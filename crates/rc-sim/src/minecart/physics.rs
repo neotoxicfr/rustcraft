@@ -656,7 +656,7 @@ impl Server {
                         n if n.ends_with("pressure_plate") => self.plate_entity_inside(p),
                         "minecraft:tripwire" => {
                             let half = crate::minecart::WIDTH / 2.0;
-                            self.tripwire_entity_inside(p, false, c.pos, c.pos, half, crate::minecart::HEIGHT);
+                            self.tripwire_entity_inside(p, false, c.pos, c.pos, half, crate::minecart::HEIGHT, false);
                         }
                         "minecraft:detector_rail" => self.detector_rail_inside(p),
                         "minecraft:cobweb" => {

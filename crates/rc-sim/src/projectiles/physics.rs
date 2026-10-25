@@ -529,49 +529,51 @@ impl Server {
 
     /// Application of block effects (one step of the arrow).
     pub(crate) fn proj_blocks_effects_from(&mut self, p: &mut Proj, from: [f64; 3]) {
+        use crate::contact::{BUTTON, FIRE, LAVA, PLATE, TRIPWIRE};
         // Retiré, ou sans physique (sauf la balle de shulker) : aucun effet des blocs.
         if p.removed || (p.no_physics && p.kind != PKind::ShulkerBullet) {
             return;
         }
         let (w, h) = p.kind.size();
+        let half = w / 2.0;
         let b = p.bbox();
         // Lowered box of the wind charge: same offset at the start.
         let dy = b.min[1] - p.pos[1];
+        let from = [from[0], from[1] + dy, from[2]];
         let to = [p.pos[0], b.min[1], p.pos[2]];
-        // G5-F02e : plaques et fil, à la position de ce pas, avant l'impact éventuel (tous les
-        // projectiles qui passent ici ; l'œil de l'Ender n'y passe pas). Le projectile, copie
-        // hors de sa case, est compté par les plaques à sa position courante.
-        self.contact.ticking_proj = Some((p.id, b));
-        self.contact_triggers([from[0], from[1] + dy, from[2]], to, w / 2.0, h);
-        self.contact.ticking_proj = None;
-        let touched = self.portals_touched_swept([from[0], from[1] + dy, from[2]], to, w, h);
-        self.entity_portal_mark(p.id, &touched, crate::portal::ENTITY_COOLDOWN);
-        let b = b.deflate(1.0e-5);
-        let lo = b.min.map(|v| v.floor() as i32);
-        let hi = b.max.map(|v| v.floor() as i32);
+        // G5-F02e : blocs traversés par ce pas, avant l'impact éventuel (l'œil de l'Ender n'y
+        // passe pas) : en ligne droite du début du pas à la position prise, par axe pour la
+        // fusée (déplacement avec collisions). Le projectile, copie hors de sa case, est compté
+        // par les plaques à sa position courante. Tous ces effets se rejouent sans dommage.
+        let straight = p.kind != PKind::Firework;
         let arrow = p.kind.arrow_like();
-        for x in lo[0]..=hi[0] {
-            for y in lo[1]..=hi[1] {
-                for z in lo[2]..=hi[2] {
-                    let st = self.st([x, y, z]);
-                    // Arrows: wooden buttons pressed (shape re-cut tested by the button).
-                    if arrow && matches!(self.v().kind(st), crate::blocks::Kind::Button { arrows: true, .. }) {
-                        self.button_arrow_inside([x, y, z], p);
-                        continue;
-                    }
-                    let n = self.state_name(st);
-                    match n {
-                        "minecraft:fire" | "minecraft:soul_fire" => {
-                            if p.fire <= 0 {
-                                p.fire = 160;
-                            }
+        // None of these blocks in the crossed sections (common case): nothing to walk.
+        let mask = [PLATE, TRIPWIRE, FIRE, LAVA].iter().fold(u32::from(arrow) << BUTTON, |m, &k| m | 1 << k);
+        let (lo, hi) = crate::contact::envelope(from, to, half, h);
+        if !crate::contact::contact_pal() || self.contact_maybe(lo, hi, mask) {
+            let cells = self.contact_cells(from, to, half, h, straight);
+            self.contact.ticking_proj = Some((p.id, b));
+            for &(q, a, e) in &cells {
+                let st = self.get(q);
+                match self.contact_kind(st) {
+                    PLATE => self.plate_entity_inside(q),
+                    TRIPWIRE => self.tripwire_entity_inside(q, false, a, e, half, h, straight),
+                    FIRE => {
+                        if p.fire <= 0 {
+                            p.fire = 160;
                         }
-                        "minecraft:lava" => p.fire = p.fire.max(300),
-                        _ => {}
                     }
+                    LAVA if self.lava_touched(q, a, e, half, h, straight) => p.fire = p.fire.max(300),
+                    // Flèches : boutons en bois enfoncés (forme recoupée testée par le bouton).
+                    BUTTON if arrow => self.button_arrow_inside(q, p),
+                    _ => {}
                 }
             }
+            self.contact.ticking_proj = None;
+            self.contact.cells = cells;
         }
+        let touched = self.portals_touched_swept(from, to, w, h, straight);
+        self.entity_portal_mark(p.id, &touched, crate::portal::ENTITY_COOLDOWN);
     }
 
     // ---------- Arrows and trident ----------

@@ -2468,3 +2468,37 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   boîte balayée contre sa forme (six comparaisons par segment, seulement dans une case de fil).
   Banc créature après reprise : 77,3 ns à l'air libre, 82,7 ns dans une toile (bruit du banc
   chargé, même ordre qu'avant). À remesurer machine calme (scène d'objets nombreux).
+- Reprise 2 (25/10 soir, machine chargée, meilleur de 5 × 100 000, A/B alternés contre HEAD) :
+  parcours exact du jeu (ligne droite pour les projectiles, tronçons par axe sinon, plafond de
+  16 itérations), feu et lave des projectiles sur ce parcours. Correction seule, sans piste :
+  créature 82-83 ns (avant 73-74), pas de flèche 329-338 ns (avant 224-226) en plein air dans la
+  section d'une rangée de plaques, 546-552 ns au ras des plaques (avant 393-394). Pistes, chacune
+  mesurée seule puis cumulée :
+  - famille de contact lue dans la table sans copier la vue (deux compteurs atomiques par
+    case) : créature 75-76 ns, flèche 287 ns. Gardée.
+  - portails : identifiants tenus par la table au lieu de trois recherches par nom, bloc lu
+    sans copie de la vue (aussi dans le relevé des palettes) : 65 → 24 ns par appel (flèches,
+    blocs qui tombent, TNT). Gardée.
+  - parcours en appel statique (générique) au lieu de fonctions de visite dynamiques : parcours
+    seul 156 → 147 ns (6 cases). Gardée.
+  - dédoublonnage du parcours par grille de bits sur l'enveloppe (au lieu d'une recherche dans
+    la liste) : parcours 184 → 200-202 ns, perd. Gardée derrière `RUSTCRAFT_OPT_WALKGRID=1`
+    (coupée par défaut) pour le banc machine calme.
+  - plancher par troncature entière au lieu de `f64::floor` : perd (créature 82 ns contre
+    72-74, parcours 183-188 contre 163-168, 3 passes alternées). Écartée : un interrupteur
+    coûterait à chaque appel ; à remesurer machine calme.
+  - sauter le vide : relevé des palettes des sections traversées (familles plaque, fil, feu,
+    lave, bouton en bois) avant tout parcours. Section vide 44 ns contre 254-260 sans, section
+    riche (une quarantaine d'états) 102 contre 286-292 ; section avec plaques : +10 ns (273
+    contre 262-264, 453-457 contre 438-446). Gardée, `RUSTCRAFT_OPT_CONTACTPAL=0` la coupe.
+  - même relevé pour les créatures : section vide 30 ns contre 74, section riche 58 contre 75,
+    mais +20 à 27 ns quand la section a un bloc de contact (plein air près d'une toile 95-103
+    contre 73-77, dans la toile 99-105 contre 75-79). Gain selon la scène : gardée coupée,
+    `RUSTCRAFT_OPT_CONTACTPAL_MOBS=1` l'active, à trancher sur les scènes machine calme.
+  Cumul retenu contre HEAD (2 passes alternées) : créature 74-75 ns contre 75-78 à l'air libre,
+  73 contre 76-78 dans une toile ; flèche en section vide 45 ns contre 222-225, section riche
+  103-106 contre 463-466 ; section avec plaques 268-271 contre 224-228 et 449 contre 390-398
+  au ras des plaques (+14 à 19 % : coût du parcours exact, 150 à 180 ns, que la fidélité
+  impose ; les autres pistes n'y gagnent rien). Un seul fil (ordre du jeu imposé, effets sur le
+  monde), GPU sans objet. Aucune allocation par tick hors portails proches. À remesurer machine
+  calme (scènes de tir à l'arc, Nether).

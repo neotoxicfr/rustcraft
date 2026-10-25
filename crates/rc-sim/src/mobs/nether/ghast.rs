@@ -81,7 +81,7 @@ fn cells(b: &rc_physics::Aabb) -> [i32; 6] {
     ]
 }
 
-fn for_cells(c: [i32; 6], f: &mut dyn FnMut([i32; 3]) -> bool) -> bool {
+fn for_cells<F: FnMut([i32; 3]) -> bool + ?Sized>(c: [i32; 6], f: &mut F) -> bool {
     let (lo, hi) = ([c[0].min(c[3]), c[1].min(c[4]), c[2].min(c[5])], [c[0].max(c[3]), c[1].max(c[4]), c[2].max(c[5])]);
     for x in lo[0]..=hi[0] {
         for y in lo[1]..=hi[1] {
@@ -140,25 +140,42 @@ fn furthest_corner(d: [f64; 3]) -> [i32; 3] {
     }
 }
 
-/// True if every visited cell accepts passage.
+/// Path shorter than 1e-5: only the arrival box counts.
+fn still(from: [f64; 3], to: [f64; 3]) -> bool {
+    let t = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+    t[0] * t[0] + t[1] * t[1] + t[2] * t[2] < f64::from(1.0e-5f32 * 1.0e-5f32)
+}
+
+/// True if every visited cell accepts passage (each cell once, in walk order).
 pub(crate) fn each_cell_between(
     from: [f64; 3],
     to: [f64; 3],
     at_target: &rc_physics::Aabb,
     visit: &mut dyn FnMut([i32; 3]) -> bool,
 ) -> bool {
-    let t = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
-    let lsq = t[0] * t[0] + t[1] * t[1] + t[2] * t[2];
-    if lsq < f64::from(1.0e-5f32 * 1.0e-5f32) {
+    if still(from, to) {
         return for_cells(cells(at_target), visit);
     }
     let mut seen = hashbrown::HashSet::new();
+    each_cell_step(from, to, at_target, &mut |p, _| !seen.insert(p) || visit(p))
+}
+
+/// Walk over the cells crossed by a box sliding up to `at_target`, with the game's iteration
+/// number: start box (0), then the furthest corner cell by cell (n at the n-th cell crossed),
+/// then the arrival box (last n + 1). A cell may come back: the caller must deduplicate. True
+/// if every visit accepts passage.
+pub(crate) fn each_cell_step<F: FnMut([i32; 3], i32) -> bool>(
+    from: [f64; 3],
+    to: [f64; 3],
+    at_target: &rc_physics::Aabb,
+    visit: &mut F,
+) -> bool {
+    if still(from, to) {
+        return for_cells(cells(at_target), &mut |p| visit(p, 0));
+    }
+    let t = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
     let back = at_target.offset(-t[0], -t[1], -t[2]);
-    let ok = for_cells(cells(&back), &mut |p| {
-        seen.insert(p);
-        visit(p)
-    });
-    if !ok {
+    if !for_cells(cells(&back), &mut |p| visit(p, 0)) {
         return false;
     }
     // Corner traversed cell by cell along the path, box of the entity's size at each step.
@@ -186,6 +203,7 @@ pub(crate) fn each_cell_between(
     let frac = |v: f64| v - v.floor();
     let mut tt: [f64; 3] =
         std::array::from_fn(|i| delta[i] * if sign[i] > 0 { 1.0 - frac(from_corner[i]) } else { frac(from_corner[i]) });
+    let mut n = 0;
     while tt[0] <= 1.0 || tt[1] <= 1.0 || tt[2] <= 1.0 {
         let a = if tt[0] < tt[1] {
             if tt[0] < tt[2] { 0 } else { 2 }
@@ -197,16 +215,16 @@ pub(crate) fn each_cell_between(
         cell[a] += sign[a];
         tt[a] += delta[a];
         let Some(hit) = clip_cell(cell, from_corner, to_corner) else { continue };
+        n += 1;
         let eps = f64::from(1.0e-5f32);
         let ch: [f64; 3] =
             std::array::from_fn(|i| hit[i].clamp(f64::from(cell[i]) + eps, f64::from(cell[i]) + 1.0 - eps));
         let opp: [i32; 3] = std::array::from_fn(|i| (ch[i] - size[i] * f64::from(dir[i])).floor() as i32);
-        let ok = for_cells([cell[0], cell[1], cell[2], opp[0], opp[1], opp[2]], &mut |p| !seen.insert(p) || visit(p));
-        if !ok {
+        if !for_cells([cell[0], cell[1], cell[2], opp[0], opp[1], opp[2]], &mut |p| visit(p, n)) {
             return false;
         }
     }
-    for_cells(cells(at_target), &mut |p| !seen.insert(p) || visit(p))
+    for_cells(cells(at_target), &mut |p| visit(p, n + 1))
 }
 
 /// Does the entity's box slid from `from` to `to` touch any

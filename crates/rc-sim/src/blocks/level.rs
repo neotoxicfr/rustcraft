@@ -210,6 +210,13 @@ impl Server {
         self.bs.t.clone()
     }
 
+    /// Bloc d'un état, comme `v().block(s)` sans copier la vue (deux compteurs atomiques) : pour
+    /// les boucles qui lisent beaucoup de cases.
+    #[inline]
+    pub(crate) fn state_block(&self, s: u32) -> u16 {
+        self.data.states.get(s as usize).map_or(u16::MAX, |i| i.block)
+    }
+
     pub(crate) fn top_y(&self) -> i32 {
         self.dim.height.min_y + self.dim.height.sections as i32 * 16
     }

@@ -320,6 +320,134 @@ fn boule_de_neige_enfonce_la_plaque() {
     assert_eq!(w.block([2, Y, 10]), "minecraft:oak_pressure_plate[powered=true]");
 }
 
+/// Projectiles : blocs traversés sur une seule ligne droite, du début du tick à la position prise
+/// (pas de découpage par axe, propre aux déplacements avec collisions). Fil accroché (1 à 2,5 px).
+/// Flèche qui descend après le fil (bas de sa boîte encore à 0,22 au-dessus de lui) : détendu ;
+/// boule de neige qui monte en travers : tendu ; flèche en biais à travers un fil à hauteur de
+/// tête (case jamais vue par un découpage Y puis X) : tendu.
+#[test]
+fn fil_tendu_par_les_projectiles_en_ligne_droite() {
+    use crate::projectiles::PKind;
+    let mut w = world("fil-droit");
+    w.p.run(&format!(
+        "setblock 3 {Y} 2 minecraft:tripwire[attached=true]\nsetblock 3 {Y} 6 minecraft:tripwire[attached=true]\nsetblock 3 {} 10 minecraft:tripwire[attached=true]\n",
+        Y + 1
+    ));
+    let y = f64::from(Y);
+    shoot(&mut w, PKind::Arrow, [2.5, y + 0.5, 2.5], [2.5, -0.4, 0.0]);
+    w.p.s.projectiles_tick();
+    // Boule de neige : gravité puis inertie avant le pas, qui va de (2,6 ; 0,01) à (4,1 ; 0,41).
+    let k = f64::from(0.99f32);
+    shoot(&mut w, PKind::Snowball, [2.6, y + 0.01, 6.5], [1.5 / k, 0.4 / k + PKind::Snowball.gravity(), 0.0]);
+    w.p.s.projectiles_tick();
+    shoot(&mut w, PKind::Arrow, [2.5, y + 1.6, 10.5], [2.5, -1.5, 0.0]);
+    w.p.s.projectiles_tick();
+    let got = [w.block([3, Y, 2]), w.block([3, Y, 6]), w.block([3, Y + 1, 10])];
+    // Flèche qui descend après le fil, boule de neige qui monte, flèche en biais.
+    assert_eq!(got.clone().map(|s| s.contains("powered=true")), [false, true, true], "{got:?}");
+}
+
+/// Plafond du parcours des blocs traversés (16 itérations pour tout le trajet), puis la seule
+/// boîte d'arrivée, comme le jeu ; valeurs calculées à part (hors dépôt) d'après le parcours du
+/// jeu, pas d'après ce code. Flèche à 20 blocs par tick au ras du sol, fils libres sur sa
+/// ligne en x = 15, 16 et 20 : tendus en 15 et 20. TNT qui file de 9,9 en X puis 9,9 en Z
+/// (tronçons par axe), fils libres sur la branche Z de z = 21 à 30 : tendus de 21 à 24 puis en
+/// 29 et 30 (boîte d'arrivée).
+#[test]
+fn plafond_d_iterations_des_blocs_traverses() {
+    use crate::projectiles::PKind;
+    let mut w = world("plafond");
+    let wires = |w: &mut W, cells: &[[i32; 3]]| {
+        let cmds: String =
+            cells.iter().map(|c| format!("setblock {} {} {} minecraft:tripwire\n", c[0], c[1], c[2])).collect();
+        w.p.run(&cmds);
+    };
+    let powered = |w: &W, cells: &[[i32; 3]]| -> Vec<bool> {
+        cells.iter().map(|&c| w.block(c).contains("powered=true")).collect()
+    };
+    let y = f64::from(Y);
+    let line: Vec<[i32; 3]> = [15, 16, 20].iter().map(|&x| [x, Y, 34]).collect();
+    wires(&mut w, &line);
+    shoot(&mut w, PKind::Arrow, [0.5, y + 0.05, 34.5], [20.0, 0.0, 0.0]);
+    w.p.s.projectiles_tick();
+    assert_eq!(powered(&w, &line), [true, false, true], "flèche en ligne droite, x = 15, 16, 20");
+    let leg: Vec<[i32; 3]> = (21..=30).map(|z| [12, Y, z]).collect();
+    wires(&mut w, &leg);
+    // Gravité (0,04) avant le déplacement : pas de (9,9 ; 0 ; 9,9).
+    w.cmd(&format!("summon minecraft:tnt 2.5 {y} 20.5 {{Motion:[9.9d,0.04d,9.9d]}}"));
+    w.p.s.tick_sim_entities();
+    let want = [true, true, true, true, false, false, false, false, true, true];
+    assert_eq!(powered(&w, &leg), want, "TNT par axe, z = 21 à 30");
+}
+
+/// Projectiles : feu et lave traversés en vol, sur la ligne droite du pas (pas seulement à
+/// l'arrivée) ; la lave seulement si la boîte touche le fluide (8/9 de bloc pour une source).
+/// Flèches à 3 blocs par tick à travers une source de lave puis un feu : enflammées ; flèche qui
+/// passe dans la case de lave au-dessus du fluide : non. Le feu est seul dans son tronçon (le
+/// relevé des palettes doit le voir sans l'aide de la lave).
+#[test]
+fn fleches_enflammees_par_la_lave_et_le_feu_traverses() {
+    use crate::projectiles::PKind;
+    let mut w = world("fleche-feu");
+    w.p.run(&format!(
+        "setblock 3 {Y} 2 minecraft:lava\nsetblock 3 {Y} 22 minecraft:fire\nsetblock 3 {Y} 10 minecraft:lava\n"
+    ));
+    let y = f64::from(Y);
+    let ids = [
+        shoot(&mut w, PKind::Arrow, [2.5, y + 0.2, 2.5], [3.0, 0.0, 0.0]),
+        shoot(&mut w, PKind::Arrow, [2.5, y + 0.2, 22.5], [3.0, 0.0, 0.0]),
+        shoot(&mut w, PKind::Arrow, [2.5, y + 0.9, 10.5], [3.0, 0.0, 0.0]),
+    ];
+    w.p.s.projectiles_tick();
+    let lit = ids.map(|id| w.p.s.proj.list.iter().find(|p| p.id == id).map(|p| p.fire > 0));
+    assert_eq!(lit, [Some(true), Some(true), Some(false)], "lave traversée, feu traversé, au-dessus de la lave");
+}
+
+/// Bloc qui tombe et TNT : portails touchés par axe (Y, puis X), comme leur déplacement avec
+/// collisions, pas en ligne droite. TNT qui file en biais de (2,5 ; 2) à (3,6 ; 0,9) : la case
+/// (3, 2) d'un portail n'est vue qu'en ligne droite, donc pas marquée ; TNT qui tombe dans un
+/// portail : marquée.
+#[test]
+fn portails_touches_par_axe_pour_le_bloc_qui_tombe() {
+    let mut w = world("portail-axe");
+    let top = Y + 2;
+    w.p.run(&format!("setblock 3 {top} 2 minecraft:nether_portal\nsetblock 7 {top} 2 minecraft:nether_portal\n"));
+    assert!(w.block([3, Y + 2, 2]).starts_with("minecraft:nether_portal"), "portail posé : {}", w.block([3, Y + 2, 2]));
+    let y = f64::from(Y);
+    let (from, to) = ([2.5, y + 2.0, 2.5], [3.6, y + 0.9, 2.5]);
+    let n = |w: &W, straight: bool| w.p.s.portals_touched_swept(from, to, 0.98, 0.98, straight).len();
+    assert_eq!((n(&w, true), n(&w, false)), (1, 0), "ligne droite, par axe");
+    // Gravité (0,04) avant le déplacement : pas de (1,1 ; −1,1).
+    w.cmd(&format!("summon minecraft:tnt 2.5 {} 2.5 {{Motion:[1.1d,-1.06d,0.0d]}}", y + 2.0));
+    w.cmd(&format!("summon minecraft:tnt 7.5 {} 2.5", y + 2.2));
+    let ids: Vec<i32> = w.p.s.bs.entities.list.iter().map(|e| e.id).collect();
+    w.p.s.tick_sim_entities();
+    let marked: Vec<bool> = ids.iter().map(|&id| w.p.s.entity_inside_portal_now(id)).collect();
+    assert_eq!(marked, [false, true], "TNT en biais, TNT qui tombe dans le portail");
+}
+
+/// Bloc qui tombe et TNT : plaques touchées juste après le déplacement, avant la pose ou le bris
+/// et avant la mèche. Sable sans objet lâché (`DropItem:0b`) retiré en arrivant sur une plaque en
+/// chêne, TNT éteinte à son dernier tick (`tnt_explodes` faux) : la plaque s'enfonce à ce tick.
+#[test]
+fn sable_et_tnt_enfoncent_la_plaque_avant_de_disparaitre() {
+    let mut w = world("sable-plaque");
+    w.p.run(&format!(
+        "setblock 10 {Y} 2 minecraft:oak_pressure_plate\nsetblock 14 {Y} 2 minecraft:oak_pressure_plate\n"
+    ));
+    w.cmd("gamerule tnt_explodes false");
+    let y = f64::from(Y);
+    w.cmd(&format!(
+        "summon minecraft:falling_block 10.5 {} 2.5 {{BlockState:{{Name:\"minecraft:sand\"}},DropItem:0b,Motion:[0.0d,-0.6d,0.0d]}}",
+        y + 0.5
+    ));
+    w.cmd(&format!("summon minecraft:tnt 14.5 {y} 2.5 {{fuse:1}}"));
+    w.p.s.tick_sim_entities();
+    assert!(w.p.s.bs.entities.list.is_empty(), "sable et TNT retirés à ce tick");
+    let pressed = "minecraft:oak_pressure_plate[powered=true]";
+    assert_eq!([w.block([10, Y, 2]), w.block([14, Y, 2])], [pressed, pressed], "sable, TNT");
+}
+
 /// Plaque pondérée légère : chaque objet la teste juste après son propre déplacement. Le
 /// premier (déjà posé) voit le second encore en l'air : signal 1, que le second, arrivé au même
 /// tick, ne recalcule pas.
@@ -390,14 +518,37 @@ fn agilite_des_ames_sur_le_sable_des_ames() {
     assert_eq!(z.attrs.speed.value(), before + f64::from(0.0405f32));
 }
 
+/// Bancs : section riche du tronçon (0, 1) (une quarantaine d'états, aucun bloc de contact).
+fn rich_section(w: &mut W) {
+    let colors = ["white", "orange", "magenta", "light_blue", "yellow", "lime", "pink", "gray"];
+    let colors = colors.iter().chain(&["light_gray", "cyan", "purple", "blue", "brown", "green", "red", "black"]);
+    let flowers = ["dandelion", "poppy", "blue_orchid", "allium", "azure_bluet", "red_tulip", "orange_tulip"];
+    let flowers =
+        flowers.iter().chain(&["white_tulip", "pink_tulip", "oxeye_daisy", "cornflower", "lily_of_the_valley"]);
+    let leaves = ["oak", "spruce", "birch", "jungle", "acacia", "dark_oak", "mangrove", "cherry", "azalea", "pale_oak"];
+    let mut cmds = String::new();
+    for (i, c) in colors.enumerate() {
+        cmds += &format!("setblock {} {} 28 minecraft:{c}_wool\n", i % 16, Y + 2);
+    }
+    for (i, f) in flowers.enumerate() {
+        cmds += &format!("setblock {} {Y} 30 minecraft:{f}\n", i);
+    }
+    for (i, l) in leaves.iter().enumerate() {
+        cmds += &format!("setblock {} {} 30 minecraft:{l}_leaves[persistent=true]\n", i, Y + 3);
+    }
+    w.p.run(&cmds);
+}
+
 /// Banc (lancé à la main, `--ignored`) : coût par tick du parcours des blocs traversés d'une
-/// créature qui marche (0,2 bloc par tick), sans bloc de contact puis dans une toile.
+/// créature qui marche (0,2 bloc par tick) : section vide (palette du monde plat), section
+/// riche, plein air dans la section d'une toile, puis dans la toile.
 #[test]
 #[ignore]
 fn banc_contacts_creature() {
     let mut w = world("banc");
     w.p.run(&format!("setblock 12 {Y} 12 minecraft:cobweb\n"));
-    for (label, pos) in [("air", at(4, 4)), ("toile", at(12, 12))] {
+    rich_section(&mut w);
+    for (label, pos) in [("vide", at(4, 36)), ("riche", at(4, 20)), ("air", at(4, 4)), ("toile", at(12, 12))] {
         let mut z = w.mob(Kind::Zombie, pos, false);
         let mut best = f64::MAX;
         for _ in 0..5 {
@@ -410,5 +561,35 @@ fn banc_contacts_creature() {
             best = best.min(t.elapsed().as_secs_f64() * 1.0e9 / 100_000.0);
         }
         println!("banc contacts {label} : {best:.1} ns par tick et par créature");
+    }
+}
+
+/// Banc (lancé à la main, `--ignored`) : coût d'un pas des effets des blocs d'une flèche qui
+/// file en biais (2,5 blocs par tick, 0,4 de descente) : section vide (palette du monde plat),
+/// section riche (une quarantaine d'états, aucun bloc de contact), plein air dans la section
+/// d'une rangée de plaques, puis au ras des plaques (boîte au-dessus de leur zone de contact :
+/// rien ne change).
+#[test]
+#[ignore]
+fn banc_contacts_projectile() {
+    use crate::projectiles::{PKind, Proj};
+    let mut w = world("banc-proj");
+    w.p.run(&format!("fill 0 {Y} 10 15 {Y} 10 minecraft:oak_pressure_plate\n"));
+    rich_section(&mut w);
+    let y = f64::from(Y);
+    for (label, z, h) in [("vide", 36.5, 1.6), ("riche", 20.5, 1.6), ("air", 4.5, 1.6), ("plaques", 10.5, 0.9)] {
+        let item = Stack { id: PKind::Arrow.default_item().into(), count: 1, components: None };
+        let mut p = Proj::new(PKind::Arrow, w.p.s.proj_new_id(), [5.5, y + h - 0.4, z], item);
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            for _ in 0..100_000 {
+                p.pos = [5.5, y + h - 0.4, z];
+                w.p.s.proj_blocks_effects_from(&mut p, [3.0, y + h, z]);
+            }
+            best = best.min(t.elapsed().as_secs_f64() * 1.0e9 / 100_000.0);
+        }
+        assert!(w.block([5, Y, 10]).contains("powered=false"), "banc : plaque restée haute");
+        println!("banc projectile {label} : {best:.1} ns par pas");
     }
 }

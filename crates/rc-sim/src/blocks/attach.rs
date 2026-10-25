@@ -498,10 +498,12 @@ impl Server {
         }
     }
 
-    /// Entity whose box (half-width `half`, height `h`, feet from `from` to `to`) intersects
-    /// the shape of the wire at `p` during its movement: a relaxed tripwire with no tick
-    /// scheduled gets tightened as soon as the entity does not ignore trigger blocks
-    /// (`ignores`: bat, spectator); the next tick (10) rechecks with all the entities.
+    /// Entity whose box (half-width `half`, height `h`, feet from `from` to `to`, in a straight
+    /// line if `straight`, otherwise axis by axis) intersects the shape of the wire at `p`
+    /// during its movement: a relaxed tripwire with no tick scheduled gets tightened as soon as
+    /// the entity does not ignore trigger blocks (`ignores`: bat, spectator); the next tick (10)
+    /// rechecks with all the entities.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn tripwire_entity_inside(
         &mut self,
         p: P,
@@ -510,13 +512,14 @@ impl Server {
         to: [f64; 3],
         half: f64,
         h: f64,
+        straight: bool,
     ) {
         let s = self.get(p);
         if !ignores
             && self.v().kind(s) == Kind::Tripwire
             && !self.v().get_bool(s, "powered")
             && !self.has_scheduled_tick(p, self.v().block(s))
-            && crate::contact::swept_touches(&self.tripwire_shape(s, p), from, to, half, h)
+            && crate::contact::touches(&self.tripwire_shape(s, p), from, to, half, h, straight)
         {
             self.tripwire_check_pressed(p, true);
         }
