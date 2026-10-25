@@ -801,7 +801,8 @@ impl Server {
             let dx = self.mobs.rng.next_int_bound(xz * 2 + 1) - xz;
             let dz = self.mobs.rng.next_int_bound(xz * 2 + 1) - xz;
             let mut sp = [start[0] + dx, start[1] + y, start[2] + dz];
-            if !self.spawn_util_ground(y, &mut sp, no_leaves) {
+            // Start block inside the world border, otherwise the attempt is lost.
+            if !Self::block_in_border(self.border_bounds(), sp) || !self.spawn_util_ground(y, &mut sp, no_leaves) {
                 continue;
             }
             let i = kind.info();
@@ -839,10 +840,12 @@ impl Server {
 
     /// The movement toward a possible spawn position ("on a support" strategies, with or without leaves).
     fn spawn_util_ground(&self, range: i32, sp: &mut [i32; 3], no_leaves: bool) -> bool {
-        let empty_shape = |s: &Server, p: [i32; 3]| {
-            let mut b = Vec::new();
-            s.phys.collision(s.st(p), &mut b);
-            b.is_empty()
+        // A single box buffer for the whole descent.
+        let mut buf = Vec::new();
+        let mut empty_shape = |s: &Server, p: [i32; 3]| {
+            buf.clear();
+            s.phys.collision(s.st(p), &mut buf);
+            buf.is_empty()
         };
         let mut above_empty = empty_shape(self, *sp);
         for _ in (-range..=range).rev() {

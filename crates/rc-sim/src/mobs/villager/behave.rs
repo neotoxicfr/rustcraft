@@ -2180,11 +2180,27 @@ impl Server {
         if !b.mem.path {
             return false;
         }
-        let Some(path) = m.nav.path.clone() else { return false };
+        self.path_doors_step(m, &mut b.mem.doors, last, cooldown, None)
+    }
+
+    /// Shared door behaviour (villager, copper golem), without the path-memory test: every 20
+    /// repetitions of the same next node (or as soon as it changes), opens the door of the node
+    /// being left and that of the target node, remembers them, then closes the ones already passed.
+    /// `near`: living entities perceived by the mob (`None`: every loaded mob).
+    pub(crate) fn path_doors_step(
+        &mut self,
+        m: &Mob,
+        doors: &mut Option<Vec<[i32; 3]>>,
+        last: &mut Option<[i32; 3]>,
+        cooldown: &mut i32,
+        near: Option<&[Ent]>,
+    ) -> bool {
+        let Some(path) = m.nav.path.as_ref() else { return false };
         if path.next == 0 || path.is_done() {
             return false;
         }
         let next = path.nodes[path.next].0;
+        let from = path.nodes[path.next - 1].0;
         if *last == Some(next) {
             *cooldown = 20;
         } else {
@@ -2194,32 +2210,45 @@ impl Server {
             }
         }
         *last = Some(next);
-        let from = path.nodes[path.next - 1].0;
         if self.is_mob_door(from) {
             self.set_door_open(from, true, m.id);
-            let d = b.mem.doors.get_or_insert_with(Vec::new);
+            let d = doors.get_or_insert_with(Vec::new);
             if !d.contains(&from) {
                 d.push(from);
             }
         }
         if self.is_mob_door(next) && !self.v().get_bool(self.st(next), "open") {
             self.set_door_open(next, true, m.id);
-            let d = b.mem.doors.get_or_insert_with(Vec::new);
+            let d = doors.get_or_insert_with(Vec::new);
             if !d.contains(&next) {
                 d.push(next);
             }
         }
-        if b.mem.doors.is_some() {
-            self.close_doors(m, b, Some(from), Some(next));
+        if doors.is_some() {
+            self.close_doors_in(m, doors, Some(from), Some(next), near);
         }
         true
     }
 
     /// Closing of the doors that were opened or passed through.
     fn close_doors(&mut self, m: &Mob, b: &mut Brain, from: Option<[i32; 3]>, to: Option<[i32; 3]>) {
-        let Some(doors) = b.mem.doors.take() else { return };
+        self.close_doors_in(m, &mut b.mem.doors, from, to, None);
+    }
+
+    /// Closes the remembered doors other than the `from` / `to` nodes: forgotten when far (3
+    /// blocks), gone or already closed; left open if a perceived fellow mob, within 2 blocks,
+    /// is crossing it on its path.
+    fn close_doors_in(
+        &mut self,
+        m: &Mob,
+        doors: &mut Option<Vec<[i32; 3]>>,
+        from: Option<[i32; 3]>,
+        to: Option<[i32; 3]>,
+        near: Option<&[Ent]>,
+    ) {
+        let Some(list) = doors.take() else { return };
         let mut keep = Vec::new();
-        for d in doors {
+        for d in list {
             if from == Some(d) || to == Some(d) {
                 keep.push(d);
                 continue;
@@ -2227,18 +2256,23 @@ impl Server {
             if !closer_center(d, m.pos, 3.0) || !self.is_mob_door(d) || !self.v().get_bool(self.st(d), "open") {
                 continue;
             }
-            let others = self.mobs.list.iter().flatten().any(|o| {
-                o.kind == m.kind && o.id != m.id && closer_center(d, o.pos, 2.0) && {
-                    o.nav.path.as_ref().is_some_and(|p| {
+            let crossing = |o: &Mob| {
+                o.kind == m.kind
+                    && o.id != m.id
+                    && closer_center(d, o.pos, 2.0)
+                    && o.nav.path.as_ref().is_some_and(|p| {
                         !p.is_done() && p.next > 0 && (p.nodes[p.next - 1].0 == d || p.nodes[p.next].0 == d)
                     })
-                }
-            });
+            };
+            let others = match near {
+                None => self.mobs.list.iter().flatten().any(|o| crossing(o)),
+                Some(n) => n.iter().any(|e| matches!(*e, Ent::Mob(id) if self.mob_ref(id).is_some_and(crossing))),
+            };
             if !others {
                 self.set_door_open(d, false, m.id);
             }
         }
-        b.mem.doors = (!keep.is_empty()).then_some(keep);
+        *doors = (!keep.is_empty()).then_some(keep);
     }
 }
 

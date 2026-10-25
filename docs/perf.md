@@ -2416,6 +2416,24 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   target; spatial index not retained (nothing measurable at this rate). Wet player: one sweep
   of the fluids of its box per examination. Multi-core and GPU not applicable (sub-microsecond work).
 - Opening of the shulker box: one collision search on a half block per click.
+## G4-F12: iron and copper golems (25/10, loaded machine)
+
+- Village defence (start test, goal-selection tick): the line of sight the game requires costs
+  rays; the villager scan is now skipped when the player is not a valid target (no observable
+  effect: the sight cache only lives for one tick), and the reputation is read before the
+  villager's sight ray. Bench `bench_defend_village_can_use` (8 villagers, 10^5 calls, 2
+  passes): player out of range 12-13 ns per call against 1,934-2,199 ns without the skip;
+  player nearby in the open (neutral reputation) 316-331 ns against 2,068-2,617 ns. Kept,
+  without a switch (dead work removed, identical result by construction). Multi-core and GPU
+  not applicable (one evaluation per golem and per goal tick).
+- Door behaviour (villager, copper golem): a single code path; no more path copy at every
+  call (one allocation fewer per walking villager and per tick). Copper golem: list of nearby
+  living entities filled into the buffer of the previous measurement (no more allocation
+  every 20 ticks for the seen living entities). Cost of a non-isolated call (below a
+  microsecond).
+- Shared spawn helper: one collision-box buffer for the whole descent instead of a `Vec` per
+  cell; border test (4 bounds) before the descent, which spares the descent outside the
+  border. Rare (spawning by attempts), not measured separately.
 ## G2-F08: singleplayer world, world pack, creation, list (24/10, loaded machine)
 
 - "..." cut of the names in the list and of the packs (`rc_text::clamp`, cumulative width in a
