@@ -968,6 +968,7 @@ impl Server {
         if self.player_hurt_by_mob(m, "minecraft:mob_attack", dmg, Some(kb)) {
             let pitch = (m.rng.next_float() - m.rng.next_float()) * 0.2 + 1.0;
             self.cube_sound(m, "minecraft:entity.slime.attack", 1.0, pitch);
+            self.player_thorns(m); // G5-F02d
         }
     }
 

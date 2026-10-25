@@ -398,8 +398,12 @@ impl Server {
         (armor.floor() as f32, tough as f32)
     }
 
-    /// Enchantment protection of the worn equipment (`damage_protection` effects of the game).
+    /// Enchantment protection of the worn equipment (`damage_protection` effects of the game);
+    /// every protection requires a type outside `bypasses_invulnerability` (`/kill`, void).
     fn protection(&self, ty: &str) -> f32 {
+        if self.damage_tag(ty, "bypasses_invulnerability") {
+            return 0.0;
+        }
         let mut p = 0.0;
         for slot in 5..9 {
             let Some(s) = &self.slots[slot] else { continue };
@@ -419,6 +423,18 @@ impl Server {
             }
         }
         p
+    }
+
+    /// Worn piece worn down by a hit of type `ty`: `equippable` component present with
+    /// `damage_on_hurt` (true by default; false for the elytra), and no `damage_resistant` that
+    /// covers the type (netherite against fire).
+    fn armor_wears(&self, s: &Stack, ty: &str) -> bool {
+        let Some(eq) = self.comp_json(s, "minecraft:equippable") else { return false };
+        let h = &eq["damage_on_hurt"];
+        if !h.as_bool().or_else(|| h.as_i64().map(|n| n != 0)).unwrap_or(true) {
+            return false;
+        }
+        !self.resistant_tag(s).is_some_and(|t| self.damage_tag(ty, t.trim_start_matches('#')))
     }
 
     /// Damage refused outright: player dead or not ready, invulnerable, game rule.
@@ -495,9 +511,14 @@ impl Server {
         // Armor.
         if !self.damage_tag(ty, "bypasses_armor") {
             let (armor, tough) = self.armor_values();
-            for slot in 5..9 {
-                if self.slots[slot].is_some() {
-                    self.hurt_item(slot, ((d / 4.0) as i32).max(1));
+            // Wear: nothing for a zero hit; feet first, equippable piece that wears on
+            // hurt (not the elytra) and that does not resist the type (netherite and fire).
+            if d > 0.0 {
+                let n = (d / 4.0).max(1.0) as i32;
+                for slot in (5..9).rev() {
+                    if self.slots[slot].as_ref().is_some_and(|s| self.armor_wears(s, ty)) {
+                        self.hurt_item(slot, n);
+                    }
                 }
             }
             let t = 2.0 + tough / 4.0;

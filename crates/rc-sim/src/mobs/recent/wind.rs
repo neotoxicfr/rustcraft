@@ -83,7 +83,9 @@ impl Server {
     pub(crate) fn wind_on_hit_entity(&mut self, p: &mut Proj, t: Ent, living: bool) {
         let owner = self.proj_owner(p);
         self.set_last_hurt_mob(owner, living.then_some(t));
-        self.proj_damage(t, "minecraft:wind_charge", 1.0, owner, (-p.vel[0], -p.vel[2]));
+        if self.proj_damage(t, "minecraft:wind_charge", 1.0, owner, (-p.vel[0], -p.vel[2])) && t == Ent::Player {
+            self.player_thorns_by(owner); // G5-F02d
+        }
         let c = p.pos;
         self.wind_explode(p, c);
     }

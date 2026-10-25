@@ -956,6 +956,10 @@ impl Server {
                 m.vel[0] *= 0.6;
                 m.vel[2] *= 0.6;
             }
+            // G5-F02d: the victim's thorns, before the attacker's weapon effects.
+            if t == Ent::Player {
+                self.player_thorns(m);
+            }
             // S7: fire aspect (after-hit effect: 4 s per level, without shortening a fire in progress).
             if fire_aspect > 0 {
                 let ticks = 80 * fire_aspect;

@@ -2433,3 +2433,9 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   walk of the order of 3.65 ms for 12,000 files (G1-F15 measurement), kept for safety.
 - Free disk space (`rc_sim::storage::low_disk_space`): one system call at opening, on
   the main thread; not measured separately (negligible).
+- Player thorns, armor wear and protections (G5-F02d, `rc_sim::thorns`, `vitals.rs`): event code
+  (one hit received), never in a per-tick loop. Thorns: six slots read, one random draw per
+  enchanted item, no allocation; wear: one `equippable` component read per piece and per hit
+  (JSON copy of a few fields, of the order of a microsecond, not measured separately); protection:
+  a tag test up front that avoids walking the four pieces for `/kill` and the void.
+  Multi-core and GPU not applicable (order of the random draws imposed, work of the order of one hit).

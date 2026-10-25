@@ -208,7 +208,9 @@ impl Server {
         let kb = (-s.vel[0], -s.vel[2]);
         match e {
             Ent::Player => {
-                self.player_hurt_by_mob(&owner, "minecraft:spit", 1.0, Some(kb));
+                if self.player_hurt_by_mob(&owner, "minecraft:spit", 1.0, Some(kb)) {
+                    self.player_thorns_by(Some(Ent::Mob(owner.id))); // G5-F02d
+                }
             }
             Ent::Mob(id) => {
                 let Some(i) = self.mob_index(id) else { return };

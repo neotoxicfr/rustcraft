@@ -646,6 +646,9 @@ impl Server {
             }
         };
         if hurt {
+            if t == Ent::Player {
+                self.player_thorns(m); // G5-F02d
+            }
             m.last_hurt_mob = Some(t);
             if !m.is_baby() {
                 self.hoglin_throw(m, t);

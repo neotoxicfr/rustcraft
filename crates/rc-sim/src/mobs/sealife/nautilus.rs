@@ -812,7 +812,10 @@ impl Server {
         let dmg = m.attrs.attack.value() as f32;
         match e {
             Ent::Player => {
-                self.player_hurt_by_mob(m, "minecraft:mob_attack", dmg, Some((m.pos[0] - self.pos[0], m.pos[2] - self.pos[2])));
+                let kb = Some((m.pos[0] - self.pos[0], m.pos[2] - self.pos[2]));
+                if self.player_hurt_by_mob(m, "minecraft:mob_attack", dmg, kb) {
+                    self.player_thorns(m); // G5-F02d
+                }
             }
             Ent::Mob(id) => {
                 if let Some(i) = self.mob_index(id)

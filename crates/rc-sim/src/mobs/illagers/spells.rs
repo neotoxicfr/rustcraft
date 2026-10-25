@@ -297,7 +297,9 @@ impl Server {
                 Some(ow) => {
                     // Direct source: the fangs (knockback from their position).
                     let kb = Some((f.pos[0] - self.pos[0], f.pos[2] - self.pos[2]));
-                    self.player_hurt_by_mob(ow, "minecraft:indirect_magic", 6.0, kb);
+                    if self.player_hurt_by_mob(ow, "minecraft:indirect_magic", 6.0, kb) {
+                        self.player_thorns_by(Some(Ent::Mob(ow.id))); // G5-F02d: on the caster
+                    }
                 }
             }
         }

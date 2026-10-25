@@ -1115,7 +1115,7 @@ impl Server {
 
 impl Server {
     /// `damage_resistant` component of the stack (patch, otherwise prototype): tag of damage types.
-    fn resistant_tag(&self, s: &Stack) -> Option<String> {
+    pub(crate) fn resistant_tag(&self, s: &Stack) -> Option<String> {
         if let Some(c) = crate::items::component(s, "minecraft:damage_resistant") {
             return c.get("types").and_then(rc_proto::nbt::Nbt::as_str).map(str::to_owned);
         }
