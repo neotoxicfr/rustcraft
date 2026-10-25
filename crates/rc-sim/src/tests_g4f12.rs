@@ -134,21 +134,21 @@ fn defend_village_player_feet_in_area() {
     assert!(!can_at(&mut w, edge + 0.2), "player with feet outside the area retained through their box");
 }
 
-/// Same player query for the phantom's targeting: feet below the bottom of the area, box
-/// entering it, no target.
+/// Same player query for the phantom's targeting: feet just outside the edge of the area,
+/// box entering it, no target (within 20 blocks, the targeting range does not come into play).
 #[test]
 fn phantom_target_player_feet_in_area() {
     let mut w = world("phantomfeet");
-    let mut ph = w.p.s.new_mob(Kind::Phantom, [8.5, f64::from(Y) + 70.0, 8.5], 0.0);
-    let bottom = ph.bbox().min[1] - 64.0;
-    let mut can_at = |w: &mut W, y: f64| {
-        w.p.s.pos = [8.5, y, 8.5];
+    let mut ph = w.p.s.new_mob(Kind::Phantom, [0.5, f64::from(Y) + 10.0, 8.5], 0.0);
+    let edge = ph.bbox().max[0] + 16.0;
+    let mut can_at = |w: &mut W, x: f64| {
+        w.p.s.pos = [x, f64::from(Y), 8.5];
         ph.sight.clear();
         ph.target = None;
         w.p.s.phantom_target_can_use(&mut ph, &mut 0)
     };
-    assert!(can_at(&mut w, bottom), "player with feet on the bottom of the area ignored");
-    assert!(!can_at(&mut w, bottom - 0.5), "player with feet below the area retained through their box");
+    assert!(can_at(&mut w, edge - 0.1), "player with feet in the area ignored");
+    assert!(!can_at(&mut w, edge + 0.2), "player with feet outside the area retained through their box");
 }
 
 /// Micro-bench (ignored): cost of the village defence start test, 8 villagers in the area,
