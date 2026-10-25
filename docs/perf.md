@@ -2433,3 +2433,16 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   walk of the order of 3.65 ms for 12,000 files (G1-F15 measurement), kept for safety.
 - Free disk space (`rc_sim::storage::low_disk_space`): one system call at opening, on
   the main thread; not measured separately (negligible).
+## G4-F16a: dragon client effects, creaking tearing itself down (25/10, loaded machine)
+
+- Dragon (`entity_render/dragon.rs` `client_fx`, `App::tick_dragon_fx`): one pass over the
+  entities per tick with a kind comparison (of the order of a nanosecond per entity), then
+  a handful of operations for each dragon; no allocation (effects delivered by callback,
+  sine and cosine from the game's table, already built). The only notable cost: the podium
+  column re-read block by block (at most the world height, 384 reads) at every landing
+  tick, a few seconds per fight; a cache of the "no leaves" height map would cost
+  an update at every block change of the whole world for this single phase: not
+  retained. Multi-core and GPU not applicable (a few microseconds per tick at most, effects emitted
+  in the order of the random draws). Not measured on the bench: nothing on the hot path outside the dragon fight.
+- Creaking: eye blinking in O(1) per tick (two floats of the free state), red overlay
+  and tilt by a kind test; no measurable cost.

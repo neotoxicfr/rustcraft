@@ -41,6 +41,9 @@ mod tests_g2f03;
 mod tests_g2f05;
 #[cfg(test)]
 mod tests_c3m11;
+// Dragon effects, creaking tearing itself down (mission G4-F16a).
+#[cfg(test)]
+mod tests_g4f16a;
 // Non-living entities and projectiles (`docs/specs/entities-objects.md`): complete rendering outside the
 // animated-models path (`push_object`), block models inside an entity.
 mod objects;
@@ -4174,8 +4177,7 @@ impl EntityRenderer {
             }
         };
         let packed = (u32::from(block) * 16) | ((u32::from(s) * 16) << 8);
-        // The dragon is not a living-entity render: red overlay on damage only.
-        let red = e.hurt_time > 0 || (e.death_time > 0 && e.kind != "ender_dragon");
+        let red = red_overlay(e);
         let mut white = 0.0f32;
         // Swallowed content of the sulfur cube (block or skull), resolved once for the frame.
         let swallowed = if e.kind == "sulfur_cube" { self.swallowed(e) } else { None };
@@ -6427,7 +6429,8 @@ fn sort_far_to_near(list: &mut [(u8, u32, u32, Instance)], mats: &[PartMat], eye
 /// Animation of a layer depending on the entity kind (`entities.md` part 3 § 2).
 /// Alpha of the glowing layers: warden (0 bioluminescence 1; 1 and 2 pulsing spots
 /// max(0, cos(age × 0.045 [+ π]) × 0.25); 3 tentacles; 4 heart, beating every
-/// 40 − ⌊anger/80 × 30⌋ ticks for 10 ticks), 5 eyes of the active creaking.
+/// 40 − ⌊anger/80 × 30⌋ ticks for 10 ticks), 5 eyes of the creaking (active, or blinking
+/// while it tears itself down).
 fn pulse_alpha(e: &Entity, id: u8, pt: f32) -> f32 {
     let age = e.age as f32 + pt;
     match id {
@@ -6443,9 +6446,17 @@ fn pulse_alpha(e: &Entity, id: u8, pt: f32) -> f32 {
             let (now, before) = ((9i32 - k as i32).max(0) as f32, (10i32 - k as i32).max(0) as f32);
             (before + pt * (now - before)) / 10.0
         }
+        // Creaking: eyes blink while it tears itself down, otherwise lit if it is active.
+        5 if creatures::creaking_tearing(e) => e.extra[5],
         5 => f32::from(u8::from(e.meta_bool(17))),
         _ => 1.0,
     }
+}
+
+/// Red overlay on injury or death. The dragon is not a living-entity render: damage only;
+/// a creaking tearing itself down never has one.
+fn red_overlay(e: &Entity) -> bool {
+    (e.hurt_time > 0 || (e.death_time > 0 && e.kind != "ender_dragon")) && !creatures::creaking_tearing(e)
 }
 
 /// Inputs of a living entity's pose rotations.
@@ -6492,8 +6503,8 @@ fn pose_rotations(e: &Entity, pt: f32, body: f32, m: &mut Mat4, c: &RotCtx) {
         if matches!(e.kind.as_str(), "spider" | "cave_spider" | "endermite" | "silverfish") { 180.0 } else { 90.0 };
     let spin = e.meta_byte(8) & 4 != 0;
     if !base_rot {
-    } else if e.death_time > 0 {
-        // Death tilt.
+    } else if e.death_time > 0 && !creatures::creaking_tearing(e) {
+        // Death tilt (not for a creaking tearing itself down: counter rendered as zero).
         let t = e.death_time as f32 - 1.0 + pt;
         let f = (t / 20.0 * 1.6).sqrt().min(1.0);
         *m *= Mat4::from_rotation_z(deg(f * flip));

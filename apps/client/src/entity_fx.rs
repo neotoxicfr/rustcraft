@@ -32,6 +32,7 @@ impl crate::App {
     /// Entity particles for one game tick (world not frozen).
     pub(crate) fn tick_entity_particles(&mut self) {
         self.tick_illusions();
+        self.tick_dragon_fx();
         let game_time = self.env.env.clocks.game_time;
         let ents = &self.entities;
         let (ps, r) = (&mut self.particles, &mut self.world_random);

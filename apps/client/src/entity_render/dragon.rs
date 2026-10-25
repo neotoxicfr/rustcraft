@@ -6,16 +6,31 @@
 //! - `animate`: neck, head, jaw, wings, legs and tail taken from the flight history;
 //! - `rotations`: dragon-specific stack in place of "Y(180 − body)";
 //! - `shadow`: shadow radius 0.5;
-//! - `tick`: flight history (64 samples) and wing flap.
+//! - `tick`: flight history (64 samples) and wing flap;
+//! - `client_fx` (called by `App::tick_dragon_fx`): sounds and particles of the client tick.
 //!
 //! Client state: `history` = ring of 64 [y, yaw, 0]; `extra[0]` = index of the last
-//! sample, `extra[1]` / `extra[2]` = current / previous wing flap.
+//! sample, `extra[1]` / `extra[2]` = current / previous wing flap, `extra[FLAP]` = flap
+//! crossed this tick, `extra[GROWL]` = ticks before the next growl, `extra[SEEN]` = phase
+//! seen + 1 (0: never), `extra[PHASE_T]` = phase counter (flames, death).
+
+use std::f32::consts::TAU;
+
+use rc_physics::{cos_t, sin_t};
 
 use super::*;
+use crate::level_events::WorldRandom;
+use crate::particles::Kind as PKind;
 
 const KIND: &str = "ender_dragon";
 const RING: usize = 64;
 const DEG: f32 = PI / 180.0;
+const FLAP: usize = 3;
+const GROWL: usize = 4;
+const SEEN: usize = 5;
+const PHASE_T: usize = 6;
+const FLAP_SOUND: &str = "minecraft:entity.ender_dragon.flap";
+const GROWL_SOUND: &str = "minecraft:entity.ender_dragon.growl";
 
 pub(super) fn layers(
     _r: &EntityRenderer,
@@ -91,6 +106,10 @@ pub(super) fn tick(e: &mut Entity) {
     if e.death_time == 0 && matches!(e.meta.get(&9), Some(rc_proto_v777::entity::Meta::Float(h)) if *h <= 0.0) {
         e.death_time = 1;
     }
+    // Wing flap: the phase cosine crosses back above −0.3 between the two values from before this
+    // tick's advance; read by `client_fx` (sound).
+    let (now, before) = (cos_t(e.extra[1] * TAU), cos_t(e.extra[2] * TAU));
+    e.extra[FLAP] = f32::from(u8::from(before <= -0.3 && now >= -0.3));
     e.extra[2] = e.extra[1];
     if dying(e) {
         return;
@@ -340,6 +359,181 @@ impl EntityRenderer {
 
 pub(super) fn shadow(k: &str) -> Option<(f32, f32)> {
     (k == KIND).then_some((0.5, 1.0))
+}
+
+/// Effect of the dragon's client tick: particle (kind, position, velocity; default options,
+/// breath power 1) or sound at the dragon's position (name, volume, pitch).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum Fx {
+    Particle(PKind, [f64; 3], [f64; 3]),
+    Sound(&'static str, f32, f32),
+}
+
+/// Sitting phases (scan, flames, attack, hover): no periodic growl, head lowered.
+fn sitting(phase: i32) -> bool {
+    matches!(phase, 5 | 6 | 7 | 10)
+}
+
+/// Random explosion around the dragon: ±4 in x and z, 2 ± 2 in y.
+fn burst(e: &Entity, r: &mut WorldRandom) -> [f64; 3] {
+    let x = f64::from((r.f() - 0.5) * 8.0);
+    let y = f64::from((r.f() - 0.5) * 4.0);
+    let z = f64::from((r.f() - 0.5) * 8.0);
+    [e.pos[0] + x, e.pos[1] + 2.0 + y, e.pos[2] + z]
+}
+
+/// Height of the flight sample recorded `k` ticks earlier.
+fn hist_y(e: &Entity, k: usize) -> f64 {
+    let head = e.extra[0] as usize;
+    e.history[(head + RING - (k & (RING - 1))) & (RING - 1)][0]
+}
+
+/// Head at the previous tick (the phase tick runs before the parts are placed), middle of its
+/// one-block box: position, yaw and flight samples shifted by one tick; no turn on the client
+/// side.
+fn head_pos(e: &Entity, phase: i32) -> [f64; 3] {
+    let y = |k: usize| hist_y(e, k + 1);
+    let tilt = (y(5) - y(10)) as f32 * 10.0 * DEG;
+    let (ct, st) = (cos_t(tilt), sin_t(tilt));
+    let rot = e.yaw_o * DEG;
+    let lift = if sitting(phase) { -1.0 } else { (y(5) - y(0)) as f32 };
+    [
+        e.pos_o[0] + f64::from(sin_t(rot) * 6.5 * ct),
+        e.pos_o[1] + f64::from(lift + st * 6.5) + 0.5,
+        e.pos_o[2] + f64::from(-cos_t(rot) * 6.5 * ct),
+    ]
+}
+
+/// Gaze direction (normalised) for an imposed pitch and the current yaw.
+fn look(x_rot: f32, yaw: f32) -> [f64; 3] {
+    let (xr, yr) = (x_rot * DEG, -yaw * DEG);
+    let v = [sin_t(yr) * cos_t(xr), -sin_t(xr), cos_t(yr) * cos_t(xr)].map(f64::from);
+    let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if n < 1.0e-5 { [0.0; 3] } else { v.map(|c| c / n) }
+}
+
+/// Breath from the head: 8 positions at ± Gaussian/2. The game loses the rotation of the
+/// direction between two positions (result discarded): all leave in the same direction
+/// (quirk reproduced). `per` breaths per position, velocity given by their rank.
+fn breath(e: &Entity, r: &mut WorldRandom, per: u32, vel: impl Fn(u32) -> [f64; 3], emit: &mut dyn FnMut(Fx)) {
+    let h = head_pos(e, e.meta_int(16).unwrap_or(10));
+    for _ in 0..8 {
+        let p = [h[0] + r.gaussian() / 2.0, h[1] + r.gaussian() / 2.0, h[2] + r.gaussian() / 2.0];
+        for j in 0..per {
+            emit(Fx::Particle(PKind::DragonBreath, p, vel(j)));
+        }
+    }
+}
+
+/// Client tick of the dragon (after `tick`): flap and growls, death explosions, phase effects
+/// (landing, flames, sitting attack, death). `egg_y`: first free y of the "blocks motion, leaves
+/// excluded" height map at the podium (0, 0) (fight origin zero on the client), read only when
+/// landing.
+pub(super) fn client_fx(e: &mut Entity, r: &mut WorldRandom, egg_y: &mut dyn FnMut() -> i32, emit: &mut dyn FnMut(Fx)) {
+    if e.kind != KIND {
+        return;
+    }
+    let phase = e.meta_int(16).unwrap_or(10);
+    let silent = e.meta_bool(4);
+    if e.extra[SEEN] == 0.0 {
+        e.extra[GROWL] = 100.0;
+    }
+    // New phase received: its counter restarts from zero.
+    if e.extra[SEEN] != (phase + 1) as f32 {
+        e.extra[SEEN] = (phase + 1) as f32;
+        e.extra[PHASE_T] = 0.0;
+    }
+    let pitch = |r: &mut WorldRandom| 0.8 + r.f() * 0.3;
+    let dying = dying(e);
+    // The dragon's own death counter (1 on the first dying tick): `death_time` has already advanced.
+    if dying && (180..=200).contains(&(e.death_time - 1)) {
+        emit(Fx::Particle(PKind::ExplosionEmitter, burst(e, r), [0.0; 3]));
+    }
+    if e.extra[FLAP] != 0.0 && !silent {
+        emit(Fx::Sound(FLAP_SOUND, 5.0, pitch(r)));
+    }
+    if !silent && !sitting(phase) {
+        e.extra[GROWL] -= 1.0;
+        if e.extra[GROWL] < 0.0 {
+            emit(Fx::Sound(GROWL_SOUND, 2.5, pitch(r)));
+            e.extra[GROWL] = 200.0 + ((r.f() * 200.0) as i32).min(199) as f32;
+        }
+    }
+    if dying {
+        emit(Fx::Particle(PKind::Explosion, burst(e, r), [0.0; 3]));
+        return;
+    }
+    if no_ai(e) || e.history.len() < RING {
+        return;
+    }
+    let f08 = f64::from(0.08f32);
+    match phase {
+        // Landing: head raised according to the distance to the egg, 8 breaths per tick.
+        3 => {
+            let ey = f64::from(egg_y()) + 0.5;
+            let d2 = (0.5 - e.pos[0]).powi(2) + (ey - e.pos[1]).powi(2) + (0.5 - e.pos[2]).powi(2);
+            let dist = (d2.sqrt() as f32 / 4.0).max(1.0);
+            let d = look(-(6.0 / dist) * 1.5 * 5.0, e.yaw);
+            let v = e.velocity;
+            let f03 = f64::from(0.3f32);
+            breath(e, r, 1, |_| [-d[0] * f08 + v[0], -d[1] * f03 + v[1], -d[2] * f08 + v[2]], emit);
+        }
+        // Sitting flames: every other tick during the first 10, 8 × 6 breaths.
+        5 => {
+            e.extra[PHASE_T] += 1.0;
+            let t = e.extra[PHASE_T] as i32;
+            if t % 2 == 0 && t < 10 {
+                let d = look(-45.0, e.yaw);
+                let f06 = f64::from(0.6f32);
+                breath(e, r, 6, |j| [-d[0] * f08 * f64::from(j), -d[1] * f06, -d[2] * f08 * f64::from(j)], emit);
+            }
+        }
+        // Sitting attack: roar every tick, even when silent.
+        7 => emit(Fx::Sound(GROWL_SOUND, 2.5, pitch(r))),
+        // Flight to the podium to die: explosion emitter every 10 ticks.
+        9 => {
+            let t = e.extra[PHASE_T] as i32;
+            e.extra[PHASE_T] += 1.0;
+            if t % 10 == 0 {
+                emit(Fx::Particle(PKind::ExplosionEmitter, burst(e, r), [0.0; 3]));
+            }
+        }
+        _ => {}
+    }
+}
+
+impl crate::App {
+    /// Dragon sounds and particles for one game tick (`client_fx`).
+    pub(crate) fn tick_dragon_fx(&mut self) {
+        let w = crate::particles::TickWorld {
+            grid: &self.world.grid,
+            min_y: self.world.min_y,
+            height: self.world.height,
+            phys: &self.phys,
+            player: None,
+            scope: None,
+        };
+        let (anim, data) = (&self.block_anim, &*self.data);
+        let mut audio = self.audio.get();
+        let (ps, r) = (&mut self.particles, &mut self.world_random);
+        let opts = crate::particles::Options::default();
+        for e in self.entities.map.values_mut() {
+            if e.kind != KIND {
+                continue;
+            }
+            let pos = e.pos;
+            client_fx(e, r, &mut || anim.no_leaves_height(&w, data, 0, 0), &mut |fx| match fx {
+                Fx::Particle(k, p, v) => {
+                    ps.spawn(k, &opts, p, v);
+                }
+                Fx::Sound(name, vol, pitch) => {
+                    if let Some(a) = audio.as_deref_mut() {
+                        a.play(name, rc_audio::Category::Hostile, Some(pos), vol, pitch, None);
+                    }
+                }
+            });
+        }
+    }
 }
 
 #[cfg(test)]
