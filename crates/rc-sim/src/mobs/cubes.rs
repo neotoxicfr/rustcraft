@@ -245,12 +245,12 @@ impl Mob {
         self.equipment[BODY].is_some()
     }
 
-    /// Species-specific persistence (outside the `persistent` flag): a sulfur cube carrying
-    /// a block or coming out of a bucket does not despawn and does not count toward the spawn cap.
-    /// (Leash and mount are not modeled yet.)
+    /// Species-specific persistence (outside the `persistent` flag): passenger, leashed animal,
+    /// sulfur cube carrying a block or coming out of a bucket; none despawns or counts toward the spawn cap.
     pub fn requires_custom_persistence(&self) -> bool {
-        // F04: a passenger does not despawn.
+        // F04: a passenger does not despawn; G4-F07a: neither does a leashed animal.
         self.mount.vehicle.is_some()
+            || super::leash::is_leashed(self)
             || self.kind == Kind::SulfurCube && (self.has_body_item() || self.cube.from_bucket)
             // F07: raid raider.
             || super::illagers::custom_persistence(self)

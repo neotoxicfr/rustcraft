@@ -285,6 +285,10 @@ impl Server {
         }
         rider.mount.vehicle = Some(v.id);
         v.mount.passengers.push(Ent::Mob(rider.id));
+        // G4-F07a: a mob that starts riding drops its lead (item on the ground).
+        if super::super::leash::is_leashed(rider) {
+            self.leash_drop(rider, true, true);
+        }
         if rider.kind.non_controlling_rider() {
             v.mount.passive_riders.push(rider.id);
         }

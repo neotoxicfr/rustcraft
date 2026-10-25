@@ -113,7 +113,7 @@ impl Server {
         [pos[0].floor() as i32, y, pos[2].floor() as i32]
     }
 
-    fn friction_at(&self, p: [i32; 3]) -> f32 {
+    pub(crate) fn friction_at(&self, p: [i32; 3]) -> f32 {
         self.phys.friction.get(self.st(p) as usize).copied().unwrap_or(0.6)
     }
 

@@ -504,6 +504,8 @@ pub struct Mob {
     pub end: super::end::EndMob,
     /// F16: wither (`wither/`).
     pub wither: super::wither::Wither,
+    /// Lead (`leash.rs`): boxed, absent for almost every mob.
+    pub leash: Option<Box<super::leash::Leash>>,
 }
 
 impl Mob {
@@ -660,6 +662,7 @@ impl Mob {
             rec: super::recent::Rec::default(),
             end: super::end::EndMob::default(),
             wither: super::wither::Wither::default(),
+            leash: None,
         };
         if super::recent::handles(kind) {
             super::recent::on_new(&mut m);
@@ -1293,6 +1296,7 @@ impl Mob {
         }
         super::variants::load_extra(self, e);
         super::villager::load(self, e);
+        super::leash::load(self, e);
         self.nbt = Some(e.clone());
     }
 
@@ -1416,6 +1420,7 @@ impl Mob {
         }
         super::variants::save_extra(self, &mut e);
         super::villager::save(self, &mut e);
+        super::leash::save(self, &mut e);
         e
     }
 }

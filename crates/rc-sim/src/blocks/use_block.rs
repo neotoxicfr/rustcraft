@@ -126,6 +126,10 @@ impl Server {
             Kind::DecoratedPot => return self.pot_fail(p),
             _ => {}
         }
+        // G4-F07a: fence: the animals held by the player get tied to it (knot).
+        if self.btag_id(p, crate::tag_bits::TagId::Fences) {
+            return self.leash_bind_player_mobs(p);
+        }
         let name = self.state_name(s).to_owned();
         let short = name.trim_start_matches("minecraft:");
         match short {

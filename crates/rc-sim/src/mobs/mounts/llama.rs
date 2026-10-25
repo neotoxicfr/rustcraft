@@ -222,9 +222,7 @@ impl Server {
     // ---------- Caravan ----------
 
     fn llama_leashed(m: &Mob) -> bool {
-        // Leash not simulated in singleplayer: never held.
-        let _ = m;
-        false
+        super::super::leash::is_leashed(m)
     }
 
     /// First of the caravan held on a leash, at most 8 links away.
@@ -322,6 +320,10 @@ impl Server {
     }
 
     pub(crate) fn caravan_tick(&mut self, m: &mut Mob, speed: f64) {
+        // Tied to a knot: it does not follow the caravan.
+        if matches!(super::super::leash::holder(m), Some(super::super::leash::Holder::Knot(_))) {
+            return;
+        }
         let Some(h) = m.mount.caravan_head.and_then(|id| self.mob_ref(id)).map(|h| h.pos) else { return };
         let d = [h[0] - m.pos[0], h[1] - m.pos[1], h[2] - m.pos[2]];
         let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
@@ -342,18 +344,31 @@ impl Server {
     }
 }
 
-/// Trader llama: despawn countdown (suspended if tamed, ridden by a player, age-locked or
-/// persistent).
-pub fn maybe_despawn(s: &Server, m: &mut Mob) {
+/// Wandering trader holding this llama on a lead: its despawn delay.
+pub fn trader_delay(s: &Server, m: &Mob) -> Option<i32> {
+    let super::super::leash::Holder::Mob(id) = super::super::leash::holder(m)? else { return None };
+    let t = s.mobs.get(id).filter(|t| t.kind == Kind::WanderingTrader)?;
+    Some(t.npc.as_ref().map_or(0, |n| n.despawn_delay))
+}
+
+/// Trader llama: despawn countdown (suspended if tamed, held by something other than its
+/// trader, ridden by a player, age-locked or persistent); held by the trader, it leaves one
+/// tick before it.
+pub fn maybe_despawn(s: &mut Server, m: &mut Mob) {
     if m.kind != Kind::TraderLlama {
         return;
     }
+    let trader = trader_delay(s, m);
+    let other_holder = super::super::leash::is_leashed(m) && trader.is_none();
     let one_player = m.mount.passengers.len() == 1 && m.mount.passengers[0] == Ent::Player;
-    let can = !super::is_tamed(m) && !one_player && !m.mount.age_locked && !m.persistent;
-    let _ = s;
+    let can = !super::is_tamed(m) && !other_holder && !one_player && !m.mount.age_locked && !m.persistent;
     if can {
-        m.mount.despawn_delay -= 1;
+        m.mount.despawn_delay = match trader {
+            Some(d) => d - 1,
+            None => m.mount.despawn_delay - 1,
+        };
         if m.mount.despawn_delay <= 0 {
+            s.leash_drop(m, true, false);
             m.removed = true;
         }
     }

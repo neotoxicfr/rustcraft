@@ -242,7 +242,7 @@ pub fn custom_ai_step(s: &mut Server, m: &mut Mob, b: &mut Brain) {
         b.first_valid(&[Act::Panic, Act::Idle]);
     }
     // The restriction control (neither leashed nor ridden).
-    if m.mount.passengers.is_empty() {
+    if m.mount.passengers.is_empty() && !super::super::leash::is_leashed(m) {
         let radius = if !m.is_baby() && !wearing_harness(m) { 64 } else { 32 };
         let bp = m.block_pos();
         let keep = m.rec.restriction.is_some_and(|(h, r)| {

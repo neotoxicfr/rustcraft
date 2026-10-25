@@ -1392,7 +1392,7 @@ impl Server {
             }
             Bk::StrollFly { speed } => {
                 let p = if m.kind == super::super::species::Kind::HappyGhast {
-                    let home = m.rec.restriction;
+                    let home = super::super::goals::rpos_home(m); // G4-F07a: lead included
                     super::allay::fly_target_pos_with(
                         self,
                         m,

@@ -637,6 +637,10 @@ impl Server {
             }
         }
         self.convert_mounts(from, &mut n);
+        // G4-F07a: the new form keeps the lead's holder (link sent at spawn).
+        if let Some(l) = from.leash.as_deref().filter(|l| l.holder.is_some()) {
+            n.leash = Some(Box::new(super::leash::Leash { holder: l.holder, anchor: l.anchor, angular: 0.0, home: None }));
+        }
         if from.kind.zombie_like() && n.kind.zombie_like() && from.can_break_doors {
             super::brains::set_can_break_doors(&mut n, true);
         }

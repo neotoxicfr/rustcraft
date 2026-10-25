@@ -127,6 +127,7 @@ impl Server {
         }
         // Active effects: never sent at pairing (only a rider receives them).
         self.pair_mount(m); // F04: passengers, mount attributes
+        self.pair_leash(m); // G4-F07a: held lead
         let t = &mut m.track;
         t.seen = true;
         t.base = m.pos;

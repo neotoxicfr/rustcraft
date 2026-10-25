@@ -2406,7 +2406,8 @@ pub(crate) fn max_head_y(kind: super::species::Kind) -> f32 {
 /// Residence zone of a mob read by the generic position draws (center, radius):
 /// tamed nautilus, elder guardian, happy ghast.
 pub(crate) fn rpos_home(m: &Mob) -> Option<([i32; 3], i32)> {
-    m.sea.home.or(m.aqua.home).or(m.rec.restriction)
+    // G4-F07a: the lead resets the zone around the holder every tick (it takes precedence).
+    super::leash::home(m).or(m.sea.home).or(m.aqua.home).or(m.rec.restriction)
 }
 
 /// Residence set and mob within radius + range + 1 of its center: points outside the

@@ -2185,8 +2185,10 @@ passengers, llama, camel brain, trap, menu) and `mobs/goals/mount_goals.rs` (goa
   remounted on arrival.
 - **Llama**: spit in front of the mouth (width + 1) / 2, towards a third of the target's height,
   speed 1.5, inaccuracy 10; gravity 0.06, friction 0.99, 1 "spit" damage; removed on a
-  block, in water or when full. Caravan written to the game but inert (leash not simulated). Trader
-  llama: 47,999 ticks then removed (suspended if tamed, ridden by a lone player, locked,
+  block, in water or when full. Caravan led by a llama held on a lead (G4-F07a). Trader
+  llama: held by its trader from the spawn (leaves one tick before him, refuses the rider,
+  defends the trader), otherwise 47,999 ticks then removed (suspended if tamed, held by
+  something else, ridden by a lone player, locked,
   persistent).
 - **Camel**: brain (sensors every 20 ticks with a start drawn on the entity's random generator;
   "core" then "rest" activities by priority 0 to 5, durations drawn on the world's random generator, single
@@ -2204,7 +2206,7 @@ passengers, llama, camel brain, trap, menu) and `mobs/goals/mount_goals.rs` (goa
 - **NBT**: `EatingHaystack`, `Bred`, `Temper`, `Tame`, `Owner`, `AgeLocked`, jump in
   `attributes`, `Variant`, `ChestedHorse`/`Items`, `Strength`, `DespawnDelay`, `SkeletonTrap(Time)`,
   `LastPoseTick`, `Passengers` (riders), `drop_chances` (saddle, body).
-- **Remaining differences**: leash and caravan (leash not simulated); wandering trader's llama
+- **Remaining differences**: wandering trader's llama
   (trader not simulated); real lightning (fire, damage: only the visual lightning is sent);
   lightning rods (point-of-interest search); enchantments of the trap skeletons'
   equipment (not applied, like the rest of the engine); skeleton horse swimming sounds; walking

@@ -1033,6 +1033,13 @@ impl Server {
                     write_varint(w, *amount);
                 }))
             }
+            // G4-F07a: lead (two fixed integers: held, holder, 0 = detached).
+            Event::Misc(rc_client::misc::Misc::Link { held, holder }) => {
+                out.push(pk(ids.set_entity_link, |w| {
+                    w.extend_from_slice(&held.to_be_bytes());
+                    w.extend_from_slice(&holder.to_be_bytes());
+                }))
+            }
             Event::Progress(p) => crate::lan::progress_packets(self, &ids, p, out),
             // W8a: sign editor, written book, data (F3+I), game rules.
             Event::OpenSignEditor { pos, front } => out.push(pk(ids.open_sign_editor, |w| {
