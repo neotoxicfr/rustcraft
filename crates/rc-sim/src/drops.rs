@@ -426,6 +426,8 @@ impl Server {
             if d.removed {
                 continue;
             }
+            // G5-F02e : plaques et fil, une fois la liste des objets remise en place.
+            self.defer_contact_triggers(old, d.pos, ITEM_SIZE / 2.0, ITEM_SIZE);
             if d.age != -32768 {
                 d.age += 1;
             }
@@ -547,11 +549,13 @@ impl Server {
         let gone: Vec<i32> = drops.iter().filter(|d| d.removed).map(|d| d.id).collect();
         drops.retain(|d| !d.removed);
         self.life.drops = drops;
+        self.flush_contact_triggers();
         let mut orbs = std::mem::take(&mut self.life.orbs);
         self.orbs_tick(&mut orbs);
         let gone_orbs: Vec<i32> = orbs.iter().filter(|o| o.removed).map(|o| o.id).collect();
         orbs.retain(|o| !o.removed);
         self.life.orbs = orbs;
+        self.flush_contact_triggers();
         let all: Vec<i32> = gone.into_iter().chain(gone_orbs).collect();
         if !all.is_empty() {
             // Scoreboard: items and orbs removed (command UUID derived from the id).
@@ -610,6 +614,7 @@ impl Server {
             if o.on_ground {
                 o.body.fall = 0.0;
             }
+            self.defer_contact_triggers(from, o.pos, ORB_SIZE / 2.0, ORB_SIZE); // G5-F02e
             o.age += 1;
             if o.age >= LIFETIME {
                 o.removed = true;

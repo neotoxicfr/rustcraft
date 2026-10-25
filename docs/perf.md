@@ -2433,3 +2433,32 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   walk of the order of 3.65 ms for 12,000 files (G1-F15 measurement), kept for safety.
 - Free disk space (`rc_sim::storage::low_disk_space`): one system call at opening, on
   the main thread; not measured separately (negligible).
+- Coupe « ... » des noms de la liste et des paquets (`rc_text::clamp`, largeur cumulée en un
+  passage au lieu d'une remesure du préfixe à chaque caractère) : 64 caractères coupés à 157,
+  1 074 puis 1 181 ns par appel pour l'ancienne méthode, 596 puis 651 ns pour la nouvelle (banc
+  `clamp_bench`, 2 passes, meilleur de 5 × 200 000 appels) : environ 1,8 fois plus rapide, gardé.
+  Sortie identique (assertion du banc, test `fit_matches_prefix_widths_and_clamp_adds_dots`).
+  Multi-cœurs et GPU sans objet (moins d'une microseconde par ligne, au dessin).
+- Question de la copie à l'ouverture (`rc_sim::packs::backup_question` : deux .dat gzip, paquets
+  du monde parcourus) : déplacée du fil principal vers un fil, sous l'écran « Chargement des
+  ressources » que le jeu affiche à ce moment ; le fil principal ne bloque plus. Pire cas (paquet
+  en dossier de dizaines de milliers de fichiers) non mesuré : à mesurer machine calme.
+- Contrôle des liens d'un monde : fait dès « Jouer » (comme le jeu, avant toute lecture), et
+  refait à l'ouverture effective en secours (le dossier peut changer entre-temps) ; second
+  parcours de l'ordre de 3,65 ms pour 12 000 fichiers (mesure G1-F15), gardé pour la sûreté.
+- Espace disque libre (`rc_sim::storage::low_disk_space`) : un appel système à l'ouverture, sur
+  le fil principal ; non mesuré à part (négligeable).
+## G5-F02e : contacts avec les blocs traversés, bottes enchantées (25/10, machine chargée)
+
+- Parcours des cases balayées par une créature (`rc_sim::contact`, segments d'un seul axe, cases
+  dédoublonnées dans un vecteur réutilisé, famille de contact lue dans une table d'un octet par
+  bloc construite une fois) : 78,6 ns par tick et par créature à l'air libre, 79,1 ns dans une
+  toile (banc `banc_contacts_creature`, meilleur de 5 × 100 000) ; 500 créatures ≈ 40 µs par
+  tick. Aucune allocation par tick. Pistes non retenues faute de gain à cette échelle : sauter
+  le parcours d'une créature immobile (il faudrait suivre les changements de blocs autour
+  d'elle), répartir sur plusieurs cœurs (les effets modifient le monde, ordre du jeu imposé),
+  GPU sans objet. À remesurer machine calme (scène de mobs nombreux).
+- Joueur : un parcours par tick (mêmes coûts) ; bottes sans Semelles givrantes ni Agilité des
+  âmes : sortie immédiate, sans requête au monde.
+- Objets et orbes : parcours différé dans un vecteur réutilisé jusqu'à la remise en place de
+  leur liste (sans quoi la plaque pondérée ne compterait pas les autres objets).

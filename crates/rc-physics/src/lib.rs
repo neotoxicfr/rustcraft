@@ -852,6 +852,8 @@ pub struct MoveEffects {
     pub dolphins_grace: bool,
     /// Blindness: restricted mobility (no sprint).
     pub blindness: bool,
+    /// Tissage : enlisement moindre dans la toile.
+    pub weaving: bool,
 }
 
 impl MoveEffects {
@@ -863,6 +865,7 @@ impl MoveEffects {
             "minecraft:slow_falling" => self.slow_falling = amplifier.is_some(),
             "minecraft:dolphins_grace" => self.dolphins_grace = amplifier.is_some(),
             "minecraft:blindness" => self.blindness = amplifier.is_some(),
+            "minecraft:weaving" => self.weaving = amplifier.is_some(),
             _ => {}
         }
     }
@@ -2290,6 +2293,8 @@ impl Player {
             }
         };
         match k {
+            // Tissage : la toile enlise deux fois moins à l'horizontale, cinq fois moins en hauteur.
+            inside::WEB if self.effects.weaving => stuck(self, [0.5, 0.25, 0.5]),
             inside::WEB => stuck(self, [0.25, f64::from(0.05f32), 0.25]),
             inside::BERRY_BUSH => stuck(self, [f64::from(0.8f32), 0.75, f64::from(0.8f32)]),
             inside::POWDER_SNOW => {

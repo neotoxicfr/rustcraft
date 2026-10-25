@@ -842,7 +842,18 @@ impl Server {
                 Some(slot) if slot.id == id => {
                     // Destroyed by another during its own tick (explosion it caused).
                     p.removed |= slot.removed;
+                    // G5-F02e : flèches, fusées, boules de feu, charges de vent et balles de
+                    // shulker touchent plaques et fil (pas les objets lancés ni l'œil de l'Ender).
+                    let touch = !p.removed
+                        && !p.no_physics
+                        && (p.kind.arrow_like()
+                            || p.kind.hurting()
+                            || matches!(p.kind, PKind::Firework | PKind::ShulkerBullet));
+                    let (from, to, b) = (p.old_pos, p.pos, p.bbox());
                     *slot = p;
+                    if touch {
+                        self.contact_triggers(from, to, (b.max[0] - b.min[0]) / 2.0, b.max[1] - b.min[1]);
+                    }
                 }
                 // List replaced during the tick (dimension change): stop.
                 _ => break,

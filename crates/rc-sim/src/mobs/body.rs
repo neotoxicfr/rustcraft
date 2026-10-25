@@ -118,6 +118,10 @@ impl Server {
     }
 
     fn speed_factor(&self, m: &Mob) -> f32 {
+        // G5-F02e : Agilité des âmes active, efficacité de mouvement 1 : aucun ralentissement.
+        if m.boots.soul_active {
+            return 1.0;
+        }
         let here = m.block_pos();
         let s = self.st(here);
         let f = self.phys.speed_factor.get(s as usize).copied().unwrap_or(1.0);
@@ -180,6 +184,14 @@ impl Server {
 
     /// Collisions, flags, fall, step, speed factor.
     pub(crate) fn mob_move(&mut self, m: &mut Mob, delta: [f64; 3]) {
+        // G5-F02e : enlisement du tick précédent (toile, baies) : déplacement multiplié, vitesse
+        // remise à zéro (les poussées de piston l'effacent sans le multiplier, `piston.rs`).
+        let mut delta = delta;
+        if l2(m.stuck) > 1.0e-7 {
+            delta = std::array::from_fn(|i| delta[i] * m.stuck[i]);
+            m.stuck = [0.0; 3];
+            m.vel = [0.0; 3];
+        }
         let start = m.bbox();
         // F12: the strider settles on lava sources (own shape above them).
         let mv = {

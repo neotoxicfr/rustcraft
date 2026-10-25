@@ -255,6 +255,8 @@ pub struct Server {
     /// Projectiles of the open world and shooting player's state (S8, `projectiles/`).
     pub(crate) proj: Box<crate::projectiles::Projs>,
     pub(crate) proj_player: Box<crate::projectiles::PlayerProj>,
+    /// Contacts with crossed blocks and the player's enchanted boots (G5-F02e, `contact.rs`).
+    pub(crate) contact: Box<crate::contact::Contact>,
     /// Minecarts of the open world and the player's minecart (G5-F06, `minecart/`).
     pub(crate) carts: Box<crate::minecart::Carts>,
     pub(crate) pcart: crate::minecart::PlayerCart,
@@ -396,6 +398,7 @@ impl Server {
             deco: Box::default(),
             proj: Box::default(),        // S8
             proj_player: Box::default(), // S8
+            contact: Box::default(),     // G5-F02e
             carts: Box::default(),       // G5-F06
             pcart: crate::minecart::PlayerCart::default(),
             maps: Box::default(), // S8

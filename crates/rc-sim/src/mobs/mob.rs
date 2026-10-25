@@ -373,6 +373,10 @@ pub struct Mob {
     pub support: Option<[i32; 3]>,
     /// Piston pushes accumulated during the tick (cap of 0.51 per axis).
     pub piston_deltas: rc_physics::piston::PistonDeltas,
+    /// Enlisement (toile, baies) posé par les blocs traversés, appliqué au déplacement suivant.
+    pub stuck: [f64; 3],
+    /// Enchantements des bottes liés au bloc (G5-F02e).
+    pub boots: crate::contact::Boots,
     pub move_dist: f32,
     pub next_step: f32,
     pub needs_sync: bool,
@@ -562,6 +566,8 @@ impl Mob {
             was_eyes_in_water: false,
             support: None,
             piston_deltas: Default::default(),
+            stuck: [0.0; 3],
+            boots: Default::default(),
             move_dist: 0.0,
             next_step: 1.0,
             needs_sync: false,

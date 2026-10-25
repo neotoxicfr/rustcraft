@@ -654,7 +654,7 @@ impl Server {
                     let p = [x, y, z];
                     match self.bname(p) {
                         n if n.ends_with("pressure_plate") => self.plate_entity_inside(p),
-                        "minecraft:tripwire" => self.tripwire_entity_inside(p),
+                        "minecraft:tripwire" => self.tripwire_entity_inside(p, false),
                         "minecraft:detector_rail" => self.detector_rail_inside(p),
                         "minecraft:cobweb" => {
                             c.fall_distance = 0.0;

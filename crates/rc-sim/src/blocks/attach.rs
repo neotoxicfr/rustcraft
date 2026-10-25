@@ -494,13 +494,15 @@ impl Server {
         }
     }
 
-    /// Player in the tripwire.
-    pub(crate) fn tripwire_entity_inside(&mut self, p: P) {
+    /// Entity in the tripwire cell: a relaxed tripwire with no tick scheduled gets tightened as
+    /// soon as the entity does not ignore trigger blocks (`ignores`: bat, spectator); the next
+    /// tick (10) rechecks the exact shape of the wire.
+    pub(crate) fn tripwire_entity_inside(&mut self, p: P, ignores: bool) {
         let s = self.get(p);
-        if self.v().kind(s) == Kind::Tripwire
+        if !ignores
+            && self.v().kind(s) == Kind::Tripwire
             && !self.v().get_bool(s, "powered")
             && !self.has_scheduled_tick(p, self.v().block(s))
-            && self.tripwire_box_has_entity(s, p)
         {
             self.tripwire_check_pressed(p, true);
         }

@@ -338,7 +338,7 @@ impl Server {
         Some(id)
     }
 
-    fn entity_box(e: &SimEntity) -> Aabb {
+    pub(crate) fn entity_box(e: &SimEntity) -> Aabb {
         let h = FALLING_SIZE / 2.0;
         Aabb { min: [e.pos[0] - h, e.pos[1], e.pos[2] - h], max: [e.pos[0] + h, e.pos[1] + FALLING_SIZE, e.pos[2] + h] }
     }
@@ -380,7 +380,12 @@ impl Server {
                 EntKind::Falling(s) => self.tick_falling(&mut e, s),
                 EntKind::Tnt(fuse) => self.tick_tnt(&mut e, fuse),
             }
+            let (removed, old, pos) = (e.removed, e.old, e.pos);
             self.bs.entities.list[i] = e;
+            // G5-F02e : plaques et fil touchés (l'entité, remise en liste, compte pour la plaque).
+            if !removed {
+                self.contact_triggers(old, pos, FALLING_SIZE / 2.0, FALLING_SIZE);
+            }
         }
         let gone: Vec<i32> = self.bs.entities.list.iter().filter(|e| e.removed).map(|e| e.id).collect();
         if !gone.is_empty() {
@@ -905,6 +910,14 @@ impl Server {
                     && hit(&m.bbox())
             })
             .count();
+        // G5-F02e : créature en cours de tick (sortie de la liste) qui touche un bloc déclencheur.
+        if let Some((id, mb, ignores)) = self.contact.ticking
+            && Some(id) != except
+            && !(triggers && ignores)
+            && hit(&mb)
+        {
+            n += 1;
+        }
         if !living {
             n += self.bs.entities.list.iter().filter(|e| !e.removed && hit(&Self::entity_box(e))).count();
             n += self.life.drops.iter().filter(|d| !d.is_removed() && hit(&around(d.pos, 0.25, 0.25))).count();
@@ -927,7 +940,7 @@ impl Server {
                 self.plate_entity_inside(q);
             }
         }
-        self.tripwire_entity_inside(p);
+        self.tripwire_entity_inside(p, self.game_mode == 3);
         // G5-F09: big dripleaf under the feet (the full pass over crossed blocks, G5-F02,
         // calls it for all entities; a second call has no effect).
         if self.game_mode != 3 && self.v().kind(self.get(p)) == Kind::BigDripleaf {

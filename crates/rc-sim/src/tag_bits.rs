@@ -99,6 +99,7 @@ tag_ids! {
     SnifferEggHatchBoost = "minecraft:sniffer_egg_hatch_boost",
     Snow = "minecraft:snow",
     SoulFireBaseBlocks = "minecraft:soul_fire_base_blocks",
+    SoulSpeedBlocks = "minecraft:soul_speed_blocks",
     SpeedsUpZombieVillagerCuring = "minecraft:speeds_up_zombie_villager_curing",
     Speleothems = "minecraft:speleothems",
     StriderWarmBlocks = "minecraft:strider_warm_blocks",

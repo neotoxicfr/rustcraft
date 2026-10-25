@@ -198,6 +198,7 @@ impl Server {
         m.pitch_o = m.pitch;
         m.head_yaw_o = m.head_yaw;
         m.tick_count += 1;
+        self.mob_boots_tick_effects(m); // G5-F02e: Soul Speed particles and sound
         // Base tick of the entity (F06: iron golem run particles first).
         self.golem_base_tick(m);
         m.was_eyes_in_water = m.eyes_in_water;
@@ -270,6 +271,7 @@ impl Server {
                 m.air =
                     super::brainy::max_air(m).map_or_else(|| super::sealife::increase_air(m), |x| (m.air + 4).min(x));
             }
+            self.mob_boots_location(m); // G5-F02e : Semelles givrantes, Agilité des âmes
         }
         if m.hurt_time > 0 {
             m.hurt_time -= 1;
@@ -517,6 +519,7 @@ impl Server {
                 self.mob_travel(m);
             }
         }
+        self.mob_contacts(m); // G5-F02e: berries, cobweb, wither rose, cauldrons, plates, tripwire
         // Block effects after the movement: without current fire, the counter returns to 0
         // (a negative fire re-read lasts only one tick; only the player keeps −20).
         if m.fire < 0 && !m.removed && !super::illagers::no_physics(m) {
