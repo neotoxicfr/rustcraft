@@ -377,7 +377,7 @@ fn kind_of(name: &str) -> Kind {
         "cactus" => return Cactus,
         "short_grass" | "fern" | "dandelion" | "poppy" | "blue_orchid" | "allium" | "azure_bluet" | "red_tulip"
         | "orange_tulip" | "white_tulip" | "pink_tulip" | "oxeye_daisy" | "cornflower" | "lily_of_the_valley"
-        | "torchflower" | "open_eyeblossom" | "closed_eyeblossom" | "bush" | "firefly_bush" | "pink_petals"
+        | "torchflower" | "open_eyeblossom" | "closed_eyeblossom" | "bush" | "red_shrub" | "firefly_bush" | "pink_petals"
         | "wildflowers" | "golden_dandelion" => {
             return Bush;
         }

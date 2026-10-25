@@ -7,6 +7,7 @@
 //! randomness are the server's, in the game's sequential order (§ 4.3).
 
 pub(crate) mod attach;
+pub(crate) mod bone_meal;
 pub(crate) mod dispense_behaviors;
 pub(crate) mod attack;
 pub(crate) mod campfire;
@@ -53,6 +54,8 @@ mod g6f06_tests;
 mod g6f12_tests;
 #[cfg(test)]
 mod g6f23_tests;
+#[cfg(test)]
+mod g6f07_tests;
 
 pub(crate) use table::{Kind, Table};
 

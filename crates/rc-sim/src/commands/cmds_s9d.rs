@@ -85,6 +85,13 @@ impl Server {
         let h = self.dim.height;
         let mut n = 0;
         let Some(Some(_)) = self.chunks.get(&(dc.cx, dc.cz)) else { return 0 };
+        // Cells broken with drops by the feature (planted nether fungus): particles, sound and
+        // drops of the previous block, as long as the world still holds that state.
+        for &(p, old) in &dc.destroyed {
+            if self.get(p) == old {
+                self.destroy_block(p, true, 512);
+            }
+        }
         for si in 0..h.sections {
             for i in 0..4096 {
                 let new = dc.blocks[si * 4096 + i];

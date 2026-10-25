@@ -93,7 +93,7 @@ impl Server {
     pub(crate) fn item_use_on(&mut self, slot: usize, clicked: P, face: Dir) -> bool {
         let Some(stack) = self.slots[slot].clone() else { return false };
         let done = match stack.id.as_str() {
-            "minecraft:bone_meal" => self.bone_meal_use(slot, clicked),
+            "minecraft:bone_meal" => self.bone_meal_use(slot, clicked, face),
             "minecraft:honeycomb" => self.wax_use(slot, clicked, &stack),
             "minecraft:potion" => self.water_bottle_on_mud(slot, clicked, face), // G6-F01
             // G5-F10: item uses on a block, followed by the common trigger
@@ -166,12 +166,17 @@ impl Server {
 
     // --- Bone meal. ---
 
-    /// Growable block → growth, bone meal consumed, vibration of
-    /// the use, particles (event 1505, 15).
-    fn bone_meal_use(&mut self, slot: usize, p: P) -> bool {
-        if !self.grow_with_bone_meal(p) {
+    /// Growable block → growth, otherwise a full face clicked against full water → water plants;
+    /// bone meal consumed, vibration of the use, particles (event 1505, 15, on the block that
+    /// received the bone meal).
+    fn bone_meal_use(&mut self, slot: usize, p: P, face: Dir) -> bool {
+        let p = if self.grow_with_bone_meal(p) {
+            p
+        } else if self.v().sturdy(self.get(p), face) && self.grow_water_plant(rel(p, face), Some(face)) {
+            rel(p, face)
+        } else {
             return false;
-        }
+        };
         // The vibration is drawn from the stack AFTER the withdrawal, which happens even in creative
         // (the count is only given back after the use): the last bone meal does not vibrate.
         let mut left = self.slots[slot].clone();
@@ -296,7 +301,7 @@ impl Server {
                 if grower_of(&name).is_some() {
                     return self.sapling_bone_meal(p, s, &name);
                 }
-                false
+                self.bone_meal_more(s, p, &name).unwrap_or(false)
             }
         }
     }

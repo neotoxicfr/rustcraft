@@ -862,7 +862,7 @@ impl Server {
         }
     }
 
-    fn bamboo_run(&self, p: P, up: bool) -> i32 {
+    pub(crate) fn bamboo_run(&self, p: P, up: bool) -> i32 {
         let bamboo = self.bamboo_id();
         let mut h = 0;
         while h < 16 && self.v().block(self.get(super::rel_n(p, if up { Dir::Up } else { Dir::Down }, h + 1))) == bamboo
@@ -894,7 +894,7 @@ impl Server {
         }
     }
 
-    fn bamboo_grow(&mut self, s: u32, p: P, height: i32) {
+    pub(crate) fn bamboo_grow(&mut self, s: u32, p: P, height: i32) {
         let v = self.v();
         let bamboo = self.bamboo_id();
         let bp = below(p);

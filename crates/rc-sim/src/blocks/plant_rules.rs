@@ -166,6 +166,33 @@ impl Server {
         true
     }
 
+    /// Bone meal on the small dripleaf (always valid; the upper half defers to the lower one):
+    /// upper half removed (its fluid stays, flags 18), then a big dripleaf of 2 to 5 cells grown
+    /// upward as long as the cell accepts it, stems then leaf, facing kept.
+    pub(crate) fn small_dripleaf_bone_meal(&mut self, s: u32, p: P) -> bool {
+        let v = self.v();
+        let (s, p) = if v.get(s, "half") == Some("upper") { (self.get(below(p)), below(p)) } else { (s, p) };
+        let facing = v.facing(s);
+        let up = above(p);
+        let left = self.fluid_at(up);
+        let left = if left.is_empty() { self.air() } else { self.legacy_block(left) };
+        self.set_block(up, left, 18);
+        let want = 2 + self.bs.rng.next_int_bound(4);
+        let mut height = 0;
+        while height < want && self.dripleaf_can_grow_into(super::rel_n(p, Dir::Up, height)) {
+            height += 1;
+        }
+        let mut q = p;
+        while q[1] < p[1] + height - 1 {
+            let w = self.water_source_at(q);
+            self.dripleaf_place(q, true, w, facing);
+            q = above(q);
+        }
+        let w = self.water_source_at(q);
+        self.dripleaf_place(q, false, w, facing);
+        true
+    }
+
     // --- Common survival (leaf, stem, chorus). ---
 
     pub(crate) fn plant_rule_survives(&self, s: u32, p: P) -> bool {
