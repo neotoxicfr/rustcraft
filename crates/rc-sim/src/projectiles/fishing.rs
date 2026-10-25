@@ -334,7 +334,8 @@ impl Server {
 
     fn hook_hit_block(&mut self, h: &mut Hook, b: BlockHit) {
         let mut tmp = h.p.clone();
-        self.block_projectile_hit(&mut tmp, b);
+        // The hook is not in the impact tag: it breaks neither pots nor chorus.
+        self.block_projectile_hit_as(&mut tmp, b, false);
         let v = h.p.vel;
         let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
         // The game takes the SQUARE of the distance to the point touched (flaw reproduced).

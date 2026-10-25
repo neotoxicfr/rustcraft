@@ -544,10 +544,19 @@ impl Server {
             for y in lo[1]..=hi[1] {
                 for z in lo[2]..=hi[2] {
                     let st = self.st([x, y, z]);
-                    // Arrows: wooden buttons pressed (shape re-cut tested by the button).
-                    if arrow && matches!(self.v().kind(st), crate::blocks::Kind::Button { arrows: true, .. }) {
-                        self.button_arrow_inside([x, y, z], p);
-                        continue;
+                    match self.v().kind(st) {
+                        // Arrows: wooden buttons pressed (shape re-cut tested by the button).
+                        crate::blocks::Kind::Button { arrows: true, .. } if arrow => {
+                            self.button_arrow_inside([x, y, z], p);
+                            continue;
+                        }
+                        // Any projectile: released plate tested (it counts for plates that react
+                        // to any entity and for weighted plates).
+                        crate::blocks::Kind::Plate { .. } | crate::blocks::Kind::WeightedPlate { .. } => {
+                            self.plate_proj_inside([x, y, z], st, p);
+                            continue;
+                        }
+                        _ => {}
                     }
                     let n = self.state_name(st);
                     match n {
