@@ -168,6 +168,89 @@ fn landing_breathes_toward_the_egg() {
     assert!(far[0].1[1] < 0.0 && far[0].1[1] > want / 2.0, "{:?}", far[0].1);
 }
 
+/// Dragon spawned with a given body yaw and head yaw, in the given phase.
+fn dragon_turned(phase: i32, yaw: f32, head_yaw: f32) -> Entities {
+    let mut all = Entities { type_names: vec!["minecraft:ender_dragon".into()], ..Default::default() };
+    let add = rc_proto_v777::entity::AddEntity {
+        id: 7,
+        uuid: 1,
+        kind: 0,
+        pos: [0.5, 64.0, 0.5],
+        velocity: [0.0; 3],
+        pitch: 0.0,
+        yaw,
+        head_yaw,
+        data: 0,
+    };
+    all.apply(rc_client::EntityEvent::Add(Box::new(add)));
+    all.map.get_mut(&7).unwrap().meta.insert(16, Meta::Int(phase));
+    all
+}
+
+/// Sitting flames of a turned dragon (body at 90°, spawn-packet head at 0), sloped flight
+/// history, yaw that changes during the emission tick. Compared draw for draw with a
+/// reference dragon (zero yaw, level flight, same seed):
+/// - head at the previous tick: previous yaw (90°) → 6.5 × cos(tilt) towards +x, z unchanged;
+///   tilt = (y from 6 ticks ago − y from 11 ticks ago) × 10°;
+/// - gaze along the frozen head yaw (0, towards −z), neither the body nor a later head packet.
+#[test]
+fn turned_dragon_breathes_along_its_spawn_head_yaw() {
+    let run = |turned: bool| {
+        let mut r = WorldRandom::default();
+        let mut all = if turned { dragon_turned(5, 90.0, 0.0) } else { dragon_turned(5, 0.0, 0.0) };
+        step(&mut all, &mut r, 0);
+        if turned {
+            // Head packet received: never applied to the dragon's gaze.
+            all.apply(rc_client::EntityEvent::Head { id: 7, yaw: 90.0 });
+            let e = all.map.get_mut(&7).unwrap();
+            // After the next tick's advance, the sample from m ticks ago is 64 − 0.2 m.
+            let h = e.extra[0] as usize;
+            for k in 0..64 {
+                e.history[(h + 64 - k) & 63][0] = 64.0 - 0.2 * (k + 1) as f64;
+            }
+        }
+        all.tick();
+        let e = all.map.get_mut(&7).unwrap();
+        if turned {
+            // The yaw went from 90° to 120° during this tick: previous 90°, current 120°.
+            assert_eq!(e.yaw_o, 90.0);
+            e.yaw = 120.0;
+        }
+        let mut out = Vec::new();
+        client_fx(e, &mut r, &mut || 0, &mut |f| out.push(f));
+        particles(&out, PKind::DragonBreath)
+    };
+    let (base, turned) = (run(false), run(true));
+    assert_eq!((base.len(), turned.len()), (48, 48));
+    let tilt = (1.0f64).to_radians() * 10.0;
+    // Reference: head at (0.5; 63.5; 0.5 − 6.5); turned dragon: (0.5 + 6.5 cos; 63.5 + 6.5 sin; 0.5).
+    let shift = [6.5 * tilt.cos(), 6.5 * tilt.sin(), 6.5];
+    let s45 = std::f64::consts::FRAC_1_SQRT_2;
+    let (f08, f06) = (f64::from(0.08f32), f64::from(0.6f32));
+    for (i, ((pb, _), (pt, vt))) in base.iter().zip(&turned).enumerate() {
+        assert!((0..3).all(|k| (pt[k] - pb[k] - shift[k]).abs() < 1e-3), "head {i} {pt:?} {pb:?}");
+        let j = (i % 6) as f64;
+        let want = [0.0, -s45 * f06, -s45 * f08 * j];
+        assert!((0..3).all(|k| (vt[k] - want[k]).abs() < 1e-4), "gaze {i} {vt:?} {want:?}");
+    }
+}
+
+/// Landing of a turned dragon (body at 90°, spawn head at 0): breath towards −z.
+#[test]
+fn turned_dragon_lands_along_its_spawn_head_yaw() {
+    let mut r = WorldRandom::default();
+    let mut all = dragon_turned(3, 90.0, 0.0);
+    let b = particles(&step(&mut all, &mut r, 63), PKind::DragonBreath);
+    assert_eq!(b.len(), 8);
+    let v = b[0].1;
+    let want = -std::f64::consts::FRAC_1_SQRT_2 * f64::from(0.08f32);
+    assert!(v[0].abs() < 1e-6 && (v[2] - want).abs() < 1e-4, "{v:?}");
+    // Reverse: body at 0, spawn head at 90°: breath towards +x (gaze towards −x).
+    let mut all = dragon_turned(3, 0.0, 90.0);
+    let v = particles(&step(&mut all, &mut r, 63), PKind::DragonBreath)[0].1;
+    assert!((v[0] + want).abs() < 1e-4 && v[2].abs() < 1e-6, "{v:?}");
+}
+
 /// Creaking tearing itself down (value 18): eyes lit on the first death tick, off on the
 /// next, then stay off 2 to 8 ticks (+ 1) and lit t/4 to t/2 ticks (+ 1); no death
 /// tilt and no red overlay. Without value 18: eyes = active (value 17), tilt and overlay.

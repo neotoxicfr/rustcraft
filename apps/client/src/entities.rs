@@ -1317,6 +1317,10 @@ impl Entities {
                     crate::entity_render::shulker_teleported(e, p);
                     e.pos_o = e.pos;
                 }
+                // Dragon: head yaw of the spawn packet, kept for the aim of the breaths.
+                if let Some(e) = self.map.get_mut(&a.id) {
+                    crate::entity_render::dragon_spawned(e);
+                }
             }
             EntityEvent::Remove(ids) => {
                 for id in ids {
