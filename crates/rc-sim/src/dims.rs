@@ -599,6 +599,7 @@ impl Server {
             self.close_menu(true);
         }
         let old_pos = self.pos;
+        self.inside_forget_player(); // G5-F02a: no sweep from one world to the other
         self.enter_world(&t.dim);
         self.forget_world_entities(&from);
         if t.missing_respawn {

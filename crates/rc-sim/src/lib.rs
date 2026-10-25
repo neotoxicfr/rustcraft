@@ -48,6 +48,7 @@ pub mod netstack;
 pub mod recipes;
 pub mod rng;
 pub mod vitals;
+pub(crate) mod inside_blocks; // G5-F02a: shared crossed-block pass
 pub mod weather;
 pub mod tickrate;
 // Mobs (S4).

@@ -44,6 +44,8 @@ mod g6f01_tests;
 #[cfg(test)]
 mod g5f09_tests;
 #[cfg(test)]
+mod g5f02a_tests;
+#[cfg(test)]
 mod g4f10_tests;
 #[cfg(test)]
 mod g6f10_tests;

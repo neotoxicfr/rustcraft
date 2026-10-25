@@ -338,6 +338,7 @@ impl Server {
         if self.life.vit.fire < t {
             self.life.vit.fire = t;
         }
+        self.life.vit.ticks_frozen = 0; // ignition always clears freezing
     }
 
     /// Damage type in a tag (`tags/damage_type`).
@@ -914,6 +915,7 @@ impl Server {
             }
             self.send_health();
             self.criteria_tick();
+            self.inside_forget_player();
             return;
         }
         let peaceful = self.level.difficulty_id() == 0;
@@ -986,6 +988,8 @@ impl Server {
         }
         if self.game_mode != 3 {
             self.environment_damage();
+        } else {
+            self.inside_forget_player(); // spectator: no crossed block
         }
         self.effects_tick(); // S7
         self.use_item_tick();
@@ -1007,13 +1011,10 @@ impl Server {
         // Same rule as the turtle helmet and mining: fluid height compared to the eye.
         let eye_water = self.eye_in_water();
         let invul = self.abilities().invulnerable;
-        let in_water = feet_block == "minecraft:water" || eye_water;
         let in_lava = feet_block == "minecraft:lava";
-        // Game order: entity fire (water that extinguishes first), lava that cushions the fall,
-        // void; then suffocation and drowning; finally the blocks crossed (lava, fire).
-        if in_water {
-            self.life.vit.fire = self.life.vit.fire.min(0);
-        }
+        // Game order: entity fire, lava that cushions the fall, void; then suffocation and
+        // drowning; finally the crossed-block pass (water puts out there, lava and fire ignite
+        // there) and freezing.
         if self.life.vit.fire > 0 {
             if self.life.vit.fire % 20 == 0 && !in_lava {
                 self.hurt("minecraft:on_fire", 1.0);
@@ -1052,47 +1053,29 @@ impl Server {
             self.life.vit.air = (self.life.vit.air + 4).min(300);
         }
         self.send_air();
-        // Blocks crossed.
-        if in_lava {
-            // Ignition by lava (15 s) then lava damage.
-            self.player_ignite(300);
-            if self.hurt("minecraft:lava", 4.0) {
-                let pitch = 2.0 + self.life.rng.next_float() * 0.4;
-                self.play_sound("minecraft:entity.generic.burn", 7, self.pos, 0.4, pitch);
-            }
-        } else if feet_block == "minecraft:fire" || feet_block == "minecraft:soul_fire" {
-            if self.life.vit.fire <= 0 {
-                self.player_ignite(160);
-            } else {
-                self.life.vit.fire += 1;
-            }
-            self.hurt("minecraft:in_fire", 1.0);
-        }
-        self.player_freezing();
+        // Crossed blocks (fire, cactus, campfire, powder snow, water, lava, rain).
+        let inside = self.inside_blocks(&mut crate::inside_blocks::Who::Player);
+        self.player_freezing(inside.in_powder_snow);
         let burning = self.life.vit.fire > 0 && !invul;
         // S7: shared flags (fire, invisibility, glowing) sent if they change.
         self.life.vit.on_fire_sent = burning;
         self.send_shared_flags(burning);
     }
 
-    /// Player freezing (like the mobs): +1 per tick in powder snow up to 140,
-    /// −2 otherwise or if it cannot freeze (spectator, leather armor); 1 freeze damage every
-    /// 40 ticks once frozen; counter sent to the client (data 7: frost overlay).
-    fn player_freezing(&mut self) {
-        const REQUIRED: i32 = 140;
-        let in_snow = self.ent_bbox(crate::mobs::mob::Ent::Player).is_some_and(|b| {
-            let lo = b.min.map(|v| (v + 1.0e-5).floor() as i32);
-            let hi = b.max.map(|v| (v - 1.0e-5).floor() as i32);
-            (lo[0]..=hi[0]).any(|x| {
-                (lo[1]..=hi[1]).any(|y| (lo[2]..=hi[2]).any(|z| self.bname([x, y, z]) == "minecraft:powder_snow"))
-            })
-        });
-        let can_freeze = self.game_mode != 3
-            && !self.slots[5..=8].iter().flatten().any(|s| self.item_tag(&s.id, "minecraft:freeze_immune_wearables"));
+    /// Can freeze: neither a spectator nor wearing an armor piece in `#freeze_immune_wearables`.
+    pub(crate) fn player_can_freeze(&self) -> bool {
+        self.game_mode != 3
+            && !self.slots[5..=8].iter().flatten().any(|s| self.item_tag(&s.id, "minecraft:freeze_immune_wearables"))
+    }
+
+    /// Player freezing (like the mobs), after the crossed-block pass, which adds 1 per tick in
+    /// powder snow (up to 140): −2 outside snow or if it cannot freeze;
+    /// 1 freeze damage every 40 ticks once frozen; counter sent to the client (data 7: frost
+    /// overlay).
+    fn player_freezing(&mut self, in_snow: bool) {
+        const REQUIRED: i32 = crate::inside_blocks::FREEZE_REQUIRED;
+        let can_freeze = self.player_can_freeze();
         let v = &mut self.life.vit;
-        if in_snow && can_freeze {
-            v.ticks_frozen = (v.ticks_frozen + 1).min(REQUIRED);
-        }
         if !in_snow || !can_freeze {
             v.ticks_frozen = (v.ticks_frozen - 2).max(0);
         }

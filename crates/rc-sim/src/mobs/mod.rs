@@ -156,6 +156,8 @@ pub struct Mobs {
     /// Imposed Halloween day (tests, bench: `Server::halloween_override`); `None`: system
     /// local date, like the game.
     pub halloween: Option<bool>,
+    /// Buffers of the crossed-block pass (player and mobs).
+    pub(crate) inside: crate::inside_blocks::Scratch,
 }
 
 impl Default for Mobs {
@@ -198,6 +200,7 @@ impl Default for Mobs {
             wither: wither::WitherWorld::default(),
             bells: Vec::new(),
             halloween: Server::halloween_override(),
+            inside: Default::default(),
         }
     }
 }

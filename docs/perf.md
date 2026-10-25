@@ -2433,3 +2433,15 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   walk of the order of 3.65 ms for 12,000 files (G1-F15 measurement), kept for safety.
 - Free disk space (`rc_sim::storage::low_disk_space`): one system call at opening, on
   the main thread; not measured separately (negligible).
+
+## G5-F02a: crossed-block pass of players and mobs (25/10, loaded machine)
+
+- Crossed-block pass (`rc_sim::inside_blocks`, player and mobs, every tick): bench
+  `g5f02a_bench` (loaded machine, 2 runs, 200,000 passes): standing cow 96 to 101 ns,
+  walking (0.2/tick) 201 to 208 ns; the old name-based "powder snow" scan that it
+  replaces cost 31 to 32 ns (the pass also covers fire, cactus, campfire, water, lava, rain).
+  Leads: state record read directly instead of the view (2 Arc): 106 -> 96..101 ns, kept;
+  reused buffers (no allocation in steady state); the hash set of the traversal replaced
+  by a list (a few dozen cells); rain tested only if the entity is burning. Multi-core
+  and GPU not applicable (work of the order of 0.1 µs per entity, sequential effects). To
+  re-measure on a quiet machine on the scenes with mobs.

@@ -966,9 +966,8 @@ impl Server {
                     Ent::Mob(id) => {
                         if let Some(i) = self.mob_index(id)
                             && let Some(o) = self.mobs.list[i].as_mut()
-                            && o.fire < ticks
                         {
-                            o.fire = ticks;
+                            crate::inside_blocks::mob_ignite(o, ticks);
                         }
                     }
                 }
@@ -1221,8 +1220,8 @@ impl Server {
             // in progress), Bane of Arthropods slowness.
             if let Some(w) = &weapon {
                 let ticks = 80 * self.life.items.enchantment(w, "minecraft:fire_aspect");
-                if ticks > 0 && m.fire < ticks {
-                    m.fire = ticks;
+                if ticks > 0 {
+                    crate::inside_blocks::mob_ignite(m, ticks);
                 }
             }
             self.bane_slowness(weapon.as_ref(), m);

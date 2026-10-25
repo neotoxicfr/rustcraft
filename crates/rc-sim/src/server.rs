@@ -1018,6 +1018,7 @@ impl Server {
             Input::Move { pos, rot, on_ground } => {
                 let (before, was) = (self.pos, self.on_ground);
                 self.on_move(pos, rot, on_ground);
+                self.inside_record_player(before); // G5-F02a: read back by the crossed-block pass
                 self.after_move(before, was); // S2: fall, exhaustion
                 self.progress_after_move(before, was); // S9: statistics, blocks crossed
                 self.rec_player_moved(before); // F14: step vibrations, shrieker

@@ -431,12 +431,7 @@ impl Server {
     pub(crate) fn mob_thunder_hit_default(&mut self, m: &mut Mob) {
         m.fire += 1;
         if m.fire == 0 {
-            let k = m.attrs.by_name("minecraft:burning_time").map_or(1.0, |a| a.value());
-            let t = (160.0 * k).ceil() as i32;
-            if m.fire < t {
-                m.fire = t;
-            }
-            m.ticks_frozen = 0;
+            crate::inside_blocks::mob_ignite(m, 160);
         }
         self.mob_hurt(m, "minecraft:lightning_bolt", 5.0, None, None);
     }

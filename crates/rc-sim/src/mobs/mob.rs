@@ -377,6 +377,8 @@ pub struct Mob {
     pub next_step: f32,
     pub needs_sync: bool,
     pub removed: bool,
+    /// Movements of the tick, read back by the crossed-block pass.
+    pub(crate) inside: crate::inside_blocks::Moves,
     // Living entity.
     pub attrs: Attrs,
     pub health: f32,
@@ -566,6 +568,7 @@ impl Mob {
             next_step: 1.0,
             needs_sync: false,
             removed: false,
+            inside: Default::default(),
             attrs,
             health: i.health as f32,
             hurt_time: 0,

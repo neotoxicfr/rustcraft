@@ -29,7 +29,9 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// behaviors fixed; series 2: raids.dat and the dragon fight in the fingerprint), identical
 /// values with all optimization switches at 0. G5-F03: initial fire of the mobs
 /// at 0 (not −1) in the three fingerprints, the only cause of the change (checked by restoring it).
-const EXPECTED_NEW: (&str, usize) = ("58ef8be0fcc17b8e20c942cf052a4560ac42ccc3a894072f72453b78e0f668d0", 815);
+/// G5-F02a: resting fire of the player at −20 after each crossed-block pass (saved in
+/// `Fire`), the only cause of the change of the new world (checked by disabling that reset alone).
+const EXPECTED_NEW: (&str, usize) = ("6ffe4a73eb6e06a2fdfd16dd0cae06ad20e5c6a08bf649880115394efbf8e960", 815);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 const EXPECTED_MODEL: &[(&str, &str, usize)] = &[(
     "790b2d94653a4243e68f2e0cb0ebc3f865f9f59815ed65149067cdd374c6b800",
