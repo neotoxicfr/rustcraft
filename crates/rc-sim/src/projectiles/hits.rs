@@ -1375,7 +1375,8 @@ impl Server {
                 let by = Some(crate::mobs::recent::vibration::Src::Projectile(self.proj_owner(p)));
                 self.destroy_block_by(b.pos, true, 512, by);
             }
-            "pointed_dripstone"
+            // Rule shared by both speleothems (dripstone and sulfur spikes).
+            "pointed_dripstone" | "sulfur_spike"
                 if p.kind == PKind::Trident
                     && griefing_ok
                     && self.proj_may_break(p, impact, s)

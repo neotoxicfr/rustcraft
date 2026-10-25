@@ -100,13 +100,32 @@ fn impact_break_needs_tag_rule_and_adventure_rights() {
     assert!(!broken(proj(&w, PKind::EnderPearl, "minecraft:ender_pearl"), &mut w, pot), "pearl outside the tag");
     assert!(!broken(proj(&w, PKind::SplashPotion, "minecraft:splash_potion"), &mut w, pot), "potion outside the tag");
     assert!(!broken(proj(&w, PKind::ShulkerBullet, "minecraft:air"), &mut w, chorus), "bullet outside the tag");
-    // Hook: snowball projectile reused, but outside the tag.
+    // Fast trident (> 0.6 block per tick): both speleothems break, a slow trident does not.
+    for spike in ["minecraft:pointed_dripstone", "minecraft:sulfur_spike"] {
+        let mut t = proj(&w, PKind::Trident, "minecraft:trident");
+        t.vel = [0.0, -2.5, 0.0];
+        assert!(broken(t, &mut w, spike), "fast trident: {spike} broken");
+        let mut t = proj(&w, PKind::Trident, "minecraft:trident");
+        t.vel = [0.0, -0.5, 0.0];
+        assert!(!broken(t, &mut w, spike), "slow trident: {spike} intact");
+    }
+
+    // Hook: a real rod cast straight down onto a pot (snowball projectile reused, but outside
+    // the impact tag).
     let at = [4, Y, 4];
     w.set(at, pot);
-    let mut hook = proj(&w, PKind::Snowball, "minecraft:fishing_rod");
-    let hit = BlockHit { loc: [4.5, f64::from(Y) + 1.0, 4.5], pos: at, face: 1, inside: false, border: false };
-    w.p.s.block_projectile_hit_as(&mut hook, hit, false);
+    let _ = w.events();
+    w.p.s.pos = [4.5, f64::from(Y) + 2.0, 3.9];
+    (w.p.s.yaw, w.p.s.pitch) = (0.0, 89.0);
+    w.p.s.slots[36 + w.p.s.held as usize] = stack("minecraft:fishing_rod", 1);
+    assert!(w.p.s.fishing_rod_use(0), "rod cast");
+    let mut evs = Vec::new();
+    game_ticks(&mut w, 10, &mut evs);
+    let h = w.p.s.proj.hook.as_ref().expect("hook still there");
+    assert!(h.p.pos[1] < f64::from(Y) + 1.2, "hook resting on the pot: {:?}", h.p.pos);
     assert!(!w.p.s.is_air(at), "hook: pot intact");
+    w.p.s.proj.hook = None;
+    w.p.s.slots[36 + w.p.s.held as usize] = None;
     w.set(at, "minecraft:air");
 
     // Rule off: nothing breaks any more.
