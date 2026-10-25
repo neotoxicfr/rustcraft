@@ -261,6 +261,8 @@ pub struct Proj {
     pub fire: i32,
     pub in_water: bool,
     pub first_tick: bool,
+    /// Added during a mob's tick: first tick on the next server tick.
+    pub wait: bool,
     pub on_ground: bool,
     pub horizontal_collision: bool,
     pub no_gravity: bool,
@@ -424,6 +426,7 @@ impl Proj {
             fire: 0,
             in_water: false,
             first_tick: true,
+            wait: false,
             on_ground: false,
             horizontal_collision: false,
             no_gravity: false,
@@ -597,6 +600,9 @@ impl Server {
     /// Addition to the world: the player is paired at once.
     pub(crate) fn proj_add(&mut self, mut p: Proj) {
         p.sync_arrow_flags();
+        // The entity walk does not see what is added to it along the way: a projectile launched
+        // by a mob during its tick makes its first tick on the next server tick.
+        p.wait = !self.mobs.ticking.is_empty();
         if self.proj_visible(&p) {
             self.proj_pair(&mut p);
         }
@@ -782,6 +788,9 @@ impl Server {
             self.proj_list_tick();
             self.clouds_tick();
             self.fishing_tick();
+        } else {
+            // Frozen: on thaw, everything ticks from the first tick.
+            self.proj.list.iter_mut().for_each(|p| p.wait = false);
         }
         self.proj_player_touch();
         self.spin_attack_tick();
@@ -828,7 +837,11 @@ impl Server {
         // at the end and wait for the next tick.
         let n = self.proj.list.len();
         for i in 0..n {
-            let Some(slot) = self.proj.list.get(i) else { break };
+            let Some(slot) = self.proj.list.get_mut(i) else { break };
+            if std::mem::take(&mut slot.wait) {
+                continue;
+            }
+            let slot = &self.proj.list[i];
             if slot.removed || !self.proj_chunk_ready(slot) {
                 continue;
             }

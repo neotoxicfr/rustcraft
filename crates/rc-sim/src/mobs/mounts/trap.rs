@@ -30,6 +30,8 @@ pub struct Bolt {
     /// Cells set on fire and entities struck.
     fires: i32,
     hit: Vec<Ent>,
+    /// Born during a mob's tick (skeleton horse trap): first tick on the next server tick.
+    pub(crate) wait: bool,
 }
 
 impl Server {
@@ -166,7 +168,8 @@ impl Server {
             data: 0,
         };
         let _ = self.send(Event::Entity(EntityEvent::Add(Box::new(add))));
-        self.mobs.mounts.bolts.push(Bolt { id, uuid, life: 2, flashes, rng, pos, visual, cause, fires: 0, hit: Vec::new() });
+        let wait = !self.mobs.ticking.is_empty();
+        self.mobs.mounts.bolts.push(Bolt { id, uuid, life: 2, flashes, rng, pos, visual, cause, fires: 0, hit: Vec::new(), wait });
     }
 
     /// Life of the lightning bolts: at the first tick fire (normal and hard),
@@ -176,6 +179,10 @@ impl Server {
         let mut bolts = std::mem::take(&mut self.mobs.mounts.bolts);
         let mut gone = Vec::new();
         for b in &mut bolts {
+            // Added during this tick's entity walk: it waits for the next one.
+            if std::mem::take(&mut b.wait) {
+                continue;
+            }
             if b.life == 2 {
                 if self.level.difficulty_id() >= 2 {
                     self.bolt_fire(b, 4);
@@ -687,6 +694,23 @@ mod w9_tests {
         step(&mut p, 2);
         assert_eq!(state_string(&p.s, p.s.get([205, -60, 205])), "minecraft:copper_block", "scraped copper");
         let _ = Ent::Player;
+        finish(p, dir);
+    }
+
+    /// Lightning bolt born during a mob's tick (skeleton horse trap): first tick on the next
+    /// server tick; born outside that walk (thunderstorm): right away.
+    #[test]
+    fn bolt_born_in_mob_tick_waits() {
+        let Some((mut p, dir)) = probe("g4f07b-bolt") else { return };
+        p.s.mobs.ticking.push((1, 1));
+        p.s.spawn_bolt([210.5, -59.0, 210.5]);
+        p.s.mobs.ticking.pop();
+        p.s.spawn_bolt([214.5, -59.0, 214.5]);
+        p.s.bolts_tick();
+        let life: Vec<i32> = p.s.mobs.mounts.bolts.iter().map(|b| b.life).collect();
+        assert_eq!(life, [2, 1], "the mob's bolt advanced on the tick of its birth");
+        p.s.bolts_tick();
+        assert_eq!(p.s.mobs.mounts.bolts[0].life, 1);
         finish(p, dir);
     }
 

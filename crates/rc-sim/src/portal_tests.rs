@@ -782,6 +782,7 @@ fn projectiles_and_dismount_respect_the_world_border() {
         removed: false,
         left_owner: true,
         tick: 0,
+        wait: false,
     };
     s.mobs.mounts.spits.push(spit);
     s.spits_tick();

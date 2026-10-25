@@ -135,12 +135,21 @@ fn carrot_on_a_stick_breaks() {
 }
 
 /// Dismounting a pig facing south: right cell (west) at the centre, otherwise the left one;
-/// a chicken follows the same rule.
+/// same rule for the chicken and the nautiluses (animals without a rule of their own). A spider
+/// or a ravager (not animals): top of the box.
 #[test]
 fn pig_dismounts_onto_neighbouring_cell() {
     let Some((mut p, dir)) = probe("g4f07b-dismount") else { return };
     let poses = [(0.6, 1.8), (0.6, 1.5), (0.6, 0.6)];
-    for k in [Kind::Pig, Kind::Chicken] {
+    for k in [Kind::Spider, Kind::Ravager] {
+        let id = bare(&mut p, k, [216.5, -59.0, 206.5]);
+        let v = p.s.mob_ref(id).cloned().unwrap();
+        let top = v.bbox().max[1];
+        assert_eq!(p.s.dismount_location(&v, 0.6, &poses), [216.5, top, 206.5], "{k:?}: top of the box");
+        let i = p.s.mob_index(id).unwrap();
+        p.s.mobs.list[i] = None;
+    }
+    for k in [Kind::Pig, Kind::Chicken, Kind::Nautilus, Kind::ZombieNautilus] {
         let id = bare(&mut p, k, [216.5, -59.0, 206.5]);
         let v = p.s.mob_ref(id).cloned().unwrap();
         assert_eq!(p.s.dismount_location(&v, 0.6, &poses), [215.5, -59.0, 206.5], "{k:?}: west cell");
@@ -165,6 +174,7 @@ fn spit(owner: i32, pos: [f64; 3], vel: [f64; 3], tick: i32) -> Spit {
         removed: false,
         left_owner: true,
         tick,
+        wait: false,
     }
 }
 
@@ -203,5 +213,93 @@ fn spit_exit_and_rotation() {
     assert!(!s.left_owner, "left the llama too early");
     assert!((s.yaw - 18.0).abs() < 1.0e-3, "rotation not smoothed: {}", s.yaw);
     assert_eq!(s.pitch, 0.0);
+    cleanup(p, dir);
+}
+
+/// Until the spit has left, neither the llama nor its passenger (a chicken sitting on it) is
+/// hit, even when its path crosses the passenger.
+#[test]
+fn spit_spares_the_llama_passenger() {
+    let Some((mut p, dir)) = probe("g4f07b-passenger") else { return };
+    let llama = bare(&mut p, Kind::Llama, [210.5, -59.0, 210.5]);
+    let hen = bare(&mut p, Kind::Chicken, [212.5, -59.0, 210.5]);
+    let (il, ih) = (p.s.mob_index(llama).unwrap(), p.s.mob_index(hen).unwrap());
+    let mut l = p.s.mobs.list[il].take().unwrap();
+    let mut h = p.s.mobs.list[ih].take().unwrap();
+    assert!(p.s.mob_start_riding(&mut h, &mut l, true), "chicken not mounted");
+    p.s.mobs.list[il] = Some(l);
+    p.s.mobs.list[ih] = Some(h);
+    let seat = mob(&p, hen).pos;
+    let (lmax, hmax) = (mob(&p, llama).health, mob(&p, hen).health);
+    let y = seat[1] + f64::from(mob(&p, hen).height()) / 2.0;
+    let mut s = spit(llama, [seat[0] - 1.0, y, seat[2]], [0.8, 0.0, 0.0], 5);
+    s.left_owner = false;
+    p.s.mobs.mounts.spits.push(s);
+    p.s.spits_tick();
+    assert!(!p.s.mobs.mounts.spits.first().expect("spit").left_owner, "left too early");
+    assert_eq!(mob(&p, hen).health, hmax, "llama passenger hit before the spit left");
+    assert_eq!(mob(&p, llama).health, lmax, "llama hit before the spit left");
+    cleanup(p, dir);
+}
+
+/// The target kept is the nearest by its entry point: a wide golem whose face is nearer than a
+/// chicken whose centre is nearer.
+#[test]
+fn spit_targets_nearest_at_entry() {
+    let Some((mut p, dir)) = probe("g4f07b-entry") else { return };
+    let llama = bare(&mut p, Kind::Llama, [205.5, -59.0, 220.5]);
+    let hen = bare(&mut p, Kind::Chicken, [212.0, -59.0, 210.5]);
+    let golem = bare(&mut p, Kind::IronGolem, [212.2, -59.0, 211.0]);
+    let (hmax, gmax) = (mob(&p, hen).health, mob(&p, golem).health);
+    p.s.mobs.mounts.spits.push(spit(llama, [210.0, -58.7, 210.5], [3.0, 0.0, 0.0], 0));
+    p.s.spits_tick();
+    assert!(mob(&p, golem).health < gmax, "golem (nearest entry) spared");
+    assert_eq!(mob(&p, hen).health, hmax, "chicken (nearest centre) hit");
+    cleanup(p, dir);
+}
+
+/// A spit, fangs or an arrow born during a mob's tick make their first tick on the next
+/// server tick; born outside that walk (command, player), right away.
+#[test]
+fn mob_projectiles_wait_for_the_next_tick() {
+    let Some((mut p, dir)) = probe("g4f07b-wait") else { return };
+    let llama = bare(&mut p, Kind::Llama, [205.5, -59.0, 205.5]);
+    let cow = bare(&mut p, Kind::Cow, [215.5, -59.0, 205.5]);
+    let i = p.s.mob_index(llama).unwrap();
+    let mut l = p.s.mobs.list[i].take().unwrap();
+    p.s.mobs.ticking.push((l.uuid, l.id));
+    p.s.llama_spit(&mut l, super::mob::Ent::Mob(cow));
+    let ammo = Stack { id: "minecraft:arrow".into(), count: 1, components: None };
+    let mut a = p.s.mob_create_arrow(&l, &ammo, None);
+    a.vel = [1.0, 0.0, 0.0];
+    let arrow = a.id;
+    p.s.proj_add(a);
+    p.s.create_fangs(&l, 208.5, 208.5, -60.0, -58.0, 0.0, 5);
+    p.s.mobs.ticking.pop();
+    p.s.mobs.list[i] = Some(l);
+    let start = p.s.mobs.mounts.spits[0].pos;
+    let apos = p.s.proj.list.iter().find(|x| x.id == arrow).expect("arrow").pos;
+    let warm = p.s.mobs.ill.fangs[0].warmup;
+    p.s.spits_tick();
+    p.s.fangs_tick();
+    p.s.projectiles_tick();
+    assert_eq!(p.s.mobs.mounts.spits[0].pos, start, "spit advanced on the tick of its birth");
+    assert_eq!(p.s.mobs.mounts.spits[0].tick, 0);
+    assert_eq!(p.s.proj.list.iter().find(|x| x.id == arrow).expect("arrow").pos, apos, "arrow advanced");
+    assert_eq!(p.s.mobs.ill.fangs[0].warmup, warm, "fangs advanced");
+    p.s.spits_tick();
+    p.s.fangs_tick();
+    p.s.projectiles_tick();
+    assert_ne!(p.s.mobs.mounts.spits[0].pos, start, "spit still on the next tick");
+    assert_eq!(p.s.mobs.mounts.spits[0].tick, 1);
+    assert_ne!(p.s.proj.list.iter().find(|x| x.id == arrow).expect("arrow").pos, apos, "arrow still");
+    assert_eq!(p.s.mobs.ill.fangs[0].warmup, warm - 1, "fangs still");
+    // Outside a mob's tick: first tick right away.
+    let mut b = p.s.new_arrow([210.5, -58.0, 215.5], &ammo, None);
+    b.vel = [1.0, 0.0, 0.0];
+    let (bid, bpos) = (b.id, b.pos);
+    p.s.proj_add(b);
+    p.s.projectiles_tick();
+    assert_ne!(p.s.proj.list.iter().find(|x| x.id == bid).expect("arrow").pos, bpos, "player's arrow kept waiting");
     cleanup(p, dir);
 }

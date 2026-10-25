@@ -2443,3 +2443,8 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   point replace the distance to the centre (same cost); the "llama and passengers" list is
   built only until the spit has left (a few ticks), then no allocation at all. No bench: a
   few spits in flight at most, nothing measurable per scene.
+- Rework (review): dismount chosen by species (horse family: sides; other animals, nautiluses
+  included: neighbouring cells; the rest: top of the box), cost unchanged (one species test per
+  dismount). Projectiles, spits, fangs and bolts born during a mob's tick: one boolean per
+  entity, read and reset on the next tick (no allocation; one extra walk only while the game is
+  frozen, to reset the flags).

@@ -24,6 +24,8 @@ pub struct Spit {
     pub removed: bool,
     pub left_owner: bool,
     pub tick: i32,
+    /// Born during a mob's tick: first tick on the next server tick.
+    pub wait: bool,
 }
 
 /// Mounts world: mounted player, spits in flight, visual lightning.
@@ -98,8 +100,20 @@ impl Server {
         }
         let v = v.map(|c| c * f64::from(1.5f32));
         let (yaw, pitch) = rot_of(v);
-        let s =
-            Spit { id, owner: m.id, pos: start, vel: v, yaw, pitch, rng, removed: false, left_owner: false, tick: 0 };
+        let wait = !self.mobs.ticking.is_empty();
+        let s = Spit {
+            id,
+            owner: m.id,
+            pos: start,
+            vel: v,
+            yaw,
+            pitch,
+            rng,
+            removed: false,
+            left_owner: false,
+            tick: 0,
+            wait,
+        };
         let add = AddEntity {
             id,
             uuid: (id as u128) << 64 | 0x4C00_0000_0000_0000,
@@ -122,6 +136,10 @@ impl Server {
     pub(crate) fn spits_tick(&mut self) {
         let mut spits = std::mem::take(&mut self.mobs.mounts.spits);
         for s in spits.iter_mut().filter(|s| !s.removed) {
+            // Added during this tick's entity walk: it waits for the next one.
+            if std::mem::take(&mut s.wait) {
+                continue;
+            }
             s.tick += 1;
             // Left the llama (shared projectile rule): the spit's box stretched by its speed and
             // inflated by 1 touches neither the llama nor its passengers any more.

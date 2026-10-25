@@ -315,8 +315,9 @@ impl Server {
 
     // ---------- Dismounting ----------
 
-    /// Dismount location (of the equine): side of the leading hand
-    /// first, then the other, otherwise the animal's position.
+    /// Dismount location according to the vehicle's species: own rule (strider, happy ghast),
+    /// sides of the equine (leading hand first, then the other, otherwise its position),
+    /// neighbouring cells for the other animals, top of the box for the rest.
     pub(crate) fn dismount_location(&self, v: &Mob, width: f32, poses: &[(f32, f32)]) -> [f64; 3] {
         // F12: the strider looks for a lava-free floor around the passenger's gaze.
         if v.kind == Kind::Strider {
@@ -326,17 +327,22 @@ impl Server {
         if let Some(p) = super::super::recent::happy_ghast::dismount_location(v) {
             return p;
         }
-        // Animals without a rule of their own (pig, chicken): cells around, following the facing direction.
-        if matches!(v.kind, Kind::Pig | Kind::Chicken) {
+        // Horse family (camels and llamas included): sides of the animal.
+        if handles(v.kind) {
+            for side in [90.0f32, -90.0] {
+                let dir = escape_vector(f64::from(v.width()), f64::from(width), v.yaw + side);
+                if let Some(p) = self.dismount_in_direction(v, dir, width, poses) {
+                    return p;
+                }
+            }
+            return v.pos;
+        }
+        // Other animals (pig, chicken, nautiluses…): cells around, following the facing direction.
+        if v.kind.is_animal() {
             return self.animal_dismount_location(v, poses);
         }
-        for side in [90.0f32, -90.0] {
-            let dir = escape_vector(f64::from(v.width()), f64::from(width), v.yaw + side);
-            if let Some(p) = self.dismount_in_direction(v, dir, width, poses) {
-                return p;
-            }
-        }
-        v.pos
+        // The rest (spider, ravager…): top of the box.
+        [v.pos[0], v.bbox().max[1], v.pos[2]]
     }
 
     /// Dismount from an animal: for each passenger pose, the eight neighbouring cells (right,

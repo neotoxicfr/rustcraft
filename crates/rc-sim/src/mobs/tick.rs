@@ -104,6 +104,12 @@ impl Server {
             self.end_world_tick(); // F15: crystals, breath, bullets
             self.spawner_blocks_tick(); // W9: spawners, trials, vaults (block entities, after the entities)
             self.player_pushes_mobs(); // player push: also stopped when frozen
+        } else {
+            // Frozen: what the player's mount created does not tick; on thaw, it ticks from the
+            // first tick, like the rest.
+            self.mobs.mounts.spits.iter_mut().for_each(|s| s.wait = false);
+            self.mobs.ill.fangs.iter_mut().for_each(|f| f.wait = false);
+            self.mobs.mounts.bolts.iter_mut().for_each(|b| b.wait = false);
         }
         self.cubes_player_touch();
         self.pufferfish_player_touch(); // F09
