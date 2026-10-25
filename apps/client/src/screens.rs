@@ -90,10 +90,14 @@ impl Rules for ItemRules<'_> {
     fn equip_slot(&self, s: &ItemStack) -> u8 {
         usize::try_from(s.item).ok().and_then(|i| self.infos.get(i)).map_or(0, |i| i.equip_slot)
     }
+    /// Fuel: the stack carries `cooking_fuel` (patch, else default not removed).
     fn is_fuel(&self, s: &ItemStack) -> bool {
-        let n = self.name(s);
-        matches!(n, "coal" | "charcoal" | "coal_block" | "lava_bucket" | "blaze_rod" | "stick" | "bucket" | "bamboo")
-            || ["_log", "_planks", "_wood", "_stem", "_sapling", "_slab", "_fence"].iter().any(|e| n.ends_with(e))
+        let Some(c) = self.ids.of("minecraft:cooking_fuel") else { return false };
+        let info = usize::try_from(s.item).ok().and_then(|i| self.infos.get(i));
+        s.component(c).is_some() || (!s.removed.contains(&c) && info.is_some_and(|i| i.components.contains(&c)))
+    }
+    fn is_bucket(&self, s: &ItemStack) -> bool {
+        self.name(s) == "bucket"
     }
     fn smeltable(&self, s: &ItemStack) -> bool {
         let n = self.name(s);
@@ -1049,6 +1053,30 @@ pub(crate) fn draw_tooltip_ex(
 #[cfg(test)]
 mod tooltip_tests {
     use super::{tooltip_height, tooltip_sprites};
+
+    /// Furnace prediction: fuel = the `cooking_fuel` component (wool yes, stone slab and nether
+    /// stem no); the empty bucket is only accepted by the slot.
+    #[test]
+    fn furnace_fuel_from_component() {
+        use crate::menu::Rules;
+        use rc_proto_v777::item::ItemStack;
+        let data = rc_testdata::version_data().expect("version data missing (extraction)");
+        let names = data.registry("minecraft:item").expect("item registry").entries.clone();
+        let ids = crate::stack::ComponentIds::new(&data);
+        let r = super::ItemRules { infos: &data.items, names: &names, ids: &ids, data: &data };
+        let st = |n: &str| {
+            let item = names.iter().position(|x| x == &format!("minecraft:{n}")).expect(n) as i32;
+            ItemStack { item, count: 1, added: Vec::new(), removed: Vec::new() }
+        };
+        for (n, fuel) in [("white_wool", true), ("oak_slab", true), ("stone_slab", false), ("crimson_stem", false)] {
+            assert_eq!(r.is_fuel(&st(n)), fuel, "{n}");
+        }
+        assert!(!r.is_fuel(&st("bucket")) && r.is_bucket(&st("bucket")));
+        // Component removed from the stack: no longer a fuel.
+        let mut coal = st("coal");
+        coal.removed.push(ids.of("minecraft:cooking_fuel").unwrap());
+        assert!(!r.is_fuel(&coal));
+    }
 
     #[test]
     fn heights_match_reference() {

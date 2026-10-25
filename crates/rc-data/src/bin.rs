@@ -10,7 +10,7 @@ use crate::{Error, Result};
 
 const MAGIC: &[u8; 8] = b"RCDATA\0\0";
 /// To increment at each change of the format or the extractor.
-pub const FORMAT: u32 = 33;
+pub const FORMAT: u32 = 34;
 
 struct W(Vec<u8>);
 
@@ -416,6 +416,8 @@ fn enc_item_use(w: &mut W, i: &crate::ItemInfo) {
     for &c in &i.components {
         w.u32(u32::from(c));
     }
+    w.u8(i.dye);
+    w.u32(u32::from(i.fuel));
 }
 
 fn dec_item_use(r: &mut R<'_>, i: &mut crate::ItemInfo) -> Result<()> {
@@ -487,6 +489,8 @@ fn dec_item_use(r: &mut R<'_>, i: &mut crate::ItemInfo) -> Result<()> {
     for _ in 0..n {
         i.components.push(r.u32()? as u16);
     }
+    i.dye = r.u8()?;
+    i.fuel = r.u32()? as u16;
     Ok(())
 }
 
