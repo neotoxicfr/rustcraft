@@ -1596,10 +1596,21 @@ impl Server {
         let slot = if hand == 0 { 36 + self.held as usize } else { 45 };
         let Some(mut s) = self.slots[slot].clone() else { return true };
         // W8c: an item without a consumable (shield raised for an hour) ends without effect.
-        if self.comp_json(&s, "minecraft:consumable").is_none() {
+        let Some(cons) = self.comp_json(&s, "minecraft:consumable") else {
             return true;
-        }
+        };
         if let Some((nutrition, sat, _)) = self.life.items.food(&s) {
+            // Food: the consumable's sound is broadcast to everyone (the eater included), neutral
+            // category, volume 1, triangular pitch around 1 (spread 0.4), before the burp.
+            let sound = match &cons["sound"] {
+                serde_json::Value::String(t) => Some(t.as_str()),
+                o => o["sound_id"].as_str(),
+            }
+            .unwrap_or("minecraft:entity.generic.eat")
+            .to_owned();
+            let rng = &mut self.life.rng;
+            let pitch = 1.0 + 0.4 * (rng.next_float() - rng.next_float());
+            self.play_sound(&sound, 6, self.pos, 1.0, pitch);
             let v = &mut self.life.vit;
             v.food = (v.food + nutrition).clamp(0, 20);
             v.saturation = (v.saturation + sat).clamp(0.0, v.food as f32);
