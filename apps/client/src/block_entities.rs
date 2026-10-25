@@ -226,8 +226,11 @@ pub struct Props {
     pub has_book: bool,
     /// Statue: 0 standing, 1 running, 2 sitting, 3 star.
     pub pose: u8,
-    /// Trial spawner waiting for players or active.
-    pub active: bool,
+    /// Trial spawner: spin speed of the mob (200 while waiting for players, 1000 when active,
+    /// 0 = spin frozen in every other state).
+    pub trial_spin: f64,
+    /// Ominous trial spawner and vault.
+    pub ominous: bool,
     pub dusted: u8,
     /// Bell: 0 floor, 1 ceiling, 2 wall, 3 between two walls.
     pub attachment: u8,
@@ -269,7 +272,14 @@ impl Props {
                         _ => 0,
                     }
                 }
-                "trial_spawner_state" => p.active = matches!(v, "waiting_for_players" | "active"),
+                "trial_spawner_state" => {
+                    p.trial_spin = match v {
+                        "waiting_for_players" => 200.0,
+                        "active" => 1000.0,
+                        _ => 0.0,
+                    }
+                }
+                "ominous" => p.ominous = v == "true",
                 "dusted" => p.dusted = v.parse().unwrap_or(0),
                 "attachment" => {
                     p.attachment = match v {
@@ -341,8 +351,9 @@ pub enum Data {
     Items(Vec<Option<Stack>>, bool),
     /// Brushable block: item and side hit.
     Brushable(Option<Stack>, Option<u8>),
-    /// Spawner: id of the display entity, player range, delay.
-    Spawner(Option<String>, i32, i32),
+    /// Spawner: id of the display entity, player range, delay, minimum delay (restored by
+    /// block event 1).
+    Spawner(Option<String>, i32, i32, i32),
     /// Trial spawner: entity, next spawn (game time).
     Trial(Option<String>, i64),
     /// Vault: displayed item.
@@ -402,6 +413,10 @@ pub struct Anim {
 /// Particle emitted by a block entity's tick: kind, position, velocity.
 pub type Emit = (crate::particles::Kind, [f64; 3], [f64; 3]);
 
+/// Local sound (blocks category) requested by a block entity tick: event, position,
+/// volume, pitch.
+pub type BeSound = (&'static str, [f64; 3], f32, f32);
+
 pub struct BlockEntity {
     pub kind: Kind,
     pub sub: u8,
@@ -443,6 +458,8 @@ struct Tables {
     items: HashMap<String, i32>,
     /// Noxious gas outlet above potent sulfur.
     gas: crate::particles::GasTables,
+    /// Note block (block events: note particle).
+    note_block: Option<u16>,
 }
 
 pub struct BlockEntities {
@@ -459,6 +476,8 @@ pub struct BlockEntities {
     /// Piston-moving blocks counted at the last tick (plus those created since): without them,
     /// physics looks for no piston shape.
     pub moving: usize,
+    /// Ambient sounds requested by the last tick (trial spawner, vault).
+    pub sounds: Vec<BeSound>,
 }
 
 /// What the tick of a moving block asks of the application.
@@ -522,12 +541,14 @@ impl BlockEntities {
                 conduit_frame: Vec::new(),
                 items,
                 gas: crate::particles::GasTables::new(&data),
+                note_block: data.blocks.iter().position(|b| b.name == "minecraft:note_block").map(|i| i as u16),
             },
             data,
             version: 0,
             heads: Vec::new(),
             tests: Default::default(),
             moving: 0,
+            sounds: Vec::new(),
         }
     }
 
@@ -799,8 +820,38 @@ impl BlockEntities {
             }
             Kind::DecoratedPot => e.anim.wobble = Some((game_time, if b1 == 0 { 7 } else { 10 })),
             Kind::EndGateway => e.anim.cooldown = 40,
+            // Mob spawned by the server: the client restarts from the minimum delay.
+            Kind::Spawner => {
+                if let Data::Spawner(_, _, delay, min) = &mut e.data {
+                    *delay = *min;
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Block event on a note block (client state at the position): note particle above the
+    /// block, tint = note / 24, for tunable instruments only. The sound comes from the server:
+    /// the client plays none itself.
+    pub fn note_particle(&self, state: u32, pos: [i32; 3]) -> Option<Emit> {
+        if Some(self.data.states.get(state as usize)?.block) != self.tables.note_block {
+            return None;
+        }
+        let (mut tunable, mut note) = (false, 0);
+        for (k, v) in self.data.state_properties(state) {
+            match k {
+                "instrument" => {
+                    tunable = !matches!(
+                        v,
+                        "zombie" | "skeleton" | "creeper" | "dragon" | "wither_skeleton" | "piglin" | "custom_head"
+                    )
+                }
+                "note" => note = v.parse::<i32>().unwrap_or(0),
+                _ => {}
+            }
+        }
+        let at = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 1.2, f64::from(pos[2]) + 0.5];
+        tunable.then_some((crate::particles::Kind::Note, at, [f64::from(note) / 24.0, 0.0, 0.0]))
     }
 
     fn stack(&self, n: &Nbt) -> Option<Stack> {
@@ -923,7 +974,8 @@ impl BlockEntities {
                     .map(str::to_owned);
                 let range = get(n, "RequiredPlayerRange").and_then(Nbt::as_i64).unwrap_or(16) as i32;
                 let delay = get(n, "Delay").and_then(Nbt::as_i64).unwrap_or(20) as i32;
-                Data::Spawner(id, range, delay)
+                let min = get(n, "MinSpawnDelay").and_then(Nbt::as_i64).unwrap_or(200) as i32;
+                Data::Spawner(id, range, delay, min)
             }
             Kind::TrialSpawner => {
                 let id = get(n, "spawn_data")
@@ -982,6 +1034,7 @@ impl BlockEntities {
     pub fn tick(&mut self, w: &TickWorld<'_>, out: &mut Vec<Emit>) {
         let tables = &self.tables;
         let data = &self.data;
+        let sounds = &mut self.sounds;
         let mut moving = 0;
         for map in self.chunks.values_mut() {
             for (pos, e) in map.iter_mut() {
@@ -989,9 +1042,19 @@ impl BlockEntities {
                     moving += 1;
                     continue;
                 }
+                if e.anim.seed == 0 {
+                    // Per-block visual randomness: two neighbouring spawners or vaults never
+                    // draw their particles and sounds on the same tick.
+                    e.anim.seed = pos_seed(*pos);
+                }
+                if e.kind == Kind::Spawner {
+                    spawner_tick(e, *pos, w, out);
+                    continue;
+                }
                 tick_one(e, *pos, w, tables, data);
                 if matches!(e.kind, Kind::Vault | Kind::TrialSpawner) {
                     emit_particles(e, *pos, w, data, out);
+                    ambient_sound(e, *pos, sounds);
                 } else if e.kind == Kind::Campfire {
                     campfire_particles(e, *pos, w, data, out);
                 } else if e.kind == Kind::PotentSulfur && w.game_time % 20 == 0 {
@@ -1133,27 +1196,14 @@ fn tick_one(e: &mut BlockEntity, pos: [i32; 3], w: &TickWorld<'_>, t: &Tables, d
             b[6] += (diff - b[6]) * 0.9;
             b[3] += b[6];
         }
-        Kind::Spawner => {
-            if let Data::Spawner(_, range, delay) = &mut e.data
-                && nearest(f64::from(*range)).is_some()
-            {
-                if *delay > 0 {
-                    *delay -= 1;
-                }
-                a.spin_o = a.spin;
-                a.spin = (a.spin + 1000.0 / (f64::from(*delay) + 200.0)) % 360.0;
-            } else {
-                a.spin_o = a.spin;
-            }
-        }
-        Kind::TrialSpawner => {
+        // Spin only while waiting for players (200) or active (1000); frozen otherwise.
+        Kind::TrialSpawner if e.props.trial_spin > 0.0 => {
             let next = match e.data {
                 Data::Trial(_, n) => n,
                 _ => 0,
             };
-            let v = if e.props.active && matches!(e.data, Data::Trial(..)) { 1000.0 } else { 200.0 };
             a.spin_o = a.spin;
-            a.spin = (a.spin + v / ((next - w.game_time).max(0) as f64 + 200.0)) % 360.0;
+            a.spin = (a.spin + e.props.trial_spin / ((next - w.game_time).max(0) as f64 + 200.0)) % 360.0;
         }
         Kind::Vault => {
             a.spin_o = a.spin;
@@ -1179,8 +1229,67 @@ fn tick_one(e: &mut BlockEntity, pos: [i32; 3], w: &TickWorld<'_>, t: &Tables, d
     }
 }
 
+/// Non-zero seed derived from the position (splitmix-style mixing).
+fn pos_seed(p: [i32; 3]) -> u64 {
+    let mut z = (p[0] as u32 as u64) ^ ((p[1] as u32 as u64) << 21) ^ ((p[2] as u32 as u64) << 42);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (z ^ (z >> 31)) | 1
+}
+
 fn next_f(seed: &mut u64) -> f64 {
     f64::from(next_int(seed, 1 << 24)) / f64::from(1 << 24)
+}
+
+/// Client tick of a mob spawner: with no player (non-spectator) strictly closer than the range,
+/// the spin freezes; with a player and a display mob, smoke and flame at the same point of the
+/// block, delay decremented, spin 1000 / (delay + 200); near but with no mob, nothing moves. On the
+/// client the spawner minecart has neither spawner data nor a display mob: as in the game, it emits
+/// no smoke or flame (nothing to do for it).
+fn spawner_tick(e: &mut BlockEntity, pos: [i32; 3], w: &TickWorld<'_>, out: &mut Vec<Emit>) {
+    use crate::particles::Kind as P;
+    let Data::Spawner(id, range, delay, _) = &mut e.data else { return };
+    let a = &mut e.anim;
+    let c = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
+    let r2 = f64::from(*range) * f64::from(*range);
+    let near = *range < 0 || w.players.iter().any(|p| (0..3).map(|i| (p[i] - c[i]).powi(2)).sum::<f64>() < r2);
+    if !near {
+        a.spin_o = a.spin;
+    } else if id.is_some() {
+        let p = [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])];
+        let at = [p[0] + next_f(&mut a.seed), p[1] + next_f(&mut a.seed), p[2] + next_f(&mut a.seed)];
+        out.push((P::Smoke, at, [0.0; 3]));
+        out.push((P::Flame, at, [0.0; 3]));
+        if *delay > 0 {
+            *delay -= 1;
+        }
+        a.spin_o = a.spin;
+        a.spin = (a.spin + 1000.0 / (f64::from(*delay) + 200.0)) % 360.0;
+    }
+}
+
+/// Local ambient sound: 2% per tick, volume 0.75-1, pitch 0.5-1.5, at the block centre.
+/// Vault: only with a displayed item; trial spawner: only while waiting for players or active,
+/// ominous variant according to the block state.
+fn ambient_sound(e: &mut BlockEntity, pos: [i32; 3], sounds: &mut Vec<BeSound>) {
+    let name = match e.kind {
+        Kind::Vault if matches!(e.data, Data::Vault(Some(_))) => "minecraft:block.vault.ambient",
+        Kind::TrialSpawner if e.props.trial_spin > 0.0 => {
+            if e.props.ominous {
+                "minecraft:block.trial_spawner.ambient_ominous"
+            } else {
+                "minecraft:block.trial_spawner.ambient"
+            }
+        }
+        _ => return,
+    };
+    let seed = &mut e.anim.seed;
+    if next_f(seed) as f32 <= 0.02 {
+        let volume = next_f(seed) as f32 * 0.25 + 0.75;
+        let pitch = next_f(seed) as f32 + 0.5;
+        let c = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
+        sounds.push((name, c, volume, pitch));
+    }
 }
 
 /// Particles emitted by the client tick of the vault and the trial spawner (states read
@@ -1624,6 +1733,132 @@ mod tests {
         bes.tick_pistons(&mut pistons);
         assert!(pistons.contains(&PistonTick::Finish([2, 64, 0], stone)), "{pistons:?}");
         assert!(pistons.contains(&PistonTick::Finish([1, 64, 0], head)), "{pistons:?}");
+    }
+
+    fn version() -> std::sync::Arc<VersionData> {
+        std::sync::Arc::new(rc_testdata::version_data().expect("version data missing (extraction)"))
+    }
+
+    /// A single block entity `name` at (5, 64, 5), state `s`, data `data`.
+    fn lone(bes: &mut BlockEntities, s: u32, name: &str, data: Data) {
+        let mut e = bes.create(s, carrier(name).unwrap());
+        e.data = data;
+        bes.chunks.clear();
+        bes.chunks.entry((0, 0)).or_default().insert([5, 64, 5], e);
+    }
+
+    fn tick_at(bes: &mut BlockEntities, s: u32, players: &[[f64; 3]], game_time: i64) -> Vec<Emit> {
+        let state = move |_: i32, _: i32, _: i32| s;
+        let w = TickWorld { state: &state, surface: &|_, _| 0, players, named: &[], game_time, min_y: -64 };
+        let mut out = Vec::new();
+        bes.tick(&w, &mut out);
+        out
+    }
+
+    /// G5-F16a: note block. Note particle above the block (tint note/24) for a tunable
+    /// instrument; nothing for a mob head or for any other block.
+    #[test]
+    fn note_block_event_spawns_note_particle() {
+        let d = version();
+        let bes = BlockEntities::new(d.clone());
+        let harp = state(&d, "minecraft:note_block", &[("instrument", "harp"), ("note", "12")]);
+        let zombie = state(&d, "minecraft:note_block", &[("instrument", "zombie"), ("note", "3")]);
+        let stone = state(&d, "minecraft:stone", &[]);
+        assert_eq!(
+            bes.note_particle(harp, [1, 0, 3]),
+            Some((crate::particles::Kind::Note, [1.5, 1.2, 3.5], [0.5, 0.0, 0.0]))
+        );
+        assert_eq!(bes.note_particle(zombie, [1, 2, 3]), None);
+        assert_eq!(bes.note_particle(stone, [1, 2, 3]), None);
+    }
+
+    /// G5-F16a: spawner. Player in range and a display mob: smoke and flame at the same point of
+    /// the block, delay decremented, spin 1000/(delay+200). Player at exactly the range: frozen.
+    /// Near but with no mob: nothing moves. Event 1: minimum delay.
+    #[test]
+    fn spawner_smoke_flame_and_spin() {
+        use crate::particles::Kind as P;
+        let d = version();
+        let mut bes = BlockEntities::new(d.clone());
+        let s = state(&d, "minecraft:spawner", &[]);
+        lone(&mut bes, s, "spawner", Data::Spawner(Some("minecraft:pig".into()), 16, 20, 200));
+        let out = tick_at(&mut bes, s, &[[5.5, 64.5, 10.5]], 0);
+        assert_eq!(out.len(), 2, "{out:?}");
+        let (k0, p0, v0) = out[0];
+        assert_eq!((k0, out[1].0, out[1].1, v0, out[1].2), (P::Smoke, P::Flame, p0, [0.0; 3], [0.0; 3]));
+        assert!((0..3).all(|i| p0[i] >= [5.0, 64.0, 5.0][i] && p0[i] < [6.0, 65.0, 6.0][i]), "{p0:?}");
+        let e = bes.get([5, 64, 5]).unwrap();
+        assert!(matches!(e.data, Data::Spawner(_, _, 19, _)));
+        assert_eq!((e.anim.spin_o, e.anim.spin), (0.0, 1000.0 / 219.0));
+        // Exactly 16 blocks from the centre: out of range (strict comparison).
+        assert!(tick_at(&mut bes, s, &[[5.5, 64.5, 21.5]], 1).is_empty());
+        let e = bes.get([5, 64, 5]).unwrap();
+        assert_eq!(e.anim.spin_o, e.anim.spin);
+        bes.on_event([5, 64, 5], 1, 0, 2);
+        assert!(matches!(bes.get([5, 64, 5]).unwrap().data, Data::Spawner(_, _, 200, _)));
+        // No mob: no particle and no spin update, even with a player nearby.
+        lone(&mut bes, s, "spawner", Data::Spawner(None, 16, 20, 200));
+        bes.chunks.get_mut(&(0, 0)).unwrap().get_mut(&[5, 64, 5]).unwrap().anim.spin = 5.0;
+        assert!(tick_at(&mut bes, s, &[[5.5, 64.5, 6.5]], 3).is_empty());
+        let e = bes.get([5, 64, 5]).unwrap();
+        assert_eq!((e.anim.spin_o, e.anim.spin), (0.0, 5.0));
+    }
+
+    /// G5-F16a: trial spawner. Spin 200 while waiting for players, 1000 when active, frozen
+    /// (spin and spin_o unchanged) in the other states.
+    #[test]
+    fn trial_spawner_spin_by_state() {
+        let d = version();
+        let mut bes = BlockEntities::new(d.clone());
+        let spin_after = |bes: &mut BlockEntities, st: &str| {
+            let s = state(&d, "minecraft:trial_spawner", &[("trial_spawner_state", st), ("ominous", "false")]);
+            lone(bes, s, "trial_spawner", Data::Trial(Some("minecraft:zombie".into()), 100));
+            bes.chunks.get_mut(&(0, 0)).unwrap().get_mut(&[5, 64, 5]).unwrap().anim.spin = 7.0;
+            tick_at(bes, s, &[], 50);
+            let a = &bes.get([5, 64, 5]).unwrap().anim;
+            (a.spin_o, a.spin)
+        };
+        assert_eq!(spin_after(&mut bes, "waiting_for_players"), (7.0, 7.0 + 200.0 / 250.0));
+        assert_eq!(spin_after(&mut bes, "active"), (7.0, 7.0 + 1000.0 / 250.0));
+        for st in ["inactive", "cooldown", "ejecting_reward", "waiting_for_reward_ejection"] {
+            assert_eq!(spin_after(&mut bes, st), (0.0, 7.0), "{st}");
+        }
+    }
+
+    /// G5-F16a: ambient sounds, 2% per tick (volume 0.75-1, pitch 0.5-1.5, block centre):
+    /// vault with a displayed item, trial spawner waiting or active (ominous variant); none
+    /// without an item or on cooldown.
+    #[test]
+    fn trial_spawner_and_vault_ambient_sounds() {
+        let d = version();
+        let mut bes = BlockEntities::new(d.clone());
+        let run = |bes: &mut BlockEntities, s: u32, name: &str, data: Data| {
+            lone(bes, s, name, data);
+            let mut all = Vec::new();
+            for t in 0..10_000 {
+                tick_at(bes, s, &[], t);
+                all.append(&mut bes.sounds);
+            }
+            all
+        };
+        let vault = state(&d, "minecraft:vault", &[("ominous", "false")]);
+        let item = Data::Vault(Some(Stack { item: 1, count: 1 }));
+        let got = run(&mut bes, vault, "vault", item);
+        assert!((120..=280).contains(&got.len()), "{}", got.len());
+        for &(n, p, v, h) in &got {
+            assert_eq!((n, p), ("minecraft:block.vault.ambient", [5.5, 64.5, 5.5]));
+            assert!((0.75..=1.0).contains(&v) && (0.5..=1.5).contains(&h), "{v} {h}");
+        }
+        assert!(run(&mut bes, vault, "vault", Data::Vault(None)).is_empty());
+        let omi = state(&d, "minecraft:trial_spawner", &[("trial_spawner_state", "waiting_for_players"), ("ominous", "true")]);
+        let got = run(&mut bes, omi, "trial_spawner", Data::Trial(None, 0));
+        assert!((120..=280).contains(&got.len()), "{}", got.len());
+        assert!(got.iter().all(|s| s.0 == "minecraft:block.trial_spawner.ambient_ominous"));
+        let act = state(&d, "minecraft:trial_spawner", &[("trial_spawner_state", "active"), ("ominous", "false")]);
+        let got = run(&mut bes, act, "trial_spawner", Data::Trial(None, 0));
+        assert!(!got.is_empty() && got.iter().all(|s| s.0 == "minecraft:block.trial_spawner.ambient"));
+        let cool = state(&d, "minecraft:trial_spawner", &[("trial_spawner_state", "cooldown")]);
+        assert!(run(&mut bes, cool, "trial_spawner", Data::Trial(None, 0)).is_empty());
     }
 
     #[test]
