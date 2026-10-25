@@ -677,10 +677,18 @@ impl Server {
 
     /// Absolute teleport (§ 4.1): next number, expected position.
     pub(crate) fn teleport_to(&mut self, pos: [f64; 3]) {
+        self.begin_teleport(pos);
+        self.send_teleport();
+    }
+
+    /// Server teleport of the player (every send): next id, position set and expected; like the
+    /// game, the tick's movements are forgotten and the old position is reset (the crossed-block
+    /// pass does not sweep the path).
+    pub(crate) fn begin_teleport(&mut self, pos: [f64; 3]) {
         self.teleport_id = if self.teleport_id == i32::MAX { 0 } else { self.teleport_id + 1 };
         self.pos = pos;
         self.teleport = Some((self.teleport_id, pos, self.tick));
-        self.send_teleport();
+        self.inside_forget_player();
     }
 
     pub(crate) fn send_teleport(&self) {

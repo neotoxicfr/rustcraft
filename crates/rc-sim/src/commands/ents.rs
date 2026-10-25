@@ -451,6 +451,7 @@ impl Server {
                 if let Some(m) = self.mobs.get_mut(i) {
                     m.pos = pos;
                     m.old = pos;
+                    m.inside.clear(); // like the game: nothing is swept until arrival
                     if let Some([y, p]) = rot {
                         m.yaw = y;
                         m.pitch = p;
@@ -527,9 +528,7 @@ impl Server {
             }
             self.yaw = fy;
             self.pitch = fp;
-            self.teleport_id = if self.teleport_id == i32::MAX { 0 } else { self.teleport_id + 1 };
-            self.pos = abs;
-            self.teleport = Some((self.teleport_id, abs, self.tick));
+            self.begin_teleport(abs);
             let _ = self.send(Event::Teleport(rc_proto_v777::play::PlayerPosition {
                 id: self.teleport_id,
                 pos: sent,

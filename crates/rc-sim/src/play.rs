@@ -501,9 +501,7 @@ impl Server {
     /// rotation, momentum kept), the expected position is the absolute one.
     pub(crate) fn teleport_up(&mut self, dy: f64) {
         use rc_proto_v777::play::relative as r;
-        self.teleport_id = if self.teleport_id == i32::MAX { 0 } else { self.teleport_id + 1 };
-        self.pos[1] += dy;
-        self.teleport = Some((self.teleport_id, self.pos, self.tick));
+        self.begin_teleport([self.pos[0], self.pos[1] + dy, self.pos[2]]);
         let all = r::X | r::Y | r::Z | r::YAW | r::PITCH | r::DELTA_X | r::DELTA_Y | r::DELTA_Z | r::ROTATE_DELTA;
         let _ = self.send(Event::Teleport(rc_proto_v777::play::PlayerPosition {
             id: self.teleport_id,

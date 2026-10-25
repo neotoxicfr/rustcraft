@@ -192,6 +192,151 @@ fn powder_snow_extinguishes_and_melts() {
     assert_eq!(w.name(b), "minecraft:powder_snow", "without mob_griefing: the snow stays");
 }
 
+/// Teleport of the player (absolute, relative, by command) out of the fire: like the game, the
+/// path is not swept, no "in fire" damage on the arrival tick.
+#[test]
+fn player_teleport_forgets_crossed_path() {
+    let mut w = world("g5f02a-ptp");
+    let at = [4, Y, 4];
+    w.set(at, "minecraft:fire");
+    for how in 0..3 {
+        player_at(&mut w, feet(at));
+        let _ = player_tick(&mut w);
+        assert_eq!(w.p.s.life.vit.health, 19.0, "in fire (case {how})");
+        w.p.s.life.vit.cooldown = 0;
+        w.p.s.life.vit.health = 20.0;
+        let far = feet([12, Y, 12]);
+        match how {
+            0 => w.p.s.teleport_to(far),
+            1 => w.p.s.send_relative_teleport(far, 0.0, 0.0, 0),
+            _ => w.p.s.command_teleport(crate::commands::ents::E::Player, far, [false; 3], None, [false; 2]),
+        }
+        w.p.s.teleport = None; // confirmation received
+        let _ = player_tick(&mut w);
+        assert_eq!(w.p.s.life.vit.health, 20.0, "teleported (case {how}): nothing swept");
+    }
+}
+
+/// `/tp` of a mob: its movements of the tick are forgotten (no ignition by the fire it left).
+#[test]
+fn mob_command_teleport_forgets_moves() {
+    use crate::inside_blocks::Who;
+    let mut w = world("g5f02a-mtp");
+    let at = [4, Y, 4];
+    w.set(at, "minecraft:fire");
+    let m = cow(&mut w, feet(at));
+    let id = m.id;
+    w.p.s.add_mob(m);
+    let m = w.p.s.mobs.get_mut(id).expect("cow in the list");
+    let from = m.pos;
+    m.pos[0] += 0.1;
+    m.inside.record(from, m.pos, [0.1, 0.0, 0.0]);
+    w.p.s.command_teleport(crate::commands::ents::E::Mob(id), feet([12, Y, 12]), [false; 3], None, [false; 2]);
+    let mut m = w.p.s.mobs.get_mut(id).expect("cow in the list").clone();
+    let _ = w.p.s.inside_blocks(&mut Who::Mob(&mut m));
+    assert_eq!(m.fire, 0, "teleported: the fire at the start is not swept");
+}
+
+/// Order of the cells within one step: when backing towards −x, the game starts from the max x
+/// edge; the cactus (x + 1) hurts before the campfire (x), which is then blocked by invulnerability.
+#[test]
+fn cells_follow_travel_direction() {
+    let mut w = world("g5f02a-order");
+    w.set([9, Y, 4], "minecraft:cactus");
+    w.set([8, Y, 4], "minecraft:campfire[lit=true]");
+    let before = [8.80, f64::from(Y), 4.5];
+    player_at(&mut w, before);
+    w.p.s.pos = [8.75, f64::from(Y), 4.5];
+    w.p.s.inside_record_player(before);
+    let _ = player_tick(&mut w);
+    assert_eq!(w.p.s.life.vit.health, 19.0, "a single hit (invulnerability)");
+    assert_eq!(w.p.s.life.vit.last_damage.as_ref().map(|d| d.0.as_str()), Some("minecraft:cactus"));
+
+    // Without a path: z in the outer loop, x inside; towards −x: start at the max x edge.
+    let at = rc_physics::Aabb { min: [0.2, 0.1, 0.2], max: [1.8, 0.9, 1.8] };
+    let mut seen = crate::inside_blocks::Seen::default();
+    let mut got = Vec::new();
+    crate::inside_blocks::each_cell_stepped([1.0, 0.0, 1.0], [1.0, 0.0, 1.0], &at, &mut seen, &mut |p, _| {
+        got.push(p);
+        true
+    });
+    assert_eq!(got, vec![[0, 0, 0], [1, 0, 0], [0, 0, 1], [1, 0, 1]]);
+    got.clear();
+    crate::inside_blocks::each_cell_stepped([1.0, 0.0, 1.0], [0.95, 0.0, 1.0], &at, &mut seen, &mut |p, _| {
+        got.push(p);
+        true
+    });
+    assert_eq!(got[..4], [[1, 0, 0], [1, 0, 1], [0, 0, 0], [0, 0, 1]], "towards −x: max x first, z inside");
+}
+
+/// Shared traversal (pass, ghasts, portals): the seen-cells mask returns exactly the same
+/// sequence (cell, step) as the list it replaces, over 3,000 random paths (boxes of 0.25 to
+/// 4 blocks, paths up to ±20 blocks, plus a few oversized paths), and the stored checksum
+/// of the sequence.
+#[test]
+fn seen_mask_matches_linear_list() {
+    use crate::inside_blocks::{Seen, each_cell_stepped};
+    let mut r = crate::mobs::jrand::JRand::new(5_020_001);
+    let (mut fast, mut slow) = (Seen::default(), Seen::linear());
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    let mut sum = 0u64;
+    let mut cells = 0usize;
+    for i in 0..3000 {
+        let reach = if i % 500 == 0 { 120.0 } else { 20.0 };
+        let mut v = || (f64::from(r.next_float()) - 0.5) * 2.0;
+        let from = [v() * 30.0, v() * 30.0, v() * 30.0];
+        let to: [f64; 3] = std::array::from_fn(|k| from[k] + v() * reach);
+        let half = [0.125 + v().abs() * 1.875, 0.125 + v().abs() * 1.875, 0.125 + v().abs() * 1.875];
+        let at = rc_physics::Aabb {
+            min: [to[0] - half[0], to[1], to[2] - half[2]],
+            max: [to[0] + half[0], to[1] + 2.0 * half[1], to[2] + half[2]],
+        };
+        a.clear();
+        b.clear();
+        each_cell_stepped(from, to, &at, &mut fast, &mut |p, s| {
+            a.push((p, s));
+            true
+        });
+        each_cell_stepped(from, to, &at, &mut slow, &mut |p, s| {
+            b.push((p, s));
+            true
+        });
+        assert_eq!(a, b, "path {i}: {from:?} -> {to:?}");
+        cells += a.len();
+        for &(p, s) in &a {
+            let h = (i64::from(p[0]) * 73_856_093) ^ (i64::from(p[1]) * 19_349_663) ^ (i64::from(p[2]) * 83_492_791);
+            sum = sum.wrapping_mul(31).wrapping_add(h as u64 ^ u64::from(s as u32));
+        }
+    }
+    assert!(cells > 100_000, "paths too short: {cells} cells");
+    assert_eq!((cells, sum), EXPECTED_SEEN_SUM, "sequence of cells changed");
+}
+
+/// Checksum of `seen_mask_matches_linear_list` (cells, sum), taken on the list.
+const EXPECTED_SEEN_SUM: (usize, u64) = (896_844, 17_753_366_349_638_366_043);
+
+/// Silent mob in lava: neither burn sound nor draw of its pitch (its own random
+/// stays one value ahead of that of the same non-silent mob).
+#[test]
+fn silent_mob_lava_keeps_its_rng() {
+    use crate::inside_blocks::Who;
+    let mut w = world("g5f02a-silent");
+    let at = [4, Y, 4];
+    w.set(at, "minecraft:lava");
+    let mut loud = cow(&mut w, feet(at));
+    let mut quiet = loud.clone();
+    quiet.x.silent = true;
+    let _ = w.p.s.inside_blocks(&mut Who::Mob(&mut loud));
+    let evs = w.events();
+    assert_eq!(w.sounds(&evs, "minecraft:entity.generic.burn"), 1, "burn sound (not silent)");
+    let _ = w.p.s.inside_blocks(&mut Who::Mob(&mut quiet));
+    let evs = w.events();
+    assert_eq!(w.sounds(&evs, "minecraft:entity.generic.burn"), 0, "silent: no sound");
+    assert_eq!(loud.health, quiet.health, "same lava damage");
+    let _ = quiet.rng.next_float();
+    assert_eq!(loud.rng.next_long(), quiet.rng.next_long(), "silent: one draw fewer");
+}
+
 /// Micro-bench (ignored by default): cost of a pass for a motionless mob and for a
 /// mob moving 0.2 per tick, compared with the old name-based "powder snow" sweep
 /// that it replaces. `cargo test --release -p rc-sim g5f02a_bench -- --ignored --nocapture`.
@@ -230,6 +375,29 @@ fn g5f02a_bench() {
     }
     let old_scan = t.elapsed().as_nanos() as f64 / f64::from(n);
     eprintln!("still pass {still:.0} ns, moving {moving:.0} ns; old snow sweep {old_scan:.0} ns");
+
+    // Traversal of a ghast (4 × 4 × 4): seen-cells mask against the list it replaces.
+    use crate::inside_blocks::{Seen, each_cell_stepped};
+    for travel in [[14.3, 6.1, -11.7], [5.0, 2.0, 6.0], [1.0, 0.0, 0.0], [0.2, 0.0, 0.0]] {
+        let from = [0.5, 70.0, 0.5];
+        let to: [f64; 3] = std::array::from_fn(|k| from[k] + travel[k]);
+        let at = rc_physics::Aabb { min: [to[0] - 2.0, to[1], to[2] - 2.0], max: [to[0] + 2.0, to[1] + 4.0, to[2] + 2.0] };
+        let mut per = [0.0f64; 2];
+        for (k, mut seen) in [Seen::default(), Seen::linear()].into_iter().enumerate() {
+            let reps = 2_000u32;
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                let mut n = 0u32;
+                each_cell_stepped(from, to, &at, &mut seen, &mut |p, _| {
+                    n += std::hint::black_box(p[0]) as u32 & 1;
+                    true
+                });
+                std::hint::black_box(n);
+            }
+            per[k] = t.elapsed().as_nanos() as f64 / f64::from(reps);
+        }
+        eprintln!("ghast {travel:?}: mask {:.0} ns, list {:.0} ns", per[0], per[1]);
+    }
 }
 
 /// Traversal: a one-block movement to the east numbers the arrival layer as step 1 and
@@ -237,7 +405,7 @@ fn g5f02a_bench() {
 #[test]
 fn stepped_traversal_numbers_layers() {
     let at = rc_physics::Aabb { min: [1.2, 0.1, 0.2], max: [1.8, 1.7, 0.8] };
-    let mut seen = Vec::new();
+    let mut seen = crate::inside_blocks::Seen::default();
     let mut got = Vec::new();
     crate::inside_blocks::each_cell_stepped([0.5, 0.1, 0.5], [1.5, 0.1, 0.5], &at, &mut seen, &mut |p, s| {
         got.push((p, s));

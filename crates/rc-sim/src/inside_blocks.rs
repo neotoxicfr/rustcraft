@@ -13,6 +13,7 @@
 //! Traversal (shared with ghast flight): cells of the box moved back (step 0), then the
 //! so-called "furthest" corner followed cell by cell, with the game's axis choice reproduced
 //! as is (for a vertical movement it takes a bottom corner), then the remaining arrival cells.
+//! Each group of cells is visited in the direction of the path (order of the direct damage).
 
 use rc_physics::Aabb;
 
@@ -38,11 +39,17 @@ fn cells(b: &Aabb) -> [i32; 6] {
     ]
 }
 
+/// Min and max bounds of a whole box given by any two corners.
+fn span(c: [i32; 6]) -> ([i32; 3], [i32; 3]) {
+    ([c[0].min(c[3]), c[1].min(c[4]), c[2].min(c[5])], [c[0].max(c[3]), c[1].max(c[4]), c[2].max(c[5])])
+}
+
+/// Cells of `c` without a path, in the game's order: z in the outer loop, then y, x inside.
 fn for_cells(c: [i32; 6], f: &mut dyn FnMut([i32; 3]) -> bool) -> bool {
-    let (lo, hi) = ([c[0].min(c[3]), c[1].min(c[4]), c[2].min(c[5])], [c[0].max(c[3]), c[1].max(c[4]), c[2].max(c[5])]);
-    for x in lo[0]..=hi[0] {
+    let (lo, hi) = span(c);
+    for z in lo[2]..=hi[2] {
         for y in lo[1]..=hi[1] {
-            for z in lo[2]..=hi[2] {
+            for x in lo[0]..=hi[0] {
                 if !f([x, y, z]) {
                     return false;
                 }
@@ -50,6 +57,92 @@ fn for_cells(c: [i32; 6], f: &mut dyn FnMut([i32; 3]) -> bool) -> bool {
         }
     }
     true
+}
+
+/// Cells of `c` in the direction of the path `d`, game order: each axis starts from the min
+/// edge if its component is positive or zero, from the max edge otherwise; vertical outer loop,
+/// the dominant horizontal axis in the middle (x on a tie), the weakest inside.
+fn for_cells_toward(c: [i32; 6], d: [f64; 3], f: &mut dyn FnMut([i32; 3]) -> bool) -> bool {
+    let (lo, hi) = span(c);
+    let [a0, a1, a2] = if d[0].abs() < d[2].abs() { [1, 2, 0] } else { [1, 0, 2] };
+    let s: [i32; 3] = d.map(|v| if v >= 0.0 { 1 } else { -1 });
+    let begin: [i32; 3] = std::array::from_fn(|i| if s[i] > 0 { lo[i] } else { hi[i] });
+    let n: [i32; 3] = std::array::from_fn(|i| hi[i] - lo[i]);
+    let mut p = [0; 3];
+    for i0 in 0..=n[a0] {
+        p[a0] = begin[a0] + s[a0] * i0;
+        for i1 in 0..=n[a1] {
+            p[a1] = begin[a1] + s[a1] * i1;
+            for i2 in 0..=n[a2] {
+                p[a2] = begin[a2] + s[a2] * i2;
+                if !f(p) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Cap of the seen-cells mask (bits): beyond it, the fallback list alone (oversized path).
+const SEEN_MAX_BITS: i64 = 1 << 18;
+
+/// Cells already seen by a traversal: bit mask over the bounding box of the path (one-cell
+/// margin), fallback list for a cell outside the box or an oversized path. Reused buffers.
+/// `RUSTCRAFT_OPT_INSIDE_SEEN_LINEAR`: list alone (previous lead, quadratic).
+#[derive(Debug, Default)]
+pub(crate) struct Seen {
+    lo: [i32; 3],
+    dim: [i64; 3],
+    bits: Vec<u64>,
+    spill: Vec<[i32; 3]>,
+    /// List alone, whatever happens (reference of the tests and the bench).
+    linear: bool,
+}
+
+impl Seen {
+    /// Set as a list alone (previous lead), for comparisons.
+    #[cfg(test)]
+    pub(crate) fn linear() -> Self {
+        Self { linear: true, ..Self::default() }
+    }
+
+    /// Empties the set, mask laid over the union of the whole boxes `a` and `b`.
+    fn reset(&mut self, a: [i32; 6], b: [i32; 6]) {
+        self.spill.clear();
+        self.bits.clear();
+        self.dim = [0; 3];
+        if self.linear || rc_data::env_flag!("RUSTCRAFT_OPT_INSIDE_SEEN_LINEAR") {
+            return;
+        }
+        let ((la, ha), (lb, hb)) = (span(a), span(b));
+        let lo: [i32; 3] = std::array::from_fn(|i| la[i].min(lb[i]).saturating_sub(1));
+        let dim: [i64; 3] =
+            std::array::from_fn(|i| i64::from(ha[i].max(hb[i])) + 1 - i64::from(lo[i]) + 1);
+        if dim.iter().any(|&d| d > SEEN_MAX_BITS) || dim[0] * dim[1] * dim[2] > SEEN_MAX_BITS {
+            return;
+        }
+        self.lo = lo;
+        self.dim = dim;
+        self.bits.resize(((dim[0] * dim[1] * dim[2] + 63) / 64) as usize, 0);
+    }
+
+    /// True if `p` had not been seen yet (it is now).
+    fn insert(&mut self, p: [i32; 3]) -> bool {
+        let r: [i64; 3] = std::array::from_fn(|i| i64::from(p[i]) - i64::from(self.lo[i]));
+        if (0..3).all(|i| r[i] >= 0 && r[i] < self.dim[i]) {
+            let k = ((r[0] * self.dim[1] + r[1]) * self.dim[2] + r[2]) as usize;
+            let (w, bit) = (k / 64, 1u64 << (k % 64));
+            let fresh = self.bits[w] & bit == 0;
+            self.bits[w] |= bit;
+            return fresh;
+        }
+        if self.spill.contains(&p) {
+            return false;
+        }
+        self.spill.push(p);
+        true
+    }
 }
 
 /// Intersection of a segment with the unit cell `c`: entry point through a face.
@@ -98,25 +191,24 @@ fn furthest_corner(d: [f64; 3]) -> [i32; 3] {
 }
 
 /// Cells swept by the box `at_target` (arrival box) coming from `from` to `to`, each one
-/// once with the number of the step where it is reached; `seen`: reused buffer (cells already
-/// seen, linear replacement of a hash set: a few dozen cells at most).
-/// False if `visit` stops the traversal.
+/// once with the number of the step where it is reached, in the game's order; `seen`: reused
+/// buffer of the cells already seen. False if `visit` stops the traversal.
 pub(crate) fn each_cell_stepped(
     from: [f64; 3],
     to: [f64; 3],
     at_target: &Aabb,
-    seen: &mut Vec<[i32; 3]>,
+    seen: &mut Seen,
     visit: &mut dyn FnMut([i32; 3], i32) -> bool,
 ) -> bool {
-    seen.clear();
     let t = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
     let lsq = t[0] * t[0] + t[1] * t[1] + t[2] * t[2];
     if lsq < f64::from(1.0e-5f32 * 1.0e-5f32) {
         return for_cells(cells(at_target), &mut |p| visit(p, 0));
     }
     let back = at_target.offset(-t[0], -t[1], -t[2]);
-    let ok = for_cells(cells(&back), &mut |p| {
-        seen.push(p);
+    seen.reset(cells(&back), cells(at_target));
+    let ok = for_cells_toward(cells(&back), t, &mut |p| {
+        seen.insert(p);
         visit(p, 0)
     });
     if !ok {
@@ -164,24 +256,14 @@ pub(crate) fn each_cell_stepped(
         let ch: [f64; 3] =
             std::array::from_fn(|i| hit[i].clamp(f64::from(cell[i]) + eps, f64::from(cell[i]) + 1.0 - eps));
         let opp: [i32; 3] = std::array::from_fn(|i| (ch[i] - size[i] * f64::from(dir[i])).floor() as i32);
-        let ok = for_cells([cell[0], cell[1], cell[2], opp[0], opp[1], opp[2]], &mut |p| {
-            if seen.contains(&p) {
-                return true;
-            }
-            seen.push(p);
-            visit(p, steps)
+        let ok = for_cells_toward([cell[0], cell[1], cell[2], opp[0], opp[1], opp[2]], t, &mut |p| {
+            !seen.insert(p) || visit(p, steps)
         });
         if !ok {
             return false;
         }
     }
-    for_cells(cells(at_target), &mut |p| {
-        if seen.contains(&p) {
-            return true;
-        }
-        seen.push(p);
-        visit(p, steps + 1)
-    })
+    for_cells_toward(cells(at_target), t, &mut |p| !seen.insert(p) || visit(p, steps + 1))
 }
 
 /// Variant without step number (ghast flight, portals).
@@ -191,7 +273,7 @@ pub(crate) fn each_cell_between(
     at_target: &Aabb,
     visit: &mut dyn FnMut([i32; 3]) -> bool,
 ) -> bool {
-    let mut seen = Vec::new();
+    let mut seen = Seen::default();
     each_cell_stepped(from, to, at_target, &mut seen, &mut |p, _| visit(p))
 }
 
@@ -332,7 +414,7 @@ impl Step {
 pub(crate) struct Scratch {
     moves: Vec<Move>,
     /// Cells seen by a traversal, cells kept over all the movements of the tick.
-    seen: Vec<[i32; 3]>,
+    seen: Seen,
     visited: Vec<[i32; 3]>,
     hits: Vec<Hit>,
     step: Step,
@@ -601,10 +683,12 @@ impl Server {
                         let pitch = 2.0 + self.life.rng.next_float() * 0.4;
                         self.play_sound("minecraft:entity.generic.burn", 7, self.pos, 0.4, pitch);
                     }
-                    Who::Mob(m) => {
+                    // Silent: neither sound nor pitch draw (the mob's random stays intact).
+                    Who::Mob(m) if !m.x.silent => {
                         let pitch = 2.0 + m.rng.next_float() * 0.4;
-                        self.mob_sound(m, "minecraft:entity.generic.burn", 0.4, pitch);
+                        self.mob_sound_unmuted(m, "minecraft:entity.generic.burn", 0.4, pitch);
                     }
+                    Who::Mob(_) => {}
                 }
             }
             Late::SnowMelt(p) => {

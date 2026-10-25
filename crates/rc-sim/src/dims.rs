@@ -572,13 +572,11 @@ impl Server {
 
     /// Absolute position with relative flags (rotation added, velocity kept).
     pub(crate) fn send_relative_teleport(&mut self, pos: [f64; 3], yaw: f32, pitch: f32, relative: i32) {
-        self.teleport_id = if self.teleport_id == i32::MAX { 0 } else { self.teleport_id + 1 };
         let ayaw = if relative & rel::Y_ROT != 0 { self.yaw + yaw } else { yaw };
         let apitch = if relative & rel::X_ROT != 0 { self.pitch + pitch } else { pitch };
-        self.pos = pos;
+        self.begin_teleport(pos);
         self.yaw = ayaw;
         self.pitch = apitch;
-        self.teleport = Some((self.teleport_id, pos, self.tick));
         let _ = self.send(Event::Teleport(rc_proto_v777::play::PlayerPosition {
             id: self.teleport_id,
             pos,
