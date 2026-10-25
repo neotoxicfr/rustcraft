@@ -853,6 +853,7 @@ impl Server {
     pub(crate) fn respawn_after_credits(&mut self) {
         self.dims.won_game = false;
         self.life.vit.crit = Default::default(); // new player: criteria rewritten
+        self.life.vit.impulse_reset(); // and no impulse context
         let t = self.respawn_transition(false);
         self.change_dimension(t);
     }

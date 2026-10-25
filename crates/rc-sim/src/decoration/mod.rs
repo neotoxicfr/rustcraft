@@ -498,7 +498,7 @@ impl Server {
     }
 
     /// Block shards (`block` particle).
-    fn block_particles(&self, state: u32, pos: [f64; 3], delta: [f32; 3], speed: f32, count: i32) {
+    pub(crate) fn block_particles(&self, state: u32, pos: [f64; 3], delta: [f32; 3], speed: f32, count: i32) {
         let Some(kind) = self
             .data
             .registry("minecraft:particle_type")

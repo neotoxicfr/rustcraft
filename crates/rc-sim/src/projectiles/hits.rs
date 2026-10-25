@@ -1087,6 +1087,7 @@ impl Server {
         }
         self.send_relative_teleport(to, 0.0, 0.0, crate::dims::rel::ROTATION);
         self.life.vit.fall = 0.0;
+        self.life.vit.impulse_reset();
         self.mobs.player_vel = [0.0; 3];
         self.hurt("minecraft:ender_pearl", 5.0);
         self.play_sound("minecraft:entity.player.teleport", 7, to, 1.0, 1.0);
