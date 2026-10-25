@@ -2433,3 +2433,20 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   walk of the order of 3.65 ms for 12,000 files (G1-F15 measurement), kept for safety.
 - Free disk space (`rc_sim::storage::low_disk_space`): one system call at opening, on
   the main thread; not measured separately (negligible).
+## G5-F02c: fall (wind charge, per-block rules, multiplier, sound, dust) (25/10, loaded machine)
+
+- Player's impulse context: two fields in `Vitals` (impact point, grace), one decrement per
+  tick, one test at landing. Clearing after each movement: immediate exit without a context
+  (almost all movements: two comparisons); with a context, the only test that reads the world
+  (liquid at the feet) is evaluated last. Not measured separately: a few nanoseconds per
+  movement, out of reach of a scene bench.
+- Block dust and sound: computed at landing only (one state read, one particle packet; the
+  game sends the same packet, 40 to 375 shards drawn by the client). The particle registry is
+  walked by name at each send (~100 entries, once per landing): off the hot path, kept.
+  Multi-core and GPU not applicable (rare events, packet order detectable by the client).
+- Block sound: the sound group lookup is shared between player and mobs
+  (`block_fall_sound_at`), without any more copying than before (name cloned once per sound,
+  as before).
+- "New world" and "mechanisms" fingerprints changed by the sole key
+  `current_impulse_context_reset_grace_time` of the player file (checked by removing it):
+  intended behavior (the game always writes it).

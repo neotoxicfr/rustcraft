@@ -1263,16 +1263,17 @@ impl Server {
     /// ground, when settled in a liquid, when climbing, as a spectator, when gliding or during a
     /// spin attack.
     fn impulse_after_move(&mut self, dy: f64, climbing: bool) {
-        let landed_in_liquid = dy < f64::from(1.0e-5f32) && {
-            let feet = crate::mobs::mth::block_of(self.pos);
-            matches!(self.fluid_at(feet).kind, 1 | 2)
-        };
+        // Without a context, nothing to forget: no test (the case for almost all movements).
+        if self.life.vit.impulse_impact.is_none() && self.life.vit.impulse_grace == 0 {
+            return;
+        }
+        // Liquid tested last (the only test that reads the world).
         if self.on_ground
-            || landed_in_liquid
             || climbing
             || self.game_mode == 3
             || self.proj_player.fall_flying
             || self.proj_player.spin > 0
+            || (dy < f64::from(1.0e-5f32) && matches!(self.fluid_at(crate::mobs::mth::block_of(self.pos)).kind, 1 | 2))
         {
             self.life.vit.impulse_try_reset();
         }
