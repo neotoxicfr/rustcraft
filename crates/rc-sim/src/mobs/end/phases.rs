@@ -450,7 +450,8 @@ impl Server {
                 let angle =
                     (f64::from(dot).acos() * f64::from(180.0f32) / f64::from(std::f32::consts::PI)) as f32 + 0.5;
                 if d.ph.strafe_charge >= 5 && (0.0..10.0).contains(&angle) {
-                    let view = super::super::nether::ghast::view_vector(m.pitch, m.yaw);
+                    // The living entity's view vector: head yaw, not the body.
+                    let view = super::super::nether::ghast::view_vector(m.pitch, m.head_yaw);
                     let head = d.parts[0];
                     let start = [head[0] - view[0], head[1] + 0.5 + 0.5, head[2] - view[2]];
                     let teye = self.ent_pos(target).map_or(tp[1], |p| p[1]) + self.ent_half_height(target);
@@ -551,21 +552,22 @@ impl Server {
         }
     }
 
-    /// Landing and takeoff (tilt according to the distance to
-    /// the egg), sitting phases (−45°), otherwise gaze.
+    /// Gaze of the head: the living entity's view vector, hence along the head yaw (caught up to
+    /// 75° from the body in flight only, `dragon::turn_head`), never the body's. Pitch: according
+    /// to the distance to the egg when landing and taking off, −45° when sitting, otherwise its own.
     pub(crate) fn dragon_head_look(&self, m: &Mob, d: &Dragon) -> [f64; 3] {
-        use super::super::nether::ghast::view_vector;
-        if matches!(d.phase, Phase::Landing | Phase::Takeoff) {
+        let pitch = if matches!(d.phase, Phase::Landing | Phase::Takeoff) {
             let egg = self.egg_pos(d);
             let c = [f64::from(egg[0]) + 0.5, f64::from(egg[1]) + 0.5, f64::from(egg[2]) + 0.5];
             let dist = ((d2(c, m.pos).sqrt() as f32) / 4.0).max(1.0);
             let y_off = 6.0 / dist;
-            view_vector(-y_off * 1.5 * 5.0, m.yaw)
+            -y_off * 1.5 * 5.0
         } else if d.phase.sitting() {
-            view_vector(-45.0, m.yaw)
+            -45.0
         } else {
-            view_vector(m.pitch, m.yaw)
-        }
+            m.pitch
+        };
+        super::super::nether::ghast::view_vector(pitch, m.head_yaw)
     }
 
     // ---------- Sitting phases ----------

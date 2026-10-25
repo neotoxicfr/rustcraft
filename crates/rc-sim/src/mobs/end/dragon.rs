@@ -103,6 +103,20 @@ pub fn part_box(d: &Dragon, i: usize) -> rc_physics::Aabb {
     rc_physics::Aabb { min: [p[0] - w / 2.0, p[1], p[2] - w / 2.0], max: [p[0] + w / 2.0, p[1] + h, p[2] + w / 2.0] }
 }
 
+/// Body control of the mobs, called after the dragon's AI step: body = yaw; head pulled back to
+/// at most 75° from the body only if it moved horizontally during this tick (game threshold:
+/// the float 2.5000003e-7, widened). Still (a sitting dragon pivoting towards the player, a dying
+/// one rising, one without AI), the head does not move; the game only turns the body there, which
+/// is never observable on the dragon (neither sent nor saved). This head orients its gaze
+/// (takeoff, strafing fireball) and goes out in the spawn and head packets.
+pub(crate) fn turn_head(m: &mut Mob) {
+    m.body_yaw = m.yaw;
+    let (dx, dz) = (m.pos[0] - m.old[0], m.pos[2] - m.old[2]);
+    if dx * dx + dz * dz > f64::from(2.500_000_3e-7_f32) {
+        m.head_yaw = rotate_if_necessary(m.head_yaw, m.body_yaw, 75.0);
+    }
+}
+
 fn inflate(b: rc_physics::Aabb, x: f64, y: f64, z: f64) -> rc_physics::Aabb {
     rc_physics::Aabb {
         min: [b.min[0] - x, b.min[1] - y, b.min[2] - z],
@@ -193,9 +207,7 @@ impl Server {
             }
         }
         self.dragon_ai_step(m, &mut d);
-        // Body and head (body = yaw, head at 75° at most).
-        m.body_yaw = m.yaw;
-        m.head_yaw = rotate_if_necessary(m.head_yaw, m.body_yaw, 75.0);
+        turn_head(m);
         let discard = std::mem::take(&mut d.discard_clouds);
         m.end.dragon = Some(d);
         for id in discard {
