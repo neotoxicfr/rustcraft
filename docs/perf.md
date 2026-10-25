@@ -2446,11 +2446,26 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   height pairs, no allocation). The search for the free center (the game's shapes) only runs
   on growth (growing up, placement), a few times in a mob's life: multi-core and GPU not
   applicable.
-- Team filter of the push: short-circuited as long as no team has a rule other than "always"
-  (one walk of the team list, empty in general); otherwise one UUID string and one team lookup
-  per neighbor that touches, only for the neighbors already in contact. Bench of the push with
-  no neighbor: 69 to 84 ns, unchanged (noise).
+- Team filter of the push: short-circuited as long as no team has a rule other than "always";
+  otherwise a team lookup for each neighbor that touches. Review: "member → (team rank, rule)"
+  index in the scoreboard (`CollisionIndex`, built on first use after a team change, members
+  with a canonical UUID keyed by UUID: no UUID string recreated and no walk over the members),
+  `RUSTCRAFT_OPT_TEAMIDX=0` for the old walk. Bench `bench_team_push` (loaded machine, 2
+  alternated passes, 200,000 calls, mob among 20 neighbors outside any team, "never" team of
+  300 members): 2,151 / 2,053 ns with the index, 18,146 / 19,146 ns with the walk (×8.8);
+  kept. Without a team, push with no neighbor 11.3 to 11.6 ns in both cases. Memory: one
+  entry per member, only when a rule is active. Equivalence: test `collision_rule_index` (index
+  = linear search, first registered wins, index rebuilt after a leave and a rule change);
+  fingerprints identical with the switch at 0 and at 1.
+- Effect cell of the block stepped on, reused only in the tick of its computation (a mob
+  without AI does not move but steps on its block every tick): 14.1 to 14.7 ns against 13.3 ns
+  before (noise, one more integer comparison), same bench.
 - Block step sound: one copy of the sound name per step (no more than one per block walked),
   like the existing fall sound; amethyst chime without allocation.
 - Entity sound seed drawn from the sound generator (atomic SplitMix64) instead of the world
   random source: equivalent cost; world fingerprints changed (intended fix, see the commit).
+  In tests, a fixed per-thread sequence (distinct from the test seeds of the other generators):
+  sound packets no longer depend on the clock (protocol A1), test `sound_seeds_reproducible`.
+- Dolphin jump and follow: direction of the yaw (`mth::facing`, a four-entry table) instead of
+  the direction closest to the velocity (six dot products): slightly less computation,
+  behavior fixed; fingerprints unchanged.

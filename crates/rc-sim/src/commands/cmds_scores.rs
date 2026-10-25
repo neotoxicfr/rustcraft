@@ -835,6 +835,7 @@ impl Server {
         if let Some(x) = self.cmd.scores.teams.iter_mut().find(|x| x.name == t.name) {
             *x = t.clone();
         }
+        self.cmd.scores.touch_teams(); // collision rule possibly changed
         self.cmd.scores.dirty = true;
         self.cmd.scores.out.push(ScoreEvent::Team {
             name: t.name.clone(),

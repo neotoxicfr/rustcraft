@@ -371,6 +371,9 @@ fn aquatic_saved() {
 }
 
 /// Creative: the nine species, AI active, stay in the pool (neither removed nor hurt) for 20 s.
+/// Pool reduced to 7 × 7: the dolphin's jump needs eight water blocks in front of it and can,
+/// like in the game, land one block past the last one checked; here it never jumps, so the
+/// result no longer depends on the random source.
 #[test]
 fn all_stay_in_pool() {
     let (Some(world), Some(data)) = (test_world(), rc_testdata::version_data()) else { return };
@@ -379,12 +382,15 @@ fn all_stay_in_pool() {
     let (s, handle, p) = start_test(&dir, data.clone());
     settle(&s);
     let c = pool(&s, p.pos);
+    let (x, y, z) = (p.pos[0].floor() as i32, p.pos[1].floor() as i32, p.pos[2].floor() as i32);
+    cmd(&s, &format!("fill {} {} {} {} {} {} minecraft:stone", x + 9, y - 4, z - 3, x + 9, y - 1, z + 3));
     let mut ids = Vec::new();
     // Without pufferfish: the nautiluses would legitimately charge (prey of the tag `nautilus_hostiles`).
     let kinds = ["cod", "salmon", "tropical_fish", "squid", "glow_squid", "dolphin", "nautilus", "zombie_nautilus"];
     for (i, k) in kinds.iter().enumerate() {
-        let x = c[0] - 3.0 + i as f64;
-        cmd(&s, &format!("summon minecraft:{k} {x} {} {} {{PersistenceRequired:1b}}", c[1], c[2]));
+        // Two rows of four in the seven water columns (x + 2 to x + 8).
+        let (x, z) = (c[0] - 2.5 + (i % 4) as f64 * 1.5, c[2] - 1.0 + (i / 4) as f64 * 2.0);
+        cmd(&s, &format!("summon minecraft:{k} {x} {} {z} {{PersistenceRequired:1b}}", c[1]));
         ids.push((*k, added(&s, &data, &format!("minecraft:{k}"))));
     }
     let mut gone: Vec<&str> = Vec::new();

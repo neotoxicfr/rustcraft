@@ -117,13 +117,13 @@ impl Server {
         if (w <= ow && h <= oh) || w > 4.0 || h > 4.0 || super::illagers::no_physics(m) {
             return;
         }
-        self.fudge_after_grow(m, (ow, oh), (w, h));
+        self.refit_after_growth(m, (ow, oh), (w, h));
     }
 
     /// Refit after growth from `old` to `new` (width, height): nearest free center in a box of
     /// the size of the gain around the old center; otherwise, if both dimensions have grown,
     /// the same search at the old height. True if the mob moved.
-    pub(crate) fn fudge_after_grow(&mut self, m: &mut Mob, old: (f32, f32), new: (f32, f32)) -> bool {
+    pub(crate) fn refit_after_growth(&mut self, m: &mut Mob, old: (f32, f32), new: (f32, f32)) -> bool {
         let ((ow, oh), (w, h)) = (old, new);
         let center = [m.pos[0], m.pos[1] + f64::from(oh) / 2.0, m.pos[2]];
         let wd = f64::from((w - ow).max(0.0)) + 1.0e-6;

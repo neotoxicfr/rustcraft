@@ -1212,17 +1212,19 @@ impl Server {
         if self.on_ground {
             let fall = self.life.vit.fall;
             if fall > 0.0 {
-                let below = [self.pos[0], self.pos[1] - 0.2, self.pos[2]];
-                let landing = self.block_name_at(below);
+                // Block touched: effect block 0.2 below the feet, in the column of the main
+                // supporting block (edge of a full block above a field: the full block).
+                let support = self.player_support();
+                let effect = self.on_pos(self.pos, support, 0.2);
+                let below_st = self.st(effect);
                 // Honey block: the slide sound is predicted by the player's client;
                 // event 54 (jump particles) goes out to everyone, player included.
-                if landing == "minecraft:honey_block" {
+                if self.state_name(below_st) == "minecraft:honey_block" {
                     let id = self.player_id;
                     let _ = self.send(Event::Entity(EntityEvent::Event { id, event: 54 }));
                 }
-                let below_st = self.state_at(below.map(|c| c.floor() as i32)).unwrap_or(0);
                 let (w, h, _) = self.player_dims();
-                self.trample_farmland(below.map(|c| c.floor() as i32), below_st, fall, true, w as f32, h as f32);
+                self.trample_farmland(effect, below_st, fall, None, w as f32, h as f32);
                 let rule = self.fall_rule(below_st, fall, self.sneaking);
                 // `fall_one_cm` statistic: any fall "onto" the block of at least 2 m
                 // (distance after the block's rule), except for a player who can fly.
@@ -1244,9 +1246,9 @@ impl Server {
                     self.play_sound(sound, 7, self.pos, 1.0, 1.0);
                     self.hurt(ty, dmg as f32);
                 }
-                // Landing: state of the main supporting block, otherwise of the block at 0.2.
-                let (_, effect) = self.player_on_pos();
-                let st = self.st(self.player_support().unwrap_or(effect));
+                // Landing: current state of the main supporting block, otherwise of the block at
+                // 0.2 (positions read before a trampling that raises the player, like the game).
+                let st = self.st(support.unwrap_or(effect));
                 let pos = self.pos;
                 let src = Some(crate::mobs::recent::vibration::Src::Living(crate::mobs::mob::Ent::Player));
                 self.game_event_src("minecraft:hit_ground", pos, src, Some(st));
@@ -1683,16 +1685,34 @@ impl Server {
 
 /// Seed of a positional sound (variant and drift chosen by the client): sound-specific
 /// generator, without a fixed seed, independent of the world's random source (like the game's).
+/// In tests, a fixed per-thread sequence, distinct from `rng::test_seed` (a sound shifts no
+/// other seed): same packets from one run to the next.
 pub(crate) fn sound_seed() -> i64 {
-    use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    static SALT: OnceLock<u64> = OnceLock::new();
-    let salt = *SALT.get_or_init(|| {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0x5DEE_CE66, |d| d.as_nanos() as u64)
-    });
+    const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+    #[cfg(not(test))]
+    let base = {
+        use std::sync::OnceLock;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        static SALT: OnceLock<u64> = OnceLock::new();
+        let salt = *SALT.get_or_init(|| {
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0x5DEE_CE66, |d| d.as_nanos() as u64)
+        });
+        NEXT.fetch_add(GOLDEN, Ordering::Relaxed) ^ salt
+    };
+    #[cfg(test)]
+    let base = {
+        thread_local! {
+            static NEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        }
+        NEXT.with(|c| {
+            let v = c.get();
+            c.set(v.wrapping_add(GOLDEN));
+            v ^ 0x500D_5EED
+        })
+    };
     // SplitMix64.
-    let mut z = (NEXT.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed) ^ salt).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = base.wrapping_add(GOLDEN);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     (z ^ (z >> 31)) as i64

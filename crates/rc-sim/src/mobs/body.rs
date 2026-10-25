@@ -23,9 +23,17 @@ fn stepon_cache() -> bool {
     *ON.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_STEPON_CACHE") != Some("0"))
 }
 
+/// `RUSTCRAFT_OPT_TEAMIDX=0`: the push team filter walks the members of each team with the UUID
+/// name recreated (old path) instead of using the scoreboard index.
+fn team_idx() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_TEAMIDX") != Some("0"))
+}
+
 /// Per-mob body state, outside physics: amethyst chime of the steps (intensity, tick of the
 /// last chime), last seen size (width, height) for the refit after growth (`None` before the
-/// first tick), effect cell of the last movement with the position and support that produced it.
+/// first tick), effect cell of the last movement with the tick, position and support that
+/// produced it.
 #[derive(Debug, Clone, Default)]
 pub struct BodyFx {
     pub crystal: f32,
@@ -34,8 +42,17 @@ pub struct BodyFx {
     pub effect: Option<EffectAt>,
 }
 
-/// Effect cell (0.2 below the feet) computed for a position and a support.
-pub type EffectAt = ([f64; 3], Option<[i32; 3]>, [i32; 3]);
+/// Effect cell (0.2 below the feet) computed in a tick for a position and a support:
+/// (tick, position, support, cell). Reused only in that tick: the support's state may change
+/// afterwards without any movement (a mob without AI on a carpet over magma, the carpet
+/// replaced by a wall: the cell becomes the wall).
+pub type EffectAt = (i32, [f64; 3], Option<[i32; 3]>, [i32; 3]);
+
+/// Species whose fall check is empty in the game (flyers): the fall does not accumulate, no
+/// block is touched (farmland, bed bounce), no landing event.
+fn ignores_falls(k: Kind) -> bool {
+    matches!(k, Kind::Bat | Kind::Allay | Kind::Bee | Kind::HappyGhast | Kind::Parrot | Kind::Ghast | Kind::Phantom)
+}
 
 fn l2(v: [f64; 3]) -> f64 {
     v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
@@ -78,21 +95,12 @@ impl rc_physics::World for SnowStand<'_> {
     }
 }
 
-/// Code of a team collision rule: 0 always, 1 never, 2 other teams, 3 own team.
-fn collision_code(rule: &str) -> u8 {
-    match rule {
-        "never" => 1,
-        "pushOtherTeams" => 2,
-        "pushOwnTeam" => 3,
-        _ => 0,
-    }
-}
-
-/// Does the entity with rule `own` (team `own_team`) push the one with rule `their`? Like the
-/// official game (and the client, `player_env.rs`): "never" on either side blocks; with "own
-/// team" on either side, two members of the same team do NOT push each other (quirk of the game,
-/// reproduced); with "other teams" on either side, only members of the same team push each other.
-fn team_allows(own: u8, own_team: Option<&str>, their: u8, their_team: Option<&str>) -> bool {
+/// Does the entity with rule `own` (team `own_team`, code from `commands::scores::collision_code`)
+/// push the one with rule `their`? Like the official game (and the client, `player_env.rs`):
+/// "never" on either side blocks; with "own team" on either side, two members of the same team
+/// do NOT push each other (quirk of the game, reproduced); with "other teams" on either side,
+/// only members of the same team push each other.
+fn team_allows(own: u8, own_team: Option<u32>, their: u8, their_team: Option<u32>) -> bool {
     if own == 1 || their == 1 {
         return false;
     }
@@ -273,21 +281,24 @@ impl Server {
                 None
             };
         }
-        // Fall; F12: strider in lava, fall reset to zero.
+        // Fall; F12: strider in lava, fall reset to zero; nothing for the flyers.
         let effect_pos = self.mob_below(m, 0.2);
-        m.body_fx.effect = Some((m.pos, m.support, effect_pos));
+        m.body_fx.effect = Some((m.tick_count, m.pos, m.support, effect_pos));
         let lava_reset = super::nether::strider::fall_reset(m);
         if lava_reset {
             m.fall_distance = 0.0;
         }
-        if !m.in_water && mv[1] < 0.0 && !lava_reset {
+        let falls = !ignores_falls(m.kind);
+        if falls && !m.in_water && mv[1] < 0.0 && !lava_reset {
             m.fall_distance -= f64::from(mv[1] as f32);
         }
-        if m.on_ground && !lava_reset {
+        if falls && m.on_ground && !lava_reset {
             if m.fall_distance > 0.0 {
                 let on = self.st(effect_pos);
                 let (w, h) = m.dims_wh();
-                self.trample_farmland(effect_pos, on, m.fall_distance, false, w, h);
+                // Once trampled, the mob is raised onto the dirt before its damage (fall sound
+                // and landing at the new height).
+                self.trample_farmland(effect_pos, on, m.fall_distance, Some(&mut *m), w, h);
                 self.fall_on(m, on, m.fall_distance);
                 // Landing: state of the main supporting block, otherwise of the block at 0.2.
                 let st = self.st(m.support.unwrap_or(effect_pos));
@@ -626,20 +637,28 @@ impl Server {
         }
     }
 
-    /// Fall of a living entity (player or mob, box `w` × `h`) onto the effect block `p`
-    /// of state `st`: farmland turns back into dirt if the world random falls below the
-    /// fall distance − 0.5, if the player (never in a protected zone on this server) or the
-    /// `mob_griefing` rule allows it, and if the box exceeds 0.512 cubic blocks; the random
-    /// is drawn only on farmland. Fall damage follows, unchanged.
-    pub(crate) fn trample_farmland(&mut self, p: [i32; 3], st: u32, dist: f64, player: bool, w: f32, h: f32) {
+    /// Fall of a living entity (the mob `mob` being ticked, otherwise the player; box `w` × `h`)
+    /// onto the effect block `p` of state `st`: farmland turns back into dirt if the world
+    /// random falls below the fall distance − 0.5, if the player (never in a protected zone on
+    /// this server) or the `mob_griefing` rule allows it, and if the box exceeds 0.512 cubic
+    /// blocks; the random is drawn only on farmland. The trampling entity is raised with the
+    /// others and becomes the source of the event; fall damage follows, unchanged.
+    pub(crate) fn trample_farmland(&mut self, p: [i32; 3], st: u32, dist: f64, mob: Option<&mut Mob>, w: f32, h: f32) {
         if self.v().block(st) != self.bs.t.id.farmland {
             return;
         }
         if f64::from(self.bs.rng.next_float()) < dist - 0.5
-            && (player || self.rule("minecraft:mob_griefing", true))
+            && (mob.is_none() || self.rule("minecraft:mob_griefing", true))
             && w * w * h > 0.512
         {
-            self.turn_to_dirt(p);
+            let src = match mob {
+                Some(m) => {
+                    Self::push_mob_up(m, p, 15.0 / 16.0, 1.0);
+                    Ent::Mob(m.id)
+                }
+                None => Ent::Player,
+            };
+            self.turn_to_dirt(p, Some(src));
         }
     }
 
@@ -668,10 +687,14 @@ impl Server {
         if !m.on_ground || m.removed || super::illagers::no_physics(m) {
             return;
         }
-        // Effect cell of the last movement if the position and the support have not changed
+        // Effect cell of this tick's movement if the position and the support have not changed
         // since (same computation, without re-reading the support).
         let p = match m.body_fx.effect {
-            Some((pos, support, e)) if stepon_cache() && pos == m.pos && support == m.support => e,
+            Some((tick, pos, support, e))
+                if stepon_cache() && tick == m.tick_count && pos == m.pos && support == m.support =>
+            {
+                e
+            }
             _ => self.mob_below(m, 0.2),
         };
         if self.step_on_block(p, false) {
@@ -883,26 +906,40 @@ impl Server {
         }
     }
 
-    /// Team and collision rule of the score holder `holder` (no team: rule 0).
-    fn team_rule(&self, holder: &str) -> (Option<&str>, u8) {
-        self.cmd.scores.team_of(holder).map_or((None, 0), |t| (Some(t.name.as_str()), collision_code(&t.collision)))
-    }
-
-    /// Team filter of the push as seen from `holder`: `None` when no team has a rule other
-    /// than "always" (the filter then lets everything through, nothing is looked up).
-    fn push_team(&self, holder: impl FnOnce() -> String) -> Option<(Option<String>, u8)> {
-        if self.cmd.scores.teams.iter().all(|t| t.collision == "always") {
-            return None;
+    /// Team (rank) and collision rule of the mob with UUID `who`, or of the player for `None`
+    /// (no team: rule 0): lookup in the scoreboard index.
+    fn team_rule(&self, who: Option<u128>) -> (Option<u32>, u8) {
+        if !team_idx() {
+            let holder = who.map_or_else(|| self.name.clone(), crate::nbtio::uuid_text);
+            let teams = &self.cmd.scores.teams;
+            return teams.iter().position(|t| t.players.contains(&holder)).map_or((None, 0), |i| {
+                (Some(i as u32), crate::commands::scores::collision_code(&teams[i].collision))
+            });
         }
-        let (t, r) = self.team_rule(&holder());
-        Some((t.map(str::to_owned), r))
+        let ix = self.cmd.scores.collision_index();
+        let e = match who {
+            Some(u) => ix.by_uuid.get(&u),
+            None => ix.by_name.get(&self.name),
+        };
+        e.map_or((None, 0), |&(t, r)| (Some(t), r))
     }
 
-    /// Can `holder` be pushed by the filter entity `own` (`push_team`)?
-    fn push_team_allows(&self, own: &Option<(Option<String>, u8)>, holder: &str) -> bool {
+    /// Team filter of the push as seen from `who` (`team_rule`): `None` when no team has a rule
+    /// other than "always" (the filter then lets everything through, nothing is looked up).
+    fn push_team(&self, who: Option<u128>) -> Option<(Option<u32>, u8)> {
+        let active = if team_idx() {
+            self.cmd.scores.collision_index().active
+        } else {
+            self.cmd.scores.teams.iter().any(|t| t.collision != "always")
+        };
+        active.then(|| self.team_rule(who))
+    }
+
+    /// Can `who` be pushed by the filter entity `own` (`push_team`)?
+    fn push_team_allows(&self, own: Option<(Option<u32>, u8)>, who: Option<u128>) -> bool {
         let Some((own_team, own_rule)) = own else { return true };
-        let (their_team, their_rule) = self.team_rule(holder);
-        team_allows(*own_rule, own_team.as_deref(), their_rule, their_team)
+        let (their_team, their_rule) = self.team_rule(who);
+        team_allows(own_rule, own_team, their_rule, their_team)
     }
 
     /// Pushable.
@@ -921,7 +958,7 @@ impl Server {
         }
         let bb = m.bbox();
         // Team collision rules (only if some team has a rule other than "always").
-        let team = self.push_team(|| crate::nbtio::uuid_text(m.uuid));
+        let team = self.push_team(Some(m.uuid));
         // (entity, slot of the list at the time of the record; u32::MAX for the player).
         let mut list: Vec<(Ent, u32)> = Vec::new();
         for (i, o) in self.mobs.list.iter().enumerate() {
@@ -931,7 +968,7 @@ impl Server {
                 && o.bbox().intersects(&bb)
                 && self.mob_pushable(o)
                 && !self.same_root(m, o)
-                && (team.is_none() || self.push_team_allows(&team, &crate::nbtio::uuid_text(o.uuid)))
+                && self.push_team_allows(team, Some(o.uuid))
             {
                 list.push((Ent::Mob(o.id), i as u32));
             }
@@ -942,7 +979,7 @@ impl Server {
             && player_box.intersects(&bb)
             && super::surface::pushes_player(m)
             && !self.player_same_root(m)
-            && self.push_team_allows(&team, &self.name)
+            && self.push_team_allows(team, None)
         {
             list.push((Ent::Player, u32::MAX));
         }
@@ -1035,7 +1072,7 @@ impl Server {
         }
         let pb = self.player_aabb();
         let ppos = self.pos;
-        let team = self.push_team(|| self.name.clone());
+        let team = self.push_team(None);
         let mut idx = Vec::new();
         for (i, o) in self.mobs.list.iter().enumerate() {
             if let Some(o) = o
@@ -1043,7 +1080,7 @@ impl Server {
                 && o.may_touch(&pb)
                 && o.bbox().intersects(&pb)
                 && !self.player_same_root(o)
-                && (team.is_none() || self.push_team_allows(&team, &crate::nbtio::uuid_text(o.uuid)))
+                && self.push_team_allows(team, Some(o.uuid))
             {
                 idx.push(i);
             }

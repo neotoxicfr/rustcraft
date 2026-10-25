@@ -31,7 +31,10 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// at 0 (not −1) in the three fingerprints, the only cause of the change (checked by restoring it).
 /// G5-F02b: entity sound seeds drawn from the sound generator (not from the mobs' world random
 /// source): spawns and finalizations no longer move with the number of sounds played.
-const EXPECTED_NEW: (&str, usize) = ("b7433a1e0d778902d6eeb731c2cacce5718d3896c1932fbe53922454d3304f68", 823);
+/// G5-F02b review: flyers with an empty fall check (bat, parrot, bee, allay, ghasts, phantom) no
+/// longer accumulate a fall (saved field), the only cause of the change (checked by restoring the
+/// old accumulation: b7433a1e…, 823).
+const EXPECTED_NEW: (&str, usize) = ("c855a20f62d2683f7c7559f09935ba7f01003874c8b6ad7a6c4aadf76e7fac5c", 823);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 const EXPECTED_MODEL: &[(&str, &str, usize)] = &[(
     "790b2d94653a4243e68f2e0cb0ebc3f865f9f59815ed65149067cdd374c6b800",

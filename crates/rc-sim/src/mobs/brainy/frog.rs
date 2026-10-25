@@ -396,13 +396,15 @@ fn set_tadpole_age(s: &mut Server, m: &mut Mob, age: i32) {
     }
 }
 
-/// Conversion to frog: "conversion" finalization (biome variant, memories), persistent, growth
-/// sound.
-fn grow_up(s: &mut Server, m: &mut Mob) {
+/// Conversion to frog: "conversion" finalization (biome variant, memories), persistent,
+/// refitted from the tadpole's size (larger, it comes out of a wall), growth sound.
+pub(crate) fn grow_up(s: &mut Server, m: &mut Mob) {
     let mut f = s.converted(m, Kind::Frog, false, false);
     let mut g = super::super::spawn::Group::default();
     s.finalize_spawn(&mut f, super::super::spawn::Reason::Conversion, &mut g);
     f.persistent = true;
+    let (old, new) = (m.dims_wh(), f.dims_wh());
+    s.refit_after_growth(&mut f, old, new);
     s.mob_sound(m, "minecraft:entity.tadpole.grow_up", 0.15, 1.0);
     m.removed = true;
     s.add_mob(f);
