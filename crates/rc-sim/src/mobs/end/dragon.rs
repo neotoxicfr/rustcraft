@@ -252,7 +252,7 @@ impl Server {
             }
             for part in [HEAD, NECK] {
                 let b = inflate(part_box(d, part), 1.0, 1.0, 1.0);
-                self.dragon_bite(m, b);
+                self.dragon_bite(m, d, b);
             }
         }
         let ss2 = sin(m.yaw * DEG - d.y_rot_a * 0.01);
@@ -345,7 +345,7 @@ impl Server {
 
     /// Wings: living entities in the box are pushed back, and hurt (5) outside the sitting
     /// phase if their last injury by a mob is at least 3 ticks old.
-    fn dragon_knockback(&mut self, m: &mut Mob, d: &Dragon, area: rc_physics::Aabb) {
+    fn dragon_knockback(&mut self, m: &mut Mob, d: &mut Dragon, area: rc_physics::Aabb) {
         let body = part_box(d, BODY);
         let xm = (body.min[0] + body.max[0]) / 2.0;
         let zm = (body.min[2] + body.max[2]) / 2.0;
@@ -382,13 +382,13 @@ impl Server {
             if !d.phase.sitting() && stamp < self.mobs.player_ticks - 2 {
                 let kb = Some((m.pos[0] - self.pos[0], m.pos[2] - self.pos[2]));
                 self.player_hurt_by_mob(m, "minecraft:mob_attack", 5.0, kb);
-                self.player_thorns(m); // G5-F02d: even without a hit dealt, like the game
+                self.dragon_thorns(m, d); // G5-F02d: even without a hit dealt, like the game
             }
         }
     }
 
     /// Head and neck: 10 damage to every living entity in the box.
-    fn dragon_bite(&mut self, m: &mut Mob, area: rc_physics::Aabb) {
+    pub(crate) fn dragon_bite(&mut self, m: &mut Mob, d: &mut Dragon, area: rc_physics::Aabb) {
         let ids: Vec<i32> = self
             .mobs
             .list
@@ -410,7 +410,18 @@ impl Server {
         {
             let kb = Some((m.pos[0] - self.pos[0], m.pos[2] - self.pos[2]));
             self.player_hurt_by_mob(m, "minecraft:mob_attack", 10.0, kb);
-            self.player_thorns(m); // G5-F02d: even without a hit dealt, like the game
+            self.dragon_thorns(m, d); // G5-F02d: even without a hit dealt, like the game
+        }
+    }
+
+    /// Player thorns against the dragon during its tick: its own state, taken out for the time
+    /// of the tick, is put back for the thorns (damage reception reads the phase and
+    /// accumulates the sitting-phase damage), then taken again with what changed.
+    fn dragon_thorns(&mut self, m: &mut Mob, d: &mut Dragon) {
+        m.end.dragon = Some(Box::new(d.clone()));
+        self.player_thorns(m);
+        if let Some(back) = m.end.dragon.take() {
+            *d = *back;
         }
     }
 

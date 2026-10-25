@@ -144,6 +144,115 @@ fn thorns_hurt_melee_attacker() {
     done(p, dir);
 }
 
+/// Dragon bite (dragon state taken out, like during its tick) on a player with thorns: the
+/// dragon loses HP (body hit: d/4 + min(d, 1), i.e. 1.25 to 2.25), the chestplate wears down.
+#[test]
+fn thorns_hurt_dragon_during_its_tick() {
+    use crate::mobs::end::phases::Phase;
+    let Some((mut p, dir)) = probe("g5f02d-dragon") else { return };
+    p.s.slots[6] = enchanted("minecraft:diamond_chestplate", "minecraft:thorns", 10);
+    let mut m = p.s.new_mob(Kind::EnderDragon, [110.5, -50.0, 110.5], 0.0);
+    m.end.dragon.as_mut().expect("dragon").set_phase(Phase::HoldingPattern);
+    let hp = m.health;
+    let mut d = m.end.dragon.take().expect("dragon");
+    let area = p.s.player_aabb();
+    p.s.dragon_bite(&mut m, &mut d, area);
+    m.end.dragon = Some(d);
+    assert!(p.s.life.vit.health < 20.0, "bite without effect");
+    let lost = hp - m.health;
+    assert!((1.25..=2.25).contains(&lost), "thorns on the dragon: {lost} HP lost");
+    assert!(wear(&p, 6) >= 2, "thorns wear missing");
+    done(p, dir);
+}
+
+/// Melee hit of a behaviour (brain taken out, like during the mob's tick) on a player with
+/// thorns: the damage reaction sees the brain. Piglin: admiring disabled (400 ticks); adult
+/// hoglin: attack target set again for 200 ticks.
+#[test]
+fn thorns_reaction_sees_detached_brain() {
+    use crate::mobs::brainy::brain::Visible;
+    use crate::mobs::piglins::brain::PB;
+    let Some((mut p, dir)) = probe("g5f02d-brain") else { return };
+    p.s.slots[6] = enchanted("minecraft:diamond_chestplate", "minecraft:thorns", 10);
+    for k in [Kind::Piglin, Kind::Hoglin] {
+        let mut m = p.s.new_mob(k, [110.5, -59.0, 111.5], 180.0);
+        let mut b = m.bm.brain.take().expect("brain");
+        b.mem.attack.set_exp(Ent::Player, 30);
+        b.mem.visible.set(Visible { list: vec![Ent::Player], cache: vec![Some(true)] });
+        let mut pb = Box::new(PB::Melee { cd: 20, adult: None });
+        p.s.life.vit.cooldown = 0;
+        p.s.life.vit.health = 20.0;
+        let hp = m.health;
+        let t = p.s.time;
+        assert!(p.s.pig_trigger(&mut m, &mut b, &mut pb, t), "{k:?}: no hit");
+        assert!(p.s.life.vit.health < 20.0, "{k:?}: player not hit");
+        assert!(m.health < hp, "{k:?}: thorns missing");
+        match k {
+            Kind::Piglin => assert!(b.mem.pig.admiring_disabled.has(), "piglin: thorns reaction lost"),
+            _ => assert_eq!(b.mem.attack.ttl, 200, "hoglin: thorns reaction lost"),
+        }
+    }
+    done(p, dir);
+}
+
+/// Same cause, other brains. Warden (common brain melee): +100 anger against the player, and
+/// the sonic boom cooldown (40) set by its hit. Nautilus (charge): angry.
+#[test]
+fn thorns_reaction_other_brains() {
+    use crate::mobs::brainy::brain::{Bk, Visible};
+    let Some((mut p, dir)) = probe("g5f02d-brain2") else { return };
+    p.s.slots[6] = enchanted("minecraft:diamond_chestplate", "minecraft:thorns", 10);
+    let mut w = p.s.new_mob(Kind::Warden, [110.5, -59.0, 111.5], 180.0);
+    w.attrs.attack.base = 2.0;
+    let mut b = w.bm.brain.take().expect("brain");
+    b.mem.attack.set(Ent::Player);
+    b.mem.visible.set(Visible { list: vec![Ent::Player], cache: vec![Some(true)] });
+    let hp = w.health;
+    let t = p.s.time;
+    assert!(p.s.bz_trigger(&mut w, &mut b, &mut Bk::Melee { cd: 18 }, t), "warden: no hit");
+    assert!(w.health < hp, "warden: thorns missing");
+    let anger = w.rec.anger.suspects.iter().find(|s| s.0 == Ent::Player).map_or(0, |s| s.2);
+    assert_eq!(anger, 100, "warden: thorns anger lost");
+    assert!(b.mem.x.sonic_cooldown.has(), "warden: sonic boom cooldown not set by the hit");
+    p.s.life.vit.cooldown = 0;
+    p.s.life.vit.health = 20.0;
+    let mut n = p.s.new_mob(Kind::Nautilus, [110.5, -59.0, 110.5], 0.0);
+    let mut nb = n.sea.brain.take().expect("nautilus brain");
+    let hp = n.health;
+    p.s.charge_hit(&mut n, &mut nb);
+    assert!(n.health < hp, "nautilus: thorns missing");
+    assert_eq!(nb.angry.map(|a| a.0), Some(p.s.uuid), "nautilus: thorns anger lost");
+    done(p, dir);
+}
+
+/// Unbreaking III, formula chosen by the item: a chestplate held in hand keeps the armor one
+/// (each point avoided with 0.3), elytra worn on the chest take the tool one (0.75).
+/// 200 points each: about 140 and 50 of wear.
+#[test]
+fn unbreaking_formula_follows_item() {
+    let Some((mut p, dir)) = probe("g5f02d-unbreaking") else { return };
+    let both = |id: &str| {
+        let mut s = Stack { id: id.into(), count: 1, components: None };
+        crate::items::set_component(
+            &mut s,
+            "minecraft:enchantments",
+            Nbt::Compound(vec![("minecraft:unbreaking".into(), Nbt::Int(3)), ("minecraft:thorns".into(), Nbt::Int(1))]),
+        );
+        Some(s)
+    };
+    let held = 36 + p.s.held as usize;
+    p.s.slots[held] = both("minecraft:netherite_chestplate");
+    p.s.slots[6] = both("minecraft:elytra");
+    for _ in 0..200 {
+        p.s.hurt_item(held, 1);
+        p.s.hurt_item(6, 1);
+    }
+    let (armor, elytra) = (wear(&p, held), wear(&p, 6));
+    assert!((110..=170).contains(&armor), "chestplate in hand: {armor} (tool formula?)");
+    assert!((25..=80).contains(&elytra), "elytra: {elytra} (armor formula?)");
+    done(p, dir);
+}
+
 /// Thorns on the shooter: the arrow of a skeleton still in the list hurts it.
 #[test]
 fn thorns_hurt_shooter_in_list() {

@@ -28,6 +28,23 @@ impl Server {
         }
     }
 
+    /// The brain `b`, taken out during the tick of `m`, put back on the mob for the time of `f`:
+    /// a hit dealt by a behaviour may hurt its author (thorns), and its reaction to the damage
+    /// reads and writes this brain on the spot, like in the game where it never leaves the mob.
+    pub(crate) fn with_brain<R>(
+        &mut self,
+        m: &mut Mob,
+        b: &mut crate::mobs::brainy::brain::Brain,
+        f: impl FnOnce(&mut Server, &mut Mob) -> R,
+    ) -> R {
+        m.bm.brain = Some(Box::new(std::mem::replace(b, crate::mobs::brainy::brain::Brain::hole())));
+        let r = f(self, m);
+        if let Some(back) = m.bm.brain.take() {
+            *b = *back;
+        }
+        r
+    }
+
     /// `player_thorns` for the causing entity `by` of a projectile: a mob still in the list
     /// (shooter gone or the player itself: nothing).
     pub(crate) fn player_thorns_by(&mut self, by: Option<Ent>) {

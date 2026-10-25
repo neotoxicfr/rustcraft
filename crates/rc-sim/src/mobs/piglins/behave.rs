@@ -592,7 +592,8 @@ impl Server {
         if m.kind == Kind::Hoglin {
             self.hoglin_on_hit_target(m, b, t);
         }
-        self.hoglin_hurt_and_throw(m, t)
+        // Brain put back for the time of the hit: thorns reaction (G5-F02d).
+        self.with_brain(m, b, |s, m| s.hoglin_hurt_and_throw(m, t))
     }
 
     /// The hoglin's reaction to damage.
@@ -1060,7 +1061,8 @@ impl Server {
                 if matches!(m.kind, Kind::Hoglin | Kind::Zoglin) {
                     self.hoglin_attack(m, b, target);
                 } else {
-                    self.mob_attack(m, target);
+                    // Brain put back for the time of the hit: thorns reaction (G5-F02d).
+                    self.with_brain(m, b, |s, m| s.mob_attack(m, target));
                 }
                 b.mem.attack_cooling.set_exp((), i64::from(*cd));
                 true

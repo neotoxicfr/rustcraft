@@ -791,7 +791,7 @@ impl Server {
     }
 
     /// Charge: the first attackable living entity in the box takes the hit and knockback.
-    fn charge_hit(&mut self, m: &mut Mob, b: &mut Brain) {
+    pub(crate) fn charge_hit(&mut self, m: &mut Mob, b: &mut Brain) {
         let bb = m.bbox();
         let mut hit: Option<Ent> = None;
         let ids: Vec<i32> =
@@ -814,7 +814,12 @@ impl Server {
             Ent::Player => {
                 let kb = Some((m.pos[0] - self.pos[0], m.pos[2] - self.pos[2]));
                 if self.player_hurt_by_mob(m, "minecraft:mob_attack", dmg, kb) {
-                    self.player_thorns(m); // G5-F02d
+                    // G5-F02d: brain put back for the time of the thorns (anger of the hurt nautilus).
+                    m.sea.brain = Some(Box::new(std::mem::take(b)));
+                    self.player_thorns(m);
+                    if let Some(back) = m.sea.brain.take() {
+                        *b = *back;
+                    }
                 }
             }
             Ent::Mob(id) => {
