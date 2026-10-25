@@ -24,8 +24,8 @@ pub struct Spit {
     pub removed: bool,
     pub left_owner: bool,
     pub tick: i32,
-    /// Born during a mob's tick: first tick on the next server tick.
-    pub wait: bool,
+    /// Number of the entity walk it was born in (0: outside the walk), read by `mobs::Walk`.
+    pub born: u64,
 }
 
 /// Mounts world: mounted player, spits in flight, visual lightning.
@@ -100,7 +100,7 @@ impl Server {
         }
         let v = v.map(|c| c * f64::from(1.5f32));
         let (yaw, pitch) = rot_of(v);
-        let wait = !self.mobs.ticking.is_empty();
+        let born = self.walk.born();
         let s = Spit {
             id,
             owner: m.id,
@@ -112,7 +112,7 @@ impl Server {
             removed: false,
             left_owner: false,
             tick: 0,
-            wait,
+            born,
         };
         let add = AddEntity {
             id,
@@ -136,8 +136,9 @@ impl Server {
     pub(crate) fn spits_tick(&mut self) {
         let mut spits = std::mem::take(&mut self.mobs.mounts.spits);
         for s in spits.iter_mut().filter(|s| !s.removed) {
-            // Added during this tick's entity walk: it waits for the next one.
-            if std::mem::take(&mut s.wait) {
+            // Born during this entity walk: it waits for the next tick (born from a minecart,
+            // after this tick, it is no longer skipped).
+            if self.walk.waits(std::mem::take(&mut s.born)) {
                 continue;
             }
             s.tick += 1;

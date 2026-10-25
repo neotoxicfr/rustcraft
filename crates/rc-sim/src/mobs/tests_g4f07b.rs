@@ -7,7 +7,7 @@ use rc_proto_v777::entity::Meta;
 use rc_proto_v777::play::SoundRef;
 
 use super::jrand::JRand;
-use super::mob::Mob;
+use super::mob::{Ent, Mob};
 use super::mounts::SADDLE;
 use super::mounts::llama::Spit;
 use super::species::Kind;
@@ -174,7 +174,7 @@ fn spit(owner: i32, pos: [f64; 3], vel: [f64; 3], tick: i32) -> Spit {
         removed: false,
         left_owner: true,
         tick,
-        wait: false,
+        born: 0,
     }
 }
 
@@ -258,48 +258,276 @@ fn spit_targets_nearest_at_entry() {
     cleanup(p, dir);
 }
 
-/// A spit, fangs or an arrow born during a mob's tick make their first tick on the next
-/// server tick; born outside that walk (command, player), right away.
+// ---------- Birth during the entity walk (complete server ticks) ----------
+
+/// Complete server tick, like the server loop (events drained).
+fn full_tick(p: &mut Probe) {
+    p.s.game_tick();
+    p.s.tick += 1;
+    let _ = p.take_events();
+}
+
+/// Complete server ticks until `seen` answers, at most `max`; returns its answer.
+fn until<T>(p: &mut Probe, max: usize, what: &str, mut seen: impl FnMut(&Server) -> Option<T>) -> T {
+    for _ in 0..max {
+        full_tick(p);
+        if let Some(v) = seen(&p.s) {
+            return v;
+        }
+    }
+    panic!("{what}: nothing in {max} server ticks");
+}
+
+/// Minecart placed at `pos`, the mob seated in it.
+fn seat_in_cart(p: &mut Probe, id: i32, pos: [f64; 3]) {
+    p.s.next_entity += 1;
+    let mut c = crate::minecart::Cart::new(crate::minecart::CKind::Rideable, p.s.next_entity, pos);
+    let i = p.s.mob_index(id).expect("mob");
+    let mut m = p.s.mobs.list[i].take().expect("mob");
+    assert!(p.s.cart_mob_start_riding(&mut c, &mut m), "mob not mounted in the minecart");
+    p.s.mobs.list[i] = Some(m);
+    p.s.cart_add(c);
+}
+
+fn set_target(p: &mut Probe, id: i32, t: Option<Ent>) {
+    let i = p.s.mob_index(id).expect("mob");
+    p.s.mobs.list[i].as_mut().expect("mob").target = t;
+}
+
+fn proj_ticks(p: &Probe, id: i32) -> Option<i32> {
+    p.s.proj.list.iter().find(|q| q.id == id).map(|q| q.tick_count)
+}
+
+fn cloud_age(p: &Probe, id: i32) -> Option<i32> {
+    p.s.proj.clouds.iter().find(|c| c.id == id).map(|c| c.age)
+}
+
+/// A spit born during the entity walk makes its first tick on the next server tick, whether the
+/// llama is free (ticked before the spits) or a passenger of a minecart (ticked after them,
+/// with the minecarts): never on the tick of its birth, never two ticks later.
 #[test]
-fn mob_projectiles_wait_for_the_next_tick() {
-    let Some((mut p, dir)) = probe("g4f07b-wait") else { return };
-    let llama = bare(&mut p, Kind::Llama, [205.5, -59.0, 205.5]);
-    let cow = bare(&mut p, Kind::Cow, [215.5, -59.0, 205.5]);
-    let i = p.s.mob_index(llama).unwrap();
-    let mut l = p.s.mobs.list[i].take().unwrap();
-    p.s.mobs.ticking.push((l.uuid, l.id));
-    p.s.llama_spit(&mut l, super::mob::Ent::Mob(cow));
+fn spit_first_tick_on_next_server_tick() {
+    let Some((mut p, dir)) = probe("g4f07b-spit-tick") else { return };
+    let cow = bare(&mut p, Kind::Cow, [216.5, -59.0, 222.5]);
+    let free = bare(&mut p, Kind::Llama, [210.5, -59.0, 210.5]);
+    let carried = bare(&mut p, Kind::Llama, [222.5, -59.0, 210.5]);
+    seat_in_cart(&mut p, carried, [222.5, -59.0, 210.5]);
+    for (who, id) in [("free llama", free), ("llama in a minecart", carried)] {
+        set_target(&mut p, id, Some(Ent::Mob(cow)));
+        let sid = until(&mut p, 200, who, |s| s.mobs.mounts.spits.iter().find(|x| x.owner == id).map(|x| x.id));
+        let tick = |p: &Probe| p.s.mobs.mounts.spits.iter().find(|x| x.id == sid).map(|x| x.tick);
+        assert_eq!(tick(&p), Some(0), "{who}: spit advanced on the tick of its birth");
+        full_tick(&mut p);
+        assert_eq!(tick(&p), Some(1), "{who}: spit still on the next tick");
+        set_target(&mut p, id, None);
+    }
+    cleanup(p, dir);
+}
+
+/// Next permitted use of an evoker spell (`i32::MAX`: never).
+fn spell_next(p: &mut Probe, id: i32, spell: super::illagers::Spell, at: i32) {
+    let i = p.s.mob_index(id).expect("evoker");
+    let m = p.s.mobs.list[i].as_mut().expect("evoker");
+    for w in &mut m.goals.goals {
+        if let super::goals::Goal::Ill(super::illagers::IGoal::UseSpell { spell: s, next_tick, .. }) = &mut w.goal
+            && *s == spell
+        {
+            *next_tick = at;
+        }
+    }
+}
+
+/// Evoker fangs, same rule: first tick on the next server tick, evoker free or passenger of a
+/// minecart (vexes disabled to keep only the fangs, one evoker at a time; player in creative,
+/// target fixed).
+#[test]
+fn fangs_first_tick_on_next_server_tick() {
+    use super::illagers::Spell;
+    let Some((mut p, dir)) = probe("g4f07b-fangs-tick") else { return };
+    p.s.game_mode = 1;
+    let free = bare(&mut p, Kind::Evoker, [216.5, -59.0, 212.5]);
+    let carried = bare(&mut p, Kind::Evoker, [226.5, -59.0, 212.5]);
+    seat_in_cart(&mut p, carried, [226.5, -59.0, 212.5]);
+    for id in [free, carried] {
+        spell_next(&mut p, id, Spell::SummonVex, i32::MAX);
+        spell_next(&mut p, id, Spell::Fangs, i32::MAX);
+        set_target(&mut p, id, Some(Ent::Player));
+    }
+    for (who, id) in [("free evoker", free), ("evoker in a minecart", carried)] {
+        spell_next(&mut p, id, Spell::Fangs, 0);
+        let fid = until(&mut p, 300, who, |s| s.mobs.ill.fangs.iter().find(|f| f.owner == Some(id)).map(|f| f.id));
+        let warm = |p: &Probe| p.s.mobs.ill.fangs.iter().find(|f| f.id == fid).map(|f| f.warmup);
+        assert_eq!(warm(&p), Some(0), "{who}: fangs advanced on the tick of their birth");
+        full_tick(&mut p);
+        assert_eq!(warm(&p), Some(-1), "{who}: fangs still on the next tick");
+        spell_next(&mut p, id, Spell::Fangs, i32::MAX);
+    }
+    cleanup(p, dir);
+}
+
+/// A creeper under an effect that explodes during its tick: its cloud has not aged at the end of
+/// the explosion tick (age 0), it is 1 on the next; wait, effects and end therefore fall on
+/// their own tick.
+#[test]
+fn creeper_cloud_ages_on_next_tick() {
+    let Some((mut p, dir)) = probe("g4f07b-creeper-cloud") else { return };
+    p.s.game_mode = 1;
+    let mut m = p.s.new_mob(Kind::Creeper, [216.5, -59.0, 218.5], 0.0);
+    assert!(p.s.give_mob_effect(&mut m, "minecraft:speed", 600, 0), "effect refused");
+    m.ignited = true;
+    p.s.add_mob(m);
+    let id = until(&mut p, 100, "explosion", |s| s.proj.clouds.first().map(|c| c.id));
+    assert_eq!(cloud_age(&p, id), Some(0), "creeper cloud aged on the tick of its birth");
+    full_tick(&mut p);
+    assert_eq!(cloud_age(&p, id), Some(1));
+    cleanup(p, dir);
+}
+
+/// A lingering potion that hits the ground during the projectile tick: its cloud does not age
+/// there either (age 0 at the end of the impact tick).
+#[test]
+fn potion_cloud_ages_on_next_tick() {
+    let Some((mut p, dir)) = probe("g4f07b-potion-cloud") else { return };
+    let mut item = Stack { id: "minecraft:lingering_potion".into(), count: 1, components: None };
+    let contents =
+        rc_proto::nbt::Nbt::Compound(vec![("potion".into(), rc_proto::nbt::Nbt::String("minecraft:poison".into()))]);
+    crate::items::set_component(&mut item, "minecraft:potion_contents", contents);
+    let pid = p.s.proj_new_id();
+    let mut q =
+        crate::projectiles::Proj::new(crate::projectiles::PKind::LingeringPotion, pid, [216.5, -57.5, 214.5], item);
+    q.vel = [0.0, -0.6, 0.0];
+    p.s.proj_add(q);
+    let id = until(&mut p, 40, "impact", |s| s.proj.clouds.first().map(|c| c.id));
+    assert_eq!(cloud_age(&p, id), Some(0), "potion cloud aged on the tick of its birth");
+    full_tick(&mut p);
+    assert_eq!(cloud_age(&p, id), Some(1));
+    cleanup(p, dir);
+}
+
+/// Arrow summoned by a command block minecart on a powered activator rail (command run during
+/// the minecart's tick, hence during the walk): first tick on the next tick.
+#[test]
+fn command_minecart_arrow_on_next_tick() {
+    let Some((mut p, dir)) = probe("g4f07b-command") else { return };
+    p.run("setblock 216 -60 214 minecraft:redstone_block\nsetblock 216 -59 214 minecraft:activator_rail[powered=true,shape=north_south]\n");
+    let src = p.s.server_source();
+    let cmd = "summon minecraft:command_block_minecart 216.5 -59 214.5 \
+               {Command:\"summon minecraft:arrow ~ ~3 ~ {Motion:[0.0d,0.0d,0.3d]}\"}";
+    let (ok, _) = p.s.perform(src, cmd);
+    assert!(ok, "command block minecart not summoned");
+    let kind = crate::projectiles::PKind::Arrow;
+    let aid = until(&mut p, 20, "minecart arrow", |s| s.proj.list.iter().find(|q| q.kind == kind).map(|q| q.id));
+    assert_eq!(proj_ticks(&p, aid), Some(0), "minecart arrow advanced on the tick of its birth");
+    full_tick(&mut p);
+    assert_eq!(proj_ticks(&p, aid), Some(1));
+    cleanup(p, dir);
+}
+
+/// Guard: what is born before the entity walk ticks within the same server tick, as in the game.
+/// Arrow added between two ticks (player, typed command) and dispenser arrow (block tick):
+/// first tick right away.
+#[test]
+fn outside_the_walk_first_tick_right_away() {
+    let Some((mut p, dir)) = probe("g4f07b-outside-walk") else { return };
     let ammo = Stack { id: "minecraft:arrow".into(), count: 1, components: None };
-    let mut a = p.s.mob_create_arrow(&l, &ammo, None);
-    a.vel = [1.0, 0.0, 0.0];
-    let arrow = a.id;
+    let mut a = p.s.new_arrow([210.5, -57.0, 215.5], &ammo, None);
+    a.vel = [0.3, 0.0, 0.0];
+    let aid = a.id;
     p.s.proj_add(a);
-    p.s.create_fangs(&l, 208.5, 208.5, -60.0, -58.0, 0.0, 5);
-    p.s.mobs.ticking.pop();
-    p.s.mobs.list[i] = Some(l);
-    let start = p.s.mobs.mounts.spits[0].pos;
-    let apos = p.s.proj.list.iter().find(|x| x.id == arrow).expect("arrow").pos;
-    let warm = p.s.mobs.ill.fangs[0].warmup;
-    p.s.spits_tick();
-    p.s.fangs_tick();
-    p.s.projectiles_tick();
-    assert_eq!(p.s.mobs.mounts.spits[0].pos, start, "spit advanced on the tick of its birth");
-    assert_eq!(p.s.mobs.mounts.spits[0].tick, 0);
-    assert_eq!(p.s.proj.list.iter().find(|x| x.id == arrow).expect("arrow").pos, apos, "arrow advanced");
-    assert_eq!(p.s.mobs.ill.fangs[0].warmup, warm, "fangs advanced");
-    p.s.spits_tick();
-    p.s.fangs_tick();
-    p.s.projectiles_tick();
-    assert_ne!(p.s.mobs.mounts.spits[0].pos, start, "spit still on the next tick");
-    assert_eq!(p.s.mobs.mounts.spits[0].tick, 1);
-    assert_ne!(p.s.proj.list.iter().find(|x| x.id == arrow).expect("arrow").pos, apos, "arrow still");
-    assert_eq!(p.s.mobs.ill.fangs[0].warmup, warm - 1, "fangs still");
-    // Outside a mob's tick: first tick right away.
-    let mut b = p.s.new_arrow([210.5, -58.0, 215.5], &ammo, None);
-    b.vel = [1.0, 0.0, 0.0];
-    let (bid, bpos) = (b.id, b.pos);
-    p.s.proj_add(b);
-    p.s.projectiles_tick();
-    assert_ne!(p.s.proj.list.iter().find(|x| x.id == bid).expect("arrow").pos, bpos, "player's arrow kept waiting");
+    full_tick(&mut p);
+    assert_eq!(proj_ticks(&p, aid), Some(1), "arrow added before the tick kept waiting");
+    p.run(
+        "setblock 220 -59 214 minecraft:dispenser[facing=up]\n\
+         data merge block 220 -59 214 {Items:[{Slot:0b,id:\"minecraft:arrow\",count:1}]}\n\
+         setblock 221 -59 214 minecraft:redstone_block\n",
+    );
+    let kind = crate::projectiles::PKind::Arrow;
+    let did = until(&mut p, 20, "dispenser shot", |s| {
+        s.proj.list.iter().find(|q| q.id != aid && q.kind == kind).map(|q| q.id)
+    });
+    assert_eq!(proj_ticks(&p, did), Some(1), "dispenser arrow kept waiting");
+    cleanup(p, dir);
+}
+
+/// Player's pearl read back from its file (as on entry, before any walk): it ticks on the very
+/// tick it is put back, although the put-back falls during the entity walk.
+#[test]
+fn reloaded_pearl_ticks_right_away() {
+    let Some((mut p, dir)) = probe("g4f07b-pearl") else { return };
+    let item = Stack { id: "minecraft:ender_pearl".into(), count: 1, components: None };
+    let id = p.s.proj_new_id();
+    let kind = crate::projectiles::PKind::EnderPearl;
+    let mut pearl = crate::projectiles::Proj::new(kind, id, [210.5, -50.0, 215.5], item);
+    pearl.owner = Some(p.s.uuid);
+    pearl.vel = [0.2, 0.0, 0.0];
+    let nbt = p.s.proj_to_nbt(&pearl);
+    p.s.proj_player.pearls_read = true;
+    p.s.proj_player.pending_pearls = vec![nbt];
+    full_tick(&mut p);
+    let back = p.s.proj.list.iter().find(|q| q.kind == kind).expect("pearl not put back");
+    assert_eq!(back.tick_count, 1, "reloaded pearl kept waiting for a tick");
+    cleanup(p, dir);
+}
+
+/// Frozen game, the player mounted on `id` (the only mob that still ticks): the entity that
+/// `born` finds is born during a frozen tick, does not tick while frozen (`ticks` at 0), then
+/// makes its first tick on the first thawed tick, not one more.
+fn frozen_birth(
+    p: &mut Probe,
+    who: &str,
+    id: i32,
+    born: impl Fn(&Server) -> Option<i32>,
+    ticks: impl Fn(&Server, i32) -> Option<i32>,
+) {
+    let i = p.s.mob_index(id).expect("mount");
+    let mut v = p.s.mobs.list[i].take().expect("mount");
+    assert!(p.s.player_start_riding(&mut v), "{who}: player not mounted");
+    p.s.mobs.list[i] = Some(v);
+    p.s.player_command("tick freeze");
+    assert!(p.s.cmd.ticking.frozen(), "game not frozen");
+    let e = until(p, 200, who, &born);
+    for _ in 0..3 {
+        full_tick(p);
+    }
+    assert_eq!(ticks(&p.s, e), Some(0), "{who}: ticked while frozen");
+    p.s.player_command("tick unfreeze");
+    full_tick(p);
+    assert_eq!(ticks(&p.s, e), Some(1), "{who}: first tick missed on thaw");
+    if p.s.mobs.mounts.riding.vehicle.is_some() {
+        p.s.player_stop_riding();
+    }
+}
+
+/// Frozen game: the player's mount still ticks. A spit (mounted llama), a snowball (mounted snow
+/// golem) and the cloud of a creeper under an effect that explodes (mounted with `/ride`) born
+/// during a frozen tick make their first tick on the first thawed tick.
+#[test]
+fn freeze_then_thaw_first_tick_on_thaw() {
+    let Some((mut p, dir)) = probe("g4f07b-freeze") else { return };
+    p.s.cmd.op = 4;
+    p.s.game_mode = 1;
+    let cow = bare(&mut p, Kind::Cow, [216.5, -59.0, 224.5]);
+    let llama = bare(&mut p, Kind::Llama, [212.5, -59.0, 210.5]);
+    let golem = bare(&mut p, Kind::SnowGolem, [220.5, -59.0, 210.5]);
+    let i = p.s.mob_index(llama).unwrap();
+    p.s.mobs.list[i].as_mut().unwrap().mount.set_flag(super::mounts::FLAG_TAME, true);
+    set_target(&mut p, llama, Some(Ent::Mob(cow)));
+    let spit = |s: &Server, e: i32| s.mobs.mounts.spits.iter().find(|x| x.id == e).map(|x| x.tick);
+    frozen_birth(&mut p, "spit", llama, |s| s.mobs.mounts.spits.first().map(|x| x.id), spit);
+    set_target(&mut p, llama, None);
+    set_target(&mut p, golem, Some(Ent::Mob(cow)));
+    let snow = crate::projectiles::PKind::Snowball;
+    let ball = |s: &Server| s.proj.list.iter().find(|q| q.kind == snow).map(|q| q.id);
+    frozen_birth(&mut p, "snowball", golem, ball, |s, e| {
+        s.proj.list.iter().find(|q| q.id == e).map(|q| q.tick_count)
+    });
+    set_target(&mut p, golem, None);
+    let mut c = p.s.new_mob(Kind::Creeper, [216.5, -59.0, 214.5], 0.0);
+    assert!(p.s.give_mob_effect(&mut c, "minecraft:speed", 600, 0), "effect refused");
+    c.ignited = true;
+    let creeper = c.id;
+    p.s.add_mob(c);
+    let age = |s: &Server, e: i32| s.proj.clouds.iter().find(|c| c.id == e).map(|c| c.age);
+    frozen_birth(&mut p, "cloud", creeper, |s| s.proj.clouds.first().map(|c| c.id), age);
     cleanup(p, dir);
 }

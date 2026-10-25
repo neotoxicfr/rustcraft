@@ -8,6 +8,44 @@ use super::mth::{DEG, degrees_difference, pitch_to, rotate_if_necessary, rotate_
 use super::species::Kind;
 use crate::server::Server;
 
+/// Entity walk of the server tick: from the first mob to the clouds. The game does not see, in
+/// this walk, an entity that is added to it: its first tick happens on the next server tick. Our
+/// lists tick one after the other (mobs, spits, fangs, bolts, minecarts, projectiles, clouds);
+/// an entity born during the walk therefore carries its number, and the list that meets it in
+/// that same walk skips it. Born after its list's tick (a spit launched from a minecart), it is
+/// no longer skipped on the next tick.
+#[derive(Debug, Default)]
+pub(crate) struct Walk {
+    /// Walks started.
+    count: u64,
+    /// Number of the walk in progress, 0 outside the walk.
+    now: u64,
+}
+
+impl Walk {
+    /// Start of the walk, right before the first mob (frozen included: the player's mount
+    /// still ticks).
+    pub(crate) fn start(&mut self) {
+        self.count += 1;
+        self.now = self.count;
+    }
+
+    /// End of the walk, after the projectiles and the clouds.
+    pub(crate) fn end(&mut self) {
+        self.now = 0;
+    }
+
+    /// Mark of an entity created now: the number of the walk in progress, 0 outside.
+    pub(crate) fn born(&self) -> u64 {
+        self.now
+    }
+
+    /// True for an entity born during the walk in progress: its tick waits for the next one.
+    pub(crate) fn waits(&self, born: u64) -> bool {
+        born != 0 && born == self.now
+    }
+}
+
 impl Server {
     /// Tick of the mobs (after the player's life, before the block broadcast).
     /// Parts of the tick specific to the current player (host, or guest set up by `as_guest`).
@@ -52,6 +90,8 @@ impl Server {
             self.bells_tick(); // rung bells: resonance, raiders glowing
         }
         let player_vehicle = self.mobs.mounts.riding.vehicle;
+        // Start of the entity walk; it ends after the projectiles and the clouds.
+        self.walk.start();
         // Snapshot: mobs added during this tick wait for the next.
         let n = self.mobs.list.len();
         for i in 0..n {
@@ -104,12 +144,6 @@ impl Server {
             self.end_world_tick(); // F15: crystals, breath, bullets
             self.spawner_blocks_tick(); // W9: spawners, trials, vaults (block entities, after the entities)
             self.player_pushes_mobs(); // player push: also stopped when frozen
-        } else {
-            // Frozen: what the player's mount created does not tick; on thaw, it ticks from the
-            // first tick, like the rest.
-            self.mobs.mounts.spits.iter_mut().for_each(|s| s.wait = false);
-            self.mobs.ill.fangs.iter_mut().for_each(|f| f.wait = false);
-            self.mobs.mounts.bolts.iter_mut().for_each(|b| b.wait = false);
         }
         self.cubes_player_touch();
         self.pufferfish_player_touch(); // F09

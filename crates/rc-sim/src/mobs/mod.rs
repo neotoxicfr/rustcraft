@@ -36,6 +36,7 @@ pub(crate) mod species;
 mod structure_spawn; // F07: spawn lists of structures
 pub(crate) mod surface;
 mod tick;
+pub(crate) use tick::Walk;
 pub(crate) mod track;
 pub(crate) mod trades;
 pub(crate) mod trial; // W9: cages, trial spawners, vaults

@@ -2448,3 +2448,10 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   dismount). Projectiles, spits, fangs and bolts born during a mob's tick: one boolean per
   entity, read and reset on the next tick (no allocation; one extra walk only while the game is
   frozen, to reset the flags).
+- Second rework: the boolean becomes a birth mark (`mobs::Walk`, number of the entity walk,
+  8 bytes per spit, fang, bolt, projectile and cloud) compared with the walk in progress; one
+  integer comparison per entity and per tick, like reading the boolean. The two reset walks of
+  the frozen game disappear (less work while frozen), no walk added, no allocation. Nothing
+  measurable per scene: even with hundreds of arrows stuck in blocks, the work per arrow and
+  per tick stays the read of one field, already done with the boolean; no bench, multi-core and
+  GPU not applicable.

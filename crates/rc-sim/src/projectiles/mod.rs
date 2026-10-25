@@ -261,8 +261,8 @@ pub struct Proj {
     pub fire: i32,
     pub in_water: bool,
     pub first_tick: bool,
-    /// Added during a mob's tick: first tick on the next server tick.
-    pub wait: bool,
+    /// Number of the entity walk it was born in (0: outside the walk), read by `mobs::Walk`.
+    pub born: u64,
     pub on_ground: bool,
     pub horizontal_collision: bool,
     pub no_gravity: bool,
@@ -426,7 +426,7 @@ impl Proj {
             fire: 0,
             in_water: false,
             first_tick: true,
-            wait: false,
+            born: 0,
             on_ground: false,
             horizontal_collision: false,
             no_gravity: false,
@@ -601,8 +601,9 @@ impl Server {
     pub(crate) fn proj_add(&mut self, mut p: Proj) {
         p.sync_arrow_flags();
         // The entity walk does not see what is added to it along the way: a projectile launched
-        // by a mob during its tick makes its first tick on the next server tick.
-        p.wait = !self.mobs.ticking.is_empty();
+        // during this walk (mob, ominous spawner, command block minecart) makes its first
+        // tick on the next server tick.
+        p.born = self.walk.born();
         if self.proj_visible(&p) {
             self.proj_pair(&mut p);
         }
@@ -788,13 +789,12 @@ impl Server {
             self.proj_list_tick();
             self.clouds_tick();
             self.fishing_tick();
-        } else {
-            // Frozen: on thaw, everything ticks from the first tick.
-            self.proj.list.iter_mut().for_each(|p| p.wait = false);
         }
         self.proj_player_touch();
         self.spin_attack_tick();
         self.proj_retain();
+        // End of the entity walk (started before the first mob).
+        self.walk.end();
     }
 
     /// Projectiles of a parked dimension (portal ticket or player's pearl in flight): tracking
@@ -838,7 +838,8 @@ impl Server {
         let n = self.proj.list.len();
         for i in 0..n {
             let Some(slot) = self.proj.list.get_mut(i) else { break };
-            if std::mem::take(&mut slot.wait) {
+            // Born during this entity walk: it waits for the next tick.
+            if self.walk.waits(std::mem::take(&mut slot.born)) {
                 continue;
             }
             let slot = &self.proj.list[i];

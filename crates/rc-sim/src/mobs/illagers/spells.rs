@@ -22,8 +22,8 @@ pub struct Fangs {
     pub sent_spike: bool,
     pub owner: Option<i32>,
     pub removed: bool,
-    /// Born during a mob's tick: first tick on the next server tick.
-    pub wait: bool,
+    /// Number of the entity walk they were born in (0: outside the walk), read by `mobs::Walk`.
+    pub born: u64,
 }
 
 impl Server {
@@ -218,7 +218,7 @@ impl Server {
             sent_spike: false,
             owner: Some(m.id),
             removed: false,
-            wait: !self.mobs.ticking.is_empty(),
+            born: self.walk.born(),
         });
     }
 
@@ -240,8 +240,8 @@ impl Server {
     pub(crate) fn fangs_tick(&mut self) {
         let mut list = std::mem::take(&mut self.mobs.ill.fangs);
         for f in list.iter_mut().filter(|f| !f.removed) {
-            // Added during this tick's entity walk: they wait for the next one.
-            if std::mem::take(&mut f.wait) {
+            // Born during this entity walk: they wait for the next tick.
+            if self.walk.waits(std::mem::take(&mut f.born)) {
                 continue;
             }
             f.warmup -= 1;

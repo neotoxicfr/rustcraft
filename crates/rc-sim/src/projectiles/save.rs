@@ -320,6 +320,11 @@ impl Server {
         for n in here {
             if let Some(p) = self.proj_from_nbt(&n) {
                 self.proj_add(p);
+                // Reset as on the player's entry, before the entity walk: it ticks from this
+                // tick on (the call falls during the walk).
+                if let Some(q) = self.proj.list.last_mut() {
+                    q.born = 0;
+                }
             }
         }
     }
