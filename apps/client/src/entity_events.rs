@@ -23,6 +23,8 @@ enum Follow {
     Guardian,
     /// Sniffer digging: while it searches or digs.
     Sniffer,
+    /// Sound "bound to the entity": follows its position, fixed volume and pitch.
+    Bound,
 }
 
 /// State of the entity event effects.
@@ -666,6 +668,7 @@ impl crate::App {
             Follow::Sniffer => {
                 rc_audio::SoundRequest::new("minecraft:entity.sniffer.digging", Category::Neutral).at(pos)
             }
+            Follow::Bound => return,
         };
         if kind == Follow::Guardian {
             // Without attenuation: audible everywhere, always placed at the guardian's position.
@@ -673,6 +676,21 @@ impl crate::App {
         }
         if let Some(h) = a.play_request(req) {
             self.ev.follows.push((h, id, kind));
+        }
+    }
+
+    /// Sound bound to entity `id` (played by the client for any entity): nothing if it is
+    /// silent; otherwise it follows its position and is cut when the entity disappears or becomes silent.
+    pub(crate) fn ev_bound_sound(&mut self, id: i32, name: &str, cat: Category, volume: f32, pitch: f32) {
+        let Some(e) = self.entities.map.get(&id) else { return };
+        if e.meta_bool(4) {
+            return;
+        }
+        let pos = e.pos;
+        let Some(a) = self.audio.get() else { return };
+        let req = rc_audio::SoundRequest::new(name, cat).at(pos).volume(volume).pitch(pitch);
+        if let Some(h) = a.play_request(req) {
+            self.ev.follows.push((h, id, Follow::Bound));
         }
     }
 
@@ -708,15 +726,18 @@ impl crate::App {
                 Follow::Guardian => {
                     let dur = if e.kind == "elder_guardian" { 60.0 } else { 80.0 };
                     let s = e.extra[5] / dur;
-                    Some((e.pos, s * s, 0.7 + 0.5 * s))
+                    Some((e.pos, Some((s * s, 0.7 + 0.5 * s))))
                 }
                 // Searching (4) or digging (5).
-                Follow::Sniffer => matches!(e.meta_int(18), Some(4 | 5)).then_some((e.pos, 1.0, 1.0)),
+                Follow::Sniffer => matches!(e.meta_int(18), Some(4 | 5)).then_some((e.pos, Some((1.0, 1.0)))),
+                Follow::Bound => Some((e.pos, None)),
             });
             match keep {
-                Some((pos, volume, pitch)) => {
+                Some((pos, params)) => {
                     a.set_position(h, pos);
-                    a.set_sound_params(h, volume, pitch);
+                    if let Some((volume, pitch)) = params {
+                        a.set_sound_params(h, volume, pitch);
+                    }
                     true
                 }
                 None => {

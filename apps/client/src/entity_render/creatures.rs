@@ -1295,7 +1295,9 @@ pub(super) fn tick(e: &mut Entity) {
 }
 
 /// Copper golem (state in 17: 0 inactive, 1-4 interactions); AI off (15 & 1): nothing.
+/// Extra 6: head spin sound due at this tick (10 ticks after the animation starts).
 fn tick_copper_golem(e: &mut Entity) {
+    e.extra[6] = 0.0;
     if e.meta_byte(15) & 1 != 0 {
         return;
     }
@@ -1314,6 +1316,7 @@ fn tick_copper_golem(e: &mut Entity) {
             x[1] = age + wait;
         }
         if age == x[1] + 10.0 {
+            x[6] = 1.0;
             x[1] = 0.0;
         }
     } else {
@@ -1389,26 +1392,48 @@ fn tick_squid(e: &mut Entity) {
 }
 
 /// Guardian (§ 12.2): 0-1 tail, 2 tail speed, 3-4 spines, 5 attack time,
-/// 6 last target (bits), 7 initialised. Always assumed in water (air supply has no effect).
+/// 6 last target (bits), 7 initialised, 8 touched the ground (fell onto a solid block), 9 block
+/// under it is solid (noted before the tick by `water_track`), 10 flop sound due at this tick.
+/// Water: box contact noted before the tick (`water_track`). Dead: nothing moves.
 fn tick_guardian(e: &mut Entity) {
+    e.extra[10] = 0.0;
+    if e.death_time > 0 {
+        return;
+    }
     let moving = e.meta_bool(16);
     let target = e.meta_int(17).unwrap_or(0);
     let dur = if e.kind == "elder_guardian" { 60.0 } else { 80.0 };
     if e.extra[7] == 0.0 {
         e.extra[7] = 1.0;
-        e.extra[0] = rand01(e, 2) * 10.0;
+        e.extra[0] = rand01(e, 2);
         e.extra[1] = e.extra[0];
     }
+    let (water, vy, silent) = (e.in_water, e.velocity[1], e.meta_bool(4));
+    // Spines out of water: a fresh draw every tick (visual only, reproducible randomness).
+    let jitter = rand01(e, e.age ^ 0x5bd1_e995);
     let x = &mut e.extra;
     x[1] = x[0];
-    if moving {
+    if !water {
+        // Out of water: fast tail; flop when it bounces back up after touching the ground.
+        x[2] = 2.0;
+        if vy > 0.0 && x[8] != 0.0 && !silent {
+            x[10] = 1.0;
+        }
+        x[8] = f32::from(u8::from(vy < 0.0 && x[9] != 0.0));
+    } else if moving {
         x[2] = if x[2] < 0.5 { 4.0 } else { x[2] + (0.5 - x[2]) * 0.1 };
     } else {
         x[2] += (0.125 - x[2]) * 0.2;
     }
     x[0] += x[2];
     x[4] = x[3];
-    x[3] += if moving { -x[3] * 0.25 } else { (1.0 - x[3]) * 0.06 };
+    x[3] = if !water {
+        jitter
+    } else if moving {
+        x[3] - x[3] * 0.25
+    } else {
+        x[3] + (1.0 - x[3]) * 0.06
+    };
     if x[6].to_bits() != target as u32 {
         x[6] = f32::from_bits(target as u32);
         x[5] = 0.0;
@@ -1418,8 +1443,9 @@ fn tick_guardian(e: &mut Entity) {
     }
 }
 
-/// Cube mobs (§ 13.1): 0-1 squash, 2 target, 3 on ground at the previous tick; sulfur:
-/// 4 fuse, 5 last fuse received (bits), 6 received.
+/// Cube mobs (§ 13.1): 0-1 squash, 2 target, 3 on ground at the previous tick, 7 landed at this
+/// tick (landing particles, `entity_fx`); sulfur: 4 fuse, 5 last fuse received (bits),
+/// 6 received.
 fn tick_cube(e: &mut Entity) {
     let magma = e.kind == "magma_cube";
     let sulfur = e.kind == "sulfur_cube";
@@ -1430,6 +1456,7 @@ fn tick_cube(e: &mut Entity) {
     x[1] = x[0];
     x[0] += (x[2] - x[0]) * 0.5;
     let was = x[3] != 0.0;
+    x[7] = f32::from(u8::from(ground && !was));
     if ground && !was {
         x[2] = -0.5;
     } else if !ground && was {
@@ -1675,5 +1702,97 @@ mod tests {
         all.map.get_mut(&7).unwrap().passengers.push(8);
         let g = *part(&posed(&l, &all.map[&7], 0.0), "goggles");
         assert_eq!((g[3], g[1]), (0.0, 14.0));
+    }
+
+    /// Cubes: "landed at this tick" (extra 7) raised only at the tick where it touches the ground
+    /// after being in the air, for the landing particles. Before: nothing was noted.
+    #[test]
+    fn cube_landing_is_flagged_once() {
+        for kind in ["slime", "magma_cube", "sulfur_cube"] {
+            let mut all = spawn(kind);
+            all.tick();
+            assert_eq!(all.map[&7].extra[7], 0.0, "{kind}");
+            all.map.get_mut(&7).unwrap().on_ground = true;
+            all.tick();
+            assert_eq!(all.map[&7].extra[7], 1.0, "{kind}");
+            all.tick();
+            assert_eq!(all.map[&7].extra[7], 0.0, "{kind}");
+            all.map.get_mut(&7).unwrap().on_ground = false;
+            all.tick();
+            assert_eq!(all.map[&7].extra[7], 0.0, "{kind}");
+        }
+    }
+
+    /// Copper golem: head spin sound due 10 ticks after the idle animation starts, once per
+    /// cycle; never with AI off. Before: the counter was reset without a sound.
+    #[test]
+    fn copper_golem_head_spin_sound_is_due() {
+        let mut all = spawn("copper_golem");
+        let (mut start, mut sound) = (None, Vec::new());
+        for _ in 0..600 {
+            all.tick();
+            let e = &all.map[&7];
+            if State::start_of(e.extra[0]).is_some() && start.is_none() {
+                start = Some(e.age);
+            }
+            if e.extra[6] != 0.0 {
+                sound.push(e.age);
+            }
+        }
+        let start = start.expect("idle animation never started");
+        assert_eq!(sound.first(), Some(&(start + 10)), "{sound:?}");
+        assert!(sound.windows(2).all(|w| (200..=250).contains(&(w[1] - w[0]))), "{sound:?}");
+        let mut all = spawn("copper_golem");
+        all.map.get_mut(&7).unwrap().meta.insert(15, Meta::Byte(1));
+        for _ in 0..600 {
+            all.tick();
+            assert_eq!(all.map[&7].extra[6], 0.0);
+        }
+    }
+
+    /// Guardian out of water: tail at speed 2, spines drawn every tick, flop due at the tick where
+    /// it rises after falling onto a solid block (not if it is silent); in still water,
+    /// speed towards 0.125. Initial tail phase in [0, 1). Before: always assumed in water,
+    /// never a flop.
+    #[test]
+    fn guardian_out_of_water() {
+        let mut all = spawn("guardian");
+        let e = all.map.get_mut(&7).unwrap();
+        e.in_water = false;
+        e.extra[9] = 1.0;
+        e.velocity = [0.0, -0.1, 0.0];
+        all.tick();
+        let e = &all.map[&7];
+        assert!(e.extra[1] >= 0.0 && e.extra[1] < 1.0, "{}", e.extra[1]);
+        assert_eq!((e.extra[2], e.extra[8], e.extra[10]), (2.0, 1.0, 0.0));
+        let spikes = e.extra[3];
+        all.map.get_mut(&7).unwrap().velocity = [0.0, 0.5, 0.0];
+        all.tick();
+        let e = &all.map[&7];
+        assert_eq!((e.extra[8], e.extra[10]), (0.0, 1.0));
+        assert_ne!(e.extra[3], spikes);
+        assert!((0.0..1.0).contains(&e.extra[3]));
+        all.tick();
+        assert_eq!(all.map[&7].extra[10], 0.0);
+        // Silent: no flop.
+        let e = all.map.get_mut(&7).unwrap();
+        e.meta.insert(4, Meta::Bool(true));
+        e.velocity = [0.0, -0.1, 0.0];
+        all.tick();
+        all.map.get_mut(&7).unwrap().velocity = [0.0, 0.5, 0.0];
+        all.tick();
+        assert_eq!(all.map[&7].extra[10], 0.0);
+        // Block under it not solid: does not "touch" the ground.
+        let e = all.map.get_mut(&7).unwrap();
+        e.meta.insert(4, Meta::Bool(false));
+        e.extra[9] = 0.0;
+        e.velocity = [0.0, -0.1, 0.0];
+        all.tick();
+        assert_eq!(all.map[&7].extra[8], 0.0);
+        // In water, still: 2 -> 2 + (0.125 - 2) x 0.2.
+        let e = all.map.get_mut(&7).unwrap();
+        e.in_water = true;
+        all.tick();
+        assert!((all.map[&7].extra[2] - 1.625).abs() < 1e-6);
     }
 }
