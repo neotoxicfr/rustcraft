@@ -986,6 +986,7 @@ impl Server {
         }
         if self.game_mode != 3 {
             self.environment_damage();
+            self.player_step_on(); // block stepped on: magma, redstone ore
         }
         self.effects_tick(); // S7
         self.use_item_tick();
@@ -1220,6 +1221,8 @@ impl Server {
                     let _ = self.send(Event::Entity(EntityEvent::Event { id, event: 54 }));
                 }
                 let below_st = self.state_at(below.map(|c| c.floor() as i32)).unwrap_or(0);
+                let (w, h, _) = self.player_dims();
+                self.trample_farmland(below.map(|c| c.floor() as i32), below_st, fall, true, w as f32, h as f32);
                 let rule = self.fall_rule(below_st, fall, self.sneaking);
                 // `fall_one_cm` statistic: any fall "onto" the block of at least 2 m
                 // (distance after the block's rule), except for a player who can fly.

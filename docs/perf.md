@@ -2433,3 +2433,24 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   walk of the order of 3.65 ms for 12,000 files (G1-F15 measurement), kept for safety.
 - Free disk space (`rc_sim::storage::low_disk_space`): one system call at opening, on
   the main thread; not measured separately (negligible).
+## G5-F02b: entity bodies (25/10, loaded machine, to re-measure when idle)
+
+- Block stepped on (magma, redstone ore), every tick for every mob on the ground: effect cell
+  reused from the last movement when the position and the support have not changed
+  (`RUSTCRAFT_OPT_STEPON_CACHE`, default 1) instead of recomputing it (support read: fence,
+  wall, fence gate by tag and by name). Bench `bench_tick_additions` (2 alternated passes,
+  2,000,000 calls, zombie standing on stone with a support): 13.3 / 13.3 ns with the cache,
+  65.6 / 59.4 ns without; kept. Equivalence: test `magma_and_ore_stepped_on` (reused cell =
+  recomputed cell). The rest (state read, comparison of three identifiers) is the minimum.
+- Size reading (refit after growth), twice per tick and per mob: 6.8 to 12 ns (two width ×
+  height pairs, no allocation). The search for the free center (the game's shapes) only runs
+  on growth (growing up, placement), a few times in a mob's life: multi-core and GPU not
+  applicable.
+- Team filter of the push: short-circuited as long as no team has a rule other than "always"
+  (one walk of the team list, empty in general); otherwise one UUID string and one team lookup
+  per neighbor that touches, only for the neighbors already in contact. Bench of the push with
+  no neighbor: 69 to 84 ns, unchanged (noise).
+- Block step sound: one copy of the sound name per step (no more than one per block walked),
+  like the existing fall sound; amethyst chime without allocation.
+- Entity sound seed drawn from the sound generator (atomic SplitMix64) instead of the world
+  random source: equivalent cost; world fingerprints changed (intended fix, see the commit).

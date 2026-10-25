@@ -482,7 +482,7 @@ impl Server {
 
     /// Farmland (or path) turned back into dirt: entities raised from 15/16 to 1, placement,
     /// "block changed" event.
-    fn turn_to_dirt(&mut self, p: P) {
+    pub(crate) fn turn_to_dirt(&mut self, p: P) {
         let dirt = self.v().default_state(self.bs.t.id.dirt);
         self.push_entities_up(p, 15.0 / 16.0, 1.0);
         self.set_update(p, dirt);

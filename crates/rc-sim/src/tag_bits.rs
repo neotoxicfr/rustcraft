@@ -55,6 +55,7 @@ tag_ids! {
     CausesSuffocation = "minecraft:causes_suffocation",
     Climbable = "minecraft:climbable",
     ConvertibleToMud = "minecraft:convertible_to_mud",
+    CrystalSoundBlocks = "minecraft:crystal_sound_blocks",
     CushionUsesCollisionShape = "minecraft:cushion_uses_collision_shape",
     DoesNotBlockHoppers = "minecraft:does_not_block_hoppers",
     Doors = "minecraft:doors",

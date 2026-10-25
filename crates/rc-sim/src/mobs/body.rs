@@ -16,6 +16,27 @@ fn push_idx() -> bool {
     *ON.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_PUSHIDX") != Some("0"))
 }
 
+/// `RUSTCRAFT_OPT_STEPON_CACHE=0`: the block stepped on always recomputes its effect cell instead
+/// of reusing the one from the last movement.
+fn stepon_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_STEPON_CACHE") != Some("0"))
+}
+
+/// Per-mob body state, outside physics: amethyst chime of the steps (intensity, tick of the
+/// last chime), last seen size (width, height) for the refit after growth (`None` before the
+/// first tick), effect cell of the last movement with the position and support that produced it.
+#[derive(Debug, Clone, Default)]
+pub struct BodyFx {
+    pub crystal: f32,
+    pub crystal_tick: i32,
+    pub dims: Option<(f32, f32)>,
+    pub effect: Option<EffectAt>,
+}
+
+/// Effect cell (0.2 below the feet) computed for a position and a support.
+pub type EffectAt = ([f64; 3], Option<[i32; 3]>, [i32; 3]);
+
 fn l2(v: [f64; 3]) -> f64 {
     v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
 }
@@ -55,6 +76,31 @@ impl rc_physics::World for SnowStand<'_> {
     fn moving_collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<rc_physics::Aabb>) -> bool {
         self.inner.moving_collision(x, y, z, out)
     }
+}
+
+/// Code of a team collision rule: 0 always, 1 never, 2 other teams, 3 own team.
+fn collision_code(rule: &str) -> u8 {
+    match rule {
+        "never" => 1,
+        "pushOtherTeams" => 2,
+        "pushOwnTeam" => 3,
+        _ => 0,
+    }
+}
+
+/// Does the entity with rule `own` (team `own_team`) push the one with rule `their`? Like the
+/// official game (and the client, `player_env.rs`): "never" on either side blocks; with "own
+/// team" on either side, two members of the same team do NOT push each other (quirk of the game,
+/// reproduced); with "other teams" on either side, only members of the same team push each other.
+fn team_allows(own: u8, own_team: Option<&str>, their: u8, their_team: Option<&str>) -> bool {
+    if own == 1 || their == 1 {
+        return false;
+    }
+    let same = own_team.is_some() && own_team == their_team;
+    if (own == 3 || their == 3) && same {
+        return false;
+    }
+    (own != 2 && their != 2) || same
 }
 
 fn corrected(x: f32, m: f32) -> f32 {
@@ -229,6 +275,7 @@ impl Server {
         }
         // Fall; F12: strider in lava, fall reset to zero.
         let effect_pos = self.mob_below(m, 0.2);
+        m.body_fx.effect = Some((m.pos, m.support, effect_pos));
         let lava_reset = super::nether::strider::fall_reset(m);
         if lava_reset {
             m.fall_distance = 0.0;
@@ -239,6 +286,8 @@ impl Server {
         if m.on_ground && !lava_reset {
             if m.fall_distance > 0.0 {
                 let on = self.st(effect_pos);
+                let (w, h) = m.dims_wh();
+                self.trample_farmland(effect_pos, on, m.fall_distance, false, w, h);
                 self.fall_on(m, on, m.fall_distance);
                 // Landing: state of the main supporting block, otherwise of the block at 0.2.
                 let st = self.st(m.support.unwrap_or(effect_pos));
@@ -270,7 +319,7 @@ impl Server {
             if m.vertical_collision {
                 let mut r = own;
                 if delta[1] < 0.0 {
-                    r = if -cur[1] > m.attrs.gravity.value() && !self.btag_id(effect_pos, crate::tag_bits::TagId::SuppressesBounce) {
+                    r = if -cur[1] > m.gravity() && !self.btag_id(effect_pos, crate::tag_bits::TagId::SuppressesBounce) {
                         r.max(block_bounce)
                     } else {
                         0.0
@@ -278,7 +327,7 @@ impl Server {
                 }
                 v[1] = if r > 0.0 {
                     let portion = mv[1] / cur[1];
-                    let comp = portion * m.attrs.gravity.value();
+                    let comp = portion * m.gravity();
                     let air = if m.omnidirectional_air() { 0.91f32 } else { 0.98f32 };
                     let air = f64::from(corrected(air, m.air_drag_modifier()));
                     let drag = 1.0 + (air - 1.0) * portion;
@@ -466,15 +515,49 @@ impl Server {
         }
     }
 
-    fn step_sound(&mut self, m: &mut Mob, _on: [i32; 3]) {
-        if self.mount_step_sound(m, _on) {
+    /// Step sound on the effect block `on`: the species' own sound (or the block's), then the
+    /// amethyst chime, played whatever the step sound (even a silent one).
+    fn step_sound(&mut self, m: &mut Mob, on: [i32; 3]) {
+        self.step_sound_own(m, on);
+        if self.btag_id(on, crate::tag_bits::TagId::CrystalSoundBlocks) && m.tick_count >= m.body_fx.crystal_tick + 20 {
+            let fx = &mut m.body_fx;
+            let decay = 0.997f64.powf(f64::from(m.tick_count - fx.crystal_tick)) as f32;
+            fx.crystal = (fx.crystal * decay + 0.07).min(1.0);
+            let pitch = 0.5 + fx.crystal * m.rng.next_float() * 1.2;
+            let volume = 0.1 + m.body_fx.crystal * 1.2;
+            m.body_fx.crystal_tick = m.tick_count;
+            self.mob_sound(m, "minecraft:block.amethyst_block.chime", volume, pitch);
+        }
+    }
+
+    fn step_sound_own(&mut self, m: &mut Mob, on: [i32; 3]) {
+        if self.mount_step_sound(m, on) {
+            return;
+        }
+        // Silent steps: happy ghast (F14), allay, bee, fish and tadpole, nautiluses; sulfur
+        // cube carrying an item. (The breeze only emits events: never called.)
+        let silent = match m.kind {
+            Kind::SulfurCube => m.has_body_item(),
+            k => {
+                super::recent::silent_steps(k)
+                    || matches!(
+                        k,
+                        Kind::Allay
+                            | Kind::Bee
+                            | Kind::Cod
+                            | Kind::Salmon
+                            | Kind::Pufferfish
+                            | Kind::TropicalFish
+                            | Kind::Tadpole
+                            | Kind::Nautilus
+                            | Kind::ZombieNautilus
+                    )
+            }
+        };
+        if silent {
             return;
         }
         // F06: iron and copper golems (volume 1).
-        // F14: breeze (events only) and silent happy ghasts.
-        if super::recent::silent_steps(m.kind) {
-            return;
-        }
         if let Some((s, v)) = super::golems::step_sound(m)
             .or_else(|| super::nether::step_sound(m))
             .or_else(|| super::recent::step_sound(m))
@@ -483,12 +566,27 @@ impl Server {
             return;
         }
         // Sound variant set (pig, cow, chicken, wolf; babies included).
-        let s = super::surface::step_sound(m)
-            .map(str::to_owned)
-            .or_else(|| self.variant_sound(m, "step_sound"))
-            .or_else(|| m.kind.info().step_sound.map(str::to_owned));
-        if let Some(s) = s {
+        let own = if m.kind == Kind::SulfurCube {
+            None
+        } else {
+            super::surface::step_sound(m)
+                .map(str::to_owned)
+                .or_else(|| self.variant_sound(m, "step_sound"))
+                .or_else(|| m.kind.info().step_sound.map(str::to_owned))
+        };
+        if let Some(s) = own {
             self.mob_sound(m, &s, 0.15, 1.0);
+            return;
+        }
+        // No sound of its own: step sound of the block's sound group, volume × 0.15.
+        let st = self.st(on);
+        let Some(t) = self.data.states.get(st as usize).and_then(|i| self.data.sound_types.get(usize::from(i.sound)))
+        else {
+            return;
+        };
+        if !t.step.is_empty() {
+            let (s, v, p) = (t.step.clone(), t.volume * 0.15, t.pitch);
+            self.mob_sound(m, &s, v, p);
         }
     }
 
@@ -528,6 +626,70 @@ impl Server {
         }
     }
 
+    /// Fall of a living entity (player or mob, box `w` × `h`) onto the effect block `p`
+    /// of state `st`: farmland turns back into dirt if the world random falls below the
+    /// fall distance − 0.5, if the player (never in a protected zone on this server) or the
+    /// `mob_griefing` rule allows it, and if the box exceeds 0.512 cubic blocks; the random
+    /// is drawn only on farmland. Fall damage follows, unchanged.
+    pub(crate) fn trample_farmland(&mut self, p: [i32; 3], st: u32, dist: f64, player: bool, w: f32, h: f32) {
+        if self.v().block(st) != self.bs.t.id.farmland {
+            return;
+        }
+        if f64::from(self.bs.rng.next_float()) < dist - 0.5
+            && (player || self.rule("minecraft:mob_griefing", true))
+            && w * w * h > 0.512
+        {
+            self.turn_to_dirt(p);
+        }
+    }
+
+    /// Entity on the ground on the effect block `p` (0.2 below the feet), every tick after the
+    /// movement; `careful`: careful step (sneaking). True if the block burns the feet (magma);
+    /// a redstone ore lights up.
+    pub(crate) fn step_on_block(&mut self, p: [i32; 3], careful: bool) -> bool {
+        if careful {
+            return false;
+        }
+        let s = self.st(p);
+        let b = self.v().block(s);
+        let ids = &self.bs.t.id;
+        if b == ids.magma {
+            return true;
+        }
+        if b == ids.redstone_ore || b == ids.deepslate_redstone_ore {
+            self.redstone_ore_touch(p, s);
+        }
+        false
+    }
+
+    /// Effect of the block stepped on by a mob on the ground (never sneaking): 1 `hot_floor`
+    /// damage on magma (fire-immune mobs are excluded by the `is_fire` tag).
+    pub(crate) fn mob_step_on(&mut self, m: &mut Mob) {
+        if !m.on_ground || m.removed || super::illagers::no_physics(m) {
+            return;
+        }
+        // Effect cell of the last movement if the position and the support have not changed
+        // since (same computation, without re-reading the support).
+        let p = match m.body_fx.effect {
+            Some((pos, support, e)) if stepon_cache() && pos == m.pos && support == m.support => e,
+            _ => self.mob_below(m, 0.2),
+        };
+        if self.step_on_block(p, false) {
+            self.mob_hurt(m, "minecraft:hot_floor", 1.0, None, None);
+        }
+    }
+
+    /// Same effect for the player on the ground, except when sneaking.
+    pub(crate) fn player_step_on(&mut self) {
+        if !self.on_ground || self.game_mode == 3 || self.life.vit.dead {
+            return;
+        }
+        let p = self.on_pos(self.pos, self.player_support(), 0.2);
+        if self.step_on_block(p, self.sneaking) {
+            self.hurt("minecraft:hot_floor", 1.0);
+        }
+    }
+
     /// `travel(input)` for a mob with effective AI.
     pub(crate) fn mob_travel(&mut self, m: &mut Mob) {
         super::mounts::camel::freeze_travel(self, m); // F04
@@ -550,9 +712,8 @@ impl Server {
         if super::sealife::travel(self, m) {
             return;
         }
-        let g = super::surface::gravity(m, m.attrs.gravity.value());
+        let gravity = m.gravity();
         let falling = m.vel[1] <= 0.0;
-        let gravity = g;
         // F12: the strider whose cell holds lava walks on it like on the ground.
         if (m.in_water || m.lava_height > 0.0) && !super::nether::strider::stands_on_fluid(self, m) {
             let y0 = m.pos[1];
@@ -722,6 +883,28 @@ impl Server {
         }
     }
 
+    /// Team and collision rule of the score holder `holder` (no team: rule 0).
+    fn team_rule(&self, holder: &str) -> (Option<&str>, u8) {
+        self.cmd.scores.team_of(holder).map_or((None, 0), |t| (Some(t.name.as_str()), collision_code(&t.collision)))
+    }
+
+    /// Team filter of the push as seen from `holder`: `None` when no team has a rule other
+    /// than "always" (the filter then lets everything through, nothing is looked up).
+    fn push_team(&self, holder: impl FnOnce() -> String) -> Option<(Option<String>, u8)> {
+        if self.cmd.scores.teams.iter().all(|t| t.collision == "always") {
+            return None;
+        }
+        let (t, r) = self.team_rule(&holder());
+        Some((t.map(str::to_owned), r))
+    }
+
+    /// Can `holder` be pushed by the filter entity `own` (`push_team`)?
+    fn push_team_allows(&self, own: &Option<(Option<String>, u8)>, holder: &str) -> bool {
+        let Some((own_team, own_rule)) = own else { return true };
+        let (their_team, their_rule) = self.team_rule(holder);
+        team_allows(*own_rule, own_team.as_deref(), their_rule, their_team)
+    }
+
     /// Pushable.
     pub(crate) fn mob_pushable(&self, m: &Mob) -> bool {
         m.alive()
@@ -737,6 +920,8 @@ impl Server {
             return;
         }
         let bb = m.bbox();
+        // Team collision rules (only if some team has a rule other than "always").
+        let team = self.push_team(|| crate::nbtio::uuid_text(m.uuid));
         // (entity, slot of the list at the time of the record; u32::MAX for the player).
         let mut list: Vec<(Ent, u32)> = Vec::new();
         for (i, o) in self.mobs.list.iter().enumerate() {
@@ -746,6 +931,7 @@ impl Server {
                 && o.bbox().intersects(&bb)
                 && self.mob_pushable(o)
                 && !self.same_root(m, o)
+                && (team.is_none() || self.push_team_allows(&team, &crate::nbtio::uuid_text(o.uuid)))
             {
                 list.push((Ent::Mob(o.id), i as u32));
             }
@@ -756,6 +942,7 @@ impl Server {
             && player_box.intersects(&bb)
             && super::surface::pushes_player(m)
             && !self.player_same_root(m)
+            && self.push_team_allows(&team, &self.name)
         {
             list.push((Ent::Player, u32::MAX));
         }
@@ -848,6 +1035,7 @@ impl Server {
         }
         let pb = self.player_aabb();
         let ppos = self.pos;
+        let team = self.push_team(|| self.name.clone());
         let mut idx = Vec::new();
         for (i, o) in self.mobs.list.iter().enumerate() {
             if let Some(o) = o
@@ -855,6 +1043,7 @@ impl Server {
                 && o.may_touch(&pb)
                 && o.bbox().intersects(&pb)
                 && !self.player_same_root(o)
+                && (team.is_none() || self.push_team_allows(&team, &crate::nbtio::uuid_text(o.uuid)))
             {
                 idx.push(i);
             }

@@ -6,6 +6,7 @@ pub(crate) mod aquatic;
 pub(crate) mod arrows;
 mod bell;
 mod body;
+mod resize; // refit after the box grows
 pub(crate) mod fireballs;
 pub(crate) mod nether;
 pub(crate) mod brains;

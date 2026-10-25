@@ -298,7 +298,7 @@ fn jump_vector(s: &Server, m: &Mob, target: [f64; 3], max_v: f32, angle: i32) ->
     let r2 = dir[0] * dir[0] + dir[2] * dir[2];
     let r = r2.sqrt();
     let y = dir[1];
-    let g = m.attrs.gravity.value();
+    let g = m.gravity();
     let sin2 = f64::from(2.0f32 * angrad).sin();
     let cos2 = f64::from(angrad).cos().powi(2);
     let sin_a = f64::from(angrad).sin();
