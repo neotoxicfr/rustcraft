@@ -12,8 +12,9 @@
 //! Client state: `history` = ring of 64 [y, yaw, 0]; `extra[0]` = index of the last
 //! sample, `extra[1]` / `extra[2]` = current / previous wing flap, `extra[FLAP]` = flap
 //! crossed this tick, `extra[GROWL]` = ticks before the next growl, `extra[SEEN]` = phase
-//! seen + 1 (0: never), `extra[PHASE_T]` = phase counter (flames, death),
-//! `extra[LOOK_YAW]` = head yaw of the spawn packet.
+//! seen + 1 (0: never), `extra[PHASE_T]` = phase counter (flames, death).
+//! Aim of the breaths: head yaw of the living entity (`head`), which the dragon only changes
+//! through the mobs' body catch-up (`Entity::tick`); its head packets are ignored.
 
 use std::f32::consts::TAU;
 
@@ -30,7 +31,6 @@ const FLAP: usize = 3;
 const GROWL: usize = 4;
 const SEEN: usize = 5;
 const PHASE_T: usize = 6;
-const LOOK_YAW: usize = 7;
 const FLAP_SOUND: &str = "minecraft:entity.ender_dragon.flap";
 const GROWL_SOUND: &str = "minecraft:entity.ender_dragon.growl";
 
@@ -97,16 +97,6 @@ fn sample(e: &Entity, k: usize, pt: f32) -> (f64, f32) {
     let (a, b) = (at(k + 1), at(k));
     let t = if dying(e) { 0.0 } else { pt };
     (a[0] + f64::from(t) * (b[0] - a[0]), rot_lerp(t, a[1] as f32, b[1] as f32))
-}
-
-/// On spawn: the aim of the breaths follows the living entity's head yaw, which the game never
-/// smooths for the client dragon (its AI step replaces the one that applies head packets) and
-/// which the server never changes. It therefore stays the one from the spawn packet (quirk
-/// reproduced), without the mobs' head correction or the head rotation packets.
-pub(super) fn spawned(e: &mut Entity) {
-    if e.kind == KIND {
-        e.extra[LOOK_YAW] = e.head;
-    }
 }
 
 pub(super) fn tick(e: &mut Entity) {
@@ -416,7 +406,9 @@ fn head_pos(e: &Entity, phase: i32) -> [f64; 3] {
     ]
 }
 
-/// Gaze direction (normalised) for an imposed pitch and a yaw.
+/// Gaze direction (normalised) for an imposed pitch and a head yaw. The phase tick runs before
+/// the head catch-up: it is given the previous tick's head (`head_o`). Measured difference:
+/// `head_o` is brought within 180° of `head` (same angle modulo 360°, f32 rounding).
 fn look(x_rot: f32, yaw: f32) -> [f64; 3] {
     let (xr, yr) = (x_rot * DEG, -yaw * DEG);
     let v = [sin_t(yr) * cos_t(xr), -sin_t(xr), cos_t(yr) * cos_t(xr)].map(f64::from);
@@ -485,7 +477,7 @@ pub(super) fn client_fx(e: &mut Entity, r: &mut WorldRandom, egg_y: &mut dyn FnM
             let ey = f64::from(egg_y()) + 0.5;
             let d2 = (0.5 - e.pos[0]).powi(2) + (ey - e.pos[1]).powi(2) + (0.5 - e.pos[2]).powi(2);
             let dist = (d2.sqrt() as f32 / 4.0).max(1.0);
-            let d = look(-(6.0 / dist) * 1.5 * 5.0, e.extra[LOOK_YAW]);
+            let d = look(-(6.0 / dist) * 1.5 * 5.0, e.head_o);
             let v = e.velocity;
             let f03 = f64::from(0.3f32);
             breath(e, r, 1, |_| [-d[0] * f08 + v[0], -d[1] * f03 + v[1], -d[2] * f08 + v[2]], emit);
@@ -495,7 +487,7 @@ pub(super) fn client_fx(e: &mut Entity, r: &mut WorldRandom, egg_y: &mut dyn FnM
             e.extra[PHASE_T] += 1.0;
             let t = e.extra[PHASE_T] as i32;
             if t % 2 == 0 && t < 10 {
-                let d = look(-45.0, e.extra[LOOK_YAW]);
+                let d = look(-45.0, e.head_o);
                 let f06 = f64::from(0.6f32);
                 breath(e, r, 6, |j| [-d[0] * f08 * f64::from(j), -d[1] * f06, -d[2] * f08 * f64::from(j)], emit);
             }

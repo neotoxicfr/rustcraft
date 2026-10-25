@@ -187,14 +187,16 @@ fn dragon_turned(phase: i32, yaw: f32, head_yaw: f32) -> Entities {
     all
 }
 
-/// Sitting flames of a turned dragon (body at 90°, spawn-packet head at 0), sloped flight
+/// Sitting flames of a still, turned dragon (body at 90°, head at 0), sloped flight
 /// history, yaw that changes during the emission tick. Compared draw for draw with a
 /// reference dragon (zero yaw, level flight, same seed):
 /// - head at the previous tick: previous yaw (90°) → 6.5 × cos(tilt) towards +x, z unchanged;
 ///   tilt = (y from 6 ticks ago − y from 11 ticks ago) × 10°;
-/// - gaze along the frozen head yaw (0, towards −z), neither the body nor a later head packet.
+/// - gaze along the previous tick's head (0, towards −z: still, no catch-up), not the
+///   body. The head packet received here would only play on the following ticks: its rejection
+///   is checked by `turning_dragon_breathes_along_its_dragged_head`.
 #[test]
-fn turned_dragon_breathes_along_its_spawn_head_yaw() {
+fn still_dragon_breathes_along_its_head_yaw() {
     let run = |turned: bool| {
         let mut r = WorldRandom::default();
         let mut all = if turned { dragon_turned(5, 90.0, 0.0) } else { dragon_turned(5, 0.0, 0.0) };
@@ -235,9 +237,9 @@ fn turned_dragon_breathes_along_its_spawn_head_yaw() {
     }
 }
 
-/// Landing of a turned dragon (body at 90°, spawn head at 0): breath towards −z.
+/// Landing of a still, turned dragon (body at 90°, head at 0): breath towards −z.
 #[test]
-fn turned_dragon_lands_along_its_spawn_head_yaw() {
+fn still_dragon_lands_along_its_head_yaw() {
     let mut r = WorldRandom::default();
     let mut all = dragon_turned(3, 90.0, 0.0);
     let b = particles(&step(&mut all, &mut r, 63), PKind::DragonBreath);
@@ -245,10 +247,66 @@ fn turned_dragon_lands_along_its_spawn_head_yaw() {
     let v = b[0].1;
     let want = -std::f64::consts::FRAC_1_SQRT_2 * f64::from(0.08f32);
     assert!(v[0].abs() < 1e-6 && (v[2] - want).abs() < 1e-4, "{v:?}");
-    // Reverse: body at 0, spawn head at 90°: breath towards +x (gaze towards −x).
+    // Reverse: body at 0, head at 90°: breath towards +x (gaze towards −x).
     let mut all = dragon_turned(3, 0.0, 90.0);
     let v = particles(&step(&mut all, &mut r, 63), PKind::DragonBreath)[0].1;
     assert!((v[0] + want).abs() < 1e-4 && v[2].abs() < 1e-6, "{v:?}");
+}
+
+/// Dragon turning in flight, moved by movement packets (interpolation path): yaw
+/// from 0 to 180° in steps of 10°, spawn head at 0. The mobs' branch pulls the head to within 75° of
+/// the body while it moves: it ends at 105° (the game, which brings the dragon's yaw back into
+/// [−180, 180[, gets −255°, same angle). A head packet received afterwards (−30°) is never
+/// applied. At every tick, the landing breath (near the egg: gaze lowered by 45°,
+/// dragon velocity added) follows the previous tick's head: neither the body, nor the current head,
+/// nor the spawn one. Dragon turned to 180°, game: (+0.055; −0.212; +0.015) + velocity.
+#[test]
+fn turning_dragon_breathes_along_its_dragged_head() {
+    use rc_client::EntityEvent;
+    use rc_proto_v777::entity::{Delta, Move};
+    let mut r = WorldRandom::default();
+    let mut all = dragon_turned(3, 0.0, 0.0);
+    let v = [0.02, -0.01, 0.03];
+    all.apply(EntityEvent::Motion { id: 7, velocity: v });
+    let (f08, f03) = (f64::from(0.08f32), f64::from(0.3f32));
+    // Expected breath (exact trigonometry) for a head yaw: gaze (−sin yaw × cos 45°,
+    // sin 45°, cos yaw × cos 45°).
+    let want = |yaw: f32| {
+        let (s, c) = (-f64::from(yaw).to_radians().sin(), f64::from(yaw).to_radians().cos());
+        let h = std::f64::consts::FRAC_1_SQRT_2;
+        [-s * h * f08 + v[0], -h * f03 + v[1], -c * h * f08 + v[2]]
+    };
+    // One tick: breath along the head from before the tick; returns (head before, head after).
+    let tick = |all: &mut Entities, r: &mut WorldRandom| {
+        let before = all.map[&7].head;
+        let b = particles(&step(all, r, 63), PKind::DragonBreath);
+        assert_eq!(b.len(), 8);
+        let w = want(before);
+        assert!((0..3).all(|k| (b[0].1[k] - w[k]).abs() < 1e-4), "head before {before}: {:?} {w:?}", b[0].1);
+        (before, all.map[&7].head)
+    };
+    let mv = |yaw: f32| Move { id: 7, on_ground: false, delta: Some(Delta::Linear([41, 0, 0])), rot: Some((yaw, 0.0)) };
+    let mut turned = 0;
+    // Turn, then a few packets at 180° to finish the turn while moving.
+    for k in 1..=24 {
+        all.apply(EntityEvent::Move(mv(10.0 * k.min(18) as f32)));
+        let (before, after) = tick(&mut all, &mut r);
+        turned += i32::from(before != after);
+    }
+    assert!(turned > 10, "head caught up at every tick of the turn: {turned}");
+    // No more packets: the interpolation ends, the dragon stops, the head stays.
+    for _ in 0..10 {
+        tick(&mut all, &mut r);
+    }
+    let e = &all.map[&7];
+    assert_eq!((e.yaw, e.head), (180.0, 105.0));
+    all.apply(EntityEvent::Head { id: 7, yaw: -30.0 });
+    for _ in 0..4 {
+        assert_eq!(tick(&mut all, &mut r), (105.0, 105.0), "head packet applied to the dragon");
+    }
+    let b = particles(&step(&mut all, &mut r, 63), PKind::DragonBreath)[0].1;
+    let game = [0.054_641 + v[0], -0.212_132 + v[1], 0.014_641 + v[2]];
+    assert!((0..3).all(|k| (b[k] - game[k]).abs() < 1e-4), "{b:?} {game:?}");
 }
 
 /// Creaking tearing itself down (value 18): eyes lit on the first death tick, off on the

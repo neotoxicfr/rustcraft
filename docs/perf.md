@@ -2446,3 +2446,9 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   in the order of the random draws). Not measured on the bench: nothing on the hot path outside the dragon fight.
 - Creaking: eye blinking in O(1) per tick (two floats of the free state), red overlay
   and tilt by a kind test; no measurable cost.
+- Breath aim (revised): the dragon's head packet is discarded on reception (one kind comparison
+  per head packet of a living entity, a few nanoseconds; filtering at the tick would cost a
+  test per entity and per tick: rejected without measuring), the aim is read from the previous
+  tick's head, already kept (nothing added per tick; the write at spawn from the previous
+  version disappears). Integrated server: horizontal-movement test of the dragon (two
+  subtractions, one comparison per dragon tick). Off the hot path: nothing to measure on the bench.

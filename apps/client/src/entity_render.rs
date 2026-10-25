@@ -62,11 +62,6 @@ pub fn tick_extra(e: &mut Entity) {
     shulker::tick(e);
 }
 
-/// Spawn of an entity: the dragon freezes the head yaw it received (aim of its breaths).
-pub fn dragon_spawned(e: &mut Entity) {
-    dragon::spawned(e);
-}
-
 /// New direct position of an entity (old position): start of the shulker's slide.
 pub fn shulker_teleported(e: &mut Entity, old: [f64; 3]) {
     shulker::teleported(e, old);

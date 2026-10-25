@@ -1317,10 +1317,6 @@ impl Entities {
                     crate::entity_render::shulker_teleported(e, p);
                     e.pos_o = e.pos;
                 }
-                // Dragon: head yaw of the spawn packet, kept for the aim of the breaths.
-                if let Some(e) = self.map.get_mut(&a.id) {
-                    crate::entity_render::dragon_spawned(e);
-                }
             }
             EntityEvent::Remove(ids) => {
                 for id in ids {
@@ -1401,7 +1397,9 @@ impl Entities {
                 let Some(e) = self.map.get_mut(&id) else { return };
                 if e.class == Kind::Other {
                     e.head = yaw;
-                } else {
+                } else if e.kind != "ender_dragon" {
+                    // The dragon keeps the target without ever smoothing it (its AI step replaces the
+                    // living entity's, which does it): its head only follows the body catch-up.
                     e.head_target = Some((yaw, 3));
                 }
             }
