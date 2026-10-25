@@ -734,6 +734,8 @@ impl Server {
             if let Some((power, _fire, _)) = m.cube.explosion
                 && m.cube.fuse == 0
             {
+                // The lead falls (item on the ground, null link) before the explosion, which would hit it.
+                self.leash_drop(m, true, true);
                 m.dead = true;
                 if self.rule("minecraft:tnt_explodes", true) {
                     let c = [m.pos[0], m.pos[1] + f64::from(m.height()) * 0.0625, m.pos[2]];

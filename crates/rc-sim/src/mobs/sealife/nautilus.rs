@@ -293,7 +293,7 @@ fn eat_sound(m: &Mob) -> &'static str {
 /// Return area of a free tamed nautilus: 32 without saddle (adult),
 /// 16 otherwise; recentered when it moves away by more than radius + 8.
 fn check_restriction(m: &mut Mob) {
-    if !m.tame || !m.mount.passengers.is_empty() {
+    if super::super::leash::is_leashed(m) || !m.tame || !m.mount.passengers.is_empty() {
         return;
     }
     let r = if !m.is_baby() && m.equipment[SADDLE].is_none() { 32 } else { 16 };
@@ -975,7 +975,7 @@ impl Server {
         if m.tame && !self.sneaking && !food(self, m, item) {
             self.player_start_riding(m);
             if m.mount.passengers.is_empty() {
-                m.sea.home = None;
+                crate::mobs::goals::clear_home(m);
             }
             return Some(true);
         }

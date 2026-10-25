@@ -1247,6 +1247,10 @@ impl Server {
                 if !*unseen {
                     return !m.nav.is_done();
                 }
+                // Chase without sight: the target must stay within the home.
+                if !self.target_in_home(m, t) {
+                    return false;
+                }
                 !(t == Ent::Player && (self.game_mode == 1 || self.game_mode == 3))
             }
             Goal::Bow { .. } => (m.target.is_some() || !m.nav.is_done()) && self.holds_bow(m),
@@ -1875,9 +1879,18 @@ impl Server {
         base.unseen = 0;
     }
 
+    /// Block of the target within the mob's home (lead included); always true without a
+    /// home.
+    pub(crate) fn target_in_home(&self, m: &Mob, t: Ent) -> bool {
+        rpos_home(m).is_none() || self.ent_pos(t).is_some_and(|p| within_home(m, super::mth::block_of(p)))
+    }
+
     /// The attack test of a targeting objective.
     fn target_can_attack(&self, base: &mut TBase, m: &mut Mob, t: Ent, sight: bool, invis: bool) -> bool {
         if !self.targeting_ok(m, t, true, -1.0, sight, invis) {
+            return false;
+        }
+        if !self.target_in_home(m, t) {
             return false;
         }
         if base.must_reach {
@@ -2408,6 +2421,20 @@ pub(crate) fn max_head_y(kind: super::species::Kind) -> f32 {
 pub(crate) fn rpos_home(m: &Mob) -> Option<([i32; 3], i32)> {
     // G4-F07a: the lead resets the zone around the holder every tick (it takes precedence).
     super::leash::home(m).or(m.sea.home).or(m.aqua.home).or(m.rec.restriction)
+}
+
+/// Clears the home (every field that carries it: the game has only one). The lead, if it still
+/// holds, sets it again on its next tick.
+pub(crate) fn clear_home(m: &mut Mob) {
+    if let Some(l) = m.leash.as_deref_mut() {
+        l.home = None;
+    }
+    m.sea.home = None;
+    m.aqua.home = None;
+    m.rec.restriction = None;
+    if let Some(n) = m.npc.as_deref_mut() {
+        n.home = None;
+    }
 }
 
 /// Residence set and mob within radius + range + 1 of its center: points outside the

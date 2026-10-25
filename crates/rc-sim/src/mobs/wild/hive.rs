@@ -171,6 +171,7 @@ pub fn add_occupant(s: &mut Server, p: [i32; 3], m: &mut Mob) {
     if bees.len() >= MAX_OCCUPANTS {
         return;
     }
+    s.leash_drop(m, true, true); // the lead falls before the bee goes into the hive
     let mut data = m.save();
     for k in IGNORED {
         nbtio::remove(&mut data, k);

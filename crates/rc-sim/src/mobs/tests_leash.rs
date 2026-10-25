@@ -322,6 +322,187 @@ fn held_trader_llamas() {
     w.p.s.mobs.list[i] = Some(m);
 }
 
+impl W {
+    /// Ties `id` to holder `h` then plays one lead tick (home zone set).
+    fn tie(&mut self, id: i32, h: Holder, anchor: Anchor) {
+        let i = self.p.s.mob_index(id).expect("mob");
+        let mut m = self.p.s.mobs.list[i].take().expect("mob");
+        self.p.s.leash_set(&mut m, h, anchor, false);
+        self.p.s.mobs.list[i] = Some(m);
+        self.leash_tick(id);
+    }
+}
+
+/// The lead's zone (radius 5 around the holder's block) counts as home for the goals: the
+/// trader defense refuses an attacker whose block is at d² = 25 from the trader and accepts a
+/// close attacker; a held bee does not go back to its flower.
+#[test]
+fn lead_home_for_goals() {
+    let mut w = world("home");
+    let trader = w.spawn(Kind::WanderingTrader, [0.5, f64::from(Y), 4.5]);
+    let llama = w.spawn(Kind::TraderLlama, [2.5, f64::from(Y), 4.5]);
+    let u = w.mob(trader).uuid;
+    w.tie(llama, Holder::Mob(trader), Anchor::Uuid(u));
+    assert_eq!(leash::home(w.mob(llama)), Some(([0, Y, 4], 5)));
+    let far = w.spawn(Kind::Zombie, [4.5, f64::from(Y), 7.5]);
+    let near = w.spawn(Kind::Zombie, [0.5, f64::from(Y), 6.5]);
+    let i = w.p.s.mob_index(llama).unwrap();
+    let mut m = w.p.s.mobs.list[i].take().unwrap();
+    let mut g = super::goals::mount_goals::MGoal::DefendTrader {
+        base: super::goals::TBase::new(false, false),
+        stamp: 0,
+        by: None,
+    };
+    w.p.s.mobs.get_mut(trader).unwrap().last_hurt_by_mob = Some((super::mob::Ent::Mob(far), 40));
+    assert!(!w.p.s.mount_can_use(&mut g, &mut m), "attacker outside the lead's zone targeted");
+    w.p.s.mobs.get_mut(trader).unwrap().last_hurt_by_mob = Some((super::mob::Ent::Mob(near), 41));
+    assert!(w.p.s.mount_can_use(&mut g, &mut m), "close attacker refused");
+    w.p.s.mobs.list[i] = Some(m);
+    // Held bee: the return to the known flower is cut.
+    let bee = w.spawn(Kind::Bee, [2.5, f64::from(Y) + 1.0, 0.5]);
+    {
+        let b = w.p.s.mobs.get_mut(bee).unwrap();
+        b.wild.flower = Some([8, Y, 8]);
+        b.wild.no_nectar_ticks = 700;
+    }
+    let mut fg = super::wild::goals::WGoal::GoToFlower { travel: 0 };
+    let i = w.p.s.mob_index(bee).unwrap();
+    let mut m = w.p.s.mobs.list[i].take().unwrap();
+    assert!(w.p.s.wild_can_use(&mut fg, &mut m), "free bee without return to the flower");
+    w.p.s.mobs.list[i] = Some(m);
+    let pu = w.p.s.uuid;
+    w.tie(bee, Holder::Player, Anchor::Uuid(pu));
+    let mut m = w.p.s.mobs.list[i].take().unwrap();
+    assert!(!w.p.s.wild_can_use(&mut fg, &mut m), "held bee set off again towards its flower");
+    w.p.s.mobs.list[i] = Some(m);
+}
+
+/// Held happy ghast at 7 blocks: every float point kept is within 9 blocks of the centre of
+/// the player's block (the lead's zone), not in its former zone.
+#[test]
+fn held_ghast_floats_in_the_lead_zone() {
+    let mut w = world("ghast");
+    let g = w.spawn(Kind::HappyGhast, [7.5, f64::from(Y) + 1.0, 0.5]);
+    let pu = w.p.s.uuid;
+    w.tie(g, Holder::Player, Anchor::Uuid(pu));
+    assert_eq!(leash::home(w.mob(g)), Some(([0, Y, 0], 9)));
+    let i = w.p.s.mob_index(g).unwrap();
+    let mut m = w.p.s.mobs.list[i].take().unwrap();
+    m.rec.restriction = Some(([7, Y + 1, 0], 64));
+    let c = [0.5, f64::from(Y) + 0.5, 0.5];
+    for n in 0..20 {
+        let t = w.p.s.ghast_fly_to(&mut m, 0);
+        let d = (0..3).map(|a| (t[a] - c[a]).powi(2)).sum::<f64>();
+        assert!(d < 81.0, "point {n} outside the lead's zone: {t:?}");
+    }
+    w.p.s.mobs.list[i] = Some(m);
+}
+
+/// Dispenser shears: a knot's lead falls (knot removed, shears sound in the neutral category);
+/// a held sheep loses its lead without being sheared; a player in the cell drops his animals.
+#[test]
+fn dispenser_shears_cut_leads() {
+    let mut w = world("dispenser");
+    let shears = || Stack { id: "minecraft:shears".into(), count: 1, components: None };
+    let fence = [3, Y, 3];
+    w.p.run(&format!("setblock {} {} {} minecraft:oak_fence\n", fence[0], fence[1], fence[2]));
+    let k = w.p.s.knot_create(fence);
+    let cow = w.spawn(Kind::Cow, [2.5, f64::from(Y), 1.5]);
+    w.tie(cow, Holder::Knot(k), Anchor::Pos(fence));
+    let _ = w.p.take_events();
+    w.p.s.dispense_item([2, Y, 3], crate::blocks::Dir::East, 0, shears());
+    let evs = w.p.take_events();
+    assert!(leash::holder(w.mob(cow)).is_none(), "knot's lead not cut");
+    assert!(w.p.s.knot_at(fence).is_none(), "empty knot left behind");
+    assert_eq!(w.leads_dropped(), 1);
+    let snip = w.p.s.sound_id("minecraft:item.shears.snip").unwrap();
+    assert!(
+        evs.iter().any(|e| matches!(e, Event::Sound(s) if matches!(s.sound, SoundRef::Id(i) if i == snip) && s.category == 6)),
+        "shears sound missing or outside the neutral category"
+    );
+    // Sheep held by the player, in the targeted cell: lead cut, wool kept.
+    let pu = w.p.s.uuid;
+    let sheep = w.spawn(Kind::Sheep, [6.5, f64::from(Y), 6.5]);
+    w.tie(sheep, Holder::Player, Anchor::Uuid(pu));
+    w.p.s.dispense_item([5, Y, 6], crate::blocks::Dir::East, 0, shears());
+    assert!(leash::holder(w.mob(sheep)).is_none(), "sheep's lead not cut");
+    assert!(!w.mob(sheep).sheared, "held sheep sheared");
+    // Player in the cell: the cow he holds is dropped.
+    w.tie(cow, Holder::Player, Anchor::Uuid(pu));
+    w.p.s.dispense_item([-1, Y, 0], crate::blocks::Dir::East, 0, shears());
+    assert!(leash::holder(w.mob(cow)).is_none(), "player's leads not cut");
+}
+
+/// Sulfur cube whose fuse runs out: the lead falls (item, null link) before the explosion.
+#[test]
+fn sulfur_cube_drops_its_lead_before_exploding() {
+    let mut w = world("cube");
+    crate::nbtio::set(&mut w.p.s.rules, "minecraft:tnt_explodes", rc_proto::nbt::Nbt::Byte(0));
+    let c = w.spawn(Kind::SulfurCube, [3.5, f64::from(Y), 0.5]);
+    let pu = w.p.s.uuid;
+    w.tie(c, Holder::Player, Anchor::Uuid(pu));
+    let _ = w.p.take_events();
+    let i = w.p.s.mob_index(c).unwrap();
+    let mut m = w.p.s.mobs.list[i].take().unwrap();
+    m.cube.explosion = Some((1, false, 1));
+    m.cube.fuse = 1;
+    assert!(w.p.s.cube_pre_tick(&mut m), "cube did not explode");
+    let evs = w.p.take_events();
+    assert!(m.leash.is_none());
+    assert_eq!(W::links(&evs), vec![(c, 0)], "null link not sent");
+    w.p.s.mobs.list[i] = Some(m);
+    assert_eq!(w.leads_dropped(), 1, "lead not dropped on the ground");
+}
+
+/// Lead home saved (`home_pos`, `home_radius`); reloaded with a missing holder, the animal
+/// drops the lead after 100 ticks and keeps the zone (like the game); a normally detached
+/// lead clears everything.
+#[test]
+fn lead_home_saved_and_reloaded() {
+    use rc_proto::nbt::Nbt;
+    let mut w = world("save");
+    let cow = w.spawn(Kind::Cow, [2.5, f64::from(Y), 0.5]);
+    let pu = w.p.s.uuid;
+    w.tie(cow, Holder::Player, Anchor::Uuid(pu));
+    let mut saved = w.mob(cow).save();
+    assert_eq!(saved.get("home_radius"), Some(&Nbt::Int(5)));
+    assert_eq!(saved.get("home_pos"), Some(&Nbt::IntArray(vec![0, Y, 0])));
+    // Missing holder.
+    crate::nbtio::set(&mut saved, "leash", Nbt::Compound(vec![("UUID".into(), crate::nbtio::uuid_nbt(0x1234))]));
+    let mut again = w.p.s.new_mob(Kind::Cow, [2.5, f64::from(Y), 1.5], 0.0);
+    again.load(&saved);
+    again.tick_count = 101;
+    let id2 = again.id;
+    w.p.s.add_mob(again);
+    w.leash_tick(id2);
+    let m = w.mob(id2);
+    assert!(m.leash.is_none(), "missing attachment not abandoned");
+    assert_eq!(super::goals::rpos_home(m), Some(([0, Y, 0], 5)), "zone lost on abandon");
+    assert_eq!(m.save().get("home_radius"), Some(&Nbt::Int(5)));
+    // Normal detach: zone cleared, nothing written any more.
+    w.p.s.slots[36 + w.p.s.held as usize] = None;
+    assert!(w.p.s.player_interact(cow, 0));
+    let m = w.mob(cow);
+    assert!(super::goals::rpos_home(m).is_none());
+    assert!(m.save().get("home_radius").is_none() && m.save().get("home_pos").is_none());
+}
+
+/// Held tamed nautilus: its zone check does not rewrite the home.
+#[test]
+fn held_nautilus_keeps_the_lead_zone() {
+    let mut w = world("nautilus");
+    let n = w.spawn(Kind::Nautilus, [3.5, f64::from(Y), 0.5]);
+    w.p.s.mobs.get_mut(n).unwrap().tame = true;
+    let pu = w.p.s.uuid;
+    w.tie(n, Holder::Player, Anchor::Uuid(pu));
+    let i = w.p.s.mob_index(n).unwrap();
+    let mut m = w.p.s.mobs.list[i].take().unwrap();
+    w.p.s.nautilus_brain_tick(&mut m);
+    assert!(m.sea.home.is_none(), "nautilus zone set during the lead: {:?}", m.sea.home);
+    assert_eq!(super::goals::rpos_home(&m), Some(([0, Y, 0], 5)));
+    w.p.s.mobs.list[i] = Some(m);
+}
+
 /// Bench (ignored by default): cost of a taut (spring) and slack (close follow, path included)
 /// lead tick, best of 5 series.
 #[test]

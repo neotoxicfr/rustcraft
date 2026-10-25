@@ -221,14 +221,50 @@ pub fn load(m: &mut Mob, e: &Nbt) {
         _ => None,
     };
     m.leash = anchor.map(|anchor| Box::new(Leash { holder: None, anchor, angular: 0.0, home: None }));
+    // Common home (`home_radius` ≥ 0, `home_pos` at the origin if missing): when no species
+    // has taken it in its own field, it goes into the generic field. An animal reloaded on a
+    // lead thus keeps the lead's zone until its holder is found, and keeps it for good if
+    // the holder stays missing (the game does not clear it in that case).
+    let r = nbtio::int(e, "home_radius").map_or(-1, |v| v as i32);
+    if r >= 0 && !species_home(m) {
+        let p = match e.get("home_pos") {
+            Some(Nbt::IntArray(v)) if v.len() == 3 => [v[0], v[1], v[2]],
+            _ => [0, 0, 0],
+        };
+        m.rec.restriction = Some((p, r));
+    }
 }
 
-/// Writes `leash` (absent without a lead).
+/// Home held by a species-specific field (nautilus, elder guardian, trader).
+fn species_home(m: &Mob) -> bool {
+    m.sea.home.is_some() || m.aqua.home.is_some() || m.npc.as_ref().is_some_and(|n| n.home.is_some())
+}
+
+/// Writes `leash` (absent without a lead), then the common home: the lead's takes precedence
+/// (the game has a single field, which the lead rewrites); without a lead, the generic field.
+/// The turtle and the creaking write their own `home_pos` after the mob's in the game: only
+/// `home_radius` is written here for them.
 pub fn save(m: &Mob, e: &mut Nbt) {
     match m.leash.as_ref().map(|l| l.anchor) {
         Some(Anchor::Uuid(u)) => nbtio::set(e, "leash", Nbt::Compound(vec![("UUID".into(), nbtio::uuid_nbt(u))])),
         Some(Anchor::Pos(p)) => nbtio::set(e, "leash", Nbt::IntArray(p.to_vec())),
         None => nbtio::remove(e, "leash"),
+    }
+    let own_pos = matches!(m.kind, Kind::Turtle | Kind::Creaking);
+    match home(m).or(m.rec.restriction) {
+        Some((p, r)) => {
+            nbtio::set(e, "home_radius", Nbt::Int(r));
+            if !own_pos {
+                nbtio::set(e, "home_pos", Nbt::IntArray(p.to_vec()));
+            }
+        }
+        None if !species_home(m) => {
+            nbtio::remove(e, "home_radius");
+            if !own_pos {
+                nbtio::remove(e, "home_pos");
+            }
+        }
+        None => {}
     }
 }
 
@@ -381,9 +417,7 @@ impl Server {
         let Some(h) = holder(m) else { return };
         m.leash = None;
         // Home cleared with the lead (all those of the mob, like the game).
-        m.sea.home = None;
-        m.aqua.home = None;
-        m.rec.restriction = None;
+        super::goals::clear_home(m);
         if drop_lead {
             self.spawn_at_location(m, Stack { id: LEAD.into(), count: 1, components: None }, 0.0);
         }
@@ -614,7 +648,7 @@ impl Server {
             }
         }
         let held = self.slots[slot].as_ref().map(|s| s.id.clone()).unwrap_or_default();
-        if held == "minecraft:shears" && self.shear_off_all(Holder::Mob(m.id), Some(m)) {
+        if held == "minecraft:shears" && self.shear_off_all(Holder::Mob(m.id), Some(m), true) {
             self.hurt_item(slot, 1);
             return Some(true);
         }
@@ -662,14 +696,22 @@ impl Server {
     }
 
     /// Shears on a holder: its own lead then all those it holds fall
-    /// (`shear` event, shears sound); true if at least one fell.
-    fn shear_off_all(&mut self, h: Holder, me: Option<&mut Mob>) -> bool {
+    /// (`shear` event, shears sound); true if at least one fell. `by_player`: cut by the player
+    /// (event source, sound in his category); otherwise (dispenser) event without a source and
+    /// sound in the category of the sheared entity.
+    pub(crate) fn shear_off_all(&mut self, h: Holder, me: Option<&mut Mob>, by_player: bool) -> bool {
         let (c, pos) = match (&me, h) {
             (Some(m), _) => (center(&m.bbox()), m.pos),
             (None, _) => match self.hold(h) {
                 Some(hi) => (hi.center, hi.pos),
                 None => return false,
             },
+        };
+        let category = match (&me, h) {
+            _ if by_player => 7,
+            (Some(m), _) => Self::mob_sound_source(m),
+            (None, Holder::Player) => 7,
+            (None, _) => NEUTRAL,
         };
         let ids = self.leashed_in_area(c, h);
         let mut dropped = !ids.is_empty();
@@ -690,10 +732,10 @@ impl Server {
         if !dropped {
             return false;
         }
-        self.game_event_at("minecraft:shear", pos, Some(Ent::Player));
+        self.game_event_at("minecraft:shear", pos, by_player.then_some(Ent::Player));
         let bp = super::mth::block_of(pos);
         let at = [f64::from(bp[0]) + 0.5, f64::from(bp[1]) + 0.5, f64::from(bp[2]) + 0.5];
-        self.world_sound("minecraft:item.shears.snip", 7, at, 1.0, 1.0);
+        self.world_sound("minecraft:item.shears.snip", category, at, 1.0, 1.0);
         true
     }
 
@@ -757,7 +799,7 @@ impl Server {
         let Some(e) = self.deco_nbt(id).cloned() else { return false };
         let Some(hk) = self.hold_knot(id) else { return false };
         if self.slots[slot].as_ref().is_some_and(|s| s.id == "minecraft:shears")
-            && self.shear_off_all(Holder::Knot(id), None)
+            && self.shear_off_all(Holder::Knot(id), None, true)
         {
             self.hurt_item(slot, 1);
             return true;
