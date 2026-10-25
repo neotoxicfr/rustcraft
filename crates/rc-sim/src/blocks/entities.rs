@@ -338,7 +338,7 @@ impl Server {
         Some(id)
     }
 
-    fn entity_box(e: &SimEntity) -> Aabb {
+    pub(super) fn entity_box(e: &SimEntity) -> Aabb {
         let h = FALLING_SIZE / 2.0;
         Aabb { min: [e.pos[0] - h, e.pos[1], e.pos[2] - h], max: [e.pos[0] + h, e.pos[1] + FALLING_SIZE, e.pos[2] + h] }
     }
@@ -1460,6 +1460,7 @@ impl Server {
                                 | "minecraft:end_gateway"
                                 | "minecraft:beacon"
                                 | "minecraft:conduit"
+                                | "minecraft:potent_sulfur"
                         )
                     )
                 })
@@ -1477,6 +1478,7 @@ impl Server {
                 _ if self.state_name(s) == "minecraft:end_gateway" => self.gateway_ticker_register(p),
                 Kind::Beacon => self.beacon_ticker_register(p), // G5-F11
                 _ if self.v().block(s) == self.bs.t.id.conduit => self.conduit_ticker_register(p), // G6-F12
+                Kind::PotentSulfur => self.potent_sulfur_ticker_sync(p, s), // G6-F09a
                 Kind::Jukebox => {
                     self.jukebox_loaded_from_save(p);
                     self.jukebox_ticker_sync(p, s);

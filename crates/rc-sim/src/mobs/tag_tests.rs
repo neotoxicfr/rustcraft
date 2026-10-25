@@ -24,6 +24,7 @@ const CHECKS: &[(&str, Pred)] = &[
     ("minecraft:powder_snow_walkable_mobs", Kind::powder_snow_walkable),
     ("minecraft:freeze_immune_entity_types", Kind::freeze_immune),
     ("minecraft:freeze_hurts_extra_types", Kind::freeze_hurts_extra),
+    ("minecraft:not_affected_by_geysers", Kind::not_affected_by_geysers),
     ("minecraft:skeletons", Kind::skeletons_tag),
     ("minecraft:raiders", super::illagers::is_raider),
     ("minecraft:burn_in_daylight", |k| k.info().burns),

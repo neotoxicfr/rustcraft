@@ -1,0 +1,282 @@
+//! Speleothems of the integrated server (G6-F09a): pointed dripstone and sulfur spike, which
+//! share their rules (tag `speleothems`).
+//!
+//! - Placement: the tip points away from the vertical gaze (looking up: tip down), otherwise
+//!   the other way, otherwise no placement. The support is the sturdy face of the block behind
+//!   the base, or the same block turned the same way. Thickness from the vertical neighbours;
+//!   two tips facing each other merge, unless the player is sneaking.
+//! - Shape: only vertical updates count. Support lost: a tick is scheduled (2 for a
+//!   stalactite, 1 for a stalagmite), a stalactite already scheduled no longer moves;
+//!   otherwise the thickness is recomputed (a merge stays a merge as long as it holds).
+//! - Tick: a stalagmite without support is broken with its loot; a stalactite falls, along with
+//!   every stalactite piece below it; the tip hurts on arrival
+//!   (max(1 + height, 6) per block of fall, 40 at most).
+//! - Random tick: 0.011377778 chance (five days per growth on average) at the top of a
+//!   stalactite attached under its feeder block: the free tip (neither waterlogged nor merged)
+//!   lengthens, or a stalagmite grows below (10 blocks searched). Sulfur spike: under
+//!   sulfur, 2 blocks at most. Pointed dripstone: under the speleothem block, 7 blocks, with a
+//!   source of water two blocks above; its stalagmite search stops at whatever would hold back a drop.
+//! - A trident thrown faster than 0.6 block per tick breaks either one (`hits.rs`).
+
+use super::{Dir, P, above, add, below, flag, rel};
+use crate::server::Server;
+use crate::tag_bits::TagId;
+
+const THICK: &str = "thickness";
+const TIP_DIR: &str = "vertical_direction";
+/// Chance of growing per random tick.
+const GROWTH_CHANCE: f32 = 0.011_377_778;
+/// Blocks walked below the tip to find where to grow a stalagmite.
+const STALAGMITE_SCAN: i32 = 10;
+/// Maximum damage of a falling tip.
+const FALL_HURT_MAX: i32 = 40;
+/// Column (x and z from 6 to 10 sixteenths) that a drop must find free to pass.
+const DRIP_MIN: f64 = 6.0 / 16.0;
+const DRIP_MAX: f64 = 10.0 / 16.0;
+
+impl Server {
+    /// Speleothem (either block) whose tip points towards `d`.
+    pub(crate) fn spel_with_dir(&self, s: u32, d: Dir) -> bool {
+        let v = self.v();
+        self.tag_id(TagId::Speleothems, v.block(s)) && v.get_dir(s, TIP_DIR) == Some(d)
+    }
+
+    /// Tip (merged included if `merged`).
+    fn spel_is_tip(&self, s: u32, merged: bool) -> bool {
+        let v = self.v();
+        if !self.tag_id(TagId::Speleothems, v.block(s)) {
+            return false;
+        }
+        match v.get(s, THICK) {
+            Some("tip") => true,
+            Some("tip_merge") => merged,
+            _ => false,
+        }
+    }
+
+    /// Unmerged tip of block `block`, pointing towards `d`.
+    fn spel_unmerged_tip(&self, s: u32, d: Dir, block: u16) -> bool {
+        self.spel_is_tip(s, false) && self.v().get_dir(s, TIP_DIR) == Some(d) && self.v().block(s) == block
+    }
+
+    /// Does block `block` hold at `p` with the tip towards `tip`?
+    pub(crate) fn spel_valid_at(&self, p: P, block: u16, tip: Dir) -> bool {
+        let b = self.get(rel(p, tip.opposite()));
+        self.v().sturdy(b, tip) || (self.spel_with_dir(b, tip) && self.v().block(b) == block)
+    }
+
+    /// Survival of a placed state (shape and placement rule).
+    pub(crate) fn speleothem_survives(&self, s: u32, p: P) -> bool {
+        let v = self.v();
+        self.spel_valid_at(p, v.block(s), v.get_dir(s, TIP_DIR).unwrap_or(Dir::Up))
+    }
+
+    /// Thickness at `p` from the block in front of the tip and the one behind the base.
+    fn spel_thickness(&self, p: P, block: u16, tip: Dir, merge: bool) -> &'static str {
+        let v = self.v();
+        let base = tip.opposite();
+        let front = self.get(rel(p, tip));
+        if self.spel_with_dir(front, base) && v.block(front) == block {
+            return if !merge && v.get(front, THICK) != Some("tip_merge") { "tip" } else { "tip_merge" };
+        }
+        if !self.spel_with_dir(front, tip) {
+            return "tip";
+        }
+        match v.get(front, THICK) {
+            Some("tip" | "tip_merge") => "frustum",
+            _ => {
+                if self.spel_with_dir(self.get(rel(p, base)), tip) {
+                    "middle"
+                } else {
+                    "base"
+                }
+            }
+        }
+    }
+
+    /// Placement state (`None`: no direction holds). `water`: source water at the position.
+    pub(crate) fn speleothem_placement(&self, def: u32, p: P, sneaking: bool, water: bool) -> Option<u32> {
+        let v = self.v();
+        let block = v.block(def);
+        let first = if self.pitch < 0.0 { Dir::Down } else { Dir::Up };
+        let tip = [first, first.opposite()].into_iter().find(|&d| self.spel_valid_at(p, block, d))?;
+        let th = self.spel_thickness(p, block, tip, !sneaking);
+        let s = v.set(v.set_dir(def, TIP_DIR, tip), THICK, th);
+        Some(v.set_bool(s, "waterlogged", water))
+    }
+
+    /// Shape update (the water tick is scheduled beforehand, for every block).
+    pub(crate) fn speleothem_update_shape(&mut self, s: u32, p: P, dir: Dir) -> u32 {
+        if dir.axis() != 1 {
+            return s;
+        }
+        let v = self.v();
+        let block = v.block(s);
+        let tip = v.get_dir(s, TIP_DIR).unwrap_or(Dir::Up);
+        if tip == Dir::Down && self.has_scheduled_tick(p, block) {
+            return s;
+        }
+        if dir == tip.opposite() && !self.spel_valid_at(p, block, tip) {
+            self.schedule_tick(p, block, if tip == Dir::Down { 2 } else { 1 });
+            return s;
+        }
+        let merge = v.get(s, THICK) == Some("tip_merge");
+        let th = self.spel_thickness(p, block, tip, merge);
+        v.set(s, THICK, th)
+    }
+
+    /// Scheduled tick: unsupported stalagmite broken, otherwise the stalactite falls.
+    pub(crate) fn speleothem_tick(&mut self, s: u32, p: P) {
+        if self.spel_with_dir(s, Dir::Up) && !self.speleothem_survives(s, p) {
+            self.destroy_block(p, true, 512);
+            return;
+        }
+        // Chain of stalactite falling downwards; the tip hurts.
+        let (mut q, mut st) = (p, s);
+        while self.spel_with_dir(st, Dir::Down) {
+            self.spawn_falling_block(q, st);
+            if self.spel_is_tip(st, true) {
+                let size = (1 + p[1] - q[1]).max(6);
+                if let Some(e) = self.bs.entities.list.last_mut() {
+                    e.hurt = Some((size as f32, FALL_HURT_MAX));
+                }
+                break;
+            }
+            q = below(q);
+            st = self.get(q);
+        }
+    }
+
+    /// Random tick. Pointed dripstone first draws the random value of its fluid transfer (rule
+    /// of the speleothem fluid-transfer mission): the draw is kept here so that growth
+    /// reads the same value as the game.
+    pub(crate) fn speleothem_random_tick(&mut self, s: u32, p: P, dripstone: bool) {
+        if dripstone {
+            let _transfer = self.bs.rng.next_float();
+        }
+        if self.bs.rng.next_float() < GROWTH_CHANCE
+            && self.spel_with_dir(s, Dir::Down)
+            && self.v().block(self.get(above(p))) != self.v().block(s)
+        {
+            self.speleothem_grow(s, p, dripstone);
+        }
+    }
+
+    fn speleothem_grow(&mut self, s: u32, p: P, dripstone: bool) {
+        let v = self.v();
+        let block = v.block(s);
+        let t = &self.bs.t.id;
+        let feeder = if dripstone { t.dripstone_block } else { t.sulfur };
+        if v.block(self.get(above(p))) != feeder {
+            return;
+        }
+        if dripstone {
+            let f = self.fluid_at(add(p, 0, 2, 0));
+            if !(f.kind == 1 && f.source) {
+                return;
+            }
+        }
+        let max_len = if dripstone { 7 } else { 2 };
+        let Some(tip) = self.spel_find_tip(s, p, max_len) else { return };
+        let ts = self.get(tip);
+        let free = self.spel_with_dir(ts, Dir::Down) && v.get(ts, THICK) == Some("tip") && !v.get_bool(ts, "waterlogged");
+        if free && self.spel_tip_can_grow(ts, tip, block) {
+            if self.bs.rng.next_bool() {
+                self.spel_grow_into(tip, Dir::Down, block);
+            } else {
+                self.spel_grow_stalagmite_below(tip, block, dripstone);
+            }
+        }
+    }
+
+    /// Tip (unmerged) at the end of the speleothem starting at `p`, within `max` steps.
+    fn spel_find_tip(&self, s: u32, p: P, max: i32) -> Option<P> {
+        if self.spel_is_tip(s, false) {
+            return Some(p);
+        }
+        let v = self.v();
+        let d = v.get_dir(s, TIP_DIR)?;
+        let block = v.block(s);
+        let mut q = p;
+        for _ in 1..max {
+            q = rel(q, d);
+            let st = self.get(q);
+            if self.spel_is_tip(st, false) {
+                return Some(q);
+            }
+            if !self.in_build_height(q[1]) || v.block(st) != block || v.get_dir(st, TIP_DIR) != Some(d) {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Can the tip lengthen (free block with no fluid, or opposite tip to merge with)?
+    fn spel_tip_can_grow(&self, ts: u32, tip: P, block: u16) -> bool {
+        let Some(d) = self.v().get_dir(ts, TIP_DIR) else { return false };
+        let st = self.get(rel(tip, d));
+        if !self.fluid_of(st).is_empty() {
+            return false;
+        }
+        self.v().is_air(st) || self.spel_unmerged_tip(st, d.opposite(), block)
+    }
+
+    fn spel_grow_into(&mut self, from: P, d: Dir, block: u16) {
+        let q = rel(from, d);
+        let st = self.get(q);
+        if self.spel_unmerged_tip(st, d.opposite(), block) {
+            let (top, bottom) = if self.v().get_dir(st, TIP_DIR) == Some(Dir::Up) { (above(q), q) } else { (q, below(q)) };
+            self.spel_create(top, Dir::Down, "tip_merge", block);
+            self.spel_create(bottom, Dir::Up, "tip_merge", block);
+        } else if self.v().is_air(st) || self.v().block(st) == self.bs.t.id.water {
+            self.spel_create(q, d, "tip", block);
+        }
+    }
+
+    fn spel_create(&mut self, q: P, d: Dir, th: &str, block: u16) {
+        let v = self.v();
+        let f = self.fluid_at(q);
+        let s = v.set(v.set_dir(v.default_state(block), TIP_DIR, d), THICK, th);
+        let s = v.set_bool(s, "waterlogged", f.kind == 1 && f.source);
+        self.set_block(q, s, flag::ALL);
+    }
+
+    /// Stalagmite growing below the tip at `tip`: the one already there lengthens, otherwise
+    /// a new one is born on the first solid ground outside the water.
+    fn spel_grow_stalagmite_below(&mut self, tip: P, block: u16, dripstone: bool) {
+        let mut q = tip;
+        for _ in 0..STALAGMITE_SCAN {
+            q = below(q);
+            let st = self.get(q);
+            if !self.fluid_of(st).is_empty() {
+                return;
+            }
+            if self.spel_unmerged_tip(st, Dir::Up, block) && self.spel_tip_can_grow(st, q, block) {
+                self.spel_grow_into(q, Dir::Up, block);
+                return;
+            }
+            if self.spel_valid_at(q, block, Dir::Up) && self.fluid_at(below(q)).kind != 1 {
+                self.spel_grow_into(below(q), Dir::Up, block);
+                return;
+            }
+            if dripstone && !self.drip_passes(st) {
+                return;
+            }
+        }
+    }
+
+    /// Does a drop pass through this state? Air yes; opaque block or fluid no; otherwise
+    /// only if its collision shape leaves the central column free.
+    fn drip_passes(&self, s: u32) -> bool {
+        let v = self.v();
+        if v.is_air(s) {
+            return true;
+        }
+        if v.info(s).has(rc_data::flags::SOLID_RENDER) || !self.fluid_of(s).is_empty() {
+            return false;
+        }
+        !self.data.shape(v.info(s).collision).iter().any(|b| {
+            b.min[0] < DRIP_MAX && b.max[0] > DRIP_MIN && b.min[2] < DRIP_MAX && b.max[2] > DRIP_MIN && b.min[1] < 1.0 && b.max[1] > 0.0
+        })
+    }
+}

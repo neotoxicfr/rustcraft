@@ -182,6 +182,7 @@ impl Server {
             BeTick::Gateway => self.state_name(s) == "minecraft:end_gateway",
             BeTick::Beacon(_) => self.v().kind(s) == Kind::Beacon,
             BeTick::Conduit(_) => self.v().block(s) == self.bs.t.id.conduit,
+            BeTick::PotentSulfur => self.potent_sulfur_alive(s), // G6-F09a
         } && self.be_get(p).is_some();
         if !alive {
             self.bs.be_ticks.remove(&p);

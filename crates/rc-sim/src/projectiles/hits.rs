@@ -1352,7 +1352,8 @@ impl Server {
                 let by = Some(crate::mobs::recent::vibration::Src::Projectile(self.proj_owner(p)));
                 self.destroy_block_by(b.pos, true, 512, by);
             }
-            "pointed_dripstone"
+            // Speleothems (pointed dripstone, sulfur spike): broken by a fast trident.
+            "pointed_dripstone" | "sulfur_spike"
                 if p.kind == PKind::Trident && griefing_ok && p.vel[0].hypot(p.vel[1]).hypot(p.vel[2]) > 0.6 =>
             {
                 self.destroy_block(b.pos, true, 512);

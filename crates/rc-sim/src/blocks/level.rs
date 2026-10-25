@@ -121,6 +121,8 @@ pub(crate) enum BeTick {
     Beacon(crate::beacon::BeaconTick),
     /// G6-F12: conduit (active, tick of the next short ambient sound).
     Conduit(super::conduit::ConduitTick),
+    /// G6-F09a: active sulfur outside the dry state (countdown in the `countdown` NBT field).
+    PotentSulfur,
 }
 
 impl Sim {
@@ -384,6 +386,10 @@ impl Server {
             // G6-F01: jukebox ticker according to `has_record`.
             if new_kind == Kind::Jukebox && self.get(p) == state {
                 self.jukebox_ticker_sync(p, state);
+            }
+            // G6-F09a: active sulfur ticker follows its state (on every state change).
+            if new_kind == Kind::PotentSulfur && self.get(p) == state {
+                self.potent_sulfur_ticker_sync(p, state);
             }
         }
         if self.get(p) == state {
@@ -845,6 +851,10 @@ impl Server {
         if id == "minecraft:comparator" {
             fields.push(("OutputSignal".to_owned(), Nbt::Int(0)));
         }
+        // G6-F09a: active sulfur countdown, -1 until it has been drawn.
+        if id == "minecraft:potent_sulfur" {
+            fields.push(("countdown".to_owned(), Nbt::Int(-1)));
+        }
         if let Some(Some(c)) = self.chunks.get_mut(&(p[0] >> 4, p[2] >> 4)) {
             c.block_entities.push(Nbt::Compound(fields));
             c.dirty = true;
@@ -977,6 +987,7 @@ impl Server {
                 self.coral_try_schedule_death(state, p);
             }
             Kind::Shelf => self.shelf_on_place(p, state, old), // G6-F01: side chain
+            Kind::PotentSulfur => self.potent_sulfur_on_place(state, p), // G6-F09a
             // Frosted ice: melt scheduled at each placement (age included), 60 to 120 ticks; the
             // shorter delay drawn afterwards by its tick is then ignored (26.3).
             Kind::FrostedIce => {
@@ -1163,6 +1174,7 @@ impl Server {
             Kind::Lectern => self.lectern_tick(state, p), // G6-F01: end of the page pulse
             Kind::GrowingHead { up } | Kind::GrowingBody { up } => self.growing_tick(state, p, up),
             Kind::BigDripleaf => self.dripleaf_tick(state, p),
+            Kind::Speleothem { .. } => self.speleothem_tick(state, p), // G6-F09a
             // Stem, chorus: broken (loot) if they no longer hold.
             Kind::BigDripleafStem | Kind::ChorusFlower | Kind::ChorusPlant => {
                 if !self.can_survive(state, p) {
@@ -1202,6 +1214,8 @@ impl Server {
             }
             Kind::NoteBlock => self.note_sound(state, p),
             Kind::Chest => true,
+            // G6-F09a: start of an eruption, timed by the client.
+            Kind::PotentSulfur => true,
             // G6-F01: wobble of the decorated pot (style 0 or 1).
             Kind::DecoratedPot => a == 1 && (0..2).contains(&b),
             // Lid (opener count) of Ender chests, copper chests, Shulker boxes;
