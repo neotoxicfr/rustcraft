@@ -1018,6 +1018,7 @@ impl Server {
                 return true;
             }
             Kind::Wolf | Kind::Cat => return self.tame_interact(m, slot),
+            Kind::Pig => return super::nether::strider::pig_interact(self, m, slot, &item),
             _ => {}
         }
         self.animal_food_interact(m, slot, &item)

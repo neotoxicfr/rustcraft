@@ -70,6 +70,8 @@ mod tests_g4f03;
 mod tests_g5f03;
 #[cfg(test)]
 mod tests_g5f03b;
+#[cfg(test)]
+mod tests_g4f07b;
 
 use rc_proto::Reader;
 use rc_proto::nbt::Nbt;

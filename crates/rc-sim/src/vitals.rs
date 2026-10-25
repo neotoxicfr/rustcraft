@@ -1535,8 +1535,8 @@ impl Server {
         if self.game_mode == 3 || self.life.vit.dead {
             return;
         }
-        // F12: warped fungus on a stick on a steered strider (boost).
-        if self.strider_boost_use(hand) {
+        // F12: warped fungus on a stick (strider) or carrot on a stick (pig): boost.
+        if self.stick_boost_use(hand) {
             return;
         }
         let slot = if hand == 0 { 36 + self.held as usize } else { 45 };

@@ -13,7 +13,7 @@ use crate::player::Stack;
 use crate::server::Server;
 
 /// Horizontal direction (south, west, north, east) of a yaw.
-fn direction_of(yaw: f32) -> [i32; 2] {
+pub(crate) fn direction_of(yaw: f32) -> [i32; 2] {
     match ((f64::from(yaw) / 90.0 + 0.5).floor() as i32) & 3 {
         0 => [0, 1],
         1 => [-1, 0],
@@ -28,7 +28,7 @@ fn clockwise(d: [i32; 2]) -> [i32; 2] {
 }
 
 /// The dismount offsets according to the direction.
-fn offsets_for(fwd: [i32; 2]) -> [[i32; 2]; 8] {
+pub(crate) fn offsets_for(fwd: [i32; 2]) -> [[i32; 2]; 8] {
     let right = clockwise(fwd);
     let left = [-right[0], -right[1]];
     let back = [-fwd[0], -fwd[1]];

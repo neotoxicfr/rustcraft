@@ -2433,3 +2433,13 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   walk of the order of 3.65 ms for 12,000 files (G1-F15 measurement), kept for safety.
 - Free disk space (`rc_sim::storage::low_disk_space`): one system call at opening, on
   the main thread; not measured separately (negligible).
+
+## G4-F07b: pig steered with a carrot, llama spit (25/10, loaded machine)
+
+- Pig: one "carrot in hand?" test per tick and per pig (two inventory slots read), the boost
+  and the wear only on click. No hot spot (no loop, no allocation); multi-core and GPU not
+  applicable. Dismount: at most eight cells, once per dismount.
+- Llama spit: same work per tick as before (one walk of the mobs); the margin and the entry
+  point replace the distance to the centre (same cost); the "llama and passengers" list is
+  built only until the spit has left (a few ticks), then no allocation at all. No bench: a
+  few spits in flight at most, nothing measurable per scene.

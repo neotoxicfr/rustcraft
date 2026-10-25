@@ -177,6 +177,9 @@ impl Server {
         super::sealife::pre_tick(self, m); // F09: pufferfish inflation
         super::brainy::pre_tick(self, m); // F10: sniffer seed
         super::nether::pre_tick(self, m); // F12: strider sounds and cold
+        if m.kind == Kind::Pig {
+            super::nether::strider::steer_tick(self, m); // carrot on a stick in hand?
+        }
         super::recent::pre_tick(self, m); // F14: creaking heart, warden vibrations, breeze random draw
         // Cubes: sulfur cube fuse, crushing; then common tick and landing.
         if m.kind.is_cube() {
