@@ -898,6 +898,12 @@ impl Server {
         }
     }
 
+    /// "Nearby players" query of a targeting: only the feet point counts (lower bounds
+    /// included, upper bounds excluded), not the player's box.
+    pub(crate) fn player_feet_in(&self, area: &rc_physics::Aabb) -> bool {
+        (0..3).all(|i| area.min[i] <= self.pos[i] && self.pos[i] < area.max[i])
+    }
+
     pub(crate) fn player_eye_y(&self) -> f64 {
         self.pos[1] + self.player_eye_h()
     }

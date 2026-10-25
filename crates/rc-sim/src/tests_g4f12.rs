@@ -103,6 +103,52 @@ fn defend_village_needs_line_of_sight() {
     assert!(!can(&mut w, &mut golem), "golem defends the village through a wall");
     w.wall(8, "minecraft:air");
     assert!(can(&mut w, &mut golem), "golem does not defend the village in the open");
+    // Player visible on the golem's side, ill-disposed villager alone behind the wall: sight of
+    // the villager is required too.
+    w.mob_mut(v).pos = [11.5, f64::from(Y), 8.5];
+    w.p.s.pos = [6.5, f64::from(Y), 8.5];
+    w.wall(8, "minecraft:stone");
+    assert!(!can(&mut w, &mut golem), "golem defends a villager it cannot see");
+    w.wall(8, "minecraft:air");
+    assert!(can(&mut w, &mut golem), "golem ignores a visible villager");
+}
+
+/// Village defence: the player is only retained if their feet are in the area (upper bounds
+/// excluded); a box that overlaps the area is not enough.
+#[test]
+fn defend_village_player_feet_in_area() {
+    let mut w = world("defendfeet");
+    let uuid = w.p.s.uuid;
+    let v = w.add(Kind::Villager, [5.5, f64::from(Y), 8.5]);
+    w.mob_mut(v).npc.as_mut().expect("villager").gossips.add(uuid, crate::mobs::villager::G_MAJOR_NEG, 100);
+    let mut golem = w.p.s.new_mob(Kind::IronGolem, [3.5, f64::from(Y), 8.5], 0.0);
+    let edge = golem.bbox().max[0] + 10.0;
+    let mut can_at = |w: &mut W, x: f64| {
+        w.p.s.pos = [x, f64::from(Y), 8.5];
+        golem.sight.clear();
+        let mut g = GolemGoal::DefendVillage { base: TBase::new(false, true), potential: None };
+        w.p.s.iron_can_use(&mut g, &mut golem)
+    };
+    assert!(can_at(&mut w, edge - 0.1), "player with feet in the area ignored");
+    assert!(!can_at(&mut w, edge), "upper bound of the area included");
+    assert!(!can_at(&mut w, edge + 0.2), "player with feet outside the area retained through their box");
+}
+
+/// Same player query for the phantom's targeting: feet below the bottom of the area, box
+/// entering it, no target.
+#[test]
+fn phantom_target_player_feet_in_area() {
+    let mut w = world("phantomfeet");
+    let mut ph = w.p.s.new_mob(Kind::Phantom, [8.5, f64::from(Y) + 70.0, 8.5], 0.0);
+    let bottom = ph.bbox().min[1] - 64.0;
+    let mut can_at = |w: &mut W, y: f64| {
+        w.p.s.pos = [8.5, y, 8.5];
+        ph.sight.clear();
+        ph.target = None;
+        w.p.s.phantom_target_can_use(&mut ph, &mut 0)
+    };
+    assert!(can_at(&mut w, bottom), "player with feet on the bottom of the area ignored");
+    assert!(!can_at(&mut w, bottom - 0.5), "player with feet below the area retained through their box");
 }
 
 /// Micro-bench (ignored): cost of the village defence start test, 8 villagers in the area,

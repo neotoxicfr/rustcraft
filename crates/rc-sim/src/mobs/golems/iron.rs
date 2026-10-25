@@ -273,7 +273,7 @@ impl Server {
                 // Without a valid player no villager can change anything: their scan is skipped
                 // (the sight rays have no observable effect).
                 let player_near =
-                    self.player_aabb().intersects(&area) && self.targeting_ok(m, Ent::Player, true, 64.0, true, true);
+                    self.player_feet_in(&area) && self.targeting_ok(m, Ent::Player, true, 64.0, true, true);
                 if player_near {
                     let villagers: Vec<(i32, i32)> = self
                         .mobs
