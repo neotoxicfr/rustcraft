@@ -315,9 +315,10 @@ impl EntityRenderer {
             rays(m, t / 200.0, &mut self.free_verts[FREE_RAYS]);
         }
         let p = e.render_pos(pt);
+        // Boîte du dragon gonflée de 32 (demi-largeur, hauteur).
         let [w, h] = {
-            let d = e.dims(&self.dims);
-            [f64::from(d[0]) / 2.0 + 32.0, f64::from(d[1]) + 32.0]
+            let s = e.size(&self.dims);
+            [f64::from(s.w) / 2.0 + 32.0, f64::from(s.h) + 32.0]
         };
         let nearest = self
             .crystals

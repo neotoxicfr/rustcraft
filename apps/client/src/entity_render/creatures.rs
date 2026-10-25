@@ -664,8 +664,30 @@ fn strider(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
     }
 }
 
+/// Delay between two warden heartbeats: 40 − ⌊clamp(anger / 80) × 30⌋ ticks.
+fn warden_heart_delay(e: &Entity) -> u32 {
+    let anger = (e.meta_int(16).unwrap_or(0) as f32 / 80.0).clamp(0.0, 1.0);
+    40 - (anger * 30.0).floor() as u32
+}
+
+/// The warden's heart beat on this tick (counter reset to 10 by `tick`).
+pub(crate) fn warden_beat(e: &Entity) -> bool {
+    e.kind == "warden" && e.extra[10] == 10.0
+}
+
+/// Ticks elapsed since the start of the current dig (14) or emerge (13) pose, if it has
+/// started (starts 5 and 6 of `tick`).
+pub(crate) fn warden_dig_ticks(e: &Entity) -> Option<f32> {
+    let slot = match e.pose() {
+        13 => 6,
+        14 => 5,
+        _ => return None,
+    };
+    State::start_of(e.extra[slot]).map(|s| e.age as f32 - s)
+}
+
 /// Warden: extra 0 pose seen (key), 1-2 tentacles (10..0), starts 3 attack, 4 sonic boom,
-/// 5 dig, 6 emerge, 7 roar, 8 sniff.
+/// 5 dig, 6 emerge, 7 roar, 8 sniff, 9-10 heart (10..0, current then old).
 fn warden(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     p.set("head", |h| {
         h[3] = s.pitch;
@@ -1208,9 +1230,17 @@ pub(super) fn tick(e: &mut Entity) {
         "warden" => {
             let pose = e.pose();
             let start = e.age as f32 - 1.0;
+            // Heart: 10 at a tick that is a multiple of the delay (current anger), then counted
+            // down; the old value is taken after the reset to 10 (9 and 10 on the beat tick).
+            let beat = e.age.is_multiple_of(warden_heart_delay(e));
             let x = &mut e.extra;
+            if beat {
+                x[9] = 10.0;
+            }
             x[2] = x[1];
             x[1] = (x[1] - 1.0).max(0.0);
+            x[10] = x[9];
+            x[9] = (x[9] - 1.0).max(0.0);
             if changed(&mut x[0], pose) {
                 let slot = match pose {
                     13 => 6,
