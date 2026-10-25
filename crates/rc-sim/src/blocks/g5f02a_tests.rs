@@ -237,6 +237,71 @@ fn mob_command_teleport_forgets_moves() {
     assert_eq!(m.fire, 0, "teleported: the fire at the start is not swept");
 }
 
+/// `rotate` and directed look of a mob: rotation alone, like the game. The recorded path
+/// (pushed through fire) is still swept by the next pass, the old position and the path
+/// do not move; the look aligns the body on the head, `rotate` does not. Before, the rotation went
+/// through the teleport, which emptied the path, reset the old position and stopped the path.
+#[test]
+fn mob_rotate_keeps_moves_and_path() {
+    use crate::commands::ents::E;
+    use crate::inside_blocks::Who;
+    let mut w = world("g5f02a-mrot");
+    let at = [4, Y, 4];
+    w.set(at, "minecraft:fire");
+    for look in [false, true] {
+        let m = cow(&mut w, feet(at));
+        let id = m.id;
+        w.p.s.add_mob(m);
+        let m = w.p.s.mobs.get_mut(id).expect("cow in the list");
+        let from = m.pos;
+        m.pos[0] += 2.0;
+        m.inside.record(from, m.pos, [2.0, 0.0, 0.0]);
+        let to = m.pos;
+        let body = m.body_yaw;
+        m.nav.path = some_path();
+        if look {
+            w.p.s.command_look_at(E::Mob(id), false, feet([4, Y, 12]), None);
+        } else {
+            w.p.s.command_rotate(E::Mob(id), [90.0, 0.0], [false, false]);
+        }
+        let mut m = w.p.s.mobs.get_mut(id).expect("cow in the list").clone();
+        let old = m.old;
+        m.old = m.pos; // start of the next tick: only the recorded path goes through the fire
+        let _ = w.p.s.inside_blocks(&mut Who::Mob(&mut m));
+        assert_eq!(m.fire, 160, "path through the fire swept (look: {look})");
+        assert_eq!((old, m.pos), (from, to), "positions intact (look: {look})");
+        assert!(m.nav.path.is_some(), "path kept (look: {look})");
+        assert_eq!(m.head_yaw, m.yaw, "head aligned (look: {look})");
+        if look {
+            assert_eq!(m.body_yaw, m.yaw, "look: body aligned on the head");
+        } else {
+            assert_eq!((m.yaw, m.body_yaw), (90.0, body), "rotate: yaw set, body unchanged");
+        }
+    }
+}
+
+/// Path in progress (empty, arbitrary target): only its presence counts.
+fn some_path() -> Option<crate::mobs::nav::Path> {
+    Some(crate::mobs::nav::Path { nodes: Vec::new(), next: 0, target: [9, Y, 4], dist_to_target: 0.0, reached: false })
+}
+
+/// Path of a mob: `tp` drops it, `spreadplayers` keeps it, like the game. Before, the shared
+/// teleport dropped it for both commands.
+#[test]
+fn only_tp_stops_the_path() {
+    use crate::commands::ents::E;
+    let mut w = world("g5f02a-path");
+    w.cmd(&format!("summon minecraft:cow 4.5 {Y} 4.5 {{Tags:[\"g5p\"],NoAI:1b}}"));
+    let src = w.p.s.player_source();
+    let Ok(E::Mob(id)) = w.p.s.arg_entity(&src, "@e[tag=g5p,limit=1]", false) else { panic!("cow summoned") };
+    w.p.s.mobs.get_mut(id).expect("cow").nav.path = some_path();
+    let walking = |w: &mut W| w.p.s.mobs.get_mut(id).map(|m| m.nav.path.is_some());
+    w.cmd("spreadplayers 8 8 1 4 false @e[tag=g5p]");
+    assert_eq!(walking(&mut w), Some(true), "spreadplayers: path kept");
+    w.cmd(&format!("tp @e[tag=g5p] 6 {Y} 6"));
+    assert_eq!(walking(&mut w), Some(false), "tp: path dropped");
+}
+
 /// Order of the cells within one step: when backing towards −x, the game starts from the max x
 /// edge; the cactus (x + 1) hurts before the campfire (x), which is then blocked by invulnerability.
 #[test]

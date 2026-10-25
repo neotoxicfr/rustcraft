@@ -608,3 +608,142 @@ fn door_crack_to_nearby_players() {
     t.s.door_break_progress(999, [2, FLOOR + 1, 2], 3);
     assert!(drain(&t).iter().any(|e| matches!(e, Event::BlockDestruction { .. })), "player near");
 }
+
+// ---------- G5-F02a: state specific to each player ----------
+
+/// Feet at the center of the cell `p`.
+fn feet(p: [i32; 3]) -> [f64; 3] {
+    [f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5]
+}
+
+/// Host ready at `pos`: survival, full health, fire at rest, no pending teleport.
+fn host_ready(t: &mut T, pos: [f64; 3]) {
+    let s = &mut t.s;
+    s.loaded = true;
+    s.teleport = None;
+    s.game_mode = 0;
+    s.pos = pos;
+    s.last_good = pos;
+    s.life.vit.health = 20.0;
+    s.life.vit.cooldown = 0;
+    s.life.vit.fire = -20;
+}
+
+/// First guest ready at `pos`, in the same state.
+fn guest_ready(t: &mut T, pos: [f64; 3]) {
+    let c = t.s.lan.as_mut().unwrap().guests[0].ctx.as_mut().unwrap();
+    c.loaded = true;
+    c.teleport = None;
+    c.game_mode = 0;
+    c.pos = pos;
+    c.last_good = pos;
+    c.vit.health = 20.0;
+    c.vit.cooldown = 0;
+    c.vit.fire = -20;
+}
+
+/// Health and fire of the first guest.
+fn guest_vitals(t: &T) -> (f32, i32) {
+    let c = t.s.lan.as_ref().unwrap().guests[0].ctx.as_ref().unwrap();
+    (c.vit.health, c.vit.fire)
+}
+
+/// One tick of the integrated server: world and host, then the guests.
+fn server_tick(t: &mut T) {
+    t.s.game_tick();
+    t.s.lan_tick();
+    t.s.tick += 1;
+}
+
+/// Crossed-block pass: the guest starts from THEIR position at their last pass. Before, it started
+/// from the host's and suffered, from afar, the lava the host was standing in.
+#[test]
+fn host_lava_not_on_guest() {
+    let mut t = open("lava");
+    publish(&mut t, false);
+    let _g = join(&mut t, "Guest", 2);
+    let host_at = [-5, FLOOR + 1, -5];
+    let lava = t.s.default_state("minecraft:lava");
+    t.s.set_block(host_at, lava, 2);
+    host_ready(&mut t, feet(host_at));
+    guest_ready(&mut t, feet([5, FLOOR + 1, 5]));
+    server_tick(&mut t);
+    assert_eq!((t.s.life.vit.health, t.s.life.vit.fire), (16.0, 300), "host in lava");
+    assert_eq!(guest_vitals(&t), (20.0, -20), "guest far from the lava: intact, fire at rest");
+}
+
+/// The reverse: the host starts from THEIR position. Before, it started from the guest's and the
+/// water the guest was swimming in put out the burning host.
+#[test]
+fn guest_water_not_on_host() {
+    let mut t = open("water");
+    publish(&mut t, false);
+    let _g = join(&mut t, "Guest", 2);
+    let guest_at = [5, FLOOR + 1, 5];
+    let water = t.s.default_state("minecraft:water");
+    t.s.set_block(guest_at, water, 2);
+    host_ready(&mut t, feet([-5, FLOOR + 1, -5]));
+    t.s.life.vit.fire = 100;
+    guest_ready(&mut t, feet(guest_at));
+    server_tick(&mut t);
+    server_tick(&mut t);
+    assert_eq!(t.s.life.vit.fire, 98, "host far from the water: still burning");
+}
+
+/// Path received from a guest (movement packet out of the lava): swept for the guest alone.
+/// Before, it landed in the host's list, and the host took the guest's lava.
+#[test]
+fn guest_path_swept_for_guest() {
+    let mut t = open("path");
+    publish(&mut t, false);
+    let _g = join(&mut t, "Guest", 2);
+    let g0 = [4, FLOOR + 1, 4];
+    let lava = t.s.default_state("minecraft:lava");
+    t.s.set_block(g0, lava, 2);
+    host_ready(&mut t, feet([-4, FLOOR + 1, -4]));
+    guest_ready(&mut t, feet(g0));
+    // One block to the east: the arrival box no longer touches the lava cell.
+    let to = [f64::from(g0[0]) + 1.5, f64::from(FLOOR + 1), f64::from(g0[2]) + 0.5];
+    t.s.as_guest(0, |sv| sv.handle(crate::input::Input::Move { pos: Some(to), rot: None, on_ground: true }));
+    assert_eq!(t.s.lan.as_ref().unwrap().guests[0].ctx.as_ref().unwrap().pos, to, "movement accepted");
+    server_tick(&mut t);
+    assert_eq!((t.s.life.vit.health, t.s.life.vit.fire), (20.0, -20), "host: nothing of the guest's path");
+    assert_eq!(guest_vitals(&t), (16.0, 300), "guest: lava crossed");
+}
+
+/// Lidded container: the guest closes their own, not the one the host has opened since.
+#[test]
+fn opened_container_specific_to_each_player() {
+    let mut t = open("barrels");
+    publish(&mut t, false);
+    let _g = join(&mut t, "Guest", 2);
+    let barrel = t.s.default_state("minecraft:barrel");
+    let (a, b) = ([3, FLOOR + 1, 0], [-3, FLOOR + 1, 0]);
+    t.s.set_block(a, barrel, 2);
+    t.s.set_block(b, barrel, 2);
+    host_ready(&mut t, feet([-3, FLOOR + 1, 1]));
+    guest_ready(&mut t, feet([3, FLOOR + 1, 1]));
+    assert!(t.s.as_guest(0, |sv| sv.use_block(a)), "guest: barrel opened");
+    assert!(t.s.use_block(b), "host: barrel opened");
+    t.s.as_guest(0, |sv| sv.close_menu(false));
+    let openers = |t: &T, p: [i32; 3]| t.s.life.openers.get(&p).copied().unwrap_or(0);
+    assert_eq!((openers(&t, a), openers(&t, b)), (0, 1), "openers (guest's barrel, host's)");
+}
+
+/// Tracked equipment: the guest does not wear the host's chestplate, and their tick does not
+/// remove it from the host.
+#[test]
+fn equipment_specific_to_each_player() {
+    let mut t = open("armor");
+    publish(&mut t, false);
+    let _g = join(&mut t, "Guest", 2);
+    host_ready(&mut t, feet([-3, FLOOR + 1, 0]));
+    guest_ready(&mut t, feet([3, FLOOR + 1, 0]));
+    t.s.slots[6] = Some(crate::player::Stack { id: "minecraft:diamond_chestplate".into(), count: 1, components: None });
+    t.s.equipment_tick();
+    assert!(!t.s.player_mods("minecraft:armor").is_empty(), "host: chestplate counted");
+    let guest = t.s.as_guest(0, |sv| sv.player_mods("minecraft:armor"));
+    assert!(guest.is_empty(), "guest without armor: {guest:?}");
+    t.s.as_guest(0, |sv| sv.equipment_tick());
+    assert!(!t.s.player_mods("minecraft:armor").is_empty(), "host: chestplate kept after the guest's tick");
+}

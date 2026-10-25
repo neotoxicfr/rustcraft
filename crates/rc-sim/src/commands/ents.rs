@@ -459,7 +459,6 @@ impl Server {
                         m.body_yaw = y;
                     }
                     m.needs_sync = true;
-                    m.nav.stop();
                 }
             }
             E::Item(i) => {
@@ -557,15 +556,34 @@ impl Server {
             self.pitch = fp;
             let _ =
                 self.send(Event::PlayerRotation { yaw: sy, yaw_relative: rel[0], pitch: sp, pitch_relative: rel[1] });
+        } else if let E::Mob(i) = e {
+            self.mob_rotate(i, fy, fp, false);
         } else {
             let pos = self.e_pos(e);
             self.ent_teleport(e, pos, Some([fy, fp]));
         }
     }
 
+    /// Rotation alone of a mob (`rotate`, directed look), like the game: yaw, head, pitch and
+    /// previous values; the look also aligns the body on the head. Neither the position, nor the
+    /// old position, nor the tick's movements (read back by the crossed-block pass), nor the path
+    /// move, and nothing is forced at send time: the rotation goes out with the tracking.
+    fn mob_rotate(&mut self, i: i32, yaw: f32, pitch: f32, look: bool) {
+        let Some(m) = self.mobs.get_mut(i) else { return };
+        m.yaw = yaw;
+        m.head_yaw = yaw;
+        m.pitch = pitch;
+        m.pitch_o = pitch;
+        if look {
+            m.head_yaw_o = yaw;
+            m.body_yaw = yaw;
+        }
+    }
+
     /// After a command teleportation: the game restarts from a zero speed and keeps that
     /// of the relative axes (`rel`) only on those, then cancels the vertical and puts the entity on
-    /// the ground, except for a living entity gliding.
+    /// the ground, except for a living entity gliding; the path of a mob is dropped
+    /// (`tp` only: `spreadplayers` keeps it).
     pub fn after_command_teleport(&mut self, e: E, rel: [bool; 3]) {
         if let E::Other(i) = e
             && let Some(c) = self.cart_mut(i)
@@ -586,6 +604,7 @@ impl Server {
                     m.vel[1] = 0.0;
                     zero_absolute(&mut m.vel, rel);
                     m.on_ground = true;
+                    m.nav.stop();
                 }
             }
             E::Item(i) => {
@@ -635,6 +654,8 @@ impl Server {
             let _ = self.send(Event::LookAt { eyes: from_eyes, target: t, entity });
             self.yaw = yaw;
             self.pitch = pitch;
+        } else if let E::Mob(i) = e {
+            self.mob_rotate(i, yaw, pitch, true);
         } else {
             let pos = self.e_pos(e);
             self.ent_teleport(e, pos, Some([yaw, pitch]));

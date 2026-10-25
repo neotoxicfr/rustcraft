@@ -2454,3 +2454,8 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   `seen_mask_matches_linear_list` (3,000 paths, stored sum). The list stays behind
   `RUSTCRAFT_OPT_INSIDE_SEEN_LINEAR` until the quiet-machine bench. Starting hash set not
   re-measured (the mask avoids hashing; to compare on a quiet machine).
+  Follow-up 2 (state specific to each LAN player, mob rotation): no in-game speed lead. A
+  guest install swaps 4 more fields (movement list, position at the last pass, opened
+  container, tracked equipment) among the sixty or so already swapped; the rotation of a mob
+  by command does less than before (no more position copy, path stop or forced sync). Not
+  measured: no bench scene has a guest or a rotation by command.
