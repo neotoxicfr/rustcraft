@@ -41,8 +41,9 @@ impl Server {
             .map(|i| i as i32)
     }
 
-    /// Sound played by a mob (seed drawn from the world's random source): nothing, and no seed drawn, if
-    /// it is silent (`Silent`); the callers' pitch draws are still made.
+    /// Sound played by a mob: nothing if it is silent (`Silent`); the callers' pitch
+    /// draws are still made. The seed comes from the sound-only generator, like the official game: a
+    /// sound never shifts the world's random source (spawns, finalizations).
     pub(crate) fn mob_sound(&mut self, m: &Mob, name: &str, volume: f32, pitch: f32) {
         if m.x.silent {
             return;
@@ -52,7 +53,7 @@ impl Server {
 
     /// Sound played by the world at a mob's position: heard even if it is silent.
     pub(crate) fn mob_sound_unmuted(&mut self, m: &Mob, name: &str, volume: f32, pitch: f32) {
-        let seed = self.mobs.rng.next_long();
+        let seed = crate::vitals::sound_seed();
         let Some(id) = self.sound_id(name) else { return };
         let category = Self::mob_sound_source(m);
         let _ = self.send(Event::Sound(SoundPacket {
@@ -104,7 +105,7 @@ impl Server {
     /// Sound attached to an entity: the client makes it follow
     /// the entity (`sound_entity` packet).
     pub(crate) fn entity_sound(&mut self, id: i32, name: &str, category: i32, volume: f32, pitch: f32) {
-        let seed = self.mobs.rng.next_long();
+        let seed = crate::vitals::sound_seed();
         let Some(sid) = self.sound_id(name) else { return };
         let _ = self.send(Event::Sound(SoundPacket {
             sound: SoundRef::Id(sid),
@@ -118,7 +119,7 @@ impl Server {
     }
 
     pub(crate) fn world_sound(&mut self, name: &str, category: i32, pos: [f64; 3], volume: f32, pitch: f32) {
-        let seed = self.mobs.rng.next_long();
+        let seed = crate::vitals::sound_seed();
         let Some(id) = self.sound_id(name) else { return };
         let _ = self.send(Event::Sound(SoundPacket {
             sound: SoundRef::Id(id),
