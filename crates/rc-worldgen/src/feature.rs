@@ -406,9 +406,13 @@ impl Registry {
         Ok(FeatureId(self.features.len() as u32 - 1))
     }
 
+    /// Set of placed features: a list, or a single feature written without a list (a form the
+    /// game accepts, used by `nylium_bonemeal`).
     fn placed_list(&mut self, j: Option<&Json>, c: &mut ParseCtx) -> Result<Vec<PlacedId>, Error> {
-        let a = j.and_then(Json::as_array).ok_or_else(|| bad("feature list"))?;
-        a.iter().map(|x| self.placed_ref(x, c)).collect()
+        match j.ok_or_else(|| bad("feature list"))? {
+            Json::Arr(a) => a.iter().map(|x| self.placed_ref(x, c)).collect(),
+            one => Ok(vec![self.placed_ref(one, c)?]),
+        }
     }
 
     fn parse_feature(&mut self, j: &Json, c: &mut ParseCtx) -> Result<Feature, Error> {

@@ -2433,3 +2433,15 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   walk of the order of 3.65 ms for 12,000 files (G1-F15 measurement), kept for safety.
 - Free disk space (`rc_sim::storage::low_disk_space`): one system call at opening, on
   the main thread; not measured separately (negligible).
+
+## G6-F07: bone meal (25/10, loaded machine)
+
+- New targets (`blocks/bone_meal.rs`): one player click or one dispenser shot, no hot path.
+  Named tags read by `TagId` (3 added: corals, nylium, wall fans), no list allocated (tag
+  members read in place for the draws). Bone meal in water: 128 attempts at most, like the
+  game; multi-core and GPU not applicable (single piece of work, ordered by the world's random
+  draws).
+- Features placed by name loaded in every decorator (29 features + `grass_bonemeal`): decorator
+  construction of a flat world 2.86 ms without, 2.88 ms with (best of 5, one pass each): under
+  the noise, kept (without them, saplings and bone meal failed outside the biomes that cite
+  them).
