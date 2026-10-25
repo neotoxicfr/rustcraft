@@ -920,9 +920,22 @@ impl Server {
         }
         if !living {
             n += self.bs.entities.list.iter().filter(|e| !e.removed && hit(&Self::entity_box(e))).count();
-            n += self.life.drops.iter().filter(|d| !d.is_removed() && hit(&around(d.pos, 0.25, 0.25))).count();
-            n += self.life.orbs.iter().filter(|o| !o.is_removed() && hit(&around(o.pos, 0.5, 0.5))).count();
-            n += self.proj.list.iter().filter(|p| !p.removed && hit(&p.bbox())).count();
+            // Objets et orbes : pendant le tick de leur liste, positions tenues à jour au fil du tick.
+            let c = &self.contact;
+            n += if c.items_ticking {
+                c.live_items.iter().filter(|&&(pos, gone)| !gone && hit(&around(pos, 0.25, 0.25))).count()
+            } else {
+                self.life.drops.iter().filter(|d| !d.is_removed() && hit(&around(d.pos, 0.25, 0.25))).count()
+            };
+            n += if c.orbs_ticking {
+                c.live_orbs.iter().filter(|&&(pos, gone)| !gone && hit(&around(pos, 0.5, 0.5))).count()
+            } else {
+                self.life.orbs.iter().filter(|o| !o.is_removed() && hit(&around(o.pos, 0.5, 0.5))).count()
+            };
+            // Projectile en cours de tick : sa boîte courante, pas sa case encore à l'ancienne place.
+            let tp = c.ticking_proj;
+            n += self.proj.list.iter().filter(|p| !p.removed && tp.is_none_or(|t| t.0 != p.id) && hit(&p.bbox())).count();
+            n += usize::from(tp.is_some_and(|t| hit(&t.1)));
             n += self.proj.clouds.iter().filter(|c| hit(&c.bbox())).count();
             n += self.mobs.mounts.spits.iter().filter(|s| hit(&around(s.pos, 0.25, 0.25))).count();
             // G5-F06: minecarts, the one being ticked included.
@@ -932,15 +945,16 @@ impl Server {
         n
     }
 
-    /// Plates under the player after an accepted movement.
-    pub(crate) fn player_touch_blocks(&mut self) {
+    /// Plates under the player after an accepted movement (feet from `from` to the position).
+    pub(crate) fn player_touch_blocks(&mut self, from: [f64; 3]) {
         let p = [self.pos[0].floor() as i32, self.pos[1].floor() as i32, self.pos[2].floor() as i32];
         for q in [p, below(p)] {
             if matches!(self.v().kind(self.get(q)), Kind::Plate { .. } | Kind::WeightedPlate { .. }) {
                 self.plate_entity_inside(q);
             }
         }
-        self.tripwire_entity_inside(p, self.game_mode == 3);
+        let (w, h, _) = self.player_dims();
+        self.tripwire_entity_inside(p, self.game_mode == 3, from, self.pos, w / 2.0, h);
         // G5-F09: big dripleaf under the feet (the full pass over crossed blocks, G5-F02,
         // calls it for all entities; a second call has no effect).
         if self.game_mode != 3 && self.v().kind(self.get(p)) == Kind::BigDripleaf {

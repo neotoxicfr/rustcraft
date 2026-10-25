@@ -2460,5 +2460,11 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   GPU sans objet. À remesurer machine calme (scène de mobs nombreux).
 - Joueur : un parcours par tick (mêmes coûts) ; bottes sans Semelles givrantes ni Agilité des
   âmes : sortie immédiate, sans requête au monde.
-- Objets et orbes : parcours différé dans un vecteur réutilisé jusqu'à la remise en place de
-  leur liste (sans quoi la plaque pondérée ne compterait pas les autres objets).
+- Objets et orbes (reprise du 25/10) : le report en fin de liste comptait tous les objets à leur
+  position de fin de tick (écart sur la plaque pondérée). Remplacé par un contact juste après le
+  déplacement de chaque objet, la plaque lisant une copie des positions (vecteur réutilisé,
+  rempli une fois par tick : une copie de 32 octets par objet, aucune allocation en régime
+  établi). Projectiles : contact dans le pas de déplacement, avant l'impact. Fil : test de la
+  boîte balayée contre sa forme (six comparaisons par segment, seulement dans une case de fil).
+  Banc créature après reprise : 77,3 ns à l'air libre, 82,7 ns dans une toile (bruit du banc
+  chargé, même ordre qu'avant). À remesurer machine calme (scène d'objets nombreux).

@@ -529,11 +529,21 @@ impl Server {
 
     /// Application of block effects (one step of the arrow).
     pub(crate) fn proj_blocks_effects_from(&mut self, p: &mut Proj, from: [f64; 3]) {
+        // Retiré, ou sans physique (sauf la balle de shulker) : aucun effet des blocs.
+        if p.removed || (p.no_physics && p.kind != PKind::ShulkerBullet) {
+            return;
+        }
         let (w, h) = p.kind.size();
         let b = p.bbox();
         // Lowered box of the wind charge: same offset at the start.
         let dy = b.min[1] - p.pos[1];
         let to = [p.pos[0], b.min[1], p.pos[2]];
+        // G5-F02e : plaques et fil, à la position de ce pas, avant l'impact éventuel (tous les
+        // projectiles qui passent ici ; l'œil de l'Ender n'y passe pas). Le projectile, copie
+        // hors de sa case, est compté par les plaques à sa position courante.
+        self.contact.ticking_proj = Some((p.id, b));
+        self.contact_triggers([from[0], from[1] + dy, from[2]], to, w / 2.0, h);
+        self.contact.ticking_proj = None;
         let touched = self.portals_touched_swept([from[0], from[1] + dy, from[2]], to, w, h);
         self.entity_portal_mark(p.id, &touched, crate::portal::ENTITY_COOLDOWN);
         let b = b.deflate(1.0e-5);

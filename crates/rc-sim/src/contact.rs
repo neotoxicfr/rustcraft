@@ -4,8 +4,10 @@
 //! Blocs traversés, après le déplacement du tick : la boîte de l'entité (rétrécie de 1e-5) est
 //! balayée de sa position de début de tick à sa position finale, axe par axe (Y, puis le plus
 //! grand de X et Z) ; chaque case n'est vue qu'une fois. Effets :
-//! - plaques de pression et fil : toute entité (créatures, objets, orbes, projectiles, blocs
-//!   qui tombent, TNT) teste la plaque à 0 ou le fil détendu, comme le joueur ;
+//! - plaques de pression et fil : toute entité (créatures, objets, orbes, projectiles hors œil
+//!   de l'Ender, blocs qui tombent, TNT) teste la plaque à 0 ou le fil détendu, comme le joueur,
+//!   juste après son propre déplacement ; le fil seulement si la boîte balayée recoupe sa forme
+//!   (1 à 2,5 px s'il est accroché, 0 à 8 px sinon) ;
 //! - buisson à baies (vivants hors renard et abeille) : enlisement 0,8 × 0,75 × 0,8 et, dès
 //!   l'âge 1, 1 dégât `sweet_berry_bush` si le déplacement horizontal du tick dépasse 0,003
 //!   sur un axe ;
@@ -84,8 +86,17 @@ pub struct Contact {
     /// Créature en cours de tick, sortie de la liste : identifiant, boîte, ignore les blocs
     /// déclencheurs (chauve-souris). Comptée par les plaques qu'elle enfonce.
     pub(crate) ticking: Option<(i32, Aabb, bool)>,
-    /// Parcours différés (objets, orbes) le temps que leur liste soit remise en place.
-    pending: Vec<([f64; 3], [f64; 3], f64, f64)>,
+    /// Projectile en cours de tick (copie hors de sa case) : identifiant, boîte à sa position
+    /// courante ; sa case, encore à l'ancienne position, n'est pas comptée par les plaques.
+    pub(crate) ticking_proj: Option<(i32, Aabb)>,
+    /// Pendant le tick de la liste des objets au sol (sortie du serveur) : position et retrait
+    /// de chacun, tenus à jour au fil du tick ; vide hors de ce tick. Une plaque touchée compte
+    /// ainsi les objets déjà déplacés à leur nouvelle place, les suivants à l'ancienne.
+    pub(crate) live_items: Vec<([f64; 3], bool)>,
+    pub(crate) items_ticking: bool,
+    /// Même chose pour les orbes d'expérience.
+    pub(crate) live_orbs: Vec<([f64; 3], bool)>,
+    pub(crate) orbs_ticking: bool,
     /// Bottes du joueur.
     pub(crate) player: Boots,
 }
@@ -146,15 +157,43 @@ fn content_top(kind: u8, level: i32) -> f64 {
     if kind == LAVA_CAULDRON { 15.0 / 16.0 } else { (6.0 + 3.0 * f64::from(level)) / 16.0 }
 }
 
+/// La boîte (demi-largeur `half`, hauteur `h`, pieds en `from`) déplacée jusqu'à `to` recoupe
+/// la forme `c`, segment par segment dans l'ordre de `swept_cells` (un segment suit un seul axe :
+/// son enveloppe est la zone balayée), marge de 1e-7 comme le jeu. Un saut de plus de 8 blocs ne
+/// teste que l'arrivée.
+pub(crate) fn swept_touches(c: &Aabb, from: [f64; 3], to: [f64; 3], half: f64, h: f64) -> bool {
+    let e = 1.0e-7;
+    let hits = |a: [f64; 3], b: [f64; 3]| {
+        let lo = [a[0].min(b[0]) - half, a[1].min(b[1]), a[2].min(b[2]) - half];
+        let hi = [a[0].max(b[0]) + half, a[1].max(b[1]) + h, a[2].max(b[2]) + half];
+        (0..3).all(|i| hi[i] > c.min[i] + e && lo[i] < c.max[i] - e)
+    };
+    let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+    if d.iter().any(|v| v.abs() > 8.0) {
+        return hits(to, to);
+    }
+    let order = if d[0].abs() < d[2].abs() { [1, 2, 0] } else { [1, 0, 2] };
+    let mut p = from;
+    let mut moved = false;
+    for a in order {
+        if d[a] != 0.0 {
+            let mut q = p;
+            q[a] = to[a];
+            if hits(p, q) {
+                return true;
+            }
+            p = q;
+            moved = true;
+        }
+    }
+    !moved && hits(from, from)
+}
+
 /// La boîte balayée touche le contenu du chaudron en `p` (colonne de 12 px depuis 4 px).
 fn touches_content(p: P, top: f64, from: [f64; 3], to: [f64; 3], half: f64, h: f64) -> bool {
     let [x, y, z] = p.map(f64::from);
     let c = Aabb { min: [x + 0.125, y + 0.25, z + 0.125], max: [x + 0.875, y + top, z + 0.875] };
-    let b = Aabb {
-        min: [from[0].min(to[0]) - half, from[1].min(to[1]), from[2].min(to[2]) - half],
-        max: [from[0].max(to[0]) + half, from[1].max(to[1]) + h, from[2].max(to[2]) + half],
-    };
-    (0..3).all(|i| b.max[i] > c.min[i] && b.min[i] < c.max[i])
+    swept_touches(&c, from, to, half, h)
 }
 
 impl Server {
@@ -175,35 +214,19 @@ impl Server {
     }
 
     /// Plaques et fil touchés par une entité qui n'est pas vivante (objet, orbe, projectile,
-    /// bloc qui tombe, TNT) déjà remise dans sa liste.
+    /// bloc qui tombe, TNT), juste après son déplacement. Sa position courante doit être
+    /// visible du compte des plaques (liste à jour, ou `ticking_proj` / `live_items` /
+    /// `live_orbs`).
     pub(crate) fn contact_triggers(&mut self, from: [f64; 3], to: [f64; 3], half: f64, h: f64) {
         let cells = self.contact_cells(from, to, half, h);
         for &p in &cells {
             match self.contact_kind(self.get(p)) {
                 PLATE => self.plate_entity_inside(p),
-                TRIPWIRE => self.tripwire_entity_inside(p, false),
+                TRIPWIRE => self.tripwire_entity_inside(p, false, from, to, half, h),
                 _ => {}
             }
         }
         self.contact.cells = cells;
-    }
-
-    /// Même chose, différé jusqu'à `flush_contact_triggers` (liste de l'entité sortie).
-    pub(crate) fn defer_contact_triggers(&mut self, from: [f64; 3], to: [f64; 3], half: f64, h: f64) {
-        self.contact.pending.push((from, to, half, h));
-    }
-
-    pub(crate) fn flush_contact_triggers(&mut self) {
-        if self.contact.pending.is_empty() {
-            return;
-        }
-        let pending = std::mem::take(&mut self.contact.pending);
-        for &(from, to, half, h) in &pending {
-            self.contact_triggers(from, to, half, h);
-        }
-        let mut pending = pending;
-        pending.clear();
-        self.contact.pending = pending;
     }
 
     /// Blocs traversés par une créature pendant son tick (après le déplacement).
@@ -224,7 +247,7 @@ impl Server {
             let s = self.get(p);
             match self.contact_kind(s) {
                 PLATE => self.plate_entity_inside(p),
-                TRIPWIRE => self.tripwire_entity_inside(p, ignores),
+                TRIPWIRE => self.tripwire_entity_inside(p, ignores, from, to, half, h),
                 BERRY if !matches!(m.kind, Kind::Fox | Kind::Bee) => {
                     m.fall_distance = 0.0;
                     m.stuck = [f64::from(0.8f32), 0.75, f64::from(0.8f32)];

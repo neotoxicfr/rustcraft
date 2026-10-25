@@ -259,6 +259,89 @@ fn plaques_et_fil_pour_toutes_les_entites() {
     assert!(w.block([10, Y, 2]).contains("powered=true"), "zombie : {}", w.block([10, Y, 2]));
 }
 
+/// Projectile ajouté au monde, lancé à `vel`.
+fn shoot(w: &mut W, kind: crate::projectiles::PKind, pos: [f64; 3], vel: [f64; 3]) -> i32 {
+    let id = w.p.s.proj_new_id();
+    let item = Stack { id: kind.default_item().into(), count: 1, components: None };
+    let mut p = crate::projectiles::Proj::new(kind, id, pos, item);
+    p.vel = vel;
+    p.has_been_shot = true;
+    w.p.s.proj_add(p);
+    id
+}
+
+/// Fil : seule la boîte qui recoupe sa forme le tend (1 à 2,5 px accroché, 0 à 8 px sinon).
+/// Joueur et créature qui passent au-dessus d'un fil accroché, flèche à 0,6 au-dessus d'un fil
+/// libre : rien ; joueur au sol et boule de neige à 0,3 : tendu.
+#[test]
+fn fil_tendu_seulement_par_sa_forme() {
+    use crate::projectiles::PKind;
+    let mut w = world("fil-forme");
+    w.p.run(&format!(
+        "setblock 10 {Y} 10 minecraft:tripwire[attached=true]\nsetblock 14 {Y} 10 minecraft:tripwire[attached=true]\nsetblock 10 {Y} 14 minecraft:tripwire[attached=true]\nsetblock 6 {Y} 14 minecraft:tripwire\nsetblock 2 {Y} 14 minecraft:tripwire\n"
+    ));
+    let y = f64::from(Y);
+    // Joueur qui saute par-dessus (pieds à 0,3, au-dessus des 2,5 px).
+    w.p.s.pos = [10.5, y + 0.3, 10.5];
+    w.p.s.player_touch_blocks([9.9, y + 0.3, 10.5]);
+    assert!(w.block([10, Y, 10]).contains("powered=false"), "joueur au-dessus : {}", w.block([10, Y, 10]));
+    // Joueur qui marche dessus : tendu.
+    w.p.s.pos = [14.5, y, 10.5];
+    w.p.s.player_touch_blocks([13.9, y, 10.5]);
+    assert!(w.block([14, Y, 10]).contains("powered=true"), "joueur au sol : {}", w.block([14, Y, 10]));
+    w.p.s.pos = [40.5, y, 40.5];
+    // Créature qui passe au-dessus du fil accroché.
+    let mut z = w.mob(Kind::Zombie, [10.5, y + 0.3, 14.5], true);
+    z.on_ground = false;
+    z.vel = [0.2, 0.0, 0.0];
+    w.p.s.tick_mob(&mut z);
+    assert!(z.pos[1] > y + 2.5 / 16.0, "zombie resté au-dessus : {}", z.pos[1]);
+    assert!(w.block([10, Y, 14]).contains("powered=false"), "créature au-dessus : {}", w.block([10, Y, 14]));
+    // Flèche à hauteur de poitrine (boîte de 0,6 à 1,1) à travers un fil libre (0 à 0,5).
+    shoot(&mut w, PKind::Arrow, [5.6, y + 0.6, 14.5], [0.8, 0.0, 0.0]);
+    w.p.s.projectiles_tick();
+    assert!(w.block([6, Y, 14]).contains("powered=false"), "flèche haute : {}", w.block([6, Y, 14]));
+    // Boule de neige basse (objet lancé) à travers un fil libre : tendu.
+    shoot(&mut w, PKind::Snowball, [1.6, y + 0.3, 14.5], [0.8, 0.0, 0.0]);
+    w.p.s.projectiles_tick();
+    assert!(w.block([2, Y, 14]).contains("powered=true"), "boule de neige basse : {}", w.block([2, Y, 14]));
+}
+
+/// Boule de neige sur une plaque en bois : elle l'enfonce au tick de son impact, avant d'être
+/// retirée (effets des blocs avant l'impact, comme le jeu).
+#[test]
+fn boule_de_neige_enfonce_la_plaque() {
+    use crate::projectiles::PKind;
+    let mut w = world("neige-plaque");
+    w.p.run(&format!("setblock 2 {Y} 10 minecraft:oak_pressure_plate\n"));
+    let id = shoot(&mut w, PKind::Snowball, [2.5, f64::from(Y) + 0.5, 10.5], [0.0, -0.8, 0.0]);
+    w.p.s.projectiles_tick();
+    assert!(!w.p.s.proj.list.iter().any(|p| p.id == id && !p.removed), "boule de neige retirée à l'impact");
+    assert_eq!(w.block([2, Y, 10]), "minecraft:oak_pressure_plate[powered=true]");
+}
+
+/// Plaque pondérée légère : chaque objet la teste juste après son propre déplacement. Le
+/// premier (déjà posé) voit le second encore en l'air : signal 1, que le second, arrivé au même
+/// tick, ne recalcule pas.
+#[test]
+fn plaque_ponderee_comptee_objet_par_objet() {
+    let mut w = world("ponderee");
+    w.p.run(&format!("setblock 6 {Y} 10 minecraft:light_weighted_pressure_plate\n"));
+    let y = f64::from(Y);
+    for (id, h, vy) in [("minecraft:stick", 0.0, 0.0), ("minecraft:dirt", 0.6, -0.7)] {
+        let s = Stack { id: id.into(), count: 1, components: None };
+        w.p.s.spawn_item([6.5, y + h, 10.5], [0.0; 3], s, 40);
+        let d = w.p.s.life.drops.last_mut().expect("objet");
+        d.pos = [6.5, y + h, 10.5];
+        d.vel = [0.0, vy, 0.0];
+        d.on_ground = h == 0.0;
+    }
+    w.p.s.drops_tick();
+    let n = w.p.s.life.drops.iter().filter(|d| d.pos[1] < y + 0.25).count();
+    assert_eq!(n, 2, "les deux objets sur la plaque");
+    assert_eq!(w.block([6, Y, 10]), "minecraft:light_weighted_pressure_plate[power=1]");
+}
+
 /// Semelles givrantes : disque de glace givrée (rayon 3 au niveau 1) sur l'eau de source sous
 /// le joueur au sol ; immunité aux dégâts `hot_floor`.
 #[test]

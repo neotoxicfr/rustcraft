@@ -462,13 +462,17 @@ impl Server {
         s
     }
 
-    fn tripwire_box_has_entity(&self, s: u32, p: P) -> bool {
+    /// Forme du fil : 1 à 2,5 px de haut s'il est accroché, 0 à 8 px sinon.
+    fn tripwire_shape(&self, s: u32, p: P) -> rc_physics::Aabb {
         let (lo, hi) = if self.v().get_bool(s, "attached") { (1.0, 2.5) } else { (0.0, 8.0) };
-        let b = rc_physics::Aabb {
+        rc_physics::Aabb {
             min: [f64::from(p[0]), f64::from(p[1]) + lo / 16.0, f64::from(p[2])],
             max: [f64::from(p[0]) + 1.0, f64::from(p[1]) + hi / 16.0, f64::from(p[2]) + 1.0],
-        };
-        self.count_entities_in(&b, false) > 0
+        }
+    }
+
+    fn tripwire_box_has_entity(&self, s: u32, p: P) -> bool {
+        self.count_entities_in(&self.tripwire_shape(s, p), false) > 0
     }
 
     fn tripwire_check_pressed(&mut self, p: P, pressed: bool) {
@@ -494,15 +498,25 @@ impl Server {
         }
     }
 
-    /// Entity in the tripwire cell: a relaxed tripwire with no tick scheduled gets tightened as
-    /// soon as the entity does not ignore trigger blocks (`ignores`: bat, spectator); the next
-    /// tick (10) rechecks the exact shape of the wire.
-    pub(crate) fn tripwire_entity_inside(&mut self, p: P, ignores: bool) {
+    /// Entity whose box (half-width `half`, height `h`, feet from `from` to `to`) intersects
+    /// the shape of the wire at `p` during its movement: a relaxed tripwire with no tick
+    /// scheduled gets tightened as soon as the entity does not ignore trigger blocks
+    /// (`ignores`: bat, spectator); the next tick (10) rechecks with all the entities.
+    pub(crate) fn tripwire_entity_inside(
+        &mut self,
+        p: P,
+        ignores: bool,
+        from: [f64; 3],
+        to: [f64; 3],
+        half: f64,
+        h: f64,
+    ) {
         let s = self.get(p);
         if !ignores
             && self.v().kind(s) == Kind::Tripwire
             && !self.v().get_bool(s, "powered")
             && !self.has_scheduled_tick(p, self.v().block(s))
+            && crate::contact::swept_touches(&self.tripwire_shape(s, p), from, to, half, h)
         {
             self.tripwire_check_pressed(p, true);
         }
