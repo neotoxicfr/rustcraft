@@ -2445,3 +2445,24 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   construction of a flat world 2.86 ms without, 2.88 ms with (best of 5, one pass each): under
   the noise, kept (without them, saplings and bone meal failed outside the biomes that cite
   them).
+- Placing a feature in the live world (sapling tree, bone meal, `place feature`), 9 chunks of
+  packed sections (bench `bench_g6f07_deco_copy_and_compare`, `--ignored`, best of 30 alternated
+  rounds, a client building alongside): copy of the world into the region 1.34 ms cell by cell,
+  0.11 ms by unpacking one pass per section (`unpack_into`); region / world comparison 3.90 ms
+  by reading every cell of the world, 0.12 ms section against section (an identical section
+  skipped by one slice comparison). A complete oak placement 3.30 ms after (about 8.3 ms before,
+  by difference). Kept: same result (copied states identical, same cells written apart from the
+  planted fungus; tests `w8b` and G6-F07). The comparison made before the replay of the breaks
+  is also the fidelity fix (cells not touched by the feature are left to the world). The rest
+  of the placement is not broken down (heightmaps of the 9 copies, biome conversion, the
+  feature itself): a lead to measure on a quiet machine. Multi-core and GPU not applicable
+  (under a tenth of a millisecond per chunk, order fixed by the world's random draws). No
+  switch: the old read is not a lead worth keeping (slower on both measurements, same output).
+  Two other ways to know which cells the feature changed, not built: a snapshot of the original
+  copy (3.5 MB more per placement, one more copy) and a mask held by each write of the region
+  (one more write on the hot path of the decoration of every generated chunk); at best they
+  would save the 0.12 ms of the comparison, against a memory cost or a cost on generation: to
+  measure on a quiet machine if feature placement becomes a hot spot.
+- Client prediction (`apps/client/src/bone_meal_use.rs`): a few block reads per click (lichen:
+  6 × 6 × 3 attempts at most; bamboo: 32 cells at most); face masks computed on demand from the
+  single shape read (`rc_sim::shape_face_full`), no table; not measured separately (one click).

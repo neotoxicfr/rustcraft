@@ -136,9 +136,225 @@ fn planted_fungus_breaks_whole_vine_column() {
     let stems: Vec<i32> =
         (Y + 3..Y + 40).filter(|&y| block(&w, [8, y, 8]) == "minecraft:crimson_stem").collect();
     assert!(stems.len() >= 2, "the stem crosses at least two vine cells: {stems:?}");
+    let top = *stems.last().expect("stem");
     for y in stems {
         assert!(broken.contains(&[8, y, 8]), "vine at y = {y} broken (broken: {broken:?})");
     }
+    // The last break turned the body above into a tip; the cap does not replace a vine: the
+    // tip stays.
+    assert_eq!(block(&w, [8, top + 1, 8]), "minecraft:weeping_vines", "tip above the stem");
+}
+
+/// Planted fungus surrounded by tall grass: when the cap starts low enough, the broken half
+/// takes the other with it (shape update) and the cap places nothing in the inner cells of its
+/// bottom rows. No half is left alone.
+#[test]
+fn planted_fungus_leaves_no_half_tall_grass() {
+    let mut w = world("fungusgrass");
+    let at = [8, Y, 8];
+    let ring: Vec<P> =
+        (-1..=1).flat_map(|dx| (-1..=1).map(move |dz| [8 + dx, Y, 8 + dz])).filter(|&q| q != at).collect();
+    let mut cleared = 0;
+    for seed in 0..16 {
+        // Reset (a fill that changes nothing is refused: no assertion here).
+        w.p.run(&format!("fill 3 {Y} 3 13 {} 13 minecraft:air\n", Y + 30));
+        w.set(below(at), "minecraft:crimson_nylium");
+        w.set(at, "minecraft:crimson_fungus");
+        for &q in &ring {
+            w.set(q, "minecraft:tall_grass[half=lower]");
+            w.set(above(q), "minecraft:tall_grass[half=upper]");
+        }
+        w.p.s.bs.rng = JavaRandom::new(seed);
+        for _ in 0..60 {
+            if block(&w, at) != "minecraft:crimson_fungus" {
+                break;
+            }
+            assert!(bm(&mut w, at), "fungus on its nylium");
+        }
+        assert_eq!(block(&w, at), "minecraft:crimson_stem", "seed {seed}: planted huge fungus");
+        for &q in &ring {
+            match (block(&w, q).as_str(), block(&w, above(q)).as_str()) {
+                ("minecraft:tall_grass", "minecraft:tall_grass") => {
+                    assert_eq!(prop(&w, q, "half"), "lower");
+                    assert_eq!(prop(&w, above(q), "half"), "upper");
+                }
+                ("minecraft:air", "minecraft:air") => cleared += 1,
+                _ => panic!("seed {seed}, cell {q:?}: {} under {}", w.name(q), w.name(above(q))),
+            }
+        }
+    }
+    assert!(cleared > 0, "no cap low enough to touch the grass");
+}
+
+fn break_events(evs: Vec<rc_client::Event>) -> Vec<P> {
+    evs.into_iter()
+        .filter_map(|e| match e {
+            rc_client::Event::LevelEvent { kind: 2001, pos, .. } => Some(pos),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Fire and soul fire broken: no break effect (event 2001), unlike stone.
+#[test]
+fn fire_breaks_silently() {
+    let mut w = world("firebreak");
+    w.set([4, Y - 1, 4], "minecraft:netherrack");
+    w.set([4, Y, 4], "minecraft:fire");
+    w.set([6, Y - 1, 6], "minecraft:soul_soil");
+    w.set([6, Y, 6], "minecraft:soul_fire");
+    w.set([8, Y, 8], "minecraft:stone");
+    let _ = w.events();
+    for p in [[4, Y, 4], [6, Y, 6], [8, Y, 8]] {
+        assert!(w.p.s.destroy_block(p, true, 512), "{p:?} broken");
+    }
+    assert_eq!(break_events(w.events()), vec![[8, Y, 8]], "only the stone has a break effect");
+}
+
+/// Fungus planted next to a fire on netherrack: the cap, when it starts at ground level,
+/// breaks the fire with no break effect.
+#[test]
+fn planted_fungus_breaks_fire_silently() {
+    let mut w = world("fungusfire");
+    let (at, fire) = ([8, Y, 8], [9, Y, 8]);
+    let mut gone = 0;
+    for seed in 0..16 {
+        w.p.run(&format!("fill 3 {Y} 3 13 {} 13 minecraft:air\n", Y + 30));
+        w.set(below(at), "minecraft:crimson_nylium");
+        w.set(below(fire), "minecraft:netherrack");
+        w.set(fire, "minecraft:fire");
+        w.set(at, "minecraft:crimson_fungus");
+        let _ = w.events();
+        w.p.s.bs.rng = JavaRandom::new(seed);
+        let mut breaks = Vec::new();
+        for _ in 0..60 {
+            if block(&w, at) != "minecraft:crimson_fungus" {
+                break;
+            }
+            assert!(w.p.s.grow_with_bone_meal(at), "fungus on its nylium");
+            breaks.extend(break_events(w.events()));
+        }
+        assert_eq!(block(&w, at), "minecraft:crimson_stem", "seed {seed}: planted huge fungus");
+        assert!(!breaks.contains(&fire), "seed {seed}: break effect on the fire");
+        if block(&w, fire) != "minecraft:fire" {
+            gone += 1;
+        }
+    }
+    assert!(gone > 0, "no cap low enough to break the fire");
+}
+
+/// Lichen at the top of the world against a wall: the spread that wraps around the edge toward
+/// y = 320 (outside the world) fails to place; the game then tries the next direction, and a
+/// face is added elsewhere, whatever the drawn order.
+#[test]
+fn lichen_skips_a_spread_outside_the_world() {
+    let mut w = world("lichentop");
+    let h = w.p.s.dim.height;
+    let top = h.min_y + h.sections as i32 * 16 - 1;
+    let lichen = [4, top, 4];
+    let faces = |w: &W| {
+        let mut n = 0;
+        for x in 2..7 {
+            for y in top - 2..=top {
+                for z in 2..7 {
+                    if block(w, [x, y, z]) == "minecraft:glow_lichen" {
+                        n += Dir::ALL.iter().filter(|d| prop(w, [x, y, z], d.name()) == "true").count();
+                    }
+                }
+            }
+        }
+        n
+    };
+    for seed in 0..32 {
+        w.p.run(&format!("fill 2 {} 2 6 {top} 6 minecraft:air\n", top - 2));
+        w.set([4, top, 5], "minecraft:stone");
+        w.set([4, top - 1, 5], "minecraft:stone");
+        w.set(lichen, "minecraft:glow_lichen[south=true]");
+        let n0 = faces(&w);
+        w.p.s.bs.rng = JavaRandom::new(seed);
+        assert!(bm(&mut w, lichen), "seed {seed}: bone meal accepted");
+        assert_eq!(faces(&w), n0 + 1, "seed {seed}: one more lichen face");
+    }
+}
+
+/// Micro-bench (loaded machine, `--ignored`): placing a feature in the live world, 9 chunks.
+/// Copy of the world into the region and region / world comparison, cell-by-cell reads (the
+/// previous code) against unpacking one pass per section; then a complete oak placement.
+#[test]
+#[ignore = "micro-bench"]
+fn bench_g6f07_deco_copy_and_compare() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    let mut w = world("benchdeco");
+    // Sections packed as in a real world: layers of varied blocks.
+    let mix = ["stone", "andesite", "granite", "diorite", "dirt", "gravel", "deepslate", "tuff"];
+    for y in -64i32..40 {
+        let b = mix[y.rem_euclid(8) as usize];
+        w.p.run(&format!("fill -16 {y} -16 31 {y} 31 minecraft:{b}\n"));
+    }
+    let (wd, dg) = w.p.s.place_data().expect("generation data");
+    let s = &w.p.s;
+    let h = s.dim.height;
+    let cs: Vec<(i32, i32)> = (-1..=1).flat_map(|dz| (-1..=1).map(move |dx| (dx, dz))).collect();
+    let dcs: Vec<_> = cs.iter().map(|&(cx, cz)| s.deco_chunk(cx, cz, &dg, &wd)).collect();
+    // The four variants, each over the 9 chunks; time in ms.
+    let copy = |by_section: bool| {
+        let t = Instant::now();
+        for &(cx, cz) in &cs {
+            let c = s.chunks.get(&(cx, cz)).and_then(Option::as_ref).expect("loaded chunk");
+            let mut out = vec![0u32; h.sections * 4096];
+            for (si, sec) in c.sections.iter().enumerate() {
+                if by_section {
+                    sec.blocks.unpack_into(&mut out[si * 4096..(si + 1) * 4096]);
+                } else {
+                    for i in 0..4096 {
+                        out[si * 4096 + i] = sec.blocks.get(i);
+                    }
+                }
+            }
+            black_box(&out);
+        }
+        t.elapsed().as_secs_f64() * 1e3
+    };
+    let compare = |by_section: bool| {
+        let t = Instant::now();
+        for dc in &dcs {
+            if by_section {
+                black_box(s.deco_changes(dc));
+            } else {
+                let mut n = 0;
+                for si in 0..h.sections {
+                    for i in 0..4096 {
+                        let (x, z, y) = ((i & 15) as i32, ((i >> 4) & 15) as i32, (i >> 8) as i32);
+                        let p = [dc.cx * 16 + x, h.min_y + si as i32 * 16 + y, dc.cz * 16 + z];
+                        n += usize::from(s.get(p) != dc.blocks[si * 4096 + i]);
+                    }
+                }
+                black_box(n);
+            }
+        }
+        t.elapsed().as_secs_f64() * 1e3
+    };
+    // Alternated rounds, best time of each variant.
+    let mut best = [f64::MAX; 4];
+    for _ in 0..30 {
+        for (k, v) in [copy(false), copy(true), compare(false), compare(true)].into_iter().enumerate() {
+            best[k] = best[k].min(v);
+        }
+    }
+    let spots: Vec<P> = (0..30).map(|i| [-12 + 3 * (i % 8), 40, -12 + 3 * (i / 8)]).collect();
+    for &at in &spots {
+        w.set(below(at), "minecraft:dirt");
+    }
+    let t = Instant::now();
+    let grown = spots.iter().filter(|&&at| w.p.s.place_world_feature("minecraft:oak", at)).count();
+    let tree = t.elapsed().as_secs_f64() * 1e3 / spots.len() as f64;
+    assert!(grown > 0, "no oak placed");
+    eprintln!(
+        "9 chunks, best of 30: copy per cell {:.2} ms, per section {:.2} ms; comparison per cell \
+         {:.2} ms, per section {:.2} ms; complete oak placement {tree:.2} ms ({grown} placed)",
+        best[0], best[1], best[2], best[3]
+    );
 }
 
 /// Features placed by name (saplings, bone meal): all present in a plains flat world, whose

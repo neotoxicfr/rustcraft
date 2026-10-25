@@ -58,9 +58,7 @@ impl Server {
         let conv = crate::generation_nbt::Conv::new(&self.data, &self.states, &wd.blocks, h, &dg.biome_names);
         if let Some(Some(c)) = self.chunks.get(&(cx, cz)) {
             for (si, sec) in c.sections.iter().enumerate() {
-                for i in 0..4096 {
-                    dc.blocks[si * 4096 + i] = sec.blocks.get(i);
-                }
+                sec.blocks.unpack_into(&mut dc.blocks[si * 4096..(si + 1) * 4096]);
                 for i in 0..64 {
                     let reg = sec.biomes.get(i);
                     dc.biomes[si * 64 + i] = conv.reg_to_biome.get(&reg).copied().unwrap_or(0);
@@ -80,42 +78,69 @@ impl Server {
         dc
     }
 
-    /// Writes the changed blocks of a decoration chunk into the world ("clients" flag).
-    pub(crate) fn apply_deco(&mut self, dc: &DecoChunk, b: &Blocks) -> usize {
-        let h = self.dim.height;
-        let mut n = 0;
-        let Some(Some(_)) = self.chunks.get(&(dc.cx, dc.cz)) else { return 0 };
+    /// Cells that a feature changed in a chunk of its region, with their new state: the region
+    /// starts from a copy of the world (`deco_chunk`), which has not moved since. Each section of
+    /// the world is unpacked in one pass; an identical section is skipped by one comparison.
+    pub(crate) fn deco_changes(&self, dc: &DecoChunk) -> Vec<([i32; 3], u32)> {
+        let mut out = Vec::new();
+        let Some(Some(c)) = self.chunks.get(&(dc.cx, dc.cz)) else { return out };
+        let min_y = self.dim.height.min_y;
+        let mut live = [0u32; 4096];
+        for (si, (sec, new)) in c.sections.iter().zip(dc.blocks.as_chunks::<4096>().0).enumerate() {
+            sec.blocks.unpack_into(&mut live);
+            if live == *new {
+                continue;
+            }
+            for (i, (&old, &s)) in live.iter().zip(new).enumerate() {
+                if old != s {
+                    let (x, z, y) = ((i & 15) as i32, ((i >> 4) & 15) as i32, (i >> 8) as i32);
+                    out.push(([dc.cx * 16 + x, min_y + si as i32 * 16 + y, dc.cz * 16 + z], s));
+                }
+            }
+        }
+        out
+    }
+
+    /// Writes into the world what a feature changed in the chunks of its region ("clients" flag)
+    /// and schedules its ticks.
+    pub(crate) fn apply_deco(&mut self, chunks: &[DecoChunk], b: &Blocks) -> usize {
+        let changes: Vec<_> = chunks.iter().map(|dc| self.deco_changes(dc)).collect();
         // Cells broken with drops by the feature (planted nether fungus): particles, sound and
         // drops of whatever the cell holds at the moment of the break, like the game: a broken
         // weeping vine turns the body above it into a tip, which is broken in turn. A cell
         // already emptied by a previous break (upper half of a double plant) is air, and the
         // break does nothing there.
-        for &(p, _) in &dc.destroyed {
-            self.destroy_block(p, true, 512);
+        for dc in chunks {
+            for &(p, _) in &dc.destroyed {
+                self.destroy_block(p, true, 512);
+            }
         }
-        for si in 0..h.sections {
-            for i in 0..4096 {
-                let new = dc.blocks[si * 4096 + i];
-                let (x, z, y) = ((i & 15) as i32, ((i >> 4) & 15) as i32, (i >> 8) as i32);
-                let p = [dc.cx * 16 + x, h.min_y + si as i32 * 16 + y, dc.cz * 16 + z];
-                if self.get(p) != new {
-                    self.set_block(p, new, flag::CLIENTS);
-                    n += 1;
+        // Only the cells the feature changed are written: elsewhere, the world keeps what the
+        // breaks left there (vine tip above the stem, half of a tall grass removed with the
+        // other, grass that loses its snow), like the game, which breaks then places cell by
+        // cell in the world itself.
+        let mut n = 0;
+        for &(p, new) in changes.iter().flatten() {
+            if self.get(p) != new {
+                self.set_block(p, new, flag::CLIENTS);
+                n += 1;
+            }
+        }
+        for dc in chunks {
+            let Some(Some(_)) = self.chunks.get(&(dc.cx, dc.cz)) else { continue };
+            // Ticks scheduled by the feature (sources, geode cracks, flowers…), with the requested
+            // delay: in the live world, it is not brought back to 0.
+            for &(p, k) in &dc.fluid_ticks {
+                let name = FLUID_TICK_NAMES[usize::from(k)];
+                if let Some(f) = crate::blocks::ticks::FLUID_NAMES.iter().position(|n| *n == name) {
+                    self.schedule_fluid_tick(p, f as u8, 0);
                 }
             }
-        }
-        // Ticks scheduled by the feature (sources, geode cracks, flowers…), with the requested
-        // delay: in the live world, it is not brought back to 0.
-        for &(p, k) in &dc.fluid_ticks {
-            let name = FLUID_TICK_NAMES[usize::from(k)];
-            if let Some(f) = crate::blocks::ticks::FLUID_NAMES.iter().position(|n| *n == name) {
-                self.schedule_fluid_tick(p, f as u8, 0);
-            }
-        }
-        for &(p, k, delay) in &dc.block_ticks {
-            let id = self.bs.t.block_id(b.block_name(k));
-            if id != u16::MAX {
-                self.schedule_tick(p, id, delay);
+            for &(p, k, delay) in &dc.block_ticks {
+                let id = self.bs.t.block_id(b.block_name(k));
+                if id != u16::MAX {
+                    self.schedule_tick(p, id, delay);
+                }
             }
         }
         n
@@ -153,9 +178,7 @@ impl Server {
         if !placed {
             return Err(Fail(tr!("commands.place.feature.failed")));
         }
-        for dc in &chunks {
-            self.apply_deco(dc, &wd.blocks);
-        }
+        self.apply_deco(&chunks, &wd.blocks);
         self.ok(s, tr!("commands.place.feature.success", id, pos[0], pos[1], pos[2]));
         Ok(1)
     }

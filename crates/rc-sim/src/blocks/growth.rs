@@ -640,9 +640,7 @@ impl Server {
             }
         };
         if ok {
-            for dc in &chunks {
-                self.apply_deco(dc, &wd.blocks);
-            }
+            self.apply_deco(&chunks, &wd.blocks);
         }
         ok
     }

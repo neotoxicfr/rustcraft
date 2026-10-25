@@ -445,9 +445,13 @@ impl Server {
         if self.v().is_air(state) {
             return false;
         }
-        // Break particles; the straw bed has its own, without sound (2014).
-        let straw = self.data.block_of(state).is_some_and(|b| b.name == "minecraft:straw_bed");
-        self.level_event(if straw { 2014 } else { 2001 }, p, state as i32);
+        // Break particles; the straw bed has its own, without sound (2014); fire (and soul fire)
+        // breaks with no effect at all.
+        let fire = [self.bs.t.id.fire, self.bs.t.id.soul_fire].contains(&self.v().block(state));
+        if !fire {
+            let straw = self.data.block_of(state).is_some_and(|b| b.name == "minecraft:straw_bed");
+            self.level_event(if straw { 2014 } else { 2001 }, p, state as i32);
+        }
         // Loot before removal (empty tool), then after-break effects.
         if drop {
             self.drop_resources(p, state, None);

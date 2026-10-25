@@ -353,8 +353,10 @@ impl Server {
                 } else {
                     v.default_state(me)
                 };
-                self.set_block(q, v.set_bool(base, face.name(), true), flag::CLIENTS);
-                return true;
+                // Placement refused (cell wrapped outside the world): next direction, like the game.
+                if self.set_block(q, v.set_bool(base, face.name(), true), flag::CLIENTS) {
+                    return true;
+                }
             }
         }
         true
