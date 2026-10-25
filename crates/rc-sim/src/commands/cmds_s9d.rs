@@ -86,11 +86,12 @@ impl Server {
         let mut n = 0;
         let Some(Some(_)) = self.chunks.get(&(dc.cx, dc.cz)) else { return 0 };
         // Cells broken with drops by the feature (planted nether fungus): particles, sound and
-        // drops of the previous block, as long as the world still holds that state.
-        for &(p, old) in &dc.destroyed {
-            if self.get(p) == old {
-                self.destroy_block(p, true, 512);
-            }
+        // drops of whatever the cell holds at the moment of the break, like the game: a broken
+        // weeping vine turns the body above it into a tip, which is broken in turn. A cell
+        // already emptied by a previous break (upper half of a double plant) is air, and the
+        // break does nothing there.
+        for &(p, _) in &dc.destroyed {
+            self.destroy_block(p, true, 512);
         }
         for si in 0..h.sections {
             for i in 0..4096 {

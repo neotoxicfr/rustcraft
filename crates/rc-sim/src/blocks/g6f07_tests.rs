@@ -108,6 +108,39 @@ fn nether_plants() {
     assert!(!bm(&mut w, [5, Y, 2]));
 }
 
+/// Fungus planted under a hanging weeping vine: every vine cell crossed by the stem is broken
+/// in turn (event 2001), even if the break below turned it into a tip.
+#[test]
+fn planted_fungus_breaks_whole_vine_column() {
+    let mut w = world("fungusvines");
+    let at = [8, Y, 8];
+    w.cmd(&format!("fill 0 {} 0 15 {} 15 minecraft:stone", Y + 40, Y + 40));
+    w.cmd(&format!("fill 8 {} 8 8 {} 8 minecraft:weeping_vines_plant", Y + 4, Y + 39));
+    w.set([8, Y + 3, 8], "minecraft:weeping_vines[age=0]");
+    w.set(below(at), "minecraft:crimson_nylium");
+    w.set(at, "minecraft:crimson_fungus");
+    let _ = w.events();
+    let mut broken = Vec::new();
+    for _ in 0..60 {
+        if block(&w, at) != "minecraft:crimson_fungus" {
+            break;
+        }
+        assert!(w.p.s.grow_with_bone_meal(at), "fungus on its nylium");
+        for e in w.events() {
+            if let rc_client::Event::LevelEvent { kind: 2001, pos, .. } = e {
+                broken.push(pos);
+            }
+        }
+    }
+    assert_eq!(block(&w, at), "minecraft:crimson_stem", "planted huge fungus");
+    let stems: Vec<i32> =
+        (Y + 3..Y + 40).filter(|&y| block(&w, [8, y, 8]) == "minecraft:crimson_stem").collect();
+    assert!(stems.len() >= 2, "the stem crosses at least two vine cells: {stems:?}");
+    for y in stems {
+        assert!(broken.contains(&[8, y, 8]), "vine at y = {y} broken (broken: {broken:?})");
+    }
+}
+
 /// Features placed by name (saplings, bone meal): all present in a plains flat world, whose
 /// biomes cite neither the nether features nor most of the trees.
 #[test]
@@ -272,6 +305,40 @@ fn corals_in_warm_ocean() {
     let fan = rel(wall, Dir::East);
     assert!(block(&w, fan).ends_with("_coral_wall_fan"), "wall fan: {}", w.name(fan));
     assert_eq!(prop(&w, fan, "facing"), "east");
+}
+
+/// Warm ocean / plains border: the coral biome is read through the fuzzy zoom, not in the
+/// block's raw quart. On cells where the two readings differ, the wall fan of the first attempt
+/// follows the zoom.
+#[test]
+fn corals_follow_zoomed_biome() {
+    let mut w = world("coralzoom");
+    w.cmd(&format!("fillbiome 0 {} 0 7 {} 15 minecraft:warm_ocean", Y - 4, Y + 8));
+    w.cmd(&format!("fill 0 {} 0 15 {} 15 minecraft:stone", Y - 1, Y - 1));
+    w.cmd(&format!("fill 0 {Y} 0 15 {} 15 minecraft:water", Y + 3));
+    let seed = w.p.s.wgs.zoom_seed;
+    // Warm quart: quart x 0 or 1 (blocks 0 to 7 of chunk 0).
+    let warm = |qx: i32| (0..2).contains(&qx);
+    let mut probes: Vec<(P, bool)> = Vec::new();
+    for z in 0..16 {
+        for x in 5..11 {
+            let p = [x, Y, z];
+            let (qx, _, _) = rc_worldgen::biome::zoom(seed, p[0], p[1], p[2]);
+            let zoomed = warm(qx);
+            if zoomed != warm(x >> 2) && !probes.iter().any(|(q, z2)| *z2 == zoomed || (q[2] - z).abs() < 9) {
+                probes.push((p, zoomed));
+            }
+        }
+    }
+    assert!(!probes.is_empty(), "no cell where the zoom and the raw quart differ");
+    for (p, zoomed) in probes {
+        let wall = rel(p, Dir::West);
+        w.set(wall, "minecraft:stone");
+        w.hold(stack("minecraft:bone_meal", 1));
+        w.click(wall, Dir::East, [1.0, 0.5, 0.5]);
+        let fan = block(&w, p).ends_with("_coral_wall_fan");
+        assert_eq!(fan, zoomed, "cell {p:?}: fan {fan}, zoomed biome has corals {zoomed} ({})", w.name(p));
+    }
 }
 
 /// Seagrass → tall; pickles on coral → 4; bone meal on the face of a solid block in water

@@ -493,7 +493,7 @@ impl Server {
                     continue 'attempt;
                 }
             }
-            if self.biome_tag(t, "minecraft:produces_corals_from_bonemeal") {
+            if self.biome_tag_zoomed(t, "minecraft:produces_corals_from_bonemeal") {
                 if let Some(face) = face.filter(|d| j == 0 && d.axis() != 1) {
                     grow = self.bm_random_in_tag("minecraft:wall_corals").unwrap_or(grow);
                     if v.has(grow, "facing") {
