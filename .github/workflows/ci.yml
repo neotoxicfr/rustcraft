@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Quicker release builds for the checks; published builds keep the full profile.
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+  CARGO_PROFILE_RELEASE_DEBUG: "false"
+
+jobs:
+  rust:
+    name: Clippy and tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+      - name: Toolchain from rust-toolchain.toml
+        run: rustup toolchain install && rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy, warnings as errors
+        run: cargo clippy --release --workspace --all-targets -- -D warnings
+      # Most tests compare with the official game's data: the game is downloaded from Mojang's
+      # servers like the launcher does (nothing is stored in the repository), then prepared.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "25"
+      - name: Official game 26.3
+        shell: bash
+        run: |
+          python -I tools/ci/fetch_game.py "$RUNNER_TEMP/minecraft" 26.3
+          echo "RUSTCRAFT_MC_DIR=$RUNNER_TEMP/minecraft" >> "$GITHUB_ENV"
+          echo "RUSTCRAFT_CACHE=$RUNNER_TEMP/rustcraft-cache" >> "$GITHUB_ENV"
+      - name: Game data
+        run: cargo run --release -p rc-data --example prepare -- 26.3
+      - name: Tests
+        run: cargo test --release --workspace --no-fail-fast
+
+  tools:
+    name: Python tools
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: python -I tools/bench/test_scenes.py

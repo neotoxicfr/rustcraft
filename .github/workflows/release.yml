@@ -1,0 +1,67 @@
+name: Release
+
+# Pushing a tag vX.Y.Z builds Windows and Linux, and publishes the release with an empty body;
+# the hand-written notes are added afterwards (`gh release edit vX.Y.Z --notes-file …`).
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Release with an empty body
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "Rustcraft $GITHUB_REF_NAME" --notes "" --verify-tag
+
+  build:
+    needs: create
+    name: Build (${{ matrix.os }})
+    strategy:
+      matrix:
+        # Linux on 22.04: the binary then needs glibc 2.35 or newer.
+        os: [windows-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+      - name: Toolchain from rust-toolchain.toml
+        run: rustup toolchain install && rustup show active-toolchain
+      - name: Build (full release profile)
+        run: cargo build --release -p rc-app
+      - name: Package for Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $v = $env:GITHUB_REF_NAME.TrimStart("v")
+          $dir = "pkg\files"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item target\release\rustcraft.exe, packaging\windows\INSTALL.txt, LICENSE-MIT, LICENSE-APACHE $dir
+          $zip = "pkg\rustcraft-$v-windows-x64.zip"
+          Compress-Archive -Path "$dir\*" -DestinationPath $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $(Split-Path $zip -Leaf)" | Set-Content -Path "$zip.sha256" -Encoding ascii
+      - name: Package for Linux
+        if: runner.os == 'Linux'
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          mkdir -p pkg/files
+          cp target/release/rustcraft packaging/linux/rustcraft.sh packaging/linux/INSTALL.txt LICENSE-MIT LICENSE-APACHE pkg/files/
+          strip pkg/files/rustcraft
+          chmod 755 pkg/files/rustcraft pkg/files/rustcraft.sh
+          tar --owner=0 --group=0 -czf "pkg/rustcraft-$v-linux-x64.tar.gz" -C pkg/files .
+          (cd pkg && sha256sum "rustcraft-$v-linux-x64.tar.gz" > "rustcraft-$v-linux-x64.tar.gz.sha256")
+      - name: Upload to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" pkg/rustcraft-* --repo "$GITHUB_REPOSITORY"
