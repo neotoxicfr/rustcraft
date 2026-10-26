@@ -1,0 +1,58 @@
+[package]
+name = "rc-app"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Rustcraft application: window, rendering, main loop"
+
+[[bin]]
+name = "rustcraft"
+path = "src/main.rs"
+
+[features]
+# Counter of live bytes on the heap (memory measurements only).
+memstats = []
+
+[dependencies]
+hashbrown = { workspace = true }
+rc-client.workspace = true
+rc-sim = { path = "../../crates/rc-sim" }
+rc-light = { path = "../../crates/rc-light" }
+rc-mesh.workspace = true
+rc-assets.workspace = true
+rc-physics.workspace = true
+rc-data.workspace = true
+rc-world.workspace = true
+rc-env.workspace = true
+rc-text.workspace = true
+rc-proto.workspace = true
+rc-proto-v777.workspace = true
+serde_json.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+glam.workspace = true
+bytemuck.workspace = true
+pollster.workspace = true
+rayon.workspace = true
+crossbeam-channel.workspace = true
+mimalloc.workspace = true
+ureq.workspace = true
+rc-audio.workspace = true
+rc-commands.workspace = true
+ring.workspace = true
+base64.workspace = true
+png.workspace = true
+# Archive of the F3+L report (`profiling_zip.rs`), already pulled in by rc-assets.
+zip.workspace = true
+# Messages from wgpu and the validation layers (`RUSTCRAFT_GPULOG`), already pulled in by wgpu.
+log = "0.4"
+
+[dev-dependencies]
+# Validation of the improved-transparency shaders in tests (`oit.rs`), already pulled in by wgpu.
+naga = { version = "30.0.1", features = ["wgsl-in"] }
+rc-testdata.workspace = true
+
+[lints]
+workspace = true

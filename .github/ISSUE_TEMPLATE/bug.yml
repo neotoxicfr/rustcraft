@@ -1,0 +1,45 @@
+name: Bug or difference with the official game
+description: Rustcraft crashes, misbehaves, or does something differently from the official client.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: What Rustcraft does. Attach a screenshot if it is visible.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What the official game does
+      description: The expected behaviour, observed with the official client in the same situation.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Server (vanilla, Paper…) and its version, steps, commands used.
+      placeholder: |
+        1. Paper 26.3 server, fresh world
+        2. /give @s minecraft:shield
+        3. …
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Rustcraft version
+      description: Release used, or commit (`git rev-parse --short HEAD`) if you built it yourself.
+  - type: input
+    id: machine
+    attributes:
+      label: Machine
+      description: System (Windows or Linux and its distribution), processor, graphics card and driver version.
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: Error output of the client. Check that it contains no personal data.
+      render: text

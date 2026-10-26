@@ -1,0 +1,19 @@
+[package]
+name = "rc-text"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Text: components, styles, translations, § codes, measuring and splitting (docs/specs/text.md)"
+
+[dependencies]
+hashbrown = { workspace = true }
+rc-data.workspace = true
+rc-proto.workspace = true
+serde_json.workspace = true
+unicode-bidi.workspace = true
+unicode-bidi-mirroring.workspace = true
+
+[lints]
+workspace = true

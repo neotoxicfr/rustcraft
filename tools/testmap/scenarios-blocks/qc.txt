@@ -1,0 +1,26 @@
+# Quasi-connectivity: piston, dispenser, dropper powered through the block above (diagonal / two above), armed until the next update (BUD).
+region 4002 -59 4002 4012 -56 4004
+fill 4000 -60 4000 4015 -60 4015 minecraft:stone
+fill 4000 -59 4000 4015 -50 4015 minecraft:air
+kill @e[type=item,x=3995,y=-64,z=3995,dx=40,dy=40,dz=40]
+wait 200
+setblock 4003 -59 4003 minecraft:piston[facing=south]
+setblock 4006 -59 4003 minecraft:dropper[facing=south]
+setblock 4009 -59 4003 minecraft:dispenser[facing=south]
+wait 5
+setblock 4004 -58 4003 minecraft:redstone_block
+setblock 4006 -57 4003 minecraft:redstone_block
+setblock 4009 -57 4003 minecraft:redstone_block
+tick 10
+setblock 4002 -59 4003 minecraft:stone
+setblock 4007 -59 4003 minecraft:stone
+setblock 4010 -59 4003 minecraft:stone
+tick 12
+setblock 4004 -58 4003 minecraft:air
+setblock 4006 -57 4003 minecraft:air
+setblock 4009 -57 4003 minecraft:air
+tick 10
+setblock 4002 -59 4003 minecraft:air
+setblock 4007 -59 4003 minecraft:air
+setblock 4010 -59 4003 minecraft:air
+tick 10

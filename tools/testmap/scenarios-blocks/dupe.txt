@@ -1,0 +1,23 @@
+# Carpet and rail on airborne slime blocks pushed then pulled by pistons (historical duplications), block side.
+region 4002 -58 4002 4010 -55 4008
+fill 4000 -60 4000 4015 -60 4015 minecraft:stone
+fill 4000 -59 4000 4015 -50 4015 minecraft:air
+kill @e[type=item,x=3995,y=-64,z=3995,dx=40,dy=40,dz=40]
+wait 200
+setblock 4003 -57 4004 minecraft:sticky_piston[facing=east]
+setblock 4004 -57 4004 minecraft:slime_block
+setblock 4004 -56 4004 minecraft:white_carpet
+setblock 4004 -57 4005 minecraft:slime_block
+setblock 4004 -56 4005 minecraft:rail
+setblock 4005 -56 4004 minecraft:stone
+setblock 4003 -57 4007 minecraft:sticky_piston[facing=up]
+setblock 4003 -56 4007 minecraft:slime_block
+setblock 4004 -56 4007 minecraft:white_carpet
+setblock 4004 -57 4007 minecraft:slime_block
+wait 5
+setblock 4002 -57 4004 minecraft:redstone_block
+setblock 4002 -57 4007 minecraft:redstone_block
+tick 10
+setblock 4002 -57 4004 minecraft:air
+setblock 4002 -57 4007 minecraft:air
+tick 10

@@ -1,0 +1,201 @@
+resources: 0 pack(s), cache valid
+resources: 80011 baked faces, 1791 textures, in 18 ms
+items: 1658 definitions, 2109 models, 1733 sprites, in 16 ms
+entities: 4409 textures (loaded on demand), 361 model layers, in 10 ms
+interface: 896 sprites, 8098 translations, in 41 ms
+audio: ready in 394 ms
+singleplayer: opening D:\repo\target\perf\game\saves\perf
+GPU features: indirect draw yes, timestamps yes, wireframe yes
+presentation: Immediate (surface: [Fifo, FifoRelaxed, Mailbox, Immediate])
+singleplayer: survival ready (2042 recipes) in 8 ms
+adapter: NVIDIA GeForce RTX 5080 (Vulkan); pool: 30 threads
+first frame: 710 ms
+[perf] in game at 885 ms (533 columns)
+singleplayer: generator minecraft:overworld ready in 513 ms
+[perf] initial load meshed at 1347 ms (533 columns)
+[   1.5 s] 1460 fps, CPU 0.201 ms/frame, GPU 0.082 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.035 ms (walk 1.255 ms), VRAM 130.8 MB (regions 108.6 of which 91.7 used, textures 9.3, other 12.9), translucent 500 columns of which 37 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 199.4 MB allocated, 348.0 MB reserved
+[perf] [   1.8 s] frames 2515, median 0.331 ms, p99 1.645 ms, max 30.792 ms; columns meshed 942/s; light: 0 chunks in 0.0 ms, 24 relights (1242 changes) in 267.2 ms; private memory 1897 MB, working set 522 MB; last mesh at 1.7 s; 533 columns
+[perf] [   1.8 s] work: sections meshed 22603/s in 2220.3 ms/s; walks 38.0/s in 40.02 ms/s; process CPU 4358 ms/s
+[   2.5 s] 2820 fps, CPU 0.120 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.251 ms (walk 1.265 ms), VRAM 131.0 MB (regions 108.8 of which 91.9 used, textures 9.3, other 12.9), translucent 500 columns of which 37 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 199.5 MB allocated, 348.0 MB reserved
+[perf] [   2.8 s] frames 2921, median 0.244 ms, p99 1.070 ms, max 31.147 ms; columns meshed 643/s; light: 0 chunks in 0.0 ms, 24 relights (1238 changes) in 326.5 ms; private memory 1889 MB, working set 519 MB; last mesh at 2.7 s; 533 columns
+[perf] [   2.8 s] work: sections meshed 15429/s in 1496.3 ms/s; walks 29.0/s in 43.89 ms/s; process CPU 2500 ms/s
+[   3.5 s] 3382 fps, CPU 0.105 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.230 ms (walk 1.378 ms), VRAM 132.4 MB (regions 110.2 of which 92.2 used, textures 9.3, other 12.9), translucent 500 columns of which 37 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 200.9 MB allocated, 348.0 MB reserved
+[perf] [   3.8 s] frames 3296, median 0.236 ms, p99 0.929 ms, max 25.518 ms; columns meshed 573/s; light: 0 chunks in 0.0 ms, 18 relights (1120 changes) in 270.4 ms; private memory 1815 MB, working set 525 MB; last mesh at 3.7 s; 533 columns
+[perf] [   3.8 s] work: sections meshed 13749/s in 1281.3 ms/s; walks 28.0/s in 42.91 ms/s; process CPU 3249 ms/s
+[   4.5 s] 3494 fps, CPU 0.106 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.330 ms (walk 1.323 ms), VRAM 132.4 MB (regions 110.2 of which 92.4 used, textures 9.3, other 12.9), translucent 500 columns of which 37 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 200.9 MB allocated, 348.0 MB reserved
+[perf] [   4.8 s] frames 3609, median 0.233 ms, p99 0.614 ms, max 22.188 ms; columns meshed 216/s; light: 0 chunks in 0.0 ms, 16 relights (858 changes) in 181.4 ms; private memory 1816 MB, working set 528 MB; last mesh at 4.7 s; 533 columns
+[perf] [   4.8 s] work: sections meshed 5184/s in 559.5 ms/s; walks 22.0/s in 30.63 ms/s; process CPU 2062 ms/s
+[   5.5 s] 3352 fps, CPU 0.105 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.280 ms (walk 1.291 ms), VRAM 132.4 MB (regions 110.2 of which 92.7 used, textures 9.3, other 12.9), translucent 500 columns of which 37 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 200.9 MB allocated, 348.0 MB reserved
+[perf] server: tick median 16.583 ms, p95 45.605 ms, p99 150.877 ms, mean 23.366 ms
+[perf] [   5.8 s] frames 3342, median 0.235 ms, p99 0.754 ms, max 19.667 ms; columns meshed 404/s; light: 0 chunks in 0.0 ms, 14 relights (918 changes) in 196.2 ms; private memory 1822 MB, working set 534 MB; last mesh at 5.7 s; 533 columns
+[perf] [   5.8 s] work: sections meshed 9694/s in 949.2 ms/s; walks 24.0/s in 34.81 ms/s; process CPU 1468 ms/s
+[   6.5 s] 3343 fps, CPU 0.104 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 60 meshes in progress, sort 0.280 ms (walk 1.350 ms), VRAM 132.4 MB (regions 110.2 of which 92.8 used, textures 9.3, other 12.9), translucent 500 columns of which 37 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 200.9 MB allocated, 348.0 MB reserved
+[perf] [   6.8 s] frames 3309, median 0.247 ms, p99 0.737 ms, max 19.432 ms; columns meshed 396/s; light: 0 chunks in 0.0 ms, 12 relights (920 changes) in 186.8 ms; private memory 1823 MB, working set 536 MB; last mesh at 6.8 s; 533 columns
+[perf] [   6.8 s] work: sections meshed 9504/s in 931.9 ms/s; walks 28.0/s in 42.15 ms/s; process CPU 2297 ms/s
+[   7.5 s] 3463 fps, CPU 0.104 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.282 ms (walk 1.396 ms), VRAM 132.4 MB (regions 110.2 of which 93.0 used, textures 9.3, other 12.9), translucent 500 columns of which 37 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 200.9 MB allocated, 348.0 MB reserved
+[perf] [   7.8 s] frames 3481, median 0.236 ms, p99 0.632 ms, max 19.316 ms; columns meshed 175/s; light: 0 chunks in 0.0 ms, 8 relights (796 changes) in 142.8 ms; private memory 1835 MB, working set 538 MB; last mesh at 7.8 s; 533 columns
+[perf] [   7.8 s] work: sections meshed 4200/s in 479.2 ms/s; walks 15.0/s in 21.09 ms/s; process CPU 1328 ms/s
+[   8.5 s] 3254 fps, CPU 0.107 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.257 ms (walk 1.238 ms), VRAM 132.4 MB (regions 110.2 of which 93.2 used, textures 9.3, other 12.9), translucent 501 columns of which 37 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 200.9 MB allocated, 348.0 MB reserved
+[perf] [   8.8 s] frames 3223, median 0.249 ms, p99 1.028 ms, max 20.789 ms; columns meshed 441/s; light: 0 chunks in 0.0 ms, 28 relights (846 changes) in 212.6 ms; private memory 1876 MB, working set 544 MB; last mesh at 8.8 s; 533 columns
+[perf] [   8.8 s] work: sections meshed 10583/s in 1038.8 ms/s; walks 32.0/s in 45.68 ms/s; process CPU 2672 ms/s
+[   9.5 s] 3086 fps, CPU 0.114 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 60 meshes in progress, sort 0.285 ms (walk 1.296 ms), VRAM 141.2 MB (regions 119.0 of which 93.3 used, textures 9.3, other 12.9), translucent 501 columns of which 37 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.6 MB allocated, 412.0 MB reserved
+[perf] [   9.8 s] frames 2966, median 0.254 ms, p99 1.025 ms, max 20.909 ms; columns meshed 377/s; light: 0 chunks in 0.0 ms, 22 relights (734 changes) in 195.9 ms; private memory 1973 MB, working set 549 MB; last mesh at 9.8 s; 533 columns
+[perf] [   9.8 s] work: sections meshed 9045/s in 924.8 ms/s; walks 27.0/s in 39.24 ms/s; process CPU 1874 ms/s
+[  10.5 s] 3311 fps, CPU 0.110 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.286 ms (walk 1.279 ms), VRAM 141.2 MB (regions 119.0 of which 93.4 used, textures 9.3, other 12.9), translucent 501 columns of which 37 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] server: tick median 15.741 ms, p95 36.587 ms, p99 41.986 ms, mean 19.972 ms
+[perf] [  10.8 s] frames 3449, median 0.247 ms, p99 0.691 ms, max 20.671 ms; columns meshed 196/s; light: 0 chunks in 0.0 ms, 28 relights (631 changes) in 180.0 ms; private memory 1990 MB, working set 552 MB; last mesh at 10.8 s; 533 columns
+[perf] [  10.8 s] work: sections meshed 4699/s in 540.9 ms/s; walks 29.0/s in 39.18 ms/s; process CPU 2310 ms/s
+[  11.5 s] 3427 fps, CPU 0.115 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.378 ms (walk 1.259 ms), VRAM 141.2 MB (regions 119.0 of which 93.6 used, textures 9.3, other 12.9), translucent 501 columns of which 37 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  11.8 s] frames 3475, median 0.245 ms, p99 0.643 ms, max 18.452 ms; columns meshed 327/s; light: 0 chunks in 0.0 ms, 21 relights (637 changes) in 183.0 ms; private memory 1990 MB, working set 552 MB; last mesh at 11.8 s; 533 columns
+[perf] [  11.8 s] work: sections meshed 7847/s in 805.8 ms/s; walks 29.0/s in 39.67 ms/s; process CPU 1390 ms/s
+[  12.5 s] 3241 fps, CPU 0.115 ms/frame, GPU 0.105 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 54 meshes in progress, sort 0.872 ms (walk 1.860 ms), VRAM 141.2 MB (regions 119.0 of which 93.7 used, textures 9.3, other 12.9), translucent 501 columns of which 37 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  12.8 s] frames 2884, median 0.263 ms, p99 1.018 ms, max 19.692 ms; columns meshed 344/s; light: 0 chunks in 0.0 ms, 20 relights (532 changes) in 171.8 ms; private memory 1987 MB, working set 553 MB; last mesh at 12.8 s; 533 columns
+[perf] [  12.8 s] work: sections meshed 8253/s in 894.1 ms/s; walks 25.0/s in 35.06 ms/s; process CPU 1796 ms/s
+[  13.5 s] 2918 fps, CPU 0.115 ms/frame, GPU 0.105 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.287 ms (walk 1.262 ms), VRAM 141.2 MB (regions 119.0 of which 93.8 used, textures 9.3, other 12.9), translucent 501 columns of which 37 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  13.8 s] frames 2900, median 0.275 ms, p99 0.912 ms, max 15.691 ms; columns meshed 152/s; light: 0 chunks in 0.0 ms, 18 relights (368 changes) in 111.4 ms; private memory 1988 MB, working set 552 MB; last mesh at 13.8 s; 533 columns
+[perf] [  13.8 s] work: sections meshed 3648/s in 403.3 ms/s; walks 25.0/s in 33.96 ms/s; process CPU 1953 ms/s
+[  14.5 s] 3005 fps, CPU 0.116 ms/frame, GPU 0.105 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.279 ms (walk 1.297 ms), VRAM 141.2 MB (regions 119.0 of which 93.9 used, textures 9.3, other 12.9), translucent 501 columns of which 37 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  14.8 s] frames 3335, median 0.255 ms, p99 0.725 ms, max 13.675 ms; columns meshed 262/s; light: 0 chunks in 0.0 ms, 20 relights (422 changes) in 121.1 ms; private memory 1991 MB, working set 553 MB; last mesh at 14.8 s; 533 columns
+[perf] [  14.8 s] work: sections meshed 6288/s in 659.8 ms/s; walks 28.0/s in 38.68 ms/s; process CPU 1422 ms/s
+[  15.5 s] 3420 fps, CPU 0.109 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.325 ms (walk 1.298 ms), VRAM 141.2 MB (regions 119.0 of which 94.0 used, textures 9.3, other 12.9), translucent 501 columns of which 37 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] server: tick median 15.855 ms, p95 33.517 ms, p99 34.932 ms, mean 18.478 ms
+[perf] [  15.8 s] frames 3384, median 0.265 ms, p99 0.700 ms, max 11.647 ms; columns meshed 231/s; light: 0 chunks in 0.0 ms, 20 relights (442 changes) in 111.3 ms; private memory 1988 MB, working set 553 MB; last mesh at 15.8 s; 533 columns
+[perf] [  15.8 s] work: sections meshed 5544/s in 546.5 ms/s; walks 25.0/s in 34.11 ms/s; process CPU 1437 ms/s
+[  16.5 s] 3358 fps, CPU 0.109 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.277 ms (walk 1.265 ms), VRAM 141.2 MB (regions 119.0 of which 94.0 used, textures 9.3, other 12.9), translucent 501 columns of which 37 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  16.8 s] frames 3349, median 0.267 ms, p99 0.611 ms, max 11.441 ms; columns meshed 87/s; light: 0 chunks in 0.0 ms, 18 relights (274 changes) in 70.1 ms; private memory 1987 MB, working set 552 MB; last mesh at 16.8 s; 533 columns
+[perf] [  16.8 s] work: sections meshed 2088/s in 175.5 ms/s; walks 23.0/s in 29.59 ms/s; process CPU 1141 ms/s
+[  17.5 s] 3533 fps, CPU 0.109 ms/frame, GPU 0.105 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.277 ms (walk 1.279 ms), VRAM 141.2 MB (regions 119.0 of which 94.1 used, textures 9.3, other 12.9), translucent 501 columns of which 37 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  17.8 s] frames 3711, median 0.233 ms, p99 0.693 ms, max 8.852 ms; columns meshed 203/s; light: 0 chunks in 0.0 ms, 20 relights (300 changes) in 86.9 ms; private memory 1987 MB, working set 553 MB; last mesh at 17.8 s; 533 columns
+[perf] [  17.8 s] work: sections meshed 4872/s in 459.0 ms/s; walks 27.0/s in 36.83 ms/s; process CPU 2406 ms/s
+[  18.5 s] 3870 fps, CPU 0.105 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.319 ms (walk 1.577 ms), VRAM 141.2 MB (regions 119.0 of which 94.1 used, textures 9.3, other 12.9), translucent 502 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 215.8 MB allocated, 412.0 MB reserved
+[perf] [  18.8 s] frames 3876, median 0.229 ms, p99 0.580 ms, max 8.969 ms; columns meshed 180/s; light: 0 chunks in 0.0 ms, 20 relights (278 changes) in 82.3 ms; private memory 1984 MB, working set 553 MB; last mesh at 18.8 s; 533 columns
+[perf] [  18.8 s] work: sections meshed 4319/s in 438.6 ms/s; walks 22.0/s in 30.48 ms/s; process CPU 1828 ms/s
+[  19.5 s] 3953 fps, CPU 0.103 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.328 ms (walk 1.280 ms), VRAM 141.2 MB (regions 119.0 of which 94.2 used, textures 9.3, other 12.9), translucent 502 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  19.8 s] frames 3989, median 0.228 ms, p99 0.549 ms, max 8.743 ms; columns meshed 80/s; light: 0 chunks in 0.0 ms, 16 relights (194 changes) in 57.9 ms; private memory 1982 MB, working set 552 MB; last mesh at 19.8 s; 533 columns
+[perf] [  19.8 s] work: sections meshed 1920/s in 173.7 ms/s; walks 18.0/s in 24.53 ms/s; process CPU 1781 ms/s
+[  20.5 s] 3981 fps, CPU 0.101 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.280 ms (walk 1.343 ms), VRAM 141.2 MB (regions 119.0 of which 94.2 used, textures 9.3, other 12.9), translucent 502 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] server: tick median 17.558 ms, p95 26.901 ms, p99 28.119 ms, mean 17.911 ms
+[perf] [  20.8 s] frames 3959, median 0.227 ms, p99 0.576 ms, max 8.307 ms; columns meshed 163/s; light: 0 chunks in 0.0 ms, 20 relights (228 changes) in 68.8 ms; private memory 1987 MB, working set 553 MB; last mesh at 20.8 s; 533 columns
+[perf] [  20.8 s] work: sections meshed 3911/s in 355.5 ms/s; walks 24.0/s in 32.87 ms/s; process CPU 2328 ms/s
+[  21.5 s] 3781 fps, CPU 0.105 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.283 ms (walk 1.452 ms), VRAM 141.2 MB (regions 119.0 of which 94.3 used, textures 9.3, other 12.9), translucent 502 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  21.8 s] frames 3652, median 0.248 ms, p99 0.633 ms, max 6.306 ms; columns meshed 143/s; light: 0 chunks in 0.0 ms, 22 relights (228 changes) in 64.4 ms; private memory 1991 MB, working set 554 MB; last mesh at 21.8 s; 533 columns
+[perf] [  21.8 s] work: sections meshed 3432/s in 307.3 ms/s; walks 21.0/s in 28.39 ms/s; process CPU 1562 ms/s
+[  22.5 s] 3666 fps, CPU 0.105 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.282 ms (walk 1.309 ms), VRAM 141.2 MB (regions 119.0 of which 94.3 used, textures 9.3, other 12.9), translucent 502 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  22.8 s] frames 3621, median 0.263 ms, p99 0.569 ms, max 6.241 ms; columns meshed 61/s; light: 0 chunks in 0.0 ms, 16 relights (230 changes) in 50.9 ms; private memory 1977 MB, working set 552 MB; last mesh at 22.8 s; 533 columns
+[perf] [  22.8 s] work: sections meshed 1464/s in 133.3 ms/s; walks 15.0/s in 20.41 ms/s; process CPU 1343 ms/s
+[  23.5 s] 3644 fps, CPU 0.105 ms/frame, GPU 0.105 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.284 ms (walk 1.341 ms), VRAM 141.2 MB (regions 119.0 of which 94.3 used, textures 9.3, other 12.9), translucent 502 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  23.8 s] frames 3777, median 0.230 ms, p99 0.580 ms, max 6.935 ms; columns meshed 136/s; light: 0 chunks in 0.0 ms, 18 relights (274 changes) in 64.4 ms; private memory 1966 MB, working set 551 MB; last mesh at 23.8 s; 533 columns
+[perf] [  23.8 s] work: sections meshed 3264/s in 309.8 ms/s; walks 21.0/s in 28.48 ms/s; process CPU 1422 ms/s
+[  24.5 s] 3737 fps, CPU 0.103 ms/frame, GPU 0.105 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.278 ms (walk 1.339 ms), VRAM 141.2 MB (regions 119.0 of which 94.4 used, textures 9.3, other 12.9), translucent 502 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  24.8 s] frames 3697, median 0.236 ms, p99 0.595 ms, max 6.515 ms; columns meshed 131/s; light: 0 chunks in 0.0 ms, 19 relights (282 changes) in 64.7 ms; private memory 1973 MB, working set 552 MB; last mesh at 24.8 s; 533 columns
+[perf] [  24.8 s] work: sections meshed 3144/s in 300.1 ms/s; walks 16.0/s in 21.92 ms/s; process CPU 1500 ms/s
+[  25.5 s] 3515 fps, CPU 0.107 ms/frame, GPU 0.105 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.281 ms (walk 1.272 ms), VRAM 141.2 MB (regions 119.0 of which 94.4 used, textures 9.3, other 12.9), translucent 502 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] server: tick median 15.628 ms, p95 21.832 ms, p99 22.394 ms, mean 16.086 ms
+[perf] [  25.8 s] frames 3224, median 0.258 ms, p99 0.729 ms, max 7.142 ms; columns meshed 109/s; light: 0 chunks in 0.0 ms, 18 relights (250 changes) in 57.9 ms; private memory 1951 MB, working set 550 MB; last mesh at 25.8 s; 533 columns
+[perf] [  25.8 s] work: sections meshed 2616/s in 245.7 ms/s; walks 19.0/s in 25.48 ms/s; process CPU 1328 ms/s
+[  26.5 s] 3404 fps, CPU 0.109 ms/frame, GPU 0.105 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.272 ms (walk 1.275 ms), VRAM 141.2 MB (regions 119.0 of which 94.5 used, textures 9.3, other 12.9), translucent 502 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  26.8 s] frames 3719, median 0.241 ms, p99 0.633 ms, max 7.192 ms; columns meshed 175/s; light: 0 chunks in 0.0 ms, 16 relights (261 changes) in 62.6 ms; private memory 1932 MB, working set 546 MB; last mesh at 26.6 s; 533 columns
+[perf] [  26.8 s] work: sections meshed 4199/s in 475.2 ms/s; walks 18.0/s in 25.02 ms/s; process CPU 2109 ms/s
+[  27.5 s] 3801 fps, CPU 0.109 ms/frame, GPU 0.105 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.287 ms (walk 1.395 ms), VRAM 141.2 MB (regions 119.0 of which 94.5 used, textures 9.3, other 12.9), translucent 502 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  27.8 s] frames 3566, median 0.243 ms, p99 0.618 ms, max 8.472 ms; columns meshed 232/s; light: 0 chunks in 0.0 ms, 10 relights (326 changes) in 59.5 ms; private memory 1940 MB, working set 546 MB; last mesh at 27.6 s; 533 columns
+[perf] [  27.8 s] work: sections meshed 5567/s in 643.2 ms/s; walks 19.0/s in 26.91 ms/s; process CPU 2687 ms/s
+[  28.5 s] 3346 fps, CPU 0.110 ms/frame, GPU 0.105 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.325 ms (walk 1.298 ms), VRAM 141.2 MB (regions 119.0 of which 94.6 used, textures 9.3, other 12.9), translucent 502 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  28.8 s] frames 3577, median 0.245 ms, p99 0.599 ms, max 7.645 ms; columns meshed 121/s; light: 0 chunks in 0.0 ms, 8 relights (239 changes) in 42.8 ms; private memory 1925 MB, working set 543 MB; last mesh at 28.7 s; 533 columns
+[perf] [  28.8 s] work: sections meshed 2904/s in 310.4 ms/s; walks 19.0/s in 26.20 ms/s; process CPU 2047 ms/s
+[  29.5 s] 3622 fps, CPU 0.109 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.281 ms (walk 1.284 ms), VRAM 141.2 MB (regions 119.0 of which 94.6 used, textures 9.3, other 12.9), translucent 502 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  29.8 s] frames 3528, median 0.263 ms, p99 0.609 ms, max 6.380 ms; columns meshed 171/s; light: 0 chunks in 0.0 ms, 10 relights (212 changes) in 49.8 ms; private memory 1919 MB, working set 544 MB; last mesh at 29.7 s; 533 columns
+[perf] [  29.8 s] work: sections meshed 4104/s in 422.9 ms/s; walks 18.0/s in 25.02 ms/s; process CPU 2156 ms/s
+[  30.5 s] 3415 fps, CPU 0.108 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.404 ms (walk 1.290 ms), VRAM 141.2 MB (regions 119.0 of which 94.6 used, textures 9.3, other 12.9), translucent 502 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] server: tick median 13.631 ms, p95 22.756 ms, p99 32.622 ms, mean 15.318 ms
+[perf] [  30.8 s] frames 3400, median 0.265 ms, p99 0.599 ms, max 6.581 ms; columns meshed 125/s; light: 0 chunks in 0.0 ms, 10 relights (170 changes) in 44.6 ms; private memory 1906 MB, working set 541 MB; last mesh at 30.7 s; 533 columns
+[perf] [  30.8 s] work: sections meshed 3000/s in 301.9 ms/s; walks 17.0/s in 22.99 ms/s; process CPU 1703 ms/s
+[  31.5 s] 3533 fps, CPU 0.106 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.328 ms (walk 1.404 ms), VRAM 141.2 MB (regions 119.0 of which 94.7 used, textures 9.3, other 12.9), translucent 502 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  31.8 s] frames 3508, median 0.264 ms, p99 0.606 ms, max 4.544 ms; columns meshed 93/s; light: 0 chunks in 0.0 ms, 11 relights (138 changes) in 29.5 ms; private memory 1902 MB, working set 542 MB; last mesh at 31.8 s; 533 columns
+[perf] [  31.8 s] work: sections meshed 2232/s in 215.2 ms/s; walks 15.0/s in 19.99 ms/s; process CPU 1187 ms/s
+[  32.5 s] 3478 fps, CPU 0.106 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.282 ms (walk 1.289 ms), VRAM 141.2 MB (regions 119.0 of which 94.7 used, textures 9.3, other 12.9), translucent 503 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  32.8 s] frames 3528, median 0.263 ms, p99 0.616 ms, max 5.315 ms; columns meshed 145/s; light: 0 chunks in 0.0 ms, 10 relights (159 changes) in 36.5 ms; private memory 1879 MB, working set 539 MB; last mesh at 32.7 s; 533 columns
+[perf] [  32.8 s] work: sections meshed 3480/s in 352.4 ms/s; walks 18.0/s in 24.42 ms/s; process CPU 1656 ms/s
+[  33.5 s] 3527 fps, CPU 0.103 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.286 ms (walk 1.373 ms), VRAM 141.2 MB (regions 119.0 of which 94.7 used, textures 9.3, other 12.9), translucent 503 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  33.8 s] frames 3723, median 0.259 ms, p99 0.574 ms, max 5.621 ms; columns meshed 101/s; light: 0 chunks in 0.0 ms, 10 relights (103 changes) in 28.7 ms; private memory 1896 MB, working set 541 MB; last mesh at 33.7 s; 533 columns
+[perf] [  33.8 s] work: sections meshed 2424/s in 233.0 ms/s; walks 15.0/s in 20.40 ms/s; process CPU 1250 ms/s
+[  34.5 s] 4142 fps, CPU 0.100 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.281 ms (walk 1.282 ms), VRAM 141.2 MB (regions 119.0 of which 94.7 used, textures 9.3, other 12.9), translucent 503 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  34.8 s] frames 3758, median 0.235 ms, p99 0.608 ms, max 3.381 ms; columns meshed 75/s; light: 0 chunks in 0.0 ms, 12 relights (23 changes) in 15.9 ms; private memory 1893 MB, working set 540 MB; last mesh at 34.6 s; 533 columns
+[perf] [  34.8 s] work: sections meshed 1799/s in 159.3 ms/s; walks 14.0/s in 19.40 ms/s; process CPU 1203 ms/s
+[  35.5 s] 3390 fps, CPU 0.106 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.280 ms (walk 1.282 ms), VRAM 141.2 MB (regions 119.0 of which 94.7 used, textures 9.3, other 12.9), translucent 503 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] server: tick median 14.189 ms, p95 19.341 ms, p99 22.054 ms, mean 15.281 ms
+[perf] [  35.8 s] frames 3621, median 0.244 ms, p99 0.624 ms, max 5.593 ms; columns meshed 112/s; light: 0 chunks in 0.0 ms, 10 relights (42 changes) in 16.3 ms; private memory 1858 MB, working set 536 MB; last mesh at 35.6 s; 533 columns
+[perf] [  35.8 s] work: sections meshed 2688/s in 245.4 ms/s; walks 13.0/s in 17.64 ms/s; process CPU 1969 ms/s
+[  36.5 s] 4027 fps, CPU 0.102 ms/frame, GPU 0.105 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.280 ms (walk 1.248 ms), VRAM 141.2 MB (regions 119.0 of which 94.7 used, textures 9.3, other 12.9), translucent 503 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  36.8 s] frames 4176, median 0.226 ms, p99 0.512 ms, max 5.946 ms; columns meshed 93/s; light: 0 chunks in 0.0 ms, 8 relights (46 changes) in 14.3 ms; private memory 1867 MB, working set 537 MB; last mesh at 36.7 s; 533 columns
+[perf] [  36.8 s] work: sections meshed 2232/s in 219.3 ms/s; walks 17.0/s in 23.43 ms/s; process CPU 1812 ms/s
+[  37.5 s] 4243 fps, CPU 0.098 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.282 ms (walk 1.468 ms), VRAM 141.2 MB (regions 119.0 of which 94.7 used, textures 9.3, other 12.9), translucent 503 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  37.8 s] frames 4183, median 0.225 ms, p99 0.481 ms, max 1.726 ms; columns meshed 24/s; light: 0 chunks in 0.0 ms, 4 relights (4 changes) in 3.6 ms; private memory 1858 MB, working set 536 MB; last mesh at 37.7 s; 533 columns
+[perf] [  37.8 s] work: sections meshed 576/s in 45.8 ms/s; walks 10.0/s in 13.30 ms/s; process CPU 1281 ms/s
+[  38.5 s] 3931 fps, CPU 0.100 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.287 ms (walk 1.368 ms), VRAM 141.2 MB (regions 119.0 of which 94.7 used, textures 9.3, other 12.9), translucent 503 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  38.8 s] frames 3982, median 0.227 ms, p99 0.506 ms, max 5.550 ms; columns meshed 80/s; light: 0 chunks in 0.0 ms, 8 relights (47 changes) in 14.3 ms; private memory 1881 MB, working set 538 MB; last mesh at 38.6 s; 533 columns
+[perf] [  38.8 s] work: sections meshed 1920/s in 188.1 ms/s; walks 13.0/s in 17.89 ms/s; process CPU 1781 ms/s
+[  39.5 s] 4143 fps, CPU 0.098 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.333 ms (walk 1.416 ms), VRAM 141.2 MB (regions 119.0 of which 94.7 used, textures 9.3, other 12.9), translucent 503 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  39.8 s] frames 4038, median 0.228 ms, p99 0.498 ms, max 5.837 ms; columns meshed 84/s; light: 0 chunks in 0.0 ms, 4 relights (40 changes) in 11.3 ms; private memory 1875 MB, working set 538 MB; last mesh at 39.7 s; 533 columns
+[perf] [  39.8 s] work: sections meshed 2016/s in 195.1 ms/s; walks 15.0/s in 20.91 ms/s; process CPU 1328 ms/s
+[  40.5 s] 3990 fps, CPU 0.099 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.284 ms (walk 1.375 ms), VRAM 141.2 MB (regions 119.0 of which 94.7 used, textures 9.3, other 12.9), translucent 503 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] server: tick median 17.165 ms, p95 18.973 ms, p99 21.375 ms, mean 16.440 ms
+[perf] [  40.8 s] frames 4089, median 0.225 ms, p99 0.496 ms, max 1.487 ms; columns meshed 43/s; light: 0 chunks in 0.0 ms, 10 relights (18 changes) in 8.8 ms; private memory 1871 MB, working set 537 MB; last mesh at 40.7 s; 533 columns
+[perf] [  40.8 s] work: sections meshed 1032/s in 78.1 ms/s; walks 18.0/s in 23.92 ms/s; process CPU 1328 ms/s
+[  41.5 s] 4113 fps, CPU 0.098 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.277 ms (walk 1.374 ms), VRAM 141.2 MB (regions 119.0 of which 94.7 used, textures 9.3, other 12.9), translucent 503 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  41.8 s] frames 4091, median 0.227 ms, p99 0.489 ms, max 4.953 ms; columns meshed 80/s; light: 0 chunks in 0.0 ms, 4 relights (36 changes) in 11.0 ms; private memory 1888 MB, working set 539 MB; last mesh at 41.6 s; 533 columns
+[perf] [  41.8 s] work: sections meshed 1920/s in 192.4 ms/s; walks 15.0/s in 20.10 ms/s; process CPU 1266 ms/s
+[  42.5 s] 4018 fps, CPU 0.105 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.288 ms (walk 1.387 ms), VRAM 141.2 MB (regions 119.0 of which 94.7 used, textures 9.3, other 12.9), translucent 503 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  42.8 s] frames 3966, median 0.240 ms, p99 0.512 ms, max 5.183 ms; columns meshed 93/s; light: 0 chunks in 0.0 ms, 8 relights (42 changes) in 13.8 ms; private memory 1896 MB, working set 539 MB; last mesh at 42.7 s; 533 columns
+[perf] [  42.8 s] work: sections meshed 2232/s in 214.2 ms/s; walks 14.0/s in 18.35 ms/s; process CPU 1906 ms/s
+[  43.5 s] 3856 fps, CPU 0.106 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.284 ms (walk 1.253 ms), VRAM 141.2 MB (regions 119.0 of which 94.7 used, textures 9.3, other 12.9), translucent 503 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  43.8 s] frames 3822, median 0.243 ms, p99 0.541 ms, max 1.815 ms; columns meshed 25/s; light: 0 chunks in 0.0 ms, 2 relights (4 changes) in 2.7 ms; private memory 1891 MB, working set 539 MB; last mesh at 43.8 s; 533 columns
+[perf] [  43.8 s] work: sections meshed 600/s in 42.4 ms/s; walks 11.0/s in 14.28 ms/s; process CPU 1250 ms/s
+[  44.5 s] 3824 fps, CPU 0.107 ms/frame, GPU 0.104 ms/frame, 533 columns loaded, 533 on GPU (2.10 M faces), 183 drawn (0.16 M faces), 0 meshes in progress, sort 0.287 ms (walk 1.372 ms), VRAM 141.2 MB (regions 119.0 of which 94.8 used, textures 9.3, other 12.9), translucent 503 columns of which 36 unsorted, 0 entities drawn, block entities 147 of which 0 drawn
+GPU allocator: 209.7 MB allocated, 412.0 MB reserved
+[perf] [  44.8 s] frames 3867, median 0.242 ms, p99 0.555 ms, max 5.580 ms; columns meshed 67/s; light: 0 chunks in 0.0 ms, 6 relights (42 changes) in 12.2 ms; private memory 1894 MB, working set 539 MB; last mesh at 44.8 s; 533 columns
+[perf] [  44.8 s] work: sections meshed 1608/s in 140.0 ms/s; walks 10.0/s in 13.83 ms/s; process CPU 1266 ms/s
+capture: D:\repo\target\perf\rerun\plains12-2-0/fin.bmp
+singleplayer: closing save: 238 chunks, snapshot 25.53 ms, total 91.8 ms

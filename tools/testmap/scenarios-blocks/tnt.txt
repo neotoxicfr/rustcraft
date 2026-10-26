@@ -1,0 +1,12 @@
+# TNT primed by redstone: fall, 80-tick fuse, explosion (blocks destroyed, neighbouring TNT launched).
+region 4003 -60 4003 4009 -57 4009
+fill 4000 -60 4000 4015 -60 4015 minecraft:stone
+fill 4000 -59 4000 4015 -50 4015 minecraft:air
+kill @e[type=item,x=3995,y=-64,z=3995,dx=40,dy=40,dz=40]
+wait 200
+fill 4003 -59 4003 4009 -58 4009 minecraft:dirt
+setblock 4006 -57 4006 minecraft:tnt
+setblock 4006 -57 4008 minecraft:tnt
+wait 5
+setblock 4006 -56 4006 minecraft:redstone_block
+tick 100

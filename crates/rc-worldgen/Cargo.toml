@@ -1,0 +1,25 @@
+[package]
+name = "rc-worldgen"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Terrain generation: randomness, noises, density functions, biomes (data read from the jar)"
+
+[dependencies]
+hashbrown = { workspace = true }
+rc-data.workspace = true
+rc-proto.workspace = true
+flate2.workspace = true
+md-5.workspace = true
+ring.workspace = true
+rayon.workspace = true
+zip.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rc-testdata.workspace = true
+
+[lints]
+workspace = true

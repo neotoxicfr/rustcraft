@@ -1,0 +1,36 @@
+[package]
+name = "rc-light"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Light engine (sky and blocks) shared by the client and the integrated server"
+
+[dependencies]
+hashbrown = { workspace = true }
+rayon.workspace = true
+rc-data.workspace = true
+rc-world.workspace = true
+
+[features]
+# Benches: counting allocator (number and bytes of allocations per relight / chunk).
+memstats = []
+
+[dev-dependencies]
+rc-testdata.workspace = true
+rc-proto.workspace = true
+rc-proto-v777.workspace = true
+criterion = { version = "0.8.2", default-features = false }
+mimalloc.workspace = true
+
+[[bench]]
+name = "relight"
+harness = false
+
+[[bench]]
+name = "light_chunk"
+harness = false
+
+[lints]
+workspace = true

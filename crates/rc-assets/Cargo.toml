@@ -1,0 +1,28 @@
+[package]
+name = "rc-assets"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Player resources (jar, packs): textures, baked block models, neutral fallbacks"
+
+[dependencies]
+hashbrown = { workspace = true }
+rc-data.workspace = true
+serde_json.workspace = true
+zip.workspace = true
+png.workspace = true
+flate2.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+# TrueType fonts from packs: outlines fitted to the grid (like FreeType), and coverage.
+skrifa = "0.44.0"
+ab_glyph_rasterizer = "0.1.10"
+
+[dev-dependencies]
+rc-testdata.workspace = true
+mimalloc.workspace = true
+
+[lints]
+workspace = true

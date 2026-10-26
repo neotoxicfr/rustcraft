@@ -1,0 +1,11 @@
+# Water flow on a stone slab with a wall and a hole.
+region 4000 -60 4000 4012 -59 4012
+fill 4000 -60 4000 4015 -60 4015 minecraft:stone
+fill 4000 -59 4000 4015 -50 4015 minecraft:air
+kill @e[type=item,x=3995,y=-64,z=3995,dx=40,dy=40,dz=40]
+wait 200
+fill 4004 -59 4002 4004 -59 4006 minecraft:cobblestone
+setblock 4009 -60 4006 minecraft:air
+wait 5
+setblock 4006 -59 4006 minecraft:water
+tick 80

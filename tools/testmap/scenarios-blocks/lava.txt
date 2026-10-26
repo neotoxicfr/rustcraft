@@ -1,0 +1,15 @@
+# Lava (flow 30 ticks, 3 blocks) against water: stone, cobblestone, obsidian.
+region 4001 -59 4001 4013 -58 4011
+fill 4000 -60 4000 4015 -60 4015 minecraft:stone
+fill 4000 -59 4000 4015 -50 4015 minecraft:air
+kill @e[type=item,x=3995,y=-64,z=3995,dx=40,dy=40,dz=40]
+wait 200
+fill 4000 -59 4008 4015 -59 4008 minecraft:cobblestone
+wait 5
+setblock 4004 -59 4004 minecraft:lava
+setblock 4010 -59 4004 minecraft:water
+setblock 4004 -58 4010 minecraft:lava
+setblock 4006 -59 4010 minecraft:water
+tick 160
+setblock 4012 -58 4004 minecraft:lava
+tick 60

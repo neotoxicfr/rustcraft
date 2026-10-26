@@ -1,0 +1,32 @@
+[package]
+name = "rc-data"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Version data: automatic preparation from the player's installation, compact binary format"
+
+[dependencies]
+hashbrown = { workspace = true }
+serde_json.workspace = true
+ureq.workspace = true
+sha1.workspace = true
+zip.workspace = true
+memmap2 = "0.9.11"
+rayon.workspace = true
+thiserror.workspace = true
+# `filter` section of packs (resources and data): Java patterns (assertions, back
+# references, possessive quantifiers), partial search.
+fancy-regex = "0.19.2"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false }
+mimalloc.workspace = true
+
+[[bench]]
+name = "load"
+harness = false
+
+[lints]
+workspace = true

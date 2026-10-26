@@ -1,0 +1,20 @@
+# Gravity: concrete powder in water, gravel on a torch, sand on a slab, sand column, anvil.
+region 4002 -59 4002 4012 -52 4006
+fill 4000 -60 4000 4015 -60 4015 minecraft:stone
+fill 4000 -59 4000 4015 -50 4015 minecraft:air
+kill @e[type=item,x=3995,y=-64,z=3995,dx=40,dy=40,dz=40]
+wait 200
+fill 4002 -59 4003 4004 -59 4005 minecraft:cobblestone
+setblock 4003 -59 4004 minecraft:water
+setblock 4005 -59 4004 minecraft:torch
+setblock 4007 -59 4004 minecraft:stone_slab
+fill 4009 -58 4004 4009 -54 4004 minecraft:sand
+setblock 4009 -59 4004 minecraft:stone
+setblock 4011 -59 4004 minecraft:oak_fence
+wait 5
+setblock 4003 -54 4004 minecraft:white_concrete_powder
+setblock 4005 -53 4004 minecraft:gravel
+setblock 4007 -53 4004 minecraft:sand
+setblock 4011 -53 4004 minecraft:anvil
+setblock 4009 -59 4004 minecraft:air
+tick 60

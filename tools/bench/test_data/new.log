@@ -1,0 +1,17 @@
+resources: 2 pack(s), cache valid
+[startup] data at 12 ms
+[startup] resources at 70 ms
+[startup] data at 99 ms
+audio: ready in 22 ms
+audio: engine joined 3.0 ms after its launch, wait 0.0 ms
+singleplayer: opened in 318 ms
+singleplayer: generator minecraft:overworld ready in 450 ms
+singleplayer: generated 16 chunks in 40.0 ms
+singleplayer: generated 48 chunks in 80.0 ms
+[perf] [  10.0 s] counter write_buffer 100
+[perf] [  26.0 s] counter write_buffer 30
+[perf] [  27.0 s] counter write_buffer 50
+singleplayer: save: 240 chunks, snapshot 20.00 ms
+singleplayer: save: 250 chunks, snapshot 30.00 ms
+singleplayer: save: 260 chunks, snapshot 25.00 ms
+singleplayer: closing save: 244 chunks, snapshot 27.15 ms, total 94.9 ms

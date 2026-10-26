@@ -1,0 +1,26 @@
+# Sticky piston: push of 3 blocks, retraction (pull), then immovable block and the limit of 12.
+region 4001 -59 4002 4018 -59 4004
+fill 4000 -60 4000 4015 -60 4015 minecraft:stone
+fill 4000 -59 4000 4015 -50 4015 minecraft:air
+kill @e[type=item,x=3995,y=-64,z=3995,dx=40,dy=40,dz=40]
+wait 200
+setblock 4002 -59 4003 minecraft:sticky_piston[facing=east]
+setblock 4003 -59 4003 minecraft:stone
+setblock 4004 -59 4003 minecraft:oak_planks
+setblock 4005 -59 4003 minecraft:dirt
+setblock 4002 -59 4010 minecraft:piston[facing=east]
+setblock 4003 -59 4010 minecraft:obsidian
+wait 10
+setblock 4001 -59 4003 minecraft:redstone_block
+tick 8
+setblock 4001 -59 4003 minecraft:air
+tick 8
+fill 4003 -59 4003 4014 -59 4003 minecraft:slime_block
+wait 5
+setblock 4001 -59 4003 minecraft:redstone_block
+tick 8
+setblock 4014 -59 4003 minecraft:air
+setblock 4001 -59 4003 minecraft:air
+tick 4
+setblock 4001 -59 4003 minecraft:redstone_block
+tick 8

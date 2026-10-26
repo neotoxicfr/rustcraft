@@ -1,0 +1,58 @@
+# Block survival: the supports are removed one by one, the blocks they carried fall in a cascade.
+region 4002 -59 4002 4014 -56 4006
+fill 4000 -60 4000 4015 -60 4015 minecraft:stone
+fill 4000 -59 4000 4015 -50 4015 minecraft:air
+kill @e[type=item,x=3995,y=-64,z=3995,dx=40,dy=40,dz=40]
+wait 200
+fill 4002 -59 4004 4014 -59 4004 minecraft:cobblestone
+setblock 4002 -58 4004 minecraft:torch
+setblock 4003 -58 4004 minecraft:redstone_wire
+setblock 4004 -58 4004 minecraft:repeater[facing=east]
+setblock 4005 -58 4004 minecraft:rail
+setblock 4006 -58 4004 minecraft:white_carpet
+setblock 4007 -58 4004 minecraft:stone_button[face=floor]
+setblock 4008 -58 4004 minecraft:lever[face=floor]
+setblock 4009 -58 4004 minecraft:oak_door[half=lower]
+setblock 4009 -57 4004 minecraft:oak_door[half=upper]
+setblock 4010 -58 4004 minecraft:oak_sign
+setblock 4011 -58 4004 minecraft:flower_pot
+setblock 4012 -58 4004 minecraft:snow
+setblock 4013 -58 4004 minecraft:comparator
+setblock 4014 -58 4004 minecraft:lantern
+setblock 4002 -59 4005 minecraft:wall_torch[facing=south]
+setblock 4003 -59 4005 minecraft:ladder[facing=south]
+setblock 4004 -59 4005 minecraft:oak_wall_sign[facing=south]
+setblock 4005 -59 4005 minecraft:stone_button[face=wall,facing=south]
+setblock 4006 -59 4005 minecraft:redstone_wall_torch[facing=south]
+setblock 4007 -59 4005 minecraft:vine[north=true]
+setblock 4008 -59 4005 minecraft:tripwire_hook[facing=south]
+setblock 4009 -59 4003 minecraft:lever[face=wall,facing=north]
+setblock 4010 -59 4003 minecraft:oak_trapdoor[facing=north,half=bottom]
+setblock 4011 -59 4003 minecraft:cocoa[facing=south]
+wait 5
+setblock 4002 -59 4004 minecraft:air
+tick 2
+setblock 4003 -59 4004 minecraft:air
+tick 2
+setblock 4004 -59 4004 minecraft:air
+tick 2
+setblock 4005 -59 4004 minecraft:air
+tick 2
+setblock 4006 -59 4004 minecraft:air
+tick 2
+setblock 4007 -59 4004 minecraft:air
+tick 2
+setblock 4008 -59 4004 minecraft:air
+tick 2
+setblock 4009 -59 4004 minecraft:air
+tick 2
+setblock 4010 -59 4004 minecraft:air
+tick 2
+setblock 4011 -59 4004 minecraft:air
+tick 2
+setblock 4012 -59 4004 minecraft:air
+tick 2
+setblock 4013 -59 4004 minecraft:air
+tick 2
+setblock 4014 -59 4004 minecraft:air
+tick 4

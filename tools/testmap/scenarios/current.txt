@@ -1,0 +1,11 @@
+# Fluid current (motionless player): flowing water plateau, waterfall, pool.
+gamemode survival Rustcraft
+execute if block 43 -58 46 minecraft:water
+tp Rustcraft 43.5 -58 46.5 0 0
+sleep 6
+tp Rustcraft 46.5 -58 50.5 0 0
+sleep 6
+tp Rustcraft 0.5 -57 44.5 0 0
+sleep 6
+tp Rustcraft 8.5 -60 50.5 0 0
+sleep 6

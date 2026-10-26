@@ -1,0 +1,6 @@
+disallowed-methods = [
+    { path = "std::env::var", reason = "read on every call: go through rc_data::env_str!/env_flag!/env_os! (read once per site)" },
+    { path = "std::env::var_os", reason = "read on every call: go through rc_data::env_os!/env_flag! (read once per site)" },
+    { path = "std::env::set_var", reason = "the environment never changes after startup: the caches of rc_data::env_flags depend on it" },
+    { path = "std::env::remove_var", reason = "the environment never changes after startup: the caches of rc_data::env_flags depend on it" },
+]

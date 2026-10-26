@@ -1,0 +1,20 @@
+[package]
+name = "rc-world"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Client-side world storage: paletted sections, columns, circular grid"
+
+[dependencies]
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false }
+
+[[bench]]
+name = "container"
+harness = false
+
+[lints]
+workspace = true

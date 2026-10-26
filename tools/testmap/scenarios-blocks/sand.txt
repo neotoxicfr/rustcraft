@@ -1,0 +1,13 @@
+# Falling sand and gravel; sand on a torch (broken); concrete powder in water.
+region 4002 -60 4002 4008 -53 4004
+fill 4000 -60 4000 4015 -60 4015 minecraft:stone
+fill 4000 -59 4000 4015 -50 4015 minecraft:air
+kill @e[type=item,x=3995,y=-64,z=3995,dx=40,dy=40,dz=40]
+wait 200
+setblock 4003 -59 4003 minecraft:torch
+setblock 4006 -59 4003 minecraft:water
+wait 10
+fill 4003 -54 4003 4003 -53 4003 minecraft:sand
+setblock 4004 -55 4003 minecraft:gravel
+setblock 4006 -54 4003 minecraft:white_concrete_powder
+tick 40

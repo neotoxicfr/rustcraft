@@ -1,0 +1,28 @@
+[package]
+name = "rc-proto-v777"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Protocol 777 packets (Java Edition 26.3): structures and codecs"
+
+[dependencies]
+rc-proto.workspace = true
+rc-world.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rc-data.workspace = true
+rc-testdata.workspace = true
+criterion = { version = "0.8.2", default-features = false }
+mimalloc.workspace = true
+rayon.workspace = true
+libdeflater.workspace = true
+
+[[bench]]
+name = "chunks"
+harness = false
+
+[lints]
+workspace = true

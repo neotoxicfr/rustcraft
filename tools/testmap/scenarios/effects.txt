@@ -1,0 +1,19 @@
+# Block effects (run with an automatic walk, e.g. 600 s):
+# 5-block fall onto the slime, cobwebs, berries, powder snow, bubble columns, bed.
+gamemode survival Rustcraft
+effect give Rustcraft minecraft:resistance infinite 255 true
+effect give Rustcraft minecraft:saturation infinite 255 true
+tp Rustcraft 55.5 -54 5.5 0 0
+sleep 6
+tp Rustcraft 2.5 -59 32.5 0 0
+sleep 6
+tp Rustcraft 10.5 -59 32.5 0 0
+sleep 6
+tp Rustcraft 18.5 -59 32.5 0 0
+sleep 6
+tp Rustcraft 22.5 -59 47.5 0 0
+sleep 5
+tp Rustcraft 24.5 -55 47.5 0 0
+sleep 5
+tp Rustcraft 54.5 -55 10.5 0 0
+sleep 5

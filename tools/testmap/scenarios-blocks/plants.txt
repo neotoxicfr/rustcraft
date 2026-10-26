@@ -1,0 +1,43 @@
+# Plants that need support: kelp and seagrass in a pool, bamboo, scaffolding; the supports are removed.
+region 4002 -59 4002 4013 -54 4010
+fill 4000 -60 4000 4015 -60 4015 minecraft:stone
+fill 4000 -59 4000 4015 -50 4015 minecraft:air
+kill @e[type=item,x=3995,y=-64,z=3995,dx=40,dy=40,dz=40]
+wait 200
+fill 4002 -59 4002 4006 -55 4006 minecraft:glass
+fill 4003 -58 4003 4005 -55 4005 minecraft:water
+setblock 4004 -59 4004 minecraft:sand
+setblock 4004 -58 4004 minecraft:kelp_plant
+setblock 4004 -57 4004 minecraft:kelp_plant
+setblock 4004 -56 4004 minecraft:kelp[age=25]
+setblock 4003 -59 4003 minecraft:sand
+setblock 4003 -58 4003 minecraft:seagrass
+setblock 4005 -59 4005 minecraft:sand
+setblock 4005 -58 4005 minecraft:tall_seagrass[half=lower]
+setblock 4005 -57 4005 minecraft:tall_seagrass[half=upper]
+setblock 4009 -59 4004 minecraft:dirt
+setblock 4009 -58 4004 minecraft:bamboo
+setblock 4009 -57 4004 minecraft:bamboo
+setblock 4009 -56 4004 minecraft:bamboo[stage=1]
+setblock 4011 -59 4004 minecraft:dirt
+setblock 4011 -58 4004 minecraft:bamboo_sapling
+setblock 4010 -59 4008 minecraft:stone
+setblock 4010 -58 4008 minecraft:scaffolding
+setblock 4010 -57 4008 minecraft:scaffolding
+setblock 4011 -57 4008 minecraft:scaffolding
+setblock 4012 -57 4008 minecraft:scaffolding
+wait 5
+setblock 4004 -59 4004 minecraft:glass
+setblock 4003 -59 4003 minecraft:glass
+setblock 4005 -59 4005 minecraft:glass
+tick 4
+setblock 4004 -58 4004 minecraft:air
+tick 6
+setblock 4004 -59 4004 minecraft:stone
+setblock 4003 -59 4003 minecraft:air
+tick 10
+setblock 4009 -59 4004 minecraft:air
+setblock 4011 -59 4004 minecraft:air
+tick 10
+setblock 4010 -59 4008 minecraft:air
+tick 30

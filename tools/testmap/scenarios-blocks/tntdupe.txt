@@ -1,0 +1,20 @@
+# TNT on a slime block (above the ground) pushed toward a powered cell: priming at the end of the movement; TNT pulled by a sticky piston against a power source.
+region 4002 -58 4002 4010 -56 4007
+fill 4000 -60 4000 4015 -60 4015 minecraft:stone
+fill 4000 -59 4000 4015 -50 4015 minecraft:air
+kill @e[type=item,x=3995,y=-64,z=3995,dx=40,dy=40,dz=40]
+wait 200
+setblock 4003 -58 4003 minecraft:piston[facing=east]
+setblock 4004 -58 4003 minecraft:slime_block
+setblock 4004 -57 4003 minecraft:tnt
+setblock 4006 -57 4004 minecraft:redstone_block
+setblock 4003 -58 4006 minecraft:sticky_piston[facing=east]
+setblock 4004 -58 4006 minecraft:tnt
+setblock 4003 -57 4007 minecraft:redstone_block
+wait 5
+setblock 4002 -58 4003 minecraft:redstone_block
+tick 8
+setblock 4002 -58 4006 minecraft:redstone_block
+tick 6
+setblock 4002 -58 4006 minecraft:air
+tick 10

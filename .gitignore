@@ -1,0 +1,31 @@
+# Build
+/target/
+/target-*/
+**/*.rs.bk
+
+# Official resources and data: never in the repository
+*.jar
+*.class
+/captures/
+/reports/
+/cache/
+*.pcap
+*.mccap
+
+# Local: settings and tools of each person's environment
+/.claude/
+*.log
+*.rccap
+
+# Editors and system
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Python
+__pycache__/
+*.pyc

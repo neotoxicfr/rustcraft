@@ -1,0 +1,15 @@
+[package]
+name = "rc-testdata"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Shared access to the real out-of-repository data (version cache, reference capture) for tests and benches"
+
+[dependencies]
+rc-data.workspace = true
+rc-proto.workspace = true
+
+[lints]
+workspace = true

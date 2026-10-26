@@ -1,0 +1,38 @@
+[package]
+name = "rc-mesh"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Column meshing (baked models, fluids, visibility)"
+
+[dependencies]
+hashbrown = { workspace = true }
+rc-data.workspace = true
+rc-physics.workspace = true
+rc-world.workspace = true
+rc-assets.workspace = true
+
+[dev-dependencies]
+rc-testdata.workspace = true
+rc-proto.workspace = true
+rc-proto-v777.workspace = true
+criterion = { version = "0.8.2", default-features = false }
+mimalloc.workspace = true
+rayon.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+rc-data.workspace = true
+
+[[bench]]
+name = "mesh"
+harness = false
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "gpu_vis"
+harness = false

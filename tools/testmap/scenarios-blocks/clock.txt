@@ -1,0 +1,19 @@
+# Clock of 4 repeaters (delay 1) in a ring, started by a redstone block pulse.
+region 4000 -59 4000 4006 -59 4006
+fill 4000 -60 4000 4010 -60 4010 minecraft:stone
+fill 4000 -59 4000 4010 -55 4010 minecraft:air
+kill @e[type=item,x=3995,y=-64,z=3995,dx=40,dy=40,dz=40]
+wait 200
+setblock 4003 -59 4002 minecraft:repeater[facing=west,delay=1]
+setblock 4004 -59 4002 minecraft:redstone_wire
+setblock 4004 -59 4003 minecraft:repeater[facing=north,delay=1]
+setblock 4004 -59 4004 minecraft:redstone_wire
+setblock 4003 -59 4004 minecraft:repeater[facing=east,delay=1]
+setblock 4002 -59 4004 minecraft:redstone_wire
+setblock 4002 -59 4003 minecraft:repeater[facing=south,delay=1]
+setblock 4002 -59 4002 minecraft:redstone_wire
+wait 10
+setblock 4001 -59 4002 minecraft:redstone_block
+tick 2
+setblock 4001 -59 4002 minecraft:air
+tick 40

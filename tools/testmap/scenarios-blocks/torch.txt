@@ -1,0 +1,15 @@
+# Torch that powers itself through a repeater: oscillation, burnout at 8 toggles, recovery.
+region 4004 -59 4004 4007 -59 4008
+fill 4000 -60 4000 4015 -60 4015 minecraft:stone
+fill 4000 -59 4000 4015 -50 4015 minecraft:air
+kill @e[type=item,x=3995,y=-64,z=3995,dx=40,dy=40,dz=40]
+wait 200
+setblock 4005 -59 4005 minecraft:stone
+setblock 4006 -59 4006 minecraft:redstone_wire
+setblock 4006 -59 4007 minecraft:redstone_wire
+setblock 4005 -59 4007 minecraft:redstone_wire
+setblock 4005 -59 4006 minecraft:repeater[facing=south,delay=1]
+wait 10
+setblock 4006 -59 4005 minecraft:redstone_wall_torch[facing=east]
+tick 80
+tick 130

@@ -1,0 +1,26 @@
+[package]
+name = "rc-net"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Transport: frame delimiting, compression, encryption"
+
+[dependencies]
+rc-proto.workspace = true
+thiserror.workspace = true
+aes.workspace = true
+libdeflater.workspace = true
+rayon.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false }
+flate2.workspace = true
+
+[[bench]]
+name = "transport"
+harness = false

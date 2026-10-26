@@ -1,0 +1,18 @@
+[package]
+name = "rc-physics"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Faithful-to-the-game physics of the local player (docs/specs/movement.md): inputs, collisions, jump, flight, water"
+
+[dependencies]
+hashbrown = { workspace = true }
+rc-data.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+rc-testdata.workspace = true

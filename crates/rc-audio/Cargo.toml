@@ -1,0 +1,29 @@
+[package]
+name = "rc-audio"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Audio engine: sounds.json, Ogg Vorbis decoding, software mixer, cpal output"
+
+[dependencies]
+hashbrown = { workspace = true }
+rc-assets.workspace = true
+# Single read of the environment variables (rc_data::env_flag!), already pulled in by rc-assets.
+rc-data.workspace = true
+serde_json.workspace = true
+crossbeam-channel.workspace = true
+lewton = "0.10.2"
+cpal = "0.18.2"
+rtrb = "0.4.0"
+
+[dev-dependencies]
+rc-testdata.workspace = true
+# mix_bench bench: mixing split across several threads.
+rayon.workspace = true
+# vorbis_compare bench: symphonia's Vorbis decoder compared with lewton (not used outside the bench).
+symphonia = { version = "0.5.4", default-features = false, features = ["ogg", "vorbis"] }
+
+[lints]
+workspace = true

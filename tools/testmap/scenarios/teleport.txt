@@ -1,0 +1,11 @@
+# Teleports relative to the player (the "~" of a lone RCON command is relative to the
+# console, placed at the spawn point: go through "execute as … at @s").
+gamemode creative Rustcraft
+tp Rustcraft 0.5 -59 0.5 0 0
+sleep 3
+execute as Rustcraft at @s run tp @s ~ ~5 ~
+sleep 3
+execute as Rustcraft at @s run tp @s ~3 ~ ~-2
+sleep 3
+execute as Rustcraft at @s run tp @s ~ ~ ~ ~90 ~
+sleep 3

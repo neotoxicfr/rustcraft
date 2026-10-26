@@ -1,0 +1,23 @@
+name: Idea or optimisation
+description: Suggest a missing feature or a performance lead.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: The need
+      description: What is missing, or what is slow, and in which situation.
+    validations:
+      required: true
+  - type: textarea
+    id: approach
+    attributes:
+      label: The approach
+      description: How you would tackle it. For an optimisation, a starting measurement helps a lot.
+  - type: checkboxes
+    id: clean-room
+    attributes:
+      label: Clean room
+      options:
+        - label: My proposal does not require bringing in any Mojang code or resource.
+          required: true
