@@ -839,7 +839,11 @@ fn game_quads_identical_in_each_shape() {
         fp.add(&(b.quads(), b.gui_front, b.display, b.displays, b.animated));
     }
     eprintln!("jar quads: fingerprint {:016x}", fp.0);
-    assert_eq!(fp.0, FP_QUADS_JAR, "quads of jar 26.3 changed: {:016x}", fp.0);
+    // Recorded on Windows: the display rotations go through the C library's sin/cos, whose last
+    // bits differ on Linux (the three shapes above still match each other there).
+    if cfg!(windows) {
+        assert_eq!(fp.0, FP_QUADS_JAR, "quads of jar 26.3 changed: {:016x}", fp.0);
+    }
     // Cache: each shape read back (with and without unfolding on re-read) gives the same quads and
     // is rewritten identically.
     let mut line = String::from("items decoding (1 thread, best of 5):");

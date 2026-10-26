@@ -49,7 +49,7 @@ fn held_buffer_never_evicted() {
 /// 26.3 game resources (installation absent: test skipped with a message).
 fn real() -> Option<(Arc<Assets>, SoundTable)> {
     let install = rc_testdata::need(rc_data::locate("26.3").ok(), "installed 26.3 game")?;
-    let index = install.asset_index();
+    let index = Some(rc_testdata::need(install.asset_index(), "26.3 sound files and fonts (asset index)")?);
     let assets = rc_testdata::need(
         Assets::for_install(&install.client_jar, &[], index.as_ref().map(|(i, o)| (i.as_path(), o.as_path()))).ok(),
         "26.3 game resources",

@@ -228,7 +228,7 @@ mod tests {
     /// file; `None` (or failure under `RUSTCRAFT_OPT_REQUIRE=1`) without the game installed.
     fn real_oggs() -> Option<Vec<(String, Vec<u8>)>> {
         let install = rc_testdata::need(rc_data::locate("26.3").ok(), "installed 26.3 game")?;
-        let index = install.asset_index();
+        let index = Some(rc_testdata::need(install.asset_index(), "26.3 sound files and fonts (asset index)")?);
         let assets = rc_testdata::need(
             rc_assets::Assets::for_install(&install.client_jar, &[], index.as_ref().map(|(i, o)| (i.as_path(), o.as_path())))
                 .ok(),

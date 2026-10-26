@@ -666,7 +666,8 @@ mod tests {
     #[test]
     fn indexed_pick_matches_recursive_pick_vanilla() {
         let Some(install) = rc_testdata::need(rc_data::locate("26.3").ok(), "installed 26.3 game") else { return };
-        let index = install.asset_index();
+        let Some(index) = rc_testdata::need(install.asset_index(), "26.3 sound files and fonts (asset index)") else { return };
+        let index = Some(index);
         let Some(assets) = rc_testdata::need(
             rc_assets::Assets::for_install(&install.client_jar, &[], index.as_ref().map(|(i, o)| (i.as_path(), o.as_path())))
                 .ok(),

@@ -1859,7 +1859,12 @@ mod tests {
             s.running = Some(Running::Backup(th, "w".into(), Some(After::ToList)));
             let out = s.tick(&lang());
             assert_eq!(s.stack.len(), 1, "copy {ok}: back to the list");
-            assert!(matches!(s.stack.last(), Some(Scr::List(_))));
+            // The list is read again from the game folder: without any world, creation opens instead.
+            if scan(&crate::servers::game_dir()).is_empty() {
+                assert!(matches!(s.stack.last(), Some(Scr::Create(_))));
+            } else {
+                assert!(matches!(s.stack.last(), Some(Scr::List(_))));
+            }
             let key = if ok { "selectWorld.edit.backupCreated" } else { "selectWorld.edit.backupFailed" };
             assert!(
                 out.iter().any(|o| matches!(o, Out::Toast(b) if matches!(&b.0.content, rc_text::Content::Translate { key: k, .. } if k == key))),

@@ -1490,7 +1490,7 @@ mod tests {
     /// Engine without a device on the real resources; `None` without a 26.3 installation.
     fn engine() -> Option<AudioEngine> {
         let install = rc_testdata::need(rc_data::locate("26.3").ok(), "installed 26.3 game")?;
-        let index = install.asset_index();
+        let index = Some(rc_testdata::need(install.asset_index(), "26.3 sound files and fonts (asset index)")?);
         let assets = rc_testdata::need(
             Assets::for_install(&install.client_jar, &[], index.as_ref().map(|(i, o)| (i.as_path(), o.as_path())))
                 .ok(),
