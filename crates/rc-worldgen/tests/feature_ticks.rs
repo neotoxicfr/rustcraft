@@ -5,15 +5,13 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 
 use rc_worldgen::chunkgen::{DimGen, GenSpec, SourceSpec, WorldData};
 use rc_worldgen::decor_blocks::State;
 use rc_worldgen::decor_region::{DecoChunk, FLUID_TICK_NAMES, Region};
 
 fn overworld() -> DimGen {
-    let mc = std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join(".minecraft")).expect("APPDATA");
-    let jar = mc.join("versions").join("26.3").join("26.3.jar");
+    let jar = rc_data::locate("26.3").expect("installed game 26.3").client_jar;
     assert!(jar.is_file(), "jar 26.3 absent : {}", jar.display());
     let v = rc_data::load_cached("26.3").expect("cache rc-data 26.3");
     let reports = rc_data::cache_root().join("26.3").join("generated").join("reports");
@@ -315,8 +313,7 @@ fn fortress_lava_well_ticks_lava() {
     use rc_worldgen::structure::Piece;
     use rc_worldgen::structure_coded::CodedPiece;
     use rc_worldgen::structure_fortress::FKind;
-    let mc = std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join(".minecraft")).expect("APPDATA");
-    let jar = mc.join("versions").join("26.3").join("26.3.jar");
+    let jar = rc_data::locate("26.3").expect("installed game 26.3").client_jar;
     let v = rc_data::load_cached("26.3").expect("cache rc-data 26.3");
     let reports = rc_data::cache_root().join("26.3").join("generated").join("reports");
     let w = WorldData::load(&jar, Some(&reports), &v).expect("world data");

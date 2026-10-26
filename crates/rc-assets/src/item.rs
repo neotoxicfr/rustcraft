@@ -2583,9 +2583,7 @@ mod tests {
                 "ground"
             }
         }
-        #[allow(clippy::disallowed_methods)]
-        let jar = std::path::PathBuf::from(std::env::var_os("APPDATA").expect("APPDATA"))
-            .join(".minecraft/versions/26.3/26.3.jar");
+        let jar = rc_data::locate("26.3").expect("installed game 26.3").client_jar;
         let assets = crate::Assets::for_install(&jar, &[], None).expect("installed game 26.3 jar");
         let want = [
             ("minecraft:enchanted_golden_apple", "minecraft:item/golden_apple"),

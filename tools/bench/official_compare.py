@@ -293,7 +293,9 @@ def run_one(a, game, scene, rd, out):
     env = dict(os.environ)
     if game == "rustcraft":
         # The performance log is what prints the "in game" line used to place the flight window.
-        env.update({"RUSTCRAFT_GAME_DIR": game_dir, "RUSTCRAFT_SOLO": "perf", "RUSTCRAFT_VSYNC": "0",
+        # Own cache: an older build under test must not rewrite the one of the installed game.
+        env.update({"RUSTCRAFT_GAME_DIR": game_dir, "RUSTCRAFT_CACHE": os.path.join(a.out, "cache"),
+                    "RUSTCRAFT_SOLO": "perf", "RUSTCRAFT_VSYNC": "0",
                     "RUSTCRAFT_LAN_BIND": "127.0.0.1", "RUSTCRAFT_PERFLOG": os.path.join(out, "frames-internal.txt")})
         w, h = a.size.split("x")
         cmd = [a.rustcraft, "--username", NAME, "--width", w, "--height", h]

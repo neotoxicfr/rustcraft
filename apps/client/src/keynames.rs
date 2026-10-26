@@ -836,6 +836,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     fn label(name: &str) -> String {
         keyboard_label(&format!("key.keyboard.{name}")).unwrap_or_else(|k| format!("<{k}>"))
     }
