@@ -29,6 +29,7 @@ jobs:
         # Linux on 22.04: the binary then needs glibc 2.35 or newer.
         os: [windows-latest, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
       - name: Linux build dependencies

@@ -285,17 +285,13 @@ impl Ambience {
 mod tests {
     use super::*;
 
-    /// Engine without a device on the real resources; `None` without a 26.3 installation.
+    /// Engine without a device on the real resources; `None` without a 26.3 installation and its
+    /// sound files (asset index: the music never starts without them, the loops below would not end).
     fn engine() -> Option<AudioEngine> {
         let install = rc_testdata::need(rc_data::locate("26.3").ok(), "installed 26.3 game")?;
-        let index = install.asset_index();
+        let (index, objects) = rc_testdata::need(install.asset_index(), "26.3 sound files (asset index)")?;
         let assets = rc_testdata::need(
-            rc_assets::Assets::for_install(
-                &install.client_jar,
-                &[],
-                index.as_ref().map(|(i, o)| (i.as_path(), o.as_path())),
-            )
-            .ok(),
+            rc_assets::Assets::for_install(&install.client_jar, &[], Some((index.as_path(), objects.as_path()))).ok(),
             "26.3 game resources",
         )?;
         let table = crate::SoundTable::load(&[&assets]);

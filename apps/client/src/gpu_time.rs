@@ -704,7 +704,9 @@ mod tests {
                 ..Default::default()
             }))
             .ok();
-            let adapter = rc_testdata::need(adapter, "GPU adapter")?;
+            // A software adapter (WARP, llvmpipe) is not the real GPU these proofs are about.
+            let hardware = adapter.filter(|a| a.get_info().device_type != wgpu::DeviceType::Cpu);
+            let adapter = rc_testdata::need(hardware, "hardware GPU adapter")?;
             let wanted = wgpu::Features::TIMESTAMP_QUERY
                 | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
                 | wgpu::Features::PIPELINE_STATISTICS_QUERY;
