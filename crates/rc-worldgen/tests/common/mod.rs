@@ -44,7 +44,7 @@ pub fn hex_f32(s: &str) -> f32 {
 }
 
 /// Game data: installed client jar (`RUSTCRAFT_MC_DIR` or `%APPDATA%\.minecraft`) and official
-/// reports (`%LOCALAPPDATA%\rustcraft-re\26.3\reports\reports`, or the rc-data cache).
+/// reports (`%LOCALAPPDATA%\rustcraft-re\26.3\reports\reports`, or the rc-data cache, `RUSTCRAFT_CACHE`).
 pub fn data_pack() -> Option<rc_worldgen::data::DataPack> {
     use std::sync::OnceLock;
     static PACK: OnceLock<Option<rc_worldgen::data::DataPack>> = OnceLock::new();
@@ -54,7 +54,7 @@ pub fn data_pack() -> Option<rc_worldgen::data::DataPack> {
         let local = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_default());
         let candidates = [
             local.join("rustcraft-re").join("26.3").join("reports").join("reports"),
-            local.join("rustcraft").join("cache").join("26.3").join("generated").join("reports"),
+            rc_data::cache_root().join("26.3").join("generated").join("reports"),
         ];
         if let Some(r) = candidates.iter().find(|p| p.join("biome_parameters").is_dir()) {
             pack.add_reports(r).expect("reports");
