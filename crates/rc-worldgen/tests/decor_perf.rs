@@ -3,7 +3,6 @@
 //! decor_perf -- --ignored --nocapture`.
 #![allow(clippy::disallowed_methods)]
 
-use std::path::PathBuf;
 use std::time::Instant;
 
 use rc_worldgen::chunkgen::{DimGen, GenSpec, SourceSpec, WorldData};
@@ -12,8 +11,7 @@ use rc_worldgen::decor_region::DecoChunk;
 #[test]
 #[ignore = "benchmark"]
 fn decorate_7x7_timing() {
-    let mc = std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join(".minecraft")).expect("APPDATA");
-    let jar = mc.join("versions").join("26.3").join("26.3.jar");
+    let jar = rc_data::locate("26.3").expect("installed game 26.3").client_jar;
     let v = rc_data::load_cached("26.3").expect("cache rc-data 26.3");
     let reports = rc_data::cache_root().join("26.3").join("generated").join("reports");
     let w = WorldData::load(&jar, Some(&reports), &v).expect("world data");

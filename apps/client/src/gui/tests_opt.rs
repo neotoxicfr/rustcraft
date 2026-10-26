@@ -43,7 +43,9 @@ fn env() -> Option<Env> {
         ..Default::default()
     }))
     .ok();
-    let adapter = rc_testdata::need(adapter, "GPU adapter")?;
+    // A software adapter (WARP, llvmpipe) is not the real GPU these proofs are about.
+    let hardware = adapter.filter(|a| a.get_info().device_type != wgpu::DeviceType::Cpu);
+    let adapter = rc_testdata::need(hardware, "hardware GPU adapter")?;
     eprintln!("GPU : {} ({:?})", adapter.get_info().name, adapter.get_info().backend);
     let (device, queue) =
         pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).expect("device");

@@ -5,7 +5,6 @@
 //! `RUSTCRAFT_OPT_REQUIRE=1` (explicit failure). The expected fingerprints were taken with the
 //! code from before laziness (read / release / compute / insert pattern).
 
-use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use crate::chunkgen::{DimGen, FlatSpec, GenSpec, SourceSpec, WorldData};
@@ -20,8 +19,7 @@ pub(crate) fn world_data() -> Option<&'static WorldData> {
     static W: OnceLock<Option<WorldData>> = OnceLock::new();
     let w = W
         .get_or_init(|| {
-            let mc = std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join(".minecraft"))?;
-            let jar = mc.join("versions").join("26.3").join("26.3.jar");
+            let jar = rc_data::locate("26.3").ok()?.client_jar;
             if !jar.is_file() {
                 return None;
             }

@@ -374,8 +374,7 @@ fn pipeline_check(prefix: &str, settings: &str, dimension: &str) {
         return;
     }
     let Some(w) = world() else { return };
-    let mc = std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join(".minecraft")).unwrap();
-    let jar = mc.join("versions").join("26.3").join("26.3.jar");
+    let jar = rc_data::locate("26.3").expect("installed game 26.3").client_jar;
     let v = rc_data::load_or_prepare("26.3", |m| eprintln!("rc-data : {m}")).expect("rc-data");
     let reports = rc_data::cache_root().join("26.3").join("generated").join("reports");
     let wd = rc_worldgen::chunkgen::WorldData::load(&jar, Some(&reports), &v).unwrap();

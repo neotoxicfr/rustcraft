@@ -44,10 +44,12 @@ cargo clippy --release --workspace
 cargo test --release --workspace
 ```
 
-Clippy must report no warning in the files you touched. Tests that need a game installation skip
-themselves if they cannot find one. The project is developed on Windows; on Linux you also need the
+Clippy must report no warning in the files you touched. Most tests compare with the official game's
+data: install 26.3 with the official launcher (or point `RUSTCRAFT_MC_DIR` to a game folder), then
+prepare the data once with `cargo run --release -p rc-data --example prepare -- 26.3`. The project
+is developed on Windows; on Linux you also need the
 ALSA and udev development packages, and code specific to one system goes behind `#[cfg(...)]` with a
-version for the others.
+version for the others. The CI runs the same clippy and tests on Windows and Linux for every PR.
 
 ## Style
 
@@ -63,5 +65,11 @@ version for the others.
 Open an issue with the matching template. For a difference with the official game, describe what the
 game does, what Rustcraft does, and how to reproduce it (server, version, commands). For a security
 flaw, do not open a public issue: follow [SECURITY.md](SECURITY.md).
+
+## Releases (maintainers)
+
+Pushing a tag `vX.Y.Z` on `main` runs the Release workflow: it builds Windows and Linux and
+publishes the release with an empty body. The notes are written by hand, by theme (what changes for
+the player), then added with `gh release edit vX.Y.Z --notes-file <file>`.
 
 By taking part, you accept the [code of conduct](CODE_OF_CONDUCT.md).

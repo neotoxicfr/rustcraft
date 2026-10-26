@@ -18,10 +18,7 @@ pub fn ref_dir() -> Option<PathBuf> {
 /// Installed client jar 26.3 (`RUSTCRAFT_MC_DIR` or `%APPDATA%\.minecraft`); `None` (test skipped)
 /// if missing, failure under `RUSTCRAFT_OPT_REQUIRE=1`.
 pub fn client_jar() -> Option<PathBuf> {
-    let mc = std::env::var_os("RUSTCRAFT_MC_DIR")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join(".minecraft")));
-    let jar = mc.map(|m| m.join("versions").join("26.3").join("26.3.jar"));
+    let jar = rc_data::locate("26.3").ok().map(|i| i.client_jar);
     rc_testdata::need(jar.filter(|j| j.is_file()), "jar client 26.3")
 }
 
@@ -47,7 +44,7 @@ pub fn hex_f32(s: &str) -> f32 {
 }
 
 /// Game data: installed client jar (`RUSTCRAFT_MC_DIR` or `%APPDATA%\.minecraft`) and official
-/// reports (`%LOCALAPPDATA%\rustcraft-re\26.3\reports\reports`, or the rc-data cache).
+/// reports (`%LOCALAPPDATA%\rustcraft-re\26.3\reports\reports`, or the rc-data cache, `RUSTCRAFT_CACHE`).
 pub fn data_pack() -> Option<rc_worldgen::data::DataPack> {
     use std::sync::OnceLock;
     static PACK: OnceLock<Option<rc_worldgen::data::DataPack>> = OnceLock::new();
@@ -57,7 +54,7 @@ pub fn data_pack() -> Option<rc_worldgen::data::DataPack> {
         let local = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_default());
         let candidates = [
             local.join("rustcraft-re").join("26.3").join("reports").join("reports"),
-            local.join("rustcraft").join("cache").join("26.3").join("generated").join("reports"),
+            rc_data::cache_root().join("26.3").join("generated").join("reports"),
         ];
         if let Some(r) = candidates.iter().find(|p| p.join("biome_parameters").is_dir()) {
             pack.add_reports(r).expect("reports");

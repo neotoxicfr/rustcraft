@@ -370,7 +370,9 @@ pub(crate) mod tests {
             ..Default::default()
         }))
         .ok();
-        let adapter = rc_testdata::need(adapter, "GPU adapter")?;
+        // A software adapter (WARP, llvmpipe) is not the real GPU these proofs are about.
+        let hardware = adapter.filter(|a| a.get_info().device_type != wgpu::DeviceType::Cpu);
+        let adapter = rc_testdata::need(hardware, "hardware GPU adapter")?;
         // Blend of float targets requested if it exists, like the client (improved transparency).
         let required_features = adapter.features() & wgpu::Features::FLOAT32_BLENDABLE;
         let desc = wgpu::DeviceDescriptor { required_features, ..Default::default() };

@@ -467,7 +467,8 @@ mod tests {
     fn respar_real_assets_identical_cold() {
         let install = rc_data::locate("26.3").expect("installation 26.3 absent: test impossible");
         let data = rc_data::load_or_prepare("26.3", |_| {}).expect("26.3 data absent: test impossible");
-        let index = install.asset_index();
+        let Some(index) = rc_testdata::need(install.asset_index(), "26.3 sound files and fonts (asset index)") else { return };
+        let index = Some(index);
         let index = index.as_ref().map(|(i, o)| (i.as_path(), o.as_path()));
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-tmp");
         let run = |par: bool| {

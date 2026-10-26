@@ -696,19 +696,22 @@ mod tests {
 }";
 
     impl Bench {
-        fn new() -> Bench {
+        fn new() -> Option<Bench> {
             crate::render::upload::tests::gpu_serial();
             let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
             let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 ..Default::default()
             }))
-            .expect("no GPU adapter: the proof on a real GPU cannot run");
+            .ok();
+            // A software adapter (WARP, llvmpipe) is not the real GPU these proofs are about.
+            let hardware = adapter.filter(|a| a.get_info().device_type != wgpu::DeviceType::Cpu);
+            let adapter = rc_testdata::need(hardware, "hardware GPU adapter")?;
             let wanted = wgpu::Features::TIMESTAMP_QUERY
                 | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
                 | wgpu::Features::PIPELINE_STATISTICS_QUERY;
             let features = adapter.features() & wanted;
-            assert!(features.contains(wgpu::Features::TIMESTAMP_QUERY), "adapter without timestamps");
+            rc_testdata::need(features.contains(wgpu::Features::TIMESTAMP_QUERY).then_some(()), "GPU with timestamps")?;
             eprintln!("GPU: {} ({:?}), features {features:?}", adapter.get_info().name, adapter.get_info().backend);
             let (device, queue) = pollster::block_on(
                 adapter.request_device(&wgpu::DeviceDescriptor { required_features: features, ..Default::default() }),
@@ -755,7 +758,7 @@ mod tests {
                 view_formats: &[],
             });
             let view = target.create_view(&Default::default());
-            Bench { device, queue, pipeline, target, view }
+            Some(Bench { device, queue, pipeline, target, view })
         }
 
         fn wait(&self) {
@@ -849,7 +852,7 @@ mod tests {
     /// of the passes ≤ total, number of named passes, overdraw of the "world" pass = 1.
     #[test]
     fn gpu_same_pixels_and_sum_fits_in_total() {
-        let b = Bench::new();
+        let Some(b) = Bench::new() else { return };
         b.frame(None);
         let reference = b.pixels();
         let encoder_ok = b.device.features().contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
@@ -914,7 +917,7 @@ mod tests {
     /// alone, without an empty submit; callback that never marks the slot as read).
     #[test]
     fn no_poll_delivers_at_next_submit() {
-        let b = Bench::new();
+        let Some(b) = Bench::new() else { return };
         const FRAMES: u32 = 40;
         let mut seen: Vec<Vec<u32>> = Vec::new();
         for poll in [true, false] {
@@ -946,7 +949,7 @@ mod tests {
     #[test]
     #[ignore = "bench"]
     fn bench_gpu_time() {
-        let b = Bench::new();
+        let Some(b) = Bench::new() else { return };
         let run = |mut t: Option<GpuTimer>| {
             for _ in 0..30 {
                 b.frame(t.as_mut());

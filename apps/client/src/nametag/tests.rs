@@ -279,7 +279,9 @@ fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
         ..Default::default()
     }))
     .ok();
-    let adapter = rc_testdata::need(adapter, "GPU adapter")?;
+    // A software adapter (WARP, llvmpipe) is not the real GPU these proofs are about.
+    let hardware = adapter.filter(|a| a.get_info().device_type != wgpu::DeviceType::Cpu);
+    let adapter = rc_testdata::need(hardware, "hardware GPU adapter")?;
     // Blended float targets: improved transparency stages.
     let blend = adapter.features().contains(wgpu::Features::FLOAT32_BLENDABLE);
     rc_testdata::need(blend.then_some(()), "float target blending (FLOAT32_BLENDABLE)")?;
