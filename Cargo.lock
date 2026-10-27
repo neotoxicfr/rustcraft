@@ -1035,7 +1035,6 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash",
- "rayon",
 ]
 
 [[package]]
@@ -1044,7 +1043,10 @@ version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash",
+ "rayon",
 ]
 
 [[package]]
@@ -2253,7 +2255,7 @@ dependencies = [
  "bytemuck",
  "crossbeam-channel",
  "glam",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
  "log",
  "mimalloc",
  "naga",
@@ -2289,7 +2291,7 @@ version = "0.1.0"
 dependencies = [
  "ab_glyph_rasterizer",
  "flate2",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
  "mimalloc",
  "png",
  "rayon",
@@ -2307,7 +2309,7 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "crossbeam-channel",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
  "lewton",
  "rayon",
  "rc-assets",
@@ -2334,7 +2336,7 @@ dependencies = [
  "base64",
  "crossbeam-channel",
  "getrandom 0.4.3",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
  "ipconfig",
  "md-5",
  "mimalloc",
@@ -2359,7 +2361,7 @@ dependencies = [
 name = "rc-commands"
 version = "0.1.0"
 dependencies = [
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
  "rc-data",
  "rc-proto",
  "rc-proto-v777",
@@ -2372,7 +2374,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "fancy-regex",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
  "memmap2",
  "mimalloc",
  "rayon",
@@ -2396,7 +2398,7 @@ name = "rc-light"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
  "mimalloc",
  "rayon",
  "rc-data",
@@ -2412,7 +2414,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "criterion",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
  "mimalloc",
  "pollster",
  "rayon",
@@ -2443,7 +2445,7 @@ dependencies = [
 name = "rc-physics"
 version = "0.1.0"
 dependencies = [
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
  "rc-data",
  "rc-testdata",
 ]
@@ -2478,7 +2480,7 @@ dependencies = [
  "crossbeam-channel",
  "flate2",
  "getrandom 0.4.3",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
  "mimalloc",
  "rand_core 0.10.1",
  "rayon",
@@ -2514,7 +2516,7 @@ dependencies = [
 name = "rc-text"
 version = "0.1.0"
 dependencies = [
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
  "rc-data",
  "rc-proto",
  "serde_json",
@@ -2534,7 +2536,7 @@ name = "rc-worldgen"
 version = "0.1.0"
 dependencies = [
  "flate2",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
  "md-5",
  "rayon",
  "rc-data",

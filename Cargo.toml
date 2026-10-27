@@ -16,7 +16,7 @@ flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] 
 aes = "0.9.3"
 libdeflater = "1.26.1"
 serde_json = "1"
-hashbrown = { version = "0.16.1", features = ["rayon"] }
+hashbrown = { version = "0.17.1", features = ["rayon"] }
 ureq = "3.4.2"
 ring = "0.17.14"
 getrandom = { version = "0.4.3", features = ["sys_rng"] }
