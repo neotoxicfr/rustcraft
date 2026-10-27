@@ -628,6 +628,10 @@ out-of-range voices play at gain 0 in OpenAL, so it is up to the mixer to skip t
   different length for 206 (end of stream), 109,822 samples at ±1. Ruled out (output
   changed). Neither is the game's decoder (stb_vorbis through LWJGL): if one day we
   compare with the game, choose the one that resembles it most, and only then speed.
+  Re-measured with symphonia 0.6.1 (27/10/2026, quiet machine, same 552 sounds): 7.5 ns per
+  sample against 14.0 (×1.88); PCM identical for 10 sounds, different length for 337 (0.6 trims
+  the end padding from the granule position, gapless decoding being the default; without it, it
+  also returns the 128 priming samples lewton drops), 109,822 samples at ±1. Still ruled out.
 
 ### Mobs: id/UUID/species index, push and dimensions (C6-M07, 22/10/2026, loaded machine)
 

@@ -23,7 +23,7 @@ rc-testdata.workspace = true
 # mix_bench bench: mixing split across several threads.
 rayon.workspace = true
 # vorbis_compare bench: symphonia's Vorbis decoder compared with lewton (not used outside the bench).
-symphonia = { version = "0.5.4", default-features = false, features = ["ogg", "vorbis"] }
+symphonia = { version = "0.6.1", default-features = false, features = ["ogg", "vorbis"] }
 
 [lints]
 workspace = true

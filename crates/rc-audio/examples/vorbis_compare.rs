@@ -4,37 +4,33 @@
 
 use std::time::Instant;
 
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::DecoderOptions;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::codecs::audio::AudioDecoderOptions;
+use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 
 fn symphonia_pcm(bytes: Vec<u8>) -> Option<Vec<i16>> {
     let mss = MediaSourceStream::new(Box::new(std::io::Cursor::new(bytes)), Default::default());
     let mut hint = Hint::new();
     hint.with_extension("ogg");
-    let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+    let mut format = symphonia::default::get_probe()
+        .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
         .ok()?;
-    let mut format = probed.format;
-    let track = format.default_track()?;
+    let track = format.default_track(TrackType::Audio)?;
     let id = track.id;
-    let mut dec = symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default()).ok()?;
+    let opts = AudioDecoderOptions::default();
+    let mut dec = symphonia::default::get_codecs().make_audio_decoder(track.codec_params.as_ref()?.audio()?, &opts).ok()?;
     let mut out = Vec::new();
-    let mut buf: Option<SampleBuffer<i16>> = None;
-    while let Ok(pkt) = format.next_packet() {
-        if pkt.track_id() != id {
+    let mut buf = Vec::new();
+    while let Ok(Some(pkt)) = format.next_packet() {
+        if pkt.track_id != id {
             continue;
         }
         let Ok(d) = dec.decode(&pkt) else { break };
-        let b = buf.get_or_insert_with(|| SampleBuffer::new(d.capacity() as u64, *d.spec()));
-        if b.capacity() < d.capacity() * d.spec().channels.count() {
-            *b = SampleBuffer::new(d.capacity() as u64, *d.spec());
-        }
-        b.copy_interleaved_ref(d);
-        out.extend_from_slice(b.samples());
+        buf.resize(d.samples_interleaved(), 0i16);
+        d.copy_to_slice_interleaved(&mut buf);
+        out.extend_from_slice(&buf);
     }
     Some(out)
 }
