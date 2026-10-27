@@ -1,0 +1,7 @@
+# cargo audit settings.
+[advisories]
+# RUSTSEC-2023-0071 (rsa, "Marvin": timing of private-key operations, no fixed version yet).
+# The client only uses `rsa` for the public-key encryption of the login handshake; its one
+# private-key operation, chat signing, goes through `ring`. Private keys of the `rsa` crate only
+# exist in tests and in the mock server example.
+ignore = ["RUSTSEC-2023-0071"]
