@@ -17,7 +17,7 @@ flate2.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
 # TrueType fonts from packs: outlines fitted to the grid (like FreeType), and coverage.
-skrifa = "0.44.0"
+skrifa = "0.49.0"
 ab_glyph_rasterizer = "0.1.10"
 
 [dev-dependencies]
