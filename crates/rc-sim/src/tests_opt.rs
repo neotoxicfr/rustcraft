@@ -34,7 +34,12 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// by removing it).
 /// G5-F02a: resting fire of the player at −20 after each crossed-block pass (saved in
 /// `Fire`), the only cause of the change of the new world (checked by disabling that reset alone).
-const EXPECTED_NEW: (&str, usize) = ("267b491ae69d2532cb5445a339735d783b91a1d0f77d089a749a81a72955a51e", 815);
+/// G5-F02b: entity sound seeds drawn from the sound generator (not from the mobs' world random
+/// source): spawns and finalizations no longer move with the number of sounds played.
+/// G5-F02b review: flyers with an empty fall check (bat, parrot, bee, allay, ghasts, phantom) no
+/// longer accumulate a fall (saved field), the only cause of the change (checked by restoring the
+/// old accumulation: b7433a1e…, 823).
+const EXPECTED_NEW: (&str, usize) = ("c855a20f62d2683f7c7559f09935ba7f01003874c8b6ad7a6c4aadf76e7fac5c", 823);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 const EXPECTED_MODEL: &[(&str, &str, usize)] = &[(
     "790b2d94653a4243e68f2e0cb0ebc3f865f9f59815ed65149067cdd374c6b800",
@@ -175,7 +180,7 @@ fn run_new() -> Option<Vec<(String, String)>> {
 }
 
 /// Expected fingerprint of the "mechanisms" site: (total, number of files).
-const EXPECTED_MECH: (&str, usize) = ("b80e1b0b933e73f561d29f9ad88917ff47e07bfd0e10a80c19369f5eac7414e7", 380);
+const EXPECTED_MECH: (&str, usize) = ("cd8c1083235a728b4b38164674636d153c1031a8e0fedfdba4eb2597f50bf5b5", 378);
 
 /// Server command (refusal = failure: the rig would be incomplete).
 pub(crate) fn cmd(s: &mut Server, c: &str) {
@@ -316,7 +321,7 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 }
 
 /// Expected fingerprint of all the regions after closing: (total, number of chunks).
-const EXPECTED_REGIONS: (&str, usize) = ("180f852f7cea8f9b590faae0ee7c7a04f5e846b3f38779f244430e5c3c45ae15", 1249);
+const EXPECTED_REGIONS: (&str, usize) = ("63579824deb6d5f45105e81be2104b8d10964c857279ceb2bf661ba833f0c858", 1254);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all
 /// dimensions): SHA-256 of the decompressed NBT per chunk. Sector locations and

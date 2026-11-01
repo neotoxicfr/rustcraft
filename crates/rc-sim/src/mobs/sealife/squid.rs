@@ -46,6 +46,7 @@ pub fn register(m: &mut Mob) {
 /// the glow squid counts down its darkening (and draws three doubles for its glows).
 pub fn post_ai_step(s: &mut Server, m: &mut Mob) {
     let drag = (1.0 - (1.0 - 0.98f32) * m.air_drag_modifier()).clamp(0.0, 1.0);
+    let gravity = m.gravity(); // zero with NoGravity
     let sq = &mut m.sea.squid;
     sq.x_rot_o = sq.x_rot;
     sq.z_rot_o = sq.z_rot;
@@ -87,7 +88,7 @@ pub fn post_ai_step(s: &mut Server, m: &mut Mob) {
         let mut yd = m.vel[1];
         match m.x.effects.iter().find(|e| e.id == "minecraft:levitation") {
             Some(e) => yd = 0.05 * f64::from(e.amp + 1),
-            None => yd -= m.attrs.gravity.value(),
+            None => yd -= gravity,
         }
         m.vel = [0.0, yd * f64::from(drag), 0.0];
         sq.x_rot += (-90.0 - sq.x_rot) * 0.02;

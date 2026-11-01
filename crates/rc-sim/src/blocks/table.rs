@@ -228,6 +228,9 @@ pub(crate) struct Ids {
     pub sand: u16,
     pub red_sand: u16,
     pub magma: u16,
+    /// Redstone ores (lit when walked on).
+    pub redstone_ore: u16,
+    pub deepslate_redstone_ore: u16,
     /// Sculk sensors (normal, calibrated): "walked on" test of each entity on the ground.
     pub sculk_sensor: u16,
     pub calibrated_sculk_sensor: u16,
@@ -619,6 +622,8 @@ impl Table {
             sand: f("sand"),
             red_sand: f("red_sand"),
             magma: f("magma_block"),
+            redstone_ore: f("redstone_ore"),
+            deepslate_redstone_ore: f("deepslate_redstone_ore"),
             sculk_sensor: f("sculk_sensor"),
             calibrated_sculk_sensor: f("calibrated_sculk_sensor"),
             kelp: f("kelp"),

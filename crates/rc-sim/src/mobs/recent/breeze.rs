@@ -353,7 +353,7 @@ fn jump_vector(m: &Mob, target: [f64; 3], max_v: f32, angle: i32) -> Option<[f64
     let r2 = d[0] * d[0] + d[2] * d[2];
     let r = r2.sqrt();
     let y = d[1];
-    let g = m.attrs.gravity.value();
+    let g = m.gravity();
     let sin2 = f64::from(2.0 * ang).sin();
     let cos_sq = f64::from(ang).cos().powi(2);
     let (s_a, c_a) = (f64::from(ang).sin(), f64::from(ang).cos());

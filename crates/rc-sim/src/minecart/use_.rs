@@ -12,16 +12,6 @@ use crate::mobs::recent::vibration::Src;
 use crate::player::Stack;
 use crate::server::Server;
 
-/// Horizontal direction (south, west, north, east) of a yaw.
-pub(crate) fn direction_of(yaw: f32) -> [i32; 2] {
-    match ((f64::from(yaw) / 90.0 + 0.5).floor() as i32) & 3 {
-        0 => [0, 1],
-        1 => [-1, 0],
-        2 => [0, -1],
-        _ => [1, 0],
-    }
-}
-
 /// Clockwise rotation of a horizontal direction.
 fn clockwise(d: [i32; 2]) -> [i32; 2] {
     [-d[1], d[0]]
@@ -600,8 +590,8 @@ impl Server {
     /// height, vertical offsets) in order, cells around according to the direction of movement,
     /// otherwise the top of the box.
     pub(crate) fn cart_dismount_location(&self, c: &Cart, poses: &[(f32, f32, &[i32])]) -> [f64; 3] {
-        let d = direction_of(c.yaw);
-        let fwd = clockwise(if c.flipped { [-d[0], -d[1]] } else { d });
+        let (dx, dz) = crate::mobs::mth::facing(c.yaw);
+        let fwd = clockwise(if c.flipped { [-dx, -dz] } else { [dx, dz] });
         let offsets = offsets_for(fwd);
         let v = c.block_pos();
         let w = self.world();

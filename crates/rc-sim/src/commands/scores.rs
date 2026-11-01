@@ -94,12 +94,35 @@ pub struct Team {
     pub players: Vec<String>,
 }
 
+/// Code of a team collision rule: 0 always, 1 never, 2 other teams, 3 own team.
+pub fn collision_code(rule: &str) -> u8 {
+    match rule {
+        "never" => 1,
+        "pushOtherTeams" => 2,
+        "pushOwnTeam" => 3,
+        _ => 0,
+    }
+}
+
+/// Team collision rules for the push: member → (team rank, rule code), like the game's
+/// "member → team" table; rebuilt on demand after a change.
+#[derive(Debug, Clone, Default)]
+pub struct CollisionIndex {
+    /// At least one team has a rule other than "always" (otherwise the push filters nothing).
+    pub active: bool,
+    /// Members whose name is a UUID in canonical text (entities).
+    pub by_uuid: std::collections::HashMap<u128, (u32, u8)>,
+    /// Other members (players, free names).
+    pub by_name: std::collections::HashMap<String, (u32, u8)>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Board {
     pub objectives: Vec<Objective>,
     /// Holder → objective → score (insertion order of the holders kept).
     pub scores: Vec<(String, BTreeMap<String, Score>)>,
     pub slots: BTreeMap<usize, String>,
+    /// Teams; every write goes through the board's methods, or calls `touch_teams`.
     pub teams: Vec<Team>,
     pub dirty: bool,
     /// Packets to send to the client (flushed by the server).
@@ -108,6 +131,8 @@ pub struct Board {
     obj_order: HashOrder,
     holder_order: HashOrder,
     team_order: HashOrder,
+    /// Collision rule index (empty until the first use after a change).
+    collision: std::cell::OnceCell<CollisionIndex>,
 }
 
 impl Default for Board {
@@ -122,6 +147,7 @@ impl Default for Board {
             obj_order: HashOrder::new(16, 0.5),
             holder_order: HashOrder::new(16, 0.5),
             team_order: HashOrder::new(16, 0.75),
+            collision: std::cell::OnceCell::new(),
         }
     }
 }
@@ -463,6 +489,7 @@ impl Board {
         let Some(t) = self.teams.iter_mut().find(|t| t.players.iter().any(|p| p == holder)) else { return false };
         t.players.retain(|p| p != holder);
         let name = t.name.clone();
+        self.touch_teams();
         self.out.push(ScoreEvent::Team { name, mode: 4, params: None, members: vec![holder.to_owned()] });
         self.dirty = true;
         true
@@ -474,6 +501,7 @@ impl Board {
         self.leave_team(holder);
         let Some(t) = self.teams.iter_mut().find(|t| t.name == team) else { return false };
         t.players.push(holder.to_owned());
+        self.touch_teams();
         self.out.push(ScoreEvent::Team {
             name: team.to_owned(),
             mode: 3,
@@ -572,11 +600,44 @@ impl Board {
     pub fn add_team(&mut self, t: Team) {
         self.team_order.insert(&t.name);
         self.teams.push(t);
+        self.touch_teams();
     }
 
     pub fn remove_team(&mut self, name: &str) {
         self.team_order.remove(name);
         self.teams.retain(|x| x.name != name);
+        self.touch_teams();
+    }
+
+    /// Teams modified outside the methods above (a team's options): the collision rule index
+    /// will be rebuilt at the next use.
+    pub fn touch_teams(&mut self) {
+        self.collision.take();
+    }
+
+    /// Collision rule index, built at the first use after a team change. A member registered in
+    /// two teams (save) keeps the first, like `team_of`.
+    pub fn collision_index(&self) -> &CollisionIndex {
+        self.collision.get_or_init(|| {
+            let mut ix = CollisionIndex { active: self.teams.iter().any(|t| t.collision != "always"), ..Default::default() };
+            if !ix.active {
+                return ix;
+            }
+            for (i, t) in self.teams.iter().enumerate() {
+                let v = (i as u32, collision_code(&t.collision));
+                for p in &t.players {
+                    match crate::commands::snbt::parse_uuid(p).filter(|u| crate::nbtio::uuid_text(*u) == *p) {
+                        Some(u) => {
+                            ix.by_uuid.entry(u).or_insert(v);
+                        }
+                        None => {
+                            ix.by_name.entry(p.clone()).or_insert(v);
+                        }
+                    }
+                }
+            }
+            ix
+        })
     }
 
     pub fn team(&self, name: &str) -> Option<&Team> {

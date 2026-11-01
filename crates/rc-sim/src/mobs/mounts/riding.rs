@@ -353,7 +353,8 @@ impl Server {
     /// left, behind, ahead, in the minecart's diagonal order) at the animal's level, low floor
     /// and free room; otherwise the top of the box.
     fn animal_dismount_location(&self, v: &Mob, poses: &[(f32, f32)]) -> [f64; 3] {
-        let offsets = crate::minecart::use_::offsets_for(crate::minecart::use_::direction_of(v.yaw));
+        let (dx, dz) = crate::mobs::mth::facing(v.yaw);
+        let offsets = crate::minecart::use_::offsets_for([dx, dz]);
         let b = v.block_pos();
         for &(w, h) in poses {
             for o in offsets {

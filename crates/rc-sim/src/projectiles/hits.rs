@@ -961,9 +961,7 @@ impl Server {
             PKind::Egg => {
                 if p.rng.next_int_bound(8) == 0 {
                     let n = if p.rng.next_int_bound(32) == 0 { 4 } else { 1 };
-                    for _ in 0..n {
-                        self.egg_chicken(p);
-                    }
+                    self.egg_chickens(p, n);
                 }
                 let _ = self.send(Event::Entity(EntityEvent::Event { id: p.id, event: 3 }));
                 p.removed = true;
@@ -1016,8 +1014,19 @@ impl Server {
         }
     }
 
-    /// Chick from the egg: baby, variant of the egg.
-    fn egg_chicken(&mut self, p: &Proj) {
+    /// Chicks from the egg, `n` at most: the first one that finds no room stops the series
+    /// (it was created, identifier included, but is not added).
+    pub(crate) fn egg_chickens(&mut self, p: &Proj, n: u32) {
+        for _ in 0..n {
+            if !self.egg_chicken(p) {
+                break;
+            }
+        }
+    }
+
+    /// Chick from the egg: baby, variant of the egg, born with a zero size at the egg's position
+    /// then refitted out of the blocks (wall, ceiling); false, and nothing added, without free room.
+    fn egg_chicken(&mut self, p: &Proj) -> bool {
         let mut m = self.new_mob(Kind::Chicken, p.pos, p.yaw);
         m.age = -24000;
         // Variant carried by the egg (component), otherwise the default variant (temperate).
@@ -1033,7 +1042,12 @@ impl Server {
         }
         m.head_yaw = m.yaw;
         m.body_yaw = m.yaw;
+        let dims = m.dims_wh();
+        if !self.refit_after_growth(&mut m, (0.0, 0.0), dims) {
+            return false;
+        }
         self.add_mob(m);
+        true
     }
 
     /// Experience orbs thrown in a direction.

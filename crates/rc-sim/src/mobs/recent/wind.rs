@@ -114,7 +114,7 @@ impl Server {
             return false;
         }
         if p.last_deflected_by != Some(Ent::Mob(id)) {
-            let seed = self.mobs.rng.next_long();
+            let seed = crate::vitals::sound_seed();
             if let Some(sid) = self.sound_id("minecraft:entity.breeze.deflect") {
                 let category = self.mob_ref(id).map_or(5, |o| o.sound_category());
                 let _ = self.send(Event::Sound(SoundPacket {

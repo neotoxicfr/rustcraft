@@ -6,6 +6,7 @@ pub(crate) mod aquatic;
 pub(crate) mod arrows;
 mod bell;
 mod body;
+mod resize; // refit after the box grows
 pub(crate) mod fireballs;
 pub(crate) mod nether;
 pub(crate) mod brains;
@@ -78,6 +79,8 @@ mod tests_g5f03;
 mod tests_g5f03b;
 #[cfg(test)]
 mod tests_g4f07b;
+#[cfg(test)]
+mod tests_g5f02b;
 
 use rc_proto::Reader;
 use rc_proto::nbt::Nbt;

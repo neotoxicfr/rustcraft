@@ -375,6 +375,8 @@ pub struct Mob {
     pub piston_deltas: rc_physics::piston::PistonDeltas,
     pub move_dist: f32,
     pub next_step: f32,
+    /// Amethyst chime of the steps and last seen size (refit after growth).
+    pub body_fx: super::body::BodyFx,
     pub needs_sync: bool,
     pub removed: bool,
     /// Movements of the tick, read back by the crossed-block pass.
@@ -568,6 +570,7 @@ impl Mob {
             piston_deltas: Default::default(),
             move_dist: 0.0,
             next_step: 1.0,
+            body_fx: Default::default(),
             needs_sync: false,
             removed: false,
             inside: Default::default(),
@@ -892,6 +895,11 @@ impl Mob {
 
     pub fn follow_range(&self) -> f64 {
         self.attrs.follow.value()
+    }
+
+    /// Effective gravity: zero with `NoGravity`, otherwise the attribute (the only allowed read).
+    pub fn gravity(&self) -> f64 {
+        super::surface::gravity(self, self.attrs.gravity.value())
     }
 
     pub fn step_height(&self) -> f64 {

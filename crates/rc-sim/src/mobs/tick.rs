@@ -235,6 +235,8 @@ impl Server {
 
     /// Common tick of a living entity.
     fn tick_living(&mut self, m: &mut Mob) {
+        // Growth since the last tick (command, interaction): refit.
+        self.mob_refit(m);
         // Common tick.
         m.old = m.pos;
         super::piglins::spear::compute_speed(m); // known speed
@@ -437,6 +439,7 @@ impl Server {
         if m.kind == Kind::Wolf {
             self.wolf_shake_tick(m);
         }
+        self.mob_refit(m); // growth during the tick (growing up, placement)
     }
 
     fn ambient_interval(&self, m: &Mob) -> i32 {
@@ -559,6 +562,7 @@ impl Server {
                 self.mob_travel(m);
             }
         }
+        self.mob_step_on(m); // block stepped on (magma, redstone ore), before the blocks passed through
         // Effects of the crossed blocks after the movement (fire, cactus, campfire, powder
         // snow, water, lava, rain); without current fire, the counter returns to 0.
         let in_snow = if !m.removed && !super::illagers::no_physics(m) {
