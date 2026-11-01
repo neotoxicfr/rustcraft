@@ -67,6 +67,9 @@ impl crate::App {
                         ps.spawn(PKind::FallingNectar, &POptions::default(), [x, e.pos[1] + half, z], [0.0; 3]);
                     }
                 }
+                "wolf" | "glow_squid" | "panda" => animal(e, &ents.dims, r, &mut |k, o, p, v| {
+                    ps.spawn(k, o, p, v);
+                }),
                 _ => {}
             }
         }
@@ -311,8 +314,253 @@ fn wither(ps: &mut crate::particles::Particles, r: &mut crate::level_events::Wor
     }
 }
 
+/// Tick particles of the wolf, glow squid and panda, emitted through `emit` (kind,
+/// options, position, velocity) after the client tick of the families (`entity_render`).
+fn animal(
+    e: &crate::entities::Entity,
+    dims: &[[f32; 4]],
+    r: &mut crate::level_events::WorldRandom,
+    emit: &mut impl FnMut(PKind, &POptions, [f64; 3], [f64; 3]),
+) {
+    let s = e.size(dims);
+    let o = POptions::default();
+    match e.kind.as_str() {
+        // Shaking (extra 4 = in progress, extra 2 = progress, +0.05 per tick): past 0.4,
+        // ⌊sin((progress − 0.4)·π)·7⌋ splashes 0.8 above the feet (single precision),
+        // within ± half the width in x and z, thrown at the wolf's velocity.
+        "wolf" => {
+            let shake = e.extra[2];
+            if e.death_time > 0 || e.extra[4] == 0.0 || shake <= 0.4 {
+                return;
+            }
+            let n = (((shake - 0.4) * std::f32::consts::PI).sin() * 7.0) as i32;
+            let y = f64::from(e.pos[1] as f32 + 0.8);
+            for _ in 0..n {
+                let xo = (r.f() * 2.0 - 1.0) * s.w * 0.5;
+                let zo = (r.f() * 2.0 - 1.0) * s.w * 0.5;
+                emit(PKind::Splash, &o, [e.pos[0] + f64::from(xo), y, e.pos[2] + f64::from(zo)], e.velocity);
+            }
+        }
+        // Glow squid, alive or dying: one glow per tick, within ±0.6 width in x and z, at
+        // height × random draw, motionless.
+        "glow_squid" => {
+            let (w, h) = (f64::from(s.w), f64::from(s.h));
+            let x = e.pos[0] + (2.0 * f64::from(r.f()) - 1.0) * 0.6 * w;
+            let y = e.pos[1] + f64::from(r.f()) * h;
+            let z = e.pos[2] + (2.0 * f64::from(r.f()) - 1.0) * 0.6 * w;
+            emit(PKind::Glow, &o, [x, y, z], [0.0; 3]);
+        }
+        // Panda (tick notes: extra 7, extra 8). Sneeze finished: one sneeze particle in front of the
+        // muzzle ((width + 1)/2 along the body axis, 0.1 below the eyes), at the panda's
+        // horizontal velocity. Eating: 6 bits of the held item, born 1 above the eyes in the
+        // body frame, thrown in the gaze frame (+0.05 in y).
+        "panda" => {
+            let eye = e.pos[1] + f64::from(s.eye);
+            if e.extra[7] != 0.0 {
+                let d = f64::from(s.w + 1.0) * 0.5;
+                let a = e.body.to_radians();
+                let p = [e.pos[0] - d * f64::from(a.sin()), eye - f64::from(0.1f32), e.pos[2] + d * f64::from(a.cos())];
+                emit(PKind::Sneeze, &o, p, [e.velocity[0], 0.0, e.velocity[2]]);
+            }
+            let Some(item) = e.equipment[0].as_ref().map(|s| s.item).filter(|_| e.extra[8] != 0.0) else {
+                return;
+            };
+            let o = POptions { item, ..o };
+            let rd = |r: &mut crate::level_events::WorldRandom| f64::from(r.f());
+            for _ in 0..6 {
+                let v = [(rd(r) - 0.5) * 0.1, rd(r) * 0.1 + 0.1, (rd(r) - 0.5) * 0.1];
+                let v = crate::entity_events::rot_xy(v, e.pitch, e.yaw);
+                let p = [(rd(r) - 0.5) * 0.8, -rd(r) * 0.6 - 0.3, 1.0 + (rd(r) - 0.5) * 0.4];
+                let p = crate::entity_events::rot_xy(p, 0.0, e.body);
+                emit(PKind::Item, &o, [p[0] + e.pos[0], p[1] + eye + 1.0, p[2] + e.pos[2]], [v[0], v[1] + 0.05, v[2]]);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Blocks with no rendering (invisible shape): no sprint particle on them.
+pub(crate) fn invisible_shape(name: &str) -> bool {
+    matches!(
+        name,
+        "minecraft:air"
+            | "minecraft:cave_air"
+            | "minecraft:void_air"
+            | "minecraft:barrier"
+            | "minecraft:light"
+            | "minecraft:structure_void"
+            | "minecraft:moving_piston"
+            | "minecraft:water"
+            | "minecraft:lava"
+            | "minecraft:bubble_column"
+            | "minecraft:end_portal"
+            | "minecraft:end_gateway"
+    )
+}
+
+/// Sprint particle (rabbit hop): position and velocity of a bit of the effect block `on`
+/// for an entity with feet at `pos`, of width `width` and velocity `vel`; `rx`, `rz` in
+/// [0, 1). Outside the entity's column, x or z is clamped to the effect block.
+pub(crate) fn sprint_spot(
+    pos: [f64; 3],
+    width: f64,
+    vel: [f64; 3],
+    on: [i32; 3],
+    rx: f64,
+    rz: f64,
+) -> ([f64; 3], [f64; 3]) {
+    let mut x = pos[0] + (rx - 0.5) * width;
+    let mut z = pos[2] + (rz - 0.5) * width;
+    if pos[0].floor() as i32 != on[0] {
+        x = x.clamp(f64::from(on[0]), f64::from(on[0]) + 1.0);
+    }
+    if pos[2].floor() as i32 != on[2] {
+        z = z.clamp(f64::from(on[2]), f64::from(on[2]) + 1.0);
+    }
+    ([x, pos[1] + 0.1, z], [vel[0] * -4.0, 1.5, vel[2] * -4.0])
+}
+
 #[cfg(test)]
 mod tests {
+    use super::PKind;
+    use crate::entities::Entities;
+
+    /// An entity of kind `kind` (id 7) in an empty client world.
+    fn spawn(kind: &str) -> Entities {
+        let mut all = Entities { type_names: vec![format!("minecraft:{kind}")], ..Default::default() };
+        let add = rc_proto_v777::entity::AddEntity {
+            id: 7,
+            uuid: 1,
+            kind: 0,
+            pos: [0.5, 64.0, 0.5],
+            velocity: [0.0; 3],
+            pitch: 0.0,
+            yaw: 0.0,
+            head_yaw: 0.0,
+            data: 0,
+        };
+        all.apply(rc_client::EntityEvent::Add(Box::new(add)));
+        all
+    }
+
+    /// Tick particles emitted for entity 7 (kind, position, velocity).
+    fn emitted(all: &Entities, r: &mut crate::level_events::WorldRandom) -> Vec<(PKind, [f64; 3], [f64; 3])> {
+        let mut out = Vec::new();
+        super::animal(&all.map[&7], &all.dims, r, &mut |k, _, p, v| out.push((k, p, v)));
+        out
+    }
+
+    /// Wolf shake (event 8): splashes per tick = ⌊sin((a − 0.4)·π)·7⌋ once the progress
+    /// exceeds 0.4 (negative sine past 1.4: none), nothing after the stop (56).
+    /// Before: no splashes.
+    #[test]
+    fn wolf_shake_splashes() {
+        let mut all = spawn("wolf");
+        let mut r = crate::level_events::WorldRandom::default();
+        all.tick();
+        all.apply(rc_client::EntityEvent::Event { id: 7, event: 8 });
+        let mut counts = Vec::new();
+        for _ in 0..42 {
+            all.tick();
+            let out = emitted(&all, &mut r);
+            assert!(out.iter().all(|(k, p, v)| *k == PKind::Splash
+                && (p[1] - 64.8).abs() < 1e-5
+                && (p[0] - 0.5).abs() <= 0.3 + 1e-6
+                && *v == [0.0; 3]));
+            counts.push(out.len());
+        }
+        // Expected values stored (game sine, progress accumulated in single precision).
+        let want: [usize; 42] = [
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 4, 5, 6, 6, 6, 7, 6, 6, 6, 5, 4, 4, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(counts, want);
+        // Stop through event 56: nothing more.
+        all.apply(rc_client::EntityEvent::Event { id: 7, event: 8 });
+        for _ in 0..12 {
+            all.tick();
+        }
+        assert!(!emitted(&all, &mut r).is_empty());
+        all.apply(rc_client::EntityEvent::Event { id: 7, event: 56 });
+        all.tick();
+        assert!(emitted(&all, &mut r).is_empty());
+    }
+
+    /// Glow squid: one glow per tick within ±0.6 width and over the height, motionless; the
+    /// ordinary squid has none.
+    #[test]
+    fn glow_squid_glows_every_tick() {
+        let mut r = crate::level_events::WorldRandom::default();
+        let all = spawn("glow_squid");
+        let s = all.map[&7].size(&all.dims);
+        for _ in 0..50 {
+            let out = emitted(&all, &mut r);
+            assert_eq!(out.len(), 1);
+            let (k, p, v) = out[0];
+            assert_eq!((k, v), (PKind::Glow, [0.0; 3]));
+            assert!((p[0] - 0.5).abs() <= 0.6 * f64::from(s.w) + 1e-9);
+            assert!(p[1] >= 64.0 && p[1] <= 64.0 + f64::from(s.h));
+        }
+        assert!(emitted(&spawn("squid"), &mut r).is_empty());
+    }
+
+    /// Panda: sneeze finished (counter > 20) → one sneeze particle (width + 1)/2 in front of the
+    /// muzzle (body at 0°: +z), 0.1 below the eyes; eating with bamboo → 6 bits every 5th
+    /// counter value. Before: nothing.
+    #[test]
+    fn panda_sneeze_and_eating_bits() {
+        use rc_proto_v777::entity::Meta;
+        let mut r = crate::level_events::WorldRandom::default();
+        let mut all = spawn("panda");
+        all.tick();
+        let e = all.map.get_mut(&7).unwrap();
+        e.meta.insert(23, Meta::Byte(2));
+        let mut sneezes = Vec::new();
+        for t in 0..25 {
+            all.tick();
+            for (k, p, v) in emitted(&all, &mut r) {
+                assert_eq!(k, PKind::Sneeze);
+                sneezes.push((t, p, v));
+            }
+        }
+        assert_eq!(sneezes.len(), 1, "{sneezes:?}");
+        let e = &all.map[&7];
+        let s = e.size(&all.dims);
+        let (_, p, v) = sneezes[0];
+        assert!((p[0] - 0.5).abs() < 1e-6, "{p:?}");
+        assert!((p[2] - (0.5 + f64::from(s.w + 1.0) * 0.5)).abs() < 1e-6, "{p:?}");
+        assert!((p[1] - (64.0 + f64::from(s.eye) - f64::from(0.1f32))).abs() < 1e-6, "{p:?}");
+        assert_eq!(v, [0.0; 3]);
+        // Eating: sitting (8) with an item, counter running at 3.
+        let e = all.map.get_mut(&7).unwrap();
+        e.meta.insert(23, Meta::Byte(8));
+        e.equipment[0] =
+            Some(rc_proto_v777::item::ItemStack { item: 42, count: 1, added: Vec::new(), removed: Vec::new() });
+        e.meta.insert(20, Meta::Int(3));
+        let mut per_tick = Vec::new();
+        for _ in 0..12 {
+            all.tick();
+            let out = emitted(&all, &mut r);
+            assert!(out.iter().all(|(k, p, _)| *k == PKind::Item && p[1] > 64.0 + f64::from(s.eye)));
+            per_tick.push(out.len());
+        }
+        // Counter read 3, 4, 5, … 14: bits at 5 and 10.
+        assert_eq!(per_tick, [0, 0, 6, 0, 0, 0, 0, 6, 0, 0, 0, 0]);
+    }
+
+    /// Sprint particle: ± half width around the feet, clamped to the effect block outside the
+    /// column, 0.1 above the feet, velocity (vx·−4, 1.5, vz·−4).
+    #[test]
+    fn sprint_spot_clamps_to_effect_block() {
+        let (p, v) = super::sprint_spot([0.5, 64.0, 0.5], 0.4, [0.1, 0.0, -0.2], [0, 63, 0], 1.0, 0.0);
+        assert_eq!(p, [0.7, 64.1, 0.3]);
+        assert_eq!(v, [-0.4, 1.5, 0.8]);
+        // Feet at x = 0.95 on the neighbouring block x = 1 (supporting block): x clamped to [1, 2].
+        let (p, _) = super::sprint_spot([0.95, 64.0, 0.5], 0.6, [0.0; 3], [1, 63, 0], 0.0, 0.5);
+        assert_eq!(p[0], 1.0);
+        assert!(super::invisible_shape("minecraft:water") && !super::invisible_shape("minecraft:grass_block"));
+    }
+
     /// Ominous spawner: 1 to 3 particles (all three counts come out), offsets with standard deviation
     /// 0.4 × √2 per axis, centered.
     #[test]

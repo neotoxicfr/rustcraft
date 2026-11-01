@@ -81,7 +81,7 @@ fn category(kind: &str, e: Option<&crate::entities::Entity>) -> Category {
 }
 
 /// Rotation of a vector around X then Y (angles in game degrees, game signs).
-fn rot_xy(v: [f64; 3], pitch: f32, yaw: f32) -> [f64; 3] {
+pub(crate) fn rot_xy(v: [f64; 3], pitch: f32, yaw: f32) -> [f64; 3] {
     let (s, c) = (f64::from(-pitch.to_radians()).sin(), f64::from(-pitch.to_radians()).cos());
     let v = [v[0], v[1] * c + v[2] * s, v[2] * c - v[1] * s];
     let (s, c) = (f64::from(-yaw.to_radians()).sin(), f64::from(-yaw.to_radians()).cos());
@@ -321,6 +321,8 @@ impl crate::App {
             ("armor_stand", 32) => {
                 self.ev_sound("minecraft:entity.armor_stand.hit", Category::Neutral, b.pos, 0.3, 1.0);
             }
+            // Rabbit hop: sprint particle of the block under its paws.
+            ("rabbit", 1) => self.ev_sprint(id),
             // Armadillo peeking.
             ("armadillo", 64) => {
                 self.ev_sound("minecraft:entity.armadillo.peek", Category::Neutral, b.pos, 1.0, 1.0);
@@ -490,6 +492,39 @@ impl crate::App {
             let p = [p[0] - v[0] * 10.0, p[1] - v[1] * 10.0, p[2] - v[2] * 10.0];
             self.ev_spawn(PKind::Poof, &POptions::default(), p, v);
         }
+    }
+
+    /// Sprint particle of a remote entity: bit of the effect block (0.2 below the feet, going
+    /// through the supporting block when it is on the ground), except for a block with no rendering.
+    fn ev_sprint(&mut self, id: i32) {
+        use rc_physics::World as _;
+        let Some(e) = self.entities.map.get(&id) else { return };
+        let s = e.size(&self.entities.dims);
+        let (w, h) = (f64::from(s.w), f64::from(s.h));
+        let (pos, vel) = (e.pos, e.velocity);
+        let world = crate::GridWorld {
+            grid: &self.world.grid,
+            min_y: self.world.min_y,
+            height: self.world.height,
+            t: &self.phys,
+            border: &self.weather.border,
+            colliders: &[],
+            movers: None,
+            noclip: None,
+        };
+        let bb = rc_physics::Aabb {
+            min: [pos[0] - w / 2.0, pos[1], pos[2] - w / 2.0],
+            max: [pos[0] + w / 2.0, pos[1] + h, pos[2] + w / 2.0],
+        };
+        let support = if e.on_ground { rc_physics::support_of(&world, &bb, pos) } else { None };
+        let on = rc_physics::below_of(support, pos, &self.phys, &world, 0.2);
+        let state = world.state(on[0], on[1], on[2]).unwrap_or(0);
+        if self.data.block_of(state).is_none_or(|b| crate::entity_fx::invisible_shape(&b.name)) {
+            return;
+        }
+        let (rx, rz) = (self.ev_r(), self.ev_r());
+        let (p, v) = crate::entity_fx::sprint_spot(pos, w, vel, on, rx, rz);
+        self.ev_spawn(PKind::Block, &POptions { state, ..Default::default() }, p, v);
     }
 
     fn ev_honey(&mut self, b: &Body, n: u32) {

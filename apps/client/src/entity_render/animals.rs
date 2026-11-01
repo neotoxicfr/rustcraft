@@ -1882,8 +1882,11 @@ pub(super) fn tick(e: &mut Entity) {
 }
 
 /// Client tick of the panda: synchronised counters modified locally like the game (the server
-/// overwrites them at its next update), ramps sitting / back / roll.
+/// overwrites them at its next update), ramps sitting / back / roll. Note for the tick's
+/// particles (`entity_fx.rs`): extra 7 = sneeze finished this tick, extra 8 = eating bits.
 fn tick_panda(e: &mut Entity) {
+    e.extra[7] = 0.0;
+    e.extra[8] = 0.0;
     let flags = e.meta_byte(23);
     let set_flag = |e: &mut Entity, bit: i8, on: bool| {
         let f = e.meta_byte(23);
@@ -1898,6 +1901,7 @@ fn tick_panda(e: &mut Entity) {
         if n > 20 {
             set_flag(e, 2, false);
             e.meta.insert(19, Meta::Int(0));
+            e.extra[7] = 1.0;
         } else {
             e.meta.insert(19, Meta::Int(n));
         }
@@ -1921,6 +1925,10 @@ fn tick_panda(e: &mut Entity) {
         e.meta.insert(20, Meta::Int(0));
     }
     if let Some(n) = e.meta_int(20).filter(|&n| n > 0) {
+        // Eating bits every 5th counter value, read before its increment.
+        if n % 5 == 0 {
+            e.extra[8] = 1.0;
+        }
         e.meta.insert(20, Meta::Int(n + 1));
     }
     let x = &mut e.extra;
