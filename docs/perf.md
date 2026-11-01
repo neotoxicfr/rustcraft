@@ -2518,7 +2518,10 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   now read for every cell and every projectile (before: arrows only) to route the plates;
   1 to 8 cells per step, no allocation; the update of the list copy and the recount of the
   entities only happen in a released plate (rare). Not measured separately: below the scene
-  noise; to confirm on the quiet-machine bench (scene with arrows in flight).
+  noise; to confirm on the quiet-machine bench (scene with arrows in flight). Lot 6
+  integration: the projectile cells now come from the G5-F02e contact walk (section below),
+  and the plate reads the box of the projectile being ticked (`ticking_proj`) instead of
+  moving its list copy.
 - Right to break on impact: the tag predicate is frozen as a `match` (no tag lookup at run
   time, test against the jar), the rule is read only when the block hit is a pot, a chorus
   flower or a speleothem. Multi-core and GPU not applicable (one-off event).
