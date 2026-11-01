@@ -202,6 +202,12 @@ impl Fluid {
     }
 }
 
+/// Palette prefilter of [`Server::scan_box`] (`RUSTCRAFT_OPT_SCAN_PALETTE=0` reads every cell).
+fn scan_palette() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_SCAN_PALETTE") != Some("0"))
+}
+
 impl Server {
     #[inline]
     pub(crate) fn v(&self) -> View {
@@ -232,6 +238,57 @@ impl Server {
     pub(crate) fn get(&self, p: P) -> u32 {
         crate::play::block_at(&self.chunks, self.dim.height.min_y, p)
             .unwrap_or_else(|| self.v().default_state(self.bs.t.id.void_air))
+    }
+
+    /// Cells of the box `min..=max` (inclusive corners) whose state satisfies `pred`, in the
+    /// game's box scan order: sections along x, then z, then y; inside a section, cells along
+    /// y, then z, then x. `f` returns false to stop the scan (then `true` is returned). A section
+    /// whose palette cannot hold such a state is skipped without reading its data; cells outside
+    /// the world height or in an unloaded chunk are never visited (no caller looks for air).
+    pub(crate) fn scan_box(&self, min: P, max: P, pred: impl Fn(u32) -> bool, mut f: impl FnMut(P, u32) -> bool) -> bool {
+        let min_y = self.dim.height.min_y;
+        let (y0, y1) = (min[1].max(min_y), max[1].min(self.top_y() - 1));
+        if y0 > y1 {
+            return false;
+        }
+        let palette = scan_palette();
+        for sx in (min[0] >> 4)..=(max[0] >> 4) {
+            for sz in (min[2] >> 4)..=(max[2] >> 4) {
+                let Some(Some(c)) = self.chunks.get(&(sx, sz)) else { continue };
+                for si in ((y0 - min_y) >> 4)..=((y1 - min_y) >> 4) {
+                    let Some(sec) = c.sections.get(si as usize) else { continue };
+                    if palette && !sec.blocks.may_contain(&pred) {
+                        continue;
+                    }
+                    let (ox, oy, oz) = (sx << 4, min_y + (si << 4), sz << 4);
+                    for y in y0.max(oy)..=y1.min(oy + 15) {
+                        for z in min[2].max(oz)..=max[2].min(oz + 15) {
+                            for x in min[0].max(ox)..=max[0].min(ox + 15) {
+                                let i = block_index((x - ox) as usize, (y - oy) as usize, (z - oz) as usize);
+                                let s = sec.blocks.get(i);
+                                if pred(s) && !f([x, y, z], s) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// No more than `n` cells of the box `p + lo ..= p + hi` hold the block `b` (spread limit of
+    /// vines and mushrooms).
+    pub(crate) fn at_most_in_box(&self, p: P, lo: P, hi: P, b: u16, n: usize) -> bool {
+        let mut seen = 0;
+        let v = self.v();
+        let min = [p[0] + lo[0], p[1] + lo[1], p[2] + lo[2]];
+        let max = [p[0] + hi[0], p[1] + hi[1], p[2] + hi[2]];
+        !self.scan_box(min, max, |s| v.block(s) == b, |_, _| {
+            seen += 1;
+            seen <= n
+        })
     }
 
     pub(crate) fn is_loaded(&self, p: P) -> bool {
@@ -1039,6 +1096,8 @@ impl Server {
         self.lightning_rod_on_place(state, p, old);
         // F10: frogspawn, sniffer egg (scheduled hatching).
         self.bz_egg_on_place(state, p);
+        // G6-F08: turtle eggs on sand (growth particles).
+        self.turtle_egg_on_place(state, p);
     }
 
     pub(crate) fn affect_after_removal(&mut self, old: u32, p: P, moved: bool) {

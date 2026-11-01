@@ -258,6 +258,18 @@ pub(crate) struct Ids {
     /// G6-F09a: blocks under which speleothems grow.
     pub dripstone_block: u16,
     pub sulfur: u16,
+    /// G6-F08: nature ticks (vine spread, turtle eggs, eyeblossoms, cauldrons fed by a
+    /// stalactite, mud dried into clay).
+    pub vine: u16,
+    pub turtle_egg: u16,
+    pub open_eyeblossom: u16,
+    pub closed_eyeblossom: u16,
+    pub potted_open_eyeblossom: u16,
+    pub potted_closed_eyeblossom: u16,
+    pub cauldron: u16,
+    pub water_cauldron: u16,
+    pub mud: u16,
+    pub clay: u16,
 }
 
 pub(crate) struct Table {
@@ -645,6 +657,16 @@ impl Table {
             carved_pumpkin: f("carved_pumpkin"),
             dripstone_block: f("dripstone_block"),
             sulfur: f("sulfur"),
+            vine: f("vine"),
+            turtle_egg: f("turtle_egg"),
+            open_eyeblossom: f("open_eyeblossom"),
+            closed_eyeblossom: f("closed_eyeblossom"),
+            potted_open_eyeblossom: f("potted_open_eyeblossom"),
+            potted_closed_eyeblossom: f("potted_closed_eyeblossom"),
+            cauldron: f("cauldron"),
+            water_cauldron: f("water_cauldron"),
+            mud: f("mud"),
+            clay: f("clay"),
         };
         let pair = d
             .blocks

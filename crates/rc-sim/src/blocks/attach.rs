@@ -609,21 +609,9 @@ impl Server {
         clicked_vine.then_some(result)
     }
 
+    /// At most 4 vines in the 9×3×9 box around (same limit as the mushrooms).
     fn vine_can_spread(&self, p: P) -> bool {
-        let mut n = 4;
-        for x in -4..=4 {
-            for y in -1..=1 {
-                for z in -4..=4 {
-                    if self.v().kind(self.get([p[0] + x, p[1] + y, p[2] + z])) == Kind::Vine {
-                        n -= 1;
-                        if n < 0 {
-                            return false;
-                        }
-                    }
-                }
-            }
-        }
-        true
+        self.at_most_in_box(p, [-4, -1, -4], [4, 1, 4], self.bs.t.id.vine, 4)
     }
 
     fn vine_copy_random(&mut self, from: u32, to: u32) -> u32 {

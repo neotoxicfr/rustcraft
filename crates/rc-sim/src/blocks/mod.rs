@@ -37,6 +37,7 @@ pub(crate) mod shape;
 pub(crate) mod speleothem;
 pub(crate) mod table;
 pub(crate) mod ticks;
+pub(crate) mod turtle_egg;
 
 #[cfg(test)]
 pub(crate) mod probe;
@@ -66,6 +67,8 @@ mod g6f23_tests;
 mod g6f09a_tests;
 #[cfg(test)]
 mod g6f07_tests;
+#[cfg(test)]
+mod g6f08_tests;
 
 pub(crate) use table::{Kind, Table};
 

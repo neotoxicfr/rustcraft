@@ -1344,6 +1344,7 @@ impl Server {
                 }
                 let (w, h, _) = self.player_dims();
                 self.trample_farmland(effect, effect_st, fall, None, w as f32, h as f32);
+                self.turtle_egg_fall_on(effect, None); // G6-F08: before the damage
                 let rule = self.fall_rule(effect_st, fall, self.sneaking);
                 // Player who can fly: no statistic and no damage, impulse context kept.
                 let may_fly = self.game_mode == 1 || self.game_mode == 3;

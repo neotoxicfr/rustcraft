@@ -2755,3 +2755,28 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   (JSON copy of a few fields, of the order of a microsecond, not measured separately); protection:
   a tag test up front that avoids walking the four pieces for `/kill` and the void.
   Multi-core and GPU not applicable (order of the random draws imposed, work of the order of one hit).
+
+## G6-F08: nature ticks and turtle eggs (01/11, loaded machine)
+
+Bench `bench_g6f08_scan_and_grass` (ignored; `--ignored bench_g6f08 --nocapture`), 2 passes each.
+
+- Box scan (`Server::scan_box`, shared by the spread limit of vines and mushrooms and the
+  eyeblossom wake-up, in the game's section/y/z/x order): one chunk lookup per section and direct
+  container reads instead of one `get` (hash lookup) per cell. Spread limit of a vine, 9 × 3 × 9
+  box, 10 % vines over 32 × 4 × 32: old walk 890-927 ns, scan 297-298 ns; lone vines in an empty
+  sky band: 1,829-1,863 ns against 476-477 ns. Kept.
+- Palette prefilter of the scan (skip a section whose palette cannot hold the block):
+  `RUSTCRAFT_OPT_SCAN_PALETTE=0` cuts it. Dense case unchanged (296-333 ns off against 297-298
+  on), sparse case 583-588 ns off against 476-477 on (−19 %). Kept on; to re-measure on a quiet
+  machine (jungle, pale garden scenes).
+- Grass, mycelium and nylium survival (`LightTables::dampening_into`: the face masks of the light
+  engine, pair table of occluded edges, then the attenuation table) instead of the old plain
+  attenuation read: 1.53-1.57 ns against 6.78-6.88 ns per test over the whole state table (the
+  old path read the 24-byte state info twice). Faithful and faster: kept, no switch.
+- Not hot, not optimised further: turtle egg (rare random ticks), eyeblossom (day time compare
+  first, scan only when it turns), copper (two property reads before the draw), pitcher crop and
+  mushroom (crop draw, 1/25 draw before any scan), pointed dripstone transfer (82 % of the draws
+  leave on the first float compare; otherwise at most 10 reads up and 10 down). Redstone ore
+  touch: 6 neighbour reads for the server's particle draws. Multi-core and GPU not applicable
+  (world random order imposed, work of a few hundred nanoseconds per event); no allocation per
+  tick (the eyeblossom wake-up list is allocated only when a flower turns).
