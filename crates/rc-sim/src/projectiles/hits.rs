@@ -1298,8 +1298,31 @@ impl Server {
     // ---------- Blocks hit ----------
 
     /// Reaction of the block hit: target, TNT, bell, campfire, chorus flower, decorated pot,
-    /// dripstone (trident), wooden button and plate (arrows).
+    /// dripstone (trident). Buttons and plates react in the pass over the traversed blocks.
     pub(crate) fn block_projectile_hit(&mut self, p: &mut Proj, b: BlockHit) {
+        let impact = p.kind.impact();
+        self.block_projectile_hit_as(p, b, impact);
+    }
+
+    /// Whether breaking on impact is allowed: kind in the `impact_projectiles` tag (`impact`),
+    /// the `projectiles_can_break_blocks` rule, and the adventure mode check: a player shooter in
+    /// adventure, a mob shooter, or no shooter in an adventure world all require the `can_break`
+    /// component of the carried stack (arrows and trident only; other projectiles do not get one).
+    pub(crate) fn proj_may_break(&self, p: &Proj, impact: bool, state: u32) -> bool {
+        if !impact || !self.rule("minecraft:projectiles_can_break_blocks", true) {
+            return false;
+        }
+        let restricted = match self.proj_owner(p) {
+            Some(Ent::Player) => self.game_mode == 2,
+            Some(Ent::Mob(_)) => true,
+            None => self.level.game_type == 2,
+        };
+        !restricted || (p.kind.arrow_like() && self.adventure_can_break(Some(&p.item), state))
+    }
+
+    /// Like `block_projectile_hit`, with the impact tag membership given (the fishing hook
+    /// reuses a snowball projectile but is not in the tag).
+    pub(crate) fn block_projectile_hit_as(&mut self, p: &mut Proj, b: BlockHit, impact: bool) {
         let s = self.st(b.pos);
         let name = self.state_name(s).to_owned();
         let short = name.trim_start_matches("minecraft:");
@@ -1341,11 +1364,11 @@ impl Server {
             }
             // Falling big dripleaf: tipped at once (any projectile).
             "big_dripleaf" => self.dripleaf_projectile_hit(s, b.pos),
-            "chorus_flower" if griefing_ok && p.kind != PKind::Firework => {
+            "chorus_flower" if griefing_ok && self.proj_may_break(p, impact, s) => {
                 let by = Some(crate::mobs::recent::vibration::Src::Projectile(self.proj_owner(p)));
                 self.destroy_block_by(b.pos, true, 512, by);
             }
-            "decorated_pot" if griefing_ok => {
+            "decorated_pot" if griefing_ok && self.proj_may_break(p, impact, s) => {
                 // Cracked first (without a visible update), so that the loot is the sherds.
                 let cracked = self.v().set_bool(s, "cracked", true);
                 self.set_block(b.pos, cracked, flag::INVISIBLE | flag::SKIP_BE_SIDE_EFFECTS);
@@ -1354,7 +1377,10 @@ impl Server {
             }
             // Speleothems (pointed dripstone, sulfur spike): broken by a fast trident.
             "pointed_dripstone" | "sulfur_spike"
-                if p.kind == PKind::Trident && griefing_ok && p.vel[0].hypot(p.vel[1]).hypot(p.vel[2]) > 0.6 =>
+                if p.kind == PKind::Trident
+                    && griefing_ok
+                    && self.proj_may_break(p, impact, s)
+                    && p.vel[0].hypot(p.vel[1]).hypot(p.vel[2]) > 0.6 =>
             {
                 self.destroy_block(b.pos, true, 512);
             }
@@ -1377,14 +1403,7 @@ impl Server {
             }
             _ => {}
         }
-        if p.kind.arrow_like() {
-            self.arrow_presses(b.pos, s, &name);
-        }
     }
-
-    /// Wooden buttons and plates pressed by arrows: left to the blocks (S3),
-    /// which test the arrows every tick if they can see them.
-    fn arrow_presses(&mut self, _p: [i32; 3], _s: u32, _name: &str) {}
 }
 
 /// Power of the target block according to the impact point.

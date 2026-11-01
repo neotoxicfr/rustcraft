@@ -1066,6 +1066,18 @@ impl Server {
         }
     }
 
+    /// Projectile being ticked inside a released plate: its copy in the list dates from the start
+    /// of the tick, so it is moved to its current position before the entities are counted.
+    pub(crate) fn plate_proj_inside(&mut self, p: P, s: u32, cur: &crate::projectiles::Proj) {
+        if self.plate_signal(s) != 0 {
+            return;
+        }
+        if let Some(q) = self.proj.list.iter_mut().find(|q| q.id == cur.id) {
+            q.pos = cur.pos;
+        }
+        self.plate_check(p, s, 0);
+    }
+
     // --- Lamp (§ 3.12). ---
 
     pub(crate) fn lamp_neighbor_changed(&mut self, s: u32, p: P) {

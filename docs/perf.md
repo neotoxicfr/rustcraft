@@ -2494,3 +2494,13 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   (none today) to read only the mobs in the column; to re-measure on a quiet machine on
   a real sulfur cave (number of active geysers unknown). Nausea and countdown:
   once every 10 and 20 ticks.
+## G6-F09b: projectiles on plates, right to break on impact (25/10, loaded machine)
+
+- Pass over the blocks traversed by a projectile: the block kind (table lookup per state) is
+  now read for every cell and every projectile (before: arrows only) to route the plates;
+  1 to 8 cells per step, no allocation; the update of the list copy and the recount of the
+  entities only happen in a released plate (rare). Not measured separately: below the scene
+  noise; to confirm on the quiet-machine bench (scene with arrows in flight).
+- Right to break on impact: the tag predicate is frozen as a `match` (no tag lookup at run
+  time, test against the jar), the rule is read only when the block hit is a pot, a chorus
+  flower or a speleothem. Multi-core and GPU not applicable (one-off event).

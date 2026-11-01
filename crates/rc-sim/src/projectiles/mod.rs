@@ -119,6 +119,26 @@ impl PKind {
         matches!(self, PKind::Arrow | PKind::SpectralArrow | PKind::Trident)
     }
 
+    /// Tag `minecraft:impact_projectiles` (frozen, compared with the jar by a test): only these
+    /// kinds can break a block on impact (decorated pot, chorus flower, speleothem).
+    pub fn impact(self) -> bool {
+        matches!(
+            self,
+            PKind::Arrow
+                | PKind::SpectralArrow
+                | PKind::Firework
+                | PKind::Snowball
+                | PKind::LargeFireball
+                | PKind::SmallFireball
+                | PKind::Egg
+                | PKind::Trident
+                | PKind::DragonFireball
+                | PKind::WitherSkull
+                | PKind::WindCharge
+                | PKind::BreezeWindCharge
+        )
+    }
+
     /// Thrown item.
     pub fn throwable(self) -> bool {
         matches!(
