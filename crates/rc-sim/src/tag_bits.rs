@@ -52,6 +52,8 @@ tag_ids! {
     CatsCanLieOn = "minecraft:cats_can_lie_on",
     CatsCanSitOn = "minecraft:cats_can_sit_on",
     Cauldrons = "minecraft:cauldrons",
+    CausesContinuousGeyserEruptions = "minecraft:causes_continuous_geyser_eruptions",
+    CausesPeriodicGeyserEruptions = "minecraft:causes_periodic_geyser_eruptions",
     CausesSuffocation = "minecraft:causes_suffocation",
     Climbable = "minecraft:climbable",
     ConvertibleToMud = "minecraft:convertible_to_mud",

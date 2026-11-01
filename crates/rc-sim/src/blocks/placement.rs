@@ -883,6 +883,9 @@ impl Server {
                 let s = v.set(def, "shape", if ew { "east_west" } else { "north_south" });
                 v.set_bool(s, "waterlogged", self.fluid_at(p).kind == 1)
             }
+            // G6-F09a: speleothems (direction from the gaze, thickness, merging) and active sulfur.
+            Kind::Speleothem { .. } => return self.speleothem_placement(def, p, ctx.sneaking, water),
+            Kind::PotentSulfur => self.potent_sulfur_state(def, p).0,
             Kind::TripwireHook => return self.hook_placement(def, p, &ctx.nearest),
             Kind::Bamboo { .. } => return self.bamboo_placement(p),
             Kind::Scaffolding => self.scaffold_placement(def, p),

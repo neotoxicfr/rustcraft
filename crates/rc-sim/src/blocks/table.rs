@@ -161,6 +161,13 @@ pub(crate) enum Kind {
     Skull,
     /// Beehive and bee nest.
     Beehive,
+    /// G6-F09a: speleothems (pointed dripstone if `dripstone`, sulfur spike otherwise): placement,
+    /// survival, fall, growth (`speleothem.rs`).
+    Speleothem {
+        dripstone: bool,
+    },
+    /// G6-F09a: active sulfur (state from the water and the block below, ticking block entity).
+    PotentSulfur,
 }
 
 /// Property of a block: index into `VersionData::properties`, not into the identifiers.
@@ -241,6 +248,11 @@ pub(crate) struct Ids {
     pub command_block: u16,
     pub lightning_rod: u16,
     pub carved_pumpkin: u16,
+    /// G6-F09a: blocks under which speleothems grow.
+    pub dripstone_block: u16,
+    pub sulfur: u16,
+    /// G6-F09a: powder snow (no collision for the geyser column).
+    pub powder_snow: u16,
 }
 
 pub(crate) struct Table {
@@ -412,6 +424,9 @@ fn kind_of(name: &str) -> Kind {
         "chorus_plant" => return ChorusPlant,
         "budding_amethyst" => return BuddingAmethyst,
         "beehive" | "bee_nest" => return Beehive,
+        "pointed_dripstone" => return Speleothem { dripstone: true },
+        "sulfur_spike" => return Speleothem { dripstone: false },
+        "potent_sulfur" => return PotentSulfur,
         _ => {}
     }
     // `piston_head` is taken above.
@@ -618,6 +633,9 @@ impl Table {
             command_block: f("command_block"),
             lightning_rod: f("lightning_rod"),
             carved_pumpkin: f("carved_pumpkin"),
+            dripstone_block: f("dripstone_block"),
+            sulfur: f("sulfur"),
+            powder_snow: f("powder_snow"),
         };
         let pair = d
             .blocks

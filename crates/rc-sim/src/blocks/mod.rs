@@ -28,10 +28,12 @@ pub(crate) mod piston;
 pub(crate) mod piston_plan;
 pub(crate) mod placement;
 pub(crate) mod plant_rules;
+pub(crate) mod potent_sulfur;
 pub(crate) mod rails;
 pub(crate) mod sculk_sensor;
 pub(crate) mod redstone;
 pub(crate) mod shape;
+pub(crate) mod speleothem;
 pub(crate) mod table;
 pub(crate) mod ticks;
 
@@ -55,6 +57,8 @@ mod g6f06_tests;
 mod g6f12_tests;
 #[cfg(test)]
 mod g6f23_tests;
+#[cfg(test)]
+mod g6f09a_tests;
 
 pub(crate) use table::{Kind, Table};
 

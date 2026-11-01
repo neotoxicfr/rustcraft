@@ -2479,3 +2479,18 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   Multi-core and GPU not applicable (under a microsecond, once per ravager per tick).
 - Food finish sound: one more sound packet for the final bite, two random draws; the sound is
   looked up by name in the registry like other sounds (once per meal).
+
+## G6-F09a: speleothems and active sulfur (25/10, loaded machine)
+
+- Random tick of a speleothem with no possible growth (bench `bench_speleothem_random_tick_and_geyser`,
+  best of 5 × 200,000): sulfur spike 15.3 ns, pointed dripstone 15.6 ns (two draws), against 21.7 ns
+  for a stone (fall back to the copper tick): the chance test (0.0114) comes before any state
+  read. Properties read by name (`vertical_direction`, `thickness`) only on this rare path
+  and at shape time; per-state byte table not retained (nothing measurable). Feeder blocks
+  (speleothem block, sulfur) resolved once in `Ids`. Multi-core and GPU not applicable.
+- Continuous geyser (block entity, every tick): 106.5 ns with no mob, 1,972 ns with 200
+  mobs outside the column (about 9 ns per mob: walk of the list, exact `Mob::touches`
+  prefilter reused from the pushes). Lead noted, not done: spatial index of the mobs
+  (none today) to read only the mobs in the column; to re-measure on a quiet machine on
+  a real sulfur cave (number of active geysers unknown). Nausea and countdown:
+  once every 10 and 20 ticks.

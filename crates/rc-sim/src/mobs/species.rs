@@ -833,6 +833,11 @@ impl Kind {
         matches!(self, Kind::Stray | Kind::PolarBear | Kind::SnowGolem | Kind::Wither)
     }
 
+    /// `#not_affected_by_geysers`: never launched by an active sulfur geyser.
+    pub fn not_affected_by_geysers(self) -> bool {
+        self == Kind::EnderDragon
+    }
+
     /// `#freeze_hurts_extra_types`: freeze damage ×5.
     pub fn freeze_hurts_extra(self) -> bool {
         matches!(self, Kind::Strider | Kind::Blaze | Kind::MagmaCube)

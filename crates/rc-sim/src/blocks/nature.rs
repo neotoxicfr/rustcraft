@@ -731,6 +731,7 @@ impl Server {
             Kind::GrowingHead { up } => self.growing_random_tick(s, p, up),
             Kind::ChorusFlower => self.chorus_flower_random_tick(s, p),
             Kind::BuddingAmethyst => self.budding_amethyst_random_tick(p),
+            Kind::Speleothem { dripstone } => self.speleothem_random_tick(s, p, dripstone), // G6-F09a
             _ => {
                 let n = self.data.block_of(s).map_or("", |x| x.name.as_str());
                 if n == "minecraft:redstone_ore" || n == "minecraft:deepslate_redstone_ore" {
