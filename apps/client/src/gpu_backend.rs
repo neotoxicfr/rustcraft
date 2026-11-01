@@ -5,8 +5,9 @@
 //! card seen as "other" by Vulkan and as "discrete" by DX12 would therefore go to DX12, and both
 //! APIs would be initialized at every launch. Here each API is tried alone, in
 //! order: the first one that gives a hardware adapter compatible with the window wins;
-//! a software adapter (WARP, lavapipe) is only a very last resort. Like the game, old Intel GPUs
-//! under Intel's Windows driver are refused on Vulkan (`known_problematic`).
+//! a software adapter (WARP, lavapipe) is only a very last resort. The game's list of refused
+//! Vulkan devices only concerns old Intel GPUs under MoltenVK (Vulkan over Metal, macOS), which
+//! our Windows and Linux builds never use: nothing is refused here.
 //!
 //! The "Graphics API" setting (`preferredGraphicsBackend` of options.txt) chooses the order at
 //! startup, like the game which tries one API then the other: "default" and "vulkan" try
@@ -94,56 +95,19 @@ impl GpuText {
     }
 }
 
-/// PCI device identifiers of old Intel integrated GPUs (generations 7 and 8) that the game refuses
-/// on Vulkan under Intel's Windows driver; sorted (lookup by halving).
-const INTEL_REFUSED: [u16; 58] = [
-    0x0152, 0x0155, 0x0157, 0x015A, 0x0162, 0x0166, 0x016A, 0x0402, 0x0406, 0x040A, 0x040B, 0x040E, 0x0412, 0x0416,
-    0x041A, 0x041B, 0x041E, 0x0422, 0x0426, 0x042A, 0x042B, 0x042E, 0x0A02, 0x0A06, 0x0A0A, 0x0A0B, 0x0A0E, 0x0A12,
-    0x0A16, 0x0A1A, 0x0A1B, 0x0A1E, 0x0A22, 0x0A26, 0x0A2A, 0x0A2B, 0x0A2E, 0x0D22, 0x0D26, 0x0D2A, 0x0D2B, 0x0D2E,
-    0x0F30, 0x0F31, 0x0F32, 0x0F33, 0x1606, 0x1612, 0x1616, 0x161E, 0x1622, 0x1626, 0x162A, 0x162B, 0x22B0, 0x22B1,
-    0x22B2, 0x22B3,
-];
-
-/// Device the game skips on Vulkan ("known problematic"): Intel vendor, Intel's Windows driver
-/// and a listed device; the next API is then tried.
-fn known_problematic(intel_windows_driver: bool, vendor: u32, device: u32) -> bool {
-    intel_windows_driver
-        && vendor == 0x8086
-        && u16::try_from(device).is_ok_and(|d| INTEL_REFUSED.binary_search(&d).is_ok())
-}
-
-/// What a Vulkan adapter tells beyond `AdapterInfo`: API version of the device and whether it
-/// runs Intel's Windows driver. `None` on another API.
+/// Vulkan API version of the device (beyond `AdapterInfo`); `None` on another API.
 #[cfg(any(windows, target_os = "linux"))]
 #[allow(unsafe_code)]
-fn vulkan_details(a: &wgpu::Adapter) -> Option<(u32, bool)> {
+fn vulkan_api_version(a: &wgpu::Adapter) -> Option<u32> {
     // SAFETY: only reads the properties the Vulkan backend cached when it listed the device; no
     // raw handle is used or kept.
     let hal = unsafe { a.as_hal::<wgpu::hal::api::Vulkan>() }?;
-    let caps = hal.physical_device_capabilities();
-    Some((caps.properties().api_version, caps.is_driver(ash::vk::DriverId::INTEL_PROPRIETARY_WINDOWS)))
+    Some(hal.physical_device_capabilities().properties().api_version)
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-fn vulkan_details(_: &wgpu::Adapter) -> Option<(u32, bool)> {
+fn vulkan_api_version(_: &wgpu::Adapter) -> Option<u32> {
     None
-}
-
-/// Adapter usable on its API: not refused by the game's list.
-fn accepted(a: &wgpu::Adapter) -> bool {
-    let info = a.get_info();
-    !vulkan_details(a).is_some_and(|(_, intel)| known_problematic(intel, info.vendor, info.device))
-}
-
-/// Like the game, which keeps the first suitable device but prefers a discrete one: another
-/// hardware adapter of the same API, compatible with the window, when the chosen one is refused.
-fn replacement(inst: &wgpu::Instance, backends: wgpu::Backends, surface: &wgpu::Surface<'_>) -> Option<wgpu::Adapter> {
-    let mut ok: Vec<wgpu::Adapter> = pollster::block_on(inst.enumerate_adapters(backends))
-        .into_iter()
-        .filter(|a| a.get_info().device_type != wgpu::DeviceType::Cpu && a.is_surface_supported(surface) && accepted(a))
-        .collect();
-    let i = ok.iter().position(|a| a.get_info().device_type == wgpu::DeviceType::DiscreteGpu).unwrap_or(0);
-    (!ok.is_empty()).then(|| ok.swap_remove(i))
 }
 
 /// APIs to try, in order, according to `RUSTCRAFT_BACKEND` then the `preferred` setting.
@@ -275,17 +239,7 @@ pub fn pick(window: &Arc<Window>) -> Picked {
             ..Default::default()
         }));
         let adapter = match found {
-            Ok(a) if accepted(&a) => a,
-            Ok(a) => {
-                eprintln!("API {backends:?}: device [{}] is known to be problematic, skipping", a.get_info().name);
-                match replacement(&inst, backends, &surface) {
-                    Some(b) => b,
-                    None => {
-                        tried.push((name, "Device known problematic".into()));
-                        continue;
-                    }
-                }
-            }
+            Ok(a) => a,
             Err(e) => {
                 eprintln!("API {backends:?}: no compatible adapter");
                 tried.push((name, e.to_string()));
@@ -305,7 +259,7 @@ pub fn pick(window: &Arc<Window>) -> Picked {
         };
         crate::boot::mark("GPU device");
         let info = adapter.get_info();
-        let text = GpuText::new(&info, vulkan_details(&adapter).map(|(api, _)| api));
+        let text = GpuText::new(&info, vulkan_api_version(&adapter));
         if info.device_type != wgpu::DeviceType::Cpu {
             return Picked { surface, adapter, device, queue, text };
         }
@@ -351,19 +305,6 @@ mod tests {
         info.driver.clear();
         let dx = GpuText::new(&info, None);
         assert_eq!((dx.backend, dx.driver.as_str()), ("DX12", "566.36"));
-    }
-
-    /// Old Intel GPUs refused on Vulkan only under Intel's Windows driver; other vendors and
-    /// recent Intel devices kept.
-    #[test]
-    fn old_intel_refused_on_vulkan() {
-        assert!(INTEL_REFUSED.windows(2).all(|w| w[0] < w[1]), "sorted");
-        assert!(known_problematic(true, 0x8086, 0x0166));
-        assert!(known_problematic(true, 0x8086, 0x22B3));
-        assert!(!known_problematic(false, 0x8086, 0x0166), "other driver (Mesa)");
-        assert!(!known_problematic(true, 0x8086, 0x9A49), "recent Intel");
-        assert!(!known_problematic(true, 0x10DE, 0x0166), "other vendor");
-        assert!(!known_problematic(true, 0x8086, 0x1_0166), "beyond 16 bits");
     }
 
     /// The "Graphics API" setting chooses the order (the environment variable takes priority).

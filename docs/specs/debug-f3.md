@@ -240,7 +240,9 @@ consistently).
 - `<mode>`: surface presentation mode: ` (immediate)`, ` (mailbox)`, ` (fifo)`,
   ` (fifo relaxed)`, empty if unknown. Direct correspondence with the wgpu modes.
 - `<Hz>`: refresh rate of the screen's active video mode, an integer if round otherwise `%.2f`; `0`
-  if unknown.
+  if unknown. The rate is the window library's single-precision value, truncated to hundredths
+  (60.001 Hz is shown `60`, 143.859 Hz `143.85`); `%.2f` rounds half up the shortest digits of
+  that value widened to double (`video::rate_label`, also the fullscreen mode labels).
 
 ### 3.3 Server — `tps`
 

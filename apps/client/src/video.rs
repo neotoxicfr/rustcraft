@@ -179,8 +179,24 @@ impl VideoMode {
             width: size.width,
             height: size.height,
             bits: [c; 3],
-            refresh: m.refresh_rate_millihertz() as f32 / 1000.0,
+            refresh: screen_rate(m.refresh_rate_millihertz()),
         }
+    }
+}
+
+/// Screen frequency as the game receives it from its window library (SDL 3): whole hundredths of
+/// hertz, truncated (59.951 Hz gives 59.95), in single precision.
+pub fn screen_rate(millihertz: u32) -> f32 {
+    (millihertz / 10) as f32 / 100.0
+}
+
+/// Frequency label of the game (F3 fps line, fullscreen modes): a whole rate without decimals,
+/// otherwise two decimals with Java's rounding of the single-precision value widened to double.
+pub fn rate_label(rate: f32) -> String {
+    if rate == rate.round_ties_even() {
+        (rate as i32).to_string()
+    } else {
+        crate::tech_blocks::java_fixed(f64::from(rate), 2)
     }
 }
 
@@ -245,9 +261,7 @@ pub fn mode_json(i: i32) -> String {
 /// Arguments of `options.fullscreen.entry`: width, height, frequency, bits.
 pub fn mode_label_args(json: &str) -> Option<[String; 4]> {
     let m = VideoMode::read(json)?;
-    let rate =
-        if m.refresh == m.refresh.round() { format!("{}", m.refresh as i32) } else { format!("{:.2}", m.refresh) };
-    Some([m.width.to_string(), m.height.to_string(), rate, m.bits.iter().sum::<u16>().to_string()])
+    Some([m.width.to_string(), m.height.to_string(), rate_label(m.refresh), m.bits.iter().sum::<u16>().to_string()])
 }
 
 /// Darkness effect of the local player: fade in and out of 22 ticks (fade out started
@@ -651,6 +665,22 @@ mod tests {
         let official = r#"{"width":2560,"height":1440,"red_bits":8,"green_bits":8,"blue_bits":8,"refresh_rate":144.0}"#;
         assert_eq!(VideoMode::read(official).map(|m| (m.width, m.refresh)), Some((2560, 144.0)));
         assert_eq!(VideoMode::read(""), None);
+    }
+
+    /// Frequency as the game gets it (hundredths, truncated) and labels it (whole number, or two
+    /// decimals rounded half up on the widened value).
+    #[test]
+    fn refresh_rate_label_like_the_game() {
+        let label = |mhz| rate_label(screen_rate(mhz));
+        assert_eq!(label(0), "0");
+        assert_eq!(label(144_000), "144");
+        assert_eq!(label(60_001), "60", "truncated to 60.00: whole");
+        assert_eq!(label(59_940), "59.94");
+        assert_eq!(label(143_859), "143.85", "truncated, not rounded");
+        // A tie exactly representable in single precision (saved mode): half up, not half to even.
+        assert_eq!(rate_label(59.625), "59.63");
+        let saved = r#"{"width":1,"height":1,"red_bits":8,"green_bits":8,"blue_bits":8,"refresh_rate":59.625}"#;
+        assert_eq!(mode_label_args(saved).map(|a| a[2].clone()), Some("59.63".into()));
     }
 
     #[test]
