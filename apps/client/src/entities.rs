@@ -547,7 +547,8 @@ impl Entity {
                     Size::scalable(ty.w, ty.h - 1.43).eye(0.845)
                 }
             }
-            "sniffer" if self.meta_int(17) == Some(5) => {
+            // Digging (state 5 of entity data 18; 17 is the age lock): 0.4 lower.
+            "sniffer" if self.meta_int(18) == Some(5) => {
                 Size::scalable(ty.w, ty.h - 0.4).eye(0.81).scale(if baby { 0.5 } else { 1.0 })
             }
             "warden" if matches!(pose, 13 | 14) => Size::fixed(base.w, 1.0),
@@ -1540,6 +1541,23 @@ mod size_tests {
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-5
+    }
+
+    /// Digging sniffer (state 5 in entity data 18): 0.4 lower, eyes at 0.81; the age lock
+    /// (entity data 17) changes nothing. Before: the state was read from 17, so the size was never applied.
+    #[test]
+    fn digging_sniffer_is_lower() {
+        let table = [[1.9f32, 1.75, 1.05, 2.0]];
+        let mut e = spawn("sniffer", [0.0; 3], 0);
+        let stand = e.size(&table);
+        assert!((stand.h - 1.75).abs() < 1e-6, "{}", stand.h);
+        e.meta.insert(18, Meta::Variant(5, 0));
+        let dig = e.size(&table);
+        assert!((dig.h - 1.35).abs() < 1e-6 && (dig.eye - 0.81).abs() < 1e-6, "{} {}", dig.h, dig.eye);
+        assert!((dig.w - 1.9).abs() < 1e-6);
+        e.meta.insert(18, Meta::Variant(4, 0));
+        e.meta.insert(17, Meta::Int(5));
+        assert!((e.size(&table).h - 1.75).abs() < 1e-6);
     }
 
     /// Mannequin cape point tracked like a player's (a quarter of the difference per tick,

@@ -86,8 +86,9 @@ pub fn party_track(ents: &mut crate::entities::Entities, is_jukebox: &dyn Fn([i3
     animals::party_track(ents, is_jukebox);
 }
 
-/// Water contact of the kinds whose pose depends on it (frog, turtle, equines), noted
-/// before their tick like the game; nothing is computed for the others.
+/// Water contact of the kinds whose pose depends on it (frog, turtle, equines, guardians), noted
+/// before their tick like the game; nothing is computed for the others. Guardians: also whether
+/// the block under them is solid (full top face), extra 9, for their flop out of the water.
 pub fn water_track(
     ents: &mut crate::entities::Entities,
     data: &rc_data::VersionData,
@@ -96,10 +97,57 @@ pub fn water_track(
 ) {
     let mask = water_fluids(data);
     for e in ents.map.values_mut() {
-        if animals::water_posed(&e.kind) {
+        let guardian = matches!(e.kind.as_str(), "guardian" | "elder_guardian");
+        if guardian || animals::water_posed(&e.kind) {
             e.in_water = touches_water(data, dims, e, state, mask);
         }
+        if guardian {
+            let below = [e.pos[0].floor() as i32, e.pos[1].floor() as i32 - 1, e.pos[2].floor() as i32];
+            let top = data.state(state(below[0], below[1], below[2])).is_some_and(|s| top_full(data.shape(s.collision)));
+            e.extra[9] = f32::from(u8::from(top));
+        }
     }
+}
+
+/// Start tick of the sniffer's digging animation (extra 1), if it is running.
+pub fn sniffer_dig_start(e: &Entity) -> Option<f32> {
+    keyframes::State::start_of(e.extra[1])
+}
+
+/// Whether the top face of a collision shape is entirely covered (exact union of the boxes
+/// that reach it: grid of the edges, each cell tested at its center).
+fn top_full(boxes: &[rc_data::Aabb]) -> bool {
+    const E: f64 = 1e-7;
+    let top = || boxes.iter().filter(|b| b.max[1] >= 1.0 - E);
+    // Common case: one box covers the whole face.
+    if top().any(|b| b.min[0] <= E && b.min[2] <= E && b.max[0] >= 1.0 - E && b.max[2] >= 1.0 - E) {
+        return true;
+    }
+    // Otherwise, edges of the top boxes (at most 8, no allocation) and each cell of the grid.
+    let (mut xs, mut zs) = ([0.0f64; 18], [0.0f64; 18]);
+    (xs[1], zs[1]) = (1.0, 1.0);
+    let mut n = 2;
+    for b in top() {
+        if n == xs.len() {
+            return false;
+        }
+        (xs[n], xs[n + 1]) = (b.min[0].clamp(0.0, 1.0), b.max[0].clamp(0.0, 1.0));
+        (zs[n], zs[n + 1]) = (b.min[2].clamp(0.0, 1.0), b.max[2].clamp(0.0, 1.0));
+        n += 2;
+    }
+    if n == 2 {
+        return false;
+    }
+    let (xs, zs) = (&mut xs[..n], &mut zs[..n]);
+    xs.sort_by(f64::total_cmp);
+    zs.sort_by(f64::total_cmp);
+    xs.windows(2).filter(|w| w[1] - w[0] > E).all(|wx| {
+        let cx = (wx[0] + wx[1]) / 2.0;
+        zs.windows(2).filter(|w| w[1] - w[0] > E).all(|wz| {
+            let cz = (wz[0] + wz[1]) / 2.0;
+            top().any(|b| b.min[0] <= cx && cx <= b.max[0] && b.min[2] <= cz && cz <= b.max[2])
+        })
+    })
 }
 
 /// Bits of the water fluids (indices of `fluids`), read once per call rather than per block.
@@ -7494,6 +7542,26 @@ mod tests {
 
     use super::keyframes::testkit;
     use rc_proto_v777::entity::Meta;
+
+    /// Full top face (solid ground for the guardian's flop): full block, union of two
+    /// halves, high slab; not a low slab, a hole in the middle or a single half.
+    #[test]
+    fn top_face_full_by_union() {
+        let b = |min: [f64; 3], max: [f64; 3]| rc_data::Aabb { min, max };
+        assert!(top_full(&[b([0.0; 3], [1.0; 3])]));
+        assert!(top_full(&[b([0.0, 0.0, 0.0], [0.5, 1.0, 1.0]), b([0.5, 0.0, 0.0], [1.0, 1.0, 1.0])]));
+        assert!(top_full(&[b([0.0, 0.5, 0.0], [1.0, 1.0, 1.0])]));
+        assert!(!top_full(&[b([0.0; 3], [1.0, 0.5, 1.0])]));
+        assert!(!top_full(&[b([0.0, 0.0, 0.0], [0.5, 1.0, 1.0])]));
+        assert!(!top_full(&[]));
+        let ring = [
+            b([0.0, 0.0, 0.0], [1.0, 1.0, 0.25]),
+            b([0.0, 0.0, 0.75], [1.0, 1.0, 1.0]),
+            b([0.0, 0.0, 0.0], [0.25, 1.0, 1.0]),
+            b([0.75, 0.0, 0.0], [1.0, 1.0, 1.0]),
+        ];
+        assert!(!top_full(&ring));
+    }
 
     /// Valid entity shader (emissive, flat, scrolling flags included).
     #[test]
