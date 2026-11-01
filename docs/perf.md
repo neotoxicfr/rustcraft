@@ -2433,72 +2433,56 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   walk of the order of 3.65 ms for 12,000 files (G1-F15 measurement), kept for safety.
 - Free disk space (`rc_sim::storage::low_disk_space`): one system call at opening, on
   the main thread; not measured separately (negligible).
-- Coupe « ... » des noms de la liste et des paquets (`rc_text::clamp`, largeur cumulée en un
-  passage au lieu d'une remesure du préfixe à chaque caractère) : 64 caractères coupés à 157,
-  1 074 puis 1 181 ns par appel pour l'ancienne méthode, 596 puis 651 ns pour la nouvelle (banc
-  `clamp_bench`, 2 passes, meilleur de 5 × 200 000 appels) : environ 1,8 fois plus rapide, gardé.
-  Sortie identique (assertion du banc, test `fit_matches_prefix_widths_and_clamp_adds_dots`).
-  Multi-cœurs et GPU sans objet (moins d'une microseconde par ligne, au dessin).
-- Question de la copie à l'ouverture (`rc_sim::packs::backup_question` : deux .dat gzip, paquets
-  du monde parcourus) : déplacée du fil principal vers un fil, sous l'écran « Chargement des
-  ressources » que le jeu affiche à ce moment ; le fil principal ne bloque plus. Pire cas (paquet
-  en dossier de dizaines de milliers de fichiers) non mesuré : à mesurer machine calme.
-- Contrôle des liens d'un monde : fait dès « Jouer » (comme le jeu, avant toute lecture), et
-  refait à l'ouverture effective en secours (le dossier peut changer entre-temps) ; second
-  parcours de l'ordre de 3,65 ms pour 12 000 fichiers (mesure G1-F15), gardé pour la sûreté.
-- Espace disque libre (`rc_sim::storage::low_disk_space`) : un appel système à l'ouverture, sur
-  le fil principal ; non mesuré à part (négligeable).
-## G5-F02e : contacts avec les blocs traversés, bottes enchantées (25/10, machine chargée)
+## G5-F02e: contacts with crossed blocks, enchanted boots (25/10, loaded machine)
 
-- Parcours des cases balayées par une créature (`rc_sim::contact`, segments d'un seul axe, cases
-  dédoublonnées dans un vecteur réutilisé, famille de contact lue dans une table d'un octet par
-  bloc construite une fois) : 78,6 ns par tick et par créature à l'air libre, 79,1 ns dans une
-  toile (banc `banc_contacts_creature`, meilleur de 5 × 100 000) ; 500 créatures ≈ 40 µs par
-  tick. Aucune allocation par tick. Pistes non retenues faute de gain à cette échelle : sauter
-  le parcours d'une créature immobile (il faudrait suivre les changements de blocs autour
-  d'elle), répartir sur plusieurs cœurs (les effets modifient le monde, ordre du jeu imposé),
-  GPU sans objet. À remesurer machine calme (scène de mobs nombreux).
-- Joueur : un parcours par tick (mêmes coûts) ; bottes sans Semelles givrantes ni Agilité des
-  âmes : sortie immédiate, sans requête au monde.
-- Objets et orbes (reprise du 25/10) : le report en fin de liste comptait tous les objets à leur
-  position de fin de tick (écart sur la plaque pondérée). Remplacé par un contact juste après le
-  déplacement de chaque objet, la plaque lisant une copie des positions (vecteur réutilisé,
-  rempli une fois par tick : une copie de 32 octets par objet, aucune allocation en régime
-  établi). Projectiles : contact dans le pas de déplacement, avant l'impact. Fil : test de la
-  boîte balayée contre sa forme (six comparaisons par segment, seulement dans une case de fil).
-  Banc créature après reprise : 77,3 ns à l'air libre, 82,7 ns dans une toile (bruit du banc
-  chargé, même ordre qu'avant). À remesurer machine calme (scène d'objets nombreux).
-- Reprise 2 (25/10 soir, machine chargée, meilleur de 5 × 100 000, A/B alternés contre HEAD) :
-  parcours exact du jeu (ligne droite pour les projectiles, tronçons par axe sinon, plafond de
-  16 itérations), feu et lave des projectiles sur ce parcours. Correction seule, sans piste :
-  créature 82-83 ns (avant 73-74), pas de flèche 329-338 ns (avant 224-226) en plein air dans la
-  section d'une rangée de plaques, 546-552 ns au ras des plaques (avant 393-394). Pistes, chacune
-  mesurée seule puis cumulée :
-  - famille de contact lue dans la table sans copier la vue (deux compteurs atomiques par
-    case) : créature 75-76 ns, flèche 287 ns. Gardée.
-  - portails : identifiants tenus par la table au lieu de trois recherches par nom, bloc lu
-    sans copie de la vue (aussi dans le relevé des palettes) : 65 → 24 ns par appel (flèches,
-    blocs qui tombent, TNT). Gardée.
-  - parcours en appel statique (générique) au lieu de fonctions de visite dynamiques : parcours
-    seul 156 → 147 ns (6 cases). Gardée.
-  - dédoublonnage du parcours par grille de bits sur l'enveloppe (au lieu d'une recherche dans
-    la liste) : parcours 184 → 200-202 ns, perd. Gardée derrière `RUSTCRAFT_OPT_WALKGRID=1`
-    (coupée par défaut) pour le banc machine calme.
-  - plancher par troncature entière au lieu de `f64::floor` : perd (créature 82 ns contre
-    72-74, parcours 183-188 contre 163-168, 3 passes alternées). Écartée : un interrupteur
-    coûterait à chaque appel ; à remesurer machine calme.
-  - sauter le vide : relevé des palettes des sections traversées (familles plaque, fil, feu,
-    lave, bouton en bois) avant tout parcours. Section vide 44 ns contre 254-260 sans, section
-    riche (une quarantaine d'états) 102 contre 286-292 ; section avec plaques : +10 ns (273
-    contre 262-264, 453-457 contre 438-446). Gardée, `RUSTCRAFT_OPT_CONTACTPAL=0` la coupe.
-  - même relevé pour les créatures : section vide 30 ns contre 74, section riche 58 contre 75,
-    mais +20 à 27 ns quand la section a un bloc de contact (plein air près d'une toile 95-103
-    contre 73-77, dans la toile 99-105 contre 75-79). Gain selon la scène : gardée coupée,
-    `RUSTCRAFT_OPT_CONTACTPAL_MOBS=1` l'active, à trancher sur les scènes machine calme.
-  Cumul retenu contre HEAD (2 passes alternées) : créature 74-75 ns contre 75-78 à l'air libre,
-  73 contre 76-78 dans une toile ; flèche en section vide 45 ns contre 222-225, section riche
-  103-106 contre 463-466 ; section avec plaques 268-271 contre 224-228 et 449 contre 390-398
-  au ras des plaques (+14 à 19 % : coût du parcours exact, 150 à 180 ns, que la fidélité
-  impose ; les autres pistes n'y gagnent rien). Un seul fil (ordre du jeu imposé, effets sur le
-  monde), GPU sans objet. Aucune allocation par tick hors portails proches. À remesurer machine
-  calme (scènes de tir à l'arc, Nether).
+- Walk over the cells swept by a mob (`rc_sim::contact`, one-axis segments, cells deduplicated
+  in a reused vector, contact family read from a one-byte-per-block table built once): 78.6 ns
+  per tick and per mob in open air, 79.1 ns in a cobweb (bench `bench_mob_contacts`, best of
+  5 × 100,000); 500 mobs ≈ 40 µs per tick. No allocation per tick. Leads not retained for lack
+  of gain at this scale: skipping the walk of a motionless mob (the changes of blocks around it
+  would have to be tracked), spreading over several cores (the effects modify the world, game
+  order imposed), GPU not applicable. To re-measure on a quiet machine (scene with many mobs).
+- Player: one walk per tick (same costs); boots without Frost Walker or Soul Speed: immediate
+  exit, no query to the world.
+- Items and orbs (revision of 25/10): the deferral to the end of the list counted every item at
+  its end-of-tick position (difference on the weighted plate). Replaced by a contact right after
+  the movement of each item, the plate reading a copy of the positions (reused vector, filled
+  once per tick: a 32-byte copy per item, no allocation in steady state). Projectiles: contact
+  in the movement step, before the impact. Tripwire: swept box tested against its shape (six
+  comparisons per segment, only in a tripwire cell). Mob bench after the revision: 77.3 ns in
+  open air, 82.7 ns in a cobweb (noise of the loaded bench, same order as before). To
+  re-measure on a quiet machine (scene with many items).
+- Revision 2 (25/10 evening, loaded machine, best of 5 × 100,000, A/B alternated against HEAD):
+  exact game walk (straight line for projectiles, per-axis segments otherwise, cap of 16
+  iterations), fire and lava of projectiles on this walk. Correction alone, no lead: mob
+  82-83 ns (before 73-74), arrow step 329-338 ns (before 224-226) in open air in the section
+  of a row of plates, 546-552 ns right at the plates (before 393-394). Leads, each measured
+  alone then combined:
+  - contact family read from the table without copying the view (two atomic counters per
+    cell): mob 75-76 ns, arrow 287 ns. Kept.
+  - portals: ids held by the table instead of three lookups by name, block read without
+    copying the view (also in the palette scan): 65 → 24 ns per call (arrows, falling blocks,
+    TNT). Kept.
+  - walk through static dispatch (generic) instead of dynamic visit functions: walk alone
+    156 → 147 ns (6 cells). Kept.
+  - dedupe of the walk by a bit grid over the envelope (instead of a search in the list): walk
+    184 → 200-202 ns, loses. Kept behind `RUSTCRAFT_OPT_WALKGRID=1` (off by default) for the
+    quiet-machine bench.
+  - floor by integer truncation instead of `f64::floor`: loses (mob 82 ns against 72-74, walk
+    183-188 against 163-168, 3 alternated passes). Discarded: a switch would cost on every
+    call; to re-measure on a quiet machine.
+  - skipping the empty: scan of the palettes of the crossed sections (plate, tripwire, fire,
+    lava, wooden button families) before any walk. Empty section 44 ns against 254-260 without,
+    rich section (about forty states) 102 against 286-292; section with plates: +10 ns (273
+    against 262-264, 453-457 against 438-446). Kept, `RUSTCRAFT_OPT_CONTACTPAL=0` disables it.
+  - same scan for mobs: empty section 30 ns against 74, rich section 58 against 75, but +20 to
+    27 ns when the section has a contact block (open air near a cobweb 95-103 against 73-77, in
+    the cobweb 99-105 against 75-79). Gain depends on the scene: kept off,
+    `RUSTCRAFT_OPT_CONTACTPAL_MOBS=1` enables it, to be settled on the quiet-machine scenes.
+  Total retained against HEAD (2 alternated passes): mob 74-75 ns against 75-78 in open air, 73
+  against 76-78 in a cobweb; arrow in an empty section 45 ns against 222-225, rich section
+  103-106 against 463-466; section with plates 268-271 against 224-228 and 449 against 390-398
+  right at the plates (+14 to 19%: cost of the exact walk, 150 to 180 ns, that fidelity
+  requires; the other leads gain nothing there). A single thread (game order imposed, effects
+  on the world), GPU not applicable. No allocation per tick outside nearby portals. To
+  re-measure on a quiet machine (bow shooting scenes, Nether).

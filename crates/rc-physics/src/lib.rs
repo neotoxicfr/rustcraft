@@ -852,7 +852,7 @@ pub struct MoveEffects {
     pub dolphins_grace: bool,
     /// Blindness: restricted mobility (no sprint).
     pub blindness: bool,
-    /// Tissage : enlisement moindre dans la toile.
+    /// Weaving: lesser slowdown in the cobweb.
     pub weaving: bool,
 }
 
@@ -2293,7 +2293,7 @@ impl Player {
             }
         };
         match k {
-            // Tissage : la toile enlise deux fois moins à l'horizontale, cinq fois moins en hauteur.
+            // Weaving: the cobweb slows down half as much horizontally, five times less vertically.
             inside::WEB if self.effects.weaving => stuck(self, [0.5, 0.25, 0.5]),
             inside::WEB => stuck(self, [0.25, f64::from(0.05f32), 0.25]),
             inside::BERRY_BUSH => stuck(self, [f64::from(0.8f32), 0.75, f64::from(0.8f32)]),

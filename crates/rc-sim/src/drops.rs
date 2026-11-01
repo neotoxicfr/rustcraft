@@ -389,7 +389,7 @@ impl Server {
         for d in drops.iter_mut().filter(|d| !d.removed) {
             self.track_object(&mut d.track, d.id, d.pos, d.vel, d.on_ground, 20);
         }
-        // G5-F02e : positions vues des plaques pendant que la liste est sortie.
+        // G5-F02e: positions seen by the plates while the list is taken out.
         let mut live = std::mem::take(&mut self.contact.live_items);
         live.clear();
         live.extend(drops.iter().map(|d| (d.pos, d.removed)));
@@ -436,7 +436,7 @@ impl Server {
             if d.removed {
                 continue;
             }
-            // G5-F02e : plaques et fil juste après son déplacement (les suivants pas encore bougés).
+            // G5-F02e: plates and tripwire right after its movement (the following ones not moved yet).
             self.contact_triggers(old, d.pos, ITEM_SIZE / 2.0, ITEM_SIZE);
             if d.age != -32768 {
                 d.age += 1;
@@ -608,7 +608,7 @@ impl Server {
         for o in orbs.iter_mut().filter(|o| !o.removed) {
             self.track_object(&mut o.track, o.id, o.pos, o.vel, o.on_ground, 20);
         }
-        // G5-F02e : positions vues des plaques pendant que la liste est sortie.
+        // G5-F02e: positions seen by the plates while the list is taken out.
         let mut live = std::mem::take(&mut self.contact.live_orbs);
         live.clear();
         live.extend(orbs.iter().map(|o| (o.pos, o.removed)));
@@ -636,7 +636,7 @@ impl Server {
             if o.on_ground {
                 o.body.fall = 0.0;
             }
-            // G5-F02e : plaques et fil juste après son déplacement.
+            // G5-F02e: plates and tripwire right after its movement.
             self.contact.live_orbs[i].0 = o.pos;
             self.contact_triggers(from, o.pos, ORB_SIZE / 2.0, ORB_SIZE);
             o.age += 1;

@@ -916,7 +916,7 @@ impl Server {
                     && hit(&m.bbox())
             })
             .count();
-        // G5-F02e : créature en cours de tick (sortie de la liste) qui touche un bloc déclencheur.
+        // G5-F02e: mob being ticked (taken out of the list) that touches a trigger block.
         if let Some((id, mb, ignores)) = self.contact.ticking
             && Some(id) != except
             && !(triggers && ignores)
@@ -926,7 +926,7 @@ impl Server {
         }
         if !living {
             let c = &self.contact;
-            // Bloc qui tombe ou TNT en cours de tick : sa boîte courante, pas sa case périmée.
+            // Falling block or TNT being ticked: its current box, not its stale slot.
             let ts = c.ticking_sim;
             n += self
                 .bs
@@ -936,7 +936,7 @@ impl Server {
                 .filter(|e| !e.removed && ts.is_none_or(|t| t.0 != e.id) && hit(&Self::entity_box(e)))
                 .count();
             n += usize::from(ts.is_some_and(|t| hit(&t.1)));
-            // Objets et orbes : pendant le tick de leur liste, positions tenues à jour au fil du tick.
+            // Items and orbs: during the tick of their list, positions kept up to date as the tick goes on.
             n += if c.items_ticking {
                 c.live_items.iter().filter(|&&(pos, gone)| !gone && hit(&around(pos, 0.25, 0.25))).count()
             } else {
@@ -947,7 +947,7 @@ impl Server {
             } else {
                 self.life.orbs.iter().filter(|o| !o.is_removed() && hit(&around(o.pos, 0.5, 0.5))).count()
             };
-            // Projectile en cours de tick : sa boîte courante, pas sa case encore à l'ancienne place.
+            // Projectile being ticked: its current box, not its slot still at the old place.
             let tp = c.ticking_proj;
             n += self
                 .proj

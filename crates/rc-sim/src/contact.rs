@@ -1,29 +1,30 @@
-//! Contacts des entités avec les blocs qu'elles traversent (G5-F02e) et enchantements des
-//! bottes liés au bloc foulé.
+//! Contacts of entities with the blocks they cross (G5-F02e) and boots enchantments tied to
+//! the block stepped on.
 //!
-//! Blocs traversés, après le déplacement du tick : la boîte de l'entité (rétrécie de 1e-5) est
-//! balayée de sa position de début de tick à sa position finale, axe par axe (Y, puis le plus
-//! grand de X et Z) pour ce qui se déplace avec collisions, en une seule ligne droite pour les
-//! projectiles qui prennent leur position directement (tous sauf la fusée) ; au plus 16
-//! itérations, puis la seule boîte d'arrivée ; un effet par case. Effets :
-//! - plaques de pression et fil : toute entité (créatures, objets, orbes, projectiles hors œil
-//!   de l'Ender, blocs qui tombent, TNT) teste la plaque à 0 ou le fil détendu, comme le joueur,
-//!   juste après son propre déplacement ; le fil seulement si la boîte balayée recoupe sa forme
-//!   (1 à 2,5 px s'il est accroché, 0 à 8 px sinon) ;
-//! - buisson à baies (vivants hors renard et abeille) : enlisement 0,8 × 0,75 × 0,8 et, dès
-//!   l'âge 1, 1 dégât `sweet_berry_bush` si le déplacement horizontal du tick dépasse 0,003
-//!   sur un axe ;
-//! - toile : enlisement 0,25 × 0,05 × 0,25, ou 0,5 × 0,25 × 0,5 sous l'effet Tissage ;
-//! - rose de Wither (vivants, hors paisible, entité non invulnérable) : Wither 40 ticks ;
-//! - chaudrons, seulement si la boîte touche le contenu (colonne de 12 px de large depuis 4 px
-//!   jusqu'au niveau) : lave = dégel, allumage 15 s puis dégâts de lave ; eau et neige
-//!   poudreuse = l'entité en feu baisse le niveau (la neige devient de l'eau) puis s'éteint.
-//!   Ces effets différés passent après le parcours, dans l'ordre du jeu : dégel, allumage par
-//!   la lave (puis ses dégâts), extinction.
+//! Blocks crossed, after the movement of the tick: the entity's box (shrunk by 1e-5) is
+//! swept from its position at the start of the tick to its final position, axis by axis (Y,
+//! then the larger of X and Z) for what moves with collisions, in a single straight line for
+//! projectiles that take their position directly (all but the firework); at most 16
+//! iterations, then only the arrival box; one effect per cell. Effects:
+//! - pressure plates and tripwire: every entity (mobs, items, orbs, projectiles other than the
+//!   Ender eye, falling blocks, TNT) tests the plate at 0 or the relaxed tripwire, like the
+//!   player, right after its own movement; the tripwire only if the swept box intersects its
+//!   shape (1 to 2.5 px if attached, 0 to 8 px otherwise);
+//! - sweet berry bush (living entities other than fox and bee): slowdown 0.8 × 0.75 × 0.8 and,
+//!   from age 1, 1 `sweet_berry_bush` damage if the horizontal movement of the tick exceeds
+//!   0.003 on an axis;
+//! - cobweb: slowdown 0.25 × 0.05 × 0.25, or 0.5 × 0.25 × 0.5 under the Weaving effect;
+//! - wither rose (living entities, not on Peaceful difficulty, entity not invulnerable):
+//!   Wither 40 ticks;
+//! - cauldrons, only if the box touches the contents (column 12 px wide from 4 px up to the
+//!   level): lava = thaw, ignition 15 s then lava damage; water and powder snow = the burning
+//!   entity lowers the level (snow becomes water) then is extinguished. These deferred effects
+//!   run after the walk, in the game's order: thaw, ignition by lava (then its damage),
+//!   extinguishing.
 //!
-//! Bottes : Semelles givrantes (disque de glace givrée sur l'eau, immunité aux dégâts de sol
-//! brûlant) et Agilité des âmes (vitesse et efficacité de mouvement sur le sable et la terre
-//! des âmes, usure, particules et son), d'après les fichiers d'enchantement du jeu.
+//! Boots: Frost Walker (frosted ice disc on water, immunity to hot-floor damage) and Soul
+//! Speed (speed and movement efficiency on soul sand and soul soil, wear, particles and
+//! sound), from the game's enchantment files.
 
 use rc_physics::Aabb;
 
@@ -42,13 +43,13 @@ const WITHER_ROSE: u8 = 5;
 const LAVA_CAULDRON: u8 = 6;
 const WATER_CAULDRON: u8 = 7;
 const SNOW_CAULDRON: u8 = 8;
-/// Feu, lave et bouton en bois (enfoncé par les flèches) : effets des projectiles seulement (les
-/// vivants passent ailleurs).
+/// Fire, lava and wooden button (pressed by arrows): projectile effects only (living entities
+/// are handled elsewhere).
 pub(crate) const FIRE: u8 = 9;
 pub(crate) const LAVA: u8 = 10;
 pub(crate) const BUTTON: u8 = 11;
 
-/// Famille de contact d'un bloc (par nom).
+/// Contact family of a block (by name).
 fn kind_of(name: &str) -> u8 {
     let n = name.strip_prefix("minecraft:").unwrap_or(name);
     match n {
@@ -66,84 +67,85 @@ fn kind_of(name: &str) -> u8 {
     }
 }
 
-/// Identifiant des modificateurs d'Agilité des âmes (emplacement des pieds).
+/// Id of the Soul Speed modifiers (feet slot).
 const SOUL_ID: &str = "minecraft:enchantment.soul_speed/feet";
 
-/// État des enchantements de bottes liés au bloc (joueur ou créature).
+/// State of the block-tied boots enchantments (player or mob).
 #[derive(Debug, Clone, Default)]
 pub struct Boots {
-    /// Bloc de la dernière évaluation (changement de bloc = nouvelle évaluation).
+    /// Block of the last evaluation (block change = new evaluation).
     last: Option<P>,
-    /// Au sol au tick précédent (un atterrissage relance l'évaluation, comme le jeu).
+    /// On the ground at the previous tick (a landing restarts the evaluation, like the game).
     grounded: bool,
-    /// Niveaux lus sur les bottes portées lors de la dernière évaluation.
+    /// Levels read on the worn boots at the last evaluation.
     soul: i32,
     frost: i32,
-    /// Modificateurs d'Agilité des âmes posés.
+    /// Soul Speed modifiers applied.
     pub(crate) soul_active: bool,
-    /// Joueur spectateur au tick précédent.
+    /// Spectator player at the previous tick.
     spectator: bool,
 }
 
-/// État des contacts tenu par le serveur.
+/// Contact state held by the server.
 #[derive(Debug, Default)]
 pub struct Contact {
-    /// Famille de contact par bloc (construite au premier usage).
+    /// Contact family per block (built on first use).
     table: Vec<u8>,
-    /// Cases du parcours en cours (réutilisées d'un appel à l'autre).
+    /// Cells of the walk in progress (reused from one call to the next).
     pub(crate) cells: Vec<Seen>,
-    /// Cases déjà entrées pendant ce parcours (un effet par case).
+    /// Cells already entered during this walk (one effect per cell).
     entered: Vec<P>,
-    /// Créature en cours de tick, sortie de la liste : identifiant, boîte, ignore les blocs
-    /// déclencheurs (chauve-souris). Comptée par les plaques qu'elle enfonce.
+    /// Mob being ticked, taken out of the list: id, box, ignores trigger blocks (bat).
+    /// Counted by the plates it presses.
     pub(crate) ticking: Option<(i32, Aabb, bool)>,
-    /// Projectile en cours de tick (copie hors de sa case) : identifiant, boîte à sa position
-    /// courante ; sa case, encore à l'ancienne position, n'est pas comptée par les plaques.
+    /// Projectile being ticked (copy outside its slot): id, box at its current position;
+    /// its slot, still at the old position, is not counted by the plates.
     pub(crate) ticking_proj: Option<(i32, Aabb)>,
-    /// Bloc qui tombe ou TNT en cours de tick, même principe que `ticking_proj`.
+    /// Falling block or TNT being ticked, same principle as `ticking_proj`.
     pub(crate) ticking_sim: Option<(i32, Aabb)>,
-    /// Pendant le tick de la liste des objets au sol (sortie du serveur) : position et retrait
-    /// de chacun, tenus à jour au fil du tick ; vide hors de ce tick. Une plaque touchée compte
-    /// ainsi les objets déjà déplacés à leur nouvelle place, les suivants à l'ancienne.
+    /// During the tick of the list of ground items (taken out of the server): position and
+    /// removal of each, kept up to date as the tick goes on; empty outside this tick. A pressed
+    /// plate thus counts the items already moved at their new place, the following ones at the
+    /// old one.
     pub(crate) live_items: Vec<([f64; 3], bool)>,
     pub(crate) items_ticking: bool,
-    /// Même chose pour les orbes d'expérience.
+    /// Same for experience orbs.
     pub(crate) live_orbs: Vec<([f64; 3], bool)>,
     pub(crate) orbs_ticking: bool,
-    /// Bottes du joueur.
+    /// Player's boots.
     pub(crate) player: Boots,
 }
 
-/// Effets différés d'un parcours.
+/// Deferred effects of a walk.
 #[derive(Default)]
 struct Deferred {
     lava: u8,
     quench: Vec<(P, u32)>,
 }
 
-/// Une case vue par le parcours d'un déplacement et le tronçon (début, fin) qui l'a vue : le
-/// test de forme suit ce tronçon. Une case peut revenir (tronçon suivant, boîte d'arrivée après
-/// le plafond) : un effet qui ne se rejoue pas sans dommage se garde des cases déjà entrées.
+/// A cell seen by the walk of a movement and the segment (start, end) that saw it: the shape
+/// test follows this segment. A cell may come back (next segment, arrival box after the cap):
+/// an effect that cannot be replayed harmlessly guards against the cells already entered.
 pub(crate) type Seen = (P, [f64; 3], [f64; 3]);
 
-/// Plafond d'itérations du parcours d'un déplacement, comme le jeu.
+/// Iteration cap of the walk of a movement, like the game.
 const MAX_STEPS: i32 = 16;
 
-/// Trajet par axe dont la somme des trois axes reste sous 7 blocs : un tronçon d'un axe consomme
-/// au plus sa longueur + 3 itérations, le plafond est hors d'atteinte.
+/// Per-axis path whose three axes sum to less than 7 blocks: a one-axis segment consumes at
+/// most its length + 3 iterations, so the cap is out of reach.
 const SHORT: f64 = 7.0;
 
-/// Ordre des tronçons d'un trajet par axe : Y, puis le plus grand de X et Z (X à égalité).
+/// Order of the segments of a per-axis path: Y, then the larger of X and Z (X on a tie).
 fn axis_order(d: [f64; 3]) -> [usize; 3] {
     if d[0].abs() < d[2].abs() { [1, 2, 0] } else { [1, 0, 2] }
 }
 
-/// Cases touchées par la boîte (demi-largeur `half`, hauteur `h`, rétrécie de 1e-5) déplacée de
-/// `from` à `to`, comme le parcours des blocs traversés du jeu : en une ligne droite
-/// (`straight`, projectile qui prend sa position sans collision) ou en un tronçon par axe
-/// (déplacement avec collisions). Au plus 16 itérations pour tout le trajet ; plafond atteint :
-/// la boîte d'arrivée en plus. Trajet par axe court : chaque tronçon couvre exactement son
-/// enveloppe, chaque case une fois, testée sur tout le trajet (même résultat, sans parcours).
+/// Cells touched by the box (half-width `half`, height `h`, shrunk by 1e-5) moved from `from`
+/// to `to`, like the game's crossed-block walk: in a straight line (`straight`, projectile that
+/// takes its position without collision) or in one segment per axis (movement with
+/// collisions). At most 16 iterations for the whole path; cap reached: the arrival box as
+/// well. Short per-axis path: each segment covers exactly its envelope, each cell once, tested
+/// over the whole path (same result, without a walk).
 pub(crate) fn path_cells(from: [f64; 3], to: [f64; 3], half: f64, h: f64, straight: bool, out: &mut Vec<Seen>) {
     let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
     let budget = if straight {
@@ -159,8 +161,8 @@ pub(crate) fn path_cells(from: [f64; 3], to: [f64; 3], half: f64, h: f64, straig
     }
 }
 
-/// Tronçons d'un axe parcourus un à un sous le plafond commun ; rend le budget restant. Trajet
-/// nul : la boîte d'arrivée seule, comme le jeu (ligne droite de longueur nulle).
+/// One-axis segments walked one by one under the common cap; returns the remaining budget.
+/// Null path: the arrival box alone, like the game (straight line of zero length).
 fn axis_walks(from: [f64; 3], to: [f64; 3], half: f64, h: f64, out: &mut Vec<Seen>) -> i32 {
     let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
     let mut budget = MAX_STEPS;
@@ -179,8 +181,8 @@ fn axis_walks(from: [f64; 3], to: [f64; 3], half: f64, h: f64, out: &mut Vec<See
     budget
 }
 
-/// Enveloppes des tronçons d'un axe d'un trajet court (un tronçon d'un axe balaie exactement son
-/// enveloppe), chaque case une fois, avec le trajet entier comme tronçon de test.
+/// Envelopes of the one-axis segments of a short path (a one-axis segment sweeps exactly its
+/// envelope), each cell once, with the whole path as the test segment.
 fn envelope_cells(from: [f64; 3], to: [f64; 3], half: f64, h: f64, out: &mut Vec<Seen>) {
     let e = f64::from(1.0e-5f32);
     let push_env = |a: [f64; 3], b: [f64; 3], out: &mut Vec<Seen>| {
@@ -216,24 +218,24 @@ fn envelope_cells(from: [f64; 3], to: [f64; 3], half: f64, h: f64, out: &mut Vec
     }
 }
 
-/// Piste du dédoublonnage par grille de bits dans le parcours (`RUSTCRAFT_OPT_WALKGRID=1`) : sans
-/// gain mesuré machine chargée (G5-F02e, docs/perf.md), gardée pour le banc machine calme.
+/// Bit-grid dedupe option in the walk (`RUSTCRAFT_OPT_WALKGRID=1`): no gain measured on a
+/// loaded machine (G5-F02e, docs/perf.md), kept for the quiet-machine bench.
 fn walk_grid() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_WALKGRID") == Some("1"))
 }
 
-/// Un parcours du jeu de `a` à `b` autour de la boîte d'arrivée rétrécie de 1e-5 : chaque case
-/// une fois dans ce parcours, arrêt à la première case nouvelle d'itération `max` ou plus. Rend
-/// les itérations consommées (dernière itération vue + 1).
+/// One game walk from `a` to `b` around the arrival box shrunk by 1e-5: each cell once in
+/// this walk, stopping at the first new cell of iteration `max` or more. Returns the
+/// iterations consumed (last iteration seen + 1).
 fn walk(a: [f64; 3], b: [f64; 3], half: f64, h: f64, max: i32, out: &mut Vec<Seen>) -> i32 {
     let e = f64::from(1.0e-5f32);
     let at = Aabb {
         min: [b[0] - half + e, b[1] + e, b[2] - half + e],
         max: [b[0] + half - e, b[1] + h - e, b[2] + half - e],
     };
-    // Cases déjà vues de ce parcours : recherche dans la liste, ou (`RUSTCRAFT_OPT_WALKGRID=1`) un
-    // bit par case de l'enveloppe du trajet quand elle tient en 256 cases.
+    // Cells already seen in this walk: search in the list, or (`RUSTCRAFT_OPT_WALKGRID=1`) one
+    // bit per cell of the path's envelope when it fits in 256 cells.
     let (grid, lo, n) = if walk_grid() {
         let lo = [(a[0].min(b[0]) - half).floor(), a[1].min(b[1]).floor(), (a[2].min(b[2]) - half).floor()];
         let hi = [(a[0].max(b[0]) + half).floor(), (a[1].max(b[1]) + h).floor(), (a[2].max(b[2]) + half).floor()];
@@ -271,14 +273,14 @@ fn walk(a: [f64; 3], b: [f64; 3], half: f64, h: f64, max: i32, out: &mut Vec<See
     last + 1
 }
 
-/// Hauteur du contenu d'un chaudron (en blocs) : lave 15 px, niveaux 6 + 3n px.
+/// Height of the cauldron contents (in blocks): lava 15 px, levels 6 + 3n px.
 fn content_top(kind: u8, level: i32) -> f64 {
     if kind == LAVA_CAULDRON { 15.0 / 16.0 } else { (6.0 + 3.0 * f64::from(level)) / 16.0 }
 }
 
-/// La boîte (demi-largeur `half`, hauteur `h`, pieds en `from`) déplacée par axe jusqu'à `to`
-/// recoupe la forme `c`, tronçon par tronçon dans l'ordre de `path_cells` (un tronçon suit un
-/// seul axe : son enveloppe est la zone balayée), marge de 1e-7 comme le jeu.
+/// The box (half-width `half`, height `h`, feet at `from`) moved axis by axis up to `to`
+/// intersects the shape `c`, segment by segment in the order of `path_cells` (a segment
+/// follows a single axis: its envelope is the swept area), margin of 1e-7 like the game.
 pub(crate) fn swept_touches(c: &Aabb, from: [f64; 3], to: [f64; 3], half: f64, h: f64) -> bool {
     let e = 1.0e-7;
     let hits = |a: [f64; 3], b: [f64; 3]| {
@@ -303,8 +305,8 @@ pub(crate) fn swept_touches(c: &Aabb, from: [f64; 3], to: [f64; 3], half: f64, h
     !moved && hits(from, from)
 }
 
-/// La boîte déplacée de `a` à `b` recoupe la forme `c` : en ligne droite (boîte de départ, non
-/// rétrécie, glissée le long du trajet, comme le jeu) ou par tronçons d'un axe.
+/// The box moved from `a` to `b` intersects the shape `c`: in a straight line (start box, not
+/// shrunk, slid along the path, like the game) or by one-axis segments.
 pub(crate) fn touches(c: &Aabb, a: [f64; 3], b: [f64; 3], half: f64, h: f64, straight: bool) -> bool {
     if !straight {
         return swept_touches(c, a, b, half, h);
@@ -314,20 +316,20 @@ pub(crate) fn touches(c: &Aabb, a: [f64; 3], b: [f64; 3], half: f64, h: f64, str
     crate::mobs::nether::ghast::collided_along(&start, travel, std::slice::from_ref(c))
 }
 
-/// Piste « sauter le vide » des projectiles (`RUSTCRAFT_OPT_CONTACTPAL=0` la coupe) : aucun
-/// parcours quand les palettes des sections traversées n'ont aucun bloc qui agit sur eux.
+/// "Skip the empty" option for projectiles (`RUSTCRAFT_OPT_CONTACTPAL=0` disables it): no
+/// walk when the palettes of the crossed sections hold no block that acts on them.
 pub(crate) fn contact_pal() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_CONTACTPAL") != Some("0"))
 }
 
-/// Même relevé pour les créatures (`RUSTCRAFT_OPT_CONTACTPAL_MOBS=1`).
+/// Same palette scan for mobs (`RUSTCRAFT_OPT_CONTACTPAL_MOBS=1`).
 fn contact_pal_mobs() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_CONTACTPAL_MOBS") == Some("1"))
 }
 
-/// Familles qui agissent sur une créature.
+/// Families that act on a mob.
 const MOB_KINDS: u32 = 1 << PLATE
     | 1 << TRIPWIRE
     | 1 << BERRY
@@ -337,15 +339,15 @@ const MOB_KINDS: u32 = 1 << PLATE
     | 1 << WATER_CAULDRON
     | 1 << SNOW_CAULDRON;
 
-/// Cases (bornes incluses) de l'enveloppe de la boîte (demi-largeur `half`, hauteur `h`) déplacée
-/// de `from` à `to` : tout parcours de ce trajet reste dedans.
+/// Cells (bounds included) of the envelope of the box (half-width `half`, height `h`) moved
+/// from `from` to `to`: any walk of this path stays inside.
 pub(crate) fn envelope(from: [f64; 3], to: [f64; 3], half: f64, h: f64) -> (P, P) {
     let lo = [from[0].min(to[0]) - half, from[1].min(to[1]), from[2].min(to[2]) - half];
     let hi = [from[0].max(to[0]) + half, from[1].max(to[1]) + h, from[2].max(to[2]) + half];
     (lo.map(|v| v.floor() as i32), hi.map(|v| v.floor() as i32))
 }
 
-/// La boîte balayée touche le contenu du chaudron en `p` (colonne de 12 px depuis 4 px).
+/// The swept box touches the contents of the cauldron at `p` (12 px column from 4 px).
 fn touches_content(p: P, top: f64, from: [f64; 3], to: [f64; 3], half: f64, h: f64) -> bool {
     let [x, y, z] = p.map(f64::from);
     let c = Aabb { min: [x + 0.125, y + 0.25, z + 0.125], max: [x + 0.875, y + top, z + 0.875] };
@@ -353,7 +355,7 @@ fn touches_content(p: P, top: f64, from: [f64; 3], to: [f64; 3], half: f64, h: f
 }
 
 impl Server {
-    /// Famille de contact par bloc, construite au premier usage.
+    /// Contact family per block, built on first use.
     fn contact_table(&mut self) -> &[u8] {
         if self.contact.table.is_empty() {
             let kinds = &self.bs.t.kind;
@@ -372,10 +374,10 @@ impl Server {
         self.contact_table().get(usize::from(b)).copied().unwrap_or(NONE)
     }
 
-    /// Une des sections couvrant les cases `lo..=hi` peut-elle contenir un bloc d'une famille de
-    /// `mask` (bit `1 << famille`) ? Lu sur leurs palettes (valeur unique ou liste d'états), sans
-    /// lire leurs blocs ; section sans palette (identifiants directs) : peut-être ; tronçon ou
-    /// section absents : non (leurs cases se lisent comme de l'air du vide).
+    /// Can one of the sections covering cells `lo..=hi` contain a block of a family of `mask`
+    /// (bit `1 << family`)? Read from their palettes (single value or list of states), without
+    /// reading their blocks; section without palette (direct ids): maybe; absent chunk or
+    /// section: no (their cells read as void air).
     pub(crate) fn contact_maybe(&mut self, lo: P, hi: P, mask: u32) -> bool {
         self.contact_table();
         let (table, states) = (&self.contact.table, &self.data.states);
@@ -404,8 +406,8 @@ impl Server {
         false
     }
 
-    /// Parcours des cases de la boîte déplacée (cases gardées dans `self.contact.cells`, à y
-    /// remettre après usage).
+    /// Walk over the cells of the moved box (cells kept in `self.contact.cells`, to be put back
+    /// after use).
     pub(crate) fn contact_cells(
         &mut self,
         from: [f64; 3],
@@ -420,10 +422,11 @@ impl Server {
         cells
     }
 
-    /// Plaques et fil touchés par une entité qui n'est pas vivante et se déplace avec collisions
-    /// (objet, orbe, bloc qui tombe, TNT), juste après son déplacement. Sa position courante doit
-    /// être visible du compte des plaques (liste à jour, ou `ticking_sim` / `live_items` /
-    /// `live_orbs`). Plaque et fil se rejouent sans effet : pas de garde des cases entrées.
+    /// Plates and tripwire touched by an entity that is not alive and moves with collisions
+    /// (item, orb, falling block, TNT), right after its movement. Its current position must be
+    /// visible to the plate count (up-to-date list, or `ticking_sim` / `live_items` /
+    /// `live_orbs`). Plate and tripwire can be replayed without effect: no guard on the cells
+    /// entered.
     pub(crate) fn contact_triggers(&mut self, from: [f64; 3], to: [f64; 3], half: f64, h: f64) {
         let cells = self.contact_cells(from, to, half, h, false);
         for &(p, a, b) in &cells {
@@ -436,8 +439,8 @@ impl Server {
         self.contact.cells = cells;
     }
 
-    /// Lave en `p` touchée par la boîte déplacée de `a` à `b` : boîte du fluide (hauteur propre,
-    /// bloc entier sous de la lave), comme le jeu.
+    /// Lava at `p` touched by the box moved from `a` to `b`: fluid box (own height, whole block
+    /// under more lava), like the game.
     pub(crate) fn lava_touched(&self, p: P, a: [f64; 3], b: [f64; 3], half: f64, h: f64, straight: bool) -> bool {
         let f = self.fluid_at(p);
         if f.kind != 2 {
@@ -449,7 +452,7 @@ impl Server {
         touches(&c, a, b, half, h, straight)
     }
 
-    /// Blocs traversés par une créature pendant son tick (après le déplacement).
+    /// Blocks crossed by a mob during its tick (after the movement).
     pub(crate) fn mob_contacts(&mut self, m: &mut Mob) {
         if m.removed || !m.alive() || crate::mobs::illagers::no_physics(m) {
             return;
@@ -515,7 +518,7 @@ impl Server {
         self.contact.cells = cells;
         self.contact.entered = entered;
         if fx.lava > 0 {
-            m.ticks_frozen = 0; // dégel
+            m.ticks_frozen = 0; // thaw
             let immune = m.kind.info().fire_immune || crate::mobs::recent::fire_immune(m);
             if !immune {
                 m.fire = m.fire.max(300);
@@ -538,8 +541,8 @@ impl Server {
         }
     }
 
-    /// Blocs traversés par le joueur au tick (son mouvement connu ; plaques et fil restent au
-    /// mouvement reçu, `player_touch_blocks`).
+    /// Blocks crossed by the player during the tick (its known movement; plates and tripwire
+    /// stay with the received movement, `player_touch_blocks`).
     pub(crate) fn player_contacts(&mut self) {
         if self.game_mode == 3 || self.life.vit.dead {
             return;
@@ -592,7 +595,7 @@ impl Server {
         self.contact.cells = cells;
         self.contact.entered = entered;
         if fx.lava > 0 {
-            self.life.vit.ticks_frozen = 0; // dégel
+            self.life.vit.ticks_frozen = 0; // thaw
             self.player_ignite(300);
             for _ in 0..fx.lava {
                 if self.hurt("minecraft:lava", 4.0) {
@@ -611,8 +614,8 @@ impl Server {
         }
     }
 
-    /// Entité en feu dans un chaudron d'eau ou de neige poudreuse : un niveau en moins (la neige
-    /// devient de l'eau au même niveau avant de baisser).
+    /// Burning entity in a water or powder snow cauldron: one level less (the snow becomes
+    /// water at the same level before lowering).
     fn cauldron_quench(&mut self, p: P, s: u32) {
         let s = if self.contact_kind(s) == SNOW_CAULDRON {
             let w = self.default_state("minecraft:water_cauldron");
@@ -623,10 +626,10 @@ impl Server {
         self.cauldron_lower(p, s);
     }
 
-    // --- Bottes : Semelles givrantes, Agilité des âmes. ---
+    // --- Boots: Frost Walker, Soul Speed. ---
 
-    /// Immunité des Semelles givrantes : dégâts `burn_from_stepping` qui ne passent pas
-    /// l'invulnérabilité.
+    /// Frost Walker immunity: `burn_from_stepping` damage that does not bypass
+    /// invulnerability.
     pub(crate) fn frost_walker_immune(&self, boots: Option<&crate::player::Stack>, ty: &str) -> bool {
         boots.is_some()
             && self.dmg_tag(ty, "minecraft:burn_from_stepping")
@@ -634,15 +637,15 @@ impl Server {
             && boots.is_some_and(|b| self.life.items.enchantment(b, "minecraft:frost_walker") > 0)
     }
 
-    /// Bloc sous les pieds qui règle le mouvement (0,500001 sous les pieds) : sable ou terre
-    /// des âmes.
+    /// Block under the feet that governs movement (0.500001 under the feet): soul sand or soul
+    /// soil.
     fn soul_block_below(&self, pos: [f64; 3], support: Option<P>) -> bool {
         let p = self.on_pos(pos, support, 0.500_001);
         self.btag_id(p, crate::tag_bits::TagId::SoulSpeedBlocks)
     }
 
-    /// Disque de glace givrée des Semelles givrantes (rayon 3 + niveau − 1, borné à 16) sous
-    /// l'entité : eau de source sous de l'air, sans entité qui gêne.
+    /// Frosted ice disc of Frost Walker (radius 3 + level − 1, capped at 16) under the entity:
+    /// source water under air, with no entity in the way.
     fn frost_disk(&mut self, pos: [f64; 3], level: i32, src: Ent) {
         let dist = (3 + level - 1).clamp(0, 16);
         let c = [pos[0].floor() as i32, pos[1].floor() as i32 - 1, pos[2].floor() as i32];
@@ -675,8 +678,8 @@ impl Server {
         }
     }
 
-    /// Aucune entité qui gêne la pose (vivants hors spectateur, blocs qui tombent, TNT,
-    /// wagonnets) ne recoupe le cube `p`.
+    /// No entity that gets in the way of placement (living entities other than spectators,
+    /// falling blocks, TNT, minecarts) intersects the cube `p`.
     fn frost_unobstructed(&self, p: P) -> bool {
         let [x, y, z] = p.map(f64::from);
         let b = Aabb { min: [x, y, z], max: [x + 1.0, y + 1.0, z + 1.0] };
@@ -691,9 +694,9 @@ impl Server {
             && !self.carts.list.iter().flatten().any(|c| !c.removed && hit(&c.bbox()))
     }
 
-    /// Bottes du joueur, au début de son tick : particules et son d'Agilité des âmes, puis
-    /// effets liés au bloc quand il change (ou à l'atterrissage, au changement de bottes, à la
-    /// sortie du mode spectateur).
+    /// Player's boots, at the start of its tick: Soul Speed particles and sound, then
+    /// block-tied effects when it changes (or on landing, on a change of boots, on leaving
+    /// spectator mode).
     pub(crate) fn player_boots_tick(&mut self) {
         let spectator = self.game_mode == 3;
         let (soul, frost) = self.slots[8].as_ref().map_or((0, 0), |b| {
@@ -701,7 +704,7 @@ impl Server {
             (it.enchantment(b, "minecraft:soul_speed"), it.enchantment(b, "minecraft:frost_walker"))
         });
         let mut st = std::mem::take(&mut self.contact.player);
-        // Sans bottes concernées ni effet en cours : rien à évaluer (cas courant, sans requête).
+        // No relevant boots nor effect in progress: nothing to evaluate (common case, no query).
         if soul == 0 && frost == 0 && !st.soul_active && st.soul == 0 && st.frost == 0 {
             st.last = None;
             st.grounded = self.on_ground;
@@ -713,7 +716,7 @@ impl Server {
         let support = self.player_support();
         let on_soul = self.soul_block_below(self.pos, support);
         let ground = self.on_ground;
-        // Effets de tick (périodiques, toutes les 5 ticks).
+        // Tick effects (periodic, every 5 ticks).
         if soul > 0 && !spectator && !self.life.vit.dead {
             let k = self.proj_player.known_move;
             let moving = (k[0] * 20.0).powi(2) + (k[2] * 20.0).powi(2) >= MIN_SPEED * MIN_SPEED;
@@ -731,7 +734,7 @@ impl Server {
                 self.play_sound("minecraft:particle.soul_escape", 7, self.pos, 0.6, pitch);
             }
         }
-        // Évaluation liée au bloc.
+        // Block-tied evaluation.
         let pos = self.pos.map(|v| v.floor() as i32);
         let changed_boots = soul != st.soul || frost != st.frost;
         if changed_boots && st.soul_active {
@@ -771,7 +774,7 @@ impl Server {
         self.contact.player = st;
     }
 
-    /// Modificateurs d'Agilité des âmes du joueur posés ou retirés.
+    /// Soul Speed modifiers of the player applied or removed.
     fn player_soul_mods(&mut self, on: bool, level: i32) {
         let mods = &mut self.life.attrs.mods;
         mods.retain(|m| m.id != SOUL_ID);
@@ -784,7 +787,7 @@ impl Server {
         }
     }
 
-    /// Effets de tick des bottes d'une créature (début du tick de base).
+    /// Tick effects of a mob's boots (start of the base tick).
     pub(crate) fn mob_boots_tick_effects(&mut self, m: &mut Mob) {
         let Some(b) = m.equipment[2].as_ref() else { return };
         let soul = self.life.items.enchantment(b, "minecraft:soul_speed");
@@ -808,7 +811,7 @@ impl Server {
         }
     }
 
-    /// Effets des bottes d'une créature liés au bloc (après l'air du tick de base).
+    /// Block-tied effects of a mob's boots (after the air supply of the base tick).
     pub(crate) fn mob_boots_location(&mut self, m: &mut Mob) {
         let (soul, frost) = m.equipment[2].as_ref().map_or((0, 0), |b| {
             let it = &self.life.items;
@@ -834,7 +837,7 @@ impl Server {
                 self.frost_disk(m.pos, frost, Ent::Mob(m.id));
             }
             if soul > 0 {
-                // Le vol plané des créatures n'est pas simulé : jamais « en vol ».
+                // Mob gliding is not simulated: never "flying".
                 let flying = false;
                 let on_soul = self.soul_block_below(m.pos, m.support);
                 let want = soul_wanted(active, vehicle, flying, on_soul, m.on_ground);
@@ -857,7 +860,7 @@ impl Server {
         m.boots.frost = frost;
     }
 
-    /// Usure des bottes d'une créature (Solidité des armures) ; cassées : retirées, événement 52.
+    /// Wear of a mob's boots (armor Unbreaking); broken: removed, event 52.
     fn mob_hurt_boots(&mut self, m: &mut Mob, n: i32) {
         let Some(s) = m.equipment[2].clone() else { return };
         if !self.life.items.damageable(&s) {
@@ -881,24 +884,24 @@ impl Server {
     }
 }
 
-/// Vitesse minimale (blocs par seconde) des effets de tick d'Agilité des âmes.
+/// Minimum speed (blocks per second) of the Soul Speed tick effects.
 const MIN_SPEED: f64 = 9.999_999_747_378_752e-6;
 
-/// Bonus de vitesse d'Agilité des âmes : 0,0405 + 0,0105 par niveau au-delà du premier (calcul
-/// en simple précision, comme les valeurs par niveau du jeu).
+/// Soul Speed speed bonus: 0.0405 + 0.0105 per level beyond the first (computed in single
+/// precision, like the game's per-level values).
 fn soul_speed_bonus(level: i32) -> f64 {
     f64::from(0.0405f32 + 0.0105f32 * (level - 1) as f32)
 }
 
-/// Condition des modificateurs d'Agilité des âmes : jamais en véhicule ni en vol ; actifs, ils
-/// restent tant que l'entité est sur un bloc des âmes ou en l'air ; inactifs, ils se posent sur
-/// un bloc des âmes.
+/// Condition of the Soul Speed modifiers: never in a vehicle or flying; once active, they
+/// stay as long as the entity is on a soul block or in the air; inactive, they are applied on
+/// a soul block.
 fn soul_wanted(active: bool, vehicle: bool, flying: bool, on_soul: bool, ground: bool) -> bool {
     !vehicle && !flying && (on_soul || (active && !ground))
 }
 
-/// Déplacement horizontal du tick assez grand pour que le buisson à baies pique (0,003 sur un
-/// axe, valeur simple précision).
+/// Horizontal movement of the tick large enough for the berry bush to sting (0.003 on an
+/// axis, single precision value).
 fn berry_moved(d: [f64; 2]) -> bool {
     let t = f64::from(0.003f32);
     (d[0] * d[0] + d[1] * d[1]) > 0.0 && (d[0].abs() >= t || d[1].abs() >= t)
@@ -908,12 +911,12 @@ fn berry_moved(d: [f64; 2]) -> bool {
 mod tests {
     use super::*;
 
-    /// Trajet par axe court (somme des axes sous 7) : les enveloppes donnent exactement les cases
-    /// des tronçons parcourus un à un, sans atteindre le plafond, et le même verdict de forme pour
-    /// une boîte quelconque dans chaque case. Positions sur la grille du 1/16 une fois sur deux
-    /// (entités posées, au sol), un axe immobile une fois sur trois.
+    /// Short per-axis path (sum of the axes under 7): the envelopes give exactly the cells
+    /// of the segments walked one by one, without reaching the cap, and the same shape verdict
+    /// for any box in each cell. Positions on the 1/16 grid every other time (entities at rest,
+    /// on the ground), one axis still one time in three.
     #[test]
-    fn enveloppes_egales_au_parcours_pour_un_trajet_court() {
+    fn envelopes_equal_walk_for_short_path() {
         let mut r = crate::mobs::jrand::JRand::new(crate::rng::test_seed());
         let (mut fast, mut exact) = (Vec::new(), Vec::new());
         let sizes = [(0.125, 0.25), (0.25, 0.5), (0.3, 1.8), (0.49, 0.98), (0.7, 1.95), (1.0, 2.9)];
@@ -927,7 +930,7 @@ mod tests {
             fast.clear();
             exact.clear();
             envelope_cells(from, to, half, h, &mut fast);
-            assert!(axis_walks(from, to, half, h, &mut exact) > 0, "plafond atteint : {from:?} -> {to:?}");
+            assert!(axis_walks(from, to, half, h, &mut exact) > 0, "cap reached: {from:?} -> {to:?}");
             let set = |v: &Vec<Seen>| {
                 let mut c: Vec<P> = v.iter().map(|s| s.0).collect();
                 c.sort_unstable();
@@ -935,7 +938,7 @@ mod tests {
                 c
             };
             let cells = set(&fast);
-            assert_eq!(cells, set(&exact), "{from:?} -> {to:?}, demi-largeur {half}, hauteur {h}");
+            assert_eq!(cells, set(&exact), "{from:?} -> {to:?}, half-width {half}, height {h}");
             for &p in &cells {
                 let [x, y, z] = p.map(f64::from);
                 let (a, b) = (r.next_double(), r.next_double());
@@ -943,7 +946,7 @@ mod tests {
                     Aabb { min: [x, y + a * 0.5, z + b * 0.5], max: [x + 1.0, y + a * 0.5 + 0.1, z + 0.5 + b * 0.5] };
                 let quick = swept_touches(&c, from, to, half, h);
                 let slow = exact.iter().filter(|s| s.0 == p).any(|s| swept_touches(&c, s.1, s.2, half, h));
-                assert_eq!(quick, slow, "forme {c:?}, {from:?} -> {to:?}, demi-largeur {half}, hauteur {h}");
+                assert_eq!(quick, slow, "shape {c:?}, {from:?} -> {to:?}, half-width {half}, height {h}");
             }
         }
     }

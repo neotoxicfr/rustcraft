@@ -373,9 +373,9 @@ pub struct Mob {
     pub support: Option<[i32; 3]>,
     /// Piston pushes accumulated during the tick (cap of 0.51 per axis).
     pub piston_deltas: rc_physics::piston::PistonDeltas,
-    /// Enlisement (toile, baies) posé par les blocs traversés, appliqué au déplacement suivant.
+    /// Slowdown (cobweb, berries) set by the crossed blocks, applied to the next movement.
     pub stuck: [f64; 3],
-    /// Enchantements des bottes liés au bloc (G5-F02e).
+    /// Block-tied boots enchantments (G5-F02e).
     pub boots: crate::contact::Boots,
     pub move_dist: f32,
     pub next_step: f32,

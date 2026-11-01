@@ -45,7 +45,7 @@ impl PistonTarget for MobTarget<'_> {
         }
         let d = self.m.piston_deltas.limit(self.s.time, d);
         if d != [0.0; 3] {
-            // Poussée de piston : l'enlisement est effacé (vitesse nulle) sans réduire la poussée.
+            // Piston push: the slowdown is cleared (zero velocity) without reducing the push.
             if self.m.stuck.iter().map(|v| v * v).sum::<f64>() > 1.0e-7 {
                 self.m.stuck = [0.0; 3];
                 self.m.vel = [0.0; 3];

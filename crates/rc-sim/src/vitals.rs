@@ -429,7 +429,7 @@ impl Server {
         if self.abilities().invulnerable && !self.damage_tag(ty, "bypasses_invulnerability") {
             return true;
         }
-        // G5-F02e : Semelles givrantes, immunité aux dégâts du sol brûlant.
+        // G5-F02e: Frost Walker, immunity to hot-floor damage.
         if self.frost_walker_immune(self.slots[8].as_ref(), ty) {
             return true;
         }
@@ -988,7 +988,7 @@ impl Server {
                 self.hurt("minecraft:starve", 1.0);
             }
         }
-        self.player_boots_tick(); // G5-F02e : Semelles givrantes, Agilité des âmes
+        self.player_boots_tick(); // G5-F02e: Frost Walker, Soul Speed
         if self.game_mode != 3 {
             self.environment_damage();
         }
@@ -1073,7 +1073,7 @@ impl Server {
             }
             self.hurt("minecraft:in_fire", 1.0);
         }
-        self.player_contacts(); // G5-F02e : baies, rose de Wither, chaudrons
+        self.player_contacts(); // G5-F02e: berries, wither rose, cauldrons
         self.player_freezing();
         let burning = self.life.vit.fire > 0 && !invul;
         // S7: shared flags (fire, invisibility, glowing) sent if they change.

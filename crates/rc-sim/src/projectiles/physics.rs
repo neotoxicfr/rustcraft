@@ -530,7 +530,7 @@ impl Server {
     /// Application of block effects (one step of the arrow).
     pub(crate) fn proj_blocks_effects_from(&mut self, p: &mut Proj, from: [f64; 3]) {
         use crate::contact::{BUTTON, FIRE, LAVA, PLATE, TRIPWIRE};
-        // Retiré, ou sans physique (sauf la balle de shulker) : aucun effet des blocs.
+        // Removed, or without physics (except the shulker bullet): no block effects.
         if p.removed || (p.no_physics && p.kind != PKind::ShulkerBullet) {
             return;
         }
@@ -541,10 +541,11 @@ impl Server {
         let dy = b.min[1] - p.pos[1];
         let from = [from[0], from[1] + dy, from[2]];
         let to = [p.pos[0], b.min[1], p.pos[2]];
-        // G5-F02e : blocs traversés par ce pas, avant l'impact éventuel (l'œil de l'Ender n'y
-        // passe pas) : en ligne droite du début du pas à la position prise, par axe pour la
-        // fusée (déplacement avec collisions). Le projectile, copie hors de sa case, est compté
-        // par les plaques à sa position courante. Tous ces effets se rejouent sans dommage.
+        // G5-F02e: blocks crossed by this step, before the possible impact (the Ender eye does
+        // not go through here): in a straight line from the start of the step to the position
+        // taken, per axis for the firework (movement with collisions). The projectile, a copy
+        // outside its slot, is counted by the plates at its current position. All these effects
+        // can be replayed harmlessly.
         let straight = p.kind != PKind::Firework;
         let arrow = p.kind.arrow_like();
         // None of these blocks in the crossed sections (common case): nothing to walk.
@@ -564,7 +565,7 @@ impl Server {
                         }
                     }
                     LAVA if self.lava_touched(q, a, e, half, h, straight) => p.fire = p.fire.max(300),
-                    // Flèches : boutons en bois enfoncés (forme recoupée testée par le bouton).
+                    // Arrows: wooden buttons pressed (shape re-cut tested by the button).
                     BUTTON if arrow => self.button_arrow_inside(q, p),
                     _ => {}
                 }

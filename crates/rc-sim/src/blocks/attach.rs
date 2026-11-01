@@ -462,7 +462,7 @@ impl Server {
         s
     }
 
-    /// Forme du fil : 1 à 2,5 px de haut s'il est accroché, 0 à 8 px sinon.
+    /// Shape of the wire: 1 to 2.5 px high if attached, 0 to 8 px otherwise.
     fn tripwire_shape(&self, s: u32, p: P) -> rc_physics::Aabb {
         let (lo, hi) = if self.v().get_bool(s, "attached") { (1.0, 2.5) } else { (0.0, 8.0) };
         rc_physics::Aabb {

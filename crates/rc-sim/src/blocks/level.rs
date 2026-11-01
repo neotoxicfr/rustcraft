@@ -210,8 +210,8 @@ impl Server {
         self.bs.t.clone()
     }
 
-    /// Bloc d'un état, comme `v().block(s)` sans copier la vue (deux compteurs atomiques) : pour
-    /// les boucles qui lisent beaucoup de cases.
+    /// Block of a state, like `v().block(s)` without copying the view (two atomic counters): for
+    /// loops that read many cells.
     #[inline]
     pub(crate) fn state_block(&self, s: u32) -> u16 {
         self.data.states.get(s as usize).map_or(u16::MAX, |i| i.block)

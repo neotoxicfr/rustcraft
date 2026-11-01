@@ -271,7 +271,7 @@ impl Server {
                 m.air =
                     super::brainy::max_air(m).map_or_else(|| super::sealife::increase_air(m), |x| (m.air + 4).min(x));
             }
-            self.mob_boots_location(m); // G5-F02e : Semelles givrantes, Agilité des âmes
+            self.mob_boots_location(m); // G5-F02e: Frost Walker, Soul Speed
         }
         if m.hurt_time > 0 {
             m.hurt_time -= 1;
