@@ -2025,9 +2025,14 @@ impl Gui {
 
     /// Item scaled by `s` from corner `(x, y)` (thumbnails, notifications).
     pub fn item_scaled(&mut self, key: u64, layers: &[rc_assets::item::Layer], x: f32, y: f32, s: f32) {
+        self.item_stretched(key, layers, x, y, s, s);
+    }
+
+    /// Item scaled by `sx` across and `sy` down from corner `(x, y)` (bouncing book tab).
+    pub fn item_stretched(&mut self, key: u64, layers: &[rc_assets::item::Layer], x: f32, y: f32, sx: f32, sy: f32) {
         let Some(atlas) = &mut self.items else { return };
         let Some(uv) = atlas.cell_for(&self.device, key, layers) else { return };
-        let p = Self::rect_quad(x, y, x + 16.0 * s, y + 16.0 * s);
+        let p = Self::rect_quad(x, y, x + 16.0 * sx, y + 16.0 * sy);
         let (u0, v0, u1, v1) = (uv[0], uv[1], uv[0] + uv[2], uv[1] + uv[3]);
         self.quad(false, p, [[u0, v0], [u0, v1], [u1, v1], [u1, v0]], [1.0; 4], [4, 0]);
     }

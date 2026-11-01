@@ -371,7 +371,7 @@ impl App {
                 let m = (f(x), f(y));
                 self.menutest.2 = Some(m);
                 if to_menus {
-                    menu_actions = self.menus.wheel(gui, &mut self.options, m, f64::from(f(n)));
+                    menu_actions = self.menus.wheel(gui, &mut self.options, m, f64::from(f(n)), false);
                 } else {
                     front_actions = self.front.wheel(gui, &mut self.options, m, f64::from(f(n)));
                 }
@@ -498,6 +498,7 @@ impl App {
                 self.local_name = p.name;
                 self.last_info = p.info;
                 self.session = session;
+                self.menus.world.new_connection();
             }
             Err(e) => {
                 eprintln!("connection: {e}");
@@ -662,6 +663,7 @@ impl App {
                 self.local_name = name;
                 self.last_info = info;
                 self.session = session;
+                self.menus.world.new_connection();
                 self.solo = Some(handle);
                 crate::world_list::set_solo_open(true);
             }

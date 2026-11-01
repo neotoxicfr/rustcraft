@@ -2814,3 +2814,25 @@ Bench `bench_g6f08_scan_and_grass` (ignored; `--ignored bench_g6f08 --nocapture`
   generic, no indirect call) for the crosshair and the F3 rays.
 - To re-measure on a quiet machine: F3 open in singleplayer (frame time against main), scene bench
   `tools/bench/scenes.py` (F3 closed: no change expected, nothing is computed).
+## G2-F11: inventory screens, recipe book, option menus (01/11, loaded machine)
+
+Interface code driven by input events or by a screen tick; nothing in a world loop. Axes reviewed
+(client CPU, regularity, allocations, network, RAM): no per-frame allocation added, no measurable
+cost; scene bench not run (no client during the series, `menu`/`inventory` scenes to re-measure
+on a quiet machine with the others).
+
+- Recipe book: the open setting is sent only when the visibility changes (as before for the
+  button; one more packet when the server changes the setting, which the game also sends back).
+  Tab bounce: the check walks the tab collections only when the book shows or a book packet
+  arrives (`retab`), then a sine per bouncing tab per frame. Shaped thumbnails: one offset pair
+  per recipe instead of none (two comparisons). The vertically stretched tab icon reuses the
+  item atlas cell (`Gui::item_stretched`, same quad as the uniform scale).
+- Warning text area (`widgets::TextArea`): lines wrapped once per layout; each frame only the
+  lines crossing the frame are walked (index range from the scroll, then the clip test), instead
+  of all of them; no allocation per frame.
+- Social interactions: chat log as a 1024-entry ring (`VecDeque`, one `None` per chat line, no
+  allocation for system lines); the list is rebuilt only on layout (tab, search, size), with the
+  senders gathered once into a hash set before the sort (instead of a log walk per comparison).
+- Spectator menu: game modes read again per tick only while the menu is open (one pass over
+  the player list, buffer reused).
+- Multi-core and GPU not applicable (a few dozen elements per event, order imposed by the screen).
