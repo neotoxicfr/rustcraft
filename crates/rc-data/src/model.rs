@@ -941,6 +941,11 @@ pub struct ItemInfo {
     /// Default component types (indices of `minecraft:data_component_type`): their count
     /// makes the "N components" line of the advanced tooltip.
     pub components: Vec<u16>,
+    /// Default `dye` (dyes): colour + 1, in the order of the game's 16 colours (0 if none).
+    pub dye: u8,
+    /// Default `cooking_fuel`: number + 1 of its value among the distinct values, numbered in
+    /// item id order (0: not a fuel). The recipe book groups fuels by value, like the game.
+    pub fuel: u16,
 }
 
 impl VersionData {

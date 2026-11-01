@@ -189,6 +189,10 @@ pub trait Rules {
     /// Equipment slot (`ItemInfo::equip_slot`), 0 if none.
     fn equip_slot(&self, s: &ItemStack) -> u8;
     fn is_fuel(&self, s: &ItemStack) -> bool;
+    /// Empty bucket: accepted in the fuel slot without being a fuel.
+    fn is_bucket(&self, _s: &ItemStack) -> bool {
+        false
+    }
     fn smeltable(&self, s: &ItemStack) -> bool;
     fn is_potion(&self, s: &ItemStack) -> bool;
     fn brew_fuel(&self, s: &ItemStack) -> bool;
@@ -247,7 +251,7 @@ impl Menu<'_> {
             Accept::Any => true,
             Accept::Nothing => false,
             Accept::Armor(e) => self.rules.equip_slot(s) == e,
-            Accept::Fuel => self.rules.is_fuel(s),
+            Accept::Fuel => self.rules.is_fuel(s) || self.rules.is_bucket(s),
             Accept::Potion => self.rules.is_potion(s),
             Accept::BrewFuel => self.rules.brew_fuel(s),
             Accept::Special(code) => crate::menu_special::accepts(code, self.rules, s),

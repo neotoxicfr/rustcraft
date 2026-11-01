@@ -10,6 +10,7 @@ mod blocks;
 mod fluid_use;
 pub mod chunk;
 pub mod demo;
+pub mod gen_debug;
 pub mod generation;
 pub mod generation_nbt;
 pub mod input;

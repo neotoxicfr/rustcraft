@@ -1155,7 +1155,14 @@ impl crate::App {
                     let (n, b) = self.audio.peek().map_or((0, 0), |a| (a.cache_len(), a.cache_bytes()));
                     c.line(format!("Sound cache: {n} buffers, {} MiB", (b as u64).div_ceil(MIB)));
                 }
-                // Singleplayer only (local difficulty, spawns, generation) and effects: nothing.
+                // Singleplayer only: generator lines at the feet block, computed by the integrated
+                // server when that block changes.
+                "chunk_generation_stats" => {
+                    if let Some(solo) = &self.solo {
+                        c.group("chunk_generation").extend(solo.gen_debug(block));
+                    }
+                }
+                // Singleplayer only (local difficulty, spawns) and effects: nothing.
                 _ => {}
             }
         }

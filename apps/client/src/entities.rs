@@ -1587,6 +1587,38 @@ mod size_tests {
         assert!((e.size(&table).h - 1.75).abs() < 1e-6);
     }
 
+    /// Event 55: both hands of a living entity swap, the rest of the equipment does not move;
+    /// a non-living entity ignores it.
+    #[test]
+    fn hand_swap_event_swaps_both_hands() {
+        let st = |item| Some(ItemStack { item, count: 1, added: Vec::new(), removed: Vec::new() });
+        for (kind, swaps) in [("player", true), ("zombie", true), ("armor_stand", true), ("item", false)] {
+            let mut all = Entities { type_names: vec![format!("minecraft:{kind}")], ..Default::default() };
+            let add = rc_proto_v777::entity::AddEntity {
+                id: 1,
+                uuid: 1,
+                kind: 0,
+                pos: [0.0; 3],
+                velocity: [0.0; 3],
+                pitch: 0.0,
+                yaw: 0.0,
+                head_yaw: 0.0,
+                data: 0,
+            };
+            all.apply(EntityEvent::Add(Box::new(add)));
+            let e = all.map.get_mut(&1).expect("added");
+            e.equipment[0] = st(10);
+            e.equipment[1] = st(20);
+            e.equipment[5] = st(30);
+            all.apply(EntityEvent::Event { id: 1, event: 55 });
+            let eq = &all.map[&1].equipment;
+            let (main, off) = if swaps { (20, 10) } else { (10, 20) };
+            assert_eq!(eq[0].as_ref().map(|s| s.item), Some(main), "{kind}");
+            assert_eq!(eq[1].as_ref().map(|s| s.item), Some(off), "{kind}");
+            assert_eq!(eq[5].as_ref().map(|s| s.item), Some(30), "{kind}");
+        }
+    }
+
     /// Mannequin cape point tracked like a player's (a quarter of the difference per tick,
     /// reset beyond 10 blocks); view swing reserved for the player.
     #[test]

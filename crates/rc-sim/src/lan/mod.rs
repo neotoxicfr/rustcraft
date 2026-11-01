@@ -1168,10 +1168,20 @@ impl Server {
                 let pose = if sneak { 5 } else { 0 };
                 evs.push(EntityEvent::Data { id, values: vec![(6, rc_proto_v777::entity::Meta::Pose(pose))] });
             }
-            if l.equip.get(&id) != Some(&t.equip) {
-                let slots: rc_proto_v777::entity::Equipment =
-                    t.equip.iter().enumerate().map(|(i, s)| (i as u8, self.net(s.as_ref()))).collect();
-                evs.push(EntityEvent::Equipment { id, slots });
+            // Only the changed slots are sent; two hands simply exchanged go out as one event 55
+            // (the observer swaps them itself), before the other slots.
+            if let Some(before) = l.equip.get(&id).filter(|b| **b != t.equip) {
+                let was = |i: usize| before.get(i).cloned().flatten();
+                let mut changed: Vec<usize> = (0..t.equip.len()).filter(|&i| t.equip[i] != was(i)).collect();
+                if changed.starts_with(&[0, 1]) && t.equip[0] == was(1) && t.equip[1] == was(0) {
+                    evs.push(EntityEvent::Event { id, event: 55 });
+                    changed.drain(..2);
+                }
+                if !changed.is_empty() {
+                    let slots: rc_proto_v777::entity::Equipment =
+                        changed.iter().map(|&i| (i as u8, self.net(t.equip[i].as_ref()))).collect();
+                    evs.push(EntityEvent::Equipment { id, slots });
+                }
             }
             for v in &list {
                 if pairs.contains(&(v.id, id)) && l.pairs.contains(&(v.id, id)) {

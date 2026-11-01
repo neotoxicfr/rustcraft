@@ -42,6 +42,8 @@ mod tick;
 pub(crate) use tick::Walk;
 pub(crate) mod track;
 pub(crate) mod trades;
+/// Dye mixing, shared with the client's recipe book demonstration.
+pub use trades::apply_dyes;
 pub(crate) mod trial; // W9: cages, trial spawners, vaults
 pub(crate) mod variants;
 pub(crate) mod villager;

@@ -22,6 +22,44 @@ pub fn quantize(v: f32) -> i64 {
     (v * 10_000.0) as i64
 }
 
+/// F3 "Biome builder" line (singleplayer, multi-noise source, also in the Nether): categories of
+/// the surface biome builder for a quantised climate in the order of
+/// [`BiomeSource::climate_at`]. Each value is dequantised (f32 / 10000) then requantised before
+/// being compared with the slices' upper bounds, like the game.
+pub fn builder_line(c: [i64; 6]) -> String {
+    let unq = |v: i64| v as f32 / 10_000.0;
+    // Peaks and valleys of a weirdness.
+    let pv = |w: f32| -((w.abs() - 0.666_666_7).abs() - 0.333_333_34) * 3.0;
+    let p = pv(unq(c[5]));
+    let peaks = if p < pv(0.05) {
+        "Valley"
+    } else if p < pv(0.266_666_68) {
+        "Low"
+    } else if p < pv(0.4) {
+        "Mid"
+    } else if p < pv(0.566_666_66) {
+        "High"
+    } else {
+        "Peak"
+    };
+    // Rank of the first slice whose upper bound exceeds the value.
+    let rank = |v: i64, maxes: &[f32], names: Option<&[&'static str]>| -> String {
+        let q = quantize(unq(v));
+        match maxes.iter().position(|m| q < quantize(*m)) {
+            Some(i) => names.map_or_else(|| i.to_string(), |n| n[i].to_owned()),
+            None => names.map_or_else(|| "?".to_owned(), |n| n[maxes.len()].to_owned()),
+        }
+    };
+    const LAND: [&str; 7] = ["Mushroom fields", "Deep ocean", "Ocean", "Coast", "Near inland", "Mid inland", "Far inland"];
+    format!(
+        "Biome builder PV: {peaks} C: {} E: {} T: {} H: {}",
+        rank(c[2], &[-1.05, -0.455, -0.19, -0.11, 0.03, 0.3], Some(&LAND)),
+        rank(c[3], &[-0.78, -0.375, -0.2225, 0.05, 0.45, 0.55, 1.0], None),
+        rank(c[0], &[-0.45, -0.15, 0.2, 0.55, 1.0], None),
+        rank(c[1], &[-0.35, -0.1, 0.1, 0.3, 1.0], None),
+    )
+}
+
 /// Exact inverse of `l → (f32)l / 10000` (values written by the official report).
 fn unquantize_inverse(f: f32) -> Option<i64> {
     let guess = (f64::from(f) * 10_000.0).round() as i64;
@@ -1245,6 +1283,25 @@ pub fn zoom_cached(zoom_seed: i64, x: i32, y: i32, z: i32) -> (i32, i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// "Biome builder" line: builder slices, upper bound excluded, "?" beyond the last numbered
+    /// slice.
+    #[test]
+    fn biome_builder_line() {
+        assert_eq!(builder_line([0; 6]), "Biome builder PV: Valley C: Near inland E: 3 T: 2 H: 2");
+        assert_eq!(
+            builder_line([10_000, -5_000, -11_000, 9_000, 0, 6_667]),
+            "Biome builder PV: Peak C: Mushroom fields E: 6 T: ? H: 0"
+        );
+        // Bounds: -0.11 is already "Near inland", 0.3 "Far inland", -0.78 erosion 1.
+        assert_eq!(
+            builder_line([5_500, 3_000, -1_100, -7_800, 0, 3_000]),
+            "Biome builder PV: Mid C: Near inland E: 1 T: 4 H: 4"
+        );
+        assert_eq!(builder_line([0, 0, 3_000, 0, 0, 1_500]).split(" C: ").nth(1).unwrap(), "Far inland E: 3 T: 2 H: 2");
+        assert!(builder_line([0, 0, 0, 0, 0, 1_500]).contains("PV: Low "));
+        assert!(builder_line([0, 0, 0, 0, 0, 4_500]).contains("PV: High "));
+    }
 
     /// Checkerboard: cells of 2^(scale + 2) quarts, Euclidean remainder, duplicates kept in the list,
     /// offset folded to 5 bits like the game's integer.

@@ -2562,3 +2562,22 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   measurable per scene: even with hundreds of arrows stuck in blocks, the work per arrow and
   per tick stays the read of one field, already done with the boolean; no bench, multi-core and
   GPU not applicable.
+
+## G5-F16b: event 55, recipe book slot displays, "Biome builder" line (25/10, loaded machine)
+
+- LAN broadcast of players' equipment: only the changed slots are sent (instead of all 6 at
+  each change) and two hands exchanged go out as a 5-byte entity event instead of two stacks:
+  fewer bytes on the network, same CPU work (the comparison of the 6 slots was already done).
+  Multi-core and GPU not applicable (6 comparisons per player per tick).
+- Recipe book, fuels: a scan of the item table (≈ 1,500 entries) then a sort of 347
+  (group, identifier) pairs for each furnace ghost recipe, instead of 1,500 name suffix tests:
+  not measured separately (rare event, of the order of ten µs). Value group precomputed when
+  the data is prepared (≈ 30 values, linear search over 347 items, once). Per-recipe cache
+  ruled out: nothing to gain on a click event.
+- Dyeing demonstration: 16 stacks at most, one 4-byte allocation each; drawn with the variants
+  menu as before (same number of resolutions).
+- F3 "Biome builder" line: computed by the integrated server only when the entry is shown AND
+  the feet block changes (6 density functions, /locate generator cache). First display:
+  construction of the generator shared with /locate, 222 to 233 ms on the server thread (test,
+  loaded machine), once per dimension; to re-measure on a quiet machine. Lead to measure:
+  build this generator off the server thread.

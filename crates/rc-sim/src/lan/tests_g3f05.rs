@@ -608,3 +608,47 @@ fn door_crack_to_nearby_players() {
     t.s.door_break_progress(999, [2, FLOOR + 1, 2], 3);
     assert!(drain(&t).iter().any(|e| matches!(e, Event::BlockDestruction { .. })), "player near");
 }
+
+/// Singleplayer F3 "Biome builder" line: computed by the server at the requested block (world of
+/// seed 7, value read off this generator); nothing before the server's first loop turn.
+#[test]
+fn generator_biome_builder_line() {
+    let mut t = open("gendbg");
+    let gd = t.s.gen_debug.clone();
+    assert!(gd.request([0, 64, 0]).is_empty());
+    t.s.gen_debug_tick();
+    assert_eq!(gd.request([0, 64, 0]), vec!["Biome builder PV: Mid C: Ocean E: 3 T: 2 H: 0".to_owned()]);
+}
+
+/// Hands swapped by the host: the guest receives event 55 and no update of the two hands;
+/// a single slot changed afterwards goes out alone.
+#[test]
+fn hand_swap_to_observers() {
+    let stack = |id: &str| Some(crate::player::Stack { id: id.into(), count: 1, components: None });
+    let mut t = open("hands");
+    publish(&mut t, false);
+    let main = 36 + t.s.held as usize;
+    t.s.slots[main] = stack("minecraft:stone");
+    t.s.slots[45] = stack("minecraft:torch");
+    let g = join(&mut t, "Guest", 2);
+    for _ in 0..3 {
+        t.s.lan_tick();
+    }
+    let _ = guest_packets(&g);
+    let hid = t.s.player_id;
+    let eq = ids(&t).set_equipment;
+    t.s.slots.swap(main, 45);
+    t.s.lan_tick();
+    let ps = guest_packets(&g);
+    assert!(entity_events(&t, &ps).contains(&(hid, 55)), "event 55 missing");
+    assert!(!ps.iter().any(|p| id_of(p) == eq && varint_at(body(p)) == hid), "hands resent as equipment");
+    // Helmet put on: only the head slot (5) goes out.
+    t.s.slots[5] = stack("minecraft:iron_helmet");
+    t.s.lan_tick();
+    let ps = guest_packets(&g);
+    assert!(!entity_events(&t, &ps).contains(&(hid, 55)));
+    let sent: Vec<&Vec<u8>> = ps.iter().filter(|p| id_of(p) == eq && varint_at(body(p)) == hid).collect();
+    assert_eq!(sent.len(), 1, "one equipment update");
+    let b = body(sent[0]);
+    assert_eq!(b[varint(hid).len()], 5, "head slot alone, last of the list");
+}
