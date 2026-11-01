@@ -420,6 +420,7 @@ impl Server {
                 && !self.end_attacked(e)
                 && !self.cart_attacked(e)
                 && !self.deco_attacked(e)
+                && !self.interaction_attacked(e)
             {
                 self.player_attack(e);
             }
@@ -429,8 +430,12 @@ impl Server {
             // Point touched (relative to the entity) and sneaking.
             let at = rc_proto_v777::entity::read_lp_vec3(r).unwrap_or_default();
             let secondary = { use rc_proto::Decode; bool::decode(r).unwrap_or(false) };
-            // G5-F06: minecart; decorations.
-            if self.player_ready() && !self.cart_interact(e, hand) && !self.deco_interact(e, hand, at, secondary) {
+            // G5-F06: minecart; decorations. G5-F05: interaction entity.
+            if self.player_ready()
+                && !self.cart_interact(e, hand)
+                && !self.deco_interact(e, hand, at, secondary)
+                && !self.interaction_used(e, hand)
+            {
                 self.player_interact(e, hand);
             }
             true

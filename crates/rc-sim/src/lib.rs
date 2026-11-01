@@ -41,6 +41,7 @@ pub mod containers;
 pub mod datapack;
 pub mod packs;
 pub mod drops;
+mod display; // G5-F05: display and interaction entities
 pub mod life;
 pub mod items;
 pub mod item_use;
@@ -86,6 +87,7 @@ mod tests_g5f02c; // G5-F02c: fall (wind charge, per-block rules, multiplier, so
 mod tests_g5f02e; // G5-F02e: contacts with crossed blocks, enchanted boots
 mod thorns; // G5-F02d: player thorns
 mod tests_g5f02d;
+mod tests_g5f05; // G5-F05: orbs, ground items, displays, interaction, marker
 pub mod randsrc;
 // Commands (S5).
 pub mod commands;

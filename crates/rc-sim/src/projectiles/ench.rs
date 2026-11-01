@@ -170,7 +170,7 @@ impl Server {
     }
 
     /// Enchantments of the stack, in component order, with their definition.
-    fn ench_defs(&self, s: &Stack) -> Vec<(i32, std::sync::Arc<Value>)> {
+    pub(crate) fn ench_defs(&self, s: &Stack) -> Vec<(i32, std::sync::Arc<Value>)> {
         crate::enchanting::read_comp(&self.life.items, s, "minecraft:enchantments")
             .into_iter()
             .filter_map(|(id, l)| Some((l, self.life.pack.get("enchantment", &id)?)))

@@ -476,6 +476,7 @@ fn meta_quat(e: &Entity, i: u8) -> Option<[f32; 4]> {
 fn meta_state(e: &Entity, i: u8) -> Option<u32> {
     match e.meta.get(&i) {
         Some(Meta::BlockState(s)) => Some(s.and_then(|s| u32::try_from(s).ok()).unwrap_or(0)),
+        Some(Meta::State(s)) => Some(u32::try_from(*s).unwrap_or(0)),
         _ => None,
     }
 }
@@ -2023,6 +2024,7 @@ pub(crate) fn display_tick(e: &mut Entity) {
             ),
             _ => {
                 let text = match e.meta.get(&23) {
+                    Some(Meta::Component(t)) => Some(t.clone()),
                     Some(Meta::Text(t)) => t.clone(),
                     _ => None,
                 };

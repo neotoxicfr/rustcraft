@@ -770,10 +770,13 @@ impl Server {
             self.sent.remove(&(x, z));
             let _ = self.send(Event::ForgetChunk { x, z });
             // Entities removed from the view, kept for the save (never simulated).
-            if let Some(ents) = self.entities.get(&(x, z))
-                && !ents.is_empty()
-            {
-                let _ = self.send(Event::Entity(EntityEvent::Remove(ents.iter().map(|e| e.0).collect())));
+            if let Some(ents) = self.entities.get(&(x, z)) {
+                // Markers were never announced (G5-F05).
+                let ids: Vec<i32> =
+                    ents.iter().filter(|e| crate::decoration::client_visible(&e.1)).map(|e| e.0).collect();
+                if !ids.is_empty() {
+                    let _ = self.send(Event::Entity(EntityEvent::Remove(ids)));
+                }
             }
         }
     }

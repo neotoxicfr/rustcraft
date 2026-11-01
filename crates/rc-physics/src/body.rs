@@ -16,8 +16,9 @@ fn f(x: f32) -> f64 {
     f64::from(x)
 }
 
-/// Movement of the tick: start, end, wanted movement (order of the swept axes).
-type Move = ([f64; 3], [f64; 3], Option<[f64; 3]>);
+/// Movement of the tick: start, end, wanted movement (order of the swept axes; absent for a
+/// completed segment).
+pub type Move = ([f64; 3], [f64; 3], Option<[f64; 3]>);
 
 /// Player that an orb can follow: identifier, feet, eye height, spectator, dying.
 #[derive(Debug, Clone, Copy)]
@@ -589,6 +590,18 @@ impl Body {
         self.travel(w, t, 0.0, 0.98, 0.500_001);
         self.block_effects(w, t, false);
         self.vel = m;
+    }
+
+    /// Movements whose crossed blocks acted during the last tick (start, arrival, wanted
+    /// movement): those of the tick, or the previous ones replayed by an item at rest.
+    pub fn effect_moves(&self) -> &[Move] {
+        &self.last_moves
+    }
+
+    /// Lava touched by the box at its current position (without current push).
+    pub fn touching_lava(&self, w: &dyn World, t: &Tables) -> bool {
+        let mut v = [0.0; 3];
+        scan_fluids(w, t, &self.bounding_box(), self.pos, self.pos[1] + self.eye, false, self.fast_lava, &mut v).1 > 0.0
     }
 
     /// Water touched by the box (without current push).

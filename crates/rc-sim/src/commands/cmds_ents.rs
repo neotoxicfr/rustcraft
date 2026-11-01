@@ -164,6 +164,7 @@ impl Server {
             if let Some(d) = self.life.drops.last_mut() {
                 d.age = crate::nbtio::int(n, "Age").unwrap_or(0) as i32;
                 d.health = crate::nbtio::int(n, "Health").unwrap_or(5) as i32;
+                d.fire = crate::nbtio::int(n, "Fire").unwrap_or(0) as i16 as i32; // G5-F05
                 return Ok(E::Item(d.id));
             }
         }
@@ -201,17 +202,23 @@ impl Server {
         let id = self.next_entity;
         let uuid = (self.life.rng.next_long() as u128) << 64 | self.life.rng.next_long() as u64 as u128;
         let mut n = nbt.unwrap_or(Nbt::Compound(Vec::new()));
+        // The game reads the compound before placing the entity: a text display resolves its
+        // text from the position written in the compound (origin if none).
+        let load_pos = crate::nbtio::f64s::<3>(n.get("Pos")).unwrap_or_default();
         crate::nbtio::set(&mut n, "id", Nbt::String(ty.to_owned()));
         crate::nbtio::set(&mut n, "Pos", Nbt::List(pos.iter().map(|&x| Nbt::Double(x)).collect()));
         if n.get("UUID").is_none() {
             crate::nbtio::set(&mut n, "UUID", crate::nbtio::uuid_nbt(uuid));
         }
         let chunk = ((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4);
-        // Spawn and metadata; paintings, frames, supports, cushions simulated.
-        self.deco_announce(id, &n);
-        self.deco_register(id, &n);
         self.entities.entry(chunk).or_default().push((id, n));
         self.life.drop_chunks.insert(chunk);
+        self.display_resolve_text(id, load_pos, None); // G5-F05
+        // Spawn and metadata; paintings, frames, supports, cushions simulated.
+        let n = self.entities.get(&chunk).and_then(|l| l.iter().find(|e| e.0 == id)).map(|e| e.1.clone());
+        let n = n.unwrap_or(Nbt::Compound(Vec::new()));
+        self.deco_announce(id, &n);
+        self.deco_register(id, &n);
         Ok(E::Other(id))
     }
 
@@ -230,6 +237,7 @@ impl Server {
         self.spawn_item(pos, vel, stack, delay);
         let d = self.life.drops.last_mut().ok_or_else(|| Fail(tr!("commands.summon.failed")))?;
         d.age = age;
+        d.fire = nbt.and_then(|n| int(n, "Fire")).unwrap_or(0) as i16 as i32; // G5-F05
         Ok(E::Item(d.id))
     }
 
@@ -238,6 +246,8 @@ impl Server {
         match e {
             E::Mob(i) => self.mobs.mob_ref_any(i).and_then(|m| m.last_hurt_by_mob.map(|x| x.0)).map(to_e),
             E::Player => self.mobs.player_hurt_by.map(|x| to_e(x.0)),
+            // G5-F05: interaction entity: the player of its last recorded hit.
+            E::Other(i) => self.interaction_relation(i, "attack"),
             _ => None,
         }
     }
@@ -245,8 +255,15 @@ impl Server {
     pub fn relation_target(&self, e: E) -> Option<E> {
         match e {
             E::Mob(i) => self.mobs.mob_ref_any(i).and_then(|m| m.target).map(to_e),
+            // G5-F05: interaction entity: the player of its last recorded use.
+            E::Other(i) => self.interaction_relation(i, "interaction"),
             _ => None,
         }
+    }
+
+    fn interaction_relation(&self, id: i32, key: &str) -> Option<E> {
+        let e = self.entities.values().flatten().find(|e| e.0 == id)?;
+        self.interaction_player(&e.1, key)
     }
 
     pub fn relation_owner(&self, e: E) -> Option<E> {

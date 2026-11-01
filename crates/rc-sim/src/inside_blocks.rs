@@ -425,6 +425,10 @@ pub(crate) struct Scratch {
 pub(crate) enum Who<'a> {
     Player,
     Mob(&'a mut Mob),
+    /// G5-F05: ground item and experience orb (not living: no campfire, no freezing; the
+    /// movements are those of their physics).
+    Item(&'a mut crate::drops::ItemEnt),
+    Orb(&'a mut crate::drops::Orb),
 }
 
 /// Result of the pass useful to the rest of the tick.
@@ -461,17 +465,20 @@ impl Server {
 
     fn inside_blocks_with(&mut self, who: &mut Who, sc: &mut Scratch) -> Outcome {
         let mut out = Outcome::default();
-        let (old, pos) = match who {
-            Who::Player => (self.life.inside_old.unwrap_or(self.pos), self.pos),
-            Who::Mob(m) => (m.old, m.pos),
-        };
-        match who {
+        let pos = match who {
             Who::Player => {
+                let (old, pos) = (self.life.inside_old.unwrap_or(self.pos), self.pos);
                 self.life.inside.finish(old, pos, &mut sc.moves);
                 self.life.inside_old = Some(pos);
+                pos
             }
-            Who::Mob(m) => m.inside.finish(old, pos, &mut sc.moves),
-        }
+            Who::Mob(m) => {
+                m.inside.finish(m.old, m.pos, &mut sc.moves);
+                m.pos
+            }
+            Who::Item(d) => body_moves(&d.body, &mut sc.moves),
+            Who::Orb(o) => body_moves(&o.body, &mut sc.moves),
+        };
         let was_on_fire = self.who_on_fire(who);
         let was_freezing = self.who_frozen(who) > 0;
         let fire_before = self.who_fire(who);
@@ -479,6 +486,8 @@ impl Server {
         let (bbox, falling) = match who {
             Who::Player => (self.player_aabb(), self.life.vit.fall > 2.5),
             Who::Mob(m) => (m.bbox(), m.fall_distance > 2.5),
+            Who::Item(d) => (d.body.bounding_box(), d.body.fall > 2.5),
+            Who::Orb(o) => (o.body.bounding_box(), o.body.fall > 2.5),
         };
         self.collect_hits(&bbox, pos, falling, sc);
         let mut last_step = -1;
@@ -495,7 +504,8 @@ impl Server {
                 Some(Blk::Cactus) => {
                     self.who_hurt(who, "minecraft:cactus", 1.0);
                 }
-                Some(Blk::Campfire(d)) => {
+                // The campfire only burns the living.
+                Some(Blk::Campfire(d)) if matches!(who, Who::Player | Who::Mob(_)) => {
                     self.who_hurt(who, "minecraft:campfire", d);
                 }
                 Some(Blk::Fire(d)) => {
@@ -508,7 +518,7 @@ impl Server {
                     sc.step.freeze = true;
                     sc.step.extinguish = true;
                 }
-                Some(Blk::Plain) | None => {}
+                Some(Blk::Plain | Blk::Campfire(_)) | None => {}
             }
             match h.fluid {
                 Fl::Water => sc.step.extinguish = true,
@@ -534,6 +544,8 @@ impl Server {
         match who {
             Who::Player => self.player_contacts(),
             Who::Mob(m) => self.mob_contacts(m),
+            // Plates and tripwire: right after, by the item and orb ticks.
+            Who::Item(_) | Who::Orb(_) => {}
         }
         if self.who_fire(who) > 0 && self.who_in_rain(who) {
             self.who_clear_fire(who);
@@ -696,6 +708,16 @@ impl Server {
                         self.mob_sound_unmuted(m, "minecraft:entity.generic.burn", 0.4, pitch);
                     }
                     Who::Mob(_) => {}
+                    // An item only hisses every 10 ticks, or when the lava destroys it.
+                    Who::Item(d) if d.health <= 0 || d.ticks % 10 == 0 => {
+                        let pitch = 2.0 + entity_rng(d.id, d.ticks, 1).next_float() * 0.4;
+                        self.play_sound("minecraft:entity.generic.burn", 6, d.pos, 0.4, pitch);
+                    }
+                    Who::Item(_) => {}
+                    Who::Orb(o) => {
+                        let pitch = 2.0 + entity_rng(o.id, o.ticks, 1).next_float() * 0.4;
+                        self.play_sound("minecraft:entity.generic.burn", 8, o.pos, 0.4, pitch);
+                    }
                 }
             }
             Late::SnowMelt(p) => {
@@ -723,6 +745,17 @@ impl Server {
                 let pitch = 1.6 + (m.rng.next_float() - m.rng.next_float()) * 0.4;
                 self.mob_sound_unmuted(m, NAME, 0.7, pitch);
             }
+            // Neutral category for an item, ambient for an orb.
+            Who::Item(d) => {
+                let mut r = entity_rng(d.id, d.ticks, 2);
+                let pitch = 1.6 + (r.next_float() - r.next_float()) * 0.4;
+                self.play_sound(NAME, 6, d.pos, 0.7, pitch);
+            }
+            Who::Orb(o) => {
+                let mut r = entity_rng(o.id, o.ticks, 2);
+                let pitch = 1.6 + (r.next_float() - r.next_float()) * 0.4;
+                self.play_sound(NAME, 8, o.pos, 0.7, pitch);
+            }
         }
     }
 
@@ -736,6 +769,8 @@ impl Server {
         match who {
             Who::Player => self.in_rain(self.pos, self.player_aabb().max[1]),
             Who::Mob(m) => self.in_rain(m.pos, m.bbox().max[1]),
+            Who::Item(d) => self.in_rain(d.pos, d.body.bounding_box().max[1]),
+            Who::Orb(o) => self.in_rain(o.pos, o.body.bounding_box().max[1]),
         }
     }
 
@@ -743,6 +778,8 @@ impl Server {
         match who {
             Who::Player => !self.life.vit.dead && self.life.vit.health > 0.0,
             Who::Mob(m) => m.alive(),
+            Who::Item(d) => !d.is_removed(),
+            Who::Orb(o) => !o.is_removed(),
         }
     }
 
@@ -750,6 +787,8 @@ impl Server {
         match who {
             Who::Player => self.life.vit.fire,
             Who::Mob(m) => m.fire,
+            Who::Item(d) => d.fire,
+            Who::Orb(o) => o.fire,
         }
     }
 
@@ -757,6 +796,8 @@ impl Server {
         match who {
             Who::Player => self.life.vit.fire = v,
             Who::Mob(m) => m.fire = v,
+            Who::Item(d) => d.fire = v,
+            Who::Orb(o) => o.fire = v,
         }
     }
 
@@ -767,8 +808,10 @@ impl Server {
 
     fn who_fire_immune(&self, who: &Who) -> bool {
         match who {
-            Who::Player => false,
+            Who::Player | Who::Orb(_) => false,
             Who::Mob(m) => mob_fire_immune(m),
+            // A stack that resists "in fire" (netherite).
+            Who::Item(d) => self.item_resists(&d.stack, "minecraft:in_fire"),
         }
     }
 
@@ -776,10 +819,12 @@ impl Server {
         !self.who_fire_immune(who) && self.who_fire(who) > 0
     }
 
+    /// Freezing counter (items and orbs: never counted, nothing perceptible).
     fn who_frozen(&self, who: &Who) -> i32 {
         match who {
             Who::Player => self.life.vit.ticks_frozen,
             Who::Mob(m) => m.ticks_frozen,
+            Who::Item(_) | Who::Orb(_) => 0,
         }
     }
 
@@ -787,6 +832,7 @@ impl Server {
         match who {
             Who::Player => self.life.vit.ticks_frozen = v,
             Who::Mob(m) => m.ticks_frozen = v,
+            Who::Item(_) | Who::Orb(_) => {}
         }
     }
 
@@ -794,6 +840,7 @@ impl Server {
         match who {
             Who::Player => self.player_can_freeze(),
             Who::Mob(m) => self.mob_can_freeze(m),
+            Who::Item(_) | Who::Orb(_) => false,
         }
     }
 
@@ -801,6 +848,15 @@ impl Server {
         match who {
             Who::Player => self.hurt(ty, amount),
             Who::Mob(m) => self.mob_hurt(m, ty, amount, None, None),
+            // Fire damage on a fire-immune item: refused (resistance to "in fire").
+            Who::Item(d) => {
+                let fire = self.dmg_tag(ty, "minecraft:is_fire");
+                !(fire && self.item_resists(&d.stack, "minecraft:in_fire")) && self.item_hurt_ent(d, ty, amount, false)
+            }
+            Who::Orb(o) => {
+                crate::drops::orb_take_damage(o, amount);
+                true
+            }
         }
     }
 
@@ -808,8 +864,24 @@ impl Server {
         match who {
             Who::Player => self.player_ignite(ticks),
             Who::Mob(m) => mob_ignite(m, ticks),
+            // No burning-time attribute: the duration as is, kept if longer.
+            Who::Item(d) => d.fire = d.fire.max(ticks),
+            Who::Orb(o) => o.fire = o.fire.max(ticks),
         }
     }
+}
+
+/// Movements of an item's or orb's last physics tick into `out`; returns its position.
+fn body_moves(b: &rc_physics::body::Body, out: &mut Vec<Move>) -> [f64; 3] {
+    out.clear();
+    out.extend(b.effect_moves().iter().map(|&(from, to, wanted)| Move { from, to, wanted }));
+    b.pos
+}
+
+/// Own random of an item or orb for a sound pitch (`salt`: kind of draw), seeded like its
+/// physics draws: the world random stays untouched.
+pub(crate) fn entity_rng(id: i32, ticks: i32, salt: i64) -> crate::mobs::jrand::JRand {
+    crate::mobs::jrand::JRand::new((i64::from(id) << 32 ^ i64::from(ticks)) ^ salt << 56)
 }
 
 /// Mob immune to fire (species, or creaking and the like).

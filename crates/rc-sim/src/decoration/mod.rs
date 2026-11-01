@@ -78,6 +78,11 @@ impl DKind {
     }
 }
 
+/// False for an entity the game never announces to clients (marker: server-side only).
+pub(crate) fn client_visible(e: &Nbt) -> bool {
+    e.get("id").and_then(Nbt::as_str) != Some("minecraft:marker")
+}
+
 /// Kind of an entity compound.
 pub(crate) fn kind_of(e: &Nbt) -> Option<DKind> {
     e.get("id").and_then(Nbt::as_str).and_then(DKind::from_name)
@@ -386,9 +391,11 @@ impl Server {
     /// Removes a decoration (`discard`/`kill`): compound, registry, client.
     pub(crate) fn deco_remove(&mut self, id: i32) {
         let mut at = None;
+        let mut visible = true;
         for (c, l) in self.entities.iter_mut() {
             if let Some(i) = l.iter().position(|(x, _)| *x == id) {
                 at = nbtio::f64s::<3>(l[i].1.get("Pos"));
+                visible = client_visible(&l[i].1);
                 l.remove(i);
                 self.life.drop_chunks.insert(*c);
                 break;
@@ -398,7 +405,9 @@ impl Server {
         for l in self.deco.live.iter_mut().filter(|l| l.id == id) {
             l.removed = true;
         }
-        let _ = self.send(Event::Entity(EntityEvent::Remove(vec![id])));
+        if visible {
+            let _ = self.send(Event::Entity(EntityEvent::Remove(vec![id])));
+        }
     }
 
     // ---------- Client ----------
@@ -406,6 +415,9 @@ impl Server {
     /// Appearance on the client of a decoration (or of any frozen entity): painting and frames
     /// announced at the corner of the hanging block with their 3D direction, like the game's server.
     pub(crate) fn deco_announce(&self, id: i32, e: &Nbt) {
+        if !client_visible(e) {
+            return;
+        }
         let types = self.data.registry("minecraft:entity_type");
         let Some(kind) =
             e.get("id").and_then(Nbt::as_str).and_then(|n| types?.entries.iter().position(|t| t == n))

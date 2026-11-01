@@ -317,6 +317,7 @@ impl Server {
             }
             E::Other(i) => {
                 let mut new = n.clone();
+                let mut old = None;
                 if let Some(o) = self.other_mut(i) {
                     // Identifier and UUID kept (`load` does not change them).
                     for k in ["id", "UUID"] {
@@ -324,9 +325,18 @@ impl Server {
                             nbtio::set(&mut new, k, v);
                         }
                     }
-                    *o = new.clone();
+                    old = Some(std::mem::replace(o, new.clone()));
                 }
-                self.send_entity_meta(i, &new);
+                // G5-F05: the reloaded text display resolves its text again (previous one kept
+                // on failure); own data of displays and interactions sent when changed.
+                if let Some(o) = &old
+                    && crate::display::kind_of(o).is_some()
+                {
+                    let at = nbtio::f64s::<3>(new.get("Pos")).unwrap_or_default();
+                    self.display_resolve_text(i, at, o.get("text").cloned());
+                    new = self.other(i).cloned().unwrap_or(new);
+                }
+                self.send_entity_meta_after(i, &new, old.as_ref());
             }
         }
     }
@@ -477,6 +487,10 @@ impl Server {
                     if let Some([y, p]) = rot {
                         nbtio::set(o, "Rotation", Nbt::List(vec![Nbt::Float(y), Nbt::Float(p)]));
                     }
+                }
+                // A marker is unknown to the clients (G5-F05).
+                if self.other(i).is_some_and(|o| !crate::decoration::client_visible(o)) {
+                    return;
                 }
                 let [yaw, pitch] = rot.unwrap_or([0.0, 0.0]);
                 let _ = self.send(Event::Entity(EntityEvent::Teleport(rc_proto_v777::entity::TeleportEntity {
@@ -699,12 +713,16 @@ impl Server {
             }
             E::Other(i) => {
                 self.entity_scores_removed(self.ent_uuid(e));
+                // A marker was never announced: no removal either (G5-F05).
+                let visible = self.other(i).is_none_or(crate::decoration::client_visible);
                 for l in self.entities.values_mut() {
                     l.retain(|(x, _)| *x != i);
                 }
                 self.deco_forget(i);
                 self.life.drop_chunks.extend(self.entities.keys().copied().collect::<Vec<_>>());
-                let _ = self.send(Event::Entity(EntityEvent::Remove(vec![i])));
+                if visible {
+                    let _ = self.send(Event::Entity(EntityEvent::Remove(vec![i])));
+                }
             }
         }
     }
