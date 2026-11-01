@@ -130,12 +130,19 @@ fn crosses(a: &Aabb, b: &Aabb) -> bool {
 
 /// G5-F05: orb `i` absorbs the orbs whose box crosses its own inflated by 0.5, of the same value
 /// and with an identifier congruent modulo 40: counts added, youngest age kept, the others removed.
-fn merge_orbs(orbs: &mut [Orb], i: usize, live: &mut [([f64; 3], bool)]) {
+/// `candidates`: indices to test (all, or those of its residue modulo 40).
+pub(crate) fn merge_orbs(
+    orbs: &mut [Orb],
+    i: usize,
+    live: &mut [([f64; 3], bool)],
+    candidates: impl Iterator<Item = usize>,
+) {
     let (id, value) = (orbs[i].id, orbs[i].value);
     let b = bbox(orbs[i].pos, ORB_SIZE);
     let zone = Aabb { min: b.min.map(|c| c - 0.5), max: b.max.map(|c| c + 0.5) };
     let (mut count, mut age) = (orbs[i].count, orbs[i].age);
-    for (j, o) in orbs.iter_mut().enumerate() {
+    for j in candidates {
+        let o = &mut orbs[j];
         if j == i || o.removed || (o.id - id) % 40 != 0 || o.value != value || !crosses(&bbox(o.pos, ORB_SIZE), &zone) {
             continue;
         }
@@ -147,6 +154,21 @@ fn merge_orbs(orbs: &mut [Orb], i: usize, live: &mut [([f64; 3], bool)]) {
         }
     }
     (orbs[i].count, orbs[i].age) = (count, age);
+}
+
+/// Orb count from which the merge candidates are bucketed (bench `g5f05_bench`: whole list
+/// cheaper at 20 orbs, buckets ahead at 100).
+const ORB_BUCKETS_FROM: usize = 40;
+
+/// Orbs still present by residue of their identifier modulo 40, in list order.
+pub(crate) fn orb_buckets(orbs: &[Orb], buckets: &mut Vec<Vec<u32>>) {
+    buckets.resize_with(40, Vec::new);
+    for b in buckets.iter_mut() {
+        b.clear();
+    }
+    for (j, o) in orbs.iter().enumerate().filter(|(_, o)| !o.removed) {
+        buckets[o.id.rem_euclid(40) as usize].push(j as u32);
+    }
 }
 
 /// True when the "on fire" point of an item or orb falls this tick (counter on a multiple of 20).
@@ -753,6 +775,8 @@ impl Server {
         self.contact.live_orbs = live;
         self.contact.orbs_ticking = true;
         let min_y = f64::from(self.dim.height.min_y) - 64.0;
+        let mut buckets = std::mem::take(&mut self.contact.orb_buckets);
+        let mut buckets_built = false;
         for i in 0..orbs.len() {
             if orbs[i].removed {
                 continue;
@@ -773,9 +797,20 @@ impl Server {
                 self.contact.live_orbs[i].1 = true;
                 continue;
             }
-            // G5-F05: absorbs the orbs of the same value around it every 20 ticks (from the first).
+            // G5-F05: absorbs the orbs of the same value around it every 20 ticks (from the first);
+            // from 40 orbs on, candidates read from the residues modulo 40 rebuilt once per tick
+            // (below, the whole list costs less; `RUSTCRAFT_OPT_ORB_MERGE_LINEAR=1`: always it).
             if o.ticks % 20 == 1 {
-                merge_orbs(orbs, i, &mut self.contact.live_orbs);
+                if orbs.len() < ORB_BUCKETS_FROM || rc_data::env_flag!("RUSTCRAFT_OPT_ORB_MERGE_LINEAR") {
+                    merge_orbs(orbs, i, &mut self.contact.live_orbs, 0..orbs.len());
+                } else {
+                    if !buckets_built {
+                        orb_buckets(orbs, &mut buckets);
+                        buckets_built = true;
+                    }
+                    let b = &buckets[orbs[i].id.rem_euclid(40) as usize];
+                    merge_orbs(orbs, i, &mut self.contact.live_orbs, b.iter().map(|&j| j as usize));
+                }
             }
             let o = &mut orbs[i];
             // Same physics as the client (`rc_physics::body`), no skipped tick.
@@ -810,6 +845,7 @@ impl Server {
                 self.contact.live_orbs[i].1 = true;
             }
         }
+        self.contact.orb_buckets = buckets;
         // Pickup: one orb every 2 ticks.
         if follow && self.player_ready() {
             if self.life.vit.xp_delay > 0 {
@@ -856,21 +892,28 @@ impl Server {
         }
     }
 
-    /// Ground items read with a chunk: made live (pickable, simulated).
+    /// Ground items and experience orbs read with a chunk: made live (pickable, simulated).
     pub(crate) fn adopt_items(&mut self, loaded: &[(i32, i32)]) {
         use rc_proto::nbt::Nbt;
+        const KINDS: [&str; 2] = ["minecraft:item", "minecraft:experience_orb"];
         for p in loaded {
             let Some(list) = self.entities.get_mut(p) else { continue };
             type Ents = Vec<(i32, Nbt)>;
             let (items, rest): (Ents, Ents) = std::mem::take(list)
                 .into_iter()
-                .partition(|(_, e)| e.get("id").and_then(Nbt::as_str) == Some("minecraft:item"));
+                .partition(|(_, e)| e.get("id").and_then(Nbt::as_str).is_some_and(|k| KINDS.contains(&k)));
             *list = rest;
             if items.is_empty() {
                 continue;
             }
             self.life.drop_chunks.insert(*p);
             for (_, e) in items {
+                // G5-F05: orb (value, count, age, health, fire, speed as the game reads them).
+                if e.get("id").and_then(Nbt::as_str) == Some(KINDS[1]) {
+                    let pos = crate::nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
+                    self.summon_orb(pos, Some(&e));
+                    continue;
+                }
                 let Some(stack) = e.get("Item").and_then(Stack::from_nbt) else { continue };
                 let pos = crate::nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
                 let vel = crate::nbtio::motion(e.get("Motion")).unwrap_or_default();
@@ -921,6 +964,25 @@ impl Server {
                 ("Item".into(), d.stack.to_nbt(None)),
             ];
             by_chunk.entry(c).or_default().push(Nbt::Compound(thrower.into_iter().chain(fields).collect()));
+        }
+        // G5-F05: experience orbs, written like the game (never saved before: lost on reload).
+        for o in self.life.orbs.iter().filter(|o| !o.removed) {
+            let c = ((o.pos[0].floor() as i32) >> 4, (o.pos[2].floor() as i32) >> 4);
+            let dbl = |v: [f64; 3]| Nbt::List(v.iter().map(|&x| Nbt::Double(x)).collect());
+            let uuid = [0x5332_0000, 0, 0, o.id];
+            by_chunk.entry(c).or_default().push(Nbt::Compound(vec![
+                ("id".into(), Nbt::String("minecraft:experience_orb".into())),
+                ("Pos".into(), dbl(o.pos)),
+                ("Motion".into(), dbl(o.vel)),
+                ("Rotation".into(), Nbt::List(vec![Nbt::Float(0.0), Nbt::Float(0.0)])),
+                ("OnGround".into(), Nbt::Byte(i8::from(o.on_ground))),
+                ("Fire".into(), Nbt::Short(o.fire as i16)),
+                ("Health".into(), Nbt::Short(o.health as i16)),
+                ("Age".into(), Nbt::Short(o.age as i16)),
+                ("Value".into(), Nbt::Short(o.value as i16)),
+                ("Count".into(), Nbt::Int(o.count)),
+                ("UUID".into(), Nbt::IntArray(uuid.to_vec())),
+            ]));
         }
         self.mobs_into_chunks(&mut by_chunk); // S4: mobs
         self.projectiles_into_chunks(&mut by_chunk); // S8: projectiles, clouds
@@ -1278,6 +1340,12 @@ impl Orb {
     /// S8: removed (merge of thrown orbs).
     pub(crate) fn is_removed(&self) -> bool {
         self.removed
+    }
+
+    /// Bench of the merging: the orb is back for the next round.
+    #[cfg(test)]
+    pub(crate) fn unremove_for_bench(&mut self) {
+        self.removed = false;
     }
 
     /// Push (explosion blast): velocity sent back at the next tracking, at once if

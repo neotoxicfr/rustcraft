@@ -356,3 +356,211 @@ fn interaction_records_attack_and_use() {
     assert!(other(&p, far).get("attack").is_none());
     done(p, dir);
 }
+
+/// Orbs saved with their chunk and read back alive (value, count, age, health, fire), instead of
+/// being lost (never saved) or frozen (read from a world of the game).
+#[test]
+fn orbs_saved_and_read_back() {
+    let Some((mut p, dir)) = probe("g5f05-orbsave") else { return };
+    p.s.add_orb([105.5, -59.0, 105.5], 17);
+    let o = &mut p.s.life.orbs[0];
+    (o.count, o.age, o.health, o.fire) = (3, 1234, 4, 60);
+    let mut jobs = Vec::new();
+    p.s.drops_save_jobs(&mut jobs);
+    let chunk = jobs
+        .iter()
+        .find_map(|j| match j {
+            crate::save::Job::Chunk { cx: 6, cz: 6, nbt, .. } => crate::nbtio::parse_root(nbt).ok(),
+            _ => None,
+        })
+        .expect("entity chunk of the orb written");
+    let saved = crate::nbtio::list(chunk.get("Entities"))
+        .iter()
+        .find(|e| e.get("id").and_then(Nbt::as_str) == Some("minecraft:experience_orb"))
+        .cloned()
+        .expect("orb saved");
+    let int = |k: &str| crate::nbtio::int(&saved, k);
+    assert_eq!((int("Value"), int("Count"), int("Age"), int("Health"), int("Fire")), (Some(17), Some(3), Some(1234), Some(4), Some(60)));
+    // Read back with a chunk: alive again, not a frozen entity.
+    p.s.life.orbs.clear();
+    p.s.entities.entry((6, 6)).or_default().push((999_999, saved));
+    p.s.adopt_items(&[(6, 6)]);
+    assert!(!p.s.entities[&(6, 6)].iter().any(|e| e.0 == 999_999), "left frozen");
+    let o = p.s.life.orbs.first().expect("orb alive");
+    assert_eq!((o.value, o.count, o.age, o.health, o.fire), (17, 3, 1234, 4, 60));
+    done(p, dir);
+}
+
+/// Hot blocks of the shortcut tests: fire, cactus, lava, water around (105..109, -59, 104).
+const HOT: &str = "setblock 104 -59 104 minecraft:fire\nsetblock 106 -59 104 minecraft:cactus\n\
+                   setblock 108 -59 104 minecraft:lava\nsetblock 110 -59 104 minecraft:water\n";
+
+/// Item at `pos` with velocity `vel` after one physics tick (its movements recorded), out of the list.
+fn moved_item(p: &mut Probe, pos: [f64; 3], vel: [f64; 3], fire: i32) -> crate::drops::ItemEnt {
+    p.s.spawn_item(pos, vel, stack("minecraft:dirt", 1), 32767);
+    let mut d = p.s.life.drops.pop().expect("item");
+    d.fire = fire;
+    let w = p.s.world();
+    d.body.pos = d.pos;
+    d.body.vel = d.vel;
+    let mut r = crate::mobs::jrand::JRand::new(i64::from(d.id));
+    d.body.tick_item_server(&w, &p.s.phys, 1, d.id, &mut || r.next_float());
+    (d.pos, d.vel, d.on_ground) = (d.body.pos, d.body.vel, d.body.on_ground);
+    d
+}
+
+/// Shortcut of the inert items (protocol A2): on a grid of 720 starts around fire, cactus, lava
+/// and water (at rest, falling, sliding, burning), the pass with the shortcut leaves every item
+/// exactly like the full pass; number of skipped starts and sum of the outcomes stored.
+#[test]
+fn inert_item_shortcut_matches_full_pass() {
+    let Some((mut p, dir)) = probe("g5f05-inert") else { return };
+    p.s.game_mode = 3;
+    p.run(HOT);
+    let (mut skipped, mut sum) = (0u32, 0i64);
+    for ix in 0..24 {
+        for iz in 0..10 {
+            for (k, (vel, fire)) in [([0.0, 0.0, 0.0], 0), ([0.13, -0.3, 0.05], 0), ([0.0, 0.0, 0.0], 30)].into_iter().enumerate() {
+                let pos = [103.0 + f64::from(ix) * 0.33, -59.0 + f64::from(k as i32) * 0.4, 103.2 + f64::from(iz) * 0.27];
+                let d = moved_item(&mut p, pos, vel, fire);
+                let (mut a, mut b) = (d.clone(), d.clone());
+                if p.s.item_inert(&mut a) {
+                    skipped += 1;
+                }
+                p.s.inside_blocks(&mut crate::inside_blocks::Who::Item(&mut a));
+                p.s.inside_blocks_full(&mut crate::inside_blocks::Who::Item(&mut b));
+                let state = |d: &crate::drops::ItemEnt| (d.fire, d.health, d.is_removed());
+                assert_eq!(state(&a), state(&b), "start {pos:?} {vel:?} fire {fire}");
+                sum += i64::from(b.fire) + 1000 * i64::from(b.health) + 100_000 * i64::from(b.is_removed());
+                p.s.life.drops.clear();
+                p.take_events();
+            }
+        }
+    }
+    assert_eq!((skipped, sum), (G5F05_INERT_SKIPPED, G5F05_INERT_SUM), "stored outcome changed");
+    done(p, dir);
+}
+
+const G5F05_INERT_SKIPPED: u32 = 360;
+const G5F05_INERT_SUM: i64 = 3_273_150;
+
+/// Bench of the item crossed-block pass and of the orb merging (loaded machine figures in
+/// `docs/perf.md`). `cargo test --release -p rc-sim g5f05_bench -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn g5f05_bench() {
+    use crate::inside_blocks::Who;
+    let Some((mut p, dir)) = probe("g5f05-bench") else { return };
+    p.s.game_mode = 3;
+    p.run(HOT);
+    let n = 200_000u32;
+    let time = |p: &mut Probe, d: &mut crate::drops::ItemEnt, full: bool| {
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            if full {
+                std::hint::black_box(p.s.inside_blocks_full(&mut Who::Item(d)));
+            } else {
+                std::hint::black_box(p.s.inside_blocks(&mut Who::Item(d)));
+            }
+        }
+        t.elapsed().as_nanos() as f64 / f64::from(n)
+    };
+    for (name, pos, vel) in [
+        ("at rest, open floor", [120.5, -59.0, 120.5], [0.0; 3]),
+        ("at rest, next to the cactus", [105.4, -59.0, 104.5], [0.0; 3]),
+        ("sliding 0.2/tick", [120.5, -59.0, 120.5], [0.2, 0.0, 0.0]),
+    ] {
+        let mut d = moved_item(&mut p, pos, vel, 0);
+        let full = time(&mut p, &mut d, true);
+        let skip = time(&mut p, &mut d, false);
+        let full2 = time(&mut p, &mut d, true);
+        let skip2 = time(&mut p, &mut d, false);
+        println!("item pass, {name}: full {full:.1} / {full2:.1} ns, shortcut {skip:.1} / {skip2:.1} ns");
+        p.take_events();
+    }
+    // Orb merging: n orbs in a 16 × 16 area, one scan per orb (every 20 ticks in the game);
+    // whole list against the residues modulo 40 (one bucket build per round).
+    for count in [20usize, 100, 1000] {
+        for pass in 0..2 {
+            for linear in [true, false] {
+                let mut orbs = scattered_orbs(&mut p, count);
+                let mut live = vec![([0.0; 3], false); orbs.len()];
+                let mut buckets = Vec::new();
+                let rounds = 20;
+                let t = std::time::Instant::now();
+                for _ in 0..rounds {
+                    // Like the game: 20 ticks, a twentieth of the orbs scans at each one, the
+                    // buckets are rebuilt at each tick.
+                    for tick in 0..20 {
+                    if !linear {
+                        crate::drops::orb_buckets(&orbs, &mut buckets);
+                    }
+                    for i in (tick..orbs.len()).step_by(20) {
+                        if orbs[i].is_removed() {
+                            continue;
+                        }
+                        if linear {
+                            crate::drops::merge_orbs(&mut orbs, i, &mut live, 0..count);
+                        } else {
+                            let b = &buckets[orbs[i].id.rem_euclid(40) as usize];
+                            crate::drops::merge_orbs(&mut orbs, i, &mut live, b.iter().map(|&j| j as usize));
+                        }
+                    }
+                    }
+                    for o in orbs.iter_mut() {
+                        o.unremove_for_bench();
+                    }
+                }
+                let per_tick = t.elapsed().as_nanos() as f64 / f64::from(rounds) / 20.0;
+                let how = if linear { "whole list" } else { "residues" };
+                println!("orb merge scan, {count} orbs, {how} (pass {pass}): {:.2} µs per tick", per_tick / 1000.0);
+            }
+        }
+    }
+    p.take_events();
+    done(p, dir);
+}
+
+/// `count` orbs of three values in a 16 × 16 area, out of the list.
+fn scattered_orbs(p: &mut Probe, count: usize) -> Vec<crate::drops::Orb> {
+    p.s.life.orbs.clear();
+    for i in 0..count {
+        let f = i as f64;
+        p.s.add_orb([100.5 + (f * 0.37) % 16.0, -59.0, 100.5 + (f * 0.61) % 16.0], 3 + (i % 3) as i32 * 4);
+    }
+    std::mem::take(&mut p.s.life.orbs)
+}
+
+/// Merge candidates by residue modulo 40 = whole list (protocol A2): 600 orbs of two values in a
+/// 2 × 2 area (many merges), outcome of each orb identical, merged count stored.
+#[test]
+fn orb_merge_buckets_match_whole_list() {
+    let Some((mut p, dir)) = probe("g5f05-orbbuckets") else { return };
+    let mut a = scattered_orbs(&mut p, 600);
+    for (k, o) in a.iter_mut().enumerate() {
+        o.pos = [100.5 + (k as f64 * 0.37) % 2.0, -59.0 + (k % 7) as f64 * 0.3, 100.5 + (k as f64 * 0.61) % 2.0];
+        o.age = (k * 7 % 50) as i32;
+        o.value = if k % 5 == 0 { 7 } else { 3 };
+    }
+    let mut b = a.clone();
+    let mut live = vec![([0.0; 3], false); a.len()];
+    let mut buckets = Vec::new();
+    crate::drops::orb_buckets(&b, &mut buckets);
+    for i in 0..a.len() {
+        if !a[i].is_removed() {
+            crate::drops::merge_orbs(&mut a, i, &mut live, 0..600);
+        }
+        if !b[i].is_removed() {
+            let c = &buckets[b[i].id.rem_euclid(40) as usize];
+            crate::drops::merge_orbs(&mut b, i, &mut live, c.iter().map(|&j| j as usize));
+        }
+    }
+    let out = |v: &[crate::drops::Orb]| v.iter().map(|o| (o.count, o.age, o.is_removed())).collect::<Vec<_>>();
+    assert_eq!(out(&a), out(&b));
+    let merged = a.iter().filter(|o| o.is_removed()).count();
+    assert_eq!(merged, G5F05_ORB_MERGED, "stored outcome changed");
+    p.take_events();
+    done(p, dir);
+}
+
+const G5F05_ORB_MERGED: usize = 421;

@@ -457,6 +457,26 @@ impl Server {
 
     /// The crossed-block pass for `who` (see the module header).
     pub(crate) fn inside_blocks(&mut self, who: &mut Who) -> Outcome {
+        self.inside_blocks_skip(who, true)
+    }
+
+    /// The pass, without the shortcut of the inert items and orbs (equivalence tests, bench).
+    #[cfg(test)]
+    pub(crate) fn inside_blocks_full(&mut self, who: &mut Who) -> Outcome {
+        self.inside_blocks_skip(who, false)
+    }
+
+    /// The shortcut would skip this item (tests).
+    #[cfg(test)]
+    pub(crate) fn item_inert(&self, d: &mut crate::drops::ItemEnt) -> bool {
+        self.inert_object(&Who::Item(d))
+    }
+
+    fn inside_blocks_skip(&mut self, who: &mut Who, skip: bool) -> Outcome {
+        // Decided before taking the buffers out (nothing copied for an inert item).
+        if skip && self.inert_object(who) {
+            return Outcome::default();
+        }
         let mut sc = std::mem::take(&mut self.mobs.inside);
         let out = self.inside_blocks_with(who, &mut sc);
         self.mobs.inside = sc;
@@ -559,6 +579,52 @@ impl Server {
             self.who_set_fire(who, rest);
         }
         out
+    }
+
+    /// G5-F05, skip the empty: an item or orb that does not burn can only be acted on by fire,
+    /// soul fire, cactus and lava (water, powder snow and rain only put out, the campfire and the
+    /// freezing are for the living). None of them in the cells of the boxes of its movements: the
+    /// pass would change nothing. `RUSTCRAFT_OPT_ITEM_INSIDE_FULL=1`: full pass always.
+    fn inert_object(&self, who: &Who) -> bool {
+        let (fire, body) = match who {
+            Who::Item(d) => (d.fire, &d.body),
+            Who::Orb(o) => (o.fire, &o.body),
+            Who::Player | Who::Mob(_) => return false,
+        };
+        if fire != 0 || rc_data::env_flag!("RUSTCRAFT_OPT_ITEM_INSIDE_FULL") {
+            return false;
+        }
+        let moves = body.effect_moves();
+        let (half, h) = (body.width / 2.0, body.height);
+        let eps = f64::from(1.0e-5f32);
+        let (mut lo, mut hi) = ([i32::MAX; 3], [i32::MIN; 3]);
+        for &(from, to, _) in moves {
+            for p in [from, to] {
+                let b = [p[0] - half + eps, p[1] + eps, p[2] - half + eps, p[0] + half - eps, p[1] + h - eps, p[2] + half - eps];
+                for a in 0..3 {
+                    lo[a] = lo[a].min(b[a].floor() as i32);
+                    hi[a] = hi[a].max(b[a + 3].floor() as i32);
+                }
+            }
+        }
+        // Long path (more than 64 cells in its envelope): the full pass decides.
+        let n: i64 = (0..3).map(|a| i64::from(hi[a]) - i64::from(lo[a]) + 1).product();
+        if moves.is_empty() || n > 64 {
+            return moves.is_empty();
+        }
+        let id = &self.bs.t.id;
+        for x in lo[0]..=hi[0] {
+            for y in lo[1]..=hi[1] {
+                for z in lo[2]..=hi[2] {
+                    let st = self.st([x, y, z]);
+                    let b = self.data.states.get(st as usize).map_or(u16::MAX, |i| i.block);
+                    if b == id.fire || b == id.soul_fire || b == id.cactus || b == id.lava {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Cells touched along the movements of the tick (`sc.moves`), stored in `sc.hits`.

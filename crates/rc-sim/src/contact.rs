@@ -112,6 +112,9 @@ pub struct Contact {
     /// Same for experience orbs.
     pub(crate) live_orbs: Vec<([f64; 3], bool)>,
     pub(crate) orbs_ticking: bool,
+    /// G5-F05: orbs of the list by identifier modulo 40 (the only ones that can merge with each
+    /// other), rebuilt at the first merge scan of an orb tick; reused buffers.
+    pub(crate) orb_buckets: Vec<Vec<u32>>,
     /// Player's boots.
     pub(crate) player: Boots,
 }
