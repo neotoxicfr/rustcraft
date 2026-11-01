@@ -249,6 +249,9 @@ impl Server {
         self.mobs.end.direct = Some("minecraft:shulker_bullet");
         let ok = self.proj_damage(t, "minecraft:mob_projectile", 4.0, owner, (-p.vel[0], -p.vel[2]));
         self.mobs.end.direct = None;
+        if ok && t == Ent::Player {
+            self.player_thorns_by(owner); // G5-F02d: before the levitation
+        }
         // A part of the dragon is not living (no effect).
         if ok && self.target_kind(t) != Some(super::super::species::Kind::EnderDragon) {
             self.give_ent_effect(t, Inst::new("minecraft:levitation", 200, 0), 1.0);

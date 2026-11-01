@@ -1036,7 +1036,10 @@ impl Server {
         if !items.damageable(&s) {
             return;
         }
-        let n2 = self.unbreaking_kept(&s, n, (5..9).contains(&slot));
+        // Formula chosen by the item (enchantable armor tag), not by the slot: an armor piece held
+        // in hand wears like armor, elytra worn on the chest like an ordinary item.
+        let armor = items.has_tag("minecraft:enchantable/armor", &s.id);
+        let n2 = self.unbreaking_kept(&s, n, armor);
         if n2 <= 0 {
             return;
         }
@@ -1154,7 +1157,7 @@ impl Server {
 
 impl Server {
     /// `damage_resistant` component of the stack (patch, otherwise prototype): tag of damage types.
-    fn resistant_tag(&self, s: &Stack) -> Option<String> {
+    pub(crate) fn resistant_tag(&self, s: &Stack) -> Option<String> {
         if let Some(c) = crate::items::component(s, "minecraft:damage_resistant") {
             return c.get("types").and_then(rc_proto::nbt::Nbt::as_str).map(str::to_owned);
         }

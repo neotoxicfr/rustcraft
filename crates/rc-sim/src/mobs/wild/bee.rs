@@ -349,6 +349,7 @@ pub fn sting(s: &mut Server, m: &mut Mob, t: Ent) -> bool {
         };
         match t {
             Ent::Player => {
+                s.player_thorns(m); // G5-F02d: before the stinger is planted
                 super::hive::add_player_stinger(s);
                 if poison > 0 {
                     s.give_player_effect_from("minecraft:poison", poison * 20, 0, Some(&*m));

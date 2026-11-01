@@ -84,6 +84,8 @@ mod tests_g4f12; // G4-F12: iron and copper golems
 mod tests_g5f02c; // G5-F02c: fall (wind charge, per-block rules, multiplier, sound, dust)
 #[cfg(test)]
 mod tests_g5f02e; // G5-F02e: contacts with crossed blocks, enchanted boots
+mod thorns; // G5-F02d: player thorns
+mod tests_g5f02d;
 pub mod randsrc;
 // Commands (S5).
 pub mod commands;

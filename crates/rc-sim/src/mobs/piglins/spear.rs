@@ -298,6 +298,10 @@ impl Server {
                 m.vel[2] *= 0.6;
             }
         }
+        // G5-F02d: the victim's thorns (hit dealt), before the weapon effects.
+        if hit && e == Ent::Player {
+            self.player_thorns(m);
+        }
         // After-hit effects of the weapon (hit dealt): fire aspect, slowness from bane of arthropods.
         if hit && let Some(w) = &weapon {
             let ticks = 80 * self.life.items.enchantment(w, "minecraft:fire_aspect");

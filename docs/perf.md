@@ -2746,3 +2746,9 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   requires; the other leads gain nothing there). A single thread (game order imposed, effects
   on the world), GPU not applicable. No allocation per tick outside nearby portals. To
   re-measure on a quiet machine (bow shooting scenes, Nether).
+- Player thorns, armor wear and protections (G5-F02d, `rc_sim::thorns`, `vitals.rs`): event code
+  (one hit received), never in a per-tick loop. Thorns: six slots read, one random draw per
+  enchanted item, no allocation; wear: one `equippable` component read per piece and per hit
+  (JSON copy of a few fields, of the order of a microsecond, not measured separately); protection:
+  a tag test up front that avoids walking the four pieces for `/kill` and the void.
+  Multi-core and GPU not applicable (order of the random draws imposed, work of the order of one hit).

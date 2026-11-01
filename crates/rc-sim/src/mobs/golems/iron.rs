@@ -145,6 +145,7 @@ impl Server {
                     self.mobs.player_vel = nv;
                     let velocity = super::super::track::lp_quantize(nv);
                     let _ = self.send(Event::Entity(EntityEvent::Motion { id: self.player_id, velocity }));
+                    self.player_thorns(m); // G5-F02d
                 }
                 r
             }
