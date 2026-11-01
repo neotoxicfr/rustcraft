@@ -225,9 +225,8 @@ impl Server {
             // F15: a dragon part is not a living entity (neither knockback nor effects).
             if self.target_kind(t) != Some(Kind::EnderDragon) {
                 self.arrow_knockback(p, t);
-                if t == Ent::Player {
-                    self.player_thorns_by(owner); // G5-F02d: thorns on the shooter
-                }
+                // G5-F02d, G5-F04: thorns of the struck player or mob on the shooter.
+                self.post_attack_by(t, owner, ty);
                 self.arrow_post_hurt(p, t);
                 // S9: `killed_by_arrow`. Arrow that pierced: the cumulative list of the killed, at
                 // each hit landed (even without a death); otherwise the target alone, if it dies.
@@ -561,9 +560,8 @@ impl Server {
         let kb = (-p.vel[0], -p.vel[2]);
         let hurt = self.proj_damage(t, "minecraft:trident", dmg, owner, kb);
         if hurt {
-            if t == Ent::Player {
-                self.player_thorns_by(owner); // G5-F02d: before the weapon's channeling
-            }
+            // G5-F02d, G5-F04: thorns of the struck player or mob, before the weapon's channeling.
+            self.post_attack_by(t, owner, "minecraft:trident");
             self.channeling_entity(p, t);
             self.arrow_knockback_trident(p, t);
         }
@@ -700,8 +698,8 @@ impl Server {
                 self.ignite_ent(t, 100);
                 if !self.proj_damage(t, ty, 5.0, owner, kb) {
                     self.set_fire_ent(t, before);
-                } else if t == Ent::Player {
-                    self.player_thorns_by(owner); // G5-F02d
+                } else {
+                    self.post_attack_by(t, owner, ty); // G5-F02d, G5-F04: player or mob
                 }
             }
             PKind::WindCharge | PKind::BreezeWindCharge => {
@@ -715,9 +713,8 @@ impl Server {
                 self.mobs.fireballs.direct_large = true;
                 self.proj_damage(t, ty, if reflected { 1000.0 } else { 6.0 }, owner, kb);
                 self.mobs.fireballs.direct_large = false;
-                if t == Ent::Player {
-                    self.player_thorns_by(owner); // G5-F02d: even without a hit dealt, like the game
-                }
+                // G5-F02d, G5-F04: even without a hit dealt, like the game; player or mob.
+                self.post_attack_by(t, owner, ty);
             }
             PKind::ShulkerBullet => self.shulker_bullet_hit(p, t, owner), // F15
             // F16: wither skull.

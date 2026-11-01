@@ -308,11 +308,11 @@ impl Server {
         if !self.may_interact(pos.map(|v| v.floor() as i32)) {
             return;
         }
-        let weapon = self.slots[36 + self.held as usize].clone();
+        let weapon = self.player_weapon();
         let speed = self.player_attribute("minecraft:attack_speed");
         let delay = (1.0 / speed * 20.0) as f32;
         let scale = ((self.mobs.attack_ticker as f32 + 0.5) / delay).clamp(0.0, 1.0);
-        let base = self.player_attribute("minecraft:attack_damage") as f32 * (0.2 + scale * scale * 0.8);
+        let base = self.player_base_damage() * (0.2 + scale * scale * 0.8);
         self.mobs.attack_ticker = 0;
         if base <= 0.0 {
             return;
@@ -323,7 +323,12 @@ impl Server {
             && !self.on_ground
             && !self.life.vit.sprinting
             && !self.phys.climbable(self.st(pos.map(|v| v.floor() as i32)));
-        if !self.stand_hurt(id, &e, "minecraft:player_attack") {
+        // G5-F04: damage source of the weapon (its type, the mace's smash), like on a mob; the
+        // damage itself does not matter to a stand.
+        let smash = weapon.as_ref().is_some_and(|w| w.id == crate::mace::MACE)
+            && crate::mace::can_smash(self.life.vit.fall, self.proj_player.fall_flying);
+        let ty = self.weapon_damage_type(weapon.as_ref(), smash, "minecraft:player_attack");
+        if !self.stand_hurt(id, &e, &ty) {
             self.world_sound("minecraft:entity.player.attack.nodamage", 7, self.pos, 1.0, 1.0);
             return;
         }
@@ -334,14 +339,28 @@ impl Server {
             let s = if full { "minecraft:entity.player.attack.strong" } else { "minecraft:entity.player.attack.weak" };
             self.world_sound(s, 7, self.pos, 1.0, 1.0);
         }
+        // The stand is a living entity: the mace's smash (fall stopped, sound, knockback around
+        // it), the weapon's after-hit effects (Wind Burst; the stand's own equipment is not
+        // read), then the fall reset.
+        if smash {
+            let bbox = self.deco_box(&e).unwrap_or(Aabb { min: pos, max: pos });
+            let st = crate::mace::Struck {
+                ent: Ent::Mob(id),
+                uuid: nbtio::uuid(e.get("UUID")).unwrap_or(0),
+                pos,
+                bbox,
+                on_ground: flag(&e, "OnGround"),
+                on_pos: self.on_pos(pos, None, 1.0e-5),
+            };
+            self.player_smash(&st);
+        }
+        self.player_weapon_post_attack(crate::commands::ents::E::Other(id), pos, &ty, weapon.as_ref());
+        if smash && crate::mace::can_smash(self.life.vit.fall, self.proj_player.fall_flying) {
+            self.life.vit.fall = 0.0;
+        }
         // Weapon wear (the stand is a living entity).
         if let Some(w) = &weapon {
-            let per = self
-                .life
-                .items
-                .default_component(w, "minecraft:weapon")
-                .and_then(|v| v["item_damage_per_attack"].as_i64())
-                .unwrap_or(0) as i32;
+            let per = self.weapon_wear(w);
             if per > 0 {
                 self.hurt_item(36 + self.held as usize, per);
             }

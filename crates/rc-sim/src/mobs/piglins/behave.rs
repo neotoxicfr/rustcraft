@@ -647,9 +647,9 @@ impl Server {
             }
         };
         if hurt {
-            if t == Ent::Player {
-                self.player_thorns(m); // G5-F02d
-            }
+            // G5-F02d, G5-F04: the victim's thorns (player or mob), the attacker's weapon.
+            let w = m.equipment[0].clone();
+            self.melee_post_attack(m, t, ty, w.as_ref());
             m.last_hurt_mob = Some(t);
             if !m.is_baby() {
                 self.hoglin_throw(m, t);

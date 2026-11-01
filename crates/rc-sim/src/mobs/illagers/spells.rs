@@ -289,8 +289,13 @@ impl Server {
                     self.mob_hurt(&mut o, "minecraft:magic", 6.0, None, None);
                 }
                 Some(ow) => {
-                    if !super::allied(self, ow, &o) {
-                        self.mob_hurt(&mut o, "minecraft:indirect_magic", 6.0, Some(Ent::Mob(ow.id)), Some(f.pos));
+                    if !super::allied(self, ow, &o)
+                        && self.mob_hurt(&mut o, "minecraft:indirect_magic", 6.0, Some(Ent::Mob(ow.id)), Some(f.pos))
+                    {
+                        // G5-F04: thorns of the struck mob on the caster.
+                        self.mobs.list[i] = Some(o);
+                        self.post_attack_by(Ent::Mob(id), Some(Ent::Mob(ow.id)), "minecraft:indirect_magic");
+                        continue;
                     }
                 }
             }
@@ -305,7 +310,7 @@ impl Server {
                     // Direct source: the fangs (knockback from their position).
                     let kb = Some((f.pos[0] - self.pos[0], f.pos[2] - self.pos[2]));
                     if self.player_hurt_by_mob(ow, "minecraft:indirect_magic", 6.0, kb) {
-                        self.player_thorns_by(Some(Ent::Mob(ow.id))); // G5-F02d: on the caster
+                        self.player_thorns_by(Some(Ent::Mob(ow.id)), "minecraft:indirect_magic"); // G5-F02d: on the caster
                     }
                 }
             }

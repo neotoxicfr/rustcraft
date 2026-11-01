@@ -48,8 +48,9 @@ impl Server {
                 // Victim killed: the author regains 5 HP; alive: thorns (G5-F02d).
                 if hurt && !self.ent_alive(t) {
                     self.heal_ent(o, 5.0);
-                } else if hurt && t == Ent::Player {
-                    self.player_thorns_by(Some(o));
+                } else if hurt {
+                    // G5-F04: thorns of a struck mob too.
+                    self.post_attack_by(t, Some(o), "minecraft:wither_skull");
                 }
                 hurt
             }

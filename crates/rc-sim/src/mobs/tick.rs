@@ -389,6 +389,13 @@ impl Server {
             }
             m.use_ticks += 1;
         }
+        // G5-F04: equipment modifiers, then the hit list of a tamed animal (every 20 ticks).
+        self.mob_gear_tick(m);
+        if m.tick_count % 20 == 0
+            && let Some(c) = m.combat.as_mut()
+        {
+            c.recheck(m.tick_count.max(0) as u64, m.health > 0.0 && !m.dead);
+        }
         if m.kind == Kind::Chicken {
             self.chicken_tick(m);
         }

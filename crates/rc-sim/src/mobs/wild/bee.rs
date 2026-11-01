@@ -347,9 +347,11 @@ pub fn sting(s: &mut Server, m: &mut Mob, t: Ent) -> bool {
             3 => 18,
             _ => 0,
         };
+        // G5-F02d, G5-F04: the victim's thorns (player or mob) before the stinger is planted.
+        let w = m.equipment[0].clone();
+        s.melee_post_attack(m, t, ty, w.as_ref());
         match t {
             Ent::Player => {
-                s.player_thorns(m); // G5-F02d: before the stinger is planted
                 super::hive::add_player_stinger(s);
                 if poison > 0 {
                     s.give_player_effect_from("minecraft:poison", poison * 20, 0, Some(&*m));

@@ -159,13 +159,21 @@ impl Server {
     }
 
     /// Player hit on a mob: damage dealt (tenths), weapon used, trigger.
-    pub(crate) fn s9_player_hit_mob(&mut self, m: &Mob, original: f32, dealt: f32, weapon: Option<&Stack>) {
-        self.s9_player_hit(Some(Who::Mob(m)), original, dealt, weapon);
+    pub(crate) fn s9_player_hit_mob(&mut self, m: &Mob, ty: &str, original: f32, dealt: f32, weapon: Option<&Stack>) {
+        self.s9_player_hit(Some(Who::Mob(m)), ty, original, dealt, weapon);
     }
 
-    /// Current player's hit on a living entity (`None`: another LAN player,
-    /// whom the entity predicates do not describe yet).
-    pub(crate) fn s9_player_hit(&mut self, victim: Option<Who<'_>>, original: f32, dealt: f32, weapon: Option<&Stack>) {
+    /// Current player's hit of type `ty` (the weapon's: `player_attack`, `mace_smash`, `spear`…)
+    /// on a living entity (`None`: another LAN player, whom the entity predicates do not
+    /// describe yet).
+    pub(crate) fn s9_player_hit(
+        &mut self,
+        victim: Option<Who<'_>>,
+        ty: &str,
+        original: f32,
+        dealt: f32,
+        weapon: Option<&Stack>,
+    ) {
         if dealt > 0.0 {
             self.award_custom("damage_dealt", (dealt * 10.0).round() as i32);
         }
@@ -174,19 +182,16 @@ impl Server {
         {
             self.award_stat("minecraft:used", &w.id, 1);
         }
-        let dmg = Dmg {
-            ty: "minecraft:player_attack".into(),
-            source: Some(Who::E(E::Player)),
-            direct: Some(Who::E(E::Player)),
-            pos: Some(self.pos),
-        };
+        let dmg =
+            Dmg { ty: ty.into(), source: Some(Who::E(E::Player)), direct: Some(Who::E(E::Player)), pos: Some(self.pos) };
         self.trig_player_hurt_entity(victim, &dmg, original, dealt, false);
     }
 
     /// The current player killed another player (`victim`: their score name): statistic,
     /// criteria `totalKillCount`, `playerKillCount`, `teamkill.<colour>` (victim's team),
-    /// `killedByTeam.<colour>` (of the victim, killer's team), `player_killed_entity`.
-    pub(crate) fn s9_player_killed_player(&mut self, victim: &str) {
+    /// `killedByTeam.<colour>` (of the victim, killer's team), `player_killed_entity` (`ty`: type
+    /// of the killing hit).
+    pub(crate) fn s9_player_killed_player(&mut self, victim: &str, ty: &str) {
         self.award_custom("player_kills", 1);
         self.score_criteria_add("totalKillCount", 1);
         self.score_criteria_add("playerKillCount", 1);
@@ -198,12 +203,8 @@ impl Server {
                 self.criteria_update(&format!("killedByTeam.{c}"), victim, |v| v.wrapping_add(1));
             }
         }
-        let dmg = Dmg {
-            ty: "minecraft:player_attack".into(),
-            source: Some(Who::E(E::Player)),
-            direct: Some(Who::E(E::Player)),
-            pos: Some(self.pos),
-        };
+        let dmg =
+            Dmg { ty: ty.into(), source: Some(Who::E(E::Player)), direct: Some(Who::E(E::Player)), pos: Some(self.pos) };
         self.trig_killed(None, &dmg);
     }
 

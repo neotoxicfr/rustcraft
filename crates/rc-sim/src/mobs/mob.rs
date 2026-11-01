@@ -158,6 +158,10 @@ pub struct Attrs {
     /// Chance to call reinforcements (zombie family only: the others do not have
     /// the attribute, like in the game).
     pub reinforcements: Option<Attr>,
+    /// G5-F04: armor toughness (armor absorption) and burning time (ignition length factor),
+    /// fed by the equipment modifiers.
+    pub toughness: Attr,
+    pub burning: Attr,
     /// Registered attributes that the simulation does not model (scale, sturdiness…): read back
     /// and rewritten as they are.
     pub extra: Vec<Nbt>,
@@ -165,7 +169,7 @@ pub struct Attrs {
 
 impl Attrs {
     /// Modeled attributes, by id.
-    pub const NAMES: [&'static str; 18] = [
+    pub const NAMES: [&'static str; 20] = [
         "minecraft:max_health",
         "minecraft:movement_speed",
         "minecraft:attack_damage",
@@ -184,6 +188,8 @@ impl Attrs {
         "minecraft:air_drag_modifier",
         "minecraft:explosion_knockback_resistance",
         "minecraft:spawn_reinforcements",
+        "minecraft:armor_toughness",
+        "minecraft:burning_time",
     ];
 
     pub fn by_name(&self, n: &str) -> Option<&Attr> {
@@ -206,6 +212,8 @@ impl Attrs {
             "minecraft:air_drag_modifier" => &self.air_drag_mod,
             "minecraft:explosion_knockback_resistance" => &self.explosion_kb_resistance,
             "minecraft:spawn_reinforcements" => self.reinforcements.as_ref()?,
+            "minecraft:armor_toughness" => &self.toughness,
+            "minecraft:burning_time" => &self.burning,
             _ => return None,
         })
     }
@@ -230,6 +238,8 @@ impl Attrs {
             "minecraft:air_drag_modifier" => &mut self.air_drag_mod,
             "minecraft:explosion_knockback_resistance" => &mut self.explosion_kb_resistance,
             "minecraft:spawn_reinforcements" => self.reinforcements.as_mut()?,
+            "minecraft:armor_toughness" => &mut self.toughness,
+            "minecraft:burning_time" => &mut self.burning,
             _ => return None,
         })
     }
@@ -435,6 +445,11 @@ pub struct Mob {
     /// Lines of sight already computed this tick (target, view).
     pub sight: Vec<(Ent, bool)>,
     pub equipment: [Option<Stack>; 8],
+    /// G5-F04: equipment seen on the previous tick (attribute modifiers tracking); absent while
+    /// the mob has never worn anything.
+    pub gear_seen: Option<Box<[Option<Stack>; 8]>>,
+    /// G5-F04: hits received, for the death message sent to the owner (tamed animals only).
+    pub combat: Option<Box<crate::vitals::Combat>>,
     pub drop_chance: [f32; 8],
     // Age (animals, villagers) and baby zombie.
     pub age: i32,
@@ -540,6 +555,8 @@ impl Mob {
             air_drag_mod: Attr::ranged(1.0, 0.0, 2048.0),
             explosion_kb_resistance: Attr::ranged(0.0, 0.0, 1.0),
             reinforcements: kind.zombie_like().then(|| Attr::ranged(0.0, 0.0, 1.0)),
+            toughness: Attr::ranged(0.0, 0.0, 20.0),
+            burning: Attr::ranged(1.0, 0.0, 1024.0),
             extra: Vec::new(),
         };
         let follow = i.follow;
@@ -620,6 +637,8 @@ impl Mob {
             targets: Selector::default(),
             sight: Vec::new(),
             equipment: Default::default(),
+            gear_seen: None,
+            combat: None,
             drop_chance: [0.085; 8],
             age: 0,
             baby: false,
@@ -1460,14 +1479,23 @@ pub(crate) const SYNCABLE_MODELED: [&str; 12] = [
     "minecraft:explosion_knockback_resistance",
 ];
 
+/// G5-F04: modeled synced attributes that only exist once used (equipment modifier, command,
+/// save): sent at pairing only when they differ from their default state, then on change.
+pub(crate) const SYNCABLE_LAZY: [&str; 2] = ["minecraft:armor_toughness", "minecraft:burning_time"];
+
+impl Attrs {
+    /// Fields of `SYNCABLE_LAZY`, same order, with their default base.
+    pub(crate) fn lazy_fields(&self) -> [(&Attr, f64); 2] {
+        [(&self.toughness, 0.0), (&self.burning, 1.0)]
+    }
+}
+
 /// Synced attributes that the simulation keeps as they are (`extra` list).
-pub(crate) const SYNCABLE_EXTRA: [&str; 20] = [
-    "minecraft:armor_toughness",
+pub(crate) const SYNCABLE_EXTRA: [&str; 18] = [
     "minecraft:attack_speed",
     "minecraft:below_name_distance",
     "minecraft:block_break_speed",
     "minecraft:block_interaction_range",
-    "minecraft:burning_time",
     "minecraft:camera_distance",
     "minecraft:entity_interaction_range",
     "minecraft:flying_speed",
@@ -1484,13 +1512,16 @@ pub(crate) const SYNCABLE_EXTRA: [&str; 20] = [
     "minecraft:water_movement_efficiency",
 ];
 
-/// Fingerprints of the syncable attributes, one per attribute of `SYNCABLE_MODELED` (same order)
-/// then one for all the kept attributes: a change of base or modifiers alters
-/// that of the attribute (negligible collision), without allocation.
-pub(crate) type AttrPrints = [u64; SYNCABLE_MODELED.len() + 1];
+/// Fingerprints of the syncable attributes, one per attribute of `SYNCABLE_MODELED` (same order),
+/// one per attribute of `SYNCABLE_LAZY`, then one for all the kept attributes: a change of base
+/// or modifiers alters that of the attribute (negligible collision), without allocation.
+pub(crate) type AttrPrints = [u64; SYNCABLE_MODELED.len() + SYNCABLE_LAZY.len() + 1];
+
+/// Index of the fingerprint of the kept (`extra`) attributes.
+pub(crate) const EXTRA_PRINT: usize = SYNCABLE_MODELED.len() + SYNCABLE_LAZY.len();
 
 pub(crate) fn syncable_fingerprint(a: &Attrs) -> AttrPrints {
-    let mut out = [0u64; SYNCABLE_MODELED.len() + 1];
+    let mut out = [0u64; EXTRA_PRINT + 1];
     let mix = |h: &mut u64, v: u64| {
         *h ^= v;
         *h = h.wrapping_mul(0x0100_0000_01b3).rotate_left(29);
@@ -1509,6 +1540,8 @@ pub(crate) fn syncable_fingerprint(a: &Attrs) -> AttrPrints {
         &a.friction_mod,
         &a.air_drag_mod,
         &a.explosion_kb_resistance,
+        &a.toughness,
+        &a.burning,
     ];
     for (attr, h) in fields.into_iter().zip(&mut out) {
         *h = 0xcbf2_9ce4_8422_2325;
@@ -1520,7 +1553,7 @@ pub(crate) fn syncable_fingerprint(a: &Attrs) -> AttrPrints {
         mix(h, attr.mods.len() as u64);
     }
     // Kept attributes: rare, changed only by command or reread.
-    let h = &mut out[SYNCABLE_MODELED.len()];
+    let h = &mut out[EXTRA_PRINT];
     *h = 0xcbf2_9ce4_8422_2325;
     for e in &a.extra {
         mix(h, e.get("base").and_then(f64_of).map_or(0, f64::to_bits));

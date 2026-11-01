@@ -298,30 +298,10 @@ impl Server {
                 m.vel[2] *= 0.6;
             }
         }
-        // G5-F02d: the victim's thorns (hit dealt), before the weapon effects.
-        if hit && e == Ent::Player {
-            self.player_thorns(m);
-        }
-        // After-hit effects of the weapon (hit dealt): fire aspect, slowness from bane of arthropods.
-        if hit && let Some(w) = &weapon {
-            let ticks = 80 * self.life.items.enchantment(w, "minecraft:fire_aspect");
-            match e {
-                Ent::Player => {
-                    if ticks > 0 {
-                        self.player_ignite(ticks);
-                    }
-                }
-                Ent::Mob(id) => {
-                    if let Some(i) = self.mob_index(id) {
-                        let mut o = self.mobs.list[i].take().expect("mob");
-                        if ticks > 0 {
-                            crate::inside_blocks::mob_ignite(&mut o, ticks);
-                        }
-                        self.bane_slowness(Some(w), &mut o);
-                        self.mobs.list[i] = Some(o);
-                    }
-                }
-            }
+        // G5-F04: after-hit effects of a hit dealt (G5-F02d: the victim's thorns, the player's or a
+        // mob's), then the weapon's (fire aspect, bane of arthropods).
+        if hit {
+            self.melee_post_attack(m, e, ty, weapon.as_ref());
         }
         if affected {
             m.last_hurt_mob = Some(e);

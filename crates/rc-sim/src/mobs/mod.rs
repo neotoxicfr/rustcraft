@@ -8,6 +8,7 @@ mod bell;
 mod body;
 mod resize; // refit after the box grows
 pub(crate) mod fireballs;
+pub(crate) mod gear; // G5-F04: attribute modifiers of the equipment
 pub(crate) mod nether;
 pub(crate) mod brains;
 pub(crate) mod brainy;
