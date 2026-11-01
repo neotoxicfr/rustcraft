@@ -563,7 +563,7 @@ mod tests {
 
     #[test]
     fn folder_names() {
-        let dir = std::env::temp_dir().join(format!("rc-storage-{}", std::process::id()));
+        let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-storage-{}", std::process::id())));
         std::fs::create_dir_all(dir.join("New World")).unwrap();
         std::fs::create_dir_all(dir.join("New World (1)")).unwrap();
         assert_eq!(find_available_name(&dir, "New World", ""), "New World (2)");
@@ -576,7 +576,7 @@ mod tests {
 
     #[test]
     fn backup_and_delete() {
-        let dir = std::env::temp_dir().join(format!("rc-storage-b-{}", std::process::id()));
+        let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-storage-b-{}", std::process::id())));
         let w = dir.join("saves").join("World");
         std::fs::create_dir_all(w.join("data")).unwrap();
         std::fs::write(w.join("level.dat"), b"abc").unwrap();
@@ -598,8 +598,7 @@ mod tests {
     /// target stays intact (the old code followed the link and emptied the target).
     #[test]
     fn delete_never_follows_links() {
-        let dir = std::env::temp_dir().join(format!("rc-storage-l-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-storage-l-{}", std::process::id())));
         let w = dir.join("World");
         let outside = dir.join("elsewhere");
         std::fs::create_dir_all(&w).unwrap();

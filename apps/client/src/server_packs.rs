@@ -1160,8 +1160,7 @@ mod tests {
     /// (the old code followed the link and erased files of its target).
     #[test]
     fn vacuum_never_follows_links() {
-        let root = std::env::temp_dir().join(format!("rc-vacuum-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-vacuum-{}", std::process::id())));
         let downloads = root.join("downloads");
         let outside = root.join("elsewhere");
         std::fs::create_dir_all(downloads.join("a")).expect("folder");

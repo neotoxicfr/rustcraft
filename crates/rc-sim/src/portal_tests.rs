@@ -204,8 +204,7 @@ fn portal_parity_with_official_server() {
     let Ok(refdir) = std::env::var("RUSTCRAFT_S6_REF") else { return };
     let refdir = std::path::PathBuf::from(refdir);
     let data = Arc::new(rc_testdata::version_data().expect("data"));
-    let work = std::env::temp_dir().join(format!("rc-s6-parity-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
+    let work = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-s6-parity-{}", std::process::id())));
     copy_dir(&refdir.join("ref-before"), &work);
     let mut s = open_world(&work, data.clone());
     let mut after = open_world(&refdir.join("ref-after"), data);
@@ -316,8 +315,7 @@ pub(crate) fn open_new_world(tag: &str, seed: i64) -> Option<(Server, std::path:
 fn open_new_world_session(tag: &str, seed: i64) -> Option<(Server, rc_client::Session, std::path::PathBuf)> {
     let data = Arc::new(rc_testdata::version_data()?);
     crate::registries::client_jar(&data)?;
-    let dir = std::env::temp_dir().join(format!("rc-s6-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-s6-{tag}-{}", std::process::id())));
     let mut w = crate::newworld::NewWorld::new(tag);
     w.seed = seed;
     crate::newworld::create_world(&dir, &data, &w).expect("creation");

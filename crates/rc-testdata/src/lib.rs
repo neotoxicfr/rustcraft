@@ -25,6 +25,28 @@ pub fn need<T>(v: Option<T>, what: &str) -> Option<T> {
     v
 }
 
+/// Empties `dir` and hands it back; it is removed again when the calling test's thread ends, even
+/// if the test fails (a failed assertion skips the erasing at the end of the test: these folders,
+/// worlds often, piled up by the hundreds in the temporary folder). Each test runs on its own
+/// thread, whose locals (server, open files) are gone by then.
+pub fn scratch(dir: PathBuf) -> PathBuf {
+    use std::cell::RefCell;
+    struct Folders(Vec<PathBuf>);
+    impl Drop for Folders {
+        fn drop(&mut self) {
+            for d in &self.0 {
+                let _ = std::fs::remove_dir_all(d);
+            }
+        }
+    }
+    thread_local! {
+        static FOLDERS: RefCell<Folders> = const { RefCell::new(Folders(Vec::new())) };
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    FOLDERS.with(|f| f.borrow_mut().0.push(dir.clone()));
+    dir
+}
+
 /// Version data from the local cache (without preparation).
 pub fn version_data() -> Option<VersionData> {
     need(rc_data::load_cached(VERSION), "26.3 data cache")

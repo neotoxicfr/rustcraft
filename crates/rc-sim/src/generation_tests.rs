@@ -30,8 +30,7 @@ fn template(tag: usize) -> Option<(Arc<VersionData>, PathBuf, Vec<String>)> {
     let data = Arc::new(rc_testdata::version_data()?);
     let jar = crate::registries::client_jar(&data)?;
     let regs = crate::registries::load(&jar, &data).ok()?;
-    let dir = std::env::temp_dir().join(format!("rc-gen-inflight-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-gen-inflight-{tag}-{}", std::process::id())));
     let mut w = crate::newworld::NewWorld::new("layer");
     w.seed = 20_261_022;
     crate::newworld::create_world(&dir, &data, &w).expect("creation");
@@ -76,9 +75,9 @@ fn run(
     batches: &[Vec<(i32, i32)>],
 ) -> BTreeMap<(i32, i32), (u64, u64)> {
     let tag = batches.len();
-    let dir = std::env::temp_dir()
-        .join(format!("rc-gen-inflight-{tag}-{keep}-{disk:?}-{lazy}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = rc_testdata::scratch(
+        std::env::temp_dir().join(format!("rc-gen-inflight-{tag}-{keep}-{disk:?}-{lazy}-{}", std::process::id())),
+    );
     let wgs = ["data", "minecraft", "world_gen_settings.dat"].iter().collect::<PathBuf>();
     std::fs::create_dir_all(dir.join("data").join("minecraft")).unwrap();
     std::fs::copy(template.join(&wgs), dir.join(&wgs)).unwrap();

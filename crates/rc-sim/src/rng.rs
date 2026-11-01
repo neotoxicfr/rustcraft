@@ -321,7 +321,7 @@ mod tests {
     /// A single sequences file, at the world root; `reset` and `clear` make them restart.
     #[test]
     fn sequences_reset_and_clear() {
-        let tmp = std::env::temp_dir().join("rc-seq-reset");
+        let tmp = rc_testdata::scratch(std::env::temp_dir().join("rc-seq-reset"));
         let mut s = Sequences::load(&tmp, 6_470_889_051_986_534_830);
         assert_eq!(s.path(), tmp.join("data").join("minecraft").join("random_sequences.dat"));
         let draw =

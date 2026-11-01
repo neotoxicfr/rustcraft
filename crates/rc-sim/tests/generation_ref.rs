@@ -35,8 +35,7 @@ fn generated_chunks_match_official_server() {
     let refdim = Dimension::new(&reference, dim_name, height);
 
     // New world: same settings, no region.
-    let work = std::env::temp_dir().join(format!("rc-gen-ref-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
+    let work = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-gen-ref-{}", std::process::id())));
     std::fs::create_dir_all(work.join("data").join("minecraft")).unwrap();
     std::fs::copy(reference.join("level.dat"), work.join("level.dat")).unwrap();
     let wgs = ["data", "minecraft", "world_gen_settings.dat"];
@@ -1010,8 +1009,7 @@ fn flat_world_layers_far_from_origin() {
             ]),
         ),
     ]));
-    let dir = std::env::temp_dir().join(format!("rc-flat-layers-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-flat-layers-{}", std::process::id())));
     rc_sim::newworld::create_world(&dir, &data, &w).expect("creation");
     let regs = rc_sim::registries::load(&jar, &data).expect("registries");
     let biomes = regs.entries("minecraft:worldgen/biome").to_vec();

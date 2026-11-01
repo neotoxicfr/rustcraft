@@ -489,7 +489,7 @@ mod tests {
 
     #[test]
     fn bars_round_trip_through_the_file() {
-        let dir = std::env::temp_dir().join(format!("rc-bars-{}", std::process::id()));
+        let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-bars-{}", std::process::id())));
         let crate::save::Job::Dat { path, nbt, .. } = super::bars_job(&dir, &[bar()]) else { panic!() };
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, crate::nbtio::gzip(&nbt)).unwrap();

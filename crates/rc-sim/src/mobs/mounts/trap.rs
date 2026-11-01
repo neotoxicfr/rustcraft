@@ -835,6 +835,9 @@ mod w9_tests {
         }
         let dir = std::env::temp_dir().join(format!("rc-w9-animals-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        if !rc_data::env_flag!("RUSTCRAFT_W9_KEEP") {
+            rc_testdata::scratch(dir.clone());
+        }
         let mut w = crate::newworld::NewWorld::new("animals");
         w.seed = 42;
         crate::newworld::create_world(&dir, &data, &w).expect("creation");
@@ -879,8 +882,7 @@ mod w9_tests {
         let Some(out) = rc_data::env_os!("RUSTCRAFT_W9_DUMP") else { return };
         let Some(data) = rc_testdata::version_data() else { return };
         let data = std::sync::Arc::new(data);
-        let dir = std::env::temp_dir().join(format!("rc-w9-dump-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-w9-dump-{}", std::process::id())));
         let mut w = crate::newworld::NewWorld::new("survey");
         w.seed = 42;
         crate::newworld::create_world(&dir, &data, &w).expect("creation");
