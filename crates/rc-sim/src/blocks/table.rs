@@ -221,7 +221,7 @@ pub(crate) struct Ids {
     pub tnt: u16,
     pub sugar_cane: u16,
     pub cactus: u16,
-    /// Crossed-block pass (`inside_blocks`).
+    /// Crossed-block pass (`inside_blocks`); powder snow also for the geyser column (G6-F09a).
     pub campfire: u16,
     pub soul_campfire: u16,
     pub powder_snow: u16,
@@ -258,8 +258,6 @@ pub(crate) struct Ids {
     /// G6-F09a: blocks under which speleothems grow.
     pub dripstone_block: u16,
     pub sulfur: u16,
-    /// G6-F09a: powder snow (no collision for the geyser column).
-    pub powder_snow: u16,
 }
 
 pub(crate) struct Table {
@@ -647,7 +645,6 @@ impl Table {
             carved_pumpkin: f("carved_pumpkin"),
             dripstone_block: f("dripstone_block"),
             sulfur: f("sulfur"),
-            powder_snow: f("powder_snow"),
         };
         let pair = d
             .blocks
