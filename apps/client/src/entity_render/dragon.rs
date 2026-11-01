@@ -315,7 +315,7 @@ impl EntityRenderer {
             rays(m, t / 200.0, &mut self.free_verts[FREE_RAYS]);
         }
         let p = e.render_pos(pt);
-        // Boîte du dragon gonflée de 32 (demi-largeur, hauteur).
+        // Dragon box inflated by 32 (half-width, height).
         let [w, h] = {
             let s = e.size(&self.dims);
             [f64::from(s.w) / 2.0 + 32.0, f64::from(s.h) + 32.0]
