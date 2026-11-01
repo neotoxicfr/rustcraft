@@ -82,7 +82,7 @@ fn visibility_and_completion() {
         ("x:d", adv(Some("x:c"), true, false)),
         ("x:e", adv(Some("x:d"), true, false)),
     ]));
-    let dir = std::env::temp_dir().join(format!("rc-s9-{}", std::process::id()));
+    let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-s9-{}", std::process::id())));
     let mut p = Progress::new(t.clone(), &dir, 1);
     // Nothing done: nothing visible, first send empty (not sent).
     assert!(p.flush().is_none());

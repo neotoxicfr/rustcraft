@@ -1836,8 +1836,7 @@ mod tests {
     }
 
     fn tmp(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("rc-solo-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+        let d = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-solo-{name}-{}", std::process::id())));
         std::fs::create_dir_all(&d).expect("folder");
         d
     }
@@ -1980,8 +1979,7 @@ mod tests {
     /// Inner link refused: the world is refused before editing.
     #[test]
     fn symlinked_level_dat_is_a_warning_entry() {
-        let root = std::env::temp_dir().join(format!("rc-world-links-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-world-links-{}", std::process::id())));
         let world = root.join("Linked world");
         let outside = root.join("elsewhere");
         std::fs::create_dir_all(&world).expect("folder");
@@ -2011,8 +2009,8 @@ mod tests {
     /// code loaded the pack then refused the world, pack left active.
     #[test]
     fn refused_world_never_loads_its_pack() {
-        let root = std::env::temp_dir().join(format!("rc-world-pack-link-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root =
+            rc_testdata::scratch(std::env::temp_dir().join(format!("rc-world-pack-link-{}", std::process::id())));
         let world = root.join("world");
         let outside = root.join("elsewhere");
         std::fs::create_dir_all(&world).expect("folder");

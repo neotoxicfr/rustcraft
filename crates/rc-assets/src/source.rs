@@ -582,8 +582,7 @@ pub(crate) mod testkit {
     use std::path::PathBuf;
 
     pub(crate) fn dir(name: &str, files: &[(&str, &[u8])]) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("rc-assets-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-assets-{name}-{}", std::process::id())));
         for (p, b) in files {
             let f = root.join(p);
             std::fs::create_dir_all(f.parent().expect("parent")).expect("directory");

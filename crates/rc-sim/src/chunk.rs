@@ -933,8 +933,7 @@ mod bonus_tests {
         if crate::registries::client_jar(&data).is_none() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("rc-bonus-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-bonus-{}", std::process::id())));
         let mut w = crate::newworld::NewWorld::new("bonus");
         w.seed = 7;
         w.bonus_chest = true;

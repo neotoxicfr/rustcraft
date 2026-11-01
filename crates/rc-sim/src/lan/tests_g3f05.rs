@@ -30,8 +30,7 @@ const FLOOR: i32 = 199;
 fn open(tag: &str) -> T {
     let data = Arc::new(rc_testdata::version_data().expect("version data missing: G3-F05 tests impossible"));
     crate::registries::client_jar(&data).expect("client jar missing: G3-F05 tests impossible");
-    let dir = std::env::temp_dir().join(format!("rc-g3f05-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-g3f05-{tag}-{}", std::process::id())));
     let mut w = crate::newworld::NewWorld::new(tag);
     w.seed = 7;
     crate::newworld::create_world(&dir, &data, &w).expect("world creation");

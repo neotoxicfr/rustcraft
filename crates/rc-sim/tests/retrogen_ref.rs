@@ -56,8 +56,7 @@ fn converted_chunks_match_official_retrogen() {
         }
     }
     assert!(!converted.is_empty(), "no converted chunk in the input");
-    let work = std::env::temp_dir().join(format!("rc-retro-ref-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&work);
+    let work = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-retro-ref-{}", std::process::id())));
     copy_dir(&input, &work);
     let (full, _) =
         rc_sim::generation::generate_now(data.clone(), &work, dim, biomes.clone(), &converted, DecorOrder::Classes)

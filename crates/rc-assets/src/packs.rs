@@ -306,8 +306,7 @@ mod tests {
     /// took it), the ordinary pack stays; an allowed linked zip takes the identifier of the link.
     #[test]
     fn discover_refuses_forbidden_links() {
-        let root = std::env::temp_dir().join(format!("rc-packs-links-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-packs-links-{}", std::process::id())));
         let packs = root.join("resourcepacks");
         let meta = br#"{"pack":{"description":"x","min_format":97,"max_format":97}}"#;
         for p in ["plain", "linked"] {

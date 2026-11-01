@@ -503,8 +503,11 @@ mod tests {
     /// texture), like `item/diamond` looked up in the game's block atlas.
     #[test]
     fn atlas_sprites_follow_the_atlas_sources() {
-        let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-tmp").join(format!("g1f13-atlas-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+        let d = rc_testdata::scratch(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/test-tmp")
+                .join(format!("g1f13-atlas-{}", std::process::id())),
+        );
         let atlases = d.join("assets/minecraft/atlases");
         std::fs::create_dir_all(&atlases).expect("atlases");
         std::fs::write(

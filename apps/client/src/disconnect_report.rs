@@ -76,7 +76,8 @@ mod tests {
 
     #[test]
     fn report_is_written_under_debug_and_carries_the_link() {
-        let dir = std::env::temp_dir().join(format!("rc-disconnect-report-{}", std::process::id()));
+        let dir =
+            rc_testdata::scratch(std::env::temp_dir().join(format!("rc-disconnect-report-{}", std::process::id())));
         let stamp = (2026, 1, 2, 3, 4, 5);
         let p = store(&dir, stamp, "java.io.IOException: x", Some("https://bug"), &[("k".into(), "v".into())]).unwrap();
         assert_eq!(p.parent().unwrap(), dir.join("debug"));

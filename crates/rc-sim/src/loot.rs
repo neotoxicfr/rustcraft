@@ -1149,8 +1149,7 @@ mod tests {
     #[test]
     fn raider_and_hook_entity_conditions_defaults() {
         let data = std::sync::Arc::new(rc_testdata::version_data().expect("version data 26.3 missing"));
-        let dir = std::env::temp_dir().join(format!("rc-loot-g1f07-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-loot-g1f07-{}", std::process::id())));
         let mut w = crate::newworld::NewWorld::new("g1f07");
         w.preset = crate::newworld::Preset::Flat;
         crate::newworld::create_world(&dir, &data, &w).expect("world creation");

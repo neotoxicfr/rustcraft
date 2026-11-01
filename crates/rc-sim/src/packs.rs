@@ -962,8 +962,7 @@ mod tests {
     /// a pack of functions alone or not enabled.
     #[test]
     fn backup_question_like_the_game() {
-        let root = std::env::temp_dir().join(format!("rc-backupq-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-backupq-{}", std::process::id())));
         let enabled = |v: &[&str]| {
             c(vec![(
                 "DataPacks",

@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn names_follow_the_game_and_skip_taken_ones() {
-        let dir = std::env::temp_dir().join(format!("rc-shot-{}", std::process::id()));
+        let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-shot-{}", std::process::id())));
         std::fs::create_dir_all(&dir).unwrap();
         let t = (2026, 10, 12, 9, 5, 3);
         let a = free_name(&dir, t);
