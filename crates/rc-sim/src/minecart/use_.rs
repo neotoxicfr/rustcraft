@@ -134,10 +134,22 @@ impl Server {
         if sprint_kb {
             self.world_sound("minecraft:entity.player.attack.knockback", 7, self.pos, 1.0, 1.0);
         }
+        // G5-F04: damage source of the weapon; the mace's fall bonus counts against any entity (its
+        // smash effects and fall reset only follow a hit on a living one).
+        let fall = self.life.vit.fall;
+        let smash = weapon.as_ref().is_some_and(|w| w.id == crate::mace::MACE)
+            && crate::mace::can_smash(fall, self.proj_player.fall_flying);
+        let ty = self.weapon_damage_type(weapon.as_ref(), smash, "minecraft:player_attack");
+        if smash {
+            let me = crate::progress::pred::Who::E(crate::commands::ents::E::Player);
+            let mut own = self.life.rng;
+            let ctx = self.damage_ctx(&ty, me, c.pos, Some(me), true);
+            base += self.mace_bonus(weapon.as_ref(), fall, true, &ctx, &mut own);
+        }
         let total = base + magic;
         // Never a critical hit against a non-living entity.
         let sweep = self.sweep_allowed(full, false, sprint_kb, weapon.as_ref());
-        let hurt = self.cart_hurt(c, "minecraft:player_attack", total, Some(Ent::Player));
+        let hurt = self.cart_hurt(c, &ty, total, Some(Ent::Player));
         if hurt {
             let kb_ench = weapon.as_ref().map_or(0, |w| self.life.items.enchantment(w, "minecraft:knockback")) as f32;
             let kb = kb_ench + if sprint_kb { 0.5 } else { 0.0 };
@@ -152,7 +164,7 @@ impl Server {
             }
             if sweep {
                 self.world_sound("minecraft:entity.player.attack.sweep", 7, self.pos, 1.0, 1.0);
-                self.sweep_attack(&c.bbox(), None, base, scale);
+                self.sweep_attack(&c.bbox(), None, base, scale, &ty, weapon.as_ref());
             } else {
                 let s = if full { "minecraft:entity.player.attack.strong" } else { "minecraft:entity.player.attack.weak" };
                 self.world_sound(s, 7, self.pos, 1.0, 1.0);

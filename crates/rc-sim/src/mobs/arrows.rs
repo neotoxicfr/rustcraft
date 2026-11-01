@@ -66,38 +66,7 @@ impl Server {
     /// Wear of the item held by a mob (Unbreaking on the world's random);
     /// broken: stack removed, break event (47 main hand, 48 off hand).
     pub(crate) fn mob_hurt_item(&mut self, m: &mut Mob, hand: usize, n: i32) {
-        let Some(s) = m.equipment[hand].clone() else { return };
-        let items = &self.life.items;
-        if !items.damageable(&s) {
-            return;
-        }
-        let unbreaking = items.enchantment(&s, "minecraft:unbreaking");
-        let mut n2 = n;
-        if unbreaking > 0 {
-            let p = unbreaking as f32 / (unbreaking as f32 + 1.0);
-            for _ in 0..n {
-                if self.life.rng.next_float() < p {
-                    n2 -= 1;
-                }
-            }
-        }
-        if n2 <= 0 {
-            return;
-        }
-        let max = self.life.items.max_damage(&s);
-        let dmg = self.life.items.damage(&s) + n2;
-        let mut s = s;
-        if dmg >= max {
-            s.count -= 1;
-            crate::items::remove_component(&mut s, "minecraft:damage");
-            m.equipment[hand] = (s.count > 0).then_some(s);
-            let event = if hand == 0 { 47 } else { 48 };
-            let _ = self.send(rc_client::Event::Entity(rc_client::EntityEvent::Event { id: m.id, event }));
-        } else {
-            crate::items::set_component(&mut s, "minecraft:damage", Nbt::Int(dmg));
-            m.equipment[hand] = Some(s);
-        }
-        self.send_mob_equipment(m, &[hand]);
+        self.mob_hurt_slot(m, hand, n);
     }
 
     /// Impact point of the segment on the collision shapes (fraction from `from` to `to`), with

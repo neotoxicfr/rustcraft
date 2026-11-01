@@ -261,7 +261,7 @@ fn thorns_hurt_shooter_in_list() {
     let sk = p.s.new_mob(Kind::Skeleton, [110.5, -59.0, 118.5], 180.0);
     let (id, hp) = (sk.id, sk.health);
     p.s.add_mob(sk);
-    p.s.player_thorns_by(Some(Ent::Mob(id)));
+    p.s.player_thorns_by(Some(Ent::Mob(id)), "minecraft:arrow");
     let after = p.s.mob_ref(id).map(|m| m.health).expect("skeleton");
     assert!((1.0..5.0).contains(&(hp - after)), "shooter not hurt: {}", hp - after);
     assert_eq!(wear(&p, 5), 2);

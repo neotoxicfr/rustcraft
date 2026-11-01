@@ -757,7 +757,24 @@ impl Server {
                 .collect();
             out.push(Attribute { id, base: attr.base, modifiers });
         }
-        let extra = if keep(super::super::mob::SYNCABLE_MODELED.len()) { &a.extra[..] } else { &[] };
+        // G5-F04: attributes that exist once used: at pairing only when out of their default state.
+        let first_lazy = super::super::mob::SYNCABLE_MODELED.len();
+        for (k, (name, (attr, default))) in
+            super::super::mob::SYNCABLE_LAZY.into_iter().zip(a.lazy_fields()).enumerate()
+        {
+            let used = attr.saved || !attr.mods.is_empty() || attr.base != default;
+            if if changed_only { !keep(first_lazy + k) } else { !used } {
+                continue;
+            }
+            let Some(id) = index(name) else { continue };
+            let modifiers = attr
+                .mods
+                .iter()
+                .map(|(n, amount, op)| Modifier { id: (*n).into(), amount: *amount, operation: *op })
+                .collect();
+            out.push(Attribute { id, base: attr.base, modifiers });
+        }
+        let extra = if keep(super::super::mob::EXTRA_PRINT) { &a.extra[..] } else { &[] };
         for e in extra {
             let name = e.get("id").and_then(rc_proto::nbt::Nbt::as_str).unwrap_or("");
             let name = if name.contains(':') { name.to_owned() } else { format!("minecraft:{name}") };

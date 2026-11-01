@@ -86,6 +86,10 @@ mod tests_g5f02c; // G5-F02c: fall (wind charge, per-block rules, multiplier, so
 mod tests_g5f02e; // G5-F02e: contacts with crossed blocks, enchanted boots
 mod thorns; // G5-F02d: player thorns
 mod tests_g5f02d;
+mod ench_fx; // G5-F04: enchantment effects (protection, armor effectiveness, after-hit effects)
+mod mace; // G5-F04: smash attack
+#[cfg(test)]
+mod tests_g5f04;
 pub mod randsrc;
 // Commands (S5).
 pub mod commands;

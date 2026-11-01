@@ -396,6 +396,10 @@ impl Server {
         }
         m.no_action_time = 0;
         let mut damage = amount.max(0.0);
+        // G5-F04: a hit that damages helmets (falling block) loses a quarter on a worn head.
+        if m.equipment[5].is_some() && self.dmg_tag(ty, "minecraft:damages_helmet") {
+            damage *= 0.75;
+        }
         if !damage.is_finite() {
             damage = f32::MAX;
         }
@@ -422,8 +426,15 @@ impl Server {
             m.last_hurt_by_mob = Some((b, m.tick_count));
             self.npc_hurt_by(m, b); // F05: reputation
         }
-        if by == Some(Ent::Player) {
-            m.last_hurt_by_player = 100;
+        match by {
+            Some(Ent::Player) => m.last_hurt_by_player = 100,
+            // G5-F04: a tamed wolf credits its owner (tamed without an owner: memory forgotten).
+            Some(Ent::Mob(id)) => {
+                if let Some(w) = self.mob_ref(id).filter(|w| w.kind == Kind::Wolf && w.tame) {
+                    m.last_hurt_by_player = if w.owner.is_some() { 100 } else { 0 };
+                }
+            }
+            None => {}
         }
         if full {
             let _ = self.send(Event::Entity(EntityEvent::Hurt { id: m.id, yaw: 0.0 }));
@@ -449,6 +460,7 @@ impl Server {
                     .or_else(|| self.variant_sound(m, "death_sound"))
                     .unwrap_or_else(|| m.death_sound().to_owned());
                 self.make_sound(m, &d);
+                self.thorns_hit_sound(ty, 5, m.pos);
             }
             self.mob_die(m, ty, by);
         } else if full {
@@ -466,6 +478,7 @@ impl Server {
                 .or_else(|| self.variant_sound(m, "hurt_sound"))
                 .unwrap_or_else(|| m.hurt_sound().to_owned());
             self.make_sound(m, &h);
+            self.thorns_hit_sound(ty, 5, m.pos);
         }
         m.last_hit = Some(Hit { ty: ty.to_owned(), by, tick: self.time as u64 });
         self.mob_hurt_effects(m); // infestation
@@ -507,27 +520,54 @@ impl Server {
         true
     }
 
-    /// Enchantment protection of a mob's armor (feet, legs, chest, head, body).
-    fn mob_protection(&self, m: &Mob, ty: &str) -> f32 {
-        let mut p = 0.0;
-        for slot in 2..7 {
-            let Some(s) = &m.equipment[slot] else { continue };
-            let lvl = |e: &str| self.life.items.enchantment(s, e) as f32;
-            p += lvl("minecraft:protection");
-            if self.dmg_tag(ty, "minecraft:is_fire") {
-                p += 2.0 * lvl("minecraft:fire_protection");
-            }
-            if self.dmg_tag(ty, "minecraft:is_fall") {
-                p += 3.0 * lvl("minecraft:feather_falling");
-            }
-            if self.dmg_tag(ty, "minecraft:is_explosion") {
-                p += 2.0 * lvl("minecraft:blast_protection");
-            }
-            if self.dmg_tag(ty, "minecraft:is_projectile") {
-                p += 2.0 * lvl("minecraft:projectile_protection");
-            }
+    /// G5-F04: enchantment protection of a mob's equipment against a hit (`damage_protection`
+    /// effects of the pack: none for `bypasses_invulnerability` damage, like their conditions).
+    fn mob_protection(&mut self, m: &mut Mob, ty: &str, by: Option<Ent>) -> f32 {
+        // Nothing worn (almost every mob): no context to build.
+        if m.equipment.iter().all(Option::is_none) {
+            return 0.0;
         }
+        let (mut world, mut own) = (self.mobs.rng, m.rng);
+        let p = {
+            let gear: [(usize, Option<&Stack>); 8] = std::array::from_fn(|k| (k, m.equipment[k].as_ref()));
+            let ctx = self.hurt_ctx(ty, crate::progress::pred::Who::Mob(m), m.pos, by);
+            self.ench_protection(&gear, &ctx, &mut world, &mut own)
+        };
+        (self.mobs.rng, m.rng) = (world, own);
         p
+    }
+
+    /// G5-F04: armor absorption (toughness of the attributes), the armor fraction modified by the
+    /// weapon of a direct attacker (Breach).
+    fn mob_armor_absorb(&mut self, m: &mut Mob, ty: &str, dmg: f32, by: Option<Ent>) -> f32 {
+        let armor = (m.attrs.armor.value() as f32).floor();
+        if armor <= 0.0 {
+            return dmg;
+        }
+        let t = 2.0 + m.attrs.toughness.value() as f32 / 4.0;
+        let a = (armor - dmg / t).clamp(armor * 0.2, 20.0);
+        let mut frac = a / 25.0;
+        if let Some(w) = self.source_weapon(ty, by) {
+            let mut own = m.rng;
+            frac = {
+                let ctx = self.hurt_ctx(ty, crate::progress::pred::Who::Mob(m), m.pos, by);
+                self.armor_fraction(frac, Some(&w), &ctx, &mut own)
+            };
+            m.rng = own;
+        }
+        dmg * (1.0 - frac)
+    }
+
+    /// G5-F04: a horse's body armor wears down with the hits (⌊d/4⌋, at least 1), if it is worn
+    /// down on hurt and does not resist the type; the other mobs never wear their pieces.
+    fn horse_armor_wear(&mut self, m: &mut Mob, ty: &str, dmg: f32) {
+        if dmg <= 0.0 || m.kind != Kind::Horse {
+            return;
+        }
+        let n = (dmg / 4.0).max(1.0) as i32;
+        if m.equipment[6].as_ref().is_some_and(|s| self.life.items.damageable(s) && self.armor_wears(s, ty)) {
+            self.mob_hurt_slot(m, 6, n);
+        }
     }
 
     fn mob_actually_hurt(&mut self, m: &mut Mob, ty: &str, mut dmg: f32, by: Option<Ent>) {
@@ -537,12 +577,8 @@ impl Server {
             return;
         }
         if !self.dmg_tag(ty, "minecraft:bypasses_armor") {
-            let armor = (m.attrs.armor.value() as f32).floor();
-            if armor > 0.0 {
-                let t = 2.0;
-                let a = (armor - dmg / t).clamp(armor * 0.2, 20.0);
-                dmg *= 1.0 - a / 25.0;
-            }
+            self.horse_armor_wear(m, ty, dmg);
+            dmg = self.mob_armor_absorb(m, ty, dmg, by);
         }
         // S7: Resistance effect, then enchantment protections of the armor (feet → body).
         if !self.dmg_tag(ty, "minecraft:bypasses_effects") {
@@ -558,7 +594,7 @@ impl Server {
                 }
             }
             if dmg > 0.0 && !self.dmg_tag(ty, "minecraft:bypasses_enchantments") {
-                let p = self.mob_protection(m, ty);
+                let p = self.mob_protection(m, ty, by);
                 if p > 0.0 {
                     dmg *= 1.0 - p.clamp(0.0, 20.0) / 25.0;
                 }
@@ -570,6 +606,10 @@ impl Server {
             dmg *= 0.15;
         }
         if dmg != 0.0 {
+            // G5-F04: the hits of an owned tamed animal are kept for its death message.
+            if m.owner.is_some() && super::species::tamable(m.kind) {
+                self.mob_record_damage(m, ty, dmg, by);
+            }
             m.health = (m.health - dmg).clamp(0.0, m.max_health());
             self.mob_game_event(m, "minecraft:entity_damage");
         }
@@ -604,6 +644,12 @@ impl Server {
         // F15: dragon's fatal hit (never "dead", death phase).
         if self.end_die(m, ty, by) {
             return;
+        }
+        // G5-F04: the owner of a tamed animal receives its death message (before the rest).
+        if let Some(owner) = m.owner.filter(|_| super::species::tamable(m.kind))
+            && self.rule("minecraft:show_death_messages", true)
+        {
+            self.pet_death_message(m, owner);
         }
         m.dead = true;
         m.use_ticks = -1;
@@ -649,6 +695,21 @@ impl Server {
             self.drop_mob_item(m, Stack { id: name, count: 1, components: None });
         }
         m.needs_sync = true;
+    }
+
+    /// G5-F04: death message of a tamed animal sent to its owner alone, if connected (the host or
+    /// a local network guest).
+    fn pet_death_message(&mut self, m: &Mob, owner: u128) {
+        let seat = match &self.lan {
+            Some(l) if l.shared.host.1 == owner => Some(None),
+            Some(l) => l.guests.iter().position(|g| g.uuid == owner).map(Some),
+            None => (owner == self.uuid).then_some(None),
+        };
+        let Some(seat) = seat else { return };
+        let empty = crate::vitals::Combat::default();
+        let c = m.combat.as_deref().unwrap_or(&empty);
+        let msg = self.death_message_of(c, self.mob_display(m), self.mob_kill_credit(m));
+        self.as_player(seat, |sv| sv.send_personal(Event::Chat { component: msg, tag: rc_client::ChatTag::System }));
     }
 
     fn mob_xp(&self, m: &mut Mob) -> i32 {
@@ -900,9 +961,10 @@ impl Server {
         }
         self.illager_before_attack(m); // F07: ravager's hit
         super::recent::before_melee(self, m); // F14: warden impact, creaking's arms
-        // Modifiers of the held weapon (vindicator's axe, vex's sword…), then enchantments.
-        let mut dmg = (m.attrs.attack.value() + super::illagers::weapon_attack_bonus(self, m)) as f32;
-        // S7: weapon enchantments (sharpness, smite, bane; knockback, fire aspect).
+        // Attack attribute (G5-F04: the held weapon's modifiers are in it, vindicator's axe, vex's
+        // sword…), then enchantments.
+        let mut dmg = m.attrs.attack.value() as f32;
+        // S7: weapon enchantments (sharpness, smite, bane; knockback).
         let weapon = m.equipment[0].clone();
         let wl = |s: &Self, e: &str| weapon.as_ref().map_or(0, |w| s.life.items.enchantment(w, e)) as f32;
         let sharp = wl(self, "minecraft:sharpness");
@@ -916,8 +978,40 @@ impl Server {
             dmg += self.kind_ench_bonus(w, o.kind);
         }
         let kb_ench = wl(self, "minecraft:knockback");
-        let fire_aspect = wl(self, "minecraft:fire_aspect") as i32;
-        let ty = "minecraft:mob_attack";
+        // G5-F04: damage source of the weapon (its type, the mace's smash), then the mace's bonus
+        // by fallen block (mobs never glide).
+        let smash = weapon.as_ref().is_some_and(|w| w.id == crate::mace::MACE)
+            && crate::mace::can_smash(m.fall_distance, false);
+        let ty = self.weapon_damage_type(weapon.as_ref(), smash, "minecraft:mob_attack");
+        let ty = ty.as_str();
+        if smash {
+            // Value effects drawn on the victim's random (the player's, or the mob's, written back).
+            let (mut own_p, mut own_m) = (self.life.rng, t_rng(self, t));
+            let bonus = {
+                let victim = match t {
+                    Ent::Player => Some(crate::progress::pred::Who::E(crate::commands::ents::E::Player)),
+                    Ent::Mob(id) => self.mob_ref(id).map(crate::progress::pred::Who::Mob),
+                };
+                let origin = self.ent_pos(t).unwrap_or(m.pos);
+                let own: &mut dyn crate::randsrc::Rand = if t == Ent::Player { &mut own_p } else { &mut own_m };
+                match victim {
+                    Some(v) => {
+                        let ctx = self.damage_ctx(ty, v, origin, Some(crate::progress::pred::Who::Mob(m)), true);
+                        self.mace_bonus(weapon.as_ref(), m.fall_distance, true, &ctx, own)
+                    }
+                    None => 0.0,
+                }
+            };
+            match t {
+                Ent::Player => self.life.rng = own_p,
+                Ent::Mob(id) => {
+                    if let Some(o) = self.mobs.get_mut(id) {
+                        o.rng = own_m;
+                    }
+                }
+            }
+            dmg += bonus;
+        }
         let hurt = match t {
             Ent::Player => {
                 let kb = (m.pos[0] - self.pos[0], m.pos[2] - self.pos[2]);
@@ -961,34 +1055,14 @@ impl Server {
                 m.vel[0] *= 0.6;
                 m.vel[2] *= 0.6;
             }
-            // G5-F02d: the victim's thorns, before the attacker's weapon effects.
-            if t == Ent::Player {
-                self.player_thorns(m);
-            }
-            // S7: fire aspect (after-hit effect: 4 s per level, without shortening a fire in progress).
-            if fire_aspect > 0 {
-                let ticks = 80 * fire_aspect;
-                match t {
-                    Ent::Player => {
-                        self.player_ignite(ticks);
-                    }
-                    Ent::Mob(id) => {
-                        if let Some(i) = self.mob_index(id)
-                            && let Some(o) = self.mobs.list[i].as_mut()
-                        {
-                            crate::inside_blocks::mob_ignite(o, ticks);
-                        }
-                    }
-                }
-            }
-            // Slowness from Bane of Arthropods (direct hit).
-            if let Ent::Mob(id) = t
-                && let Some(i) = self.mob_index(id)
+            // G5-F04: the weapon's own effect (mace smash), then the after-hit effects: the
+            // victim's equipment (thorns), then the weapon's (fire aspect, bane, wind burst).
+            if smash
+                && let Some(st) = self.struck(t)
             {
-                let mut o = self.mobs.list[i].take().expect("mob");
-                self.bane_slowness(weapon.as_ref(), &mut o);
-                self.mobs.list[i] = Some(o);
+                self.mob_smash(m, &st);
             }
+            self.melee_post_attack(m, t, ty, weapon.as_ref());
             // F01: burning zombie (ignited target), husk hunger, cave spider poison.
             self.on_mob_hit(m, t);
             // F12: wither effect of the wither skeleton.
@@ -1186,6 +1260,28 @@ impl Server {
         if sprint_kb {
             self.world_sound("minecraft:entity.player.attack.knockback", 7, self.pos, 1.0, 1.0);
         }
+        // G5-F04: damage source of the weapon (its type, the mace's smash) and the mace's bonus
+        // by fallen block, added after the charge scaling, before the critical hit.
+        let fall = self.life.vit.fall;
+        let smash = weapon.as_ref().is_some_and(|w| w.id == crate::mace::MACE)
+            && crate::mace::can_smash(fall, self.proj_player.fall_flying);
+        let ty = self.weapon_damage_type(weapon.as_ref(), smash, "minecraft:player_attack");
+        let ty = ty.as_str();
+        if smash {
+            let mut own = m.rng;
+            let bonus = {
+                let ctx = self.damage_ctx(
+                    ty,
+                    crate::progress::pred::Who::Mob(m),
+                    m.pos,
+                    Some(crate::progress::pred::Who::E(crate::commands::ents::E::Player)),
+                    true,
+                );
+                self.mace_bonus(weapon.as_ref(), fall, true, &ctx, &mut own)
+            };
+            m.rng = own;
+            base += bonus;
+        }
         let crit = full
             && self.life.vit.fall > 0.0
             && !self.on_ground
@@ -1197,7 +1293,6 @@ impl Server {
         let total = base + magic;
         let sweep = self.sweep_allowed(full, crit, sprint_kb, weapon.as_ref());
         let old_h = m.health;
-        let ty = "minecraft:player_attack";
         let hurt = self.mob_hurt(m, ty, total, Some(Ent::Player), Some(self.pos));
         if hurt {
             let kb_ench = weapon.as_ref().map_or(0, |w| self.life.items.enchantment(w, "minecraft:knockback")) as f32;
@@ -1209,7 +1304,7 @@ impl Server {
             }
             if sweep {
                 self.world_sound("minecraft:entity.player.attack.sweep", 7, self.pos, 1.0, 1.0);
-                self.sweep_attack(&m.bbox(), Some(m.id), base, scale);
+                self.sweep_attack(&m.bbox(), Some(m.id), base, scale, ty, weapon.as_ref());
             }
             if crit {
                 self.world_sound("minecraft:entity.player.attack.crit", 7, self.pos, 1.0, 1.0);
@@ -1225,23 +1320,28 @@ impl Server {
             }
             // Hit dealt to a dragon part: non-living target, the memory is cleared.
             self.set_last_hurt_mob(Some(Ent::Player), (!self.mobs.end.part_attack).then_some(Ent::Mob(m.id)));
-            // After-hit effects of the weapon: fire aspect (4 s per level, without shortening a fire
-            // in progress), Bane of Arthropods slowness.
-            if let Some(w) = &weapon {
-                let ticks = 80 * self.life.items.enchantment(w, "minecraft:fire_aspect");
-                if ticks > 0 {
-                    crate::inside_blocks::mob_ignite(m, ticks);
-                }
+            // G5-F04: the weapon's own effect (mace smash), the after-hit effects (the victim's
+            // equipment: thorns; then the weapon's: fire aspect, bane, wind burst), then the
+            // smash's fall reset.
+            if smash {
+                let st = crate::mace::Struck::mob(self, m);
+                self.player_smash(&st);
             }
-            self.bane_slowness(weapon.as_ref(), m);
+            {
+                let mut hit = crate::ench_fx::Hit {
+                    ty,
+                    victim: crate::ench_fx::Side::Mob(m),
+                    attacker: Some(crate::ench_fx::Side::Player),
+                    direct: true,
+                };
+                self.post_attack(&mut hit, weapon.as_ref());
+            }
+            if smash && crate::mace::can_smash(self.life.vit.fall, self.proj_player.fall_flying) {
+                self.life.vit.fall = 0.0;
+            }
             // Weapon wear (`weapon` component).
             if let Some(w) = &weapon {
-                let per = self
-                    .life
-                    .items
-                    .default_component(w, "minecraft:weapon")
-                    .and_then(|v| v["item_damage_per_attack"].as_i64())
-                    .unwrap_or(0) as i32;
+                let per = self.weapon_wear(w);
                 if per > 0 {
                     self.hurt_item(36 + self.held as usize, per);
                 }
@@ -1297,6 +1397,17 @@ impl Server {
         if sprint_kb {
             self.world_sound("minecraft:entity.player.attack.knockback", 7, self.pos, 1.0, 1.0);
         }
+        // G5-F04: weapon damage source and mace bonus, as on a mob.
+        let fall = self.life.vit.fall;
+        let smash = weapon.as_ref().is_some_and(|w| w.id == crate::mace::MACE)
+            && crate::mace::can_smash(fall, self.proj_player.fall_flying);
+        let ty = self.weapon_damage_type(weapon.as_ref(), smash, "minecraft:player_attack");
+        if smash {
+            let me = crate::progress::pred::Who::E(crate::commands::ents::E::Player);
+            let mut own = self.life.rng;
+            let ctx = self.damage_ctx(&ty, me, pos, Some(me), true);
+            base += self.mace_bonus(weapon.as_ref(), fall, true, &ctx, &mut own);
+        }
         let crit = full
             && self.life.vit.fall > 0.0
             && !self.on_ground
@@ -1309,6 +1420,8 @@ impl Server {
         let sweep = self.sweep_allowed(full, crit, sprint_kb, weapon.as_ref());
         let kb_ench = weapon.as_ref().map_or(0, |w| self.life.items.enchantment(w, "minecraft:knockback")) as f32;
         let hit = PvpHit {
+            ty: ty.clone(),
+            weapon: weapon.clone(),
             name: self.name.clone(),
             display: self.player_display_name(),
             named_item: weapon
@@ -1337,7 +1450,7 @@ impl Server {
         }
         if sweep {
             self.world_sound("minecraft:entity.player.attack.sweep", 7, self.pos, 1.0, 1.0);
-            self.sweep_attack(&b, None, base, scale);
+            self.sweep_attack(&b, None, base, scale, &ty, weapon.as_ref());
         }
         if crit {
             self.world_sound("minecraft:entity.player.attack.crit", 7, self.pos, 1.0, 1.0);
@@ -1350,13 +1463,24 @@ impl Server {
         if magic > 0.0 {
             let _ = self.send(Event::Entity(EntityEvent::Animate { id, action: 2 }));
         }
+        // G5-F04: the mace's smash on the other player (on the ground or not), then the fall reset.
+        if smash {
+            let (on_ground, uuid) = self.as_player(who, |sv| (sv.on_ground, sv.uuid));
+            let st = crate::mace::Struck {
+                ent: Ent::Mob(id),
+                uuid,
+                pos,
+                bbox: b,
+                on_ground,
+                on_pos: self.on_pos(pos, None, 1.0e-5),
+            };
+            self.player_smash(&st);
+            if crate::mace::can_smash(self.life.vit.fall, self.proj_player.fall_flying) {
+                self.life.vit.fall = 0.0;
+            }
+        }
         if let Some(w) = &weapon {
-            let per = self
-                .life
-                .items
-                .default_component(w, "minecraft:weapon")
-                .and_then(|v| v["item_damage_per_attack"].as_i64())
-                .unwrap_or(0) as i32;
+            let per = self.weapon_wear(w);
             if per > 0 {
                 self.hurt_item(36 + self.held as usize, per);
             }
@@ -1390,7 +1514,7 @@ impl Server {
         {
             return None;
         }
-        let ty = "minecraft:player_attack";
+        let ty = hit.ty.as_str();
         let full = self.life.vit.cooldown <= 10;
         self.prog.dmg_src = crate::item_use::DmgSrc {
             pos: Some(hit.pos),
@@ -1400,9 +1524,11 @@ impl Server {
             attacker_pos: Some(hit.pos),
         };
         self.prog.attacker_player = Some((hit.display.clone(), hit.named_item.clone()));
+        self.prog.attacker_weapon = hit.weapon.clone();
         let old = self.life.vit.health;
         let ok = self.hurt(ty, hit.total);
         self.prog.attacker_player = None;
+        self.prog.attacker_weapon = None;
         if !ok {
             return None;
         }
@@ -1417,6 +1543,21 @@ impl Server {
             self.life.vit.fire = hit.fire;
         }
         Some((old, self.life.vit.health))
+    }
+
+    /// G5-F04: second hurt sound of a full hit of thorns, at the hurt entity, category players (7)
+    /// for the player and hostile (5) for any mob, whatever it is.
+    pub(crate) fn thorns_hit_sound(&mut self, ty: &str, category: i32, pos: [f64; 3]) {
+        if ty == "minecraft:thorns" {
+            self.world_sound("minecraft:enchant.thorns.hit", category, pos, 1.0, 1.0);
+        }
+    }
+
+    /// G5-F04: wear of a hit with a weapon: its `weapon` component (the stack's or the item's),
+    /// 1 point when the field is left out (the default value, omitted by the extracted data); no
+    /// component: none.
+    pub(crate) fn weapon_wear(&self, w: &Stack) -> i32 {
+        self.comp_json(w, "minecraft:weapon").map_or(0, |v| v["item_damage_per_attack"].as_i64().unwrap_or(1) as i32)
     }
 
     /// Sharpness bonus of the weapon (any target).
@@ -1448,23 +1589,6 @@ impl Server {
         b
     }
 
-    /// After-hit effect of Bane of Arthropods (direct hit on an arthropod): slowness IV for a duration
-    /// drawn between 1.5 s and 1.5 s + 0.5 s per level beyond the first (victim's random source:
-    /// list element, duration, amplifier).
-    pub(crate) fn bane_slowness(&self, w: Option<&Stack>, victim: &mut Mob) {
-        let Some(w) = w else { return };
-        let level = self.life.items.enchantment(w, "minecraft:bane_of_arthropods");
-        if level <= 0 || !victim.kind.arthropod() {
-            return;
-        }
-        let _ = victim.rng.next_int_bound(1);
-        let max = 1.5 + 0.5 * (level - 1) as f32;
-        let ticks = ((victim.rng.next_float() * (max - 1.5) + 1.5) * 20.0).round() as i32;
-        // Amplifier drawn between 3 and 3: the draw still takes place.
-        let _ = victim.rng.next_float();
-        self.give_mob_effect(victim, "minecraft:slowness", ticks, 3);
-    }
-
     /// Sweep hit allowed: full charge, neither crit nor sprint knockback, on the ground, movement
     /// known to the player under (speed × 2.5)², sword in hand.
     pub(crate) fn sweep_allowed(&self, full: bool, crit: bool, sprint_kb: bool, weapon: Option<&crate::player::Stack>) -> bool {
@@ -1477,29 +1601,48 @@ impl Server {
     }
 
     /// Sweep around the box `tb` of the struck target (mob `target`, or non-living entity
-    /// such as a minecart): mobs within 3 blocks of the player, damage and knockback.
-    pub(crate) fn sweep_attack(&mut self, tb: &rc_physics::Aabb, target: Option<i32>, base: f32, scale: f32) {
+    /// such as a minecart): mobs within 3 blocks of the player that are not its allies, damage
+    /// (with the weapon's enchantment bonus against each of them), knockback and after-hit effects.
+    pub(crate) fn sweep_attack(
+        &mut self,
+        tb: &rc_physics::Aabb,
+        target: Option<i32>,
+        base: f32,
+        scale: f32,
+        ty: &str,
+        weapon: Option<&Stack>,
+    ) {
         // W8a: ratio read from the attribute (Sweeping Edge via the tracked equipment, `/attribute`).
         let ratio = self.player_attribute("minecraft:sweeping_damage_ratio") as f32;
-        let dmg = (1.0 + ratio * base) * scale;
+        let sweep = 1.0 + ratio * base;
         let area = rc_physics::Aabb {
             min: [tb.min[0] - 1.0, tb.min[1] - 0.25, tb.min[2] - 1.0],
             max: [tb.max[0] + 1.0, tb.max[1] + 0.25, tb.max[2] + 1.0],
         };
+        let me = self.name.clone();
         let ids: Vec<i32> = self
             .mobs
             .list
             .iter()
             .flatten()
             .filter(|o| Some(o.id) != target && o.touches(&area) && super::mth::dist2(o.pos, self.pos) < 9.0)
+            .filter(|o| !self.same_team(&me, &crate::nbtio::uuid_text(o.uuid)))
             .map(|o| o.id)
             .collect();
         let (s, c) = (sin(self.yaw * DEG), cos(self.yaw * DEG));
         for id in ids {
             let Some(i) = self.mob_index(id) else { continue };
             let mut o = self.mobs.list[i].take().expect("mob");
-            if self.mob_hurt(&mut o, "minecraft:player_attack", dmg, Some(Ent::Player), Some(self.pos)) {
+            let dmg = (sweep + weapon.map_or(0.0, |w| self.enchanted_bonus(w, &o))) * scale;
+            if self.mob_hurt(&mut o, ty, dmg, Some(Ent::Player), Some(self.pos)) {
                 self.mob_knockback(&mut o, 0.4, f64::from(s), f64::from(-c), Some(Ent::Player), dmg, false);
+                let mut hit = crate::ench_fx::Hit {
+                    ty,
+                    victim: crate::ench_fx::Side::Mob(o.as_mut()),
+                    attacker: Some(crate::ench_fx::Side::Player),
+                    direct: true,
+                };
+                self.post_attack(&mut hit, weapon);
             }
             self.mobs.list[i] = Some(o);
         }
@@ -1514,8 +1657,19 @@ impl Server {
     }
 }
 
+/// Random of a mob target of the list (a fresh one for the player or a missing mob: unused then).
+fn t_rng(s: &Server, t: Ent) -> super::jrand::JRand {
+    match t {
+        Ent::Mob(id) => s.mob_ref(id).map_or_else(|| super::jrand::JRand::new(0), |o| o.rng),
+        Ent::Player => super::jrand::JRand::new(0),
+    }
+}
+
 /// Hit from one player on another, computed on the attacker's side, applied on the victim's side.
 struct PvpHit {
+    /// G5-F04: damage type of the weapon (mace smash…) and the weapon (armor effectiveness).
+    ty: String,
+    weapon: Option<Stack>,
     /// Attacker's name (team) and displayed name (death messages).
     name: String,
     display: rc_text::Component,

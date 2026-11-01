@@ -2755,3 +2755,31 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   (JSON copy of a few fields, of the order of a microsecond, not measured separately); protection:
   a tag test up front that avoids walking the four pieces for `/kill` and the void.
   Multi-core and GPU not applicable (order of the random draws imposed, work of the order of one hit).
+
+## G5-F04: mace, thorns of mobs, equipment modifiers of mobs, enchantment effects (01/11, loaded machine)
+
+- Equipment modifiers of mobs (`rc_sim::mobs::gear`, every tick of every mob, like the game):
+  nothing worn and nothing seen = immediate exit (8 empty slots tested, no allocation, the
+  previous state is not even allocated: `Option<Box<…>>`, 8 bytes per mob); worn equipment =
+  8 stack comparisons, the modifiers recomputed only for a changed slot (allocation on change
+  only). Bench `bench_g5f04_gear_and_post_attack` (5 passes, loaded machine): 2.6-2.8 ns per tick
+  without equipment, 27-29 ns with full iron armor and a sword (500 armored mobs ≈ 14 µs per
+  tick). Leads considered: tracking at the
+  mutation sites instead of comparing (dozens of scattered writes to `equipment`, risk of a
+  forgotten site: rejected for robustness, the comparison costs a few ns); hash of the slots
+  (would cost as much as the comparison of short ids). Multi-core and GPU not applicable (part
+  of the mob's own tick, already ordered).
+- After-hit effects (`rc_sim::ench_fx`, event code: one landed hit), same bench: victim without
+  equipment 4.8 ns; full unenchanted iron armor 302-316 ns with the first filter (the item's default
+  component copied, key formatted), 155-161 ns once the default enchantments are read in place
+  (kept: −49%); a thorns chestplate that does not trigger 552-563 → 418-432 ns (−23%). Lead not
+  tried (shared `Items` API): a per-item flag "default enchantments non-empty" would avoid the
+  global lock of the defaults cache for every piece (≈ 30 ns each), to measure on a quiet machine.
+  Only the enchanted pieces
+  are copied (component present), the definitions are read from the pack (`Arc`), the conditions
+  go through the loot condition evaluator; Thorns of the player: same random draws as the former
+  hand-written code (G5-F02d tests unchanged). Protection of mobs: immediate exit without
+  equipment (the common case), otherwise one component read per piece (the former code read five
+  enchantments per piece).
+- Mace smash: event code (one hit), area knockback over the mob list once.
+- Sweep: the weapon's bonus is computed per swept mob (one more enchantment read per target).

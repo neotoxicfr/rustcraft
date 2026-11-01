@@ -431,7 +431,7 @@ impl Server {
     /// accumulates the sitting-phase damage), then taken again with what changed.
     fn dragon_thorns(&mut self, m: &mut Mob, d: &mut Dragon) {
         m.end.dragon = Some(Box::new(d.clone()));
-        self.player_thorns(m);
+        self.player_thorns(m, "minecraft:mob_attack");
         if let Some(back) = m.end.dragon.take() {
             *d = *back;
         }

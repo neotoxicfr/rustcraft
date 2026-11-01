@@ -376,11 +376,15 @@ pub fn has_any(items: &Items, s: &Stack) -> bool {
     false
 }
 
-/// Replaces the enchantments (component suited to the item); empty list = empty component.
+/// Highest level an enchantment component can hold (G5-F04: levels set or merged are capped).
+pub const MAX_LEVEL: i32 = 255;
+
+/// Replaces the enchantments (component suited to the item); empty list = empty component;
+/// a level above 255 is stored as 255.
 pub fn set_enchants(items: &Items, s: &mut Stack, list: &[(String, i32)]) {
     let k = ench_key(s);
     let fields: Vec<(String, Nbt)> =
-        list.iter().filter(|(_, l)| *l > 0).map(|(e, l)| (e.clone(), Nbt::Int(*l))).collect();
+        list.iter().filter(|(_, l)| *l > 0).map(|(e, l)| (e.clone(), Nbt::Int((*l).min(MAX_LEVEL)))).collect();
     let default_empty = match items.default_component(s, k) {
         Some(Value::Object(o)) => o.is_empty(),
         None => false,
@@ -393,8 +397,13 @@ pub fn set_enchants(items: &Items, s: &mut Stack, list: &[(String, i32)]) {
     }
 }
 
-/// `upgrade`: level raised to the maximum of the two.
+/// `upgrade`: level raised to the maximum of the two (the new one capped at 255 first); a
+/// level of 0 or less changes nothing.
 pub fn upgrade(items: &Items, s: &mut Stack, ench: &str, level: i32) {
+    if level <= 0 {
+        return;
+    }
+    let level = level.min(MAX_LEVEL);
     let mut l = enchants_of(items, s);
     match l.iter_mut().find(|(e, _)| e == ench) {
         Some(x) => x.1 = x.1.max(level),

@@ -83,8 +83,8 @@ impl Server {
     pub(crate) fn wind_on_hit_entity(&mut self, p: &mut Proj, t: Ent, living: bool) {
         let owner = self.proj_owner(p);
         self.set_last_hurt_mob(owner, living.then_some(t));
-        if self.proj_damage(t, "minecraft:wind_charge", 1.0, owner, (-p.vel[0], -p.vel[2])) && t == Ent::Player {
-            self.player_thorns_by(owner); // G5-F02d
+        if self.proj_damage(t, "minecraft:wind_charge", 1.0, owner, (-p.vel[0], -p.vel[2])) {
+            self.post_attack_by(t, owner, "minecraft:wind_charge"); // G5-F02d, G5-F04: player or mob
         }
         let c = p.pos;
         self.wind_explode(p, c);
@@ -154,7 +154,24 @@ impl Server {
         kb_mult: f64,
         sound: &str,
     ) {
-        self.game_event_src("minecraft:explode", center, Some(src), None);
+        self.wind_burst_with(Some(src), owner, center, radius, kb_mult, sound, &mut []);
+    }
+
+    /// `wind_burst_from` without a source entity when `src` is `None` (G5-F04: Wind Burst of a
+    /// weapon), also pushing the mobs `held` outside the list by the caller (the victim and the
+    /// attacker of a hit in progress), like any entity in range.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn wind_burst_with(
+        &mut self,
+        src: Option<Src>,
+        owner: Option<Ent>,
+        center: [f64; 3],
+        radius: f32,
+        kb_mult: f64,
+        sound: &str,
+        held: &mut [&mut super::super::mob::Mob],
+    ) {
+        self.game_event_src("minecraft:explode", center, src, None);
         // 1. Blocks hit (set; only the number of draws matters for the random).
         let h = self.dim.height;
         let mut toblow: Vec<[i32; 3]> = Vec::new();
@@ -246,6 +263,23 @@ impl Server {
                     }
                 }
             }
+        }
+        // Mobs held by the caller: same knockback rule.
+        for o in held.iter_mut() {
+            if super::ignores_explosion(o) {
+                continue;
+            }
+            let dist = dist2(o.pos, center).sqrt() / double;
+            if dist > 1.0 {
+                continue;
+            }
+            let mut dir = [o.pos[0] - center[0], o.eye_y() - center[1], o.pos[2] - center[2]];
+            let l = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+            dir = if l < 1.0e-4 { [0.0; 3] } else { dir.map(|v| v / l) };
+            let exposure = f64::from(self.seen_percent(center, &o.bbox()));
+            let kp = (1.0 - dist) * exposure * kb_mult * (1.0 - o.attrs.explosion_kb_resistance.value());
+            o.vel = [o.vel[0] + dir[0] * kp, o.vel[1] + dir[1] * kp, o.vel[2] + dir[2] * kp];
+            o.needs_sync = true;
         }
         // Fireballs and other charges: pushed, the launcher becomes their owner.
         let uuid = self.blast_owner_uuid(owner, None);

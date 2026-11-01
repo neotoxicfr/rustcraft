@@ -264,14 +264,19 @@ impl Server {
         match e {
             Ent::Player => {
                 if self.player_hurt_by_mob(&owner, "minecraft:spit", 1.0, Some(kb)) {
-                    self.player_thorns_by(Some(Ent::Mob(owner.id))); // G5-F02d
+                    self.player_thorns_by(Some(Ent::Mob(owner.id)), "minecraft:spit"); // G5-F02d
                 }
             }
             Ent::Mob(id) => {
                 let Some(i) = self.mob_index(id) else { return };
                 let Some(mut o) = self.mobs.list[i].take() else { return };
-                self.mob_hurt_dir(&mut o, "minecraft:spit", 1.0, Some(Ent::Mob(s.owner)), Some(s.pos), Some(kb));
+                let hurt =
+                    self.mob_hurt_dir(&mut o, "minecraft:spit", 1.0, Some(Ent::Mob(s.owner)), Some(s.pos), Some(kb));
                 self.mobs.list[i] = Some(o);
+                // G5-F04: thorns of the struck mob on the llama.
+                if hurt {
+                    self.post_attack_by(e, Some(Ent::Mob(s.owner)), "minecraft:spit");
+                }
             }
         }
     }

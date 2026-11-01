@@ -39,6 +39,8 @@ pub struct Vitals {
     /// grace ticks before a landing can forget it.
     pub impulse_impact: Option<[f64; 3]>,
     pub impulse_grace: i32,
+    /// G5-F04: a smash on a target on the ground: block particles on the next landing.
+    pub extra_fall_particles: bool,
     /// Invulnerability window (§ 2.3 step 7) and last hit.
     pub cooldown: i32,
     pub last_hurt: f32,
@@ -68,6 +70,19 @@ pub struct Vitals {
     on_fire_sent: bool,
     /// Last values of the read-only criteria (restart from zero on respawn).
     pub(crate) crit: crate::score_criteria::CriteriaWatch,
+}
+
+/// Fall location of a climbing block (`death.fell.accident.*` key).
+fn climb_location(name: &str) -> &'static str {
+    match name {
+        "minecraft:ladder" => "ladder",
+        n if n.ends_with("_trapdoor") => "ladder",
+        "minecraft:vine" => "vines",
+        "minecraft:weeping_vines" | "minecraft:weeping_vines_plant" => "weeping_vines",
+        "minecraft:twisting_vines" | "minecraft:twisting_vines_plant" => "twisting_vines",
+        "minecraft:scaffolding" => "scaffolding",
+        _ => "other_climbable",
+    }
 }
 
 /// Points to reach the next level (§ 1.3).
@@ -167,6 +182,7 @@ impl Vitals {
                 _ => None,
             },
             impulse_grace: int(p, "current_impulse_context_reset_grace_time").unwrap_or(0) as i32,
+            extra_fall_particles: int(p, "spawn_extra_particles_on_fall").is_some_and(|v| v != 0),
             cooldown: 0,
             last_hurt: 0.0,
             dead: health <= 0.0,
@@ -215,6 +231,8 @@ impl Vitals {
         set(root, "Fire", Nbt::Short(self.fire.clamp(-32768, 32767) as i16));
         set(root, "fall_distance", Nbt::Double(self.fall));
         set(root, "current_impulse_context_reset_grace_time", Nbt::Int(self.impulse_grace));
+        // G5-F04: always written, like the game (false by default).
+        set(root, "spawn_extra_particles_on_fall", Nbt::Byte(i8::from(self.extra_fall_particles)));
         match self.impulse_impact {
             Some(p) => set(root, "current_explosion_impact_pos", Nbt::List(p.map(Nbt::Double).to_vec())),
             None => crate::nbtio::remove(root, "current_explosion_impact_pos"),
@@ -356,6 +374,30 @@ pub struct Combat {
     pub direct: Option<rc_text::Component>,
 }
 
+impl Combat {
+    /// End of a combat (300 ticks without a hit) or of a series of hits (100), or death: list
+    /// emptied. `now`: age of the tracked entity in ticks.
+    pub(crate) fn recheck(&mut self, now: u64, alive: bool) {
+        let reset: u64 = if self.in_combat { 300 } else { 100 };
+        if self.taking_damage && (!alive || now.saturating_sub(self.last_damage_time) > reset) {
+            self.taking_damage = false;
+            self.in_combat = false;
+            self.entries.clear();
+        }
+    }
+
+    /// Hit recorded (after a recheck by the caller); a living author starts a combat.
+    fn push(&mut self, entry: CombatEntry, now: u64, alive: bool) {
+        let enter = entry.attacker.as_ref().is_some_and(|a| a.living);
+        self.entries.push(entry);
+        self.last_damage_time = now;
+        self.taking_damage = true;
+        if !self.in_combat && alive && enter {
+            self.in_combat = true;
+        }
+    }
+}
+
 impl Server {
     fn damage_info(&self, ty: &str) -> DamageInfo {
         let v = self.life.pack.get("damage_type", ty);
@@ -437,37 +479,41 @@ impl Server {
         (armor.floor() as f32, tough as f32)
     }
 
-    /// Enchantment protection of the worn equipment (`damage_protection` effects of the game);
-    /// every protection requires a type outside `bypasses_invulnerability` (`/kill`, void).
-    fn protection(&self, ty: &str) -> f32 {
-        if self.damage_tag(ty, "bypasses_invulnerability") {
-            return 0.0;
-        }
-        let mut p = 0.0;
-        for slot in 5..9 {
-            let Some(s) = &self.slots[slot] else { continue };
-            let lvl = |e: &str| self.life.items.enchantment(s, e) as f32;
-            p += lvl("minecraft:protection");
-            if self.damage_tag(ty, "is_fire") {
-                p += 2.0 * lvl("minecraft:fire_protection");
-            }
-            if self.damage_tag(ty, "is_fall") {
-                p += 3.0 * lvl("minecraft:feather_falling");
-            }
-            if self.damage_tag(ty, "is_explosion") {
-                p += 2.0 * lvl("minecraft:blast_protection");
-            }
-            if self.damage_tag(ty, "is_projectile") {
-                p += 2.0 * lvl("minecraft:projectile_protection");
-            }
-        }
+    /// Enchantment protection of the worn equipment: the `damage_protection` effects of the pack
+    /// (G5-F04, `ench_fx`), whose conditions exclude `bypasses_invulnerability` (`/kill`, void).
+    fn protection(&mut self, ty: &str) -> f32 {
+        let (mut world, mut own) = (self.mobs.rng, self.life.rng);
+        let p = {
+            let sl = |i: usize| self.slots[i].as_ref();
+            let gear = [(0, sl(36 + self.held as usize)), (1, sl(45)), (2, sl(8)), (3, sl(7)), (4, sl(6)), (5, sl(5))];
+            let ctx = self.player_hurt_ctx(ty);
+            self.ench_protection(&gear, &ctx, &mut world, &mut own)
+        };
+        (self.mobs.rng, self.life.rng) = (world, own);
         p
+    }
+
+    /// G5-F04: damage context of a hit on the player: the mob hitting it (direct when the type has
+    /// no projectile of its own).
+    fn player_hurt_ctx(&self, ty: &str) -> crate::progress::pred::Ctx<'_> {
+        use crate::progress::pred::Who;
+        let attacker = self.prog.attacker.as_deref().map(Who::Mob);
+        let direct = attacker.is_some() && crate::loot::direct_of(ty) == Some(None);
+        self.damage_ctx(ty, Who::E(crate::commands::ents::E::Player), self.pos, attacker, direct)
+    }
+
+    /// G5-F04: weapon of a direct attacker of the player (mob in combat, other player).
+    fn player_hurt_weapon(&self, ty: &str) -> Option<Stack> {
+        if crate::loot::direct_of(ty) != Some(None) {
+            return None;
+        }
+        self.prog.attacker_weapon.clone().or_else(|| self.prog.attacker.as_ref()?.equipment[0].clone())
     }
 
     /// Worn piece worn down by a hit of type `ty`: `equippable` component present with
     /// `damage_on_hurt` (true by default; false for the elytra), and no `damage_resistant` that
     /// covers the type (netherite against fire).
-    fn armor_wears(&self, s: &Stack, ty: &str) -> bool {
+    pub(crate) fn armor_wears(&self, s: &Stack, ty: &str) -> bool {
         let Some(eq) = self.comp_json(s, "minecraft:equippable") else { return false };
         let h = &eq["damage_on_hurt"];
         if !h.as_bool().or_else(|| h.as_i64().map(|n| n != 0)).unwrap_or(true) {
@@ -566,7 +612,17 @@ impl Server {
             }
             let t = 2.0 + tough / 4.0;
             let a = (armor - d / t).clamp(armor * 0.2, 20.0);
-            d *= 1.0 - a / 25.0;
+            let mut frac = a / 25.0;
+            // G5-F04: the weapon of a direct attacker modifies the armor fraction (Breach).
+            if let Some(w) = self.player_hurt_weapon(ty) {
+                let mut own = self.life.rng;
+                frac = {
+                    let ctx = self.player_hurt_ctx(ty);
+                    self.armor_fraction(frac, Some(&w), &ctx, &mut own)
+                };
+                self.life.rng = own;
+            }
+            d *= 1.0 - frac;
         }
         // S7: Resistance effect, then enchantment protections.
         if !self.damage_tag(ty, "bypasses_effects") {
@@ -608,11 +664,16 @@ impl Server {
         if self.life.vit.health <= 0.0 {
             // W8c: totem (protection against death) before death.
             if !self.death_protection(ty) {
+                // G5-F04: second sound of a full hit of thorns.
+                if full {
+                    self.thorns_hit_sound(ty, 7, self.pos);
+                }
                 self.die(ty);
             }
         } else if full && !blocked {
             let pitch = 1.0 + (self.life.rng.next_float() - self.life.rng.next_float()) * 0.2;
             self.play_sound(info.hurt_sound, 7, self.pos, 1.0, pitch);
+            self.thorns_hit_sound(ty, 7, self.pos);
         }
         // Effects on injury (infestation): any hit that landed.
         if !blocked || dealt > 0.0 {
@@ -643,16 +704,7 @@ impl Server {
     fn fall_location(&self) -> Option<&'static str> {
         if let Some(p) = self.life.combat.climbable {
             let s = self.get(p);
-            let name = self.data.block_of(s).map_or("", |b| b.name.as_str());
-            return Some(match name {
-                "minecraft:ladder" => "ladder",
-                n if n.ends_with("_trapdoor") => "ladder",
-                "minecraft:vine" => "vines",
-                "minecraft:weeping_vines" | "minecraft:weeping_vines_plant" => "weeping_vines",
-                "minecraft:twisting_vines" | "minecraft:twisting_vines_plant" => "twisting_vines",
-                "minecraft:scaffolding" => "scaffolding",
-                _ => "other_climbable",
-            });
+            return Some(climb_location(self.data.block_of(s).map_or("", |b| b.name.as_str())));
         }
         (self.fluid_at(crate::mobs::mth::block_of(self.pos)).kind == 1).then_some("water")
     }
@@ -661,13 +713,7 @@ impl Server {
     pub(crate) fn combat_recheck(&mut self) {
         let age = self.life.vit.age;
         let alive = !self.life.vit.dead;
-        let c = &mut self.life.combat;
-        let reset: u64 = if c.in_combat { 300 } else { 100 };
-        if c.taking_damage && (!alive || age.saturating_sub(c.last_damage_time) > reset) {
-            c.taking_damage = false;
-            c.in_combat = false;
-            c.entries.clear();
-        }
+        self.life.combat.recheck(age, alive);
     }
 
     /// Hit received: author taken from the mob responsible for the hit in progress.
@@ -694,21 +740,13 @@ impl Server {
             attacker,
             direct,
         };
-        let enter = entry.attacker.as_ref().is_some_and(|a| a.living);
         let age = self.life.vit.age;
         let alive = !self.life.vit.dead;
-        let c = &mut self.life.combat;
-        c.entries.push(entry);
-        c.last_damage_time = age;
-        c.taking_damage = true;
-        if !c.in_combat && alive && enter {
-            c.in_combat = true;
-        }
+        self.life.combat.push(entry, age, alive);
     }
 
-    /// Most significant fall.
-    fn most_significant_fall(&self) -> Option<&CombatEntry> {
-        let entries = &self.life.combat.entries;
+    /// Most significant fall of a hit list.
+    fn most_significant_fall<'c>(&self, entries: &'c [CombatEntry]) -> Option<&'c CombatEntry> {
         let mut result: Option<&CombatEntry> = None;
         let mut alternative: Option<&CombatEntry> = None;
         let mut alt_damage = 0.0f32;
@@ -750,12 +788,17 @@ impl Server {
         }
     }
 
-    /// Message of a hit.
-    fn localized_death(&self, e: &CombatEntry, victim: rc_text::Component) -> rc_text::Component {
+    /// Message of a hit (`credit`: the victim's kill credit, for a hit without an author).
+    fn localized_death(
+        &self,
+        e: &CombatEntry,
+        victim: rc_text::Component,
+        credit: Option<rc_text::Component>,
+    ) -> rc_text::Component {
         use rc_text::{Arg, Component};
         let msg = format!("death.attack.{}", self.damage_info(&e.ty).message);
         match (&e.attacker, &e.direct) {
-            (None, None) => match self.kill_credit() {
+            (None, None) => match credit {
                 Some(k) => {
                     Component::translate(format!("{msg}.player"), vec![Arg::Component(victim), Arg::Component(k)])
                 }
@@ -804,13 +847,23 @@ impl Server {
 
     /// Death message of the player.
     fn death_message(&self) -> rc_text::Component {
-        use rc_text::{Arg, Component};
         let victim = self.player_display_name();
-        let Some(kill) = self.life.combat.entries.last() else {
+        self.death_message_of(&self.life.combat, victim, self.kill_credit())
+    }
+
+    /// Death message of a tracked entity: its hit list, its displayed name, its kill credit.
+    pub(crate) fn death_message_of(
+        &self,
+        c: &Combat,
+        victim: rc_text::Component,
+        credit: Option<rc_text::Component>,
+    ) -> rc_text::Component {
+        use rc_text::{Arg, Component};
+        let Some(kill) = c.entries.last() else {
             return Component::translate("death.attack.generic", vec![Arg::Component(victim)]);
         };
         let info = self.damage_info(&kill.ty);
-        match (info.death_type.as_str(), self.most_significant_fall()) {
+        match (info.death_type.as_str(), self.most_significant_fall(&c.entries)) {
             ("fall_variants", Some(knock)) => self.fall_message(knock, kill.attacker.as_ref(), victim),
             ("intentional_game_design", _) => {
                 let msg = format!("death.attack.{}", info.message);
@@ -823,7 +876,67 @@ impl Server {
                 link.style.hover = Some(std::sync::Arc::new(rc_text::HoverEvent::Text(Component::text("MCPE-28723"))));
                 Component::translate(format!("{msg}.message"), vec![Arg::Component(victim), Arg::Component(link)])
             }
-            _ => self.localized_death(kill, victim),
+            _ => self.localized_death(kill, victim, credit),
+        }
+    }
+
+    /// G5-F04: hit received by a tamed animal (its owner gets its death message): author seen
+    /// at the time of the hit, fall location (current climbing block, otherwise water).
+    pub(crate) fn mob_record_damage(
+        &mut self,
+        m: &mut crate::mobs::mob::Mob,
+        ty: &str,
+        damage: f32,
+        by: Option<crate::mobs::mob::Ent>,
+    ) {
+        use crate::mobs::mob::Ent as E;
+        let named = |s: &Server, st: Option<&Stack>| {
+            st.filter(|s| crate::items::component(s, "minecraft:custom_name").is_some()).map(|st| s.stack_display(st))
+        };
+        let attacker = match by {
+            Some(E::Player) => Some(Attacker {
+                display: self.player_display_name(),
+                named_item: named(self, self.slots[36 + self.held as usize].as_ref()),
+                living: true,
+            }),
+            Some(E::Mob(id)) => self.mob_ref(id).map(|a| Attacker {
+                display: self.mob_display(a),
+                named_item: named(self, a.equipment[0].as_ref()),
+                living: true,
+            }),
+            None => None,
+        };
+        // Direct entity without an author (arrow of a dispenser…): named by its type.
+        let direct = match (by, crate::loot::direct_of(ty)) {
+            (None, Some(Some(t))) => {
+                Some(rc_text::Component::translate(format!("entity.{}", t.replace(':', ".")), Vec::new()))
+            }
+            _ => None,
+        };
+        let here = crate::mobs::mth::block_of(m.pos);
+        let fall_location = if self.phys.climbable(self.st(here)) {
+            Some(climb_location(self.bname(here)))
+        } else {
+            (self.fluid_at(here).kind == 1).then_some("water")
+        };
+        let entry =
+            CombatEntry { ty: ty.to_owned(), damage, fall_location, fall_distance: m.fall_distance as f32, attacker, direct };
+        let now = m.tick_count.max(0) as u64;
+        let alive = m.health > 0.0 && !m.dead;
+        let c = m.combat.get_or_insert_with(Default::default);
+        c.recheck(now, alive);
+        c.push(entry, now, alive);
+    }
+
+    /// G5-F04: kill credit of a mob: the player who hurt it recently, otherwise its last attacker.
+    pub(crate) fn mob_kill_credit(&self, m: &crate::mobs::mob::Mob) -> Option<rc_text::Component> {
+        use crate::mobs::mob::Ent as E;
+        if m.last_hurt_by_player > 0 {
+            return Some(self.player_display_name());
+        }
+        match m.last_hurt_by_mob?.0 {
+            E::Player => Some(self.player_display_name()),
+            E::Mob(id) => self.mob_ref(id).map(|a| self.mob_display(a)),
         }
     }
 
@@ -1329,6 +1442,14 @@ impl Server {
             let support = self.player_support();
             let effect = self.on_pos(self.pos, support, 0.2);
             let effect_st = self.state_at(effect).unwrap_or(0);
+            // G5-F04: landing after a smash on a target on the ground: up to 200 block particles
+            // on top of the block (50 per block of fall), before the dust.
+            if self.life.vit.extra_fall_particles && before > 0.0 {
+                let top = [f64::from(effect[0]) + 0.5, f64::from(effect[1]) + 1.0, f64::from(effect[2]) + 0.5];
+                let n = (50.0 * before).clamp(0.0, 200.0) as i32;
+                self.block_particles(effect_st, top, [0.3; 3], 0.15, n);
+                self.life.vit.extra_fall_particles = false;
+            }
             // Landing dust, before the block's rule, on the fall from before this movement.
             if before > 0.0 {
                 self.fall_dust(self.pos, effect, before, self.safe_fall_distance());

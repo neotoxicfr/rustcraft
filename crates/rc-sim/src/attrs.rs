@@ -225,7 +225,7 @@ impl Server {
     }
 
     /// Broken stack: usable and worn down to the end (its modifiers do not apply).
-    fn stack_broken(&self, s: &Stack) -> bool {
+    pub(crate) fn stack_broken(&self, s: &Stack) -> bool {
         let items = &self.life.items;
         items.damageable(s) && items.damage(s) >= items.max_damage(s)
     }

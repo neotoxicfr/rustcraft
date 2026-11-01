@@ -336,12 +336,7 @@ impl Server {
         }
         // Weapon wear (the stand is a living entity).
         if let Some(w) = &weapon {
-            let per = self
-                .life
-                .items
-                .default_component(w, "minecraft:weapon")
-                .and_then(|v| v["item_damage_per_attack"].as_i64())
-                .unwrap_or(0) as i32;
+            let per = self.weapon_wear(w);
             if per > 0 {
                 self.hurt_item(36 + self.held as usize, per);
             }

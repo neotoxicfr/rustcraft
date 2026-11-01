@@ -816,7 +816,7 @@ impl Server {
                 if self.player_hurt_by_mob(m, "minecraft:mob_attack", dmg, kb) {
                     // G5-F02d: brain put back for the time of the thorns (anger of the hurt nautilus).
                     m.sea.brain = Some(Box::new(std::mem::take(b)));
-                    self.player_thorns(m);
+                    self.player_thorns(m, "minecraft:mob_attack");
                     if let Some(back) = m.sea.brain.take() {
                         *b = *back;
                     }
@@ -826,7 +826,22 @@ impl Server {
                 if let Some(i) = self.mob_index(id)
                     && let Some(mut o) = self.mobs.list[i].take()
                 {
-                    self.mob_hurt_by(&mut o, m, "minecraft:mob_attack", dmg);
+                    let hurt = self.mob_hurt_by(&mut o, m, "minecraft:mob_attack", dmg);
+                    // G5-F04: the struck mob's thorns, brain put back like for the player's.
+                    if hurt {
+                        m.sea.brain = Some(Box::new(std::mem::take(b)));
+                        let w = m.equipment[0].clone();
+                        let mut hit = crate::ench_fx::Hit {
+                            ty: "minecraft:mob_attack",
+                            victim: crate::ench_fx::Side::Mob(o.as_mut()),
+                            attacker: Some(crate::ench_fx::Side::Mob(m)),
+                            direct: true,
+                        };
+                        self.post_attack(&mut hit, w.as_ref());
+                        if let Some(back) = m.sea.brain.take() {
+                            *b = *back;
+                        }
+                    }
                     self.mobs.list[i] = Some(o);
                 }
             }
