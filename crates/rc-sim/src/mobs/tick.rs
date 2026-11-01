@@ -252,8 +252,7 @@ impl Server {
             self.mob_splash(m, vel);
         }
         super::aquatic::update_swimming(self, m); // F08: drowned swimming
-        let fire_immune = m.kind.info().fire_immune || super::recent::fire_immune(m);
-        if m.fire > 0 && fire_immune {
+        if m.fire > 0 && crate::inside_blocks::mob_fire_immune(m) {
             m.fire = 0;
         } else if m.fire > 0 {
             if m.fire % 20 == 0 && m.lava_height <= 0.0 {
@@ -261,14 +260,10 @@ impl Server {
             }
             m.fire -= 1;
         }
-        if m.lava_height > 0.0 && fire_immune {
+        // Lava cushions the fall; its ignition and damage come from the crossed-block pass,
+        // after the movement.
+        if m.lava_height > 0.0 {
             m.fall_distance *= 0.5;
-        } else if m.lava_height > 0.0 {
-            m.fall_distance *= 0.5;
-            if m.fire < 300 {
-                m.fire = 300;
-            }
-            self.mob_hurt(m, "minecraft:lava", 4.0, None, None);
         }
         if m.pos[1] < f64::from(self.dim.height.min_y - 64) {
             m.removed = true;
@@ -564,12 +559,15 @@ impl Server {
                 self.mob_travel(m);
             }
         }
-        // Block effects after the movement: without current fire, the counter returns to 0
-        // (a negative fire re-read lasts only one tick; only the player keeps −20).
-        if m.fire < 0 && !m.removed && !super::illagers::no_physics(m) {
-            m.fire = 0;
-        }
-        self.mob_freezing(m); // freezing in powder snow
+        // Effects of the crossed blocks after the movement (fire, cactus, campfire, powder
+        // snow, water, lava, rain); without current fire, the counter returns to 0.
+        let in_snow = if !m.removed && !super::illagers::no_physics(m) {
+            self.inside_blocks(&mut crate::inside_blocks::Who::Mob(m)).in_powder_snow
+        } else {
+            m.inside.clear();
+            false
+        };
+        self.mob_freezing(m, in_snow); // freezing in powder snow
         self.mob_push_entities(m);
         if m.kind.info().water_sensitive && self.mob_in_water_or_rain(m) && m.alive() {
             self.mob_hurt(m, "minecraft:drown", 1.0, None, None);

@@ -674,8 +674,8 @@ impl Server {
                     }
                 }
             }
-        } else if m.fire < 160 {
-            m.fire = 160;
+        } else {
+            crate::inside_blocks::mob_ignite(m, 160);
         }
     }
 

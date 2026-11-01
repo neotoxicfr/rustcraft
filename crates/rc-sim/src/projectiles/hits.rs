@@ -107,8 +107,8 @@ impl Server {
                 let Some(i) = self.mob_index(id) else { return 0 };
                 let Some(m) = self.mobs.list[i].as_mut() else { return 0 };
                 let old = m.fire;
-                if !m.kind.info().fire_immune && old < ticks {
-                    m.fire = ticks;
+                if !m.kind.info().fire_immune {
+                    crate::inside_blocks::mob_ignite(m, ticks);
                 }
                 old
             }

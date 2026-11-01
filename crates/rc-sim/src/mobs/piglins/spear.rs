@@ -310,8 +310,8 @@ impl Server {
                 Ent::Mob(id) => {
                     if let Some(i) = self.mob_index(id) {
                         let mut o = self.mobs.list[i].take().expect("mob");
-                        if ticks > 0 && o.fire < ticks {
-                            o.fire = ticks;
+                        if ticks > 0 {
+                            crate::inside_blocks::mob_ignite(&mut o, ticks);
                         }
                         self.bane_slowness(Some(w), &mut o);
                         self.mobs.list[i] = Some(o);

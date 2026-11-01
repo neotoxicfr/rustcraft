@@ -82,10 +82,7 @@ impl Server {
         m.in_water = water > 0.0;
         m.eyes_in_water = eyes;
         if m.in_water {
-            m.fall_distance = 0.0;
-            if m.fire > 0 {
-                m.fire = 0;
-            }
+            m.fall_distance = 0.0; // extinguishing happens in the crossed-block pass
         }
     }
 
@@ -202,9 +199,11 @@ impl Server {
         };
         let ml = l2(mv);
         if ml > 1.0e-7 || l2(delta) - ml < 1.0e-7 {
+            let from = m.pos;
             for (p, v) in m.pos.iter_mut().zip(mv) {
                 *p += v;
             }
+            m.inside.record(from, m.pos, delta); // read back by the crossed-block pass
         }
         let xc = (delta[0] - mv[0]).abs() >= 1.0e-5;
         let zc = (delta[2] - mv[2]).abs() >= 1.0e-5;
@@ -487,27 +486,19 @@ impl Server {
         }
     }
 
-    /// Box of the entity in a powder snow block.
-    pub(crate) fn mob_in_powder_snow(&self, m: &Mob) -> bool {
-        let b = m.bbox();
-        let lo = b.min.map(|v| (v + 1.0e-5).floor() as i32);
-        let hi = b.max.map(|v| (v - 1.0e-5).floor() as i32);
-        (lo[0]..=hi[0])
-            .any(|x| (lo[1]..=hi[1]).any(|y| (lo[2]..=hi[2]).any(|z| self.bname([x, y, z]) == "minecraft:powder_snow")))
+    /// Can freeze: not in `#freeze_immune_entity_types`, no `#freeze_immune_wearables` piece worn.
+    pub(crate) fn mob_can_freeze(&self, m: &Mob) -> bool {
+        !m.kind.freeze_immune()
+            && !m.equipment[2..=6].iter().flatten().any(|s| self.item_tag(&s.id, "minecraft:freeze_immune_wearables"))
     }
 
-    /// Freezing (server side): +1 per tick in powder snow up to 140, −2 otherwise
-    /// or if the entity cannot freeze (`#freeze_immune_entity_types`, leather armor);
+    /// Freezing (server side), after the crossed-block pass, which adds 1 per tick in powder
+    /// snow (up to 140): −2 outside snow or if the entity cannot freeze;
     /// slowdown proportional to freezing above a block; 1 freezing damage every
     /// 40 ticks once frozen.
-    pub(crate) fn mob_freezing(&mut self, m: &mut Mob) {
-        const REQUIRED: i32 = 140;
-        let in_snow = self.mob_in_powder_snow(m);
-        let can_freeze = !m.kind.freeze_immune()
-            && !m.equipment[2..=6].iter().flatten().any(|s| self.item_tag(&s.id, "minecraft:freeze_immune_wearables"));
-        if in_snow && can_freeze {
-            m.ticks_frozen = (m.ticks_frozen + 1).min(REQUIRED);
-        }
+    pub(crate) fn mob_freezing(&mut self, m: &mut Mob, in_snow: bool) {
+        const REQUIRED: i32 = crate::inside_blocks::FREEZE_REQUIRED;
+        let can_freeze = self.mob_can_freeze(m);
         if !in_snow || !can_freeze {
             m.ticks_frozen = (m.ticks_frozen - 2).max(0);
         }

@@ -32,6 +32,8 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// G5-F02c: the player's `current_impulse_context_reset_grace_time` key, always written like the
 /// game, the only cause of the change of the "new world" and "mechanisms" fingerprints (checked
 /// by removing it).
+/// G5-F02a: resting fire of the player at −20 after each crossed-block pass (saved in
+/// `Fire`), the only cause of the change of the new world (checked by disabling that reset alone).
 const EXPECTED_NEW: (&str, usize) = ("267b491ae69d2532cb5445a339735d783b91a1d0f77d089a749a81a72955a51e", 815);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 const EXPECTED_MODEL: &[(&str, &str, usize)] = &[(

@@ -2631,3 +2631,29 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
 - "New world" and "mechanisms" fingerprints changed by the sole key
   `current_impulse_context_reset_grace_time` of the player file (checked by removing it):
   intended behavior (the game always writes it).
+
+## G5-F02a: crossed-block pass of players and mobs (25/10, loaded machine)
+
+- Crossed-block pass (`rc_sim::inside_blocks`, player and mobs, every tick): bench
+  `g5f02a_bench` (loaded machine, 2 runs, 200,000 passes): standing cow 96 to 101 ns,
+  walking (0.2/tick) 201 to 208 ns; the old name-based "powder snow" scan that it
+  replaces cost 31 to 32 ns (the pass also covers fire, cactus, campfire, water, lava, rain).
+  Leads: state record read directly instead of the view (2 Arc): 106 -> 96..101 ns, kept;
+  reused buffers (no allocation in steady state); rain tested only if the entity is
+  burning. Multi-core and GPU not applicable (work of the order of 0.1 µs per entity,
+  sequential effects). To re-measure on a quiet machine on the scenes with mobs.
+  Cells already seen by the traversal (shared with ghast flight, the happy ghast and portals):
+  the linear list first retained is quadratic for big boxes (4 × 4 × 4 ghast: hundreds of
+  cells, not "a few dozen"). Replaced by a bit mask over the bounding box of the path (one-cell
+  margin, fallback list beyond 2^18 cells or outside the box). Bench `g5f02a_bench` (loaded
+  machine, 2,000 traversals): ghast path (14.3, 6.1, −11.7) 865 µs -> 18.7 µs; (5, 2, 6)
+  299 -> 11.5 µs; 1 block 25.6 -> 2.8 µs; 0.2 block 9.6 -> 2.0 µs. Walking cow (small box),
+  2 alternating runs: mask 277 / 233 ns, list 288 / 236 ns (noise). Identical output:
+  `seen_mask_matches_linear_list` (3,000 paths, stored sum). The list stays behind
+  `RUSTCRAFT_OPT_INSIDE_SEEN_LINEAR` until the quiet-machine bench. Starting hash set not
+  re-measured (the mask avoids hashing; to compare on a quiet machine).
+  Follow-up 2 (state specific to each LAN player, mob rotation): no in-game speed lead. A
+  guest install swaps 4 more fields (movement list, position at the last pass, opened
+  container, tracked equipment) among the sixty or so already swapped; the rotation of a mob
+  by command does less than before (no more position copy, path stop or forced sync). Not
+  measured: no bench scene has a guest or a rotation by command.

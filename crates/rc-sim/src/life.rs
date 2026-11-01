@@ -75,6 +75,9 @@ pub struct Life {
     pub attrs: crate::attrs::EquipAttrs,
     pub combat: crate::vitals::Combat,
     pub sign_editors: HashMap<[i32; 3], u128>,
+    /// Player movements since the last crossed-block pass, position at that pass.
+    pub(crate) inside: crate::inside_blocks::Moves,
+    pub(crate) inside_old: Option<[f64; 3]>,
 }
 
 impl Life {
@@ -133,6 +136,8 @@ impl Life {
             attrs: Default::default(),
             combat: Default::default(),
             sign_editors: HashMap::new(),
+            inside: Default::default(),
+            inside_old: None,
             pack,
             items,
             recipes,
