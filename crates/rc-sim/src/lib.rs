@@ -75,6 +75,8 @@ mod crafter; // G5-F11: crafter menu
 mod tests_g5f11;
 #[cfg(test)]
 mod tests_g4f09; // G4-F09: turtle helmet, 1.21 effects, hurt sound, statistics
+#[cfg(test)]
+mod tests_g4f12; // G4-F12: iron and copper golems
 pub mod randsrc;
 // Commands (S5).
 pub mod commands;
