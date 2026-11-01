@@ -47,7 +47,7 @@ impl Server {
                 rest
             }
             "minecraft:bone_meal" => {
-                let ok = self.grow_with_bone_meal(front);
+                let ok = self.grow_with_bone_meal(front) || self.grow_water_plant(front, None);
                 if ok {
                     self.level_event(1505, front, 15);
                 }

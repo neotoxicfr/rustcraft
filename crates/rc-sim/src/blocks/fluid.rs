@@ -57,6 +57,12 @@ fn masks(boxes: &[rc_data::Aabb]) -> [[u64; 4]; 6] {
 
 const FULL: [u64; 4] = [u64::MAX; 4];
 
+/// Whether face `face` (down, up, north, south, west, east) of shape `shape` is entirely covered,
+/// computed on demand (client: attachment of lichen and moss carpet).
+pub fn shape_face_full(d: &VersionData, shape: u16, face: usize) -> bool {
+    d.shapes.get(usize::from(shape)).is_some_and(|&(a, b)| masks(&d.aabbs[a as usize..b as usize])[face] == FULL)
+}
+
 impl Server {
     pub(crate) fn tag(&self, name: &str, block: u16) -> bool {
         self.tag_u32(name, u32::from(block), crate::tag_bits::mode())

@@ -8,6 +8,7 @@ mod alloc_trace;
 mod arena;
 mod audio_slot;
 mod block_anim;
+mod bone_meal_use;
 mod boot;
 mod block_entities;
 mod block_fx;

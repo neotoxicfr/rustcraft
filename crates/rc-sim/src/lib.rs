@@ -98,6 +98,7 @@ pub(crate) mod brush;
 // Minecarts (G5-F06).
 pub mod minecart;
 
+pub use blocks::fluid::shape_face_full;
 pub use blocks::piston_plan::{MovingBlock, PistonReplay, PistonWorld, ReplayOp, ReplayWorld};
 pub use blocks::redstone::{button_sound, openable_sound_name};
 pub use server::{Handle, Options, start};
