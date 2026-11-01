@@ -2465,3 +2465,17 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   tick's head, already kept (nothing added per tick; the write at spawn from the previous
   version disappears). Integrated server: horizontal-movement test of the dragon (two
   subtractions, one comparison per dragon tick). Off the hot path: nothing to measure on the bench.
+
+## G5-F02f: food finish sound, ravager trampling crops (25/10, loaded machine)
+
+- Crop trampling by the ravager, one pass per ravager per tick (box shrunk by 1e-5, 3 x 4 x 3
+  blocks). Bench `bench_ravager_trample_pass` (rc-sim, `--ignored`), 2 alternating passes, box
+  without crops (common case): plain pass (one chunk looked up per block) 715 then 522 ns;
+  per-column pre-scan (one chunk per column, exit as soon as there is no crop) 195 then 207 ns:
+  about 3 times faster, kept by default (`RUSTCRAFT_OPT_RAVAGER_SCAN=0`: plain pass only, to
+  re-measure on a quiet machine). Full field (placing + breaking 9 crops): 35 to 54 µs,
+  dominated by the break (drops, updates), pre-scan difference within the noise.
+  Identical result (the break keeps the game's x, y, z order; tests under both settings).
+  Multi-core and GPU not applicable (under a microsecond, once per ravager per tick).
+- Food finish sound: one more sound packet for the final bite, two random draws; the sound is
+  looked up by name in the registry like other sounds (once per meal).
