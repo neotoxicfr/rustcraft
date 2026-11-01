@@ -1406,7 +1406,9 @@ impl Entities {
                 let Some(e) = self.map.get_mut(&id) else { return };
                 if e.class == Kind::Other {
                     e.head = yaw;
-                } else {
+                } else if e.kind != "ender_dragon" {
+                    // The dragon keeps the target without ever smoothing it (its AI step replaces the
+                    // living entity's, which does it): its head only follows the body catch-up.
                     e.head_target = Some((yaw, 3));
                 }
             }

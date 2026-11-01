@@ -1191,22 +1191,47 @@ pub(super) fn shadow(k: &str) -> Option<(f32, f32)> {
     Some((r, 1.0))
 }
 
-/// Gaussian draw (Box-Muller) on a shared xorshift generator: the shaking is
-/// random each frame, with no seed to reproduce.
-fn gaussian() -> f64 {
+/// Uniform draw in ]0, 1] on a shared xorshift generator (purely visual effects, with no seed to
+/// reproduce).
+fn uniform() -> f64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static STATE: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
-    let next = || {
-        let mut x = STATE.load(Ordering::Relaxed);
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        STATE.store(x, Ordering::Relaxed);
-        // 53 useful bits, in ]0, 1].
-        ((x >> 11) as f64 + 1.0) / (1u64 << 53) as f64
-    };
-    let (u, v) = (next(), next());
+    let mut x = STATE.load(Ordering::Relaxed);
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    STATE.store(x, Ordering::Relaxed);
+    // 53 useful bits, in ]0, 1].
+    ((x >> 11) as f64 + 1.0) / (1u64 << 53) as f64
+}
+
+/// Gaussian draw (Box-Muller): the shaking is random each frame.
+fn gaussian() -> f64 {
+    let (u, v) = (uniform(), uniform());
     (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
+}
+
+/// Creaking tearing itself down (value 18): no death tilt and no red overlay, blinking eyes.
+pub(super) fn creaking_tearing(e: &Entity) -> bool {
+    e.kind == "creaking" && e.meta_bool(18)
+}
+
+/// Eyes of the creaking (`extra[5]` lit, `extra[6]` next toggle): when the death counter exceeds
+/// the next toggle, they toggle and the following one falls 2 to 8 ticks later if they were lit,
+/// t/4 to t/2 otherwise. Only used by the render while it tears itself down.
+fn creaking_blink(e: &mut Entity) {
+    let t = e.death_time;
+    if t as f32 > e.extra[6] {
+        let lit = e.extra[5] != 0.0;
+        let (lo, hi) = if lit { (2, 8) } else { (t / 4, t / 2) };
+        e.extra[6] = (t + int_between(lo, hi)) as f32;
+        e.extra[5] = if lit { 0.0 } else { 1.0 };
+    }
+}
+
+/// Uniform integer in [lo, hi] (hi >= lo).
+fn int_between(lo: i32, hi: i32) -> i32 {
+    lo + ((uniform() * f64::from(hi - lo + 1)) as i32).min(hi - lo)
 }
 
 /// Render offset of the "creepy" enderman (value 17): each frame, a Gaussian draw
@@ -1266,6 +1291,7 @@ pub(super) fn tick(e: &mut Entity) {
             let invulnerable = x[4] > 0.0;
             State::animate_when(&mut x[1], invulnerable, age);
             State::animate_when(&mut x[2], tearing, age);
+            creaking_blink(e);
         }
         "breeze" => {
             let pose = e.pose();

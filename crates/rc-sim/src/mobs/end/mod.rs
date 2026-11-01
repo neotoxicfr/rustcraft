@@ -17,6 +17,9 @@ pub(crate) mod shulker;
 
 #[cfg(test)]
 mod tests;
+// Dragon gaze along its head (mission G4-F16a).
+#[cfg(test)]
+mod head_tests;
 #[cfg(test)]
 mod kb_world_tests;
 #[cfg(test)]

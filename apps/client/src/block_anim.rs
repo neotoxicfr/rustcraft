@@ -541,6 +541,20 @@ impl BlockAnim {
         }
     }
 
+    /// "Blocks motion, leaves excluded" height map at a column (first free y), read from the
+    /// blocks; chunk absent: minimum Y.
+    pub(crate) fn no_leaves_height(&self, w: &TickWorld<'_>, data: &VersionData, x: i32, z: i32) -> i32 {
+        let (lo, hi) = (w.min_y, w.min_y + w.height);
+        if w.state(x, lo, z).is_none() {
+            return lo;
+        }
+        let blocks = |s: u32| {
+            let b = data.state(s).map_or(0, |i| usize::from(i.block));
+            self.tags.get(b).is_some_and(|t| t & T_NO_LEAVES_HEIGHT != 0) || w.phys.fluids.fluid(s) != Fluid::None
+        };
+        (lo..hi).rev().find(|&y| blocks(w.state(x, y, z).unwrap_or(0))).map_or(lo, |y| y + 1)
+    }
+
     /// Biome registry received (on entering a world).
     pub fn set_biomes(&mut self, names: &[String]) {
         self.ambient = names.iter().map(|n| biome_ambient(n)).collect();
