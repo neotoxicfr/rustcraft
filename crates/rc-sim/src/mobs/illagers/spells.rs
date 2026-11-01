@@ -22,6 +22,8 @@ pub struct Fangs {
     pub sent_spike: bool,
     pub owner: Option<i32>,
     pub removed: bool,
+    /// Number of the entity walk they were born in (0: outside the walk), read by `mobs::Walk`.
+    pub born: u64,
 }
 
 impl Server {
@@ -166,7 +168,7 @@ impl Server {
 
     /// Fangs placed on the first full top face going down from `max_y`.
     #[allow(clippy::too_many_arguments)]
-    fn create_fangs(&mut self, m: &Mob, x: f64, z: f64, min_y: f64, max_y: f64, angle: f32, delay: i32) {
+    pub(crate) fn create_fangs(&mut self, m: &Mob, x: f64, z: f64, min_y: f64, max_y: f64, angle: f32, delay: i32) {
         let mut p = block_of([x, max_y, z]);
         let mut found = false;
         let mut top = 0.0;
@@ -216,6 +218,7 @@ impl Server {
             sent_spike: false,
             owner: Some(m.id),
             removed: false,
+            born: self.walk.born(),
         });
     }
 
@@ -237,6 +240,10 @@ impl Server {
     pub(crate) fn fangs_tick(&mut self) {
         let mut list = std::mem::take(&mut self.mobs.ill.fangs);
         for f in list.iter_mut().filter(|f| !f.removed) {
+            // Born during this entity walk: they wait for the next tick.
+            if self.walk.waits(std::mem::take(&mut f.born)) {
+                continue;
+            }
             f.warmup -= 1;
             if f.warmup >= 0 {
                 continue;

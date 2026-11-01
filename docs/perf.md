@@ -2540,3 +2540,25 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   bee goals. Without a home, it costs four `Option` tests (short-circuit before any
   position); no structure added. Lead tick unchanged: 64 ns taut and slack (bench above,
   loaded machine). Generic home in the field already present on every mob (no extra byte).
+
+## G4-F07b: pig steered with a carrot, llama spit (25/10, loaded machine)
+
+- Pig: one "carrot in hand?" test per tick and per pig (two inventory slots read), the boost
+  and the wear only on click. No hot spot (no loop, no allocation); multi-core and GPU not
+  applicable. Dismount: at most eight cells, once per dismount.
+- Llama spit: same work per tick as before (one walk of the mobs); the margin and the entry
+  point replace the distance to the centre (same cost); the "llama and passengers" list is
+  built only until the spit has left (a few ticks), then no allocation at all. No bench: a
+  few spits in flight at most, nothing measurable per scene.
+- Rework (review): dismount chosen by species (horse family: sides; other animals, nautiluses
+  included: neighbouring cells; the rest: top of the box), cost unchanged (one species test per
+  dismount). Projectiles, spits, fangs and bolts born during a mob's tick: one boolean per
+  entity, read and reset on the next tick (no allocation; one extra walk only while the game is
+  frozen, to reset the flags).
+- Second rework: the boolean becomes a birth mark (`mobs::Walk`, number of the entity walk,
+  8 bytes per spit, fang, bolt, projectile and cloud) compared with the walk in progress; one
+  integer comparison per entity and per tick, like reading the boolean. The two reset walks of
+  the frozen game disappear (less work while frozen), no walk added, no allocation. Nothing
+  measurable per scene: even with hundreds of arrows stuck in blocks, the work per arrow and
+  per tick stays the read of one field, already done with the boolean; no bench, multi-core and
+  GPU not applicable.

@@ -1513,6 +1513,24 @@ mod tests {
         p.s.prop(AT, key).unwrap_or_default()
     }
 
+    /// Arrow released by an ominous item spawner (an entity, ticked during the entity walk):
+    /// first tick on the next server tick, not on the one it was born in. Complete server ticks.
+    #[test]
+    fn ominous_arrow_first_tick_on_next_server_tick() {
+        let Some((mut p, dir)) = probe("g4f07b-ominous") else { return };
+        let item = Stack { id: "minecraft:arrow".into(), count: 1, components: None };
+        let o = OminousItem { id: 9_000_100, uuid: 9_000_100, pos: [216.5, -55.0, 214.5], item, after: 1, age: 0 };
+        p.s.mobs.spawners.blocks.items.push(o);
+        p.s.game_tick();
+        p.s.tick += 1;
+        let a = p.s.proj.list.iter().find(|q| q.owner == Some(9_000_100)).expect("arrow released");
+        assert_eq!(a.tick_count, 0, "spawner's arrow advanced on the tick of its birth");
+        let aid = a.id;
+        p.s.game_tick();
+        assert_eq!(p.s.proj.list.iter().find(|q| q.id == aid).map(|q| q.tick_count), Some(1));
+        finish(p, dir);
+    }
+
     /// Advances to the wanted state (at most `max` ticks); returns the number of ticks.
     fn until(p: &mut Probe, key: &str, want: &str, max: i32) -> i32 {
         for i in 0..max {

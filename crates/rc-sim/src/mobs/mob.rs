@@ -1130,6 +1130,8 @@ impl Mob {
                 self.set(16, Meta::Bool(self.age < 0));
                 self.set(17, Meta::Bool(self.mount.age_locked));
                 match self.kind {
+                    // Total duration of the carrot-on-a-stick boost.
+                    Kind::Pig => self.set(18, Meta::Int(self.neth.boost_total)),
                     Kind::Sheep => self.set(18, Meta::Byte((self.wool & 15) as i8 | if self.sheared { 16 } else { 0 })),
                     Kind::Villager => {
                         self.set(19, Meta::Villager(self.villager));

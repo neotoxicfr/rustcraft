@@ -9,7 +9,7 @@
 mod physics;
 mod save;
 mod track;
-mod use_;
+pub(crate) mod use_;
 mod variants;
 
 #[cfg(test)]

@@ -35,6 +35,8 @@ pub struct Cloud {
     pub waiting: bool,
     pub removed: bool,
     pub seen: bool,
+    /// Number of the entity walk it was born in (0: outside the walk), read by `mobs::Walk`.
+    pub born: u64,
     sent_radius: f32,
     sent_waiting: bool,
 }
@@ -63,6 +65,7 @@ impl Cloud {
             waiting: false,
             removed: false,
             seen: false,
+            born: 0,
             sent_radius: 3.0,
             sent_waiting: false,
         }
@@ -171,6 +174,9 @@ impl Cloud {
 
 impl Server {
     pub(crate) fn cloud_add(&mut self, mut c: Cloud) {
+        // Born during the entity walk (creeper, dragon flame or fireball, lingering potion,
+        // command block minecart): its age only advances on the next tick.
+        c.born = self.walk.born();
         self.cloud_pair(&mut c);
         self.proj.clouds.push(c);
     }
@@ -222,6 +228,9 @@ impl Server {
     pub(crate) fn clouds_tick(&mut self) {
         let mut clouds = std::mem::take(&mut self.proj.clouds);
         for c in clouds.iter_mut().filter(|c| !c.removed) {
+            if self.walk.waits(std::mem::take(&mut c.born)) {
+                continue;
+            }
             if !c.seen {
                 self.cloud_pair(c);
             }

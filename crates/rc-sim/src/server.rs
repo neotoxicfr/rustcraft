@@ -242,6 +242,9 @@ pub struct Server {
     pub(crate) life: Box<crate::life::Life>,
     /// Mobs (S4, `mobs/`).
     pub(crate) mobs: Box<crate::mobs::Mobs>,
+    /// Entity walk of the tick in progress (a single counter for all dimensions): what is born
+    /// in it waits for the next tick (`mobs::Walk`).
+    pub(crate) walk: crate::mobs::Walk,
     /// Simulated decorations (paintings, frames, armor stands, cushions, `decoration/`).
     pub(crate) deco: Box<crate::decoration::Decos>,
     /// Generation of missing chunks (`generation.rs`).
@@ -393,6 +396,7 @@ impl Server {
             cmd,
             life,
             mobs: Box::default(),
+            walk: crate::mobs::Walk::default(),
             deco: Box::default(),
             proj: Box::default(),        // S8
             proj_player: Box::default(), // S8

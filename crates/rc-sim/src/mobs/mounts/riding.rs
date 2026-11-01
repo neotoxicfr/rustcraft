@@ -195,7 +195,8 @@ impl Server {
         ((handles(v.kind) || super::super::sealife::is_nautilus(v.kind))
             && saddled(v)
             && v.mount.passengers.first() == Some(&Ent::Player))
-            // F12: saddled strider, player holding the warped fungus on a stick.
+            // F12: saddled strider (warped fungus on a stick) or pig (carrot on a stick),
+            // player first holding its stick.
             || super::super::nether::strider::player_controls(v)
             // F14: harnessed happy ghast, outside immobility.
             || super::super::recent::happy_ghast::player_controls(v)
@@ -318,8 +319,9 @@ impl Server {
 
     // ---------- Dismounting ----------
 
-    /// Dismount location (of the equine): side of the leading hand
-    /// first, then the other, otherwise the animal's position.
+    /// Dismount location according to the vehicle's species: own rule (strider, happy ghast),
+    /// sides of the equine (leading hand first, then the other, otherwise its position),
+    /// neighbouring cells for the other animals, top of the box for the rest.
     pub(crate) fn dismount_location(&self, v: &Mob, width: f32, poses: &[(f32, f32)]) -> [f64; 3] {
         // F12: the strider looks for a lava-free floor around the passenger's gaze.
         if v.kind == Kind::Strider {
@@ -329,13 +331,45 @@ impl Server {
         if let Some(p) = super::super::recent::happy_ghast::dismount_location(v) {
             return p;
         }
-        for side in [90.0f32, -90.0] {
-            let dir = escape_vector(f64::from(v.width()), f64::from(width), v.yaw + side);
-            if let Some(p) = self.dismount_in_direction(v, dir, width, poses) {
-                return p;
+        // Horse family (camels and llamas included): sides of the animal.
+        if handles(v.kind) {
+            for side in [90.0f32, -90.0] {
+                let dir = escape_vector(f64::from(v.width()), f64::from(width), v.yaw + side);
+                if let Some(p) = self.dismount_in_direction(v, dir, width, poses) {
+                    return p;
+                }
+            }
+            return v.pos;
+        }
+        // Other animals (pig, chicken, nautiluses…): cells around, following the facing direction.
+        if v.kind.is_animal() {
+            return self.animal_dismount_location(v, poses);
+        }
+        // The rest (spider, ravager…): top of the box.
+        [v.pos[0], v.bbox().max[1], v.pos[2]]
+    }
+
+    /// Dismount from an animal: for each passenger pose, the eight neighbouring cells (right,
+    /// left, behind, ahead, in the minecart's diagonal order) at the animal's level, low floor
+    /// and free room; otherwise the top of the box.
+    fn animal_dismount_location(&self, v: &Mob, poses: &[(f32, f32)]) -> [f64; 3] {
+        let offsets = crate::minecart::use_::offsets_for(crate::minecart::use_::direction_of(v.yaw));
+        let b = v.block_pos();
+        for &(w, h) in poses {
+            for o in offsets {
+                let t = [b[0] + o[0], b[1], b[2] + o[1]];
+                let floor = self.block_floor_height(t);
+                if !(floor.is_finite() && floor < 1.0) {
+                    continue;
+                }
+                let loc = [f64::from(t[0]) + 0.5, f64::from(t[1]) + floor, f64::from(t[2]) + 0.5];
+                let bb = Mob::bbox_at(loc, w, h);
+                if rc_physics::is_free(&self.world(), &bb) && self.box_in_border(&bb) {
+                    return loc;
+                }
             }
         }
-        v.pos
+        [v.pos[0], v.bbox().max[1], v.pos[2]]
     }
 
     fn dismount_in_direction(&self, v: &Mob, dir: [f64; 3], width: f32, poses: &[(f32, f32)]) -> Option<[f64; 3]> {
@@ -592,7 +626,7 @@ impl Server {
     /// Mount piloted by the player: no server AI or movement; rotation taken from
     /// the player; the camel stands up if the player moves forward.
     pub(crate) fn tick_ridden(&mut self, m: &mut Mob) {
-        // F12: strider dash.
+        // F12: strider or pig dash.
         super::super::nether::strider::tick_boost(m);
         if super::super::recent::happy_ghast::tick_ridden(self, m) {
             // F14: the happy ghast catches up 8% of the yaw difference.
@@ -802,9 +836,12 @@ impl Server {
         self.mobs.list[i] = Some(v);
     }
 
-    /// Saddled (camel: and not sitting).
+    /// Mount with a commanded jump (equines, camels, nautiluses; neither strider nor pig),
+    /// saddled (camel: and not sitting).
     fn mount_can_jump(&self, v: &Mob) -> bool {
-        saddled(v) && (!is_camel(v.kind) || !super::camel::refuse_to_move(self, v))
+        (handles(v.kind) || super::super::sealife::is_nautilus(v.kind))
+            && saddled(v)
+            && (!is_camel(v.kind) || !super::camel::refuse_to_move(self, v))
     }
 
     /// Equine → rears and jump sound; camel → dash.

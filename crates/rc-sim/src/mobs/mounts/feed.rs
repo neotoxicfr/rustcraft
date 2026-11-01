@@ -117,6 +117,7 @@ impl Server {
                 Kind::CamelHusk => Some("minecraft:entity.camel_husk.saddle".to_owned()),
                 // F12: strider.
                 Kind::Strider => Some("minecraft:entity.strider.saddle".to_owned()),
+                Kind::Pig => Some("minecraft:entity.pig.saddle".to_owned()),
                 Kind::Nautilus | Kind::ZombieNautilus => Some(
                     if super::super::sealife::under_water(m) {
                         "minecraft:item.nautilus_saddle_underwater_equip"

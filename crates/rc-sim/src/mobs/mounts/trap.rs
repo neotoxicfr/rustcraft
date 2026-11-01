@@ -30,6 +30,8 @@ pub struct Bolt {
     /// Cells set on fire and entities struck.
     fires: i32,
     hit: Vec<Ent>,
+    /// Number of the entity walk it was born in (0: outside the walk), read by `mobs::Walk`.
+    pub(crate) born: u64,
 }
 
 impl Server {
@@ -166,7 +168,20 @@ impl Server {
             data: 0,
         };
         let _ = self.send(Event::Entity(EntityEvent::Add(Box::new(add))));
-        self.mobs.mounts.bolts.push(Bolt { id, uuid, life: 2, flashes, rng, pos, visual, cause, fires: 0, hit: Vec::new() });
+        let born = self.walk.born();
+        self.mobs.mounts.bolts.push(Bolt {
+            id,
+            uuid,
+            life: 2,
+            flashes,
+            rng,
+            pos,
+            visual,
+            cause,
+            fires: 0,
+            hit: Vec::new(),
+            born,
+        });
     }
 
     /// Life of the lightning bolts: at the first tick fire (normal and hard),
@@ -176,6 +191,12 @@ impl Server {
         let mut bolts = std::mem::take(&mut self.mobs.mounts.bolts);
         let mut gone = Vec::new();
         for b in &mut bolts {
+            // Born during this entity walk (skeleton horse trap): it waits for the next tick.
+            // Thunderstorm (before the walk): right away; channeling (during the projectiles,
+            // after this tick): on the next tick without being skipped.
+            if self.walk.waits(std::mem::take(&mut b.born)) {
+                continue;
+            }
             if b.life == 2 {
                 if self.level.difficulty_id() >= 2 {
                     self.bolt_fire(b, 4);
@@ -687,6 +708,63 @@ mod w9_tests {
         step(&mut p, 2);
         assert_eq!(state_string(&p.s, p.s.get([205, -60, 205])), "minecraft:copper_block", "scraped copper");
         let _ = Ent::Player;
+        finish(p, dir);
+    }
+
+    /// Complete server tick, like the server loop (events drained).
+    fn full_tick(p: &mut Probe) {
+        p.s.game_tick();
+        p.s.tick += 1;
+        let _ = p.take_events();
+    }
+
+    /// Bolt of a skeleton horse trap, born during the entity walk: first tick on the next server
+    /// tick, whether the horse is free (ticked before the bolts) or a passenger of a minecart
+    /// (ticked after them, with the minecarts). Complete server ticks; each trap springs when
+    /// the player (creative) comes within 6 blocks.
+    #[test]
+    fn trap_bolt_first_tick_on_next_server_tick() {
+        let Some((mut p, dir)) = probe("g4f07b-bolt") else { return };
+        p.s.game_mode = 1;
+        let mut trap = |at: [f64; 3]| {
+            let mut m = p.s.new_mob(Kind::SkeletonHorse, at, 0.0);
+            m.persistent = true;
+            m.mount.trap = true;
+            crate::server::Server::add_trap_goal(&mut m);
+            let id = m.id;
+            p.s.add_mob(m);
+            id
+        };
+        let free = trap([216.5, -59.0, 216.5]);
+        let carried = trap([226.5, -59.0, 226.5]);
+        p.s.next_entity += 1;
+        let mut c =
+            crate::minecart::Cart::new(crate::minecart::CKind::Rideable, p.s.next_entity, [226.5, -59.0, 226.5]);
+        let i = p.s.mob_index(carried).unwrap();
+        let mut h = p.s.mobs.list[i].take().unwrap();
+        assert!(p.s.cart_mob_start_riding(&mut c, &mut h), "horse not mounted in the minecart");
+        p.s.mobs.list[i] = Some(h);
+        p.s.cart_add(c);
+        let mut seen = Vec::new();
+        for (who, id, near) in [("free", free, [216.5, -59.0, 210.5]), ("minecart", carried, [226.5, -59.0, 220.5])] {
+            p.s.pos = near;
+            p.s.last_good = near;
+            let mut bolt = None;
+            for _ in 0..100 {
+                full_tick(&mut p);
+                bolt = p.s.mobs.mounts.bolts.iter().find(|b| !seen.contains(&b.id)).map(|b| b.id);
+                if bolt.is_some() {
+                    break;
+                }
+            }
+            let bid = bolt.unwrap_or_else(|| panic!("{who}: trap never sprung"));
+            seen.push(bid);
+            assert!(p.s.mob_ref(id).is_some_and(|m| !m.mount.trap), "{who}: bolt of another trap");
+            let life = |p: &Probe| p.s.mobs.mounts.bolts.iter().find(|b| b.id == bid).map(|b| b.life);
+            assert_eq!(life(&p), Some(2), "{who}: bolt advanced on the tick of its birth");
+            full_tick(&mut p);
+            assert_eq!(life(&p), Some(1), "{who}: bolt still on the next tick");
+        }
         finish(p, dir);
     }
 
