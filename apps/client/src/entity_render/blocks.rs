@@ -332,7 +332,7 @@ impl EntityRenderer {
                 _ => false,
             },
             Kind::TrialSpawner => match &e.data {
-                Data::Trial(Some(id), _) if e.props.active => self.push_spawn_entity(id, e, t, light, f.pt),
+                Data::Trial(Some(id), _) if e.props.trial_spin > 0.0 => self.push_spawn_entity(id, e, t, light, f.pt),
                 _ => false,
             },
             Kind::Campfire => self.push_campfire(e, t, light, f),

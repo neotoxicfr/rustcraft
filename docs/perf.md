@@ -2416,6 +2416,24 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   target; spatial index not retained (nothing measurable at this rate). Wet player: one sweep
   of the fluids of its box per examination. Multi-core and GPU not applicable (sub-microsecond work).
 - Opening of the shulker box: one collision search on a half block per click.
+## G4-F12: iron and copper golems (25/10, loaded machine)
+
+- Village defence (start test, goal-selection tick): the line of sight the game requires costs
+  rays; the villager scan is now skipped when the player is not a valid target (no observable
+  effect: the sight cache only lives for one tick), and the reputation is read before the
+  villager's sight ray. Bench `bench_defend_village_can_use` (8 villagers, 10^5 calls, 2
+  passes): player out of range 12-13 ns per call against 1,934-2,199 ns without the skip;
+  player nearby in the open (neutral reputation) 316-331 ns against 2,068-2,617 ns. Kept,
+  without a switch (dead work removed, identical result by construction). Multi-core and GPU
+  not applicable (one evaluation per golem and per goal tick).
+- Door behaviour (villager, copper golem): a single code path; no more path copy at every
+  call (one allocation fewer per walking villager and per tick). Copper golem: list of nearby
+  living entities filled into the buffer of the previous measurement (no more allocation
+  every 20 ticks for the seen living entities). Cost of a non-isolated call (below a
+  microsecond).
+- Shared spawn helper: one collision-box buffer for the whole descent instead of a `Vec` per
+  cell; border test (4 bounds) before the descent, which spares the descent outside the
+  border. Rare (spawning by attempts), not measured separately.
 ## G2-F08: singleplayer world, world pack, creation, list (24/10, loaded machine)
 
 - "..." cut of the names in the list and of the packs (`rc_text::clamp`, cumulative width in a
@@ -2433,3 +2451,307 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   walk of the order of 3.65 ms for 12,000 files (G1-F15 measurement), kept for safety.
 - Free disk space (`rc_sim::storage::low_disk_space`): one system call at opening, on
   the main thread; not measured separately (negligible).
+## G4-F16b: local monster effects (25/10, loaded machine)
+
+- `entity_fx::mob_fx` (blaze, breeze, enderman, endermite, evoker, illusioner, phantom,
+  ravager, warden): a few comparisons and draws per affected monster and per tick, on the
+  main thread, inside the entity loop already walked (no second walk); no allocation
+  except for a sound (empty vector otherwise). Rough measurement: 900,000 entity ticks +
+  effects (test `ravager_stun_particles`) in under 0.1 s, i.e. < 110 ns per call, tick
+  included. Leads not retained: grouping the draws by batch or with SIMD (a few monsters at a
+  time, nothing measurable), multi-core and GPU not applicable (sub-microsecond work, output
+  to the particle system of the main thread). Render shape of the ground block: comparison of
+  the block name (12 cases) only for the breeze and the digging warden; per-state table not
+  retained (construction at loading for a rare use). Scenes to re-measure on a calm machine:
+  Nether (blazes), night (phantoms), ancient city (warden), trial chamber (breezes).
+## G4-F16a: dragon client effects, creaking tearing itself down (25/10, loaded machine)
+
+- Dragon (`entity_render/dragon.rs` `client_fx`, `App::tick_dragon_fx`): one pass over the
+  entities per tick with a kind comparison (of the order of a nanosecond per entity), then
+  a handful of operations for each dragon; no allocation (effects delivered by callback,
+  sine and cosine from the game's table, already built). The only notable cost: the podium
+  column re-read block by block (at most the world height, 384 reads) at every landing
+  tick, a few seconds per fight; a cache of the "no leaves" height map would cost
+  an update at every block change of the whole world for this single phase: not
+  retained. Multi-core and GPU not applicable (a few microseconds per tick at most, effects emitted
+  in the order of the random draws). Not measured on the bench: nothing on the hot path outside the dragon fight.
+- Creaking: eye blinking in O(1) per tick (two floats of the free state), red overlay
+  and tilt by a kind test; no measurable cost.
+- Breath aim (revised): the dragon's head packet is discarded on reception (one kind comparison
+  per head packet of a living entity, a few nanoseconds; filtering at the tick would cost a
+  test per entity and per tick: rejected without measuring), the aim is read from the previous
+  tick's head, already kept (nothing added per tick; the write at spawn from the previous
+  version disappears). Integrated server: horizontal-movement test of the dragon (two
+  subtractions, one comparison per dragon tick). Off the hot path: nothing to measure on the bench.
+
+## G5-F02f: food finish sound, ravager trampling crops (25/10, loaded machine)
+
+- Crop trampling by the ravager, one pass per ravager per tick (box shrunk by 1e-5, 3 x 4 x 3
+  blocks). Bench `bench_ravager_trample_pass` (rc-sim, `--ignored`), 2 alternating passes, box
+  without crops (common case): plain pass (one chunk looked up per block) 715 then 522 ns;
+  per-column pre-scan (one chunk per column, exit as soon as there is no crop) 195 then 207 ns:
+  about 3 times faster, kept by default (`RUSTCRAFT_OPT_RAVAGER_SCAN=0`: plain pass only, to
+  re-measure on a quiet machine). Full field (placing + breaking 9 crops): 35 to 54 µs,
+  dominated by the break (drops, updates), pre-scan difference within the noise.
+  Identical result (the break keeps the game's x, y, z order; tests under both settings).
+  Multi-core and GPU not applicable (under a microsecond, once per ravager per tick).
+- Food finish sound: one more sound packet for the final bite, two random draws; the sound is
+  looked up by name in the registry like other sounds (once per meal).
+
+## G6-F09a: speleothems and active sulfur (25/10, loaded machine)
+
+- Random tick of a speleothem with no possible growth (bench `bench_speleothem_random_tick_and_geyser`,
+  best of 5 × 200,000): sulfur spike 15.3 ns, pointed dripstone 15.6 ns (two draws), against 21.7 ns
+  for a stone (fall back to the copper tick): the chance test (0.0114) comes before any state
+  read. Properties read by name (`vertical_direction`, `thickness`) only on this rare path
+  and at shape time; per-state byte table not retained (nothing measurable). Feeder blocks
+  (speleothem block, sulfur) resolved once in `Ids`. Multi-core and GPU not applicable.
+- Continuous geyser (block entity, every tick): 106.5 ns with no mob, 1,972 ns with 200
+  mobs outside the column (about 9 ns per mob: walk of the list, exact `Mob::touches`
+  prefilter reused from the pushes). Lead noted, not done: spatial index of the mobs
+  (none today) to read only the mobs in the column; to re-measure on a quiet machine on
+  a real sulfur cave (number of active geysers unknown). Nausea and countdown:
+  once every 10 and 20 ticks.
+## G6-F09b: projectiles on plates, right to break on impact (25/10, loaded machine)
+
+- Pass over the blocks traversed by a projectile: the block kind (table lookup per state) is
+  now read for every cell and every projectile (before: arrows only) to route the plates;
+  1 to 8 cells per step, no allocation; the update of the list copy and the recount of the
+  entities only happen in a released plate (rare). Not measured separately: below the scene
+  noise; to confirm on the quiet-machine bench (scene with arrows in flight). Lot 6
+  integration: the projectile cells now come from the G5-F02e contact walk (section below),
+  and the plate reads the box of the projectile being ticked (`ticking_proj`) instead of
+  moving its list copy.
+- Right to break on impact: the tag predicate is frozen as a `match` (no tag lookup at run
+  time, test against the jar), the rule is read only when the block hit is a pot, a chorus
+  flower or a speleothem. Multi-core and GPU not applicable (one-off event).
+
+## G4-F07a: simulated lead and the wandering trader's llamas (25/10, loaded machine)
+
+- Lead state boxed on the mob (`Option<Box<Leash>>`, 8 bytes per mob): a mob without a lead
+  pays one test per tick; no global structure to keep up to date.
+- Tick of a lead (bench `bench_leash_tick`, ignored by default, best of 5 × 2,000): taut
+  (spring) 64 to 66 ns, slack near the holder 63 ns (2 passes). Holder found through the
+  id index, knot through the decoration registry; reload by UUID through the UUID index.
+  Multi-core and GPU not applicable (a few held animals, sub-microsecond work). The
+  "animals held by X" sweeps (32-block cube) only serve clicks, snaps and knot removals:
+  linear walk kept (nothing measurable at this rate).
+- Fence knot: ordinary decoration filtered at write time (never saved, like the game);
+  no separate list (selectors, `/kill` and `/data` see it with no extra code).
+- Follow-up (lead zone read by the goals): home test added to the attack tests of the
+  targeting goals, to the chase without sight, to the "go to a block" searches and to the
+  bee goals. Without a home, it costs four `Option` tests (short-circuit before any
+  position); no structure added. Lead tick unchanged: 64 ns taut and slack (bench above,
+  loaded machine). Generic home in the field already present on every mob (no extra byte).
+
+## G4-F07b: pig steered with a carrot, llama spit (25/10, loaded machine)
+
+- Pig: one "carrot in hand?" test per tick and per pig (two inventory slots read), the boost
+  and the wear only on click. No hot spot (no loop, no allocation); multi-core and GPU not
+  applicable. Dismount: at most eight cells, once per dismount.
+- Llama spit: same work per tick as before (one walk of the mobs); the margin and the entry
+  point replace the distance to the centre (same cost); the "llama and passengers" list is
+  built only until the spit has left (a few ticks), then no allocation at all. No bench: a
+  few spits in flight at most, nothing measurable per scene.
+- Rework (review): dismount chosen by species (horse family: sides; other animals, nautiluses
+  included: neighbouring cells; the rest: top of the box), cost unchanged (one species test per
+  dismount). Projectiles, spits, fangs and bolts born during a mob's tick: one boolean per
+  entity, read and reset on the next tick (no allocation; one extra walk only while the game is
+  frozen, to reset the flags).
+- Second rework: the boolean becomes a birth mark (`mobs::Walk`, number of the entity walk,
+  8 bytes per spit, fang, bolt, projectile and cloud) compared with the walk in progress; one
+  integer comparison per entity and per tick, like reading the boolean. The two reset walks of
+  the frozen game disappear (less work while frozen), no walk added, no allocation. Nothing
+  measurable per scene: even with hundreds of arrows stuck in blocks, the work per arrow and
+  per tick stays the read of one field, already done with the boolean; no bench, multi-core and
+  GPU not applicable.
+
+## G5-F16b: event 55, recipe book slot displays, "Biome builder" line (25/10, loaded machine)
+
+- LAN broadcast of players' equipment: only the changed slots are sent (instead of all 6 at
+  each change) and two hands exchanged go out as a 5-byte entity event instead of two stacks:
+  fewer bytes on the network, same CPU work (the comparison of the 6 slots was already done).
+  Multi-core and GPU not applicable (6 comparisons per player per tick).
+- Recipe book, fuels: a scan of the item table (≈ 1,500 entries) then a sort of 347
+  (group, identifier) pairs for each furnace ghost recipe, instead of 1,500 name suffix tests:
+  not measured separately (rare event, of the order of ten µs). Value group precomputed when
+  the data is prepared (≈ 30 values, linear search over 347 items, once). Per-recipe cache
+  ruled out: nothing to gain on a click event.
+- Dyeing demonstration: 16 stacks at most, one 4-byte allocation each; drawn with the variants
+  menu as before (same number of resolutions).
+- F3 "Biome builder" line: computed by the integrated server only when the entry is shown AND
+  the feet block changes (6 density functions, /locate generator cache). First display:
+  construction of the generator shared with /locate, 222 to 233 ms on the server thread (test,
+  loaded machine), once per dimension; to re-measure on a quiet machine. Lead to measure:
+  build this generator off the server thread.
+
+## G6-F07: bone meal (25/10, loaded machine)
+
+- New targets (`blocks/bone_meal.rs`): one player click or one dispenser shot, no hot path.
+  Named tags read by `TagId` (3 added: corals, nylium, wall fans), no list allocated (tag
+  members read in place for the draws). Bone meal in water: 128 attempts at most, like the
+  game; multi-core and GPU not applicable (single piece of work, ordered by the world's random
+  draws).
+- Features placed by name loaded in every decorator (29 features + `grass_bonemeal`): decorator
+  construction of a flat world 2.86 ms without, 2.88 ms with (best of 5, one pass each): under
+  the noise, kept (without them, saplings and bone meal failed outside the biomes that cite
+  them).
+- Placing a feature in the live world (sapling tree, bone meal, `place feature`), 9 chunks of
+  packed sections (bench `bench_g6f07_deco_copy_and_compare`, `--ignored`, best of 30 alternated
+  rounds, a client building alongside): copy of the world into the region 1.34 ms cell by cell,
+  0.11 ms by unpacking one pass per section (`unpack_into`); region / world comparison 3.90 ms
+  by reading every cell of the world, 0.12 ms section against section (an identical section
+  skipped by one slice comparison). A complete oak placement 3.30 ms after (about 8.3 ms before,
+  by difference). Kept: same result (copied states identical, same cells written apart from the
+  planted fungus; tests `w8b` and G6-F07). The comparison made before the replay of the breaks
+  is also the fidelity fix (cells not touched by the feature are left to the world). The rest
+  of the placement is not broken down (heightmaps of the 9 copies, biome conversion, the
+  feature itself): a lead to measure on a quiet machine. Multi-core and GPU not applicable
+  (under a tenth of a millisecond per chunk, order fixed by the world's random draws). No
+  switch: the old read is not a lead worth keeping (slower on both measurements, same output).
+  Two other ways to know which cells the feature changed, not built: a snapshot of the original
+  copy (3.5 MB more per placement, one more copy) and a mask held by each write of the region
+  (one more write on the hot path of the decoration of every generated chunk); at best they
+  would save the 0.12 ms of the comparison, against a memory cost or a cost on generation: to
+  measure on a quiet machine if feature placement becomes a hot spot.
+- Client prediction (`apps/client/src/bone_meal_use.rs`): a few block reads per click (lichen:
+  6 × 6 × 3 attempts at most; bamboo: 32 cells at most); face masks computed on demand from the
+  single shape read (`rc_sim::shape_face_full`), no table; not measured separately (one click).
+## G5-F02c: fall (wind charge, per-block rules, multiplier, sound, dust) (25/10, loaded machine)
+
+- Player's impulse context: two fields in `Vitals` (impact point, grace), one decrement per
+  tick, one test at landing. Clearing after each movement: immediate exit without a context
+  (almost all movements: two comparisons); with a context, the only test that reads the world
+  (liquid at the feet) is evaluated last. Not measured separately: a few nanoseconds per
+  movement, out of reach of a scene bench.
+- Block dust and sound: computed at landing only (one state read, one particle packet; the
+  game sends the same packet, 40 to 375 shards drawn by the client). The particle registry is
+  walked by name at each send (~100 entries, once per landing): off the hot path, kept.
+  Multi-core and GPU not applicable (rare events, packet order detectable by the client).
+- Block sound: the sound group lookup is shared between player and mobs
+  (`block_fall_sound_at`), without any more copying than before (name cloned once per sound,
+  as before).
+- "New world" and "mechanisms" fingerprints changed by the sole key
+  `current_impulse_context_reset_grace_time` of the player file (checked by removing it):
+  intended behavior (the game always writes it).
+
+## G5-F02a: crossed-block pass of players and mobs (25/10, loaded machine)
+
+- Crossed-block pass (`rc_sim::inside_blocks`, player and mobs, every tick): bench
+  `g5f02a_bench` (loaded machine, 2 runs, 200,000 passes): standing cow 96 to 101 ns,
+  walking (0.2/tick) 201 to 208 ns; the old name-based "powder snow" scan that it
+  replaces cost 31 to 32 ns (the pass also covers fire, cactus, campfire, water, lava, rain).
+  Leads: state record read directly instead of the view (2 Arc): 106 -> 96..101 ns, kept;
+  reused buffers (no allocation in steady state); rain tested only if the entity is
+  burning. Multi-core and GPU not applicable (work of the order of 0.1 µs per entity,
+  sequential effects). To re-measure on a quiet machine on the scenes with mobs.
+  Cells already seen by the traversal (shared with ghast flight, the happy ghast and portals):
+  the linear list first retained is quadratic for big boxes (4 × 4 × 4 ghast: hundreds of
+  cells, not "a few dozen"). Replaced by a bit mask over the bounding box of the path (one-cell
+  margin, fallback list beyond 2^18 cells or outside the box). Bench `g5f02a_bench` (loaded
+  machine, 2,000 traversals): ghast path (14.3, 6.1, −11.7) 865 µs -> 18.7 µs; (5, 2, 6)
+  299 -> 11.5 µs; 1 block 25.6 -> 2.8 µs; 0.2 block 9.6 -> 2.0 µs. Walking cow (small box),
+  2 alternating runs: mask 277 / 233 ns, list 288 / 236 ns (noise). Identical output:
+  `seen_mask_matches_linear_list` (3,000 paths, stored sum). The list stays behind
+  `RUSTCRAFT_OPT_INSIDE_SEEN_LINEAR` until the quiet-machine bench. Starting hash set not
+  re-measured (the mask avoids hashing; to compare on a quiet machine).
+  Follow-up 2 (state specific to each LAN player, mob rotation): no in-game speed lead. A
+  guest install swaps 4 more fields (movement list, position at the last pass, opened
+  container, tracked equipment) among the sixty or so already swapped; the rotation of a mob
+  by command does less than before (no more position copy, path stop or forced sync). Not
+  measured: no bench scene has a guest or a rotation by command.
+## G5-F02b: entity bodies (25/10, loaded machine, to re-measure when idle)
+
+- Block stepped on (magma, redstone ore), every tick for every mob on the ground: effect cell
+  reused from the last movement when the position and the support have not changed
+  (`RUSTCRAFT_OPT_STEPON_CACHE`, default 1) instead of recomputing it (support read: fence,
+  wall, fence gate by tag and by name). Bench `bench_tick_additions` (2 alternated passes,
+  2,000,000 calls, zombie standing on stone with a support): 13.3 / 13.3 ns with the cache,
+  65.6 / 59.4 ns without; kept. Equivalence: test `magma_and_ore_stepped_on` (reused cell =
+  recomputed cell). The rest (state read, comparison of three identifiers) is the minimum.
+- Size reading (refit after growth), twice per tick and per mob: 6.8 to 12 ns (two width ×
+  height pairs, no allocation). The search for the free center (the game's shapes) only runs
+  on growth (growing up, placement), a few times in a mob's life: multi-core and GPU not
+  applicable.
+- Team filter of the push: short-circuited as long as no team has a rule other than "always";
+  otherwise a team lookup for each neighbor that touches. Review: "member → (team rank, rule)"
+  index in the scoreboard (`CollisionIndex`, built on first use after a team change, members
+  with a canonical UUID keyed by UUID: no UUID string recreated and no walk over the members),
+  `RUSTCRAFT_OPT_TEAMIDX=0` for the old walk. Bench `bench_team_push` (loaded machine, 2
+  alternated passes, 200,000 calls, mob among 20 neighbors outside any team, "never" team of
+  300 members): 2,151 / 2,053 ns with the index, 18,146 / 19,146 ns with the walk (×8.8);
+  kept. Without a team, push with no neighbor 11.3 to 11.6 ns in both cases. Memory: one
+  entry per member, only when a rule is active. Equivalence: test `collision_rule_index` (index
+  = linear search, first registered wins, index rebuilt after a leave and a rule change);
+  fingerprints identical with the switch at 0 and at 1.
+- Effect cell of the block stepped on, reused only in the tick of its computation (a mob
+  without AI does not move but steps on its block every tick): 14.1 to 14.7 ns against 13.3 ns
+  before (noise, one more integer comparison), same bench.
+- Block step sound: one copy of the sound name per step (no more than one per block walked),
+  like the existing fall sound; amethyst chime without allocation.
+- Entity sound seed drawn from the sound generator (atomic SplitMix64) instead of the world
+  random source: equivalent cost; world fingerprints changed (intended fix, see the commit).
+  In tests, a fixed per-thread sequence (distinct from the test seeds of the other generators):
+  sound packets no longer depend on the clock (protocol A1), test `sound_seeds_reproducible`.
+- Dolphin jump and follow: direction of the yaw (`mth::facing`, a four-entry table) instead of
+  the direction closest to the velocity (six dot products): slightly less computation,
+  behavior fixed; fingerprints unchanged.
+## G5-F02e: contacts with crossed blocks, enchanted boots (25/10, loaded machine)
+
+- Walk over the cells swept by a mob (`rc_sim::contact`, one-axis segments, cells deduplicated
+  in a reused vector, contact family read from a one-byte-per-block table built once): 78.6 ns
+  per tick and per mob in open air, 79.1 ns in a cobweb (bench `bench_mob_contacts`, best of
+  5 × 100,000); 500 mobs ≈ 40 µs per tick. No allocation per tick. Leads not retained for lack
+  of gain at this scale: skipping the walk of a motionless mob (the changes of blocks around it
+  would have to be tracked), spreading over several cores (the effects modify the world, game
+  order imposed), GPU not applicable. To re-measure on a quiet machine (scene with many mobs).
+- Player: one walk per tick (same costs); boots without Frost Walker or Soul Speed: immediate
+  exit, no query to the world.
+- Items and orbs (revision of 25/10): the deferral to the end of the list counted every item at
+  its end-of-tick position (difference on the weighted plate). Replaced by a contact right after
+  the movement of each item, the plate reading a copy of the positions (reused vector, filled
+  once per tick: a 32-byte copy per item, no allocation in steady state). Projectiles: contact
+  in the movement step, before the impact. Tripwire: swept box tested against its shape (six
+  comparisons per segment, only in a tripwire cell). Mob bench after the revision: 77.3 ns in
+  open air, 82.7 ns in a cobweb (noise of the loaded bench, same order as before). To
+  re-measure on a quiet machine (scene with many items).
+- Revision 2 (25/10 evening, loaded machine, best of 5 × 100,000, A/B alternated against HEAD):
+  exact game walk (straight line for projectiles, per-axis segments otherwise, cap of 16
+  iterations), fire and lava of projectiles on this walk. Correction alone, no lead: mob
+  82-83 ns (before 73-74), arrow step 329-338 ns (before 224-226) in open air in the section
+  of a row of plates, 546-552 ns right at the plates (before 393-394). Leads, each measured
+  alone then combined:
+  - contact family read from the table without copying the view (two atomic counters per
+    cell): mob 75-76 ns, arrow 287 ns. Kept.
+  - portals: ids held by the table instead of three lookups by name, block read without
+    copying the view (also in the palette scan): 65 → 24 ns per call (arrows, falling blocks,
+    TNT). Kept.
+  - walk through static dispatch (generic) instead of dynamic visit functions: walk alone
+    156 → 147 ns (6 cells). Kept.
+  - dedupe of the walk by a bit grid over the envelope (instead of a search in the list): walk
+    184 → 200-202 ns, loses. Kept behind `RUSTCRAFT_OPT_WALKGRID=1` (off by default) for the
+    quiet-machine bench.
+  - floor by integer truncation instead of `f64::floor`: loses (mob 82 ns against 72-74, walk
+    183-188 against 163-168, 3 alternated passes). Discarded: a switch would cost on every
+    call; to re-measure on a quiet machine.
+  - skipping the empty: scan of the palettes of the crossed sections (plate, tripwire, fire,
+    lava, wooden button families) before any walk. Empty section 44 ns against 254-260 without,
+    rich section (about forty states) 102 against 286-292; section with plates: +10 ns (273
+    against 262-264, 453-457 against 438-446). Kept, `RUSTCRAFT_OPT_CONTACTPAL=0` disables it.
+  - same scan for mobs: empty section 30 ns against 74, rich section 58 against 75, but +20 to
+    27 ns when the section has a contact block (open air near a cobweb 95-103 against 73-77, in
+    the cobweb 99-105 against 75-79). Gain depends on the scene: kept off,
+    `RUSTCRAFT_OPT_CONTACTPAL_MOBS=1` enables it, to be settled on the quiet-machine scenes.
+  Total retained against HEAD (2 alternated passes): mob 74-75 ns against 75-78 in open air, 73
+  against 76-78 in a cobweb; arrow in an empty section 45 ns against 222-225, rich section
+  103-106 against 463-466; section with plates 268-271 against 224-228 and 449 against 390-398
+  right at the plates (+14 to 19%: cost of the exact walk, 150 to 180 ns, that fidelity
+  requires; the other leads gain nothing there). A single thread (game order imposed, effects
+  on the world), GPU not applicable. No allocation per tick outside nearby portals. To
+  re-measure on a quiet machine (bow shooting scenes, Nether).
+- Player thorns, armor wear and protections (G5-F02d, `rc_sim::thorns`, `vitals.rs`): event code
+  (one hit received), never in a per-tick loop. Thorns: six slots read, one random draw per
+  enchanted item, no allocation; wear: one `equippable` component read per piece and per hit
+  (JSON copy of a few fields, of the order of a microsecond, not measured separately); protection:
+  a tag test up front that avoids walking the four pieces for `/kill` and the void.
+  Multi-core and GPU not applicable (order of the random draws imposed, work of the order of one hit).

@@ -41,8 +41,9 @@ impl Server {
             .map(|i| i as i32)
     }
 
-    /// Sound played by a mob (seed drawn from the world's random source): nothing, and no seed drawn, if
-    /// it is silent (`Silent`); the callers' pitch draws are still made.
+    /// Sound played by a mob: nothing if it is silent (`Silent`); the callers' pitch
+    /// draws are still made. The seed comes from the sound-only generator, like the official game: a
+    /// sound never shifts the world's random source (spawns, finalizations).
     pub(crate) fn mob_sound(&mut self, m: &Mob, name: &str, volume: f32, pitch: f32) {
         if m.x.silent {
             return;
@@ -52,7 +53,7 @@ impl Server {
 
     /// Sound played by the world at a mob's position: heard even if it is silent.
     pub(crate) fn mob_sound_unmuted(&mut self, m: &Mob, name: &str, volume: f32, pitch: f32) {
-        let seed = self.mobs.rng.next_long();
+        let seed = crate::vitals::sound_seed();
         let Some(id) = self.sound_id(name) else { return };
         let category = Self::mob_sound_source(m);
         let _ = self.send(Event::Sound(SoundPacket {
@@ -104,7 +105,7 @@ impl Server {
     /// Sound attached to an entity: the client makes it follow
     /// the entity (`sound_entity` packet).
     pub(crate) fn entity_sound(&mut self, id: i32, name: &str, category: i32, volume: f32, pitch: f32) {
-        let seed = self.mobs.rng.next_long();
+        let seed = crate::vitals::sound_seed();
         let Some(sid) = self.sound_id(name) else { return };
         let _ = self.send(Event::Sound(SoundPacket {
             sound: SoundRef::Id(sid),
@@ -118,7 +119,7 @@ impl Server {
     }
 
     pub(crate) fn world_sound(&mut self, name: &str, category: i32, pos: [f64; 3], volume: f32, pitch: f32) {
-        let seed = self.mobs.rng.next_long();
+        let seed = crate::vitals::sound_seed();
         let Some(id) = self.sound_id(name) else { return };
         let _ = self.send(Event::Sound(SoundPacket {
             sound: SoundRef::Id(id),
@@ -267,6 +268,10 @@ impl Server {
         // Tag `fall_damage_immune`: the game computes no fall damage, hence no hit
         // (nor species hook: the wither does not arm block destruction).
         if ty == "minecraft:fall" && m.kind.info().fall_immune {
+            return false;
+        }
+        // G5-F02e: Frost Walker, immunity to hot-floor damage.
+        if self.frost_walker_immune(m.equipment[2].as_ref(), ty) {
             return false;
         }
         // F14: linked creaking (damage diverted to its heart), buried warden, breeze among themselves.
@@ -956,6 +961,10 @@ impl Server {
                 m.vel[0] *= 0.6;
                 m.vel[2] *= 0.6;
             }
+            // G5-F02d: the victim's thorns, before the attacker's weapon effects.
+            if t == Ent::Player {
+                self.player_thorns(m);
+            }
             // S7: fire aspect (after-hit effect: 4 s per level, without shortening a fire in progress).
             if fire_aspect > 0 {
                 let ticks = 80 * fire_aspect;
@@ -966,9 +975,8 @@ impl Server {
                     Ent::Mob(id) => {
                         if let Some(i) = self.mob_index(id)
                             && let Some(o) = self.mobs.list[i].as_mut()
-                            && o.fire < ticks
                         {
-                            o.fire = ticks;
+                            crate::inside_blocks::mob_ignite(o, ticks);
                         }
                     }
                 }
@@ -1221,8 +1229,8 @@ impl Server {
             // in progress), Bane of Arthropods slowness.
             if let Some(w) = &weapon {
                 let ticks = 80 * self.life.items.enchantment(w, "minecraft:fire_aspect");
-                if ticks > 0 && m.fire < ticks {
-                    m.fire = ticks;
+                if ticks > 0 {
+                    crate::inside_blocks::mob_ignite(m, ticks);
                 }
             }
             self.bane_slowness(weapon.as_ref(), m);

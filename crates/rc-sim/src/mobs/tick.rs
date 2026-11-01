@@ -8,6 +8,44 @@ use super::mth::{DEG, degrees_difference, pitch_to, rotate_if_necessary, rotate_
 use super::species::Kind;
 use crate::server::Server;
 
+/// Entity walk of the server tick: from the first mob to the clouds. The game does not see, in
+/// this walk, an entity that is added to it: its first tick happens on the next server tick. Our
+/// lists tick one after the other (mobs, spits, fangs, bolts, minecarts, projectiles, clouds);
+/// an entity born during the walk therefore carries its number, and the list that meets it in
+/// that same walk skips it. Born after its list's tick (a spit launched from a minecart), it is
+/// no longer skipped on the next tick.
+#[derive(Debug, Default)]
+pub(crate) struct Walk {
+    /// Walks started.
+    count: u64,
+    /// Number of the walk in progress, 0 outside the walk.
+    now: u64,
+}
+
+impl Walk {
+    /// Start of the walk, right before the first mob (frozen included: the player's mount
+    /// still ticks).
+    pub(crate) fn start(&mut self) {
+        self.count += 1;
+        self.now = self.count;
+    }
+
+    /// End of the walk, after the projectiles and the clouds.
+    pub(crate) fn end(&mut self) {
+        self.now = 0;
+    }
+
+    /// Mark of an entity created now: the number of the walk in progress, 0 outside.
+    pub(crate) fn born(&self) -> u64 {
+        self.now
+    }
+
+    /// True for an entity born during the walk in progress: its tick waits for the next one.
+    pub(crate) fn waits(&self, born: u64) -> bool {
+        born != 0 && born == self.now
+    }
+}
+
 impl Server {
     /// Tick of the mobs (after the player's life, before the block broadcast).
     /// Parts of the tick specific to the current player (host, or guest set up by `as_guest`).
@@ -52,6 +90,8 @@ impl Server {
             self.bells_tick(); // rung bells: resonance, raiders glowing
         }
         let player_vehicle = self.mobs.mounts.riding.vehicle;
+        // Start of the entity walk; it ends after the projectiles and the clouds.
+        self.walk.start();
         // Snapshot: mobs added during this tick wait for the next.
         let n = self.mobs.list.len();
         for i in 0..n {
@@ -177,6 +217,9 @@ impl Server {
         super::sealife::pre_tick(self, m); // F09: pufferfish inflation
         super::brainy::pre_tick(self, m); // F10: sniffer seed
         super::nether::pre_tick(self, m); // F12: strider sounds and cold
+        if m.kind == Kind::Pig {
+            super::nether::strider::steer_tick(self, m); // carrot on a stick in hand?
+        }
         super::recent::pre_tick(self, m); // F14: creaking heart, warden vibrations, breeze random draw
         // Cubes: sulfur cube fuse, crushing; then common tick and landing.
         if m.kind.is_cube() {
@@ -192,12 +235,15 @@ impl Server {
 
     /// Common tick of a living entity.
     fn tick_living(&mut self, m: &mut Mob) {
+        // Growth since the last tick (command, interaction): refit.
+        self.mob_refit(m);
         // Common tick.
         m.old = m.pos;
         super::piglins::spear::compute_speed(m); // known speed
         m.pitch_o = m.pitch;
         m.head_yaw_o = m.head_yaw;
         m.tick_count += 1;
+        self.mob_boots_tick_effects(m); // G5-F02e: Soul Speed particles and sound
         // Base tick of the entity (F06: iron golem run particles first).
         self.golem_base_tick(m);
         m.was_eyes_in_water = m.eyes_in_water;
@@ -209,8 +255,7 @@ impl Server {
             self.mob_splash(m, vel);
         }
         super::aquatic::update_swimming(self, m); // F08: drowned swimming
-        let fire_immune = m.kind.info().fire_immune || super::recent::fire_immune(m);
-        if m.fire > 0 && fire_immune {
+        if m.fire > 0 && crate::inside_blocks::mob_fire_immune(m) {
             m.fire = 0;
         } else if m.fire > 0 {
             if m.fire % 20 == 0 && m.lava_height <= 0.0 {
@@ -218,18 +263,18 @@ impl Server {
             }
             m.fire -= 1;
         }
-        if m.lava_height > 0.0 && fire_immune {
+        // Lava cushions the fall; its ignition and damage come from the crossed-block pass,
+        // after the movement.
+        if m.lava_height > 0.0 {
             m.fall_distance *= 0.5;
-        } else if m.lava_height > 0.0 {
-            m.fall_distance *= 0.5;
-            if m.fire < 300 {
-                m.fire = 300;
-            }
-            self.mob_hurt(m, "minecraft:lava", 4.0, None, None);
         }
         if m.pos[1] < f64::from(self.dim.height.min_y - 64) {
             m.removed = true;
             return;
+        }
+        // G4-F07a: lead (end of the entity's base tick).
+        if m.leash.is_some() {
+            self.leash_tick(m);
         }
         // Base tick of the living entity.
         if m.alive() {
@@ -270,6 +315,7 @@ impl Server {
                 m.air =
                     super::brainy::max_air(m).map_or_else(|| super::sealife::increase_air(m), |x| (m.air + 4).min(x));
             }
+            self.mob_boots_location(m); // G5-F02e: Frost Walker, Soul Speed
         }
         if m.hurt_time > 0 {
             m.hurt_time -= 1;
@@ -395,6 +441,7 @@ impl Server {
         if m.kind == Kind::Wolf {
             self.wolf_shake_tick(m);
         }
+        self.mob_refit(m); // growth during the tick (growing up, placement)
     }
 
     fn ambient_interval(&self, m: &Mob) -> i32 {
@@ -517,12 +564,16 @@ impl Server {
                 self.mob_travel(m);
             }
         }
-        // Block effects after the movement: without current fire, the counter returns to 0
-        // (a negative fire re-read lasts only one tick; only the player keeps −20).
-        if m.fire < 0 && !m.removed && !super::illagers::no_physics(m) {
-            m.fire = 0;
-        }
-        self.mob_freezing(m); // freezing in powder snow
+        self.mob_step_on(m); // block stepped on (magma, redstone ore), before the blocks passed through
+        // Effects of the crossed blocks after the movement (fire, cactus, campfire, powder
+        // snow, water, lava, rain); without current fire, the counter returns to 0.
+        let in_snow = if !m.removed && !super::illagers::no_physics(m) {
+            self.inside_blocks(&mut crate::inside_blocks::Who::Mob(m)).in_powder_snow
+        } else {
+            m.inside.clear();
+            false
+        };
+        self.mob_freezing(m, in_snow); // freezing in powder snow
         self.mob_push_entities(m);
         if m.kind.info().water_sensitive && self.mob_in_water_or_rain(m) && m.alive() {
             self.mob_hurt(m, "minecraft:drown", 1.0, None, None);

@@ -34,10 +34,20 @@ fn hostile(k: Kind) -> bool {
     )
 }
 
-/// Does the species' movement emission produce sounds (swim, step)? Guardians, bats,
-/// silverfish and endermites only emit events.
+/// Does the species' movement emission produce sounds (swim, step, chime)? Guardians, bats,
+/// silverfish, endermites, squids and breezes only emit events.
 pub fn emits_sounds(k: Kind) -> bool {
-    !matches!(k, Kind::Guardian | Kind::ElderGuardian | Kind::Bat | Kind::Silverfish | Kind::Endermite)
+    !matches!(
+        k,
+        Kind::Guardian
+            | Kind::ElderGuardian
+            | Kind::Bat
+            | Kind::Silverfish
+            | Kind::Endermite
+            | Kind::Squid
+            | Kind::GlowSquid
+            | Kind::Breeze
+    )
 }
 
 /// Swim sound of the species.

@@ -664,8 +664,30 @@ fn strider(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
     }
 }
 
+/// Delay between two warden heartbeats: 40 − ⌊clamp(anger / 80) × 30⌋ ticks.
+fn warden_heart_delay(e: &Entity) -> u32 {
+    let anger = (e.meta_int(16).unwrap_or(0) as f32 / 80.0).clamp(0.0, 1.0);
+    40 - (anger * 30.0).floor() as u32
+}
+
+/// The warden's heart beat on this tick (counter reset to 10 by `tick`).
+pub(crate) fn warden_beat(e: &Entity) -> bool {
+    e.kind == "warden" && e.extra[10] == 10.0
+}
+
+/// Ticks elapsed since the start of the current dig (14) or emerge (13) pose, if it has
+/// started (starts 5 and 6 of `tick`).
+pub(crate) fn warden_dig_ticks(e: &Entity) -> Option<f32> {
+    let slot = match e.pose() {
+        13 => 6,
+        14 => 5,
+        _ => return None,
+    };
+    State::start_of(e.extra[slot]).map(|s| e.age as f32 - s)
+}
+
 /// Warden: extra 0 pose seen (key), 1-2 tentacles (10..0), starts 3 attack, 4 sonic boom,
-/// 5 dig, 6 emerge, 7 roar, 8 sniff.
+/// 5 dig, 6 emerge, 7 roar, 8 sniff, 9-10 heart (10..0, current then old).
 fn warden(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     p.set("head", |h| {
         h[3] = s.pitch;
@@ -1169,22 +1191,47 @@ pub(super) fn shadow(k: &str) -> Option<(f32, f32)> {
     Some((r, 1.0))
 }
 
-/// Gaussian draw (Box-Muller) on a shared xorshift generator: the shaking is
-/// random each frame, with no seed to reproduce.
-fn gaussian() -> f64 {
+/// Uniform draw in ]0, 1] on a shared xorshift generator (purely visual effects, with no seed to
+/// reproduce).
+fn uniform() -> f64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static STATE: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
-    let next = || {
-        let mut x = STATE.load(Ordering::Relaxed);
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        STATE.store(x, Ordering::Relaxed);
-        // 53 useful bits, in ]0, 1].
-        ((x >> 11) as f64 + 1.0) / (1u64 << 53) as f64
-    };
-    let (u, v) = (next(), next());
+    let mut x = STATE.load(Ordering::Relaxed);
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    STATE.store(x, Ordering::Relaxed);
+    // 53 useful bits, in ]0, 1].
+    ((x >> 11) as f64 + 1.0) / (1u64 << 53) as f64
+}
+
+/// Gaussian draw (Box-Muller): the shaking is random each frame.
+fn gaussian() -> f64 {
+    let (u, v) = (uniform(), uniform());
     (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
+}
+
+/// Creaking tearing itself down (value 18): no death tilt and no red overlay, blinking eyes.
+pub(super) fn creaking_tearing(e: &Entity) -> bool {
+    e.kind == "creaking" && e.meta_bool(18)
+}
+
+/// Eyes of the creaking (`extra[5]` lit, `extra[6]` next toggle): when the death counter exceeds
+/// the next toggle, they toggle and the following one falls 2 to 8 ticks later if they were lit,
+/// t/4 to t/2 otherwise. Only used by the render while it tears itself down.
+fn creaking_blink(e: &mut Entity) {
+    let t = e.death_time;
+    if t as f32 > e.extra[6] {
+        let lit = e.extra[5] != 0.0;
+        let (lo, hi) = if lit { (2, 8) } else { (t / 4, t / 2) };
+        e.extra[6] = (t + int_between(lo, hi)) as f32;
+        e.extra[5] = if lit { 0.0 } else { 1.0 };
+    }
+}
+
+/// Uniform integer in [lo, hi] (hi >= lo).
+fn int_between(lo: i32, hi: i32) -> i32 {
+    lo + ((uniform() * f64::from(hi - lo + 1)) as i32).min(hi - lo)
 }
 
 /// Render offset of the "creepy" enderman (value 17): each frame, a Gaussian draw
@@ -1208,9 +1255,17 @@ pub(super) fn tick(e: &mut Entity) {
         "warden" => {
             let pose = e.pose();
             let start = e.age as f32 - 1.0;
+            // Heart: 10 at a tick that is a multiple of the delay (current anger), then counted
+            // down; the old value is taken after the reset to 10 (9 and 10 on the beat tick).
+            let beat = e.age.is_multiple_of(warden_heart_delay(e));
             let x = &mut e.extra;
+            if beat {
+                x[9] = 10.0;
+            }
             x[2] = x[1];
             x[1] = (x[1] - 1.0).max(0.0);
+            x[10] = x[9];
+            x[9] = (x[9] - 1.0).max(0.0);
             if changed(&mut x[0], pose) {
                 let slot = match pose {
                     13 => 6,
@@ -1236,6 +1291,7 @@ pub(super) fn tick(e: &mut Entity) {
             let invulnerable = x[4] > 0.0;
             State::animate_when(&mut x[1], invulnerable, age);
             State::animate_when(&mut x[2], tearing, age);
+            creaking_blink(e);
         }
         "breeze" => {
             let pose = e.pose();
@@ -1295,7 +1351,9 @@ pub(super) fn tick(e: &mut Entity) {
 }
 
 /// Copper golem (state in 17: 0 inactive, 1-4 interactions); AI off (15 & 1): nothing.
+/// Extra 6: head spin sound due at this tick (10 ticks after the animation starts).
 fn tick_copper_golem(e: &mut Entity) {
+    e.extra[6] = 0.0;
     if e.meta_byte(15) & 1 != 0 {
         return;
     }
@@ -1314,6 +1372,7 @@ fn tick_copper_golem(e: &mut Entity) {
             x[1] = age + wait;
         }
         if age == x[1] + 10.0 {
+            x[6] = 1.0;
             x[1] = 0.0;
         }
     } else {
@@ -1389,26 +1448,48 @@ fn tick_squid(e: &mut Entity) {
 }
 
 /// Guardian (§ 12.2): 0-1 tail, 2 tail speed, 3-4 spines, 5 attack time,
-/// 6 last target (bits), 7 initialised. Always assumed in water (air supply has no effect).
+/// 6 last target (bits), 7 initialised, 8 touched the ground (fell onto a solid block), 9 block
+/// under it is solid (noted before the tick by `water_track`), 10 flop sound due at this tick.
+/// Water: box contact noted before the tick (`water_track`). Dead: nothing moves.
 fn tick_guardian(e: &mut Entity) {
+    e.extra[10] = 0.0;
+    if e.death_time > 0 {
+        return;
+    }
     let moving = e.meta_bool(16);
     let target = e.meta_int(17).unwrap_or(0);
     let dur = if e.kind == "elder_guardian" { 60.0 } else { 80.0 };
     if e.extra[7] == 0.0 {
         e.extra[7] = 1.0;
-        e.extra[0] = rand01(e, 2) * 10.0;
+        e.extra[0] = rand01(e, 2);
         e.extra[1] = e.extra[0];
     }
+    let (water, vy, silent) = (e.in_water, e.velocity[1], e.meta_bool(4));
+    // Spines out of water: a fresh draw every tick (visual only, reproducible randomness).
+    let jitter = rand01(e, e.age ^ 0x5bd1_e995);
     let x = &mut e.extra;
     x[1] = x[0];
-    if moving {
+    if !water {
+        // Out of water: fast tail; flop when it bounces back up after touching the ground.
+        x[2] = 2.0;
+        if vy > 0.0 && x[8] != 0.0 && !silent {
+            x[10] = 1.0;
+        }
+        x[8] = f32::from(u8::from(vy < 0.0 && x[9] != 0.0));
+    } else if moving {
         x[2] = if x[2] < 0.5 { 4.0 } else { x[2] + (0.5 - x[2]) * 0.1 };
     } else {
         x[2] += (0.125 - x[2]) * 0.2;
     }
     x[0] += x[2];
     x[4] = x[3];
-    x[3] += if moving { -x[3] * 0.25 } else { (1.0 - x[3]) * 0.06 };
+    x[3] = if !water {
+        jitter
+    } else if moving {
+        x[3] - x[3] * 0.25
+    } else {
+        x[3] + (1.0 - x[3]) * 0.06
+    };
     if x[6].to_bits() != target as u32 {
         x[6] = f32::from_bits(target as u32);
         x[5] = 0.0;
@@ -1418,8 +1499,9 @@ fn tick_guardian(e: &mut Entity) {
     }
 }
 
-/// Cube mobs (§ 13.1): 0-1 squash, 2 target, 3 on ground at the previous tick; sulfur:
-/// 4 fuse, 5 last fuse received (bits), 6 received.
+/// Cube mobs (§ 13.1): 0-1 squash, 2 target, 3 on ground at the previous tick, 7 landed at this
+/// tick (landing particles, `entity_fx`); sulfur: 4 fuse, 5 last fuse received (bits),
+/// 6 received.
 fn tick_cube(e: &mut Entity) {
     let magma = e.kind == "magma_cube";
     let sulfur = e.kind == "sulfur_cube";
@@ -1430,6 +1512,7 @@ fn tick_cube(e: &mut Entity) {
     x[1] = x[0];
     x[0] += (x[2] - x[0]) * 0.5;
     let was = x[3] != 0.0;
+    x[7] = f32::from(u8::from(ground && !was));
     if ground && !was {
         x[2] = -0.5;
     } else if !ground && was {
@@ -1675,5 +1758,97 @@ mod tests {
         all.map.get_mut(&7).unwrap().passengers.push(8);
         let g = *part(&posed(&l, &all.map[&7], 0.0), "goggles");
         assert_eq!((g[3], g[1]), (0.0, 14.0));
+    }
+
+    /// Cubes: "landed at this tick" (extra 7) raised only at the tick where it touches the ground
+    /// after being in the air, for the landing particles. Before: nothing was noted.
+    #[test]
+    fn cube_landing_is_flagged_once() {
+        for kind in ["slime", "magma_cube", "sulfur_cube"] {
+            let mut all = spawn(kind);
+            all.tick();
+            assert_eq!(all.map[&7].extra[7], 0.0, "{kind}");
+            all.map.get_mut(&7).unwrap().on_ground = true;
+            all.tick();
+            assert_eq!(all.map[&7].extra[7], 1.0, "{kind}");
+            all.tick();
+            assert_eq!(all.map[&7].extra[7], 0.0, "{kind}");
+            all.map.get_mut(&7).unwrap().on_ground = false;
+            all.tick();
+            assert_eq!(all.map[&7].extra[7], 0.0, "{kind}");
+        }
+    }
+
+    /// Copper golem: head spin sound due 10 ticks after the idle animation starts, once per
+    /// cycle; never with AI off. Before: the counter was reset without a sound.
+    #[test]
+    fn copper_golem_head_spin_sound_is_due() {
+        let mut all = spawn("copper_golem");
+        let (mut start, mut sound) = (None, Vec::new());
+        for _ in 0..600 {
+            all.tick();
+            let e = &all.map[&7];
+            if State::start_of(e.extra[0]).is_some() && start.is_none() {
+                start = Some(e.age);
+            }
+            if e.extra[6] != 0.0 {
+                sound.push(e.age);
+            }
+        }
+        let start = start.expect("idle animation never started");
+        assert_eq!(sound.first(), Some(&(start + 10)), "{sound:?}");
+        assert!(sound.windows(2).all(|w| (200..=250).contains(&(w[1] - w[0]))), "{sound:?}");
+        let mut all = spawn("copper_golem");
+        all.map.get_mut(&7).unwrap().meta.insert(15, Meta::Byte(1));
+        for _ in 0..600 {
+            all.tick();
+            assert_eq!(all.map[&7].extra[6], 0.0);
+        }
+    }
+
+    /// Guardian out of water: tail at speed 2, spines drawn every tick, flop due at the tick where
+    /// it rises after falling onto a solid block (not if it is silent); in still water,
+    /// speed towards 0.125. Initial tail phase in [0, 1). Before: always assumed in water,
+    /// never a flop.
+    #[test]
+    fn guardian_out_of_water() {
+        let mut all = spawn("guardian");
+        let e = all.map.get_mut(&7).unwrap();
+        e.in_water = false;
+        e.extra[9] = 1.0;
+        e.velocity = [0.0, -0.1, 0.0];
+        all.tick();
+        let e = &all.map[&7];
+        assert!(e.extra[1] >= 0.0 && e.extra[1] < 1.0, "{}", e.extra[1]);
+        assert_eq!((e.extra[2], e.extra[8], e.extra[10]), (2.0, 1.0, 0.0));
+        let spikes = e.extra[3];
+        all.map.get_mut(&7).unwrap().velocity = [0.0, 0.5, 0.0];
+        all.tick();
+        let e = &all.map[&7];
+        assert_eq!((e.extra[8], e.extra[10]), (0.0, 1.0));
+        assert_ne!(e.extra[3], spikes);
+        assert!((0.0..1.0).contains(&e.extra[3]));
+        all.tick();
+        assert_eq!(all.map[&7].extra[10], 0.0);
+        // Silent: no flop.
+        let e = all.map.get_mut(&7).unwrap();
+        e.meta.insert(4, Meta::Bool(true));
+        e.velocity = [0.0, -0.1, 0.0];
+        all.tick();
+        all.map.get_mut(&7).unwrap().velocity = [0.0, 0.5, 0.0];
+        all.tick();
+        assert_eq!(all.map[&7].extra[10], 0.0);
+        // Block under it not solid: does not "touch" the ground.
+        let e = all.map.get_mut(&7).unwrap();
+        e.meta.insert(4, Meta::Bool(false));
+        e.extra[9] = 0.0;
+        e.velocity = [0.0, -0.1, 0.0];
+        all.tick();
+        assert_eq!(all.map[&7].extra[8], 0.0);
+        // In water, still: 2 -> 2 + (0.125 - 2) x 0.2.
+        let e = all.map.get_mut(&7).unwrap();
+        e.in_water = true;
+        all.tick();
+        assert!((all.map[&7].extra[2] - 1.625).abs() < 1e-6);
     }
 }

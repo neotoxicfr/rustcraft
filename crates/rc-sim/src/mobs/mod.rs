@@ -6,6 +6,7 @@ pub(crate) mod aquatic;
 pub(crate) mod arrows;
 mod bell;
 mod body;
+mod resize; // refit after the box grows
 pub(crate) mod fireballs;
 pub(crate) mod nether;
 pub(crate) mod brains;
@@ -22,6 +23,9 @@ pub(crate) mod illagers;
 pub(crate) mod index;
 pub(crate) mod interact; // G5-F03: name tag, egg, dyeing, cat and wolf
 pub(crate) mod jrand;
+pub(crate) mod leash; // G4-F07a: lead, fence knot
+#[cfg(test)]
+mod tests_leash;
 pub(crate) mod mob;
 pub(crate) mod mounts;
 pub(crate) mod mth;
@@ -36,8 +40,11 @@ pub(crate) mod species;
 mod structure_spawn; // F07: spawn lists of structures
 pub(crate) mod surface;
 mod tick;
+pub(crate) use tick::Walk;
 pub(crate) mod track;
 pub(crate) mod trades;
+/// Dye mixing, shared with the client's recipe book demonstration.
+pub use trades::apply_dyes;
 pub(crate) mod trial; // W9: cages, trial spawners, vaults
 pub(crate) mod variants;
 pub(crate) mod villager;
@@ -70,6 +77,10 @@ mod tests_g4f03;
 mod tests_g5f03;
 #[cfg(test)]
 mod tests_g5f03b;
+#[cfg(test)]
+mod tests_g4f07b;
+#[cfg(test)]
+mod tests_g5f02b;
 
 use rc_proto::Reader;
 use rc_proto::nbt::Nbt;
@@ -156,6 +167,8 @@ pub struct Mobs {
     /// Imposed Halloween day (tests, bench: `Server::halloween_override`); `None`: system
     /// local date, like the game.
     pub halloween: Option<bool>,
+    /// Buffers of the crossed-block pass (player and mobs).
+    pub(crate) inside: crate::inside_blocks::Scratch,
 }
 
 impl Default for Mobs {
@@ -198,6 +211,7 @@ impl Default for Mobs {
             wither: wither::WitherWorld::default(),
             bells: Vec::new(),
             halloween: Server::halloween_override(),
+            inside: Default::default(),
         }
     }
 }

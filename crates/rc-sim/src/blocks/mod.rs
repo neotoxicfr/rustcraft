@@ -7,6 +7,7 @@
 //! randomness are the server's, in the game's sequential order (§ 4.3).
 
 pub(crate) mod attach;
+pub(crate) mod bone_meal;
 pub(crate) mod dispense_behaviors;
 pub(crate) mod attack;
 pub(crate) mod campfire;
@@ -28,10 +29,12 @@ pub(crate) mod piston;
 pub(crate) mod piston_plan;
 pub(crate) mod placement;
 pub(crate) mod plant_rules;
+pub(crate) mod potent_sulfur;
 pub(crate) mod rails;
 pub(crate) mod sculk_sensor;
 pub(crate) mod redstone;
 pub(crate) mod shape;
+pub(crate) mod speleothem;
 pub(crate) mod table;
 pub(crate) mod ticks;
 
@@ -44,15 +47,25 @@ mod g6f01_tests;
 #[cfg(test)]
 mod g5f09_tests;
 #[cfg(test)]
+mod g5f02f_tests;
+#[cfg(test)]
+mod g5f02a_tests;
+#[cfg(test)]
 mod g4f10_tests;
 #[cfg(test)]
 mod g6f10_tests;
+#[cfg(test)]
+mod g6f09b_tests;
 #[cfg(test)]
 mod g6f06_tests;
 #[cfg(test)]
 mod g6f12_tests;
 #[cfg(test)]
 mod g6f23_tests;
+#[cfg(test)]
+mod g6f09a_tests;
+#[cfg(test)]
+mod g6f07_tests;
 
 pub(crate) use table::{Kind, Table};
 

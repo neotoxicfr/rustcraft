@@ -4,6 +4,20 @@
 use super::{Dir, Kind, P, above, add, below, flag, rel};
 use crate::server::Server;
 
+/// Rise of a box `bb` that touches the part gained by the shape of a block `p` (fractions
+/// `lo` → `hi` on each axis): raised by a block then lowered onto the new top, by at most one
+/// block; `None` if it does not touch that part.
+fn push_up_dy(bb: &rc_physics::Aabb, p: P, lo: [f64; 3], hi: [f64; 3]) -> Option<f64> {
+    let c = p.map(f64::from);
+    let (min, max) = ([0, 1, 2].map(|i| c[i] + lo[i]), [0, 1, 2].map(|i| c[i] + hi[i]));
+    if !(0..3).all(|i| bb.min[i] < max[i] && bb.max[i] > min[i]) {
+        return None;
+    }
+    let (top, raised) = (max[1], bb.min[1] + 1.0);
+    let offset = if top - 1.0e-7 <= raised { (top - raised).max(-1.0) } else { -1.0 };
+    Some(1.0 + offset)
+}
+
 /// Precipitation of a biome at a point (none, rain, snow).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Precip {
@@ -441,11 +455,11 @@ impl Server {
             }
             Kind::Farmland => {
                 if !self.can_survive(s, p) {
-                    self.turn_to_dirt(p);
+                    self.turn_to_dirt(p, None);
                 }
             }
             // Dirt path: turns back into dirt unconditionally on its tick.
-            _ if v.block(s) == self.bs.t.block_id("minecraft:dirt_path") => self.turn_to_dirt(p),
+            _ if v.block(s) == self.bs.t.block_id("minecraft:dirt_path") => self.turn_to_dirt(p, None),
             Kind::FrostedIce => self.frosted_ice_tick(s, p),
             // F05: full composter (level 7 → 8, "ready" sound).
             _ if self.state_name(s) == "minecraft:composter" && v.get_int(s, "level") == 7 => {
@@ -481,12 +495,23 @@ impl Server {
     }
 
     /// Farmland (or path) turned back into dirt: entities raised from 15/16 to 1, placement,
-    /// "block changed" event.
-    fn turn_to_dirt(&mut self, p: P) {
+    /// "block changed" event attributed to `src` (the entity trampling it; none on the tick).
+    pub(crate) fn turn_to_dirt(&mut self, p: P, src: Option<crate::mobs::mob::Ent>) {
         let dirt = self.v().default_state(self.bs.t.id.dirt);
         self.push_entities_up(p, 15.0 / 16.0, 1.0);
         self.set_update(p, dirt);
-        self.game_event_block("minecraft:block_change", p, None, Some(dirt));
+        self.game_event_block("minecraft:block_change", p, src, Some(dirt));
+    }
+
+    /// Rise of the mob being ticked, taken out of the list and therefore absent from
+    /// `push_entities_up`: same rule as for the other entities (the one trampling the farmland
+    /// is raised with them, before its fall damage).
+    pub(crate) fn push_mob_up(m: &mut crate::mobs::mob::Mob, p: P, lo: f64, hi: f64) {
+        if let Some(dy) = push_up_dy(&m.bbox(), p, [0.0, lo, 0.0], [1.0, hi, 1.0]) {
+            m.pos[1] += dy;
+            m.old = m.pos;
+            m.needs_sync = true;
+        }
     }
 
     /// Entities that touch the part gained by a block's collision shape (full width,
@@ -503,20 +528,11 @@ impl Server {
         if (0..3).any(|i| hi[i] <= lo[i]) {
             return;
         }
-        let (x, y, z) = (f64::from(p[0]), f64::from(p[1]), f64::from(p[2]));
-        let (min, max) = ([x + lo[0], y + lo[1], z + lo[2]], [x + hi[0], y + hi[1], z + hi[2]]);
-        let top = y + hi[1];
         for e in self.all_ents() {
             if matches!(e, E::Player) && self.game_mode == 3 {
                 continue;
             }
-            let bb = self.e_bbox(e);
-            if !(0..3).all(|i| bb.min[i] < max[i] && bb.max[i] > min[i]) {
-                continue;
-            }
-            let raised = bb.min[1] + 1.0;
-            let offset = if top - 1.0e-7 <= raised { (top - raised).max(-1.0) } else { -1.0 };
-            let dy = 1.0 + offset;
+            let Some(dy) = push_up_dy(&self.e_bbox(e), p, lo, hi) else { continue };
             match e {
                 E::Player => self.teleport_up(dy),
                 E::Mob(i) => {
@@ -698,7 +714,7 @@ impl Server {
                         let ns = self.v().set_int(s, "moisture", moisture - 1);
                         self.set_block(p, ns, flag::CLIENTS);
                     } else if !self.maintains_farmland(p) {
-                        self.turn_to_dirt(p);
+                        self.turn_to_dirt(p, None);
                     }
                 } else if moisture < 7 {
                     let ns = self.v().set_int(s, "moisture", 7);
@@ -731,6 +747,7 @@ impl Server {
             Kind::GrowingHead { up } => self.growing_random_tick(s, p, up),
             Kind::ChorusFlower => self.chorus_flower_random_tick(s, p),
             Kind::BuddingAmethyst => self.budding_amethyst_random_tick(p),
+            Kind::Speleothem { dripstone } => self.speleothem_random_tick(s, p, dripstone), // G6-F09a
             _ => {
                 let n = self.data.block_of(s).map_or("", |x| x.name.as_str());
                 if n == "minecraft:redstone_ore" || n == "minecraft:deepslate_redstone_ore" {

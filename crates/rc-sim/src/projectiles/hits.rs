@@ -107,8 +107,8 @@ impl Server {
                 let Some(i) = self.mob_index(id) else { return 0 };
                 let Some(m) = self.mobs.list[i].as_mut() else { return 0 };
                 let old = m.fire;
-                if !m.kind.info().fire_immune && old < ticks {
-                    m.fire = ticks;
+                if !m.kind.info().fire_immune {
+                    crate::inside_blocks::mob_ignite(m, ticks);
                 }
                 old
             }
@@ -225,6 +225,9 @@ impl Server {
             // F15: a dragon part is not a living entity (neither knockback nor effects).
             if self.target_kind(t) != Some(Kind::EnderDragon) {
                 self.arrow_knockback(p, t);
+                if t == Ent::Player {
+                    self.player_thorns_by(owner); // G5-F02d: thorns on the shooter
+                }
                 self.arrow_post_hurt(p, t);
                 // S9: `killed_by_arrow`. Arrow that pierced: the cumulative list of the killed, at
                 // each hit landed (even without a death); otherwise the target alone, if it dies.
@@ -558,6 +561,9 @@ impl Server {
         let kb = (-p.vel[0], -p.vel[2]);
         let hurt = self.proj_damage(t, "minecraft:trident", dmg, owner, kb);
         if hurt {
+            if t == Ent::Player {
+                self.player_thorns_by(owner); // G5-F02d: before the weapon's channeling
+            }
             self.channeling_entity(p, t);
             self.arrow_knockback_trident(p, t);
         }
@@ -694,6 +700,8 @@ impl Server {
                 self.ignite_ent(t, 100);
                 if !self.proj_damage(t, ty, 5.0, owner, kb) {
                     self.set_fire_ent(t, before);
+                } else if t == Ent::Player {
+                    self.player_thorns_by(owner); // G5-F02d
                 }
             }
             PKind::WindCharge | PKind::BreezeWindCharge => {
@@ -707,6 +715,9 @@ impl Server {
                 self.mobs.fireballs.direct_large = true;
                 self.proj_damage(t, ty, if reflected { 1000.0 } else { 6.0 }, owner, kb);
                 self.mobs.fireballs.direct_large = false;
+                if t == Ent::Player {
+                    self.player_thorns_by(owner); // G5-F02d: even without a hit dealt, like the game
+                }
             }
             PKind::ShulkerBullet => self.shulker_bullet_hit(p, t, owner), // F15
             // F16: wither skull.
@@ -961,9 +972,7 @@ impl Server {
             PKind::Egg => {
                 if p.rng.next_int_bound(8) == 0 {
                     let n = if p.rng.next_int_bound(32) == 0 { 4 } else { 1 };
-                    for _ in 0..n {
-                        self.egg_chicken(p);
-                    }
+                    self.egg_chickens(p, n);
                 }
                 let _ = self.send(Event::Entity(EntityEvent::Event { id: p.id, event: 3 }));
                 p.removed = true;
@@ -1016,8 +1025,19 @@ impl Server {
         }
     }
 
-    /// Chick from the egg: baby, variant of the egg.
-    fn egg_chicken(&mut self, p: &Proj) {
+    /// Chicks from the egg, `n` at most: the first one that finds no room stops the series
+    /// (it was created, identifier included, but is not added).
+    pub(crate) fn egg_chickens(&mut self, p: &Proj, n: u32) {
+        for _ in 0..n {
+            if !self.egg_chicken(p) {
+                break;
+            }
+        }
+    }
+
+    /// Chick from the egg: baby, variant of the egg, born with a zero size at the egg's position
+    /// then refitted out of the blocks (wall, ceiling); false, and nothing added, without free room.
+    fn egg_chicken(&mut self, p: &Proj) -> bool {
         let mut m = self.new_mob(Kind::Chicken, p.pos, p.yaw);
         m.age = -24000;
         // Variant carried by the egg (component), otherwise the default variant (temperate).
@@ -1033,7 +1053,12 @@ impl Server {
         }
         m.head_yaw = m.yaw;
         m.body_yaw = m.yaw;
+        let dims = m.dims_wh();
+        if !self.refit_after_growth(&mut m, (0.0, 0.0), dims) {
+            return false;
+        }
         self.add_mob(m);
+        true
     }
 
     /// Experience orbs thrown in a direction.
@@ -1087,6 +1112,7 @@ impl Server {
         }
         self.send_relative_teleport(to, 0.0, 0.0, crate::dims::rel::ROTATION);
         self.life.vit.fall = 0.0;
+        self.life.vit.impulse_reset();
         self.mobs.player_vel = [0.0; 3];
         self.hurt("minecraft:ender_pearl", 5.0);
         self.play_sound("minecraft:entity.player.teleport", 7, to, 1.0, 1.0);
@@ -1298,8 +1324,31 @@ impl Server {
     // ---------- Blocks hit ----------
 
     /// Reaction of the block hit: target, TNT, bell, campfire, chorus flower, decorated pot,
-    /// dripstone (trident), wooden button and plate (arrows).
+    /// dripstone (trident). Buttons and plates react in the pass over the traversed blocks.
     pub(crate) fn block_projectile_hit(&mut self, p: &mut Proj, b: BlockHit) {
+        let impact = p.kind.impact();
+        self.block_projectile_hit_as(p, b, impact);
+    }
+
+    /// Whether breaking on impact is allowed: kind in the `impact_projectiles` tag (`impact`),
+    /// the `projectiles_can_break_blocks` rule, and the adventure mode check: a player shooter in
+    /// adventure, a mob shooter, or no shooter in an adventure world all require the `can_break`
+    /// component of the carried stack (arrows and trident only; other projectiles do not get one).
+    pub(crate) fn proj_may_break(&self, p: &Proj, impact: bool, state: u32) -> bool {
+        if !impact || !self.rule("minecraft:projectiles_can_break_blocks", true) {
+            return false;
+        }
+        let restricted = match self.proj_owner(p) {
+            Some(Ent::Player) => self.game_mode == 2,
+            Some(Ent::Mob(_)) => true,
+            None => self.level.game_type == 2,
+        };
+        !restricted || (p.kind.arrow_like() && self.adventure_can_break(Some(&p.item), state))
+    }
+
+    /// Like `block_projectile_hit`, with the impact tag membership given (the fishing hook
+    /// reuses a snowball projectile but is not in the tag).
+    pub(crate) fn block_projectile_hit_as(&mut self, p: &mut Proj, b: BlockHit, impact: bool) {
         let s = self.st(b.pos);
         let name = self.state_name(s).to_owned();
         let short = name.trim_start_matches("minecraft:");
@@ -1341,19 +1390,23 @@ impl Server {
             }
             // Falling big dripleaf: tipped at once (any projectile).
             "big_dripleaf" => self.dripleaf_projectile_hit(s, b.pos),
-            "chorus_flower" if griefing_ok && p.kind != PKind::Firework => {
+            "chorus_flower" if griefing_ok && self.proj_may_break(p, impact, s) => {
                 let by = Some(crate::mobs::recent::vibration::Src::Projectile(self.proj_owner(p)));
                 self.destroy_block_by(b.pos, true, 512, by);
             }
-            "decorated_pot" if griefing_ok => {
+            "decorated_pot" if griefing_ok && self.proj_may_break(p, impact, s) => {
                 // Cracked first (without a visible update), so that the loot is the sherds.
                 let cracked = self.v().set_bool(s, "cracked", true);
                 self.set_block(b.pos, cracked, flag::INVISIBLE | flag::SKIP_BE_SIDE_EFFECTS);
                 let by = Some(crate::mobs::recent::vibration::Src::Projectile(self.proj_owner(p)));
                 self.destroy_block_by(b.pos, true, 512, by);
             }
-            "pointed_dripstone"
-                if p.kind == PKind::Trident && griefing_ok && p.vel[0].hypot(p.vel[1]).hypot(p.vel[2]) > 0.6 =>
+            // Speleothems (pointed dripstone, sulfur spike): broken by a fast trident.
+            "pointed_dripstone" | "sulfur_spike"
+                if p.kind == PKind::Trident
+                    && griefing_ok
+                    && self.proj_may_break(p, impact, s)
+                    && p.vel[0].hypot(p.vel[1]).hypot(p.vel[2]) > 0.6 =>
             {
                 self.destroy_block(b.pos, true, 512);
             }
@@ -1376,14 +1429,7 @@ impl Server {
             }
             _ => {}
         }
-        if p.kind.arrow_like() {
-            self.arrow_presses(b.pos, s, &name);
-        }
     }
-
-    /// Wooden buttons and plates pressed by arrows: left to the blocks (S3),
-    /// which test the arrows every tick if they can see them.
-    fn arrow_presses(&mut self, _p: [i32; 3], _s: u32, _name: &str) {}
 }
 
 /// Power of the target block according to the impact point.

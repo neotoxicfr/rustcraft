@@ -261,6 +261,9 @@ impl Server {
                         _ => self.prog.expl_cause_next.map(str::to_owned),
                     };
                     self.prog.expl_impact = Some((self.pos, cause));
+                    // Ordinary explosion: the grace of an impulse in progress is cancelled.
+                    let at = self.pos;
+                    self.life.vit.impulse_from_explosion(false, at);
                     // F12: author out of the list (creeper) or found again (ghast), otherwise anonymous.
                     let owner = match (source, by) {
                         (Some(s), _) => Some(s.clone()),

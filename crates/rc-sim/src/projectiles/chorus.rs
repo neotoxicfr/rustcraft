@@ -48,6 +48,7 @@ impl Server {
                     self.chorus_trail(old, self.pos);
                 }
                 self.life.vit.fall = 0.0;
+                self.life.vit.impulse_reset();
                 return true;
             }
         }

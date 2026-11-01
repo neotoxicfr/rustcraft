@@ -209,10 +209,7 @@ impl Server {
 
     /// Mob in water or in the rain (at its feet or at the top of its box).
     pub(crate) fn mob_in_water_or_rain(&self, m: &super::mob::Mob) -> bool {
-        m.in_water || self.is_raining_at(m.block_pos()) || {
-            let top = super::mth::block_of([m.pos[0], m.bbox().max[1], m.pos[2]]);
-            self.is_raining_at(top)
-        }
+        m.in_water || self.in_rain(m.pos, m.bbox().max[1])
     }
 
     /// Height of a height map (network identifier: 1 surface, 4 motion blocking).
@@ -249,9 +246,25 @@ impl Server {
         self.regs.entries("minecraft:worldgen/biome").get(id).map_or("", String::as_str)
     }
 
+    /// Biome of a block as the game reads it: quart chosen by the hashed-seed fuzzy zoom; quart
+    /// outside the loaded chunks: the block's own, without zoom (same fallback as `biome_of`).
+    pub(crate) fn biome_at_zoomed(&self, p: [i32; 3]) -> Option<usize> {
+        let (qx, qy, qz) = rc_worldgen::biome::zoom(self.wgs.zoom_seed, p[0], p[1], p[2]);
+        self.biome_at([qx << 2, qy << 2, qz << 2]).or_else(|| self.biome_at(p))
+    }
+
     /// Biome in a tag (`#minecraft:…`).
     pub(crate) fn biome_tag(&self, p: [i32; 3], tag: &str) -> bool {
-        let Some(id) = self.biome_at(p) else { return false };
+        self.biome_id_in_tag(self.biome_at(p), tag)
+    }
+
+    /// Like `biome_tag`, on the biome read through the fuzzy zoom (`biome_at_zoomed`).
+    pub(crate) fn biome_tag_zoomed(&self, p: [i32; 3], tag: &str) -> bool {
+        self.biome_id_in_tag(self.biome_at_zoomed(p), tag)
+    }
+
+    fn biome_id_in_tag(&self, id: Option<usize>, tag: &str) -> bool {
+        let Some(id) = id else { return false };
         self.regs
             .tags
             .iter()

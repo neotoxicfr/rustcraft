@@ -47,7 +47,7 @@ impl Server {
                 rest
             }
             "minecraft:bone_meal" => {
-                let ok = self.grow_with_bone_meal(front);
+                let ok = self.grow_with_bone_meal(front) || self.grow_water_plant(front, None);
                 if ok {
                     self.level_event(1505, front, 15);
                 }
@@ -410,26 +410,43 @@ impl Server {
             return true;
         }
         let cell = cell_box(front);
-        let sheep: Option<i32> = self
-            .mobs
-            .list
-            .iter()
-            .flatten()
-            .find(|m| {
-                m.kind == crate::mobs::species::Kind::Sheep
-                    && m.alive()
-                    && !m.sheared
-                    && !m.is_baby()
-                    && m.bbox().intersects(&cell)
-            })
-            .map(|m| m.id);
-        let Some(id) = sheep else { return false };
-        let Some(i) = self.mob_index(id) else { return false };
-        let Some(mut m) = self.mobs.list[i].take() else { return false };
-        self.sheep_shear(&mut m, 4);
-        self.mobs.list[i] = Some(m);
-        self.game_event_block("minecraft:shear", front, None, None);
-        true
+        // Each entity in the cell: its leads (its own and those it holds) first.
+        // Walk order: mobs, knot, player (the game follows the order of its entity list).
+        let ids: Vec<i32> =
+            self.mobs.list.iter().flatten().filter(|m| !m.removed && m.bbox().intersects(&cell)).map(|m| m.id).collect();
+        for id in ids {
+            let Some(i) = self.mob_index(id) else { continue };
+            let Some(mut m) = self.mobs.list[i].take() else { continue };
+            let cut = self.shear_off_all(crate::mobs::leash::Holder::Mob(id), Some(&mut m), false);
+            let shorn = !cut
+                && m.kind == crate::mobs::species::Kind::Sheep
+                && m.alive()
+                && !m.sheared
+                && !m.is_baby();
+            if shorn {
+                self.sheep_shear(&mut m, 4);
+            }
+            self.mobs.list[i] = Some(m);
+            if cut {
+                return true;
+            }
+            if shorn {
+                self.game_event_block("minecraft:shear", front, None, None);
+                return true;
+            }
+        }
+        if let Some(k) = self.knot_at(front)
+            && self.shear_off_all(crate::mobs::leash::Holder::Knot(k), None, false)
+        {
+            return true;
+        }
+        if self.game_mode != 3
+            && self.player_aabb().intersects(&cell)
+            && self.shear_off_all(crate::mobs::leash::Holder::Player, None, false)
+        {
+            return true;
+        }
+        false
     }
 
     /// Spawn egg: mob placed in front (shifted upwards

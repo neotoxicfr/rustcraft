@@ -117,6 +117,7 @@ impl Server {
                 Kind::CamelHusk => Some("minecraft:entity.camel_husk.saddle".to_owned()),
                 // F12: strider.
                 Kind::Strider => Some("minecraft:entity.strider.saddle".to_owned()),
+                Kind::Pig => Some("minecraft:entity.pig.saddle".to_owned()),
                 Kind::Nautilus | Kind::ZombieNautilus => Some(
                     if super::super::sealife::under_water(m) {
                         "minecraft:item.nautilus_saddle_underwater_equip"
@@ -442,7 +443,10 @@ impl Server {
 
     /// Neither meal nor rearing, the player takes the animal's rotation and mounts.
     fn do_player_ride(&mut self, m: &mut Mob) {
-        // Trader llama held by the trader: refusal (leash not simulated, never the case).
+        // Trader llama held by its trader: it refuses the rider (nothing changes).
+        if m.kind == Kind::TraderLlama && super::llama::trader_delay(self, m).is_some() {
+            return;
+        }
         m.mount.set_flag(FLAG_EATING, false);
         super::clear_standing(m);
         self.yaw = m.yaw;

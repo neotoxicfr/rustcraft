@@ -145,6 +145,7 @@ impl Server {
                     self.mobs.player_vel = nv;
                     let velocity = super::super::track::lp_quantize(nv);
                     let _ = self.send(Event::Entity(EntityEvent::Motion { id: self.player_id, velocity }));
+                    self.player_thorns(m); // G5-F02d
                 }
                 r
             }
@@ -269,19 +270,24 @@ impl Server {
                     min: [bb.min[0] - 10.0, bb.min[1] - 8.0, bb.min[2] - 10.0],
                     max: [bb.max[0] + 10.0, bb.max[1] + 8.0, bb.max[2] + 10.0],
                 };
+                // Combat conditions at 64 blocks, line of sight included (villagers and player).
+                // Without a valid player no villager can change anything: their scan is skipped
+                // (the sight rays have no observable effect).
                 let player_near =
-                    self.player_aabb().intersects(&area) && self.targeting_ok(m, Ent::Player, true, 64.0, false, true);
-                let villagers: Vec<(i32, i32)> = self
-                    .mobs
-                    .list
-                    .iter()
-                    .flatten()
-                    .filter(|o| o.kind == Kind::Villager && o.touches(&area))
-                    .map(|o| (o.id, self.villager_reputation(o)))
-                    .collect();
-                for (id, rep) in villagers {
-                    if self.targeting_ok(m, Ent::Mob(id), true, 64.0, false, true) && player_near && rep <= -100 {
-                        *potential = Some(Ent::Player);
+                    self.player_feet_in(&area) && self.targeting_ok(m, Ent::Player, true, 64.0, true, true);
+                if player_near {
+                    let villagers: Vec<(i32, i32)> = self
+                        .mobs
+                        .list
+                        .iter()
+                        .flatten()
+                        .filter(|o| o.kind == Kind::Villager && o.touches(&area))
+                        .map(|o| (o.id, self.villager_reputation(o)))
+                        .collect();
+                    for (id, rep) in villagers {
+                        if rep <= -100 && self.targeting_ok(m, Ent::Mob(id), true, 64.0, true, true) {
+                            *potential = Some(Ent::Player);
+                        }
                     }
                 }
                 // The potential target is never forgotten (goal always valid afterward).
@@ -365,7 +371,7 @@ impl Server {
     }
 
     /// Closest villager or copper golem (6 blocks, box ±6/±2/±6, no combat).
-    fn flower_candidate(&self, m: &mut Mob) -> Option<Ent> {
+    pub(crate) fn flower_candidate(&self, m: &mut Mob) -> Option<Ent> {
         let bb = m.bbox();
         let area = rc_physics::Aabb {
             min: [bb.min[0] - 6.0, bb.min[1] - 2.0, bb.min[2] - 6.0],
@@ -381,7 +387,8 @@ impl Server {
             .collect();
         let mut best: Option<(f64, Ent)> = None;
         for (id, p) in cands {
-            if !self.targeting_ok(m, Ent::Mob(id), false, 6.0, false, true) {
+            // Non-combat conditions at 6 blocks, line of sight included.
+            if !self.targeting_ok(m, Ent::Mob(id), false, 6.0, true, true) {
                 continue;
             }
             let d = dist2(m.pos, p);
@@ -472,6 +479,10 @@ impl Server {
             let dx = self.mobs.rng.next_int_bound(17) - 8;
             let dz = self.mobs.rng.next_int_bound(17) - 8;
             let start = [center[0] + dx, center[1] + 6, center[2] + dz];
+            // Start block inside the world border, otherwise the attempt is lost.
+            if !Self::block_in_border(self.border_bounds(), start) {
+                continue;
+            }
             let Some(p) = self.legacy_golem_ground(start, 6) else { continue };
             // Yaw drawn on the world random, "summoned" finalization.
             let yaw = super::super::mth::wrap(self.mobs.rng.next_float() * 360.0);
@@ -493,7 +504,7 @@ impl Server {
 
     /// The movement toward a possible spawn position ("legacy" strategy): going down from `range` to
     /// −`range`, first solid (non-excluded) block under an air or liquid cell.
-    fn legacy_golem_ground(&self, start: [i32; 3], range: i32) -> Option<[i32; 3]> {
+    pub(crate) fn legacy_golem_ground(&self, start: [i32; 3], range: i32) -> Option<[i32; 3]> {
         const EXCLUDED: [&str; 11] = [
             "minecraft:cobweb",
             "minecraft:cactus",
@@ -519,7 +530,11 @@ impl Server {
                 || n.ends_with("_stained_glass_pane")
                 || n.ends_with("_leaves");
             let an = self.state_name(above);
-            let above_ok = self.v().is_air(above) || an == "minecraft:water" || an == "minecraft:lava";
+            // "Liquid" blocks: water, lava and bubble column.
+            let above_ok = self.v().is_air(above)
+                || an == "minecraft:water"
+                || an == "minecraft:lava"
+                || an == "minecraft:bubble_column";
             if !excluded && above_ok && (self.v().legacy_solid(cur) || n == "minecraft:powder_snow") {
                 return Some([p[0], p[1] + 1, p[2]]);
             }

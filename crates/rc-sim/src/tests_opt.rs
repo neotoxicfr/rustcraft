@@ -29,7 +29,19 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// behaviors fixed; series 2: raids.dat and the dragon fight in the fingerprint), identical
 /// values with all optimization switches at 0. G5-F03: initial fire of the mobs
 /// at 0 (not −1) in the three fingerprints, the only cause of the change (checked by restoring it).
-const EXPECTED_NEW: (&str, usize) = ("58ef8be0fcc17b8e20c942cf052a4560ac42ccc3a894072f72453b78e0f668d0", 815);
+/// G5-F02c: the player's `current_impulse_context_reset_grace_time` key, always written like the
+/// game, the only cause of the change of the "new world" and "mechanisms" fingerprints (checked
+/// by removing it).
+/// G5-F02a: resting fire of the player at −20 after each crossed-block pass (saved in
+/// `Fire`), the only cause of the change of the new world (checked by disabling that reset alone).
+/// G5-F02b: entity sound seeds drawn from the sound generator (not from the mobs' world random
+/// source): spawns and finalizations no longer move with the number of sounds played.
+/// G5-F02b review: flyers with an empty fall check (bat, parrot, bee, allay, ghasts, phantom) no
+/// longer accumulate a fall (saved field), the only cause of the change (checked by restoring the
+/// old accumulation: b7433a1e…, 823).
+/// Lot 6 integration: the three changes above together (alone: G5-F02c 267b491a…, 815;
+/// G5-F02a 6ffe4a73…, 815; G5-F02b c855a20f…, 823), merged with the rest of lot 6.
+const EXPECTED_NEW: (&str, usize) = ("24fde67e1af5bc1545c6cab4e16cdcba39e4adf26d419b0b75d40a0cab3707c9", 823);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 const EXPECTED_MODEL: &[(&str, &str, usize)] = &[(
     "790b2d94653a4243e68f2e0cb0ebc3f865f9f59815ed65149067cdd374c6b800",
@@ -169,8 +181,9 @@ fn run_new() -> Option<Vec<(String, String)>> {
     Some(out)
 }
 
-/// Expected fingerprint of the "mechanisms" site: (total, number of files).
-const EXPECTED_MECH: (&str, usize) = ("23967b310740166c63e1740d05c3239fc71acfc44ea9b8a55e4fa5676053f563", 380);
+/// Expected fingerprint of the "mechanisms" site: (total, number of files). Lot 6 integration:
+/// G5-F02b (alone cd8c1083…, 378) and G5-F02c (alone b80e1b0b…, 380) together.
+const EXPECTED_MECH: (&str, usize) = ("7f0e2e80787f3ad5981b0a1b91df3b6efe9784e8d484c9f92076b17c582c10dd", 378);
 
 /// Server command (refusal = failure: the rig would be incomplete).
 pub(crate) fn cmd(s: &mut Server, c: &str) {
@@ -311,7 +324,7 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 }
 
 /// Expected fingerprint of all the regions after closing: (total, number of chunks).
-const EXPECTED_REGIONS: (&str, usize) = ("180f852f7cea8f9b590faae0ee7c7a04f5e846b3f38779f244430e5c3c45ae15", 1249);
+const EXPECTED_REGIONS: (&str, usize) = ("63579824deb6d5f45105e81be2104b8d10964c857279ceb2bf661ba833f0c858", 1254);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all
 /// dimensions): SHA-256 of the decompressed NBT per chunk. Sector locations and

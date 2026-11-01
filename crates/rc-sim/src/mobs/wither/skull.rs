@@ -45,9 +45,11 @@ impl Server {
         let hurt = match owner {
             Some(o) => {
                 let hurt = self.proj_damage(t, "minecraft:wither_skull", 8.0, Some(o), kb);
-                // Victim killed: the author regains 5 HP.
+                // Victim killed: the author regains 5 HP; alive: thorns (G5-F02d).
                 if hurt && !self.ent_alive(t) {
                     self.heal_ent(o, 5.0);
+                } else if hurt && t == Ent::Player {
+                    self.player_thorns_by(Some(o));
                 }
                 hurt
             }

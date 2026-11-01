@@ -183,7 +183,7 @@ pub fn out_from_origin(origin: i32, lo: i32, hi: i32, step: i32) -> Vec<i32> {
 
 impl Server {
     /// Generator of the open dimension for the searches (built once).
-    fn locate_gen(&mut self) -> Option<Arc<DimGen>> {
+    pub(crate) fn locate_gen(&mut self) -> Option<Arc<DimGen>> {
         if let Some((d, g)) = &self.cmd.locgen
             && *d == self.dim.name
         {

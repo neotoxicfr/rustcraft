@@ -8,6 +8,7 @@ mod alloc_trace;
 mod arena;
 mod audio_slot;
 mod block_anim;
+mod bone_meal_use;
 mod boot;
 mod block_entities;
 mod block_fx;
@@ -807,6 +808,10 @@ impl App {
                 }
                 let added = if let rc_client::EntityEvent::Add(a) = &e { Some(a.id) } else { None };
                 self.entities.apply(e);
+                if !self.entities.pending_sounds.is_empty() {
+                    let sounds = std::mem::take(&mut self.entities.pending_sounds);
+                    self.play_fx_sounds(&sounds);
+                }
                 // Sustained sounds created at spawn (minecarts, bees: `entity_loops.rs`).
                 if let Some(id) = added {
                     self.loop_sound_added(id);
@@ -912,6 +917,11 @@ impl App {
             Event::BlockEvent { pos, b0, b1, .. } => {
                 self.piston_event(pos, b0, b1);
                 self.block_entities.on_event(pos, b0, b1, self.env.env.clocks.game_time);
+                let view =
+                    environ::WorldView { grid: &self.world.grid, min_y: self.world.min_y, height: self.world.height };
+                if let Some((kind, at, vel)) = self.block_entities.note_particle(view.state(pos[0], pos[1], pos[2]), pos) {
+                    self.particles.spawn(kind, &particles::Options::default(), at, vel);
+                }
             }
             Event::BlockEntityData { pos, kind, nbt } => {
                 self.op_block_data(pos, nbt.as_ref());
@@ -2190,6 +2200,12 @@ impl App {
         let opts = particles::Options::default();
         for (kind, pos, vel) in emitted {
             self.particles.spawn(kind, &opts, pos, vel);
+        }
+        let sounds = std::mem::take(&mut self.block_entities.sounds);
+        if let Some(a) = self.audio.get() {
+            for (name, pos, volume, pitch) in sounds {
+                a.play(name, rc_audio::Category::Block, Some(pos), volume, pitch, None);
+            }
         }
         self.pistons_due = true;
     }

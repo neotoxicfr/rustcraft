@@ -10,6 +10,7 @@ mod blocks;
 mod fluid_use;
 pub mod chunk;
 pub mod demo;
+pub mod gen_debug;
 pub mod generation;
 pub mod generation_nbt;
 pub mod input;
@@ -32,6 +33,7 @@ pub mod version_info;
 pub mod world;
 // W8a: equipment attributes, client packets specific to singleplayer.
 pub mod attrs;
+pub mod contact; // G5-F02e: crossed blocks, enchanted boots
 mod solo_packets;
 // Survival loop (milestone 2, S2).
 pub mod book;
@@ -48,6 +50,7 @@ pub mod netstack;
 pub mod recipes;
 pub mod rng;
 pub mod vitals;
+pub(crate) mod inside_blocks; // G5-F02a: shared crossed-block pass
 pub mod weather;
 pub mod tickrate;
 // Mobs (S4).
@@ -75,6 +78,14 @@ mod crafter; // G5-F11: crafter menu
 mod tests_g5f11;
 #[cfg(test)]
 mod tests_g4f09; // G4-F09: turtle helmet, 1.21 effects, hurt sound, statistics
+#[cfg(test)]
+mod tests_g4f12; // G4-F12: iron and copper golems
+#[cfg(test)]
+mod tests_g5f02c; // G5-F02c: fall (wind charge, per-block rules, multiplier, sound, dust)
+#[cfg(test)]
+mod tests_g5f02e; // G5-F02e: contacts with crossed blocks, enchanted boots
+mod thorns; // G5-F02d: player thorns
+mod tests_g5f02d;
 pub mod randsrc;
 // Commands (S5).
 pub mod commands;
@@ -95,6 +106,7 @@ pub(crate) mod brush;
 // Minecarts (G5-F06).
 pub mod minecart;
 
+pub use blocks::fluid::shape_face_full;
 pub use blocks::piston_plan::{MovingBlock, PistonReplay, PistonWorld, ReplayOp, ReplayWorld};
 pub use blocks::redstone::{button_sound, openable_sound_name};
 pub use server::{Handle, Options, start};

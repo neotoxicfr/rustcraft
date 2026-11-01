@@ -10,7 +10,11 @@ use crate::states::States;
 use crate::world::{Dimension, Load};
 
 pub(crate) fn test_world() -> Option<PathBuf> {
-    std::env::var_os("RUSTCRAFT_SOLO_WORLD").map(PathBuf::from).filter(|p| p.join("level.dat").is_file())
+    // Absent: test skipped, or failure under `RUSTCRAFT_OPT_REQUIRE=1` (like the other data).
+    rc_testdata::need(
+        std::env::var_os("RUSTCRAFT_SOLO_WORLD").map(PathBuf::from).filter(|p| p.join("level.dat").is_file()),
+        "test world (RUSTCRAFT_SOLO_WORLD)",
+    )
 }
 
 pub(crate) const DIMENSIONS: [&str; 3] = ["minecraft:overworld", "minecraft:the_nether", "minecraft:the_end"];

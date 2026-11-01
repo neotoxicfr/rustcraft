@@ -386,6 +386,7 @@ impl Server {
                 super::level::BeTick::Gateway => self.gateway_be_tick(p), // G5-F10
                 super::level::BeTick::Beacon(b) => self.beacon_tick(p, b), // G5-F11
                 super::level::BeTick::Conduit(c) => self.conduit_tick(p, c), // G6-F12
+                super::level::BeTick::PotentSulfur => self.potent_sulfur_tick(p), // G6-F09a
             }
         } else if self.hive_is_ticker(id, p) {
             self.hive_tick(p); // F11

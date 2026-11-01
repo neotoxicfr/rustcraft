@@ -419,6 +419,12 @@ fn minecart_use(kind: &str, sneak: bool, occupied: bool) -> UseRes {
     }
 }
 
+/// Break with sound and pieces (event 2001): every block except fire and soul fire, which go
+/// out without a break effect (the server only sends the extinguish sound).
+fn break_shows_effect(name: &str) -> bool {
+    !matches!(name, "minecraft:fire" | "minecraft:soul_fire")
+}
+
 /// "Game master" blocks: broken only by an operator.
 fn game_master(name: &str) -> bool {
     matches!(
@@ -645,12 +651,14 @@ impl crate::App {
         if self.is_air(state) || self.data.block_of(state).is_some_and(|b| game_master(&b.name)) {
             return false;
         }
-        // Event 2001 played locally: "broken" sound and block pieces.
-        if let Some(a) = self.audio.get() {
-            let r = &mut self.world_random;
-            crate::world_sounds::level_event(a, &self.data, r, 2001, pos, state as i32, false, self.eye, state);
+        // Event 2001 played locally: "broken" sound and block pieces (nothing for fire).
+        if self.data.block_of(state).is_none_or(|b| break_shows_effect(&b.name)) {
+            if let Some(a) = self.audio.get() {
+                let r = &mut self.world_random;
+                crate::world_sounds::level_event(a, &self.data, r, 2001, pos, state as i32, false, self.eye, state);
+            }
+            self.break_particles(pos, state);
         }
-        self.break_particles(pos, state);
         // The block becomes its fluid alone (air, or source water if it was waterlogged).
         let fluid = self.fluid_only(state);
         self.act_set_block(pos, fluid);
@@ -2086,7 +2094,9 @@ impl crate::App {
             }
             ("minecraft:item.honeycomb.wax_on", 3003)
         } else if it == "bone_meal" {
-            return self.bone_meal_target(clicked, n, above_air).then_some(UseRes::Success { swing: true });
+            let face = usize::from(face.min(5));
+            return crate::bone_meal_use::predicts_success(&ClientWorld(self), pos, face)
+                .then_some(UseRes::Success { swing: true });
         } else {
             return None;
         };
@@ -2099,23 +2109,54 @@ impl crate::App {
         }
         Some(UseRes::Success { swing: true })
     }
+}
 
-    /// Valid bone meal target seen from the client (arm swing; the particles come
-    /// from the server).
-    fn bone_meal_target(&self, s: u32, n: &str, above_air: bool) -> bool {
-        let int = |k: &str| self.state_prop(s, k).and_then(|v| v.parse::<i32>().ok()).unwrap_or(0);
-        match n {
-            "wheat" | "carrots" | "potatoes" => int("age") < 7,
-            "beetroots" => int("age") < 3,
-            "torchflower_crop" => int("age") < 2,
-            "pumpkin_stem" | "melon_stem" => int("age") < 7,
-            "sweet_berry_bush" => int("age") < 3,
-            "cocoa" => int("age") < 2,
-            "short_grass" | "fern" | "grass_block" | "moss_block" | "pale_moss_block" => above_air,
-            "sunflower" | "lilac" | "rose_bush" | "peony" | "pink_petals" | "wildflowers" => true,
-            "red_mushroom" | "brown_mushroom" | "azalea" | "flowering_azalea" | "mangrove_propagule" => true,
-            _ => n.ends_with("_sapling"),
-        }
+/// Client world as seen by the bone meal prediction (the particles come from the server).
+struct ClientWorld<'a>(&'a crate::App);
+
+impl ClientWorld<'_> {
+    fn info(&self, p: [i32; 3]) -> Option<&rc_data::model::StateInfo> {
+        self.0.data.state(self.0.act_state(p))
+    }
+}
+
+impl crate::bone_meal_use::World for ClientWorld<'_> {
+    fn name(&self, p: [i32; 3]) -> &str {
+        self.0.data.block_of(self.0.act_state(p)).map_or("minecraft:air", |b| b.name.as_str())
+    }
+    fn prop(&self, p: [i32; 3], key: &str) -> Option<&str> {
+        self.0.data.state_properties(self.0.act_state(p)).find(|(k, _)| *k == key).map(|(_, v)| v)
+    }
+    fn is_air(&self, p: [i32; 3]) -> bool {
+        self.0.is_air(self.0.act_state(p))
+    }
+    fn replaceable(&self, p: [i32; 3]) -> bool {
+        self.info(p).is_some_and(|i| i.has(flags::REPLACEABLE))
+    }
+    fn tag(&self, p: [i32; 3], tag: &str) -> bool {
+        self.0.state_tag(tag, self.0.act_state(p))
+    }
+    fn face_full(&self, p: [i32; 3], face: usize, collision: bool) -> bool {
+        self.info(p).is_some_and(|i| {
+            i.sturdy & (1 << face) != 0 || (collision && rc_sim::shape_face_full(&self.0.data, i.collision, face))
+        })
+    }
+    fn fluid_amount(&self, p: [i32; 3]) -> u8 {
+        self.info(p).map_or(0, |i| i.fluid_amount)
+    }
+    fn fluid_source(&self, p: [i32; 3]) -> bool {
+        self.info(p).is_some_and(|i| i.has(flags::FLUID_SOURCE))
+    }
+    fn skylight_through(&self, p: [i32; 3]) -> bool {
+        self.info(p).is_some_and(|i| i.has(flags::SKYLIGHT_THROUGH))
+    }
+    fn raw_light(&self, p: [i32; 3]) -> i32 {
+        let w = &self.0.world;
+        let view = crate::environ::WorldView { grid: &w.grid, min_y: w.min_y, height: w.height };
+        view.raw_brightness(p[0], p[1], p[2], self.0.env.has_sky, 0)
+    }
+    fn in_height(&self, y: i32) -> bool {
+        (self.0.world.min_y..self.0.world.min_y + self.0.world.height).contains(&y)
     }
 }
 
@@ -2153,6 +2194,15 @@ mod game_master_tests {
         assert_eq!(item_block_states(&data, &stack), pairs(&[("powered", "true"), ("mode", "fail")]));
         let bare = ItemStack { item: 1, count: 1, added: Vec::new(), removed: Vec::new() };
         assert!(item_block_states(&data, &bare).is_empty());
+    }
+
+    /// Fire put out by hand: no break sound and no pieces; every other block has them.
+    #[test]
+    fn fire_breaks_without_effect() {
+        assert!(!break_shows_effect("minecraft:fire"));
+        assert!(!break_shows_effect("minecraft:soul_fire"));
+        assert!(break_shows_effect("minecraft:stone"));
+        assert!(break_shows_effect("minecraft:campfire"));
     }
 
     /// Carrot or berries clicked where the plant does not hold: placement refused (the item is eaten).

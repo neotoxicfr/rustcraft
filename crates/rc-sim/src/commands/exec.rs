@@ -491,7 +491,7 @@ impl Server {
                     "passengers" => self.relation_passengers(me),
                     "controller" => self.relation_controller(me).into_iter().collect(),
                     "origin" => self.relation_origin(me).into_iter().collect(),
-                    // Leashes not simulated by singleplayer: no held entity.
+                    "leasher" => self.relation_leasher(me).into_iter().collect(),
                     _ => Vec::new(),
                 };
                 Ok(found.into_iter().map(|e| self.with_entity(s, e)).collect())

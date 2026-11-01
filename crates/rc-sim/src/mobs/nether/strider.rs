@@ -2,6 +2,8 @@
 //! cell on the lava sources under it), cold out of lava (speed −34%), saddled mount
 //! steered with a warped fungus on a stick (boost 140 to 980 ticks), breeding with
 //! warped fungus, mounts at spawn (baby strider, zombified piglin rider).
+//! Steering by item (boost, wear of the stick) also serves the saddled pig and the carrot
+//! on a stick (`server-mobs.md`, pig).
 
 use rc_physics::Aabb;
 
@@ -15,6 +17,7 @@ use crate::server::Server;
 
 const SADDLE: usize = 7;
 const STICK: &str = "minecraft:warped_fungus_on_a_stick";
+const PIG_STICK: &str = "minecraft:carrot_on_a_stick";
 
 /// Goals in the game's add order.
 pub fn register_goals(m: &mut Mob) {
@@ -50,19 +53,41 @@ pub fn ambient_sound(m: &Mob) -> Option<&'static str> {
     (!panicking(m) && !tempted(m)).then_some("minecraft:entity.strider.ambient")
 }
 
+/// Item-steered mount: the stick that steers it and its wear per boost (strider: warped
+/// fungus, 1; pig: carrot, 7).
+fn stick_of(k: Kind) -> Option<(&'static str, i32)> {
+    match k {
+        Kind::Strider => Some((STICK, 1)),
+        Kind::Pig => Some((PIG_STICK, 7)),
+        _ => None,
+    }
+}
+
+/// The species steered by this stick.
+fn steered_by(item: &str) -> Option<Kind> {
+    [Kind::Strider, Kind::Pig].into_iter().find(|&k| stick_of(k).is_some_and(|(id, _)| id == item))
+}
+
 /// Does the player hold the stick in a hand?
-fn player_holds_stick(s: &Server) -> bool {
-    [&s.slots[36 + s.held as usize], &s.slots[45]].iter().any(|h| h.as_ref().is_some_and(|h| h.id == STICK))
+fn player_holds_stick(s: &Server, stick: &str) -> bool {
+    [&s.slots[36 + s.held as usize], &s.slots[45]].iter().any(|h| h.as_ref().is_some_and(|h| h.id == stick))
 }
 
-/// The passenger steering on the player's side: saddled, player first, stick in hand.
+/// The passenger steering on the player's side: saddled, player first, the species' stick in hand.
 fn player_steers(s: &Server, m: &Mob) -> bool {
-    saddled(m) && m.mount.passengers.first() == Some(&Ent::Player) && player_holds_stick(s)
+    stick_of(m.kind).is_some_and(|(id, _)| {
+        saddled(m) && m.mount.passengers.first() == Some(&Ent::Player) && player_holds_stick(s, id)
+    })
 }
 
-/// Steering by the player (read by the mount engine).
+/// Steering by the player (read by the mount engine): strider or pig.
 pub fn player_controls(m: &Mob) -> bool {
-    m.kind == Kind::Strider && m.neth.steered
+    stick_of(m.kind).is_some() && m.neth.steered
+}
+
+/// Who steers, re-evaluated at the start of every tick (pig; the strider does it in its own tick).
+pub fn steer_tick(s: &Server, m: &mut Mob) {
+    m.neth.steered = player_steers(s, m);
 }
 
 /// Synced data and speed modifier (−34% of the base).
@@ -230,6 +255,17 @@ pub fn interact(s: &mut Server, m: &mut Mob, slot: usize, item: &str) -> bool {
         s.world_sound("minecraft:entity.strider.eat", 6, at, 1.0, p);
     }
     true
+}
+
+/// Pig: mount (saddled, free, no food, player standing), otherwise the shared food and
+/// golden dandelion handling, otherwise fitting the saddle.
+pub fn pig_interact(s: &mut Server, m: &mut Mob, slot: usize, item: &str) -> bool {
+    let food = s.item_tag(item, "minecraft:pig_food");
+    if !food && saddled(m) && m.mount.passengers.is_empty() && !s.sneaking {
+        s.player_start_riding(m);
+        return true;
+    }
+    s.animal_food_interact(m, slot, item) || equip_saddle(s, m, slot)
 }
 
 /// The player's interaction with an animal then golden dandelion; true if the item was used.
@@ -417,21 +453,26 @@ pub fn finalize(s: &mut Server, m: &mut Mob, group: &mut super::super::spawn::Gr
 }
 
 impl Server {
-    /// Boost of the steered strider; the stick wears (1) and becomes a
-    /// fishing rod again when it breaks. True if the item is the stick (action handled).
-    pub(crate) fn strider_boost_use(&mut self, hand: i32) -> bool {
+    /// Boost of the mount steered by the held stick (strider, pig); the stick wears (1 or 7)
+    /// and becomes a fishing rod again when it breaks. Without a boost (not riding, other
+    /// mount, boost running): the "used" statistic. True if the item is one of these sticks
+    /// (action handled).
+    pub(crate) fn stick_boost_use(&mut self, hand: i32) -> bool {
         let slot = if hand == 0 { 36 + self.held as usize } else { 45 };
-        if self.slots[slot].as_ref().is_none_or(|s| s.id != STICK) {
-            return false;
-        }
-        let Some(vid) = self.mobs.mounts.riding.vehicle else { return true };
-        let Some(i) = self.mob_index(vid) else { return true };
-        let Some(mut v) = self.mobs.list[i].take() else { return true };
-        let ok = v.kind == Kind::Strider && player_steers(self, &v) && boost(&mut v);
-        self.mobs.list[i] = Some(v);
-        if ok {
+        let Some(id) = self.slots[slot].as_ref().map(|s| s.id.clone()) else { return false };
+        let Some(kind) = steered_by(&id) else { return false };
+        let wear = stick_of(kind).map_or(1, |(_, w)| w);
+        let ok = self.mobs.mounts.riding.vehicle.and_then(|vid| self.mob_index(vid)).is_some_and(|i| {
+            let Some(mut v) = self.mobs.list[i].take() else { return false };
+            let ok = v.kind == kind && player_steers(self, &v) && boost(&mut v);
+            self.mobs.list[i] = Some(v);
+            ok
+        });
+        if !ok {
+            self.award_stat("minecraft:used", &id, 1);
+        } else {
             let before = self.slots[slot].clone();
-            self.hurt_item(slot, 1);
+            self.hurt_item(slot, wear);
             if self.slots[slot].is_none()
                 && let Some(mut b) = before
             {

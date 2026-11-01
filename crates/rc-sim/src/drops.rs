@@ -389,7 +389,16 @@ impl Server {
         for d in drops.iter_mut().filter(|d| !d.removed) {
             self.track_object(&mut d.track, d.id, d.pos, d.vel, d.on_ground, 20);
         }
-        for d in drops.iter_mut().filter(|d| !d.removed) {
+        // G5-F02e: positions seen by the plates while the list is taken out.
+        let mut live = std::mem::take(&mut self.contact.live_items);
+        live.clear();
+        live.extend(drops.iter().map(|d| (d.pos, d.removed)));
+        self.contact.live_items = live;
+        self.contact.items_ticking = true;
+        for (i, d) in drops.iter_mut().enumerate() {
+            if d.removed {
+                continue;
+            }
             d.ticks += 1;
             if d.pickup_delay > 0 && d.pickup_delay != 32767 {
                 d.pickup_delay -= 1;
@@ -423,14 +432,18 @@ impl Server {
             }
             // Blocks passed through (or, at rest, those it rests in): a hopper takes it at once.
             self.hopper_item_inside(old, d);
+            self.contact.live_items[i] = (d.pos, d.removed);
             if d.removed {
                 continue;
             }
+            // G5-F02e: plates and tripwire right after its movement (the following ones not moved yet).
+            self.contact_triggers(old, d.pos, ITEM_SIZE / 2.0, ITEM_SIZE);
             if d.age != -32768 {
                 d.age += 1;
             }
             if d.age >= LIFETIME || d.pos[1] < f64::from(self.dim.height.min_y) - 64.0 {
                 d.removed = true;
+                self.contact.live_items[i].1 = true;
             }
             let moved = (0..3).any(|a| old[a].floor() != d.pos[a].floor());
             d.moved = moved;
@@ -547,11 +560,15 @@ impl Server {
         let gone: Vec<i32> = drops.iter().filter(|d| d.removed).map(|d| d.id).collect();
         drops.retain(|d| !d.removed);
         self.life.drops = drops;
+        self.contact.items_ticking = false;
+        self.contact.live_items.clear();
         let mut orbs = std::mem::take(&mut self.life.orbs);
         self.orbs_tick(&mut orbs);
         let gone_orbs: Vec<i32> = orbs.iter().filter(|o| o.removed).map(|o| o.id).collect();
         orbs.retain(|o| !o.removed);
         self.life.orbs = orbs;
+        self.contact.orbs_ticking = false;
+        self.contact.live_orbs.clear();
         let all: Vec<i32> = gone.into_iter().chain(gone_orbs).collect();
         if !all.is_empty() {
             // Scoreboard: items and orbs removed (command UUID derived from the id).
@@ -591,7 +608,16 @@ impl Server {
         for o in orbs.iter_mut().filter(|o| !o.removed) {
             self.track_object(&mut o.track, o.id, o.pos, o.vel, o.on_ground, 20);
         }
-        for o in orbs.iter_mut().filter(|o| !o.removed) {
+        // G5-F02e: positions seen by the plates while the list is taken out.
+        let mut live = std::mem::take(&mut self.contact.live_orbs);
+        live.clear();
+        live.extend(orbs.iter().map(|o| (o.pos, o.removed)));
+        self.contact.live_orbs = live;
+        self.contact.orbs_ticking = true;
+        for (i, o) in orbs.iter_mut().enumerate() {
+            if o.removed {
+                continue;
+            }
             o.ticks += 1;
             // Same physics as the client (`rc_physics::body`), no skipped tick.
             let w = self.world();
@@ -610,9 +636,13 @@ impl Server {
             if o.on_ground {
                 o.body.fall = 0.0;
             }
+            // G5-F02e: plates and tripwire right after its movement.
+            self.contact.live_orbs[i].0 = o.pos;
+            self.contact_triggers(from, o.pos, ORB_SIZE / 2.0, ORB_SIZE);
             o.age += 1;
             if o.age >= LIFETIME {
                 o.removed = true;
+                self.contact.live_orbs[i].1 = true;
             }
         }
         // Pickup: one orb every 2 ticks.
@@ -725,8 +755,17 @@ impl Server {
         let mut all = now.clone();
         all.extend(self.life.drop_chunks.iter().copied());
         for c in all {
-            let mut ents: Vec<Nbt> =
-                self.entities.get(&c).map(|l| l.iter().map(|e| e.1.clone()).collect()).unwrap_or_default();
+            // Lead knot: never saved (the held mob recreates it on reload).
+            let mut ents: Vec<Nbt> = self
+                .entities
+                .get(&c)
+                .map(|l| {
+                    l.iter()
+                        .filter(|e| e.1.get("id").and_then(Nbt::as_str) != Some("minecraft:leash_knot"))
+                        .map(|e| e.1.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
             ents.extend(by_chunk.remove(&c).unwrap_or_default());
             let root = Nbt::Compound(vec![
                 ("DataVersion".into(), Nbt::Int(crate::chunk::DATA_VERSION)),
@@ -997,7 +1036,10 @@ impl Server {
         if !items.damageable(&s) {
             return;
         }
-        let n2 = self.unbreaking_kept(&s, n, (5..9).contains(&slot));
+        // Formula chosen by the item (enchantable armor tag), not by the slot: an armor piece held
+        // in hand wears like armor, elytra worn on the chest like an ordinary item.
+        let armor = items.has_tag("minecraft:enchantable/armor", &s.id);
+        let n2 = self.unbreaking_kept(&s, n, armor);
         if n2 <= 0 {
             return;
         }
@@ -1115,7 +1157,7 @@ impl Server {
 
 impl Server {
     /// `damage_resistant` component of the stack (patch, otherwise prototype): tag of damage types.
-    fn resistant_tag(&self, s: &Stack) -> Option<String> {
+    pub(crate) fn resistant_tag(&self, s: &Stack) -> Option<String> {
         if let Some(c) = crate::items::component(s, "minecraft:damage_resistant") {
             return c.get("types").and_then(rc_proto::nbt::Nbt::as_str).map(str::to_owned);
         }

@@ -242,7 +242,7 @@ pub fn custom_ai_step(s: &mut Server, m: &mut Mob, b: &mut Brain) {
         b.first_valid(&[Act::Panic, Act::Idle]);
     }
     // The restriction control (neither leashed nor ridden).
-    if m.mount.passengers.is_empty() {
+    if m.mount.passengers.is_empty() && !super::super::leash::is_leashed(m) {
         let radius = if !m.is_baby() && !wearing_harness(m) { 64 } else { 32 };
         let bp = m.block_pos();
         let keep = m.rec.restriction.is_some_and(|(h, r)| {
@@ -507,7 +507,7 @@ pub fn on_passenger_removed(s: &mut Server, m: &mut Mob) {
     }
     set_still_timeout(s, m, 10);
     if m.mount.passengers.is_empty() {
-        m.rec.restriction = None;
+        crate::mobs::goals::clear_home(m);
         s.mob_sound(m, "minecraft:entity.happy_ghast.harness_goggles_up", 1.0, 1.0);
     }
 }
@@ -674,7 +674,7 @@ impl Server {
     /// 64 tries in a ±16 cube in the home area, empty
     /// and within 16 blocks of a block in one of the six directions; otherwise the last one drawn,
     /// brought under the surface if it is above.
-    fn ghast_fly_to(&self, m: &mut Mob, dist_blocks: i32) -> [f64; 3] {
+    pub(crate) fn ghast_fly_to(&self, m: &mut Mob, dist_blocks: i32) -> [f64; 3] {
         let c = m.pos;
         let mut result: Option<[f64; 3]> = None;
         for _ in 0..64 {
@@ -683,10 +683,11 @@ impl Server {
                 c[1] + f64::from((m.rng.next_float() * 2.0 - 1.0) * 16.0),
                 c[2] + f64::from((m.rng.next_float() * 2.0 - 1.0) * 16.0),
             ];
-            let within = m.rec.restriction.is_none_or(|(h, r)| {
-                let b = t.map(|v| v.floor() as i32);
-                let d = (0..3).map(|i| f64::from(h[i] - b[i]).powi(2)).sum::<f64>();
-                r == -1 || d < f64::from(r * r)
+            // Common home (the lead's when it is held), point compared with the centre of the
+            // central block.
+            let within = crate::mobs::goals::rpos_home(m).is_none_or(|(h, r)| {
+                let d = (0..3).map(|i| (f64::from(h[i]) + 0.5 - t[i]).powi(2)).sum::<f64>();
+                d < f64::from(r * r)
             });
             result = within.then_some(t);
             if let Some(t) = result

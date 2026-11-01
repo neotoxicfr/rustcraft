@@ -5,7 +5,6 @@
 use rc_client::{EntityEvent, Event};
 use rc_proto_v777::entity::{AddEntity, PositionPath, PositionSync};
 
-use super::super::arrows::ray_t;
 use super::super::jrand::JRand;
 use super::super::mob::{Ent, Mob};
 use super::super::mth::{DEG, atan2, cos, dist2, sin};
@@ -25,6 +24,8 @@ pub struct Spit {
     pub removed: bool,
     pub left_owner: bool,
     pub tick: i32,
+    /// Number of the entity walk it was born in (0: outside the walk), read by `mobs::Walk`.
+    pub born: u64,
 }
 
 /// Mounts world: mounted player, spits in flight, visual lightning.
@@ -46,7 +47,34 @@ fn spit_box(p: [f64; 3]) -> rc_physics::Aabb {
     rc_physics::Aabb { min: [p[0] - 0.125, p[1], p[2] - 0.125], max: [p[0] + 0.125, p[1] + 0.25, p[2] + 0.125] }
 }
 
+fn grow(b: &rc_physics::Aabb, m: f64) -> rc_physics::Aabb {
+    rc_physics::Aabb { min: b.min.map(|v| v - m), max: b.max.map(|v| v + m) }
+}
+
 impl Server {
+    /// The shooting llama, the root vehicle carrying it and all passengers of that vehicle (what
+    /// the spit ignores until it has left them); empty if the llama no longer exists.
+    fn spit_owner_family(&self, owner: i32) -> Vec<Ent> {
+        let Some(mut root) = self.mob_ref(owner) else { return Vec::new() };
+        for _ in 0..16 {
+            match root.mount.vehicle.and_then(|v| self.mob_ref(v)) {
+                Some(v) => root = v,
+                None => break,
+            }
+        }
+        let mut out = vec![Ent::Mob(root.id)];
+        let mut i = 0;
+        while i < out.len() && out.len() < 64 {
+            if let Ent::Mob(id) = out[i]
+                && let Some(m) = self.mob_ref(id)
+            {
+                out.extend(m.mount.passengers.iter().copied());
+            }
+            i += 1;
+        }
+        out
+    }
+
     /// Start in front of the mouth, aim at a third of the target's height,
     /// speed 1.5, inaccuracy 10; spit sound (llama's random).
     pub(crate) fn llama_spit(&mut self, m: &mut Mob, target: Ent) {
@@ -72,8 +100,20 @@ impl Server {
         }
         let v = v.map(|c| c * f64::from(1.5f32));
         let (yaw, pitch) = rot_of(v);
-        let s =
-            Spit { id, owner: m.id, pos: start, vel: v, yaw, pitch, rng, removed: false, left_owner: false, tick: 0 };
+        let born = self.walk.born();
+        let s = Spit {
+            id,
+            owner: m.id,
+            pos: start,
+            vel: v,
+            yaw,
+            pitch,
+            rng,
+            removed: false,
+            left_owner: false,
+            tick: 0,
+            born,
+        };
         let add = AddEntity {
             id,
             uuid: (id as u128) << 64 | 0x4C00_0000_0000_0000,
@@ -96,10 +136,22 @@ impl Server {
     pub(crate) fn spits_tick(&mut self) {
         let mut spits = std::mem::take(&mut self.mobs.mounts.spits);
         for s in spits.iter_mut().filter(|s| !s.removed) {
+            // Born during this entity walk: it waits for the next tick (born from a minecart,
+            // after this tick, it is no longer skipped).
+            if self.walk.waits(std::mem::take(&mut s.born)) {
+                continue;
+            }
             s.tick += 1;
-            // The spit can only hit its llama after leaving it.
+            // Left the llama (shared projectile rule): the spit's box stretched by its speed and
+            // inflated by 1 touches neither the llama nor its passengers any more.
+            // (List built only until the spit has left: no allocation afterwards.)
+            let family = if s.left_owner { Vec::new() } else { self.spit_owner_family(s.owner) };
             if !s.left_owner {
-                s.left_owner = self.mob_ref(s.owner).is_none_or(|o| !o.touches(&spit_box(s.pos)));
+                let area = grow(&spit_box(s.pos).expand_towards(s.vel), 1.0);
+                s.left_owner = family.iter().all(|&e| {
+                    let pickable = e != Ent::Player || self.game_mode != 3;
+                    !pickable || self.ent_bbox(e).is_none_or(|b| !b.intersects(&area))
+                });
             }
             let mv = s.vel;
             let from = s.pos;
@@ -119,30 +171,31 @@ impl Server {
                 end = [end[0].clamp(b[0], b[1] - e), end[1], end[2].clamp(b[2], b[3] - e)];
                 block_hit = true;
             }
-            let seg = [end[0] - from[0], end[1] - from[1], end[2] - from[2]];
+            // Shared projectile margin (0, then +0.05 per tick up to 0.3), the nearest at the
+            // entry point; before leaving, neither the llama nor its passengers.
+            let m = crate::projectiles::physics::margin(s.tick);
+            let area = grow(&spit_box(s.pos).expand_towards(mv), 1.0);
+            let skip = |e: Ent| !s.left_owner && family.contains(&e);
             let mut hit: Option<(f64, Ent)> = None;
-            for o in self.mobs.list.iter().flatten() {
-                if !o.alive() || (o.id == s.owner && !s.left_owner) {
-                    continue;
+            let mut try_hit = |e: Ent, bb: rc_physics::Aabb| {
+                if skip(e) || !bb.intersects(&area) {
+                    return;
                 }
-                let bb = o.bbox();
-                let g = rc_physics::Aabb { min: bb.min.map(|v| v - 0.3), max: bb.max.map(|v| v + 0.3) };
-                if ray_t(&g, from, seg).is_some() {
-                    let d = dist2(from, o.pos);
+                if let Some((t, _)) = crate::projectiles::physics::aabb_clip(&grow(&bb, m), from, end) {
+                    let loc: [f64; 3] = std::array::from_fn(|i| from[i] + t * (end[i] - from[i]));
+                    let d = dist2(from, loc);
                     if hit.is_none_or(|h| d < h.0) {
-                        hit = Some((d, Ent::Mob(o.id)));
+                        hit = Some((d, e));
                     }
+                }
+            };
+            for o in self.mobs.list.iter().flatten() {
+                if o.alive() && !o.removed {
+                    try_hit(Ent::Mob(o.id), o.bbox());
                 }
             }
             if self.game_mode != 3 && self.ent_alive(Ent::Player) {
-                let bb = self.player_aabb();
-                let g = rc_physics::Aabb { min: bb.min.map(|v| v - 0.3), max: bb.max.map(|v| v + 0.3) };
-                if ray_t(&g, from, seg).is_some() {
-                    let d = dist2(from, self.pos);
-                    if hit.is_none_or(|h| d < h.0) {
-                        hit = Some((d, Ent::Player));
-                    }
-                }
+                try_hit(Ent::Player, self.player_aabb());
             }
             if let Some((_, e)) = hit {
                 self.spit_hit(s, e);
@@ -151,8 +204,10 @@ impl Server {
                 continue;
             }
             let next = to;
-            s.pitch = rot_of(mv).1;
-            s.yaw = rot_of(mv).0;
+            // Smoothed rotation (a fifth of the difference) from the previous tick's.
+            let (yaw, pitch) = rot_of(mv);
+            s.pitch = crate::projectiles::lerp_rotation(s.pitch, pitch);
+            s.yaw = crate::projectiles::lerp_rotation(s.yaw, yaw);
             let air_only = {
                 let b = spit_box(s.pos);
                 let lo = b.min.map(|v| v.floor() as i32);
@@ -208,7 +263,9 @@ impl Server {
         let kb = (-s.vel[0], -s.vel[2]);
         match e {
             Ent::Player => {
-                self.player_hurt_by_mob(&owner, "minecraft:spit", 1.0, Some(kb));
+                if self.player_hurt_by_mob(&owner, "minecraft:spit", 1.0, Some(kb)) {
+                    self.player_thorns_by(Some(Ent::Mob(owner.id))); // G5-F02d
+                }
             }
             Ent::Mob(id) => {
                 let Some(i) = self.mob_index(id) else { return };
@@ -222,9 +279,7 @@ impl Server {
     // ---------- Caravan ----------
 
     fn llama_leashed(m: &Mob) -> bool {
-        // Leash not simulated in singleplayer: never held.
-        let _ = m;
-        false
+        super::super::leash::is_leashed(m)
     }
 
     /// First of the caravan held on a leash, at most 8 links away.
@@ -322,6 +377,10 @@ impl Server {
     }
 
     pub(crate) fn caravan_tick(&mut self, m: &mut Mob, speed: f64) {
+        // Tied to a knot: it does not follow the caravan.
+        if matches!(super::super::leash::holder(m), Some(super::super::leash::Holder::Knot(_))) {
+            return;
+        }
         let Some(h) = m.mount.caravan_head.and_then(|id| self.mob_ref(id)).map(|h| h.pos) else { return };
         let d = [h[0] - m.pos[0], h[1] - m.pos[1], h[2] - m.pos[2]];
         let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
@@ -342,18 +401,31 @@ impl Server {
     }
 }
 
-/// Trader llama: despawn countdown (suspended if tamed, ridden by a player, age-locked or
-/// persistent).
-pub fn maybe_despawn(s: &Server, m: &mut Mob) {
+/// Wandering trader holding this llama on a lead: its despawn delay.
+pub fn trader_delay(s: &Server, m: &Mob) -> Option<i32> {
+    let super::super::leash::Holder::Mob(id) = super::super::leash::holder(m)? else { return None };
+    let t = s.mobs.get(id).filter(|t| t.kind == Kind::WanderingTrader)?;
+    Some(t.npc.as_ref().map_or(0, |n| n.despawn_delay))
+}
+
+/// Trader llama: despawn countdown (suspended if tamed, held by something other than its
+/// trader, ridden by a player, age-locked or persistent); held by the trader, it leaves one
+/// tick before it.
+pub fn maybe_despawn(s: &mut Server, m: &mut Mob) {
     if m.kind != Kind::TraderLlama {
         return;
     }
+    let trader = trader_delay(s, m);
+    let other_holder = super::super::leash::is_leashed(m) && trader.is_none();
     let one_player = m.mount.passengers.len() == 1 && m.mount.passengers[0] == Ent::Player;
-    let can = !super::is_tamed(m) && !one_player && !m.mount.age_locked && !m.persistent;
-    let _ = s;
+    let can = !super::is_tamed(m) && !other_holder && !one_player && !m.mount.age_locked && !m.persistent;
     if can {
-        m.mount.despawn_delay -= 1;
+        m.mount.despawn_delay = match trader {
+            Some(d) => d - 1,
+            None => m.mount.despawn_delay - 1,
+        };
         if m.mount.despawn_delay <= 0 {
+            s.leash_drop(m, true, false);
             m.removed = true;
         }
     }

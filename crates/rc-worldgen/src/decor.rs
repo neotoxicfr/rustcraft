@@ -18,6 +18,41 @@ use crate::rng::Rng;
 
 pub const STEPS: usize = 11;
 
+/// Configured features that the live world places by name (sapling trees, huge mushrooms, moss
+/// patches, nylium vegetation, planted nether fungi): loaded even when no biome of the dimension
+/// cites them.
+pub const LIVE_FEATURES: &[&str] = &[
+    "minecraft:oak",
+    "minecraft:fancy_oak",
+    "minecraft:oak_bees_005",
+    "minecraft:fancy_oak_bees_005",
+    "minecraft:spruce",
+    "minecraft:mega_spruce",
+    "minecraft:mega_pine",
+    "minecraft:mangrove",
+    "minecraft:tall_mangrove",
+    "minecraft:azalea_tree",
+    "minecraft:birch",
+    "minecraft:birch_bees_005",
+    "minecraft:jungle_tree_no_vine",
+    "minecraft:mega_jungle_tree",
+    "minecraft:acacia",
+    "minecraft:cherry",
+    "minecraft:cherry_bees_005",
+    "minecraft:dark_oak",
+    "minecraft:pale_oak_bonemeal",
+    "minecraft:red_poplar",
+    "minecraft:orange_poplar",
+    "minecraft:yellow_poplar",
+    "minecraft:huge_red_mushroom",
+    "minecraft:huge_brown_mushroom",
+    "minecraft:moss_patch_bonemeal",
+    "minecraft:pale_moss_patch_bonemeal",
+    "minecraft:nylium_bonemeal",
+    "minecraft:crimson_fungus_planted",
+    "minecraft:warped_fungus_planted",
+];
+
 /// Debug journal: draws (bits, value) and placements (position, state).
 pub type RngTrace = (Vec<(u32, i32)>, Vec<([i32; 3], u32)>);
 
@@ -234,6 +269,16 @@ impl Decorator {
         }
         for f in named {
             reg.placed_ref(&Json::Str(f), &mut c)?;
+        }
+        // Features placed by the live world (saplings and bone meal), whatever the biome; an
+        // unreadable feature stays absent (the placement fails) without blocking generation.
+        for &f in LIVE_FEATURES {
+            if data.raw("feature", f).is_some() {
+                let _ = reg.feature_ref(&Json::Str(f.into()), &mut c);
+            }
+        }
+        if data.raw("placed_feature", "minecraft:grass_bonemeal").is_some() {
+            let _ = reg.placed_ref(&Json::Str("minecraft:grass_bonemeal".into()), &mut c);
         }
         // Topological sort (§ 2.2).
         let mut number: HashMap<PlacedId, u32> = HashMap::new();

@@ -373,10 +373,18 @@ pub struct Mob {
     pub support: Option<[i32; 3]>,
     /// Piston pushes accumulated during the tick (cap of 0.51 per axis).
     pub piston_deltas: rc_physics::piston::PistonDeltas,
+    /// Slowdown (cobweb, berries) set by the crossed blocks, applied to the next movement.
+    pub stuck: [f64; 3],
+    /// Block-tied boots enchantments (G5-F02e).
+    pub boots: crate::contact::Boots,
     pub move_dist: f32,
     pub next_step: f32,
+    /// Amethyst chime of the steps and last seen size (refit after growth).
+    pub body_fx: super::body::BodyFx,
     pub needs_sync: bool,
     pub removed: bool,
+    /// Movements of the tick, read back by the crossed-block pass.
+    pub(crate) inside: crate::inside_blocks::Moves,
     // Living entity.
     pub attrs: Attrs,
     pub health: f32,
@@ -504,6 +512,8 @@ pub struct Mob {
     pub end: super::end::EndMob,
     /// F16: wither (`wither/`).
     pub wither: super::wither::Wither,
+    /// Lead (`leash.rs`): boxed, absent for almost every mob.
+    pub leash: Option<Box<super::leash::Leash>>,
 }
 
 impl Mob {
@@ -562,10 +572,14 @@ impl Mob {
             was_eyes_in_water: false,
             support: None,
             piston_deltas: Default::default(),
+            stuck: [0.0; 3],
+            boots: Default::default(),
             move_dist: 0.0,
             next_step: 1.0,
+            body_fx: Default::default(),
             needs_sync: false,
             removed: false,
+            inside: Default::default(),
             attrs,
             health: i.health as f32,
             hurt_time: 0,
@@ -660,6 +674,7 @@ impl Mob {
             rec: super::recent::Rec::default(),
             end: super::end::EndMob::default(),
             wither: super::wither::Wither::default(),
+            leash: None,
         };
         if super::recent::handles(kind) {
             super::recent::on_new(&mut m);
@@ -886,6 +901,11 @@ impl Mob {
 
     pub fn follow_range(&self) -> f64 {
         self.attrs.follow.value()
+    }
+
+    /// Effective gravity: zero with `NoGravity`, otherwise the attribute (the only allowed read).
+    pub fn gravity(&self) -> f64 {
+        super::surface::gravity(self, self.attrs.gravity.value())
     }
 
     pub fn step_height(&self) -> f64 {
@@ -1127,6 +1147,8 @@ impl Mob {
                 self.set(16, Meta::Bool(self.age < 0));
                 self.set(17, Meta::Bool(self.mount.age_locked));
                 match self.kind {
+                    // Total duration of the carrot-on-a-stick boost.
+                    Kind::Pig => self.set(18, Meta::Int(self.neth.boost_total)),
                     Kind::Sheep => self.set(18, Meta::Byte((self.wool & 15) as i8 | if self.sheared { 16 } else { 0 })),
                     Kind::Villager => {
                         self.set(19, Meta::Villager(self.villager));
@@ -1293,6 +1315,7 @@ impl Mob {
         }
         super::variants::load_extra(self, e);
         super::villager::load(self, e);
+        super::leash::load(self, e);
         self.nbt = Some(e.clone());
     }
 
@@ -1416,6 +1439,7 @@ impl Mob {
         }
         super::variants::save_extra(self, &mut e);
         super::villager::save(self, &mut e);
+        super::leash::save(self, &mut e);
         e
     }
 }

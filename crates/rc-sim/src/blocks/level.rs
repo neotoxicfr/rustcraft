@@ -121,6 +121,8 @@ pub(crate) enum BeTick {
     Beacon(crate::beacon::BeaconTick),
     /// G6-F12: conduit (active, tick of the next short ambient sound).
     Conduit(super::conduit::ConduitTick),
+    /// G6-F09a: active sulfur outside the dry state (countdown in the `countdown` NBT field).
+    PotentSulfur,
 }
 
 impl Sim {
@@ -208,6 +210,13 @@ impl Server {
 
     pub(crate) fn tb(&self) -> Arc<Table> {
         self.bs.t.clone()
+    }
+
+    /// Block of a state, like `v().block(s)` without copying the view (two atomic counters): for
+    /// loops that read many cells.
+    #[inline]
+    pub(crate) fn state_block(&self, s: u32) -> u16 {
+        self.data.states.get(s as usize).map_or(u16::MAX, |i| i.block)
     }
 
     pub(crate) fn top_y(&self) -> i32 {
@@ -385,6 +394,10 @@ impl Server {
             if new_kind == Kind::Jukebox && self.get(p) == state {
                 self.jukebox_ticker_sync(p, state);
             }
+            // G6-F09a: active sulfur ticker follows its state (on every state change).
+            if new_kind == Kind::PotentSulfur && self.get(p) == state {
+                self.potent_sulfur_ticker_sync(p, state);
+            }
         }
         if self.get(p) == state {
             if flags & flag::CLIENTS != 0 {
@@ -445,9 +458,13 @@ impl Server {
         if self.v().is_air(state) {
             return false;
         }
-        // Break particles; the straw bed has its own, without sound (2014).
-        let straw = self.data.block_of(state).is_some_and(|b| b.name == "minecraft:straw_bed");
-        self.level_event(if straw { 2014 } else { 2001 }, p, state as i32);
+        // Break particles; the straw bed has its own, without sound (2014); fire (and soul fire)
+        // breaks with no effect at all.
+        let fire = [self.bs.t.id.fire, self.bs.t.id.soul_fire].contains(&self.v().block(state));
+        if !fire {
+            let straw = self.data.block_of(state).is_some_and(|b| b.name == "minecraft:straw_bed");
+            self.level_event(if straw { 2014 } else { 2001 }, p, state as i32);
+        }
         // Loot before removal (empty tool), then after-break effects.
         if drop {
             self.drop_resources(p, state, None);
@@ -845,6 +862,10 @@ impl Server {
         if id == "minecraft:comparator" {
             fields.push(("OutputSignal".to_owned(), Nbt::Int(0)));
         }
+        // G6-F09a: active sulfur countdown, -1 until it has been drawn.
+        if id == "minecraft:potent_sulfur" {
+            fields.push(("countdown".to_owned(), Nbt::Int(-1)));
+        }
         if let Some(Some(c)) = self.chunks.get_mut(&(p[0] >> 4, p[2] >> 4)) {
             c.block_entities.push(Nbt::Compound(fields));
             c.dirty = true;
@@ -977,6 +998,7 @@ impl Server {
                 self.coral_try_schedule_death(state, p);
             }
             Kind::Shelf => self.shelf_on_place(p, state, old), // G6-F01: side chain
+            Kind::PotentSulfur => self.potent_sulfur_on_place(state, p), // G6-F09a
             // Frosted ice: melt scheduled at each placement (age included), 60 to 120 ticks; the
             // shorter delay drawn afterwards by its tick is then ignored (26.3).
             Kind::FrostedIce => {
@@ -1163,6 +1185,7 @@ impl Server {
             Kind::Lectern => self.lectern_tick(state, p), // G6-F01: end of the page pulse
             Kind::GrowingHead { up } | Kind::GrowingBody { up } => self.growing_tick(state, p, up),
             Kind::BigDripleaf => self.dripleaf_tick(state, p),
+            Kind::Speleothem { .. } => self.speleothem_tick(state, p), // G6-F09a
             // Stem, chorus: broken (loot) if they no longer hold.
             Kind::BigDripleafStem | Kind::ChorusFlower | Kind::ChorusPlant => {
                 if !self.can_survive(state, p) {
@@ -1202,6 +1225,8 @@ impl Server {
             }
             Kind::NoteBlock => self.note_sound(state, p),
             Kind::Chest => true,
+            // G6-F09a: start of an eruption, timed by the client.
+            Kind::PotentSulfur => true,
             // G6-F01: wobble of the decorated pot (style 0 or 1).
             Kind::DecoratedPot => a == 1 && (0..2).contains(&b),
             // Lid (opener count) of Ender chests, copper chests, Shulker boxes;

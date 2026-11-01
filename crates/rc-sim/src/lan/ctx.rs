@@ -52,6 +52,13 @@ pub struct PlayerCtx {
     pub fx: crate::effects::Effects,
     /// Hits received (death messages): specific to each player.
     pub combat: crate::vitals::Combat,
+    /// Opened lidded container (closed with the menu), tracked equipment and sent attributes,
+    /// the tick's movements and the position at the last crossed-block pass: specific to each
+    /// player.
+    pub(crate) opened: Option<[i32; 3]>,
+    pub(crate) attrs: crate::attrs::EquipAttrs,
+    pub(crate) inside: crate::inside_blocks::Moves,
+    pub(crate) inside_old: Option<[f64; 3]>,
     /// Mounted minecart and related states: specific to each player.
     pub pcart: crate::minecart::PlayerCart,
     /// Cushion the player is sitting on: specific to each player.
@@ -128,6 +135,10 @@ impl Server {
         swap(&mut l.vit, &mut c.vit);
         swap(&mut l.fx, &mut c.fx);
         swap(&mut l.combat, &mut c.combat);
+        swap(&mut l.opened, &mut c.opened);
+        swap(&mut l.attrs, &mut c.attrs);
+        swap(&mut l.inside, &mut c.inside);
+        swap(&mut l.inside_old, &mut c.inside_old);
         swap(&mut self.pcart, &mut c.pcart);
         swap(&mut self.deco.seat, &mut c.seat);
         let m = &mut *self.mobs;
@@ -228,6 +239,10 @@ impl Server {
             vit: crate::vitals::Vitals::read(&pdata.root),
             fx: crate::effects::Effects::read(&pdata.root),
             combat: Default::default(),
+            opened: None,
+            attrs: Default::default(),
+            inside: Default::default(),
+            inside_old: None,
             pcart: Default::default(),
             seat: None,
             player_hurt_by: None,

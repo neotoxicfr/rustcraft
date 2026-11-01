@@ -298,7 +298,7 @@ fn jump_vector(s: &Server, m: &Mob, target: [f64; 3], max_v: f32, angle: i32) ->
     let r2 = dir[0] * dir[0] + dir[2] * dir[2];
     let r = r2.sqrt();
     let y = dir[1];
-    let g = m.attrs.gravity.value();
+    let g = m.gravity();
     let sin2 = f64::from(2.0f32 * angrad).sin();
     let cos2 = f64::from(angrad).cos().powi(2);
     let sin_a = f64::from(angrad).sin();
@@ -502,7 +502,9 @@ pub fn ram_tick(s: &mut Server, m: &mut Mob, b: &mut Brain, dir: [f64; 3]) {
         let force = if m.is_baby() { 1.0 } else { 2.5 };
         match target {
             Ent::Player => {
-                let _ = s.player_hurt_by_mob(m, ty, dmg, Some((m.pos[0] - s.pos[0], m.pos[2] - s.pos[2])));
+                if s.player_hurt_by_mob(m, ty, dmg, Some((m.pos[0] - s.pos[0], m.pos[2] - s.pos[2]))) {
+                    s.player_thorns(m); // G5-F02d
+                }
                 // W8c: block replayed after the hit (the shield wears down a second time).
                 let blocking = s.reapply_blocking("minecraft:mob_attack", dmg, m.pos);
                 let bf = if blocking { 0.5 } else { 1.0 };

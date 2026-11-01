@@ -196,6 +196,14 @@ impl Server {
             f64::from(clicked[1]) + f64::from(at[1]),
             f64::from(clicked[2]) + f64::from(at[2]),
         ];
+        // G4-F07a: lead on a fence (sneaking: the block did not react): knot.
+        if stack.id == crate::mobs::leash::LEAD
+            && self.btag_id(clicked, crate::tag_bits::TagId::Fences)
+            && self.leash_bind_player_mobs(clicked)
+        {
+            self.award_stat("minecraft:used", &stack.id, 1);
+            return;
+        }
         // Entities placed by their item: painting, frames, armor stand, cushion.
         if self.deco_use_on(36 + self.held as usize, &stack, clicked, face, at) {
             return;
@@ -883,6 +891,9 @@ impl Server {
                 let s = v.set(def, "shape", if ew { "east_west" } else { "north_south" });
                 v.set_bool(s, "waterlogged", self.fluid_at(p).kind == 1)
             }
+            // G6-F09a: speleothems (direction from the gaze, thickness, merging) and active sulfur.
+            Kind::Speleothem { .. } => return self.speleothem_placement(def, p, ctx.sneaking, water),
+            Kind::PotentSulfur => self.potent_sulfur_state(def, p).0,
             Kind::TripwireHook => return self.hook_placement(def, p, &ctx.nearest),
             Kind::Bamboo { .. } => return self.bamboo_placement(p),
             Kind::Scaffolding => self.scaffold_placement(def, p),

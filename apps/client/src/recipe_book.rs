@@ -116,13 +116,66 @@ impl Ctx<'_> {
         self.data.registry("minecraft:data_component_type")?.entries.iter().position(|n| n == name).map(|i| i as u16)
     }
 
+    /// The stack carries the component: in its patch, or by default without having removed it.
+    fn has(&self, s: &ItemStack, c: u16) -> bool {
+        s.component(c).is_some()
+            || (!s.removed.contains(&c)
+                && usize::try_from(s.item).ok().and_then(|i| self.data.items.get(i)).is_some_and(|i| i.components.contains(&c)))
+    }
+
+    /// Colour (0..16) of a dye: the stack's `dye` component, else the default, else white.
+    fn dye_of(&self, s: &ItemStack, dye: Option<u16>) -> usize {
+        if let Some(c) = dye {
+            if let Some(b) = s.component(c) {
+                let v = rc_proto::varint::read_varint(&mut rc_proto::Reader::new(b));
+                return v.map_or(0, |v| v.clamp(0, 15) as usize);
+            }
+            if s.removed.contains(&c) {
+                return 0;
+            }
+        }
+        let info = usize::try_from(s.item).ok().and_then(|i| self.data.items.get(i));
+        info.map_or(0, |i| usize::from(i.dye.saturating_sub(1)))
+    }
+
+    /// Dyeing demo: targets × dyes (the target varies fastest), 16 at most, each target
+    /// receiving the colour mixed with its own.
+    fn dyed_demo(&self, dye: &SlotDisplay, target: &SlotDisplay) -> Vec<ItemStack> {
+        let targets = self.resolve(target);
+        let dyes = if targets.is_empty() { Vec::new() } else { self.resolve(dye) };
+        let Some(dc) = self.component("minecraft:dyed_color") else { return Vec::new() };
+        let dye_c = self.component("minecraft:dye");
+        let n = targets.len();
+        (0..n * dyes.len())
+            .take(16)
+            .map(|k| {
+                let (t, d) = (&targets[k % n], &dyes[k / n]);
+                let current = t.component(dc).and_then(|b| Some(i32::from_be_bytes(b.get(..4)?.try_into().ok()?)));
+                let color = crate::entity_render::DYE_COLORS[self.dye_of(d, dye_c)] as i32;
+                let rgb = rc_sim::mobs::apply_dyes(current, &[color]);
+                let mut s = t.clone();
+                s.count = 1;
+                s.added.retain(|a| a.0 != dc);
+                s.removed.retain(|r| *r != dc);
+                s.added.push((dc, rgb.to_be_bytes().into()));
+                s
+            })
+            .collect()
+    }
+
     /// Stacks of a slot display, in order (§ 9.4).
     pub fn resolve(&self, d: &SlotDisplay) -> Vec<ItemStack> {
         match d {
             SlotDisplay::Empty => Vec::new(),
+            // Items with a default `cooking_fuel`, grouped by value (groups in the order of their
+            // first item), in id order within a group.
             SlotDisplay::AnyFuel => {
-                let rules = FuelNames(self.item_names);
-                (0..self.item_names.len() as i32).filter(|&i| rules.is_fuel(i)).map(|i| self.stack(i)).collect()
+                let mut fuels: Vec<(u16, i32)> = (self.data.items.iter().enumerate())
+                    .filter(|(_, i)| i.fuel != 0)
+                    .map(|(k, i)| (i.fuel, k as i32))
+                    .collect();
+                fuels.sort_unstable();
+                fuels.into_iter().map(|(_, i)| self.stack(i)).collect()
             }
             SlotDisplay::WithAnyPotion(x) => {
                 let base = self.resolve(x);
@@ -143,27 +196,17 @@ impl Ctx<'_> {
                 out
             }
             SlotDisplay::OnlyWithComponent(x, c) => {
-                self.resolve(x).into_iter().filter(|s| s.added.iter().any(|a| i32::from(a.0) == *c)).collect()
+                let Ok(c) = u16::try_from(*c) else { return Vec::new() };
+                self.resolve(x).into_iter().filter(|s| self.has(s, c)).collect()
             }
             SlotDisplay::Item(i) => vec![self.stack(*i)],
             SlotDisplay::Stack(s) => vec![s.clone()],
             SlotDisplay::Tag(h) => self.holder_set(h).into_iter().map(|i| self.stack(i)).collect(),
-            SlotDisplay::Dyed(_, target) => self.resolve(target).into_iter().take(16).collect(),
+            SlotDisplay::Dyed(dye, target) => self.dyed_demo(dye, target),
             SlotDisplay::SmithingTrim(base, _) => self.resolve(base).into_iter().take(16).collect(),
             SlotDisplay::WithRemainder(x) => self.resolve(x),
             SlotDisplay::Composite(l) => l.iter().flat_map(|x| self.resolve(x)).collect(),
         }
-    }
-}
-
-/// Fuels approximated by name (like the furnace prediction, `inventories.md` § 6.2).
-struct FuelNames<'a>(&'a [String]);
-
-impl FuelNames<'_> {
-    fn is_fuel(&self, i: i32) -> bool {
-        let n = self.0.get(i as usize).map_or("", |n| n.strip_prefix("minecraft:").unwrap_or(n));
-        matches!(n, "coal" | "charcoal" | "coal_block" | "lava_bucket" | "blaze_rod" | "stick" | "bamboo")
-            || ["_log", "_planks", "_wood", "_stem", "_sapling", "_slab", "_fence"].iter().any(|e| n.ends_with(e))
     }
 }
 
@@ -1229,6 +1272,59 @@ mod tests {
         assert_eq!(overlay_origin((0, 140), 8, 4, (100, 100)), (0, 90));
         // Right: 4 columns from x = 120 → 220 > 150, overflow 70 → 2 buttons.
         assert_eq!(overlay_origin((120, 0), 4, 4, (100, 100)), (70, 0));
+    }
+
+    /// Slot displays resolved like the game: fuels from `cooking_fuel` (grouped by value),
+    /// default components, coloured dyeing demo.
+    #[test]
+    fn slot_displays_follow_item_components() {
+        let data = rc_testdata::version_data().expect("version data missing (extraction)");
+        let names = data.registry("minecraft:item").expect("item registry").entries.clone();
+        let rec = Received::default();
+        let ctx = Ctx { data: &data, rec: &rec, item_names: &names };
+        let id = |n: &str| names.iter().position(|x| x == &format!("minecraft:{n}")).expect(n) as i32;
+        let items = |v: &[ItemStack]| v.iter().map(|s| s.item).collect::<Vec<_>>();
+        // Fuels: 347 items from the report, each value in one block.
+        let fuels = items(&ctx.resolve(&SlotDisplay::AnyFuel));
+        assert_eq!(fuels.len(), 347);
+        for n in ["coal", "oak_planks", "lava_bucket", "white_wool", "dried_kelp_block"] {
+            assert!(fuels.contains(&id(n)), "{n} fuel");
+        }
+        for n in ["stone_slab", "crimson_stem", "bucket"] {
+            assert!(!fuels.contains(&id(n)), "{n} not a fuel");
+        }
+        let groups: Vec<u16> = fuels.iter().map(|&i| data.items[i as usize].fuel).collect();
+        assert!(groups.windows(2).all(|w| w[0] <= w[1]), "values grouped");
+        // Default component: the red dye carries `dye` without a patch.
+        let comp = |n: &str| ctx.component(n).expect(n);
+        let only = SlotDisplay::OnlyWithComponent(
+            Box::new(SlotDisplay::Composite(vec![SlotDisplay::Item(id("red_dye")), SlotDisplay::Item(id("stone"))])),
+            i32::from(comp("minecraft:dye")),
+        );
+        assert_eq!(items(&ctx.resolve(&only)), vec![id("red_dye")]);
+        // Dyeing: fastest target, colour of the dye (red 0xB02E26, blue 0x3C44AA).
+        let both = |a: &str, b: &str| {
+            Box::new(SlotDisplay::Composite(vec![SlotDisplay::Item(id(a)), SlotDisplay::Item(id(b))]))
+        };
+        let dyed = ctx.resolve(&SlotDisplay::Dyed(both("red_dye", "blue_dye"), both("leather_helmet", "leather_boots")));
+        let dc = comp("minecraft:dyed_color");
+        let shown: Vec<(i32, i32)> = dyed
+            .iter()
+            .map(|s| (s.item, i32::from_be_bytes(s.component(dc).expect("colour").try_into().unwrap())))
+            .collect();
+        let (h, b) = (id("leather_helmet"), id("leather_boots"));
+        assert_eq!(shown, vec![(h, 0xB02E26), (b, 0xB02E26), (h, 0x3C44AA), (b, 0x3C44AA)]);
+        // Target already dyed: mixture (black 0x1D1D21 + white 0xF9FFFE).
+        let black = ItemStack { item: h, count: 3, added: vec![(dc, 0x1D1D21i32.to_be_bytes().into())], removed: Vec::new() };
+        let mixed = ctx.resolve(&SlotDisplay::Dyed(
+            Box::new(SlotDisplay::Item(id("white_dye"))),
+            Box::new(SlotDisplay::Stack(black)),
+        ));
+        assert_eq!(mixed.len(), 1);
+        assert_eq!(mixed[0].count, 1);
+        let rgb = i32::from_be_bytes(mixed[0].component(dc).unwrap().try_into().unwrap());
+        assert_eq!(rgb, rc_sim::mobs::apply_dyes(Some(0x1D1D21), &[0xF9FFFE]));
+        assert_eq!(mixed[0].added.iter().filter(|a| a.0 == dc).count(), 1);
     }
 
     #[test]

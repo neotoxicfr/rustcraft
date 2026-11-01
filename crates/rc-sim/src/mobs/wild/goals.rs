@@ -251,6 +251,7 @@ impl Server {
                 !trusted
                     && fox::has_last_hurt_mob(self, a)
                     && self.targeting_ok(m, a, true, m.follow_range(), base.must_see, true)
+                    && self.target_in_home(m, a)
             }
             WGoal::PandaBreed { inner, cd } => {
                 if !self.goal_can_use(inner, m) || m.wild.unhappy != 0 {
@@ -313,7 +314,7 @@ impl Server {
                 if by == Ent::Player && self.rule("minecraft:universal_anger", false) {
                     return false;
                 }
-                self.targeting_ok(m, by, true, -1.0, base.must_see, true)
+                self.targeting_ok(m, by, true, -1.0, base.must_see, true) && self.target_in_home(m, by)
             }
         }
     }
@@ -795,6 +796,7 @@ impl Server {
     fn go_to_hive_ok(&self, m: &Mob) -> bool {
         let Some(h) = m.wild.hive else { return false };
         !bee::too_far(m, h)
+            && super::super::goals::rpos_home(m).is_none()
             && bee::wants_to_enter_hive(self, m)
             && !bee::closer_than(m, h, 2)
             && !path_reached(m, h)
@@ -1172,7 +1174,7 @@ impl Server {
                     let mut z = if x < r && x > -r { r } else { 0 };
                     while z <= r {
                         let p = [o[0] + x, o[1] + y - 1, o[2] + z];
-                        if fox::berry_target(self, p) {
+                        if super::super::goals::within_home(m, p) && fox::berry_target(self, p) {
                             return Some(p);
                         }
                         z = if z > 0 { -z } else { 1 - z };
@@ -1269,7 +1271,7 @@ impl Server {
 
 fn go_to_flower_ok(m: &Mob) -> bool {
     let Some(f) = m.wild.flower else { return false };
-    m.wild.no_nectar_ticks > 600 && !bee::closer_than(m, f, 2)
+    super::super::goals::rpos_home(m).is_none() && m.wild.no_nectar_ticks > 600 && !bee::closer_than(m, f, 2)
 }
 
 /// The current path reaches the hive and is finished.

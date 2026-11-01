@@ -619,7 +619,7 @@ fn placed_eyeblossom_schedules_its_tick() {
     let closed = wd.blocks.block_id("closed_eyeblossom").expect("closed eyeblossom");
     let mut dc = p.s.deco_chunk(ch.0, ch.1, &dg, &wd);
     dc.block_ticks.push((at, closed, 1));
-    assert_eq!(p.s.apply_deco(&dc, &wd.blocks), 0, "no block changed");
+    assert_eq!(p.s.apply_deco(std::slice::from_ref(&dc), &wd.blocks), 0, "no block changed");
     let ticks = p.s.bs.block_ticks.chunk_ticks(ch);
     assert!(
         ticks.iter().any(|t| t.pos == at && t.kind == u32::from(id) && t.at == p.s.time + 1),
@@ -640,7 +640,7 @@ fn deco_fluid_tick_reaches_live_world() {
     let (wd, dg) = p.s.place_data().expect("generation data");
     let mut dc = p.s.deco_chunk(ch.0, ch.1, &dg, &wd);
     dc.fluid_ticks.push((w, 0));
-    assert_eq!(p.s.apply_deco(&dc, &wd.blocks), 0, "no block changed");
+    assert_eq!(p.s.apply_deco(std::slice::from_ref(&dc), &wd.blocks), 0, "no block changed");
     let ticks = p.s.bs.fluid_ticks.chunk_ticks(ch);
     assert!(ticks.iter().any(|t| t.pos == w && t.kind == 1 && t.at == p.s.time), "water tick missing: {ticks:?}");
     done(p, dir);

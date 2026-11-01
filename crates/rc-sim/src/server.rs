@@ -57,9 +57,17 @@ pub struct Handle {
     sim: Arc<AtomicI32>,
     /// World preparation (loading screen: progress, chunk map).
     prep: Arc<crate::prep::Prep>,
+    /// F3 generator lines (the "chunk_generation_stats" entry).
+    gen_debug: Arc<crate::gen_debug::GenDebug>,
 }
 
 impl Handle {
+    /// F3 generator lines at the `feet` block (last computed; the request is picked up on the
+    /// server's next loop turn).
+    pub fn gen_debug(&self, feet: [i32; 3]) -> Vec<String> {
+        self.gen_debug.request(feet)
+    }
+
     /// World preparation read by the loading screen.
     pub fn prep(&self) -> Arc<crate::prep::Prep> {
         self.prep.clone()
@@ -112,6 +120,8 @@ pub fn start(opts: Options, data: Arc<VersionData>) -> Result<(rc_client::Sessio
     let sm = sim.clone();
     let prep = Arc::new(crate::prep::Prep::default());
     let pr = prep.clone();
+    let gen_debug: Arc<crate::gen_debug::GenDebug> = Arc::default();
+    let gd = gen_debug.clone();
     let thread = std::thread::Builder::new().name("singleplayer".into()).stack_size(SOLO_STACK).spawn(move || {
         let _ = peer.send(Event::LoginFinished);
         match Server::open(opts, uuid, data, peer, p) {
@@ -119,6 +129,7 @@ pub fn start(opts: Options, data: Arc<VersionData>) -> Result<(rc_client::Sessio
                 s.saving = sv;
                 s.publish_req = pb; // S9
                 s.sim_req = sm; // W9: tracked simulation distance
+                s.gen_debug = gd;
                 s.prep_open(pr);
                 s.run()
             }
@@ -129,7 +140,7 @@ pub fn start(opts: Options, data: Arc<VersionData>) -> Result<(rc_client::Sessio
             }
         }
     })?;
-    Ok((session, Handle { thread: Some(thread), paused, saving, publish, sim, prep }))
+    Ok((session, Handle { thread: Some(thread), paused, saving, publish, sim, prep, gen_debug }))
 }
 
 /// Slot of a chunk on the server side: loaded, or absent / not loadable (nothing sent).
@@ -157,6 +168,8 @@ pub struct Server {
     /// Simulation distance (client setting) and its shared request.
     pub(crate) sim_dist: i32,
     pub(crate) sim_req: Arc<AtomicI32>,
+    /// F3 generator lines requested by the client (`gen_debug.rs`).
+    pub(crate) gen_debug: Arc<crate::gen_debug::GenDebug>,
     was_paused: bool,
     pub(crate) tick: u64,
     // Player.
@@ -242,6 +255,9 @@ pub struct Server {
     pub(crate) life: Box<crate::life::Life>,
     /// Mobs (S4, `mobs/`).
     pub(crate) mobs: Box<crate::mobs::Mobs>,
+    /// Entity walk of the tick in progress (a single counter for all dimensions): what is born
+    /// in it waits for the next tick (`mobs::Walk`).
+    pub(crate) walk: crate::mobs::Walk,
     /// Simulated decorations (paintings, frames, armor stands, cushions, `decoration/`).
     pub(crate) deco: Box<crate::decoration::Decos>,
     /// Generation of missing chunks (`generation.rs`).
@@ -255,6 +271,8 @@ pub struct Server {
     /// Projectiles of the open world and shooting player's state (S8, `projectiles/`).
     pub(crate) proj: Box<crate::projectiles::Projs>,
     pub(crate) proj_player: Box<crate::projectiles::PlayerProj>,
+    /// Contacts with crossed blocks and the player's enchanted boots (G5-F02e, `contact.rs`).
+    pub(crate) contact: Box<crate::contact::Contact>,
     /// Minecarts of the open world and the player's minecart (G5-F06, `minecart/`).
     pub(crate) carts: Box<crate::minecart::Carts>,
     pub(crate) pcart: crate::minecart::PlayerCart,
@@ -393,9 +411,11 @@ impl Server {
             cmd,
             life,
             mobs: Box::default(),
+            walk: crate::mobs::Walk::default(),
             deco: Box::default(),
             proj: Box::default(),        // S8
             proj_player: Box::default(), // S8
+            contact: Box::default(),     // G5-F02e
             carts: Box::default(),       // G5-F06
             pcart: crate::minecart::PlayerCart::default(),
             maps: Box::default(), // S8
@@ -414,6 +434,7 @@ impl Server {
             saving: Arc::new(AtomicBool::new(false)),
             sim_dist: opts.sim_distance.max(2),
             sim_req: Arc::new(AtomicI32::new(opts.sim_distance.max(2))),
+            gen_debug: Arc::default(),
             was_paused: false,
             tick: 0,
             player_id: 1,
@@ -677,10 +698,18 @@ impl Server {
 
     /// Absolute teleport (§ 4.1): next number, expected position.
     pub(crate) fn teleport_to(&mut self, pos: [f64; 3]) {
+        self.begin_teleport(pos);
+        self.send_teleport();
+    }
+
+    /// Server teleport of the player (every send): next id, position set and expected; like the
+    /// game, the tick's movements are forgotten and the old position is reset (the crossed-block
+    /// pass does not sweep the path).
+    pub(crate) fn begin_teleport(&mut self, pos: [f64; 3]) {
         self.teleport_id = if self.teleport_id == i32::MAX { 0 } else { self.teleport_id + 1 };
         self.pos = pos;
         self.teleport = Some((self.teleport_id, pos, self.tick));
-        self.send_teleport();
+        self.inside_forget_player();
     }
 
     pub(crate) fn send_teleport(&self) {
@@ -1018,6 +1047,7 @@ impl Server {
             Input::Move { pos, rot, on_ground } => {
                 let (before, was) = (self.pos, self.on_ground);
                 self.on_move(pos, rot, on_ground);
+                self.inside_record_player(before); // G5-F02a: read back by the crossed-block pass
                 self.after_move(before, was); // S2: fall, exhaustion
                 self.progress_after_move(before, was); // S9: statistics, blocks crossed
                 self.rec_player_moved(before); // F14: step vibrations, shrieker
@@ -1182,6 +1212,7 @@ impl Server {
                 self.sim_dist = sd;
                 let _ = self.send(Event::SimulationDistance(sd));
             }
+            self.gen_debug_tick();
             let method_start = Instant::now();
             // (2) tick, outside pause (§ 9); an open world does not pause.
             let paused = self.paused.load(Ordering::Acquire) && self.lan.is_none();

@@ -83,7 +83,9 @@ impl Server {
     pub(crate) fn wind_on_hit_entity(&mut self, p: &mut Proj, t: Ent, living: bool) {
         let owner = self.proj_owner(p);
         self.set_last_hurt_mob(owner, living.then_some(t));
-        self.proj_damage(t, "minecraft:wind_charge", 1.0, owner, (-p.vel[0], -p.vel[2]));
+        if self.proj_damage(t, "minecraft:wind_charge", 1.0, owner, (-p.vel[0], -p.vel[2])) && t == Ent::Player {
+            self.player_thorns_by(owner); // G5-F02d
+        }
         let c = p.pos;
         self.wind_explode(p, c);
     }
@@ -114,7 +116,7 @@ impl Server {
             return false;
         }
         if p.last_deflected_by != Some(Ent::Mob(id)) {
-            let seed = self.mobs.rng.next_long();
+            let seed = crate::vitals::sound_seed();
             if let Some(sid) = self.sound_id("minecraft:entity.breeze.deflect") {
                 let category = self.mob_ref(id).map_or(5, |o| o.sound_category());
                 let _ = self.send(Event::Sound(SoundPacket {
@@ -228,6 +230,11 @@ impl Server {
                 Ent::Player => {
                     // W8c: impact point and cause (`fall_after_explosion`).
                     self.prog.expl_impact = Some((self.pos, self.prog.expl_cause_next.map(str::to_owned)));
+                    // Player's wind charge (not the breeze's): the fall that follows is bounded
+                    // to the height from here.
+                    let wind_charge = self.prog.expl_cause_next == Some("minecraft:wind_charge");
+                    let at = self.pos;
+                    self.life.vit.impulse_from_explosion(wind_charge, at);
                     if !(self.game_mode == 1 && self.flying) {
                         player_kb = Some(kb);
                     }

@@ -22,6 +22,7 @@ mod animals;
 mod blocks;
 pub use blocks::BlockFrame;
 mod creatures;
+pub(crate) use creatures::{warden_beat, warden_dig_ticks};
 // Transient blocks (`docs/specs/miscellaneous.md` § 5.5).
 mod misc;
 mod dragon;
@@ -41,6 +42,9 @@ mod tests_g2f03;
 mod tests_g2f05;
 #[cfg(test)]
 mod tests_c3m11;
+// Dragon effects, creaking tearing itself down (mission G4-F16a).
+#[cfg(test)]
+mod tests_g4f16a;
 // Non-living entities and projectiles (`docs/specs/entities-objects.md`): complete rendering outside the
 // animated-models path (`push_object`), block models inside an entity.
 mod objects;
@@ -86,8 +90,9 @@ pub fn party_track(ents: &mut crate::entities::Entities, is_jukebox: &dyn Fn([i3
     animals::party_track(ents, is_jukebox);
 }
 
-/// Water contact of the kinds whose pose depends on it (frog, turtle, equines), noted
-/// before their tick like the game; nothing is computed for the others.
+/// Water contact of the kinds whose pose depends on it (frog, turtle, equines, guardians), noted
+/// before their tick like the game; nothing is computed for the others. Guardians: also whether
+/// the block under them is solid (full top face), extra 9, for their flop out of the water.
 pub fn water_track(
     ents: &mut crate::entities::Entities,
     data: &rc_data::VersionData,
@@ -96,10 +101,57 @@ pub fn water_track(
 ) {
     let mask = water_fluids(data);
     for e in ents.map.values_mut() {
-        if animals::water_posed(&e.kind) {
+        let guardian = matches!(e.kind.as_str(), "guardian" | "elder_guardian");
+        if guardian || animals::water_posed(&e.kind) {
             e.in_water = touches_water(data, dims, e, state, mask);
         }
+        if guardian {
+            let below = [e.pos[0].floor() as i32, e.pos[1].floor() as i32 - 1, e.pos[2].floor() as i32];
+            let top = data.state(state(below[0], below[1], below[2])).is_some_and(|s| top_full(data.shape(s.collision)));
+            e.extra[9] = f32::from(u8::from(top));
+        }
     }
+}
+
+/// Start tick of the sniffer's digging animation (extra 1), if it is running.
+pub fn sniffer_dig_start(e: &Entity) -> Option<f32> {
+    keyframes::State::start_of(e.extra[1])
+}
+
+/// Whether the top face of a collision shape is entirely covered (exact union of the boxes
+/// that reach it: grid of the edges, each cell tested at its center).
+fn top_full(boxes: &[rc_data::Aabb]) -> bool {
+    const E: f64 = 1e-7;
+    let top = || boxes.iter().filter(|b| b.max[1] >= 1.0 - E);
+    // Common case: one box covers the whole face.
+    if top().any(|b| b.min[0] <= E && b.min[2] <= E && b.max[0] >= 1.0 - E && b.max[2] >= 1.0 - E) {
+        return true;
+    }
+    // Otherwise, edges of the top boxes (at most 8, no allocation) and each cell of the grid.
+    let (mut xs, mut zs) = ([0.0f64; 18], [0.0f64; 18]);
+    (xs[1], zs[1]) = (1.0, 1.0);
+    let mut n = 2;
+    for b in top() {
+        if n == xs.len() {
+            return false;
+        }
+        (xs[n], xs[n + 1]) = (b.min[0].clamp(0.0, 1.0), b.max[0].clamp(0.0, 1.0));
+        (zs[n], zs[n + 1]) = (b.min[2].clamp(0.0, 1.0), b.max[2].clamp(0.0, 1.0));
+        n += 2;
+    }
+    if n == 2 {
+        return false;
+    }
+    let (xs, zs) = (&mut xs[..n], &mut zs[..n]);
+    xs.sort_by(f64::total_cmp);
+    zs.sort_by(f64::total_cmp);
+    xs.windows(2).filter(|w| w[1] - w[0] > E).all(|wx| {
+        let cx = (wx[0] + wx[1]) / 2.0;
+        zs.windows(2).filter(|w| w[1] - w[0] > E).all(|wz| {
+            let cz = (wz[0] + wz[1]) / 2.0;
+            top().any(|b| b.min[0] <= cx && cx <= b.max[0] && b.min[2] <= cz && cz <= b.max[2])
+        })
+    })
 }
 
 /// Bits of the water fluids (indices of `fluids`), read once per call rather than per block.
@@ -1688,7 +1740,7 @@ impl Pass {
     }
 }
 
-const DYE_COLORS: [u32; 16] = [
+pub(crate) const DYE_COLORS: [u32; 16] = [
     0xF9FFFE, 0xF9801D, 0xC74EBD, 0x3AB3DA, 0xFED83D, 0x80C71F, 0xF38BAA, 0x474F52, 0x9D9D97, 0x169C9C, 0x8932B8,
     0x3C44AA, 0x835432, 0x5E7C16, 0xB02E26, 0x1D1D21,
 ];
@@ -4174,8 +4226,7 @@ impl EntityRenderer {
             }
         };
         let packed = (u32::from(block) * 16) | ((u32::from(s) * 16) << 8);
-        // The dragon is not a living-entity render: red overlay on damage only.
-        let red = e.hurt_time > 0 || (e.death_time > 0 && e.kind != "ender_dragon");
+        let red = red_overlay(e);
         let mut white = 0.0f32;
         // Swallowed content of the sulfur cube (block or skull), resolved once for the frame.
         let swallowed = if e.kind == "sulfur_cube" { self.swallowed(e) } else { None };
@@ -6427,7 +6478,8 @@ fn sort_far_to_near(list: &mut [(u8, u32, u32, Instance)], mats: &[PartMat], eye
 /// Animation of a layer depending on the entity kind (`entities.md` part 3 § 2).
 /// Alpha of the glowing layers: warden (0 bioluminescence 1; 1 and 2 pulsing spots
 /// max(0, cos(age × 0.045 [+ π]) × 0.25); 3 tentacles; 4 heart, beating every
-/// 40 − ⌊anger/80 × 30⌋ ticks for 10 ticks), 5 eyes of the active creaking.
+/// 40 − ⌊anger/80 × 30⌋ ticks for 10 ticks), 5 eyes of the creaking (active, or blinking
+/// while it tears itself down).
 fn pulse_alpha(e: &Entity, id: u8, pt: f32) -> f32 {
     let age = e.age as f32 + pt;
     match id {
@@ -6435,17 +6487,20 @@ fn pulse_alpha(e: &Entity, id: u8, pt: f32) -> f32 {
         1 => ((age * 0.045).cos() * 0.25).max(0.0),
         2 => ((age * 0.045 + PI).cos() * 0.25).max(0.0),
         3 => (e.extra[2] + pt * (e.extra[1] - e.extra[2])) / 10.0,
-        4 => {
-            let anger = (e.meta_int(16).unwrap_or(0) as f32 / 80.0).clamp(0.0, 1.0);
-            let delay = 40 - (anger * 30.0).floor() as u32;
-            // Beat at the tick multiple of the delay: 10 then countdown (after the tick: 9).
-            let k = e.age % delay;
-            let (now, before) = ((9i32 - k as i32).max(0) as f32, (10i32 - k as i32).max(0) as f32);
-            (before + pt * (now - before)) / 10.0
-        }
+        // Heart counter held by the tick (`creatures::tick`, extra 9 current, 10 old): a change
+        // of anger does not interrupt a beat in progress.
+        4 => (e.extra[10] + pt * (e.extra[9] - e.extra[10])) / 10.0,
+        // Creaking: eyes blink while it tears itself down, otherwise lit if it is active.
+        5 if creatures::creaking_tearing(e) => e.extra[5],
         5 => f32::from(u8::from(e.meta_bool(17))),
         _ => 1.0,
     }
+}
+
+/// Red overlay on injury or death. The dragon is not a living-entity render: damage only;
+/// a creaking tearing itself down never has one.
+fn red_overlay(e: &Entity) -> bool {
+    (e.hurt_time > 0 || (e.death_time > 0 && e.kind != "ender_dragon")) && !creatures::creaking_tearing(e)
 }
 
 /// Inputs of a living entity's pose rotations.
@@ -6492,8 +6547,8 @@ fn pose_rotations(e: &Entity, pt: f32, body: f32, m: &mut Mat4, c: &RotCtx) {
         if matches!(e.kind.as_str(), "spider" | "cave_spider" | "endermite" | "silverfish") { 180.0 } else { 90.0 };
     let spin = e.meta_byte(8) & 4 != 0;
     if !base_rot {
-    } else if e.death_time > 0 {
-        // Death tilt.
+    } else if e.death_time > 0 && !creatures::creaking_tearing(e) {
+        // Death tilt (not for a creaking tearing itself down: counter rendered as zero).
         let t = e.death_time as f32 - 1.0 + pt;
         let f = (t / 20.0 * 1.6).sqrt().min(1.0);
         *m *= Mat4::from_rotation_z(deg(f * flip));
@@ -7495,6 +7550,26 @@ mod tests {
     use super::keyframes::testkit;
     use rc_proto_v777::entity::Meta;
 
+    /// Full top face (solid ground for the guardian's flop): full block, union of two
+    /// halves, high slab; not a low slab, a hole in the middle or a single half.
+    #[test]
+    fn top_face_full_by_union() {
+        let b = |min: [f64; 3], max: [f64; 3]| rc_data::Aabb { min, max };
+        assert!(top_full(&[b([0.0; 3], [1.0; 3])]));
+        assert!(top_full(&[b([0.0, 0.0, 0.0], [0.5, 1.0, 1.0]), b([0.5, 0.0, 0.0], [1.0, 1.0, 1.0])]));
+        assert!(top_full(&[b([0.0, 0.5, 0.0], [1.0, 1.0, 1.0])]));
+        assert!(!top_full(&[b([0.0; 3], [1.0, 0.5, 1.0])]));
+        assert!(!top_full(&[b([0.0, 0.0, 0.0], [0.5, 1.0, 1.0])]));
+        assert!(!top_full(&[]));
+        let ring = [
+            b([0.0, 0.0, 0.0], [1.0, 1.0, 0.25]),
+            b([0.0, 0.0, 0.75], [1.0, 1.0, 1.0]),
+            b([0.0, 0.0, 0.0], [0.25, 1.0, 1.0]),
+            b([0.75, 0.0, 0.0], [1.0, 1.0, 1.0]),
+        ];
+        assert!(!top_full(&ring));
+    }
+
     /// Valid entity shader (emissive, flat, scrolling flags included).
     #[test]
     fn entity_shader_validates() {
@@ -7595,12 +7670,26 @@ mod tests {
         let e = all.map.get_mut(&7).unwrap();
         e.age = 0;
         assert!((pulse_alpha(e, 1, 0.0) - 0.25).abs() < 1e-6 && pulse_alpha(e, 2, 0.0) == 0.0);
-        assert!((pulse_alpha(e, 4, 0.0) - 1.0).abs() < 1e-6 && (pulse_alpha(e, 4, 1.0) - 0.9).abs() < 1e-6);
-        e.age = 39;
-        assert_eq!(pulse_alpha(e, 4, 0.5), 0.0);
-        e.meta.insert(16, Meta::Int(80));
-        e.age = 20;
-        assert!((pulse_alpha(e, 4, 0.0) - 1.0).abs() < 1e-6, "maximum anger: delay 10");
+        // Heart: beat at tick 40 (delay 40 without anger), 10 -> 9 on that tick.
+        for _ in 0..39 {
+            all.tick();
+        }
+        let a = |all: &crate::entities::Entities, pt| pulse_alpha(&all.map[&7], 4, pt);
+        assert_eq!(a(&all, 0.5), 0.0);
+        all.tick();
+        assert!((a(&all, 0.0) - 1.0).abs() < 1e-6 && (a(&all, 1.0) - 0.9).abs() < 1e-6);
+        // Anger 40 (delay 25) in the middle of a beat: the countdown continues (0.5 at tick 45,
+        // a modulo of the age would give 0), then beats at tick 50.
+        for _ in 0..4 {
+            all.tick();
+        }
+        all.map.get_mut(&7).unwrap().meta.insert(16, Meta::Int(40));
+        all.tick();
+        assert!((a(&all, 0.0) - 0.5).abs() < 1e-6, "{}", a(&all, 0.0));
+        for _ in 0..5 {
+            all.tick();
+        }
+        assert!((a(&all, 0.0) - 1.0).abs() < 1e-6, "anger 40: delay 25");
     }
 
     fn rot_ctx() -> RotCtx {

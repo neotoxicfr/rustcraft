@@ -284,15 +284,12 @@ pub fn huge_fungus(cx: &mut Ctx, f: &HugeFungus, rng: &mut DecoRng, o: [i32; 3])
     if rng.next_int_bounded(12) == 0 {
         total *= 2;
     }
-    if f.planted {
-        // Planted variant (bone meal): outside natural decoration.
-        cx.note_missing("huge_fungus (planted)");
+    // Planted variant (bone meal): no generator ceiling, no huge stem (so no random draw), and
+    // every replaced cell standing on a non-empty block is first broken with drops.
+    if !f.planted && o[1] + total + 1 >= cx.r.generator_depth {
         return false;
     }
-    if o[1] + total + 1 >= cx.r.generator_depth {
-        return false;
-    }
-    let huge = rng.next_float() < 0.06;
+    let huge = !f.planted && rng.next_float() < 0.06;
     cx.r.set_p(o, b.default_state(b.k.air), 260);
     // Stem.
     let sr = i32::from(huge);
@@ -302,7 +299,12 @@ pub fn huge_fungus(cx: &mut Ctx, f: &HugeFungus, rng: &mut DecoRng, o: [i32; 3])
             for dy in 0..total {
                 let p = [o[0] + dx, o[1] + dy, o[2] + dz];
                 if fungus_replaceable(cx, f, p, true) {
-                    if corner {
+                    if f.planted {
+                        if !b.is_air(cx.r.get_p(add(p, Dir::Down))) {
+                            cx.r.destroy_p(p);
+                        }
+                        cx.r.set_p(p, f.stem, 3);
+                    } else if corner {
                         if rng.next_float() < 0.1 {
                             cx.r.set_p(p, f.stem, 3);
                         }
@@ -335,6 +337,9 @@ pub fn huge_fungus(cx: &mut Ctx, f: &HugeFungus, rng: &mut DecoRng, o: [i32; 3])
                 let p = [o[0] + dx, o[1] + dy, o[2] + dz];
                 if !fungus_replaceable(cx, f, p, false) {
                     continue;
+                }
+                if f.planted && !b.is_air(cx.r.get_p(add(p, Dir::Down))) {
+                    cx.r.destroy_p(p);
                 }
                 if bottom {
                     if !inside {

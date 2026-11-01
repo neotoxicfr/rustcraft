@@ -87,6 +87,8 @@ pub struct Brain {
     pub sense_living: i64,
     pub sense_hurt: i64,
     pub visible: Vec<Ent>,
+    /// Nearby living entities perceived (tracking range), seen or not: fellow mobs crossing a door.
+    pub nearest: Vec<Ent>,
     pub hurt_by: Option<String>,
     pub hurt_by_entity: Option<Ent>,
     // Memories.
@@ -119,6 +121,10 @@ pub struct Brain {
     pub shuffle: JRand,
     /// Path kept by the walk toward the target.
     pub pending: Option<super::super::nav::Path>,
+    /// Open doors to close again, last node seen and delay of the door behaviour.
+    pub doors: Option<Vec<[i32; 3]>>,
+    pub door_last: Option<[i32; 3]>,
+    pub door_cd: i32,
 }
 
 impl Default for Brain {
@@ -127,6 +133,7 @@ impl Default for Brain {
             sense_living: 0,
             sense_hurt: 0,
             visible: Vec::new(),
+            nearest: Vec::new(),
             hurt_by: None,
             hurt_by_entity: None,
             walk: None,
@@ -154,6 +161,9 @@ impl Default for Brain {
             do_nothing: Run::default(),
             shuffle: JRand::from_time(0x00C0_FFEE),
             pending: None,
+            doors: None,
+            door_last: None,
+            door_cd: 0,
         }
     }
 }
@@ -291,6 +301,9 @@ fn turn_to_statue(s: &mut Server, m: &mut Mob) {
     s.drop_preserved_equipment(m);
     m.removed = true;
     s.mob_sound(m, "minecraft:entity.copper_golem_become_statue", 1.0, 1.0);
+    // Held animal: the lead falls, the item only if the entity-drops rule allows it.
+    let drops = s.rule("minecraft:entity_drops", true);
+    s.leash_drop(m, true, drops);
 }
 
 impl Server {
@@ -425,13 +438,18 @@ fn sensors(s: &mut Server, m: &mut Mob) {
             list.push((dist2(m.pos, s.pos), Ent::Player));
         }
         list.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let mut visible = Vec::new();
+        let mut visible = std::mem::take(&mut m.golem.brain.visible);
+        let mut nearest = std::mem::take(&mut m.golem.brain.nearest);
+        visible.clear();
+        nearest.clear();
         for (_, e) in list {
+            nearest.push(e);
             if s.targeting_ok(m, e, false, f, true, true) {
                 visible.push(e);
             }
         }
         m.golem.brain.visible = visible;
+        m.golem.brain.nearest = nearest;
     }
     // Recent hurt (40 ticks).
     m.golem.brain.sense_hurt -= 1;
@@ -512,6 +530,15 @@ fn start_behaviors(s: &mut Server, m: &mut Mob) {
                 break;
             }
         }
+    }
+    // Priority 3: doors on the path (one-shot trigger, path memory present).
+    if m.golem.brain.path {
+        let mut doors = m.golem.brain.doors.take();
+        let (mut last, mut cd) = (m.golem.brain.door_last, m.golem.brain.door_cd);
+        let near = std::mem::take(&mut m.golem.brain.nearest);
+        s.path_doors_step(m, &mut doors, &mut last, &mut cd, Some(&near));
+        let b = &mut m.golem.brain;
+        (b.doors, b.door_last, b.door_cd, b.nearest) = (doors, last, cd, near);
     }
     // Priority 5: transport cooldown countdown.
     if !m.golem.brain.cd_transport && m.golem.brain.transport_cd.is_some() {

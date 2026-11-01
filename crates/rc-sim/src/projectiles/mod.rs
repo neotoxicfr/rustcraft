@@ -119,6 +119,26 @@ impl PKind {
         matches!(self, PKind::Arrow | PKind::SpectralArrow | PKind::Trident)
     }
 
+    /// Tag `minecraft:impact_projectiles` (frozen, compared with the jar by a test): only these
+    /// kinds can break a block on impact (decorated pot, chorus flower, speleothem).
+    pub fn impact(self) -> bool {
+        matches!(
+            self,
+            PKind::Arrow
+                | PKind::SpectralArrow
+                | PKind::Firework
+                | PKind::Snowball
+                | PKind::LargeFireball
+                | PKind::SmallFireball
+                | PKind::Egg
+                | PKind::Trident
+                | PKind::DragonFireball
+                | PKind::WitherSkull
+                | PKind::WindCharge
+                | PKind::BreezeWindCharge
+        )
+    }
+
     /// Thrown item.
     pub fn throwable(self) -> bool {
         matches!(
@@ -261,6 +281,8 @@ pub struct Proj {
     pub fire: i32,
     pub in_water: bool,
     pub first_tick: bool,
+    /// Number of the entity walk it was born in (0: outside the walk), read by `mobs::Walk`.
+    pub born: u64,
     pub on_ground: bool,
     pub horizontal_collision: bool,
     pub no_gravity: bool,
@@ -424,6 +446,7 @@ impl Proj {
             fire: 0,
             in_water: false,
             first_tick: true,
+            born: 0,
             on_ground: false,
             horizontal_collision: false,
             no_gravity: false,
@@ -597,6 +620,10 @@ impl Server {
     /// Addition to the world: the player is paired at once.
     pub(crate) fn proj_add(&mut self, mut p: Proj) {
         p.sync_arrow_flags();
+        // The entity walk does not see what is added to it along the way: a projectile launched
+        // during this walk (mob, ominous spawner, command block minecart) makes its first
+        // tick on the next server tick.
+        p.born = self.walk.born();
         if self.proj_visible(&p) {
             self.proj_pair(&mut p);
         }
@@ -786,6 +813,8 @@ impl Server {
         self.proj_player_touch();
         self.spin_attack_tick();
         self.proj_retain();
+        // End of the entity walk (started before the first mob).
+        self.walk.end();
     }
 
     /// Projectiles of a parked dimension (portal ticket or player's pearl in flight): tracking
@@ -828,7 +857,12 @@ impl Server {
         // at the end and wait for the next tick.
         let n = self.proj.list.len();
         for i in 0..n {
-            let Some(slot) = self.proj.list.get(i) else { break };
+            let Some(slot) = self.proj.list.get_mut(i) else { break };
+            // Born during this entity walk: it waits for the next tick.
+            if self.walk.waits(std::mem::take(&mut slot.born)) {
+                continue;
+            }
+            let slot = &self.proj.list[i];
             if slot.removed || !self.proj_chunk_ready(slot) {
                 continue;
             }

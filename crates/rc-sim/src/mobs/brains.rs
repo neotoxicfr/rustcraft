@@ -674,8 +674,8 @@ impl Server {
                     }
                 }
             }
-        } else if m.fire < 160 {
-            m.fire = 160;
+        } else {
+            crate::inside_blocks::mob_ignite(m, 160);
         }
     }
 
@@ -893,9 +893,10 @@ impl Server {
         let Some(i) = self.mob_index(id) else { return false };
         let mut m = self.mobs.list[i].take().expect("mob");
         let held_s9 = self.slots[slot].clone(); // S9
-        let r = self.interact_mob(&mut m, slot);
+        let (r, with_item) = self.interact_mob(&mut m, slot);
         if r {
-            self.s9_entity_interact(held_s9.as_ref(), &m); // S9
+            // S9; an action without an item (lead detached, animals handed over) triggers without a stack.
+            self.s9_entity_interact(held_s9.as_ref().filter(|_| with_item), &m);
         }
         self.mobs.list[i] = Some(m);
         if r {
@@ -904,17 +905,22 @@ impl Server {
         r
     }
 
-    fn interact_mob(&mut self, m: &mut Mob, slot: usize) -> bool {
+    /// (consumed, with the held item).
+    fn interact_mob(&mut self, m: &mut Mob, slot: usize) -> (bool, bool) {
         let item = self.slots[slot].as_ref().map(|s| s.id.clone()).unwrap_or_default();
         if !m.alive() || dist2(self.pos, m.pos) > 64.0 {
-            return false;
+            return (false, false);
         }
         // Name tag, egg of the same species: before everything else.
         if self.important_interact(m, slot) {
-            return true;
+            return (true, true);
+        }
+        // G4-F07a: lead and shears, common to every entity, before the own interaction.
+        if let Some(with_item) = self.leash_interact(m, slot) {
+            return (true, with_item);
         }
         // Then the own interaction; if it does nothing, the item acts on the mob.
-        self.mob_interact(m, slot, &item) || self.item_on_mob(m, slot)
+        (self.mob_interact(m, slot, &item) || self.item_on_mob(m, slot), true)
     }
 
     fn mob_interact(&mut self, m: &mut Mob, slot: usize, item: &str) -> bool {
@@ -1018,6 +1024,7 @@ impl Server {
                 return true;
             }
             Kind::Wolf | Kind::Cat => return self.tame_interact(m, slot),
+            Kind::Pig => return super::nether::strider::pig_interact(self, m, slot, &item),
             _ => {}
         }
         self.animal_food_interact(m, slot, &item)

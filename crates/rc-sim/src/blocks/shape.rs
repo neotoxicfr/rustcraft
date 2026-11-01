@@ -312,6 +312,8 @@ impl Server {
             // Huge mushroom: the face against the same block goes out (never relit).
             Kind::HugeMushroom if v.block(ns) == v.block(s) => v.set_bool(s, dir.name(), false),
             Kind::HangingMoss => self.hanging_moss_update_shape(s, p),
+            Kind::Speleothem { .. } => self.speleothem_update_shape(s, p, dir), // G6-F09a
+            Kind::PotentSulfur => self.potent_sulfur_update_shape(s, p),     // G6-F09a
             Kind::PaleMossCarpet => self.moss_carpet_update_shape(s, p),
             // Campfire: signal (high smoke) depending on the hay bale below.
             Kind::Campfire if dir == Dir::Down => {
@@ -457,6 +459,7 @@ impl Server {
             Kind::Bell => self.bell_survives(s, p),
             Kind::HangingMoss => self.hanging_moss_survives(s, p),
             Kind::PaleMossCarpet => self.moss_carpet_survives(s, p),
+            Kind::Speleothem { .. } => self.speleothem_survives(s, p), // G6-F09a
             // Dirt path: nothing solid above, except a fence gate.
             _ if v.block(s) == self.bs.t.block_id("minecraft:dirt_path") => {
                 let up = self.get(above(p));

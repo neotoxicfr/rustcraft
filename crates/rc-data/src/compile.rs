@@ -453,6 +453,26 @@ fn read_potions(facts: &Value, d: &mut VersionData) {
         .collect();
 }
 
+/// The 16 dye colours, in the order of their ids in the game.
+const DYES: [&str; 16] = [
+    "white",
+    "orange",
+    "magenta",
+    "light_blue",
+    "yellow",
+    "lime",
+    "pink",
+    "gray",
+    "light_gray",
+    "cyan",
+    "purple",
+    "blue",
+    "brown",
+    "green",
+    "red",
+    "black",
+];
+
 /// Default components of each item (`reports/minecraft/components/item/<id>.json`), in
 /// network identifier order; report absent (old generator): empty table.
 fn read_items(reports: &Path, d: &VersionData) -> Result<Vec<crate::ItemInfo>> {
@@ -565,7 +585,12 @@ fn read_items(reports: &Path, d: &VersionData) -> Result<Vec<crate::ItemInfo>> {
         let range = get("attack_range");
         let rf = |k: &str, def: f64| range[k].as_f64().unwrap_or(def) as f32;
         let effects = get("use_effects");
-        Ok(crate::ItemInfo {
+        let dye = get("dye").as_str().and_then(|d| DYES.iter().position(|n| *n == d)).map_or(0, |i| i as u8 + 1);
+        let fuel = get("cooking_fuel");
+        let fuel = (!fuel.is_null()).then(|| fuel.to_string());
+        Ok((crate::ItemInfo {
+            dye,
+            fuel: 0,
             tool,
             consumable,
             food: get("food").as_object().map(|f| f.get("can_always_eat").and_then(Value::as_bool).unwrap_or(false)),
@@ -641,17 +666,32 @@ fn read_items(reports: &Path, d: &VersionData) -> Result<Vec<crate::ItemInfo>> {
                 .flatten()
                 .filter_map(|(k, _)| component_types.id(k).map(|i| i as u16))
                 .collect(),
-        })
+        }, fuel))
     };
     // ≈ 1,500 reports read and parsed: in parallel, stored in identifier order
     // (`RUSTCRAFT_OPT_PREPPAR=0`: in series, old path; only the returned error may differ
     // if several reports are unreadable).
-    if prep_par() {
+    let all: Vec<(crate::ItemInfo, Option<String>)> = if prep_par() {
         use rayon::prelude::*;
-        reg.entries.par_iter().map(one).collect()
+        reg.entries.par_iter().map(one).collect::<Result<_>>()?
     } else {
-        reg.entries.iter().map(one).collect()
-    }
+        reg.entries.iter().map(one).collect::<Result<_>>()?
+    };
+    // Fuel values numbered at first appearance (≈ 350 items, 30 values).
+    let mut values: Vec<String> = Vec::new();
+    Ok(all
+        .into_iter()
+        .map(|(mut info, fuel)| {
+            if let Some(f) = fuel {
+                let k = values.iter().position(|v| *v == f).unwrap_or_else(|| {
+                    values.push(f);
+                    values.len() - 1
+                });
+                info.fuel = k as u16 + 1;
+            }
+            info
+        })
+        .collect())
 }
 
 /// Preparation reads in parallel (`RUSTCRAFT_OPT_PREPPAR=0`: in series).

@@ -408,6 +408,10 @@ pub struct Entity {
     /// Parrot: jukebox marked by events 1010 / 1011 and party in progress
     /// (`entity_render::party_track`).
     pub jukebox: Option<([i32; 3], bool)>,
+    /// Counters of the client effects per kind (`entity_fx`): enderman 0 = next tick at which the
+    /// stare sound is allowed; breeze 0 whistle, 1 jump trail, 2 ambient sound;
+    /// ravager 0 stun seen at the previous tick.
+    pub fx: [i32; 3],
 }
 
 impl Entity {
@@ -547,7 +551,8 @@ impl Entity {
                     Size::scalable(ty.w, ty.h - 1.43).eye(0.845)
                 }
             }
-            "sniffer" if self.meta_int(17) == Some(5) => {
+            // Digging (state 5 of entity data 18; 17 is the age lock): 0.4 lower.
+            "sniffer" if self.meta_int(18) == Some(5) => {
                 Size::scalable(ty.w, ty.h - 0.4).eye(0.81).scale(if baby { 0.5 } else { 1.0 })
             }
             "warden" if matches!(pose, 13 | 14) => Size::fixed(base.w, 1.0),
@@ -1079,6 +1084,9 @@ pub struct Entities {
     /// Mount of the local player removed by the server (the player mounted on it, even
     /// indirectly): a `teleport_entity` that still targets it applies to the player.
     pub removed_vehicle: Option<i32>,
+    /// Local sounds born from a metadata update (enderman stare), played by the caller right
+    /// after `apply`.
+    pub pending_sounds: Vec<crate::entity_fx::FxSound>,
 }
 
 impl Entities {
@@ -1307,6 +1315,7 @@ impl Entities {
                         pose_anim: Default::default(),
                         in_water: false,
                         jukebox: None,
+                        fx: [0; 3],
                     },
                 );
                 // Shulker: position recentred on its block from the spawn.
@@ -1397,7 +1406,9 @@ impl Entities {
                 let Some(e) = self.map.get_mut(&id) else { return };
                 if e.class == Kind::Other {
                     e.head = yaw;
-                } else {
+                } else if e.kind != "ender_dragon" {
+                    // The dragon keeps the target without ever smoothing it (its AI step replaces the
+                    // living entity's, which does it): its head only follows the body catch-up.
                     e.head_target = Some((yaw, 3));
                 }
             }
@@ -1412,8 +1423,15 @@ impl Entities {
                 }
             }
             EntityEvent::Data { id, values } => {
+                let mut stare = false;
                 if let Some(e) = self.get_mut(id) {
                     for (i, v) in values {
+                        // Enderman: data 17 (threatening) received while data 18 (stared at) is already
+                        // true, in packet order (a calm-down that sends 17 then sets 18 to false
+                        // therefore also sounds, like the game).
+                        if i == 17 && e.kind == "enderman" && e.meta_bool(18) {
+                            stare |= crate::entity_fx::stare_ready(e);
+                        }
                         // Arrow that sticks: shaking of 7 ticks (part C § 4.3).
                         if i == 10
                             && matches!(e.kind.as_str(), "arrow" | "spectral_arrow")
@@ -1425,6 +1443,16 @@ impl Entities {
                         e.meta.insert(i, v);
                         crate::entity_render::display_data(e, i);
                     }
+                }
+                if stare && let Some(e) = self.map.get(&id) {
+                    let eye = f64::from(e.size(&self.dims).eye);
+                    self.pending_sounds.push(crate::entity_fx::FxSound {
+                        name: "minecraft:entity.enderman.stare",
+                        at: [e.pos[0], e.pos[1] + eye, e.pos[2]],
+                        volume: 2.5,
+                        pitch: 1.0,
+                        follow: None,
+                    });
                 }
             }
             EntityEvent::Equipment { id, slots } => {
@@ -1540,6 +1568,55 @@ mod size_tests {
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-5
+    }
+
+    /// Digging sniffer (state 5 in entity data 18): 0.4 lower, eyes at 0.81; the age lock
+    /// (entity data 17) changes nothing. Before: the state was read from 17, so the size was never applied.
+    #[test]
+    fn digging_sniffer_is_lower() {
+        let table = [[1.9f32, 1.75, 1.05, 2.0]];
+        let mut e = spawn("sniffer", [0.0; 3], 0);
+        let stand = e.size(&table);
+        assert!((stand.h - 1.75).abs() < 1e-6, "{}", stand.h);
+        e.meta.insert(18, Meta::Variant(5, 0));
+        let dig = e.size(&table);
+        assert!((dig.h - 1.35).abs() < 1e-6 && (dig.eye - 0.81).abs() < 1e-6, "{} {}", dig.h, dig.eye);
+        assert!((dig.w - 1.9).abs() < 1e-6);
+        e.meta.insert(18, Meta::Variant(4, 0));
+        e.meta.insert(17, Meta::Int(5));
+        assert!((e.size(&table).h - 1.75).abs() < 1e-6);
+    }
+
+    /// Event 55: both hands of a living entity swap, the rest of the equipment does not move;
+    /// a non-living entity ignores it.
+    #[test]
+    fn hand_swap_event_swaps_both_hands() {
+        let st = |item| Some(ItemStack { item, count: 1, added: Vec::new(), removed: Vec::new() });
+        for (kind, swaps) in [("player", true), ("zombie", true), ("armor_stand", true), ("item", false)] {
+            let mut all = Entities { type_names: vec![format!("minecraft:{kind}")], ..Default::default() };
+            let add = rc_proto_v777::entity::AddEntity {
+                id: 1,
+                uuid: 1,
+                kind: 0,
+                pos: [0.0; 3],
+                velocity: [0.0; 3],
+                pitch: 0.0,
+                yaw: 0.0,
+                head_yaw: 0.0,
+                data: 0,
+            };
+            all.apply(EntityEvent::Add(Box::new(add)));
+            let e = all.map.get_mut(&1).expect("added");
+            e.equipment[0] = st(10);
+            e.equipment[1] = st(20);
+            e.equipment[5] = st(30);
+            all.apply(EntityEvent::Event { id: 1, event: 55 });
+            let eq = &all.map[&1].equipment;
+            let (main, off) = if swaps { (20, 10) } else { (10, 20) };
+            assert_eq!(eq[0].as_ref().map(|s| s.item), Some(main), "{kind}");
+            assert_eq!(eq[1].as_ref().map(|s| s.item), Some(off), "{kind}");
+            assert_eq!(eq[5].as_ref().map(|s| s.item), Some(30), "{kind}");
+        }
     }
 
     /// Mannequin cape point tracked like a player's (a quarter of the difference per tick,

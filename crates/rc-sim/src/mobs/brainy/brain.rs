@@ -832,6 +832,12 @@ impl Brain {
         }
     }
 
+    /// Empty brain, without allocation: a stand-in while the real brain is put back on its
+    /// mob (`Server::with_brain`).
+    pub fn hole() -> Brain {
+        Brain { mem: Mem::default(), sensors: Vec::new(), nodes: Vec::new(), acts: Vec::new(), act: Act::Idle }
+    }
+
     fn requirements_met(&self, a: Act) -> bool {
         self.acts.iter().find(|d| d.act == a).is_some_and(|d| self.mem.check(&d.cond))
     }
@@ -1392,7 +1398,7 @@ impl Server {
             }
             Bk::StrollFly { speed } => {
                 let p = if m.kind == super::super::species::Kind::HappyGhast {
-                    let home = m.rec.restriction;
+                    let home = super::super::goals::rpos_home(m); // G4-F07a: lead included
                     super::allay::fly_target_pos_with(
                         self,
                         m,
@@ -1465,7 +1471,8 @@ impl Server {
                 }
                 b.mem.look.set(Track::ent(target, true));
                 self.mob_swing(m);
-                super::melee_hit(self, m, target);
+                // Brain put back for the time of the hit (thorns, warden impact).
+                self.with_brain(m, b, |s, m| super::melee_hit(s, m, target));
                 b.mem.attack_cooling.set_exp((), i64::from(*cd));
                 true
             }

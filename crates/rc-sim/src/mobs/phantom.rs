@@ -45,7 +45,7 @@ impl Server {
             max: [b.max[0] + 16.0, b.max[1] + 64.0, b.max[2] + 16.0],
         };
         // A single player in singleplayer: the list sorted by height reduces to them.
-        if self.player_aabb().intersects(&area)
+        if self.player_feet_in(&area)
             && self.targeting_ok(m, Ent::Player, true, 64.0, true, true)
             && self.targeting_ok(m, Ent::Player, true, -1.0, true, true)
         {

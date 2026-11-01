@@ -293,7 +293,7 @@ fn eat_sound(m: &Mob) -> &'static str {
 /// Return area of a free tamed nautilus: 32 without saddle (adult),
 /// 16 otherwise; recentered when it moves away by more than radius + 8.
 fn check_restriction(m: &mut Mob) {
-    if !m.tame || !m.mount.passengers.is_empty() {
+    if super::super::leash::is_leashed(m) || !m.tame || !m.mount.passengers.is_empty() {
         return;
     }
     let r = if !m.is_baby() && m.equipment[SADDLE].is_none() { 32 } else { 16 };
@@ -791,7 +791,7 @@ impl Server {
     }
 
     /// Charge: the first attackable living entity in the box takes the hit and knockback.
-    fn charge_hit(&mut self, m: &mut Mob, b: &mut Brain) {
+    pub(crate) fn charge_hit(&mut self, m: &mut Mob, b: &mut Brain) {
         let bb = m.bbox();
         let mut hit: Option<Ent> = None;
         let ids: Vec<i32> =
@@ -812,7 +812,15 @@ impl Server {
         let dmg = m.attrs.attack.value() as f32;
         match e {
             Ent::Player => {
-                self.player_hurt_by_mob(m, "minecraft:mob_attack", dmg, Some((m.pos[0] - self.pos[0], m.pos[2] - self.pos[2])));
+                let kb = Some((m.pos[0] - self.pos[0], m.pos[2] - self.pos[2]));
+                if self.player_hurt_by_mob(m, "minecraft:mob_attack", dmg, kb) {
+                    // G5-F02d: brain put back for the time of the thorns (anger of the hurt nautilus).
+                    m.sea.brain = Some(Box::new(std::mem::take(b)));
+                    self.player_thorns(m);
+                    if let Some(back) = m.sea.brain.take() {
+                        *b = *back;
+                    }
+                }
             }
             Ent::Mob(id) => {
                 if let Some(i) = self.mob_index(id)
@@ -975,7 +983,7 @@ impl Server {
         if m.tame && !self.sneaking && !food(self, m, item) {
             self.player_start_riding(m);
             if m.mount.passengers.is_empty() {
-                m.sea.home = None;
+                crate::mobs::goals::clear_home(m);
             }
             return Some(true);
         }

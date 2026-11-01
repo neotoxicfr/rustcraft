@@ -33,6 +33,8 @@ pub(crate) enum DKind {
     Stand,
     Cushion,
     Mannequin,
+    /// Lead knot on a fence (G4-F07a, never saved).
+    Knot,
 }
 
 impl DKind {
@@ -44,6 +46,7 @@ impl DKind {
             "minecraft:armor_stand" => DKind::Stand,
             "minecraft:cushion" => DKind::Cushion,
             "minecraft:mannequin" => DKind::Mannequin,
+            "minecraft:leash_knot" => DKind::Knot,
             _ => return None,
         })
     }
@@ -56,6 +59,7 @@ impl DKind {
             DKind::Stand => "minecraft:armor_stand",
             DKind::Cushion => "minecraft:cushion",
             DKind::Mannequin => "minecraft:mannequin",
+            DKind::Knot => "minecraft:leash_knot",
         }
     }
 
@@ -70,7 +74,7 @@ impl DKind {
 
     /// Attached to a block: survival checked every 100 ticks.
     fn attached(self) -> bool {
-        self.hanging() || self == DKind::Cushion
+        self.hanging() || matches!(self, DKind::Cushion | DKind::Knot)
     }
 }
 
@@ -417,6 +421,10 @@ impl Server {
             let (p, d) = self.hang_place(k, e);
             pos = p.map(f64::from);
             data = d as i32;
+        } else if kind_of(e) == Some(DKind::Knot) {
+            // Knot: announced at the corner of its block, null data.
+            pos = block_pos_of(e).map(f64::from);
+            data = 0;
         }
         let add = rc_proto_v777::entity::AddEntity {
             id,
@@ -465,6 +473,7 @@ impl Server {
                 }
             }
             DKind::Mannequin => mannequin_meta(e, values),
+            DKind::Knot => {}
         }
     }
 
@@ -498,7 +507,7 @@ impl Server {
     }
 
     /// Block shards (`block` particle).
-    fn block_particles(&self, state: u32, pos: [f64; 3], delta: [f32; 3], speed: f32, count: i32) {
+    pub(crate) fn block_particles(&self, state: u32, pos: [f64; 3], delta: [f32; 3], speed: f32, count: i32) {
         let Some(kind) = self
             .data
             .registry("minecraft:particle_type")
@@ -591,6 +600,10 @@ impl Server {
         match kind_of(e) {
             Some(k) if k.hanging() => self.hang_survives(id, k, e),
             Some(DKind::Cushion) => self.cushion_survives(e),
+            Some(DKind::Knot) => {
+                let p = block_pos_of(e);
+                self.btag_id(p, crate::tag_bits::TagId::Fences)
+            }
             _ => true,
         }
     }
@@ -611,6 +624,8 @@ impl Server {
             }
             Some(k) if k.frame() => self.frame_broken(k, e, by),
             Some(DKind::Cushion) => self.cushion_dropped(e, by),
+            // Knot: no item, only the sound of a detached lead.
+            Some(DKind::Knot) => self.knot_dropped(e),
             _ => {}
         }
     }
@@ -665,6 +680,7 @@ impl Server {
                     }
                 }
                 DKind::Mannequin => f64::from(1.62f32),
+                DKind::Knot => f64::from(0.0625f32),
             };
             let o = [pos[0] - center[0], pos[1] + eye - center[1], pos[2] - center[2]];
             let olen = (o[0] * o[0] + o[1] * o[1] + o[2] * o[2]).sqrt();
@@ -758,6 +774,7 @@ impl Server {
             DKind::Frame | DKind::GlowFrame if self.game_mode != 3 => self.frame_interact(id, kind, slot),
             DKind::Stand if self.game_mode != 3 => self.stand_interact(id, slot, at),
             DKind::Cushion if self.game_mode != 3 => self.cushion_interact(id, secondary),
+            DKind::Knot if self.game_mode != 3 => self.knot_interact(id, slot),
             _ => false,
         };
         // Unconsumed click on a living entity: the held item acts on it
@@ -828,7 +845,18 @@ impl Server {
             }
             DKind::Cushion => around(1.0, 0.25),
             DKind::Mannequin => around(0.6, 1.8),
+            DKind::Knot => around(0.375, 0.5),
         })
+    }
+
+    /// Lead knot hung on block `p`, if any.
+    pub(crate) fn knot_at(&self, p: P) -> Option<i32> {
+        self.deco
+            .live
+            .iter()
+            .filter(|l| l.kind == DKind::Knot && !l.removed)
+            .map(|l| l.id)
+            .find(|&id| self.deco_nbt(id).is_some_and(|e| block_pos_of(e) == p))
     }
 
     /// Block position of an attached entity (`pos`).

@@ -95,6 +95,10 @@ pub struct DecoChunk {
     pub retro: Option<Retro>,
     /// Keys of the disk compound to keep as they are (`blending_data` of an old chunk).
     pub keep: Vec<(String, rc_proto::nbt::Nbt)>,
+    /// Blocks broken with drops by the feature (position, broken state), in order: only the
+    /// planted variant of the nether fungus produces them, and only the live world replays them
+    /// (particles, sound and drops of the break).
+    pub destroyed: Vec<([i32; 3], State)>,
 }
 
 /// Regeneration below y = 0 of a converted chunk: columns without bedrock in the old world
@@ -145,6 +149,7 @@ impl DecoChunk {
             structures: None,
             retro: None,
             keep: Vec::new(),
+            destroyed: Vec::new(),
         }
     }
 
@@ -354,6 +359,26 @@ impl<'a> Region<'a> {
     #[inline]
     pub fn set_p(&mut self, p: [i32; 3], s: State, flags: u32) -> bool {
         self.set(p[0], p[1], p[2], s, flags)
+    }
+
+    /// Break with drops (planted variant of the nether fungus): nothing on air; the broken state
+    /// is recorded in its chunk for the live world, and the cell keeps its fluid.
+    pub fn destroy_p(&mut self, p: [i32; 3]) {
+        let s = self.get_p(p);
+        let Some(i) = self.chunk_index(p[0], p[2]) else { return };
+        if self.b.is_air(s) || self.outside_height(p[1]) || self.band_refuses(p[1]) {
+            return;
+        }
+        self.chunks[i].destroyed.push((p, s));
+        let b = self.b;
+        let left = match b.fluid(s) {
+            0 => b.default_state(b.k.air),
+            // The fluid block itself (level kept), otherwise a waterlogged block: source stays.
+            _ if b.is(s, b.k.water) || b.is(s, b.k.lava) => s,
+            1 => b.default_state(b.k.water),
+            _ => b.default_state(b.k.lava),
+        };
+        self.set_p(p, left, 3);
     }
 
     /// Direct write into the section (ores): neither height maps nor post-processing.

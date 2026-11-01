@@ -161,6 +161,13 @@ pub(crate) enum Kind {
     Skull,
     /// Beehive and bee nest.
     Beehive,
+    /// G6-F09a: speleothems (pointed dripstone if `dripstone`, sulfur spike otherwise): placement,
+    /// survival, fall, growth (`speleothem.rs`).
+    Speleothem {
+        dripstone: bool,
+    },
+    /// G6-F09a: active sulfur (state from the water and the block below, ticking block entity).
+    PotentSulfur,
 }
 
 /// Property of a block: index into `VersionData::properties`, not into the identifiers.
@@ -214,9 +221,16 @@ pub(crate) struct Ids {
     pub tnt: u16,
     pub sugar_cane: u16,
     pub cactus: u16,
+    /// Crossed-block pass (`inside_blocks`); powder snow also for the geyser column (G6-F09a).
+    pub campfire: u16,
+    pub soul_campfire: u16,
+    pub powder_snow: u16,
     pub sand: u16,
     pub red_sand: u16,
     pub magma: u16,
+    /// Redstone ores (lit when walked on).
+    pub redstone_ore: u16,
+    pub deepslate_redstone_ore: u16,
     /// Sculk sensors (normal, calibrated): "walked on" test of each entity on the ground.
     pub sculk_sensor: u16,
     pub calibrated_sculk_sensor: u16,
@@ -241,6 +255,9 @@ pub(crate) struct Ids {
     pub command_block: u16,
     pub lightning_rod: u16,
     pub carved_pumpkin: u16,
+    /// G6-F09a: blocks under which speleothems grow.
+    pub dripstone_block: u16,
+    pub sulfur: u16,
 }
 
 pub(crate) struct Table {
@@ -377,7 +394,7 @@ fn kind_of(name: &str) -> Kind {
         "cactus" => return Cactus,
         "short_grass" | "fern" | "dandelion" | "poppy" | "blue_orchid" | "allium" | "azure_bluet" | "red_tulip"
         | "orange_tulip" | "white_tulip" | "pink_tulip" | "oxeye_daisy" | "cornflower" | "lily_of_the_valley"
-        | "torchflower" | "open_eyeblossom" | "closed_eyeblossom" | "bush" | "firefly_bush" | "pink_petals"
+        | "torchflower" | "open_eyeblossom" | "closed_eyeblossom" | "bush" | "red_shrub" | "firefly_bush" | "pink_petals"
         | "wildflowers" | "golden_dandelion" => {
             return Bush;
         }
@@ -412,6 +429,9 @@ fn kind_of(name: &str) -> Kind {
         "chorus_plant" => return ChorusPlant,
         "budding_amethyst" => return BuddingAmethyst,
         "beehive" | "bee_nest" => return Beehive,
+        "pointed_dripstone" => return Speleothem { dripstone: true },
+        "sulfur_spike" => return Speleothem { dripstone: false },
+        "potent_sulfur" => return PotentSulfur,
         _ => {}
     }
     // `piston_head` is taken above.
@@ -594,9 +614,14 @@ impl Table {
             tnt: f("tnt"),
             sugar_cane: f("sugar_cane"),
             cactus: f("cactus"),
+            campfire: f("campfire"),
+            soul_campfire: f("soul_campfire"),
+            powder_snow: f("powder_snow"),
             sand: f("sand"),
             red_sand: f("red_sand"),
             magma: f("magma_block"),
+            redstone_ore: f("redstone_ore"),
+            deepslate_redstone_ore: f("deepslate_redstone_ore"),
             sculk_sensor: f("sculk_sensor"),
             calibrated_sculk_sensor: f("calibrated_sculk_sensor"),
             kelp: f("kelp"),
@@ -618,6 +643,8 @@ impl Table {
             command_block: f("command_block"),
             lightning_rod: f("lightning_rod"),
             carved_pumpkin: f("carved_pumpkin"),
+            dripstone_block: f("dripstone_block"),
+            sulfur: f("sulfur"),
         };
         let pair = d
             .blocks

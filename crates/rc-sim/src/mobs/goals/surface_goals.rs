@@ -579,7 +579,7 @@ impl Server {
                     let mut z = if x < r && x > -r { r } else { 0 };
                     while z <= r {
                         let p = [b[0] + x, b[1] + y - 1, b[2] + z];
-                        if self.mtb_valid(g, m, p) {
+                        if super::within_home(m, p) && self.mtb_valid(g, m, p) {
                             if let SGoal::MoveToBlock { pos, .. } = g {
                                 *pos = p;
                             }

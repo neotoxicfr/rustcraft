@@ -103,6 +103,20 @@ pub fn part_box(d: &Dragon, i: usize) -> rc_physics::Aabb {
     rc_physics::Aabb { min: [p[0] - w / 2.0, p[1], p[2] - w / 2.0], max: [p[0] + w / 2.0, p[1] + h, p[2] + w / 2.0] }
 }
 
+/// Body control of the mobs, called after the dragon's AI step: body = yaw; head pulled back to
+/// at most 75° from the body only if it moved horizontally during this tick (game threshold:
+/// the float 2.5000003e-7, widened). Still (a sitting dragon pivoting towards the player, a dying
+/// one rising, one without AI), the head does not move; the game only turns the body there, which
+/// is never observable on the dragon (neither sent nor saved). This head orients its gaze
+/// (takeoff, strafing fireball) and goes out in the spawn and head packets.
+pub(crate) fn turn_head(m: &mut Mob) {
+    m.body_yaw = m.yaw;
+    let (dx, dz) = (m.pos[0] - m.old[0], m.pos[2] - m.old[2]);
+    if dx * dx + dz * dz > f64::from(2.500_000_3e-7_f32) {
+        m.head_yaw = rotate_if_necessary(m.head_yaw, m.body_yaw, 75.0);
+    }
+}
+
 fn inflate(b: rc_physics::Aabb, x: f64, y: f64, z: f64) -> rc_physics::Aabb {
     rc_physics::Aabb {
         min: [b.min[0] - x, b.min[1] - y, b.min[2] - z],
@@ -193,9 +207,7 @@ impl Server {
             }
         }
         self.dragon_ai_step(m, &mut d);
-        // Body and head (body = yaw, head at 75° at most).
-        m.body_yaw = m.yaw;
-        m.head_yaw = rotate_if_necessary(m.head_yaw, m.body_yaw, 75.0);
+        turn_head(m);
         let discard = std::mem::take(&mut d.discard_clouds);
         m.end.dragon = Some(d);
         for id in discard {
@@ -252,7 +264,7 @@ impl Server {
             }
             for part in [HEAD, NECK] {
                 let b = inflate(part_box(d, part), 1.0, 1.0, 1.0);
-                self.dragon_bite(m, b);
+                self.dragon_bite(m, d, b);
             }
         }
         let ss2 = sin(m.yaw * DEG - d.y_rot_a * 0.01);
@@ -345,7 +357,7 @@ impl Server {
 
     /// Wings: living entities in the box are pushed back, and hurt (5) outside the sitting
     /// phase if their last injury by a mob is at least 3 ticks old.
-    fn dragon_knockback(&mut self, m: &Mob, d: &Dragon, area: rc_physics::Aabb) {
+    fn dragon_knockback(&mut self, m: &mut Mob, d: &mut Dragon, area: rc_physics::Aabb) {
         let body = part_box(d, BODY);
         let xm = (body.min[0] + body.max[0]) / 2.0;
         let zm = (body.min[2] + body.max[2]) / 2.0;
@@ -382,12 +394,13 @@ impl Server {
             if !d.phase.sitting() && stamp < self.mobs.player_ticks - 2 {
                 let kb = Some((m.pos[0] - self.pos[0], m.pos[2] - self.pos[2]));
                 self.player_hurt_by_mob(m, "minecraft:mob_attack", 5.0, kb);
+                self.dragon_thorns(m, d); // G5-F02d: even without a hit dealt, like the game
             }
         }
     }
 
     /// Head and neck: 10 damage to every living entity in the box.
-    fn dragon_bite(&mut self, m: &Mob, area: rc_physics::Aabb) {
+    pub(crate) fn dragon_bite(&mut self, m: &mut Mob, d: &mut Dragon, area: rc_physics::Aabb) {
         let ids: Vec<i32> = self
             .mobs
             .list
@@ -409,6 +422,18 @@ impl Server {
         {
             let kb = Some((m.pos[0] - self.pos[0], m.pos[2] - self.pos[2]));
             self.player_hurt_by_mob(m, "minecraft:mob_attack", 10.0, kb);
+            self.dragon_thorns(m, d); // G5-F02d: even without a hit dealt, like the game
+        }
+    }
+
+    /// Player thorns against the dragon during its tick: its own state, taken out for the time
+    /// of the tick, is put back for the thorns (damage reception reads the phase and
+    /// accumulates the sitting-phase damage), then taken again with what changed.
+    fn dragon_thorns(&mut self, m: &mut Mob, d: &mut Dragon) {
+        m.end.dragon = Some(Box::new(d.clone()));
+        self.player_thorns(m);
+        if let Some(back) = m.end.dragon.take() {
+            *d = *back;
         }
     }
 

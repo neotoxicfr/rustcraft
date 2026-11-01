@@ -35,6 +35,10 @@ pub struct Vitals {
     pub sent_frozen: Option<i32>,
     pub fire: i32,
     pub fall: f64,
+    /// Impulse context (wind charge jump): impact point whose height bounds the next fall, and
+    /// grace ticks before a landing can forget it.
+    pub impulse_impact: Option<[f64; 3]>,
+    pub impulse_grace: i32,
     /// Invulnerability window (§ 2.3 step 7) and last hit.
     pub cooldown: i32,
     pub last_hurt: f32,
@@ -78,6 +82,30 @@ pub fn xp_needed(level: i32) -> i32 {
 }
 
 impl Vitals {
+    /// Hit by an explosion: a player's wind charge sets the impact point (`at`) and at least 40
+    /// grace ticks; any other explosion cancels the grace (the point stays).
+    pub(crate) fn impulse_from_explosion(&mut self, wind_charge: bool, at: [f64; 3]) {
+        if wind_charge {
+            self.impulse_grace = self.impulse_grace.max(40);
+            self.impulse_impact = Some(at);
+        } else {
+            self.impulse_grace = 0;
+        }
+    }
+
+    /// Impulse context forgotten.
+    pub(crate) fn impulse_reset(&mut self) {
+        self.impulse_grace = 0;
+        self.impulse_impact = None;
+    }
+
+    /// Context forgotten only once the grace has elapsed.
+    pub(crate) fn impulse_try_reset(&mut self) {
+        if self.impulse_grace == 0 {
+            self.impulse_reset();
+        }
+    }
+
     /// Health, hunger and experience resent on the next tick (dimension change, S6).
     pub(crate) fn force_resend(&mut self) {
         self.sent_health = None;
@@ -134,6 +162,11 @@ impl Vitals {
                 .get("fall_distance")
                 .and_then(|v| if let Nbt::Double(d) = v { Some(*d) } else { None })
                 .unwrap_or(0.0),
+            impulse_impact: match list(p.get("current_explosion_impact_pos")) {
+                [Nbt::Double(x), Nbt::Double(y), Nbt::Double(z)] => Some([*x, *y, *z]),
+                _ => None,
+            },
+            impulse_grace: int(p, "current_impulse_context_reset_grace_time").unwrap_or(0) as i32,
             cooldown: 0,
             last_hurt: 0.0,
             dead: health <= 0.0,
@@ -181,6 +214,11 @@ impl Vitals {
         }
         set(root, "Fire", Nbt::Short(self.fire.clamp(-32768, 32767) as i16));
         set(root, "fall_distance", Nbt::Double(self.fall));
+        set(root, "current_impulse_context_reset_grace_time", Nbt::Int(self.impulse_grace));
+        match self.impulse_impact {
+            Some(p) => set(root, "current_explosion_impact_pos", Nbt::List(p.map(Nbt::Double).to_vec())),
+            None => crate::nbtio::remove(root, "current_explosion_impact_pos"),
+        }
         set(root, "DeathTime", Nbt::Short(self.death_time as i16));
         let ender: Vec<Nbt> =
             self.ender.iter().enumerate().filter_map(|(i, s)| s.as_ref().map(|s| s.to_nbt(Some(i as i8)))).collect();
@@ -338,6 +376,7 @@ impl Server {
         if self.life.vit.fire < t {
             self.life.vit.fire = t;
         }
+        self.life.vit.ticks_frozen = 0; // ignition always clears freezing
     }
 
     /// Damage type in a tag (`tags/damage_type`).
@@ -398,8 +437,12 @@ impl Server {
         (armor.floor() as f32, tough as f32)
     }
 
-    /// Enchantment protection of the worn equipment (`damage_protection` effects of the game).
+    /// Enchantment protection of the worn equipment (`damage_protection` effects of the game);
+    /// every protection requires a type outside `bypasses_invulnerability` (`/kill`, void).
     fn protection(&self, ty: &str) -> f32 {
+        if self.damage_tag(ty, "bypasses_invulnerability") {
+            return 0.0;
+        }
         let mut p = 0.0;
         for slot in 5..9 {
             let Some(s) = &self.slots[slot] else { continue };
@@ -421,12 +464,28 @@ impl Server {
         p
     }
 
+    /// Worn piece worn down by a hit of type `ty`: `equippable` component present with
+    /// `damage_on_hurt` (true by default; false for the elytra), and no `damage_resistant` that
+    /// covers the type (netherite against fire).
+    fn armor_wears(&self, s: &Stack, ty: &str) -> bool {
+        let Some(eq) = self.comp_json(s, "minecraft:equippable") else { return false };
+        let h = &eq["damage_on_hurt"];
+        if !h.as_bool().or_else(|| h.as_i64().map(|n| n != 0)).unwrap_or(true) {
+            return false;
+        }
+        !self.resistant_tag(s).is_some_and(|t| self.damage_tag(ty, t.trim_start_matches('#')))
+    }
+
     /// Damage refused outright: player dead or not ready, invulnerable, game rule.
     pub(crate) fn hurt_refused(&self, ty: &str) -> bool {
         if self.life.vit.dead || !self.player_ready() {
             return true;
         }
         if self.abilities().invulnerable && !self.damage_tag(ty, "bypasses_invulnerability") {
+            return true;
+        }
+        // G5-F02e: Frost Walker, immunity to hot-floor damage.
+        if self.frost_walker_immune(self.slots[8].as_ref(), ty) {
             return true;
         }
         (self.damage_tag(ty, "is_fall") && !self.rule("minecraft:fall_damage", true))
@@ -495,9 +554,14 @@ impl Server {
         // Armor.
         if !self.damage_tag(ty, "bypasses_armor") {
             let (armor, tough) = self.armor_values();
-            for slot in 5..9 {
-                if self.slots[slot].is_some() {
-                    self.hurt_item(slot, ((d / 4.0) as i32).max(1));
+            // Wear: nothing for a zero hit; feet first, equippable piece that wears on
+            // hurt (not the elytra) and that does not resist the type (netherite and fire).
+            if d > 0.0 {
+                let n = (d / 4.0).max(1.0) as i32;
+                for slot in (5..9).rev() {
+                    if self.slots[slot].as_ref().is_some_and(|s| self.armor_wears(s, ty)) {
+                        self.hurt_item(slot, n);
+                    }
                 }
             }
             let t = 2.0 + tough / 4.0;
@@ -874,7 +938,8 @@ impl Server {
             {
                 (dist + 2.5, 2.0, "minecraft:stalagmite")
             }
-            "minecraft:hay_block" | "minecraft:honey_block" => (dist, 0.2, "minecraft:fall"),
+            // Factor as a 32-bit float like the game (0.2 is not exactly 0.2 there).
+            "minecraft:hay_block" | "minecraft:honey_block" => (dist, f64::from(0.2f32), "minecraft:fall"),
             "minecraft:slime_block" if !no_bounce => (dist, 0.0, "minecraft:fall"),
             // Reduction of the distance (not of the damage): beds, shelf fungus.
             n if n.ends_with("_bed") || n == "minecraft:shelf_mushroom" => {
@@ -882,6 +947,44 @@ impl Server {
             }
             _ => (dist, 1.0, "minecraft:fall"),
         })
+    }
+
+    /// Landing dust of a living entity at `at` on the effect block `on`: power = integer part of
+    /// the fall beyond the safe distance; 150 × min(0.2 + p/15, 2.5) block shards, speed 0.15,
+    /// brought back to the block edge when the entity is not above it.
+    pub(crate) fn fall_dust(&self, at: [f64; 3], on: [i32; 3], dist: f64, safe: f64) {
+        let power = f64::from((dist + 1.0e-6 - safe).floor().max(0.0) as i32);
+        if power <= 0.0 || self.is_air(on) {
+            return;
+        }
+        let (mut x, y, mut z) = (at[0], at[1], at[2]);
+        if on[0] != x.floor() as i32 || on[2] != z.floor() as i32 {
+            let (dx, dz) = (x - f64::from(on[0]) - 0.5, z - f64::from(on[2]) - 0.5);
+            let m = dx.abs().max(dz.abs());
+            x = f64::from(on[0]) + 0.5 + dx / m * 0.5;
+            z = f64::from(on[2]) + 0.5 + dz / m * 0.5;
+        }
+        let scale = (f64::from(0.2f32) + power / 15.0).min(2.5);
+        self.block_particles(self.st(on), [x, y, z], [0.0; 3], 0.15, (150.0 * scale) as i32);
+    }
+
+    /// Fall sound of the block 0.2 below `at` (volume ½, pitch ¾ of its sound group); nothing
+    /// on air. Name, volume, pitch.
+    pub(crate) fn block_fall_sound_at(&self, at: [f64; 3]) -> Option<(String, f32, f32)> {
+        let below = [at[0].floor() as i32, (at[1] - f64::from(0.2f32)).floor() as i32, at[2].floor() as i32];
+        if self.is_air(below) {
+            return None;
+        }
+        let st = self.st(below);
+        let t = self.data.states.get(st as usize).and_then(|i| self.data.sound_types.get(usize::from(i.sound)))?;
+        (!t.fall.is_empty()).then(|| (t.fall.clone(), t.volume * 0.5, t.pitch * 0.75))
+    }
+
+    /// Fall sound of the block under the player (players category), after the fall sound.
+    fn player_block_fall_sound(&self) {
+        if let Some((s, v, p)) = self.block_fall_sound_at(self.pos) {
+            self.play_sound(&s, 7, self.pos, v, p);
+        }
     }
 
     /// Player tick (hunger, regeneration, air, fire, void, death, item use).
@@ -897,6 +1000,9 @@ impl Server {
             self.life.vit.health = max;
         }
         self.life.vit.age += 1;
+        if self.life.vit.impulse_grace > 0 {
+            self.life.vit.impulse_grace -= 1;
+        }
         self.send_score();
         if self.life.vit.age.is_multiple_of(20) {
             self.combat_recheck(); // W8a: end of combat after 5 s (15 s in combat) without a hit
@@ -914,6 +1020,7 @@ impl Server {
             }
             self.send_health();
             self.criteria_tick();
+            self.inside_forget_player();
             return;
         }
         let peaceful = self.level.difficulty_id() == 0;
@@ -984,8 +1091,12 @@ impl Server {
                 self.hurt("minecraft:starve", 1.0);
             }
         }
+        self.player_boots_tick(); // G5-F02e: Frost Walker, Soul Speed
         if self.game_mode != 3 {
             self.environment_damage();
+            self.player_step_on(); // block stepped on: magma, redstone ore
+        } else {
+            self.inside_forget_player(); // spectator: no crossed block
         }
         self.effects_tick(); // S7
         self.use_item_tick();
@@ -1007,13 +1118,10 @@ impl Server {
         // Same rule as the turtle helmet and mining: fluid height compared to the eye.
         let eye_water = self.eye_in_water();
         let invul = self.abilities().invulnerable;
-        let in_water = feet_block == "minecraft:water" || eye_water;
         let in_lava = feet_block == "minecraft:lava";
-        // Game order: entity fire (water that extinguishes first), lava that cushions the fall,
-        // void; then suffocation and drowning; finally the blocks crossed (lava, fire).
-        if in_water {
-            self.life.vit.fire = self.life.vit.fire.min(0);
-        }
+        // Game order: entity fire, lava that cushions the fall, void; then suffocation and
+        // drowning; finally the crossed-block pass (water puts out there, lava and fire ignite
+        // there) and freezing.
         if self.life.vit.fire > 0 {
             if self.life.vit.fire % 20 == 0 && !in_lava {
                 self.hurt("minecraft:on_fire", 1.0);
@@ -1052,47 +1160,29 @@ impl Server {
             self.life.vit.air = (self.life.vit.air + 4).min(300);
         }
         self.send_air();
-        // Blocks crossed.
-        if in_lava {
-            // Ignition by lava (15 s) then lava damage.
-            self.player_ignite(300);
-            if self.hurt("minecraft:lava", 4.0) {
-                let pitch = 2.0 + self.life.rng.next_float() * 0.4;
-                self.play_sound("minecraft:entity.generic.burn", 7, self.pos, 0.4, pitch);
-            }
-        } else if feet_block == "minecraft:fire" || feet_block == "minecraft:soul_fire" {
-            if self.life.vit.fire <= 0 {
-                self.player_ignite(160);
-            } else {
-                self.life.vit.fire += 1;
-            }
-            self.hurt("minecraft:in_fire", 1.0);
-        }
-        self.player_freezing();
+        // Crossed blocks (fire, cactus, campfire, powder snow, water, lava, rain).
+        let inside = self.inside_blocks(&mut crate::inside_blocks::Who::Player);
+        self.player_freezing(inside.in_powder_snow);
         let burning = self.life.vit.fire > 0 && !invul;
         // S7: shared flags (fire, invisibility, glowing) sent if they change.
         self.life.vit.on_fire_sent = burning;
         self.send_shared_flags(burning);
     }
 
-    /// Player freezing (like the mobs): +1 per tick in powder snow up to 140,
-    /// −2 otherwise or if it cannot freeze (spectator, leather armor); 1 freeze damage every
-    /// 40 ticks once frozen; counter sent to the client (data 7: frost overlay).
-    fn player_freezing(&mut self) {
-        const REQUIRED: i32 = 140;
-        let in_snow = self.ent_bbox(crate::mobs::mob::Ent::Player).is_some_and(|b| {
-            let lo = b.min.map(|v| (v + 1.0e-5).floor() as i32);
-            let hi = b.max.map(|v| (v - 1.0e-5).floor() as i32);
-            (lo[0]..=hi[0]).any(|x| {
-                (lo[1]..=hi[1]).any(|y| (lo[2]..=hi[2]).any(|z| self.bname([x, y, z]) == "minecraft:powder_snow"))
-            })
-        });
-        let can_freeze = self.game_mode != 3
-            && !self.slots[5..=8].iter().flatten().any(|s| self.item_tag(&s.id, "minecraft:freeze_immune_wearables"));
+    /// Can freeze: neither a spectator nor wearing an armor piece in `#freeze_immune_wearables`.
+    pub(crate) fn player_can_freeze(&self) -> bool {
+        self.game_mode != 3
+            && !self.slots[5..=8].iter().flatten().any(|s| self.item_tag(&s.id, "minecraft:freeze_immune_wearables"))
+    }
+
+    /// Player freezing (like the mobs), after the crossed-block pass, which adds 1 per tick in
+    /// powder snow (up to 140): −2 outside snow or if it cannot freeze;
+    /// 1 freeze damage every 40 ticks once frozen; counter sent to the client (data 7: frost
+    /// overlay).
+    fn player_freezing(&mut self, in_snow: bool) {
+        const REQUIRED: i32 = crate::inside_blocks::FREEZE_REQUIRED;
+        let can_freeze = self.player_can_freeze();
         let v = &mut self.life.vit;
-        if in_snow && can_freeze {
-            v.ticks_frozen = (v.ticks_frozen + 1).min(REQUIRED);
-        }
         if !in_snow || !can_freeze {
             v.ticks_frozen = (v.ticks_frozen - 2).max(0);
         }
@@ -1149,9 +1239,11 @@ impl Server {
         }
         let d = [self.pos[0] - before[0], self.pos[1] - before[1], self.pos[2] - before[2]];
         if d == [0.0; 3] {
+            self.impulse_after_move(0.0, false);
             return;
         }
         self.after_move_inner(was_on_ground, d);
+        let mut climbing = false;
         // W8a: last climbing block, reread by the death messages (fall location);
         // forgotten on the ground (after the fall damage), noted in the air in a climbable, like the
         // server's check after each movement.
@@ -1169,9 +1261,31 @@ impl Server {
                     self.data.block_of(below).is_some_and(|b| b.name == "minecraft:ladder")
                         && v.get(below, "facing") == v.get(s, "facing")
                 };
-            if climb || trap_ladder {
+            climbing = climb || trap_ladder;
+            if climbing {
                 self.life.combat.climbable = Some(feet);
             }
+        }
+        self.impulse_after_move(d[1], climbing);
+    }
+
+    /// After a movement: the impulse context is forgotten (once the grace has elapsed) on the
+    /// ground, when settled in a liquid, when climbing, as a spectator, when gliding or during a
+    /// spin attack.
+    fn impulse_after_move(&mut self, dy: f64, climbing: bool) {
+        // Without a context, nothing to forget: no test (the case for almost all movements).
+        if self.life.vit.impulse_impact.is_none() && self.life.vit.impulse_grace == 0 {
+            return;
+        }
+        // Liquid tested last (the only test that reads the world).
+        if self.on_ground
+            || climbing
+            || self.game_mode == 3
+            || self.proj_player.fall_flying
+            || self.proj_player.spin > 0
+            || (dy < f64::from(1.0e-5f32) && matches!(self.fluid_at(crate::mobs::mth::block_of(self.pos)).kind, 1 | 2))
+        {
+            self.life.vit.impulse_try_reset();
         }
     }
 
@@ -1205,45 +1319,76 @@ impl Server {
         }
         // The descent of this movement counts before the landing (converted to 32-bit float
         // like in the game).
+        let before = self.life.vit.fall;
         if d[1] < 0.0 {
             self.life.vit.fall -= f64::from(d[1] as f32);
         }
         if self.on_ground {
+            // Effect block: 0.2 below the feet, in the column of the main supporting block (fall
+            // rule, dust, trampling; edge of a full block above a field: the full block).
+            let support = self.player_support();
+            let effect = self.on_pos(self.pos, support, 0.2);
+            let effect_st = self.state_at(effect).unwrap_or(0);
+            // Landing dust, before the block's rule, on the fall from before this movement.
+            if before > 0.0 {
+                self.fall_dust(self.pos, effect, before, self.safe_fall_distance());
+            }
             let fall = self.life.vit.fall;
             if fall > 0.0 {
-                let below = [self.pos[0], self.pos[1] - 0.2, self.pos[2]];
-                let landing = self.block_name_at(below);
                 // Honey block: the slide sound is predicted by the player's client;
                 // event 54 (jump particles) goes out to everyone, player included.
-                if landing == "minecraft:honey_block" {
+                let honey = self.data.block_of(effect_st).is_some_and(|b| b.name == "minecraft:honey_block");
+                if honey {
                     let id = self.player_id;
                     let _ = self.send(Event::Entity(EntityEvent::Event { id, event: 54 }));
                 }
-                let below_st = self.state_at(below.map(|c| c.floor() as i32)).unwrap_or(0);
-                let rule = self.fall_rule(below_st, fall, self.sneaking);
+                let (w, h, _) = self.player_dims();
+                self.trample_farmland(effect, effect_st, fall, None, w as f32, h as f32);
+                let rule = self.fall_rule(effect_st, fall, self.sneaking);
+                // Player who can fly: no statistic and no damage, impulse context kept.
+                let may_fly = self.game_mode == 1 || self.game_mode == 3;
                 // `fall_one_cm` statistic: any fall "onto" the block of at least 2 m
-                // (distance after the block's rule), except for a player who can fly.
+                // (distance after the block's rule, before the impulse bound).
                 if let Some((f, ..)) = rule
                     && f >= 2.0
-                    && self.game_mode != 1
-                    && self.game_mode != 3
+                    && !may_fly
                 {
                     self.award_custom("fall_one_cm", (f * 100.0).round() as i32);
                 }
-                let (fall, mult, ty) = rule.unwrap_or((0.0, 0.0, "minecraft:fall"));
-                let dmg = ((fall + 1.0e-6 - self.safe_fall_distance()) * mult).floor(); // S7: improved jump
-                if dmg > 0.0 {
-                    let sound = if dmg > 4.0 {
-                        "minecraft:entity.player.big_fall"
-                    } else {
-                        "minecraft:entity.player.small_fall"
-                    };
-                    self.play_sound(sound, 7, self.pos, 1.0, 1.0);
-                    self.hurt(ty, dmg as f32);
+                if let Some((mut fall, mult, ty)) = rule
+                    && !may_fly
+                {
+                    // Wind charge jump: fall bounded to the height of the impact point;
+                    // landed above it, the context is forgotten, otherwise once the grace has elapsed.
+                    if let Some(imp) = self.life.vit.impulse_impact {
+                        fall = fall.min(imp[1] - self.pos[1]);
+                        if fall <= 0.0 {
+                            self.life.vit.impulse_reset();
+                        } else {
+                            self.life.vit.impulse_try_reset();
+                        }
+                    }
+                    let power = fall + 1.0e-6 - self.safe_fall_distance(); // S7: improved jump
+                    let dmg = (power * mult * self.player_attribute("minecraft:fall_damage_multiplier")).floor();
+                    if dmg > 0.0 {
+                        self.life.vit.impulse_reset();
+                        let sound = if dmg > 4.0 {
+                            "minecraft:entity.player.big_fall"
+                        } else {
+                            "minecraft:entity.player.small_fall"
+                        };
+                        self.play_sound(sound, 7, self.pos, 1.0, 1.0);
+                        self.player_block_fall_sound();
+                        self.hurt(ty, dmg as f32);
+                        // Honey: block fall sound replayed after the damage.
+                        if honey {
+                            self.play_sound("minecraft:block.honey_block.fall", 7, self.pos, 0.5, 0.75);
+                        }
+                    }
                 }
-                // Landing: state of the main supporting block, otherwise of the block at 0.2.
-                let (_, effect) = self.player_on_pos();
-                let st = self.st(self.player_support().unwrap_or(effect));
+                // Landing: current state of the main supporting block, otherwise of the block at
+                // 0.2 (positions read before a trampling that raises the player, like the game).
+                let st = self.st(support.unwrap_or(effect));
                 let pos = self.pos;
                 let src = Some(crate::mobs::recent::vibration::Src::Living(crate::mobs::mob::Ent::Player));
                 self.game_event_src("minecraft:hit_ground", pos, src, Some(st));
@@ -1283,6 +1428,7 @@ impl Server {
         v.sent_frozen = None;
         v.fire = -20;
         v.fall = 0.0;
+        v.impulse_reset();
         v.cooldown = 0;
         v.last_damage = None;
         v.sent_health = None;
@@ -1535,8 +1681,8 @@ impl Server {
         if self.game_mode == 3 || self.life.vit.dead {
             return;
         }
-        // F12: warped fungus on a stick on a steered strider (boost).
-        if self.strider_boost_use(hand) {
+        // F12: warped fungus on a stick (strider) or carrot on a stick (pig): boost.
+        if self.stick_boost_use(hand) {
             return;
         }
         let slot = if hand == 0 { 36 + self.held as usize } else { 45 };
@@ -1596,10 +1742,21 @@ impl Server {
         let slot = if hand == 0 { 36 + self.held as usize } else { 45 };
         let Some(mut s) = self.slots[slot].clone() else { return true };
         // W8c: an item without a consumable (shield raised for an hour) ends without effect.
-        if self.comp_json(&s, "minecraft:consumable").is_none() {
+        let Some(cons) = self.comp_json(&s, "minecraft:consumable") else {
             return true;
-        }
+        };
         if let Some((nutrition, sat, _)) = self.life.items.food(&s) {
+            // Food: the consumable's sound is broadcast to everyone (the eater included), neutral
+            // category, volume 1, triangular pitch around 1 (spread 0.4), before the burp.
+            let sound = match &cons["sound"] {
+                serde_json::Value::String(t) => Some(t.as_str()),
+                o => o["sound_id"].as_str(),
+            }
+            .unwrap_or("minecraft:entity.generic.eat")
+            .to_owned();
+            let rng = &mut self.life.rng;
+            let pitch = 1.0 + 0.4 * (rng.next_float() - rng.next_float());
+            self.play_sound(&sound, 6, self.pos, 1.0, pitch);
             let v = &mut self.life.vit;
             v.food = (v.food + nutrition).clamp(0, 20);
             v.saturation = (v.saturation + sat).clamp(0.0, v.food as f32);
@@ -1660,6 +1817,9 @@ impl Server {
             self.flying = true;
         }
         let _ = self.send(Event::GameEvent { kind: 3, param: mode as f32 });
+        if mode == 1 {
+            self.life.vit.impulse_reset();
+        }
         if mode == 3 {
             // Dismount (stop riding), after the mode announcement.
             self.player_stop_riding();
@@ -1680,16 +1840,34 @@ impl Server {
 
 /// Seed of a positional sound (variant and drift chosen by the client): sound-specific
 /// generator, without a fixed seed, independent of the world's random source (like the game's).
+/// In tests, a fixed per-thread sequence, distinct from `rng::test_seed` (a sound shifts no
+/// other seed): same packets from one run to the next.
 pub(crate) fn sound_seed() -> i64 {
-    use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    static SALT: OnceLock<u64> = OnceLock::new();
-    let salt = *SALT.get_or_init(|| {
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0x5DEE_CE66, |d| d.as_nanos() as u64)
-    });
+    const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+    #[cfg(not(test))]
+    let base = {
+        use std::sync::OnceLock;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        static SALT: OnceLock<u64> = OnceLock::new();
+        let salt = *SALT.get_or_init(|| {
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0x5DEE_CE66, |d| d.as_nanos() as u64)
+        });
+        NEXT.fetch_add(GOLDEN, Ordering::Relaxed) ^ salt
+    };
+    #[cfg(test)]
+    let base = {
+        thread_local! {
+            static NEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        }
+        NEXT.with(|c| {
+            let v = c.get();
+            c.set(v.wrapping_add(GOLDEN));
+            v ^ 0x500D_5EED
+        })
+    };
     // SplitMix64.
-    let mut z = (NEXT.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed) ^ salt).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = base.wrapping_add(GOLDEN);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     (z ^ (z >> 31)) as i64

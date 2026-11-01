@@ -245,12 +245,12 @@ impl Mob {
         self.equipment[BODY].is_some()
     }
 
-    /// Species-specific persistence (outside the `persistent` flag): a sulfur cube carrying
-    /// a block or coming out of a bucket does not despawn and does not count toward the spawn cap.
-    /// (Leash and mount are not modeled yet.)
+    /// Species-specific persistence (outside the `persistent` flag): passenger, leashed animal,
+    /// sulfur cube carrying a block or coming out of a bucket; none despawns or counts toward the spawn cap.
     pub fn requires_custom_persistence(&self) -> bool {
-        // F04: a passenger does not despawn.
+        // F04: a passenger does not despawn; G4-F07a: neither does a leashed animal.
         self.mount.vehicle.is_some()
+            || super::leash::is_leashed(self)
             || self.kind == Kind::SulfurCube && (self.has_body_item() || self.cube.from_bucket)
             // F07: raid raider.
             || super::illagers::custom_persistence(self)
@@ -734,6 +734,8 @@ impl Server {
             if let Some((power, _fire, _)) = m.cube.explosion
                 && m.cube.fuse == 0
             {
+                // The lead falls (item on the ground, null link) before the explosion, which would hit it.
+                self.leash_drop(m, true, true);
                 m.dead = true;
                 if self.rule("minecraft:tnt_explodes", true) {
                     let c = [m.pos[0], m.pos[1] + f64::from(m.height()) * 0.0625, m.pos[2]];
@@ -968,6 +970,7 @@ impl Server {
         if self.player_hurt_by_mob(m, "minecraft:mob_attack", dmg, Some(kb)) {
             let pitch = (m.rng.next_float() - m.rng.next_float()) * 0.2 + 1.0;
             self.cube_sound(m, "minecraft:entity.slime.attack", 1.0, pitch);
+            self.player_thorns(m); // G5-F02d
         }
     }
 
