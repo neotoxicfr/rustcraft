@@ -2433,3 +2433,16 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   walk of the order of 3.65 ms for 12,000 files (G1-F15 measurement), kept for safety.
 - Free disk space (`rc_sim::storage::low_disk_space`): one system call at opening, on
   the main thread; not measured separately (negligible).
+## G4-F16b: local monster effects (25/10, loaded machine)
+
+- `entity_fx::mob_fx` (blaze, breeze, enderman, endermite, evoker, illusioner, phantom,
+  ravager, warden): a few comparisons and draws per affected monster and per tick, on the
+  main thread, inside the entity loop already walked (no second walk); no allocation
+  except for a sound (empty vector otherwise). Rough measurement: 900,000 entity ticks +
+  effects (test `ravager_stun_particles`) in under 0.1 s, i.e. < 110 ns per call, tick
+  included. Leads not retained: grouping the draws by batch or with SIMD (a few monsters at a
+  time, nothing measurable), multi-core and GPU not applicable (sub-microsecond work, output
+  to the particle system of the main thread). Render shape of the ground block: comparison of
+  the block name (12 cases) only for the breeze and the digging warden; per-state table not
+  retained (construction at loading for a rare use). Scenes to re-measure on a calm machine:
+  Nether (blazes), night (phantoms), ancient city (warden), trial chamber (breezes).

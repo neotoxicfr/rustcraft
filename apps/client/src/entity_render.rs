@@ -22,6 +22,7 @@ mod animals;
 mod blocks;
 pub use blocks::BlockFrame;
 mod creatures;
+pub(crate) use creatures::{warden_beat, warden_dig_ticks};
 // Transient blocks (`docs/specs/miscellaneous.md` § 5.5).
 mod misc;
 mod dragon;
@@ -6483,14 +6484,9 @@ fn pulse_alpha(e: &Entity, id: u8, pt: f32) -> f32 {
         1 => ((age * 0.045).cos() * 0.25).max(0.0),
         2 => ((age * 0.045 + PI).cos() * 0.25).max(0.0),
         3 => (e.extra[2] + pt * (e.extra[1] - e.extra[2])) / 10.0,
-        4 => {
-            let anger = (e.meta_int(16).unwrap_or(0) as f32 / 80.0).clamp(0.0, 1.0);
-            let delay = 40 - (anger * 30.0).floor() as u32;
-            // Beat at the tick multiple of the delay: 10 then countdown (after the tick: 9).
-            let k = e.age % delay;
-            let (now, before) = ((9i32 - k as i32).max(0) as f32, (10i32 - k as i32).max(0) as f32);
-            (before + pt * (now - before)) / 10.0
-        }
+        // Heart counter held by the tick (`creatures::tick`, extra 9 current, 10 old): a change
+        // of anger does not interrupt a beat in progress.
+        4 => (e.extra[10] + pt * (e.extra[9] - e.extra[10])) / 10.0,
         5 => f32::from(u8::from(e.meta_bool(17))),
         _ => 1.0,
     }
@@ -7663,12 +7659,26 @@ mod tests {
         let e = all.map.get_mut(&7).unwrap();
         e.age = 0;
         assert!((pulse_alpha(e, 1, 0.0) - 0.25).abs() < 1e-6 && pulse_alpha(e, 2, 0.0) == 0.0);
-        assert!((pulse_alpha(e, 4, 0.0) - 1.0).abs() < 1e-6 && (pulse_alpha(e, 4, 1.0) - 0.9).abs() < 1e-6);
-        e.age = 39;
-        assert_eq!(pulse_alpha(e, 4, 0.5), 0.0);
-        e.meta.insert(16, Meta::Int(80));
-        e.age = 20;
-        assert!((pulse_alpha(e, 4, 0.0) - 1.0).abs() < 1e-6, "maximum anger: delay 10");
+        // Heart: beat at tick 40 (delay 40 without anger), 10 -> 9 on that tick.
+        for _ in 0..39 {
+            all.tick();
+        }
+        let a = |all: &crate::entities::Entities, pt| pulse_alpha(&all.map[&7], 4, pt);
+        assert_eq!(a(&all, 0.5), 0.0);
+        all.tick();
+        assert!((a(&all, 0.0) - 1.0).abs() < 1e-6 && (a(&all, 1.0) - 0.9).abs() < 1e-6);
+        // Anger 40 (delay 25) in the middle of a beat: the countdown continues (0.5 at tick 45,
+        // a modulo of the age would give 0), then beats at tick 50.
+        for _ in 0..4 {
+            all.tick();
+        }
+        all.map.get_mut(&7).unwrap().meta.insert(16, Meta::Int(40));
+        all.tick();
+        assert!((a(&all, 0.0) - 0.5).abs() < 1e-6, "{}", a(&all, 0.0));
+        for _ in 0..5 {
+            all.tick();
+        }
+        assert!((a(&all, 0.0) - 1.0).abs() < 1e-6, "anger 40: delay 25");
     }
 
     fn rot_ctx() -> RotCtx {

@@ -807,6 +807,10 @@ impl App {
                 }
                 let added = if let rc_client::EntityEvent::Add(a) = &e { Some(a.id) } else { None };
                 self.entities.apply(e);
+                if !self.entities.pending_sounds.is_empty() {
+                    let sounds = std::mem::take(&mut self.entities.pending_sounds);
+                    self.play_fx_sounds(&sounds);
+                }
                 // Sustained sounds created at spawn (minecarts, bees: `entity_loops.rs`).
                 if let Some(id) = added {
                     self.loop_sound_added(id);
