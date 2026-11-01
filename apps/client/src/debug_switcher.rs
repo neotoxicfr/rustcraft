@@ -6,7 +6,8 @@ use crate::gui::Gui;
 /// Display and cycle order: creative, survival, adventure, spectator (network modes 1, 0, 2, 3).
 const MODES: [i32; 4] = [1, 0, 2, 3];
 const KEYS: [&str; 4] = ["gameMode.creative", "gameMode.survival", "gameMode.adventure", "gameMode.spectator"];
-const ICONS: [&str; 4] = ["grass_block", "iron_sword", "map", "ender_eye"];
+/// Icon items, in the same order (adventure: the buried treasure explorer map).
+const ICONS: [&str; 4] = ["grass_block", "iron_sword", "buried_treasure_map", "ender_eye"];
 
 pub struct Switcher {
     /// Chosen slot (index into `MODES`).
@@ -169,5 +170,22 @@ impl crate::App {
             let _ = self.session.link.send_change_game_mode(s.mode());
         }
         self.grab(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ICONS;
+
+    /// Icons of the game: grass block, iron sword, buried treasure explorer map, ender eye; each
+    /// one an item of the extracted registry.
+    #[test]
+    fn icons_are_the_game_items() {
+        assert_eq!(ICONS, ["grass_block", "iron_sword", "buried_treasure_map", "ender_eye"]);
+        let d = rc_testdata::version_data().expect("version data missing (extraction)");
+        let items = d.registry("minecraft:item").expect("item registry");
+        for icon in ICONS {
+            assert!(items.entries.iter().any(|e| e == &format!("minecraft:{icon}")), "{icon}");
+        }
     }
 }

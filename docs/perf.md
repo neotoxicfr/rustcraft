@@ -2786,3 +2786,31 @@ Bench `bench_g6f08_scan_and_grass` (ignored; `--ignored bench_g6f08 --nocapture`
   touch: 6 neighbour reads for the server's particle draws. Multi-core and GPU not applicable
   (world random order imposed, work of a few hundred nanoseconds per event); no allocation per
   tick (the eyeblossom wake-up list is allocated only when a flower turns).
+## G1-F16: F3 and debug lines (01/11, loaded machine)
+
+- Server values of the F3 screen in singleplayer (`rc_sim::debug_report`: server heightmaps,
+  forced chunks, sprint, local difficulty, spawn census): the screen posts its request only while
+  one of the five entries is shown, the server answers once per loop turn with the values of its
+  last tick. Micro-bench (`tests_g1f16::bench_debug_report`, 2 passes): values 36 ns, loop turn
+  without a request 3 ns, request + answer 47-48 ns; `Copy` report, no allocation per frame or per
+  tick (dimension names copied into kept buffers). Leads not taken: per-frame direct reads of the
+  server state (impossible without sharing the server's structures across threads, and the
+  answer already costs less than 50 ns); multi-core and GPU not applicable (a few lookups).
+  Census of the natural spawn pass kept in place (one name copy per tick into the same buffer).
+- The game's `%.Nf` rounding (`tech_blocks::java_fixed`, half up on the shortest digits) for the
+  reals of the F3 lines: 10 reals 1,116-1,143 ns against 1,168-1,255 ns for Rust's `{:.N}`
+  (`debug_screen::tests::bench_java_rounding`, 2 passes): no cost, kept. Only while F3 is open.
+- Adapter texts (vendor, API, driver) computed once at startup (`gpu_backend::GpuText`) instead
+  of every frame of the F3 screen; Vulkan API version read through wgpu's backend once (one
+  property read, no device call). No device refusal: the game's list only applies under MoltenVK,
+  absent from our builds.
+- Sounds line: two counters already kept up to date by the engine (no walk of the instances).
+- Screen frequency label (`video::rate_label`): one integer division and, for a fractional rate,
+  one `java_fixed` (about 110 ns per real in the bench above) per frame while the fps entry is
+  shown; not measured separately.
+- Fluid target: same walk as the block target, a second box per crossed block only for the fluid
+  entries; one ray of 20 blocks per frame and per entry, as before (not measured separately: the
+  walk is unchanged, the extra box test is of the order of ten ns). Shared walk (`pick::walk`,
+  generic, no indirect call) for the crosshair and the F3 rays.
+- To re-measure on a quiet machine: F3 open in singleplayer (frame time against main), scene bench
+  `tools/bench/scenes.py` (F3 closed: no change expected, nothing is computed).

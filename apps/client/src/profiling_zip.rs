@@ -213,9 +213,10 @@ impl crate::App {
             lines.push(("Backend library".into(), format!("wgpu ({:?})", info.backend)));
             lines.push(("Window size".into(), format!("{w}x{h}")));
             lines.push(("Graphics Device".into(), info.name.clone()));
-            lines.push(("Graphics Backend".into(), format!("{:?}", info.backend)));
-            lines.push(("Graphics Vendor".into(), format!("0x{:04x}", info.vendor)));
-            lines.push(("Graphics Drivers".into(), format!("{} {}", info.driver, info.driver_info)));
+            let t = &r.gpu_text;
+            lines.push(("Graphics Backend".into(), t.backend.into()));
+            lines.push(("Graphics Vendor".into(), t.vendor.clone()));
+            lines.push(("Graphics Drivers".into(), t.driver.clone()));
         }
         lines.push(("Type".into(), "Client".into()));
         let rd = self.options.i("renderDistance");

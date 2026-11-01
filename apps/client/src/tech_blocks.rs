@@ -766,6 +766,13 @@ fn java_double(v: f64) -> String {
 
 /// Java's `%.2f`: "half up" rounding applied to the shortest digits.
 pub fn java_fixed2(v: f64) -> String {
+    java_fixed(v, 2)
+}
+
+/// Java's `%.<places>f` (a single-precision value goes through `f64::from`, like the game): "half
+/// up" rounding applied to the shortest digits, where `{:.N}` rounds the exact binary value
+/// half to even (2.5 → "3" here, "2" there).
+pub fn java_fixed(v: f64, places: usize) -> String {
     if !v.is_finite() {
         return java_double(v);
     }
@@ -776,7 +783,7 @@ pub fn java_fixed2(v: f64) -> String {
         d = z;
         point = 0;
     }
-    let keep = point as usize + 2;
+    let keep = point as usize + places;
     if d.len() > keep {
         let up = d[keep] >= b'5';
         d.truncate(keep);
@@ -798,12 +805,22 @@ pub fn java_fixed2(v: f64) -> String {
             }
         }
     }
-    let keep = point as usize + 2;
+    let keep = point as usize + places;
     d.resize(keep, b'0');
     let p = point as usize;
-    let int: String = if p == 0 { "0".into() } else { d[..p].iter().map(|&b| b as char).collect() };
-    let frac: String = d[p..].iter().map(|&b| b as char).collect();
-    format!("{}{int}.{frac}", if neg { "-" } else { "" })
+    let mut out = String::with_capacity(keep + 3);
+    if neg {
+        out.push('-');
+    }
+    if p == 0 {
+        out.push('0');
+    }
+    out.extend(d[..p].iter().map(|&b| b as char));
+    if places > 0 {
+        out.push('.');
+        out.extend(d[p..].iter().map(|&b| b as char));
+    }
+    out
 }
 
 /// Quotes and escapes of the SNBT strings (the quote that does not appear first).
@@ -1014,6 +1031,14 @@ mod tests {
         assert_eq!(java_fixed2(-59.0), "-59.00");
         assert_eq!(java_fixed2(1899.995), "1900.00");
         assert_eq!(java_fixed2(0.004), "0.00");
+        // Other widths: half up where `{:.N}` rounds half to even.
+        assert_eq!(java_fixed(0.5, 0), "1");
+        assert_eq!(java_fixed(2.5, 0), "3");
+        assert_eq!(java_fixed(0.25, 1), "0.3");
+        assert_eq!(java_fixed(0.0625, 3), "0.063");
+        assert_eq!(java_fixed(64.0, 5), "64.00000");
+        assert_eq!(java_fixed(-0.04, 1), "-0.0");
+        assert_eq!(java_fixed(99.96, 1), "100.0");
     }
 
     #[test]

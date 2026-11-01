@@ -200,11 +200,17 @@ fn fill_quad_banded(gui: &mut Gui, p: [[f32; 2]; 4], ymin: f32, ymax: f32, color
     }
 }
 
-/// Pie chart disc in the band `[top, bottom]`: centered at mid-height of the band, parts in
+/// Center of the disc in the band `[top, bottom]`: mid-height raised by 5 units (the game draws
+/// the disc into a texture of the band's size, origin at its middle, then moves it up by 5).
+fn pie_center_y(top: f32, bottom: f32) -> f32 {
+    (top + bottom) / 2.0 - 5.0
+}
+
+/// Pie chart disc in the band `[top, bottom]`: centered by `pie_center_y`, parts in
 /// a fan (radius 105, flattened by half, one subdivision per 4% slice), then a 10 px slice
-/// darkened on the front half, clipped at the bottom of the band.
+/// darkened on the front half, clipped to the band.
 fn draw_pie_disc(gui: &mut Gui, fields: &[crate::profiler::Field], cx: f32, top: f32, bottom: f32) {
-    let cy = (top + bottom) / 2.0;
+    let cy = pie_center_y(top, bottom);
     let mut total = 0.0f64;
     for f in fields {
         let (pct, cur) = (f.percentage, total);
@@ -530,6 +536,14 @@ mod tests {
         assert_eq!(gradient(28.0, 0.0, 0xFF00_FF00, 28.0, 0xFFFF_FF00, 56.0, 0xFFFF_0000), 0xFFFF_FF00);
         assert_eq!(gradient(99.0, 0.0, 0xFF00_FF00, 28.0, 0xFFFF_FF00, 56.0, 0xFFFF_0000), 0xFFFF_0000);
         assert_eq!(gradient(14.0, 0.0, 0xFF00_FF00, 28.0, 0xFFFF_FF00, 56.0, 0xFFFF_0000), 0xFF7F_FF00);
+    }
+
+    /// Band of the pie chart for a disc whose text block starts at y = 300 (center 300 − 67 =
+    /// 233, band 181..295): the disc sits 5 units above the band's middle, at 233.
+    #[test]
+    fn pie_disc_raised_by_five() {
+        let cy = 300.0 - 62.0 - 5.0;
+        assert_eq!(pie_center_y(cy - 52.0, cy + 62.0), 233.0);
     }
 
     #[test]

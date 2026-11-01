@@ -9,6 +9,7 @@
 mod blocks;
 mod fluid_use;
 pub mod chunk;
+pub mod debug_report;
 pub mod demo;
 pub mod gen_debug;
 pub mod generation;
@@ -76,6 +77,8 @@ pub(crate) mod tag_bits; // C6-M02: block tags as bits
 mod crafter; // G5-F11: crafter menu
 #[cfg(test)]
 mod tests_g5f11;
+#[cfg(test)]
+mod tests_g1f16; // G1-F16: F3 values answered by the server
 #[cfg(test)]
 mod tests_g4f09; // G4-F09: turtle helmet, 1.21 effects, hurt sound, statistics
 #[cfg(test)]

@@ -59,9 +59,17 @@ pub struct Handle {
     prep: Arc<crate::prep::Prep>,
     /// F3 generator lines (the "chunk_generation_stats" entry).
     gen_debug: Arc<crate::gen_debug::GenDebug>,
+    /// F3 values of the server (heightmaps, forced chunks, sprint, local difficulty, census).
+    debug_report: Arc<crate::debug_report::DebugReport>,
 }
 
 impl Handle {
+    /// F3 values of the server for the dimension `dim` and the `feet` block (last answer; the
+    /// request is picked up on the server's next loop turn).
+    pub fn debug_report(&self, dim: &str, feet: [i32; 3]) -> Option<crate::debug_report::Report> {
+        self.debug_report.request(dim, feet)
+    }
+
     /// F3 generator lines at the `feet` block (last computed; the request is picked up on the
     /// server's next loop turn).
     pub fn gen_debug(&self, feet: [i32; 3]) -> Vec<String> {
@@ -122,6 +130,8 @@ pub fn start(opts: Options, data: Arc<VersionData>) -> Result<(rc_client::Sessio
     let pr = prep.clone();
     let gen_debug: Arc<crate::gen_debug::GenDebug> = Arc::default();
     let gd = gen_debug.clone();
+    let debug_report: Arc<crate::debug_report::DebugReport> = Arc::default();
+    let dr = debug_report.clone();
     let thread = std::thread::Builder::new().name("singleplayer".into()).stack_size(SOLO_STACK).spawn(move || {
         let _ = peer.send(Event::LoginFinished);
         match Server::open(opts, uuid, data, peer, p) {
@@ -130,6 +140,7 @@ pub fn start(opts: Options, data: Arc<VersionData>) -> Result<(rc_client::Sessio
                 s.publish_req = pb; // S9
                 s.sim_req = sm; // W9: tracked simulation distance
                 s.gen_debug = gd;
+                s.debug_report = dr;
                 s.prep_open(pr);
                 s.run()
             }
@@ -140,7 +151,7 @@ pub fn start(opts: Options, data: Arc<VersionData>) -> Result<(rc_client::Sessio
             }
         }
     })?;
-    Ok((session, Handle { thread: Some(thread), paused, saving, publish, sim, prep, gen_debug }))
+    Ok((session, Handle { thread: Some(thread), paused, saving, publish, sim, prep, gen_debug, debug_report }))
 }
 
 /// Slot of a chunk on the server side: loaded, or absent / not loadable (nothing sent).
@@ -170,6 +181,8 @@ pub struct Server {
     pub(crate) sim_req: Arc<AtomicI32>,
     /// F3 generator lines requested by the client (`gen_debug.rs`).
     pub(crate) gen_debug: Arc<crate::gen_debug::GenDebug>,
+    /// F3 server values requested by the client (`debug_report.rs`).
+    pub(crate) debug_report: Arc<crate::debug_report::DebugReport>,
     was_paused: bool,
     pub(crate) tick: u64,
     // Player.
@@ -435,6 +448,7 @@ impl Server {
             sim_dist: opts.sim_distance.max(2),
             sim_req: Arc::new(AtomicI32::new(opts.sim_distance.max(2))),
             gen_debug: Arc::default(),
+            debug_report: Arc::default(),
             was_paused: false,
             tick: 0,
             player_id: 1,
@@ -1213,6 +1227,7 @@ impl Server {
                 let _ = self.send(Event::SimulationDistance(sd));
             }
             self.gen_debug_tick();
+            self.debug_report_tick();
             let method_start = Instant::now();
             // (2) tick, outside pause (§ 9); an open world does not pause.
             let paused = self.paused.load(Ordering::Acquire) && self.lan.is_none();

@@ -114,8 +114,17 @@ Each active entry, in the order of § 1.3, may emit:
   created empty (target entry without a target): it still counts in the split below, but emits
   nothing.
 
-The "server" values only exist in singleplayer (integrated server); for our client, the world
-consulted is always the client world and the "server chunk" is always absent.
+The "server" values only exist in singleplayer (integrated server); in multiplayer the "server
+chunk" is always absent. In singleplayer they come from `rc_sim::debug_report`: while one of the
+entries `tps`, `player_position`, `heightmap`, `local_difficulty`, `entity_spawn_counts` is shown,
+the screen posts its dimension and feet block every frame and the server answers at its next loop
+turn with the values of its last tick (server chunk of the feet when loaded, forced chunks, sprint,
+local difficulty, last natural spawn census); nothing is computed otherwise. The targeted block
+and fluid always read the client world.
+
+Reals (`%.Nf` of the game): rounding **half up** on the shortest decimal digits of the value (a
+single-precision value widened to double first), e.g. `%.0f` of 2.5 = `3`, where Rust's `{:.N}`
+rounds the exact binary value half to even (`java_fixed`).
 
 ### 2.3 Column assembly
 
@@ -231,7 +240,9 @@ consistently).
 - `<mode>`: surface presentation mode: ` (immediate)`, ` (mailbox)`, ` (fifo)`,
   ` (fifo relaxed)`, empty if unknown. Direct correspondence with the wgpu modes.
 - `<Hz>`: refresh rate of the screen's active video mode, an integer if round otherwise `%.2f`; `0`
-  if unknown.
+  if unknown. The rate is the window library's single-precision value, truncated to hundredths
+  (60.001 Hz is shown `60`, 143.859 Hz `143.85`); `%.2f` rounds half up the shortest digits of
+  that value widened to double (`video::rate_label`, also the fullscreen mode labels).
 
 ### 3.3 Server — `tps`
 
@@ -243,7 +254,9 @@ Multiplayer: `"<server brand>" server<state>, <tx> tx, <rx> rx`, e.g.
 - `<tx>`/`<rx>`: smoothed averages of the **packets** sent/received per second, `%.0f`. Every
   20 iterations of the network loop (1 s): `avg = 0.25·count + 0.75·avg`, then count reset to 0.
 
-(Singleplayer: `Integrated server @ <ms>/<target> ms<state>, …` — not concerned.)
+Singleplayer: `Integrated server @ <ms>/<target> ms<state>, <tx> tx, <rx> rx`: smoothed tick
+duration `%.1f`, target = milliseconds per tick `%.1f`; while the integrated server sprints
+(`/tick sprint`), `<state>` = ` (sprinting)` and `<target>` = `-`.
 
 ### 3.4 Memory — `memory`, `detailed_memory` (group "memory")
 
@@ -274,13 +287,20 @@ Six lines:
    same place.
 2. `CPU: <n>x <name>`: number of logical processors and commercial name, multiple spaces reduced
    to one; `<unknown>` if unreadable. Computed only once.
-3. `Display: <W>x<H> (<GPU vendor>)`: size of the framebuffer in pixels.
+3. `Display: <W>x<H> (<GPU vendor>)`: size of the framebuffer in pixels; vendor named from its
+   PCI identifier like the game's Vulkan backend: `AMD` (0x1002, 0x1022), `IMGTEC` (0x1010),
+   `APPLE` (0x106B), `NVIDIA` (0x10DE, 0x12D2), `ARM` (0x13B5), `MICROSOFT` (0x1414), `BROADCOM`
+   (0x14E4), `QUALCOMM` (0x168C, 0x17CB, 0x1969, 0x5143), `INTEL` (0x8086), otherwise `0x<hex>`
+   (lowercase, no padding).
 4. `Window: <w>x<h> (<d>x pixel density)`: size of the window in screen coordinates, density
    `%.2f` (buffer pixels / screen coordinates).
 5. `<GPU name><type>`: type ` (iGPU)` integrated, ` (dGPU)` discrete, ` (vGPU)` virtual,
    ` (software)` processor, empty otherwise (direct correspondence with the wgpu adapter type).
 6. `<backend> <driver>`: name of the API (`Vulkan`, `DX12`…) then the **first line** of the
-   driver description (for us: name + driver info of the adapter).
+   driver description, not trimmed. Vulkan: `<API major.minor.patch> <driver name> <driver
+   info>` (API version of the device, e.g. `Vulkan 1.3.289 NVIDIA 566.36`). DX12 (no game
+   equivalent): driver name and information, trimmed. The same texts fill "Graphics Backend",
+   "Graphics Vendor" and "Graphics Drivers" of the F3+L system report.
 
 ### 3.6 GPU — `gpu_utilization`
 
@@ -331,7 +351,7 @@ display `GPU: 0%`).
    east), text `Towards negative Z` / `Towards positive Z` / `Towards negative X` /
    `Towards positive X`, then yaw and pitch brought into [−180, 180).
 5. `<dimension> FC: <n>`: dimension identifier (e.g. `minecraft:overworld`), n = forced
-   chunks, **always 0** in multiplayer.
+   chunks of the integrated server (`/forceload`), **always 0** in multiplayer.
 
 `player_section_position`: `Section-relative: %02d %02d %02d` (x & 15, y & 15, z & 15 of the feet
 block).
@@ -347,7 +367,9 @@ Order within the group (alphabetical by entry): lines of `player_position`, then
 Ray cast from the camera entity, range **20 blocks**, with frame interpolation = 0
 (end-of-tick position), from the eyes, block outline shapes, independent of the interaction
 range; two casts: without fluids (block) and stopped by any fluid, source or not
-(fluid). Nothing if the ray does not hit a block.
+(fluid). The fluid cast also tests, in each block, the fluid's own shape: a box as high as the
+fluid (1 under the same fluid, otherwise amount / 9); the nearer of the outline and the fluid box
+counts, the outline on a tie. Nothing if the ray does not hit a block.
 
 - `looking_at_block_state` (group "looking_at_block"):
   `§n` + `Targeted Block: x, y, z` (underlined), then the block identifier
@@ -371,21 +393,29 @@ The "server" states (development flag) are not concerned.
   (`lighting.md`).
 - `heightmap` (group "heightmaps"): two lines at the feet's (x, z):
   `CH S: <a> M: <b> ML: <c>` (maps sent to the client: world surface, motion blocking,
-  blocking without leaves; value = y of the first free block above) and
-  `SH S: ?? O: ?? M: ?? ML: ??` (server maps, **always `??`** for us).
+  blocking without leaves; value = y of the **highest block taken**, one below the first free
+  height stored by the map) and `SH S: <s> O: <o> M: <m> ML: <ml>` (server maps of the feet
+  chunk, same reading: world surface, ocean floor, motion blocking, without leaves), `??` for each
+  value while the server chunk is not loaded, always in multiplayer.
 - `biome`: `Biome: <identifier>` (e.g. `minecraft:plains`) at the feet block, only if its y
   is within the buildable height; `[unregistered …]` for a biome without a key.
 - `day_count`: `Day #<n>` = total ticks of the Overworld day clock / period (24,000),
   truncated; the line only exists if the `overworld_day` timeline exists in the received
   registries.
 - `sound_mood`: `Sounds: <a>/<A> + <b>/<B> (Mood <m>%)`: point sources used/max,
-  streaming sources used/max (`sounds.md` § 3.5, e.g. 247 and 8), ambient mood × 100 rounded
-  (0 if the dimension has no biome ambience handler).
+  streaming sources used/max (`sounds.md` § 3.5, e.g. 247 and 8; a sound holds its channel 20
+  ticks at least), ambient mood × 100 rounded (0 if the dimension has no biome ambience handler);
+  without an audio output `0/0 + 0/0`.
 - `sound_cache`: `Sound cache: <n> buffers, <t> MiB` (decoded buffers in cache, size rounded
   **up** to the MiB).
-- `local_difficulty` (`Local Difficulty: %.2f // %.2f`), `entity_spawn_counts` (`SC: …`),
-  `chunk_generation_stats`: singleplayer only, not to be implemented (they produce nothing in
-  multiplayer).
+- Singleplayer only (nothing in multiplayer):
+  - `local_difficulty`: `Local Difficulty: %.2f // %.2f` (effective difficulty, special
+    multiplier) at the feet block, only if the server chunk is loaded and the feet within the
+    build height;
+  - `entity_spawn_counts`: `SC: <n>, MO: …, C: …, AM: …, AX: …, UWC: …, WC: …, WA: …, MI: 0`: spawn
+    chunk count and mobs per category of the last natural spawn pass of the dimension (counts
+    after that pass's spawns; misc never counted); nothing before the first pass;
+  - `chunk_generation_stats`: generator lines (biome builder).
 
 ---
 
@@ -459,7 +489,9 @@ In the game folder. Compact JSON, two exclusive forms:
 The format is versioned like the other data (data version field added on
 writing; absent = old version). Read at startup: file absent → `default` profile
 (without writing); unreadable → `default` profile **and** the file is rewritten. Written on
-every status change or profile choice. Unknown identifiers kept but ignored.
+every status change or profile choice. Unknown identifiers kept but ignored. The custom table
+holds every status set, **explicit `never` included**; an entry never set stays absent (which
+matters for the quick toggle, § 1.5).
 
 ---
 
@@ -668,7 +700,8 @@ Details:
   by decreasing share then decreasing name; at the top the node itself (100%).
 - Colour of a node: `(Java hash of the name & 0xAAAAAA) + 0xFF444444`.
 - Layout: `cx = L − 140`, bottom = `H − offset − 5`, child lines above the bottom
-  (9 px each), disc centre 67 px above the lines; title split on the dots
+  (9 px each), disc centre 67 px above the lines (drawn into the band from 52 above to 62 below
+  that centre, whose middle is 5 lower, and clipped to it); title split on the dots
   (first line ≤ width − global % − 5 − "[0]", following ones 10 less, offset by
   10 + "[0]"); text with shadow, title white; "unspecified" child noted `[?]` (the
   numbers follow the index).
