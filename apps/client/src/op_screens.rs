@@ -1262,6 +1262,7 @@ impl crate::App {
         };
         let lang = self.renderer.as_ref().map(|r| r.gui.lang.clone()).unwrap_or_default();
         let output = match e.meta.get(&14) {
+            Some(Meta::Component(n)) => plain(Some(n), &lang),
             Some(Meta::Text(n)) => plain(n.as_ref(), &lang),
             _ => String::new(),
         };

@@ -50,6 +50,9 @@ pub struct ItemEnt {
     /// Yaw drawn at creation (random, never changed afterwards): it rotates the velocity at the
     /// passage of an End portal.
     pub yaw: f32,
+    /// G5-F05: fire ticks left (`Fire`), and the "on fire" flag last sent to the client.
+    pub fire: i32,
+    fire_flag: bool,
 }
 
 impl ItemEnt {
@@ -76,6 +79,9 @@ pub struct Orb {
     pub health: i32,
     /// Physics shared with the client (`rc_physics::body`).
     pub body: Box<Body>,
+    /// G5-F05: fire ticks left, and the "on fire" flag last sent to the client.
+    pub fire: i32,
+    fire_flag: bool,
 }
 
 /// Split of a reward into orbs (values of the game).
@@ -115,6 +121,74 @@ pub(crate) fn block_xp(name: &str) -> Option<BlockXp> {
 fn bbox(pos: [f64; 3], size: f64) -> Aabb {
     let h = size / 2.0;
     Aabb { min: [pos[0] - h, pos[1], pos[2] - h], max: [pos[0] + h, pos[1] + size, pos[2] + h] }
+}
+
+/// Boxes that overlap (touching faces do not count).
+fn crosses(a: &Aabb, b: &Aabb) -> bool {
+    (0..3).all(|i| a.min[i] < b.max[i] && a.max[i] > b.min[i])
+}
+
+/// G5-F05: orb `i` absorbs the orbs whose box crosses its own inflated by 0.5, of the same value
+/// and with an identifier congruent modulo 40: counts added, youngest age kept, the others removed.
+/// `candidates`: indices to test (all, or those of its residue modulo 40).
+pub(crate) fn merge_orbs(
+    orbs: &mut [Orb],
+    i: usize,
+    live: &mut [([f64; 3], bool)],
+    candidates: impl Iterator<Item = usize>,
+) {
+    let (id, value) = (orbs[i].id, orbs[i].value);
+    let b = bbox(orbs[i].pos, ORB_SIZE);
+    let zone = Aabb { min: b.min.map(|c| c - 0.5), max: b.max.map(|c| c + 0.5) };
+    let (mut count, mut age) = (orbs[i].count, orbs[i].age);
+    for j in candidates {
+        let o = &mut orbs[j];
+        if j == i || o.removed || (o.id - id) % 40 != 0 || o.value != value || !crosses(&bbox(o.pos, ORB_SIZE), &zone) {
+            continue;
+        }
+        count += o.count;
+        age = age.min(o.age);
+        o.removed = true;
+        if let Some(l) = live.get_mut(j) {
+            l.1 = true;
+        }
+    }
+    (orbs[i].count, orbs[i].age) = (count, age);
+}
+
+/// Orb count from which the merge candidates are bucketed (bench `g5f05_bench`: whole list
+/// cheaper at 20 orbs, buckets ahead at 100).
+const ORB_BUCKETS_FROM: usize = 40;
+
+/// Orbs still present by residue of their identifier modulo 40, in list order.
+pub(crate) fn orb_buckets(orbs: &[Orb], buckets: &mut Vec<Vec<u32>>) {
+    buckets.resize_with(40, Vec::new);
+    for b in buckets.iter_mut() {
+        b.clear();
+    }
+    for (j, o) in orbs.iter().enumerate().filter(|(_, o)| !o.removed) {
+        buckets[o.id.rem_euclid(40) as usize].push(j as u32);
+    }
+}
+
+/// True when the "on fire" point of an item or orb falls this tick (counter on a multiple of 20).
+fn burn_due(fire: i32, immune: bool) -> bool {
+    fire > 0 && !immune && fire % 20 == 0
+}
+
+/// Fire counter at the start of the tick of an item or orb: an immune one is put out, otherwise
+/// the counter goes down. True if the "on fire" point falls now (never in lava).
+fn burn_step(fire: &mut i32, immune: bool, in_lava: bool) -> bool {
+    if *fire <= 0 {
+        return false;
+    }
+    if immune {
+        *fire = 0;
+        return false;
+    }
+    let hurt = *fire % 20 == 0 && !in_lava;
+    *fire -= 1;
+    hurt
 }
 
 impl Server {
@@ -170,6 +244,8 @@ impl Server {
             body: server_body(pos, vel, ITEM_SIZE, 0.2125),
             thrower: None,
             yaw,
+            fire: 0,
+            fire_flag: false,
         });
     }
 
@@ -271,8 +347,10 @@ impl Server {
             let v = orb_value(amount);
             amount -= v;
             let r = self.life.rng.next_int_bound(40);
+            // G5-F05: box of 1 around the point, crossing the orb's box (strict bounds).
+            let around = Aabb { min: pos.map(|c| c - 0.5), max: pos.map(|c| c + 0.5) };
             if let Some(o) = self.life.orbs.iter_mut().find(|o| {
-                !o.removed && o.value == v && (o.id - r) % 40 == 0 && (0..3).all(|a| (o.pos[a] - pos[a]).abs() <= 0.5)
+                !o.removed && o.value == v && (o.id - r) % 40 == 0 && crosses(&bbox(o.pos, ORB_SIZE), &around)
             }) {
                 o.count += 1;
                 o.age = 0;
@@ -329,6 +407,8 @@ impl Server {
             removed: false,
             health: 5,
             body: server_body(pos, vel, ORB_SIZE, 0.425),
+            fire: 0,
+            fire_flag: false,
         });
     }
 
@@ -366,8 +446,71 @@ impl Server {
             removed: false,
             health,
             body: server_body(pos, vel, ORB_SIZE, 0.425),
+            fire: get("Fire", 0) as i16 as i32,
+            fire_flag: false,
         });
         id
+    }
+
+    /// G5-F05: "on fire" flag (data 0, bit 0x01) of an item or orb, sent when it changes.
+    fn fire_flag(&self, id: i32, fire: i32, sent: &mut bool) {
+        let on = fire > 0;
+        if on != *sent {
+            *sent = on;
+            let _ = self.send(Event::Entity(EntityEvent::Data { id, values: vec![(0, Meta::Byte(i8::from(on)))] }));
+        }
+    }
+
+    /// G5-F05: experience spent on repairs when an orb is picked up (`repair_with_xp` effect,
+    /// Mending): an equipped and damaged stack is drawn among the slots of the enchantments that
+    /// carry the effect and fit the slot (a stack counts once per such enchantment), repaired by
+    /// the effect's value; what the repair did not use goes on to another draw. Returns the
+    /// experience left for the player.
+    pub(crate) fn repair_with_xp(&mut self, mut amount: i32) -> i32 {
+        const KEY: &str = "minecraft:repair_with_xp";
+        loop {
+            // Equipment slots in the game's order: main hand, off hand, feet, legs, chest, head.
+            let order = [(36 + self.held as usize, "mainhand"), (45, "offhand"), (8, "feet"), (7, "legs"), (6, "chest"), (5, "head")];
+            let mut found: Vec<usize> = Vec::new();
+            for (slot, name) in order {
+                let Some(s) = self.slots[slot].as_ref() else { continue };
+                if !self.life.items.damageable(s) || self.life.items.damage(s) <= 0 {
+                    continue;
+                }
+                for (_, def) in self.ench_defs(s) {
+                    let fits = def["slots"].as_array().is_some_and(|g| {
+                        g.iter().any(|g| g.as_str().is_some_and(|g| crate::projectiles::ench::slot_in_group(g, name)))
+                    });
+                    if fits && def["effects"].get(KEY).is_some() {
+                        found.push(slot);
+                    }
+                }
+            }
+            if found.is_empty() {
+                return amount;
+            }
+            let slot = found[self.life.rng.next_int_bound(found.len() as i32) as usize];
+            let Some(mut s) = self.slots[slot].clone() else { return 0 };
+            let ctx = crate::projectiles::ench::Ctx { tool: Some(&s), ..Default::default() };
+            let to_repair = (self.ench_value(&s, KEY, amount as f32, &ctx) as i32).max(0);
+            let damage = self.life.items.damage(&s);
+            let repair = to_repair.min(damage);
+            if damage - repair == 0 {
+                crate::items::remove_component(&mut s, "minecraft:damage");
+            } else {
+                crate::items::set_component(&mut s, "minecraft:damage", rc_proto::nbt::Nbt::Int(damage - repair));
+            }
+            self.slots[slot] = Some(s);
+            if repair <= 0 {
+                return 0;
+            }
+            // 32-bit products that wrap like the game's (huge custom durability).
+            let left = amount.wrapping_sub(repair.wrapping_mul(amount) / to_repair);
+            if left <= 0 {
+                return 0;
+            }
+            amount = left;
+        }
     }
 
     /// Players an orb can follow (the local player).
@@ -400,6 +543,18 @@ impl Server {
                 continue;
             }
             d.ticks += 1;
+            // G5-F05: fire at the start of its tick (an immune stack is put out).
+            let immune = d.fire > 0 && self.item_resists(&d.stack, "minecraft:in_fire");
+            d.body.pos = d.pos;
+            let lava = burn_due(d.fire, immune) && d.body.touching_lava(&self.world(), &self.phys);
+            if burn_step(&mut d.fire, immune, lava) {
+                self.item_hurt_ent(d, "minecraft:on_fire", 1.0, false);
+            }
+            self.fire_flag(d.id, d.fire, &mut d.fire_flag);
+            if d.removed {
+                self.contact.live_items[i].1 = true;
+                continue;
+            }
             if d.pickup_delay > 0 && d.pickup_delay != 32767 {
                 d.pickup_delay -= 1;
             }
@@ -432,6 +587,10 @@ impl Server {
             }
             // Blocks passed through (or, at rest, those it rests in): a hopper takes it at once.
             self.hopper_item_inside(old, d);
+            if !d.removed {
+                // G5-F05: fire, lava, cactus, water and powder snow of the blocks crossed.
+                self.inside_blocks(&mut crate::inside_blocks::Who::Item(d));
+            }
             self.contact.live_items[i] = (d.pos, d.removed);
             if d.removed {
                 continue;
@@ -559,6 +718,8 @@ impl Server {
         }
         let gone: Vec<i32> = drops.iter().filter(|d| d.removed).map(|d| d.id).collect();
         drops.retain(|d| !d.removed);
+        // Items appeared during the tick (contents of a destroyed box or bag…): after the others.
+        drops.append(&mut self.life.drops);
         self.life.drops = drops;
         self.contact.items_ticking = false;
         self.contact.live_items.clear();
@@ -614,11 +775,50 @@ impl Server {
         live.extend(orbs.iter().map(|o| (o.pos, o.removed)));
         self.contact.live_orbs = live;
         self.contact.orbs_ticking = true;
-        for (i, o) in orbs.iter_mut().enumerate() {
-            if o.removed {
+        let min_y = f64::from(self.dim.height.min_y) - 64.0;
+        let mut buckets = std::mem::take(&mut self.contact.orb_buckets);
+        let mut buckets_built = false;
+        for i in 0..orbs.len() {
+            if orbs[i].removed {
                 continue;
             }
+            let o = &mut orbs[i];
             o.ticks += 1;
+            // G5-F05: fire at the start of its tick, below the world.
+            o.body.pos = o.pos;
+            let lava = burn_due(o.fire, false) && o.body.touching_lava(&self.world(), &self.phys);
+            if burn_step(&mut o.fire, false, lava) {
+                orb_take_damage(o, 1.0);
+            }
+            self.fire_flag(o.id, o.fire, &mut o.fire_flag);
+            if o.pos[1] < min_y {
+                o.removed = true;
+            }
+            let gone = o.removed;
+            if gone {
+                self.contact.live_orbs[i].1 = true;
+            }
+            // G5-F05: absorbs the orbs of the same value around it every 20 ticks (from the first);
+            // from 40 orbs on, candidates read from the residues modulo 40 rebuilt once per tick
+            // (below, the whole list costs less; `RUSTCRAFT_OPT_ORB_MERGE_LINEAR=1`: always it).
+            // Quirk kept: an orb just removed above (burnt, below the world) still absorbs its
+            // neighbours, which disappear with it.
+            if o.ticks % 20 == 1 {
+                if orbs.len() < ORB_BUCKETS_FROM || rc_data::env_flag!("RUSTCRAFT_OPT_ORB_MERGE_LINEAR") {
+                    merge_orbs(orbs, i, &mut self.contact.live_orbs, 0..orbs.len());
+                } else {
+                    if !buckets_built {
+                        orb_buckets(orbs, &mut buckets);
+                        buckets_built = true;
+                    }
+                    let b = &buckets[orbs[i].id.rem_euclid(40) as usize];
+                    merge_orbs(orbs, i, &mut self.contact.live_orbs, b.iter().map(|&j| j as usize));
+                }
+            }
+            if gone {
+                continue;
+            }
+            let o = &mut orbs[i];
             // Same physics as the client (`rc_physics::body`), no skipped tick.
             let w = self.world();
             let from = o.pos;
@@ -636,6 +836,12 @@ impl Server {
             if o.on_ground {
                 o.body.fall = 0.0;
             }
+            // G5-F05: fire, lava, cactus, water and powder snow of the blocks crossed.
+            self.inside_blocks(&mut crate::inside_blocks::Who::Orb(o));
+            if o.removed {
+                self.contact.live_orbs[i] = (o.pos, true);
+                continue;
+            }
             // G5-F02e: plates and tripwire right after its movement.
             self.contact.live_orbs[i].0 = o.pos;
             self.contact_triggers(from, o.pos, ORB_SIZE / 2.0, ORB_SIZE);
@@ -645,6 +851,7 @@ impl Server {
                 self.contact.live_orbs[i].1 = true;
             }
         }
+        self.contact.orb_buckets = buckets;
         // Pickup: one orb every 2 ticks.
         if follow && self.player_ready() {
             if self.life.vit.xp_delay > 0 {
@@ -674,8 +881,12 @@ impl Server {
                     collector: self.player_id,
                     amount: 1,
                 }));
-                let v = orbs[i].value;
-                self.give_xp(v);
+                // G5-F05: Mending repairs first, the player gets what is left. The pickup sound
+                // is the client's own, played when it reads the pickup packet.
+                let left = self.repair_with_xp(orbs[i].value);
+                if left > 0 {
+                    self.give_xp(left);
+                }
                 orbs[i].count -= 1;
                 if orbs[i].count <= 0 {
                     orbs[i].removed = true;
@@ -684,21 +895,28 @@ impl Server {
         }
     }
 
-    /// Ground items read with a chunk: made live (pickable, simulated).
+    /// Ground items and experience orbs read with a chunk: made live (pickable, simulated).
     pub(crate) fn adopt_items(&mut self, loaded: &[(i32, i32)]) {
         use rc_proto::nbt::Nbt;
+        const KINDS: [&str; 2] = ["minecraft:item", "minecraft:experience_orb"];
         for p in loaded {
             let Some(list) = self.entities.get_mut(p) else { continue };
             type Ents = Vec<(i32, Nbt)>;
             let (items, rest): (Ents, Ents) = std::mem::take(list)
                 .into_iter()
-                .partition(|(_, e)| e.get("id").and_then(Nbt::as_str) == Some("minecraft:item"));
+                .partition(|(_, e)| e.get("id").and_then(Nbt::as_str).is_some_and(|k| KINDS.contains(&k)));
             *list = rest;
             if items.is_empty() {
                 continue;
             }
             self.life.drop_chunks.insert(*p);
             for (_, e) in items {
+                // G5-F05: orb (value, count, age, health, fire, speed as the game reads them).
+                if e.get("id").and_then(Nbt::as_str) == Some(KINDS[1]) {
+                    let pos = crate::nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
+                    self.summon_orb(pos, Some(&e));
+                    continue;
+                }
                 let Some(stack) = e.get("Item").and_then(Stack::from_nbt) else { continue };
                 let pos = crate::nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
                 let vel = crate::nbtio::motion(e.get("Motion")).unwrap_or_default();
@@ -711,6 +929,7 @@ impl Server {
                 if let Some(d) = self.life.drops.last_mut() {
                     d.age = age;
                     d.health = health;
+                    d.fire = crate::nbtio::int(&e, "Fire").unwrap_or(0) as i16 as i32;
                     if let Some([yaw, _]) = crate::nbtio::f32s::<2>(e.get("Rotation")) {
                         d.yaw = yaw;
                     }
@@ -740,6 +959,7 @@ impl Server {
                 ("Motion".into(), dbl(d.vel)),
                 ("Rotation".into(), Nbt::List(vec![Nbt::Float(d.yaw), Nbt::Float(0.0)])),
                 ("OnGround".into(), Nbt::Byte(i8::from(d.on_ground))),
+                ("Fire".into(), Nbt::Short(d.fire as i16)),
                 ("Health".into(), Nbt::Short(d.health as i16)),
                 ("Age".into(), Nbt::Short(d.age as i16)),
                 ("PickupDelay".into(), Nbt::Short(d.pickup_delay as i16)),
@@ -747,6 +967,25 @@ impl Server {
                 ("Item".into(), d.stack.to_nbt(None)),
             ];
             by_chunk.entry(c).or_default().push(Nbt::Compound(thrower.into_iter().chain(fields).collect()));
+        }
+        // G5-F05: experience orbs, written like the game (never saved before: lost on reload).
+        for o in self.life.orbs.iter().filter(|o| !o.removed) {
+            let c = ((o.pos[0].floor() as i32) >> 4, (o.pos[2].floor() as i32) >> 4);
+            let dbl = |v: [f64; 3]| Nbt::List(v.iter().map(|&x| Nbt::Double(x)).collect());
+            let uuid = [0x5332_0000, 0, 0, o.id];
+            by_chunk.entry(c).or_default().push(Nbt::Compound(vec![
+                ("id".into(), Nbt::String("minecraft:experience_orb".into())),
+                ("Pos".into(), dbl(o.pos)),
+                ("Motion".into(), dbl(o.vel)),
+                ("Rotation".into(), Nbt::List(vec![Nbt::Float(0.0), Nbt::Float(0.0)])),
+                ("OnGround".into(), Nbt::Byte(i8::from(o.on_ground))),
+                ("Fire".into(), Nbt::Short(o.fire as i16)),
+                ("Health".into(), Nbt::Short(o.health as i16)),
+                ("Age".into(), Nbt::Short(o.age as i16)),
+                ("Value".into(), Nbt::Short(o.value as i16)),
+                ("Count".into(), Nbt::Int(o.count)),
+                ("UUID".into(), Nbt::IntArray(uuid.to_vec())),
+            ]));
         }
         self.mobs_into_chunks(&mut by_chunk); // S4: mobs
         self.projectiles_into_chunks(&mut by_chunk); // S8: projectiles, clouds
@@ -781,8 +1020,18 @@ impl Server {
     /// Metadata and equipment of an entity read from the world (`entities.md` § 3): common
     /// fields, mob (no AI, left-handed), age, ground item, worn equipment.
     pub(crate) fn send_entity_meta(&self, id: i32, e: &rc_proto::nbt::Nbt) {
+        self.send_entity_meta_after(id, e, None);
+    }
+
+    /// [`Server::send_entity_meta`] after a modification of the compound `old` (`/data`): the own
+    /// data of displays and interactions are sent when they changed.
+    pub(crate) fn send_entity_meta_after(&self, id: i32, e: &rc_proto::nbt::Nbt, old: Option<&rc_proto::nbt::Nbt>) {
         use crate::nbtio::int;
         use rc_proto::nbt::Nbt;
+        // Never announced (marker): no data either.
+        if !crate::decoration::client_visible(e) {
+            return;
+        }
         let flag = |k: &str| int(e, k).is_some_and(|v| v != 0);
         let mut values: Vec<(u8, Meta)> = Vec::new();
         let mut shared = 0i8;
@@ -845,6 +1094,7 @@ impl Server {
             }
         }
         self.deco_meta(e, &mut values); // paintings, frames, stands, cushions, mannequins
+        self.display_meta(e, old, &mut values); // G5-F05: displays, interaction
         if !values.is_empty() {
             let _ = self.send(Event::Entity(EntityEvent::Data { id, values }));
         }
@@ -880,9 +1130,16 @@ impl Server {
         let Some(block) = self.data.block_of(state).map(|b| b.name.clone()) else { return };
         let held = 36 + self.held as usize;
         let tool = self.slots[held].clone();
-        // Wear: non-zero hardness.
+        // Wear: non-zero hardness; shears: any block outside `#fire` (G5-F05).
         let hardness = self.data.hardness.get(state as usize).copied().unwrap_or(0.0);
-        if hardness != 0.0
+        let shears = tool.as_ref().is_some_and(|t| t.id == "minecraft:shears");
+        let wears = if shears {
+            let block = self.data.state(state).map_or(u32::MAX, |s| u32::from(s.block));
+            !self.block_tags.get("minecraft:fire").is_some_and(|v| v.binary_search(&block).is_ok())
+        } else {
+            hardness != 0.0
+        };
+        if wears
             && let Some(t) = &tool
             && let Some(info) = self.life.items.id(&t.id).and_then(|i| self.data.items.get(i as usize))
             && let Some(tc) = &info.tool
@@ -1092,6 +1349,12 @@ impl Orb {
         self.removed
     }
 
+    /// Bench of the merging: the orb is back for the next round.
+    #[cfg(test)]
+    pub(crate) fn unremove_for_bench(&mut self) {
+        self.removed = false;
+    }
+
     /// Push (explosion blast): velocity sent back at the next tracking, at once if
     /// the orb has just been hurt.
     pub(crate) fn push_sync(&mut self, kb: [f64; 3], hurt: bool) {
@@ -1170,42 +1433,69 @@ impl Server {
     /// with its contents (box, bag) spilled in its place. True if they landed.
     pub(crate) fn item_hurt(&mut self, id: i32, ty: &str, amount: f32, by_mob: bool) -> bool {
         let Some(k) = self.life.drops.iter().position(|d| d.id == id && !d.removed) else { return false };
-        if by_mob && !self.rule("minecraft:mob_griefing", true) {
+        if !self.item_may_hurt(&self.life.drops[k].stack, ty, by_mob) {
             return false;
         }
-        if let Some(tag) = self.resistant_tag(&self.life.drops[k].stack)
-            && self.dmg_tag(ty, tag.trim_start_matches('#'))
-        {
-            return false;
-        }
-        let d = &mut self.life.drops[k];
-        d.health = (d.health as f32 - amount) as i32;
-        if d.health > 0 {
-            return true;
-        }
-        d.removed = true;
-        let pos = d.pos;
-        let mut spill = Vec::new();
-        use rc_proto::nbt::Nbt;
-        if let Some(Nbt::List(l)) = crate::items::component(&d.stack, "minecraft:container") {
-            spill.extend(l.iter().filter_map(|e| e.get("item").and_then(Stack::from_nbt)));
-        }
-        if let Some(Nbt::List(l)) = crate::items::component(&d.stack, "minecraft:bundle_contents") {
-            spill.extend(l.iter().filter_map(Stack::from_nbt));
-        }
+        let spill = item_take_damage(&mut self.life.drops[k], amount);
+        let pos = self.life.drops[k].pos;
         for s in spill {
             self.spawn_item_random(pos, s, 0);
         }
         true
     }
 
+    /// [`Server::item_hurt`] on an item taken out of the list (its own tick).
+    pub(crate) fn item_hurt_ent(&mut self, d: &mut ItemEnt, ty: &str, amount: f32, by_mob: bool) -> bool {
+        if d.removed || !self.item_may_hurt(&d.stack, ty, by_mob) {
+            return false;
+        }
+        for s in item_take_damage(d, amount) {
+            self.spawn_item_random(d.pos, s, 0);
+        }
+        true
+    }
+
+    /// Damage refused: caused by a mob without `mob_griefing`, or resisted by the stack.
+    fn item_may_hurt(&self, s: &Stack, ty: &str, by_mob: bool) -> bool {
+        !(by_mob && !self.rule("minecraft:mob_griefing", true)) && !self.item_resists(s, ty)
+    }
+
+    /// True if the stack resists damage type `ty` (`damage_resistant` component).
+    pub(crate) fn item_resists(&self, s: &Stack, ty: &str) -> bool {
+        self.resistant_tag(s).is_some_and(|tag| self.dmg_tag(ty, tag.trim_start_matches('#')))
+    }
+
     /// Damage to an experience orb: health points removed, orb removed at 0.
     pub(crate) fn orb_hurt(&mut self, id: i32, amount: f32) -> bool {
         let Some(o) = self.life.orbs.iter_mut().find(|o| o.id == id && !o.removed) else { return false };
-        o.health = (o.health as f32 - amount) as i32;
-        if o.health <= 0 {
-            o.removed = true;
-        }
+        orb_take_damage(o, amount);
         true
+    }
+}
+
+/// Health points removed (the game's integer truncation); at 0 the item is destroyed and its
+/// contents (box, bag) are returned to be spilled in its place.
+fn item_take_damage(d: &mut ItemEnt, amount: f32) -> Vec<Stack> {
+    use rc_proto::nbt::Nbt;
+    d.health = (d.health as f32 - amount) as i32;
+    let mut spill = Vec::new();
+    if d.health > 0 {
+        return spill;
+    }
+    d.removed = true;
+    if let Some(Nbt::List(l)) = crate::items::component(&d.stack, "minecraft:container") {
+        spill.extend(l.iter().filter_map(|e| e.get("item").and_then(Stack::from_nbt)));
+    }
+    if let Some(Nbt::List(l)) = crate::items::component(&d.stack, "minecraft:bundle_contents") {
+        spill.extend(l.iter().filter_map(Stack::from_nbt));
+    }
+    spill
+}
+
+/// Health points removed, orb removed at 0.
+pub(crate) fn orb_take_damage(o: &mut Orb, amount: f32) {
+    o.health = (o.health as f32 - amount) as i32;
+    if o.health <= 0 {
+        o.removed = true;
     }
 }

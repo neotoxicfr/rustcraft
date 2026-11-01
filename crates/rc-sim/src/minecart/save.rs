@@ -328,7 +328,7 @@ impl Cart {
                 let cmd = e.get("Command").and_then(Nbt::as_str).unwrap_or("").to_owned();
                 self.set_meta(13, Meta::String(cmd));
                 let out = e.get("LastOutput").cloned().unwrap_or(Nbt::String(String::new()));
-                self.set_meta(14, Meta::Text(Some(out)));
+                self.set_meta(14, Meta::Component(out));
             }
             CKind::Rideable | CKind::Spawner => {}
         }

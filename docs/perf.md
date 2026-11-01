@@ -2836,3 +2836,42 @@ on a quiet machine with the others).
 - Spectator menu: game modes read again per tick only while the menu is open (one pass over
   the player list, buffer reused).
 - Multi-core and GPU not applicable (a few dozen elements per event, order imposed by the screen).
+## G5-F05: orbs, ground items, display and interaction entities (01/11, loaded machine)
+
+- Crossed-block pass of ground items and orbs (new, `rc_sim::inside_blocks`, every tick and per
+  item or orb): bench `g5f05_bench` (loaded machine, 2 alternated runs, 200,000 passes), full
+  pass 176 to 186 ns at rest on an open floor, 176 to 197 ns next to a cactus, 217 to 242 ns
+  sliding. Leads:
+  - skipping the empty: a non-burning item or orb can only be acted on by fire, soul fire,
+    cactus and lava (water, powder snow and rain only put out, the campfire and the freezing are
+    for the living); none of them in the cells of the envelope of its movements (at most 64
+    cells, otherwise the full pass): nothing to do. 45 to 48 ns. Kept,
+    `RUSTCRAFT_OPT_ITEM_INSIDE_FULL=1` gives the full pass back.
+  - decision before taking the buffers out and copying the movements (read in place from the
+    physics body): 45 to 48 -> 27 to 29 ns (all three cases). Kept (×6.5 against the full pass).
+  - equivalence: `inert_item_shortcut_matches_full_pass` (720 starts around fire, cactus,
+    lava, water, at rest, falling, burning: same state with and without the shortcut; 360
+    skipped and sum of the outcomes stored).
+  - not retained: remembering that a resting item's cells did not change (block-change
+    tracking needed for two cell reads, about 20 ns); several cores (effects on the world in the
+    game's order) and GPU not applicable.
+- Periodic orb merging (new, one scan per orb every 20 ticks): whole list O(n) per scan; lead:
+  candidates bucketed by identifier modulo 40 (the only ones that can merge), buckets rebuilt
+  once per orb tick in a reused buffer. Bench at the game's rhythm (2 runs, a twentieth of the
+  orbs scanning each tick, buckets rebuilt each tick): 20 orbs 0.02-0.03 µs whole list against
+  0.04 µs buckets (loses), 100 orbs 0.38-0.39 against 0.17-0.28, 1,000 orbs 34.1 against
+  3.3-4.4 (×8 to ×10). Kept from 40 orbs on (`ORB_BUCKETS_FROM`), whole list below;
+  `RUSTCRAFT_OPT_ORB_MERGE_LINEAR=1` forces the whole list. Equivalence:
+  `orb_merge_buckets_match_whole_list` (600 orbs in 2 × 2 blocks, 421 merged, same outcome per
+  orb). Spatial grid not tried (residues already leave a few candidates per scan).
+- Mending, interaction, marker, shears: event code (one pickup, one click, one break), no
+  loop per tick; Mending reads the enchantment definitions of at most six equipped stacks.
+- Display data: decoded when the entity is announced (summon, chunk sent, `/data`), never per
+  tick. A matrix transformation goes through the game's SVD (5 Jacobi sweeps, 3 Givens steps:
+  a few hundred float operations), bit-identical to the game (`svd_matches_the_game_bit_for_bit`,
+  14 matrices computed by the game's code). Not cached: a few displays per chunk at most in the
+  bench scenes; to measure on a map with thousands of displays (cache of the decomposition by
+  entity, or the decomposed form written at save time like the game).
+- Ground item and orb fire: one integer test per tick when not burning; the lava test (fluid
+  scan of the box) only on the ticks where the burn point falls (every 20 ticks while burning).
+- Quiet-machine bench to do: scene with many items (item farm) and orbs (XP farm), before/after.

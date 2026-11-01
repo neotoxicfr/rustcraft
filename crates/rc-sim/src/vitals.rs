@@ -893,11 +893,10 @@ impl Server {
         }
     }
 
+    /// Points of a picked-up orb: only the level-up sound here, the pickup sound is played by the
+    /// client on the pickup packet (no server draw).
     pub(crate) fn give_xp(&mut self, p: i32) {
-        let levelup = self.life.vit.give_points_at(p, self.mobs.player_ticks);
-        let pitch = (self.life.rng.next_float() - self.life.rng.next_float()) * 0.35 + 0.9;
-        self.play_sound("minecraft:entity.experience_orb.pickup", 7, self.pos, 0.1, pitch);
-        if let Some(vol) = levelup {
+        if let Some(vol) = self.life.vit.give_points_at(p, self.mobs.player_ticks) {
             self.play_sound("minecraft:entity.player.levelup", 7, self.pos, vol, 1.0);
         }
     }
