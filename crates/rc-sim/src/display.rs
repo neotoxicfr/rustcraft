@@ -476,21 +476,27 @@ impl Server {
     }
 
     /// Text of a text display resolved like the game when it loads the entity (selector, score
-    /// and nbt contents), source = the entity at `at` with game master rights. On failure the
-    /// text becomes `previous` (the one the entity had, absent at creation).
+    /// and nbt contents), source = the entity at `at` with game master rights. On failure, or
+    /// without a `text` field, the text stays `previous` (the one the entity had, absent at
+    /// creation).
     pub(crate) fn display_resolve_text(&mut self, id: i32, at: [f64; 3], previous: Option<Nbt>) {
         let found = self.entities.values().flatten().find(|(i, _)| *i == id).map(|(_, n)| n);
         let Some(n) = found.filter(|n| kind_of(n) == Some(Kind::Text)) else { return };
-        let Some(text) = n.get("text").cloned() else { return };
-        let [yaw, pitch] = crate::nbtio::f32s::<2>(n.get("Rotation")).unwrap_or_default();
-        let base = self.server_source();
-        let mut src = self.with_entity(&base, E::Other(id));
-        src.pos = at;
-        src.rot = [pitch, yaw];
-        src.dim = self.dim.name.clone();
-        src.level = 2;
-        src.silent = true;
-        let value = self.resolve_component(&src, &text, Some(E::Other(id)), 0).ok().or(previous);
+        let value = match n.get("text").cloned() {
+            None if previous.is_none() => return,
+            None => previous,
+            Some(text) => {
+                let [yaw, pitch] = crate::nbtio::f32s::<2>(n.get("Rotation")).unwrap_or_default();
+                let base = self.server_source();
+                let mut src = self.with_entity(&base, E::Other(id));
+                src.pos = at;
+                src.rot = [pitch, yaw];
+                src.dim = self.dim.name.clone();
+                src.level = 2;
+                src.silent = true;
+                self.resolve_component(&src, &text, Some(E::Other(id)), 0).ok().or(previous)
+            }
+        };
         for (c, l) in self.entities.iter_mut() {
             if let Some((_, n)) = l.iter_mut().find(|(i, _)| *i == id) {
                 match value {

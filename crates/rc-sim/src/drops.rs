@@ -794,13 +794,15 @@ impl Server {
             if o.pos[1] < min_y {
                 o.removed = true;
             }
-            if o.removed {
+            let gone = o.removed;
+            if gone {
                 self.contact.live_orbs[i].1 = true;
-                continue;
             }
             // G5-F05: absorbs the orbs of the same value around it every 20 ticks (from the first);
             // from 40 orbs on, candidates read from the residues modulo 40 rebuilt once per tick
             // (below, the whole list costs less; `RUSTCRAFT_OPT_ORB_MERGE_LINEAR=1`: always it).
+            // Quirk kept: an orb just removed above (burnt, below the world) still absorbs its
+            // neighbours, which disappear with it.
             if o.ticks % 20 == 1 {
                 if orbs.len() < ORB_BUCKETS_FROM || rc_data::env_flag!("RUSTCRAFT_OPT_ORB_MERGE_LINEAR") {
                     merge_orbs(orbs, i, &mut self.contact.live_orbs, 0..orbs.len());
@@ -812,6 +814,9 @@ impl Server {
                     let b = &buckets[orbs[i].id.rem_euclid(40) as usize];
                     merge_orbs(orbs, i, &mut self.contact.live_orbs, b.iter().map(|&j| j as usize));
                 }
+            }
+            if gone {
+                continue;
             }
             let o = &mut orbs[i];
             // Same physics as the client (`rc_physics::body`), no skipped tick.
@@ -876,14 +881,11 @@ impl Server {
                     collector: self.player_id,
                     amount: 1,
                 }));
-                // G5-F05: Mending repairs first, the player gets what is left.
+                // G5-F05: Mending repairs first, the player gets what is left. The pickup sound
+                // is the client's own, played when it reads the pickup packet.
                 let left = self.repair_with_xp(orbs[i].value);
                 if left > 0 {
                     self.give_xp(left);
-                } else {
-                    let r = &mut self.life.rng;
-                    let pitch = (r.next_float() - r.next_float()) * 0.35 + 0.9;
-                    self.play_sound("minecraft:entity.experience_orb.pickup", 7, self.pos, 0.1, pitch);
                 }
                 orbs[i].count -= 1;
                 if orbs[i].count <= 0 {
@@ -1026,6 +1028,10 @@ impl Server {
     pub(crate) fn send_entity_meta_after(&self, id: i32, e: &rc_proto::nbt::Nbt, old: Option<&rc_proto::nbt::Nbt>) {
         use crate::nbtio::int;
         use rc_proto::nbt::Nbt;
+        // Never announced (marker): no data either.
+        if !crate::decoration::client_visible(e) {
+            return;
+        }
         let flag = |k: &str| int(e, k).is_some_and(|v| v != 0);
         let mut values: Vec<(u8, Meta)> = Vec::new();
         let mut shared = 0i8;

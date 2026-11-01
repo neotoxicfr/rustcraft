@@ -93,6 +93,9 @@ fn marker_is_never_sent() {
         _ => false,
     });
     assert!(!sent, "marker announced: {ev:?}");
+    // A `/data` that sets common fields sends no data for it either.
+    assert!(cmd(&mut p, "data merge entity @e[tag=m,limit=1] {CustomName:\"x\",Glowing:1b}"));
+    assert!(data_of(&p, id).is_empty(), "data sent for a marker");
     assert!(cmd(&mut p, "kill @e[tag=m]"));
     let removed = p.take_events().iter().any(|e| matches!(e, Event::Entity(EntityEvent::Remove(l)) if l.contains(&id)));
     assert!(!removed, "removal of a marker never announced");
@@ -184,12 +187,96 @@ fn mending_repairs_before_the_player_gets_xp() {
     p.s.life.vit.xp_delay = 0;
     p.s.add_orb(p.s.pos, 7);
     p.s.life.orbs[0].vel = [0.0; 3];
+    p.take_events();
+    let mut ev = Vec::new();
     for _ in 0..3 {
         p.s.drops_tick();
+        ev.extend(p.take_events());
     }
     assert!(p.s.life.orbs.is_empty(), "orb picked up");
     assert_eq!(wear(p.s.slots[8].as_ref()), 6);
     assert_eq!(p.s.life.vit.xp_total, before);
+    // The pickup sound is the client's (on the pickup packet), never the server's.
+    assert!(sounds(&p, &ev, "minecraft:entity.experience_orb.pickup").is_empty(), "server pickup sound");
+    assert!(ev.iter().any(|e| matches!(e, Event::Misc(rc_client::misc::Misc::Take { .. }))), "pickup packet");
+    // Same without Mending: points given, still no server sound.
+    p.s.slots[8] = None;
+    p.s.add_orb(p.s.pos, 7);
+    p.s.life.orbs[0].vel = [0.0; 3];
+    p.take_events();
+    let mut ev = Vec::new();
+    for _ in 0..3 {
+        p.s.drops_tick();
+        ev.extend(p.take_events());
+    }
+    assert_eq!(p.s.life.vit.xp_total, before + 7);
+    assert!(sounds(&p, &ev, "minecraft:entity.experience_orb.pickup").is_empty(), "server pickup sound");
+    done(p, dir);
+}
+
+/// Sounds named `name` among `ev`: (category, position).
+fn sounds(p: &Probe, ev: &[Event], name: &str) -> Vec<(i32, [f64; 3])> {
+    let id = p.s.sound_id(name).expect("known sound");
+    ev.iter()
+        .filter_map(|e| match e {
+            Event::Sound(s) if s.sound == rc_proto_v777::play::SoundRef::Id(id) => Some((s.category, s.pos?)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Lava hiss and extinguish sound of a ground item and of an orb: ambient category (8) for both.
+#[test]
+fn item_and_orb_fire_sounds_are_ambient() {
+    let Some((mut p, dir)) = probe("g5f05-sounds") else { return };
+    p.s.pos = [125.5, -59.0, 125.5];
+    p.s.game_mode = 3;
+    p.run(
+        "setblock 108 -59 104 minecraft:lava\nsetblock 112 -59 104 minecraft:lava\n\
+         setblock 104 -59 108 minecraft:water\nsetblock 116 -59 108 minecraft:water\n",
+    );
+    p.s.spawn_item([108.5, -58.9, 104.5], [0.0; 3], stack("minecraft:dirt", 1), 32767);
+    p.s.add_orb([112.5, -58.9, 104.5], 3);
+    p.s.spawn_item([104.5, -58.9, 108.5], [0.0; 3], stack("minecraft:dirt", 1), 32767);
+    p.s.life.drops.last_mut().expect("item").fire = 41;
+    p.s.add_orb([116.5, -58.9, 108.5], 3);
+    p.s.life.orbs.last_mut().expect("orb").fire = 41;
+    p.take_events();
+    let mut ev = Vec::new();
+    for _ in 0..10 {
+        p.s.drops_tick();
+        ev.extend(p.take_events());
+    }
+    let near = |s: &[(i32, [f64; 3])], x: f64| s.iter().any(|(_, at)| (at[0] - x).abs() < 0.6);
+    for (name, item, orb) in
+        [("minecraft:entity.generic.burn", 108.5, 112.5), ("minecraft:entity.generic.extinguish_fire", 104.5, 116.5)]
+    {
+        let s = sounds(&p, &ev, name);
+        assert!(near(&s, item), "{name} of the item: {s:?}");
+        assert!(near(&s, orb), "{name} of the orb: {s:?}");
+        assert!(s.iter().all(|(c, _)| *c == 8), "{name} not ambient: {s:?}");
+    }
+    done(p, dir);
+}
+
+/// Quirk: an orb removed at the start of a merge tick (below the world) still absorbs its
+/// neighbour of the same value, which disappears with it.
+#[test]
+fn removed_orb_still_absorbs_its_neighbours() {
+    let Some((mut p, dir)) = probe("g5f05-orbgone") else { return };
+    p.s.pos = [120.5, -59.0, 120.5];
+    p.s.game_mode = 3;
+    let floor = f64::from(p.s.dim.height.min_y) - 64.0;
+    p.s.add_orb([105.5, floor - 0.2, 105.5], 3);
+    p.s.add_orb([105.5, floor + 0.1, 105.5], 3);
+    let base = p.s.life.orbs[0].id;
+    for (k, o) in p.s.life.orbs.iter_mut().enumerate() {
+        o.id = base + 40 * k as i32;
+        o.vel = [0.0; 3];
+        o.ticks = 0; // next tick is a merge tick
+    }
+    p.s.drops_tick();
+    assert!(p.s.life.orbs.is_empty(), "neighbour kept: {} orb(s) left", p.s.life.orbs.len());
     done(p, dir);
 }
 
@@ -201,13 +288,14 @@ fn items_and_orbs_burn_and_prick() {
     p.s.pos = [125.5, -59.0, 125.5];
     p.s.game_mode = 3;
     p.run("setblock 104 -59 104 minecraft:cactus\nsetblock 108 -59 104 minecraft:lava\nsetblock 112 -59 104 minecraft:fire\n");
+    let first = p.s.life.drops.len(); // items already in the world copy are not ours
     p.s.spawn_item([104.5, -58.0, 104.5], [0.0; 3], stack("minecraft:dirt", 1), 32767);
     p.s.spawn_item([108.5, -58.9, 104.5], [0.0; 3], stack("minecraft:dirt", 1), 32767);
     p.s.spawn_item([108.5, -58.9, 104.6], [0.0; 3], stack("minecraft:netherite_ingot", 1), 32767);
     p.s.spawn_item([112.5, -58.9, 104.5], [0.0; 3], stack("minecraft:dirt", 1), 32767);
     p.s.add_orb([108.5, -58.9, 104.4], 3);
-    let ids: Vec<i32> = p.s.life.drops.iter().map(|d| d.id).collect();
-    let orb = p.s.life.orbs[0].id;
+    let ids: Vec<i32> = p.s.life.drops[first..].iter().map(|d| d.id).collect();
+    let orb = p.s.life.orbs.last().expect("orb").id;
     let alive = |p: &Probe, id: i32| p.s.life.drops.iter().any(|d| d.id == id);
     let mut gone_at = [0; 4];
     for t in 1..=60 {
@@ -311,6 +399,12 @@ fn text_and_item_display_data_sent() {
     assert!(v.contains(&(26, Meta::Byte(200u8 as i8))), "{v:?}");
     assert!(v.contains(&(27, Meta::Byte(1 | 8))), "{v:?}");
     assert!(other(&p, id).get("text").is_some_and(|t| !format!("{t:?}").contains("score")), "resolved text kept");
+    // `text` removed by `/data`: the display keeps its text (only read back when present).
+    let before = other(&p, id).get("text").cloned();
+    assert!(cmd(&mut p, "data remove entity @e[type=minecraft:text_display,limit=1] text"));
+    assert_eq!(other(&p, id).get("text"), before.as_ref(), "text lost");
+    let v = data_of(&p, id);
+    assert!(!v.iter().any(|(i, _)| *i == 23), "text resent: {v:?}");
     assert!(cmd(&mut p, "summon minecraft:item_display 110 -59 113 {item:{id:\"minecraft:diamond\"},item_display:\"head\"}"));
     let id = last_other(&p);
     let v = data_of(&p, id);

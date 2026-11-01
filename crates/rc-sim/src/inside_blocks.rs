@@ -778,10 +778,11 @@ impl Server {
                         self.mob_sound_unmuted(m, "minecraft:entity.generic.burn", 0.4, pitch);
                     }
                     Who::Mob(_) => {}
-                    // An item only hisses every 10 ticks, or when the lava destroys it.
+                    // An item only hisses every 10 ticks, or when the lava destroys it; ambient
+                    // category (8) like an orb.
                     Who::Item(d) if d.health <= 0 || d.ticks % 10 == 0 => {
                         let pitch = 2.0 + entity_rng(d.id, d.ticks, 1).next_float() * 0.4;
-                        self.play_sound("minecraft:entity.generic.burn", 6, d.pos, 0.4, pitch);
+                        self.play_sound("minecraft:entity.generic.burn", 8, d.pos, 0.4, pitch);
                     }
                     Who::Item(_) => {}
                     Who::Orb(o) => {
@@ -815,11 +816,11 @@ impl Server {
                 let pitch = 1.6 + (m.rng.next_float() - m.rng.next_float()) * 0.4;
                 self.mob_sound_unmuted(m, NAME, 0.7, pitch);
             }
-            // Neutral category for an item, ambient for an orb.
+            // Ambient category (8) for an item and for an orb.
             Who::Item(d) => {
                 let mut r = entity_rng(d.id, d.ticks, 2);
                 let pitch = 1.6 + (r.next_float() - r.next_float()) * 0.4;
-                self.play_sound(NAME, 6, d.pos, 0.7, pitch);
+                self.play_sound(NAME, 8, d.pos, 0.7, pitch);
             }
             Who::Orb(o) => {
                 let mut r = entity_rng(o.id, o.ticks, 2);
