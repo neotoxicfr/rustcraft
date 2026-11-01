@@ -29,9 +29,9 @@ numbers below come from that list.
 
 | Area | Where it stands |
 |---|---|
-| Fidelity to the official game | **53 of 83** audit missions fixed and merged, 8 more implemented and under review |
+| Fidelity to the official game | **66 of 83** audit missions fixed and merged |
 | Performance work | **47 of 125** planned optimisations done, each one measured |
-| Tests | about **2,200** automated tests, many of them compared bit for bit with the official game |
+| Tests | about **2,600** automated tests, many of them compared bit for bit with the official game |
 
 ### What works well
 
@@ -44,25 +44,22 @@ numbers below come from that list.
 - **Lighting** identical to the official game, and the **physics** of the player and of mounts.
 - **Redstone**, with the official game's quirks reproduced on purpose (quasi-connectivity, update
   order), and the bugs Mojang keeps listed in [docs/quirks-to-reproduce.md](docs/quirks-to-reproduce.md).
-- **Mobs and villagers** (AI, trading, breeding, raids), blocks and block entities, items,
-  enchantments, effects, commands with autocompletion.
+- **Mobs and villagers** (AI, trading, breeding, raids), leads, mounts and golems, blocks and block
+  entities, items, combat and enchantments, experience orbs, effects, nature ticks, commands with
+  autocompletion.
 - **Interface**: title screen, server list, HUD, inventories, creative inventory, recipe book, chat,
   player list, scoreboards, boss bars, F3 screen, options and `options.txt` shared with the official
   game; sounds, music and particles.
 
 ### Work in progress
 
-Implemented and waiting to be merged: leads and saddled pigs, entity contacts (fire, rain, magma,
-berries, honey, falls, armour wear), bone meal, sulfur blocks and projectiles, golems, block entity
-and mob effects on the client.
-
 Still on the fidelity list, by priority:
 
-- combat and offensive enchantments; experience orbs, dropped items and display entities;
-- nature ticks and turtle eggs; technical blocks (structure, jigsaw, test), `/place`, `/clone`, `/locate`;
+- technical blocks (structure, jigsaw, test), `/place`, `/clone`, `/locate`;
 - some commands (`/loot`, `/enchant`, attributes…), data pack tags and `/reload`, saving, `/schedule` and `/data`;
-- mob spawning and spawn eggs, navigation and maps, the locator bar;
-- the F3 and debug screens, inventory screens and option menus, small client effects.
+- mob spawning and spawn eggs, a few monsters (creeper, shulker, warden…), navigation and maps, the locator bar;
+- the world's tick order, loot functions, game tests;
+- the trading screen, tooltips, option menus, small client effects.
 
 Implemented but **not yet systematically compared** with the official game: fluid flow, entity
 movement and collisions, the damage chain, hunger, generic menu clicks, attribute lines in tooltips.
