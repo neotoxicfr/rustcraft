@@ -504,7 +504,8 @@ impl Server {
             if repair <= 0 {
                 return 0;
             }
-            let left = amount - repair * amount / to_repair;
+            // 32-bit products that wrap like the game's (huge custom durability).
+            let left = amount.wrapping_sub(repair.wrapping_mul(amount) / to_repair);
             if left <= 0 {
                 return 0;
             }

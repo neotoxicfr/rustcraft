@@ -595,6 +595,9 @@ impl Server {
             return false;
         }
         let moves = body.effect_moves();
+        if moves.is_empty() {
+            return true;
+        }
         let (half, h) = (body.width / 2.0, body.height);
         let eps = f64::from(1.0e-5f32);
         let (mut lo, mut hi) = ([i32::MAX; 3], [i32::MIN; 3]);
@@ -608,9 +611,10 @@ impl Server {
             }
         }
         // Long path (more than 64 cells in its envelope): the full pass decides.
-        let n: i64 = (0..3).map(|a| i64::from(hi[a]) - i64::from(lo[a]) + 1).product();
-        if moves.is_empty() || n > 64 {
-            return moves.is_empty();
+        let n = (0..3).map(|a| i64::from(hi[a]) - i64::from(lo[a]) + 1).try_fold(1i64, i64::checked_mul);
+        let n = n.unwrap_or(i64::MAX);
+        if n > 64 {
+            return false;
         }
         let id = &self.bs.t.id;
         for x in lo[0]..=hi[0] {

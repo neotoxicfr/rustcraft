@@ -615,7 +615,8 @@ mod tests {
     }
 
     /// Matrices given row by row, decomposed by the game (JOML 1.10.9 and the game's SVD code run
-    /// in Java by `target/svd_oracle.java`, outside the repository): translation, left rotation,
+    /// in Java by a small oracle program kept with the mission notes of G5-F05, outside the
+    /// repository: game jar and JOML jar on the class path): translation, left rotation,
     /// scale, right rotation, as float bits.
     #[test]
     fn svd_matches_the_game_bit_for_bit() {
