@@ -33,9 +33,7 @@ fn data() -> Arc<rc_data::VersionData> {
 }
 
 fn world_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("rc-g3f07-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
+    rc_testdata::scratch(std::env::temp_dir().join(format!("rc-g3f07-{tag}-{}", std::process::id())))
 }
 
 fn open(tag: &str) -> T {

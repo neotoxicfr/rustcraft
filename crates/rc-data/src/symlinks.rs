@@ -319,6 +319,15 @@ impl SymlinkRules {
 mod tests {
     use super::*;
 
+    /// Removes the folder at the end of the test, even if it fails (`rc_testdata::scratch`
+    /// depends on this crate).
+    struct Gone(PathBuf);
+    impl Drop for Gone {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn list(text: &str, windows: bool) -> SymlinkRules {
         SymlinkRules::parse_for(text, windows).expect("list")
     }
@@ -365,6 +374,7 @@ mod tests {
     fn bench_check_world() {
         let root = std::env::temp_dir().join(format!("rc-symlinks-bench-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
+        let _gone = Gone(root.clone());
         for dim in ["", "DIM-1", "DIM1"] {
             for sub in ["region", "entities", "poi", "data"] {
                 let d = root.join(dim).join(sub);
@@ -400,6 +410,7 @@ mod tests {
     fn real_links() {
         let root = std::env::temp_dir().join(format!("rc-symlinks-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
+        let _gone = Gone(root.clone());
         let world = root.join("world");
         let outside = root.join("elsewhere");
         std::fs::create_dir_all(world.join("region")).expect("folder");

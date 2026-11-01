@@ -472,8 +472,7 @@ mod tests {
         let index = index.as_ref().map(|(i, o)| (i.as_path(), o.as_path()));
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test-tmp");
         let run = |par: bool| {
-            let dir = root.join(format!("i01-respar-{par}-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
+            let dir = rc_testdata::scratch(root.join(format!("i01-respar-{par}-{}", std::process::id())));
             let (assets, cache) =
                 rc_assets::cache::open_assets(&dir, "26.3", &install.client_jar, &[], index, &[]).expect("resources");
             assert!(!cache.hot(), "cold cache expected");

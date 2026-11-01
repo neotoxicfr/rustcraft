@@ -46,8 +46,7 @@ fn new_world_regions_survive_two_sessions() {
     if crate::registries::client_jar(&data).is_none() {
         return;
     }
-    let dir = std::env::temp_dir().join(format!("rc-newworld-sess-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-newworld-sess-{}", std::process::id())));
     let mut w = NewWorld::new("sessions");
     w.seed = 42;
     create_world(&dir, &data, &w).expect("creation");
@@ -90,8 +89,7 @@ fn new_world_regions_survive_generation_and_saves() {
     let Some(data) = rc_testdata::version_data() else { return };
     let data = Arc::new(data);
     let Some(jar) = crate::registries::client_jar(&data) else { return };
-    let dir = std::env::temp_dir().join(format!("rc-newworld-rt-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-newworld-rt-{}", std::process::id())));
     let mut w = NewWorld::new("round-trip");
     w.seed = 1234567890123456789;
     create_world(&dir, &data, &w).expect("creation");

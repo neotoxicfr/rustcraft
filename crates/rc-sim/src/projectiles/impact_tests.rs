@@ -18,8 +18,7 @@ use crate::player::Stack;
 fn open(tag: &str) -> (Probe, PathBuf) {
     let data = Arc::new(rc_testdata::version_data().expect("26.3 version data missing"));
     assert!(crate::registries::client_jar(&data).is_some(), "26.3 client jar missing");
-    let dir = std::env::temp_dir().join(format!("rc-projimpact-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-projimpact-{tag}-{}", std::process::id())));
     let mut w = NewWorld::new(tag);
     w.seed = 1;
     w.preset = Preset::Flat;

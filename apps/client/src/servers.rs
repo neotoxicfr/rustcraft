@@ -254,8 +254,7 @@ mod tests {
 
     #[test]
     fn save_keeps_old_and_updates_icon() {
-        let dir = std::env::temp_dir().join(format!("rc-servers-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-servers-test-{}", std::process::id())));
         let l = sample();
         l.save(&dir).unwrap();
         assert!(!dir.join("servers.dat_old").exists());

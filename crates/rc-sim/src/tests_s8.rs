@@ -332,7 +332,7 @@ fn comparator_unseals_loot_chest() {
 /// official server (test world seed).
 #[test]
 fn named_sequence_matches_official() {
-    let tmp = std::env::temp_dir().join("rc-s8-seq");
+    let tmp = rc_testdata::scratch(std::env::temp_dir().join("rc-s8-seq"));
     let mut s = crate::rng::Sequences::load(&tmp, 6_470_889_051_986_534_830);
     let r = s.get("minecraft:s8test");
     let got: Vec<i32> = (0..3).map(|_| r.next_int_bound(95)).collect();
@@ -354,7 +354,7 @@ fn fishing_loot_offline() {
     let loot = crate::loot::Loot { pack: &pack, items: &items, block_tag: &bt };
     let rod = crate::player::Stack { id: "minecraft:fishing_rod".into(), count: 1, components: None };
     let ctx = crate::loot::Ctx { tool: Some(Some(&rod)), ..Default::default() };
-    let tmp = std::env::temp_dir().join("rc-s8-seq2");
+    let tmp = rc_testdata::scratch(std::env::temp_dir().join("rc-s8-seq2"));
     let mut seqs = crate::rng::Sequences::load(&tmp, 6_470_889_051_986_534_830);
     let got: Vec<String> = (0..40)
         .map(|_| loot.drops("minecraft:gameplay/fishing", &ctx, seqs.get("minecraft:gameplay/fishing")))

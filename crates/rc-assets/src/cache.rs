@@ -1790,10 +1790,11 @@ pub(crate) mod tests {
     // Streamed write, split cache, per-view recording.
 
     fn tmp_dir(name: &str) -> PathBuf {
-        let d = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/test-tmp")
-            .join(format!("c4m05-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+        let d = rc_testdata::scratch(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/test-tmp")
+                .join(format!("c4m05-{name}-{}", std::process::id())),
+        );
         std::fs::create_dir_all(&d).expect("temporary directory");
         d
     }

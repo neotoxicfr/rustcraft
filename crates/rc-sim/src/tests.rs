@@ -85,25 +85,10 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
 }
 
 /// Fresh copy of the test world in a temporary folder specific to the test, erased at the end
-/// of the test's thread even if it fails (a test that panics skips its own erasing: these
-/// 70 MB copies piled up by the hundreds in the temporary folder).
+/// of the test's thread even if it fails (`rc_testdata::scratch`).
 pub(crate) fn fresh_copy(world: &std::path::Path, tag: &str) -> PathBuf {
-    use std::cell::RefCell;
-    struct Copies(Vec<PathBuf>);
-    impl Drop for Copies {
-        fn drop(&mut self) {
-            for d in &self.0 {
-                let _ = std::fs::remove_dir_all(d);
-            }
-        }
-    }
-    thread_local! {
-        static COPIES: RefCell<Copies> = const { RefCell::new(Copies(Vec::new())) };
-    }
-    let dir = std::env::temp_dir().join(format!("rc-sim-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-sim-{tag}-{}", std::process::id())));
     copy_dir(world, &dir);
-    COPIES.with(|c| c.borrow_mut().0.push(dir.clone()));
     dir
 }
 

@@ -407,8 +407,7 @@ mod tests {
         if crate::registries::client_jar(&data).is_none() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("rc-prep-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-prep-{}", std::process::id())));
         let mut w = crate::newworld::NewWorld::new("prep");
         w.seed = 7;
         crate::newworld::create_world(&dir, &data, &w).expect("creation");
