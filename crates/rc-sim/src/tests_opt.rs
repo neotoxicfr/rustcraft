@@ -39,7 +39,9 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// G5-F02b review: flyers with an empty fall check (bat, parrot, bee, allay, ghasts, phantom) no
 /// longer accumulate a fall (saved field), the only cause of the change (checked by restoring the
 /// old accumulation: b7433a1e…, 823).
-const EXPECTED_NEW: (&str, usize) = ("c855a20f62d2683f7c7559f09935ba7f01003874c8b6ad7a6c4aadf76e7fac5c", 823);
+/// Lot 6 integration: the three changes above together (alone: G5-F02c 267b491a…, 815;
+/// G5-F02a 6ffe4a73…, 815; G5-F02b c855a20f…, 823), merged with the rest of lot 6.
+const EXPECTED_NEW: (&str, usize) = ("24fde67e1af5bc1545c6cab4e16cdcba39e4adf26d419b0b75d40a0cab3707c9", 823);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 const EXPECTED_MODEL: &[(&str, &str, usize)] = &[(
     "790b2d94653a4243e68f2e0cb0ebc3f865f9f59815ed65149067cdd374c6b800",
@@ -179,8 +181,9 @@ fn run_new() -> Option<Vec<(String, String)>> {
     Some(out)
 }
 
-/// Expected fingerprint of the "mechanisms" site: (total, number of files).
-const EXPECTED_MECH: (&str, usize) = ("cd8c1083235a728b4b38164674636d153c1031a8e0fedfdba4eb2597f50bf5b5", 378);
+/// Expected fingerprint of the "mechanisms" site: (total, number of files). Lot 6 integration:
+/// G5-F02b (alone cd8c1083…, 378) and G5-F02c (alone b80e1b0b…, 380) together.
+const EXPECTED_MECH: (&str, usize) = ("7f0e2e80787f3ad5981b0a1b91df3b6efe9784e8d484c9f92076b17c582c10dd", 378);
 
 /// Server command (refusal = failure: the rig would be incomplete).
 pub(crate) fn cmd(s: &mut Server, c: &str) {
