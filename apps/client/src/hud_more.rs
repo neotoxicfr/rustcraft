@@ -291,7 +291,7 @@ pub struct HudMore {
     /// Jump to send to the server (strength 0..100).
     jump_send: Option<i32>,
     ticks: i32,
-    /// Tick of the last change of experience progress.
+    /// Tick from which the XP bar is shown for 100 ticks (`None`: never set for this player).
     xp_changed: Option<i32>,
     frozen: i32,
     /// Portal intensity (previous tick, current).
@@ -633,9 +633,21 @@ impl HudMore {
         }
     }
 
-    /// Experience progress changed: the XP bar takes precedence over the locator for 100 ticks.
+    /// Experience progress changed: the XP bar takes precedence over the locator for 100 ticks,
+    /// except for the very first change of a player (values received on arrival), which only
+    /// marks the start as set without showing anything.
     pub fn xp_changed(&mut self) {
+        self.xp_changed = Some(if self.xp_changed.is_none() { i32::MIN + 1 } else { self.ticks });
+    }
+
+    /// Anvil or enchanting table screen open (each tick): the XP bar stays in front.
+    pub fn force_xp(&mut self) {
         self.xp_changed = Some(self.ticks);
+    }
+
+    /// New player (respawn, dimension change): start of the XP display forgotten.
+    pub fn respawn(&mut self) {
+        self.xp_changed = None;
     }
 
     /// Hearts of the living mount (0: no mount showing its health).
@@ -1078,6 +1090,49 @@ mod tests {
         assert_eq!(style_sprite(b, 300.0), "hud/locator_bar_dot/default_2");
         // Pure grey: brightness only.
         assert_eq!(set_brightness(0x808080, 0.9), 0xffe6_e6e6);
+    }
+
+    /// With waypoints: the first experience change of a player shows nothing, later ones show
+    /// the XP bar for 100 ticks; the anvil / enchanting screen keeps it in front while open.
+    #[test]
+    fn xp_bar_priority_over_the_locator() {
+        use rc_proto_v777::waypoint::{Waypoint, WaypointId, WaypointOp, WaypointPos};
+        let plain = |h: &mut HudMore| {
+            h.tick(&TickIn { air: None, eyes_in_water: false, vehicle: None, jump: false, frozen: None, in_portal: false })
+        };
+        let mut h = HudMore::new();
+        h.waypoint(Waypoint {
+            op: WaypointOp::Track,
+            id: WaypointId::Uuid(7),
+            style: "minecraft:default".into(),
+            color: None,
+            pos: WaypointPos::Azimuth(0.0),
+        });
+        plain(&mut h);
+        h.xp_changed();
+        assert_eq!(h.bar(true), Bar::Locator, "first change: not shown");
+        h.xp_changed();
+        assert_eq!(h.bar(true), Bar::Experience);
+        for _ in 0..100 {
+            plain(&mut h);
+        }
+        assert_eq!(h.bar(true), Bar::Locator, "100 ticks later");
+        // Screen open for 300 ticks: forced every tick.
+        for _ in 0..300 {
+            plain(&mut h);
+            h.force_xp();
+            assert_eq!(h.bar(true), Bar::Experience);
+        }
+        for _ in 0..99 {
+            plain(&mut h);
+        }
+        assert_eq!(h.bar(true), Bar::Experience, "still 99 ticks after closing");
+        plain(&mut h);
+        assert_eq!(h.bar(true), Bar::Locator);
+        // New player: the first change is silent again.
+        h.respawn();
+        h.xp_changed();
+        assert_eq!(h.bar(true), Bar::Locator);
     }
 
     #[test]

@@ -137,6 +137,9 @@ pub enum Event {
     ChatSignature(chat::Signature),
     /// Original signed text of the "modified" message emitted just before (tooltip of the tag).
     ChatOriginal(String),
+    /// Sender of the player message emitted just before, when that message carries a signature
+    /// (chat log: senders listed by the social interactions screen).
+    ChatSender(u128),
     /// Signed message to delete (`chat.md` § 1.5).
     DeleteChat(chat::Signature),
     /// Command tree (`commands.md` § 1), replaces the previous one.

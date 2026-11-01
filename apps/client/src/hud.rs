@@ -439,6 +439,10 @@ impl Hud {
         self.damage_cooldown = 0;
         self.food = 20;
         self.saturation = 5.0;
+        // New player: no experience until the server sends it again (always, after a respawn).
+        self.xp_progress = 0.0;
+        self.xp_level = 0;
+        self.more.respawn();
         if !keep_data {
             self.health = 20.0;
             self.absorption = 0.0;

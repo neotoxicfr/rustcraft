@@ -650,9 +650,16 @@ impl App {
                 self.world.grid.set_radius(d as u32);
                 self.env.server_view = d;
             }
-            Event::Chat { component, tag } => self.chat.add(component, tag),
+            Event::Chat { component, tag } => {
+                self.menus.world.chat_line();
+                self.chat.add(component, tag);
+            }
             Event::ChatSignature(sig) => self.chat.attach_signature(sig),
             Event::ChatOriginal(text) => self.chat.attach_original(text),
+            Event::ChatSender(uuid) => {
+                let name = self.players.map.get(&uuid).map(|p| p.name.clone()).unwrap_or_default();
+                self.menus.world.chat_sender(uuid, name);
+            }
             Event::DeleteChat(sig) => self.chat.delete(sig),
             Event::Commands(c) => self.cmd.set_tree(&c),
             Event::CommandSuggestions(s) => self.op_suggestions(s),
@@ -784,6 +791,14 @@ impl App {
                     // Glide and spin attack as the server sends them back.
                     rc_client::EntityEvent::Data { id, ref values } if id == self.player_id => {
                         player_env::local_flags(values, &mut self.player);
+                    }
+                    // Player entity added while listed: kept by the social interactions screen.
+                    rc_client::EntityEvent::Add(ref a)
+                        if self.entities.type_names.get(a.kind as usize).is_some_and(|n| n == "minecraft:player") =>
+                    {
+                        if let Some(p) = self.players.map.get(&a.uuid) {
+                            self.menus.world.spotted(a.uuid, p.name.clone());
+                        }
                     }
                     _ => {}
                 }
@@ -3089,22 +3104,24 @@ impl App {
                 menus::Action::ResourcePacks => self.open_pack_screen(),
                 menus::Action::Advancements(kb) => self.open_advancements(true, kb),
                 menus::Action::Stats(kb) => self.open_stats(kb),
-                menus::Action::Language(code) => {
-                    let read = |p: &str| self.assets.read(p);
-                    let chosen =
-                        if code == "en_us" { None } else { read(&format!("assets/minecraft/lang/{code}.json")) };
-                    let mut lang = rc_text::Lang::load(
-                        &read("assets/minecraft/lang/en_us.json").unwrap_or_default(),
-                        chosen.as_deref(),
-                        read("assets/minecraft/lang/deprecated.json").as_deref(),
-                    );
-                    lang.bidirectional = self.menus.languages.iter().any(|l| l.code == code && l.bidirectional);
-                    if let Some(r) = &mut self.renderer {
-                        r.gui.lang = lang;
-                    }
-                }
+                menus::Action::Language(code) => self.apply_language(&code),
                 other => self.world_menu_action(other),
             }
+        }
+    }
+
+    /// Loads the translations of `code` (already written in the options) into the interface.
+    pub(crate) fn apply_language(&mut self, code: &str) {
+        let read = |p: &str| self.assets.read(p);
+        let chosen = if code == "en_us" { None } else { read(&format!("assets/minecraft/lang/{code}.json")) };
+        let mut lang = rc_text::Lang::load(
+            &read("assets/minecraft/lang/en_us.json").unwrap_or_default(),
+            chosen.as_deref(),
+            read("assets/minecraft/lang/deprecated.json").as_deref(),
+        );
+        lang.bidirectional = self.menus.languages.iter().any(|l| l.code == code && l.bidirectional);
+        if let Some(r) = &mut self.renderer {
+            r.gui.lang = lang;
         }
     }
 
@@ -3233,7 +3250,7 @@ impl App {
             }
             ["w", x, y, n] => {
                 self.menutest.2 = Some((f(x), f(y)));
-                actions = self.menus.wheel(gui, &mut self.options, (f(x), f(y)), f64::from(f(n)));
+                actions = self.menus.wheel(gui, &mut self.options, (f(x), f(y)), f64::from(f(n)), false);
             }
             ["k", key] => {
                 let k = match key {
@@ -3440,7 +3457,7 @@ impl ApplicationHandler for App {
                     winit::event::MouseScrollDelta::PixelDelta(p) => p.y / 20.0,
                 };
                 let (Some(r), Some(m)) = (&self.renderer, self.gui_mouse()) else { return };
-                let actions = self.menus.wheel(&r.gui, &mut self.options, m, y);
+                let actions = self.menus.wheel(&r.gui, &mut self.options, m, y, self.mods.control_key());
                 self.menu_actions(actions);
             }
             WindowEvent::CursorMoved { position, .. } => {

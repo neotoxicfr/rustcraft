@@ -231,7 +231,6 @@ fn rows(id: Id, opts: &Options) -> Vec<Row> {
             ]));
             r.push(Row::Header("options.video.quality.header"));
             r.push(Row::Big(Slider("graphicsPreset", "options.graphics.preset")));
-            let aniso = opts.i("textureFiltering") == 2;
             r.extend(pairs(&[
                 Slider("biomeBlendRadius", "options.biomeBlendRadius"),
                 Slider("renderDistance", "options.renderDistance"),
@@ -276,7 +275,8 @@ fn rows(id: Id, opts: &Options) -> Vec<Row> {
                         ("2", "options.textureFiltering.anisotropic"),
                     ],
                 ),
-                if aniso { Slider("maxAnisotropyBit", "options.maxAnisotropy") } else { Off("maxAnisotropyBit") },
+                // Inactive (value still shown) unless the filtering is anisotropic.
+                Slider(MAX_ANISOTROPY, "options.maxAnisotropy"),
                 Slider("weatherRadius", "options.weatherRadius"),
             ]));
             r.push(Row::Header("options.video.preferences.header"));
@@ -746,6 +746,9 @@ const DISCONNECT: u32 = 10;
 const PAUSE_EXTRA: u32 = 11;
 const ONLINE: u32 = 60;
 const FONT: u32 = 61;
+/// Accessibility guide button (link opening confirmation).
+const ACCESSIBILITY_GUIDE: u32 = 62;
+const ACCESSIBILITY_URL: &str = "https://aka.ms/MinecraftJavaAccessibility";
 
 struct Screen {
     id: Id,
@@ -1011,6 +1014,10 @@ impl Menus {
                     top.size = (-2, -2);
                     out.push(Action::Save);
                 }
+                (Id::Accessibility, Event::Press(ACCESSIBILITY_GUIDE)) => {
+                    self.world.url = ACCESSIBILITY_URL.to_owned();
+                    next = Some(Next::Open(Id::Confirm(Confirm::Link), top.panel.keyboard));
+                }
                 (Id::Language, Event::Edit(SEARCH)) => top.size = (-2, -2),
                 (Id::Language, Event::Activate(_)) => next = Some(Next::Pop),
                 (_, e) => {
@@ -1140,10 +1147,23 @@ impl Menus {
         self.handle(gui, o, ev)
     }
 
-    pub fn wheel(&mut self, gui: &Gui, o: &mut Options, m: (f32, f32), dy: f64) -> Vec<Action> {
+    /// Wheel; with Ctrl on the video screen it steps the interface scale instead (never to
+    /// automatic, list back to the top), and does nothing else.
+    pub fn wheel(&mut self, gui: &Gui, o: &mut Options, m: (f32, f32), dy: f64, ctrl: bool) -> Vec<Action> {
         self.layout(gui, o);
         let mut ev = Vec::new();
         if let Some(s) = self.stack.last_mut() {
+            if s.id == Id::Video && ctrl {
+                if let Some(v) = wheel_scale(o.i("guiScale"), s.max_scale, dy) {
+                    o.set("guiScale", Val::I(v));
+                    if let Some(l) = s.panel.list.as_mut() {
+                        l.set_scroll(0.0);
+                    }
+                    s.size = (-2, -2);
+                    return vec![Action::Changed];
+                }
+                return Vec::new();
+            }
             s.panel.wheel(m, dy, &mut ev);
         }
         self.handle(gui, o, ev)
@@ -1405,6 +1425,11 @@ fn refresh_labels(s: &mut Screen, gui: &Gui, o: &Options) {
         if matches!(opt, Opt::Choice(GRAPHICS_API, ..)) {
             w.set_tooltip(gui, &graphics_api_tooltip(gui, o));
         }
+        // Maximum anisotropy: a slider showing its value, active only with the anisotropic
+        // filtering (which the filtering button or the preset can change on this screen).
+        if matches!(opt, Opt::Slider(MAX_ANISOTROPY, _)) {
+            w.active = o.i("textureFiltering") == 2;
+        }
     }
 }
 
@@ -1442,8 +1467,24 @@ fn opt_widget(gui: &Gui, o: &Options, opt: &Opt, id: u32, x: i32, y: i32, w: i32
     wd
 }
 
+/// Tooltip of a key also bound to other actions: their names on one line, comma separated.
+fn duplicate_tooltip(lang: &rc_text::Lang, others: &[String]) -> String {
+    tr(lang, "controls.keybinds.duplicateKeybinds", &[others.join(", ")])
+}
+
+/// Interface scale after a Ctrl+wheel notch: automatic (0) counts as one above the maximum,
+/// the sign of the notch moves by one, and the result must stay within 1..=max (automatic is
+/// never reached by the wheel); None leaves the scale unchanged.
+fn wheel_scale(cur: i32, max: u32, dy: f64) -> Option<i32> {
+    let max = max as i32;
+    let from = if cur == 0 { max + 1 } else { cur };
+    let to = from + dy.signum() as i32 * i32::from(dy != 0.0);
+    (to != 0 && (0..=max).contains(&to)).then_some(to)
+}
+
 /// Graphics API setting, applied at the next startup (`gpu_backend`).
 const GRAPHICS_API: &str = "preferredGraphicsBackend";
+const MAX_ANISOTROPY: &str = "maxAnisotropyBit";
 
 /// A value applied only at startup has changed since launch (red banner of
 /// the video screen).
@@ -1631,7 +1672,7 @@ fn build(
                 };
                 let mut b = Widget::new(BIND + i as u32, Kind::Button, bx, 2 + top, 75, 20, chars(&msg));
                 if !others.is_empty() {
-                    b.set_tooltip(gui, &tr(&gui.lang, "controls.keybinds.duplicateKeybinds", &[others.join("\n")]));
+                    b.set_tooltip(gui, &duplicate_tooltip(&gui.lang, &others));
                 }
                 b.in_list = true;
                 widgets.push(b);
@@ -1652,7 +1693,7 @@ fn build(
         }
         Id::Language => {
             // Header of 36 (title, search 200 × 15), footer of 53 (§ 3.11).
-            let mut field = TextField::new(chars(""));
+            let mut field = TextField::new(chars(&format!("§7§o{}", t("gui.language.search"))));
             field.text = search.chars().collect();
             field.cursor = field.text.len();
             field.anchor = field.cursor;
@@ -1725,7 +1766,7 @@ fn build(
             list = Some(l);
             if id == Id::Accessibility {
                 let x = (w - 308) / 2;
-                widgets.push(Widget::button(62, x, h - 26, 150, &t("options.accessibility.link")).inactive());
+                widgets.push(Widget::button(ACCESSIBILITY_GUIDE, x, h - 26, 150, &t("options.accessibility.link")));
                 widgets.push(done(x + 158, 150));
             } else {
                 widgets.push(done((w - 200) / 2, 200));
@@ -1772,6 +1813,52 @@ mod tests {
         assert_eq!((o.s("graphicsPreset"), o.i("renderDistance")), ("fast", 8));
         cycle(&mut o, &Opt::Choice("particles", "", &[("0", ""), ("1", ""), ("2", "")]), 1, 3);
         assert_eq!((o.i("particles"), o.s("graphicsPreset")), (2, "custom"));
+    }
+
+    /// Default filtering (not anisotropic): the row is still the slider with its value, not an
+    /// inactive button showing the raw setting name.
+    #[test]
+    fn anisotropy_row_is_a_slider_with_its_value() {
+        let lang = rc_text::Lang::load(
+            br#"{"options.maxAnisotropy":"Max Anisotropy","options.generic_value":"%s: %s","options.multiplier":"%sx"}"#,
+            None,
+            None,
+        );
+        let o = Options::default();
+        assert_ne!(o.i("textureFiltering"), 2);
+        let row = rows(Id::Video, &o)
+            .into_iter()
+            .flat_map(|r| match r {
+                Row::Pair(a, b) => vec![Some(a), b],
+                Row::Big(a) => vec![Some(a)],
+                Row::Header(_) => Vec::new(),
+            })
+            .flatten()
+            .find(|opt| matches!(opt, Opt::Slider(MAX_ANISOTROPY, _) | Opt::Off(MAX_ANISOTROPY)))
+            .expect("anisotropy row");
+        assert_eq!(row, Opt::Slider(MAX_ANISOTROPY, "options.maxAnisotropy"));
+        assert_eq!(opt_label(&lang, &o, &row, None, 4), "Max Anisotropy: 4x");
+    }
+
+    /// Ctrl+wheel on the video screen: automatic counts as max + 1, stays within 1..=max.
+    #[test]
+    fn ctrl_wheel_steps_the_interface_scale() {
+        assert_eq!(wheel_scale(0, 4, -1.0), Some(4), "automatic, down: the maximum");
+        assert_eq!(wheel_scale(0, 4, 1.0), None, "automatic, up: nothing");
+        assert_eq!(wheel_scale(3, 4, 1.0), Some(4));
+        assert_eq!(wheel_scale(4, 4, 1.0), None);
+        assert_eq!(wheel_scale(1, 4, -1.0), None, "never to automatic");
+        assert_eq!(wheel_scale(2, 4, -3.0), Some(1), "one step per notch, whatever its size");
+        assert_eq!(wheel_scale(6, 4, -1.0), None, "stored scale above the maximum");
+        assert_eq!(wheel_scale(2, 4, 0.0), Some(2), "no vertical motion: same value");
+    }
+
+    /// Duplicated keys: the other actions are listed on one line, separated by commas.
+    #[test]
+    fn duplicate_key_tooltip_lists_with_commas() {
+        let lang = rc_text::Lang::load(br#"{"controls.keybinds.duplicateKeybinds":"Also used for:\n%s"}"#, None, None);
+        let names = ["Attack/Destroy".to_owned(), "Pick Block".to_owned()];
+        assert_eq!(duplicate_tooltip(&lang, &names), "Also used for:\nAttack/Destroy, Pick Block");
     }
 
     #[test]

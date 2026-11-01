@@ -69,6 +69,36 @@ fn search_categories(book: usize) -> &'static [&'static str] {
     ][book.min(3)]
 }
 
+/// Item to draw: stack, corner, scale across and down, count and bar drawn.
+type Drawn = (ItemStack, f32, f32, (f32, f32), bool);
+
+/// Tooltip lines of a button and the button's rectangle.
+type WidgetTip = (Vec<Vec<StyledChar>>, (i32, i32, i32, i32));
+
+/// Offset of a shaped recipe of `size` cells on a grid side of `grid` cells: centred only
+/// when it takes less than half of the side (a 1-wide recipe on 3 columns goes to the
+/// middle one, a 2-wide stays on the left).
+fn centre_offset(grid: i32, size: i32) -> i32 {
+    if (size as f32) < grid as f32 / 2.0 { (grid as f32 / 2.0 - size as f32 / 2.0).floor() as i32 } else { 0 }
+}
+
+/// Thumbnail cells (column, row, ingredient) of a variant on the 3×3 pattern of the
+/// variants menu: shaped centred like the placement on the grid, shapeless in reading
+/// order, furnace in the middle.
+fn overlay_cells(display: &RecipeDisplay) -> Vec<(i32, i32, &SlotDisplay)> {
+    match display {
+        RecipeDisplay::Shaped { width, height, ingredients, .. } => {
+            let (dx, dy) = (centre_offset(3, *width), centre_offset(3, *height));
+            ingredients.iter().enumerate().map(|(k, d)| (k as i32 % width + dx, k as i32 / width + dy, d)).collect()
+        }
+        RecipeDisplay::Shapeless { ingredients, .. } => {
+            ingredients.iter().enumerate().map(|(k, d)| (k as i32 % 3, k as i32 / 3, d)).collect()
+        }
+        RecipeDisplay::Furnace { ingredient, .. } => vec![(1, 1, ingredient)],
+        _ => Vec::new(),
+    }
+}
+
 /// Ghost recipe: slots of the current menu and stacks to show (§ 11.4).
 pub struct Ghost {
     pub window: i32,
@@ -292,6 +322,12 @@ pub struct RecipeBook {
     pub clicks: u32,
     /// End of the bounce of each slot of the page, in `clock` ticks (newly shown recipe).
     anim: [f32; 20],
+    /// End of the vertical bounce of each tab, in `clock` ticks (tab holding a newly
+    /// unlocked recipe); `retab` asks for the check at the next drawing (book shown, recipes changed).
+    tab_anim: [f32; 5],
+    retab: bool,
+    /// The search reads the easter egg word: the client switches to the pirate language.
+    pub pirate: bool,
     /// Elapsed ticks, Ctrl included (the bounce does not stop with Ctrl, scrolling does).
     pub clock: u64,
     overlay: Option<Overlay>,
@@ -369,6 +405,8 @@ impl RecipeBook {
             RecipeEvent::Settings(s) => self.settings = s,
             RecipeEvent::Ghost { .. } => return,
         }
+        // Any book packet refreshes the tabs of the open screen, bounce included.
+        self.retab = true;
         self.regroup();
         self.generation += 1;
         self.stamp = 0;
@@ -601,6 +639,9 @@ impl RecipeBook {
             }
             None => self.visible = false,
         }
+        // New screen: fresh tab buttons, checked at the first drawing.
+        self.tab_anim = [0.0; 5];
+        self.retab = true;
         self.overlay = None;
         self.focused = false;
         self.stamp = 0;
@@ -646,13 +687,35 @@ impl RecipeBook {
         }
     }
 
-    /// Book toggle (button): setting sent to the server.
+    /// Book toggle (button, Esc in narrow mode).
     pub fn toggle(&mut self, link: &rc_client::link::Link) {
-        self.visible = !self.visible;
-        self.settings[self.book].0 = self.visible;
-        self.overlay = None;
+        self.set_visible(!self.visible, link);
+    }
+
+    /// Shows or hides the book: the open setting follows and the settings go to the
+    /// server each time. Shown: fresh search field (no focus) and tab buttons; hidden:
+    /// variants menu closed.
+    pub fn set_visible(&mut self, visible: bool, link: &rc_client::link::Link) {
+        if visible {
+            self.focused = false;
+            self.tab_anim = [0.0; 5];
+            self.retab = true;
+        } else {
+            self.overlay = None;
+        }
+        self.visible = visible;
+        self.settings[self.book].0 = visible;
         let (o, f) = self.settings[self.book];
         let _ = link.send_recipe_book_settings(self.book as i32, o, f);
+    }
+
+    /// Screen tick: the book follows the open setting (the server can change it), and
+    /// every change of visibility echoes the settings back like a toggle.
+    pub fn follow_settings(&mut self, link: &rc_client::link::Link) {
+        let open = self.settings[self.book].0;
+        if self.visible != open {
+            self.set_visible(open, link);
+        }
     }
 
     /// Ghost recipe received (§ 11.4).
@@ -666,8 +729,7 @@ impl RecipeBook {
         let (gw, gh) = if kind == Kind::Player { (2, 2) } else { (3, 3) };
         match display {
             RecipeDisplay::Shaped { width, height, ingredients, .. } => {
-                let dy = if *height < gh / 2 + gh % 2 && *height * 2 < gh { gh / 2 - height / 2 } else { 0 };
-                let dx = if *width * 2 < gw { gw / 2 - width / 2 } else { 0 };
+                let (dx, dy) = (centre_offset(gw, *width), centre_offset(gh, *height));
                 for (k, d) in ingredients.iter().enumerate() {
                     let (c, r) = (k as i32 % width, k as i32 / width);
                     let cell = (r + dy) * gw + c + dx;
@@ -707,8 +769,8 @@ impl RecipeBook {
     }
 
     /// Placement of a recipe; false if refused (non-craftable recipe already placed). Retained for
-    /// Enter / Space.
-    fn place(&mut self, id: i32, window: i32, shift: bool, narrow: bool, link: &rc_client::link::Link) -> bool {
+    /// Enter / Space, which place again without hiding the book.
+    fn place(&mut self, id: i32, window: i32, shift: bool, link: &rc_client::link::Link) -> bool {
         if !self.craftable.contains(&id) && self.last_placed == Some(id) {
             return false;
         }
@@ -716,11 +778,15 @@ impl RecipeBook {
         self.last_recipe = Some(id);
         self.ghost = None;
         let _ = link.send_place_recipe(window, id, shift);
-        if narrow {
-            self.visible = false;
-            self.overlay = None;
-        }
         true
+    }
+
+    /// Placement by a click (recipe button or variant): the narrow book then closes, which
+    /// writes the open setting and sends it (otherwise the next tick would show it again).
+    fn place_clicked(&mut self, id: i32, window: i32, shift: bool, narrow: bool, link: &rc_client::link::Link) {
+        if self.place(id, window, shift, link) && narrow {
+            self.set_visible(false, link);
+        }
     }
 
     /// Mouse press (0 left, 1 right); true if the book consumed it.
@@ -767,8 +833,7 @@ impl RecipeBook {
             if let Some(id) = hit {
                 self.clicks += 1;
                 self.overlay = Some(o);
-                let narrow = Self::narrow(gui);
-                let _ = self.place(id, window, shift, narrow, link);
+                self.place_clicked(id, window, shift, Self::narrow(gui), link);
             }
             return true;
         }
@@ -840,7 +905,7 @@ impl RecipeBook {
             if button == 0 {
                 let m = shown.len();
                 let id = shown[(self.time / 30) as usize % m];
-                let _ = self.place(id, window, shift, Self::narrow(gui), link);
+                self.place_clicked(id, window, shift, Self::narrow(gui), link);
             }
             return true;
         }
@@ -877,14 +942,19 @@ impl RecipeBook {
             if k == K::Escape {
                 return (false, false);
             }
-            let (_, mut changed) = self.search.key(k, mods);
+            let (mut used, mut changed) = self.search.key(k, mods);
             if let Some(t) = text.filter(|t| t.chars().all(|c| !c.is_control())) {
                 let before = self.search.text.clone();
                 self.search.insert(t);
                 changed |= before != self.search.text;
+                used = true;
             }
             if changed {
                 self.page = 0;
+            }
+            // Every input taken by the field rereads the easter egg word.
+            if used && self.search.value().to_lowercase() == "excitedze" {
+                self.pirate = true;
             }
             return (true, false);
         }
@@ -895,7 +965,7 @@ impl RecipeBook {
         if matches!(k, K::Enter | K::Space | K::NumpadEnter)
             && let Some(id) = self.last_recipe
         {
-            return (self.place(id, window, mods.shift_key(), narrow, link), true);
+            return (self.place(id, window, mods.shift_key(), link), true);
         }
         (false, false)
     }
@@ -924,8 +994,10 @@ impl RecipeBook {
         let f = |v: i32| v as f32;
         let (mx, my) = mouse.map_or((-1000, -1000), |(x, y)| (x.floor() as i32, y.floor() as i32));
         let inside = |x: i32, y: i32, w: i32, h: i32| mx >= x && mx < x + w && my >= y && my < y + h;
-        let mut items: Vec<(ItemStack, f32, f32, f32, bool)> = Vec::new();
+        let mut items: Vec<Drawn> = Vec::new();
         let mut tip: Option<Vec<Vec<StyledChar>>> = None;
+        // Tooltip of a button (filter, page arrows): placed against the button, not the mouse.
+        let mut widget_tip: Option<WidgetTip> = None;
         let mut tip_stack: Option<ItemStack> = None;
         // Book button.
         gui.next_layer();
@@ -950,7 +1022,7 @@ impl RecipeBook {
                 if inside(x, y, 16, 16) {
                     tip_stack = Some(s.clone());
                 }
-                items.push((s, f(x), f(y), 1.0, *result));
+                items.push((s, f(x), f(y), (1.0, 1.0), *result));
             }
         }
         if !self.visible {
@@ -1001,29 +1073,35 @@ impl RecipeBook {
         gui.sprite(&format!("{pre}_{st}{hl}"), f(l.bx + 110), f(l.by + 12), 26.0, 16.0, 0xffff_ffff);
         if !hl.is_empty() {
             let key = if filter { ["craftable", "smeltable", "blastable", "smokable"][self.book] } else { "all" };
-            tip = Some(vec![rc_text::styled_chars(&rc_text::flatten(
-                &Component::translate(format!("gui.recipebook.toggleRecipes.{key}"), vec![]),
-                &gui.lang,
-            ))]);
+            let line = Component::translate(format!("gui.recipebook.toggleRecipes.{key}"), vec![]);
+            widget_tip = Some((vec![rc_text::styled_chars(&rc_text::flatten(&line, &gui.lang))], (l.bx + 110, l.by + 12, 26, 16)));
         }
-        // Tabs.
+        // Tabs. A category tab holding a newly unlocked recipe (among those its filter shows)
+        // bounces vertically for 15 ticks; checked when the book shows and when recipes change,
+        // before the page marks its recipes as seen.
+        let now = self.clock as f32 + it.pt;
+        self.start_tab_bounce(&l.tabs, kind, ctx, now);
         for &(x, y, t) in &l.tabs {
             let sel = t == self.tab;
             let x = if sel { x - 2 } else { x };
+            let left = self.tab_anim[t] - now;
+            let squeeze = if left > 0.0 { 1.0 + 0.1 * (left / 15.0 * std::f32::consts::PI).sin() } else { 1.0 };
+            // Vertical scale around y + 12.
+            let at = |v: i32| f(y + 12) + f(v - y - 12) * squeeze;
             gui.sprite(
                 if sel { "recipe_book/tab_selected" } else { "recipe_book/tab" },
                 f(x),
-                f(y),
+                at(y),
                 35.0,
-                27.0,
+                27.0 * squeeze,
                 0xffff_ffff,
             );
             let icons = tabs(self.book)[t].icons;
             let xs: &[i32] = if icons.len() == 1 { &[9] } else { &[3, 14] };
             for (icon, dx) in icons.iter().zip(xs) {
-                let at = rc_data::ids::with_key(&["minecraft:", icon], |k| ctx.item_names.iter().position(|n| *n == k));
-                if let Some(id) = at {
-                    items.push((ctx.stack(id as i32), f(x + dx), f(y + 5), 1.0, false));
+                let id = rc_data::ids::with_key(&["minecraft:", icon], |k| ctx.item_names.iter().position(|n| *n == k));
+                if let Some(id) = id {
+                    items.push((ctx.stack(id as i32), f(x + dx), at(y + 5), (1.0, squeeze), false));
                 }
             }
         }
@@ -1072,10 +1150,10 @@ impl RecipeBook {
                 all.iter().all(|o| o.item == all[0].item && o.added == all[0].added && o.removed == all[0].removed)
             };
             if same {
-                items.push((s.clone(), at(x + 5, px), at(y + 5, py), squeeze, false));
-                items.push((s.clone(), at(x + 3, px), at(y + 3, py), squeeze, false));
+                items.push((s.clone(), at(x + 5, px), at(y + 5, py), (squeeze, squeeze), false));
+                items.push((s.clone(), at(x + 3, px), at(y + 3, py), (squeeze, squeeze), false));
             } else {
-                items.push((s.clone(), at(x + 4, px), at(y + 4, py), squeeze, false));
+                items.push((s.clone(), at(x + 4, px), at(y + 4, py), (squeeze, squeeze), false));
             }
             if self.overlay.is_none() && inside(x, y, 25, 25) {
                 let mut lines = tooltip_lines(&s, it, ench, gui, crate::screens::advanced());
@@ -1089,27 +1167,20 @@ impl RecipeBook {
             }
         }
         if l.pages > 1 {
-            if page + 1 < l.pages {
-                let h = if inside(l.bx + 93, l.by + 137, 12, 17) { "_highlighted" } else { "" };
-                gui.sprite(
-                    &format!("recipe_book/page_forward{h}"),
-                    f(l.bx + 93),
-                    f(l.by + 137),
-                    12.0,
-                    17.0,
-                    0xffff_ffff,
-                );
-            }
-            if page > 0 {
-                let h = if inside(l.bx + 38, l.by + 137, 12, 17) { "_highlighted" } else { "" };
-                gui.sprite(
-                    &format!("recipe_book/page_backward{h}"),
-                    f(l.bx + 38),
-                    f(l.by + 137),
-                    12.0,
-                    17.0,
-                    0xffff_ffff,
-                );
+            // Page arrows: highlighted sprite and tooltip while hovered.
+            let arrows = [(page + 1 < l.pages, 93, "forward", "next_page"), (page > 0, 38, "backward", "previous_page")];
+            for (shown, dx, sprite, key) in arrows {
+                if !shown {
+                    continue;
+                }
+                let r = (l.bx + dx, l.by + 137, 12, 17);
+                let hover = inside(r.0, r.1, r.2, r.3);
+                let h = if hover { "_highlighted" } else { "" };
+                gui.sprite(&format!("recipe_book/page_{sprite}{h}"), f(r.0), f(r.1), 12.0, 17.0, 0xffff_ffff);
+                if hover {
+                    let line = Component::translate(format!("gui.recipebook.{key}"), vec![]);
+                    widget_tip = Some((vec![rc_text::styled_chars(&rc_text::flatten(&line, &gui.lang))], r));
+                }
             }
             let t = rc_text::styled_chars(&rc_text::flatten(
                 &Component::translate(
@@ -1157,24 +1228,14 @@ impl RecipeBook {
                 );
                 gui.sprite(&name, f(x), f(y), 24.0, 24.0, 0xffff_ffff);
                 let Some((e, _)) = self.known.get(&id) else { continue };
-                let cells: Vec<(i32, i32, &SlotDisplay)> = match &e.display {
-                    RecipeDisplay::Shaped { width, ingredients, .. } => {
-                        ingredients.iter().enumerate().map(|(k, d)| (k as i32 % width, k as i32 / width, d)).collect()
-                    }
-                    RecipeDisplay::Shapeless { ingredients, .. } => {
-                        ingredients.iter().enumerate().map(|(k, d)| (k as i32 % 3, k as i32 / 3, d)).collect()
-                    }
-                    RecipeDisplay::Furnace { ingredient, .. } => vec![(1, 1, ingredient)],
-                    _ => Vec::new(),
-                };
-                for (c, r, d) in cells {
+                for (c, r, d) in overlay_cells(&e.display) {
                     let st = ctx.resolve(d);
                     if st.is_empty() {
                         continue;
                     }
                     let s = st[(self.time / 30) as usize % st.len()].clone();
                     let (cx, cy) = (x + 2 + 3 + 7 * c, y + 2 + 3 + 7 * r);
-                    mini.push((s, f(cx) - 3.0, f(cy) - 3.0, 0.375, false));
+                    mini.push((s, f(cx) - 3.0, f(cy) - 3.0, (0.375, 0.375), false));
                 }
             }
             self.flush_items(gui, queue, it, &mut mini);
@@ -1185,10 +1246,26 @@ impl RecipeBook {
             let w = lines.iter().map(|l| rc_text::width(gui, l)).max().unwrap_or(0);
             // Recipe button: component tooltip (no gap under the name).
             crate::screens::draw_text_tooltip(gui, queue, &lines, w, mx, my);
-        } else if let Some((bx, by)) = Self::button_pos(gui, kind, gx)
-            && inside(bx, by, 20, 18)
-        {
-            let _ = by;
+        } else if let Some((lines, r)) = widget_tip {
+            crate::widgets::draw_tooltip(gui, queue, &lines, r, mouse);
+        }
+    }
+
+    /// Pending tab check (book shown, recipes changed): every shown category tab holding a
+    /// highlighted recipe among those its filter shows starts its 15-tick bounce at `now`.
+    fn start_tab_bounce(&mut self, shown: &[(i32, i32, usize)], kind: Kind, ctx: &Ctx<'_>, now: f32) {
+        if !std::mem::take(&mut self.retab) {
+            return;
+        }
+        for &(_, _, t) in shown {
+            let hot = !tabs(self.book)[t].categories.is_empty()
+                && self
+                    .tab_collections(t, ctx)
+                    .into_iter()
+                    .any(|c| self.shown_recipes(c, kind).iter().any(|id| self.highlight.contains(id)));
+            if hot {
+                self.tab_anim[t] = now + 15.0;
+            }
         }
     }
 
@@ -1223,7 +1300,7 @@ impl RecipeBook {
         gui: &mut Gui,
         queue: &wgpu::Queue,
         it: &HotbarItems<'_>,
-        items: &mut Vec<(ItemStack, f32, f32, f32, bool)>,
+        items: &mut Vec<Drawn>,
     ) {
         if items.is_empty() {
             return;
@@ -1243,10 +1320,10 @@ impl RecipeBook {
             if let Some(c) = &self.cache[base + k]
                 && !c.layers.is_empty()
             {
-                if *sc == 1.0 {
+                if *sc == (1.0, 1.0) {
                     gui.item(c.key, &c.layers, *x, *y, 0.0);
                 } else {
-                    gui.item_scaled(c.key, &c.layers, *x, *y, *sc);
+                    gui.item_stretched(c.key, &c.layers, *x, *y, sc.0, sc.1);
                 }
             }
         }
@@ -1325,6 +1402,202 @@ mod tests {
         let rgb = i32::from_be_bytes(mixed[0].component(dc).unwrap().try_into().unwrap());
         assert_eq!(rgb, rc_sim::mobs::apply_dyes(Some(0x1D1D21), &[0xF9FFFE]));
         assert_eq!(mixed[0].added.iter().filter(|a| a.0 == dc).count(), 1);
+    }
+
+    /// In-memory link and the packet ids it sends.
+    fn link() -> Option<(rc_client::Session, rc_client::memory::Peer)> {
+        let data = rc_testdata::version_data()?;
+        Some(rc_client::memory::session(std::sync::Arc::new(data), 1).expect("session"))
+    }
+
+    fn sent(peer: &rc_client::memory::Peer) -> Vec<Vec<u8>> {
+        peer.packets.try_iter().collect()
+    }
+
+    fn settings_packet(s: &rc_client::Session, book: u8, open: bool, filter: bool) -> Vec<u8> {
+        let mut v = Vec::new();
+        write_varint(&mut v, s.link.ids.recipe_book_change_settings);
+        v.extend([book, u8::from(open), u8::from(filter)]);
+        v
+    }
+
+    /// Narrow book: a placement by click hides the book AND writes the open setting sent to
+    /// the server, so the tick that follows the setting keeps it hidden.
+    #[test]
+    fn narrow_click_placement_keeps_the_book_closed() {
+        let Some((s, peer)) = link() else { return };
+        let mut b = RecipeBook::new();
+        b.settings[0] = (true, false);
+        b.on_screen(Kind::Crafting);
+        assert!(b.visible);
+        b.place_clicked(7, 3, false, true, &s.link);
+        assert!(!b.visible);
+        assert_eq!(b.settings[0], (false, false));
+        b.follow_settings(&s.link);
+        assert!(!b.visible, "the next tick must not reopen the book");
+        let p = sent(&peer);
+        assert_eq!(p.len(), 2, "placement then settings");
+        let mut place = Vec::new();
+        write_varint(&mut place, s.link.ids.place_recipe);
+        place.extend([3, 7, 0]);
+        assert_eq!(p[0], place);
+        assert_eq!(p[1], settings_packet(&s, 0, false, false));
+        // Wide book: the placement leaves it open, no settings sent.
+        b.settings[0].0 = true;
+        b.on_screen(Kind::Player);
+        b.place_clicked(8, 0, true, false, &s.link);
+        assert!(b.visible);
+        assert_eq!(sent(&peer).len(), 1);
+    }
+
+    /// Enter / Space place the last recipe again without hiding the narrow book.
+    #[test]
+    fn enter_in_narrow_mode_keeps_the_book_shown() {
+        let Some((s, peer)) = link() else { return };
+        let mut b = RecipeBook::new();
+        b.settings[0] = (true, false);
+        b.on_screen(Kind::Crafting);
+        b.last_recipe = Some(5);
+        let none = winit::keyboard::ModifiersState::empty();
+        let (used, click) = b.key(winit::keyboard::KeyCode::Enter, none, None, false, true, 2, &s.link);
+        assert!(used && click);
+        assert!(b.visible && b.settings[0].0);
+        assert_eq!(sent(&peer).len(), 1, "placement only");
+    }
+
+    /// The server opens the book: the screen follows at the tick and echoes the settings;
+    /// Esc in narrow mode closes it the same way.
+    #[test]
+    fn open_setting_is_followed_and_echoed() {
+        let Some((s, peer)) = link() else { return };
+        let mut b = RecipeBook::new();
+        b.on_screen(Kind::Furnace(0));
+        assert!(!b.visible);
+        b.focused = true;
+        b.settings[1] = (true, true);
+        b.follow_settings(&s.link);
+        assert!(b.visible);
+        assert!(!b.focused, "fresh search field");
+        assert_eq!(sent(&peer), vec![settings_packet(&s, 1, true, true)]);
+        b.follow_settings(&s.link);
+        assert!(sent(&peer).is_empty(), "no change, nothing sent");
+        let none = winit::keyboard::ModifiersState::empty();
+        let _ = b.key(winit::keyboard::KeyCode::Escape, none, None, false, true, 1, &s.link);
+        assert!(!b.visible);
+        assert_eq!(sent(&peer), vec![settings_packet(&s, 1, false, true)]);
+    }
+
+    /// Typing the easter egg word in the search asks for the pirate language.
+    #[test]
+    fn search_word_asks_for_the_pirate_language() {
+        let Some((s, _peer)) = link() else { return };
+        let mut b = RecipeBook::new();
+        b.settings[0] = (true, false);
+        b.on_screen(Kind::Player);
+        b.focused = true;
+        let none = winit::keyboard::ModifiersState::empty();
+        let k = winit::keyboard::KeyCode::KeyE;
+        let _ = b.key(k, none, Some("Excited"), false, false, 0, &s.link);
+        assert!(!b.pirate);
+        let _ = b.key(k, none, Some("ze"), false, false, 0, &s.link);
+        assert!(b.pirate);
+    }
+
+    /// Reference walk of the official grid placement, in our words: rows from the top, a short
+    /// recipe (less than half of the side) starts at the middle row / column.
+    fn grid_walk(grid: i32, w: i32, h: i32, n: usize) -> Vec<(i32, i32)> {
+        let mut out = Vec::new();
+        let mut y = 0;
+        while y < grid {
+            let start_y = (grid as f32 / 2.0 - h as f32 / 2.0).floor() as i32;
+            if (h as f32) < grid as f32 / 2.0 && start_y > y {
+                y += 1;
+            }
+            for x in 0..grid {
+                if out.len() == n {
+                    return out;
+                }
+                let start_x = (grid as f32 / 2.0 - w as f32 / 2.0).floor() as i32;
+                let centred = (w as f32) < grid as f32 / 2.0;
+                let (end, take) = if centred { (start_x + w, start_x <= x && x < start_x + w) } else { (w, x < w) };
+                if take {
+                    out.push((x, y));
+                } else if x == end {
+                    break;
+                }
+            }
+            y += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn shaped_cells_follow_the_grid_placement() {
+        for grid in [2, 3] {
+            for w in 1..=grid {
+                for h in 1..=grid {
+                    let n = (w * h) as usize;
+                    let ours: Vec<(i32, i32)> = (0..n as i32)
+                        .map(|k| (k % w + centre_offset(grid, w), k / w + centre_offset(grid, h)))
+                        .collect();
+                    assert_eq!(ours, grid_walk(grid, w, h, n), "grid {grid}, recipe {w}×{h}");
+                }
+            }
+        }
+        // Thumbnails of the variants menu: stick (1×2) in the middle column, slab (3×1) on the
+        // middle row.
+        let d = |w: i32, h: i32| RecipeDisplay::Shaped {
+            width: w,
+            height: h,
+            ingredients: vec![SlotDisplay::Empty; (w * h) as usize],
+            result: SlotDisplay::Empty,
+            station: SlotDisplay::Empty,
+        };
+        let cells = |r: &RecipeDisplay| overlay_cells(r).into_iter().map(|(c, r, _)| (c, r)).collect::<Vec<_>>();
+        assert_eq!(cells(&d(1, 2)), vec![(1, 0), (1, 1)]);
+        assert_eq!(cells(&d(3, 1)), vec![(0, 1), (1, 1), (2, 1)]);
+        assert_eq!(cells(&d(2, 2)), vec![(0, 0), (1, 0), (0, 1), (1, 1)]);
+    }
+
+    /// A tab whose category holds a newly unlocked recipe bounces (search tab never); filtered
+    /// book: only for a craftable one.
+    #[test]
+    fn tab_with_new_recipe_bounces() {
+        let Some(data) = rc_testdata::version_data() else { return };
+        let names = data.registry("minecraft:item").expect("item registry").entries.clone();
+        let cats = data.registry("minecraft:recipe_book_category").expect("categories").entries.clone();
+        let cat = |n: &str| cats.iter().position(|c| c == &format!("minecraft:{n}")).expect(n) as i32;
+        let rec = Received::default();
+        let ctx = Ctx { data: &data, rec: &rec, item_names: &names };
+        let entry = |id: i32, category: i32| RecipeEntry {
+            id,
+            display: RecipeDisplay::Shapeless {
+                ingredients: vec![SlotDisplay::Item(1)],
+                result: SlotDisplay::Item(1),
+                station: SlotDisplay::Empty,
+            },
+            group: None,
+            category,
+            requirements: None,
+        };
+        let mut b = RecipeBook::new();
+        b.on_event(
+            RecipeEvent::Add(vec![(entry(1, cat("crafting_building_blocks")), 2), (entry(2, cat("crafting_misc")), 0)], true),
+            &ctx,
+        );
+        b.settings[0] = (true, false);
+        b.on_screen(Kind::Crafting);
+        let shown = [(0, 0, 0), (0, 0, 2), (0, 0, 3)];
+        b.start_tab_bounce(&shown, Kind::Crafting, &ctx, 100.0);
+        assert_eq!(b.tab_anim[..4], [0.0, 0.0, 115.0, 0.0], "building blocks only");
+        // Checked once: a later drawing does not restart it.
+        b.start_tab_bounce(&shown, Kind::Crafting, &ctx, 105.0);
+        assert_eq!(b.tab_anim[2], 115.0);
+        // Filtered book: the highlighted recipe is not craftable, no bounce.
+        b.settings[0].1 = true;
+        b.on_screen(Kind::Crafting);
+        b.start_tab_bounce(&shown, Kind::Crafting, &ctx, 200.0);
+        assert_eq!(b.tab_anim[2], 0.0);
     }
 
     #[test]

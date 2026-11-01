@@ -120,6 +120,7 @@ impl crate::App {
         if self.env.game_mode != 3 && self.spectator.active() {
             self.spectator.close();
         }
+        self.spectator.game_modes(&self.players);
         match pos {
             Some(p) if self.bed.placed != Some(p) => {
                 // Feet at the center of the bed, at its height + 0.125.

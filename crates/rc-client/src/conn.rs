@@ -631,6 +631,10 @@ fn run(
                             if kept && let Some(s) = m.signature.clone() {
                                 emit(next, Event::ChatSignature(s));
                             }
+                            // Chat log: shown messages that passed validation (not the error line).
+                            if m.signature.is_some() && matches!(verdict, crate::chat_verify::Verdict::Accepted { .. }) {
+                                emit(next, Event::ChatSender(m.sender));
+                            }
                         }
                     } else if id == ids.delete_chat {
                         let packed = match read_varint(&mut r)? {

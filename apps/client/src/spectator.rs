@@ -57,10 +57,13 @@ pub enum Item {
 }
 
 impl Item {
-    fn enabled(&self) -> bool {
+    /// Usable slot; a player is only while not in spectator mode now (`spectators`: players
+    /// currently in that mode), even if they were not when the menu was built.
+    fn enabled(&self, spectators: &[u128]) -> bool {
         match self {
             Item::Empty => false,
-            Item::Close | Item::Player(_) | Item::Team(_) => true,
+            Item::Player(p) => !spectators.contains(&p.uuid),
+            Item::Close | Item::Team(_) => true,
             Item::Scroll { enabled, .. } | Item::TeleportPlayers { enabled } | Item::TeleportTeams { enabled } => {
                 *enabled
             }
@@ -150,6 +153,8 @@ pub struct SpectatorUi {
     /// Label of each slot's key (assigned key, then ready text): recomputed when the
     /// assignment changes, emptied on every menu opening (language or layout changed).
     key_labels: Vec<(String, Vec<StyledChar>)>,
+    /// Players in spectator mode, read again each tick and at each key while the menu is open.
+    spectators: Vec<u128>,
 }
 
 /// Settings of the slot keys 1–9 (`options.txt`).
@@ -233,6 +238,16 @@ impl SpectatorUi {
         let category = Category::Root { players: listed_players(players, None), teams: team_items(players, scores) };
         self.menu = Some(Menu { category, selected: -1, page: 0 });
         self.key_labels.clear();
+        self.game_modes(players);
+    }
+
+    /// Game modes of the players (menu open): who is in spectator mode now.
+    pub fn game_modes(&mut self, players: &PlayerList) {
+        if self.menu.is_none() {
+            return;
+        }
+        self.spectators.clear();
+        self.spectators.extend(players.map.iter().filter(|(_, p)| p.game_mode == 3).map(|(u, _)| *u));
     }
 
     /// Label of the key assigned to slot `slot` (`bound`: key name from the settings),
@@ -256,7 +271,7 @@ impl SpectatorUi {
         if item == Item::Empty {
             return Action::None;
         }
-        if m.selected != slot || !item.enabled() {
+        if m.selected != slot || !item.enabled(&self.spectators) {
             m.selected = slot;
             return Action::None;
         }
@@ -272,7 +287,12 @@ impl SpectatorUi {
                 };
                 *m = Menu { category, selected: -1, page: 0 };
             }
-            Item::Team(t) => *m = Menu { category: Category::Players(t.players), selected: -1, page: 0 },
+            // Members of the team in UUID order, like the player category.
+            Item::Team(t) => {
+                let mut players = t.players;
+                players.sort_by_key(|p| uuid_key(p.uuid));
+                *m = Menu { category: Category::Players(players), selected: -1, page: 0 };
+            }
             Item::Player(p) => return Action::Teleport(p.uuid),
             Item::Empty => {}
         }
@@ -283,6 +303,7 @@ impl SpectatorUi {
     pub fn hotbar_key(&mut self, slot: usize, players: &PlayerList, scores: &Scoreboard) -> Action {
         self.last_selection = Some(Instant::now());
         if self.menu.is_some() {
+            self.game_modes(players);
             self.select(slot as i32)
         } else {
             self.open(players, scores);
@@ -293,6 +314,7 @@ impl SpectatorUi {
     /// Middle button: uses the selected slot, or opens the menu.
     pub fn action_key(&mut self, players: &PlayerList, scores: &Scoreboard) -> Action {
         self.last_selection = Some(Instant::now());
+        self.game_modes(players);
         match &self.menu {
             Some(m) if m.selected != -1 => self.select(m.selected),
             Some(_) => Action::None,
@@ -307,7 +329,7 @@ impl SpectatorUi {
     pub fn scroll(&mut self, wheel: i32) {
         let Some(m) = &self.menu else { return };
         let mut s = m.selected + wheel;
-        while (0..=8).contains(&s) && !m.item(s).enabled() {
+        while (0..=8).contains(&s) && !m.item(s).enabled(&self.spectators) {
             s += wheel;
         }
         if (0..=8).contains(&s) {
@@ -367,7 +389,8 @@ impl SpectatorUi {
             }
             let x = cx - 90 + slot as i32 * 20 + 2;
             let iy = y + 3;
-            let b = if item.enabled() { 1.0 } else { 0.25 };
+            let on = item.enabled(&self.spectators);
+            let b = if on { 1.0 } else { 0.25 };
             let gray = a | (((b * 255.0) as u32) * 0x01_0101);
             let sprite = |gui: &mut Gui, name: &str| gui.sprite(name, f(x), f(iy), 16.0, 16.0, gray);
             match item {
@@ -393,7 +416,7 @@ impl SpectatorUi {
                 }
                 Item::Empty => {}
             }
-            if item.enabled() {
+            if on {
                 let key = self.key_label(slot, bound(slot), &gui.lang);
                 let kw = rc_text::width(gui, key);
                 gui.text(queue, key, f(x + 19 - 2 - kw), f(iy + 6 + 3), white, true, 0);
@@ -558,6 +581,23 @@ mod tests {
         assert_eq!(text(ui.key_label(0, "key.keyboard.f1", &lang)), "F1");
         assert_eq!(text(ui.key_label(0, "key.keyboard.unknown", &lang)), "Not Bound");
         assert_eq!(text(ui.key_label(8, "key.keyboard.f1", &lang)), "F1");
+    }
+
+    /// A player who switched to spectator mode after the menu opened can be selected but not
+    /// used; the members of a team are listed in UUID order.
+    #[test]
+    fn live_spectators_and_team_order() {
+        let mut ui = SpectatorUi { menu: Some(menu(3)), spectators: vec![1], ..Default::default() };
+        assert_eq!(ui.select(1), Action::None);
+        assert_eq!(ui.select(1), Action::None, "now spectating: no teleport");
+        ui.spectators.clear();
+        assert_eq!(ui.select(1), Action::Teleport(1));
+        let p = |u: u128| PlayerItem { uuid: u, name: format!("p{u}") };
+        let team = TeamItem { name: Component::text("t"), color: None, players: vec![p(9), p(1u128 << 127), p(4)], icon: 9 };
+        ui.menu = Some(Menu { category: Category::Teams(vec![team]), selected: 0, page: 0 });
+        assert_eq!(ui.select(0), Action::None);
+        let m = ui.menu.as_ref().expect("menu");
+        assert_eq!((m.item(0), m.item(1), m.item(2)), (Item::Player(p(1u128 << 127)), Item::Player(p(4)), Item::Player(p(9))));
     }
 
     #[test]

@@ -494,6 +494,18 @@ pub fn draw_tooltip(
 
 impl crate::App {
     /// Wheel in a container screen: choice of the hovered bundle's item (never the bar).
+    /// The wheel goes to the hovered bundle first (it shows items): container screens with
+    /// their own scrolling (merchant, stonecutter, loom) only get it otherwise.
+    pub(crate) fn bundle_takes_wheel(&self) -> bool {
+        let Some(gui) = self.renderer.as_ref().map(|r| &r.gui) else { return false };
+        let Some(m) = self.gui_mouse() else { return false };
+        let Some(slot) = self.screens.hovered_slot(gui, &self.inventory, m) else { return false };
+        let (_, slots, _, _) = crate::screens::current(&self.inventory);
+        let Some(st) = slots.get(slot).and_then(Option::as_ref) else { return false };
+        let ctx = Ctx { ids: &self.component_ids, data: &self.data };
+        ctx.bundle(st).is_some_and(|items| shown(items.len()) > 0)
+    }
+
     pub(crate) fn bundle_wheel(&mut self, delta: winit::event::MouseScrollDelta) {
         let (x, y) = match delta {
             winit::event::MouseScrollDelta::LineDelta(x, y) => (f64::from(x), f64::from(y)),

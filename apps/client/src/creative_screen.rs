@@ -240,7 +240,8 @@ impl CreativeScreen {
         }
     }
 
-    /// Scrollbar: press (true if the drag starts), movement.
+    /// Scrollbar: press (true if the drag starts), movement. The bar only follows the mouse once
+    /// it moves, not at the press.
     pub fn bar_press(&mut self, gui: &Gui, data: &rc_data::VersionData, mouse: (f32, f32)) -> bool {
         let (gx, gy) = origin(gui);
         let (mx, my) = (mouse.0 - gx as f32, mouse.1 - gy as f32);
@@ -248,7 +249,6 @@ impl CreativeScreen {
         let inside = (175.0..189.0).contains(&mx) && (18.0..130.0).contains(&my);
         if has_bar && inside && self.can_scroll(data) {
             self.bar_drag = true;
-            self.bar_motion(gui, mouse);
             return true;
         }
         false
@@ -506,26 +506,19 @@ impl CreativeScreen {
             decorate(gui, queue, c, x, y, (c.stack.count, false));
         }
         let Some((mx, my)) = mouse else { return };
-        // Tooltips: hovered tab, trash, item (§ 5, § 6.4).
-        if inv.carried.is_none() {
-            if let Some(k) = self.tab_hover(gui, data, (mx, my)) {
-                let t = rc_text::styled_chars(&rc_text::flatten(
-                    &Component::translate(tabs[k].title.clone(), vec![]),
-                    &gui.lang,
-                ));
-                let w = rc_text::width(gui, &t);
-                draw_tooltip(gui, queue, &[t], w, mx.floor() as i32, my.floor() as i32);
-                return;
-            }
-            if hover == Some(Hit::Trash) {
-                let t = rc_text::styled_chars(&rc_text::flatten(
-                    &Component::translate("inventory.binSlot", vec![]),
-                    &gui.lang,
-                ));
-                let w = rc_text::width(gui, &t);
-                draw_tooltip(gui, queue, &[t], w, mx.floor() as i32, my.floor() as i32);
-                return;
-            }
+        // Tooltips: hovered tab, trash (both even with an item carried), item (§ 5, § 6.4).
+        if let Some(k) = self.tab_hover(gui, data, (mx, my)) {
+            let t =
+                rc_text::styled_chars(&rc_text::flatten(&Component::translate(tabs[k].title.clone(), vec![]), &gui.lang));
+            let w = rc_text::width(gui, &t);
+            draw_tooltip(gui, queue, &[t], w, mx.floor() as i32, my.floor() as i32);
+            return;
+        }
+        if hover == Some(Hit::Trash) {
+            let t = rc_text::styled_chars(&rc_text::flatten(&Component::translate("inventory.binSlot", vec![]), &gui.lang));
+            let w = rc_text::width(gui, &t);
+            draw_tooltip(gui, queue, &[t], w, mx.floor() as i32, my.floor() as i32);
+            return;
         }
         if let (Some(h), None) = (hover, &inv.carried)
             && let Some(st) = self.stack_at(inv, h)
