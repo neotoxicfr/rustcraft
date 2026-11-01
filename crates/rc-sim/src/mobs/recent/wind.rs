@@ -228,6 +228,11 @@ impl Server {
                 Ent::Player => {
                     // W8c: impact point and cause (`fall_after_explosion`).
                     self.prog.expl_impact = Some((self.pos, self.prog.expl_cause_next.map(str::to_owned)));
+                    // Player's wind charge (not the breeze's): the fall that follows is bounded
+                    // to the height from here.
+                    let wind_charge = self.prog.expl_cause_next == Some("minecraft:wind_charge");
+                    let at = self.pos;
+                    self.life.vit.impulse_from_explosion(wind_charge, at);
                     if !(self.game_mode == 1 && self.flying) {
                         player_kb = Some(kb);
                     }

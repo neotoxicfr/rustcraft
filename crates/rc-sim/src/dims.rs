@@ -481,6 +481,7 @@ impl Server {
             };
             self.teleport_player(t);
             self.life.vit.fall = 0.0;
+            self.life.vit.impulse_reset();
             self.mobs.player_vel = [0.0; 3];
             // Player in the middle of a dimension change (not yet "loaded"): the game lets
             // only the pearl's damage through.

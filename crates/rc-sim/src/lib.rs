@@ -78,6 +78,8 @@ mod tests_g5f11;
 mod tests_g4f09; // G4-F09: turtle helmet, 1.21 effects, hurt sound, statistics
 #[cfg(test)]
 mod tests_g4f12; // G4-F12: iron and copper golems
+#[cfg(test)]
+mod tests_g5f02c; // G5-F02c: fall (wind charge, per-block rules, multiplier, sound, dust)
 pub mod randsrc;
 // Commands (S5).
 pub mod commands;

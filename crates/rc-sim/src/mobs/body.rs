@@ -233,8 +233,13 @@ impl Server {
         if lava_reset {
             m.fall_distance = 0.0;
         }
+        let before = m.fall_distance;
         if !m.in_water && mv[1] < 0.0 && !lava_reset {
             m.fall_distance -= f64::from(mv[1] as f32);
+        }
+        // Landing dust: before the block's rule, on the fall from before this movement.
+        if m.on_ground && before > 0.0 {
+            self.fall_dust(m.pos, effect_pos, before, m.attrs.safe_fall.value());
         }
         if m.on_ground && !lava_reset {
             if m.fall_distance > 0.0 {
@@ -451,17 +456,7 @@ impl Server {
     /// Fall sound of the block touched at 0.2 under the feet: volume ½,
     /// pitch ¾ of its sound set; nothing on air.
     pub(crate) fn mob_block_fall_sound(&mut self, m: &Mob) {
-        let below = super::mth::block_of([m.pos[0], m.pos[1] - 0.2, m.pos[2]]);
-        if self.is_air(below) {
-            return;
-        }
-        let st = self.st(below);
-        let Some(t) = self.data.states.get(st as usize).and_then(|i| self.data.sound_types.get(usize::from(i.sound)))
-        else {
-            return;
-        };
-        if !t.fall.is_empty() {
-            let (s, v, p) = (t.fall.clone(), t.volume * 0.5, t.pitch * 0.75);
+        if let Some((s, v, p)) = self.block_fall_sound_at(m.pos) {
             self.mob_sound(m, &s, v, p);
         }
     }
