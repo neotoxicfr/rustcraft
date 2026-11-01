@@ -338,7 +338,7 @@ impl Server {
         Some(id)
     }
 
-    pub(super) fn entity_box(e: &SimEntity) -> Aabb {
+    pub(crate) fn entity_box(e: &SimEntity) -> Aabb {
         let h = FALLING_SIZE / 2.0;
         Aabb { min: [e.pos[0] - h, e.pos[1], e.pos[2] - h], max: [e.pos[0] + h, e.pos[1] + FALLING_SIZE, e.pos[2] + h] }
     }
@@ -411,6 +411,7 @@ impl Server {
         if e.on_ground {
             e.fall = 0.0;
         }
+        self.sim_contacts(e, from);
         // The original block (`s`) is used for loot and for breaking even if the anvil got damaged on
         // landing (26.3); the current state (possibly damaged) is used for placement.
         let orig = s;
@@ -754,8 +755,10 @@ impl Server {
         if e.on_ground {
             e.fall = 0.0;
         }
-        // Portals touched by this movement, handled on the next tick.
+        // Gone elsewhere (removed): the blocks no longer have any effect.
         if !gone {
+            self.sim_contacts(e, from);
+            // Portals touched by this movement, handled on the next tick.
             self.sim_entity_portal_mark(e);
         }
         if !alive {
@@ -770,6 +773,14 @@ impl Server {
                 self.tnt_explode(e.id, c, 4.0, e.owner, wet, e.used_portal);
             }
         }
+    }
+
+    /// G5-F02e: plates and tripwire right after the movement from `from` (before the portal,
+    /// the landing or the explosion); the entity, taken out of the list, counts at its current box.
+    fn sim_contacts(&mut self, e: &SimEntity, from: [f64; 3]) {
+        self.contact.ticking_sim = Some((e.id, Self::entity_box(e)));
+        self.contact_triggers(from, e.pos, FALLING_SIZE / 2.0, FALLING_SIZE);
+        self.contact.ticking_sim = None;
     }
 
     /// TNT block blown up by an explosion: primed with a short fuse (10 to 29 ticks).
@@ -905,11 +916,46 @@ impl Server {
                     && hit(&m.bbox())
             })
             .count();
+        // G5-F02e: mob being ticked (taken out of the list) that touches a trigger block.
+        if let Some((id, mb, ignores)) = self.contact.ticking
+            && Some(id) != except
+            && !(triggers && ignores)
+            && hit(&mb)
+        {
+            n += 1;
+        }
         if !living {
-            n += self.bs.entities.list.iter().filter(|e| !e.removed && hit(&Self::entity_box(e))).count();
-            n += self.life.drops.iter().filter(|d| !d.is_removed() && hit(&around(d.pos, 0.25, 0.25))).count();
-            n += self.life.orbs.iter().filter(|o| !o.is_removed() && hit(&around(o.pos, 0.5, 0.5))).count();
-            n += self.proj.list.iter().filter(|p| !p.removed && hit(&p.bbox())).count();
+            let c = &self.contact;
+            // Falling block or TNT being ticked: its current box, not its stale slot.
+            let ts = c.ticking_sim;
+            n += self
+                .bs
+                .entities
+                .list
+                .iter()
+                .filter(|e| !e.removed && ts.is_none_or(|t| t.0 != e.id) && hit(&Self::entity_box(e)))
+                .count();
+            n += usize::from(ts.is_some_and(|t| hit(&t.1)));
+            // Items and orbs: during the tick of their list, positions kept up to date as the tick goes on.
+            n += if c.items_ticking {
+                c.live_items.iter().filter(|&&(pos, gone)| !gone && hit(&around(pos, 0.25, 0.25))).count()
+            } else {
+                self.life.drops.iter().filter(|d| !d.is_removed() && hit(&around(d.pos, 0.25, 0.25))).count()
+            };
+            n += if c.orbs_ticking {
+                c.live_orbs.iter().filter(|&&(pos, gone)| !gone && hit(&around(pos, 0.5, 0.5))).count()
+            } else {
+                self.life.orbs.iter().filter(|o| !o.is_removed() && hit(&around(o.pos, 0.5, 0.5))).count()
+            };
+            // Projectile being ticked: its current box, not its slot still at the old place.
+            let tp = c.ticking_proj;
+            n += self
+                .proj
+                .list
+                .iter()
+                .filter(|p| !p.removed && tp.is_none_or(|t| t.0 != p.id) && hit(&p.bbox()))
+                .count();
+            n += usize::from(tp.is_some_and(|t| hit(&t.1)));
             n += self.proj.clouds.iter().filter(|c| hit(&c.bbox())).count();
             n += self.mobs.mounts.spits.iter().filter(|s| hit(&around(s.pos, 0.25, 0.25))).count();
             // G5-F06: minecarts, the one being ticked included.
@@ -919,15 +965,16 @@ impl Server {
         n
     }
 
-    /// Plates under the player after an accepted movement.
-    pub(crate) fn player_touch_blocks(&mut self) {
+    /// Plates under the player after an accepted movement (feet from `from` to the position).
+    pub(crate) fn player_touch_blocks(&mut self, from: [f64; 3]) {
         let p = [self.pos[0].floor() as i32, self.pos[1].floor() as i32, self.pos[2].floor() as i32];
         for q in [p, below(p)] {
             if matches!(self.v().kind(self.get(q)), Kind::Plate { .. } | Kind::WeightedPlate { .. }) {
                 self.plate_entity_inside(q);
             }
         }
-        self.tripwire_entity_inside(p);
+        let (w, h, _) = self.player_dims();
+        self.tripwire_entity_inside(p, self.game_mode == 3, from, self.pos, w / 2.0, h, false);
         // G5-F09: big dripleaf under the feet (the full pass over crossed blocks, G5-F02,
         // calls it for all entities; a second call has no effect).
         if self.game_mode != 3 && self.v().kind(self.get(p)) == Kind::BigDripleaf {

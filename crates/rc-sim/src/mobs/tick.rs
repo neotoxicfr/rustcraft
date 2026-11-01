@@ -243,6 +243,7 @@ impl Server {
         m.pitch_o = m.pitch;
         m.head_yaw_o = m.head_yaw;
         m.tick_count += 1;
+        self.mob_boots_tick_effects(m); // G5-F02e: Soul Speed particles and sound
         // Base tick of the entity (F06: iron golem run particles first).
         self.golem_base_tick(m);
         m.was_eyes_in_water = m.eyes_in_water;
@@ -314,6 +315,7 @@ impl Server {
                 m.air =
                     super::brainy::max_air(m).map_or_else(|| super::sealife::increase_air(m), |x| (m.air + 4).min(x));
             }
+            self.mob_boots_location(m); // G5-F02e: Frost Walker, Soul Speed
         }
         if m.hurt_time > 0 {
             m.hurt_time -= 1;

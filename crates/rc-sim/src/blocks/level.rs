@@ -212,6 +212,13 @@ impl Server {
         self.bs.t.clone()
     }
 
+    /// Block of a state, like `v().block(s)` without copying the view (two atomic counters): for
+    /// loops that read many cells.
+    #[inline]
+    pub(crate) fn state_block(&self, s: u32) -> u16 {
+        self.data.states.get(s as usize).map_or(u16::MAX, |i| i.block)
+    }
+
     pub(crate) fn top_y(&self) -> i32 {
         self.dim.height.min_y + self.dim.height.sections as i32 * 16
     }

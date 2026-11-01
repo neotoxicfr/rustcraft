@@ -514,10 +514,11 @@ impl Server {
     }
 
     fn accept_move(&mut self, target: [f64; 3], on_ground: bool) {
+        let from = self.pos;
         self.pos = target;
         self.last_good = target;
         self.on_ground = on_ground;
-        self.player_touch_blocks();
+        self.player_touch_blocks(from);
     }
 
     /// Interaction reach: distance from the eyes to the block's box < reach + 1.

@@ -270,6 +270,10 @@ impl Server {
         if ty == "minecraft:fall" && m.kind.info().fall_immune {
             return false;
         }
+        // G5-F02e: Frost Walker, immunity to hot-floor damage.
+        if self.frost_walker_immune(m.equipment[2].as_ref(), ty) {
+            return false;
+        }
         // F14: linked creaking (damage diverted to its heart), buried warden, breeze among themselves.
         if let Some(r) = super::recent::before_hurt(self, m, ty, by) {
             return r;

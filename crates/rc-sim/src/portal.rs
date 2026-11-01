@@ -1187,14 +1187,21 @@ impl Server {
     // --- Entities. ---
 
     /// Portals touched by an entity `w`×`h` going from `from` to `to` during this tick
-    /// (the check of blocks passed through): cells swept along the path around the arrival box
-    /// shrunk by 1e-5; the shape of the End portal must be touched by the sliding box.
-    /// Each cell once, in sweep order. With no portal block in the box that
-    /// encloses the path (common case), nothing is swept.
-    pub(crate) fn portals_touched_swept(&self, from: [f64; 3], to: [f64; 3], w: f64, h: f64) -> Vec<Touch> {
-        let (np, ep, gw) =
-            (self.block_id_of("nether_portal"), self.block_id_of("end_portal"), self.block_id_of("end_gateway"));
-        let e = f64::from(1.0e-5f32);
+    /// (the check of blocks passed through): cells of the crossed-block walk, in a straight line
+    /// (`straight`: projectile that takes its position) or axis by axis (movement with collisions);
+    /// the shape of the End portal must be touched by the sliding box. Each portal once, in walk
+    /// order. With no portal block in the box that encloses the path (common case), nothing is
+    /// walked.
+    pub(crate) fn portals_touched_swept(
+        &self,
+        from: [f64; 3],
+        to: [f64; 3],
+        w: f64,
+        h: f64,
+        straight: bool,
+    ) -> Vec<Touch> {
+        // Ids kept by the table (no lookup by name on every call).
+        let (np, ep, gw) = (self.bs.t.id.nether_portal, self.bs.t.id.end_portal, self.bs.t.id.end_gateway);
         let at = ent_box(to, w, h);
         let start = ent_box(from, w, h);
         let lo = floor3(std::array::from_fn(|i| at.min[i].min(start.min[i])));
@@ -1202,32 +1209,31 @@ impl Server {
         if !self.portal_in_sections(lo, hi, [np, ep, gw]) {
             return Vec::new();
         }
-        let d = Aabb { min: at.min.map(|v| v + e), max: at.max.map(|v| v - e) };
-        let travel = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+        let mut cells = Vec::new();
+        crate::contact::path_cells(from, to, w / 2.0, h, straight, &mut cells);
         let mut out: Vec<Touch> = Vec::new();
-        crate::mobs::nether::ghast::each_cell_between(from, to, &d, &mut |p| {
-            let b = self.v().block(self.get(p));
-            let kind = if b == np {
+        for (p, a, b) in cells {
+            let block = self.state_block(self.get(p));
+            let kind = if block == np {
                 PortalKind::Nether
-            } else if b == gw {
+            } else if block == gw {
                 PortalKind::Gateway
-            } else if b == ep {
+            } else if block == ep {
                 let shape = Aabb {
                     min: [f64::from(p[0]), f64::from(p[1]) + 0.375, f64::from(p[2])],
                     max: [f64::from(p[0]) + 1.0, f64::from(p[1]) + 0.75, f64::from(p[2]) + 1.0],
                 };
-                if !crate::mobs::nether::ghast::collided_along(&start, travel, &[shape]) {
-                    return true;
+                if !crate::contact::touches(&shape, a, b, w / 2.0, h, straight) {
+                    continue;
                 }
                 PortalKind::End
             } else {
-                return true;
+                continue;
             };
             if !out.iter().any(|t| t.pos == p) {
                 out.push(Touch { kind, pos: p });
             }
-            true
-        });
+        }
         out
     }
 
@@ -1235,7 +1241,7 @@ impl Server {
     /// Read from the section's palette (single value or list of states), without reading its blocks;
     /// section without palette (direct identifiers): maybe. Absent chunk or section: no.
     fn portal_in_sections(&self, lo: P, hi: P, blocks: [u16; 3]) -> bool {
-        let is_portal = |s: u32| blocks.contains(&self.v().block(s));
+        let is_portal = |s: u32| blocks.contains(&self.state_block(s));
         let min_y = self.dim.height.min_y;
         let (sy0, sy1) = ((lo[1] - min_y).max(0) >> 4, (hi[1] - min_y) >> 4);
         for cx in lo[0] >> 4..=hi[0] >> 4 {
@@ -1545,7 +1551,7 @@ impl Server {
     /// Portals touched by the movement of this tick of a falling block or a TNT
     /// (application of block effects).
     pub(crate) fn sim_entity_portal_mark(&mut self, e: &crate::blocks::entities::SimEntity) {
-        let touched = self.portals_touched_swept(e.old, e.pos, 0.98, 0.98);
+        let touched = self.portals_touched_swept(e.old, e.pos, 0.98, 0.98, false);
         self.entity_portal_mark(e.id, &touched, ENTITY_COOLDOWN);
     }
 

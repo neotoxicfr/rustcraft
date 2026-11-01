@@ -33,6 +33,7 @@ pub mod version_info;
 pub mod world;
 // W8a: equipment attributes, client packets specific to singleplayer.
 pub mod attrs;
+pub mod contact; // G5-F02e: crossed blocks, enchanted boots
 mod solo_packets;
 // Survival loop (milestone 2, S2).
 pub mod book;
@@ -81,6 +82,8 @@ mod tests_g4f09; // G4-F09: turtle helmet, 1.21 effects, hurt sound, statistics
 mod tests_g4f12; // G4-F12: iron and copper golems
 #[cfg(test)]
 mod tests_g5f02c; // G5-F02c: fall (wind charge, per-block rules, multiplier, sound, dust)
+#[cfg(test)]
+mod tests_g5f02e; // G5-F02e: contacts with crossed blocks, enchanted boots
 pub mod randsrc;
 // Commands (S5).
 pub mod commands;

@@ -2693,3 +2693,56 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
 - Dolphin jump and follow: direction of the yaw (`mth::facing`, a four-entry table) instead of
   the direction closest to the velocity (six dot products): slightly less computation,
   behavior fixed; fingerprints unchanged.
+## G5-F02e: contacts with crossed blocks, enchanted boots (25/10, loaded machine)
+
+- Walk over the cells swept by a mob (`rc_sim::contact`, one-axis segments, cells deduplicated
+  in a reused vector, contact family read from a one-byte-per-block table built once): 78.6 ns
+  per tick and per mob in open air, 79.1 ns in a cobweb (bench `bench_mob_contacts`, best of
+  5 × 100,000); 500 mobs ≈ 40 µs per tick. No allocation per tick. Leads not retained for lack
+  of gain at this scale: skipping the walk of a motionless mob (the changes of blocks around it
+  would have to be tracked), spreading over several cores (the effects modify the world, game
+  order imposed), GPU not applicable. To re-measure on a quiet machine (scene with many mobs).
+- Player: one walk per tick (same costs); boots without Frost Walker or Soul Speed: immediate
+  exit, no query to the world.
+- Items and orbs (revision of 25/10): the deferral to the end of the list counted every item at
+  its end-of-tick position (difference on the weighted plate). Replaced by a contact right after
+  the movement of each item, the plate reading a copy of the positions (reused vector, filled
+  once per tick: a 32-byte copy per item, no allocation in steady state). Projectiles: contact
+  in the movement step, before the impact. Tripwire: swept box tested against its shape (six
+  comparisons per segment, only in a tripwire cell). Mob bench after the revision: 77.3 ns in
+  open air, 82.7 ns in a cobweb (noise of the loaded bench, same order as before). To
+  re-measure on a quiet machine (scene with many items).
+- Revision 2 (25/10 evening, loaded machine, best of 5 × 100,000, A/B alternated against HEAD):
+  exact game walk (straight line for projectiles, per-axis segments otherwise, cap of 16
+  iterations), fire and lava of projectiles on this walk. Correction alone, no lead: mob
+  82-83 ns (before 73-74), arrow step 329-338 ns (before 224-226) in open air in the section
+  of a row of plates, 546-552 ns right at the plates (before 393-394). Leads, each measured
+  alone then combined:
+  - contact family read from the table without copying the view (two atomic counters per
+    cell): mob 75-76 ns, arrow 287 ns. Kept.
+  - portals: ids held by the table instead of three lookups by name, block read without
+    copying the view (also in the palette scan): 65 → 24 ns per call (arrows, falling blocks,
+    TNT). Kept.
+  - walk through static dispatch (generic) instead of dynamic visit functions: walk alone
+    156 → 147 ns (6 cells). Kept.
+  - dedupe of the walk by a bit grid over the envelope (instead of a search in the list): walk
+    184 → 200-202 ns, loses. Kept behind `RUSTCRAFT_OPT_WALKGRID=1` (off by default) for the
+    quiet-machine bench.
+  - floor by integer truncation instead of `f64::floor`: loses (mob 82 ns against 72-74, walk
+    183-188 against 163-168, 3 alternated passes). Discarded: a switch would cost on every
+    call; to re-measure on a quiet machine.
+  - skipping the empty: scan of the palettes of the crossed sections (plate, tripwire, fire,
+    lava, wooden button families) before any walk. Empty section 44 ns against 254-260 without,
+    rich section (about forty states) 102 against 286-292; section with plates: +10 ns (273
+    against 262-264, 453-457 against 438-446). Kept, `RUSTCRAFT_OPT_CONTACTPAL=0` disables it.
+  - same scan for mobs: empty section 30 ns against 74, rich section 58 against 75, but +20 to
+    27 ns when the section has a contact block (open air near a cobweb 95-103 against 73-77, in
+    the cobweb 99-105 against 75-79). Gain depends on the scene: kept off,
+    `RUSTCRAFT_OPT_CONTACTPAL_MOBS=1` enables it, to be settled on the quiet-machine scenes.
+  Total retained against HEAD (2 alternated passes): mob 74-75 ns against 75-78 in open air, 73
+  against 76-78 in a cobweb; arrow in an empty section 45 ns against 222-225, rich section
+  103-106 against 463-466; section with plates 268-271 against 224-228 and 449 against 390-398
+  right at the plates (+14 to 19%: cost of the exact walk, 150 to 180 ns, that fidelity
+  requires; the other leads gain nothing there). A single thread (game order imposed, effects
+  on the world), GPU not applicable. No allocation per tick outside nearby portals. To
+  re-measure on a quiet machine (bow shooting scenes, Nether).

@@ -289,6 +289,29 @@ fn cobweb_nearly_stops_walking_and_falling() {
     assert!(walked > 0.0 && walked < 0.6, "cobweb {walked}");
 }
 
+/// Weaving (G5-F02e): the cobweb only slows down by 0.5 × 0.25 × 0.5, i.e. a step twice
+/// as long as at 0.25 on every tick (the speed restarts from zero in both cases).
+#[test]
+fn weaving_halves_cobweb_slowdown() {
+    let t = tables();
+    let w = Flat { t: &t, floor: STONE, extra: vec![([0, 0, 0], WEB), ([0, 1, 0], WEB)] };
+    let walk = |weaving: bool| {
+        let mut p = Player::new([0.5, 0.0, 0.5], 0.0, 0.0);
+        if weaving {
+            p.effects.set("minecraft:weaving", Some(0));
+        }
+        settle(&mut p, &w, &t);
+        let z0 = p.pos[2];
+        for _ in 0..3 {
+            p.tick(Input { forward: true, ..Default::default() }, &w, &t);
+        }
+        p.pos[2] - z0
+    };
+    let (plain, woven) = (walk(false), walk(true));
+    assert!(plain > 0.0, "cobweb {plain}");
+    assert!((woven / plain - 2.0).abs() < 1.0e-9, "cobweb {plain}, weaving {woven}");
+}
+
 /// One-block wall in front: auto-jump climbs onto it, otherwise one bumps into it.
 #[test]
 fn auto_jump_climbs_one_block() {

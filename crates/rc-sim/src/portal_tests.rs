@@ -621,7 +621,7 @@ fn bench_portal_sweep() {
         let t = std::time::Instant::now();
         for i in 0..n {
             let d = f64::from(i % 7) * 1.0e-3;
-            found += s.portals_touched_swept([from[0] + d, from[1], from[2]], to, 0.5, 0.5).len();
+            found += s.portals_touched_swept([from[0] + d, from[1], from[2]], to, 0.5, 0.5, true).len();
         }
         let ns = t.elapsed().as_nanos() as f64 / f64::from(n);
         eprintln!("portal survey {label}: {ns:.0} ns per call ({found} touched)");

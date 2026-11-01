@@ -528,6 +528,13 @@ impl Server {
             }
             self.late_effect(who, e, &mut out);
         }
+        // Contacts with the other crossed blocks (berries, cobweb, wither rose, cauldrons, plates,
+        // tripwire: `contact`), deferred effects after these ones; the rain, the extinguish sound
+        // and the return to rest below also see them.
+        match who {
+            Who::Player => self.player_contacts(),
+            Who::Mob(m) => self.mob_contacts(m),
+        }
         if self.who_fire(who) > 0 && self.who_in_rain(who) {
             self.who_clear_fire(who);
         }

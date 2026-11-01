@@ -468,6 +468,10 @@ impl Server {
         if self.abilities().invulnerable && !self.damage_tag(ty, "bypasses_invulnerability") {
             return true;
         }
+        // G5-F02e: Frost Walker, immunity to hot-floor damage.
+        if self.frost_walker_immune(self.slots[8].as_ref(), ty) {
+            return true;
+        }
         (self.damage_tag(ty, "is_fall") && !self.rule("minecraft:fall_damage", true))
             || (self.damage_tag(ty, "is_fire") && !self.rule("minecraft:fire_damage", true))
             || (self.damage_tag(ty, "is_drowning") && !self.rule("minecraft:drowning_damage", true))
@@ -1066,6 +1070,7 @@ impl Server {
                 self.hurt("minecraft:starve", 1.0);
             }
         }
+        self.player_boots_tick(); // G5-F02e: Frost Walker, Soul Speed
         if self.game_mode != 3 {
             self.environment_damage();
             self.player_step_on(); // block stepped on: magma, redstone ore
