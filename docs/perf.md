@@ -2522,3 +2522,21 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
 - Right to break on impact: the tag predicate is frozen as a `match` (no tag lookup at run
   time, test against the jar), the rule is read only when the block hit is a pot, a chorus
   flower or a speleothem. Multi-core and GPU not applicable (one-off event).
+
+## G4-F07a: simulated lead and the wandering trader's llamas (25/10, loaded machine)
+
+- Lead state boxed on the mob (`Option<Box<Leash>>`, 8 bytes per mob): a mob without a lead
+  pays one test per tick; no global structure to keep up to date.
+- Tick of a lead (bench `bench_leash_tick`, ignored by default, best of 5 × 2,000): taut
+  (spring) 64 to 66 ns, slack near the holder 63 ns (2 passes). Holder found through the
+  id index, knot through the decoration registry; reload by UUID through the UUID index.
+  Multi-core and GPU not applicable (a few held animals, sub-microsecond work). The
+  "animals held by X" sweeps (32-block cube) only serve clicks, snaps and knot removals:
+  linear walk kept (nothing measurable at this rate).
+- Fence knot: ordinary decoration filtered at write time (never saved, like the game);
+  no separate list (selectors, `/kill` and `/data` see it with no extra code).
+- Follow-up (lead zone read by the goals): home test added to the attack tests of the
+  targeting goals, to the chase without sight, to the "go to a block" searches and to the
+  bee goals. Without a home, it costs four `Option` tests (short-circuit before any
+  position); no structure added. Lead tick unchanged: 64 ns taut and slack (bench above,
+  loaded machine). Generic home in the field already present on every mob (no extra byte).

@@ -301,6 +301,9 @@ fn turn_to_statue(s: &mut Server, m: &mut Mob) {
     s.drop_preserved_equipment(m);
     m.removed = true;
     s.mob_sound(m, "minecraft:entity.copper_golem_become_statue", 1.0, 1.0);
+    // Held animal: the lead falls, the item only if the entity-drops rule allows it.
+    let drops = s.rule("minecraft:entity_drops", true);
+    s.leash_drop(m, true, drops);
 }
 
 impl Server {

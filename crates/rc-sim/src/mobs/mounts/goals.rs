@@ -98,8 +98,11 @@ fn register_llama(m: &mut Mob) {
     );
     if m.kind == Kind::TraderLlama {
         m.goals.add(1, panic(2.0, "minecraft:panic_causes"));
-        // Defense of the wandering trader (leash not simulated: never usable); zombies,
-        // illagers (none simulated).
+        // Defense of the wandering trader who holds it on a lead (G4-F07a); zombies, illagers.
+        m.targets.add(
+            1,
+            Goal::Mount(MGoal::DefendTrader { base: TBase::new(false, false), stamp: 0, by: None }),
+        );
         m.targets.add(2, nearest(Who::Zombie, true, 10));
         m.targets.add(2, nearest(Who::Illager, true, 10));
     }

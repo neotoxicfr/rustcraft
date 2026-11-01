@@ -465,8 +465,8 @@ impl Server {
         // The trader enters the world before its llamas (like the game).
         self.add_mob(t);
         for _ in 0..2 {
-            // Trader's llamas (F04): created, finalized ("event") and added; the leash
-            // that attaches them to the trader is not simulated.
+            // Trader's llamas (F04): created, finalized ("event"), added, then attached
+            // to the trader (G4-F07a; the link is sent to the client at spawn).
             if let Some(p) = self.trader_find_spawn(tp, 4) {
                 let yaw = super::super::mth::wrap(self.mobs.rng.next_float() * 360.0);
                 let pos = [f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5];
@@ -475,6 +475,10 @@ impl Server {
                 l.body_yaw = yaw;
                 let mut lg = super::super::spawn::Group::default();
                 self.finalize_spawn(&mut l, super::super::spawn::Reason::Event, &mut lg);
+                if let Some(u) = self.mobs.get(tid).map(|t| t.uuid) {
+                    use super::super::leash::{Anchor, Holder};
+                    self.leash_set(&mut l, Holder::Mob(tid), Anchor::Uuid(u), false);
+                }
                 self.add_mob(l);
             }
         }

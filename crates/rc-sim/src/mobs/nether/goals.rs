@@ -66,7 +66,7 @@ fn find_lava(s: &Server, m: &Mob, range: i32, vrange: i32) -> Option<[i32; 3]> {
                 let mut z = if x < r && x > -r { r } else { 0 };
                 while z <= r {
                     let p = [b[0] + x, b[1] + y - 1, b[2] + z];
-                    if super::strider::lava_target(s, p) {
+                    if super::super::goals::within_home(m, p) && super::strider::lava_target(s, p) {
                         return Some(p);
                     }
                     z = if z > 0 { -z } else { 1 - z };

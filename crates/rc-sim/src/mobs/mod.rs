@@ -22,6 +22,9 @@ pub(crate) mod illagers;
 pub(crate) mod index;
 pub(crate) mod interact; // G5-F03: name tag, egg, dyeing, cat and wolf
 pub(crate) mod jrand;
+pub(crate) mod leash; // G4-F07a: lead, fence knot
+#[cfg(test)]
+mod tests_leash;
 pub(crate) mod mob;
 pub(crate) mod mounts;
 pub(crate) mod mth;

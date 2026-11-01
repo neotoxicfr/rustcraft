@@ -725,8 +725,17 @@ impl Server {
         let mut all = now.clone();
         all.extend(self.life.drop_chunks.iter().copied());
         for c in all {
-            let mut ents: Vec<Nbt> =
-                self.entities.get(&c).map(|l| l.iter().map(|e| e.1.clone()).collect()).unwrap_or_default();
+            // Lead knot: never saved (the held mob recreates it on reload).
+            let mut ents: Vec<Nbt> = self
+                .entities
+                .get(&c)
+                .map(|l| {
+                    l.iter()
+                        .filter(|e| e.1.get("id").and_then(Nbt::as_str) != Some("minecraft:leash_knot"))
+                        .map(|e| e.1.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
             ents.extend(by_chunk.remove(&c).unwrap_or_default());
             let root = Nbt::Compound(vec![
                 ("DataVersion".into(), Nbt::Int(crate::chunk::DATA_VERSION)),

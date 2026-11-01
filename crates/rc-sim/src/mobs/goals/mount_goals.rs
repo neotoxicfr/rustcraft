@@ -23,6 +23,9 @@ pub enum MGoal {
     WolfTarget(Box<Goal>),
     /// The skeleton trap objective.
     Trap,
+    /// Trader llama held by its trader: targets the trader's last attacker (once
+    /// per hit, from the instant of the hit).
+    DefendTrader { base: super::TBase, stamp: i32, by: Option<Ent> },
 }
 
 impl MGoal {
@@ -30,7 +33,7 @@ impl MGoal {
         match self {
             MGoal::RunAround { .. } | MGoal::Caravan { .. } => MOVE,
             MGoal::Spit { .. } => MOVE | LOOK,
-            MGoal::LlamaHurtBy(_) | MGoal::WolfTarget(_) => TARGET,
+            MGoal::LlamaHurtBy(_) | MGoal::WolfTarget(_) | MGoal::DefendTrader { .. } => TARGET,
             MGoal::RandomStand { .. } | MGoal::Trap => 0,
         }
     }
@@ -52,7 +55,7 @@ fn quarter_range(m: &mut Mob, on: bool) {
 }
 
 impl Server {
-    pub(super) fn mount_can_use(&mut self, g: &mut MGoal, m: &mut Mob) -> bool {
+    pub(crate) fn mount_can_use(&mut self, g: &mut MGoal, m: &mut Mob) -> bool {
         match g {
             MGoal::RunAround { pos, .. } => {
                 if mounts::mob_controlled(m) || mounts::is_tamed(m) || m.mount.passengers.is_empty() {
@@ -91,6 +94,22 @@ impl Server {
                 r
             }
             MGoal::Trap => m.mount.trap && self.player_near_alive(m.pos, 10.0),
+            MGoal::DefendTrader { base, stamp, by } => {
+                let Some(super::super::leash::Holder::Mob(tid)) = super::super::leash::holder(m) else {
+                    return false;
+                };
+                let Some(t) = self.mobs.get(tid).filter(|t| t.kind == super::super::species::Kind::WanderingTrader)
+                else {
+                    return false;
+                };
+                let hurt = t.last_hurt_by_mob;
+                *by = hurt.map(|h| h.0);
+                let ts = hurt.map_or(0, |h| h.1);
+                match hurt {
+                    Some((who, _)) => ts != *stamp && self.target_can_attack(base, m, who, true, true),
+                    None => false,
+                }
+            }
         }
     }
 
@@ -121,10 +140,11 @@ impl Server {
                 r
             }
             MGoal::Trap => m.mount.trap && self.player_near_alive(m.pos, 10.0),
+            MGoal::DefendTrader { base, .. } => self.target_continue(base, m),
         }
     }
 
-    pub(super) fn mount_start(&mut self, g: &mut MGoal, m: &mut Mob) {
+    pub(crate) fn mount_start(&mut self, g: &mut MGoal, m: &mut Mob) {
         match g {
             MGoal::RunAround { speed, pos } => {
                 let (s, p) = (*speed, *pos);
@@ -142,12 +162,25 @@ impl Server {
                 self.goal_start(inner, m);
                 quarter_range(m, false);
             }
+            MGoal::DefendTrader { base, stamp, by } => {
+                m.target = *by;
+                if let Some(super::super::leash::Holder::Mob(tid)) = super::super::leash::holder(m)
+                    && let Some(t) = self.mobs.get(tid).filter(|t| t.kind == super::super::species::Kind::WanderingTrader)
+                {
+                    *stamp = t.last_hurt_by_mob.map_or(0, |h| h.1);
+                }
+                Self::target_start(base);
+            }
             _ => {}
         }
     }
 
     pub(super) fn mount_stop(&mut self, g: &mut MGoal, m: &mut Mob) {
         match g {
+            MGoal::DefendTrader { base, .. } => {
+                m.target = None;
+                base.target_mob = None;
+            }
             MGoal::Spit { target, attack_time, see, .. } => {
                 *target = None;
                 *see = 0;
@@ -185,7 +218,7 @@ impl Server {
                 quarter_range(m, false);
             }
             MGoal::Trap => self.trap_trigger(m),
-            MGoal::RandomStand { .. } => {}
+            MGoal::RandomStand { .. } | MGoal::DefendTrader { .. } => {}
         }
     }
 

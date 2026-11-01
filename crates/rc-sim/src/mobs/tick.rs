@@ -231,6 +231,10 @@ impl Server {
             m.removed = true;
             return;
         }
+        // G4-F07a: lead (end of the entity's base tick).
+        if m.leash.is_some() {
+            self.leash_tick(m);
+        }
         // Base tick of the living entity.
         if m.alive() {
             let eye = super::mth::block_of([m.pos[0], m.eye_y(), m.pos[2]]);
