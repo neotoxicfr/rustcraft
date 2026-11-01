@@ -1027,6 +1027,8 @@ pub struct Renderer {
     pub debug_lines: crate::debug_render::DebugLines,
     /// Adapter, effective presentation mode, indirect draw: F3 lines `system_specs`, `fps`.
     pub adapter_info: wgpu::AdapterInfo,
+    /// Vendor, API and driver in the game's words (F3 `system_specs`, F3+L system report).
+    pub gpu_text: crate::gpu_backend::GpuText,
     pub present_mode: wgpu::PresentMode,
     warned_surface: bool,
     /// Presentation modes offered by the surface (choice of vertical sync).
@@ -1328,7 +1330,8 @@ impl Renderer {
         let formats = init_gpu_formats(tables);
         // Order of the APIs according to the "graphics API" setting read at startup (Vulkan first by
         // default, arch § 8); RUSTCRAFT_BACKEND=vulkan|dx12 to force.
-        let crate::gpu_backend::Picked { surface, adapter, device, queue } = crate::gpu_backend::pick(&window);
+        let crate::gpu_backend::Picked { surface, adapter, device, queue, text: gpu_text } =
+            crate::gpu_backend::pick(&window);
         let info = adapter.get_info();
         // Features retained when the device was opened (`gpu_backend::open_device`).
         let features = device.features();
@@ -1749,6 +1752,7 @@ impl Renderer {
             cracks,
             debug_lines,
             adapter_info: info.clone(),
+            gpu_text,
             present_mode,
             warned_surface: false,
             present_modes_caps,

@@ -621,21 +621,17 @@ impl Server {
     /// (plates, tripwire, detector rail, cobweb and powder snow that entangle, cactus), then the
     /// deferred effects in the game's order: freezing, fire (ignition then damage of each fire),
     /// lava cauldron, water and powder snow cauldrons that extinguish; finally the fire state
-    /// (rain, extinguishing sound, −1 off fire). Not reproduced: bubble column, honey,
-    /// turtle eggs, stepped-on sculk sensor, big dripleaf (docs/gaps-client.md).
+    /// (rain, extinguishing sound, −1 off fire). A cart is not living: it never breaks turtle
+    /// eggs. Not reproduced: bubble column, honey, stepped-on sculk sensor, big dripleaf
+    /// (docs/gaps-client.md).
     pub(crate) fn cart_block_effects(&mut self, c: &mut Cart) {
         if c.removed {
             return;
         }
         if c.on_ground {
             let p = self.cart_on_pos(c, 0.2);
-            if matches!(self.bname(p), "minecraft:redstone_ore" | "minecraft:deepslate_redstone_ore") {
-                let s = self.st(p);
-                if !self.v().get_bool(s, "lit") {
-                    let ns = self.v().set_bool(s, "lit", true);
-                    self.set_block(p, ns, crate::blocks::flag::ALL);
-                }
-            }
+            let s = self.st(p);
+            self.redstone_ore_touch(p, s);
         }
         let was_on_fire = c.fire > 0;
         let before = c.fire;

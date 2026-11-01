@@ -377,9 +377,72 @@ pub(crate) fn clipboard() -> String {
     }
 }
 
+/// Read-only text in a frame (warnings): lines of 9 with a padding of 4, scrolled by the wheel
+/// (9 a notch), the vertical arrows with focus and its bar, drawn outside the frame on the right.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TextArea {
+    pub lines: Vec<Vec<StyledChar>>,
+    pub scroll: f64,
+    /// Mouse ordinate while the bar is held.
+    grab: Option<f32>,
+}
+
+impl TextArea {
+    const RATE: f64 = 9.0;
+
+    pub fn new(lines: Vec<Vec<StyledChar>>) -> TextArea {
+        TextArea { lines, ..Default::default() }
+    }
+
+    /// Height of the content, padding included.
+    pub fn content(&self) -> i32 {
+        9 * self.lines.len() as i32 + 8
+    }
+
+    fn max_scroll(&self, h: i32) -> f64 {
+        f64::from((self.content() - h).max(0))
+    }
+
+    pub fn set_scroll(&mut self, s: f64, h: i32) {
+        self.scroll = s.clamp(0.0, self.max_scroll(h));
+    }
+
+    /// Handle height: proportional, at least 32, at most the height − 8 (that bound wins).
+    fn bar_height(&self, h: i32) -> i32 {
+        (((h * h) as f32 / self.content() as f32) as i32).max(32).min(h - 8)
+    }
+
+    /// Handle top (whole steps of the scroll).
+    fn bar_y(&self, y: i32, h: i32) -> i32 {
+        let max = self.max_scroll(h) as i32;
+        if max == 0 { y } else { (self.scroll as i32 * (h - self.bar_height(h)) / max + y).max(y) }
+    }
+
+    /// Mouse on the bar (right of the frame, both horizontal bounds included).
+    fn over_bar(&self, (x, y, w, h): (i32, i32, i32, i32), m: (f32, f32)) -> bool {
+        let bx = (x + w) as f32;
+        m.0 >= bx && m.0 <= bx + 6.0 && m.1 >= y as f32 && m.1 < (y + h) as f32
+    }
+
+    /// Bar held: above the frame to the top, below it to the end, otherwise the motion scaled
+    /// by the ratio of the content to the free height.
+    fn drag(&mut self, (_, y, _, h): (i32, i32, i32, i32), my: f32) {
+        let Some(last) = self.grab.replace(my) else { return };
+        if my < y as f32 {
+            self.set_scroll(0.0, h);
+        } else if my > (y + h) as f32 {
+            self.set_scroll(self.max_scroll(h), h);
+        } else {
+            let k = (self.max_scroll(h).max(1.0) / f64::from(h - self.bar_height(h))).max(1.0);
+            self.set_scroll(self.scroll + f64::from(my - last) * k, h);
+        }
+    }
+}
+
 /// Kind of a component.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Kind {
+    TextArea(Box<TextArea>),
     Button,
     /// Cycle button "name: value" (§ 1.4): returns [`Event::Cycle`].
     Cycle,
@@ -683,6 +746,8 @@ impl Panel {
             return false;
         }
         let (x, y, ww, hh) = self.rect(w);
+        // A text area also answers over its bar.
+        let ww = if matches!(w.kind, Kind::TextArea(_)) { ww + 6 } else { ww };
         let (x, y, ww, hh) = (x as f32, y as f32, ww as f32, hh as f32);
         m.0 >= x && m.0 < x + ww && m.1 >= y && m.1 < y + hh
     }
@@ -816,6 +881,12 @@ impl Panel {
                 t.move_to(k, true);
             }
         }
+        for i in 0..self.widgets.len() {
+            let r = self.rect(&self.widgets[i]);
+            if let Kind::TextArea(a) = &mut self.widgets[i].kind {
+                a.drag(r, m.1);
+            }
+        }
         if self.bar_drag
             && let Some(l) = &mut self.list
         {
@@ -884,6 +955,7 @@ impl Panel {
         let double = self.last_click.is_some_and(|t| t.elapsed().as_millis() < 250);
         self.last_click = Some(Instant::now());
         let (id, wx, ww) = (self.widgets[i].id, self.rect(&self.widgets[i]).0, self.widgets[i].w);
+        let (wy, wh) = (self.rect(&self.widgets[i]).1, self.widgets[i].h);
         match &mut self.widgets[i].kind {
             Kind::Button | Kind::Icon(_) | Kind::IconText(..) | Kind::Sprite(_) => {
                 self.clicks += 1;
@@ -908,6 +980,13 @@ impl Panel {
                 t.click(m.0.floor() as i32 - wx, inner_width(t, ww), shift, double);
                 self.drag_field = Some(i);
             }
+            // Focus without a sound; the bar is held only when there is something to scroll.
+            Kind::TextArea(a) => {
+                let r = (wx, wy, ww, wh);
+                if a.max_scroll(wh) > 0.0 && a.over_bar(r, m) {
+                    a.grab = Some(m.1);
+                }
+            }
             Kind::Title | Kind::Label { .. } => {}
         }
     }
@@ -916,6 +995,11 @@ impl Panel {
     pub fn release(&mut self, out: &mut Vec<Event>) {
         self.bar_drag = false;
         self.drag_field = None;
+        for w in &mut self.widgets {
+            if let Kind::TextArea(a) = &mut w.kind {
+                a.grab = None;
+            }
+        }
         if let Some(i) = self.dragging.take() {
             self.clicks += 1;
             out.push(Event::SlideEnd(self.widgets[i].id));
@@ -929,6 +1013,13 @@ impl Panel {
         {
             l.set_scroll(l.scroll - dy * f64::from(l.step));
             return;
+        }
+        if let Some(i) = self.at(m) {
+            let h = self.widgets[i].h;
+            if let Kind::TextArea(a) = &mut self.widgets[i].kind {
+                a.set_scroll(a.scroll - dy * TextArea::RATE, h);
+                return;
+            }
         }
         if let Some(i) = self.at(m)
             && self.widgets[i].active
@@ -1005,6 +1096,17 @@ impl Panel {
             }
             KeyCode::ArrowUp | KeyCode::ArrowDown => {
                 let dir = if k == KeyCode::ArrowUp { -1 } else { 1 };
+                // Focused text area: scrolls by a line; at the end the arrow navigates.
+                if let Some(i) = self.focus {
+                    let h = self.widgets[i].h;
+                    if let Kind::TextArea(a) = &mut self.widgets[i].kind {
+                        let before = a.scroll;
+                        a.set_scroll(before + f64::from(dir) * TextArea::RATE, h);
+                        if a.scroll != before {
+                            return true;
+                        }
+                    }
+                }
                 if self.focus.is_none()
                     && let Some(l) = &mut self.list
                     && !l.entries.is_empty()
@@ -1115,6 +1217,14 @@ impl Panel {
         let w = &self.widgets[i];
         let c = match &w.kind {
             Kind::Label { .. } | Kind::Title => return,
+            // Only its bar changes the cursor, when there is something to scroll.
+            Kind::TextArea(a) => {
+                let r = self.rect(w);
+                if a.max_scroll(r.3) == 0.0 || !a.over_bar(r, m) {
+                    return;
+                }
+                if a.grab.is_some() { Cursor::ResizeNs } else { Cursor::Hand }
+            }
             _ if !w.active => Cursor::NotAllowed,
             Kind::Slider { .. } if self.dragging == Some(i) => Cursor::ResizeEw,
             Kind::Field(t) if !t.editable => Cursor::NotAllowed,
@@ -1189,6 +1299,33 @@ impl Panel {
                 gui.text(q, &w.msg, xf + 21.0, yf + 4.0, text_color, true, 0);
             }
             Kind::Field(t) => draw_field(gui, q, t, x, y, ww, hh, focused),
+            Kind::TextArea(a) => {
+                let frame = if focused { "widget/text_field_highlighted" } else { "widget/text_field" };
+                gui.sprite(frame, xf, yf, wf, hf, tint);
+                let old = gui.clip();
+                let r = [xf + 1.0, yf + 1.0, xf + wf - 1.0, yf + hf - 1.0];
+                gui.set_clip(Some(match old {
+                    Some(c) => [c[0].max(r[0]), c[1].max(r[1]), c[2].min(r[2]), c[3].min(r[3])],
+                    None => r,
+                }));
+                // Only the lines that cross the frame are drawn.
+                let top = yf + 4.0 - a.scroll as f32;
+                let first = (((a.scroll - 13.0) / 9.0).floor().max(0.0)) as usize;
+                let last = (((a.scroll + f64::from(hh)) / 9.0).ceil() as usize + 1).min(a.lines.len());
+                for (k, l) in a.lines.iter().enumerate().take(last).skip(first) {
+                    let ly = top + 9.0 * k as f32;
+                    if ly + 9.0 >= yf && ly <= yf + hf {
+                        gui.text(q, l, xf + 4.0, ly, tint, true, 0);
+                    }
+                }
+                gui.set_clip(old);
+                if a.max_scroll(hh) > 0.0 {
+                    let bx = (x + ww) as f32;
+                    gui.sprite("widget/scroller_background", bx, yf, 6.0, hf, 0xffff_ffff);
+                    let bh = a.bar_height(hh);
+                    gui.sprite("widget/scroller", bx, a.bar_y(y, hh) as f32, 6.0, bh as f32, 0xffff_ffff);
+                }
+            }
             Kind::Title => {
                 let msg = underlined_bold(&w.msg);
                 let tw = rc_text::width(gui, &msg);

@@ -697,21 +697,6 @@ pub fn custom_persistence(m: &Mob) -> bool {
     is_raider(m.kind) && m.ill.raid.is_some()
 }
 
-/// Damage bonus of the held weapon (`attack_damage` "add" modifiers of the right hand).
-pub fn weapon_attack_bonus(s: &Server, m: &Mob) -> f64 {
-    let Some(w) = m.equipment[0].as_ref() else { return 0.0 };
-    let Some(v) = s.life.items.default_component(w, "minecraft:attribute_modifiers") else { return 0.0 };
-    let list = v.as_array().cloned().unwrap_or_default();
-    list.iter()
-        .filter(|m| {
-            m["type"].as_str() == Some("minecraft:attack_damage")
-                && matches!(m["slot"].as_str().unwrap_or("any"), "mainhand" | "hand" | "any")
-                && m["operation"].as_str().unwrap_or("add_value") == "add_value"
-        })
-        .filter_map(|m| m["amount"].as_f64())
-        .sum()
-}
-
 impl Server {
     /// Equipment sent back to the client after a change.
     pub(crate) fn send_mob_equipment(&self, m: &Mob, slots: &[usize]) {

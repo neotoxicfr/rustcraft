@@ -2755,3 +2755,158 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   (JSON copy of a few fields, of the order of a microsecond, not measured separately); protection:
   a tag test up front that avoids walking the four pieces for `/kill` and the void.
   Multi-core and GPU not applicable (order of the random draws imposed, work of the order of one hit).
+
+## G6-F08: nature ticks and turtle eggs (01/11, loaded machine)
+
+Bench `bench_g6f08_scan_and_grass` (ignored; `--ignored bench_g6f08 --nocapture`), 2 passes each.
+
+- Box scan (`Server::scan_box`, shared by the spread limit of vines and mushrooms and the
+  eyeblossom wake-up, in the game's section/y/z/x order): one chunk lookup per section and direct
+  container reads instead of one `get` (hash lookup) per cell. Spread limit of a vine, 9 × 3 × 9
+  box, 10 % vines over 32 × 4 × 32: old walk 890-927 ns, scan 297-298 ns; lone vines in an empty
+  sky band: 1,829-1,863 ns against 476-477 ns. Kept.
+- Palette prefilter of the scan (skip a section whose palette cannot hold the block):
+  `RUSTCRAFT_OPT_SCAN_PALETTE=0` cuts it. Dense case unchanged (296-333 ns off against 297-298
+  on), sparse case 583-588 ns off against 476-477 on (−19 %). Kept on; to re-measure on a quiet
+  machine (jungle, pale garden scenes).
+- Grass, mycelium and nylium survival (`LightTables::dampening_into`: the face masks of the light
+  engine, pair table of occluded edges, then the attenuation table) instead of the old plain
+  attenuation read: 1.53-1.57 ns against 6.78-6.88 ns per test over the whole state table (the
+  old path read the 24-byte state info twice). Faithful and faster: kept, no switch.
+- Pointed dripstone fluid transfer (bench `bench_speleothem_random_tick_and_geyser`, top of a
+  dry stalactite): 24.4-24.6 ns per random tick, stone 23.4-23.9 ns in the same runs (25/10,
+  before the transfer: 15.6 against 21.7). 82 % of the draws leave on the first float compare;
+  otherwise the block above, then the cell above the root (no walk from the top). Lead measured
+  and discarded: reading the root directly instead of the walk of the shared helper, 24.4-24.8 ns
+  against 24.4-24.6 (3 alternated passes, nothing measurable). Multi-core and GPU not
+  applicable (one block per random tick, world random order).
+- Not hot, not optimised further: turtle egg (rare random ticks), eyeblossom (day time compare
+  first, scan only when it turns), copper (two property reads before the draw), pitcher crop and
+  mushroom (crop draw, 1/25 draw before any scan). Redstone ore
+  touch: 6 neighbour reads for the server's particle draws. Multi-core and GPU not applicable
+  (world random order imposed, work of a few hundred nanoseconds per event); no allocation per
+  tick (the eyeblossom wake-up list is allocated only when a flower turns).
+## G1-F16: F3 and debug lines (01/11, loaded machine)
+
+- Server values of the F3 screen in singleplayer (`rc_sim::debug_report`: server heightmaps,
+  forced chunks, sprint, local difficulty, spawn census): the screen posts its request only while
+  one of the five entries is shown, the server answers once per loop turn with the values of its
+  last tick. Micro-bench (`tests_g1f16::bench_debug_report`, 2 passes): values 36 ns, loop turn
+  without a request 3 ns, request + answer 47-48 ns; `Copy` report, no allocation per frame or per
+  tick (dimension names copied into kept buffers). Leads not taken: per-frame direct reads of the
+  server state (impossible without sharing the server's structures across threads, and the
+  answer already costs less than 50 ns); multi-core and GPU not applicable (a few lookups).
+  Census of the natural spawn pass kept in place (one name copy per tick into the same buffer).
+- The game's `%.Nf` rounding (`tech_blocks::java_fixed`, half up on the shortest digits) for the
+  reals of the F3 lines: 10 reals 1,116-1,143 ns against 1,168-1,255 ns for Rust's `{:.N}`
+  (`debug_screen::tests::bench_java_rounding`, 2 passes): no cost, kept. Only while F3 is open.
+- Adapter texts (vendor, API, driver) computed once at startup (`gpu_backend::GpuText`) instead
+  of every frame of the F3 screen; Vulkan API version read through wgpu's backend once (one
+  property read, no device call). No device refusal: the game's list only applies under MoltenVK,
+  absent from our builds.
+- Sounds line: two counters already kept up to date by the engine (no walk of the instances).
+- Screen frequency label (`video::rate_label`): one integer division and, for a fractional rate,
+  one `java_fixed` (about 110 ns per real in the bench above) per frame while the fps entry is
+  shown; not measured separately.
+- Fluid target: same walk as the block target, a second box per crossed block only for the fluid
+  entries; one ray of 20 blocks per frame and per entry, as before (not measured separately: the
+  walk is unchanged, the extra box test is of the order of ten ns). Shared walk (`pick::walk`,
+  generic, no indirect call) for the crosshair and the F3 rays.
+- To re-measure on a quiet machine: F3 open in singleplayer (frame time against main), scene bench
+  `tools/bench/scenes.py` (F3 closed: no change expected, nothing is computed).
+## G2-F11: inventory screens, recipe book, option menus (01/11, loaded machine)
+
+Interface code driven by input events or by a screen tick; nothing in a world loop. Axes reviewed
+(client CPU, regularity, allocations, network, RAM): no per-frame allocation added, no measurable
+cost; scene bench not run (no client during the series, `menu`/`inventory` scenes to re-measure
+on a quiet machine with the others).
+
+- Recipe book: the open setting is sent only when the visibility changes (as before for the
+  button; one more packet when the server changes the setting, which the game also sends back).
+  Tab bounce: the check walks the tab collections only when the book shows or a book packet
+  arrives (`retab`), then a sine per bouncing tab per frame. Shaped thumbnails: one offset pair
+  per recipe instead of none (two comparisons). The vertically stretched tab icon reuses the
+  item atlas cell (`Gui::item_stretched`, same quad as the uniform scale).
+- Warning text area (`widgets::TextArea`): lines wrapped once per layout; each frame only the
+  lines crossing the frame are walked (index range from the scroll, then the clip test), instead
+  of all of them; no allocation per frame.
+- Social interactions: chat log as a 1024-entry ring (`VecDeque`, one `None` per chat line, no
+  allocation for system lines); the list is rebuilt only on layout (tab, search, size), with the
+  senders gathered once into a hash set before the sort (instead of a log walk per comparison).
+- Spectator menu: game modes read again per tick only while the menu is open (one pass over
+  the player list, buffer reused).
+- Multi-core and GPU not applicable (a few dozen elements per event, order imposed by the screen).
+## G5-F05: orbs, ground items, display and interaction entities (01/11, loaded machine)
+
+- Crossed-block pass of ground items and orbs (new, `rc_sim::inside_blocks`, every tick and per
+  item or orb): bench `g5f05_bench` (loaded machine, 2 alternated runs, 200,000 passes), full
+  pass 176 to 186 ns at rest on an open floor, 176 to 197 ns next to a cactus, 217 to 242 ns
+  sliding. Leads:
+  - skipping the empty: a non-burning item or orb can only be acted on by fire, soul fire,
+    cactus and lava (water, powder snow and rain only put out, the campfire and the freezing are
+    for the living); none of them in the cells of the envelope of its movements (at most 64
+    cells, otherwise the full pass): nothing to do. 45 to 48 ns. Kept,
+    `RUSTCRAFT_OPT_ITEM_INSIDE_FULL=1` gives the full pass back.
+  - decision before taking the buffers out and copying the movements (read in place from the
+    physics body): 45 to 48 -> 27 to 29 ns (all three cases). Kept (×6.5 against the full pass).
+  - equivalence: `inert_item_shortcut_matches_full_pass` (720 starts around fire, cactus,
+    lava, water, at rest, falling, burning: same state with and without the shortcut; 360
+    skipped and sum of the outcomes stored).
+  - not retained: remembering that a resting item's cells did not change (block-change
+    tracking needed for two cell reads, about 20 ns); several cores (effects on the world in the
+    game's order) and GPU not applicable.
+- Periodic orb merging (new, one scan per orb every 20 ticks): whole list O(n) per scan; lead:
+  candidates bucketed by identifier modulo 40 (the only ones that can merge), buckets rebuilt
+  once per orb tick in a reused buffer. Bench at the game's rhythm (2 runs, a twentieth of the
+  orbs scanning each tick, buckets rebuilt each tick): 20 orbs 0.02-0.03 µs whole list against
+  0.04 µs buckets (loses), 100 orbs 0.38-0.39 against 0.17-0.28, 1,000 orbs 34.1 against
+  3.3-4.4 (×8 to ×10). Kept from 40 orbs on (`ORB_BUCKETS_FROM`), whole list below;
+  `RUSTCRAFT_OPT_ORB_MERGE_LINEAR=1` forces the whole list. Equivalence:
+  `orb_merge_buckets_match_whole_list` (600 orbs in 2 × 2 blocks, 421 merged, same outcome per
+  orb). Spatial grid not tried (residues already leave a few candidates per scan).
+- Mending, interaction, marker, shears: event code (one pickup, one click, one break), no
+  loop per tick; Mending reads the enchantment definitions of at most six equipped stacks.
+- Display data: decoded when the entity is announced (summon, chunk sent, `/data`), never per
+  tick. A matrix transformation goes through the game's SVD (5 Jacobi sweeps, 3 Givens steps:
+  a few hundred float operations), bit-identical to the game (`svd_matches_the_game_bit_for_bit`,
+  14 matrices computed by the game's code). Not cached: a few displays per chunk at most in the
+  bench scenes; to measure on a map with thousands of displays (cache of the decomposition by
+  entity, or the decomposed form written at save time like the game).
+- Ground item and orb fire: one integer test per tick when not burning; the lava test (fluid
+  scan of the box) only on the ticks where the burn point falls (every 20 ticks while burning).
+- Quiet-machine bench to do: scene with many items (item farm) and orbs (XP farm), before/after.
+## G5-F04: mace, thorns of mobs, equipment modifiers of mobs, enchantment effects (01/11, loaded machine)
+
+- Equipment modifiers of mobs (`rc_sim::mobs::gear`, every tick of every mob, like the game):
+  nothing worn and nothing seen = immediate exit (8 empty slots tested, no allocation, the
+  previous state is not even allocated: `Option<Box<…>>`, 8 bytes per mob); worn equipment =
+  8 stack comparisons, the modifiers recomputed only for a changed slot (allocation on change
+  only). Bench `bench_g5f04_gear_and_post_attack` (5 passes, loaded machine): 2.6-2.8 ns per tick
+  without equipment, 27-29 ns with full iron armor and a sword (500 armored mobs ≈ 14 µs per
+  tick). Leads considered: tracking at the
+  mutation sites instead of comparing (dozens of scattered writes to `equipment`, risk of a
+  forgotten site: rejected for robustness, the comparison costs a few ns); hash of the slots
+  (would cost as much as the comparison of short ids). Multi-core and GPU not applicable (part
+  of the mob's own tick, already ordered).
+- After-hit effects (`rc_sim::ench_fx`, event code: one landed hit), same bench: victim without
+  equipment 4.8 ns; full unenchanted iron armor 302-316 ns with the first filter (the item's default
+  component copied, key formatted), 155-161 ns once the default enchantments are read in place
+  (kept: −49%); a thorns chestplate that does not trigger 552-563 → 418-432 ns (−23%). Lead not
+  tried (shared `Items` API): a per-item flag "default enchantments non-empty" would avoid the
+  global lock of the defaults cache for every piece (≈ 30 ns each), to measure on a quiet machine.
+  Only the enchanted pieces
+  are copied (component present), the definitions are read from the pack (`Arc`), the conditions
+  go through the loot condition evaluator; Thorns of the player: same random draws as the former
+  hand-written code (G5-F02d tests unchanged). Protection of mobs: immediate exit without
+  equipment (the common case), otherwise one component read per piece (the former code read five
+  enchantments per piece).
+- Mace smash: event code (one hit), area knockback over the mob list once.
+- Sweep: the weapon's bonus is computed per swept mob (one more enchantment read per target).
+- Review (01/11): after-hit effects added on the dragon's wing and bite hits on mobs (one
+  `post_attack` per mob struck, plus one copy of the dragon state per hit so that a thorns
+  reaction sees it; event code, a few mobs per hit at most), on the player's hits on armor
+  stands, minecarts, crystals and other local-network players (weapon only: no equipment walk),
+  and on a projectile that hits its own shooter; the spin attack now goes through the player's
+  melee path (one hit per spin). No hot path touched: the per-tick and per-hit costs above are
+  unchanged (same bench, the mob melee path is identical). Multi-core and GPU not applicable
+  (single events, ordered by the game).

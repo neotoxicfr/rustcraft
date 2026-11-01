@@ -284,6 +284,10 @@ impl Server {
                 write_varint(w, 6);
                 opt_nbt(w, t.as_ref());
             }
+            Meta::Component(t) => {
+                write_varint(w, 5);
+                nbt::write(w, Some(t));
+            }
             Meta::Item(s) => {
                 write_varint(w, 7);
                 stack(w, s.as_ref());
@@ -319,6 +323,10 @@ impl Server {
             Meta::BlockState(s) => {
                 write_varint(w, 15);
                 write_varint(w, s.unwrap_or(0));
+            }
+            Meta::State(s) => {
+                write_varint(w, 14);
+                write_varint(w, *s);
             }
             Meta::Particle(p) => {
                 write_varint(w, 16);

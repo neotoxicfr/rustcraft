@@ -53,6 +53,10 @@ pub fn level_value(v: &Value, lvl: i32) -> f32 {
             if d == 0.0 { 0.0 } else { level_value(&v["numerator"], lvl) / d }
         }
         "levels_squared" => (lvl * lvl) as f32 + f("added"),
+        // Power computed in double precision, then narrowed (G5-F04).
+        "exponent" => {
+            f64::from(level_value(&v["base"], lvl)).powf(f64::from(level_value(&v["power"], lvl))) as f32
+        }
         "lookup" => {
             let vals = v["values"].as_array().map(Vec::as_slice).unwrap_or(&[]);
             match vals.get((lvl - 1).max(0) as usize) {
@@ -62,6 +66,39 @@ pub fn level_value(v: &Value, lvl: i32) -> f32 {
         }
         _ => 0.0,
     }
+}
+
+/// Java rounding of a double to the nearest integer, halves towards +∞ (exact near 0.5).
+pub fn java_round_f64(x: f64) -> i64 {
+    let f = x.floor();
+    (if x - f >= 0.5 { f + 1.0 } else { f }) as i64
+}
+
+/// `n` minus the successes of `n` trials of chance `p`. Beyond 128 trials with at least 20
+/// expected successes and failures, the game draws a normal approximation (one Gaussian draw,
+/// rounded, clamped to `[0, n]`); otherwise one draw per trial (`y < n` compared in float).
+pub fn remove_binomial(p: f32, n: f32, rng: &mut dyn crate::randsrc::Rand) -> f32 {
+    use std::cmp::Ordering::{Equal, Less};
+    // Negated tests, true for a NaN like the game's.
+    let not_le = |a: f32, b: f32| !matches!(a.partial_cmp(&b), Some(Less | Equal));
+    let not_lt = |a: f32, b: f32| !matches!(a.partial_cmp(&b), Some(Less));
+    let drop = if not_le(n, 128.0) && not_lt(n * p, 20.0) && not_lt(n * (1.0 - p), 20.0) {
+        let miu = f64::from(n * p).floor();
+        let sigma = f64::from(n * p * (1.0 - p)).sqrt();
+        let d = java_round_f64(miu + rng.next_gaussian() * sigma) as i32;
+        d.clamp(0, n as i32)
+    } else {
+        let mut d = 0;
+        let mut y = 0i32;
+        while (y as f32) < n {
+            if rng.next_float() < p {
+                d += 1;
+            }
+            y += 1;
+        }
+        d
+    };
+    n - drop as f32
 }
 
 impl Server {
@@ -143,20 +180,16 @@ impl Server {
     }
 
     /// Value effect applied to `v`.
-    fn value_effect(&self, e: &Value, lvl: i32, v: f32, rng: &mut dyn crate::randsrc::Rand) -> f32 {
+    pub(crate) fn value_effect(&self, e: &Value, lvl: i32, v: f32, rng: &mut dyn crate::randsrc::Rand) -> f32 {
         match e["type"].as_str().unwrap_or("").trim_start_matches("minecraft:") {
             "add" => v + level_value(&e["value"], lvl),
             "multiply" => v * level_value(&e["factor"], lvl),
             "set" => level_value(&e["value"], lvl),
-            "remove_binomial" => {
-                let chance = level_value(&e["chance"], lvl);
-                let mut out = v;
-                for _ in 0..(v as i32) {
-                    if rng.next_float() < chance {
-                        out -= 1.0;
-                    }
-                }
-                out
+            "remove_binomial" => remove_binomial(level_value(&e["chance"], lvl), v, rng),
+            // G5-F04: `v × base^exponent`, the power in double precision.
+            "exponential" => {
+                let p = f64::from(level_value(&e["base"], lvl)).powf(f64::from(level_value(&e["exponent"], lvl)));
+                (f64::from(v) * p) as f32
             }
             "all_of" => {
                 let mut out = v;
@@ -170,7 +203,7 @@ impl Server {
     }
 
     /// Enchantments of the stack, in component order, with their definition.
-    fn ench_defs(&self, s: &Stack) -> Vec<(i32, std::sync::Arc<Value>)> {
+    pub(crate) fn ench_defs(&self, s: &Stack) -> Vec<(i32, std::sync::Arc<Value>)> {
         crate::enchanting::read_comp(&self.life.items, s, "minecraft:enchantments")
             .into_iter()
             .filter_map(|(id, l)| Some((l, self.life.pack.get("enchantment", &id)?)))

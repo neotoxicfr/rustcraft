@@ -12,6 +12,10 @@ offers no hardware adapter compatible with the window (`apps/client/src/gpu_back
   APIs would be initialised on every launch.
 - So we try each API alone, in order. The first one that yields a hardware adapter wins. A software
   adapter (WARP, lavapipe) is used only as a last resort.
+- No Vulkan device is refused. The game's "known problematic" list (old Intel integrated GPUs,
+  generations 7 and 8) applies only under MoltenVK (Vulkan driver identifier 14, Vulkan over
+  Metal on macOS); our Windows and Linux builds never go through MoltenVK, so the refusal has no
+  case to apply to. To add with a macOS build that uses MoltenVK.
 - DX12 shader compiler pinned to **FXC**. By default, wgpu picks `dxcompiler.dll` if it finds one
   on the PATH. The result would then depend on the machine, and the 1.8.2502 DLL from the Windows
   SDK **crashes** on debug labels containing non-ASCII characters (seen on 17/10).

@@ -13,6 +13,7 @@ use crate::widgets::{self, Event, Kind, Panel, Widget, chars, tr};
 pub const ACCEPT: u32 = 1;
 pub const REFUSE: u32 = 2;
 const CHECK: u32 = 3;
+const MESSAGE: u32 = 4;
 
 /// Centered "title, message, checkbox, buttons" warning (§ 3.16).
 #[derive(Debug, Clone, PartialEq)]
@@ -27,29 +28,34 @@ pub struct Notice {
     pub kind: NoticeKind,
     pub panel: Panel,
     size: (i32, i32),
-    lines: Vec<Vec<StyledChar>>,
     title_y: i32,
-    text_x: i32,
-    text_y: i32,
 }
 
 /// Reply to a warning: accepted, checkbox ticked.
 pub type Answer = (bool, bool);
 
+/// Colour of the online play checkbox label (the code of conduct keeps the default white).
+const SAFETY_CHECK_COLOR: u32 = 0xE0E0E0;
+
 impl Notice {
     pub fn new(kind: NoticeKind) -> Notice {
-        Notice { kind, panel: Panel::default(), size: (-1, -1), lines: Vec::new(), title_y: 0, text_x: 0, text_y: 0 }
+        Notice { kind, panel: Panel::default(), size: (-1, -1), title_y: 0 }
     }
 
-    /// Layout: centered column, spacing 8; message cut at `width − 100` (margin 12).
     pub fn layout(&mut self, gui: &Gui) {
         let size = (gui.width as i32, gui.height as i32);
-        if self.size == size {
-            return;
+        if self.size != size {
+            self.arrange(gui, &gui.lang, size);
         }
+    }
+
+    /// Centered column, spacing 8: title, message in a framed text area `width − 100` wide
+    /// (margin 12) cut to its lines, or `height − 100` high and scrolled when longer;
+    /// checkbox, buttons. Focus order: message, checkbox, buttons.
+    fn arrange(&mut self, m: &dyn rc_text::Metrics, lang: &rc_text::Lang, size: (i32, i32)) {
         self.size = size;
         let (w, h) = size;
-        let t = |k: &str| tr(&gui.lang, k, &[]);
+        let t = |k: &str| tr(lang, k, &[]);
         let (message, check, yes, no) = match &self.kind {
             NoticeKind::Multiplayer => {
                 (t("multiplayerWarning.message"), t("multiplayerWarning.check"), t("gui.proceed"), t("gui.back"))
@@ -58,27 +64,36 @@ impl Notice {
                 (text.clone(), t("multiplayer.codeOfConduct.check"), t("gui.acknowledge"), t("menu.disconnect"))
             }
         };
-        let text_w = w - 100 - 8;
-        let max_lines = ((h - 100 - 8) / 9).max(1) as usize;
-        self.lines = rc_text::wrap(gui, &chars(&message), text_w as f32);
-        self.lines.truncate(max_lines);
-        let msg_h = 9 * self.lines.len() as i32 + 8;
-        let total = 9 + 8 + (msg_h + 24) + 8 + 17 + 8 + 20;
+        let area_w = w - 100;
+        let mut area = widgets::TextArea::new(rc_text::wrap(m, &chars(&message), (area_w - 8) as f32));
+        let area_h = area.content().min(h - 100);
+        let old = self.panel.get(MESSAGE).and_then(|w| match &w.kind {
+            Kind::TextArea(a) => Some(a.scroll),
+            _ => None,
+        });
+        area.set_scroll(old.unwrap_or(0.0), area_h);
+        let total = 9 + 8 + (area_h + 24) + 8 + 17 + 8 + 20;
         let top = (h - total) / 2;
         self.title_y = top;
-        self.text_x = 50 + 4;
-        self.text_y = top + 9 + 8 + 12 + 4;
-        let check_y = top + 9 + 8 + msg_h + 24 + 8;
-        let cw = 17 + 4 + rc_text::width(gui, &chars(&check));
+        let check_y = top + 9 + 8 + area_h + 24 + 8;
+        let mut label = chars(&check);
+        if self.kind == NoticeKind::Multiplayer {
+            for c in &mut label {
+                c.style.color.get_or_insert(SAFETY_CHECK_COLOR);
+            }
+        }
+        let cw = 17 + 4 + rc_text::width(m, &label);
         let checked = self.panel.get(CHECK).is_some_and(|c| matches!(c.kind, Kind::Checkbox { checked: true }));
         let by = check_y + 17 + 8;
-        let keyboard = self.panel.keyboard;
+        let (keyboard, focus) = (self.panel.keyboard, self.panel.focus);
         self.panel = Panel::new(vec![
-            Widget::new(CHECK, Kind::Checkbox { checked }, (w - cw) / 2, check_y, cw, 17, chars(&format!("§7{check}"))),
+            Widget::new(MESSAGE, Kind::TextArea(Box::new(area)), (w - area_w) / 2, top + 9 + 8 + 12, area_w, area_h, Vec::new()),
+            Widget::new(CHECK, Kind::Checkbox { checked }, (w - cw) / 2, check_y, cw, 17, label),
             Widget::button(ACCEPT, w / 2 - 154, by, 150, &yes),
             Widget::button(REFUSE, w / 2 + 4, by, 150, &no),
         ]);
         self.panel.keyboard = keyboard;
+        self.panel.focus = focus;
     }
 
     /// Button pressed: (accepted, checkbox ticked).
@@ -107,9 +122,6 @@ impl Notice {
         };
         let title = chars(&format!("§l{}", tr(&gui.lang, key, &[])));
         widgets::centered(gui, q, &title, gui.width as i32 / 2, self.title_y, 0xffff_ffff);
-        for (k, l) in self.lines.iter().enumerate() {
-            gui.text(q, l, self.text_x as f32, (self.text_y + 9 * k as i32) as f32, 0xffff_ffff, true, 0);
-        }
         self.panel.draw(gui, q, mouse, time);
     }
 }
@@ -380,5 +392,87 @@ impl crate::App {
             self.front.kicked = Some(rc_text::Component::translate("multiplayer.disconnect.code_of_conduct", vec![]));
             self.session_end("code of conduct refused");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Dummy metrics: 6 px per character, 4 px for the space.
+    struct Fixed;
+    impl rc_text::Metrics for Fixed {
+        fn advance(&self, _font: &str, c: char) -> (f32, f32) {
+            (if c == ' ' { 4.0 } else { 6.0 }, 1.0)
+        }
+    }
+
+    fn lang() -> rc_text::Lang {
+        rc_text::Lang::load(br#"{"multiplayerWarning.check":"Do not show this screen again"}"#, None, None)
+    }
+
+    fn area(n: &Notice) -> (&Widget, &widgets::TextArea) {
+        let w = n.panel.get(MESSAGE).expect("message area");
+        let Kind::TextArea(a) = &w.kind else { panic!("not a text area") };
+        (w, a)
+    }
+
+    /// Short message: framed area cut to its lines; long one: `height − 100` high and scrolled
+    /// (wheel, arrows with focus, bar held), the whole text kept.
+    #[test]
+    fn warning_message_is_framed_and_scrolls() {
+        let mut n = Notice::new(NoticeKind::Conduct("Be nice.".into()));
+        n.arrange(&Fixed, &lang(), (400, 300));
+        let (w, a) = area(&n);
+        assert_eq!((w.x, w.w, w.h, a.lines.len()), (50, 300, 17, 1));
+        assert_eq!(w.y, n.title_y + 9 + 8 + 12);
+        let long = vec!["word"; 400].join(" ");
+        let mut n = Notice::new(NoticeKind::Conduct(long));
+        n.arrange(&Fixed, &lang(), (400, 200));
+        let (w, a) = area(&n);
+        let (x, y, h, lines) = (w.x, w.y, w.h, a.lines.len());
+        assert_eq!(h, 100, "height − 100");
+        assert!(9 * lines as i32 + 8 > 100 && lines > 20, "nothing cut: {lines} lines");
+        let max = f64::from(9 * lines as i32 + 8 - 100);
+        let scroll = |n: &Notice| area(n).1.scroll;
+        let mut ev = Vec::new();
+        n.panel.wheel((x as f32 + 10.0, y as f32 + 10.0), -1.0, &mut ev);
+        assert_eq!(scroll(&n), 9.0);
+        // Over the bar (right of the frame) the wheel scrolls too.
+        n.panel.wheel((x as f32 + 300.0 + 3.0, y as f32 + 10.0), -2.0, &mut ev);
+        assert_eq!(scroll(&n), 27.0);
+        n.panel.wheel((x as f32 + 10.0, y as f32 + 10.0), 10.0, &mut ev);
+        assert_eq!(scroll(&n), 0.0);
+        let none = winit::keyboard::ModifiersState::empty();
+        n.panel.key(winit::keyboard::KeyCode::Tab, none, &mut ev);
+        assert_eq!(n.panel.focus, Some(0), "the message takes the focus first");
+        assert!(n.panel.key(winit::keyboard::KeyCode::ArrowDown, none, &mut ev));
+        assert_eq!(scroll(&n), 9.0);
+        // Bar: 10 px down moves by 10 × content / free height.
+        n.panel.press((x as f32 + 302.0, y as f32 + 5.0), 0, false, &mut ev);
+        n.panel.motion((x as f32 + 302.0, y as f32 + 15.0), &mut ev);
+        let bar = (100 * 100 / (9 * lines as i32 + 8)).max(32);
+        let k = (max / f64::from(100 - bar)).max(1.0);
+        assert!((scroll(&n) - (9.0 + 10.0 * k)).abs() < 1e-3, "{} vs {}", scroll(&n), 9.0 + 10.0 * k);
+        n.panel.motion((x as f32 + 302.0, y as f32 + 150.0), &mut ev);
+        assert_eq!(scroll(&n), max, "below the frame: to the end");
+        n.panel.release(&mut ev);
+        n.panel.motion((x as f32 + 302.0, y as f32 - 50.0), &mut ev);
+        assert_eq!(scroll(&n), max, "released: no more drag");
+        // A new layout keeps the scroll.
+        n.arrange(&Fixed, &lang(), (400, 201));
+        assert_eq!(scroll(&n), max - 1.0, "clamped to the new maximum");
+    }
+
+    /// Checkbox label: light grey for the online play warning, default white for the code of conduct.
+    #[test]
+    fn checkbox_label_colours() {
+        let colour = |kind: NoticeKind| {
+            let mut n = Notice::new(kind);
+            n.arrange(&Fixed, &lang(), (400, 300));
+            n.panel.get(CHECK).expect("checkbox").msg[0].style.color
+        };
+        assert_eq!(colour(NoticeKind::Multiplayer), Some(0xE0E0E0));
+        assert_eq!(colour(NoticeKind::Conduct("x".into())), None);
     }
 }

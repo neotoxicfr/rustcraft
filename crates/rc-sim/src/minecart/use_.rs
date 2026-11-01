@@ -115,8 +115,8 @@ impl Server {
     }
 
     fn player_attack_cart(&mut self, c: &mut Cart) {
-        let weapon = self.slots[36 + self.held as usize].clone();
-        let mut base = self.player_attribute("minecraft:attack_damage") as f32;
+        let weapon = self.player_weapon();
+        let mut base = self.player_base_damage();
         let speed = self.player_attribute("minecraft:attack_speed");
         let delay = (1.0 / speed * 20.0) as f32;
         let scale = ((self.mobs.attack_ticker as f32 + 0.5) / delay).clamp(0.0, 1.0);
@@ -134,10 +134,22 @@ impl Server {
         if sprint_kb {
             self.world_sound("minecraft:entity.player.attack.knockback", 7, self.pos, 1.0, 1.0);
         }
+        // G5-F04: damage source of the weapon; the mace's fall bonus counts against any entity (its
+        // smash effects and fall reset only follow a hit on a living one).
+        let fall = self.life.vit.fall;
+        let smash = weapon.as_ref().is_some_and(|w| w.id == crate::mace::MACE)
+            && crate::mace::can_smash(fall, self.proj_player.fall_flying);
+        let ty = self.weapon_damage_type(weapon.as_ref(), smash, "minecraft:player_attack");
+        if smash {
+            let me = crate::progress::pred::Who::E(crate::commands::ents::E::Player);
+            let mut own = self.life.rng;
+            let ctx = self.damage_ctx(&ty, me, c.pos, Some(me), true);
+            base += self.mace_bonus(weapon.as_ref(), fall, true, &ctx, &mut own);
+        }
         let total = base + magic;
         // Never a critical hit against a non-living entity.
         let sweep = self.sweep_allowed(full, false, sprint_kb, weapon.as_ref());
-        let hurt = self.cart_hurt(c, "minecraft:player_attack", total, Some(Ent::Player));
+        let hurt = self.cart_hurt(c, &ty, total, Some(Ent::Player));
         if hurt {
             let kb_ench = weapon.as_ref().map_or(0, |w| self.life.items.enchantment(w, "minecraft:knockback")) as f32;
             let kb = kb_ench + if sprint_kb { 0.5 } else { 0.0 };
@@ -152,7 +164,7 @@ impl Server {
             }
             if sweep {
                 self.world_sound("minecraft:entity.player.attack.sweep", 7, self.pos, 1.0, 1.0);
-                self.sweep_attack(&c.bbox(), None, base, scale);
+                self.sweep_attack(&c.bbox(), None, base, scale, &ty, weapon.as_ref());
             } else {
                 let s = if full { "minecraft:entity.player.attack.strong" } else { "minecraft:entity.player.attack.weak" };
                 self.world_sound(s, 7, self.pos, 1.0, 1.0);
@@ -162,6 +174,8 @@ impl Server {
             }
             // Non-living target: the player forgets their last victim (wolf that helps them).
             self.set_last_hurt_mob(Some(Ent::Player), None);
+            // G5-F04: the weapon's after-hit effects still run on a non-living target (Wind Burst).
+            self.player_weapon_post_attack(crate::commands::ents::E::Other(c.id), c.pos, &ty, weapon.as_ref());
             let invul = self.abilities().invulnerable;
             self.life.vit.exhaust(0.1, invul);
         } else {

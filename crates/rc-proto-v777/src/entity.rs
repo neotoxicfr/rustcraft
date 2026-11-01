@@ -232,15 +232,20 @@ pub enum Meta {
     Long(i64),
     Float(f32),
     String(String),
-    /// Text component (raw NBT), absent for an empty optional component.
+    /// Text component (raw NBT), absent for an empty optional component (serializer 6).
     Text(Option<rc_proto::nbt::Nbt>),
+    /// Mandatory text component (serializer 5: text display, command minecart output).
+    Component(rc_proto::nbt::Nbt),
     Item(Option<ItemStack>),
     Bool(bool),
     Rotations([f32; 3]),
     BlockPos(Option<[i32; 3]>),
     Direction(i32),
     Entity(Option<u128>),
+    /// Optional block state (serializer 15, 0 = absent).
     BlockState(Option<i32>),
+    /// Mandatory block state (serializer 14: block display).
+    State(i32),
     Particles(Vec<Particle>),
     /// Particle alone (serializer 16: area effect cloud).
     Particle(Particle),
@@ -444,7 +449,7 @@ impl MetaCodec {
             2 => Meta::Long(read_varlong(r)?),
             3 => Meta::Float(f32::decode(r)?),
             4 => Meta::String(read_str(r, 32767)?.to_owned()),
-            5 => Meta::Text(rc_proto::nbt::read(r)?),
+            5 => Meta::Component(rc_proto::nbt::read(r)?.unwrap_or(rc_proto::nbt::Nbt::String(String::new()))),
             6 => Meta::Text(if bool::decode(r)? { rc_proto::nbt::read(r)? } else { None }),
             7 => Meta::Item(self.items.read_stack(r)?),
             8 => Meta::Bool(bool::decode(r)?),
@@ -453,7 +458,7 @@ impl MetaCodec {
             11 => Meta::BlockPos(if bool::decode(r)? { Some(block_pos(r)?) } else { None }),
             12 => Meta::Direction(read_varint(r)?),
             13 => Meta::Entity(if bool::decode(r)? { Some(u128::from_be_bytes(r.take_array()?)) } else { None }),
-            14 => Meta::BlockState(Some(read_varint(r)?)),
+            14 => Meta::State(read_varint(r)?),
             15 => Meta::BlockState(match read_varint(r)? {
                 0 => None,
                 s => Some(s),

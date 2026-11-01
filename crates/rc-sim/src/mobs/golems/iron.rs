@@ -145,7 +145,7 @@ impl Server {
                     self.mobs.player_vel = nv;
                     let velocity = super::super::track::lp_quantize(nv);
                     let _ = self.send(Event::Entity(EntityEvent::Motion { id: self.player_id, velocity }));
-                    self.player_thorns(m); // G5-F02d
+                    self.player_thorns(m, ty); // G5-F02d
                 }
                 r
             }
@@ -159,6 +159,11 @@ impl Server {
                     o.needs_sync = true;
                 }
                 self.mobs.list[i] = Some(o);
+                // G5-F04: the struck mob's thorns (and the golem's weapon, if any).
+                if r {
+                    let w = m.equipment[0].clone();
+                    self.melee_post_attack(m, t, ty, w.as_ref());
+                }
                 r
             }
         };

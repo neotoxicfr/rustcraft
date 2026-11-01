@@ -284,7 +284,7 @@ impl crate::App {
         if b != 0 {
             return false;
         }
-        // Scrollbar.
+        // Scrollbar: held, the list follows the mouse once it moves (not at the press).
         if n > 7
             && m.0 > (gx + 94) as f32
             && m.0 < (gx + 100) as f32
@@ -292,7 +292,6 @@ impl crate::App {
             && m.1 <= (gy + 158) as f32
         {
             t.dragging = true;
-            self.trade_motion(m);
             return true;
         }
         for i in 0..7.min(n) {
@@ -388,15 +387,31 @@ impl crate::App {
         if n <= 7 {
             return false;
         }
-        let d = dy.signum() as i32;
-        t.scroll = (t.scroll as i32 - d).clamp(0, (n - 7) as i32) as usize;
+        t.scroll = wheel_offset(t.scroll, n, dy);
         true
     }
+}
+
+/// First offer shown after a wheel motion: the offset minus the motion, truncated toward zero
+/// (a small motion upwards still moves by one, a small one downwards does nothing).
+fn wheel_offset(scroll: usize, offers: usize, dy: f64) -> usize {
+    ((scroll as f64 - dy) as i32).clamp(0, offers as i32 - 7) as usize
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wheel over 10 offers (3 hidden): offset minus the motion, truncated toward zero.
+    #[test]
+    fn merchant_wheel_truncates_the_motion() {
+        assert_eq!(wheel_offset(2, 10, 1.0), 1);
+        assert_eq!(wheel_offset(2, 10, 0.3), 1, "small motion up: one offer");
+        assert_eq!(wheel_offset(2, 10, -0.3), 2, "small motion down: nothing");
+        assert_eq!(wheel_offset(1, 10, -2.0), 3, "two notches at once");
+        assert_eq!(wheel_offset(3, 10, -1.0), 3, "at the end");
+        assert_eq!(wheel_offset(0, 10, 0.5), 0);
+    }
 
     struct R;
     impl Rules for R {

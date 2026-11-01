@@ -9,6 +9,7 @@
 mod blocks;
 mod fluid_use;
 pub mod chunk;
+pub mod debug_report;
 pub mod demo;
 pub mod gen_debug;
 pub mod generation;
@@ -41,6 +42,7 @@ pub mod containers;
 pub mod datapack;
 pub mod packs;
 pub mod drops;
+mod display; // G5-F05: display and interaction entities
 pub mod life;
 pub mod items;
 pub mod item_use;
@@ -77,6 +79,8 @@ mod crafter; // G5-F11: crafter menu
 #[cfg(test)]
 mod tests_g5f11;
 #[cfg(test)]
+mod tests_g1f16; // G1-F16: F3 values answered by the server
+#[cfg(test)]
 mod tests_g4f09; // G4-F09: turtle helmet, 1.21 effects, hurt sound, statistics
 #[cfg(test)]
 mod tests_g4f12; // G4-F12: iron and copper golems
@@ -86,6 +90,11 @@ mod tests_g5f02c; // G5-F02c: fall (wind charge, per-block rules, multiplier, so
 mod tests_g5f02e; // G5-F02e: contacts with crossed blocks, enchanted boots
 mod thorns; // G5-F02d: player thorns
 mod tests_g5f02d;
+mod tests_g5f05; // G5-F05: orbs, ground items, displays, interaction, marker
+mod ench_fx; // G5-F04: enchantment effects (protection, armor effectiveness, after-hit effects)
+mod mace; // G5-F04: smash attack
+#[cfg(test)]
+mod tests_g5f04;
 pub mod randsrc;
 // Commands (S5).
 pub mod commands;

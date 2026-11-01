@@ -870,6 +870,11 @@ impl Kind {
     }
 }
 
+/// G5-F04: species that can be tamed with an owner (wolf, cat, parrot, nautiluses).
+pub fn tamable(kind: Kind) -> bool {
+    matches!(kind, Kind::Wolf | Kind::Cat | Kind::Parrot | Kind::Nautilus | Kind::ZombieNautilus)
+}
+
 /// Static bound of a species' box around its position: (half-width, height)
 /// maximum over adult, baby and poses (sitting, jumping, digging: all smaller than
 /// the adult). `None` for variable boxes: cubes (size), shulker (opening), phantom

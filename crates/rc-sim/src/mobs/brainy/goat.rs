@@ -503,7 +503,7 @@ pub fn ram_tick(s: &mut Server, m: &mut Mob, b: &mut Brain, dir: [f64; 3]) {
         match target {
             Ent::Player => {
                 if s.player_hurt_by_mob(m, ty, dmg, Some((m.pos[0] - s.pos[0], m.pos[2] - s.pos[2]))) {
-                    s.player_thorns(m); // G5-F02d
+                    s.player_thorns(m, ty); // G5-F02d
                 }
                 // W8c: block replayed after the hit (the shield wears down a second time).
                 let blocking = s.reapply_blocking("minecraft:mob_attack", dmg, m.pos);
@@ -513,7 +513,17 @@ pub fn ram_tick(s: &mut Server, m: &mut Mob, b: &mut Brain, dir: [f64; 3]) {
             Ent::Mob(id) => {
                 if let Some(i) = s.mob_index(id) {
                     let mut o = s.mobs.list[i].take().expect("mob");
-                    s.mob_hurt_by(&mut o, m, ty, dmg);
+                    // G5-F04: after-hit effects of the struck mob (thorns), then the goat's weapon.
+                    if s.mob_hurt_by(&mut o, m, ty, dmg) {
+                        let w = m.equipment[0].clone();
+                        let mut hit = crate::ench_fx::Hit {
+                            ty,
+                            victim: crate::ench_fx::Side::Mob(o.as_mut()),
+                            attacker: Some(crate::ench_fx::Side::Mob(m)),
+                            direct: true,
+                        };
+                        s.post_attack(&mut hit, w.as_ref());
+                    }
                     // Victim's own knockback (full sulfur cube: ram aim).
                     s.ghost_push(m);
                     let by = Some(Ent::Mob(m.id));

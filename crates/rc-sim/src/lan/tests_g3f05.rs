@@ -562,6 +562,37 @@ fn hits_between_players() {
     assert_eq!(t.s.stat_value("minecraft:custom", "minecraft:damage_dealt"), ((h0 - h1) * 10.0).round() as i32, "hit refused: nothing more");
 }
 
+/// G5-F04: a mace smash with Wind Burst on another player runs the weapon's after-hit effect
+/// after the smash: the attacker is launched, its fall reset.
+#[test]
+fn mace_wind_burst_between_players() {
+    let mut t = open("pvpmace");
+    publish(&mut t, false);
+    let g = join(&mut t, "Guest", 2);
+    {
+        let c = t.s.lan.as_mut().unwrap().guests[0].ctx.as_mut().unwrap();
+        c.loaded = true;
+        c.teleport = None;
+        c.game_mode = 0;
+    }
+    let health = |t: &T| t.s.lan.as_ref().unwrap().guests[0].ctx.as_ref().unwrap().vit.health;
+    let h0 = health(&t);
+    let mut mace = crate::player::Stack { id: "minecraft:mace".into(), count: 1, components: None };
+    let fields = vec![("minecraft:wind_burst".to_owned(), rc_proto::nbt::Nbt::Int(1))];
+    crate::items::set_component(&mut mace, "minecraft:enchantments", rc_proto::nbt::Nbt::Compound(fields.into_iter().collect()));
+    let slot = 36 + t.s.held as usize;
+    t.s.slots[slot] = Some(mace);
+    t.s.equipment_tick();
+    t.s.on_ground = false;
+    t.s.life.vit.fall = 4.0;
+    t.s.mobs.player_vel = [0.0; 3];
+    t.s.mobs.attack_ticker = 100;
+    t.s.player_attack(g.id);
+    assert!(health(&t) < h0, "hit landed");
+    assert!(t.s.mobs.player_vel[1] > 0.5, "attacker not launched: {:?}", t.s.mobs.player_vel);
+    assert_eq!(t.s.life.vit.fall, 0.0, "fall not reset");
+}
+
 /// Hit and kill between players, as on a mob: weapon used, damage dealt, player killed
 /// (statistic and objective criteria) on the attacker's side; `killed_by` of the player
 /// on the victim's side.

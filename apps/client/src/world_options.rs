@@ -86,8 +86,112 @@ pub struct World {
     // Social interactions: tab (0 all, 1 hidden, 2 blocked), players shown.
     social_page: u8,
     shown: Vec<u128>,
-    /// Players seen during the session (stay shown "offline" in the hidden tab).
+    /// Names of the players known during the session.
     seen: Vec<Player>,
+    /// Player entities that appeared while listed, this connection: they stay in the "All"
+    /// tab once gone (offline).
+    spotted: Vec<Player>,
+    /// Chat log of this connection: one entry per chat line received, holding the sender of
+    /// a signed player message (listed in the "All" tab, sorted before the other players).
+    chat_log: std::collections::VecDeque<Option<Player>>,
+}
+
+/// Lines kept by the chat log.
+const CHAT_LOG: usize = 1024;
+
+impl World {
+    /// New connection: the players met and the chat log start empty.
+    pub fn new_connection(&mut self) {
+        self.spotted.clear();
+        self.chat_log.clear();
+    }
+
+    pub fn spotted(&mut self, uuid: u128, name: String) {
+        match self.spotted.iter_mut().find(|p| p.uuid == uuid) {
+            Some(p) => p.name = name,
+            None => self.spotted.push(Player { uuid, name }),
+        }
+    }
+
+    /// A chat line was received.
+    pub fn chat_line(&mut self) {
+        if self.chat_log.len() == CHAT_LOG {
+            self.chat_log.pop_front();
+        }
+        self.chat_log.push_back(None);
+    }
+
+    /// The line just received is a signed message of `uuid`.
+    pub fn chat_sender(&mut self, uuid: u128, name: String) {
+        if let Some(last) = self.chat_log.back_mut() {
+            *last = Some(Player { uuid, name });
+        }
+    }
+
+    /// Players of a social interactions tab, before the search filter: "All" = online players,
+    /// then those met this connection and the senders of the chat log (both offline);
+    /// "Hidden" and "Blocked" = online players only.
+    fn social_players(&self, page: u8, hidden: &[u128]) -> Vec<Player> {
+        match page {
+            0 => {
+                let mut out = self.players.clone();
+                // Newest message first: the name of the oldest message of a sender wins.
+                let mut senders: Vec<&Player> = Vec::new();
+                for p in self.chat_log.iter().rev().flatten() {
+                    match senders.iter_mut().find(|s| s.uuid == p.uuid) {
+                        Some(s) => *s = p,
+                        None => senders.push(p),
+                    }
+                }
+                for p in self.spotted.iter().chain(senders) {
+                    if !out.iter().any(|o| o.uuid == p.uuid) {
+                        out.push(p.clone());
+                    }
+                }
+                out
+            }
+            1 => self.players.iter().filter(|p| hidden.contains(&p.uuid)).cloned().collect(),
+            _ => self.players.iter().filter(|p| rc_client::session::is_blocked(p.uuid)).cloned().collect(),
+        }
+    }
+
+    /// Order of the list: local player, players who sent a signed message, the others, then the
+    /// version-2 identifiers; within each, names starting with a letter, a digit or `_` first,
+    /// then by name ignoring case.
+    fn sort_social(&self, list: &mut [Player]) {
+        let recent: hashbrown::HashSet<u128> = self.chat_log.iter().flatten().map(|p| p.uuid).collect();
+        let rank = |p: &Player| {
+            if p.uuid == self.local {
+                0
+            } else if (p.uuid >> 76) & 0xf == 2 {
+                4
+            } else if recent.contains(&p.uuid) {
+                2
+            } else {
+                3
+            }
+        };
+        let plain_start =
+            |p: &Player| p.name.chars().next().filter(|_| !p.name.trim().is_empty()).is_some_and(|c| c == '_' || c.is_ascii_alphanumeric());
+        list.sort_by_cached_key(|p| (rank(p), !plain_start(p), fold_case(&p.name)));
+    }
+}
+
+/// Name compared ignoring case like the game: each character upper-cased then lower-cased,
+/// when that maps it to a single character.
+fn fold_case(s: &str) -> Vec<char> {
+    fn single(mut it: impl Iterator<Item = char>, c: char) -> char {
+        match (it.next(), it.next()) {
+            (Some(x), None) => x,
+            _ => c,
+        }
+    }
+    s.chars()
+        .map(|c| {
+            let u = single(c.to_uppercase(), c);
+            single(u.to_lowercase(), u)
+        })
+        .collect()
 }
 
 impl World {
@@ -985,17 +1089,17 @@ fn build_social(gui: &Gui, w: &mut World, search: &str, sw: i32, sh: i32) -> (Ve
         ));
     }
     v.push(Widget::button(DONE, (sw - 200) / 2, sh - 26, 200, &t(gui, "gui.done")));
-    // Players of the tab, filtered and sorted by name (case-insensitive).
+    // Players of the tab, filtered and sorted.
     let hidden = rc_client::chat::hidden_players();
     let needle = search.to_lowercase();
-    let mut list: Vec<Player> = match w.social_page {
-        0 => w.players.clone(),
-        1 => hidden.iter().filter_map(|u| w.seen.iter().find(|p| p.uuid == *u).cloned()).collect(),
-        // Blocked: online players from the account's block list (`rc_client::session`).
-        _ => w.players.iter().filter(|p| rc_client::session::is_blocked(p.uuid)).cloned().collect(),
-    };
+    let mut list = w.social_players(w.social_page, &hidden);
     list.retain(|p| needle.is_empty() || p.name.to_lowercase().contains(&needle));
-    list.sort_by_key(|p| p.name.to_lowercase());
+    w.sort_social(&mut list);
+    for p in &list {
+        if !w.seen.iter().any(|s| s.uuid == p.uuid) {
+            w.seen.push(p.clone());
+        }
+    }
     w.shown = list.iter().map(|p| p.uuid).collect();
     let mut top = 0;
     for (i, p) in list.iter().enumerate() {
@@ -1355,12 +1459,12 @@ pub(crate) fn draw_social_rows(gui: &mut Gui, q: &wgpu::Queue, w: &World, l: &Li
             Some(k) => {
                 let ty = y + (rh - 18) / 2;
                 let s = chars(&format!("§o{}", t(gui, k)));
-                gui.text(q, &s, tx as f32, (ty + 12) as f32, 0x8cff_ffff, false, 0);
+                gui.text(q, &s, tx as f32, (ty + 12) as f32, 0x8cff_ffff, true, 0);
                 ty
             }
             None => y + (rh - 9) / 2,
         };
-        gui.text(q, &chars(name), tx as f32, ty as f32, 0xffff_ffff, false, 0);
+        gui.text(q, &chars(name), tx as f32, ty as f32, 0xffff_ffff, true, 0);
         if !online {
             gui.fill((x + 4) as f32, (y + 6) as f32, (x + 28) as f32, (y + 30) as f32, 0xbe00_0000);
         }
@@ -1664,6 +1768,48 @@ impl RulesEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn player(uuid: u128, name: &str) -> Player {
+        Player { uuid, name: name.into() }
+    }
+
+    fn names(w: &World, page: u8, hidden: &[u128]) -> Vec<String> {
+        let mut l = w.social_players(page, hidden);
+        w.sort_social(&mut l);
+        l.into_iter().map(|p| p.name).collect()
+    }
+
+    /// "All" tab: online players, players met and chat senders (offline); local player
+    /// first, then senders, then the others with plain names before the rest, version-2
+    /// identifiers last; "Hidden" lists online hidden players only.
+    #[test]
+    fn social_tabs_list_and_sort_like_the_game() {
+        let mut w = World { local: 1, ..Default::default() };
+        let v2 = 2u128 << 76 | 9;
+        w.set_players(vec![player(1, "zed"), player(2, "bob"), player(3, "Alice"), player(4, "~tilde"), player(v2, "Aaron")]);
+        w.spotted(5, "carl".into());
+        w.chat_line();
+        w.chat_sender(6, "dave".into());
+        w.chat_line();
+        w.chat_sender(2, "bob".into());
+        w.chat_line();
+        assert_eq!(names(&w, 0, &[]), ["zed", "bob", "dave", "Alice", "carl", "~tilde", "Aaron"]);
+        assert_eq!(names(&w, 1, &[2, 5]), ["bob"], "hidden: online ones only");
+        // The log keeps 1024 lines: the oldest sender drops out.
+        for _ in 0..1022 {
+            w.chat_line();
+        }
+        assert_eq!(names(&w, 0, &[]), ["zed", "bob", "Alice", "carl", "~tilde", "Aaron"]);
+        w.new_connection();
+        assert_eq!(names(&w, 0, &[]), ["zed", "Alice", "bob", "~tilde", "Aaron"]);
+    }
+
+    #[test]
+    fn names_compare_ignoring_case() {
+        assert_eq!(fold_case("ÄbC"), fold_case("äBc"));
+        assert_eq!(fold_case("ß"), vec!['ß']);
+        assert!(fold_case("alice") < fold_case("Bob"));
+    }
 
     #[test]
     fn pause_button_follows_tag_then_links() {

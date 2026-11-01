@@ -264,6 +264,8 @@ pub struct Progress {
     /// Other player currently hitting the player (local network): display name, name of
     /// the item in hand if renamed.
     pub attacker_player: Option<(rc_text::Component, Option<rc_text::Component>)>,
+    /// G5-F04: weapon of that other player (armor effectiveness of the hit).
+    pub attacker_weapon: Option<Stack>,
     /// Retaliation of a parried hit that changed the attacker (stunned ravager): identifier,
     /// stun ticks, random draw; taken back by the caller that holds the mob.
     pub riposte: Option<(i32, i32, crate::mobs::jrand::JRand)>,
@@ -309,6 +311,7 @@ impl Progress {
             stats: crate::stats::Stats::read(world, uuid),
             attacker: None,
             attacker_player: None,
+            attacker_weapon: None,
             riposte: None,
             dmg_src: Default::default(),
             lev_start: None,

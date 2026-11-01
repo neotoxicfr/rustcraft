@@ -69,6 +69,15 @@ pub struct Group {
 
 const MOON: [f32; 8] = [1.0, 0.75, 0.5, 0.25, 0.0, 0.25, 0.5, 0.75];
 
+/// Natural spawn census of a tick (F3 "SC" line): dimension, spawn chunk count, mobs per category
+/// (`Category::SPAWNING` order) once the tick's groups are placed.
+#[derive(Debug, Clone, Default)]
+pub struct Census {
+    pub dim: String,
+    pub chunks: i32,
+    pub counts: [i32; 7],
+}
+
 /// Spawner carrier: block entity, or spawner minecart (G5-F06).
 pub(crate) enum SpawnerAt<'a> {
     Block([i32; 3]),
@@ -806,6 +815,10 @@ impl Server {
                 counts[i] += n;
             }
         }
+        // Census kept for the debug screen (dimension name copied into the kept buffer).
+        let census = self.mobs.census.get_or_insert_with(Census::default);
+        census.dim.clone_from(&self.dim.name);
+        (census.chunks, census.counts) = (spawnable, counts);
     }
 
     /// Spawn cost of the type in the biome (charge, energy budget), if it has one.

@@ -112,6 +112,9 @@ pub struct Contact {
     /// Same for experience orbs.
     pub(crate) live_orbs: Vec<([f64; 3], bool)>,
     pub(crate) orbs_ticking: bool,
+    /// G5-F05: orbs of the list by identifier modulo 40 (the only ones that can merge with each
+    /// other), rebuilt at the first merge scan of an orb tick; reused buffers.
+    pub(crate) orb_buckets: Vec<Vec<u32>>,
     /// Player's boots.
     pub(crate) player: Boots,
 }
@@ -862,27 +865,9 @@ impl Server {
         m.boots.frost = frost;
     }
 
-    /// Wear of a mob's boots (armor Unbreaking); broken: removed, event 52.
+    /// Wear of a mob's boots (Unbreaking by the item's kind); broken: removed, event 52.
     fn mob_hurt_boots(&mut self, m: &mut Mob, n: i32) {
-        let Some(s) = m.equipment[2].clone() else { return };
-        if !self.life.items.damageable(&s) {
-            return;
-        }
-        let n = self.unbreaking_kept(&s, n, true);
-        if n <= 0 {
-            return;
-        }
-        let dmg = self.life.items.damage(&s) + n;
-        let mut s = s;
-        if dmg >= self.life.items.max_damage(&s) {
-            s.count -= 1;
-            crate::items::remove_component(&mut s, "minecraft:damage");
-            m.equipment[2] = (s.count > 0).then_some(s);
-            let _ = self.send(rc_client::Event::Entity(rc_client::EntityEvent::Event { id: m.id, event: 52 }));
-        } else {
-            crate::items::set_component(&mut s, "minecraft:damage", rc_proto::nbt::Nbt::Int(dmg));
-            m.equipment[2] = Some(s);
-        }
+        self.mob_hurt_slot(m, 2, n);
     }
 }
 

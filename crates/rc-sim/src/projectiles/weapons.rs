@@ -684,8 +684,9 @@ impl Server {
         }
     }
 
-    /// Spin attack: the first mob touched takes the
-    /// impulse damage; the attack stops at the first hit or after 20 ticks.
+    /// Spin attack: the first mob touched takes the player's full melee hit (base damage of the
+    /// impulse, its trident as the weapon: type, charge, enchantments, after-hit effects); the
+    /// attack stops at the first hit or after 20 ticks.
     pub(crate) fn spin_attack_tick(&mut self) {
         if self.proj_player.spin <= 0 {
             return;
@@ -693,11 +694,10 @@ impl Server {
         let b = self.player_aabb();
         let hit = self.mobs.list.iter().flatten().find(|m| m.alive() && m.touches(&b)).map(|m| m.id);
         if let Some(id) = hit {
-            let dmg = self.proj_player.spin_damage;
             if let Some(i) = self.mob_index(id)
                 && let Some(mut m) = self.mobs.list[i].take()
             {
-                self.mob_hurt(&mut m, "minecraft:player_attack", dmg, Some(Ent::Player), Some(self.pos));
+                self.player_attack_mob(&mut m);
                 self.mobs.list[i] = Some(m);
             }
             self.proj_player.spin = 0;

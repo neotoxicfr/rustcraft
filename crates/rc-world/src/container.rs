@@ -439,6 +439,17 @@ impl Container {
         }
     }
 
+    /// Could a value satisfying `pred` be stored here? `false` only when no palette entry (nor
+    /// the value 0 of out-of-palette indices, like `get`) answers yes, so the data need not be
+    /// read; a container without a palette always answers yes.
+    pub fn may_contain(&self, pred: impl Fn(u32) -> bool) -> bool {
+        match self {
+            Container::Single(v) => pred(*v),
+            Container::Packed { palette: Some(p), .. } => pred(0) || p.iter().any(|&v| pred(v)),
+            Container::Packed { palette: None, .. } => true,
+        }
+    }
+
     /// Number of entries (among `entries`) whose value satisfies `pred`, without unfolding: histogram
     /// of the indices, then `pred` once per palette entry (several entries may answer
     /// yes; index outside the palette = value 0, like `get`).

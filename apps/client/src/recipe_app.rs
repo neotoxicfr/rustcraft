@@ -49,9 +49,8 @@ impl App {
             self.recipe_book.screen = Some((window, kind));
             self.recipe_book.on_screen(kind);
         }
-        if let Some(b) = book_type(kind) {
-            // The server can change the open state of the book.
-            self.recipe_book.visible = self.recipe_book.settings[b].0;
+        if book_type(kind).is_some() {
+            self.recipe_book.follow_settings(&self.session.link);
         }
         if !self.mods.control_key() {
             self.recipe_book.time += 1;
@@ -74,10 +73,6 @@ impl App {
         let t = self.recipe_book.test;
         if t == 20 && !self.recipe_book.visible {
             self.recipe_book.toggle(&self.session.link);
-            let kind = crate::screens::current(&self.inventory).0;
-            if let Some(b) = book_type(kind) {
-                self.recipe_book.settings[b].0 = true;
-            }
         }
         if t == 40
             && let Some(n) = spec.strip_prefix("place:").and_then(|n| n.parse::<usize>().ok())
@@ -156,8 +151,10 @@ impl App {
             let narrow = self.renderer.as_ref().is_some_and(|r| (r.gui.width as i32) < 379);
             let window = crate::screens::current(&self.inventory).2;
             let k = crate::ime::TEXT_ONLY;
-            return self.recipe_book.focused
+            let used = self.recipe_book.focused
                 && self.recipe_book.key(k, self.mods, Some(t), false, narrow, window, &self.session.link).0;
+            self.pirate_speech();
+            return used;
         }
         let WindowEvent::KeyboardInput { event, .. } = e else { return false };
         if event.state != ElementState::Pressed {
@@ -181,7 +178,23 @@ impl App {
         if click {
             self.play_ui(crate::widgets::CLICK_SOUND, 1.0);
         }
+        self.pirate_speech();
         self.screens.book = (self.recipe_book.visible, narrow);
         used
+    }
+
+    /// Easter egg of the book search: the word switches the client to the pirate language
+    /// when that language exists and is not already chosen (options saved).
+    fn pirate_speech(&mut self) {
+        const PIRATE: &str = "en_pt";
+        if !std::mem::take(&mut self.recipe_book.pirate)
+            || self.options.s("lang") == PIRATE
+            || !self.menus.languages.iter().any(|l| l.code == PIRATE)
+        {
+            return;
+        }
+        self.options.set("lang", crate::options::Val::S(PIRATE.to_owned()));
+        self.apply_language(PIRATE);
+        self.save_options();
     }
 }

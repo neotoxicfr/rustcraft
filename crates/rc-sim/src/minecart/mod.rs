@@ -304,7 +304,7 @@ impl Cart {
             CKind::Furnace => self.define(13, Meta::Bool(false)),
             CKind::Command => {
                 self.define(13, Meta::String(String::new()));
-                self.define(14, Meta::Text(Some(Nbt::String(String::new()))));
+                self.define(14, Meta::Component(Nbt::String(String::new())));
             }
             _ => {}
         }
@@ -321,6 +321,7 @@ impl Cart {
             12 => Meta::Int(self.kind.default_offset()),
             13 if self.kind == CKind::Furnace => Meta::Bool(false),
             13 => Meta::String(String::new()),
+            14 => Meta::Component(Nbt::String(String::new())),
             7 => Meta::Int(0),
             _ => Meta::Text(Some(Nbt::String(String::new()))),
         }

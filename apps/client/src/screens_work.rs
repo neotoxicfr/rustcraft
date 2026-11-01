@@ -86,9 +86,10 @@ pub struct Work {
     recipes: Vec<Option<ItemStack>>,
     scroll: f32,
     dragging: bool,
-    /// Loom: patterns offered (indices of the `banner_pattern` registry).
+    /// Loom: patterns offered (indices of the `banner_pattern` registry), first row shown.
     patterns: Vec<usize>,
     show_patterns: bool,
+    start_row: usize,
     /// Smithing table: icons of the empty slots.
     icons: [Cycle; 3],
     book: BookAnim,
@@ -330,10 +331,22 @@ fn sc_start(w: &Work) -> usize {
     ((w.scroll * rows as f32 + 0.5).floor() as usize) * 4
 }
 
+/// Input slot seen at the tick: recipes listed again for a new item; any change of the slot
+/// (its count too, after taking a result) brings the list back to the top.
+fn stonecutter_input(w: &mut Work, input: Option<&ItemStack>, changed: bool, same_item: bool) {
+    if !same_item {
+        w.recipes = input.map_or_else(Vec::new, |s| crate::menu_special::stonecutter_for(s.item));
+    }
+    if changed {
+        w.scroll = 0.0;
+    }
+}
+
+/// Recipe under the mouse for its tooltip: the drawn cell (2 lower than the click cell).
 fn recipe_at(w: &Work, gx: i32, gy: i32, m: (f32, f32)) -> Option<usize> {
     let start = sc_start(w);
     (0..12).find_map(|j| {
-        let (x, y) = (gx + 52 + 16 * (j % 4) as i32, gy + 14 + 18 * (j / 4) as i32);
+        let (x, y) = (gx + 52 + 16 * (j % 4) as i32, gy + 16 + 18 * (j / 4) as i32);
         let i = start + j;
         (i < w.recipes.len() && inside(Some(m), x, y, 16, 18)).then_some(i)
     })
@@ -377,12 +390,25 @@ fn loom_rows(w: &Work) -> i32 {
     (w.patterns.len() as i32 + 3) / 4 - 4
 }
 
+/// First row shown for the bar position; kept in `start_row` when the bar moves only (a new
+/// list keeps it while it still has that row).
 fn loom_first_row(w: &Work) -> usize {
     (w.scroll * loom_rows(w).max(0) as f32 + 0.5).floor() as usize
 }
 
+/// New loom inputs: the shown row (and the bar) go back to the top only when the new list no
+/// longer has that row.
+fn loom_list_changed(w: &mut Work, list: Vec<usize>, show: bool) {
+    if w.start_row >= list.len().div_ceil(4) {
+        w.start_row = 0;
+        w.scroll = 0.0;
+    }
+    w.patterns = list;
+    w.show_patterns = show;
+}
+
 fn pattern_at(w: &Work, gx: i32, gy: i32, m: (f32, f32)) -> Option<usize> {
-    let first = loom_first_row(w) * 4;
+    let first = w.start_row * 4;
     (0..16).find_map(|k| {
         let (x, y) = (gx + 60 + 14 * (k % 4) as i32, gy + 13 + 14 * (k / 4) as i32);
         let i = first + k;
@@ -465,7 +491,7 @@ fn draw_loom(cx: &mut Ctx<'_, '_>, c: &Container) {
     if !w.show_patterns {
         return;
     }
-    let first = loom_first_row(w) * 4;
+    let first = w.start_row * 4;
     for k in 0..16usize {
         let i = first + k;
         let Some(&p) = w.patterns.get(i) else { break };
@@ -1325,8 +1351,11 @@ impl crate::App {
             Sp::Loom if w.show_patterns && w.patterns.len() > 16 => {
                 ((m.1 - gy as f32 - 13.0 - 7.5) / 41.0).clamp(0.0, 1.0)
             }
-            _ => w.scroll,
+            _ => return,
         };
+        if s == Sp::Loom {
+            w.start_row = loom_first_row(w);
+        }
     }
 
     pub(crate) fn work_wheel(&mut self, s: Sp, _m: (f32, f32), dy: f64) -> bool {
@@ -1338,11 +1367,17 @@ impl crate::App {
             _ => return false,
         };
         w.scroll = (w.scroll - dy as f32 / rows.max(1) as f32).clamp(0.0, 1.0);
+        if s == Sp::Loom {
+            w.start_row = loom_first_row(w);
+        }
         true
     }
 
     /// Screen tick: input changes, animations, anvil field, beacon.
     pub(crate) fn work_tick(&mut self, s: Sp) {
+        if matches!(s, Sp::Anvil | Sp::Enchant) {
+            self.hud.more.force_xp();
+        }
         let level = self.hud.experience_level();
         let creative = self.env.game_mode == 1;
         let effects = &self.hud_extra.effect_names;
@@ -1368,10 +1403,7 @@ impl crate::App {
             n.strip_prefix("minecraft:").unwrap_or(n).to_owned()
         };
         match s {
-            Sp::Stonecutter if !same_item => {
-                w.recipes = c.slots[0].as_ref().map_or_else(Vec::new, |s| crate::menu_special::stonecutter_for(s.item));
-                w.scroll = 0.0;
-            }
+            Sp::Stonecutter => stonecutter_input(w, c.slots[0].as_ref(), first_changed, same_item),
             Sp::Smithing => {
                 let t = c.slots[0].as_ref().map(name);
                 let [a, b, cc] = smithing_icons(t.as_deref());
@@ -1452,16 +1484,10 @@ impl crate::App {
         let list = if banner.is_some() && dye.is_some() { loom_patterns(&it, pat.as_ref()) } else { Vec::new() };
         let show = banner.is_some() && dye.is_some() && layers < 6 && !list.is_empty();
         if let Some(c) = &mut self.inventory.container {
-            let w = &mut c.extra.work;
-            if w.patterns != list {
-                w.scroll = 0.0;
-            }
-            w.patterns = list;
-            w.show_patterns = show;
-            // A single proposal: chosen by default.
-            if show && w.patterns.len() == 1 && c.props[0] != 0 {
+            loom_list_changed(&mut c.extra.work, list, show);
+            // A single proposal: chosen by default, locally (the server does the same on its side).
+            if show && c.extra.work.patterns.len() == 1 {
                 c.props[0] = 0;
-                self.send_button(0);
             }
         }
     }
@@ -1524,6 +1550,36 @@ mod tests {
         assert!(!crafter_reenables(false, true, true, true));
         // Item on the cursor: no swap, hence nothing re-enabled.
         assert!(!crafter_reenables(true, false, true, true));
+    }
+
+    /// Stonecutter: the tooltip cell is the drawn one (2 below the click cell); the count of
+    /// the input changing alone still brings the list back to the top.
+    #[test]
+    fn stonecutter_tooltip_cell_and_scroll_reset() {
+        let mut w = Work { recipes: vec![None; 20], ..Default::default() };
+        let (gx, gy) = (100, 50);
+        assert_eq!(recipe_at(&w, gx, gy, (153.0, 65.0)), None, "click cell only");
+        assert_eq!(recipe_at(&w, gx, gy, (153.0, 66.0)), Some(0));
+        assert_eq!(recipe_at(&w, gx, gy, (153.0, 83.0)), Some(0));
+        assert_eq!(recipe_at(&w, gx, gy, (153.0, 84.0)), Some(4));
+        w.scroll = 1.0;
+        stonecutter_input(&mut w, None, true, true);
+        assert_eq!(w.scroll, 0.0, "same item, other count");
+        assert_eq!(w.recipes.len(), 20, "same item: list kept");
+        w.scroll = 0.5;
+        stonecutter_input(&mut w, None, false, true);
+        assert_eq!(w.scroll, 0.5, "nothing changed");
+    }
+
+    /// Loom: new inputs keep the shown row while the new list still has it.
+    #[test]
+    fn loom_keeps_its_row_while_it_exists() {
+        let mut w = Work { patterns: (0..40).collect(), start_row: 4, scroll: 0.66, ..Default::default() };
+        loom_list_changed(&mut w, (0..20).collect(), true);
+        assert_eq!((w.start_row, w.scroll), (4, 0.66), "5 rows: row 4 still there");
+        loom_list_changed(&mut w, (0..16).collect(), true);
+        assert_eq!((w.start_row, w.scroll), (0, 0.0), "4 rows: back to the top");
+        assert_eq!(w.patterns.len(), 16);
     }
 
     #[test]

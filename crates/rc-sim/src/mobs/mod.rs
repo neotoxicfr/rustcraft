@@ -8,6 +8,7 @@ mod bell;
 mod body;
 mod resize; // refit after the box grows
 pub(crate) mod fireballs;
+pub(crate) mod gear; // G5-F04: attribute modifiers of the equipment
 pub(crate) mod nether;
 pub(crate) mod brains;
 pub(crate) mod brainy;
@@ -169,6 +170,8 @@ pub struct Mobs {
     pub halloween: Option<bool>,
     /// Buffers of the crossed-block pass (player and mobs).
     pub(crate) inside: crate::inside_blocks::Scratch,
+    /// Last natural spawn census (F3 "SC" line).
+    pub census: Option<spawn::Census>,
 }
 
 impl Default for Mobs {
@@ -212,6 +215,7 @@ impl Default for Mobs {
             bells: Vec::new(),
             halloween: Server::halloween_override(),
             inside: Default::default(),
+            census: None,
         }
     }
 }
@@ -420,6 +424,7 @@ impl Server {
                 && !self.end_attacked(e)
                 && !self.cart_attacked(e)
                 && !self.deco_attacked(e)
+                && !self.interaction_attacked(e)
             {
                 self.player_attack(e);
             }
@@ -429,8 +434,12 @@ impl Server {
             // Point touched (relative to the entity) and sneaking.
             let at = rc_proto_v777::entity::read_lp_vec3(r).unwrap_or_default();
             let secondary = { use rc_proto::Decode; bool::decode(r).unwrap_or(false) };
-            // G5-F06: minecart; decorations.
-            if self.player_ready() && !self.cart_interact(e, hand) && !self.deco_interact(e, hand, at, secondary) {
+            // G5-F06: minecart; decorations. G5-F05: interaction entity.
+            if self.player_ready()
+                && !self.cart_interact(e, hand)
+                && !self.deco_interact(e, hand, at, secondary)
+                && !self.interaction_used(e, hand)
+            {
                 self.player_interact(e, hand);
             }
             true

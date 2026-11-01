@@ -494,6 +494,9 @@ impl crate::App {
                 false
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if self.bundle_takes_wheel() {
+                    return false;
+                }
                 let y = match delta {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => f64::from(*y),
                     winit::event::MouseScrollDelta::PixelDelta(p) => p.y / 20.0,
