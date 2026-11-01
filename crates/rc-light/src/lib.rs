@@ -294,6 +294,18 @@ impl LightTables {
         self.face.get(s as usize).copied().unwrap_or(0)
     }
 
+    /// Attenuation of the light leaving `from` through its face `dir` (order down, up, north,
+    /// south, west, east) into its neighbour `to`: 16 when the faces of their shapes together
+    /// close the passage, otherwise the plain attenuation of `to` (survival of grass, mycelium
+    /// and nylium under the block above).
+    pub fn dampening_into(&self, from: u32, to: u32, dir: usize) -> u8 {
+        if self.occluded_faces(self.face(from), self.face(to), dir, true) {
+            16
+        } else {
+            self.dampening.get(to as usize).copied().unwrap_or(0)
+        }
+    }
+
     fn opacity(&self, s: u32) -> u8 {
         self.dampening.get(s as usize).copied().unwrap_or(15).max(1)
     }

@@ -36,10 +36,15 @@ impl Server {
         s
     }
 
-    /// Just after the player breaks it, loot included (not in creative):
-    /// ice without Silk Touch above a block that blocks movement or a liquid
+    /// Just after the player breaks it, loot included (not in creative): turtle eggs put back
+    /// with one egg fewer; ice without Silk Touch above a block that blocks movement or a liquid
     /// → water (the Nether evaporates it).
     pub(crate) fn player_destroyed(&mut self, p: P, s: u32, tool: Option<&Stack>) {
+        // G6-F08: turtle eggs broken after their loot: one egg fewer put back.
+        if self.v().block(s) == self.bs.t.id.turtle_egg {
+            self.turtle_egg_decrease(p, s);
+            return;
+        }
         let ice =
             self.data.block_of(s).is_some_and(|b| matches!(b.name.as_str(), "minecraft:ice" | "minecraft:frosted_ice"));
         if !ice || tool.is_some_and(|t| self.life.items.enchantment(t, "minecraft:silk_touch") > 0) {
@@ -75,13 +80,21 @@ impl Server {
         }
     }
 
-    /// Redstone ore touched: lit if it is not (particles are the client's).
+    /// Redstone ore touched (hit, walked on, clicked): lit if it is not (flags 3). Its dust
+    /// particles are drawn by the server too, which sends nothing but still draws, on the world
+    /// random, two floats per face whose neighbour is not opaque (the two coordinates across
+    /// that face).
     pub(crate) fn redstone_ore_touch(&mut self, p: P, s: u32) {
-        let ore = self
-            .data
-            .block_of(s)
-            .is_some_and(|b| matches!(b.name.as_str(), "minecraft:redstone_ore" | "minecraft:deepslate_redstone_ore"));
-        if ore && !self.v().get_bool(s, "lit") {
+        let b = self.v().block(s);
+        if b != self.bs.t.id.redstone_ore && b != self.bs.t.id.deepslate_redstone_ore {
+            return;
+        }
+        for d in super::Dir::ALL {
+            if !self.v().info(self.get(super::rel(p, d))).has(rc_data::flags::SOLID_RENDER) {
+                let _ = (self.bs.rng.next_float(), self.bs.rng.next_float());
+            }
+        }
+        if !self.v().get_bool(s, "lit") {
             let lit = self.v().set_bool(s, "lit", true);
             self.set_block(p, lit, flag::ALL);
         }

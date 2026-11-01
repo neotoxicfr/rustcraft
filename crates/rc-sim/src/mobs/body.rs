@@ -316,6 +316,7 @@ impl Server {
                 // Once trampled, the mob is raised onto the dirt before its damage (fall sound
                 // and landing at the new height).
                 self.trample_farmland(effect_pos, on, m.fall_distance, Some(&mut *m), w, h);
+                self.turtle_egg_fall_on(effect_pos, Some(m.kind)); // G6-F08: before the damage
                 self.fall_on(m, on, m.fall_distance);
                 // Landing: state of the main supporting block, otherwise of the block at 0.2.
                 let st = self.st(m.support.unwrap_or(effect_pos));
@@ -662,9 +663,10 @@ impl Server {
     }
 
     /// Entity on the ground on the effect block `p` (0.2 below the feet), every tick after the
-    /// movement; `careful`: careful step (sneaking). True if the block burns the feet (magma);
-    /// a redstone ore lights up.
-    pub(crate) fn step_on_block(&mut self, p: [i32; 3], careful: bool) -> bool {
+    /// movement; `careful`: careful step (sneaking); `by`: the mob's species (`None`: the
+    /// player). True if the block burns the feet (magma); a redstone ore lights up; turtle eggs
+    /// may lose one (G6-F08).
+    pub(crate) fn step_on_block(&mut self, p: [i32; 3], careful: bool, by: Option<Kind>) -> bool {
         if careful {
             return false;
         }
@@ -676,6 +678,8 @@ impl Server {
         }
         if b == ids.redstone_ore || b == ids.deepslate_redstone_ore {
             self.redstone_ore_touch(p, s);
+        } else if b == ids.turtle_egg {
+            self.turtle_egg_step_on(p, by, careful);
         }
         false
     }
@@ -696,7 +700,7 @@ impl Server {
             }
             _ => self.mob_below(m, 0.2),
         };
-        if self.step_on_block(p, false) {
+        if self.step_on_block(p, false, Some(m.kind)) {
             self.mob_hurt(m, "minecraft:hot_floor", 1.0, None, None);
         }
     }
@@ -707,7 +711,7 @@ impl Server {
             return;
         }
         let p = self.on_pos(self.pos, self.player_support(), 0.2);
-        if self.step_on_block(p, self.sneaking) {
+        if self.step_on_block(p, self.sneaking, None) {
             self.hurt("minecraft:hot_floor", 1.0);
         }
     }

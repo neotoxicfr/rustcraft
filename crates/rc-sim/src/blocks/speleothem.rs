@@ -33,6 +33,12 @@ const FALL_HURT_MAX: i32 = 40;
 /// Column (x and z from 6 to 10 sixteenths) that a drop must find free to pass.
 const DRIP_MIN: f64 = 6.0 / 16.0;
 const DRIP_MAX: f64 = 10.0 / 16.0;
+/// Chances of a fluid transfer per random tick (water, lava).
+const DRIP_WATER: f32 = 0.175_781_25;
+const DRIP_LAVA: f32 = 0.058_593_75;
+/// Walks of a drop: from a stalactite to its root, from the tip to a cauldron and back (one
+/// less cell than this count).
+const DRIP_SCAN: i32 = 11;
 
 impl Server {
     /// Speleothem (either block) whose tip points towards `d`.
@@ -147,12 +153,12 @@ impl Server {
         }
     }
 
-    /// Random tick. Pointed dripstone first draws the random value of its fluid transfer (rule
-    /// of the speleothem fluid-transfer mission): the draw is kept here so that growth
-    /// reads the same value as the game.
+    /// Random tick. Pointed dripstone first draws the random value of its fluid transfer, then
+    /// growth draws its own.
     pub(crate) fn speleothem_random_tick(&mut self, s: u32, p: P, dripstone: bool) {
         if dripstone {
-            let _transfer = self.bs.rng.next_float();
+            let r = self.bs.rng.next_float();
+            self.dripstone_transfer(s, p, r);
         }
         if self.bs.rng.next_float() < GROWTH_CHANCE
             && self.spel_with_dir(s, Dir::Down)
@@ -263,6 +269,138 @@ impl Server {
                 return;
             }
         }
+    }
+
+    // --- Fluid transfer of pointed dripstone (G6-F08). ---
+
+    /// Fluid feeding a stalactite: walked up from `p` (same block, pointing down) to the first
+    /// other block (the root), then the cell above it: mud gives water (unless water
+    /// evaporates in this dimension), otherwise its fluid if it is a source. Returns (cell,
+    /// fluid: 0 none, 1 water, 2 lava, its state); `None` if `s` is not a stalactite or the
+    /// root is not found within 10 blocks.
+    fn drip_source(&self, s: u32, p: P) -> Option<(P, u8, u32)> {
+        if !self.spel_with_dir(s, Dir::Down) {
+            return None;
+        }
+        let v = self.v();
+        let block = v.block(s);
+        let mut q = p;
+        for _ in 1..DRIP_SCAN {
+            q = above(q);
+            let st = self.get(q);
+            if v.block(st) != block {
+                let a = above(q);
+                let at = self.get(a);
+                let fluid = if v.block(at) == self.bs.t.id.mud && self.dim.name != "minecraft:the_nether" {
+                    1
+                } else {
+                    match self.fluid_of(at) {
+                        f if f.source && f.kind == 1 => 1,
+                        f if f.source && f.kind == 2 => 2,
+                        _ => 0,
+                    }
+                };
+                return Some((a, fluid, at));
+            }
+            if !self.in_build_height(q[1]) || v.get_dir(st, TIP_DIR) != Some(Dir::Down) {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// The cauldron state `s` takes a drop of `fluid` (empty: water or lava; water cauldron:
+    /// water, even when full).
+    fn cauldron_takes_drip(&self, s: u32, fluid: u8) -> bool {
+        let (b, id) = (self.v().block(s), &self.bs.t.id);
+        (b == id.cauldron && fluid != 0) || (b == id.water_cauldron && fluid == 1)
+    }
+
+    /// First cell from `from` towards `d` (10 blocks at most) whose state satisfies `target`,
+    /// through cells a drop passes; `None` outside the world or at a blocking cell.
+    fn drip_walk(&self, from: P, d: Dir, target: impl Fn(u32) -> bool) -> Option<P> {
+        let mut q = from;
+        for _ in 1..DRIP_SCAN {
+            q = rel(q, d);
+            let st = self.get(q);
+            if target(st) {
+                return Some(q);
+            }
+            if !self.in_build_height(q[1]) || !self.drip_passes(st) {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Fluid transfer at the random tick (`r`: its draw): at the top of a stalactite, below
+    /// 0.17578125 for water or 0.05859375 for lava, the tip (10 blocks at most) drips. Mud above
+    /// the root dries into clay (entities raised, "block changed" with the clay); otherwise a
+    /// cauldron that takes the fluid below the tip gets a tick in 50 + the fall height. Event
+    /// 1504 at the tip in both cases.
+    fn dripstone_transfer(&mut self, s: u32, p: P, r: f32) {
+        if r > DRIP_WATER || self.v().block(self.get(above(p))) == self.v().block(s) {
+            return;
+        }
+        let Some((src, fluid, src_state)) = self.drip_source(s, p) else { return };
+        let chance = match fluid {
+            1 => DRIP_WATER,
+            2 => DRIP_LAVA,
+            _ => return,
+        };
+        if r >= chance {
+            return;
+        }
+        let Some(tip) = self.spel_find_tip(s, p, DRIP_SCAN) else { return };
+        if fluid == 1 && self.v().block(src_state) == self.bs.t.id.mud {
+            let clay = self.v().default_state(self.bs.t.id.clay);
+            self.set_update(src, clay);
+            // Gained part: from the top of the mud's collision shape to the full block.
+            let mud_top = self.data.shape(self.v().info(src_state).collision).iter().map(|b| b.max[1]).fold(0.0, f64::max);
+            self.push_entities_up(src, mud_top, 1.0);
+            self.game_event_block("minecraft:block_change", src, None, Some(clay));
+            self.level_event(1504, tip, 0);
+        } else if let Some(c) = self.drip_walk(tip, Dir::Down, |st| self.cauldron_takes_drip(st, fluid)) {
+            self.level_event(1504, tip, 0);
+            let cb = self.v().block(self.get(c));
+            self.schedule_tick(c, cb, 50 + tip[1] - c[1]);
+        }
+    }
+
+    /// Scheduled tick of an empty or water cauldron (the drop arrives): the free-hanging tip
+    /// above (10 blocks at most, through cells a drop passes) fed by water or lava fills it. Empty:
+    /// water cauldron (1047) or lava cauldron (1046); water cauldron: one level more unless
+    /// full (1047). "Block changed" with the new state.
+    pub(crate) fn cauldron_drip_tick(&mut self, s: u32, p: P) {
+        let free_tip = |st: u32| {
+            let v = self.v();
+            self.spel_with_dir(st, Dir::Down) && v.get(st, THICK) == Some("tip") && !v.get_bool(st, "waterlogged")
+        };
+        let Some(tip) = self.drip_walk(p, Dir::Up, free_tip) else { return };
+        let fluid = match self.drip_source(self.get(tip), tip) {
+            Some((_, f @ (1 | 2), _)) => f,
+            _ => return,
+        };
+        if !self.cauldron_takes_drip(s, fluid) {
+            return;
+        }
+        let v = self.v();
+        let (ns, event) = if v.block(s) == self.bs.t.id.cauldron {
+            if fluid == 1 {
+                (v.default_state(self.bs.t.id.water_cauldron), 1047)
+            } else {
+                (self.default_state("minecraft:lava_cauldron"), 1046)
+            }
+        } else {
+            let level = v.get_int(s, "level");
+            if level >= 3 {
+                return;
+            }
+            (v.set_int(s, "level", level + 1), 1047)
+        };
+        self.set_update(p, ns);
+        self.game_event_block("minecraft:block_change", p, None, Some(ns));
+        self.level_event(event, p, 0);
     }
 
     /// Does a drop pass through this state? Air yes; opaque block or fluid no; otherwise

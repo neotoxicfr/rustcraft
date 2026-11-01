@@ -2,7 +2,7 @@
 //! empty hand — cake (candle, eaten slice), candles put out by hand, flower
 //! pot, composter, cauldrons (buckets, bottles, washing), TNT with flint and steel, bell, dragon
 //! egg, jukebox, lectern, campfire, shelves, chiseled bookshelf, decorated pot, copper golem
-//! statue, light block, head placed on a note block; water bottle on
+//! statue, light block, head placed on a note block, redstone ore lit; water bottle on
 //! dirt (mud).
 
 use super::{Dir, Kind, P, below, flag};
@@ -46,6 +46,13 @@ impl Server {
                 return ItemOn::Pass;
             }
             _ => {}
+        }
+        // G6-F08: redstone ore lit by any use; a block item placeable against it goes on to its
+        // placement, anything else (empty hand included) is consumed.
+        let b = self.v().block(s);
+        if b == self.bs.t.id.redstone_ore || b == self.bs.t.id.deepslate_redstone_ore {
+            self.redstone_ore_touch(p, s);
+            return if self.block_item_placeable(&id, p, face, at) { ItemOn::Pass } else { ItemOn::Done };
         }
         let name = self.state_name(s).to_owned();
         let short = name.trim_start_matches("minecraft:");
@@ -115,6 +122,17 @@ impl Server {
             _ if short.ends_with("copper_golem_statue") => self.statue_use_item(p, s, short, &id, slot),
             _ => ItemOn::TryEmptyHand,
         }
+    }
+
+    /// The held item places a block, and its placement context finds a cell for it: the clicked
+    /// block replaced, or the neighbour on the clicked face (shape and survival rules aside).
+    fn block_item_placeable(&self, id: &str, clicked: P, face: Dir, at: [f32; 3]) -> bool {
+        if id.is_empty() || self.bs.t.block_id(rc_data::rules::placed_block(id)) == u16::MAX {
+            return false;
+        }
+        let upper = at[1] > 0.5;
+        self.replaceable_by(self.get(clicked), id, true, face, upper)
+            || self.replaceable_by(self.get(super::rel(clicked, face)), id, false, face, upper)
     }
 
     /// Use without an item of the blocks handled here; true if the action is consumed.

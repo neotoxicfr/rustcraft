@@ -1,5 +1,6 @@
 //! Gravity, fire, growth and "living" blocks (§ 2.2 to § 2.8): scheduled and random ticks of
-//! plants, grass, leaves, ice, snow, farmland.
+//! plants, grass, leaves, ice, snow, farmland; G6-F08: eyeblossoms (open at night, wake their
+//! neighbours), mushroom spread, pitcher crop growth, cauldrons fed by a stalactite.
 
 use super::{Dir, Kind, P, above, add, below, flag, rel};
 use crate::server::Server;
@@ -186,6 +187,14 @@ impl Server {
 
     pub(crate) fn copper_random_tick(&mut self, s: u32, p: P) {
         let Some(age) = self.copper_stage(s) else { return };
+        // A door ages from its lower half only (the upper half copies it); a chest from its
+        // single or left half, and never while someone has it open.
+        let v = self.v();
+        match v.kind(s) {
+            Kind::Door { .. } if v.get(s, "half") == Some("upper") => return,
+            Kind::Chest if v.get(s, "type") == Some("right") || self.life.openers.contains_key(&p) => return,
+            _ => {}
+        }
         if self.bs.rng.next_float() >= 0.056_888_89 {
             return;
         }
@@ -461,6 +470,19 @@ impl Server {
             // Dirt path: turns back into dirt unconditionally on its tick.
             _ if v.block(s) == self.bs.t.block_id("minecraft:dirt_path") => self.turn_to_dirt(p, None),
             Kind::FrostedIce => self.frosted_ice_tick(s, p),
+            // G6-F08: the drop of a stalactite reaches the cauldron (the other two cauldrons
+            // never take one).
+            _ if v.block(s) == self.bs.t.id.cauldron || v.block(s) == self.bs.t.id.water_cauldron => {
+                self.cauldron_drip_tick(s, p);
+            }
+            // G6-F08: eyeblossom woken by a neighbour that turned (short sound).
+            _ if self.is_eyeblossom(v.block(s)) => {
+                if self.eyeblossom_try_turn(s, p) {
+                    let open = v.block(s) != self.bs.t.id.open_eyeblossom;
+                    let sound = if open { "minecraft:block.eyeblossom.open" } else { "minecraft:block.eyeblossom.close" };
+                    self.block_sound(p, sound, 1.0, 1.0);
+                }
+            }
             // F05: full composter (level 7 → 8, "ready" sound).
             _ if self.state_name(s) == "minecraft:composter" && v.get_int(s, "level") == 7 => {
                 let ns = v.set_int(s, "level", 8);
@@ -684,7 +706,8 @@ impl Server {
             }
             Kind::Spreading => self.grass_random_tick(s, p),
             Kind::Nylium => {
-                if !self.can_be_grass(s, p) {
+                // Only the light through the top face counts (no snow or fluid rule).
+                if self.light.dampening_into(s, self.get(above(p)), Dir::Up as usize) >= 15 {
                     let n = self.v().default_state(self.bs.t.id.netherrack);
                     self.set_update(p, n);
                 }
@@ -728,19 +751,28 @@ impl Server {
                         h += 1;
                     }
                     if h < 3 {
+                        // The age is never sent to the clients (flags 260).
                         let age = v.get_int(s, "age");
                         if age == 15 {
                             let d = self.v().default_state(b);
                             self.set_update(above(p), d);
                             let ns = self.v().set_int(s, "age", 0);
-                            self.set_block(p, ns, flag::CLIENTS | flag::SKIP_BE_SIDE_EFFECTS);
+                            self.set_block(p, ns, flag::INVISIBLE | flag::SKIP_BE_SIDE_EFFECTS);
                         } else {
                             let ns = self.v().set_int(s, "age", age + 1);
-                            self.set_block(p, ns, flag::CLIENTS | flag::SKIP_BE_SIDE_EFFECTS);
+                            self.set_block(p, ns, flag::INVISIBLE | flag::SKIP_BE_SIDE_EFFECTS);
                         }
                     }
                 }
             }
+            // G6-F08: pitcher crop, lower half not ripe (only one that ticks): crop draw.
+            Kind::PitcherCrop => {
+                let speed = self.growth_speed(b, p);
+                if self.bs.rng.next_int_bound((25.0 / speed) as i32 + 1) == 0 {
+                    self.pitcher_grow(p, s, 1);
+                }
+            }
+            Kind::Mushroom => self.mushroom_random_tick(s, p), // G6-F08
             Kind::Cactus => self.cactus_random_tick(s, p),
             Kind::Vine => self.vine_random_tick(s, p),
             Kind::Bamboo { sapling } => self.bamboo_random_tick(s, p, sapling),
@@ -749,16 +781,119 @@ impl Server {
             Kind::BuddingAmethyst => self.budding_amethyst_random_tick(p),
             Kind::Speleothem { dripstone } => self.speleothem_random_tick(s, p, dripstone), // G6-F09a
             _ => {
-                let n = self.data.block_of(s).map_or("", |x| x.name.as_str());
-                if n == "minecraft:redstone_ore" || n == "minecraft:deepslate_redstone_ore" {
+                let id = &self.bs.t.id;
+                if b == id.redstone_ore || b == id.deepslate_redstone_ore {
                     if v.get_bool(s, "lit") {
                         let ns = v.set_bool(s, "lit", false);
                         self.set_block(p, ns, flag::ALL);
                     }
+                } else if b == id.turtle_egg {
+                    self.turtle_egg_random_tick(s, p); // G6-F08
+                } else if self.is_eyeblossom(b) {
+                    if self.eyeblossom_try_turn(s, p) {
+                        let open = b != self.bs.t.id.open_eyeblossom;
+                        let sound =
+                            if open { "minecraft:block.eyeblossom.open_long" } else { "minecraft:block.eyeblossom.close_long" };
+                        self.block_sound(p, sound, 1.0, 1.0);
+                    }
+                } else if b == id.potted_open_eyeblossom || b == id.potted_closed_eyeblossom {
+                    self.potted_eyeblossom_random_tick(s, p);
                 } else {
                     self.copper_random_tick(s, p);
                 }
             }
+        }
+    }
+
+    // --- Eyeblossoms (G6-F08): open at night in the overworld. ---
+
+    pub(crate) fn is_eyeblossom(&self, b: u16) -> bool {
+        b == self.bs.t.id.open_eyeblossom || b == self.bs.t.id.closed_eyeblossom
+    }
+
+    /// Environment attribute "eyeblossom open": the overworld day timeline opens them from
+    /// 12,600 to 23,400; elsewhere no opinion (`None`: the flower keeps its state).
+    fn eyeblossom_should_open(&self) -> Option<bool> {
+        (self.dim.name == "minecraft:overworld").then(|| (12_600..23_401).contains(&self.day_time()))
+    }
+
+    /// Trail particle of a turning eyeblossom: its draws of the world random (lifetime, then the
+    /// three velocity components). The `trail` particle itself is not sent: our particle
+    /// structure carries neither its target nor its duration, and the client does not draw it.
+    fn eyeblossom_trail_draws(&mut self) {
+        for _ in 0..4 {
+            let _ = self.bs.rng.next_double();
+        }
+    }
+
+    /// Eyeblossom that disagrees with the time of day: turned (flags 3, "block changed" with the
+    /// old state), trail particle, then every identical flower within ±3, ±2, ±3 gets a tick in
+    /// distance × 5 to distance × 10 ticks (one draw each, box scan order). True if it turned.
+    pub(crate) fn eyeblossom_try_turn(&mut self, s: u32, p: P) -> bool {
+        let open = self.v().block(s) == self.bs.t.id.open_eyeblossom;
+        if self.eyeblossom_should_open().unwrap_or(open) == open {
+            return false;
+        }
+        let to = if open { self.bs.t.id.closed_eyeblossom } else { self.bs.t.id.open_eyeblossom };
+        let ns = self.v().default_state(to);
+        self.set_update(p, ns);
+        self.game_event_block("minecraft:block_change", p, None, Some(s));
+        self.eyeblossom_trail_draws();
+        let mut same = Vec::new();
+        self.scan_box(add(p, -3, -2, -3), add(p, 3, 2, 3), |q| q == s, |q, _| {
+            same.push(q);
+            true
+        });
+        let b = self.v().block(s);
+        for q in same {
+            let d2 = (0..3).map(|i| f64::from(q[i] - p[i]).powi(2)).sum::<f64>();
+            let d = d2.sqrt();
+            let (lo, hi) = ((d * 5.0) as i32, (d * 10.0) as i32);
+            let delay = lo + self.bs.rng.next_int_bound(hi - lo + 1);
+            self.schedule_tick(q, b, delay);
+        }
+        true
+    }
+
+    /// Potted eyeblossom: turned at its random tick like the flower, without event or neighbours
+    /// (trail particle, then the long sound of the new state).
+    fn potted_eyeblossom_random_tick(&mut self, s: u32, p: P) {
+        let open = self.v().block(s) == self.bs.t.id.potted_open_eyeblossom;
+        if self.eyeblossom_should_open().unwrap_or(open) == open {
+            return;
+        }
+        let to = if open { self.bs.t.id.potted_closed_eyeblossom } else { self.bs.t.id.potted_open_eyeblossom };
+        let ns = self.v().default_state(to);
+        self.set_update(p, ns);
+        self.eyeblossom_trail_draws();
+        let sound = if open { "minecraft:block.eyeblossom.close_long" } else { "minecraft:block.eyeblossom.open_long" };
+        self.block_sound(p, sound, 1.0, 1.0);
+    }
+
+    /// Mushroom (G6-F08): one chance in 25, if at most 4 of the same mushroom stand in the 9×3×9
+    /// box; four random hops towards empty cells where it would hold, then a copy (flags 2) at
+    /// the last drawn cell if it is empty and holds it.
+    fn mushroom_random_tick(&mut self, s: u32, p: P) {
+        if self.bs.rng.next_int_bound(25) != 0 || !self.at_most_in_box(p, [-4, -1, -4], [4, 1, 4], self.v().block(s), 4) {
+            return;
+        }
+        let hop = |sv: &mut Self, from: P| {
+            let dx = sv.bs.rng.next_int_bound(3) - 1;
+            let dy = sv.bs.rng.next_int_bound(2) - sv.bs.rng.next_int_bound(2);
+            let dz = sv.bs.rng.next_int_bound(3) - 1;
+            add(from, dx, dy, dz)
+        };
+        let fits = |sv: &Self, q: P| sv.v().is_air(sv.get(q)) && sv.can_survive(s, q);
+        let mut base = p;
+        let mut q = hop(self, base);
+        for _ in 0..4 {
+            if fits(self, q) {
+                base = q;
+            }
+            q = hop(self, base);
+        }
+        if fits(self, q) {
+            self.set_block(q, s, flag::CLIENTS);
         }
     }
 
@@ -823,19 +958,19 @@ impl Server {
         }
     }
 
+    /// Grass and mycelium stay alive: a single snow layer above always lets them, a full fluid
+    /// never; otherwise the light entering through their top face must not be fully blocked,
+    /// shape of the block above included (a bottom slab, stairs or thicker snow kill them).
     fn can_be_grass(&self, s: u32, p: P) -> bool {
-        let _ = s;
         let a = self.get(above(p));
         let v = self.v();
         if v.block(a) == self.bs.t.id.snow && v.get_int(a, "layers") == 1 {
             return true;
         }
-        let f = self.fluid_of(a);
-        if f.amount == 8 {
+        if self.fluid_of(a).amount == 8 {
             return false;
         }
-        let damp = if v.info(a).has(rc_data::flags::SOLID_RENDER) { 15 } else { v.info(a).light_dampening };
-        damp < 15
+        self.light.dampening_into(s, a, Dir::Up as usize) < 15
     }
 
     fn grass_random_tick(&mut self, s: u32, p: P) {
@@ -901,12 +1036,13 @@ impl Server {
         } else if age == 15 && h < 3 {
             self.set_update(a, def);
             let ns = self.v().set_int(s, "age", 0);
-            self.set_block(p, ns, flag::CLIENTS | flag::SKIP_BE_SIDE_EFFECTS);
+            self.set_block(p, ns, flag::INVISIBLE | flag::SKIP_BE_SIDE_EFFECTS);
             self.neighbor_changed_full(ns, a, b, false);
         }
+        // The age is never sent to the clients (flags 260).
         if age < 15 {
             let ns = self.v().set_int(s, "age", age + 1);
-            self.set_block(p, ns, flag::CLIENTS | flag::SKIP_BE_SIDE_EFFECTS);
+            self.set_block(p, ns, flag::INVISIBLE | flag::SKIP_BE_SIDE_EFFECTS);
         }
     }
 

@@ -40,8 +40,10 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// longer accumulate a fall (saved field), the only cause of the change (checked by restoring the
 /// old accumulation: b7433a1e…, 823).
 /// Lot 6 integration: the three changes above together (alone: G5-F02c 267b491a…, 815;
-/// G5-F02a 6ffe4a73…, 815; G5-F02b c855a20f…, 823), merged with the rest of lot 6.
-const EXPECTED_NEW: (&str, usize) = ("24fde67e1af5bc1545c6cab4e16cdcba39e4adf26d419b0b75d40a0cab3707c9", 823);
+/// G5-F02a 6ffe4a73…, 815; G5-F02b c855a20f…, 823), merged with the rest of lot 6 (24fde67e…, 823).
+/// G6-F08: mushrooms spread at their random ticks, the only cause of the change (checked by
+/// turning each G6-F08 fix on alone: every other one keeps 24fde67e…).
+const EXPECTED_NEW: (&str, usize) = ("11bc637277f172f6a44bebd353b27897ccf5105e6d35fd6fcd0e301468a9319f", 823);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 const EXPECTED_MODEL: &[(&str, &str, usize)] = &[(
     "790b2d94653a4243e68f2e0cb0ebc3f865f9f59815ed65149067cdd374c6b800",
