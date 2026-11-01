@@ -49,6 +49,10 @@ zip.workspace = true
 # Messages from wgpu and the validation layers (`RUSTCRAFT_GPULOG`), already pulled in by wgpu.
 log = "0.4"
 
+# Vulkan driver identifier of the adapter (`gpu_backend.rs`), already pulled in by wgpu's Vulkan backend.
+[target.'cfg(any(windows, target_os = "linux"))'.dependencies]
+ash = { version = "0.38", default-features = false }
+
 [dev-dependencies]
 # Validation of the improved-transparency shaders in tests (`oit.rs`), already pulled in by wgpu.
 naga = { version = "30.0.1", features = ["wgsl-in"] }

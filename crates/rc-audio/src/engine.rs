@@ -773,6 +773,12 @@ impl AudioEngine {
         self.instances.len()
     }
 
+    /// Channels in use and reserve sizes, each `[normal, stream]` (F3 "Sounds" line). Without an
+    /// output both read zero, like the game whose two pools stay empty until a device opens.
+    pub fn channel_counts(&self) -> ([usize; 2], [usize; 2]) {
+        if self.has_output() { (self.counts, [self.max_normal, self.max_stream]) } else { ([0; 2], [0; 2]) }
+    }
+
     /// Plays a sound event. `pos`: `Some` = positioned, linear attenuation; `None` =
     /// relative to the listener, without attenuation. `seed`: seed of the packet, `None` = random.
     pub fn play(
@@ -1536,6 +1542,17 @@ mod tests {
         assert_eq!(&*e.instances[&cow.0].event, "minecraft:entity.cow.ambient");
         e.preview(Category::Master, 1.0);
         assert_eq!(e.preview.0, Some(cow), "master: no sound");
+    }
+
+    /// F3 "Sounds" counters: normal and stream channels counted apart, against the two reserve
+    /// sizes of a 255-source device (247 + 8).
+    #[test]
+    fn channel_counts_per_reserve() {
+        let Some(mut e) = engine() else { return };
+        assert_eq!(e.channel_counts(), ([0, 0], [247, 8]));
+        e.play_request(SoundRequest::new("minecraft:entity.cow.ambient", Category::Neutral)).expect("normal sound");
+        e.play_request(SoundRequest::new("minecraft:music.menu", Category::Music)).expect("streamed music");
+        assert_eq!(e.channel_counts(), ([1, 1], [247, 8]));
     }
 }
 

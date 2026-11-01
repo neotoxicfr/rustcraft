@@ -401,11 +401,10 @@ impl crate::App {
         }
     }
 
-    /// Frame limit per second, `None` = none: `maxFps`, 60 outside a world, 10 minimised (or
-    /// exclusive fullscreen without focus), 30 then 10 after 1 and 10 min without input. Automatic
-    /// captures are not limited (measurements), except `RUSTCRAFT_FPSLIMIT=1`.
-    pub(crate) fn fps_limit(&self) -> Option<u32> {
-        let r = self.renderer.as_ref()?;
+    /// The frame limiter's effective limit (`UNLIMITED` = none), shown by F3 after "T:": the
+    /// setting, 60 outside a world, 10 minimised, 30 then 10 without input.
+    pub(crate) fn frame_limit(&self) -> i32 {
+        let Some(r) = self.renderer.as_ref() else { return self.options.i("maxFps") };
         let input = LimitIn {
             max_fps: self.options.i("maxFps"),
             afk_limit: self.options.s("inactivityFpsLimit") == "afk",
@@ -414,9 +413,17 @@ impl crate::App {
             exclusive_fullscreen: matches!(r.window.fullscreen(), Some(winit::window::Fullscreen::Exclusive(_))),
             in_world: self.front.in_world,
         };
+        self.video.limiter.limit(&input)
+    }
+
+    /// Frame limit per second, `None` = none: `maxFps`, 60 outside a world, 10 minimised (or
+    /// exclusive fullscreen without focus), 30 then 10 after 1 and 10 min without input. Automatic
+    /// captures are not limited (measurements), except `RUSTCRAFT_FPSLIMIT=1`.
+    pub(crate) fn fps_limit(&self) -> Option<u32> {
+        let r = self.renderer.as_ref()?;
         static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let forced = *FORCED.get_or_init(|| rc_data::env_os!("RUSTCRAFT_FPSLIMIT").is_some_and(|v| v == "1"));
-        let mut limit = if self.capture.is_some() && !forced { UNLIMITED } else { self.video.limiter.limit(&input) };
+        let mut limit = if self.capture.is_some() && !forced { UNLIMITED } else { self.frame_limit() };
         // Vertical sync: the pacing follows the screen even if the driver lets the presentation
         // return without waiting (observed: several thousand frames per second in Fifo).
         if vsync_forced().unwrap_or_else(|| self.options.b("enableVsync"))

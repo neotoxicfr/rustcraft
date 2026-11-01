@@ -234,6 +234,41 @@ pub fn clip_blocks_with<'a>(
     shape: &dyn Fn(i32, i32, i32) -> Shape<'a>,
     interaction: Interaction<'a, '_>,
 ) -> Option<Hit> {
+    walk(from, to, |c| {
+        clip_shape(shape(c[0], c[1], c[2]), from, to, c)
+            .map(|h| interaction_face(h, interaction(c[0], c[1], c[2]), from, to))
+    })
+}
+
+/// Walk that also sees fluids: in each block, the nearer of the outline hit and of the fluid
+/// box hit (`fluid`: height of the block's fluid shape, `None` without fluid), the outline on a
+/// tie; the first block hit wins.
+pub fn clip_blocks_fluid<'a>(
+    from: [f64; 3],
+    to: [f64; 3],
+    shape: &dyn Fn(i32, i32, i32) -> Shape<'a>,
+    fluid: &dyn Fn(i32, i32, i32) -> Option<f64>,
+) -> Option<Hit> {
+    let at = |h: &Hit| match h {
+        Hit::Block { at, .. } | Hit::Entity { at, .. } => *at,
+        Hit::Miss => from,
+    };
+    walk(from, to, |c| {
+        let block = clip_shape(shape(c[0], c[1], c[2]), from, to, c);
+        let liquid = fluid(c[0], c[1], c[2]).and_then(|h| {
+            let b = [Aabb { min: [0.0; 3], max: [1.0, h, 1.0] }];
+            clip_shape(plain(&b), from, to, c)
+        });
+        match (block, liquid) {
+            (Some(b), Some(l)) => Some(if dist2(at(&b), from) <= dist2(at(&l), from) { b } else { l }),
+            (b, l) => b.or(l),
+        }
+    })
+}
+
+/// Walk over the blocks crossed from `from` to `to`: `test` gives the hit inside a block, the
+/// first block hit wins.
+fn walk(from: [f64; 3], to: [f64; 3], test: impl Fn([i32; 3]) -> Option<Hit>) -> Option<Hit> {
     if from == to {
         return None;
     }
@@ -241,10 +276,6 @@ pub fn clip_blocks_with<'a>(
     let t = [lerp(-1.0e-7, to[0], from[0]), lerp(-1.0e-7, to[1], from[1]), lerp(-1.0e-7, to[2], from[2])];
     let f = [lerp(-1.0e-7, from[0], to[0]), lerp(-1.0e-7, from[1], to[1]), lerp(-1.0e-7, from[2], to[2])];
     let mut c = f.map(|v| v.floor() as i32);
-    let test = |c: [i32; 3]| {
-        clip_shape(shape(c[0], c[1], c[2]), from, to, c)
-            .map(|h| interaction_face(h, interaction(c[0], c[1], c[2]), from, to))
-    };
     if let Some(h) = test(c) {
         return Some(h);
     }
@@ -532,6 +563,27 @@ mod tests {
         assert!(matches!(h, Hit::Entity { id: 7, .. }), "{h:?}");
     }
     const SLAB: [Aabb; 1] = [Aabb { min: [0.0; 3], max: [1.0, 0.5, 1.0] }];
+
+    /// Rays that see fluids: the fluid box is as high as the fluid. Over a lone source (8/9) the
+    /// ray at y = 62.95 reaches the stone behind; under more water (height 1) it stops on the
+    /// source. A slab in water: the nearer of the two shapes (the water's top at 63).
+    #[test]
+    fn fluid_box_as_high_as_the_fluid() {
+        let stone = |_: i32, y: i32, z: i32| plain(if y == 62 && z == 3 { &FULL[..] } else { &[] });
+        let (from, to) = ([0.5, 62.95, 0.5], [0.5, 62.95, 5.5]);
+        let lone = |_: i32, y: i32, z: i32| (y == 62 && z == 1).then_some(f64::from(8.0f32 / 9.0));
+        let h = clip_blocks_fluid(from, to, &stone, &lone);
+        assert!(matches!(h, Some(Hit::Block { pos: [0, 62, 3], .. })), "{h:?}");
+        let covered = |_: i32, y: i32, z: i32| (y == 62 && z == 1).then_some(1.0);
+        let h = clip_blocks_fluid(from, to, &stone, &covered);
+        assert!(matches!(h, Some(Hit::Block { pos: [0, 62, 1], .. })), "{h:?}");
+        let slab = |_: i32, y: i32, _: i32| plain(if y == 62 { &SLAB[..] } else { &[] });
+        let down = ([0.5, 64.5, 0.5], [0.5, 60.5, 0.5]);
+        let h = clip_blocks_fluid(down.0, down.1, &slab, &|_, y, _| (y == 62).then_some(1.0));
+        assert!(matches!(h, Some(Hit::Block { pos: [0, 62, 0], at, .. }) if at[1] == 63.0), "{h:?}");
+        let h = clip_blocks_fluid(down.0, down.1, &slab, &|_, _, _| None);
+        assert!(matches!(h, Some(Hit::Block { pos: [0, 62, 0], at, .. }) if at[1] == 62.5), "{h:?}");
+    }
 
     fn floor_at(y0: i32) -> impl Fn(i32, i32, i32) -> Shape<'static> {
         move |_, y, _| plain(if y <= y0 { &FULL[..] } else { &[] })

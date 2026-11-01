@@ -169,6 +169,8 @@ pub struct Mobs {
     pub halloween: Option<bool>,
     /// Buffers of the crossed-block pass (player and mobs).
     pub(crate) inside: crate::inside_blocks::Scratch,
+    /// Last natural spawn census (F3 "SC" line).
+    pub census: Option<spawn::Census>,
 }
 
 impl Default for Mobs {
@@ -212,6 +214,7 @@ impl Default for Mobs {
             bells: Vec::new(),
             halloween: Server::halloween_override(),
             inside: Default::default(),
+            census: None,
         }
     }
 }

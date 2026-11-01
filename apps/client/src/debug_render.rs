@@ -1333,7 +1333,7 @@ fn water_levels(
 }
 
 /// Height of a received heightmap at the local point (x, z): first free block.
-fn heightmap_at(longs: &[i64], x: i32, z: i32, height: i32, min_y: i32) -> Option<i32> {
+pub(crate) fn heightmap_at(longs: &[i64], x: i32, z: i32, height: i32, min_y: i32) -> Option<i32> {
     let bits = (32 - (height as u32 + 1).saturating_sub(1).leading_zeros()).max(1);
     let per = 64 / bits;
     let i = (x.rem_euclid(16) + z.rem_euclid(16) * 16) as u32;

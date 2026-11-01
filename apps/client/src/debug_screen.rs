@@ -12,6 +12,8 @@ use std::time::Instant;
 use rc_text::StyledChar;
 
 use crate::gui::Gui;
+// The game's `%.Nf` (half up on the shortest digits), for every real of the lines.
+use crate::tech_blocks::java_fixed as jfix;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
@@ -276,7 +278,9 @@ struct CachedLine {
 }
 
 pub struct DebugScreen {
-    status: Vec<Status>,
+    /// Status per entry; `None`: absent from the saved map (shown as "never", but a quick
+    /// toggle turns it always on, overlay or not).
+    status: Vec<Option<Status>>,
     /// Unknown ids read from the file: kept as they are.
     unknown: Vec<(String, String)>,
     pub profile: Option<Profile>,
@@ -363,7 +367,7 @@ impl DebugScreen {
     /// unreadable: default profile and file rewritten).
     pub fn new(dir: Option<PathBuf>) -> DebugScreen {
         let mut d = DebugScreen {
-            status: vec![Status::Never; ENTRIES.len()],
+            status: vec![None; ENTRIES.len()],
             unknown: Vec::new(),
             profile: None,
             overlay: false,
@@ -431,12 +435,12 @@ impl DebugScreen {
             return true;
         }
         let Some(custom) = v.get("custom").and_then(|c| c.as_object()) else { return false };
-        self.status.fill(Status::Never);
+        self.status.fill(None);
         self.unknown.clear();
         for (k, s) in custom {
             let Some(st) = s.as_str() else { continue };
             match (index(k), Status::parse(st)) {
-                (Some(i), Some(st)) => self.status[i] = st,
+                (Some(i), Some(st)) => self.status[i] = Some(st),
                 _ => self.unknown.push((k.clone(), st.to_owned())),
             }
         }
@@ -453,10 +457,11 @@ impl DebugScreen {
                 m.insert("profile".into(), p.name().into());
             }
             None => {
+                // Every status of the map, explicit "never" included (an absent entry stays absent).
                 let mut c = serde_json::Map::new();
                 for (i, e) in ENTRIES.iter().enumerate() {
-                    if self.status[i] != Status::Never {
-                        c.insert(format!("minecraft:{}", e.id), self.status[i].name().into());
+                    if let Some(s) = self.status[i] {
+                        c.insert(format!("minecraft:{}", e.id), s.name().into());
                     }
                 }
                 for (k, v) in &self.unknown {
@@ -481,11 +486,11 @@ impl DebugScreen {
     }
 
     fn load_profile_quiet(&mut self, p: Profile) {
-        self.status.fill(Status::Never);
+        self.status.fill(None);
         self.unknown.clear();
         for &(id, s) in p.statuses() {
             if let Some(i) = index(id) {
-                self.status[i] = s;
+                self.status[i] = Some(s);
             }
         }
         self.profile = Some(p);
@@ -498,25 +503,27 @@ impl DebugScreen {
         self.save();
     }
 
+    /// Status shown (an entry absent from the map reads as "never").
     pub fn status_of(&self, i: usize) -> Status {
-        self.status[i]
+        self.status[i].unwrap_or(Status::Never)
     }
 
     /// Status set by hand: custom profile, save.
     pub fn set_status(&mut self, i: usize, s: Status) {
-        self.status[i] = s;
+        self.status[i] = Some(s);
         self.profile = None;
         self.rebuild();
         self.save();
     }
 
-    /// Quick toggle (§ 1.5): returns true if the entry is now shown.
+    /// Quick toggle (§ 1.5): returns true if the entry is now shown. An entry absent from the
+    /// map (never set since the profile) becomes always on, even with the overlay open.
     pub fn toggle(&mut self, id: &str) -> bool {
         let Some(i) = index(id) else { return false };
         let (s, shown) = match (self.status[i], self.overlay) {
-            (Status::AlwaysOn, _) | (Status::InOverlay, true) => (Status::Never, false),
-            (Status::InOverlay, false) | (Status::Never, false) => (Status::AlwaysOn, true),
-            (Status::Never, true) => (Status::InOverlay, true),
+            (Some(Status::AlwaysOn), _) | (Some(Status::InOverlay), true) => (Status::Never, false),
+            (Some(Status::InOverlay | Status::Never), false) | (None, _) => (Status::AlwaysOn, true),
+            (Some(Status::Never), true) => (Status::InOverlay, true),
         };
         self.set_status(i, s);
         shown
@@ -581,9 +588,9 @@ impl DebugScreen {
         let reduced = self.reduced();
         for (i, e) in ENTRIES.iter().enumerate() {
             let on = match self.status[i] {
-                Status::AlwaysOn => true,
-                Status::InOverlay => self.overlay,
-                Status::Never => false,
+                Some(Status::AlwaysOn) => true,
+                Some(Status::InOverlay) => self.overlay,
+                Some(Status::Never) | None => false,
             };
             self.active[i] = on && (!reduced || e.reduced);
         }
@@ -835,28 +842,6 @@ fn device_type(t: wgpu::DeviceType) -> &'static str {
     }
 }
 
-fn vendor_name(id: u32) -> &'static str {
-    match id {
-        0x10DE => "NVIDIA Corporation",
-        0x1002 | 0x1022 => "ATI Technologies Inc.",
-        0x8086 => "Intel",
-        0x13B5 => "ARM",
-        0x5143 => "Qualcomm",
-        0x106B => "Apple",
-        _ => "<unknown>",
-    }
-}
-
-fn backend_name(b: wgpu::Backend) -> &'static str {
-    match b {
-        wgpu::Backend::Vulkan => "Vulkan",
-        wgpu::Backend::Dx12 => "DX12",
-        wgpu::Backend::Metal => "Metal",
-        wgpu::Backend::Gl => "OpenGL",
-        _ => "Unknown",
-    }
-}
-
 /// Angle brought into [−180, 180).
 pub(crate) fn wrap_degrees(a: f32) -> f32 {
     let mut v = a % 360.0;
@@ -869,15 +854,43 @@ pub(crate) fn wrap_degrees(a: f32) -> f32 {
     v
 }
 
-/// Height of a received heightmap (`heightmaps` of a column) at the local point (x, z).
+/// Height shown for a received heightmap (`heightmaps` of a column) at the local point (x, z): the
+/// highest block taken, one below the first free height that the map stores (like the game's
+/// per-chunk reading).
 fn heightmap_at(maps: &[(i32, Box<[i64]>)], kind: i32, x: i32, z: i32, height: i32, min_y: i32) -> Option<i32> {
     let (_, longs) = maps.iter().find(|h| h.0 == kind)?;
-    let bits = (32 - (height as u32 + 1).saturating_sub(1).leading_zeros()).max(1);
-    let per = 64 / bits;
-    let i = (x.rem_euclid(16) + z.rem_euclid(16) * 16) as u32;
-    let long = *longs.get((i / per) as usize)? as u64;
-    let v = (long >> ((i % per) * bits)) & ((1u64 << bits) - 1);
-    Some(v as i32 + min_y)
+    crate::debug_render::heightmap_at(longs, x, z, height, min_y).map(|v| v - 1)
+}
+
+/// "fps" line: frames of the last second, effective limit ("inf" without one), presentation, rate.
+fn fps_line(fps: u32, limit: i32, present: &str, hz: &str) -> String {
+    if limit == crate::video::UNLIMITED {
+        format!("{fps} fps T: inf{present} @{hz}Hz")
+    } else {
+        format!("{fps} fps T: {limit}{present} @{hz}Hz")
+    }
+}
+
+/// F3 entries fed by the integrated server (`rc_sim::debug_report`).
+const SERVER_ENTRIES: [&str; 5] = ["entity_spawn_counts", "heightmap", "local_difficulty", "player_position", "tps"];
+
+/// "SH" line: server maps S, O, M, ML; "??" while the server chunk is not loaded (multiplayer:
+/// always).
+fn server_heightmaps_line(maps: Option<[i32; 4]>) -> String {
+    match maps {
+        Some([s, o, m, ml]) => format!("SH S: {s} O: {o} M: {m} ML: {ml}"),
+        None => "SH S: ?? O: ?? M: ?? ML: ??".into(),
+    }
+}
+
+/// "SC" line: spawn chunks, then mobs per category with the game's abbreviations ("misc" last,
+/// never counted).
+fn spawn_counts_line((chunks, counts): (i32, [i32; 7])) -> String {
+    let mut s = format!("SC: {chunks}");
+    for (abbr, n) in ["MO", "C", "AM", "AX", "UWC", "WC", "WA"].iter().zip(counts) {
+        s += &format!(", {abbr}: {n}");
+    }
+    s + ", MI: 0"
 }
 
 impl crate::App {
@@ -900,6 +913,13 @@ impl crate::App {
         let block = feet.map(|v| v.floor() as i32);
         let view =
             crate::environ::WorldView { grid: &self.world.grid, min_y: self.world.min_y, height: self.world.height };
+        // Values of the integrated server, asked only while one of their entries is shown.
+        let server = match &self.solo {
+            Some(solo) if SERVER_ENTRIES.iter().any(|id| self.debug.is_on(id)) => {
+                solo.debug_report(&self.dimension, block)
+            }
+            _ => None,
+        };
         for (i, e) in ENTRIES.iter().enumerate() {
             if !e.text || !self.debug.active[i] {
                 continue;
@@ -910,16 +930,11 @@ impl crate::App {
                     c.priority(format!("Minecraft {v} ({v}/vanilla)"));
                 }
                 "fps" => {
-                    let limit = o.i("maxFps");
                     let hz = r.window.current_monitor().and_then(|m| m.refresh_rate_millihertz()).unwrap_or(0);
                     let hz =
                         if hz % 1000 == 0 { (hz / 1000).to_string() } else { format!("{:.2}", f64::from(hz) / 1000.0) };
-                    c.priority(format!(
-                        "{} fps T: {}{} @{hz}Hz",
-                        self.debug.fps,
-                        if limit >= 260 { "inf".to_owned() } else { limit.to_string() },
-                        present_mode(r.present_mode)
-                    ));
+                    // Limit of the frame limiter (inactivity, menus outside a world), not the setting.
+                    c.priority(fps_line(self.debug.fps, self.frame_limit(), present_mode(r.present_mode), &hz));
                 }
                 "tps" if self.positioned => {
                     // Cadence of the client's world (singleplayer included: `ticking_state` goes through the
@@ -932,22 +947,25 @@ impl crate::App {
                     } else {
                         ""
                     };
-                    let (tx, rx) = (self.debug.tx_avg, self.debug.rx_avg);
+                    let (tx, rx) = (jfix(f64::from(self.debug.tx_avg), 0), jfix(f64::from(self.debug.rx_avg), 0));
                     if self.solo.is_some() {
-                        // Integrated server: smoothed tick duration (method) and target.
+                        // Integrated server: smoothed tick duration (method) and target ("-" in sprint).
                         let mspt = 1000.0 / t.rate.max(1.0);
-                        let smooth = self.debug.logs.smoothed_tick_ms;
-                        c.line(format!("Integrated server @ {smooth:.1}/{mspt:.1} ms{run}, {tx:.0} tx, {rx:.0} rx"));
+                        let smooth = jfix(f64::from(self.debug.logs.smoothed_tick_ms), 1);
+                        let sprint = server.is_some_and(|r| r.sprinting);
+                        let (run, target) =
+                            if sprint { (" (sprinting)", "-".to_owned()) } else { (run, jfix(f64::from(mspt), 1)) };
+                        c.line(format!("Integrated server @ {smooth}/{target} ms{run}, {tx} tx, {rx} rx"));
                     } else {
                         let brand = self.session.link.stats.brand().unwrap_or_else(|| "null".into());
-                        c.line(format!("\"{brand}\" server{run}, {tx:.0} tx, {rx:.0} rx"));
+                        c.line(format!("\"{brand}\" server{run}, {tx} tx, {rx} rx"));
                     }
                 }
                 "detailed_memory" | "memory" => {
                     self.debug.memory_lines(&mut c, e.id == "detailed_memory", now, report);
                 }
                 "system_specs" => {
-                    let info = &r.adapter_info;
+                    let (info, gt) = (&r.adapter_info, &r.gpu_text);
                     let (pw, ph) = r.size();
                     let sf = r.window.scale_factor();
                     let (lw, lh) = ((f64::from(pw) / sf).round(), (f64::from(ph) / sf).round());
@@ -955,11 +973,11 @@ impl crate::App {
                     let g = c.group("system");
                     g.push(format!("Rust: {}", env!("RC_RUSTC_VERSION")));
                     g.push(format!("CPU: {cpu}"));
-                    g.push(format!("Display: {pw}x{ph} ({})", vendor_name(info.vendor)));
-                    g.push(format!("Window: {lw}x{lh} ({sf:.2}x pixel density)"));
+                    g.push(format!("Display: {pw}x{ph} ({})", gt.vendor));
+                    // The game's density is single precision.
+                    g.push(format!("Window: {lw}x{lh} ({}x pixel density)", jfix(f64::from(sf as f32), 2)));
                     g.push(format!("{}{}", info.name, device_type(info.device_type)));
-                    let driver = format!("{} {}", info.driver, info.driver_info);
-                    g.push(format!("{} {}", backend_name(info.backend), driver.lines().next().unwrap_or("").trim()));
+                    g.push(format!("{} {}", gt.backend, gt.driver.lines().next().unwrap_or("")));
                 }
                 "gpu_utilization" => {
                     let p = self.debug.gpu_percent;
@@ -1038,7 +1056,7 @@ impl crate::App {
                         _ => ("east", "Towards positive X"),
                     };
                     let g = c.group("position");
-                    g.push(format!("XYZ: {:.3} / {:.5} / {:.3}", feet[0], feet[1], feet[2]));
+                    g.push(format!("XYZ: {} / {} / {}", jfix(feet[0], 3), jfix(feet[1], 5), jfix(feet[2], 3)));
                     g.push(format!("Block: {} {} {}", block[0], block[1], block[2]));
                     g.push(format!(
                         "Chunk: {cx} {} {cz} [{} {} in r.{}.{}.mca]",
@@ -1049,11 +1067,12 @@ impl crate::App {
                         cz >> 5
                     ));
                     g.push(format!(
-                        "Facing: {name} ({text}) ({:.1} / {:.1})",
-                        wrap_degrees(self.yaw),
-                        wrap_degrees(self.pitch)
+                        "Facing: {name} ({text}) ({} / {})",
+                        jfix(f64::from(wrap_degrees(self.yaw)), 1),
+                        jfix(f64::from(wrap_degrees(self.pitch)), 1)
                     ));
-                    g.push(format!("{} FC: 0", self.dimension));
+                    // Force-loaded chunks of the server's level (singleplayer), none otherwise.
+                    g.push(format!("{} FC: {}", self.dimension, server.map_or(0, |r| r.forced)));
                 }
                 "player_section_position" => {
                     let [x, y, z] = block.map(|v| v & 15);
@@ -1062,7 +1081,7 @@ impl crate::App {
                 "player_speed" => {
                     let d: [f64; 3] = std::array::from_fn(|a| self.player.pos[a] - self.prev_pos[a]);
                     let s = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-                    c.group("position").push(format!("Speed: {s:.3} blocks/tick"));
+                    c.group("position").push(format!("Speed: {} blocks/tick", jfix(s, 3)));
                 }
                 "looking_at_block_state" | "looking_at_fluid_state" => {
                     let fluid = e.id == "looking_at_fluid_state";
@@ -1127,7 +1146,21 @@ impl crate::App {
                     };
                     let g = c.group("heightmaps");
                     g.push(format!("CH S: {} M: {} ML: {}", v(1), v(4), v(5)));
-                    g.push("SH S: ?? O: ?? M: ?? ML: ??".into());
+                    g.push(server_heightmaps_line(server.and_then(|r| r.heightmaps)));
+                }
+                "local_difficulty" => {
+                    if let Some((eff, special)) = server.and_then(|r| r.local_difficulty) {
+                        c.line(format!(
+                            "Local Difficulty: {} // {}",
+                            jfix(f64::from(eff), 2),
+                            jfix(f64::from(special), 2)
+                        ));
+                    }
+                }
+                "entity_spawn_counts" => {
+                    if let Some(census) = server.and_then(|r| r.spawn) {
+                        c.line(spawn_counts_line(census));
+                    }
                 }
                 "biome" => {
                     if block[1] >= self.world.min_y && block[1] < self.world.min_y + self.world.height {
@@ -1147,9 +1180,9 @@ impl crate::App {
                     }
                 }
                 "sound_mood" => {
-                    let used = self.audio.peek().map_or(0, |a| a.active());
+                    let ([n, s], [nmax, smax]) = self.audio.peek().map_or(([0; 2], [0; 2]), |a| a.channel_counts());
                     let mood = (self.world_sounds.mood() * 100.0).round() as i32;
-                    c.line(format!("Sounds: {used}/247 + 0/8 (Mood {mood}%)"));
+                    c.line(format!("Sounds: {n}/{nmax} + {s}/{smax} (Mood {mood}%)"));
                 }
                 "sound_cache" => {
                     let (n, b) = self.audio.peek().map_or((0, 0), |a| (a.cache_len(), a.cache_bytes()));
@@ -1162,7 +1195,7 @@ impl crate::App {
                         c.group("chunk_generation").extend(solo.gen_debug(block));
                     }
                 }
-                // Singleplayer only (local difficulty, spawns) and effects: nothing.
+                // Post effects: nothing.
                 _ => {}
             }
         }
@@ -1203,18 +1236,26 @@ impl crate::App {
         let dir = crate::camera::forward(self.yaw, self.pitch);
         let to = [eye[0] + f64::from(dir.x) * 20.0, eye[1] + f64::from(dir.y) * 20.0, eye[2] + f64::from(dir.z) * 20.0];
         let data = &self.data;
-        static FULL: [rc_data::Aabb; 1] = [rc_data::Aabb { min: [0.0; 3], max: [1.0; 3] }];
         // Outline shape seen by the player (held item, block offset), like the aiming.
         let (full, held) = (self.act.full_shape, self.held_name());
         let shape = |x: i32, y: i32, z: i32| -> crate::pick::Shape<'_> {
-            let s = view.state(x, y, z);
-            match data.state(s) {
-                Some(i) if fluid && i.fluid != 0 => crate::pick::plain(&FULL),
-                _ => crate::aim_shape(data, full, held, s, [x, y, z])
-                    .map_or_else(|| crate::pick::plain(&[]), |(i, shift)| (data.shape(i), shift)),
-            }
+            crate::aim_shape(data, full, held, view.state(x, y, z), [x, y, z])
+                .map_or_else(|| crate::pick::plain(&[]), |(i, shift)| (data.shape(i), shift))
         };
-        match crate::pick::clip_blocks(eye, to, &shape) {
+        let hit = if fluid {
+            // Fluid entries: also the fluid's own shape, as high as the fluid (full under the
+            // same fluid), the nearer of the two counting in each block.
+            let fluids = &self.phys.fluids;
+            let height = |x: i32, y: i32, z: i32| {
+                let s = view.state(x, y, z);
+                (fluids.fluid(s) != rc_physics::Fluid::None)
+                    .then(|| f64::from(fluids.height_at(s, view.state(x, y + 1, z))))
+            };
+            crate::pick::clip_blocks_fluid(eye, to, &shape, &height)
+        } else {
+            crate::pick::clip_blocks(eye, to, &shape)
+        };
+        match hit {
             Some(crate::pick::Hit::Block { pos, .. }) => Some(pos),
             _ => None,
         }
@@ -1305,8 +1346,79 @@ mod tests {
 
     #[test]
     fn heightmap_decode() {
-        // Height 384: 9 bits, 7 values per long; cell (1, 0) = 70 → y = 70 − 64.
+        // Height 384: 9 bits, 7 values per long; cell (1, 0) = 70 → first free y = 70 − 64 = 6,
+        // shown as the highest block taken: 5.
         let maps = vec![(1, vec![70i64 << 9].into_boxed_slice())];
-        assert_eq!(heightmap_at(&maps, 1, 1, 0, 384, -64), Some(6));
+        assert_eq!(heightmap_at(&maps, 1, 1, 0, 384, -64), Some(5));
+    }
+
+    /// Entry absent from the map (default profile, never toggled): the quick toggle shows it
+    /// always, overlay open or not; once turned off, "never" is written and the next toggle
+    /// with the overlay open gives "in overlay".
+    #[test]
+    fn toggle_of_an_entry_without_status() {
+        let mut d = DebugScreen::new(None);
+        d.set_overlay(true);
+        let i = index("chunk_borders").unwrap();
+        assert!(d.toggle("chunk_borders"));
+        assert_eq!(d.status_of(i), Status::AlwaysOn, "absent: always on even with the overlay");
+        assert!(!d.toggle("chunk_borders"));
+        assert!(d.to_json().contains(r#""minecraft:chunk_borders":"never""#), "{}", d.to_json());
+        let mut e = DebugScreen::new(None);
+        assert!(e.parse(&d.to_json()));
+        e.set_overlay(true);
+        assert!(e.toggle("chunk_borders"));
+        assert_eq!(e.status_of(i), Status::InOverlay, "explicit never kept by the file");
+    }
+
+    /// Lines fed by the integrated server, and the effective frame limit after "T:".
+    #[test]
+    fn server_and_fps_lines() {
+        assert_eq!(server_heightmaps_line(None), "SH S: ?? O: ?? M: ?? ML: ??");
+        assert_eq!(server_heightmaps_line(Some([63, 60, 63, 62])), "SH S: 63 O: 60 M: 63 ML: 62");
+        assert_eq!(
+            spawn_counts_line((289, [3, 1, 2, 0, 0, 4, 5])),
+            "SC: 289, MO: 3, C: 1, AM: 2, AX: 0, UWC: 0, WC: 4, WA: 5, MI: 0"
+        );
+        // Menus outside a world: 60 whatever the setting.
+        let limiter = crate::video::FrameLimiter::default();
+        let input = crate::video::LimitIn {
+            max_fps: 120,
+            afk_limit: true,
+            minimized: false,
+            focused: true,
+            exclusive_fullscreen: false,
+            in_world: false,
+        };
+        assert_eq!(fps_line(59, limiter.limit(&input), " (fifo)", "60"), "59 fps T: 60 (fifo) @60Hz");
+        assert_eq!(fps_line(400, crate::video::UNLIMITED, "", "144"), "400 fps T: inf @144Hz");
+    }
+
+    /// Micro-bench: the game's rounding for the ten reals of an open F3 screen (XYZ, facing,
+    /// speed, tick times, packets, pixel density), against Rust's own `{:.N}`.
+    #[test]
+    #[ignore = "micro-bench"]
+    fn bench_java_rounding() {
+        let vals = [123.456_789, 64.0, -987.654_321, 22.25, -45.5, 0.125, 50.0, 2.5, 0.75, 1.25];
+        let places = [3, 5, 3, 1, 1, 3, 1, 0, 0, 2];
+        let n = 200_000u32;
+        let mut len = 0;
+        for pass in 0..2 {
+            let t = Instant::now();
+            for _ in 0..n {
+                for (v, p) in vals.iter().zip(places) {
+                    len += jfix(std::hint::black_box(*v), p).len();
+                }
+            }
+            let java = t.elapsed().as_nanos() as f64 / f64::from(n);
+            let t = Instant::now();
+            for _ in 0..n {
+                for (v, p) in vals.iter().zip(places) {
+                    len += format!("{:.*}", p, std::hint::black_box(*v)).len();
+                }
+            }
+            let rust = t.elapsed().as_nanos() as f64 / f64::from(n);
+            eprintln!("pass {pass}: 10 reals per frame: game rounding {java:.0} ns, Rust {{:.N}} {rust:.0} ns ({len})");
+        }
     }
 }

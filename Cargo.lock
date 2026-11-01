@@ -2234,6 +2234,7 @@ dependencies = [
 name = "rc-app"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "base64",
  "bytemuck",
  "crossbeam-channel",
