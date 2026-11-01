@@ -2773,10 +2773,16 @@ Bench `bench_g6f08_scan_and_grass` (ignored; `--ignored bench_g6f08 --nocapture`
   engine, pair table of occluded edges, then the attenuation table) instead of the old plain
   attenuation read: 1.53-1.57 ns against 6.78-6.88 ns per test over the whole state table (the
   old path read the 24-byte state info twice). Faithful and faster: kept, no switch.
+- Pointed dripstone fluid transfer (bench `bench_speleothem_random_tick_and_geyser`, top of a
+  dry stalactite): 24.4-24.6 ns per random tick, stone 23.4-23.9 ns in the same runs (25/10,
+  before the transfer: 15.6 against 21.7). 82 % of the draws leave on the first float compare;
+  otherwise the block above, then the cell above the root (no walk from the top). Lead measured
+  and discarded: reading the root directly instead of the walk of the shared helper, 24.4-24.8 ns
+  against 24.4-24.6 (3 alternated passes, nothing measurable). Multi-core and GPU not
+  applicable (one block per random tick, world random order).
 - Not hot, not optimised further: turtle egg (rare random ticks), eyeblossom (day time compare
   first, scan only when it turns), copper (two property reads before the draw), pitcher crop and
-  mushroom (crop draw, 1/25 draw before any scan), pointed dripstone transfer (82 % of the draws
-  leave on the first float compare; otherwise at most 10 reads up and 10 down). Redstone ore
+  mushroom (crop draw, 1/25 draw before any scan). Redstone ore
   touch: 6 neighbour reads for the server's particle draws. Multi-core and GPU not applicable
   (world random order imposed, work of a few hundred nanoseconds per event); no allocation per
   tick (the eyeblossom wake-up list is allocated only when a flower turns).
