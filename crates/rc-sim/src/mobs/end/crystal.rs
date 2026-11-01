@@ -169,7 +169,7 @@ impl Server {
         if self.game_mode == 3 || self.life.vit.dead {
             return true;
         }
-        let b = c.bbox();
+        let (b, pos) = (c.bbox(), c.pos);
         let eye = [self.pos[0], self.player_eye_y(), self.pos[2]];
         let cl: [f64; 3] = std::array::from_fn(|k| eye[k].clamp(b.min[k], b.max[k]));
         if super::super::mth::dist2(eye, cl) >= 36.0 {
@@ -177,9 +177,16 @@ impl Server {
         }
         self.mobs.attack_ticker = 0;
         let creative = self.game_mode == 1;
-        if self.crystal_hurt(id, "minecraft:player_attack", Some(Ent::Player), creative) {
-            // Non-living target hit: the player forgets their last victim.
+        // G5-F04: damage source of the weapon (its type, the mace's smash).
+        let weapon = self.player_weapon();
+        let smash = weapon.as_ref().is_some_and(|w| w.id == crate::mace::MACE)
+            && crate::mace::can_smash(self.life.vit.fall, self.proj_player.fall_flying);
+        let ty = self.weapon_damage_type(weapon.as_ref(), smash, "minecraft:player_attack");
+        if self.crystal_hurt(id, &ty, Some(Ent::Player), creative) {
+            // Non-living target hit: the player forgets their last victim; the weapon's after-hit
+            // effects still run (Wind Burst).
             self.set_last_hurt_mob(Some(Ent::Player), None);
+            self.player_weapon_post_attack(crate::commands::ents::E::Other(id), pos, &ty, weapon.as_ref());
         }
         true
     }

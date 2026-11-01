@@ -18,17 +18,24 @@ use crate::projectiles::ench::level_value;
 use crate::randsrc::Rand;
 use crate::server::Server;
 
-/// One side of a hit: the current player, or a mob held outside the list by the caller.
+/// One side of a hit: the current player, a mob held outside the list by the caller, or another
+/// struck entity (armor stand, minecart, crystal, another local-network player) seen only by its
+/// identifier and position: no equipment read, no effect applied to it.
 pub(crate) enum Side<'a> {
     Player,
     Mob(&'a mut Mob),
+    Other(E, [f64; 3]),
+    /// As the attacker only: the victim itself (hit by its own projectile). `Hit::side` and
+    /// `Hit::split` resolve it to the victim.
+    Itself,
 }
 
 impl Side<'_> {
-    pub(crate) fn ent(&self) -> Ent {
+    fn ent(&self) -> Option<Ent> {
         match self {
-            Side::Player => Ent::Player,
-            Side::Mob(m) => Ent::Mob(m.id),
+            Side::Player => Some(Ent::Player),
+            Side::Mob(m) => Some(Ent::Mob(m.id)),
+            Side::Other(..) | Side::Itself => None,
         }
     }
 
@@ -36,6 +43,8 @@ impl Side<'_> {
         match self {
             Side::Player => Who::E(E::Player),
             Side::Mob(m) => Who::Mob(m),
+            Side::Other(e, _) => Who::E(*e),
+            Side::Itself => unreachable!("resolved to the victim by Hit::side"),
         }
     }
 }
@@ -59,17 +68,18 @@ pub(crate) struct Hit<'a> {
 
 impl<'a> Hit<'a> {
     fn side(&self, r: Role) -> Option<&Side<'a>> {
-        match r {
-            Role::Victim => Some(&self.victim),
-            Role::Attacker => self.attacker.as_ref(),
+        match (r, &self.attacker) {
+            (Role::Victim, _) | (Role::Attacker, Some(Side::Itself)) => Some(&self.victim),
+            (Role::Attacker, a) => a.as_ref(),
         }
     }
 
-    /// The side `r` mutable and the other side readable.
+    /// The side `r` mutable and the other side readable (none when both are the same entity).
     fn split(&mut self, r: Role) -> (Option<&mut Side<'a>>, Option<&Side<'a>>) {
-        match r {
-            Role::Victim => (Some(&mut self.victim), self.attacker.as_ref()),
-            Role::Attacker => (self.attacker.as_mut(), Some(&self.victim)),
+        match (r, &mut self.attacker) {
+            (_, Some(Side::Itself)) => (Some(&mut self.victim), None),
+            (Role::Victim, a) => (Some(&mut self.victim), a.as_ref()),
+            (Role::Attacker, a) => (a.as_mut(), Some(&self.victim)),
         }
     }
 }
@@ -242,6 +252,7 @@ impl Server {
             let s = match &hit.victim {
                 Side::Player => player_slot(self.held, k).and_then(|i| self.slots[i].as_ref()),
                 Side::Mob(m) => m.equipment[k].as_ref(),
+                Side::Other(..) | Side::Itself => None,
             };
             // Only an enchanted item is copied (the effects may change the slot while they run).
             let Some(s) = s.filter(|s| enchanted(&self.life.items, s)).cloned() else { continue };
@@ -252,6 +263,14 @@ impl Server {
         {
             self.post_attack_item(hit, w, Role::Attacker, 0);
         }
+    }
+
+    /// After-hit effects of the player's weapon on a struck entity that is neither the player nor
+    /// a mob (`victim` at `pos`: armor stand, minecart, crystal, another local-network player);
+    /// the victim's equipment is not read.
+    pub(crate) fn player_weapon_post_attack(&mut self, victim: E, pos: [f64; 3], ty: &str, weapon: Option<&Stack>) {
+        let mut hit = Hit { ty, victim: Side::Other(victim, pos), attacker: Some(Side::Player), direct: true };
+        self.post_attack(&mut hit, weapon);
     }
 
     /// After-hit effects of a melee hit of the mob `m` (held outside the list) on `t`: the
@@ -275,10 +294,8 @@ impl Server {
     /// After-hit effects of a hit on `t` caused by `by` through a projectile or another entity: the
     /// victim's equipment only (thorns on the shooter); the shooter is looked up in the list.
     pub(crate) fn post_attack_by(&mut self, t: Ent, by: Option<Ent>, ty: &str) {
-        // The player hit by its own projectile: nobody to hurt back.
-        if t == Ent::Player && by == Some(Ent::Player) {
-            return;
-        }
+        // Hit by its own projectile (`by == t`): the victim is its own attacker, like the game (its
+        // thorns hurt it and wear the piece).
         let take = |s: &mut Server, id: i32| s.mob_index(id).and_then(|i| Some((i, s.mobs.list[i].take()?)));
         let mut victim = match t {
             Ent::Player => None,
@@ -292,6 +309,7 @@ impl Server {
             _ => None,
         };
         let attacker = match (by, shooter.as_mut()) {
+            (Some(b), _) if b == t => Some(Side::Itself),
             (Some(Ent::Player), _) => Some(Side::Player),
             (_, Some((_, a))) => Some(Side::Mob(a.as_mut())),
             _ => None,
@@ -366,13 +384,15 @@ impl Server {
 
     fn hit_ctx<'h>(&'h self, hit: &'h Hit<'_>) -> Ctx<'h> {
         let origin = self.side_pos(&hit.victim);
-        self.damage_ctx(hit.ty, hit.victim.who(), origin, hit.attacker.as_ref().map(Side::who), hit.direct)
+        self.damage_ctx(hit.ty, hit.victim.who(), origin, hit.side(Role::Attacker).map(Side::who), hit.direct)
     }
 
     fn side_pos(&self, s: &Side<'_>) -> [f64; 3] {
         match s {
             Side::Player => self.pos,
             Side::Mob(m) => m.pos,
+            Side::Other(_, p) => *p,
+            Side::Itself => unreachable!("resolved to the victim by Hit::side"),
         }
     }
 
@@ -396,7 +416,7 @@ impl Server {
                         }
                     }
                     Some(Side::Mob(m)) => self.mob_hurt_slot(m, k, n),
-                    None => {}
+                    _ => {}
                 }
             }
             "ignite" => {
@@ -404,7 +424,7 @@ impl Server {
                 match hit.split(target).0 {
                     Some(Side::Player) => self.player_ignite(ticks),
                     Some(Side::Mob(m)) => crate::inside_blocks::mob_ignite(m, ticks),
-                    None => {}
+                    _ => {}
                 }
             }
             "apply_mob_effect" => self.fx_mob_effect(hit, e, lvl, target),
@@ -420,7 +440,7 @@ impl Server {
     fn fx_damage(&mut self, hit: &mut Hit<'_>, e: &Value, lvl: i32, owner: Role, target: Role) {
         let (lo, hi) = (level_value(&e["min_damage"], lvl), level_value(&e["max_damage"], lvl));
         let ty = crate::commands::args::id(e["damage_type"].as_str().unwrap_or("minecraft:generic"));
-        let src_ent = hit.side(owner).map(Side::ent);
+        let src_ent = hit.side(owner).and_then(Side::ent);
         let src_pos = hit.side(owner).map(|s| self.side_pos(s));
         let same = owner == target;
         let (t, other) = hit.split(target);
@@ -453,7 +473,7 @@ impl Server {
                     }
                 }
             }
-            None => {}
+            _ => {}
         }
     }
 
@@ -486,7 +506,7 @@ impl Server {
                 let (id, ticks, amp) = draw(&mut m.rng);
                 self.give_mob_effect(m, &id, ticks, amp);
             }
-            None => {}
+            _ => {}
         }
     }
 
@@ -547,7 +567,7 @@ impl Server {
                 let (v, p) = (sample(&e["volume"], &mut m.rng), sample(&e["pitch"], &mut m.rng));
                 (m.pos, Self::mob_sound_source(m), v, p)
             }
-            None => return,
+            _ => return,
         };
         self.world_sound(&name, cat, pos, vol, pitch);
     }

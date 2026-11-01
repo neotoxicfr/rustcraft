@@ -1212,8 +1212,22 @@ impl Server {
         self.player_attribute(name)
     }
 
-    fn player_weapon(&self) -> Option<Stack> {
+    /// Weapon of a player hit: the item of the spin attack in progress, otherwise the held one.
+    pub(crate) fn player_weapon(&self) -> Option<Stack> {
+        if self.proj_player.spin > 0
+            && let Some(s) = &self.proj_player.spin_item
+        {
+            return Some(s.clone());
+        }
         self.slots[36 + self.held as usize].clone()
+    }
+
+    /// Base damage of a player hit: that of the spin attack in progress, otherwise the attribute.
+    pub(crate) fn player_base_damage(&self) -> f32 {
+        if self.proj_player.spin > 0 {
+            return self.proj_player.spin_damage;
+        }
+        self.player_attr("minecraft:attack_damage") as f32
     }
 
     /// Player hit on a mob.
@@ -1244,7 +1258,7 @@ impl Server {
 
     pub(crate) fn player_attack_mob(&mut self, m: &mut Mob) {
         let weapon = self.player_weapon();
-        let mut base = self.player_attr("minecraft:attack_damage") as f32;
+        let mut base = self.player_base_damage();
         let speed = self.player_attr("minecraft:attack_speed");
         let delay = (1.0 / speed * 20.0) as f32;
         let scale = ((self.mobs.attack_ticker as f32 + 0.5) / delay).clamp(0.0, 1.0);
@@ -1347,7 +1361,7 @@ impl Server {
                 }
             }
             let dealt = old_h - m.health;
-            self.s9_player_hit_mob(m, total, dealt, weapon.as_ref()); // S9
+            self.s9_player_hit_mob(m, ty, total, dealt, weapon.as_ref()); // S9
             if dealt > 2.0 {
                 let n = (dealt * 0.5) as i32;
                 self.particles(
@@ -1381,7 +1395,7 @@ impl Server {
             return;
         }
         let weapon = self.player_weapon();
-        let mut base = self.player_attr("minecraft:attack_damage") as f32;
+        let mut base = self.player_base_damage();
         let speed = self.player_attr("minecraft:attack_speed");
         let delay = (1.0 / speed * 20.0) as f32;
         let scale = ((self.mobs.attack_ticker as f32 + 0.5) / delay).clamp(0.0, 1.0);
@@ -1463,7 +1477,8 @@ impl Server {
         if magic > 0.0 {
             let _ = self.send(Event::Entity(EntityEvent::Animate { id, action: 2 }));
         }
-        // G5-F04: the mace's smash on the other player (on the ground or not), then the fall reset.
+        // G5-F04: the mace's smash on the other player (on the ground or not), the weapon's
+        // after-hit effects (Wind Burst; the victim's equipment is not read), then the fall reset.
         if smash {
             let (on_ground, uuid) = self.as_player(who, |sv| (sv.on_ground, sv.uuid));
             let st = crate::mace::Struck {
@@ -1475,9 +1490,10 @@ impl Server {
                 on_pos: self.on_pos(pos, None, 1.0e-5),
             };
             self.player_smash(&st);
-            if crate::mace::can_smash(self.life.vit.fall, self.proj_player.fall_flying) {
-                self.life.vit.fall = 0.0;
-            }
+        }
+        self.player_weapon_post_attack(crate::commands::ents::E::Other(id), pos, &ty, weapon.as_ref());
+        if smash && crate::mace::can_smash(self.life.vit.fall, self.proj_player.fall_flying) {
+            self.life.vit.fall = 0.0;
         }
         if let Some(w) = &weapon {
             let per = self.weapon_wear(w);
@@ -1488,9 +1504,9 @@ impl Server {
         let dealt = old_h - new_h;
         // Like on a mob: damage dealt, weapon used, `player_hurt_entity`; then the
         // kill credit if the victim dies of it.
-        self.s9_player_hit(None, total, dealt, weapon.as_ref());
+        self.s9_player_hit(None, &ty, total, dealt, weapon.as_ref());
         if let Some(victim) = killed {
-            self.s9_player_killed_player(&victim);
+            self.s9_player_killed_player(&victim, &ty);
         }
         if dealt > 2.0 {
             let h = if sneak { 1.5 } else { 1.8 };

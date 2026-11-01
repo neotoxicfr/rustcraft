@@ -186,6 +186,40 @@ fn armor_stand_equips_and_breaks_in_two_hits() {
     done(p, dir);
 }
 
+/// G5-F04: an armor stand is a living entity: a mace smash on it stops the fall (vertical speed
+/// 0.01, level event 2013) and resets the fall distance, so no fall damage on landing; with Wind
+/// Burst the player is launched again.
+#[test]
+fn armor_stand_takes_mace_smash() {
+    let Some((mut p, dir)) = probe("deco-stand-mace") else { return };
+    hold(&mut p, "minecraft:armor_stand", 1);
+    p.s.use_item_on_block([106, -60, 106], Dir::Up, [0.5, 1.0, 0.5]);
+    let id = decos(&p, DKind::Stand)[0].0;
+    let smash = |p: &mut Probe, mace: Stack| {
+        p.s.slots[36 + p.s.held as usize] = Some(mace);
+        p.s.equipment_tick();
+        p.s.on_ground = false;
+        p.s.life.vit.fall = 10.0;
+        p.s.mobs.attack_ticker = 100;
+        p.s.mobs.player_vel = [0.0; 3];
+        p.take_events();
+        assert!(p.s.deco_attacked(id));
+        p.take_events()
+    };
+    let ev = smash(&mut p, Stack { id: "minecraft:mace".into(), count: 1, components: None });
+    assert_eq!(p.s.life.vit.fall, 0.0, "fall not reset");
+    assert_eq!(p.s.mobs.player_vel[1], f64::from(0.01f32), "fall not stopped");
+    assert!(ev.iter().any(|e| matches!(e, rc_client::Event::LevelEvent { kind: 2013, .. })), "level event");
+    assert_eq!(decos(&p, DKind::Stand).len(), 1, "broken on the first hit");
+    p.s.time += 10;
+    let mut burst = Stack { id: "minecraft:mace".into(), count: 1, components: None };
+    let fields = vec![("minecraft:wind_burst".to_owned(), Nbt::Int(1))];
+    crate::items::set_component(&mut burst, "minecraft:enchantments", Nbt::Compound(fields.into_iter().collect()));
+    smash(&mut p, burst);
+    assert!(p.s.mobs.player_vel[1] > 0.5, "player not launched: {:?}", p.s.mobs.player_vel);
+    done(p, dir);
+}
+
 /// Cushion: placed on top of a block with the item's color; refused on a side;
 /// anchor removed, it drops as an item at the check; network data: color (index 8).
 #[test]

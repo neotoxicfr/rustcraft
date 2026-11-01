@@ -379,6 +379,7 @@ impl Server {
             let stamp = o.last_hurt_by_mob.map_or(0, |h| h.1);
             if !d.phase.sitting() && stamp < o.tick_count - 2 {
                 self.mob_hurt_by(&mut o, m, "minecraft:mob_attack", 5.0);
+                self.dragon_post_attack(m, d, &mut o); // even without a hit dealt, like the game
             }
             self.mobs.list[i] = Some(o);
         }
@@ -413,6 +414,7 @@ impl Server {
             let Some(i) = self.mob_index(id) else { continue };
             let Some(mut o) = self.mobs.list[i].take() else { continue };
             self.mob_hurt_by(&mut o, m, "minecraft:mob_attack", 10.0);
+            self.dragon_post_attack(m, d, &mut o); // even without a hit dealt, like the game
             self.mobs.list[i] = Some(o);
         }
         if self.game_mode != 1
@@ -432,6 +434,24 @@ impl Server {
     fn dragon_thorns(&mut self, m: &mut Mob, d: &mut Dragon) {
         m.end.dragon = Some(Box::new(d.clone()));
         self.player_thorns(m, "minecraft:mob_attack");
+        if let Some(back) = m.end.dragon.take() {
+            *d = *back;
+        }
+    }
+
+    /// After-hit effects of a wing or bite hit on the mob `o` (taken out of the list), with the
+    /// dragon's state put back like for the player's thorns: its equipment (thorns), then the
+    /// dragon's empty main hand.
+    fn dragon_post_attack(&mut self, m: &mut Mob, d: &mut Dragon, o: &mut Mob) {
+        m.end.dragon = Some(Box::new(d.clone()));
+        let weapon = m.equipment[0].clone();
+        let mut hit = crate::ench_fx::Hit {
+            ty: "minecraft:mob_attack",
+            victim: crate::ench_fx::Side::Mob(o),
+            attacker: Some(crate::ench_fx::Side::Mob(m)),
+            direct: true,
+        };
+        self.post_attack(&mut hit, weapon.as_ref());
         if let Some(back) = m.end.dragon.take() {
             *d = *back;
         }

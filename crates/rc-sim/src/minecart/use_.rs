@@ -115,8 +115,8 @@ impl Server {
     }
 
     fn player_attack_cart(&mut self, c: &mut Cart) {
-        let weapon = self.slots[36 + self.held as usize].clone();
-        let mut base = self.player_attribute("minecraft:attack_damage") as f32;
+        let weapon = self.player_weapon();
+        let mut base = self.player_base_damage();
         let speed = self.player_attribute("minecraft:attack_speed");
         let delay = (1.0 / speed * 20.0) as f32;
         let scale = ((self.mobs.attack_ticker as f32 + 0.5) / delay).clamp(0.0, 1.0);
@@ -174,6 +174,8 @@ impl Server {
             }
             // Non-living target: the player forgets their last victim (wolf that helps them).
             self.set_last_hurt_mob(Some(Ent::Player), None);
+            // G5-F04: the weapon's after-hit effects still run on a non-living target (Wind Burst).
+            self.player_weapon_post_attack(crate::commands::ents::E::Other(c.id), c.pos, &ty, weapon.as_ref());
             let invul = self.abilities().invulnerable;
             self.life.vit.exhaust(0.1, invul);
         } else {

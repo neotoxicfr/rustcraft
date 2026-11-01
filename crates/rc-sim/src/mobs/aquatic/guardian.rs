@@ -360,10 +360,9 @@ impl Server {
 /// Thorns (2 damage) to the living direct attacker if the guardian does not move, then restarted
 /// wandering; before the damage itself.
 pub fn before_hurt(s: &mut Server, m: &mut Mob, ty: &str, by: Option<Ent>) {
-    let direct_living = matches!(
-        ty,
-        "minecraft:mob_attack" | "minecraft:mob_attack_no_aggro" | "minecraft:player_attack" | "minecraft:sting"
-    );
+    // Direct living: the attacker is the direct entity (melee of any kind, mace smash, spear,
+    // sonic boom...), not a projectile.
+    let direct_living = matches!(crate::loot::direct_of(ty), Some(None));
     if !m.aqua.moving
         && direct_living
         && !s.dmg_tag(ty, "minecraft:avoids_guardian_thorns")

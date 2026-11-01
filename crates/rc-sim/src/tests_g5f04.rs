@@ -471,3 +471,124 @@ fn player_protection_from_pack() {
     assert!((p.s.life.vit.health - expect).abs() < 1e-4, "{} for {expect}", p.s.life.vit.health);
     done(p, dir);
 }
+
+fn adv(p: &Probe, id: &str) -> bool {
+    let i = *p.s.prog.tree.index.get(id).unwrap_or_else(|| panic!("advancement {id} missing"));
+    p.s.prog.done(i)
+}
+
+/// A falling player holding a mace, ready to smash.
+fn ready_to_smash(p: &mut Probe, mace: Stack, fall: f64) {
+    p.s.slots[36 + p.s.held as usize] = Some(mace);
+    p.s.equipment_tick();
+    p.s.on_ground = false;
+    p.s.life.vit.fall = fall;
+    p.s.mobs.attack_ticker = 100;
+    p.s.mobs.player_vel = [0.0; 3];
+}
+
+/// The thorns of a still guardian answer any hit whose attacker is the direct entity: a mace
+/// smash (type `mace_smash`) costs the player 2 HP.
+#[test]
+fn guardian_thorns_answer_mace_smash() {
+    let Some((mut p, dir)) = probe("g5f04-guardian") else { return };
+    p.s.set_difficulty(2, true);
+    ready_to_smash(&mut p, st("minecraft:mace"), 4.0);
+    let mut g = p.s.new_mob(Kind::Guardian, [110.5, -59.0, 111.5], 180.0);
+    g.attrs.max_health.base = 500.0;
+    g.health = 500.0;
+    g.aqua.moving = false;
+    p.s.player_attack_mob(&mut g);
+    assert_eq!(g.last_hit.as_ref().map(|h| h.ty.as_str()), Some("minecraft:mace_smash"));
+    let lost = 20.0 - p.s.life.vit.health;
+    assert!((lost - 2.0).abs() < 1e-4, "guardian thorns: {lost} HP lost");
+    done(p, dir);
+}
+
+/// `player_hurt_entity` sees the hit's real type: a Density V smash after a 25-block fall
+/// (22 + 17 + 2.5 × 25 by fall, over 100 before armor) grants Over-Overkill.
+#[test]
+fn overoverkill_from_mace_smash() {
+    let Some((mut p, dir)) = probe("g5f04-overoverkill") else { return };
+    ready_to_smash(&mut p, enchanted("minecraft:mace", &[("minecraft:density", 5)]), 25.0);
+    let mut z = tank(&mut p, [110.5, -59.0, 111.5]);
+    assert!(!adv(&p, "minecraft:adventure/overoverkill"));
+    p.s.player_attack_mob(&mut z);
+    assert!(500.0 - z.health > 100.0, "smash too weak: {}", 500.0 - z.health);
+    assert!(adv(&p, "minecraft:adventure/overoverkill"), "over-overkill not granted");
+    done(p, dir);
+}
+
+/// Wing and bite hits of the dragon run the after-hit effects of the struck mob: a zombie wearing
+/// thorns (level 10: always) wears its chestplate by 2; the thorns damage itself is refused by
+/// the dragon (only a player's source or `always_hurts_ender_dragons` hurts it, like the game).
+#[test]
+fn dragon_bite_meets_mob_thorns() {
+    use crate::mobs::end::phases::Phase;
+    let Some((mut p, dir)) = probe("g5f04-dragon-thorns") else { return };
+    let mut m = p.s.new_mob(Kind::EnderDragon, [110.5, -50.0, 110.5], 0.0);
+    m.end.dragon.as_mut().expect("dragon").set_phase(Phase::HoldingPattern);
+    let hp = m.health;
+    let mut z = tank(&mut p, [110.5, -59.0, 112.5]);
+    z.equipment[4] = Some(enchanted("minecraft:iron_chestplate", &[("minecraft:thorns", 10)]));
+    let (zid, area) = (z.id, z.bbox());
+    p.s.add_mob(z);
+    let mut d = m.end.dragon.take().expect("dragon");
+    p.s.dragon_bite(&mut m, &mut d, area);
+    m.end.dragon = Some(d);
+    let z = p.s.mob_ref(zid).expect("zombie");
+    assert!(z.health < 500.0, "bite without effect");
+    assert_eq!(wear(z.equipment[4].as_ref()), 2, "thorns wear");
+    assert_eq!(m.health, hp, "a mob's thorns hurt the dragon");
+    done(p, dir);
+}
+
+/// The spin attack of a trident is the player's full melee hit: a zombie wearing thorns (level
+/// 10: always) touched by it hurts the player back and wears its chestplate.
+#[test]
+fn spin_attack_meets_mob_thorns() {
+    let Some((mut p, dir)) = probe("g5f04-spin") else { return };
+    p.s.set_difficulty(2, true);
+    let trident = st("minecraft:trident");
+    p.s.slots[36 + p.s.held as usize] = Some(trident.clone());
+    p.s.equipment_tick();
+    p.s.mobs.attack_ticker = 100;
+    p.s.proj_player.spin = 20;
+    p.s.proj_player.spin_damage = 8.0;
+    p.s.proj_player.spin_item = Some(trident);
+    let mut z = tank(&mut p, [110.5, -59.0, 110.9]);
+    z.equipment[4] = Some(enchanted("minecraft:iron_chestplate", &[("minecraft:thorns", 10)]));
+    let zid = z.id;
+    p.s.add_mob(z);
+    p.s.spin_attack_tick();
+    assert_eq!(p.s.proj_player.spin, 0, "spin not stopped by the hit");
+    let z = p.s.mob_ref(zid).expect("zombie");
+    assert!(z.health < 500.0, "spin hit without damage");
+    assert_eq!(wear(z.equipment[4].as_ref()), 2, "thorns wear");
+    let lost = 20.0 - p.s.life.vit.health;
+    assert!((1.0..=5.0).contains(&lost), "player thorns damage {lost}");
+    done(p, dir);
+}
+
+/// Hit by its own projectile, the victim is its own attacker: its thorns (level 10: always) wear
+/// the piece and hurt it, for the player (2 by thorns + 1 for the thorns damage it takes on its
+/// armor) and for a mob (a mob's armor does not wear on a hit).
+#[test]
+fn own_projectile_meets_own_thorns() {
+    let Some((mut p, dir)) = probe("g5f04-own-arrow") else { return };
+    p.s.set_difficulty(2, true);
+    let thorny = enchanted("minecraft:iron_chestplate", &[("minecraft:thorns", 10)]);
+    p.s.slots[6] = Some(thorny.clone());
+    p.s.post_attack_by(Ent::Player, Some(Ent::Player), "minecraft:arrow");
+    assert_eq!(wear(p.s.slots[6].as_ref()), 3, "player's thorns wear");
+    assert!(p.s.life.vit.health < 20.0, "player's thorns on itself");
+    let mut z = tank(&mut p, [110.5, -59.0, 113.5]);
+    z.equipment[4] = Some(thorny);
+    let zid = z.id;
+    p.s.add_mob(z);
+    p.s.post_attack_by(Ent::Mob(zid), Some(Ent::Mob(zid)), "minecraft:arrow");
+    let z = p.s.mob_ref(zid).expect("zombie");
+    assert_eq!(wear(z.equipment[4].as_ref()), 2, "mob's thorns wear");
+    assert!(z.health < 500.0, "mob's thorns on itself");
+    done(p, dir);
+}

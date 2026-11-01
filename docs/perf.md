@@ -2783,3 +2783,11 @@ Tracking range read by the passengers: immediate exit without a passenger (no al
   enchantments per piece).
 - Mace smash: event code (one hit), area knockback over the mob list once.
 - Sweep: the weapon's bonus is computed per swept mob (one more enchantment read per target).
+- Review (01/11): after-hit effects added on the dragon's wing and bite hits on mobs (one
+  `post_attack` per mob struck, plus one copy of the dragon state per hit so that a thorns
+  reaction sees it; event code, a few mobs per hit at most), on the player's hits on armor
+  stands, minecarts, crystals and other local-network players (weapon only: no equipment walk),
+  and on a projectile that hits its own shooter; the spin attack now goes through the player's
+  melee path (one hit per spin). No hot path touched: the per-tick and per-hit costs above are
+  unchanged (same bench, the mob melee path is identical). Multi-core and GPU not applicable
+  (single events, ordered by the game).
