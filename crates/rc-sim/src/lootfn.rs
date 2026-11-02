@@ -829,13 +829,11 @@ fn rgb_color(rgb: &[Value]) -> i32 {
     (255 << 24) | (ch(0) << 16) | (ch(1) << 8) | ch(2)
 }
 
-/// Wear set (`damage` component, removed at 0 like the default value).
+/// Wear set (`damage` component, floored at 0). Always written, never removed: an item without a
+/// default wear keeps `damage:0` and so stays usable; for an item whose default is 0 the patch
+/// write drops the entry, as before.
 pub fn set_damage(s: &mut Stack, d: i32) {
-    if d <= 0 {
-        crate::items::remove_component(s, "minecraft:damage");
-    } else {
-        set_component(s, "minecraft:damage", Nbt::Int(d));
-    }
+    set_component(s, "minecraft:damage", Nbt::Int(d.max(0)));
 }
 
 #[cfg(test)]

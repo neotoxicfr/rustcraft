@@ -505,11 +505,8 @@ impl Server {
             let to_repair = (self.ench_value(&s, KEY, amount as f32, &ctx) as i32).max(0);
             let damage = self.life.items.damage(&s);
             let repair = to_repair.min(damage);
-            if damage - repair == 0 {
-                crate::items::remove_component(&mut s, "minecraft:damage");
-            } else {
-                crate::items::set_component(&mut s, "minecraft:damage", rc_proto::nbt::Nbt::Int(damage - repair));
-            }
+            // Written even at 0 (an item without a default wear must keep its `damage` to stay usable).
+            crate::items::set_component(&mut s, "minecraft:damage", rc_proto::nbt::Nbt::Int(damage - repair));
             self.slots[slot] = Some(s);
             if repair <= 0 {
                 return 0;
@@ -1337,9 +1334,10 @@ impl Server {
         self.s9_item_damaged(&s, dmg.min(max), dmg >= max); // S9
         let mut s = s;
         if dmg >= max {
-            // Broken: stack −1, break sound.
+            // Broken: stack −1, break sound; the rest of the stack keeps the wear, capped at the
+            // durability (so it is broken too).
             s.count -= 1;
-            crate::items::remove_component(&mut s, "minecraft:damage");
+            crate::items::set_component(&mut s, "minecraft:damage", rc_proto::nbt::Nbt::Int(max));
             self.slots[slot] = (s.count > 0).then_some(s);
             self.use_stack_emptied(slot); // bow, brush, shield broken mid-use
             // W8c: break event specific to the slot (47 main hand, 48 off hand, 49-52

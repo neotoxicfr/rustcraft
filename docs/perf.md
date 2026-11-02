@@ -3320,8 +3320,15 @@ runs), so only the order of magnitude is claimed.
   fishing +4.7 / +1.8 % (mean +3.6 / +1.0 %). Two earlier 4-pass series: generic +1.2 %, `dyn`
   +0.5 %. The enum, which does the least work, is the slowest: inlining and layout of the
   incremental 16-unit build, not the algorithm; old-code passes alone spread 1.5-2 %. Kept:
-  `dyn` (one instance, best mean). To re-measure on a quiet machine with the full release
-  profile: the three spellings are one signature apart in `Loot::expand`.
+  `dyn` (one instance, best mean). C6 not met as written: the generic and enum spellings are
+  compile-time shapes of the same code, they cannot sit behind a run-time switch (a branch
+  would itself change the inlining being measured), and the gap (+0.1 % between generic and
+  `dyn`) is inside the old code's own spread, so they were not kept behind a `cfg` either. To
+  re-measure on a quiet machine with the full release profile, rebuild by hand: generic =
+  `Loot::expand` takes `out: &mut F` with `F: FnMut(Cand<'v>, &mut dyn Rand)` (recursive calls
+  unchanged); enum = `out` becomes a two-case target, a pool's candidate buffer (pushed
+  directly) or the container-contents creator (stack made at once), matched where `push` is
+  called.
 - `Items::max_stack`: the removal (`!max_stack_size`) is read in the same pass over the patch as
   the value (one length test more per entry, no second scan); `damageable` answers a patch-free
   stack with one item lookup (before: two empty component lookups then the same item lookup).
@@ -3332,3 +3339,8 @@ runs), so only the order of magnitude is claimed.
   No measurable cost: none of them is on a per-tick path.
 - Not applicable: multi-core and GPU (a draw is one chain on one generator, a few
   microseconds); the value-check change removes a draw, it adds no work.
+- Review follow-up: wear brought back to 0 (set_damage, Mending) and the rest of a broken stack
+  are written through the patch writer instead of a removal (same single lookup of the item's
+  defaults); the composter reads `compostable` on the stack (one patch lookup before the same
+  default lookup) for the click, the hopper and the farmer. Event-driven paths, nothing per
+  tick: no measurement.

@@ -545,6 +545,53 @@ fn removed_components_read_like_the_game() {
     assert!(fails.is_empty(), "{fails:#?}");
 }
 
+/// L10: wear brought back to 0 (loot function, Mending) is written, not removed: a stick given a
+/// durability and a wear stays usable; a broken stack of two keeps the full wear on what remains.
+#[test]
+fn wear_back_to_zero_keeps_the_item_usable() {
+    let mut p = world("l10wear");
+    let mut fails: Vec<String> = Vec::new();
+    let stick = |extra: &str| {
+        with(
+            "minecraft:stick",
+            1,
+            &format!("{{\"minecraft:max_damage\":100,\"minecraft:damage\":40,\"minecraft:max_stack_size\":1{extra}}}"),
+        )
+    };
+    let mut s = stick("");
+    crate::lootfn::set_damage(&mut s, 0);
+    if !p.s.life.items.damageable(&s) || p.s.life.items.damage(&s) != 0 {
+        fails.push(format!("set_damage 0 on a stick: {s:?}"));
+    }
+    let mut sword = with("minecraft:diamond_sword", 1, "{\"minecraft:damage\":3}");
+    crate::lootfn::set_damage(&mut sword, 0);
+    if sword.components.is_some() {
+        fails.push(format!("set_damage 0 on a sword leaves a patch: {sword:?}"));
+    }
+    // Mending: the whole wear repaired, then the stick wears again.
+    p.s.game_mode = 0;
+    p.s.held = 0;
+    p.s.slots[36] = Some(stick(",\"minecraft:enchantments\":{\"minecraft:mending\":1}"));
+    p.s.repair_with_xp(1000);
+    let after = p.s.slots[36].clone();
+    if !after.as_ref().is_some_and(|s| p.s.life.items.damageable(s) && p.s.life.items.damage(s) == 0) {
+        fails.push(format!("stick mended to 0: {after:?}"));
+    }
+    p.s.hurt_item(36, 1);
+    let worn = p.s.slots[36].as_ref().map_or(-1, |s| p.s.life.items.damage(s));
+    if worn != 1 {
+        fails.push(format!("mended stick wears again: damage {worn}"));
+    }
+    // Broken stack of two: one goes, the other keeps the wear at the durability.
+    p.s.slots[36] = Some(with("minecraft:stick", 2, "{\"minecraft:max_damage\":10,\"minecraft:damage\":9,\"minecraft:max_stack_size\":2}"));
+    p.s.hurt_item(36, 1);
+    let rest = p.s.slots[36].clone();
+    if !rest.as_ref().is_some_and(|s| s.count == 1 && p.s.life.items.damage(s) == 10 && p.s.life.items.damageable(s)) {
+        fails.push(format!("rest of a broken stack: {rest:?}"));
+    }
+    assert!(fails.is_empty(), "{fails:#?}");
+}
+
 /// `/item modify` and `/loot`: the source entity and position are the context.
 #[test]
 fn command_contexts() {

@@ -678,6 +678,66 @@ fn container_comparator_removed_stack_size() {
     assert_eq!(w.comparator(at, Dir::North), 15);
 }
 
+/// L10: the composter reads `compostable` on the stack (patch included), for the click and for
+/// the layers drawn, by hand and from a hopper: seeds whose component is removed are refused
+/// and kept; a stone given the pie's component composts like the pie (one layer when empty).
+#[test]
+fn composter_reads_the_stack_component() {
+    let mut w = world("composter-patch");
+    let at = [3, Y, 8];
+    let up = [0.5f32, 1.0, 0.5];
+    let pie = w.p.s.life.items.defaults("minecraft:pumpkin_pie")["minecraft:compostable"].to_string();
+    assert!(pie != "null", "item component reports missing");
+    let patched = |id: &str, n: i32, comps: &str| {
+        let mut s = Stack { id: id.into(), count: n, components: Some(crate::commands::snbt::parse(comps).unwrap()) };
+        crate::items::normalize_patch(&mut s);
+        s
+    };
+    let level = |w: &W| w.p.s.v().get_int(w.p.s.get(at), "level");
+    let mut fails: Vec<String> = Vec::new();
+    w.set(at, "minecraft:composter");
+    w.hold(Some(patched("minecraft:wheat_seeds", 5, "{\"!minecraft:compostable\":{}}")));
+    w.click(at, Dir::Up, up);
+    let kept = w.held().map_or(0, |s| s.count);
+    if level(&w) != 0 || kept != 5 {
+        fails.push(format!("seeds without compostable: level {} count {kept}", level(&w)));
+    }
+    // Fresh composter: the layer can only come from the stone (refused, it would be placed on top).
+    w.set(at, "minecraft:composter");
+    w.hold(Some(patched("minecraft:stone", 5, &format!("{{\"minecraft:compostable\":{pie}}}"))));
+    w.click(at, Dir::Up, up);
+    let left = w.held().map_or(0, |s| s.count);
+    if level(&w) != 1 || left != 4 {
+        fails.push(format!("stone given compostable: level {} count {left}", level(&w)));
+    }
+    // From a hopper above: the layer comes from the stack's component too.
+    w.set(at, "minecraft:composter");
+    w.cmd(&format!(
+        r#"setblock 3 {} 8 minecraft:hopper[facing=down]{{Items:[{{Slot:0b,id:"minecraft:stone",count:1,components:{{"minecraft:compostable":{pie}}}}}]}}"#,
+        Y + 1
+    ));
+    let mut evs = Vec::new();
+    w.ticks(20, &mut evs);
+    if level(&w) != 1 {
+        fails.push(format!("stone given compostable from a hopper: level {}", level(&w)));
+    }
+    // Farmer: 15 seeds whose component is removed are counted but neither composted nor used.
+    use crate::mobs::{jrand::JRand, mob::Mob, species::Kind};
+    let at2 = [5, Y, 8];
+    w.set(at2, "minecraft:composter");
+    let mut m = Mob::new(Kind::Villager, 1, 9, [5.5, f64::from(Y), 6.5], 0.0, JRand::new(1));
+    m.define_data();
+    crate::mobs::villager::load(&mut m, &Nbt::Compound(Vec::new()));
+    m.npc.as_mut().unwrap().inv[0] = Some(patched("minecraft:wheat_seeds", 15, "{\"!minecraft:compostable\":{}}"));
+    w.p.s.compost(&mut m, at2);
+    let seeds = m.npc.as_ref().unwrap().inv[0].as_ref().map_or(0, |s| s.count);
+    let farmed = w.p.s.v().get_int(w.p.s.get(at2), "level");
+    if seeds != 15 || farmed != 0 {
+        fails.push(format!("farmer with seeds without compostable: level {farmed} seeds {seeds}"));
+    }
+    assert!(fails.is_empty(), "{fails:#?}");
+}
+
 /// Decorated pot with sealed loot: the loot is drawn on click, the dirt does not go in (failure), and
 /// breaking drops only the loot.
 #[test]

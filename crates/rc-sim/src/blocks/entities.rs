@@ -1581,12 +1581,13 @@ impl Server {
         if self.state_name(s) != "minecraft:composter" {
             return None;
         }
-        let id = item.get("id").and_then(Nbt::as_str).unwrap_or("").to_owned();
-        let compostable = crate::player::Stack::from_nbt(item).is_some_and(|st| self.stack_has(&st, "minecraft:compostable"));
-        if face != Dir::Up || self.v().get_int(s, "level") >= 7 || !compostable {
+        let Some(st) = crate::player::Stack::from_nbt(item).filter(|st| self.stack_has(st, "minecraft:compostable")) else {
+            return Some(false);
+        };
+        if face != Dir::Up || self.v().get_int(s, "level") >= 7 {
             return Some(false);
         }
-        let ns = self.composter_add_layer(c, s, &id, None);
+        let ns = self.composter_add_layer(c, s, &st, None);
         self.level_event(1500, c, i32::from(ns != s));
         Some(true)
     }
