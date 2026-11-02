@@ -209,8 +209,9 @@ impl Server {
     /// Entities whose box touches `area`, moved by `d` with their collisions (an ordinary
     /// movement, not a piston one): mobs except shulkers, those without physics (vex, dragon)
     /// and those riding the same root vehicle as the shulker, dying ones included; items, orbs,
-    /// primed TNT and falling blocks. The player is pushed by their own client, which opens the
-    /// shulker too (`entity_motion.rs`). Projectiles and vehicles: not yet, as for the piston.
+    /// primed TNT and falling blocks; decorations (what hangs falls with its item, armor stands
+    /// and mannequins move). The player is pushed by their own client, which opens the shulker
+    /// too (`entity_motion.rs`). Projectiles and vehicles: not yet, as for the piston.
     pub(crate) fn shulker_shove(&mut self, m: &Mob, area: &rc_physics::Aabb, d: [f64; 3]) {
         use rc_physics::body::Heft;
         for i in 0..self.mobs.list.len() {
@@ -255,6 +256,7 @@ impl Server {
         self.bs.entities.list = ents;
         self.life.drops = drops;
         self.life.orbs = orbs;
+        self.deco_shove(area, d);
     }
 
     /// 5 tries at ±8 on each axis (entity random); empty cell,

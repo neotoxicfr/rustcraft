@@ -56,6 +56,34 @@ impl PistonTarget for MobTarget<'_> {
     }
 }
 
+/// Something attached to a block (frame, painting, knot, cushion) in the piston's way: the first
+/// non-zero push kills it and drops its item; never on the ground, never launched visibly.
+struct AttachedTarget<'a> {
+    s: &'a mut Server,
+    id: i32,
+    b: Aabb,
+    pos: [f64; 3],
+}
+
+impl PistonTarget for AttachedTarget<'_> {
+    fn bbox(&self) -> Aabb {
+        self.b
+    }
+    fn position(&self) -> [f64; 3] {
+        self.pos
+    }
+    fn grounded(&self) -> bool {
+        false
+    }
+    fn supported_by(&self, _: [i32; 3]) -> bool {
+        false
+    }
+    fn launch(&mut self, _: usize, _: f64) {}
+    fn piston_push(&mut self, d: [f64; 3]) {
+        self.s.deco_attached_moved(self.id, d);
+    }
+}
+
 impl PistonWorld for Server {
     #[inline]
     fn state(&self, p: P) -> u32 {
@@ -293,9 +321,9 @@ impl Server {
     }
 
     /// Entities touched by the moving block at `p` going to `next`: pushed by the
-    /// swept area (mobs, items, orbs, primed TNT, falling blocks), then dragged
-    /// by honey. The player is pushed by their client, which replays the piston. Projectiles and
-    /// vehicles: not yet (`docs/gaps-protocol.md`).
+    /// swept area (mobs, items, orbs, primed TNT, falling blocks; what hangs on a block falls),
+    /// then dragged by honey. The player is pushed by their client, which replays the piston.
+    /// Projectiles, vehicles, armor stands and mannequins: not yet (`docs/gaps-protocol.md`).
     fn mover_push_entities(&mut self, p: P, m: &Moving, next: f32) {
         let sweep = self.phys.piston_sweep(p, m, next);
         let carry = self.phys.honey_carry(p, m, next);
@@ -359,6 +387,14 @@ impl Server {
         self.life.drops = drops;
         self.life.orbs = orbs;
         self.bs.entities.list = ents;
+        // Decorations attached to a block (armor stands and mannequins: not yet).
+        for (id, _) in self.deco_touching(&area, true) {
+            let Some((b, pos)) = self.deco_nbt(id).and_then(|e| Some((self.deco_box(e)?, crate::nbtio::f64s::<3>(e.get("Pos"))?)))
+            else {
+                continue;
+            };
+            apply(&mut AttachedTarget { s: self, id, b, pos });
+        }
     }
 
     /// Tick of the moving block (block entity phase).

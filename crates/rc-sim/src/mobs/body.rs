@@ -976,6 +976,18 @@ impl Server {
                 list.push((Ent::Mob(o.id), i as u32));
             }
         }
+        // Minecarts touched: always pushable, the one the mob rides included (only the minecart's
+        // own push skips its passenger); counted for the cramming like the game.
+        let mut carts: Vec<usize> = Vec::new();
+        for (i, c) in self.carts.list.iter().enumerate() {
+            if let Some(c) = c
+                && !c.removed
+                && c.bbox().intersects(&bb)
+                && self.push_team_allows(team, Some(c.uuid))
+            {
+                carts.push(i);
+            }
+        }
         let player_box = self.player_aabb();
         if self.game_mode != 3
             && !self.life.vit.dead
@@ -986,11 +998,12 @@ impl Server {
         {
             list.push((Ent::Player, u32::MAX));
         }
-        if list.is_empty() {
+        if list.is_empty() && carts.is_empty() {
             return;
         }
         let max = self.mob_rule_int("minecraft:max_entity_cramming", 24);
-        if max > 0 && list.len() as i32 > max - 1 && m.rng.next_int_bound(4) == 0 && list.len() as i32 > max - 1 {
+        let n = (list.len() + carts.len()) as i32;
+        if max > 0 && n > max - 1 && m.rng.next_int_bound(4) == 0 && n > max - 1 {
             self.mob_hurt(m, "minecraft:cramming", 6.0, None, None);
         }
         for (e, at) in list {
@@ -1040,6 +1053,26 @@ impl Server {
                     }
                 }
             }
+        }
+        for i in carts {
+            let Some(mut c) = self.carts.list[i].take() else { continue };
+            if m.kind == Kind::Warden {
+                // Touch cooldown and disturbance; a minecart is never a target (no anger).
+                super::recent::warden::on_push_at(self, m, None, Some(c.pos));
+            }
+            // The minecart's rule: it moves aside and gives the mob a quarter, except to its rider.
+            if !super::illagers::no_physics(m)
+                && !c.passengers.contains(&Ent::Mob(m.id))
+                && let Some((xa, za)) = Self::cart_pushed_by(&mut c, m.pos)
+            {
+                m.vel[0] += xa;
+                m.vel[2] += za;
+                m.needs_sync = true;
+            }
+            if m.kind == Kind::SulfurCube && !m.cube.contacts.is_empty() {
+                self.sulfur_contact_cart(m, &mut c);
+            }
+            self.carts.list[i] = Some(c);
         }
     }
 

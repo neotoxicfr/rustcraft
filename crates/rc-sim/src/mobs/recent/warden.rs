@@ -470,14 +470,20 @@ pub fn before_melee(s: &mut Server, m: &mut Mob) {
 
 /// Pushed by an entity: anger and investigation, once per second.
 pub fn on_push(s: &mut Server, m: &mut Mob, by: Ent) {
+    let p = s.ent_pos(by);
+    on_push_at(s, m, Some(by), p);
+}
+
+/// Push of any entity at `pos`; `by` is `None` for an entity that can never be a target.
+pub fn on_push_at(s: &mut Server, m: &mut Mob, by: Option<Ent>, pos: Option<[f64; 3]>) {
     if m.no_ai {
         return;
     }
     let Some(mut b) = m.bm.brain.take() else { return };
     if !b.mem.x.touch_cooldown.has() {
         b.mem.x.touch_cooldown.set_exp((), 20);
-        increase_anger_at(s, m, &mut b, Some(by), 35, true);
-        if let Some(p) = s.ent_pos(by) {
+        increase_anger_at(s, m, &mut b, by, 35, true);
+        if let Some(p) = pos {
             let bp = p.map(|v| v.floor() as i32);
             set_disturbance(s, m, &mut b, bp);
         }

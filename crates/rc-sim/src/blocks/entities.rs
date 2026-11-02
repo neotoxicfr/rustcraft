@@ -409,6 +409,9 @@ impl Server {
         };
         let vel = nbt.and_then(|n| crate::nbtio::motion(n.get("Motion"))).unwrap_or_default();
         let id = self.alloc_entity();
+        if let Some(n) = nbt {
+            self.load_portal_cooldown(id, n);
+        }
         let mut e = SimEntity::new(id, kind, pos, vel);
         e.on_ground = nbt.and_then(|n| n.get("OnGround")).is_some_and(|v| matches!(v, Nbt::Byte(1)));
         e.time = nbt.and_then(|n| crate::nbtio::int(n, "Time")).unwrap_or(0) as i32;
@@ -912,7 +915,7 @@ impl Server {
         for e in self.bs.entities.list.iter().filter(|e| !e.removed) {
             let c = ((e.pos[0].floor() as i32) >> 4, (e.pos[2].floor() as i32) >> 4);
             let id = if matches!(e.kind, EntKind::Tnt(_)) { "minecraft:tnt" } else { "minecraft:falling_block" };
-            let cooldown = self.dims.ents.get(&e.id).map_or(0, |p| p.cooldown);
+            let cooldown = self.portal_cooldown(e.id);
             let mut f: Vec<(String, Nbt)> = vec![
                 ("id".into(), Nbt::String(id.into())),
                 ("Pos".into(), dbl(e.pos)),

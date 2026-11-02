@@ -741,10 +741,12 @@ impl Server {
                     let c = [m.pos[0], m.pos[1] + f64::from(m.height()) * 0.0625, m.pos[2]];
                     // A TNT's interaction with the blocks if mobs may grief, none otherwise; the
                     // calculator of a TNT that went through a portal while its portal delay runs.
+                    // The calculator does not depend on the interaction.
+                    let portal = self.dims.ents.get(&m.id).is_some_and(|p| p.cooldown > 0);
                     let blast = if self.rule("minecraft:mob_griefing", true) {
-                        super::explode::Blast::Tnt(self.dims.ents.get(&m.id).is_some_and(|p| p.cooldown > 0))
+                        super::explode::Blast::Tnt(portal)
                     } else {
-                        super::explode::Blast::None
+                        super::explode::Blast::None(portal)
                     };
                     let by = Some(Ent::Mob(m.id));
                     self.explode_with(Some(m), by, Some(m.id), c, power as f32, fire, "minecraft:player_explosion", blast);
@@ -1034,6 +1036,15 @@ impl Server {
             } else {
                 self.mob_hurt(o, &ty, a, None, None);
             }
+        }
+    }
+
+    /// Contact damage of the archetype on a minecart the cube touches (the one it rides
+    /// included): attributed to the cube only if the archetype says so.
+    pub(crate) fn sulfur_contact_cart(&mut self, m: &mut Mob, c: &mut crate::minecart::Cart) {
+        for (ty, amount, attr) in m.cube.contacts.clone() {
+            let a = crate::ench_fx::sample(&amount, &mut m.rng);
+            self.cart_hurt(c, &ty, a, attr.then_some(Ent::Mob(m.id)));
         }
     }
 

@@ -50,7 +50,9 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// their single-precision speed widened like the game's; without both: 5092e230… again.
 /// G4-F08: fire-immune species may spawn in a fire cell like the game's (Nether entity chunks;
 /// before: 521f08db…, 823).
-const EXPECTED_NEW: (&str, usize) = ("360ac84c83a0bedb70e4b6231607424a6a89930a440bb1e03240ee99819714a6", 807);
+/// G4-F08 resumption: mobs write their live `PortalCooldown` (the game writes it for every
+/// entity), the only cause of the change (without it: 360ac84c…, 807 again).
+const EXPECTED_NEW: (&str, usize) = ("989a0967fcf8d16b8f2859e10a844f33cbd13579574bf037225d49bd09bde373", 807);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 const EXPECTED_MODEL: &[(&str, &str, usize)] = &[(
     "790b2d94653a4243e68f2e0cb0ebc3f865f9f59815ed65149067cdd374c6b800",
@@ -199,7 +201,9 @@ fn run_new() -> Option<Vec<(String, String)>> {
 /// G3-F08: player file key `post_effects` (alone: 27355455…, 378) and the widened speeds of
 /// the zombie and spider families and of the enderman (without both: 9d3c0ffd… again).
 /// Lot 8 integration: both together.
-const EXPECTED_MECH: (&str, usize) = ("a551d2723eb85bed3efc1cfddae60490fbfaff269dd6609d1e752ae358b3efac", 380);
+/// G4-F08 resumption: mobs write their live `PortalCooldown` (the game writes it for every
+/// entity), the only cause of the change (without it: a551d272…, 380 again).
+const EXPECTED_MECH: (&str, usize) = ("0c5ef13ddebec351116f6683a2067ce4241e6bc8a3b8c26547820b13d40e76bb", 380);
 
 /// Server command (refusal = failure: the rig would be incomplete).
 pub(crate) fn cmd(s: &mut Server, c: &str) {
@@ -342,7 +346,9 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 /// Expected fingerprint of all the regions after closing: (total, number of chunks).
 /// G3-F08: zombie, spider and enderman families at their widened single-precision speed, the
 /// only cause of the change (without it: 63579824… again).
-const EXPECTED_REGIONS: (&str, usize) = ("9c4062454b5998f1a0b4392066a5e3e56966ee691cee3525aabf9c4e99b7f60f", 1254);
+/// G4-F08 resumption: mobs write their live `PortalCooldown` (the game writes it for every
+/// entity), the only cause of the change (without it: 9c406245… again).
+const EXPECTED_REGIONS: (&str, usize) = ("6e577b616a00a81d019168d7d76b2a16f441371c1f3cdd90ef8e467c940f19df", 1254);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all
 /// dimensions): SHA-256 of the decompressed NBT per chunk. Sector locations and

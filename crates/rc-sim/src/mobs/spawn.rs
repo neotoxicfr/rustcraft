@@ -1625,20 +1625,22 @@ impl Server {
     }
 
     /// Block dangerous for a species (the game's per-type test, shared by spawning and the
-    /// breeze's jumps): never for the species' own "immune to" tag; the burning blocks (fire tag,
-    /// lava, magma, lava cauldron, lit campfire) unless it is fire immune; wither rose, sweet
-    /// berry bush, cactus and powder snow.
+    /// breeze's jumps): never for the species' own "immune to" tag (`default_immune_to` for the
+    /// species without one, empty in the vanilla data, filled by a data pack); the burning blocks
+    /// (fire tag, lava, magma, lava cauldron, lit campfire) unless it is fire immune; wither
+    /// rose, sweet berry bush, cactus and powder snow.
     pub(crate) fn block_dangerous(&self, p: [i32; 3], kind: Kind) -> bool {
+        use crate::tag_bits::TagId;
         let immune = match kind {
-            Kind::Fox => Some("minecraft:fox_immune_to"),
-            Kind::PolarBear => Some("minecraft:polar_bear_immune_to"),
-            Kind::SnowGolem => Some("minecraft:snow_golem_immune_to"),
-            Kind::Stray => Some("minecraft:stray_immune_to"),
-            Kind::Wither => Some("minecraft:wither_immune_to"),
-            Kind::WitherSkeleton => Some("minecraft:wither_skeleton_immune_to"),
-            _ => None,
+            Kind::Fox => TagId::FoxImmuneTo,
+            Kind::PolarBear => TagId::PolarBearImmuneTo,
+            Kind::SnowGolem => TagId::SnowGolemImmuneTo,
+            Kind::Stray => TagId::StrayImmuneTo,
+            Kind::Wither => TagId::WitherImmuneTo,
+            Kind::WitherSkeleton => TagId::WitherSkeletonImmuneTo,
+            _ => TagId::DefaultImmuneTo,
         };
-        if immune.is_some_and(|t| self.btag(p, t)) {
+        if self.btag_id(p, immune) {
             return false;
         }
         let n = self.bname(p).trim_start_matches("minecraft:");

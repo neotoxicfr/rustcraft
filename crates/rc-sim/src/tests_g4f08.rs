@@ -84,12 +84,18 @@ fn primed_tnt_keeps_power_and_block_through_a_save() {
     assert!(!p.s.is_air([30, -61, 0]), "a power of 0 dug the ground");
     assert!(p.s.is_air([50, -61, 0]), "the default power did not dig the ground");
     let log = "{Name:\"minecraft:oak_log\",Properties:{axis:\"x\"}}";
-    cmd(&mut p, &format!("summon minecraft:tnt 70.5 -60 0.5 {{fuse:300,explosion_power:2.5f,block_state:{log}}}"));
+    cmd(
+        &mut p,
+        &format!("summon minecraft:tnt 70.5 -60 0.5 {{fuse:300,explosion_power:2.5f,block_state:{log},PortalCooldown:300}}"),
+    );
     cmd(
         &mut p,
         "summon minecraft:falling_block 80.5 -60 0.5 {BlockState:{Name:\"minecraft:anvil\"},Time:5,\
-         HurtEntities:1b,FallHurtAmount:2.0f,FallHurtMax:30,DropItem:0b}",
+         HurtEntities:1b,FallHurtAmount:2.0f,FallHurtMax:30,DropItem:0b,PortalCooldown:150}",
     );
+    // The portal return delay is read back for every entity (mobs too). Before: written, never
+    // read for TNT and falling blocks; neither for mobs (stale value of their compound).
+    cmd(&mut p, "summon minecraft:zombie 75.5 -60 0.5 {NoAI:1b,PersistenceRequired:1b,PortalCooldown:200}");
     p.s.save(true);
     let data = p.s.data.clone();
     drop(p);
@@ -102,6 +108,10 @@ fn primed_tnt_keeps_power_and_block_through_a_save() {
     let anvil = live.iter().find(|e| matches!(e.kind, EntKind::Falling(_))).expect("falling block not read back");
     assert!(matches!(anvil.kind, EntKind::Falling(s) if s == p.s.default_state("minecraft:anvil")));
     assert_eq!((anvil.time, anvil.hurt, anvil.drop_item), (5, Some((2.0, 30)), false));
+    assert_eq!((p.s.portal_cooldown(tnt.id), p.s.portal_cooldown(anvil.id)), (300, 150), "portal delays");
+    let z = p.s.mobs.of_kind(Kind::Zombie).next().expect("zombie read back");
+    assert_eq!(p.s.portal_cooldown(z.id), 200, "portal delay of the mob");
+    assert_eq!(p.s.mob_nbt(z).get("PortalCooldown"), Some(&rc_proto::nbt::Nbt::Int(200)));
     finish(p, dir);
 }
 
@@ -277,6 +287,15 @@ fn dangerous_blocks_per_species_and_copper_bars_sight() {
     assert!(!d(Kind::Strider, 81) && d(Kind::Zombie, 81), "fire");
     assert!(!d(Kind::Fox, 82) && d(Kind::Zombie, 82), "berry bush");
     assert!(p.s.visual_boxes([83, -60, 0]).is_empty(), "copper bars block the gaze");
+    // A pack that puts the cactus in `default_immune_to`: safe for a species without its own
+    // tag (zombie), still dangerous for the fox (its own tag).
+    cmd(&mut p, "setblock 84 -60 0 minecraft:cactus");
+    assert!(p.s.block_dangerous([84, -60, 0], Kind::Zombie), "cactus");
+    let cactus = u32::from(p.s.data.state(p.s.default_state("minecraft:cactus")).expect("cactus").block);
+    p.s.block_tags.insert("minecraft:default_immune_to".into(), vec![cactus]);
+    p.s.tag_bits = crate::tag_bits::TagBits::new(&p.s.block_tags, &p.s.data);
+    assert!(!p.s.block_dangerous([84, -60, 0], Kind::Zombie), "default immune tag ignored");
+    assert!(p.s.block_dangerous([84, -60, 0], Kind::Fox), "fox reads its own tag");
     finish(p, dir);
 }
 
@@ -411,6 +430,165 @@ fn sniffer_turtle_rabbit_game_events_and_sniffer_border() {
     sn.bm.brain = Some(brain);
     put(&mut p, i, sn);
     assert!(spots.is_empty(), "digging spots outside the border: {spots:?}");
+    finish(p, dir);
+}
+
+/// Minecarts in a mob's push: a standing zombie moves a stationary minecart it touches, and a
+/// burning cube destroys the one it touches in about 5 ticks (10 per tick, minus 1 of recovery,
+/// above 40), which drops its item. Before: no minecart in a mob's push, the minecart stayed.
+#[test]
+fn mobs_push_minecarts_and_a_burning_cube_destroys_one() {
+    const BODY: usize = 6;
+    let (mut p, dir) = open("sulfurcart");
+    cmd(&mut p, "summon minecraft:zombie 100.5 -60 0.5 {NoAI:1b,PersistenceRequired:1b}");
+    cmd(&mut p, "summon minecraft:minecart 100.9 -60 0.5");
+    cmd(&mut p, "summon minecraft:sulfur_cube 110.5 -60 0.5 {NoAI:1b,PersistenceRequired:1b}");
+    cmd(&mut p, "summon minecraft:minecart 110.6 -60 0.5");
+    let (i, mut m) = take(&mut p, Kind::SulfurCube, 110.5);
+    m.equipment[BODY] = stack("minecraft:magma_block", 1);
+    put(&mut p, i, m);
+    let cart = |p: &Probe, x: f64| {
+        p.s.carts.list.iter().flatten().find(|c| (c.pos[0] - x).abs() < 0.5).map(|c| (c.pos[0], c.removed))
+    };
+    game_ticks(&mut p, 1);
+    let pushed = cart(&p, 100.9).expect("minecart by the zombie");
+    assert!(pushed.0 > 100.9, "minecart not pushed by the zombie: {}", pushed.0);
+    game_ticks(&mut p, 8);
+    assert!(cart(&p, 110.6).is_none_or(|c| c.1), "minecart touched by the burning cube still there");
+    let carts: i32 = p.s.life.drops.iter().filter(|d| d.stack.id == "minecraft:minecart").map(|d| d.stack.count).sum();
+    assert_eq!(carts, 1, "item of the destroyed minecart");
+    finish(p, dir);
+}
+
+/// A sulfur cube that came out of a portal (delay running) explodes without mob griefing: the
+/// "went through a portal" calculator still applies, a Nether portal next to it is not counted
+/// among the blocks hit (packet field). Before: counted (calculator lost with no interaction).
+#[test]
+fn sulfur_blast_without_griefing_keeps_the_portal_calculator() {
+    const BODY: usize = 6;
+    let (mut p, dir) = open("sulfurportal");
+    cmd(&mut p, "gamerule minecraft:mob_griefing false");
+    for x in [10, 20] {
+        cmd(&mut p, &format!("summon minecraft:sulfur_cube {x}.5 -40 0.5 {{NoGravity:1b,PersistenceRequired:1b}}"));
+        cmd(&mut p, &format!("setblock {} -40 0 minecraft:nether_portal", x + 1));
+    }
+    for x in [10.5, 20.5] {
+        let (i, mut m) = take(&mut p, Kind::SulfurCube, x);
+        m.equipment[BODY] = stack("minecraft:tnt", 1);
+        put(&mut p, i, m);
+    }
+    game_ticks(&mut p, 1);
+    for x in [10.5, 20.5] {
+        let (i, mut m) = take(&mut p, Kind::SulfurCube, x);
+        assert!(m.cube.explosion.is_some(), "explosive archetype not applied");
+        m.cube.explosion = Some((1, false, 120));
+        m.cube.fuse = 1;
+        if x == 10.5 {
+            p.s.dims.ents.insert(m.id, crate::dims::EntPortal { cooldown: 300, proc: None });
+        }
+        put(&mut p, i, m);
+    }
+    assert!(p.s.bname([11, -40, 0]).starts_with("minecraft:nether_portal"), "portal placed");
+    crate::mobs::explode::BLAST_CELLS.with_borrow_mut(Vec::clear);
+    game_ticks(&mut p, 1);
+    let blasts = crate::mobs::explode::BLAST_CELLS.with_borrow_mut(std::mem::take);
+    let hit = |x: f64, cell: [i32; 3]| {
+        blasts.iter().find(|b| (b.0[0] - x).abs() < 0.5).map(|b| b.1.contains(&cell))
+    };
+    assert_eq!(hit(10.5, [11, -40, 0]), Some(false), "portal hit while the portal delay runs");
+    assert_eq!(hit(20.5, [21, -40, 0]), Some(true), "portal not hit without the delay");
+    finish(p, dir);
+}
+
+fn deco_of(p: &Probe, k: crate::decoration::DKind) -> Vec<rc_proto::nbt::Nbt> {
+    p.s.entities
+        .values()
+        .flat_map(|l| l.iter())
+        .filter(|(_, e)| crate::decoration::kind_of(e) == Some(k))
+        .map(|(_, e)| e.clone())
+        .collect()
+}
+
+fn dropped(p: &Probe, id: &str) -> i32 {
+    p.s.life.drops.iter().filter(|d| d.stack.id == id && !d.is_removed()).map(|d| d.stack.count).sum()
+}
+
+/// Decorations in a push: an opening shulker knocks off the item frame hung in its slice
+/// (frame and item drop) and lifts a mannequin; a marker armor stand (no physics) stays. A
+/// piston that pushes a block into a frame knocks it off too. Before: all left in place.
+#[test]
+fn shulker_and_piston_pushes_knock_off_frames_and_move_stands() {
+    use crate::decoration::DKind;
+    let (mut p, dir) = open("decopush");
+    cmd(&mut p, "setblock 31 -59 0 minecraft:stone");
+    cmd(
+        &mut p,
+        "summon minecraft:item_frame 30.96875 -58.5 0.5 {Facing:4b,block_pos:[I;30,-59,0],\
+         Item:{id:\"minecraft:diamond\",count:1}}",
+    );
+    cmd(&mut p, "summon minecraft:mannequin 34.5 -59 0.5 {immovable:1b}");
+    cmd(&mut p, "summon minecraft:armor_stand 38.5 -59 0.5 {Marker:1b}");
+    assert_eq!(deco_of(&p, DKind::Frame).len(), 1, "frame placed");
+    for x in [30.5, 34.5, 38.5] {
+        cmd(&mut p, &format!("summon minecraft:shulker {x} -60 0.5 {{NoAI:1b,Peek:100b,PersistenceRequired:1b}}"));
+    }
+    game_ticks(&mut p, 25);
+    assert!(deco_of(&p, DKind::Frame).is_empty(), "frame still hung");
+    assert_eq!((dropped(&p, "minecraft:item_frame"), dropped(&p, "minecraft:diamond")), (1, 1), "frame loot");
+    let y = |e: &rc_proto::nbt::Nbt| crate::nbtio::f64s::<3>(e.get("Pos")).unwrap()[1];
+    let man = deco_of(&p, DKind::Mannequin);
+    close(y(&man[0]), -58.0, "mannequin");
+    let stand = deco_of(&p, DKind::Stand);
+    close(y(&stand[0]), -59.0, "marker stand");
+    // Piston pushing stone into the frame's cell.
+    cmd(&mut p, "setblock 50 -60 0 minecraft:piston[facing=east]");
+    cmd(&mut p, "setblock 51 -60 0 minecraft:stone");
+    cmd(&mut p, "setblock 53 -60 0 minecraft:stone");
+    cmd(
+        &mut p,
+        "summon minecraft:item_frame 52.96875 -59.5 0.5 {Facing:4b,block_pos:[I;52,-60,0],\
+         Item:{id:\"minecraft:emerald\",count:1}}",
+    );
+    assert_eq!(deco_of(&p, DKind::Frame).len(), 1, "second frame placed");
+    cmd(&mut p, "setblock 49 -60 0 minecraft:redstone_block");
+    game_ticks(&mut p, 4);
+    assert!(p.s.bname([52, -60, 0]) == "minecraft:stone", "stone not pushed: {}", p.s.bname([52, -60, 0]));
+    assert!(deco_of(&p, DKind::Frame).is_empty(), "frame in the piston's way still hung");
+    assert_eq!(dropped(&p, "minecraft:emerald"), 1, "item of the frame knocked off by the piston");
+    finish(p, dir);
+}
+
+/// Micro-bench (ignored, `--ignored --nocapture`): a mob's push (20 zombies around it) without
+/// minecarts, then with 100 minecarts that touch nothing (rail network elsewhere): cost of the
+/// minecart scan added to every mob push.
+#[test]
+#[ignore]
+fn bench_g4f08_mob_push_with_minecarts() {
+    let (mut p, dir) = open("benchcarts");
+    for i in 0..20 {
+        let m = p.s.new_mob(Kind::Zombie, [20.3 + f64::from(i % 5) * 0.1, -60.0, 0.3 + f64::from(i / 5) * 0.1], 0.0);
+        p.s.add_mob(m);
+    }
+    let mut z = p.s.new_mob(Kind::Zombie, [20.5, -60.0, 0.5], 0.0);
+    let run = |p: &mut Probe, z: &mut Mob| {
+        let n = 200_000u32;
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            p.s.mob_push_entities(std::hint::black_box(&mut *z));
+        }
+        t.elapsed().as_nanos() as f64 / f64::from(n)
+    };
+    for _ in 0..2 {
+        let none = run(&mut p, &mut z);
+        eprintln!("mob push, 20 neighbours, no minecart: {none:.1} ns");
+    }
+    for i in 0..100 {
+        cmd(&mut p, &format!("summon minecraft:minecart {}.5 -60 {}.5", 40 + i % 10, 10 + i / 10));
+    }
+    for _ in 0..2 {
+        let carts = run(&mut p, &mut z);
+        eprintln!("mob push, 20 neighbours, 100 minecarts elsewhere: {carts:.1} ns");
+    }
     finish(p, dir);
 }
 

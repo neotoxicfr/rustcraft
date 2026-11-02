@@ -3098,3 +3098,18 @@ regularity, allocations, disk, RAM, startup, multi-core): figures below, the res
   entity. Warden targets: team names built only when a team exists, border test two comparisons.
 - To re-measure on a quiet machine: the two micro-benches above; scene bench not concerned (no
   shulker, jockey or sulfur cube in the scenes).
+- Resumption (fidelity): every mob push now scans the minecarts (the game pushes them, the cramming
+  counts them, a burning cube hurts them). Bench `tests_g4f08::bench_g4f08_mob_push_with_minecarts`
+  (2 passes, 20 neighbouring zombies): 1,508-1,509 ns per push without minecart, 1,694-1,758 ns
+  with 100 minecarts that touch nothing, about 2 ns per minecart and per push (300 mobs, 100
+  minecarts: about 60 µs per tick). Nothing allocated when no minecart touches (empty list).
+  Leads noted, not taken at these counts: a spatial grid of the minecarts, or their boxes computed
+  once per tick (a box is 6 additions from the position). Multi-core: not applicable (mutations
+  in list order).
+- The spawning danger test reads the seven "immune to" tags by `TagId` (one bit word per block,
+  no name hashing; before: six tags read by name), `default_immune_to` included for the other
+  species: one bit test more on the spawning path, no bench.
+- The decorations in a shulker or piston push: nothing scanned while no decoration exists; the
+  live list is walked (box of each) only when a shulker opens further or a block moves.
+- Fingerprints: the three change for one cause only, the `PortalCooldown` now written by every mob
+  (the game writes it for every entity); without that line the three come back identical.
