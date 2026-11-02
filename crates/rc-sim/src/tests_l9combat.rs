@@ -218,6 +218,30 @@ fn arrow_hit_grants_take_aim() {
     assert!(p.s.proj.direct_hit.is_none(), "direct projectile left behind");
 }
 
+/// The player's hurt by a falling block: a worn helmet wears (⌊10/4⌋ for the hit, then 1 with the
+/// other pieces) and the damage loses a quarter, like any living entity; `entity_hurt_player` sees
+/// the damage received (10) and the damage after the helmet, before armor (7.5), not the health
+/// lost.
+#[test]
+fn falling_block_meets_player_helmet() {
+    let Some((mut p, _dir)) = probe("l9-helmet") else { return };
+    let mut raw = std::collections::BTreeMap::new();
+    raw.insert(
+        "l9:hurt_player".to_owned(),
+        serde_json::json!({"criteria": {"hit": {"trigger": "minecraft:entity_hurt_player",
+            "conditions": {"damage": {"dealt": {"min": 9.9, "max": 10.1}, "taken": {"min": 7.4, "max": 7.6}}}}}}),
+    );
+    p.s.prog.reload(std::sync::Arc::new(crate::progress::Tree::build(raw)));
+    p.s.slots[5] = Some(st("minecraft:iron_helmet"));
+    p.s.slots[6] = Some(st("minecraft:diamond_chestplate"));
+    p.s.equipment_tick();
+    assert!(p.s.hurt("minecraft:falling_block", 10.0), "hit refused");
+    let worn = |s: Option<&Stack>| s.and_then(|s| crate::items::component(s, "minecraft:damage")).and_then(Nbt::as_i64).unwrap_or(0);
+    assert_eq!(worn(p.s.slots[5].as_ref()), 3, "helmet wear");
+    assert_eq!(worn(p.s.slots[6].as_ref()), 1, "chestplate wear");
+    assert!(done(&p, "l9:hurt_player"), "entity_hurt_player did not see 10 received and 7.5 before armor");
+}
+
 /// Ranged hits do not count in the `damage_dealt` statistic (the game only counts the melee
 /// hits of the player).
 #[test]
@@ -262,6 +286,16 @@ fn bench_wind_burst_decorations() {
     }
     let full = (time(&mut p, 50, &burst), time(&mut p, 50, &pass));
     eprintln!("wind burst: 0 stands {:.1} us (deco pass {:.2} us); 400 stands {:.1} us (deco pass {:.1} us)", empty.0, empty.1, full.0, full.1);
+    // Split of the deco pass: scan alone (nothing in range), visible part of the stands in range.
+    let scan = time(&mut p, 50, &|p: &mut Probe| p.s.deco_blast_push([0.5, -200.0, 0.5], 0.5, 1.2, true));
+    let near: Vec<rc_physics::Aabb> =
+        p.s.deco_living().into_iter().filter(|d| crate::mobs::mth::dist2(d.pos, center) <= 49.0).map(|d| d.bbox).collect();
+    let seen = time(&mut p, 50, &|p: &mut Probe| {
+        for b in &near {
+            std::hint::black_box(p.s.seen_percent(center, b));
+        }
+    });
+    eprintln!("deco pass split: scan {scan:.1} us, visible part of {} stands {seen:.1} us", near.len());
 }
 
 fn nbt_of(p: &Probe, id: i32) -> Nbt {

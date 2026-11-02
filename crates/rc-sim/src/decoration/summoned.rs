@@ -275,10 +275,11 @@ pub(crate) fn summoned(k: DKind, pos: [f64; 3], uuid: u128, given: &Nbt) -> Nbt 
                 _ => "right",
             };
             f.push(("main_hand".into(), Nbt::String(hand.into())));
-            let pose = match g.get("pose").and_then(Nbt::as_str) {
-                Some(p @ ("crouching" | "swimming" | "fall_flying" | "sleeping")) => p,
-                _ => "standing",
-            };
+            let pose = g
+                .get("pose")
+                .and_then(Nbt::as_str)
+                .filter(|p| matches!(*p, "crouching" | "swimming" | "fall_flying" | "sleeping"))
+                .unwrap_or("standing");
             f.push(("pose".into(), Nbt::String(pose.into())));
             f.push(("immovable".into(), Nbt::Byte(i8::from(g.bool("immovable")))));
             if g.bool("hide_description") {

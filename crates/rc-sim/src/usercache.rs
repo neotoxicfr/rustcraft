@@ -153,7 +153,7 @@ impl UserCache {
     fn save(&self) {
         let Some(path) = &self.path else { return };
         let mut live: Vec<&Entry> = self.by_id.values().map(|&i| &self.list[i]).collect();
-        live.sort_by(|a, b| b.last.cmp(&a.last));
+        live.sort_by_key(|e| std::cmp::Reverse(e.last));
         let body: Vec<String> = live
             .iter()
             .take(MRU_LIMIT)

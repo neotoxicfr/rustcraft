@@ -572,6 +572,14 @@ impl Server {
         let parried = self.apply_item_blocking(ty, d, &src);
         d -= parried;
         let blocked = parried > 0.0;
+        // A hit that damages helmets (falling block, anvil, stalactite) wears a worn head piece
+        // (⌊d/4⌋, at least 1) and loses a quarter, like any living entity.
+        if self.slots[5].is_some() && self.damage_tag(ty, "damages_helmet") {
+            if d > 0.0 && self.slots[5].as_ref().is_some_and(|s| self.armor_wears(s, ty)) {
+                self.hurt_item(5, (d / 4.0).max(1.0) as i32);
+            }
+            d *= 0.75;
+        }
         if !d.is_finite() {
             d = f32::MAX;
         }
@@ -682,7 +690,7 @@ impl Server {
             self.player_hurt_effects();
         }
         self.prog.hurt_parts = Some((received, dealt, blocked));
-        self.s9_player_hurt(ty, amount, d, pre_absorb - d, parried); // S9, W8c: parried part
+        self.s9_player_hurt(ty, (received, dealt), d, pre_absorb - d, parried); // S9, W8c: parried part
         self.send_health();
         !blocked || dealt > 0.0
     }

@@ -818,19 +818,18 @@ impl Server {
         if !v.iter().all(|x| x.is_finite()) {
             return;
         }
-        let Some(e) = self.deco_nbt(id) else { return };
+        // One registry search; the compound read and rewritten in place (its chunk known).
+        let Some(i) = self.deco.live.iter().position(|l| l.id == id && !l.removed) else { return };
+        let stand = self.deco.live[i].kind == DKind::Stand;
+        let Some(e) = self.live_nbt(i) else { return };
         let m = nbtio::motion(e.get("Motion")).unwrap_or_default();
         let nv = [m[0] + v[0], m[1] + v[1], m[2] + v[2]];
-        let still = flag(e, "NoGravity")
-            || match kind_of(e) {
-                Some(DKind::Stand) => flag(e, "Marker"),
-                _ => flag(e, "immovable"),
-            };
+        let still = flag(e, "NoGravity") || flag(e, if stand { "Marker" } else { "immovable" });
         self.deco_edit(id, |n| nbtio::set(n, "Motion", dbl(nv)));
         if still {
             let _ = self.send(Event::Entity(EntityEvent::Motion { id, velocity: crate::mobs::track::lp_quantize(nv) }));
-        } else if let Some(l) = self.deco_live(id) {
-            l.track.needs_sync = true;
+        } else {
+            self.deco.live[i].track.needs_sync = true;
         }
     }
 

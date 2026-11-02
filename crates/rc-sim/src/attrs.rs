@@ -135,9 +135,12 @@ pub(crate) fn type_default(ty: &str, name: &str) -> Option<f64> {
     }
 }
 
+/// Modifiers of an attribute: identifier, amount, operation.
+pub(crate) type Mods = Vec<(String, f64, i32)>;
+
 /// Saved entry of attribute `name` in an `attributes` list: base (`None` if left out) and
-/// modifiers (identifier, amount, operation).
-pub(crate) fn saved_entry(list: &[Nbt], name: &str) -> Option<(Option<f64>, Vec<(String, f64, i32)>)> {
+/// modifiers.
+pub(crate) fn saved_entry(list: &[Nbt], name: &str) -> Option<(Option<f64>, Mods)> {
     let a = list.iter().find(|a| a.get("id").and_then(Nbt::as_str) == Some(name))?;
     let mods = crate::nbtio::list(a.get("modifiers"))
         .iter()

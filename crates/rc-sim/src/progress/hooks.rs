@@ -242,8 +242,10 @@ impl Server {
         self.trig_killed(Some(Who::Mob(m)), &dmg);
     }
 
-    /// Damage received by the player: statistics in tenths, `entity_hurt_player`.
-    pub(crate) fn s9_player_hurt(&mut self, ty: &str, original: f32, taken: f32, absorbed: f32, parried: f32) {
+    /// Damage received by the player: statistics in tenths (`taken`: the health lost), then
+    /// `entity_hurt_player` with the damage received and the damage after the shield, before
+    /// armor (`hit`), like the game.
+    pub(crate) fn s9_player_hurt(&mut self, ty: &str, hit: (f32, f32), taken: f32, absorbed: f32, parried: f32) {
         // W8c: `damage_blocked_by_shield` (tenths of a point).
         if parried > 0.0 && parried < 3.402_823_5e37 {
             self.award_custom("damage_blocked_by_shield", (parried * 10.0).round() as i32);
@@ -257,7 +259,7 @@ impl Server {
         let attacker = self.prog.attacker.take();
         let src = attacker.as_deref().map(Who::Mob);
         let dmg = Dmg { ty: ty.to_owned(), source: src, direct: src, pos: attacker.as_ref().map(|m| m.pos) };
-        self.trig_entity_hurt_player(&dmg, original, taken, parried > 0.0);
+        self.trig_entity_hurt_player(&dmg, hit.0, hit.1, parried > 0.0);
         self.prog.attacker = attacker;
     }
 

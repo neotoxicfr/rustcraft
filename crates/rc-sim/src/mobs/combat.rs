@@ -1533,7 +1533,7 @@ impl Server {
     /// from the attacker, extra knockback in their gaze, fire. Returns the hurt report (damage
     /// received, after the shield, parried) if the hit went past the invulnerability window, and
     /// the health before and after the hit if it landed.
-    fn pvp_receive(&mut self, hit: &PvpHit) -> (Option<(f32, f32, bool)>, Option<(f32, f32)>) {
+    fn pvp_receive(&mut self, hit: &PvpHit) -> (Option<HurtParts>, Option<(f32, f32)>) {
         if !self.rule("minecraft:pvp", true) {
             return (None, None);
         }
@@ -1695,6 +1695,9 @@ fn t_rng(s: &Server, t: Ent) -> super::jrand::JRand {
         Ent::Player => super::jrand::JRand::new(0),
     }
 }
+
+/// Hurt report of a player hit by another: damage received, after the shield, parried.
+type HurtParts = (f32, f32, bool);
 
 /// Hit from one player on another, computed on the attacker's side, applied on the victim's side.
 struct PvpHit {
