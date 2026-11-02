@@ -3176,3 +3176,30 @@ runs), so only the order of magnitude is claimed.
   live list is walked (box of each) only when a shulker opens further or a block moves.
 - Fingerprints: the three change for one cause only, the `PortalCooldown` now written by every mob
   (the game writes it for every entity); without that line the three come back identical.
+## G6-F17: loot functions, providers and entries (02/11, loaded machine)
+
+- Engine (`loot.rs`): each stack now goes through the entry's, the composites', the pool's and
+  the table's modifiers as soon as it is made (one receiver per level, `Sink`) instead of being
+  collected per entry then per roll: the draws of the functions interleave with those of nested
+  tables like the game's, and the two vectors per roll are gone. The candidate buffer is kept
+  from one roll and one pool to the next; weightless candidates are dropped while expanding (no
+  second pass); a candidate stays 40 bytes (registry id of an expanded tag item instead of a
+  string, composite modifiers as an optional boxed slice, absent in the base pack). Tables
+  running: a `RefCell<Vec<usize>>` of data pointers in the context (push and pop per table run)
+  replaces the depth counter.
+- Equivalence (A1/A2): `loot::bench_tests::loot_bench` (ignored) fingerprints the 1447 tables of
+  the base pack, 16 seeds each, fortune III pickaxe, luck 1, looting II: `af880b1baa83fb25` on
+  389108f0 and on this branch.
+- Time per draw (best of 7 x 5 000 draws, same bench, built before and after; loaded machine, 4
+  alternating pairs). Quietest pair, before / after (first candidate layout, 72 bytes): stone
+  442-450 / 434-435 ns, oak leaves 1304-1340 / 1329-1355, zombie 823 / 813-826, simple dungeon
+  5168-5184 / 5273-5353, fishing 819-823 / 822-830. The dungeon's +2 % led to the 40-byte
+  candidate and the kept buffer; the following pairs vary by up to 40 % between two passes of the
+  same build (other compilations): no conclusion, nothing removed. To re-measure on a quiet
+  machine: `loot_bench` on both builds, 2 alternating passes.
+- Not applicable: multi-core and GPU (a draw is one chain on one generator, a few microseconds,
+  main thread); caching resolved nested sets or tag item lists (none on the measured block,
+  entity, chest and fishing tables).
+- Value checks of `/execute if predicate` and advancements: one loot evaluator built per check
+  (a few fields and a copy of the condition context). `/item modify`, `/loot`, chest loot: the
+  world is lent to the draw by reference (`LootView`), nothing copied.

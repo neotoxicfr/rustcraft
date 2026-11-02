@@ -169,7 +169,7 @@ fn start_workers(cache: &Arc<Mutex<Cache>>) -> Option<Sender<Job>> {
 }
 
 /// Stored form of a resolved profile: identifier (4 integers), name, properties if any.
-fn profile_nbt(p: &ProfileResult) -> Nbt {
+pub(crate) fn profile_nbt(p: &ProfileResult) -> Nbt {
     let mut f = vec![("id".to_owned(), crate::nbtio::uuid_nbt(p.id)), ("name".to_owned(), Nbt::String(p.name.clone()))];
     if !p.properties.is_empty() {
         let props = p

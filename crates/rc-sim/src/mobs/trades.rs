@@ -179,7 +179,7 @@ pub fn recipe_for(items: &Items, offers: &[Offer], a: Option<&Stack>, b: Option<
 }
 
 /// Dye colours (diffuse colour of the texture), identifier order.
-const DYE_DIFFUSE: [i32; 16] = [
+pub(crate) const DYE_DIFFUSE: [i32; 16] = [
     16383998, 16351261, 13061821, 3847130, 16701501, 8439583, 15961002, 4673362, 10329495, 1481884, 8991416, 3949738,
     8606770, 6192150, 11546150, 1908001,
 ];

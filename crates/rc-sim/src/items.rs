@@ -27,6 +27,8 @@ pub struct Items {
     index: HashMap<String, i32>,
     /// Item tags: name (without `#`) → sorted identifiers.
     pub tags: HashMap<String, Vec<i32>>,
+    /// Potion tags (registry identifiers, tag order), for the draws that pick a potion.
+    pub potion_tags: Vec<(String, Vec<i32>)>,
 }
 
 /// Default component reports (one data set per process) and their cache, shared
@@ -155,6 +157,33 @@ pub fn normalize_patch(s: &mut Stack) {
     }
 }
 
+/// Removal of a component through a patch (`!name`): recorded when the item carries it by
+/// default, otherwise the entry simply goes (nothing to remove from the prototype).
+pub fn unset_component(s: &mut Stack, name: &str) {
+    let by_default = !defaults_of(&s.id)[name].is_null();
+    let c = s.components.get_or_insert_with(|| Nbt::Compound(Vec::new()));
+    crate::nbtio::remove(c, name);
+    if by_default {
+        crate::nbtio::set(c, &format!("!{name}"), Nbt::Compound(Vec::new()));
+    }
+    if matches!(c, Nbt::Compound(f) if f.is_empty()) {
+        s.components = None;
+    }
+}
+
+/// Effective value of a component: the patch's, nothing if the patch removes it, otherwise the
+/// item's default (report read back as NBT).
+pub fn effective_component(s: &Stack, name: &str) -> Option<Nbt> {
+    if let Some(v) = component(s, name) {
+        return Some(v.clone());
+    }
+    if component(s, &format!("!{name}")).is_some() {
+        return None;
+    }
+    let d = &defaults_of(&s.id)[name];
+    (!d.is_null()).then(|| crate::recipes::json_to_nbt(d))
+}
+
 pub fn remove_component(s: &mut Stack, name: &str) {
     if let Some(c) = &mut s.components {
         crate::nbtio::remove(c, name);
@@ -168,7 +197,7 @@ impl Items {
     pub fn new(data: Arc<VersionData>, tags: &crate::registries::Tags) -> Items {
         let names = data.registry("minecraft:item").map(|r| r.entries.clone()).unwrap_or_default();
         let index = names.iter().enumerate().map(|(i, n)| (n.clone(), i as i32)).collect();
-        let tags = tags
+        let item_tags = tags
             .iter()
             .find(|(r, _)| r == "minecraft:item")
             .map(|(_, t)| {
@@ -193,7 +222,8 @@ impl Items {
             eprintln!("singleplayer: item component reports missing (fuels and food unknown)");
         }
         set_reports(reports);
-        Items { data, names, index, tags }
+        let potion_tags = tags.iter().find(|(r, _)| r == "minecraft:potion").map(|(_, t)| t.clone()).unwrap_or_default();
+        Items { data, names, index, tags: item_tags, potion_tags }
     }
 
     pub fn id(&self, name: &str) -> Option<i32> {
@@ -290,6 +320,34 @@ impl Items {
         // 26.3 form: { id: level }; old form: { levels: { id: level } }.
         let map = e.get("levels").unwrap_or(e);
         map.get(ench).and_then(Nbt::as_i64).unwrap_or(0) as i32
+    }
+
+    /// Strict check of a stack after a component patch: not both damageable and stackable,
+    /// quantity within the maximum, every stack held by a container, bundle or loaded
+    /// crossbow within its own maximum, a bundle weight that can be computed.
+    pub fn valid_strict(&self, s: &Stack) -> bool {
+        if self.max_damage(s) > 0 && self.max_stack(s) > 1 {
+            return false;
+        }
+        if s.count > self.max_stack(s) {
+            return false;
+        }
+        let fits = |l: &[Nbt], item: fn(&Nbt) -> Option<&Nbt>| {
+            l.iter().filter_map(item).filter_map(Stack::from_nbt).all(|x| x.count <= self.max_stack(&x))
+        };
+        if let Some(Nbt::List(l)) = effective_component(s, "minecraft:container").as_ref()
+            && !fits(l, |e| e.get("item"))
+        {
+            return false;
+        }
+        for k in ["minecraft:bundle_contents", "minecraft:charged_projectiles"] {
+            if let Some(Nbt::List(l)) = effective_component(s, k).as_ref()
+                && !fits(l, |e| Some(e))
+            {
+                return false;
+            }
+        }
+        crate::menus::bundle::contents(self, s).is_none() || crate::menus::bundle::weight(self, s).is_some()
     }
 
     /// `food` component: nutrition, saturation, can always be eaten.

@@ -2,6 +2,8 @@
 //! and targets), `item` (replace, fill, override, modify; slot ranges), `attribute`
 //! (modifiers, computed value, base reset).
 
+use std::sync::Arc;
+
 use rc_proto::nbt::Nbt;
 use serde_json::Value;
 
@@ -12,6 +14,7 @@ use super::src::{Fail, Src};
 use super::text;
 use super::{Parsed, R, Seg, args};
 use crate::player::Stack;
+use crate::progress::pred::{Ctx as PCtx, Dmg, Who};
 use crate::server::Server;
 use crate::tr;
 
@@ -120,48 +123,12 @@ impl Server {
     }
 
     fn s9_container_size(&self, p: [i32; 3]) -> usize {
-        let id = self.be_get(p).and_then(|b| b.get("id")).and_then(Nbt::as_str).unwrap_or("").to_owned();
-        match id.trim_start_matches("minecraft:") {
-            "furnace" | "blast_furnace" | "smoker" => 3,
-            "brewing_stand" => 5,
-            "hopper" => 5,
-            "dispenser" | "dropper" | "crafter" => 9,
-            "chiseled_bookshelf" | "decorated_pot" => {
-                if id.ends_with("pot") {
-                    1
-                } else {
-                    6
-                }
-            }
-            "jukebox" => 1,
-            "shelf" => 3,
-            _ => crate::lootchest::loot_size(&id).unwrap_or(27),
-        }
+        container_size(self.be_get(p).and_then(|b| b.get("id")).and_then(Nbt::as_str).unwrap_or(""))
     }
 
-    /// Block entity that is an item container for the commands. The lectern and the campfire
-    /// hold items without being containers in the game (their contents go through `/data`).
+    /// Block entity that is an item container for the commands.
     fn is_container(&self, p: [i32; 3]) -> bool {
-        let Some(be) = self.be_get(p) else { return false };
-        let id = be.get("id").and_then(Nbt::as_str).unwrap_or("");
-        let short = id.trim_start_matches("minecraft:");
-        crate::lootchest::loot_size(id).is_some()
-            || matches!(
-                short,
-                "furnace"
-                    | "blast_furnace"
-                    | "smoker"
-                    | "brewing_stand"
-                    | "hopper"
-                    | "dispenser"
-                    | "dropper"
-                    | "crafter"
-                    | "chiseled_bookshelf"
-                    | "shelf"
-                    | "decorated_pot"
-                    | "jukebox"
-            )
-            || short.ends_with("shulker_box")
+        self.be_get(p).is_some_and(|be| is_container_id(be.get("id").and_then(Nbt::as_str).unwrap_or("")))
     }
 
     /// The game's placement test of slot `i` of the container at `p` for the commands (no
@@ -327,35 +294,29 @@ impl Server {
             .ok_or_else(|| Fail(tr!("argument.resource_or_id.failed_to_parse", id)))
     }
 
-    /// Loot table (identifier or inline content).
-    fn arg_loot_table(&self, text: &str) -> Result<(Option<String>, Value), Fail> {
+    /// Loot table (identifier or inline content); a table of the pack keeps its shared data
+    /// (its identity when it nests itself).
+    fn arg_loot_table(&self, text: &str) -> Result<(Option<String>, Arc<Value>), Fail> {
         let t = text.trim();
         if t.starts_with('{') {
             let n = super::snbt::parse(t).map_err(|_| Fail(tr!("argument.nbt.expected.compound")))?;
-            return Ok((None, nbt_to_json(&n)));
+            return Ok((None, Arc::new(nbt_to_json(&n))));
         }
         let id = args::id(t);
-        match self.life.pack.get("loot_table", &id) {
-            Some(v) => Ok((Some(id), (*v).clone())),
-            None => Ok((Some(id), Value::Null)),
-        }
+        let v = self.life.pack.get("loot_table", &id).unwrap_or_else(|| Arc::new(Value::Null));
+        Ok((Some(id), v))
     }
 
-    /// Applies loot functions to a stack ("command" context), size bounded.
-    fn apply_modifier(&mut self, f: &Value, s: Stack) -> Stack {
-        let items = &self.life.items;
-        let tags = &self.block_tags;
-        let data = &self.data;
-        let bt = |tag: &str, name: &str| {
-            let b = data.blocks.iter().position(|x| x.name == name).map_or(u32::MAX, |i| i as u32);
-            tags.get(tag.trim_start_matches('#')).is_some_and(|v| v.binary_search(&b).is_ok())
-        };
-        let loot = crate::loot::Loot { pack: &self.life.pack, items, block_tag: &bt };
-        let ctx = crate::loot::Ctx::default();
+    /// Applies loot functions to a stack ("command" context: source position, source entity),
+    /// size bounded.
+    fn apply_modifier(&mut self, src: &Src, f: &Value, s: Stack) -> Stack {
         let mut rng = self.life.rng;
-        let mut out = match f {
-            Value::Array(list) => list.iter().fold(s, |acc, x| loot.apply(x, acc, &ctx, &mut rng)),
-            o => loot.apply(o, s, &ctx, &mut rng),
+        let mut out = {
+            let bt = |tag: &str, name: &str| self.block_name_tagged(tag, name);
+            let loot = crate::loot::Loot { pack: &self.life.pack, items: &self.life.items, block_tag: &bt };
+            let view = self.loot_world(PCtx { this: src.entity.map(Who::E), origin: Some(src.pos), ..PCtx::default() });
+            let ctx = crate::loot::Ctx { world: Some(&view), ..Default::default() };
+            loot.apply(f, s, &ctx, &mut rng)
         };
         self.life.rng = rng;
         let max = self.life.items.max_stack(&out);
@@ -401,7 +362,7 @@ impl Server {
                 for sl in slots {
                     let Some(cur) = self.slot_get(sl) else { continue };
                     selected += 1;
-                    let new = self.apply_modifier(&modifier, cur.clone());
+                    let new = self.apply_modifier(s, &modifier, cur.clone());
                     if !crate::items::matches(Some(&new), Some(&cur)) || new.count != cur.count {
                         self.slot_set(sl, Some(new));
                         n += 1;
@@ -471,7 +432,7 @@ impl Server {
                         components: None,
                     });
                     let st = match &modifier {
-                        Some(m) if st.count > 0 => self.apply_modifier(m, st),
+                        Some(m) if st.count > 0 => self.apply_modifier(s, m, st),
                         _ => st,
                     };
                     out.push(st);
@@ -609,12 +570,19 @@ impl Server {
             None => sv.life.rng,
         };
         let (drops, table, seq, rng): (Vec<Stack>, Option<String>, Option<String>, crate::rng::Rng) = match w[si] {
+            // Chest context (source entity, source position); fishing: the centre of the loaded
+            // position given and the tool.
             "loot" | "fish" => {
                 let (_, v) = self.arg_loot_table(&p.arg(seg, "loot_table").unwrap_or_default())?;
-                let tool = if w[si] == "fish" { tool_of(self, p)? } else { None };
+                let (tool, origin) = if w[si] == "fish" {
+                    let pos = self.loaded_pos(s, &p.arg(seg, "pos").unwrap_or_default())?;
+                    (tool_of(self, p)?, pos.map(|c| f64::from(c) + 0.5))
+                } else {
+                    (None, s.pos)
+                };
                 let seq = seq_of(&v);
                 let mut rng = pick(self, &seq);
-                let out = self.loot_with(&v, tool.as_ref(), None, &mut rng);
+                let out = self.loot_with(s, &v, tool.as_ref(), None, origin, &mut rng);
                 (out, None, seq, rng)
             }
             "kill" => {
@@ -636,10 +604,10 @@ impl Server {
                 let Some(id) = id else {
                     return Err(Fail(tr!("commands.drop.no_loot_table.entity", self.ent_display(e))));
                 };
-                let v = self.life.pack.get("loot_table", &id).map(|v| (*v).clone()).unwrap_or(Value::Null);
+                let v = self.life.pack.get("loot_table", &id).unwrap_or_else(|| Arc::new(Value::Null));
                 let seq = seq_of(&v);
                 let mut rng = pick(self, &seq);
-                let out = self.loot_with(&v, None, Some(e), &mut rng);
+                let out = self.loot_with(s, &v, None, Some(e), s.pos, &mut rng);
                 (out, Some(id), seq, rng)
             }
             _ => {
@@ -654,7 +622,7 @@ impl Server {
                 }
                 let seq = self.life.pack.get("loot_table", &id).and_then(|v| seq_of(&v));
                 let mut rng = pick(self, &seq);
-                let out = self.block_loot(pos, st, tool.as_ref(), &mut rng);
+                let out = self.block_loot(s, pos, st, tool.as_ref(), &mut rng);
                 (out, Some(id), seq, rng)
             }
         };
@@ -825,21 +793,20 @@ impl Server {
         }
     }
 
+    /// Draw of `/loot … loot|fish|kill`: the source entity is `this` (killed entity: `this` is
+    /// the target and the source is its killer, a player one only when the source is a
+    /// player, killed by magic), `origin` the position of the context.
     fn loot_with(
         &mut self,
+        src: &Src,
         table: &Value,
         tool: Option<&Stack>,
         killed: Option<E>,
+        origin: [f64; 3],
         rng: &mut crate::rng::Rng,
     ) -> Vec<Stack> {
-        let items = &self.life.items;
-        let tags = &self.block_tags;
-        let data = &self.data;
-        let bt = |tag: &str, name: &str| {
-            let b = data.blocks.iter().position(|x| x.name == name).map_or(u32::MAX, |i| i as u32);
-            tags.get(tag.trim_start_matches('#')).is_some_and(|v| v.binary_search(&b).is_ok())
-        };
-        let loot = crate::loot::Loot { pack: &self.life.pack, items, block_tag: &bt };
+        let bt = |tag: &str, name: &str| self.block_name_tagged(tag, name);
+        let loot = crate::loot::Loot { pack: &self.life.pack, items: &self.life.items, block_tag: &bt };
         let (on_fire, baby, sheep) = match killed {
             Some(E::Mob(i)) => self.mobs.mob_ref_any(i).map_or((false, false, None), |m| {
                 (
@@ -850,36 +817,63 @@ impl Server {
             }),
             _ => (false, false, None),
         };
+        let source = src.entity.map(Who::E);
+        let by_player = killed.is_some() && src.entity == Some(E::Player);
+        let pctx = match killed {
+            Some(k) => PCtx {
+                this: Some(Who::E(k)),
+                origin: Some(origin),
+                attacker: source,
+                direct_attacker: source,
+                attacking_player: source.filter(|_| by_player),
+                damage: Some(Dmg::plain("minecraft:magic")),
+                ..PCtx::default()
+            },
+            None => PCtx { this: source, origin: Some(origin), tool: tool.map(Some), ..PCtx::default() },
+        };
+        let view = self.loot_world(pctx);
         let ctx = crate::loot::Ctx {
             tool: tool.map(Some),
-            killed_by_player: killed.is_some(),
+            killed_by_player: by_player,
             on_fire,
             baby,
             damage_type: killed.map(|_| "minecraft:magic".to_owned()),
             sheep,
+            world: Some(&view),
             ..Default::default()
         };
-        loot.run(table, &ctx, rng, 0)
+        loot.run(table, &ctx, rng)
     }
 
-    fn block_loot(&mut self, pos: [i32; 3], st: u32, tool: Option<&Stack>, rng: &mut crate::rng::Rng) -> Vec<Stack> {
+    /// Draw of `/loot … mine`: block, its block entity and the tool, the source entity as
+    /// `this`, origin at the centre of the block.
+    fn block_loot(
+        &mut self,
+        src: &Src,
+        pos: [i32; 3],
+        st: u32,
+        tool: Option<&Stack>,
+        rng: &mut crate::rng::Rng,
+    ) -> Vec<Stack> {
         let name = self.data.block_of(st).map_or("", |b| b.name.as_str()).to_owned();
         let props: Vec<(String, String)> =
             self.data.state_properties(st).map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
         let be = self.be_get(pos).cloned();
         let id = format!("minecraft:blocks/{}", name.trim_start_matches("minecraft:"));
-        let items = &self.life.items;
-        let tags = &self.block_tags;
-        let data = &self.data;
-        let bt = |tag: &str, n: &str| {
-            let b = data.blocks.iter().position(|x| x.name == n).map_or(u32::MAX, |i| i as u32);
-            tags.get(tag.trim_start_matches('#')).is_some_and(|v| v.binary_search(&b).is_ok())
-        };
-        let loot = crate::loot::Loot { pack: &self.life.pack, items, block_tag: &bt };
+        let bt = |tag: &str, n: &str| self.block_name_tagged(tag, n);
+        let loot = crate::loot::Loot { pack: &self.life.pack, items: &self.life.items, block_tag: &bt };
+        let view = self.loot_world(PCtx {
+            this: src.entity.map(Who::E),
+            origin: Some(pos.map(|c| f64::from(c) + 0.5)),
+            block: Some(st),
+            tool: Some(tool),
+            ..PCtx::default()
+        });
         let ctx = crate::loot::Ctx {
             block: Some((name.as_str(), props)),
             tool: Some(tool),
             block_entity: be.as_ref(),
+            world: Some(&view),
             ..Default::default()
         };
         loot.drops(&id, &ctx, rng)
@@ -1079,6 +1073,60 @@ impl Server {
             _ => None,
         }
     }
+}
+
+/// Number of slots of a block entity, by identifier.
+fn container_size(id: &str) -> usize {
+    match id.trim_start_matches("minecraft:") {
+        "furnace" | "blast_furnace" | "smoker" => 3,
+        "brewing_stand" => 5,
+        "hopper" => 5,
+        "dispenser" | "dropper" | "crafter" => 9,
+        "chiseled_bookshelf" => 6,
+        "decorated_pot" => 1,
+        "jukebox" => 1,
+        "shelf" => 3,
+        _ => crate::lootchest::loot_size(id).unwrap_or(27),
+    }
+}
+
+/// Block entity that is an item container for the commands, by identifier. The lectern and the
+/// campfire hold items without being containers in the game (their contents go through `/data`).
+fn is_container_id(id: &str) -> bool {
+    let short = id.trim_start_matches("minecraft:");
+    crate::lootchest::loot_size(id).is_some()
+        || matches!(
+            short,
+            "furnace"
+                | "blast_furnace"
+                | "smoker"
+                | "brewing_stand"
+                | "hopper"
+                | "dispenser"
+                | "dropper"
+                | "crafter"
+                | "chiseled_bookshelf"
+                | "shelf"
+                | "decorated_pot"
+                | "jukebox"
+        )
+        || short.ends_with("shulker_box")
+}
+
+/// Copies of the slots of a block entity's data in a slot range (`container.*`…), when it is
+/// an item container; empty otherwise.
+pub(crate) fn be_slot_range(be: &Nbt, range: &str) -> Vec<Option<Stack>> {
+    let id = be.get("id").and_then(Nbt::as_str).unwrap_or("");
+    if !is_container_id(id) {
+        return Vec::new();
+    }
+    let size = container_size(id);
+    let items = crate::containers::read_items(be, size);
+    slot_ids(range)
+        .into_iter()
+        .filter_map(|i| usize::try_from(i).ok().filter(|&i| i < size))
+        .map(|i| items.get(i).cloned().flatten())
+        .collect()
 }
 
 fn dye(w: u8) -> String {

@@ -651,6 +651,16 @@ fn path_insert(root: &mut Nbt, path: &str, index: i32, values: &[Nbt]) -> Result
     })
 }
 
+/// Every tag a path designates, the missing ones created as `default`, passed to `f`; a path
+/// that fails (invalid, empty parent level) reaches nothing.
+pub(crate) fn path_each_created(root: &mut Nbt, path: &str, default: &Nbt, f: &mut dyn FnMut(&mut Nbt)) {
+    let p = parse_path(path);
+    let _ = walk_created(root, &p, Some(default), &mut |t| {
+        f(t);
+        Ok(1)
+    });
+}
+
 /// `merge` of the sub-path: each target (obtained or created as a compound) receives the sources.
 fn path_merge(root: &mut Nbt, path: &str, values: &[Nbt]) -> Result<usize, Fail> {
     let p = parse_path(path);
