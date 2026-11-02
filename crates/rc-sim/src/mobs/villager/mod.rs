@@ -968,10 +968,15 @@ impl Server {
                 continue;
             }
             total -= use_n;
+            // A seed stack whose `compostable` the patch removes is counted but neither composted
+            // nor consumed.
+            if !self.stack_has(st, "minecraft:compostable") {
+                continue;
+            }
             for _ in 0..use_n {
                 // Layers of the `compostable` component (seeds: "weak").
                 if level < 7 {
-                    let layers = self.compost_layers(&st.id, level);
+                    let layers = self.compost_layers(st, level);
                     if layers > 0 {
                         level = (level + layers).clamp(0, 7);
                         let s = self.st(p);
@@ -1001,10 +1006,10 @@ impl Server {
         self.send_level_event(1500, p, i32::from(level != start));
     }
 
-    /// Layers added by a compostable item (the game's provider: 1 on an empty composter,
-    /// otherwise weighted list on the world random).
-    pub(crate) fn compost_layers(&mut self, item: &str, level: i32) -> i32 {
-        let comp = self.life.items.defaults(item)["minecraft:compostable"]["layers"].clone();
+    /// Layers added by a compostable stack (its own component, patch included; the game's
+    /// provider: 1 on an empty composter, otherwise weighted list on the world random).
+    pub(crate) fn compost_layers(&mut self, st: &Stack, level: i32) -> i32 {
+        let comp = self.comp_json(st, "minecraft:compostable").map_or(serde_json::Value::Null, |c| c["layers"].clone());
         let prov = match &comp {
             serde_json::Value::String(id) => self.life.pack.get("context_int_provider", id).map(|v| (*v).clone()),
             v if v.is_object() => Some(v.clone()),

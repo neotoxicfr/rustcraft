@@ -72,10 +72,12 @@ impl Server {
         }
         let dmg = self.life.items.damage(&s) + n;
         let mut s = s;
-        if dmg >= self.life.items.max_damage(&s) {
+        let max = self.life.items.max_damage(&s);
+        if dmg >= max {
             self.mob_remove_stack_mods(m, &s, k);
             s.count -= 1;
-            crate::items::remove_component(&mut s, "minecraft:damage");
+            // The rest of the stack keeps the wear, capped at the durability (broken too).
+            crate::items::set_component(&mut s, "minecraft:damage", rc_proto::nbt::Nbt::Int(max));
             m.equipment[k] = (s.count > 0).then_some(s);
             let event = BREAK_EVENTS[k];
             let _ = self.send(rc_client::Event::Entity(rc_client::EntityEvent::Event { id: m.id, event }));

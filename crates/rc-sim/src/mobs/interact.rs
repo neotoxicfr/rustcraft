@@ -144,13 +144,19 @@ impl Server {
         held.id.ends_with("_spawn_egg") && self.egg_offspring(m, slot, &held)
     }
 
-    /// Species of the egg: entity data of the stack, otherwise that of the item.
+    /// Species of the egg: entity data of the stack, otherwise that of the item unless the
+    /// patch removes it (no species then).
     pub(crate) fn egg_kind(&self, egg: &Stack) -> Option<Kind> {
         let id = crate::items::component(egg, "minecraft:entity_data")
             .and_then(|d| d.get("id"))
             .and_then(rc_proto::nbt::Nbt::as_str)
             .map(str::to_owned)
-            .or_else(|| self.life.items.defaults(&egg.id)["minecraft:entity_data"]["id"].as_str().map(str::to_owned))?;
+            .or_else(|| {
+                self.life
+                    .items
+                    .default_component(egg, "minecraft:entity_data")
+                    .and_then(|d| d["id"].as_str().map(str::to_owned))
+            })?;
         Kind::from_name(&id)
     }
 

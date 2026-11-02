@@ -266,10 +266,22 @@ impl Items {
         self.tags.get(tag).is_some_and(|v| v.binary_search(&id).is_ok())
     }
 
-    /// Maximum size of a stack (`max_stack_size` component).
+    /// Maximum size of a stack (`max_stack_size` component); a patch that removes it leaves
+    /// the game's fallback, 1.
     pub fn max_stack(&self, s: &Stack) -> i32 {
-        if let Some(v) = component(s, "minecraft:max_stack_size").and_then(Nbt::as_i64) {
-            return v.clamp(1, 99) as i32;
+        // One pass over the patch for the value and the removal (called for every stack moved).
+        if let Some(Nbt::Compound(f)) = &s.components {
+            for (k, v) in f {
+                match k.as_str() {
+                    "minecraft:max_stack_size" => {
+                        if let Some(n) = v.as_i64() {
+                            return n.clamp(1, 99) as i32;
+                        }
+                    }
+                    "!minecraft:max_stack_size" => return 1,
+                    _ => {}
+                }
+            }
         }
         self.info(&s.id).map_or(64, |i| i32::from(i.max_stack_size.max(1)))
     }
@@ -288,13 +300,20 @@ impl Items {
         component(s, "minecraft:damage").and_then(Nbt::as_i64).unwrap_or(0) as i32
     }
 
-    /// Usable: durability, wear tracked, not unbreakable (§ 3.1).
+    /// Usable: durability, wear tracked, not unbreakable (§ 3.1). Wear tracked = a `damage`
+    /// component, on the stack or by default (items with a durability carry one) and not removed.
     pub fn damageable(&self, s: &Stack) -> bool {
-        self.max_damage(s) > 0 && component(s, "minecraft:unbreakable").is_none()
+        if s.components.is_none() {
+            return self.info(&s.id).is_some_and(|i| i.max_damage > 0);
+        }
+        self.max_damage(s) > 0
+            && component(s, "minecraft:unbreakable").is_none()
+            && (component(s, "minecraft:damage").is_some()
+                || component(s, "!minecraft:damage").is_none() && self.info(&s.id).is_some_and(|i| i.max_damage > 0))
     }
 
     /// Equipment slot: 0 main hand, 1 feet, 2 legs, 3 chest, 4 head, 5 off hand,
-    /// 6 body, 7 saddle; `None` without an `equippable` component.
+    /// 6 body, 7 saddle; `None` without an `equippable` component (removed by the patch included).
     pub fn equip_slot(&self, s: &Stack) -> Option<u8> {
         if let Some(e) = component(s, "minecraft:equippable") {
             let slot = e.get("slot").and_then(Nbt::as_str)?;
@@ -302,6 +321,9 @@ impl Items {
                 .iter()
                 .position(|n| *n == slot)
                 .map(|i| i as u8);
+        }
+        if component(s, "!minecraft:equippable").is_some() {
+            return None;
         }
         self.info(&s.id).and_then(|i| i.equip_slot.checked_sub(1))
     }

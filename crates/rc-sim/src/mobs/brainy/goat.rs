@@ -598,15 +598,7 @@ fn drop_horn(s: &mut Server, m: &mut Mob) -> bool {
 /// of the goat's UUID (always the same for a given goat).
 pub fn create_horn(s: &Server, m: &Mob) -> Stack {
     let tag = if m.bm.screaming { "screaming_goat_horns" } else { "regular_goat_horns" };
-    let list: Vec<String> = s
-        .life
-        .pack
-        .get("tags/instrument", tag)
-        .and_then(|v| v["values"].as_array().cloned())
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|v| v.as_str().map(str::to_owned))
-        .collect();
+    let list = s.life.pack.tag("instrument", tag);
     let mut st = Stack { id: "minecraft:goat_horn".into(), count: 1, components: None };
     if !list.is_empty() {
         let pick = &list[horn_pick(m.uuid, list.len())];

@@ -109,7 +109,7 @@ impl Server {
             }
             "flower_pot" => self.pot_use_item(p, &id, slot, true),
             _ if short.starts_with("potted_") => self.pot_use_item(p, &id, slot, false),
-            "composter" => self.composter_use_item(p, s, &id, slot),
+            "composter" => self.composter_use_item(p, s, held.as_ref(), slot),
             // W9: key inserted into an active vault.
             "vault" => match self.vault_use_item(p, slot) {
                 Some(()) => ItemOn::Done,
@@ -377,28 +377,27 @@ impl Server {
         ItemOn::Done
     }
 
-    /// Composter: compostable item below level 8; layer drawn below 7 (event 1500,
-    /// 1 if the level rises), item consumed.
-    fn composter_use_item(&mut self, p: P, s: u32, item: &str, slot: usize) -> ItemOn {
+    /// Composter: compostable stack (its own `compostable` component, patch included) below
+    /// level 8; layer drawn below 7 (event 1500, 1 if the level rises), item consumed.
+    fn composter_use_item(&mut self, p: P, s: u32, held: Option<&Stack>, slot: usize) -> ItemOn {
         let level = self.v().get_int(s, "level");
-        let compostable = !item.is_empty() && !self.life.items.defaults(item)["minecraft:compostable"].is_null();
-        if level >= 8 || !compostable {
+        let Some(st) = held.filter(|h| level < 8 && self.stack_has(h, "minecraft:compostable")) else {
             return ItemOn::TryEmptyHand;
-        }
+        };
         if level < 7 {
-            let ns = self.composter_add_layer(p, s, item, Some(Ent::Player));
+            let ns = self.composter_add_layer(p, s, st, Some(Ent::Player));
             self.level_event(1500, p, i32::from(ns != s));
-            self.award_stat("minecraft:used", item, 1);
+            self.award_stat("minecraft:used", &st.id, 1);
             self.consume_held(slot);
         }
         ItemOn::Done
     }
 
-    /// Layers drawn for the item; if any, level capped at 7, placement,
+    /// Layers drawn for the stack; if any, level capped at 7, placement,
     /// `block_change` event (author `by`), switch to 8 scheduled at level 7. Returns the state.
-    pub(crate) fn composter_add_layer(&mut self, p: P, s: u32, item: &str, by: Option<Ent>) -> u32 {
+    pub(crate) fn composter_add_layer(&mut self, p: P, s: u32, st: &Stack, by: Option<Ent>) -> u32 {
         let level = self.v().get_int(s, "level");
-        let layers = self.compost_layers(item, level);
+        let layers = self.compost_layers(st, level);
         if layers <= 0 {
             return s;
         }

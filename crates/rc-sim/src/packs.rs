@@ -490,7 +490,7 @@ fn keep(key: &str) -> bool {
 
 /// Content of a valid tag file: `values` list of valid entries, `replace`
 /// boolean if written. Otherwise `None` (file rejected).
-fn tag_values(v: &Value) -> Option<&Vec<Value>> {
+pub(crate) fn tag_values(v: &Value) -> Option<&Vec<Value>> {
     if v.get("replace").is_some_and(|r| !r.is_boolean()) {
         return None;
     }

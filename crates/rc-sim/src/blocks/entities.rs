@@ -1276,7 +1276,8 @@ impl Server {
     }
 
     /// Contents by increasing slot: id, count, stack size from the stack's
-    /// `max_stack_size` component if set (clamped to 1..99 like the game).
+    /// `max_stack_size` component if set (clamped to 1..99 like the game), 1 if the patch
+    /// removes it.
     pub(crate) fn be_item_counts_full(&self, p: P) -> Vec<(String, i32, Option<i32>)> {
         self.slots(p)
             .into_iter()
@@ -1284,11 +1285,11 @@ impl Server {
             .filter_map(|it| {
                 let id = it.get("id").and_then(Nbt::as_str).unwrap_or("").to_owned();
                 let count = Self::item_count(&it);
-                let own = it
-                    .get("components")
-                    .and_then(|c| c.get("minecraft:max_stack_size"))
-                    .and_then(Nbt::as_i64)
-                    .map(|n| n.clamp(1, 99) as i32);
+                let comps = it.get("components");
+                let own = match comps.and_then(|c| c.get("minecraft:max_stack_size")).and_then(Nbt::as_i64) {
+                    Some(n) => Some(n.clamp(1, 99) as i32),
+                    None => comps.and_then(|c| c.get("!minecraft:max_stack_size")).map(|_| 1),
+                };
                 (!id.is_empty() && count > 0).then_some((id, count, own))
             })
             .collect()
@@ -1580,12 +1581,13 @@ impl Server {
         if self.state_name(s) != "minecraft:composter" {
             return None;
         }
-        let id = item.get("id").and_then(Nbt::as_str).unwrap_or("").to_owned();
-        let compostable = crate::player::Stack::from_nbt(item).is_some_and(|st| self.stack_has(&st, "minecraft:compostable"));
-        if face != Dir::Up || self.v().get_int(s, "level") >= 7 || !compostable {
+        let Some(st) = crate::player::Stack::from_nbt(item).filter(|st| self.stack_has(st, "minecraft:compostable")) else {
+            return Some(false);
+        };
+        if face != Dir::Up || self.v().get_int(s, "level") >= 7 {
             return Some(false);
         }
-        let ns = self.composter_add_layer(c, s, &id, None);
+        let ns = self.composter_add_layer(c, s, &st, None);
         self.level_event(1500, c, i32::from(ns != s));
         Some(true)
     }
