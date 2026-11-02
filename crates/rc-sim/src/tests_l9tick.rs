@@ -255,6 +255,25 @@ fn packed_order_is_the_game_hash_table_walk() {
         [9, 250, 0],
     ];
     assert_eq!(crate::blocks::entities::java_hash_order(&b), [0, 11, 1, 7, 2, 3, 4, 10, 8, 12, 9, 5, 6]);
+    // Ten positions in one bucket up to 32 buckets: the ninth grows the table to 32, the tenth
+    // to 64, which splits them.
+    let c: [[i32; 3]; 13] = [
+        [0, 0, 0],
+        [1, 1, 0],
+        [2, 2, 0],
+        [3, 3, 0],
+        [4, 4, 0],
+        [5, 5, 0],
+        [6, 6, 0],
+        [7, 7, 0],
+        [8, 8, 0],
+        [9, 9, 0],
+        [3, -60, 7],
+        [15, 64, 2],
+        [11, 5, 3],
+    ];
+    assert_eq!(crate::blocks::entities::java_hash_order(&c), [0, 2, 4, 6, 8, 10, 11, 1, 3, 5, 7, 9, 12]);
+    assert_eq!(crate::blocks::entities::java_hash_order(&c[..9]), [0, 1, 2, 3, 4, 5, 6, 7, 8]);
 }
 
 /// A packed block entity (saved before its chunk ever ticked) is promoted once the chunk's
