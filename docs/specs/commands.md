@@ -203,7 +203,7 @@ Identifier (used everywhere): greedy run of `0-9 a-z _ : / . -`; default namespa
 | `objective`, `team` | unquoted word | — |
 | `objective_criteria` | everything up to the space; must be a known criterion (`dummy`, `trigger`, `health`, `minecraft.type:item`…) | `argument.criteria.invalid` |
 | `operation` | everything up to the space among `= += -= *= /= %= < > ><` | `arguments.operation.invalid` |
-| `particle` | particle type identifier then, if the type has options, `{SNBT}` | `particle.notFound`, `particle.invalidOptions` |
+| `particle` | particle type identifier then, if the type has options, `{SNBT}` (no braces = empty options), decoded at parse time by the type's record codec: every field is read, the messages of the failed ones joined by `; ` LAST field first (`trail` without options: `No key duration in MapLike[{}]; No key color in MapLike[{}]; No key target in MapLike[{}]`) | `particle.notFound`, `particle.invalidOptions` |
 | `scoreboard_slot` | word: `list`, `sidebar`, `below_name`, `sidebar.team.<colour>` | `argument.scoreboardDisplaySlot.invalid` |
 | `item_slot` | name up to the space designating **one** slot (`container.5`, `weapon.mainhand`…) | `slot.unknown`, `slot.only_single_allowed` |
 | `item_slots` | name or range (`container.*`) | `slot.unknown` |

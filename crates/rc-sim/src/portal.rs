@@ -1018,8 +1018,8 @@ impl Server {
 
     /// The search or creation of a valid teleport position (gateway without known exit).
     fn gateway_find_or_create(&mut self, entry: P) -> P {
-        let len = (f64::from(entry[0]).powi(2) + f64::from(entry[2]).powi(2)).sqrt();
-        let dir = if len < 1.0e-5 { [0.0, 0.0] } else { [f64::from(entry[0]) / len, f64::from(entry[2]) / len] };
+        let n = crate::mobs::mth::normalize([f64::from(entry[0]), 0.0, f64::from(entry[2])]);
+        let dir = [n[0], n[2]];
         let mut t = [dir[0] * 1024.0, dir[1] * 1024.0];
         let mut limit = 16;
         while !self.chunk_empty(t[0], t[1]) && {

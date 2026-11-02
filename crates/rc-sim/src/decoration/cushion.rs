@@ -171,12 +171,9 @@ impl Server {
             return (clicked, face, at);
         }
         let from = [self.pos[0], self.player_eye_y(), self.pos[2]];
-        let ray = [at[0] - from[0], at[1] - from[1], at[2] - from[2]];
-        let len = (ray[0] * ray[0] + ray[1] * ray[1] + ray[2] * ray[2]).sqrt();
-        if len < 1.0e-4 {
-            return (clicked, face, at);
-        }
-        let to = std::array::from_fn(|i| at[i] + ray[i] / len * 0.001);
+        // Unit ray (zero when the eye is on the point), 0.001 past the touched point.
+        let n = crate::mobs::mth::normalize([at[0] - from[0], at[1] - from[1], at[2] - from[2]]);
+        let to = std::array::from_fn(|i| at[i] + n[i] * 0.001);
         let shape = self.data.shape(self.v().info(self.get(clicked)).collision);
         let mut best: Option<(f64, Dir)> = None;
         for s in shape {
@@ -241,7 +238,7 @@ impl Server {
             .live
             .iter()
             .filter(|l| l.kind == DKind::Cushion && !l.removed)
-            .filter_map(|l| self.deco_nbt(l.id))
+            .filter_map(|l| self.deco_nbt_near(l.id, Some(l.chunk)))
             .any(|e| self.deco_box(e).is_some_and(|o| o.intersects(b)))
     }
 

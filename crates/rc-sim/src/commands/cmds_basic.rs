@@ -1508,10 +1508,175 @@ pub fn rule_default(key: &str) -> &'static str {
     }
 }
 
+/// Options of a particle read like the game's record decoders: every field is decoded, and the
+/// messages of the failed ones are joined last field first (the order in which the game's
+/// decoder combines them).
+struct Options<'a> {
+    o: &'a Nbt,
+    errors: Vec<String>,
+}
+
+impl<'a> Options<'a> {
+    fn new(o: &'a Nbt) -> Self {
+        Options { o, errors: Vec::new() }
+    }
+
+    fn field(&self, k: &str) -> Result<&'a Nbt, String> {
+        self.o.get(k).ok_or_else(|| format!("No key {k} in MapLike[{}]", super::snbt::to_snbt(self.o)))
+    }
+
+    /// Required field decoded by `f`; its error is kept.
+    fn req<T>(&mut self, k: &str, f: impl FnOnce(&'a Nbt) -> Result<T, String>) -> Option<T> {
+        let r = self.field(k).and_then(f);
+        self.keep(r)
+    }
+
+    /// Optional field: `default` when absent, its error kept when present and invalid.
+    fn opt<T>(&mut self, k: &str, default: T, f: impl FnOnce(&'a Nbt) -> Result<T, String>) -> Option<T> {
+        match self.o.get(k) {
+            None => Some(default),
+            Some(v) => {
+                let r = f(v);
+                self.keep(r)
+            }
+        }
+    }
+
+    fn keep<T>(&mut self, r: Result<T, String>) -> Option<T> {
+        r.map_err(|e| self.errors.push(e)).ok()
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        if self.errors.is_empty() {
+            return Ok(());
+        }
+        self.errors.reverse();
+        Err(self.errors.join("; "))
+    }
+}
+
+/// Integer of a numeric tag, cut like the game's (`int` of a long or of a decimal).
+fn int_of(v: &Nbt) -> Option<i32> {
+    match *v {
+        Nbt::Float(f) => Some(f as i32),
+        Nbt::Double(d) => Some(d as i32),
+        ref other => other.as_i64().map(|i| i as i32),
+    }
+}
+
+fn float_tag(v: &Nbt) -> Result<f32, String> {
+    crate::mobs::mob::f64_of(v).map(|v| v as f32).ok_or_else(|| "Not a number".to_owned())
+}
+
+fn int_tag(v: &Nbt) -> Result<i32, String> {
+    int_of(v).ok_or_else(|| "Not a number".to_owned())
+}
+
+fn positive_tag(v: &Nbt) -> Result<i32, String> {
+    let n = int_tag(v)?;
+    if n >= 1 { Ok(n) } else { Err(format!("Value must be positive: {n}")) }
+}
+
+fn scale_tag(v: &Nbt) -> Result<f32, String> {
+    let v = float_tag(v)?;
+    if !(0.01..=4.0).contains(&v) {
+        return Err(format!("Value must be within range [0.01;4.0]: {}", jf(v)));
+    }
+    Ok(v)
+}
+
+/// Integer color, or a list of 3 (`alpha`: 4) floats 0–1 (`floor(x × 255)`, opaque without alpha).
+fn color_tag(v: &Nbt, alpha: bool) -> Result<u32, String> {
+    if let Some(i) = v.as_i64().filter(|_| !matches!(v, Nbt::Float(_) | Nbt::Double(_))) {
+        return Ok(i as i32 as u32);
+    }
+    let n = if alpha { 4 } else { 3 };
+    let f: Vec<f32> = match v {
+        Nbt::List(l) => l.iter().filter_map(|x| crate::mobs::mob::f64_of(x).map(|x| x as f32)).collect(),
+        _ => Vec::new(),
+    };
+    if f.len() != n {
+        return Err(format!("Input is not a list of {n} elements"));
+    }
+    let ch = |x: f32| ((x * 255.0).floor() as i32 & 0xFF) as u32;
+    let a = if alpha { ch(f[3]) } else { 255 };
+    Ok(a << 24 | ch(f[0]) << 16 | ch(f[1]) << 8 | ch(f[2]))
+}
+
+/// Point of 3 doubles (list or array tag): an error per element that is not a number, then the
+/// size checked on the others.
+fn vec3_tag(v: &Nbt) -> Result<[f64; 3], String> {
+    let all: Vec<Option<f64>> = match v {
+        Nbt::List(l) => l.iter().map(crate::mobs::mob::f64_of).collect(),
+        Nbt::ByteArray(a) => a.iter().map(|&b| Some(f64::from(b as i8))).collect(),
+        Nbt::IntArray(a) => a.iter().map(|&i| Some(f64::from(i))).collect(),
+        Nbt::LongArray(a) => a.iter().map(|&i| Some(i as f64)).collect(),
+        _ => return Err(format!("Not a list: {}", super::snbt::to_snbt(v))),
+    };
+    let mut errors = vec!["Not a number"; all.iter().filter(|x| x.is_none()).count()];
+    let good: Vec<f64> = all.into_iter().flatten().collect();
+    if errors.is_empty()
+        && let [x, y, z] = good[..]
+    {
+        return Ok([x, y, z]);
+    }
+    if good.len() != 3 {
+        errors.push("Input is not a list of 3 elements");
+    }
+    Err(errors.join("; "))
+}
+
+/// Stream of `n` integers (int array, or list or array of numbers).
+fn ints_tag(v: &Nbt, n: usize) -> Result<Vec<i32>, String> {
+    let all: Option<Vec<i32>> = match v {
+        Nbt::IntArray(a) => Some(a.clone()),
+        Nbt::List(l) => l.iter().map(int_of).collect(),
+        Nbt::ByteArray(a) => Some(a.iter().map(|&b| i32::from(b as i8)).collect()),
+        Nbt::LongArray(a) => Some(a.iter().map(|&i| i as i32).collect()),
+        _ => return Err("Not a list".to_owned()),
+    };
+    let all = all.ok_or_else(|| format!("Some elements are not ints: {}", super::snbt::to_snbt(v)))?;
+    if all.len() != n {
+        return Err(format!("Input is not a list of {n} ints"));
+    }
+    Ok(all)
+}
+
+/// Destination of a `vibration`: block position source `{type:"block",pos:[x,y,z]}`; an entity
+/// source is decoded, then refused like the game's command.
+fn vibration_destination(v: &Nbt) -> Result<[i32; 3], String> {
+    if !matches!(v, Nbt::Compound(_)) {
+        return Err(format!("Not a map: {}", super::snbt::to_snbt(v)));
+    }
+    let mut d = Options::new(v);
+    let Nbt::String(ty) = d.field("type")? else { return Err("Not a string".to_owned()) };
+    rc_commands::components::identifier(ty)?;
+    let ty = match ty.find(':') {
+        Some(0) => format!("minecraft{ty}"),
+        Some(_) => ty.clone(),
+        None => format!("minecraft:{ty}"),
+    };
+    match ty.as_str() {
+        "minecraft:block" => {
+            let pos = d.req("pos", |p| ints_tag(p, 3));
+            d.finish()?;
+            Ok(pos.map_or([0; 3], |p| [p[0], p[1], p[2]]))
+        }
+        "minecraft:entity" => {
+            d.req("source_entity", |u| ints_tag(u, 4));
+            d.opt("y_offset", 0.0, float_tag);
+            d.finish()?;
+            Err("Entity position sources are not allowed".to_owned())
+        }
+        _ => Err(format!("Unknown registry key in ResourceKey[minecraft:root / minecraft:position_source_type]: {ty}")),
+    }
+}
+
 /// Particle options decoded like the game's codecs: integer color or floats 0–1
 /// (`floor(x × 255)`), block state (compound `Name`/`Properties` or identifier), item
-/// (identifier or compound `id`), bounded scale, power, delay. Shared by execution
-/// (`particle_options`) and parsing (`check_particle`): the game refuses at parse time.
+/// (identifier or compound `id`), bounded scale, power, delay, trail target and duration,
+/// vibration destination, geyser water and impulse. Shared by execution (`particle_options`) and
+/// parsing (`check_particle`): the game refuses at parse time.
 fn decode_particle(
     kind: i32,
     name: &str,
@@ -1519,72 +1684,63 @@ fn decode_particle(
     block_state: &dyn Fn(&Nbt) -> Option<i32>,
     item_index: &dyn Fn(&str) -> Option<i32>,
 ) -> Result<rc_proto_v777::entity::Particle, String> {
-    let mut part =
-        rc_proto_v777::entity::Particle { kind, color: 0, state: 0, item: -1, scale: 1.0, color2: 0, vib: None, trail: None };
-    let invalid = |m: String| m;
-    let field =
-        |k: &str| o.get(k).ok_or_else(|| invalid(format!("No key {k} in MapLike[{}]", super::snbt::to_snbt(o))));
-    let float = |k: &str| -> Result<f32, String> {
-        crate::mobs::mob::f64_of(field(k)?).map(|v| v as f32).ok_or_else(|| {
-            invalid(format!("Not a number: {}", super::snbt::to_snbt(&o.get(k).cloned().unwrap_or(Nbt::Byte(0)))))
-        })
-    };
-    let color = |k: &str, alpha: bool| -> Result<u32, String> {
-        let v = field(k)?;
-        if let Some(i) = v.as_i64().filter(|_| !matches!(v, Nbt::Float(_) | Nbt::Double(_))) {
-            return Ok(i as i32 as u32);
-        }
-        let n = if alpha { 4 } else { 3 };
-        let f: Vec<f32> = match v {
-            Nbt::List(l) => l.iter().filter_map(|x| crate::mobs::mob::f64_of(x).map(|x| x as f32)).collect(),
-            _ => Vec::new(),
-        };
-        if f.len() != n {
-            return Err(invalid(format!("Input is not a list of {n} elements")));
-        }
-        let ch = |x: f32| ((x * 255.0).floor() as i32 & 0xFF) as u32;
-        let a = if alpha { ch(f[3]) } else { 255 };
-        Ok(a << 24 | ch(f[0]) << 16 | ch(f[1]) << 8 | ch(f[2]))
-    };
-    let scale = |k: &str| -> Result<f32, String> {
-        let v = float(k)?;
-        if !(0.01..=4.0).contains(&v) {
-            return Err(invalid(format!("Value must be within range [0.01;4.0]: {v}")));
-        }
-        Ok(v)
-    };
+    let mut part = rc_proto_v777::entity::Particle::plain(kind);
+    let mut f = Options::new(o);
     match name.trim_start_matches("minecraft:") {
         "block" | "block_marker" | "falling_dust" | "dust_pillar" | "block_crumble" => {
-            let v = field("block_state")?;
-            part.state = block_state(v).ok_or_else(|| invalid("Unknown block".into()))?;
+            if let Some(s) = f.req("block_state", |v| block_state(v).ok_or_else(|| "Unknown block".to_owned())) {
+                part.state = s;
+            }
         }
         "dust" => {
-            part.color = color("color", false)?;
-            part.scale = scale("scale")?;
+            part.color = f.req("color", |v| color_tag(v, false)).unwrap_or(0);
+            part.scale = f.req("scale", scale_tag).unwrap_or(1.0);
         }
         "dust_color_transition" => {
-            part.color = color("from_color", false)?;
-            part.color2 = color("to_color", false)?;
-            part.scale = scale("scale")?;
+            part.color = f.req("from_color", |v| color_tag(v, false)).unwrap_or(0);
+            part.color2 = f.req("to_color", |v| color_tag(v, false)).unwrap_or(0);
+            part.scale = f.req("scale", scale_tag).unwrap_or(1.0);
         }
-        "entity_effect" | "tinted_leaves" | "flash" => part.color = color("color", true)?,
+        "entity_effect" | "tinted_leaves" | "flash" => part.color = f.req("color", |v| color_tag(v, true)).unwrap_or(0),
         "effect" | "instant_effect" => {
-            part.color = if o.get("color").is_some() { color("color", false)? } else { u32::MAX };
-            part.scale = if o.get("power").is_some() { float("power")? } else { 1.0 };
+            part.color = f.opt("color", u32::MAX, |v| color_tag(v, false)).unwrap_or(0);
+            part.scale = f.opt("power", 1.0, float_tag).unwrap_or(1.0);
         }
-        "dragon_breath" => part.scale = if o.get("power").is_some() { float("power")? } else { 1.0 },
-        "sculk_charge" => part.scale = float("roll")?,
-        "shriek" => part.state = field("delay")?.as_i64().ok_or_else(|| invalid("Not a number".into()))? as i32,
+        "dragon_breath" => part.scale = f.opt("power", 1.0, float_tag).unwrap_or(1.0),
+        "sculk_charge" => part.scale = f.req("roll", float_tag).unwrap_or(1.0),
+        "shriek" => part.state = f.req("delay", int_tag).unwrap_or(0),
         "item" => {
-            let v = field("item")?;
-            let id = v.as_str().map(str::to_owned).or_else(|| v.get("id").and_then(Nbt::as_str).map(str::to_owned));
-            let id = id.map(|i| args::id(&i)).ok_or_else(|| invalid("Not a string".into()))?;
-            part.item = item_index(&id).ok_or_else(|| {
-                invalid(format!("Unknown registry key in ResourceKey[minecraft:root / minecraft:item]: {id}"))
-            })?;
+            let item = f.req("item", |v| {
+                let id = v.as_str().map(str::to_owned).or_else(|| v.get("id").and_then(Nbt::as_str).map(str::to_owned));
+                let id = id.map(|i| args::id(&i)).ok_or_else(|| "Not a string".to_owned())?;
+                item_index(&id)
+                    .ok_or_else(|| format!("Unknown registry key in ResourceKey[minecraft:root / minecraft:item]: {id}"))
+            });
+            part.item = item.unwrap_or(-1);
+        }
+        "vibration" => {
+            let dest = f.req("destination", vibration_destination);
+            let ticks = f.req("arrival_in_ticks", int_tag);
+            if let (Some(d), Some(t)) = (dest, ticks) {
+                part.vib = Some((rc_proto_v777::entity::VibDest::Block(d), t));
+            }
+        }
+        "trail" => {
+            let target = f.req("target", vec3_tag);
+            part.color = f.req("color", |v| color_tag(v, false)).unwrap_or(0);
+            let duration = f.req("duration", positive_tag);
+            if let (Some(t), Some(d)) = (target, duration) {
+                part.trail = Some((t, d));
+            }
+        }
+        "geyser" | "geyser_plume" => part.state = f.req("water_blocks", positive_tag).unwrap_or(0),
+        "geyser_base" | "geyser_poof" => {
+            part.state = f.req("water_blocks", positive_tag).unwrap_or(0);
+            part.scale = f.req("burst_impulse_base", float_tag).unwrap_or(1.0);
         }
         _ => {}
     }
+    f.finish()?;
     Ok(part)
 }
 
@@ -1618,3 +1774,7 @@ pub fn check_particle(d: &rc_commands::Data, text: &str) -> Result<(), String> {
     )
     .map(|_| ())
 }
+
+#[cfg(test)]
+#[path = "particle_options_tests.rs"]
+mod particle_options_tests;

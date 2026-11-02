@@ -208,10 +208,11 @@ impl Server {
 
     /// Entities whose box touches `area`, moved by `d` with their collisions (an ordinary
     /// movement, not a piston one): mobs except shulkers, those without physics (vex, dragon)
-    /// and those riding the same root vehicle as the shulker, dying ones included; items, orbs,
-    /// primed TNT and falling blocks; decorations (what hangs falls with its item, armor stands
-    /// and mannequins move). The player is pushed by their own client, which opens the shulker
-    /// too (`entity_motion.rs`). Projectiles and vehicles: not yet, as for the piston.
+    /// and those riding the same root vehicle as the shulker, dying ones included; minecarts
+    /// (their own move: stuck slowdown, collisions, block effects) except the one the shulker
+    /// rides; items, orbs, primed TNT and falling blocks; decorations (what hangs falls with its
+    /// item, armor stands and mannequins move). The player is pushed by their own client, which
+    /// opens the shulker too (`entity_motion.rs`). Projectiles: not yet, as for the piston.
     pub(crate) fn shulker_shove(&mut self, m: &Mob, area: &rc_physics::Aabb, d: [f64; 3]) {
         use rc_physics::body::Heft;
         for i in 0..self.mobs.list.len() {
@@ -229,6 +230,19 @@ impl Server {
             let Some(mut o) = self.mobs.list[i].take() else { continue };
             self.mob_move(&mut o, d);
             self.mobs.list[i] = Some(o);
+        }
+        if !self.carts.list.is_empty() {
+            // A minecart never rides: it shares the shulker's root vehicle only when it is it.
+            let root = self.root_of(m.id, m.mount.vehicle);
+            for i in 0..self.carts.list.len() {
+                let hit = self.carts.list[i].as_ref().is_some_and(|c| !c.removed && c.id != root && c.bbox().intersects(area));
+                if !hit {
+                    continue;
+                }
+                let Some(mut c) = self.carts.list[i].take() else { continue };
+                self.cart_move(&mut c, d);
+                self.carts.list[i] = Some(c);
+            }
         }
         let mut ents = std::mem::take(&mut self.bs.entities.list);
         let mut drops = std::mem::take(&mut self.life.drops);

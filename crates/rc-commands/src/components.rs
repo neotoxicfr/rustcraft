@@ -139,7 +139,7 @@ fn path_char(c: char) -> bool {
 }
 
 /// Decoder identifier: namespace then path checked, game message.
-fn identifier(s: &str) -> Result<(), String> {
+pub fn identifier(s: &str) -> Result<(), String> {
     let (ns, path) = match s.find(':') {
         Some(0) => ("minecraft", &s[1..]),
         Some(i) => (&s[..i], &s[i + 1..]),

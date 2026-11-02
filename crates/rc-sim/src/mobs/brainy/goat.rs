@@ -286,11 +286,7 @@ fn optimal_jump(s: &Server, m: &Mob, j: &mut LongJump, target: [f64; 3]) -> Opti
 /// "long jump" pose).
 fn jump_vector(s: &Server, m: &Mob, target: [f64; 3], max_v: f32, angle: i32) -> Option<[f64; 3]> {
     let p = m.pos;
-    let plane = {
-        let d = [target[0] - p[0], 0.0, target[2] - p[2]];
-        let l = (d[0] * d[0] + d[2] * d[2]).sqrt();
-        if l < 1.0e-4 { [0.0; 3] } else { [d[0] / l * 0.5, 0.0, d[2] / l * 0.5] }
-    };
+    let plane = crate::mobs::mth::normalize([target[0] - p[0], 0.0, target[2] - p[2]]).map(|v| v * 0.5);
     let tp = [target[0] - plane[0], target[1] - plane[1], target[2] - plane[2]];
     let dir = [tp[0] - p[0], tp[1] - p[1], tp[2] - p[2]];
     let angrad = angle as f32 * std::f32::consts::PI / 180.0;
@@ -338,7 +334,7 @@ fn clear_transition(s: &Server, w: f32, h: f32, a: [f64; 3], b: [f64; 3]) -> boo
     let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
     let min = f64::from(w.min(h));
     let checks = (len / min).ceil() as i32;
-    let n = if len < 1.0e-4 { [0.0; 3] } else { d.map(|x| x / len) };
+    let n = crate::mobs::mth::normalize(d);
     let mut next = a;
     for i in 0..checks {
         next = if i == checks - 1 {
@@ -471,9 +467,7 @@ pub fn prepare_ram_stop(s: &mut Server, m: &mut Mob, b: &mut Brain) {
 pub fn ram_start(_s: &mut Server, m: &mut Mob, b: &mut Brain, dir: &mut [f64; 3]) {
     let cur = m.block_pos();
     let Some(rt) = b.mem.ram_target.get() else { return };
-    let d = [f64::from(cur[0]) - rt[0], 0.0, f64::from(cur[2]) - rt[2]];
-    let l = (d[0] * d[0] + d[2] * d[2]).sqrt();
-    *dir = if l < 1.0e-4 { [0.0; 3] } else { [d[0] / l, 0.0, d[2] / l] };
+    *dir = crate::mobs::mth::normalize([f64::from(cur[0]) - rt[0], 0.0, f64::from(cur[2]) - rt[2]]);
     b.mem.walk.set(Walk::to(rt, 3.0, 0));
 }
 
@@ -562,9 +556,8 @@ fn finish_ram(s: &mut Server, m: &mut Mob, b: &mut Brain) {
 
 /// Block of the `snaps_goat_horn` tag ahead (direction of horizontal movement) or above.
 fn rammed_horn_block(s: &Server, m: &Mob) -> bool {
-    let (x, z) = (m.vel[0], m.vel[2]);
-    let l = (x * x + z * z).sqrt();
-    let n = if l < 1.0e-4 { [0.0, 0.0] } else { [x / l, z / l] };
+    let n = crate::mobs::mth::normalize([m.vel[0], 0.0, m.vel[2]]);
+    let n = [n[0], n[2]];
     let f = block_of([m.pos[0] + n[0], m.pos[1], m.pos[2] + n[1]]);
     s.btag_id(f, crate::tag_bits::TagId::SnapsGoatHorn) || s.btag_id([f[0], f[1] + 1, f[2]], crate::tag_bits::TagId::SnapsGoatHorn)
 }
@@ -598,15 +591,7 @@ fn drop_horn(s: &mut Server, m: &mut Mob) -> bool {
 /// of the goat's UUID (always the same for a given goat).
 pub fn create_horn(s: &Server, m: &Mob) -> Stack {
     let tag = if m.bm.screaming { "screaming_goat_horns" } else { "regular_goat_horns" };
-    let list: Vec<String> = s
-        .life
-        .pack
-        .get("tags/instrument", tag)
-        .and_then(|v| v["values"].as_array().cloned())
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|v| v.as_str().map(str::to_owned))
-        .collect();
+    let list = s.life.pack.tag("instrument", tag);
     let mut st = Stack { id: "minecraft:goat_horn".into(), count: 1, components: None };
     if !list.is_empty() {
         let pick = &list[horn_pick(m.uuid, list.len())];

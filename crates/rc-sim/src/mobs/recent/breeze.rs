@@ -320,8 +320,7 @@ fn optimal_jump(m: &mut Mob, target: [f64; 3]) -> Option<[f64; 3]> {
         let max_v = 0.058_333_334f32 * m.follow_range() as f32;
         if let Some(v) = jump_vector(m, target, max_v, a) {
             if let Some(e) = m.x.effects.iter().find(|e| e.id == "minecraft:jump_boost") {
-                let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-                let ny = if l < 1.0e-5 { 0.0 } else { v[1] / l };
+                let ny = super::super::mth::normalize(v)[1];
                 let power = f64::from(0.1f32 * (e.amp + 1) as f32);
                 return Some([v[0], v[1] + ny * power, v[2]]);
             }
@@ -334,9 +333,7 @@ fn optimal_jump(m: &mut Mob, target: [f64; 3]) -> Option<[f64; 3]> {
 /// The jump vector computation for an angle without collision control.
 fn jump_vector(m: &Mob, target: [f64; 3], max_v: f32, angle: i32) -> Option<[f64; 3]> {
     let p = m.pos;
-    let plane = [target[0] - p[0], 0.0, target[2] - p[2]];
-    let pl = (plane[0] * plane[0] + plane[2] * plane[2]).sqrt();
-    let half = if pl < 1.0e-5 { [0.0; 3] } else { [plane[0] / pl * 0.5, 0.0, plane[2] / pl * 0.5] };
+    let half = super::super::mth::normalize([target[0] - p[0], 0.0, target[2] - p[2]]).map(|v| v * 0.5);
     let tp = [target[0] - half[0], target[1], target[2] - half[2]];
     let d = [tp[0] - p[0], tp[1] - p[1], tp[2] - p[2]];
     let ang = angle as f32 * std::f32::consts::PI / 180.0;
@@ -391,7 +388,7 @@ pub fn slide_start(s: &mut Server, m: &mut Mob, b: &mut Brain) {
                 let dir = [tp[0] - m.pos[0], tp[1] - m.pos[1], tp[2] - m.pos[2]];
                 let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
                 let dist = len - (8.0 + m.rng.next_double() * (4.0 - 8.0));
-                let n = if len < 1.0e-5 { [0.0; 3] } else { dir.map(|v| v / len) };
+                let n = super::super::mth::normalize(dir);
                 [m.pos[0] + n[0] * dist, m.pos[1] + n[1] * dist, m.pos[2] + n[2] * dist]
             }
         }

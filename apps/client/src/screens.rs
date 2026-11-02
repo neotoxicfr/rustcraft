@@ -442,9 +442,6 @@ impl Screens {
         if let Some(i) = crate::bundle::unselect_before_click(c.mode, c.slot, slots, |st| {
             crate::bundle::is_bundle_name(rules.item_name(st))
         }) {
-            if crate::bundle::selected_slot() == Some(i) {
-                crate::bundle::set_selected(i, -1);
-            }
             let _ = link.send_bundle_item_selected(i as i32, -1);
         }
         let before = slots.clone();

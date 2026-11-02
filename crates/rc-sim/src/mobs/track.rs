@@ -31,6 +31,18 @@ pub struct Tracker {
     pub attr_hash: super::mob::AttrPrints,
 }
 
+impl Tracker {
+    /// The first state seen (what the client was given on pairing): later sends compare with it.
+    pub(crate) fn begin(&mut self, pos: [f64; 3], vel: [f64; 3], on_ground: bool) {
+        if !self.seen {
+            self.seen = true;
+            self.base = pos;
+            self.last_vel = vel;
+            self.was_on_ground = on_ground;
+        }
+    }
+}
+
 /// Tracking range of the player entity type (chunks).
 const PLAYER_TRACKING: i32 = 32;
 
@@ -40,6 +52,14 @@ fn unpack(b: i8) -> f32 {
 
 fn enc(v: f64) -> i64 {
     rc_proto_v777::entity::delta_unit(v)
+}
+
+/// The tracking sends a velocity `new` after `sent` if they differ beyond 1e-7 squared, or at
+/// all when it fell to zero.
+pub fn velocity_changed(sent: [f64; 3], new: [f64; 3]) -> bool {
+    let d = [new[0] - sent[0], new[1] - sent[1], new[2] - sent[2]];
+    let diff = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    diff > 1.0e-7 || (diff > 0.0 && new == [0.0; 3])
 }
 
 /// Velocity as the client decodes it.
@@ -292,12 +312,7 @@ impl Server {
         interval: i32,
         rot: [f32; 2],
     ) {
-        if !t.seen {
-            t.seen = true;
-            t.base = pos;
-            t.last_vel = vel;
-            t.was_on_ground = on_ground;
-        }
+        t.begin(pos, vel, on_ground);
         let tick = t.tick;
         if tick % interval == 0 || t.needs_sync {
             t.needs_sync = false;
@@ -336,9 +351,7 @@ impl Server {
                 }
                 t.base = pos;
             }
-            let dv = [vel[0] - t.last_vel[0], vel[1] - t.last_vel[1], vel[2] - t.last_vel[2]];
-            let diff = dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2];
-            if diff > 1.0e-7 || (diff > 0.0 && vel == [0.0; 3]) {
+            if velocity_changed(t.last_vel, vel) {
                 t.last_vel = vel;
                 let _ = self.send(Event::Entity(EntityEvent::Motion { id, velocity: lp_quantize(vel) }));
             }

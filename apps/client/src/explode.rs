@@ -89,12 +89,8 @@ impl App {
         for _ in 0..n {
             let r = &mut self.world_random;
             let (center, radius, _, parts) = &list[weighted(list.iter().map(|e| e.2), r.f())];
-            let mut d = [0.0f64; 3].map(|_| f64::from(r.f()) * 2.0 - 1.0);
-            let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-            if len < 1e-4 {
-                continue;
-            }
-            d = d.map(|v| v / len);
+            // The game's normalization: a vector too short becomes zero, the draws go on.
+            let d = rc_physics::normalize([0.0f64; 3].map(|_| f64::from(r.f()) * 2.0 - 1.0));
             let radius = f64::from(*radius);
             let dist = f64::from(r.f()).cbrt() * radius;
             let p: [f64; 3] = std::array::from_fn(|i| center[i] + d[i] * dist);

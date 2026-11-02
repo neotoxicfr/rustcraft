@@ -391,14 +391,8 @@ impl Loot<'_> {
                     // F10: source entity of the damage (exact type, components).
                     // W8c: draw-free conditions entrusted to the world when it is lent.
                     // Value checks: the value then the bounds are providers (draws possible).
-                    "int_value_check" => {
-                        let x = self.int(&v["value"], ctx, rng);
-                        self.int_test(&v["test"], x, ctx, rng)
-                    }
-                    "float_value_check" => {
-                        let x = self.float(&v["value"], ctx, rng);
-                        self.float_test(&v["test"], x, ctx, rng)
-                    }
+                    "int_value_check" => self.int_test(&v["test"], &v["value"], ctx, rng),
+                    "float_value_check" => self.float_test(&v["test"], &v["value"], ctx, rng),
                     "damage_source_properties" | "entity_properties" | "location_check"
                         if let Some(w) = ctx.world
                             && (w.knows_all() || !locally_known(ty, v)) =>
@@ -538,22 +532,35 @@ impl Loot<'_> {
         }
     }
 
-    /// Integer test of a value check: a provider the value must equal, or `{min, max}` bounds
-    /// (providers, each read only when the previous one passed).
-    fn int_test(&self, t: &Value, x: i32, ctx: &Ctx<'_>, rng: &mut dyn Rand) -> bool {
+    /// Integer test `t` of a value check on the provider `value`: a provider the value must
+    /// equal, or `{min, max}` bounds (providers). The value is read first, then each bound only
+    /// when the previous one passed; bounds with neither `min` nor `max` pass without reading
+    /// the value (no draw), like the game's.
+    fn int_test(&self, t: &Value, value: &Value, ctx: &Ctx<'_>, rng: &mut dyn Rand) -> bool {
         if t.is_object() && t.get("type").is_none() {
-            t.get("min").is_none_or(|m| x >= self.int(m, ctx, rng)) && t.get("max").is_none_or(|m| x <= self.int(m, ctx, rng))
+            let (min, max) = (t.get("min"), t.get("max"));
+            if min.is_none() && max.is_none() {
+                return true;
+            }
+            let x = self.int(value, ctx, rng);
+            min.is_none_or(|m| x >= self.int(m, ctx, rng)) && max.is_none_or(|m| x <= self.int(m, ctx, rng))
         } else {
+            let x = self.int(value, ctx, rng);
             self.int(t, ctx, rng) == x
         }
     }
 
-    /// Float test of a value check (same shapes as [`Self::int_test`]).
-    fn float_test(&self, t: &Value, x: f32, ctx: &Ctx<'_>, rng: &mut dyn Rand) -> bool {
+    /// Float test of a value check (same shapes and order as [`Self::int_test`]).
+    fn float_test(&self, t: &Value, value: &Value, ctx: &Ctx<'_>, rng: &mut dyn Rand) -> bool {
         if t.is_object() && t.get("type").is_none() {
-            t.get("min").is_none_or(|m| x >= self.float(m, ctx, rng))
-                && t.get("max").is_none_or(|m| x <= self.float(m, ctx, rng))
+            let (min, max) = (t.get("min"), t.get("max"));
+            if min.is_none() && max.is_none() {
+                return true;
+            }
+            let x = self.float(value, ctx, rng);
+            min.is_none_or(|m| x >= self.float(m, ctx, rng)) && max.is_none_or(|m| x <= self.float(m, ctx, rng))
         } else {
+            let x = self.float(value, ctx, rng);
             self.float(t, ctx, rng) == x
         }
     }
@@ -1210,9 +1217,12 @@ impl Loot<'_> {
         self.items.data.registry("minecraft:data_component_type").map(|r| r.entries.clone()).unwrap_or_default()
     }
 
-    /// Expands an entry into candidates (entry, weight, part, composite modifiers above it).
-    /// `mods`: modifiers of the enclosing composite entries, outermost first. `all`: weightless
-    /// candidates kept too (container contents take them all; a pool draws among the positive).
+    /// Expands an entry into candidates (entry, weight, part, composite modifiers above it),
+    /// each passed to `out` as soon as it is accepted, before the next entry's condition is
+    /// tested (a pool collects them, container contents create each one at once, like the
+    /// game's). `mods`: modifiers of the enclosing composite entries, outermost first. `all`:
+    /// weightless candidates kept too (container contents take them all; a pool draws among
+    /// the positive).
     fn expand<'v>(
         &self,
         e: &'v Value,
@@ -1220,7 +1230,7 @@ impl Loot<'_> {
         rng: &mut dyn Rand,
         all: bool,
         mods: &mut Vec<&'v Value>,
-        out: &mut Vec<Cand<'v>>,
+        out: &mut dyn FnMut(Cand<'v>, &mut dyn Rand),
     ) -> bool {
         if !self.cond(&e["condition"], ctx, rng) {
             return false;
@@ -1235,19 +1245,21 @@ impl Loot<'_> {
             }
             let expanded = e["expand"].as_bool() == Some(true);
             let chain = (!mods.is_empty()).then(|| mods.clone().into_boxed_slice());
-            let mut push = |pick| out.push(Cand { e, w, pick, mods: chain.clone() });
+            let mut push = |pick, rng: &mut dyn Rand| out(Cand { e, w, pick, mods: chain.clone() }, rng);
             match ty {
                 // Expanded tag: one candidate per item, each with the weight of the entry.
                 "tag" if expanded => {
                     for id in self.tag_items(e) {
                         if let Some(i) = self.items.id(&id) {
-                            push(Pick::Item(i));
+                            push(Pick::Item(i), rng);
                         }
                     }
                 }
                 // Expanded nested set: one candidate per table.
-                "loot_table" if expanded => (0..self.tables(&e["value"]).len() as u32).for_each(|i| push(Pick::Table(i))),
-                _ => push(Pick::All),
+                "loot_table" if expanded => {
+                    (0..self.tables(&e["value"]).len() as u32).for_each(|i| push(Pick::Table(i), rng));
+                }
+                _ => push(Pick::All, rng),
             }
             return true;
         }
@@ -1312,7 +1324,7 @@ impl Loot<'_> {
         let mut out = Vec::new();
         match v {
             Value::String(s) => match s.strip_prefix('#') {
-                Some(tag) => self.tag_tables(tag, 0, &mut out),
+                Some(tag) => self.tag_tables(tag, &mut out),
                 None => out.extend(self.pack.get("loot_table", s).map(Table::Pack)),
             },
             Value::Array(a) => {
@@ -1330,16 +1342,11 @@ impl Loot<'_> {
         out
     }
 
-    /// Members of a loot table tag (identifiers, nested tags, `{id}` entries), in order.
-    fn tag_tables(&self, tag: &str, depth: u32, out: &mut Vec<Table<'_>>) {
-        let Some(t) = self.pack.get("tags/loot_table", tag).filter(|_| depth < 16) else { return };
-        for x in t["values"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
-            let id = x.as_str().or_else(|| x["id"].as_str()).unwrap_or("");
-            match id.strip_prefix('#') {
-                Some(inner) => self.tag_tables(inner, depth + 1, out),
-                None => out.extend(self.pack.get("loot_table", id).map(Table::Pack)),
-            }
-        }
+    /// Members of a loot table tag, resolved like the game's tags (`DataPack::tag`), in order.
+    fn tag_tables(&self, tag: &str, out: &mut Vec<Table<'_>>) {
+        out.extend(
+            self.pack.tag("loot_table", tag).iter().filter_map(|id| self.pack.get("loot_table", id)).map(Table::Pack),
+        );
     }
 
     /// Copies of the slots a slot source provides (`slots` entry), in order; `None` = empty slot.
@@ -1350,10 +1357,14 @@ impl Loot<'_> {
         let ty = v["type"].as_str().unwrap_or("").trim_start_matches("minecraft:");
         match v {
             Value::String(id) => match id.strip_prefix('#') {
-                Some(tag) => {
-                    let Some(t) = self.pack.get("tags/slot_source", tag) else { return Vec::new() };
-                    self.slot_source(&t["values"], ctx, depth + 1)
-                }
+                // Members of the tag, resolved like the game's tags (`{id, required}` included).
+                Some(tag) => self
+                    .pack
+                    .tag("slot_source", tag)
+                    .iter()
+                    .filter_map(|m| self.pack.get("slot_source", m))
+                    .flat_map(|p| self.slot_source(&p, ctx, depth + 1))
+                    .collect(),
                 None => match self.pack.get("slot_source", id) {
                     Some(p) => self.slot_source(&p, ctx, depth + 1),
                     None => Vec::new(),
@@ -1481,14 +1492,11 @@ impl Loot<'_> {
     }
 
     /// Every candidate of a list of entries, created in order whatever its weight (contents of
-    /// `set_contents`), each stack passed to `sink`.
+    /// `set_contents`), each one as soon as it is expanded (its stacks' draws come before the
+    /// next candidate's condition), each stack passed to `sink`.
     pub(crate) fn create_all(&self, entries: &Value, ctx: &Ctx<'_>, rng: &mut dyn Rand, sink: &mut Sink<'_>) {
         for e in entries.as_array().map(Vec::as_slice).unwrap_or(&[]) {
-            let mut cands = Vec::new();
-            self.expand(e, ctx, rng, true, &mut Vec::new(), &mut cands);
-            for c in &cands {
-                self.create(c, ctx, rng, sink);
-            }
+            self.expand(e, ctx, rng, true, &mut Vec::new(), &mut |c, rng| self.create(&c, ctx, rng, sink));
         }
     }
 
@@ -1533,7 +1541,7 @@ impl Loot<'_> {
             for _ in 0..rolls {
                 cands.clear();
                 for e in pool["entries"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
-                    self.expand(e, ctx, rng, false, &mut Vec::new(), &mut cands);
+                    self.expand(e, ctx, rng, false, &mut Vec::new(), &mut |c, _| cands.push(c));
                 }
                 let total: i32 = cands.iter().map(|c| c.w).sum();
                 if total == 0 || cands.is_empty() {

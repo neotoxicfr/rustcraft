@@ -480,18 +480,11 @@ impl Loot<'_> {
                 s
             }
             "set_instrument" => {
-                let opts: Vec<String> = match &f["options"] {
-                    Value::String(t) if t.starts_with('#') => self
-                        .pack
-                        .get("tags/instrument", t.trim_start_matches('#'))
-                        .and_then(|v| v["values"].as_array().cloned())
-                        .unwrap_or_default()
-                        .iter()
-                        .filter_map(|x| x.as_str().map(str::to_owned))
-                        .collect(),
-                    Value::String(id) => vec![id.clone()],
+                let opts: std::sync::Arc<[String]> = match &f["options"] {
+                    Value::String(t) if t.starts_with('#') => self.pack.tag("instrument", t),
+                    Value::String(id) => std::sync::Arc::from([id.clone()]),
                     Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect(),
-                    _ => Vec::new(),
+                    _ => std::sync::Arc::from([]),
                 };
                 if !opts.is_empty() {
                     let k = rng.next_int_bound(opts.len() as i32) as usize;
@@ -836,13 +829,11 @@ fn rgb_color(rgb: &[Value]) -> i32 {
     (255 << 24) | (ch(0) << 16) | (ch(1) << 8) | ch(2)
 }
 
-/// Wear set (`damage` component, removed at 0 like the default value).
+/// Wear set (`damage` component, floored at 0). Always written, never removed: an item without a
+/// default wear keeps `damage:0` and so stays usable; for an item whose default is 0 the patch
+/// write drops the entry, as before.
 pub fn set_damage(s: &mut Stack, d: i32) {
-    if d <= 0 {
-        crate::items::remove_component(s, "minecraft:damage");
-    } else {
-        set_component(s, "minecraft:damage", Nbt::Int(d));
-    }
+    set_component(s, "minecraft:damage", Nbt::Int(d.max(0)));
 }
 
 #[cfg(test)]

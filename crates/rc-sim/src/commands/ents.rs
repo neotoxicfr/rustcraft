@@ -92,6 +92,8 @@ impl Server {
             .map(|(_, n)| n)
             .or_else(|| self.end_other(id)) // F15
             .or_else(|| self.cart_ref(id).map(|c| &c.nbt)) // G5-F06: fields kept (name, tags)
+            // L10-COMBAT: the entity exploding right now, out of its list.
+            .or_else(|| self.proj.blast_ent.as_ref().filter(|(i, _)| *i == id).map(|(_, n)| n))
     }
 
     fn other_mut(&mut self, id: i32) -> Option<&mut Nbt> {
@@ -165,7 +167,7 @@ impl Server {
         match e {
             E::Player => self.uuid,
             E::Mob(i) => self.mobs.mob_ref_any(i).map_or(0, |m| m.uuid),
-            E::Item(i) | E::Orb(i) => 0x5332_0000_0000_0000_0000_0000_0000_0000 | i as u32 as u128,
+            E::Item(i) | E::Orb(i) => crate::drops::ground_uuid(i),
             E::Other(i) => self.other(i).and_then(|n| nbtio::uuid(n.get("UUID"))).unwrap_or(0),
         }
     }
@@ -182,12 +184,24 @@ impl Server {
                 [w, h, eye]
             }),
             _ => {
-                let ty = self.ent_type(e);
-                let idx =
-                    self.data.registry("minecraft:entity_type").and_then(|r| r.entries.iter().position(|x| *x == ty));
-                idx.and_then(|i| self.data.entity_dims.get(i)).map_or([0.25, 0.25, 0.2], |d| [d[0], d[1], d[2]])
+                // Armor stand, mannequin: marker, small stand, pose and scale (L10-COMBAT).
+                if let E::Other(i) = e
+                    && let Some(n) = self.other(i)
+                    && let Some(k @ (crate::decoration::DKind::Stand | crate::decoration::DKind::Mannequin)) =
+                        crate::decoration::kind_of(n)
+                {
+                    let (w, h, eye) = self.living_size(n, k == crate::decoration::DKind::Stand);
+                    return [w as f32, h as f32, eye as f32];
+                }
+                self.type_dims(&self.ent_type(e)).unwrap_or([0.25, 0.25, 0.2])
             }
         }
+    }
+
+    /// Width, height and eye height of entity type `ty` (version data).
+    pub(crate) fn type_dims(&self, ty: &str) -> Option<[f32; 3]> {
+        let i = self.data.registry("minecraft:entity_type")?.entries.iter().position(|x| x == ty)?;
+        self.data.entity_dims.get(i).map(|d| [d[0], d[1], d[2]])
     }
 
     pub fn ent_eye_height(&self, e: E) -> f64 {
@@ -219,36 +233,11 @@ impl Server {
                 n
             }
             E::Mob(i) => self.mobs.mob_ref_any(i).map_or(Nbt::Compound(Vec::new()), |m| self.mob_nbt(m)),
+            // L10-ENT: the compound the save writes (one writer for both).
             E::Item(i) => {
-                let Some(d) = self.life.drops.iter().find(|d| d.id == i) else { return Nbt::Compound(Vec::new()) };
-                let dbl = |v: [f64; 3]| Nbt::List(v.iter().map(|&x| Nbt::Double(x)).collect());
-                Nbt::Compound(vec![
-                    ("id".into(), Nbt::String("minecraft:item".into())),
-                    ("Pos".into(), dbl(d.pos)),
-                    ("Motion".into(), dbl(d.vel)),
-                    ("Rotation".into(), Nbt::List(vec![Nbt::Float(d.yaw), Nbt::Float(0.0)])),
-                    ("OnGround".into(), Nbt::Byte(i8::from(d.on_ground))),
-                    ("Health".into(), Nbt::Short(d.health as i16)),
-                    ("Age".into(), Nbt::Short(d.age as i16)),
-                    ("PickupDelay".into(), Nbt::Short(d.pickup_delay as i16)),
-                    ("UUID".into(), nbtio::uuid_nbt(self.ent_uuid(e))),
-                    ("Item".into(), d.stack.to_nbt(None)),
-                ])
+                self.life.drops.iter().find(|d| d.id == i).map_or(Nbt::Compound(Vec::new()), |d| self.item_ent_nbt(d))
             }
-            E::Orb(i) => {
-                let Some(d) = self.life.orbs.iter().find(|d| d.id == i) else { return Nbt::Compound(Vec::new()) };
-                let dbl = |v: [f64; 3]| Nbt::List(v.iter().map(|&x| Nbt::Double(x)).collect());
-                Nbt::Compound(vec![
-                    ("id".into(), Nbt::String("minecraft:experience_orb".into())),
-                    ("Pos".into(), dbl(d.pos)),
-                    ("Motion".into(), dbl(d.vel)),
-                    ("Health".into(), Nbt::Short(d.health as i16)),
-                    ("Age".into(), Nbt::Short(d.age as i16)),
-                    ("Value".into(), Nbt::Short(d.value as i16)),
-                    ("Count".into(), Nbt::Int(d.count)),
-                    ("UUID".into(), nbtio::uuid_nbt(self.ent_uuid(e))),
-                ])
-            }
+            E::Orb(i) => self.life.orbs.iter().find(|o| o.id == i).map_or(Nbt::Compound(Vec::new()), |o| self.orb_ent_nbt(o)),
             E::Other(i) => self.other(i).cloned().unwrap_or(Nbt::Compound(Vec::new())),
         }
     }
@@ -290,29 +279,21 @@ impl Server {
                 }
             }
             E::Item(i) => {
-                if let Some(d) = self.life.drops.iter_mut().find(|d| d.id == i) {
+                // L10-ENT: read back like the game's load (common part included).
+                if let Some(k) = self.life.drops.iter().position(|d| d.id == i) {
+                    self.item_read_nbt(k, n);
+                    let d = &mut self.life.drops[k];
                     if let Some(s) = n.get("Item").and_then(crate::player::Stack::from_nbt) {
                         d.stack = s;
                     }
                     if let Some(p) = nbtio::f64s::<3>(n.get("Pos")) {
                         d.pos = p;
                     }
-                    if let Some(v) = nbtio::int(n, "PickupDelay") {
-                        d.pickup_delay = v as i32;
-                    }
-                    if let Some(v) = nbtio::int(n, "Age") {
-                        d.age = v as i32;
-                    }
-                    if let Some(v) = nbtio::int(n, "Health") {
-                        d.health = v as i32;
-                    }
                 }
             }
             E::Orb(i) => {
-                if let Some(o) = self.life.orbs.iter_mut().find(|o| o.id == i)
-                    && let Some(v) = nbtio::int(n, "Health")
-                {
-                    o.health = v as i32;
+                if let Some(k) = self.life.orbs.iter().position(|o| o.id == i) {
+                    self.orb_read_nbt(k, n); // L10-ENT
                 }
             }
             E::Other(i) => {

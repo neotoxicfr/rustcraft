@@ -421,7 +421,7 @@ impl Server {
             if l.removed || !l.kind.frame() || (l.chunk.0 - cx).abs() > 1 || (l.chunk.1 - cz).abs() > 1 {
                 continue;
             }
-            let Some(e) = self.deco_nbt(l.id) else { continue };
+            let Some(e) = self.deco_nbt_near(l.id, Some(l.chunk)) else { continue };
             if self.hang_place(l.kind, e).1 != d || !self.deco_box(e).is_some_and(|b| b.intersects(&cell)) {
                 continue;
             }

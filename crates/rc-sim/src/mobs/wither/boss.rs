@@ -86,8 +86,8 @@ pub fn pre_ai_step(s: &Server, m: &mut Mob) {
         v[1] = yd;
         let (dx, dz) = (p[0] - m.pos[0], p[2] - m.pos[2]);
         if dx * dx + dz * dz > 9.0 {
-            let l = (dx * dx + dz * dz).sqrt();
-            let (nx, nz) = if l < 1.0e-5 { (0.0, 0.0) } else { (dx / l, dz / l) };
+            let n = crate::mobs::mth::normalize([dx, 0.0, dz]);
+            let (nx, nz) = (n[0], n[2]);
             v[0] += nx * 0.3 - v[0] * 0.6;
             v[2] += nz * 0.3 - v[2] * 0.6;
         }
@@ -260,9 +260,7 @@ pub(crate) fn shoot(s: &mut Server, m: &Mob, head: i32, t: [f64; 3], dangerous: 
         s.level_event(1024, m.block_pos(), 0);
     }
     let h = [head_x(m, head), head_y(m, head), head_z(m, head)];
-    let d = [t[0] - h[0], t[1] - h[1], t[2] - h[2]];
-    let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-    let dir = if l < 1.0e-5 { [0.0; 3] } else { d.map(|v| v / l) };
+    let dir = crate::mobs::mth::normalize([t[0] - h[0], t[1] - h[1], t[2] - h[2]]);
     s.shoot_wither_skull(m.uuid, h, dir, (m.yaw, m.pitch), dangerous);
 }
 

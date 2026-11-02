@@ -6,7 +6,7 @@
 //! keeps the shot and the return by the player.
 
 use super::mob::Ent;
-use super::mth::dist2;
+use super::mth::{dist2, normalize};
 use crate::player::Stack;
 use crate::projectiles::{PKind, Proj};
 use crate::server::Server;
@@ -17,11 +17,6 @@ pub struct FireballsWorld {
     /// True during the damage of a large fireball (direct hit or explosion): the direct
     /// source of the damage is then a large fireball.
     pub direct_large: bool,
-}
-
-fn normalize(v: [f64; 3]) -> [f64; 3] {
-    let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    if l < 1.0e-5 { [0.0; 3] } else { v.map(|c| c / l) }
 }
 
 impl Server {
@@ -114,33 +109,63 @@ impl Server {
         }
     }
 
-    /// Projectiles of the tag `redirectable_projectile` in an explosion: pushed like
-    /// entities, then the author of the explosion's damage becomes their
-    /// owner (none if the explosion is anonymous).
-    pub(crate) fn explosion_redirect(&mut self, center: [f64; 3], radius: f32, uuid: Option<u128>, kb_mult: f64) {
+    /// Projectiles in an explosion or a burst, like any entity: each one pushed from its eyes by
+    /// the visible part of its box (× `kb_mult`), the velocity going out with its tracking. The
+    /// damage of an ordinary explosion (`hurt`) marks them hurt (velocity sent back as is), except
+    /// the hurting projectiles and the eyes of ender, which take none, and the shulker bullets,
+    /// destroyed by the explosion elsewhere. Those of the tag `redirectable_projectile` (large
+    /// fireball, wind charges) then belong to the author of the explosion's damage (none if
+    /// anonymous). The bobber and the llama spits are pushed and hurt too.
+    pub(crate) fn explosion_projectiles(&mut self, center: [f64; 3], radius: f32, uuid: Option<u128>, kb_mult: f64, hurt: bool) {
         let double = f64::from(radius * 2.0);
+        // Push of an entity at `pos`, eyes `eye` above, box `b`, if in range.
+        let push = |s: &Server, pos: [f64; 3], ty: &str, b: &rc_physics::Aabb| -> Option<[f64; 3]> {
+            let dist = dist2(pos, center).sqrt() / double;
+            if dist > 1.0 {
+                return None;
+            }
+            let eye = f64::from(s.type_dims(ty).map_or(0.0, |d| d[2]));
+            let dir = normalize([pos[0] - center[0], pos[1] + eye - center[1], pos[2] - center[2]]);
+            let exposure = if !hurt && kb_mult == 0.0 { 0.0 } else { f64::from(s.seen_percent(center, b)) };
+            let kp = (1.0 - dist) * exposure * kb_mult;
+            Some(dir.map(|d| d * kp))
+        };
         for i in 0..self.proj.list.len() {
             let p = &self.proj.list[i];
-            if p.removed || !matches!(p.kind, PKind::LargeFireball | PKind::WindCharge | PKind::BreezeWindCharge) {
+            if p.removed || (hurt && p.kind == PKind::ShulkerBullet) {
                 continue;
             }
-            let dist = dist2(p.pos, center).sqrt() / double;
-            if dist > 1.0 {
-                continue;
-            }
-            let bb = p.bbox();
-            let eye = if p.kind == PKind::LargeFireball { f64::from(0.85f32) } else { 0.0 };
-            let mut dir = [p.pos[0] - center[0], p.pos[1] + eye - center[1], p.pos[2] - center[2]];
-            let l = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
-            dir = if l < 1.0e-4 { [0.0; 3] } else { dir.map(|v| v / l) };
-            let exposure = if kb_mult == 0.0 { 0.0 } else { f64::from(self.seen_percent(center, &bb)) };
-            let kp = (1.0 - dist) * exposure * kb_mult;
+            let Some(kb) = push(self, p.pos, p.kind.name(), &p.bbox()) else { continue };
             let p = &mut self.proj.list[i];
-            for (v, d) in p.vel.iter_mut().zip(dir) {
-                *v += d * kp;
-            }
+            p.vel = [p.vel[0] + kb[0], p.vel[1] + kb[1], p.vel[2] + kb[2]];
             p.needs_sync = true;
-            p.owner = uuid;
+            p.sync_velocity |= hurt && !p.kind.hurting() && p.kind != PKind::EyeOfEnder;
+            if matches!(p.kind, PKind::LargeFireball | PKind::WindCharge | PKind::BreezeWindCharge) {
+                p.owner = uuid;
+            }
+        }
+        if let Some(h) = &self.proj.hook
+            && let Some(kb) = push(self, h.p.pos, "minecraft:fishing_bobber", &h.p.bbox())
+            && let Some(h) = self.proj.hook.as_mut()
+        {
+            h.p.vel = [h.p.vel[0] + kb[0], h.p.vel[1] + kb[1], h.p.vel[2] + kb[2]];
+            h.p.needs_sync = true;
+            h.p.sync_velocity |= hurt;
+        }
+        // Llama spits (no tracking of their own: the pushed velocity goes out at once, and so
+        // does the velocity of a hurt one, pushed or not).
+        for i in 0..self.mobs.mounts.spits.len() {
+            let s = &self.mobs.mounts.spits[i];
+            if s.removed {
+                continue;
+            }
+            let Some(kb) = push(self, s.pos, "minecraft:llama_spit", &super::mounts::llama::spit_box(s.pos)) else { continue };
+            let s = &mut self.mobs.mounts.spits[i];
+            s.vel = [s.vel[0] + kb[0], s.vel[1] + kb[1], s.vel[2] + kb[2]];
+            let (id, velocity) = (s.id, crate::mobs::track::lp_quantize(s.vel));
+            if hurt || kb.iter().any(|&v| v != 0.0) {
+                let _ = self.send(rc_client::Event::Entity(rc_client::EntityEvent::Motion { id, velocity }));
+            }
         }
     }
 }

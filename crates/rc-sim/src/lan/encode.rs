@@ -178,12 +178,62 @@ fn template(w: &mut Vec<u8>, s: &ItemStack) {
     patch(w, s);
 }
 
-/// Options of a `trail` particle: target, RGB colour, duration in ticks.
-fn trail_opts(w: &mut Vec<u8>, p: &Particle) {
-    let (target, duration) = p.trail.unwrap_or(([0.0; 3], 1));
-    vec3d(w, target);
-    p.color.encode(w);
-    write_varint(w, duration);
+/// Options of a particle by options type (`particle_opts`), after its type.
+fn particle_options(w: &mut Vec<u8>, opts: &str, p: &Particle) {
+    match opts {
+        "state" | "varint" => write_varint(w, p.state),
+        "dust" => {
+            p.color.encode(w);
+            p.scale.encode(w);
+        }
+        "dust_transition" => {
+            p.color.encode(w);
+            p.color2.encode(w);
+            p.scale.encode(w);
+        }
+        "color" => p.color.encode(w),
+        "color_power" => {
+            p.color.encode(w);
+            p.scale.encode(w);
+        }
+        "float" => p.scale.encode(w),
+        // Water blocks, then the burst impulse of the base.
+        "geyser" => p.state.encode(w),
+        "geyser_base" => {
+            p.state.encode(w);
+            p.scale.encode(w);
+        }
+        "item" => {
+            write_varint(w, p.item.max(1));
+            write_varint(w, 1);
+            write_varint(w, 0);
+            write_varint(w, 0);
+        }
+        "vibration" => {
+            use rc_proto_v777::entity::VibDest;
+            let (dest, ticks) = p.vib.unwrap_or((VibDest::Block([0, 0, 0]), 0));
+            match dest {
+                VibDest::Block(b) => {
+                    write_varint(w, 0);
+                    bpos(w, b);
+                }
+                VibDest::Entity { id, y_offset } => {
+                    write_varint(w, 1);
+                    write_varint(w, id);
+                    y_offset.encode(w);
+                }
+            }
+            write_varint(w, ticks);
+        }
+        // Target, RGB colour, duration in ticks.
+        "trail" => {
+            let (target, duration) = p.trail.unwrap_or(([0.0; 3], 1));
+            vec3d(w, target);
+            p.color.encode(w);
+            write_varint(w, duration);
+        }
+        _ => {}
+    }
 }
 
 impl Server {
@@ -213,53 +263,7 @@ impl Server {
 
     fn particle(&self, w: &mut Vec<u8>, p: &Particle) {
         write_varint(w, p.kind);
-        match self.particle_opts(p.kind) {
-            "state" | "varint" => write_varint(w, p.state),
-            "dust" => {
-                p.color.encode(w);
-                p.scale.encode(w);
-            }
-            "dust_transition" => {
-                p.color.encode(w);
-                p.color2.encode(w);
-                p.scale.encode(w);
-            }
-            "color" => p.color.encode(w),
-            "color_power" => {
-                p.color.encode(w);
-                p.scale.encode(w);
-            }
-            "float" => p.scale.encode(w),
-            "geyser" => 0i32.encode(w),
-            "geyser_base" => {
-                0i32.encode(w);
-                0i32.encode(w);
-            }
-            "item" => {
-                write_varint(w, p.item.max(1));
-                write_varint(w, 1);
-                write_varint(w, 0);
-                write_varint(w, 0);
-            }
-            "vibration" => {
-                use rc_proto_v777::entity::VibDest;
-                let (dest, ticks) = p.vib.unwrap_or((VibDest::Block([0, 0, 0]), 0));
-                match dest {
-                    VibDest::Block(b) => {
-                        write_varint(w, 0);
-                        bpos(w, b);
-                    }
-                    VibDest::Entity { id, y_offset } => {
-                        write_varint(w, 1);
-                        write_varint(w, id);
-                        y_offset.encode(w);
-                    }
-                }
-                write_varint(w, ticks);
-            }
-            "trail" => trail_opts(w, p),
-            _ => {}
-        }
+        particle_options(w, self.particle_opts(p.kind), p);
     }
 
     fn meta_value(&self, w: &mut Vec<u8>, m: &Meta) {
@@ -1560,11 +1564,35 @@ fn trail_options_round_trip() {
     p.trail = Some(([216.25, -57.5, 222.75], 37));
     let mut w = Vec::new();
     write_varint(&mut w, 0);
-    trail_opts(&mut w, &p);
+    particle_options(&mut w, "trail", &p);
     let codec = rc_proto_v777::entity::MetaCodec::new(Default::default(), &["minecraft:trail".to_owned()]);
     let mut r = rc_proto::Reader::new(&w);
     assert_eq!(codec.particle(&mut r).expect("decoded"), p);
     assert!(r.is_empty());
+}
+
+/// L10: a guest receives the water blocks and burst impulse of the geyser particles (they were
+/// zeros) and the block destination of a vibration, read back by the client's decoder.
+#[cfg(test)]
+#[test]
+fn geyser_and_vibration_options_round_trip() {
+    let names = ["minecraft:geyser", "minecraft:geyser_base", "minecraft:vibration"].map(str::to_owned);
+    let codec = rc_proto_v777::entity::MetaCodec::new(Default::default(), &names);
+    let mut geyser = Particle::plain(0);
+    geyser.state = 7;
+    let mut base = Particle::plain(1);
+    base.state = 3;
+    base.scale = 0.75;
+    let mut vib = Particle::plain(2);
+    vib.vib = Some((rc_proto_v777::entity::VibDest::Block([-12, 64, 900]), 25));
+    for (p, opts) in [(geyser, "geyser"), (base, "geyser_base"), (vib, "vibration")] {
+        let mut w = Vec::new();
+        write_varint(&mut w, p.kind);
+        particle_options(&mut w, opts, &p);
+        let mut r = rc_proto::Reader::new(&w);
+        assert_eq!(codec.particle(&mut r).expect("decoded"), p, "{opts}");
+        assert!(r.is_empty(), "{opts}");
+    }
 }
 
 #[cfg(test)]

@@ -3283,6 +3283,36 @@ runs), so only the order of magnitude is claimed.
   (a few attributes, equipment parsed once).
 - Multi-core and GPU not applicable to the rest (event paths, a few entities). To re-measure on a
   quiet machine: the bench above (2 passes), `fingerprint_*` tests unchanged.
+## L10-COMBAT: explosion reach and direct entity, decoration sizes, sweep, normalization (02/11, loaded machine)
+
+- Bench `tests_l10combat::bench_l10_combat` (200 calls per figure, 3 passes): new pass of the
+  entities that never move (displays, markers, interactions kept as compounds, then clouds) 0.06-0.07
+  us with nothing kept, 60.4-60.8 us with 4,000 markers out of range (15 ns per compound: type then
+  position read; most real compounds are decorations, rejected on their type). New projectile pass
+  (every projectile instead of the redirectable ones) 0.02-0.03 us empty, 1.32-1.38 us with 200 far
+  arrows. Both run once per explosion or burst (a TNT burst alone costs hundreds of us).
+- Lead discarded, chunk range of the still pass (only the chunks the explosion reaches): exact only
+  if a kept compound always sits in the list of its position's chunk, which a teleport breaks (the
+  compound stays in the list it was read in): it would miss a teleported display. Not kept; a
+  registry of the pushable compounds (like the decorations') is the lead to measure if a world with
+  thousands of markers shows it.
+- Still armor stands now tracked every tick (weightless, markers, immovable mannequins, stands in
+  water): 400 weightless stands with a helmet, deco tick 47.8-49.8 us against 48.4-48.5 us with the
+  old early return (alternated, same build): no measurable cost. Their scale read every tick stays
+  free: the attribute is only computed for a stand with a saved scale entry or a worn stack carrying
+  modifiers or enchantments of its own (no item scales by default).
+- Normalization sweep (33 sites through the common helper): same work, one threshold. Mannequin
+  hurt, sweep over decorations and other players, LAN players in ordinary explosions: per event,
+  a few entities; no hot spot. Multi-core and GPU not applicable. To re-measure on a quiet machine:
+  the bench above (3 passes), TNT and creeper scenes.
+- Review round (02/11, loaded machine, other agents compiling): still stands now cancel their
+  speeds under 0.003 each tick (a map and a bit comparison of the saved motion; the compound is
+  only rewritten when a value changes). Same bench, 2 passes: 400 weightless stands 56.5-56.6 us
+  per deco tick (48 us earlier in the day, other load): the added work is a few ns per stand, the
+  gap is attributed to the load and stays to re-measure on a quiet machine (no switch: the
+  cancellation is the game's behaviour). The bobber now sends its velocity only when it changed
+  (fewer packets at rest); the explosion author check (pvp rule, team) runs once per player in
+  range of an explosion with a player author. No hot spot; multi-core and GPU not applicable.
 ## L9-CLIENT: screen limits (02/11, loaded machine)
 
 - Wheel: discrete mode and sensitivity read once per wheel event (two option lookups, before any
@@ -3303,3 +3333,99 @@ runs), so only the order of magnitude is claimed.
 - Multi-core and GPU not applicable (per-event or per-frame UI work of a few hundred
   nanoseconds at most). Scenes to re-measure on a quiet machine: `menu` and an in-game scene with
   the creative inventory open (no change expected beyond the removed allocation).
+## L10-LOOT: value checks, set_contents order, removed components, pack tags (02/11, loaded machine)
+
+- Equivalence (A1/A2): `loot::bench_tests::loot_bench` fingerprint of the 1447 base pack tables
+  (16 seeds each) `af880b1baa83fb25` on 2b3094dd and on this branch, every per-table line
+  identical (`RUSTCRAFT_LOOT_PRINT` files compared). The base pack has no bound-free value check
+  and no set_contents with drawing children, so its draws do not move.
+- Entry expansion: candidates are handed to a callback (a pool's roll pushes them into its kept
+  buffer, set_contents creates each at once, its per-entry vector is gone). Three spellings
+  built and benched against the old code in the same series (best of 7 x 5000 draws, `essai`
+  profile, medians of alternated passes). Series A, 6 passes, old ns then generic `F: FnMut` /
+  `&mut dyn FnMut`: stone 444 +0.6 / +2.0 %, oak leaves 1287 +0.2 / -1.0 %, zombie 821 +0.9 /
+  +1.3 %, simple dungeon 5170 +0.9 / +0.9 %, fishing 821 +1.7 / +1.0 % (geometric mean +0.9 /
+  +0.8 %). Series B, 6 passes, two-case enum (direct push for a pool, creation for contents) /
+  `dyn`: stone +3.5 / +0.6 %, oak +2.0 / -1.4 %, zombie +4.1 / +2.4 %, dungeon +3.7 / +1.4 %,
+  fishing +4.7 / +1.8 % (mean +3.6 / +1.0 %). Two earlier 4-pass series: generic +1.2 %, `dyn`
+  +0.5 %. The enum, which does the least work, is the slowest: inlining and layout of the
+  incremental 16-unit build, not the algorithm; old-code passes alone spread 1.5-2 %. Kept:
+  `dyn` (one instance, best mean). C6 not met as written: the generic and enum spellings are
+  compile-time shapes of the same code, they cannot sit behind a run-time switch (a branch
+  would itself change the inlining being measured), and the gap (+0.1 % between generic and
+  `dyn`) is inside the old code's own spread, so they were not kept behind a `cfg` either. To
+  re-measure on a quiet machine with the full release profile, rebuild by hand: generic =
+  `Loot::expand` takes `out: &mut F` with `F: FnMut(Cand<'v>, &mut dyn Rand)` (recursive calls
+  unchanged); enum = `out` becomes a two-case target, a pool's candidate buffer (pushed
+  directly) or the container-contents creator (stack made at once), matched where `push` is
+  called.
+- `Items::max_stack`: the removal (`!max_stack_size`) is read in the same pass over the patch as
+  the value (one length test more per entry, no second scan); `damageable` answers a patch-free
+  stack with one item lookup (before: two empty component lookups then the same item lookup).
+- Pack tags (`DataPack::tag`): a registry folder's tags are all resolved on its first request with
+  the shared `packs::resolve_tags` and kept (`Arc<[String]>` per tag, no copy per read); before,
+  each read parsed-and-cached the raw file and walked it. Readers: nested loot tables, slot
+  sources, set_instrument, goat horns (one per horn), bone meal features (one per bone meal).
+  No measurable cost: none of them is on a per-tick path.
+- Not applicable: multi-core and GPU (a draw is one chain on one generator, a few
+  microseconds); the value-check change removes a draw, it adds no work.
+- Review follow-up: wear brought back to 0 (set_damage, Mending) and the rest of a broken stack
+  are written through the patch writer instead of a removal (same single lookup of the item's
+  defaults); the composter reads `compostable` on the stack (one patch lookup before the same
+  default lookup) for the click, the hopper and the farmer. Event-driven paths, nothing per
+  tick: no measurement.
+
+## L10-ENT: entity pushes, ground item fields, raids per dimension (02/11, loaded machine)
+
+- Piston push (`push_targets`, per moving block and per tick): minecarts now walked (one box test
+  each), and every decoration instead of the attached ones only (armor stands and mannequins are
+  pushed). Micro-bench `tests_l10ent::bench_l10ent_piston_push_scan` (2 passes, 20,000 scans, a
+  slice touching nothing among 20 armor stands, 20 mannequins, 10 frames and 100 minecarts):
+  former decoration scan (attached only, looked up by identifier) 652-696 ns; new scan of every
+  decoration: looked up by identifier with the kind read from the compound 2,142-2,233 ns, from
+  the registry entry alone 1,900 ns, by identifier with the entry's kind alone 1,886-1,896 ns, both
+  leads together 1,647-1,663 ns (kept; `RUSTCRAFT_OPT_DECOSCAN=0` brings back the identifier
+  lookup and the compound's kind); minecart walk 141-142 ns for 100. Same decorations in the same
+  order for both lookups: `tests_l10ent::push_scan_lookups_agree`. The same lookup-per-entry walk
+  replaced by the entry's chunk in the cushion, frame-signal, knot, burst and survival loops of the
+  decorations (same compound found, speed only; no bench).
+- Leads noted, not taken at these counts: the position of each decoration cached in its registry
+  entry (every write of `Pos` would have to refresh it; about 1 µs per push with 40 living
+  decorations to win), a spatial grid of the minecarts shared with the mob push (G4-F08 lead).
+  Multi-core and GPU: not applicable (a few boxes per push, mutations in list order, the cap of
+  each entity depends on the pushes before it in the tick).
+- Opening shulker: the minecart walk is skipped while the world has none (empty list); otherwise
+  one box test per minecart per opening tick.
+- Raids of the parked worlds, every tick like the game: an empty list costs a counter increment
+  without visiting its world, 3 ns per tick; a world with raids is visited (`in_world`, two world
+  swaps) 291-293 ns per tick per world (`tests_l10ent::bench_l10ent_parked_raids`, 2 passes, 20,000
+  ticks, one inactive raid). Lead noted: tick an inactive raid of a parked world without the visit
+  (only its counter and the difficulty and rule stops would run), not taken at one raid.
+- Armor stands and mannequins without physics now run their tracking each tick (one interval test
+  per tick, a packet every 60 ticks like every entity). Cramming: one addition per pushed entity.
+- Ground items and orbs: one writer for the save and `/data` (the save's former writer and the
+  `/data` one built the compound twice in two shapes), ten common fields more per entity per save;
+  one reader for the chunk, the two summon paths and `/data`.
+- Fingerprints: only the new world's changes, for two causes (items alone b36c37ff..., raids alone
+  0947daba..., both reverted 700c26d9... again); mechanisms unchanged.
+- To re-measure on a quiet machine: the two micro-benches above. Scene bench not concerned (no
+  piston on an entity, no shulker, no parked raid in the scenes).
+
+## L10-CLIENT: bundle choices per stack, particle options of `/particle` (02/11, loaded machine)
+
+- Bundle choices: the single cell (one slot, one index) became a table per stack key (menu slot,
+  or place in the creative grid's list), since the game keeps the choice on the stack. Micro-bench
+  `bundle::tests::bench_bundle_choices` (3 passes, 4 million lookups): former cell 0.52-0.59 ns per
+  lookup, table empty 1.14-1.33 ns, with 4 choices 1.91-2.09 ns; hovered-slot rule of a frame (mouse
+  changing slot every frame, the worst case) 3.70-4.00 ns. Called for the bundles drawn in an open
+  screen and once per frame for the rule: a few nanoseconds per frame, not a hot spot; an empty-table
+  fast path (count in a cell) would save about 0.6 ns per drawn bundle, below anything a frame can
+  show, not kept (more state for nothing measurable). No allocation per frame (the table only grows
+  when a wheel notch chooses an item).
+- Window resized with a screen open: one wheel reset, and for the creative screen one grid reload
+  (the same as choosing the tab, already done on each tab change). Per event, never per frame.
+- `/particle` options: decoded once at parse and once at execution, like before; the error list only
+  allocates when a field fails. Geyser options now carried to the guests (4 or 8 bytes, as before,
+  with the real values instead of zeros). Not a hot spot; multi-core and GPU not applicable.
+- Scenes to re-measure on a quiet machine: `menu` and an in-game scene with the creative inventory
+  open (saved hotbars tab with bundles); no change expected.

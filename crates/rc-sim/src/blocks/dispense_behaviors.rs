@@ -457,7 +457,12 @@ impl Server {
             .and_then(|d| d.get("id"))
             .and_then(Nbt::as_str)
             .map(str::to_owned)
-            .or_else(|| self.life.items.defaults(&egg.id)["minecraft:entity_data"]["id"].as_str().map(str::to_owned));
+            .or_else(|| {
+                self.life
+                    .items
+                    .default_component(egg, "minecraft:entity_data")
+                    .and_then(|d| d["id"].as_str().map(str::to_owned))
+            });
         let Some(kind) = ty.as_deref().and_then(crate::mobs::species::Kind::from_name) else { return false };
         let y_off = if f == Dir::Up { 0.0 } else { self.spawn_y_offset(front, false, kind) };
         let pos = [f64::from(front[0]) + 0.5, f64::from(front[1]) + y_off, f64::from(front[2]) + 0.5];

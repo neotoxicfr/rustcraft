@@ -55,8 +55,12 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// before: 521f08db…, 823).
 /// G4-F08 resumption: mobs write their live `PortalCooldown` (the game writes it for every
 /// entity), the only cause of the change (without it: 360ac84c…, 807 again).
-/// Lot 9 integration: all together.
-const EXPECTED_NEW: (&str, usize) = ("700c26d921c9f1eb3c783ac07d5e9d0bcb2ee92d919d00fed6fe4a71487faa21", 820);
+/// Lot 9 integration: all together (700c26d9…, 820).
+/// L10-ENT: ground items and orbs written with the game's common entity part (fall distance,
+/// air, invulnerability, portal delay; UUID the one `/data` shows), alone b36c37ff…, 820; raids
+/// kept per dimension (the Nether's raids file carries the Nether's own counter instead of the
+/// one that followed the player), alone 0947daba…, 820; both reverted: 700c26d9… again.
+const EXPECTED_NEW: (&str, usize) = ("8af6e543cdc39ac6bf47103b865d4582ae4aaa5d2c6b0c55a00c69e4d10d0fb9", 820);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 const EXPECTED_MODEL: &[(&str, &str, usize)] = &[(
     "790b2d94653a4243e68f2e0cb0ebc3f865f9f59815ed65149067cdd374c6b800",

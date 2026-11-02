@@ -220,7 +220,7 @@ pub fn num_groups(difficulty: i32) -> i32 {
     }
 }
 
-/// World raids state.
+/// Raids of one dimension (each world keeps its own list, counter and file, parked with it).
 #[derive(Debug, Clone, Default)]
 pub struct Raids {
     pub list: Vec<Raid>,
@@ -228,8 +228,11 @@ pub struct Raids {
     pub tick: i32,
     pub loaded: bool,
     pub dirty: bool,
-    /// Player omen position (`raid_omen_position`).
-    pub omen_pos: Option<[i32; 3]>,
+}
+
+/// File of the raids of a dimension (in the dimension's own `data` folder, like the game).
+fn raids_path(dim_dir: &std::path::Path) -> std::path::PathBuf {
+    dim_dir.join("data").join("minecraft").join("raids.dat")
 }
 
 impl Server {
@@ -242,7 +245,11 @@ impl Server {
         let r = &mut self.mobs.ill.raids;
         r.loaded = true;
         r.next_id = 1;
-        let path = self.world.join("data").join("minecraft").join("raids.dat");
+        // Overworld without its own file: the world-level file our earlier versions wrote.
+        let mut path = raids_path(&self.dim.dir);
+        if self.dim.name == crate::dims::OVERWORLD && !path.exists() {
+            path = raids_path(&self.world);
+        }
         if let Ok(root) = crate::nbtio::read_dat(&path)
             && let Some(d) = root.get("data")
         {
@@ -251,11 +258,11 @@ impl Server {
             r.next_id = int(d, "next_id").unwrap_or(1) as i32;
             r.tick = int(d, "tick").unwrap_or(0) as i32;
         }
-        if let Some(Nbt::IntArray(a)) = self.pdata.root.get("raid_omen_position")
-            && a.len() == 3
-        {
-            self.mobs.ill.raids.omen_pos = Some([a[0], a[1], a[2]]);
-        }
+    }
+
+    /// The player is in the world being ticked (not a parked dimension visited for its tick).
+    fn player_here(&self) -> bool {
+        self.dims.home.is_none()
     }
 
     pub(crate) fn raid_ref(&self, id: i32) -> Option<&Raid> {
@@ -331,14 +338,17 @@ impl Server {
         true
     }
 
-    /// Raid omen tick (1 tick from the end): the raid starts.
+    /// Raid omen tick (1 tick from the end): the raid starts in the player's current world, at
+    /// the position kept by the player (`raid_omen_position` of its file).
     pub(crate) fn raid_omen_tick(&mut self) -> bool {
         self.raids_load();
         if self.game_mode == 3 {
             return true;
         }
-        if let Some(p) = self.mobs.ill.raids.omen_pos {
-            self.create_or_extend_raid(p);
+        if let Some(Nbt::IntArray(a)) = self.pdata.root.get("raid_omen_position")
+            && let [x, y, z] = a[..]
+        {
+            self.create_or_extend_raid([x, y, z]);
             self.set_raid_omen_pos(None);
             return false;
         }
@@ -346,16 +356,19 @@ impl Server {
     }
 
     fn set_raid_omen_pos(&mut self, p: Option<[i32; 3]>) {
-        self.mobs.ill.raids.omen_pos = p;
         match p {
             Some(p) => nbtio::set(&mut self.pdata.root, "raid_omen_position", Nbt::IntArray(p.to_vec())),
             None => nbtio::remove(&mut self.pdata.root, "raid_omen_position"),
         }
     }
 
-    /// Center = average of the occupied village POIs within 64 blocks.
+    /// Center = average of the occupied village POIs within 64 blocks. Allowed where the
+    /// `can_start_raid` environment attribute is true (biome, then dimension type; only the
+    /// Nether turns it off in the game's data, the End keeps the default).
     fn create_or_extend_raid(&mut self, at: [i32; 3]) {
-        if !self.rule("minecraft:raids", true) || self.dim.name != "minecraft:overworld" {
+        if !self.rule("minecraft:raids", true)
+            || !crate::mobs::piglins::env_bool(self, at, "minecraft:gameplay/can_start_raid", true)
+        {
             return;
         }
         let recs = self.poi_in_range(|t| t.is_village(), at, 64, crate::poi::Occupancy::IsOccupied);
@@ -402,6 +415,11 @@ impl Server {
     pub(crate) fn raids_tick(&mut self) {
         #[cfg(test)]
         crate::server::phase("raids");
+        self.raids_tick_world();
+    }
+
+    /// Raids of the world being ticked: the active one, or a parked one (`parked_raids_tick`).
+    fn raids_tick_world(&mut self) {
         self.raids_load();
         self.mobs.ill.raids.tick += 1;
         let ids: Vec<i32> = self.mobs.ill.raids.list.iter().map(|r| r.id).collect();
@@ -459,7 +477,11 @@ impl Server {
         }
         let center = r.center;
         let old_active = r.active;
-        let active = self.chunks.get(&(center[0] >> 4, center[2] >> 4)).is_some_and(Option::is_some);
+        // Center chunk loaded. In a parked world nobody holds the chunks: the game has unloaded
+        // them unless a ticket (pearl, dragon fight) keeps them at the full level.
+        let c = (center[0] >> 4, center[2] >> 4);
+        let active = self.chunks.get(&c).is_some_and(Option::is_some)
+            && (self.player_here() || self.ticket_level(c) <= crate::mobs::spawn::FULL);
         self.raid_mut(id).expect("raid").active = active;
         if self.level.difficulty_id() == 0 {
             self.raid_stop(id);
@@ -573,7 +595,8 @@ impl Server {
             } else {
                 r.status = VICTORY;
                 let (heroes, omen) = (r.heroes.clone(), r.omen);
-                if heroes.contains(&self.uuid) && self.game_mode != 3 && self.ent_alive(Ent::Player) {
+                // Heroes looked up in the raid's own world only.
+                if heroes.contains(&self.uuid) && self.player_here() && self.game_mode != 3 && self.ent_alive(Ent::Player) {
                     self.give_player_effect("minecraft:hero_of_the_village", 48000, omen - 1);
                     // W8c: `raid_win` statistic and `hero_of_the_village` trigger.
                     self.award_custom("raid_win", 1);
@@ -1205,10 +1228,10 @@ impl Server {
 
     // ---------- Boss bar ----------
 
-    /// The living player in the raid zone is registered, otherwise removed.
+    /// The living player in the raid zone (of the raid's world) is registered, otherwise removed.
     fn raid_update_players(&mut self, id: i32) {
         let p = block_of(self.pos);
-        let valid = self.ent_alive(Ent::Player) && self.raid_at(p) == Some(id);
+        let valid = self.player_here() && self.ent_alive(Ent::Player) && self.raid_at(p) == Some(id);
         let Some(r) = self.raid_ref(id) else { return };
         if valid && !r.bar_player {
             self.raid_mut(id).expect("raid").bar_player = true;
@@ -1281,7 +1304,45 @@ impl Server {
 
     // ---------- Saving ----------
 
-    /// `data/minecraft/raids.dat` (if modified).
+    /// The player leaves this world for another dimension: it leaves the raid bars (the game
+    /// drops it at the next player update, or hides the bar when the unloaded center turns the
+    /// raid inactive); a temporary visit of a parked world changes nothing.
+    pub(crate) fn raids_on_park(&mut self) {
+        if self.muted {
+            return;
+        }
+        for i in 0..self.mobs.ill.raids.list.len() {
+            let id = self.mobs.ill.raids.list[i].id;
+            self.bar_remove_player(id);
+        }
+    }
+
+    /// Raids of the parked worlds, every tick like the game's (each world ticks its own): the
+    /// counter of an empty list moves without visiting its world; a world with raids is visited.
+    pub(crate) fn parked_raids_tick(&mut self) {
+        let mut visit = Vec::new();
+        for w in &mut self.dims.parked {
+            let r = &mut w.mobs.ill.raids;
+            if !r.loaded {
+                continue;
+            }
+            if r.list.is_empty() {
+                r.tick += 1;
+                r.dirty |= r.tick % 200 == 0;
+            } else {
+                visit.push(w.dim.name.clone());
+            }
+        }
+        for name in visit {
+            let home = self.dim.name.clone();
+            self.dims.home = Some(home);
+            self.dims.home_pos = self.pos;
+            self.in_world(&name, Server::raids_tick_world);
+            self.dims.home = None;
+        }
+    }
+
+    /// `data/minecraft/raids.dat` of the dimension (if modified).
     pub(crate) fn raids_save_jobs(&mut self, jobs: &mut Vec<crate::save::Job>) {
         if !self.mobs.ill.raids.dirty || !self.mobs.ill.raids.loaded {
             return;
@@ -1295,8 +1356,7 @@ impl Server {
         ]);
         let root =
             Nbt::Compound(vec![("data".into(), data), ("DataVersion".into(), Nbt::Int(crate::chunk::DATA_VERSION))]);
-        let path = self.world.join("data").join("minecraft").join("raids.dat");
-        jobs.push(crate::save::Job::Dat { path, nbt: nbtio::encode_root(&root), backup: false });
+        jobs.push(crate::save::Job::Dat { path: raids_path(&self.dim.dir), nbt: nbtio::encode_root(&root), backup: false });
     }
 }
 

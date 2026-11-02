@@ -2162,9 +2162,7 @@ fn guardian_eye(eye: [f64; 3], look: [f64; 3], pitch: f32, yaw: f32) -> [f32; 2]
     let y = if look[1] - eye[1] > 0.0 { 0.0 } else { 1.0 };
     let (f, g) = (f64::from(pitch).to_radians(), -f64::from(yaw).to_radians());
     let view = [g.sin() * f.cos(), g.cos() * f.cos()];
-    let (dx, dz) = (eye[0] - look[0], eye[2] - look[2]);
-    let len = (dx * dx + dz * dz).sqrt();
-    let (dx, dz) = if len < 1.0e-5 { (0.0, 0.0) } else { (dx / len, dz / len) };
+    let [dx, _, dz] = rc_physics::normalize([eye[0] - look[0], 0.0, eye[2] - look[2]]);
     // Quarter turn around y: (x, z) → (z, −x).
     let dot = view[0] * dz + view[1] * -dx;
     [(dot.abs() as f32).sqrt() * 2.0 * (dot.signum() as f32), y]

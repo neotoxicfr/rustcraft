@@ -19,7 +19,7 @@ pub mod piston;
 pub mod ray;
 
 pub use border::WorldBorder;
-pub use flow::{Fluid, FluidTables};
+pub use flow::{Fluid, FluidTables, normalize};
 
 use hashbrown::HashMap;
 

@@ -964,6 +964,8 @@ impl Server {
         let team = self.push_team(Some(m.uuid));
         // (entity, slot of the list at the time of the record; u32::MAX for the player).
         let mut list: Vec<(Ent, u32)> = Vec::new();
+        // Pushed entities that ride something: pushed, but the cramming only counts the others.
+        let mut riders = 0i32;
         for (i, o) in self.mobs.list.iter().enumerate() {
             if let Some(o) = o
                 && o.alive()
@@ -974,6 +976,7 @@ impl Server {
                 && self.push_team_allows(team, Some(o.uuid))
             {
                 list.push((Ent::Mob(o.id), i as u32));
+                riders += i32::from(o.mount.vehicle.is_some());
             }
         }
         // Minecarts touched: always pushable, the one the mob rides included (only the minecart's
@@ -997,13 +1000,16 @@ impl Server {
             && self.push_team_allows(team, None)
         {
             list.push((Ent::Player, u32::MAX));
+            riders += i32::from(self.player_riding_any());
         }
         if list.is_empty() && carts.is_empty() {
             return;
         }
         let max = self.mob_rule_int("minecraft:max_entity_cramming", 24);
+        // The draw uses every pushed entity, the damage only those that ride nothing (a minecart
+        // never rides).
         let n = (list.len() + carts.len()) as i32;
-        if max > 0 && n > max - 1 && m.rng.next_int_bound(4) == 0 && n > max - 1 {
+        if max > 0 && n > max - 1 && m.rng.next_int_bound(4) == 0 && n - riders > max - 1 {
             self.mob_hurt(m, "minecraft:cramming", 6.0, None, None);
         }
         for (e, at) in list {

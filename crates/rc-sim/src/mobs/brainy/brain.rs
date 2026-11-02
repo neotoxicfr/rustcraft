@@ -1979,9 +1979,7 @@ impl Server {
             target = match fallback {
                 None => self.random_swimmable_pos(m, h, v),
                 Some(f) => {
-                    let d = [f[0] - m.pos[0], f[1] - m.pos[1], f[2] - m.pos[2]];
-                    let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-                    let n = if l < 1.0e-4 { [0.0; 3] } else { d.map(|x| x / l) };
+                    let n = crate::mobs::mth::normalize([f[0] - m.pos[0], f[1] - m.pos[1], f[2] - m.pos[2]]);
                     Some([
                         m.pos[0] + n[0] * f64::from(h),
                         m.pos[1] + n[1] * f64::from(v),

@@ -185,7 +185,11 @@ mod tests_g4f08; // G4-F08: shulker push, TNT, sulfur cube, creaking, warden, sm
 #[cfg(test)]
 mod tests_g3f08; // G3-F08: compute, posteffect, fetchprofile, attribute reset, loot targets
 #[cfg(test)]
+mod tests_l10ent; // L10-ENT: pistons and shulkers on stands, mannequins, minecarts; item fields; raids per dimension
+#[cfg(test)]
 mod tests_l9combat; // L9-COMBAT: smash and wind reach, hurt trigger, stand attributes, summon, profile cache
+#[cfg(test)]
+mod tests_l10combat; // L10-COMBAT: blast reach and direct entity, decoration sizes, sweep, vector normalization
 
 use std::path::{Path, PathBuf};
 

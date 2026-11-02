@@ -10,10 +10,7 @@ use crate::player::Stack;
 use crate::projectiles::{PKind, Proj};
 use crate::server::Server;
 
-fn normalize(v: [f64; 3]) -> [f64; 3] {
-    let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    if l < 1.0e-5 { [0.0; 3] } else { v.map(|c| c / l) }
-}
+use crate::mobs::mth::normalize;
 
 impl Server {
     /// Throws a skull (`new WitherSkull(level, owner, direction)` then the placement): velocity =

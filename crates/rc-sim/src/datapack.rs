@@ -87,7 +87,12 @@ pub struct DataPack {
     structure_spawns: Cache<Option<Arc<SpawnOverride>>>,
     /// S7: enchantment definitions built on first request.
     pub(crate) ench: std::sync::OnceLock<crate::enchanting::Enchants>,
+    /// Tags of a data-driven registry folder, all resolved at its first request.
+    tags: Mutex<HashMap<Box<str>, Arc<FolderTags>>>,
 }
+
+/// Resolved tags of one registry folder: tag name (`ns:path`) → members (`ns:path`), in order.
+type FolderTags = BTreeMap<String, Arc<[String]>>;
 
 impl DataPack {
     pub(crate) fn from_jar(jar: &crate::registries::Jar) -> DataPack {
@@ -102,14 +107,7 @@ impl DataPack {
             let key = if ns == "minecraft" { path.to_owned() } else { format!("{ns}:{path}") };
             files.insert(key, bytes.clone());
         }
-        DataPack {
-            files,
-            cache: Mutex::default(),
-            nbt: Mutex::default(),
-            biome_spawns: Mutex::default(),
-            structure_spawns: Mutex::default(),
-            ench: std::sync::OnceLock::new(),
-        }
+        DataPack { files, ..DataPack::default() }
     }
 
     /// Pack built by hand (tests).
@@ -117,11 +115,7 @@ impl DataPack {
     pub fn from_files(files: &[(&str, &str)]) -> DataPack {
         DataPack {
             files: files.iter().map(|(k, v)| ((*k).to_owned(), Arc::from(v.as_bytes()))).collect(),
-            cache: Mutex::default(),
-            nbt: Mutex::default(),
-            biome_spawns: Mutex::default(),
-            structure_spawns: Mutex::default(),
-            ench: std::sync::OnceLock::new(),
+            ..DataPack::default()
         }
     }
 
@@ -191,6 +185,39 @@ impl DataPack {
         v
     }
 
+    /// Members of tag `tag` (`#` optional, `minecraft` namespace implicit) of the data-driven
+    /// registry folder `dir` (`loot_table`, `slot_source`, `instrument`…), resolved like the
+    /// game's tag loader (`packs::resolve_tags`): `id`, `#tag` and `{id, required}` members,
+    /// nested tags followed, duplicates dropped (first kept), the whole tag refused (empty)
+    /// when a required member is missing. A member exists when the folder holds its file. All
+    /// the folder's tags are resolved at its first request, then kept.
+    pub(crate) fn tag(&self, dir: &str, tag: &str) -> Arc<[String]> {
+        let folder = {
+            let mut cache = self.tags.lock().unwrap_or_else(|e| e.into_inner());
+            match cache.get(dir) {
+                Some(t) => t.clone(),
+                None => {
+                    let lists: Vec<(String, Vec<Value>)> = self
+                        .all(&format!("tags/{dir}"))
+                        .into_iter()
+                        .map(|(n, v)| (n, crate::packs::tag_values(&v).cloned().unwrap_or_default()))
+                        .collect();
+                    let raw: BTreeMap<String, &[Value]> =
+                        lists.iter().map(|(n, v)| (n.clone(), v.as_slice())).collect();
+                    let exists = |id: &str| self.files.contains_key(&Self::key(dir, id)).then(|| id.to_owned());
+                    let t: Arc<FolderTags> = Arc::new(
+                        crate::packs::resolve_tags(&raw, &exists).into_iter().map(|(k, v)| (k, Arc::from(v))).collect(),
+                    );
+                    cache.insert(dir.into(), t.clone());
+                    t
+                }
+            }
+        };
+        let name = tag.strip_prefix('#').unwrap_or(tag);
+        let hit = if name.contains(':') { folder.get(name) } else { folder.get(&format!("minecraft:{name}")) };
+        hit.cloned().unwrap_or_else(|| Arc::from(Vec::new()))
+    }
+
     /// All files of a folder: (identifier, contents), in identifier order.
     pub fn all(&self, dir: &str) -> Vec<(String, Value)> {
         let prefix = format!("{dir}/");
@@ -237,4 +264,40 @@ pub(crate) struct SpawnOverride {
     pub spawns: Arc<[Value]>,
     pub piece: bool,
     pub grow: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// L10: tags of a registry folder read like the game's tag loader: `{id, required}`
+    /// members, nested tags, duplicates dropped (first kept), a missing required member
+    /// refusing the whole tag, an optional one skipped; `#` and `minecraft:` optional.
+    #[test]
+    fn folder_tags_resolved_like_the_game() {
+        let pack = DataPack::from_files(&[
+            ("instrument/a", "{}"),
+            ("x:instrument/b", "{}"),
+            ("tags/instrument/plain", r#"{"values":["a","x:b"]}"#),
+            (
+                "x:tags/instrument/ids",
+                r##"{"values":[{"id":"x:b"},{"id":"minecraft:a","required":true},"#plain","a"]}"##,
+            ),
+            (
+                "x:tags/instrument/optional",
+                r##"{"values":[{"id":"x:none","required":false},{"id":"#x:gone","required":false},"a"]}"##,
+            ),
+            ("x:tags/instrument/missing", r#"{"values":["a","x:none"]}"#),
+            ("x:tags/instrument/uses_missing", r##"{"values":["#x:missing","a"]}"##),
+        ]);
+        let tag = |t: &str| pack.tag("instrument", t).to_vec();
+        assert_eq!(tag("plain"), ["minecraft:a", "x:b"]);
+        assert_eq!(tag("#minecraft:plain"), ["minecraft:a", "x:b"]);
+        assert_eq!(tag("#x:ids"), ["x:b", "minecraft:a"]);
+        assert_eq!(tag("x:optional"), ["minecraft:a"]);
+        assert!(tag("x:missing").is_empty());
+        assert!(tag("x:uses_missing").is_empty());
+        assert!(tag("x:unknown").is_empty());
+        assert!(pack.tag("loot_table", "plain").is_empty(), "another folder");
+    }
 }

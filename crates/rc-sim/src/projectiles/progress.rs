@@ -122,22 +122,40 @@ impl Server {
         r
     }
 
+    /// The entity `id` about to explode (crystal, primed TNT, TNT minecart: not a projectile)
+    /// becomes the direct entity of its explosion's damage; its compound is only built when the
+    /// player is behind the blast and a `player_hurt_entity` criterion may read it.
+    pub(crate) fn blast_direct_next(&mut self, by: Option<Ent>, id: i32, nbt: impl FnOnce(&Server) -> rc_proto::nbt::Nbt) {
+        if by == Some(Ent::Player) && self.trig_active("minecraft:player_hurt_entity") {
+            self.proj.blast_next = Some((id, nbt(self)));
+        }
+    }
+
     /// `player_hurt_entity` for a hurt mob whose source is the player (`original`: the damage
     /// received; `taken`: after the extra freeze damage and the helmet, before armor). Direct
-    /// entity: the player for a hit of its own, otherwise the projectile being resolved.
+    /// entity: the player for a hit of its own, otherwise the projectile being resolved, otherwise
+    /// the entity exploding (an explosion it set off hides the projectile).
     pub(crate) fn s9_player_hurt_mob(&mut self, m: &crate::mobs::mob::Mob, ty: &str, original: f32, taken: f32) {
+        self.s9_player_hurt_living(Some(Who::Mob(m)), ty, original, taken, false);
+    }
+
+    /// `player_hurt_entity` for any hurt living entity `victim` (mob, mannequin, player; `None`:
+    /// another player of the local network) whose source is the player, as
+    /// [`Self::s9_player_hurt_mob`] describes it (`blocked`: parried by a shield).
+    pub(crate) fn s9_player_hurt_living(&mut self, victim: Option<Who<'_>>, ty: &str, original: f32, taken: f32, blocked: bool) {
         if !self.trig_active("minecraft:player_hurt_entity") {
             return;
         }
         let proj = self.proj.direct_hit.take();
+        let blast = self.proj.blast_ent.as_ref().map(|(id, n)| (*id, crate::nbtio::f64s::<3>(n.get("Pos")).unwrap_or(self.pos)));
         let direct = if crate::loot::direct_of(ty) == Some(None) {
             Some(Who::E(E::Player))
         } else {
-            proj.as_deref().map(Who::Proj)
+            proj.as_deref().map(Who::Proj).or_else(|| blast.map(|(id, _)| Who::E(E::Other(id))))
         };
-        let pos = proj.as_ref().map_or(self.pos, |p| p.pos);
+        let pos = proj.as_ref().map(|p| p.pos).or_else(|| blast.map(|b| b.1)).unwrap_or(self.pos);
         let dmg = Dmg { ty: ty.to_owned(), source: Some(Who::E(E::Player)), direct, pos: Some(pos) };
-        self.trig_player_hurt_entity(Some(Who::Mob(m)), &dmg, original, taken, false);
+        self.trig_player_hurt_entity(victim, &dmg, original, taken, blocked);
         self.proj.direct_hit = proj;
     }
 }

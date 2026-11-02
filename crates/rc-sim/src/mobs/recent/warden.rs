@@ -631,7 +631,7 @@ pub fn sonic_tick(s: &mut Server, m: &mut Mob, b: &mut Brain) {
     let src = [m.pos[0], m.pos[1] + f64::from(1.6f32), m.pos[2]];
     let d = [tp[0] - src[0], eye - src[1], tp[2] - src[2]];
     let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-    let n = if l < 1.0e-5 { [0.0; 3] } else { d.map(|v| v / l) };
+    let n = crate::mobs::mth::normalize(d);
     let steps = l.floor() as i32 + 7;
     for i in 1..steps {
         let pp = [src[0] + n[0] * f64::from(i), src[1] + n[1] * f64::from(i), src[2] + n[2] * f64::from(i)];
