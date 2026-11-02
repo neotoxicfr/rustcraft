@@ -197,7 +197,7 @@ fn run_new() -> Option<Vec<(String, String)>> {
 /// G3-F08: player file key `post_effects` (alone: 27355455…, 378) and the widened speeds of
 /// the zombie and spider families and of the enderman (without both: 9d3c0ffd… again).
 /// Lot 8 integration: both together.
-const EXPECTED_MECH: (&str, usize) = ("TO_MEASURE", 0);
+const EXPECTED_MECH: (&str, usize) = ("a551d2723eb85bed3efc1cfddae60490fbfaff269dd6609d1e752ae358b3efac", 380);
 
 /// Server command (refusal = failure: the rig would be incomplete).
 pub(crate) fn cmd(s: &mut Server, c: &str) {

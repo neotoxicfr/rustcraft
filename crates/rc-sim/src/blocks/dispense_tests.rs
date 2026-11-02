@@ -368,7 +368,9 @@ fn furnace_and_brewer_load_given_data() {
     assert_eq!(count(&p, [104, -59, 108], "minecraft:blaze_powder"), 3, "brewing stand emptied");
     p.run("tick 3\n");
     assert_eq!(count(&p, [102, -59, 108], "minecraft:raw_iron"), 5, "furnace overwritten at tick");
-    assert_eq!(count(&p, [104, -59, 108], "minecraft:blaze_powder"), 3, "brewing stand overwritten at tick");
+    // Without fuel the stand burns one powder at its first tick, as in the game (fuel refilled
+    // from the fuel slot): 2 left, not 0 (overwritten) nor 3 (not ticking).
+    assert_eq!(count(&p, [104, -59, 108], "minecraft:blaze_powder"), 2, "brewing stand overwritten at tick");
     done(p, dir);
 }
 
