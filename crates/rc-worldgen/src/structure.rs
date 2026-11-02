@@ -316,6 +316,8 @@ pub struct GenStart<'a> {
     pub def: &'a StructureDef,
     /// Kept biome context of the attempt (`RUSTCRAFT_OPT_GENSTART_CTX`), otherwise a new one per point.
     pub bctx: Option<RefCell<Ctx>>,
+    /// Every biome accepted (`place structure`, jigsaw block: the game's test accepts all).
+    pub any_biome: bool,
 }
 
 impl GenStart<'_> {
@@ -330,7 +332,12 @@ impl GenStart<'_> {
     }
 
     pub fn valid_biome(&self, p: [i32; 3]) -> bool {
-        self.def.biomes.get(self.biome_at(p[0], p[1], p[2]) as usize).copied().unwrap_or(false)
+        self.biome_ok(p[0], p[1], p[2])
+    }
+
+    /// The structure accepts the biome at the point (every one for a placement by command).
+    pub fn biome_ok(&self, x: i32, y: i32, z: i32) -> bool {
+        self.any_biome || self.def.biomes.get(self.biome_at(x, y, z) as usize).copied().unwrap_or(false)
     }
 
     /// Ground height (first free y) without decoration.
@@ -809,11 +816,25 @@ impl StructureGen {
     }
 
     fn try_start(&self, s: usize, cx: i32, cz: i32, t: &TerrainGenerator, b: &Blocks, ctx: bool) -> Option<Start> {
+        self.try_start_biome(s, cx, cz, t, b, ctx, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn try_start_biome(
+        &self,
+        s: usize,
+        cx: i32,
+        cz: i32,
+        t: &TerrainGenerator,
+        b: &Blocks,
+        ctx: bool,
+        any_biome: bool,
+    ) -> Option<Start> {
         let def = &self.defs[s];
         let mut rng = DecoRng::legacy(0);
         rng.set_large_feature_seed(self.seed, cx, cz);
         let bctx = ctx.then(|| RefCell::new(Ctx::cached()));
-        let mut g = GenStart { sg: self, t, b, cx, cz, rng, hctx: t.gen_ctx(), def, bctx };
+        let mut g = GenStart { sg: self, t, b, cx, cz, rng, hctx: t.gen_ctx(), def, bctx, any_biome };
         let (pos, pieces) = match &def.kind {
             Kind::Jigsaw(cfg) => crate::jigsaw::generate(&mut g, cfg)?,
             Kind::BuriedTreasure => crate::structure_coded::buried_treasure(&mut g)?,
@@ -843,6 +864,54 @@ impl StructureGen {
             bbox.encapsulate(&p.bbox());
         }
         Some(Start { structure: s, cx, cz, pieces, bbox })
+    }
+
+    /// Start of the structure `id` generated at chunk (cx, cz) whatever the placement rules and
+    /// the biome (`place structure`).
+    pub fn start_anywhere(&self, id: &str, cx: i32, cz: i32, t: &TerrainGenerator, b: &Blocks) -> Option<Start> {
+        let id = crate::data::full_id(id);
+        let s = self.defs.iter().position(|d| d.id == id)?;
+        self.try_start_biome(s, cx, cz, t, b, genstart_ctx(), true)
+    }
+
+    /// Jigsaw assembly from the pool `pool` at `pos` (jigsaw block, `place jigsaw`): the start
+    /// piece joins by its jigsaw named `target`, `depth` levels, within 128 blocks, randomness of
+    /// the chunk of `pos`. The start carries no structure (index `usize::MAX`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn jigsaw_at(
+        &self,
+        pool: &str,
+        target: &str,
+        depth: i32,
+        pos: [i32; 3],
+        t: &TerrainGenerator,
+        b: &Blocks,
+    ) -> Option<Start> {
+        let def = self.defs.first()?;
+        let (cx, cz) = (pos[0] >> 4, pos[2] >> 4);
+        let mut rng = DecoRng::legacy(0);
+        rng.set_large_feature_seed(self.seed, cx, cz);
+        let mut g = GenStart { sg: self, t, b, cx, cz, rng, hctx: t.gen_ctx(), def, bctx: None, any_biome: true };
+        let cfg = crate::jigsaw::JigsawCfg {
+            start_pool: crate::data::full_id(pool),
+            start_jigsaw_name: Some(crate::data::full_id(target)),
+            size: depth,
+            start_height: crate::decor_pred::HeightP::Const(crate::decor_pred::Anchor::Absolute(pos[1])),
+            expansion_hack: false,
+            project: None,
+            max_h: 128,
+            max_v: Some(128),
+            aliases: Vec::new(),
+            pad_bottom: 0,
+            pad_top: 0,
+            waterlog: true,
+        };
+        let (_, pieces) = crate::jigsaw::generate_from(&mut g, &cfg, pos)?;
+        let mut bbox = pieces.first()?.bbox();
+        for p in &pieces[1..] {
+            bbox.encapsulate(&p.bbox());
+        }
+        Some(Start { structure: usize::MAX, cx, cz, pieces, bbox })
     }
 
     /// References of the chunk (§ 7.4): starts of the chunks within 8 whose box intersects its

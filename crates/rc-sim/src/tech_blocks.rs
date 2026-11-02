@@ -328,13 +328,23 @@ impl Server {
         Ok(())
     }
 
-    /// Generation from a jigsaw block: decoded and checked; the assembly into the live world
-    /// is not wired (see `place jigsaw`).
+    /// Generation from a jigsaw block: assembly of its pool in front of it (the cell its front
+    /// faces), joined by its target name, the jigsaw blocks kept on request.
     fn on_jigsaw_generate(&mut self, r: &mut Reader<'_>) -> rc_proto::Result<()> {
         let bp = BlockPos::decode(r)?;
-        let _levels = read_varint(r)?;
-        let _keep = bool::decode(r)?;
-        let _ = (bp, self.can_use_game_master_blocks());
+        let levels = read_varint(r)?;
+        let keep = bool::decode(r)?;
+        let p = [bp.x, bp.y, bp.z];
+        if !self.can_use_game_master_blocks() || be_id(self.be_get(p)) != Some("minecraft:jigsaw") {
+            return Ok(());
+        }
+        let s = self.get(p);
+        let front = self.v().get(s, "orientation").and_then(|o| o.split('_').next()).and_then(Dir::parse);
+        let Some(front) = front else { return Ok(()) };
+        let be = self.be_get(p).cloned().unwrap_or(Nbt::Compound(Vec::new()));
+        let text = |k: &str| be.get(k).and_then(Nbt::as_str).unwrap_or("minecraft:empty").to_owned();
+        let at = crate::blocks::rel(p, front);
+        let _ = self.generate_jigsaw(&text("pool"), &text("target"), levels, at, keep);
         Ok(())
     }
 

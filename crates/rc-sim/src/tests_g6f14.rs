@@ -490,3 +490,77 @@ fn bench_border_in_entity_collision() {
     });
     eprintln!("view {view:.1} ns, view + border + edge test {with_border:.1} ns (loaded machine)");
 }
+
+fn count_non_air(w: &W, lo: [i32; 3], hi: [i32; 3]) -> usize {
+    let mut n = 0;
+    for x in lo[0]..=hi[0] {
+        for y in lo[1]..=hi[1] {
+            for z in lo[2]..=hi[2] {
+                if !w.p.s.v().is_air(w.p.s.get([x, y, z])) {
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Name of a jigsaw of the pillager outpost base plate (target of the assemblies below).
+fn base_plate_jigsaw(w: &mut W) -> String {
+    let (wd, _) = w.p.s.place_data().expect("generation data");
+    let t = wd.templates.get("minecraft:pillager_outpost/base_plate", &wd.blocks).expect("base plate template");
+    t.jigsaws[0].first().expect("a jigsaw").name.to_string()
+}
+
+/// `place structure` generates a start at the position's chunk whatever the biome and places it
+/// (here an igloo in a flat plains world); `place jigsaw` assembles a pool at a position.
+#[test]
+fn place_structure_and_jigsaw_build_into_the_world() {
+    let mut w = world("place-structure");
+    let area = ([-24, Y, -24], [40, Y + 10, 40]);
+    let before = count_non_air(&w, area.0, area.1);
+    let ok = w.try_cmd(&format!("place structure minecraft:igloo 8 {Y} 8"));
+    assert!(ok, "igloo refused: {}", w.chat_text());
+    let after = count_non_air(&w, area.0, area.1);
+    assert!(after > before + 50, "igloo placed: {before} -> {after}");
+    let target = base_plate_jigsaw(&mut w);
+    let lo = [-24, Y - 4, 24];
+    let hi = [24, Y + 6, 40];
+    let before = count_non_air(&w, lo, hi);
+    w.cmd(&format!("place jigsaw minecraft:pillager_outpost/base_plates {target} 1 0 {Y} 32"));
+    let after = count_non_air(&w, lo, hi);
+    assert!(after != before, "base plate placed: {before} -> {after}");
+    assert!(!w.try_cmd(&format!("place structure minecraft:nothing 0 {Y} 0")));
+}
+
+/// A jigsaw block generates its pool in front of it on request (screen's button).
+#[test]
+fn jigsaw_block_generates_its_pool() {
+    let mut w = world("jigsaw-generate");
+    let target = base_plate_jigsaw(&mut w);
+    let j = [0, Y, 32];
+    w.cmd(&format!("setblock 0 {Y} 32 minecraft:jigsaw[orientation=up_north]"));
+    let mut buf = Vec::new();
+    let at = BlockPos::new(j[0], j[1], j[2]);
+    write_set_jigsaw_block(
+        &mut buf,
+        at,
+        "minecraft:empty",
+        &target,
+        "minecraft:pillager_outpost/base_plates",
+        "minecraft:air",
+        "rollable",
+        0,
+        0,
+    );
+    let id = w.p.s.peer.ids().set_jigsaw_block;
+    w.p.s.tech_packet(id, &mut Reader::new(&buf));
+    let (lo, hi) = ([-24, Y - 4, 24], [24, Y + 8, 40]);
+    let before = count_non_air(&w, lo, hi);
+    let mut buf = Vec::new();
+    rc_proto_v777::special::write_jigsaw_generate(&mut buf, at, 1, false);
+    let id = w.p.s.peer.ids().jigsaw_generate;
+    w.p.s.tech_packet(id, &mut Reader::new(&buf));
+    let after = count_non_air(&w, lo, hi);
+    assert!(after != before, "pool generated: {before} -> {after}");
+}

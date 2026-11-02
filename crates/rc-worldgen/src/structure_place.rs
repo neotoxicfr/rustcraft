@@ -771,29 +771,44 @@ pub fn place_step(
         rng.set_feature_seed(deco_seed, k as i32, step as i32);
         let Some((_, starts)) = refs.iter().find(|(id, _)| *id == s) else { continue };
         for st in starts {
-            let Some(first) = st.pieces.first() else { continue };
-            let fb = first.bbox();
-            let c = fb.center();
-            let reference = [c[0], fb.min[1], c[2]];
-            for p in &st.pieces {
-                if p.bbox().intersects(&zone) {
-                    place_piece(cx, sg, p, rng, zone, reference);
-                }
-            }
-            if matches!(sg.defs[s].kind, crate::structure::Kind::DesertPyramid) {
-                crate::structure_scattered::pyramid_after(cx.r, &st.pieces, zone);
-            }
-            if matches!(sg.defs[s].kind, crate::structure::Kind::Mansion) {
-                crate::structure_mansion::after(cx.r, &st.pieces, zone);
-            }
+            place_start_zone(cx, sg, st, rng, zone, false);
         }
     }
 }
 
-fn place_piece(cx: &mut Ctx, sg: &StructureGen, p: &Piece, rng: &mut DecoRng, zone: BBox, reference: [i32; 3]) {
+/// Placement of a start's pieces that touch `zone` (one chunk column of the live world for
+/// `place structure` and the jigsaw block, like the game's per-chunk placement), then the
+/// structure's own finishing (desert pyramid, mansion); `keep`: jigsaw blocks left in place.
+pub fn place_start_zone(cx: &mut Ctx, sg: &StructureGen, st: &Start, rng: &mut DecoRng, zone: BBox, keep: bool) {
+    let Some(first) = st.pieces.first() else { return };
+    let fb = first.bbox();
+    let c = fb.center();
+    let reference = [c[0], fb.min[1], c[2]];
+    for p in &st.pieces {
+        if p.bbox().intersects(&zone) {
+            place_piece(cx, sg, p, rng, zone, reference, keep);
+        }
+    }
+    use crate::structure::Kind;
+    match sg.defs.get(st.structure).map(|d| &d.kind) {
+        Some(Kind::DesertPyramid) => crate::structure_scattered::pyramid_after(cx.r, &st.pieces, zone),
+        Some(Kind::Mansion) => crate::structure_mansion::after(cx.r, &st.pieces, zone),
+        _ => {}
+    }
+}
+
+fn place_piece(
+    cx: &mut Ctx,
+    sg: &StructureGen,
+    p: &Piece,
+    rng: &mut DecoRng,
+    zone: BBox,
+    reference: [i32; 3],
+    keep: bool,
+) {
     match p {
         Piece::Jigsaw(jp) => {
-            place_element(cx, sg, &jp.element, jp, jp.pos, rng, zone, reference);
+            place_element(cx, sg, &jp.element, jp, jp.pos, rng, zone, reference, keep);
         }
         Piece::Coded { data, bbox, .. } => match &**data {
             CodedPiece::BuriedTreasure => buried_treasure(cx, *bbox, rng, zone),
@@ -817,6 +832,7 @@ fn place_element(
     rng: &mut DecoRng,
     zone: BBox,
     reference: [i32; 3],
+    keep: bool,
 ) -> bool {
     let b = cx.r.b;
     match e {
@@ -826,7 +842,10 @@ fn place_element(
             if !legacy {
                 pre.push(Proc::Ignore(b.block_id("minecraft:structure_block").into_iter().collect()));
             }
-            pre.push(Proc::JigsawReplace);
+            // Jigsaw blocks kept on request (jigsaw block generation), otherwise replaced.
+            if !keep {
+                pre.push(Proc::JigsawReplace);
+            }
             let mut post: Vec<Proc> = Vec::new();
             if *projection == Projection::TerrainMatching {
                 post.push(Proc::Gravity { hm: Hm::WorldSurfaceWg, offset: -1 });
@@ -860,7 +879,7 @@ fn place_element(
         }
         Element::List { elements, .. } => {
             for el in elements {
-                if !place_element(cx, sg, el, jp, pos, rng, zone, reference) {
+                if !place_element(cx, sg, el, jp, pos, rng, zone, reference, keep) {
                     return false;
                 }
             }

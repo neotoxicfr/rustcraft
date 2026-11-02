@@ -1,13 +1,16 @@
-//! S9: `place feature` (configured features of the generator, `rc-worldgen`) and `place template`
-//! (`.nbt` templates from the jar or the world); `place structure` and `place jigsaw` are not
-//! yet wired to structure generation (clean failure).
+//! S9: `place feature` (configured features of the generator, `rc-worldgen`), `place template`
+//! (templates of the server, `tech_blocks.rs`), `place structure` and `place jigsaw` (structure
+//! generation of `rc-worldgen`, placed chunk by chunk into the live world; also the jigsaw
+//! block's generation).
 
 use std::sync::Arc;
 
+use rc_proto::nbt::Nbt;
 use rc_worldgen::chunkgen::{DimGen, WorldData};
 use rc_worldgen::decor_blocks::Blocks;
 use rc_worldgen::decor_region::{DecoChunk, FLUID_TICK_NAMES, Region};
-use rc_worldgen::template::{Mirror, Rot};
+use rc_worldgen::structure::Start;
+use rc_worldgen::template::{BBox, Mirror, Rot};
 
 use super::src::{Fail, Src};
 use super::{Parsed, R, Seg, args};
@@ -20,6 +23,9 @@ pub struct PlaceData {
     pub dim: String,
     pub wd: Arc<WorldData>,
     pub dg: Arc<DimGen>,
+    /// Generator with the structures enabled (`place structure`, jigsaw), built at first need
+    /// even in a world created without structures.
+    pub structured: Option<Arc<DimGen>>,
 }
 
 impl std::fmt::Debug for PlaceData {
@@ -40,8 +46,93 @@ impl Server {
         let reports = crate::generation::reports_dir(&self.data);
         let wd = WorldData::shared(&jar, reports.is_dir().then_some(reports.as_path()), &self.data).ok()?;
         let dg = Arc::new(DimGen::new(&wd, &spec, &self.dim.name, seed).ok()?);
-        self.prog.place = Some(Box::new(PlaceData { dim: self.dim.name.clone(), wd: wd.clone(), dg: dg.clone() }));
+        self.prog.place =
+            Some(Box::new(PlaceData { dim: self.dim.name.clone(), wd: wd.clone(), dg: dg.clone(), structured: None }));
         Some((wd, dg))
+    }
+
+    /// Generator of the open dimension with its structures (kept with the `place` data).
+    fn structured_gen(&mut self) -> Option<(Arc<WorldData>, Arc<DimGen>)> {
+        let (wd, _) = self.place_data()?;
+        if let Some(g) = self.prog.place.as_ref().and_then(|p| p.structured.clone()) {
+            return Some((wd, g));
+        }
+        let (spec, seed) = crate::generation::read_spec(&self.world, &self.dim.name)?;
+        let mut dg = DimGen::new(&wd, &spec, &self.dim.name, seed).ok()?;
+        dg.enable_structures(&wd).ok()?;
+        let dg = Arc::new(dg);
+        if let Some(p) = self.prog.place.as_mut() {
+            p.structured = Some(dg.clone());
+        }
+        Some((wd, dg))
+    }
+
+    /// The pieces of a start placed into the live world, one chunk column at a time over the
+    /// start's box (like the game), on copies of the chunks with a one-chunk border so that a
+    /// chunk sees what its neighbours received; then the changed cells, ticks, post-processing,
+    /// block entity data and entities are written back. Randomness drawn from the world's.
+    pub(crate) fn place_start_live(&mut self, wd: &WorldData, dg: &DimGen, st: &Start, keep: bool) -> bool {
+        let (Some(sg), Some(deco)) = (dg.structures.clone(), dg.deco.clone()) else { return false };
+        let bb = st.bbox;
+        let (c0, c1) = ((bb.min[0] >> 4, bb.min[2] >> 4), (bb.max[0] >> 4, bb.max[2] >> 4));
+        let (gx0, gz0) = (c0.0 - 1, c0.1 - 1);
+        let w = c1.0 - c0.0 + 3;
+        let h = c1.1 - c0.1 + 3;
+        let mut grid: Vec<DecoChunk> = Vec::with_capacity((w * h) as usize);
+        for dz in 0..h {
+            for dx in 0..w {
+                grid.push(self.deco_chunk(gx0 + dx, gz0 + dz, dg, wd));
+            }
+        }
+        let hi = i64::from(self.bs.rng.next_int());
+        let mut rng =
+            rc_worldgen::decor_rng::DecoRng::legacy((hi << 32).wrapping_add(i64::from(self.bs.rng.next_int())));
+        let (min_y, top) = (self.dim.height.min_y, self.top_y());
+        let idx = |x: i32, z: i32| ((z - gz0) * w + (x - gx0)) as usize;
+        // Chunks in the game's order (x varies first).
+        for cz in c0.1..=c1.1 {
+            for cx in c0.0..=c1.0 {
+                let ids: [usize; 9] = std::array::from_fn(|i| idx(cx + i as i32 % 3 - 1, cz + i as i32 / 3 - 1));
+                let Ok(refs) = grid.get_disjoint_mut(ids) else { continue };
+                let mut r = Region::new(refs, &wd.blocks, dg.sea_level, dg.seed);
+                let mut ctx = rc_worldgen::decor::Ctx::new(&mut r, &deco);
+                let zone = BBox::new([cx * 16, min_y, cz * 16], [cx * 16 + 15, top, cz * 16 + 15]);
+                rc_worldgen::structure_place::place_start_zone(&mut ctx, &sg, st, &mut rng, zone, keep);
+            }
+        }
+        self.apply_deco(&grid, &wd.blocks);
+        for dc in &grid {
+            if !matches!(self.chunks.get(&(dc.cx, dc.cz)), Some(Some(_))) {
+                continue;
+            }
+            // Shapes of the marked cells, like the post-processing of a generated chunk.
+            for &p in &dc.post_process {
+                let s = self.get(p);
+                let ns = self.update_from_neighbour_shapes(s, p);
+                if ns != s {
+                    self.set_block(p, ns, flag::CLIENTS | flag::KNOWN_SHAPE);
+                }
+            }
+            for (p, d) in &dc.be_data {
+                if self.be_get(*p).is_some() {
+                    let mut f = Vec::new();
+                    crate::generation_nbt::be_extra_fields(d, &mut f);
+                    self.set_block_data(*p, Nbt::Compound(f));
+                }
+            }
+            let src = self.player_source();
+            for e in &dc.entities {
+                let ty = e.get("id").and_then(Nbt::as_str).unwrap_or("").to_owned();
+                if crate::mobs::species::Kind::from_name(&ty).is_some() {
+                    self.next_entity += 1;
+                    let n = self.next_entity;
+                    let _ = self.adopt_with_passengers(n, e, None);
+                } else if let Some(pos) = crate::nbtio::f64s::<3>(e.get("Pos")) {
+                    let _ = self.summon_entity(&src, &ty, pos, Some(e.clone()));
+                }
+            }
+        }
+        true
     }
 
     fn chunk_loaded_xz(&self, x: i32, z: i32) -> bool {
@@ -236,13 +327,68 @@ impl Server {
         Ok(1)
     }
 
+    /// `place structure <structure> [<pos>]`: start generated at the chunk of the position
+    /// (placement rules and biome ignored), every chunk of its box loaded, then placed.
     pub(crate) fn place_structure_cmd(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
-        let _ = (s, p, seg);
-        Err(Fail(tr!("commands.place.structure.failed")))
+        let id = args::id(&p.arg(seg, "structure").unwrap_or_default());
+        let pos = match p.arg(seg, "pos") {
+            Some(t) => args::block_pos(self, s, &t),
+            None => crate::mobs::mth::block_of(s.pos),
+        };
+        let Some((wd, dg)) = self.structured_gen() else { return Err(Fail(tr!("commands.place.structure.failed"))) };
+        if !dg.structures.as_ref().is_some_and(|sg| sg.defs.iter().any(|d| d.id == id)) {
+            return Err(Fail(tr!("commands.place.structure.invalid", id)));
+        }
+        let Some(st) = dg.structure_start_anywhere(&id, pos[0] >> 4, pos[2] >> 4) else {
+            return Err(Fail(tr!("commands.place.structure.failed")));
+        };
+        let bb = st.bbox;
+        let loaded = ((bb.min[0] >> 4)..=(bb.max[0] >> 4))
+            .all(|cx| ((bb.min[2] >> 4)..=(bb.max[2] >> 4)).all(|cz| self.chunk_loaded_xz(cx * 16, cz * 16)));
+        if !loaded {
+            return Err(Fail(tr!("argument.pos.unloaded")));
+        }
+        self.place_start_live(&wd, &dg, &st, false);
+        self.ok(s, tr!("commands.place.structure.success", id, pos[0], pos[1], pos[2]));
+        Ok(1)
     }
 
+    /// `place jigsaw <pool> <target> <max_depth> [<position>]`: assembly from the pool at the
+    /// position (its chunk loaded).
     pub(crate) fn place_jigsaw_cmd(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
-        let _ = (s, p, seg);
-        Err(Fail(tr!("commands.place.jigsaw.failed")))
+        let pool = args::id(&p.arg(seg, "pool").unwrap_or_default());
+        let target = args::id(&p.arg(seg, "target").unwrap_or_default());
+        let depth: i32 = p.arg(seg, "max_depth").and_then(|v| v.parse().ok()).unwrap_or(1);
+        let pos = match p.arg(seg, "position") {
+            Some(t) => args::block_pos(self, s, &t),
+            None => crate::mobs::mth::block_of(s.pos),
+        };
+        if !self.chunk_loaded_xz(pos[0], pos[2]) {
+            return Err(Fail(tr!("argument.pos.unloaded")));
+        }
+        match self.generate_jigsaw(&pool, &target, depth, pos, false) {
+            Some(true) => {
+                self.ok(s, tr!("commands.place.jigsaw.success", pos[0], pos[1], pos[2]));
+                Ok(1)
+            }
+            Some(false) => Err(Fail(tr!("commands.place.jigsaw.failed"))),
+            None => Err(Fail(tr!("commands.place.jigsaw.invalid", pool))),
+        }
+    }
+
+    /// Jigsaw assembly into the live world (command, jigsaw block): `None` for an unknown pool,
+    /// `Some(false)` if nothing could start.
+    pub(crate) fn generate_jigsaw(
+        &mut self,
+        pool: &str,
+        target: &str,
+        depth: i32,
+        pos: [i32; 3],
+        keep: bool,
+    ) -> Option<bool> {
+        let (wd, dg) = self.structured_gen()?;
+        dg.structures.as_ref()?.pools.get(pool)?;
+        let Some(st) = dg.jigsaw_start(pool, target, depth, pos) else { return Some(false) };
+        Some(self.place_start_live(&wd, &dg, &st, keep))
     }
 }

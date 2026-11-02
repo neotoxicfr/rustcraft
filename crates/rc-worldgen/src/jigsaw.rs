@@ -631,10 +631,14 @@ struct Pending {
 
 /// Start of a jigsaw structure (§ 8.1).
 pub fn generate(g: &mut GenStart, cfg: &JigsawCfg) -> Option<([i32; 3], Vec<Piece>)> {
+    let h = cfg.start_height.sample(&mut g.rng, g.hctx);
+    generate_from(g, cfg, [16 * g.cx, h, 16 * g.cz])
+}
+
+/// Assembly from a given start position (jigsaw block, `place jigsaw`): no height drawn.
+pub fn generate_from(g: &mut GenStart, cfg: &JigsawCfg, p: [i32; 3]) -> Option<([i32; 3], Vec<Piece>)> {
     let sg = g.sg;
     let (t, b) = (&*sg.templates, g.b);
-    let h = cfg.start_height.sample(&mut g.rng, g.hctx);
-    let p = [16 * g.cx, h, 16 * g.cz];
     let aliases = resolve_aliases(cfg, sg.seed, p);
     let (precalc, idx) = (crate::opt::jigsaw_precalc(), crate::opt::jigsaw_idx());
     let rot = Rot::from_index(g.rng.next_int_bounded(4));
@@ -702,7 +706,7 @@ pub fn generate(g: &mut GenStart, cfg: &JigsawCfg) -> Option<([i32; 3], Vec<Piec
 fn column_has_biome(g: &GenStart, x: i32, z: i32, y0: i32, y1: i32) -> bool {
     let mut qy = y0 >> 2;
     while qy <= y1 >> 2 {
-        if g.def.biomes.get(g.biome_at(x, qy << 2, z) as usize).copied().unwrap_or(false) {
+        if g.biome_ok(x, qy << 2, z) {
             return true;
         }
         qy += 1;

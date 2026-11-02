@@ -438,6 +438,19 @@ impl DimGen {
         }
     }
 
+    /// Start of the structure `id` at chunk (cx, cz), placement rules and biome ignored
+    /// (`place structure`); `None` without structures or if it cannot start there.
+    pub fn structure_start_anywhere(&self, id: &str, cx: i32, cz: i32) -> Option<crate::structure::Start> {
+        let (sg, t) = (self.structures.as_ref()?, self.structure_terrain()?);
+        sg.start_anywhere(id, cx, cz, t, &self.blocks)
+    }
+
+    /// Jigsaw assembly from a pool at a position (jigsaw block, `place jigsaw`).
+    pub fn jigsaw_start(&self, pool: &str, target: &str, depth: i32, pos: [i32; 3]) -> Option<crate::structure::Start> {
+        let (sg, t) = (self.structures.as_ref()?, self.structure_terrain()?);
+        sg.jigsaw_at(pool, target, depth, pos, t, &self.blocks)
+    }
+
     /// Structure starts of a chunk (empty without structures).
     pub fn structure_starts(&self, cx: i32, cz: i32) -> Arc<Vec<crate::structure::Start>> {
         match (&self.structures, self.structure_terrain()) {

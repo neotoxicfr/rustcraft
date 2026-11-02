@@ -2929,3 +2929,10 @@ on a quiet machine with the others).
   locked in a hash set; command-time only (no per-tick cost). Multi-core and GPU not applicable:
   ordered writes into the live world, like the game.
 - `clone` ticks: only the chunks of the source box are visited (`TickQueue::in_box`).
+- `place structure`, `place jigsaw`, jigsaw block: the chunks of the start's box plus a one-chunk
+  border are copied once into a grid, each chunk column is placed through a 3×3 window of that
+  grid (disjoint borrows, no copy per chunk), and the changes are written back once; lead not
+  taken: one copy of the 3×3 neighbourhood per chunk (9 copies per chunk instead of about 1).
+  Command-time only. Biome tests of the structure generators go through one helper (`biome_ok`):
+  a command placement skips the biome lookup altogether; world generation unchanged (equivalence
+  tests of the starts and placements pass with their stored fingerprints).
