@@ -854,7 +854,7 @@ impl Server {
         self.dims.won_game = false;
         self.life.vit.crit = Default::default(); // new player: criteria rewritten
         self.life.vit.impulse_reset(); // and no impulse context
-        self.post_effects_reset(); // G3-F08: screen effects not carried over to the new player
+        self.pdata.post_effects_dirty = true; // G3-F08: screen effects carried over, sent again
         let t = self.respawn_transition(false);
         self.change_dimension(t);
     }

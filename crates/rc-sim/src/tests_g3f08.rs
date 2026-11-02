@@ -171,7 +171,7 @@ fn compute_values_errors_and_messages() {
 }
 
 #[test]
-fn posteffect_kept_saved_sent_and_lost_on_respawn() {
+fn posteffect_kept_saved_sent_and_carried_over() {
     let mut t = open("posteffect");
     let mut f = Fails::default();
     // Joining: the list goes out once, even empty.
@@ -205,14 +205,26 @@ fn posteffect_kept_saved_sent_and_lost_on_respawn() {
     let r = run(&mut t.s, "posteffect clear @s");
     f.eq("clear empty", (r, last(&t).0), ((false, 0), "commands.posteffect.clear.failed".into()));
     f.eq("saved empty", t.s.player_nbt().get("post_effects").cloned(), Some(Nbt::List(Vec::new())));
-    // Respawn: the new player starts without effects, sent empty.
+    // Respawn and end of the credits: the new player inherits the list, sent again once.
     run(&mut t.s, "posteffect add @s minecraft:spider");
     t.s.post_effects_tick();
     let _ = sent(&t);
+    let spider = vec!["minecraft:spider".to_owned()];
     t.s.life.vit.dead = true;
     t.s.perform_respawn();
     t.s.post_effects_tick();
-    f.eq("respawn: list lost", (t.s.post_effects(), sent(&t)), (Vec::new(), vec![Vec::new()]));
+    t.s.post_effects_tick();
+    f.eq("respawn: list kept", (t.s.post_effects(), sent(&t)), (spider.clone(), vec![spider.clone()]));
+    t.s.respawn_after_credits();
+    t.s.post_effects_tick();
+    f.eq("credits: list kept", (t.s.post_effects(), sent(&t)), (spider.clone(), vec![spider.clone()]));
+    let r = run(&mut t.s, "posteffect list @s");
+    f.eq("list after respawn", r, (true, 1));
+    f.eq(
+        "saved after respawn",
+        t.s.player_nbt().get("post_effects").cloned(),
+        Some(Nbt::List(vec![Nbt::String("minecraft:spider".into())])),
+    );
     f.done();
 }
 
@@ -278,6 +290,72 @@ fn fetchprofile_entity_and_lookups() {
     f.eq("unknown name", (r, m.0), ((true, 1), "commands.fetchprofile.name.failure".into()));
     let (r, m) = ask(&mut t, "fetchprofile id 00000000-0000-0000-0000-000000001234");
     f.eq("id", (r, m.0), ((true, 1), "commands.fetchprofile.id.success".into()));
+    f.done();
+}
+
+/// `fetchprofile id` in bulk: every lookup answered by a pool of reused threads (no thread per
+/// request), and two loads of different profiles run at the same time (the cache lock is not
+/// held during the network access).
+#[test]
+fn fetchprofile_pool_reuses_threads_and_overlaps_loads() {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use std::sync::atomic::Ordering::SeqCst;
+    use std::time::{Duration, Instant};
+    static THREADS: Mutex<Option<HashSet<std::thread::ThreadId>>> = Mutex::new(None);
+    static A: AtomicBool = AtomicBool::new(false);
+    static B: AtomicBool = AtomicBool::new(false);
+    fn wait(flag: &AtomicBool) -> bool {
+        let end = Instant::now() + Duration::from_secs(3);
+        while !flag.load(SeqCst) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        flag.load(SeqCst)
+    }
+    let mut t = open("fetchpool");
+    let mut f = Fails::default();
+    t.s.cmd.s9.profiles.services = crate::commands::cmds_s9e::Services {
+        id_by_name: |_| None,
+        profile: |id| {
+            THREADS.lock().unwrap().get_or_insert_with(HashSet::new).insert(std::thread::current().id());
+            // Profiles 1 and 2 each wait for the load of the other.
+            let met = match id {
+                1 => {
+                    A.store(true, SeqCst);
+                    wait(&B)
+                }
+                2 => {
+                    B.store(true, SeqCst);
+                    wait(&A)
+                }
+                _ => true,
+            };
+            met.then(|| ProfileResult {
+                id,
+                name: format!("p{id}"),
+                properties: Vec::new(),
+                forced_name_change: false,
+                banned_skin: false,
+            })
+        },
+    };
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let n = 3 * cores + 8;
+    let _ = chats(&t);
+    for id in 1..=n {
+        run(&mut t.s, &format!("fetchprofile id 00000000-0000-0000-0000-{id:012x}"));
+    }
+    let mut answers = Vec::new();
+    let end = Instant::now() + Duration::from_secs(20);
+    while answers.len() < n && Instant::now() < end {
+        t.s.fetchprofile_poll();
+        answers.extend(chats(&t).iter().map(|c| key(c).to_owned()));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let ok = answers.iter().filter(|k| *k == "commands.fetchprofile.id.success").count();
+    f.eq("all answered", (answers.len(), ok), (n, if cores >= 2 { n } else { n - 1 }));
+    let used = THREADS.lock().unwrap().as_ref().map_or(0, HashSet::len);
+    f.eq("threads reused", used <= cores, true);
     f.done();
 }
 
@@ -356,8 +434,24 @@ fn enchant_ride_datapack_debug_spectate() {
     let _ = chats(&t);
     let r = run(&mut t.s, &format!("enchant {z} minecraft:sharpness 2"));
     f.eq("enchant a zombie", (r, last(&t).0), ((true, 1), "commands.enchant.success.single".into()));
-    // Ride on a marker: refused, rider and vehicle named.
+    // A mannequin is living: empty hand, then its own hand enchanted; a marker is not living.
+    run(&mut t.s, "summon minecraft:mannequin 3 100 3");
+    let mq = "@e[type=minecraft:mannequin,limit=1]";
+    let _ = chats(&t);
+    let r = run(&mut t.s, &format!("enchant {mq} minecraft:sharpness"));
+    f.eq("mannequin empty hand", (r, last(&t).0), ((false, 0), "commands.enchant.failed.itemless".into()));
+    run(&mut t.s, &format!("item replace entity {mq} weapon.mainhand with minecraft:iron_sword"));
+    run(&mut t.s, &format!("item replace entity {mq} armor.body with minecraft:diamond_horse_armor"));
+    let _ = chats(&t);
+    let r = run(&mut t.s, &format!("enchant {mq} minecraft:sharpness"));
+    f.eq("mannequin hand", (r, last(&t).0), ((true, 1), "commands.enchant.success.single".into()));
+    let body = run(&mut t.s, &format!("execute if items entity {mq} armor.body minecraft:diamond_horse_armor"));
+    f.eq("mannequin body slot", body.0, true);
     run(&mut t.s, "summon minecraft:marker 1 100 1");
+    let _ = chats(&t);
+    let r = run(&mut t.s, "enchant @e[type=minecraft:marker,limit=1] minecraft:sharpness");
+    f.eq("marker not living", (r, last(&t).0), ((false, 0), "commands.enchant.failed.entity".into()));
+    // Ride on a marker: refused, rider and vehicle named.
     let _ = chats(&t);
     let r = run(&mut t.s, "ride @s mount @e[type=minecraft:marker,limit=1]");
     let (k, a) = last(&t);
@@ -426,4 +520,32 @@ fn bench_g3f08_providers_and_hooks() {
         black_box(&mut t.s).fetchprofile_poll();
     }
     eprintln!("idle tick hooks: {:.2} ns", t0.elapsed().as_nanos() as f64 / f64::from(n));
+    // `fetchprofile id` in bursts (instant fake services): cost of issuing on the server thread,
+    // then time until every answer is read.
+    t.s.cmd.s9.profiles.services = crate::commands::cmds_s9e::Services {
+        id_by_name: |_| None,
+        profile: |id| {
+            Some(ProfileResult { id, name: "p".into(), properties: Vec::new(), forced_name_change: false, banned_skin: false })
+        },
+    };
+    let burst = 2000usize;
+    for pass in 0..2 {
+        let cmds: Vec<String> =
+            (0..burst).map(|i| format!("fetchprofile id 00000000-0000-0000-0001-{:012x}", pass * burst + i)).collect();
+        let t0 = Instant::now();
+        for c in &cmds {
+            run(&mut t.s, c);
+        }
+        let issue = t0.elapsed();
+        let mut got = 0;
+        while got < burst && t0.elapsed().as_secs() < 30 {
+            t.s.fetchprofile_poll();
+            got += chats(&t).len();
+        }
+        eprintln!(
+            "fetchprofile burst {pass}: issue {:.2} us/command, all {got} answered in {:.1} ms",
+            issue.as_nanos() as f64 / burst as f64 / 1000.0,
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+    }
 }

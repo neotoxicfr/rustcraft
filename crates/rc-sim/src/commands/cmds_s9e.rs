@@ -3,7 +3,7 @@
 //! services, or carried by a player or a mannequin).
 
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -51,19 +51,27 @@ struct Cache {
 const CACHE_TTL: Duration = Duration::from_secs(600);
 const CACHE_MAX: usize = 256;
 
+type Entries<K> = HashMap<K, (Instant, Option<ProfileResult>)>;
+
+/// Cached entry of `key` in the map `pick` selects, loaded on a miss. The lock is released
+/// during the load (network access), so the workers do not wait on each other.
 fn cached<K: std::hash::Hash + Eq + Clone>(
-    map: &mut HashMap<K, (Instant, Option<ProfileResult>)>,
+    cache: &Mutex<Cache>,
+    pick: fn(&mut Cache) -> &mut Entries<K>,
     key: &K,
     load: impl FnOnce() -> Option<ProfileResult>,
 ) -> Option<ProfileResult> {
+    let lock = || cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let now = Instant::now();
-    if let Some((at, v)) = map.get_mut(key)
+    if let Some((at, v)) = pick(&mut lock()).get_mut(key)
         && now.duration_since(*at) < CACHE_TTL
     {
         *at = now;
         return v.clone();
     }
     let v = load();
+    let mut c = lock();
+    let map = pick(&mut c);
     map.insert(key.clone(), (now, v.clone()));
     if map.len() > CACHE_MAX
         && let Some(old) = map.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone())
@@ -94,6 +102,8 @@ pub struct Profiles {
     pub services: Services,
     cache: Arc<Mutex<Cache>>,
     pending: Vec<Pending>,
+    /// Queue of the workers, started with the first lookup.
+    jobs: Option<Sender<Job>>,
 }
 
 /// Name accepted by the profile lookup: 16 characters at most, none of them a space or a
@@ -118,39 +128,43 @@ fn network_id_by_name(name: &str) -> Option<u128> {
 /// Lookup on a worker thread: by identifier; by name, the name's identifier (lowercased; an
 /// unknown name gets its offline identifier, looked up all the same), then by identifier.
 fn resolve(services: Services, cache: &Mutex<Cache>, ask: &Ask) -> Option<ProfileResult> {
-    let by_id = |id: u128| {
-        let mut c = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        cached(&mut c.by_id, &id, || (services.profile)(id))
-    };
+    let by_id = |id: u128| cached(cache, |c| &mut c.by_id, &id, || (services.profile)(id));
     match ask {
         Ask::Id(id) => by_id(*id),
-        Ask::Name(name) => {
-            if !valid_player_name(name) {
-                return None;
-            }
-            let load = || {
-                let lower = name.to_ascii_lowercase();
-                let id = (services.id_by_name)(&lower).unwrap_or_else(|| rc_client::offline_uuid(&lower));
-                by_id(id)
-            };
-            // The name entry is read without holding the lock during the network access.
-            let hit = {
-                let mut c = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                c.by_name.get_mut(name).filter(|(at, _)| at.elapsed() < CACHE_TTL).map(|(at, v)| {
-                    *at = Instant::now();
-                    v.clone()
-                })
-            };
-            match hit {
-                Some(v) => v,
-                None => {
-                    let v = load();
-                    let mut c = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    cached(&mut c.by_name, name, || v)
-                }
-            }
-        }
+        Ask::Name(name) if !valid_player_name(name) => None,
+        Ask::Name(name) => cached(cache, |c| &mut c.by_name, name, || {
+            let lower = name.to_ascii_lowercase();
+            let id = (services.id_by_name)(&lower).unwrap_or_else(|| rc_client::offline_uuid(&lower));
+            by_id(id)
+        }),
     }
+}
+
+/// Lookup handed to the workers: services to use, request, where to answer.
+type Job = (Services, Ask, Sender<Option<ProfileResult>>);
+
+/// Workers serving the lookups (the game reuses idle threads of an I/O pool), one per
+/// logical core: started with the first lookup, they share one queue and stop when the queue
+/// is dropped.
+fn start_workers(cache: &Arc<Mutex<Cache>>) -> Option<Sender<Job>> {
+    let (tx, rx) = channel::<Job>();
+    let rx = Arc::new(Mutex::new(rx));
+    let mut started = false;
+    for _ in 0..std::thread::available_parallelism().map_or(1, |n| n.get()) {
+        let (rx, cache) = (rx.clone(), cache.clone());
+        started |= std::thread::Builder::new()
+            .name("rc-fetchprofile".into())
+            .spawn(move || {
+                loop {
+                    // The queue lock is released once a job is taken.
+                    let job = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).recv();
+                    let Ok((services, ask, reply)) = job else { break };
+                    let _ = reply.send(resolve(services, &cache, &ask));
+                }
+            })
+            .is_ok();
+    }
+    started.then_some(tx)
 }
 
 /// Stored form of a resolved profile: identifier (4 integers), name, properties if any.
@@ -244,13 +258,6 @@ impl Server {
 
     fn set_post_effects(&mut self, list: Vec<String>) {
         crate::nbtio::set(&mut self.pdata.root, "post_effects", Nbt::List(list.into_iter().map(Nbt::String).collect()));
-        self.pdata.post_effects_dirty = true;
-    }
-
-    /// New player (respawn, return from the End): the game does not carry the list over, the
-    /// effects disappear and the empty list goes out at the next tick.
-    pub(crate) fn post_effects_reset(&mut self) {
-        crate::nbtio::remove(&mut self.pdata.root, "post_effects");
         self.pdata.post_effects_dirty = true;
     }
 
@@ -368,17 +375,13 @@ impl Server {
                 return Ok(1);
             }
         };
+        let pr = &mut self.cmd.s9.profiles;
+        if pr.jobs.is_none() {
+            pr.jobs = start_workers(&pr.cache);
+        }
         let (tx, rx) = channel();
-        let (services, cache) = (self.cmd.s9.profiles.services, self.cmd.s9.profiles.cache.clone());
-        let job = ask.clone();
-        let spawned = std::thread::Builder::new()
-            .name("rc-fetchprofile".into())
-            .spawn(move || {
-                let _ = tx.send(resolve(services, &cache, &job));
-            })
-            .is_ok();
-        if spawned {
-            self.cmd.s9.profiles.pending.push(Pending { src: s.clone(), ask, rx });
+        if pr.jobs.as_ref().is_some_and(|q| q.send((pr.services, ask.clone(), tx)).is_ok()) {
+            pr.pending.push(Pending { src: s.clone(), ask, rx });
         }
         Ok(1)
     }

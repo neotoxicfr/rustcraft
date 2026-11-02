@@ -464,15 +464,16 @@ impl Server {
         let mut t: Track<Component> = Track::default();
         let mut others = Vec::new();
         for e in &targets {
-            // Item in the main hand of any living entity (player, mob, armor stand).
-            let slot = self.entity_slot_range(*e, "weapon.mainhand").first().copied();
-            let Some(slot) = slot.filter(|_| self.ent_is_living(*e)) else {
+            // Item in the main hand of any living entity (player, mob, armor stand, mannequin);
+            // a living entity whose hand is not modelled reads as empty-handed.
+            if !self.ent_is_living(*e) {
                 if single {
                     return Err(Fail(tr!("commands.enchant.failed.entity", plain(&self.ent_display(*e)))));
                 }
                 continue;
-            };
-            let Some(mut st) = self.slot_get(slot) else {
+            }
+            let slot = self.entity_slot_range(*e, "weapon.mainhand").first().copied();
+            let Some((slot, mut st)) = slot.and_then(|sl| Some((sl, self.slot_get(sl)?))) else {
                 if single {
                     let name = if *e == E::Player { self.player_display_name() } else { self.ent_display(*e) };
                     return Err(Fail(tr!("commands.enchant.failed.itemless", plain(&name))));

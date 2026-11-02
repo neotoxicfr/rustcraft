@@ -2926,8 +2926,18 @@ on a quiet machine with the others).
   per event, the order of the draws is the game's).
 - Per-tick hooks: screen effects sent only when changed (one flag), profile answers polled only
   when a lookup is pending: 2.9 ns per tick together when idle (same bench, 10,000,000 calls).
-- `/fetchprofile name|id`: network lookups on a worker thread (never the server thread), cached
-  10 minutes per name and per identifier (256 entries each, failures included) like the game;
+- `/fetchprofile name|id`: network lookups on worker threads (never the server thread), cached
+  10 minutes per name and per identifier (256 entries each, failures included) like the game.
+  Review fix: one thread per lookup at first; now a pool started with the first lookup (one
+  worker per logical core, one shared queue; the game reuses the idle threads of an unbounded
+  I/O pool) and the cache lock is released during the network access (it was held, so lookups
+  of different profiles waited on each other). Same bench, bursts of 2,000 `fetchprofile id`
+  with instant fake services, 2 passes per version alternated: issuing on the server thread
+  16.7-17.4 µs → 1.9-2.8 µs per command, whole burst answered 53.4-55.7 ms → 7.7-11.7 ms.
+  Memory: the idle workers keep their stacks reserved (address space, a few committed pages
+  each) instead of up to one transient thread per pending lookup. Answers still read at a
+  following tick on the server thread: nothing observable changes but the order in which
+  simultaneous lookups finish, which the network decides in the game as well.
   `/compute`, `/posteffect`, `/attribute`, `/loot`, `/enchant`, `/ride`, `/datapack`, `/spectate`:
   command code, no hot path. Attribute base reset builds one mob of the species to read its
   construction default (once per command). Player save: one key check (`post_effects`).

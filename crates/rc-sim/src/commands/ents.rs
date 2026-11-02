@@ -740,7 +740,11 @@ impl Server {
         match e {
             E::Player | E::Mob(_) => true,
             E::Item(_) | E::Orb(_) => false,
-            E::Other(i) => self.other(i).is_some_and(|n| n.get("Health").is_some()),
+            // Living by its type (a summoned stand or mannequin carries no `Health` yet).
+            E::Other(i) => {
+                matches!(self.ent_type(e).as_str(), "minecraft:armor_stand" | "minecraft:mannequin")
+                    || self.other(i).is_some_and(|n| n.get("Health").is_some())
+            }
         }
     }
 

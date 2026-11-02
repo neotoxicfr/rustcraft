@@ -84,8 +84,8 @@ impl Server {
                 "minecraft:item_frame" | "minecraft:glow_item_frame" => {
                     ids.filter(|&id| id == 0).map(|_| Slot::Nbt(e, "Item", None)).collect()
                 }
-                // Living entity in the game: same equipment slots as a mob.
-                "minecraft:armor_stand" => {
+                // Living entities in the game: same equipment slots as a mob.
+                "minecraft:armor_stand" | "minecraft:mannequin" => {
                     ids.filter_map(equipment_index).map(|k| Slot::Nbt(e, "equipment", Some(EQUIP_KEYS[k]))).collect()
                 }
                 _ => Vec::new(),
@@ -291,10 +291,13 @@ impl Server {
             Some(7) => 7,
             _ => 0,
         };
-        // Armor stand: neither body nor saddle, nor a disabled slot. Mobs: every slot (the
-        // species that refuse the saddle or the body armor to the young are not modelled here).
+        // Armor stand: neither body nor saddle, nor a disabled slot. Mobs and mannequins: every
+        // slot (the species that refuse the saddle or the body armor to the young are not
+        // modelled here).
         let usable = match e {
-            E::Other(_) => k < 6 && !crate::decoration::stand::is_disabled(&self.ent_nbt(e), k),
+            E::Other(_) if self.ent_type(e) == "minecraft:armor_stand" => {
+                k < 6 && !crate::decoration::stand::is_disabled(&self.ent_nbt(e), k)
+            }
             _ => true,
         };
         if usable { k } else { 0 }
