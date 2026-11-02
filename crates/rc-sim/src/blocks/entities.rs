@@ -98,6 +98,58 @@ pub(crate) fn chunk_be_order(at: &[P]) -> Vec<usize> {
     table.iter().rev().flatten().copied().collect()
 }
 
+/// Block entity saved "packed" (`keepPacked` set): never promoted by its chunk yet.
+fn is_packed(b: &Nbt) -> bool {
+    b.get("keepPacked").and_then(Nbt::as_i64).is_some_and(|v| v != 0)
+}
+
+/// L9-TICK: order in which the game promotes the "packed" block entities of a chunk (`keepPacked`
+/// set: saved before the chunk ever ticked). They wait in a chained hash table keyed by position
+/// (16 buckets at first, doubled past 3/4 full, and doubled when a bucket would hold a ninth entry
+/// below 64 buckets; bucket = position hash folded on its high half), filled in the order of the
+/// chunk's list and walked bucket by bucket, each in insertion order. `at`: positions in list
+/// order; returns indices into `at`, a repeated position keeping its first place. Not modelled:
+/// the order inside a bucket of nine entries or more at 64 buckets and beyond (never seen in a
+/// chunk's list).
+pub(crate) fn java_hash_order(at: &[P]) -> Vec<usize> {
+    fn spread(p: P) -> usize {
+        let h = p[1].wrapping_add(p[2].wrapping_mul(31)).wrapping_mul(31).wrapping_add(p[0]) as u32;
+        (h ^ (h >> 16)) as usize
+    }
+    let mut keys: Vec<usize> = Vec::with_capacity(at.len());
+    let mut seen: hashbrown::HashSet<P> = hashbrown::HashSet::with_capacity(at.len());
+    let mut cap = 16usize;
+    // Entries per bucket at the current size (recounted when the table grows).
+    let mut fill = vec![0u32; cap];
+    for (i, &p) in at.iter().enumerate() {
+        if !seen.insert(p) {
+            continue; // same position: its value is replaced in place
+        }
+        let bucket = spread(p) & (cap - 1);
+        let before = fill[bucket];
+        fill[bucket] += 1;
+        keys.push(i);
+        let mut grown = false;
+        if before >= 8 && cap < 64 {
+            cap *= 2; // long bucket: the table grows instead
+            grown = true;
+        }
+        if keys.len() > cap * 3 / 4 {
+            cap *= 2;
+            grown = true;
+        }
+        if grown {
+            fill.clear();
+            fill.resize(cap, 0);
+            for &k in &keys {
+                fill[spread(at[k]) & (cap - 1)] += 1;
+            }
+        }
+    }
+    keys.sort_by_key(|&k| spread(at[k]) & (cap - 1));
+    keys
+}
+
 /// Entity simulated by the block behaviours.
 #[derive(Debug, Clone)]
 pub(crate) struct SimEntity {
@@ -1576,19 +1628,71 @@ impl Server {
     /// generated chunk).
     pub(crate) fn register_chunk_tickers(&mut self, ch: (i32, i32)) {
         let Some(Some(c)) = self.chunks.get(&ch) else { return };
-        let found: Vec<(P, LoadedBe)> = c
-            .block_entities
-            .iter()
-            .map(|b| {
-                let i = |k: &str| crate::nbtio::int(b, k).unwrap_or(0) as i32;
-                let id = b.get("id").and_then(Nbt::as_str).unwrap_or("");
-                ([i("x"), i("y"), i("z")], LoadedBe::of(id, i("TransferCooldown")))
-            })
-            .collect();
+        let mut found: Vec<(P, LoadedBe)> = Vec::with_capacity(c.block_entities.len());
+        let mut packed: Vec<P> = Vec::new();
+        for b in &c.block_entities {
+            // One pass over the fields (before: one search per field read).
+            let Nbt::Compound(fields) = b else { continue };
+            let (mut p, mut id, mut cooldown, mut keep) = ([0; 3], "", 0, false);
+            let int = |v: &Nbt| v.as_i64().unwrap_or(0) as i32;
+            for (k, v) in fields {
+                match k.as_str() {
+                    "x" => p[0] = int(v),
+                    "y" => p[1] = int(v),
+                    "z" => p[2] = int(v),
+                    "id" => id = v.as_str().unwrap_or(""),
+                    "TransferCooldown" => cooldown = int(v),
+                    "keepPacked" => keep = int(v) != 0,
+                    _ => {}
+                }
+            }
+            if keep {
+                packed.push(p);
+            } else {
+                found.push((p, LoadedBe::of(id, cooldown)));
+            }
+        }
         let at: Vec<P> = found.iter().map(|f| f.0).collect();
         for k in chunk_be_order(&at) {
             let (p, be) = found[k];
             self.register_loaded_ticker(p, be);
+        }
+        // L9-TICK: the packed ones wait for the chunk to tick (before, registered with the rest).
+        if !packed.is_empty() {
+            let order: Vec<P> = java_hash_order(&packed).into_iter().map(|k| packed[k]).collect();
+            self.bs.packed.insert(ch, order);
+        }
+        self.promote_packed_near(ch);
+    }
+
+    /// L9-TICK: chunks around `ch` (itself included) holding packed block entities and whose
+    /// 3 × 3 neighbourhood is now loaded: the chunk can tick, so like the game it promotes them,
+    /// in the order of their table, after every block entity registered so far; promoted, a
+    /// block entity is saved unpacked.
+    fn promote_packed_near(&mut self, ch: (i32, i32)) {
+        if self.bs.packed.is_empty() {
+            return;
+        }
+        let loaded = |s: &Self, c: (i32, i32)| matches!(s.chunks.get(&c), Some(Some(_)));
+        for c in (-1..=1).flat_map(|dx| (-1..=1).map(move |dz| (ch.0 + dx, ch.1 + dz))) {
+            if !self.bs.packed.contains_key(&c)
+                || !(-1..=1).all(|dx| (-1..=1).all(|dz| loaded(self, (c.0 + dx, c.1 + dz))))
+            {
+                continue;
+            }
+            for p in self.bs.packed.remove(&c).unwrap_or_default() {
+                let Some(Some(chunk)) = self.chunks.get_mut(&c) else { break };
+                let pos_of = |b: &Nbt| {
+                    let i = |k: &str| crate::nbtio::int(b, k).unwrap_or(0) as i32;
+                    [i("x"), i("y"), i("z")] == p
+                };
+                // Still the packed entry (a block entity put there since then registered its own).
+                let Some(b) = chunk.block_entities.iter_mut().find(|b| pos_of(b) && is_packed(b)) else { continue };
+                crate::nbtio::set(b, "keepPacked", Nbt::Byte(0));
+                let id = b.get("id").and_then(Nbt::as_str).unwrap_or("");
+                let be = LoadedBe::of(id, crate::nbtio::int(b, "TransferCooldown").unwrap_or(0) as i32);
+                self.register_loaded_ticker(p, be);
+            }
         }
     }
 

@@ -787,10 +787,17 @@ impl Server {
         }
     }
 
-    /// Disappears if its player is dead (rule), otherwise thrown item.
+    /// Disappears if its player (host or guest) is dead (rule), otherwise thrown item.
     pub(crate) fn pearl_tick(&mut self, p: &mut Proj) {
-        if p.owner == Some(self.uuid) && self.life.vit.dead && self.rule("minecraft:ender_pearls_vanish_on_death", true)
-        {
+        let dead = p.owner.is_some_and(|o| {
+            if o == self.uuid {
+                return self.life.vit.dead;
+            }
+            self.lan
+                .as_ref()
+                .is_some_and(|l| l.guests.iter().any(|g| g.ctx.as_ref().is_some_and(|c| c.uuid == o && c.vit.dead)))
+        });
+        if dead && self.rule("minecraft:ender_pearls_vanish_on_death", true) {
             p.removed = true;
             return;
         }

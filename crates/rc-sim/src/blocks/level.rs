@@ -105,6 +105,9 @@ pub(crate) struct Sim {
     pub be_ticks: HashMap<P, (u64, BeTick)>,
     /// G5-F10: brushings in progress of suspicious blocks (not saved, as in the game).
     pub brushing: HashMap<P, crate::brush::Brushing>,
+    /// L9-TICK: packed block entities of the loaded chunks (positions, in promotion order),
+    /// waiting for their chunk's neighbours to be loaded.
+    pub packed: HashMap<(i32, i32), Vec<P>>,
 }
 
 /// Kept state of a ticking block entity (G6-F01).
@@ -174,6 +177,7 @@ impl Sim {
             shulkers: HashMap::new(),
             be_ticks: HashMap::new(),
             brushing: HashMap::new(),
+            packed: HashMap::new(),
         }
     }
 }

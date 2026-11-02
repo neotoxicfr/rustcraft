@@ -278,6 +278,8 @@ pub(crate) struct Ids {
     pub potted_closed_eyeblossom: u16,
     pub cauldron: u16,
     pub water_cauldron: u16,
+    pub lava_cauldron: u16,
+    pub powder_snow_cauldron: u16,
     pub mud: u16,
     pub clay: u16,
 }
@@ -683,6 +685,8 @@ impl Table {
             potted_closed_eyeblossom: f("potted_closed_eyeblossom"),
             cauldron: f("cauldron"),
             water_cauldron: f("water_cauldron"),
+            lava_cauldron: f("lava_cauldron"),
+            powder_snow_cauldron: f("powder_snow_cauldron"),
             mud: f("mud"),
             clay: f("clay"),
         };

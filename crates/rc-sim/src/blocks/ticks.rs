@@ -212,10 +212,13 @@ impl Server {
         crate::server::phase("scheduled");
         self.bs.handling_tick = true;
         let now = self.time;
+        // L9-TICK: the pearl tickets created during the previous tick apply (between two ticks).
+        self.proj.pearl_tickets_apply();
         // 7. Scheduled ticks of blocks then of fluids.
         let chunks: HashSet<(i32, i32)> = self.chunks.iter().filter(|(_, c)| c.is_some()).map(|(k, _)| *k).collect();
         // Ticking chunks: loaded neighbours AND within a player's simulation range (or
-        // force-loaded); chunks visited then left no longer grow.
+        // force-loaded, or a pearl's or the dragon fight's ticket); chunks visited then left no
+        // longer grow.
         let centers = self.sim_centers();
         let simulated: HashSet<(i32, i32)> =
             chunks.iter().copied().filter(|&c| self.chunk_simulated(c, &centers)).collect();
@@ -241,8 +244,14 @@ impl Server {
         #[cfg(test)]
         let mut spent = t.elapsed();
         if world {
-            // 8. Raids; 9. chunk source: the spawning chunks first (thunder, natural spawns).
+            // 8. Raids.
             self.raids_tick();
+        }
+        // 9. Chunk source: purge of the expired tickets first (L9-TICK: a pearl's ticket
+        // stops counting from here, its chunks no longer simulated for the rest of the tick).
+        self.proj.pearl_tickets_purge();
+        if world {
+            // Then the spawning chunks (thunder, natural spawns).
             self.natural_spawn_tick();
         }
         #[cfg(test)]
@@ -509,10 +518,13 @@ impl Server {
 
     /// Resumption of the saved ticks of a chunk that has just been loaded.
     pub(crate) fn import_chunk_ticks(&mut self, ch: (i32, i32)) {
+        // L9-TICK: marked once the chunk is there. Before, a chunk missing from the disk was
+        // marked when it was put into generation, so the generated chunk never resumed its ticks
+        // nor registered its block entities' tickers (a dungeon's spawner, a village's bell).
+        let Some(Some(c)) = self.chunks.get(&ch) else { return };
         if !self.bs.imported.insert(ch) {
             return;
         }
-        let Some(Some(c)) = self.chunks.get(&ch) else { return };
         let mut todo: Vec<(bool, Nbt)> = Vec::new();
         for (key, fluid) in [("block_ticks", false), ("fluid_ticks", true)] {
             if let Some(Nbt::List(l)) = c.root.get(key) {

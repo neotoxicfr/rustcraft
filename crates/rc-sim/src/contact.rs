@@ -16,11 +16,7 @@
 //! - cobweb: slowdown 0.25 × 0.05 × 0.25, or 0.5 × 0.25 × 0.5 under the Weaving effect;
 //! - wither rose (living entities, not on Peaceful difficulty, entity not invulnerable):
 //!   Wither 40 ticks;
-//! - cauldrons, only if the box touches the contents (column 12 px wide from 4 px up to the
-//!   level): lava = thaw, ignition 15 s then lava damage; water and powder snow = the burning
-//!   entity lowers the level (snow becomes water) then is extinguished. These deferred effects
-//!   run after the walk, in the game's order: thaw, ignition by lava (then its damage),
-//!   extinguishing.
+//! - cauldrons: in the crossed-block pass (`inside_blocks`), whose deferred effects they share.
 //!
 //! Boots: Frost Walker (frosted ice disc on water, immunity to hot-floor damage) and Soul
 //! Speed (speed and movement efficiency on soul sand and soul soil, wear, particles and
@@ -40,9 +36,6 @@ pub(crate) const TRIPWIRE: u8 = 2;
 const BERRY: u8 = 3;
 const WEB: u8 = 4;
 const WITHER_ROSE: u8 = 5;
-const LAVA_CAULDRON: u8 = 6;
-const WATER_CAULDRON: u8 = 7;
-const SNOW_CAULDRON: u8 = 8;
 /// Fire, lava and wooden button (pressed by arrows): projectile effects only (living entities
 /// are handled elsewhere).
 pub(crate) const FIRE: u8 = 9;
@@ -57,9 +50,6 @@ fn kind_of(name: &str) -> u8 {
         "sweet_berry_bush" => BERRY,
         "cobweb" => WEB,
         "wither_rose" => WITHER_ROSE,
-        "lava_cauldron" => LAVA_CAULDRON,
-        "water_cauldron" => WATER_CAULDRON,
-        "powder_snow_cauldron" => SNOW_CAULDRON,
         "fire" | "soul_fire" => FIRE,
         "lava" => LAVA,
         _ if n.ends_with("pressure_plate") => PLATE,
@@ -117,13 +107,6 @@ pub struct Contact {
     pub(crate) orb_buckets: Vec<Vec<u32>>,
     /// Player's boots.
     pub(crate) player: Boots,
-}
-
-/// Deferred effects of a walk.
-#[derive(Default)]
-struct Deferred {
-    lava: u8,
-    quench: Vec<(P, u32)>,
 }
 
 /// A cell seen by the walk of a movement and the segment (start, end) that saw it: the shape
@@ -278,11 +261,6 @@ fn walk(a: [f64; 3], b: [f64; 3], half: f64, h: f64, max: i32, out: &mut Vec<See
     last + 1
 }
 
-/// Height of the cauldron contents (in blocks): lava 15 px, levels 6 + 3n px.
-fn content_top(kind: u8, level: i32) -> f64 {
-    if kind == LAVA_CAULDRON { 15.0 / 16.0 } else { (6.0 + 3.0 * f64::from(level)) / 16.0 }
-}
-
 /// The box (half-width `half`, height `h`, feet at `from`) moved axis by axis up to `to`
 /// intersects the shape `c`, segment by segment in the order of `path_cells` (a segment
 /// follows a single axis: its envelope is the swept area), margin of 1e-7 like the game.
@@ -334,15 +312,8 @@ fn contact_pal_mobs() -> bool {
     *ON.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_CONTACTPAL_MOBS") == Some("1"))
 }
 
-/// Families that act on a mob.
-const MOB_KINDS: u32 = 1 << PLATE
-    | 1 << TRIPWIRE
-    | 1 << BERRY
-    | 1 << WEB
-    | 1 << WITHER_ROSE
-    | 1 << LAVA_CAULDRON
-    | 1 << WATER_CAULDRON
-    | 1 << SNOW_CAULDRON;
+/// Families that act on a mob (cauldrons: in the crossed-block pass, `inside_blocks`).
+const MOB_KINDS: u32 = 1 << PLATE | 1 << TRIPWIRE | 1 << BERRY | 1 << WEB | 1 << WITHER_ROSE;
 
 /// Cells (bounds included) of the envelope of the box (half-width `half`, height `h`) moved
 /// from `from` to `to`: any walk of this path stays inside.
@@ -350,13 +321,6 @@ pub(crate) fn envelope(from: [f64; 3], to: [f64; 3], half: f64, h: f64) -> (P, P
     let lo = [from[0].min(to[0]) - half, from[1].min(to[1]), from[2].min(to[2]) - half];
     let hi = [from[0].max(to[0]) + half, from[1].max(to[1]) + h, from[2].max(to[2]) + half];
     (lo.map(|v| v.floor() as i32), hi.map(|v| v.floor() as i32))
-}
-
-/// The swept box touches the contents of the cauldron at `p` (12 px column from 4 px).
-fn touches_content(p: P, top: f64, from: [f64; 3], to: [f64; 3], half: f64, h: f64) -> bool {
-    let [x, y, z] = p.map(f64::from);
-    let c = Aabb { min: [x + 0.125, y + 0.25, z + 0.125], max: [x + 0.875, y + top, z + 0.875] };
-    swept_touches(&c, from, to, half, h)
 }
 
 impl Server {
@@ -475,7 +439,6 @@ impl Server {
         entered.clear();
         let ignores = m.kind == Kind::Bat;
         self.contact.ticking = Some((m.id, m.bbox(), ignores));
-        let mut fx = Deferred::default();
         for &(p, a, b) in &cells {
             if !m.alive() {
                 break;
@@ -505,45 +468,12 @@ impl Server {
                     entered.push(p);
                     self.give_mob_effect(m, "minecraft:wither", 40, 0);
                 }
-                LAVA_CAULDRON | WATER_CAULDRON | SNOW_CAULDRON => {
-                    let top = content_top(k, self.v().get_int(s, "level"));
-                    if touches_content(p, top, a, b, half, h) {
-                        entered.push(p);
-                        if k == LAVA_CAULDRON {
-                            fx.lava += 1;
-                        } else {
-                            fx.quench.push((p, s));
-                        }
-                    }
-                }
                 _ => {}
             }
         }
         self.contact.ticking = None;
         self.contact.cells = cells;
         self.contact.entered = entered;
-        if fx.lava > 0 {
-            m.ticks_frozen = 0; // thaw
-            let immune = m.kind.info().fire_immune || crate::mobs::recent::fire_immune(m);
-            if !immune {
-                m.fire = m.fire.max(300);
-                for _ in 0..fx.lava {
-                    if self.mob_hurt(m, "minecraft:lava", 4.0, None, None) && !m.x.silent {
-                        let pitch = 2.0 + m.rng.next_float() * 0.4;
-                        self.mob_sound(m, "minecraft:entity.generic.burn", 0.4, pitch);
-                    }
-                }
-            }
-        }
-        if !fx.quench.is_empty() {
-            let immune = m.kind.info().fire_immune || crate::mobs::recent::fire_immune(m);
-            for &(p, s) in &fx.quench {
-                if m.fire > 0 && !immune {
-                    self.cauldron_quench(p, s);
-                }
-            }
-            m.fire = m.fire.min(0);
-        }
     }
 
     /// Blocks crossed by the player during the tick (its known movement; plates and tripwire
@@ -560,8 +490,7 @@ impl Server {
         let cells = self.contact_cells(from, to, half, h, false);
         let mut entered = std::mem::take(&mut self.contact.entered);
         entered.clear();
-        let mut fx = Deferred::default();
-        for &(p, a, b) in &cells {
+        for &(p, _, _) in &cells {
             if self.life.vit.dead {
                 break;
             }
@@ -583,46 +512,17 @@ impl Server {
                     entered.push(p);
                     self.give_player_effect("minecraft:wither", 40, 0);
                 }
-                LAVA_CAULDRON | WATER_CAULDRON | SNOW_CAULDRON => {
-                    let top = content_top(kind, self.v().get_int(s, "level"));
-                    if touches_content(p, top, a, b, half, h) {
-                        entered.push(p);
-                        if kind == LAVA_CAULDRON {
-                            fx.lava += 1;
-                        } else {
-                            fx.quench.push((p, s));
-                        }
-                    }
-                }
                 _ => {}
             }
         }
         self.contact.cells = cells;
         self.contact.entered = entered;
-        if fx.lava > 0 {
-            self.life.vit.ticks_frozen = 0; // thaw
-            self.player_ignite(300);
-            for _ in 0..fx.lava {
-                if self.hurt("minecraft:lava", 4.0) {
-                    let pitch = 2.0 + self.life.rng.next_float() * 0.4;
-                    self.play_sound("minecraft:entity.generic.burn", 7, self.pos, 0.4, pitch);
-                }
-            }
-        }
-        if !fx.quench.is_empty() {
-            for &(p, s) in &fx.quench {
-                if self.life.vit.fire > 0 && self.may_interact(p) {
-                    self.cauldron_quench(p, s);
-                }
-            }
-            self.life.vit.fire = self.life.vit.fire.min(0);
-        }
     }
 
     /// Burning entity in a water or powder snow cauldron: one level less (the snow becomes
     /// water at the same level before lowering).
-    fn cauldron_quench(&mut self, p: P, s: u32) {
-        let s = if self.contact_kind(s) == SNOW_CAULDRON {
+    pub(crate) fn cauldron_quench(&mut self, p: P, s: u32) {
+        let s = if self.v().block(s) == self.bs.t.id.powder_snow_cauldron {
             let w = self.default_state("minecraft:water_cauldron");
             self.v().set_int(w, "level", self.v().get_int(s, "level"))
         } else {

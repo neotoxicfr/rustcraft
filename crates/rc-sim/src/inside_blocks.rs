@@ -2,10 +2,12 @@
 //! its movement of the tick:
 //! 1. cells swept by the box (shrunk by 1e-5) along each recorded movement,
 //!    axis by axis (vertical first, then the longest horizontal axis second);
-//! 2. effects of the blocks (fire, soul fire, cactus, lit campfire, powder snow) and of the
-//!    fluids (water, lava) touched: direct damage (cactus, campfire) falls during the
-//!    traversal, the others are grouped by step then applied in the fixed order of the types
-//!    (freezing, end of freezing, ignition by fire, ignition by lava, extinguishing);
+//! 2. effects of the blocks (fire, soul fire, cactus, lit campfire, powder snow, cauldrons
+//!    whose body or contents the swept box meets) and of the fluids (water, lava) touched:
+//!    direct damage (cactus, campfire) falls during the traversal, then the direct contacts
+//!    (`contact`: berries, cobweb, wither rose, plates, tripwire), the others are grouped by
+//!    step then applied in the fixed order of the types (freezing, end of freezing, ignition by
+//!    fire, ignition by lava, extinguishing), each with what runs before or after it;
 //! 3. rain at the feet or at the top of the box puts out; the extinguish sound plays if fire
 //!    or freezing stopped during the pass; with no fire and no ignition, the counter returns
 //!    to rest (−20 for the player, 0 for a mob).
@@ -338,6 +340,39 @@ enum Blk {
     /// Lit campfire: direct damage (1, soul 2).
     Campfire(f32),
     PowderSnow,
+    /// L9-TICK: water or powder snow cauldron entered (its state at the time of the pass):
+    /// extinguishes, after lowering its level if the entity burns.
+    Quench(u32),
+    /// L9-TICK: lava cauldron entered: like lava (thaw, ignition, damage).
+    LavaCauldron,
+}
+
+/// Shape a cauldron is entered by, in pixels (x0, y0, z0, x1, y1, z1): its body (the four legs,
+/// the floor, the walls) and its contents, a 12 px column from the floor (4 px) up to `top`.
+fn cauldron_inside(o: [f64; 3], top: f64, out: &mut [Aabb; 14]) {
+    const BODY: [[f64; 6]; 13] = [
+        [0.0, 0.0, 0.0, 2.0, 3.0, 4.0],
+        [2.0, 0.0, 0.0, 4.0, 3.0, 2.0],
+        [14.0, 0.0, 0.0, 16.0, 3.0, 4.0],
+        [12.0, 0.0, 0.0, 14.0, 3.0, 2.0],
+        [0.0, 0.0, 12.0, 2.0, 3.0, 16.0],
+        [2.0, 0.0, 14.0, 4.0, 3.0, 16.0],
+        [14.0, 0.0, 12.0, 16.0, 3.0, 16.0],
+        [12.0, 0.0, 14.0, 14.0, 3.0, 16.0],
+        [0.0, 3.0, 0.0, 16.0, 4.0, 16.0],
+        [0.0, 4.0, 0.0, 2.0, 16.0, 16.0],
+        [14.0, 4.0, 0.0, 16.0, 16.0, 16.0],
+        [2.0, 4.0, 0.0, 14.0, 16.0, 2.0],
+        [2.0, 4.0, 14.0, 14.0, 16.0, 16.0],
+    ];
+    let at = |b: [f64; 6]| Aabb {
+        min: [o[0] + b[0] / 16.0, o[1] + b[1] / 16.0, o[2] + b[2] / 16.0],
+        max: [o[0] + b[3] / 16.0, o[1] + b[4] / 16.0, o[2] + b[5] / 16.0],
+    };
+    for (slot, b) in out.iter_mut().zip(BODY) {
+        *slot = at(b);
+    }
+    out[13] = at([2.0, 4.0, 2.0, 14.0, top, 14.0]);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -370,6 +405,9 @@ enum Late {
     LavaHurt,
     /// Before extinguishing: powder snow melts under a burning entity.
     SnowMelt([i32; 3]),
+    /// Before extinguishing: a burning entity lowers the level of the water or powder snow
+    /// cauldron entered (state seen by the pass).
+    Quench([i32; 3], u32),
 }
 
 /// Effects of a step being collected.
@@ -382,7 +420,8 @@ struct Step {
     extinguish: bool,
     in_fire: Vec<f32>,
     lava_hurt: u32,
-    melt: Vec<[i32; 3]>,
+    /// Effects run before the extinguishing, in the order of the cells (snow melt, cauldron).
+    before_extinguish: Vec<Late>,
 }
 
 impl Step {
@@ -402,7 +441,7 @@ impl Step {
             out.push(Late::LavaIgnite);
         }
         out.extend((0..std::mem::take(&mut self.lava_hurt)).map(|_| Late::LavaHurt));
-        out.extend(self.melt.drain(..).map(Late::SnowMelt));
+        out.append(&mut self.before_extinguish);
         if std::mem::take(&mut self.extinguish) {
             out.push(Late::Extinguish);
         }
@@ -534,9 +573,20 @@ impl Server {
                     sc.step.in_fire.push(d);
                 }
                 Some(Blk::PowderSnow) => {
-                    sc.step.melt.push(h.p);
+                    sc.step.before_extinguish.push(Late::SnowMelt(h.p));
                     sc.step.freeze = true;
                     sc.step.extinguish = true;
+                }
+                // L9-TICK: cauldrons in the same collection as the rest of the pass (before, in
+                // a second group after all of it).
+                Some(Blk::Quench(s)) => {
+                    sc.step.before_extinguish.push(Late::Quench(h.p, s));
+                    sc.step.extinguish = true;
+                }
+                Some(Blk::LavaCauldron) => {
+                    sc.step.clear_freeze = true;
+                    sc.step.lava = true;
+                    sc.step.lava_hurt += 1;
                 }
                 Some(Blk::Plain | Blk::Campfire(_)) | None => {}
             }
@@ -551,21 +601,22 @@ impl Server {
             }
         }
         sc.step.flush(&mut sc.late);
-        // Deferred effects, as long as the entity lives.
-        for &e in &sc.late {
-            if !self.who_alive(who) {
-                break;
-            }
-            self.late_effect(who, e, &mut out);
-        }
-        // Contacts with the other crossed blocks (berries, cobweb, wither rose, cauldrons, plates,
-        // tripwire: `contact`), deferred effects after these ones; the rain, the extinguish sound
-        // and the return to rest below also see them.
+        // Contacts with the other crossed blocks (berries, cobweb, wither rose, plates, tripwire:
+        // `contact`): their effects are direct in the game, played while it walks the cells, so
+        // before the deferred ones (L9-TICK; before, after them).
         match who {
             Who::Player => self.player_contacts(),
             Who::Mob(m) => self.mob_contacts(m),
             // Plates and tripwire: right after, by the item and orb ticks.
             Who::Item(_) | Who::Orb(_) => {}
+        }
+        // Deferred effects, as long as the entity lives; the rain, the extinguish sound and the
+        // return to rest below also see them.
+        for &e in &sc.late {
+            if !self.who_alive(who) {
+                break;
+            }
+            self.late_effect(who, e, &mut out);
         }
         if self.who_fire(who) > 0 && self.who_in_rain(who) {
             self.who_clear_fire(who);
@@ -582,9 +633,10 @@ impl Server {
     }
 
     /// G5-F05, skip the empty: an item or orb that does not burn can only be acted on by fire,
-    /// soul fire, cactus and lava (water, powder snow and rain only put out, the campfire and the
-    /// freezing are for the living). None of them in the cells of the boxes of its movements: the
-    /// pass would change nothing. `RUSTCRAFT_OPT_ITEM_INSIDE_FULL=1`: full pass always.
+    /// soul fire, cactus, lava and the lava cauldron (water, powder snow, their cauldrons and rain
+    /// only put out, the campfire and the freezing are for the living). None of them in the cells
+    /// of the boxes of its movements: the pass would change nothing.
+    /// `RUSTCRAFT_OPT_ITEM_INSIDE_FULL=1`: full pass always.
     fn inert_object(&self, who: &Who) -> bool {
         let (fire, body) = match who {
             Who::Item(d) => (d.fire, &d.body),
@@ -622,7 +674,7 @@ impl Server {
                 for z in lo[2]..=hi[2] {
                     let st = self.st([x, y, z]);
                     let b = self.data.states.get(st as usize).map_or(u16::MAX, |i| i.block);
-                    if b == id.fire || b == id.soul_fire || b == id.cactus || b == id.lava {
+                    if b == id.fire || b == id.soul_fire || b == id.cactus || b == id.lava || b == id.lava_cauldron {
                         return false;
                     }
                 }
@@ -674,6 +726,15 @@ impl Server {
                     Some(Blk::Cactus)
                 } else if (b == id.campfire || b == id.soul_campfire) && self.v().get(st, "lit") == Some("true") {
                     Some(Blk::Campfire(if b == id.soul_campfire { 2.0 } else { 1.0 }))
+                } else if b == id.water_cauldron || b == id.powder_snow_cauldron || b == id.lava_cauldron {
+                    // L9-TICK: entered only if the swept box meets its body or its contents
+                    // (a cauldron passed over is no step at all).
+                    let lava = b == id.lava_cauldron;
+                    let top = if lava { 15.0 } else { 6.0 + 3.0 * f64::from(self.v().get_int(st, "level")) };
+                    let mut shape = [Aabb { min: [0.0; 3], max: [0.0; 3] }; 14];
+                    cauldron_inside([f64::from(p[0]), f64::from(p[1]), f64::from(p[2])], top, &mut shape);
+                    let blk = if lava { Blk::LavaCauldron } else { Blk::Quench(st) };
+                    crate::mobs::nether::ghast::collided_along(&start, travel, &shape).then_some(blk)
                 } else {
                     Some(Blk::Plain)
                 };
@@ -789,6 +850,13 @@ impl Server {
                         let pitch = 2.0 + entity_rng(o.id, o.ticks, 1).next_float() * 0.4;
                         self.play_sound("minecraft:entity.generic.burn", 8, o.pos, 0.4, pitch);
                     }
+                }
+            }
+            Late::Quench(p, s) => {
+                // Only a player can be refused the block (spawn protection, border).
+                let may = !matches!(who, Who::Player) || self.may_interact(p);
+                if self.who_on_fire(who) && may {
+                    self.cauldron_quench(p, s);
                 }
             }
             Late::SnowMelt(p) => {
