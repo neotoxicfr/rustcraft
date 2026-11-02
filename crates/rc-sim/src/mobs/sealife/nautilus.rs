@@ -603,9 +603,7 @@ impl Server {
             target = match fallback {
                 None => self.random_swimmable_pos(m, h, v),
                 Some(f) => {
-                    let d = [f[0] - m.pos[0], f[1] - m.pos[1], f[2] - m.pos[2]];
-                    let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-                    let n = if l < 1.0e-4 { [0.0; 3] } else { d.map(|x| x / l) };
+                    let n = crate::mobs::mth::normalize([f[0] - m.pos[0], f[1] - m.pos[1], f[2] - m.pos[2]]);
                     Some([
                         m.pos[0] + n[0] * f64::from(h),
                         m.pos[1] + n[1] * f64::from(v),
@@ -624,9 +622,7 @@ impl Server {
     fn charge_start(&mut self, m: &mut Mob, b: &mut Brain) {
         b.charge_start = m.pos;
         let Some(tp) = b.attack.and_then(|e| self.ent_pos(e)) else { return };
-        let d = [tp[0] - m.pos[0], tp[1] - m.pos[1], tp[2] - m.pos[2]];
-        let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-        let n = if l < 1.0e-4 { [0.0; 3] } else { d.map(|x| x / l) };
+        let n = crate::mobs::mth::normalize([tp[0] - m.pos[0], tp[1] - m.pos[1], tp[2] - m.pos[2]]);
         let sp = if m.kind == Kind::ZombieNautilus { 0.5 } else { 0.6 };
         b.charge_vel = n.map(|x| x * f64::from(sp as f32));
         if self.charge_can_continue(m, b) {

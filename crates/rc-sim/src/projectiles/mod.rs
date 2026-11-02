@@ -289,6 +289,8 @@ pub struct Proj {
     pub silent: bool,
     /// Immediate send at the next tracking.
     pub needs_sync: bool,
+    /// Marked hurt (explosion): velocity sent as is after the next tracking.
+    pub sync_velocity: bool,
     // --- Arrows and trident. ---
     pub in_ground: bool,
     pub in_ground_time: i32,
@@ -356,6 +358,11 @@ pub struct Projs {
     /// During the damage dealt by a player's projectile: that projectile, the direct entity
     /// `player_hurt_entity` describes (copied only while one of its criteria is open).
     pub direct_hit: Option<Box<Proj>>,
+    /// L10-COMBAT: entity about to explode that is not a projectile (crystal, primed TNT, TNT
+    /// minecart), with its compound: taken by the explosion as the direct entity of its damage.
+    pub blast_next: Option<(i32, rc_proto::nbt::Nbt)>,
+    /// That entity during its explosion (out of its list: found by identifier through it).
+    pub blast_ent: Option<(i32, rc_proto::nbt::Nbt)>,
 }
 
 /// An Ender pearl of `owner` flies among these projectiles.
@@ -523,6 +530,7 @@ impl Proj {
             no_gravity: false,
             silent: false,
             needs_sync: false,
+            sync_velocity: false,
             in_ground: false,
             in_ground_time: 0,
             life: 0,
@@ -777,6 +785,7 @@ impl Server {
         if !p.track.seen {
             p.take_dirty();
             p.track.tick += 1;
+            p.sync_velocity = false;
             return;
         }
         let dirty = p.meta.iter().any(|s| s.2);
@@ -804,9 +813,7 @@ impl Server {
             };
             // Velocity before the movement packet (game order).
             let v = p.vel;
-            let dv = [v[0] - p.track.last_vel[0], v[1] - p.track.last_vel[1], v[2] - p.track.last_vel[2]];
-            let diff = dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2];
-            if diff > 1.0e-7 || (diff > 0.0 && v == [0.0; 3]) {
+            if crate::mobs::track::velocity_changed(p.track.last_vel, v) {
                 p.track.last_vel = v;
                 let _ = self.send(Event::Entity(EntityEvent::Motion { id: p.id, velocity: lp_quantize(v) }));
                 if p.kind.hurting() {
@@ -860,6 +867,10 @@ impl Server {
             p.needs_sync = false;
         }
         p.track.tick += 1;
+        // Marked hurt: its velocity as is, after the tracking.
+        if std::mem::take(&mut p.sync_velocity) {
+            let _ = self.send(Event::Entity(EntityEvent::Motion { id: p.id, velocity: lp_quantize(p.vel) }));
+        }
     }
 
     /// Tick of the open world's projectiles, then clouds, bobber, pickup and tracking.

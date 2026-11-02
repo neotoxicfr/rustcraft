@@ -466,9 +466,7 @@ impl Server {
 
     pub(crate) fn enderman_teleport_towards(&mut self, m: &mut Mob, target: [f64; 3]) -> bool {
         let eye = self.player_eye_y();
-        let mut d = [m.pos[0] - target[0], m.pos[1] + f64::from(m.height()) * 0.5 - eye, m.pos[2] - target[2]];
-        let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-        d = if l < 1.0e-4 { [0.0; 3] } else { d.map(|v| v / l) };
+        let d = super::mth::normalize([m.pos[0] - target[0], m.pos[1] + f64::from(m.height()) * 0.5 - eye, m.pos[2] - target[2]]);
         let x = m.pos[0] + (m.rng.next_double() - 0.5) * 8.0 - d[0] * 16.0;
         let y = m.pos[1] + f64::from(m.rng.next_int_bound(16) - 8) - d[1] * 16.0;
         let z = m.pos[2] + (m.rng.next_double() - 0.5) * 8.0 - d[2] * 16.0;

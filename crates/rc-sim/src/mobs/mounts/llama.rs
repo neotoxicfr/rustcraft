@@ -43,7 +43,8 @@ fn rot_of(v: [f64; 3]) -> (f32, f32) {
     (yaw, pitch)
 }
 
-fn spit_box(p: [f64; 3]) -> rc_physics::Aabb {
+/// Box of a llama spit (0.25 × 0.25) at `p`.
+pub(crate) fn spit_box(p: [f64; 3]) -> rc_physics::Aabb {
     rc_physics::Aabb { min: [p[0] - 0.125, p[1], p[2] - 0.125], max: [p[0] + 0.125, p[1] + 0.25, p[2] + 0.125] }
 }
 
@@ -92,9 +93,7 @@ impl Server {
         let yd = tb.min[1] + (tb.max[1] - tb.min[1]) * 0.333_333_333_333_333_3 - start[1];
         let zd = tp[2] - m.pos[2];
         let yo = (xd * xd + zd * zd).sqrt() * f64::from(0.2f32);
-        let dir = [xd, yd + yo, zd];
-        let l = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
-        let mut v = dir.map(|c| if l < 1.0e-4 { 0.0 } else { c / l });
+        let mut v = crate::mobs::mth::normalize([xd, yd + yo, zd]);
         for c in &mut v {
             *c += rng.triangle(0.0, 0.017_227_5 * 10.0);
         }
@@ -390,7 +389,7 @@ impl Server {
         let Some(h) = m.mount.caravan_head.and_then(|id| self.mob_ref(id)).map(|h| h.pos) else { return };
         let d = [h[0] - m.pos[0], h[1] - m.pos[1], h[2] - m.pos[2]];
         let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-        let n = if dist < 1.0e-4 { [0.0; 3] } else { d.map(|c| c / dist) };
+        let n = crate::mobs::mth::normalize(d);
         let k = (dist - 2.0).max(0.0);
         let to = [m.pos[0] + n[0] * k, m.pos[1] + n[1] * k, m.pos[2] + n[2] * k];
         self.move_to_pos(m, to, speed);

@@ -8,6 +8,7 @@
 
 mod cushion;
 mod hanging;
+mod mannequin;
 pub(crate) mod stand;
 mod summoned;
 #[cfg(test)]
@@ -112,11 +113,14 @@ struct Live {
     removed: bool,
     /// Network tracking of a decoration that moves (armor stand, mannequin).
     track: crate::mobs::track::Tracker,
+    /// Mannequin: hurt cooldown (ticks) and the damage of the last hit (not saved, like the game).
+    hurt_cooldown: i32,
+    last_hurt: f32,
 }
 
 impl Live {
     fn new(id: i32, kind: DKind, chunk: (i32, i32)) -> Live {
-        Live { id, kind, chunk, check: 0, last_hit: 0, removed: false, track: Default::default() }
+        Live { id, kind, chunk, check: 0, last_hit: 0, removed: false, track: Default::default(), hurt_cooldown: 0, last_hurt: 0.0 }
     }
 }
 
@@ -666,14 +670,16 @@ impl Server {
 
     // ---------- Explosions ----------
 
-    /// Blast of an explosion on the decorations: hung items
-    /// and cushions broken (item dropped), armor stands smashed (equipment
-    /// dropped); `by`: author (entity behind the damage source); `wet`: direct source in water, nothing
+    /// Blast of an explosion of type `ty` on the decorations: hung items and cushions broken
+    /// (item dropped), armor stands smashed (equipment dropped), mannequins hurt; a stand or a
+    /// mannequin left standing is then pushed (reduced by its explosion knockback resistance);
+    /// `by`: author (entity behind the damage source); `wet`: direct source in water, nothing
     /// hung is then touched; `blocklike`: the explosion touches block-like entities.
     pub(crate) fn deco_explosion(
         &mut self,
         center: [f64; 3],
         radius: f32,
+        ty: &str,
         by: Option<crate::mobs::mob::Ent>,
         wet: bool,
         blocklike: bool,
@@ -689,7 +695,7 @@ impl Server {
             let Some(e) = self.deco_nbt(id).cloned() else { continue };
             let ignore = match k {
                 DKind::Stand => !blocklike || flag(&e, "Invisible"),
-                DKind::Mannequin => true,
+                DKind::Mannequin => false,
                 _ => wet || !blocklike,
             };
             if ignore {
@@ -702,32 +708,28 @@ impl Server {
             if dist > 1.0 {
                 continue;
             }
-            let eye = match k {
-                DKind::Painting => f64::from(0.5f32 * 0.85),
-                DKind::Frame | DKind::GlowFrame => 0.0,
-                DKind::Cushion => f64::from(0.25f32 * 0.85),
-                DKind::Stand => {
-                    if flag(&e, "Small") {
-                        f64::from(0.9875f32)
-                    } else {
-                        f64::from(1.7775f32)
-                    }
-                }
-                DKind::Mannequin => f64::from(1.62f32),
-                DKind::Knot => f64::from(0.0625f32),
-            };
+            let eye = self.deco_eye(k, &e);
             let o = [pos[0] - center[0], pos[1] + eye - center[1], pos[2] - center[2]];
             let olen = (o[0] * o[0] + o[1] * o[1] + o[2] * o[2]).sqrt();
             let exposure = f64::from(self.seen_percent(center, &b));
             // The hit: refused for a mob without the `mob_griefing` rule, or invulnerable.
             let refused = (by_mob && !griefing) || flag(&e, "Invulnerable");
-            if k == DKind::Stand {
-                if !refused && !flag(&e, "Marker") {
+            if matches!(k, DKind::Stand | DKind::Mannequin) {
+                if k == DKind::Mannequin {
+                    let pow = (1.0 - dist) * exposure;
+                    let dmg = ((pow * pow + pow) / 2.0 * 7.0 * double + 1.0) as f32;
+                    self.mannequin_hurt(id, ty, dmg, by, Some(center));
+                } else if !refused && !flag(&e, "Marker") {
                     let at = pos.map(|v| v.floor() as i32);
                     self.stand_broken(&e, at);
                     self.deco_remove(id);
                     self.game_event_at("minecraft:entity_die", pos, None);
+                    continue;
                 }
+                // Still there (refused, marker, mannequin): pushed like any living entity.
+                let res = self.nbt_attribute(&e, k.name(), "minecraft:explosion_knockback_resistance").unwrap_or(0.0);
+                let kp = (1.0 - dist) * exposure * (1.0 - res);
+                self.deco_push(id, crate::mobs::mth::normalize(o).map(|v| v * kp));
                 continue;
             }
             if !refused {
@@ -735,7 +737,7 @@ impl Server {
                 continue;
             }
             // Non-zero push: the hung item is knocked off (fixed frame excepted).
-            let pushed = olen >= 1.0e-5 && (1.0 - dist) * exposure != 0.0;
+            let pushed = olen >= f64::from(1.0e-5f32) && (1.0 - dist) * exposure != 0.0;
             if pushed && !(k.frame() && flag(&e, "Fixed")) {
                 self.attached_kill_by(id, &e, None);
             }
@@ -811,14 +813,7 @@ impl Server {
                 continue;
             }
             let Some(b) = self.deco_box(e) else { continue };
-            let eye = match k {
-                DKind::Painting => f64::from(0.5f32 * 0.85),
-                DKind::Frame | DKind::GlowFrame => 0.0,
-                DKind::Cushion => f64::from(0.25f32 * 0.85),
-                DKind::Stand => f64::from(if flag(e, "Small") { 0.9875f32 } else { 1.7775f32 }),
-                DKind::Mannequin => f64::from(1.62f32),
-                DKind::Knot => f64::from(0.0625f32),
-            };
+            let eye = self.deco_eye(k, e);
             let dir = crate::mobs::mth::normalize([pos[0] - center[0], pos[1] + eye - center[1], pos[2] - center[2]]);
             let living = matches!(k, DKind::Stand | DKind::Mannequin);
             let res =
@@ -857,25 +852,23 @@ impl Server {
     }
 
     /// Push of a living decoration: the velocity is added to its saved motion and goes to the
-    /// client with its next tracking; one that never moves by itself (no gravity, marker,
-    /// immovable mannequin, whose tick stops before the tracking) sends it at once.
+    /// client with its next tracking, which runs every tick (even without physics) and sends it
+    /// only if it differs from the last one sent (beyond 1e-7 squared), like the game.
     pub(crate) fn deco_push(&mut self, id: i32, v: [f64; 3]) {
         if !v.iter().all(|x| x.is_finite()) {
             return;
         }
         // One registry search; the compound read and rewritten in place (its chunk known).
         let Some(i) = self.deco.live.iter().position(|l| l.id == id && !l.removed) else { return };
-        let stand = self.deco.live[i].kind == DKind::Stand;
         let Some(e) = self.live_nbt(i) else { return };
         let m = nbtio::motion(e.get("Motion")).unwrap_or_default();
+        let (pos, ground) = (nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default(), flag(e, "OnGround"));
         let nv = [m[0] + v[0], m[1] + v[1], m[2] + v[2]];
-        let still = flag(e, "NoGravity") || flag(e, if stand { "Marker" } else { "immovable" });
         self.deco_edit(id, |n| nbtio::set(n, "Motion", dbl(nv)));
-        if still {
-            let _ = self.send(Event::Entity(EntityEvent::Motion { id, velocity: crate::mobs::track::lp_quantize(nv) }));
-        } else {
-            self.deco.live[i].track.needs_sync = true;
-        }
+        // Not tracked yet (pushed before its first tick): the client knows the state before.
+        let t = &mut self.deco.live[i].track;
+        t.begin(pos, m, ground);
+        t.needs_sync = true;
     }
 
     /// Value of an attribute of a living decoration (`None`: not one, or an attribute its type
@@ -1045,6 +1038,18 @@ impl Server {
         d2 < range * range
     }
 
+    /// Eye height of a decoration of kind `k` (what an explosion pushes from): 0.85 of the height of
+    /// what is hung or laid, the living sizes of the stands and mannequins.
+    fn deco_eye(&self, k: DKind, e: &Nbt) -> f64 {
+        match k {
+            DKind::Painting => f64::from(0.5f32 * 0.85),
+            DKind::Frame | DKind::GlowFrame => 0.0,
+            DKind::Cushion => f64::from(0.25f32 * 0.85),
+            DKind::Stand | DKind::Mannequin => self.living_size(e, k == DKind::Stand).2,
+            DKind::Knot => f64::from(0.0625f32),
+        }
+    }
+
     /// Box of a decoration (selectors, range, overlaps).
     pub(crate) fn deco_box(&self, e: &Nbt) -> Option<Aabb> {
         let k = kind_of(e)?;
@@ -1060,13 +1065,12 @@ impl Server {
                 let (pos, d) = self.hang_place(k, e);
                 frame_box(pos, d, hanging::has_map(e))
             }
-            DKind::Stand => {
-                let (w, h) = stand::size(e);
+            // Size of the marker, small stand, mannequin pose, scale.
+            DKind::Stand | DKind::Mannequin => {
+                let (w, h, _) = self.living_size(e, k == DKind::Stand);
                 around(w, h)
             }
             DKind::Cushion => around(1.0, 0.25),
-            // The player's size, in single precision like the game.
-            DKind::Mannequin => around(f64::from(0.6f32), f64::from(1.8f32)),
             DKind::Knot => around(0.375, 0.5),
         })
     }

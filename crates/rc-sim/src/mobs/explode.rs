@@ -11,6 +11,17 @@ use super::mob::{Ent, Mob};
 use super::mth::dist2;
 use crate::server::Server;
 
+/// Player behind an explosion's damage, read before any other player is installed.
+pub(crate) struct BlastAuthor {
+    name: String,
+    display: rc_text::Component,
+    named_item: Option<rc_text::Component>,
+}
+
+/// What an explosion with a player author did to one player: the hurt report (past the
+/// invulnerability window) and that player's name if it died of it.
+type AuthorHit = (Option<super::combat::HurtParts>, Option<String>);
+
 #[cfg(test)]
 thread_local! {
     /// Tests: primed TNT explosions of this thread, (dimension, passed through a portal).
@@ -119,7 +130,8 @@ impl Server {
         self.explode_with(source, by, exclude, center, radius, fire, ty, Blast::Mob);
     }
 
-    /// Explosion of a primed TNT (`tnt`: its identifier, outside the blast), author of the priming if any.
+    /// Explosion of a primed TNT (`tnt`: its identifier, outside the blast), author of the priming if any
+    /// (then of the "player" type, like any explosion with an author and a direct entity).
     /// `used_portal`: TNT that went through a portal (the game's own calculator: the Nether portal
     /// does not resist and does not break). `wet`: TNT in water (direct source of the decorations).
     pub(crate) fn tnt_explode(
@@ -134,7 +146,8 @@ impl Server {
         self.deco.blast_wet = wet;
         #[cfg(test)]
         TNT_BLASTS.with_borrow_mut(|v| v.push((self.dim.name.clone(), used_portal)));
-        self.explode_with(None, by, Some(tnt), center, radius, false, "minecraft:explosion", Blast::Tnt(used_portal));
+        let ty = if by.is_some() { "minecraft:player_explosion" } else { "minecraft:explosion" };
+        self.explode_with(None, by, Some(tnt), center, radius, false, ty, Blast::Tnt(used_portal));
     }
 
     /// Explosion according to its interaction with blocks (F15: crystal "block", dragon respawn
@@ -153,6 +166,12 @@ impl Server {
     ) {
         // G5-F06: projectile direct source (taken before any chain explosion).
         let direct = self.carts.blast_direct.take();
+        // L10-COMBAT: the projectile being resolved is the direct entity of its own explosion
+        // only (fireball, skull); another exploding entity (crystal set off by an arrow, TNT,
+        // minecart) is the direct entity of the damage it deals and hides it. Restored after.
+        let outer_hit = if direct.is_none() { self.proj.direct_hit.take() } else { None };
+        let me = self.proj.blast_next.take();
+        let outer_ent = std::mem::replace(&mut self.proj.blast_ent, me);
         // Direct source in water: the exploding mob, otherwise the value
         // set by the caller (TNT, projectile), consumed here.
         let direct_wet = source.map_or(self.deco.blast_wet, |m| m.in_water);
@@ -236,7 +255,6 @@ impl Server {
             self.ghost_push(s);
         }
         let double = radius * 2.0;
-        let mut player_kb: Option<[f64; 3]> = None;
         // A digging or emerging warden ignores explosions (neither hurt nor pushed).
         let ids: Vec<i32> = self
             .mobs
@@ -246,15 +264,11 @@ impl Server {
             .filter(|o| Some(o.id) != exclude && !super::recent::ignores_explosion(o))
             .map(|o| o.id)
             .collect();
-        let mut targets: Vec<Ent> = ids.into_iter().map(Ent::Mob).collect();
-        targets.push(Ent::Player);
-        for t in targets {
+        for id in ids {
+            let t = Ent::Mob(id);
             let (Some(pos), Some(eye), Some(bb)) = (self.ent_pos(t), self.ent_eye(t), self.ent_bbox(t)) else {
                 continue;
             };
-            if t == Ent::Player && self.game_mode == 3 {
-                continue;
-            }
             let dist = dist2(pos, center).sqrt() / f64::from(double);
             if dist > 1.0 {
                 continue;
@@ -266,77 +280,64 @@ impl Server {
             if rc_data::env_flag!("RUSTCRAFT_S4LOG") {
                 eprintln!("explosion: {t:?} at {pos:?}, distance {dist:.3}, seen part {exposure}, damage {dmg}");
             }
-            match t {
-                Ent::Player => {
-                    // W8c: point of impact and direct cause (`fall_after_explosion`).
-                    let cause = match (source, blast) {
-                        (Some(s), _) => Some(s.kind.info().name.to_owned()),
-                        (None, Blast::Tnt(_)) => Some("minecraft:tnt".to_owned()),
-                        _ => self.prog.expl_cause_next.map(str::to_owned),
-                    };
-                    self.prog.expl_impact = Some((self.pos, cause));
-                    // Ordinary explosion: the grace of an impulse in progress is cancelled.
-                    let at = self.pos;
-                    self.life.vit.impulse_from_explosion(false, at);
-                    // F12: author out of the list (creeper) or found again (ghast), otherwise anonymous.
-                    let owner = match (source, by) {
-                        (Some(s), _) => Some(s.clone()),
-                        (None, Some(Ent::Mob(id))) => self.mob_ref(id).cloned(),
-                        _ => None,
-                    };
-                    // W8c: source = the exploding entity (creeper: alive) or the centre.
-                    self.prog.dmg_src = crate::item_use::DmgSrc {
-                        pos: Some(center),
-                        direct_living: source.is_some(),
-                        attacker_pos: source.map(|s| s.pos),
-                        ..Default::default()
-                    };
-                    match owner {
-                        Some(o) => {
-                            self.player_hurt_by_mob(&o, ty, dmg, Some((center[0] - pos[0], center[2] - pos[2])));
-                        }
-                        None => {
-                            self.hurt(ty, dmg);
-                        }
-                    }
-                    if self.game_mode != 3 && !(self.game_mode == 1 && self.flying) {
-                        // W8a: explosion knockback resistance (Blast Protection).
-                        // Power computed from one block then applied directionally, like the game.
-                        let r = self.player_attribute("minecraft:explosion_knockback_resistance");
-                        let power = (1.0 - dist) * f64::from(exposure) * (1.0 - r);
-                        player_kb = Some(dir.map(|v| v * power));
-                    }
-                }
-                Ent::Mob(id) => {
-                    let Some(i) = self.mob_index(id) else { continue };
-                    let mut o = self.mobs.list[i].take().expect("mob");
-                    // Ghast hit by the explosion of a fireball sent back by the player: 1,000.
-                    let dmg = if super::nether::reflected_fireball(&o, self.mobs.fireballs.direct_large, by) {
-                        1000.0
-                    } else {
-                        dmg
-                    };
-                    self.mob_hurt(&mut o, ty, dmg, by, Some(center));
-                    // Knockback power, then along the direction; reduced by the explosion
-                    // knockback resistance (Blast Protection), like the game.
-                    let kp = (1.0 - dist) * f64::from(exposure) * (1.0 - o.attrs.explosion_kb_resistance.value());
-                    o.vel = [o.vel[0] + dir[0] * kp, o.vel[1] + dir[1] * kp, o.vel[2] + dir[2] * kp];
-                    o.needs_sync = true;
-                    self.mobs.list[i] = Some(o);
-                }
+            let Some(i) = self.mob_index(id) else { continue };
+            let mut o = self.mobs.list[i].take().expect("mob");
+            // Ghast hit by the explosion of a fireball sent back by the player: 1,000.
+            let dmg = if super::nether::reflected_fireball(&o, self.mobs.fireballs.direct_large, by) { 1000.0 } else { dmg };
+            self.mob_hurt(&mut o, ty, dmg, by, Some(center));
+            // Knockback power, then along the direction; reduced by the explosion
+            // knockback resistance (Blast Protection), like the game.
+            let kp = (1.0 - dist) * f64::from(exposure) * (1.0 - o.attrs.explosion_kb_resistance.value());
+            o.vel = [o.vel[0] + dir[0] * kp, o.vel[1] + dir[1] * kp, o.vel[2] + dir[2] * kp];
+            o.needs_sync = true;
+            self.mobs.list[i] = Some(o);
+        }
+        // The current player, then the other players of the local network: hurt and pushed like
+        // the host (W8c: the direct cause is the explosion's, whoever is installed).
+        let cause = match (source, blast) {
+            (Some(s), _) => Some(s.kind.info().name),
+            (None, Blast::Tnt(_)) => Some("minecraft:tnt"),
+            _ => self.prog.expl_cause_next,
+        };
+        // A player author (TNT primer, crystal breaker…) read now: once another player is
+        // installed, `Ent::Player` designates that one.
+        let author = (by == Some(Ent::Player)).then(|| self.blast_author());
+        let (player_kb, own) = self.explosion_player(source, by, ty, center, double, cause, author.as_ref());
+        // The author hurt by its own explosion: `player_hurt_entity` on itself; no kill credit
+        // (the game never credits a player with its own death).
+        if let Some((original, taken, blocked)) = own.0 {
+            let me = Some(crate::progress::pred::Who::E(crate::commands::ents::E::Player));
+            self.s9_player_hurt_living(me, ty, original, taken, blocked);
+        }
+        let mut peers: Vec<(Option<usize>, Option<[f64; 3]>)> = Vec::new();
+        for o in self.lan_peers().into_iter().filter(|o| o.game_mode != 3) {
+            let (kb, hit) = self.as_player(o.who, |sv| sv.explosion_player(source, by, ty, center, double, cause, author.as_ref()));
+            // Credited to the author (the current player again): hurt, then the kill.
+            if let Some((original, taken, blocked)) = hit.0 {
+                self.s9_player_hurt_living(None, ty, original, taken, blocked);
             }
+            if let Some(victim) = hit.1 {
+                self.s9_player_killed_player(&victim, ty);
+            }
+            peers.push((o.who, kb));
         }
         // Non-living entities of blocks and loot: primed TNT, falling block, item, orb.
         self.explosion_hits_objects(center, radius, exclude, ty, by, direct_wet, blocklike);
         // G5-F06: minecarts (direct source: exploding projectile, otherwise none).
         self.with_direct(direct, |s| s.carts_explosion_hit(center, radius, exclude, ty, by));
-        // Fireballs and wind charges: pushed, the author becomes their owner.
+        // Projectiles hurt and pushed (fireballs and wind charges: the author becomes their
+        // owner); displays, markers, interactions and clouds pushed.
         let owner = self.blast_owner_uuid(by, source);
-        self.explosion_redirect(center, radius, owner, 1.0);
+        self.explosion_projectiles(center, radius, owner, 1.0, true);
+        self.blast_push_still(center, radius, 1.0);
         // F15: crystals (destroyed without a new explosion) and shulker bullets in the radius.
         self.end_explosion_hits(center, radius, by, ty, exclude);
         if source.is_some() {
             self.ghost_pop();
+        }
+        self.proj.blast_ent = outer_ent;
+        if direct.is_none() {
+            self.proj.direct_hit = outer_hit;
         }
         // 3. Blocks destroyed (shuffled, loot grouped by 16).
         if griefing {
@@ -403,8 +404,8 @@ impl Server {
                 }
             }
         }
-        // 4. Packet to each player within 64 blocks (the other players of the local network are
-        //    not reached by the blast: no knockback in theirs).
+        // 4. Packet to each player within 64 blocks, carrying that player's own knockback, also
+        //    given to its server velocity.
         {
             let small = radius < 2.0 || !griefing;
             let pt = |s: &Server, n: &str| Particle {
@@ -439,9 +440,104 @@ impl Server {
                 ],
                 play_sound: true,
             };
-            self.send_explosion(ex, player_kb, &[]);
+            self.send_explosion(ex, player_kb, &peers);
         }
         let _ = EntityEvent::Remove(Vec::new());
+    }
+
+    /// The explosion reaching the installed player (spectators excluded): impact point and cause
+    /// (`fall_after_explosion`), impulse grace cancelled, damage (from its author when a mob is
+    /// behind it), then its knockback added to its server velocity; returned for its packet
+    /// unless it flies in creative mode. `double`: twice the radius. A player `author` is refused
+    /// by the `pvp` rule or a common team without friendly fire (the push stays), otherwise named
+    /// as the attacker (death message, `killed_by`); then also returned: the hurt report if the
+    /// hit went past the invulnerability window, and the player's name if it died of it.
+    #[allow(clippy::too_many_arguments)]
+    fn explosion_player(
+        &mut self,
+        source: Option<&Mob>,
+        by: Option<Ent>,
+        ty: &str,
+        center: [f64; 3],
+        double: f32,
+        cause: Option<&'static str>,
+        author: Option<&BlastAuthor>,
+    ) -> (Option<[f64; 3]>, AuthorHit) {
+        let none = (None, (None, None));
+        if self.game_mode == 3 {
+            return none;
+        }
+        let t = Ent::Player;
+        let (Some(pos), Some(eye), Some(bb)) = (self.ent_pos(t), self.ent_eye(t), self.ent_bbox(t)) else { return none };
+        let dist = dist2(pos, center).sqrt() / f64::from(double);
+        if dist > 1.0 {
+            return none;
+        }
+        let dir = super::mth::normalize([pos[0] - center[0], eye - center[1], pos[2] - center[2]]);
+        let exposure = self.seen_percent(center, &bb);
+        let pow = (1.0 - dist) * f64::from(exposure);
+        let dmg = ((pow * pow + pow) / 2.0 * 7.0 * f64::from(double) + 1.0) as f32;
+        if rc_data::env_flag!("RUSTCRAFT_S4LOG") {
+            eprintln!("explosion: {t:?} at {pos:?}, distance {dist:.3}, seen part {exposure}, damage {dmg}");
+        }
+        self.prog.expl_impact = Some((self.pos, cause.map(str::to_owned)));
+        // Ordinary explosion: the grace of an impulse in progress is cancelled.
+        let at = self.pos;
+        self.life.vit.impulse_from_explosion(false, at);
+        // F12: author out of the list (creeper) or found again (ghast), otherwise anonymous.
+        let owner = match (source, by) {
+            (Some(s), _) => Some(s.clone()),
+            (None, Some(Ent::Mob(id))) => self.mob_ref(id).cloned(),
+            _ => None,
+        };
+        // W8c: source = the exploding entity (creeper: alive) or the centre.
+        self.prog.dmg_src = crate::item_use::DmgSrc {
+            pos: Some(center),
+            direct_living: source.is_some(),
+            attacker_pos: source.map(|s| s.pos),
+            ..Default::default()
+        };
+        let mut hit = (None, None);
+        match (owner, author) {
+            (Some(o), _) => {
+                self.player_hurt_by_mob(&o, ty, dmg, Some((center[0] - pos[0], center[2] - pos[2])));
+            }
+            (None, Some(a)) => {
+                if !self.refuses_player_damage(&a.name) {
+                    self.prog.attacker_player = Some((a.display.clone(), a.named_item.clone()));
+                    self.prog.hurt_parts = None;
+                    let alive = !self.life.vit.dead;
+                    self.hurt(ty, dmg);
+                    self.prog.attacker_player = None;
+                    hit = (self.prog.hurt_parts.take(), (alive && self.life.vit.dead).then(|| self.name.clone()));
+                }
+            }
+            (None, None) => {
+                self.hurt(ty, dmg);
+            }
+        }
+        if self.game_mode == 3 {
+            return (None, hit);
+        }
+        // W8a: explosion knockback resistance (Blast Protection). Power computed from one block
+        // then applied directionally, like the game.
+        let r = self.player_attribute("minecraft:explosion_knockback_resistance");
+        let power = (1.0 - dist) * f64::from(exposure) * (1.0 - r);
+        let kb = dir.map(|v| v * power);
+        // Flying in creative: pushed on the server, nothing in its packet.
+        self.add_player_vel(kb);
+        ((!(self.game_mode == 1 && self.flying)).then_some(kb), hit)
+    }
+
+    /// The current player as the author of an explosion's damage: score name, displayed name, and
+    /// its main-hand item when it bears a custom name (death message "… using …").
+    fn blast_author(&self) -> BlastAuthor {
+        let held = self.slots.get(36 + self.held as usize).and_then(Option::as_ref);
+        BlastAuthor {
+            name: self.name.clone(),
+            display: self.player_display_name(),
+            named_item: held.filter(|s| crate::items::component(s, "minecraft:custom_name").is_some()).map(|s| self.stack_display(s)),
+        }
     }
 
     /// Explosion packet to each player within 64 blocks of its centre, carrying that player's

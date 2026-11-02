@@ -3283,6 +3283,36 @@ runs), so only the order of magnitude is claimed.
   (a few attributes, equipment parsed once).
 - Multi-core and GPU not applicable to the rest (event paths, a few entities). To re-measure on a
   quiet machine: the bench above (2 passes), `fingerprint_*` tests unchanged.
+## L10-COMBAT: explosion reach and direct entity, decoration sizes, sweep, normalization (02/11, loaded machine)
+
+- Bench `tests_l10combat::bench_l10_combat` (200 calls per figure, 3 passes): new pass of the
+  entities that never move (displays, markers, interactions kept as compounds, then clouds) 0.06-0.07
+  us with nothing kept, 60.4-60.8 us with 4,000 markers out of range (15 ns per compound: type then
+  position read; most real compounds are decorations, rejected on their type). New projectile pass
+  (every projectile instead of the redirectable ones) 0.02-0.03 us empty, 1.32-1.38 us with 200 far
+  arrows. Both run once per explosion or burst (a TNT burst alone costs hundreds of us).
+- Lead discarded, chunk range of the still pass (only the chunks the explosion reaches): exact only
+  if a kept compound always sits in the list of its position's chunk, which a teleport breaks (the
+  compound stays in the list it was read in): it would miss a teleported display. Not kept; a
+  registry of the pushable compounds (like the decorations') is the lead to measure if a world with
+  thousands of markers shows it.
+- Still armor stands now tracked every tick (weightless, markers, immovable mannequins, stands in
+  water): 400 weightless stands with a helmet, deco tick 47.8-49.8 us against 48.4-48.5 us with the
+  old early return (alternated, same build): no measurable cost. Their scale read every tick stays
+  free: the attribute is only computed for a stand with a saved scale entry or a worn stack carrying
+  modifiers or enchantments of its own (no item scales by default).
+- Normalization sweep (33 sites through the common helper): same work, one threshold. Mannequin
+  hurt, sweep over decorations and other players, LAN players in ordinary explosions: per event,
+  a few entities; no hot spot. Multi-core and GPU not applicable. To re-measure on a quiet machine:
+  the bench above (3 passes), TNT and creeper scenes.
+- Review round (02/11, loaded machine, other agents compiling): still stands now cancel their
+  speeds under 0.003 each tick (a map and a bit comparison of the saved motion; the compound is
+  only rewritten when a value changes). Same bench, 2 passes: 400 weightless stands 56.5-56.6 us
+  per deco tick (48 us earlier in the day, other load): the added work is a few ns per stand, the
+  gap is attributed to the load and stays to re-measure on a quiet machine (no switch: the
+  cancellation is the game's behaviour). The bobber now sends its velocity only when it changed
+  (fewer packets at rest); the explosion author check (pvp rule, team) runs once per player in
+  range of an explosion with a player author. No hot spot; multi-core and GPU not applicable.
 ## L9-CLIENT: screen limits (02/11, loaded machine)
 
 - Wheel: discrete mode and sensitivity read once per wheel event (two option lookups, before any

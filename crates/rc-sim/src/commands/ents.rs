@@ -92,6 +92,8 @@ impl Server {
             .map(|(_, n)| n)
             .or_else(|| self.end_other(id)) // F15
             .or_else(|| self.cart_ref(id).map(|c| &c.nbt)) // G5-F06: fields kept (name, tags)
+            // L10-COMBAT: the entity exploding right now, out of its list.
+            .or_else(|| self.proj.blast_ent.as_ref().filter(|(i, _)| *i == id).map(|(_, n)| n))
     }
 
     fn other_mut(&mut self, id: i32) -> Option<&mut Nbt> {
@@ -182,12 +184,24 @@ impl Server {
                 [w, h, eye]
             }),
             _ => {
-                let ty = self.ent_type(e);
-                let idx =
-                    self.data.registry("minecraft:entity_type").and_then(|r| r.entries.iter().position(|x| *x == ty));
-                idx.and_then(|i| self.data.entity_dims.get(i)).map_or([0.25, 0.25, 0.2], |d| [d[0], d[1], d[2]])
+                // Armor stand, mannequin: marker, small stand, pose and scale (L10-COMBAT).
+                if let E::Other(i) = e
+                    && let Some(n) = self.other(i)
+                    && let Some(k @ (crate::decoration::DKind::Stand | crate::decoration::DKind::Mannequin)) =
+                        crate::decoration::kind_of(n)
+                {
+                    let (w, h, eye) = self.living_size(n, k == crate::decoration::DKind::Stand);
+                    return [w as f32, h as f32, eye as f32];
+                }
+                self.type_dims(&self.ent_type(e)).unwrap_or([0.25, 0.25, 0.2])
             }
         }
+    }
+
+    /// Width, height and eye height of entity type `ty` (version data).
+    pub(crate) fn type_dims(&self, ty: &str) -> Option<[f32; 3]> {
+        let i = self.data.registry("minecraft:entity_type")?.entries.iter().position(|x| x == ty)?;
+        self.data.entity_dims.get(i).map(|d| [d[0], d[1], d[2]])
     }
 
     pub fn ent_eye_height(&self, e: E) -> f64 {

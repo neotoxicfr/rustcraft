@@ -121,9 +121,8 @@ impl Server {
                 let vl = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
                 let dot = p[0] * v[0] + p[1] * v[1] + p[2] * v[2];
                 let proj = [v[0] * dot / vl, v[1] * dot / vl, v[2] * dot / vl];
-                let pl = (proj[0] * proj[0] + proj[1] * proj[1] + proj[2] * proj[2]).sqrt();
                 let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
-                c.push = if pl < 1.0e-4 { [0.0; 3] } else { proj.map(|x| x / pl * len) };
+                c.push = crate::mobs::mth::normalize(proj).map(|x| x * len);
             }
             let q = c.push;
             let mut n = [v[0] * 0.8 + q[0], v[1] * 0.0 + q[1], v[2] * 0.8 + q[2]];
@@ -184,6 +183,7 @@ impl Server {
             c.removed = true;
             let src = Some(crate::mobs::recent::vibration::Src::Other);
             self.game_event_src("minecraft:explode", c.pos, src, None);
+            self.blast_direct_next(by, c.id, |s| s.cart_to_nbt(c)); // L10-COMBAT
             self.explode_with(
                 None,
                 by,

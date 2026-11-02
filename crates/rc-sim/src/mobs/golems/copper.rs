@@ -1219,9 +1219,7 @@ impl Server {
         let pos = [m.pos[0], m.eye_y() - f64::from(0.3f32), m.pos[2]];
         let r = &mut self.mobs.rng;
         let _ = (r.next_double(), r.next_double());
-        let d = [to[0] - m.pos[0], to[1] - m.pos[1], to[2] - m.pos[2]];
-        let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-        let v = if l < 1.0e-5 { [0.0; 3] } else { d.map(|c| c / l * f64::from(0.3f32)) };
+        let v = crate::mobs::mth::normalize([to[0] - m.pos[0], to[1] - m.pos[1], to[2] - m.pos[2]]).map(|c| c * f64::from(0.3f32));
         self.spawn_item(pos, v, item, 10);
     }
 

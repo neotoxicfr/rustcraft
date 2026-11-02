@@ -260,9 +260,7 @@ pub fn tongue_tick(s: &mut Server, m: &mut Mob, b: &mut Brain, tg: &mut Tongue) 
                     && let Some(i) = s.mob_index(id)
                     && let Some(o) = s.mobs.list[i].as_mut()
                 {
-                    let d = [m.pos[0] - o.pos[0], m.pos[1] - o.pos[1], m.pos[2] - o.pos[2]];
-                    let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-                    let n = if l < 1.0e-4 { [0.0; 3] } else { d.map(|x| x / l) };
+                    let n = crate::mobs::mth::normalize([m.pos[0] - o.pos[0], m.pos[1] - o.pos[1], m.pos[2] - o.pos[2]]);
                     o.vel = n.map(|x| x * 0.75);
                     o.needs_sync = true;
                 }

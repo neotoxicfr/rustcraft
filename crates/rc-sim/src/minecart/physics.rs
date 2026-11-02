@@ -936,13 +936,12 @@ impl Server {
 
     /// The push of another minecart (old behavior: only if the other is in the axis).
     fn push_other_minecart(me: &mut Cart, other: &mut Cart, xa: f64, za: f64) {
-        let (xo, zo) = (other.pos[0] - me.pos[0], other.pos[2] - me.pos[2]);
-        let l = (xo * xo + zo * zo).sqrt();
-        let dir = if l < 1.0e-4 { [0.0, 0.0] } else { [xo / l, zo / l] };
+        use crate::mobs::mth::normalize;
+        let o = normalize([other.pos[0] - me.pos[0], 0.0, other.pos[2] - me.pos[2]]);
+        let dir = [o[0], o[2]];
         let r = me.yaw * crate::mobs::mth::DEG;
-        let (fc, fs) = (f64::from(crate::mobs::mth::cos(r)), f64::from(crate::mobs::mth::sin(r)));
-        let fl = (fc * fc + fs * fs).sqrt();
-        let facing = if fl < 1.0e-4 { [0.0, 0.0] } else { [fc / fl, fs / fl] };
+        let f = normalize([f64::from(crate::mobs::mth::cos(r)), 0.0, f64::from(crate::mobs::mth::sin(r))]);
+        let facing = [f[0], f[2]];
         let dot = (dir[0] * facing[0] + dir[1] * facing[1]).abs();
         if dot < f64::from(0.8f32) {
             return;
