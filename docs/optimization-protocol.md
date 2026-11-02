@@ -39,6 +39,33 @@ through `rc_data::env_str!` / `env_flag!` / `env_os!` (one read per site, `crate
   (`tools/hot_map.py`), then read every touched file in full.
 - [ ] B6. Root cause everywhere: every pattern found is searched for and fixed across the whole repository.
 - [ ] B7. Simplify the code when possible without changing the behaviour.
+- [ ] B8. Share the work: the same data walked or computed several times (two passes over the
+  same list, the same neighbour search, the same lookup in several systems) becomes one pass or
+  one shared structure (a spatial index shared by collisions, AI, explosions and pushes; one cache
+  read by several callers). In singleplayer, client and integrated server live in one process:
+  what both hold or compute (registries, block-state tables, biome data, chunk contents, light)
+  is shared or handed over without a copy, and a packet is not encoded then decoded when a direct
+  hand-over gives the same result (the network path stays for LAN guests).
+- [ ] B9. Transfers, at every boundary crossed: CPU to GPU (batched uploads, partial updates,
+  persistent or staging buffers, compact vertex formats, no readback that stalls), thread to
+  thread (batched messages, no copy of large data, bounded queues), disk (batched writes,
+  buffered reads, compression level), network (batching, compression threshold, deltas). Count
+  what crosses per frame or per tick, before and after.
+- [ ] B10. Memory footprint and sharing: identical immutable data stored once (interning,
+  deduplicated palettes and block-state maps, shared sections, copy-on-write), compact types
+  (smaller integers, rare variants boxed, `size_of` of the hot structs asserted in a test),
+  buffers and pools reused instead of per-frame allocations, arenas for short-lived trees.
+- [ ] B11. Toolchain leads, measured like any other: fat LTO against thin, `panic = "abort"`,
+  profile-guided optimisation trained on the bench scenes, a faster hasher for internal maps
+  whose keys no outsider controls, cold/inline hints on measured paths. CPU-specific code only
+  behind runtime detection: the release runs on any x86-64.
+- [ ] B12. Spread the work in time: a budget per frame and per tick, amortised work (a little
+  each frame rather than a spike), priorities (what the camera sees first), background threads
+  for what does not need the main one. Check p99 and stutter, not only the median.
+- [ ] B13. Rendering leads, within the rendering tolerance of A1: culling (frustum, an occlusion
+  graph like Sodium's), instancing of entities and particles, GPU-driven draws (indirect,
+  compute culling), overdraw and translucency cost, shader cost (ALU, texture samples), pipeline
+  cache, frame pacing and input latency.
 
 ## C. Decide
 
@@ -60,6 +87,8 @@ through `rc_data::env_str!` / `env_flag!` / `env_os!` (one read per site, `crate
 - [ ] D2. Quiet machine: no compilation or other client during a measurement (compilation queue).
 - [ ] D3. Rendering: 1600×900 screenshots before/after compared.
 - [ ] D4. Before/after figures in the commit message.
+- [ ] D5. On a loaded machine, a deterministic count (instructions or cache misses, for example
+  cachegrind under WSL) may back up a timing; it never replaces the quiet-machine bench.
 
 ## E. Deliver
 
