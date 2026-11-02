@@ -112,6 +112,15 @@ impl Server {
         }
     }
 
+    /// The server's own source when it reports (sprint report, test runs): owner level, output
+    /// kept (its successes reach the operators; the server's log is not kept).
+    pub(crate) fn server_reply_source(&self) -> Src {
+        let mut s = self.server_source();
+        s.level = 4;
+        s.silent = false;
+        s
+    }
+
     /// Source with the same output, become entity `e` (`execute as`).
     pub(crate) fn with_entity(&self, src: &Src, e: E) -> Src {
         let mut s = src.clone();

@@ -173,6 +173,35 @@ impl TickQueue {
         v
     }
 
+    /// Drops the pending ticks inside the box `min..=max` (those queued for the current tick
+    /// included); only the chunks of the box are visited, a chunk keeps its next due time.
+    pub fn clear_box(&mut self, min: P, max: P) {
+        let inside = |p: &P| (0..3).all(|i| p[i] >= min[i] && p[i] <= max[i]);
+        for cx in (min[0] >> 4)..=(max[0] >> 4) {
+            for cz in (min[2] >> 4)..=(max[2] >> 4) {
+                let Some(c) = self.containers.get_mut(&(cx, cz)) else { continue };
+                if !c.set.iter().any(|(p, _)| inside(p)) {
+                    continue;
+                }
+                c.heap.retain(|r| !inside(&r.0.pos));
+                c.set.retain(|(p, _)| !inside(p));
+                match c.peek() {
+                    Some(t) => {
+                        self.next.insert((cx, cz), t.at);
+                    }
+                    None => {
+                        self.containers.remove(&(cx, cz));
+                        self.next.remove(&(cx, cz));
+                    }
+                }
+            }
+        }
+        if self.to_run_set.iter().any(|(p, _)| inside(p)) {
+            self.to_run.retain(|t| !inside(&t.pos));
+            self.to_run_set.retain(|(p, _)| !inside(p));
+        }
+    }
+
     /// Pending ticks of a chunk (save).
     pub fn chunk_ticks(&self, ch: (i32, i32)) -> Vec<Tick> {
         let mut v: Vec<Tick> =

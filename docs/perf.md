@@ -3072,3 +3072,31 @@ regularity, allocations, disk, RAM, startup, multi-core): figures below, the res
 - To re-measure on a quiet machine with the other menu missions: `menu` scene of
   `tools/bench/scenes.py` (no change expected), screenshots of the video and accessibility
   screens (titles 2 px lower, labels).
+## G3-F06: in-game tests (`/test`), relay of command successes, pack templates (02/11, loaded machine)
+
+- Block-based tests read their structure every tick (start, accept, fail and log blocks). The game
+  walks the structure cell by cell once per mode (three walks per tick, up to 48³ cells each).
+  Kept: one walk for the four modes (nothing changes the blocks between the game's walks), the
+  sections whose palette holds no test block skipped (`may_contain`), only the cells of the
+  structure read in the others, then sorted back into the game's order (relative z, y, x).
+  Bench `tests_g3f06::bench_test_block_search` (48³, a few test blocks, best of 5 × 20): one
+  cell-by-cell walk 1.021 ms, section walk 0.054 ms (×19, per walk; the game makes three per tick).
+  Equivalence: `test_block_search_matches_the_cellwise_reference` (four rotations, chunk and
+  section borders). The cell walk stays behind `RUSTCRAFT_OPT_GT_SCAN=0` until the quiet-machine
+  bench. Leads not taken: cache of the test block positions between ticks (blocks move: pistons,
+  players; a rescan is needed every tick anyway, and the walk is already skip-dominated),
+  multi-core and GPU (a few thousand cells, ordered results, below a thread start).
+- Relay of command successes (`chat.type.admin`): the table of the game's non-relayed keys
+  (97 sorted keys, binary search) is read only when an operator other than the source could
+  receive the message: never for the host's own commands in singleplayer (the common case pays
+  one rule read and one comparison). Command block output: one fewer rule read on success.
+- Templates of the packs: looked up on demand (at most once per identifier, the absence
+  remembered by the template cache, cleared on `/reload`), nothing read at opening; a world with
+  the base pack only skips the pack listing. Lead not taken: stacking every pack `.nbt` at
+  opening (startup and memory for every world, for files most worlds never ask for).
+- Test runner: per tick, only the tests of the current batch are visited (indices, no copy of
+  the tests); structure placement, clearing and barriers run once per test start (command or
+  batch start), with the clearing's tick and block event removal limited to the box's chunks
+  (`TickQueue::clear_box`). Not on any path when no test runs (one `Option` test per tick).
+- To re-measure on a quiet machine: `bench_test_block_search` (2 passes, both walks); scene bench
+  not concerned (no test runs in the scenes; the per-tick cost without a runner is one branch).

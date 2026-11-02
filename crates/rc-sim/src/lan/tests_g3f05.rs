@@ -12,9 +12,9 @@ use rc_proto::varint::{read_varint, write_varint};
 
 use crate::server::Server;
 
-struct T {
-    s: Server,
-    session: rc_client::Session,
+pub(super) struct T {
+    pub(super) s: Server,
+    pub(super) session: rc_client::Session,
     dir: std::path::PathBuf,
 }
 
@@ -27,7 +27,7 @@ impl Drop for T {
 
 const FLOOR: i32 = 199;
 
-fn open(tag: &str) -> T {
+pub(super) fn open(tag: &str) -> T {
     let data = Arc::new(rc_testdata::version_data().expect("version data missing: G3-F05 tests impossible"));
     crate::registries::client_jar(&data).expect("client jar missing: G3-F05 tests impossible");
     let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-g3f05-{tag}-{}", std::process::id())));
@@ -74,7 +74,7 @@ fn open(tag: &str) -> T {
     t
 }
 
-fn drain(t: &T) -> Vec<Event> {
+pub(super) fn drain(t: &T) -> Vec<Event> {
     let mut out = Vec::new();
     while let Ok(e) = t.session.events.try_recv() {
         out.push(e);
@@ -82,19 +82,19 @@ fn drain(t: &T) -> Vec<Event> {
     out
 }
 
-fn publish(t: &mut T, guest_commands: bool) {
+pub(super) fn publish(t: &mut T, guest_commands: bool) {
     let req = super::Publish { open: true, port: 0, guest_commands, force_mode: None };
     t.s.lan_publish(&req).expect("opening");
 }
 
 /// Plugged-in guest: packets received, sending packets to the server.
-struct G {
-    from: Receiver<Vec<u8>>,
+pub(super) struct G {
+    pub(super) from: Receiver<Vec<u8>>,
     to: Sender<Vec<u8>>,
     id: i32,
 }
 
-fn join(t: &mut T, name: &str, view: u8) -> G {
+pub(super) fn join(t: &mut T, name: &str, view: u8) -> G {
     let (out, from) = crossbeam_channel::unbounded();
     let (to, inp) = crossbeam_channel::unbounded();
     let info = rc_proto_v777::play::ClientInformation { view_distance: view, ..Default::default() };

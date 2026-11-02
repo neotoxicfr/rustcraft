@@ -1073,6 +1073,23 @@ impl Server {
                     entity.encode(w);
                 }));
             }
+            // G3-F06: test instance screen answer and `test pos` highlight of a guest.
+            Event::TestInstanceStatus { status, size } => out.push(pk(ids.test_instance_block_status, |w| {
+                match status {
+                    Some(c) => text(w, c),
+                    None => text(w, &rc_text::Component::text("")),
+                }
+                size.is_some().encode(w);
+                if let Some(s) = size {
+                    for v in s {
+                        write_varint(w, *v);
+                    }
+                }
+            })),
+            Event::GameTestHighlight { absolute, relative } => out.push(pk(ids.game_test_highlight_pos, |w| {
+                bpos(w, *absolute);
+                bpos(w, *relative);
+            })),
             Event::TagQuery { id, nbt: n } => out.push(pk(ids.tag_query, |w| {
                 write_varint(w, *id);
                 nbt::write(w, n.as_ref());

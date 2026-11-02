@@ -630,7 +630,7 @@ fn criteria_list(data: &Data) -> Vec<String> {
 }
 
 /// `*` / `?` pattern on a full identifier.
-fn glob(pat: &str, s: &str) -> bool {
+pub fn glob(pat: &str, s: &str) -> bool {
     let p: Vec<char> = pat.chars().collect();
     let t: Vec<char> = s.chars().collect();
     let (mut i, mut j, mut star, mut mark) = (0usize, 0usize, None, 0usize);

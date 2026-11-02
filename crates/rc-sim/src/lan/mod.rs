@@ -14,6 +14,8 @@ mod tests;
 #[cfg(test)]
 mod tests_g3f05;
 #[cfg(test)]
+mod tests_g3f06;
+#[cfg(test)]
 mod tests_g3f07;
 
 use hashbrown::{HashMap, HashSet};

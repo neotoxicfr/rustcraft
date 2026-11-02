@@ -1428,7 +1428,7 @@ impl Server {
         }
     }
 
-    fn set_clock(&mut self, clock: &str, v: i64) {
+    pub(crate) fn set_clock(&mut self, clock: &str, v: i64) {
         if let Some(c) = self.clocks.iter_mut().find(|c| c.0 == clock) {
             c.1 = v;
         } else {

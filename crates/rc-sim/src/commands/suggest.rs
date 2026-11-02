@@ -175,6 +175,15 @@ impl Server {
                 let v: Vec<String> = self.cmd.scheduled.iter().map(|s| s.1.clone()).collect();
                 b.suggest_matching(v);
             }
+            // G3-F06: test instances, the game's own ones shown without their namespace.
+            ("test", "tests" | "test") => {
+                let c = b.remaining_lower.clone();
+                for t in &self.cmd.tests.tests {
+                    if rc_commands::suggest::resource_matches(&c, &t.id) {
+                        b.suggest(t.id.strip_prefix("minecraft:").unwrap_or(&t.id).to_owned());
+                    }
+                }
+            }
             ("place", "template") => {
                 if let Some(v) = self.cmd.server_regs.get("minecraft:structure") {
                     b.suggest_resources(v);

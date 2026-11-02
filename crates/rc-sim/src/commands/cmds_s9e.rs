@@ -202,6 +202,7 @@ impl Server {
             "compute" => self.cmd_compute(s, p, seg),
             "posteffect" => self.cmd_posteffect(s, p, seg),
             "fetchprofile" => self.cmd_fetchprofile(s, p, seg),
+            "test" => self.cmd_test(s, p, seg), // G3-F06
             _ => return None,
         })
     }

@@ -719,8 +719,10 @@ impl Server {
                 let t = &self.cmd.ticking;
                 let (rate, busy, target) = (format!("{:.1}", t.rate()), t.average_tick_nanos(), t.nanos_per_tick());
                 let (p50, p95, p99, n) = t.percentiles();
+                // The query keeps its status for the source (the same status is relayed by the
+                // commands that change it).
                 if t.sprinting() {
-                    self.ok(s, tr!("commands.tick.status.sprinting"));
+                    self.ok_quiet(s, tr!("commands.tick.status.sprinting"));
                     self.ok(s, tr!("commands.tick.query.rate.sprinting", rate.clone(), ms(busy)));
                 } else {
                     let status = if t.frozen() {
@@ -730,7 +732,7 @@ impl Server {
                     } else {
                         "commands.tick.status.running"
                     };
-                    self.ok(s, tr!(status));
+                    self.ok_quiet(s, tr!(status));
                     self.ok(s, tr!("commands.tick.query.rate.running", rate.clone(), ms(busy), ms(target)));
                 }
                 self.ok(s, tr!("commands.tick.query.percentiles", ms(p50), ms(p95), ms(p99), n as i32));
@@ -812,13 +814,9 @@ impl Server {
     /// End of a sprint: report to the operators (source "Server", grey italic), previous freeze
     /// restored and announced.
     pub(crate) fn sprint_finished(&mut self, rep: &crate::tickrate::SprintReport) {
-        if self.rule("minecraft:send_command_feedback", true) && self.cmd.op >= 2 {
-            let msg = tr!("commands.tick.sprint.report", rep.ticks_per_second, rep.ms_per_tick.clone());
-            let mut c = tr!("chat.type.admin", lit("Server"), msg);
-            c.style.color = Some(super::text::GRAY);
-            c.style.italic = Some(true);
-            self.system(c);
-        }
+        let msg = tr!("commands.tick.sprint.report", rep.ticks_per_second, rep.ms_per_tick.clone());
+        let src = self.server_reply_source();
+        self.ok(&src, msg);
         self.on_tick_rate_changed();
         self.send_ticking_state();
     }
