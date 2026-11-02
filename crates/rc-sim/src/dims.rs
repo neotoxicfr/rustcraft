@@ -570,6 +570,10 @@ impl Server {
             for c in &mut w.proj.clouds {
                 c.seen = false;
             }
+            // L9-TICK: fangs parked with the world left (`enter_world` already swapped them out).
+            for f in &mut w.fangs {
+                f.seen = false;
+            }
             // L9-TICK: the bobber left behind no longer finds its player in its world: the game
             // discards it at its next tick, before the rod can be used again.
             w.proj.hook = None;

@@ -112,10 +112,7 @@ fn is_packed(b: &Nbt) -> bool {
 /// the order inside a bucket of nine entries or more at 64 buckets and beyond (never seen in a
 /// chunk's list).
 pub(crate) fn java_hash_order(at: &[P]) -> Vec<usize> {
-    fn spread(p: P) -> usize {
-        let h = p[1].wrapping_add(p[2].wrapping_mul(31)).wrapping_mul(31).wrapping_add(p[0]) as u32;
-        (h ^ (h >> 16)) as usize
-    }
+    let spread = java_spread;
     let mut keys: Vec<usize> = Vec::with_capacity(at.len());
     let mut seen: hashbrown::HashSet<P> = hashbrown::HashSet::with_capacity(at.len());
     let mut cap = 16usize;
@@ -147,6 +144,29 @@ pub(crate) fn java_hash_order(at: &[P]) -> Vec<usize> {
         }
     }
     keys.sort_by_key(|&k| spread(at[k]) & (cap - 1));
+    keys
+}
+
+/// Hash of a position folded on its high half, as the game's hash tables use it.
+fn java_spread(p: P) -> usize {
+    let h = p[1].wrapping_add(p[2].wrapping_mul(31)).wrapping_mul(31).wrapping_add(p[0]) as u32;
+    (h ^ (h >> 16)) as usize
+}
+
+/// L9-TICK: order in which a chunk save promotes the packed block entities still waiting. The
+/// save walks a new set of every block entity position of the chunk (the waiting ones copied
+/// first, in their table's order, into a table sized for them, 16 buckets at least, then the
+/// others added, the table doubling past 3/4 full): the waiting ones come out bucket by bucket
+/// of the final size, each bucket in their table's order. `waiting`: positions in their table's
+/// order; `total`: distinct positions of the chunk, waiting ones included. Returns indices into
+/// `waiting`. Not modelled: a doubling caused by a bucket of nine entries (never seen in a chunk).
+pub(crate) fn java_save_order(waiting: &[P], total: usize) -> Vec<usize> {
+    let mut cap = (waiting.len().max(12) * 4).div_ceil(3).next_power_of_two();
+    while total > cap * 3 / 4 {
+        cap *= 2;
+    }
+    let mut keys: Vec<usize> = (0..waiting.len()).collect();
+    keys.sort_by_key(|&k| java_spread(waiting[k]) & (cap - 1));
     keys
 }
 
@@ -1668,7 +1688,9 @@ impl Server {
     /// L9-TICK: chunks around `ch` (itself included) holding packed block entities and whose
     /// 3 × 3 neighbourhood is now loaded: the chunk can tick, so like the game it promotes them,
     /// in the order of their table, after every block entity registered so far; promoted, a
-    /// block entity is saved unpacked.
+    /// block entity is saved unpacked. A save promotes them too (`promote_packed_for_save`).
+    /// Not modelled: the game also promotes one as soon as anything reads it (a hopper pulling
+    /// from it, a comparator) before its chunk can tick.
     fn promote_packed_near(&mut self, ch: (i32, i32)) {
         if self.bs.packed.is_empty() {
             return;
@@ -1680,19 +1702,40 @@ impl Server {
             {
                 continue;
             }
-            for p in self.bs.packed.remove(&c).unwrap_or_default() {
-                let Some(Some(chunk)) = self.chunks.get_mut(&c) else { break };
-                let pos_of = |b: &Nbt| {
-                    let i = |k: &str| crate::nbtio::int(b, k).unwrap_or(0) as i32;
-                    [i("x"), i("y"), i("z")] == p
-                };
-                // Still the packed entry (a block entity put there since then registered its own).
-                let Some(b) = chunk.block_entities.iter_mut().find(|b| pos_of(b) && is_packed(b)) else { continue };
-                crate::nbtio::set(b, "keepPacked", Nbt::Byte(0));
-                let id = b.get("id").and_then(Nbt::as_str).unwrap_or("");
-                let be = LoadedBe::of(id, crate::nbtio::int(b, "TransferCooldown").unwrap_or(0) as i32);
-                self.register_loaded_ticker(p, be);
-            }
+            let list = self.bs.packed.remove(&c).unwrap_or_default();
+            self.promote_packed(c, list);
+        }
+    }
+
+    /// L9-TICK: a chunk about to be written promotes its packed block entities still waiting,
+    /// like the game, whose save reads every block entity of the chunk (each one then registers
+    /// its ticker and is written unpacked), in the order of `java_save_order`.
+    pub(crate) fn promote_packed_for_save(&mut self, ch: (i32, i32)) {
+        let Some(list) = self.bs.packed.remove(&ch) else { return };
+        let Some(Some(c)) = self.chunks.get(&ch) else { return };
+        let pos = |b: &Nbt| {
+            let i = |k: &str| crate::nbtio::int(b, k).unwrap_or(0) as i32;
+            [i("x"), i("y"), i("z")]
+        };
+        let total = c.block_entities.iter().map(pos).collect::<hashbrown::HashSet<P>>().len();
+        let order: Vec<P> = java_save_order(&list, total).into_iter().map(|k| list[k]).collect();
+        self.promote_packed(ch, order);
+    }
+
+    /// Promotes the packed block entities `list` of chunk `c`, in that order.
+    fn promote_packed(&mut self, c: (i32, i32), list: Vec<P>) {
+        for p in list {
+            let Some(Some(chunk)) = self.chunks.get_mut(&c) else { break };
+            let pos_of = |b: &Nbt| {
+                let i = |k: &str| crate::nbtio::int(b, k).unwrap_or(0) as i32;
+                [i("x"), i("y"), i("z")] == p
+            };
+            // Still the packed entry (a block entity put there since then registered its own).
+            let Some(b) = chunk.block_entities.iter_mut().find(|b| pos_of(b) && is_packed(b)) else { continue };
+            crate::nbtio::set(b, "keepPacked", Nbt::Byte(0));
+            let id = b.get("id").and_then(Nbt::as_str).unwrap_or("");
+            let be = LoadedBe::of(id, crate::nbtio::int(b, "TransferCooldown").unwrap_or(0) as i32);
+            self.register_loaded_ticker(p, be);
         }
     }
 

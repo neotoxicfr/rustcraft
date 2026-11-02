@@ -7,6 +7,7 @@ use crate::dims::{NETHER, OVERWORLD, Transition, rel};
 use crate::mobs::species::Kind;
 use crate::player::Stack;
 use crate::tests_g3f13::{finish, open};
+use rc_client::{EntityEvent, Event};
 
 fn cmd(p: &mut Probe, c: &str) {
     let src = p.s.server_source();
@@ -133,17 +134,21 @@ pub(crate) fn fight_ticket_ticks_the_blocks_of_the_arena(fight: impl FnOnce() ->
 #[test]
 fn dimension_state_stays_with_its_world() {
     let (mut p, dir) = open("l9-swap");
-    p.s.mobs.ill.fangs.push(crate::mobs::illagers::spells::Fangs {
-        id: 9001,
+    let fangs = |id: i32, warmup: i32, sent_spike: bool| crate::mobs::illagers::spells::Fangs {
+        id,
         pos: [2.5, -60.0, 2.5],
         yaw: 0.0,
-        warmup: 5,
+        warmup,
         life: 22,
-        sent_spike: false,
+        sent_spike,
         owner: None,
         removed: false,
         born: 0,
-    });
+        seen: true,
+    };
+    p.s.mobs.ill.fangs.push(fangs(9001, 5, false));
+    // Already bitten (its bite event went out before the player left).
+    p.s.mobs.ill.fangs.push(fangs(9002, -3, true));
     let uuid = p.s.uuid;
     p.s.life.sign_editors.insert([3, -60, 3], uuid);
     p.s.slots[36] = Some(Stack { id: "minecraft:fishing_rod".into(), count: 1, components: None });
@@ -165,9 +170,22 @@ fn dimension_state_stays_with_its_world() {
     let left = p.s.dims.parked.iter().find(|w| w.dim.name == OVERWORLD).expect("parked overworld");
     assert!(left.proj.hook.is_none(), "bobber kept in the world left");
     p.s.change_dimension(to(OVERWORLD));
-    assert_eq!(p.s.mobs.ill.fangs.iter().map(|f| f.id).collect::<Vec<_>>(), vec![9001], "fangs kept");
+    assert_eq!(p.s.mobs.ill.fangs.iter().map(|f| f.id).collect::<Vec<_>>(), vec![9001, 9002], "fangs kept");
     assert_eq!(p.s.life.sign_editors.get(&[3, -60, 3]), Some(&uuid), "editor kept with its sign");
     assert!(p.s.proj.hook.is_none());
+    // The client cleared its entities at respawn: both fangs are announced again at their next
+    // tick, without the bite event of the one that had already bitten (the game sends only the
+    // entity: on the client those fangs stay invisible).
+    let _ = p.take_events();
+    game_ticks(&mut p, 1);
+    let ev = p.take_events();
+    let added = |id: i32| ev.iter().any(|e| matches!(e, Event::Entity(EntityEvent::Add(a)) if a.id == id));
+    assert!(added(9001) && added(9002), "fangs announced again on return");
+    let bite = ev.iter().any(|e| matches!(e, Event::Entity(EntityEvent::Event { id: 9002, event: 4 })));
+    assert!(!bite, "bite event sent a second time");
+    game_ticks(&mut p, 1);
+    let again = p.take_events().iter().any(|e| matches!(e, Event::Entity(EntityEvent::Add(a)) if a.id == 9001));
+    assert!(!again, "announced once");
     finish(p, dir);
 }
 
@@ -301,6 +319,55 @@ fn packed_block_entities_promoted_when_the_chunk_can_tick() {
     assert!(id(packed) > id(plain) && id(packed) > id(other), "promoted after the others");
     let flag = p.s.chunks.get(&at).cloned().flatten().expect("chunk").block_entities[0].get("keepPacked").cloned();
     assert_eq!(flag, Some(rc_proto::nbt::Nbt::Byte(0)), "saved unpacked once promoted");
+    finish(p, dir);
+}
+
+/// Order of the packed block entities promoted by a chunk save: the walk of a set of every
+/// position of the chunk, sized for the waiting ones then grown by the others (values from
+/// Java's standard collections run on these positions; with 12 waiting and 1 other, or 13 and
+/// 14, the set is larger than the waiting table and the order changes).
+#[test]
+fn save_promotion_order_is_the_game_set_walk() {
+    let waiting = |n: i32| (0..n).map(|i| [192 + i, -60 + 3 * i, (5 * i) % 16]).collect::<Vec<_>>();
+    let order = |n: i32, others: usize| {
+        let at = waiting(n);
+        let walk: Vec<usize> = crate::blocks::entities::java_hash_order(&at);
+        let pos: Vec<[i32; 3]> = walk.iter().map(|&k| at[k]).collect();
+        let save = crate::blocks::entities::java_save_order(&pos, at.len() + others);
+        save.into_iter().map(|k| walk[k]).collect::<Vec<_>>()
+    };
+    assert_eq!(order(13, 0), [2, 0, 3, 10, 11, 12, 7, 8, 9, 4, 5, 6, 1]);
+    assert_eq!(order(13, 14), [2, 0, 11, 7, 9, 5, 1, 3, 10, 12, 8, 4, 6]);
+    assert_eq!(order(12, 1), [2, 0, 3, 10, 11, 7, 8, 9, 4, 5, 6, 1]);
+    assert_eq!(order(5, 30), [2, 0, 1, 3, 4]);
+}
+
+/// A chunk at the edge of the loaded area (neighbours missing: it never ticks) saved while its
+/// packed hoppers still wait: the save reads them, so like the game they register their tickers
+/// in the save's order and are written unpacked. Before: still waiting, written packed.
+#[test]
+fn chunk_save_promotes_its_packed_block_entities() {
+    let (mut p, dir) = open("l9-savepack");
+    let at = (12, 0);
+    let (a, b) = ([192, -60, 0], [193, -57, 5]);
+    let c = crafted_chunk(&p, at, vec![hopper_nbt(b, true), hopper_nbt(a, true)]);
+    p.s.chunks.insert(at, Some(c));
+    p.s.import_chunk_ticks(at);
+    assert!(!p.s.bs.hoppers.contains_key(&a), "waits for the neighbours");
+    if let Some(Some(c)) = p.s.chunks.get_mut(&at) {
+        c.dirty = true;
+    }
+    let mut jobs = Vec::new();
+    p.s.chunk_jobs(&mut jobs);
+    let id = |q: [i32; 3]| p.s.bs.hoppers.get(&q).map(|h| h.0).expect("hopper ticker");
+    // Save order of these two (a set of 16 buckets): a's bucket 3 before b's bucket 15, whatever
+    // their place in the chunk's list.
+    assert!(id(a) < id(b), "promoted in the save's order");
+    let c = p.s.chunks.get(&at).cloned().flatten().expect("chunk");
+    for be in &c.block_entities {
+        assert_eq!(be.get("keepPacked").cloned(), Some(rc_proto::nbt::Nbt::Byte(0)), "written unpacked");
+    }
+    assert!(!p.s.bs.packed.contains_key(&at));
     finish(p, dir);
 }
 
