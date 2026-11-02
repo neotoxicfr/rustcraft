@@ -60,6 +60,22 @@ impl App {
         self.grab(true);
     }
 
+    /// Window resized: the open screen is laid out again like the game's (`bundle::screen_init`);
+    /// the creative screen reloads its grid at the same row (saved hotbars read again) and sets its
+    /// search text again (cursor at the end, no selection).
+    pub(crate) fn screen_resized(&mut self) {
+        if !(self.screens.open || self.creative_ui.open) {
+            return;
+        }
+        self.bundle_resize();
+        if self.creative_ui.open {
+            let rows = self.hotbar_rows();
+            self.creative_ui.reload(&self.data, &rows, true);
+            let search = &mut self.creative_ui.search;
+            (search.cursor, search.anchor) = (search.text.len(), search.text.len());
+        }
+    }
+
     /// Tick: survival ↔ creative switch according to the abilities, rebuilding of the lists (§ 1, § 3.1).
     pub(crate) fn creative_tick(&mut self) {
         self.creative_ui.drops = (self.creative_ui.drops - 1).max(0);
@@ -176,10 +192,6 @@ impl App {
     }
 
     fn creative_search_changed(&mut self) {
-        // The grid shows other stacks: a choice made on a grid bundle stays with the old stack.
-        if let Some(k) = crate::bundle::selected_slot().filter(|&k| k >= crate::bundle::CREATIVE_GRID) {
-            crate::bundle::set_selected(k, -1);
-        }
         if let Some(r) = &self.renderer {
             let env = self.hud_env();
 
@@ -407,21 +419,12 @@ impl App {
     pub(crate) fn creative_click(&mut self, hit: Option<Hit>, outside: bool, button: u8, mode: i32) {
         let before = self.inventory.menu.clone();
         let inventory_tab = self.creative_ui.kind(&self.data) == CreativeKind::Inventory;
-        // Bundle moved quickly or swapped: "no item selected" announced before the click, like
-        // the container screens (`screens.rs`), with the slot index in the creative screen.
-        if matches!(mode, 1 | 2)
-            && let Some(h) = hit
-            && let Some(index) = creative_slot_index(h, inventory_tab)
-        {
-            let st = match h {
-                Hit::Grid(i) => self.creative_ui.grid_stack(i),
-                Hit::Menu(i) => self.inventory.menu.get(i).and_then(Option::as_ref),
-                Hit::Trash => None,
-            };
-            let name = |s: &ItemStack| usize::try_from(s.item).ok().and_then(|i| self.item_names.get(i));
-            if st.and_then(name).map(String::as_str).is_some_and(crate::bundle::is_bundle_name) {
-                let _ = self.session.link.send_bundle_item_selected(index, -1);
-            }
+        let names = &self.item_names;
+        let is_bundle = |s: &ItemStack| {
+            usize::try_from(s.item).ok().and_then(|i| names.get(i)).is_some_and(|n| crate::bundle::is_bundle_name(n))
+        };
+        if let Some(index) = unselect_creative(&self.creative_ui, &self.inventory.menu, hit, mode, inventory_tab, is_bundle) {
+            let _ = self.session.link.send_bundle_item_selected(index, -1);
         }
         match hit {
             None => {
@@ -760,6 +763,27 @@ impl App {
     }
 }
 
+/// Bundle moved quickly or swapped in the creative screen (mode 1 or 2): its stack forgets its
+/// chosen item and −1 is announced before the click, with the slot's index in the creative screen
+/// (returned), like the container screens (`bundle::unselect_before_click`).
+pub(crate) fn unselect_creative(
+    ui: &crate::creative_screen::CreativeScreen,
+    menu: &[Option<ItemStack>],
+    hit: Option<Hit>,
+    mode: i32,
+    inventory_tab: bool,
+    is_bundle: impl Fn(&ItemStack) -> bool,
+) -> Option<i32> {
+    let h = hit?;
+    let index = creative_slot_index(h, inventory_tab)?;
+    let st = match h {
+        Hit::Grid(i) => ui.grid_stack(i),
+        Hit::Menu(i) => menu.get(i).and_then(Option::as_ref),
+        Hit::Trash => None,
+    };
+    crate::bundle::unselect_on_click(mode, ui.stack_key(h), st.is_some_and(is_bundle)).then_some(index)
+}
+
 /// Index of a slot in the creative screen's menu, as the game announces it to the server:
 /// grid 0..44, hotbar 45..53; the inventory tab recreates its slots without giving them an index
 /// (all 0, game quirk reproduced). Trash: never (always empty).
@@ -784,5 +808,33 @@ mod tests {
         assert_eq!(idx(Hit::Menu(12), true), Some(0));
         assert_eq!(idx(Hit::Menu(45), true), Some(0));
         assert_eq!(idx(Hit::Trash, true), None);
+    }
+
+    /// L10: a quick move or a number-key swap on a bundle forgets its stack's chosen item before the
+    /// click (announced with the creative index), like the container screens: the bundle brought
+    /// into the slot by the swap shows none, and the next wheel notch starts from −1.
+    #[test]
+    fn creative_click_unselects_the_bundle() {
+        use crate::bundle::{CREATIVE_GRID as G, selected, set_selected};
+        use rc_proto_v777::item::ItemStack;
+        let st = |item| Some(ItemStack { item, count: 1, added: Vec::new(), removed: Vec::new() });
+        // 90 grid stacks scrolled one row down: slot 3 shows the bundle at place 12.
+        let mut ui = crate::creative_screen::CreativeScreen::default();
+        ui.shown = (0..90).map(|k| st(if k == 12 { 7 } else { 3 })).collect();
+        ui.scroll = 0.2;
+        let mut menu = vec![None; 46];
+        menu[20] = st(7);
+        let is_bundle = |s: &ItemStack| s.item == 7;
+        let u = super::unselect_creative;
+        set_selected(20, 2);
+        assert_eq!(u(&ui, &menu, Some(Hit::Menu(20)), 0, true, is_bundle), None, "simple click");
+        assert_eq!(selected(20), 2);
+        assert_eq!(u(&ui, &menu, Some(Hit::Menu(20)), 2, true, is_bundle), Some(0), "inventory tab index");
+        assert_eq!(selected(20), -1, "choice forgotten with the swap");
+        set_selected(G + 12, 1);
+        assert_eq!(u(&ui, &menu, Some(Hit::Grid(3)), 1, false, is_bundle), Some(3));
+        assert_eq!(selected(G + 12), -1);
+        assert_eq!(u(&ui, &menu, Some(Hit::Grid(4)), 2, false, is_bundle), None, "not a bundle");
+        assert_eq!(u(&ui, &menu, None, 2, false, is_bundle), None);
     }
 }

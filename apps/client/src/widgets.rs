@@ -21,7 +21,6 @@ pub fn tr(lang: &rc_text::Lang, key: &str, args: &[String]) -> String {
     rc_text::flatten(&c, lang).iter().map(|s| s.text.as_str()).collect()
 }
 
-/// Styled characters of a text (§ codes included).
 /// Label lines of a checkbox `max` wide: two lines at most; when more remain, the second is cut
 /// to leave room for a plain "..." and ends with dots in `dots` style.
 pub fn checkbox_lines(m: &dyn rc_text::Metrics, msg: &[StyledChar], max: i32, dots: &rc_text::CharStyle) -> Vec<Vec<StyledChar>> {
@@ -43,6 +42,7 @@ fn checkbox_text_top(y: i32, lines: usize) -> i32 {
     y + 17 / 2 - (9 * lines as i32) / 2
 }
 
+/// Styled characters of a text (§ codes included).
 pub fn chars(s: &str) -> Vec<StyledChar> {
     crate::gui::plain(s)
 }
