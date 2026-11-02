@@ -130,8 +130,9 @@ pub fn inventory_slot_pos(i: usize) -> Option<(i32, i32)> {
     })
 }
 
-/// Key of a slot in the bundles' chosen-item table (`bundle.rs`): menu slots keep their index,
-/// grid slots come after every menu, the trash has none (`usize::MAX`).
+/// Key of a slot for the bundles' hovered-slot rule (`bundle.rs`): menu slots keep their index,
+/// grid slots come after every menu, the trash has none (`usize::MAX`). The chosen items go by
+/// stack: [`CreativeScreen::stack_key`].
 pub fn hit_key(h: Hit) -> usize {
     match h {
         Hit::Grid(i) => crate::bundle::CREATIVE_GRID + i,
@@ -241,6 +242,16 @@ impl CreativeScreen {
         self.shown.get(i + 9 * k)?.as_ref()
     }
 
+    /// Key of the stack a slot shows in the bundles' chosen-item table: a menu slot keeps its
+    /// index; a grid slot gives its stack's place in the grid's list (`CREATIVE_GRID` + place), as
+    /// the game keeps the choice on the stack, which the grid may scroll away from under the mouse.
+    pub fn stack_key(&self, h: Hit) -> usize {
+        match h {
+            Hit::Grid(i) => crate::bundle::CREATIVE_GRID + i + 9 * self.first_row() as usize,
+            _ => hit_key(h),
+        }
+    }
+
     /// Stack of a displayed slot.
     pub fn stack_at(&self, inv: &PlayerInventory, h: Hit) -> Option<ItemStack> {
         match h {
@@ -279,8 +290,10 @@ impl CreativeScreen {
         }
     }
 
-    /// Grid contents for the current tab; `keep_row` keeps the starting row.
+    /// Grid contents for the current tab; `keep_row` keeps the starting row. The grid's stacks are
+    /// new (saved hotbars read again), without chosen bundle items.
     pub fn reload(&mut self, data: &rc_data::VersionData, hotbars: &[Option<ItemStack>], keep_row: bool) {
+        crate::bundle::forget_grid();
         let row = self.first_row();
         self.shown = match self.kind(data) {
             CreativeKind::Category => {
@@ -364,9 +377,10 @@ impl CreativeScreen {
         self.index = Some((key, idx));
     }
 
-    /// Search text modified: filter and back to the top (§ 4.2).
+    /// Search text modified: filter and back to the top (§ 4.2), other stacks without choices.
     pub fn search_changed(&mut self, data: &rc_data::VersionData) {
         if self.kind(data) == CreativeKind::Search {
+            crate::bundle::forget_grid();
             self.shown = self.filtered();
             self.scroll = 0.0;
         }
@@ -465,8 +479,9 @@ impl CreativeScreen {
         self.icons.resize_with(tabs.len(), || None);
         if let Some(models) = gui.items.as_ref().map(|a| &a.models) {
             for (i, s) in stacks.iter().enumerate() {
-                // Slot key: the item chosen in a bundle with the wheel shows in its model.
-                let hold = crate::stack::Hold { menu_slot: u16::try_from(hit_key(hits[i])).ok(), ..crate::stack::Hold::NONE };
+                // Stack key: the item chosen in a bundle with the wheel shows in its model.
+                let hold =
+                    crate::stack::Hold { menu_slot: u16::try_from(self.stack_key(hits[i])).ok(), ..crate::stack::Hold::NONE };
                 match s {
                     Some(st) => crate::screens::refresh_held(&mut self.cache[i], st, it, models, i as i32, hold),
                     None => self.cache[i] = None,
@@ -561,7 +576,7 @@ impl CreativeScreen {
                 match contents {
                     // Container (bundle): grid of the items under the name, chosen item marked.
                     Some(items) if !lines.is_empty() => {
-                        let sel = crate::bundle::selected(hit_key(h));
+                        let sel = crate::bundle::selected(self.stack_key(h));
                         crate::bundle::draw_tooltip(gui, queue, it, &ctx, lines, &items, sel, m, style.as_deref());
                     }
                     _ => crate::screens::draw_tooltip_ex(gui, queue, lines, *tw, m, true, style.as_deref()),
@@ -645,6 +660,43 @@ mod tests {
             let Some((x, y)) = hit_pos(h) else { return false };
             mx >= x - 1 && mx < x + 17 && my >= y - 1 && my < y + 17
         })
+    }
+
+    /// Grid of 90 stacks scrolled one row down (slot `i` shows the stack at place `i + 9`).
+    fn scrolled() -> CreativeScreen {
+        let st = |item| Some(ItemStack { item, count: 1, added: Vec::new(), removed: Vec::new() });
+        let mut c = CreativeScreen { shown: (0..90).map(st).collect(), ..Default::default() };
+        c.scroll = 0.2;
+        c
+    }
+
+    /// L10: a grid slot's chosen-item key is its stack's place in the list (it follows a scroll);
+    /// menu slots keep theirs.
+    #[test]
+    fn grid_stack_key_follows_the_list() {
+        use crate::bundle::CREATIVE_GRID as G;
+        let mut c = scrolled();
+        assert_eq!(c.grid_stack(3).map(|s| s.item), Some(12));
+        assert_eq!(c.stack_key(Hit::Grid(3)), G + 12);
+        assert_eq!((c.stack_key(Hit::Menu(36)), c.stack_key(Hit::Trash)), (36, usize::MAX));
+        c.scroll = 0.0;
+        assert_eq!(c.stack_key(Hit::Grid(3)), G + 3);
+    }
+
+    /// L10: the grid shows other stacks (tab chosen, lists rebuilt, search changed): the choices of
+    /// its old stacks go with them; those of the menu slots stay.
+    #[test]
+    fn grid_rebuild_forgets_its_stacks_choices() {
+        use crate::bundle::{CREATIVE_GRID as G, selected, set_selected};
+        let mut c = scrolled();
+        set_selected(G + 12, 1);
+        set_selected(36, 2);
+        c.reload(&data(CreativeKind::Category), &[], true);
+        assert_eq!((selected(G + 12), selected(36)), (-1, 2));
+        let mut c = scrolled();
+        set_selected(G + 12, 1);
+        c.search_changed(&data(CreativeKind::Search));
+        assert_eq!((selected(G + 12), selected(36)), (-1, 2));
     }
 
     /// The hovered slot is checked every frame now (bundle stop-hover rule): same slot as the

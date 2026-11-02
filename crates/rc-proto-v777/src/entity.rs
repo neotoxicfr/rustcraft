@@ -269,11 +269,11 @@ pub struct Particle {
     pub kind: i32,
     /// ARGB colour for tinted particles (`entity_effect`…), RGB for `dust`, otherwise 0.
     pub color: u32,
-    /// Block state (`block`…) or integer (`shriek`), otherwise 0.
+    /// Block state (`block`…), integer (`shriek`) or water blocks (`geyser`…), otherwise 0.
     pub state: i32,
     /// Item (`item`), otherwise −1.
     pub item: i32,
-    /// Scale (`dust`) or power (`effect`), otherwise 1.
+    /// Scale (`dust`), power (`effect`) or burst impulse (`geyser_base`, `geyser_poof`), otherwise 1.
     pub scale: f32,
     /// End RGB colour of `dust_color_transition` (`color` = start), otherwise 0.
     pub color2: u32,
@@ -422,11 +422,10 @@ impl MetaCodec {
             }
             // Power (`dragon_breath`) or roll (`sculk_charge`), read like the scale.
             Some(ParticleOpts::Float) => scale = f32::decode(r)?,
-            Some(ParticleOpts::Geyser) => {
-                r.take(4)?;
-            }
+            Some(ParticleOpts::Geyser) => state = i32::decode(r)?,
             Some(ParticleOpts::GeyserBase) => {
-                r.take(8)?;
+                state = i32::decode(r)?;
+                scale = f32::decode(r)?;
             }
             Some(ParticleOpts::Item) => {
                 item = self.items.read_template(r)?.item;

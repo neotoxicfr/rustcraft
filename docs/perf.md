@@ -3303,3 +3303,22 @@ runs), so only the order of magnitude is claimed.
 - Multi-core and GPU not applicable (per-event or per-frame UI work of a few hundred
   nanoseconds at most). Scenes to re-measure on a quiet machine: `menu` and an in-game scene with
   the creative inventory open (no change expected beyond the removed allocation).
+
+## L10-CLIENT: bundle choices per stack, particle options of `/particle` (02/11, loaded machine)
+
+- Bundle choices: the single cell (one slot, one index) became a table per stack key (menu slot,
+  or place in the creative grid's list), since the game keeps the choice on the stack. Micro-bench
+  `bundle::tests::bench_bundle_choices` (3 passes, 4 million lookups): former cell 0.52-0.59 ns per
+  lookup, table empty 1.14-1.33 ns, with 4 choices 1.91-2.09 ns; hovered-slot rule of a frame (mouse
+  changing slot every frame, the worst case) 3.70-4.00 ns. Called for the bundles drawn in an open
+  screen and once per frame for the rule: a few nanoseconds per frame, not a hot spot; an empty-table
+  fast path (count in a cell) would save about 0.6 ns per drawn bundle, below anything a frame can
+  show, not kept (more state for nothing measurable). No allocation per frame (the table only grows
+  when a wheel notch chooses an item).
+- Window resized with a screen open: one wheel reset, and for the creative screen one grid reload
+  (the same as choosing the tab, already done on each tab change). Per event, never per frame.
+- `/particle` options: decoded once at parse and once at execution, like before; the error list only
+  allocates when a field fails. Geyser options now carried to the guests (4 or 8 bytes, as before,
+  with the real values instead of zeros). Not a hot spot; multi-core and GPU not applicable.
+- Scenes to re-measure on a quiet machine: `menu` and an in-game scene with the creative inventory
+  open (saved hotbars tab with bundles); no change expected.

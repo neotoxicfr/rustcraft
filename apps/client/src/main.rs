@@ -3382,8 +3382,16 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::Resized(s) => {
+                // The game lays its screen out again each time the window takes another non-zero
+                // size (a minimised window restored included).
+                static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let size = u64::from(s.width) << 32 | u64::from(s.height);
+                let changed = LAST.swap(size, std::sync::atomic::Ordering::Relaxed) != size;
                 if let Some(r) = &mut self.renderer {
                     r.resize(s.width, s.height);
+                }
+                if changed && s.width > 0 && s.height > 0 {
+                    self.screen_resized();
                 }
             }
             // F3 and F3 + … keys (`debug-f3.md` § 6), before the screens.

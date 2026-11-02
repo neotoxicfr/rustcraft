@@ -239,8 +239,10 @@ pub fn bar(ctx: &Ctx<'_>, st: &ItemStack) -> Option<(i32, u32)> {
 // Client state: wheel choice, prediction sounds.
 
 thread_local! {
-    /// Hovered menu slot whose bundle has a chosen item, and its index.
-    static SELECTED: Cell<Option<(usize, i32)>> = const { Cell::new(None) };
+    /// Chosen item per stack key (menu slot, or `CREATIVE_GRID` + place in the creative grid's
+    /// list): the game keeps the choice on the stack itself, so a grid stack moved away from under
+    /// the mouse keeps its own while another is chosen.
+    static SELECTED: RefCell<Vec<(usize, i32)>> = const { RefCell::new(Vec::new()) };
     /// Wheel accumulation (x, y), like the game's handler.
     static WHEEL: Cell<(f64, f64)> = const { Cell::new((0.0, 0.0)) };
     /// Sound to play after a prediction: (event, volume, random pitch).
@@ -249,33 +251,49 @@ thread_local! {
     static CACHE: RefCell<Vec<Option<Cached>>> = const { RefCell::new(Vec::new()) };
 }
 
-pub fn selected(slot: usize) -> i32 {
-    SELECTED.with(|s| s.get().filter(|(k, _)| *k == slot).map_or(-1, |(_, i)| i))
+/// Chosen item of the stack `key` (−1: none).
+pub fn selected(key: usize) -> i32 {
+    SELECTED.with(|s| s.borrow().iter().find(|e| e.0 == key).map_or(-1, |e| e.1))
 }
 
-pub fn set_selected(slot: usize, index: i32) {
-    SELECTED.with(|s| s.set((index >= 0).then_some((slot, index))));
+/// Chooses item `index` of the stack `key` (−1: forgets its choice).
+pub fn set_selected(key: usize, index: i32) {
+    SELECTED.with(|s| {
+        let mut s = s.borrow_mut();
+        s.retain(|e| e.0 != key);
+        if index >= 0 {
+            s.push((key, index));
+        }
+    });
 }
 
-/// Slot whose bundle loses its chosen item before a click is sent: quick move (mode 1)
-/// or swap with the hotbar (mode 2) on a non-empty slot that contains a bundle. The game then
-/// announces −1 to the server even if nothing was chosen.
+/// The creative grid shows other stacks (search, tab, reload): its old stacks are gone with
+/// their choices.
+pub fn forget_grid() {
+    SELECTED.with(|s| s.borrow_mut().retain(|e| e.0 < CREATIVE_GRID));
+}
+
+/// Quick move (mode 1) or swap with the hotbar (mode 2) on a slot that holds a bundle: its stack
+/// (`key`) forgets its chosen item, and the game announces −1 for the slot before the click even if
+/// nothing was chosen. True if −1 is to be announced.
+pub fn unselect_on_click(mode: i32, key: usize, holds_bundle: bool) -> bool {
+    let unselect = matches!(mode, 1 | 2) && holds_bundle;
+    if unselect {
+        set_selected(key, -1);
+    }
+    unselect
+}
+
+/// [`unselect_on_click`] in a container screen: slot `slot` of `slots`; returns the slot to announce.
 pub fn unselect_before_click(
     mode: i32,
     slot: i16,
     slots: &[Option<ItemStack>],
     is_bundle: impl Fn(&ItemStack) -> bool,
 ) -> Option<usize> {
-    if !matches!(mode, 1 | 2) {
-        return None;
-    }
     let i = usize::try_from(slot).ok()?;
-    slots.get(i)?.as_ref().filter(|st| is_bundle(st)).map(|_| i)
-}
-
-/// Slot currently chosen (for the reset to −1 when the mouse leaves it).
-pub fn selected_slot() -> Option<usize> {
-    SELECTED.with(|s| s.get().map(|(k, _)| k))
+    let holds = slots.get(i)?.as_ref().is_some_and(is_bundle);
+    unselect_on_click(mode, i, holds).then_some(i)
 }
 
 pub fn sound(name: &'static str, volume: f32, random_pitch: bool) {
@@ -493,13 +511,15 @@ pub fn draw_tooltip(
     }
 }
 
-/// Key of a creative grid slot in the chosen-item table: after every menu slot (the creative
-/// screen's menu slots keep their index).
+/// Key of a creative grid slot, and of a stack of the grid's list, in the bundle tables: after
+/// every menu slot (the creative screen's menu slots keep their index).
 pub const CREATIVE_GRID: usize = 1000;
 
 thread_local! {
     /// Slot hovered at the previous frame (key), to announce the one the mouse leaves.
     static HOVERED: Cell<Option<usize>> = const { Cell::new(None) };
+    /// Screen of the previous frame (`HoverScreen::id`), `None` without a screen.
+    static SCREEN: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
 /// What the stop-hover rule needs of the open screen, for slot keys.
@@ -508,31 +528,50 @@ pub(crate) trait HoverScreen {
     fn holds_bundle(&self, key: usize) -> bool;
     /// Slot index announced to the server.
     fn index(&self, key: usize) -> Option<i32>;
+    /// Key of the stack the slot shows, in the chosen-item table.
+    fn stack_key(&self, key: usize) -> usize;
+    /// Identity of the screen: another one replaces it without any slot being left.
+    fn id(&self) -> u32;
+}
+
+/// Everything forgotten: chosen items, and the wheel accumulation (the game's next screen makes its
+/// own).
+fn forget() {
+    SELECTED.with(|c| c.borrow_mut().clear());
+    WHEEL.with(|w| w.set((0.0, 0.0)));
 }
 
 /// Hovered slot of the frame (`now`, `None` without a screen): when it changes, the slot left
 /// forgets its chosen item and, if it holds a bundle, −1 is announced for it, whatever was
-/// chosen, like the game each time its hovered slot changes; without a screen everything is
-/// forgotten silently (a screen closed by the server announces nothing) and the wheel
-/// accumulation starts again from zero at the next screen. Returns the announcement to send.
+/// chosen, like the game each time its hovered slot changes; without a screen, or when another
+/// screen replaced the previous one (opened by the server, creative and survival inventories
+/// swapped), everything is forgotten silently and the wheel accumulation starts again from zero.
+/// Returns the announcement to send.
 pub(crate) fn hover_frame(now: Option<usize>, screen: Option<&dyn HoverScreen>) -> Option<i32> {
     let before = HOVERED.with(|h| h.replace(now));
-    let Some(s) = screen else {
-        SELECTED.with(|c| c.set(None));
-        WHEEL.with(|w| w.set((0.0, 0.0)));
+    let id = screen.map(|s| s.id());
+    let replaced = SCREEN.with(|c| c.replace(id)) != id;
+    let Some(s) = screen.filter(|_| !replaced) else {
+        forget();
         return None;
     };
     let k = before.filter(|_| before != now)?;
     leave(k, s)
 }
 
-/// The mouse leaves slot `k` (or its screen is closed by the player): chosen item forgotten,
-/// −1 to announce if a bundle is there.
+/// The mouse leaves slot `k` (or its screen is closed by the player): the stack shown there
+/// forgets its chosen item, −1 to announce if it is a bundle.
 fn leave(k: usize, s: &dyn HoverScreen) -> Option<i32> {
-    if selected_slot() == Some(k) {
-        set_selected(k, -1);
-    }
+    set_selected(s.stack_key(k), -1);
     if s.holds_bundle(k) { s.index(k) } else { None }
+}
+
+/// Screen laid out again (window resized): a new wheel accumulation, like the game's new mouse
+/// action; `rebuilt`: its slots are new (creative inventory tab), so the hovered one is left
+/// (announced if it holds a bundle) and the next frame enters the new one.
+pub(crate) fn screen_init(rebuilt: Option<&dyn HoverScreen>) -> Option<i32> {
+    WHEEL.with(|w| w.set((0.0, 0.0)));
+    hover_close(rebuilt?)
 }
 
 /// Screen closed by the player: its hovered slot is left (announced after the closing packet,
@@ -573,6 +612,18 @@ impl HoverScreen for OpenScreen<'_> {
         }
         creative_index(key, a.creative_ui.kind(&a.data) == rc_data::CreativeKind::Inventory)
     }
+
+    fn stack_key(&self, key: usize) -> usize {
+        match key.checked_sub(CREATIVE_GRID) {
+            Some(i) if self.app.creative_ui.open => self.app.creative_ui.stack_key(crate::creative_screen::Hit::Grid(i)),
+            _ => key,
+        }
+    }
+
+    /// Creative screen, otherwise the window of the container screen (0: inventory).
+    fn id(&self) -> u32 {
+        if self.app.creative_ui.open { u32::MAX } else { crate::screens::current(&self.app.inventory).2 as u32 }
+    }
 }
 
 /// Index the game announces for a creative screen slot key: grid 0..44, bar 45..53, every slot
@@ -590,7 +641,7 @@ impl crate::App {
         self.screens.open || self.creative_ui.open
     }
 
-    /// Slot under the mouse in the open screen, as a key of the chosen-item table: menu slot of a
+    /// Slot under the mouse in the open screen, as a slot key (`HoverScreen`): menu slot of a
     /// container screen; creative screen: menu slot, or grid slot `CREATIVE_GRID + i`.
     fn hovered_key(&self) -> Option<usize> {
         let gui = self.renderer.as_ref().map(|r| &r.gui)?;
@@ -628,11 +679,13 @@ impl crate::App {
         if w == 0 {
             return true;
         }
-        let cur = selected(key);
+        let screen = OpenScreen { app: self };
+        let stack = screen.stack_key(key);
+        let cur = selected(stack);
         let next = next_selection(w, cur, limit);
         if next != cur {
-            set_selected(key, next);
-            if let Some(i) = (OpenScreen { app: self }).index(key) {
+            set_selected(stack, next);
+            if let Some(i) = screen.index(key) {
                 let _ = self.session.link.send_bundle_item_selected(i, next);
             }
         }
@@ -652,6 +705,17 @@ impl crate::App {
     /// Screen closed by the player, its closing packet sent: the hovered bundle is left.
     pub(crate) fn bundle_close(&self) {
         if let Some(i) = hover_close(&OpenScreen { app: self }) {
+            let _ = self.session.link.send_bundle_item_selected(i, -1);
+        }
+    }
+
+    /// Window resized with a screen open (`screen_init`): the creative inventory tab rebuilds its
+    /// slots.
+    pub(crate) fn bundle_resize(&self) {
+        let screen = OpenScreen { app: self };
+        let rebuilt =
+            self.creative_ui.open && self.creative_ui.kind(&self.data) == rc_data::CreativeKind::Inventory;
+        if let Some(i) = screen_init(rebuilt.then_some(&screen as &dyn HoverScreen)) {
             let _ = self.session.link.send_bundle_item_selected(i, -1);
         }
     }
@@ -686,17 +750,112 @@ mod tests {
         assert_eq!(u(1, 2, &slots, is_bundle), None);
         assert_eq!(u(1, -999, &slots, is_bundle), None);
         assert_eq!(u(2, 9, &slots, is_bundle), None);
+        // L10: the bundle's choice goes before the click (it stayed on the slot).
+        super::set_selected(0, 2);
+        assert_eq!(u(0, 0, &slots, is_bundle), None);
+        assert_eq!(super::selected(0), 2, "a simple click keeps the choice");
+        assert_eq!(u(2, 0, &slots, is_bundle), Some(0));
+        assert_eq!(super::selected(0), -1, "swap: choice forgotten");
     }
 
-    /// Screen whose slots 5 and 9 hold bundles; announced index = key + 100.
-    struct Two;
+    /// L10: choices are per stack: forgetting one keeps the others; a rebuilt creative grid
+    /// forgets its stacks' choices only; quick move or swap of a bundle forgets its choice, other
+    /// clicks and other items keep theirs.
+    #[test]
+    fn choices_per_stack() {
+        use super::{CREATIVE_GRID, forget_grid, selected, set_selected, unselect_on_click};
+        set_selected(20, 2);
+        set_selected(CREATIVE_GRID + 50, 1);
+        set_selected(CREATIVE_GRID + 3, 0);
+        assert_eq!((selected(20), selected(CREATIVE_GRID + 50), selected(CREATIVE_GRID + 3)), (2, 1, 0));
+        set_selected(CREATIVE_GRID + 3, -1);
+        assert_eq!((selected(20), selected(CREATIVE_GRID + 50), selected(CREATIVE_GRID + 3)), (2, 1, -1));
+        set_selected(20, 4);
+        assert_eq!(selected(20), 4, "a new choice replaces the old one");
+        forget_grid();
+        assert_eq!((selected(20), selected(CREATIVE_GRID + 50)), (4, -1));
+        assert!(!unselect_on_click(0, 20, true));
+        assert!(!unselect_on_click(2, 20, false));
+        assert_eq!(selected(20), 4);
+        assert!(unselect_on_click(1, 20, true));
+        assert_eq!(selected(20), -1);
+        assert!(unselect_on_click(2, 21, true), "announced even with nothing chosen");
+    }
+
+    /// Screen whose slots 5 and 9 hold bundles; announced index = key + 100; grid slots
+    /// (`CREATIVE_GRID` + i) show the stack `CREATIVE_GRID + i + 9 × row`; identity `id`.
+    struct Two {
+        row: std::cell::Cell<usize>,
+        id: std::cell::Cell<u32>,
+    }
     impl super::HoverScreen for Two {
         fn holds_bundle(&self, key: usize) -> bool {
-            key == 5 || key == 9
+            key == 5 || key == 9 || key >= super::CREATIVE_GRID
         }
         fn index(&self, key: usize) -> Option<i32> {
             Some(key as i32 + 100)
         }
+        fn stack_key(&self, key: usize) -> usize {
+            if key >= super::CREATIVE_GRID { key + 9 * self.row.get() } else { key }
+        }
+        fn id(&self) -> u32 {
+            self.id.get()
+        }
+    }
+
+    fn two() -> Two {
+        Two { row: std::cell::Cell::new(0), id: std::cell::Cell::new(0) }
+    }
+
+    /// L10: a grid scrolled under the mouse keeps each stack's choice (the slot is not left): the
+    /// stack brought under the mouse has none, the one moved away keeps its own, and leaving the
+    /// slot forgets the choice of the stack it shows then.
+    #[test]
+    fn grid_choice_stays_on_its_stack() {
+        use super::{CREATIVE_GRID as G, hover_frame, selected, set_selected};
+        let t = two();
+        let s: &dyn super::HoverScreen = &t;
+        assert_eq!(hover_frame(Some(G), Some(s)), None);
+        set_selected(s.stack_key(G), 2);
+        t.row.set(1);
+        assert_eq!(hover_frame(Some(G), Some(s)), None, "same slot: nothing announced");
+        assert_eq!(selected(s.stack_key(G)), -1, "the new stack has no choice");
+        set_selected(s.stack_key(G), 1);
+        t.row.set(0);
+        assert_eq!(hover_frame(Some(G), Some(s)), None);
+        assert_eq!(selected(s.stack_key(G)), 2, "the old stack kept its choice");
+        assert_eq!(hover_frame(Some(G + 1), Some(s)), Some(G as i32 + 100));
+        assert_eq!((selected(G), selected(G + 9)), (-1, 1), "only the stack shown when left forgets");
+        // Slot left while the grid is scrolled: the stack it shows (place 9) forgets, place 0 keeps.
+        set_selected(G, 2);
+        t.row.set(1);
+        assert_eq!(hover_frame(Some(G), Some(s)), Some(G as i32 + 101));
+        assert_eq!(hover_frame(Some(G + 2), Some(s)), Some(G as i32 + 100));
+        assert_eq!((selected(G), selected(G + 9)), (2, -1));
+    }
+
+    /// L10: another screen replacing the open one (no frame without a screen) forgets everything
+    /// silently and starts a new wheel accumulation; a resize starts one too, and a rebuilt
+    /// creative inventory tab leaves its hovered slot.
+    #[test]
+    fn replaced_or_resized_screen() {
+        use super::{hover_frame, screen_init, selected, set_selected, wheel};
+        let t = two();
+        let s: &dyn super::HoverScreen = &t;
+        assert_eq!(hover_frame(Some(5), Some(s)), None);
+        set_selected(5, 3);
+        assert_eq!(wheel(0.0, 0.6), (0, 0));
+        t.id.set(7);
+        assert_eq!(hover_frame(Some(9), Some(s)), None, "replaced: slot 5 not announced");
+        assert_eq!(selected(5), -1);
+        assert_eq!(wheel(0.0, 0.6), (0, 0), "accumulation started again");
+        assert_eq!(screen_init(None), None);
+        assert_eq!(wheel(0.0, 0.6), (0, 0), "resize: started again");
+        assert_eq!(wheel(0.0, 0.6), (0, 1));
+        set_selected(9, 1);
+        assert_eq!(screen_init(Some(s)), Some(109), "slots rebuilt: hovered bundle left");
+        assert_eq!(selected(9), -1);
+        assert_eq!(hover_frame(Some(9), Some(s)), None, "the new slot is entered");
     }
 
     /// Leaving a bundle slot announces −1 for it even with nothing chosen; leaving another slot,
@@ -705,7 +864,8 @@ mod tests {
     #[test]
     fn leaving_a_bundle_slot_announces_no_choice() {
         use super::{hover_close, hover_frame, selected, set_selected};
-        let s: &dyn super::HoverScreen = &Two;
+        let t = two();
+        let s: &dyn super::HoverScreen = &t;
         assert_eq!(hover_frame(None, None), None);
         assert_eq!(hover_frame(Some(5), Some(s)), None, "entering announces nothing");
         assert_eq!(hover_frame(Some(5), Some(s)), None, "staying announces nothing");
@@ -721,6 +881,43 @@ mod tests {
         assert_eq!(hover_frame(Some(9), Some(s)), None);
         assert_eq!(hover_close(s), Some(109), "closed by the player");
         assert_eq!(hover_close(s), None);
+    }
+
+    /// Micro-bench of the per-frame lookups: chosen item of a drawn slot (former single cell against
+    /// the per-stack table, empty and with 4 choices) and the hovered-slot rule of a frame.
+    /// `cargo test --release -p rc-app --bin rustcraft bench_bundle_choices -- --ignored --nocapture`
+    #[test]
+    #[ignore = "micro-bench"]
+    fn bench_bundle_choices() {
+        use super::{CREATIVE_GRID as G, hover_frame, selected, set_selected};
+        use std::hint::black_box;
+        let cell: std::cell::Cell<Option<(usize, i32)>> = std::cell::Cell::new(Some((3, 1)));
+        let former = |slot: usize| cell.get().filter(|(k, _)| *k == slot).map_or(-1, |(_, i)| i);
+        let n = 4_000_000usize;
+        let t = two();
+        let s: &dyn super::HoverScreen = &t;
+        let time = |f: &mut dyn FnMut(usize) -> i64| {
+            let t0 = std::time::Instant::now();
+            let mut k = 0i64;
+            for i in 0..n {
+                k += f(black_box(i % 64));
+            }
+            black_box(k);
+            t0.elapsed().as_nanos() as f64 / n as f64
+        };
+        for pass in 0..3 {
+            let a = time(&mut |i| i64::from(former(i)));
+            for k in [3, 40, G + 5, G + 70] {
+                set_selected(k, -1);
+            }
+            let b = time(&mut |i| i64::from(selected(i)));
+            for (k, v) in [(3, 1), (40, 3), (G + 5, 2), (G + 70, 0)] {
+                set_selected(k, v);
+            }
+            let c = time(&mut |i| i64::from(selected(i)));
+            let h = time(&mut |i| i64::from(hover_frame(Some(5 + (i & 1) * 2), Some(s)).unwrap_or(0)));
+            eprintln!("pass {pass}: former cell {a:.2} ns, table empty {b:.2} ns, 4 choices {c:.2} ns, hover rule {h:.2} ns");
+        }
     }
 
     /// Creative screen keys: grid slots after every menu, announced with the creative screen's

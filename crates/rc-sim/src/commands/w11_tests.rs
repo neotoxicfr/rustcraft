@@ -398,6 +398,14 @@ fn particle_options_like_the_game() {
     assert_eq!(d, [(x + 1.0) as f32, (y + 1.0) as f32, (z + 1.0) as f32]);
     // Scale out of bounds refused.
     assert!(!run(&mut s, "particle dust{color:[1.0,0.0,0.0],scale:5} ~ ~ ~ 0 0 0 0 1").0);
+    // L10: `trail` passes its target, color and duration (the client skipped it without them);
+    // refused at parse time when a key is missing.
+    events(&session);
+    assert!(run(&mut s, "particle minecraft:trail{target:[0.5,70,0.5],color:16545810,duration:40} ~ ~1 ~").0);
+    let p = part(&session).expect("trail particle").particle;
+    assert_eq!((p.trail, p.color), (Some(([0.5, 70.0, 0.5], 40)), 16_545_810));
+    assert!(!run(&mut s, "particle minecraft:trail ~ ~ ~").0);
+    assert!(part(&session).is_none(), "refused trail sent nothing");
     // Distance from the center of the block: 31.9 from the center passes, 32 does not.
     let cx = s.pos[0].floor() + 0.5;
     let (py, pz) = (s.pos[1].floor() + 0.5, s.pos[2].floor() + 0.5);
