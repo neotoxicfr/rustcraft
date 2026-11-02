@@ -571,7 +571,7 @@ impl Server {
             // located in an absent neighbour would be read as void.
             let c = chunk_of(pos);
             let loaded = (-1..=1).all(|dx| (-1..=1).all(|dz| matches!(self.chunks.get(&(c.0 + dx, c.1 + dz)), Some(Some(_)))));
-            if !self.mob_chunk_ticking(c) || !loaded {
+            if !self.entities_tick_in(c) || !loaded {
                 continue;
             }
             if pos[1] < floor {

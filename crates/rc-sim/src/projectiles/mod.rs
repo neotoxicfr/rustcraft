@@ -329,6 +329,9 @@ pub struct Proj {
     /// G5-F10: Eye of Ender (aimed point, never saved; survival at the end of the flight).
     pub eye_target: Option<[f64; 3]>,
     pub eye_survive: bool,
+    /// L9-TICK: ender pearl, ticks before renewing its ticket (not saved: 0 on load, so a
+    /// read pearl renews it at its first tick).
+    pub ticket_timer: i64,
     /// Entity data (index, value, modified).
     meta: Vec<(u8, Meta, bool)>,
     pub track: PTrack,
@@ -346,11 +349,76 @@ pub struct Projs {
     /// During the damage dealt directly by a thrown potion: true if it hurts those
     /// sensitive to water (the enderman only takes those, then teleports).
     pub direct_potion: Option<bool>,
+    /// L9-TICK: tickets of the players' ender pearls in this dimension, and the game time of
+    /// their last purge (a world parked or unparked during a tick is not purged twice).
+    pub tickets: Vec<PearlTicket>,
+    pub purged: Option<i64>,
 }
 
-/// An Ender pearl of `owner` flies among these projectiles (its ticket keeps the world active).
+/// An Ender pearl of `owner` flies among these projectiles.
+#[cfg(test)]
 pub(crate) fn holds_player_pearl(p: &Projs, owner: u128) -> bool {
     p.list.iter().any(|q| !q.removed && q.kind == PKind::EnderPearl && q.owner == Some(owner))
+}
+
+/// Ticket of a player's ender pearl, radius 2: level 31 at its chunk, so "ticking entities"
+/// there (entities, random ticks), "ticking blocks" one chunk around (scheduled ticks, block
+/// events, block entities) and full chunks two around. It expires 40 ticks after its last
+/// renewal (the pearl renews it every 40 ticks and on entering a chunk; the old chunk keeps its
+/// own until it expires), and counts from the tick after its creation: the game applies new
+/// tickets between two ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PearlTicket {
+    pub chunk: (i32, i32),
+    /// Purges left: counted down once per tick, removed below 0.
+    pub left: i32,
+    /// Applied (from the tick after the one that created it).
+    pub live: bool,
+}
+
+/// Level of a pearl ticket at its own chunk (full level 33 − radius 2).
+pub(crate) const PEARL_TICKET_LEVEL: i32 = 31;
+/// Lifetime of a pearl ticket after its last renewal.
+const PEARL_TICKET_TIMEOUT: i32 = 40;
+
+impl Projs {
+    /// The pearl's ticket at `chunk`: a new one, or the one already there renewed (same type
+    /// and level: its countdown starts again).
+    pub(crate) fn pearl_ticket(&mut self, chunk: (i32, i32), live: bool) {
+        match self.tickets.iter_mut().find(|t| t.chunk == chunk) {
+            Some(t) => t.left = PEARL_TICKET_TIMEOUT,
+            None => self.tickets.push(PearlTicket { chunk, left: PEARL_TICKET_TIMEOUT, live }),
+        }
+    }
+
+    /// Between two ticks: the tickets created during the previous one apply.
+    pub(crate) fn pearl_tickets_apply(&mut self) {
+        for t in &mut self.tickets {
+            t.live = true;
+        }
+    }
+
+    /// Purge of the chunk source (once per ticking tick, `now`: game time): one tick less,
+    /// expired ones removed.
+    pub(crate) fn pearl_tickets_purge(&mut self, now: i64) {
+        if self.purged.replace(now) == Some(now) {
+            return;
+        }
+        self.tickets.retain_mut(|t| {
+            t.left -= 1;
+            t.left >= 0
+        });
+    }
+
+    /// Lowest level of the applied pearl tickets at chunk `c` (`i32::MAX` without any).
+    pub(crate) fn pearl_ticket_level(&self, c: (i32, i32)) -> i32 {
+        let mut lvl = i32::MAX;
+        for t in self.tickets.iter().filter(|t| t.live) {
+            let d = (c.0 - t.chunk.0).abs().max((c.1 - t.chunk.1).abs());
+            lvl = lvl.min(PEARL_TICKET_LEVEL.saturating_add(d));
+        }
+        lvl
+    }
 }
 
 /// State tied to the player (does not change with the dimension).
@@ -486,6 +554,7 @@ impl Proj {
             dangerous: false,
             eye_target: None,
             eye_survive: false,
+            ticket_timer: 0,
             meta: Vec::new(),
             track: PTrack::default(),
         };
@@ -840,8 +909,8 @@ impl Server {
     /// finds its next chunk ready instead of stopping at each one (a projectile whose chunk is
     /// not ready does not tick). Its own chunk is read now if missing; the rest goes to the read
     /// thread when it runs (`RUSTCRAFT_OPT_ASYNC_LOAD`), otherwise is read now like the view.
-    /// Not modelled: the ticket also makes the chunks around the pearl tick (entities within 2,
-    /// blocks within 3) and keeps them for 40 ticks; here only the pearl itself ticks there.
+    /// What the ticket simulates (entities of its chunk, blocks one chunk around, 40 ticks after
+    /// its last renewal) is `Projs::tickets`, read by the chunk tests.
     fn load_pearl_chunks(&mut self) {
         let centres: Vec<(i32, i32)> = self
             .proj
@@ -882,11 +951,16 @@ impl Server {
             || self.lan.as_ref().is_some_and(|l| l.guests.iter().any(|g| g.ctx.as_ref().is_some_and(|c| c.uuid == o)))
     }
 
-    /// Ender pearl of a player whose chunk is loaded: the pearl's own ticket makes that chunk
-    /// "ticking entities" wherever it flies.
-    fn player_pearl_ready(&self, p: &Proj) -> bool {
-        let c = ((p.pos[0].floor() as i32) >> 4, (p.pos[2].floor() as i32) >> 4);
-        self.player_pearl(p) && matches!(self.chunks.get(&c), Some(Some(_)))
+    /// End of a living pearl's tick: its timer counts down, and at 0 or on entering another
+    /// chunk, a pearl of a connected player (dead or alive) renews its ticket where it is now;
+    /// the timer restarts at 39 (the ticket's 40 ticks minus this one).
+    fn pearl_ticket_tick(&mut self, p: &mut Proj, before: (i32, i32)) {
+        p.ticket_timer -= 1;
+        let now = ((p.pos[0].floor() as i32) >> 4, (p.pos[2].floor() as i32) >> 4);
+        if (p.ticket_timer <= 0 || before != now) && self.player_pearl(p) {
+            self.proj.pearl_ticket(now, false);
+            p.ticket_timer = i64::from(PEARL_TICKET_TIMEOUT) - 1;
+        }
     }
 
     /// Tick of each projectile present at the start.
@@ -903,26 +977,27 @@ impl Server {
                 continue;
             }
             // G3-F13: outside a "ticking entities" chunk (or one not loaded), it waits; a
-            // player's pearl carries its own ticket (its loaded chunk is enough).
+            // player's pearl ticks in the chunks of its own ticket (L9-TICK).
             let slot = &self.proj.list[i];
-            if slot.removed || !(self.entity_ticks_at(slot.pos) || self.player_pearl_ready(slot)) {
+            if slot.removed || !self.entity_ticks_at(slot.pos) {
                 continue;
             }
             let mut p = slot.clone();
             let id = p.id;
             p.tick_count += 1;
             p.old_pos = p.pos;
+            let before = ((p.pos[0].floor() as i32) >> 4, (p.pos[2].floor() as i32) >> 4);
             self.proj_tick(&mut p);
             trace(&p);
-            match self.proj.list.get_mut(i) {
-                Some(slot) if slot.id == id => {
-                    // Destroyed by another during its own tick (explosion it caused).
-                    p.removed |= slot.removed;
-                    *slot = p;
-                }
-                // List replaced during the tick (dimension change): stop.
-                _ => break,
+            // List replaced during the tick (dimension change): stop.
+            let Some(slot) = self.proj.list.get(i).filter(|s| s.id == id) else { break };
+            // Destroyed by another during its own tick (explosion it caused).
+            p.removed |= slot.removed;
+            // L9-TICK: a pearl still alive after its tick renews its ticket.
+            if p.kind == PKind::EnderPearl && !p.removed {
+                self.pearl_ticket_tick(&mut p, before);
             }
+            self.proj.list[i] = p;
         }
     }
 

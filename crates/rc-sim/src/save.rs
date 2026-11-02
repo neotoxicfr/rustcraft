@@ -294,6 +294,7 @@ impl Server {
             self.chunks.iter().filter(|(_, c)| c.as_ref().is_some_and(|c| c.dirty)).map(|(p, _)| *p).collect();
         dirty.sort_unstable();
         for p in dirty {
+            self.promote_packed_for_save(p); // L9-TICK
             self.export_chunk_ticks(p);
             let Some(Some(c)) = self.chunks.get_mut(&p) else { continue };
             c.dirty = false;

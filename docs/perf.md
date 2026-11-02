@@ -3072,3 +3072,38 @@ regularity, allocations, disk, RAM, startup, multi-core): figures below, the res
 - To re-measure on a quiet machine with the other menu missions: `menu` scene of
   `tools/bench/scenes.py` (no change expected), screenshots of the video and accessibility
   screens (titles 2 px lower, labels).
+
+## L9-TICK: pearl and fight tickets, dimension state, cauldrons in the crossed-block pass, packed block entities (02/11, loaded machine)
+
+Fidelity fixes; figures from the existing micro-benches (`bench_g3f13_entity_test_and_furnace_list`,
+`bench_mob_contacts`, `cargo test --release -p rc-sim <name> -- --ignored --nocapture`), loaded
+machine (other agents compiling: the untouched furnace loop moved from 55 to 100 ns between two
+runs), so only the order of magnitude is claimed.
+
+- Entity chunk test (`entity_ticks_at`): the ticket test (pearls, dragon fight) only runs when
+  the player's zone test fails, and costs a flag test plus an empty-list test without tickets:
+  8.6-9.4 ns in range, 7.1-7.8 ns out of range, against 8.2-8.5 / 6.6-7.3 ns recorded by G3-F13
+  (same bench, other load): no measurable change. Pearl tickets live in a small vector (one per
+  chunk a pearl entered in the last 40 ticks): a linear scan beats a map at these sizes.
+- Chunk tests of the world tick (`chunk_simulated`, `chunk_entity_ticking`,
+  `chunk_simulated_now`): same ticket test appended after the existing ones.
+- Dragon fight arena: the 19 × 19 chunk list is only built when one of them is missing (before:
+  a 17 × 17 list allocated every tick of the fight, then filtered).
+- Block-entity registration of a loaded chunk: one pass over each block entity's fields instead
+  of one search per field read (six) now that `keepPacked` is read too: 256 block entities
+  14.0-14.3 µs, against 15.5-16.8 µs for the first version (six searches + the new one) and
+  13.8-14.0 µs recorded by G3-F13. Packed ones: promotion order computed once per chunk, linear
+  in their count (bucket counts kept, recounted on growth).
+- Crossed-block pass: cauldrons are three more block comparisons, after the existing ones, for
+  the non-air cells only, and their 14-box shape is built only for a cauldron cell. The contact
+  pass of the mobs no longer looks for cauldrons (smaller family mask for its palette pre-scan):
+  `bench_mob_contacts` 74.6-75.5 ns per tick and per mob (78.6 ns in open air and 79.1 ns in a
+  cobweb recorded by G5-F02e, other load): no measurable change.
+- Generated chunks now resume their scheduled ticks and register their tickers (fidelity: never
+  done before during the session), once per chunk arrival: the cost of `register_chunk_tickers`
+  above per chunk, plus the ticks it schedules.
+- Leads not taken: a per-tick set of the ticking chunks (would also hold the tickets; considered
+  by G3-F13, more costly to build than the per-entity test at usual counts). Multi-core and GPU:
+  not applicable (ticket expiry, promotion order and effect order are observable sequences).
+- To re-measure on a quiet machine: `tools/bench/scenes.py` scenes with generated terrain
+  (new chunks now register their tickers), and the dragon fight if a scene covers it.

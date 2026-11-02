@@ -354,6 +354,39 @@ fn departure_vehicle_and_pearls() {
     );
 }
 
+/// L9-TICK: a guest's ender pearl carries its ticket like the host's (placed where it enters a
+/// chunk), and vanishes when its guest is dead (rule `ender_pearls_vanish_on_death`). Before:
+/// a parked world only stayed active for the host's pearls, and a dead guest's pearl flew on.
+#[test]
+fn guest_pearl_ticket_and_vanishing() {
+    let mut t = open("guest-pearl");
+    publish(&mut t, false);
+    let _g = join(&mut t, "Guest", 2);
+    let uuid = rc_client::offline_uuid("Guest");
+    let pearl = |x: f64| {
+        use rc_proto::nbt::Nbt;
+        let list = |v: [f64; 3]| Nbt::List(v.map(Nbt::Double).to_vec());
+        Nbt::Compound(vec![
+            ("id".into(), Nbt::String("minecraft:ender_pearl".into())),
+            ("Pos".into(), list([x, f64::from(FLOOR + 3), 3.5])),
+            ("Motion".into(), list([1.0, 0.0, 0.0])),
+            ("NoGravity".into(), Nbt::Byte(1)),
+            ("Owner".into(), crate::nbtio::uuid_nbt(uuid)),
+        ])
+    };
+    let p = t.s.proj_from_nbt(&pearl(-0.5)).expect("pearl");
+    t.s.proj_add(p);
+    t.s.game_tick();
+    t.s.tick += 1;
+    assert_eq!(t.s.proj.tickets.iter().map(|k| k.chunk).collect::<Vec<_>>(), vec![(0, 0)], "guest pearl ticket");
+    // Its guest dead: the pearl vanishes at its next tick.
+    if let Some(c) = t.s.lan.as_mut().and_then(|l| l.guests[0].ctx.as_mut()) {
+        c.vit.dead = true;
+    }
+    t.s.game_tick();
+    assert!(t.s.proj.list.iter().filter(|p| p.owner == Some(uuid)).all(|p| p.removed), "pearl of a dead guest");
+}
+
 /// Shared vehicle (host and guest on the same camel): the guest's file does not carry
 /// the vehicle (`RootVehicle` absent) and the camel stays in the world at their departure.
 #[test]
