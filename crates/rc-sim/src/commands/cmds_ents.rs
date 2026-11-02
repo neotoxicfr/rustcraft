@@ -160,12 +160,11 @@ impl Server {
         {
             let vel = crate::nbtio::motion(n.get("Motion")).unwrap_or_default();
             let delay = crate::nbtio::int(n, "PickupDelay").unwrap_or(0) as i32;
+            let before = self.life.drops.len();
             self.spawn_item(pos, vel, stack, delay);
-            if let Some(d) = self.life.drops.last_mut() {
-                d.age = crate::nbtio::int(n, "Age").unwrap_or(0) as i32;
-                d.health = crate::nbtio::int(n, "Health").unwrap_or(5) as i32;
-                d.fire = crate::nbtio::int(n, "Fire").unwrap_or(0) as i16 as i32; // G5-F05
-                return Ok(E::Item(d.id));
+            if self.life.drops.len() > before {
+                self.item_read_nbt(before, n); // L10-ENT: the game's load, common part included
+                return Ok(E::Item(self.life.drops[before].id));
             }
         }
         // F15: crystal, cloud, dragon fireball, shulker bullet simulated.
@@ -233,18 +232,19 @@ impl Server {
     /// `PickupDelay` at 0 by default). Without an item, the entity is removed as soon as it is read and
     /// the add fails (duplicate id message, like the game).
     fn summon_item(&mut self, pos: [f64; 3], nbt: Option<&Nbt>) -> Result<E, Fail> {
-        use crate::nbtio::int;
-        let Some(stack) = nbt.and_then(|n| n.get("Item")).and_then(crate::player::Stack::from_nbt) else {
+        let Some(n) = nbt else { return Err(Fail(tr!("commands.summon.failed.uuid"))) };
+        let Some(stack) = n.get("Item").and_then(crate::player::Stack::from_nbt) else {
             return Err(Fail(tr!("commands.summon.failed.uuid")));
         };
-        let vel = nbt.and_then(|n| crate::nbtio::motion(n.get("Motion"))).unwrap_or_default();
-        let delay = nbt.and_then(|n| int(n, "PickupDelay")).unwrap_or(0) as i32;
-        let age = nbt.and_then(|n| int(n, "Age")).unwrap_or(0) as i32;
+        let vel = crate::nbtio::motion(n.get("Motion")).unwrap_or_default();
+        let delay = crate::nbtio::int(n, "PickupDelay").unwrap_or(0) as i32;
+        let before = self.life.drops.len();
         self.spawn_item(pos, vel, stack, delay);
-        let d = self.life.drops.last_mut().ok_or_else(|| Fail(tr!("commands.summon.failed")))?;
-        d.age = age;
-        d.fire = nbt.and_then(|n| int(n, "Fire")).unwrap_or(0) as i16 as i32; // G5-F05
-        Ok(E::Item(d.id))
+        if self.life.drops.len() == before {
+            return Err(Fail(tr!("commands.summon.failed")));
+        }
+        self.item_read_nbt(before, n); // L10-ENT: the game's load, common part included
+        Ok(E::Item(self.life.drops[before].id))
     }
 
     /// `execute on attacker|target|owner`.
@@ -589,7 +589,7 @@ impl Server {
                 r
             }
             E::Item(i) => self.item_hurt(i, ty, amount, matches!(causing, Some(E::Mob(_)))),
-            E::Orb(i) => self.orb_hurt(i, amount),
+            E::Orb(i) => self.orb_hurt(i, ty, amount),
             // G5-F06: minecart.
             E::Other(i) if self.cart_ref(i).is_some() => match self.cart_take(i) {
                 Some((k, mut c)) => {

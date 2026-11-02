@@ -7,6 +7,7 @@ use rc_data::sim_bits;
 use super::level::Mover;
 use super::piston_plan::{PistonWorld, Resolver};
 use super::{Dir, JavaMap, Kind, P, above, flag, rel, rel_n};
+use crate::decoration::DKind;
 use crate::mobs::mob::Mob;
 use crate::server::Server;
 use rc_physics::Aabb;
@@ -81,6 +82,68 @@ impl PistonTarget for AttachedTarget<'_> {
     fn launch(&mut self, _: usize, _: f64) {}
     fn piston_push(&mut self, d: [f64; 3]) {
         self.s.deco_attached_moved(self.id, d);
+    }
+}
+
+/// Armor stand or mannequin pushed by a piston (a piston movement): its own cap per tick, its
+/// collisions; a weightless stand placed as is. Box and position re-read after each push (the
+/// fix out of a retracting base reads them).
+struct LivingDecoTarget<'a> {
+    s: &'a mut Server,
+    id: i32,
+    b: crate::decoration::stand::PistonBody,
+}
+
+impl PistonTarget for LivingDecoTarget<'_> {
+    fn bbox(&self) -> Aabb {
+        self.b.bbox
+    }
+    fn position(&self) -> [f64; 3] {
+        self.b.pos
+    }
+    fn grounded(&self) -> bool {
+        self.b.on_ground
+    }
+    fn supported_by(&self, p: [i32; 3]) -> bool {
+        self.b.support == Some(p)
+    }
+    fn launch(&mut self, axis: usize, v: f64) {
+        self.s.deco_launch(self.id, axis, v);
+    }
+    fn piston_push(&mut self, d: [f64; 3]) {
+        self.s.deco_piston_move(self.id, d);
+        if let Some(b) = self.s.deco_piston_body(self.id) {
+            self.b = b;
+        }
+    }
+}
+
+/// Minecart pushed by a piston (a piston movement): its own cap per tick, a stuck state cleared
+/// without slowing the push, its collisions, then the block effects twice (those of its own
+/// move, then those the piston applies after any pushed entity).
+struct CartTarget<'a> {
+    s: &'a mut Server,
+    c: &'a mut crate::minecart::Cart,
+}
+
+impl PistonTarget for CartTarget<'_> {
+    fn bbox(&self) -> Aabb {
+        self.c.bbox()
+    }
+    fn position(&self) -> [f64; 3] {
+        self.c.pos
+    }
+    fn grounded(&self) -> bool {
+        self.c.on_ground
+    }
+    fn supported_by(&self, p: [i32; 3]) -> bool {
+        self.c.support == Some(p)
+    }
+    fn launch(&mut self, axis: usize, v: f64) {
+        self.c.vel[axis] = v;
+    }
+    fn piston_push(&mut self, d: [f64; 3]) {
+        self.s.cart_piston_move(self.c, d);
     }
 }
 
@@ -321,9 +384,9 @@ impl Server {
     }
 
     /// Entities touched by the moving block at `p` going to `next`: pushed by the
-    /// swept area (mobs, items, orbs, primed TNT, falling blocks; what hangs on a block falls),
-    /// then dragged by honey. The player is pushed by their client, which replays the piston.
-    /// Projectiles, vehicles, armor stands and mannequins: not yet (`docs/gaps-protocol.md`).
+    /// swept area (mobs, minecarts, items, orbs, primed TNT, falling blocks, armor stands and
+    /// mannequins; what hangs on a block falls), then dragged by honey. The player is pushed by
+    /// their client, which replays the piston. Projectiles: not yet (`docs/gaps-protocol.md`).
     fn mover_push_entities(&mut self, p: P, m: &Moving, next: f32) {
         let sweep = self.phys.piston_sweep(p, m, next);
         let carry = self.phys.honey_carry(p, m, next);
@@ -338,8 +401,8 @@ impl Server {
         self.bs.noclip = prev;
     }
 
-    /// Mobs, items, orbs, TNT and falling blocks whose box touches `area`, pushed
-    /// or dragged.
+    /// Mobs, minecarts, items, orbs, TNT, falling blocks and decorations whose box touches
+    /// `area`, pushed or dragged.
     fn push_targets(&mut self, area: Aabb, sw: Option<&Sweep>, carry: Option<&(Aabb, u8, f64)>, p: P) {
         let apply = |e: &mut dyn PistonTarget| {
             if let Some(sw) = sw {
@@ -356,6 +419,14 @@ impl Server {
             let Some(mut o) = self.mobs.list[i].take() else { continue };
             apply(&mut MobTarget { s: self, m: &mut o });
             self.mobs.list[i] = Some(o);
+        }
+        for i in 0..self.carts.list.len() {
+            if !self.carts.list[i].as_ref().is_some_and(|c| !c.removed && c.bbox().intersects(&area)) {
+                continue;
+            }
+            let Some(mut c) = self.carts.list[i].take() else { continue };
+            apply(&mut CartTarget { s: self, c: &mut c });
+            self.carts.list[i] = Some(c);
         }
         let time = self.time;
         let mut drops = std::mem::take(&mut self.life.drops);
@@ -387,8 +458,14 @@ impl Server {
         self.life.drops = drops;
         self.life.orbs = orbs;
         self.bs.entities.list = ents;
-        // Decorations attached to a block (armor stands and mannequins: not yet).
-        for (id, _) in self.deco_touching(&area, true) {
+        // Decorations: attached to a block (knocked off), armor stands and mannequins (moved).
+        for (id, k) in self.deco_touching(&area, false) {
+            if matches!(k, DKind::Stand | DKind::Mannequin) {
+                if let Some(b) = self.deco_piston_body(id) {
+                    apply(&mut LivingDecoTarget { s: self, id, b });
+                }
+                continue;
+            }
             let Some((b, pos)) = self.deco_nbt(id).and_then(|e| Some((self.deco_box(e)?, crate::nbtio::f64s::<3>(e.get("Pos"))?)))
             else {
                 continue;

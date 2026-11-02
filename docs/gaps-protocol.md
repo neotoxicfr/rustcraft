@@ -47,10 +47,15 @@ official launcher), encryption, `join`, chat keys and signatures. Not tested wit
 ## F. Pistons: entities not pushed yet (G5-F14, 22/10/2026)
 
 The game pushes every entity whose piston reaction is "push" (the default). Rustcraft pushes
-mobs, items, orbs, primed TNT and falling blocks on the server side; on the client side the local player
-and the entities it simulates (items, orbs, TNT, falling blocks). Missing:
+mobs, minecarts, items, orbs, primed TNT, falling blocks, armor stands (markers ignored, a
+weightless stand placed without collisions or cap) and mannequins on the server side, each with its
+own cap of 0.51 block per axis and per tick (L10-ENT); what hangs on a block (frame, painting,
+knot, cushion) is knocked off with its item by the first non-zero push, a fixed frame excepted. On
+the client side the local player and the entities it simulates (items, orbs, TNT, falling blocks).
+A pushed minecart applies its block effects twice like the game's (its own move, then the
+piston's pass), both read at its final box instead of the path crossed. Missing:
 
-- projectiles (arrows, tridents, fireballs…) and vehicles (boats, minecarts), server and client;
+- projectiles (arrows, tridents, fireballs…) and boats (not simulated), server and client;
 - player on the server side (its client pushes it and sends back its position, like the game; the server does not
   replay the push for the movement check);
 - interpolated entities on the client side (mobs, other players): the game adds the push to the
@@ -58,27 +63,33 @@ and the entities it simulates (items, orbs, TNT, falling blocks). Missing:
 - effects of the blocks crossed by a pushed mob (cobweb, berries, magma): to wire up with
   the mobs' block effects (G5-F02);
 - footstep sounds while the local player is pushed (the game emits them in the piston movement);
-- armor stands (except markers, ignored) and mannequins: the game moves them (a weightless stand
-  without collisions). What hangs on a block (frame, painting, knot, cushion) is handled: the
-  first non-zero push knocks it off with its item, a fixed frame excepted.
+- interpolated armor stands, mannequins and minecarts on the client side (same as the mobs: the
+  server's tracking carries their push).
 
 The push of an opening shulker (G4-F08) moves the same entities, with an ordinary movement
-(slowdown of the tick applied, no caution at the edge), and the decorations: what hangs falls with
-its item (fixed frame excepted), armor stands and mannequins move with their collisions (markers and
-weightless stands have no physics). Same missing cases (projectiles, vehicles, player on the server
-side, interpolated entities on the client side). The server does not model the scale attribute of
-the shulker (size 1 there; the client scales its push). An armor stand or mannequin whose own tick
-does not run its tracking (immovable mannequin) is moved without the move being sent.
+(slowdown of the tick applied, no caution at the edge), minecarts included (their own move, block
+effects after it; never the one the shulker rides, L10-ENT), and the decorations: what hangs falls
+with its item (fixed frame excepted), armor stands and mannequins move with their collisions
+(markers and weightless stands have no physics). Same missing cases (projectiles, boats, player on
+the server side, interpolated entities on the client side). The server does not model the scale
+attribute of the shulker (size 1 there; the client scales its push). Every armor stand and mannequin
+runs its tracking at each tick, still ones included (L10-ENT): a pushed immovable mannequin reaches
+the client.
 
 ## G. Vehicles and mob pushes (G4-F08, 02/11/2026)
 
 A mob pushes the minecarts it touches (the minecart's own rule: it moves aside, the mob gets a
 quarter; never its own rider), they count for the cramming, and a burning sulfur cube hurts them
 (the one it rides included), which destroys one in about 5 ticks. Boats and rafts are not simulated
-by the integrated server (`gaps-client.md`): neither pushed nor hurt. The cramming count still
-includes passengers (the game counts only the entities that ride nothing).
+by the integrated server (`gaps-client.md`): neither pushed nor hurt. The cramming draw uses every
+pushed entity, the damage only those that ride nothing, like the game (L10-ENT).
 
-`PortalCooldown`: read back and written for minecarts, primed TNT, falling blocks, mobs and
-projectiles. Dropped items and experience orbs write a reduced compound without it (nor `Air`,
-`Invulnerable`, `fall_distance`): an item that went through a portal and is saved during its delay
-can go back through at once on reload.
+`PortalCooldown`: read back and written for minecarts, primed TNT, falling blocks, mobs,
+projectiles, dropped items and experience orbs. Items and orbs carry the game's common entity part
+(`fall_distance`, `Fire`, `Air`, `OnGround`, `Invulnerable`, `PortalCooldown`), in its order, in the
+save and in `/data` alike (one writer), read back at load, summon and `/data` (one reader); an
+`Invulnerable` one only takes the damage of `bypasses_invulnerability` (L10-ENT). Still missing for
+them: their UUID (derived from the identifier, never the world's), the optional fields
+(`CustomName`, `Tags`, `data`, `Silent`, `NoGravity`, `Glowing`, `TicksFrozen`, `HasVisualFire`,
+`invulnerable_time`, the item's `Owner`), the orb's random yaw, and a creative player's damage
+through the invulnerability (no source carried down to them).

@@ -992,10 +992,7 @@ impl Server {
                 let fire = self.dmg_tag(ty, "minecraft:is_fire");
                 !(fire && self.item_resists(&d.stack, "minecraft:in_fire")) && self.item_hurt_ent(d, ty, amount, false)
             }
-            Who::Orb(o) => {
-                crate::drops::orb_take_damage(o, amount);
-                true
-            }
+            Who::Orb(o) => self.orb_hurt_ent(o, ty, amount),
         }
     }
 

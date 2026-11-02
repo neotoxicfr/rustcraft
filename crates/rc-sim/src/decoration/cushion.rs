@@ -238,7 +238,7 @@ impl Server {
             .live
             .iter()
             .filter(|l| l.kind == DKind::Cushion && !l.removed)
-            .filter_map(|l| self.deco_nbt(l.id))
+            .filter_map(|l| self.deco_nbt_near(l.id, Some(l.chunk)))
             .any(|e| self.deco_box(e).is_some_and(|o| o.intersects(b)))
     }
 

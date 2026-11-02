@@ -436,7 +436,7 @@ impl Server {
             .map(|o| o.id)
             .collect();
         for id in orbs {
-            self.orb_hurt(id, 5.0);
+            self.orb_hurt(id, "minecraft:lightning_bolt", 5.0);
         }
         for e in &hit {
             if !b.hit.contains(e) {

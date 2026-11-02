@@ -1145,7 +1145,7 @@ impl Server {
             else {
                 continue;
             };
-            let hit = hurt.is_some() && self.orb_hurt(id, damage(dist, exposure));
+            let hit = hurt.is_some_and(|(ty, _)| self.orb_hurt(id, ty, damage(dist, exposure)));
             let kp = (1.0 - dist) * exposure * mult;
             let kb = dir.map(|v| v * kp);
             if let Some(o) = self.life.orbs.iter_mut().find(|o| o.id == id && !o.is_removed()) {

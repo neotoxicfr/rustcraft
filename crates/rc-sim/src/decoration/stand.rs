@@ -601,10 +601,61 @@ impl Server {
     }
 }
 
+/// Armor stand or mannequin that a piston pushes: its box, position, ground flag and, on the
+/// ground, its main supporting block (a marker is ignored by pistons: `None`).
+pub(crate) struct PistonBody {
+    pub bbox: Aabb,
+    pub pos: [f64; 3],
+    pub on_ground: bool,
+    pub support: Option<[i32; 3]>,
+}
+
 impl Server {
+    /// [`PistonBody`] of the decoration `id`, if it is a pushable armor stand or mannequin.
+    pub(crate) fn deco_piston_body(&self, id: i32) -> Option<PistonBody> {
+        let e = self.deco_nbt(id)?;
+        let k = kind_of(e)?;
+        if !matches!(k, DKind::Stand | DKind::Mannequin) || (k == DKind::Stand && marker(e)) {
+            return None;
+        }
+        let bbox = self.deco_box(e)?;
+        let pos = nbtio::f64s::<3>(e.get("Pos"))?;
+        let on_ground = flag(e, "OnGround");
+        let support = if on_ground { rc_physics::support_of(&self.world(), &bbox, pos) } else { None };
+        Some(PistonBody { bbox, pos, on_ground, support })
+    }
+
+    /// Piston move of an armor stand or a mannequin: a weightless stand has no physics and is
+    /// placed as is (no cap, no collision); the others are capped at 0.51 block per axis and per
+    /// tick (their own total), then moved with their collisions. Its tick's tracking sends it.
+    pub(crate) fn deco_piston_move(&mut self, id: i32, d: [f64; 3]) {
+        let Some(i) = self.deco.live.iter().position(|l| l.id == id && !l.removed) else { return };
+        let Some(e) = self.live_nbt(i) else { return };
+        if self.deco.live[i].kind == DKind::Stand && flag(e, "NoGravity") {
+            let Some(p) = nbtio::f64s::<3>(e.get("Pos")) else { return };
+            let np = [p[0] + d[0], p[1] + d[1], p[2] + d[2]];
+            self.deco_edit(id, |n| nbtio::set(n, "Pos", super::dbl(np)));
+            return;
+        }
+        let d = self.deco.live[i].piston.limit(self.time, d);
+        if d != [0.0; 3] {
+            self.living_shove(id, d);
+        }
+    }
+
+    /// Velocity of an armor stand or a mannequin set on one axis (slime block in motion: the
+    /// server simulates them).
+    pub(crate) fn deco_launch(&mut self, id: i32, axis: usize, v: f64) {
+        let Some(e) = self.deco_nbt(id) else { return };
+        let mut m = nbtio::motion(e.get("Motion")).unwrap_or_default();
+        m[axis] = v;
+        self.deco_edit(id, |n| nbtio::set(n, "Motion", super::dbl(m)));
+    }
+
     /// An ordinary move of an armor stand or a mannequin by `d` with its collisions (opening
-    /// shulker): position, ground flag, horizontal speed stopped against a wall. A marker or a
-    /// weightless stand has no physics and is not moved. The tracking of its tick sends it.
+    /// shulker, capped piston push): position, ground flag, horizontal speed stopped against a
+    /// wall. A marker or a weightless stand has no physics and is not moved. The tracking of its
+    /// tick sends it.
     pub(super) fn living_shove(&mut self, id: i32, d: [f64; 3]) {
         let Some(e) = self.deco_nbt(id) else { return };
         let stand = kind_of(e) == Some(DKind::Stand);
