@@ -71,6 +71,29 @@ impl Src {
     }
 }
 
+/// Source kept past the end of its command (test runs, profile lookups answered later): the
+/// player in it is found again by their profile at each report, since LAN seats move when a guest
+/// leaves.
+#[derive(Debug, Clone)]
+pub(crate) struct KeptSource {
+    pub src: Src,
+    /// Profile of the source's player (the one who typed it, or the executing player); `None`
+    /// without one.
+    pub player: Option<u128>,
+    /// Last known position of that player (kept after they leave, like the game's player object).
+    pub last: [f64; 3],
+}
+
+impl KeptSource {
+    /// The command is over: a command block (or minecart) closes its output, which then keeps
+    /// nothing and informs nobody; a player or the server keep theirs.
+    pub(crate) fn command_ended(&mut self) {
+        if matches!(self.src.origin, Origin::Block(_) | Origin::Minecart(_)) {
+            self.src.silent = true;
+        }
+    }
+}
+
 impl Server {
     /// Source of the player who types a command.
     pub(crate) fn player_source(&self) -> Src {
@@ -119,6 +142,33 @@ impl Server {
         s.level = 4;
         s.silent = false;
         s
+    }
+
+    /// Source kept past its command; its player is the current one (the only player a command
+    /// can name as its executing entity).
+    pub(crate) fn keep_source(&self, s: &Src) -> KeptSource {
+        let player = (s.origin == Origin::Player || s.entity == Some(E::Player)).then_some(self.uuid);
+        KeptSource { src: s.clone(), player, last: self.pos }
+    }
+
+    /// Runs `f` as a kept source: its dimension, its player installed. A player who left gets
+    /// nothing (their messages are lost), but their relayed successes still reach the operators.
+    pub(crate) fn as_kept_source(&mut self, ks: &KeptSource, f: impl FnOnce(&mut Server, &Src)) {
+        let mut src = ks.src.clone();
+        let seat = ks.player.and_then(|u| self.seat_of_uuid(u));
+        if ks.player.is_some() && seat.is_none() {
+            if src.origin == Origin::Player {
+                src.origin = Origin::Server;
+            }
+            if src.entity == Some(E::Player) {
+                src.entity = None;
+            }
+        }
+        let dim = src.dim.clone();
+        self.in_dimension(&dim, |sv| match seat {
+            Some(who) => sv.as_player(who, |sv| f(sv, &src)),
+            None => f(sv, &src),
+        });
     }
 
     /// Source with the same output, become entity `e` (`execute as`).

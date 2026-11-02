@@ -338,6 +338,22 @@ fn create_reset_and_clear_test_structures() {
     assert_eq!(w.name(floor), "minecraft:air");
 }
 
+/// `test clearthat` looks through the player's camera: spectating an armor stand that faces the
+/// test structure, the player (looking up) clears it.
+#[test]
+fn looked_at_test_goes_through_the_camera() {
+    let mut w = world("camera");
+    assert!(w.cmd("test create gt:made"));
+    assert_eq!(w.name(FIRST), "minecraft:test_instance_block");
+    assert!(w.cmd(&format!("summon minecraft:armor_stand 8.5 {Y} 6.5 {{Rotation:[0f,0f],NoGravity:1b}}")));
+    assert!(w.cmd("gamemode spectator"));
+    assert!(w.cmd("spectate @e[type=minecraft:armor_stand,limit=1]"));
+    w.p.s.pitch = -90.0;
+    let _ = w.chats();
+    assert!(w.cmd("test clearthat"), "{:?}", texts(&w.chats()));
+    assert_eq!(w.name(FIRST), "minecraft:air", "the structure the camera looks at");
+}
+
 /// Template priority: the world's `generated` folder before the packs.
 #[test]
 fn world_templates_come_before_the_packs() {
@@ -445,4 +461,50 @@ fn command_block_successes_reach_the_operators_like_the_game() {
     let _ = w.chats();
     assert!(w.cmd("time set 5000"));
     assert!(!w.chats().iter().any(|c| key(c).as_deref() == Some("chat.type.admin")));
+}
+
+/// A command block's output closes with its command, like the game's: `execute as @p run test
+/// run` lays its grid around the player (not the block); the first batch starts inside the
+/// command (kept in `LastOutput`, relayed once); the reports of the following ticks are neither
+/// kept nor relayed. A profile lookup answered later leaves the block's output alone too.
+#[test]
+fn command_block_output_closes_with_its_command() {
+    let mut w = world("cbclose");
+    let at = [0, Y, 0];
+    let place = |w: &mut W, cmd: &str| {
+        let _ = w.cmd(&format!("setblock {} {} {} minecraft:air", at[0], at[1], at[2]));
+        assert!(w.cmd(&format!(
+            "setblock {} {} {} minecraft:command_block{{auto:1b,Command:\"{cmd}\"}}",
+            at[0], at[1], at[2]
+        )));
+        let _ = w.chats();
+    };
+    let admin = |w: &mut W| -> Vec<String> {
+        w.chats().iter().filter(|c| key(c).as_deref() == Some("chat.type.admin")).map(plain).collect()
+    };
+    let output = |w: &W| w.p.s.be_get(at).and_then(|b| b.get("LastOutput")).map(crate::commands::snbt::to_snbt);
+    place(&mut w, "execute as @p run test run always_pass");
+    let mut ticks = 0;
+    while output(&w).is_none() {
+        assert!(ticks < 4, "the command block never ran");
+        w.tick(1);
+        ticks += 1;
+    }
+    assert_eq!(w.name(FIRST), "minecraft:test_instance_block", "grid around the executing player");
+    let kept = output(&w);
+    assert!(kept.as_deref().is_some_and(|o| o.contains("commands.test.batch.starting")), "{kept:?}");
+    assert_eq!(admin(&mut w).len(), 1, "the first batch is announced while the command runs");
+    w.tick(6);
+    assert_eq!(w.data(FIRST).status, 2, "the test finished");
+    assert_eq!(admin(&mut w), Vec::<String>::new(), "nothing relayed once the command is over");
+    assert_eq!(output(&w), kept, "nothing kept once the command is over");
+
+    w.p.s.cmd.s9.profiles.services = crate::commands::cmds_s9e::Services { id_by_name: |_| None, profile: |_| None };
+    place(&mut w, "fetchprofile name nobody");
+    for _ in 0..100 {
+        w.tick(1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(output(&w), None, "the failure comes after the command: the block keeps nothing");
+    assert_eq!(admin(&mut w), Vec::<String>::new());
 }

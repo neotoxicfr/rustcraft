@@ -10,7 +10,7 @@ use super::text::{GREEN, brackets, copy_click, hover_text, lit, suggest_click};
 use super::{Fail, Parsed, R, Seg, Src};
 use crate::blocks::P;
 use crate::commands::ents::E;
-use crate::gametest::run::{Planned, Retry, RunSource, RunSpec};
+use crate::gametest::run::{Planned, Retry, RunSpec};
 use crate::gametest::{Data, TestDef};
 use crate::poi::{Occupancy, PoiType};
 use crate::server::Server;
@@ -90,11 +90,6 @@ impl Server {
         self.cmd.tests.tests.iter().filter(|t| rc_commands::args::glob(&pat, &t.id)).cloned().collect()
     }
 
-    fn run_source(&self, s: &Src) -> RunSource {
-        let seat = if s.origin == super::Origin::Player { self.lan.as_ref().and_then(|l| l.active) } else { None };
-        RunSource { src: s.clone(), seat }
-    }
-
     /// Test instance blocks of a finder (source's dimension), and its tests.
     fn find(&mut self, s: &Src, f: &Finder) -> Result<(Vec<P>, Vec<Arc<TestDef>>), Fail> {
         let at = s.pos.map(|v| v.floor() as i32);
@@ -123,8 +118,11 @@ impl Server {
                 if s.entity != Some(E::Player) {
                     return Err(Fail(tr!("command.failed")));
                 }
-                let eye = [self.pos[0], self.pos[1] + self.ent_eye_height(E::Player), self.pos[2]];
-                let v = rc_physics::ray::view_vector(self.pitch, self.yaw);
+                // Through the player's camera: the entity they spectate, if any.
+                let cam = self.prog.cmds.camera.filter(|&e| self.ent_exists(e)).unwrap_or(E::Player);
+                let (at_cam, [yaw, pitch]) = (self.e_pos(cam), self.ent_rot(cam));
+                let eye = [at_cam[0], at_cam[1] + self.ent_eye_height(cam), at_cam[2]];
+                let v = rc_physics::ray::view_vector(pitch, yaw);
                 let end = [eye[0] + v[0] * 250.0, eye[1] + v[1] * 250.0, eye[2] + v[2] * 250.0];
                 let hit = self.in_dimension(&s.dim.clone(), |sv| {
                     let mut seen: Vec<P> = sv
@@ -217,7 +215,7 @@ impl Server {
         }
         self.cmd.tests.forget_failed();
         self.ok(s, tr!("commands.test.run.running", plans.len()));
-        let rs = self.run_source(s);
+        let rs = self.keep_source(s);
         self.tests_start(rs, plans, RunSpec { per_row, clear_on_batch: false, verify: None });
         Ok(1)
     }
@@ -239,7 +237,7 @@ impl Server {
                 groups.push(((first..plans.len()).collect(), b.test.env.clone(), k as i32, b.test.dimension.clone()));
             }
         }
-        let rs = self.run_source(s);
+        let rs = self.keep_source(s);
         self.tests_start(rs, plans, RunSpec { per_row: 10, clear_on_batch: true, verify: Some(groups) });
         Ok(1)
     }
@@ -399,9 +397,9 @@ impl Server {
         if size.iter().any(|&v| v > 48) {
             return Err(Fail(tr!("commands.test.error.too_large", 48)));
         }
-        let rs = self.run_source(s);
+        let mut rs = self.keep_source(s);
         let dim = s.dim.clone();
-        let at = self.test_position_around(&rs, &dim);
+        let at = self.test_position_around(&mut rs, &dim);
         let made = self.in_dimension(&dim, |sv| {
             let corner = [at[0], at[1] + 1, at[2] + 1];
             let far = [corner[0] + size[0] - 1, corner[1] + size[1] - 1, corner[2] + size[2] - 1];

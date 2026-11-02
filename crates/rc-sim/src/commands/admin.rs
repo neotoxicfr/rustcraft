@@ -6,7 +6,7 @@
 use rc_text::{Component, Content};
 
 /// Translation keys of the successes kept for the source alone (sorted, binary search).
-pub(crate) const QUIET: [&str; 97] = [
+pub(crate) const QUIET: [&str; 100] = [
     "command.compute.result.named.exact",
     "command.compute.result.named.invalid",
     "command.compute.result.named.rounded",
@@ -44,6 +44,9 @@ pub(crate) const QUIET: [&str; 97] = [
     "commands.execute.conditional.pass_count",
     "commands.experience.query.levels",
     "commands.experience.query.points",
+    "commands.fetchprofile.entity.success",
+    "commands.fetchprofile.id.success",
+    "commands.fetchprofile.name.success",
     "commands.forceload.list.multiple",
     "commands.forceload.list.single",
     "commands.forceload.query.success",
@@ -123,7 +126,15 @@ mod tests {
         assert!(QUIET.windows(2).all(|w| w[0] < w[1]), "QUIET must stay sorted for the binary search");
         let t = |k: &str| Component::translate(k, Vec::new());
         // Queries and listings stay with the source.
-        for k in ["commands.time.query.gametime", "commands.seed.success", "commands.data.entity.query", "commands.list.players"] {
+        for k in [
+            "commands.time.query.gametime",
+            "commands.seed.success",
+            "commands.data.entity.query",
+            "commands.list.players",
+            "commands.fetchprofile.name.success",
+            "commands.fetchprofile.id.success",
+            "commands.fetchprofile.entity.success",
+        ] {
             assert!(quiet(&t(k)), "{k} must not be relayed");
         }
         // Changes are relayed (the same key can be both: tick status, decided by its caller).

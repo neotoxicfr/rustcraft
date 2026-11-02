@@ -49,3 +49,40 @@ fn guest_successes_reach_the_host_only() {
     let needle = b"chat.type.admin";
     assert!(!packets.iter().any(|p| p.windows(needle.len()).any(|w| w == needle)), "no relay to the guest");
 }
+
+fn has(packets: &[Vec<u8>], needle: &[u8]) -> bool {
+    packets.iter().any(|p| p.windows(needle.len()).any(|w| w == needle))
+}
+
+/// A guest who started a test run leaves before its summary: seats move, but the reports never
+/// reach the guest now in their seat; the summary is lost for the one who left, and its relay
+/// still reaches the host (the game's player object stays the source).
+#[test]
+fn test_run_reports_follow_their_player_after_a_departure() {
+    let mut t = open("gtleave");
+    t.s.level.allow_commands = true;
+    t.s.cmd.op = 4;
+    publish(&mut t, true);
+    let a = join(&mut t, "Alice", 2);
+    let b = join(&mut t, "Bob", 2);
+    let _ = drain(&t);
+    let _: Vec<Vec<u8>> = a.from.try_iter().chain(b.from.try_iter()).collect();
+    assert!(t.s.as_guest(0, |sv| {
+        let src = sv.player_source();
+        sv.perform(src, "test run always_pass").0
+    }));
+    let _: Vec<Vec<u8>> = b.from.try_iter().collect();
+    let _ = drain(&t);
+    t.s.lan_leave(0);
+    let _ = drain(&t);
+    let _: Vec<Vec<u8>> = b.from.try_iter().collect();
+    for _ in 0..8 {
+        t.s.game_tick();
+        t.s.tick += 1;
+    }
+    assert!(t.s.cmd.tests.runner.as_ref().is_none_or(|r| r.ticked_len() == 0), "the test finished");
+    let to_bob: Vec<Vec<u8>> = b.from.try_iter().collect();
+    assert!(!has(&to_bob, b"commands.test.summary"), "Bob never gets Alice's reports");
+    let host = admin_lines(&drain(&t));
+    assert!(host.iter().any(|l| l.starts_with("[Alice: ") && l.contains("1")), "relay to the host: {host:?}");
+}

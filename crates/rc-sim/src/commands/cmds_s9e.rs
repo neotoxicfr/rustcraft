@@ -91,7 +91,8 @@ enum Ask {
 /// Lookup in progress (answered on the server thread at a following tick, like the game).
 #[derive(Debug)]
 struct Pending {
-    src: Src,
+    /// Source of the command, closed: the answer comes after its end.
+    src: super::src::KeptSource,
     ask: Ask,
     rx: Receiver<Option<ProfileResult>>,
 }
@@ -376,13 +377,15 @@ impl Server {
                 return Ok(1);
             }
         };
+        let mut kept = self.keep_source(s);
+        kept.command_ended();
         let pr = &mut self.cmd.s9.profiles;
         if pr.jobs.is_none() {
             pr.jobs = start_workers(&pr.cache);
         }
         let (tx, rx) = channel();
         if pr.jobs.as_ref().is_some_and(|q| q.send((pr.services, ask.clone(), tx)).is_ok()) {
-            pr.pending.push(Pending { src: s.clone(), ask, rx });
+            pr.pending.push(Pending { src: kept, ask, rx });
         }
         Ok(1)
     }
@@ -409,12 +412,13 @@ impl Server {
                 Ask::Name(n) => (lit(n.clone()), "name"),
                 Ask::Id(id) => (lit(crate::nbtio::uuid_text(*id)), "id"),
             };
-            match r {
+            // To the player who asked (found again by their profile), whoever is installed now.
+            self.as_kept_source(&src, |sv, s| match r {
                 Some(profile) => {
-                    self.report_profile(&src, &format!("commands.fetchprofile.{kind}.success"), arg, profile_nbt(&profile))
+                    sv.report_profile(s, &format!("commands.fetchprofile.{kind}.success"), arg, profile_nbt(&profile))
                 }
-                None => self.fail(&src, tr!(&format!("commands.fetchprofile.{kind}.failure"), arg)),
-            }
+                None => sv.fail(s, tr!(&format!("commands.fetchprofile.{kind}.failure"), arg)),
+            });
         }
     }
 

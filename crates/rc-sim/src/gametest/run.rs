@@ -16,9 +16,10 @@ use rc_worldgen::template::{Mirror, Rot, transform};
 
 use super::{Data, EnvDef, EnvRef, Kind, TestDef, Weather};
 use crate::blocks::{Kind as BKind, P, flag};
+use crate::commands::Src;
 use crate::commands::ents::E;
+use crate::commands::src::KeptSource;
 use crate::commands::text::{GOLD, GREEN, RED, YELLOW, brackets, colored, hover_text, lit, suggest_click};
-use crate::commands::{Origin, Src};
 use crate::server::Server;
 use crate::tr;
 
@@ -237,12 +238,7 @@ fn unit_box(p: P) -> ([f64; 3], [f64; 3]) {
 }
 
 /// Who receives the reports meant for the source of the run.
-#[derive(Clone)]
-pub(crate) struct RunSource {
-    pub src: Src,
-    /// LAN seat of the player who ran it (`None`: the host).
-    pub seat: Option<usize>,
-}
+pub(crate) type RunSource = KeptSource;
 
 pub(crate) struct Runner {
     pub(crate) infos: Vec<Info>,
@@ -632,7 +628,7 @@ impl Server {
         self.cmd.tests.forget_failed();
         feedback(self, tr!("test_instance_block.starting", test.id.clone()));
         let plan = Planned { test, rot: g.data.rot, dim: self.dim.name.clone(), retry: Retry::NONE, pos: Some(p) };
-        let src = RunSource { src: self.server_reply_source(), seat: None };
+        let src = self.keep_source(&self.server_reply_source());
         self.tests_start(src, vec![plan], RunSpec { per_row: 8, clear_on_batch: false, verify: None });
     }
 
@@ -714,6 +710,8 @@ impl Server {
         rn.stopped = false;
         let stops = self.cmd.tests.stops;
         self.run_batch(&mut rn, 0);
+        // The first batch starts inside the command; what follows comes after its end.
+        rn.source.command_ended();
         // Stopped while starting (a function of the environment ran `test stop`): the game's
         // ticker forgets it at once; a runner started meanwhile wins.
         if self.cmd.tests.stops != stops {
@@ -1292,16 +1290,7 @@ impl Server {
 
     /// Runs `f` as the source of the run: its dimension and its player installed.
     pub(crate) fn as_source(&mut self, rs: &RunSource, f: impl FnOnce(&mut Server, &Src)) {
-        let src = rs.src.clone();
-        let seat = rs.seat;
-        let dim = src.dim.clone();
-        self.in_dimension(&dim, |sv| {
-            if src.origin == Origin::Player {
-                sv.as_player(seat, |sv| f(sv, &src));
-            } else {
-                f(sv, &src);
-            }
-        });
+        self.as_kept_source(rs, f);
     }
 
     // ---------- Grid ----------
@@ -1335,8 +1324,7 @@ impl Server {
             return false;
         }
         if !have {
-            let src = rn.source.clone();
-            let first = self.test_position_around(&src, &dim);
+            let first = self.test_position_around(&mut rn.source, &dim);
             if let Some(g) = rn.grid.as_mut() {
                 g.dims.push((dim.clone(), DimGrid { first, next: first, row: unit_box(first), count: 0, last_batch: Vec::new() }));
             }
@@ -1372,11 +1360,15 @@ impl Server {
         true
     }
 
-    /// Player (or source) position of a run, the surface of its column in `dim`.
-    fn player_and_surface(&mut self, rs: &RunSource, dim: &str) -> (P, i32) {
-        let pos = if rs.src.entity == Some(E::Player) && rs.src.origin == Origin::Player {
-            let cur = self.lan.as_ref().and_then(|l| l.active);
-            if cur == rs.seat { self.pos } else { self.as_player(rs.seat, |sv| sv.pos) }
+    /// Position of the source's player when its executing entity is a player (whoever runs the
+    /// command: `execute as @p` from a command block included; their last known position once
+    /// they left), otherwise of the source; the surface of its column in `dim`.
+    fn player_and_surface(&mut self, rs: &mut RunSource, dim: &str) -> (P, i32) {
+        let pos = if rs.src.entity == Some(E::Player) {
+            if let Some(seat) = rs.player.and_then(|u| self.seat_of_uuid(u)) {
+                rs.last = self.as_player(seat, |sv| sv.pos);
+            }
+            rs.last
         } else {
             rs.src.pos
         };
@@ -1388,7 +1380,14 @@ impl Server {
         (p, y)
     }
 
-    pub(crate) fn test_position_around(&mut self, rs: &RunSource, dim: &str) -> P {
+    /// A player of the run left: their last position is kept for the grid.
+    pub(crate) fn tests_player_left(&mut self, uuid: u128, pos: [f64; 3]) {
+        if let Some(rs) = self.cmd.tests.runner.as_mut().map(|r| &mut r.source).filter(|s| s.player == Some(uuid)) {
+            rs.last = pos;
+        }
+    }
+
+    pub(crate) fn test_position_around(&mut self, rs: &mut RunSource, dim: &str) -> P {
         let (p, y) = self.player_and_surface(rs, dim);
         [p[0], y, p[2] + 3]
     }
@@ -1539,8 +1538,8 @@ impl Server {
     }
 
     pub(crate) fn output_player_coordinates(&mut self, s: &Src, dims: &[String]) {
-        let rs = RunSource { src: s.clone(), seat: self.lan.as_ref().and_then(|l| l.active) };
-        let (p, _) = self.player_and_surface(&rs, &s.dim.clone());
+        let mut rs = self.keep_source(s);
+        let (p, _) = self.player_and_surface(&mut rs, &s.dim.clone());
         if self.player_in_test_dimension(s, dims) || s.entity != Some(E::Player) {
             return;
         }
@@ -1553,10 +1552,10 @@ impl Server {
     }
 
     fn output_test_coordinates(&mut self, s: &Src, dims: &[String]) {
-        let rs = RunSource { src: s.clone(), seat: self.lan.as_ref().and_then(|l| l.active) };
+        let mut rs = self.keep_source(s);
         for d in dims {
-            let (p, y) = self.player_and_surface(&rs, d);
-            let _ = self.player_and_surface(&rs, &s.dim.clone());
+            let (p, y) = self.player_and_surface(&mut rs, d);
+            let _ = self.player_and_surface(&mut rs, &s.dim.clone());
             if self.player_in_test_dimension(s, dims) {
                 return;
             }
