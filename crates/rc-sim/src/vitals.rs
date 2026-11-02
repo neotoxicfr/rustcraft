@@ -565,6 +565,8 @@ impl Server {
                 return false;
             }
         }
+        // Damage received (after the difficulty), as the other player's `player_hurt_entity` reads it.
+        let received = d.max(0.0);
         // W8c: blocking item (shield), before the invulnerability window.
         let in_use = self.using_blocks_attacks();
         let parried = self.apply_item_blocking(ty, d, &src);
@@ -679,6 +681,7 @@ impl Server {
         if !blocked || dealt > 0.0 {
             self.player_hurt_effects();
         }
+        self.prog.hurt_parts = Some((received, dealt, blocked));
         self.s9_player_hurt(ty, amount, d, pre_absorb - d, parried); // S9, W8c: parried part
         self.send_health();
         !blocked || dealt > 0.0

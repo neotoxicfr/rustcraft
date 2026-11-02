@@ -346,6 +346,9 @@ pub struct Projs {
     /// During the damage dealt directly by a thrown potion: true if it hurts those
     /// sensitive to water (the enderman only takes those, then teleports).
     pub direct_potion: Option<bool>,
+    /// During the damage dealt by a player's projectile: that projectile, the direct entity
+    /// `player_hurt_entity` describes (copied only while one of its criteria is open).
+    pub direct_hit: Option<Box<Proj>>,
 }
 
 /// An Ender pearl of `owner` flies among these projectiles (its ticket keeps the world active).

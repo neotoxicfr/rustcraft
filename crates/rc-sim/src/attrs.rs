@@ -78,6 +78,81 @@ pub(crate) fn def(name: &str) -> Option<&'static AttrDef> {
     ATTRS.iter().find(|d| d.name == name)
 }
 
+/// Attributes every living entity has (the game's common table).
+const LIVING: &[&str] = &[
+    "minecraft:max_health",
+    "minecraft:knockback_resistance",
+    "minecraft:movement_speed",
+    "minecraft:armor",
+    "minecraft:armor_toughness",
+    "minecraft:max_absorption",
+    "minecraft:step_height",
+    "minecraft:scale",
+    "minecraft:gravity",
+    "minecraft:safe_fall_distance",
+    "minecraft:fall_damage_multiplier",
+    "minecraft:jump_strength",
+    "minecraft:entity_interaction_range",
+    "minecraft:oxygen_bonus",
+    "minecraft:burning_time",
+    "minecraft:explosion_knockback_resistance",
+    "minecraft:water_movement_efficiency",
+    "minecraft:movement_efficiency",
+    "minecraft:attack_knockback",
+    "minecraft:camera_distance",
+    "minecraft:waypoint_transmit_range",
+    "minecraft:bounciness",
+    "minecraft:air_drag_modifier",
+    "minecraft:friction_modifier",
+    "minecraft:name_tag_distance",
+    "minecraft:below_name_distance",
+];
+
+/// Attributes the player adds to the common table.
+const PLAYER_ONLY: &[&str] = &[
+    "minecraft:attack_damage",
+    "minecraft:attack_speed",
+    "minecraft:luck",
+    "minecraft:block_interaction_range",
+    "minecraft:block_break_speed",
+    "minecraft:submerged_mining_speed",
+    "minecraft:sneaking_speed",
+    "minecraft:mining_efficiency",
+    "minecraft:sweeping_damage_ratio",
+    "minecraft:waypoint_receive_range",
+];
+
+/// Base of attribute `name` for an entity of type `ty` without a value of its own (its type's
+/// table): `None` if the type does not have the attribute. Player, armor stand, mannequin.
+pub(crate) fn type_default(ty: &str, name: &str) -> Option<f64> {
+    let living = LIVING.contains(&name);
+    let d = def(name)?.default;
+    match ty {
+        "minecraft:player" if living || PLAYER_ONLY.contains(&name) => Some(crate::effects::player_base_or(name, d)),
+        "minecraft:armor_stand" if name == "minecraft:step_height" => Some(0.0),
+        "minecraft:armor_stand" | "minecraft:mannequin" if living => Some(d),
+        _ => None,
+    }
+}
+
+/// Saved entry of attribute `name` in an `attributes` list: base (`None` if left out) and
+/// modifiers (identifier, amount, operation).
+pub(crate) fn saved_entry(list: &[Nbt], name: &str) -> Option<(Option<f64>, Vec<(String, f64, i32)>)> {
+    let a = list.iter().find(|a| a.get("id").and_then(Nbt::as_str) == Some(name))?;
+    let mods = crate::nbtio::list(a.get("modifiers"))
+        .iter()
+        .filter_map(|m| {
+            let id = m.get("id")?.as_str()?.to_owned();
+            let amount = m.get("amount").and_then(crate::mobs::mob::f64_of).unwrap_or(0.0);
+            Some((id, amount, op_of(m.get("operation").and_then(Nbt::as_str))))
+        })
+        .collect();
+    Some((a.get("base").and_then(crate::mobs::mob::f64_of), mods))
+}
+
+/// Equipment slots of an entity compound, in the game's order.
+const ENTITY_SLOTS: [&str; 8] = ["mainhand", "offhand", "feet", "legs", "chest", "head", "body", "saddle"];
+
 /// Clamps an attribute (`NaN`: minimum), as the game does on every value computation.
 pub(crate) fn sanitize(name: &str, v: f64) -> f64 {
     match def(name) {
@@ -274,6 +349,68 @@ impl Server {
             "minecraft:entity_interaction_range" => vec![("minecraft:creative_mode_entity_range".into(), 2.0, 0)],
             _ => Vec::new(),
         }
+    }
+
+    /// Modifiers that the worn equipment of entity compound `e` applies (broken pieces left out;
+    /// a later slot replaces an attribute's identifier, like the game).
+    pub(crate) fn nbt_equipment_mods(&self, e: &Nbt) -> Vec<EquipMod> {
+        let mut out: Vec<EquipMod> = Vec::new();
+        let Some(eq) = e.get("equipment") else { return out };
+        for slot in ENTITY_SLOTS {
+            let Some(s) = eq.get(slot).and_then(Stack::from_nbt) else { continue };
+            if self.stack_broken(&s) {
+                continue;
+            }
+            for m in self.stack_mods(&s, slot) {
+                out.retain(|o| !(o.attr == m.attr && o.id == m.id));
+                out.push(m);
+            }
+        }
+        out
+    }
+
+    /// Base and modifiers (saved ones, then those of the worn equipment `eq`) of attribute `name`
+    /// of a living entity kept as compound `e` of type `ty`; `None` if the type does not have it.
+    fn nbt_attribute_parts(&self, e: &Nbt, ty: &str, name: &str, eq: &[EquipMod]) -> Option<Sent> {
+        let default = type_default(ty, name)?;
+        let (base, mut mods) = saved_entry(crate::nbtio::list(e.get("attributes")), name).unwrap_or((None, Vec::new()));
+        for m in eq.iter().filter(|m| m.attr == name) {
+            mods.retain(|o| o.0 != m.id);
+            mods.push((m.id.clone(), m.amount, m.op));
+        }
+        Some((base.unwrap_or(default), mods))
+    }
+
+    /// Value of attribute `name` of a living entity kept as compound `e` of type `ty` (armor
+    /// stand, mannequin): its saved base (its type's otherwise), saved modifiers and those of its
+    /// worn equipment, clamped; `None` if the type does not have the attribute.
+    pub(crate) fn nbt_attribute(&self, e: &Nbt, ty: &str, name: &str) -> Option<f64> {
+        let (base, mods) = self.nbt_attribute_parts(e, ty, name, &self.nbt_equipment_mods(e))?;
+        Some(sanitize(name, crate::effects::attribute_value(base, &mods)))
+    }
+
+    /// Synchronised attributes of a living entity kept as compound `e` of type `ty` for which
+    /// the game holds an instance (a saved entry, or a modifier of its equipment): base and every
+    /// modifier, as the spawn of the entity or a change sends them (`only`: that attribute alone).
+    pub(crate) fn nbt_synced_attributes(&self, e: &Nbt, ty: &str, only: Option<&str>) -> Vec<rc_proto_v777::play::Attribute> {
+        use rc_proto_v777::play::{Attribute, Modifier};
+        let Some(reg) = self.data.registry("minecraft:attribute") else { return Vec::new() };
+        let eq = self.nbt_equipment_mods(e);
+        let saved = crate::nbtio::list(e.get("attributes"));
+        let mut out = Vec::new();
+        for d in ATTRS.iter().filter(|d| d.synced && only.is_none_or(|o| o == d.name)) {
+            if saved_entry(saved, d.name).is_none() && !eq.iter().any(|m| m.attr == d.name) {
+                continue;
+            }
+            let (Some((base, mods)), Some(id)) =
+                (self.nbt_attribute_parts(e, ty, d.name, &eq), reg.entries.iter().position(|n| n == d.name))
+            else {
+                continue;
+            };
+            let modifiers = mods.into_iter().map(|(id, amount, operation)| Modifier { id, amount, operation }).collect();
+            out.push(Attribute { id: id as i32, base, modifiers });
+        }
+        out
     }
 
     /// Full value of a player attribute (base, `/attribute`, effects, mode, equipment),

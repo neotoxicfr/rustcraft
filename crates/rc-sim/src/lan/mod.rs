@@ -142,6 +142,15 @@ pub(crate) fn guest_level(allow_commands: bool, guest_commands: bool) -> u8 {
 /// game mode.
 pub(crate) type OtherPlayer = (Option<usize>, [f64; 3], bool, bool, i32);
 
+/// Another living player of the world, as an area effect sees it (`lan_peers`).
+pub(crate) struct Peer {
+    pub who: Option<usize>,
+    pub id: i32,
+    pub pos: [f64; 3],
+    pub bbox: rc_physics::Aabb,
+    pub game_mode: i32,
+}
+
 /// Entity event that announces a permission level (24 + level).
 pub(crate) fn op_event(op: u8) -> i8 {
     24 + op.min(4) as i8
@@ -528,6 +537,28 @@ impl Server {
             let who = if Some(k) == l.active { None } else { Some(k) };
             Some((who, c.pos, c.sneaking, c.vit.dead, c.game_mode))
         })
+    }
+
+    /// Living players in game other than the current player, in player-list order: their seat
+    /// for `as_player` (`None`: the host), entity id, position, box, game mode. Read without
+    /// installing anyone (empty outside the local network).
+    pub(crate) fn lan_peers(&self) -> Vec<Peer> {
+        let Some(l) = &self.lan else { return Vec::new() };
+        let mut v = Vec::new();
+        for (k, g) in l.guests.iter().enumerate() {
+            let Some(c) = g.ctx.as_ref().filter(|c| !c.vit.dead && (g.joined || Some(k) == l.active)) else { continue };
+            let who = if Some(k) == l.active { None } else { Some(k) };
+            let p = Peer {
+                who,
+                id: c.player_id,
+                pos: c.pos,
+                bbox: crate::play::player_box(c.pos, c.sneaking),
+                game_mode: c.game_mode,
+            };
+            // The host first, like the player list.
+            if who.is_none() { v.insert(0, p) } else { v.push(p) }
+        }
+        v
     }
 
     /// Network loop: new guests, guest packets, departures.

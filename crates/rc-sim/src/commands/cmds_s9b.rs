@@ -887,35 +887,50 @@ impl Server {
 
     // ---- attribute --------------------------------------------------------------------------
 
-    /// Modifiers (identifier, amount, operation) of an attribute.
+    /// Saved modifiers (identifier, amount, operation) of an attribute: those `/attribute` adds
+    /// and removes (the player's and an armor stand's or mannequin's from their compound; every
+    /// modifier of a mob).
     fn attr_mods(&self, e: E, attr: &str) -> Vec<(String, f64, i32)> {
+        let saved = |list: &[Nbt]| crate::attrs::saved_entry(list, attr).map(|(_, m)| m).unwrap_or_default();
         match e {
-            E::Player => crate::nbtio::list(self.pdata.root.get("attributes"))
-                .iter()
-                .find(|a| a.get("id").and_then(Nbt::as_str) == Some(attr))
-                .map(|a| {
-                    crate::nbtio::list(a.get("modifiers"))
-                        .iter()
-                        .filter_map(|m| {
-                            let id = m.get("id")?.as_str()?.to_owned();
-                            let amount = m.get("amount").and_then(crate::mobs::mob::f64_of).unwrap_or(0.0);
-                            let op = match m.get("operation").and_then(Nbt::as_str) {
-                                Some("add_multiplied_base") => 1,
-                                Some("add_multiplied_total") => 2,
-                                _ => 0,
-                            };
-                            Some((id, amount, op))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
+            E::Player => saved(crate::nbtio::list(self.pdata.root.get("attributes"))),
             E::Mob(i) => self
                 .mobs
                 .mob_ref_any(i)
                 .and_then(|m| mob_attr(m, attr))
                 .map(|a| a.mods.iter().map(|(id, v, op)| ((*id).to_owned(), *v, *op)).collect())
                 .unwrap_or_default(),
+            E::Other(i) => self.deco_nbt(i).map(|n| saved(crate::nbtio::list(n.get("attributes")))).unwrap_or_default(),
             _ => Vec::new(),
+        }
+    }
+
+    /// Every modifier an attribute holds (saved, equipment, effects, mode), as the lookups of
+    /// `/attribute … modifier` see them.
+    fn attr_all_mods(&self, e: E, attr: &str) -> Vec<(String, f64, i32)> {
+        match e {
+            E::Player => self.player_mods(attr),
+            E::Other(i) => {
+                let mut mods = self.attr_mods(e, attr);
+                if let Some(n) = self.deco_nbt(i) {
+                    for m in self.nbt_equipment_mods(n).into_iter().filter(|m| m.attr == attr) {
+                        mods.retain(|o| o.0 != m.id);
+                        mods.push((m.id, m.amount, m.op));
+                    }
+                }
+                mods
+            }
+            _ => self.attr_mods(e, attr),
+        }
+    }
+
+    /// Full value of an attribute (base and every modifier, clamped), as the game reads it.
+    fn attr_value_s9(&self, e: E, attr: &str, base: f64) -> f64 {
+        match e {
+            E::Player => self.player_attribute(attr),
+            E::Mob(i) => self.mobs.mob_ref_any(i).and_then(|m| mob_attr(m, attr)).map_or(base, crate::mobs::mob::Attr::value),
+            E::Other(i) => self.deco_attribute(i, attr).unwrap_or(base),
+            _ => base,
         }
     }
 
@@ -961,6 +976,7 @@ impl Server {
                     m.needs_sync = true;
                 }
             }
+            E::Other(i) => self.deco_store_attribute(i, attr, base, mods),
             _ => {}
         }
     }
@@ -978,10 +994,10 @@ impl Server {
         };
         let scale: f64 = p.arg(seg, "scale").and_then(|v| v.parse().ok()).unwrap_or(1.0);
         let mut mods = self.attr_mods(e, &attr);
-        let value = attr_value(base, &mods);
         let id = p.arg(seg, "id").map(|x| args::id(&x));
         match (w.get(3).copied(), w.get(4).copied(), w.get(5).copied()) {
             (Some("get"), _, _) => {
+                let value = self.attr_value_s9(e, &attr, base);
                 self.ok(s, tr!("commands.attribute.value.get.success", desc, self.ent_display(e), text::jd(value)));
                 Ok((value * scale) as i32)
             }
@@ -997,7 +1013,15 @@ impl Server {
             }
             (Some("base"), Some("reset"), _) => {
                 let def = self.attribute_default_s9(e, &attr).unwrap_or(base);
-                self.set_attr_mods(e, &attr, def, &mods);
+                // An armor stand or a mannequin without an entry of its own keeps none (the
+                // game resets an existing instance only).
+                let held = !matches!(e, E::Other(_))
+                    || self.deco_nbt(self.ent_id(e)).is_some_and(|n| {
+                        crate::attrs::saved_entry(crate::nbtio::list(n.get("attributes")), &attr).is_some()
+                    });
+                if held {
+                    self.set_attr_mods(e, &attr, def, &mods);
+                }
                 self.ok(
                     s,
                     tr!("commands.attribute.base_value.reset.success", desc, self.ent_display(e), text::jd(def)),
@@ -1006,7 +1030,7 @@ impl Server {
             }
             (Some("modifier"), Some("add"), _) => {
                 let id = id.unwrap_or_default();
-                if mods.iter().any(|m| m.0 == id) {
+                if self.attr_all_mods(e, &attr).iter().any(|m| m.0 == id) {
                     return Err(Fail(tr!(
                         "commands.attribute.failed.modifier_already_present",
                         id,
@@ -1037,7 +1061,8 @@ impl Server {
             }
             (Some("modifier"), Some("value"), _) => {
                 let id = id.unwrap_or_default();
-                let Some(m) = mods.iter().find(|m| m.0 == id) else {
+                let all = self.attr_all_mods(e, &attr);
+                let Some(m) = all.iter().find(|m| m.0 == id) else {
                     return Err(Fail(tr!("commands.attribute.failed.no_modifier", desc, self.ent_display(e), id)));
                 };
                 let v = m.1;
@@ -1061,20 +1086,29 @@ impl Server {
                 let fresh = crate::mobs::mob::Mob::new(kind, 0, 0, [0.0; 3], 0.0, crate::mobs::jrand::JRand::new(0));
                 mob_attr(&fresh, attr).map(|a| a.base)
             }
-            E::Player => default_attr(attr),
+            E::Player => crate::attrs::type_default("minecraft:player", attr),
+            // Armor stand, mannequin: the table of their type.
+            E::Other(i) => {
+                let n = self.deco_nbt(i)?;
+                crate::attrs::type_default(n.get("id").and_then(Nbt::as_str)?, attr)
+            }
             _ => None,
         }
     }
 
+    /// Base of an attribute the entity's type has: its saved base, otherwise the type's
+    /// (`None`: the type does not have the attribute).
     fn attribute_base_s9(&self, e: E, attr: &str) -> Option<f64> {
+        let saved = |list: &[Nbt]| crate::attrs::saved_entry(list, attr).and_then(|(b, _)| b);
         match e {
             E::Mob(i) => self.mobs.mob_ref_any(i).and_then(|m| mob_attr(m, attr)).map(|a| a.base),
             E::Player => {
-                let saved = crate::nbtio::list(self.pdata.root.get("attributes"))
-                    .iter()
-                    .find(|a| a.get("id").and_then(Nbt::as_str) == Some(attr))
-                    .and_then(|a| a.get("base").and_then(crate::mobs::mob::f64_of));
-                saved.or_else(|| default_attr(attr))
+                let def = crate::attrs::type_default("minecraft:player", attr)?;
+                Some(saved(crate::nbtio::list(self.pdata.root.get("attributes"))).unwrap_or(def))
+            }
+            E::Other(i) => {
+                let def = self.attribute_default_s9(e, attr)?;
+                Some(self.deco_nbt(i).and_then(|n| saved(crate::nbtio::list(n.get("attributes")))).unwrap_or(def))
             }
             _ => None,
         }
@@ -1109,60 +1143,6 @@ fn op_name(op: i32) -> &'static str {
         2 => "add_multiplied_total",
         _ => "add_value",
     }
-}
-
-/// Value of an attribute.
-fn attr_value(base: f64, mods: &[(String, f64, i32)]) -> f64 {
-    let mut b = base;
-    for m in mods.iter().filter(|m| m.2 == 0) {
-        b += m.1;
-    }
-    let mut r = b;
-    for m in mods.iter().filter(|m| m.2 == 1) {
-        r += b * m.1;
-    }
-    for m in mods.iter().filter(|m| m.2 == 2) {
-        r *= 1.0 + m.1;
-    }
-    r
-}
-
-/// Default base of a player attribute.
-fn default_attr(attr: &str) -> Option<f64> {
-    Some(match attr {
-        "minecraft:max_health" => 20.0,
-        // Player: float 0.1 widened (`0.10000000149011612`), like the game.
-        "minecraft:movement_speed" => f64::from(0.1f32),
-        "minecraft:attack_damage" => 1.0,
-        "minecraft:attack_speed" => 4.0,
-        "minecraft:armor" | "minecraft:armor_toughness" | "minecraft:luck" | "minecraft:knockback_resistance" => 0.0,
-        "minecraft:block_interaction_range" => 4.5,
-        "minecraft:entity_interaction_range" => 3.0,
-        "minecraft:gravity" => 0.08,
-        "minecraft:jump_strength" => 0.42,
-        "minecraft:step_height" => 0.6,
-        "minecraft:scale" => 1.0,
-        "minecraft:safe_fall_distance" => 3.0,
-        "minecraft:fall_damage_multiplier" => 1.0,
-        "minecraft:block_break_speed" | "minecraft:mining_efficiency" | "minecraft:submerged_mining_speed" => {
-            if attr.ends_with("block_break_speed") {
-                1.0
-            } else if attr.ends_with("submerged_mining_speed") {
-                0.2
-            } else {
-                0.0
-            }
-        }
-        "minecraft:oxygen_bonus" | "minecraft:burning_time" | "minecraft:explosion_knockback_resistance" => {
-            if attr.ends_with("burning_time") { 1.0 } else { 0.0 }
-        }
-        "minecraft:sneaking_speed" => 0.3,
-        "minecraft:sweeping_damage_ratio" | "minecraft:water_movement_efficiency" | "minecraft:movement_efficiency" => {
-            0.0
-        }
-        "minecraft:waypoint_transmit_range" | "minecraft:waypoint_receive_range" => 60_000_000.0,
-        _ => return None,
-    })
 }
 
 fn mob_attr<'a>(m: &'a crate::mobs::mob::Mob, attr: &str) -> Option<&'a crate::mobs::mob::Attr> {

@@ -266,6 +266,9 @@ pub struct Progress {
     pub attacker_player: Option<(rc_text::Component, Option<rc_text::Component>)>,
     /// G5-F04: weapon of that other player (armor effectiveness of the hit).
     pub attacker_weapon: Option<Stack>,
+    /// Last hit taken past the invulnerability window: damage received, damage after the
+    /// shield (before armor), parried; read by the other player's `player_hurt_entity`.
+    pub hurt_parts: Option<(f32, f32, bool)>,
     /// Retaliation of a parried hit that changed the attacker (stunned ravager): identifier,
     /// stun ticks, random draw; taken back by the caller that holds the mob.
     pub riposte: Option<(i32, i32, crate::mobs::jrand::JRand)>,
@@ -312,6 +315,7 @@ impl Progress {
             attacker: None,
             attacker_player: None,
             attacker_weapon: None,
+            hurt_parts: None,
             riposte: None,
             dmg_src: Default::default(),
             lev_start: None,

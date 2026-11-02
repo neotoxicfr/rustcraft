@@ -158,6 +158,13 @@ pub fn dist2(a: [f64; 3], b: [f64; 3]) -> f64 {
     (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)
 }
 
+/// Unit vector of `v`, the zero vector below a length of 1e-5 in single precision (the
+/// game's vector normalization).
+pub fn normalize(v: [f64; 3]) -> [f64; 3] {
+    let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if l < f64::from(1.0e-5f32) { [0.0; 3] } else { v.map(|c| c / l) }
+}
+
 pub fn block_of(p: [f64; 3]) -> [i32; 3] {
     [p[0].floor() as i32, p[1].floor() as i32, p[2].floor() as i32]
 }

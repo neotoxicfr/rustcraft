@@ -213,57 +213,49 @@ impl Server {
         // 2. Entities: knockback only (kind multiplier; the player flying in creative
         //    receives none).
         let double = f64::from(radius * 2.0);
-        let mut player_kb: Option<[f64; 3]> = None;
-        let mut targets: Vec<Ent> = self.mobs.list.iter().flatten().map(|o| Ent::Mob(o.id)).collect();
-        targets.push(Ent::Player);
-        for t in targets {
+        let ids: Vec<i32> = self.mobs.list.iter().flatten().map(|o| o.id).collect();
+        for id in ids {
+            let t = Ent::Mob(id);
             let (Some(pos), Some(eye), Some(bb)) = (self.ent_pos(t), self.ent_eye(t), self.ent_bbox(t)) else {
                 continue;
             };
-            if t == Ent::Player && (self.game_mode == 3 || !self.ent_alive(Ent::Player)) {
-                continue;
-            }
-            if let Ent::Mob(id) = t
-                && self.mob_ref(id).is_some_and(super::ignores_explosion)
-            {
+            if self.mob_ref(id).is_some_and(super::ignores_explosion) {
                 continue;
             }
             let dist = dist2(pos, center).sqrt() / double;
             if dist > 1.0 {
                 continue;
             }
-            let mut dir = [pos[0] - center[0], eye - center[1], pos[2] - center[2]];
-            let l = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
-            dir = if l < 1.0e-4 { [0.0; 3] } else { dir.map(|v| v / l) };
-            let mult = kb_mult;
+            let dir = crate::mobs::mth::normalize([pos[0] - center[0], eye - center[1], pos[2] - center[2]]);
             let exposure = f64::from(self.seen_percent(center, &bb));
-            let res = match t {
-                Ent::Mob(id) => self.mob_ref(id).map_or(0.0, |o| o.attrs.explosion_kb_resistance.value()),
-                Ent::Player => self.player_attribute("minecraft:explosion_knockback_resistance"),
-            };
-            let kp = (1.0 - dist) * exposure * mult * (1.0 - res);
-            let kb = dir.map(|v| v * kp);
-            match t {
-                Ent::Player => {
-                    // W8c: impact point and cause (`fall_after_explosion`).
-                    self.prog.expl_impact = Some((self.pos, self.prog.expl_cause_next.map(str::to_owned)));
-                    // Player's wind charge (not the breeze's): the fall that follows is bounded
-                    // to the height from here.
-                    let wind_charge = self.prog.expl_cause_next == Some("minecraft:wind_charge");
-                    let at = self.pos;
-                    self.life.vit.impulse_from_explosion(wind_charge, at);
-                    if !(self.game_mode == 1 && self.flying) {
-                        player_kb = Some(kb);
-                    }
-                }
-                Ent::Mob(id) => {
-                    if let Some(o) = self.mobs.get_mut(id) {
-                        o.vel = [o.vel[0] + kb[0], o.vel[1] + kb[1], o.vel[2] + kb[2]];
-                        o.needs_sync = true;
-                    }
-                }
+            let res = self.mob_ref(id).map_or(0.0, |o| o.attrs.explosion_kb_resistance.value());
+            let kp = (1.0 - dist) * exposure * kb_mult * (1.0 - res);
+            if let Some(o) = self.mobs.get_mut(id) {
+                o.vel = [o.vel[0] + dir[0] * kp, o.vel[1] + dir[1] * kp, o.vel[2] + dir[2] * kp];
+                o.needs_sync = true;
             }
         }
+        // The current player, then the other players of the local network (the cause of the
+        // burst is the explosion's, whoever is installed).
+        let cause = self.prog.expl_cause_next;
+        let player_kb = self.wind_burst_player(center, double, kb_mult, cause);
+        let peers: Vec<(Option<usize>, Option<[f64; 3]>)> = self
+            .lan_peers()
+            .into_iter()
+            .filter(|o| o.game_mode != 3)
+            .map(|o| (o.who, self.as_player(o.who, |sv| sv.wind_burst_player(center, double, kb_mult, cause))))
+            .collect();
+        // Block-like entities (armor stands, items, what is hung) are reached only under the
+        // mob rule, and never by the burst of a wind charge itself; minecarts are spared when a
+        // mob is behind the burst without the mob rule.
+        let griefing = self.rule("minecraft:mob_griefing", true);
+        let blocklike = griefing && !matches!(src, Some(Src::Projectile(_)));
+        self.blast_push_objects(center, radius, kb_mult, blocklike);
+        self.deco_blast_push(center, radius, kb_mult, blocklike);
+        if griefing || !matches!(owner, Some(Ent::Mob(_))) {
+            self.carts_blast_push(center, radius, kb_mult);
+        }
+        self.crystals_blast_push(center, radius, kb_mult);
         // Mobs held by the caller: same knockback rule.
         for o in held.iter_mut() {
             if super::ignores_explosion(o) {
@@ -273,9 +265,7 @@ impl Server {
             if dist > 1.0 {
                 continue;
             }
-            let mut dir = [o.pos[0] - center[0], o.eye_y() - center[1], o.pos[2] - center[2]];
-            let l = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
-            dir = if l < 1.0e-4 { [0.0; 3] } else { dir.map(|v| v / l) };
+            let dir = crate::mobs::mth::normalize([o.pos[0] - center[0], o.eye_y() - center[1], o.pos[2] - center[2]]);
             let exposure = f64::from(self.seen_percent(center, &o.bbox()));
             let kp = (1.0 - dist) * exposure * kb_mult * (1.0 - o.attrs.explosion_kb_resistance.value());
             o.vel = [o.vel[0] + dir[0] * kp, o.vel[1] + dir[1] * kp, o.vel[2] + dir[2] * kp];
@@ -289,44 +279,77 @@ impl Server {
         for p in toblow.iter().copied() {
             self.wind_trigger_block(p);
         }
-        // 4. Packet to the player.
-        if dist2(self.pos, center) < 4096.0 {
-            let pt = |s: &Server, n: &str| Particle {
-                kind: s
-                    .data
-                    .registry("minecraft:particle_type")
-                    .and_then(|r| r.entries.iter().position(|e| e == n))
-                    .unwrap_or(0) as i32,
-                color: 0,
-                state: 0,
-                item: -1,
-                scale: 1.0,
-                color2: 0,
-                vib: None,
-            };
-            // Radius of at least 2 with interaction (trigger): big burst, otherwise small.
-            let emitter = if radius >= 2.0 { "minecraft:gust_emitter_large" } else { "minecraft:gust_emitter_small" };
-            let ex = rc_client::extra::Explosion {
-                center,
-                radius,
-                blocks: toblow.len() as i32,
-                knockback: player_kb,
-                particle: pt(self, emitter),
-                sound: SoundRef::Id(
-                    self.data
-                        .registry("minecraft:sound_event")
-                        .and_then(|r| r.entries.iter().position(|e| e == sound))
-                        .unwrap_or(0) as i32,
-                ),
-                block_particles: Vec::new(),
-                play_sound: true,
-            };
-            let _ = self.send(Event::Explode(Box::new(ex)));
+        // 4. Packet to each player within 64 blocks, with its own knockback.
+        let pt = |s: &Server, n: &str| Particle {
+            kind: s.data.registry("minecraft:particle_type").and_then(|r| r.entries.iter().position(|e| e == n)).unwrap_or(0)
+                as i32,
+            color: 0,
+            state: 0,
+            item: -1,
+            scale: 1.0,
+            color2: 0,
+            vib: None,
+        };
+        // Radius of at least 2 with interaction (trigger): big burst, otherwise small.
+        let emitter = if radius >= 2.0 { "minecraft:gust_emitter_large" } else { "minecraft:gust_emitter_small" };
+        let ex = rc_client::extra::Explosion {
+            center,
+            radius,
+            blocks: toblow.len() as i32,
+            knockback: None,
+            particle: pt(self, emitter),
+            sound: SoundRef::Id(
+                self.data.registry("minecraft:sound_event").and_then(|r| r.entries.iter().position(|e| e == sound)).unwrap_or(0)
+                    as i32,
+            ),
+            block_particles: Vec::new(),
+            play_sound: true,
+        };
+        self.send_explosion(ex, player_kb, &peers);
+        for (who, kb) in peers {
+            if let Some(kb) = kb {
+                self.as_player(who, |sv| sv.add_player_vel(kb));
+            }
         }
         if let Some(kb) = player_kb {
-            let v = self.mobs.player_vel;
-            self.mobs.player_vel = [v[0] + kb[0], v[1] + kb[1], v[2] + kb[2]];
+            self.add_player_vel(kb);
         }
+    }
+
+    /// The burst reaching the installed player (spectators and the dead excluded): impact point
+    /// and cause, fall grace of a player's wind charge; its knockback, unless it flies in
+    /// creative mode (the packet then carries none).
+    fn wind_burst_player(&mut self, center: [f64; 3], double: f64, kb_mult: f64, cause: Option<&'static str>) -> Option<[f64; 3]> {
+        if self.game_mode == 3 || !self.ent_alive(Ent::Player) {
+            return None;
+        }
+        let (Some(pos), Some(eye), Some(bb)) = (self.ent_pos(Ent::Player), self.ent_eye(Ent::Player), self.ent_bbox(Ent::Player))
+        else {
+            return None;
+        };
+        let dist = dist2(pos, center).sqrt() / double;
+        if dist > 1.0 {
+            return None;
+        }
+        let dir = crate::mobs::mth::normalize([pos[0] - center[0], eye - center[1], pos[2] - center[2]]);
+        let exposure = f64::from(self.seen_percent(center, &bb));
+        let res = self.player_attribute("minecraft:explosion_knockback_resistance");
+        let kp = (1.0 - dist) * exposure * kb_mult * (1.0 - res);
+        // W8c: impact point and cause (`fall_after_explosion`).
+        self.prog.expl_impact = Some((self.pos, cause.map(str::to_owned)));
+        // Player's wind charge (not the breeze's): the fall that follows is bounded to the
+        // height from here.
+        let wind_charge = cause == Some("minecraft:wind_charge");
+        let at = self.pos;
+        self.life.vit.impulse_from_explosion(wind_charge, at);
+        (!(self.game_mode == 1 && self.flying)).then(|| dir.map(|v| v * kp))
+    }
+
+    /// Server velocity of the installed player increased (the client applies the knockback of
+    /// the explosion packet itself).
+    fn add_player_vel(&mut self, kb: [f64; 3]) {
+        let v = self.mobs.player_vel;
+        self.mobs.player_vel = [v[0] + kb[0], v[1] + kb[1], v[2] + kb[2]];
     }
 
     /// The reaction to an explosion in "trigger" mode: levers, buttons, doors and trapdoors openable by
