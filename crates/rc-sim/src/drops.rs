@@ -18,6 +18,20 @@ const ITEM_SIZE: f64 = 0.25;
 const ORB_SIZE: f64 = 0.5;
 const LIFETIME: i32 = 6000;
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: items and orbs always ticked one by one (out of their slot), never by runs with
+    /// the list taken out (equivalence of the two ways, `tests_l10order`).
+    pub(crate) static ONE_BY_ONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn one_by_one() -> bool {
+    #[cfg(test)]
+    return ONE_BY_ONE.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    false
+}
+
 /// Physics of a server item or orb (authoritative instance).
 fn server_body(pos: [f64; 3], vel: [f64; 3], size: f64, eye: f64) -> Box<Body> {
     let mut b = Box::new(Body::new(pos, vel, size, size, eye));
@@ -53,13 +67,38 @@ pub struct ItemEnt {
     /// G5-F05: fire ticks left (`Fire`), and the "on fire" flag last sent to the client.
     pub fire: i32,
     fire_flag: bool,
-    /// G3-F13: entity walk of its birth (`Walk::born`), and "ticked this tick" (only a ticked
-    /// item merges its neighbours into itself).
-    born: u64,
+    /// Rank in the entity walk (`walk::next_rank`), and "ticked this tick" (only a ticked item
+    /// merges its neighbours into itself).
+    pub(crate) rank: u64,
     pub(crate) ticked: bool,
 }
 
 impl ItemEnt {
+    /// Stand-in left in the slot of the item being ticked (removed: nothing counts or finds it).
+    fn placeholder() -> ItemEnt {
+        ItemEnt {
+            id: i32::MIN,
+            stack: Stack { id: String::new(), count: 0, components: None },
+            pos: [0.0; 3],
+            vel: [0.0; 3],
+            on_ground: false,
+            age: 0,
+            pickup_delay: 0,
+            ticks: 0,
+            moved: false,
+            track: Default::default(),
+            removed: true,
+            health: 0,
+            body: server_body([0.0; 3], [0.0; 3], ITEM_SIZE, 0.2125),
+            thrower: None,
+            yaw: 0.0,
+            fire: 0,
+            fire_flag: false,
+            rank: 0,
+            ticked: false,
+        }
+    }
+
     /// Network tracking restarted from zero (item re-announced elsewhere, S6).
     pub(crate) fn retrack(&mut self) {
         self.track = Default::default();
@@ -86,8 +125,31 @@ pub struct Orb {
     /// G5-F05: fire ticks left, and the "on fire" flag last sent to the client.
     pub fire: i32,
     fire_flag: bool,
-    /// G3-F13: entity walk of its birth (`Walk::born`).
-    born: u64,
+    /// Rank in the entity walk (`walk::next_rank`).
+    pub(crate) rank: u64,
+}
+
+impl Orb {
+    /// Stand-in left in the slot of the orb being ticked (removed: nothing counts or absorbs it).
+    fn placeholder() -> Orb {
+        Orb {
+            id: i32::MIN,
+            value: 0,
+            count: 0,
+            pos: [0.0; 3],
+            vel: [0.0; 3],
+            on_ground: false,
+            age: 0,
+            ticks: 0,
+            track: Default::default(),
+            removed: true,
+            health: 0,
+            body: server_body([0.0; 3], [0.0; 3], ORB_SIZE, 0.425),
+            fire: 0,
+            fire_flag: false,
+            rank: 0,
+        }
+    }
 }
 
 /// Split of a reward into orbs (values of the game).
@@ -252,7 +314,7 @@ impl Server {
             yaw,
             fire: 0,
             fire_flag: false,
-            born: self.walk.born(),
+            rank: crate::walk::next_rank(),
             ticked: false,
         });
     }
@@ -417,7 +479,7 @@ impl Server {
             body: server_body(pos, vel, ORB_SIZE, 0.425),
             fire: 0,
             fire_flag: false,
-            born: self.walk.born(),
+            rank: crate::walk::next_rank(),
         });
     }
 
@@ -457,7 +519,7 @@ impl Server {
             body: server_body(pos, vel, ORB_SIZE, 0.425),
             fire: get("Fire", 0) as i16 as i32,
             fire_flag: false,
-            born: self.walk.born(),
+            rank: crate::walk::next_rank(),
         });
         id
     }
@@ -534,29 +596,116 @@ impl Server {
         }]
     }
 
-    /// Tick of items and orbs: physics, merge, pickup, disappearance.
+    /// Items and orbs as their own walk (block probes, parked worlds): physics, merge, pickup,
+    /// disappearance.
+    #[cfg(test)]
     pub(crate) fn drops_tick(&mut self) {
-        #[cfg(test)]
         crate::server::phase("items");
+        use crate::walk::{Fam, bit};
+        self.walk_alone(bit(Fam::Item) | bit(Fam::Orb), Self::drops_track, Self::drops_post);
+    }
+
+    /// Network tracking of the items and orbs BEFORE the walk, like the official server (the
+    /// client receives the state of the previous tick then does the current tick itself).
+    pub(crate) fn drops_track(&mut self) {
         let mut drops = std::mem::take(&mut self.life.drops);
-        // Network tracking BEFORE the entity tick, like the official server (the client receives
-        // the state of the previous tick then does the current tick itself).
-        for d in drops.iter_mut().filter(|d| !d.removed) {
-            self.track_object(&mut d.track, d.id, d.pos, d.vel, d.on_ground, 20);
+        for d in drops.iter_mut() {
+            d.ticked = false;
+            if !d.removed {
+                self.track_object(&mut d.track, d.id, d.pos, d.vel, d.on_ground, 20);
+            }
         }
-        // G5-F02e: positions seen by the plates while the list is taken out.
+        drops.append(&mut self.life.drops);
+        self.life.drops = drops;
+        let mut orbs = std::mem::take(&mut self.life.orbs);
+        for o in orbs.iter_mut().filter(|o| !o.removed) {
+            self.track_object(&mut o.track, o.id, o.pos, o.vel, o.on_ground, 20);
+        }
+        orbs.append(&mut self.life.orbs);
+        self.life.orbs = orbs;
+    }
+
+    /// Items of the slots from `start` whose rank stays under `limit` (before `end`), in the
+    /// entity walk; returns the slot after them. A run of at least an eighth of the list ticks
+    /// with the list taken out once, the plates reading every item's position from
+    /// `contact.live_items` (O(list) once per run); a shorter one (ranks interleaved with other
+    /// families) ticks each item out of its slot (`item_visit`). Both are O(1) per item.
+    pub(crate) fn item_run(&mut self, start: usize, end: usize, limit: u64) -> usize {
+        let mut stop = start + 1;
+        while stop < end && self.life.drops.get(stop).is_some_and(|d| d.rank < limit) {
+            stop += 1;
+        }
+        if (stop - start) * 8 < self.life.drops.len() || self.contact.items_taken || one_by_one() {
+            for i in start..stop {
+                self.item_visit(i);
+            }
+            return stop;
+        }
+        let mut drops = std::mem::take(&mut self.life.drops);
         let mut live = std::mem::take(&mut self.contact.live_items);
         live.clear();
         live.extend(drops.iter().map(|d| (d.pos, d.removed)));
         self.contact.live_items = live;
-        self.contact.items_ticking = true;
-        for (i, d) in drops.iter_mut().enumerate() {
-            // G3-F13: born during this entity walk (falling block, mining), or outside a "ticking
-            // entities" chunk: no tick (and no merge into it) this tick.
-            d.ticked = !d.removed && !self.walk.waits(std::mem::take(&mut d.born)) && self.entity_ticks_at(d.pos);
-            if !d.ticked {
-                continue;
+        self.contact.items_taken = true;
+        for (i, d) in drops.iter_mut().enumerate().take(stop).skip(start) {
+            if self.item_meets(d, i) {
+                self.item_tick(d, i);
             }
+        }
+        self.contact.items_taken = false;
+        self.contact.live_items.clear();
+        drops.append(&mut self.life.drops);
+        self.life.drops = drops;
+        stop
+    }
+
+    /// Item of slot `i`, at its rank in the entity walk. Ticked out of its slot (a removed
+    /// placeholder holds it): the other items stay in the list, the plates count it through
+    /// `contact.ticking_item`.
+    pub(crate) fn item_visit(&mut self, i: usize) {
+        let Some(d) = self.life.drops.get(i).filter(|d| !d.removed) else { return };
+        // G3-F13: outside a "ticking entities" chunk, no tick (and no merge into it) this tick.
+        let (ticking, mut rank) = (self.entity_ticks_at(d.pos), d.rank);
+        let meet = self.meet(&mut rank, ticking, crate::walk::Fam::Item, i);
+        self.life.drops[i].rank = rank;
+        if meet != crate::walk::Meet::Tick {
+            return;
+        }
+        let spare = self.walk.spare_item.take().unwrap_or_else(ItemEnt::placeholder);
+        let mut d = std::mem::replace(&mut self.life.drops[i], spare);
+        d.ticked = true;
+        self.contact.ticking_item = Some((d.pos, false));
+        self.item_tick(&mut d, i);
+        self.contact.ticking_item = None;
+        if let Some(slot) = self.life.drops.get_mut(i) {
+            self.walk.spare_item = Some(std::mem::replace(slot, d));
+        }
+    }
+
+    /// The item of slot `i` met by the walk ticks now (G3-F13: not outside a "ticking entities"
+    /// chunk, no merge into it then); marked "ticked".
+    fn item_meets(&mut self, d: &mut ItemEnt, i: usize) -> bool {
+        if d.removed {
+            return false;
+        }
+        let ticking = self.entity_ticks_at(d.pos);
+        d.ticked = self.meet(&mut d.rank, ticking, crate::walk::Fam::Item, i) == crate::walk::Meet::Tick;
+        d.ticked
+    }
+
+    /// Position and removal of the item of slot `i` being ticked, as the plates see them.
+    fn item_seen(&mut self, i: usize, pos: [f64; 3], gone: bool) {
+        if self.contact.items_taken {
+            if let Some(l) = self.contact.live_items.get_mut(i) {
+                *l = (pos, gone);
+            }
+        } else {
+            self.contact.ticking_item = Some((pos, gone));
+        }
+    }
+
+    fn item_tick(&mut self, d: &mut ItemEnt, i: usize) {
+        {
             d.ticks += 1;
             // G5-F05: fire at the start of its tick (an immune stack is put out).
             let immune = d.fire > 0 && self.item_resists(&d.stack, "minecraft:in_fire");
@@ -567,8 +716,8 @@ impl Server {
             }
             self.fire_flag(d.id, d.fire, &mut d.fire_flag);
             if d.removed {
-                self.contact.live_items[i].1 = true;
-                continue;
+                self.item_seen(i, d.pos, true);
+                return;
             }
             if d.pickup_delay > 0 && d.pickup_delay != 32767 {
                 d.pickup_delay -= 1;
@@ -606,9 +755,9 @@ impl Server {
                 // G5-F05: fire, lava, cactus, water and powder snow of the blocks crossed.
                 self.inside_blocks(&mut crate::inside_blocks::Who::Item(d));
             }
-            self.contact.live_items[i] = (d.pos, d.removed);
+            self.item_seen(i, d.pos, d.removed);
             if d.removed {
-                continue;
+                return;
             }
             // G5-F02e: plates and tripwire right after its movement (the following ones not moved yet).
             self.contact_triggers(old, d.pos, ITEM_SIZE / 2.0, ITEM_SIZE);
@@ -617,12 +766,17 @@ impl Server {
             }
             if d.age >= LIFETIME || d.pos[1] < f64::from(self.dim.height.min_y) - 64.0 {
                 d.removed = true;
-                self.contact.live_items[i].1 = true;
+                self.item_seen(i, d.pos, true);
             }
             let moved = (0..3).any(|a| old[a].floor() != d.pos[a].floor());
             d.moved = moved;
         }
-        // Merge (every 2 ticks while moving, 40 at rest).
+    }
+
+    /// After the walk: merge of the items (every 2 ticks while moving, 40 at rest), pickup by the
+    /// player, then the orbs' pickup, removals.
+    pub(crate) fn drops_post(&mut self) {
+        let mut drops = std::mem::take(&mut self.life.drops);
         let n = drops.len();
         for i in 0..n {
             let rate = if drops[i].moved { 2 } else { 40 };
@@ -733,18 +887,15 @@ impl Server {
         }
         let gone: Vec<i32> = drops.iter().filter(|d| d.removed).map(|d| d.id).collect();
         drops.retain(|d| !d.removed);
-        // Items appeared during the tick (contents of a destroyed box or bag…): after the others.
+        // Items appeared during the pickup (contents of a bag…): after the others.
         drops.append(&mut self.life.drops);
         self.life.drops = drops;
-        self.contact.items_ticking = false;
-        self.contact.live_items.clear();
         let mut orbs = std::mem::take(&mut self.life.orbs);
-        self.orbs_tick(&mut orbs);
+        self.orbs_pickup(&mut orbs);
         let gone_orbs: Vec<i32> = orbs.iter().filter(|o| o.removed).map(|o| o.id).collect();
         orbs.retain(|o| !o.removed);
+        orbs.append(&mut self.life.orbs);
         self.life.orbs = orbs;
-        self.contact.orbs_ticking = false;
-        self.contact.live_orbs.clear();
         let all: Vec<i32> = gone.into_iter().chain(gone_orbs).collect();
         if !all.is_empty() {
             // Scoreboard: items and orbs removed (command UUID derived from the id).
@@ -776,102 +927,178 @@ impl Server {
         }
     }
 
-    fn orbs_tick(&mut self, orbs: &mut [Orb]) {
-        let follow = !self.life.vit.dead && self.game_mode != 3;
-        let players = self.orb_followers();
-        let fast = self.fast_lava();
-        // Network tracking before the tick (order of the official server).
-        for o in orbs.iter_mut().filter(|o| !o.removed) {
-            self.track_object(&mut o.track, o.id, o.pos, o.vel, o.on_ground, 20);
+    /// Orbs of the slots from `start` whose rank stays under `limit` (before `end`), in the entity
+    /// walk; returns the slot after them. Same two ways as the items (`item_run`): a long run with
+    /// the list taken out once and the positions in `contact.live_orbs`, a short one orb by orb.
+    pub(crate) fn orb_run(&mut self, start: usize, end: usize, limit: u64) -> usize {
+        let mut stop = start + 1;
+        while stop < end && self.life.orbs.get(stop).is_some_and(|o| o.rank < limit) {
+            stop += 1;
         }
-        // G5-F02e: positions seen by the plates while the list is taken out.
+        if (stop - start) * 8 < self.life.orbs.len() || self.contact.orbs_taken || one_by_one() {
+            for i in start..stop {
+                self.orb_visit(i);
+            }
+            return stop;
+        }
+        let mut orbs = std::mem::take(&mut self.life.orbs);
         let mut live = std::mem::take(&mut self.contact.live_orbs);
         live.clear();
         live.extend(orbs.iter().map(|o| (o.pos, o.removed)));
         self.contact.live_orbs = live;
-        self.contact.orbs_ticking = true;
-        let min_y = f64::from(self.dim.height.min_y) - 64.0;
-        let mut buckets = std::mem::take(&mut self.contact.orb_buckets);
-        let mut buckets_built = false;
-        for i in 0..orbs.len() {
-            // G3-F13: born during this entity walk, or outside a "ticking entities" chunk.
-            if orbs[i].removed
-                || self.walk.waits(std::mem::take(&mut orbs[i].born))
-                || !self.entity_ticks_at(orbs[i].pos)
-            {
+        self.contact.orbs_taken = true;
+        for i in start..stop.min(orbs.len()) {
+            if !self.orb_meets(&mut orbs[i], i) {
                 continue;
             }
-            let o = &mut orbs[i];
-            o.ticks += 1;
-            // G5-F05: fire at the start of its tick, below the world.
-            o.body.pos = o.pos;
-            let lava = burn_due(o.fire, false) && o.body.touching_lava(&self.world(), &self.phys);
-            if burn_step(&mut o.fire, false, lava) {
-                orb_take_damage(o, 1.0);
+            let gone = self.orb_fire(&mut orbs[i], i);
+            if orbs[i].ticks % 20 == 1 {
+                self.orbs_merge(&mut orbs, i);
             }
-            self.fire_flag(o.id, o.fire, &mut o.fire_flag);
-            if o.pos[1] < min_y {
-                o.removed = true;
-            }
-            let gone = o.removed;
-            if gone {
-                self.contact.live_orbs[i].1 = true;
-            }
-            // G5-F05: absorbs the orbs of the same value around it every 20 ticks (from the first);
-            // from 40 orbs on, candidates read from the residues modulo 40 rebuilt once per tick
-            // (below, the whole list costs less; `RUSTCRAFT_OPT_ORB_MERGE_LINEAR=1`: always it).
-            // Quirk kept: an orb just removed above (burnt, below the world) still absorbs its
-            // neighbours, which disappear with it.
-            if o.ticks % 20 == 1 {
-                if orbs.len() < ORB_BUCKETS_FROM || rc_data::env_flag!("RUSTCRAFT_OPT_ORB_MERGE_LINEAR") {
-                    merge_orbs(orbs, i, &mut self.contact.live_orbs, 0..orbs.len());
-                } else {
-                    if !buckets_built {
-                        orb_buckets(orbs, &mut buckets);
-                        buckets_built = true;
-                    }
-                    let b = &buckets[orbs[i].id.rem_euclid(40) as usize];
-                    merge_orbs(orbs, i, &mut self.contact.live_orbs, b.iter().map(|&j| j as usize));
-                }
-            }
-            if gone {
-                continue;
-            }
-            let o = &mut orbs[i];
-            // Same physics as the client (`rc_physics::body`), no skipped tick.
-            let w = self.world();
-            let from = o.pos;
-            let b = &mut o.body;
-            let wet = b.was_in_water();
-            (b.pos, b.vel, b.on_ground) = (o.pos, o.vel, o.on_ground);
-            b.fast_lava = fast;
-            let mut r = crate::mobs::jrand::JRand::new(i64::from(o.id) << 32 ^ i64::from(o.ticks));
-            b.tick_orb_server(&w, &self.phys, &players, &mut || r.next_float());
-            (o.pos, o.vel, o.on_ground) = (b.pos, b.vel, b.on_ground);
-            let (mv, below, support) = (b.moved, b.below(&self.phys, &w, 0.2), b.support());
-            if self.fall_step(&mut o.body.fall, from, mv, wet, o.on_ground) {
-                self.landing_effects(o.pos, below, support, Src::Other);
-            }
-            if o.on_ground {
-                o.body.fall = 0.0;
-            }
-            // G5-F05: fire, lava, cactus, water and powder snow of the blocks crossed.
-            self.inside_blocks(&mut crate::inside_blocks::Who::Orb(o));
-            if o.removed {
-                self.contact.live_orbs[i] = (o.pos, true);
-                continue;
-            }
-            // G5-F02e: plates and tripwire right after its movement.
-            self.contact.live_orbs[i].0 = o.pos;
-            self.contact_triggers(from, o.pos, ORB_SIZE / 2.0, ORB_SIZE);
-            o.age += 1;
-            if o.age >= LIFETIME {
-                o.removed = true;
-                self.contact.live_orbs[i].1 = true;
+            if !gone {
+                self.orb_move(&mut orbs[i], i);
             }
         }
-        self.contact.orb_buckets = buckets;
-        // Pickup: one orb every 2 ticks.
+        self.contact.orbs_taken = false;
+        self.contact.live_orbs.clear();
+        orbs.append(&mut self.life.orbs);
+        self.life.orbs = orbs;
+        stop
+    }
+
+    /// Orb of slot `i`, at its rank in the entity walk. Ticked out of its slot like an item, put
+    /// back for its merge (which reads the whole list).
+    pub(crate) fn orb_visit(&mut self, i: usize) {
+        let Some(o) = self.life.orbs.get(i).filter(|o| !o.removed) else { return };
+        // G3-F13: outside a "ticking entities" chunk, it waits.
+        let (ticking, mut rank) = (self.entity_ticks_at(o.pos), o.rank);
+        let meet = self.meet(&mut rank, ticking, crate::walk::Fam::Orb, i);
+        self.life.orbs[i].rank = rank;
+        if meet != crate::walk::Meet::Tick {
+            return;
+        }
+        let spare = self.walk.spare_orb.take().unwrap_or_else(Orb::placeholder);
+        let mut o = std::mem::replace(&mut self.life.orbs[i], spare);
+        let gone = self.orb_fire(&mut o, i);
+        if o.ticks % 20 == 1 {
+            let spare = std::mem::replace(&mut self.life.orbs[i], o);
+            let mut orbs = std::mem::take(&mut self.life.orbs);
+            self.orbs_merge(&mut orbs, i);
+            orbs.append(&mut self.life.orbs);
+            self.life.orbs = orbs;
+            o = std::mem::replace(&mut self.life.orbs[i], spare);
+        }
+        if !gone {
+            self.contact.ticking_orb = Some((o.pos, false));
+            self.orb_move(&mut o, i);
+            self.contact.ticking_orb = None;
+        }
+        if let Some(slot) = self.life.orbs.get_mut(i) {
+            self.walk.spare_orb = Some(std::mem::replace(slot, o));
+        }
+    }
+
+    /// The orb of slot `i` met by the walk ticks now (G3-F13: not outside a "ticking entities"
+    /// chunk).
+    fn orb_meets(&mut self, o: &mut Orb, i: usize) -> bool {
+        if o.removed {
+            return false;
+        }
+        let ticking = self.entity_ticks_at(o.pos);
+        self.meet(&mut o.rank, ticking, crate::walk::Fam::Orb, i) == crate::walk::Meet::Tick
+    }
+
+    /// Position and removal of the orb of slot `i` being ticked, as the plates see them.
+    fn orb_seen(&mut self, i: usize, pos: [f64; 3], gone: bool) {
+        if self.contact.orbs_taken {
+            if let Some(l) = self.contact.live_orbs.get_mut(i) {
+                *l = (pos, gone);
+            }
+        } else {
+            self.contact.ticking_orb = Some((pos, gone));
+        }
+    }
+
+    /// Start of an orb's tick (G5-F05): fire, below the world. True when it is gone.
+    fn orb_fire(&mut self, o: &mut Orb, i: usize) -> bool {
+        o.ticks += 1;
+        o.body.pos = o.pos;
+        let lava = burn_due(o.fire, false) && o.body.touching_lava(&self.world(), &self.phys);
+        if burn_step(&mut o.fire, false, lava) {
+            orb_take_damage(o, 1.0);
+        }
+        self.fire_flag(o.id, o.fire, &mut o.fire_flag);
+        if o.pos[1] < f64::from(self.dim.height.min_y) - 64.0 {
+            o.removed = true;
+        }
+        if o.removed {
+            self.orb_seen(i, o.pos, true);
+        }
+        o.removed
+    }
+
+    /// G5-F05: orb `i` absorbs the orbs of the same value around it every 20 ticks (from the
+    /// first); from 40 orbs on, candidates read from the residues modulo 40 built once per walk
+    /// (below, the whole list costs less; `RUSTCRAFT_OPT_ORB_MERGE_LINEAR=1`: always it).
+    /// Quirk kept: an orb just removed (burnt, below the world) still absorbs its neighbours,
+    /// which disappear with it.
+    fn orbs_merge(&mut self, orbs: &mut [Orb], i: usize) {
+        let mut live = std::mem::take(&mut self.contact.live_orbs);
+        if orbs.len() < ORB_BUCKETS_FROM || rc_data::env_flag!("RUSTCRAFT_OPT_ORB_MERGE_LINEAR") {
+            let n = orbs.len();
+            merge_orbs(orbs, i, &mut live, 0..n);
+        } else {
+            let mut buckets = std::mem::take(&mut self.contact.orb_buckets);
+            if !self.walk.buckets_built {
+                orb_buckets(orbs, &mut buckets);
+                self.walk.buckets_built = true;
+            }
+            let b = &buckets[orbs[i].id.rem_euclid(40) as usize];
+            merge_orbs(orbs, i, &mut live, b.iter().map(|&j| j as usize));
+            self.contact.orb_buckets = buckets;
+        }
+        self.contact.live_orbs = live;
+    }
+
+    /// Movement of a living orb: same physics as the client (`rc_physics::body`), no skipped
+    /// tick; landing, crossed blocks, plates, age.
+    fn orb_move(&mut self, o: &mut Orb, i: usize) {
+        let players = self.orb_followers();
+        let w = self.world();
+        let from = o.pos;
+        let b = &mut o.body;
+        let wet = b.was_in_water();
+        (b.pos, b.vel, b.on_ground) = (o.pos, o.vel, o.on_ground);
+        b.fast_lava = self.fast_lava();
+        let mut r = crate::mobs::jrand::JRand::new(i64::from(o.id) << 32 ^ i64::from(o.ticks));
+        b.tick_orb_server(&w, &self.phys, &players, &mut || r.next_float());
+        (o.pos, o.vel, o.on_ground) = (b.pos, b.vel, b.on_ground);
+        let (mv, below, support) = (b.moved, b.below(&self.phys, &w, 0.2), b.support());
+        if self.fall_step(&mut o.body.fall, from, mv, wet, o.on_ground) {
+            self.landing_effects(o.pos, below, support, Src::Other);
+        }
+        if o.on_ground {
+            o.body.fall = 0.0;
+        }
+        // G5-F05: fire, lava, cactus, water and powder snow of the blocks crossed.
+        self.inside_blocks(&mut crate::inside_blocks::Who::Orb(o));
+        if o.removed {
+            self.orb_seen(i, o.pos, true);
+            return;
+        }
+        // G5-F02e: plates and tripwire right after its movement.
+        self.orb_seen(i, o.pos, false);
+        self.contact_triggers(from, o.pos, ORB_SIZE / 2.0, ORB_SIZE);
+        o.age += 1;
+        if o.age >= LIFETIME {
+            o.removed = true;
+            self.orb_seen(i, o.pos, true);
+        }
+    }
+
+    /// Orb pickup by the player after the walk: one orb every 2 ticks.
+    fn orbs_pickup(&mut self, orbs: &mut [Orb]) {
+        let follow = !self.life.vit.dead && self.game_mode != 3;
         if follow && self.player_ready() {
             if self.life.vit.xp_delay > 0 {
                 self.life.vit.xp_delay -= 1;
@@ -1378,6 +1605,11 @@ impl Orb {
     /// S8: removed (merge of thrown orbs).
     pub(crate) fn is_removed(&self) -> bool {
         self.removed
+    }
+
+    /// Removed from the world (`kill` during the entity walk): leaves with the walk's removals.
+    pub(crate) fn mark_removed(&mut self) {
+        self.removed = true;
     }
 
     /// Bench of the merging: the orb is back for the next round.

@@ -112,11 +112,14 @@ struct Live {
     removed: bool,
     /// Network tracking of a decoration that moves (armor stand, mannequin).
     track: crate::mobs::track::Tracker,
+    /// Rank in the entity walk (`walk::next_rank`), stamped when it enters the list.
+    rank: u64,
 }
 
 impl Live {
     fn new(id: i32, kind: DKind, chunk: (i32, i32)) -> Live {
-        Live { id, kind, chunk, check: 0, last_hit: 0, removed: false, track: Default::default() }
+        let rank = crate::walk::next_rank();
+        Live { id, kind, chunk, check: 0, last_hit: 0, removed: false, track: Default::default(), rank }
     }
 }
 
@@ -572,57 +575,80 @@ impl Server {
 
     // ---------- Tick ----------
 
-    /// Tick of the decorations (entity phase): under the world, survival every 100 ticks.
+    /// The decorations as their own walk (tests): under the world, survival every 100 ticks.
+    #[cfg(test)]
     pub(crate) fn deco_tick(&mut self) {
         self.cushion_seat_tick(); // seated player: it ticks even when the world is frozen
-        if !self.cmd.ticking.runs() || self.deco.live.is_empty() {
+        if self.cmd.ticking.runs() {
+            self.walk_alone(crate::walk::bit(crate::walk::Fam::Deco), |_| {}, Self::deco_post);
+        }
+    }
+
+    pub(crate) fn deco_live_len(&self) -> usize {
+        self.deco.live.len()
+    }
+
+    pub(crate) fn deco_rank(&self, i: usize) -> Option<u64> {
+        self.deco.live.get(i).map(|l| l.rank)
+    }
+
+    pub(crate) fn deco_resort(&mut self) {
+        self.deco.live.sort_by_key(|l| l.rank);
+    }
+
+    /// Decoration of slot `i`, at its rank in the entity walk: under the world, survival every
+    /// 100 ticks, the fall of an armor stand or a mannequin.
+    pub(crate) fn deco_visit(&mut self, i: usize) {
+        let Some(l) = self.deco.live.get(i) else { return };
+        let l = Brief { id: l.id, kind: l.kind, check: l.check, removed: l.removed };
+        if l.removed {
             return;
         }
-        let floor = f64::from(self.dim.height.min_y - 64);
-        for i in 0..self.deco.live.len() {
-            let l = &self.deco.live[i];
-            let l = Brief { id: l.id, kind: l.kind, check: l.check, removed: l.removed };
-            if l.removed {
-                continue;
-            }
-            let Some(pos) = self.live_pos(i) else {
-                self.deco.live[i].removed = true;
-                continue;
-            };
-            // "Entity ticking" chunk: simulated and its 8 neighbours loaded; otherwise a support
-            // located in an absent neighbour would be read as void.
-            let c = chunk_of(pos);
-            let loaded = (-1..=1).all(|dx| (-1..=1).all(|dz| matches!(self.chunks.get(&(c.0 + dx, c.1 + dz)), Some(Some(_)))));
-            if !self.entities_tick_in(c) || !loaded {
-                continue;
-            }
-            if pos[1] < floor {
-                self.deco_remove(l.id);
-                continue;
-            }
-            if !l.kind.attached() {
-                self.living_tick(i, pos); // armor stand, mannequin: fall
-                continue;
-            }
-            self.deco.live[i].check = l.check + 1;
-            if l.check < 100 {
-                continue;
-            }
-            self.deco.live[i].check = 0;
-            if l.kind == DKind::Cushion {
-                self.cushion_fire_check(l.id, true);
-                if self.deco.live[i].removed {
-                    continue;
-                }
-            }
-            if !self.deco_survives(l.id) {
-                let e = self.deco_nbt(l.id).cloned();
-                self.deco_remove(l.id);
-                if let Some(e) = e {
-                    self.deco_drop_item(&e, None);
-                }
+        let Some(pos) = self.live_pos(i) else {
+            self.deco.live[i].removed = true;
+            return;
+        };
+        // "Entity ticking" chunk: simulated and its 8 neighbours loaded; otherwise a support
+        // located in an absent neighbour would be read as void.
+        let c = chunk_of(pos);
+        let loaded =
+            (-1..=1).all(|dx| (-1..=1).all(|dz| matches!(self.chunks.get(&(c.0 + dx, c.1 + dz)), Some(Some(_)))));
+        let mut rank = self.deco.live[i].rank;
+        let meet = self.meet(&mut rank, self.entities_tick_in(c) && loaded, crate::walk::Fam::Deco, i);
+        self.deco.live[i].rank = rank;
+        if meet != crate::walk::Meet::Tick {
+            return;
+        }
+        if pos[1] < f64::from(self.dim.height.min_y - 64) {
+            self.deco_remove(l.id);
+            return;
+        }
+        if !l.kind.attached() {
+            self.living_tick(i, pos); // armor stand, mannequin: fall
+            return;
+        }
+        self.deco.live[i].check = l.check + 1;
+        if l.check < 100 {
+            return;
+        }
+        self.deco.live[i].check = 0;
+        if l.kind == DKind::Cushion {
+            self.cushion_fire_check(l.id, true);
+            if self.deco.live[i].removed {
+                return;
             }
         }
+        if !self.deco_survives(l.id) {
+            let e = self.deco_nbt(l.id).cloned();
+            self.deco_remove(l.id);
+            if let Some(e) = e {
+                self.deco_drop_item(&e, None);
+            }
+        }
+    }
+
+    /// Removed decorations, after the entity walk.
+    pub(crate) fn deco_post(&mut self) {
         if self.deco.live.iter().any(|l| l.removed) {
             self.deco.live.retain(|l| !l.removed);
         }

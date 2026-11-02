@@ -102,6 +102,7 @@ impl Server {
             sync: JRand::new(0),
         };
         self.hook_pair(&mut h);
+        h.p.rank = crate::walk::next_rank();
         self.proj.hook = Some(h);
     }
 

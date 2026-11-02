@@ -35,8 +35,8 @@ pub struct Cloud {
     pub waiting: bool,
     pub removed: bool,
     pub seen: bool,
-    /// Number of the entity walk it was born in (0: outside the walk), read by `mobs::Walk`.
-    pub born: u64,
+    /// Rank in the entity walk (`walk::next_rank`), stamped when it enters the list.
+    pub rank: u64,
     sent_radius: f32,
     sent_waiting: bool,
 }
@@ -65,7 +65,7 @@ impl Cloud {
             waiting: false,
             removed: false,
             seen: false,
-            born: 0,
+            rank: 0,
             sent_radius: 3.0,
             sent_waiting: false,
         }
@@ -174,9 +174,7 @@ impl Cloud {
 
 impl Server {
     pub(crate) fn cloud_add(&mut self, mut c: Cloud) {
-        // Born during the entity walk (creeper, dragon flame or fireball, lingering potion,
-        // command block minecart): its age only advances on the next tick.
-        c.born = self.walk.born();
+        c.rank = crate::walk::next_rank();
         self.cloud_pair(&mut c);
         self.proj.clouds.push(c);
     }
@@ -224,42 +222,61 @@ impl Server {
         }
     }
 
-    /// Tick of the clouds then modified data.
+    /// The clouds as their own walk (tests).
+    #[cfg(test)]
     pub(crate) fn clouds_tick(&mut self) {
+        self.walk_alone(crate::walk::bit(crate::walk::Fam::Cloud), |_| {}, Self::clouds_post);
+    }
+
+    /// Cloud of slot `i`, at its rank in the entity walk (born during a walk, from a creeper, a
+    /// dragon's flame or fireball, a lingering potion, a command block minecart: its age only
+    /// advances on the next one), then its modified data. The list is taken out during its
+    /// tick (newcomers appended after).
+    pub(crate) fn cloud_visit(&mut self, i: usize) {
         let mut clouds = std::mem::take(&mut self.proj.clouds);
-        for c in clouds.iter_mut().filter(|c| !c.removed) {
-            // Born during this walk, or outside a "ticking entities" chunk (G3-F13): it waits.
-            if self.walk.waits(std::mem::take(&mut c.born)) || !self.entity_ticks_at(c.pos) {
-                continue;
-            }
-            if !c.seen {
-                self.cloud_pair(c);
-            }
-            c.age += 1;
-            self.cloud_tick(c);
-            if c.removed {
-                continue;
-            }
-            let mut values = Vec::new();
-            if c.radius != c.sent_radius {
-                c.sent_radius = c.radius;
-                values.push((8, Meta::Float(c.radius)));
-            }
-            if c.waiting != c.sent_waiting {
-                c.sent_waiting = c.waiting;
-                values.push((9, Meta::Bool(c.waiting)));
-            }
-            if !values.is_empty() {
-                let _ = self.send(Event::Entity(EntityEvent::Data { id: c.id, values }));
-            }
+        if let Some(c) = clouds.get_mut(i).filter(|c| !c.removed) {
+            self.cloud_step(c, i);
         }
-        let gone: Vec<i32> = clouds.iter().filter(|c| c.removed).map(|c| c.id).collect();
-        clouds.retain(|c| !c.removed);
-        clouds.extend(std::mem::take(&mut self.proj.clouds));
+        clouds.append(&mut self.proj.clouds);
         self.proj.clouds = clouds;
-        if !gone.is_empty() {
-            let _ = self.send(Event::Entity(EntityEvent::Remove(gone)));
+    }
+
+    fn cloud_step(&mut self, c: &mut Cloud, i: usize) {
+        // Outside a "ticking entities" chunk (G3-F13): it waits.
+        let ticking = self.entity_ticks_at(c.pos);
+        if self.meet(&mut c.rank, ticking, crate::walk::Fam::Cloud, i) != crate::walk::Meet::Tick {
+            return;
         }
+        if !c.seen {
+            self.cloud_pair(c);
+        }
+        c.age += 1;
+        self.cloud_tick(c);
+        if c.removed {
+            return;
+        }
+        let mut values = Vec::new();
+        if c.radius != c.sent_radius {
+            c.sent_radius = c.radius;
+            values.push((8, Meta::Float(c.radius)));
+        }
+        if c.waiting != c.sent_waiting {
+            c.sent_waiting = c.waiting;
+            values.push((9, Meta::Bool(c.waiting)));
+        }
+        if !values.is_empty() {
+            let _ = self.send(Event::Entity(EntityEvent::Data { id: c.id, values }));
+        }
+    }
+
+    /// Removed clouds, after the entity walk.
+    pub(crate) fn clouds_post(&mut self) {
+        if !self.proj.clouds.iter().any(|c| c.removed) {
+            return;
+        }
+        let gone: Vec<i32> = self.proj.clouds.iter().filter(|c| c.removed).map(|c| c.id).collect();
+        self.proj.clouds.retain(|c| !c.removed);
+        let _ = self.send(Event::Entity(EntityEvent::Remove(gone)));
     }
 
     fn cloud_tick(&mut self, c: &mut Cloud) {

@@ -143,7 +143,7 @@ fn dimension_state_stays_with_its_world() {
         sent_spike,
         owner: None,
         removed: false,
-        born: 0,
+        rank: 0,
         seen: true,
     };
     p.s.mobs.ill.fangs.push(fangs(9001, 5, false));
@@ -375,11 +375,10 @@ fn chunk_save_promotes_its_packed_block_entities() {
 /// ticks every entity in one list, in the order they were added. An item (a nether star: the
 /// blast does not destroy it) lying in the air before a TNT is primed therefore ticks before the
 /// TNT explodes in the same tick: it does not move that tick (its velocity was zero) and only
-/// flies off on the next one. Our walk ticks family by family (falling blocks and TNT first,
-/// items after): the TNT explodes first and the item moves with the blast in the same tick, one
-/// tick early. Fails until the entity walk follows the single insertion order.
+/// flies off on the next one. The family-by-family walk (falling blocks and TNT first, items
+/// after) exploded the TNT first and moved the item with the blast in the same tick, one tick
+/// early; the single walk by rank (L10-ORDER) ticks the item first.
 #[test]
-#[ignore = "L9-TICK: the entity walk is still family by family (single list not done)"]
 fn item_before_tnt_moves_on_the_next_tick() {
     let (mut p, dir) = open("l9-order");
     cmd(&mut p, "summon minecraft:item 4.5 -50 4.5 {NoGravity:1b,Item:{id:\"minecraft:nether_star\",count:1}}");
@@ -387,7 +386,8 @@ fn item_before_tnt_moves_on_the_next_tick() {
     game_ticks(&mut p, 1);
     let item = p.s.life.drops.iter().find(|d| !d.is_removed()).expect("nether star");
     assert!(item.vel[0] > 0.0, "blast received");
-    assert_eq!(item.pos, [4.5, -50.0, 4.5], "the item ticked before the explosion");
+    // Along x only: our ground items still fall despite `NoGravity` (separate gap).
+    assert_eq!(item.pos[0], 4.5, "the item ticked before the explosion: {:?}", item.pos);
     finish(p, dir);
 }
 

@@ -396,10 +396,9 @@ impl Server {
         false
     }
 
-    /// Tick of the family's entities that are not mobs (after the mobs):
-    /// fight, crystals, dragon fireballs, clouds, shulker bullets; then network tracking.
-    pub(crate) fn end_world_tick(&mut self) {
-        self.crystals_tick();
+    /// After the entity walk (the crystals tick in it; dragon fireballs, clouds and shulker
+    /// bullets with the projectiles): network tracking of the crystals, snapshot for commands.
+    pub(crate) fn end_world_post(&mut self) {
         self.track_crystals();
         self.end_snapshot();
     }

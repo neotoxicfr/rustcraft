@@ -64,6 +64,7 @@ pub mod weather;
 pub mod tickrate;
 // Mobs (S4).
 pub mod mobs;
+mod walk; // L10-ORDER: one entity walk for every family, in list order
 pub(crate) mod decoration;
 // Dimensions and portals (S6).
 pub(crate) mod dims;
@@ -180,6 +181,10 @@ mod tests_g3f11;
 mod tests_g3f13;
 #[cfg(test)]
 mod tests_l9tick; // L9-TICK: pearl and fight tickets, state kept with its dimension
+#[cfg(test)]
+mod tests_l10order; // L10-ORDER: one entity walk, every kind in the order of arrival
+#[cfg(test)]
+mod bench_l10order; // L10-ORDER: server tick with 1,000 entities of five families
 #[cfg(test)]
 mod tests_g4f08; // G4-F08: shulker push, TNT, sulfur cube, creaking, warden, smaller mob gaps
 #[cfg(test)]

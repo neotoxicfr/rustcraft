@@ -472,12 +472,7 @@ impl Server {
                     // Tickets of the previous tick applied, then the chunk source's purge.
                     s.proj.pearl_tickets_apply();
                     s.proj.pearl_tickets_purge(s.time);
-                    if ticket > 0 {
-                        s.tick_sim_entities();
-                        s.drops_tick();
-                        s.drops_portal_tick();
-                    }
-                    s.proj_world_tick();
+                    s.tick_parked_entities(ticket > 0);
                     s.flush_block_changes();
                     s.pos = pos;
                     s.loaded = ready;
@@ -641,6 +636,8 @@ impl Server {
         let old_pos = self.pos;
         self.inside_forget_player(); // G5-F02a: no sweep from one world to the other
         self.enter_world(&t.dim);
+        // The player joins the end of the arrival world's entity list.
+        self.walk.player = crate::walk::next_rank();
         self.forget_world_entities(&from);
         if t.missing_respawn {
             let _ = self.send(Event::GameEvent { kind: 0, param: 0.0 });

@@ -505,6 +505,7 @@ impl Server {
         self.in_world(&dim, |s| {
             copy.id = s.proj_new_id();
             s.dims.ents.insert(copy.id, ep);
+            copy.rank = crate::walk::next_rank();
             s.proj.list.push(copy);
         });
         self.place_portal_ticket(&dim);

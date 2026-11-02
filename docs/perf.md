@@ -3303,3 +3303,51 @@ runs), so only the order of magnitude is claimed.
 - Multi-core and GPU not applicable (per-event or per-frame UI work of a few hundred
   nanoseconds at most). Scenes to re-measure on a quiet machine: `menu` and an in-game scene with
   the creative inventory open (no change expected beyond the removed allocation).
+## L10-ORDER: one entity walk for every family, in the order of arrival (02/11, loaded machine)
+
+Fidelity fix (the world's entities tick in the order they joined its list, every kind together:
+`walk.rs`); figures from the micro-bench `bench_l10order_walk` (`cargo test --release -p rc-sim
+bench_l10order -- --ignored --nocapture`): server ticks of a flat world with 1,000 entities,
+test executables of `integ/lot9` (before) and of this branch (after) run alternately, three
+rounds, minimum of 5 passes of 400 ticks per scene, loaded machine (other agents compiling).
+
+- Design: a rank per entity (stamped when it enters its family's list, renewed when it comes
+  back into a ticking chunk), each family list kept in rank order, a k-way merge of the lists by
+  runs; the heads of the families of the walk that have entities are cached (one rank read per
+  step, not one per family). No allocation in steady state (late list, live position lists and
+  item/orb placeholders reused); a family is re-sorted (stable sort) only on a tick where one of
+  its entities came back.
+- Five families interleaved (worst case: ranks alternate, one run per entity): 1,382-1,402 µs
+  before, 1,430-1,447 µs after per server tick (+3.4 %, about 50 ns per entity). This is the
+  price of the order itself: the walk changes family at every entity (code and data of five
+  families in turn instead of 200 in a row), and items and orbs then tick one by one.
+- Same entities summoned family after family (one run per family, the former order):
+  1,369-1,411 µs before, 1,356-1,379 µs after: equal. Families alone (1,000 of one):
+  items 889-914 / 889-906 µs, orbs 1,177-1,201 / 1,167-1,183, minecarts 4,325-4,391 /
+  4,384-4,407 (+1 %), arrows stuck in the ground 417-421 / 431-437 (+3 %: a cheap tick, about
+  15 ns of dispatch per entity; with the dispatch inlined, 440-450 / 443-445 on a noisier round:
+  not resolved on this machine), pigs without AI 13.3-13.5 / 12.6-12.8 ms (−5 %, not explained,
+  not claimed).
+- Items and orbs, first version: ticked one by one out of their slot (a removed placeholder
+  swapped in; item 360 bytes, orb 280, of which 184 of network tracker): +45 ns per item and
+  +30 ns per orb (+5 %, +2.5 % on the families alone). Kept for short runs only; a run of at
+  least an eighth of the list now ticks with the list taken out once and the plates' positions in
+  `contact.live_items` / `live_orbs` (O(list) per run, O(1) per entity amortized): figures above.
+  Equivalence test `item_runs_and_one_by_one_give_the_same_world` (plate states every tick,
+  final positions; fails when the live positions are not updated).
+- Merge, first version: the ranks of all 15 families re-read at each step: +3.5-5.6 % on the
+  interleaved scene against the old code; cached heads: not distinguishable from it within this
+  machine's noise, kept (strictly less work).
+- Falling blocks and TNT: the copy ticked each tick no longer clones the physics body (one
+  allocation per entity per tick removed): 1,000 primed TNT on the ground 988-1,000 µs before,
+  975-994 after: below the noise.
+- Leads not taken: an order buffer sorted at each walk (O(n log n), a scratch allocation above
+  4 KB) instead of the merge (O(n + runs × families)): not measured, the merge is already within
+  noise in the grouped case; items boxed in their list (8-byte moves) rejected (one more
+  allocation per item, a pointer chase in the quadratic merge pass of the items); ranks in arrays
+  beside each family list (no read through a mob's box): not tried, the mob's rank line is read by
+  its visit anyway. To re-measure on a quiet machine: this bench (both scenes), then scenes
+  `crowd`, `tnt`, `redstone`, `village` of `tools/bench/scenes.py`.
+- Memory: 8 bytes per entity (rank), a removed flag per bolt and ominous item spawner, the late
+  list, two placeholders (item, orb). Multi-core, GPU: not applicable (the order is observable
+  by the player and by a server, the walk is sequential by definition).

@@ -8,51 +8,6 @@ use super::mth::{DEG, degrees_difference, pitch_to, rotate_if_necessary, rotate_
 use super::species::Kind;
 use crate::server::Server;
 
-/// Entity walk of the server tick: from the falling blocks to the clouds. The game does not see,
-/// in this walk, an entity that is added to it: its first tick happens on the next server tick.
-/// Our lists tick one after the other (falling blocks and TNT, items and orbs, mobs, spits,
-/// fangs, bolts, minecarts, projectiles, clouds); an entity born during the walk therefore
-/// carries its number, and the list that meets it in that same walk skips it. Born after its
-/// list's tick (a spit launched from a minecart), it is no longer skipped on the next tick.
-#[derive(Debug, Default)]
-pub(crate) struct Walk {
-    /// Walks started.
-    count: u64,
-    /// Number of the walk in progress, 0 outside the walk.
-    now: u64,
-}
-
-impl Walk {
-    /// Start of the walk, right before the first entity (frozen included: the player's mount
-    /// still ticks).
-    pub(crate) fn start(&mut self) {
-        self.count += 1;
-        self.now = self.count;
-    }
-
-    /// Start of the walk if none is in progress (the mobs ticked without the server tick).
-    pub(crate) fn ensure_started(&mut self) {
-        if self.now == 0 {
-            self.start();
-        }
-    }
-
-    /// End of the walk, after the projectiles and the clouds.
-    pub(crate) fn end(&mut self) {
-        self.now = 0;
-    }
-
-    /// Mark of an entity created now: the number of the walk in progress, 0 outside.
-    pub(crate) fn born(&self) -> u64 {
-        self.now
-    }
-
-    /// True for an entity born during the walk in progress: its tick waits for the next one.
-    pub(crate) fn waits(&self, born: u64) -> bool {
-        born != 0 && born == self.now
-    }
-}
-
 impl Server {
     /// Tick of the mobs (after the player's life, before the block broadcast).
     /// Parts of the tick specific to the current player (host, or guest set up by `as_guest`).
@@ -102,68 +57,86 @@ impl Server {
         self.mobs_tick();
     }
 
-    /// Mobs of the entity walk (spawns, raids and the dragon fight come before it in the world
-    /// tick, bells and spawner blocks after it with the block entities).
+    /// Mobs and the mob families (fangs, spits, bolts, crystals, ominous items) as their own walk
+    /// (tests that tick the mobs without the server tick; spawns, raids and the dragon fight
+    /// come before the walk in the world tick, bells and spawner blocks after it with the block
+    /// entities).
+    #[cfg(test)]
     pub(crate) fn mobs_tick(&mut self) {
+        crate::server::phase("mobs");
+        use crate::walk::{Fam, bit};
+        let runs = self.cmd.ticking.runs();
+        let mobs = bit(Fam::Mob)
+            | if runs {
+                bit(Fam::Fang) | bit(Fam::Spit) | bit(Fam::Bolt) | bit(Fam::Crystal) | bit(Fam::Ominous)
+            } else {
+                0
+            };
+        self.walk_alone(mobs, Self::mobs_pre, move |s| s.mobs_post(runs));
+    }
+
+    /// Before the entity walk: the player's parts the mobs read, the shriekers' warnings.
+    pub(crate) fn mobs_pre(&mut self) {
         self.mobs_player_tick();
         self.rec_world_tick(); // F14: shrieker warnings
-        // Frozen (`tick freeze`): mobs wait, except the player's mount.
-        let runs = self.cmd.ticking.runs();
-        let player_vehicle = self.mobs.mounts.riding.vehicle;
-        // Entity walk: started by the server tick before its first entity (falling blocks), here
-        // when the mobs tick alone; it ends after the projectiles and the clouds.
-        self.walk.ensure_started();
-        #[cfg(test)]
-        crate::server::phase("mobs");
-        // Snapshot: mobs added during this tick wait for the next.
-        let n = self.mobs.list.len();
-        for i in 0..n {
-            let Some(mut m) = self.mobs.list[i].take() else { continue };
-            if m.removed || (!runs && player_vehicle != Some(m.id)) {
-                self.mobs.list[i] = Some(m);
-                continue;
-            }
-            if self.check_despawn(&mut m) {
-                m.removed = true;
-                self.mobs.list[i] = Some(m);
-                continue;
-            }
-            // F04: a passenger is ticked by its vehicle.
-            if self.ticked_by_vehicle(&mut m) {
-                self.mobs.list[i] = Some(m);
-                continue;
-            }
-            let ticking = self.entity_ticks_at(m.pos); // F15: arena ticket included
-            if ticking {
-                self.tick_mob(&mut m);
-            }
-            let (id, carries) = (m.id, !m.mount.passengers.is_empty());
-            // G6-F10: on the ground on a sculk sensor or a shrieker (effect block 0.2 under the feet).
-            let step = (ticking && m.on_ground && !m.removed && !self.mobs.rec.vib_blocks.is_empty())
-                .then(|| (m.support, m.pos, m.kind == Kind::Warden));
+    }
+
+    /// Mob of slot `i`, at its rank in the entity walk. Frozen (`tick freeze`), only the
+    /// player's mount ticks.
+    pub(crate) fn mob_visit(&mut self, i: usize) {
+        let Some(mut m) = self.mobs.list.get_mut(i).and_then(Option::take) else { return };
+        if m.removed || (!self.cmd.ticking.runs() && self.mobs.mounts.riding.vehicle != Some(m.id)) {
             self.mobs.list[i] = Some(m);
-            if let Some((support, pos, warden)) = step {
-                let src = super::recent::vibration::Src::Living(super::mob::Ent::Mob(id));
-                self.sensor_entity_on(pos, support, src, warden);
-            }
-            if ticking && carries {
-                self.tick_passengers(id);
-            }
+            return;
         }
+        let ticking = self.entity_ticks_at(m.pos); // F15: arena ticket included
+        // Back in a ticking chunk: at the end of the walk (despawn check included).
+        if self.meet(&mut m.rank, ticking, crate::walk::Fam::Mob, i) == crate::walk::Meet::Late {
+            self.mobs.list[i] = Some(m);
+            return;
+        }
+        if self.check_despawn(&mut m) {
+            m.removed = true;
+            self.mobs.list[i] = Some(m);
+            return;
+        }
+        // F04: a passenger is ticked by its vehicle.
+        if self.ticked_by_vehicle(&mut m) {
+            self.mobs.list[i] = Some(m);
+            return;
+        }
+        if ticking {
+            self.tick_mob(&mut m);
+        }
+        let (id, carries) = (m.id, !m.mount.passengers.is_empty());
+        // G6-F10: on the ground on a sculk sensor or a shrieker (effect block 0.2 under the feet).
+        let step = (ticking && m.on_ground && !m.removed && !self.mobs.rec.vib_blocks.is_empty())
+            .then(|| (m.support, m.pos, m.kind == Kind::Warden));
+        if let Some(slot) = self.mobs.list.get_mut(i) {
+            *slot = Some(m);
+        }
+        if let Some((support, pos, warden)) = step {
+            let src = super::recent::vibration::Src::Living(super::mob::Ent::Mob(id));
+            self.sensor_entity_on(pos, support, src, warden);
+        }
+        if ticking && carries {
+            self.tick_passengers(id);
+        }
+    }
+
+    /// After the entity walk: the player's mount and push, the mob families' removals, contacts
+    /// of the player, removed mobs, then network tracking.
+    pub(crate) fn mobs_post(&mut self, runs: bool) {
         self.riding_player_tick(); // F04
         self.mount_menu_tick(); // F04
         if runs {
-            // Arrows and bolts of mobs: common projectile engine (S8, `projectiles_tick`).
-            self.fangs_tick(); // F07
-            // F07: witch potions ticked with the projectiles (S8, `projectiles_tick`).
-            self.spits_tick(); // F04
-            self.bolts_tick(); // F04
-            // F06: snowballs of golems ticked with the projectiles (S8, `projectiles_tick`).
-            // F08: drowned tridents ticked with the projectiles (S8, `projectiles_tick`).
-            // F12: fireballs ticked with the projectiles (S8, `projectiles_tick`).
-            // F14: wind charges ticked with the projectiles (S8, `projectiles_tick`).
-            self.end_world_tick(); // F15: crystals, breath, bullets
-            self.ominous_items_tick(); // W9: ominous item spawners (their blocks tick with the block entities)
+            // Arrows and bolts of mobs, witch potions, golem snowballs, drowned tridents,
+            // fireballs, wind charges: common projectile engine (S8).
+            self.fangs_post(); // F07
+            self.spits_post(); // F04
+            self.bolts_post(); // F04
+            self.end_world_post(); // F15: crystals
+            self.ominous_items_post(); // W9: ominous item spawners
             self.player_pushes_mobs(); // player push: also stopped when frozen
         }
         self.cubes_player_touch();
