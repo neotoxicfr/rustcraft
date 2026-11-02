@@ -393,6 +393,8 @@ pub struct Mob {
     pub body_fx: super::body::BodyFx,
     pub needs_sync: bool,
     pub removed: bool,
+    /// Rank in the entity walk (`walk::next_rank`), stamped when it enters the list.
+    pub(crate) rank: u64,
     /// Movements of the tick, read back by the crossed-block pass.
     pub(crate) inside: crate::inside_blocks::Moves,
     // Living entity.
@@ -596,6 +598,7 @@ impl Mob {
             body_fx: Default::default(),
             needs_sync: false,
             removed: false,
+            rank: 0,
             inside: Default::default(),
             attrs,
             health: i.health as f32,

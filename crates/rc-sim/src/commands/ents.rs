@@ -673,6 +673,18 @@ impl Server {
                     self.mobs.list[idx] = Some(m);
                 }
             }
+            // During the entity walk (a command block minecart's command) the lists keep their
+            // slots: the item or orb is marked removed and leaves with the walk's removals.
+            E::Item(i) if self.walk.on() => {
+                if let Some(d) = self.life.drops.iter_mut().find(|d| d.id == i && !d.is_removed()) {
+                    d.mark_removed();
+                }
+            }
+            E::Orb(i) if self.walk.on() => {
+                if let Some(o) = self.life.orbs.iter_mut().find(|o| o.id == i && !o.is_removed()) {
+                    o.mark_removed();
+                }
+            }
             E::Item(i) => {
                 self.entity_scores_removed(self.ent_uuid(e));
                 self.life.drops.retain(|d| d.id != i);

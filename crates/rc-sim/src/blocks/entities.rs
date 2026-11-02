@@ -202,6 +202,8 @@ pub(crate) struct SimEntity {
     /// shows (`block_state`; `None`: the TNT block).
     pub power: f32,
     pub block: Option<u32>,
+    /// Rank in the entity walk (`walk::next_rank`), stamped when it enters the list.
+    pub rank: u64,
 }
 
 impl SimEntity {
@@ -225,6 +227,7 @@ impl SimEntity {
             used_portal: false,
             power: 4.0,
             block: None,
+            rank: crate::walk::next_rank(),
         }
     }
 
@@ -548,40 +551,63 @@ impl Server {
         e.body = Some(b);
     }
 
-    /// Entity phase (§ 1.2, step 11b) for the entities simulated here, first of the walk: those
+    /// The falling blocks and primed TNT as their own walk (block probes, parked worlds): those
     /// born during it (a TNT primed by another) wait for the next tick.
+    #[cfg(test)]
     pub(crate) fn tick_sim_entities(&mut self) {
-        #[cfg(test)]
         crate::server::phase("falling");
-        let n = self.bs.entities.list.len();
-        for i in 0..n {
-            let mut e = self.bs.entities.list[i].clone();
+        self.walk_alone(crate::walk::bit(crate::walk::Fam::Sim), Self::sim_track, Self::sim_post);
+    }
+
+    /// Official server tracking, before the walk: TNT every 10 ticks, the falling block every
+    /// 20, frozen ones included; the client simulates the rest with the same physics.
+    pub(crate) fn sim_track(&mut self) {
+        for i in 0..self.bs.entities.list.len() {
+            let e = &mut self.bs.entities.list[i];
             if e.removed {
                 continue;
             }
-            // Official server tracking, before the tick: TNT every 10 ticks, the falling
-            // block every 20; the client simulates the rest with the same physics.
             let interval = if matches!(e.kind, EntKind::Tnt(_)) { 10 } else { 20 };
+            let (id, pos, vel, on_ground) = (e.id, e.pos, e.vel, e.on_ground);
             let mut t = std::mem::take(&mut e.track);
-            self.track_object(&mut t, e.id, e.pos, e.vel, e.on_ground, interval);
-            e.track = t;
-            // G3-F13: outside a "ticking entities" chunk, frozen (tracked all the same).
-            if !self.entity_ticks_at(e.pos) {
-                self.bs.entities.list[i] = e;
-                continue;
-            }
-            e.old = e.pos;
-            match e.kind {
-                EntKind::Falling(s) => self.tick_falling(&mut e, s),
-                EntKind::Tnt(fuse) => self.tick_tnt(&mut e, fuse),
-            }
-            self.bs.entities.list[i] = e;
+            self.track_object(&mut t, id, pos, vel, on_ground, interval);
+            self.bs.entities.list[i].track = t;
+        }
+    }
+
+    /// Falling block or TNT of slot `i`, at its rank in the entity walk (§ 1.2, step 11b).
+    pub(crate) fn sim_visit(&mut self, i: usize) {
+        let Some(e) = self.bs.entities.list.get(i).filter(|e| !e.removed) else { return };
+        // G3-F13: outside a "ticking entities" chunk, frozen.
+        let (ticking, mut rank) = (self.entity_ticks_at(e.pos), e.rank);
+        let meet = self.meet(&mut rank, ticking, crate::walk::Fam::Sim);
+        self.bs.entities.list[i].rank = rank;
+        if meet != crate::walk::Meet::Tick {
+            return;
+        }
+        // Copy ticked, the slot keeps the old state meanwhile (its physics body moves with the
+        // copy: no allocation).
+        let body = self.bs.entities.list[i].body.take();
+        let mut e = self.bs.entities.list[i].clone();
+        e.body = body;
+        e.old = e.pos;
+        match e.kind {
+            EntKind::Falling(s) => self.tick_falling(&mut e, s),
+            EntKind::Tnt(fuse) => self.tick_tnt(&mut e, fuse),
+        }
+        if let Some(slot) = self.bs.entities.list.get_mut(i) {
+            *slot = e;
+        }
+    }
+
+    /// Removed falling blocks and TNT, after the walk.
+    pub(crate) fn sim_post(&mut self) {
+        if !self.bs.entities.list.iter().any(|e| e.removed) {
+            return;
         }
         let gone: Vec<i32> = self.bs.entities.list.iter().filter(|e| e.removed).map(|e| e.id).collect();
-        if !gone.is_empty() {
-            let _ = self.send(Event::Entity(EntityEvent::Remove(gone)));
-            self.bs.entities.list.retain(|e| !e.removed);
-        }
+        let _ = self.send(Event::Entity(EntityEvent::Remove(gone)));
+        self.bs.entities.list.retain(|e| !e.removed);
     }
 
     fn tick_falling(&mut self, e: &mut SimEntity, s: u32) {
@@ -1207,16 +1233,23 @@ impl Server {
                 .filter(|e| !e.removed && ts.is_none_or(|t| t.0 != e.id) && hit(&Self::entity_box(e)))
                 .count();
             n += usize::from(ts.is_some_and(|t| hit(&t.1)));
-            // Items and orbs: during the tick of their list, positions kept up to date as the tick goes on.
-            n += if c.items_ticking {
-                c.live_items.iter().filter(|&&(pos, gone)| !gone && hit(&around(pos, 0.25, 0.25))).count()
+            // Items and orbs: during a run with their list taken out, the positions kept up to
+            // date as it goes on; otherwise the list, and the one being ticked out of its slot
+            // where it is now.
+            let seen = |p: [f64; 3], gone: bool, w: f64| !gone && hit(&around(p, w, w));
+            let live = |l: &[([f64; 3], bool)], w: f64| l.iter().filter(|&&(p, gone)| seen(p, gone, w)).count();
+            let one = |t: Option<([f64; 3], bool)>, w: f64| usize::from(t.is_some_and(|(p, gone)| seen(p, gone, w)));
+            n += if c.items_taken {
+                live(&c.live_items, 0.25)
             } else {
                 self.life.drops.iter().filter(|d| !d.is_removed() && hit(&around(d.pos, 0.25, 0.25))).count()
+                    + one(c.ticking_item, 0.25)
             };
-            n += if c.orbs_ticking {
-                c.live_orbs.iter().filter(|&&(pos, gone)| !gone && hit(&around(pos, 0.5, 0.5))).count()
+            n += if c.orbs_taken {
+                live(&c.live_orbs, 0.5)
             } else {
                 self.life.orbs.iter().filter(|o| !o.is_removed() && hit(&around(o.pos, 0.5, 0.5))).count()
+                    + one(c.ticking_orb, 0.5)
             };
             // Projectile being ticked: its current box, not its slot still at the old place.
             let tp = c.ticking_proj;

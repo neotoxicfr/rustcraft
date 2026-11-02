@@ -41,12 +41,6 @@ impl Server {
         list.iter().all(|(id, want)| self.adv_predicate(id, want))
     }
 
-    /// Minecarts (G5-F06, `minecart/`): tick of all minecarts, including command block
-    /// ones, once per world tick.
-    pub(crate) fn command_minecarts_tick(&mut self) {
-        self.minecarts_tick();
-    }
-
     /// Activation of a command block minecart (the activation of a command block minecart →
     /// the execution of a command): "minecart" source at its position and its current rotation,
     /// level 2; success count written into its compound (`SuccessCount`).

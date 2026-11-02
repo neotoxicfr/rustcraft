@@ -22,8 +22,8 @@ pub struct Fangs {
     pub sent_spike: bool,
     pub owner: Option<i32>,
     pub removed: bool,
-    /// Number of the entity walk they were born in (0: outside the walk), read by `mobs::Walk`.
-    pub born: u64,
+    /// Rank in the entity walk (`walk::next_rank`).
+    pub rank: u64,
     /// Announced to the client (L9-TICK: false again once the player has left their world).
     pub seen: bool,
 }
@@ -208,7 +208,7 @@ impl Server {
             sent_spike: false,
             owner: Some(m.id),
             removed: false,
-            born: self.walk.born(),
+            rank: crate::walk::next_rank(),
             seen: false,
         };
         self.fangs_pair(&mut f);
@@ -250,46 +250,57 @@ impl Server {
         })
     }
 
-    /// Fang tick (after the mobs): delay, hit at −8, event 4, disappearance.
-    pub(crate) fn fangs_tick(&mut self) {
+    /// Fangs of slot `i`, at their rank in the entity walk: delay, hit at −8, event 4,
+    /// disappearance. The list is taken out during their tick (newcomers appended after).
+    pub(crate) fn fang_visit(&mut self, i: usize) {
         let mut list = std::mem::take(&mut self.mobs.ill.fangs);
-        for f in list.iter_mut().filter(|f| !f.removed) {
-            // L9-TICK: back in their world, the client has forgotten them (cleared at respawn).
-            if !f.seen {
-                self.fangs_pair(f);
-            }
-            // Born during this entity walk: they wait for the next tick.
-            // G3-F13: outside a "ticking entities" chunk, it waits too.
-            if self.walk.waits(std::mem::take(&mut f.born)) || !self.entity_ticks_at(f.pos) {
-                continue;
-            }
-            f.warmup -= 1;
-            if f.warmup >= 0 {
-                continue;
-            }
-            if f.warmup == -8 {
-                // Box 0.5 × 0.8 inflated by 0.2 horizontally.
-                let bb = rc_physics::Aabb {
-                    min: [f.pos[0] - 0.25 - 0.2, f.pos[1], f.pos[2] - 0.25 - 0.2],
-                    max: [f.pos[0] + 0.25 + 0.2, f.pos[1] + 0.8, f.pos[2] + 0.25 + 0.2],
-                };
-                self.fangs_damage(f, &bb);
-            }
-            if !f.sent_spike {
-                let _ = self.send(Event::Entity(EntityEvent::Event { id: f.id, event: 4 }));
-                f.sent_spike = true;
-            }
-            f.life -= 1;
-            if f.life < 0 {
-                f.removed = true;
-            }
+        if let Some(f) = list.get_mut(i).filter(|f| !f.removed) {
+            self.fang_tick(f);
         }
-        let gone: Vec<i32> = list.iter().filter(|f| f.removed).map(|f| f.id).collect();
-        if !gone.is_empty() {
-            let _ = self.send(Event::Entity(EntityEvent::Remove(gone)));
-        }
-        list.retain(|f| !f.removed);
+        list.append(&mut self.mobs.ill.fangs);
         self.mobs.ill.fangs = list;
+    }
+
+    fn fang_tick(&mut self, f: &mut Fangs) {
+        // L9-TICK: back in their world, the client has forgotten them (cleared at respawn).
+        if !f.seen {
+            self.fangs_pair(f);
+        }
+        // G3-F13: outside a "ticking entities" chunk, it waits.
+        let ticking = self.entity_ticks_at(f.pos);
+        if self.meet(&mut f.rank, ticking, crate::walk::Fam::Fang) != crate::walk::Meet::Tick {
+            return;
+        }
+        f.warmup -= 1;
+        if f.warmup >= 0 {
+            return;
+        }
+        if f.warmup == -8 {
+            // Box 0.5 × 0.8 inflated by 0.2 horizontally.
+            let bb = rc_physics::Aabb {
+                min: [f.pos[0] - 0.25 - 0.2, f.pos[1], f.pos[2] - 0.25 - 0.2],
+                max: [f.pos[0] + 0.25 + 0.2, f.pos[1] + 0.8, f.pos[2] + 0.25 + 0.2],
+            };
+            self.fangs_damage(f, &bb);
+        }
+        if !f.sent_spike {
+            let _ = self.send(Event::Entity(EntityEvent::Event { id: f.id, event: 4 }));
+            f.sent_spike = true;
+        }
+        f.life -= 1;
+        if f.life < 0 {
+            f.removed = true;
+        }
+    }
+
+    /// Removed fangs, after the entity walk.
+    pub(crate) fn fangs_post(&mut self) {
+        if !self.mobs.ill.fangs.iter().any(|f| f.removed) {
+            return;
+        }
+        let gone: Vec<i32> = self.mobs.ill.fangs.iter().filter(|f| f.removed).map(|f| f.id).collect();
+        let _ = self.send(Event::Entity(EntityEvent::Remove(gone)));
+        self.mobs.ill.fangs.retain(|f| !f.removed);
     }
 
     /// 6 magic (indirect if the caster lives), allies spared.

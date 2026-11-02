@@ -134,7 +134,10 @@ fn player_mount_and_dismount() {
     step(&mut s, 1);
     assert_eq!(s.pcart.vehicle, None, "dismounted while sneaking");
     assert!(s.cart_ref(id).unwrap().passengers.is_empty());
-    assert_eq!(s.mobs.mounts.riding.boarding_cooldown, 60);
+    // 60 at the dismount (minecart's tick, in the entity walk), then one tick off in the
+    // player's own tick after the world, like the game (L10-ORDER: before, the player's
+    // countdown ran before the minecarts and this read 60).
+    assert_eq!(s.mobs.mounts.riding.boarding_cooldown, 59);
     // Dismount cell: beside the minecart (not on it), stone floor.
     let c = s.cart_ref(id).unwrap();
     let d = ((s.pos[0] - c.pos[0]).powi(2) + (s.pos[2] - c.pos[2]).powi(2)).sqrt();

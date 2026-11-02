@@ -66,6 +66,8 @@ pub(crate) struct World {
     /// game keeps the editor on the sign itself, so a sign at the same coordinates elsewhere
     /// refuses the text.
     pub sign_editors: HashMap<[i32; 3], u128>,
+    /// L10-ORDER: entities of the dimension outside the entity list (`walk::Walk::left`).
+    pub left: Vec<(crate::walk::Fam, u64)>,
 }
 
 /// World generation settings (`data/minecraft/world_gen_settings.dat`): seed, and for
@@ -257,6 +259,7 @@ impl Server {
         swap(&mut self.deco, &mut w.deco); // decorations
         swap(&mut self.mobs.ill.fangs, &mut w.fangs); // L9-TICK
         swap(&mut self.life.sign_editors, &mut w.sign_editors); // L9-TICK
+        swap(&mut self.walk.left, &mut w.left); // L10-ORDER
     }
 
     pub(crate) fn world_seed(&self) -> i64 {
@@ -336,6 +339,7 @@ impl Server {
             carts: Box::default(),
             fangs: Vec::new(),
             sign_editors: HashMap::new(),
+            left: Vec::new(),
         }
     }
 
@@ -478,12 +482,7 @@ impl Server {
                     // Tickets of the previous tick applied, then the chunk source's purge.
                     s.proj.pearl_tickets_apply();
                     s.proj.pearl_tickets_purge(s.time);
-                    if ticket > 0 {
-                        s.tick_sim_entities();
-                        s.drops_tick();
-                        s.drops_portal_tick();
-                    }
-                    s.proj_world_tick();
+                    s.tick_parked_entities(ticket > 0);
                     s.flush_block_changes();
                     s.pos = pos;
                     s.loaded = ready;
@@ -647,6 +646,8 @@ impl Server {
         let old_pos = self.pos;
         self.inside_forget_player(); // G5-F02a: no sweep from one world to the other
         self.enter_world(&t.dim);
+        // The player joins the end of the arrival world's entity list.
+        self.walk.player = crate::walk::next_rank();
         self.forget_world_entities(&from);
         if t.missing_respawn {
             let _ = self.send(Event::GameEvent { kind: 0, param: 0.0 });

@@ -41,7 +41,7 @@ pub(crate) mod species;
 mod structure_spawn; // F07: spawn lists of structures
 pub(crate) mod surface;
 mod tick;
-pub(crate) use tick::Walk;
+
 pub(crate) mod track;
 pub(crate) mod trades;
 /// Dye mixing, shared with the client's recipe book demonstration.
@@ -221,8 +221,9 @@ impl Default for Mobs {
 }
 
 impl Mobs {
-    /// Added at the end of the list (index kept up to date).
-    pub(crate) fn push(&mut self, m: Box<Mob>) {
+    /// Added at the end of the list (index kept up to date), with its rank in the entity walk.
+    pub(crate) fn push(&mut self, mut m: Box<Mob>) {
+        m.rank = crate::walk::next_rank();
         self.index.pushed(&m, &self.list);
         self.list.push(Some(m));
     }

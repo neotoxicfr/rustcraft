@@ -92,6 +92,9 @@ pub struct PlayerCtx {
     pub prog: Box<crate::progress::Progress>,
     /// S8: shooting state (use, cooldowns, stuck arrows, gliding).
     pub proj_player: Box<crate::projectiles::PlayerProj>,
+    /// Rank in its world's entity list (`walk::next_rank`), renewed at respawn and dimension
+    /// change: specific to each player.
+    pub(crate) walk_rank: u64,
 }
 
 impl Server {
@@ -169,6 +172,7 @@ impl Server {
         swap(&mut self.cmd.pending_suggest, &mut c.pending_suggest);
         swap(&mut self.prog, &mut c.prog);
         swap(&mut self.proj_player, &mut c.proj_player); // S8
+        swap(&mut self.walk.player, &mut c.walk_rank);
     }
 
     /// State of a new player (file `players/data/<uuid>.dat` if it exists).
@@ -268,6 +272,7 @@ impl Server {
             pending_suggest: None,
             prog: Box::new(crate::progress::Progress::new(tree, &self.world, uuid)),
             proj_player: Box::default(), // S8
+            walk_rank: crate::walk::next_rank(),
             pdata,
         }
     }

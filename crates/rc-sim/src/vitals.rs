@@ -1593,6 +1593,8 @@ impl Server {
         self.joined_tick = self.tick;
         self.mining = None; // new player: mining and tick counter restart from zero
         self.mine_ticks = 0;
+        // New player entity: it joins the end of the world's entity list.
+        self.walk.player = crate::walk::next_rank();
         // Demo: fresh state like the recreated player (the welcome screen returns 20 ticks later).
         self.demo = crate::demo::Demo::default();
         self.sent.clear();

@@ -321,10 +321,9 @@ impl Server {
         for n in here {
             if let Some(p) = self.proj_from_nbt(&n) {
                 self.proj_add(p);
-                // Reset as on the player's entry, before the entity walk: it ticks from this
-                // tick on (the call falls during the walk).
+                // Put back as on the player's entry, before the entity walk (`tick_entities`):
+                // it ticks from this tick on.
                 let Some(q) = self.proj.list.last_mut() else { continue };
-                q.born = 0;
                 // L9-TICK: its ticket is placed with it, applied before its first tick.
                 let c = ((q.pos[0].floor() as i32) >> 4, (q.pos[2].floor() as i32) >> 4);
                 self.proj.pearl_ticket(c, true);

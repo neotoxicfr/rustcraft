@@ -1384,7 +1384,7 @@ impl Server {
                 // The active world becomes the destination: the minecart is put back there afterwards.
                 self.carts.list.remove(i);
                 self.teleport_cart_passenger(pt);
-                self.carts.list.push(Some(c));
+                self.cart_push(c);
                 return;
             }
             if same {
@@ -1393,7 +1393,7 @@ impl Server {
             } else {
                 self.carts.list.remove(i);
                 let dim = t.dim.clone();
-                self.in_world(&dim, move |s| s.carts.list.push(Some(c)));
+                self.in_world(&dim, move |s| s.cart_push(c));
                 if t.ticket {
                     self.place_portal_ticket(&dim);
                 }
@@ -1484,6 +1484,7 @@ impl Server {
                 i += 1;
             } else {
                 let dim = t.dim.clone();
+                d.rank = crate::walk::next_rank();
                 self.in_world(&dim, move |s| s.life.drops.push(d));
                 self.place_portal_ticket(&dim);
             }
@@ -1636,6 +1637,7 @@ impl Server {
                 }
                 s.muted = muted;
             }
+            copy.rank = crate::walk::next_rank();
             s.bs.entities.list.push(copy);
         });
         self.place_portal_ticket(&dim);

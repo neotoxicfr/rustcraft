@@ -24,8 +24,8 @@ pub struct Spit {
     pub removed: bool,
     pub left_owner: bool,
     pub tick: i32,
-    /// Number of the entity walk it was born in (0: outside the walk), read by `mobs::Walk`.
-    pub born: u64,
+    /// Rank in the entity walk (`walk::next_rank`).
+    pub rank: u64,
 }
 
 /// Mounts world: mounted player, spits in flight, visual lightning.
@@ -99,7 +99,6 @@ impl Server {
         }
         let v = v.map(|c| c * f64::from(1.5f32));
         let (yaw, pitch) = rot_of(v);
-        let born = self.walk.born();
         let s = Spit {
             id,
             owner: m.id,
@@ -111,7 +110,7 @@ impl Server {
             removed: false,
             left_owner: false,
             tick: 0,
-            born,
+            rank: crate::walk::next_rank(),
         };
         let add = AddEntity {
             id,
@@ -131,15 +130,29 @@ impl Server {
         m.mount.did_spit = true;
     }
 
-    /// Spit tick (after the mobs); position sent back every 10 ticks.
+    /// The spits as their own walk (tests): those born during it wait for the next one.
+    #[cfg(test)]
     pub(crate) fn spits_tick(&mut self) {
+        self.walk_alone(crate::walk::bit(crate::walk::Fam::Spit), |_| {}, Self::spits_post);
+    }
+
+    /// Spit of slot `i`, at its rank in the entity walk; position sent back every 10 ticks.
+    /// The list is taken out during its tick (newcomers appended after).
+    pub(crate) fn spit_visit(&mut self, i: usize) {
         let mut spits = std::mem::take(&mut self.mobs.mounts.spits);
-        for s in spits.iter_mut().filter(|s| !s.removed) {
-            // Born during this entity walk: it waits for the next tick (born from a minecart,
-            // after this tick, it is no longer skipped).
-            // G3-F13: outside a "ticking entities" chunk, it waits too.
-            if self.walk.waits(std::mem::take(&mut s.born)) || !self.entity_ticks_at(s.pos) {
-                continue;
+        if let Some(s) = spits.get_mut(i).filter(|s| !s.removed) {
+            self.spit_step(s);
+        }
+        spits.append(&mut self.mobs.mounts.spits);
+        self.mobs.mounts.spits = spits;
+    }
+
+    fn spit_step(&mut self, s: &mut Spit) {
+        {
+            // G3-F13: outside a "ticking entities" chunk, it waits.
+            let ticking = self.entity_ticks_at(s.pos);
+            if self.meet(&mut s.rank, ticking, crate::walk::Fam::Spit) != crate::walk::Meet::Tick {
+                return;
             }
             s.tick += 1;
             // Left the llama (shared projectile rule): the spit's box stretched by its speed and
@@ -201,7 +214,7 @@ impl Server {
                 self.spit_hit(s, e);
             } else if block_hit {
                 s.removed = true;
-                continue;
+                return;
             }
             let next = to;
             // Smoothed rotation (a fifth of the difference) from the previous tick's.
@@ -226,7 +239,7 @@ impl Server {
             };
             if !air_only || self.mob_fluid(super::super::mth::block_of(s.pos)) == super::super::env::Fluid::Water {
                 s.removed = true;
-                continue;
+                return;
             }
             s.vel = s.vel.map(|v| v * f64::from(0.99f32));
             s.vel[1] -= 0.06;
@@ -245,14 +258,16 @@ impl Server {
                 s.removed = true;
             }
         }
-        let gone: Vec<i32> = spits.iter().filter(|s| s.removed).map(|s| s.id).collect();
-        if !gone.is_empty() {
-            let _ = self.send(Event::Entity(EntityEvent::Remove(gone)));
+    }
+
+    /// Removed spits, after the entity walk.
+    pub(crate) fn spits_post(&mut self) {
+        if !self.mobs.mounts.spits.iter().any(|s| s.removed) {
+            return;
         }
-        spits.retain(|s| !s.removed);
-        let added = std::mem::take(&mut self.mobs.mounts.spits);
-        spits.extend(added);
-        self.mobs.mounts.spits = spits;
+        let gone: Vec<i32> = self.mobs.mounts.spits.iter().filter(|s| s.removed).map(|s| s.id).collect();
+        let _ = self.send(Event::Entity(EntityEvent::Remove(gone)));
+        self.mobs.mounts.spits.retain(|s| !s.removed);
     }
 
     /// Spit on an entity: 1 damage (`spit`), the spit continues on its way.

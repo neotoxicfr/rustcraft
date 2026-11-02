@@ -93,17 +93,20 @@ pub struct Contact {
     pub(crate) ticking_proj: Option<(i32, Aabb)>,
     /// Falling block or TNT being ticked, same principle as `ticking_proj`.
     pub(crate) ticking_sim: Option<(i32, Aabb)>,
-    /// During the tick of the list of ground items (taken out of the server): position and
-    /// removal of each, kept up to date as the tick goes on; empty outside this tick. A pressed
-    /// plate thus counts the items already moved at their new place, the following ones at the
-    /// old one.
+    /// Ground item being ticked out of its slot (which holds a removed placeholder): position and
+    /// removal, kept up to date during its tick. A pressed plate thus counts the items already
+    /// moved at their new place, the following ones at the old one, this one where it is now.
+    pub(crate) ticking_item: Option<([f64; 3], bool)>,
+    /// During a long run of items ticked with their list taken out of the server
+    /// (`items_taken`): position and removal of each, kept up to date as the run goes on.
     pub(crate) live_items: Vec<([f64; 3], bool)>,
-    pub(crate) items_ticking: bool,
-    /// Same for experience orbs.
+    pub(crate) items_taken: bool,
+    /// Same for the experience orbs.
+    pub(crate) ticking_orb: Option<([f64; 3], bool)>,
     pub(crate) live_orbs: Vec<([f64; 3], bool)>,
-    pub(crate) orbs_ticking: bool,
+    pub(crate) orbs_taken: bool,
     /// G5-F05: orbs of the list by identifier modulo 40 (the only ones that can merge with each
-    /// other), rebuilt at the first merge scan of an orb tick; reused buffers.
+    /// other), rebuilt at the first merge scan of an entity walk; reused buffers.
     pub(crate) orb_buckets: Vec<Vec<u32>>,
     /// Player's boots.
     pub(crate) player: Boots,
@@ -393,8 +396,9 @@ impl Server {
 
     /// Plates and tripwire touched by an entity that is not alive and moves with collisions
     /// (item, orb, falling block, TNT), right after its movement. Its current position must be
-    /// visible to the plate count (up-to-date list, or `ticking_sim` / `live_items` /
-    /// `live_orbs`). Plate and tripwire can be replayed without effect: no guard on the cells
+    /// visible to the plate count (up-to-date list, or `ticking_sim`, `ticking_item` /
+    /// `live_items`, `ticking_orb` / `live_orbs`). Plate and tripwire can be replayed without
+    /// effect: no guard on the cells
     /// entered.
     pub(crate) fn contact_triggers(&mut self, from: [f64; 3], to: [f64; 3], half: f64, h: f64) {
         let cells = self.contact_cells(from, to, half, h, false);
