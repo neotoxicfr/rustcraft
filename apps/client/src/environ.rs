@@ -184,6 +184,9 @@ pub struct EnvState {
     boss_dark: (f32, f32),
     /// "Brightness" option (`None`: default 0.5).
     pub gamma: Option<f32>,
+    /// Half-height of the near plane tested for lava and powder snow, from the "Field of view"
+    /// option (`set_fov_option`, default 70°).
+    near_half: NearHalf,
     /// Darkness effect (`video.rs`): brightness drop, darkening of the lightmap.
     pub darkness: (f32, f32),
     /// Blindness (ticks left, −1 infinite) and camera darkness fade: tightened fog,
@@ -302,15 +305,29 @@ impl ViewCache {
     }
 }
 
-/// Half-height of the camera's near plane (fov 70°, plane at 0.05).
-fn near_half_height() -> f64 {
-    (70.0f64.to_radians() / 2.0).tan() * 0.05
+/// Distance of the camera's near plane: 0.05 in single precision, widened like the game.
+const Z_NEAR: f64 = 0.05f32 as f64;
+
+/// Half-height of the camera's near plane for the field-of-view option in degrees (the game sizes
+/// this test with the option, not with the field of view of the frame), angle in single precision.
+fn near_half_height(fov: i32) -> f64 {
+    let angle = fov as f32 * (std::f64::consts::PI / 180.0) as f32;
+    (f64::from(angle) / 2.0).tan() * Z_NEAR
 }
 
-/// True if the near-plane points stay within one block of the eye on each axis.
-fn reach(aspect: f32) -> bool {
-    let h = near_half_height();
-    0.05 + h + h * f64::from(aspect).abs() < 0.99
+/// Near-plane half-height kept between frames (one tangent per change of the option).
+#[derive(Clone, Copy)]
+struct NearHalf(f64);
+
+impl Default for NearHalf {
+    fn default() -> Self {
+        NearHalf(near_half_height(70))
+    }
+}
+
+/// True if the near-plane points (half-height `h`) stay within one block of the eye on each axis.
+fn reach(aspect: f32, h: f64) -> bool {
+    Z_NEAR + h + h * f64::from(aspect).abs() < 0.99
 }
 
 #[derive(Default, Clone, Copy)]
@@ -370,6 +387,11 @@ pub fn end_flash_direction(x_angle: f32, y_angle: f32) -> [f64; 3] {
 }
 
 impl EnvState {
+    /// "Field of view" option in degrees: sizes the near plane of the lava and powder snow test.
+    pub fn set_fov_option(&mut self, fov: i32) {
+        self.near_half = NearHalf(near_half_height(fov));
+    }
+
     /// Id of the plains (biome of absent columns, like the game's empty level).
     pub fn plains(&self) -> u32 {
         self.plains
@@ -518,10 +540,10 @@ impl EnvState {
         let f = [-yr.sin() * pr.cos(), -pr.sin(), yr.cos() * pr.cos()];
         let l = [yr.cos(), 0.0, yr.sin()];
         let u = [f[1] * l[2] - f[2] * l[1], f[2] * l[0] - f[0] * l[2], f[0] * l[1] - f[1] * l[0]];
-        let half_h = near_half_height();
+        let half_h = self.near_half.0;
         let half_w = half_h * f64::from(aspect);
         for (su, sl) in [(0.0, 0.0), (1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)] {
-            let p: [f64; 3] = std::array::from_fn(|a| eye[a] + f[a] * 0.05 + u[a] * half_h * su + l[a] * half_w * sl);
+            let p: [f64; 3] = std::array::from_fn(|a| eye[a] + f[a] * Z_NEAR + u[a] * half_h * su + l[a] * half_w * sl);
             let b = p.map(|v| v.floor() as i32);
             let s = w.state(b[0], b[1], b[2]);
             if t.fluids.fluid(s) == Fluid::Lava && p[1] <= top(s, b[0], b[1], b[2]) {
@@ -553,7 +575,7 @@ impl EnvState {
         self.cam = eye;
         let b = eye.map(|v| v.floor() as i32);
         let (kind, biome) = if self.cache.on {
-            let clear = reach(aspect) && self.cache.clear_around(w, t, d, self.powder_snow, b);
+            let clear = reach(aspect, self.near_half.0) && self.cache.clear_around(w, t, d, self.powder_snow, b);
             let kind =
                 if clear { FogKind::Atmospheric } else { self.camera_kind(w, t, d, eye, yaw, pitch, aspect) };
             let q = self.cache.zoom(biome_zoom_seed(), b);

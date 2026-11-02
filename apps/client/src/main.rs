@@ -1776,9 +1776,8 @@ impl App {
                 yaw: self.yaw,
                 pitch: self.pitch,
                 shot: (shot.yaw, shot.pitch),
-                fov: r.view.fov,
+                view: r.view,
                 aspect,
-                hud_fov: r.view.hud_fov,
                 first_person: !self.camera.view.detached() && !self.free_cam,
                 spectator: self.env.game_mode == 3,
                 hud_hidden: self.hud.hidden,
@@ -3139,6 +3138,7 @@ impl App {
             }
         }
         self.env.gamma = Some(o.f("gamma") as f32);
+        self.env.set_fov_option(o.fov());
         let clouds = o.s("renderClouds") != "false";
         self.env.clouds = Some((clouds, o.i("cloudRange"), o.s("renderClouds") == "fast"));
         self.chat.apply_options(o);

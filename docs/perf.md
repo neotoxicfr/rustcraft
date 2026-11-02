@@ -3052,3 +3052,23 @@ regularity, allocations, disk, RAM, startup, multi-core): figures below, the res
   every 501 ms (`NtQuerySystemInformation` / `/proc/stat`). Archive written once at the end.
 - To re-measure on a quiet machine: `bench_optimize` and `bench_named_curves` (2 passes each);
   scene bench not concerned (nothing changed in the world loop).
+## G1-F17: option labels and menus, near plane of the fluid camera test (02/11, loaded machine)
+
+- Fluid-in-camera test (lava, powder snow): the near plane now follows the field-of-view option.
+  Its half-height is computed once when the option is applied (`EnvState::set_fov_option`) and
+  kept, instead of a tangent each frame (the former fixed 70° could be folded at compile time):
+  micro-bench `environ::cache_tests::bench_near_half` (2 passes, 10 M calls) 2.71-2.72 ns per frame
+  with the tangent against 0.56-0.57 ns with the kept value; kept. Third track, a table of the
+  81 option angles (30..=110) read each frame: 0.56-0.57 ns (2 passes, rerun 02/11 with the
+  tangent at 2.74-2.76 ns), no gain over the single kept value, which needs no table: dropped.
+  In-wall overlay test: near plane now sized by the culling field of view (max of the frame's and
+  the option, like the game); same tangent per frame as before, only its input changed, no cost
+  to measure. Rest of the per-frame test
+  unchanged (same neighbourhood cache, same five points). Multi-core and GPU not applicable (five
+  block reads per frame).
+- Option labels (brightness, fixed decimals through `tech_blocks::java_fixed`, about 110 ns per
+  real, see G1-F16; composed OFF key): computed on layout and on slider moves only, never per
+  frame; no measurable cost. Japanese glyph default: one system call at the first read, cached.
+- To re-measure on a quiet machine with the other menu missions: `menu` scene of
+  `tools/bench/scenes.py` (no change expected), screenshots of the video and accessibility
+  screens (titles 2 px lower, labels).

@@ -10,6 +10,7 @@ use winit::keyboard::{KeyCode, ModifiersState};
 
 use crate::gui::Gui;
 use crate::options::{self, Cat, KEYS, Options, Ty, Val, java_double};
+use crate::tech_blocks::java_fixed;
 use crate::widgets::{self, Entry, Event, Kind, List, Panel, TextField, Widget, chars, tr};
 
 /// Request from the screen to the application.
@@ -501,7 +502,7 @@ fn slider_kind(key: &str) -> Sk {
         "notificationDisplayTime" => Sk::Div(5, 100, 10.0),
         "sprintWindow" => Sk::Int(0, 10),
         "fov" => Sk::Fov,
-        "fovEffectScale" => Sk::Square,
+        "fovEffectScale" | "darknessEffectScale" => Sk::Square,
         "mouseWheelSensitivity" => Sk::Wheel,
         "graphicsPreset" => Sk::Preset,
         "fullscreenResolution" => Sk::Modes,
@@ -628,6 +629,8 @@ fn slider_label(lang: &rc_text::Lang, key: &str, name: &str, v: &Val) -> String 
     let gv = |value: String| t("options.generic_value", &[n.clone(), value]);
     let pct = |f: f64| t("options.percent_value", &[n.clone(), ((f * 100.0).floor() as i64).to_string()]);
     let off = || gv(t("options.off", &[]));
+    // Name and OFF in one key (differs from `off()` in some languages).
+    let off_composed = || t("options.off.composed", std::slice::from_ref(&n));
     let (i, f) = match v {
         Val::I(i) => (*i, f64::from(*i)),
         Val::F(f) => (*f as i32, *f),
@@ -643,38 +646,52 @@ fn slider_label(lang: &rc_text::Lang, key: &str, name: &str, v: &Val) -> String 
         "biomeBlendRadius" => gv(t(&format!("options.biomeBlendRadius.{}", 2 * i + 1), &[])),
         "maxFps" if i >= 260 => gv(t("options.framerateLimit.max", &[])),
         "maxFps" => gv(t("options.framerate", &[i.to_string()])),
-        "mipmapLevels" | "menuBackgroundBlurriness" | "sprintWindow" if i == 0 => off(),
-        "mipmapLevels" | "menuBackgroundBlurriness" | "sprintWindow" => gv(i.to_string()),
+        "mipmapLevels" if i == 0 => off_composed(),
+        "menuBackgroundBlurriness" | "sprintWindow" if i == 0 => off(),
+        "sprintWindow" => gv(t("options.value", &[i.to_string()])),
+        "mipmapLevels" | "menuBackgroundBlurriness" => gv(i.to_string()),
         "maxAnisotropyBit" => gv(t("options.multiplier", &[(1 << i).to_string()])),
         "weatherRadius" => gv(t("options.blocks", &[i.to_string()])),
         "entityDistanceScaling" => pct(f),
-        "chunkSectionFadeInTime" if f == 0.0 => t("options.chunkFade.none", &[]),
-        "chunkSectionFadeInTime" => t("options.chunkFade.seconds", &[java_double(f)]),
-        "chatDelay" if f == 0.0 => t("options.chat.delay_none", &[]),
-        "chatDelay" => t("options.chat.delay", &[java_double(f)]),
+        // Fixed decimals rounded like Java's formatter (half up on the shortest digits).
+        "chunkSectionFadeInTime" if f <= 0.0 => t("options.chunkFade.none", &[]),
+        "chunkSectionFadeInTime" => t("options.chunkFade.seconds", &[java_fixed(f, 2)]),
+        "chatDelay" if f <= 0.0 => t("options.chat.delay_none", &[]),
+        "chatDelay" => t("options.chat.delay", &[java_fixed(f, 1)]),
         "notificationDisplayTime" => gv(t("options.multiplier", &[java_double(f)])),
-        "gamma" if f == 0.0 => gv(t("options.gamma.min", &[])),
-        "gamma" if f == 0.5 => gv(t("options.gamma.default", &[])),
-        "gamma" if f == 1.0 => gv(t("options.gamma.max", &[])),
-        "fov" => {
-            let deg = (70.0 + f * 40.0).round() as i32;
-            match deg {
-                70 => gv(t("options.fov.min", &[])),
-                110 => gv(t("options.fov.max", &[])),
-                d => gv(d.to_string()),
-            }
-        }
+        // Truncated percentage, shown without a percent sign.
+        "gamma" => match (f * 100.0) as i32 {
+            0 => gv(t("options.gamma.min", &[])),
+            50 => gv(t("options.gamma.default", &[])),
+            100 => gv(t("options.gamma.max", &[])),
+            g => gv(g.to_string()),
+        },
+        "fov" => match options::fov_degrees(f) {
+            70 => gv(t("options.fov.min", &[])),
+            110 => gv(t("options.fov.max", &[])),
+            d => gv(d.to_string()),
+        },
         "mouseSensitivity" if f == 0.0 => gv(t("options.sensitivity.min", &[])),
         "mouseSensitivity" if f == 1.0 => gv(t("options.sensitivity.max", &[])),
         "mouseSensitivity" => pct(2.0 * f),
-        "mouseWheelSensitivity" => gv(format!("{f:.2}")),
+        "mouseWheelSensitivity" => gv(java_fixed(f, 2)),
         "chatOpacity" => pct(f * 0.9 + 0.1),
         "chatWidth" => t("options.pixel_value", &[n.clone(), ((f * 280.0 + 40.0).floor() as i32).to_string()]),
         "chatHeightFocused" | "chatHeightUnfocused" => {
             t("options.pixel_value", &[n.clone(), ((f * 160.0 + 20.0).floor() as i32).to_string()])
         }
         "graphicsPreset" => gv(t(&format!("options.graphics.{}", val_text(v)), &[])),
-        k if (k.starts_with("soundCategory_") || matches!(k, "screenEffectScale" | "chatScale" | "fovEffectScale"))
+        "chatScale" if f == 0.0 => off_composed(),
+        k if (k.starts_with("soundCategory_")
+            || matches!(
+                k,
+                "screenEffectScale"
+                    | "fovEffectScale"
+                    | "darknessEffectScale"
+                    | "glintSpeed"
+                    | "glintStrength"
+                    | "damageTiltStrength"
+            ))
             && f == 0.0 =>
         {
             off()
@@ -1510,6 +1527,31 @@ fn graphics_api_tooltip(gui: &Gui, o: &Options) -> String {
     lines.join("\n")
 }
 
+/// Row of an option list starting `top` px into the list (§ 3.3): y of its widgets and height.
+/// The entry begins at `2 + top`, its content 2 px lower; a section title sits in that content
+/// below its top margin (18, none for the first row) and takes 18 more.
+fn row_layout(row: &Row, top: i32, first: bool) -> (i32, i32) {
+    let content = 2 + top + 2;
+    match row {
+        Row::Header(_) => {
+            let margin = if first { 0 } else { 18 };
+            (content + margin, margin + 18)
+        }
+        Row::Big(_) | Row::Pair(..) => (content, 25),
+    }
+}
+
+/// Friends button of the pause screen (id 6): message of the game; when the friends list is not
+/// available (demo) it is inactive and has no tooltip.
+fn friends_button(m: &dyn rc_text::Metrics, t: &dyn Fn(&str) -> String, x: i32, y: i32, available: bool) -> Widget {
+    let mut w = Widget::new(6, Kind::Icon("friends/friends"), x, y, 20, 20, chars(&t("gui.friends.open")));
+    w.active = available;
+    if available {
+        w.set_tooltip(m, &t("gui.friends.open.tooltip"));
+    }
+    w
+}
+
 /// Components of a screen for a `W × H` interface.
 fn build(
     s: &mut Screen,
@@ -1543,12 +1585,12 @@ fn build(
                 b(ADVANCEMENTS, 4, 74, 98, "gui.advancements"),
                 b(STATS, 110, 74, 98, "gui.stats"),
                 // Icons: report a bug and give feedback (confirmed link), friends list of the
-                // Microsoft account (active outside demo and outside offline developer mode, like
-                // the game), social interactions.
+                // Microsoft account (active outside demo, like the game; the offline developer
+                // mode is not supported), social interactions.
                 icon(REPORT_BUGS, 60, "pause_menu/bug", "menu.reportBugs"),
                 icon(FEEDBACK, 84, "pause_menu/social_interactions", "menu.sendFeedback"),
-                icon(6, 108, "friends/friends", "options.friendsList"),
             ];
+            widgets.push(friends_button(gui, &t, gx + 108, gy + 98, !rc_sim::demo::launch_demo()));
             let mut social = icon(SOCIAL, 132, "pause_menu/player_reporting", "menu.playerReporting");
             if world.ctx.solo && world.players.iter().all(|p| p.uuid == world.local) {
                 social.active = false;
@@ -1740,26 +1782,22 @@ fn build(
                     wd.in_list = true;
                     widgets.push(wd);
                 };
+                let (y, height) = row_layout(&row, top, first);
                 match row {
                     Row::Header(k) => {
-                        let margin = if first { 0 } else { 18 };
-                        let mut tw = Widget::new(0, Kind::Title, x0, 2 + top + margin, 310, 17, chars(&t(k)));
+                        let mut tw = Widget::new(0, Kind::Title, x0, y, 310, 17, chars(&t(k)));
                         tw.in_list = true;
                         widgets.push(tw);
-                        top += margin + 18;
                     }
-                    Row::Big(opt) => {
-                        add(opt, x0, 2 + top + 2, 310, s);
-                        top += 25;
-                    }
+                    Row::Big(opt) => add(opt, x0, y, 310, s),
                     Row::Pair(a, b) => {
-                        add(a, x0, 2 + top + 2, 150, s);
+                        add(a, x0, y, 150, s);
                         if let Some(b) = b {
-                            add(b, x1, 2 + top + 2, 150, s);
+                            add(b, x1, y, 150, s);
                         }
-                        top += 25;
                     }
                 }
+                top += height;
                 first = false;
             }
             l.content = top + 4;
@@ -1802,6 +1840,117 @@ mod tests {
         assert_eq!(pos_value("graphicsPreset", 0.5), Val::S("fabulous".into()));
         assert!((slider_pos("mouseWheelSensitivity", &o) - 2.0 / 3.0).abs() < 1e-9);
         assert_eq!(slider_pos("gamma", &o), 0.5);
+    }
+
+    /// Darkness pulsing: like the field-of-view effects, the slider position is the square root
+    /// of the value.
+    #[test]
+    fn darkness_slider_is_squared() {
+        assert_eq!(pos_value("darknessEffectScale", 0.5), Val::F(0.25));
+        let mut o = Options::default();
+        o.set("darknessEffectScale", Val::F(0.25));
+        assert_eq!(slider_pos("darknessEffectScale", &o), 0.5);
+        assert_eq!(slider_steps("darknessEffectScale"), 0, "continuous");
+    }
+
+    /// Labels written like the game's option definitions.
+    #[test]
+    fn slider_labels_follow_the_game() {
+        let lang = rc_text::Lang::load(
+            br#"{"options.generic_value":"%s: %s","options.percent_value":"%s: %s%%","options.off":"OFF",
+            "options.off.composed":"%s: disabled","options.value":"%s ticks",
+            "options.darknessEffectScale":"Darkness","options.glintSpeed":"Glint Speed",
+            "options.glintStrength":"Glint Strength","options.damageTiltStrength":"Tilt",
+            "options.screenEffectScale":"Distortion","options.mipmapLevels":"Mipmap",
+            "options.chat.scale":"Chat Scale","options.sprintWindow":"Sprint Window",
+            "options.accessibility.menu_background_blurriness":"Blur",
+            "options.gamma":"Brightness","options.gamma.min":"Moody","options.gamma.default":"Default",
+            "options.gamma.max":"Bright","options.chunkFade.none":"Chunk Fade: None",
+            "options.chunkFade.seconds":"Chunk Fade: %s second(s)","options.chat.delay":"Chat Delay: %s seconds",
+            "options.fov":"FOV","options.fov.min":"Normal","options.mouseWheelSensitivity":"Scroll"}"#,
+            None,
+            None,
+        );
+        let l = |key: &str, name: &str, v: Val| slider_label(&lang, key, name, &v);
+        // OFF at exactly 0 for every percentage-or-off scale, percentage otherwise.
+        for (key, shown) in [
+            ("darknessEffectScale", "Darkness"),
+            ("glintSpeed", "Glint Speed"),
+            ("glintStrength", "Glint Strength"),
+            ("damageTiltStrength", "Tilt"),
+            ("screenEffectScale", "Distortion"),
+        ] {
+            let name = format!("options.{key}");
+            assert_eq!(l(key, &name, Val::F(0.0)), format!("{shown}: OFF"));
+            assert_eq!(l(key, &name, Val::F(0.505)), format!("{shown}: 50%"));
+        }
+        // Name and OFF in one key for the mipmaps and the chat scale, the plain OFF for the others.
+        assert_eq!(l("mipmapLevels", "options.mipmapLevels", Val::I(0)), "Mipmap: disabled");
+        assert_eq!(l("mipmapLevels", "options.mipmapLevels", Val::I(2)), "Mipmap: 2");
+        assert_eq!(l("chatScale", "options.chat.scale", Val::F(0.0)), "Chat Scale: disabled");
+        let blur = "options.accessibility.menu_background_blurriness";
+        assert_eq!(l("menuBackgroundBlurriness", blur, Val::I(0)), "Blur: OFF");
+        assert_eq!(l("sprintWindow", "options.sprintWindow", Val::I(0)), "Sprint Window: OFF");
+        assert_eq!(l("sprintWindow", "options.sprintWindow", Val::I(3)), "Sprint Window: 3 ticks");
+        // Brightness: truncated percentage without a percent sign, names at 0, 50 and 100.
+        let gamma = |f: f64| l("gamma", "options.gamma", Val::F(f));
+        assert_eq!(gamma(0.3), "Brightness: 30");
+        assert_eq!(gamma(0.999), "Brightness: 99");
+        assert_eq!(gamma(0.009), "Brightness: Moody");
+        assert_eq!(gamma(0.505), "Brightness: Default");
+        assert_eq!(gamma(1.0), "Brightness: Bright");
+        // Fixed decimals rounded half up on the shortest digits, like Java's formatter.
+        let fade = |f: f64| l("chunkSectionFadeInTime", "options.chunkFade", Val::F(f));
+        assert_eq!(fade(0.75), "Chunk Fade: 0.75 second(s)");
+        assert_eq!(fade(1.0), "Chunk Fade: 1.00 second(s)");
+        assert_eq!(fade(0.5), "Chunk Fade: 0.50 second(s)");
+        assert_eq!(fade(0.125), "Chunk Fade: 0.13 second(s)");
+        assert_eq!(fade(0.0), "Chunk Fade: None");
+        let delay = |f: f64| l("chatDelay", "options.chat.delay_instant", Val::F(f));
+        assert_eq!(delay(1.0), "Chat Delay: 1.0 seconds");
+        assert_eq!(delay(0.25), "Chat Delay: 0.3 seconds");
+        assert_eq!(l("mouseWheelSensitivity", "options.mouseWheelSensitivity", Val::F(1.005)), "Scroll: 1.01");
+        // Field of view decoded by truncation: 70.5° is 70 (Normal).
+        assert_eq!(l("fov", "options.fov", Val::F(0.0125)), "FOV: Normal");
+        assert_eq!(l("fov", "options.fov", Val::F(0.25)), "FOV: 80");
+    }
+
+    /// Section titles sit in the entry content (2 px below the entry, like the options) under their
+    /// margin.
+    #[test]
+    fn section_titles_sit_in_the_entry_content() {
+        let (mut top, mut first, mut ys) = (0, true, Vec::new());
+        for row in &rows(Id::Video, &Options::default()) {
+            let (y, h) = row_layout(row, top, first);
+            ys.push((matches!(row, Row::Header(_)), y));
+            top += h;
+            first = false;
+        }
+        assert_eq!(&ys[..2], &[(true, 4), (false, 22)], "first title, then its first row");
+        let i = ys.iter().skip(1).position(|r| r.0).expect("second title") + 1;
+        assert_eq!(ys[i].1, ys[i - 1].1 + 25 + 18, "18 px margin below the previous row");
+        assert_eq!(ys[i + 1].1, ys[i].1 + 18, "options under the title");
+    }
+
+    /// Pause friends button: message and tooltip of the game, active; in demo inactive without
+    /// a tooltip.
+    #[test]
+    fn friends_button_follows_availability() {
+        struct Fixed;
+        impl rc_text::Metrics for Fixed {
+            fn advance(&self, _font: &str, _c: char) -> (f32, f32) {
+                (6.0, 1.0)
+            }
+        }
+        let t = |k: &str| k.to_owned();
+        let text = |l: &[StyledChar]| l.iter().map(|s| s.c).collect::<String>();
+        let on = friends_button(&Fixed, &t, 10, 20, true);
+        assert_eq!((on.id, on.x, on.y, on.active), (6, 10, 20, true));
+        assert_eq!(text(&on.msg), "gui.friends.open");
+        assert_eq!(on.tooltip.iter().map(|l| text(l)).collect::<String>(), "gui.friends.open.tooltip");
+        let off = friends_button(&Fixed, &t, 10, 20, false);
+        assert_eq!((off.active, text(&off.msg)), (false, "gui.friends.open".to_owned()));
+        assert!(off.tooltip.is_empty(), "no tooltip in demo");
     }
 
     #[test]

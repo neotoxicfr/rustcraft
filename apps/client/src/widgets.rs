@@ -531,7 +531,7 @@ impl Widget {
         self
     }
 
-    pub fn set_tooltip(&mut self, gui: &Gui, text: &str) {
+    pub fn set_tooltip(&mut self, gui: &dyn rc_text::Metrics, text: &str) {
         self.tooltip = if text.is_empty() { Vec::new() } else { rc_text::wrap(gui, &chars(text), 170.0) };
     }
 
