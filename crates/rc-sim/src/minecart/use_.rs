@@ -568,11 +568,15 @@ impl Server {
         }
     }
 
-    /// Tick of the player riding a minecart: sneaking → gets off; otherwise seated.
+    /// Tick of the player riding a minecart: sneaking → gets off (no tick of its own then);
+    /// otherwise its world part (mining, demo), then seated.
     fn player_cart_ride_tick(&mut self, id: i32) {
         if self.sneaking {
             self.player_stop_riding_cart();
             return;
+        }
+        if self.cart_ref(id).is_some() {
+            self.passenger_world_tick();
         }
         let Some(c) = self.cart_ref(id) else {
             self.pcart.vehicle = None;

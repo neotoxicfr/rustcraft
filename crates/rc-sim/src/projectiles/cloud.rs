@@ -235,16 +235,16 @@ impl Server {
     pub(crate) fn cloud_visit(&mut self, i: usize) {
         let mut clouds = std::mem::take(&mut self.proj.clouds);
         if let Some(c) = clouds.get_mut(i).filter(|c| !c.removed) {
-            self.cloud_step(c, i);
+            self.cloud_step(c);
         }
         clouds.append(&mut self.proj.clouds);
         self.proj.clouds = clouds;
     }
 
-    fn cloud_step(&mut self, c: &mut Cloud, i: usize) {
+    fn cloud_step(&mut self, c: &mut Cloud) {
         // Outside a "ticking entities" chunk (G3-F13): it waits.
         let ticking = self.entity_ticks_at(c.pos);
-        if self.meet(&mut c.rank, ticking, crate::walk::Fam::Cloud, i) != crate::walk::Meet::Tick {
+        if self.meet(&mut c.rank, ticking, crate::walk::Fam::Cloud) != crate::walk::Meet::Tick {
             return;
         }
         if !c.seen {

@@ -572,6 +572,10 @@ impl Server {
             self.player_stop_riding();
             return;
         }
+        // Its world part (mining, demo) at its vehicle's rank, then seated.
+        if self.mob_ref(vid).is_some() {
+            self.passenger_world_tick();
+        }
         let Some(v) = self.mob_ref(vid) else {
             self.mobs.mounts.riding.vehicle = None;
             return;

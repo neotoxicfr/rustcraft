@@ -66,6 +66,8 @@ pub(crate) struct World {
     /// game keeps the editor on the sign itself, so a sign at the same coordinates elsewhere
     /// refuses the text.
     pub sign_editors: HashMap<[i32; 3], u128>,
+    /// L10-ORDER: entities of the dimension outside the entity list (`walk::Walk::left`).
+    pub left: Vec<(crate::walk::Fam, u64)>,
 }
 
 /// World generation settings (`data/minecraft/world_gen_settings.dat`): seed, and for
@@ -255,6 +257,7 @@ impl Server {
         swap(&mut self.deco, &mut w.deco); // decorations
         swap(&mut self.mobs.ill.fangs, &mut w.fangs); // L9-TICK
         swap(&mut self.life.sign_editors, &mut w.sign_editors); // L9-TICK
+        swap(&mut self.walk.left, &mut w.left); // L10-ORDER
     }
 
     pub(crate) fn world_seed(&self) -> i64 {
@@ -334,6 +337,7 @@ impl Server {
             carts: Box::default(),
             fangs: Vec::new(),
             sign_editors: HashMap::new(),
+            left: Vec::new(),
         }
     }
 

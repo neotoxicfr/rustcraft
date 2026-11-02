@@ -23,7 +23,7 @@ pub struct Bolt {
     life: i32,
     flashes: i32,
     rng: JRand,
-    pos: [f64; 3],
+    pub(crate) pos: [f64; 3],
     visual: bool,
     /// Thrown by the player (channeling): `channeled_lightning` progress on every strike.
     cause: bool,
@@ -197,7 +197,7 @@ impl Server {
     pub(crate) fn bolt_visit(&mut self, i: usize) {
         let mut bolts = std::mem::take(&mut self.mobs.mounts.bolts);
         if let Some(b) = bolts.get_mut(i).filter(|b| !b.removed) {
-            self.bolt_tick(b, i);
+            self.bolt_tick(b);
         }
         bolts.append(&mut self.mobs.mounts.bolts);
         self.mobs.mounts.bolts = bolts;
@@ -206,11 +206,11 @@ impl Server {
     /// Life of a lightning bolt: at the first tick fire (normal and hard),
     /// lightning rod, scraped copper, `lightning_strike` event; while life is positive,
     /// all entities in the 6×12×6 box are struck; removed once the flashes are used up.
-    fn bolt_tick(&mut self, b: &mut Bolt, i: usize) {
+    fn bolt_tick(&mut self, b: &mut Bolt) {
         {
             // G3-F13: outside a "ticking entities" chunk, it waits.
             let ticking = self.entity_ticks_at(b.pos);
-            if self.meet(&mut b.rank, ticking, crate::walk::Fam::Bolt, i) != crate::walk::Meet::Tick {
+            if self.meet(&mut b.rank, ticking, crate::walk::Fam::Bolt) != crate::walk::Meet::Tick {
                 return;
             }
             if b.life == 2 {

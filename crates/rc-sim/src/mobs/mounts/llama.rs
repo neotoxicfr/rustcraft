@@ -142,17 +142,17 @@ impl Server {
     pub(crate) fn spit_visit(&mut self, i: usize) {
         let mut spits = std::mem::take(&mut self.mobs.mounts.spits);
         if let Some(s) = spits.get_mut(i).filter(|s| !s.removed) {
-            self.spit_step(s, i);
+            self.spit_step(s);
         }
         spits.append(&mut self.mobs.mounts.spits);
         self.mobs.mounts.spits = spits;
     }
 
-    fn spit_step(&mut self, s: &mut Spit, i: usize) {
+    fn spit_step(&mut self, s: &mut Spit) {
         {
             // G3-F13: outside a "ticking entities" chunk, it waits.
             let ticking = self.entity_ticks_at(s.pos);
-            if self.meet(&mut s.rank, ticking, crate::walk::Fam::Spit, i) != crate::walk::Meet::Tick {
+            if self.meet(&mut s.rank, ticking, crate::walk::Fam::Spit) != crate::walk::Meet::Tick {
                 return;
             }
             s.tick += 1;

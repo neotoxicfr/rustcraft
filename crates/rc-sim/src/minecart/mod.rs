@@ -445,7 +445,7 @@ impl Server {
             return;
         }
         let ticking = self.entity_ticks_at(cart.pos);
-        if self.meet(&mut cart.rank, ticking, crate::walk::Fam::Cart, i) != crate::walk::Meet::Tick {
+        if self.meet(&mut cart.rank, ticking, crate::walk::Fam::Cart) != crate::walk::Meet::Tick {
             self.carts.list[i] = Some(cart);
             return;
         }

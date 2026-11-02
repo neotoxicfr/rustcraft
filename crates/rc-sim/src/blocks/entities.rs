@@ -580,7 +580,7 @@ impl Server {
         let Some(e) = self.bs.entities.list.get(i).filter(|e| !e.removed) else { return };
         // G3-F13: outside a "ticking entities" chunk, frozen.
         let (ticking, mut rank) = (self.entity_ticks_at(e.pos), e.rank);
-        let meet = self.meet(&mut rank, ticking, crate::walk::Fam::Sim, i);
+        let meet = self.meet(&mut rank, ticking, crate::walk::Fam::Sim);
         self.bs.entities.list[i].rank = rank;
         if meet != crate::walk::Meet::Tick {
             return;

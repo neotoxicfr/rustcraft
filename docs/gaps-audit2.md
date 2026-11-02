@@ -969,15 +969,24 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
 - **Scale of the refactor**: every family keeps its own list with batch phases around its loop (network tracking before the projectiles' and items' ticks, merging of the items after all of them, removals and tracking after the mobs, pearl chunk loading, contact flushes); a single walk needs each family's per-entity tick extracted, one insertion rank per entity (kept when an entity changes family slot, renewed when its chunk stops and starts ticking again), and those batch phases moved before or after the merged walk. About fifteen loops in `drops.rs`, `blocks/entities.rs`, `mobs/tick.rs`, `mobs/illagers/spells.rs`, `mobs/mounts/{llama,trap}.rs`, `mobs/end/*.rs`, `mobs/trial.rs`, `decoration/mod.rs`, `minecart/mod.rs`, `projectiles/{mod,cloud,fishing}.rs`, plus the mechanisms fingerprint to re-record. Plan: a rank counter per dimension stamped at insertion, a merged walk by rank over the families (k-way merge of lists already in rank order, no allocation in steady state), the batch phases kept around it.
 - **Done in L10-ORDER** (`crates/rc-sim/src/walk.rs`): one walk by rank over every family, the
   host player's own part of the world walk (mining progress, demo) at its rank (renewed at
-  respawn and dimension change); an entity leaving a ticking chunk leaves the list, back in one
-  it joins its end (ticked at the end of that walk, its family list re-sorted); phases run for a
-  whole family stay before the walk (network tracking, the player's parts read by the mobs and
-  projectiles) or after it (removals, item merge, pickups, the player's health, menus, mount,
-  pushes), as the player's own tick comes after the world in the game. Tests
+  respawn and dimension change, kept per player for LAN guests; a passenger host is ticked by its
+  mob or minecart, after the vehicle's own tick); an entity leaving a ticking chunk leaves the
+  list, and when its chunk ticks again it joins the end at the chunk source's step of the world
+  tick (`walk_rejoin`: before the walk and what is born in it; chunk by chunk, sections in the
+  game's order, then former order); moved into a ticking chunk during the walk, it joins the end
+  and ticks from the next walk. An item merges with its neighbours in its own tick, at its rank,
+  as in the game. Phases run for a whole family stay before the walk (network tracking; the
+  player's hand, memory, parrots, swimming and stingers, at their former place before the mobs;
+  its cushion seat) or after it (removals, the player's pickups, health, menus, item cooldowns
+  and use, mount, pushes): those are the player's own tick, which comes after the world. Tests
   `tests_l9tick::item_before_tnt_moves_on_the_next_tick` (no longer ignored) and
   `tests_l10order` (TNT minecart before an item, arrow and a mob summoned after it, an entity
-  back in a ticking chunk, two items on both sides of a TNT, equivalence of the two ways items
-  and orbs tick). Side effect checked against the game: the remount delay of a player getting
+  back in a ticking chunk and ranked before what the walk spawns, two items on both sides of a
+  TNT, equivalence of the two ways items and orbs tick, items merged before a hopper minecart
+  takes them, an orb born during the walk seen by a later merge, a shield disabled by a mob
+  ending after 99 more ticks, the player's rank at the start, after a respawn, back from another
+  dimension and in a minecart; `lan::tests_g3f05::guest_respawn_keeps_the_host_rank`). Side
+  effect checked against the game: the remount delay of a player getting
   off a minecart reads 59 at the end of that tick (dismount during the minecart's tick, countdown
   in the player's own tick after the world), 60 before. World fingerprints unchanged.
 - **Left after L10-ORDER**: (a) LAN guests still run their mining and demo in their own tick
@@ -986,7 +995,14 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   projectiles, minecarts, decorations), where the game adds them in the chunk's saved order
   across kinds (P3, only the first ticks after a load); (c) found on the way: ground items
   ignore `NoGravity` on the server (summon and chunk load: their physics body keeps gravity),
-  they fall (P2, `drops.rs` `spawn_item`, `commands/cmds_ents.rs` summon).
+  they fall (P2, `drops.rs` `spawn_item`, `commands/cmds_ents.rs` summon); (d) between two
+  chunks that tick again in the same tick, the game re-adds their entities in the order of its
+  chunk updates (its own hash order, not reproducible): we take that of their oldest entity, and
+  within a section their former rank instead of the order they entered that section (P3);
+  (e) the player's hand, memory, parrots, swimming and stingers still run before the mobs (their
+  place since S4), where the game counts them in the player's own tick after the world (P3, a
+  tick of delay at most on what mobs read of them); (f) a host seated on a cushion is not ticked
+  at the cushion's rank (its seat runs before the walk) (P3).
 - **Packed block entities** (P3, residue of L9-TICK): a block entity saved packed waits until its chunk can tick (3 × 3 loaded) or is saved (the save reads every block entity, which promotes it, `blocks/entities.rs` `promote_packed_for_save`). Not modelled: the game also promotes one as soon as anything reads it before then (a hopper of a ticking neighbour pulling from it, a comparator reading it), which moves its ticker's rank earlier. Fix: promote the waiting entry in the block entity accessors of `containers.rs` and the comparator reading.
 
 ## P3, per mission

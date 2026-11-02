@@ -323,7 +323,7 @@ impl Server {
     }
 
     /// Position of a decoration of the registry (searched first in its chunk).
-    fn live_pos(&mut self, i: usize) -> Option<[f64; 3]> {
+    pub(crate) fn live_pos(&mut self, i: usize) -> Option<[f64; 3]> {
         let (lid, lchunk) = (self.deco.live[i].id, self.deco.live[i].chunk);
         let near = self.entities.get(&lchunk).and_then(|v| v.iter().find(|(x, _)| *x == lid));
         let pos = match near {
@@ -592,8 +592,21 @@ impl Server {
         self.deco.live.get(i).map(|l| l.rank)
     }
 
+    pub(crate) fn deco_rank_mut(&mut self, i: usize) -> Option<&mut u64> {
+        self.deco.live.get_mut(i).map(|l| &mut l.rank)
+    }
+
     pub(crate) fn deco_resort(&mut self) {
         self.deco.live.sort_by_key(|l| l.rank);
+    }
+
+    /// A decoration at `pos` ticks: "entity ticking" chunk, simulated and its 8 neighbours
+    /// loaded (otherwise a support located in an absent neighbour would be read as void).
+    pub(crate) fn deco_ticks_at(&self, pos: [f64; 3]) -> bool {
+        let c = chunk_of(pos);
+        let loaded =
+            (-1..=1).all(|dx| (-1..=1).all(|dz| matches!(self.chunks.get(&(c.0 + dx, c.1 + dz)), Some(Some(_)))));
+        self.entities_tick_in(c) && loaded
     }
 
     /// Decoration of slot `i`, at its rank in the entity walk: under the world, survival every
@@ -608,13 +621,8 @@ impl Server {
             self.deco.live[i].removed = true;
             return;
         };
-        // "Entity ticking" chunk: simulated and its 8 neighbours loaded; otherwise a support
-        // located in an absent neighbour would be read as void.
-        let c = chunk_of(pos);
-        let loaded =
-            (-1..=1).all(|dx| (-1..=1).all(|dz| matches!(self.chunks.get(&(c.0 + dx, c.1 + dz)), Some(Some(_)))));
         let mut rank = self.deco.live[i].rank;
-        let meet = self.meet(&mut rank, self.entities_tick_in(c) && loaded, crate::walk::Fam::Deco, i);
+        let meet = self.meet(&mut rank, self.deco_ticks_at(pos), crate::walk::Fam::Deco);
         self.deco.live[i].rank = rank;
         if meet != crate::walk::Meet::Tick {
             return;

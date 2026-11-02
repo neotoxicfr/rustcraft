@@ -255,20 +255,20 @@ impl Server {
     pub(crate) fn fang_visit(&mut self, i: usize) {
         let mut list = std::mem::take(&mut self.mobs.ill.fangs);
         if let Some(f) = list.get_mut(i).filter(|f| !f.removed) {
-            self.fang_tick(f, i);
+            self.fang_tick(f);
         }
         list.append(&mut self.mobs.ill.fangs);
         self.mobs.ill.fangs = list;
     }
 
-    fn fang_tick(&mut self, f: &mut Fangs, i: usize) {
+    fn fang_tick(&mut self, f: &mut Fangs) {
         // L9-TICK: back in their world, the client has forgotten them (cleared at respawn).
         if !f.seen {
             self.fangs_pair(f);
         }
         // G3-F13: outside a "ticking entities" chunk, it waits.
         let ticking = self.entity_ticks_at(f.pos);
-        if self.meet(&mut f.rank, ticking, crate::walk::Fam::Fang, i) != crate::walk::Meet::Tick {
+        if self.meet(&mut f.rank, ticking, crate::walk::Fam::Fang) != crate::walk::Meet::Tick {
             return;
         }
         f.warmup -= 1;

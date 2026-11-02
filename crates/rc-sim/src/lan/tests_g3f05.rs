@@ -487,6 +487,24 @@ fn guest_minecart_ticks_guest() {
     assert_eq!(guest_pos, seat, "guest seated");
 }
 
+/// L10-ORDER: a guest's respawn renews its own rank in the world's entity list, not the host's
+/// (the rank is part of each player's state).
+#[test]
+fn guest_respawn_keeps_the_host_rank() {
+    let mut t = open("respawn-rank");
+    publish(&mut t, false);
+    let _g = join(&mut t, "Guest", 2);
+    let host = t.s.walk.player;
+    let before = t.s.lan.as_ref().unwrap().guests[0].ctx.as_ref().unwrap().walk_rank;
+    t.s.as_guest(0, |sv| {
+        sv.life.vit.dead = true;
+        sv.perform_respawn();
+    });
+    assert_eq!(t.s.walk.player, host, "host rank unchanged");
+    let after = t.s.lan.as_ref().unwrap().guests[0].ctx.as_ref().unwrap().walk_rank;
+    assert!(after > before, "guest rank renewed: {before} -> {after}");
+}
+
 /// Echo (pong) answered to the guest; chunks sent in batches bounded by its acknowledgements.
 #[test]
 fn echo_and_chunk_throughput() {

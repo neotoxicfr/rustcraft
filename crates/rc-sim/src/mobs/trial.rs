@@ -937,6 +937,14 @@ impl Server {
         self.mobs.spawners.blocks.items.get(i).map(|o| o.rank)
     }
 
+    pub(crate) fn ominous_pos(&self, i: usize) -> Option<[f64; 3]> {
+        self.mobs.spawners.blocks.items.get(i).map(|o| o.pos)
+    }
+
+    pub(crate) fn ominous_rank_mut(&mut self, i: usize) -> Option<&mut u64> {
+        self.mobs.spawners.blocks.items.get_mut(i).map(|o| &mut o.rank)
+    }
+
     pub(crate) fn ominous_resort(&mut self) {
         self.mobs.spawners.blocks.items.sort_by_key(|o| o.rank);
     }
@@ -948,7 +956,7 @@ impl Server {
         if let Some(o) = list.get_mut(i).filter(|o| !o.removed) {
             // Outside a "ticking entities" chunk, it waits (G3-F13).
             let ticking = self.entity_ticks_at(o.pos);
-            if self.meet(&mut o.rank, ticking, crate::walk::Fam::Ominous, i) == crate::walk::Meet::Tick {
+            if self.meet(&mut o.rank, ticking, crate::walk::Fam::Ominous) == crate::walk::Meet::Tick {
                 o.age += 1;
                 if o.age == o.after - 36 {
                     let at = center(block_of(o.pos));

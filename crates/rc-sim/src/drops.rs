@@ -20,16 +20,27 @@ const LIFETIME: i32 = 6000;
 
 #[cfg(test)]
 thread_local! {
-    /// Tests: items and orbs always ticked one by one (out of their slot), never by runs with
-    /// the list taken out (equivalence of the two ways, `tests_l10order`).
+    /// Tests: forces `RUSTCRAFT_OPT_ITEM_RUNS=0` in this thread (equivalence of the two ways,
+    /// `tests_l10order`), without touching the environment.
     pub(crate) static ONE_BY_ONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn one_by_one() -> bool {
+/// `RUSTCRAFT_OPT_ITEM_RUNS=N` (default 8): in the entity walk, a run of items or orbs of at least
+/// 1/N of their list ticks with the list taken out once; a shorter one, one by one out of its slot.
+/// `0`: always one by one (the first version of the walk). Read once.
+fn item_run_divisor() -> usize {
     #[cfg(test)]
-    return ONE_BY_ONE.with(std::cell::Cell::get);
-    #[cfg(not(test))]
-    false
+    if ONE_BY_ONE.with(std::cell::Cell::get) {
+        return 0;
+    }
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_ITEM_RUNS").and_then(|v| v.parse().ok()).unwrap_or(8))
+}
+
+/// The run from `start` to `stop` of a list of `len` entities ticks one by one.
+fn one_by_one(start: usize, stop: usize, len: usize) -> bool {
+    let n = item_run_divisor();
+    n == 0 || (stop - start) * n < len
 }
 
 /// Physics of a server item or orb (authoritative instance).
@@ -68,7 +79,7 @@ pub struct ItemEnt {
     pub fire: i32,
     fire_flag: bool,
     /// Rank in the entity walk (`walk::next_rank`), and "ticked this tick" (only a ticked item
-    /// merges its neighbours into itself).
+    /// goes through a portal, `drops_portal_tick`).
     pub(crate) rank: u64,
     pub(crate) ticked: bool,
 }
@@ -481,6 +492,25 @@ impl Server {
             fire_flag: false,
             rank: crate::walk::next_rank(),
         });
+        self.orb_joined();
+    }
+
+    /// The orb just pushed at the end of the list, during a walk whose merge buckets are built:
+    /// it joins its bucket, at the end like in the list (the merges later in this walk see it,
+    /// as the linear way does). List taken out for a run: buckets rebuilt at the next merge.
+    fn orb_joined(&mut self) {
+        if !self.walk.buckets_built {
+            return;
+        }
+        let (Some(o), false) = (self.life.orbs.last(), self.contact.orbs_taken) else {
+            self.walk.buckets_built = false;
+            return;
+        };
+        let (j, r) = (self.life.orbs.len() - 1, o.id.rem_euclid(40) as usize);
+        match self.contact.orb_buckets.get_mut(r) {
+            Some(b) => b.push(j as u32),
+            None => self.walk.buckets_built = false,
+        }
     }
 
     /// Orb summoned (`/summon`): value, count, age, health points and velocity from the NBT.
@@ -521,6 +551,7 @@ impl Server {
             fire_flag: false,
             rank: crate::walk::next_rank(),
         });
+        self.orb_joined();
         id
     }
 
@@ -635,7 +666,7 @@ impl Server {
         while stop < end && self.life.drops.get(stop).is_some_and(|d| d.rank < limit) {
             stop += 1;
         }
-        if (stop - start) * 8 < self.life.drops.len() || self.contact.items_taken || one_by_one() {
+        if one_by_one(start, stop, self.life.drops.len()) || self.contact.items_taken {
             for i in start..stop {
                 self.item_visit(i);
             }
@@ -647,9 +678,11 @@ impl Server {
         live.extend(drops.iter().map(|d| (d.pos, d.removed)));
         self.contact.live_items = live;
         self.contact.items_taken = true;
-        for (i, d) in drops.iter_mut().enumerate().take(stop).skip(start) {
-            if self.item_meets(d, i) {
-                self.item_tick(d, i);
+        for i in start..stop.min(drops.len()) {
+            let (left, rest) = drops.split_at_mut(i);
+            let (d, right) = rest.split_first_mut().expect("slot of the run");
+            if self.item_meets(d) {
+                self.item_tick(d, i, Some([left, right]));
             }
         }
         self.contact.items_taken = false;
@@ -666,7 +699,7 @@ impl Server {
         let Some(d) = self.life.drops.get(i).filter(|d| !d.removed) else { return };
         // G3-F13: outside a "ticking entities" chunk, no tick (and no merge into it) this tick.
         let (ticking, mut rank) = (self.entity_ticks_at(d.pos), d.rank);
-        let meet = self.meet(&mut rank, ticking, crate::walk::Fam::Item, i);
+        let meet = self.meet(&mut rank, ticking, crate::walk::Fam::Item);
         self.life.drops[i].rank = rank;
         if meet != crate::walk::Meet::Tick {
             return;
@@ -675,7 +708,7 @@ impl Server {
         let mut d = std::mem::replace(&mut self.life.drops[i], spare);
         d.ticked = true;
         self.contact.ticking_item = Some((d.pos, false));
-        self.item_tick(&mut d, i);
+        self.item_tick(&mut d, i, None);
         self.contact.ticking_item = None;
         if let Some(slot) = self.life.drops.get_mut(i) {
             self.walk.spare_item = Some(std::mem::replace(slot, d));
@@ -683,13 +716,13 @@ impl Server {
     }
 
     /// The item of slot `i` met by the walk ticks now (G3-F13: not outside a "ticking entities"
-    /// chunk, no merge into it then); marked "ticked".
-    fn item_meets(&mut self, d: &mut ItemEnt, i: usize) -> bool {
+    /// chunk).
+    fn item_meets(&mut self, d: &mut ItemEnt) -> bool {
         if d.removed {
             return false;
         }
         let ticking = self.entity_ticks_at(d.pos);
-        d.ticked = self.meet(&mut d.rank, ticking, crate::walk::Fam::Item, i) == crate::walk::Meet::Tick;
+        d.ticked = self.meet(&mut d.rank, ticking, crate::walk::Fam::Item) == crate::walk::Meet::Tick;
         d.ticked
     }
 
@@ -704,7 +737,9 @@ impl Server {
         }
     }
 
-    fn item_tick(&mut self, d: &mut ItemEnt, i: usize) {
+    /// Tick of the item of slot `i`, out of its list: `taken`, the slots before and after it
+    /// when the list is taken out for a run; `None`, it sits in place (a placeholder in slot `i`).
+    fn item_tick(&mut self, d: &mut ItemEnt, i: usize, taken: Option<[&mut [ItemEnt]; 2]>) {
         {
             d.ticks += 1;
             // G5-F05: fire at the start of its tick (an immune stack is put out).
@@ -761,6 +796,16 @@ impl Server {
             }
             // G5-F02e: plates and tripwire right after its movement (the following ones not moved yet).
             self.contact_triggers(old, d.pos, ITEM_SIZE / 2.0, ITEM_SIZE);
+            // Merge with its neighbours in its own tick, before its age moves (every 2 ticks
+            // when it changed block, otherwise 40).
+            d.moved = (0..3).any(|a| old[a].floor() != d.pos[a].floor());
+            if d.ticks % if d.moved { 2 } else { 40 } == 0 {
+                self.item_merge(d, i, taken);
+                if d.removed {
+                    self.item_seen(i, d.pos, true);
+                    return;
+                }
+            }
             if d.age != -32768 {
                 d.age += 1;
             }
@@ -768,56 +813,79 @@ impl Server {
                 d.removed = true;
                 self.item_seen(i, d.pos, true);
             }
-            let moved = (0..3).any(|a| old[a].floor() != d.pos[a].floor());
-            d.moved = moved;
         }
     }
 
-    /// After the walk: merge of the items (every 2 ticks while moving, 40 at rest), pickup by the
-    /// player, then the orbs' pickup, removals.
-    pub(crate) fn drops_post(&mut self) {
-        let mut drops = std::mem::take(&mut self.life.drops);
-        let n = drops.len();
-        for i in 0..n {
-            let rate = if drops[i].moved { 2 } else { 40 };
-            if drops[i].removed || !drops[i].ticked || drops[i].ticks % rate != 0 {
-                continue;
-            }
-            for j in 0..n {
-                if i == j || drops[j].removed || drops[i].removed {
-                    continue;
-                }
-                let (a, b) = (&drops[i], &drops[j]);
-                let max = self.life.items.max_stack(&a.stack);
-                // Neither pickup blocked (32767) nor eternal item (age −32768): never merged.
-                let mergeable =
-                    |e: &ItemEnt| e.pickup_delay != 32767 && e.age != -32768 && e.age < LIFETIME && e.stack.count < max;
-                let near = (a.pos[0] - b.pos[0]).abs() <= ITEM_SIZE + 0.5
-                    && (a.pos[2] - b.pos[2]).abs() <= ITEM_SIZE + 0.5
-                    && (a.pos[1] - b.pos[1]).abs() <= ITEM_SIZE;
-                if !near
-                    || !mergeable(a)
-                    || !mergeable(b)
-                    || !same(&a.stack, &b.stack)
-                    || a.stack.count + b.stack.count > max
+    /// Merge of the ticking item `d` (slot `i`) with the items around it, in list order, then
+    /// those born during this walk: the biggest stack absorbs the smallest (`d` absorbed at
+    /// equal counts), stops once `d` is gone. `taken`: see `item_tick`; the items it removes are
+    /// marked in `contact.live_items` for the plates.
+    fn item_merge(&mut self, d: &mut ItemEnt, i: usize, taken: Option<[&mut [ItemEnt]; 2]>) {
+        // In place: the whole list (placeholder in slot `i`); run: the items born since it began.
+        let mut rest = std::mem::take(&mut self.life.drops);
+        if let Some([left, right]) = taken {
+            let slots = left.iter_mut().enumerate().chain(right.iter_mut().enumerate().map(|(k, o)| (i + 1 + k, o)));
+            for (j, o) in slots {
+                if self.item_merge_pair(d, o)
+                    && let Some(l) = self.contact.live_items.get_mut(j)
                 {
-                    continue;
+                    l.1 = true;
                 }
-                // The biggest stack absorbs the smallest.
-                let (to, from) = if b.stack.count < a.stack.count { (i, j) } else { (j, i) };
-                let moved = drops[from].stack.count.min(max.min(64) - drops[to].stack.count);
-                drops[to].stack.count += moved;
-                drops[from].stack.count -= moved;
-                drops[to].pickup_delay = drops[to].pickup_delay.max(drops[from].pickup_delay);
-                drops[to].age = drops[to].age.min(drops[from].age);
-                let net = self.net(Some(&drops[to].stack));
-                let _ = self
-                    .send(Event::Entity(EntityEvent::Data { id: drops[to].id, values: vec![(8, Meta::Item(net))] }));
-                if drops[from].stack.count <= 0 {
-                    drops[from].removed = true;
+                if d.removed {
+                    break;
                 }
             }
         }
+        if !d.removed {
+            for o in &mut rest {
+                self.item_merge_pair(d, o);
+                if d.removed {
+                    break;
+                }
+            }
+        }
+        rest.append(&mut self.life.drops);
+        self.life.drops = rest;
+    }
+
+    /// One merge between the ticking item `d` and `o`; true when `o` was absorbed whole.
+    fn item_merge_pair(&mut self, d: &mut ItemEnt, o: &mut ItemEnt) -> bool {
+        if o.removed || d.removed {
+            return false;
+        }
+        let max = self.life.items.max_stack(&d.stack);
+        // Neither pickup blocked (32767) nor eternal item (age −32768): never merged.
+        let mergeable = |e: &ItemEnt| e.pickup_delay != 32767 && e.age != -32768 && e.age < LIFETIME && e.stack.count < max;
+        let near = (d.pos[0] - o.pos[0]).abs() <= ITEM_SIZE + 0.5
+            && (d.pos[2] - o.pos[2]).abs() <= ITEM_SIZE + 0.5
+            && (d.pos[1] - o.pos[1]).abs() <= ITEM_SIZE;
+        if !near
+            || !mergeable(d)
+            || !mergeable(o)
+            || !same(&d.stack, &o.stack)
+            || d.stack.count + o.stack.count > max
+        {
+            return false;
+        }
+        // The biggest stack absorbs the smallest.
+        let (to, from) = if o.stack.count < d.stack.count { (&mut *d, &mut *o) } else { (&mut *o, &mut *d) };
+        let moved = from.stack.count.min(max.min(64) - to.stack.count);
+        to.stack.count += moved;
+        from.stack.count -= moved;
+        to.pickup_delay = to.pickup_delay.max(from.pickup_delay);
+        to.age = to.age.min(from.age);
+        let net = self.net(Some(&to.stack));
+        let _ = self.send(Event::Entity(EntityEvent::Data { id: to.id, values: vec![(8, Meta::Item(net))] }));
+        if from.stack.count <= 0 {
+            from.removed = true;
+        }
+        o.removed
+    }
+
+    /// After the walk: pickup by the player (its own tick, after the world), then the orbs'
+    /// pickup, removals.
+    pub(crate) fn drops_post(&mut self) {
+        let mut drops = std::mem::take(&mut self.life.drops);
         // Pickup: player box inflated by 1 / 0.5 / 1.
         let alive = !self.life.vit.dead && self.game_mode != 3 && self.player_ready();
         if alive {
@@ -935,7 +1003,7 @@ impl Server {
         while stop < end && self.life.orbs.get(stop).is_some_and(|o| o.rank < limit) {
             stop += 1;
         }
-        if (stop - start) * 8 < self.life.orbs.len() || self.contact.orbs_taken || one_by_one() {
+        if one_by_one(start, stop, self.life.orbs.len()) || self.contact.orbs_taken {
             for i in start..stop {
                 self.orb_visit(i);
             }
@@ -948,7 +1016,7 @@ impl Server {
         self.contact.live_orbs = live;
         self.contact.orbs_taken = true;
         for i in start..stop.min(orbs.len()) {
-            if !self.orb_meets(&mut orbs[i], i) {
+            if !self.orb_meets(&mut orbs[i]) {
                 continue;
             }
             let gone = self.orb_fire(&mut orbs[i], i);
@@ -972,7 +1040,7 @@ impl Server {
         let Some(o) = self.life.orbs.get(i).filter(|o| !o.removed) else { return };
         // G3-F13: outside a "ticking entities" chunk, it waits.
         let (ticking, mut rank) = (self.entity_ticks_at(o.pos), o.rank);
-        let meet = self.meet(&mut rank, ticking, crate::walk::Fam::Orb, i);
+        let meet = self.meet(&mut rank, ticking, crate::walk::Fam::Orb);
         self.life.orbs[i].rank = rank;
         if meet != crate::walk::Meet::Tick {
             return;
@@ -1000,12 +1068,12 @@ impl Server {
 
     /// The orb of slot `i` met by the walk ticks now (G3-F13: not outside a "ticking entities"
     /// chunk).
-    fn orb_meets(&mut self, o: &mut Orb, i: usize) -> bool {
+    fn orb_meets(&mut self, o: &mut Orb) -> bool {
         if o.removed {
             return false;
         }
         let ticking = self.entity_ticks_at(o.pos);
-        self.meet(&mut o.rank, ticking, crate::walk::Fam::Orb, i) == crate::walk::Meet::Tick
+        self.meet(&mut o.rank, ticking, crate::walk::Fam::Orb) == crate::walk::Meet::Tick
     }
 
     /// Position and removal of the orb of slot `i` being ticked, as the plates see them.

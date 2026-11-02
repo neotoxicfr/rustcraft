@@ -3314,9 +3314,9 @@ rounds, minimum of 5 passes of 400 ticks per scene, loaded machine (other agents
 - Design: a rank per entity (stamped when it enters its family's list, renewed when it comes
   back into a ticking chunk), each family list kept in rank order, a k-way merge of the lists by
   runs; the heads of the families of the walk that have entities are cached (one rank read per
-  step, not one per family). No allocation in steady state (late list, live position lists and
-  item/orb placeholders reused); a family is re-sorted (stable sort) only on a tick where one of
-  its entities came back.
+  step, not one per family). No allocation in steady state (live position lists and item/orb
+  placeholders reused); a family is re-sorted (stable sort) only on a tick where one of its
+  entities came back.
 - Five families interleaved (worst case: ranks alternate, one run per entity): 1,382-1,402 µs
   before, 1,430-1,447 µs after per server tick (+3.4 %, about 50 ns per entity). This is the
   price of the order itself: the walk changes family at every entity (code and data of five
@@ -3348,6 +3348,21 @@ rounds, minimum of 5 passes of 400 ticks per scene, loaded machine (other agents
   beside each family list (no read through a mob's box): not tried, the mob's rank line is read by
   its visit anyway. To re-measure on a quiet machine: this bench (both scenes), then scenes
   `crowd`, `tnt`, `redstone`, `village` of `tools/bench/scenes.py`.
-- Memory: 8 bytes per entity (rank), a removed flag per bolt and ominous item spawner, the late
-  list, two placeholders (item, orb). Multi-core, GPU: not applicable (the order is observable
-  by the player and by a server, the walk is sequential by definition).
+- Memory: 8 bytes per entity (rank), a removed flag per bolt and ominous item spawner, the list
+  of entities out of the list (16 bytes each, only those outside a ticking chunk), two
+  placeholders (item, orb). Multi-core, GPU: not applicable (the order is observable by the
+  player and by a server, the walk is sequential by definition).
+- Review fixes (02/11, loaded machine, same bench, one executable, switch alternated, two
+  rounds): the item merge moved from after the walk into the item's own tick (same pairs
+  tested, the list taken out once per due merge when ticked one by one); orbs born during the
+  walk join the built merge buckets (O(1) per birth); entities back in a ticking chunk re-ranked
+  by a pass at the chunk source's step (one emptiness test per tick when nothing is out, a
+  binary search per entity out otherwise); player cooldowns counted after the walk (no cost).
+  New switch `RUSTCRAFT_OPT_ITEM_RUNS=N` (default 8: a run of at least 1/N of the list ticks
+  with the list taken out; 0: always one by one, the first version): default against 0,
+  interleaved 1,455-1,474 / 1,455-1,481 µs (equal: its runs are short, one by one either way),
+  items alone 931-944 / 937-948 (0 costs +0.5-1 %), orbs alone 1,171-1,193 / 1,202-1,217 (+2 %),
+  grouped and TNT equal; `1000` (any run taken out): interleaved 1,532-1,656 (+5 %, the
+  O(list) setup paid per one-entity run), items and orbs alone 929-933 and 1,164-1,177 (within
+  1 % of the default). Default 8 kept; both other ways stay behind the switch for the
+  quiet-machine scenes (`crowd`, `village`, `tnt`).

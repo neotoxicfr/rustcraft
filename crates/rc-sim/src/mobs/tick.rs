@@ -90,8 +90,9 @@ impl Server {
             return;
         }
         let ticking = self.entity_ticks_at(m.pos); // F15: arena ticket included
-        // Back in a ticking chunk: at the end of the walk (despawn check included).
-        if self.meet(&mut m.rank, ticking, crate::walk::Fam::Mob, i) == crate::walk::Meet::Late {
+        // Back in a ticking chunk during the walk: in the list from the next walk (despawn
+        // check included).
+        if self.meet(&mut m.rank, ticking, crate::walk::Fam::Mob) == crate::walk::Meet::Joined {
             self.mobs.list[i] = Some(m);
             return;
         }

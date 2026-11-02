@@ -878,7 +878,6 @@ impl Server {
     /// item in use), then network tracking, like the official server: the client receives the
     /// state of the previous tick then does the current tick itself.
     pub(crate) fn proj_pre(&mut self, runs: bool) {
-        self.proj_player_tick();
         self.proj_track();
         if runs {
             self.load_pearl_chunks(); // G3-F13: a pearl beyond the loaded chunks keeps flying
@@ -895,12 +894,14 @@ impl Server {
         self.proj.list = list;
     }
 
-    /// After the entity walk: removed clouds, the player's pickups and spin attack, removed
-    /// projectiles.
+    /// After the entity walk: removed clouds, the player's own part (item cooldowns, use, stuck
+    /// arrows, gliding: its tick comes after the world, so what the walk sets this tick counts
+    /// down from the next one), its pickups and spin attack, removed projectiles.
     pub(crate) fn proj_post(&mut self, runs: bool) {
         if runs {
             self.clouds_post();
         }
+        self.proj_player_tick();
         self.proj_player_touch();
         self.spin_attack_tick();
         self.proj_retain();
@@ -975,7 +976,7 @@ impl Server {
         // G3-F13: outside a "ticking entities" chunk (or one not loaded), it waits; a player's
         // pearl ticks in the chunks of its own ticket (L9-TICK).
         let (ticking, mut rank) = (self.entity_ticks_at(slot.pos), slot.rank);
-        let meet = self.meet(&mut rank, ticking, crate::walk::Fam::Proj, i);
+        let meet = self.meet(&mut rank, ticking, crate::walk::Fam::Proj);
         self.proj.list[i].rank = rank;
         if meet != crate::walk::Meet::Tick {
             return;

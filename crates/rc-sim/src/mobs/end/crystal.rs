@@ -115,7 +115,7 @@ impl Server {
         let Some(c) = self.mobs.end.crystals.get(i).filter(|c| !c.removed) else { return };
         // G3-F13: a crystal outside a "ticking entities" chunk waits (age included).
         let (ticking, mut rank) = (self.entity_ticks_at(c.pos), c.rank);
-        let meet = self.meet(&mut rank, ticking, crate::walk::Fam::Crystal, i);
+        let meet = self.meet(&mut rank, ticking, crate::walk::Fam::Crystal);
         let c = &mut self.mobs.end.crystals[i];
         c.rank = rank;
         if meet != crate::walk::Meet::Tick {
