@@ -2984,6 +2984,56 @@ bench_g3f13 -- --ignored --nocapture`), loaded machine (other agents compiling).
   Command-time only. Biome tests of the structure generators go through one helper (`biome_ok`):
   a command placement skips the biome lookup altogether; world generation unchanged (equivalence
   tests of the starts and placements pass with their stored fingerprints).
+
+## L9-STRUCT: features and structures replayed into the live world (02/11, loaded machine)
+
+- Features of bone meal, saplings and `place feature` now replay the region's journal (the
+  structure path's `Region::live_log`) with each write's own flags, breaks and direct section
+  writes, instead of comparing the 9 copies with the world (fidelity fix). The comparison (0.12 to
+  0.13 ms per placement, 9 chunks, section against section) is gone; the replay costs what the
+  game's own writes cost (neighbour updates of the trees, flag 19). Bench
+  `g6f07_tests::bench_g6f07_deco_copy_and_compare` (`--ignored`, best of 30, other agents
+  compiling), main → this branch with `RUSTCRAFT_OPT_DECO_PRIME=0`: complete oak placement 3.17 to
+  3.29 ms → 3.03 to 3.08 ms; `tests_g6f14::bench_place_jigsaw` 13.9 to 14.0 ms → 13.3 to 13.5 ms.
+- Hot spot found by splitting the bench: the region copy of 9 chunks takes 2.2 to 2.6 ms of the
+  3.1 ms oak placement, almost all of it in the six height maps, each walked from the top of the
+  world down every column (6 × 256 × up to 384 cells per chunk); unpacking the sections is
+  0.11 ms. Leads:
+  - one walk per column for the six maps, started at the top of the highest section that is not
+    all air (no map counts air), switch `RUSTCRAFT_OPT_DECO_PRIME` (default 1). Same heights
+    (tests `prime_many_matches_prime_per_map`, random columns, and
+    `deco_chunk_one_walk_matches_per_map`, built, flat and unloaded chunks). Alternated A/B, two
+    passes each: region copy 2.22 / 2.58 ms → 0.20 / 0.21 ms; oak placement 3.03 / 3.08 ms →
+    0.29 / 0.29 ms; bone meal on a grass field (up to 128 feature placements) 33.5 / 34.3 ms →
+    2.38 / 2.39 ms (a single click took two thirds of a tick before); `place jigsaw` of the outpost
+    base plate 13.3 / 13.5 ms → 1.75 / 1.75 ms. Kept, on by default.
+  - region copies on several threads (B4): spawned threads in the bench, 9 chunks: 1 / 2 / 4 / 8
+    threads 0.27-0.29 / 0.17-0.21 / 0.16-0.22 / 0.17-0.27 ms against 0.21 ms on the server thread
+    alone: the spawn eats the gain at this size. Built for the grids of live structures (16 chunks
+    or more, `RUSTCRAFT_THREADS` or the logical cores, `std::thread::scope`, not the rayon pool
+    that the generation thread keeps busy), switch `RUSTCRAFT_OPT_DECO_PAR` (default 0); `place
+    jigsaw` 1.76 / 1.95 ms on, 1.85 / 1.89 ms off: under the noise; kept off behind its switch
+    until the quiet-machine bench (C6). Same copies in the same order (test
+    `region_copies_on_threads_match_one_thread`, 2, 4 and 7 threads).
+  - same pattern in world generation (B6): the final height maps of every generated chunk (and
+    the generation maps of a flat chunk) were walked map by map from the top. One walk per column
+    from the highest slice of 16 that is not all plain air (`DecoChunk::top_non_air`, one slice
+    comparison each), switch `RUSTCRAFT_OPT_PRIME_ONE_WALK` (default 1). Bench
+    `templ_tests::bench_prime_final` (25 chunks, best of 20, two runs): noise terrain 4.69 / 4.75 ms
+    → 0.48 / 0.50 ms (0.19 → 0.02 ms per chunk), flat 6.64 / 6.73 ms → 0.55 / 0.57 ms. Same heights
+    (test `generated_heightmaps_one_walk_match`, three seeds and flat, 25 chunks each; the stored
+    fingerprints of generation pass). Kept, on by default; scene bench (chunk loading) to run on a
+    quiet machine.
+  - GPU not applicable (a few hundred kilobytes copied and walked once, result needed at once by
+    the server thread). Not built: reusing the 9 copies across the 128 attempts of a grass bone
+    meal (the copies would have to follow the live side effects of each replay); lazy height
+    maps (a branch on every height read of the decoration hot path).
+- `place jigsaw` and the jigsaw block load the chunks under their pieces before copying them
+  (disk, otherwise the generation thread is awaited, like the game's direct chunk access); only
+  when the command reaches unloaded chunks. The wait of `load_now` (portal search too) now wakes on
+  the generation thread's channel instead of polling every millisecond: same result, no busy loop.
+- Live structures journal a barrier (24 bytes) before each block entity of a template; command
+  time only, nothing on world generation (no journal there).
 ## G3-F08: compute, posteffect, fetchprofile, attribute reset, loot targets (02/11, loaded machine)
 
 - Numeric providers (`rc_sim::loot`, every loot draw): the unchecked reading now carries the

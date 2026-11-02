@@ -18,6 +18,21 @@ use crate::blocks::flag;
 use crate::server::Server;
 use crate::tr;
 
+/// `RUSTCRAFT_OPT_DECO_PRIME` (default 1; `0`: one walk per map from the top of the world): the
+/// height maps of a region copy (features of bone meal and commands, live structures) in a single
+/// walk down each column, from the highest section that is not all air. Same heights.
+fn deco_prime() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    crate::generation::opt_switch(&C, "RUSTCRAFT_OPT_DECO_PRIME", true)
+}
+
+/// `RUSTCRAFT_OPT_DECO_PAR` (default 0 until the quiet-machine bench; `1`: on): the region
+/// copies of a live structure of 16 chunks or more shared among threads.
+fn deco_par() -> bool {
+    static C: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    crate::generation::opt_switch(&C, "RUSTCRAFT_OPT_DECO_PAR", false)
+}
+
 /// Generation data kept for `place` (loaded on first request).
 pub struct PlaceData {
     pub dim: String,
@@ -74,6 +89,10 @@ impl Server {
     /// shape updates of the neighbours; neighbour updates of the templates without known shape),
     /// followed by the ticks, block entity data and entities. No post-processing pass: the live
     /// world's chunks drop the marks (game quirk). Randomness drawn from the world's.
+    /// The game writes the pieces straight into the live world, which loads (generating it if
+    /// needed) every chunk it touches: the chunks under the pieces are loaded first, and a journal
+    /// that still reaches an unloaded chunk (feature of a pool element) loads it and starts the
+    /// placement over on fresh copies, with the same draws.
     /// `reference`: position handed to the processors (`None`: the world generation's).
     pub(crate) fn place_start_live(
         &mut self,
@@ -84,20 +103,61 @@ impl Server {
         reference: Option<[i32; 3]>,
     ) -> bool {
         let (Some(sg), Some(deco)) = (dg.structures.clone(), dg.deco.clone()) else { return false };
+        let mut under: Vec<(i32, i32)> = Vec::new();
+        for p in &st.pieces {
+            let b = p.bbox();
+            for cz in (b.min[2] >> 4)..=(b.max[2] >> 4) {
+                under.extend(((b.min[0] >> 4)..=(b.max[0] >> 4)).map(|cx| (cx, cz)));
+            }
+        }
+        under.sort_unstable();
+        under.dedup();
+        self.load_now(&under);
+        let hi = i64::from(self.bs.rng.next_int());
+        let seed = (hi << 32).wrapping_add(i64::from(self.bs.rng.next_int()));
+        let mut rounds = 0;
+        let (grid, ops) = loop {
+            let (grid, ops) = self.start_ops(wd, dg, &sg, &deco, st, seed, keep, reference);
+            let mut reach: Vec<(i32, i32)> =
+                ops.iter().map(|op| (op.pos()[0] >> 4, op.pos()[2] >> 4)).filter(|c| !self.chunk_present(*c)).collect();
+            reach.sort_unstable();
+            reach.dedup();
+            rounds += 1;
+            if reach.is_empty() || rounds == 3 {
+                break (grid, ops);
+            }
+            self.load_now(&reach);
+            if !reach.iter().any(|c| self.chunk_present(*c)) {
+                break (grid, ops);
+            }
+        };
+        self.replay_live(ops);
+        self.deco_finish(&grid, &wd.blocks);
+        true
+    }
+
+    /// Placement of a start on copies of the chunks of its box and their border (see
+    /// [`Server::place_start_live`]): the copies and the journal of the placements.
+    #[allow(clippy::too_many_arguments)]
+    fn start_ops(
+        &self,
+        wd: &WorldData,
+        dg: &DimGen,
+        sg: &rc_worldgen::structure::StructureGen,
+        deco: &rc_worldgen::decor::Decorator,
+        st: &Start,
+        seed: i64,
+        keep: bool,
+        reference: Option<[i32; 3]>,
+    ) -> (Vec<DecoChunk>, Vec<LiveOp>) {
         let bb = st.bbox;
         let (c0, c1) = ((bb.min[0] >> 4, bb.min[2] >> 4), (bb.max[0] >> 4, bb.max[2] >> 4));
         let (gx0, gz0) = (c0.0 - 1, c0.1 - 1);
         let w = c1.0 - c0.0 + 3;
         let h = c1.1 - c0.1 + 3;
-        let mut grid: Vec<DecoChunk> = Vec::with_capacity((w * h) as usize);
-        for dz in 0..h {
-            for dx in 0..w {
-                grid.push(self.deco_chunk(gx0 + dx, gz0 + dz, dg, wd));
-            }
-        }
-        let hi = i64::from(self.bs.rng.next_int());
-        let mut rng =
-            rc_worldgen::decor_rng::DecoRng::legacy((hi << 32).wrapping_add(i64::from(self.bs.rng.next_int())));
+        let cells: Vec<(i32, i32)> = (0..h).flat_map(|dz| (0..w).map(move |dx| (gx0 + dx, gz0 + dz))).collect();
+        let mut grid = self.copy_chunks(&cells, dg, wd);
+        let mut rng = rc_worldgen::decor_rng::DecoRng::legacy(seed);
         let (min_y, top) = (self.dim.height.min_y, self.top_y());
         let idx = |x: i32, z: i32| ((z - gz0) * w + (x - gx0)) as usize;
         let mut ops: Vec<LiveOp> = Vec::new();
@@ -108,68 +168,117 @@ impl Server {
                 let Ok(refs) = grid.get_disjoint_mut(ids) else { continue };
                 let mut r = Region::new(refs, &wd.blocks, dg.sea_level, dg.seed);
                 r.live_log = Some(std::mem::take(&mut ops));
-                let mut ctx = rc_worldgen::decor::Ctx::new(&mut r, &deco);
+                let mut ctx = rc_worldgen::decor::Ctx::new(&mut r, deco);
                 let zone = BBox::new([cx * 16, min_y, cz * 16], [cx * 16 + 15, top, cz * 16 + 15]);
-                rc_worldgen::structure_place::place_start_zone(&mut ctx, &sg, st, &mut rng, zone, keep, reference);
+                rc_worldgen::structure_place::place_start_zone(&mut ctx, sg, st, &mut rng, zone, keep, reference);
                 ops = r.live_log.take().unwrap_or_default();
             }
         }
-        for dc in &grid {
-            for &(p, _) in &dc.destroyed {
-                self.destroy_block(p, true, 512);
-            }
-        }
+        (grid, ops)
+    }
+
+    /// Journal of a feature or a structure replayed into the live world in its order, each step
+    /// with its own effects; the steps of an unloaded chunk are dropped. Returns the number of
+    /// placements that changed a cell.
+    pub(crate) fn replay_live(&mut self, ops: Vec<LiveOp>) -> usize {
+        let mut n = 0;
         for op in ops {
+            let p = op.pos();
+            if !self.is_loaded(p) {
+                continue;
+            }
             match op {
-                LiveOp::Set(p, s, f) if self.chunk_loaded_xz(p[0], p[2]) => {
-                    self.set_block(p, s, f);
-                }
-                LiveOp::Notify(p) if self.chunk_loaded_xz(p[0], p[2]) => {
+                LiveOp::Set(_, s, f) => n += usize::from(self.set_block(p, s, f)),
+                LiveOp::Notify(_) => {
                     let b = self.v().block(self.get(p));
                     self.update_neighbors_at(p, b);
                 }
-                _ => {}
+                LiveOp::Destroy(_) => {
+                    self.destroy_block(p, true, 512);
+                }
+                LiveOp::Raw(_, s) => self.write_section_only(p, s),
             }
         }
-        self.deco_ticks(&grid, &wd.blocks);
-        for dc in &grid {
-            if !matches!(self.chunks.get(&(dc.cx, dc.cz)), Some(Some(_))) {
-                continue;
-            }
-            for (p, d) in &dc.be_data {
-                if self.be_get(*p).is_some() {
-                    let mut f = Vec::new();
-                    crate::generation_nbt::be_extra_fields(d, &mut f);
-                    self.set_block_data(*p, Nbt::Compound(f));
-                }
-            }
-            let src = self.player_source();
-            for e in &dc.entities {
-                let ty = e.get("id").and_then(Nbt::as_str).unwrap_or("").to_owned();
-                if crate::mobs::species::Kind::from_name(&ty).is_some() {
-                    self.next_entity += 1;
-                    let n = self.next_entity;
-                    let _ = self.adopt_with_passengers(n, e, None);
-                } else if let Some(pos) = crate::nbtio::f64s::<3>(e.get("Pos")) {
-                    let _ = self.summon_entity(&src, &ty, pos, Some(e.clone()));
-                }
-            }
-        }
-        true
+        n
     }
 
     fn chunk_loaded_xz(&self, x: i32, z: i32) -> bool {
-        matches!(self.chunks.get(&(x >> 4, z >> 4)), Some(Some(_)))
+        self.chunk_present((x >> 4, z >> 4))
+    }
+
+    fn chunk_present(&self, c: (i32, i32)) -> bool {
+        matches!(self.chunks.get(&c), Some(Some(_)))
     }
 
     /// Decoration chunk copied from a loaded chunk (blocks, biomes, heightmaps).
     pub(crate) fn deco_chunk(&self, cx: i32, cz: i32, dg: &DimGen, wd: &WorldData) -> DecoChunk {
-        let h = self.dim.height;
+        self.deco_chunk_with(cx, cz, dg, wd, deco_prime())
+    }
+
+    /// Region copies of `cells`, in order: shared among threads for a large grid when
+    /// `RUSTCRAFT_OPT_DECO_PAR=1` (`RUSTCRAFT_THREADS`, otherwise the logical cores), one after
+    /// the other otherwise.
+    fn copy_chunks(&self, cells: &[(i32, i32)], dg: &DimGen, wd: &WorldData) -> Vec<DecoChunk> {
+        let threads = if deco_par() && cells.len() >= 16 {
+            rc_data::env_str!("RUSTCRAFT_THREADS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get))
+                .clamp(1, cells.len() / 4)
+        } else {
+            1
+        };
+        self.copy_chunks_on(cells, dg, wd, threads)
+    }
+
+    /// [`Server::copy_chunks`] on `threads` threads.
+    pub(crate) fn copy_chunks_on(&self, cells: &[(i32, i32)], dg: &DimGen, wd: &WorldData, threads: usize) -> Vec<DecoChunk> {
+        if threads <= 1 {
+            return cells.iter().map(|&(cx, cz)| self.deco_chunk(cx, cz, dg, wd)).collect();
+        }
+        let (data, states, h, one_walk) = (&*self.data, &*self.states, self.dim.height, deco_prime());
+        let live: Vec<Option<&crate::chunk::Chunk>> =
+            cells.iter().map(|c| self.chunks.get(c).and_then(Option::as_deref)).collect();
+        let per = cells.len().div_ceil(threads);
+        std::thread::scope(|sc| {
+            let parts: Vec<_> = cells
+                .chunks(per)
+                .zip(live.chunks(per))
+                .map(|(cs, ls)| {
+                    sc.spawn(move || {
+                        cs.iter()
+                            .zip(ls)
+                            .map(|(&c, &l)| Self::copy_chunk(data, states, h, l, c, dg, wd, one_walk))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            parts.into_iter().flat_map(|p| p.join().expect("region copy thread")).collect()
+        })
+    }
+
+    /// [`Server::deco_chunk`], height maps in one walk per column (`one_walk`) or one per map.
+    pub(crate) fn deco_chunk_with(&self, cx: i32, cz: i32, dg: &DimGen, wd: &WorldData, one_walk: bool) -> DecoChunk {
+        let live = self.chunks.get(&(cx, cz)).and_then(Option::as_deref);
+        Self::copy_chunk(&self.data, &self.states, self.dim.height, live, (cx, cz), dg, wd, one_walk)
+    }
+
+    /// Region copy of a chunk (`live`: `None` for a chunk that is not loaded, all air); only
+    /// shared data, so that copies can be made on several threads.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn copy_chunk(
+        data: &rc_data::VersionData,
+        states: &crate::states::States,
+        h: crate::chunk::Height,
+        live: Option<&crate::chunk::Chunk>,
+        (cx, cz): (i32, i32),
+        dg: &DimGen,
+        wd: &WorldData,
+        one_walk: bool,
+    ) -> DecoChunk {
         let mut dc = DecoChunk::new(cx, cz, h.min_y, h.sections as i32 * 16);
-        let air = self.states.air_state;
-        dc.blocks.fill(air);
-        let conv = crate::generation_nbt::Conv::new(&self.data, &self.states, &wd.blocks, h, &dg.biome_names);
-        if let Some(Some(c)) = self.chunks.get(&(cx, cz)) {
+        dc.blocks.fill(states.air_state);
+        let conv = crate::generation_nbt::Conv::new(data, states, &wd.blocks, h, &dg.biome_names);
+        if let Some(c) = live {
             for (si, sec) in c.sections.iter().enumerate() {
                 sec.blocks.unpack_into(&mut dc.blocks[si * 4096..(si + 1) * 4096]);
                 for i in 0..64 {
@@ -178,75 +287,39 @@ impl Server {
                 }
             }
         }
-        for hm in [
-            rc_worldgen::decor_region::Hm::WorldSurfaceWg,
-            rc_worldgen::decor_region::Hm::WorldSurface,
-            rc_worldgen::decor_region::Hm::OceanFloorWg,
-            rc_worldgen::decor_region::Hm::OceanFloor,
-            rc_worldgen::decor_region::Hm::MotionBlocking,
-            rc_worldgen::decor_region::Hm::MotionBlockingNoLeaves,
-        ] {
-            dc.prime(&wd.blocks, hm);
+        use rc_worldgen::decor_region::Hm;
+        const MAPS: [Hm; 6] = [
+            Hm::WorldSurfaceWg,
+            Hm::WorldSurface,
+            Hm::OceanFloorWg,
+            Hm::OceanFloor,
+            Hm::MotionBlocking,
+            Hm::MotionBlockingNoLeaves,
+        ];
+        if one_walk {
+            // Top of the highest section that is not all air: no map counts what is above.
+            let top = live
+                .and_then(|c| {
+                    c.sections.iter().rposition(|s| !matches!(s.blocks, rc_world::Container::Single(v) if states.is_air(v)))
+                })
+                .map_or(h.min_y, |si| h.min_y + (si as i32 + 1) * 16);
+            dc.prime_many(&wd.blocks, &MAPS, top);
+        } else {
+            for hm in MAPS {
+                dc.prime(&wd.blocks, hm);
+            }
         }
         dc
     }
 
-    /// Cells that a feature changed in a chunk of its region, with their new state: the region
-    /// starts from a copy of the world (`deco_chunk`), which has not moved since. Each section of
-    /// the world is unpacked in one pass; an identical section is skipped by one comparison.
-    pub(crate) fn deco_changes(&self, dc: &DecoChunk) -> Vec<([i32; 3], u32)> {
-        let mut out = Vec::new();
-        let Some(Some(c)) = self.chunks.get(&(dc.cx, dc.cz)) else { return out };
-        let min_y = self.dim.height.min_y;
-        let mut live = [0u32; 4096];
-        for (si, (sec, new)) in c.sections.iter().zip(dc.blocks.as_chunks::<4096>().0).enumerate() {
-            sec.blocks.unpack_into(&mut live);
-            if live == *new {
+    /// What a feature or a structure left in the loaded chunks of its region besides its
+    /// placements (already replayed): ticks, block entity data (bees of a hive, loot tables,
+    /// templates), then entities.
+    pub(crate) fn deco_finish(&mut self, chunks: &[DecoChunk], b: &Blocks) {
+        for dc in chunks {
+            if !self.chunk_present((dc.cx, dc.cz)) {
                 continue;
             }
-            for (i, (&old, &s)) in live.iter().zip(new).enumerate() {
-                if old != s {
-                    let (x, z, y) = ((i & 15) as i32, ((i >> 4) & 15) as i32, (i >> 8) as i32);
-                    out.push(([dc.cx * 16 + x, min_y + si as i32 * 16 + y, dc.cz * 16 + z], s));
-                }
-            }
-        }
-        out
-    }
-
-    /// Writes into the world what a feature changed in the chunks of its region ("clients" flag)
-    /// and schedules its ticks.
-    pub(crate) fn apply_deco(&mut self, chunks: &[DecoChunk], b: &Blocks) -> usize {
-        let changes: Vec<_> = chunks.iter().map(|dc| self.deco_changes(dc)).collect();
-        // Cells broken with drops by the feature (planted nether fungus): particles, sound and
-        // drops of whatever the cell holds at the moment of the break, like the game: a broken
-        // weeping vine turns the body above it into a tip, which is broken in turn. A cell
-        // already emptied by a previous break (upper half of a double plant) is air, and the
-        // break does nothing there.
-        for dc in chunks {
-            for &(p, _) in &dc.destroyed {
-                self.destroy_block(p, true, 512);
-            }
-        }
-        // Only the cells the feature changed are written: elsewhere, the world keeps what the
-        // breaks left there (vine tip above the stem, half of a tall grass removed with the
-        // other, grass that loses its snow), like the game, which breaks then places cell by
-        // cell in the world itself.
-        let mut n = 0;
-        for &(p, new) in changes.iter().flatten() {
-            if self.get(p) != new {
-                self.set_block(p, new, flag::CLIENTS);
-                n += 1;
-            }
-        }
-        self.deco_ticks(chunks, b);
-        n
-    }
-
-    /// Ticks scheduled by a feature or a structure in the loaded chunks of its region.
-    fn deco_ticks(&mut self, chunks: &[DecoChunk], b: &Blocks) {
-        for dc in chunks {
-            let Some(Some(_)) = self.chunks.get(&(dc.cx, dc.cz)) else { continue };
             // Ticks scheduled by the feature (sources, geode cracks, flowers…), with the requested
             // delay: in the live world, it is not brought back to 0.
             for &(p, k) in &dc.fluid_ticks {
@@ -259,6 +332,32 @@ impl Server {
                 let id = self.bs.t.block_id(b.block_name(k));
                 if id != u16::MAX {
                     self.schedule_tick(p, id, delay);
+                }
+            }
+        }
+        for dc in chunks {
+            if !self.chunk_present((dc.cx, dc.cz)) {
+                continue;
+            }
+            for (p, d) in &dc.be_data {
+                if self.be_get(*p).is_some() {
+                    let mut f = Vec::new();
+                    crate::generation_nbt::be_extra_fields(d, &mut f);
+                    self.set_block_data(*p, Nbt::Compound(f));
+                }
+            }
+            if dc.entities.is_empty() {
+                continue;
+            }
+            let src = self.player_source();
+            for e in &dc.entities {
+                let ty = e.get("id").and_then(Nbt::as_str).unwrap_or("").to_owned();
+                if crate::mobs::species::Kind::from_name(&ty).is_some() {
+                    self.next_entity += 1;
+                    let n = self.next_entity;
+                    let _ = self.adopt_with_passengers(n, e, None);
+                } else if let Some(pos) = crate::nbtio::f64s::<3>(e.get("Pos")) {
+                    let _ = self.summon_entity(&src, &ty, pos, Some(e.clone()));
                 }
             }
         }
@@ -275,33 +374,16 @@ impl Server {
         if !loaded {
             return Err(Fail(tr!("argument.pos.unloaded")));
         }
-        let Some((wd, dg)) = self.place_data() else { return Err(Fail(tr!("commands.place.feature.failed"))) };
-        let Some(deco) = dg.deco.clone() else { return Err(Fail(tr!("commands.place.feature.failed"))) };
-        let Some(fid) = deco.reg.feature_id(&id) else {
+        let Some(deco) = self.place_data().and_then(|(_, dg)| dg.deco.clone()) else {
+            return Err(Fail(tr!("commands.place.feature.failed")));
+        };
+        if deco.reg.feature_id(&id).is_none() {
             return Err(Fail(tr!("argument.resource.not_found", id, "minecraft:worldgen/configured_feature")));
-        };
-        let (cx, cz) = (pos[0] >> 4, pos[2] >> 4);
-        let mut chunks: Vec<DecoChunk> = Vec::with_capacity(9);
-        for dz in -1..=1 {
-            for dx in -1..=1 {
-                chunks.push(self.deco_chunk(cx + dx, cz + dz, &dg, &wd));
-            }
         }
-        // Drawn on the world's random source (like the bone meal features), not the clock.
-        let hi = i64::from(self.bs.rng.next_int());
-        let seed = (hi << 32).wrapping_add(i64::from(self.bs.rng.next_int()));
-        let placed = {
-            let mut it = chunks.iter_mut();
-            let refs: [&mut DecoChunk; 9] = std::array::from_fn(|_| it.next().expect("9 chunks"));
-            let mut r = Region::new(refs, &wd.blocks, dg.sea_level, dg.seed);
-            let mut ctx = rc_worldgen::decor::Ctx::new(&mut r, &deco);
-            let mut rng = rc_worldgen::decor_rng::DecoRng::legacy(seed);
-            rc_worldgen::feature::place_feature(&mut ctx, fid, &mut rng, pos)
-        };
-        if !placed {
+        // Same placement as the bone meal features (world's random source, journal replayed).
+        if !self.place_world_feature(&id, pos) {
             return Err(Fail(tr!("commands.place.feature.failed")));
         }
-        self.apply_deco(&chunks, &wd.blocks);
         self.ok(s, tr!("commands.place.feature.success", id, pos[0], pos[1], pos[2]));
         Ok(1)
     }

@@ -548,8 +548,7 @@ impl DimGen {
                     let base = i * 256;
                     c.blocks[base..base + 256].fill(s);
                 }
-                c.prime(&self.blocks, Hm::WorldSurfaceWg);
-                c.prime(&self.blocks, Hm::OceanFloorWg);
+                c.prime_maps(&self.blocks, &[Hm::WorldSurfaceWg, Hm::OceanFloorWg]);
             }
             Kind::Debug => c.blocks.fill(air),
         }

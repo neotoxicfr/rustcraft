@@ -597,7 +597,10 @@ impl Server {
         self.place_data().and_then(|(_, dg)| dg.deco.clone()).is_some_and(|d| d.reg.feature_id(id).is_some())
     }
 
-    /// Configured feature placed at `pos` (3×3 chunks copied, changed blocks rewritten).
+    /// Configured feature placed at `pos` (`place feature`, bone meal, saplings): placed on copies
+    /// of the 3×3 chunks, then its placements replayed into the world in their order with the
+    /// feature's own flags (neighbour updates of the trees and of the "set and update" writes,
+    /// silent ore writes, breaks), followed by its ticks and block entity data.
     pub(crate) fn place_world_feature(&mut self, id: &str, pos: P) -> bool {
         self.place_world(id, pos, false)
     }
@@ -621,13 +624,14 @@ impl Server {
         // Seed drawn from the world's randomness (draw of a 64-bit integer).
         let hi = i64::from(self.bs.rng.next_int());
         let seed = (hi << 32).wrapping_add(i64::from(self.bs.rng.next_int()));
-        let ok = {
+        let (ok, ops) = {
             let mut it = chunks.iter_mut();
             let refs: [&mut DecoChunk; 9] = std::array::from_fn(|_| it.next().expect("9 chunks"));
             let mut r = Region::new(refs, &wd.blocks, dg.sea_level, dg.seed);
+            r.live_log = Some(Vec::new());
             let mut ctx = rc_worldgen::decor::Ctx::new(&mut r, &deco);
             let mut rng = rc_worldgen::decor_rng::DecoRng::legacy(seed);
-            if placed {
+            let ok = if placed {
                 match deco.reg.placed_id(id) {
                     Some(pid) => rc_worldgen::placement::place(&mut ctx, pid, &mut rng, pos, None),
                     None => false,
@@ -637,11 +641,14 @@ impl Server {
                     Some(fid) => rc_worldgen::feature::place_feature(&mut ctx, fid, &mut rng, pos),
                     None => false,
                 }
-            }
+            };
+            (ok, r.live_log.take().unwrap_or_default())
         };
-        if ok {
-            self.apply_deco(&chunks, &wd.blocks);
-        }
+        // Even a feature that ends up failing keeps what it already wrote (the game writes into
+        // the world as it goes); the vanilla features check before writing, so the journal is
+        // then empty.
+        self.replay_live(ops);
+        self.deco_finish(&chunks, &wd.blocks);
         ok
     }
 
