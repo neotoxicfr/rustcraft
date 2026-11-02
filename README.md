@@ -29,9 +29,9 @@ numbers below come from that list.
 
 | Area | Where it stands |
 |---|---|
-| Fidelity to the official game | **66 of 83** audit missions fixed and merged |
+| Fidelity to the official game | **74 of 83** audit missions fixed and merged |
 | Performance work | **47 of 125** planned optimisations done, each one measured |
-| Tests | about **2,600** automated tests, many of them compared bit for bit with the official game |
+| Tests | about **2,700** automated tests, many of them compared bit for bit with the official game |
 
 ### What works well
 
@@ -44,22 +44,25 @@ numbers below come from that list.
 - **Lighting** identical to the official game, and the **physics** of the player and of mounts.
 - **Redstone**, with the official game's quirks reproduced on purpose (quasi-connectivity, update
   order), and the bugs Mojang keeps listed in [docs/quirks-to-reproduce.md](docs/quirks-to-reproduce.md).
-- **Mobs and villagers** (AI, trading, breeding, raids), leads, mounts and golems, blocks and block
-  entities, items, combat and enchantments, experience orbs, effects, nature ticks, commands with
-  autocompletion.
-- **Interface**: title screen, server list, HUD, inventories, creative inventory, recipe book, chat,
-  player list, scoreboards, boss bars, F3 screen, options and `options.txt` shared with the official
-  game; sounds, music and particles.
+- **Mobs and villagers** (AI, trading, breeding, raids), monsters (creeper, shulker, warden…),
+  leads, mounts and golems, blocks and block entities, technical blocks (structure, jigsaw, test),
+  items, loot, combat and enchantments, experience orbs, effects, nature ticks, commands with
+  autocompletion, in-game tests (`/test`).
+- **The world's tick**: every entity ticks in one walk, in the order it joined the world, like the
+  official game.
+- **Interface**: title screen, server list, HUD, inventories, creative inventory, recipe book,
+  trading screen, tooltips, chat, player list, scoreboards, boss bars, F3 screen, option menus and
+  `options.txt` shared with the official game; sounds, music and particles.
 
 ### Work in progress
 
 Still on the fidelity list, by priority:
 
-- technical blocks (structure, jigsaw, test), `/place`, `/clone`, `/locate`;
-- some commands (`/loot`, `/enchant`, attributes…), data pack tags and `/reload`, saving, `/schedule` and `/data`;
-- mob spawning and spawn eggs, a few monsters (creeper, shulker, warden…), navigation and maps, the locator bar;
-- the world's tick order, loot functions, game tests;
-- the trading screen, tooltips, option menus, small client effects.
+- data pack tags and `/reload`, clocks; saving, `/schedule`, `/data` and the world list;
+- mob spawning and spawn eggs, navigation and maps, the locator bar's waypoints;
+- aiming, particles, options and meshing details on the client;
+- two investigations: the order in which redstone sends block changes, and loaded chunks left unmeshed;
+- core shaders of resource packs (after the optimisation work, to be decided).
 
 Implemented but **not yet systematically compared** with the official game: fluid flow, entity
 movement and collisions, the damage chain, hunger, generic menu clicks, attribute lines in tooltips.
