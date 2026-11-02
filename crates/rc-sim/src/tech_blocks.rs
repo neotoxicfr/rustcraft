@@ -910,6 +910,9 @@ impl Server {
         if enabled.len() <= 1 && enabled.first().is_none_or(|e| e == "vanilla") {
             return Some(crate::packs::StackFile::Base);
         }
+        // Same path checks as the world's folder: no empty, `.` or `..` part (a pack folder is
+        // never left), no reserved name.
+        template_file(&self.world, id)?;
         let (ns, path) = id.split_once(':')?;
         let key = format!("data/{ns}/structure/{path}.nbt");
         let repo = crate::packs::with_world(&self.cmd.builtin_packs, &self.world);

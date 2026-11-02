@@ -348,6 +348,10 @@ fn world_templates_come_before_the_packs() {
     let t = w.p.s.template_get("gt:accept").expect("template");
     assert_eq!(t.t.size, [5, 1, 1], "the world's copy wins");
     assert_eq!(w.p.s.template_get("gt:fail").map(|t| t.t.size), Some([4, 1, 1]), "the pack's otherwise");
+    // An identifier climbing out of the structure folder never reads a pack's other files.
+    let outside = w.p.s.world.join("datapacks").join("gt").join("x.nbt");
+    std::fs::write(&outside, template([2, 1, 1], &[([0, 0, 0], "start", "")])).expect("file outside data/");
+    assert!(w.p.s.template_get("gt:../../../x").is_none(), "path left the structure folder");
 }
 
 /// Test blocks around a corner, one per quadrant and mode, for the search passes.
