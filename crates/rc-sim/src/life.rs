@@ -740,11 +740,10 @@ impl Server {
 
     /// Survival tick (within the server tick, after the clocks).
     pub(crate) fn life_tick(&mut self) {
-        // Frozen (`tick freeze`): block entities and dropped items wait; the player ticks.
-        // (Weather is advanced at the start of the world tick, in `game_tick`.)
+        // Frozen (`tick freeze`): dropped items wait; the player ticks. (Weather is advanced at
+        // the start of the world tick; furnaces and brewing stands tick with the other block
+        // entities, after all the entities: `tick_block_entities`.)
         if self.cmd.ticking.runs() {
-            self.furnaces_tick();
-            self.brewers_tick(); // S7
             self.drops_tick();
         }
         self.vitals_tick();

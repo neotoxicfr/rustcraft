@@ -206,6 +206,11 @@ pub(crate) struct Ids {
     pub hopper: u16,
     /// G6-F12: conduit (ticking block entity, no kind of its own).
     pub conduit: u16,
+    /// G3-F13: furnaces and brewing stand (block entities ticked in the common list).
+    pub furnace: u16,
+    pub blast_furnace: u16,
+    pub smoker: u16,
+    pub brewing_stand: u16,
     pub fire: u16,
     pub soul_fire: u16,
     pub dirt: u16,
@@ -611,6 +616,10 @@ impl Table {
             repeater: f("repeater"),
             hopper: f("hopper"),
             conduit: f("conduit"),
+            furnace: f("furnace"),
+            blast_furnace: f("blast_furnace"),
+            smoker: f("smoker"),
+            brewing_stand: f("brewing_stand"),
             fire: f("fire"),
             soul_fire: f("soul_fire"),
             dirt: f("dirt"),

@@ -8,12 +8,12 @@ use super::mth::{DEG, degrees_difference, pitch_to, rotate_if_necessary, rotate_
 use super::species::Kind;
 use crate::server::Server;
 
-/// Entity walk of the server tick: from the first mob to the clouds. The game does not see, in
-/// this walk, an entity that is added to it: its first tick happens on the next server tick. Our
-/// lists tick one after the other (mobs, spits, fangs, bolts, minecarts, projectiles, clouds);
-/// an entity born during the walk therefore carries its number, and the list that meets it in
-/// that same walk skips it. Born after its list's tick (a spit launched from a minecart), it is
-/// no longer skipped on the next tick.
+/// Entity walk of the server tick: from the falling blocks to the clouds. The game does not see,
+/// in this walk, an entity that is added to it: its first tick happens on the next server tick.
+/// Our lists tick one after the other (falling blocks and TNT, items and orbs, mobs, spits,
+/// fangs, bolts, minecarts, projectiles, clouds); an entity born during the walk therefore
+/// carries its number, and the list that meets it in that same walk skips it. Born after its
+/// list's tick (a spit launched from a minecart), it is no longer skipped on the next tick.
 #[derive(Debug, Default)]
 pub(crate) struct Walk {
     /// Walks started.
@@ -23,11 +23,18 @@ pub(crate) struct Walk {
 }
 
 impl Walk {
-    /// Start of the walk, right before the first mob (frozen included: the player's mount
+    /// Start of the walk, right before the first entity (frozen included: the player's mount
     /// still ticks).
     pub(crate) fn start(&mut self) {
         self.count += 1;
         self.now = self.count;
+    }
+
+    /// Start of the walk if none is in progress (the mobs ticked without the server tick).
+    pub(crate) fn ensure_started(&mut self) {
+        if self.now == 0 {
+            self.start();
+        }
     }
 
     /// End of the walk, after the projectiles and the clouds.
@@ -67,31 +74,47 @@ impl Server {
         self.pufferfish_player_touch(); // F09
     }
 
+    /// Special spawners of the chunk source (§ 1.2 step 9, after the random ticks): only if mobs
+    /// spawn (rule `spawn_mobs`).
+    pub(crate) fn custom_spawners_tick(&mut self) {
+        #[cfg(test)]
+        crate::server::phase("spawners");
+        if self.rule("minecraft:spawn_mobs", true) {
+            self.phantom_spawner_tick();
+            self.patrol_spawner_tick(); // F07
+            self.cat_spawner_tick();
+            self.village_siege_tick();
+            self.trader_spawner_tick(); // F05
+        }
+    }
+
+    /// Harnesses that tick the blocks without the server tick (`Probe::tick`): raids, spawns
+    /// and dragon fight, then the mobs (the server tick runs the first three before the
+    /// random ticks and the entities).
+    #[cfg(test)]
+    pub(crate) fn mobs_world_tick(&mut self) {
+        if self.cmd.ticking.runs() {
+            self.raids_tick();
+            self.natural_spawn_tick();
+            self.custom_spawners_tick();
+            self.end_fight_tick();
+        }
+        self.mobs_tick();
+    }
+
+    /// Mobs of the entity walk (spawns, raids and the dragon fight come before it in the world
+    /// tick, bells and spawner blocks after it with the block entities).
     pub(crate) fn mobs_tick(&mut self) {
         self.mobs_player_tick();
         self.rec_world_tick(); // F14: shrieker warnings
-        // Frozen (`tick freeze`): spawns, raids, fight and mobs wait, except the
-        // player's mount.
+        // Frozen (`tick freeze`): mobs wait, except the player's mount.
         let runs = self.cmd.ticking.runs();
-        if runs {
-            self.natural_spawn_tick();
-            // Special spawners: only if mobs spawn (rule `spawn_mobs`).
-            if self.rule("minecraft:spawn_mobs", true) {
-                self.phantom_spawner_tick();
-                self.patrol_spawner_tick(); // F07
-                self.cat_spawner_tick();
-                self.village_siege_tick();
-                self.trader_spawner_tick(); // F05
-            }
-            self.raids_tick(); // F07: raids before the entities
-            self.end_fight_tick(); // F15: dragon fight (before the entities)
-        }
-        if runs {
-            self.bells_tick(); // rung bells: resonance, raiders glowing
-        }
         let player_vehicle = self.mobs.mounts.riding.vehicle;
-        // Start of the entity walk; it ends after the projectiles and the clouds.
-        self.walk.start();
+        // Entity walk: started by the server tick before its first entity (falling blocks), here
+        // when the mobs tick alone; it ends after the projectiles and the clouds.
+        self.walk.ensure_started();
+        #[cfg(test)]
+        crate::server::phase("mobs");
         // Snapshot: mobs added during this tick wait for the next.
         let n = self.mobs.list.len();
         for i in 0..n {
@@ -110,9 +133,7 @@ impl Server {
                 self.mobs.list[i] = Some(m);
                 continue;
             }
-            let c = ((m.pos[0].floor() as i32) >> 4, (m.pos[2].floor() as i32) >> 4);
-            let ticking = (self.mob_chunk_ticking(c) && self.chunks.get(&c).is_some_and(Option::is_some))
-                || self.fight_forces_ticking(&m); // F15: arena ticket
+            let ticking = self.entity_ticks_at(m.pos); // F15: arena ticket included
             if ticking {
                 self.tick_mob(&mut m);
             }
@@ -142,7 +163,7 @@ impl Server {
             // F12: fireballs ticked with the projectiles (S8, `projectiles_tick`).
             // F14: wind charges ticked with the projectiles (S8, `projectiles_tick`).
             self.end_world_tick(); // F15: crystals, breath, bullets
-            self.spawner_blocks_tick(); // W9: spawners, trials, vaults (block entities, after the entities)
+            self.ominous_items_tick(); // W9: ominous item spawners (their blocks tick with the block entities)
             self.player_pushes_mobs(); // player push: also stopped when frozen
         }
         self.cubes_player_touch();

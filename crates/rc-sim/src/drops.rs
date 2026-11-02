@@ -53,6 +53,10 @@ pub struct ItemEnt {
     /// G5-F05: fire ticks left (`Fire`), and the "on fire" flag last sent to the client.
     pub fire: i32,
     fire_flag: bool,
+    /// G3-F13: entity walk of its birth (`Walk::born`), and "ticked this tick" (only a ticked
+    /// item merges its neighbours into itself).
+    born: u64,
+    ticked: bool,
 }
 
 impl ItemEnt {
@@ -82,6 +86,8 @@ pub struct Orb {
     /// G5-F05: fire ticks left, and the "on fire" flag last sent to the client.
     pub fire: i32,
     fire_flag: bool,
+    /// G3-F13: entity walk of its birth (`Walk::born`).
+    born: u64,
 }
 
 /// Split of a reward into orbs (values of the game).
@@ -246,6 +252,8 @@ impl Server {
             yaw,
             fire: 0,
             fire_flag: false,
+            born: self.walk.born(),
+            ticked: false,
         });
     }
 
@@ -409,6 +417,7 @@ impl Server {
             body: server_body(pos, vel, ORB_SIZE, 0.425),
             fire: 0,
             fire_flag: false,
+            born: self.walk.born(),
         });
     }
 
@@ -448,6 +457,7 @@ impl Server {
             body: server_body(pos, vel, ORB_SIZE, 0.425),
             fire: get("Fire", 0) as i16 as i32,
             fire_flag: false,
+            born: self.walk.born(),
         });
         id
     }
@@ -526,6 +536,8 @@ impl Server {
 
     /// Tick of items and orbs: physics, merge, pickup, disappearance.
     pub(crate) fn drops_tick(&mut self) {
+        #[cfg(test)]
+        crate::server::phase("items");
         let mut drops = std::mem::take(&mut self.life.drops);
         // Network tracking BEFORE the entity tick, like the official server (the client receives
         // the state of the previous tick then does the current tick itself).
@@ -539,7 +551,10 @@ impl Server {
         self.contact.live_items = live;
         self.contact.items_ticking = true;
         for (i, d) in drops.iter_mut().enumerate() {
-            if d.removed {
+            // G3-F13: born during this entity walk (falling block, mining), or outside a "ticking
+            // entities" chunk: no tick (and no merge into it) this tick.
+            d.ticked = !d.removed && !self.walk.waits(std::mem::take(&mut d.born)) && self.entity_ticks_at(d.pos);
+            if !d.ticked {
                 continue;
             }
             d.ticks += 1;
@@ -611,7 +626,7 @@ impl Server {
         let n = drops.len();
         for i in 0..n {
             let rate = if drops[i].moved { 2 } else { 40 };
-            if drops[i].removed || drops[i].ticks % rate != 0 {
+            if drops[i].removed || !drops[i].ticked || drops[i].ticks % rate != 0 {
                 continue;
             }
             for j in 0..n {
@@ -779,7 +794,11 @@ impl Server {
         let mut buckets = std::mem::take(&mut self.contact.orb_buckets);
         let mut buckets_built = false;
         for i in 0..orbs.len() {
-            if orbs[i].removed {
+            // G3-F13: born during this entity walk, or outside a "ticking entities" chunk.
+            if orbs[i].removed
+                || self.walk.waits(std::mem::take(&mut orbs[i].born))
+                || !self.entity_ticks_at(orbs[i].pos)
+            {
                 continue;
             }
             let o = &mut orbs[i];

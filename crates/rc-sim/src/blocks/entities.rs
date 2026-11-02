@@ -361,8 +361,11 @@ impl Server {
         e.body = Some(b);
     }
 
-    /// Entity phase (§ 1.2, step 11b) for the entities simulated here.
+    /// Entity phase (§ 1.2, step 11b) for the entities simulated here, first of the walk: those
+    /// born during it (a TNT primed by another) wait for the next tick.
     pub(crate) fn tick_sim_entities(&mut self) {
+        #[cfg(test)]
+        crate::server::phase("falling");
         let n = self.bs.entities.list.len();
         for i in 0..n {
             let mut e = self.bs.entities.list[i].clone();
@@ -375,6 +378,11 @@ impl Server {
             let mut t = std::mem::take(&mut e.track);
             self.track_object(&mut t, e.id, e.pos, e.vel, e.on_ground, interval);
             e.track = t;
+            // G3-F13: outside a "ticking entities" chunk, frozen (tracked all the same).
+            if !self.entity_ticks_at(e.pos) {
+                self.bs.entities.list[i] = e;
+                continue;
+            }
             e.old = e.pos;
             match e.kind {
                 EntKind::Falling(s) => self.tick_falling(&mut e, s),
@@ -1435,6 +1443,7 @@ impl Server {
         match self.v().kind(s) {
             Kind::Campfire => self.campfire_ticker_register(p), // G6-F01
             Kind::Beacon => self.beacon_ticker_register(p),     // G5-F11
+            Kind::Bell => self.bell_ticker_register(p),         // G3-F13
             _ if self.v().block(s) == self.bs.t.id.conduit => self.conduit_ticker_register(p), // G6-F12
             _ => {}
         }
@@ -1508,6 +1517,7 @@ impl Server {
                                 | "minecraft:beacon"
                                 | "minecraft:conduit"
                                 | "minecraft:potent_sulfur"
+                                | "minecraft:bell"
                         )
                     )
                 })
@@ -1526,6 +1536,7 @@ impl Server {
                 Kind::Beacon => self.beacon_ticker_register(p), // G5-F11
                 _ if self.v().block(s) == self.bs.t.id.conduit => self.conduit_ticker_register(p), // G6-F12
                 Kind::PotentSulfur => self.potent_sulfur_ticker_sync(p, s), // G6-F09a
+                Kind::Bell => self.bell_ticker_register(p),                 // G3-F13
                 Kind::Jukebox => {
                     self.jukebox_loaded_from_save(p);
                     self.jukebox_ticker_sync(p, s);

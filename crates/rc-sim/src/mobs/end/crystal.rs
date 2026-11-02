@@ -100,21 +100,22 @@ impl Crystal {
 impl Server {
     /// Crystal tick: fire under the crystal during a fight (air cell).
     pub(crate) fn crystals_tick(&mut self) {
-        if self.mobs.end.fight.is_none() {
-            for c in &mut self.mobs.end.crystals {
-                c.time += 1;
-            }
-            return;
-        }
+        // G3-F13: a crystal outside a "ticking entities" chunk waits (age included).
+        let fight = self.mobs.end.fight.is_some();
         let n = self.mobs.end.crystals.len();
         for i in 0..n {
-            let c = &mut self.mobs.end.crystals[i];
-            if c.removed {
+            let c = &self.mobs.end.crystals[i];
+            if c.removed || !self.entity_ticks_at(c.pos) {
                 continue;
             }
+            let c = &mut self.mobs.end.crystals[i];
             c.time += 1;
+            if !fight {
+                continue;
+            }
+            // Its chunk is loaded (ticking test above).
             let p = c.block_pos();
-            if self.chunks.get(&(p[0] >> 4, p[2] >> 4)).is_some_and(Option::is_some) && self.is_air(p) {
+            if self.is_air(p) {
                 let f = self.fire_state_for(p);
                 self.set_block(p, f, crate::blocks::flag::ALL);
             }

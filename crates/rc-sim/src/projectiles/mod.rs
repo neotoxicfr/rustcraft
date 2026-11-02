@@ -792,6 +792,8 @@ impl Server {
 
     /// Tick of the open world's projectiles, then clouds, bobber, pickup and tracking.
     pub(crate) fn projectiles_tick(&mut self) {
+        #[cfg(test)]
+        crate::server::phase("projectiles");
         self.proj_restore_pearls();
         self.proj_player_tick();
         // Frozen (`tick freeze`): projectiles, clouds and floats wait.
@@ -806,6 +808,7 @@ impl Server {
         list.extend(added);
         self.proj.list = list;
         if runs {
+            self.load_pearl_chunks(); // G3-F13: a pearl beyond the loaded chunks keeps flying
             self.proj_list_tick();
             self.clouds_tick();
             self.fishing_tick();
@@ -827,26 +830,35 @@ impl Server {
         let added = std::mem::take(&mut self.proj.list);
         list.extend(added);
         self.proj.list = list;
-        let pearls: Vec<(i32, i32)> = self
+        self.load_pearl_chunks();
+        self.proj_list_tick();
+        self.proj_retain();
+    }
+
+    /// Chunks of the host's flying pearls read from disk or put into generation, without
+    /// waiting (the pearl's ticket): a projectile whose chunk is not ready does not tick.
+    fn load_pearl_chunks(&mut self) {
+        let missing: Vec<(i32, i32)> = self
             .proj
             .list
             .iter()
             .filter(|p| !p.removed && p.kind == PKind::EnderPearl && p.owner == Some(self.uuid))
             .map(|p| ((p.pos[0].floor() as i32) >> 4, (p.pos[2].floor() as i32) >> 4))
+            .filter(|c| !matches!(self.chunks.get(c), Some(Some(_))))
             .collect();
-        if !pearls.is_empty() {
-            // Read from disk or put into generation, without waiting: a projectile whose chunk
-            // is not ready does not tick (entity outside a loaded chunk).
-            self.ensure_loaded(&pearls);
+        if !missing.is_empty() {
+            self.ensure_loaded(&missing);
         }
-        self.proj_list_tick();
-        self.proj_retain();
     }
 
-    /// The projectile's chunk is ready (parked dimension only: the player's ticks everything).
-    fn proj_chunk_ready(&self, p: &Proj) -> bool {
+    /// Ender pearl of a player (host or guest) whose chunk is loaded: the pearl's own ticket
+    /// makes that chunk "ticking entities" wherever it flies.
+    fn player_pearl_ready(&self, p: &Proj) -> bool {
+        let Some(o) = p.owner.filter(|_| p.kind == PKind::EnderPearl) else { return false };
+        let player = o == self.uuid
+            || self.lan.as_ref().is_some_and(|l| l.guests.iter().any(|g| g.ctx.as_ref().is_some_and(|c| c.uuid == o)));
         let c = ((p.pos[0].floor() as i32) >> 4, (p.pos[2].floor() as i32) >> 4);
-        self.dims.home.is_none() || matches!(self.chunks.get(&c), Some(Some(_)))
+        player && matches!(self.chunks.get(&c), Some(Some(_)))
     }
 
     /// Tick of each projectile present at the start.
@@ -862,8 +874,10 @@ impl Server {
             if self.walk.waits(std::mem::take(&mut slot.born)) {
                 continue;
             }
+            // G3-F13: outside a "ticking entities" chunk (or one not loaded), it waits; a
+            // player's pearl carries its own ticket (its loaded chunk is enough).
             let slot = &self.proj.list[i];
-            if slot.removed || !self.proj_chunk_ready(slot) {
+            if slot.removed || !(self.entity_ticks_at(slot.pos) || self.player_pearl_ready(slot)) {
                 continue;
             }
             let mut p = slot.clone();

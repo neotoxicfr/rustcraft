@@ -123,6 +123,14 @@ pub(crate) enum BeTick {
     Conduit(super::conduit::ConduitTick),
     /// G6-F09a: active sulfur outside the dry state (countdown in the `countdown` NBT field).
     PotentSulfur,
+    /// G3-F13: furnace, blast furnace or smoker (state in `life.furnaces`).
+    Furnace,
+    /// G3-F13: brewing stand (state in `life.brewers`).
+    Brewing,
+    /// G3-F13: bell (state of a rung bell in `mobs.bells`, none before the first ring).
+    Bell,
+    /// G3-F13: monster spawner, trial spawner or vault (state in the block entity).
+    Spawner,
 }
 
 impl Sim {
@@ -893,6 +901,13 @@ impl Server {
 
     pub(crate) fn remove_block_entity(&mut self, p: P) {
         self.bs.movers.remove(&p);
+        // G3-F13: its ticker dies with it (dropped on the next walk); a block entity placed back
+        // at the same position gets a new ticker at the end of the list, like the game. The state
+        // kept outside the block entity goes too (a broken furnace's contents were thrown just
+        // before), otherwise a furnace placed back there would find the old one's.
+        if let Some((_, t)) = self.bs.be_ticks.remove(&p) {
+            self.dead_ticker_state(p, t);
+        }
         if let Some(i) = self.be_index(p)
             && let Some(Some(c)) = self.chunks.get_mut(&(p[0] >> 4, p[2] >> 4))
         {

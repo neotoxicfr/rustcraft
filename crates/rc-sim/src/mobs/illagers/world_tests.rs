@@ -33,7 +33,7 @@ fn step(p: &mut Probe, n: i32) {
         p.tick();
         // Player effects (omens), then mobs.
         p.s.effects_tick();
-        p.s.mobs_tick();
+        p.s.mobs_world_tick();
         p.s.projectiles_tick(); // mob projectiles: common engine (S8)
     }
 }

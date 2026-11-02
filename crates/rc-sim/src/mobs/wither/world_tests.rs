@@ -29,7 +29,7 @@ fn probe(tag: &str) -> Option<(Probe, std::path::PathBuf)> {
 fn step(p: &mut Probe, n: i32) {
     for _ in 0..n {
         p.tick();
-        p.s.mobs_tick();
+        p.s.mobs_world_tick();
         p.s.projectiles_tick();
     }
 }

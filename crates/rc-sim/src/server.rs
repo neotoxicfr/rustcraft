@@ -305,8 +305,21 @@ pub const DIMENSIONS: [&str; 3] = ["minecraft:overworld", "minecraft:the_nether"
 
 #[cfg(test)]
 thread_local! {
-    /// Benches: cumulative time of the world's block and fluid pass (`tick_level_blocks`, without the block entities).
+    /// Benches: cumulative time of the world's block and fluid pass (`tick_level_blocks`: scheduled
+    /// ticks, random ticks, block events; without raids, spawns, entities or block entities).
     pub(crate) static BLOCKS_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Tests (G3-F13): phases of the world tick in the order they ran (`None`: not recorded).
+    pub(crate) static PHASES: std::cell::RefCell<Option<Vec<&'static str>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Tests (G3-F13): records a phase of the world tick when the record is on.
+#[cfg(test)]
+pub(crate) fn phase(name: &'static str) {
+    PHASES.with(|p| {
+        if let Some(v) = p.borrow_mut().as_mut() {
+            v.push(name);
+        }
+    });
 }
 
 pub(crate) fn sha256_seed(seed: i64) -> i64 {
@@ -977,7 +990,7 @@ impl Server {
     /// The current player loads and generates chunks (false for a spectator under the
     /// `spectators_generate_chunks` rule false).
     fn loads_chunks(&self) -> bool {
-        self.game_mode != 3 || self.rule("minecraft:spectators_generate_chunks", true)
+        self.holds_tickets(self.game_mode)
     }
 
     /// Sends the loaded chunks of `list`; those being generated or read stay in the queue.
@@ -1140,16 +1153,25 @@ impl Server {
         if self.tick.is_multiple_of(20) {
             self.send_time(false);
         }
+        // World tick (§ 1.2), "handling the tick" from the border to the block events like the
+        // game (a piston retracting in that span finishes at once).
+        self.bs.handling_tick = true;
         if runs {
             self.border_tick(); // moving border, before the weather
             self.weather_tick(); // S2: weather
-            self.sleep_world_tick(); // S2: night skip (all players)
+        }
+        self.sleep_world_tick(); // S2: night skip (all players), even frozen like the game
+        if runs {
             self.run_scheduled(); // S5: scheduled functions, before blocks and entities
-            #[cfg(test)]
-            let t = Instant::now();
-            self.tick_level_blocks();
-            #[cfg(test)]
-            BLOCKS_NS.with(|n| n.set(n.get() + t.elapsed().as_nanos() as u64));
+            // Scheduled ticks, raids, spawns and random ticks, block events.
+            self.tick_level_blocks(true);
+            self.end_fight_tick(); // F15: dragon fight, before the entities
+        }
+        self.bs.handling_tick = false;
+        // Entity walk: falling blocks and TNT first; it ends after the projectiles and clouds.
+        self.walk.start();
+        if runs {
+            self.tick_sim_entities();
         }
         if let Some((_, _, at)) = self.teleport
             && self.tick > at + 20
@@ -1159,13 +1181,14 @@ impl Server {
         }
         self.tick_mining();
         self.demo_tick(); // demo mode: after mining, like the game
-        self.life_tick(); // S2: furnaces, items, health, menus
+        self.life_tick(); // S2: items, health, menus
         self.mobs_tick(); // S4: mobs
         self.deco_tick(); // decorations: survival of what is attached
         self.command_minecarts_tick(); // G5-F06: minecarts (command block included), once per tick
         self.projectiles_tick(); // S8: projectiles, clouds, fishing
         // Block entities after all the entities, like the game: a piston pushes an entity
-        // after its own movement of the tick (slime momentum consumed on the next tick).
+        // after its own movement of the tick (slime momentum consumed on the next tick); one
+        // list for every family (furnaces, brewing stands, bells and spawner blocks included).
         if runs {
             self.tick_block_entities();
         }

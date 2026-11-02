@@ -76,53 +76,48 @@ impl Server {
             .is_some_and(|m| m.alive() && !m.removed && super::illagers::is_raider(m.kind) && near(p, m.pos, d))
     }
 
-    /// Tick of rung bells; a bell whose block has disappeared is forgotten.
-    pub(crate) fn bells_tick(&mut self) {
-        let mut i = 0;
-        while i < self.mobs.bells.len() {
-            let mut b = std::mem::take(&mut self.mobs.bells[i]);
-            if self.bname(b.pos) != "minecraft:bell" {
-                self.mobs.bells.swap_remove(i);
-                continue;
-            }
-            // Same test as the other block entities: outside the border or out of tick range,
-            // the bell is kept but frozen.
-            if !self.be_ticking(b.pos) {
-                self.mobs.bells[i] = b;
-                i += 1;
-                continue;
-            }
-            if b.shaking {
-                b.ticks += 1;
-            }
-            if b.ticks >= 50 {
-                b.shaking = false;
-                b.ticks = 0;
-            }
-            let list = b.nearby.clone().unwrap_or_default();
-            if b.ticks >= 5 && b.resonation == 0 && list.iter().any(|&e| self.bell_raider(b.pos, e, 32.0)) {
-                b.resonating = true;
-                self.block_sound(b.pos, "minecraft:block.bell.resonate", 1.0, 1.0);
-            }
-            if b.resonating {
-                if b.resonation < 40 {
-                    b.resonation += 1;
-                } else {
-                    for e in list {
-                        if self.bell_raider(b.pos, e, 48.0)
-                            && let Ent::Mob(id) = e
-                            && let Some(k) = self.mob_index(id)
-                        {
-                            let mut m = self.mobs.list[k].take().expect("mob");
-                            self.give_mob_effect(&mut m, "minecraft:glowing", 60, 0);
-                            self.mobs.list[k] = Some(m);
-                        }
-                    }
-                    b.resonating = false;
-                }
-            }
-            self.mobs.bells[i] = b;
-            i += 1;
+    /// Bell block entity created or loaded: its ticker (G3-F13, common block-entity list).
+    pub(crate) fn bell_ticker_register(&mut self, p: [i32; 3]) {
+        self.ticker_register(p, crate::blocks::level::BeTick::Bell);
+    }
+
+    /// Tick of a bell (block entity phase; the dead ticker forgets the bell): nothing until its
+    /// first ring.
+    pub(crate) fn bell_tick(&mut self, p: [i32; 3]) {
+        let Some(i) = self.mobs.bells.iter().position(|b| b.pos == p) else { return };
+        let mut b = std::mem::take(&mut self.mobs.bells[i]);
+        if b.shaking {
+            b.ticks += 1;
         }
+        if b.ticks >= 50 {
+            b.shaking = false;
+            b.ticks = 0;
+        }
+        // Recorded entities read in place (taken out, put back), without a copy per tick.
+        let nearby = b.nearby.take();
+        let list = nearby.as_deref().unwrap_or(&[]);
+        if b.ticks >= 5 && b.resonation == 0 && list.iter().any(|&e| self.bell_raider(b.pos, e, 32.0)) {
+            b.resonating = true;
+            self.block_sound(b.pos, "minecraft:block.bell.resonate", 1.0, 1.0);
+        }
+        if b.resonating {
+            if b.resonation < 40 {
+                b.resonation += 1;
+            } else {
+                for &e in list {
+                    if self.bell_raider(b.pos, e, 48.0)
+                        && let Ent::Mob(id) = e
+                        && let Some(k) = self.mob_index(id)
+                    {
+                        let mut m = self.mobs.list[k].take().expect("mob");
+                        self.give_mob_effect(&mut m, "minecraft:glowing", 60, 0);
+                        self.mobs.list[k] = Some(m);
+                    }
+                }
+                b.resonating = false;
+            }
+        }
+        b.nearby = nearby;
+        self.mobs.bells[i] = b;
     }
 }

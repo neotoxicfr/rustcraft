@@ -2910,3 +2910,38 @@ on a quiet machine with the others).
   melee path (one hit per spin). No hot path touched: the per-tick and per-hit costs above are
   unchanged (same bench, the mob melee path is identical). Multi-core and GPU not applicable
   (single events, ordered by the game).
+
+## G3-F13: world tick order, ticking chunks of the entities (02/11, loaded machine)
+
+Fidelity fix (phases of the world tick in the game's order, one block-entity list for every
+family, entities frozen outside the "ticking entities" chunks); figures from the micro-bench
+`bench_g3f13_entity_test_and_furnace_list` (3 passes, `cargo test --release -p rc-sim
+bench_g3f13 -- --ignored --nocapture`), loaded machine (other agents compiling).
+
+- Entity chunk test (`entity_ticks_at`, every entity other than a player and the mobs, which
+  already had it: items, orbs, falling blocks and TNT, projectiles, clouds, fangs, spits, bolts,
+  crystals, ominous item spawners): 8.2-8.5 ns per entity per tick in range, 6.6-7.3 ns out of
+  range (distance tests first, the chunk table lookup last: one hash lookup). Lead considered: a
+  per-tick set of the ticking chunks (O(loaded chunks) to build, more than the per-entity test
+  for the usual entity counts); not tried.
+- Furnaces and brewing stands moved from their own loops into the common block-entity list:
+  idle furnace 42.1-42.9 ns per tick against 54.2-54.6 ns for the former loop (−22 %), idle
+  brewing stand 55.7-56.3 ns against 82.0-83.0 ns (−32 %). Causes: no key copy per tick (former
+  `Vec` of every position), no block-name string per brewing stand per tick, the chunk test of
+  `be_ticking` (9 table lookups) reused while consecutive tickers stay in the same chunk, the
+  border read once per walk, the shared-map families (campfires, jukeboxes, beacons, conduits,
+  gateways, sulfur, and the four new ones) resolved by one lookup instead of the chain
+  movers → creaking hearts → map. First version measured on the way: 107 ns (two chains of
+  lookups, liveness reading the block and scanning the chunk's block entities), then 57-63 ns
+  (one lookup, block still read): both discarded for the figures above. The liveness of the four
+  new families reads nothing (their ticker leaves the map with their block entity). Bells: the
+  copy of the recorded entities per tick removed (read in place). Spawner blocks: the living
+  players read once per walk, only if a spawner ticks.
+- Tick bench `bench_ticks` (5 sites, the `redstone` site fails: function `perf:redstone` missing
+  from the current model world), before then after, not alternated, loaded machine: means
+  2.103 / 1.024 / 2.110 / 0.763 / 1.873 ms before, 0.820-0.856 / 0.711-0.714 / 1.371-1.395 /
+  0.543-0.544 / 1.377-1.398 ms after (two passes). The difference follows the machine's load
+  (the "before" pass ran during other agents' builds), not this change: no gain is claimed; to
+  measure on a quiet machine with `tools/bench/scenes.py`. Its "blocks and fluids" figure no
+  longer includes the falling blocks and TNT (they tick with the entities now).
+- Multi-core, GPU: not applicable (phase order and list order are observable).

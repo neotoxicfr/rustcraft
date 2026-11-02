@@ -6,11 +6,9 @@
 use rc_proto::nbt::Nbt;
 
 use crate::containers::{read_items, write_items};
-use crate::menus::Kind;
 use crate::nbtio::{float, int};
 use crate::player::Stack;
 use crate::server::Server;
-use crate::stations::St;
 
 #[derive(Debug, Clone, Default)]
 pub struct Brewer {
@@ -83,6 +81,8 @@ impl Server {
     }
 
     pub(crate) fn ensure_brewer(&mut self, pos: [i32; 3]) {
+        // G3-F13: ticks in the common block-entity list (insertion order with the hoppers).
+        self.ticker_register(pos, crate::blocks::level::BeTick::Brewing);
         if self.life.brewers.contains_key(&pos) {
             return;
         }
@@ -108,32 +108,12 @@ impl Server {
         }
     }
 
-    pub(crate) fn brewers_tick(&mut self) {
-        let positions: Vec<[i32; 3]> = self.life.brewers.keys().copied().collect();
-        for p in positions {
-            if self.block_name_s7(p).as_deref() != Some("minecraft:brewing_stand") {
-                self.life.brewers.remove(&p);
-                continue;
-            }
-            // Same test as the other block entities: border and chunk within tick range.
-            if self.be_ticking(p) {
-                self.brewer_tick(p);
-            }
-        }
-        if let Some(m) = &mut self.life.menu
-            && let (Kind::Station(St::Brewing), Some(p)) = (m.kind, m.block)
-            && let Some(b) = self.life.brewers.get(&p)
-        {
-            // Contents re-read by `pull_menu`.
-            m.data = b.data().to_vec();
-        }
-    }
-
     pub(crate) fn block_name_s7(&self, p: [i32; 3]) -> Option<String> {
         self.state_at(p).and_then(|s| self.data.block_of(s)).map(|b| b.name.clone())
     }
 
-    fn brewer_tick(&mut self, p: [i32; 3]) {
+    /// Brewing stand tick (block entity phase, common list).
+    pub(crate) fn brewer_tick(&mut self, p: [i32; 3]) {
         let Some(mut b) = self.life.brewers.remove(&p) else { return };
         // The "to save" marking of this tick (neighbouring comparators); `dirty` itself keeps the write due to the
         // block entity.

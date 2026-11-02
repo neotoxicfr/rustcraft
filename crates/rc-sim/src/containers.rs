@@ -671,6 +671,8 @@ impl Server {
 
     /// Furnaces of the chunk loaded to be simulated.
     fn ensure_furnace(&mut self, pos: [i32; 3], kind: u8) {
+        // G3-F13: ticks in the common block-entity list (insertion order with the hoppers).
+        self.ticker_register(pos, crate::blocks::level::BeTick::Furnace);
         if self.life.furnaces.contains_key(&pos) {
             return;
         }
@@ -699,25 +701,28 @@ impl Server {
         self.adopt_items(loaded);
     }
 
-    /// Furnace tick.
-    pub(crate) fn furnaces_tick(&mut self) {
-        let positions: Vec<[i32; 3]> = self.life.furnaces.keys().copied().collect();
-        for p in positions {
-            // Same test as the other block entities: border and chunk within tick range.
-            if self.be_ticking(p) {
-                self.furnace_tick(p);
+    /// Data of the open furnace or brewing stand menu after the block-entity phase (its contents
+    /// are re-read by `pull_menu`); sent by the next menu broadcast, like the game.
+    pub(crate) fn station_menu_data(&mut self) {
+        let Some(m) = &mut self.life.menu else { return };
+        let Some(p) = m.block else { return };
+        match m.kind {
+            Kind::Furnace(_) => {
+                if let Some(f) = self.life.furnaces.get(&p) {
+                    m.data = f.data().to_vec();
+                }
             }
-        }
-        // Data of the open menu (its contents are re-read by `pull_menu`).
-        if let Some(m) = &mut self.life.menu
-            && let (Kind::Furnace(_), Some(p)) = (m.kind, m.block)
-            && let Some(f) = self.life.furnaces.get(&p)
-        {
-            m.data = f.data().to_vec();
+            Kind::Station(crate::stations::St::Brewing) => {
+                if let Some(b) = self.life.brewers.get(&p) {
+                    m.data = b.data().to_vec();
+                }
+            }
+            _ => {}
         }
     }
 
-    fn furnace_tick(&mut self, p: [i32; 3]) {
+    /// Furnace tick (block entity phase, common list).
+    pub(crate) fn furnace_tick(&mut self, p: [i32; 3]) {
         let Some(mut f) = self.life.furnaces.remove(&p) else { return };
         let mut changed = false;
         let was_lit = f.lit_remaining > 0;

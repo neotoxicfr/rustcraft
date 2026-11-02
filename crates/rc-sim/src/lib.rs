@@ -169,6 +169,8 @@ mod tests_g3f03;
 mod tests_g6f11;
 #[cfg(test)]
 mod tests_g3f11;
+#[cfg(test)]
+mod tests_g3f13;
 
 use std::path::{Path, PathBuf};
 

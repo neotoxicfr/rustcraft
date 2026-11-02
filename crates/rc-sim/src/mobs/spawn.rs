@@ -734,6 +734,8 @@ impl Server {
     /// inhabited time and the thunderstorm run even without the `spawn_mobs` rule; a spectator
     /// retains no chunk.
     pub(crate) fn natural_spawn_tick(&mut self) {
+        #[cfg(test)]
+        crate::server::phase("spawns");
         let do_spawn = self.rule("minecraft:spawn_mobs", true);
         // Players (host and guests): position and spectator state. Spawn chunks
         // (the spawn chunk collection): within 8 of a player at most, loaded, and within 128 blocks
@@ -1135,12 +1137,22 @@ impl Server {
         out
     }
 
-    /// Center chunks of the simulation: those of the players (host and guests).
+    /// A player in this game mode holds the player tickets (loading and simulation): not a
+    /// spectator under the rule `spectators_generate_chunks` false, around whom nothing loads
+    /// and nothing is simulated (G3-F13).
+    pub(crate) fn holds_tickets(&self, game_mode: i32) -> bool {
+        game_mode != 3 || self.rule("minecraft:spectators_generate_chunks", true)
+    }
+
+    /// Center chunks of the simulation: those of the players (host and guests) holding tickets.
     pub(crate) fn sim_centers(&self) -> Vec<(i32, i32)> {
-        let mut out = vec![self.chunk_pos()];
+        let mut out = Vec::with_capacity(1);
+        if self.holds_tickets(self.game_mode) {
+            out.push(self.chunk_pos());
+        }
         if let Some(l) = &self.lan {
             for g in &l.guests {
-                if let Some(c) = g.ctx.as_ref().filter(|_| g.joined && !g.gone) {
+                if let Some(c) = g.ctx.as_ref().filter(|c| g.joined && !g.gone && self.holds_tickets(c.game_mode)) {
                     out.push(((c.pos[0].floor() as i32) >> 4, (c.pos[2].floor() as i32) >> 4));
                 }
             }
@@ -1169,17 +1181,26 @@ impl Server {
     pub(crate) fn mob_chunk_ticking(&self, c: (i32, i32)) -> bool {
         let r = self.view.min(self.sim_dist);
         let near = |p: (i32, i32)| (c.0 - p.0).abs() <= r && (c.1 - p.1).abs() <= r;
-        if self.cmd.forced.contains(&c) || near(self.chunk_pos()) {
+        if self.cmd.forced.contains(&c) || (near(self.chunk_pos()) && self.holds_tickets(self.game_mode)) {
             return true;
         }
         self.lan.as_ref().is_some_and(|l| {
             l.guests.iter().any(|g| {
-                g.ctx
-                    .as_ref()
-                    .filter(|_| g.joined && !g.gone)
-                    .is_some_and(|ctx| near(((ctx.pos[0].floor() as i32) >> 4, (ctx.pos[2].floor() as i32) >> 4)))
+                g.ctx.as_ref().filter(|ctx| g.joined && !g.gone && self.holds_tickets(ctx.game_mode)).is_some_and(
+                    |ctx| near(((ctx.pos[0].floor() as i32) >> 4, (ctx.pos[2].floor() as i32) >> 4)),
+                )
             })
         })
+    }
+
+    /// An entity other than a player at `pos` ticks this tick (§ 1.2 step 11b): its chunk is
+    /// loaded and "ticking entities" (`mob_chunk_ticking`, or the dragon fight's ticket); in a
+    /// parked dimension (portal ticket, no player there), a loaded chunk is enough.
+    pub(crate) fn entity_ticks_at(&self, pos: [f64; 3]) -> bool {
+        let c = ((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4);
+        // Distance tests first (a few comparisons), the chunk table lookup last.
+        (self.dims.home.is_some() || self.mob_chunk_ticking(c) || self.fight_ticket_at(c))
+            && matches!(self.chunks.get(&c), Some(Some(_)))
     }
 
     fn forced_near(&self, c: (i32, i32), r: i32) -> bool {
@@ -1225,15 +1246,14 @@ impl Server {
     pub(crate) fn chunk_simulated_now(&self, c: (i32, i32)) -> bool {
         let r = self.sim_dist + 1;
         let near = |p: (i32, i32)| (c.0 - p.0).abs() <= r && (c.1 - p.1).abs() <= r;
-        if near(self.chunk_pos()) || self.forced_near(c, 1) {
+        if (near(self.chunk_pos()) && self.holds_tickets(self.game_mode)) || self.forced_near(c, 1) {
             return true;
         }
         self.lan.as_ref().is_some_and(|l| {
             l.guests.iter().any(|g| {
-                g.ctx
-                    .as_ref()
-                    .filter(|_| g.joined && !g.gone)
-                    .is_some_and(|ctx| near(((ctx.pos[0].floor() as i32) >> 4, (ctx.pos[2].floor() as i32) >> 4)))
+                g.ctx.as_ref().filter(|ctx| g.joined && !g.gone && self.holds_tickets(ctx.game_mode)).is_some_and(
+                    |ctx| near(((ctx.pos[0].floor() as i32) >> 4, (ctx.pos[2].floor() as i32) >> 4)),
+                )
             })
         })
     }

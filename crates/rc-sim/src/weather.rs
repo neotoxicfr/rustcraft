@@ -513,6 +513,8 @@ impl Server {
     /// 24,000), all the sleepers get up (without sampling the list, emptied), then the rain
     /// stops.
     pub(crate) fn sleep_world_tick(&mut self) {
+        #[cfg(test)]
+        crate::server::phase("sleep");
         let pct = self.sleep_percentage();
         let needed = self.sleepers_needed(pct);
         if self.life.weather.sleep.1 < needed {

@@ -138,7 +138,8 @@ impl Server {
         for s in spits.iter_mut().filter(|s| !s.removed) {
             // Born during this entity walk: it waits for the next tick (born from a minecart,
             // after this tick, it is no longer skipped).
-            if self.walk.waits(std::mem::take(&mut s.born)) {
+            // G3-F13: outside a "ticking entities" chunk, it waits too.
+            if self.walk.waits(std::mem::take(&mut s.born)) || !self.entity_ticks_at(s.pos) {
                 continue;
             }
             s.tick += 1;
