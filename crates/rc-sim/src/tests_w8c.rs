@@ -518,13 +518,13 @@ fn strider_lava_ride_distance() {
     p.s.add_mob(m);
     p.s.mobs.mounts.riding.vehicle = Some(id);
     mob_mut(&mut p, id).lava_height = 0.5;
-    p.s.trig_tick();
+    p.s.trig_world_part();
     assert_eq!(p.s.prog.lava_ride, Some(p.s.pos));
     p.s.pos[0] += 51.0;
-    p.s.trig_tick();
+    p.s.trig_world_part();
     assert!(adv(&p, "minecraft:nether/ride_strider_in_overworld_lava"), "trigger missing");
     mob_mut(&mut p, id).lava_height = 0.0;
-    p.s.trig_tick();
+    p.s.trig_world_part();
     assert!(p.s.prog.lava_ride.is_none());
     done(p, dir);
 }
@@ -541,7 +541,7 @@ fn wind_charge_fall_after_explosion() {
     assert!(p.s.prog.expl_impact.is_some(), "impact not noted");
     p.s.pos[1] += 8.0;
     p.s.life.vit.fall = 0.5;
-    p.s.trig_tick();
+    p.s.trig_world_part();
     assert!(!adv(&p, "minecraft:adventure/who_needs_rockets"), "cause ignored");
     assert!(p.s.prog.expl_impact.is_none(), "impact kept");
     p.s.pos = start;
@@ -552,7 +552,7 @@ fn wind_charge_fall_after_explosion() {
     p.s.prog.expl_cause_next = None;
     p.s.pos[1] += 8.0;
     p.s.life.vit.fall = 0.5;
-    p.s.trig_tick();
+    p.s.trig_world_part();
     assert!(adv(&p, "minecraft:adventure/who_needs_rockets"), "trigger missing");
     done(p, dir);
 }

@@ -62,6 +62,51 @@ fn scene(tag: &str, family_of: impl Fn(usize) -> usize) {
     finish(p, dir);
 }
 
+/// 1,000 pigs (AI on), 25 of them in chunk 3, which leaves the ticking chunks and comes back every
+/// other tick (simulation distance 2, then 3): on each return the mob list is put back in rank
+/// order before the walk, then the walk looks mobs up.
+fn rejoin_scene() {
+    let (mut p, dir) = open("rejoin");
+    for k in 0..1000usize {
+        let (x, z) = if k < 25 {
+            (50.5 + (k % 5) as f64 * 2.5, -8.5 + (k / 5) as f64 * 2.5)
+        } else {
+            (-20.5 + (k % 30) as f64 * 2.0, -24.5 + (k / 30) as f64 * 1.4)
+        };
+        cmd(&mut p, &format!("summon minecraft:pig {x} -60 {z}"));
+    }
+    let tick = |p: &mut Probe| {
+        p.s.sim_dist = if p.s.tick.is_multiple_of(2) { 2 } else { 3 };
+        p.s.game_tick();
+        p.s.tick += 1;
+        let _ = p.take_events();
+    };
+    for _ in 0..60 {
+        tick(&mut p);
+    }
+    let ticks = 400;
+    let mut all = Vec::new();
+    for _ in 0..5 {
+        let t = std::time::Instant::now();
+        for _ in 0..ticks {
+            tick(&mut p);
+        }
+        all.push(t.elapsed().as_secs_f64() * 1.0e6 / f64::from(ticks));
+    }
+    let shown: Vec<String> = all.iter().map(|us| format!("{us:.0}")).collect();
+    eprintln!("bench_l10order rejoin: µs per server tick {}", shown.join(" "));
+    finish(p, dir);
+}
+
+#[test]
+#[ignore = "measurement bench"]
+fn bench_l10order_rejoin() {
+    crate::mobs::index::set_verify(false);
+    for _ in 0..2 {
+        rejoin_scene();
+    }
+}
+
 #[test]
 #[ignore = "measurement bench"]
 fn bench_l10order_walk() {

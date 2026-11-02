@@ -3492,3 +3492,20 @@ rounds, minimum of 5 passes of 400 ticks per scene, loaded machine (other agents
   O(list) setup paid per one-entity run), items and orbs alone 929-933 and 1,164-1,177 (within
   1 % of the default). Default 8 kept; both other ways stay behind the switch for the
   quiet-machine scenes (`crowd`, `village`, `tnt`).
+- Re-review fixes (02/11, quiet machine: no compilation during a measure; new scene
+  `bench_l10order_rejoin`: 1,000 pigs with AI, 25 of them in a chunk that leaves the ticking
+  chunks and comes back every other tick, so the mob list is re-sorted before every other walk;
+  five passes of 400 ticks, two rounds per executable, executables alternated): the mob index is
+  rebuilt at once after that re-sort instead of being marked stale (the walk's lookups and
+  per-species queries then use it instead of scanning the list until the end of the walk; one
+  rebuild per such tick either way, at the re-sort instead of after the mobs). Rebuilt
+  7,311-7,488 µs per tick, marked stale 7,252-7,405, rebuilt again 7,250-7,462: equal within noise
+  (pigs look few mobs up); kept, strictly less work where mobs look each other up. Lead not
+  tried: re-indexing only the slots the re-sort moved (a stable sort can shift every slot after
+  the first one that moved: O(list) as well). The base
+  before all the review fixes read 7,664-8,090 µs earlier on the same scene: that gap is not
+  attributed to these fixes (no work added to the walk), not claimed. The other fixes add no
+  measurable work: the player's world part only moved (same calls, at its rank), the freeze
+  test of a vehicle's passengers runs only when frozen, the plates also scan the server's item
+  and orb lists during a series (empty unless something was born in it), a parked world is
+  swept once per family after the player leaves (O(its entities), then a bit test per tick).

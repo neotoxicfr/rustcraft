@@ -885,9 +885,10 @@ impl Server {
         self.walk_alone(mask, move |s| s.proj_pre(runs), move |s| s.proj_post(runs));
     }
 
-    /// Before the entity walk: the player's projectile state (cooldowns, stuck arrows, gliding,
-    /// item in use), then network tracking, like the official server: the client receives the
-    /// state of the previous tick then does the current tick itself.
+    /// Before the entity walk: network tracking, like the official server (the client receives
+    /// the state of the previous tick then does the current tick itself), then the chunks ahead
+    /// of the players' flying pearls. The player's own projectile state (cooldowns, stuck arrows,
+    /// gliding, item in use) ticks after the walk (`proj_post`).
     pub(crate) fn proj_pre(&mut self, runs: bool) {
         self.proj_track();
         if runs {

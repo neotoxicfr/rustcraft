@@ -334,3 +334,168 @@ fn walk_interleaves_families_by_rank() {
     assert!(second.1[0] < 0.0 && second.0[0] < 0.5, "second item: blast then its move: {second:?}");
     finish(p, dir);
 }
+
+/// The host's world part, at its rank, counts its damage cooldown down and broadcasts its menu's
+/// changes: a chestplate worn by a TNT blast reaches the client in the tick of the blast when the
+/// TNT ranks before the player, on the next tick when it ranks after; the cooldown set by the hit
+/// reads 19 (counted that tick) or 20 at the end of the tick. Before, both ran after the whole
+/// walk: the packet in the tick of the blast and 19 either way.
+#[test]
+fn menu_broadcast_and_damage_cooldown_at_the_player_rank() {
+    let (mut p, dir) = open("l10-menu");
+    p.s.life.vit.dead = false;
+    p.s.life.vit.health = 20.0;
+    cmd(&mut p, "effect give @p minecraft:resistance 1000 4 true");
+    p.s.slots[6] = Some(crate::player::Stack { id: "minecraft:iron_chestplate".into(), count: 1, components: None });
+    let worn = |p: &Probe| {
+        p.take_events().iter().any(|e| {
+            matches!(e, rc_client::Event::Inventory(rc_proto_v777::item::Inventory::Slot { container: 0, slot: 6, .. }))
+        })
+    };
+    for tnt_first in [true, false] {
+        let tnt = "summon minecraft:tnt 2.5 -60 0.5 {fuse:1s,NoGravity:1b}";
+        if tnt_first {
+            cmd(&mut p, tnt);
+            p.s.walk.player = crate::walk::next_rank();
+        } else {
+            p.s.walk.player = crate::walk::next_rank();
+            cmd(&mut p, tnt);
+        }
+        p.s.broadcast_menus();
+        let _ = worn(&p);
+        p.s.life.vit.cooldown = 0;
+        game_ticks(&mut p, 1);
+        assert_eq!(worn(&p), tnt_first, "chestplate sent in the tick of the blast (TNT first: {tnt_first})");
+        assert_eq!(p.s.life.vit.cooldown, if tnt_first { 19 } else { 20 }, "cooldown (TNT first: {tnt_first})");
+        game_ticks(&mut p, 1);
+        assert_eq!(worn(&p), !tnt_first, "chestplate sent on the next tick (TNT first: {tnt_first})");
+    }
+    finish(p, dir);
+}
+
+/// `tick freeze` with the host on a pig that rides a minecart: the minecart carries the host
+/// through the pig, so it is not frozen; it ticks the pig, which ticks the host's world part.
+/// Before, the minecart was frozen (not the host's own vehicle) and the pig and the host were
+/// skipped as passengers: no world part at all (mining and demo stopped).
+#[test]
+fn frozen_game_ticks_a_minecart_carrying_the_host_through_a_pig() {
+    let (mut p, dir) = open("l10-freeze");
+    cmd(&mut p, "summon minecraft:minecart 1.5 -60 0.5 {NoGravity:1b}");
+    cmd(&mut p, "summon minecraft:pig 1.5 -60 0.5 {NoAI:1b}");
+    cmd(&mut p, "ride @e[type=minecraft:pig,limit=1] mount @e[type=minecraft:minecart,limit=1]");
+    cmd(&mut p, "ride @p mount @e[type=minecraft:pig,limit=1]");
+    p.s.teleport = None;
+    p.s.cmd.ticking.set_frozen(true); // `tick freeze`
+    crate::walk::TRACE.with_borrow_mut(|t| *t = Some(Vec::new()));
+    game_ticks(&mut p, 1);
+    let t = crate::walk::TRACE.with_borrow_mut(Option::take).expect("trace");
+    let t: Vec<Fam> = t.into_iter().filter(|f| matches!(f, Fam::Player | Fam::Cart)).collect();
+    assert_eq!(t, [Fam::Cart, Fam::Player], "the minecart ticks, then the host through the pig");
+    finish(p, dir);
+}
+
+/// Same with a stack of mobs: the host on a pig that rides another pig. The lower pig carries the
+/// host through the upper one, so it ticks while frozen (and ticks them both). Before, only the
+/// host's own mount escaped the freeze, and it is a passenger.
+#[test]
+fn frozen_game_ticks_a_mob_carrying_the_host_through_another() {
+    let (mut p, dir) = open("l10-freeze-mobs");
+    cmd(&mut p, "summon minecraft:pig 1.5 -60 0.5 {NoAI:1b,Tags:[\"low\"]}");
+    cmd(&mut p, "summon minecraft:pig 1.5 -60 0.5 {NoAI:1b,Tags:[\"top\"]}");
+    cmd(&mut p, "ride @e[tag=top,limit=1] mount @e[tag=low,limit=1]");
+    cmd(&mut p, "ride @p mount @e[tag=top,limit=1]");
+    p.s.teleport = None;
+    p.s.cmd.ticking.set_frozen(true); // `tick freeze`
+    crate::walk::TRACE.with_borrow_mut(|t| *t = Some(Vec::new()));
+    game_ticks(&mut p, 1);
+    let t = crate::walk::TRACE.with_borrow_mut(Option::take).expect("trace");
+    assert!(t.contains(&Fam::Player), "the host's world part ran through the two pigs: {t:?}");
+    finish(p, dir);
+}
+
+/// A shulker box item on a light weighted plate burns out at the start of an item series and
+/// spills its three stacks there; an item later in the series then lands on the plate, which
+/// counts it and the three born in the series (power 4), in both ways items tick. Before, the
+/// series with the list taken out counted only the items it started with (power 1).
+#[test]
+fn plates_count_items_born_during_an_item_series() {
+    let run = |one: bool| {
+        crate::drops::ONE_BY_ONE.with(|c| c.set(one));
+        let (mut p, dir) = open(if one { "l10-born-one" } else { "l10-born-run" });
+        cmd(&mut p, "setblock 4 -60 4 minecraft:light_weighted_pressure_plate");
+        let stack = |slot: i32, id: &str| format!("{{slot:{slot},item:{{id:\"minecraft:{id}\",count:1}}}}");
+        let contents = [stack(0, "stone"), stack(1, "dirt"), stack(2, "sand")].join(",");
+        cmd(
+            &mut p,
+            &format!(
+                "summon minecraft:item 4.5 -60 4.5 {{Health:1s,Fire:20s,Item:{{id:\"minecraft:shulker_box\",count:1,\
+                 components:{{\"minecraft:container\":[{contents}]}}}}}}"
+            ),
+        );
+        cmd(&mut p, "summon minecraft:item 4.5 -59.9 4.5 {Item:{id:\"minecraft:cobblestone\",count:1}}");
+        game_ticks(&mut p, 1);
+        let plate = crate::blocks::probe::state_string(&p.s, p.s.get([4, -60, 4]));
+        let born = p.s.life.drops.iter().filter(|d| !d.is_removed() && d.stack.id != "minecraft:cobblestone").count();
+        crate::drops::ONE_BY_ONE.with(|c| c.set(false));
+        finish(p, dir);
+        (plate, born)
+    };
+    for one in [false, true] {
+        let (plate, born) = std::thread::spawn(move || run(one)).join().expect("simulation");
+        assert_eq!(born, 3, "the box spilled its stacks (one by one: {one})");
+        assert!(plate.contains("power=4"), "cobblestone and the three spilled stacks: {plate} (one by one: {one})");
+    }
+}
+
+/// Entities left in a world the player leaves: on that world's next tick without the player they
+/// leave the list (their chunk no longer ticks), and when the player comes back they join it
+/// after the player, chunk by chunk. A TNT and a minecart (families a parked world without a
+/// ticket does not walk) summoned before the departure now tick after the player. Before, they
+/// kept their place in front of the player's new rank. Back before that tick, nothing leaves
+/// (`player_back_from_another_dimension_ticks_at_the_end`).
+#[test]
+fn entities_of_a_left_world_tick_after_the_player_back() {
+    use crate::dims::{NETHER, OVERWORLD, Transition, rel};
+    let (mut p, dir) = open("l10-parked");
+    cmd(&mut p, "summon minecraft:tnt 2.5 -60 4.5 {fuse:400s}");
+    cmd(&mut p, "summon minecraft:minecart 3.5 -60 6.5 {NoGravity:1b}");
+    let to = |dim: &str, pos: [f64; 3]| Transition {
+        dim: dim.into(),
+        pos,
+        yaw: 0.0,
+        pitch: 0.0,
+        relative: rel::ROTATION,
+        sound: false,
+        ticket: false,
+        missing_respawn: false,
+    };
+    p.s.change_dimension(to(NETHER, [0.5, 70.0, 0.5]));
+    p.s.dims_tick(); // the overworld's tick without the player
+    p.s.change_dimension(to(OVERWORLD, [0.5, -60.0, 0.5]));
+    p.s.loaded = true;
+    p.s.teleport = None;
+    crate::walk::TRACE.with_borrow_mut(|t| *t = Some(Vec::new()));
+    game_ticks(&mut p, 1);
+    let t = crate::walk::TRACE.with_borrow_mut(Option::take).expect("trace");
+    let t: Vec<Fam> = t.into_iter().filter(|f| matches!(f, Fam::Player | Fam::Sim | Fam::Cart)).collect();
+    assert_eq!(t, [Fam::Player, Fam::Sim, Fam::Cart], "the player, then what it left behind");
+    finish(p, dir);
+}
+
+/// A mob back in a ticking chunk is put back in rank order before the walk, and the mob index is
+/// rebuilt at once: the walk's lookups and per-species queries use it instead of scanning the
+/// list until the end of the walk.
+#[test]
+fn mob_index_rebuilt_when_a_mob_rejoins() {
+    let (mut p, dir) = open("l10-index");
+    p.s.sim_dist = 2;
+    cmd(&mut p, "summon minecraft:pig 48.5 -60 4.5 {NoAI:1b}");
+    cmd(&mut p, "summon minecraft:pig 4.5 -60 4.5 {NoAI:1b}");
+    let far = p.s.mobs.list.iter().flatten().find(|m| m.pos[0] > 40.0).expect("pig of chunk 3").id;
+    game_ticks(&mut p, 1);
+    p.s.sim_dist = 3;
+    p.s.walk_rejoin();
+    assert_eq!(p.s.mobs.list.last().and_then(Option::as_ref).map(|m| m.id), Some(far), "back at the end");
+    assert!(p.s.mobs.index.kind_slots(&p.s.mobs.list, Kind::Pig).is_some(), "per-species index in use");
+    finish(p, dir);
+}

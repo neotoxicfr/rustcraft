@@ -977,15 +977,30 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   and ticks from the next walk. An item merges with its neighbours in its own tick, at its rank,
   as in the game. Phases run for a whole family stay before the walk (network tracking; the
   player's hand, memory, parrots, swimming and stingers, at their former place before the mobs;
-  its cushion seat) or after it (removals, the player's pickups, health, menus, item cooldowns
-  and use, mount, pushes): those are the player's own tick, which comes after the world. Tests
+  its cushion seat) or after it (removals, the player's pickups, health, item cooldowns and use,
+  mount, pushes, a second check that its open menu is still usable): those are the player's own
+  tick, which comes after the world. The host's world part at its rank holds, in the game's
+  order, its mining and demo, its warden warning tracker, its damage cooldown countdown, the
+  broadcast of its menu's changes (`inventory_changed` fires with it) then the check that the
+  menu is still usable (closed otherwise), the `tick`, `levitation`, fall start and
+  lava-on-vehicle triggers, then the sending of its advancements and screen effects. What changes
+  after its rank (a pickup, armour worn by a hit from an entity ranked after it, an advancement
+  granted by the player's own tick) reaches the client on the next tick, like the game. A
+  vehicle carrying the host, even through another passenger, is never frozen by `tick freeze`.
+  During an item (orb) series taken out of the list, the plates also count the items (orbs)
+  born in the series. A parked world's families its own walk does not visit leave the list on
+  its first tick without the player (where no forced chunk or pearl ticket keeps them ticking)
+  and come back after the player when it returns, chunk by chunk (`walk_park_sweep`). Tests
   `tests_l9tick::item_before_tnt_moves_on_the_next_tick` (no longer ignored) and
   `tests_l10order` (TNT minecart before an item, arrow and a mob summoned after it, an entity
   back in a ticking chunk and ranked before what the walk spawns, two items on both sides of a
   TNT, equivalence of the two ways items and orbs tick, items merged before a hopper minecart
   takes them, an orb born during the walk seen by a later merge, a shield disabled by a mob
   ending after 99 more ticks, the player's rank at the start, after a respawn, back from another
-  dimension and in a minecart; `lan::tests_g3f05::guest_respawn_keeps_the_host_rank`). Side
+  dimension and in a minecart, its menu broadcast and damage cooldown at its rank, a frozen
+  minecart or mob carrying the host through a passenger, plates counting the items born during
+  a series, the entities of a left world ticking after the returning player, the mob index
+  rebuilt at a return; `lan::tests_g3f05::guest_respawn_keeps_the_host_rank`). Side
   effect checked against the game: the remount delay of a player getting
   off a minecart reads 59 at the end of that tick (dismount during the minecart's tick, countdown
   in the player's own tick after the world), 60 before. World fingerprints unchanged.
@@ -1002,7 +1017,18 @@ Files: `apps/client/src/render.rs`, `crates/rc-mesh/src/visibility.rs`, `apps/cl
   (e) the player's hand, memory, parrots, swimming and stingers still run before the mobs (their
   place since S4), where the game counts them in the player's own tick after the world (P3, a
   tick of delay at most on what mobs read of them); (f) a host seated on a cushion is not ticked
-  at the cushion's rank (its seat runs before the walk) (P3).
+  at the cushion's rank (its seat runs before the walk) (P3); (g) parts of the game's world part
+  of the player kept elsewhere: the client load timeout is computed from the join tick
+  (`player_ready`) and reads the same all along a tick, where the game counts it down at the
+  player's rank (on the 60th tick an entity ranked before the player still finds it not loaded,
+  so its hit is refused) (P3); the spectator's camera following its target is not modelled on
+  the server (the position comes from the client; separate); the creative and crouch attribute
+  modifiers are computed when read (nothing to time); the attribute packet leaves after the walk
+  every tick where the game sends it from network tracking, before the walk, every other tick
+  (P3); a LAN guest runs its whole world part in its own tick after the world ((a)); (h) an
+  entity added to a parked world after its sweep (summoned there by `execute in`, or come
+  through a portal whose ticket ends before the player returns) keeps its rank instead of leaving
+  the list, so it ticks before the player once back (P3).
 - **Packed block entities** (P3, residue of L9-TICK): a block entity saved packed waits until its chunk can tick (3 × 3 loaded) or is saved (the save reads every block entity, which promotes it, `blocks/entities.rs` `promote_packed_for_save`). Not modelled: the game also promotes one as soon as anything reads it before then (a hopper of a ticking neighbour pulling from it, a comparator reading it), which moves its ticker's rank earlier. Fix: promote the waiting entry in the block entity accessors of `containers.rs` and the comparator reading.
 
 ## P3, per mission

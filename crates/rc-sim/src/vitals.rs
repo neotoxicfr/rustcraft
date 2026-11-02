@@ -1130,9 +1130,7 @@ impl Server {
         if self.life.vit.age.is_multiple_of(20) {
             self.combat_recheck(); // W8a: end of combat after 5 s (15 s in combat) without a hit
         }
-        if self.life.vit.cooldown > 0 {
-            self.life.vit.cooldown -= 1;
-        }
+        // The damage cooldown counts down in the player's world part (`player_world_rest`).
         if self.life.vit.dead {
             self.life.vit.death_time += 1;
             // End of death (20 ticks): the player is removed from the world like any living entity

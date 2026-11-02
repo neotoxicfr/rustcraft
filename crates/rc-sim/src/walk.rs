@@ -24,7 +24,8 @@ use crate::server::Server;
 pub(crate) enum Fam {
     /// Falling blocks and primed TNT (`bs.entities.list`).
     Sim,
-    /// The host player: the part of its tick that belongs to the world (mining progress, demo).
+    /// The host player: the part of its tick that belongs to the world (mining progress, demo,
+    /// menu broadcast, advancements sent: `player_world_tick`).
     Player,
     Item,
     Orb,
@@ -76,8 +77,8 @@ pub(crate) const fn bit(f: Fam) -> u16 {
 /// Every family (the server tick).
 pub(crate) const ALL: u16 = (1 << FAMS.len()) - 1;
 
-/// Families still visited when the game is frozen (`tick freeze`): the player, and its mount
-/// (a mob or a minecart).
+/// Families still visited when the game is frozen (`tick freeze`): the player, and a mob or a
+/// minecart that carries it, even through another passenger (`passengers_carry_player`).
 pub(crate) const FROZEN: u16 = bit(Fam::Player) | bit(Fam::Mob) | bit(Fam::Cart);
 
 /// Rank counter. Only the order of two ranks of the same server matters, so a single counter
@@ -138,6 +139,11 @@ pub(crate) struct Walk {
     pub(crate) spare_orb: Option<crate::drops::Orb>,
     /// Orb merge buckets built for this walk (`drops::orb_buckets`).
     pub(crate) buckets_built: bool,
+    /// Families of a parked world already swept out of the list (`walk_park_sweep`); kept with
+    /// the world, cleared when the player leaves it.
+    pub(crate) swept: u16,
+    /// Families a parked world's own walk visits (`tick_parked_entities`), 0 otherwise.
+    parked: u16,
 }
 
 impl Walk {
@@ -218,7 +224,7 @@ impl Server {
             // Gone (removed, or back by `meet`): forgotten.
             let Some(i) = self.fam_find(f, r) else { continue };
             let Some(pos) = self.fam_pos(f, i) else { continue };
-            if if f == Fam::Deco { self.deco_ticks_at(pos) } else { self.entity_ticks_at(pos) } {
+            if self.fam_ticks_at(f, pos) {
                 let c = ((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4);
                 back.push((f, i, r, c, i64::from((pos[1].floor() as i32) >> 4) & 0xF_FFFF));
             } else {
@@ -283,6 +289,45 @@ impl Server {
             Fam::Cloud => self.proj.clouds.get(i)?.pos,
             Fam::Player | Fam::Hook => return None,
         })
+    }
+
+    /// An entity of family `f` at `pos` ticks: its chunk ticks entities (a decoration's 3 × 3
+    /// chunks loaded too). In a parked world, a loaded chunk is enough for the families its own
+    /// walk visits (portal or pearl ticket: `entity_ticks_at`); the others tick only where a
+    /// chunk ticks entities without the player (forced chunk, pearl ticket).
+    fn fam_ticks_at(&self, f: Fam, pos: [f64; 3]) -> bool {
+        if f == Fam::Deco {
+            return self.deco_ticks_at(pos);
+        }
+        if self.dims.home.is_some() && self.walk.parked & bit(f) == 0 {
+            let c = ((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4);
+            return self.entities_tick_in(c) && matches!(self.chunks.get(&c), Some(Some(_)));
+        }
+        self.entity_ticks_at(pos)
+    }
+
+    /// Tick of a parked world, player absent (its position moved away): the entities of the
+    /// families of `mask` (not visited by its own walk) whose chunk no longer ticks entities
+    /// leave the list, as in the game on that world's first tick without the player's ticket;
+    /// they come back after the player when it returns (`walk_rejoin`, chunk by chunk). Not done
+    /// when the player leaves: back before that tick, nothing has left the list.
+    pub(crate) fn walk_park_sweep(&mut self, mask: u16) {
+        for &f in &FAMS {
+            if mask & bit(f) == 0 {
+                continue;
+            }
+            for i in 0..self.fam_len(f) {
+                let Some(pos) = self.fam_pos(f, i) else { continue };
+                if self.fam_ticks_at(f, pos) {
+                    continue;
+                }
+                let Some(mut r) = self.fam_rank(f, i) else { continue };
+                self.meet(&mut r, false, f);
+                if let Some(slot) = self.fam_rank_mut(f, i) {
+                    *slot = r;
+                }
+            }
+        }
     }
 
     /// Rank of the entity of slot `i`, to change it.
@@ -469,7 +514,8 @@ impl Server {
         }
         if has(Fam::Mob) {
             self.mobs.list.sort_by_key(|m| m.as_ref().map_or(0, |m| m.rank));
-            self.mobs.index.mark_stale();
+            // Rebuilt now: the walk that follows a return looks mobs up by the index.
+            self.mobs.index.refresh(&self.mobs.list, true);
         }
         if has(Fam::Fang) {
             self.mobs.ill.fangs.sort_by_key(|f| f.rank);
@@ -501,12 +547,36 @@ impl Server {
     }
 
     /// The host player's own part of the world walk, at its rank: progress of the block being
-    /// mined (and the delayed break), then the demo messages.
+    /// mined (and the delayed break), the demo messages, its warden warning tracker, then the rest
+    /// (`player_world_rest`).
     fn player_world_tick(&mut self) {
         #[cfg(test)]
         trace(Fam::Player);
         self.tick_mining();
         self.demo_tick();
+        self.mobs.rec.warden_tracker.tick(); // F14: the host's (a LAN guest has none)
+        self.player_world_rest();
+    }
+
+    /// A player's world part after its mining, demo and warden tracker, in the game's order: its
+    /// damage cooldown counts down, its menu's changes are broadcast (`inventory_changed` fires
+    /// with them) then the menu is closed if no longer usable, the `tick`, `levitation`, fall
+    /// start and lava-on-vehicle triggers, then its advancements and screen effects are sent.
+    /// What changes after it in the tick (pickups, the player's own tick) reaches the client on
+    /// the next one.
+    pub(crate) fn player_world_rest(&mut self) {
+        let v = &mut self.life.vit;
+        if v.cooldown > 0 {
+            v.cooldown -= 1;
+        }
+        self.broadcast_menus();
+        self.trig_inventory_scan();
+        if self.life.menu.is_some() && !self.menu_valid() {
+            self.close_menu(true);
+        }
+        self.trig_world_part();
+        self.adv_flush(true);
+        self.post_effects_tick(); // G3-F08: after the advancements like the game
     }
 
     /// The host rides a mob or a minecart of this world that has it as a passenger: like any
@@ -529,8 +599,8 @@ impl Server {
     }
 
     /// Entity phase of the server tick: phases run for a whole family before the walk, the
-    /// merged walk, then the phases after it. Frozen (`tick freeze`), only the player and its
-    /// mount tick; the player's own phases still run.
+    /// merged walk, then the phases after it. Frozen (`tick freeze`), only the player and what
+    /// carries it tick; the player's own phases still run.
     pub(crate) fn tick_entities(&mut self) {
         #[cfg(test)]
         crate::server::phase("entities");
@@ -569,6 +639,7 @@ impl Server {
     /// Entity walk of a parked world, player absent: under a portal ticket its falling blocks,
     /// TNT, items, orbs and projectiles; under a player's pearl ticket alone, its projectiles.
     pub(crate) fn tick_parked_entities(&mut self, portal: bool) {
+        self.walk.parked = parked_walk(portal);
         let own = self.walk_begin();
         if portal {
             self.sim_track();
@@ -576,8 +647,7 @@ impl Server {
         }
         self.proj_track();
         self.load_pearl_chunks();
-        let fams = bit(Fam::Sim) | bit(Fam::Item) | bit(Fam::Orb);
-        self.walk_run(bit(Fam::Proj) | if portal { fams } else { 0 });
+        self.walk_run(self.walk.parked);
         if portal {
             self.sim_post();
             self.drops_post();
@@ -585,5 +655,16 @@ impl Server {
         }
         self.proj_retain();
         self.walk_end(own);
+        self.walk.parked = 0;
     }
 }
+
+/// Families a parked world's walk visits: its projectiles, and under a portal ticket its falling
+/// blocks, TNT, items and orbs.
+pub(crate) const fn parked_walk(portal: bool) -> u16 {
+    bit(Fam::Proj) | if portal { bit(Fam::Sim) | bit(Fam::Item) | bit(Fam::Orb) } else { 0 }
+}
+
+/// Families a parked world sweeps out of the list (`walk_park_sweep`): all but the player and
+/// its bobber (neither is kept with a world).
+pub(crate) const SWEPT: u16 = ALL & !bit(Fam::Player) & !bit(Fam::Hook);

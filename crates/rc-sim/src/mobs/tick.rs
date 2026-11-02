@@ -75,17 +75,20 @@ impl Server {
         self.walk_alone(mobs, Self::mobs_pre, move |s| s.mobs_post(runs));
     }
 
-    /// Before the entity walk: the player's parts the mobs read, the shriekers' warnings.
+    /// Before the entity walk: the player's parts the mobs read, its steps on sculk.
     pub(crate) fn mobs_pre(&mut self) {
         self.mobs_player_tick();
-        self.rec_world_tick(); // F14: shrieker warnings
+        self.rec_world_tick(); // G6-F10: sensors and shriekers stepped on
     }
 
-    /// Mob of slot `i`, at its rank in the entity walk. Frozen (`tick freeze`), only the
-    /// player's mount ticks.
+    /// Mob of slot `i`, at its rank in the entity walk. Frozen (`tick freeze`), only a mob
+    /// carrying the player ticks, even through another passenger.
     pub(crate) fn mob_visit(&mut self, i: usize) {
         let Some(mut m) = self.mobs.list.get_mut(i).and_then(Option::take) else { return };
-        if m.removed || (!self.cmd.ticking.runs() && self.mobs.mounts.riding.vehicle != Some(m.id)) {
+        let frozen = !self.cmd.ticking.runs()
+            && self.mobs.mounts.riding.vehicle != Some(m.id)
+            && !self.carries_player(&m);
+        if m.removed || frozen {
             self.mobs.list[i] = Some(m);
             return;
         }

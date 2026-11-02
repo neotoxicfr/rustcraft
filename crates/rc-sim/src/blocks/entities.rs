@@ -1233,24 +1233,16 @@ impl Server {
                 .filter(|e| !e.removed && ts.is_none_or(|t| t.0 != e.id) && hit(&Self::entity_box(e)))
                 .count();
             n += usize::from(ts.is_some_and(|t| hit(&t.1)));
-            // Items and orbs: during a run with their list taken out, the positions kept up to
-            // date as it goes on; otherwise the list, and the one being ticked out of its slot
-            // where it is now.
+            // Items and orbs: the list (during a run with it taken out, the ones born since the
+            // run began, the others' positions kept up to date as it goes on), and the one being
+            // ticked out of its slot where it is now.
             let seen = |p: [f64; 3], gone: bool, w: f64| !gone && hit(&around(p, w, w));
             let live = |l: &[([f64; 3], bool)], w: f64| l.iter().filter(|&&(p, gone)| seen(p, gone, w)).count();
             let one = |t: Option<([f64; 3], bool)>, w: f64| usize::from(t.is_some_and(|(p, gone)| seen(p, gone, w)));
-            n += if c.items_taken {
-                live(&c.live_items, 0.25)
-            } else {
-                self.life.drops.iter().filter(|d| !d.is_removed() && hit(&around(d.pos, 0.25, 0.25))).count()
-                    + one(c.ticking_item, 0.25)
-            };
-            n += if c.orbs_taken {
-                live(&c.live_orbs, 0.5)
-            } else {
-                self.life.orbs.iter().filter(|o| !o.is_removed() && hit(&around(o.pos, 0.5, 0.5))).count()
-                    + one(c.ticking_orb, 0.5)
-            };
+            n += self.life.drops.iter().filter(|d| !d.is_removed() && hit(&around(d.pos, 0.25, 0.25))).count();
+            n += if c.items_taken { live(&c.live_items, 0.25) } else { one(c.ticking_item, 0.25) };
+            n += self.life.orbs.iter().filter(|o| !o.is_removed() && hit(&around(o.pos, 0.5, 0.5))).count();
+            n += if c.orbs_taken { live(&c.live_orbs, 0.5) } else { one(c.ticking_orb, 0.5) };
             // Projectile being ticked: its current box, not its slot still at the old place.
             let tp = c.ticking_proj;
             n += self

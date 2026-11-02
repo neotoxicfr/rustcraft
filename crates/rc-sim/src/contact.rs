@@ -98,7 +98,8 @@ pub struct Contact {
     /// moved at their new place, the following ones at the old one, this one where it is now.
     pub(crate) ticking_item: Option<([f64; 3], bool)>,
     /// During a long run of items ticked with their list taken out of the server
-    /// (`items_taken`): position and removal of each, kept up to date as the run goes on.
+    /// (`items_taken`): position and removal of each, kept up to date as the run goes on (the
+    /// items born during the run are in the server's list meanwhile, counted from there).
     pub(crate) live_items: Vec<([f64; 3], bool)>,
     pub(crate) items_taken: bool,
     /// Same for the experience orbs.

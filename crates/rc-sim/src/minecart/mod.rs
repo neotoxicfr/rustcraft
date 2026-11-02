@@ -440,10 +440,14 @@ impl Server {
     }
 
     /// Minecart of slot `i`, at its rank in the entity walk (once per world tick, command block
-    /// ones included). Frozen (`tick freeze`), only the player's one ticks.
+    /// ones included). Frozen (`tick freeze`), only one carrying the player ticks, even through
+    /// another passenger.
     pub(crate) fn cart_visit(&mut self, i: usize) {
         let Some(mut cart) = self.carts.list.get_mut(i).and_then(Option::take) else { return };
-        if cart.removed || (!self.cmd.ticking.runs() && self.pcart.vehicle != Some(cart.id)) {
+        let frozen = !self.cmd.ticking.runs()
+            && self.pcart.vehicle != Some(cart.id)
+            && !self.passengers_carry_player(&cart.passengers, cart.id);
+        if cart.removed || frozen {
             self.carts.list[i] = Some(cart);
             return;
         }

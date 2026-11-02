@@ -1184,8 +1184,8 @@ impl Server {
             self.send_teleport();
         }
         // Entity walk (`walk.rs`): every entity of the world in the order it joined the
-        // world's list, every kind together, the player's mining and demo at its rank; then the
-        // player's health, menus, pushes and pickups.
+        // world's list, every kind together, the player's world part at its rank (mining, demo,
+        // menu broadcast, advancements sent); then the player's health, pushes and pickups.
         self.tick_entities();
         // Block entities after all the entities, like the game: a piston pushes an entity
         // after its own movement of the tick (slime momentum consumed on the next tick); one
@@ -1197,7 +1197,7 @@ impl Server {
         self.lodestone_compass_tick(); // G5-F10: lodestone compasses
         self.dims_tick(); // S6: portals, parked dimensions
         self.commands_tick(); // S5 : suggestions, scores
-        self.progress_tick(); // S9: time statistics, triggers, sending of advancements
+        self.progress_tick(); // S9: time statistics, triggers of the player's own tick
         if runs {
             self.gametest_tick(); // G3-F06: in-game tests, after the world and the players
         }

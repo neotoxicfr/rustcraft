@@ -1060,8 +1060,10 @@ impl Server {
             self.teleport = self.teleport.map(|(n, p, _)| (n, p, self.tick));
             self.send_teleport();
         }
+        // Its world part (in the game at its rank in the walk; here at the start of its tick).
         self.tick_mining();
         self.demo_tick();
+        self.player_world_rest();
         self.vitals_tick();
         self.mobs_player_tick(); // S4: hand, memory, parrots, swimming, darts
         self.proj_player_tick(); // S8: crossbow, reloads, stuck arrows, gliding
@@ -1069,10 +1071,10 @@ impl Server {
         self.proj_player_touch(); // S8: arrows picked up
         self.spin_attack_tick(); // S8: spin attack
         self.maps_tick(); // S8: held maps
+        // Its own tick checks the open menu again (changes broadcast by its world part).
         if self.life.menu.is_some() && !self.menu_valid() {
             self.close_menu(true);
         }
-        self.broadcast_menus();
         if let Some((tx, text)) = self.cmd.pending_suggest.take() {
             self.answer_suggestions(tx, &text);
         }

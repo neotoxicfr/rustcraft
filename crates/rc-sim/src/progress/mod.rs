@@ -912,13 +912,12 @@ impl Server {
         self.prog.stats.mark_all();
     }
 
-    /// Player tick: periodic triggers, inventory, time statistics, send.
+    /// Player's own tick, after the world: time statistics and its periodic triggers. The `tick`
+    /// trigger, the inventory changes and the sending of advancements and screen effects belong
+    /// to its world part, at its rank (`player_world_rest`).
     pub(crate) fn progress_tick(&mut self) {
         self.stats_tick();
         self.trig_tick();
-        self.trig_inventory_scan();
-        self.adv_flush(true);
-        self.post_effects_tick(); // G3-F08: screen effects, after the advancements like the game
     }
 }
 

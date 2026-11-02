@@ -1043,9 +1043,9 @@ impl Server {
         false
     }
 
-    /// World tick specific to the family: player warnings (before the mobs).
+    /// World tick specific to the family, before the mobs: the player's steps on sculk (its
+    /// warning tracker counts down in its world part, at its rank: `player_world_tick`).
     pub(crate) fn rec_world_tick(&mut self) {
-        self.mobs.rec.warden_tracker.tick();
         // G6-F10: player on the ground on a sculk sensor or a shrieker (block effects, every tick).
         if self.on_ground && self.game_mode != 3 && !self.mobs.rec.vib_blocks.is_empty() {
             let support = self.player_support();

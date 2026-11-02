@@ -68,6 +68,8 @@ pub(crate) struct World {
     pub sign_editors: HashMap<[i32; 3], u128>,
     /// L10-ORDER: entities of the dimension outside the entity list (`walk::Walk::left`).
     pub left: Vec<(crate::walk::Fam, u64)>,
+    /// L10-ORDER: families swept out of the list while parked (`walk::Walk::swept`).
+    pub swept: u16,
 }
 
 /// World generation settings (`data/minecraft/world_gen_settings.dat`): seed, and for
@@ -260,6 +262,7 @@ impl Server {
         swap(&mut self.mobs.ill.fangs, &mut w.fangs); // L9-TICK
         swap(&mut self.life.sign_editors, &mut w.sign_editors); // L9-TICK
         swap(&mut self.walk.left, &mut w.left); // L10-ORDER
+        swap(&mut self.walk.swept, &mut w.swept);
     }
 
     pub(crate) fn world_seed(&self) -> i64 {
@@ -340,6 +343,7 @@ impl Server {
             fangs: Vec::new(),
             sign_editors: HashMap::new(),
             left: Vec::new(),
+            swept: 0,
         }
     }
 
@@ -458,36 +462,52 @@ impl Server {
     fn parked_tick(&mut self, runs: bool) {
         // L9-TICK: a pearl ticket (of the host or of a guest, still flying or expiring) keeps
         // the world active like the game's.
-        let names: Vec<(String, i32, bool)> =
-            self.dims.parked.iter().map(|w| (w.dim.name.clone(), w.ticket, !w.proj.tickets.is_empty())).collect();
+        let names: Vec<(String, i32, bool, u16)> = self
+            .dims
+            .parked
+            .iter()
+            .map(|w| (w.dim.name.clone(), w.ticket, !w.proj.tickets.is_empty(), w.swept))
+            .collect();
         let home = self.dim.name.clone();
-        for (name, ticket, pearl) in names {
+        for (name, ticket, pearl, swept) in names {
             let has_gen = self.dims.parked.iter().any(|w| w.dim.name == name && w.generator.is_some());
-            if ticket <= 0 && !has_gen && !pearl {
+            // L10-ORDER: the families its own walk does not visit leave the list where their
+            // chunk no longer ticks, once until that walk visits them again.
+            let active = (ticket > 0 || pearl) && runs;
+            let walked = if active { crate::walk::parked_walk(ticket > 0) } else { 0 };
+            let sweep = crate::walk::SWEPT & !walked & !swept;
+            if ticket <= 0 && !has_gen && !pearl && sweep == 0 {
                 continue;
             }
             self.dims.home = Some(home.clone());
             self.dims.home_pos = self.pos;
             self.in_world(&name, |s| {
                 s.poll_gen();
-                if (ticket > 0 || pearl) && runs {
-                    // Portal ticket: items, falling blocks and projectiles continue
-                    // (player absent); a player's pearl keeps its own while it flies
-                    // (the game's pearl ticket), only its projectiles tick then.
-                    let (pos, ready) = (s.pos, s.loaded);
-                    s.pos = [f64::from(i32::MAX), -1.0e9, f64::from(i32::MAX)];
-                    s.loaded = false;
-                    let joined = s.joined_tick;
-                    s.joined_tick = s.tick + 1;
+                if !active && sweep == 0 {
+                    return;
+                }
+                // Player absent.
+                let (pos, ready, joined) = (s.pos, s.loaded, s.joined_tick);
+                s.pos = [f64::from(i32::MAX), -1.0e9, f64::from(i32::MAX)];
+                s.loaded = false;
+                s.joined_tick = s.tick + 1;
+                if active {
                     // Tickets of the previous tick applied, then the chunk source's purge.
                     s.proj.pearl_tickets_apply();
                     s.proj.pearl_tickets_purge(s.time);
+                }
+                s.walk.swept = (s.walk.swept & !walked) | sweep;
+                s.walk_park_sweep(sweep);
+                if active {
+                    // Portal ticket: items, falling blocks and projectiles continue; a player's
+                    // pearl keeps its own while it flies (the game's pearl ticket), only its
+                    // projectiles tick then.
                     s.tick_parked_entities(ticket > 0);
                     s.flush_block_changes();
-                    s.pos = pos;
-                    s.loaded = ready;
-                    s.joined_tick = joined;
                 }
+                s.pos = pos;
+                s.loaded = ready;
+                s.joined_tick = joined;
             });
             self.dims.home = None;
             if runs && let Some(w) = self.dims.parked.iter_mut().find(|w| w.dim.name == name) {
@@ -599,6 +619,8 @@ impl Server {
             for c in w.carts.list.iter_mut().flatten() {
                 c.track.seen = false;
             }
+            // L10-ORDER: its entities leave the list on its next tick (`walk_park_sweep`).
+            w.swept = 0;
         }
         self.proj_forget_tracking();
         self.carts_forget_tracking(); // G5-F06
