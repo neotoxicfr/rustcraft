@@ -278,8 +278,9 @@ fn lichen_skips_a_spread_outside_the_world() {
 }
 
 /// Micro-bench (loaded machine, `--ignored`): placing a feature in the live world, 9 chunks.
-/// Copy of the world into the region and region / world comparison, cell-by-cell reads (the
-/// previous code) against unpacking one pass per section; then a complete oak placement.
+/// Copy of the world into the region, cell-by-cell reads (the previous code) against unpacking
+/// one pass per section; then a complete oak placement (journal replayed since L9-STRUCT: the
+/// region / world comparison it replaced is gone).
 #[test]
 #[ignore = "micro-bench"]
 fn bench_g6f07_deco_copy_and_compare() {
@@ -296,8 +297,39 @@ fn bench_g6f07_deco_copy_and_compare() {
     let s = &w.p.s;
     let h = s.dim.height;
     let cs: Vec<(i32, i32)> = (-1..=1).flat_map(|dz| (-1..=1).map(move |dx| (dx, dz))).collect();
-    let dcs: Vec<_> = cs.iter().map(|&(cx, cz)| s.deco_chunk(cx, cz, &dg, &wd)).collect();
-    // The four variants, each over the 9 chunks; time in ms.
+    // Complete region copy (unpacking and height maps), 9 chunks.
+    let deco9 = || {
+        let t = Instant::now();
+        for &(cx, cz) in &cs {
+            black_box(s.deco_chunk(cx, cz, &dg, &wd));
+        }
+        t.elapsed().as_secs_f64() * 1e3
+    };
+    // Region copy shared among n threads (placement lead, L9-STRUCT).
+    let live: Vec<_> = cs.iter().map(|c| s.chunks.get(c).and_then(Option::as_deref)).collect();
+    let (data, states) = (&*s.data, &*s.states);
+    let deco9_par = |n: usize| {
+        let t = Instant::now();
+        std::thread::scope(|sc| {
+            for (part, lv) in cs.chunks(cs.len().div_ceil(n)).zip(live.chunks(cs.len().div_ceil(n))) {
+                let (dg, wd) = (&dg, &wd);
+                sc.spawn(move || {
+                    for (&c, l) in part.iter().zip(lv) {
+                        black_box(crate::server::Server::copy_chunk(data, states, h, *l, c, dg, wd, true));
+                    }
+                });
+            }
+        });
+        t.elapsed().as_secs_f64() * 1e3
+    };
+    let mut par = [f64::MAX; 4];
+    for _ in 0..30 {
+        for (k, n) in [1usize, 2, 4, 8].into_iter().enumerate() {
+            par[k] = par[k].min(deco9_par(n));
+        }
+    }
+    eprintln!("region copy on 1/2/4/8 threads (spawned): {par:.2?} ms");
+    // The two variants, each over the 9 chunks; time in ms.
     let copy = |by_section: bool| {
         let t = Instant::now();
         for &(cx, cz) in &cs {
@@ -316,29 +348,10 @@ fn bench_g6f07_deco_copy_and_compare() {
         }
         t.elapsed().as_secs_f64() * 1e3
     };
-    let compare = |by_section: bool| {
-        let t = Instant::now();
-        for dc in &dcs {
-            if by_section {
-                black_box(s.deco_changes(dc));
-            } else {
-                let mut n = 0;
-                for si in 0..h.sections {
-                    for i in 0..4096 {
-                        let (x, z, y) = ((i & 15) as i32, ((i >> 4) & 15) as i32, (i >> 8) as i32);
-                        let p = [dc.cx * 16 + x, h.min_y + si as i32 * 16 + y, dc.cz * 16 + z];
-                        n += usize::from(s.get(p) != dc.blocks[si * 4096 + i]);
-                    }
-                }
-                black_box(n);
-            }
-        }
-        t.elapsed().as_secs_f64() * 1e3
-    };
     // Alternated rounds, best time of each variant.
-    let mut best = [f64::MAX; 4];
+    let mut best = [f64::MAX; 3];
     for _ in 0..30 {
-        for (k, v) in [copy(false), copy(true), compare(false), compare(true)].into_iter().enumerate() {
+        for (k, v) in [copy(false), copy(true), deco9()].into_iter().enumerate() {
             best[k] = best[k].min(v);
         }
     }
@@ -350,10 +363,18 @@ fn bench_g6f07_deco_copy_and_compare() {
     let grown = spots.iter().filter(|&&at| w.p.s.place_world_feature("minecraft:oak", at)).count();
     let tree = t.elapsed().as_secs_f64() * 1e3 / spots.len() as f64;
     assert!(grown > 0, "no oak placed");
+    // Bone meal on grass: up to 128 attempts, each placing a grass or flower feature.
+    w.p.run("fill -16 39 16 31 39 31 minecraft:grass_block\n");
+    let field: Vec<P> = (0..8).map(|i| [-12 + 3 * i, 40, 24]).collect();
+    let t = Instant::now();
+    for &at in &field {
+        w.p.s.grow_with_bone_meal(below(at));
+    }
+    let grass = t.elapsed().as_secs_f64() * 1e3 / field.len() as f64;
     eprintln!(
-        "9 chunks, best of 30: copy per cell {:.2} ms, per section {:.2} ms; comparison per cell \
-         {:.2} ms, per section {:.2} ms; complete oak placement {tree:.2} ms ({grown} placed)",
-        best[0], best[1], best[2], best[3]
+        "9 chunks, best of 30: copy per cell {:.2} ms, per section {:.2} ms, region copy {:.2} ms; \
+         complete oak placement {tree:.2} ms ({grown} placed); bone meal on grass {grass:.2} ms",
+        best[0], best[1], best[2]
     );
 }
 

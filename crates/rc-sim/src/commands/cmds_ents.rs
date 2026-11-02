@@ -62,7 +62,6 @@ impl Server {
                 self.ok(s, tr!("commands.rotate.success", self.ent_display(e)));
                 Ok(1)
             }
-            "attribute" => self.cmd_attribute(s, p, seg),
             "scoreboard" => self.cmd_scoreboard(s, p, seg),
             "team" => self.cmd_team(s, p, seg),
             "trigger" => self.cmd_trigger(s, p, seg),
@@ -135,6 +134,7 @@ impl Server {
                 crate::nbtio::set(&mut full, "id", Nbt::String(ty.to_owned()));
                 crate::nbtio::set(&mut full, "Pos", Nbt::List(pos.iter().map(|&x| Nbt::Double(x)).collect()));
                 self.load_mob(&mut m, &full);
+                self.load_portal_cooldown(m.id, &full);
                 m.pos = pos;
                 m.old = pos;
                 m.sync_data();
@@ -209,6 +209,12 @@ impl Server {
         crate::nbtio::set(&mut n, "Pos", Nbt::List(pos.iter().map(|&x| Nbt::Double(x)).collect()));
         if n.get("UUID").is_none() {
             crate::nbtio::set(&mut n, "UUID", crate::nbtio::uuid_nbt(uuid));
+        }
+        // Armor stand, mannequin: the living entity the game builds, saved with all its fields.
+        if let Some(k @ (crate::decoration::DKind::Stand | crate::decoration::DKind::Mannequin)) =
+            crate::decoration::DKind::from_name(ty)
+        {
+            n = crate::decoration::summoned(k, pos, crate::nbtio::uuid(n.get("UUID")).unwrap_or(uuid), &n);
         }
         let chunk = ((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4);
         self.entities.entry(chunk).or_default().push((id, n));
@@ -598,118 +604,6 @@ impl Server {
         }
     }
 
-    fn cmd_attribute(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
-        let e = self.arg_entity(s, &p.arg(seg, "target").unwrap_or_default(), false)?;
-        let attr = args::id(&p.arg(seg, "attribute").unwrap_or_default());
-        let desc = tr!(&format!("attribute.name.{}", attr.trim_start_matches("minecraft:")));
-        let w: Vec<&str> = seg.path.iter().map(String::as_str).collect();
-        let Some(base) = self.attribute_base(e, &attr) else {
-            return Err(Fail(tr!("commands.attribute.failed.no_attribute", self.ent_display(e), desc)));
-        };
-        let scale: f64 = p.arg(seg, "scale").and_then(|v| v.parse().ok()).unwrap_or(1.0);
-        match (w.get(3).copied(), w.get(4).copied()) {
-            (Some("get"), _) => {
-                let r = (base * scale).floor() as i32;
-                self.ok(
-                    s,
-                    tr!("commands.attribute.value.get.success", desc, self.ent_display(e), super::text::jd(base)),
-                );
-                Ok(r)
-            }
-            (Some("base"), Some("get")) => {
-                let r = (base * scale).floor() as i32;
-                self.ok(
-                    s,
-                    tr!("commands.attribute.base_value.get.success", desc, self.ent_display(e), super::text::jd(base)),
-                );
-                Ok(r)
-            }
-            (Some("base"), Some("set")) => {
-                let v: f64 = p.arg(seg, "value").and_then(|x| x.parse().ok()).unwrap_or(0.0);
-                self.set_attribute_base(e, &attr, v);
-                self.ok(
-                    s,
-                    tr!("commands.attribute.base_value.set.success", desc, self.ent_display(e), super::text::jd(v)),
-                );
-                Ok(1)
-            }
-            _ => Err(Fail(tr!("commands.attribute.failed.entity", self.ent_display(e)))),
-        }
-    }
-
-    fn attribute_base(&self, e: E, attr: &str) -> Option<f64> {
-        match e {
-            E::Mob(i) => {
-                let m = self.mobs.mob_ref_any(i)?;
-                Some(match attr {
-                    "minecraft:max_health" => m.attrs.max_health.base,
-                    "minecraft:movement_speed" => m.attrs.speed.base,
-                    "minecraft:attack_damage" => m.attrs.attack.base,
-                    "minecraft:follow_range" => m.attrs.follow.base,
-                    "minecraft:armor" => m.attrs.armor.base,
-                    "minecraft:step_height" => m.attrs.step.base,
-                    "minecraft:gravity" => m.attrs.gravity.base,
-                    "minecraft:jump_strength" => m.attrs.jump.base,
-                    _ => return None,
-                })
-            }
-            E::Player => {
-                let saved = crate::nbtio::list(self.pdata.root.get("attributes"))
-                    .iter()
-                    .find(|a| a.get("id").and_then(Nbt::as_str) == Some(attr))
-                    .and_then(|a| a.get("base").and_then(crate::mobs::mob::f64_of));
-                saved.or(match attr {
-                    "minecraft:max_health" => Some(20.0),
-                    "minecraft:movement_speed" => Some(0.1),
-                    "minecraft:attack_damage" => Some(1.0),
-                    "minecraft:attack_speed" => Some(4.0),
-                    "minecraft:armor" | "minecraft:armor_toughness" | "minecraft:luck" => Some(0.0),
-                    "minecraft:block_interaction_range" => Some(4.5),
-                    "minecraft:entity_interaction_range" => Some(3.0),
-                    "minecraft:gravity" => Some(0.08),
-                    "minecraft:jump_strength" => Some(0.42),
-                    "minecraft:step_height" => Some(0.6),
-                    "minecraft:scale" => Some(1.0),
-                    "minecraft:safe_fall_distance" => Some(3.0),
-                    "minecraft:fall_damage_multiplier" => Some(1.0),
-                    _ => None,
-                })
-            }
-            _ => None,
-        }
-    }
-
-    fn set_attribute_base(&mut self, e: E, attr: &str, v: f64) {
-        match e {
-            E::Mob(i) => {
-                if let Some(m) = self.mobs.get_mut(i) {
-                    let slot = match attr {
-                        "minecraft:max_health" => &mut m.attrs.max_health,
-                        "minecraft:movement_speed" => &mut m.attrs.speed,
-                        "minecraft:attack_damage" => &mut m.attrs.attack,
-                        "minecraft:follow_range" => &mut m.attrs.follow,
-                        "minecraft:armor" => &mut m.attrs.armor,
-                        "minecraft:step_height" => &mut m.attrs.step,
-                        "minecraft:gravity" => &mut m.attrs.gravity,
-                        _ => &mut m.attrs.jump,
-                    };
-                    slot.base = v;
-                }
-            }
-            E::Player => {
-                let mut list: Vec<Nbt> = crate::nbtio::list(self.pdata.root.get("attributes")).to_vec();
-                list.retain(|a| a.get("id").and_then(Nbt::as_str) != Some(attr));
-                list.push(Nbt::Compound(vec![
-                    ("id".into(), Nbt::String(attr.into())),
-                    ("base".into(), Nbt::Double(v)),
-                ]));
-                crate::nbtio::set(&mut self.pdata.root, "attributes", Nbt::List(list));
-                self.send_attributes();
-            }
-            _ => {}
-        }
-    }
-
     /// `tick query|rate|freeze|unfreeze|step|sprint`.
     fn cmd_tick(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
         let w: Vec<&str> = seg.path.iter().map(String::as_str).collect();
@@ -719,8 +613,10 @@ impl Server {
                 let t = &self.cmd.ticking;
                 let (rate, busy, target) = (format!("{:.1}", t.rate()), t.average_tick_nanos(), t.nanos_per_tick());
                 let (p50, p95, p99, n) = t.percentiles();
+                // The query keeps its status for the source (the same status is relayed by the
+                // commands that change it).
                 if t.sprinting() {
-                    self.ok(s, tr!("commands.tick.status.sprinting"));
+                    self.ok_quiet(s, tr!("commands.tick.status.sprinting"));
                     self.ok(s, tr!("commands.tick.query.rate.sprinting", rate.clone(), ms(busy)));
                 } else {
                     let status = if t.frozen() {
@@ -730,7 +626,7 @@ impl Server {
                     } else {
                         "commands.tick.status.running"
                     };
-                    self.ok(s, tr!(status));
+                    self.ok_quiet(s, tr!(status));
                     self.ok(s, tr!("commands.tick.query.rate.running", rate.clone(), ms(busy), ms(target)));
                 }
                 self.ok(s, tr!("commands.tick.query.percentiles", ms(p50), ms(p95), ms(p99), n as i32));
@@ -812,13 +708,9 @@ impl Server {
     /// End of a sprint: report to the operators (source "Server", grey italic), previous freeze
     /// restored and announced.
     pub(crate) fn sprint_finished(&mut self, rep: &crate::tickrate::SprintReport) {
-        if self.rule("minecraft:send_command_feedback", true) && self.cmd.op >= 2 {
-            let msg = tr!("commands.tick.sprint.report", rep.ticks_per_second, rep.ms_per_tick.clone());
-            let mut c = tr!("chat.type.admin", lit("Server"), msg);
-            c.style.color = Some(super::text::GRAY);
-            c.style.italic = Some(true);
-            self.system(c);
-        }
+        let msg = tr!("commands.tick.sprint.report", rep.ticks_per_second, rep.ms_per_tick.clone());
+        let src = self.server_reply_source();
+        self.ok(&src, msg);
         self.on_tick_rate_changed();
         self.send_ticking_state();
     }

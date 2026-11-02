@@ -12,9 +12,9 @@ use rc_proto::varint::{read_varint, write_varint};
 
 use crate::server::Server;
 
-struct T {
-    s: Server,
-    session: rc_client::Session,
+pub(super) struct T {
+    pub(super) s: Server,
+    pub(super) session: rc_client::Session,
     dir: std::path::PathBuf,
 }
 
@@ -27,7 +27,7 @@ impl Drop for T {
 
 const FLOOR: i32 = 199;
 
-fn open(tag: &str) -> T {
+pub(super) fn open(tag: &str) -> T {
     let data = Arc::new(rc_testdata::version_data().expect("version data missing: G3-F05 tests impossible"));
     crate::registries::client_jar(&data).expect("client jar missing: G3-F05 tests impossible");
     let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-g3f05-{tag}-{}", std::process::id())));
@@ -74,7 +74,7 @@ fn open(tag: &str) -> T {
     t
 }
 
-fn drain(t: &T) -> Vec<Event> {
+pub(super) fn drain(t: &T) -> Vec<Event> {
     let mut out = Vec::new();
     while let Ok(e) = t.session.events.try_recv() {
         out.push(e);
@@ -82,19 +82,19 @@ fn drain(t: &T) -> Vec<Event> {
     out
 }
 
-fn publish(t: &mut T, guest_commands: bool) {
+pub(super) fn publish(t: &mut T, guest_commands: bool) {
     let req = super::Publish { open: true, port: 0, guest_commands, force_mode: None };
     t.s.lan_publish(&req).expect("opening");
 }
 
 /// Plugged-in guest: packets received, sending packets to the server.
-struct G {
-    from: Receiver<Vec<u8>>,
+pub(super) struct G {
+    pub(super) from: Receiver<Vec<u8>>,
     to: Sender<Vec<u8>>,
     id: i32,
 }
 
-fn join(t: &mut T, name: &str, view: u8) -> G {
+pub(super) fn join(t: &mut T, name: &str, view: u8) -> G {
     let (out, from) = crossbeam_channel::unbounded();
     let (to, inp) = crossbeam_channel::unbounded();
     let info = rc_proto_v777::play::ClientInformation { view_distance: view, ..Default::default() };
@@ -354,6 +354,39 @@ fn departure_vehicle_and_pearls() {
     );
 }
 
+/// L9-TICK: a guest's ender pearl carries its ticket like the host's (placed where it enters a
+/// chunk), and vanishes when its guest is dead (rule `ender_pearls_vanish_on_death`). Before:
+/// a parked world only stayed active for the host's pearls, and a dead guest's pearl flew on.
+#[test]
+fn guest_pearl_ticket_and_vanishing() {
+    let mut t = open("guest-pearl");
+    publish(&mut t, false);
+    let _g = join(&mut t, "Guest", 2);
+    let uuid = rc_client::offline_uuid("Guest");
+    let pearl = |x: f64| {
+        use rc_proto::nbt::Nbt;
+        let list = |v: [f64; 3]| Nbt::List(v.map(Nbt::Double).to_vec());
+        Nbt::Compound(vec![
+            ("id".into(), Nbt::String("minecraft:ender_pearl".into())),
+            ("Pos".into(), list([x, f64::from(FLOOR + 3), 3.5])),
+            ("Motion".into(), list([1.0, 0.0, 0.0])),
+            ("NoGravity".into(), Nbt::Byte(1)),
+            ("Owner".into(), crate::nbtio::uuid_nbt(uuid)),
+        ])
+    };
+    let p = t.s.proj_from_nbt(&pearl(-0.5)).expect("pearl");
+    t.s.proj_add(p);
+    t.s.game_tick();
+    t.s.tick += 1;
+    assert_eq!(t.s.proj.tickets.iter().map(|k| k.chunk).collect::<Vec<_>>(), vec![(0, 0)], "guest pearl ticket");
+    // Its guest dead: the pearl vanishes at its next tick.
+    if let Some(c) = t.s.lan.as_mut().and_then(|l| l.guests[0].ctx.as_mut()) {
+        c.vit.dead = true;
+    }
+    t.s.game_tick();
+    assert!(t.s.proj.list.iter().filter(|p| p.owner == Some(uuid)).all(|p| p.removed), "pearl of a dead guest");
+}
+
 /// Shared vehicle (host and guest on the same camel): the guest's file does not carry
 /// the vehicle (`RootVehicle` absent) and the camel stays in the world at their departure.
 #[test]
@@ -591,6 +624,58 @@ fn mace_wind_burst_between_players() {
     assert!(health(&t) < h0, "hit landed");
     assert!(t.s.mobs.player_vel[1] > 0.5, "attacker not launched: {:?}", t.s.mobs.player_vel);
     assert_eq!(t.s.life.vit.fall, 0.0, "fall not reset");
+}
+
+/// L9-COMBAT: the smash knockback reaches another player standing near the target (pushed away
+/// from it and 0.7 upwards, its velocity sent to it), and a Wind Burst sends that player an
+/// explosion packet carrying its own knockback (before, only the current player was reached and
+/// its knockback went to everyone).
+#[test]
+fn smash_and_wind_burst_reach_other_player() {
+    let mut t = open("pvpreach");
+    publish(&mut t, false);
+    let g = join(&mut t, "Guest", 2);
+    fn guest(t: &mut T) -> &mut crate::lan::ctx::PlayerCtx {
+        t.s.lan.as_mut().unwrap().guests[0].ctx.as_mut().unwrap()
+    }
+    {
+        let c = guest(&mut t);
+        c.loaded = true;
+        c.teleport = None;
+        c.game_mode = 0;
+        c.pos = [0.5, f64::from(FLOOR + 1), 3.5];
+        c.player_vel = [0.0; 3];
+    }
+    let mut z = t.s.new_mob(crate::mobs::species::Kind::Zombie, [0.5, f64::from(FLOOR + 1), 1.5], 180.0);
+    z.attrs.max_health.base = 500.0;
+    z.health = 500.0;
+    let slot = 36 + t.s.held as usize;
+    t.s.slots[slot] = Some(crate::player::Stack { id: "minecraft:mace".into(), count: 1, components: None });
+    t.s.equipment_tick();
+    t.s.on_ground = false;
+    t.s.life.vit.fall = 4.0;
+    t.s.mobs.player_vel = [0.0; 3];
+    t.s.mobs.attack_ticker = 100;
+    let _ = guest_packets(&g);
+    t.s.player_attack_mob(&mut z);
+    let v = guest(&mut t).player_vel;
+    assert_eq!(v[1], f64::from(0.7f32), "other player not lifted: {v:?}");
+    assert!(v[2] > 0.0, "other player not pushed away: {v:?}");
+    let motion = ids(&t).set_entity_motion;
+    assert!(guest_packets(&g).iter().any(|p| id_of(p) == motion), "velocity not sent to the other player");
+    // Wind Burst centred between both players: each packet carries its own knockback.
+    guest(&mut t).player_vel = [0.0; 3];
+    t.s.wind_burst_with(None, None, [0.5, f64::from(FLOOR + 1) + 0.5, 2.5], 3.5, 1.2, "minecraft:entity.wind_charge.wind_burst", &mut []);
+    let v = guest(&mut t).player_vel;
+    assert!(v[2] > 0.0, "other player not pushed by the burst: {v:?}");
+    let explode = ids(&t).explode;
+    let ps = guest_packets(&g);
+    let p = ps.iter().find(|p| id_of(p) == explode).expect("explosion packet to the other player");
+    // Centre (3 doubles), radius (float), block count (int), then the knockback flag and vector.
+    let b = body(p);
+    assert_eq!(b[32], 1, "no knockback in the other player's packet");
+    let kz = f64::from_be_bytes(b[49..57].try_into().unwrap());
+    assert!((kz - v[2]).abs() < 1e-12, "the other player received another knockback: {kz} vs {}", v[2]);
 }
 
 /// Hit and kill between players, as on a mob: weapon used, damage dealt, player killed

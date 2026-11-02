@@ -1405,8 +1405,8 @@ impl Chat {
 
 /// Chat lines scrolled by a wheel motion over the open chat: clamped to one notch, 7 lines per
 /// notch (1 with Shift), truncated toward zero; an idle vertical axis scrolls nothing.
-pub fn wheel_lines(y: f32, shift: bool) -> i32 {
-    (f64::from(y).clamp(-1.0, 1.0) * if shift { 1.0 } else { 7.0 }) as i32
+pub fn wheel_lines(y: f64, shift: bool) -> i32 {
+    (y.clamp(-1.0, 1.0) * if shift { 1.0 } else { 7.0 }) as i32
 }
 
 #[cfg(test)]

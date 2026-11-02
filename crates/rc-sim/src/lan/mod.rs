@@ -14,6 +14,8 @@ mod tests;
 #[cfg(test)]
 mod tests_g3f05;
 #[cfg(test)]
+mod tests_g3f06;
+#[cfg(test)]
 mod tests_g3f07;
 
 use hashbrown::{HashMap, HashSet};
@@ -141,6 +143,15 @@ pub(crate) fn guest_level(allow_commands: bool, guest_commands: bool) -> u8 {
 /// Other player seen from the current player: their seat (`None`: the host), position, sneaking, dead,
 /// game mode.
 pub(crate) type OtherPlayer = (Option<usize>, [f64; 3], bool, bool, i32);
+
+/// Another living player of the world, as an area effect sees it (`lan_peers`).
+pub(crate) struct Peer {
+    pub who: Option<usize>,
+    pub id: i32,
+    pub pos: [f64; 3],
+    pub bbox: rc_physics::Aabb,
+    pub game_mode: i32,
+}
 
 /// Entity event that announces a permission level (24 + level).
 pub(crate) fn op_event(op: u8) -> i8 {
@@ -506,6 +517,21 @@ impl Server {
         }
     }
 
+    /// Seat of the player with this profile, in the form expected by `as_player` (`None`: the
+    /// host); `None` if they are not (or no longer) in the world.
+    pub(crate) fn seat_of_uuid(&self, uuid: u128) -> Option<Option<usize>> {
+        let active = self.lan.as_ref().and_then(|l| l.active);
+        if self.uuid == uuid {
+            return Some(active);
+        }
+        let l = self.lan.as_ref()?;
+        l.guests.iter().enumerate().find_map(|(k, g)| {
+            // The active guest's seat holds the host.
+            g.ctx.as_ref().filter(|c| c.uuid == uuid && (g.joined || Some(k) == active))?;
+            Some(if Some(k) == active { None } else { Some(k) })
+        })
+    }
+
     /// Player of entity `id` other than the current player: their seat (`None`: the host), their
     /// position, sneaking, dead, game mode.
     /// Player seated in minecart `cart`, in the form expected by `as_player` (`None`:
@@ -528,6 +554,28 @@ impl Server {
             let who = if Some(k) == l.active { None } else { Some(k) };
             Some((who, c.pos, c.sneaking, c.vit.dead, c.game_mode))
         })
+    }
+
+    /// Living players in game other than the current player, in player-list order: their seat
+    /// for `as_player` (`None`: the host), entity id, position, box, game mode. Read without
+    /// installing anyone (empty outside the local network).
+    pub(crate) fn lan_peers(&self) -> Vec<Peer> {
+        let Some(l) = &self.lan else { return Vec::new() };
+        let mut v = Vec::new();
+        for (k, g) in l.guests.iter().enumerate() {
+            let Some(c) = g.ctx.as_ref().filter(|c| !c.vit.dead && (g.joined || Some(k) == l.active)) else { continue };
+            let who = if Some(k) == l.active { None } else { Some(k) };
+            let p = Peer {
+                who,
+                id: c.player_id,
+                pos: c.pos,
+                bbox: crate::play::player_box(c.pos, c.sneaking),
+                game_mode: c.game_mode,
+            };
+            // The host first, like the player list.
+            if who.is_none() { v.insert(0, p) } else { v.push(p) }
+        }
+        v
     }
 
     /// Network loop: new guests, guest packets, departures.
@@ -650,7 +698,7 @@ impl Server {
         let Some(name) = self.lan.as_ref().and_then(|l| l.guests.get(i)).map(|g| g.name.clone()) else { return };
         // Forced wake-up of the sleeper (bed freed, list refreshed after the removal), save of the
         // player, then removal for the others.
-        let (uuid, id, shown) = self.as_guest(i, |sv| {
+        let (uuid, id, shown, pos) = self.as_guest(i, |sv| {
             sv.stop_sleep_in_bed(true, false);
             sv.award_custom("leave_game", 1);
             let mut jobs = Vec::new();
@@ -665,8 +713,10 @@ impl Server {
             sv.close_menu(true);
             // Written to their file, their vehicle and their pearls leave with them.
             sv.unload_with_leaving_player();
-            (sv.uuid, sv.player_id, sv.player_display_name())
+            (sv.uuid, sv.player_id, sv.player_display_name(), sv.pos)
         });
+        // A test run started by them keeps laying its grid around where they were.
+        self.tests_player_left(uuid, pos);
         let Some(l) = &mut self.lan else { return };
         l.guests.remove(i);
         l.shared.online.fetch_sub(1, Ordering::AcqRel);

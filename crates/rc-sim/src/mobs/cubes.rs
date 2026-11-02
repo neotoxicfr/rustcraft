@@ -731,7 +731,7 @@ impl Server {
             if m.cube.fuse > 0 {
                 m.cube.fuse -= 1;
             }
-            if let Some((power, _fire, _)) = m.cube.explosion
+            if let Some((power, fire, _)) = m.cube.explosion
                 && m.cube.fuse == 0
             {
                 // The lead falls (item on the ground, null link) before the explosion, which would hit it.
@@ -739,7 +739,17 @@ impl Server {
                 m.dead = true;
                 if self.rule("minecraft:tnt_explodes", true) {
                     let c = [m.pos[0], m.pos[1] + f64::from(m.height()) * 0.0625, m.pos[2]];
-                    self.mob_explode(m, c, power as f32);
+                    // A TNT's interaction with the blocks if mobs may grief, none otherwise; the
+                    // calculator of a TNT that went through a portal while its portal delay runs.
+                    // The calculator does not depend on the interaction.
+                    let portal = self.dims.ents.get(&m.id).is_some_and(|p| p.cooldown > 0);
+                    let blast = if self.rule("minecraft:mob_griefing", true) {
+                        super::explode::Blast::Tnt(portal)
+                    } else {
+                        super::explode::Blast::None(portal)
+                    };
+                    let by = Some(Ent::Mob(m.id));
+                    self.explode_with(Some(m), by, Some(m.id), c, power as f32, fire, "minecraft:player_explosion", blast);
                 }
                 self.mob_removed_effects(m); // "killed" removal effects, explosion or not
                 m.removed = true;
@@ -1006,12 +1016,35 @@ impl Server {
         self.sulfur_contact_damage(m);
     }
 
-    /// Contact damage of the archetype (burning cube) on the player.
-    fn sulfur_contact_damage(&mut self, m: &mut Mob) {
+    /// Contact damage of the archetype (burning cube) on the player (always attributed to the
+    /// cube), amount drawn on the cube's own random.
+    pub(crate) fn sulfur_contact_damage(&mut self, m: &mut Mob) {
         for (ty, amount, _attr) in m.cube.contacts.clone() {
-            let a = amount.as_f64().unwrap_or(0.0) as f32;
+            let a = crate::ench_fx::sample(&amount, &mut m.rng);
             let kb = (m.pos[0] - self.pos[0], m.pos[2] - self.pos[2]);
             self.player_hurt_by_mob(m, &ty, a, Some(kb));
+        }
+    }
+
+    /// Contact damage of the archetype on a mob the cube pushes: attributed to the cube only
+    /// if the archetype says so.
+    pub(crate) fn sulfur_contact_mob(&mut self, m: &mut Mob, o: &mut Mob) {
+        for (ty, amount, attr) in m.cube.contacts.clone() {
+            let a = crate::ench_fx::sample(&amount, &mut m.rng);
+            if attr {
+                self.mob_hurt_by(o, m, &ty, a);
+            } else {
+                self.mob_hurt(o, &ty, a, None, None);
+            }
+        }
+    }
+
+    /// Contact damage of the archetype on a minecart the cube touches (the one it rides
+    /// included): attributed to the cube only if the archetype says so.
+    pub(crate) fn sulfur_contact_cart(&mut self, m: &mut Mob, c: &mut crate::minecart::Cart) {
+        for (ty, amount, attr) in m.cube.contacts.clone() {
+            let a = crate::ench_fx::sample(&amount, &mut m.rng);
+            self.cart_hurt(c, &ty, a, attr.then_some(Ent::Mob(m.id)));
         }
     }
 
@@ -1335,6 +1368,8 @@ impl Server {
         }
         if m.can_explode() && (item == "minecraft:flint_and_steel" || item == "minecraft:fire_charge") {
             if !self.rule("minecraft:tnt_explodes", true) {
+                let msg = rc_text::Component::translate("block.minecraft.tnt.disabled", Vec::new());
+                let _ = self.send(rc_client::Event::ActionBar(msg));
                 return Some(false);
             }
             self.sulfur_prime(m, false);
@@ -1343,6 +1378,10 @@ impl Server {
             } else {
                 self.sulfur_consume(slot);
             }
+            // "Used" statistic of the item held AFTER the use, like the game: the last fire
+            // charge, or a lighter that breaks, counts as air.
+            let after = self.slots[slot].as_ref().map_or_else(|| "minecraft:air".to_owned(), |s| s.id.clone());
+            self.award_stat("minecraft:used", &after, 1);
             return Some(true);
         }
         if item == "minecraft:shears" && m.has_body_item() {

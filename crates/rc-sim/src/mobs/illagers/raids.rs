@@ -611,7 +611,7 @@ impl Server {
     /// Position in a simulated chunk.
     fn entity_ticking(&self, p: [i32; 3]) -> bool {
         let c = (p[0] >> 4, p[2] >> 4);
-        self.mob_chunk_ticking(c) && self.chunks.get(&c).is_some_and(Option::is_some)
+        self.entities_tick_in(c) && self.chunks.get(&c).is_some_and(Option::is_some)
     }
 
     /// On a circle around the center, closer when approaching the

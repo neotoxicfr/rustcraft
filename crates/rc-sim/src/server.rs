@@ -624,11 +624,19 @@ impl Server {
         let _ = self.send(Event::Entity(EntityEvent::Event { id: self.player_id, event: crate::lan::op_event(self.cmd.op) }));
         self.send_commands(); // S5: command tree of the player's level
         self.send_scoreboard(); // S5: displayed teams and objectives
-        // Game display name: team, entity hover, insertion, "/tell" click.
-        let mut joined = rc_text::Component::translate(
-            "multiplayer.player.joined",
-            vec![rc_text::Arg::Component(self.player_display_name())],
-        );
+        // Game display name: team, entity hover, insertion, "/tell" click. The name cache of the
+        // game folder records the player; another name it held there is recalled ("formerly
+        // known as").
+        let mut joined = match self.user_cache_join() {
+            None => rc_text::Component::translate(
+                "multiplayer.player.joined",
+                vec![rc_text::Arg::Component(self.player_display_name())],
+            ),
+            Some(old) => rc_text::Component::translate(
+                "multiplayer.player.joined.renamed",
+                vec![rc_text::Arg::Component(self.player_display_name()), rc_text::Arg::Text(old)],
+            ),
+        };
         joined.style.color = Some(0xFFFF55);
         let _ = self.send(Event::Chat { component: joined, tag: ChatTag::System });
         self.teleport_to(self.pos);
@@ -1198,6 +1206,9 @@ impl Server {
         self.dims_tick(); // S6: portals, parked dimensions
         self.commands_tick(); // S5 : suggestions, scores
         self.progress_tick(); // S9: time statistics, triggers, sending of advancements
+        if runs {
+            self.gametest_tick(); // G3-F06: in-game tests, after the world and the players
+        }
         self.flush_block_changes();
         if let Some(a) = self.ack.take() {
             let _ = self.send(Event::BlockChangedAck(a));

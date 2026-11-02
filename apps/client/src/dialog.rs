@@ -13,7 +13,7 @@ use std::time::Instant;
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::item::ItemStack;
 use rc_text::{Arg, ClickEvent, Component, HoverEvent, StyledChar};
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::keyboard::{KeyCode, ModifiersState};
 
 use crate::App;
@@ -1019,7 +1019,7 @@ impl Screen {
                     Control::Choice { .. } => Some(State::Choice(ui.choices[i])),
                     _ => ui.panel.get(INPUT + i as u32).and_then(|w| match &w.kind {
                         Kind::Field(t) => Some(State::Text(t.value())),
-                        Kind::Checkbox { checked } => Some(State::Bool(*checked)),
+                        Kind::Checkbox { checked, .. } => Some(State::Bool(*checked)),
                         Kind::Slider { value, .. } => Some(State::Number(*value as f32)),
                         _ => None,
                     }),
@@ -1139,10 +1139,11 @@ impl Screen {
                     if *label_visible { labeled(&mut widgets, label, *width, h, part) } else { ((*width, h), vec![(part, 0, 0)]) }
                 }
                 Control::Bool { label, initial, .. } => {
-                    let msg = chars(gui, label);
-                    let w = 17 + 4 + rc_text::width(gui, &msg);
-                    widgets.push(Widget::new(id, Kind::Checkbox { checked: *initial }, 0, 0, w, 17, msg));
-                    ((w, 17), vec![(Part::Widget(widgets.len() - 1), 0, 0)])
+                    let dots = rc_text::CharStyle::from(&label.style);
+                    let b = Widget::checkbox(gui, id, (0, 0), *initial, chars(gui, label), None, &dots);
+                    let size = (b.w, b.h);
+                    widgets.push(b);
+                    (size, vec![(Part::Widget(widgets.len() - 1), 0, 0)])
                 }
                 Control::Choice { width, initial, .. } => {
                     choices[i] = *initial;
@@ -1504,10 +1505,7 @@ impl Screen {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let dy = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => f64::from(*y),
-                    MouseScrollDelta::PixelDelta(p) => p.y / 20.0,
-                };
+                let dy = crate::keys::wheel_offsets(delta).1;
                 if let Some(m) = m {
                     let top = ui.panel.list.as_ref().map_or(0, |l| l.y - l.scroll.floor() as i32);
                     let over = ui.multis.iter_mut().find(|mt| {

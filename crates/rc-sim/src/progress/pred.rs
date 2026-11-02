@@ -64,6 +64,115 @@ pub struct Ctx<'a> {
     pub explosion: Option<f32>,
 }
 
+impl<'a> Ctx<'a> {
+    /// Entity of a context target (`this`, `attacker`…, with the old names of the killers).
+    pub(crate) fn target_of(&self, name: &str) -> Option<Who<'a>> {
+        match name {
+            "this" => self.this,
+            "attacker" | "killer" => self.attacker,
+            "direct_attacker" | "direct_killer" => self.direct_attacker,
+            "attacking_player" | "killer_player" => self.attacking_player,
+            "target_entity" => self.target,
+            "interacting_entity" => self.interacting,
+            _ => None,
+        }
+    }
+}
+
+/// World lent to a loot draw: the condition evaluator over a context, and the server data the
+/// draws read (scores, command storage, the context's entities and their slots).
+pub(crate) struct LootView<'s> {
+    sv: &'s Server,
+    ctx: Ctx<'s>,
+    /// Every draw-free condition is answered here (the draw has no context of its own).
+    all: bool,
+}
+
+impl crate::loot::LootWorld for LootView<'_> {
+    fn condition(&self, v: &Value) -> bool {
+        self.sv.p_condition(v, &self.ctx)
+    }
+
+    fn knows_all(&self) -> bool {
+        self.all
+    }
+
+    fn score(&self, holder: crate::loot::ScoreHolder<'_>, objective: &str) -> Option<i32> {
+        let name = match holder {
+            crate::loot::ScoreHolder::Name(n) => n.to_owned(),
+            crate::loot::ScoreHolder::Target(t) => self.sv.w_score_name(self.ctx.target_of(t)?),
+        };
+        self.sv.cmd.scores.objective(objective)?;
+        self.sv.cmd.scores.get(&name, objective)
+    }
+
+    fn storage(&self, id: &str) -> Option<&Nbt> {
+        self.sv.cmd.storage.get(&crate::commands::args::id(id))
+    }
+
+    fn entity_nbt(&self, target: &str) -> Option<Nbt> {
+        Some(self.sv.w_nbt(self.ctx.target_of(target)?))
+    }
+
+    fn entity_name(&self, target: &str) -> Option<Option<Nbt>> {
+        Some(self.sv.w_custom_name(self.ctx.target_of(target)?))
+    }
+
+    fn entity_profile(&self, target: &str) -> Option<Nbt> {
+        matches!(self.ctx.target_of(target)?, Who::E(E::Player)).then(|| {
+            crate::commands::cmds_s9e::profile_nbt(&rc_client::session::ProfileResult {
+                id: self.sv.uuid,
+                name: self.sv.name.clone(),
+                properties: self.sv.profile_properties(self.sv.uuid),
+                forced_name_change: false,
+                banned_skin: false,
+            })
+        })
+    }
+
+    fn entity_components(&self, target: &str) -> Option<Vec<(String, Nbt)>> {
+        Some(self.sv.w_components(self.ctx.target_of(target)?))
+    }
+
+    fn slots(&self, target: &str, range: &str) -> Option<Vec<Option<Stack>>> {
+        let e = match self.ctx.target_of(target)? {
+            Who::E(e) => e,
+            Who::Mob(m) => E::Mob(m.id),
+            Who::Proj(_) => return Some(Vec::new()),
+        };
+        Some(self.sv.entity_slot_range(e, range).into_iter().map(|s| self.sv.slot_get(s)).collect())
+    }
+}
+
+/// Random source of the conditions outside loot (the generator of `random_chance` here).
+struct LocalRand;
+
+impl crate::randsrc::Rand for LocalRand {
+    fn next_int(&mut self) -> i32 {
+        (rand_bits() >> 32) as i32
+    }
+    fn next_int_bound(&mut self, bound: i32) -> i32 {
+        if bound <= 0 { 0 } else { ((rand_bits() >> 33) % bound as u64) as i32 }
+    }
+    fn next_long(&mut self) -> i64 {
+        rand_bits() as i64
+    }
+    fn next_float(&mut self) -> f32 {
+        rand_float()
+    }
+    fn next_double(&mut self) -> f64 {
+        (rand_bits() >> 11) as f64 / (1u64 << 53) as f64
+    }
+    fn next_bool(&mut self) -> bool {
+        rand_bits() >> 63 != 0
+    }
+    fn next_gaussian(&mut self) -> f64 {
+        // Box-Muller on two uniform draws (no condition reads it; kept for completeness).
+        let (a, b) = (self.next_double().max(f64::MIN_POSITIVE), self.next_double());
+        (-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Bounds.
 
@@ -1285,17 +1394,7 @@ impl Server {
             return a.iter().all(|c| self.p_condition(c, ctx));
         }
         let ty = v.get("type").or_else(|| v.get("condition")).and_then(Value::as_str).unwrap_or("");
-        let target = |name: Option<&str>| -> Option<Who<'_>> {
-            match name.unwrap_or("this") {
-                "this" => ctx.this,
-                "attacker" | "killer" => ctx.attacker,
-                "direct_attacker" | "direct_killer" => ctx.direct_attacker,
-                "attacking_player" | "killer_player" => ctx.attacking_player,
-                "target_entity" => ctx.target,
-                "interacting_entity" => ctx.interacting,
-                _ => None,
-            }
-        };
+        let target = |name: Option<&str>| ctx.target_of(name.unwrap_or("this"));
         match crate::commands::args::id(ty).as_str() {
             "minecraft:inverted" => !self.p_condition(&v["term"], ctx),
             "minecraft:any_of" => v["terms"].as_array().is_some_and(|t| t.iter().any(|c| self.p_condition(c, ctx))),
@@ -1348,11 +1447,7 @@ impl Server {
             },
             "minecraft:entity_scores" => {
                 let Some(w) = target(v["entity"].as_str()) else { return false };
-                let holder = match w {
-                    Who::E(e) => self.ent_score_name(e),
-                    Who::Mob(m) => crate::nbtio::uuid_text(m.uuid),
-                    Who::Proj(p) => crate::nbtio::uuid_text(p.uuid),
-                };
+                let holder = self.w_score_name(w);
                 let Some(Value::Object(scores)) = v.get("scores") else { return true };
                 scores.iter().all(|(obj, range)| {
                     self.cmd.scores.objective(obj).is_some()
@@ -1380,23 +1475,74 @@ impl Server {
             }
             "minecraft:survives_explosion" => ctx.explosion.is_none_or(|r| rand_float() <= 1.0 / r),
             "minecraft:enchantment_active_check" => false,
-            "minecraft:int_value_check" => {
-                let n = v["value"].as_i64().unwrap_or(0) as i32;
-                self.p_int_range(&v["test"], n)
-            }
-            "minecraft:float_value_check" => {
-                let n = v["value"].as_f64().unwrap_or(0.0);
-                doubles(v.get("test"), n)
+            // Value and bounds are number providers: the loot engine's evaluator, this
+            // context lent as its world, drawn on the source of `random_chance` here.
+            "minecraft:int_value_check" | "minecraft:float_value_check" => {
+                let bt = |tag: &str, name: &str| self.block_name_tagged(tag, name);
+                let loot = crate::loot::Loot { pack: &self.life.pack, items: &self.life.items, block_tag: &bt };
+                let view = LootView { sv: self, ctx: ctx.clone(), all: true };
+                let lctx = crate::loot::Ctx { world: Some(&view), ..Default::default() };
+                loot.cond(v, &lctx, &mut LocalRand)
             }
             "minecraft:table_bonus" | "minecraft:random_chance_with_enchanted_bonus" => false,
             _ => false,
         }
     }
 
-    /// W8c: full evaluator of the draw-free loot conditions (location, entity
-    /// properties, damage source…), lent to the loot tables.
-    pub(crate) fn loot_world<'s>(&'s self, ctx: Ctx<'s>) -> impl Fn(&Value) -> bool + 's {
-        move |v| self.p_condition(v, &ctx)
+    /// W8c: world lent to the loot tables: full evaluator of the draw-free loot conditions
+    /// (location, entity properties, damage source…) and the data the draws read.
+    pub(crate) fn loot_world<'s>(&'s self, ctx: Ctx<'s>) -> LootView<'s> {
+        LootView { sv: self, ctx, all: false }
+    }
+
+    /// Block `name` in the block tag `tag` (the loot engine's `block_tag`).
+    pub(crate) fn block_name_tagged(&self, tag: &str, name: &str) -> bool {
+        let b = self.data.blocks.iter().position(|x| x.name == name).map_or(u32::MAX, |i| i as u32);
+        self.block_tags.get(tag.trim_start_matches('#')).is_some_and(|v| v.binary_search(&b).is_ok())
+    }
+
+    /// Score holder name of an entity: the player's name, otherwise its UUID as text.
+    fn w_score_name(&self, w: Who<'_>) -> String {
+        match w {
+            Who::E(e) => self.ent_score_name(e),
+            Who::Mob(m) => crate::nbtio::uuid_text(m.uuid),
+            Who::Proj(p) => crate::nbtio::uuid_text(p.uuid),
+        }
+    }
+
+    /// Custom name of an entity (`None`: unnamed; the player never carries one).
+    fn w_custom_name(&self, w: Who<'_>) -> Option<Nbt> {
+        match w {
+            Who::E(E::Player) => None,
+            Who::Mob(m) => m.custom_name.clone(),
+            Who::E(E::Mob(i)) => self.mobs.mob_ref_any(i).and_then(|m| m.custom_name.clone()),
+            _ => self.w_nbt(w).get("CustomName").cloned(),
+        }
+    }
+
+    /// Components an entity carries, registry order: its custom name, then the components of
+    /// its type (variants, colours) it has a value for.
+    fn w_components(&self, w: Who<'_>) -> Vec<(String, Nbt)> {
+        let mut out = Vec::new();
+        let short = self.w_type(w);
+        let short = short.trim_start_matches("minecraft:");
+        let owner = |k: &str| {
+            k.trim_start_matches("minecraft:")
+                .split_once('/')
+                .is_some_and(|(o, _)| o == short || (o == "villager" && short == "zombie_villager"))
+        };
+        for k in self.life.items.data.registry("minecraft:data_component_type").map_or(&[][..], |r| &r.entries[..]) {
+            if k == "minecraft:custom_name" {
+                if let Some(n) = self.w_custom_name(w) {
+                    out.push((k.clone(), n));
+                }
+            } else if owner(k)
+                && let Some(v) = self.w_component(w, k)
+            {
+                out.push((k.clone(), crate::recipes::json_to_nbt(&v)));
+            }
+        }
+        out
     }
 
     /// Integer range (`IntRange`: constant bounds or simple providers).
@@ -1486,6 +1632,11 @@ mod tests;
 
 /// Draw of a random condition outside loot (criteria, `execute if predicate`).
 fn rand_float() -> f32 {
+    (rand_bits() >> 40) as f32 / (1u64 << 24) as f32
+}
+
+/// Next 64 bits of the thread's xorshift source of the conditions outside loot.
+fn rand_bits() -> u64 {
     use std::cell::Cell;
     thread_local!(static S: Cell<u64> = Cell::new(0x2545_F491_4F6C_DD1D ^ std::process::id() as u64));
     S.with(|s| {
@@ -1494,6 +1645,6 @@ fn rand_float() -> f32 {
         x ^= x >> 7;
         x ^= x << 17;
         s.set(x);
-        (x >> 40) as f32 / (1u64 << 24) as f32
+        x
     })
 }

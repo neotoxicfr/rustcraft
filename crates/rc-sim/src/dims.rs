@@ -59,6 +59,13 @@ pub(crate) struct World {
     pub proj: Box<crate::projectiles::Projs>,
     /// G5-F06: minecarts of the dimension.
     pub carts: Box<crate::minecart::Carts>,
+    /// L9-TICK: evoker fangs of the dimension (before, they followed the player and bit at the
+    /// same coordinates in the arrival dimension).
+    pub fangs: Vec<crate::mobs::illagers::spells::Fangs>,
+    /// L9-TICK: signs of the dimension being edited (player allowed to send their text): the
+    /// game keeps the editor on the sign itself, so a sign at the same coordinates elsewhere
+    /// refuses the text.
+    pub sign_editors: HashMap<[i32; 3], u128>,
 }
 
 /// World generation settings (`data/minecraft/world_gen_settings.dat`): seed, and for
@@ -246,6 +253,8 @@ impl Server {
         swap(&mut self.proj, &mut w.proj); // S8: projectiles
         swap(&mut self.carts, &mut w.carts); // G5-F06: minecarts
         swap(&mut self.deco, &mut w.deco); // decorations
+        swap(&mut self.mobs.ill.fangs, &mut w.fangs); // L9-TICK
+        swap(&mut self.life.sign_editors, &mut w.sign_editors); // L9-TICK
     }
 
     pub(crate) fn world_seed(&self) -> i64 {
@@ -323,6 +332,8 @@ impl Server {
             dim,
             proj: Box::default(),
             carts: Box::default(),
+            fangs: Vec::new(),
+            sign_editors: HashMap::new(),
         }
     }
 
@@ -364,6 +375,19 @@ impl Server {
         self.dims.player.cooldown = nbtio::int(root, "PortalCooldown").unwrap_or(0) as i32;
         self.dims.seen_credits = nbtio::int(root, "seenCredits").is_some_and(|v| v != 0);
         self.dims.entered_nether = nbtio::f64s::<3>(root.get("entered_nether_pos"));
+    }
+
+    /// Portal return delay of the simulated entity `id`, as written in its NBT.
+    pub(crate) fn portal_cooldown(&self, id: i32) -> i32 {
+        self.dims.ents.get(&id).map_or(0, |p| p.cooldown)
+    }
+
+    /// `PortalCooldown` of an entity read from its NBT (chunk or summon): a running delay is
+    /// restored under its new identifier, the game reads it for every entity.
+    pub(crate) fn load_portal_cooldown(&mut self, id: i32, e: &Nbt) {
+        if let Some(cd) = nbtio::int(e, "PortalCooldown").filter(|&v| v > 0) {
+            self.dims.ents.insert(id, EntPortal { cooldown: cd as i32, proc: None });
+        }
     }
 
     /// "Portals" fields written in the player file.
@@ -422,12 +446,10 @@ impl Server {
     /// Parked dimensions: generation always collected; entities and tickets only if the world
     /// ticks (`runs` false under `tick freeze`).
     fn parked_tick(&mut self, runs: bool) {
-        let names: Vec<(String, i32, bool)> = self
-            .dims
-            .parked
-            .iter()
-            .map(|w| (w.dim.name.clone(), w.ticket, crate::projectiles::holds_player_pearl(&w.proj, self.uuid)))
-            .collect();
+        // L9-TICK: a pearl ticket (of the host or of a guest, still flying or expiring) keeps
+        // the world active like the game's.
+        let names: Vec<(String, i32, bool)> =
+            self.dims.parked.iter().map(|w| (w.dim.name.clone(), w.ticket, !w.proj.tickets.is_empty())).collect();
         let home = self.dim.name.clone();
         for (name, ticket, pearl) in names {
             let has_gen = self.dims.parked.iter().any(|w| w.dim.name == name && w.generator.is_some());
@@ -447,6 +469,9 @@ impl Server {
                     s.loaded = false;
                     let joined = s.joined_tick;
                     s.joined_tick = s.tick + 1;
+                    // Tickets of the previous tick applied, then the chunk source's purge.
+                    s.proj.pearl_tickets_apply();
+                    s.proj.pearl_tickets_purge(s.time);
                     if ticket > 0 {
                         s.tick_sim_entities();
                         s.drops_tick();
@@ -558,6 +583,13 @@ impl Server {
             for c in &mut w.proj.clouds {
                 c.seen = false;
             }
+            // L9-TICK: fangs parked with the world left (`enter_world` already swapped them out).
+            for f in &mut w.fangs {
+                f.seen = false;
+            }
+            // L9-TICK: the bobber left behind no longer finds its player in its world: the game
+            // discards it at its next tick, before the rod can be used again.
+            w.proj.hook = None;
             // G5-F06: minecarts of the world left.
             for c in w.carts.list.iter_mut().flatten() {
                 c.track.seen = false;

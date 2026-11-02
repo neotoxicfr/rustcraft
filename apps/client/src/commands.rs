@@ -781,7 +781,7 @@ impl CommandUi {
     }
 
     /// Wheel over the list.
-    pub fn wheel(&mut self, m: (f32, f32), d: f32) -> bool {
+    pub fn wheel(&mut self, m: (f32, f32), d: f64) -> bool {
         let lines = self.lines();
         let Some(l) = &mut self.list else { return false };
         let (x, y, w, h) = l.rect;
@@ -790,7 +790,7 @@ impl CommandUi {
         }
         let max = l.items.len().saturating_sub(lines) as i64;
         // Truncated after the subtraction: a fraction of a notch upwards still moves by one.
-        l.offset = ((l.offset as f64 - f64::from(d.clamp(-1.0, 1.0))) as i64).clamp(0, max) as usize;
+        l.offset = ((l.offset as f64 - d.clamp(-1.0, 1.0)) as i64).clamp(0, max) as usize;
         true
     }
 

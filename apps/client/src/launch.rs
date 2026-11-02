@@ -26,6 +26,8 @@ pub struct Launch {
     pub height: Option<u32>,
     pub fullscreen: bool,
     pub demo: bool,
+    /// `--offlineDeveloperMode`: friends list unavailable.
+    pub offline_developer_mode: bool,
     pub disable_multiplayer: bool,
     pub disable_chat: bool,
     /// `--quickPlayMultiplayer <address>`: direct connection to this server.
@@ -226,6 +228,7 @@ impl Launch {
             "quickPlayPath" => self.quick_play_path = value,
             "fullscreen" => self.fullscreen = true,
             "demo" => self.demo = true,
+            "offlineDeveloperMode" => self.offline_developer_mode = true,
             "disableMultiplayer" => self.disable_multiplayer = true,
             "disableChat" => self.disable_chat = true,
             "proxyHost" => self.proxy.host = value,
@@ -538,5 +541,14 @@ mod tests {
         // Invalid UUID: offline UUID of the username, like the game.
         let (l, _) = parse(&["--username", "Bob", "--uuid", "zz"]);
         assert_eq!(l.account().map(|a| a.uuid), Some(rc_client::offline_uuid("Bob")));
+    }
+
+    /// `--offlineDeveloperMode` is read (friends list unavailable), no longer listed as without effect.
+    #[test]
+    fn offline_developer_mode_flag() {
+        let (l, _) = parse(&["--offlineDeveloperMode", "--demo"]);
+        assert!(l.offline_developer_mode && l.demo);
+        assert!(l.unused.is_empty(), "{:?}", l.unused);
+        assert!(!parse(&["--demo"]).0.offline_developer_mode);
     }
 }

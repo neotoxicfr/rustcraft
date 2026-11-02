@@ -24,6 +24,8 @@ pub struct Fangs {
     pub removed: bool,
     /// Number of the entity walk they were born in (0: outside the walk), read by `mobs::Walk`.
     pub born: u64,
+    /// Announced to the client (L9-TICK: false again once the player has left their world).
+    pub seen: bool,
 }
 
 impl Server {
@@ -197,19 +199,7 @@ impl Server {
         let id = self.next_entity;
         let pos = [x, f64::from(p[1]) + top, z];
         let yaw = angle * (180.0 / std::f32::consts::PI);
-        let add = AddEntity {
-            id,
-            uuid: (id as u128) << 64 | 0x4600_0000_0000_0000,
-            kind: self.entity_kind_id("minecraft:evoker_fangs"),
-            pos,
-            velocity: [0.0; 3],
-            pitch: 0.0,
-            yaw,
-            head_yaw: 0.0,
-            data: 0,
-        };
-        let _ = self.send(Event::Entity(EntityEvent::Add(Box::new(add))));
-        self.mobs.ill.fangs.push(Fangs {
+        let mut f = Fangs {
             id,
             pos,
             yaw,
@@ -219,7 +209,31 @@ impl Server {
             owner: Some(m.id),
             removed: false,
             born: self.walk.born(),
-        });
+            seen: false,
+        };
+        self.fangs_pair(&mut f);
+        self.mobs.ill.fangs.push(f);
+        let src = Some(crate::mobs::recent::vibration::Src::Living(Ent::Mob(m.id)));
+        self.game_event_src("minecraft:entity_place", pos, src, None);
+    }
+
+    /// Announces the fangs to the client. Only the entity itself: the bite event is never sent
+    /// again, so fangs paired after it stay invisible on the client (game behaviour: the client
+    /// draws them only once it has received that event).
+    fn fangs_pair(&mut self, f: &mut Fangs) {
+        let add = AddEntity {
+            id: f.id,
+            uuid: (f.id as u128) << 64 | 0x4600_0000_0000_0000,
+            kind: self.entity_kind_id("minecraft:evoker_fangs"),
+            pos: f.pos,
+            velocity: [0.0; 3],
+            pitch: 0.0,
+            yaw: f.yaw,
+            head_yaw: 0.0,
+            data: 0,
+        };
+        let _ = self.send(Event::Entity(EntityEvent::Add(Box::new(add))));
+        f.seen = true;
     }
 
     /// Full top face: approximated by a collision box
@@ -240,6 +254,10 @@ impl Server {
     pub(crate) fn fangs_tick(&mut self) {
         let mut list = std::mem::take(&mut self.mobs.ill.fangs);
         for f in list.iter_mut().filter(|f| !f.removed) {
+            // L9-TICK: back in their world, the client has forgotten them (cleared at respawn).
+            if !f.seen {
+                self.fangs_pair(f);
+            }
             // Born during this entity walk: they wait for the next tick.
             // G3-F13: outside a "ticking entities" chunk, it waits too.
             if self.walk.waits(std::mem::take(&mut f.born)) || !self.entity_ticks_at(f.pos) {
@@ -320,7 +338,7 @@ impl Server {
 
     /// Launch of the evoker's summoning spell: 3 vexes at ±2 blocks, one block higher, life of
     /// 30 to 119 s (evoker's random).
-    fn summon_vexes(&mut self, m: &mut Mob) {
+    pub(crate) fn summon_vexes(&mut self, m: &mut Mob) {
         let b = m.block_pos();
         for _ in 0..3 {
             let dx = -2 + m.rng.next_int_bound(5);
@@ -336,7 +354,12 @@ impl Server {
             v.ill.owner_id = Some(m.id);
             v.ill.bound = Some(p);
             v.ill.life = Some(20 * (30 + m.rng.next_int_bound(90)));
+            // The evoker's scoreboard team, if any, before the vex enters the world.
+            if let Some(team) = self.cmd.scores.team_of(&crate::nbtio::uuid_text(m.uuid)).map(|t| t.name.clone()) {
+                self.cmd.scores.join_team(&crate::nbtio::uuid_text(v.uuid), &team);
+            }
             self.add_mob(v);
+            self.game_event_block("minecraft:entity_place", p, Some(Ent::Mob(m.id)), None);
         }
     }
 }

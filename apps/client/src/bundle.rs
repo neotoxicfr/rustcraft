@@ -493,61 +493,166 @@ pub fn draw_tooltip(
     }
 }
 
-impl crate::App {
-    /// Wheel in a container screen: choice of the hovered bundle's item (never the bar).
-    /// The wheel goes to the hovered bundle first (it shows items): container screens with
-    /// their own scrolling (merchant, stonecutter, loom) only get it otherwise.
-    pub(crate) fn bundle_takes_wheel(&self) -> bool {
-        let Some(gui) = self.renderer.as_ref().map(|r| &r.gui) else { return false };
-        let Some(m) = self.gui_mouse() else { return false };
-        let Some(slot) = self.screens.hovered_slot(gui, &self.inventory, m) else { return false };
-        let (_, slots, _, _) = crate::screens::current(&self.inventory);
-        let Some(st) = slots.get(slot).and_then(Option::as_ref) else { return false };
-        let ctx = Ctx { ids: &self.component_ids, data: &self.data };
-        ctx.bundle(st).is_some_and(|items| shown(items.len()) > 0)
+/// Key of a creative grid slot in the chosen-item table: after every menu slot (the creative
+/// screen's menu slots keep their index).
+pub const CREATIVE_GRID: usize = 1000;
+
+thread_local! {
+    /// Slot hovered at the previous frame (key), to announce the one the mouse leaves.
+    static HOVERED: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// What the stop-hover rule needs of the open screen, for slot keys.
+pub(crate) trait HoverScreen {
+    /// The slot holds an item of the `bundles` tag.
+    fn holds_bundle(&self, key: usize) -> bool;
+    /// Slot index announced to the server.
+    fn index(&self, key: usize) -> Option<i32>;
+}
+
+/// Hovered slot of the frame (`now`, `None` without a screen): when it changes, the slot left
+/// forgets its chosen item and, if it holds a bundle, −1 is announced for it, whatever was
+/// chosen, like the game each time its hovered slot changes; without a screen everything is
+/// forgotten silently (a screen closed by the server announces nothing) and the wheel
+/// accumulation starts again from zero at the next screen. Returns the announcement to send.
+pub(crate) fn hover_frame(now: Option<usize>, screen: Option<&dyn HoverScreen>) -> Option<i32> {
+    let before = HOVERED.with(|h| h.replace(now));
+    let Some(s) = screen else {
+        SELECTED.with(|c| c.set(None));
+        WHEEL.with(|w| w.set((0.0, 0.0)));
+        return None;
+    };
+    let k = before.filter(|_| before != now)?;
+    leave(k, s)
+}
+
+/// The mouse leaves slot `k` (or its screen is closed by the player): chosen item forgotten,
+/// −1 to announce if a bundle is there.
+fn leave(k: usize, s: &dyn HoverScreen) -> Option<i32> {
+    if selected_slot() == Some(k) {
+        set_selected(k, -1);
+    }
+    if s.holds_bundle(k) { s.index(k) } else { None }
+}
+
+/// Screen closed by the player: its hovered slot is left (announced after the closing packet,
+/// like the game).
+pub(crate) fn hover_close(s: &dyn HoverScreen) -> Option<i32> {
+    let k = HOVERED.with(Cell::take)?;
+    leave(k, s)
+}
+
+/// Open screen seen through slot keys: container screen (menu slots) or creative screen.
+struct OpenScreen<'a> {
+    app: &'a crate::App,
+}
+
+impl<'a> OpenScreen<'a> {
+    fn stack(&self, key: usize) -> Option<&'a ItemStack> {
+        let a = self.app;
+        if a.creative_ui.open {
+            return match key.checked_sub(CREATIVE_GRID) {
+                Some(i) => a.creative_ui.grid_stack(i),
+                None => a.inventory.menu.get(key)?.as_ref(),
+            };
+        }
+        crate::screens::current(&a.inventory).1.get(key)?.as_ref()
+    }
+}
+
+impl HoverScreen for OpenScreen<'_> {
+    fn holds_bundle(&self, key: usize) -> bool {
+        let name = |s: &ItemStack| usize::try_from(s.item).ok().and_then(|i| self.app.item_names.get(i));
+        self.stack(key).and_then(name).is_some_and(|n| is_bundle_name(n))
     }
 
-    pub(crate) fn bundle_wheel(&mut self, delta: winit::event::MouseScrollDelta) {
-        let (x, y) = match delta {
-            winit::event::MouseScrollDelta::LineDelta(x, y) => (f64::from(x), f64::from(y)),
-            winit::event::MouseScrollDelta::PixelDelta(p) => (p.x / 20.0, p.y / 20.0),
-        };
-        let Some(gui) = self.renderer.as_ref().map(|r| &r.gui) else { return };
-        let Some(m) = self.gui_mouse() else { return };
-        let Some(slot) = self.screens.hovered_slot(gui, &self.inventory, m) else { return };
-        let (_, slots, _, _) = crate::screens::current(&self.inventory);
-        let Some(st) = slots.get(slot).cloned().flatten() else { return };
-        let ctx = Ctx { ids: &self.component_ids, data: &self.data };
-        let Some(items) = ctx.bundle(&st) else { return };
-        let limit = shown(items.len()) as i32;
-        if limit == 0 {
-            return;
+    fn index(&self, key: usize) -> Option<i32> {
+        let a = self.app;
+        if !a.creative_ui.open {
+            return i32::try_from(key).ok();
         }
+        creative_index(key, a.creative_ui.kind(&a.data) == rc_data::CreativeKind::Inventory)
+    }
+}
+
+/// Index the game announces for a creative screen slot key: grid 0..44, bar 45..53, every slot
+/// of the inventory tab 0 (`creative_app::creative_slot_index`).
+pub(crate) fn creative_index(key: usize, inventory_tab: bool) -> Option<i32> {
+    let hit = match key.checked_sub(CREATIVE_GRID) {
+        Some(i) => crate::creative_screen::Hit::Grid(i),
+        None => crate::creative_screen::Hit::Menu(key),
+    };
+    crate::creative_app::creative_slot_index(hit, inventory_tab)
+}
+
+impl crate::App {
+    fn screen_open(&self) -> bool {
+        self.screens.open || self.creative_ui.open
+    }
+
+    /// Slot under the mouse in the open screen, as a key of the chosen-item table: menu slot of a
+    /// container screen; creative screen: menu slot, or grid slot `CREATIVE_GRID + i`.
+    fn hovered_key(&self) -> Option<usize> {
+        let gui = self.renderer.as_ref().map(|r| &r.gui)?;
+        let m = self.gui_mouse()?;
+        if self.creative_ui.open {
+            return match self.creative_ui.hovered(gui, &self.data, m)? {
+                crate::creative_screen::Hit::Trash => None,
+                h => Some(crate::creative_screen::hit_key(h)),
+            };
+        }
+        if self.screens.open { self.screens.hovered_slot(gui, &self.inventory, m) } else { None }
+    }
+
+    /// Items shown by the hovered bundle (0: no bundle, or nothing to show).
+    fn hovered_bundle_shown(&self) -> Option<(usize, i32)> {
+        let key = self.hovered_key()?;
+        let st = OpenScreen { app: self }.stack(key)?;
+        let ctx = Ctx { ids: &self.component_ids, data: &self.data };
+        let n = ctx.bundle(st).map_or(0, |items| shown(items.len()) as i32);
+        (n > 0).then_some((key, n))
+    }
+
+    /// The wheel goes to the hovered bundle first (it shows items): container screens with their
+    /// own scrolling (merchant, stonecutter, loom, creative grid) only get it otherwise.
+    pub(crate) fn bundle_takes_wheel(&self) -> bool {
+        self.hovered_bundle_shown().is_some()
+    }
+
+    /// Wheel over the open screen (scaled offsets): choice of the hovered bundle's item (never the
+    /// bar); true if a bundle took it.
+    pub(crate) fn bundle_wheel(&mut self, x: f64, y: f64) -> bool {
+        let Some((key, limit)) = self.hovered_bundle_shown() else { return false };
         let (wx, wy) = wheel(x, y);
         let w = if wy == 0 { -wx } else { wy };
         if w == 0 {
-            return;
+            return true;
         }
-        let cur = selected(slot);
+        let cur = selected(key);
         let next = next_selection(w, cur, limit);
         if next != cur {
-            set_selected(slot, next);
-            let _ = self.session.link.send_bundle_item_selected(slot as i32, next);
+            set_selected(key, next);
+            if let Some(i) = (OpenScreen { app: self }).index(key) {
+                let _ = self.session.link.send_bundle_item_selected(i, next);
+            }
+        }
+        true
+    }
+
+    /// Each frame: slot left by the mouse (`hover_frame`).
+    pub(crate) fn bundle_hover(&self) {
+        let now = if self.screen_open() { self.hovered_key() } else { None };
+        let screen = OpenScreen { app: self };
+        let open: Option<&dyn HoverScreen> = if self.screen_open() { Some(&screen) } else { None };
+        if let Some(i) = hover_frame(now, open) {
+            let _ = self.session.link.send_bundle_item_selected(i, -1);
         }
     }
 
-    /// Chosen bundle left by the mouse (or move click): choice reset to −1.
-    pub(crate) fn bundle_tick(&mut self) {
-        let Some(slot) = selected_slot() else { return };
-        let hovered = match (self.renderer.as_ref().map(|r| &r.gui), self.gui_mouse()) {
-            (Some(gui), Some(m)) if self.screens.open => self.screens.hovered_slot(gui, &self.inventory, m),
-            _ => None,
-        };
-        if hovered != Some(slot) {
-            set_selected(slot, -1);
-            if self.screens.open {
-                let _ = self.session.link.send_bundle_item_selected(slot as i32, -1);
-            }
+    /// Screen closed by the player, its closing packet sent: the hovered bundle is left.
+    pub(crate) fn bundle_close(&self) {
+        if let Some(i) = hover_close(&OpenScreen { app: self }) {
+            let _ = self.session.link.send_bundle_item_selected(i, -1);
         }
     }
 
@@ -581,6 +686,53 @@ mod tests {
         assert_eq!(u(1, 2, &slots, is_bundle), None);
         assert_eq!(u(1, -999, &slots, is_bundle), None);
         assert_eq!(u(2, 9, &slots, is_bundle), None);
+    }
+
+    /// Screen whose slots 5 and 9 hold bundles; announced index = key + 100.
+    struct Two;
+    impl super::HoverScreen for Two {
+        fn holds_bundle(&self, key: usize) -> bool {
+            key == 5 || key == 9
+        }
+        fn index(&self, key: usize) -> Option<i32> {
+            Some(key as i32 + 100)
+        }
+    }
+
+    /// Leaving a bundle slot announces −1 for it even with nothing chosen; leaving another slot,
+    /// staying on one, or a screen closed by the server announce nothing; the chosen item is
+    /// forgotten when its slot is left; closing by the player leaves the hovered slot.
+    #[test]
+    fn leaving_a_bundle_slot_announces_no_choice() {
+        use super::{hover_close, hover_frame, selected, set_selected};
+        let s: &dyn super::HoverScreen = &Two;
+        assert_eq!(hover_frame(None, None), None);
+        assert_eq!(hover_frame(Some(5), Some(s)), None, "entering announces nothing");
+        assert_eq!(hover_frame(Some(5), Some(s)), None, "staying announces nothing");
+        assert_eq!(hover_frame(Some(7), Some(s)), Some(105), "bundle left, nothing chosen");
+        assert_eq!(hover_frame(None, Some(s)), None, "slot 7 holds no bundle");
+        assert_eq!(hover_frame(Some(9), Some(s)), None);
+        set_selected(9, 2);
+        assert_eq!(hover_frame(Some(5), Some(s)), Some(109));
+        assert_eq!(selected(9), -1, "choice forgotten");
+        set_selected(5, 1);
+        assert_eq!(hover_frame(None, None), None, "closed by the server: silent");
+        assert_eq!(selected(5), -1);
+        assert_eq!(hover_frame(Some(9), Some(s)), None);
+        assert_eq!(hover_close(s), Some(109), "closed by the player");
+        assert_eq!(hover_close(s), None);
+    }
+
+    /// Creative screen keys: grid slots after every menu, announced with the creative screen's
+    /// index (grid 0..44, bar 45..53, inventory tab 0).
+    #[test]
+    fn creative_bundle_keys() {
+        use crate::creative_screen::{Hit, hit_key};
+        assert_eq!(hit_key(Hit::Grid(7)), super::CREATIVE_GRID + 7);
+        assert_eq!(hit_key(Hit::Menu(36)), 36);
+        assert_eq!(super::creative_index(super::CREATIVE_GRID + 7, false), Some(7));
+        assert_eq!(super::creative_index(36, false), Some(45));
+        assert_eq!(super::creative_index(12, true), Some(0));
     }
 
     /// Tooltip of the chosen item: anchor (center − 12 − half-width, y − 15) then common positioner

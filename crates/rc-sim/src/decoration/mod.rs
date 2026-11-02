@@ -9,8 +9,11 @@
 mod cushion;
 mod hanging;
 pub(crate) mod stand;
+mod summoned;
 #[cfg(test)]
 mod tests;
+
+pub(crate) use summoned::summoned;
 
 use std::collections::HashSet;
 
@@ -115,6 +118,15 @@ impl Live {
     fn new(id: i32, kind: DKind, chunk: (i32, i32)) -> Live {
         Live { id, kind, chunk, check: 0, last_hit: 0, removed: false, track: Default::default() }
     }
+}
+
+/// A living decoration (armor stand, mannequin) as an area effect sees it (`deco_living`).
+pub(crate) struct LivingDeco {
+    pub id: i32,
+    pub uuid: u128,
+    pub pos: [f64; 3],
+    pub bbox: Aabb,
+    pub marker: bool,
 }
 
 /// Fields of an entry read by the tick (without copying the network tracking).
@@ -443,7 +455,7 @@ impl Server {
             uuid: nbtio::uuid(e.get("UUID")).unwrap_or(0),
             kind: kind as i32,
             pos,
-            velocity: [0.0; 3],
+            velocity: nbtio::motion(e.get("Motion")).unwrap_or_default(),
             pitch,
             yaw,
             head_yaw: yaw,
@@ -451,6 +463,15 @@ impl Server {
         };
         let _ = self.send(Event::Entity(EntityEvent::Add(Box::new(add))));
         self.send_entity_meta(id, e);
+        // A living one: its synchronised attributes held by the game (scale, armor…).
+        if let Some(DKind::Stand | DKind::Mannequin) = kind_of(e)
+            && let Some(ty) = e.get("id").and_then(Nbt::as_str)
+        {
+            let attributes = self.nbt_synced_attributes(e, ty, None);
+            if !attributes.is_empty() {
+                let _ = self.send(Event::Attributes { entity: id, attributes });
+            }
+        }
     }
 
     /// Data specific to decorations, added to those of `send_entity_meta`.
@@ -536,6 +557,7 @@ impl Server {
                 scale: 1.0,
                 color2: 0,
                 vib: None,
+                trail: None,
             },
             force: false,
             always_visible: false,
@@ -571,7 +593,7 @@ impl Server {
             // located in an absent neighbour would be read as void.
             let c = chunk_of(pos);
             let loaded = (-1..=1).all(|dx| (-1..=1).all(|dz| matches!(self.chunks.get(&(c.0 + dx, c.1 + dz)), Some(Some(_)))));
-            if !self.mob_chunk_ticking(c) || !loaded {
+            if !self.entities_tick_in(c) || !loaded {
                 continue;
             }
             if pos[1] < floor {
@@ -720,6 +742,193 @@ impl Server {
         }
     }
 
+    // ---------- Pushes (shulker, piston) ----------
+
+    /// Decorations whose box touches `area`, with their kind; none when there is none (no
+    /// allocation on the usual path).
+    pub(crate) fn deco_touching(&self, area: &Aabb, attached_only: bool) -> Vec<(i32, DKind)> {
+        if self.deco.live.is_empty() {
+            return Vec::new();
+        }
+        self.deco
+            .live
+            .iter()
+            .filter(|l| !l.removed && (!attached_only || l.kind.attached()))
+            .filter(|l| self.deco_nbt(l.id).and_then(|e| self.deco_box(e)).is_some_and(|b| b.intersects(area)))
+            .map(|l| (l.id, l.kind))
+            .collect()
+    }
+
+    /// A non-zero move given to something attached to a block: it dies and drops its item
+    /// (a fixed frame does not move). True if it fell.
+    pub(crate) fn deco_attached_moved(&mut self, id: i32, d: [f64; 3]) -> bool {
+        if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= 0.0 {
+            return false;
+        }
+        let Some(e) = self.deco_nbt(id).cloned() else { return false };
+        match kind_of(&e) {
+            Some(k) if k.frame() && flag(&e, "Fixed") => false,
+            Some(k) if k.attached() => self.attached_kill_by(id, &e, None),
+            _ => false,
+        }
+    }
+
+    /// An opening shulker's push on the decorations touching `area`: what hangs on a block
+    /// falls with its item, an armor stand or a mannequin is moved with its collisions (a
+    /// marker or weightless stand has no physics and stays).
+    pub(crate) fn deco_shove(&mut self, area: &Aabb, d: [f64; 3]) {
+        for (id, k) in self.deco_touching(area, false) {
+            if k.attached() {
+                self.deco_attached_moved(id, d);
+            } else {
+                self.living_shove(id, d);
+            }
+        }
+    }
+
+    /// Knockback alone of a burst (wind), × `mult`: armor stands (block-like bursts only,
+    /// visible ones) and mannequins pushed, reduced by their explosion knockback resistance;
+    /// what is hung or laid (block-like bursts only) knocked off by a non-zero push, a fixed frame
+    /// excepted, its item dropped.
+    pub(crate) fn deco_blast_push(&mut self, center: [f64; 3], radius: f32, mult: f64, blocklike: bool) {
+        if radius < 1.0e-5 || self.deco.live.is_empty() {
+            return;
+        }
+        let double = f64::from(radius * 2.0);
+        // By registry index (its chunk known): one pass, whatever the number of decorations.
+        for i in 0..self.deco.live.len() {
+            let (id, k) = (self.deco.live[i].id, self.deco.live[i].kind);
+            if self.deco.live[i].removed || (!blocklike && !matches!(k, DKind::Mannequin)) {
+                continue;
+            }
+            let Some(e) = self.live_nbt(i) else { continue };
+            if k == DKind::Stand && flag(e, "Invisible") {
+                continue;
+            }
+            let pos = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
+            let dist = crate::mobs::mth::dist2(pos, center).sqrt() / double;
+            if dist > 1.0 {
+                continue;
+            }
+            let Some(b) = self.deco_box(e) else { continue };
+            let eye = match k {
+                DKind::Painting => f64::from(0.5f32 * 0.85),
+                DKind::Frame | DKind::GlowFrame => 0.0,
+                DKind::Cushion => f64::from(0.25f32 * 0.85),
+                DKind::Stand => f64::from(if flag(e, "Small") { 0.9875f32 } else { 1.7775f32 }),
+                DKind::Mannequin => f64::from(1.62f32),
+                DKind::Knot => f64::from(0.0625f32),
+            };
+            let dir = crate::mobs::mth::normalize([pos[0] - center[0], pos[1] + eye - center[1], pos[2] - center[2]]);
+            let living = matches!(k, DKind::Stand | DKind::Mannequin);
+            let res =
+                if living { self.nbt_attribute(e, k.name(), "minecraft:explosion_knockback_resistance").unwrap_or(0.0) } else { 0.0 };
+            let kp = (1.0 - dist) * f64::from(self.seen_percent(center, &b)) * mult * (1.0 - res);
+            let kb = dir.map(|v| v * kp);
+            if living {
+                self.deco_push(id, kb);
+            } else if kb.iter().any(|&v| v != 0.0) && !(k.frame() && flag(e, "Fixed")) {
+                let e = e.clone();
+                self.attached_kill_by(id, &e, None);
+            }
+        }
+    }
+
+    // ---------- Living decorations in area effects ----------
+
+    /// Armor stands and mannequins present, with their box (smash knockback, wind bursts).
+    pub(crate) fn deco_living(&self) -> Vec<LivingDeco> {
+        let mut v = Vec::new();
+        for (i, l) in self.deco.live.iter().enumerate() {
+            if l.removed || !matches!(l.kind, DKind::Stand | DKind::Mannequin) {
+                continue;
+            }
+            let Some(e) = self.live_nbt(i) else { continue };
+            let Some(bbox) = self.deco_box(e) else { continue };
+            v.push(LivingDeco {
+                id: l.id,
+                uuid: nbtio::uuid(e.get("UUID")).unwrap_or(0),
+                pos: nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default(),
+                bbox,
+                marker: l.kind == DKind::Stand && flag(e, "Marker"),
+            });
+        }
+        v
+    }
+
+    /// Push of a living decoration: the velocity is added to its saved motion and goes to the
+    /// client with its next tracking; one that never moves by itself (no gravity, marker,
+    /// immovable mannequin, whose tick stops before the tracking) sends it at once.
+    pub(crate) fn deco_push(&mut self, id: i32, v: [f64; 3]) {
+        if !v.iter().all(|x| x.is_finite()) {
+            return;
+        }
+        // One registry search; the compound read and rewritten in place (its chunk known).
+        let Some(i) = self.deco.live.iter().position(|l| l.id == id && !l.removed) else { return };
+        let stand = self.deco.live[i].kind == DKind::Stand;
+        let Some(e) = self.live_nbt(i) else { return };
+        let m = nbtio::motion(e.get("Motion")).unwrap_or_default();
+        let nv = [m[0] + v[0], m[1] + v[1], m[2] + v[2]];
+        let still = flag(e, "NoGravity") || flag(e, if stand { "Marker" } else { "immovable" });
+        self.deco_edit(id, |n| nbtio::set(n, "Motion", dbl(nv)));
+        if still {
+            let _ = self.send(Event::Entity(EntityEvent::Motion { id, velocity: crate::mobs::track::lp_quantize(nv) }));
+        } else {
+            self.deco.live[i].track.needs_sync = true;
+        }
+    }
+
+    /// Value of an attribute of a living decoration (`None`: not one, or an attribute its type
+    /// does not have).
+    pub(crate) fn deco_attribute(&self, id: i32, name: &str) -> Option<f64> {
+        let e = self.deco_nbt(id)?;
+        let ty = e.get("id").and_then(Nbt::as_str)?;
+        self.nbt_attribute(e, ty, name)
+    }
+
+    /// Saved entry of attribute `name` of a living decoration replaced (or added at the end of
+    /// its list): base, then its modifiers if any (`/attribute`).
+    pub(crate) fn deco_store_attribute(&mut self, id: i32, name: &str, base: f64, mods: &[(String, f64, i32)]) {
+        let op = |o: i32| match o {
+            1 => "add_multiplied_base",
+            2 => "add_multiplied_total",
+            _ => "add_value",
+        };
+        let mut entry = vec![("id".to_owned(), Nbt::String(name.to_owned())), ("base".to_owned(), Nbt::Double(base))];
+        if !mods.is_empty() {
+            let list = mods
+                .iter()
+                .map(|(m, v, o)| {
+                    Nbt::Compound(vec![
+                        ("id".to_owned(), Nbt::String(m.clone())),
+                        ("amount".to_owned(), Nbt::Double(*v)),
+                        ("operation".to_owned(), Nbt::String(op(*o).to_owned())),
+                    ])
+                })
+                .collect();
+            entry.push(("modifiers".to_owned(), Nbt::List(list)));
+        }
+        let entry = Nbt::Compound(entry);
+        self.deco_edit(id, |n| {
+            let mut list = nbtio::list(n.get("attributes")).to_vec();
+            match list.iter_mut().find(|a| a.get("id").and_then(Nbt::as_str) == Some(name)) {
+                Some(a) => *a = entry,
+                None => list.push(entry),
+            }
+            nbtio::set(n, "attributes", Nbt::List(list));
+        });
+        // A synchronised attribute goes to the client (scale, armor…).
+        if let Some(e) = self.deco_nbt(id)
+            && let Some(ty) = e.get("id").and_then(Nbt::as_str)
+            && client_visible(e)
+        {
+            let attributes = self.nbt_synced_attributes(e, ty, Some(name));
+            if !attributes.is_empty() {
+                let _ = self.send(Event::Attributes { entity: id, attributes });
+            }
+        }
+    }
+
     // ---------- Player ----------
 
     /// Item that places an entity, used on a block; true if the item is one
@@ -856,7 +1065,8 @@ impl Server {
                 around(w, h)
             }
             DKind::Cushion => around(1.0, 0.25),
-            DKind::Mannequin => around(0.6, 1.8),
+            // The player's size, in single precision like the game.
+            DKind::Mannequin => around(f64::from(0.6f32), f64::from(1.8f32)),
             DKind::Knot => around(0.375, 0.5),
         })
     }

@@ -81,13 +81,8 @@ impl Server {
                 let Some(i) = self.mob_index(id) else { return false };
                 let Some(mut m) = self.mobs.list[i].take() else { return false };
                 let src = [m.pos[0] + kb.0, m.pos[1], m.pos[2] + kb.1];
-                let before = m.health;
                 let r = self.mob_hurt_dir(&mut m, ty, amount, by, Some(src), Some(kb));
-                let dealt = before - m.health;
                 self.mobs.list[i] = Some(m);
-                if r && by == Some(Ent::Player) {
-                    self.s8_player_hurt_by_projectile(t, ty, amount, dealt); // S9
-                }
                 r
             }
         }
@@ -161,6 +156,10 @@ impl Server {
     /// Impact of an arrow against an entity / impact of a trident against an entity; true if the projectile was
     /// deflected by the entity (never for simulated living ones).
     pub(crate) fn proj_hit_entity(&mut self, p: &mut Proj, h: EntityHit) -> bool {
+        self.as_direct_hit(p, |s, p| s.proj_hit_entity_now(p, h))
+    }
+
+    fn proj_hit_entity_now(&mut self, p: &mut Proj, h: EntityHit) -> bool {
         // F14: the breeze returns arrows and tridents.
         if self.proj_deflected_by_entity(p, h) {
             return true;
@@ -619,6 +618,10 @@ impl Server {
 
     /// The impact or deflection then the impact of the non-arrow projectiles.
     pub(crate) fn proj_hit(&mut self, p: &mut Proj, hit: Hit) {
+        self.as_direct_hit(p, |s, p| s.proj_hit_now(p, hit));
+    }
+
+    fn proj_hit_now(&mut self, p: &mut Proj, hit: Hit) {
         match hit {
             Hit::Miss(_) => {}
             Hit::Block(b) => {
@@ -1279,6 +1282,10 @@ impl Server {
 
     /// Event 17, explosion damage, removal.
     pub(crate) fn firework_explode(&mut self, p: &mut Proj) {
+        self.as_direct_hit(p, Self::firework_explode_now);
+    }
+
+    fn firework_explode_now(&mut self, p: &mut Proj) {
         let _ = self.send(Event::Entity(EntityEvent::Event { id: p.id, event: 17 }));
         // `explode` event at the rocket, emitted by its shooter.
         let owner = self.proj_owner(p);

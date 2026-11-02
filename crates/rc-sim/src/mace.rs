@@ -141,9 +141,11 @@ impl Server {
 
     /// Living entities within 3.5 blocks of the target (box grown by 3.5, then distance between
     /// positions), except the attacker, the target, the attacker's allies, the animals tamed by
-    /// the target (the game tests the target, not the attacker) and a player flying in creative
-    /// mode or spectating: pushed by `(3.5 − distance) × 0.7`, doubled beyond 5 blocks of fall,
-    /// reduced by their knockback resistance, along the direction from the target, 0.7 upwards.
+    /// the target (the game tests the target, not the attacker), armor stands that are markers
+    /// and a player flying in creative mode or spectating: pushed by `(3.5 − distance) × 0.7`,
+    /// doubled beyond 5 blocks of fall, reduced by their knockback resistance, along the
+    /// direction from the target, 0.7 upwards. Mobs, armor stands, mannequins and players
+    /// (the current one and the other players of the local network) alike.
     fn smash_knockback(&mut self, attacker: Ent, attacker_name: &str, fall: f64, t: &Struck) {
         self.level_event(2013, t.on_pos, 750);
         let b = &t.bbox;
@@ -152,12 +154,7 @@ impl Server {
             max: [b.max[0] + 3.5, b.max[1] + 3.5, b.max[2] + 3.5],
         };
         let mult = if fall > 5.0 { 2.0 } else { 1.0 };
-        let power = |d: [f64; 3], res: f64| {
-            let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-            let p = (3.5 - len) * f64::from(0.7f32) * mult * (1.0 - res);
-            let n = if len < f64::from(1.0e-5f32) { [0.0; 3] } else { d.map(|c| c / len) };
-            (p, [n[0] * p, n[2] * p])
-        };
+        let power = |d: [f64; 3], res: f64| smash_power(d, res, mult);
         let near = |pos: [f64; 3]| crate::mobs::mth::dist2(t.pos, pos) <= 3.5 * 3.5;
         let attacker_mob = match attacker {
             Ent::Mob(id) => self.mob_ref(id).cloned(),
@@ -186,22 +183,61 @@ impl Server {
                 o.needs_sync = true;
             }
         }
-        // The player as a bystander (a mob smashes another mob).
-        if attacker != Ent::Player
-            && t.ent != Ent::Player
-            && self.game_mode != 3
-            && !(self.game_mode == 1 && self.flying)
-            && self.ent_alive(Ent::Player)
-            && near(self.pos)
-            && self.player_aabb().intersects(&area)
-            && !self.same_team(attacker_name, &self.name.clone())
-        {
-            let d = [self.pos[0] - t.pos[0], self.pos[1] - t.pos[1], self.pos[2] - t.pos[2]];
-            let res = self.player_attribute("minecraft:knockback_resistance");
-            let (p, kb) = power(d, res);
+        // Armor stands (except markers) and mannequins, kept as compounds; their knockback
+        // resistance comes from their attributes and worn equipment.
+        for d in self.deco_living() {
+            if d.marker || Ent::Mob(d.id) == attacker || Ent::Mob(d.id) == t.ent || !near(d.pos) || !d.bbox.intersects(&area)
+            {
+                continue;
+            }
+            if self.same_team(attacker_name, &crate::nbtio::uuid_text(d.uuid)) {
+                continue;
+            }
+            let res = self.deco_attribute(d.id, "minecraft:knockback_resistance").unwrap_or(0.0);
+            let (p, kb) = power([d.pos[0] - t.pos[0], d.pos[1] - t.pos[1], d.pos[2] - t.pos[2]], res);
             if p > 0.0 {
-                self.player_add_velocity([kb[0], f64::from(0.7f32), kb[1]]);
+                self.deco_push(d.id, [kb[0], f64::from(0.7f32), kb[1]]);
             }
         }
+        // The current player as a bystander (a mob smashes), then the other players.
+        if attacker != Ent::Player && t.ent != Ent::Player {
+            self.smash_push_player(attacker_name, t.pos, &area, mult);
+        }
+        for o in self.lan_peers() {
+            if Ent::Mob(o.id) == t.ent || o.game_mode == 3 || !near(o.pos) || !o.bbox.intersects(&area) {
+                continue;
+            }
+            let name = attacker_name.to_owned();
+            self.as_player(o.who, |sv| sv.smash_push_player(&name, t.pos, &area, mult));
+        }
     }
+
+    /// The smash knockback on the installed player as a bystander: alive, neither spectating nor
+    /// flying in creative mode, in range, not allied with the attacker; its velocity is sent to it.
+    fn smash_push_player(&mut self, attacker_name: &str, from: [f64; 3], area: &Aabb, mult: f64) {
+        if self.game_mode == 3
+            || (self.game_mode == 1 && self.flying)
+            || !self.ent_alive(Ent::Player)
+            || crate::mobs::mth::dist2(from, self.pos) > 3.5 * 3.5
+            || !self.player_aabb().intersects(area)
+            || self.same_team(attacker_name, &self.name.clone())
+        {
+            return;
+        }
+        let d = [self.pos[0] - from[0], self.pos[1] - from[1], self.pos[2] - from[2]];
+        let res = self.player_attribute("minecraft:knockback_resistance");
+        let (p, kb) = smash_power(d, res, mult);
+        if p > 0.0 {
+            self.player_add_velocity([kb[0], f64::from(0.7f32), kb[1]]);
+        }
+    }
+}
+
+/// Smash knockback of a bystander at offset `d` from the target: power `(3.5 − distance) × 0.7`
+/// × `mult` × (1 − resistance) and its horizontal push along the normalized offset.
+fn smash_power(d: [f64; 3], res: f64, mult: f64) -> (f64, [f64; 2]) {
+    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    let p = (3.5 - len) * f64::from(0.7f32) * mult * (1.0 - res);
+    let n = if len < f64::from(1.0e-5f32) { [0.0; 3] } else { d.map(|c| c / len) };
+    (p, [n[0] * p, n[2] * p])
 }

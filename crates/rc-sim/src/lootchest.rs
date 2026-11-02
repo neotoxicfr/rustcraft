@@ -124,31 +124,42 @@ impl Server {
         let luck = if by_player { self.luck() } else { 0.0 };
         let generated = {
             let mut items = std::mem::take(items);
-            let tags = &self.block_tags;
-            let data = &self.data;
-            let tag_fn = |tag: &str, name: &str| {
-                let bid = data.blocks.iter().position(|b| b.name == name).map(|i| i as u32);
-                bid.is_some_and(|b| tags.get(tag).is_some_and(|v| v.binary_search(&b).is_ok()))
-            };
-            let life = &mut *self.life;
-            let loot = crate::loot::Loot { pack: &life.pack, items: &life.items, block_tag: &tag_fn };
-            let ctx = crate::loot::Ctx { luck, ..Default::default() };
             // Fixed seed, otherwise sequence declared by the table (`random_sequence`), otherwise the level's
-            // random (table without sequence or nonexistent: nothing is created in the sequences).
+            // random (table without sequence or nonexistent: nothing is created in the sequences). The
+            // world's generator is taken out for the draw, the world being lent to it.
             let seq =
-                life.pack.get("loot_table", table).and_then(|t| t["random_sequence"].as_str().map(str::to_owned));
-            if seed != 0 {
-                let mut rng = crate::mobs::jrand::JRand::new(seed);
-                let stacks = loot.drops(table, &ctx, &mut rng);
-                fill(&mut items, stacks, &mut rng);
-            } else if let Some(q) = seq {
-                let rng = life.seqs.get(&q);
-                let stacks = loot.drops(table, &ctx, rng);
-                fill(&mut items, stacks, rng);
-            } else {
-                let rng = &mut life.rng;
-                let stacks = loot.drops(table, &ctx, rng);
-                fill(&mut items, stacks, rng);
+                self.life.pack.get("loot_table", table).and_then(|t| t["random_sequence"].as_str().map(str::to_owned));
+            let mut world_rng = match &seq {
+                _ if seed != 0 => None,
+                Some(q) => Some(*self.life.seqs.get(q)),
+                None => Some(self.life.rng),
+            };
+            {
+                let tag_fn = |tag: &str, name: &str| self.block_name_tagged(tag, name);
+                let loot = crate::loot::Loot { pack: &self.life.pack, items: &self.life.items, block_tag: &tag_fn };
+                // Chest context: the opening player is `this`, origin at the centre of the block.
+                let view = self.loot_world(crate::progress::pred::Ctx {
+                    this: by_player.then_some(crate::progress::pred::Who::E(crate::commands::ents::E::Player)),
+                    origin: Some(p.map(|c| f64::from(c) + 0.5)),
+                    ..Default::default()
+                });
+                let ctx = crate::loot::Ctx { luck, world: Some(&view), ..Default::default() };
+                match &mut world_rng {
+                    None => {
+                        let mut rng = crate::mobs::jrand::JRand::new(seed);
+                        let stacks = loot.drops(table, &ctx, &mut rng);
+                        fill(&mut items, stacks, &mut rng);
+                    }
+                    Some(rng) => {
+                        let stacks = loot.drops(table, &ctx, rng);
+                        fill(&mut items, stacks, rng);
+                    }
+                }
+            }
+            match (seq, world_rng) {
+                (Some(q), Some(r)) => *self.life.seqs.get(&q) = r,
+                (None, Some(r)) => self.life.rng = r,
+                _ => {}
             }
             items
         };

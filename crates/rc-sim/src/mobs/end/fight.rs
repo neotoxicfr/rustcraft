@@ -15,6 +15,11 @@ use crate::blocks::flag;
 use crate::nbtio::{self, int};
 use crate::server::Server;
 
+/// Level of the fight's ticket at chunk (0, 0): full level 33 − radius 9.
+const FIGHT_TICKET_LEVEL: i32 = 24;
+/// Radius of the fight's ticket: the full chunks it keeps loaded around chunk (0, 0).
+const FIGHT_TICKET_RADIUS: i32 = 9;
+
 /// Respawn stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
@@ -214,11 +219,15 @@ impl Server {
         if !f.bar_player {
             return;
         }
-        // Arena ticket: chunks within 8 of the origin kept loaded.
-        let o = f.origin;
-        let (cx, cz) = (o[0] >> 4, o[2] >> 4);
-        let arena: Vec<(i32, i32)> = (-8..=8).flat_map(|x| (-8..=8).map(move |z| (cx + x, cz + z))).collect();
-        self.ensure_loaded(&arena);
+        // Arena ticket (L9-TICK: centred on chunk (0, 0) like the game, full chunks within 9, so
+        // those within 8 have their neighbours and tick their blocks).
+        if (-FIGHT_TICKET_RADIUS..=FIGHT_TICKET_RADIUS)
+            .any(|x| (-FIGHT_TICKET_RADIUS..=FIGHT_TICKET_RADIUS).any(|z| !self.chunks.contains_key(&(x, z))))
+        {
+            let r = FIGHT_TICKET_RADIUS;
+            let arena: Vec<(i32, i32)> = (-r..=r).flat_map(|x| (-r..=r).map(move |z| (x, z))).collect();
+            self.ensure_loaded(&arena);
+        }
         if !self.arena_loaded() {
             return;
         }
@@ -941,7 +950,7 @@ impl Server {
                             6.0,
                             false,
                             "minecraft:explosion",
-                            super::super::explode::Blast::None,
+                            super::super::explode::Blast::None(false),
                         );
                         self.mobs.end.crystals[i].removed = true;
                     }
@@ -1024,13 +1033,15 @@ impl Server {
         jobs.push(crate::save::Job::Dat { path, nbt: nbtio::encode_root(&f.to_nbt()), backup: false });
     }
 
-    /// Chunk covered by the fight's ticket while players are in the fight: its entities (the
-    /// dragon, the crystals, the rest) tick within 7 chunks of the origin even far from the
-    /// player's simulated zone.
-    pub(crate) fn fight_ticket_at(&self, c: (i32, i32)) -> bool {
-        let Some(f) = self.mobs.end.fight.as_ref().filter(|f| f.bar_player) else { return false };
-        let o = (f.origin[0] >> 4, f.origin[2] >> 4);
-        (c.0 - o.0).abs() <= 7 && (c.1 - o.1).abs() <= 7
+    /// Level of the fight's ticket at chunk `c` while players are in the fight (`i32::MAX`
+    /// otherwise): radius 9 at chunk (0, 0) whatever the origin, i.e. level 24 there plus the
+    /// distance, so entities and random ticks within 7 chunks, scheduled ticks and block
+    /// entities within 8, full chunks within 9, even far from the player's simulated zone.
+    pub(crate) fn fight_ticket_level(&self, c: (i32, i32)) -> i32 {
+        if !self.mobs.end.fight.as_ref().is_some_and(|f| f.bar_player) {
+            return i32::MAX;
+        }
+        FIGHT_TICKET_LEVEL.saturating_add(c.0.saturating_abs().max(c.1.saturating_abs()))
     }
 }
 
@@ -1057,6 +1068,16 @@ mod summon_tests {
         assert!(p.s.prog.done(i), "summoned_entity missing");
         drop(p);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// L9-TICK: the fight's ticket also ticks the blocks of the arena (see the shared body).
+    #[test]
+    fn fight_ticket_ticks_the_blocks_of_the_arena() {
+        crate::tests_l9tick::fight_ticket_ticks_the_blocks_of_the_arena(|| {
+            let mut f = Fight::read(None);
+            f.bar_player = true;
+            f
+        });
     }
 
     /// G3-F13: the fight's ticket (players in the fight) makes the arena "ticking entities" for

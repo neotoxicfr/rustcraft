@@ -48,7 +48,15 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// G3-F08: the player file always carries `post_effects` like the game's (alone: b993b7aa…, 823),
 /// and zombies, husks, zombie villagers, drowned, spiders, cave spiders and endermen move at
 /// their single-precision speed widened like the game's; without both: 5092e230… again.
-const EXPECTED_NEW: (&str, usize) = ("521f08db7744fcb239fff91a8324e19b689efc1eaa316dafa106292e72dcea0f", 823);
+/// L9-TICK: a generated chunk resumes its scheduled ticks and registers its block entities'
+/// tickers (before: never during the session), the only cause of the change (checked by putting
+/// the old marking back: 521f08db…, 823 again); the mobs then end in other entity chunks.
+/// G4-F08: fire-immune species may spawn in a fire cell like the game's (Nether entity chunks;
+/// before: 521f08db…, 823).
+/// G4-F08 resumption: mobs write their live `PortalCooldown` (the game writes it for every
+/// entity), the only cause of the change (without it: 360ac84c…, 807 again).
+/// Lot 9 integration: all together.
+const EXPECTED_NEW: (&str, usize) = ("700c26d921c9f1eb3c783ac07d5e9d0bcb2ee92d919d00fed6fe4a71487faa21", 820);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 const EXPECTED_MODEL: &[(&str, &str, usize)] = &[(
     "790b2d94653a4243e68f2e0cb0ebc3f865f9f59815ed65149067cdd374c6b800",
@@ -197,7 +205,12 @@ fn run_new() -> Option<Vec<(String, String)>> {
 /// G3-F08: player file key `post_effects` (alone: 27355455…, 378) and the widened speeds of
 /// the zombie and spider families and of the enderman (without both: 9d3c0ffd… again).
 /// Lot 8 integration: both together.
-const EXPECTED_MECH: (&str, usize) = ("a551d2723eb85bed3efc1cfddae60490fbfaff269dd6609d1e752ae358b3efac", 380);
+/// L9-TICK: generated chunks resume their ticks and register their tickers, the only cause of
+/// the change (old marking put back: a551d272…, 380 again).
+/// G4-F08 resumption: mobs write their live `PortalCooldown` (the game writes it for every
+/// entity), the only cause of the change (without it: a551d272…, 380 again).
+/// Lot 9 integration: all together.
+const EXPECTED_MECH: (&str, usize) = ("304c0b39d8961896bf4a8c4d1f90342ef19701aac82e67a005136f19b0d9ff3c", 380);
 
 /// Server command (refusal = failure: the rig would be incomplete).
 pub(crate) fn cmd(s: &mut Server, c: &str) {
@@ -340,7 +353,14 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 /// Expected fingerprint of all the regions after closing: (total, number of chunks).
 /// G3-F08: zombie, spider and enderman families at their widened single-precision speed, the
 /// only cause of the change (without it: 63579824… again).
-const EXPECTED_REGIONS: (&str, usize) = ("9c4062454b5998f1a0b4392066a5e3e56966ee691cee3525aabf9c4e99b7f60f", 1254);
+/// L9-TICK: generated chunks resume their ticks and register their tickers, the only cause of
+/// the change (old marking put back: 9c406245…, 1254 again). Same block chunks (514 of them now
+/// carry the resumed ticks or block entity states); 11 entity chunks fewer, the mobs ending
+/// elsewhere.
+/// G4-F08 resumption: mobs write their live `PortalCooldown` (the game writes it for every
+/// entity), the only cause of the change (without it: 9c406245… again).
+/// Lot 9 integration: all together.
+const EXPECTED_REGIONS: (&str, usize) = ("054d4766947e49aff86433df1c37fd3cbe32520d5967caa948e56b4ad1192377", 1243);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all
 /// dimensions): SHA-256 of the decompressed NBT per chunk. Sector locations and

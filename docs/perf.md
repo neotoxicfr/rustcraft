@@ -2984,6 +2984,56 @@ bench_g3f13 -- --ignored --nocapture`), loaded machine (other agents compiling).
   Command-time only. Biome tests of the structure generators go through one helper (`biome_ok`):
   a command placement skips the biome lookup altogether; world generation unchanged (equivalence
   tests of the starts and placements pass with their stored fingerprints).
+
+## L9-STRUCT: features and structures replayed into the live world (02/11, loaded machine)
+
+- Features of bone meal, saplings and `place feature` now replay the region's journal (the
+  structure path's `Region::live_log`) with each write's own flags, breaks and direct section
+  writes, instead of comparing the 9 copies with the world (fidelity fix). The comparison (0.12 to
+  0.13 ms per placement, 9 chunks, section against section) is gone; the replay costs what the
+  game's own writes cost (neighbour updates of the trees, flag 19). Bench
+  `g6f07_tests::bench_g6f07_deco_copy_and_compare` (`--ignored`, best of 30, other agents
+  compiling), main → this branch with `RUSTCRAFT_OPT_DECO_PRIME=0`: complete oak placement 3.17 to
+  3.29 ms → 3.03 to 3.08 ms; `tests_g6f14::bench_place_jigsaw` 13.9 to 14.0 ms → 13.3 to 13.5 ms.
+- Hot spot found by splitting the bench: the region copy of 9 chunks takes 2.2 to 2.6 ms of the
+  3.1 ms oak placement, almost all of it in the six height maps, each walked from the top of the
+  world down every column (6 × 256 × up to 384 cells per chunk); unpacking the sections is
+  0.11 ms. Leads:
+  - one walk per column for the six maps, started at the top of the highest section that is not
+    all air (no map counts air), switch `RUSTCRAFT_OPT_DECO_PRIME` (default 1). Same heights
+    (tests `prime_many_matches_prime_per_map`, random columns, and
+    `deco_chunk_one_walk_matches_per_map`, built, flat and unloaded chunks). Alternated A/B, two
+    passes each: region copy 2.22 / 2.58 ms → 0.20 / 0.21 ms; oak placement 3.03 / 3.08 ms →
+    0.29 / 0.29 ms; bone meal on a grass field (up to 128 feature placements) 33.5 / 34.3 ms →
+    2.38 / 2.39 ms (a single click took two thirds of a tick before); `place jigsaw` of the outpost
+    base plate 13.3 / 13.5 ms → 1.75 / 1.75 ms. Kept, on by default.
+  - region copies on several threads (B4): spawned threads in the bench, 9 chunks: 1 / 2 / 4 / 8
+    threads 0.27-0.29 / 0.17-0.21 / 0.16-0.22 / 0.17-0.27 ms against 0.21 ms on the server thread
+    alone: the spawn eats the gain at this size. Built for the grids of live structures (16 chunks
+    or more, `RUSTCRAFT_THREADS` or the logical cores, `std::thread::scope`, not the rayon pool
+    that the generation thread keeps busy), switch `RUSTCRAFT_OPT_DECO_PAR` (default 0); `place
+    jigsaw` 1.76 / 1.95 ms on, 1.85 / 1.89 ms off: under the noise; kept off behind its switch
+    until the quiet-machine bench (C6). Same copies in the same order (test
+    `region_copies_on_threads_match_one_thread`, 2, 4 and 7 threads).
+  - same pattern in world generation (B6): the final height maps of every generated chunk (and
+    the generation maps of a flat chunk) were walked map by map from the top. One walk per column
+    from the highest slice of 16 that is not all plain air (`DecoChunk::top_non_air`, one slice
+    comparison each), switch `RUSTCRAFT_OPT_PRIME_ONE_WALK` (default 1). Bench
+    `templ_tests::bench_prime_final` (25 chunks, best of 20, two runs): noise terrain 4.69 / 4.75 ms
+    → 0.48 / 0.50 ms (0.19 → 0.02 ms per chunk), flat 6.64 / 6.73 ms → 0.55 / 0.57 ms. Same heights
+    (test `generated_heightmaps_one_walk_match`, three seeds and flat, 25 chunks each; the stored
+    fingerprints of generation pass). Kept, on by default; scene bench (chunk loading) to run on a
+    quiet machine.
+  - GPU not applicable (a few hundred kilobytes copied and walked once, result needed at once by
+    the server thread). Not built: reusing the 9 copies across the 128 attempts of a grass bone
+    meal (the copies would have to follow the live side effects of each replay); lazy height
+    maps (a branch on every height read of the decoration hot path).
+- `place jigsaw` and the jigsaw block load the chunks under their pieces before copying them
+  (disk, otherwise the generation thread is awaited, like the game's direct chunk access); only
+  when the command reaches unloaded chunks. The wait of `load_now` (portal search too) now wakes on
+  the generation thread's channel instead of polling every millisecond: same result, no busy loop.
+- Live structures journal a barrier (24 bytes) before each block entity of a template; command
+  time only, nothing on world generation (no journal there).
 ## G3-F08: compute, posteffect, fetchprofile, attribute reset, loot targets (02/11, loaded machine)
 
 - Numeric providers (`rc_sim::loot`, every loot draw): the unchecked reading now carries the
@@ -3072,3 +3122,184 @@ regularity, allocations, disk, RAM, startup, multi-core): figures below, the res
 - To re-measure on a quiet machine with the other menu missions: `menu` scene of
   `tools/bench/scenes.py` (no change expected), screenshots of the video and accessibility
   screens (titles 2 px lower, labels).
+
+## L9-TICK: pearl and fight tickets, dimension state, cauldrons in the crossed-block pass, packed block entities (02/11, loaded machine)
+
+Fidelity fixes; figures from the existing micro-benches (`bench_g3f13_entity_test_and_furnace_list`,
+`bench_mob_contacts`, `cargo test --release -p rc-sim <name> -- --ignored --nocapture`), loaded
+machine (other agents compiling: the untouched furnace loop moved from 55 to 100 ns between two
+runs), so only the order of magnitude is claimed.
+
+- Entity chunk test (`entity_ticks_at`): the ticket test (pearls, dragon fight) only runs when
+  the player's zone test fails, and costs a flag test plus an empty-list test without tickets:
+  8.6-9.4 ns in range, 7.1-7.8 ns out of range, against 8.2-8.5 / 6.6-7.3 ns recorded by G3-F13
+  (same bench, other load): no measurable change. Pearl tickets live in a small vector (one per
+  chunk a pearl entered in the last 40 ticks): a linear scan beats a map at these sizes.
+- Chunk tests of the world tick (`chunk_simulated`, `chunk_entity_ticking`,
+  `chunk_simulated_now`): same ticket test appended after the existing ones.
+- Dragon fight arena: the 19 × 19 chunk list is only built when one of them is missing (before:
+  a 17 × 17 list allocated every tick of the fight, then filtered).
+- Block-entity registration of a loaded chunk: one pass over each block entity's fields instead
+  of one search per field read (six) now that `keepPacked` is read too: 256 block entities
+  14.0-14.3 µs, against 15.5-16.8 µs for the first version (six searches + the new one) and
+  13.8-14.0 µs recorded by G3-F13. Packed ones: promotion order computed once per chunk, linear
+  in their count (bucket counts kept, recounted on growth).
+- Crossed-block pass: cauldrons are three more block comparisons, after the existing ones, for
+  the non-air cells only, and their 14-box shape is built only for a cauldron cell. The contact
+  pass of the mobs no longer looks for cauldrons (smaller family mask for its palette pre-scan):
+  `bench_mob_contacts` 74.6-75.5 ns per tick and per mob (78.6 ns in open air and 79.1 ns in a
+  cobweb recorded by G5-F02e, other load): no measurable change.
+- Generated chunks now resume their scheduled ticks and register their tickers (fidelity: never
+  done before during the session), once per chunk arrival: the cost of `register_chunk_tickers`
+  above per chunk, plus the ticks it schedules.
+- Leads not taken: a per-tick set of the ticking chunks (would also hold the tickets; considered
+  by G3-F13, more costly to build than the per-entity test at usual counts). Multi-core and GPU:
+  not applicable (ticket expiry, promotion order and effect order are observable sequences).
+- To re-measure on a quiet machine: `tools/bench/scenes.py` scenes with generated terrain
+  (new chunks now register their tickers), and the dragon fight if a scene covers it.
+## G3-F06: in-game tests (`/test`), relay of command successes, pack templates (02/11, loaded machine)
+
+- Block-based tests read their structure every tick (start, accept, fail and log blocks). The game
+  walks the structure cell by cell once per mode (three walks per tick, up to 48³ cells each).
+  Kept: one walk for the four modes (nothing changes the blocks between the game's walks), the
+  sections whose palette holds no test block skipped (`may_contain`), only the cells of the
+  structure read in the others, then sorted back into the game's order (relative z, y, x).
+  Bench `tests_g3f06::bench_test_block_search` (48³, a few test blocks, best of 5 × 20): one
+  cell-by-cell walk 1.021 ms, section walk 0.054 ms (×19, per walk; the game makes three per tick).
+  Equivalence: `test_block_search_matches_the_cellwise_reference` (four rotations, chunk and
+  section borders). The cell walk stays behind `RUSTCRAFT_OPT_GT_SCAN=0` until the quiet-machine
+  bench. Leads not taken: cache of the test block positions between ticks (blocks move: pistons,
+  players; a rescan is needed every tick anyway, and the walk is already skip-dominated),
+  multi-core and GPU (a few thousand cells, ordered results, below a thread start).
+- Relay of command successes (`chat.type.admin`): the table of the game's non-relayed keys
+  (97 sorted keys, binary search) is read only when an operator other than the source could
+  receive the message: never for the host's own commands in singleplayer (the common case pays
+  one rule read and one comparison). Command block output: one fewer rule read on success.
+- Templates of the packs: looked up on demand (at most once per identifier, the absence
+  remembered by the template cache, cleared on `/reload`), nothing read at opening; a world with
+  the base pack only skips the pack listing. Lead not taken: stacking every pack `.nbt` at
+  opening (startup and memory for every world, for files most worlds never ask for).
+- Test runner: per tick, only the tests of the current batch are visited (indices, no copy of
+  the tests); structure placement, clearing and barriers run once per test start (command or
+  batch start), with the clearing's tick and block event removal limited to the box's chunks
+  (`TickQueue::clear_box`). Not on any path when no test runs (one `Option` test per tick).
+- To re-measure on a quiet machine: `bench_test_block_search` (2 passes, both walks); scene bench
+  not concerned (no test runs in the scenes; the per-tick cost without a runner is one branch).
+## G4-F08: monsters and entities (02/11, loaded machine)
+
+- Opening shulker (server): the push now walks the mobs (species-bound prefilter kept), the
+  primed TNT and falling blocks, the items and the orbs, and moves what it touches with its
+  collisions (`mob_move`, `Body::shove`) instead of placing the mobs. Micro-bench
+  `tests_g4f08::bench_g4f08_shulker_push_scan` (2 passes; 300 mobs, 1,000 items, 100 orbs, a slice
+  touching nothing): former scan (mobs only) 3.76-3.83 µs, new 6.61-6.69 µs per push. Only while
+  a shulker opens further (20 ticks per opening): about 60 µs per opening in such a crowd. Lead
+  noted, not taken for this path alone: a spatial index of the items and orbs, which the piston push
+  (`push_targets`, same full walk) would share. Multi-core, GPU: not applicable (a few boxes).
+- Client side, the zones are built only for the shulkers opening further this tick; the player's
+  collision boxes for the push are gathered only when a zone exists: nothing more per tick otherwise.
+- Body rotation of a standing mob carrying a mob (client): the "first passenger is a mob" flag is
+  refreshed before each entity tick. Two leads, same flags (checked by
+  `entities::size_tests::standing_mob_carrying_a_mob_keeps_its_body`): walk of every entity 3.12-3.20
+  µs per tick, list of the vehicles that received passengers 0.127-0.129 µs (bench
+  `entities::size_tests::bench_mark_mob_riders`, 3,000 zombies, 10 vehicles, 2 passes; whole entity
+  tick 138-141 µs). Kept: the list; `RUSTCRAFT_OPT_RIDERLIST=0` brings back the walk.
+- Spawning and breeze dangers in one per-species test: same name tests as before, the fire tag read
+  only for a species that is not fire immune, the "immune to" tag only for six species; no extra
+  work on the spawning path, no bench. The new-world fingerprint changes (Nether entity chunks only:
+  fire-immune species now spawn in fire cells like the game), see `tests_opt.rs`.
+- Primed TNT and falling blocks written with the entity chunks: once per save, a dozen fields per
+  entity. Warden targets: team names built only when a team exists, border test two comparisons.
+- To re-measure on a quiet machine: the two micro-benches above; scene bench not concerned (no
+  shulker, jockey or sulfur cube in the scenes).
+- Resumption (fidelity): every mob push now scans the minecarts (the game pushes them, the cramming
+  counts them, a burning cube hurts them). Bench `tests_g4f08::bench_g4f08_mob_push_with_minecarts`
+  (2 passes, 20 neighbouring zombies): 1,508-1,509 ns per push without minecart, 1,694-1,758 ns
+  with 100 minecarts that touch nothing, about 2 ns per minecart and per push (300 mobs, 100
+  minecarts: about 60 µs per tick). Nothing allocated when no minecart touches (empty list).
+  Leads noted, not taken at these counts: a spatial grid of the minecarts, or their boxes computed
+  once per tick (a box is 6 additions from the position). Multi-core: not applicable (mutations
+  in list order).
+- The spawning danger test reads the seven "immune to" tags by `TagId` (one bit word per block,
+  no name hashing; before: six tags read by name), `default_immune_to` included for the other
+  species: one bit test more on the spawning path, no bench.
+- The decorations in a shulker or piston push: nothing scanned while no decoration exists; the
+  live list is walked (box of each) only when a shulker opens further or a block moves.
+- Fingerprints: the three change for one cause only, the `PortalCooldown` now written by every mob
+  (the game writes it for every entity); without that line the three come back identical.
+## G6-F17: loot functions, providers and entries (02/11, loaded machine)
+
+- Engine (`loot.rs`): each stack now goes through the entry's, the composites', the pool's and
+  the table's modifiers as soon as it is made (one receiver per level, `Sink`) instead of being
+  collected per entry then per roll: the draws of the functions interleave with those of nested
+  tables like the game's, and the two vectors per roll are gone. The candidate buffer is kept
+  from one roll and one pool to the next; weightless candidates are dropped while expanding (no
+  second pass); a candidate stays 40 bytes (registry id of an expanded tag item instead of a
+  string, composite modifiers as an optional boxed slice, absent in the base pack). Tables
+  running: a `RefCell<Vec<usize>>` of data pointers in the context (push and pop per table run)
+  replaces the depth counter.
+- Equivalence (A1/A2): `loot::bench_tests::loot_bench` (ignored) fingerprints the 1447 tables of
+  the base pack, 16 seeds each, fortune III pickaxe, luck 1, looting II: `af880b1baa83fb25` on
+  389108f0 and on this branch.
+- Time per draw (best of 7 x 5 000 draws, same bench, built before and after; loaded machine, 4
+  alternating pairs). Quietest pair, before / after (first candidate layout, 72 bytes): stone
+  442-450 / 434-435 ns, oak leaves 1304-1340 / 1329-1355, zombie 823 / 813-826, simple dungeon
+  5168-5184 / 5273-5353, fishing 819-823 / 822-830. The dungeon's +2 % led to the 40-byte
+  candidate and the kept buffer; the following pairs vary by up to 40 % between two passes of the
+  same build (other compilations): no conclusion, nothing removed. To re-measure on a quiet
+  machine: `loot_bench` on both builds, 2 alternating passes.
+- Not applicable: multi-core and GPU (a draw is one chain on one generator, a few microseconds,
+  main thread); caching resolved nested sets or tag item lists (none on the measured block,
+  entity, chest and fishing tables).
+- Value checks of `/execute if predicate` and advancements: one loot evaluator built per check
+  (a few fields and a copy of the condition context). `/item modify`, `/loot`, chest loot: the
+  world is lent to the draw by reference (`LootView`), nothing copied.
+## L9-COMBAT: smash and wind reach, hurt trigger, stand attributes, summon, name cache (02/11, loaded machine)
+
+- Wind Burst / wind charge bursts now reach armor stands, mannequins, what is hung, items, orbs,
+  TNT, falling blocks, minecarts, crystals and the other players. Bench
+  `tests_l9combat::bench_wind_burst_decorations` (50 bursts per figure, 2 passes): burst alone
+  371-443 us (block rays, unchanged); with 400 armor stands around (68 in range) 825-903 us, of
+  which the decoration pass 454-636 us: scan of the 400 entries 17-25 us, visible part of the 68
+  stands 404-601 us (about 6 us each, 54 rays per stand box: the game's own computation, shared
+  with every explosion). Without decorations the pass costs 0.01-0.12 us.
+- Decoration pass, lead 1: one pass by registry index (chunk known) instead of a search by
+  identifier per decoration (quadratic): scan 17-25 us against 43.6 us; kept. Lead 2: the push of
+  a stand searches the registry once instead of three times (68 pushes): below the noise of the
+  bench, kept (fewer searches, same result). Lead 3, distance tested before the box (painting
+  boxes computed only in range): part of the 17-25 us scan, kept.
+- Visible part of a box (`seen_percent`): the dominant cost for any entity in range, mobs
+  included (pre-existing). Multi-core: not feasible as is (the world is read through the server,
+  which is not shareable between threads); a lead for the explosion engine as a whole (a read-only
+  block view shared by threads, or a cache of the cells crossed by the rays), to measure with the
+  TNT scenes, not for this mission.
+- Smash knockback: one pass over the living decorations and the other players per smash (rare);
+  no measurable cost. `player_hurt_entity` from the mob's hurt: one lookup of the open criteria
+  per hurt by the player; the projectile is copied only while such a criterion is open (none once
+  the three vanilla advancements are done). Explosion packets: one per player only with other
+  players of the local network (solo: same single event).
+- `/attribute` on stands, `/summon` of stands and mannequins, the name cache: command and join
+  paths, no measurable cost; the name cache is read once per world and written on each new entry
+  (like the game). Spawn of a living decoration: synchronised attributes read from its compound
+  (a few attributes, equipment parsed once).
+- Multi-core and GPU not applicable to the rest (event paths, a few entities). To re-measure on a
+  quiet machine: the bench above (2 passes), `fingerprint_*` tests unchanged.
+## L9-CLIENT: screen limits (02/11, loaded machine)
+
+- Wheel: discrete mode and sensitivity read once per wheel event (two option lookups, before any
+  screen) and applied by one shared conversion; per event, never per frame: no cost to measure.
+- Bundles: the stop-hover rule (announce "no item chosen" when the hovered slot changes away from
+  a bundle) is checked every frame with a container or creative screen open, as the game does
+  (a per-tick check would miss slots crossed between two ticks). One hit test per frame: the
+  container screen's existing one; the creative screen's built a 54-entry list at each call,
+  replaced by an iterator (same slot at every point, test `hit_test_without_a_list_finds_the_same_slot`).
+  Micro-bench `creative_screen::tests::bench_creative_hit_test` (3 alternated passes, 200 000
+  calls): with the list 61.2-62.1 ns per hit test, without 22.7-22.8 ns. Kept (no allocation per frame).
+- Trail particle: sent with the particle type looked up by name like every other particle send
+  (eyeblossom turns and creaking heart calls: rare, at most two per tick per calling heart); client
+  tick shared with the vibration signal (`home_in`), same cost per particle. Not a hot spot.
+- Checkbox label lines computed at layout (screen size change), never per frame. CSV column order
+  computed once per archive. System locale read once (cached). Merchant result check: one offer
+  lookup per click on the result slot.
+- Multi-core and GPU not applicable (per-event or per-frame UI work of a few hundred
+  nanoseconds at most). Scenes to re-measure on a quiet machine: `menu` and an in-game scene with
+  the creative inventory open (no change expected beyond the removed allocation).

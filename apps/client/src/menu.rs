@@ -261,7 +261,15 @@ impl Menu<'_> {
     }
 
     fn may_pickup(&self, i: usize) -> bool {
-        !matches!(self.kind, Kind::Special(s) if crate::menu_special::locked(s, i))
+        use crate::menu_special::Sp;
+        match self.kind {
+            Kind::Special(s) if crate::menu_special::locked(s, i) => false,
+            // Merchant result: only while the payment slots pay the active offer.
+            Kind::Special(Sp::Merchant) if i == 2 => {
+                self.trade.as_deref().is_none_or(|t| crate::screens_trade::payable(t, self.slots, self.rules))
+            }
+            _ => true,
+        }
     }
 
     /// Max size of the slot for this stack.
@@ -286,6 +294,13 @@ impl Menu<'_> {
         (p.count > t).then(|| with_count(&p, p.count - t))
     }
 
+    /// Result slot whose container hands over its whole stack whatever the amount asked: crafting
+    /// grids, merchant and the stations built on a result container (not the loom, nor the
+    /// furnace, whose containers give the amount asked).
+    fn takes_whole(&self, i: usize) -> bool {
+        self.def(i).craft_result || matches!(self.kind, Kind::Special(s) if crate::menu_special::takes_whole(s, i))
+    }
+
     /// Removal of `a` items, cap `m` (§ 2.1).
     fn try_remove(&mut self, i: usize, a: i32, m: i32) -> Option<ItemStack> {
         if !self.may_pickup(i) {
@@ -296,7 +311,7 @@ impl Menu<'_> {
         if !modifiable && m < c.count {
             return None;
         }
-        let t = a.min(m).min(c.count);
+        let t = if self.takes_whole(i) { c.count } else { a.min(m).min(c.count) };
         if t <= 0 {
             return None;
         }
@@ -842,6 +857,44 @@ mod tests {
         run(Kind::Player, &mut slots, &mut carried, 0, 0, 0);
         assert_eq!(carried.as_ref().unwrap().count, 4);
         assert_eq!((slots[1].as_ref().unwrap().count, slots[2].clone()), (1, None));
+    }
+
+    /// A result container hands over its whole stack: Q (one item asked) throws the 4 planks of
+    /// the 2×2 grid, a right click takes them all, the grid is consumed once each time.
+    #[test]
+    fn result_slot_gives_its_whole_stack() {
+        let mut slots = vec![None; 46];
+        slots[0] = st(5, 4);
+        slots[1] = st(1, 2);
+        let mut carried = None;
+        run(Kind::Player, &mut slots, &mut carried, 0, 0, 4);
+        assert_eq!((slots[0].clone(), slots[1].as_ref().map(|s| s.count)), (None, Some(1)), "Q: whole result thrown");
+        slots[0] = st(5, 4);
+        run(Kind::Player, &mut slots, &mut carried, 0, 1, 0);
+        assert_eq!((carried.as_ref().map(|s| s.count), slots[0].clone()), (Some(4), None), "right click: all taken");
+        assert_eq!(slots[1], None, "grid consumed");
+    }
+
+    /// Same rule on the stations' result slots, but not on the loom's (its output container gives
+    /// the amount asked) nor on the furnace's.
+    #[test]
+    fn station_results_give_their_whole_stack_except_the_loom() {
+        use crate::menu_special::Sp;
+        let q = |kind: Kind, n: usize, slot: usize| {
+            let mut slots = vec![None; n];
+            slots[slot] = st(5, 2);
+            let mut carried = None;
+            run(kind, &mut slots, &mut carried, slot as i16, 0, 4);
+            slots[slot].as_ref().map_or(0, |s| s.count)
+        };
+        assert_eq!(q(Kind::Special(Sp::Stonecutter), 38, 1), 0, "stonecutter");
+        assert_eq!(q(Kind::Special(Sp::Grindstone), 39, 2), 0, "grindstone");
+        assert_eq!(q(Kind::Special(Sp::Cartography), 39, 2), 0, "cartography");
+        assert_eq!(q(Kind::Special(Sp::Anvil), 39, 2), 0, "anvil");
+        assert_eq!(q(Kind::Special(Sp::Smithing), 40, 3), 0, "smithing");
+        assert_eq!(q(Kind::Crafting, 46, 0), 0, "crafting table");
+        assert_eq!(q(Kind::Special(Sp::Loom), 40, 3), 1, "loom: one item");
+        assert_eq!(q(Kind::Furnace(0), 39, 2), 1, "furnace: one item");
     }
 
     #[test]

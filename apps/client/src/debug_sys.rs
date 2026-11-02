@@ -98,7 +98,6 @@ mod win {
         pub fn GetSystemTimePreciseAsFileTime(t: *mut u64);
         pub fn GetCurrentThread() -> isize;
         pub fn SetThreadPriority(thread: isize, priority: i32) -> i32;
-        pub fn GetLocaleInfoEx(name: *const u16, lctype: u32, data: *mut u16, len: i32) -> i32;
     }
 
     /// Times of a logical processor since boot (100 ns): idle, kernel (idle included), user, then
@@ -126,20 +125,10 @@ mod win {
     }
 }
 
-/// Country of the user's regional language, three-letter ISO 3166 code (`FRA`, `KOR`);
-/// `None` outside Windows or if the system does not provide it.
+/// Country of the user's locale as the game reads it, three-letter ISO 3166 code (`FRA`, `KOR`);
+/// `None` without one (`syslocale.rs`: Windows, macOS and the POSIX variables alike).
 pub fn country_iso3() -> Option<String> {
-    #[cfg(windows)]
-    {
-        // Three-letter country code of a regional language.
-        const LOCALE_SISO3166CTRYNAME2: u32 = 0x68;
-        let mut buf = [0u16; 16];
-        // SAFETY: null name = user's regional language; 16-character buffer.
-        let n = unsafe { win::GetLocaleInfoEx(std::ptr::null(), LOCALE_SISO3166CTRYNAME2, buf.as_mut_ptr(), 16) };
-        (n > 1).then(|| String::from_utf16_lossy(&buf[..n as usize - 1]))
-    }
-    #[cfg(not(windows))]
-    None
+    crate::syslocale::country_iso3().map(str::to_owned)
 }
 
 /// Priority of the calling thread: one step below normal (compute pool threads: the render thread and

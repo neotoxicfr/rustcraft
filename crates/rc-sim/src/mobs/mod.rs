@@ -347,6 +347,7 @@ impl Server {
             return None;
         }
         self.init_mob(&mut m);
+        self.load_portal_cooldown(m.id, &e);
         // Illager placed by structure generation: finalised only once (the marker is never
         // rewritten).
         if e.get("rc_finalize_structure").is_some() {

@@ -421,6 +421,12 @@ switch_f!(
     statetrans_fast,
     "STATETRANS_FAST"
 );
+switch_f!(
+    /// Height maps of a generated chunk: every map from a single walk down each column, started
+    /// at the top of the highest slice of 16 that is not all plain air (L9-STRUCT).
+    prime_one_walk,
+    "PRIME_ONE_WALK"
+);
 
 /// Vectorised kernel compiled for AVX2, if the processor has it (detection done once).
 #[inline]

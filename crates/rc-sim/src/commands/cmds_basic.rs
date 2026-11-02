@@ -1428,7 +1428,7 @@ impl Server {
         }
     }
 
-    fn set_clock(&mut self, clock: &str, v: i64) {
+    pub(crate) fn set_clock(&mut self, clock: &str, v: i64) {
         if let Some(c) = self.clocks.iter_mut().find(|c| c.0 == clock) {
             c.1 = v;
         } else {
@@ -1520,7 +1520,7 @@ fn decode_particle(
     item_index: &dyn Fn(&str) -> Option<i32>,
 ) -> Result<rc_proto_v777::entity::Particle, String> {
     let mut part =
-        rc_proto_v777::entity::Particle { kind, color: 0, state: 0, item: -1, scale: 1.0, color2: 0, vib: None };
+        rc_proto_v777::entity::Particle { kind, color: 0, state: 0, item: -1, scale: 1.0, color2: 0, vib: None, trail: None };
     let invalid = |m: String| m;
     let field =
         |k: &str| o.get(k).ok_or_else(|| invalid(format!("No key {k} in MapLike[{}]", super::snbt::to_snbt(o))));

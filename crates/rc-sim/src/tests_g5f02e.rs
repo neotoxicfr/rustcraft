@@ -232,6 +232,40 @@ fn cauldrons_extinguish_and_burn() {
     assert!(w.p.s.life.vit.health <= 16.0, "player hurt: {}", w.p.s.life.vit.health);
 }
 
+/// L9-TICK: cauldrons share the crossed-block pass's deferred effects, in the order of its
+/// steps: the player leaving a water cauldron for lava in one tick is extinguished (first step)
+/// then set on fire (later step), and the cauldron keeps its level (not burning when it was
+/// entered). Before: cauldrons came in a second group after the whole pass, so the player ended
+/// extinguished and the cauldron lowered.
+#[test]
+fn cauldron_and_lava_in_one_tick_follow_the_pass_order() {
+    let mut w = world("cauldron-order");
+    w.p.run(&format!("setblock 2 {Y} 2 minecraft:water_cauldron[level=3]\nsetblock 3 {Y} 2 minecraft:lava\n"));
+    let floor = |x: f64| [x, f64::from(Y) + 0.25, 2.5];
+    w.player_tick_at(floor(2.5), [0.0; 3]);
+    assert!(w.p.s.life.vit.fire <= 0);
+    w.player_tick_at(floor(3.5), [1.0, 0.0, 0.0]);
+    assert!(w.p.s.life.vit.fire >= 299, "set on fire by the lava after the cauldron: {}", w.p.s.life.vit.fire);
+    assert_eq!(w.block([2, Y, 2]), "minecraft:water_cauldron[level=3]", "not burning when it entered the cauldron");
+}
+
+/// L9-TICK: the direct contacts (berry bush) come before the deferred effects (lava ignition
+/// and damage), as in the game where they play while it walks the cells: a pig at 1 health
+/// running from a berry bush into lava dies of the bush, not set on fire. Before: lava first
+/// (burning, killed by the lava: cooked drops).
+#[test]
+fn direct_contacts_before_the_deferred_effects() {
+    let mut w = world("contact-order");
+    w.p.run(&format!("setblock 2 {Y} 6 minecraft:sweet_berry_bush[age=1]\nsetblock 3 {Y} 6 minecraft:lava\n"));
+    let mut pig = w.mob(Kind::Pig, at(2, 6), true);
+    pig.health = 1.0;
+    pig.vel = [1.0, 0.0, 0.0];
+    w.p.s.tick_mob(&mut pig);
+    assert!(pig.pos[0] > 3.0, "pig in the lava cell: {:?}", pig.pos);
+    assert!(pig.health <= 0.0, "killed by the bush");
+    assert!(pig.fire <= 0, "set on fire after its death: {}", pig.fire);
+}
+
 /// Plates and tripwire: a mob and a ground item press the plate; a mob tightens the
 /// tripwire, a bat does not.
 #[test]

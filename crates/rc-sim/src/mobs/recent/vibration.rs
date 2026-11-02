@@ -656,6 +656,7 @@ impl Server {
                 scale: 1.0,
                 color2: 0,
                 vib: Some((target, ticks)),
+                trail: None,
             },
             force: false,
             always_visible: false,

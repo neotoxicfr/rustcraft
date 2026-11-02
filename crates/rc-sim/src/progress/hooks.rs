@@ -164,22 +164,9 @@ impl Server {
         self.trig_enchanted_item(s, cost);
     }
 
-    /// Player hit on a mob: damage dealt (tenths), weapon used, trigger.
-    pub(crate) fn s9_player_hit_mob(&mut self, m: &Mob, ty: &str, original: f32, dealt: f32, weapon: Option<&Stack>) {
-        self.s9_player_hit(Some(Who::Mob(m)), ty, original, dealt, weapon);
-    }
-
-    /// Current player's hit of type `ty` (the weapon's: `player_attack`, `mace_smash`, `spear`…)
-    /// on a living entity (`None`: another LAN player, whom the entity predicates do not
-    /// describe yet).
-    pub(crate) fn s9_player_hit(
-        &mut self,
-        victim: Option<Who<'_>>,
-        ty: &str,
-        original: f32,
-        dealt: f32,
-        weapon: Option<&Stack>,
-    ) {
+    /// Current player's landed melee hit on its main target: damage dealt (health lost, in
+    /// tenths) and weapon used. `player_hurt_entity` comes from the victim's hurt itself.
+    pub(crate) fn s9_player_hit(&mut self, dealt: f32, weapon: Option<&Stack>) {
         if dealt > 0.0 {
             self.award_custom("damage_dealt", (dealt * 10.0).round() as i32);
         }
@@ -188,9 +175,15 @@ impl Server {
         {
             self.award_stat("minecraft:used", &w.id, 1);
         }
+    }
+
+    /// `player_hurt_entity` for a hit of type `ty` from the current player on another LAN player
+    /// (whom the entity predicates do not describe yet): damage received, after the shield,
+    /// parried, as the victim's hurt reported them.
+    pub(crate) fn s9_player_hurt_player(&mut self, ty: &str, original: f32, taken: f32, blocked: bool) {
         let dmg =
             Dmg { ty: ty.into(), source: Some(Who::E(E::Player)), direct: Some(Who::E(E::Player)), pos: Some(self.pos) };
-        self.trig_player_hurt_entity(victim, &dmg, original, dealt, false);
+        self.trig_player_hurt_entity(None, &dmg, original, taken, blocked);
     }
 
     /// The current player killed another player (`victim`: their score name): statistic,
@@ -249,8 +242,10 @@ impl Server {
         self.trig_killed(Some(Who::Mob(m)), &dmg);
     }
 
-    /// Damage received by the player: statistics in tenths, `entity_hurt_player`.
-    pub(crate) fn s9_player_hurt(&mut self, ty: &str, original: f32, taken: f32, absorbed: f32, parried: f32) {
+    /// Damage received by the player: statistics in tenths (`taken`: the health lost), then
+    /// `entity_hurt_player` with the damage received and the damage after the shield, before
+    /// armor (`hit`), like the game.
+    pub(crate) fn s9_player_hurt(&mut self, ty: &str, hit: (f32, f32), taken: f32, absorbed: f32, parried: f32) {
         // W8c: `damage_blocked_by_shield` (tenths of a point).
         if parried > 0.0 && parried < 3.402_823_5e37 {
             self.award_custom("damage_blocked_by_shield", (parried * 10.0).round() as i32);
@@ -264,7 +259,7 @@ impl Server {
         let attacker = self.prog.attacker.take();
         let src = attacker.as_deref().map(Who::Mob);
         let dmg = Dmg { ty: ty.to_owned(), source: src, direct: src, pos: attacker.as_ref().map(|m| m.pos) };
-        self.trig_entity_hurt_player(&dmg, original, taken, parried > 0.0);
+        self.trig_entity_hurt_player(&dmg, hit.0, hit.1, parried > 0.0);
         self.prog.attacker = attacker;
     }
 

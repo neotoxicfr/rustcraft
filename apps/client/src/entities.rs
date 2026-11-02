@@ -202,6 +202,11 @@ fn wrap(a: f32) -> f32 {
     a
 }
 
+/// "Physical" opening of a shulker for an opening `peek` in 0..1: 0.5 − sin((0.5 + peek)·π)·0.5.
+pub fn shulker_physical(peek: f32) -> f32 {
+    0.5 - rc_physics::sin_t((0.5 + peek) * std::f32::consts::PI) * 0.5
+}
+
 /// Shortest-way angular interpolation.
 pub fn rot_lerp(t: f32, a: f32, b: f32) -> f32 {
     a + t * wrap(b - a)
@@ -381,9 +386,11 @@ pub struct Entity {
     /// Swing: (hand, kind, duration, ticks) and animation (old, current).
     pub swing: Option<(i32, i32, i32, i32)>,
     pub swing_anim: (f32, f32),
-    /// Body rotation controller of mobs: stable head, counter.
+    /// Body rotation controller of mobs: stable head, counter, and "first passenger is a mob"
+    /// (refreshed before each tick: the body then keeps its rotation while standing still).
     stable_head: f32,
     head_still: i32,
+    carries_mob: bool,
     /// Sheep grazing (remaining ticks).
     pub graze: i32,
     /// Chicken flapping: (previous flap, flap, previous flap speed, flap speed, flap factor).
@@ -671,27 +678,49 @@ impl Entity {
     /// Shulker box: scaled cube pushed towards the face opposite the attachment, of the
     /// "physical" opening.
     pub fn shulker_box(&self) -> rc_physics::Aabb {
-        let p = self.pos;
-        let s = f64::from(self.attribute_scale());
-        let phys = f64::from(0.5 - rc_physics::sin_t((0.5 + self.peek) * std::f32::consts::PI) * 0.5);
+        self.shulker_zone(-1.0, shulker_physical(self.peek))
+    }
+
+    /// Opening direction of a shulker (opposite of its attachment face), as a unit step.
+    pub fn shulker_step(&self) -> [f64; 3] {
         let face = match self.meta.get(&16) {
             Some(Meta::Direction(v)) => *v,
             _ => 0,
         };
         // Opposite of the attachment: down → up, up → down, north → south, south → north…
-        let step: [f64; 3] = match face {
+        match face {
             0 => [0.0, 1.0, 0.0],
             1 => [0.0, -1.0, 0.0],
             2 => [0.0, 0.0, 1.0],
             3 => [0.0, 0.0, -1.0],
             4 => [1.0, 0.0, 0.0],
             _ => [-1.0, 0.0, 0.0],
-        };
-        let b = rc_physics::Aabb {
+        }
+    }
+
+    /// Part of the shulker's scaled cube between the physical openings `from` and `to`, toward
+    /// its opening direction (`from` = −1: the whole box at opening `to`; otherwise the slice
+    /// that an opening sweeps).
+    pub fn shulker_zone(&self, from: f32, to: f32) -> rc_physics::Aabb {
+        let p = self.pos;
+        let s = f64::from(self.attribute_scale());
+        let step = self.shulker_step();
+        let (hi, lo) = (f64::from(from.max(to)), f64::from(from.min(to)));
+        let mut b = rc_physics::Aabb {
             min: [p[0] - s * 0.5, p[1], p[2] - s * 0.5],
             max: [p[0] + s * 0.5, p[1] + s, p[2] + s * 0.5],
-        };
-        b.expand_towards(step.map(|d| d * phys * s))
+        }
+        .expand_towards(step.map(|d| d * hi * s));
+        // Then shrunk from the attachment side by (1 + lo) sizes.
+        for (k, d) in step.into_iter().enumerate() {
+            let c = -d * (1.0 + lo) * s;
+            if c < 0.0 {
+                b.min[k] -= c;
+            } else if c > 0.0 {
+                b.max[k] -= c;
+            }
+        }
+        b
     }
 
     /// Interpolated view rotation (yaw, pitch): head of living entities, entity rotation
@@ -928,6 +957,8 @@ impl Entity {
                     self.head = clamp_to(self.head, self.body, 75.0);
                     self.stable_head = self.head;
                     self.head_still = 0;
+                } else if self.carries_mob {
+                    // Standing still with a mob as first passenger: the body keeps its rotation.
                 } else if (self.head - self.stable_head).abs() > 15.0 {
                     self.head_still = 0;
                     self.stable_head = self.head;
@@ -1087,11 +1118,20 @@ pub struct Entities {
     /// Local sounds born from a metadata update (enderman stare), played by the caller right
     /// after `apply`.
     pub pending_sounds: Vec<crate::entity_fx::FxSound>,
+    /// Vehicles that received passengers: the mob-rider pass of a tick walks only them.
+    pub riders: Vec<i32>,
+}
+
+/// `RUSTCRAFT_OPT_RIDERLIST=0`: the mob-rider pass walks every entity instead of the vehicles.
+pub(crate) fn rider_list_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    opt_on(&ON, rc_data::env_str!("RUSTCRAFT_OPT_RIDERLIST"))
 }
 
 impl Entities {
     pub fn clear(&mut self) {
         self.map.clear();
+        self.riders.clear();
     }
 
     /// Position of a sound attached to entity `id`, or nothing when it must be cut (entity
@@ -1155,14 +1195,39 @@ impl Entities {
     }
 
     pub fn tick(&mut self) {
+        self.mark_mob_riders();
         for e in self.map.values_mut() {
             e.tick();
         }
         crate::entity_render::wither_track(self);
     }
 
+    /// Entities whose first passenger is a mob (the body rotation of a standing mob depends on it).
+    fn mark_mob_riders(&mut self) {
+        self.mark_mob_riders_with(rider_list_on());
+    }
+
+    fn mark_mob_riders_with(&mut self, list: bool) {
+        let carries = |e: &Entity| e.passengers.first().and_then(|p| self.map.get(p)).is_some_and(|p| p.class == Kind::Mob);
+        let carried: Vec<(i32, bool)> = if list {
+            // Vehicles only; those gone or without passengers leave the list once reset.
+            self.riders.iter().filter_map(|id| self.map.get(id).map(|e| (*id, carries(e)))).collect()
+        } else {
+            let walk = self.map.iter().filter(|(_, e)| e.carries_mob || !e.passengers.is_empty());
+            walk.map(|(&id, e)| (id, carries(e))).collect()
+        };
+        for &(id, v) in &carried {
+            if let Some(e) = self.map.get_mut(&id) {
+                e.carries_mob = v;
+            }
+        }
+        let map = &self.map;
+        self.riders.retain(|id| map.get(id).is_some_and(|e| !e.passengers.is_empty()));
+    }
+
     /// Tick of these entities only (world frozen, `ticking.rs`).
     pub fn tick_some(&mut self, ids: &[i32]) {
+        self.mark_mob_riders();
         for id in ids {
             if let Some(e) = self.map.get_mut(id) {
                 e.tick();
@@ -1304,6 +1369,7 @@ impl Entities {
                         swing_anim: (0.0, 0.0),
                         stable_head: a.head_yaw,
                         head_still: 0,
+                        carries_mob: false,
                         graze: 0,
                         flap: [0.0; 5],
                         swell: (0, 0),
@@ -1521,6 +1587,9 @@ impl Entities {
             }
             EntityEvent::Passengers { vehicle, passengers } => {
                 // Former passengers detached, new ones attached to the mount.
+                if !passengers.is_empty() && !self.riders.contains(&vehicle) {
+                    self.riders.push(vehicle);
+                }
                 let old = self.map.get_mut(&vehicle).map(|v| std::mem::replace(&mut v.passengers, passengers.clone()));
                 for id in old.into_iter().flatten() {
                     if let Some(p) = self.map.get_mut(&id)
@@ -1813,6 +1882,93 @@ mod size_tests {
         e.meta.insert(15, Meta::Byte(0x01));
         let s = e.size(&[[0.5, 1.975, 1.7775, 1.975]]);
         assert_eq!((s.w, s.eye), (0.25, 0.9875));
+    }
+
+    /// A standing mob whose first passenger is a mob keeps its body rotation when its head
+    /// turns; alone, its body follows the head. Before: both followed.
+    #[test]
+    fn standing_mob_carrying_a_mob_keeps_its_body() {
+        let mut all = Entities {
+            type_names: vec!["minecraft:spider".into(), "minecraft:skeleton".into()],
+            ..Default::default()
+        };
+        for (id, kind) in [(1, 0), (2, 1), (3, 0)] {
+            let add = rc_proto_v777::entity::AddEntity {
+                id,
+                uuid: id as u128,
+                kind,
+                pos: [f64::from(id) * 4.0, 64.0, 0.0],
+                velocity: [0.0; 3],
+                pitch: 0.0,
+                yaw: 0.0,
+                head_yaw: 0.0,
+                data: 0,
+            };
+            all.apply(EntityEvent::Add(Box::new(add)));
+        }
+        all.apply(EntityEvent::Passengers { vehicle: 1, passengers: vec![2] });
+        for id in [1, 3] {
+            let e = all.map.get_mut(&id).expect("spider");
+            (e.head, e.body, e.stable_head) = (100.0, 0.0, 0.0);
+        }
+        all.tick();
+        assert_eq!(all.map[&1].body, 0.0, "the jockey turned its body");
+        assert!(all.map[&3].body != 0.0, "the lone spider kept its body");
+        // The vehicle list and the walk of every entity mark the same riders; a dismount resets.
+        let flags = |a: &Entities| {
+            let mut v: Vec<(i32, bool)> = a.map.iter().map(|(i, e)| (*i, e.carries_mob)).collect();
+            v.sort_unstable();
+            v
+        };
+        let listed = flags(&all);
+        all.mark_mob_riders_with(false);
+        assert_eq!(flags(&all), listed);
+        all.apply(EntityEvent::Passengers { vehicle: 1, passengers: vec![] });
+        all.tick();
+        assert!(!all.map[&1].carries_mob && all.riders.is_empty(), "dismounted spider still marked");
+    }
+
+    /// Micro-bench (ignored, `--ignored --nocapture`): the mob-rider pass of a tick against the
+    /// whole tick, 3,000 zombies, 10 with a zombie passenger.
+    #[test]
+    #[ignore]
+    fn bench_mark_mob_riders() {
+        let mut all = Entities { type_names: vec!["minecraft:zombie".into()], ..Default::default() };
+        for id in 0..3000 {
+            let pos = [f64::from(id % 60), 64.0, f64::from(id / 60)];
+            let add = rc_proto_v777::entity::AddEntity {
+                id,
+                uuid: id as u128,
+                kind: 0,
+                pos,
+                velocity: [0.0; 3],
+                pitch: 0.0,
+                yaw: 0.0,
+                head_yaw: 0.0,
+                data: 0,
+            };
+            all.apply(EntityEvent::Add(Box::new(add)));
+        }
+        for v in 0..10 {
+            all.apply(EntityEvent::Passengers { vehicle: v * 2, passengers: vec![v * 2 + 1] });
+        }
+        for _ in 0..2 {
+            let mut us = [0.0; 2];
+            for (k, list) in [false, true].into_iter().enumerate() {
+                let t0 = std::time::Instant::now();
+                for _ in 0..1000 {
+                    all.mark_mob_riders_with(list);
+                }
+                us[k] = t0.elapsed().as_secs_f64() * 1.0e3;
+            }
+            let t0 = std::time::Instant::now();
+            for _ in 0..100 {
+                all.tick();
+            }
+            let tick = t0.elapsed().as_secs_f64() * 1.0e4;
+            eprintln!("mob riders: walk {:.2} us, vehicle list {:.3} us per tick; whole tick {tick:.1} us (3,000 entities)", us[0], us[1]);
+        }
+        assert!(all.map[&0].carries_mob && !all.map[&2999].carries_mob && all.riders.len() == 10);
     }
 
     #[test]

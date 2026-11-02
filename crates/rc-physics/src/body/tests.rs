@@ -403,7 +403,7 @@ fn horizontal_piston_push_ungrounds_server_body_only() {
         let mut b = item([0.5, 0.0, 0.5], [0.0; 3]);
         b.server = server;
         b.on_ground = true;
-        b.piston_move([0.3, 0.0, 0.0], 7, &w, &t, 0.04);
+        b.piston_move([0.3, 0.0, 0.0], 7, &w, &t, Heft::ITEM);
         close(b.pos[0], 0.8);
         assert_eq!(b.on_ground, grounded, "server {server}");
     }
@@ -416,10 +416,10 @@ fn capped_piston_push_still_applies_block_effects() {
     let t = tables();
     let w = Flat { t: &t, floor: STONE, extra: vec![([0, 0, 0], WEB), ([1, 0, 0], WEB)] };
     let mut b = item([0.5, 0.0, 0.5], [0.0; 3]);
-    b.piston_move([0.51, 0.0, 0.0], 3, &w, &t, 0.04);
+    b.piston_move([0.51, 0.0, 0.0], 3, &w, &t, Heft::ITEM);
     close(b.pos[0], 1.01);
     b.stuck = [0.0; 3];
-    b.piston_move([0.3, 0.0, 0.0], 3, &w, &t, 0.04);
+    b.piston_move([0.3, 0.0, 0.0], 3, &w, &t, Heft::ITEM);
     close(b.pos[0], 1.01);
     assert_eq!(b.stuck, [0.25, f(0.05), 0.25]);
     // Player: same rule.
@@ -429,4 +429,45 @@ fn capped_piston_push_still_applies_block_effects() {
     p.piston_move([0.3, 0.0, 0.0], 3, &w, &t);
     close(p.pos[0], 1.01);
     assert!(p.stuck != [0.0; 3], "{:?}", p.stuck);
+}
+
+/// A body moved by a piston reads the slowing block of its kind: half a block down for primed
+/// TNT and falling blocks, almost one block down for items. Before: always one block down.
+#[test]
+fn piston_push_reads_the_slowing_block_of_the_kind() {
+    let t = tables();
+    let w = Flat { t: &t, floor: SOUL, extra: vec![] };
+    for (k, want) in [(Heft::BLOCK, 1.0), (Heft::ITEM, f(0.4))] {
+        let mut b = Body::new([0.5, 0.6, 0.5], [1.0, 0.0, 0.0], 0.98, 0.98, 0.15);
+        b.no_gravity = true;
+        b.piston_move([0.3, 0.0, 0.0], 1, &w, &t, k);
+        close(b.vel[0], want);
+    }
+}
+
+/// Push by an opening shulker: an ordinary movement, stopped by the ceiling, multiplied by the
+/// slowdown of the tick (a piston push is not); a spectator stays in place.
+#[test]
+fn shove_collides_and_takes_the_slowdown() {
+    let t = tables();
+    let w = Flat { t: &t, floor: STONE, extra: vec![([0, 1, 0], STONE)] };
+    let mut b = item([0.5, 0.0, 0.5], [0.0; 3]);
+    b.shove([0.0, 1.0, 0.0], &w, &t, Heft::ITEM);
+    close(b.pos[1], 0.75);
+    let mut b = item([0.5, 0.0, 0.5], [0.0; 3]);
+    b.stuck = [0.25, f(0.05), 0.25];
+    b.shove([0.3, 0.0, 0.0], &w, &t, Heft::ITEM);
+    close(b.pos[0], 0.5 + 0.075);
+    let mut p = crate::Player::new([0.5, 0.0, 0.5], 0.0, 0.0);
+    p.stuck = [0.25, f(0.05), 0.25];
+    p.shove([0.3, 0.0, 0.0], &w, &t);
+    close(p.pos[0], 0.5 + 0.075);
+    let mut p = crate::Player::new([0.5, 0.0, 0.5], 0.0, 0.0);
+    p.stuck = [0.25, f(0.05), 0.25];
+    p.piston_move([0.3, 0.0, 0.0], 3, &w, &t);
+    close(p.pos[0], 0.8);
+    let mut p = crate::Player::new([0.5, 0.0, 0.5], 0.0, 0.0);
+    p.spectator = true;
+    p.shove([0.3, 0.0, 0.0], &w, &t);
+    close(p.pos[0], 0.5);
 }

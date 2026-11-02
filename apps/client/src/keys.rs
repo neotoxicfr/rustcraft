@@ -16,6 +16,27 @@ use crate::options::{KEYS, Options};
 /// Tags of a registry: (registry, [(tag, ids)]).
 type RegistryTags = (String, Vec<(String, Vec<i32>)>);
 
+thread_local! {
+    /// Wheel options of the current event: discrete mode, sensitivity (§ 3.6).
+    static WHEEL: std::cell::Cell<(bool, f64)> = const { std::cell::Cell::new((false, 1.0)) };
+}
+
+/// Wheel offsets of an event in notches (x, y), as the game hands them to every screen and to the
+/// game: raw notches (a pixel delta counts 20 pixels per notch), then in discrete mode the sign of
+/// each axis (an idle axis stays at zero), then the sensitivity.
+pub(crate) fn wheel_offsets(delta: &MouseScrollDelta) -> (f64, f64) {
+    let (x, y) = match *delta {
+        MouseScrollDelta::LineDelta(x, y) => (f64::from(x), f64::from(y)),
+        MouseScrollDelta::PixelDelta(p) => (p.x / 20.0, p.y / 20.0),
+    };
+    let (discrete, k) = WHEEL.with(std::cell::Cell::get);
+    scale_wheel(x, y, discrete, k)
+}
+
+fn scale_wheel(x: f64, y: f64, discrete: bool, k: f64) -> (f64, f64) {
+    if discrete { (rc_physics::signum(x) * k, rc_physics::signum(y) * k) } else { (x * k, y * k) }
+}
+
 /// Physical key or mouse button (0 left, 1 right, 2 middle, 3+ side).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Input {
@@ -335,7 +356,12 @@ impl App {
                     return self.global_input(Input::Mouse(b));
                 }
             }
-            WindowEvent::MouseWheel { .. } | WindowEvent::CursorMoved { .. } => {
+            WindowEvent::MouseWheel { .. } => {
+                self.video.limiter.input();
+                // Read at each wheel event, before any screen or the game receives its offsets.
+                WHEEL.with(|c| c.set((self.options.b("discrete_mouse_scroll"), self.options.f("mouseWheelSensitivity"))));
+            }
+            WindowEvent::CursorMoved { .. } => {
                 self.video.limiter.input();
             }
             WindowEvent::Focused(f) => {
@@ -513,16 +539,9 @@ impl App {
         (digit, drop, close)
     }
 
-    /// Wheel in game (§ 3.6): discrete mode, sensitivity, accumulation; hotbar or flight speed.
+    /// Wheel in game (§ 3.6): scaled offsets, accumulation; hotbar or flight speed.
     pub(crate) fn game_scroll(&mut self, delta: MouseScrollDelta) {
-        let (x, y) = match delta {
-            MouseScrollDelta::LineDelta(x, y) => (f64::from(x), f64::from(y)),
-            MouseScrollDelta::PixelDelta(p) => (p.x / 20.0, p.y / 20.0),
-        };
-        let k = self.options.f("mouseWheelSensitivity");
-        let discrete = self.options.b("discrete_mouse_scroll");
-        // Discrete: the sign of each axis, an idle axis staying at zero.
-        let (x, y) = if discrete { (rc_physics::signum(x) * k, rc_physics::signum(y) * k) } else { (x * k, y * k) };
+        let (x, y) = wheel_offsets(&delta);
         let (wx, wy) = self.hud.wheel(x, y);
         if wx == 0 && wy == 0 {
             return;
@@ -609,6 +628,46 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wheel offsets as every screen receives them: raw notches (20 pixels per notch), discrete
+    /// mode (sign, idle axis at zero, sign of −0 kept), then sensitivity.
+    #[test]
+    fn wheel_offsets_apply_discrete_mode_and_sensitivity() {
+        let set = |discrete, k| WHEEL.with(|c| c.set((discrete, k)));
+        set(false, 1.0);
+        assert_eq!(wheel_offsets(&MouseScrollDelta::LineDelta(0.0, 2.0)), (0.0, 2.0));
+        let px = MouseScrollDelta::PixelDelta(winit::dpi::PhysicalPosition::new(10.0, -30.0));
+        assert_eq!(wheel_offsets(&px), (0.5, -1.5));
+        set(false, 0.5);
+        assert_eq!(wheel_offsets(&MouseScrollDelta::LineDelta(0.0, 3.0)), (0.0, 1.5));
+        set(true, 2.0);
+        assert_eq!(wheel_offsets(&px), (2.0, -2.0));
+        let (x, y) = wheel_offsets(&MouseScrollDelta::LineDelta(-0.0, 0.25));
+        assert_eq!((x.to_bits(), y), ((-0.0f64).to_bits(), 2.0), "idle axis stays a signed zero");
+        set(false, 1.0);
+    }
+
+    /// Root cause of the wheel gap: no screen converts a wheel delta itself, they all go through
+    /// `wheel_offsets` (otherwise discrete mode and sensitivity are skipped there).
+    #[test]
+    fn wheel_deltas_converted_in_one_place() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+            for e in std::fs::read_dir(dir).expect("source folder").flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs")
+                    && p.file_name().is_some_and(|n| n != "keys.rs")
+                    && std::fs::read_to_string(&p).is_ok_and(|t| t.contains("LineDelta") || t.contains("PixelDelta"))
+                {
+                    out.push(p.display().to_string());
+                }
+            }
+        }
+        let mut found = Vec::new();
+        walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut found);
+        assert!(found.is_empty(), "local wheel conversions: {found:?}");
+    }
 
     #[test]
     fn indices_match_option_table() {

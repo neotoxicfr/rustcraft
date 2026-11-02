@@ -285,11 +285,7 @@ impl crate::App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let y = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => f64::from(*y),
-                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y / 20.0,
-                };
-                s.panel.wheel(m, y, &mut ev);
+                s.panel.wheel(m, crate::keys::wheel_offsets(delta).1, &mut ev);
             }
             WindowEvent::CursorMoved { .. } => s.panel.motion(m, &mut ev),
             _ => {}

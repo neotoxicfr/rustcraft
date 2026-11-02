@@ -199,18 +199,9 @@ fn has_line_of_sight(s: &Server, m: &Mob, to: [f64; 3]) -> bool {
     d <= max && !s.clip_blocks(m.pos, to)
 }
 
-/// The dangerous-block test for an entity type (breeze not immune to fire).
+/// The dangerous-block test of the breeze's type (not fire immune: the lava cauldron counts).
 fn dangerous(s: &Server, p: [i32; 3]) -> bool {
-    let n = s.bname(p);
-    s.btag_id(p, crate::tag_bits::TagId::Fire)
-        || n == "minecraft:lava"
-        || n == "minecraft:magma_block"
-        || ((n == "minecraft:campfire" || n == "minecraft:soul_campfire")
-            && s.prop(p, "lit").as_deref() == Some("true"))
-        || matches!(
-            n,
-            "minecraft:wither_rose" | "minecraft:sweet_berry_bush" | "minecraft:cactus" | "minecraft:powder_snow"
-        )
+    s.block_dangerous(p, super::super::species::Kind::Breeze)
 }
 
 /// The long-jump start condition (with its effects: out-of-range target forgotten, jump target set).

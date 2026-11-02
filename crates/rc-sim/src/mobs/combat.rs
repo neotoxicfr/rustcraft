@@ -181,6 +181,7 @@ impl Server {
                 scale: 1.0,
                 color2: 0,
                 vib: None,
+                trail: None,
             },
             force: false,
             always_visible: false,
@@ -212,7 +213,7 @@ impl Server {
             return;
         };
         let p = LevelParticles {
-            particle: Particle { kind: kind as i32, color, state: 0, item: -1, scale: 1.0, color2: 0, vib: None },
+            particle: Particle { kind: kind as i32, color, state: 0, item: -1, scale: 1.0, color2: 0, vib: None, trail: None },
             force: false,
             always_visible: false,
             pos,
@@ -220,6 +221,32 @@ impl Server {
             speed,
             count,
             mode,
+        };
+        let _ = self.send(Event::Particles(p));
+    }
+
+    /// One `trail` particle from `pos` towards `target`, reached in `duration` ticks, RGB `color`;
+    /// `forced`: beyond the usual distance and always shown (creaking heart).
+    pub(crate) fn trail_particle(&self, pos: [f64; 3], target: [f64; 3], color: u32, duration: i32, forced: bool) {
+        let Some(kind) = self
+            .data
+            .registry("minecraft:particle_type")
+            .and_then(|r| r.entries.iter().position(|e| e == "minecraft:trail"))
+        else {
+            return;
+        };
+        let mut particle = Particle::plain(kind as i32);
+        particle.color = color;
+        particle.trail = Some((target, duration));
+        let p = LevelParticles {
+            particle,
+            force: forced,
+            always_visible: forced,
+            pos,
+            delta: [0.0; 3],
+            speed: [0.0; 3],
+            count: 1,
+            mode: 0,
         };
         let _ = self.send(Event::Particles(p));
     }
@@ -308,10 +335,6 @@ impl Server {
         }
         // F10: armadillo rolled up (reduced damage), axolotl (playing dead), allay (beloved player).
         let mut amount = amount;
-        // `#freeze_hurts_extra_types`: freeze damage ×5 (strider, blaze, magma cube).
-        if m.kind.freeze_hurts_extra() && self.dmg_tag(ty, "minecraft:is_freezing") {
-            amount *= 5.0;
-        }
         if let Some(r) = super::brainy::before_hurt(self, m, ty, &mut amount, by) {
             return r;
         }
@@ -396,6 +419,12 @@ impl Server {
         }
         m.no_action_time = 0;
         let mut damage = amount.max(0.0);
+        // Damage as received, before the extra freeze damage and the helmet (`player_hurt_entity`).
+        let original = damage;
+        // `#freeze_hurts_extra_types`: freeze damage ×5 (strider, blaze, magma cube).
+        if m.kind.freeze_hurts_extra() && self.dmg_tag(ty, "minecraft:is_freezing") {
+            damage *= 5.0;
+        }
         // G5-F04: a hit that damages helmets (falling block) loses a quarter on a worn head.
         if m.equipment[5].is_some() && self.dmg_tag(ty, "minecraft:damages_helmet") {
             damage *= 0.75;
@@ -482,6 +511,11 @@ impl Server {
         }
         m.last_hit = Some(Hit { ty: ty.to_owned(), by, tick: self.time as u64 });
         self.mob_hurt_effects(m); // infestation
+        // Any hit whose source is the player (melee, sweep, smash, thorns, projectile, blast of
+        // its TNT…), once the hurt is through, like the game.
+        if by == Some(Ent::Player) {
+            self.s9_player_hurt_mob(m, ty, original, damage);
+        }
         // Own reactions.
         match m.kind {
             Kind::Pig | Kind::Cow | Kind::Sheep | Kind::Chicken | Kind::Wolf | Kind::Cat => {
@@ -1076,6 +1110,10 @@ impl Server {
             if m.kind == Kind::Dolphin {
                 self.mob_sound(m, "minecraft:entity.dolphin.attack", 1.0, 1.0);
             }
+            // The creaking's attack sound (its own volume and voice pitch).
+            if m.kind == Kind::Creaking {
+                self.make_sound(m, "minecraft:entity.creaking.attack");
+            }
         }
         self.wild_after_attack(m, hurt); // F11: panda bite sound
         hurt
@@ -1361,7 +1399,7 @@ impl Server {
                 }
             }
             let dealt = old_h - m.health;
-            self.s9_player_hit_mob(m, ty, total, dealt, weapon.as_ref()); // S9
+            self.s9_player_hit(dealt, weapon.as_ref()); // S9
             if dealt > 2.0 {
                 let n = (dealt * 0.5) as i32;
                 self.particles(
@@ -1453,9 +1491,15 @@ impl Server {
                 .and_then(|w| w["disable_blocking_for_seconds"].as_f64())
                 .unwrap_or(0.0) as f32,
         };
-        let Some((old_h, new_h, killed)) = self.as_player(who, |sv| {
-            sv.pvp_receive(&hit).map(|(o, n)| (o, n, sv.life.vit.dead.then(|| sv.name.clone())))
-        }) else {
+        let (parts, landed) = self.as_player(who, |sv| {
+            let (parts, health) = sv.pvp_receive(&hit);
+            (parts, health.map(|(o, n)| (o, n, sv.life.vit.dead.then(|| sv.name.clone()))))
+        });
+        // The victim's hurt went past its invulnerability window (even fully parried).
+        if let Some((original, taken, blocked)) = parts {
+            self.s9_player_hurt_player(&ty, original, taken, blocked);
+        }
+        let Some((old_h, new_h, killed)) = landed else {
             self.world_sound("minecraft:entity.player.attack.nodamage", 7, self.pos, 1.0, 1.0);
             return;
         };
@@ -1502,9 +1546,8 @@ impl Server {
             }
         }
         let dealt = old_h - new_h;
-        // Like on a mob: damage dealt, weapon used, `player_hurt_entity`; then the
-        // kill credit if the victim dies of it.
-        self.s9_player_hit(None, &ty, total, dealt, weapon.as_ref());
+        // Like on a mob: damage dealt, weapon used; then the kill credit if the victim dies of it.
+        self.s9_player_hit(dealt, weapon.as_ref());
         if let Some(victim) = killed {
             self.s9_player_killed_player(&victim, &ty);
         }
@@ -1518,17 +1561,18 @@ impl Server {
 
     /// Hit from another player received by the current player: `pvp` rule and team (allies without
     /// friendly fire: refused), then "player hit" damage (shield, armor…), base knockback
-    /// from the attacker, extra knockback in their gaze, fire. Returns the health before and
-    /// after the hit if it landed.
-    fn pvp_receive(&mut self, hit: &PvpHit) -> Option<(f32, f32)> {
+    /// from the attacker, extra knockback in their gaze, fire. Returns the hurt report (damage
+    /// received, after the shield, parried) if the hit went past the invulnerability window, and
+    /// the health before and after the hit if it landed.
+    fn pvp_receive(&mut self, hit: &PvpHit) -> (Option<HurtParts>, Option<(f32, f32)>) {
         if !self.rule("minecraft:pvp", true) {
-            return None;
+            return (None, None);
         }
         if let Some(t) = self.cmd.scores.team_of(&self.name)
             && t.players.contains(&hit.name)
             && !t.friendly_fire
         {
-            return None;
+            return (None, None);
         }
         let ty = hit.ty.as_str();
         let full = self.life.vit.cooldown <= 10;
@@ -1542,11 +1586,13 @@ impl Server {
         self.prog.attacker_player = Some((hit.display.clone(), hit.named_item.clone()));
         self.prog.attacker_weapon = hit.weapon.clone();
         let old = self.life.vit.health;
+        self.prog.hurt_parts = None;
         let ok = self.hurt(ty, hit.total);
+        let parts = self.prog.hurt_parts.take();
         self.prog.attacker_player = None;
         self.prog.attacker_weapon = None;
         if !ok {
-            return None;
+            return (parts, None);
         }
         if full && !self.dmg_tag(ty, "minecraft:no_knockback") {
             self.player_knockback(0.4, hit.pos[0] - self.pos[0], hit.pos[2] - self.pos[2]);
@@ -1558,7 +1604,7 @@ impl Server {
         if hit.fire > 0 && self.life.vit.fire < hit.fire {
             self.life.vit.fire = hit.fire;
         }
-        Some((old, self.life.vit.health))
+        (parts, Some((old, self.life.vit.health)))
     }
 
     /// G5-F04: second hurt sound of a full hit of thorns, at the hurt entity, category players (7)
@@ -1680,6 +1726,9 @@ fn t_rng(s: &Server, t: Ent) -> super::jrand::JRand {
         Ent::Player => super::jrand::JRand::new(0),
     }
 }
+
+/// Hurt report of a player hit by another: damage received, after the shield, parried.
+type HurtParts = (f32, f32, bool);
 
 /// Hit from one player on another, computed on the attacker's side, applied on the victim's side.
 struct PvpHit {

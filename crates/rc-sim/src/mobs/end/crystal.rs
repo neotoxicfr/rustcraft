@@ -17,6 +17,10 @@ pub struct Crystal {
     pub id: i32,
     pub uuid: u128,
     pub pos: [f64; 3],
+    /// Velocity (`Motion`): a crystal never moves, but a push (wind burst) is kept and saved.
+    pub vel: [f64; 3],
+    /// Velocity changed by a push: sent with the next tracking.
+    vel_dirty: bool,
     pub yaw: f32,
     /// Beam target (`beam_target`).
     pub beam: Option<[i32; 3]>,
@@ -36,6 +40,8 @@ impl Crystal {
             id,
             uuid,
             pos,
+            vel: [0.0; 3],
+            vel_dirty: false,
             yaw,
             beam: None,
             show_bottom: true,
@@ -52,6 +58,8 @@ impl Crystal {
         let pos = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
         let [yaw, _] = nbtio::f32s::<2>(e.get("Rotation")).unwrap_or_default();
         let mut c = Crystal::new(id, nbtio::uuid(e.get("UUID")).unwrap_or(0), pos, yaw);
+        // Each component beyond 10 in absolute value is read as 0, like any entity.
+        c.vel = nbtio::motion(e.get("Motion")).unwrap_or_default();
         c.beam = match e.get("beam_target") {
             Some(Nbt::IntArray(a)) if a.len() == 3 => Some([a[0], a[1], a[2]]),
             _ => None,
@@ -67,7 +75,7 @@ impl Crystal {
         let dbl = |v: [f64; 3]| Nbt::List(v.iter().map(|&x| Nbt::Double(x)).collect());
         nbtio::set(&mut e, "id", Nbt::String("minecraft:end_crystal".into()));
         nbtio::set(&mut e, "Pos", dbl(self.pos));
-        nbtio::set(&mut e, "Motion", dbl([0.0; 3]));
+        nbtio::set(&mut e, "Motion", dbl(self.vel));
         nbtio::set(&mut e, "Rotation", Nbt::List(vec![Nbt::Float(self.yaw), Nbt::Float(0.0)]));
         nbtio::set(&mut e, "UUID", nbtio::uuid_nbt(self.uuid));
         nbtio::set(&mut e, "Invulnerable", Nbt::Byte(i8::from(self.invulnerable)));
@@ -119,6 +127,28 @@ impl Server {
                 let f = self.fire_state_for(p);
                 self.set_block(p, f, crate::blocks::flag::ALL);
             }
+        }
+    }
+
+    /// Knockback alone of a burst (wind) on the crystals, × `mult`: kept in their velocity (a
+    /// crystal never moves, but saves and sends it).
+    pub(crate) fn crystals_blast_push(&mut self, center: [f64; 3], radius: f32, mult: f64) {
+        let double = f64::from(radius * 2.0);
+        for i in 0..self.mobs.end.crystals.len() {
+            let c = &self.mobs.end.crystals[i];
+            if c.removed {
+                continue;
+            }
+            let dist = super::super::mth::dist2(c.pos, center).sqrt() / double;
+            if dist > 1.0 {
+                continue;
+            }
+            let eye = c.pos[1] + f64::from(2.0f32 * 0.85);
+            let dir = super::super::mth::normalize([c.pos[0] - center[0], eye - center[1], c.pos[2] - center[2]]);
+            let kp = (1.0 - dist) * f64::from(self.seen_percent(center, &c.bbox())) * mult;
+            let c = &mut self.mobs.end.crystals[i];
+            c.vel = [c.vel[0] + dir[0] * kp, c.vel[1] + dir[1] * kp, c.vel[2] + dir[2] * kp];
+            c.vel_dirty = true;
         }
     }
 
@@ -239,7 +269,7 @@ impl Server {
                     uuid: c.uuid,
                     kind,
                     pos: c.pos,
-                    velocity: [0.0; 3],
+                    velocity: c.vel,
                     pitch: 0.0,
                     yaw: c.yaw,
                     head_yaw: 0.0,
@@ -263,6 +293,10 @@ impl Server {
                 c.meta_dirty = false;
                 let values = vec![(8, Meta::BlockPos(c.beam)), (9, Meta::Bool(c.show_bottom))];
                 let _ = self.send(Event::Entity(EntityEvent::Data { id: c.id, values }));
+            }
+            // A push: its velocity goes to the client (the spawn carries it otherwise).
+            if std::mem::take(&mut c.vel_dirty) && c.seen && !c.removed {
+                let _ = self.send(Event::Entity(EntityEvent::Motion { id: c.id, velocity: crate::mobs::track::lp_quantize(c.vel) }));
             }
         }
         list.retain(|c| !c.removed || c.seen);

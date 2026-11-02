@@ -15,7 +15,13 @@ use crate::server::Server;
 thread_local! {
     /// Tests: primed TNT explosions of this thread, (dimension, passed through a portal).
     pub(crate) static TNT_BLASTS: std::cell::RefCell<Vec<(String, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Tests: cells hit by each explosion of this thread.
+    pub(crate) static BLAST_CELLS: std::cell::RefCell<Vec<BlastCells>> = const { std::cell::RefCell::new(Vec::new()) };
 }
+
+/// Tests: centre of an explosion and the cells it hit.
+#[cfg(test)]
+pub(crate) type BlastCells = ([f64; 3], Vec<[i32; 3]>);
 
 /// Interaction of an explosion with blocks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,8 +36,9 @@ pub(crate) enum Blast {
     /// G5-F06: TNT minecart ("TNT" interaction); primed, it spares the rails and the block
     /// that carries them (zero resistance, never destroyed).
     TntCart { primed: bool },
-    /// None.
-    None,
+    /// None; true with the calculator of an entity that went through a portal (its portal
+    /// delay runs): the Nether portal neither resists nor counts as hit.
+    None(bool),
     /// Bed or respawn anchor ("block"); anchor in water: its cell resists like water,
     /// even empty (own calculator for the explosion of a respawn anchor).
     Respawn(Option<[i32; 3]>),
@@ -162,14 +169,14 @@ impl Server {
             }
             Blast::Block | Blast::Respawn(_) => (true, self.rule("minecraft:block_explosion_drop_decay", true)),
             Blast::Tnt(_) | Blast::TntCart { .. } => (true, self.rule("minecraft:tnt_explosion_drop_decay", false)),
-            Blast::None => (false, false),
+            Blast::None(_) => (false, false),
         };
         // Dropped items, orbs, falling blocks: touched if the mob rule allows it
         // or if the explosion destroys blocks.
         let blocklike =
             self.rule("minecraft:mob_griefing", true) || matches!(blast, Blast::Block | Blast::Tnt(_) | Blast::TntCart { .. });
         let rail_safe = matches!(blast, Blast::TntCart { primed: true });
-        let portal_immune = blast == Blast::Tnt(true);
+        let portal_immune = matches!(blast, Blast::Tnt(true) | Blast::None(true));
         let nether_portal = self.tb().block_id("nether_portal");
         // 1. Blocks hit.
         let mut toblow: Vec<[i32; 3]> = Vec::new();
@@ -221,6 +228,8 @@ impl Server {
         }
         // Order of a hash set of the game: the order only matters for the next shuffle.
         let count = toblow.len() as i32;
+        #[cfg(test)]
+        BLAST_CELLS.with_borrow_mut(|v| v.push((center, toblow.clone())));
         // 2. Entities. The author held out of the list (creeper, wither being ticked) stays
         // findable by identifier for the time of the damage (warden anger, gossip…).
         if let Some(s) = source {
@@ -228,7 +237,15 @@ impl Server {
         }
         let double = radius * 2.0;
         let mut player_kb: Option<[f64; 3]> = None;
-        let ids: Vec<i32> = self.mobs.list.iter().flatten().filter(|o| Some(o.id) != exclude).map(|o| o.id).collect();
+        // A digging or emerging warden ignores explosions (neither hurt nor pushed).
+        let ids: Vec<i32> = self
+            .mobs
+            .list
+            .iter()
+            .flatten()
+            .filter(|o| Some(o.id) != exclude && !super::recent::ignores_explosion(o))
+            .map(|o| o.id)
+            .collect();
         let mut targets: Vec<Ent> = ids.into_iter().map(Ent::Mob).collect();
         targets.push(Ent::Player);
         for t in targets {
@@ -242,13 +259,10 @@ impl Server {
             if dist > 1.0 {
                 continue;
             }
-            let mut dir = [pos[0] - center[0], eye - center[1], pos[2] - center[2]];
-            let l = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
-            dir = if l < 1.0e-4 { [0.0; 3] } else { dir.map(|v| v / l) };
+            let dir = super::mth::normalize([pos[0] - center[0], eye - center[1], pos[2] - center[2]]);
             let exposure = self.seen_percent(center, &bb);
             let pow = (1.0 - dist) * f64::from(exposure);
             let dmg = ((pow * pow + pow) / 2.0 * 7.0 * f64::from(double) + 1.0) as f32;
-            let kb = dir.map(|v| v * (1.0 - dist) * f64::from(exposure));
             if rc_data::env_flag!("RUSTCRAFT_S4LOG") {
                 eprintln!("explosion: {t:?} at {pos:?}, distance {dist:.3}, seen part {exposure}, damage {dmg}");
             }
@@ -303,7 +317,10 @@ impl Server {
                         dmg
                     };
                     self.mob_hurt(&mut o, ty, dmg, by, Some(center));
-                    o.vel = [o.vel[0] + kb[0], o.vel[1] + kb[1], o.vel[2] + kb[2]];
+                    // Knockback power, then along the direction; reduced by the explosion
+                    // knockback resistance (Blast Protection), like the game.
+                    let kp = (1.0 - dist) * f64::from(exposure) * (1.0 - o.attrs.explosion_kb_resistance.value());
+                    o.vel = [o.vel[0] + dir[0] * kp, o.vel[1] + dir[1] * kp, o.vel[2] + dir[2] * kp];
                     o.needs_sync = true;
                     self.mobs.list[i] = Some(o);
                 }
@@ -325,7 +342,8 @@ impl Server {
         if griefing {
             // Beehives: emergency exit if the direct source is a TNT, a creeper, a wither skull,
             // the wither or a TNT minecart; bees angered after the breaking.
-            let hive_release = matches!(blast, Blast::Tnt(_) | Blast::TntCart { .. })
+            // (A TNT interaction from a mob, the sulfur cube, does not count.)
+            let hive_release = (source.is_none() && matches!(blast, Blast::Tnt(_) | Blast::TntCart { .. }))
                 || source.is_some_and(|m| matches!(m.kind, super::species::Kind::Creeper | super::species::Kind::Wither))
                 || self.prog.expl_cause_next == Some("minecraft:wither_skull");
             self.mobs.rng.shuffle(&mut toblow);
@@ -385,8 +403,9 @@ impl Server {
                 }
             }
         }
-        // 4. Packet to the player.
-        if dist2(self.pos, center) < 4096.0 {
+        // 4. Packet to each player within 64 blocks (the other players of the local network are
+        //    not reached by the blast: no knockback in theirs).
+        {
             let small = radius < 2.0 || !griefing;
             let pt = |s: &Server, n: &str| Particle {
                 kind: s
@@ -400,12 +419,13 @@ impl Server {
                 scale: 1.0,
                 color2: 0,
                 vib: None,
+                trail: None,
             };
             let ex = rc_client::extra::Explosion {
                 center,
                 radius,
                 blocks: count,
-                knockback: player_kb,
+                knockback: None,
                 particle: pt(self, if small { "minecraft:explosion" } else { "minecraft:explosion_emitter" }),
                 sound: SoundRef::Id(
                     self.data
@@ -419,9 +439,45 @@ impl Server {
                 ],
                 play_sound: true,
             };
-            let _ = self.send(Event::Explode(Box::new(ex)));
+            self.send_explosion(ex, player_kb, &[]);
         }
         let _ = EntityEvent::Remove(Vec::new());
+    }
+
+    /// Explosion packet to each player within 64 blocks of its centre, carrying that player's
+    /// own knockback (`own`: the current player's; `peers`: those of other players by seat,
+    /// none for the others), like the game sends one per player.
+    pub(crate) fn send_explosion(
+        &mut self,
+        mut ex: rc_client::extra::Explosion,
+        own: Option<[f64; 3]>,
+        peers: &[(Option<usize>, Option<[f64; 3]>)],
+    ) {
+        if self.muted {
+            return;
+        }
+        let center = ex.center;
+        if self.lan.is_none() {
+            if dist2(self.pos, center) < 4096.0 {
+                ex.knockback = own;
+                let _ = self.send(Event::Explode(Box::new(ex)));
+            }
+            return;
+        }
+        if dist2(self.pos, center) < 4096.0 {
+            let mut mine = ex.clone();
+            mine.knockback = own;
+            let _ = self.send_to_current(Event::Explode(Box::new(mine)));
+        }
+        for (who, _) in self.lan_other_players() {
+            let mut theirs = ex.clone();
+            theirs.knockback = peers.iter().find(|p| p.0 == who).and_then(|p| p.1);
+            self.as_player(who, |sv| {
+                if dist2(sv.pos, center) < 4096.0 {
+                    let _ = sv.send_to_current(Event::Explode(Box::new(theirs)));
+                }
+            });
+        }
     }
 
     /// Loot of a blown-up block (block table, explosion context).

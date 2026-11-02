@@ -20,11 +20,11 @@ use super::{Parsed, R, Seg, args, snbt};
 use crate::server::Server;
 use crate::tr;
 
-/// Profile services used by `/fetchprofile`: identifier of a name (profile service), signed
-/// profile of an identifier (session service). Replaced in the tests (no network).
+/// Profile services used by `/fetchprofile`: identifier and name of a name (profile service),
+/// signed profile of an identifier (session service). Replaced in the tests (no network).
 #[derive(Clone, Copy)]
 pub struct Services {
-    pub id_by_name: fn(&str) -> Option<u128>,
+    pub id_by_name: fn(&str) -> Option<(u128, String)>,
     pub profile: fn(u128) -> Option<ProfileResult>,
 }
 
@@ -91,7 +91,8 @@ enum Ask {
 /// Lookup in progress (answered on the server thread at a following tick, like the game).
 #[derive(Debug)]
 struct Pending {
-    src: Src,
+    /// Source of the command, closed: the answer comes after its end.
+    src: super::src::KeptSource,
     ask: Ask,
     rx: Receiver<Option<ProfileResult>>,
 }
@@ -101,6 +102,8 @@ struct Pending {
 pub struct Profiles {
     pub services: Services,
     cache: Arc<Mutex<Cache>>,
+    /// The game folder's name cache (`usercache.json`), read on first use.
+    users: Option<Arc<Mutex<crate::usercache::UserCache>>>,
     pending: Vec<Pending>,
     /// Queue of the workers, started with the first lookup.
     jobs: Option<Sender<Job>>,
@@ -112,9 +115,9 @@ fn valid_player_name(name: &str) -> bool {
     name.encode_utf16().count() <= 16 && !name.encode_utf16().any(|c| c <= 32 || c >= 127)
 }
 
-/// Identifier of a name through the profile service (name lowercased, inserted as it is in
-/// the address, like the game). `None`: unknown or service unreachable.
-fn network_id_by_name(name: &str) -> Option<u128> {
+/// Identifier and name of a name through the profile service (name lowercased, inserted as it is
+/// in the address, like the game). `None`: unknown or service unreachable.
+fn network_id_by_name(name: &str) -> Option<(u128, String)> {
     let url = rc_client::session::endpoint("profiles", "getByName")?.replace("{name}", name);
     let mut r = rc_client::session::agent().get(&url).call().ok()?;
     if r.status().as_u16() >= 400 {
@@ -122,26 +125,36 @@ fn network_id_by_name(name: &str) -> Option<u128> {
     }
     let body = r.body_mut().with_config().limit(1 << 20).read_to_string().ok()?;
     let v: serde_json::Value = serde_json::from_str(&body).ok()?;
-    rc_client::auth::parse_uuid(v["id"].as_str()?)
+    Some((rc_client::auth::parse_uuid(v["id"].as_str()?)?, v["name"].as_str()?.to_owned()))
 }
 
-/// Lookup on a worker thread: by identifier; by name, the name's identifier (lowercased; an
-/// unknown name gets its offline identifier, looked up all the same), then by identifier.
-fn resolve(services: Services, cache: &Mutex<Cache>, ask: &Ask) -> Option<ProfileResult> {
+type Users = Arc<Mutex<crate::usercache::UserCache>>;
+
+/// Lookup on a worker thread: by identifier; by name, the name's identifier from the game
+/// folder's name cache, otherwise from the profile service (lowercased; an unknown name gets its
+/// offline identifier), recorded in the name cache, then by identifier.
+fn resolve(services: Services, cache: &Mutex<Cache>, users: &Users, ask: &Ask) -> Option<ProfileResult> {
     let by_id = |id: u128| cached(cache, |c| &mut c.by_id, &id, || (services.profile)(id));
+    let lock = || users.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     match ask {
         Ask::Id(id) => by_id(*id),
         Ask::Name(name) if !valid_player_name(name) => None,
         Ask::Name(name) => cached(cache, |c| &mut c.by_name, name, || {
             let lower = name.to_ascii_lowercase();
-            let id = (services.id_by_name)(&lower).unwrap_or_else(|| rc_client::offline_uuid(&lower));
+            let known = lock().id_of(&lower);
+            let id = known.unwrap_or_else(|| {
+                // Network access with the name cache released.
+                let (id, found) = (services.id_by_name)(&lower).unwrap_or_else(|| (rc_client::offline_uuid(&lower), lower.clone()));
+                lock().add(id, &found);
+                id
+            });
             by_id(id)
         }),
     }
 }
 
-/// Lookup handed to the workers: services to use, request, where to answer.
-type Job = (Services, Ask, Sender<Option<ProfileResult>>);
+/// Lookup handed to the workers: services to use, name cache, request, where to answer.
+type Job = (Services, Users, Ask, Sender<Option<ProfileResult>>);
 
 /// Workers serving the lookups (the game reuses idle threads of an I/O pool), one per
 /// logical core: started with the first lookup, they share one queue and stop when the queue
@@ -158,8 +171,8 @@ fn start_workers(cache: &Arc<Mutex<Cache>>) -> Option<Sender<Job>> {
                 loop {
                     // The queue lock is released once a job is taken.
                     let job = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).recv();
-                    let Ok((services, ask, reply)) = job else { break };
-                    let _ = reply.send(resolve(services, &cache, &ask));
+                    let Ok((services, users, ask, reply)) = job else { break };
+                    let _ = reply.send(resolve(services, &cache, &users, &ask));
                 }
             })
             .is_ok();
@@ -168,7 +181,7 @@ fn start_workers(cache: &Arc<Mutex<Cache>>) -> Option<Sender<Job>> {
 }
 
 /// Stored form of a resolved profile: identifier (4 integers), name, properties if any.
-fn profile_nbt(p: &ProfileResult) -> Nbt {
+pub(crate) fn profile_nbt(p: &ProfileResult) -> Nbt {
     let mut f = vec![("id".to_owned(), crate::nbtio::uuid_nbt(p.id)), ("name".to_owned(), Nbt::String(p.name.clone()))];
     if !p.properties.is_empty() {
         let props = p
@@ -202,6 +215,7 @@ impl Server {
             "compute" => self.cmd_compute(s, p, seg),
             "posteffect" => self.cmd_posteffect(s, p, seg),
             "fetchprofile" => self.cmd_fetchprofile(s, p, seg),
+            "test" => self.cmd_test(s, p, seg), // G3-F06
             _ => return None,
         })
     }
@@ -375,15 +389,45 @@ impl Server {
                 return Ok(1);
             }
         };
+        let mut kept = self.keep_source(s);
+        kept.command_ended();
+        let users = self.user_cache();
         let pr = &mut self.cmd.s9.profiles;
         if pr.jobs.is_none() {
             pr.jobs = start_workers(&pr.cache);
         }
         let (tx, rx) = channel();
-        if pr.jobs.as_ref().is_some_and(|q| q.send((pr.services, ask.clone(), tx)).is_ok()) {
-            pr.pending.push(Pending { src: s.clone(), ask, rx });
+        if pr.jobs.as_ref().is_some_and(|q| q.send((pr.services, users, ask.clone(), tx)).is_ok()) {
+            pr.pending.push(Pending { src: kept, ask, rx });
         }
         Ok(1)
+    }
+
+    /// The game folder's name cache (`usercache.json` next to `saves`), read on first use; a
+    /// world outside a `saves` folder keeps it in memory only.
+    pub(crate) fn user_cache(&mut self) -> Users {
+        if let Some(u) = &self.cmd.s9.profiles.users {
+            return u.clone();
+        }
+        let path = self
+            .world
+            .parent()
+            .filter(|s| s.file_name().is_some_and(|n| n == "saves"))
+            .and_then(std::path::Path::parent)
+            .map(|g| g.join("usercache.json"));
+        let u = Arc::new(Mutex::new(crate::usercache::UserCache::load(path)));
+        self.cmd.s9.profiles.users = Some(u.clone());
+        u
+    }
+
+    /// Joining player recorded in the name cache; the name it carried there if it differs (any
+    /// case aside), for the "formerly known as" join message.
+    pub(crate) fn user_cache_join(&mut self) -> Option<String> {
+        let users = self.user_cache();
+        let mut c = users.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let old = c.name_of(self.uuid);
+        c.add(self.uuid, &self.name);
+        old.filter(|o| !o.eq_ignore_ascii_case(&self.name))
     }
 
     /// Answers of the finished lookups (server thread, start of the commands phase).
@@ -408,12 +452,13 @@ impl Server {
                 Ask::Name(n) => (lit(n.clone()), "name"),
                 Ask::Id(id) => (lit(crate::nbtio::uuid_text(*id)), "id"),
             };
-            match r {
+            // To the player who asked (found again by their profile), whoever is installed now.
+            self.as_kept_source(&src, |sv, s| match r {
                 Some(profile) => {
-                    self.report_profile(&src, &format!("commands.fetchprofile.{kind}.success"), arg, profile_nbt(&profile))
+                    sv.report_profile(s, &format!("commands.fetchprofile.{kind}.success"), arg, profile_nbt(&profile))
                 }
-                None => self.fail(&src, tr!(&format!("commands.fetchprofile.{kind}.failure"), arg)),
-            }
+                None => sv.fail(s, tr!(&format!("commands.fetchprofile.{kind}.failure"), arg)),
+            });
         }
     }
 

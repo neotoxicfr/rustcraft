@@ -241,6 +241,7 @@ pub fn eat_carrot(s: &mut Server, m: &mut Mob, p: [i32; 3]) {
         } else {
             let to = s.with_prop(st, "age", &(age - 1).to_string()).unwrap_or(st);
             s.set_block(crops, to, 2);
+            s.game_event_block("minecraft:block_change", crops, Some(Ent::Mob(m.id)), None);
             s.level_event(2001, crops, st as i32);
         }
         m.surf.more_carrot = 40;

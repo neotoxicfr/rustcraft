@@ -259,7 +259,7 @@ fn fetchprofile_entity_and_lookups() {
     f.eq("marker", (r, last(&t).0), ((false, 0), "commands.fetchprofile.no_profile".into()));
     // Lookups through the services (fake here): answered at a following poll.
     t.s.cmd.s9.profiles.services = crate::commands::cmds_s9e::Services {
-        id_by_name: |n| (n == "known").then_some(0x1234),
+        id_by_name: |n| (n == "known").then(|| (0x1234, "Known".to_owned())),
         profile: |id| {
             (id == 0x1234).then(|| ProfileResult {
                 id,
@@ -290,6 +290,84 @@ fn fetchprofile_entity_and_lookups() {
     f.eq("unknown name", (r, m.0), ((true, 1), "commands.fetchprofile.name.failure".into()));
     let (r, m) = ask(&mut t, "fetchprofile id 00000000-0000-0000-0000-000000001234");
     f.eq("id", (r, m.0), ((true, 1), "commands.fetchprofile.id.success".into()));
+    f.done();
+}
+
+/// L9-COMBAT: the name cache of the game folder (`usercache.json`, next to `saves`). The join
+/// records the player and recalls another name it held there ("formerly known as");
+/// `fetchprofile name` reads the cache before the profile service (a name in any case: one call
+/// only) and records what it finds, an unknown name lowercased with its offline identifier. The
+/// file has the game's layout: identifier, name, expiry one month later.
+#[test]
+fn fetchprofile_and_join_use_the_name_cache() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let mut t = open("usercache");
+    let mut f = Fails::default();
+    let file = t.dir.parent().and_then(std::path::Path::parent).expect("game folder").join("usercache.json");
+    let uuid = t.s.uuid;
+    t.s.user_cache().lock().unwrap().add(uuid, "OldName");
+    let _ = chats(&t);
+    t.s.join();
+    let joined = chats(&t)
+        .iter()
+        .find(|c| key(c).starts_with("multiplayer.player.joined"))
+        .map(|c| (key(c).to_owned(), args(c).iter().map(arg_text).collect::<Vec<_>>()));
+    f.eq("join recalls the old name", joined, Some(("multiplayer.player.joined.renamed".into(), vec!["G3F08".into(), "OldName".into()])));
+    let read = || -> Vec<serde_json::Value> {
+        serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(&file).unwrap_or_default())
+            .ok()
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default()
+    };
+    let text = std::fs::read_to_string(&file).unwrap_or_default();
+    let uuid_text = |u: u128| {
+        let h = format!("{u:032x}");
+        format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
+    };
+    f.eq("layout", text.starts_with(&format!("[{{\"uuid\":\"{}\",\"name\":\"G3F08\",\"expiresOn\":\"", uuid_text(uuid))), true);
+    let entries = read();
+    f.eq("one entry per player", entries.len(), 1);
+    let expires = entries.first().and_then(|e| e["expiresOn"].as_str()).and_then(crate::progress::parse_date).unwrap_or(0);
+    let days = (expires - crate::progress::now_ms()) / 86_400_000;
+    f.eq("expiry one month later", (27..=31).contains(&days), true);
+    t.s.cmd.s9.profiles.services = crate::commands::cmds_s9e::Services {
+        id_by_name: |n| {
+            CALLS.fetch_add(1, SeqCst);
+            (n == "known").then(|| (0x1234, "Known".to_owned()))
+        },
+        profile: |id| {
+            (id == 0x1234).then(|| ProfileResult {
+                id,
+                name: "Known".into(),
+                properties: Vec::new(),
+                forced_name_change: false,
+                banned_skin: false,
+            })
+        },
+    };
+    let ask = |t: &mut T, cmd: &str| -> String {
+        run(&mut t.s, cmd);
+        for _ in 0..400 {
+            t.s.fetchprofile_poll();
+            if let Some(c) = chats(t).last() {
+                return key(c).to_owned();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        String::new()
+    };
+    f.eq("name", ask(&mut t, "fetchprofile name Known"), "commands.fetchprofile.name.success".to_owned());
+    f.eq("other case", ask(&mut t, "fetchprofile name KNOWN"), "commands.fetchprofile.name.success".to_owned());
+    f.eq("service asked once", CALLS.load(SeqCst), 1);
+    f.eq("unknown name", ask(&mut t, "fetchprofile name Nobody"), "commands.fetchprofile.name.failure".to_owned());
+    let entries = read();
+    let has = |id: u128, name: &str| {
+        entries.iter().any(|e| e["uuid"].as_str() == Some(uuid_text(id).as_str()) && e["name"].as_str() == Some(name))
+    };
+    f.eq("found name recorded", has(0x1234, "Known"), true);
+    f.eq("unknown name recorded offline", has(rc_client::offline_uuid("nobody"), "nobody"), true);
+    f.eq("latest first", entries.first().and_then(|e| e["name"].as_str().map(str::to_owned)), Some("nobody".to_owned()));
     f.done();
 }
 

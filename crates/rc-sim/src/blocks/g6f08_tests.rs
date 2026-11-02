@@ -202,6 +202,39 @@ fn turtle_eggs_broken_by_real_landings() {
     assert!(land(&mut w, None, 12) < 4, "the player landing 60 times broke nothing");
 }
 
+/// A turning eyeblossom sends one trail particle (L9): from the block's centre to the point its
+/// world draws give (lifetime 0.5 + d, speed (d − 0.5, d + 1, d − 0.5)), reached in 20 ticks per
+/// second of lifetime, orange when it opens, grey when it closes, not forced; the potted one too.
+#[test]
+fn eyeblossom_trail_particle() {
+    let mut w = world("l9-eye-trail");
+    w.cmd("gamerule random_tick_speed 0");
+    let c = [8, Y, 8];
+    let pot = [2, Y, 2];
+    w.set(c, "minecraft:closed_eyeblossom");
+    w.set(pot, "minecraft:potted_closed_eyeblossom");
+    let expect = |w: &W, at: P| {
+        let mut r = w.p.s.bs.rng.clone();
+        let life = 0.5 + r.next_double();
+        let v = [r.next_double() - 0.5, r.next_double() + 1.0, r.next_double() - 0.5];
+        let s = at.map(|k| f64::from(k) + 0.5);
+        (s, [s[0] + v[0] * life, s[1] + v[1] * life, s[2] + v[2] * life], (20.0 * life) as i32)
+    };
+    for (day, at, color) in [(13_000, c, 0xFC_7812), (13_000, pot, 0xFC_7812), (23_401, c, 0x5F_5F5F)] {
+        set_day(&mut w, day);
+        let _ = w.events();
+        let (start, target, ticks) = expect(&w, at);
+        rtick(&mut w, at);
+        let evs = w.events();
+        let sent = super::g6f01_tests::particles(&w, &evs, "minecraft:trail");
+        assert_eq!(sent.len(), 1, "one trail particle at {at:?}");
+        let p = &sent[0];
+        assert_eq!((p.pos, p.particle.trail, p.particle.color), (start, Some((target, ticks)), color));
+        assert_eq!((p.count, p.force, p.always_visible, p.delta, p.speed), (1, false, false, [0.0; 3], [0.0; 3]));
+        assert!((10..30).contains(&ticks));
+    }
+}
+
 /// At night a closed eyeblossom opens on its random tick (long sound, "block changed" with the
 /// old state) and wakes the closed ones within ±3/±2/±3 (scheduled tick, short sound), not
 /// the farther one; by day it closes again. A potted one turns too. Outside the overworld, no

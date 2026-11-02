@@ -12,6 +12,11 @@ use super::mth::dist2;
 use super::species::{Category, Kind};
 use crate::server::Server;
 
+/// Simulation levels of a chunk (lower is stronger): 31 or less "ticking entities" (entities,
+/// random ticks, thunder), 32 "ticking blocks" (scheduled ticks, block events, block entities).
+pub(crate) const ENTITY_TICKING: i32 = 31;
+pub(crate) const BLOCK_TICKING: i32 = 32;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
     Natural,
@@ -1166,14 +1171,26 @@ impl Server {
     /// (level 31) also covers its neighbors.
     pub(crate) fn chunk_simulated(&self, c: (i32, i32), centers: &[(i32, i32)]) -> bool {
         let r = self.sim_dist + 1;
-        self.forced_near(c, 1) || centers.iter().any(|p| (c.0 - p.0).abs() <= r && (c.1 - p.1).abs() <= r)
+        self.forced_near(c, 1)
+            || centers.iter().any(|p| (c.0 - p.0).abs() <= r && (c.1 - p.1).abs() <= r)
+            || self.ticket_level(c) <= BLOCK_TICKING
     }
 
     /// "Ticking entities" chunk (level 31): random ticks, thunderstorm; simulation
     /// distance, or the force-loaded chunk itself.
     pub(crate) fn chunk_entity_ticking(&self, c: (i32, i32), centers: &[(i32, i32)]) -> bool {
         let r = self.sim_dist;
-        self.cmd.forced.contains(&c) || centers.iter().any(|p| (c.0 - p.0).abs() <= r && (c.1 - p.1).abs() <= r)
+        self.cmd.forced.contains(&c)
+            || centers.iter().any(|p| (c.0 - p.0).abs() <= r && (c.1 - p.1).abs() <= r)
+            || self.ticket_level(c) <= ENTITY_TICKING
+    }
+
+    /// L9-TICK: lowest simulation level at chunk `c` of the tickets other than the players' and
+    /// the forced ones (`i32::MAX` without any): the players' ender pearls and the dragon
+    /// fight. 31 or less: "ticking entities"; 32: "ticking blocks".
+    pub(crate) fn ticket_level(&self, c: (i32, i32)) -> i32 {
+        let fight = self.fight_ticket_level(c);
+        if self.proj.tickets.is_empty() { fight } else { fight.min(self.proj.pearl_ticket_level(c)) }
     }
 
     /// Ticked mob: "ticking entities" chunk on the simulation side AND the loading side
@@ -1194,13 +1211,18 @@ impl Server {
     }
 
     /// An entity other than a player at `pos` ticks this tick (§ 1.2 step 11b): its chunk is
-    /// loaded and "ticking entities" (`mob_chunk_ticking`, or the dragon fight's ticket); in a
-    /// parked dimension (portal ticket, no player there), a loaded chunk is enough.
+    /// loaded and "ticking entities" (`mob_chunk_ticking`, or a pearl's or the dragon fight's
+    /// ticket); in a parked dimension (portal ticket, no player there), a loaded chunk is enough.
     pub(crate) fn entity_ticks_at(&self, pos: [f64; 3]) -> bool {
         let c = ((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4);
         // Distance tests first (a few comparisons), the chunk table lookup last.
-        (self.dims.home.is_some() || self.mob_chunk_ticking(c) || self.fight_ticket_at(c))
-            && matches!(self.chunks.get(&c), Some(Some(_)))
+        (self.dims.home.is_some() || self.entities_tick_in(c)) && matches!(self.chunks.get(&c), Some(Some(_)))
+    }
+
+    /// Chunk `c` is "ticking entities" for an entity other than a player: around a player
+    /// (`mob_chunk_ticking`) or under a pearl's or the dragon fight's ticket (L9-TICK).
+    pub(crate) fn entities_tick_in(&self, c: (i32, i32)) -> bool {
+        self.mob_chunk_ticking(c) || self.ticket_level(c) <= ENTITY_TICKING
     }
 
     fn forced_near(&self, c: (i32, i32), r: i32) -> bool {
@@ -1246,7 +1268,10 @@ impl Server {
     pub(crate) fn chunk_simulated_now(&self, c: (i32, i32)) -> bool {
         let r = self.sim_dist + 1;
         let near = |p: (i32, i32)| (c.0 - p.0).abs() <= r && (c.1 - p.1).abs() <= r;
-        if (near(self.chunk_pos()) && self.holds_tickets(self.game_mode)) || self.forced_near(c, 1) {
+        if (near(self.chunk_pos()) && self.holds_tickets(self.game_mode))
+            || self.forced_near(c, 1)
+            || self.ticket_level(c) <= BLOCK_TICKING
+        {
             return true;
         }
         self.lan.as_ref().is_some_and(|l| {
@@ -1597,7 +1622,7 @@ impl Server {
     }
 
     /// Valid empty cell without looking at its fluid (caller that passes an empty fluid).
-    pub(crate) fn valid_empty_spawn_dry(&self, p: [i32; 3], _kind: Kind) -> bool {
+    pub(crate) fn valid_empty_spawn_dry(&self, p: [i32; 3], kind: Kind) -> bool {
         if self.sflag(p, flags::FULL_COLLISION) {
             return false;
         }
@@ -1621,19 +1646,36 @@ impl Server {
                     | "trapped_chest"
                     | "lightning_rod"
             );
-        let danger = matches!(
-            n,
-            "fire"
-                | "soul_fire"
-                | "magma_block"
-                | "sweet_berry_bush"
-                | "wither_rose"
-                | "cactus"
-                | "powder_snow"
-                | "lava"
-        ) || ((n == "campfire" || n == "soul_campfire")
-            && self.data.state_properties(self.st(p)).any(|kv| kv == ("lit", "true")));
-        !signal && !danger
+        !signal && !self.block_dangerous(p, kind)
+    }
+
+    /// Block dangerous for a species (the game's per-type test, shared by spawning and the
+    /// breeze's jumps): never for the species' own "immune to" tag (`default_immune_to` for the
+    /// species without one, empty in the vanilla data, filled by a data pack); the burning blocks
+    /// (fire tag, lava, magma, lava cauldron, lit campfire) unless it is fire immune; wither
+    /// rose, sweet berry bush, cactus and powder snow.
+    pub(crate) fn block_dangerous(&self, p: [i32; 3], kind: Kind) -> bool {
+        use crate::tag_bits::TagId;
+        let immune = match kind {
+            Kind::Fox => TagId::FoxImmuneTo,
+            Kind::PolarBear => TagId::PolarBearImmuneTo,
+            Kind::SnowGolem => TagId::SnowGolemImmuneTo,
+            Kind::Stray => TagId::StrayImmuneTo,
+            Kind::Wither => TagId::WitherImmuneTo,
+            Kind::WitherSkeleton => TagId::WitherSkeletonImmuneTo,
+            _ => TagId::DefaultImmuneTo,
+        };
+        if self.btag_id(p, immune) {
+            return false;
+        }
+        let n = self.bname(p).trim_start_matches("minecraft:");
+        let burning = || {
+            matches!(n, "lava" | "magma_block" | "lava_cauldron")
+                || self.btag_id(p, crate::tag_bits::TagId::Fire)
+                || ((n == "campfire" || n == "soul_campfire")
+                    && self.data.state_properties(self.st(p)).any(|kv| kv == ("lit", "true")))
+        };
+        matches!(n, "wither_rose" | "sweet_berry_bush" | "cactus" | "powder_snow") || (!kind.info().fire_immune && burning())
     }
 
     /// Own rules of a spawn data (`custom_spawn_rules`): block light and

@@ -1,9 +1,8 @@
 //! Creaking heart (block entity, `server-mobs.md` § 4.F14): tick (comparator signal,
 //! distress call when its creaking is hit, awake or dormant state according to the
 //! timeline, protector spawning at night near a player, sending back a protector too
-//! far or stuck), UUID link kept in the NBT (`creaking`), resin sown on distress.
-//! The trail particles (heart ↔ creaking) are not sent (the client's particle format
-//! has no destination) but their random draws are made.
+//! far or stuck), UUID link kept in the NBT (`creaking`), resin sown on distress, trail
+//! particles between the heart and its creaking.
 
 use hashbrown::HashMap;
 
@@ -180,8 +179,8 @@ impl Server {
         let emitter = self.mobs.rec.hearts.map.get(&p).map_or(0, |h| h.emitter);
         if emitter > 0 {
             if emitter > 50 {
-                self.heart_emit_particles(p, 1);
-                self.heart_emit_particles(p, 1);
+                self.heart_emit_particles(p, 1, true);
+                self.heart_emit_particles(p, 1, false);
             }
             let target = self.mobs.rec.hearts.map.get(&p).and_then(|h| h.emitter_target);
             if emitter % 10 == 0
@@ -361,7 +360,7 @@ impl Server {
         if self.mobs.rec.hearts.map.get(&p).is_some_and(|h| h.emitter > 0) {
             return;
         }
-        self.heart_particle_draws(20);
+        self.heart_trails(p, c.bbox(), 20, false);
         if self.heart_state_value(p).as_deref() == Some("awake") {
             let n = self.mobs.rng.int_between(2, 3);
             for _ in 0..n {
@@ -379,21 +378,31 @@ impl Server {
         }
     }
 
-    /// Trail particle draws (world random: 6 doubles and one integer per particle).
-    fn heart_emit_particles(&mut self, p: [i32; 3], count: i32) {
-        if self.heart_protector(p).is_none() {
-            return;
-        }
-        self.heart_particle_draws(count);
+    /// Trail particles between the heart and its loaded protector (`heart_trails`).
+    fn heart_emit_particles(&mut self, p: [i32; 3], count: i32, towards_creaking: bool) {
+        let Some(b) = self.heart_protector(p).and_then(|id| self.mob_ref(id)).map(Mob::bbox) else { return };
+        self.heart_trails(p, b, count, towards_creaking);
     }
 
-    fn heart_particle_draws(&mut self, count: i32) {
-        let r = &mut self.mobs.rng;
+    /// `count` trail particles between a point of the protector's box `b` and a point of the
+    /// heart's block (world random: the box point, the block point, then the duration of 10 to 49
+    /// ticks), sent forced and always shown: towards the creaking in orange, towards the heart in
+    /// grey.
+    fn heart_trails(&mut self, p: [i32; 3], b: rc_physics::Aabb, count: i32, towards_creaking: bool) {
+        let color = if towards_creaking { 0xFC_7812 } else { 0x5F_5F5F };
         for _ in 0..count {
-            for _ in 0..6 {
-                let _ = r.next_double();
+            let r = &mut self.mobs.rng;
+            let mut on_box = [0.0; 3];
+            for (i, v) in on_box.iter_mut().enumerate() {
+                *v = b.min[i] + r.next_double() * (b.max[i] - b.min[i]);
             }
-            let _ = r.next_int_bound(40);
+            let mut in_block = [0.0; 3];
+            for (i, v) in in_block.iter_mut().enumerate() {
+                *v = f64::from(p[i]) + r.next_double();
+            }
+            let duration = r.next_int_bound(40) + 10;
+            let (from, to) = if towards_creaking { (in_block, on_box) } else { (on_box, in_block) };
+            self.trail_particle(from, to, color, duration, true);
         }
     }
 

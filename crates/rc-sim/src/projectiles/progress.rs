@@ -105,14 +105,39 @@ impl Server {
         self.trig_killed_by_arrow(&who, weapon);
     }
 
-    /// Ranged damage dealt by the player: statistic and `player_hurt_entity`.
-    pub(crate) fn s8_player_hurt_by_projectile(&mut self, victim: Ent, ty: &str, original: f32, dealt: f32) {
-        if dealt > 0.0 {
-            self.award_custom("damage_dealt", (dealt * 10.0).round() as i32);
+    /// Runs the impact `f` of projectile `p` with `p` kept as the direct entity of the damage it
+    /// deals; copied only for a player's projectile while a `player_hurt_entity` criterion is
+    /// open (nested impacts keep the outer copy).
+    pub(crate) fn as_direct_hit<T>(&mut self, p: &mut Proj, f: impl FnOnce(&mut Server, &mut Proj) -> T) -> T {
+        let set = self.proj.direct_hit.is_none()
+            && self.proj_owner(p) == Some(Ent::Player)
+            && self.trig_active("minecraft:player_hurt_entity");
+        if set {
+            self.proj.direct_hit = Some(Box::new(p.clone()));
         }
-        let Ent::Mob(id) = victim else { return };
-        let Some(m) = self.mob_ref(id).map(|m| (*m).clone()) else { return };
-        let dmg = Dmg { ty: ty.to_owned(), source: Some(Who::E(E::Player)), direct: None, pos: Some(self.pos) };
-        self.trig_player_hurt_entity(Some(Who::Mob(&m)), &dmg, original, dealt, false);
+        let r = f(self, p);
+        if set {
+            self.proj.direct_hit = None;
+        }
+        r
+    }
+
+    /// `player_hurt_entity` for a hurt mob whose source is the player (`original`: the damage
+    /// received; `taken`: after the extra freeze damage and the helmet, before armor). Direct
+    /// entity: the player for a hit of its own, otherwise the projectile being resolved.
+    pub(crate) fn s9_player_hurt_mob(&mut self, m: &crate::mobs::mob::Mob, ty: &str, original: f32, taken: f32) {
+        if !self.trig_active("minecraft:player_hurt_entity") {
+            return;
+        }
+        let proj = self.proj.direct_hit.take();
+        let direct = if crate::loot::direct_of(ty) == Some(None) {
+            Some(Who::E(E::Player))
+        } else {
+            proj.as_deref().map(Who::Proj)
+        };
+        let pos = proj.as_ref().map_or(self.pos, |p| p.pos);
+        let dmg = Dmg { ty: ty.to_owned(), source: Some(Who::E(E::Player)), direct, pos: Some(pos) };
+        self.trig_player_hurt_entity(Some(Who::Mob(m)), &dmg, original, taken, false);
+        self.proj.direct_hit = proj;
     }
 }

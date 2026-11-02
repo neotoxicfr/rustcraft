@@ -5,7 +5,7 @@ use rc_physics::Aabb;
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::Meta;
 
-use super::{DKind, Use, base_fields, flag, named, put_after};
+use super::{DKind, Use, base_fields, flag, kind_of, named, put_after};
 use crate::blocks::{Dir, P, rel};
 use crate::mobs::mob::Ent;
 use crate::nbtio::{self, int};
@@ -29,7 +29,7 @@ const CHEST: usize = 4;
 const HEAD: usize = 5;
 
 /// Default poses (head, body, left arm, right arm, left leg, right leg).
-const POSES: [(&str, [f32; 3]); 6] = [
+pub(super) const POSES: [(&str, [f32; 3]); 6] = [
     ("Head", [0.0, 0.0, 0.0]),
     ("Body", [0.0, 0.0, 0.0]),
     ("LeftArm", [-10.0, 0.0, -10.0]),
@@ -66,7 +66,7 @@ pub(super) fn size(e: &Nbt) -> (f64, f64) {
 }
 
 /// Angles of a part (`Rotations`: each angle modulo 360, non-finite read as 0).
-fn rotations(v: Option<&Nbt>, d: [f32; 3]) -> [f32; 3] {
+pub(super) fn rotations(v: Option<&Nbt>, d: [f32; 3]) -> [f32; 3] {
     match nbtio::f32s::<3>(v) {
         Some(r) => r.map(|a| if a.is_finite() { a % 360.0 } else { 0.0 }),
         None => d,
@@ -536,6 +536,42 @@ impl Server {
         let interval = if stand { 3 } else { 2 };
         self.track_turned(&mut t, id, np, vel, landed, interval, rot);
         self.deco.live[i].track = t;
+    }
+}
+
+impl Server {
+    /// An ordinary move of an armor stand or a mannequin by `d` with its collisions (opening
+    /// shulker): position, ground flag, horizontal speed stopped against a wall. A marker or a
+    /// weightless stand has no physics and is not moved. The tracking of its tick sends it.
+    pub(super) fn living_shove(&mut self, id: i32, d: [f64; 3]) {
+        let Some(e) = self.deco_nbt(id) else { return };
+        let stand = kind_of(e) == Some(DKind::Stand);
+        if stand && (marker(e) || flag(e, "NoGravity")) {
+            return;
+        }
+        let Some(pos) = nbtio::f64s::<3>(e.get("Pos")) else { return };
+        let (w, h) = if stand { size(e) } else { (f64::from(0.6f32), f64::from(1.8f32)) };
+        let on_ground = flag(e, "OnGround");
+        let mut vel = nbtio::motion(e.get("Motion")).unwrap_or_default();
+        let b = Aabb { min: [pos[0] - w / 2.0, pos[1], pos[2] - w / 2.0], max: [pos[0] + w / 2.0, pos[1] + h, pos[2] + w / 2.0] };
+        let step = if stand { 0.0 } else { f64::from(0.6f32) };
+        let mv = rc_physics::collide::resolve(&self.world(), &b, d, on_ground, step);
+        let np = [pos[0] + mv[0], pos[1] + mv[1], pos[2] + mv[2]];
+        let vertical = d[1] != mv[1];
+        let ground = vertical && d[1] < 0.0;
+        for a in [0, 2] {
+            if (d[a] - mv[a]).abs() >= 1.0e-5 {
+                vel[a] = 0.0;
+            }
+        }
+        if vertical {
+            vel[1] = 0.0;
+        }
+        self.deco_edit(id, |n| {
+            nbtio::set(n, "Pos", super::dbl(np));
+            nbtio::set(n, "Motion", super::dbl(vel));
+            nbtio::set(n, "OnGround", Nbt::Byte(i8::from(ground)));
+        });
     }
 }
 

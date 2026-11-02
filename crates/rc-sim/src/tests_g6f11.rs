@@ -537,7 +537,7 @@ fn crystal_explosion_spares_its_source() {
     let a = p.s.spawn_crystal([0.5, -59.0, 0.5], 0.0, false);
     let b = p.s.spawn_crystal([3.5, -59.0, 0.5], 0.0, false);
     let pos = [0.5, -59.0, 0.5];
-    p.s.explode_with(None, None, Some(a), pos, 6.0, false, "minecraft:explosion", crate::mobs::explode::Blast::None);
+    p.s.explode_with(None, None, Some(a), pos, 6.0, false, "minecraft:explosion", crate::mobs::explode::Blast::None(false));
     let alive = |id: i32| p.s.mobs.end.crystals.iter().any(|c| c.id == id && !c.removed);
     assert!(alive(a), "the source crystal is not hit by its own blast");
     assert!(!alive(b), "the other crystal is destroyed");

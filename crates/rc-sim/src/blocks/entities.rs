@@ -98,6 +98,78 @@ pub(crate) fn chunk_be_order(at: &[P]) -> Vec<usize> {
     table.iter().rev().flatten().copied().collect()
 }
 
+/// Block entity saved "packed" (`keepPacked` set): never promoted by its chunk yet.
+fn is_packed(b: &Nbt) -> bool {
+    b.get("keepPacked").and_then(Nbt::as_i64).is_some_and(|v| v != 0)
+}
+
+/// L9-TICK: order in which the game promotes the "packed" block entities of a chunk (`keepPacked`
+/// set: saved before the chunk ever ticked). They wait in a chained hash table keyed by position
+/// (16 buckets at first, doubled past 3/4 full, and doubled when a bucket would hold a ninth entry
+/// below 64 buckets; bucket = position hash folded on its high half), filled in the order of the
+/// chunk's list and walked bucket by bucket, each in insertion order. `at`: positions in list
+/// order; returns indices into `at`, a repeated position keeping its first place. Not modelled:
+/// the order inside a bucket of nine entries or more at 64 buckets and beyond (never seen in a
+/// chunk's list).
+pub(crate) fn java_hash_order(at: &[P]) -> Vec<usize> {
+    let spread = java_spread;
+    let mut keys: Vec<usize> = Vec::with_capacity(at.len());
+    let mut seen: hashbrown::HashSet<P> = hashbrown::HashSet::with_capacity(at.len());
+    let mut cap = 16usize;
+    // Entries per bucket at the current size (recounted when the table grows).
+    let mut fill = vec![0u32; cap];
+    for (i, &p) in at.iter().enumerate() {
+        if !seen.insert(p) {
+            continue; // same position: its value is replaced in place
+        }
+        let bucket = spread(p) & (cap - 1);
+        let before = fill[bucket];
+        fill[bucket] += 1;
+        keys.push(i);
+        let mut grown = false;
+        if before >= 8 && cap < 64 {
+            cap *= 2; // long bucket: the table grows instead
+            grown = true;
+        }
+        if keys.len() > cap * 3 / 4 {
+            cap *= 2;
+            grown = true;
+        }
+        if grown {
+            fill.clear();
+            fill.resize(cap, 0);
+            for &k in &keys {
+                fill[spread(at[k]) & (cap - 1)] += 1;
+            }
+        }
+    }
+    keys.sort_by_key(|&k| spread(at[k]) & (cap - 1));
+    keys
+}
+
+/// Hash of a position folded on its high half, as the game's hash tables use it.
+fn java_spread(p: P) -> usize {
+    let h = p[1].wrapping_add(p[2].wrapping_mul(31)).wrapping_mul(31).wrapping_add(p[0]) as u32;
+    (h ^ (h >> 16)) as usize
+}
+
+/// L9-TICK: order in which a chunk save promotes the packed block entities still waiting. The
+/// save walks a new set of every block entity position of the chunk (the waiting ones copied
+/// first, in their table's order, into a table sized for them, 16 buckets at least, then the
+/// others added, the table doubling past 3/4 full): the waiting ones come out bucket by bucket
+/// of the final size, each bucket in their table's order. `waiting`: positions in their table's
+/// order; `total`: distinct positions of the chunk, waiting ones included. Returns indices into
+/// `waiting`. Not modelled: a doubling caused by a bucket of nine entries (never seen in a chunk).
+pub(crate) fn java_save_order(waiting: &[P], total: usize) -> Vec<usize> {
+    let mut cap = (waiting.len().max(12) * 4).div_ceil(3).next_power_of_two();
+    while total > cap * 3 / 4 {
+        cap *= 2;
+    }
+    let mut keys: Vec<usize> = (0..waiting.len()).collect();
+    keys.sort_by_key(|&k| java_spread(waiting[k]) & (cap - 1));
+    keys
+}
+
 /// Entity simulated by the block behaviours.
 #[derive(Debug, Clone)]
 pub(crate) struct SimEntity {
@@ -126,6 +198,10 @@ pub(crate) struct SimEntity {
     /// Primed TNT that went through a portal ("took a portal" flag, not saved): its explosion does not
     /// break the Nether portal and loses no power there.
     pub used_portal: bool,
+    /// Primed TNT: explosion power (`explosion_power`, 4 by default, 0 to 128) and block it
+    /// shows (`block_state`; `None`: the TNT block).
+    pub power: f32,
+    pub block: Option<u32>,
 }
 
 impl SimEntity {
@@ -147,7 +223,20 @@ impl SimEntity {
             hurt: None,
             owner: None,
             used_portal: false,
+            power: 4.0,
+            block: None,
         }
+    }
+
+    /// Data of a primed TNT with `fuse` ticks left that its pairing carries: the fuse, and the
+    /// block it shows when it is not the TNT block.
+    pub(crate) fn tnt_data(&self, fuse: i32) -> Vec<(u8, rc_proto_v777::entity::Meta)> {
+        use rc_proto_v777::entity::Meta;
+        let mut values = vec![(8, Meta::Int(fuse))];
+        if let Some(b) = self.block {
+            values.push((9, Meta::State(b as i32)));
+        }
+        values
     }
 }
 
@@ -350,7 +439,8 @@ impl Server {
     }
 
     fn spawn_tnt(&mut self, p: P, fuse: i32, owner: Option<crate::mobs::mob::Ent>) {
-        let rot = self.bs.rng.next_double() * std::f64::consts::TAU;
+        // A full turn as the game writes it: 2π rounded to a float, then widened.
+        let rot = self.bs.rng.next_double() * f64::from(std::f32::consts::TAU);
         let id = self.alloc_entity();
         let pos = [f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5];
         let vel = [-rot.sin() * 0.02, 0.2f32 as f64, -rot.cos() * 0.02];
@@ -368,12 +458,16 @@ impl Server {
         self.bs.entities.list.push(e);
     }
 
-    /// Primed TNT or falling block summoned (`/summon`): simulated like those of the blocks, with the
-    /// velocity (`Motion`, component beyond 10 read as 0), the fuse (`fuse`, 80) or the state
-    /// (`BlockState`, sand by default and in place of air) and the duration (`Time`) of the NBT.
+    /// Primed TNT or falling block summoned (`/summon`) or read with its chunk: simulated like those
+    /// of the blocks, with the velocity (`Motion`, component beyond 10 read as 0), the fuse (`fuse`,
+    /// a short, 80), power (`explosion_power`, 0 to 128) and block (`block_state`) of the TNT or
+    /// the state (`BlockState`, sand by default and in place of air) and the duration (`Time`) of
+    /// the NBT.
     pub(crate) fn summon_sim_entity(&mut self, ty: &str, pos: [f64; 3], nbt: Option<&Nbt>) -> Option<i32> {
         let kind = match ty {
-            "minecraft:tnt" => EntKind::Tnt(nbt.and_then(|n| crate::nbtio::int(n, "fuse")).unwrap_or(80) as i32),
+            "minecraft:tnt" => {
+                EntKind::Tnt(nbt.and_then(|n| crate::nbtio::int(n, "fuse")).map_or(80, |f| i32::from(f as i16)))
+            }
             "minecraft:falling_block" => {
                 let sand = self.states.state_of(&self.data, &Nbt::String("minecraft:sand".into()))?;
                 let s = nbt
@@ -387,6 +481,9 @@ impl Server {
         };
         let vel = nbt.and_then(|n| crate::nbtio::motion(n.get("Motion"))).unwrap_or_default();
         let id = self.alloc_entity();
+        if let Some(n) = nbt {
+            self.load_portal_cooldown(id, n);
+        }
         let mut e = SimEntity::new(id, kind, pos, vel);
         e.on_ground = nbt.and_then(|n| n.get("OnGround")).is_some_and(|v| matches!(v, Nbt::Byte(1)));
         e.time = nbt.and_then(|n| crate::nbtio::int(n, "Time")).unwrap_or(0) as i32;
@@ -406,20 +503,23 @@ impl Server {
             }
             e.drop_item = flag("DropItem").unwrap_or(true);
             e.cancel_drop = flag("CancelDrop").unwrap_or(false);
-            e.fall = match nbt.and_then(|n| n.get("fall_distance")) {
-                Some(Nbt::Double(d)) => *d,
-                _ => 0.0,
-            };
+        } else {
+            e.power = nbt.and_then(|n| crate::nbtio::float(n, "explosion_power")).map_or(4.0, |p| p.clamp(0.0, 128.0));
+            let tnt = self.default_state("minecraft:tnt");
+            let block = nbt.and_then(|n| n.get("block_state")).and_then(|b| self.states.state_of(&self.data, b));
+            e.block = block.filter(|&s| s != tnt);
+            e.owner = nbt.and_then(|n| crate::nbtio::uuid(n.get("owner"))).and_then(|u| self.ent_of_uuid(u));
         }
+        e.fall = match nbt.and_then(|n| n.get("fall_distance")) {
+            Some(Nbt::Double(d)) => *d,
+            _ => 0.0,
+        };
         match kind {
             EntKind::Tnt(_) => self.add_entity_packet(&e, "minecraft:tnt", 0),
             EntKind::Falling(s) => self.add_entity_packet(&e, "minecraft:falling_block", s as i32),
         }
         if let EntKind::Tnt(fuse) = kind {
-            let _ = self.send(Event::Entity(EntityEvent::Data {
-                id,
-                values: vec![(8, rc_proto_v777::entity::Meta::Int(fuse))],
-            }));
+            let _ = self.send(Event::Entity(EntityEvent::Data { id, values: e.tnt_data(fuse) }));
         }
         self.bs.entities.list.push(e);
         Some(id)
@@ -431,7 +531,7 @@ impl Server {
     }
 
     /// Physics shared with the client (`rc_physics::body`), re-synced onto the entity.
-    pub(super) fn body_of(&self, e: &mut SimEntity) -> Box<Body> {
+    pub(crate) fn body_of(&self, e: &mut SimEntity) -> Box<Body> {
         let eye = if matches!(e.kind, EntKind::Tnt(_)) { 0.15 } else { 0.833 };
         let mut b = e
             .body
@@ -443,7 +543,7 @@ impl Server {
         b
     }
 
-    pub(super) fn put_body(e: &mut SimEntity, b: Box<Body>) {
+    pub(crate) fn put_body(e: &mut SimEntity, b: Box<Body>) {
         (e.pos, e.vel, e.on_ground) = (b.pos, b.vel, b.on_ground);
         e.body = Some(b);
     }
@@ -865,7 +965,7 @@ impl Server {
                 // the common explosion: damage, knockback, loot, packet (particles and sound).
                 self.game_event_src("minecraft:explode", c, Some(crate::mobs::recent::vibration::Src::Other), None);
                 // In water: state at the end of the previous tick, like the game.
-                self.tnt_explode(e.id, c, 4.0, e.owner, wet, e.used_portal);
+                self.tnt_explode(e.id, c, e.power, e.owner, wet, e.used_portal);
             }
         }
     }
@@ -876,6 +976,56 @@ impl Server {
         self.contact.ticking_sim = Some((e.id, Self::entity_box(e)));
         self.contact_triggers(from, e.pos, FALLING_SIZE / 2.0, FALLING_SIZE);
         self.contact.ticking_sim = None;
+    }
+
+    /// Primed TNT and falling blocks to write into the entity chunks, with the fields the game
+    /// saves (common part, then fuse, block and power of the TNT, or state, duration and flags of
+    /// the falling block). Never saved before: lost on reload.
+    pub(crate) fn sim_entities_into_chunks(&self, by_chunk: &mut std::collections::BTreeMap<(i32, i32), Vec<Nbt>>) {
+        let dbl = |v: [f64; 3]| Nbt::List(v.iter().map(|&x| Nbt::Double(x)).collect());
+        let flag = |b: bool| Nbt::Byte(i8::from(b));
+        for e in self.bs.entities.list.iter().filter(|e| !e.removed) {
+            let c = ((e.pos[0].floor() as i32) >> 4, (e.pos[2].floor() as i32) >> 4);
+            let id = if matches!(e.kind, EntKind::Tnt(_)) { "minecraft:tnt" } else { "minecraft:falling_block" };
+            let cooldown = self.portal_cooldown(e.id);
+            let mut f: Vec<(String, Nbt)> = vec![
+                ("id".into(), Nbt::String(id.into())),
+                ("Pos".into(), dbl(e.pos)),
+                ("Motion".into(), dbl(e.vel)),
+                ("Rotation".into(), Nbt::List(vec![Nbt::Float(0.0), Nbt::Float(0.0)])),
+                ("fall_distance".into(), Nbt::Double(e.fall)),
+                ("Fire".into(), Nbt::Short(0)),
+                ("Air".into(), Nbt::Short(300)),
+                ("OnGround".into(), flag(e.on_ground)),
+                ("Invulnerable".into(), flag(false)),
+                ("PortalCooldown".into(), Nbt::Int(cooldown)),
+                ("UUID".into(), Nbt::IntArray(vec![0x5332_0001, 0, 0, e.id])),
+            ];
+            match e.kind {
+                EntKind::Tnt(fuse) => {
+                    f.push(("fuse".into(), Nbt::Short(fuse as i16)));
+                    let block = e.block.unwrap_or_else(|| self.default_state("minecraft:tnt"));
+                    f.push(("block_state".into(), self.state_nbt(block)));
+                    if e.power != 4.0 {
+                        f.push(("explosion_power".into(), Nbt::Float(e.power)));
+                    }
+                    if let Some(u) = e.owner.and_then(|o| self.ent_uuid_of(o)) {
+                        f.push(("owner".into(), crate::nbtio::uuid_nbt(u)));
+                    }
+                }
+                EntKind::Falling(s) => {
+                    let (per, max) = e.hurt.unwrap_or((0.0, 40));
+                    f.push(("BlockState".into(), self.state_nbt(s)));
+                    f.push(("Time".into(), Nbt::Int(e.time)));
+                    f.push(("DropItem".into(), flag(e.drop_item)));
+                    f.push(("HurtEntities".into(), flag(e.hurt.is_some())));
+                    f.push(("FallHurtAmount".into(), Nbt::Float(per)));
+                    f.push(("FallHurtMax".into(), Nbt::Int(max)));
+                    f.push(("CancelDrop".into(), flag(e.cancel_drop)));
+                }
+            }
+            by_chunk.entry(c).or_default().push(Nbt::Compound(f));
+        }
     }
 
     /// TNT block blown up by an explosion: primed with a short fuse (10 to 29 ticks).
@@ -903,6 +1053,27 @@ impl Server {
         blocklike: bool,
     ) {
         let by_mob = matches!(by, Some(crate::mobs::mob::Ent::Mob(_)));
+        self.objects_blast(center, radius, exclude, blocklike, Some((ty, by_mob)), 1.0);
+        // Paintings, frames, armor stands, cushions.
+        self.deco_explosion(center, radius, by, direct_wet, blocklike);
+    }
+
+    /// Knockback alone of a burst (wind) on the same non-living entities, × `mult`.
+    pub(crate) fn blast_push_objects(&mut self, center: [f64; 3], radius: f32, mult: f64, blocklike: bool) {
+        self.objects_blast(center, radius, None, blocklike, None, mult);
+    }
+
+    /// Blast on primed TNT, falling blocks, items on the ground (`blocklike`) and orbs: damage
+    /// of `hurt` (type, author is a mob) if any, knockback × `mult`.
+    fn objects_blast(
+        &mut self,
+        center: [f64; 3],
+        radius: f32,
+        exclude: Option<i32>,
+        blocklike: bool,
+        hurt: Option<(&str, bool)>,
+        mult: f64,
+    ) {
         let double = f64::from(radius * 2.0);
         // Relative distance, direction (from `origin`) and visible part.
         let blast = |s: &Server, pos: [f64; 3], origin: [f64; 3], b: &Aabb| -> Option<(f64, [f64; 3], f64)> {
@@ -911,9 +1082,7 @@ impl Server {
             if dist > 1.0 {
                 return None;
             }
-            let mut dir = [origin[0] - center[0], origin[1] - center[1], origin[2] - center[2]];
-            let l = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
-            dir = if l < 1.0e-4 { [0.0; 3] } else { dir.map(|v| v / l) };
+            let dir = crate::mobs::mth::normalize([origin[0] - center[0], origin[1] - center[1], origin[2] - center[2]]);
             Some((dist, dir, f64::from(s.seen_percent(center, b))))
         };
         let damage = |dist: f64, exposure: f64| {
@@ -932,12 +1101,13 @@ impl Server {
             else {
                 continue;
             };
-            let kb = dir.map(|v| v * (1.0 - dist) * exposure);
+            let kp = (1.0 - dist) * exposure * mult;
+            let kb = dir.map(|v| v * kp);
             let e = &mut self.bs.entities.list[i];
             e.vel = [e.vel[0] + kb[0], e.vel[1] + kb[1], e.vel[2] + kb[2]];
             e.track.needs_sync = true;
-            // The falling block registers the hit (velocity returned right away); the TNT does not.
-            e.track.sync_velocity |= !tnt;
+            // The falling block registers a hit (velocity returned right away); the TNT does not.
+            e.track.sync_velocity |= !tnt && hurt.is_some();
         }
         // Only the item on the ground escapes the blast when neither the rule nor the explosion touch
         // the blocks; the falling block and the orb always take it.
@@ -953,10 +1123,11 @@ impl Server {
             else {
                 continue;
             };
-            let hurt = self.item_hurt(id, ty, damage(dist, exposure), by_mob);
-            let kb = dir.map(|v| v * (1.0 - dist) * exposure);
+            let hit = hurt.is_some_and(|(ty, by_mob)| self.item_hurt(id, ty, damage(dist, exposure), by_mob));
+            let kp = (1.0 - dist) * exposure * mult;
+            let kb = dir.map(|v| v * kp);
             if let Some(d) = self.life.drops.iter_mut().find(|d| d.id == id && !d.is_removed()) {
-                d.push_sync(kb, hurt);
+                d.push_sync(kb, hit);
             }
         }
         let orbs: Vec<(i32, [f64; 3])> =
@@ -968,14 +1139,13 @@ impl Server {
             else {
                 continue;
             };
-            let hurt = self.orb_hurt(id, damage(dist, exposure));
-            let kb = dir.map(|v| v * (1.0 - dist) * exposure);
+            let hit = hurt.is_some() && self.orb_hurt(id, damage(dist, exposure));
+            let kp = (1.0 - dist) * exposure * mult;
+            let kb = dir.map(|v| v * kp);
             if let Some(o) = self.life.orbs.iter_mut().find(|o| o.id == id && !o.is_removed()) {
-                o.push_sync(kb, hurt);
+                o.push_sync(kb, hit);
             }
         }
-        // Paintings, frames, armor stands, cushions.
-        self.deco_explosion(center, radius, by, direct_wet, blocklike);
     }
 
     /// Entities that trigger blocks (plates, tripwire) whose box touches `b`; `living`:
@@ -1576,18 +1746,93 @@ impl Server {
     /// generated chunk).
     pub(crate) fn register_chunk_tickers(&mut self, ch: (i32, i32)) {
         let Some(Some(c)) = self.chunks.get(&ch) else { return };
-        let found: Vec<(P, LoadedBe)> = c
-            .block_entities
-            .iter()
-            .map(|b| {
-                let i = |k: &str| crate::nbtio::int(b, k).unwrap_or(0) as i32;
-                let id = b.get("id").and_then(Nbt::as_str).unwrap_or("");
-                ([i("x"), i("y"), i("z")], LoadedBe::of(id, i("TransferCooldown")))
-            })
-            .collect();
+        let mut found: Vec<(P, LoadedBe)> = Vec::with_capacity(c.block_entities.len());
+        let mut packed: Vec<P> = Vec::new();
+        for b in &c.block_entities {
+            // One pass over the fields (before: one search per field read).
+            let Nbt::Compound(fields) = b else { continue };
+            let (mut p, mut id, mut cooldown, mut keep) = ([0; 3], "", 0, false);
+            let int = |v: &Nbt| v.as_i64().unwrap_or(0) as i32;
+            for (k, v) in fields {
+                match k.as_str() {
+                    "x" => p[0] = int(v),
+                    "y" => p[1] = int(v),
+                    "z" => p[2] = int(v),
+                    "id" => id = v.as_str().unwrap_or(""),
+                    "TransferCooldown" => cooldown = int(v),
+                    "keepPacked" => keep = int(v) != 0,
+                    _ => {}
+                }
+            }
+            if keep {
+                packed.push(p);
+            } else {
+                found.push((p, LoadedBe::of(id, cooldown)));
+            }
+        }
         let at: Vec<P> = found.iter().map(|f| f.0).collect();
         for k in chunk_be_order(&at) {
             let (p, be) = found[k];
+            self.register_loaded_ticker(p, be);
+        }
+        // L9-TICK: the packed ones wait for the chunk to tick (before, registered with the rest).
+        if !packed.is_empty() {
+            let order: Vec<P> = java_hash_order(&packed).into_iter().map(|k| packed[k]).collect();
+            self.bs.packed.insert(ch, order);
+        }
+        self.promote_packed_near(ch);
+    }
+
+    /// L9-TICK: chunks around `ch` (itself included) holding packed block entities and whose
+    /// 3 × 3 neighbourhood is now loaded: the chunk can tick, so like the game it promotes them,
+    /// in the order of their table, after every block entity registered so far; promoted, a
+    /// block entity is saved unpacked. A save promotes them too (`promote_packed_for_save`).
+    /// Not modelled: the game also promotes one as soon as anything reads it (a hopper pulling
+    /// from it, a comparator) before its chunk can tick.
+    fn promote_packed_near(&mut self, ch: (i32, i32)) {
+        if self.bs.packed.is_empty() {
+            return;
+        }
+        let loaded = |s: &Self, c: (i32, i32)| matches!(s.chunks.get(&c), Some(Some(_)));
+        for c in (-1..=1).flat_map(|dx| (-1..=1).map(move |dz| (ch.0 + dx, ch.1 + dz))) {
+            if !self.bs.packed.contains_key(&c)
+                || !(-1..=1).all(|dx| (-1..=1).all(|dz| loaded(self, (c.0 + dx, c.1 + dz))))
+            {
+                continue;
+            }
+            let list = self.bs.packed.remove(&c).unwrap_or_default();
+            self.promote_packed(c, list);
+        }
+    }
+
+    /// L9-TICK: a chunk about to be written promotes its packed block entities still waiting,
+    /// like the game, whose save reads every block entity of the chunk (each one then registers
+    /// its ticker and is written unpacked), in the order of `java_save_order`.
+    pub(crate) fn promote_packed_for_save(&mut self, ch: (i32, i32)) {
+        let Some(list) = self.bs.packed.remove(&ch) else { return };
+        let Some(Some(c)) = self.chunks.get(&ch) else { return };
+        let pos = |b: &Nbt| {
+            let i = |k: &str| crate::nbtio::int(b, k).unwrap_or(0) as i32;
+            [i("x"), i("y"), i("z")]
+        };
+        let total = c.block_entities.iter().map(pos).collect::<hashbrown::HashSet<P>>().len();
+        let order: Vec<P> = java_save_order(&list, total).into_iter().map(|k| list[k]).collect();
+        self.promote_packed(ch, order);
+    }
+
+    /// Promotes the packed block entities `list` of chunk `c`, in that order.
+    fn promote_packed(&mut self, c: (i32, i32), list: Vec<P>) {
+        for p in list {
+            let Some(Some(chunk)) = self.chunks.get_mut(&c) else { break };
+            let pos_of = |b: &Nbt| {
+                let i = |k: &str| crate::nbtio::int(b, k).unwrap_or(0) as i32;
+                [i("x"), i("y"), i("z")] == p
+            };
+            // Still the packed entry (a block entity put there since then registered its own).
+            let Some(b) = chunk.block_entities.iter_mut().find(|b| pos_of(b) && is_packed(b)) else { continue };
+            crate::nbtio::set(b, "keepPacked", Nbt::Byte(0));
+            let id = b.get("id").and_then(Nbt::as_str).unwrap_or("");
+            let be = LoadedBe::of(id, crate::nbtio::int(b, "TransferCooldown").unwrap_or(0) as i32);
             self.register_loaded_ticker(p, be);
         }
     }

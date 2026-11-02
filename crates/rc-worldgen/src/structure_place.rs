@@ -612,6 +612,9 @@ pub fn place_template(
         }
         let prev = if s.waterlog { Some(r.get_p(bi.pos)) } else { None };
         let state = tr.apply(bi.state, s.mirror, s.rot);
+        if bi.nbt.is_some() {
+            r.log_barrier(bi.pos);
+        }
         if !r.set_p(bi.pos, state, flags) {
             continue;
         }

@@ -72,23 +72,26 @@ impl Notice {
             _ => None,
         });
         area.set_scroll(old.unwrap_or(0.0), area_h);
-        let total = 9 + 8 + (area_h + 24) + 8 + 17 + 8 + 20;
-        let top = (h - total) / 2;
-        self.title_y = top;
-        let check_y = top + 9 + 8 + area_h + 24 + 8;
         let mut label = chars(&check);
+        let mut dots = rc_text::CharStyle::default();
         if self.kind == NoticeKind::Multiplayer {
+            dots.color = Some(SAFETY_CHECK_COLOR);
             for c in &mut label {
                 c.style.color.get_or_insert(SAFETY_CHECK_COLOR);
             }
         }
-        let cw = 17 + 4 + rc_text::width(m, &label);
-        let checked = self.panel.get(CHECK).is_some_and(|c| matches!(c.kind, Kind::Checkbox { checked: true }));
-        let by = check_y + 17 + 8;
+        let checked = self.panel.get(CHECK).is_some_and(|c| matches!(c.kind, Kind::Checkbox { checked: true, .. }));
+        let mut cb = Widget::checkbox(m, CHECK, (0, 0), checked, label, None, &dots);
+        let total = 9 + 8 + (area_h + 24) + 8 + cb.h + 8 + 20;
+        let top = (h - total) / 2;
+        self.title_y = top;
+        let check_y = top + 9 + 8 + area_h + 24 + 8;
+        (cb.x, cb.y) = ((w - cb.w) / 2, check_y);
+        let by = check_y + cb.h + 8;
         let (keyboard, focus) = (self.panel.keyboard, self.panel.focus);
         self.panel = Panel::new(vec![
             Widget::new(MESSAGE, Kind::TextArea(Box::new(area)), (w - area_w) / 2, top + 9 + 8 + 12, area_w, area_h, Vec::new()),
-            Widget::new(CHECK, Kind::Checkbox { checked }, (w - cw) / 2, check_y, cw, 17, label),
+            cb,
             Widget::button(ACCEPT, w / 2 - 154, by, 150, &yes),
             Widget::button(REFUSE, w / 2 + 4, by, 150, &no),
         ]);
@@ -98,7 +101,7 @@ impl Notice {
 
     /// Button pressed: (accepted, checkbox ticked).
     pub fn handle(&mut self, events: &[Event]) -> Option<Answer> {
-        let checked = self.panel.get(CHECK).is_some_and(|c| matches!(c.kind, Kind::Checkbox { checked: true }));
+        let checked = self.panel.get(CHECK).is_some_and(|c| matches!(c.kind, Kind::Checkbox { checked: true, .. }));
         events.iter().find_map(|e| match e {
             Event::Press(ACCEPT) => Some((true, checked)),
             Event::Press(REFUSE) => Some((false, checked)),

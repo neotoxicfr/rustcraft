@@ -3,7 +3,7 @@
 //! jump, movement, push), body rotation; then the tick of the world's mobs.
 
 use super::goals::max_head_y;
-use super::mob::{Mob, MoveOp};
+use super::mob::{Ent, Mob, MoveOp};
 use super::mth::{DEG, degrees_difference, pitch_to, rotate_if_necessary, rotate_towards, rotlerp_360, yaw_to};
 use super::species::Kind;
 use crate::server::Server;
@@ -837,6 +837,8 @@ impl Server {
             m.head_yaw = rotate_if_necessary(m.head_yaw, m.body_yaw, max_head_y(m.kind));
             m.body.last_stable_head = m.head_yaw;
             m.body.head_stable_time = 0;
+        } else if matches!(m.mount.passengers.first(), Some(Ent::Mob(_))) {
+            // Standing still with a mob as first passenger: the body keeps its rotation.
         } else if (m.head_yaw - m.body.last_stable_head).abs() > 15.0 {
             m.body.head_stable_time = 0;
             m.body.last_stable_head = m.head_yaw;

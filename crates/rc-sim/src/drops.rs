@@ -914,10 +914,12 @@ impl Server {
         }
     }
 
-    /// Ground items and experience orbs read with a chunk: made live (pickable, simulated).
+    /// Ground items, experience orbs, primed TNT and falling blocks read with a chunk: made live
+    /// (pickable, simulated).
     pub(crate) fn adopt_items(&mut self, loaded: &[(i32, i32)]) {
         use rc_proto::nbt::Nbt;
-        const KINDS: [&str; 2] = ["minecraft:item", "minecraft:experience_orb"];
+        const KINDS: [&str; 4] =
+            ["minecraft:item", "minecraft:experience_orb", "minecraft:tnt", "minecraft:falling_block"];
         for p in loaded {
             let Some(list) = self.entities.get_mut(p) else { continue };
             type Ents = Vec<(i32, Nbt)>;
@@ -931,9 +933,16 @@ impl Server {
             self.life.drop_chunks.insert(*p);
             for (_, e) in items {
                 // G5-F05: orb (value, count, age, health, fire, speed as the game reads them).
-                if e.get("id").and_then(Nbt::as_str) == Some(KINDS[1]) {
+                let id = e.get("id").and_then(Nbt::as_str).unwrap_or_default();
+                if id == KINDS[1] {
                     let pos = crate::nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
                     self.summon_orb(pos, Some(&e));
+                    continue;
+                }
+                if id == KINDS[2] || id == KINDS[3] {
+                    let pos = crate::nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
+                    let id = id.to_owned();
+                    self.summon_sim_entity(&id, pos, Some(&e));
                     continue;
                 }
                 let Some(stack) = e.get("Item").and_then(Stack::from_nbt) else { continue };
@@ -1006,6 +1015,7 @@ impl Server {
                 ("UUID".into(), Nbt::IntArray(uuid.to_vec())),
             ]));
         }
+        self.sim_entities_into_chunks(&mut by_chunk); // G4-F08: primed TNT, falling blocks
         self.mobs_into_chunks(&mut by_chunk); // S4: mobs
         self.projectiles_into_chunks(&mut by_chunk); // S8: projectiles, clouds
         self.carts_into_chunks(&mut by_chunk); // G5-F06: minecarts
