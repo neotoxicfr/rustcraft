@@ -10,6 +10,7 @@ use super::{Dir, JavaMap, Kind, P, above, flag, rel, rel_n};
 use crate::mobs::mob::Mob;
 use crate::server::Server;
 use rc_physics::Aabb;
+use rc_physics::body::Heft;
 use rc_physics::piston::{BodyTarget, Moving, PistonTarget, Sweep, carry_stuck, push_collided};
 
 /// Mob pushed by a piston (`move(PISTON)`: movement with server collisions).
@@ -52,6 +53,34 @@ impl PistonTarget for MobTarget<'_> {
             }
             self.s.mob_move(self.m, d);
         }
+    }
+}
+
+/// Something attached to a block (frame, painting, knot, cushion) in the piston's way: the first
+/// non-zero push kills it and drops its item; never on the ground, never launched visibly.
+struct AttachedTarget<'a> {
+    s: &'a mut Server,
+    id: i32,
+    b: Aabb,
+    pos: [f64; 3],
+}
+
+impl PistonTarget for AttachedTarget<'_> {
+    fn bbox(&self) -> Aabb {
+        self.b
+    }
+    fn position(&self) -> [f64; 3] {
+        self.pos
+    }
+    fn grounded(&self) -> bool {
+        false
+    }
+    fn supported_by(&self, _: [i32; 3]) -> bool {
+        false
+    }
+    fn launch(&mut self, _: usize, _: f64) {}
+    fn piston_push(&mut self, d: [f64; 3]) {
+        self.s.deco_attached_moved(self.id, d);
     }
 }
 
@@ -292,9 +321,9 @@ impl Server {
     }
 
     /// Entities touched by the moving block at `p` going to `next`: pushed by the
-    /// swept area (mobs, items, orbs, primed TNT, falling blocks), then dragged
-    /// by honey. The player is pushed by their client, which replays the piston. Projectiles and
-    /// vehicles: not yet (`docs/gaps-protocol.md`).
+    /// swept area (mobs, items, orbs, primed TNT, falling blocks; what hangs on a block falls),
+    /// then dragged by honey. The player is pushed by their client, which replays the piston.
+    /// Projectiles, vehicles, armor stands and mannequins: not yet (`docs/gaps-protocol.md`).
     fn mover_push_entities(&mut self, p: P, m: &Moving, next: f32) {
         let sweep = self.phys.piston_sweep(p, m, next);
         let carry = self.phys.honey_carry(p, m, next);
@@ -338,26 +367,34 @@ impl Server {
             for e in ents.iter_mut().filter(|e| !e.removed) {
                 let mut b = self.body_of(e);
                 if b.bounding_box().intersects(&area) {
-                    apply(&mut BodyTarget { b: &mut b, w: &w, t: &self.phys, time, g: 0.04 });
+                    apply(&mut BodyTarget { b: &mut b, w: &w, t: &self.phys, time, k: Heft::BLOCK });
                 }
                 Self::put_body(e, b);
             }
             for d in drops.iter_mut().filter(|d| !d.is_removed() && d.body.bounding_box().intersects(&area)) {
                 let b = &mut d.body;
                 (b.pos, b.vel, b.on_ground) = (d.pos, d.vel, d.on_ground);
-                apply(&mut BodyTarget { b, w: &w, t: &self.phys, time, g: 0.04 });
+                apply(&mut BodyTarget { b, w: &w, t: &self.phys, time, k: Heft::ITEM });
                 (d.pos, d.vel, d.on_ground) = (d.body.pos, d.body.vel, d.body.on_ground);
             }
             for o in orbs.iter_mut().filter(|o| !o.is_removed() && o.body.bounding_box().intersects(&area)) {
                 let b = &mut o.body;
                 (b.pos, b.vel, b.on_ground) = (o.pos, o.vel, o.on_ground);
-                apply(&mut BodyTarget { b, w: &w, t: &self.phys, time, g: 0.03 });
+                apply(&mut BodyTarget { b, w: &w, t: &self.phys, time, k: Heft::ORB });
                 (o.pos, o.vel, o.on_ground) = (o.body.pos, o.body.vel, o.body.on_ground);
             }
         }
         self.life.drops = drops;
         self.life.orbs = orbs;
         self.bs.entities.list = ents;
+        // Decorations attached to a block (armor stands and mannequins: not yet).
+        for (id, _) in self.deco_touching(&area, true) {
+            let Some((b, pos)) = self.deco_nbt(id).and_then(|e| Some((self.deco_box(e)?, crate::nbtio::f64s::<3>(e.get("Pos"))?)))
+            else {
+                continue;
+            };
+            apply(&mut AttachedTarget { s: self, id, b, pos });
+        }
     }
 
     /// Tick of the moving block (block entity phase).

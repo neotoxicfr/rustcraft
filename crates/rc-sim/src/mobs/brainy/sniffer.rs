@@ -3,7 +3,7 @@
 //! 120 ticks after digging starts, sniffer egg on breeding.
 
 use super::super::jrand::JRand;
-use super::super::mob::Mob;
+use super::super::mob::{Ent, Mob};
 use super::super::villager::brain::{DimKey, GPos};
 use super::brain::*;
 use crate::player::Stack;
@@ -162,11 +162,14 @@ pub fn search_continue(s: &mut Server, m: &mut Mob, b: &mut Brain) -> bool {
     }
 }
 
-/// 5 position tries on the ground (10 + 2i, height 3), block below.
+/// 5 position tries on the ground (10 + 2i, height 3) inside the world border, block below.
 pub fn dig_position(s: &mut Server, m: &mut Mob, b: &Brain) -> Option<[i32; 3]> {
     for i in 0..5 {
         let Some(p) = s.land_random_pos(m, 10 + 2 * i, 3) else { continue };
         let bp = super::super::mth::block_of(p);
+        if !Server::block_in_border(s.border_bounds(), bp) {
+            continue;
+        }
         let below = [bp[0], bp[1] - 1, bp[2]];
         if diggable(s, m, b, below) {
             return Some(below);
@@ -185,9 +188,16 @@ pub fn store_explored(s: &Server, m: &Mob, b: &mut Brain) {
     b.mem.explored.set(list);
 }
 
-/// Before the common tick: seed dropped at the scheduled tick during digging.
+/// Before the common tick, during digging: the action event at the head every 10 ticks, then
+/// the seed dropped at the scheduled tick.
 pub fn pre_tick(s: &mut Server, m: &mut Mob) {
-    if m.bm.sniffer == DIGGING && m.bm.drop_seed_at == m.tick_count {
+    if m.bm.sniffer != DIGGING {
+        return;
+    }
+    if m.tick_count % 10 == 0 {
+        s.game_event_block("minecraft:entity_action", head_block(m), Some(Ent::Mob(m.id)), None);
+    }
+    if m.bm.drop_seed_at == m.tick_count {
         let h = head_block(m);
         let drops = s.simple_loot("minecraft:gameplay/sniffer_digging", None);
         for d in drops {

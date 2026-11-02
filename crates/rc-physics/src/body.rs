@@ -20,6 +20,22 @@ fn f(x: f32) -> f64 {
 /// completed segment).
 pub type Move = ([f64; 3], [f64; 3], Option<[f64; 3]>);
 
+/// Constants of a body moved by something else (piston, opening shulker): its gravity and the
+/// offset under its feet of the block that slows it (items and orbs read it almost one block
+/// down, primed TNT and falling blocks half a block down, like their own tick).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Heft {
+    pub g: f64,
+    pub slow_h: f32,
+}
+
+impl Heft {
+    pub const ITEM: Heft = Heft { g: 0.04, slow_h: 0.999_999 };
+    pub const ORB: Heft = Heft { g: 0.03, slow_h: 0.999_999 };
+    /// Primed TNT and falling block.
+    pub const BLOCK: Heft = Heft { g: 0.04, slow_h: 0.500_001 };
+}
+
 /// Player that an orb can follow: identifier, feet, eye height, spectator, dying.
 #[derive(Debug, Clone, Copy)]
 pub struct Follow {
@@ -209,10 +225,10 @@ impl Body {
     /// Piston push (`move(PISTON, d)`) at game tick `time`: cap of 0.51 per axis
     /// and per tick, blocking cancelled without reducing the push; then effects of the blocks crossed by
     /// this movement alone, which is not kept for the tick (the last one recorded is removed).
-    /// `w` must ignore the pushing block in its direction. Items and orbs: `base_g` gravity of
-    /// the entity (0.04, 0.03), air friction 0.98, slowing block at 0.999999.
-    pub fn piston_move(&mut self, d: [f64; 3], time: i64, w: &dyn World, t: &Tables, base_g: f64) {
-        let (g, drag, slow_h) = (self.gravity(base_g), 0.98, 0.999_999);
+    /// `w` must ignore the pushing block in its direction. `k`: gravity and slowing block of the
+    /// kind; air friction 0.98.
+    pub fn piston_move(&mut self, d: [f64; 3], time: i64, w: &dyn World, t: &Tables, k: Heft) {
+        let (g, drag, slow_h) = (self.gravity(k.g), 0.98, k.slow_h);
         let from = self.pos;
         if self.no_physics {
             for (p, v) in self.pos.iter_mut().zip(d) {
@@ -230,6 +246,15 @@ impl Body {
         self.old = from;
         self.block_effects(w, t, false);
         (self.moves, self.last_moves, self.old) = (moves, last, old);
+    }
+
+    /// Push by another entity (a shulker opening into it): an ordinary movement, not a piston
+    /// one: multiplied by the slowdown of the tick, with collisions, and recorded for the block
+    /// effects of the next tick. A body without physics is left in place (the game skips it).
+    pub fn shove(&mut self, d: [f64; 3], w: &dyn World, t: &Tables, k: Heft) {
+        if !self.no_physics {
+            self.move_delta(d, w, t, self.gravity(k.g), 0.98, k.slow_h, false);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

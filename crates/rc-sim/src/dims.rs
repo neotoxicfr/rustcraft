@@ -377,6 +377,19 @@ impl Server {
         self.dims.entered_nether = nbtio::f64s::<3>(root.get("entered_nether_pos"));
     }
 
+    /// Portal return delay of the simulated entity `id`, as written in its NBT.
+    pub(crate) fn portal_cooldown(&self, id: i32) -> i32 {
+        self.dims.ents.get(&id).map_or(0, |p| p.cooldown)
+    }
+
+    /// `PortalCooldown` of an entity read from its NBT (chunk or summon): a running delay is
+    /// restored under its new identifier, the game reads it for every entity.
+    pub(crate) fn load_portal_cooldown(&mut self, id: i32, e: &Nbt) {
+        if let Some(cd) = nbtio::int(e, "PortalCooldown").filter(|&v| v > 0) {
+            self.dims.ents.insert(id, EntPortal { cooldown: cd as i32, proc: None });
+        }
+    }
+
     /// "Portals" fields written in the player file.
     pub(crate) fn dims_player_nbt(&self, root: &mut Nbt) {
         nbtio::set(root, "PortalCooldown", Nbt::Int(self.dims.player.cooldown));

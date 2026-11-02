@@ -213,6 +213,8 @@ impl Server {
         };
         self.fangs_pair(&mut f);
         self.mobs.ill.fangs.push(f);
+        let src = Some(crate::mobs::recent::vibration::Src::Living(Ent::Mob(m.id)));
+        self.game_event_src("minecraft:entity_place", pos, src, None);
     }
 
     /// Announces the fangs to the client. Only the entity itself: the bite event is never sent
@@ -336,7 +338,7 @@ impl Server {
 
     /// Launch of the evoker's summoning spell: 3 vexes at ±2 blocks, one block higher, life of
     /// 30 to 119 s (evoker's random).
-    fn summon_vexes(&mut self, m: &mut Mob) {
+    pub(crate) fn summon_vexes(&mut self, m: &mut Mob) {
         let b = m.block_pos();
         for _ in 0..3 {
             let dx = -2 + m.rng.next_int_bound(5);
@@ -352,7 +354,12 @@ impl Server {
             v.ill.owner_id = Some(m.id);
             v.ill.bound = Some(p);
             v.ill.life = Some(20 * (30 + m.rng.next_int_bound(90)));
+            // The evoker's scoreboard team, if any, before the vex enters the world.
+            if let Some(team) = self.cmd.scores.team_of(&crate::nbtio::uuid_text(m.uuid)).map(|t| t.name.clone()) {
+                self.cmd.scores.join_team(&crate::nbtio::uuid_text(v.uuid), &team);
+            }
             self.add_mob(v);
+            self.game_event_block("minecraft:entity_place", p, Some(Ent::Mob(m.id)), None);
         }
     }
 }

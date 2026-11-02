@@ -720,6 +720,50 @@ impl Server {
         }
     }
 
+    // ---------- Pushes (shulker, piston) ----------
+
+    /// Decorations whose box touches `area`, with their kind; none when there is none (no
+    /// allocation on the usual path).
+    pub(crate) fn deco_touching(&self, area: &Aabb, attached_only: bool) -> Vec<(i32, DKind)> {
+        if self.deco.live.is_empty() {
+            return Vec::new();
+        }
+        self.deco
+            .live
+            .iter()
+            .filter(|l| !l.removed && (!attached_only || l.kind.attached()))
+            .filter(|l| self.deco_nbt(l.id).and_then(|e| self.deco_box(e)).is_some_and(|b| b.intersects(area)))
+            .map(|l| (l.id, l.kind))
+            .collect()
+    }
+
+    /// A non-zero move given to something attached to a block: it dies and drops its item
+    /// (a fixed frame does not move). True if it fell.
+    pub(crate) fn deco_attached_moved(&mut self, id: i32, d: [f64; 3]) -> bool {
+        if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= 0.0 {
+            return false;
+        }
+        let Some(e) = self.deco_nbt(id).cloned() else { return false };
+        match kind_of(&e) {
+            Some(k) if k.frame() && flag(&e, "Fixed") => false,
+            Some(k) if k.attached() => self.attached_kill_by(id, &e, None),
+            _ => false,
+        }
+    }
+
+    /// An opening shulker's push on the decorations touching `area`: what hangs on a block
+    /// falls with its item, an armor stand or a mannequin is moved with its collisions (a
+    /// marker or weightless stand has no physics and stays).
+    pub(crate) fn deco_shove(&mut self, area: &Aabb, d: [f64; 3]) {
+        for (id, k) in self.deco_touching(area, false) {
+            if k.attached() {
+                self.deco_attached_moved(id, d);
+            } else {
+                self.living_shove(id, d);
+            }
+        }
+    }
+
     // ---------- Player ----------
 
     /// Item that places an entity, used on a block; true if the item is one

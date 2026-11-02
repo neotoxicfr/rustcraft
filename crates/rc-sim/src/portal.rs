@@ -1620,10 +1620,7 @@ impl Server {
                     EntKind::Falling(st) => s.add_entity_packet(&copy, "minecraft:falling_block", st as i32),
                     EntKind::Tnt(fuse) => {
                         s.add_entity_packet(&copy, "minecraft:tnt", 0);
-                        let _ = s.send(Event::Entity(EntityEvent::Data {
-                            id: copy.id,
-                            values: vec![(8, rc_proto_v777::entity::Meta::Int(fuse))],
-                        }));
+                        let _ = s.send(Event::Entity(EntityEvent::Data { id: copy.id, values: copy.tnt_data(fuse) }));
                     }
                 }
                 s.muted = muted;

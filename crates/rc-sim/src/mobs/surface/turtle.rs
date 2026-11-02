@@ -95,13 +95,14 @@ pub fn travel_in_water(s: &mut Server, m: &mut Mob) {
     }
 }
 
-/// End of the AI step: sand particles while laying.
+/// End of the AI step: sand particles and the action event while laying.
 pub fn post_ai_step(s: &mut Server, m: &mut Mob) {
     if m.alive() && m.surf.laying && m.surf.lay_counter >= 1 && m.surf.lay_counter % 5 == 0 {
         let p = m.block_pos();
         if on_sand(s, p) {
             let below = s.st([p[0], p[1] - 1, p[2]]);
             s.level_event(2001, p, below as i32);
+            s.mob_game_event(m, "minecraft:entity_action");
         }
     }
 }

@@ -15,7 +15,13 @@ use crate::server::Server;
 thread_local! {
     /// Tests: primed TNT explosions of this thread, (dimension, passed through a portal).
     pub(crate) static TNT_BLASTS: std::cell::RefCell<Vec<(String, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Tests: cells hit by each explosion of this thread.
+    pub(crate) static BLAST_CELLS: std::cell::RefCell<Vec<BlastCells>> = const { std::cell::RefCell::new(Vec::new()) };
 }
+
+/// Tests: centre of an explosion and the cells it hit.
+#[cfg(test)]
+pub(crate) type BlastCells = ([f64; 3], Vec<[i32; 3]>);
 
 /// Interaction of an explosion with blocks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,8 +36,9 @@ pub(crate) enum Blast {
     /// G5-F06: TNT minecart ("TNT" interaction); primed, it spares the rails and the block
     /// that carries them (zero resistance, never destroyed).
     TntCart { primed: bool },
-    /// None.
-    None,
+    /// None; true with the calculator of an entity that went through a portal (its portal
+    /// delay runs): the Nether portal neither resists nor counts as hit.
+    None(bool),
     /// Bed or respawn anchor ("block"); anchor in water: its cell resists like water,
     /// even empty (own calculator for the explosion of a respawn anchor).
     Respawn(Option<[i32; 3]>),
@@ -162,14 +169,14 @@ impl Server {
             }
             Blast::Block | Blast::Respawn(_) => (true, self.rule("minecraft:block_explosion_drop_decay", true)),
             Blast::Tnt(_) | Blast::TntCart { .. } => (true, self.rule("minecraft:tnt_explosion_drop_decay", false)),
-            Blast::None => (false, false),
+            Blast::None(_) => (false, false),
         };
         // Dropped items, orbs, falling blocks: touched if the mob rule allows it
         // or if the explosion destroys blocks.
         let blocklike =
             self.rule("minecraft:mob_griefing", true) || matches!(blast, Blast::Block | Blast::Tnt(_) | Blast::TntCart { .. });
         let rail_safe = matches!(blast, Blast::TntCart { primed: true });
-        let portal_immune = blast == Blast::Tnt(true);
+        let portal_immune = matches!(blast, Blast::Tnt(true) | Blast::None(true));
         let nether_portal = self.tb().block_id("nether_portal");
         // 1. Blocks hit.
         let mut toblow: Vec<[i32; 3]> = Vec::new();
@@ -221,6 +228,8 @@ impl Server {
         }
         // Order of a hash set of the game: the order only matters for the next shuffle.
         let count = toblow.len() as i32;
+        #[cfg(test)]
+        BLAST_CELLS.with_borrow_mut(|v| v.push((center, toblow.clone())));
         // 2. Entities. The author held out of the list (creeper, wither being ticked) stays
         // findable by identifier for the time of the damage (warden anger, gossip…).
         if let Some(s) = source {
@@ -325,7 +334,8 @@ impl Server {
         if griefing {
             // Beehives: emergency exit if the direct source is a TNT, a creeper, a wither skull,
             // the wither or a TNT minecart; bees angered after the breaking.
-            let hive_release = matches!(blast, Blast::Tnt(_) | Blast::TntCart { .. })
+            // (A TNT interaction from a mob, the sulfur cube, does not count.)
+            let hive_release = (source.is_none() && matches!(blast, Blast::Tnt(_) | Blast::TntCart { .. }))
                 || source.is_some_and(|m| matches!(m.kind, super::species::Kind::Creeper | super::species::Kind::Wither))
                 || self.prog.expl_cause_next == Some("minecraft:wither_skull");
             self.mobs.rng.shuffle(&mut toblow);

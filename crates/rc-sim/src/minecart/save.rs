@@ -86,7 +86,7 @@ impl Server {
             ("Air".into(), get("Air").unwrap_or(Nbt::Short(300))),
             ("OnGround".into(), byte(c.on_ground)),
             ("Invulnerable".into(), byte(c.invulnerable)),
-            ("PortalCooldown".into(), Nbt::Int(self.dims.ents.get(&c.id).map_or(0, |p| p.cooldown))),
+            ("PortalCooldown".into(), Nbt::Int(self.portal_cooldown(c.id))),
         ];
         if let Some(v) = get("invulnerable_time") {
             f.push(("invulnerable_time".into(), v));
@@ -188,9 +188,7 @@ impl Server {
         let mut c = Cart::new(kind, id, pos);
         c.load(self, e);
         // Portal return delay in progress.
-        if let Some(cd) = int(e, "PortalCooldown").filter(|&v| v > 0) {
-            self.dims.ents.insert(id, crate::dims::EntPortal { cooldown: cd as i32, proc: None });
-        }
+        self.load_portal_cooldown(id, e);
         // Passengers: simulated mobs adopted, the others kept as NBT.
         for p in list(e.get("Passengers")) {
             if p.get("id").and_then(Nbt::as_str).and_then(Kind::from_name).is_some() {

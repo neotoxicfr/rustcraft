@@ -431,6 +431,8 @@ impl Server {
     /// need the registries.
     pub(crate) fn mob_nbt(&self, m: &Mob) -> Nbt {
         let mut e = m.save();
+        // The live portal return delay (the one read is stale), written for every entity.
+        nbtio::set(&mut e, "PortalCooldown", Nbt::Int(self.portal_cooldown(m.id)));
         if let Some((reg, _, sound_reg)) = variant_regs(m.kind) {
             for (key, r, i) in [("variant", reg, m.variant), ("sound_variant", sound_reg, m.sound_variant)] {
                 if let Some(n) = self.regs.entries(r).get(i as usize) {

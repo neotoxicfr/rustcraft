@@ -950,7 +950,7 @@ impl Server {
                             6.0,
                             false,
                             "minecraft:explosion",
-                            super::super::explode::Blast::None,
+                            super::super::explode::Blast::None(false),
                         );
                         self.mobs.end.crystals[i].removed = true;
                     }

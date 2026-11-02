@@ -1148,6 +1148,11 @@ impl Server {
         reach: i32,
         max_len: f32,
     ) -> Option<Path> {
+        // Wall climber: the asked position is kept as is (before the chunk test and the
+        // surface adjustment), the one it heads for once its path is done.
+        if m.nav.climber {
+            m.nav.path_to = Some(target);
+        }
         if !self.chunks.get(&(target[0] >> 4, target[2] >> 4)).is_some_and(Option::is_some) {
             return None;
         }
@@ -1156,9 +1161,6 @@ impl Server {
         } else {
             self.surface_target(target)
         };
-        if m.nav.climber {
-            m.nav.path_to = Some(target);
-        }
         if m.pos[1] < f64::from(self.dim.height.min_y) || !Self::can_update_path(m) {
             return None;
         }

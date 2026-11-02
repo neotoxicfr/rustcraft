@@ -57,4 +57,28 @@ and the entities it simulates (items, orbs, TNT, falling blocks). Missing:
   prediction of their interpolation;
 - effects of the blocks crossed by a pushed mob (cobweb, berries, magma): to wire up with
   the mobs' block effects (G5-F02);
-- footstep sounds while the local player is pushed (the game emits them in the piston movement).
+- footstep sounds while the local player is pushed (the game emits them in the piston movement);
+- armor stands (except markers, ignored) and mannequins: the game moves them (a weightless stand
+  without collisions). What hangs on a block (frame, painting, knot, cushion) is handled: the
+  first non-zero push knocks it off with its item, a fixed frame excepted.
+
+The push of an opening shulker (G4-F08) moves the same entities, with an ordinary movement
+(slowdown of the tick applied, no caution at the edge), and the decorations: what hangs falls with
+its item (fixed frame excepted), armor stands and mannequins move with their collisions (markers and
+weightless stands have no physics). Same missing cases (projectiles, vehicles, player on the server
+side, interpolated entities on the client side). The server does not model the scale attribute of
+the shulker (size 1 there; the client scales its push). An armor stand or mannequin whose own tick
+does not run its tracking (immovable mannequin) is moved without the move being sent.
+
+## G. Vehicles and mob pushes (G4-F08, 02/11/2026)
+
+A mob pushes the minecarts it touches (the minecart's own rule: it moves aside, the mob gets a
+quarter; never its own rider), they count for the cramming, and a burning sulfur cube hurts them
+(the one it rides included), which destroys one in about 5 ticks. Boats and rafts are not simulated
+by the integrated server (`gaps-client.md`): neither pushed nor hurt. The cramming count still
+includes passengers (the game counts only the entities that ride nothing).
+
+`PortalCooldown`: read back and written for minecarts, primed TNT, falling blocks, mobs and
+projectiles. Dropped items and experience orbs write a reduced compound without it (nor `Air`,
+`Invulnerable`, `fall_distance`): an item that went through a portal and is saved during its delay
+can go back through at once on reload.

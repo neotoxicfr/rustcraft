@@ -51,7 +51,12 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// L9-TICK: a generated chunk resumes its scheduled ticks and registers its block entities'
 /// tickers (before: never during the session), the only cause of the change (checked by putting
 /// the old marking back: 521f08db…, 823 again); the mobs then end in other entity chunks.
-const EXPECTED_NEW: (&str, usize) = ("f555e6115b495c9a0e1244b16e0847f65dc6153ae21bd6f1018628e49a5de348", 800);
+/// G4-F08: fire-immune species may spawn in a fire cell like the game's (Nether entity chunks;
+/// before: 521f08db…, 823).
+/// G4-F08 resumption: mobs write their live `PortalCooldown` (the game writes it for every
+/// entity), the only cause of the change (without it: 360ac84c…, 807 again).
+// Lot 9 integration: all together.
+const EXPECTED_NEW: (&str, usize) = ("REMEASURE", 0);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 const EXPECTED_MODEL: &[(&str, &str, usize)] = &[(
     "790b2d94653a4243e68f2e0cb0ebc3f865f9f59815ed65149067cdd374c6b800",
@@ -202,7 +207,10 @@ fn run_new() -> Option<Vec<(String, String)>> {
 /// Lot 8 integration: both together.
 /// L9-TICK: generated chunks resume their ticks and register their tickers, the only cause of
 /// the change (old marking put back: a551d272…, 380 again).
-const EXPECTED_MECH: (&str, usize) = ("e1e96b39370f69f6f370fca86a920c506daf352a690b0c09be199109c1d4a0b9", 380);
+/// G4-F08 resumption: mobs write their live `PortalCooldown` (the game writes it for every
+/// entity), the only cause of the change (without it: a551d272…, 380 again).
+// Lot 9 integration: all together.
+const EXPECTED_MECH: (&str, usize) = ("REMEASURE", 0);
 
 /// Server command (refusal = failure: the rig would be incomplete).
 pub(crate) fn cmd(s: &mut Server, c: &str) {
@@ -349,7 +357,10 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 /// the change (old marking put back: 9c406245…, 1254 again). Same block chunks (514 of them now
 /// carry the resumed ticks or block entity states); 11 entity chunks fewer, the mobs ending
 /// elsewhere.
-const EXPECTED_REGIONS: (&str, usize) = ("b36cb2ab32bd343711b4580feac7cfe959c0b347ede3ec10fd135a4690377f41", 1243);
+/// G4-F08 resumption: mobs write their live `PortalCooldown` (the game writes it for every
+/// entity), the only cause of the change (without it: 9c406245… again).
+// Lot 9 integration: all together.
+const EXPECTED_REGIONS: (&str, usize) = ("REMEASURE", 0);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all
 /// dimensions): SHA-256 of the decompressed NBT per chunk. Sector locations and

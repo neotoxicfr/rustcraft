@@ -338,14 +338,14 @@ fn hostile(s: &Server, e: Ent) -> bool {
 
 impl Server {
     /// Entity of a UUID (player or simulated mob).
-    fn ent_of_uuid(&self, u: u128) -> Option<Ent> {
+    pub(crate) fn ent_of_uuid(&self, u: u128) -> Option<Ent> {
         if u == self.uuid {
             return Some(Ent::Player);
         }
         self.mobs.get_uuid(u).map(|o| Ent::Mob(o.id))
     }
 
-    fn ent_uuid_of(&self, e: Ent) -> Option<u128> {
+    pub(crate) fn ent_uuid_of(&self, e: Ent) -> Option<u128> {
         match e {
             Ent::Player => Some(self.uuid),
             Ent::Mob(id) => self.mob_ref(id).map(|o| o.uuid),

@@ -45,7 +45,7 @@ impl Server {
             ("Air".into(), Nbt::Short(300)),
             ("OnGround".into(), byte(p.on_ground)),
             ("Invulnerable".into(), byte(false)),
-            ("PortalCooldown".into(), Nbt::Int(0)),
+            ("PortalCooldown".into(), Nbt::Int(self.portal_cooldown(p.id))),
             ("UUID".into(), uuid_nbt(p.uuid)),
         ];
         if p.no_gravity {
@@ -126,6 +126,7 @@ impl Server {
         let kind = PKind::from_name(e.get("id").and_then(Nbt::as_str)?)?;
         let pos = f64s::<3>(e.get("Pos"))?;
         let id = self.proj_new_id();
+        self.load_portal_cooldown(id, e);
         let item_key = match kind {
             k if k.arrow_like() => "item",
             PKind::Firework => "FireworksItem",
