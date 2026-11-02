@@ -245,7 +245,7 @@ fn copper_golem_opens_doors() {
     let (mut opened, mut max_x) = (false, 0.0f64);
     for _ in 0..400 {
         w.p.tick();
-        w.p.s.mobs_tick();
+        w.p.s.mobs_world_tick();
         opened |= w.name([10, Y, 8]).contains("open=true");
         let m = w.p.s.mob_ref(id).expect("golem");
         max_x = max_x.max(m.pos[0]);

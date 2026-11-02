@@ -168,12 +168,15 @@ impl Server {
         }
     }
 
-    /// Ticker still valid (G6-F01); `None`: this ticker is not one of the campfire tickers. A dead
-    /// ticker is forgotten.
-    pub(crate) fn be_tick_alive(&mut self, id: u64, p: P) -> Option<bool> {
-        let &(i, t) = self.bs.be_ticks.get(&p)?;
-        if i != id {
-            return None;
+    /// Ticker of the shared map (G6-F01 and after) still valid, `t` its kept state. A dead ticker
+    /// is forgotten.
+    pub(crate) fn be_tick_alive(&mut self, p: P, t: BeTick) -> bool {
+        // G3-F13: furnaces, brewing stands, bells and spawner blocks: their ticker leaves the map
+        // with their block entity (`remove_block_entity`; any change of these blocks removes
+        // it), so a ticker still in the map is alive, without reading the block or scanning the
+        // chunk's block entities. Their tick does nothing if their own state is missing.
+        if matches!(t, BeTick::Furnace | BeTick::Brewing | BeTick::Bell | BeTick::Spawner) {
+            return true;
         }
         let s = self.get(p);
         let alive = match t {
@@ -183,11 +186,12 @@ impl Server {
             BeTick::Beacon(_) => self.v().kind(s) == Kind::Beacon,
             BeTick::Conduit(_) => self.v().block(s) == self.bs.t.id.conduit,
             BeTick::PotentSulfur => self.potent_sulfur_alive(s), // G6-F09a
+            BeTick::Furnace | BeTick::Brewing | BeTick::Bell | BeTick::Spawner => true,
         } && self.be_get(p).is_some();
         if !alive {
             self.bs.be_ticks.remove(&p);
         }
-        Some(alive)
+        alive
     }
 
     /// Index of the block entity type at `p` (registry `block_entity_type`).

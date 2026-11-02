@@ -29,7 +29,7 @@ pub struct Furnace {
     pub dirty: bool,
 }
 
-fn furnace_kind(id: &str) -> Option<u8> {
+pub(crate) fn furnace_kind(id: &str) -> Option<u8> {
     match id {
         "minecraft:furnace" => Some(0),
         "minecraft:blast_furnace" => Some(1),
@@ -670,7 +670,9 @@ impl Server {
     }
 
     /// Furnaces of the chunk loaded to be simulated.
-    fn ensure_furnace(&mut self, pos: [i32; 3], kind: u8) {
+    pub(crate) fn ensure_furnace(&mut self, pos: [i32; 3], kind: u8) {
+        // G3-F13: ticks in the common block-entity list (insertion order with the hoppers).
+        self.ticker_register(pos, crate::blocks::level::BeTick::Furnace);
         if self.life.furnaces.contains_key(&pos) {
             return;
         }
@@ -681,43 +683,28 @@ impl Server {
         self.life.furnaces.insert(pos, f);
     }
 
-    /// Furnaces found in chunks that have just been loaded.
-    pub(crate) fn discover_furnaces(&mut self, loaded: &[(i32, i32)]) {
-        let mut found = Vec::new();
-        for p in loaded {
-            let Some(Some(c)) = self.chunks.get(p) else { continue };
-            for be in &c.block_entities {
-                let Some(k) = be.get("id").and_then(Nbt::as_str).and_then(furnace_kind) else { continue };
-                let (Some(x), Some(y), Some(z)) = (int(be, "x"), int(be, "y"), int(be, "z")) else { continue };
-                found.push(([x as i32, y as i32, z as i32], k));
+    /// Data of the open furnace or brewing stand menu after the block-entity phase (its contents
+    /// are re-read by `pull_menu`); sent by the next menu broadcast, like the game.
+    pub(crate) fn station_menu_data(&mut self) {
+        let Some(m) = &mut self.life.menu else { return };
+        let Some(p) = m.block else { return };
+        match m.kind {
+            Kind::Furnace(_) => {
+                if let Some(f) = self.life.furnaces.get(&p) {
+                    m.data = f.data().to_vec();
+                }
             }
-        }
-        for (p, k) in found {
-            self.ensure_furnace(p, k);
-        }
-        self.discover_brewers(loaded); // S7
-        self.adopt_items(loaded);
-    }
-
-    /// Furnace tick.
-    pub(crate) fn furnaces_tick(&mut self) {
-        let positions: Vec<[i32; 3]> = self.life.furnaces.keys().copied().collect();
-        for p in positions {
-            // Same test as the other block entities: border and chunk within tick range.
-            if self.be_ticking(p) {
-                self.furnace_tick(p);
+            Kind::Station(crate::stations::St::Brewing) => {
+                if let Some(b) = self.life.brewers.get(&p) {
+                    m.data = b.data().to_vec();
+                }
             }
-        }
-        // Data of the open menu (its contents are re-read by `pull_menu`).
-        if let Some(m) = &mut self.life.menu
-            && let (Kind::Furnace(_), Some(p)) = (m.kind, m.block)
-            && let Some(f) = self.life.furnaces.get(&p)
-        {
-            m.data = f.data().to_vec();
+            _ => {}
         }
     }
 
-    fn furnace_tick(&mut self, p: [i32; 3]) {
+    /// Furnace tick (block entity phase, common list).
+    pub(crate) fn furnace_tick(&mut self, p: [i32; 3]) {
         let Some(mut f) = self.life.furnaces.remove(&p) else { return };
         let mut changed = false;
         let was_lit = f.lit_remaining > 0;
@@ -915,12 +902,24 @@ impl Server {
         }
     }
 
-    /// Block removed: furnace forgotten, container contents thrown.
+    /// Block entity removed with its side effects (`set_block` without `SKIP_BE_SIDE_EFFECTS`:
+    /// player, explosion, `destroy` modes, mobs): furnace or brewing stand forgotten, container
+    /// contents thrown. The contents are consumed, so a second call does nothing: the player's
+    /// break calls it before its loot (the game throws the contents at the removal, before the
+    /// loot of the block), then the removal finds nothing left.
     pub(crate) fn container_broken(&mut self, p: [i32; 3]) {
         if self.brewer_broken(p) {
             return; // S7
         }
-        self.unpack_loot(p, false); // S7: loot chest never opened
+        // S7: loot container never opened (not a suspicious block: its loot is not contents).
+        let lootable = self
+            .block_entity(p)
+            .and_then(|b| b.get("id"))
+            .and_then(Nbt::as_str)
+            .is_some_and(|id| crate::lootchest::loot_size(id).is_some() || id == "minecraft:decorated_pot");
+        if lootable {
+            self.unpack_loot(p, false);
+        }
         if let Some(f) = self.life.furnaces.remove(&p) {
             let at = [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])];
             for s in f.items.into_iter().flatten() {
@@ -950,6 +949,12 @@ impl Server {
             return;
         }
         let items: Vec<Stack> = list(be.get("Items")).iter().filter_map(Stack::from_nbt).collect();
+        if items.is_empty() {
+            return;
+        }
+        if let Some(be) = self.be_get_mut(p) {
+            crate::nbtio::remove(be, "Items");
+        }
         let at = [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])];
         for s in items {
             self.drop_contents(at, s);

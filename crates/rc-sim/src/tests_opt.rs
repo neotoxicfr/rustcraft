@@ -188,7 +188,10 @@ fn run_new() -> Option<Vec<(String, String)>> {
 /// Expected fingerprint of the "mechanisms" site: (total, number of files). Lot 6 integration:
 /// G5-F02b (alone cd8c1083…, 378) and G5-F02c (alone b80e1b0b…, 380) together.
 /// G5-F04: player file key `spawn_extra_particles_on_fall` (without it: 7f0e2e80… again).
-const EXPECTED_MECH: (&str, usize) = ("9d3c0ffd62f68eb13abd0c0b22377c9c6689f5f43112f9e27206e65de366e534", 378);
+/// G3-F13: raids, natural spawns and special spawners moved to their place in the world tick
+/// (before the random ticks, the block events and the entities), the only cause of the change
+/// (checked by putting them back after the items: 9d3c0ffd…, 378 again).
+const EXPECTED_MECH: (&str, usize) = ("ebe2b710e50440b96464d409b23403e1d98ddf3aec9a20fdb409ccda0fdff486", 380);
 
 /// Server command (refusal = failure: the rig would be incomplete).
 pub(crate) fn cmd(s: &mut Server, c: &str) {

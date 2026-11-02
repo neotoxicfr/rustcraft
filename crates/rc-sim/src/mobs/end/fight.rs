@@ -1024,19 +1024,13 @@ impl Server {
         jobs.push(crate::save::Job::Dat { path, nbt: nbtio::encode_root(&f.to_nbt()), backup: false });
     }
 
-    /// The dragon of a fight ticks in the arena (fight ticket: 7 chunks from the origin)
-    /// even far from the player's simulated zone.
-    pub(crate) fn fight_forces_ticking(&self, m: &super::super::mob::Mob) -> bool {
-        if m.kind != Kind::EnderDragon {
-            return false;
-        }
-        let Some(f) = self.mobs.end.fight.as_ref() else { return false };
-        if !f.bar_player {
-            return false;
-        }
-        let c = ((m.pos[0].floor() as i32) >> 4, (m.pos[2].floor() as i32) >> 4);
+    /// Chunk covered by the fight's ticket while players are in the fight: its entities (the
+    /// dragon, the crystals, the rest) tick within 7 chunks of the origin even far from the
+    /// player's simulated zone.
+    pub(crate) fn fight_ticket_at(&self, c: (i32, i32)) -> bool {
+        let Some(f) = self.mobs.end.fight.as_ref().filter(|f| f.bar_player) else { return false };
         let o = (f.origin[0] >> 4, f.origin[2] >> 4);
-        (c.0 - o.0).abs() <= 7 && (c.1 - o.1).abs() <= 7 && self.chunks.get(&c).is_some_and(Option::is_some)
+        (c.0 - o.0).abs() <= 7 && (c.1 - o.1).abs() <= 7
     }
 }
 
@@ -1063,5 +1057,35 @@ mod summon_tests {
         assert!(p.s.prog.done(i), "summoned_entity missing");
         drop(p);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// G3-F13: the fight's ticket (players in the fight) makes the arena "ticking entities" for
+    /// every entity, not only the dragon: a mob 6 chunks from the origin, beyond the simulation
+    /// distance, ticks (falls); 8 chunks away, or without players in the fight, it waits.
+    #[test]
+    fn fight_ticket_ticks_every_entity_of_the_arena() {
+        let (mut p, dir) = crate::tests_g3f13::open("fight");
+        p.s.sim_dist = 2;
+        let mut f = Fight::read(None);
+        f.origin = [0, 64, 0];
+        f.bar_player = true;
+        p.s.mobs.end.fight = Some(Box::new(f));
+        assert!(p.s.entity_ticks_at([100.5, -50.0, 0.5]), "arena chunk 6");
+        assert!(!p.s.entity_ticks_at([136.5, -50.0, 0.5]), "chunk 8 (loaded), outside the ticket");
+        let mut m = p.s.new_mob(super::Kind::Zombie, [100.5, -50.0, 0.5], 0.0);
+        m.persistent = true;
+        let id = m.id;
+        p.s.add_mob(m);
+        // First tick: moved by its zero velocity, then gravity; the second one moves it.
+        for _ in 0..2 {
+            p.s.mobs_tick();
+        }
+        let y = p.s.mob_ref(id).expect("zombie").pos[1];
+        assert!(y < -50.0, "mob of the arena did not tick: y {y}");
+        if let Some(f) = p.s.mobs.end.fight.as_mut() {
+            f.bar_player = false;
+        }
+        assert!(!p.s.entity_ticks_at([100.5, -50.0, 0.5]), "no player in the fight: no ticket");
+        crate::tests_g3f13::finish(p, dir);
     }
 }

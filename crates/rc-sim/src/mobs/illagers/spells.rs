@@ -241,7 +241,8 @@ impl Server {
         let mut list = std::mem::take(&mut self.mobs.ill.fangs);
         for f in list.iter_mut().filter(|f| !f.removed) {
             // Born during this entity walk: they wait for the next tick.
-            if self.walk.waits(std::mem::take(&mut f.born)) {
+            // G3-F13: outside a "ticking entities" chunk, it waits too.
+            if self.walk.waits(std::mem::take(&mut f.born)) || !self.entity_ticks_at(f.pos) {
                 continue;
             }
             f.warmup -= 1;

@@ -235,7 +235,11 @@ impl Server {
             let rp = rc_worldgen::template::transform(b.pos, mirror, rot, [0, 0, 0]);
             let wp = [pos[0] + rp[0], pos[1] + rp[1], pos[2] + rp[2]];
             let st = wd.templates.transforms.apply(b.state, mirror, rot);
-            self.set_block(wp, st, flags);
+            // A block carrying data first empties the block entity it replaces (contents lost, not
+            // thrown, like the game's clearing and barrier step); a plain block replacing a
+            // container throws its contents.
+            let f = if b.nbt.is_some() { flags | flag::SKIP_BE_SIDE_EFFECTS } else { flags };
+            self.set_block(wp, st, f);
             if let Some(n) = &b.nbt {
                 let mut be = n.clone();
                 crate::nbtio::set(&mut be, "x", Nbt::Int(wp[0]));

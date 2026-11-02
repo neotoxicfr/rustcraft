@@ -3,7 +3,7 @@
 //! cooldown, ominous version) and vault (key, rewarded players, ejection one by one);
 //! plus the ominous item spawner that the ominous trial spawner places above the fighters.
 
-use hashbrown::{HashMap, HashSet};
+use hashbrown::HashMap;
 
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::{AddEntity, Meta};
@@ -22,11 +22,15 @@ const CAGE: &str = "minecraft:mob_spawner";
 const TRIAL: &str = "minecraft:trial_spawner";
 const VAULT: &str = "minecraft:vault";
 
-/// Known spawner blocks (add order = order of the game's tickers) and ominous spawners.
+/// Block entity identifier of a spawner block (monster spawner, trial spawner, vault).
+pub(crate) fn spawner_block_id(be: Option<&Nbt>) -> Option<&str> {
+    be?.get("id").and_then(Nbt::as_str).filter(|i| matches!(*i, CAGE | TRIAL | VAULT))
+}
+
+/// State of the spawner blocks outside their block entity, and ominous spawners. The spawner
+/// blocks themselves tick in the common block-entity list (G3-F13).
 #[derive(Debug, Clone, Default)]
 pub struct SpawnerBlocks {
-    list: Vec<P>,
-    set: HashSet<P>,
     /// Vaults: last denied sound (not saved).
     vault_fail: HashMap<P, i64>,
     items: Vec<OminousItem>,
@@ -165,64 +169,29 @@ impl Server {
 
     /// Spawner or vault block entity added (load or placement).
     pub(crate) fn spawner_blocks_register(&mut self, p: P) {
-        let id = self.be_get(p).and_then(|b| b.get("id")).and_then(Nbt::as_str);
-        if !matches!(id, Some(CAGE | TRIAL | VAULT)) {
-            return;
-        }
-        let b = &mut self.mobs.spawners.blocks;
-        if b.set.insert(p) {
-            b.list.push(p);
+        if spawner_block_id(self.be_get(p)).is_some() {
+            self.ticker_register(p, crate::blocks::level::BeTick::Spawner);
         }
     }
 
-    pub(crate) fn spawner_blocks_register_chunk(&mut self, ch: (i32, i32)) {
-        let Some(Some(c)) = self.chunks.get(&ch) else { return };
-        let found: Vec<P> = c
-            .block_entities
-            .iter()
-            .filter(|b| matches!(b.get("id").and_then(Nbt::as_str), Some(CAGE | TRIAL | VAULT)))
-            .map(|b| {
-                let i = |k: &str| nbtio::int(b, k).unwrap_or(0) as i32;
-                [i("x"), i("y"), i("z")]
-            })
-            .collect();
-        for p in found {
-            self.spawner_blocks_register(p);
-        }
+    /// Spawner block gone (its ticker died): its state outside the block entity forgotten.
+    pub(crate) fn spawner_block_forgotten(&mut self, p: P) {
+        self.mobs.spawners.blocks.vault_fail.remove(&p);
     }
 
-    /// Tick of the ominous spawners (entities) then of the spawner blocks (block entities), after
-    /// the mobs: a mob born here ticks on the next tick, like in the game.
-    pub(crate) fn spawner_blocks_tick(&mut self) {
-        self.ominous_items_tick();
-        let list = std::mem::take(&mut self.mobs.spawners.blocks.list);
-        let players = self.alive_players();
-        let mut keep = Vec::with_capacity(list.len());
-        for p in list {
-            let id = self.be_get(p).and_then(|b| b.get("id")).and_then(Nbt::as_str).map(str::to_owned);
-            let Some(id) = id.filter(|i| matches!(i.as_str(), CAGE | TRIAL | VAULT)) else {
-                self.mobs.spawners.blocks.set.remove(&p);
-                self.mobs.spawners.blocks.vault_fail.remove(&p);
-                continue;
-            };
-            keep.push(p);
-            if !self.be_ticking(p) {
-                continue;
-            }
-            match id.as_str() {
-                CAGE => {
-                    if self.rule("minecraft:spawner_blocks_work", true) {
-                        self.spawner_tick(p, &players);
-                    }
+    /// Tick of a spawner block (block entity phase, after the entities: a mob born here ticks on
+    /// the next tick, like in the game). `players`: living players, read once per walk.
+    pub(crate) fn spawner_block_tick(&mut self, p: P, players: &[[f64; 3]]) {
+        match spawner_block_id(self.be_get(p)) {
+            Some(CAGE) => {
+                if self.rule("minecraft:spawner_blocks_work", true) {
+                    self.spawner_tick(p, players);
                 }
-                TRIAL => self.trial_tick(p),
-                _ => self.vault_tick(p),
             }
+            Some(TRIAL) => self.trial_tick(p),
+            Some(_) => self.vault_tick(p),
+            None => {}
         }
-        // Registered during the traversal: after the old ones.
-        let added = std::mem::take(&mut self.mobs.spawners.blocks.list);
-        keep.extend(added);
-        self.mobs.spawners.blocks.list = keep;
     }
 
     // ---------- Players ----------
@@ -950,13 +919,18 @@ impl Server {
         self.mobs.spawners.blocks.items.push(OminousItem { id, uuid, pos, item, after, age: 0 });
     }
 
-    fn ominous_items_tick(&mut self) {
+    /// Tick of the ominous item spawners (entities, after the mobs).
+    pub(crate) fn ominous_items_tick(&mut self) {
         if self.mobs.spawners.blocks.items.is_empty() {
             return;
         }
         let mut list = std::mem::take(&mut self.mobs.spawners.blocks.items);
         let mut gone = Vec::new();
         list.retain_mut(|o| {
+            // Outside a "ticking entities" chunk, it waits (G3-F13).
+            if !self.entity_ticks_at(o.pos) {
+                return true;
+            }
             o.age += 1;
             if o.age == o.after - 36 {
                 self.world_sound(
@@ -1505,7 +1479,7 @@ mod tests {
     fn run(p: &mut Probe, n: i32) {
         for _ in 0..n {
             p.tick();
-            p.s.spawner_blocks_tick();
+            p.s.ominous_items_tick(); // the spawner blocks tick in `p.tick()` (block entities)
         }
     }
 

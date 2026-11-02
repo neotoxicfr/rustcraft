@@ -176,18 +176,25 @@ impl Server {
         self.rules.get(name).and_then(Nbt::as_i64).unwrap_or(default)
     }
 
-    /// "Block" phases of a world tick (§ 1.2, steps 7 to 11) then block entities, without the
-    /// other entities (block probes).
+    /// "Block" phases of a world tick (§ 1.2, steps 7 to 10), falling blocks and primed TNT, then
+    /// block entities, without raids, spawns or the other entities (block probes).
     #[cfg(test)]
     pub(crate) fn tick_world_blocks(&mut self) {
-        self.tick_level_blocks();
+        self.tick_level_blocks(false);
+        self.tick_sim_entities();
         self.tick_block_entities();
     }
 
-    /// "Block" phases of a world tick (§ 1.2, steps 7 to 11a), after time advances;
-    /// block entities tick after all entities (`tick_block_entities`, called by the
-    /// server tick after mobs, items and projectiles, like the game).
-    pub(crate) fn tick_level_blocks(&mut self) {
+    /// Phases of a world tick from the scheduled ticks to the block events (§ 1.2, steps 7 to
+    /// 10), after time advances: scheduled ticks of blocks then of fluids, raids, chunk source
+    /// (spawning chunks: thunder and natural spawns; random ticks; special spawners), block
+    /// events. `world` false (block probes): without raids and spawns. The entities then the
+    /// block entities follow in the server tick.
+    pub(crate) fn tick_level_blocks(&mut self, world: bool) {
+        #[cfg(test)]
+        let t = std::time::Instant::now();
+        #[cfg(test)]
+        crate::server::phase("scheduled");
         self.bs.handling_tick = true;
         let now = self.time;
         // 7. Scheduled ticks of blocks then of fluids.
@@ -216,6 +223,17 @@ impl Server {
             }
         }
         self.bs.fluid_ticks.cleanup();
+        #[cfg(test)]
+        let mut spent = t.elapsed();
+        if world {
+            // 8. Raids; 9. chunk source: the spawning chunks first (thunder, natural spawns).
+            self.raids_tick();
+            self.natural_spawn_tick();
+        }
+        #[cfg(test)]
+        let t = std::time::Instant::now();
+        #[cfg(test)]
+        crate::server::phase("random");
         // 9. Random ticks of the "ticking entities" chunks (simulation distance),
         // loaded neighbours.
         let speed = self.rule_int("minecraft:random_tick_speed", 3).max(0) as usize;
@@ -225,11 +243,21 @@ impl Server {
         for ch in list {
             self.tick_chunk(ch, speed);
         }
+        #[cfg(test)]
+        {
+            spent += t.elapsed();
+        }
+        if world {
+            // 9. Then the special spawners (phantoms, patrols, cats, siege, trader).
+            self.custom_spawners_tick();
+        }
+        #[cfg(test)]
+        let t = std::time::Instant::now();
         // 10. Block events.
         self.run_block_events();
         self.bs.handling_tick = false;
-        // 11a. Entities (falling blocks, primed TNT); block entities later.
-        self.tick_sim_entities();
+        #[cfg(test)]
+        crate::server::BLOCKS_NS.with(|n| n.set(n.get() + (spent + t.elapsed()).as_nanos() as u64));
     }
 
     /// Position drawn at random in a section (world LCG, § 1.5).
@@ -289,6 +317,8 @@ impl Server {
     }
 
     fn run_block_events(&mut self) {
+        #[cfg(test)]
+        crate::server::phase("events");
         let mut later = Vec::new();
         while let Some(e) = self.bs.events.pop_front() {
             self.bs.event_set.remove(&e);
@@ -325,23 +355,79 @@ impl Server {
         id
     }
 
+    /// Ticker of the family `t` at `p` (§ 1.7), registered once: a re-read of its data keeps its
+    /// place in the list (G3-F13: furnaces, brewing stands, bells, spawner blocks).
+    pub(crate) fn ticker_register(&mut self, p: P, t: super::level::BeTick) {
+        if self.bs.be_ticks.get(&p).is_some_and(|(_, o)| std::mem::discriminant(o) == std::mem::discriminant(&t)) {
+            return;
+        }
+        let id = self.add_ticker(p);
+        self.bs.be_ticks.insert(p, (id, t));
+    }
+
+    /// State kept outside the block entity by a furnace, a brewing stand, a bell or a vault whose
+    /// block entity is removed: forgotten with it.
+    pub(crate) fn dead_ticker_state(&mut self, p: P, t: super::level::BeTick) {
+        use super::level::BeTick;
+        match t {
+            BeTick::Furnace => {
+                self.life.furnaces.remove(&p);
+            }
+            BeTick::Brewing => {
+                self.life.brewers.remove(&p);
+            }
+            BeTick::Bell => self.mobs.bells.retain(|b| b.pos != p),
+            BeTick::Spawner => self.spawner_block_forgotten(p),
+            _ => {}
+        }
+    }
+
+    /// Block entity phase (§ 1.2 step 11c, § 1.7), after all the entities: one list in
+    /// insertion order for every family (a furnace placed before a hopper ticks before it).
     pub(crate) fn tick_block_entities(&mut self) {
+        #[cfg(test)]
+        crate::server::phase("block_entities");
         self.bs.ticking_bes = true;
         let pending = std::mem::take(&mut self.bs.pending_tickers);
         self.bs.tickers.extend(pending);
+        // Living players seen by the monster spawners, read once per walk (at the first one).
+        let mut players = None;
+        // `be_ticking` split: the border read once, the chunk test (9 table lookups) reused while
+        // consecutive tickers stay in the same chunk (neither changes during the walk).
+        let border = self.border_bounds();
+        let mut last: Option<((i32, i32), bool)> = None;
         let mut i = 0;
         while i < self.bs.tickers.len() {
             let (id, p) = self.bs.tickers[i];
-            if !self.ticker_alive(id, p) {
+            // Families of the shared map first: one lookup gives the family and its kept state.
+            let shared = self.bs.be_ticks.get(&p).filter(|e| e.0 == id).map(|e| e.1);
+            let alive = match shared {
+                Some(t) => self.be_tick_alive(p, t),
+                None => self.ticker_alive(id, p),
+            };
+            if !alive {
                 self.bs.tickers.remove(i);
                 continue;
             }
-            if self.be_ticking(p) {
-                self.tick_ticker(id, p);
+            let c = (p[0] >> 4, p[2] >> 4);
+            let chunk_ticks = match last {
+                Some((k, v)) if k == c => v,
+                _ => {
+                    let v = self.ticking_at(p);
+                    last = Some((c, v));
+                    v
+                }
+            };
+            if chunk_ticks && Self::block_in_border(border, p) {
+                match shared {
+                    Some(t) => self.be_tick_run(p, t, &mut players),
+                    None => self.tick_ticker(id, p),
+                }
             }
             i += 1;
         }
         self.bs.ticking_bes = false;
+        self.station_menu_data(); // open furnace or brewing stand menu: its data after the tick
     }
 
     fn ticker_alive(&mut self, id: u64, p: P) -> bool {
@@ -352,10 +438,7 @@ impl Server {
         if let Some(alive) = self.rec_ticker_alive(id, p) {
             return alive;
         }
-        // G6-F01: jukebox, campfires.
-        if let Some(alive) = self.be_tick_alive(id, p) {
-            return alive;
-        }
+        // (The families of the shared map, G6-F01 and after, are tested by the walk itself.)
         // F11: beehives and nests.
         if self.hive_is_ticker(id, p) {
             return self.hive_ticker_alive(id, p);
@@ -370,23 +453,33 @@ impl Server {
         self.hopper_ticker_alive(id, p)
     }
 
+    /// Tick of a ticker of the shared map, with its kept state `t`.
+    fn be_tick_run(&mut self, p: P, t: super::level::BeTick, players: &mut Option<Vec<[f64; 3]>>) {
+        use super::level::BeTick;
+        match t {
+            // G6-F01: jukebox, campfires (tick skipped without food or started cooking).
+            BeTick::Jukebox(song) => self.jukebox_tick(p, song),
+            BeTick::Campfire { food, warm } => self.campfire_tick(p, food, warm),
+            BeTick::Gateway => self.gateway_be_tick(p),         // G5-F10
+            BeTick::Beacon(b) => self.beacon_tick(p, b),        // G5-F11
+            BeTick::Conduit(c) => self.conduit_tick(p, c),      // G6-F12
+            BeTick::PotentSulfur => self.potent_sulfur_tick(p), // G6-F09a
+            // G3-F13: furnaces, brewing stands, bells and spawner blocks in the same list.
+            BeTick::Furnace => self.furnace_tick(p),
+            BeTick::Brewing => self.brewer_tick(p),
+            BeTick::Bell => self.bell_tick(p),
+            BeTick::Spawner => {
+                let players = players.get_or_insert_with(|| self.alive_players());
+                self.spawner_block_tick(p, players);
+            }
+        }
+    }
+
     fn tick_ticker(&mut self, id: u64, p: P) {
         if self.bs.movers.get(&p).is_some_and(|m| m.id == id) {
             let s = self.get(p);
             if self.v().kind(s) == super::Kind::MovingPiston {
                 self.mover_tick(p);
-            }
-        } else if let Some(&(i, t)) = self.bs.be_ticks.get(&p)
-            && i == id
-        {
-            // G6-F01: jukebox, campfires (tick skipped without food or started cooking).
-            match t {
-                super::level::BeTick::Jukebox(song) => self.jukebox_tick(p, song),
-                super::level::BeTick::Campfire { food, warm } => self.campfire_tick(p, food, warm),
-                super::level::BeTick::Gateway => self.gateway_be_tick(p), // G5-F10
-                super::level::BeTick::Beacon(b) => self.beacon_tick(p, b), // G5-F11
-                super::level::BeTick::Conduit(c) => self.conduit_tick(p, c), // G6-F12
-                super::level::BeTick::PotentSulfur => self.potent_sulfur_tick(p), // G6-F09a
             }
         } else if self.hive_is_ticker(id, p) {
             self.hive_tick(p); // F11
