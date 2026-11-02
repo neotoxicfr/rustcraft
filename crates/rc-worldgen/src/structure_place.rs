@@ -771,7 +771,7 @@ pub fn place_step(
         rng.set_feature_seed(deco_seed, k as i32, step as i32);
         let Some((_, starts)) = refs.iter().find(|(id, _)| *id == s) else { continue };
         for st in starts {
-            place_start_zone(cx, sg, st, rng, zone, false);
+            place_start_zone(cx, sg, st, rng, zone, false, None);
         }
     }
 }
@@ -779,11 +779,23 @@ pub fn place_step(
 /// Placement of a start's pieces that touch `zone` (one chunk column of the live world for
 /// `place structure` and the jigsaw block, like the game's per-chunk placement), then the
 /// structure's own finishing (desert pyramid, mansion); `keep`: jigsaw blocks left in place.
-pub fn place_start_zone(cx: &mut Ctx, sg: &StructureGen, st: &Start, rng: &mut DecoRng, zone: BBox, keep: bool) {
+/// `reference`: position handed to the processors; `None` takes the world generation's (centre
+/// of the first piece's box at its bottom), `place jigsaw` and the jigsaw block give their own.
+pub fn place_start_zone(
+    cx: &mut Ctx,
+    sg: &StructureGen,
+    st: &Start,
+    rng: &mut DecoRng,
+    zone: BBox,
+    keep: bool,
+    reference: Option<[i32; 3]>,
+) {
     let Some(first) = st.pieces.first() else { return };
-    let fb = first.bbox();
-    let c = fb.center();
-    let reference = [c[0], fb.min[1], c[2]];
+    let reference = reference.unwrap_or_else(|| {
+        let fb = first.bbox();
+        let c = fb.center();
+        [c[0], fb.min[1], c[2]]
+    });
     for p in &st.pieces {
         if p.bbox().intersects(&zone) {
             place_piece(cx, sg, p, rng, zone, reference, keep);

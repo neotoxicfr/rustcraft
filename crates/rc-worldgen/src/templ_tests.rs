@@ -687,3 +687,51 @@ fn linear_pos_rule_uses_the_manhattan_distance() {
     assert_eq!(rule("minecraft:linear_pos"), Some(3));
     assert_eq!(rule("minecraft:axis_aligned_linear_pos"), Some(0));
 }
+
+/// A reference handed to the placement of a start (`place jigsaw`, jigsaw block) reaches the
+/// processors: the high ramparts of the bastion treasure empty their blocks with a chance that
+/// grows with the vertical distance to it; without it, the world generation's reference.
+#[test]
+fn start_reference_reaches_the_processors() {
+    use crate::decor_region::Region;
+    use crate::template::BBox;
+    let Some(w) = world_data() else { return };
+    let dg = nether(w, 1);
+    let sg = dg.structures.clone().unwrap();
+    let pool = "minecraft:bastion/treasure/ramparts";
+    let top = "minecraft:bastion/treasure/ramparts/top_wall";
+    let elements = sg.pools.get(pool).expect("ramparts pool").templates.clone();
+    let wall = elements.iter().find(|e| elem_name(e) == top).expect("top wall element");
+    let t = wall.template(&sg.templates, &dg.blocks).expect("top wall template");
+    // A start whose first piece is the top wall (element drawn per chunk).
+    let (pos, st) = t.jigsaws[0]
+        .iter()
+        .flat_map(|j| (0..64).map(move |i| (j.name.to_string(), [i * 16 + 8, 64, 8])))
+        .find_map(|(target, pos)| {
+            let st = dg.jigsaw_start(pool, &target, 0, pos)?;
+            matches!(&st.pieces[0], Piece::Jigsaw(jp) if elem_name(&jp.element) == top).then_some((pos, st))
+        })
+        .expect("a top wall start");
+    let deco = dg.deco.clone().unwrap();
+    let (cx, cz) = (st.bbox.min[0] >> 4, st.bbox.min[2] >> 4);
+    let place = |reference: Option<[i32; 3]>| {
+        let mut chunks: Vec<DecoChunk> =
+            (0..9).map(|i| DecoChunk::new(cx + i % 3 - 1, cz + i / 3 - 1, dg.min_y, dg.height)).collect();
+        {
+            let refs: [&mut DecoChunk; 9] = chunks.iter_mut().collect::<Vec<_>>().try_into().unwrap();
+            let mut r = Region::new(refs, &dg.blocks, dg.sea_level, dg.seed);
+            let mut ctx = crate::decor::Ctx::new(&mut r, &deco);
+            let zone = BBox::new([cx * 16, dg.min_y, cz * 16], [cx * 16 + 15, dg.min_y + dg.height - 1, cz * 16 + 15]);
+            let mut rng = crate::decor_rng::DecoRng::legacy(5);
+            crate::structure_place::place_start_zone(&mut ctx, &sg, &st, &mut rng, zone, false, reference);
+        }
+        chunks[4].blocks.iter().filter(|&&s| !dg.blocks.is_air(s)).count()
+    };
+    let fb = st.pieces[0].bbox();
+    let c = fb.center();
+    let default = place(None);
+    assert!(default > 100, "rampart placed: {default}");
+    assert_eq!(place(Some([c[0], fb.min[1], c[2]])), default, "default = the world generation's reference");
+    let far = place(Some([pos[0], pos[1] - 100, pos[2]]));
+    assert!(far < default, "blocks emptied far from the reference: {far} vs {default}");
+}

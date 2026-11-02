@@ -416,6 +416,25 @@ impl Server {
     /// Default data of a game master block entity just created (values of the game's empty
     /// block entity; the mode comes from the block state).
     pub(crate) fn tech_created(&mut self, p: P, s: u32) {
+        self.tech_defaults(p, s, true);
+    }
+
+    /// Data loaded into a game master block entity (`setblock` or `data` with NBT): the missing
+    /// fields take the game's loading defaults (jigsaw joint from its front, test block in start
+    /// mode, structure block offsets and sizes clamped), as its next save writes them.
+    pub(crate) fn tech_loaded(&mut self, p: P) {
+        let s = self.get(p);
+        if self.v().kind(s) == Kind::Structure {
+            if let Some(be) = self.be_get_mut(p) {
+                let sb = Sb::read(be);
+                sb.write(be);
+            }
+            return;
+        }
+        self.tech_defaults(p, s, false);
+    }
+
+    fn tech_defaults(&mut self, p: P, s: u32, fresh: bool) {
         let v = self.v();
         let fields: Vec<(&str, Nbt)> = match v.kind(s) {
             Kind::Structure => {
@@ -445,14 +464,15 @@ impl Server {
                 return;
             }
             Kind::Test => vec![
-                ("mode", Nbt::String(v.get(s, "mode").unwrap_or("start").to_owned())),
+                ("mode", Nbt::String(if fresh { v.get(s, "mode").unwrap_or("start") } else { "start" }.to_owned())),
                 ("message", Nbt::String(String::new())),
                 ("powered", Nbt::Byte(0)),
             ],
             Kind::Jigsaw => {
-                // Joint: aligned for a horizontal front, rollable otherwise.
+                // Joint: rollable for a new block entity; data loaded without one: aligned for a
+                // horizontal front, rollable otherwise.
                 let front = v.get(s, "orientation").and_then(|o| o.split('_').next()).unwrap_or("north");
-                let joint = if matches!(front, "up" | "down") { "rollable" } else { "aligned" };
+                let joint = if fresh || matches!(front, "up" | "down") { "rollable" } else { "aligned" };
                 vec![
                     ("name", Nbt::String("minecraft:empty".into())),
                     ("target", Nbt::String("minecraft:empty".into())),
@@ -463,6 +483,16 @@ impl Server {
                     ("selection_priority", Nbt::Int(0)),
                 ]
             }
+            // No test, empty size, no rotation, entities kept, cleared.
+            Kind::TestInstance => vec![(
+                "data",
+                Nbt::Compound(vec![
+                    ("size".to_owned(), Nbt::IntArray(vec![0, 0, 0])),
+                    ("rotation".to_owned(), Nbt::String("none".to_owned())),
+                    ("ignore_entities".to_owned(), Nbt::Byte(0)),
+                    ("status".to_owned(), Nbt::String("cleared".to_owned())),
+                ]),
+            )],
             _ => return,
         };
         if let Some(be) = self.be_get_mut(p) {
@@ -832,7 +862,7 @@ impl Server {
     }
 
     /// The area as the game's template file describes it: every block except the structure
-    /// voids (air included, cells beyond the build height read as air), in placement order
+    /// voids (air included, cells beyond the build height read as void air), in placement order
     /// (full blocks, others, block entities; each by y, x, z), palette in order of first use;
     /// the entities (players excepted) if asked.
     fn capture_area(&self, origin: P, size: [i32; 3], entities: bool, wb: &Blocks) -> Nbt {
@@ -840,14 +870,13 @@ impl Server {
         let lo = [origin[0].min(far[0]), origin[1].min(far[1]), origin[2].min(far[2])];
         let hi = [origin[0].max(far[0]), origin[1].max(far[1]), origin[2].max(far[2])];
         let void = self.tb().block_id("minecraft:structure_void");
-        let air = self.air();
         // (y, x, z) order inside each category comes from the loops.
         let (mut full, mut other, mut with) = (Vec::new(), Vec::new(), Vec::new());
         for y in lo[1]..=hi[1] {
             for x in lo[0]..=hi[0] {
                 for z in lo[2]..=hi[2] {
                     let q = [x, y, z];
-                    let st = if self.in_build_height(y) { self.get(q) } else { air };
+                    let st = self.get(q);
                     if self.v().block(st) == void {
                         continue;
                     }

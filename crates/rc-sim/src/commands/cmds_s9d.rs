@@ -8,7 +8,7 @@ use std::sync::Arc;
 use rc_proto::nbt::Nbt;
 use rc_worldgen::chunkgen::{DimGen, WorldData};
 use rc_worldgen::decor_blocks::Blocks;
-use rc_worldgen::decor_region::{DecoChunk, FLUID_TICK_NAMES, Region};
+use rc_worldgen::decor_region::{DecoChunk, FLUID_TICK_NAMES, LiveOp, Region};
 use rc_worldgen::structure::Start;
 use rc_worldgen::template::{BBox, Mirror, Rot};
 
@@ -69,9 +69,20 @@ impl Server {
 
     /// The pieces of a start placed into the live world, one chunk column at a time over the
     /// start's box (like the game), on copies of the chunks with a one-chunk border so that a
-    /// chunk sees what its neighbours received; then the changed cells, ticks, post-processing,
-    /// block entity data and entities are written back. Randomness drawn from the world's.
-    pub(crate) fn place_start_live(&mut self, wd: &WorldData, dg: &DimGen, st: &Start, keep: bool) -> bool {
+    /// chunk sees what its neighbours received; then the placements are replayed into the world in
+    /// their order with their own flags (pool pieces: known shape, no shape update; built pieces:
+    /// shape updates of the neighbours; neighbour updates of the templates without known shape),
+    /// followed by the ticks, block entity data and entities. No post-processing pass: the live
+    /// world's chunks drop the marks (game quirk). Randomness drawn from the world's.
+    /// `reference`: position handed to the processors (`None`: the world generation's).
+    pub(crate) fn place_start_live(
+        &mut self,
+        wd: &WorldData,
+        dg: &DimGen,
+        st: &Start,
+        keep: bool,
+        reference: Option<[i32; 3]>,
+    ) -> bool {
         let (Some(sg), Some(deco)) = (dg.structures.clone(), dg.deco.clone()) else { return false };
         let bb = st.bbox;
         let (c0, c1) = ((bb.min[0] >> 4, bb.min[2] >> 4), (bb.max[0] >> 4, bb.max[2] >> 4));
@@ -89,29 +100,41 @@ impl Server {
             rc_worldgen::decor_rng::DecoRng::legacy((hi << 32).wrapping_add(i64::from(self.bs.rng.next_int())));
         let (min_y, top) = (self.dim.height.min_y, self.top_y());
         let idx = |x: i32, z: i32| ((z - gz0) * w + (x - gx0)) as usize;
+        let mut ops: Vec<LiveOp> = Vec::new();
         // Chunks in the game's order (x varies first).
         for cz in c0.1..=c1.1 {
             for cx in c0.0..=c1.0 {
                 let ids: [usize; 9] = std::array::from_fn(|i| idx(cx + i as i32 % 3 - 1, cz + i as i32 / 3 - 1));
                 let Ok(refs) = grid.get_disjoint_mut(ids) else { continue };
                 let mut r = Region::new(refs, &wd.blocks, dg.sea_level, dg.seed);
+                r.live_log = Some(std::mem::take(&mut ops));
                 let mut ctx = rc_worldgen::decor::Ctx::new(&mut r, &deco);
                 let zone = BBox::new([cx * 16, min_y, cz * 16], [cx * 16 + 15, top, cz * 16 + 15]);
-                rc_worldgen::structure_place::place_start_zone(&mut ctx, &sg, st, &mut rng, zone, keep);
+                rc_worldgen::structure_place::place_start_zone(&mut ctx, &sg, st, &mut rng, zone, keep, reference);
+                ops = r.live_log.take().unwrap_or_default();
             }
         }
-        self.apply_deco(&grid, &wd.blocks);
+        for dc in &grid {
+            for &(p, _) in &dc.destroyed {
+                self.destroy_block(p, true, 512);
+            }
+        }
+        for op in ops {
+            match op {
+                LiveOp::Set(p, s, f) if self.chunk_loaded_xz(p[0], p[2]) => {
+                    self.set_block(p, s, f);
+                }
+                LiveOp::Notify(p) if self.chunk_loaded_xz(p[0], p[2]) => {
+                    let b = self.v().block(self.get(p));
+                    self.update_neighbors_at(p, b);
+                }
+                _ => {}
+            }
+        }
+        self.deco_ticks(&grid, &wd.blocks);
         for dc in &grid {
             if !matches!(self.chunks.get(&(dc.cx, dc.cz)), Some(Some(_))) {
                 continue;
-            }
-            // Shapes of the marked cells, like the post-processing of a generated chunk.
-            for &p in &dc.post_process {
-                let s = self.get(p);
-                let ns = self.update_from_neighbour_shapes(s, p);
-                if ns != s {
-                    self.set_block(p, ns, flag::CLIENTS | flag::KNOWN_SHAPE);
-                }
             }
             for (p, d) in &dc.be_data {
                 if self.be_get(*p).is_some() {
@@ -216,6 +239,12 @@ impl Server {
                 n += 1;
             }
         }
+        self.deco_ticks(chunks, b);
+        n
+    }
+
+    /// Ticks scheduled by a feature or a structure in the loaded chunks of its region.
+    fn deco_ticks(&mut self, chunks: &[DecoChunk], b: &Blocks) {
         for dc in chunks {
             let Some(Some(_)) = self.chunks.get(&(dc.cx, dc.cz)) else { continue };
             // Ticks scheduled by the feature (sources, geode cracks, flowers…), with the requested
@@ -233,7 +262,6 @@ impl Server {
                 }
             }
         }
-        n
     }
 
     pub(crate) fn place_feature_cmd(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
@@ -348,7 +376,7 @@ impl Server {
         if !loaded {
             return Err(Fail(tr!("argument.pos.unloaded")));
         }
-        self.place_start_live(&wd, &dg, &st, false);
+        self.place_start_live(&wd, &dg, &st, false, None);
         self.ok(s, tr!("commands.place.structure.success", id, pos[0], pos[1], pos[2]));
         Ok(1)
     }
@@ -389,6 +417,6 @@ impl Server {
         let (wd, dg) = self.structured_gen()?;
         dg.structures.as_ref()?.pools.get(pool)?;
         let Some(st) = dg.jigsaw_start(pool, target, depth, pos) else { return Some(false) };
-        Some(self.place_start_live(&wd, &dg, &st, keep))
+        Some(self.place_start_live(&wd, &dg, &st, keep, Some(pos)))
     }
 }

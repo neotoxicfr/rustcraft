@@ -285,6 +285,19 @@ impl Server {
         let base = flag::CLIENTS | if strict { 816 } else { 0 };
         let barrier = self.v().default_state(self.tb().block_id("barrier"));
         let air = self.air();
+        let mut all: Vec<Info> = Vec::new();
+        all.extend(solid);
+        let n_solid = all.len();
+        all.extend(bes);
+        let n_bes = all.len() - n_solid;
+        all.extend(other);
+        // State found at the destination during the scan, before a move clears the source
+        // (removed state of the final neighbour pass, overlapping boxes included).
+        self.in_world(&dst_dim, |me| {
+            for info in &mut all {
+                info.3 = me.get(info.0);
+            }
+        });
         if mode == "move" {
             self.in_world(&src_dim, |me| {
                 for &pos in &clear {
@@ -296,17 +309,7 @@ impl Server {
                 }
             });
         }
-        let mut all: Vec<Info> = Vec::new();
-        all.extend(solid);
-        let n_solid = all.len();
-        all.extend(bes);
-        let n_bes = all.len() - n_solid;
-        all.extend(other);
         let count = self.in_world(&dst_dim, |me| {
-            // State found at the destination before the copy (neighbour updates at the end).
-            for info in &mut all {
-                info.3 = me.get(info.0);
-            }
             for info in all.iter().rev() {
                 me.set_block(info.0, barrier, base | 816);
             }

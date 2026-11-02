@@ -2931,8 +2931,14 @@ on a quiet machine with the others).
 - `clone` ticks: only the chunks of the source box are visited (`TickQueue::in_box`).
 - `place structure`, `place jigsaw`, jigsaw block: the chunks of the start's box plus a one-chunk
   border are copied once into a grid, each chunk column is placed through a 3×3 window of that
-  grid (disjoint borrows, no copy per chunk), and the changes are written back once; lead not
-  taken: one copy of the 3×3 neighbourhood per chunk (9 copies per chunk instead of about 1).
+  grid (disjoint borrows, no copy per chunk); lead not taken: one copy of the 3×3 neighbourhood
+  per chunk (9 copies per chunk instead of about 1). Review round: the placements are no longer
+  written back as a diff of the copies but replayed from a journal kept by the region
+  (`Region::live_log`, 24 bytes per placement, freed after the command, `None` and one branch per
+  write everywhere else), in their order and with their own flags (pool pieces without shape
+  update, like the game); bench `tests_g6f14::bench_place_jigsaw` (outpost base plate, best of
+  3): 13.1 ms, loaded machine; the old diff path is not kept (it was a fidelity defect, not a
+  lead), to compare against `main` on a quiet machine.
   Command-time only. Biome tests of the structure generators go through one helper (`biome_ok`):
   a command placement skips the biome lookup altogether; world generation unchanged (equivalence
   tests of the starts and placements pass with their stored fingerprints).

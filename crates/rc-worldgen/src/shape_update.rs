@@ -649,11 +649,16 @@ pub fn after_template(r: &mut Region, placed: &[[i32; 3]]) {
             }
         }
     }
+    // Each placed block from its neighbours: written without a shape update nor a post-processing
+    // mark (flag 16), then its neighbours updated (only the live world has them).
     for p in placed {
         let s = r.get_p(*p);
         let n = from_neighbours(r, s, *p);
         if n != s {
-            r.set_p(*p, n, 2);
+            r.set_p(*p, n, 18);
+        }
+        if let Some(l) = &mut r.live_log {
+            l.push(crate::decor_region::LiveOp::Notify(*p));
         }
     }
 }

@@ -167,6 +167,22 @@ fn structure_block_saves_and_loads_a_template() {
     assert!(keys.iter().any(|k| k == "structure_block.load_not_found"), "keys {keys:?}");
 }
 
+/// A save reaching above the build height records the cells there as void air (the state the
+/// world reads outside its height).
+#[test]
+fn structure_block_saves_void_air_above_the_world() {
+    let mut w = world("save-void");
+    let sb = [0, 318, 0];
+    w.cmd("setblock 0 318 0 minecraft:structure_block[mode=save]");
+    let keys = w.structure(sb, &settings(1, 0, "g6f14:top", [0, 1, 0], [1, 4, 1], 1 | 4));
+    assert!(keys.iter().any(|k| k == "structure_block.save_success"), "keys {keys:?}");
+    let file = w.p.s.world.join("generated").join("g6f14").join("structure").join("top.nbt");
+    let root = crate::nbtio::read_dat(&file).expect("template file");
+    let names: Vec<&str> =
+        crate::nbtio::list(root.get("palette")).iter().filter_map(|e| e.get("Name").and_then(Nbt::as_str)).collect();
+    assert_eq!(names, ["minecraft:air", "minecraft:void_air"], "y 319 inside, 320..322 outside");
+}
+
 fn int_of(n: &Nbt, k: &str) -> i64 {
     crate::nbtio::int(n, k).unwrap_or(i64::MIN)
 }
@@ -355,8 +371,24 @@ fn forceload_list_order_and_world_bound() {
 fn jigsaw_and_test_block_settings() {
     let mut w = world("jigsaw-test");
     let j = [0, Y, 0];
+    // New block entity: rollable whatever the front; data loaded without a joint: from the front.
+    w.cmd(&format!("setblock 2 {Y} 0 minecraft:jigsaw[orientation=north_up]{{name:\"minecraft:x\"}}"));
+    assert_eq!(w.be([2, Y, 0]).get("joint").and_then(Nbt::as_str), Some("aligned"), "loaded, horizontal front");
+    assert_eq!(w.be([2, Y, 0]).get("pool").and_then(Nbt::as_str), Some("minecraft:empty"), "loading defaults");
     w.cmd(&format!("setblock 0 {Y} 0 minecraft:jigsaw[orientation=north_up]"));
-    assert_eq!(w.be(j).get("joint").and_then(Nbt::as_str), Some("aligned"), "default joint of a horizontal front");
+    assert_eq!(w.be(j).get("joint").and_then(Nbt::as_str), Some("rollable"), "new block entity");
+    // Test instance block: the game's empty data.
+    w.cmd(&format!("setblock 0 {Y} 4 minecraft:test_instance_block"));
+    let data = w.be([0, Y, 4]).get("data").cloned().expect("default data");
+    assert_eq!(
+        data,
+        Nbt::Compound(vec![
+            ("size".to_owned(), Nbt::IntArray(vec![0, 0, 0])),
+            ("rotation".to_owned(), Nbt::String("none".to_owned())),
+            ("ignore_entities".to_owned(), Nbt::Byte(0)),
+            ("status".to_owned(), Nbt::String("cleared".to_owned())),
+        ])
+    );
     let mut buf = Vec::new();
     write_set_jigsaw_block(
         &mut buf,
@@ -427,6 +459,25 @@ fn clone_copies_scheduled_ticks_and_reads_the_source_dimension() {
     )));
     assert!(w.keys().iter().any(|k| k == "argument.pos.unloaded"));
     assert_eq!(w.name([12, Y, 30]), "minecraft:air");
+}
+
+/// `clone … move` over an overlapping box reads the destination's previous states before the
+/// source is cleared: the powered lever replaced at the destination is passed as the removed
+/// state of the final neighbour pass, so the lamp behind its support turns off.
+#[test]
+fn clone_move_keeps_the_previous_destination_state() {
+    let mut w = world("clone-move");
+    let z = 40;
+    // Support placed last: its neighbour updates light the lamp behind it.
+    w.cmd(&format!("setblock 1 {Y} {} minecraft:redstone_lamp", z - 2));
+    w.cmd(&format!("setblock 1 {Y} {z} minecraft:lever[face=wall,facing=south,powered=true]"));
+    w.cmd(&format!("setblock 1 {Y} {} minecraft:stone", z - 1));
+    assert!(w.name([1, Y, z - 2]).contains("lit=true"), "lamp lit by the lever: {}", w.name([1, Y, z - 2]));
+    w.cmd(&format!("clone 0 {Y} {z} 3 {Y} {z} 1 {Y} {z} replace move"));
+    for _ in 0..6 {
+        w.p.tick();
+    }
+    assert!(w.name([1, Y, z - 2]).contains("lit=false"), "lever removal propagated: {}", w.name([1, Y, z - 2]));
 }
 
 /// `locate poi` finds the nearest point of interest (here a bell: meeting point).
@@ -563,4 +614,72 @@ fn jigsaw_block_generates_its_pool() {
     w.p.s.tech_packet(id, &mut Reader::new(&buf));
     let after = count_non_air(&w, lo, hi);
     assert!(after != before, "pool generated: {before} -> {after}");
+}
+
+/// Bench (loaded machine): `place jigsaw` of the outpost base plate (journal of the placements
+/// replayed into the world), best of 3 at three chunks.
+#[test]
+#[ignore = "bench"]
+fn bench_place_jigsaw() {
+    let mut w = world("bench-jigsaw");
+    let target = base_plate_jigsaw(&mut w);
+    let best = [0, 16, 32]
+        .iter()
+        .map(|x| {
+            let t = std::time::Instant::now();
+            w.cmd(&format!("place jigsaw minecraft:pillager_outpost/base_plates {target} 1 {x} {Y} 32"));
+            t.elapsed().as_secs_f64() * 1e3
+        })
+        .fold(f64::MAX, f64::min);
+    eprintln!("place jigsaw base plate: {best:.2} ms (loaded machine)");
+}
+
+/// `place jigsaw` writes its pool pieces with a known shape: a fence already in the world next to
+/// a placed block does not connect to it (game quirk), whereas it connects when placed after.
+#[test]
+fn place_jigsaw_leaves_the_world_shapes_alone() {
+    let cmd = |target: &str| format!("place jigsaw minecraft:pillager_outpost/base_plates {target} 1 0 {Y} 32");
+    let (lo, hi) = ([-24, Y, 16], [24, Y + 4, 48]);
+    // First world: cells that the placement fills, with an empty neighbour to the east.
+    let mut w = world("jigsaw-shape-a");
+    let target = base_plate_jigsaw(&mut w);
+    let cells = |w: &W| {
+        let mut v = std::collections::BTreeMap::new();
+        for x in lo[0]..=hi[0] {
+            for y in lo[1]..=hi[1] {
+                for z in lo[2]..=hi[2] {
+                    v.insert([x, y, z], w.p.s.v().is_air(w.p.s.get([x, y, z])));
+                }
+            }
+        }
+        v
+    };
+    let before = cells(&w);
+    w.cmd(&cmd(&target));
+    let after = cells(&w);
+    let east = |p: [i32; 3]| [p[0] + 1, p[1], p[2]];
+    let candidates: Vec<[i32; 3]> = before
+        .iter()
+        .filter(|(p, was_air)| **was_air && !after[*p])
+        .map(|(p, _)| *p)
+        .filter(|p| before.get(&east(*p)) == Some(&true) && after.get(&east(*p)) == Some(&true))
+        .collect();
+    let mut found = None;
+    for c in candidates {
+        let n = east(c);
+        w.cmd(&format!("setblock {} {} {} minecraft:oak_fence", n[0], n[1], n[2]));
+        if w.name(n).contains("west=true") {
+            found = Some(n);
+            break;
+        }
+    }
+    let n = found.expect("a placed block a fence connects to");
+    drop(w);
+    // Second world: the fence is there first; the placement leaves it unconnected.
+    let mut w = world("jigsaw-shape-b");
+    w.cmd(&format!("setblock {} {} {} minecraft:oak_fence", n[0], n[1], n[2]));
+    assert!(w.name(n).contains("west=false"));
+    w.cmd(&cmd(&target));
+    assert!(!w.p.s.v().is_air(w.p.s.get([n[0] - 1, n[1], n[2]])), "same placement");
+    assert!(w.name(n).contains("west=false"), "no shape update from a pool piece: {}", w.name(n));
 }
