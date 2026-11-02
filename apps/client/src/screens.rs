@@ -299,7 +299,7 @@ impl Screens {
         let (kind, taken, dk) = (current(inv).0, drag.slots.len(), drag.kind);
         let mut carried = inv.carried.clone();
         let mut slots = current(inv).1.to_vec();
-        let m = Menu { kind, slots: &mut slots, carried: &mut carried, rules, creative: true };
+        let m = Menu { kind, slots: &mut slots, carried: &mut carried, rules, creative: true, trade: None };
         if m.drag_accepts(s, dk, taken, true)
             && let Some(d) = &mut self.drag
         {
@@ -434,9 +434,9 @@ impl Screens {
             (k, w, s)
         };
         let carried = &mut inv.carried;
-        let slots: &mut Vec<Option<ItemStack>> = match &mut inv.container {
-            Some(ct) => &mut ct.slots,
-            None => &mut inv.menu,
+        let (slots, trade): (&mut Vec<Option<ItemStack>>, _) = match &mut inv.container {
+            Some(ct) => (&mut ct.slots, Some(&mut ct.extra.trade)),
+            None => (&mut inv.menu, None),
         };
         // Bundle moved quickly or swapped: chosen item forgotten, announced before the click.
         if let Some(i) = crate::bundle::unselect_before_click(c.mode, c.slot, slots, |st| {
@@ -448,7 +448,7 @@ impl Screens {
             let _ = link.send_bundle_item_selected(i as i32, -1);
         }
         let before = slots.clone();
-        let mut m = Menu { kind, slots, carried, rules, creative };
+        let mut m = Menu { kind, slots, carried, rules, creative, trade };
         if c.mode == 5 {
             if c.button & 3 == 2 {
                 let cases = std::mem::take(&mut self.drag_sent);
@@ -659,7 +659,7 @@ impl Screens {
         if let Some((cases, k)) = &preview {
             let mut carried = inv.carried.clone();
             let mut tmp = slots.to_vec();
-            let m = Menu { kind, slots: &mut tmp, carried: &mut carried, rules: &rules, creative: true };
+            let m = Menu { kind, slots: &mut tmp, carried: &mut carried, rules: &rules, creative: true, trade: None };
             for &i in cases {
                 if let Some((cnt, capped)) = m.drag_share(i, *k, cases.len()) {
                     let before = slots[i].as_ref().map_or(0, |c| c.count);

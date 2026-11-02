@@ -74,7 +74,9 @@ these components.
 
 Handling: ignored if the window is not the current menu or if it is not a merchant menu.
 Otherwise replaces the offer list, the experience, the level, the two booleans. "Out of stock" true
-forces uses = max. The packet arrives right after `open_screen`, then after each trade.
+forces uses = max. The packet arrives right after `open_screen` (and again when the special
+prices are recomputed while trading), never after a trade: the client counts the uses itself
+(§ 1.2).
 
 Derived quantities:
 
@@ -101,6 +103,17 @@ empty result. Otherwise we look for the offer (chosen offer index `h`: if `0 < h
 h is tested, otherwise the first satisfied offer) with (A, B); if none or out of stock, we retry
 with (B, A). Offer found and not out of stock → result = copy of the offer's result, "future
 experience" = its experience; otherwise empty result and future experience 0.
+
+The **active offer** is the one found by the last prediction, or, when the first attempt found a
+sold-out offer and the swapped attempt nothing usable, that sold-out offer (without result). With
+payment but no offer received yet, the result slot is left as it is.
+
+**Taking the result** (click, shift-click, swap with the bar, throw), predicted by the client too:
+the active offer pays with (slot 0, slot 1) as (A, B), otherwise with (slot 1, slot 0): if
+satisfied, the adjusted price A and the price B are removed from those slots and the offer
+counts one use (sold out at uses ≥ max); the merchant's experience grows by the offer's
+experience in any case; the result is then predicted again from what is left. Shift-click repeats
+while the result slot comes back with the same item.
 
 Shift-click: result → 3..38 reverse direction; 0/1 → 3..38; 3..29 → hotbar 30..38; hotbar → 3..29.
 The gathering double-click never takes from a slot of the merchant menu.

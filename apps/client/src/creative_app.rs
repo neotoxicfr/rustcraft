@@ -386,6 +386,7 @@ impl App {
             carried: &mut inv.carried,
             rules: &rules,
             creative: true,
+            trade: None,
         };
         let mut hotbar = |b: i8| match b {
             0..=8 => Some(36 + b as usize),
@@ -521,6 +522,7 @@ impl App {
             carried: &mut inv.carried,
             rules: &rules,
             creative: true,
+            trade: None,
         };
         m.drag_end(slots, kind);
         if self.creative_ui.kind(&self.data) == CreativeKind::Inventory {
@@ -596,6 +598,7 @@ impl App {
             carried: &mut carried,
             rules: &rules,
             creative: true,
+            trade: None,
         };
         if mm.drag_accepts(i, kind, taken, true)
             && let Some((_, s)) = &mut self.creative_ui.drag
