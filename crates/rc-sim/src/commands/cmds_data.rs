@@ -766,6 +766,7 @@ impl Server {
             *be = n;
         }
         self.reload_live_be(p);
+        self.tech_loaded(p); // G6-F14: loading defaults of the game master blocks
         let was_auto = crate::nbtio::int(&old, "auto").is_some_and(|v| v != 0);
         self.cmdblock_loaded(p, was_auto);
         self.be_ticks_reloaded(p, &old); // G6-F01: campfire, jukebox

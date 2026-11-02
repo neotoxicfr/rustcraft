@@ -52,6 +52,9 @@ pub(crate) struct SimWorld<'a> {
     /// Moving piston blocks and direction of the push in progress (ignored by them).
     pub movers: &'a HashMap<[i32; 3], crate::blocks::level::Mover>,
     pub noclip: Option<u8>,
+    /// G6-F14: border of the dimension (collision of the server's entities), built at first need.
+    pub border_src: &'a crate::commands::Border,
+    pub border: std::cell::OnceCell<rc_physics::WorldBorder>,
 }
 
 impl SimWorld<'_> {
@@ -87,6 +90,10 @@ impl rc_physics::World for SimWorld<'_> {
             Some(s) => (!self.movers.is_empty() && self.piston_shape(s, [x, y, z], out)) || self.t.collision(s, out),
             None => false,
         }
+    }
+
+    fn border(&self) -> Option<&rc_physics::WorldBorder> {
+        Some(self.border.get_or_init(|| self.border_src.physics()))
     }
 
     fn moving_collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
@@ -386,6 +393,8 @@ impl Server {
             t: &self.phys,
             movers: &self.bs.movers,
             noclip: self.bs.noclip,
+            border_src: &self.cmd.border,
+            border: std::cell::OnceCell::new(),
         }
     }
 
@@ -842,7 +851,9 @@ impl Server {
         // S2: menu block or bed first (except when sneaking with an item in hand).
         let busy_hands = self.slots[36 + self.held as usize].is_some() || self.slots[45].is_some();
         let s9_before = (self.data.block_of(self.get(pos)).map(|b| b.name.clone()).unwrap_or_default(), self.life.menu.is_some()); // S9
-        let used = hand == 0 && !(self.sneaking && busy_hands) && (self.cmdblock_use(pos) || self.use_block_or_bed(pos)); // S5
+        let used = hand == 0
+            && !(self.sneaking && busy_hands)
+            && (self.cmdblock_use(pos) || self.tech_block_use(pos) || self.use_block_or_bed(pos)); // S5, G6-F14
         if used {
             self.s9_block_used(pos, &s9_before.0, !s9_before.1 && self.life.menu.is_some()); // S9
             self.piglin_container_opened(&s9_before.0, !s9_before.1 && self.life.menu.is_some()); // F13

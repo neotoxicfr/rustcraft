@@ -168,6 +168,11 @@ pub(crate) enum Kind {
     },
     /// G6-F09a: active sulfur (state from the water and the block below, ticking block entity).
     PotentSulfur,
+    // G6-F14: game master blocks with server data (`tech_blocks.rs`).
+    Structure,
+    Jigsaw,
+    Test,
+    TestInstance,
 }
 
 /// Property of a block: index into `VersionData::properties`, not into the identifiers.
@@ -449,6 +454,10 @@ fn kind_of(name: &str) -> Kind {
         "pointed_dripstone" => return Speleothem { dripstone: true },
         "sulfur_spike" => return Speleothem { dripstone: false },
         "potent_sulfur" => return PotentSulfur,
+        "structure_block" => return Structure,
+        "jigsaw" => return Jigsaw,
+        "test_block" => return Test,
+        "test_instance_block" => return TestInstance,
         _ => {}
     }
     // `piston_head` is taken above.

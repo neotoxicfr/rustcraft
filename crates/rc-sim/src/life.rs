@@ -445,7 +445,7 @@ impl Server {
         } else {
             // S7: station buttons and name; W8a: difficulty, rules, signs, books,
             // entities, F3+I.
-            self.station_packet(id, r) || self.solo_packet(id, r)
+            self.station_packet(id, r) || self.solo_packet(id, r) || self.tech_packet(id, r)
         }
     }
 

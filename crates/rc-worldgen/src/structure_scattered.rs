@@ -94,7 +94,7 @@ fn biome_on_center(g: &GenStart) -> bool {
     let (y0, y1) = (g.t.world_min_y - 1, g.t.world_min_y + g.t.world_height - 1);
     let mut qy = y0 >> 2;
     while qy <= y1 >> 2 {
-        if g.def.biomes.get(g.biome_at(x, qy << 2, z) as usize).copied().unwrap_or(false) {
+        if g.biome_ok(x, qy << 2, z) {
             return true;
         }
         qy += 1;

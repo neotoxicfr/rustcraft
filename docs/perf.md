@@ -2953,3 +2953,34 @@ bench_g3f13 -- --ignored --nocapture`), loaded machine (other agents compiling).
   chunks (one chunk test per mob or minecart per tick, 7-8 ns; items reuse their tick's flag).
   A player's pearl asks for 25 chunks instead of 1: a set lookup per chunk per pearl per tick.
 - Multi-core, GPU: not applicable (phase order and list order are observable).
+## G6-F14: game master blocks, live templates, clone, locate poi, border (02/11, loaded machine)
+
+- Border collision of the server's entities: the physics view builds the border at first need
+  (lazy cell, no work for the light engine or block reads); bench
+  `tests_g6f14::bench_border_in_entity_collision`: view alone 0.9 ns, view + border + edge test
+  of an entity far from the edge 16.0 ns per movement (best of 5 over 1,000,000). Lead not taken:
+  a border cached in the server (would save the build, a few ns) needs a resync at every change
+  of the border (command, transition tick, tests that write the fields): kept lazy, to re-measure
+  on a quiet machine against a movement of `rc_physics::collide::resolve`.
+- Redstone, neighbour changes and scheduled ticks of the structure and test blocks: new arms of
+  the existing `Kind` matches (block kind table), no name comparison on the hot path.
+- Size detection of a structure block: sections skipped by their palette (`may_contain`) before
+  any cell is read, then only the cells of the 161×161 area; command-time only.
+- Live template placement (`place template`, structure block): one pass over the palette, block
+  entities written once, edge shape pass on a bitset of the placed volume (faces only), sources
+  locked in a hash set; command-time only (no per-tick cost). Multi-core and GPU not applicable:
+  ordered writes into the live world, like the game.
+- `clone` ticks: only the chunks of the source box are visited (`TickQueue::in_box`).
+- `place structure`, `place jigsaw`, jigsaw block: the chunks of the start's box plus a one-chunk
+  border are copied once into a grid, each chunk column is placed through a 3×3 window of that
+  grid (disjoint borrows, no copy per chunk); lead not taken: one copy of the 3×3 neighbourhood
+  per chunk (9 copies per chunk instead of about 1). Review round: the placements are no longer
+  written back as a diff of the copies but replayed from a journal kept by the region
+  (`Region::live_log`, 24 bytes per placement, freed after the command, `None` and one branch per
+  write everywhere else), in their order and with their own flags (pool pieces without shape
+  update, like the game); bench `tests_g6f14::bench_place_jigsaw` (outpost base plate, best of
+  3): 13.1 ms, loaded machine; the old diff path is not kept (it was a fidelity defect, not a
+  lead), to compare against `main` on a quiet machine.
+  Command-time only. Biome tests of the structure generators go through one helper (`biome_ok`):
+  a command placement skips the biome lookup altogether; world generation unchanged (equivalence
+  tests of the starts and placements pass with their stored fingerprints).

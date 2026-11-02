@@ -187,50 +187,8 @@ impl<'a> Conv<'a> {
                 ("z".to_owned(), Nbt::Int(p[2])),
                 ("keepPacked".to_owned(), Nbt::Byte(i8::from(packed))),
             ];
-            match extra.get(&p) {
-                Some(BeData::Loot { table, seed }) => {
-                    f.push(("LootTable".into(), Nbt::String((*table).into())));
-                    f.push(("LootTableSeed".into(), Nbt::Long(*seed)));
-                }
-                Some(BeData::Spawner { entity }) => {
-                    for (k, v) in [
-                        ("Delay", 20),
-                        ("MinSpawnDelay", 200),
-                        ("MaxSpawnDelay", 800),
-                        ("SpawnCount", 4),
-                        ("MaxNearbyEntities", 6),
-                        ("RequiredPlayerRange", 16),
-                        ("SpawnRange", 4),
-                    ] {
-                        f.push((k.into(), Nbt::Short(v)));
-                    }
-                    let ent = Nbt::Compound(vec![("id".into(), Nbt::String((*entity).into()))]);
-                    f.push(("SpawnData".into(), Nbt::Compound(vec![("entity".into(), ent)])));
-                    f.push(("SpawnPotentials".into(), Nbt::List(Vec::new())));
-                }
-                Some(BeData::Bees(ticks)) => {
-                    let bees = ticks
-                        .iter()
-                        .map(|&t| {
-                            let ent = Nbt::Compound(vec![("id".into(), Nbt::String("minecraft:bee".into()))]);
-                            Nbt::Compound(vec![
-                                ("entity_data".into(), ent),
-                                ("ticks_in_hive".into(), Nbt::Int(t)),
-                                ("min_ticks_in_hive".into(), Nbt::Int(600)),
-                            ])
-                        })
-                        .collect();
-                    f.push(("bees".into(), Nbt::List(bees)));
-                }
-                Some(BeData::Raw(Nbt::Compound(fields))) => {
-                    for (k, v) in fields {
-                        if !matches!(k.as_str(), "id" | "x" | "y" | "z" | "keepPacked") {
-                            f.retain(|(kk, _)| kk != k);
-                            f.push((k.clone(), v.clone()));
-                        }
-                    }
-                }
-                Some(BeData::Raw(_)) | None => {}
+            if let Some(d) = extra.get(&p) {
+                be_extra_fields(d, &mut f);
             }
             out.push(Nbt::Compound(f));
         }
@@ -570,6 +528,57 @@ fn pack_post(p: [i32; 3], ly: i32) -> i16 {
 fn unpack_post(v: i16, cx: i32, cz: i32, y0: i32) -> [i32; 3] {
     let v = i32::from(v);
     [cx * 16 + (v & 15), y0 + ((v >> 4) & 15), cz * 16 + ((v >> 8) & 15)]
+}
+
+/// Fields that generation gives a block entity (loot table, spawner, bees, template data),
+/// added to `f` (identifier and position already there); shared by the chunk conversion and
+/// the live placement of structures.
+pub(crate) fn be_extra_fields(d: &BeData, f: &mut Vec<(String, Nbt)>) {
+    match d {
+        BeData::Loot { table, seed } => {
+            f.push(("LootTable".into(), Nbt::String((*table).into())));
+            f.push(("LootTableSeed".into(), Nbt::Long(*seed)));
+        }
+        BeData::Spawner { entity } => {
+            for (k, v) in [
+                ("Delay", 20),
+                ("MinSpawnDelay", 200),
+                ("MaxSpawnDelay", 800),
+                ("SpawnCount", 4),
+                ("MaxNearbyEntities", 6),
+                ("RequiredPlayerRange", 16),
+                ("SpawnRange", 4),
+            ] {
+                f.push((k.into(), Nbt::Short(v)));
+            }
+            let ent = Nbt::Compound(vec![("id".into(), Nbt::String((*entity).into()))]);
+            f.push(("SpawnData".into(), Nbt::Compound(vec![("entity".into(), ent)])));
+            f.push(("SpawnPotentials".into(), Nbt::List(Vec::new())));
+        }
+        BeData::Bees(ticks) => {
+            let bees = ticks
+                .iter()
+                .map(|&t| {
+                    let ent = Nbt::Compound(vec![("id".into(), Nbt::String("minecraft:bee".into()))]);
+                    Nbt::Compound(vec![
+                        ("entity_data".into(), ent),
+                        ("ticks_in_hive".into(), Nbt::Int(t)),
+                        ("min_ticks_in_hive".into(), Nbt::Int(600)),
+                    ])
+                })
+                .collect();
+            f.push(("bees".into(), Nbt::List(bees)));
+        }
+        BeData::Raw(Nbt::Compound(fields)) => {
+            for (k, v) in fields {
+                if !matches!(k.as_str(), "id" | "x" | "y" | "z" | "keepPacked") {
+                    f.retain(|(kk, _)| kk != k);
+                    f.push((k.clone(), v.clone()));
+                }
+            }
+        }
+        BeData::Raw(_) => {}
+    }
 }
 
 #[cfg(test)]

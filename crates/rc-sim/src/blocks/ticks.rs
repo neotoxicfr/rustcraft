@@ -158,6 +158,21 @@ impl TickQueue {
         self.to_run_set.clear();
     }
 
+    /// Pending ticks inside the box `min..=max` (those queued for the current tick included),
+    /// for an area copy (`clone`); only the chunks of the box are visited.
+    pub fn in_box(&self, min: P, max: P) -> Vec<Tick> {
+        let inside = |p: &P| (0..3).all(|i| p[i] >= min[i] && p[i] <= max[i]);
+        let mut v: Vec<Tick> = self.to_run.iter().filter(|t| inside(&t.pos)).copied().collect();
+        for cx in (min[0] >> 4)..=(max[0] >> 4) {
+            for cz in (min[2] >> 4)..=(max[2] >> 4) {
+                if let Some(c) = self.containers.get(&(cx, cz)) {
+                    v.extend(c.heap.iter().map(|r| r.0).filter(|t| inside(&t.pos)));
+                }
+            }
+        }
+        v
+    }
+
     /// Pending ticks of a chunk (save).
     pub fn chunk_ticks(&self, ch: (i32, i32)) -> Vec<Tick> {
         let mut v: Vec<Tick> =

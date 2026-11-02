@@ -805,7 +805,7 @@ impl Placer<'_> {
 /// A valid biome cell in the column (bottom − 1 to world top).
 fn biome_in_column(g: &GenStart, x: i32, z: i32) -> bool {
     let (y0, y1) = (g.t.world_min_y - 1, g.t.world_min_y + g.t.world_height - 1);
-    ((y0 >> 2)..=(y1 >> 2)).any(|qy| g.def.biomes.get(g.biome_at(x, qy << 2, z) as usize).copied().unwrap_or(false))
+    ((y0 >> 2)..=(y1 >> 2)).any(|qy| g.biome_ok(x, qy << 2, z))
 }
 
 pub fn mansion(g: &mut GenStart) -> Option<([i32; 3], Vec<Piece>)> {

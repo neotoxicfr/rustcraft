@@ -1521,6 +1521,7 @@ impl Server {
             _ => {}
         }
         self.cmdblock_created(p, s); // S5: command blocks
+        self.tech_created(p, s); // G6-F14: structure, jigsaw and test blocks
         // F11: beehive or bee nest placed.
         if block_entity_id(self.state_name(s)) == Some("minecraft:beehive") {
             self.hive_register(p);

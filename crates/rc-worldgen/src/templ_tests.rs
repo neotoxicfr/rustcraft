@@ -252,8 +252,27 @@ fn state_transforms_fast_matches_old() {
     assert_eq!(old.digest(), STORED_TRANSFORMS, "tables differ from the stored value");
 }
 
-/// Fingerprint of the tables rot[1..3] then mirror[0..1] (old code, 26.3).
-const STORED_TRANSFORMS: u64 = 0x4edf_96dd_82e9_8a0b;
+/// Fingerprint of the tables rot[1..3] then mirror[0..1] (26.3; changed by G6-F14: mirror of the
+/// 16-step rotation).
+const STORED_TRANSFORMS: u64 = 0xfa6c_ab13_8e6f_e4cb;
+
+/// Mirror of a 16-step rotation (standing signs, banners, heads): left-right swaps north and
+/// south (rotation 1 -> 7), front-back swaps east and west (rotation 1 -> 15); the cardinal
+/// values that the mirror keeps stay put.
+#[test]
+fn mirror_of_sixteen_step_rotation() {
+    let Some(w) = world_data() else { return };
+    let b = &*w.blocks;
+    let t = StateTransforms::new(b);
+    let rot = b.prop("rotation").expect("rotation property");
+    let sign = |r: i32| b.state_from_str(&format!("minecraft:oak_sign[rotation={r}]")).expect("sign state");
+    use crate::template::{Mirror, Rot};
+    let after = |r: i32, m: Mirror| b.get_str(t.apply(sign(r), m, Rot::None), rot).map(str::to_owned);
+    for (r, lr, fb) in [(1, 7, 15), (0, 8, 0), (4, 4, 12), (8, 0, 8), (12, 12, 4), (15, 9, 1)] {
+        assert_eq!(after(r, Mirror::LeftRight), Some(lr.to_string()), "left-right of {r}");
+        assert_eq!(after(r, Mirror::FrontBack), Some(fb.to_string()), "front-back of {r}");
+    }
+}
 
 /// Fingerprint of a decorated area: states, block entity data (loot seeds included),
 /// entities, ticks and post-processing marks of the 9 chunks.
@@ -595,4 +614,124 @@ fn bench_place_template() {
         }
     }
     opt::force(&ALL, None);
+}
+
+// ---------------------------------------------------------------- G6-F14
+
+/// Yaw of a template entity: rotation then mirror on the wrapped angle (front-back changes the
+/// sign, left-right gives 180° minus the angle), the stored angle removed once.
+#[test]
+fn template_entity_yaw_follows_the_game() {
+    use crate::template::{Mirror, Rot, entity_yaw};
+    assert_eq!(entity_yaw(30.0, Mirror::FrontBack, Rot::None), -30.0);
+    assert_eq!(entity_yaw(30.0, Mirror::LeftRight, Rot::None), 150.0);
+    assert_eq!(entity_yaw(30.0, Mirror::None, Rot::Cw90), 120.0);
+    assert_eq!(entity_yaw(30.0, Mirror::None, Rot::Ccw90), 300.0);
+    // A stored angle beyond 180° is wrapped for both terms, removed raw once.
+    assert_eq!(entity_yaw(450.0, Mirror::None, Rot::None), -270.0);
+}
+
+/// Hanging entities turn their facing with the template: a painting facing south (0) rotated
+/// a quarter turn clockwise faces west (1); an item frame facing north (2) mirrored front-back
+/// keeps north, mirrored left-right faces south (3).
+#[test]
+fn template_hanging_entities_turn_their_facing() {
+    use crate::template::{Mirror, Rot, place_entity_nbt};
+    use rc_proto::nbt::Nbt;
+    let facing = |id: &str, key: &str, v: i8, m: Mirror, r: Rot| {
+        let mut f = vec![("id".to_owned(), Nbt::String(id.into())), (key.to_owned(), Nbt::Byte(v))];
+        place_entity_nbt(&mut f, [0.5; 3], [0; 3], m, r);
+        f.iter().find(|(k, _)| k == key).and_then(|(_, v)| v.as_i64())
+    };
+    assert_eq!(facing("minecraft:painting", "facing", 0, Mirror::None, Rot::Cw90), Some(1));
+    assert_eq!(facing("minecraft:item_frame", "Facing", 2, Mirror::FrontBack, Rot::None), Some(2));
+    assert_eq!(facing("minecraft:glow_item_frame", "Facing", 2, Mirror::LeftRight, Rot::None), Some(3));
+    assert_eq!(facing("minecraft:item_frame", "Facing", 1, Mirror::LeftRight, Rot::Cw90), Some(1), "up stays up");
+}
+
+/// Static data appended by a rule merges deeply: an inner compound keeps its other keys.
+#[test]
+fn append_static_merges_compounds_deeply() {
+    use rc_proto::nbt::Nbt;
+    let c = |v: Vec<(&str, Nbt)>| v.into_iter().map(|(k, v)| (k.to_owned(), v)).collect::<Vec<_>>();
+    let mut dst = c(vec![("a", Nbt::Compound(c(vec![("x", Nbt::Int(1)), ("y", Nbt::Int(2))]))), ("b", Nbt::Int(5))]);
+    let add = c(vec![("a", Nbt::Compound(c(vec![("y", Nbt::Int(9)), ("z", Nbt::Int(3))]))), ("b", Nbt::Int(6))]);
+    crate::structure_place::merge_compound(&mut dst, &add);
+    let want = c(vec![
+        ("a", Nbt::Compound(c(vec![("x", Nbt::Int(1)), ("y", Nbt::Int(9)), ("z", Nbt::Int(3))]))),
+        ("b", Nbt::Int(6)),
+    ]);
+    assert_eq!(dst, want);
+}
+
+/// The plain linear position test (`linear_pos`) measures the Manhattan distance (axis 3); the
+/// axis-aligned one keeps its axis.
+#[test]
+fn linear_pos_rule_uses_the_manhattan_distance() {
+    use crate::structure_place::{PosPred, Proc, ProcLists};
+    let Some(w) = world_data() else { return };
+    let lists = ProcLists::new(&w.decor);
+    let rule = |kind: &str| {
+        let text = format!(
+            r#"{{"processors":[{{"processor_type":"minecraft:rule","rules":[{{"input_predicate":{{"predicate_type":"minecraft:always_true"}},"location_predicate":{{"predicate_type":"minecraft:always_true"}},"position_predicate":{{"predicate_type":"{kind}","axis":"x","min_chance":0.0,"max_chance":1.0,"min_dist":0,"max_dist":8}},"output_state":{{"Name":"minecraft:stone"}}}}]}}]}}"#
+        );
+        let j = crate::json::parse(&text).expect("json");
+        match lists.get(&j, &w.blocks).first() {
+            Some(Proc::Rules(r)) => match r.first().map(|r| &r.pos) {
+                Some(PosPred::Linear(_, _, _, _, axis)) => Some(*axis),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    assert_eq!(rule("minecraft:linear_pos"), Some(3));
+    assert_eq!(rule("minecraft:axis_aligned_linear_pos"), Some(0));
+}
+
+/// A reference handed to the placement of a start (`place jigsaw`, jigsaw block) reaches the
+/// processors: the high ramparts of the bastion treasure empty their blocks with a chance that
+/// grows with the vertical distance to it; without it, the world generation's reference.
+#[test]
+fn start_reference_reaches_the_processors() {
+    use crate::decor_region::Region;
+    use crate::template::BBox;
+    let Some(w) = world_data() else { return };
+    let dg = nether(w, 1);
+    let sg = dg.structures.clone().unwrap();
+    let pool = "minecraft:bastion/treasure/ramparts";
+    let top = "minecraft:bastion/treasure/ramparts/top_wall";
+    let elements = sg.pools.get(pool).expect("ramparts pool").templates.clone();
+    let wall = elements.iter().find(|e| elem_name(e) == top).expect("top wall element");
+    let t = wall.template(&sg.templates, &dg.blocks).expect("top wall template");
+    // A start whose first piece is the top wall (element drawn per chunk).
+    let (pos, st) = t.jigsaws[0]
+        .iter()
+        .flat_map(|j| (0..64).map(move |i| (j.name.to_string(), [i * 16 + 8, 64, 8])))
+        .find_map(|(target, pos)| {
+            let st = dg.jigsaw_start(pool, &target, 0, pos)?;
+            matches!(&st.pieces[0], Piece::Jigsaw(jp) if elem_name(&jp.element) == top).then_some((pos, st))
+        })
+        .expect("a top wall start");
+    let deco = dg.deco.clone().unwrap();
+    let (cx, cz) = (st.bbox.min[0] >> 4, st.bbox.min[2] >> 4);
+    let place = |reference: Option<[i32; 3]>| {
+        let mut chunks: Vec<DecoChunk> =
+            (0..9).map(|i| DecoChunk::new(cx + i % 3 - 1, cz + i / 3 - 1, dg.min_y, dg.height)).collect();
+        {
+            let refs: [&mut DecoChunk; 9] = chunks.iter_mut().collect::<Vec<_>>().try_into().unwrap();
+            let mut r = Region::new(refs, &dg.blocks, dg.sea_level, dg.seed);
+            let mut ctx = crate::decor::Ctx::new(&mut r, &deco);
+            let zone = BBox::new([cx * 16, dg.min_y, cz * 16], [cx * 16 + 15, dg.min_y + dg.height - 1, cz * 16 + 15]);
+            let mut rng = crate::decor_rng::DecoRng::legacy(5);
+            crate::structure_place::place_start_zone(&mut ctx, &sg, &st, &mut rng, zone, false, reference);
+        }
+        chunks[4].blocks.iter().filter(|&&s| !dg.blocks.is_air(s)).count()
+    };
+    let fb = st.pieces[0].bbox();
+    let c = fb.center();
+    let default = place(None);
+    assert!(default > 100, "rampart placed: {default}");
+    assert_eq!(place(Some([c[0], fb.min[1], c[2]])), default, "default = the world generation's reference");
+    let far = place(Some([pos[0], pos[1] - 100, pos[2]]));
+    assert!(far < default, "blocks emptied far from the reference: {far} vs {default}");
 }

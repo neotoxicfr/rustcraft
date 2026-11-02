@@ -704,7 +704,7 @@ impl Server {
             ticks: f("lerp_time", 0.0) as i64,
             max_size: 29_999_984,
             warn_blocks: f("warning_blocks", 5.0) as i32,
-            warn_ticks: f("warning_time", 15.0) as i32,
+            warn_ticks: f("warning_time", 300.0) as i32,
         }));
     }
 

@@ -26,7 +26,8 @@ use crate::terrain::TerrainGenerator;
 #[derive(Debug, Clone)]
 pub enum PosPred {
     Always,
-    /// (min chance, max chance, min distance, max distance, axis 0..2).
+    /// (min chance, max chance, min distance, max distance, axis 0..2, or 3 for the Manhattan
+    /// distance over the three axes).
     Linear(f32, f32, i32, i32, usize),
 }
 
@@ -42,7 +43,7 @@ pub enum BeMod {
 pub struct PRule {
     input: Rule,
     loc: Rule,
-    pos: PosPred,
+    pub(crate) pos: PosPred,
     output: State,
     modifier: BeMod,
 }
@@ -99,12 +100,16 @@ fn parse_proc(j: &Json, b: &Blocks) -> Option<Proc> {
                 .as_array()?
                 .iter()
                 .filter_map(|r| {
+                    let kind = r
+                        .get("position_predicate")
+                        .and_then(|p| p.get("predicate_type"))
+                        .and_then(Json::as_str)
+                        .map(|k| k.strip_prefix("minecraft:").unwrap_or(k));
                     let pos = match r.get("position_predicate") {
-                        Some(p)
-                            if p.get("predicate_type").and_then(Json::as_str)
-                                == Some("minecraft:axis_aligned_linear_pos") =>
-                        {
+                        Some(p) if matches!(kind, Some("axis_aligned_linear_pos" | "linear_pos")) => {
+                            // Plain linear test: Manhattan distance over the three axes (axis 3).
                             let axis = match p.get("axis").and_then(Json::as_str).unwrap_or("y") {
+                                _ if kind == Some("linear_pos") => 3,
                                 "x" => 0,
                                 "z" => 2,
                                 _ => 1,
@@ -326,7 +331,11 @@ fn process_one(
                     && match rule.pos {
                         PosPred::Always => true,
                         PosPred::Linear(cmin, cmax, dmin, dmax, axis) => {
-                            let dist = (cur.pos[axis] - reference[axis]).abs();
+                            let dist = if axis == 3 {
+                                (0..3).map(|a| (cur.pos[a] - reference[a]).abs()).sum()
+                            } else {
+                                (cur.pos[axis] - reference[axis]).abs()
+                            };
                             let rnd = rng.next_float();
                             let t = (dist as f32 - dmin as f32) / (dmax as f32 - dmin as f32);
                             let chance = if t < 0.0 {
@@ -346,10 +355,7 @@ fn process_one(
                         BeMod::Static(d) => {
                             let mut n = cur.nbt.clone().unwrap_or(Nbt::Compound(Vec::new()));
                             if let (Nbt::Compound(f), Nbt::Compound(add)) = (&mut n, d) {
-                                for (k, v) in add {
-                                    f.retain(|(kk, _)| kk != k);
-                                    f.push((k.clone(), v.clone()));
-                                }
+                                merge_compound(f, add);
                             }
                             Some(n)
                         }
@@ -427,6 +433,18 @@ fn process_one(
             } else {
                 Some(cur)
             }
+        }
+    }
+}
+
+/// Deep merge of a compound into another (static data appended by a rule): a compound meets a
+/// compound and merges into it, any other value replaces the old one in place.
+pub(crate) fn merge_compound(dst: &mut Vec<(String, Nbt)>, add: &[(String, Nbt)]) {
+    for (k, v) in add {
+        match (dst.iter_mut().find(|(kk, _)| kk == k), v) {
+            (Some((_, Nbt::Compound(old))), Nbt::Compound(inner)) => merge_compound(old, inner),
+            (Some((_, old)), v) => *old = v.clone(),
+            (None, v) => dst.push((k.clone(), v.clone())),
         }
     }
 }
@@ -543,10 +561,12 @@ fn process(
     out
 }
 
-pub(crate) fn is_loot_container(name: &str) -> bool {
+pub fn is_loot_container(name: &str) -> bool {
     let n = name.strip_prefix("minecraft:").unwrap_or(name);
     matches!(n, "chest" | "trapped_chest" | "barrel" | "dispenser" | "dropper" | "hopper" | "crafter" | "decorated_pot")
         || n.ends_with("shulker_box")
+        // Copper chests (all stages, waxed or not) are chests: their loot seed is drawn too.
+        || n.ends_with("copper_chest")
 }
 
 /// Placement of a template (§ 10.3). `flags`: placement flags; `rng`: placement randomness (loot seeds).
@@ -705,32 +725,7 @@ fn place_entities(r: &mut Region, t: &Template, pos: [i32; 3], s: &Placing, vill
         let rp = crate::template::transform_f(e.pos, s.mirror, s.rot, s.pivot);
         let wp = [rp[0] + f64::from(pos[0]), rp[1] + f64::from(pos[1]), rp[2] + f64::from(pos[2])];
         let Nbt::Compound(mut f) = e.nbt.clone() else { continue };
-        f.retain(|(k, _)| k != "UUID" && k != "Pos");
-        f.push(("Pos".into(), Nbt::List(wp.iter().map(|v| Nbt::Double(*v)).collect())));
-        if let Some(i) = f.iter().position(|(k, _)| k == "block_pos") {
-            f[i].1 = Nbt::IntArray(bp.to_vec());
-        }
-        let (yaw, pitch) = match f.iter().find(|(k, _)| k == "Rotation").map(|(_, v)| v) {
-            Some(Nbt::List(l)) if l.len() == 2 => match (&l[0], &l[1]) {
-                (Nbt::Float(a), Nbt::Float(b)) => (*a, *b),
-                _ => (0.0, 0.0),
-            },
-            _ => (0.0, 0.0),
-        };
-        let rotated = match s.rot {
-            Rot::Cw180 => yaw + 180.0,
-            Rot::Ccw90 => yaw + 270.0,
-            Rot::Cw90 => yaw + 90.0,
-            Rot::None => yaw,
-        };
-        let mirrored = match s.mirror {
-            Mirror::LeftRight => -yaw,
-            Mirror::FrontBack => 180.0 - yaw,
-            Mirror::None => yaw,
-        };
-        let new_yaw = rotated + mirrored - yaw;
-        f.retain(|(k, _)| k != "Rotation");
-        f.push(("Rotation".into(), Nbt::List(vec![Nbt::Float(new_yaw), Nbt::Float(pitch)])));
+        crate::template::place_entity_nbt(&mut f, wp, bp, s.mirror, s.rot);
         let id = f.iter().find(|(k, _)| k == "id").and_then(|(_, v)| v.as_str()).unwrap_or("").to_owned();
         if let Some(types) = villagers
             && matches!(id.as_str(), "minecraft:villager" | "minecraft:zombie_villager")
@@ -776,29 +771,56 @@ pub fn place_step(
         rng.set_feature_seed(deco_seed, k as i32, step as i32);
         let Some((_, starts)) = refs.iter().find(|(id, _)| *id == s) else { continue };
         for st in starts {
-            let Some(first) = st.pieces.first() else { continue };
-            let fb = first.bbox();
-            let c = fb.center();
-            let reference = [c[0], fb.min[1], c[2]];
-            for p in &st.pieces {
-                if p.bbox().intersects(&zone) {
-                    place_piece(cx, sg, p, rng, zone, reference);
-                }
-            }
-            if matches!(sg.defs[s].kind, crate::structure::Kind::DesertPyramid) {
-                crate::structure_scattered::pyramid_after(cx.r, &st.pieces, zone);
-            }
-            if matches!(sg.defs[s].kind, crate::structure::Kind::Mansion) {
-                crate::structure_mansion::after(cx.r, &st.pieces, zone);
-            }
+            place_start_zone(cx, sg, st, rng, zone, false, None);
         }
     }
 }
 
-fn place_piece(cx: &mut Ctx, sg: &StructureGen, p: &Piece, rng: &mut DecoRng, zone: BBox, reference: [i32; 3]) {
+/// Placement of a start's pieces that touch `zone` (one chunk column of the live world for
+/// `place structure` and the jigsaw block, like the game's per-chunk placement), then the
+/// structure's own finishing (desert pyramid, mansion); `keep`: jigsaw blocks left in place.
+/// `reference`: position handed to the processors; `None` takes the world generation's (centre
+/// of the first piece's box at its bottom), `place jigsaw` and the jigsaw block give their own.
+pub fn place_start_zone(
+    cx: &mut Ctx,
+    sg: &StructureGen,
+    st: &Start,
+    rng: &mut DecoRng,
+    zone: BBox,
+    keep: bool,
+    reference: Option<[i32; 3]>,
+) {
+    let Some(first) = st.pieces.first() else { return };
+    let reference = reference.unwrap_or_else(|| {
+        let fb = first.bbox();
+        let c = fb.center();
+        [c[0], fb.min[1], c[2]]
+    });
+    for p in &st.pieces {
+        if p.bbox().intersects(&zone) {
+            place_piece(cx, sg, p, rng, zone, reference, keep);
+        }
+    }
+    use crate::structure::Kind;
+    match sg.defs.get(st.structure).map(|d| &d.kind) {
+        Some(Kind::DesertPyramid) => crate::structure_scattered::pyramid_after(cx.r, &st.pieces, zone),
+        Some(Kind::Mansion) => crate::structure_mansion::after(cx.r, &st.pieces, zone),
+        _ => {}
+    }
+}
+
+fn place_piece(
+    cx: &mut Ctx,
+    sg: &StructureGen,
+    p: &Piece,
+    rng: &mut DecoRng,
+    zone: BBox,
+    reference: [i32; 3],
+    keep: bool,
+) {
     match p {
         Piece::Jigsaw(jp) => {
-            place_element(cx, sg, &jp.element, jp, jp.pos, rng, zone, reference);
+            place_element(cx, sg, &jp.element, jp, jp.pos, rng, zone, reference, keep);
         }
         Piece::Coded { data, bbox, .. } => match &**data {
             CodedPiece::BuriedTreasure => buried_treasure(cx, *bbox, rng, zone),
@@ -822,6 +844,7 @@ fn place_element(
     rng: &mut DecoRng,
     zone: BBox,
     reference: [i32; 3],
+    keep: bool,
 ) -> bool {
     let b = cx.r.b;
     match e {
@@ -831,7 +854,10 @@ fn place_element(
             if !legacy {
                 pre.push(Proc::Ignore(b.block_id("minecraft:structure_block").into_iter().collect()));
             }
-            pre.push(Proc::JigsawReplace);
+            // Jigsaw blocks kept on request (jigsaw block generation), otherwise replaced.
+            if !keep {
+                pre.push(Proc::JigsawReplace);
+            }
             let mut post: Vec<Proc> = Vec::new();
             if *projection == Projection::TerrainMatching {
                 post.push(Proc::Gravity { hm: Hm::WorldSurfaceWg, offset: -1 });
@@ -865,7 +891,7 @@ fn place_element(
         }
         Element::List { elements, .. } => {
             for el in elements {
-                if !place_element(cx, sg, el, jp, pos, rng, zone, reference) {
+                if !place_element(cx, sg, el, jp, pos, rng, zone, reference, keep) {
                     return false;
                 }
             }
