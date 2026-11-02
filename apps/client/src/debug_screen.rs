@@ -348,7 +348,17 @@ pub struct Profiling {
     /// Stop requested (F3+L during the recording): effective at the end of the frame.
     pub stop: bool,
     pub frame_start: Option<Instant>,
-    pub rows: Vec<[f64; 5]>,
+    /// Per frame: duration (ns), sections, drawn sections, view distance, GPU %, heap MiB.
+    pub rows: Vec<[f64; 6]>,
+    /// Load of each logical processor (`None`: not known on this system), per frame.
+    pub cpu: Option<crate::profiling_zip::CpuStats>,
+    pub cpu_rows: Vec<Vec<f64>>,
+    /// Duration of the previous frame (threshold of the slow frames).
+    pub last_frame: Option<f64>,
+    /// Frames at least three times slower than the previous one: (frame, date ms, its profile).
+    pub deviations: Vec<(usize, i64, String)>,
+    /// Integrated server: (duration ns, date ms) of each of its ticks during the recording.
+    pub server_ticks: Vec<(i64, i64)>,
 }
 
 #[derive(Default, Clone, Copy)]

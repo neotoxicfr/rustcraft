@@ -46,9 +46,10 @@ fn num(x: f64) -> String {
     if s.is_empty() || s == "-0" { "0".to_owned() } else { s.to_owned() }
 }
 
-/// Duration of an effect: "mm:ss" ("hh:mm:ss" beyond an hour).
-fn duration(ticks: i32) -> String {
-    let secs = ticks / 20;
+/// Duration of an effect: "mm:ss" ("hh:mm:ss" beyond an hour), in seconds of the server's
+/// tick rate (ticks per second).
+pub(crate) fn tick_duration(ticks: i32, tick_rate: f32) -> String {
+    let secs = (ticks as f32 / tick_rate).floor() as i32;
     let (m, s) = (secs / 60, secs % 60);
     if m >= 60 { format!("{:02}:{:02}:{:02}", m / 60, m % 60, s) } else { format!("{m:02}:{s:02}") }
 }
@@ -93,9 +94,16 @@ pub fn hidden(view: &StackRef<'_>) -> bool {
 /// Tooltip context, set on every world tick: bit 0 peaceful difficulty, bit 1
 /// operator player (permission 2 at least).
 static CONTEXT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Server tick rate of the tooltip context (bits of an `f32`, 20 before any world).
+static TICK_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x41a0_0000);
 
-pub fn set_context(peaceful: bool, operator: bool) {
+pub fn set_context(peaceful: bool, operator: bool, tick_rate: f32) {
     CONTEXT.store(u8::from(peaceful) | u8::from(operator) << 1, std::sync::atomic::Ordering::Relaxed);
+    TICK_RATE.store(tick_rate.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn tick_rate() -> f32 {
+    f32::from_bits(TICK_RATE.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 fn context() -> (bool, bool) {
@@ -270,7 +278,7 @@ fn effect_line(view: &StackRef<'_>, (effect, amp, dur): (usize, i32, i32), scale
         let text = if dur == -1 {
             Component::translate("effect.duration.infinite", vec![])
         } else {
-            Component::text(duration((dur as f32 * scale).floor() as i32))
+            Component::text(tick_duration((dur as f32 * scale).floor() as i32, tick_rate()))
         };
         line = Component::translate("potion.withDuration", vec![arg(line), arg(text)]);
     }
@@ -760,8 +768,13 @@ mod tests {
 
     #[test]
     fn durations() {
-        assert_eq!(duration(3600), "03:00");
-        assert_eq!(duration(1800), "01:30");
-        assert_eq!(duration(20 * 3600 * 2), "02:00:00");
+        assert_eq!(tick_duration(3600, 20.0), "03:00");
+        assert_eq!(tick_duration(1800, 20.0), "01:30");
+        assert_eq!(tick_duration(20 * 3600 * 2, 20.0), "02:00:00");
+        assert_eq!(f32::from_bits(0x41a0_0000), 20.0, "default rate of the context");
+        // Seconds of the server's rate (`/tick rate`), not of 20 ticks.
+        assert_eq!(tick_duration(3600, 10.0), "06:00");
+        assert_eq!(tick_duration(100, 30.0), "00:03");
+        assert_eq!(tick_duration(3600, 1.5), "40:00");
     }
 }

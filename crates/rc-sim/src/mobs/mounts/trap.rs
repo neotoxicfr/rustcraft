@@ -194,7 +194,8 @@ impl Server {
             // Born during this entity walk (skeleton horse trap): it waits for the next tick.
             // Thunderstorm (before the walk): right away; channeling (during the projectiles,
             // after this tick): on the next tick without being skipped.
-            if self.walk.waits(std::mem::take(&mut b.born)) {
+            // G3-F13: outside a "ticking entities" chunk, it waits too.
+            if self.walk.waits(std::mem::take(&mut b.born)) || !self.entity_ticks_at(b.pos) {
                 continue;
             }
             if b.life == 2 {
@@ -1017,16 +1018,16 @@ mod w9_tests {
         }
         // Player far away: nothing.
         p.run("player 216.5 -59 240.5 0 0\n");
-        p.s.spawner_blocks_tick();
+        p.s.tick_block_entities();
         let zombies = |p: &Probe| p.s.mobs.list.iter().flatten().filter(|m| m.kind == Kind::Zombie).count();
         assert_eq!(zombies(&p), 0, "player at 28 blocks");
         p.run("player 216.5 -59 202.5 0 0\n");
-        p.s.spawner_blocks_tick();
+        p.s.tick_block_entities();
         let n = zombies(&p);
         assert!((1..=4).contains(&n), "zombies: {n}");
         let delay = crate::nbtio::int(p.s.be_get([216, -59, 212]).unwrap(), "Delay").unwrap();
         assert!((200..800).contains(&delay), "delay {delay}");
-        p.s.spawner_blocks_tick();
+        p.s.tick_block_entities();
         assert_eq!(zombies(&p), n, "no spawn during the delay");
         finish(p, dir);
     }

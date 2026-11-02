@@ -228,7 +228,8 @@ impl Server {
     pub(crate) fn clouds_tick(&mut self) {
         let mut clouds = std::mem::take(&mut self.proj.clouds);
         for c in clouds.iter_mut().filter(|c| !c.removed) {
-            if self.walk.waits(std::mem::take(&mut c.born)) {
+            // Born during this walk, or outside a "ticking entities" chunk (G3-F13): it waits.
+            if self.walk.waits(std::mem::take(&mut c.born)) || !self.entity_ticks_at(c.pos) {
                 continue;
             }
             if !c.seen {

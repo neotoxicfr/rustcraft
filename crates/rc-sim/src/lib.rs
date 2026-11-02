@@ -36,6 +36,9 @@ pub mod world;
 pub mod attrs;
 pub mod contact; // G5-F02e: crossed blocks, enchanted boots
 mod solo_packets;
+mod tech_blocks; // G6-F14: structure, jigsaw and test blocks, live templates
+#[cfg(test)]
+mod tests_g6f14;
 // Survival loop (milestone 2, S2).
 pub mod book;
 pub mod containers;
@@ -169,6 +172,10 @@ mod tests_g3f03;
 mod tests_g6f11;
 #[cfg(test)]
 mod tests_g3f11;
+#[cfg(test)]
+mod tests_g3f13;
+#[cfg(test)]
+mod tests_g3f08; // G3-F08: compute, posteffect, fetchprofile, attribute reset, loot targets
 
 use std::path::{Path, PathBuf};
 

@@ -89,6 +89,12 @@ impl Server {
         {
             crate::loot::be::apply(be, comps, op);
             self.reload_live_be(pos);
+            // G6-F14: loaded like a block entity read, before the placement reaction: a copied
+            // command block that becomes automatic schedules its first tick (the fresh block
+            // entity was not automatic).
+            if comps.get("minecraft:block_entity_data").is_some() {
+                self.cmdblock_loaded(pos, false);
+            }
             self.send_block_entity(pos);
         }
     }

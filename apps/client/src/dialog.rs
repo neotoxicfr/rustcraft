@@ -1412,8 +1412,8 @@ impl Screen {
                     let mt = &mut ui.multis[f];
                     mt.area.key(gui, k, mods);
                     // Ctrl + letter types nothing, AltGr types its character (`widgets::typed_text`).
-                    if let Some(t) = crate::widgets::typed_text(event, mods) {
-                        mt.area.insert(gui, t);
+                    if let Some(t) = crate::widgets::typed_text(event, mods).and_then(crate::widgets::chat_typed) {
+                        mt.area.insert(gui, &t);
                     }
                     mt.reveal(gui);
                     return Outcome::Done;
@@ -1431,7 +1431,9 @@ impl Screen {
                 let Some(t) = crate::ime::commit(e) else { return Outcome::Pass };
                 if let Some(f) = ui.multi_focus {
                     let mt = &mut ui.multis[f];
-                    mt.area.insert(gui, t);
+                    if let Some(t) = crate::widgets::chat_typed(t) {
+                        mt.area.insert(gui, &t);
+                    }
                     mt.reveal(gui);
                     return Outcome::Done;
                 }

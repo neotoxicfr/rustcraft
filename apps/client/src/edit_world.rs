@@ -177,6 +177,18 @@ pub struct Optimizing {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+/// Status line of the optimisation: counting before any pass works, then "upgrading" or
+/// "finishing up" for the pass (entities, points of interest, chunks). A pass still counting
+/// keeps the previous status with its own name, as in the game.
+fn optimize_status(stage: u8, pass: u8) -> String {
+    let kind = usize::from(pass).checked_sub(1).and_then(|i| rc_sim::storage::OPTIMIZE_PASSES.get(i));
+    match (stage, kind) {
+        (0, _) | (_, None) => "optimizeWorld.stage.counting".to_owned(),
+        (1, Some((_, k))) => format!("optimizeWorld.stage.upgrading.{k}"),
+        (_, Some((_, k))) => format!("optimizeWorld.stage.finished.{k}"),
+    }
+}
+
 impl Optimizing {
     pub fn new(dir: &Path, erase: bool) -> Optimizing {
         let name = rc_sim::level::Level::read(dir).map(|l| l.name).unwrap_or_default();
@@ -234,14 +246,9 @@ impl Optimizing {
         let (x0, x1) = (w / 2 - 150, w / 2 + 150);
         let y0 = h / 4 + 100;
         let y1 = y0 + 10;
-        let status = match p.stage.load(Ordering::Acquire) {
-            0 => "optimizeWorld.stage.counting",
-            1 => "optimizeWorld.stage.upgrading",
-            4 => "optimizeWorld.stage.failed",
-            _ => "optimizeWorld.stage.finished",
-        };
         const GRAY: u32 = 0xffa0_a0a0;
-        widgets::centered(gui, q, &chars(&t(gui, status)), w / 2, y0 - 9 - 2, GRAY);
+        let status = optimize_status(p.stage.load(Ordering::Acquire), p.pass.load(Ordering::Acquire));
+        widgets::centered(gui, q, &chars(&t(gui, &status)), w / 2, y0 - 9 - 2, GRAY);
         let total = p.total.load(Ordering::Relaxed);
         if total > 0 {
             let f = |v: i32| v as f32;
@@ -254,27 +261,40 @@ impl Optimizing {
             line(gui, "optimizeWorld.info.converted", conv, 40);
             line(gui, "optimizeWorld.info.skipped", skip, 40 + 12);
             line(gui, "optimizeWorld.info.total", total, 40 + 24);
-            // Bar: one color per dimension, length according to its progress.
+            // Bar: one color per dimension, each as long as its share of the pass's region files.
             let colors = [0xff33_6622, 0xff66_4433, 0xff77_8855];
             let mut x = 0;
             for (k, c) in colors.iter().enumerate() {
-                let n = p.per_dim[k].load(Ordering::Relaxed);
-                if n == 0 {
-                    continue;
-                }
-                let dp = p.done[k].load(Ordering::Relaxed) as f32 / total as f32;
-                let len = (dp * (x1 - x0) as f32).floor() as i32;
+                let len = (p.dim_progress(k) * (x1 - x0) as f32).floor() as i32;
                 gui.fill(f(x0 + x), f(y0), f(x0 + x + len), f(y1), *c);
                 x += len;
             }
             let done = conv + skip;
             let counter =
                 chars(&tr(&gui.lang, "optimizeWorld.progress.counter", &[done.to_string(), total.to_string()]));
-            let pct = (done as f32 / total as f32 * 100.0).floor() as i32;
+            let pct = (p.progress() * 100.0).floor() as i32;
             let percent = chars(&tr(&gui.lang, "optimizeWorld.progress.percentage", &[pct.to_string()]));
             widgets::centered(gui, q, &counter, w / 2, y0 + 2 * 9 + 2, GRAY);
             widgets::centered(gui, q, &percent, w / 2, y0 + (y1 - y0) / 2 - 9 / 2, GRAY);
         }
         self.panel.draw(gui, q, mouse, time);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Status per pass, with the names of the game (chunks for the block pass).
+    #[test]
+    fn optimize_status_names_the_pass() {
+        assert_eq!(optimize_status(0, 0), "optimizeWorld.stage.counting");
+        assert_eq!(optimize_status(0, 1), "optimizeWorld.stage.counting");
+        assert_eq!(optimize_status(1, 1), "optimizeWorld.stage.upgrading.entities");
+        assert_eq!(optimize_status(2, 1), "optimizeWorld.stage.finished.entities");
+        // Next pass counting after a finished one: its name, still "finishing up".
+        assert_eq!(optimize_status(2, 2), "optimizeWorld.stage.finished.poi");
+        assert_eq!(optimize_status(1, 3), "optimizeWorld.stage.upgrading.chunks");
+        assert_eq!(optimize_status(2, 3), "optimizeWorld.stage.finished.chunks");
     }
 }

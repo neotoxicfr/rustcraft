@@ -943,9 +943,9 @@ impl RecipeBook {
                 return (false, false);
             }
             let (mut used, mut changed) = self.search.key(k, mods);
-            if let Some(t) = text.filter(|t| t.chars().all(|c| !c.is_control())) {
+            if let Some(t) = text.and_then(crate::widgets::chat_typed) {
                 let before = self.search.text.clone();
-                self.search.insert(t);
+                self.search.insert(&t);
                 changed |= before != self.search.text;
                 used = true;
             }

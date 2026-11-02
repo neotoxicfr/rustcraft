@@ -20,6 +20,7 @@ pub mod cmds_s9a;
 pub mod cmds_s9b;
 pub mod cmds_s9c;
 pub mod cmds_s9d;
+pub mod cmds_s9e;
 pub mod cmds_scores;
 pub mod cmds_world;
 pub mod ents;
@@ -132,6 +133,8 @@ pub struct Cmds {
     pub bars_dirty: bool,
     /// Messages emitted in a parked dimension (sends cut off), rendered on return.
     pub deferred: std::cell::RefCell<Vec<Event>>,
+    /// G6-F14: templates known to the server (world, game, structure block captures).
+    pub templates: crate::tech_blocks::Templates,
 }
 
 /// Time marker: clock, identifier, ticks, timeline period, suggested?
@@ -171,9 +174,20 @@ impl Border {
             size,
             damage: f("damage_per_block", 0.2) as f32,
             buffer: f("safe_zone", 5.0) as f32,
-            warn_time: f("warning_time", 15.0) as i32,
+            warn_time: f("warning_time", 300.0) as i32,
             warn_blocks: f("warning_blocks", 5.0) as i32,
         }
+    }
+
+    /// Border as the physics sees it (current size, centre, warnings): the server's entities
+    /// collide with it like the game's.
+    pub(crate) fn physics(&self) -> rc_physics::WorldBorder {
+        let mut w = rc_physics::WorldBorder::default();
+        w.set_center(self.center[0], self.center[1]);
+        w.set_size(self.size);
+        w.warn_blocks = self.warn_blocks;
+        w.warn_ticks = self.warn_time;
+        w
     }
 
     fn to_nbt(&self) -> Nbt {
@@ -368,6 +382,7 @@ impl Cmds {
             bars: cmds_more::read_bars(world),
             bars_dirty: false,
             deferred: std::cell::RefCell::new(Vec::new()),
+            templates: Default::default(),
         };
         c.data.teams = c.scores.teams.iter().map(|t| t.name.clone()).collect();
         c.data.players = vec![player.to_owned()];
@@ -710,6 +725,7 @@ impl Server {
         if let Some((tx, text)) = self.cmd.pending_suggest.take() {
             self.answer_suggestions(tx, &text);
         }
+        self.fetchprofile_poll(); // G3-F08: profile lookups answered on the server thread
         self.flush_scores();
     }
 

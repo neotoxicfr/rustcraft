@@ -444,6 +444,8 @@ impl Server {
 
     /// Dragon fight (before the entities).
     pub(crate) fn end_fight_tick(&mut self) {
+        #[cfg(test)]
+        crate::server::phase("fight");
         self.fight_tick();
     }
 

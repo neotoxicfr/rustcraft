@@ -200,7 +200,9 @@ impl App {
                 return false;
             }
             let before = self.creative_ui.search.text.clone();
-            self.creative_ui.search.insert(t);
+            if let Some(t) = crate::widgets::chat_typed(t) {
+                self.creative_ui.search.insert(&t);
+            }
             if self.creative_ui.search.text != before {
                 self.creative_search_changed();
             }
@@ -295,9 +297,9 @@ impl App {
                 }
                 let (_, changed) = self.creative_ui.search.key(k, self.mods);
                 let mut changed = changed;
-                if let Some(t) = crate::widgets::typed_text(event, self.mods) {
+                if let Some(t) = crate::widgets::typed_text(event, self.mods).and_then(crate::widgets::chat_typed) {
                     let before = self.creative_ui.search.text.clone();
-                    self.creative_ui.search.insert(t);
+                    self.creative_ui.search.insert(&t);
                     changed |= self.creative_ui.search.text != before;
                 }
                 if changed {
@@ -386,6 +388,7 @@ impl App {
             carried: &mut inv.carried,
             rules: &rules,
             creative: true,
+            trade: None,
         };
         let mut hotbar = |b: i8| match b {
             0..=8 => Some(36 + b as usize),
@@ -521,6 +524,7 @@ impl App {
             carried: &mut inv.carried,
             rules: &rules,
             creative: true,
+            trade: None,
         };
         m.drag_end(slots, kind);
         if self.creative_ui.kind(&self.data) == CreativeKind::Inventory {
@@ -596,6 +600,7 @@ impl App {
             carried: &mut carried,
             rules: &rules,
             creative: true,
+            trade: None,
         };
         if mm.drag_accepts(i, kind, taken, true)
             && let Some((_, s)) = &mut self.creative_ui.drag

@@ -1319,6 +1319,7 @@ impl App {
         profiler::push("tick");
         let depth = profiler::depth();
         for _ in 0..due {
+            profiler::increment("clientTick");
             self.game_tick();
             profiler::unwind(depth);
         }
@@ -1775,9 +1776,8 @@ impl App {
                 yaw: self.yaw,
                 pitch: self.pitch,
                 shot: (shot.yaw, shot.pitch),
-                fov: r.view.fov,
+                view: r.view,
                 aspect,
-                hud_fov: r.view.hud_fov,
                 first_person: !self.camera.view.detached() && !self.free_cam,
                 spectator: self.env.game_mode == 3,
                 hud_hidden: self.hud.hidden,
@@ -3138,6 +3138,7 @@ impl App {
             }
         }
         self.env.gamma = Some(o.f("gamma") as f32);
+        self.env.set_fov_option(o.fov());
         let clouds = o.s("renderClouds") != "false";
         self.env.clouds = Some((clouds, o.i("cloudRange"), o.s("renderClouds") == "fast"));
         self.chat.apply_options(o);
@@ -3576,8 +3577,7 @@ impl ApplicationHandler for App {
                 {
                     return;
                 }
-                let step = if self.keys.contains(&KeyCode::ShiftLeft) { 1 } else { 7 };
-                self.chat.scroll(lines.signum() as i32 * step);
+                self.chat.scroll(chat::wheel_lines(lines, self.mods.shift_key()));
             }
             // Container screen: the wheel picks a bundle's item, never the bar.
             WindowEvent::MouseWheel { delta, .. } if self.screens.open => self.bundle_wheel(delta),

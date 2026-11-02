@@ -695,6 +695,25 @@ fn env_entries(attrs: &Value) -> Vec<crate::EnvEntry> {
     out
 }
 
+/// Curve of a track: `constant`, a named curve, `{"cubic_bezier": [x1, y1, x2, y2]}`, otherwise
+/// linear (`linear` or absent).
+fn read_ease(v: &Value) -> crate::Ease {
+    match v {
+        Value::String(s) if s == "constant" => crate::Ease::Constant,
+        Value::String(s) => {
+            crate::EASE_NAMES.iter().position(|n| n == s).map_or(crate::Ease::Linear, |i| crate::Ease::Named(i as u8))
+        }
+        Value::Object(o) => match o.get("cubic_bezier").and_then(Value::as_array) {
+            Some(c) if c.len() == 4 => {
+                let f = |i: usize| c[i].as_f64().unwrap_or(0.0) as f32;
+                crate::Ease::Bezier([f(0), f(1), f(2), f(3)])
+            }
+            _ => crate::Ease::Linear,
+        },
+        _ => crate::Ease::Linear,
+    }
+}
+
 /// Timelines of the base pack: tracks of the retained attributes only.
 fn read_timelines(jar: &Path) -> Result<Vec<crate::Timeline>> {
     Ok(data_jsons(jar, "timeline")?
@@ -705,17 +724,7 @@ fn read_timelines(jar: &Path) -> Result<Vec<crate::Timeline>> {
                 for (key, t) in map {
                     let Some(attr) = env_attr(key) else { continue };
                     let op = t["modifier"].as_str().and_then(crate::EnvOp::parse).unwrap_or(crate::EnvOp::Override);
-                    let ease = match &t["ease"] {
-                        Value::String(s) if s == "constant" => crate::Ease::Constant,
-                        Value::Object(o) => match o.get("cubic_bezier").and_then(Value::as_array) {
-                            Some(c) if c.len() == 4 => {
-                                let f = |i: usize| c[i].as_f64().unwrap_or(0.0) as f32;
-                                crate::Ease::Bezier([f(0), f(1), f(2), f(3)])
-                            }
-                            _ => crate::Ease::Linear,
-                        },
-                        _ => crate::Ease::Linear,
-                    };
+                    let ease = read_ease(&t["ease"]);
                     let keys = t["keyframes"]
                         .as_array()
                         .map(|k| {
@@ -833,6 +842,21 @@ fn parse_build_info(v: &Value) -> Result<BuildInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Track curves: named curves kept (a data pack may use any of the 30), unknown names linear.
+    #[test]
+    fn track_curves_keep_the_named_ones() {
+        let s = |v: &str| Value::String(v.to_owned());
+        assert_eq!(read_ease(&s("constant")), crate::Ease::Constant);
+        assert_eq!(read_ease(&s("linear")), crate::Ease::Linear);
+        assert_eq!(read_ease(&s("in_back")), crate::Ease::Named(0));
+        assert_eq!(read_ease(&s("in_out_sine")), crate::Ease::Named(19));
+        assert_eq!(read_ease(&s("out_sine")), crate::Ease::Named(29));
+        assert_eq!(read_ease(&s("wobble")), crate::Ease::Linear);
+        assert_eq!(read_ease(&Value::Null), crate::Ease::Linear);
+        let b = serde_json::json!({ "cubic_bezier": [0.25, 0.1, 0.25, 1.0] });
+        assert_eq!(read_ease(&b), crate::Ease::Bezier([0.25, 0.1, 0.25, 1.0]));
+    }
 
     /// Native libraries: each system retains only its own (otherwise, on Linux, Windows-specific
     /// files are missing and the game looks incomplete).

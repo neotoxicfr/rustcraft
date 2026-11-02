@@ -1018,31 +1018,6 @@ impl Server {
         }
     }
 
-    /// Chunk loaded: hearts, shriekers and sensors of its block entities registered.
-    pub(crate) fn rec_register_chunk(&mut self, ch: (i32, i32)) {
-        let Some(Some(c)) = self.chunks.get(&ch) else { return };
-        let found: Vec<(bool, [i32; 3])> = c
-            .block_entities
-            .iter()
-            .filter_map(|b| {
-                let id = b.get("id").and_then(Nbt::as_str)?;
-                let heart = id == "minecraft:creaking_heart";
-                if !heart && vibration::block_ear(id).is_none() {
-                    return None;
-                }
-                let i = |k: &str| crate::nbtio::int(b, k).unwrap_or(0) as i32;
-                Some((heart, [i("x"), i("y"), i("z")]))
-            })
-            .collect();
-        for (heart, p) in found {
-            if heart {
-                self.heart_register(p);
-            } else {
-                self.vib_block_register(p);
-            }
-        }
-    }
-
     /// Family ticker: alive? (`None`: not theirs.)
     pub(crate) fn rec_ticker_alive(&mut self, id: u64, p: [i32; 3]) -> Option<bool> {
         if self.heart_is_ticker(id, p) {

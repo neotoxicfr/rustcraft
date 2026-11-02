@@ -568,6 +568,8 @@ fn enc_misc(d: &VersionData, w: &mut W) {
                 Ease::Linear => (0, [0.0; 4]),
                 Ease::Constant => (1, [0.0; 4]),
                 Ease::Bezier(c) => (2, c),
+                // Named curves after the three fixed kinds (absent from the base pack's timelines).
+                Ease::Named(i) => (3 + i, [0.0; 4]),
             };
             w.u8(kind);
             for v in c {
@@ -1018,6 +1020,7 @@ fn dec_misc(b: &[u8]) -> Result<Misc> {
                 0 => Ease::Linear,
                 1 => Ease::Constant,
                 2 => Ease::Bezier(c),
+                k if usize::from(k - 3) < crate::EASE_NAMES.len() => Ease::Named(k - 3),
                 _ => return Err(Error::Format("invalid timeline curve".into())),
             };
             let m = r.len()?;
@@ -1253,4 +1256,20 @@ pub fn decode_with(bytes: &[u8], tag: u64, parallel: bool) -> Result<VersionData
         }
     }
     Ok(d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Track curves survive the cache: the three fixed kinds and the named ones.
+    #[test]
+    fn timeline_curves_round_trip() {
+        let mut d = VersionData::default();
+        let track = |ease| Track { attr: "minecraft:visual/sky_color".into(), op: EnvOp::Override, ease, keys: vec![(0, [1.0; 4])] };
+        let eases = [Ease::Linear, Ease::Constant, Ease::Bezier([0.1, 0.2, 0.3, 0.4]), Ease::Named(0), Ease::Named(29)];
+        d.timelines.push(Timeline { name: "t".into(), clock: "minecraft:overworld".into(), period: 24_000, tracks: eases.map(track).to_vec() });
+        let back = decode(&encode(&d, 7), 7).expect("decodes");
+        assert_eq!(back.timelines, d.timelines);
+    }
 }

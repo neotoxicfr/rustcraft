@@ -932,6 +932,8 @@ fn item_through_end_portal_turns_its_motion_by_its_own_yaw() {
     s.spawn_item(pos, [0.0, 0.0, 0.3], stack, 0);
     let id = s.life.drops.last().expect("item").id;
     s.life.drops.last_mut().expect("item").yaw = 90.0;
+    // Portal handled as part of the item's tick: ticked this tick.
+    s.life.drops.last_mut().expect("item").ticked = true;
     for _ in 0..3 {
         if !s.life.drops.iter().any(|d| d.id == id) {
             break;

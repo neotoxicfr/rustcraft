@@ -427,8 +427,7 @@ impl Server {
         let n = self.carts.list.len();
         for i in 0..n {
             let Some(mut cart) = self.carts.list.get_mut(i).and_then(Option::take) else { continue };
-            let c = (cart.pos[0].floor() as i32 >> 4, cart.pos[2].floor() as i32 >> 4);
-            let ticking = self.mob_chunk_ticking(c) && self.chunks.get(&c).is_some_and(Option::is_some);
+            let ticking = self.entity_ticks_at(cart.pos);
             if cart.removed || (!runs && player_cart != Some(cart.id)) || !ticking {
                 self.carts.list[i] = Some(cart);
                 continue;

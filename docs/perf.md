@@ -2910,3 +2910,165 @@ on a quiet machine with the others).
   melee path (one hit per spin). No hot path touched: the per-tick and per-hit costs above are
   unchanged (same bench, the mob melee path is identical). Multi-core and GPU not applicable
   (single events, ordered by the game).
+
+## G3-F13: world tick order, ticking chunks of the entities (02/11, loaded machine)
+
+Fidelity fix (phases of the world tick in the game's order, one block-entity list for every
+family, entities frozen outside the "ticking entities" chunks); figures from the micro-bench
+`bench_g3f13_entity_test_and_furnace_list` (3 passes, `cargo test --release -p rc-sim
+bench_g3f13 -- --ignored --nocapture`), loaded machine (other agents compiling).
+
+- Entity chunk test (`entity_ticks_at`, every entity other than a player and the mobs, which
+  already had it: items, orbs, falling blocks and TNT, projectiles, clouds, fangs, spits, bolts,
+  crystals, ominous item spawners): 8.2-8.5 ns per entity per tick in range, 6.6-7.3 ns out of
+  range (distance tests first, the chunk table lookup last: one hash lookup). Lead considered: a
+  per-tick set of the ticking chunks (O(loaded chunks) to build, more than the per-entity test
+  for the usual entity counts); not tried.
+- Furnaces and brewing stands moved from their own loops into the common block-entity list:
+  idle furnace 42.1-42.9 ns per tick against 54.2-54.6 ns for the former loop (−22 %), idle
+  brewing stand 55.7-56.3 ns against 82.0-83.0 ns (−32 %). Causes: no key copy per tick (former
+  `Vec` of every position), no block-name string per brewing stand per tick, the chunk test of
+  `be_ticking` (9 table lookups) reused while consecutive tickers stay in the same chunk, the
+  border read once per walk, the shared-map families (campfires, jukeboxes, beacons, conduits,
+  gateways, sulfur, and the four new ones) resolved by one lookup instead of the chain
+  movers → creaking hearts → map. First version measured on the way: 107 ns (two chains of
+  lookups, liveness reading the block and scanning the chunk's block entities), then 57-63 ns
+  (one lookup, block still read): both discarded for the figures above. The liveness of the four
+  new families reads nothing (their ticker leaves the map with their block entity). Bells: the
+  copy of the recorded entities per tick removed (read in place). Spawner blocks: the living
+  players read once per walk, only if a spawner ticks.
+- Tick bench `bench_ticks` (5 sites, the `redstone` site fails: function `perf:redstone` missing
+  from the current model world), before then after, not alternated, loaded machine: means
+  2.103 / 1.024 / 2.110 / 0.763 / 1.873 ms before, 0.820-0.856 / 0.711-0.714 / 1.371-1.395 /
+  0.543-0.544 / 1.377-1.398 ms after (two passes). The difference follows the machine's load
+  (the "before" pass ran during other agents' builds), not this change: no gain is claimed; to
+  measure on a quiet machine with `tools/bench/scenes.py`. Its "blocks and fluids" figure no
+  longer includes the falling blocks and TNT (they tick with the entities now).
+- Review follow-up: tickers of a loaded chunk in the order of the game's per-chunk table, every
+  family in one walk over the chunk's block entities (before: five walks, then the furnaces and
+  brewing stands in a sixth after the whole batch). Same bench: table order 3.0 µs for 256 block
+  entities (12 ns each), whole registration of a chunk of 256 brewing stands 13.8-14.0 µs, once
+  per chunk read or generated. Lead not taken: caching the order per chunk (computed once per
+  load already). Portal passage of items, mobs and minecarts now skipped outside the ticking
+  chunks (one chunk test per mob or minecart per tick, 7-8 ns; items reuse their tick's flag).
+  A player's pearl asks for 25 chunks instead of 1: a set lookup per chunk per pearl per tick.
+- Multi-core, GPU: not applicable (phase order and list order are observable).
+## G6-F14: game master blocks, live templates, clone, locate poi, border (02/11, loaded machine)
+
+- Border collision of the server's entities: the physics view builds the border at first need
+  (lazy cell, no work for the light engine or block reads); bench
+  `tests_g6f14::bench_border_in_entity_collision`: view alone 0.9 ns, view + border + edge test
+  of an entity far from the edge 16.0 ns per movement (best of 5 over 1,000,000). Lead not taken:
+  a border cached in the server (would save the build, a few ns) needs a resync at every change
+  of the border (command, transition tick, tests that write the fields): kept lazy, to re-measure
+  on a quiet machine against a movement of `rc_physics::collide::resolve`.
+- Redstone, neighbour changes and scheduled ticks of the structure and test blocks: new arms of
+  the existing `Kind` matches (block kind table), no name comparison on the hot path.
+- Size detection of a structure block: sections skipped by their palette (`may_contain`) before
+  any cell is read, then only the cells of the 161×161 area; command-time only.
+- Live template placement (`place template`, structure block): one pass over the palette, block
+  entities written once, edge shape pass on a bitset of the placed volume (faces only), sources
+  locked in a hash set; command-time only (no per-tick cost). Multi-core and GPU not applicable:
+  ordered writes into the live world, like the game.
+- `clone` ticks: only the chunks of the source box are visited (`TickQueue::in_box`).
+- `place structure`, `place jigsaw`, jigsaw block: the chunks of the start's box plus a one-chunk
+  border are copied once into a grid, each chunk column is placed through a 3×3 window of that
+  grid (disjoint borrows, no copy per chunk); lead not taken: one copy of the 3×3 neighbourhood
+  per chunk (9 copies per chunk instead of about 1). Review round: the placements are no longer
+  written back as a diff of the copies but replayed from a journal kept by the region
+  (`Region::live_log`, 24 bytes per placement, freed after the command, `None` and one branch per
+  write everywhere else), in their order and with their own flags (pool pieces without shape
+  update, like the game); bench `tests_g6f14::bench_place_jigsaw` (outpost base plate, best of
+  3): 13.1 ms, loaded machine; the old diff path is not kept (it was a fidelity defect, not a
+  lead), to compare against `main` on a quiet machine.
+  Command-time only. Biome tests of the structure generators go through one helper (`biome_ok`):
+  a command placement skips the biome lookup altogether; world generation unchanged (equivalence
+  tests of the starts and placements pass with their stored fingerprints).
+## G3-F08: compute, posteffect, fetchprofile, attribute reset, loot targets (02/11, loaded machine)
+
+- Numeric providers (`rc_sim::loot`, every loot draw): the unchecked reading now carries the
+  game's arithmetic error text (`Result<_, String>`, allocated only on an error) instead of a bare
+  failure. Bench `bench_g3f08_providers_and_hooks` (ignored by default, 1,000,000 reads, 2 passes
+  each): uniform 46.7-46.9 ns, binomial 46.7-46.8 ns, float uniform 45.6-49.0 ns, unchanged
+  within noise after the change below. Lead tried and kept: the entries of an aggregate
+  provider (`add`, `mul`, `min`, `max`, `avg`, `length`) are evaluated where they are instead of
+  copying the JSON list at each reading: sum of three constants 92.5-94.4 ns → 56.4-70.5 ns
+  (−25 to −40 %). Lead not tried (shared loot engine, G6-F17's ground): providers compiled once
+  per table into a typed tree (no string lookups of `type`, `min`, `max` at each reading), to
+  measure on a quiet machine with a loot-heavy scene. Multi-core and GPU not applicable (one draw
+  per event, the order of the draws is the game's).
+- Per-tick hooks: screen effects sent only when changed (one flag), profile answers polled only
+  when a lookup is pending: 2.9 ns per tick together when idle (same bench, 10,000,000 calls).
+- `/fetchprofile name|id`: network lookups on worker threads (never the server thread), cached
+  10 minutes per name and per identifier (256 entries each, failures included) like the game.
+  Review fix: one thread per lookup at first; now a pool started with the first lookup (one
+  worker per logical core, one shared queue; the game reuses the idle threads of an unbounded
+  I/O pool) and the cache lock is released during the network access (it was held, so lookups
+  of different profiles waited on each other). Same bench, bursts of 2,000 `fetchprofile id`
+  with instant fake services, 2 passes per version alternated: issuing on the server thread
+  16.7-17.4 µs → 1.9-2.8 µs per command, whole burst answered 53.4-55.7 ms → 7.7-11.7 ms.
+  Memory: the idle workers keep their stacks reserved (address space, a few committed pages
+  each) instead of up to one transient thread per pending lookup. Answers still read at a
+  following tick on the server thread: nothing observable changes but the order in which
+  simultaneous lookups finish, which the network decides in the game as well.
+  `/compute`, `/posteffect`, `/attribute`, `/loot`, `/enchant`, `/ride`, `/datapack`, `/spectate`:
+  command code, no hot path. Attribute base reset builds one mob of the species to read its
+  construction default (once per command). Player save: one key check (`post_effects`).
+- Fidelity side effect on the simulation: zombies, husks, zombie villagers, drowned, spiders,
+  cave spiders and endermen now move at their single-precision speed widened like the game
+  (0.23F, 0.3F): no cost change, world fingerprints updated in `tests_opt.rs` (causes checked
+  one by one).
+## G4-F17: trading uses, typed input, tooltips, smoothing, timeline curves, saves, profiling (02/11, loaded machine)
+
+Interface, save-folder and debug code driven by events, a screen or the F3+L recording; nothing
+added to a world loop outside these. Axes reviewed (client CPU, integrated server CPU,
+regularity, allocations, disk, RAM, startup, multi-core): figures below, the rest unchanged.
+
+- Optimize World (`rc_sim::storage::optimize`, three passes like the game): micro-bench
+  `storage::tests::bench_optimize` (8 region files of 1024 chunks, 2 passes, loaded machine).
+  Without erasing nothing can change, so no chunk is read again: 1.1-1.2 ms against 70-100 ms for
+  reading and inflating every chunk (what the old single pass did). With erasing, region files
+  shared among threads (one file per thread, `RUSTCRAFT_THREADS`, default the logical cores):
+  1 thread 359-371 ms, 2 threads 194-200 ms, 4 threads 118-212 ms, 8 threads 83-146 ms: kept
+  multi-core. Leads not taken: parallel chunks inside one region file (writes to one file stay
+  sequential, the inflate/deflate is per chunk and already spread by files); GPU not applicable
+  (zlib and NBT). The entity and POI passes only read region headers (8 KiB per file).
+- Named timeline curves (`rc_env::named_ease`, bit for bit with the game, values printed by the
+  game itself): `ease_tests::bench_named_curves`, 30 curves x 10 000 points, 4.77-4.84 ns per call
+  against 6.49-6.50 ns for the Bezier curve (2 passes). Sine and cosine of the game's table
+  computed on demand from the entry index (same value as the table, no 256 KiB table kept);
+  base-pack timelines never use them (no change in play).
+- Trading: the take of the result reuses the prediction (one offer lookup, at most 2 payment
+  checks); only on a click on the result slot. Not measured (a few comparisons per click).
+- Typed text: the event check reads only the first character (was: every character).
+- Tooltip effect durations: one atomic load of the tick rate per effect line (set once per
+  client tick with the other tooltip context bits).
+- Mouse smoothing, wheel accumulation, gliding roll: the game's sign (zero kept) replaces Rust's
+  `signum`: one more comparison; no measurable cost.
+- F3+L recording (only while it runs, 10 s): counters on the open path (at most 10 increments
+  per frame, `&'static` names, one path string per new zone), one single-frame collection per
+  frame like the game's per-tick profiler (rebuilt each frame; reusing its map would leave zero
+  entries in the tree), working-set read per frame (`heap MiB`), processor times read at most
+  every 501 ms (`NtQuerySystemInformation` / `/proc/stat`). Archive written once at the end.
+- To re-measure on a quiet machine: `bench_optimize` and `bench_named_curves` (2 passes each);
+  scene bench not concerned (nothing changed in the world loop).
+## G1-F17: option labels and menus, near plane of the fluid camera test (02/11, loaded machine)
+
+- Fluid-in-camera test (lava, powder snow): the near plane now follows the field-of-view option.
+  Its half-height is computed once when the option is applied (`EnvState::set_fov_option`) and
+  kept, instead of a tangent each frame (the former fixed 70° could be folded at compile time):
+  micro-bench `environ::cache_tests::bench_near_half` (2 passes, 10 M calls) 2.71-2.72 ns per frame
+  with the tangent against 0.56-0.57 ns with the kept value; kept. Third track, a table of the
+  81 option angles (30..=110) read each frame: 0.56-0.57 ns (2 passes, rerun 02/11 with the
+  tangent at 2.74-2.76 ns), no gain over the single kept value, which needs no table: dropped.
+  In-wall overlay test: near plane now sized by the culling field of view (max of the frame's and
+  the option, like the game); same tangent per frame as before, only its input changed, no cost
+  to measure. Rest of the per-frame test
+  unchanged (same neighbourhood cache, same five points). Multi-core and GPU not applicable (five
+  block reads per frame).
+- Option labels (brightness, fixed decimals through `tech_blocks::java_fixed`, about 110 ns per
+  real, see G1-F16; composed OFF key): computed on layout and on slider moves only, never per
+  frame; no measurable cost. Japanese glyph default: one system call at the first read, cached.
+- To re-measure on a quiet machine with the other menu missions: `menu` scene of
+  `tools/bench/scenes.py` (no change expected), screenshots of the video and accessibility
+  screens (titles 2 px lower, labels).

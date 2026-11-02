@@ -183,6 +183,15 @@ impl DecoChunk {
     }
 }
 
+/// One step of [`Region::live_log`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveOp {
+    /// Placement with the game's flags (a direct section write carries 18: no shape update).
+    Set([i32; 3], State, u32),
+    /// Neighbour update around the cell (template placed without known shape).
+    Notify([i32; 3]),
+}
+
 /// Write area: 3×3 chunks, centre at index 4 (`(dz + 1)·3 + (dx + 1)`).
 pub struct Region<'a> {
     pub chunks: [&'a mut DecoChunk; 9],
@@ -204,6 +213,9 @@ pub struct Region<'a> {
     pub writes: u64,
     /// Journal of the placements (debug against the probe).
     pub set_log: Option<Vec<([i32; 3], State)>>,
+    /// Journal replayed into the live world (`place structure`, `place jigsaw`): every accepted
+    /// write with its game flags, and the neighbour updates, in their order.
+    pub live_log: Option<Vec<LiveOp>>,
     /// Randomness of the region (factory "worldgen_region_random" at the corner of the central chunk).
     pub region_rng: crate::rng::Rng,
     /// Centre converted under regeneration: only the placements in this band (bottom, top excluded)
@@ -235,6 +247,7 @@ impl<'a> Region<'a> {
             zoom_seed: crate::rng::biome_zoom_seed(seed),
             writes: 0,
             set_log: None,
+            live_log: None,
             region_rng: crate::rng::Rng::xoroshiro(seed)
                 .fork_positional()
                 .from_hash_of("minecraft:worldgen_region_random")
@@ -317,6 +330,9 @@ impl<'a> Region<'a> {
         if self.outside_height(y) {
             return true;
         }
+        if let Some(l) = &mut self.live_log {
+            l.push(LiveOp::Set([x, y, z], s, flags));
+        }
         self.writes += 1;
         let b = self.b;
         let c = &mut *self.chunks[i];
@@ -388,6 +404,9 @@ impl<'a> Region<'a> {
             return;
         }
         if let Some(i) = self.chunk_index(x, z) {
+            if let Some(l) = &mut self.live_log {
+                l.push(LiveOp::Set([x, y, z], s, 18));
+            }
             let c = &mut *self.chunks[i];
             let idx = c.index(x, y, z);
             c.blocks[idx] = s;
@@ -413,6 +432,9 @@ impl<'a> Region<'a> {
     pub fn set_direct_in(&mut self, ci: usize, x: i32, y: i32, z: i32, s: State) {
         if self.band_refuses(y) {
             return;
+        }
+        if let Some(l) = &mut self.live_log {
+            l.push(LiveOp::Set([x, y, z], s, 18));
         }
         let c = &mut *self.chunks[ci];
         let idx = c.index(x, y, z);

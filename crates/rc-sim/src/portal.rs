@@ -854,6 +854,7 @@ impl Server {
         self.dims.won_game = false;
         self.life.vit.crit = Default::default(); // new player: criteria rewritten
         self.life.vit.impulse_reset(); // and no impulse context
+        self.pdata.post_effects_dirty = true; // G3-F08: screen effects carried over, sent again
         let t = self.respawn_transition(false);
         self.change_dimension(t);
     }
@@ -1326,6 +1327,11 @@ impl Server {
                 continue;
             }
             let (id, pos) = (c.id, c.pos);
+            // Part of the minecart's tick: frozen outside the "ticking entities" chunks.
+            if !self.entity_ticks_at(pos) {
+                i += 1;
+                continue;
+            }
             let touched = self.portals_touched(&ent_box(pos, WIDTH, HEIGHT));
             if touched.is_empty() && !self.dims.ents.contains_key(&id) {
                 i += 1;
@@ -1431,10 +1437,16 @@ impl Server {
         Some(t)
     }
 
-    /// Ground items in a portal (after their tick): passage, new dimension.
+    /// Ground items in a portal (after their tick): passage, new dimension. Part of the item's
+    /// tick: an item that did not tick this tick (outside the "ticking entities" chunks, born
+    /// during the walk) neither counts its portal time nor passes.
     pub(crate) fn drops_portal_tick(&mut self) {
         let mut i = 0;
         while i < self.life.drops.len() {
+            if !self.life.drops[i].ticked {
+                i += 1;
+                continue;
+            }
             let (id, pos) = (self.life.drops[i].id, self.life.drops[i].pos);
             let touched = self.portals_touched(&ent_box(pos, 0.25, 0.25));
             if touched.is_empty() && !self.dims.ents.contains_key(&id) {
@@ -1488,6 +1500,11 @@ impl Server {
                 continue;
             }
             let (id, pos) = (m.id, m.pos);
+            // Part of the mob's tick: frozen outside the "ticking entities" chunks.
+            if !self.entity_ticks_at(pos) {
+                i += 1;
+                continue;
+            }
             // Real box (babies, cube sizes, postures).
             let (w, h) = (f64::from(m.width()), f64::from(m.height()));
             let touched = self.portals_touched(&ent_box(pos, w, h));

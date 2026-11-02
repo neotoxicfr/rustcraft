@@ -6,6 +6,7 @@
 use rc_proto::nbt::Nbt;
 use serde_json::Value;
 
+use crate::commands::text::jf;
 use crate::datapack::DataPack;
 use crate::items::Items;
 use crate::player::Stack;
@@ -131,6 +132,74 @@ pub fn direct_of(ty: &str) -> Option<Option<&'static str>> {
 
 /// Stack thrown by `discard` (the game's single empty stack).
 const DISCARDED: &str = "minecraft:air";
+
+/// Value of a provider, or the text of the arithmetic error the game raises computing it.
+pub(crate) type Arith<T> = Result<T, String>;
+
+/// Error texts of the game's checked integer arithmetic (Java standard library).
+const OVERFLOW: &str = "integer overflow";
+const BY_ZERO: &str = "/ by zero";
+
+/// 64-bit value brought back to 32 bits, refused if it does not fit.
+fn long_to_int(v: i64) -> Arith<i32> {
+    i32::try_from(v).map_err(|_| format!("Value {v} can't be safely converted to int"))
+}
+
+/// Float truncated to an integer: refused if it is not finite or does not fit.
+fn float_to_int(f: f32) -> Arith<i32> {
+    if !f.is_finite() {
+        return Err(format!("Value {} can't be safely converted to int", jf(f)));
+    }
+    long_to_int(f as i64)
+}
+
+/// Checked integer power, step for step like the game's: negative exponent refused, square
+/// and final product checked, the partial products of the odd bits not checked.
+fn pow_exact(mut x: i32, mut n: i32) -> Arith<i32> {
+    if n < 0 {
+        return Err("negative exponent".to_owned());
+    }
+    if n == 0 {
+        return Ok(1);
+    }
+    if x == 0 || x == 1 {
+        return Ok(x);
+    }
+    if x == -1 {
+        return Ok(if n & 1 == 0 { 1 } else { -1 });
+    }
+    let mut p = 1i32;
+    while n > 1 {
+        if n & 1 != 0 {
+            p = p.wrapping_mul(x);
+        }
+        x = x.checked_mul(x).ok_or_else(|| OVERFLOW.to_owned())?;
+        n >>= 1;
+    }
+    p.checked_mul(x).ok_or_else(|| OVERFLOW.to_owned())
+}
+
+/// Minimum of two floats like the game's: NaN wins, -0 is below +0.
+fn java_min(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else if a == b {
+        if a.is_sign_negative() { a } else { b }
+    } else {
+        a.min(b)
+    }
+}
+
+/// Maximum of two floats like the game's: NaN wins, +0 is above -0.
+fn java_max(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else if a == b {
+        if a.is_sign_negative() { b } else { a }
+    } else {
+        a.max(b)
+    }
+}
 
 fn ench_name(v: &Value) -> &str {
     v.as_str().unwrap_or("")
@@ -435,25 +504,29 @@ impl Loot<'_> {
     /// Integer provider (`context_int_provider`): 0 if a computation overflows or makes no
     /// sense (division by zero, impossible conversion), like reading an integer.
     pub fn int(&self, v: &Value, ctx: &Ctx<'_>, rng: &mut dyn Rand) -> i32 {
-        self.int_unsafe(v, ctx, rng).unwrap_or(0)
+        self.int_checked(v, ctx, rng).unwrap_or(0)
     }
 
     /// Float provider (`context_float_provider`): 0 if the computation fails or is not
     /// finite, like reading a float.
     pub fn float(&self, v: &Value, ctx: &Ctx<'_>, rng: &mut dyn Rand) -> f32 {
-        self.float_unsafe(v, ctx, rng).filter(|f| f.is_finite()).unwrap_or(0.0)
+        self.float_checked(v, ctx, rng).ok().filter(|f| f.is_finite()).unwrap_or(0.0)
     }
 
-    /// Entries of an aggregate provider (`inputs`: list, reference or tag of providers).
-    fn inputs(&self, v: &Value, reg: &str) -> Vec<Value> {
+    /// Values of the entries of an aggregate provider (`inputs`: list, reference or tag of
+    /// providers), evaluated in order where they are (no copy of the entries).
+    fn each_input<T>(&self, v: &Value, reg: &str, mut f: impl FnMut(&Value) -> Arith<T>) -> Arith<Vec<T>> {
         match v {
-            Value::Array(a) => a.clone(),
+            Value::Array(a) => a.iter().map(f).collect(),
             Value::String(id) => match id.strip_prefix('#') {
-                Some(_) => Vec::new(),
-                None => self.pack.get(reg, id).map(|a| (*a).clone()).into_iter().collect(),
+                Some(_) => Ok(Vec::new()),
+                None => match self.pack.get(reg, id) {
+                    Some(p) => Ok(vec![f(&p)?]),
+                    None => Ok(Vec::new()),
+                },
             },
-            Value::Null => Vec::new(),
-            o => vec![o.clone()],
+            Value::Null => Ok(Vec::new()),
+            o => Ok(vec![f(o)?]),
         }
     }
 
@@ -484,184 +557,188 @@ impl Loot<'_> {
         v.get("default")
     }
 
-    /// `None` = arithmetic error (propagated up to the first call).
-    fn int_unsafe(&self, v: &Value, ctx: &Ctx<'_>, rng: &mut dyn Rand) -> Option<i32> {
-        let int_of = |f: f32| -> Option<i32> {
-            if !f.is_finite() {
-                return None;
-            }
-            let l = f as i64;
-            i32::try_from(l).ok()
-        };
+    /// Integer provider read without the safety net: `Err` carries the text of the arithmetic
+    /// error the game raises (overflow, division by zero, impossible conversion), shown by
+    /// `/compute`; it propagates up to the first call.
+    pub(crate) fn int_checked(&self, v: &Value, ctx: &Ctx<'_>, rng: &mut dyn Rand) -> Arith<i32> {
         match v {
-            Value::Number(n) => Some(n.as_i64().map_or_else(|| n.as_f64().unwrap_or(0.0) as i32, |i| i as i32)),
+            Value::Number(n) => Ok(n.as_i64().map_or_else(|| n.as_f64().unwrap_or(0.0) as i32, |i| i as i32)),
             Value::String(id) => match self.pack.get("context_int_provider", id) {
-                Some(p) => self.int_unsafe(&p, ctx, rng),
-                None => Some(0),
+                Some(p) => self.int_checked(&p, ctx, rng),
+                None => Ok(0),
             },
             Value::Object(o) => {
                 let ty = o.get("type").and_then(Value::as_str).unwrap_or("").trim_start_matches("minecraft:");
                 let reg = "context_int_provider";
-                let all = |s: &Self, rng: &mut dyn Rand| -> Option<Vec<i32>> {
-                    s.inputs(&v["inputs"], reg).iter().map(|x| s.int_unsafe(x, ctx, rng)).collect()
+                let all = |s: &Self, rng: &mut dyn Rand| -> Arith<Vec<i32>> {
+                    s.each_input(&v["inputs"], reg, |x| s.int_checked(x, ctx, rng))
                 };
-                let two = |s: &Self, rng: &mut dyn Rand| -> Option<(i32, i32)> {
-                    let a = s.int_unsafe(&v["left"], ctx, rng)?;
-                    let b = s.int_unsafe(&v["right"], ctx, rng)?;
-                    Some((a, b))
+                let two = |s: &Self, rng: &mut dyn Rand| -> Arith<(i32, i32)> {
+                    let a = s.int_checked(&v["left"], ctx, rng)?;
+                    let b = s.int_checked(&v["right"], ctx, rng)?;
+                    Ok((a, b))
                 };
-                let one = |s: &Self, rng: &mut dyn Rand| s.int_unsafe(&v["input"], ctx, rng);
+                let one = |s: &Self, rng: &mut dyn Rand| s.int_checked(&v["input"], ctx, rng);
+                let nonzero = |b: i32| if b == 0 { Err(BY_ZERO.to_owned()) } else { Ok(b) };
                 match ty {
-                    "constant" => v["value"].as_i64().map(|x| x as i32).or(Some(0)),
+                    "constant" => Ok(v["value"].as_i64().map_or(0, |x| x as i32)),
                     "uniform" => {
-                        let a = self.int_unsafe(&v["min"], ctx, rng)?;
-                        let b = self.int_unsafe(&v["max"], ctx, rng)?;
-                        Some(rng.between(a, b))
+                        let a = self.int_checked(&v["min"], ctx, rng)?;
+                        let b = self.int_checked(&v["max"], ctx, rng)?;
+                        Ok(rng.between(a, b))
                     }
                     "binomial" => {
-                        let n = self.int_unsafe(&v["n"], ctx, rng)?;
-                        let p = self.float_unsafe(&v["p"], ctx, rng)?;
-                        Some((0..n).filter(|_| rng.next_float() < p).count() as i32)
+                        let n = self.int_checked(&v["n"], ctx, rng)?;
+                        // The probability must be a finite number (otherwise an error, not 0).
+                        let p = self.float_checked(&v["p"], ctx, rng)?;
+                        if !p.is_finite() {
+                            return Err(format!("Invalid value: {}", jf(p)));
+                        }
+                        Ok((0..n).filter(|_| rng.next_float() < p).count() as i32)
                     }
                     "conditional" => {
                         if self.cond(&v["condition"], ctx, rng) {
-                            self.int_unsafe(&v["on_true"], ctx, rng)
+                            self.int_checked(&v["on_true"], ctx, rng)
                         } else {
                             match v.get("on_false") {
-                                Some(f) => self.int_unsafe(f, ctx, rng),
-                                None => Some(0),
+                                Some(f) => self.int_checked(f, ctx, rng),
+                                None => Ok(0),
                             }
                         }
                     }
                     "number_dispatcher" => match self.dispatch(v, ctx, rng) {
-                        Some(x) => self.int_unsafe(x, ctx, rng),
-                        None => Some(0),
+                        Some(x) => self.int_checked(x, ctx, rng),
+                        None => Ok(0),
                     },
-                    "weighted_list" => {
-                        let x = self.weighted(v, rng)?;
-                        self.int_unsafe(x, ctx, rng)
-                    }
-                    "add" => i32::try_from(all(self, rng)?.iter().map(|&x| i64::from(x)).sum::<i64>()).ok(),
-                    "mul" => {
-                        let mut p = 1i64;
-                        for x in all(self, rng)? {
-                            p = p.wrapping_mul(i64::from(x));
-                        }
-                        i32::try_from(p).ok()
-                    }
-                    "min" => Some(all(self, rng)?.into_iter().fold(i32::MAX, i32::min)),
-                    "max" => Some(all(self, rng)?.into_iter().fold(i32::MIN, i32::max)),
+                    // Empty or oversized distribution: refused when the data is read, never drawn.
+                    "weighted_list" => match self.weighted(v, rng) {
+                        Some(x) => self.int_checked(x, ctx, rng),
+                        None => Err(String::new()),
+                    },
+                    // Sums and products accumulated on 64 bits, then brought back to 32 bits.
+                    "add" => long_to_int(all(self, rng)?.iter().map(|&x| i64::from(x)).sum::<i64>()),
+                    "mul" => long_to_int(all(self, rng)?.iter().fold(1i64, |p, &x| p.wrapping_mul(i64::from(x)))),
+                    "min" => Ok(all(self, rng)?.into_iter().fold(i32::MAX, i32::min)),
+                    "max" => Ok(all(self, rng)?.into_iter().fold(i32::MIN, i32::max)),
                     "avg" => {
                         let xs = all(self, rng)?;
-                        if xs.is_empty() {
-                            return None;
-                        }
                         let sum: i64 = xs.iter().map(|&x| i64::from(x)).sum();
-                        i32::try_from(sum / xs.len() as i64).ok()
+                        let n = xs.len() as i64;
+                        if n == 0 {
+                            return Err(BY_ZERO.to_owned());
+                        }
+                        long_to_int(sum / n)
                     }
                     "sub" => {
                         let (a, b) = two(self, rng)?;
-                        a.checked_sub(b)
+                        a.checked_sub(b).ok_or_else(|| OVERFLOW.to_owned())
                     }
+                    // Plain 32-bit division and remainder: the minimum divided by -1 wraps.
                     "div" => {
                         let (a, b) = two(self, rng)?;
-                        a.checked_div(b)
+                        Ok(a.wrapping_div(nonzero(b)?))
                     }
                     "mod" => {
                         let (a, b) = two(self, rng)?;
-                        a.checked_rem(b)
+                        Ok(a.wrapping_rem(nonzero(b)?))
                     }
                     "floor_div" => {
                         let (a, b) = two(self, rng)?;
-                        if b == 0 || (a == i32::MIN && b == -1) {
-                            return None;
+                        let b = nonzero(b)?;
+                        if a == i32::MIN && b == -1 {
+                            return Err(OVERFLOW.to_owned());
                         }
                         let q = a / b;
-                        Some(if a % b != 0 && ((a ^ b) < 0) { q - 1 } else { q })
+                        Ok(if a % b != 0 && ((a ^ b) < 0) { q - 1 } else { q })
                     }
                     "floor_mod" => {
                         let (a, b) = two(self, rng)?;
-                        if b == 0 {
-                            return None;
-                        }
+                        let b = nonzero(b)?;
                         let r = a.wrapping_rem(b);
-                        Some(if r != 0 && ((r ^ b) < 0) { r + b } else { r })
+                        Ok(if r != 0 && ((r ^ b) < 0) { r + b } else { r })
                     }
-                    "abs" => one(self, rng)?.checked_abs(),
-                    "negate" => one(self, rng)?.checked_neg(),
+                    "abs" => {
+                        let x = one(self, rng)?;
+                        x.checked_abs().ok_or_else(|| "Overflow to represent absolute value of Integer.MIN_VALUE".to_owned())
+                    }
+                    "negate" => one(self, rng)?.checked_neg().ok_or_else(|| OVERFLOW.to_owned()),
                     "pow" => {
-                        let base = self.int_unsafe(&v["base"], ctx, rng)?;
-                        let e = self.int_unsafe(&v["exponent"], ctx, rng)?;
-                        if (base == 0 && e == 0) || e < 0 {
-                            return None;
+                        let base = self.int_checked(&v["base"], ctx, rng)?;
+                        let e = self.int_checked(&v["exponent"], ctx, rng)?;
+                        if base == 0 && e == 0 {
+                            return Err("Result of 0 to the power of 0 is undefined".to_owned());
                         }
-                        base.checked_pow(e as u32)
+                        pow_exact(base, e)
                     }
-                    "from_float" => int_of(self.float_unsafe(&v["input"], ctx, rng)?),
+                    "from_float" => float_to_int(self.float_checked(&v["input"], ctx, rng)?),
                     // Scoreboard, storage, environment attributes: world not lent,
                     // fallback value.
                     "score" | "storage" => match v.get("fallback") {
-                        Some(f) => self.int_unsafe(f, ctx, rng),
-                        None => Some(0),
+                        Some(f) => self.int_checked(f, ctx, rng),
+                        None => Ok(0),
                     },
-                    _ => Some(0),
+                    _ => Ok(0),
                 }
             }
-            _ => Some(0),
+            _ => Ok(0),
         }
     }
 
-    /// `None` = arithmetic error.
-    fn float_unsafe(&self, v: &Value, ctx: &Ctx<'_>, rng: &mut dyn Rand) -> Option<f32> {
+    /// Float provider read without the safety net: `Err` = arithmetic error of an integer
+    /// provider inside; a non-finite result is a value (the caller decides).
+    pub(crate) fn float_checked(&self, v: &Value, ctx: &Ctx<'_>, rng: &mut dyn Rand) -> Arith<f32> {
         match v {
-            Value::Number(n) => Some(n.as_f64().unwrap_or(0.0) as f32),
+            Value::Number(n) => Ok(n.as_f64().unwrap_or(0.0) as f32),
             Value::String(id) => match self.pack.get("context_float_provider", id) {
-                Some(p) => self.float_unsafe(&p, ctx, rng),
-                None => Some(0.0),
+                Some(p) => self.float_checked(&p, ctx, rng),
+                None => Ok(0.0),
             },
             Value::Object(o) => {
                 let ty = o.get("type").and_then(Value::as_str).unwrap_or("").trim_start_matches("minecraft:");
                 let reg = "context_float_provider";
-                let all = |s: &Self, rng: &mut dyn Rand| -> Option<Vec<f32>> {
-                    s.inputs(&v["inputs"], reg).iter().map(|x| s.float_unsafe(x, ctx, rng)).collect()
+                let all = |s: &Self, rng: &mut dyn Rand| -> Arith<Vec<f32>> {
+                    s.each_input(&v["inputs"], reg, |x| s.float_checked(x, ctx, rng))
                 };
-                let two = |s: &Self, rng: &mut dyn Rand| -> Option<(f32, f32)> {
-                    let a = s.float_unsafe(&v["left"], ctx, rng)?;
-                    let b = s.float_unsafe(&v["right"], ctx, rng)?;
-                    Some((a, b))
+                let two = |s: &Self, rng: &mut dyn Rand| -> Arith<(f32, f32)> {
+                    let a = s.float_checked(&v["left"], ctx, rng)?;
+                    let b = s.float_checked(&v["right"], ctx, rng)?;
+                    Ok((a, b))
                 };
-                let one = |s: &Self, rng: &mut dyn Rand| s.float_unsafe(&v["input"], ctx, rng);
-                Some(match ty {
+                let one = |s: &Self, rng: &mut dyn Rand| s.float_checked(&v["input"], ctx, rng);
+                Ok(match ty {
                     "constant" => v["value"].as_f64().unwrap_or(0.0) as f32,
                     "uniform" => {
-                        let a = self.float_unsafe(&v["min"], ctx, rng)?;
-                        let b = self.float_unsafe(&v["max"], ctx, rng)?;
+                        let a = self.float_checked(&v["min"], ctx, rng)?;
+                        let b = self.float_checked(&v["max"], ctx, rng)?;
                         if a >= b { a } else { rng.next_float() * (b - a) + a }
                     }
                     "conditional" => {
                         return if self.cond(&v["condition"], ctx, rng) {
-                            self.float_unsafe(&v["on_true"], ctx, rng)
+                            self.float_checked(&v["on_true"], ctx, rng)
                         } else {
                             match v.get("on_false") {
-                                Some(f) => self.float_unsafe(f, ctx, rng),
-                                None => Some(0.0),
+                                Some(f) => self.float_checked(f, ctx, rng),
+                                None => Ok(0.0),
                             }
                         };
                     }
                     "number_dispatcher" => {
                         return match self.dispatch(v, ctx, rng) {
-                            Some(x) => self.float_unsafe(x, ctx, rng),
-                            None => Some(0.0),
+                            Some(x) => self.float_checked(x, ctx, rng),
+                            None => Ok(0.0),
                         };
                     }
                     "weighted_list" => {
-                        let x = self.weighted(v, rng)?;
-                        return self.float_unsafe(x, ctx, rng);
+                        return match self.weighted(v, rng) {
+                            Some(x) => self.float_checked(x, ctx, rng),
+                            None => Err(String::new()),
+                        };
                     }
                     "add" => all(self, rng)?.into_iter().fold(0.0, |a, x| a + x),
                     "mul" => all(self, rng)?.into_iter().fold(1.0, |a, x| a * x),
-                    "min" => all(self, rng)?.into_iter().fold(f32::MAX, f32::min),
-                    "max" => all(self, rng)?.into_iter().fold(-f32::MAX, f32::max),
+                    // The game's minimum and maximum: NaN wins, -0 is below +0.
+                    "min" => all(self, rng)?.into_iter().fold(f32::MAX, java_min),
+                    "max" => all(self, rng)?.into_iter().fold(-f32::MAX, java_max),
                     "avg" => {
                         let xs = all(self, rng)?;
                         xs.iter().fold(0.0f32, |a, x| a + x) / xs.len() as f32
@@ -675,23 +752,22 @@ impl Loot<'_> {
                         let (a, b) = two(self, rng)?;
                         a / b
                     }
+                    // Divisor read first; zero gives NaN without reading the dividend.
                     "mod" => {
-                        let (a, b) = two(self, rng)?;
-                        if b == 0.0 { f32::NAN } else { a % b }
+                        let b = self.float_checked(&v["right"], ctx, rng)?;
+                        if b == 0.0 { f32::NAN } else { self.float_checked(&v["left"], ctx, rng)? % b }
                     }
                     "pow" => {
-                        let base = self.float_unsafe(&v["base"], ctx, rng)?;
-                        let e = self.float_unsafe(&v["exponent"], ctx, rng)?;
+                        let base = self.float_checked(&v["base"], ctx, rng)?;
+                        let e = self.float_checked(&v["exponent"], ctx, rng)?;
                         if base == 0.0 && e == 0.0 { f32::NAN } else { f64::from(base).powf(f64::from(e)) as f32 }
                     }
                     "abs" => one(self, rng)?.abs(),
                     "negate" => -one(self, rng)?,
                     "floor" => one(self, rng)?.floor(),
-                    "ceil" => one(self, rng)?.ceil(),
-                    "round" => {
-                        let x = one(self, rng)?;
-                        if x.is_nan() { 0.0 } else { (x + 0.5).floor().clamp(i32::MIN as f32, i32::MAX as f32) }
-                    }
+                    // Ceiling and rounding go through a 32-bit integer: saturated, NaN gives 0.
+                    "ceil" => (f64::from(one(self, rng)?).ceil() as i32) as f32,
+                    "round" => ((f64::from(one(self, rng)?) + 0.5).floor() as i32) as f32,
                     "truncate" => {
                         let x = one(self, rng)?;
                         if x > 0.0 { x.floor() } else { x.ceil() }
@@ -699,19 +775,19 @@ impl Loot<'_> {
                     "sqrt" => one(self, rng)?.sqrt(),
                     "sin" => crate::mobs::mth::sin(one(self, rng)?),
                     "cos" => crate::mobs::mth::cos(one(self, rng)?),
-                    "from_int" => self.int_unsafe(&v["input"], ctx, rng)? as f32,
+                    "from_int" => self.int_checked(&v["input"], ctx, rng)? as f32,
                     // Storage: world not lent, fallback value; enchantment level absent
                     // from the loot context: level 0.
                     "storage" => {
                         return match v.get("fallback") {
-                            Some(f) => self.float_unsafe(f, ctx, rng),
-                            None => Some(0.0),
+                            Some(f) => self.float_checked(f, ctx, rng),
+                            None => Ok(0.0),
                         };
                     }
                     _ => 0.0,
                 })
             }
-            _ => Some(0.0),
+            _ => Ok(0.0),
         }
     }
 
@@ -1123,6 +1199,36 @@ mod tests {
     use serde_json::json;
 
     use super::{Ctx, Loot};
+
+    /// G3-F08: checked integer power, compared with the Java standard library's over a grid
+    /// (x in -40..=40 plus extremes, n in -2..=40): text `x,n=result;` or `x,n!message;`,
+    /// length and Java string hash recorded with the launcher's JDK 25.
+    #[test]
+    fn pow_exact_matches_java() {
+        let mut xs: Vec<i32> = (-40..=40).collect();
+        xs.extend([i32::MIN, i32::MAX, 46340, 46341, -46341, 1290, -1291, 65536]);
+        let mut s = String::new();
+        for &x in &xs {
+            for n in -2..=40 {
+                match super::pow_exact(x, n) {
+                    Ok(v) => s.push_str(&format!("{x},{n}={v};")),
+                    Err(e) => s.push_str(&format!("{x},{n}!{e};")),
+                }
+            }
+        }
+        let hash = s.encode_utf16().fold(0i32, |h, c| h.wrapping_mul(31).wrapping_add(i32::from(c)));
+        assert_eq!((s.len(), hash), (79_972, 1_696_459_921), "checked power grid differs from Java");
+    }
+
+    /// G3-F08: float minimum and maximum like Java's (NaN wins, signed zeros ordered).
+    #[test]
+    fn java_float_min_max() {
+        use super::{java_max, java_min};
+        assert!(java_min(1.0, f32::NAN).is_nan() && java_max(f32::NAN, 1.0).is_nan());
+        assert!(java_min(0.0, -0.0).is_sign_negative() && java_min(-0.0, 0.0).is_sign_negative());
+        assert!(java_max(0.0, -0.0).is_sign_positive() && java_max(-0.0, 0.0).is_sign_positive());
+        assert_eq!((java_min(2.0, 3.0), java_max(2.0, 3.0)), (2.0, 3.0));
+    }
 
     #[test]
     fn emptied_stack_still_goes_through_pool_and_table_functions() {

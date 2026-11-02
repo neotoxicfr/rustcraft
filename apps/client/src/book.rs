@@ -90,7 +90,7 @@ pub(crate) fn truncate_u16(t: &mut Vec<char>, max: usize) {
 
 /// Character allowed in an input (no `§`, no control, no DEL; `\n` in multiline).
 fn allowed(c: char, multiline: bool) -> bool {
-    (c != '§' && c >= ' ' && c != '\u{7f}') || (multiline && c == '\n')
+    rc_text::allowed_chat_char(c) || (multiline && c == '\n')
 }
 
 fn advance(m: &dyn rc_text::Metrics, c: char) -> f32 {
@@ -849,8 +849,8 @@ impl Book {
                 return out;
             }
             let (used, _) = t.key(k, mods);
-            if !used && let Some(s) = text {
-                t.insert(s);
+            if !used && let Some(s) = text.and_then(crate::widgets::chat_typed) {
+                t.insert(&s);
             }
             return out;
         }
@@ -868,8 +868,8 @@ impl Book {
         let page = self.page;
         let (Mode::Edit { pages, area, .. }, Some(gui)) = (&mut self.mode, gui) else { return out };
         let mut changed = area.key(gui, k, mods);
-        if let Some(s) = text {
-            changed |= area.insert(gui, s);
+        if let Some(s) = text.and_then(crate::widgets::chat_typed) {
+            changed |= area.insert(gui, &s);
         }
         if changed {
             pages[page] = area.value();

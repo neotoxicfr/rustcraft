@@ -366,7 +366,7 @@ impl Server {
                     }
                 }
                 let air = self.default_state("minecraft:air");
-                self.container_broken(p);
+                // Contents thrown by the removal itself (`container_broken` in `set_block`).
                 self.set_block(p, air, crate::blocks::flag::ALL);
                 if hive {
                     crate::mobs::wild::hive::anger_nearby(self, p);

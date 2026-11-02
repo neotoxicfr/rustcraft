@@ -46,6 +46,8 @@ pub(crate) struct World {
     pub drop_chunks: BTreeSet<(i32, i32)>,
     pub orbs: Vec<crate::drops::Orb>,
     pub furnaces: HashMap<[i32; 3], crate::containers::Furnace>,
+    /// G3-F13: brewing stands of the dimension (their tickers are in `bs`).
+    pub brewers: HashMap<[i32; 3], crate::brewing::Brewer>,
     pub changed: Vec<P>,
     pub relight: Vec<P>,
     /// `relight` positions that touch the sky (C2-M04).
@@ -229,10 +231,15 @@ impl Server {
         swap(&mut self.mobs.mounts.bolts, &mut w.mobs.mounts.bolts);
         swap(&mut self.mobs.poi, &mut w.mobs.poi);
         swap(&mut self.mobs.end, &mut w.mobs.end); // F15: crystals, dragon fight
+        // G3-F13: state of the block entities whose tickers live in `bs` (rung bells, vaults,
+        // ominous item spawners), kept with their dimension.
+        swap(&mut self.mobs.bells, &mut w.mobs.bells);
+        swap(&mut self.mobs.spawners.blocks, &mut w.mobs.spawners.blocks);
         swap(&mut self.life.drops, &mut w.drops);
         swap(&mut self.life.drop_chunks, &mut w.drop_chunks);
         swap(&mut self.life.orbs, &mut w.orbs);
         swap(&mut self.life.furnaces, &mut w.furnaces);
+        swap(&mut self.life.brewers, &mut w.brewers); // G3-F13
         swap(&mut self.changed, &mut w.changed);
         swap(&mut self.relight, &mut w.relight);
         swap(&mut self.relight_sky, &mut w.relight_sky);
@@ -308,6 +315,7 @@ impl Server {
             drop_chunks: BTreeSet::new(),
             orbs: Vec::new(),
             furnaces: HashMap::new(),
+            brewers: HashMap::new(),
             changed: Vec::new(),
             relight: Vec::new(),
             relight_sky: Vec::new(),
@@ -377,6 +385,7 @@ impl Server {
                 // Proto-chunks of the parked dimension's generator: written before `jobs`.
                 s.flush_gen(wait);
                 s.flush_furnaces();
+                s.flush_brewers(); // G3-F13: brewing stands kept with their dimension
                 s.drops_save_jobs(jobs);
                 s.poi_save_jobs(jobs); // F05: points of interest of the parked dimension
                 s.end_save_jobs(jobs); // F15: dragon fight

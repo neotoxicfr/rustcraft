@@ -68,10 +68,17 @@ fn satisfied(o: &Offer, a: &ItemStack, b: Option<&ItemStack>, rules: &dyn Rules)
     }
 }
 
-/// Predicted result (§ 1.2): offer found and not sold out.
-pub fn predict(t: &Trade, s0: Option<&ItemStack>, s1: Option<&ItemStack>, rules: &dyn Rules) -> Option<usize> {
+/// Offers matched by the payment slots (§ 1.2): (active offer, offer whose result is shown). A
+/// sold-out first match stays the active offer, without a result, when the swapped attempt finds
+/// no offer still in stock.
+fn lookup(
+    t: &Trade,
+    s0: Option<&ItemStack>,
+    s1: Option<&ItemStack>,
+    rules: &dyn Rules,
+) -> (Option<usize>, Option<usize>) {
     let (a, b) = if s0.is_none() { (s1, None) } else { (s0, s1) };
-    let a = a?;
+    let Some(a) = a else { return (None, None) };
     let n = t.offers.len();
     let find = |a: &ItemStack, b: Option<&ItemStack>| -> Option<usize> {
         let h = t.selected;
@@ -80,8 +87,74 @@ pub fn predict(t: &Trade, s0: Option<&ItemStack>, s1: Option<&ItemStack>, rules:
         }
         (0..n).find(|&i| satisfied(&t.offers[i], a, b, rules))
     };
-    let first = find(a, b).filter(|&i| !out_of_stock(&t.offers[i]));
-    first.or_else(|| b.and_then(|b| find(b, Some(a))).filter(|&i| !out_of_stock(&t.offers[i])))
+    let first = find(a, b);
+    if first.is_some_and(|i| !out_of_stock(&t.offers[i])) {
+        return (first, first);
+    }
+    match b.and_then(|b| find(b, Some(a))) {
+        Some(j) if !out_of_stock(&t.offers[j]) => (Some(j), Some(j)),
+        _ => (first, None),
+    }
+}
+
+/// Predicted result (§ 1.2): offer found and not sold out.
+pub fn predict(t: &Trade, s0: Option<&ItemStack>, s1: Option<&ItemStack>, rules: &dyn Rules) -> Option<usize> {
+    lookup(t, s0, s1, rules).1
+}
+
+/// Result slot and predicted experience recomputed from the payment slots. With payment but no
+/// offer received yet, the result slot is left as it is.
+fn refresh(t: &mut Trade, slots: &mut [Option<ItemStack>], rules: &dyn Rules) {
+    t.last = (slots[0].clone(), slots[1].clone());
+    if (slots[0].is_some() || slots[1].is_some()) && t.offers.is_empty() {
+        return;
+    }
+    match predict(t, slots[0].as_ref(), slots[1].as_ref(), rules) {
+        Some(i) => {
+            slots[2] = t.offers[i].result.clone();
+            t.future_xp = t.offers[i].xp;
+        }
+        None => {
+            slots[2] = None;
+            t.future_xp = 0;
+        }
+    }
+}
+
+/// Result just taken out of slot 2 (§ 1.4): the active offer consumes its payment (in either slot
+/// order) and counts one use, the merchant's experience grows by the offer's in any case, then the
+/// result is predicted again from what is left. Without this the client never sees an offer sell
+/// out before the screen is reopened (the server does not resend the offers after a trade).
+pub(crate) fn take(t: &mut Trade, slots: &mut [Option<ItemStack>], rules: &dyn Rules) {
+    if let (Some(i), _) = lookup(t, slots[0].as_ref(), slots[1].as_ref(), rules) {
+        let o = &mut t.offers[i];
+        if pay(o, slots, 0, 1, rules) || pay(o, slots, 1, 0, rules) {
+            o.uses = o.uses.wrapping_add(1);
+        }
+        t.xp = t.xp.wrapping_add(o.xp);
+    }
+    refresh(t, slots, rules);
+}
+
+/// Payment of `o` with slot `a` as first cost and slot `b` as second; nothing taken when unmet.
+fn pay(o: &Offer, slots: &mut [Option<ItemStack>], a: usize, b: usize, rules: &dyn Rules) -> bool {
+    let Some(sa) = &slots[a] else { return false };
+    if !satisfied(o, sa, slots[b].as_ref(), rules) {
+        return false;
+    }
+    let shrink = |s: &mut Option<ItemStack>, n: i32| {
+        if let Some(st) = s {
+            st.count -= n;
+            if st.count <= 0 {
+                *s = None;
+            }
+        }
+    };
+    shrink(&mut slots[a], adjusted_a(o, rules).count);
+    if let Some(c) = &o.cost_b {
+        shrink(&mut slots[b], c.count);
+    }
+    true
 }
 
 /// Background, titles, offer buttons, list, scrolling, experience bar.
@@ -251,18 +324,7 @@ impl crate::App {
         if c.kind != Kind::Special(Sp::Merchant) || c.slots.len() < 3 {
             return;
         }
-        let t = &mut c.extra.trade;
-        t.last = (c.slots[0].clone(), c.slots[1].clone());
-        match predict(t, c.slots[0].as_ref(), c.slots[1].as_ref(), &rules) {
-            Some(i) => {
-                c.slots[2] = t.offers[i].result.clone();
-                t.future_xp = t.offers[i].xp;
-            }
-            None => {
-                c.slots[2] = None;
-                t.future_xp = 0;
-            }
-        }
+        refresh(&mut c.extra.trade, &mut c.slots, &rules);
     }
 
     pub(crate) fn trade_tick(&mut self) {
@@ -320,7 +382,7 @@ impl crate::App {
         let offer = c.extra.trade.offers.get(index).cloned();
         let n = c.slots.len();
         let mut carried = None;
-        let mut m = Menu { kind: c.kind, slots: &mut c.slots, carried: &mut carried, rules: &rules, creative };
+        let mut m = Menu { kind: c.kind, slots: &mut c.slots, carried: &mut carried, rules: &rules, creative, trade: None };
         let mut emptied = true;
         for s in 0..2 {
             if let Some(mut st) = m.slots[s].clone() {
@@ -479,5 +541,50 @@ mod tests {
         assert_eq!(predict(&t, None, Some(&st(3, 1)), &R), None);
         // Insufficient quantity.
         assert_eq!(predict(&t, Some(&st(1, 2)), Some(&st(2, 1)), &R), None);
+    }
+
+    /// Click on the merchant menu (payment 0-1, result 2, inventory 3..39); returns the carried stack.
+    fn click(t: &mut Trade, slots: &mut [Option<ItemStack>], slot: i16, mode: i32) -> Option<ItemStack> {
+        let mut carried = None;
+        let kind = Kind::Special(Sp::Merchant);
+        let mut m = Menu { kind, slots, carried: &mut carried, rules: &R, creative: false, trade: Some(t) };
+        m.click(slot, 0, mode, &mut |_| None);
+        carried
+    }
+
+    /// Taking the result counts a use, consumes the adjusted payment and raises the merchant's
+    /// experience; the result comes back while the offer is in stock and disappears once sold out
+    /// (the server never resends the offers after a trade).
+    #[test]
+    fn taking_the_result_counts_a_use_until_sold_out() {
+        let mut t = Trade { offers: vec![offer(st(1, 3), None, 9)], xp: 10, ..Default::default() };
+        t.offers[0].uses = 10;
+        let mut slots = vec![None; 39];
+        slots[0] = Some(st(1, 7));
+        refresh(&mut t, &mut slots, &R);
+        assert_eq!(slots[2], Some(st(9, 1)));
+        assert_eq!(click(&mut t, &mut slots, 2, 0), Some(st(9, 1)));
+        assert_eq!((t.offers[0].uses, t.xp), (11, 15));
+        assert_eq!(slots[0], Some(st(1, 4)), "payment consumed");
+        assert_eq!(slots[2], Some(st(9, 1)), "still in stock: result predicted again");
+        // Shift-click: trades repeated while the result comes back, here once (12 uses = sold out).
+        assert_eq!(click(&mut t, &mut slots, 2, 1), None);
+        assert_eq!((t.offers[0].uses, t.xp), (12, 20));
+        assert_eq!(slots[0], Some(st(1, 1)));
+        assert_eq!(slots[2], None, "sold out: no result");
+        assert_eq!(slots[38], Some(st(9, 1)), "result moved to the end of the inventory");
+    }
+
+    /// Payment placed in the swapped order (cost B in slot 0, cost A in slot 1): both consumed.
+    #[test]
+    fn taking_the_result_pays_in_either_slot_order() {
+        let mut t = Trade { offers: vec![offer(st(1, 3), Some(st(2, 2)), 9)], ..Default::default() };
+        let mut slots = vec![None; 39];
+        slots[0] = Some(st(2, 2));
+        slots[1] = Some(st(1, 5));
+        refresh(&mut t, &mut slots, &R);
+        assert_eq!(click(&mut t, &mut slots, 2, 0), Some(st(9, 1)));
+        assert_eq!(t.offers[0].uses, 1);
+        assert_eq!((slots[0].clone(), slots[1].clone(), slots[2].clone()), (None, Some(st(1, 2)), None));
     }
 }

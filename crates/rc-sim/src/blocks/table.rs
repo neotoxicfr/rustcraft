@@ -168,6 +168,11 @@ pub(crate) enum Kind {
     },
     /// G6-F09a: active sulfur (state from the water and the block below, ticking block entity).
     PotentSulfur,
+    // G6-F14: game master blocks with server data (`tech_blocks.rs`).
+    Structure,
+    Jigsaw,
+    Test,
+    TestInstance,
 }
 
 /// Property of a block: index into `VersionData::properties`, not into the identifiers.
@@ -206,6 +211,11 @@ pub(crate) struct Ids {
     pub hopper: u16,
     /// G6-F12: conduit (ticking block entity, no kind of its own).
     pub conduit: u16,
+    /// G3-F13: furnaces and brewing stand (block entities ticked in the common list).
+    pub furnace: u16,
+    pub blast_furnace: u16,
+    pub smoker: u16,
+    pub brewing_stand: u16,
     pub fire: u16,
     pub soul_fire: u16,
     pub dirt: u16,
@@ -444,6 +454,10 @@ fn kind_of(name: &str) -> Kind {
         "pointed_dripstone" => return Speleothem { dripstone: true },
         "sulfur_spike" => return Speleothem { dripstone: false },
         "potent_sulfur" => return PotentSulfur,
+        "structure_block" => return Structure,
+        "jigsaw" => return Jigsaw,
+        "test_block" => return Test,
+        "test_instance_block" => return TestInstance,
         _ => {}
     }
     // `piston_head` is taken above.
@@ -611,6 +625,10 @@ impl Table {
             repeater: f("repeater"),
             hopper: f("hopper"),
             conduit: f("conduit"),
+            furnace: f("furnace"),
+            blast_furnace: f("blast_furnace"),
+            smoker: f("smoker"),
+            brewing_stand: f("brewing_stand"),
             fire: f("fire"),
             soul_fire: f("soul_fire"),
             dirt: f("dirt"),

@@ -1601,8 +1601,8 @@ impl crate::App {
     /// Interaction tick, before the player physics (§ 1.3, 3.1, 6).
     pub fn act_tick(&mut self) {
         self.act.tick += 1;
-        // Tooltip context: peaceful difficulty, operator.
-        crate::tooltips::set_context(self.exact.difficulty.0 == 0, self.debug.op_level >= 2);
+        // Tooltip context: peaceful difficulty, operator, server tick rate.
+        crate::tooltips::set_context(self.exact.difficulty.0 == 0, self.debug.op_level >= 2, self.exact.rate.rate);
         if self.act.right_delay > 0 {
             self.act.right_delay -= 1;
         }

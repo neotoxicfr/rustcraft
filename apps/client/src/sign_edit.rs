@@ -185,9 +185,9 @@ impl SignEdit {
             // Ctrl alone types nothing (winit nonetheless returns the letter without Ctrl: Ctrl+B gives "b").
             _ if ctrl && !mods.alt_key() => {}
             _ => {
-                // Character by character, like the game's keystrokes (`§`, controls and DEL
-                // refused); AltGr (Ctrl + Alt) gives real characters, allowed.
-                for c in text.unwrap_or("").chars().filter(|&c| c != '§' && c >= ' ' && c != '\u{7f}') {
+                // Character by character, like the game's keystrokes (`§`, C0 controls and DEL
+                // refused, C1 controls kept); AltGr (Ctrl + Alt) gives real characters, allowed.
+                for c in text.unwrap_or("").chars().filter(|&c| rc_text::allowed_chat_char(c)) {
                     self.insert(gui, &c.to_string());
                 }
             }

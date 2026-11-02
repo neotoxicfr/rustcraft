@@ -1403,9 +1403,26 @@ impl Chat {
     }
 }
 
+/// Chat lines scrolled by a wheel motion over the open chat: clamped to one notch, 7 lines per
+/// notch (1 with Shift), truncated toward zero; an idle vertical axis scrolls nothing.
+pub fn wheel_lines(y: f32, shift: bool) -> i32 {
+    (f64::from(y).clamp(-1.0, 1.0) * if shift { 1.0 } else { 7.0 }) as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Horizontal-only motion: nothing; half a notch: 3 lines; several notches: one notch.
+    #[test]
+    fn wheel_lines_clamp_then_truncate() {
+        assert_eq!(wheel_lines(0.0, false), 0);
+        assert_eq!(wheel_lines(-0.0, true), 0);
+        assert_eq!(wheel_lines(0.5, false), 3);
+        assert_eq!(wheel_lines(-3.0, false), -7);
+        assert_eq!(wheel_lines(1.0, true), 1);
+        assert_eq!(wheel_lines(0.5, true), 0);
+    }
 
     /// Menus on top of the open chat (restrictions screen): input not visible, hence no
     /// field, hover or IME cursor; on return: chat visible again, scrolling reset to 0.

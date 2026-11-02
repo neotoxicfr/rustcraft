@@ -395,6 +395,79 @@ pub fn transform_f(p: [f64; 3], m: Mirror, r: Rot, pivot: [i32; 3]) -> [f64; 3] 
     }
 }
 
+/// Angle brought back into [−180, 180) (float remainder, like the game).
+pub fn wrap_degrees(a: f32) -> f32 {
+    let mut w = a % 360.0;
+    if w >= 180.0 {
+        w -= 360.0;
+    }
+    if w < -180.0 {
+        w += 360.0;
+    }
+    w
+}
+
+/// Yaw of a template entity once placed: the rotation and the mirror are both applied to the
+/// wrapped angle, then the stored angle is removed once (game formula; front-back flips x so the
+/// angle changes sign, left-right flips z so it becomes 180° minus the angle).
+pub fn entity_yaw(yaw: f32, m: Mirror, r: Rot) -> f32 {
+    let w = wrap_degrees(yaw);
+    let rotated = match r {
+        Rot::Cw180 => w + 180.0,
+        Rot::Ccw90 => w + 270.0,
+        Rot::Cw90 => w + 90.0,
+        Rot::None => w,
+    };
+    let mirrored = match m {
+        Mirror::FrontBack => -w,
+        Mirror::LeftRight => 180.0 - w,
+        Mirror::None => w,
+    };
+    rotated + mirrored - yaw
+}
+
+/// Entity compound of a template made ready for the world: position, look, attached block
+/// and facing of the hanging entities (paintings, item frames) transformed.
+pub fn place_entity_nbt(f: &mut Vec<(String, Nbt)>, wp: [f64; 3], bp: [i32; 3], m: Mirror, r: Rot) {
+    f.retain(|(k, _)| k != "UUID" && k != "Pos");
+    f.push(("Pos".into(), Nbt::List(wp.iter().map(|v| Nbt::Double(*v)).collect())));
+    if let Some(i) = f.iter().position(|(k, _)| k == "block_pos") {
+        f[i].1 = Nbt::IntArray(bp.to_vec());
+    }
+    let (yaw, pitch) = match f.iter().find(|(k, _)| k == "Rotation").map(|(_, v)| v) {
+        Some(Nbt::List(l)) if l.len() == 2 => match (&l[0], &l[1]) {
+            (Nbt::Float(a), Nbt::Float(b)) => (*a, *b),
+            _ => (0.0, 0.0),
+        },
+        _ => (0.0, 0.0),
+    };
+    let id = f.iter().find(|(k, _)| k == "id").and_then(|(_, v)| v.as_str()).unwrap_or("");
+    let id = id.strip_prefix("minecraft:").unwrap_or(id);
+    // Hanging entities turn their facing (horizontal only): rotation, then the mirror reverses a
+    // facing that lies on the flipped axis.
+    let facing = match id {
+        "painting" => Some(("facing", false)),
+        "item_frame" | "glow_item_frame" => Some(("Facing", true)),
+        _ => None,
+    };
+    if let Some((key, three_d)) = facing
+        && let Some(i) = f.iter().position(|(k, _)| k == key)
+        && let Some(v) = f[i].1.as_i64()
+    {
+        let d = if three_d { Dir::ALL.get(v as usize).copied() } else { Dir::H2D.get((v & 3) as usize).copied() };
+        if let Some(d) = d.filter(|d| d.is_horizontal()) {
+            let nd = m.dir(r.dir(d));
+            let table: &[Dir] = if three_d { &Dir::ALL } else { &Dir::H2D };
+            let out = table.iter().position(|&x| x == nd);
+            if let Some(o) = out {
+                f[i].1 = Nbt::Byte(o as i8);
+            }
+        }
+    }
+    f.retain(|(k, _)| k != "Rotation");
+    f.push(("Rotation".into(), Nbt::List(vec![Nbt::Float(entity_yaw(yaw, m, r)), Nbt::Float(pitch)])));
+}
+
 /// Origin ("zero") corner of a rotated and mirrored template for the same footprint (§ 10.2).
 pub fn zero_position(pos: [i32; 3], size: [i32; 3], m: Mirror, r: Rot) -> [i32; 3] {
     let (a, b) = (size[0] - 1, size[2] - 1);
@@ -614,8 +687,10 @@ impl StateTransforms {
                 let r = v.parse::<i32>().ok()?;
                 Some(
                     match m {
-                        Mirror::LeftRight => (16 - r).rem_euclid(16),
-                        Mirror::FrontBack => (8 - r).rem_euclid(16),
+                        // Left-right flips the z axis: north (8) and south (0) swap, east and
+                        // west stay; front-back flips x: east (4) and west (12) swap.
+                        Mirror::LeftRight => (8 - r).rem_euclid(16),
+                        Mirror::FrontBack => (16 - r).rem_euclid(16),
                         Mirror::None => r,
                     }
                     .to_string(),

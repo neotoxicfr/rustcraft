@@ -400,6 +400,8 @@ impl Server {
 
     /// The raids tick (before the mobs).
     pub(crate) fn raids_tick(&mut self) {
+        #[cfg(test)]
+        crate::server::phase("raids");
         self.raids_load();
         self.mobs.ill.raids.tick += 1;
         let ids: Vec<i32> = self.mobs.ill.raids.list.iter().map(|r| r.id).collect();

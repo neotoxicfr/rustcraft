@@ -1502,7 +1502,7 @@ impl crate::App {
         let w = &mut c.extra.work;
         let Some(t) = &mut w.name else { return false };
         let (used, mut edited) = t.key(k, mods);
-        if !used && let Some(s) = text.filter(|s| s.chars().all(|ch| !ch.is_control())) {
+        if !used && let Some(s) = text {
             let before = t.value();
             t.insert(s);
             edited |= t.value() != before;

@@ -155,7 +155,7 @@ impl TextField {
     pub(crate) fn insert(&mut self, s: &str) {
         self.delete_selection();
         let mut len = crate::book::u16_len(&self.text);
-        for c in s.chars().filter(|&c| c != '§' && c >= ' ' && c != '\u{7f}') {
+        for c in s.chars().filter(|&c| rc_text::allowed_chat_char(c)) {
             len += c.len_utf16();
             if len > self.max_len {
                 break;
@@ -327,11 +327,26 @@ pub fn typed_text(event: &winit::event::KeyEvent, mods: ModifiersState) -> Optio
     keep_typed(event.text.as_deref(), all, mods)
 }
 
-/// Rule of [`typed_text`]: with Ctrl, the "all modifiers" text; never a control character
-/// (DEL included).
+/// Rule of [`typed_text`]: with Ctrl, the "all modifiers" text, kept as [`text_event`] says.
 pub fn keep_typed<'a>(text: Option<&'a str>, all_mods: Option<&'a str>, mods: ModifiersState) -> Option<&'a str> {
     let t = if mods.control_key() { all_mods } else { text };
-    t.filter(|t| !t.is_empty() && !t.chars().any(char::is_control))
+    t.filter(|t| text_event(t))
+}
+
+/// Characters of a keystroke that reach a field: the game types character by character and only
+/// the chat ones (`§`, controls below space, DEL and line breaks refused), so a refused key leaves
+/// the field, selection included, as it was. None when nothing is left.
+pub(crate) fn chat_typed(s: &str) -> Option<String> {
+    let t: String = s.chars().filter(|&c| rc_text::allowed_chat_char(c)).collect();
+    (!t.is_empty()).then_some(t)
+}
+
+/// Text event (keystroke or IME commit) kept as typed input. Like the game's windowing layer, an
+/// event is dropped whole when empty or when its first character is a C0 control or DEL; C1
+/// controls (U+0080 to U+009F) go through, and each field then filters character by character
+/// with [`rc_text::allowed_chat_char`].
+pub fn text_event(t: &str) -> bool {
+    t.chars().next().is_some_and(|c| c >= ' ' && c != '\u{7f}')
 }
 
 /// Internal fallback copy (system clipboard unreadable or empty).
@@ -524,7 +539,7 @@ impl Widget {
         self
     }
 
-    pub fn set_tooltip(&mut self, gui: &Gui, text: &str) {
+    pub fn set_tooltip(&mut self, gui: &dyn rc_text::Metrics, text: &str) {
         self.tooltip = if text.is_empty() { Vec::new() } else { rc_text::wrap(gui, &chars(text), 170.0) };
     }
 
@@ -1136,9 +1151,10 @@ impl Panel {
         if let Some(i) = self.focus
             && let Kind::Field(t) = &mut self.widgets[i].kind
             && t.editable
+            && let Some(s) = chat_typed(s)
         {
             let before = t.text.len();
-            t.insert(s);
+            t.insert(&s);
             if t.text.len() != before {
                 out.push(Event::Edit(self.widgets[i].id));
             }
@@ -1703,6 +1719,23 @@ mod tests {
         assert_eq!(keep_typed(Some("a"), None, ctrl | alt), None);
         assert_eq!(keep_typed(Some("\u{7f}"), Some("\u{7f}"), none), None);
         assert_eq!(keep_typed(Some("\u{8}"), Some("\u{8}"), none), None);
+        // C1 controls are real input: the field keeps them, a C0 control further on is removed.
+        assert_eq!(keep_typed(Some("\u{85}"), Some("\u{85}"), none), Some("\u{85}"));
+        let mut t = TextField::new(Vec::new());
+        t.insert(keep_typed(Some("\u{9f}a\u{1}§"), None, none).unwrap());
+        assert_eq!(t.value(), "\u{9f}a");
+    }
+
+    #[test]
+    fn refused_keystroke_keeps_the_selection() {
+        assert_eq!(chat_typed("a\nb§\u{7f}"), Some("ab".to_string()));
+        let mut t = TextField::new(Vec::new());
+        t.insert("abc");
+        t.key(KeyCode::KeyA, ModifiersState::CONTROL);
+        if let Some(s) = chat_typed("§") {
+            t.insert(&s);
+        }
+        assert_eq!((t.value(), t.anchor, t.cursor), ("abc".to_string(), 0, 3));
     }
 
     #[test]

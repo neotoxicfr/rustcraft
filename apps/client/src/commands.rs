@@ -789,7 +789,8 @@ impl CommandUi {
             return false;
         }
         let max = l.items.len().saturating_sub(lines) as i64;
-        l.offset = (l.offset as i64 - d.clamp(-1.0, 1.0) as i64).clamp(0, max) as usize;
+        // Truncated after the subtraction: a fraction of a notch upwards still moves by one.
+        l.offset = ((l.offset as f64 - f64::from(d.clamp(-1.0, 1.0))) as i64).clamp(0, max) as usize;
         true
     }
 

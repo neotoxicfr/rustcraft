@@ -116,6 +116,7 @@ impl Server {
                 }
             }
             Kind::Jukebox => self.jukebox_signal(p), // G6-F01: 15 during playback
+            Kind::Test => self.test_block_signal(s, p), // G6-F14: start block while powered
             _ => {
                 // Other sources (lightning rod, tripwire hook, sensors…): usual properties.
                 if !self.is_signal_source(s) {

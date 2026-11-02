@@ -21,7 +21,6 @@ fn sounds(w: &W, evs: &[Event], name: &str) -> usize {
 fn tick(w: &mut W, out: &mut Vec<Event>) {
     w.p.s.time += 1;
     w.p.s.tick_world_blocks();
-    w.p.s.furnaces_tick();
     w.p.s.flush_block_changes();
     out.extend(w.p.take_events());
 }
@@ -238,7 +237,7 @@ fn bell_stops_ticking_outside_the_world_border() {
     w.p.s.bell_rung(bell);
     let mut evs = Vec::new();
     for _ in 0..60 {
-        w.p.s.bells_tick();
+        w.p.s.tick_block_entities();
         evs.extend(w.p.take_events());
     }
     assert_eq!(sounds(&w, &evs, "minecraft:block.bell.resonate"), 0, "bell outside the border: resonance");
@@ -246,7 +245,7 @@ fn bell_stops_ticking_outside_the_world_border() {
     assert_eq!(w.p.s.mobs.bells.len(), 1, "bell forgotten outside the border");
     w.cmd("worldborder set 1000");
     for _ in 0..60 {
-        w.p.s.bells_tick();
+        w.p.s.tick_block_entities();
         evs.extend(w.p.take_events());
     }
     assert_eq!(sounds(&w, &evs, "minecraft:block.bell.resonate"), 1, "bell inside the border");

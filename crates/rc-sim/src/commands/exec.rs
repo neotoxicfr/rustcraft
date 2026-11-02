@@ -1104,6 +1104,8 @@ impl Server {
     }
 
     pub(crate) fn run_scheduled(&mut self) {
+        #[cfg(test)]
+        crate::server::phase(if self.bs.handling_tick { "functions:handling" } else { "functions" });
         if self.cmd.scheduled.is_empty() {
             return;
         }

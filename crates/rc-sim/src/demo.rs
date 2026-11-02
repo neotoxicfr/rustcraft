@@ -22,7 +22,8 @@ pub fn set_launch_demo(on: bool) {
     LAUNCH.store(on, Ordering::Relaxed);
 }
 
-pub(crate) fn launch_demo() -> bool {
+/// `--demo` given at launch.
+pub fn launch_demo() -> bool {
     LAUNCH.load(Ordering::Relaxed)
 }
 
