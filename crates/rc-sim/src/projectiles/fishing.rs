@@ -120,6 +120,7 @@ impl Server {
         };
         let _ = self.send(Event::Entity(EntityEvent::Add(Box::new(add))));
         p.track.seen = true;
+        p.track.last_vel = p.vel;
     }
 
     fn hook_meta(&self, h: &Hook) {
@@ -264,10 +265,17 @@ impl Server {
         self.proj.hook = Some(h);
     }
 
-    /// Network tracking of the bobber (interval 5).
+    /// Network tracking of the bobber (interval 5): its velocity when it changed from the last
+    /// one sent (1e-7 squared), then its position; after the tracking, the velocity of a hurt
+    /// bobber as is.
     fn hook_track(&self, h: &mut Hook) {
         let p = &mut h.p;
         if p.track.tick % 5 == 0 || p.needs_sync {
+            if crate::mobs::track::velocity_changed(p.track.last_vel, p.vel) {
+                p.track.last_vel = p.vel;
+                let velocity = crate::mobs::track::lp_quantize(p.vel);
+                let _ = self.send(Event::Entity(EntityEvent::Motion { id: p.id, velocity }));
+            }
             let s = rc_proto_v777::entity::PositionSync {
                 id: p.id,
                 path: rc_proto_v777::entity::PositionPath { linear: true, steps: vec![(p.pos, 0)] },
@@ -276,11 +284,13 @@ impl Server {
                 on_ground: p.on_ground,
             };
             let _ = self.send(Event::Entity(EntityEvent::Sync(s)));
-            let velocity = crate::mobs::track::lp_quantize(p.vel);
-            let _ = self.send(Event::Entity(EntityEvent::Motion { id: p.id, velocity }));
             p.needs_sync = false;
         }
         p.track.tick += 1;
+        if std::mem::take(&mut p.sync_velocity) {
+            let velocity = crate::mobs::track::lp_quantize(p.vel);
+            let _ = self.send(Event::Entity(EntityEvent::Motion { id: p.id, velocity }));
+        }
     }
 
     /// Rod in hand and within 32 blocks.

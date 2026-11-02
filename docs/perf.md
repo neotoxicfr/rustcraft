@@ -3305,6 +3305,14 @@ runs), so only the order of magnitude is claimed.
   hurt, sweep over decorations and other players, LAN players in ordinary explosions: per event,
   a few entities; no hot spot. Multi-core and GPU not applicable. To re-measure on a quiet machine:
   the bench above (3 passes), TNT and creeper scenes.
+- Review round (02/11, loaded machine, other agents compiling): still stands now cancel their
+  speeds under 0.003 each tick (a map and a bit comparison of the saved motion; the compound is
+  only rewritten when a value changes). Same bench, 2 passes: 400 weightless stands 56.5-56.6 us
+  per deco tick (48 us earlier in the day, other load): the added work is a few ns per stand, the
+  gap is attributed to the load and stays to re-measure on a quiet machine (no switch: the
+  cancellation is the game's behaviour). The bobber now sends its velocity only when it changed
+  (fewer packets at rest); the explosion author check (pvp rule, team) runs once per player in
+  range of an explosion with a player author. No hot spot; multi-core and GPU not applicable.
 ## L9-CLIENT: screen limits (02/11, loaded machine)
 
 - Wheel: discrete mode and sensitivity read once per wheel event (two option lookups, before any

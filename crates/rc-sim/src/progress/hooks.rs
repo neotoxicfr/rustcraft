@@ -212,25 +212,40 @@ impl Server {
         if m.last_hurt_by_player <= 0 {
             return;
         }
-        let kind = m.kind.info().name.to_owned();
-        self.award_stat("minecraft:killed", &kind, 1);
+        // Display name taken from `m`: a mob that dies during its tick is out of the list, not
+        // findable by its UUID.
+        self.s9_living_killed(m.kind.info().name, m.uuid, Who::Mob(m), m.pos, &|s| s.mob_display(m), ty, by);
+    }
+
+    /// Kill of a non-player living entity credited to the player: statistics `killed` (its type
+    /// `kind`) and `mob_kills`, criteria `totalKillCount`, `teamkill.<colour>` (victim's team),
+    /// `killedByTeam.<colour>` scored by the victim (`uuid`, displayed as `shown`), then
+    /// `player_killed_entity`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn s9_living_killed(
+        &mut self,
+        kind: &str,
+        uuid: u128,
+        victim: Who<'_>,
+        pos: [f64; 3],
+        shown: &dyn Fn(&Self) -> rc_text::Component,
+        ty: &str,
+        by: Option<Ent>,
+    ) {
+        self.award_stat("minecraft:killed", kind, 1);
         self.award_custom("mob_kills", 1);
         self.score_criteria_add("totalKillCount", 1);
         if !self.cmd.scores.objectives.is_empty() {
-            let victim = crate::nbtio::uuid_text(m.uuid);
-            let team = self.cmd.scores.team_of(&victim).and_then(|t| t.color.clone());
+            let name = crate::nbtio::uuid_text(uuid);
+            let team = self.cmd.scores.team_of(&name).and_then(|t| t.color.clone());
             if let Some(c) = team {
                 self.score_criteria_add(&format!("teamkill.{c}"), 1);
             }
             // The victim scores `killedByTeam.<colour of the player's team>`.
             let mine = self.cmd.scores.team_of(&self.name).and_then(|t| t.color.clone());
-            // Display name taken from `m`: a mob that dies during its tick is out of the
-            // list, not findable by its UUID.
             if let Some(c) = mine {
-                let shown = self.mob_display(m);
-                self.criteria_update_shown(&format!("killedByTeam.{c}"), &victim, Some(&shown), |v| {
-                    v.wrapping_add(1)
-                });
+                let shown = shown(self);
+                self.criteria_update_shown(&format!("killedByTeam.{c}"), &name, Some(&shown), |v| v.wrapping_add(1));
             }
         }
         let direct = match by {
@@ -238,8 +253,8 @@ impl Server {
             Some(Ent::Mob(i)) => Some(Who::E(E::Mob(i))),
             None => None,
         };
-        let dmg = Dmg { ty: ty.to_owned(), source: direct, direct, pos: Some(m.pos) };
-        self.trig_killed(Some(Who::Mob(m)), &dmg);
+        let dmg = Dmg { ty: ty.to_owned(), source: direct, direct, pos: Some(pos) };
+        self.trig_killed(Some(victim), &dmg);
     }
 
     /// Damage received by the player: statistics in tenths (`taken`: the health lost), then

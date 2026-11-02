@@ -164,7 +164,7 @@ impl FluidTables {
 
 /// Unit vector of `v`, zero below a length of 1e-5 in single precision (the game's vector
 /// normalization).
-pub(crate) fn normalize(v: [f64; 3]) -> [f64; 3] {
+pub fn normalize(v: [f64; 3]) -> [f64; 3] {
     let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
     if l < f64::from(1.0e-5f32) { [0.0; 3] } else { [v[0] / l, v[1] / l, v[2] / l] }
 }

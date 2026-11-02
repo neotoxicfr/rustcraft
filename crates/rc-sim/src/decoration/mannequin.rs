@@ -14,6 +14,7 @@ use rc_proto_v777::entity::Meta;
 use super::{DKind, dbl, flag};
 use crate::commands::ents::E;
 use crate::mobs::mob::Ent;
+use crate::mobs::recent::vibration::Src;
 use crate::nbtio;
 use crate::player::Stack;
 use crate::progress::pred::Who;
@@ -94,7 +95,13 @@ impl Server {
             if full {
                 self.deco_sound(&e, "minecraft:entity.generic.death", 6, 1.0, self.living_pitch());
             }
-            self.game_event_at("minecraft:entity_die", pos, by);
+            // The kill credited to the player who dealt it, before the death's own effects.
+            if by == Some(Ent::Player) {
+                let uuid = nbtio::uuid(e.get("UUID")).unwrap_or(0);
+                self.s9_living_killed(TYPE, uuid, Who::E(E::Other(id)), pos, &|s| s.ent_display(E::Other(id)), ty, by);
+            }
+            // Emitted by the mannequin itself (never a player behind it: no shrieker answers).
+            self.game_event_src("minecraft:entity_die", pos, Some(Src::Other), None);
             let _ = self.send(Event::Entity(EntityEvent::Event { id, event: 3 }));
             self.deco_data(id, vec![(6, Meta::Pose(7))]);
         } else if full {
@@ -102,7 +109,7 @@ impl Server {
         }
         // Any hurt whose source is the player, once past the cooldown.
         if by == Some(Ent::Player) {
-            self.s9_player_hurt_living(Who::E(E::Other(id)), ty, amount.max(0.0), damage);
+            self.s9_player_hurt_living(Some(Who::E(E::Other(id))), ty, amount.max(0.0), damage, false);
         }
         true
     }
@@ -178,7 +185,8 @@ impl Server {
             nbtio::set(n, "AbsorptionAmount", Nbt::Float(absorption));
         });
         self.deco_data(id, vec![(9, Meta::Float(health))]);
-        self.game_event_at("minecraft:entity_damage", pos, by);
+        // Emitted by the mannequin itself, whoever hurt it.
+        self.game_event_src("minecraft:entity_damage", pos, Some(Src::Other), None);
     }
 
     /// Knockback of a living decoration (armor stand, mannequin), like any living entity: power

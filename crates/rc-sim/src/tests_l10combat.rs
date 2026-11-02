@@ -160,23 +160,25 @@ fn motion_packets(p: &Probe, id: i32) -> Vec<[f64; 3]> {
         .collect()
 }
 
-/// A weightless armor stand pushed by a hair (1e-4) sends no velocity: its tracking compares with
-/// the last velocity sent (1e-7 squared), like the game; a real push is sent by its next tick.
-/// A stand with gravity standing in water (not moved by us) still sends its pushed velocity.
-/// Before, the weightless stand sent every push at once and the one in water never.
+/// A weightless armor stand's push is sent by its next tick's tracking, then a further push by a
+/// hair (1e-4) sends nothing: the tracking compares with the last velocity sent (1e-7 squared),
+/// like the game. A stand with gravity standing in water (not moved by us) still sends its pushed
+/// velocity. Before, the weightless stand sent every push at once and the one in water never.
 #[test]
 fn still_stand_velocity_goes_through_tracking() {
     let Some((mut p, _dir)) = probe("l10-stand-sync") else { return };
     let still = summon(&mut p, "minecraft:armor_stand", [112.5, -59.0, 110.5], "{NoGravity:1b}");
     p.s.deco_tick();
     let _ = p.take_events();
-    p.s.deco_push(still, [1.0e-4, 0.0, 0.0]);
-    p.s.deco_tick();
-    assert!(motion_packets(&p, still).is_empty(), "a push below the tracking threshold was sent");
     p.s.deco_push(still, [0.25, 0.0, 0.0]);
     assert!(motion_packets(&p, still).is_empty(), "sent at once, outside the tracking");
     p.s.deco_tick();
-    assert_eq!(motion_packets(&p, still), vec![crate::mobs::track::lp_quantize([0.2501, 0.0, 0.0])], "push not sent by the tracking");
+    assert_eq!(motion_packets(&p, still), vec![crate::mobs::track::lp_quantize([0.25, 0.0, 0.0])], "push not sent by the tracking");
+    p.s.deco_push(still, [1.0e-4, 0.0, 0.0]);
+    for _ in 0..3 {
+        p.s.deco_tick();
+    }
+    assert!(motion_packets(&p, still).is_empty(), "a change below the tracking threshold was sent");
     // In water: no movement simulated, the tracking runs.
     p.run("setblock 114 -59 114 minecraft:water");
     let wet = summon(&mut p, "minecraft:armor_stand", [114.5, -59.0, 114.5], "{}");
@@ -302,6 +304,124 @@ fn sweep_reaches_stands_and_mannequins() {
     assert!(matches!(h, Some(rc_proto::nbt::Nbt::Float(v)) if v < 20.0), "swept mannequin not hurt: {h:?}");
     assert!(done(&p, "l10:hurt_mannequin"), "the mannequin's hurt did not trigger player_hurt_entity");
     assert_eq!(motion(&p, mark), [0.0; 3], "a marker stand was swept");
+}
+
+// ---------- Explosions with a player author ----------
+
+/// The player killed by its own primed TNT is "blown up by" itself (the attacker named: both
+/// arguments are the player), counts `killed_by` player and no player kill; with `pvp` off its TNT
+/// pushes it without hurting it. Before, the key went out with the victim alone.
+#[test]
+fn own_tnt_names_the_player_and_follows_pvp() {
+    use crate::mobs::mob::Ent;
+    use rc_proto::nbt::Nbt;
+    let Some((mut p, _dir)) = probe("l10-own-tnt") else { return };
+    let center = [112.5, -59.0, 110.5];
+    crate::nbtio::set(&mut p.s.rules, "minecraft:pvp", Nbt::Byte(0));
+    p.s.mobs.player_vel = [0.0; 3];
+    p.s.tnt_explode(-1, center, 4.0, Some(Ent::Player), false, false);
+    assert_eq!(p.s.life.vit.health, 20.0, "own TNT hurt the player with pvp off");
+    assert!(p.s.mobs.player_vel[0] < 0.0, "own TNT did not push: {:?}", p.s.mobs.player_vel);
+    crate::nbtio::set(&mut p.s.rules, "minecraft:pvp", Nbt::Byte(1));
+    p.s.life.vit.health = 1.0;
+    let _ = p.take_events();
+    p.s.tnt_explode(-1, center, 4.0, Some(Ent::Player), false, false);
+    let m = p
+        .take_events()
+        .into_iter()
+        .find_map(|e| match e {
+            rc_client::Event::Died { message: Some(m), .. } => Some(m),
+            _ => None,
+        })
+        .expect("no death");
+    let rc_text::Content::Translate { key, with, .. } = &m.content else { panic!("{m:?}") };
+    assert_eq!(key, "death.attack.explosion.player");
+    assert_eq!(with.len(), 2, "{m:?}");
+    assert_eq!(format!("{:?}", with[0]), format!("{:?}", with[1]), "the attacker is not the player itself");
+    assert_eq!(p.s.stat_value("minecraft:killed_by", "minecraft:player"), 1, "killed_by player");
+    assert_eq!(p.s.stat_value("minecraft:custom", "minecraft:player_kills"), 0, "credited with its own death");
+}
+
+/// A mannequin hurt and killed by the player's explosion emits its damage and death events itself
+/// (no player behind them: a shrieker would not answer), and its death credits the player:
+/// `killed` mannequin, `mob_kills`, `totalKillCount`, `player_killed_entity`. Before, both events
+/// came from the player and the kill counted nowhere.
+#[test]
+fn mannequin_events_are_its_own_and_its_kill_is_credited() {
+    use crate::mobs::explode::Blast;
+    use crate::mobs::mob::Ent;
+    use crate::mobs::recent::vibration::Src;
+    let Some((mut p, _dir)) = probe("l10-mannequin-kill") else { return };
+    p.s.pos = [130.5, -59.0, 130.5];
+    tree(
+        &mut p,
+        vec![(
+            "l10:kill_mannequin",
+            serde_json::json!({"trigger": "minecraft:player_killed_entity",
+                "conditions": {"entity": {"minecraft:entity_type": "minecraft:mannequin"}}}),
+        )],
+    );
+    let mut src = p.s.player_source();
+    src.level = 4;
+    assert!(p.s.perform(src, "scoreboard objectives add total totalKillCount").0);
+    let mp = [112.5, -59.0, 110.5];
+    summon(&mut p, "minecraft:mannequin", mp, "{NoGravity:1b,Health:1f}");
+    p.s.mobs.rec.vib.log.clear();
+    let center = [110.5, -59.0, 110.5];
+    p.s.explode_with(None, Some(Ent::Player), None, center, 2.0, false, "minecraft:player_explosion", Blast::None(false));
+    for ev in ["minecraft:entity_damage", "minecraft:entity_die"] {
+        let srcs: Vec<_> = p.s.mobs.rec.vib.log.iter().filter(|l| l.0 == ev && l.1 == mp).map(|l| l.2).collect();
+        assert_eq!(srcs, vec![Some(Src::Other)], "{ev}");
+    }
+    assert_eq!(p.s.stat_value("minecraft:killed", "minecraft:mannequin"), 1, "killed stat");
+    assert_eq!(p.s.stat_value("minecraft:custom", "minecraft:mob_kills"), 1, "mob_kills");
+    let name = p.s.name.clone();
+    assert_eq!(p.s.cmd.scores.get(&name, "total"), Some(1), "totalKillCount");
+    assert!(done(&p, "l10:kill_mannequin"), "player_killed_entity");
+}
+
+/// A weightless armor stand cancels its small speeds each tick like any living entity
+/// (|v| < 0.003): its saved motion drops to zero and nothing residual is sent. Before, the
+/// residual motion stayed saved for good and went out with the tracking.
+#[test]
+fn still_stand_cancels_small_speeds() {
+    let Some((mut p, _dir)) = probe("l10-stand-small") else { return };
+    let id = summon(&mut p, "minecraft:armor_stand", [112.5, -59.0, 110.5], "{NoGravity:1b}");
+    p.s.deco_tick();
+    let _ = p.take_events();
+    p.s.deco_push(id, [0.002, 0.0, -0.001]);
+    for _ in 0..3 {
+        p.s.deco_tick();
+    }
+    assert_eq!(motion(&p, id).map(f64::to_bits), [0.0f64; 3].map(f64::to_bits), "residual motion kept");
+    assert!(motion_packets(&p, id).iter().all(|v| *v == [0.0; 3]), "residual velocity sent");
+}
+
+/// The bobber's tracking sends its velocity only when it changed (a burst that does not push it
+/// sends nothing), and an ordinary explosion marks it hurt: its velocity goes out as is after the
+/// tracking, even unpushed. Before, every tracking sent it and the hurt was never seen.
+#[test]
+fn bobber_velocity_tracked_and_sent_when_hurt() {
+    let Some((mut p, _dir)) = probe("l10-bobber") else { return };
+    p.s.slots[36] = Some(st("minecraft:fishing_rod"));
+    p.s.held = 0;
+    assert!(p.s.fishing_rod_use(0), "rod cast");
+    let h = p.s.proj.hook.as_mut().expect("bobber");
+    h.p.pos = [111.5, -59.0, 110.5];
+    h.p.vel = [0.0; 3];
+    let id = h.p.id;
+    for _ in 0..10 {
+        p.s.fishing_tick();
+    }
+    assert_eq!(p.s.proj.hook.as_ref().expect("bobber").p.vel, [0.0; 3], "bobber not at rest");
+    let _ = p.take_events();
+    let center = [110.5, -59.0, 110.5];
+    p.s.explosion_projectiles(center, 4.0, None, 0.0, false);
+    p.s.fishing_tick();
+    assert!(motion_packets(&p, id).is_empty(), "unchanged velocity sent by the tracking");
+    p.s.explosion_projectiles(center, 4.0, None, 0.0, true);
+    p.s.fishing_tick();
+    assert_eq!(motion_packets(&p, id), vec![[0.0; 3]], "hurt bobber's velocity not sent");
 }
 
 /// Bench (ignored): cost of the new explosion passes and of the still stands' tracking.

@@ -114,8 +114,7 @@ fn put_body(e: &mut Entity, b: Box<Body>) {
 fn loyalty_pull(pos: [f64; 3], vel: [f64; 3], eye: [f64; 3], loyalty: i8) -> ([f64; 3], [f64; 3]) {
     let l = f64::from(loyalty);
     let d = [eye[0] - pos[0], eye[1] - pos[1], eye[2] - pos[2]];
-    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-    let n = if len < 1.0e-5 { [0.0; 3] } else { d.map(|c| c / len) };
+    let n = rc_physics::normalize(d);
     let accel = 0.05 * l;
     ([pos[0], pos[1] + d[1] * 0.015 * l, pos[2]], std::array::from_fn(|i| vel[i] * 0.95 + n[i] * accel))
 }

@@ -495,10 +495,17 @@ impl Server {
         let motion = nbtio::motion(e.get("Motion"));
         let on_ground = flag(e, "OnGround");
         let rot = nbtio::f32s::<2>(e.get("Rotation")).unwrap_or_default();
-        // Tracking alone, the entity left where it is.
+        // Tracking alone, the entity left where it is; its small speeds are still cancelled (the
+        // game does it each tick for every living entity, physics or not).
         let still = |s: &mut Server| {
+            let saved = motion.unwrap_or_default();
+            let v = saved.map(|c| if c.abs() < 0.003 { 0.0 } else { c });
+            // Compared bit for bit: a saved -0.0 becomes 0.0 like the game's.
+            if v.map(f64::to_bits) != saved.map(f64::to_bits) {
+                s.deco_edit(id, |n| nbtio::set(n, "Motion", super::dbl(v)));
+            }
             let mut t = std::mem::take(&mut s.deco.live[i].track);
-            s.track_turned(&mut t, id, pos, motion.unwrap_or_default(), on_ground, interval, rot);
+            s.track_turned(&mut t, id, pos, v, on_ground, interval, rot);
             s.deco.live[i].track = t;
         };
         if flag(e, "NoGravity") || if stand { marker(e) } else { flag(e, "immovable") } {

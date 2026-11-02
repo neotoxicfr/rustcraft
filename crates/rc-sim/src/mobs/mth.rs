@@ -159,11 +159,8 @@ pub fn dist2(a: [f64; 3], b: [f64; 3]) -> f64 {
 }
 
 /// Unit vector of `v`, the zero vector below a length of 1e-5 in single precision (the
-/// game's vector normalization).
-pub fn normalize(v: [f64; 3]) -> [f64; 3] {
-    let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    if l < f64::from(1.0e-5f32) { [0.0; 3] } else { v.map(|c| c / l) }
-}
+/// game's vector normalization, shared with the client's physics).
+pub use rc_physics::normalize;
 
 pub fn block_of(p: [f64; 3]) -> [i32; 3] {
     [p[0].floor() as i32, p[1].floor() as i32, p[2].floor() as i32]

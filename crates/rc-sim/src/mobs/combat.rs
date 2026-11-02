@@ -1565,13 +1565,7 @@ impl Server {
     /// received, after the shield, parried) if the hit went past the invulnerability window, and
     /// the health before and after the hit if it landed.
     fn pvp_receive(&mut self, hit: &PvpHit) -> (Option<HurtParts>, Option<(f32, f32)>) {
-        if !self.rule("minecraft:pvp", true) {
-            return (None, None);
-        }
-        if let Some(t) = self.cmd.scores.team_of(&self.name)
-            && t.players.contains(&hit.name)
-            && !t.friendly_fire
-        {
+        if self.refuses_player_damage(&hit.name) {
             return (None, None);
         }
         let ty = hit.ty.as_str();
@@ -1605,6 +1599,13 @@ impl Server {
             self.life.vit.fire = hit.fire;
         }
         (parts, Some((old, self.life.vit.health)))
+    }
+
+    /// The current player refuses any damage whose author is the player named `attacker` (itself
+    /// included): `pvp` rule off, or a common team without friendly fire.
+    pub(crate) fn refuses_player_damage(&self, attacker: &str) -> bool {
+        !self.rule("minecraft:pvp", true)
+            || self.cmd.scores.team_of(&self.name).is_some_and(|t| !t.friendly_fire && t.players.iter().any(|p| p == attacker))
     }
 
     /// G5-F04: second hurt sound of a full hit of thorns, at the hurt entity, category players (7)
@@ -1783,7 +1784,7 @@ fn t_rng(s: &Server, t: Ent) -> super::jrand::JRand {
 }
 
 /// Hurt report of a player hit by another: damage received, after the shield, parried.
-type HurtParts = (f32, f32, bool);
+pub(crate) type HurtParts = (f32, f32, bool);
 
 /// Hit from one player on another, computed on the attacker's side, applied on the victim's side.
 struct PvpHit {

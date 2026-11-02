@@ -706,6 +706,35 @@ fn ordinary_explosion_hurts_and_pushes_other_player() {
     assert!((kz - v[2]).abs() < 1e-12, "packet knockback {kz} vs server velocity {}", v[2]);
 }
 
+/// L10-COMBAT: an explosion whose author is the host (its primed TNT) does not hurt another player
+/// while `pvp` is off, but pushes it all the same, like the game; allowed, it names the host as the
+/// attacker: the other player killed by it counts `killed_by` player, the host a player kill.
+#[test]
+fn player_explosion_follows_pvp_and_credits_author() {
+    use crate::mobs::explode::Blast;
+    use crate::mobs::mob::Ent;
+    let mut t = open("blastpvp");
+    publish(&mut t, false);
+    let _g = join(&mut t, "Guest", 2);
+    host_ready(&mut t, feet([12, FLOOR + 1, 12]));
+    guest_ready(&mut t, [0.5, f64::from(FLOOR + 1), 2.5]);
+    let center = [0.5, f64::from(FLOOR + 1), 0.5];
+    let blast = |t: &mut T| t.s.explode_with(None, Some(Ent::Player), None, center, 2.0, false, "minecraft:player_explosion", Blast::None(false));
+    crate::nbtio::set(&mut t.s.rules, "minecraft:pvp", rc_proto::nbt::Nbt::Byte(0));
+    t.s.lan.as_mut().unwrap().guests[0].ctx.as_mut().unwrap().player_vel = [0.0; 3];
+    blast(&mut t);
+    assert_eq!(guest_vitals(&t).0, 20.0, "hurt by the host's explosion with pvp off");
+    let v = t.s.lan.as_ref().unwrap().guests[0].ctx.as_ref().unwrap().player_vel;
+    assert!(v[2] > 0.0, "refused hurt, but not pushed: {v:?}");
+    crate::nbtio::set(&mut t.s.rules, "minecraft:pvp", rc_proto::nbt::Nbt::Byte(1));
+    t.s.lan.as_mut().unwrap().guests[0].ctx.as_mut().unwrap().vit.health = 1.0;
+    blast(&mut t);
+    assert!(t.s.lan.as_ref().unwrap().guests[0].ctx.as_ref().unwrap().vit.dead, "other player not killed");
+    assert_eq!(t.s.stat_value("minecraft:custom", "minecraft:player_kills"), 1, "host not credited");
+    let killed_by = t.s.as_guest(0, |sv| sv.stat_value("minecraft:killed_by", "minecraft:player"));
+    assert_eq!(killed_by, 1, "killed by a player");
+}
+
 /// L10-COMBAT: the sweep of a sword hurts another player standing next to the target (not an
 /// ally). Before, only mobs were swept.
 #[test]

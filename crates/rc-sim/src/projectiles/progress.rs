@@ -136,12 +136,13 @@ impl Server {
     /// entity: the player for a hit of its own, otherwise the projectile being resolved, otherwise
     /// the entity exploding (an explosion it set off hides the projectile).
     pub(crate) fn s9_player_hurt_mob(&mut self, m: &crate::mobs::mob::Mob, ty: &str, original: f32, taken: f32) {
-        self.s9_player_hurt_living(Who::Mob(m), ty, original, taken);
+        self.s9_player_hurt_living(Some(Who::Mob(m)), ty, original, taken, false);
     }
 
-    /// `player_hurt_entity` for any hurt living entity `victim` (mob, mannequin) whose source is
-    /// the player, as [`Self::s9_player_hurt_mob`] describes it.
-    pub(crate) fn s9_player_hurt_living(&mut self, victim: Who<'_>, ty: &str, original: f32, taken: f32) {
+    /// `player_hurt_entity` for any hurt living entity `victim` (mob, mannequin, player; `None`:
+    /// another player of the local network) whose source is the player, as
+    /// [`Self::s9_player_hurt_mob`] describes it (`blocked`: parried by a shield).
+    pub(crate) fn s9_player_hurt_living(&mut self, victim: Option<Who<'_>>, ty: &str, original: f32, taken: f32, blocked: bool) {
         if !self.trig_active("minecraft:player_hurt_entity") {
             return;
         }
@@ -154,7 +155,7 @@ impl Server {
         };
         let pos = proj.as_ref().map(|p| p.pos).or_else(|| blast.map(|b| b.1)).unwrap_or(self.pos);
         let dmg = Dmg { ty: ty.to_owned(), source: Some(Who::E(E::Player)), direct, pos: Some(pos) };
-        self.trig_player_hurt_entity(Some(victim), &dmg, original, taken, false);
+        self.trig_player_hurt_entity(victim, &dmg, original, taken, blocked);
         self.proj.direct_hit = proj;
     }
 }
