@@ -246,16 +246,27 @@ impl Server {
         min
     }
 
-    /// Present chunks made complete at once (generation awaited).
+    /// Present chunks made complete at once (generation awaited): the game's direct access to a
+    /// chunk from the server thread (portal search, structure pieces written into the live
+    /// world). The wait wakes on each output of the generation thread, at most 60 s in all; a
+    /// chunk that can be neither read nor generated stays missing.
     pub(crate) fn load_now(&mut self, list: &[(i32, i32)]) {
         self.ensure_loaded(list);
         let t = std::time::Instant::now();
+        let budget = std::time::Duration::from_secs(60);
         loop {
-            let waiting = self.generator.as_ref().is_some_and(|g| list.iter().any(|p| g.pending.contains(p)));
-            if !waiting || t.elapsed().as_secs() > 60 {
+            let g = self.generator.as_ref().filter(|g| list.iter().any(|p| g.pending.contains(p)));
+            let (Some(g), Some(left)) = (g, budget.checked_sub(t.elapsed())) else { break };
+            // Output awaited without taking it (`poll_gen` reads it); ready with nothing to read:
+            // the thread is gone.
+            let ready = {
+                let mut sel = crossbeam_channel::Select::new();
+                sel.recv(&g.rx);
+                sel.ready_timeout(left).is_ok() && !g.rx.is_empty()
+            };
+            if !ready {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
             self.poll_gen();
         }
     }

@@ -380,14 +380,7 @@ impl Server {
         );
         c.changed[si] = true;
         c.dirty = true;
-        let key = (p[0] >> 4, p[2] >> 4, si);
-        if self.data.states.get(state as usize).is_some_and(|i| i.has(flags::RANDOM_TICK))
-            || self.fluid_of(state).kind == 2
-        {
-            self.bs.rt.insert(key, true);
-        } else if self.data.states.get(old as usize).is_some_and(|i| i.has(flags::RANDOM_TICK)) {
-            self.bs.rt.remove(&key);
-        }
+        self.random_tick_changed((p[0] >> 4, p[2] >> 4, si), old, state);
         if self.light.matters(old, state) {
             let o = self.light_opts;
             // Consecutive duplicate dropped (`misc`): exact, nothing moved between the two, it
@@ -401,6 +394,36 @@ impl Server {
         }
         self.poi_block_changed(p, old, state); // F05: POI registry
         Some(old)
+    }
+
+    /// Random-tick cache of the section after a change of `old` into `state`.
+    fn random_tick_changed(&mut self, key: (i32, i32, usize), old: u32, state: u32) {
+        if self.data.states.get(state as usize).is_some_and(|i| i.has(flags::RANDOM_TICK))
+            || self.fluid_of(state).kind == 2
+        {
+            self.bs.rt.insert(key, true);
+        } else if self.data.states.get(old as usize).is_some_and(|i| i.has(flags::RANDOM_TICK)) {
+            self.bs.rt.remove(&key);
+        }
+    }
+
+    /// Direct write into the section, like the game's ore veins in the live world: the section
+    /// counts its random ticks, but nothing else is told: no client update, light, height map,
+    /// block entity or point of interest, and the chunk is not marked for saving (the cell goes to
+    /// disk only if something else does mark it).
+    pub(crate) fn write_section_only(&mut self, p: P, state: u32) {
+        let ly = p[1] - self.dim.height.min_y;
+        let Some(Some(c)) = self.chunks.get_mut(&(p[0] >> 4, p[2] >> 4)) else { return };
+        let Some(si) = usize::try_from(ly >> 4).ok().filter(|&i| i < c.sections.len()) else { return };
+        let idx = block_index((p[0] & 15) as usize, (ly & 15) as usize, (p[2] & 15) as usize);
+        let old = c.sections[si].blocks.get(idx);
+        if old == state {
+            return;
+        }
+        let air = &self.states;
+        c.sections[si].set_blocks(&[(idx as u16, state)], self.data.state_bits() as u8, |s| air.is_air(s));
+        c.changed[si] = true;
+        self.random_tick_changed((p[0] >> 4, p[2] >> 4, si), old, state);
     }
 
     /// Placement with flags and shape depth 512.

@@ -683,3 +683,172 @@ fn place_jigsaw_leaves_the_world_shapes_alone() {
     assert!(!w.p.s.v().is_air(w.p.s.get([n[0] - 1, n[1], n[2]])), "same placement");
     assert!(w.name(n).contains("west=false"), "no shape update from a pool piece: {}", w.name(n));
 }
+
+// ---- L9-STRUCT: features and structures replayed into the live world ----
+
+fn chunk_loaded(w: &W, c: (i32, i32)) -> bool {
+    matches!(w.p.s.chunks.get(&c), Some(Some(_)))
+}
+
+/// A feature placed into the live world keeps its own flags: the oak's trunk is written with
+/// neighbour updates (flags 19), so a lit lamp without power beside it schedules its switching
+/// off. A copy written back with the "clients" flag alone left it lit and unscheduled.
+#[test]
+fn live_feature_writes_update_their_neighbours() {
+    let mut w = world("feature-flags");
+    let (at, lamp) = ([8, Y, 8], [9, Y, 8]);
+    w.cmd(&format!("setblock {} {} {} minecraft:redstone_lamp[lit=true]", lamp[0], lamp[1], lamp[2]));
+    assert!(w.name(lamp).contains("lit=true"), "{}", w.name(lamp));
+    let id = u32::from(w.p.s.bs.t.block_id("minecraft:redstone_lamp"));
+    let scheduled =
+        |w: &W| w.p.s.bs.block_ticks.chunk_ticks((0, 0)).iter().any(|t| t.pos == lamp && t.kind == id);
+    assert!(!scheduled(&w), "lamp tick before the tree");
+    assert!(w.p.s.place_world_feature("minecraft:oak", at), "oak placed");
+    assert!(w.name(at).starts_with("minecraft:oak_log"), "trunk: {}", w.name(at));
+    assert!(scheduled(&w), "the trunk's neighbour update reaches the lamp");
+}
+
+/// `place feature` of an ore writes straight into the sections, like the game's ore veins: the
+/// cells change on the server, but no client update is sent and the chunk is not marked for
+/// saving (game quirk).
+#[test]
+fn place_feature_ore_writes_silently() {
+    let mut w = world("ore-silent");
+    w.cmd(&format!("fill 0 {Y} 0 15 {} 15 minecraft:stone", Y + 15));
+    w.p.s.flush_block_changes();
+    let _ = w.p.take_events();
+    w.p.s.chunks.get_mut(&(0, 0)).and_then(Option::as_mut).expect("chunk").dirty = false;
+    let ore = |w: &W| {
+        let mut v = Vec::new();
+        for x in 0..16 {
+            for y in Y..Y + 16 {
+                for z in 0..16 {
+                    if w.name([x, y, z]) == "minecraft:iron_ore" {
+                        v.push([x, y, z]);
+                    }
+                }
+            }
+        }
+        v
+    };
+    assert!(ore(&w).is_empty());
+    w.cmd(&format!("place feature minecraft:ore_iron 8 {} 8", Y + 8));
+    let cells = ore(&w);
+    assert!(!cells.is_empty(), "vein placed");
+    assert!(cells.iter().all(|p| !w.p.s.changed.contains(p)), "an ore cell was sent to the client");
+    assert!(!w.p.s.chunks[&(0, 0)].as_ref().expect("chunk").dirty, "chunk marked for saving");
+}
+
+/// `place jigsaw` only needs the chunk of its position loaded; the pieces that reach other chunks
+/// load them (generated when absent) and land there, like the game, instead of being dropped.
+#[test]
+fn place_jigsaw_loads_the_chunks_its_pieces_reach() {
+    let mut w = world("jigsaw-unloaded");
+    let target = base_plate_jigsaw(&mut w);
+    let home = (10, 10);
+    w.p.s.load_now(&[home]);
+    assert!(chunk_loaded(&w, home), "home chunk");
+    let around: Vec<(i32, i32)> = (-1..=1)
+        .flat_map(|dz| (-1..=1).map(move |dx| (home.0 + dx, home.1 + dz)))
+        .filter(|&c| c != home)
+        .collect();
+    assert!(around.iter().all(|&c| !chunk_loaded(&w, c)), "neighbours unloaded before");
+    w.cmd(&format!("place jigsaw minecraft:pillager_outpost/base_plates {target} 2 168 {Y} 168"));
+    let reached: Vec<(i32, i32)> = around.iter().copied().filter(|&c| chunk_loaded(&w, c)).collect();
+    assert!(!reached.is_empty(), "no chunk around the position loaded by the pieces");
+    // Flat terrain: bedrock, two dirt, grass, then air from Y up.
+    let flat = |y: i32| match y - (Y - 4) {
+        0 => "minecraft:bedrock",
+        1 | 2 => "minecraft:dirt",
+        3 => "minecraft:grass_block",
+        _ => "minecraft:air",
+    };
+    let mut placed = 0;
+    for &(cx, cz) in &reached {
+        for x in cx * 16..cx * 16 + 16 {
+            for z in cz * 16..cz * 16 + 16 {
+                for y in Y - 4..Y + 30 {
+                    let n = w.name([x, y, z]);
+                    placed += usize::from(n.split('[').next() != Some(flat(y)));
+                }
+            }
+        }
+    }
+    assert!(placed > 0, "no piece block in the chunks reached: {reached:?}");
+}
+
+/// Region copy of a live chunk: height maps from one walk per column (from the highest section
+/// that is not all air) equal to one walk per map from the top of the world, for built, flat and
+/// unloaded chunks.
+#[test]
+fn deco_chunk_one_walk_matches_per_map() {
+    let mut w = world("deco-prime");
+    w.cmd(&format!("fill 0 {Y} 0 15 {} 15 minecraft:stone", Y + 20));
+    w.cmd(&format!("fill 2 {} 2 6 {} 6 minecraft:water", Y + 21, Y + 40));
+    w.cmd(&format!("fill 8 {} 8 12 {} 12 minecraft:oak_leaves", Y + 21, Y + 60));
+    w.cmd("fill 16 100 0 31 100 15 minecraft:glass");
+    w.cmd("setblock 20 300 4 minecraft:cobweb");
+    let (wd, dg) = w.p.s.place_data().expect("generation data");
+    for c in [(0, 0), (1, 0), (-2, -2), (40, 40)] {
+        let a = w.p.s.deco_chunk_with(c.0, c.1, &dg, &wd, true);
+        let b = w.p.s.deco_chunk_with(c.0, c.1, &dg, &wd, false);
+        assert_eq!(a.heights, b.heights, "chunk {c:?}");
+        assert_eq!(a.blocks, b.blocks, "chunk {c:?}");
+    }
+}
+
+/// Region copies of a live structure's grid shared among threads: the same copies, in the same
+/// order, as on one thread (loaded and unloaded chunks mixed).
+#[test]
+fn region_copies_on_threads_match_one_thread() {
+    let mut w = world("deco-par");
+    w.cmd(&format!("fill 0 {Y} 0 15 {} 15 minecraft:stone", Y + 20));
+    let (wd, dg) = w.p.s.place_data().expect("generation data");
+    let cells: Vec<(i32, i32)> = (-3..=3).flat_map(|z| (-3..=3).map(move |x| (x, z))).collect();
+    let one = w.p.s.copy_chunks_on(&cells, &dg, &wd, 1);
+    for n in [2, 4, 7] {
+        let many = w.p.s.copy_chunks_on(&cells, &dg, &wd, n);
+        assert_eq!(many.len(), one.len(), "{n} threads");
+        for (a, b) in one.iter().zip(&many) {
+            assert_eq!((a.cx, a.cz), (b.cx, b.cz), "{n} threads: order");
+            assert!(a.blocks == b.blocks && a.heights == b.heights && a.biomes == b.biomes, "{n} threads: {:?}", (a.cx, a.cz));
+        }
+    }
+}
+
+/// A live structure writes a barrier without side effects before each block that carries data,
+/// like the game: a chest standing where the igloo puts one of its block entities is replaced
+/// without spilling its contents.
+#[test]
+fn live_structure_replaces_block_entities_through_a_barrier() {
+    let cmd = format!("place structure minecraft:igloo 8 {Y} 8");
+    let (lo, hi) = ([-24, Y - 4, -24], [40, Y + 10, 40]);
+    // First world: a cell of the igloo that holds a block entity other than a chest (a chest
+    // would keep the old one's entity even without the barrier).
+    let mut w = world("igloo-be-a");
+    w.cmd(&cmd);
+    let mut cell = None;
+    'find: for x in lo[0]..=hi[0] {
+        for y in lo[1]..=hi[1] {
+            for z in lo[2]..=hi[2] {
+                if w.p.s.be_get([x, y, z]).is_some() && !w.name([x, y, z]).starts_with("minecraft:chest") {
+                    cell = Some([x, y, z]);
+                    break 'find;
+                }
+            }
+        }
+    }
+    let c = cell.expect("a block entity in the igloo");
+    let block = w.name(c);
+    drop(w);
+    // Second world: a chest with a diamond there first.
+    let mut w = world("igloo-be-b");
+    w.cmd(&format!(
+        "setblock {} {} {} minecraft:chest{{Items:[{{Slot:0b,id:\"minecraft:diamond\",count:1}}]}}",
+        c[0], c[1], c[2]
+    ));
+    w.cmd(&cmd);
+    assert_eq!(w.name(c), block, "same igloo block");
+    let diamonds = w.p.s.life.drops.iter().filter(|d| !d.is_removed() && d.stack.id == "minecraft:diamond").count();
+    assert_eq!(diamonds, 0, "the chest's contents were spilled");
+}

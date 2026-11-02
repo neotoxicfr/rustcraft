@@ -95,10 +95,6 @@ pub struct DecoChunk {
     pub retro: Option<Retro>,
     /// Keys of the disk compound to keep as they are (`blending_data` of an old chunk).
     pub keep: Vec<(String, rc_proto::nbt::Nbt)>,
-    /// Blocks broken with drops by the feature (position, broken state), in order: only the
-    /// planted variant of the nether fungus produces them, and only the live world replays them
-    /// (particles, sound and drops of the break).
-    pub destroyed: Vec<([i32; 3], State)>,
 }
 
 /// Regeneration below y = 0 of a converted chunk: columns without bedrock in the old world
@@ -149,7 +145,6 @@ impl DecoChunk {
             structures: None,
             retro: None,
             keep: Vec::new(),
-            destroyed: Vec::new(),
         }
     }
 
@@ -160,8 +155,57 @@ impl DecoChunk {
 
     /// Computes the final maps from the blocks (like at the end of terrain).
     pub fn prime_final_heightmaps(&mut self, b: &Blocks) {
-        for hmap in FINAL_HMS {
-            self.prime(b, hmap);
+        self.prime_maps(b, &FINAL_HMS);
+    }
+
+    /// The given maps from the blocks: one walk per column from the highest slice that is not
+    /// all air (`RUSTCRAFT_OPT_PRIME_ONE_WALK`, default), otherwise one walk per map from the top.
+    pub fn prime_maps(&mut self, b: &Blocks, maps: &[Hm]) {
+        if crate::opt::prime_one_walk() {
+            let top = self.top_non_air(b);
+            self.prime_many(b, maps, top);
+        } else {
+            for &hmap in maps {
+                self.prime(b, hmap);
+            }
+        }
+    }
+
+    /// Top of the highest slice of 16 blocks that holds anything but plain air (bottom of the
+    /// chunk if it is all air): no height map counts the cells above.
+    pub fn top_non_air(&self, b: &Blocks) -> i32 {
+        let air = b.default_state(b.k.air);
+        let slices = (self.height / 16) as usize;
+        (0..slices)
+            .rposition(|s| self.blocks[s << 12..(s + 1) << 12].iter().any(|&v| v != air))
+            .map_or(self.min_y, |s| self.min_y + (s as i32 + 1) * 16)
+    }
+
+    /// Several maps from a single walk down each column, started below `top` (every cell from
+    /// `top` up is air, which no map counts): the same heights as [`Self::prime`] map by map.
+    pub fn prime_many(&mut self, b: &Blocks, maps: &[Hm], top: i32) {
+        let top = top.clamp(self.min_y, self.min_y + self.height);
+        let want = maps.iter().fold(0u8, |a, m| a | m.bit());
+        for col in 0..256usize {
+            for &m in maps {
+                self.heights[m as usize][col] = self.min_y as i16;
+            }
+            let mut left = want;
+            let mut i = (((top - self.min_y) as usize) << 8) | col;
+            let mut y = top;
+            while left != 0 && y > self.min_y {
+                i -= 256;
+                y -= 1;
+                let hit = b.facts(self.blocks[i]).hm & left;
+                if hit != 0 {
+                    for &m in maps {
+                        if hit & m.bit() != 0 {
+                            self.heights[m as usize][col] = (y + 1) as i16;
+                        }
+                    }
+                    left &= !hit;
+                }
+            }
         }
     }
 
@@ -186,10 +230,23 @@ impl DecoChunk {
 /// One step of [`Region::live_log`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveOp {
-    /// Placement with the game's flags (a direct section write carries 18: no shape update).
+    /// Placement with the game's flags.
     Set([i32; 3], State, u32),
     /// Neighbour update around the cell (template placed without known shape).
     Notify([i32; 3]),
+    /// Break with drops (planted nether fungus): particles, sound, drops, remaining fluid.
+    Destroy([i32; 3]),
+    /// Direct write into the section (ore veins): no flag at all, the live world is not told.
+    Raw([i32; 3], State),
+}
+
+impl LiveOp {
+    /// Cell the step touches.
+    pub fn pos(&self) -> [i32; 3] {
+        match *self {
+            LiveOp::Set(p, ..) | LiveOp::Notify(p) | LiveOp::Destroy(p) | LiveOp::Raw(p, _) => p,
+        }
+    }
 }
 
 /// Write area: 3×3 chunks, centre at index 4 (`(dz + 1)·3 + (dx + 1)`).
@@ -213,8 +270,9 @@ pub struct Region<'a> {
     pub writes: u64,
     /// Journal of the placements (debug against the probe).
     pub set_log: Option<Vec<([i32; 3], State)>>,
-    /// Journal replayed into the live world (`place structure`, `place jigsaw`): every accepted
-    /// write with its game flags, and the neighbour updates, in their order.
+    /// Journal replayed into the live world (features of commands and bone meal, `place
+    /// structure`, `place jigsaw`): every accepted write with its game flags, the breaks, the
+    /// direct section writes and the neighbour updates, in their order.
     pub live_log: Option<Vec<LiveOp>>,
     /// Randomness of the region (factory "worldgen_region_random" at the corner of the central chunk).
     pub region_rng: crate::rng::Rng,
@@ -377,15 +435,18 @@ impl<'a> Region<'a> {
         self.set(p[0], p[1], p[2], s, flags)
     }
 
-    /// Break with drops (planted variant of the nether fungus): nothing on air; the broken state
-    /// is recorded in its chunk for the live world, and the cell keeps its fluid.
+    /// Break with drops (planted variant of the nether fungus): nothing on air; the break is
+    /// journaled for the live world (which does the remaining fluid itself), and the cell keeps
+    /// its fluid.
     pub fn destroy_p(&mut self, p: [i32; 3]) {
         let s = self.get_p(p);
-        let Some(i) = self.chunk_index(p[0], p[2]) else { return };
-        if self.b.is_air(s) || self.outside_height(p[1]) || self.band_refuses(p[1]) {
+        if self.chunk_index(p[0], p[2]).is_none()
+            || self.b.is_air(s)
+            || self.outside_height(p[1])
+            || self.band_refuses(p[1])
+        {
             return;
         }
-        self.chunks[i].destroyed.push((p, s));
         let b = self.b;
         let left = match b.fluid(s) {
             0 => b.default_state(b.k.air),
@@ -394,7 +455,30 @@ impl<'a> Region<'a> {
             1 => b.default_state(b.k.water),
             _ => b.default_state(b.k.lava),
         };
+        let log = self.live_log.take().map(|mut l| {
+            l.push(LiveOp::Destroy(p));
+            l
+        });
         self.set_p(p, left, 3);
+        self.live_log = log;
+    }
+
+    /// Barrier written without any side effect before a block that carries data (template
+    /// placement, like the game): in the live world it removes the old block entity without its
+    /// removal effects, and the following write always lands. Journal only: the copy is
+    /// overwritten right after.
+    pub fn log_barrier(&mut self, p: [i32; 3]) {
+        if self.live_log.is_none()
+            || self.chunk_index(p[0], p[2]).is_none()
+            || self.outside_height(p[1])
+            || self.band_refuses(p[1])
+        {
+            return;
+        }
+        let s = self.b.default_state(self.b.k.barrier);
+        if let Some(l) = &mut self.live_log {
+            l.push(LiveOp::Set(p, s, 820));
+        }
     }
 
     /// Direct write into the section (ores): neither height maps nor post-processing.
@@ -405,7 +489,7 @@ impl<'a> Region<'a> {
         }
         if let Some(i) = self.chunk_index(x, z) {
             if let Some(l) = &mut self.live_log {
-                l.push(LiveOp::Set([x, y, z], s, 18));
+                l.push(LiveOp::Raw([x, y, z], s));
             }
             let c = &mut *self.chunks[i];
             let idx = c.index(x, y, z);
@@ -434,7 +518,7 @@ impl<'a> Region<'a> {
             return;
         }
         if let Some(l) = &mut self.live_log {
-            l.push(LiveOp::Set([x, y, z], s, 18));
+            l.push(LiveOp::Raw([x, y, z], s));
         }
         let c = &mut *self.chunks[ci];
         let idx = c.index(x, y, z);

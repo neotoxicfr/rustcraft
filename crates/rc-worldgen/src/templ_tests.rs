@@ -421,6 +421,175 @@ fn locked_sources_do_not_waterlog() {
     opt::force(&ALL, None);
 }
 
+/// L9-STRUCT: journal for the live world of a template placement. A block that carries data is
+/// preceded by a barrier written without any side effect (flags 820), like the game, so that the
+/// old block entity of the live cell goes without its removal effects and the write always lands;
+/// a block without data is written alone. The copy itself never holds the barrier.
+#[test]
+fn template_block_entity_journals_a_barrier_first() {
+    use crate::decor_region::{LiveOp, Region};
+    use crate::structure_place::{Placing, place_template};
+    use crate::template::{TBlock, Template};
+    use rc_proto::nbt::Nbt;
+    let Some(w) = world_data() else { return };
+    let b = &*w.blocks;
+    let chest = b.state_from_str("minecraft:chest").expect("chest");
+    let stone = b.state_from_str("minecraft:stone").expect("stone");
+    let barrier = b.state_from_str("minecraft:barrier").expect("barrier");
+    let t = Template {
+        size: [2, 1, 1],
+        palettes: vec![vec![
+            TBlock { pos: [0, 0, 0], state: stone, nbt: None },
+            TBlock { pos: [1, 0, 0], state: chest, nbt: Some(Nbt::Compound(Vec::new())) },
+        ]],
+        cats: vec![[1, 1]],
+        jigsaws: vec![Vec::new()],
+        entities: Vec::new(),
+    };
+    let s = Placing {
+        mirror: crate::template::Mirror::None,
+        rot: crate::template::Rot::None,
+        pivot: [0, 0, 0],
+        bbox: None,
+        procs: Vec::new().into(),
+        waterlog: false,
+        seed: None,
+        shared: false,
+        known_shape: true,
+        entities: None,
+    };
+    let mut chunks: Vec<DecoChunk> = (-1..=1).flat_map(|z| (-1..=1).map(move |x| DecoChunk::new(x, z, -64, 384))).collect();
+    let arr: [&mut DecoChunk; 9] = chunks.iter_mut().collect::<Vec<_>>().try_into().unwrap();
+    let mut r = Region::new(arr, b, 63, 1);
+    r.live_log = Some(Vec::new());
+    let mut rng = crate::decor_rng::DecoRng::legacy(1);
+    assert!(place_template(&mut r, b, &w.templates.transforms, 1, &t, [8, 70, 8], [8, 70, 8], &s, &mut rng, 2));
+    let ops = r.live_log.take().expect("journal");
+    assert_eq!(
+        ops,
+        vec![
+            LiveOp::Set([8, 70, 8], stone, 2),
+            LiveOp::Set([9, 70, 8], barrier, 820),
+            LiveOp::Set([9, 70, 8], chest, 2),
+        ],
+        "journal of the placement"
+    );
+    assert_eq!(r.get_p([9, 70, 8]), chest, "the copy holds the chest");
+}
+
+/// L9-STRUCT: the six height maps of a region copy from one walk per column, started at the
+/// top of the highest section that holds something (air above), equal map by map to a walk per
+/// map from the top of the world: random columns (air, fluids, leaves, plants, solids).
+#[test]
+fn prime_many_matches_prime_per_map() {
+    use crate::decor_region::Hm;
+    let Some(w) = world_data() else { return };
+    let b = &*w.blocks;
+    let pool: Vec<u32> = [
+        "minecraft:air",
+        "minecraft:cave_air",
+        "minecraft:water",
+        "minecraft:lava",
+        "minecraft:oak_leaves",
+        "minecraft:stone",
+        "minecraft:glass",
+        "minecraft:short_grass",
+        "minecraft:snow",
+        "minecraft:cobweb",
+        "minecraft:kelp",
+    ]
+    .iter()
+    .map(|n| b.state_from_str(n).expect(n))
+    .collect();
+    let maps = [
+        Hm::WorldSurfaceWg,
+        Hm::WorldSurface,
+        Hm::OceanFloorWg,
+        Hm::OceanFloor,
+        Hm::MotionBlocking,
+        Hm::MotionBlockingNoLeaves,
+    ];
+    let mut rng = crate::decor_rng::DecoRng::legacy(20261102);
+    for round in 0..24 {
+        let mut dc = DecoChunk::new(0, 0, -64, 384);
+        let sections = 1 + rng.next_int_bounded(24);
+        let top = -64 + 16 * if round == 0 { 0 } else if round == 1 { 24 } else { sections };
+        for (i, s) in dc.blocks.iter_mut().enumerate() {
+            let y = -64 + (i >> 8) as i32;
+            // Sparse cells: the walks go deep, and some columns stay empty.
+            *s = if y >= top || rng.next_int_bounded(64) != 0 {
+                pool[0]
+            } else {
+                pool[rng.next_int_bounded(pool.len() as i32) as usize]
+            };
+        }
+        let mut per_map = dc.clone();
+        for m in maps {
+            per_map.prime(b, m);
+        }
+        dc.prime_many(b, &maps, top);
+        for m in maps {
+            assert_eq!(dc.heights[m as usize], per_map.heights[m as usize], "round {round}, map {m:?}");
+        }
+    }
+}
+
+/// L9-STRUCT: height maps of generated chunks (noise terrain with structures, flat) from one walk
+/// per column (`PRIME_ONE_WALK`) equal to one walk per map.
+#[test]
+fn generated_heightmaps_one_walk_match() {
+    let Some(w) = world_data() else { return };
+    let all: Vec<(i32, i32)> = (-2..=2).flat_map(|x| (-2..=2).map(move |z| (x, z))).collect();
+    for seed in [Some(1), Some(20261011), None] {
+        let dg = dim(w, seed);
+        let mut cache = crate::terrain::BiomeCache::default();
+        dg.prepare_biomes(&mut cache, &all);
+        for &(x, z) in &all {
+            opt::force(&["PRIME_ONE_WALK"], Some(true));
+            let a = dg.terrain(x, z, &cache, None);
+            opt::force(&["PRIME_ONE_WALK"], Some(false));
+            let b = dg.terrain(x, z, &cache, None);
+            assert_eq!(a.heights, b.heights, "seed {seed:?}, chunk {x} {z}");
+        }
+    }
+    opt::force(&["PRIME_ONE_WALK"], None);
+}
+
+/// Bench (loaded machine, `--ignored`): the four final height maps of 25 terrain chunks, one walk
+/// per map against one walk per column (best of 20).
+#[test]
+#[ignore = "bench"]
+fn bench_prime_final() {
+    let Some(w) = world_data() else { return };
+    let all: Vec<(i32, i32)> = (-2..=2).flat_map(|x| (-2..=2).map(move |z| (x, z))).collect();
+    for seed in [Some(1), None] {
+        let dg = dim(w, seed);
+        let mut cache = crate::terrain::BiomeCache::default();
+        dg.prepare_biomes(&mut cache, &all);
+        let base: Vec<DecoChunk> = all.iter().map(|&(x, z)| dg.terrain(x, z, &cache, None)).collect();
+        let mut best = [f64::MAX; 2];
+        for _ in 0..20 {
+            for (k, on) in [false, true].into_iter().enumerate() {
+                opt::force(&["PRIME_ONE_WALK"], Some(on));
+                let mut cs = base.clone();
+                let t = std::time::Instant::now();
+                for c in &mut cs {
+                    c.prime_final_heightmaps(&w.blocks);
+                }
+                best[k] = best[k].min(t.elapsed().as_secs_f64() * 1e3);
+                std::hint::black_box(&cs);
+            }
+        }
+        opt::force(&["PRIME_ONE_WALK"], None);
+        eprintln!(
+            "{}: final height maps of 25 chunks, per map {:.2} ms, one walk {:.2} ms (loaded machine)",
+            if seed.is_some() { "noise" } else { "flat" },
+            best[0],
+            best[1]
+        );
+    }
+}
+
 /// Local box of the placement = exact antecedent of the area (all mirrors, rotations, pivots).
 #[test]
 fn local_box_is_exact_preimage() {
