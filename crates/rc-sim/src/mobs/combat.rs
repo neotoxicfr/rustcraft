@@ -181,6 +181,7 @@ impl Server {
                 scale: 1.0,
                 color2: 0,
                 vib: None,
+                trail: None,
             },
             force: false,
             always_visible: false,
@@ -212,7 +213,7 @@ impl Server {
             return;
         };
         let p = LevelParticles {
-            particle: Particle { kind: kind as i32, color, state: 0, item: -1, scale: 1.0, color2: 0, vib: None },
+            particle: Particle { kind: kind as i32, color, state: 0, item: -1, scale: 1.0, color2: 0, vib: None, trail: None },
             force: false,
             always_visible: false,
             pos,
@@ -220,6 +221,32 @@ impl Server {
             speed,
             count,
             mode,
+        };
+        let _ = self.send(Event::Particles(p));
+    }
+
+    /// One `trail` particle from `pos` towards `target`, reached in `duration` ticks, RGB `color`;
+    /// `forced`: beyond the usual distance and always shown (creaking heart).
+    pub(crate) fn trail_particle(&self, pos: [f64; 3], target: [f64; 3], color: u32, duration: i32, forced: bool) {
+        let Some(kind) = self
+            .data
+            .registry("minecraft:particle_type")
+            .and_then(|r| r.entries.iter().position(|e| e == "minecraft:trail"))
+        else {
+            return;
+        };
+        let mut particle = Particle::plain(kind as i32);
+        particle.color = color;
+        particle.trail = Some((target, duration));
+        let p = LevelParticles {
+            particle,
+            force: forced,
+            always_visible: forced,
+            pos,
+            delta: [0.0; 3],
+            speed: [0.0; 3],
+            count: 1,
+            mode: 0,
         };
         let _ = self.send(Event::Particles(p));
     }

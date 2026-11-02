@@ -1092,11 +1092,18 @@ fn end_portal_background(gui: &mut Gui) {
     gui.end_portal(0.0, 0.0, w, h);
 }
 
+/// Friends button of the title screen, first of the three icons under the buttons: same rule as
+/// the pause menu (active with its tooltip unless the friends list is unavailable).
+fn title_friends(m: &dyn rc_text::Metrics, t: &dyn Fn(&str) -> String, (w, h): (i32, i32), available: bool) -> Widget {
+    let x = w / 2 - (3 * 20 + 2 * 4) / 2;
+    crate::menus::friends_button(m, t, FRIENDS, (x, h / 4 + 48 + 72), available)
+}
+
 fn title_widgets(gui: &Gui, (w, h): (i32, i32)) -> Vec<Widget> {
     let t = |k: &str| tr(&gui.lang, k, &[]);
     let y0 = h / 4 + 48;
     let x = w / 2 - 100;
-    // Rustcraft: singleplayer through the integrated server, no Realms; friends unavailable offline.
+    // Rustcraft: singleplayer through the integrated server, no Realms.
     let mut multiplayer = Widget::button(MULTIPLAYER, x, y0 + 24, 200, &t("menu.multiplayer"));
     let mut realms = Widget::button(REALMS, x, y0 + 48, 200, &t("menu.online")).inactive();
     // Multiplayer refused by the launcher or the account (ban, username to change): buttons
@@ -1107,12 +1114,8 @@ fn title_widgets(gui: &Gui, (w, h): (i32, i32)) -> Vec<Widget> {
     }
     let mut v = vec![Widget::button(SINGLEPLAYER, x, y0, 200, &t("menu.singleplayer")), multiplayer, realms];
     let icon = |i: i32| w / 2 - (3 * 20 + 2 * 4) / 2 + (i - 1) * 24;
-    let mut friends =
-        Widget::new(FRIENDS, Kind::Icon("friends/friends"), icon(1), y0 + 72, 20, 20, chars(&t("gui.friends.open")));
-    friends.active = false;
-    v.push(friends);
-    // Tooltips specific to the common language and accessibility buttons (friends
-    // unavailable: none).
+    v.push(title_friends(gui, &t, (w, h), crate::menus::friends_available()));
+    // Tooltips specific to the common language and accessibility buttons.
     v.push(
         Widget::new(LANGUAGE, Kind::Icon("icon/language"), icon(2), y0 + 72, 20, 20, chars(&t("options.language")))
             .with_tooltip(gui, &t("options.language.tooltip")),
@@ -1199,6 +1202,26 @@ fn draw_title(t: &mut Title, gui: &mut Gui, q: &wgpu::Queue, mouse: Option<(f32,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Title friends button: active with the game's tooltip like the pause one, first icon of the
+    /// row; inactive without a tooltip when the friends list is unavailable (demo, offline
+    /// developer mode).
+    #[test]
+    fn title_friends_button_follows_availability() {
+        struct Fixed;
+        impl rc_text::Metrics for Fixed {
+            fn advance(&self, _font: &str, _c: char) -> (f32, f32) {
+                (6.0, 1.0)
+            }
+        }
+        let t = |k: &str| k.to_owned();
+        let on = title_friends(&Fixed, &t, (320, 240), true);
+        assert_eq!((on.id, on.x, on.y, on.w, on.active), (FRIENDS, 126, 180, 20, true));
+        let tip: String = on.tooltip.iter().flatten().map(|s| s.c).collect();
+        assert_eq!(tip, "gui.friends.open.tooltip");
+        let off = title_friends(&Fixed, &t, (320, 240), false);
+        assert!(!off.active && off.tooltip.is_empty());
+    }
 
     /// Just-created world: the loading screen stays 500 ms after the world is ready
     /// (the old code closed it at once), and stays even if the condition drops.

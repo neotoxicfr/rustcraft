@@ -178,6 +178,14 @@ fn template(w: &mut Vec<u8>, s: &ItemStack) {
     patch(w, s);
 }
 
+/// Options of a `trail` particle: target, RGB colour, duration in ticks.
+fn trail_opts(w: &mut Vec<u8>, p: &Particle) {
+    let (target, duration) = p.trail.unwrap_or(([0.0; 3], 1));
+    vec3d(w, target);
+    p.color.encode(w);
+    write_varint(w, duration);
+}
+
 impl Server {
     /// Options type of a particle from its name (registry order).
     fn particle_opts(&self, kind: i32) -> &'static str {
@@ -249,11 +257,7 @@ impl Server {
                 }
                 write_varint(w, ticks);
             }
-            "trail" => {
-                vec3d(w, [0.0; 3]);
-                p.color.encode(w);
-                write_varint(w, 1);
-            }
+            "trail" => trail_opts(w, p),
             _ => {}
         }
     }
@@ -1544,6 +1548,23 @@ pub fn tags(w: &mut Vec<u8>, t: &rc_proto_v777::play::Tags) {
 /// Item template exported for the other modules (`recipes`, advancements).
 pub fn write_template(w: &mut Vec<u8>, s: &ItemStack) {
     template(w, s);
+}
+
+/// L9: a guest receives the trail particle's real target and duration (they were zero and one),
+/// read back by the client's decoder.
+#[cfg(test)]
+#[test]
+fn trail_options_round_trip() {
+    let mut p = Particle::plain(0);
+    p.color = 0x5F_5F5F;
+    p.trail = Some(([216.25, -57.5, 222.75], 37));
+    let mut w = Vec::new();
+    write_varint(&mut w, 0);
+    trail_opts(&mut w, &p);
+    let codec = rc_proto_v777::entity::MetaCodec::new(Default::default(), &["minecraft:trail".to_owned()]);
+    let mut r = rc_proto::Reader::new(&w);
+    assert_eq!(codec.particle(&mut r).expect("decoded"), p);
+    assert!(r.is_empty());
 }
 
 #[cfg(test)]

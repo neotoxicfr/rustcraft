@@ -216,10 +216,7 @@ impl App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let y = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => f64::from(*y),
-                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y / 20.0,
-                };
+                let y = crate::keys::wheel_offsets(delta).1;
                 let (Some(r), Some(m)) = (&self.renderer, self.gui_mouse()) else { return true };
                 self.front.wheel(&r.gui, &mut self.options, m, y)
             }

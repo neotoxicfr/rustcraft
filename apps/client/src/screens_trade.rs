@@ -102,6 +102,15 @@ pub fn predict(t: &Trade, s0: Option<&ItemStack>, s1: Option<&ItemStack>, rules:
     lookup(t, s0, s1, rules).1
 }
 
+/// The result slot can be taken: the active offer is paid by the payment slots in either order
+/// (none without an active offer, offers not received included).
+pub(crate) fn payable(t: &Trade, slots: &[Option<ItemStack>], rules: &dyn Rules) -> bool {
+    let (s0, s1) = (slots[0].as_ref(), slots[1].as_ref());
+    let Some(i) = lookup(t, s0, s1, rules).0 else { return false };
+    let o = &t.offers[i];
+    s0.is_some_and(|a| satisfied(o, a, s1, rules)) || s1.is_some_and(|b| satisfied(o, b, s0, rules))
+}
+
 /// Result slot and predicted experience recomputed from the payment slots. With payment but no
 /// offer received yet, the result slot is left as it is.
 fn refresh(t: &mut Trade, slots: &mut [Option<ItemStack>], rules: &dyn Rules) {
@@ -573,6 +582,40 @@ mod tests {
         assert_eq!(slots[0], Some(st(1, 1)));
         assert_eq!(slots[2], None, "sold out: no result");
         assert_eq!(slots[38], Some(st(9, 1)), "result moved to the end of the inventory");
+    }
+
+    /// The result slot is taken only while the payment pays the active offer: a result left by
+    /// the server with too small a payment, or before any offer arrived, stays put; Q throws the
+    /// whole result of a paid offer.
+    #[test]
+    fn result_slot_needs_the_active_offer_paid() {
+        let mut t = Trade { offers: vec![offer(st(1, 3), None, 9)], ..Default::default() };
+        let mut slots = vec![None; 39];
+        slots[0] = Some(st(1, 2));
+        slots[2] = Some(st(9, 1));
+        assert_eq!(click(&mut t, &mut slots, 2, 0), None, "payment too small");
+        assert_eq!((slots[2].clone(), t.offers[0].uses), (Some(st(9, 1)), 0));
+        let mut none = Trade::default();
+        assert_eq!(click(&mut none, &mut slots, 2, 0), None, "no offer received");
+        slots[0] = None;
+        slots[1] = Some(st(1, 3));
+        assert_eq!(click(&mut t, &mut slots, 2, 0), Some(st(9, 1)), "paid by slot 1 alone");
+        assert_eq!((t.offers[0].uses, slots[1].clone()), (1, None));
+        // A right click takes the whole result (two items), not half of it.
+        t.offers[0].result = Some(st(9, 2));
+        slots[1] = Some(st(1, 6));
+        refresh(&mut t, &mut slots, &R);
+        let mut carried = None;
+        let mut m = Menu {
+            kind: Kind::Special(Sp::Merchant),
+            slots: &mut slots,
+            carried: &mut carried,
+            rules: &R,
+            creative: false,
+            trade: Some(&mut t),
+        };
+        m.click(2, 1, 0, &mut |_| None);
+        assert_eq!(carried, Some(st(9, 2)), "right click: whole result");
     }
 
     /// Payment placed in the swapped order (cost B in slot 0, cost A in slot 1): both consumed.

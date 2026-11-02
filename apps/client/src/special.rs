@@ -497,11 +497,7 @@ impl crate::App {
                 if self.bundle_takes_wheel() {
                     return false;
                 }
-                let y = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => f64::from(*y),
-                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y / 20.0,
-                };
-                self.special_wheel(s, m, y)
+                self.special_wheel(s, m, crate::keys::wheel_offsets(delta).1)
             }
             WindowEvent::KeyboardInput { event, .. } if self.chat.input.is_none() => {
                 if event.state != ElementState::Pressed {
@@ -578,10 +574,7 @@ impl crate::App {
                 true
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let y = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => f64::from(*y),
-                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y / 20.0,
-                };
+                let y = crate::keys::wheel_offsets(delta).1;
                 if let Some(m) = self.gui_mouse()
                     && matches!(self.special.overlay, Some(Overlay::Op(_)))
                     && let Some(Overlay::Op(mut op)) = self.special.overlay.take()

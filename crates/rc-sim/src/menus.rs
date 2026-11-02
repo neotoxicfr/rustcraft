@@ -551,11 +551,17 @@ impl Menu {
         true
     }
 
-    /// Raw removal from a slot: the crafting result slot empties by a block.
+    /// Raw removal from a slot: a result container (crafting, merchant, the stations except the
+    /// loom) empties by a block, whatever the amount asked.
     fn remove(&mut self, inv: &mut [Option<Stack>], i: usize, amount: i32) -> Option<Stack> {
         let role = self.slots[i].role;
         let have = self.get(inv, i)?.count;
-        let n = if matches!(role, Role::CraftResult | Role::MerchantResult) { have } else { amount.min(have) };
+        let whole = match role {
+            Role::CraftResult | Role::MerchantResult => true,
+            Role::StationResult => crate::stations::result_takes_whole(self),
+            _ => false,
+        };
+        let n = if whole { have } else { amount.min(have) };
         if matches!(role, Role::CraftResult | Role::FurnaceResult | Role::MerchantResult) {
             self.remove_count += amount.min(have);
         }

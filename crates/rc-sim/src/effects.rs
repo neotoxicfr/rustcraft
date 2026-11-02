@@ -739,7 +739,7 @@ impl Server {
                     }
                 };
                 colors.push((k, color));
-                parts.push(Particle { kind: k, color, state: 0, item: -1, scale: 1.0, color2: 0, vib: None });
+                parts.push(Particle { kind: k, color, state: 0, item: -1, scale: 1.0, color2: 0, vib: None, trail: None });
             }
             let ambient = self.life.fx.list.iter().all(|e| !e.visible || e.ambient);
             let key = (colors, ambient);
@@ -779,7 +779,7 @@ impl Server {
                     (kind("minecraft:entity_effect"), (alpha << 24) | (d.color & 0xFF_FFFF))
                 }
             };
-            parts.push(Particle { kind: k, color, state: 0, item: -1, scale: 1.0, color2: 0, vib: None });
+            parts.push(Particle { kind: k, color, state: 0, item: -1, scale: 1.0, color2: 0, vib: None, trail: None });
         }
         (parts, list.iter().all(|e| !e.visible || e.ambient))
     }

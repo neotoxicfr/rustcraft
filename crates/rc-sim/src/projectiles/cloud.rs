@@ -212,8 +212,8 @@ impl Server {
             .unwrap_or(0) as i32;
         match &c.custom_particle {
             // F15: dragon's breath (power).
-            Some((_, power)) => Particle { kind, color: 0, state: 0, item: -1, scale: *power, color2: 0, vib: None },
-            None => Particle { kind, color: c.color(), state: 0, item: -1, scale: 1.0, color2: 0, vib: None },
+            Some((_, power)) => Particle { kind, color: 0, state: 0, item: -1, scale: *power, color2: 0, vib: None, trail: None },
+            None => Particle { kind, color: c.color(), state: 0, item: -1, scale: 1.0, color2: 0, vib: None, trail: None },
         }
     }
 

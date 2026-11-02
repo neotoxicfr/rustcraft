@@ -817,13 +817,18 @@ impl Server {
         (self.dim.name == "minecraft:overworld").then(|| (12_600..23_401).contains(&self.day_time()))
     }
 
-    /// Trail particle of a turning eyeblossom: its draws of the world random (lifetime, then the
-    /// three velocity components). The `trail` particle itself is not sent: our particle
-    /// structure carries neither its target nor its duration, and the client does not draw it.
-    fn eyeblossom_trail_draws(&mut self) {
-        for _ in 0..4 {
-            let _ = self.bs.rng.next_double();
-        }
+    /// Trail particle of an eyeblossom turned `open` (or closed): from the block's centre towards
+    /// the point reached at a drawn speed (world random: lifetime 0.5 to 1.5 s, then the speed's
+    /// three components, upwards), in as many ticks as 20 per second of lifetime, in the colour
+    /// of the new state.
+    fn eyeblossom_trail(&mut self, p: P, open: bool) {
+        let r = &mut self.bs.rng;
+        let life = 0.5 + r.next_double();
+        let v = [r.next_double() - 0.5, r.next_double() + 1.0, r.next_double() - 0.5];
+        let start = p.map(|c| f64::from(c) + 0.5);
+        let target = [start[0] + v[0] * life, start[1] + v[1] * life, start[2] + v[2] * life];
+        let color = if open { 0xFC_7812 } else { 0x5F_5F5F };
+        self.trail_particle(start, target, color, (20.0 * life) as i32, false);
     }
 
     /// Eyeblossom that disagrees with the time of day: turned (flags 3, "block changed" with the
@@ -838,7 +843,7 @@ impl Server {
         let ns = self.v().default_state(to);
         self.set_update(p, ns);
         self.game_event_block("minecraft:block_change", p, None, Some(s));
-        self.eyeblossom_trail_draws();
+        self.eyeblossom_trail(p, !open);
         let mut same = Vec::new();
         self.scan_box(add(p, -3, -2, -3), add(p, 3, 2, 3), |q| q == s, |q, _| {
             same.push(q);
@@ -865,7 +870,7 @@ impl Server {
         let to = if open { self.bs.t.id.potted_closed_eyeblossom } else { self.bs.t.id.potted_open_eyeblossom };
         let ns = self.v().default_state(to);
         self.set_update(p, ns);
-        self.eyeblossom_trail_draws();
+        self.eyeblossom_trail(p, !open);
         let sound = if open { "minecraft:block.eyeblossom.close_long" } else { "minecraft:block.eyeblossom.open_long" };
         self.block_sound(p, sound, 1.0, 1.0);
     }

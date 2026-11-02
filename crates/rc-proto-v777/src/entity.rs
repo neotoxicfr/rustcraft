@@ -279,6 +279,15 @@ pub struct Particle {
     pub color2: u32,
     /// `vibration`: destination and trip duration in ticks, otherwise `None`.
     pub vib: Option<(VibDest, i32)>,
+    /// `trail`: target point and duration in ticks (colour in `color`), otherwise `None`.
+    pub trail: Option<([f64; 3], i32)>,
+}
+
+impl Particle {
+    /// Particle of type `kind` without options.
+    pub fn plain(kind: i32) -> Particle {
+        Particle { kind, color: 0, state: 0, item: -1, scale: 1.0, color2: 0, vib: None, trail: None }
+    }
 }
 
 /// Destination of a vibration particle (the game's position source).
@@ -390,7 +399,7 @@ impl MetaCodec {
         let kind = read_varint(r)?;
         let opts = usize::try_from(kind).ok().and_then(|k| self.particles.get(k)).copied();
         let (mut color, mut state, mut item, mut scale, mut color2) = (0, 0, -1, 1.0, 0);
-        let mut vib = None;
+        let (mut vib, mut trail) = (None, None);
         match opts {
             None => return Err(bad("particle type", i64::from(kind))),
             Some(ParticleOpts::None) => {}
@@ -434,12 +443,12 @@ impl MetaCodec {
                 vib = Some((dest, read_varint(r)?));
             }
             Some(ParticleOpts::Trail) => {
-                vec3d(r)?;
+                let target = vec3d(r)?;
                 color = u32::decode(r)?;
-                read_varint(r)?;
+                trail = Some((target, read_varint(r)?));
             }
         }
-        Ok(Particle { kind, color, state, item, scale, color2, vib })
+        Ok(Particle { kind, color, state, item, scale, color2, vib, trail })
     }
 
     fn value(&self, r: &mut Reader<'_>, ty: i32) -> Result<Meta> {
@@ -639,6 +648,22 @@ mod tests {
         let p = c.particle(&mut r).unwrap();
         assert!(r.is_empty());
         assert_eq!((p.color, p.color2, p.scale), (0x0011_2233, 0x00aa_bbcc, 2.5));
+    }
+
+    /// `trail`: target (three doubles), RGB colour, duration (VarInt), all kept.
+    #[test]
+    fn trail_keeps_target_colour_and_duration() {
+        let c = MetaCodec::new(ItemCodec::default(), &["minecraft:trail".to_owned()]);
+        let mut b = vec![0u8];
+        for v in [1.5f64, -2.25, 3.0] {
+            b.extend(v.to_be_bytes());
+        }
+        b.extend(0x00fc_7812u32.to_be_bytes());
+        b.push(23);
+        let mut r = Reader::new(&b);
+        let p = c.particle(&mut r).unwrap();
+        assert!(r.is_empty());
+        assert_eq!((p.color, p.trail), (0x00fc_7812, Some(([1.5, -2.25, 3.0], 23))));
     }
 
     #[test]

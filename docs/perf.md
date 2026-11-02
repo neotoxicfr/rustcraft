@@ -3283,3 +3283,23 @@ runs), so only the order of magnitude is claimed.
   (a few attributes, equipment parsed once).
 - Multi-core and GPU not applicable to the rest (event paths, a few entities). To re-measure on a
   quiet machine: the bench above (2 passes), `fingerprint_*` tests unchanged.
+## L9-CLIENT: screen limits (02/11, loaded machine)
+
+- Wheel: discrete mode and sensitivity read once per wheel event (two option lookups, before any
+  screen) and applied by one shared conversion; per event, never per frame: no cost to measure.
+- Bundles: the stop-hover rule (announce "no item chosen" when the hovered slot changes away from
+  a bundle) is checked every frame with a container or creative screen open, as the game does
+  (a per-tick check would miss slots crossed between two ticks). One hit test per frame: the
+  container screen's existing one; the creative screen's built a 54-entry list at each call,
+  replaced by an iterator (same slot at every point, test `hit_test_without_a_list_finds_the_same_slot`).
+  Micro-bench `creative_screen::tests::bench_creative_hit_test` (3 alternated passes, 200 000
+  calls): with the list 61.2-62.1 ns per hit test, without 22.7-22.8 ns. Kept (no allocation per frame).
+- Trail particle: sent with the particle type looked up by name like every other particle send
+  (eyeblossom turns and creaking heart calls: rare, at most two per tick per calling heart); client
+  tick shared with the vibration signal (`home_in`), same cost per particle. Not a hot spot.
+- Checkbox label lines computed at layout (screen size change), never per frame. CSV column order
+  computed once per archive. System locale read once (cached). Merchant result check: one offer
+  lookup per click on the result slot.
+- Multi-core and GPU not applicable (per-event or per-frame UI work of a few hundred
+  nanoseconds at most). Scenes to re-measure on a quiet machine: `menu` and an in-game scene with
+  the creative inventory open (no change expected beyond the removed allocation).

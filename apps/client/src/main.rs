@@ -117,6 +117,7 @@ mod tablist;
 mod tech_blocks;
 mod terrain_shader;
 mod text_display;
+mod syslocale;
 mod ticking;
 mod toasts;
 mod tooltips;
@@ -1271,6 +1272,8 @@ impl App {
             self.menu_frame();
             return;
         }
+        // Slot left by the mouse in a container or creative screen (`bundle.rs`).
+        self.bundle_hover();
         // Light recomputed after the frame's packets, before the meshing (like the game).
         if !self.relight.is_empty() {
             let changes = std::mem::take(&mut self.relight);
@@ -2369,7 +2372,6 @@ impl App {
             self.fx_tick();
             self.entity_events_tick();
         }
-        self.bundle_tick();
         self.bundle_sound();
         self.social_toast_tick();
         self.tutorial_tick();
@@ -2890,6 +2892,7 @@ impl App {
         }
         let window = self.inventory.container.as_ref().map_or(0, |c| c.window);
         let _ = self.session.link.send_container_close(window);
+        self.bundle_close();
         self.inventory.container = None;
         self.screens.hide();
         self.grab(true);
@@ -3463,10 +3466,7 @@ impl ApplicationHandler for App {
                 self.menu_actions(actions);
             }
             WindowEvent::MouseWheel { delta, .. } if self.menus.is_open() => {
-                let y = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => f64::from(y),
-                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y / 20.0,
-                };
+                let (_, y) = keys::wheel_offsets(&delta);
                 let (Some(r), Some(m)) = (&self.renderer, self.gui_mouse()) else { return };
                 let actions = self.menus.wheel(&r.gui, &mut self.options, m, y, self.mods.control_key());
                 self.menu_actions(actions);
@@ -3578,10 +3578,7 @@ impl ApplicationHandler for App {
                 self.grab(true)
             }
             WindowEvent::MouseWheel { delta, .. } if self.chat.input.is_some() => {
-                let lines = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
-                    winit::event::MouseScrollDelta::PixelDelta(p) => (p.y / 20.0) as f32,
-                };
+                let lines = keys::wheel_offsets(&delta).1;
                 if let Some(m) = self.gui_mouse()
                     && self.cmd.wheel(m, lines)
                 {
@@ -3590,7 +3587,10 @@ impl ApplicationHandler for App {
                 self.chat.scroll(chat::wheel_lines(lines, self.mods.shift_key()));
             }
             // Container screen: the wheel picks a bundle's item, never the bar.
-            WindowEvent::MouseWheel { delta, .. } if self.screens.open => self.bundle_wheel(delta),
+            WindowEvent::MouseWheel { delta, .. } if self.screens.open => {
+                let (x, y) = keys::wheel_offsets(&delta);
+                self.bundle_wheel(x, y);
+            }
             WindowEvent::MouseWheel { delta, .. } => self.game_scroll(delta),
             WindowEvent::Focused(false) => {
                 self.keys.clear();
@@ -3684,6 +3684,7 @@ fn main() {
         game_dir: Some(servers::game_dir()),
         disable_multiplayer: args.launch.disable_multiplayer,
         disable_chat: args.launch.disable_chat,
+        offline_developer_mode: args.launch.offline_developer_mode,
     });
     // `--demo`: the worlds opened by this client are in demo mode (integrated server).
     rc_sim::demo::set_launch_demo(args.launch.demo);

@@ -1118,16 +1118,8 @@ impl BackupConfirm {
         ];
         if self.erase_box {
             let label = colored(&t(gui, "selectWorld.backupEraseCache"), 0xe0_e0e0);
-            let lw = rc_text::width(gui, &label);
-            v.push(Widget::new(
-                B_ERASE,
-                Kind::Checkbox { checked: self.erase },
-                w / 2 - 155 + 80,
-                76 + ts,
-                17 + 4 + lw,
-                17,
-                label,
-            ));
+            let dots = rc_text::CharStyle { color: Some(0xe0_e0e0), ..Default::default() };
+            v.push(Widget::checkbox(gui, B_ERASE, (w / 2 - 155 + 80, 76 + ts), self.erase, label, None, &dots));
         }
         let keyboard = self.panel.keyboard;
         self.panel = Panel::new(v);

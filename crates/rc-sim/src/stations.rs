@@ -474,6 +474,12 @@ pub fn no_pick_all(m: &Menu) -> bool {
     matches!(st_of(m), Some(St::Smithing | St::Stonecutter | St::Cartography))
 }
 
+/// The result slot sits on a result container that hands over its whole stack on any removal:
+/// every station result except the loom's, whose output container gives the amount asked.
+pub fn result_takes_whole(m: &Menu) -> bool {
+    st_of(m).is_some_and(|s| s != St::Loom)
+}
+
 /// The rest of a quick move of the result is thrown away (stonecutter).
 pub fn drops_rest(m: &Menu) -> bool {
     st_of(m) == Some(St::Stonecutter)
