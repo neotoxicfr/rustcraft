@@ -978,7 +978,7 @@ impl Server {
         self.bs.block_ticks.will_tick_this_tick(p, u32::from(block))
     }
 
-    fn mark_dirty(&mut self, p: P) {
+    pub(crate) fn mark_dirty(&mut self, p: P) {
         if let Some(Some(c)) = self.chunks.get_mut(&(p[0] >> 4, p[2] >> 4)) {
             c.dirty = true;
         }
@@ -1217,6 +1217,10 @@ impl Server {
                 }
             }
             Kind::BigDripleaf => self.dripleaf_neighbor_changed(state, p),
+            // G6-F14: structure and test blocks follow the signal.
+            Kind::Structure | Kind::Test => {
+                self.tech_neighbor_changed(state, p);
+            }
             _ => self.cmdblock_neighbor_changed(state, p), // S5
         }
         let _ = moved;
@@ -1245,6 +1249,7 @@ impl Server {
             Kind::GrowingHead { up } | Kind::GrowingBody { up } => self.growing_tick(state, p, up),
             Kind::BigDripleaf => self.dripleaf_tick(state, p),
             Kind::Speleothem { .. } => self.speleothem_tick(state, p), // G6-F09a
+            Kind::Test => self.test_block_tick(state, p),         // G6-F14: start block resets
             // Stem, chorus: broken (loot) if they no longer hold.
             Kind::BigDripleafStem | Kind::ChorusFlower | Kind::ChorusPlant => {
                 if !self.can_survive(state, p) {

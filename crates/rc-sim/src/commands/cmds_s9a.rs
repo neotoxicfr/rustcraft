@@ -1008,6 +1008,8 @@ impl Server {
     /// Data reload with the `enabled` packs (in order): selection rewritten
     /// in level.dat, stack rebuilt, then tags (sent back to the client), functions and advancements.
     fn reload_packs(&mut self, repo: &[crate::packs::Pack], enabled: &[String]) {
+        // G6-F14: the template manager forgets everything, unsaved captures included.
+        self.cmd.templates.clear();
         let sel = crate::packs::explicit(repo, enabled, &self.features);
         if let Some(d) = crate::nbtio::get_mut(&mut self.level.root, "Data") {
             crate::packs::write_config(d, &sel);

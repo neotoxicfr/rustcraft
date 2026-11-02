@@ -212,6 +212,16 @@ impl Server {
         let start = args::block_pos(self, s, &a("begin"));
         let end = args::block_pos(self, s, &a("end"));
         let dest = args::block_pos(self, s, &a("destination"));
+        // Source dimension: the one named after `from`, otherwise the source's; target: the one
+        // named after `to`, otherwise the source dimension.
+        let here = self.dim.name.clone();
+        let src_dim = p.arg(seg, "sourceDimension").map_or_else(|| here.clone(), |d| args::id(&d));
+        let dst_dim = p.arg(seg, "targetDimension").map_or_else(|| src_dim.clone(), |d| args::id(&d));
+        for d in [&src_dim, &dst_dim] {
+            if *d != here && !self.world_dimensions().contains(d) {
+                return Err(Fail(tr!("argument.dimension.invalid", d.clone())));
+            }
+        }
         let (min, max) = bbox(start, end);
         let len = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
         let dmax = [dest[0] + len[0], dest[1] + len[1], dest[2] + len[2]];
@@ -219,7 +229,7 @@ impl Server {
         let mask = w.iter().find(|x| matches!(**x, "replace" | "masked" | "filtered")).copied().unwrap_or("replace");
         let strict = w.contains(&"strict");
         let overlap = (0..3).all(|k| dest[k] <= max[k] && dmax[k] >= min[k]);
-        if mode == "normal" && overlap {
+        if mode == "normal" && src_dim == dst_dim && overlap {
             return Err(Fail(tr!("commands.clone.overlap")));
         }
         let area: i64 = (0..3).map(|k| i64::from(len[k] + 1)).product();
@@ -230,82 +240,115 @@ impl Server {
         let loaded = |me: &Server, a: [i32; 3], b: [i32; 3]| {
             (a[0] >> 4..=b[0] >> 4).all(|cx| (a[2] >> 4..=b[2] >> 4).all(|cz| me.is_loaded([cx << 4, 0, cz << 4])))
         };
-        if !loaded(self, min, max) || !loaded(self, dest, dmax) {
+        if !self.in_world(&src_dim, |me| loaded(me, min, max)) || !self.in_world(&dst_dim, |me| loaded(me, dest, dmax))
+        {
             return Err(Fail(tr!("argument.pos.unloaded")));
         }
         let filter = p.arg(seg, "filter");
-        let air_block = self.tb().block_id("air");
         type Info = ([i32; 3], u32, Option<Nbt>, u32);
-        let (mut solid, mut bes, mut other): (Vec<Info>, Vec<Info>, Vec<Info>) = Default::default();
-        let mut clear: std::collections::VecDeque<[i32; 3]> = Default::default();
-        for z in min[2]..=max[2] {
-            for y in min[1]..=max[1] {
-                for x in min[0]..=max[0] {
-                    let sp = [x, y, z];
-                    let dp = [dest[0] + x - min[0], dest[1] + y - min[1], dest[2] + z - min[2]];
-                    let st = self.get(sp);
-                    let ok = match mask {
-                        "masked" => self.v().block(st) != air_block,
-                        "filtered" => filter.as_ref().is_some_and(|f| self.block_matches(f, sp)),
-                        _ => true,
-                    };
-                    if !ok {
-                        continue;
-                    }
-                    let prev = self.get(dp);
-                    if let Some(be) = self.be_get(sp).cloned() {
-                        bes.push((dp, st, Some(be), prev));
-                        clear.push_back(sp);
-                    } else if !self.v().full_collision(st) {
-                        other.push((dp, st, None, prev));
-                        clear.push_front(sp);
-                    } else {
-                        solid.push((dp, st, None, prev));
-                        clear.push_back(sp);
+        type Lists = (Vec<Info>, Vec<Info>, Vec<Info>, std::collections::VecDeque<[i32; 3]>);
+        // Source side: blocks sorted like the game (solid: opaque or full collision; block
+        // entities; others), clear order of a move (others first).
+        let (solid, bes, other, clear): Lists = self.in_world(&src_dim, |me| {
+            let air_block = me.tb().block_id("air");
+            let mut l: Lists = Default::default();
+            for z in min[2]..=max[2] {
+                for y in min[1]..=max[1] {
+                    for x in min[0]..=max[0] {
+                        let sp = [x, y, z];
+                        let dp = [dest[0] + x - min[0], dest[1] + y - min[1], dest[2] + z - min[2]];
+                        let st = me.get(sp);
+                        let ok = match mask {
+                            "masked" => me.v().block(st) != air_block,
+                            "filtered" => filter.as_ref().is_some_and(|f| me.block_matches(f, sp)),
+                            _ => true,
+                        };
+                        if !ok {
+                            continue;
+                        }
+                        let info = me.v().info(st);
+                        if let Some(be) = me.be_get(sp).cloned() {
+                            l.1.push((dp, st, Some(be), 0));
+                            l.3.push_back(sp);
+                        } else if !info.has(rc_data::flags::SOLID_RENDER) && !info.has(rc_data::flags::FULL_COLLISION) {
+                            l.2.push((dp, st, None, 0));
+                            l.3.push_front(sp);
+                        } else {
+                            l.0.push((dp, st, None, 0));
+                            l.3.push_back(sp);
+                        }
                     }
                 }
             }
-        }
+            l
+        });
         let base = flag::CLIENTS | if strict { 816 } else { 0 };
         let barrier = self.v().default_state(self.tb().block_id("barrier"));
         let air = self.air();
         if mode == "move" {
-            for &pos in &clear {
-                self.set_block(pos, barrier, base | 816);
-            }
-            let std_flags = if strict { base } else { flag::ALL };
-            for &pos in &clear {
-                self.set_block(pos, air, std_flags);
-            }
+            self.in_world(&src_dim, |me| {
+                for &pos in &clear {
+                    me.set_block(pos, barrier, base | 816);
+                }
+                let std_flags = if strict { base } else { flag::ALL };
+                for &pos in &clear {
+                    me.set_block(pos, air, std_flags);
+                }
+            });
         }
         let mut all: Vec<Info> = Vec::new();
         all.extend(solid);
-        all.extend(bes.iter().cloned());
+        let n_solid = all.len();
+        all.extend(bes);
+        let n_bes = all.len() - n_solid;
         all.extend(other);
-        for info in all.iter().rev() {
-            self.set_block(info.0, barrier, base | 816);
-        }
-        let mut count = 0;
-        for info in &all {
-            if self.set_block(info.0, info.1, base) {
-                count += 1;
+        let count = self.in_world(&dst_dim, |me| {
+            // State found at the destination before the copy (neighbour updates at the end).
+            for info in &mut all {
+                info.3 = me.get(info.0);
             }
-        }
-        for info in &bes {
-            if let Some(mut n) = info.2.clone()
-                && self.be_get(info.0).is_some()
-            {
-                for k in ["x", "y", "z"] {
-                    crate::nbtio::remove(&mut n, k);
-                }
-                self.set_block_data(info.0, n);
-            }
-            self.set_block(info.0, info.1, base);
-        }
-        if !strict {
             for info in all.iter().rev() {
-                self.neighbours_on_set(info.0, info.3);
+                me.set_block(info.0, barrier, base | 816);
             }
+            let mut count = 0;
+            for info in &all {
+                if me.set_block(info.0, info.1, base) {
+                    count += 1;
+                }
+            }
+            for info in &all[n_solid..n_solid + n_bes] {
+                if let Some(mut n) = info.2.clone()
+                    && me.be_get(info.0).is_some()
+                {
+                    for k in ["x", "y", "z"] {
+                        crate::nbtio::remove(&mut n, k);
+                    }
+                    me.set_block_data(info.0, n);
+                }
+                me.set_block(info.0, info.1, base);
+            }
+            if !strict {
+                for info in all.iter().rev() {
+                    me.neighbours_on_set(info.0, info.3);
+                }
+            }
+            count
+        });
+        // Scheduled block ticks of the source box (fluids are not copied), moved by the
+        // offset with the same due time and priority, ordered after the copied ones.
+        let ticks = self.in_world(&src_dim, |me| me.bs.block_ticks.in_box(min, max));
+        if !ticks.is_empty() {
+            let off = [dest[0] - min[0], dest[1] - min[1], dest[2] - min[2]];
+            let lo = ticks.iter().map(|t| t.sub).min().unwrap_or(0);
+            let hi = ticks.iter().map(|t| t.sub).max().unwrap_or(0);
+            self.in_world(&dst_dim, |me| {
+                for t in &ticks {
+                    let q = [t.pos[0] + off[0], t.pos[1] + off[1], t.pos[2] + off[2]];
+                    if me.bs.block_ticks.schedule(q, t.kind, t.at, t.priority, t.sub - lo + hi + 1) {
+                        me.mark_dirty(q);
+                    }
+                }
+            });
         }
         if count == 0 {
             return Err(Fail(tr!("commands.clone.failed")));
@@ -335,7 +378,11 @@ impl Server {
                     if n == 0 {
                         self.fail(s, tr!("commands.forceload.added.none", dim));
                     } else {
-                        let list = self.cmd.forced.iter().map(|&c| chunk_text(c)).collect::<Vec<_>>().join(", ");
+                        // Listed in the order of the packed position (z then x as an unsigned
+                        // 32-bit value), like the game.
+                        let mut sorted: Vec<(i32, i32)> = self.cmd.forced.iter().copied().collect();
+                        sorted.sort_unstable_by_key(|c| (i64::from(c.1) << 32) | i64::from(c.0 as u32));
+                        let list = sorted.into_iter().map(chunk_text).collect::<Vec<_>>().join(", ");
                         if n == 1 {
                             self.ok(s, tr!("commands.forceload.list.single", dim, list));
                         } else {
@@ -355,7 +402,11 @@ impl Server {
                 let add = op == "add";
                 let [x1, z1] = args::column(s, &p.arg(seg, "from").unwrap_or_default());
                 let [x2, z2] = p.arg(seg, "to").map_or([x1, z1], |t| args::column(s, &t));
-                let (cx0, cz0, cx1, cz1) = (x1.min(x2) >> 4, z1.min(z2) >> 4, x1.max(x2) >> 4, z1.max(z2) >> 4);
+                let (bx0, bz0, bx1, bz1) = (x1.min(x2), z1.min(z2), x1.max(x2), z1.max(z2));
+                if bx0 < -30_000_000 || bz0 < -30_000_000 || bx1 >= 30_000_000 || bz1 >= 30_000_000 {
+                    return Err(Fail(tr!("argument.pos.outofworld")));
+                }
+                let (cx0, cz0, cx1, cz1) = (bx0 >> 4, bz0 >> 4, bx1 >> 4, bz1 >> 4);
                 let n = i64::from(cx1 - cx0 + 1) * i64::from(cz1 - cz0 + 1);
                 if n > 256 {
                     return Err(Fail(tr!("commands.forceload.toobig", 256, n)));
@@ -458,7 +509,12 @@ impl Server {
             }
             Some(op @ ("set" | "add")) => {
                 let d: f64 = a("distance").parse().unwrap_or(0.0);
-                let t = p.arg(seg, "time").map_or(0, |x| super::cmds_basic::time_ticks(&x));
+                let mut t = p.arg(seg, "time").map_or(0, |x| super::cmds_basic::time_ticks(&x));
+                // `add` with a duration extends the transition in progress: its remaining
+                // ticks are added to the given time.
+                if op == "add" && p.arg(seg, "time").is_some() {
+                    t = t.saturating_add(b.lerp.map_or(0, |l| l.3.clamp(0, i64::from(i32::MAX)) as i32));
+                }
                 let target = if op == "add" { b.size + d } else { d };
                 if target == b.size {
                     return Err(Fail(tr!("commands.worldborder.set.failed.nochange")));

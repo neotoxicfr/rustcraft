@@ -2910,3 +2910,22 @@ on a quiet machine with the others).
   melee path (one hit per spin). No hot path touched: the per-tick and per-hit costs above are
   unchanged (same bench, the mob melee path is identical). Multi-core and GPU not applicable
   (single events, ordered by the game).
+
+## G6-F14: game master blocks, live templates, clone, locate poi, border (02/11, loaded machine)
+
+- Border collision of the server's entities: the physics view builds the border at first need
+  (lazy cell, no work for the light engine or block reads); bench
+  `tests_g6f14::bench_border_in_entity_collision`: view alone 0.9 ns, view + border + edge test
+  of an entity far from the edge 16.0 ns per movement (best of 5 over 1,000,000). Lead not taken:
+  a border cached in the server (would save the build, a few ns) needs a resync at every change
+  of the border (command, transition tick, tests that write the fields): kept lazy, to re-measure
+  on a quiet machine against a movement of `rc_physics::collide::resolve`.
+- Redstone, neighbour changes and scheduled ticks of the structure and test blocks: new arms of
+  the existing `Kind` matches (block kind table), no name comparison on the hot path.
+- Size detection of a structure block: sections skipped by their palette (`may_contain`) before
+  any cell is read, then only the cells of the 161×161 area; command-time only.
+- Live template placement (`place template`, structure block): one pass over the palette, block
+  entities written once, edge shape pass on a bitset of the placed volume (faces only), sources
+  locked in a hash set; command-time only (no per-tick cost). Multi-core and GPU not applicable:
+  ordered writes into the live world, like the game.
+- `clone` ticks: only the chunks of the source box are visited (`TickQueue::in_box`).

@@ -412,13 +412,18 @@ impl Server {
         }
     }
 
-    /// Placed by the player: tracked output according to the rule, power.
-    pub(crate) fn cmdblock_placed(&mut self, p: [i32; 3], s: u32) {
+    /// Placed by the player: tracked output according to the rule and automatic mode of the
+    /// block, unless the stack carried block entity data (its own settings, already loaded);
+    /// then power.
+    pub(crate) fn cmdblock_placed(&mut self, p: [i32; 3], s: u32, with_data: bool) {
         let Some(name) = self.cb_name(s) else { return };
-        let auto = name == "minecraft:chain_command_block";
-        let t = self.rule("minecraft:send_command_feedback", true);
-        self.cb_set(p, "TrackOutput", Nbt::Byte(i8::from(t)));
-        self.cb_set(p, "auto", Nbt::Byte(i8::from(auto)));
+        if !with_data {
+            let auto = name == "minecraft:chain_command_block";
+            let t = self.rule("minecraft:send_command_feedback", true);
+            self.cb_set(p, "TrackOutput", Nbt::Byte(i8::from(t)));
+            // Only the chain block is automatic by itself, and it never schedules on its own.
+            self.cb_set(p, "auto", Nbt::Byte(i8::from(auto)));
+        }
         let powered = self.has_neighbor_signal(p);
         self.cb_set_powered(p, s, powered);
     }

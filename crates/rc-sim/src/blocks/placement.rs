@@ -341,7 +341,7 @@ impl Server {
                 placed = self.apply_block_state_component(pos, placed, st);
                 self.placed_components(pos, st);
             }
-            self.set_placed_by(pos, placed);
+            self.set_placed_by(pos, placed, stack.as_ref());
             if let Some(st) = &stack {
                 if by_use {
                     self.trig_location("minecraft:placed_block", pos, Some(st));
@@ -1201,7 +1201,7 @@ impl Server {
     }
 
     /// Second halves, repeaters and pistons.
-    fn set_placed_by(&mut self, p: P, s: u32) {
+    fn set_placed_by(&mut self, p: P, s: u32, stack: Option<&crate::player::Stack>) {
         self.wither_check_spawn(p); // F16: wither skeleton skull that completes a wither
         let v = self.v();
         match v.kind(s) {
@@ -1229,9 +1229,11 @@ impl Server {
             Kind::Piston { .. } => self.piston_placed_by_player(p, s),
             Kind::TripwireHook => self.hook_calculate(p, s, false, false, -1, None),
             Kind::PaleMossCarpet => self.moss_carpet_placed(s, p),
-            _ => self.cmdblock_placed(p, s), // S5: command blocks
+            // S5: command blocks (a stack carrying block entity data keeps its own settings).
+            _ => self.cmdblock_placed(p, s, stack.is_some_and(has_be_data)),
         }
         self.sign_placed_by(p); // W8a: editor of the placed sign
+        self.tech_placed_by(p, s); // G6-F14: author of the structure block
         self.dried_ghast_placed(p, s); // G6-F01: placement sound of the dried ghast
     }
 
@@ -1356,4 +1358,9 @@ impl Server {
         let _ = flags::AIR;
         self.set_block(p, rest, flag::ALL)
     }
+}
+
+/// The stack carries block entity data (`block_entity_data` component).
+fn has_be_data(st: &crate::player::Stack) -> bool {
+    st.components.as_ref().is_some_and(|c| c.get("minecraft:block_entity_data").is_some())
 }

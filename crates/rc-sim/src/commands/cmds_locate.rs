@@ -208,8 +208,39 @@ impl Server {
         match what.as_str() {
             "structure" => self.locate_structure(s, &p.arg(seg, "structure").unwrap_or_default(), origin),
             "biome" => self.locate_biome(s, &p.arg(seg, "biome").unwrap_or_default(), origin),
-            _ => Err(Fail(tr!("commands.locate.poi.not_found", p.arg(seg, "poi").unwrap_or_default()))),
+            _ => self.locate_poi(s, &p.arg(seg, "poi").unwrap_or_default(), origin),
         }
+    }
+
+    /// Nearest point of interest of a type or a tag within 256 blocks (sphere), occupied or not;
+    /// a tag names the type found.
+    fn locate_poi(&mut self, s: &Src, arg: &str, origin: [i32; 3]) -> R {
+        use crate::poi::{Occupancy, PoiType};
+        const REG: &str = "minecraft:point_of_interest_type";
+        let (is_tag, id) = match arg.strip_prefix('#') {
+            Some(t) => (true, args::id(t)),
+            None => (false, args::id(arg)),
+        };
+        let printable = if is_tag { format!("#{id}") } else { id.clone() };
+        let types: Vec<PoiType> = if is_tag {
+            let Some(members) = self.cmd.jar_tags.get(REG).and_then(|m| m.get(&id)) else {
+                return Err(Fail(tr!("argument.resource_tag.not_found", id, REG)));
+            };
+            members.iter().filter_map(|n| PoiType::from_name(n)).collect()
+        } else {
+            match PoiType::from_name(&id) {
+                Some(t) => vec![t],
+                None => return Err(Fail(tr!("argument.resource.not_found", id, REG))),
+            }
+        };
+        let Some(found) = self.poi_closest(|t| types.contains(&t), origin, 256, Occupancy::Any) else {
+            return Err(Fail(tr!("commands.locate.poi.not_found", printable)));
+        };
+        let name = match (is_tag, self.poi_type(found)) {
+            (true, Some(t)) => format!("{printable} ({})", t.name()),
+            _ => printable,
+        };
+        self.locate_result(s, "commands.locate.poi.success", name, origin, found, false)
     }
 
     fn locate_result(&mut self, s: &Src, key: &str, name: String, origin: [i32; 3], found: [i32; 3], y: bool) -> R {

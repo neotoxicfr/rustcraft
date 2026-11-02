@@ -4,7 +4,6 @@
 
 use std::sync::Arc;
 
-use rc_proto::nbt::Nbt;
 use rc_worldgen::chunkgen::{DimGen, WorldData};
 use rc_worldgen::decor_blocks::Blocks;
 use rc_worldgen::decor_region::{DecoChunk, FLUID_TICK_NAMES, Region};
@@ -152,7 +151,9 @@ impl Server {
             Some(t) => args::block_pos(self, s, &t),
             None => crate::mobs::mth::block_of(s.pos),
         };
-        if !self.chunk_loaded_xz(pos[0], pos[2]) {
+        // The 3×3 chunks around the position must be loaded (the feature may write into them).
+        let loaded = (-1..=1).all(|dz| (-1..=1).all(|dx| self.chunk_loaded_xz(pos[0] + dx * 16, pos[2] + dz * 16)));
+        if !loaded {
             return Err(Fail(tr!("argument.pos.unloaded")));
         }
         let Some((wd, dg)) = self.place_data() else { return Err(Fail(tr!("commands.place.feature.failed"))) };
@@ -167,12 +168,15 @@ impl Server {
                 chunks.push(self.deco_chunk(cx + dx, cz + dz, &dg, &wd));
             }
         }
+        // Drawn on the world's random source (like the bone meal features), not the clock.
+        let hi = i64::from(self.bs.rng.next_int());
+        let seed = (hi << 32).wrapping_add(i64::from(self.bs.rng.next_int()));
         let placed = {
             let mut it = chunks.iter_mut();
             let refs: [&mut DecoChunk; 9] = std::array::from_fn(|_| it.next().expect("9 chunks"));
             let mut r = Region::new(refs, &wd.blocks, dg.sea_level, dg.seed);
             let mut ctx = rc_worldgen::decor::Ctx::new(&mut r, &deco);
-            let mut rng = rc_worldgen::decor_rng::DecoRng::legacy(crate::rng::Rng::from_time().next_long());
+            let mut rng = rc_worldgen::decor_rng::DecoRng::legacy(seed);
             rc_worldgen::feature::place_feature(&mut ctx, fid, &mut rng, pos)
         };
         if !placed {
@@ -203,15 +207,9 @@ impl Server {
         let integrity: f32 = p.arg(seg, "integrity").and_then(|v| v.parse().ok()).unwrap_or(1.0);
         let seed: i32 = p.arg(seg, "seed").and_then(|v| v.parse().ok()).unwrap_or(0);
         let strict = seg.path.iter().any(|x| x == "strict");
-        let Some((wd, _)) = self.place_data() else { return Err(Fail(tr!("commands.place.template.invalid", id))) };
-        // Template of the world (`generated/<ns>/structures/<path>.nbt`), otherwise of the jar.
-        let (ns, path) = id.split_once(':').unwrap_or(("minecraft", id.as_str()));
-        let world_file = self.world.join("generated").join(ns).join("structures").join(format!("{path}.nbt"));
-        let tpl = match crate::nbtio::read_dat(&world_file) {
-            Ok(root) => rc_worldgen::template::Template::parse(&root, &wd.blocks).ok().map(Arc::new),
-            Err(_) => wd.templates.get(&id, &wd.blocks),
-        };
-        let Some(t) = tpl else { return Err(Fail(tr!("commands.place.template.invalid", id))) };
+        // Template of the server (world folder `generated/<ns>/structure/`, game files, captures).
+        let tpl = crate::tech_blocks::template_id(&id).and_then(|i| self.template_get(&i));
+        let Some(t) = tpl.map(|e| e.t) else { return Err(Fail(tr!("commands.place.template.invalid", id))) };
         let far = [pos[0] + t.size[0], pos[1] + t.size[1], pos[2] + t.size[2]];
         for cx in (pos[0].min(far[0]) >> 4)..=(pos[0].max(far[0]) >> 4) {
             for cz in (pos[2].min(far[2]) >> 4)..=(pos[2].max(far[2]) >> 4) {
@@ -220,29 +218,19 @@ impl Server {
                 }
             }
         }
-        let Some(palette) = t.palettes.first() else { return Err(Fail(tr!("commands.place.template.failed"))) };
-        if palette.is_empty() && t.entities.is_empty() {
-            return Err(Fail(tr!("commands.place.template.failed")));
-        }
-        // Integrity: each block kept with the given probability (command seed).
-        let mut rng =
-            crate::rng::Rng::new(if seed == 0 { crate::rng::Rng::from_time().next_long() } else { i64::from(seed) });
+        // Placement of the game (palette drawn, integrity on the settings' own random, entities,
+        // waterlogging, shape pass outside strict mode).
+        let set = crate::tech_blocks::LivePlace {
+            mirror,
+            rot,
+            ignore_entities: false,
+            known_shape: strict,
+            integrity,
+            seed: i64::from(seed),
+        };
         let flags = flag::CLIENTS | if strict { 816 } else { 0 };
-        for b in palette {
-            if integrity < 1.0 && rng.next_float() > integrity {
-                continue;
-            }
-            let rp = rc_worldgen::template::transform(b.pos, mirror, rot, [0, 0, 0]);
-            let wp = [pos[0] + rp[0], pos[1] + rp[1], pos[2] + rp[2]];
-            let st = wd.templates.transforms.apply(b.state, mirror, rot);
-            self.set_block(wp, st, flags);
-            if let Some(n) = &b.nbt {
-                let mut be = n.clone();
-                crate::nbtio::set(&mut be, "x", Nbt::Int(wp[0]));
-                crate::nbtio::set(&mut be, "y", Nbt::Int(wp[1]));
-                crate::nbtio::set(&mut be, "z", Nbt::Int(wp[2]));
-                self.set_block_data(wp, be);
-            }
+        if !self.place_template_live(&t, pos, &set, flags) {
+            return Err(Fail(tr!("commands.place.template.failed")));
         }
         self.ok(s, tr!("commands.place.template.success", id, pos[0], pos[1], pos[2]));
         Ok(1)
