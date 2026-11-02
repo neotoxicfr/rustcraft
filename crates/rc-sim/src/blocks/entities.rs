@@ -1053,6 +1053,27 @@ impl Server {
         blocklike: bool,
     ) {
         let by_mob = matches!(by, Some(crate::mobs::mob::Ent::Mob(_)));
+        self.objects_blast(center, radius, exclude, blocklike, Some((ty, by_mob)), 1.0);
+        // Paintings, frames, armor stands, cushions.
+        self.deco_explosion(center, radius, by, direct_wet, blocklike);
+    }
+
+    /// Knockback alone of a burst (wind) on the same non-living entities, × `mult`.
+    pub(crate) fn blast_push_objects(&mut self, center: [f64; 3], radius: f32, mult: f64, blocklike: bool) {
+        self.objects_blast(center, radius, None, blocklike, None, mult);
+    }
+
+    /// Blast on primed TNT, falling blocks, items on the ground (`blocklike`) and orbs: damage
+    /// of `hurt` (type, author is a mob) if any, knockback × `mult`.
+    fn objects_blast(
+        &mut self,
+        center: [f64; 3],
+        radius: f32,
+        exclude: Option<i32>,
+        blocklike: bool,
+        hurt: Option<(&str, bool)>,
+        mult: f64,
+    ) {
         let double = f64::from(radius * 2.0);
         // Relative distance, direction (from `origin`) and visible part.
         let blast = |s: &Server, pos: [f64; 3], origin: [f64; 3], b: &Aabb| -> Option<(f64, [f64; 3], f64)> {
@@ -1061,9 +1082,7 @@ impl Server {
             if dist > 1.0 {
                 return None;
             }
-            let mut dir = [origin[0] - center[0], origin[1] - center[1], origin[2] - center[2]];
-            let l = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
-            dir = if l < 1.0e-4 { [0.0; 3] } else { dir.map(|v| v / l) };
+            let dir = crate::mobs::mth::normalize([origin[0] - center[0], origin[1] - center[1], origin[2] - center[2]]);
             Some((dist, dir, f64::from(s.seen_percent(center, b))))
         };
         let damage = |dist: f64, exposure: f64| {
@@ -1082,12 +1101,13 @@ impl Server {
             else {
                 continue;
             };
-            let kb = dir.map(|v| v * (1.0 - dist) * exposure);
+            let kp = (1.0 - dist) * exposure * mult;
+            let kb = dir.map(|v| v * kp);
             let e = &mut self.bs.entities.list[i];
             e.vel = [e.vel[0] + kb[0], e.vel[1] + kb[1], e.vel[2] + kb[2]];
             e.track.needs_sync = true;
-            // The falling block registers the hit (velocity returned right away); the TNT does not.
-            e.track.sync_velocity |= !tnt;
+            // The falling block registers a hit (velocity returned right away); the TNT does not.
+            e.track.sync_velocity |= !tnt && hurt.is_some();
         }
         // Only the item on the ground escapes the blast when neither the rule nor the explosion touch
         // the blocks; the falling block and the orb always take it.
@@ -1103,10 +1123,11 @@ impl Server {
             else {
                 continue;
             };
-            let hurt = self.item_hurt(id, ty, damage(dist, exposure), by_mob);
-            let kb = dir.map(|v| v * (1.0 - dist) * exposure);
+            let hit = hurt.is_some_and(|(ty, by_mob)| self.item_hurt(id, ty, damage(dist, exposure), by_mob));
+            let kp = (1.0 - dist) * exposure * mult;
+            let kb = dir.map(|v| v * kp);
             if let Some(d) = self.life.drops.iter_mut().find(|d| d.id == id && !d.is_removed()) {
-                d.push_sync(kb, hurt);
+                d.push_sync(kb, hit);
             }
         }
         let orbs: Vec<(i32, [f64; 3])> =
@@ -1118,14 +1139,13 @@ impl Server {
             else {
                 continue;
             };
-            let hurt = self.orb_hurt(id, damage(dist, exposure));
-            let kb = dir.map(|v| v * (1.0 - dist) * exposure);
+            let hit = hurt.is_some() && self.orb_hurt(id, damage(dist, exposure));
+            let kp = (1.0 - dist) * exposure * mult;
+            let kb = dir.map(|v| v * kp);
             if let Some(o) = self.life.orbs.iter_mut().find(|o| o.id == id && !o.is_removed()) {
-                o.push_sync(kb, hurt);
+                o.push_sync(kb, hit);
             }
         }
-        // Paintings, frames, armor stands, cushions.
-        self.deco_explosion(center, radius, by, direct_wet, blocklike);
     }
 
     /// Entities that trigger blocks (plates, tripwire) whose box touches `b`; `living`:

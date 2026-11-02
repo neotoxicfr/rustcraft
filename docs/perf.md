@@ -3203,3 +3203,33 @@ runs), so only the order of magnitude is claimed.
 - Value checks of `/execute if predicate` and advancements: one loot evaluator built per check
   (a few fields and a copy of the condition context). `/item modify`, `/loot`, chest loot: the
   world is lent to the draw by reference (`LootView`), nothing copied.
+## L9-COMBAT: smash and wind reach, hurt trigger, stand attributes, summon, name cache (02/11, loaded machine)
+
+- Wind Burst / wind charge bursts now reach armor stands, mannequins, what is hung, items, orbs,
+  TNT, falling blocks, minecarts, crystals and the other players. Bench
+  `tests_l9combat::bench_wind_burst_decorations` (50 bursts per figure, 2 passes): burst alone
+  371-443 us (block rays, unchanged); with 400 armor stands around (68 in range) 825-903 us, of
+  which the decoration pass 454-636 us: scan of the 400 entries 17-25 us, visible part of the 68
+  stands 404-601 us (about 6 us each, 54 rays per stand box: the game's own computation, shared
+  with every explosion). Without decorations the pass costs 0.01-0.12 us.
+- Decoration pass, lead 1: one pass by registry index (chunk known) instead of a search by
+  identifier per decoration (quadratic): scan 17-25 us against 43.6 us; kept. Lead 2: the push of
+  a stand searches the registry once instead of three times (68 pushes): below the noise of the
+  bench, kept (fewer searches, same result). Lead 3, distance tested before the box (painting
+  boxes computed only in range): part of the 17-25 us scan, kept.
+- Visible part of a box (`seen_percent`): the dominant cost for any entity in range, mobs
+  included (pre-existing). Multi-core: not feasible as is (the world is read through the server,
+  which is not shareable between threads); a lead for the explosion engine as a whole (a read-only
+  block view shared by threads, or a cache of the cells crossed by the rays), to measure with the
+  TNT scenes, not for this mission.
+- Smash knockback: one pass over the living decorations and the other players per smash (rare);
+  no measurable cost. `player_hurt_entity` from the mob's hurt: one lookup of the open criteria
+  per hurt by the player; the projectile is copied only while such a criterion is open (none once
+  the three vanilla advancements are done). Explosion packets: one per player only with other
+  players of the local network (solo: same single event).
+- `/attribute` on stands, `/summon` of stands and mannequins, the name cache: command and join
+  paths, no measurable cost; the name cache is read once per world and written on each new entry
+  (like the game). Spawn of a living decoration: synchronised attributes read from its compound
+  (a few attributes, equipment parsed once).
+- Multi-core and GPU not applicable to the rest (event paths, a few entities). To re-measure on a
+  quiet machine: the bench above (2 passes), `fingerprint_*` tests unchanged.

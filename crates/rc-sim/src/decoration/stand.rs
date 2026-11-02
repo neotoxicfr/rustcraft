@@ -29,7 +29,7 @@ const CHEST: usize = 4;
 const HEAD: usize = 5;
 
 /// Default poses (head, body, left arm, right arm, left leg, right leg).
-const POSES: [(&str, [f32; 3]); 6] = [
+pub(super) const POSES: [(&str, [f32; 3]); 6] = [
     ("Head", [0.0, 0.0, 0.0]),
     ("Body", [0.0, 0.0, 0.0]),
     ("LeftArm", [-10.0, 0.0, -10.0]),
@@ -66,7 +66,7 @@ pub(super) fn size(e: &Nbt) -> (f64, f64) {
 }
 
 /// Angles of a part (`Rotations`: each angle modulo 360, non-finite read as 0).
-fn rotations(v: Option<&Nbt>, d: [f32; 3]) -> [f32; 3] {
+pub(super) fn rotations(v: Option<&Nbt>, d: [f32; 3]) -> [f32; 3] {
     match nbtio::f32s::<3>(v) {
         Some(r) => r.map(|a| if a.is_finite() { a % 360.0 } else { 0.0 }),
         None => d,

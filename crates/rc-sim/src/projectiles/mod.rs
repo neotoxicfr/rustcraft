@@ -353,6 +353,9 @@ pub struct Projs {
     /// their last purge (a world parked or unparked during a tick is not purged twice).
     pub tickets: Vec<PearlTicket>,
     pub purged: Option<i64>,
+    /// During the damage dealt by a player's projectile: that projectile, the direct entity
+    /// `player_hurt_entity` describes (copied only while one of its criteria is open).
+    pub direct_hit: Option<Box<Proj>>,
 }
 
 /// An Ender pearl of `owner` flies among these projectiles.

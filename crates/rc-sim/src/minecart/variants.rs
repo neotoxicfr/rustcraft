@@ -473,21 +473,35 @@ impl Server {
                 continue;
             }
             let eye = c.pos[1] + f64::from(0.595f32);
-            let mut dir = [c.pos[0] - center[0], eye - center[1], c.pos[2] - center[2]];
-            let l = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
-            if l == 0.0 {
-                self.carts.list[i] = Some(c);
-                continue;
-            }
-            dir = dir.map(|v| v / l);
+            // A minecart at the centre is still hurt (zero push), like the game.
+            let dir = crate::mobs::mth::normalize([c.pos[0] - center[0], eye - center[1], c.pos[2] - center[2]]);
             let exposure = f64::from(self.seen_percent(center, &c.bbox()));
             let pow = (1.0 - dist) * exposure;
             let dmg = ((pow * pow + pow) / 2.0 * 7.0 * double + 1.0) as f32;
             self.cart_hurt(&mut c, ty, dmg, by);
-            let kb = dir.map(|v| v * (1.0 - dist) * exposure);
-            c.vel = [c.vel[0] + kb[0], c.vel[1] + kb[1], c.vel[2] + kb[2]];
+            c.vel = [c.vel[0] + dir[0] * pow, c.vel[1] + dir[1] * pow, c.vel[2] + dir[2] * pow];
             c.needs_sync = true;
             self.carts.list[i] = Some(c);
+        }
+    }
+
+    /// Knockback alone of a burst (wind) on the minecarts, × `mult`.
+    pub(crate) fn carts_blast_push(&mut self, center: [f64; 3], radius: f32, mult: f64) {
+        let double = f64::from(radius * 2.0);
+        for i in 0..self.carts.list.len() {
+            let Some(c) = &self.carts.list[i] else { continue };
+            if c.removed {
+                continue;
+            }
+            let dist = crate::mobs::mth::dist2(c.pos, center).sqrt() / double;
+            if dist > 1.0 {
+                continue;
+            }
+            let dir = crate::mobs::mth::normalize([c.pos[0] - center[0], c.pos[1] + f64::from(0.595f32) - center[1], c.pos[2] - center[2]]);
+            let kp = (1.0 - dist) * f64::from(self.seen_percent(center, &c.bbox())) * mult;
+            let Some(c) = self.carts.list[i].as_mut() else { continue };
+            c.vel = [c.vel[0] + dir[0] * kp, c.vel[1] + dir[1] * kp, c.vel[2] + dir[2] * kp];
+            c.needs_sync = true;
         }
     }
 

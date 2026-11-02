@@ -237,7 +237,15 @@ impl Server {
         }
         let double = radius * 2.0;
         let mut player_kb: Option<[f64; 3]> = None;
-        let ids: Vec<i32> = self.mobs.list.iter().flatten().filter(|o| Some(o.id) != exclude).map(|o| o.id).collect();
+        // A digging or emerging warden ignores explosions (neither hurt nor pushed).
+        let ids: Vec<i32> = self
+            .mobs
+            .list
+            .iter()
+            .flatten()
+            .filter(|o| Some(o.id) != exclude && !super::recent::ignores_explosion(o))
+            .map(|o| o.id)
+            .collect();
         let mut targets: Vec<Ent> = ids.into_iter().map(Ent::Mob).collect();
         targets.push(Ent::Player);
         for t in targets {
@@ -251,13 +259,10 @@ impl Server {
             if dist > 1.0 {
                 continue;
             }
-            let mut dir = [pos[0] - center[0], eye - center[1], pos[2] - center[2]];
-            let l = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
-            dir = if l < 1.0e-4 { [0.0; 3] } else { dir.map(|v| v / l) };
+            let dir = super::mth::normalize([pos[0] - center[0], eye - center[1], pos[2] - center[2]]);
             let exposure = self.seen_percent(center, &bb);
             let pow = (1.0 - dist) * f64::from(exposure);
             let dmg = ((pow * pow + pow) / 2.0 * 7.0 * f64::from(double) + 1.0) as f32;
-            let kb = dir.map(|v| v * (1.0 - dist) * f64::from(exposure));
             if rc_data::env_flag!("RUSTCRAFT_S4LOG") {
                 eprintln!("explosion: {t:?} at {pos:?}, distance {dist:.3}, seen part {exposure}, damage {dmg}");
             }
@@ -312,7 +317,10 @@ impl Server {
                         dmg
                     };
                     self.mob_hurt(&mut o, ty, dmg, by, Some(center));
-                    o.vel = [o.vel[0] + kb[0], o.vel[1] + kb[1], o.vel[2] + kb[2]];
+                    // Knockback power, then along the direction; reduced by the explosion
+                    // knockback resistance (Blast Protection), like the game.
+                    let kp = (1.0 - dist) * f64::from(exposure) * (1.0 - o.attrs.explosion_kb_resistance.value());
+                    o.vel = [o.vel[0] + dir[0] * kp, o.vel[1] + dir[1] * kp, o.vel[2] + dir[2] * kp];
                     o.needs_sync = true;
                     self.mobs.list[i] = Some(o);
                 }
@@ -395,8 +403,9 @@ impl Server {
                 }
             }
         }
-        // 4. Packet to the player.
-        if dist2(self.pos, center) < 4096.0 {
+        // 4. Packet to each player within 64 blocks (the other players of the local network are
+        //    not reached by the blast: no knockback in theirs).
+        {
             let small = radius < 2.0 || !griefing;
             let pt = |s: &Server, n: &str| Particle {
                 kind: s
@@ -415,7 +424,7 @@ impl Server {
                 center,
                 radius,
                 blocks: count,
-                knockback: player_kb,
+                knockback: None,
                 particle: pt(self, if small { "minecraft:explosion" } else { "minecraft:explosion_emitter" }),
                 sound: SoundRef::Id(
                     self.data
@@ -429,9 +438,45 @@ impl Server {
                 ],
                 play_sound: true,
             };
-            let _ = self.send(Event::Explode(Box::new(ex)));
+            self.send_explosion(ex, player_kb, &[]);
         }
         let _ = EntityEvent::Remove(Vec::new());
+    }
+
+    /// Explosion packet to each player within 64 blocks of its centre, carrying that player's
+    /// own knockback (`own`: the current player's; `peers`: those of other players by seat,
+    /// none for the others), like the game sends one per player.
+    pub(crate) fn send_explosion(
+        &mut self,
+        mut ex: rc_client::extra::Explosion,
+        own: Option<[f64; 3]>,
+        peers: &[(Option<usize>, Option<[f64; 3]>)],
+    ) {
+        if self.muted {
+            return;
+        }
+        let center = ex.center;
+        if self.lan.is_none() {
+            if dist2(self.pos, center) < 4096.0 {
+                ex.knockback = own;
+                let _ = self.send(Event::Explode(Box::new(ex)));
+            }
+            return;
+        }
+        if dist2(self.pos, center) < 4096.0 {
+            let mut mine = ex.clone();
+            mine.knockback = own;
+            let _ = self.send_to_current(Event::Explode(Box::new(mine)));
+        }
+        for (who, _) in self.lan_other_players() {
+            let mut theirs = ex.clone();
+            theirs.knockback = peers.iter().find(|p| p.0 == who).and_then(|p| p.1);
+            self.as_player(who, |sv| {
+                if dist2(sv.pos, center) < 4096.0 {
+                    let _ = sv.send_to_current(Event::Explode(Box::new(theirs)));
+                }
+            });
+        }
     }
 
     /// Loot of a blown-up block (block table, explosion context).

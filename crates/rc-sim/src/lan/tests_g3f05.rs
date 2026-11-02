@@ -626,6 +626,58 @@ fn mace_wind_burst_between_players() {
     assert_eq!(t.s.life.vit.fall, 0.0, "fall not reset");
 }
 
+/// L9-COMBAT: the smash knockback reaches another player standing near the target (pushed away
+/// from it and 0.7 upwards, its velocity sent to it), and a Wind Burst sends that player an
+/// explosion packet carrying its own knockback (before, only the current player was reached and
+/// its knockback went to everyone).
+#[test]
+fn smash_and_wind_burst_reach_other_player() {
+    let mut t = open("pvpreach");
+    publish(&mut t, false);
+    let g = join(&mut t, "Guest", 2);
+    fn guest(t: &mut T) -> &mut crate::lan::ctx::PlayerCtx {
+        t.s.lan.as_mut().unwrap().guests[0].ctx.as_mut().unwrap()
+    }
+    {
+        let c = guest(&mut t);
+        c.loaded = true;
+        c.teleport = None;
+        c.game_mode = 0;
+        c.pos = [0.5, f64::from(FLOOR + 1), 3.5];
+        c.player_vel = [0.0; 3];
+    }
+    let mut z = t.s.new_mob(crate::mobs::species::Kind::Zombie, [0.5, f64::from(FLOOR + 1), 1.5], 180.0);
+    z.attrs.max_health.base = 500.0;
+    z.health = 500.0;
+    let slot = 36 + t.s.held as usize;
+    t.s.slots[slot] = Some(crate::player::Stack { id: "minecraft:mace".into(), count: 1, components: None });
+    t.s.equipment_tick();
+    t.s.on_ground = false;
+    t.s.life.vit.fall = 4.0;
+    t.s.mobs.player_vel = [0.0; 3];
+    t.s.mobs.attack_ticker = 100;
+    let _ = guest_packets(&g);
+    t.s.player_attack_mob(&mut z);
+    let v = guest(&mut t).player_vel;
+    assert_eq!(v[1], f64::from(0.7f32), "other player not lifted: {v:?}");
+    assert!(v[2] > 0.0, "other player not pushed away: {v:?}");
+    let motion = ids(&t).set_entity_motion;
+    assert!(guest_packets(&g).iter().any(|p| id_of(p) == motion), "velocity not sent to the other player");
+    // Wind Burst centred between both players: each packet carries its own knockback.
+    guest(&mut t).player_vel = [0.0; 3];
+    t.s.wind_burst_with(None, None, [0.5, f64::from(FLOOR + 1) + 0.5, 2.5], 3.5, 1.2, "minecraft:entity.wind_charge.wind_burst", &mut []);
+    let v = guest(&mut t).player_vel;
+    assert!(v[2] > 0.0, "other player not pushed by the burst: {v:?}");
+    let explode = ids(&t).explode;
+    let ps = guest_packets(&g);
+    let p = ps.iter().find(|p| id_of(p) == explode).expect("explosion packet to the other player");
+    // Centre (3 doubles), radius (float), block count (int), then the knockback flag and vector.
+    let b = body(p);
+    assert_eq!(b[32], 1, "no knockback in the other player's packet");
+    let kz = f64::from_be_bytes(b[49..57].try_into().unwrap());
+    assert!((kz - v[2]).abs() < 1e-12, "the other player received another knockback: {kz} vs {}", v[2]);
+}
+
 /// Hit and kill between players, as on a mob: weapon used, damage dealt, player killed
 /// (statistic and objective criteria) on the attacker's side; `killed_by` of the player
 /// on the victim's side.
