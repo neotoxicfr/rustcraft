@@ -69,7 +69,13 @@ impl Server {
     /// (`slot_ids`), then what each kind of entity stores under each identifier. A slot that
     /// the entity does not have is omitted.
     pub(crate) fn entity_slot_range(&self, e: E, name: &str) -> Vec<Slot> {
-        let ids = slot_ids(name).into_iter();
+        self.entity_slots(e, slot_ids(name))
+    }
+
+    /// Slots of an entity for slot identifiers of the game's table (one that the entity does
+    /// not have is omitted).
+    pub(crate) fn entity_slots(&self, e: E, ids: impl IntoIterator<Item = i32>) -> Vec<Slot> {
+        let ids = ids.into_iter();
         match e {
             E::Player => ids.filter_map(|id| self.player_slot(id)).collect(),
             E::Mob(m) => ids.filter_map(equipment_index).map(|k| Slot::Mob(m, k)).collect(),
@@ -78,8 +84,8 @@ impl Server {
                 "minecraft:item_frame" | "minecraft:glow_item_frame" => {
                     ids.filter(|&id| id == 0).map(|_| Slot::Nbt(e, "Item", None)).collect()
                 }
-                // Living entity in the game: same equipment slots as a mob.
-                "minecraft:armor_stand" => {
+                // Living entities in the game: same equipment slots as a mob.
+                "minecraft:armor_stand" | "minecraft:mannequin" => {
                     ids.filter_map(equipment_index).map(|k| Slot::Nbt(e, "equipment", Some(EQUIP_KEYS[k]))).collect()
                 }
                 _ => Vec::new(),
@@ -127,12 +133,14 @@ impl Server {
                     6
                 }
             }
-            "jukebox" | "lectern" => 1,
-            "campfire" | "soul_campfire" => 4,
+            "jukebox" => 1,
+            "shelf" => 3,
             _ => crate::lootchest::loot_size(&id).unwrap_or(27),
         }
     }
 
+    /// Block entity that is an item container for the commands. The lectern and the campfire
+    /// hold items without being containers in the game (their contents go through `/data`).
     fn is_container(&self, p: [i32; 3]) -> bool {
         let Some(be) = self.be_get(p) else { return false };
         let id = be.get("id").and_then(Nbt::as_str).unwrap_or("");
@@ -149,13 +157,25 @@ impl Server {
                     | "dropper"
                     | "crafter"
                     | "chiseled_bookshelf"
+                    | "shelf"
                     | "decorated_pot"
                     | "jukebox"
-                    | "lectern"
-                    | "campfire"
-                    | "soul_campfire"
             )
             || short.ends_with("shulker_box")
+    }
+
+    /// The game's placement test of slot `i` of the container at `p` for the commands (no
+    /// face): that of the hoppers' containers (furnace, brewing stand, jukebox, crafter), Shulker
+    /// boxes accepting boxes outside a face; the chiseled bookshelf takes one book per empty
+    /// slot, the shelf a stack below its size.
+    fn container_accepts(&self, p: [i32; 3], i: usize, item: &Stack) -> bool {
+        let id = self.be_get(p).and_then(|b| b.get("id")).and_then(Nbt::as_str).unwrap_or("").to_owned();
+        let cur = || self.slot_get(Slot::Block(p, i));
+        match id.trim_start_matches("minecraft:") {
+            "chiseled_bookshelf" => self.life.items.has_tag("minecraft:bookshelf_books", &item.id) && cur().is_none(),
+            "shelf" => cur().is_none_or(|c| c.count < self.life.items.max_stack(item).min(99)),
+            _ => self.command_can_place(p, i, item),
+        }
     }
 
     pub(crate) fn slot_get(&self, s: Slot) -> Option<Stack> {
@@ -182,6 +202,8 @@ impl Server {
     pub(crate) fn slot_set(&mut self, s: Slot, v: Option<Stack>) -> bool {
         let v = v.filter(|x| x.count > 0 && x.id != "minecraft:air");
         match s {
+            // Player armor (menu 6 chest, 7 legs, 8 feet): same equipment rule as the mobs.
+            Slot::Player(i @ 6..=8) if !self.equipment_accepts(E::Player, 10 - i, v.as_ref()) => false,
             Slot::Player(i) => {
                 if i < self.slots.len() {
                     self.slots[i] = v;
@@ -199,6 +221,12 @@ impl Server {
                 } else {
                     false
                 }
+            }
+            Slot::Mob(id, i) if !self.equipment_accepts(E::Mob(id), i, v.as_ref()) => false,
+            Slot::Nbt(e, "equipment", Some(k))
+                if !self.equipment_accepts(e, EQUIP_KEYS.iter().position(|x| *x == k).unwrap_or(0), v.as_ref()) =>
+            {
+                false
             }
             Slot::Mob(id, i) => match self.mobs.get_mut(id) {
                 Some(m) => {
@@ -247,6 +275,40 @@ impl Server {
                 self.ent_set_nbt(e, &n);
                 true
             }
+        }
+    }
+
+    /// Equipment slot (network order) where a living entity puts an item: that of its
+    /// `equippable` component if the entity can use that slot, otherwise the main hand.
+    fn equipment_slot_for(&self, e: E, st: &Stack) -> usize {
+        let k = match self.life.items.equip_slot(st) {
+            Some(1) => 2,
+            Some(2) => 3,
+            Some(3) => 4,
+            Some(4) => 5,
+            Some(5) => 1,
+            Some(6) => 6,
+            Some(7) => 7,
+            _ => 0,
+        };
+        // Armor stand: neither body nor saddle, nor a disabled slot. Mobs and mannequins: every
+        // slot (the species that refuse the saddle or the body armor to the young are not
+        // modelled here).
+        let usable = match e {
+            E::Other(_) if self.ent_type(e) == "minecraft:armor_stand" => {
+                k < 6 && !crate::decoration::stand::is_disabled(&self.ent_nbt(e), k)
+            }
+            _ => true,
+        };
+        if usable { k } else { 0 }
+    }
+
+    /// The game's slot access of a living entity's equipment: the hands and the head take any
+    /// item; the other slots only an item that goes there (or nothing).
+    fn equipment_accepts(&self, e: E, k: usize, v: Option<&Stack>) -> bool {
+        match v {
+            Some(st) if matches!(k, 2 | 3 | 4 | 6 | 7) => self.equipment_slot_for(e, st) == k,
+            _ => true,
         }
     }
 
@@ -644,13 +706,17 @@ impl Server {
                         if st.count <= 0 {
                             break;
                         }
-                        let cur = self.slot_get(Slot::Block(pos, i));
-                        match cur {
+                        if !self.container_accepts(pos, i, &st) {
+                            continue;
+                        }
+                        match self.slot_get(Slot::Block(pos, i)) {
                             None => {
                                 self.slot_set(Slot::Block(pos, i), Some(st.clone()));
                                 changed = true;
                                 break;
                             }
+                            // Same item: merged as far as the stack allows, and counted as a
+                            // change even when the stack was already full (the game's quirk).
                             Some(mut c) if crate::items::same(&c, &st) && c.count <= self.life.items.max_stack(&c) => {
                                 let space = self.life.items.max_stack(&st) - c.count;
                                 let n = st.count.min(space);
@@ -658,8 +724,8 @@ impl Server {
                                     c.count += n;
                                     st.count -= n;
                                     self.slot_set(Slot::Block(pos, i), Some(c));
-                                    changed = true;
                                 }
+                                changed = true;
                             }
                             _ => {}
                         }
@@ -674,6 +740,9 @@ impl Server {
                 let count: Option<usize> = p.arg(seg, "count").and_then(|v| v.parse().ok());
                 let n = count.unwrap_or(drops.len());
                 let slot_name = p.arg(seg, "slot").unwrap_or_default();
+                let Some(&start) = slot_ids(&slot_name).first() else {
+                    return Err(Fail(tr!("slot.unknown", slot_name)));
+                };
                 let air = Stack { id: "minecraft:air".into(), count: 0, components: None };
                 if w[2] == "block" {
                     let pos = self.loaded_pos(s, &p.arg(seg, "targetPos").unwrap_or_default())?;
@@ -681,32 +750,32 @@ impl Server {
                         return Err(Fail(tr!("commands.item.target.not_a_container", pos[0], pos[1], pos[2])));
                     }
                     let size = self.s9_container_size(pos);
-                    let start = self.slot_index_of(&slot_name);
-                    let Some(start) = start.filter(|x| *x < size) else {
-                        return Err(Fail(tr!("commands.item.target.no_such_slot", slot_name)));
-                    };
+                    if !(0..size as i32).contains(&start) {
+                        return Err(Fail(tr!("commands.item.target.no_such_slot", start)));
+                    }
                     for i in 0..n {
+                        let slot = start as usize + i;
                         let item = drops.get(i).cloned().unwrap_or_else(|| air.clone());
-                        if start + i < size {
-                            self.slot_set(Slot::Block(pos, start + i), Some(item.clone()));
+                        let placed = if slot < size {
+                            let ok = self.container_accepts(pos, slot, &item);
+                            if ok {
+                                self.slot_set(Slot::Block(pos, slot), Some(item.clone()));
+                            }
+                            ok
+                        } else {
+                            self.past_end(pos, slot, size, &item).map_err(Fail)?
+                        };
+                        if placed {
                             t.track(item, 1);
                         }
                     }
                 } else {
+                    // Slots `start`, `start + 1`… of each entity, through its slot access.
                     let ents = self.arg_entities(s, &p.arg(seg, "entities").unwrap_or_default(), false)?;
                     for e in ents {
-                        let slots = self.entity_slot_range(e, &slot_name);
-                        let Some(first) = slots.first().copied() else { continue };
                         for i in 0..n {
                             let item = drops.get(i).cloned().unwrap_or_else(|| air.clone());
-                            let sl = match first {
-                                Slot::Player(k) if i > 0 => Slot::Player(k + i),
-                                other if i > 0 => {
-                                    let _ = other;
-                                    continue;
-                                }
-                                other => other,
-                            };
+                            let Some(sl) = self.entity_slots(e, [start + i as i32]).first().copied() else { continue };
                             if self.slot_set(sl, Some(item.clone())) {
                                 t.track(item, 1);
                             }
@@ -730,9 +799,30 @@ impl Server {
         Ok(total)
     }
 
-    /// Numeric index of a slot (`container.N` → N).
-    fn slot_index_of(&self, name: &str) -> Option<usize> {
-        name.strip_prefix("container.").and_then(|x| x.parse().ok())
+    /// Slot `slot` beyond the end of the container at `p` (`loot replace block` with a count that
+    /// overflows): the game still tests then writes that slot. A container keeping a single item
+    /// ignores it (the jukebox only for a disc, the pot always): `Ok(true)` = counted without
+    /// effect; the brewing stand and the chiseled bookshelf refuse at once what they could never
+    /// take (`Ok(false)`); everywhere else the read of its list fails and the command stops
+    /// with the generic failure, the index error in its tooltip (slots already written stay).
+    fn past_end(&self, p: [i32; 3], slot: usize, size: usize, item: &Stack) -> Result<bool, rc_text::Component> {
+        let be = self.be_get(p);
+        let id = be.and_then(|b| b.get("id")).and_then(Nbt::as_str).unwrap_or("").trim_start_matches("minecraft:");
+        let out_of_bounds = |len: usize| {
+            let mut c = tr!("command.failed");
+            text::hover_text(&mut c, text::lit(format!("Index {slot} out of bounds for length {len}")));
+            c
+        };
+        let empty = item.count <= 0 || item.id == "minecraft:air";
+        match id {
+            "jukebox" => Ok(!empty && self.stack_has(item, "minecraft:jukebox_playable")),
+            "decorated_pot" => Ok(true),
+            "brewing_stand" if empty || !self.life.stations.is_potion_input(&self.life.items, item) => Ok(false),
+            "chiseled_bookshelf" if empty || !self.life.items.has_tag("minecraft:bookshelf_books", &item.id) => Ok(false),
+            // The crafter reads its "triggered" flag just past its 9 slot states.
+            "crafter" if slot == size && be.and_then(|b| crate::nbtio::int(b, "triggered")) == Some(1) => Ok(false),
+            _ => Err(out_of_bounds(size)),
+        }
     }
 
     fn loot_with(
@@ -906,7 +996,7 @@ impl Server {
                 Ok(1)
             }
             (Some("base"), Some("reset"), _) => {
-                let def = default_attr(&attr).unwrap_or(base);
+                let def = self.attribute_default_s9(e, &attr).unwrap_or(base);
                 self.set_attr_mods(e, &attr, def, &mods);
                 self.ok(
                     s,
@@ -958,6 +1048,21 @@ impl Server {
                 Ok((v * scale) as i32)
             }
             _ => Err(Fail(tr!("commands.attribute.failed.entity", self.ent_display(e)))),
+        }
+    }
+
+    /// Default base of an attribute for the entity's type (base reset): the player's table, or
+    /// for a mob the base of a freshly built mob of its species (construction values,
+    /// before any spawn draw or later change).
+    fn attribute_default_s9(&self, e: E, attr: &str) -> Option<f64> {
+        match e {
+            E::Mob(i) => {
+                let kind = self.mobs.mob_ref_any(i)?.kind;
+                let fresh = crate::mobs::mob::Mob::new(kind, 0, 0, [0.0; 3], 0.0, crate::mobs::jrand::JRand::new(0));
+                mob_attr(&fresh, attr).map(|a| a.base)
+            }
+            E::Player => default_attr(attr),
+            _ => None,
         }
     }
 

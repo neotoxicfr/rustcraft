@@ -653,7 +653,7 @@ fn profile_properties(v: &Nbt) -> Option<Vec<Nbt>> {
 /// `name`, `id` (4 integers, rendered as an array; a string is refused), `properties`, then the
 /// imposed skin `texture`, `cape`, `elytra` (full identifiers) and `model` (`wide`, `slim`).
 /// Unknown fields removed; name and identifier both present: `id` first.
-fn canonical_profile(p: &Nbt) -> Option<Nbt> {
+pub fn canonical_profile(p: &Nbt) -> Option<Nbt> {
     let Nbt::Compound(_) = p else {
         return p.as_str().filter(|n| valid_player_name(n)).map(|_| p.clone());
     };

@@ -1306,6 +1306,18 @@ impl Server {
         }
     }
 
+    /// Placement rule of slot `i` of the container at `q` outside any face (commands): that of
+    /// the hoppers, except that Shulker boxes accept other boxes (they refuse them only
+    /// through a face).
+    pub(crate) fn command_can_place(&self, q: P, i: usize, item: &crate::player::Stack) -> bool {
+        let kind = self.cont_kind(self.get(q));
+        if matches!(kind, Cont::Plain | Cont::Pot | Cont::Shulker) {
+            return true;
+        }
+        let slots = self.slots(q);
+        i < slots.len() && self.can_place(q, kind, i, item, &slots)
+    }
+
     /// Disabled slot of the crafter (`disabled_slots`).
     fn crafter_slot_disabled(&self, q: P, k: usize) -> bool {
         match self.be_get(q).and_then(|be| be.get("disabled_slots")) {

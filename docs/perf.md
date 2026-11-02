@@ -2984,3 +2984,37 @@ bench_g3f13 -- --ignored --nocapture`), loaded machine (other agents compiling).
   Command-time only. Biome tests of the structure generators go through one helper (`biome_ok`):
   a command placement skips the biome lookup altogether; world generation unchanged (equivalence
   tests of the starts and placements pass with their stored fingerprints).
+## G3-F08: compute, posteffect, fetchprofile, attribute reset, loot targets (02/11, loaded machine)
+
+- Numeric providers (`rc_sim::loot`, every loot draw): the unchecked reading now carries the
+  game's arithmetic error text (`Result<_, String>`, allocated only on an error) instead of a bare
+  failure. Bench `bench_g3f08_providers_and_hooks` (ignored by default, 1,000,000 reads, 2 passes
+  each): uniform 46.7-46.9 ns, binomial 46.7-46.8 ns, float uniform 45.6-49.0 ns, unchanged
+  within noise after the change below. Lead tried and kept: the entries of an aggregate
+  provider (`add`, `mul`, `min`, `max`, `avg`, `length`) are evaluated where they are instead of
+  copying the JSON list at each reading: sum of three constants 92.5-94.4 ns → 56.4-70.5 ns
+  (−25 to −40 %). Lead not tried (shared loot engine, G6-F17's ground): providers compiled once
+  per table into a typed tree (no string lookups of `type`, `min`, `max` at each reading), to
+  measure on a quiet machine with a loot-heavy scene. Multi-core and GPU not applicable (one draw
+  per event, the order of the draws is the game's).
+- Per-tick hooks: screen effects sent only when changed (one flag), profile answers polled only
+  when a lookup is pending: 2.9 ns per tick together when idle (same bench, 10,000,000 calls).
+- `/fetchprofile name|id`: network lookups on worker threads (never the server thread), cached
+  10 minutes per name and per identifier (256 entries each, failures included) like the game.
+  Review fix: one thread per lookup at first; now a pool started with the first lookup (one
+  worker per logical core, one shared queue; the game reuses the idle threads of an unbounded
+  I/O pool) and the cache lock is released during the network access (it was held, so lookups
+  of different profiles waited on each other). Same bench, bursts of 2,000 `fetchprofile id`
+  with instant fake services, 2 passes per version alternated: issuing on the server thread
+  16.7-17.4 µs → 1.9-2.8 µs per command, whole burst answered 53.4-55.7 ms → 7.7-11.7 ms.
+  Memory: the idle workers keep their stacks reserved (address space, a few committed pages
+  each) instead of up to one transient thread per pending lookup. Answers still read at a
+  following tick on the server thread: nothing observable changes but the order in which
+  simultaneous lookups finish, which the network decides in the game as well.
+  `/compute`, `/posteffect`, `/attribute`, `/loot`, `/enchant`, `/ride`, `/datapack`, `/spectate`:
+  command code, no hot path. Attribute base reset builds one mob of the species to read its
+  construction default (once per command). Player save: one key check (`post_effects`).
+- Fidelity side effect on the simulation: zombies, husks, zombie villagers, drowned, spiders,
+  cave spiders and endermen now move at their single-precision speed widened like the game
+  (0.23F, 0.3F): no cost change, world fingerprints updated in `tests_opt.rs` (causes checked
+  one by one).

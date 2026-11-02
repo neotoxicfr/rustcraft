@@ -79,6 +79,9 @@ pub struct PlayerData {
     pub flying: bool,
     pub fly_speed: f32,
     pub walk_speed: f32,
+    /// Screen effects (`post_effects`) to send at the next player tick: set at creation, like
+    /// the game (the list always goes out once after joining).
+    pub post_effects_dirty: bool,
 }
 
 impl PlayerData {
@@ -120,6 +123,7 @@ impl PlayerData {
             flying: ab.and_then(|a| int(a, "flying")) == Some(1),
             fly_speed: ab.and_then(|a| nbtio::float(a, "flySpeed")).unwrap_or(0.05),
             walk_speed: ab.and_then(|a| nbtio::float(a, "walkSpeed")).unwrap_or(0.1),
+            post_effects_dirty: true,
             root,
         }
     }

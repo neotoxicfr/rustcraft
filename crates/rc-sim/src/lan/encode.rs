@@ -1048,6 +1048,13 @@ impl Server {
                     w.extend_from_slice(&holder.to_be_bytes());
                 }))
             }
+            // G3-F08: screen effects imposed by `/posteffect` (list of identifiers).
+            Event::Misc(rc_client::misc::Misc::PostEffects(list)) => out.push(pk(ids.post_effects, |w| {
+                write_varint(w, list.len() as i32);
+                for id in list {
+                    rc_proto::write_str(w, id);
+                }
+            })),
             Event::Progress(p) => crate::lan::progress_packets(self, &ids, p, out),
             // W8a: sign editor, written book, data (F3+I), game rules.
             Event::OpenSignEditor { pos, front } => out.push(pk(ids.open_sign_editor, |w| {

@@ -462,22 +462,21 @@ impl Server {
         }
         let single = targets.len() == 1;
         let mut t: Track<Component> = Track::default();
+        let mut others = Vec::new();
         for e in &targets {
-            if *e != E::Player {
+            // Item in the main hand of any living entity (player, mob, armor stand, mannequin);
+            // a living entity whose hand is not modelled reads as empty-handed.
+            if !self.ent_is_living(*e) {
                 if single {
-                    let name = plain(&self.ent_display(*e));
-                    return Err(Fail(if self.ent_is_living(*e) {
-                        tr!("commands.enchant.failed.itemless", name)
-                    } else {
-                        tr!("commands.enchant.failed.entity", name)
-                    }));
+                    return Err(Fail(tr!("commands.enchant.failed.entity", plain(&self.ent_display(*e)))));
                 }
                 continue;
             }
-            let slot = 36 + self.held as usize;
-            let Some(mut st) = self.slots[slot].clone() else {
+            let slot = self.entity_slot_range(*e, "weapon.mainhand").first().copied();
+            let Some((slot, mut st)) = slot.and_then(|sl| Some((sl, self.slot_get(sl)?))) else {
                 if single {
-                    return Err(Fail(tr!("commands.enchant.failed.itemless", plain(&self.player_display_name()))));
+                    let name = if *e == E::Player { self.player_display_name() } else { self.ent_display(*e) };
+                    return Err(Fail(tr!("commands.enchant.failed.itemless", plain(&name))));
                 }
                 continue;
             };
@@ -492,8 +491,16 @@ impl Server {
                 continue;
             }
             crate::enchanting::upgrade(items, &mut st, &ench, level);
-            self.slots[slot] = Some(st);
+            match slot {
+                // The player's stack changes in place: the menu goes out below, as before.
+                super::cmds_s9b::Slot::Player(i) => self.slots[i] = Some(st),
+                other => others.push((other, st)),
+            }
             t.track(self.ent_display(*e), 1);
+        }
+        // Other entities: their hand rewritten (equipment sent) once the definitions are released.
+        for (slot, st) in others {
+            self.slot_set(slot, Some(st));
         }
         self.broadcast_menus();
         let full = enchantment_name(&ench, level, max);
@@ -1030,6 +1037,10 @@ impl Server {
     }
 
     fn cmd_debug_function(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
+        // Tracing cannot hand a result back to a function (`return run`): refused first.
+        if self.cmd.flow.ret_mode {
+            return Err(Fail(tr!("commands.debug.function.noReturnRun")));
+        }
         if TRACE.with(|t| t.borrow().is_some()) {
             return Err(Fail(tr!("commands.debug.function.noRecursion")));
         }
