@@ -1215,12 +1215,12 @@ impl Server {
         }
     }
 
+    /// The common item throw of a mob: from 0.3 (single precision) under its eyes, unit vector
+    /// toward the target × 0.3 (single precision) on each axis.
     pub(crate) fn throw_item(&mut self, m: &Mob, s: Stack, target: [f64; 3]) {
-        let pos = [m.pos[0], m.eye_y() - 0.3, m.pos[2]];
-        let d = [target[0] - m.pos[0], target[1] - m.pos[1], target[2] - m.pos[2]];
-        let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-        let v = if l < 1.0e-4 { [0.0; 3] } else { [d[0] / l * 0.3, d[1] / l * 0.3, d[2] / l * 0.3] };
-        let v = v.map(|x| x * f64::from(0.3f32) / 0.3);
+        let k = f64::from(0.3f32);
+        let pos = [m.pos[0], m.eye_y() - k, m.pos[2]];
+        let v = crate::mobs::mth::normalize([target[0] - m.pos[0], target[1] - m.pos[1], target[2] - m.pos[2]]).map(|c| c * k);
         self.spawn_item(pos, v, s, 10);
     }
 

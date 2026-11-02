@@ -285,8 +285,7 @@ pub fn move_control(s: &Server, m: &mut Mob) -> bool {
     let w = m.move_ctl.wanted;
     let travel = [w[0] - m.pos[0], w[1] - m.pos[1], w[2] - m.pos[2]];
     if careful_can_reach(s, m, travel) {
-        let l = (travel[0] * travel[0] + travel[1] * travel[1] + travel[2] * travel[2]).sqrt();
-        let n = if l < 1.0e-5 { [0.0; 3] } else { travel.map(|c| c / l) };
+        let n = crate::mobs::mth::normalize(travel);
         let k = FLYING_SPEED * 5.0 / 3.0;
         m.vel = [m.vel[0] + n[0] * k, m.vel[1] + n[1] * k, m.vel[2] + n[2] * k];
     } else {

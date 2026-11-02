@@ -458,9 +458,7 @@ impl Server {
                     && let (Some(p), Some(eye)) = (self.ent_pos(t), self.ent_eye(t))
                 {
                     self.look_at(m, [p[0], eye, p[2]], 60.0, 30.0);
-                    let d = [p[0] - m.pos[0], p[1] - m.pos[1], p[2] - m.pos[2]];
-                    let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-                    let u = if l < 1.0e-4 { [0.0; 3] } else { d.map(|v| v / l) };
+                    let u = crate::mobs::mth::normalize([p[0] - m.pos[0], p[1] - m.pos[1], p[2] - m.pos[2]]);
                     m.vel = [m.vel[0] + u[0] * 0.8, m.vel[1] + 0.9, m.vel[2] + u[2] * 0.8];
                     m.needs_sync = true;
                 }
@@ -1020,9 +1018,7 @@ impl Server {
         let dir = match bee::hive_entity(self, m) {
             Some(h) if !bee::closer_than(m, h, threshold) => {
                 let c = [f64::from(h[0]) + 0.5, f64::from(h[1]) + 0.5, f64::from(h[2]) + 0.5];
-                let d = [c[0] - m.pos[0], c[1] - m.pos[1], c[2] - m.pos[2]];
-                let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-                if l < 1.0e-4 { [0.0; 3] } else { d.map(|v| v / l) }
+                crate::mobs::mth::normalize([c[0] - m.pos[0], c[1] - m.pos[1], c[2] - m.pos[2]])
             }
             _ => view_vector(m),
         };
@@ -1147,9 +1143,7 @@ impl Server {
         let me = m.pos;
         let dist = [me[0] - target[0], me[1] - target[1], me[2] - target[2]];
         let far = [dist[0] * 0.4 + target[0], dist[1] * 0.4 + target[1], dist[2] * 0.4 + target[2]];
-        let d = [far[0] - me[0], far[1] - me[1], far[2] - me[2]];
-        let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-        let n = if l < 1.0e-4 { [0.0; 3] } else { d.map(|v| v / l) };
+        let n = crate::mobs::mth::normalize([far[0] - me[0], far[1] - me[1], far[2] - me[2]]);
         let mv = [n[0] * 10.0 + me[0], n[1] * 10.0 + me[1], n[2] * 10.0 + me[2]];
         let pt = super::super::mth::block_of(mv);
         let y = self.surface_y(pt[0], pt[2], 5);

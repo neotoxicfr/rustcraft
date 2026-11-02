@@ -243,9 +243,8 @@ impl Server {
         let angle = match src.pos {
             Some(p) => {
                 let view = crate::mobs::cubes::view_vector(0.0, self.yaw);
-                let (x, z) = (p[0] - self.pos[0], p[2] - self.pos[2]);
-                let l = (x * x + z * z).sqrt();
-                let (nx, nz) = if l < 1.0e-5 { (0.0, 0.0) } else { (x / l, z / l) };
+                let n = crate::mobs::mth::normalize([p[0] - self.pos[0], 0.0, p[2] - self.pos[2]]);
+                let (nx, nz) = (n[0], n[2]);
                 (nx * view[0] + nz * view[2]).acos()
             }
             None => std::f64::consts::PI,

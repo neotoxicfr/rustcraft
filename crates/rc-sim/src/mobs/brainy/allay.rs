@@ -199,9 +199,7 @@ fn throw_item(s: &mut Server, m: &mut Mob, target: [f64; 3], liked: bool) {
 fn throw_stack(s: &mut Server, m: &Mob, st: Stack, target: [f64; 3], vel: [f64; 3], hand: f32) {
     let r = &mut s.mobs.rng;
     let _ = (r.next_double(), r.next_double());
-    let d = [target[0] - m.pos[0], target[1] - m.pos[1], target[2] - m.pos[2]];
-    let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-    let n = if l < 1.0e-4 { [0.0; 3] } else { d.map(|x| x / l) };
+    let n = crate::mobs::mth::normalize([target[0] - m.pos[0], target[1] - m.pos[1], target[2] - m.pos[2]]);
     let v = [n[0] * vel[0], n[1] * vel[1], n[2] * vel[2]];
     let pos = [m.pos[0], m.eye_y() - f64::from(hand), m.pos[2]];
     s.spawn_item(pos, v, st, 10);

@@ -31,6 +31,18 @@ pub struct Tracker {
     pub attr_hash: super::mob::AttrPrints,
 }
 
+impl Tracker {
+    /// The first state seen (what the client was given on pairing): later sends compare with it.
+    pub(crate) fn begin(&mut self, pos: [f64; 3], vel: [f64; 3], on_ground: bool) {
+        if !self.seen {
+            self.seen = true;
+            self.base = pos;
+            self.last_vel = vel;
+            self.was_on_ground = on_ground;
+        }
+    }
+}
+
 /// Tracking range of the player entity type (chunks).
 const PLAYER_TRACKING: i32 = 32;
 
@@ -292,12 +304,7 @@ impl Server {
         interval: i32,
         rot: [f32; 2],
     ) {
-        if !t.seen {
-            t.seen = true;
-            t.base = pos;
-            t.last_vel = vel;
-            t.was_on_ground = on_ground;
-        }
+        t.begin(pos, vel, on_ground);
         let tick = t.tick;
         if tick % interval == 0 || t.needs_sync {
             t.needs_sync = false;

@@ -54,14 +54,47 @@ fn disabled_slots(e: &Nbt) -> i64 {
     int(e, "DisabledSlots").unwrap_or(0)
 }
 
-/// Width and height: marker without size, small at half.
-pub(super) fn size(e: &Nbt) -> (f64, f64) {
-    if marker(e) {
-        (0.0, 0.0)
-    } else if small(e) {
-        (f64::from(0.5f32 * 0.5), f64::from(1.975f32 * 0.5))
+/// Width, height and eye height of an armor stand (`stand`) or a mannequin kept as compound `e`,
+/// in single precision like the game: a marker stand has none (a fixed size, never scaled); a
+/// small stand is half as large with its eyes at 0.9875; a mannequin takes the size of its pose,
+/// asleep a fixed 0.2. The others are multiplied by `scale` (the attribute).
+pub(crate) fn living_dims(e: &Nbt, stand: bool, scale: f32) -> (f32, f32, f32) {
+    let (w, h, eye) = if stand {
+        if marker(e) {
+            return (0.0, 0.0, 0.0);
+        } else if small(e) {
+            (0.5 * 0.5, 1.975 * 0.5, 0.9875)
+        } else {
+            (0.5, 1.975, 1.7775)
+        }
     } else {
-        (f64::from(0.5f32), f64::from(1.975f32))
+        match e.get("pose").and_then(Nbt::as_str) {
+            Some("sleeping") => return (0.2, 0.2, 0.2),
+            Some("crouching") => (0.6, 1.5, 1.27),
+            Some("swimming" | "fall_flying") => (0.6, 0.6, 0.4),
+            _ => (0.6, 1.8, 1.62),
+        }
+    };
+    if scale == 1.0 { (w, h, eye) } else { (w * scale, h * scale, eye * scale) }
+}
+
+impl Server {
+    /// The `scale` attribute of a living decoration: 1 without a saved entry of its own nor worn
+    /// equipment (the usual case, read without building anything).
+    pub(crate) fn living_scale(&self, e: &Nbt, ty: &str) -> f32 {
+        let saved = nbtio::list(e.get("attributes")).iter().any(|a| a.get("id").and_then(Nbt::as_str) == Some("minecraft:scale"));
+        let worn = matches!(e.get("equipment"), Some(Nbt::Compound(f)) if !f.is_empty());
+        if !saved && !worn {
+            return 1.0;
+        }
+        self.nbt_attribute(e, ty, "minecraft:scale").map_or(1.0, |v| v as f32)
+    }
+
+    /// [`living_dims`] of a living decoration with its own scale, widened: (width, height, eyes).
+    pub(crate) fn living_size(&self, e: &Nbt, stand: bool) -> (f64, f64, f64) {
+        let ty = if stand { "minecraft:armor_stand" } else { "minecraft:mannequin" };
+        let (w, h, eye) = living_dims(e, stand, self.living_scale(e, ty));
+        (f64::from(w), f64::from(h), f64::from(eye))
     }
 }
 
@@ -428,7 +461,7 @@ impl Server {
     /// Oak plank fragments.
     fn stand_particles(&self, e: &Nbt) {
         let pos = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
-        let (w, h) = size(e);
+        let (w, h, _) = self.living_size(e, true);
         let Some(state) = self.states.state_of(&self.data, &Nbt::String("minecraft:oak_planks".into())) else { return };
         let at = [pos[0], pos[1] + h * 0.666_666_666_666_666_6, pos[2]];
         let d = [(w / 4.0) as f32, (h / 4.0) as f32, (w / 4.0) as f32];
@@ -439,32 +472,43 @@ impl Server {
 impl Server {
     /// Tick of an armor stand or a mannequin (no input): falling
     /// in the air, landing (fall sound), network tracking. Without physics (marker, no
-    /// gravity, immobile mannequin): nothing moves.
+    /// gravity, immobile mannequin): nothing moves, but the tracking still runs (the game tracks
+    /// every entity each tick: a push is sent by it, compared with the last velocity sent).
     pub(super) fn living_tick(&mut self, i: usize, pos: [f64; 3]) {
         let id = self.deco.live[i].id;
         let stand = self.deco.live[i].kind == DKind::Stand;
+        let interval = if stand { 3 } else { 2 };
         // Fields read without cloning the compound (equipment included): called every tick.
         let Some(e) = self.live_nbt(i) else { return };
-        if flag(e, "NoGravity") || if stand { marker(e) } else { flag(e, "immovable") } {
-            return;
-        }
-        let (w, h) = if stand { size(e) } else { (f64::from(0.6f32), f64::from(1.8f32)) };
         let motion = nbtio::motion(e.get("Motion"));
         let on_ground = flag(e, "OnGround");
+        let rot = nbtio::f32s::<2>(e.get("Rotation")).unwrap_or_default();
+        // Tracking alone, the entity left where it is.
+        let still = |s: &mut Server| {
+            let mut t = std::mem::take(&mut s.deco.live[i].track);
+            s.track_turned(&mut t, id, pos, motion.unwrap_or_default(), on_ground, interval, rot);
+            s.deco.live[i].track = t;
+        };
+        if flag(e, "NoGravity") || if stand { marker(e) } else { flag(e, "immovable") } {
+            still(self);
+            return;
+        }
+        let (w, h, _) = self.living_size(e, stand);
         let mut fall = match e.get("fall_distance") {
             Some(Nbt::Double(d)) => *d,
             _ => 0.0,
         };
         let silent = flag(e, "Silent");
-        let rot = nbtio::f32s::<2>(e.get("Rotation")).unwrap_or_default();
         let b = Aabb { min: [pos[0] - w / 2.0, pos[1], pos[2] - w / 2.0], max: [pos[0] + w / 2.0, pos[1] + h, pos[2] + w / 2.0] };
-        // In a fluid: fluid displacement not simulated for them, the entity stays in place.
+        // In a fluid: fluid displacement not simulated for them, the entity stays in place (its
+        // tracking still runs).
         let lo = b.min.map(|v| v.floor() as i32);
         let hi = b.max.map(|v| v.floor() as i32);
         for y in lo[1]..=hi[1] {
             for z in lo[2]..=hi[2] {
                 for x in lo[0]..=hi[0] {
                     if !self.fluid_at([x, y, z]).is_empty() {
+                        still(self);
                         return;
                     }
                 }
@@ -533,7 +577,6 @@ impl Server {
             });
         }
         let mut t = std::mem::take(&mut self.deco.live[i].track);
-        let interval = if stand { 3 } else { 2 };
         self.track_turned(&mut t, id, np, vel, landed, interval, rot);
         self.deco.live[i].track = t;
     }
@@ -550,7 +593,7 @@ impl Server {
             return;
         }
         let Some(pos) = nbtio::f64s::<3>(e.get("Pos")) else { return };
-        let (w, h) = if stand { size(e) } else { (f64::from(0.6f32), f64::from(1.8f32)) };
+        let (w, h, _) = self.living_size(e, stand);
         let on_ground = flag(e, "OnGround");
         let mut vel = nbtio::motion(e.get("Motion")).unwrap_or_default();
         let b = Aabb { min: [pos[0] - w / 2.0, pos[1], pos[2] - w / 2.0], max: [pos[0] + w / 2.0, pos[1] + h, pos[2] + w / 2.0] };

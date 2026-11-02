@@ -92,6 +92,8 @@ impl Server {
             .map(|(_, n)| n)
             .or_else(|| self.end_other(id)) // F15
             .or_else(|| self.cart_ref(id).map(|c| &c.nbt)) // G5-F06: fields kept (name, tags)
+            // L10-COMBAT: the entity exploding right now, out of its list.
+            .or_else(|| self.proj.blast_ent.as_ref().filter(|(i, _)| *i == id).map(|(_, n)| n))
     }
 
     fn other_mut(&mut self, id: i32) -> Option<&mut Nbt> {
@@ -182,6 +184,15 @@ impl Server {
                 [w, h, eye]
             }),
             _ => {
+                // Armor stand, mannequin: marker, small stand, pose and scale (L10-COMBAT).
+                if let E::Other(i) = e
+                    && let Some(n) = self.other(i)
+                    && let Some(k @ (crate::decoration::DKind::Stand | crate::decoration::DKind::Mannequin)) =
+                        crate::decoration::kind_of(n)
+                {
+                    let (w, h, eye) = self.living_size(n, k == crate::decoration::DKind::Stand);
+                    return [w as f32, h as f32, eye as f32];
+                }
                 let ty = self.ent_type(e);
                 let idx =
                     self.data.registry("minecraft:entity_type").and_then(|r| r.entries.iter().position(|x| *x == ty));

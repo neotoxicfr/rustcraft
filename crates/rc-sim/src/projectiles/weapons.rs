@@ -68,8 +68,7 @@ pub(crate) fn rotate_axis(v: [f32; 3], angle: f32, axis: [f32; 3]) -> [f32; 3] {
 impl Proj {
     /// Normalised direction, triangular inaccuracy, power; rotation.
     pub fn shoot(&mut self, d: [f64; 3], pow: f32, unc: f32) {
-        let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-        let mut v = d.map(|c| if l < 1.0e-5 { 0.0 } else { c / l });
+        let mut v = crate::mobs::mth::normalize(d);
         for c in &mut v {
             *c += self.rng.triangle(0.0, 0.017_227_5 * f64::from(unc));
         }

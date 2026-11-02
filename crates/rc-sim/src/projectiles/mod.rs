@@ -356,6 +356,11 @@ pub struct Projs {
     /// During the damage dealt by a player's projectile: that projectile, the direct entity
     /// `player_hurt_entity` describes (copied only while one of its criteria is open).
     pub direct_hit: Option<Box<Proj>>,
+    /// L10-COMBAT: entity about to explode that is not a projectile (crystal, primed TNT, TNT
+    /// minecart), with its compound: taken by the explosion as the direct entity of its damage.
+    pub blast_next: Option<(i32, rc_proto::nbt::Nbt)>,
+    /// That entity during its explosion (out of its list: found by identifier through it).
+    pub blast_ent: Option<(i32, rc_proto::nbt::Nbt)>,
 }
 
 /// An Ender pearl of `owner` flies among these projectiles.

@@ -726,8 +726,7 @@ impl Mount {
     fn dash(&mut self, a: f32, w: &dyn World, t: &Tables) {
         let momentum = f64::from(self.jump_power(1.0, w, t));
         let look = view_vector(self.yaw, self.pitch);
-        let h = (look[0] * look[0] + look[2] * look[2]).sqrt();
-        let dir = if h < 1.0e-5 { [0.0; 3] } else { [look[0] / h, 0.0, look[2] / h] };
+        let dir = crate::flow::normalize([look[0], 0.0, look[2]]);
         let k = f64::from(22.2222f32 * a) * self.attrs.movement_speed * f64::from(self.speed_factor(w, t));
         self.vel[0] += dir[0] * k;
         self.vel[1] += f64::from(1.4285f32 * a) * momentum;

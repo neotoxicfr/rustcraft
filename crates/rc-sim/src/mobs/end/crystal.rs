@@ -187,6 +187,7 @@ impl Server {
             let ety = if by.is_some() { "minecraft:player_explosion" } else { "minecraft:explosion" };
             self.game_event_src("minecraft:explode", pos, Some(crate::mobs::recent::vibration::Src::Other), None);
             self.prog.expl_cause_next = Some("minecraft:end_crystal"); // W8c
+            self.blast_direct_next(by, id, |s| s.mobs.end.crystals[i].save()); // L10-COMBAT
             self.explode_with(None, by, None, pos, 6.0, false, ety, super::super::explode::Blast::Block);
             self.prog.expl_cause_next = None;
         }

@@ -265,13 +265,11 @@ impl Server {
         let (f, g) = (self.pitch * DEG, -self.yaw * DEG);
         let (h, i, j, k) = (cos(g), sin(g), cos(f), sin(f));
         let look = [f64::from(i * j), f64::from(-k), f64::from(h * j)];
-        let ll = (look[0] * look[0] + look[1] * look[1] + look[2] * look[2]).sqrt();
-        let look = if ll < 1.0e-5 { [0.0; 3] } else { look.map(|v| v / ll) };
+        let look = crate::mobs::mth::normalize(look);
         let eye = self.player_eye_y();
         for &gh in heights {
             let dir = [m.pos[0] - self.pos[0], gh - eye, m.pos[2] - self.pos[2]];
-            let l = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
-            let n = if l < 1.0e-5 { [0.0; 3] } else { dir.map(|v| v / l) };
+            let n = crate::mobs::mth::normalize(dir);
             let dot = look[0] * n[0] + look[1] * n[1] + look[2] * n[2];
             if dot > 1.0 - cone {
                 let from = [self.pos[0], eye, self.pos[2]];

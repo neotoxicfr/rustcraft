@@ -316,9 +316,11 @@ impl Server {
                     return;
                 }
                 if !closer_center(w, m.pos, 10.0) {
-                    let d = [f64::from(w[0]) - m.pos[0], f64::from(w[1]) - m.pos[1], f64::from(w[2]) - m.pos[2]];
-                    let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-                    let n = if l < 1.0e-4 { [0.0; 3] } else { [d[0] / l, d[1] / l, d[2] / l] };
+                    let n = crate::mobs::mth::normalize([
+                        f64::from(w[0]) - m.pos[0],
+                        f64::from(w[1]) - m.pos[1],
+                        f64::from(w[2]) - m.pos[2],
+                    ]);
                     let t = [n[0] * 10.0 + m.pos[0], n[1] * 10.0 + m.pos[1], n[2] * 10.0 + m.pos[2]];
                     self.move_to_pos(m, t, 0.35);
                 } else {

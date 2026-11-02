@@ -6,7 +6,7 @@
 //! keeps the shot and the return by the player.
 
 use super::mob::Ent;
-use super::mth::dist2;
+use super::mth::{dist2, normalize};
 use crate::player::Stack;
 use crate::projectiles::{PKind, Proj};
 use crate::server::Server;
@@ -17,11 +17,6 @@ pub struct FireballsWorld {
     /// True during the damage of a large fireball (direct hit or explosion): the direct
     /// source of the damage is then a large fireball.
     pub direct_large: bool,
-}
-
-fn normalize(v: [f64; 3]) -> [f64; 3] {
-    let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-    if l < 1.0e-5 { [0.0; 3] } else { v.map(|c| c / l) }
 }
 
 impl Server {
@@ -130,9 +125,7 @@ impl Server {
             }
             let bb = p.bbox();
             let eye = if p.kind == PKind::LargeFireball { f64::from(0.85f32) } else { 0.0 };
-            let mut dir = [p.pos[0] - center[0], p.pos[1] + eye - center[1], p.pos[2] - center[2]];
-            let l = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
-            dir = if l < 1.0e-4 { [0.0; 3] } else { dir.map(|v| v / l) };
+            let dir = normalize([p.pos[0] - center[0], p.pos[1] + eye - center[1], p.pos[2] - center[2]]);
             let exposure = if kb_mult == 0.0 { 0.0 } else { f64::from(self.seen_percent(center, &bb)) };
             let kp = (1.0 - dist) * exposure * kb_mult;
             let p = &mut self.proj.list[i];

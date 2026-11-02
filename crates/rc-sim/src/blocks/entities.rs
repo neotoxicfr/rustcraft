@@ -964,6 +964,7 @@ impl Server {
                 // `explode` event emitted by the primed TNT (non-living entity), then
                 // the common explosion: damage, knockback, loot, packet (particles and sound).
                 self.game_event_src("minecraft:explode", c, Some(crate::mobs::recent::vibration::Src::Other), None);
+                self.blast_direct_next(e.owner, e.id, |s| s.sim_entity_nbt(e)); // L10-COMBAT
                 // In water: state at the end of the previous tick, like the game.
                 self.tnt_explode(e.id, c, e.power, e.owner, wet, e.used_portal);
             }
@@ -982,50 +983,55 @@ impl Server {
     /// saves (common part, then fuse, block and power of the TNT, or state, duration and flags of
     /// the falling block). Never saved before: lost on reload.
     pub(crate) fn sim_entities_into_chunks(&self, by_chunk: &mut std::collections::BTreeMap<(i32, i32), Vec<Nbt>>) {
-        let dbl = |v: [f64; 3]| Nbt::List(v.iter().map(|&x| Nbt::Double(x)).collect());
-        let flag = |b: bool| Nbt::Byte(i8::from(b));
         for e in self.bs.entities.list.iter().filter(|e| !e.removed) {
             let c = ((e.pos[0].floor() as i32) >> 4, (e.pos[2].floor() as i32) >> 4);
-            let id = if matches!(e.kind, EntKind::Tnt(_)) { "minecraft:tnt" } else { "minecraft:falling_block" };
-            let cooldown = self.portal_cooldown(e.id);
-            let mut f: Vec<(String, Nbt)> = vec![
-                ("id".into(), Nbt::String(id.into())),
-                ("Pos".into(), dbl(e.pos)),
-                ("Motion".into(), dbl(e.vel)),
-                ("Rotation".into(), Nbt::List(vec![Nbt::Float(0.0), Nbt::Float(0.0)])),
-                ("fall_distance".into(), Nbt::Double(e.fall)),
-                ("Fire".into(), Nbt::Short(0)),
-                ("Air".into(), Nbt::Short(300)),
-                ("OnGround".into(), flag(e.on_ground)),
-                ("Invulnerable".into(), flag(false)),
-                ("PortalCooldown".into(), Nbt::Int(cooldown)),
-                ("UUID".into(), Nbt::IntArray(vec![0x5332_0001, 0, 0, e.id])),
-            ];
-            match e.kind {
-                EntKind::Tnt(fuse) => {
-                    f.push(("fuse".into(), Nbt::Short(fuse as i16)));
-                    let block = e.block.unwrap_or_else(|| self.default_state("minecraft:tnt"));
-                    f.push(("block_state".into(), self.state_nbt(block)));
-                    if e.power != 4.0 {
-                        f.push(("explosion_power".into(), Nbt::Float(e.power)));
-                    }
-                    if let Some(u) = e.owner.and_then(|o| self.ent_uuid_of(o)) {
-                        f.push(("owner".into(), crate::nbtio::uuid_nbt(u)));
-                    }
+            by_chunk.entry(c).or_default().push(self.sim_entity_nbt(e));
+        }
+    }
+
+    /// Saved compound of a primed TNT or a falling block.
+    pub(crate) fn sim_entity_nbt(&self, e: &SimEntity) -> Nbt {
+        let dbl = |v: [f64; 3]| Nbt::List(v.iter().map(|&x| Nbt::Double(x)).collect());
+        let flag = |b: bool| Nbt::Byte(i8::from(b));
+        let id = if matches!(e.kind, EntKind::Tnt(_)) { "minecraft:tnt" } else { "minecraft:falling_block" };
+        let cooldown = self.portal_cooldown(e.id);
+        let mut f: Vec<(String, Nbt)> = vec![
+            ("id".into(), Nbt::String(id.into())),
+            ("Pos".into(), dbl(e.pos)),
+            ("Motion".into(), dbl(e.vel)),
+            ("Rotation".into(), Nbt::List(vec![Nbt::Float(0.0), Nbt::Float(0.0)])),
+            ("fall_distance".into(), Nbt::Double(e.fall)),
+            ("Fire".into(), Nbt::Short(0)),
+            ("Air".into(), Nbt::Short(300)),
+            ("OnGround".into(), flag(e.on_ground)),
+            ("Invulnerable".into(), flag(false)),
+            ("PortalCooldown".into(), Nbt::Int(cooldown)),
+            ("UUID".into(), Nbt::IntArray(vec![0x5332_0001, 0, 0, e.id])),
+        ];
+        match e.kind {
+            EntKind::Tnt(fuse) => {
+                f.push(("fuse".into(), Nbt::Short(fuse as i16)));
+                let block = e.block.unwrap_or_else(|| self.default_state("minecraft:tnt"));
+                f.push(("block_state".into(), self.state_nbt(block)));
+                if e.power != 4.0 {
+                    f.push(("explosion_power".into(), Nbt::Float(e.power)));
                 }
-                EntKind::Falling(s) => {
-                    let (per, max) = e.hurt.unwrap_or((0.0, 40));
-                    f.push(("BlockState".into(), self.state_nbt(s)));
-                    f.push(("Time".into(), Nbt::Int(e.time)));
-                    f.push(("DropItem".into(), flag(e.drop_item)));
-                    f.push(("HurtEntities".into(), flag(e.hurt.is_some())));
-                    f.push(("FallHurtAmount".into(), Nbt::Float(per)));
-                    f.push(("FallHurtMax".into(), Nbt::Int(max)));
-                    f.push(("CancelDrop".into(), flag(e.cancel_drop)));
+                if let Some(u) = e.owner.and_then(|o| self.ent_uuid_of(o)) {
+                    f.push(("owner".into(), crate::nbtio::uuid_nbt(u)));
                 }
             }
-            by_chunk.entry(c).or_default().push(Nbt::Compound(f));
+            EntKind::Falling(s) => {
+                let (per, max) = e.hurt.unwrap_or((0.0, 40));
+                f.push(("BlockState".into(), self.state_nbt(s)));
+                f.push(("Time".into(), Nbt::Int(e.time)));
+                f.push(("DropItem".into(), flag(e.drop_item)));
+                f.push(("HurtEntities".into(), flag(e.hurt.is_some())));
+                f.push(("FallHurtAmount".into(), Nbt::Float(per)));
+                f.push(("FallHurtMax".into(), Nbt::Int(max)));
+                f.push(("CancelDrop".into(), flag(e.cancel_drop)));
+            }
         }
+        Nbt::Compound(f)
     }
 
     /// TNT block blown up by an explosion: primed with a short fuse (10 to 29 ticks).

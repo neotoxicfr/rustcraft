@@ -878,8 +878,7 @@ impl Server {
             return;
         }
         let v = p.vel;
-        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-        let n = if l < 1.0e-4 { [0.0; 3] } else { v.map(|c| c / l) };
+        let n = crate::mobs::mth::normalize(v);
         // F14: inertia 1 (air and liquid) for the wind charge; F16: wither blue skull
         // less inert (0.73) out of water.
         let inertia = if p.kind.wind() {

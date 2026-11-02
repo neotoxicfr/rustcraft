@@ -702,20 +702,7 @@ impl Server {
             if dist > 1.0 {
                 continue;
             }
-            let eye = match k {
-                DKind::Painting => f64::from(0.5f32 * 0.85),
-                DKind::Frame | DKind::GlowFrame => 0.0,
-                DKind::Cushion => f64::from(0.25f32 * 0.85),
-                DKind::Stand => {
-                    if flag(&e, "Small") {
-                        f64::from(0.9875f32)
-                    } else {
-                        f64::from(1.7775f32)
-                    }
-                }
-                DKind::Mannequin => f64::from(1.62f32),
-                DKind::Knot => f64::from(0.0625f32),
-            };
+            let eye = self.deco_eye(k, &e);
             let o = [pos[0] - center[0], pos[1] + eye - center[1], pos[2] - center[2]];
             let olen = (o[0] * o[0] + o[1] * o[1] + o[2] * o[2]).sqrt();
             let exposure = f64::from(self.seen_percent(center, &b));
@@ -811,14 +798,7 @@ impl Server {
                 continue;
             }
             let Some(b) = self.deco_box(e) else { continue };
-            let eye = match k {
-                DKind::Painting => f64::from(0.5f32 * 0.85),
-                DKind::Frame | DKind::GlowFrame => 0.0,
-                DKind::Cushion => f64::from(0.25f32 * 0.85),
-                DKind::Stand => f64::from(if flag(e, "Small") { 0.9875f32 } else { 1.7775f32 }),
-                DKind::Mannequin => f64::from(1.62f32),
-                DKind::Knot => f64::from(0.0625f32),
-            };
+            let eye = self.deco_eye(k, e);
             let dir = crate::mobs::mth::normalize([pos[0] - center[0], pos[1] + eye - center[1], pos[2] - center[2]]);
             let living = matches!(k, DKind::Stand | DKind::Mannequin);
             let res =
@@ -857,25 +837,23 @@ impl Server {
     }
 
     /// Push of a living decoration: the velocity is added to its saved motion and goes to the
-    /// client with its next tracking; one that never moves by itself (no gravity, marker,
-    /// immovable mannequin, whose tick stops before the tracking) sends it at once.
+    /// client with its next tracking, which runs every tick (even without physics) and sends it
+    /// only if it differs from the last one sent (beyond 1e-7 squared), like the game.
     pub(crate) fn deco_push(&mut self, id: i32, v: [f64; 3]) {
         if !v.iter().all(|x| x.is_finite()) {
             return;
         }
         // One registry search; the compound read and rewritten in place (its chunk known).
         let Some(i) = self.deco.live.iter().position(|l| l.id == id && !l.removed) else { return };
-        let stand = self.deco.live[i].kind == DKind::Stand;
         let Some(e) = self.live_nbt(i) else { return };
         let m = nbtio::motion(e.get("Motion")).unwrap_or_default();
+        let (pos, ground) = (nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default(), flag(e, "OnGround"));
         let nv = [m[0] + v[0], m[1] + v[1], m[2] + v[2]];
-        let still = flag(e, "NoGravity") || flag(e, if stand { "Marker" } else { "immovable" });
         self.deco_edit(id, |n| nbtio::set(n, "Motion", dbl(nv)));
-        if still {
-            let _ = self.send(Event::Entity(EntityEvent::Motion { id, velocity: crate::mobs::track::lp_quantize(nv) }));
-        } else {
-            self.deco.live[i].track.needs_sync = true;
-        }
+        // Not tracked yet (pushed before its first tick): the client knows the state before.
+        let t = &mut self.deco.live[i].track;
+        t.begin(pos, m, ground);
+        t.needs_sync = true;
     }
 
     /// Value of an attribute of a living decoration (`None`: not one, or an attribute its type
@@ -1045,6 +1023,18 @@ impl Server {
         d2 < range * range
     }
 
+    /// Eye height of a decoration of kind `k` (what an explosion pushes from): 0.85 of the height of
+    /// what is hung or laid, the living sizes of the stands and mannequins.
+    fn deco_eye(&self, k: DKind, e: &Nbt) -> f64 {
+        match k {
+            DKind::Painting => f64::from(0.5f32 * 0.85),
+            DKind::Frame | DKind::GlowFrame => 0.0,
+            DKind::Cushion => f64::from(0.25f32 * 0.85),
+            DKind::Stand | DKind::Mannequin => self.living_size(e, k == DKind::Stand).2,
+            DKind::Knot => f64::from(0.0625f32),
+        }
+    }
+
     /// Box of a decoration (selectors, range, overlaps).
     pub(crate) fn deco_box(&self, e: &Nbt) -> Option<Aabb> {
         let k = kind_of(e)?;
@@ -1060,13 +1050,12 @@ impl Server {
                 let (pos, d) = self.hang_place(k, e);
                 frame_box(pos, d, hanging::has_map(e))
             }
-            DKind::Stand => {
-                let (w, h) = stand::size(e);
+            // Size of the marker, small stand, mannequin pose, scale.
+            DKind::Stand | DKind::Mannequin => {
+                let (w, h, _) = self.living_size(e, k == DKind::Stand);
                 around(w, h)
             }
             DKind::Cushion => around(1.0, 0.25),
-            // The player's size, in single precision like the game.
-            DKind::Mannequin => around(f64::from(0.6f32), f64::from(1.8f32)),
             DKind::Knot => around(0.375, 0.5),
         })
     }

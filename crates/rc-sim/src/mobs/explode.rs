@@ -119,7 +119,8 @@ impl Server {
         self.explode_with(source, by, exclude, center, radius, fire, ty, Blast::Mob);
     }
 
-    /// Explosion of a primed TNT (`tnt`: its identifier, outside the blast), author of the priming if any.
+    /// Explosion of a primed TNT (`tnt`: its identifier, outside the blast), author of the priming if any
+    /// (then of the "player" type, like any explosion with an author and a direct entity).
     /// `used_portal`: TNT that went through a portal (the game's own calculator: the Nether portal
     /// does not resist and does not break). `wet`: TNT in water (direct source of the decorations).
     pub(crate) fn tnt_explode(
@@ -134,7 +135,8 @@ impl Server {
         self.deco.blast_wet = wet;
         #[cfg(test)]
         TNT_BLASTS.with_borrow_mut(|v| v.push((self.dim.name.clone(), used_portal)));
-        self.explode_with(None, by, Some(tnt), center, radius, false, "minecraft:explosion", Blast::Tnt(used_portal));
+        let ty = if by.is_some() { "minecraft:player_explosion" } else { "minecraft:explosion" };
+        self.explode_with(None, by, Some(tnt), center, radius, false, ty, Blast::Tnt(used_portal));
     }
 
     /// Explosion according to its interaction with blocks (F15: crystal "block", dragon respawn
@@ -153,6 +155,12 @@ impl Server {
     ) {
         // G5-F06: projectile direct source (taken before any chain explosion).
         let direct = self.carts.blast_direct.take();
+        // L10-COMBAT: the projectile being resolved is the direct entity of its own explosion
+        // only (fireball, skull); another exploding entity (crystal set off by an arrow, TNT,
+        // minecart) is the direct entity of the damage it deals and hides it. Restored after.
+        let outer_hit = if direct.is_none() { self.proj.direct_hit.take() } else { None };
+        let me = self.proj.blast_next.take();
+        let outer_ent = std::mem::replace(&mut self.proj.blast_ent, me);
         // Direct source in water: the exploding mob, otherwise the value
         // set by the caller (TNT, projectile), consumed here.
         let direct_wet = source.map_or(self.deco.blast_wet, |m| m.in_water);
@@ -337,6 +345,10 @@ impl Server {
         self.end_explosion_hits(center, radius, by, ty, exclude);
         if source.is_some() {
             self.ghost_pop();
+        }
+        self.proj.blast_ent = outer_ent;
+        if direct.is_none() {
+            self.proj.direct_hit = outer_hit;
         }
         // 3. Blocks destroyed (shuffled, loot grouped by 16).
         if griefing {

@@ -541,8 +541,7 @@ impl Server {
         let loyalty = f64::from(p.loyalty);
         p.pos[1] += v[1] * 0.015 * loyalty;
         let accel = 0.05 * loyalty;
-        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-        let n = if l < 1.0e-4 { [0.0; 3] } else { v.map(|c| c / l) };
+        let n = crate::mobs::mth::normalize(v);
         p.vel = std::array::from_fn(|i| p.vel[i] * 0.95 + n[i] * accel);
         if p.return_ticks == 0 {
             self.world_sound("minecraft:item.trident.return", 6, p.pos, 10.0, 1.0);
