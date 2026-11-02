@@ -26,6 +26,8 @@ pub struct State {
     pub waypoints: BTreeMap<i32, (Option<i32>, Option<String>)>,
     /// Player camera (`spectate`): followed entity.
     pub camera: Option<E>,
+    /// G3-F08: profile lookups of `fetchprofile` (services, cache, answers awaited).
+    pub profiles: super::cmds_s9e::Profiles,
 }
 
 /// Monotonic clock in milliseconds.
@@ -57,7 +59,7 @@ impl Server {
             "item" => self.cmd_item_s9(s, p, seg),
             "attribute" => self.cmd_attribute_s9(s, p, seg),
             "place" => self.cmd_place(s, p, seg),
-            _ => return None,
+            _ => return self.dispatch_s9e(s, p, seg), // G3-F08: compute, posteffect, fetchprofile
         })
     }
 
@@ -493,25 +495,29 @@ impl Server {
             }
             x = self.vehicle_of(v);
         }
+        // Refused mount (marker, entity that carries nobody…): rider and vehicle named.
+        let generic = |sv: &Server| {
+            Fail(tr!("commands.ride.mount.failure.generic", sv.ent_display(target), sv.ent_display(vehicle)))
+        };
         // G5-F06: minecart, forced mount.
         if let E::Other(cid) = vehicle
             && self.cart_ref(cid).is_some()
         {
             if !self.cart_ride_forced(cid, target) {
-                return Err(Fail(tr!("commands.ride.mount.failure.generic")));
+                return Err(generic(self));
             }
             self.ok(s, tr!("commands.ride.mount.success", self.ent_display(target), self.ent_display(vehicle)));
             return Ok(1);
         }
         // Forced mount: mobs and minecarts serve as vehicles here.
         let E::Mob(vid) = vehicle else {
-            return Err(Fail(tr!("commands.ride.mount.failure.generic")));
+            return Err(generic(self));
         };
         let Some(vi) = self.mob_index(vid) else {
-            return Err(Fail(tr!("commands.ride.mount.failure.generic")));
+            return Err(generic(self));
         };
         let Some(mut veh) = self.mobs.list[vi].take() else {
-            return Err(Fail(tr!("commands.ride.mount.failure.generic")));
+            return Err(generic(self));
         };
         let ok = match target {
             E::Player => {
@@ -541,7 +547,7 @@ impl Server {
         }
         self.mobs.list[vi] = Some(veh);
         if !ok {
-            return Err(Fail(tr!("commands.ride.mount.failure.generic")));
+            return Err(generic(self));
         }
         self.ok(s, tr!("commands.ride.mount.success", self.ent_display(target), self.ent_display(vehicle)));
         Ok(1)
@@ -563,6 +569,12 @@ impl Server {
         }
         if self.game_mode != 3 {
             return Err(Fail(tr!("commands.spectate.not_spectator", self.ent_display(player))));
+        }
+        // A type the clients never track (tracking range 0: the marker) cannot be watched.
+        if let Some(t @ E::Other(_)) = target
+            && !crate::decoration::client_visible(&self.ent_nbt(t))
+        {
+            return Err(Fail(tr!("commands.spectate.cannot_spectate", self.ent_display(t))));
         }
         match target {
             Some(t) => {
@@ -959,6 +971,10 @@ impl Server {
                 Ok(enabled.len() as i32)
             }
             _ => {
+                // The description is a text component, read and resolved before the name is
+                // checked (argument of the command).
+                let desc = p.arg(seg, "description").unwrap_or_default();
+                let desc = self.arg_component(s, &desc, None)?;
                 let id = p.arg(seg, "id").unwrap_or_default();
                 let id = id.trim_matches('"').to_owned();
                 let valid = !id.is_empty()
@@ -968,16 +984,15 @@ impl Server {
                 if !valid {
                     return Err(Fail(tr!("commands.datapack.create.invalid_name", id)));
                 }
+                if !path_part_portable(&id) {
+                    return Err(Fail(tr!("commands.datapack.create.invalid_full_name", id)));
+                }
                 let full = format!("file/{id}");
                 if repo.iter().any(|r| r.id == full) || self.world.join("datapacks").join(&id).exists() {
                     return Err(Fail(tr!("commands.datapack.create.already_exists", id)));
                 }
-                let desc = p.arg(seg, "description").unwrap_or_default();
                 let dir = self.world.join("datapacks").join(&id);
-                let desc_json = match super::snbt::parse(&desc) {
-                    Ok(Nbt::String(t)) => serde_json::Value::String(t),
-                    _ => serde_json::Value::String(desc.trim_matches('"').to_owned()),
-                };
+                let desc_json = super::cmds_s9b::nbt_to_json(&text::to_nbt(&desc));
                 let meta = serde_json::json!({
                     "pack": { "description": desc_json, "min_format": crate::progress::DATA_PACK_FORMAT, "max_format": crate::progress::DATA_PACK_FORMAT }
                 });
@@ -1038,6 +1053,17 @@ impl Server {
 /// Team color.
 fn team_color_rgb(name: &str) -> i32 {
     rc_text::parse_color(name).map_or(0xFF_FFFF, |c| c as i32)
+}
+
+/// Folder name usable on every system: neither ending with a dot nor a reserved Windows device
+/// name (`con`, `nul`, `com1`, `lpt9`, `clock$`…, alone or before an extension), any case.
+fn path_part_portable(name: &str) -> bool {
+    if name.ends_with('.') {
+        return false;
+    }
+    let stem = name.split_once('.').map_or(name, |(s, _)| s).to_ascii_uppercase();
+    let numbered = |p: &str| stem.strip_prefix(p).is_some_and(|d| d.len() == 1 && matches!(d.as_bytes()[0], b'1'..=b'9'));
+    !(matches!(stem.as_str(), "COM" | "CLOCK$" | "CON" | "PRN" | "AUX" | "NUL") || numbered("COM") || numbered("LPT"))
 }
 
 /// Quotes if necessary.

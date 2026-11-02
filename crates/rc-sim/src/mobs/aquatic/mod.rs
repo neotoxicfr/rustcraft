@@ -38,7 +38,7 @@ const fn monster(name: &'static str, width: f32, height: f32, eye: f32) -> Info 
 /// Drowned: zombie attributes, step height 1, burns in sunlight.
 static DROWNED: Info = {
     let mut i = monster("minecraft:drowned", 0.6, 1.95, 1.74);
-    i.speed = 0.23;
+    i.speed = 0.23f32 as f64; // zombie attributes: single-precision literal widened
     i.attack = 3.0;
     i.follow = 35.0;
     i.armor = 2.0;

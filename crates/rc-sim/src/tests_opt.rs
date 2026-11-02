@@ -45,7 +45,10 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// turning each G6-F08 fix on alone: every other one keeps 24fde67e…): 11bc6372…, 823.
 /// G5-F04: the player file carries `spawn_extra_particles_on_fall` like the game's (only change:
 /// without this key, 24fde67e… again): 33144ada…, 823. Lot 7 integration: both together.
-const EXPECTED_NEW: (&str, usize) = ("5092e230b3b74c857f97cb75d13cf8ea298fcaa4bdae002f673fa1fc15c69430", 823);
+/// G3-F08: the player file always carries `post_effects` like the game's (alone: b993b7aa…, 823),
+/// and zombies, husks, zombie villagers, drowned, spiders, cave spiders and endermen move at
+/// their single-precision speed widened like the game's; without both: 5092e230… again.
+const EXPECTED_NEW: (&str, usize) = ("521f08db7744fcb239fff91a8324e19b689efc1eaa316dafa106292e72dcea0f", 823);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 const EXPECTED_MODEL: &[(&str, &str, usize)] = &[(
     "790b2d94653a4243e68f2e0cb0ebc3f865f9f59815ed65149067cdd374c6b800",
@@ -188,7 +191,9 @@ fn run_new() -> Option<Vec<(String, String)>> {
 /// Expected fingerprint of the "mechanisms" site: (total, number of files). Lot 6 integration:
 /// G5-F02b (alone cd8c1083…, 378) and G5-F02c (alone b80e1b0b…, 380) together.
 /// G5-F04: player file key `spawn_extra_particles_on_fall` (without it: 7f0e2e80… again).
-const EXPECTED_MECH: (&str, usize) = ("9d3c0ffd62f68eb13abd0c0b22377c9c6689f5f43112f9e27206e65de366e534", 378);
+/// G3-F08: player file key `post_effects` (alone: 27355455…, 378) and the widened speeds of
+/// the zombie and spider families and of the enderman (without both: 9d3c0ffd… again).
+const EXPECTED_MECH: (&str, usize) = ("8740d4442a6713967bd2ab78e52dcfc52137471e25a97d742565d1ed44149df2", 378);
 
 /// Server command (refusal = failure: the rig would be incomplete).
 pub(crate) fn cmd(s: &mut Server, c: &str) {
@@ -329,7 +334,9 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 }
 
 /// Expected fingerprint of all the regions after closing: (total, number of chunks).
-const EXPECTED_REGIONS: (&str, usize) = ("63579824deb6d5f45105e81be2104b8d10964c857279ceb2bf661ba833f0c858", 1254);
+/// G3-F08: zombie, spider and enderman families at their widened single-precision speed, the
+/// only cause of the change (without it: 63579824… again).
+const EXPECTED_REGIONS: (&str, usize) = ("9c4062454b5998f1a0b4392066a5e3e56966ee691cee3525aabf9c4e99b7f60f", 1254);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all
 /// dimensions): SHA-256 of the decompressed NBT per chunk. Sector locations and

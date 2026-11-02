@@ -20,6 +20,7 @@ pub mod cmds_s9a;
 pub mod cmds_s9b;
 pub mod cmds_s9c;
 pub mod cmds_s9d;
+pub mod cmds_s9e;
 pub mod cmds_scores;
 pub mod cmds_world;
 pub mod ents;
@@ -710,6 +711,7 @@ impl Server {
         if let Some((tx, text)) = self.cmd.pending_suggest.take() {
             self.answer_suggestions(tx, &text);
         }
+        self.fetchprofile_poll(); // G3-F08: profile lookups answered on the server thread
         self.flush_scores();
     }
 

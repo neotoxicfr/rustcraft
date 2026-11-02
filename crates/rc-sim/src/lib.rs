@@ -169,6 +169,8 @@ mod tests_g3f03;
 mod tests_g6f11;
 #[cfg(test)]
 mod tests_g3f11;
+#[cfg(test)]
+mod tests_g3f08; // G3-F08: compute, posteffect, fetchprofile, attribute reset, loot targets
 
 use std::path::{Path, PathBuf};
 

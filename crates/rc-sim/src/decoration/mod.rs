@@ -8,7 +8,7 @@
 
 mod cushion;
 mod hanging;
-mod stand;
+pub(crate) mod stand;
 #[cfg(test)]
 mod tests;
 

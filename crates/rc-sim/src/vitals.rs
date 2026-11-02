@@ -1566,6 +1566,7 @@ impl Server {
         // W8a: new player, equipment to rediscover; the client restarts from fresh attributes.
         self.life.attrs = crate::attrs::EquipAttrs::default();
         self.life.combat = crate::vitals::Combat::default();
+        self.post_effects_reset(); // G3-F08: the new player has no screen effect (not carried over)
         let height = rc_proto_v777::config::DimensionHeight {
             min_y: self.dim.height.min_y,
             height: self.dim.height.sections as i32 * 16,

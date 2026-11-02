@@ -896,10 +896,8 @@ impl Server {
         Ok(self.holder_slots(&h, &range).iter().map(|(_, v)| v.len() as i32).sum())
     }
 
-    /// `compute float|integer <provider>` of `data modify`: value of a numeric provider
-    /// (registry id or inline content) in the loot context of a command:
-    /// entity and position of the source; `block`: state and block entity of the position; `entity`:
-    /// the target. Random draw of the world.
+    /// `compute float|integer <provider>` of `data modify`: value of the provider read safely
+    /// (0 on an arithmetic error or a value that is not finite).
     pub(crate) fn compute_number(
         &mut self,
         s: &Src,
@@ -908,10 +906,31 @@ impl Server {
         ctx_kind: &str,
         float: bool,
     ) -> Result<Nbt, Fail> {
+        let (_, v) = self.compute_eval(s, p, seg, ctx_kind, float)?;
+        Ok(if float {
+            Nbt::Float(v.ok().map(|x| x as f32).filter(|x| x.is_finite()).unwrap_or(0.0))
+        } else {
+            Nbt::Int(v.map_or(0, |x| x as i32))
+        })
+    }
+
+    /// Value of a numeric provider (registry id or inline content) in the loot context of a
+    /// command: entity and position of the source; `block`: state and block entity of the
+    /// position; `entity`: the target. Random draw of the world. Gives the registry id when
+    /// the provider is named, and the unchecked value (an integer or a float, exact in a
+    /// double; `Err`: text of the arithmetic error), shared by `data modify` and `/compute`.
+    pub(crate) fn compute_eval(
+        &mut self,
+        s: &Src,
+        p: &Parsed,
+        seg: &Seg,
+        ctx_kind: &str,
+        float: bool,
+    ) -> Result<(Option<String>, crate::loot::Arith<f64>), Fail> {
         let reg = provider_registry(float);
         let text = p.arg(seg, "provider").unwrap_or_default();
         let t = text.trim();
-        let provider = if t.starts_with('{') || t.starts_with('[') {
+        let (name, provider) = if t.starts_with('{') || t.starts_with('[') {
             let n = snbt::parse(t).map_err(|_| Fail(tr!("argument.resource_or_id.failed_to_parse", t.to_owned())))?;
             let v = super::cmds_s9b::nbt_to_json(&n);
             // The game decodes the content as soon as the argument is read and refuses what it cannot read.
@@ -919,13 +938,13 @@ impl Server {
             if !provider_direct_ok(&v, float, &exists) {
                 return Err(Fail(tr!("argument.resource_or_id.failed_to_parse", t.to_owned())));
             }
-            v
+            (None, v)
         } else {
             let id = args::id(t);
             if self.life.pack.get(reg, &id).is_none() {
                 return Err(Fail(tr!("argument.resource_or_id.no_such_element", id, reg.to_owned())));
             }
-            serde_json::Value::String(id)
+            (Some(id.clone()), serde_json::Value::String(id))
         };
         let target = match ctx_kind {
             "entity" => Some(self.arg_entity(s, &p.arg(seg, "computeTarget").unwrap_or_default(), false)?),
@@ -968,13 +987,13 @@ impl Server {
                 ..Default::default()
             };
             if float {
-                Nbt::Float(loot.float(&provider, &ctx, &mut rng))
+                loot.float_checked(&provider, &ctx, &mut rng).map(f64::from)
             } else {
-                Nbt::Int(loot.int(&provider, &ctx, &mut rng))
+                loot.int_checked(&provider, &ctx, &mut rng).map(f64::from)
             }
         };
         self.life.rng = rng;
-        Ok(value)
+        Ok((name, value))
     }
 
     /// Commands `data`, `item`, `loot`.

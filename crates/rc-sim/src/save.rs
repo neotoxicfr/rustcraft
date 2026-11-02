@@ -239,6 +239,10 @@ impl Server {
         self.proj_player_nbt(&mut root); // S8: ender pearls
         crate::mobs::surface::parrot::save_shoulders(self, &mut root); // F02: parrots
         self.mount_player_nbt(&mut root); // F04: ridden vehicle
+        // G3-F08: screen effects, always written (empty list included), like the game.
+        if root.get("post_effects").is_none() {
+            set(&mut root, "post_effects", Nbt::List(Vec::new()));
+        }
         root
     }
 

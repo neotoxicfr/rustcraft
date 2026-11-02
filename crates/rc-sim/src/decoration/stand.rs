@@ -98,7 +98,7 @@ fn slot_item(e: &Nbt, i: usize) -> Option<Stack> {
 }
 
 /// Slot forbidden by `DisabledSlots`, or hand without arms.
-fn is_disabled(e: &Nbt, i: usize) -> bool {
+pub(crate) fn is_disabled(e: &Nbt, i: usize) -> bool {
     disabled_slots(e) & (1 << SLOTS[i].2) != 0 || (SLOTS[i].3 && !show_arms(e))
 }
 

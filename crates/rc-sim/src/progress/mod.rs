@@ -914,6 +914,7 @@ impl Server {
         self.trig_tick();
         self.trig_inventory_scan();
         self.adv_flush(true);
+        self.post_effects_tick(); // G3-F08: screen effects, after the advancements like the game
     }
 }
 
