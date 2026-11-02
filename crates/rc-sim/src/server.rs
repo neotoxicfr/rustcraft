@@ -865,7 +865,8 @@ impl Server {
             self.entities.insert(p, list);
         }
         self.poi_loaded(read.poi); // F05: points of interest
-        self.discover_furnaces(missing); // S2: simulated furnaces
+        // Furnaces and brewing stands: with the other tickers, in `import_chunk_ticks` above.
+        self.adopt_items(missing);
         self.adopt_mobs(missing); // S4: mobs
         self.adopt_projectiles(missing); // S8: arrows, tridents, clouds
         self.adopt_carts(missing); // G5-F06: minecarts

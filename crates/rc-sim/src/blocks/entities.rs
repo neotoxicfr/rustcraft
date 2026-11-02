@@ -11,6 +11,93 @@ use super::{Dir, Kind, P, above, below, flag, rel};
 use crate::mobs::recent::vibration::Src;
 use crate::server::Server;
 
+/// Ticker family of a block entity read with its chunk (from its id).
+#[derive(Clone, Copy)]
+enum LoadedBe {
+    /// Hopper or daylight detector, with its saved transfer cooldown.
+    Hopper(i32),
+    Hive,
+    Heart,
+    Ear,
+    Spawner,
+    Furnace(u8),
+    Brewing,
+    /// Campfire, jukebox, gateway, beacon, conduit, potent sulfur, bell: told apart by the block.
+    ByBlock,
+    Other,
+}
+
+impl LoadedBe {
+    fn of(id: &str, cooldown: i32) -> LoadedBe {
+        match id {
+            "minecraft:hopper" | "minecraft:daylight_detector" => LoadedBe::Hopper(cooldown),
+            "minecraft:beehive" => LoadedBe::Hive,
+            "minecraft:creaking_heart" => LoadedBe::Heart,
+            "minecraft:brewing_stand" => LoadedBe::Brewing,
+            "minecraft:mob_spawner" | "minecraft:trial_spawner" | "minecraft:vault" => LoadedBe::Spawner,
+            "minecraft:campfire"
+            | "minecraft:jukebox"
+            | "minecraft:end_gateway"
+            | "minecraft:beacon"
+            | "minecraft:conduit"
+            | "minecraft:potent_sulfur"
+            | "minecraft:bell" => LoadedBe::ByBlock,
+            _ if crate::mobs::recent::vibration::block_ear(id).is_some() => LoadedBe::Ear,
+            _ => crate::containers::furnace_kind(id).map_or(LoadedBe::Other, LoadedBe::Furnace),
+        }
+    }
+}
+
+/// Order in which the game registers the tickers of a chunk it loads: its block entities sit in
+/// an open-addressing table keyed by position (32 slots, doubled once more than 3/4 full; home
+/// slot = mixed hash of the position, a taken slot passes to the next one), walked from the last
+/// slot down. `at`: positions in the order of the chunk's block-entity list, which is the
+/// insertion order (it only matters for collisions). Returns indices into `at`; a repeated
+/// position keeps its first slot and takes the later entry.
+pub(crate) fn chunk_be_order(at: &[P]) -> Vec<usize> {
+    fn home(p: P, mask: usize) -> usize {
+        let code = p[1].wrapping_add(p[2].wrapping_mul(31)).wrapping_mul(31).wrapping_add(p[0]);
+        let h = code.wrapping_mul(0x9E37_79B9_u32 as i32);
+        ((h ^ ((h as u32 >> 16) as i32)) as u32 as usize) & mask
+    }
+    /// Puts entry `i` in its slot; false if its position was already there (entry replaced).
+    fn place(table: &mut [Option<usize>], at: &[P], i: usize) -> bool {
+        let mask = table.len() - 1;
+        let mut s = home(at[i], mask);
+        while let Some(j) = table[s] {
+            if at[j] == at[i] {
+                table[s] = Some(i);
+                return false;
+            }
+            s = (s + 1) & mask;
+        }
+        table[s] = Some(i);
+        true
+    }
+    // Table length for `expected` entries at load factor 3/4 (power of two, at least 2).
+    let length = |expected: usize| (expected * 4).div_ceil(3).next_power_of_two().max(2);
+    let mut table: Vec<Option<usize>> = vec![None; 32];
+    let mut size = 0;
+    for i in 0..at.len() {
+        if !place(&mut table, at, i) {
+            continue; // same position again
+        }
+        let n = table.len();
+        let max_fill = (n * 3).div_ceil(4).min(n - 1);
+        let full = size >= max_fill;
+        size += 1;
+        if full {
+            // Re-inserted from the last slot down, like the walk.
+            let old: Vec<usize> = table.iter().rev().flatten().copied().collect();
+            table = vec![None; length(size + 1)];
+            for j in old {
+                place(&mut table, at, j);
+            }
+        }
+    }
+    table.iter().rev().flatten().copied().collect()
+}
+
 /// Entity simulated by the block behaviours.
 #[derive(Debug, Clone)]
 pub(crate) struct SimEntity {
@@ -1469,83 +1556,59 @@ impl Server {
         }
     }
 
+    /// Tickers of a chunk just read or generated, every family together, in the order the game
+    /// walks the chunk's block entities (`chunk_be_order`): a furnace whose slot comes first
+    /// ticks before the hopper under it, whatever their kinds (before: hoppers, then hives, ...,
+    /// and the furnaces and brewing stands of a read chunk after all of them, never for a
+    /// generated chunk).
     pub(crate) fn register_chunk_tickers(&mut self, ch: (i32, i32)) {
         let Some(Some(c)) = self.chunks.get(&ch) else { return };
-        let hoppers: Vec<(P, i32)> = c
+        let found: Vec<(P, LoadedBe)> = c
             .block_entities
             .iter()
-            .filter(|b| {
-                matches!(b.get("id").and_then(Nbt::as_str), Some("minecraft:hopper" | "minecraft:daylight_detector"))
-            })
             .map(|b| {
                 let i = |k: &str| crate::nbtio::int(b, k).unwrap_or(0) as i32;
-                ([i("x"), i("y"), i("z")], i("TransferCooldown"))
+                let id = b.get("id").and_then(Nbt::as_str).unwrap_or("");
+                ([i("x"), i("y"), i("z")], LoadedBe::of(id, i("TransferCooldown")))
             })
             .collect();
-        for (p, cd) in hoppers {
-            let id = self.add_ticker(p);
-            self.bs.hoppers.insert(p, (id, cd, i64::MIN));
+        let at: Vec<P> = found.iter().map(|f| f.0).collect();
+        for k in chunk_be_order(&at) {
+            let (p, be) = found[k];
+            self.register_loaded_ticker(p, be);
         }
-        // F11: beehives and bee nests of the chunk.
-        let hives: Vec<P> = match self.chunks.get(&ch) {
-            Some(Some(c)) => c
-                .block_entities
-                .iter()
-                .filter(|b| b.get("id").and_then(Nbt::as_str) == Some("minecraft:beehive"))
-                .map(|b| {
-                    let i = |k: &str| crate::nbtio::int(b, k).unwrap_or(0) as i32;
-                    [i("x"), i("y"), i("z")]
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
-        for p in hives {
-            self.hive_register(p);
-        }
-        // G6-F01: campfires and jukeboxes (with a disc) of the chunk.
-        let ticking: Vec<P> = match self.chunks.get(&ch) {
-            Some(Some(c)) => c
-                .block_entities
-                .iter()
-                .filter(|b| {
-                    matches!(
-                        b.get("id").and_then(Nbt::as_str),
-                        Some(
-                            "minecraft:campfire"
-                                | "minecraft:jukebox"
-                                | "minecraft:end_gateway"
-                                | "minecraft:beacon"
-                                | "minecraft:conduit"
-                                | "minecraft:potent_sulfur"
-                                | "minecraft:bell"
-                        )
-                    )
-                })
-                .map(|b| {
-                    let i = |k: &str| crate::nbtio::int(b, k).unwrap_or(0) as i32;
-                    [i("x"), i("y"), i("z")]
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
-        for p in ticking {
-            let s = self.get(p);
-            match self.v().kind(s) {
-                Kind::Campfire => self.campfire_ticker_register(p),
-                _ if self.state_name(s) == "minecraft:end_gateway" => self.gateway_ticker_register(p),
-                Kind::Beacon => self.beacon_ticker_register(p), // G5-F11
-                _ if self.v().block(s) == self.bs.t.id.conduit => self.conduit_ticker_register(p), // G6-F12
-                Kind::PotentSulfur => self.potent_sulfur_ticker_sync(p, s), // G6-F09a
-                Kind::Bell => self.bell_ticker_register(p),                 // G3-F13
-                Kind::Jukebox => {
-                    self.jukebox_loaded_from_save(p);
-                    self.jukebox_ticker_sync(p, s);
-                }
-                _ => {}
+    }
+
+    fn register_loaded_ticker(&mut self, p: P, be: LoadedBe) {
+        match be {
+            LoadedBe::Hopper(cd) => {
+                let id = self.add_ticker(p);
+                self.bs.hoppers.insert(p, (id, cd, i64::MIN));
             }
+            LoadedBe::Hive => self.hive_register(p),              // F11
+            LoadedBe::Heart => self.heart_register(p),            // F14
+            LoadedBe::Ear => self.vib_block_register(p),          // F14: shriekers, sensors
+            LoadedBe::Spawner => self.spawner_blocks_register(p), // W9: cages, trials, vaults
+            LoadedBe::Furnace(k) => self.ensure_furnace(p, k),
+            LoadedBe::Brewing => self.ensure_brewer(p),
+            LoadedBe::ByBlock => {
+                let s = self.get(p);
+                match self.v().kind(s) {
+                    Kind::Campfire => self.campfire_ticker_register(p), // G6-F01
+                    _ if self.state_name(s) == "minecraft:end_gateway" => self.gateway_ticker_register(p),
+                    Kind::Beacon => self.beacon_ticker_register(p), // G5-F11
+                    _ if self.v().block(s) == self.bs.t.id.conduit => self.conduit_ticker_register(p), // G6-F12
+                    Kind::PotentSulfur => self.potent_sulfur_ticker_sync(p, s), // G6-F09a
+                    Kind::Bell => self.bell_ticker_register(p),     // G3-F13
+                    Kind::Jukebox => {
+                        self.jukebox_loaded_from_save(p);
+                        self.jukebox_ticker_sync(p, s);
+                    }
+                    _ => {}
+                }
+            }
+            LoadedBe::Other => {}
         }
-        self.rec_register_chunk(ch); // F14: creaking hearts, shriekers
-        self.spawner_blocks_register_chunk(ch); // W9: cages, trials, vaults
     }
 
     pub(crate) fn hopper_tick(&mut self, p: P) {

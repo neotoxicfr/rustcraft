@@ -2944,4 +2944,12 @@ bench_g3f13 -- --ignored --nocapture`), loaded machine (other agents compiling).
   (the "before" pass ran during other agents' builds), not this change: no gain is claimed; to
   measure on a quiet machine with `tools/bench/scenes.py`. Its "blocks and fluids" figure no
   longer includes the falling blocks and TNT (they tick with the entities now).
+- Review follow-up: tickers of a loaded chunk in the order of the game's per-chunk table, every
+  family in one walk over the chunk's block entities (before: five walks, then the furnaces and
+  brewing stands in a sixth after the whole batch). Same bench: table order 3.0 µs for 256 block
+  entities (12 ns each), whole registration of a chunk of 256 brewing stands 13.8-14.0 µs, once
+  per chunk read or generated. Lead not taken: caching the order per chunk (computed once per
+  load already). Portal passage of items, mobs and minecarts now skipped outside the ticking
+  chunks (one chunk test per mob or minecart per tick, 7-8 ns; items reuse their tick's flag).
+  A player's pearl asks for 25 chunks instead of 1: a set lookup per chunk per pearl per tick.
 - Multi-core, GPU: not applicable (phase order and list order are observable).

@@ -179,22 +179,6 @@ impl Server {
         self.mobs.spawners.blocks.vault_fail.remove(&p);
     }
 
-    pub(crate) fn spawner_blocks_register_chunk(&mut self, ch: (i32, i32)) {
-        let Some(Some(c)) = self.chunks.get(&ch) else { return };
-        let found: Vec<P> = c
-            .block_entities
-            .iter()
-            .filter(|b| matches!(b.get("id").and_then(Nbt::as_str), Some(CAGE | TRIAL | VAULT)))
-            .map(|b| {
-                let i = |k: &str| nbtio::int(b, k).unwrap_or(0) as i32;
-                [i("x"), i("y"), i("z")]
-            })
-            .collect();
-        for p in found {
-            self.spawner_blocks_register(p);
-        }
-    }
-
     /// Tick of a spawner block (block entity phase, after the entities: a mob born here ticks on
     /// the next tick, like in the game). `players`: living players, read once per walk.
     pub(crate) fn spawner_block_tick(&mut self, p: P, players: &[[f64; 3]]) {

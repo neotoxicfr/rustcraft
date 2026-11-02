@@ -419,8 +419,11 @@ impl Server {
         let block_changed = ob != nb;
         let moved = flags & flag::MOVED != 0;
         if block_changed && v.has_block_entity(old) && !self.keeps_block_entity(ob, nb) {
-            // F14: creaking heart, shrieker.
             if flags & flag::SKIP_BE_SIDE_EFFECTS == 0 {
+                // Container contents thrown, furnace experience (every removal with side effects,
+                // `/setblock destroy` and mob breaks included).
+                self.container_broken(p);
+                // F14: creaking heart, shrieker.
                 self.rec_pre_remove(p, old);
                 // G6-F01: disc, book, pot item given back.
                 match self.v().kind(old) {
@@ -903,8 +906,9 @@ impl Server {
         self.bs.movers.remove(&p);
         // G3-F13: its ticker dies with it (dropped on the next walk); a block entity placed back
         // at the same position gets a new ticker at the end of the list, like the game. The state
-        // kept outside the block entity goes too (a broken furnace's contents were thrown just
-        // before), otherwise a furnace placed back there would find the old one's.
+        // kept outside the block entity goes too (thrown first by `container_broken` when the
+        // removal has side effects; lost without them, like the game), otherwise a furnace placed
+        // back there would find the old one's.
         if let Some((_, t)) = self.bs.be_ticks.remove(&p) {
             self.dead_ticker_state(p, t);
         }

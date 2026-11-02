@@ -21,7 +21,12 @@ pub(crate) fn open(tag: &str) -> (Probe, PathBuf) {
     w.seed = 1;
     w.preset = Preset::Flat;
     create_world(&dir, &data, &w).expect("world creation");
-    let mut p = Probe::open(&dir, data);
+    (reopen(&dir, data), dir)
+}
+
+/// The world of `dir` opened again (same player setup and loaded chunks as `open`).
+fn reopen(dir: &std::path::Path, data: Arc<rc_data::VersionData>) -> Probe {
+    let mut p = Probe::open(dir, data);
     p.s.pos = [0.5, -60.0, 0.5];
     p.s.loaded = true;
     p.s.game_mode = 0;
@@ -29,8 +34,10 @@ pub(crate) fn open(tag: &str) -> (Probe, PathBuf) {
     p.s.view = 8;
     let around: Vec<(i32, i32)> = (-2..=9).flat_map(|x| (-2..=2).map(move |z| (x, z))).collect();
     p.s.load_now(&around);
-    cmd(&mut p, "gamerule minecraft:spawn_mobs false");
-    (p, dir)
+    // Refused when already false (reopened world).
+    let src = p.s.server_source();
+    let _ = p.s.perform(src, "gamerule minecraft:spawn_mobs false");
+    p
 }
 
 pub(crate) fn finish(p: Probe, dir: PathBuf) {
@@ -278,6 +285,22 @@ fn bench_g3f13_entity_test_and_furnace_list() {
         let old = t.elapsed().as_nanos() as f64 / f64::from(rounds) / 512.0;
         eprintln!("bench_g3f13 pass {pass}: idle brewing stand in the common list {list:.1} ns, former loop {old:.1} ns");
     }
+    // Order of the tickers of a loaded chunk: the table walk alone, then the whole registration
+    // (chunk 0: 256 brewing stands, already registered: the idempotent path).
+    let at: Vec<[i32; 3]> = (0..256).map(|i| [i & 15, -59, i >> 4]).collect();
+    for pass in 0..3 {
+        let t = std::time::Instant::now();
+        for _ in 0..rounds {
+            std::hint::black_box(crate::blocks::entities::chunk_be_order(std::hint::black_box(&at)));
+        }
+        let order = t.elapsed().as_nanos() as f64 / f64::from(rounds);
+        let t = std::time::Instant::now();
+        for _ in 0..rounds {
+            p.s.register_chunk_tickers((0, 0));
+        }
+        let all = t.elapsed().as_nanos() as f64 / f64::from(rounds);
+        eprintln!("bench_g3f13 pass {pass}: 256 block entities, table order {order:.0} ns, registration {all:.0} ns");
+    }
     finish(p, dir);
 }
 
@@ -325,5 +348,124 @@ fn replaced_block_entities_start_fresh() {
     cmd(&mut p, "setblock 6 -60 4 minecraft:air");
     cmd(&mut p, "setblock 6 -60 4 minecraft:furnace");
     assert!(p.s.life.furnaces.get(&f).is_some_and(|f| f.items.iter().all(Option::is_none)), "old contents revived");
+    finish(p, dir);
+}
+
+/// Walk order of the game's per-chunk block-entity table, frozen from an independent model of
+/// that table (32 slots, doubled past 3/4 full, mixed position hash, walked from the last slot):
+/// the four cells of the reload test, then 30 positions (two growths of the table).
+#[test]
+fn chunk_block_entity_order_is_the_game_table_walk() {
+    use crate::blocks::entities::chunk_be_order;
+    let four = [[10, -60, 3], [10, -61, 3], [3, -60, 3], [3, -61, 3]];
+    assert_eq!(chunk_be_order(&four), [0, 1, 3, 2], "slots 27, 24, 21, 7");
+    let many: Vec<[i32; 3]> = (0..30).map(|x| [x * 3 % 16 + 32, -60 + x % 5, (x * 7) % 16 - 16]).collect();
+    let want =
+        [11, 20, 6, 25, 4, 0, 2, 7, 8, 9, 5, 1, 12, 23, 13, 15, 24, 27, 14, 22, 26, 19, 28, 29, 10, 18, 3, 16, 21, 17];
+    assert_eq!(chunk_be_order(&many), want);
+    // A repeated position keeps its slot and takes the later entry.
+    assert_eq!(chunk_be_order(&[[10, -60, 3], [3, -60, 3], [10, -60, 3]]), [2, 1]);
+}
+
+/// A chunk read from disk registers its tickers in the game's order, every family together:
+/// after a reload the furnace at x = 10 (slot 27) ticks before the hopper under it (slot 24), so
+/// the ingot is pulled in the same tick; at x = 3 the hopper (21) comes before the furnace (7)
+/// and the ingot waits one tick. Before: the furnaces of a read chunk registered after all its
+/// other block entities (x = 10 one tick late) and never for a generated chunk.
+#[test]
+fn reloaded_chunk_ticks_its_block_entities_in_table_order() {
+    let (mut p, dir) = open("reload");
+    let furnace = "setblock {X} -60 3 minecraft:furnace[lit=true]{Items:[{Slot:0b,id:\"minecraft:raw_iron\",count:1}],\
+        cooking_time_spent:199,cooking_total_time:200,lit_time_remaining:100,lit_total_time:1600}";
+    let hopper = "setblock {X} -61 3 minecraft:hopper[facing=down]";
+    for x in ["3", "10"] {
+        cmd(&mut p, &furnace.replace("{X}", x));
+        cmd(&mut p, &hopper.replace("{X}", x));
+    }
+    p.s.save(true);
+    let data = p.s.data.clone();
+    drop(p);
+    let mut p = reopen(&dir, data);
+    assert!(p.s.life.furnaces.contains_key(&[10, -60, 3]), "furnace not simulated after the reload");
+    game_ticks(&mut p, 1);
+    assert_eq!(hopper_count(&p, [10, -61, 3], "minecraft:iron_ingot"), 1, "x = 10: furnace first, same tick");
+    assert_eq!(hopper_count(&p, [3, -61, 3], "minecraft:iron_ingot"), 0, "x = 3: hopper first, ingot waits");
+    game_ticks(&mut p, 1);
+    assert_eq!(hopper_count(&p, [3, -61, 3], "minecraft:iron_ingot"), 1, "x = 3: pulled on the next tick");
+    finish(p, dir);
+}
+
+/// Going through a portal is part of an entity's tick: simulation distance 2, an item, a zombie
+/// and a minecart in an End portal in chunk 4 (loaded, outside the "ticking entities" chunks)
+/// stay; the same in chunk 1 go to the End. Before: all of them passed.
+#[test]
+fn frozen_entities_do_not_go_through_portals() {
+    let (mut p, dir) = open("portal");
+    p.s.sim_dist = 2;
+    for x in [24, 72] {
+        for z in [0, 4, 8] {
+            cmd(&mut p, &format!("setblock {x} -60 {z} minecraft:end_portal"));
+        }
+        let c = f64::from(x) + 0.5;
+        cmd(&mut p, &format!("summon minecraft:item {c} -59.6 0.5 {{Item:{{id:\"minecraft:stone\",count:1}}}}"));
+        cmd(&mut p, &format!("summon minecraft:zombie {c} -60 4.5 {{NoAI:1b}}"));
+        cmd(&mut p, &format!("summon minecraft:minecart {c} -60 8.5"));
+    }
+    let count = |p: &Probe, far: bool| {
+        let side = |x: f64| (x > 64.0) == far;
+        (
+            p.s.life.drops.iter().filter(|d| side(d.pos[0])).count(),
+            p.s.mobs.list.iter().flatten().filter(|m| side(m.pos[0])).count(),
+            p.s.carts.list.iter().flatten().filter(|c| side(c.pos[0])).count(),
+        )
+    };
+    assert_eq!((count(&p, false), count(&p, true)), ((1, 1, 1), (1, 1, 1)), "summoned");
+    game_ticks(&mut p, 3);
+    assert_eq!(count(&p, true), (1, 1, 1), "chunk 4: frozen entities passed");
+    assert_eq!(count(&p, false), (0, 0, 0), "chunk 1: ticking entities stayed");
+    finish(p, dir);
+}
+
+/// A player's ender pearl asks for the chunks within its ticket's radius (2), not only its own:
+/// flying from chunk 9 (last loaded) towards +x, chunks 11 are read or generating after one
+/// tick, before it reaches them. Before: only its current chunk, so it stopped at each new one
+/// until that one was generated.
+#[test]
+fn player_pearl_loads_the_chunks_of_its_ticket() {
+    let (mut p, dir) = open("pearl");
+    assert!(!p.s.chunks.contains_key(&(11, 0)), "chunk 11 already loaded");
+    cmd(&mut p, "summon minecraft:ender_pearl 150.5 -50 0.5 {NoGravity:1b,Motion:[1.5d,0.0d,0.0d]}");
+    let uuid = p.s.uuid;
+    p.s.proj.list.last_mut().expect("pearl").owner = Some(uuid);
+    game_ticks(&mut p, 1);
+    for c in [(11, 0), (11, 2), (10, -2)] {
+        assert!(p.s.chunks.contains_key(&c), "chunk {c:?} of the pearl's ticket not requested");
+    }
+    finish(p, dir);
+}
+
+/// Container contents are thrown by every removal with side effects: `/setblock ... destroy` on
+/// a furnace with 5 raw iron and on a chest with 3 stone throws the blocks and their contents
+/// (before: the contents were erased). The player's path (contents first, then the removal)
+/// throws them once.
+#[test]
+fn destroyed_containers_throw_their_contents() {
+    let (mut p, dir) = open("contents");
+    cmd(&mut p, "setblock 6 -60 4 minecraft:furnace{Items:[{Slot:0b,id:\"minecraft:raw_iron\",count:5}]}");
+    cmd(&mut p, "setblock 8 -60 4 minecraft:chest{Items:[{Slot:0b,id:\"minecraft:stone\",count:3}]}");
+    cmd(&mut p, "setblock 6 -60 4 minecraft:air destroy");
+    cmd(&mut p, "setblock 8 -60 4 minecraft:air destroy");
+    let thrown = |p: &Probe, id: &str| -> i32 {
+        p.s.life.drops.iter().filter(|d| d.stack.id == id).map(|d| d.stack.count).sum()
+    };
+    assert_eq!(thrown(&p, "minecraft:raw_iron"), 5, "furnace contents");
+    assert_eq!(thrown(&p, "minecraft:furnace"), 1);
+    assert_eq!(thrown(&p, "minecraft:stone"), 3, "chest contents");
+    assert_eq!(thrown(&p, "minecraft:chest"), 1);
+    cmd(&mut p, "setblock 10 -60 4 minecraft:barrel{Items:[{Slot:0b,id:\"minecraft:dirt\",count:2}]}");
+    p.s.container_broken([10, -60, 4]);
+    let air = p.s.air();
+    p.s.set_block([10, -60, 4], air, crate::blocks::flag::ALL);
+    assert_eq!(thrown(&p, "minecraft:dirt"), 2, "contents thrown twice");
     finish(p, dir);
 }

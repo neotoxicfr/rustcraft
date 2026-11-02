@@ -90,24 +90,6 @@ impl Server {
         self.life.brewers.insert(pos, b);
     }
 
-    /// Brewing stands of the chunks that have just been loaded.
-    pub(crate) fn discover_brewers(&mut self, loaded: &[(i32, i32)]) {
-        let mut found = Vec::new();
-        for p in loaded {
-            let Some(Some(c)) = self.chunks.get(p) else { continue };
-            for be in &c.block_entities {
-                if be.get("id").and_then(Nbt::as_str) != Some("minecraft:brewing_stand") {
-                    continue;
-                }
-                let (Some(x), Some(y), Some(z)) = (int(be, "x"), int(be, "y"), int(be, "z")) else { continue };
-                found.push([x as i32, y as i32, z as i32]);
-            }
-        }
-        for p in found {
-            self.ensure_brewer(p);
-        }
-    }
-
     pub(crate) fn block_name_s7(&self, p: [i32; 3]) -> Option<String> {
         self.state_at(p).and_then(|s| self.data.block_of(s)).map(|b| b.name.clone())
     }

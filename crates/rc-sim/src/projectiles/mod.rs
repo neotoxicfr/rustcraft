@@ -835,30 +835,58 @@ impl Server {
         self.proj_retain();
     }
 
-    /// Chunks of the host's flying pearls read from disk or put into generation, without
-    /// waiting (the pearl's ticket): a projectile whose chunk is not ready does not tick.
+    /// Chunks around the flying pearls of players (host or guest) within the radius of the
+    /// pearl's ticket (2), read from disk or put into generation ahead of the pearl, so that it
+    /// finds its next chunk ready instead of stopping at each one (a projectile whose chunk is
+    /// not ready does not tick). Its own chunk is read now if missing; the rest goes to the read
+    /// thread when it runs (`RUSTCRAFT_OPT_ASYNC_LOAD`), otherwise is read now like the view.
+    /// Not modelled: the ticket also makes the chunks around the pearl tick (entities within 2,
+    /// blocks within 3) and keeps them for 40 ticks; here only the pearl itself ticks there.
     fn load_pearl_chunks(&mut self) {
-        let missing: Vec<(i32, i32)> = self
+        let centres: Vec<(i32, i32)> = self
             .proj
             .list
             .iter()
-            .filter(|p| !p.removed && p.kind == PKind::EnderPearl && p.owner == Some(self.uuid))
+            .filter(|p| !p.removed && self.player_pearl(p))
             .map(|p| ((p.pos[0].floor() as i32) >> 4, (p.pos[2].floor() as i32) >> 4))
-            .filter(|c| !matches!(self.chunks.get(c), Some(Some(_))))
             .collect();
-        if !missing.is_empty() {
-            self.ensure_loaded(&missing);
+        if centres.is_empty() {
+            return;
+        }
+        let own: Vec<(i32, i32)> = centres.iter().copied().filter(|c| !self.chunks.contains_key(c)).collect();
+        if !own.is_empty() {
+            self.ensure_loaded(&own);
+        }
+        let mut ring: Vec<(i32, i32)> = Vec::new();
+        for &(cx, cz) in &centres {
+            for c in (-2..=2).flat_map(|dx| (-2..=2).map(move |dz| (cx + dx, cz + dz))) {
+                if !self.chunks.contains_key(&c) && !ring.contains(&c) {
+                    ring.push(c);
+                }
+            }
+        }
+        if ring.is_empty() {
+            return;
+        }
+        // A parked world reads now: the read thread serves one dimension at a time (the player's).
+        match &mut self.loader {
+            Some(l) if crate::loader::async_on() && self.dims.home.is_none() => l.want(&self.dim, &ring),
+            _ => self.ensure_loaded(&ring),
         }
     }
 
-    /// Ender pearl of a player (host or guest) whose chunk is loaded: the pearl's own ticket
-    /// makes that chunk "ticking entities" wherever it flies.
-    fn player_pearl_ready(&self, p: &Proj) -> bool {
+    /// Ender pearl thrown by a player (host or guest): it carries the pearl's ticket.
+    fn player_pearl(&self, p: &Proj) -> bool {
         let Some(o) = p.owner.filter(|_| p.kind == PKind::EnderPearl) else { return false };
-        let player = o == self.uuid
-            || self.lan.as_ref().is_some_and(|l| l.guests.iter().any(|g| g.ctx.as_ref().is_some_and(|c| c.uuid == o)));
+        o == self.uuid
+            || self.lan.as_ref().is_some_and(|l| l.guests.iter().any(|g| g.ctx.as_ref().is_some_and(|c| c.uuid == o)))
+    }
+
+    /// Ender pearl of a player whose chunk is loaded: the pearl's own ticket makes that chunk
+    /// "ticking entities" wherever it flies.
+    fn player_pearl_ready(&self, p: &Proj) -> bool {
         let c = ((p.pos[0].floor() as i32) >> 4, (p.pos[2].floor() as i32) >> 4);
-        player && matches!(self.chunks.get(&c), Some(Some(_)))
+        self.player_pearl(p) && matches!(self.chunks.get(&c), Some(Some(_)))
     }
 
     /// Tick of each projectile present at the start.

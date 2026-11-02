@@ -56,7 +56,7 @@ pub struct ItemEnt {
     /// G3-F13: entity walk of its birth (`Walk::born`), and "ticked this tick" (only a ticked
     /// item merges its neighbours into itself).
     born: u64,
-    ticked: bool,
+    pub(crate) ticked: bool,
 }
 
 impl ItemEnt {
@@ -1142,6 +1142,8 @@ impl Server {
     /// tool wear, exhaustion, loot and experience (survival only).
     pub(crate) fn on_block_broken(&mut self, p: [i32; 3], state: u32) {
         self.piglin_block_destroyed(p); // F13: block guarded by the piglins
+        // Contents before the loot of the block, like the game (which throws them at the removal,
+        // before that loot); consumed here, the removal then finds nothing.
         self.container_broken(p);
         if self.game_mode == 1 {
             return;
