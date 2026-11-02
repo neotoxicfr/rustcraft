@@ -55,8 +55,8 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// before: 521f08db…, 823).
 /// G4-F08 resumption: mobs write their live `PortalCooldown` (the game writes it for every
 /// entity), the only cause of the change (without it: 360ac84c…, 807 again).
-// Lot 9 integration: all together.
-const EXPECTED_NEW: (&str, usize) = ("REMEASURE", 0);
+/// Lot 9 integration: all together.
+const EXPECTED_NEW: (&str, usize) = ("700c26d921c9f1eb3c783ac07d5e9d0bcb2ee92d919d00fed6fe4a71487faa21", 820);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 const EXPECTED_MODEL: &[(&str, &str, usize)] = &[(
     "790b2d94653a4243e68f2e0cb0ebc3f865f9f59815ed65149067cdd374c6b800",
@@ -209,8 +209,8 @@ fn run_new() -> Option<Vec<(String, String)>> {
 /// the change (old marking put back: a551d272…, 380 again).
 /// G4-F08 resumption: mobs write their live `PortalCooldown` (the game writes it for every
 /// entity), the only cause of the change (without it: a551d272…, 380 again).
-// Lot 9 integration: all together.
-const EXPECTED_MECH: (&str, usize) = ("REMEASURE", 0);
+/// Lot 9 integration: all together.
+const EXPECTED_MECH: (&str, usize) = ("304c0b39d8961896bf4a8c4d1f90342ef19701aac82e67a005136f19b0d9ff3c", 380);
 
 /// Server command (refusal = failure: the rig would be incomplete).
 pub(crate) fn cmd(s: &mut Server, c: &str) {
@@ -359,8 +359,8 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 /// elsewhere.
 /// G4-F08 resumption: mobs write their live `PortalCooldown` (the game writes it for every
 /// entity), the only cause of the change (without it: 9c406245… again).
-// Lot 9 integration: all together.
-const EXPECTED_REGIONS: (&str, usize) = ("REMEASURE", 0);
+/// Lot 9 integration: all together.
+const EXPECTED_REGIONS: (&str, usize) = ("054d4766947e49aff86433df1c37fd3cbe32520d5967caa948e56b4ad1192377", 1243);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all
 /// dimensions): SHA-256 of the decompressed NBT per chunk. Sector locations and
