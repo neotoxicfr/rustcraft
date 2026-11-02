@@ -281,8 +281,8 @@ pub struct Proj {
     pub fire: i32,
     pub in_water: bool,
     pub first_tick: bool,
-    /// Number of the entity walk it was born in (0: outside the walk), read by `mobs::Walk`.
-    pub born: u64,
+    /// Rank in the entity walk (`walk::next_rank`), stamped when it enters the list.
+    pub rank: u64,
     pub on_ground: bool,
     pub horizontal_collision: bool,
     pub no_gravity: bool,
@@ -524,7 +524,7 @@ impl Proj {
             fire: 0,
             in_water: false,
             first_tick: true,
-            born: 0,
+            rank: 0,
             on_ground: false,
             horizontal_collision: false,
             no_gravity: false,
@@ -700,10 +700,9 @@ impl Server {
     /// Addition to the world: the player is paired at once.
     pub(crate) fn proj_add(&mut self, mut p: Proj) {
         p.sync_arrow_flags();
-        // The entity walk does not see what is added to it along the way: a projectile launched
-        // during this walk (mob, ominous spawner, command block minecart) makes its first
-        // tick on the next server tick.
-        p.born = self.walk.born();
+        // Rank in the entity walk: a projectile launched during a walk (mob, ominous spawner,
+        // command block minecart) is past its start and makes its first tick on the next one.
+        p.rank = crate::walk::next_rank();
         if self.proj_visible(&p) {
             self.proj_pair(&mut p);
         }
@@ -873,16 +872,31 @@ impl Server {
         }
     }
 
-    /// Tick of the open world's projectiles, then clouds, bobber, pickup and tracking.
+    /// The open world's projectiles, clouds and bobber as their own walk (tests), with the
+    /// player's parts around them: pickup and tracking.
+    #[cfg(test)]
     pub(crate) fn projectiles_tick(&mut self) {
-        #[cfg(test)]
         crate::server::phase("projectiles");
+        use crate::walk::{Fam, bit};
         self.proj_restore_pearls();
-        self.proj_player_tick();
         // Frozen (`tick freeze`): projectiles, clouds and floats wait.
         let runs = self.cmd.ticking.runs();
-        // Network tracking BEFORE the projectile tick, like the official server: the client
-        // receives the state of the previous tick then does the current tick itself.
+        let mask = if runs { bit(Fam::Proj) | bit(Fam::Cloud) | bit(Fam::Hook) } else { 0 };
+        self.walk_alone(mask, move |s| s.proj_pre(runs), move |s| s.proj_post(runs));
+    }
+
+    /// Before the entity walk: network tracking, like the official server (the client receives
+    /// the state of the previous tick then does the current tick itself), then the chunks ahead
+    /// of the players' flying pearls. The player's own projectile state (cooldowns, stuck arrows,
+    /// gliding, item in use) ticks after the walk (`proj_post`).
+    pub(crate) fn proj_pre(&mut self, runs: bool) {
+        self.proj_track();
+        if runs {
+            self.load_pearl_chunks(); // G3-F13: a pearl beyond the loaded chunks keeps flying
+        }
+    }
+
+    pub(crate) fn proj_track(&mut self) {
         let mut list = std::mem::take(&mut self.proj.list);
         for p in list.iter_mut().filter(|p| !p.removed) {
             self.proj_send_changes(p);
@@ -890,33 +904,21 @@ impl Server {
         let added = std::mem::take(&mut self.proj.list);
         list.extend(added);
         self.proj.list = list;
+    }
+
+    /// After the entity walk: removed clouds, the player's own part (item cooldowns, use, stuck
+    /// arrows, gliding: its tick comes after the world, so what the walk sets this tick counts
+    /// down from the next one), its pickups and spin attack, removed projectiles.
+    pub(crate) fn proj_post(&mut self, runs: bool) {
         if runs {
-            self.load_pearl_chunks(); // G3-F13: a pearl beyond the loaded chunks keeps flying
-            self.proj_list_tick();
-            self.clouds_tick();
-            self.fishing_tick();
+            self.clouds_post();
         }
+        self.proj_player_tick();
         self.proj_player_touch();
         self.spin_attack_tick();
         self.proj_retain();
-        // End of the entity walk (started before the first mob).
-        self.walk.end();
     }
 
-    /// Projectiles of a parked dimension (portal ticket or player's pearl in flight): tracking
-    /// (sends cut off), tick, removal. The player's pearls keep their chunk loaded.
-    pub(crate) fn proj_world_tick(&mut self) {
-        let mut list = std::mem::take(&mut self.proj.list);
-        for p in list.iter_mut().filter(|p| !p.removed) {
-            self.proj_send_changes(p);
-        }
-        let added = std::mem::take(&mut self.proj.list);
-        list.extend(added);
-        self.proj.list = list;
-        self.load_pearl_chunks();
-        self.proj_list_tick();
-        self.proj_retain();
-    }
 
     /// Chunks around the flying pearls of players (host or guest) within the radius of the
     /// pearl's ticket (2), read from disk or put into generation ahead of the pearl, so that it
@@ -925,7 +927,7 @@ impl Server {
     /// thread when it runs (`RUSTCRAFT_OPT_ASYNC_LOAD`), otherwise is read now like the view.
     /// What the ticket simulates (entities of its chunk, blocks one chunk around, 40 ticks after
     /// its last renewal) is `Projs::tickets`, read by the chunk tests.
-    fn load_pearl_chunks(&mut self) {
+    pub(crate) fn load_pearl_chunks(&mut self) {
         let centres: Vec<(i32, i32)> = self
             .proj
             .list
@@ -977,46 +979,40 @@ impl Server {
         }
     }
 
-    /// Tick of each projectile present at the start.
-    fn proj_list_tick(&mut self) {
-        // The list stays in place: during a projectile's tick, the others stay
-        // findable by identifier (bullets hit by an arrow or by the explosion of a
-        // fireball). Projectiles added during the tick (crossbow rockets…) go
-        // at the end and wait for the next tick.
-        let n = self.proj.list.len();
-        for i in 0..n {
-            let Some(slot) = self.proj.list.get_mut(i) else { break };
-            // Born during this entity walk: it waits for the next tick.
-            if self.walk.waits(std::mem::take(&mut slot.born)) {
-                continue;
-            }
-            // G3-F13: outside a "ticking entities" chunk (or one not loaded), it waits; a
-            // player's pearl ticks in the chunks of its own ticket (L9-TICK).
-            let slot = &self.proj.list[i];
-            if slot.removed || !self.entity_ticks_at(slot.pos) {
-                continue;
-            }
-            let mut p = slot.clone();
-            let id = p.id;
-            p.tick_count += 1;
-            p.old_pos = p.pos;
-            let before = ((p.pos[0].floor() as i32) >> 4, (p.pos[2].floor() as i32) >> 4);
-            self.proj_tick(&mut p);
-            trace(&p);
-            // List replaced during the tick (dimension change): stop.
-            let Some(slot) = self.proj.list.get(i).filter(|s| s.id == id) else { break };
-            // Destroyed by another during its own tick (explosion it caused).
-            p.removed |= slot.removed;
-            // L9-TICK: a pearl still alive after its tick renews its ticket.
-            if p.kind == PKind::EnderPearl && !p.removed {
-                self.pearl_ticket_tick(&mut p, before);
-            }
-            self.proj.list[i] = p;
+    /// Projectile of slot `i`, at its rank in the entity walk. The list stays in place: during
+    /// a projectile's tick, the others stay findable by identifier (bullets hit by an arrow or
+    /// by the explosion of a fireball). Projectiles added during the walk (crossbow rockets…) go
+    /// at the end and wait for the next one.
+    pub(crate) fn proj_visit(&mut self, i: usize) {
+        let Some(slot) = self.proj.list.get(i).filter(|p| !p.removed) else { return };
+        // G3-F13: outside a "ticking entities" chunk (or one not loaded), it waits; a player's
+        // pearl ticks in the chunks of its own ticket (L9-TICK).
+        let (ticking, mut rank) = (self.entity_ticks_at(slot.pos), slot.rank);
+        let meet = self.meet(&mut rank, ticking, crate::walk::Fam::Proj);
+        self.proj.list[i].rank = rank;
+        if meet != crate::walk::Meet::Tick {
+            return;
         }
+        let mut p = self.proj.list[i].clone();
+        let id = p.id;
+        p.tick_count += 1;
+        p.old_pos = p.pos;
+        let before = ((p.pos[0].floor() as i32) >> 4, (p.pos[2].floor() as i32) >> 4);
+        self.proj_tick(&mut p);
+        trace(&p);
+        // List replaced during the tick (dimension change): left as it is.
+        let Some(slot) = self.proj.list.get(i).filter(|s| s.id == id) else { return };
+        // Destroyed by another during its own tick (explosion it caused).
+        p.removed |= slot.removed;
+        // L9-TICK: a pearl still alive after its tick renews its ticket.
+        if p.kind == PKind::EnderPearl && !p.removed {
+            self.pearl_ticket_tick(&mut p, before);
+        }
+        self.proj.list[i] = p;
     }
 
     /// Removed projectiles: taken off the list, forgotten by the client that saw them.
-    fn proj_retain(&mut self) {
+    pub(crate) fn proj_retain(&mut self) {
         let mut list = std::mem::take(&mut self.proj.list);
         let mut gone = Vec::new();
         for p in list.iter_mut() {

@@ -599,9 +599,15 @@ impl Server {
 
     /// Is the player carried by this mob, directly or through a stack of passengers?
     pub(crate) fn carries_player(&self, m: &Mob) -> bool {
-        m.mount.passengers.iter().any(|p| match *p {
+        self.passengers_carry_player(&m.mount.passengers, m.id)
+    }
+
+    /// Passengers of `vehicle` (a mob or a minecart) carry the player, directly or through a
+    /// stack of passengers: that vehicle is never frozen by `tick freeze`, like the game's.
+    pub(crate) fn passengers_carry_player(&self, passengers: &[Ent], vehicle: i32) -> bool {
+        passengers.iter().any(|p| match *p {
             Ent::Player => true,
-            Ent::Mob(id) => self.mob_ref(id).is_some_and(|o| o.id != m.id && self.carries_player(o)),
+            Ent::Mob(id) => self.mob_ref(id).is_some_and(|o| o.id != vehicle && self.carries_player(o)),
         })
     }
 

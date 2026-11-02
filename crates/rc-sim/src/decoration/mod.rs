@@ -125,6 +125,8 @@ struct Live {
     last_hurt: f32,
     /// Piston pushes of the current tick (armor stand, mannequin: each entity its own cap).
     piston: rc_physics::piston::PistonDeltas,
+    /// Rank in the entity walk (`walk::next_rank`), stamped when it enters the list.
+    rank: u64,
 }
 
 impl Live {
@@ -140,6 +142,7 @@ impl Live {
             hurt_cooldown: 0,
             last_hurt: 0.0,
             piston: Default::default(),
+            rank: crate::walk::next_rank(),
         }
     }
 }
@@ -344,7 +347,7 @@ impl Server {
     }
 
     /// Position of a decoration of the registry (searched first in its chunk).
-    fn live_pos(&mut self, i: usize) -> Option<[f64; 3]> {
+    pub(crate) fn live_pos(&mut self, i: usize) -> Option<[f64; 3]> {
         let (lid, lchunk) = (self.deco.live[i].id, self.deco.live[i].chunk);
         let near = self.entities.get(&lchunk).and_then(|v| v.iter().find(|(x, _)| *x == lid));
         let pos = match near {
@@ -596,57 +599,88 @@ impl Server {
 
     // ---------- Tick ----------
 
-    /// Tick of the decorations (entity phase): under the world, survival every 100 ticks.
+    /// The decorations as their own walk (tests): under the world, survival every 100 ticks.
+    #[cfg(test)]
     pub(crate) fn deco_tick(&mut self) {
         self.cushion_seat_tick(); // seated player: it ticks even when the world is frozen
-        if !self.cmd.ticking.runs() || self.deco.live.is_empty() {
+        if self.cmd.ticking.runs() {
+            self.walk_alone(crate::walk::bit(crate::walk::Fam::Deco), |_| {}, Self::deco_post);
+        }
+    }
+
+    pub(crate) fn deco_live_len(&self) -> usize {
+        self.deco.live.len()
+    }
+
+    pub(crate) fn deco_rank(&self, i: usize) -> Option<u64> {
+        self.deco.live.get(i).map(|l| l.rank)
+    }
+
+    pub(crate) fn deco_rank_mut(&mut self, i: usize) -> Option<&mut u64> {
+        self.deco.live.get_mut(i).map(|l| &mut l.rank)
+    }
+
+    pub(crate) fn deco_resort(&mut self) {
+        self.deco.live.sort_by_key(|l| l.rank);
+    }
+
+    /// A decoration at `pos` ticks: "entity ticking" chunk, simulated and its 8 neighbours
+    /// loaded (otherwise a support located in an absent neighbour would be read as void).
+    pub(crate) fn deco_ticks_at(&self, pos: [f64; 3]) -> bool {
+        let c = chunk_of(pos);
+        let loaded =
+            (-1..=1).all(|dx| (-1..=1).all(|dz| matches!(self.chunks.get(&(c.0 + dx, c.1 + dz)), Some(Some(_)))));
+        self.entities_tick_in(c) && loaded
+    }
+
+    /// Decoration of slot `i`, at its rank in the entity walk: under the world, survival every
+    /// 100 ticks, the fall of an armor stand or a mannequin.
+    pub(crate) fn deco_visit(&mut self, i: usize) {
+        let Some(l) = self.deco.live.get(i) else { return };
+        let l = Brief { id: l.id, kind: l.kind, check: l.check, removed: l.removed };
+        if l.removed {
             return;
         }
-        let floor = f64::from(self.dim.height.min_y - 64);
-        for i in 0..self.deco.live.len() {
-            let l = &self.deco.live[i];
-            let l = Brief { id: l.id, kind: l.kind, check: l.check, removed: l.removed };
-            if l.removed {
-                continue;
-            }
-            let Some(pos) = self.live_pos(i) else {
-                self.deco.live[i].removed = true;
-                continue;
-            };
-            // "Entity ticking" chunk: simulated and its 8 neighbours loaded; otherwise a support
-            // located in an absent neighbour would be read as void.
-            let c = chunk_of(pos);
-            let loaded = (-1..=1).all(|dx| (-1..=1).all(|dz| matches!(self.chunks.get(&(c.0 + dx, c.1 + dz)), Some(Some(_)))));
-            if !self.entities_tick_in(c) || !loaded {
-                continue;
-            }
-            if pos[1] < floor {
-                self.deco_remove(l.id);
-                continue;
-            }
-            if !l.kind.attached() {
-                self.living_tick(i, pos); // armor stand, mannequin: fall
-                continue;
-            }
-            self.deco.live[i].check = l.check + 1;
-            if l.check < 100 {
-                continue;
-            }
-            self.deco.live[i].check = 0;
-            if l.kind == DKind::Cushion {
-                self.cushion_fire_check(l.id, true);
-                if self.deco.live[i].removed {
-                    continue;
-                }
-            }
-            if !self.deco_survives(l.id) {
-                let e = self.live_nbt(i).cloned();
-                self.deco_remove(l.id);
-                if let Some(e) = e {
-                    self.deco_drop_item(&e, None);
-                }
+        let Some(pos) = self.live_pos(i) else {
+            self.deco.live[i].removed = true;
+            return;
+        };
+        let mut rank = self.deco.live[i].rank;
+        let meet = self.meet(&mut rank, self.deco_ticks_at(pos), crate::walk::Fam::Deco);
+        self.deco.live[i].rank = rank;
+        if meet != crate::walk::Meet::Tick {
+            return;
+        }
+        if pos[1] < f64::from(self.dim.height.min_y - 64) {
+            self.deco_remove(l.id);
+            return;
+        }
+        if !l.kind.attached() {
+            self.living_tick(i, pos); // armor stand, mannequin: fall
+            return;
+        }
+        self.deco.live[i].check = l.check + 1;
+        if l.check < 100 {
+            return;
+        }
+        self.deco.live[i].check = 0;
+        if l.kind == DKind::Cushion {
+            self.cushion_fire_check(l.id, true);
+            if self.deco.live[i].removed {
+                return;
             }
         }
+        if !self.deco_survives(l.id) {
+            let e = self.live_nbt(i).cloned();
+            self.deco_remove(l.id);
+            if let Some(e) = e {
+                self.deco_drop_item(&e, None);
+            }
+        }
+    }
+
+    /// Removed decorations, after the entity walk.
+    pub(crate) fn deco_post(&mut self) {
         if self.deco.live.iter().any(|l| l.removed) {
             self.deco.live.retain(|l| !l.removed);
         }

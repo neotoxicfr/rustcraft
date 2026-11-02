@@ -738,20 +738,17 @@ impl Server {
         }
     }
 
-    /// Survival tick (within the server tick, after the clocks).
-    pub(crate) fn life_tick(&mut self) {
-        // Frozen (`tick freeze`): dropped items wait; the player ticks. (Weather is advanced at
-        // the start of the world tick; furnaces and brewing stands tick with the other block
-        // entities, after all the entities: `tick_block_entities`.)
-        if self.cmd.ticking.runs() {
-            self.drops_tick();
-        }
+    /// Survival tick of the player, after the entity walk (its items and orbs tick in the walk;
+    /// weather is advanced at the start of the world tick; furnaces and brewing stands tick with
+    /// the other block entities: `tick_block_entities`). Its own tick checks again that the open
+    /// menu is still usable; the changes were broadcast by its world part, at its rank
+    /// (`player_world_rest`).
+    pub(crate) fn life_player_tick(&mut self) {
         self.vitals_tick();
         self.sign_editors_tick(); // W8a: sign editors too far away forgotten
         self.sync_attributes(); // W8a: attributes changed (equipment, effects, mode)
         if self.life.menu.is_some() && !self.menu_valid() {
             self.close_menu(true);
         }
-        self.broadcast_menus();
     }
 }

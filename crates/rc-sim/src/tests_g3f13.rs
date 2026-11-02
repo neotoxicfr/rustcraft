@@ -67,8 +67,8 @@ fn phases_of_one_tick(p: &mut Probe) -> Vec<&'static str> {
 
 /// § 1.2: scheduled functions inside the "handling the tick" span, scheduled ticks, raids,
 /// spawning chunks, random ticks, special spawners, block events, dragon fight, then the entity
-/// walk (falling blocks first) and the block entities last. Frozen (`tick freeze`): the night
-/// skip still runs, the world phases and the block entities wait.
+/// walk (one walk for every kind, L10-ORDER) and the block entities last. Frozen (`tick
+/// freeze`): the night skip still runs, the world phases and the block entities wait.
 #[test]
 fn world_tick_runs_the_game_phases_in_order() {
     let (mut p, dir) = open("phases");
@@ -83,16 +83,13 @@ fn world_tick_runs_the_game_phases_in_order() {
         "spawners",
         "events",
         "fight",
-        "falling",
-        "items",
-        "mobs",
-        "projectiles",
+        "entities",
         "block_entities",
     ];
     assert_eq!(got, want, "world tick phases");
     p.s.cmd.ticking.set_frozen(true);
     let got = phases_of_one_tick(&mut p);
-    assert_eq!(got, ["sleep", "mobs", "projectiles"], "frozen world tick phases");
+    assert_eq!(got, ["sleep", "entities"], "frozen world tick phases");
     finish(p, dir);
 }
 
@@ -178,18 +175,18 @@ fn entities_outside_ticking_chunks_wait() {
 fn items_and_orbs_born_during_the_walk_wait() {
     let (mut p, dir) = open("born");
     let stone = Stack { id: "minecraft:stone".into(), count: 1, components: None };
-    p.s.walk.start();
+    let own = p.s.walk_begin();
     p.s.spawn_item_at([2.5, -55.0, 2.5], stone.clone());
     p.s.add_orb([2.5, -55.0, -2.5], 3);
     p.s.drops_tick();
     assert_eq!(p.s.life.drops.last().map(|d| d.ticks), Some(0), "item born in the walk ticked");
     assert_eq!(p.s.life.orbs.last().map(|o| o.ticks), Some(0), "orb born in the walk ticked");
-    p.s.walk.end();
-    p.s.walk.start();
+    p.s.walk_end(own);
+    let own = p.s.walk_begin();
     p.s.drops_tick();
     assert_eq!(p.s.life.drops.last().map(|d| d.ticks), Some(1), "item: first tick on the next walk");
     assert_eq!(p.s.life.orbs.last().map(|o| o.ticks), Some(1), "orb: first tick on the next walk");
-    p.s.walk.end();
+    p.s.walk_end(own);
     p.s.spawn_item_at([2.5, -55.0, 4.5], stone);
     p.s.drops_tick();
     assert_eq!(p.s.life.drops.last().map(|d| d.ticks), Some(1), "item born outside the walk ticks at once");

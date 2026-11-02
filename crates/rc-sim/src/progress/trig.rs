@@ -66,37 +66,37 @@ impl Server {
 
     // ---- Periodic ---------------------------------------------------------------------------
 
-    /// Player tick: `tick`, `location` (every 20 ticks), fall, effects, item in use.
+    /// Player's own tick, after the world: `location` (every 20 ticks), landing, mount, item in
+    /// use.
     pub(crate) fn trig_tick(&mut self) {
-        if self.trig_active("minecraft:tick") {
-            self.trigger("minecraft:tick", &|_, _| true);
-        }
         if self.tick.is_multiple_of(20) && self.trig_active("minecraft:location") {
             self.trigger("minecraft:location", &|_, _| true);
         }
-        // Fall start and landing.
-        let fall = self.life.vit.fall;
-        if fall > 0.0 && self.prog.fall_start.is_none() {
-            self.prog.fall_start = Some(self.pos);
-            // W8c: fall started above the impact point of an explosion
-            // (`fall_after_explosion`); the impact is forgotten in all cases.
-            if let Some((imp, cause)) = self.prog.expl_impact.take()
-                && imp[1] <= self.pos[1]
-                && self.trig_active("minecraft:fall_after_explosion")
-            {
-                let here = self.pos;
-                self.trigger("minecraft:fall_after_explosion", &|s, c| {
-                    distance_ok(s, c, imp, here) && typed_cause_ok(s, c.get("cause"), cause.as_deref())
-                });
-            }
-        }
-        if fall == 0.0
+        if self.life.vit.fall == 0.0
             && let Some(start) = self.prog.fall_start.take()
             && !self.life.vit.dead
             && self.trig_active("minecraft:fall_from_height")
         {
             let here = self.pos;
             self.trigger("minecraft:fall_from_height", &|s, c| distance_ok(s, c, start, here));
+        }
+        // W8c: mount reported by mounting an entity (mob or player, vehicle carrying the player).
+        if std::mem::take(&mut self.prog.ride_started) && self.trig_active("minecraft:started_riding") {
+            self.trigger("minecraft:started_riding", &|_, _| true);
+        }
+        // Item in use (`using_item`, each tick of use).
+        if self.life.vit.using.is_some() && self.trig_active("minecraft:using_item") {
+            let hand = self.life.vit.using.map_or(0, |u| u.0);
+            let s = if hand == 1 { self.slots[45].clone() } else { self.slots[36 + self.held as usize].clone() };
+            self.trigger("minecraft:using_item", &|sv, c| sv.item_ok(c.get("item"), s.as_ref()));
+        }
+    }
+
+    /// Player's world part, at its rank, in the game's order: `tick`, `levitation`, fall start,
+    /// vehicle in lava.
+    pub(crate) fn trig_world_part(&mut self) {
+        if self.trig_active("minecraft:tick") {
+            self.trigger("minecraft:tick", &|_, _| true);
         }
         // W8c: levitation (`levitation`): start noted when the effect is added, forgotten at
         // removal; each tick, distance traveled and duration.
@@ -116,6 +116,22 @@ impl Server {
                 distance_ok(s, c, start, here) && ints(c.get("duration"), dur)
             });
         }
+        // Fall start (the landing counts in the player's own tick: `trig_tick`).
+        let fall = self.life.vit.fall;
+        if fall > 0.0 && self.prog.fall_start.is_none() {
+            self.prog.fall_start = Some(self.pos);
+            // W8c: fall started above the impact point of an explosion
+            // (`fall_after_explosion`); the impact is forgotten in all cases.
+            if let Some((imp, cause)) = self.prog.expl_impact.take()
+                && imp[1] <= self.pos[1]
+                && self.trig_active("minecraft:fall_after_explosion")
+            {
+                let here = self.pos;
+                self.trigger("minecraft:fall_after_explosion", &|s, c| {
+                    distance_ok(s, c, imp, here) && typed_cause_ok(s, c.get("cause"), cause.as_deref())
+                });
+            }
+        }
         // W8c: vehicle in lava (`ride_entity_in_lava`): entry noted at the first tick,
         // trigger on the following ones, forgotten as soon as the vehicle leaves it or one dismounts.
         let veh_in_lava =
@@ -132,16 +148,6 @@ impl Server {
             }
         } else {
             self.prog.lava_ride = None;
-        }
-        // W8c: mount reported by mounting an entity (mob or player, vehicle carrying the player).
-        if std::mem::take(&mut self.prog.ride_started) && self.trig_active("minecraft:started_riding") {
-            self.trigger("minecraft:started_riding", &|_, _| true);
-        }
-        // Item in use (`using_item`, each tick of use).
-        if self.life.vit.using.is_some() && self.trig_active("minecraft:using_item") {
-            let hand = self.life.vit.using.map_or(0, |u| u.0);
-            let s = if hand == 1 { self.slots[45].clone() } else { self.slots[36 + self.held as usize].clone() };
-            self.trigger("minecraft:using_item", &|sv, c| sv.item_ok(c.get("item"), s.as_ref()));
         }
     }
 

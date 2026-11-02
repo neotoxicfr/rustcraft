@@ -174,7 +174,7 @@ fn spit(owner: i32, pos: [f64; 3], vel: [f64; 3], tick: i32) -> Spit {
         removed: false,
         left_owner: true,
         tick,
-        born: 0,
+        rank: 0,
     }
 }
 

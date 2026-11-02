@@ -32,6 +32,8 @@ pub struct Crystal {
     pub seen: bool,
     meta_dirty: bool,
     nbt: Nbt,
+    /// Rank in the entity walk (`walk::next_rank`), stamped when it enters the list.
+    pub(crate) rank: u64,
 }
 
 impl Crystal {
@@ -51,6 +53,7 @@ impl Crystal {
             seen: false,
             meta_dirty: false,
             nbt: Nbt::Compound(Vec::new()),
+            rank: crate::walk::next_rank(),
         }
     }
 
@@ -106,27 +109,27 @@ impl Crystal {
 }
 
 impl Server {
-    /// Crystal tick: fire under the crystal during a fight (air cell).
-    pub(crate) fn crystals_tick(&mut self) {
+    /// Crystal of slot `i`, at its rank in the entity walk: fire under the crystal during a
+    /// fight (air cell).
+    pub(crate) fn crystal_visit(&mut self, i: usize) {
+        let Some(c) = self.mobs.end.crystals.get(i).filter(|c| !c.removed) else { return };
         // G3-F13: a crystal outside a "ticking entities" chunk waits (age included).
-        let fight = self.mobs.end.fight.is_some();
-        let n = self.mobs.end.crystals.len();
-        for i in 0..n {
-            let c = &self.mobs.end.crystals[i];
-            if c.removed || !self.entity_ticks_at(c.pos) {
-                continue;
-            }
-            let c = &mut self.mobs.end.crystals[i];
-            c.time += 1;
-            if !fight {
-                continue;
-            }
-            // Its chunk is loaded (ticking test above).
-            let p = c.block_pos();
-            if self.is_air(p) {
-                let f = self.fire_state_for(p);
-                self.set_block(p, f, crate::blocks::flag::ALL);
-            }
+        let (ticking, mut rank) = (self.entity_ticks_at(c.pos), c.rank);
+        let meet = self.meet(&mut rank, ticking, crate::walk::Fam::Crystal);
+        let c = &mut self.mobs.end.crystals[i];
+        c.rank = rank;
+        if meet != crate::walk::Meet::Tick {
+            return;
+        }
+        c.time += 1;
+        if self.mobs.end.fight.is_none() {
+            return;
+        }
+        // Its chunk is loaded (ticking test above).
+        let p = c.block_pos();
+        if self.is_air(p) {
+            let f = self.fire_state_for(p);
+            self.set_block(p, f, crate::blocks::flag::ALL);
         }
     }
 

@@ -180,6 +180,8 @@ pub struct Cart {
     pub track: CTrack,
     /// Piston pushes of the current tick (its own cap).
     pub piston_deltas: rc_physics::piston::PistonDeltas,
+    /// Rank in the entity walk (`walk::next_rank`), stamped when it enters the list.
+    pub(crate) rank: u64,
 }
 
 /// Minecarts of the open world (exchanged with the dimension, like projectiles).
@@ -271,6 +273,7 @@ impl Cart {
             meta: Vec::new(),
             track: CTrack::default(),
             piston_deltas: Default::default(),
+            rank: 0,
         };
         c.define_meta();
         c
@@ -410,42 +413,65 @@ impl Server {
         if self.cart_visible(&c) {
             self.cart_pair(&mut c);
         }
-        self.carts.list.push(Some(Box::new(c)));
+        self.cart_push(Box::new(c));
     }
 
-    /// Tick of the minecarts (path of command block minecarts, once per world tick):
-    /// network tracking of the previous state, then tick of each in an active chunk, passengers
-    /// included, then removals.
+    /// At the end of the list, with its rank in the entity walk.
+    pub(crate) fn cart_push(&mut self, mut c: Box<Cart>) {
+        c.rank = crate::walk::next_rank();
+        self.carts.list.push(Some(c));
+    }
+
+    /// The minecarts as their own walk (tests): network tracking of the previous state, then
+    /// tick of each in an active chunk, passengers included, then removals.
+    #[cfg(test)]
     pub(crate) fn minecarts_tick(&mut self) {
-        let runs = self.cmd.ticking.runs();
-        let player_cart = self.pcart.vehicle;
-        // Network tracking BEFORE the tick, like the official server (entity tracking comes before
-        // their tick): the client receives the state of the previous tick.
+        self.walk_alone(crate::walk::bit(crate::walk::Fam::Cart), Self::carts_track, Self::carts_post);
+    }
+
+    /// Network tracking BEFORE the walk, like the official server (entity tracking comes before
+    /// their tick): the client receives the state of the previous tick.
+    pub(crate) fn carts_track(&mut self) {
         for i in 0..self.carts.list.len() {
             let Some(mut c) = self.carts.list[i].take() else { continue };
             self.cart_send_changes(&mut c);
             self.carts.list[i] = Some(c);
         }
-        // Snapshot: minecarts added during this tick wait for the next.
-        let n = self.carts.list.len();
-        for i in 0..n {
-            let Some(mut cart) = self.carts.list.get_mut(i).and_then(Option::take) else { continue };
-            let ticking = self.entity_ticks_at(cart.pos);
-            if cart.removed || (!runs && player_cart != Some(cart.id)) || !ticking {
-                self.carts.list[i] = Some(cart);
-                continue;
-            }
-            let id = cart.id;
-            cart.old_pos = cart.pos;
-            cart.yaw_o = cart.yaw;
-            cart.tick_count += 1;
-            self.carts.ticking_index = Some(i);
-            self.cart_tick(&mut cart);
-            self.carts.ticking_index = None;
+    }
+
+    /// Minecart of slot `i`, at its rank in the entity walk (once per world tick, command block
+    /// ones included). Frozen (`tick freeze`), only one carrying the player ticks, even through
+    /// another passenger.
+    pub(crate) fn cart_visit(&mut self, i: usize) {
+        let Some(mut cart) = self.carts.list.get_mut(i).and_then(Option::take) else { return };
+        let frozen = !self.cmd.ticking.runs()
+            && self.pcart.vehicle != Some(cart.id)
+            && !self.passengers_carry_player(&cart.passengers, cart.id);
+        if cart.removed || frozen {
             self.carts.list[i] = Some(cart);
-            self.cart_run_pending_command(id);
-            self.cart_tick_passengers(id);
+            return;
         }
+        let ticking = self.entity_ticks_at(cart.pos);
+        if self.meet(&mut cart.rank, ticking, crate::walk::Fam::Cart) != crate::walk::Meet::Tick {
+            self.carts.list[i] = Some(cart);
+            return;
+        }
+        let id = cart.id;
+        cart.old_pos = cart.pos;
+        cart.yaw_o = cart.yaw;
+        cart.tick_count += 1;
+        self.carts.ticking_index = Some(i);
+        self.cart_tick(&mut cart);
+        self.carts.ticking_index = None;
+        if let Some(slot) = self.carts.list.get_mut(i) {
+            *slot = Some(cart);
+        }
+        self.cart_run_pending_command(id);
+        self.cart_tick_passengers(id);
+    }
+
+    /// After the entity walk: the player's minecart, removals.
+    pub(crate) fn carts_post(&mut self) {
         self.cart_player_tick();
         let mut gone = Vec::new();
         let mut removed = Vec::new();

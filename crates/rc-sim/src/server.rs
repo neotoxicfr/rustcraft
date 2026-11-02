@@ -268,9 +268,9 @@ pub struct Server {
     pub(crate) life: Box<crate::life::Life>,
     /// Mobs (S4, `mobs/`).
     pub(crate) mobs: Box<crate::mobs::Mobs>,
-    /// Entity walk of the tick in progress (a single counter for all dimensions): what is born
-    /// in it waits for the next tick (`mobs::Walk`).
-    pub(crate) walk: crate::mobs::Walk,
+    /// Entity walk of the tick in progress (`walk.rs`): what is born in it waits for the next
+    /// tick; the host player's rank in its world's list.
+    pub(crate) walk: crate::walk::Walk,
     /// Simulated decorations (paintings, frames, armor stands, cushions, `decoration/`).
     pub(crate) deco: Box<crate::decoration::Decos>,
     /// Generation of missing chunks (`generation.rs`).
@@ -437,7 +437,7 @@ impl Server {
             cmd,
             life,
             mobs: Box::default(),
-            walk: crate::mobs::Walk::default(),
+            walk: crate::walk::Walk::default(),
             deco: Box::default(),
             proj: Box::default(),        // S8
             proj_player: Box::default(), // S8
@@ -1177,24 +1177,16 @@ impl Server {
             self.end_fight_tick(); // F15: dragon fight, before the entities
         }
         self.bs.handling_tick = false;
-        // Entity walk: falling blocks and TNT first; it ends after the projectiles and clouds.
-        self.walk.start();
-        if runs {
-            self.tick_sim_entities();
-        }
         if let Some((_, _, at)) = self.teleport
             && self.tick > at + 20
         {
             self.teleport = self.teleport.map(|(n, p, _)| (n, p, self.tick));
             self.send_teleport();
         }
-        self.tick_mining();
-        self.demo_tick(); // demo mode: after mining, like the game
-        self.life_tick(); // S2: items, health, menus
-        self.mobs_tick(); // S4: mobs
-        self.deco_tick(); // decorations: survival of what is attached
-        self.command_minecarts_tick(); // G5-F06: minecarts (command block included), once per tick
-        self.projectiles_tick(); // S8: projectiles, clouds, fishing
+        // Entity walk (`walk.rs`): every entity of the world in the order it joined the
+        // world's list, every kind together, the player's world part at its rank (mining, demo,
+        // menu broadcast, advancements sent); then the player's health, pushes and pickups.
+        self.tick_entities();
         // Block entities after all the entities, like the game: a piston pushes an entity
         // after its own movement of the tick (slime momentum consumed on the next tick); one
         // list for every family (furnaces, brewing stands, bells and spawner blocks included).
@@ -1205,7 +1197,7 @@ impl Server {
         self.lodestone_compass_tick(); // G5-F10: lodestone compasses
         self.dims_tick(); // S6: portals, parked dimensions
         self.commands_tick(); // S5 : suggestions, scores
-        self.progress_tick(); // S9: time statistics, triggers, sending of advancements
+        self.progress_tick(); // S9: time statistics, triggers of the player's own tick
         if runs {
             self.gametest_tick(); // G3-F06: in-game tests, after the world and the players
         }

@@ -23,15 +23,16 @@ pub struct Bolt {
     life: i32,
     flashes: i32,
     rng: JRand,
-    pos: [f64; 3],
+    pub(crate) pos: [f64; 3],
     visual: bool,
     /// Thrown by the player (channeling): `channeled_lightning` progress on every strike.
     cause: bool,
     /// Cells set on fire and entities struck.
     fires: i32,
     hit: Vec<Ent>,
-    /// Number of the entity walk it was born in (0: outside the walk), read by `mobs::Walk`.
-    pub(crate) born: u64,
+    /// Rank in the entity walk (`walk::next_rank`); spent (removed after the walk).
+    pub(crate) rank: u64,
+    removed: bool,
 }
 
 impl Server {
@@ -168,7 +169,6 @@ impl Server {
             data: 0,
         };
         let _ = self.send(Event::Entity(EntityEvent::Add(Box::new(add))));
-        let born = self.walk.born();
         self.mobs.mounts.bolts.push(Bolt {
             id,
             uuid,
@@ -180,23 +180,38 @@ impl Server {
             cause,
             fires: 0,
             hit: Vec::new(),
-            born,
+            rank: crate::walk::next_rank(),
+            removed: false,
         });
     }
 
-    /// Life of the lightning bolts: at the first tick fire (normal and hard),
+    /// The lightning bolts as their own walk (tests).
+    #[cfg(test)]
+    pub(crate) fn bolts_tick(&mut self) {
+        self.walk_alone(crate::walk::bit(crate::walk::Fam::Bolt), |_| {}, Self::bolts_post);
+    }
+
+    /// Bolt of slot `i`, at its rank in the entity walk (a thunderstorm's, struck before the
+    /// walk, ticks in it; a trap's or a channeling trident's, born during it, on the next one).
+    /// The list is taken out during its tick (newcomers appended after).
+    pub(crate) fn bolt_visit(&mut self, i: usize) {
+        let mut bolts = std::mem::take(&mut self.mobs.mounts.bolts);
+        if let Some(b) = bolts.get_mut(i).filter(|b| !b.removed) {
+            self.bolt_tick(b);
+        }
+        bolts.append(&mut self.mobs.mounts.bolts);
+        self.mobs.mounts.bolts = bolts;
+    }
+
+    /// Life of a lightning bolt: at the first tick fire (normal and hard),
     /// lightning rod, scraped copper, `lightning_strike` event; while life is positive,
     /// all entities in the 6×12×6 box are struck; removed once the flashes are used up.
-    pub(crate) fn bolts_tick(&mut self) {
-        let mut bolts = std::mem::take(&mut self.mobs.mounts.bolts);
-        let mut gone = Vec::new();
-        for b in &mut bolts {
-            // Born during this entity walk (skeleton horse trap): it waits for the next tick.
-            // Thunderstorm (before the walk): right away; channeling (during the projectiles,
-            // after this tick): on the next tick without being skipped.
-            // G3-F13: outside a "ticking entities" chunk, it waits too.
-            if self.walk.waits(std::mem::take(&mut b.born)) || !self.entity_ticks_at(b.pos) {
-                continue;
+    fn bolt_tick(&mut self, b: &mut Bolt) {
+        {
+            // G3-F13: outside a "ticking entities" chunk, it waits.
+            let ticking = self.entity_ticks_at(b.pos);
+            if self.meet(&mut b.rank, ticking, crate::walk::Fam::Bolt) != crate::walk::Meet::Tick {
+                return;
             }
             if b.life == 2 {
                 if self.level.difficulty_id() >= 2 {
@@ -211,7 +226,7 @@ impl Server {
             b.life -= 1;
             if b.life < 0 {
                 if b.flashes == 0 {
-                    gone.push(b.id);
+                    b.removed = true;
                     self.bolt_vanish_trigger(b);
                 } else if b.life < -b.rng.next_int_bound(10) {
                     b.flashes -= 1;
@@ -224,12 +239,16 @@ impl Server {
                 self.bolt_strike_entities(b);
             }
         }
-        bolts.append(&mut self.mobs.mounts.bolts);
-        self.mobs.mounts.bolts = bolts;
-        if !gone.is_empty() {
-            self.mobs.mounts.bolts.retain(|b| !gone.contains(&b.id));
-            let _ = self.send(Event::Entity(EntityEvent::Remove(gone)));
+    }
+
+    /// Spent lightning bolts, after the entity walk.
+    pub(crate) fn bolts_post(&mut self) {
+        if !self.mobs.mounts.bolts.iter().any(|b| b.removed) {
+            return;
         }
+        let gone: Vec<i32> = self.mobs.mounts.bolts.iter().filter(|b| b.removed).map(|b| b.id).collect();
+        self.mobs.mounts.bolts.retain(|b| !b.removed);
+        let _ = self.send(Event::Entity(EntityEvent::Remove(gone)));
     }
 
     /// Fire on the lightning's cell then `extra` neighboring cells drawn (±1), if

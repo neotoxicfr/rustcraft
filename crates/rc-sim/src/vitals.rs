@@ -1130,9 +1130,7 @@ impl Server {
         if self.life.vit.age.is_multiple_of(20) {
             self.combat_recheck(); // W8a: end of combat after 5 s (15 s in combat) without a hit
         }
-        if self.life.vit.cooldown > 0 {
-            self.life.vit.cooldown -= 1;
-        }
+        // The damage cooldown counts down in the player's world part (`player_world_rest`).
         if self.life.vit.dead {
             self.life.vit.death_time += 1;
             // End of death (20 ticks): the player is removed from the world like any living entity
@@ -1593,6 +1591,8 @@ impl Server {
         self.joined_tick = self.tick;
         self.mining = None; // new player: mining and tick counter restart from zero
         self.mine_ticks = 0;
+        // New player entity: it joins the end of the world's entity list.
+        self.walk.player = crate::walk::next_rank();
         // Demo: fresh state like the recreated player (the welcome screen returns 20 ticks later).
         self.demo = crate::demo::Demo::default();
         self.sent.clear();

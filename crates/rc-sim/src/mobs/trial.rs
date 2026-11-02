@@ -45,6 +45,9 @@ struct OminousItem {
     item: Stack,
     after: i64,
     age: i64,
+    /// Rank in the entity walk (`walk::next_rank`); released (removed after the walk).
+    rank: u64,
+    removed: bool,
 }
 
 /// Settings of a trial spawner (normal or ominous).
@@ -916,41 +919,67 @@ impl Server {
         let net = self.net(Some(&item));
         let _ = self
             .send(rc_client::Event::Entity(rc_client::EntityEvent::Data { id, values: vec![(8, Meta::Item(net))] }));
-        self.mobs.spawners.blocks.items.push(OminousItem { id, uuid, pos, item, after, age: 0 });
+        let rank = crate::walk::next_rank();
+        self.mobs.spawners.blocks.items.push(OminousItem { id, uuid, pos, item, after, age: 0, rank, removed: false });
     }
 
-    /// Tick of the ominous item spawners (entities, after the mobs).
+    /// The ominous item spawners as their own walk (tests).
+    #[cfg(test)]
     pub(crate) fn ominous_items_tick(&mut self) {
-        if self.mobs.spawners.blocks.items.is_empty() {
-            return;
-        }
+        self.walk_alone(crate::walk::bit(crate::walk::Fam::Ominous), |_| {}, Self::ominous_items_post);
+    }
+
+    pub(crate) fn ominous_len(&self) -> usize {
+        self.mobs.spawners.blocks.items.len()
+    }
+
+    pub(crate) fn ominous_rank(&self, i: usize) -> Option<u64> {
+        self.mobs.spawners.blocks.items.get(i).map(|o| o.rank)
+    }
+
+    pub(crate) fn ominous_pos(&self, i: usize) -> Option<[f64; 3]> {
+        self.mobs.spawners.blocks.items.get(i).map(|o| o.pos)
+    }
+
+    pub(crate) fn ominous_rank_mut(&mut self, i: usize) -> Option<&mut u64> {
+        self.mobs.spawners.blocks.items.get_mut(i).map(|o| &mut o.rank)
+    }
+
+    pub(crate) fn ominous_resort(&mut self) {
+        self.mobs.spawners.blocks.items.sort_by_key(|o| o.rank);
+    }
+
+    /// Ominous item spawner of slot `i`, at its rank in the entity walk. The list is taken out
+    /// during its tick (newcomers appended after).
+    pub(crate) fn ominous_visit(&mut self, i: usize) {
         let mut list = std::mem::take(&mut self.mobs.spawners.blocks.items);
-        let mut gone = Vec::new();
-        list.retain_mut(|o| {
+        if let Some(o) = list.get_mut(i).filter(|o| !o.removed) {
             // Outside a "ticking entities" chunk, it waits (G3-F13).
-            if !self.entity_ticks_at(o.pos) {
-                return true;
+            let ticking = self.entity_ticks_at(o.pos);
+            if self.meet(&mut o.rank, ticking, crate::walk::Fam::Ominous) == crate::walk::Meet::Tick {
+                o.age += 1;
+                if o.age == o.after - 36 {
+                    let at = center(block_of(o.pos));
+                    self.world_sound("minecraft:block.trial_spawner.about_to_spawn_item", 6, at, 1.0, 1.0);
+                }
+                if o.age >= o.after {
+                    self.ominous_item_release(o);
+                    o.removed = true;
+                }
             }
-            o.age += 1;
-            if o.age == o.after - 36 {
-                self.world_sound(
-                    "minecraft:block.trial_spawner.about_to_spawn_item",
-                    6,
-                    center(block_of(o.pos)),
-                    1.0,
-                    1.0,
-                );
-            }
-            if o.age >= o.after {
-                self.ominous_item_release(o);
-                gone.push(o.id);
-                return false;
-            }
-            true
-        });
+        }
         list.append(&mut self.mobs.spawners.blocks.items);
         self.mobs.spawners.blocks.items = list;
-        if !gone.is_empty() {
+    }
+
+    /// Released ominous item spawners, after the entity walk.
+    pub(crate) fn ominous_items_post(&mut self) {
+        if !self.mobs.spawners.blocks.items.iter().any(|o| o.removed) {
+            return;
+        }
+        let gone: Vec<i32> = self.mobs.spawners.blocks.items.iter().filter(|o| o.removed).map(|o| o.id).collect();
+        self.mobs.spawners.blocks.items.retain(|o| !o.removed);
+        {
             let _ = self.send(rc_client::Event::Entity(rc_client::EntityEvent::Remove(gone)));
         }
     }
@@ -1493,7 +1522,16 @@ mod tests {
     fn ominous_arrow_first_tick_on_next_server_tick() {
         let Some((mut p, dir)) = probe("g4f07b-ominous") else { return };
         let item = Stack { id: "minecraft:arrow".into(), count: 1, components: None };
-        let o = OminousItem { id: 9_000_100, uuid: 9_000_100, pos: [216.5, -55.0, 214.5], item, after: 1, age: 0 };
+        let o = OminousItem {
+            id: 9_000_100,
+            uuid: 9_000_100,
+            pos: [216.5, -55.0, 214.5],
+            item,
+            after: 1,
+            age: 0,
+            rank: crate::walk::next_rank(),
+            removed: false,
+        };
         p.s.mobs.spawners.blocks.items.push(o);
         p.s.game_tick();
         p.s.tick += 1;
