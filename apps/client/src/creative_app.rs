@@ -200,7 +200,9 @@ impl App {
                 return false;
             }
             let before = self.creative_ui.search.text.clone();
-            self.creative_ui.search.insert(t);
+            if let Some(t) = crate::widgets::chat_typed(t) {
+                self.creative_ui.search.insert(&t);
+            }
             if self.creative_ui.search.text != before {
                 self.creative_search_changed();
             }
@@ -295,9 +297,9 @@ impl App {
                 }
                 let (_, changed) = self.creative_ui.search.key(k, self.mods);
                 let mut changed = changed;
-                if let Some(t) = crate::widgets::typed_text(event, self.mods) {
+                if let Some(t) = crate::widgets::typed_text(event, self.mods).and_then(crate::widgets::chat_typed) {
                     let before = self.creative_ui.search.text.clone();
-                    self.creative_ui.search.insert(t);
+                    self.creative_ui.search.insert(&t);
                     changed |= self.creative_ui.search.text != before;
                 }
                 if changed {

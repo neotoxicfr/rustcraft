@@ -849,8 +849,8 @@ impl Book {
                 return out;
             }
             let (used, _) = t.key(k, mods);
-            if !used && let Some(s) = text {
-                t.insert(s);
+            if !used && let Some(s) = text.and_then(crate::widgets::chat_typed) {
+                t.insert(&s);
             }
             return out;
         }
@@ -868,8 +868,8 @@ impl Book {
         let page = self.page;
         let (Mode::Edit { pages, area, .. }, Some(gui)) = (&mut self.mode, gui) else { return out };
         let mut changed = area.key(gui, k, mods);
-        if let Some(s) = text {
-            changed |= area.insert(gui, s);
+        if let Some(s) = text.and_then(crate::widgets::chat_typed) {
+            changed |= area.insert(gui, &s);
         }
         if changed {
             pages[page] = area.value();

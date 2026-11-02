@@ -333,6 +333,14 @@ pub fn keep_typed<'a>(text: Option<&'a str>, all_mods: Option<&'a str>, mods: Mo
     t.filter(|t| text_event(t))
 }
 
+/// Characters of a keystroke that reach a field: the game types character by character and only
+/// the chat ones (`§`, controls below space, DEL and line breaks refused), so a refused key leaves
+/// the field, selection included, as it was. None when nothing is left.
+pub(crate) fn chat_typed(s: &str) -> Option<String> {
+    let t: String = s.chars().filter(|&c| rc_text::allowed_chat_char(c)).collect();
+    (!t.is_empty()).then_some(t)
+}
+
 /// Text event (keystroke or IME commit) kept as typed input. Like the game's windowing layer, an
 /// event is dropped whole when empty or when its first character is a C0 control or DEL; C1
 /// controls (U+0080 to U+009F) go through, and each field then filters character by character
@@ -1143,9 +1151,10 @@ impl Panel {
         if let Some(i) = self.focus
             && let Kind::Field(t) = &mut self.widgets[i].kind
             && t.editable
+            && let Some(s) = chat_typed(s)
         {
             let before = t.text.len();
-            t.insert(s);
+            t.insert(&s);
             if t.text.len() != before {
                 out.push(Event::Edit(self.widgets[i].id));
             }
@@ -1715,6 +1724,18 @@ mod tests {
         let mut t = TextField::new(Vec::new());
         t.insert(keep_typed(Some("\u{9f}a\u{1}§"), None, none).unwrap());
         assert_eq!(t.value(), "\u{9f}a");
+    }
+
+    #[test]
+    fn refused_keystroke_keeps_the_selection() {
+        assert_eq!(chat_typed("a\nb§\u{7f}"), Some("ab".to_string()));
+        let mut t = TextField::new(Vec::new());
+        t.insert("abc");
+        t.key(KeyCode::KeyA, ModifiersState::CONTROL);
+        if let Some(s) = chat_typed("§") {
+            t.insert(&s);
+        }
+        assert_eq!((t.value(), t.anchor, t.cursor), ("abc".to_string(), 0, 3));
     }
 
     #[test]
