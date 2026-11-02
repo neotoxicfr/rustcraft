@@ -39,6 +39,9 @@ mod solo_packets;
 mod tech_blocks; // G6-F14: structure, jigsaw and test blocks, live templates
 #[cfg(test)]
 mod tests_g6f14;
+mod gametest; // G3-F06: test instances, environments, `/test` runner
+#[cfg(test)]
+mod tests_g3f06;
 // Survival loop (milestone 2, S2).
 pub mod book;
 pub mod containers;

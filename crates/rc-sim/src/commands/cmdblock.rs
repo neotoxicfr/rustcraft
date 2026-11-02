@@ -9,7 +9,7 @@ use rc_proto::{BlockPos, Decode, Reader, read_str};
 use rc_text::Component;
 
 use super::src::{Origin, Src};
-use super::text::{GRAY, lit};
+use super::text::lit;
 use crate::blocks::Dir;
 use crate::nbtio::{int, set};
 use crate::server::Server;
@@ -234,28 +234,21 @@ impl Server {
         }
     }
 
-    /// Output of a command block: `LastOutput` (tracking enabled) and broadcast to the operators.
+    /// Output of a command block. A command block tracking its output keeps it in `LastOutput`: a failure always, a success
+    /// when `send_command_feedback` allows it (`command_block_output` only governs the relay to
+    /// the operators, `ok`). Without tracking, the block has no output at all.
     pub(crate) fn cb_output(&mut self, p: [i32; 3], msg: Component, success: bool) {
-        if success && !self.rule("minecraft:command_block_output", true) {
+        if !self.cb_tracks_output(p) || (success && !self.rule("minecraft:send_command_feedback", true)) {
             return;
         }
-        let track = self.be_get(p).and_then(|b| int(b, "TrackOutput")).is_none_or(|v| v != 0);
-        if track {
-            let now = chrono_hms();
-            let mut c = lit(format!("[{now}] "));
-            c.extra.push(msg.clone());
-            self.cb_set(p, "LastOutput", crate::commands::text::to_nbt(&c));
-        }
-        if success && self.rule("minecraft:send_command_feedback", true) && self.cmd.op >= 2 {
-            let name = self
-                .be_get(p)
-                .and_then(|b| b.get("CustomName").and_then(rc_text::from_nbt))
-                .unwrap_or_else(|| lit("@"));
-            let mut c = tr!("chat.type.admin", name, msg);
-            c.style.color = Some(GRAY);
-            c.style.italic = Some(true);
-            self.system(c);
-        }
+        let now = chrono_hms();
+        let mut c = lit(format!("[{now}] "));
+        c.extra.push(msg);
+        self.cb_set(p, "LastOutput", crate::commands::text::to_nbt(&c));
+    }
+
+    pub(crate) fn cb_tracks_output(&self, p: [i32; 3]) -> bool {
+        self.be_get(p).and_then(|b| int(b, "TrackOutput")).is_none_or(|v| v != 0)
     }
 
     /// Operator (level 2) in creative: placement and data of the game master blocks.

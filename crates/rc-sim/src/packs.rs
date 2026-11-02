@@ -573,6 +573,44 @@ fn zip_files(path: &Path) -> std::vec::IntoIter<(String, Arc<[u8]>)> {
     out.into_iter()
 }
 
+/// File of the pack stack outside the stacked JSON (`data/<ns>/structure/<path>.nbt`).
+#[derive(Debug, PartialEq)]
+pub(crate) enum StackFile {
+    /// Taken from the game's base pack (the caller reads its own copy).
+    Base,
+    Bytes(Arc<[u8]>),
+}
+
+/// Looks `key` up in the chosen packs like the game's resource manager: the top pack first (its
+/// overlays, the last one first, before its `data/` folder), a pack's `filter` hiding the file
+/// of every pack below it. `jar`: entry of the game's jar (built-in feature packs). Read on
+/// demand, never kept: a world's datapacks can carry many large templates.
+pub(crate) fn stack_file(
+    avail: &[Pack],
+    enabled: &[String],
+    key: &str,
+    jar: impl Fn(&str) -> Option<Arc<[u8]>>,
+) -> Option<StackFile> {
+    for id in enabled.iter().rev() {
+        let Some(p) = avail.iter().find(|p| p.id == *id) else { continue };
+        let mut names: Vec<String> = p.overlays.iter().rev().map(|o| format!("{o}/{key}")).collect();
+        names.push(key.to_owned());
+        let found = match &p.loc {
+            Loc::Vanilla => return Some(StackFile::Base),
+            Loc::Jar(prefix) => names.iter().find_map(|n| jar(&format!("{prefix}{n}"))),
+            Loc::Dir(dir) => names.iter().find_map(|n| std::fs::read(dir.join(n)).ok().map(Arc::from)),
+            Loc::Zip(z) => names.iter().find_map(|n| zip_entry(z, n).map(Arc::from)),
+        };
+        if let Some(b) = found {
+            return Some(StackFile::Bytes(b));
+        }
+        if p.filter.as_ref().and_then(rc_data::pack_filter::filter).is_some_and(|f| f.hides_file(key)) {
+            return None;
+        }
+    }
+    None
+}
+
 fn zip_entry(path: &Path, name: &str) -> Option<Vec<u8>> {
     let mut z = zip::ZipArchive::new(std::fs::File::open(path).ok()?).ok()?;
     let mut e = z.by_name(name).ok()?;

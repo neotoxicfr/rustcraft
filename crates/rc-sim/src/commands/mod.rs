@@ -9,6 +9,7 @@
 // Failures carry a component (rare, off the hot path).
 #![allow(clippy::result_large_err)]
 
+pub mod admin;
 pub mod args;
 pub mod cmdblock;
 pub mod cmds_basic;
@@ -32,6 +33,7 @@ pub mod select;
 pub mod snbt;
 pub mod src;
 pub mod suggest;
+pub mod test;
 #[macro_use]
 pub mod text;
 
@@ -135,6 +137,8 @@ pub struct Cmds {
     pub deferred: std::cell::RefCell<Vec<Event>>,
     /// G6-F14: templates known to the server (world, game, structure block captures).
     pub templates: crate::tech_blocks::Templates,
+    /// G3-F06: in-game tests (registries frozen at opening, runner).
+    pub tests: crate::gametest::GameTests,
 }
 
 /// Time marker: clock, identifier, ticks, timeline period, suggested?
@@ -383,6 +387,7 @@ impl Cmds {
             bars_dirty: false,
             deferred: std::cell::RefCell::new(Vec::new()),
             templates: Default::default(),
+            tests: crate::gametest::GameTests::read(jar, regs),
         };
         c.data.teams = c.scores.teams.iter().map(|t| t.name.clone()).collect();
         c.data.players = vec![player.to_owned()];
@@ -616,9 +621,21 @@ impl Server {
         self.in_context(|sv| sv.run_parsed(src, &parsed))
     }
 
-    /// Success message: to the player if the rule allows it, to the output
-    /// of a command block otherwise.
+    /// Success message: to the player if the rule allows it, to the output of a command block
+    /// otherwise; then relayed to the other operators unless the game keeps this message for its
+    /// source (`admin::quiet`).
     pub fn ok(&mut self, src: &Src, msg: Component) {
+        self.success(src, msg, None);
+    }
+
+    /// Success message the game never relays to the other operators (its call says so, for a
+    /// message that other calls do relay: tick status of `tick query`).
+    pub fn ok_quiet(&mut self, src: &Src, msg: Component) {
+        self.success(src, msg, Some(false));
+    }
+
+    /// `relay`: the game's choice for this call, `None` to read it from the message.
+    fn success(&mut self, src: &Src, msg: Component, relay: Option<bool>) {
         // Scoreboard packets first: the game broadcasts them during the operation, before the return.
         self.flush_scores();
         if cmds_ents::trace_message(&msg) {
@@ -627,14 +644,57 @@ impl Server {
         if src.silent {
             return;
         }
+        let feedback = self.rule("minecraft:send_command_feedback", true);
+        // Built before the message moves to the source; the table is read only when an operator
+        // could receive it (never for the host's own commands in singleplayer).
+        let admin = (feedback && self.admin_recipient(src) && relay.unwrap_or_else(|| !admin::quiet(&msg)))
+            .then(|| {
+                let mut c = tr!("chat.type.admin", src.display.clone(), msg.clone());
+                c.style.color = Some(GRAY);
+                c.style.italic = Some(true);
+                c
+            });
         match src.origin {
             Origin::Player => {
-                if self.rule("minecraft:send_command_feedback", true) {
+                if feedback {
                     self.chat_out(Event::Chat { component: msg, tag: ChatTag::System });
                 }
             }
             Origin::Block(p) => self.cb_output(p, msg, true),
             Origin::Minecart(_) | Origin::Server => {}
+        }
+        if let Some(c) = admin {
+            self.to_host(c);
+        }
+    }
+
+    /// Does an operator other than the source receive its relayed successes? The operators of the
+    /// integrated server: the host when the world allows commands (the guests are never on the
+    /// operator list, whatever their permission level). The source must also inform them: a
+    /// player or the server always, a command block (or minecart) with `command_block_output`
+    /// while it tracks its output (without tracking it has no output at all).
+    fn admin_recipient(&self, src: &Src) -> bool {
+        if !self.level.allow_commands {
+            return false;
+        }
+        let host_current = self.lan.as_ref().is_none_or(|l| l.active.is_none());
+        match src.origin {
+            Origin::Player => !host_current,
+            Origin::Server => true,
+            Origin::Block(p) => self.rule("minecraft:command_block_output", true) && self.cb_tracks_output(p),
+            Origin::Minecart(id) => {
+                self.rule("minecraft:command_block_output", true)
+                    && self.cart_ref(id).is_none_or(|c| crate::nbtio::int(&c.nbt, "TrackOutput").is_none_or(|v| v != 0))
+            }
+        }
+    }
+
+    /// System message to the host, whoever the current player is.
+    pub(crate) fn to_host(&self, c: Component) {
+        if self.lan.as_ref().is_some_and(|l| l.active.is_some()) {
+            let _ = self.peer.send(Event::Chat { component: c, tag: ChatTag::System });
+        } else {
+            self.system(c);
         }
     }
 

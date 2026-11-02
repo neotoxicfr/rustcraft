@@ -366,12 +366,13 @@ impl Server {
         Ok(())
     }
 
-    /// Test instance block: the settings (test, size, rotation, entities, status) are applied for
-    /// every action except the initial and size queries; the actions themselves (reset, save,
-    /// export, run) and the status answer belong to the test runner.
+    /// Test instance block: the initial and size queries answer with the test's description
+    /// (and its structure size); the other actions take the screen's settings (test, size,
+    /// rotation, entities, status), then reset, save, export or run the test.
     fn on_test_instance_action(&mut self, r: &mut Reader<'_>) -> rc_proto::Result<()> {
         let bp = BlockPos::decode(r)?;
-        let action = read_varint(r)?;
+        // Unknown action: the first one (initial query), like the game's table.
+        let action = Some(read_varint(r)?).filter(|a| (0..=6).contains(a)).unwrap_or(0);
         let test = if bool::decode(r)? {
             let Some(id) = template_id(read_str(r, 32767)?) else { return Ok(()) };
             Some(id)
@@ -391,24 +392,61 @@ impl Server {
             return Ok(());
         }
         if matches!(action, 0 | 1) {
+            let status = match test.as_deref().and_then(|t| self.cmd.tests.test(t)).cloned() {
+                Some(t) => self.test_description(&t),
+                None => crate::commands::text::colored(tr!("test_instance.description.no_test"), crate::commands::text::RED),
+            };
+            let size = if action == 1 { test.as_deref().and_then(|t| self.test_structure_size(t)) } else { None };
+            let _ = self.send(rc_client::Event::TestInstanceStatus { status: Some(status), size });
             return Ok(());
         }
-        let rot_name = ["none", "clockwise_90", "180", "counterclockwise_90"][rot as usize];
-        let status = ["cleared", "running", "finished"].get(status as usize).copied().unwrap_or("cleared");
-        let mut data = vec![
-            ("size".to_owned(), Nbt::IntArray(size.to_vec())),
-            ("rotation".to_owned(), Nbt::String(rot_name.to_owned())),
-            ("ignore_entities".to_owned(), Nbt::Byte(i8::from(ignore_entities))),
-            ("status".to_owned(), Nbt::String(status.to_owned())),
-        ];
-        if let Some(t) = test {
-            data.insert(0, ("test".to_owned(), Nbt::String(t)));
-        }
-        if let Some(be) = self.be_get_mut(p) {
-            set(be, "data", Nbt::Compound(data));
+        let status = u8::try_from(status).ok().filter(|s| *s <= 2).unwrap_or(0);
+        let data = crate::gametest::Data { test, size, rot, ignore_entities, status, error: None };
+        self.ti_set(p, &data);
+        let mut to_player = |sv: &mut Server, c: rc_text::Component| sv.system(c);
+        match action {
+            3 => self.ti_reset(p, &mut to_player),
+            4 => {
+                self.ti_save(p, &mut to_player);
+            }
+            // Saved to the world's folder; the export of test structures only exists in the
+            // game's development environment.
+            5 => {
+                if self.ti_save(p, &mut to_player).is_some() {
+                    let msg = rc_text::Component::text("Test structure exporting is disabled");
+                    self.system(crate::commands::text::colored(msg, crate::commands::text::RED));
+                }
+            }
+            6 => self.ti_run(p, &mut to_player),
+            _ => {}
         }
         self.send_block_entity(p);
         Ok(())
+    }
+
+    /// Description of a test (its screen): type, function, structure, environment, dimension,
+    /// one line each, values in blue.
+    pub(crate) fn test_description(&self, t: &crate::gametest::TestDef) -> rc_text::Component {
+        use crate::commands::text::{colored, lit};
+        const BLUE: u32 = 0x5555FF;
+        let row = |key: &str, v: rc_text::Component| {
+            let mut c = tr!(key, colored(v, BLUE));
+            c.extra.push(lit("\n"));
+            c
+        };
+        let ty = match t.kind {
+            crate::gametest::Kind::Function(_) => "test_instance.type.function",
+            crate::gametest::Kind::TestBlocks => "test_instance.type.block_based",
+        };
+        let mut info = row("test_instance.description.structure", lit(t.structure.clone()));
+        info.extra.push(row("test_instance.description.batch", lit(t.env.name())));
+        info.extra.push(row("test_instance.description.dimension", lit(t.dimension.clone())));
+        let mut c = row("test_instance.description.type", tr!(ty));
+        if let crate::gametest::Kind::Function(f) = &t.kind {
+            c.extra.push(row("test_instance.description.function", lit(f.clone())));
+        }
+        c.extra.push(info);
+        c
     }
 
     // ---------- Block life ----------
@@ -416,6 +454,10 @@ impl Server {
     /// Default data of a game master block entity just created (values of the game's empty
     /// block entity; the mode comes from the block state).
     pub(crate) fn tech_created(&mut self, p: P, s: u32) {
+        // A new test block entity starts untriggered.
+        if self.v().kind(s) == Kind::Test {
+            self.test_block_mark(p, false);
+        }
         self.tech_defaults(p, s, true);
     }
 
@@ -590,7 +632,8 @@ impl Server {
         }
     }
 
-    /// Trigger of a test block: the start mode powers itself and warns its neighbours; the
+    /// Trigger of a test block: the start mode powers itself and warns its neighbours (the game
+    /// only asks whether a tick is due, so nothing stops its signal before the test ends); the
     /// others are noted as triggered for the test runner (the log mode also writes its message
     /// to the server log, which the integrated server does not keep).
     pub(crate) fn test_block_trigger(&mut self, p: P) {
@@ -602,19 +645,14 @@ impl Server {
             }
             let b = self.v().block(s);
             self.update_neighbors_at(p, b);
+        } else {
+            self.test_block_mark(p, true);
         }
     }
 
-    /// Scheduled tick of a test block: a start block stops emitting (neighbours warned).
-    pub(crate) fn test_block_tick(&mut self, s: u32, p: P) {
-        let start = self.be_get(p).and_then(|b| b.get("mode")).and_then(Nbt::as_str) == Some("start");
-        if start {
-            if let Some(be) = self.be_get_mut(p) {
-                set(be, "powered", Nbt::Byte(0));
-            }
-            let b = self.v().block(s);
-            self.update_neighbors_at(p, b);
-        }
+    /// Scheduled tick of a test block: reset (no longer triggered, a start block stops emitting).
+    pub(crate) fn test_block_tick(&mut self, _s: u32, p: P) {
+        self.test_block_reset(p);
     }
 
     /// Signal of a test block: 15 in start mode while powered, otherwise nothing.
@@ -664,9 +702,25 @@ impl Server {
     fn structure_save(&mut self, p: P, sb: &Sb, to_disk: bool) -> bool {
         let Some(id) = sb.name.clone() else { return false };
         let origin = [p[0] + sb.pos[0], p[1] + sb.pos[1], p[2] + sb.pos[2]];
+        self.template_capture(&id, origin, sb.size, !sb.ignore_entities, &sb.author, to_disk, false)
+    }
+
+    /// Capture of an area into the named template (structure voids left out, air too if
+    /// `skip_air`), kept by the server and written to the world's folder if `to_disk`. An area
+    /// without volume leaves the template as it was (created empty if new).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn template_capture(
+        &mut self,
+        id: &str,
+        origin: P,
+        size: [i32; 3],
+        entities: bool,
+        author: &str,
+        to_disk: bool,
+        skip_air: bool,
+    ) -> bool {
         let Some((wd, _)) = self.place_data() else { return false };
-        // An area without volume leaves the template as it was (created empty if new).
-        let mut entry = match self.template_get(&id) {
+        let mut entry = match self.template_get(id) {
             Some(e) => e,
             None => {
                 let empty = Template::parse(&self.empty_template_root(), &wd.blocks).ok().map(Arc::new);
@@ -674,20 +728,20 @@ impl Server {
                 Tpl { t, author: "?".into() }
             }
         };
-        if sb.size.iter().all(|&v| v >= 1) {
-            let root = self.capture_area(origin, sb.size, !sb.ignore_entities, &wd.blocks);
+        if size.iter().all(|&v| v >= 1) {
+            let root = self.capture_area(origin, size, entities, skip_air, &wd.blocks);
             match Template::parse(&root, &wd.blocks) {
                 Ok(t) => entry.t = Arc::new(t),
                 Err(_) => return false,
             }
         }
-        entry.author = sb.author.clone();
+        entry.author = author.to_owned();
         let t = entry.t.clone();
-        self.cmd.templates.map.insert(id.clone(), Some(entry));
+        self.cmd.templates.map.insert(id.to_owned(), Some(entry));
         if !to_disk {
             return true;
         }
-        self.template_write(&id, &t)
+        self.template_write(id, &t)
     }
 
     /// Writes a template to `generated/<ns>/structure/<path>.nbt` (compressed NBT).
@@ -826,14 +880,44 @@ impl Server {
         loaded
     }
 
+    /// The world's `generated` folder (an unreadable file passes on to the next source), then the
+    /// chosen packs: the top pack holding the file (`data/<ns>/structure/<path>.nbt`), the game's
+    /// base pack last.
     fn template_load(&mut self, id: &str) -> Option<Tpl> {
         let (wd, _) = self.place_data()?;
         let world = template_file(&self.world, id)
             .and_then(|f| crate::nbtio::read_dat(&f).ok())
             .and_then(|root| Template::parse(&root, &wd.blocks).ok())
             .map(Arc::new);
-        let t = world.or_else(|| wd.templates.get(id, &wd.blocks))?;
+        let t = match world {
+            Some(t) => t,
+            None => match self.pack_template_file(id)? {
+                crate::packs::StackFile::Base => wd.templates.get(id, &wd.blocks)?,
+                crate::packs::StackFile::Bytes(b) => {
+                    let raw = crate::nbtio::decompress_auto(&b).ok()?;
+                    let root = crate::nbtio::parse_root(&raw).ok()?;
+                    Arc::new(Template::parse(&root, &wd.blocks).ok()?)
+                }
+            },
+        };
         Some(Tpl { t, author: "?".into() })
+    }
+
+    /// Template file in the chosen packs; only the base pack when no other is chosen (no folder
+    /// listed).
+    fn pack_template_file(&self, id: &str) -> Option<crate::packs::StackFile> {
+        let enabled = crate::packs::config_of(self.level.root.get("Data")).0;
+        if enabled.len() <= 1 && enabled.first().is_none_or(|e| e == "vanilla") {
+            return Some(crate::packs::StackFile::Base);
+        }
+        // Same path checks as the world's folder: no empty, `.` or `..` part (a pack folder is
+        // never left), no reserved name.
+        template_file(&self.world, id)?;
+        let (ns, path) = id.split_once(':')?;
+        let key = format!("data/{ns}/structure/{path}.nbt");
+        let repo = crate::packs::with_world(&self.cmd.builtin_packs, &self.world);
+        let jar = crate::registries::client_jar(&self.data).and_then(|j| rc_data::jar::index(&j).ok());
+        crate::packs::stack_file(&repo, &enabled, &key, |name| jar.as_ref()?.get(name).map(rc_data::jar::Blob::bytes))
     }
 
     fn empty_template_root(&self) -> Nbt {
@@ -865,11 +949,12 @@ impl Server {
     /// voids (air included, cells beyond the build height read as void air), in placement order
     /// (full blocks, others, block entities; each by y, x, z), palette in order of first use;
     /// the entities (players excepted) if asked.
-    fn capture_area(&self, origin: P, size: [i32; 3], entities: bool, wb: &Blocks) -> Nbt {
+    fn capture_area(&self, origin: P, size: [i32; 3], entities: bool, skip_air: bool, wb: &Blocks) -> Nbt {
         let far = [origin[0] + size[0] - 1, origin[1] + size[1] - 1, origin[2] + size[2] - 1];
         let lo = [origin[0].min(far[0]), origin[1].min(far[1]), origin[2].min(far[2])];
         let hi = [origin[0].max(far[0]), origin[1].max(far[1]), origin[2].max(far[2])];
         let void = self.tb().block_id("minecraft:structure_void");
+        let air = self.tb().block_id("minecraft:air");
         // (y, x, z) order inside each category comes from the loops.
         let (mut full, mut other, mut with) = (Vec::new(), Vec::new(), Vec::new());
         for y in lo[1]..=hi[1] {
@@ -877,7 +962,8 @@ impl Server {
                 for z in lo[2]..=hi[2] {
                     let q = [x, y, z];
                     let st = self.get(q);
-                    if self.v().block(st) == void {
+                    let b = self.v().block(st);
+                    if b == void || (skip_air && b == air) {
                         continue;
                     }
                     let rel = [x - lo[0], y - lo[1], z - lo[2]];

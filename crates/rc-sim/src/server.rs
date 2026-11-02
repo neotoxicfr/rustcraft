@@ -1198,6 +1198,9 @@ impl Server {
         self.dims_tick(); // S6: portals, parked dimensions
         self.commands_tick(); // S5 : suggestions, scores
         self.progress_tick(); // S9: time statistics, triggers, sending of advancements
+        if runs {
+            self.gametest_tick(); // G3-F06: in-game tests, after the world and the players
+        }
         self.flush_block_changes();
         if let Some(a) = self.ack.take() {
             let _ = self.send(Event::BlockChangedAck(a));
