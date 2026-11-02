@@ -325,7 +325,43 @@ pub enum Ease {
     Linear,
     Constant,
     Bezier([f32; 4]),
+    /// Named curve: rank in [`EASE_NAMES`].
+    Named(u8),
 }
+
+/// Names of the game's named curves (besides `constant` and `linear`), in its registration order.
+pub const EASE_NAMES: [&str; 30] = [
+    "in_back",
+    "in_bounce",
+    "in_circ",
+    "in_cubic",
+    "in_elastic",
+    "in_expo",
+    "in_quad",
+    "in_quart",
+    "in_quint",
+    "in_sine",
+    "in_out_back",
+    "in_out_bounce",
+    "in_out_circ",
+    "in_out_cubic",
+    "in_out_elastic",
+    "in_out_expo",
+    "in_out_quad",
+    "in_out_quart",
+    "in_out_quint",
+    "in_out_sine",
+    "out_back",
+    "out_bounce",
+    "out_circ",
+    "out_cubic",
+    "out_elastic",
+    "out_expo",
+    "out_quad",
+    "out_quart",
+    "out_quint",
+    "out_sine",
+];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Track {

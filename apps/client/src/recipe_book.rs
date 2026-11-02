@@ -943,7 +943,7 @@ impl RecipeBook {
                 return (false, false);
             }
             let (mut used, mut changed) = self.search.key(k, mods);
-            if let Some(t) = text.filter(|t| t.chars().all(|c| !c.is_control())) {
+            if let Some(t) = text {
                 let before = self.search.text.clone();
                 self.search.insert(t);
                 changed |= before != self.search.text;

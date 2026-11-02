@@ -294,10 +294,11 @@ pub const REMOVE_ONE: &str = "minecraft:item.bundle.remove_one";
 pub fn wheel(x: f64, y: f64) -> (i32, i32) {
     WHEEL.with(|c| {
         let (mut ax, mut ay) = c.get();
-        if ax != 0.0 && x.signum() != ax.signum() {
+        // An idle axis (0) also resets its accumulation, as the game's sign of 0 is 0.
+        if ax != 0.0 && rc_physics::signum(x) != rc_physics::signum(ax) {
             ax = 0.0;
         }
-        if ay != 0.0 && y.signum() != ay.signum() {
+        if ay != 0.0 && rc_physics::signum(y) != rc_physics::signum(ay) {
             ay = 0.0;
         }
         ax += x;

@@ -134,7 +134,7 @@ fn grip(holder: &Entity, ctx: &Ctx<'_>, id: i32) -> [f64; 3] {
                 let (lv, lr) = (v[0].hypot(v[2]), 1.0);
                 let roll = if lv > 0.0 {
                     let cos = ((v[0] * r[0] + v[2] * r[1]) / (lv * lr)).clamp(-1.0, 1.0);
-                    cos.acos() * (v[0] * r[1] - v[2] * r[0]).signum()
+                    cos.acos() * rc_physics::signum(v[0] * r[1] - v[2] * r[0])
                 } else {
                     0.0
                 };

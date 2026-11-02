@@ -93,7 +93,7 @@ impl Smooth {
         self.target += add;
         let mut d = self.target - self.remaining;
         let next = self.last + (d - self.last) * 0.5;
-        let sign = d.signum();
+        let sign = rc_physics::signum(d);
         if sign * d > sign * self.last {
             d = next;
         }
@@ -521,9 +521,8 @@ impl App {
         };
         let k = self.options.f("mouseWheelSensitivity");
         let discrete = self.options.b("discrete_mouse_scroll");
-        let (x, y) = if discrete { (x.signum() * k, y.signum() * k) } else { (x * k, y * k) };
-        // Zero sign: zero (the sign of 0.0 in Rust is 1).
-        let (x, y) = (if x == 0.0 { 0.0 } else { x }, if y == 0.0 { 0.0 } else { y });
+        // Discrete: the sign of each axis, an idle axis staying at zero.
+        let (x, y) = if discrete { (rc_physics::signum(x) * k, rc_physics::signum(y) * k) } else { (x * k, y * k) };
         let (wx, wy) = self.hud.wheel(x, y);
         if wx == 0 && wy == 0 {
             return;
@@ -699,5 +698,17 @@ mod tests {
         }
         assert!(first < 10.0 * 0.016, "damped start {first}");
         assert!((total - 10.0).abs() < 0.5, "almost reaches the target {total}");
+    }
+
+    /// Target exactly reached with a negative inertia left: the sign of 0 is 0, so no motion
+    /// (Rust's sign of 0.0 would be 1 and replay the inertia).
+    #[test]
+    fn smooth_camera_stays_put_on_an_exact_zero() {
+        let mut s = Smooth { target: 0.0, remaining: 0.0, last: -1.0 };
+        assert_eq!(s.delta(0.0, 1.0).to_bits(), 0.0f64.to_bits());
+        assert_eq!((s.last, s.remaining), (-0.5, 0.0));
+        let mut s = Smooth { target: 0.0, remaining: 0.0, last: 1.0 };
+        assert_eq!(s.delta(-0.0, 1.0), 0.0);
+        assert_eq!(s.remaining, 0.0);
     }
 }

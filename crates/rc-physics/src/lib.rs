@@ -223,6 +223,22 @@ pub fn cos_t(a: f32) -> f32 {
 
 const DEG: f32 = std::f32::consts::PI / 180.0;
 
+/// Sign as the game computes it: ±1, but a zero (of either sign) and NaN are returned as they
+/// are, where Rust's `f64::signum` gives ±1 for a zero.
+#[inline]
+pub fn signum(v: f64) -> f64 {
+    if v == 0.0 || v.is_nan() { v } else { 1.0f64.copysign(v) }
+}
+
+#[cfg(test)]
+#[test]
+fn signum_keeps_zeros_and_nan() {
+    assert_eq!(signum(0.0).to_bits(), 0.0f64.to_bits());
+    assert_eq!(signum(-0.0).to_bits(), (-0.0f64).to_bits());
+    assert!(signum(f64::NAN).is_nan());
+    assert_eq!((signum(-3.5), signum(1e-300), signum(f64::INFINITY)), (-1.0, 1.0, 1.0));
+}
+
 // ---------- Per-state data ----------
 
 /// Per-state tables and tags useful to the physics.

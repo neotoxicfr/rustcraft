@@ -187,7 +187,7 @@ pub fn window_update() -> (Option<bool>, Option<[i32; 4]>) {
 /// Text committed by the IME carried by an event (handled like a keystroke by the screen).
 pub fn commit(event: &WindowEvent) -> Option<&str> {
     match event {
-        WindowEvent::Ime(Ime::Commit(t)) => Some(t.as_str()).filter(|t| t.chars().all(|c| !c.is_control())),
+        WindowEvent::Ime(Ime::Commit(t)) => Some(t.as_str()).filter(|t| crate::widgets::text_event(t)),
         _ => None,
     }
 }
@@ -264,5 +264,10 @@ mod tests {
         let c = WindowEvent::Ime(Ime::Commit("日本".into()));
         assert!(!observe(&c));
         assert_eq!((preedit(), commit(&c)), (None, Some("日本")));
+        // Dropped only when it starts with a C0 control or DEL; a C1 control is real input.
+        let c1 = WindowEvent::Ime(Ime::Commit("\u{85}a\u{1}".into()));
+        assert_eq!(commit(&c1), Some("\u{85}a\u{1}"));
+        assert_eq!(commit(&WindowEvent::Ime(Ime::Commit("\u{1}a".into()))), None);
+        assert_eq!(commit(&WindowEvent::Ime(Ime::Commit("\u{7f}".into()))), None);
     }
 }
