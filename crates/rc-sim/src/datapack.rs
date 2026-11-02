@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 
 /// Folders kept (the rest of the pack serves the registries and is not kept).
-const KEPT: [&str; 37] = [
+const KEPT: [&str; 40] = [
     // G6-F01: jukebox songs (duration, comparator output).
     "jukebox_song/",
     // W9: settings of the trial spawner generators.
@@ -43,6 +43,10 @@ const KEPT: [&str; 37] = [
     "predicate/",
     "damage_type/",
     "item_modifier/",
+    // G6-F17: nested sets of loot tables (`#tag`), slot sources of the `slots` entries.
+    "tags/loot_table/",
+    "slot_source/",
+    "tags/slot_source/",
     // S4: spawn lists of biomes, mob variants.
     "worldgen/biome/",
     "cow_variant/",

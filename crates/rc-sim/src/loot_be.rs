@@ -27,7 +27,7 @@ fn is_container(id: &str) -> bool {
 }
 
 /// Name carried by the `CustomName` field (the head keeps its own under `custom_name`).
-fn nameable(id: &str) -> bool {
+pub(crate) fn nameable(id: &str) -> bool {
     is_container(id)
         || matches!(
             id,
