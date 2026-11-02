@@ -119,7 +119,8 @@ fn near_plane_follows_the_fov_option() {
 }
 
 /// Micro-bench (loaded machine): `cargo test --release -p rc-app --bin rustcraft bench_near_half --
-/// --ignored --nocapture`. Half-height recomputed per frame against the kept one.
+/// --ignored --nocapture`. Half-height recomputed per frame, read from a table of the 81 option
+/// angles (30..=110), and kept between frames.
 #[test]
 #[ignore]
 fn bench_near_half() {
@@ -127,7 +128,15 @@ fn bench_near_half() {
     use std::time::Instant;
     const N: u32 = 10_000_000;
     let kept = NearHalf::default();
+    let table: Vec<f64> = (30..=110).map(near_half_height).collect();
     for pass in 0..2 {
+        let t0 = Instant::now();
+        for _ in 0..N {
+            let fov: i32 = black_box(70);
+            black_box(reach(black_box(16.0 / 9.0), table[(fov - 30) as usize]));
+        }
+        let looked_up = t0.elapsed().as_nanos() as f64 / f64::from(N);
+        println!("pass {pass}: 81-angle table {looked_up:.2} ns");
         let t0 = Instant::now();
         for _ in 0..N {
             black_box(reach(black_box(16.0 / 9.0), near_half_height(black_box(70))));

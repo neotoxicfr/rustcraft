@@ -1541,10 +1541,15 @@ fn row_layout(row: &Row, top: i32, first: bool) -> (i32, i32) {
     }
 }
 
-/// Keys of the friends button (message, tooltip): without a tooltip when the friends list is not
-/// available (demo).
-fn friends_keys(available: bool) -> (&'static str, Option<&'static str>) {
-    ("gui.friends.open", available.then_some("gui.friends.open.tooltip"))
+/// Friends button of the pause screen (id 6): message of the game; when the friends list is not
+/// available (demo) it is inactive and has no tooltip.
+fn friends_button(m: &dyn rc_text::Metrics, t: &dyn Fn(&str) -> String, x: i32, y: i32, available: bool) -> Widget {
+    let mut w = Widget::new(6, Kind::Icon("friends/friends"), x, y, 20, 20, chars(&t("gui.friends.open")));
+    w.active = available;
+    if available {
+        w.set_tooltip(m, &t("gui.friends.open.tooltip"));
+    }
+    w
 }
 
 /// Components of a screen for a `W × H` interface.
@@ -1585,14 +1590,7 @@ fn build(
                 icon(REPORT_BUGS, 60, "pause_menu/bug", "menu.reportBugs"),
                 icon(FEEDBACK, 84, "pause_menu/social_interactions", "menu.sendFeedback"),
             ];
-            let available = !rc_sim::demo::launch_demo();
-            let (msg, tip) = friends_keys(available);
-            let mut friends = Widget::new(6, Kind::Icon("friends/friends"), gx + 108, gy + 98, 20, 20, chars(&t(msg)));
-            friends.active = available;
-            if let Some(k) = tip {
-                friends.set_tooltip(gui, &t(k));
-            }
-            widgets.push(friends);
+            widgets.push(friends_button(gui, &t, gx + 108, gy + 98, !rc_sim::demo::launch_demo()));
             let mut social = icon(SOCIAL, 132, "pause_menu/player_reporting", "menu.playerReporting");
             if world.ctx.solo && world.players.iter().all(|p| p.uuid == world.local) {
                 social.active = false;
@@ -1934,11 +1932,25 @@ mod tests {
         assert_eq!(ys[i + 1].1, ys[i].1 + 18, "options under the title");
     }
 
-    /// Pause friends button: message and tooltip of the game; no tooltip when unavailable (demo).
+    /// Pause friends button: message and tooltip of the game, active; in demo inactive without
+    /// a tooltip.
     #[test]
-    fn friends_button_keys() {
-        assert_eq!(friends_keys(true), ("gui.friends.open", Some("gui.friends.open.tooltip")));
-        assert_eq!(friends_keys(false), ("gui.friends.open", None));
+    fn friends_button_follows_availability() {
+        struct Fixed;
+        impl rc_text::Metrics for Fixed {
+            fn advance(&self, _font: &str, _c: char) -> (f32, f32) {
+                (6.0, 1.0)
+            }
+        }
+        let t = |k: &str| k.to_owned();
+        let text = |l: &[StyledChar]| l.iter().map(|s| s.c).collect::<String>();
+        let on = friends_button(&Fixed, &t, 10, 20, true);
+        assert_eq!((on.id, on.x, on.y, on.active), (6, 10, 20, true));
+        assert_eq!(text(&on.msg), "gui.friends.open");
+        assert_eq!(on.tooltip.iter().map(|l| text(l)).collect::<String>(), "gui.friends.open.tooltip");
+        let off = friends_button(&Fixed, &t, 10, 20, false);
+        assert_eq!((off.active, text(&off.msg)), (false, "gui.friends.open".to_owned()));
+        assert!(off.tooltip.is_empty(), "no tooltip in demo");
     }
 
     #[test]

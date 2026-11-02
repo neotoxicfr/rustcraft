@@ -2917,7 +2917,12 @@ on a quiet machine with the others).
   Its half-height is computed once when the option is applied (`EnvState::set_fov_option`) and
   kept, instead of a tangent each frame (the former fixed 70° could be folded at compile time):
   micro-bench `environ::cache_tests::bench_near_half` (2 passes, 10 M calls) 2.71-2.72 ns per frame
-  with the tangent against 0.56-0.57 ns with the kept value; kept. Rest of the per-frame test
+  with the tangent against 0.56-0.57 ns with the kept value; kept. Third track, a table of the
+  81 option angles (30..=110) read each frame: 0.56-0.57 ns (2 passes, rerun 02/11 with the
+  tangent at 2.74-2.76 ns), no gain over the single kept value, which needs no table: dropped.
+  In-wall overlay test: near plane now sized by the culling field of view (max of the frame's and
+  the option, like the game); same tangent per frame as before, only its input changed, no cost
+  to measure. Rest of the per-frame test
   unchanged (same neighbourhood cache, same five points). Multi-core and GPU not applicable (five
   block reads per frame).
 - Option labels (brightness, fixed decimals through `tech_blocks::java_fixed`, about 110 ns per

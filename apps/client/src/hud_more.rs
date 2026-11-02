@@ -67,9 +67,10 @@ pub struct SceneIn<'a> {
     pub yaw: f32,
     pub pitch: f32,
     pub shot: (f32, f32),
-    pub fov: f32,
+    /// Projection of the frame: the near plane of the in-wall test comes from the culling field
+    /// of view (max of the frame's and the option), the hand from `hud_fov`.
+    pub view: crate::camera::RenderView,
     pub aspect: f32,
-    pub hud_fov: f32,
     pub first_person: bool,
     pub spectator: bool,
     pub hud_hidden: bool,
@@ -481,7 +482,9 @@ impl HudMore {
         } else {
             let (right, up, fwd) = crate::camera::axes(s.shot.0, s.shot.1);
             let (right, up, fwd) = (right.as_dvec3(), up.as_dvec3(), fwd.as_dvec3());
-            let hh = 0.05 * (f64::from(s.fov).to_radians() / 2.0).tan();
+            // The game takes the bounds of the culling frustum's near plane, whose angle is never
+            // below the option (spyglass and water keep the option's plane).
+            let hh = 0.05 * (f64::from(s.view.cull_fov).to_radians() / 2.0).tan();
             let hw = hh * f64::from(s.aspect);
             let eye = glam::DVec3::from_array(s.eye);
             let near = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
@@ -511,7 +514,7 @@ impl HudMore {
             yaw: s.yaw,
             pitch: s.pitch,
             on_fire: s.me.is_some_and(|me| me.flags() & 1 != 0),
-            hud_fov: s.hud_fov,
+            hud_fov: s.view.hud_fov,
         });
         // HUD hidden (F1): no camera overlays; the screen effects remain.
         if s.hud_hidden {
@@ -1158,5 +1161,45 @@ mod tests {
         assert_eq!(attribute_value(n, &mk(1.0, -3.0)), 0.0625);
         assert_eq!(attribute_value(n, &mk(f64::NAN, 0.0)), 0.0625);
         assert_eq!(attribute_value(n, &mk(2.0, 0.0)), 2.0);
+    }
+
+    /// Eyes 2 cm above a bottom slab, looking level, frame narrowed to 7° (spyglass) with the
+    /// option at 70°: the near plane keeps the culling angle (70°, half-height 0.035), reaches the
+    /// slab and shows its texture; a 7° plane (half-height 0.003) would not.
+    #[test]
+    fn in_wall_near_plane_uses_the_culling_fov() {
+        let Some(d) = rc_testdata::version_data() else { return };
+        let def = |n: &str| d.blocks.iter().find(|b| b.name == n).map(|b| b.default_state).expect(n);
+        let (air, slab) = (def("minecraft:air"), def("minecraft:stone_slab"));
+        let state_at = move |x: i32, y: i32, z: i32| if (x, y, z) == (0, 64, 0) { slab } else { air };
+        let eye = [0.5, 64.52, 0.5];
+        let mut h = HudMore::new();
+        let mut block = |fov: f32, cull_fov: f32| {
+            let view = crate::camera::RenderView { fov, cull_fov, ..Default::default() };
+            let s = SceneIn {
+                data: &d,
+                state_at: &state_at,
+                me: None,
+                equippable: None,
+                feet: [eye[0], eye[1] - 1.62, eye[2]],
+                eye,
+                yaw: 0.0,
+                pitch: 0.0,
+                shot: (0.0, 0.0),
+                view,
+                aspect: 16.0 / 9.0,
+                first_person: true,
+                spectator: false,
+                hud_hidden: false,
+                screen_effect_scale: 1.0,
+                eye_brightness: 1.0,
+                pt: 0.0,
+                tick_len: 0.05,
+            };
+            h.scene(&s).0.block
+        };
+        assert_eq!(block(7.0, 70.0), Some(slab as usize), "spyglass frame, option 70°");
+        assert_eq!(block(70.0, 70.0), Some(slab as usize));
+        assert_eq!(block(7.0, 7.0), None, "a 7° plane stays above the slab");
     }
 }
