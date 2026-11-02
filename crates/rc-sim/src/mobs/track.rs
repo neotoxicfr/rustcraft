@@ -54,6 +54,14 @@ fn enc(v: f64) -> i64 {
     rc_proto_v777::entity::delta_unit(v)
 }
 
+/// The tracking sends a velocity `new` after `sent` if they differ beyond 1e-7 squared, or at
+/// all when it fell to zero.
+pub fn velocity_changed(sent: [f64; 3], new: [f64; 3]) -> bool {
+    let d = [new[0] - sent[0], new[1] - sent[1], new[2] - sent[2]];
+    let diff = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    diff > 1.0e-7 || (diff > 0.0 && new == [0.0; 3])
+}
+
 /// Velocity as the client decodes it.
 pub fn lp_quantize(v: [f64; 3]) -> [f64; 3] {
     let v = v.map(|x| if x.is_nan() { 0.0 } else { x.clamp(-1.717_986_918_3e10, 1.717_986_918_3e10) });
@@ -343,9 +351,7 @@ impl Server {
                 }
                 t.base = pos;
             }
-            let dv = [vel[0] - t.last_vel[0], vel[1] - t.last_vel[1], vel[2] - t.last_vel[2]];
-            let diff = dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2];
-            if diff > 1.0e-7 || (diff > 0.0 && vel == [0.0; 3]) {
+            if velocity_changed(t.last_vel, vel) {
                 t.last_vel = vel;
                 let _ = self.send(Event::Entity(EntityEvent::Motion { id, velocity: lp_quantize(vel) }));
             }

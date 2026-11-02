@@ -1508,7 +1508,7 @@ impl Server {
         }
         if sweep {
             self.world_sound("minecraft:entity.player.attack.sweep", 7, self.pos, 1.0, 1.0);
-            self.sweep_attack(&b, None, base, scale, &ty, weapon.as_ref());
+            self.sweep_attack(&b, Some(id), base, scale, &ty, weapon.as_ref());
         }
         if crit {
             self.world_sound("minecraft:entity.player.attack.crit", 7, self.pos, 1.0, 1.0);
@@ -1662,9 +1662,11 @@ impl Server {
         k[0] * k[0] + k[2] * k[2] < max * max && weapon.is_some_and(|w| self.item_tag(&w.id, "minecraft:swords"))
     }
 
-    /// Sweep around the box `tb` of the struck target (mob `target`, or non-living entity
-    /// such as a minecart): mobs within 3 blocks of the player that are not its allies, damage
-    /// (with the weapon's enchantment bonus against each of them), knockback and after-hit effects.
+    /// Sweep around the box `tb` of the struck target (mob or other player `target`, or
+    /// non-living entity such as a minecart): every living entity within 3 blocks of the player
+    /// that is not its ally (mobs, armor stands but markers, mannequins, the other players),
+    /// damage (with the weapon's enchantment bonus against each of them), then, if it landed,
+    /// knockback along the player's yaw and after-hit effects.
     pub(crate) fn sweep_attack(
         &mut self,
         tb: &rc_physics::Aabb,
@@ -1707,6 +1709,59 @@ impl Server {
                 self.post_attack(&mut hit, weapon);
             }
             self.mobs.list[i] = Some(o);
+        }
+        // Armor stands (markers left out) and mannequins: the stand takes the hit as a stand
+        // (wobble or broken), the mannequin as a living entity.
+        let bonus = weapon.map_or(0.0, |w| self.sharpness_bonus(w));
+        for d in self.deco_living() {
+            let ally = self.same_team(&me, &crate::nbtio::uuid_text(d.uuid));
+            if d.marker || ally || !d.bbox.intersects(&area) || super::mth::dist2(d.pos, self.pos) >= 9.0 {
+                continue;
+            }
+            let Some(e) = self.deco_nbt(d.id).cloned() else { continue };
+            let dmg = (sweep + bonus) * scale;
+            let landed = if crate::decoration::kind_of(&e) == Some(crate::decoration::DKind::Stand) {
+                self.stand_hurt(d.id, &e, ty)
+            } else {
+                self.mannequin_hurt(d.id, ty, dmg, Some(Ent::Player), Some(self.pos))
+            };
+            if landed && self.deco_nbt(d.id).is_some() {
+                self.deco_knockback(d.id, 0.4, f64::from(s), f64::from(-c));
+                self.player_weapon_post_attack(crate::commands::ents::E::Other(d.id), d.pos, ty, weapon);
+            }
+        }
+        // The other players of the local network (the struck one left out).
+        for o in self.lan_peers() {
+            if Some(o.id) == target || o.game_mode == 3 || !o.bbox.intersects(&area) || super::mth::dist2(o.pos, self.pos) >= 9.0 {
+                continue;
+            }
+            let name = self.as_player(o.who, |sv| sv.name.clone());
+            if self.same_team(&me, &name) {
+                continue;
+            }
+            let hit = PvpHit {
+                ty: ty.to_owned(),
+                weapon: weapon.cloned(),
+                name: me.clone(),
+                display: self.player_display_name(),
+                named_item: weapon.filter(|s| crate::items::component(s, "minecraft:custom_name").is_some()).map(|s| self.stack_display(s)),
+                pos: self.pos,
+                yaw: self.yaw,
+                total: (sweep + bonus) * scale,
+                knockback: 0.4,
+                fire: weapon.map_or(0, |w| 80 * self.life.items.enchantment(w, "minecraft:fire_aspect")),
+                disable_secs: weapon
+                    .and_then(|w| self.comp_json(w, "minecraft:weapon"))
+                    .and_then(|w| w["disable_blocking_for_seconds"].as_f64())
+                    .unwrap_or(0.0) as f32,
+            };
+            let (parts, landed) = self.as_player(o.who, |sv| sv.pvp_receive(&hit));
+            if let Some((original, taken, blocked)) = parts {
+                self.s9_player_hurt_player(ty, original, taken, blocked);
+            }
+            if landed.is_some() {
+                self.player_weapon_post_attack(crate::commands::ents::E::Other(o.id), o.pos, ty, weapon);
+            }
         }
         let (dx, dz) = (-f64::from(s), f64::from(c));
         self.particles(

@@ -678,6 +678,60 @@ fn smash_and_wind_burst_reach_other_player() {
     assert!((kz - v[2]).abs() < 1e-12, "the other player received another knockback: {kz} vs {}", v[2]);
 }
 
+/// L10-COMBAT: an ordinary explosion next to another player hurts and pushes that player like the
+/// host (its server velocity, and its own packet's knockback); the host, far away, is untouched.
+/// Before, only the current player was reached.
+#[test]
+fn ordinary_explosion_hurts_and_pushes_other_player() {
+    let mut t = open("blastpeer");
+    publish(&mut t, false);
+    let g = join(&mut t, "Guest", 2);
+    host_ready(&mut t, feet([12, FLOOR + 1, 12]));
+    guest_ready(&mut t, [0.5, f64::from(FLOOR + 1), 2.5]);
+    t.s.lan.as_mut().unwrap().guests[0].ctx.as_mut().unwrap().player_vel = [0.0; 3];
+    let _ = guest_packets(&g);
+    let center = [0.5, f64::from(FLOOR + 1), 0.5];
+    t.s.explode_with(None, None, None, center, 2.0, false, "minecraft:explosion", crate::mobs::explode::Blast::None(false));
+    assert_eq!(t.s.life.vit.health, 20.0, "the host, out of range, was hurt");
+    let (h, _) = guest_vitals(&t);
+    assert!(h < 20.0, "other player not hurt: {h}");
+    let v = t.s.lan.as_ref().unwrap().guests[0].ctx.as_ref().unwrap().player_vel;
+    assert!(v[2] > 0.0, "other player not pushed: {v:?}");
+    let explode = ids(&t).explode;
+    let ps = guest_packets(&g);
+    let p = ps.iter().find(|p| id_of(p) == explode).expect("explosion packet to the other player");
+    let b = body(p);
+    assert_eq!(b[32], 1, "no knockback in the other player's packet");
+    let kz = f64::from_be_bytes(b[49..57].try_into().unwrap());
+    assert!((kz - v[2]).abs() < 1e-12, "packet knockback {kz} vs server velocity {}", v[2]);
+}
+
+/// L10-COMBAT: the sweep of a sword hurts another player standing next to the target (not an
+/// ally). Before, only mobs were swept.
+#[test]
+fn sweep_reaches_other_player() {
+    let mut t = open("sweeppeer");
+    publish(&mut t, false);
+    let _g = join(&mut t, "Guest", 2);
+    host_ready(&mut t, [0.5, f64::from(FLOOR + 1), 0.5]);
+    guest_ready(&mut t, [1.3, f64::from(FLOOR + 1), 1.5]);
+    let slot = 36 + t.s.held as usize;
+    t.s.slots[slot] = Some(crate::player::Stack { id: "minecraft:diamond_sword".into(), count: 1, components: None });
+    t.s.equipment_tick();
+    t.s.on_ground = true;
+    t.s.mobs.attack_ticker = 100;
+    t.s.life.vit.sprinting = false;
+    t.s.life.vit.fall = 0.0;
+    t.s.proj_player.known_move = [0.0; 3];
+    let mut z = t.s.new_mob(crate::mobs::species::Kind::Zombie, [0.5, f64::from(FLOOR + 1), 1.5], 180.0);
+    z.attrs.max_health.base = 500.0;
+    z.health = 500.0;
+    t.s.player_attack_mob(&mut z);
+    assert!(z.health < 500.0, "main hit without damage");
+    let (h, _) = guest_vitals(&t);
+    assert!(h < 20.0, "the swept player was not hurt: {h}");
+}
+
 /// Hit and kill between players, as on a mob: weapon used, damage dealt, player killed
 /// (statistic and objective criteria) on the attacker's side; `killed_by` of the player
 /// on the victim's side.

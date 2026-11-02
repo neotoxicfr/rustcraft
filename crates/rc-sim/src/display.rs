@@ -509,6 +509,79 @@ impl Server {
         }
     }
 
+    /// Entities that never move by themselves in an explosion or a burst, pushed like any entity
+    /// (× `mult`; the damage does nothing to them): displays, markers and interactions kept as
+    /// compounds (motion saved; a display or an interaction sends it when it differs from the
+    /// motion before beyond the tracking's threshold, a marker is never sent), then the effect
+    /// clouds. Only the compounds of those types are looked at.
+    pub(crate) fn blast_push_still(&mut self, center: [f64; 3], radius: f32, mult: f64) {
+        if radius < 1.0e-5 {
+            return;
+        }
+        let double = f64::from(radius * 2.0);
+        let push = |s: &Server, pos: [f64; 3], eye: f64, b: &rc_physics::Aabb| -> Option<[f64; 3]> {
+            let dist = crate::mobs::mth::dist2(pos, center).sqrt() / double;
+            if dist > 1.0 {
+                return None;
+            }
+            let dir = crate::mobs::mth::normalize([pos[0] - center[0], pos[1] + eye - center[1], pos[2] - center[2]]);
+            let exposure = if mult == 0.0 { 0.0 } else { f64::from(s.seen_percent(center, b)) };
+            let kp = (1.0 - dist) * exposure * mult;
+            Some(dir.map(|v| v * kp))
+        };
+        let mut hits: Vec<((i32, i32), usize, [f64; 3])> = Vec::new();
+        // Every kept compound: one teleported keeps the list of the chunk it was read in.
+        for (&c, list) in &self.entities {
+            for (k, (_, e)) in list.iter().enumerate() {
+                // Displays and markers: no size, eyes at their feet; an interaction its own size.
+                let (w, h, eye) = match kind_of(e) {
+                    Some(Kind::Interaction) => {
+                        let h = get_float(e, "height", 1.0);
+                        (f64::from(get_float(e, "width", 1.0)), f64::from(h), f64::from(h * 0.85))
+                    }
+                    Some(_) => (0.0, 0.0, 0.0),
+                    None if e.get("id").and_then(Nbt::as_str) == Some("minecraft:marker") => (0.0, 0.0, 0.0),
+                    None => continue,
+                };
+                let p = crate::nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
+                let b = rc_physics::Aabb { min: [p[0] - w / 2.0, p[1], p[2] - w / 2.0], max: [p[0] + w / 2.0, p[1] + h, p[2] + w / 2.0] };
+                if let Some(kb) = push(self, p, eye, &b) {
+                    hits.push((c, k, kb));
+                }
+            }
+        }
+        for (c, k, kb) in hits {
+            let Some((id, n)) = self.entities.get_mut(&c).and_then(|l| l.get_mut(k)) else { continue };
+            let id = *id;
+            let old = crate::nbtio::motion(n.get("Motion")).unwrap_or_default();
+            let new = [old[0] + kb[0], old[1] + kb[1], old[2] + kb[2]];
+            crate::nbtio::set(n, "Motion", Nbt::List(new.iter().map(|&v| Nbt::Double(v)).collect()));
+            let visible = crate::decoration::client_visible(n);
+            self.life.drop_chunks.insert(c);
+            if visible && crate::mobs::track::velocity_changed(old, new) {
+                let velocity = crate::mobs::track::lp_quantize(new);
+                let _ = self.send(rc_client::Event::Entity(rc_client::EntityEvent::Motion { id, velocity }));
+            }
+        }
+        for i in 0..self.proj.clouds.len() {
+            let c = &self.proj.clouds[i];
+            if c.removed {
+                continue;
+            }
+            // Box 2 × radius wide, 0.5 high: eyes at 0.85 of it.
+            let Some(kb) = push(self, c.pos, f64::from(0.5f32 * 0.85), &c.bbox()) else { continue };
+            let c = &mut self.proj.clouds[i];
+            c.vel = [c.vel[0] + kb[0], c.vel[1] + kb[1], c.vel[2] + kb[2]];
+            if crate::mobs::track::velocity_changed(c.sent_vel, c.vel) {
+                c.sent_vel = c.vel;
+                let (id, velocity) = (c.id, crate::mobs::track::lp_quantize(c.vel));
+                if c.seen {
+                    let _ = self.send(rc_client::Event::Entity(rc_client::EntityEvent::Motion { id, velocity }));
+                }
+            }
+        }
+    }
+
     /// Interaction entity `id` reachable by the player (eyes within the interaction range + 3 of
     /// its box, block inside the border): its compound's position, otherwise nothing.
     fn interaction_target(&self, id: i32) -> Option<((i32, i32), usize, bool)> {

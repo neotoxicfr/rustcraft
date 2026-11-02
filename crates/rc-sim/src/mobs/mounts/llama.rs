@@ -43,7 +43,8 @@ fn rot_of(v: [f64; 3]) -> (f32, f32) {
     (yaw, pitch)
 }
 
-fn spit_box(p: [f64; 3]) -> rc_physics::Aabb {
+/// Box of a llama spit (0.25 × 0.25) at `p`.
+pub(crate) fn spit_box(p: [f64; 3]) -> rc_physics::Aabb {
     rc_physics::Aabb { min: [p[0] - 0.125, p[1], p[2] - 0.125], max: [p[0] + 0.125, p[1] + 0.25, p[2] + 0.125] }
 }
 

@@ -271,9 +271,11 @@ impl Server {
             o.vel = [o.vel[0] + dir[0] * kp, o.vel[1] + dir[1] * kp, o.vel[2] + dir[2] * kp];
             o.needs_sync = true;
         }
-        // Fireballs and other charges: pushed, the launcher becomes their owner.
+        // Every projectile pushed (fireballs and other charges: the launcher becomes their
+        // owner), displays, markers, interactions and clouds too.
         let uuid = self.blast_owner_uuid(owner, None);
-        self.explosion_redirect(center, radius, uuid, kb_mult);
+        self.explosion_projectiles(center, radius, uuid, kb_mult, false);
+        self.blast_push_still(center, radius, kb_mult);
         // 3. Triggered blocks (shuffled order on the world random).
         self.mobs.rng.shuffle(&mut toblow);
         for p in toblow.iter().copied() {
@@ -348,7 +350,7 @@ impl Server {
 
     /// Server velocity of the installed player increased (the client applies the knockback of
     /// the explosion packet itself).
-    fn add_player_vel(&mut self, kb: [f64; 3]) {
+    pub(crate) fn add_player_vel(&mut self, kb: [f64; 3]) {
         let v = self.mobs.player_vel;
         self.mobs.player_vel = [v[0] + kb[0], v[1] + kb[1], v[2] + kb[2]];
     }

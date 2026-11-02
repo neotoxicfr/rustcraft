@@ -136,6 +136,12 @@ impl Server {
     /// entity: the player for a hit of its own, otherwise the projectile being resolved, otherwise
     /// the entity exploding (an explosion it set off hides the projectile).
     pub(crate) fn s9_player_hurt_mob(&mut self, m: &crate::mobs::mob::Mob, ty: &str, original: f32, taken: f32) {
+        self.s9_player_hurt_living(Who::Mob(m), ty, original, taken);
+    }
+
+    /// `player_hurt_entity` for any hurt living entity `victim` (mob, mannequin) whose source is
+    /// the player, as [`Self::s9_player_hurt_mob`] describes it.
+    pub(crate) fn s9_player_hurt_living(&mut self, victim: Who<'_>, ty: &str, original: f32, taken: f32) {
         if !self.trig_active("minecraft:player_hurt_entity") {
             return;
         }
@@ -144,11 +150,11 @@ impl Server {
         let direct = if crate::loot::direct_of(ty) == Some(None) {
             Some(Who::E(E::Player))
         } else {
-            proj.as_deref().map(Who::Proj).or(blast.map(|(id, _)| Who::E(E::Other(id))))
+            proj.as_deref().map(Who::Proj).or_else(|| blast.map(|(id, _)| Who::E(E::Other(id))))
         };
-        let pos = proj.as_ref().map(|p| p.pos).or(blast.map(|b| b.1)).unwrap_or(self.pos);
+        let pos = proj.as_ref().map(|p| p.pos).or_else(|| blast.map(|b| b.1)).unwrap_or(self.pos);
         let dmg = Dmg { ty: ty.to_owned(), source: Some(Who::E(E::Player)), direct, pos: Some(pos) };
-        self.trig_player_hurt_entity(Some(Who::Mob(m)), &dmg, original, taken, false);
+        self.trig_player_hurt_entity(Some(victim), &dmg, original, taken, false);
         self.proj.direct_hit = proj;
     }
 }

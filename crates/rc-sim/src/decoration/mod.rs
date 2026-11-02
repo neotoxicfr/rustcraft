@@ -8,6 +8,7 @@
 
 mod cushion;
 mod hanging;
+mod mannequin;
 pub(crate) mod stand;
 mod summoned;
 #[cfg(test)]
@@ -112,11 +113,14 @@ struct Live {
     removed: bool,
     /// Network tracking of a decoration that moves (armor stand, mannequin).
     track: crate::mobs::track::Tracker,
+    /// Mannequin: hurt cooldown (ticks) and the damage of the last hit (not saved, like the game).
+    hurt_cooldown: i32,
+    last_hurt: f32,
 }
 
 impl Live {
     fn new(id: i32, kind: DKind, chunk: (i32, i32)) -> Live {
-        Live { id, kind, chunk, check: 0, last_hit: 0, removed: false, track: Default::default() }
+        Live { id, kind, chunk, check: 0, last_hit: 0, removed: false, track: Default::default(), hurt_cooldown: 0, last_hurt: 0.0 }
     }
 }
 
@@ -666,14 +670,16 @@ impl Server {
 
     // ---------- Explosions ----------
 
-    /// Blast of an explosion on the decorations: hung items
-    /// and cushions broken (item dropped), armor stands smashed (equipment
-    /// dropped); `by`: author (entity behind the damage source); `wet`: direct source in water, nothing
+    /// Blast of an explosion of type `ty` on the decorations: hung items and cushions broken
+    /// (item dropped), armor stands smashed (equipment dropped), mannequins hurt; a stand or a
+    /// mannequin left standing is then pushed (reduced by its explosion knockback resistance);
+    /// `by`: author (entity behind the damage source); `wet`: direct source in water, nothing
     /// hung is then touched; `blocklike`: the explosion touches block-like entities.
     pub(crate) fn deco_explosion(
         &mut self,
         center: [f64; 3],
         radius: f32,
+        ty: &str,
         by: Option<crate::mobs::mob::Ent>,
         wet: bool,
         blocklike: bool,
@@ -689,7 +695,7 @@ impl Server {
             let Some(e) = self.deco_nbt(id).cloned() else { continue };
             let ignore = match k {
                 DKind::Stand => !blocklike || flag(&e, "Invisible"),
-                DKind::Mannequin => true,
+                DKind::Mannequin => false,
                 _ => wet || !blocklike,
             };
             if ignore {
@@ -708,13 +714,22 @@ impl Server {
             let exposure = f64::from(self.seen_percent(center, &b));
             // The hit: refused for a mob without the `mob_griefing` rule, or invulnerable.
             let refused = (by_mob && !griefing) || flag(&e, "Invulnerable");
-            if k == DKind::Stand {
-                if !refused && !flag(&e, "Marker") {
+            if matches!(k, DKind::Stand | DKind::Mannequin) {
+                if k == DKind::Mannequin {
+                    let pow = (1.0 - dist) * exposure;
+                    let dmg = ((pow * pow + pow) / 2.0 * 7.0 * double + 1.0) as f32;
+                    self.mannequin_hurt(id, ty, dmg, by, Some(center));
+                } else if !refused && !flag(&e, "Marker") {
                     let at = pos.map(|v| v.floor() as i32);
                     self.stand_broken(&e, at);
                     self.deco_remove(id);
                     self.game_event_at("minecraft:entity_die", pos, None);
+                    continue;
                 }
+                // Still there (refused, marker, mannequin): pushed like any living entity.
+                let res = self.nbt_attribute(&e, k.name(), "minecraft:explosion_knockback_resistance").unwrap_or(0.0);
+                let kp = (1.0 - dist) * exposure * (1.0 - res);
+                self.deco_push(id, crate::mobs::mth::normalize(o).map(|v| v * kp));
                 continue;
             }
             if !refused {
@@ -722,7 +737,7 @@ impl Server {
                 continue;
             }
             // Non-zero push: the hung item is knocked off (fixed frame excepted).
-            let pushed = olen >= 1.0e-5 && (1.0 - dist) * exposure != 0.0;
+            let pushed = olen >= f64::from(1.0e-5f32) && (1.0 - dist) * exposure != 0.0;
             if pushed && !(k.frame() && flag(&e, "Fixed")) {
                 self.attached_kill_by(id, &e, None);
             }

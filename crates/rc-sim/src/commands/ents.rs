@@ -193,12 +193,15 @@ impl Server {
                     let (w, h, eye) = self.living_size(n, k == crate::decoration::DKind::Stand);
                     return [w as f32, h as f32, eye as f32];
                 }
-                let ty = self.ent_type(e);
-                let idx =
-                    self.data.registry("minecraft:entity_type").and_then(|r| r.entries.iter().position(|x| *x == ty));
-                idx.and_then(|i| self.data.entity_dims.get(i)).map_or([0.25, 0.25, 0.2], |d| [d[0], d[1], d[2]])
+                self.type_dims(&self.ent_type(e)).unwrap_or([0.25, 0.25, 0.2])
             }
         }
+    }
+
+    /// Width, height and eye height of entity type `ty` (version data).
+    pub(crate) fn type_dims(&self, ty: &str) -> Option<[f32; 3]> {
+        let i = self.data.registry("minecraft:entity_type")?.entries.iter().position(|x| x == ty)?;
+        self.data.entity_dims.get(i).map(|d| [d[0], d[1], d[2]])
     }
 
     pub fn ent_eye_height(&self, e: E) -> f64 {

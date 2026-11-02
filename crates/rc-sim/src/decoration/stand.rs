@@ -79,11 +79,19 @@ pub(crate) fn living_dims(e: &Nbt, stand: bool, scale: f32) -> (f32, f32, f32) {
 }
 
 impl Server {
-    /// The `scale` attribute of a living decoration: 1 without a saved entry of its own nor worn
-    /// equipment (the usual case, read without building anything).
+    /// The `scale` attribute of a living decoration: 1 without a saved entry of its own nor a worn
+    /// stack carrying attribute modifiers or enchantments of its own (no item scales by default):
+    /// the usual case, read every tick without building anything.
     pub(crate) fn living_scale(&self, e: &Nbt, ty: &str) -> f32 {
         let saved = nbtio::list(e.get("attributes")).iter().any(|a| a.get("id").and_then(Nbt::as_str) == Some("minecraft:scale"));
-        let worn = matches!(e.get("equipment"), Some(Nbt::Compound(f)) if !f.is_empty());
+        let worn = match e.get("equipment") {
+            Some(Nbt::Compound(f)) => f.iter().any(|(_, s)| {
+                s.get("components").is_some_and(|c| {
+                    c.get("minecraft:attribute_modifiers").is_some() || c.get("minecraft:enchantments").is_some()
+                })
+            }),
+            _ => false,
+        };
         if !saved && !worn {
             return 1.0;
         }
@@ -403,7 +411,7 @@ impl Server {
     }
 
     /// The damage taken by an armor stand on the server side from a player source; true if the hit landed.
-    fn stand_hurt(&mut self, id: i32, e: &Nbt, ty: &str) -> bool {
+    pub(crate) fn stand_hurt(&mut self, id: i32, e: &Nbt, ty: &str) -> bool {
         let creative = self.game_mode == 1;
         if (flag(e, "Invulnerable") && !creative) || flag(e, "Invisible") || marker(e) {
             return false;
@@ -477,6 +485,10 @@ impl Server {
     pub(super) fn living_tick(&mut self, i: usize, pos: [f64; 3]) {
         let id = self.deco.live[i].id;
         let stand = self.deco.live[i].kind == DKind::Stand;
+        // Mannequin: hurt and death countdowns (removed at the end of its death).
+        if !stand && self.mannequin_tick_counts(i) {
+            return;
+        }
         let interval = if stand { 3 } else { 2 };
         // Fields read without cloning the compound (equipment included): called every tick.
         let Some(e) = self.live_nbt(i) else { return };

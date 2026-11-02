@@ -1061,7 +1061,7 @@ impl Server {
         let by_mob = matches!(by, Some(crate::mobs::mob::Ent::Mob(_)));
         self.objects_blast(center, radius, exclude, blocklike, Some((ty, by_mob)), 1.0);
         // Paintings, frames, armor stands, cushions.
-        self.deco_explosion(center, radius, by, direct_wet, blocklike);
+        self.deco_explosion(center, radius, ty, by, direct_wet, blocklike);
     }
 
     /// Knockback alone of a burst (wind) on the same non-living entities, × `mult`.

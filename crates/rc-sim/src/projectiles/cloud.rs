@@ -39,6 +39,9 @@ pub struct Cloud {
     pub born: u64,
     sent_radius: f32,
     sent_waiting: bool,
+    /// Velocity (explosion pushes; a cloud never moves), saved, and the last one sent.
+    pub vel: [f64; 3],
+    pub sent_vel: [f64; 3],
 }
 
 impl Cloud {
@@ -68,6 +71,8 @@ impl Cloud {
             born: 0,
             sent_radius: 3.0,
             sent_waiting: false,
+            vel: [0.0; 3],
+            sent_vel: [0.0; 3],
         }
     }
 
@@ -98,6 +103,7 @@ impl Cloud {
         let mut f: Vec<(String, Nbt)> = vec![
             ("id".into(), Nbt::String("minecraft:area_effect_cloud".into())),
             ("Pos".into(), Nbt::List(self.pos.iter().map(|&v| Nbt::Double(v)).collect())),
+            ("Motion".into(), Nbt::List(self.vel.iter().map(|&v| Nbt::Double(v)).collect())),
             ("Age".into(), Nbt::Int(self.age)),
             ("Duration".into(), Nbt::Int(self.duration)),
             ("WaitTime".into(), Nbt::Int(self.wait_time)),
@@ -131,6 +137,8 @@ impl Cloud {
     pub fn from_nbt(id: i32, e: &Nbt) -> Cloud {
         let pos = crate::nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
         let mut c = Cloud::new(id, pos);
+        c.vel = crate::nbtio::motion(e.get("Motion")).unwrap_or_default();
+        c.sent_vel = c.vel;
         let i = |k: &str, d: i32| crate::nbtio::int(e, k).map_or(d, |v| v as i32);
         let f = |k: &str, d: f32| match e.get(k) {
             Some(Nbt::Float(v)) => *v,
@@ -187,7 +195,7 @@ impl Server {
             uuid: c.uuid,
             kind: self.entity_kind_id("minecraft:area_effect_cloud"),
             pos: c.pos,
-            velocity: [0.0; 3],
+            velocity: crate::mobs::track::lp_quantize(c.vel),
             pitch: 0.0,
             yaw: 0.0,
             head_yaw: 0.0,
@@ -201,6 +209,7 @@ impl Server {
         c.seen = true;
         c.sent_radius = c.radius;
         c.sent_waiting = c.waiting;
+        c.sent_vel = c.vel;
     }
 
     fn cloud_particle(&self, c: &Cloud) -> Particle {

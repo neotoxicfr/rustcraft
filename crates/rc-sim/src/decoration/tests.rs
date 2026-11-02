@@ -308,12 +308,12 @@ fn explosion_breaks_hanging_things() {
     hold(&mut p, "minecraft:painting", 2);
     p.s.use_item_on_block([106, -58, 104], Dir::West, [0.0, 0.5, 0.5]);
     assert_eq!(decos(&p, DKind::Painting).len(), 1);
-    p.s.deco_explosion([103.5, -58.0, 104.5], 4.0, None, false, false);
+    p.s.deco_explosion([103.5, -58.0, 104.5], 4.0, "minecraft:explosion", None, false, false);
     assert_eq!(decos(&p, DKind::Painting).len(), 1, "explosion without block-like entities");
-    p.s.deco_explosion([103.5, -58.0, 104.5], 4.0, None, true, true);
+    p.s.deco_explosion([103.5, -58.0, 104.5], 4.0, "minecraft:explosion", None, true, true);
     assert_eq!(decos(&p, DKind::Painting).len(), 1, "direct source in water");
     p.run("setblock 103 -58 104 minecraft:water");
-    p.s.deco_explosion([103.5, -58.0, 104.5], 4.0, None, false, true);
+    p.s.deco_explosion([103.5, -58.0, 104.5], 4.0, "minecraft:explosion", None, false, true);
     assert!(decos(&p, DKind::Painting).is_empty(), "water at the center, dry source: painting stayed");
     assert_eq!(dropped(&p, "minecraft:painting"), 1);
     // Player author in creative: broken, nothing drops.
@@ -321,7 +321,7 @@ fn explosion_breaks_hanging_things() {
     p.s.use_item_on_block([106, -58, 104], Dir::West, [0.0, 0.5, 0.5]);
     assert_eq!(decos(&p, DKind::Painting).len(), 1);
     p.s.game_mode = 1;
-    p.s.deco_explosion([103.5, -58.0, 104.5], 4.0, Some(Ent::Player), false, true);
+    p.s.deco_explosion([103.5, -58.0, 104.5], 4.0, "minecraft:player_explosion", Some(Ent::Player), false, true);
     assert!(decos(&p, DKind::Painting).is_empty());
     assert_eq!(dropped(&p, "minecraft:painting"), 1, "item dropped for a creative author");
     done(p, dir);
