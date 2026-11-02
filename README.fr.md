@@ -29,9 +29,9 @@ de cette liste.
 
 | Domaine | Où on en est |
 |---|---|
-| Fidélité au jeu officiel | **66 missions d'audit sur 83** corrigées et intégrées |
+| Fidélité au jeu officiel | **74 missions d'audit sur 83** corrigées et intégrées |
 | Optimisation | **47 optimisations sur 125** prévues faites, chacune mesurée |
-| Tests | environ **2 600** tests automatiques, dont beaucoup comparés bit à bit avec le jeu officiel |
+| Tests | environ **2 700** tests automatiques, dont beaucoup comparés bit à bit avec le jeu officiel |
 
 ### Ce qui marche bien
 
@@ -44,22 +44,26 @@ de cette liste.
 - **Éclairage** identique au jeu officiel, ainsi que la **physique** du joueur et des montures.
 - **Redstone**, avec les bizarreries du jeu officiel reproduites volontairement (quasi-connectivité,
   ordre des mises à jour), et les bogues que Mojang garde, listés dans [docs/quirks-to-reproduce.md](docs/quirks-to-reproduce.md).
-- **Créatures et villageois** (IA, commerce, reproduction, raids), laisses, montures et golems, blocs
-  et blocs-entités, objets, combat et enchantements, orbes d'expérience, effets, ticks de la nature,
-  commandes avec autocomplétion.
+- **Créatures et villageois** (IA, commerce, reproduction, raids), monstres (creeper, shulker,
+  warden…), laisses, montures et golems, blocs et blocs-entités, blocs techniques (structure, jigsaw,
+  test), objets, butin, combat et enchantements, orbes d'expérience, effets, ticks de la nature,
+  commandes avec autocomplétion, tests en jeu (`/test`).
+- **Le tick du monde** : toutes les entités tiquent en un seul parcours, dans l'ordre de leur arrivée
+  dans le monde, comme dans le jeu officiel.
 - **Interface** : écran titre, liste des serveurs, HUD, inventaires, inventaire créatif, livre de
-  recettes, chat, liste des joueurs, tableaux des scores, barres de boss, écran F3, options et
-  `options.txt` partagés avec le jeu officiel ; sons, musique et particules.
+  recettes, écran de commerce, infobulles, chat, liste des joueurs, tableaux des scores, barres de
+  boss, écran F3, menus d'options et `options.txt` partagés avec le jeu officiel ; sons, musique et
+  particules.
 
 ### En cours
 
 Encore sur la liste de fidélité, par priorité :
 
-- blocs techniques (structure, jigsaw, test), `/place`, `/clone`, `/locate` ;
-- quelques commandes (`/loot`, `/enchant`, attributs…), tags des packs de données et `/reload`, sauvegarde, `/schedule` et `/data` ;
-- apparitions et œufs d'apparition, quelques monstres (creeper, shulker, warden…), navigation et cartes, barre de localisation ;
-- ordre du tick du monde, fonctions de butin, tests de jeu ;
-- écran de commerce, infobulles, menus d'options, petits effets côté client.
+- tags des packs de données et `/reload`, horloges ; sauvegarde, `/schedule`, `/data` et liste des mondes ;
+- apparitions et œufs d'apparition, navigation et cartes, repères de la barre de localisation ;
+- visée, particules, options et détails du maillage côté client ;
+- deux enquêtes : l'ordre d'envoi des changements de blocs de la redstone, et des tronçons chargés restés sans maillage ;
+- shaders core des packs de ressources (après le travail d'optimisation, à trancher).
 
 Faits mais **pas encore comparés systématiquement** au jeu officiel : écoulement des fluides,
 mouvement et collisions des entités, chaîne de dégâts, faim, clics génériques des menus, lignes
