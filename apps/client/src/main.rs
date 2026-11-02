@@ -3138,6 +3138,7 @@ impl App {
             }
         }
         self.env.gamma = Some(o.f("gamma") as f32);
+        self.env.set_fov_option(o.fov());
         let clouds = o.s("renderClouds") != "false";
         self.env.clouds = Some((clouds, o.i("cloudRange"), o.s("renderClouds") == "fast"));
         self.chat.apply_options(o);

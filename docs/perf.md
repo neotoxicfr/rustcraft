@@ -2910,3 +2910,19 @@ on a quiet machine with the others).
   melee path (one hit per spin). No hot path touched: the per-tick and per-hit costs above are
   unchanged (same bench, the mob melee path is identical). Multi-core and GPU not applicable
   (single events, ordered by the game).
+
+## G1-F17: option labels and menus, near plane of the fluid camera test (02/11, loaded machine)
+
+- Fluid-in-camera test (lava, powder snow): the near plane now follows the field-of-view option.
+  Its half-height is computed once when the option is applied (`EnvState::set_fov_option`) and
+  kept, instead of a tangent each frame (the former fixed 70° could be folded at compile time):
+  micro-bench `environ::cache_tests::bench_near_half` (2 passes, 10 M calls) 2.71-2.72 ns per frame
+  with the tangent against 0.56-0.57 ns with the kept value; kept. Rest of the per-frame test
+  unchanged (same neighbourhood cache, same five points). Multi-core and GPU not applicable (five
+  block reads per frame).
+- Option labels (brightness, fixed decimals through `tech_blocks::java_fixed`, about 110 ns per
+  real, see G1-F16; composed OFF key): computed on layout and on slider moves only, never per
+  frame; no measurable cost. Japanese glyph default: one system call at the first read, cached.
+- To re-measure on a quiet machine with the other menu missions: `menu` scene of
+  `tools/bench/scenes.py` (no change expected), screenshots of the video and accessibility
+  screens (titles 2 px lower, labels).

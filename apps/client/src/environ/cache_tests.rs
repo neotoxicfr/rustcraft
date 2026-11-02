@@ -92,6 +92,56 @@ fn set(grid: &mut ChunkGrid, s: &States, x: i32, y: i32, z: i32, state: u32) {
     c.sections[(ly >> 4) as usize].set_blocks(&[(i, state)], s.direct_bits, |v| v == 0);
 }
 
+/// The lava test of the near plane is sized by the field-of-view option: 5 cm above the surface of
+/// the lava pool, looking level, the lower corners of the plane reach it at 110° but not at 70°.
+#[test]
+fn near_plane_follows_the_fov_option() {
+    let Some(d) = rc_testdata::version_data() else { return };
+    let t = rc_physics::Tables::new(&d);
+    let s = states(&d);
+    let mut grid = ChunkGrid::new(4);
+    for cx in 0..=1 {
+        for cz in 0..=1 {
+            grid.insert(column(&s, cx, cz, 0));
+        }
+    }
+    let w = WorldView { grid: &grid, min_y: MIN_Y, height: HEIGHT };
+    let top = 63.0 + f64::from(t.fluids.camera_height(s.lava, 0));
+    let eye = [16.5, top + 0.05, 16.5];
+    let mut e = EnvState::default();
+    e.join(&d, "minecraft:overworld", &["minecraft:plains".to_owned()], false);
+    let kind = |e: &EnvState| e.camera_kind(&w, &t, &d, eye, 0.0, 0.0, 16.0 / 9.0);
+    assert_eq!(kind(&e), FogKind::Atmospheric, "default option (70°)");
+    for (fov, expected) in [(70, FogKind::Atmospheric), (100, FogKind::Lava), (110, FogKind::Lava)] {
+        e.set_fov_option(fov);
+        assert_eq!(kind(&e), expected, "fov {fov}");
+    }
+}
+
+/// Micro-bench (loaded machine): `cargo test --release -p rc-app --bin rustcraft bench_near_half --
+/// --ignored --nocapture`. Half-height recomputed per frame against the kept one.
+#[test]
+#[ignore]
+fn bench_near_half() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    const N: u32 = 10_000_000;
+    let kept = NearHalf::default();
+    for pass in 0..2 {
+        let t0 = Instant::now();
+        for _ in 0..N {
+            black_box(reach(black_box(16.0 / 9.0), near_half_height(black_box(70))));
+        }
+        let computed = t0.elapsed().as_nanos() as f64 / f64::from(N);
+        let t0 = Instant::now();
+        for _ in 0..N {
+            black_box(reach(black_box(16.0 / 9.0), black_box(kept).0));
+        }
+        let read = t0.elapsed().as_nanos() as f64 / f64::from(N);
+        println!("pass {pass}: tangent per frame {computed:.2} ns, kept half-height {read:.2} ns");
+    }
+}
+
 #[test]
 fn frame_env_identical_with_and_without_cache() {
     let Some(d) = rc_testdata::version_data() else { return };
