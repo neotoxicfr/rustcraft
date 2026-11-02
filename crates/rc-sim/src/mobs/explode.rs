@@ -325,7 +325,8 @@ impl Server {
         if griefing {
             // Beehives: emergency exit if the direct source is a TNT, a creeper, a wither skull,
             // the wither or a TNT minecart; bees angered after the breaking.
-            let hive_release = matches!(blast, Blast::Tnt(_) | Blast::TntCart { .. })
+            // (A TNT interaction from a mob, the sulfur cube, does not count.)
+            let hive_release = (source.is_none() && matches!(blast, Blast::Tnt(_) | Blast::TntCart { .. }))
                 || source.is_some_and(|m| matches!(m.kind, super::species::Kind::Creeper | super::species::Kind::Wither))
                 || self.prog.expl_cause_next == Some("minecraft:wither_skull");
             self.mobs.rng.shuffle(&mut toblow);

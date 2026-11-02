@@ -3072,3 +3072,29 @@ regularity, allocations, disk, RAM, startup, multi-core): figures below, the res
 - To re-measure on a quiet machine with the other menu missions: `menu` scene of
   `tools/bench/scenes.py` (no change expected), screenshots of the video and accessibility
   screens (titles 2 px lower, labels).
+## G4-F08: monsters and entities (02/11, loaded machine)
+
+- Opening shulker (server): the push now walks the mobs (species-bound prefilter kept), the
+  primed TNT and falling blocks, the items and the orbs, and moves what it touches with its
+  collisions (`mob_move`, `Body::shove`) instead of placing the mobs. Micro-bench
+  `tests_g4f08::bench_g4f08_shulker_push_scan` (2 passes; 300 mobs, 1,000 items, 100 orbs, a slice
+  touching nothing): former scan (mobs only) 3.76-3.83 µs, new 6.61-6.69 µs per push. Only while
+  a shulker opens further (20 ticks per opening): about 60 µs per opening in such a crowd. Lead
+  noted, not taken for this path alone: a spatial index of the items and orbs, which the piston push
+  (`push_targets`, same full walk) would share. Multi-core, GPU: not applicable (a few boxes).
+- Client side, the zones are built only for the shulkers opening further this tick; the player's
+  collision boxes for the push are gathered only when a zone exists: nothing more per tick otherwise.
+- Body rotation of a standing mob carrying a mob (client): the "first passenger is a mob" flag is
+  refreshed before each entity tick. Two leads, same flags (checked by
+  `entities::size_tests::standing_mob_carrying_a_mob_keeps_its_body`): walk of every entity 3.12-3.20
+  µs per tick, list of the vehicles that received passengers 0.127-0.129 µs (bench
+  `entities::size_tests::bench_mark_mob_riders`, 3,000 zombies, 10 vehicles, 2 passes; whole entity
+  tick 138-141 µs). Kept: the list; `RUSTCRAFT_OPT_RIDERLIST=0` brings back the walk.
+- Spawning and breeze dangers in one per-species test: same name tests as before, the fire tag read
+  only for a species that is not fire immune, the "immune to" tag only for six species; no extra
+  work on the spawning path, no bench. The new-world fingerprint changes (Nether entity chunks only:
+  fire-immune species now spawn in fire cells like the game), see `tests_opt.rs`.
+- Primed TNT and falling blocks written with the entity chunks: once per save, a dozen fields per
+  entity. Warden targets: team names built only when a team exists, border test two comparisons.
+- To re-measure on a quiet machine: the two micro-benches above; scene bench not concerned (no
+  shulker, jockey or sulfur cube in the scenes).

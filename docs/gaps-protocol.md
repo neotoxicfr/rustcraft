@@ -58,3 +58,8 @@ and the entities it simulates (items, orbs, TNT, falling blocks). Missing:
 - effects of the blocks crossed by a pushed mob (cobweb, berries, magma): to wire up with
   the mobs' block effects (G5-F02);
 - footstep sounds while the local player is pushed (the game emits them in the piston movement).
+
+The push of an opening shulker (G4-F08) moves the same entities, with an ordinary movement
+(slowdown of the tick applied, no caution at the edge): same missing cases (projectiles, vehicles,
+player on the server side, interpolated entities on the client side). The server does not model the
+scale attribute of the shulker (size 1 there; the client scales its push).

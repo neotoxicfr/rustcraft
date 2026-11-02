@@ -175,6 +175,8 @@ mod tests_g3f11;
 #[cfg(test)]
 mod tests_g3f13;
 #[cfg(test)]
+mod tests_g4f08; // G4-F08: shulker push, TNT, sulfur cube, creaking, warden, smaller mob gaps
+#[cfg(test)]
 mod tests_g3f08; // G3-F08: compute, posteffect, fetchprofile, attribute reset, loot targets
 
 use std::path::{Path, PathBuf};

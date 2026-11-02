@@ -25,7 +25,7 @@ pub(crate) fn open(tag: &str) -> (Probe, PathBuf) {
 }
 
 /// The world of `dir` opened again (same player setup and loaded chunks as `open`).
-fn reopen(dir: &std::path::Path, data: Arc<rc_data::VersionData>) -> Probe {
+pub(crate) fn reopen(dir: &std::path::Path, data: Arc<rc_data::VersionData>) -> Probe {
     let mut p = Probe::open(dir, data);
     p.s.pos = [0.5, -60.0, 0.5];
     p.s.loaded = true;

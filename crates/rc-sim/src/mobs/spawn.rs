@@ -1597,7 +1597,7 @@ impl Server {
     }
 
     /// Valid empty cell without looking at its fluid (caller that passes an empty fluid).
-    pub(crate) fn valid_empty_spawn_dry(&self, p: [i32; 3], _kind: Kind) -> bool {
+    pub(crate) fn valid_empty_spawn_dry(&self, p: [i32; 3], kind: Kind) -> bool {
         if self.sflag(p, flags::FULL_COLLISION) {
             return false;
         }
@@ -1621,19 +1621,34 @@ impl Server {
                     | "trapped_chest"
                     | "lightning_rod"
             );
-        let danger = matches!(
-            n,
-            "fire"
-                | "soul_fire"
-                | "magma_block"
-                | "sweet_berry_bush"
-                | "wither_rose"
-                | "cactus"
-                | "powder_snow"
-                | "lava"
-        ) || ((n == "campfire" || n == "soul_campfire")
-            && self.data.state_properties(self.st(p)).any(|kv| kv == ("lit", "true")));
-        !signal && !danger
+        !signal && !self.block_dangerous(p, kind)
+    }
+
+    /// Block dangerous for a species (the game's per-type test, shared by spawning and the
+    /// breeze's jumps): never for the species' own "immune to" tag; the burning blocks (fire tag,
+    /// lava, magma, lava cauldron, lit campfire) unless it is fire immune; wither rose, sweet
+    /// berry bush, cactus and powder snow.
+    pub(crate) fn block_dangerous(&self, p: [i32; 3], kind: Kind) -> bool {
+        let immune = match kind {
+            Kind::Fox => Some("minecraft:fox_immune_to"),
+            Kind::PolarBear => Some("minecraft:polar_bear_immune_to"),
+            Kind::SnowGolem => Some("minecraft:snow_golem_immune_to"),
+            Kind::Stray => Some("minecraft:stray_immune_to"),
+            Kind::Wither => Some("minecraft:wither_immune_to"),
+            Kind::WitherSkeleton => Some("minecraft:wither_skeleton_immune_to"),
+            _ => None,
+        };
+        if immune.is_some_and(|t| self.btag(p, t)) {
+            return false;
+        }
+        let n = self.bname(p).trim_start_matches("minecraft:");
+        let burning = || {
+            matches!(n, "lava" | "magma_block" | "lava_cauldron")
+                || self.btag_id(p, crate::tag_bits::TagId::Fire)
+                || ((n == "campfire" || n == "soul_campfire")
+                    && self.data.state_properties(self.st(p)).any(|kv| kv == ("lit", "true")))
+        };
+        matches!(n, "wither_rose" | "sweet_berry_bush" | "cactus" | "powder_snow") || (!kind.info().fire_immune && burning())
     }
 
     /// Own rules of a spawn data (`custom_spawn_rules`): block light and

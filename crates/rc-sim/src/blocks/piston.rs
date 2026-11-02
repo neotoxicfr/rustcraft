@@ -10,6 +10,7 @@ use super::{Dir, JavaMap, Kind, P, above, flag, rel, rel_n};
 use crate::mobs::mob::Mob;
 use crate::server::Server;
 use rc_physics::Aabb;
+use rc_physics::body::Heft;
 use rc_physics::piston::{BodyTarget, Moving, PistonTarget, Sweep, carry_stuck, push_collided};
 
 /// Mob pushed by a piston (`move(PISTON)`: movement with server collisions).
@@ -338,20 +339,20 @@ impl Server {
             for e in ents.iter_mut().filter(|e| !e.removed) {
                 let mut b = self.body_of(e);
                 if b.bounding_box().intersects(&area) {
-                    apply(&mut BodyTarget { b: &mut b, w: &w, t: &self.phys, time, g: 0.04 });
+                    apply(&mut BodyTarget { b: &mut b, w: &w, t: &self.phys, time, k: Heft::BLOCK });
                 }
                 Self::put_body(e, b);
             }
             for d in drops.iter_mut().filter(|d| !d.is_removed() && d.body.bounding_box().intersects(&area)) {
                 let b = &mut d.body;
                 (b.pos, b.vel, b.on_ground) = (d.pos, d.vel, d.on_ground);
-                apply(&mut BodyTarget { b, w: &w, t: &self.phys, time, g: 0.04 });
+                apply(&mut BodyTarget { b, w: &w, t: &self.phys, time, k: Heft::ITEM });
                 (d.pos, d.vel, d.on_ground) = (d.body.pos, d.body.vel, d.body.on_ground);
             }
             for o in orbs.iter_mut().filter(|o| !o.is_removed() && o.body.bounding_box().intersects(&area)) {
                 let b = &mut o.body;
                 (b.pos, b.vel, b.on_ground) = (o.pos, o.vel, o.on_ground);
-                apply(&mut BodyTarget { b, w: &w, t: &self.phys, time, g: 0.03 });
+                apply(&mut BodyTarget { b, w: &w, t: &self.phys, time, k: Heft::ORB });
                 (o.pos, o.vel, o.on_ground) = (o.body.pos, o.body.vel, o.body.on_ground);
             }
         }

@@ -112,10 +112,10 @@ impl App {
             noclip: Some(m.movement()),
         };
         for e in self.entities.map.values_mut().filter(|e| e.vehicle.is_none()) {
-            let g = if e.kind == "experience_orb" { 0.03 } else { 0.04 };
+            let k = entity_motion::heft(&e.kind);
             let Some(b) = e.motion.as_deref_mut() else { continue };
             (b.pos, b.vel, b.on_ground) = (e.pos, e.velocity, e.on_ground);
-            let mut target = BodyTarget { b, w: &world, t: &self.phys, time, g };
+            let mut target = BodyTarget { b, w: &world, t: &self.phys, time, k };
             if let Some(sw) = &sweep {
                 push_collided(sw, pos, &mut target);
             }

@@ -109,8 +109,8 @@ fn chance_of(v: &Value, lvl: i32) -> f32 {
     }
 }
 
-/// Float provider of a sound (constant or uniform), sampled on `rng`.
-fn sample(v: &Value, rng: &mut dyn Rand) -> f32 {
+/// Float provider (constant or uniform: sound volume, contact damage), sampled on `rng`.
+pub(crate) fn sample(v: &Value, rng: &mut dyn Rand) -> f32 {
     if let Some(n) = v.as_f64() {
         return n as f32;
     }

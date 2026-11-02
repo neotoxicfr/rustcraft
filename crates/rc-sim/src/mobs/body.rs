@@ -1018,6 +1018,10 @@ impl Server {
                     Self::push_pair(&mut o, m, po, pm);
                     // F06: a cube pushed by an iron golem is hurt by it (`push` of the cube).
                     self.cube_pushed_by_golem(&mut o, m);
+                    // A sulfur cube with a burning archetype hurts every entity it pushes.
+                    if m.kind == Kind::SulfurCube && !m.cube.contacts.is_empty() {
+                        self.sulfur_contact_mob(m, &mut o);
+                    }
                     self.mobs.list[i] = Some(o);
                 }
                 Ent::Player => {
@@ -1030,6 +1034,9 @@ impl Server {
                         m.vel[0] += xa;
                         m.vel[2] += za;
                         m.needs_sync = true;
+                    }
+                    if m.kind == Kind::SulfurCube && !m.cube.contacts.is_empty() {
+                        self.sulfur_contact_damage(m);
                     }
                 }
             }

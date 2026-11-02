@@ -17,9 +17,10 @@ fn set_resting(m: &mut Mob, v: bool) {
     }
 }
 
-/// "Conductive" block (full opaque) above.
+/// Redstone conductor block above (the game's per-block flag, not the opacity: a redstone
+/// block, an observer or TNT does not hold a resting bat).
 fn conductor(s: &Server, p: [i32; 3]) -> bool {
-    s.solid_render(p)
+    s.v().conductor(s.get(p))
 }
 
 /// End of `tick`: stuck to the ceiling at rest, otherwise vertical velocity damped.
@@ -40,17 +41,23 @@ pub fn custom_ai_step(s: &mut Server, m: &mut Mob) {
     let pos = m.block_pos();
     let above = [pos[0], pos[1] + 1, pos[2]];
     if resting(m) {
+        // The take-off event (sound for the client) only for a bat that is not silent.
+        let silent = m.x.silent;
         if conductor(s, above) {
             if m.rng.next_int_bound(200) == 0 {
                 m.head_yaw = m.rng.next_int_bound(360) as f32;
             }
             if s.targeting_ok(m, Ent::Player, false, 4.0, true, true) {
                 set_resting(m, false);
-                s.level_event(1025, pos, 0);
+                if !silent {
+                    s.level_event(1025, pos, 0);
+                }
             }
         } else {
             set_resting(m, false);
-            s.level_event(1025, pos, 0);
+            if !silent {
+                s.level_event(1025, pos, 0);
+            }
         }
         return;
     }

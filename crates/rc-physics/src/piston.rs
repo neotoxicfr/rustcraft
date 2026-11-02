@@ -418,13 +418,13 @@ impl PistonTarget for PlayerTarget<'_> {
 }
 
 /// Item, orb, primed TNT or falling block pushed (shared `body` physics), at game
-/// tick `time`, in world `w` (with `noclip`); `g`: gravity of the entity (0.04; orb 0.03).
+/// tick `time`, in world `w` (with `noclip`); `k`: gravity and slowing block of its kind.
 pub struct BodyTarget<'a> {
     pub b: &'a mut crate::body::Body,
     pub w: &'a dyn World,
     pub t: &'a Tables,
     pub time: i64,
-    pub g: f64,
+    pub k: crate::body::Heft,
 }
 
 impl PistonTarget for BodyTarget<'_> {
@@ -444,7 +444,7 @@ impl PistonTarget for BodyTarget<'_> {
         self.b.vel[axis] = v;
     }
     fn piston_push(&mut self, d: [f64; 3]) {
-        self.b.piston_move(d, self.time, self.w, self.t, self.g);
+        self.b.piston_move(d, self.time, self.w, self.t, self.k);
     }
 }
 

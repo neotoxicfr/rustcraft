@@ -126,6 +126,10 @@ pub(crate) struct SimEntity {
     /// Primed TNT that went through a portal ("took a portal" flag, not saved): its explosion does not
     /// break the Nether portal and loses no power there.
     pub used_portal: bool,
+    /// Primed TNT: explosion power (`explosion_power`, 4 by default, 0 to 128) and block it
+    /// shows (`block_state`; `None`: the TNT block).
+    pub power: f32,
+    pub block: Option<u32>,
 }
 
 impl SimEntity {
@@ -147,7 +151,20 @@ impl SimEntity {
             hurt: None,
             owner: None,
             used_portal: false,
+            power: 4.0,
+            block: None,
         }
+    }
+
+    /// Data of a primed TNT with `fuse` ticks left that its pairing carries: the fuse, and the
+    /// block it shows when it is not the TNT block.
+    pub(crate) fn tnt_data(&self, fuse: i32) -> Vec<(u8, rc_proto_v777::entity::Meta)> {
+        use rc_proto_v777::entity::Meta;
+        let mut values = vec![(8, Meta::Int(fuse))];
+        if let Some(b) = self.block {
+            values.push((9, Meta::State(b as i32)));
+        }
+        values
     }
 }
 
@@ -350,7 +367,8 @@ impl Server {
     }
 
     fn spawn_tnt(&mut self, p: P, fuse: i32, owner: Option<crate::mobs::mob::Ent>) {
-        let rot = self.bs.rng.next_double() * std::f64::consts::TAU;
+        // A full turn as the game writes it: 2π rounded to a float, then widened.
+        let rot = self.bs.rng.next_double() * f64::from(std::f32::consts::TAU);
         let id = self.alloc_entity();
         let pos = [f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5];
         let vel = [-rot.sin() * 0.02, 0.2f32 as f64, -rot.cos() * 0.02];
@@ -368,12 +386,16 @@ impl Server {
         self.bs.entities.list.push(e);
     }
 
-    /// Primed TNT or falling block summoned (`/summon`): simulated like those of the blocks, with the
-    /// velocity (`Motion`, component beyond 10 read as 0), the fuse (`fuse`, 80) or the state
-    /// (`BlockState`, sand by default and in place of air) and the duration (`Time`) of the NBT.
+    /// Primed TNT or falling block summoned (`/summon`) or read with its chunk: simulated like those
+    /// of the blocks, with the velocity (`Motion`, component beyond 10 read as 0), the fuse (`fuse`,
+    /// a short, 80), power (`explosion_power`, 0 to 128) and block (`block_state`) of the TNT or
+    /// the state (`BlockState`, sand by default and in place of air) and the duration (`Time`) of
+    /// the NBT.
     pub(crate) fn summon_sim_entity(&mut self, ty: &str, pos: [f64; 3], nbt: Option<&Nbt>) -> Option<i32> {
         let kind = match ty {
-            "minecraft:tnt" => EntKind::Tnt(nbt.and_then(|n| crate::nbtio::int(n, "fuse")).unwrap_or(80) as i32),
+            "minecraft:tnt" => {
+                EntKind::Tnt(nbt.and_then(|n| crate::nbtio::int(n, "fuse")).map_or(80, |f| i32::from(f as i16)))
+            }
             "minecraft:falling_block" => {
                 let sand = self.states.state_of(&self.data, &Nbt::String("minecraft:sand".into()))?;
                 let s = nbt
@@ -406,20 +428,23 @@ impl Server {
             }
             e.drop_item = flag("DropItem").unwrap_or(true);
             e.cancel_drop = flag("CancelDrop").unwrap_or(false);
-            e.fall = match nbt.and_then(|n| n.get("fall_distance")) {
-                Some(Nbt::Double(d)) => *d,
-                _ => 0.0,
-            };
+        } else {
+            e.power = nbt.and_then(|n| crate::nbtio::float(n, "explosion_power")).map_or(4.0, |p| p.clamp(0.0, 128.0));
+            let tnt = self.default_state("minecraft:tnt");
+            let block = nbt.and_then(|n| n.get("block_state")).and_then(|b| self.states.state_of(&self.data, b));
+            e.block = block.filter(|&s| s != tnt);
+            e.owner = nbt.and_then(|n| crate::nbtio::uuid(n.get("owner"))).and_then(|u| self.ent_of_uuid(u));
         }
+        e.fall = match nbt.and_then(|n| n.get("fall_distance")) {
+            Some(Nbt::Double(d)) => *d,
+            _ => 0.0,
+        };
         match kind {
             EntKind::Tnt(_) => self.add_entity_packet(&e, "minecraft:tnt", 0),
             EntKind::Falling(s) => self.add_entity_packet(&e, "minecraft:falling_block", s as i32),
         }
         if let EntKind::Tnt(fuse) = kind {
-            let _ = self.send(Event::Entity(EntityEvent::Data {
-                id,
-                values: vec![(8, rc_proto_v777::entity::Meta::Int(fuse))],
-            }));
+            let _ = self.send(Event::Entity(EntityEvent::Data { id, values: e.tnt_data(fuse) }));
         }
         self.bs.entities.list.push(e);
         Some(id)
@@ -431,7 +456,7 @@ impl Server {
     }
 
     /// Physics shared with the client (`rc_physics::body`), re-synced onto the entity.
-    pub(super) fn body_of(&self, e: &mut SimEntity) -> Box<Body> {
+    pub(crate) fn body_of(&self, e: &mut SimEntity) -> Box<Body> {
         let eye = if matches!(e.kind, EntKind::Tnt(_)) { 0.15 } else { 0.833 };
         let mut b = e
             .body
@@ -443,7 +468,7 @@ impl Server {
         b
     }
 
-    pub(super) fn put_body(e: &mut SimEntity, b: Box<Body>) {
+    pub(crate) fn put_body(e: &mut SimEntity, b: Box<Body>) {
         (e.pos, e.vel, e.on_ground) = (b.pos, b.vel, b.on_ground);
         e.body = Some(b);
     }
@@ -865,7 +890,7 @@ impl Server {
                 // the common explosion: damage, knockback, loot, packet (particles and sound).
                 self.game_event_src("minecraft:explode", c, Some(crate::mobs::recent::vibration::Src::Other), None);
                 // In water: state at the end of the previous tick, like the game.
-                self.tnt_explode(e.id, c, 4.0, e.owner, wet, e.used_portal);
+                self.tnt_explode(e.id, c, e.power, e.owner, wet, e.used_portal);
             }
         }
     }
@@ -876,6 +901,56 @@ impl Server {
         self.contact.ticking_sim = Some((e.id, Self::entity_box(e)));
         self.contact_triggers(from, e.pos, FALLING_SIZE / 2.0, FALLING_SIZE);
         self.contact.ticking_sim = None;
+    }
+
+    /// Primed TNT and falling blocks to write into the entity chunks, with the fields the game
+    /// saves (common part, then fuse, block and power of the TNT, or state, duration and flags of
+    /// the falling block). Never saved before: lost on reload.
+    pub(crate) fn sim_entities_into_chunks(&self, by_chunk: &mut std::collections::BTreeMap<(i32, i32), Vec<Nbt>>) {
+        let dbl = |v: [f64; 3]| Nbt::List(v.iter().map(|&x| Nbt::Double(x)).collect());
+        let flag = |b: bool| Nbt::Byte(i8::from(b));
+        for e in self.bs.entities.list.iter().filter(|e| !e.removed) {
+            let c = ((e.pos[0].floor() as i32) >> 4, (e.pos[2].floor() as i32) >> 4);
+            let id = if matches!(e.kind, EntKind::Tnt(_)) { "minecraft:tnt" } else { "minecraft:falling_block" };
+            let cooldown = self.dims.ents.get(&e.id).map_or(0, |p| p.cooldown);
+            let mut f: Vec<(String, Nbt)> = vec![
+                ("id".into(), Nbt::String(id.into())),
+                ("Pos".into(), dbl(e.pos)),
+                ("Motion".into(), dbl(e.vel)),
+                ("Rotation".into(), Nbt::List(vec![Nbt::Float(0.0), Nbt::Float(0.0)])),
+                ("fall_distance".into(), Nbt::Double(e.fall)),
+                ("Fire".into(), Nbt::Short(0)),
+                ("Air".into(), Nbt::Short(300)),
+                ("OnGround".into(), flag(e.on_ground)),
+                ("Invulnerable".into(), flag(false)),
+                ("PortalCooldown".into(), Nbt::Int(cooldown)),
+                ("UUID".into(), Nbt::IntArray(vec![0x5332_0001, 0, 0, e.id])),
+            ];
+            match e.kind {
+                EntKind::Tnt(fuse) => {
+                    f.push(("fuse".into(), Nbt::Short(fuse as i16)));
+                    let block = e.block.unwrap_or_else(|| self.default_state("minecraft:tnt"));
+                    f.push(("block_state".into(), self.state_nbt(block)));
+                    if e.power != 4.0 {
+                        f.push(("explosion_power".into(), Nbt::Float(e.power)));
+                    }
+                    if let Some(u) = e.owner.and_then(|o| self.ent_uuid_of(o)) {
+                        f.push(("owner".into(), crate::nbtio::uuid_nbt(u)));
+                    }
+                }
+                EntKind::Falling(s) => {
+                    let (per, max) = e.hurt.unwrap_or((0.0, 40));
+                    f.push(("BlockState".into(), self.state_nbt(s)));
+                    f.push(("Time".into(), Nbt::Int(e.time)));
+                    f.push(("DropItem".into(), flag(e.drop_item)));
+                    f.push(("HurtEntities".into(), flag(e.hurt.is_some())));
+                    f.push(("FallHurtAmount".into(), Nbt::Float(per)));
+                    f.push(("FallHurtMax".into(), Nbt::Int(max)));
+                    f.push(("CancelDrop".into(), flag(e.cancel_drop)));
+                }
+            }
+            by_chunk.entry(c).or_default().push(Nbt::Compound(f));
+        }
     }
 
     /// TNT block blown up by an explosion: primed with a short fuse (10 to 29 ticks).

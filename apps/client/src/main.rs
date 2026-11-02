@@ -2289,6 +2289,8 @@ impl App {
         if runs {
             // Projectiles, items, orbs, falling blocks, TNT: also simulated client-side between
             // two server resyncs (`projectile_sim.rs`, `entity_motion.rs`).
+            let zones = entity_motion::shulker_peeks(&mut self.entities);
+            let pushable = self.positioned && self.env.game_mode != 3 && self.moves_freely();
             let colliders = entity_motion::colliders(&self.entities, None, None);
             let world = GridWorld {
                 grid: &self.world.grid,
@@ -2300,6 +2302,14 @@ impl App {
                 movers: Some(&self.block_entities),
                 noclip: None,
             };
+            if !zones.is_empty() {
+                // Opening shulkers push the local player (their own collision world, as for
+                // their movement) and the bodies simulated here.
+                let mine = entity_motion::colliders(&self.entities, None, Some(self.player.pos[1]));
+                let pw = GridWorld { colliders: &mine, ..world };
+                let me = pushable.then_some((&mut self.player, &pw as &dyn rc_physics::World));
+                entity_motion::shulker_push(&mut self.entities, &zones, me, &world, &self.phys);
+            }
             let me = rc_physics::body::Follow {
                 id: self.player_id,
                 pos: self.player.pos,

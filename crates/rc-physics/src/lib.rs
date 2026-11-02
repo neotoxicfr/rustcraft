@@ -835,6 +835,15 @@ pub fn below_of(support: Option<[i32; 3]>, pos: [f64; 3], t: &Tables, w: &dyn Wo
 
 // ---------- Player ----------
 
+/// What moves the player: their own movement, a piston (slowdown not applied), or another
+/// entity (opening shulker: slowdown applied, no caution at the edge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveBy {
+    Own,
+    Piston,
+    Other,
+}
+
 /// Keys of the tick (in the order of the input packet).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Input {
@@ -2082,7 +2091,19 @@ impl Player {
 
     /// Movement `d` with collisions (`move(SELF, d)`).
     fn move_by(&mut self, d: [f64; 3], sx: f32, fz: f32, input: Input, w: &dyn World, t: &Tables) {
-        self.move_typed(d, sx, fz, input, w, t, false);
+        self.move_typed(d, sx, fz, input, w, t, MoveBy::Own);
+    }
+
+    /// Push by another entity (a shulker opening into the player): an ordinary movement,
+    /// multiplied by the slowdown of the tick, without the caution at the edge (kept for the
+    /// player's own movement), recorded for the block effects of the next tick. A spectator
+    /// (no physics) is left in place, like the game skips it.
+    pub fn shove(&mut self, d: [f64; 3], w: &dyn World, t: &Tables) {
+        if self.spectator {
+            return;
+        }
+        let input = Input { shift: self.descending, ..Input::default() };
+        self.move_typed(d, 0.0, 0.0, input, w, t, MoveBy::Other);
     }
 
     /// Piston push (`move(PISTON, d)`) at game tick `time`: cap of 0.51 per axis and
@@ -2098,7 +2119,7 @@ impl Player {
         // Push capped to zero: no movement, but block effects (zero segment) and
         // removal of the last one recorded all the same, like the game.
         if self.spectator || d != [0.0; 3] {
-            self.move_typed(d, 0.0, 0.0, input, w, t, true);
+            self.move_typed(d, 0.0, 0.0, input, w, t, MoveBy::Piston);
         }
         self.moves.pop();
         let saved = std::mem::replace(&mut self.moves, vec![(from, self.pos, [0.0; 3])]);
@@ -2107,7 +2128,8 @@ impl Player {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn move_typed(&mut self, d: [f64; 3], sx: f32, fz: f32, input: Input, w: &dyn World, t: &Tables, piston: bool) {
+    fn move_typed(&mut self, d: [f64; 3], sx: f32, fz: f32, input: Input, w: &dyn World, t: &Tables, by: MoveBy) {
+        let piston = by == MoveBy::Piston;
         let before = self.pos;
         let mut d = d;
         // Spectator: passes through everything, collision flags false, nothing else (§ 6.2, step 0).
@@ -2132,8 +2154,8 @@ impl Player {
         let step = self.attr("minecraft:step_height");
         // Collision searches with the player's context (scaffolding, powder snow).
         let cw = self.ctx(w, t);
-        // Caution at the edge (§ 6.4), not for a piston push.
-        if !piston && !self.flying && d[1] <= 0.0 && input.shift && self.above_ground(&cw, step) {
+        // Caution at the edge (§ 6.4): the player's own movement only.
+        if by == MoveBy::Own && !self.flying && d[1] <= 0.0 && input.shift && self.above_ground(&cw, step) {
             d = self.back_off_edge(d, &cw, step);
         }
         let start = self.bounding_box();

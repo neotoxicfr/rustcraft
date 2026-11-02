@@ -187,12 +187,29 @@ fn sound(s: &mut Server, m: &mut Mob, name: &str, volume: f32) {
     s.mob_sound(m, name, volume, 1.0);
 }
 
-/// Living, neither creative nor spectator, not another warden nor an armor stand,
-/// not dead.
-pub fn can_target(s: &Server, _m: &Mob, e: Ent) -> bool {
+/// Living, in the warden's dimension, neither creative nor spectator, not of the warden's team,
+/// not another warden (armor stands are not mobs here), not invulnerable, not dead, its box
+/// inside the world border.
+pub fn can_target(s: &Server, m: &Mob, e: Ent) -> bool {
+    // Same scoreboard team (names built only when some team exists).
+    let allied = |holder: &dyn Fn() -> String| {
+        !s.cmd.scores.teams.is_empty() && s.same_team(&crate::nbtio::uuid_text(m.uuid), &holder())
+    };
     match e {
-        Ent::Player => !matches!(s.game_mode, 1 | 3) && s.ent_alive(Ent::Player),
-        Ent::Mob(id) => s.mob_ref(id).is_some_and(|o| o.alive() && o.kind != Kind::Warden),
+        Ent::Player => {
+            s.dims.home.is_none()
+                && !matches!(s.game_mode, 1 | 3)
+                && s.ent_alive(Ent::Player)
+                && !allied(&|| s.name.clone())
+                && s.box_in_border(&s.player_aabb())
+        }
+        Ent::Mob(id) => s.mob_ref(id).is_some_and(|o| {
+            o.alive()
+                && o.kind != Kind::Warden
+                && !o.invulnerable
+                && !allied(&|| crate::nbtio::uuid_text(o.uuid))
+                && s.box_in_border(&o.bbox())
+        }),
     }
 }
 
@@ -361,15 +378,27 @@ fn anger_tick(s: &Server, m: &mut Mob) {
             true
         }
     });
+    let mut moved = Vec::new();
     a.suspects.retain_mut(|x| {
-        let valid = can_target(s, m, x.0);
-        if x.2 > 1 && valid {
+        // Removed mob (left the list, or marked during this tick).
+        let gone = matches!(x.0, Ent::Mob(id) if s.mob_ref(id).is_none_or(|o| o.removed));
+        if x.2 > 1 && !gone && can_target(s, m, x.0) {
             x.2 -= 1;
             true
         } else {
+            // A mob gone to another dimension (alive there) keeps its anger by UUID.
+            if x.2 > 1 && gone && s.dims.parked.iter().any(|w| w.mobs.get_uuid(x.1).is_some()) {
+                moved.push((x.1, x.2 - 1));
+            }
             false
         }
     });
+    for (u, v) in moved {
+        match a.by_uuid.iter_mut().find(|e| e.0 == u) {
+            Some(e) => e.1 = v,
+            None => a.by_uuid.push((u, v)),
+        }
+    }
     a.sort();
     m.rec.anger = a;
 }

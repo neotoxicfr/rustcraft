@@ -194,7 +194,7 @@ impl Server {
         }
         m.end.peek_amount =
             if cur > target { (cur - 0.05).clamp(target, 1.0) } else { (cur + 0.05).clamp(0.0, target) };
-        // Push of entities (not shulkers) in the open zone.
+        // Push of the entities in the zone the opening sweeps this tick.
         let (now, old) = (physical_peek(m.end.peek_amount), physical_peek(m.end.peek_o));
         let dir = opposite(m.end.attach);
         let push = now - old;
@@ -202,23 +202,59 @@ impl Server {
             return;
         }
         let area = progress_delta_box(dir, old, now, m.pos);
-        let s = step(dir).map(|v| f64::from(v) * f64::from(push));
-        let ids: Vec<i32> = self
-            .mobs
-            .list
-            .iter()
-            .flatten()
-            .filter(|o| o.id != m.id && o.kind != Kind::Shulker && o.alive() && o.touches(&area))
-            .map(|o| o.id)
-            .collect();
-        for id in ids {
-            if let Some(i) = self.mob_index(id)
-                && let Some(o) = self.mobs.list[i].as_mut()
-            {
-                o.pos = [o.pos[0] + s[0], o.pos[1] + s[1], o.pos[2] + s[2]];
-                o.needs_sync = true;
+        let s = step(dir).map(|v| f64::from(v as f32 * push));
+        self.shulker_shove(m, &area, s);
+    }
+
+    /// Entities whose box touches `area`, moved by `d` with their collisions (an ordinary
+    /// movement, not a piston one): mobs except shulkers, those without physics (vex, dragon)
+    /// and those riding the same root vehicle as the shulker, dying ones included; items, orbs,
+    /// primed TNT and falling blocks. The player is pushed by their own client, which opens the
+    /// shulker too (`entity_motion.rs`). Projectiles and vehicles: not yet, as for the piston.
+    pub(crate) fn shulker_shove(&mut self, m: &Mob, area: &rc_physics::Aabb, d: [f64; 3]) {
+        use rc_physics::body::Heft;
+        for i in 0..self.mobs.list.len() {
+            let hit = self.mobs.list[i].as_ref().is_some_and(|o| {
+                !o.removed
+                    && o.id != m.id
+                    && !matches!(o.kind, Kind::Shulker | Kind::EnderDragon)
+                    && !crate::mobs::illagers::no_physics(o)
+                    && o.touches(area)
+                    && !self.same_root(m, o)
+            });
+            if !hit {
+                continue;
+            }
+            let Some(mut o) = self.mobs.list[i].take() else { continue };
+            self.mob_move(&mut o, d);
+            self.mobs.list[i] = Some(o);
+        }
+        let mut ents = std::mem::take(&mut self.bs.entities.list);
+        let mut drops = std::mem::take(&mut self.life.drops);
+        let mut orbs = std::mem::take(&mut self.life.orbs);
+        {
+            let w = self.world();
+            for e in ents.iter_mut().filter(|e| !e.removed && Self::entity_box(e).intersects(area)) {
+                let mut b = self.body_of(e);
+                b.shove(d, &w, &self.phys, Heft::BLOCK);
+                Self::put_body(e, b);
+            }
+            for x in drops.iter_mut().filter(|x| !x.is_removed() && x.body.bounding_box().intersects(area)) {
+                let b = &mut x.body;
+                (b.pos, b.vel, b.on_ground) = (x.pos, x.vel, x.on_ground);
+                b.shove(d, &w, &self.phys, Heft::ITEM);
+                (x.pos, x.vel, x.on_ground) = (b.pos, b.vel, b.on_ground);
+            }
+            for x in orbs.iter_mut().filter(|x| !x.is_removed() && x.body.bounding_box().intersects(area)) {
+                let b = &mut x.body;
+                (b.pos, b.vel, b.on_ground) = (x.pos, x.vel, x.on_ground);
+                b.shove(d, &w, &self.phys, Heft::ORB);
+                (x.pos, x.vel, x.on_ground) = (b.pos, b.vel, b.on_ground);
             }
         }
+        self.bs.entities.list = ents;
+        self.life.drops = drops;
+        self.life.orbs = orbs;
     }
 
     /// 5 tries at ±8 on each axis (entity random); empty cell,

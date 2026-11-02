@@ -1076,6 +1076,10 @@ impl Server {
             if m.kind == Kind::Dolphin {
                 self.mob_sound(m, "minecraft:entity.dolphin.attack", 1.0, 1.0);
             }
+            // The creaking's attack sound (its own volume and voice pitch).
+            if m.kind == Kind::Creaking {
+                self.make_sound(m, "minecraft:entity.creaking.attack");
+            }
         }
         self.wild_after_attack(m, hurt); // F11: panda bite sound
         hurt

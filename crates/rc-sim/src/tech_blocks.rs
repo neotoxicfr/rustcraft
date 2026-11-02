@@ -846,7 +846,7 @@ impl Server {
     }
 
     /// Palette entry of a state (`Name`, `Properties` if any).
-    fn state_nbt(&self, s: u32) -> Nbt {
+    pub(crate) fn state_nbt(&self, s: u32) -> Nbt {
         let name = self.data.block_of(s).map_or("minecraft:air", |b| b.name.as_str()).to_owned();
         let props: Vec<(String, Nbt)> = self
             .v()

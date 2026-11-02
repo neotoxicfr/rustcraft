@@ -354,6 +354,7 @@ impl Server {
             || name.ends_with("_stained_glass")
             || name.ends_with("_pane")
             || name == "iron_bars"
+            || name.ends_with("copper_bars")
             || name == "powder_snow"
             || (name.contains("copper_grate"));
         if transparent {

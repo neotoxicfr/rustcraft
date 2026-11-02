@@ -48,7 +48,9 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// G3-F08: the player file always carries `post_effects` like the game's (alone: b993b7aa…, 823),
 /// and zombies, husks, zombie villagers, drowned, spiders, cave spiders and endermen move at
 /// their single-precision speed widened like the game's; without both: 5092e230… again.
-const EXPECTED_NEW: (&str, usize) = ("521f08db7744fcb239fff91a8324e19b689efc1eaa316dafa106292e72dcea0f", 823);
+/// G4-F08: fire-immune species may spawn in a fire cell like the game's (Nether entity chunks;
+/// before: 521f08db…, 823).
+const EXPECTED_NEW: (&str, usize) = ("360ac84c83a0bedb70e4b6231607424a6a89930a440bb1e03240ee99819714a6", 807);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 const EXPECTED_MODEL: &[(&str, &str, usize)] = &[(
     "790b2d94653a4243e68f2e0cb0ebc3f865f9f59815ed65149067cdd374c6b800",
