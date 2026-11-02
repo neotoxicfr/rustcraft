@@ -21,37 +21,31 @@ pub fn sanitize_name(base: &str) -> String {
     base.chars().map(|c| if ILLEGAL.contains(&c) || matches!(c, '.' | '/' | '"') { '_' } else { c }).collect()
 }
 
-/// Reserved Windows name (`CON`, `COM1`…, or ending with a dot): refused as is.
+/// Reserved Windows name (`CON`, `COM1`…, or ending with a dot): refused as is. The game's list
+/// also holds a bare `COM` (but no bare `LPT`).
 fn reserved(name: &str) -> bool {
     if name.ends_with('.') {
         return true;
     }
     let up = name.to_ascii_uppercase();
     let stem = up.split('.').next().unwrap_or("");
-    matches!(stem, "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$")
+    matches!(stem, "CON" | "PRN" | "AUX" | "NUL" | "CLOCK$" | "COM")
         || ((stem.starts_with("COM") || stem.starts_with("LPT"))
             && stem.len() == 4
             && stem.as_bytes()[3].is_ascii_digit()
             && stem.as_bytes()[3] != b'0')
 }
 
-/// First free name in `dir` for `base` (+ `suffix`): cleaned name, "Name (n)" taken up and
-/// counted, suffix "(n)" added as long as the folder exists (case ignored on Windows).
+/// First free name in `dir` for `base` (+ `suffix`): cleaned name, then " (n)" added from 1
+/// as long as the folder exists (case ignored on Windows). A base already ending in " (n)" keeps
+/// it and gets a second counter ("World (3)" → "World (3) (1)"): the game's copy-counter
+/// pattern never matches (quirk reproduced, `docs/quirks-to-reproduce.md`).
 pub fn find_available_name(dir: &Path, base: &str, suffix: &str) -> String {
     let mut base = sanitize_name(base);
     if reserved(&base) {
         base = format!("_{base}_");
     }
     let mut count = 0u32;
-    if let Some(open) = base.rfind(" (")
-        && base.ends_with(')')
-    {
-        let digits = &base[open + 2..base.len() - 1];
-        if digits.chars().all(|c| c.is_ascii_digit()) {
-            count = digits.parse().unwrap_or(0);
-            base.truncate(open);
-        }
-    }
     let limit = |s: &str, n: usize| -> String { s.chars().take(n).collect() };
     let max = 255usize.saturating_sub(suffix.chars().count());
     base = limit(&base, max);
@@ -395,88 +389,185 @@ fn remove_tree(dir: &Path, keep: Option<&Path>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Optimisation progress, read by the screen while the thread works.
+/// Optimisation progress, read by the screen while the thread works. Like the game, the chunk
+/// counters and the pass progress restart with each pass; the dimensions' progress does not.
 #[derive(Default)]
 pub struct Optimize {
-    /// 0 counting, 1 rewriting, 2 finished, 3 cancelled, 4 failed.
+    /// 0 counting, 1 upgrading, 2 finished (last dimension worked on).
     pub stage: AtomicU8,
+    /// Pass: 0 none yet, otherwise rank + 1 in [`OPTIMIZE_PASSES`].
+    pub pass: AtomicU8,
+    /// Chunks of the pass.
     pub total: AtomicU32,
     pub converted: AtomicU32,
     pub skipped: AtomicU32,
-    /// Chunks processed per dimension (Overworld, Nether, End).
-    pub done: [AtomicU32; 3],
-    pub per_dim: [AtomicU32; 3],
+    /// Progress (`f32` bits) of each dimension (Overworld, Nether, End): its region files done
+    /// over all the region files of the pass.
+    pub dim_progress: [AtomicU32; 3],
+    /// Progress (`f32` bits) of the pass, in region files.
+    pub progress: AtomicU32,
     pub cancel: AtomicBool,
 }
 
-/// Optimisation ("Optimize World"): each chunk of the three dimensions is read again; data from
-/// an older version cannot be converted here (counted "ignored");
-/// `erase_cache` removes stored heights and light then rewrites the chunk ("converted").
-pub fn optimize(world: &Path, erase_cache: bool, p: &Optimize) {
-    let dims = crate::server::DIMENSIONS;
-    let mut work: Vec<(usize, PathBuf)> = Vec::new();
-    for (k, d) in dims.iter().enumerate() {
-        let dir = crate::world::dimension_dir(world, d).join("region");
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-        for e in rd.flatten() {
-            let path = e.path();
-            if path.extension().is_some_and(|x| x == "mca") {
-                let n = RegionFile::open(&path, false).map_or(0, |r| r.present().count() as u32);
-                p.total.fetch_add(n, Ordering::Relaxed);
-                p.per_dim[k].fetch_add(n, Ordering::Relaxed);
-                work.push((k, path));
-            }
-        }
+impl Optimize {
+    pub fn dim_progress(&self, k: usize) -> f32 {
+        f32::from_bits(self.dim_progress[k].load(Ordering::Relaxed))
     }
-    p.stage.store(1, Ordering::Release);
-    for (k, path) in work {
-        let Some((rx, rz)) = region_coords(&path) else { continue };
-        let Ok(mut r) = RegionFile::open(&path, erase_cache) else { continue };
-        let present: Vec<usize> = r.present().collect();
-        for i in present {
-            if p.cancel.load(Ordering::Acquire) {
-                p.stage.store(3, Ordering::Release);
-                return;
-            }
-            let (cx, cz) = (rx * 32 + (i % 32) as i32, rz * 32 + (i / 32) as i32);
-            let rewritten = match r.read(i, cx, cz) {
-                Ok(Some(bytes)) if erase_cache => match nbtio::parse_root(&bytes) {
-                    Ok(mut root) => {
-                        erase_chunk_cache(&mut root);
-                        r.write(i, cx, cz, &nbtio::encode_root(&root)).is_ok()
-                    }
-                    Err(_) => false,
-                },
-                _ => false,
-            };
-            let counter = if rewritten { &p.converted } else { &p.skipped };
-            counter.fetch_add(1, Ordering::Relaxed);
-            p.done[k].fetch_add(1, Ordering::Relaxed);
-        }
-        if erase_cache && r.close().is_err() {
-            p.stage.store(4, Ordering::Release);
-            return;
-        }
+
+    pub fn progress(&self) -> f32 {
+        f32::from_bits(self.progress.load(Ordering::Relaxed))
     }
-    p.stage.store(2, Ordering::Release);
 }
 
+/// Passes of the optimisation in the game's order: (folder of the dimension, status key suffix).
+pub const OPTIMIZE_PASSES: [(&str, &str); 3] = [("entities", "entities"), ("poi", "poi"), ("region", "chunks")];
+
+/// Optimisation ("Optimize World"), three passes like the game: entity chunks, points of
+/// interest, then block chunks, each dimension in turn. A pass counts the region files holding
+/// chunks, then reads every chunk again: in the block pass, `erase_cache` removes stored heights
+/// and light and rewrites the chunk ("converted") when any was there; otherwise "skipped". Data
+/// from an older version would be converted by the game's data fixers, not reproduced here: left
+/// as is and counted "skipped". Cancelling stops after the region files being processed.
+/// The region files of a dimension are shared among `RUSTCRAFT_THREADS` threads (default: the
+/// logical cores), one file per thread at a time.
+pub fn optimize(world: &Path, erase_cache: bool, p: &Optimize) {
+    let threads = rc_data::env_str!("RUSTCRAFT_THREADS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get));
+    optimize_with(world, erase_cache, p, threads);
+}
+
+fn optimize_with(world: &Path, erase_cache: bool, p: &Optimize, threads: usize) {
+    let dims = crate::server::DIMENSIONS;
+    for (rank, (folder, _)) in OPTIMIZE_PASSES.iter().enumerate() {
+        for c in [&p.total, &p.converted, &p.skipped] {
+            c.store(0, Ordering::Relaxed);
+        }
+        p.pass.store(rank as u8 + 1, Ordering::Release);
+        let erase = erase_cache && *folder == "region";
+        let files: Vec<Vec<(PathBuf, Vec<usize>)>> =
+            dims.iter().map(|d| region_files(&crate::world::dimension_dir(world, d).join(folder))).collect();
+        for f in files.iter().flatten() {
+            p.total.fetch_add(f.1.len() as u32, Ordering::Relaxed);
+        }
+        let all = files.iter().map(Vec::len).sum::<usize>() as f32;
+        let mut start = 0;
+        for (k, list) in files.iter().enumerate() {
+            if !list.is_empty() {
+                p.stage.store(1, Ordering::Release);
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                // Files finished, under the lock so that the shown progress only grows.
+                let done = std::sync::Mutex::new(0usize);
+                let work = || {
+                    while !p.cancel.load(Ordering::Acquire) {
+                        let Some((path, chunks)) = list.get(next.fetch_add(1, Ordering::Relaxed)) else { break };
+                        optimize_file(path, chunks, erase, p);
+                        let mut d = done.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        *d += 1;
+                        p.dim_progress[k].store((*d as f32 / all).to_bits(), Ordering::Relaxed);
+                        p.progress.store(((start + *d) as f32 / all).to_bits(), Ordering::Relaxed);
+                    }
+                };
+                let n = threads.clamp(1, list.len());
+                if n == 1 {
+                    work();
+                } else {
+                    std::thread::scope(|s| {
+                        for _ in 0..n {
+                            s.spawn(work);
+                        }
+                    });
+                }
+                p.stage.store(2, Ordering::Release);
+            }
+            start += list.len();
+        }
+    }
+}
+
+/// Region files (`r.<x>.<z>.mca`) of `dir` holding chunks, with their chunks in the game's order
+/// (a column of the region after the other).
+fn region_files(dir: &Path) -> Vec<(PathBuf, Vec<usize>)> {
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut out = Vec::new();
+    for e in rd.flatten() {
+        let path = e.path();
+        if region_coords(&path).is_none() {
+            continue;
+        }
+        let Ok(r) = RegionFile::open(&path, false) else { continue };
+        let mut have = [false; 1024];
+        for i in r.present() {
+            have[i] = true;
+        }
+        let chunks: Vec<usize> = (0..32).flat_map(|x| (0..32).map(move |z| x + 32 * z)).filter(|&i| have[i]).collect();
+        if !chunks.is_empty() {
+            out.push((path, chunks));
+        }
+    }
+    out
+}
+
+/// One region file of a pass: each chunk counted "converted" (rewritten) or "skipped".
+fn optimize_file(path: &Path, chunks: &[usize], erase: bool, p: &Optimize) {
+    let Some((rx, rz)) = region_coords(path) else { return };
+    // Without erasing nothing can change (same version) or be converted here (older data): every
+    // chunk is skipped without reading it again.
+    let opened = if erase { RegionFile::open(path, true).ok() } else { None };
+    let Some(mut r) = opened else {
+        p.skipped.fetch_add(chunks.len() as u32, Ordering::Relaxed);
+        return;
+    };
+    for &i in chunks {
+        let (cx, cz) = (rx * 32 + (i % 32) as i32, rz * 32 + (i / 32) as i32);
+        let converted = match r.read(i, cx, cz) {
+            Ok(Some(bytes)) => match nbtio::parse_root(&bytes) {
+                Ok(mut root) => {
+                    let current = nbtio::int(&root, "DataVersion").is_some_and(|v| v >= i64::from(crate::chunk::DATA_VERSION));
+                    // Counted as soon as it is sent to be written, like the game (a failed
+                    // write only reaches its log).
+                    current && erase_chunk_cache(&mut root) && {
+                        let _ = r.write(i, cx, cz, &nbtio::encode_root(&root));
+                        true
+                    }
+                }
+                Err(_) => false,
+            },
+            _ => false,
+        };
+        let counter = if converted { &p.converted } else { &p.skipped };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+    let _ = r.close();
+}
+
+/// Region of a file named exactly `r.<x>.<z>.mca` (optional minus sign and digits only).
 fn region_coords(path: &Path) -> Option<(i32, i32)> {
     let name = path.file_name()?.to_str()?;
-    let mut it = name.strip_prefix("r.")?.strip_suffix(".mca")?.split('.');
-    Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+    let (x, z) = name.strip_prefix("r.")?.strip_suffix(".mca")?.split_once('.')?;
+    let num = |s: &str| {
+        let digits = s.strip_prefix('-').unwrap_or(s);
+        (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse().ok()).flatten()
+    };
+    Some((num(x)?, num(z)?))
 }
 
-/// Recomputable data of a chunk: heights, light flag, section light.
-fn erase_chunk_cache(root: &mut Nbt) {
-    nbtio::remove(root, "Heightmaps");
-    nbtio::remove(root, "isLightOn");
+/// Recomputable data of a chunk removed: heights, light flag, section light; true if any was there.
+fn erase_chunk_cache(root: &mut Nbt) -> bool {
+    let take = |v: &mut Nbt, key: &str| {
+        let had = v.get(key).is_some();
+        nbtio::remove(v, key);
+        had
+    };
+    let mut had = take(root, "Heightmaps");
+    had |= take(root, "isLightOn");
     if let Some(Nbt::List(sections)) = nbtio::get_mut(root, "sections") {
         for s in sections {
-            nbtio::remove(s, "BlockLight");
-            nbtio::remove(s, "SkyLight");
+            had |= take(s, "BlockLight");
+            had |= take(s, "SkyLight");
         }
     }
+    had
 }
 
 /// Visible flat world preset (`flat_level_generator_preset`, tag `visible`).
@@ -567,11 +658,116 @@ mod tests {
         std::fs::create_dir_all(dir.join("New World")).unwrap();
         std::fs::create_dir_all(dir.join("New World (1)")).unwrap();
         assert_eq!(find_available_name(&dir, "New World", ""), "New World (2)");
-        assert_eq!(find_available_name(&dir, "New World (1)", ""), "New World (2)");
+        // The counter of the base is never taken up: a second one is added (game quirk).
+        assert_eq!(find_available_name(&dir, "New World (1)", ""), "New World (1) (1)");
         assert_eq!(find_available_name(&dir, "a/b.c:d", ""), "a_b_c_d");
         assert_eq!(find_available_name(&dir, "CON", ""), "_CON_");
+        // Bare `COM` is reserved too, bare `LPT` is not.
+        assert_eq!(find_available_name(&dir, "com", ""), "_com_");
+        assert_eq!(find_available_name(&dir, "LPT", ""), "LPT");
+        assert_eq!(find_available_name(&dir, "COM0", ""), "COM0");
         assert_eq!(find_available_name(&dir, "x", ".zip"), "x.zip");
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Optimisation: entity chunks, points of interest, then block chunks; only block chunks
+    /// carrying a cache are rewritten; the counters restart with each pass; the progress of a
+    /// dimension is its share of the pass's region files.
+    #[test]
+    fn optimize_runs_the_three_passes() {
+        let world = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-storage-o-{}", std::process::id())));
+        let chunk = |cache: bool, version: i32| {
+            let mut f = vec![("DataVersion".to_owned(), Nbt::Int(version))];
+            if cache {
+                f.push(("Heightmaps".into(), Nbt::Compound(vec![])));
+                let s = Nbt::Compound(vec![("SkyLight".into(), Nbt::ByteArray(vec![0; 2048]))]);
+                f.push(("sections".into(), Nbt::List(vec![s])));
+            }
+            nbtio::encode_root(&Nbt::Compound(f))
+        };
+        let put = |dim: &str, folder: &str, file: &str, chunks: &[(usize, bool, i32)]| {
+            let path = crate::world::dimension_dir(&world, dim).join(folder).join(file);
+            let mut r = RegionFile::open_or_create(&path).unwrap();
+            for &(i, cache, v) in chunks {
+                r.write(i, (i % 32) as i32, (i / 32) as i32, &chunk(cache, v)).unwrap();
+            }
+            r.close().unwrap();
+        };
+        let now = crate::chunk::DATA_VERSION;
+        put("minecraft:overworld", "region", "r.0.0.mca", &[(0, true, now), (1, false, now), (33, true, now - 1)]);
+        put("minecraft:overworld", "region", "r.0.0.mca.bak", &[(0, true, now)]);
+        put("minecraft:the_nether", "region", "r.0.0.mca", &[(5, true, now)]);
+        put("minecraft:overworld", "entities", "r.0.0.mca", &[(0, false, now), (1, false, now)]);
+        let p = Optimize::default();
+        optimize(&world, true, &p);
+        let n = |a: &AtomicU32| a.load(Ordering::Relaxed);
+        assert_eq!((p.stage.load(Ordering::Relaxed), p.pass.load(Ordering::Relaxed)), (2, 3));
+        // Block pass only: 4 chunks, 2 rewritten (cache, current version), an older one left.
+        assert_eq!((n(&p.total), n(&p.converted), n(&p.skipped)), (4, 2, 2));
+        assert_eq!((p.dim_progress(0), p.dim_progress(1), p.dim_progress(2), p.progress()), (0.5, 0.5, 0.0, 1.0));
+        let mut r = RegionFile::open(&crate::world::dimension_dir(&world, "minecraft:overworld").join("region/r.0.0.mca"), false).unwrap();
+        let read = |r: &mut RegionFile, i: usize| nbtio::parse_root(&r.read(i, (i % 32) as i32, (i / 32) as i32).unwrap().unwrap()).unwrap();
+        let c0 = read(&mut r, 0);
+        assert!(c0.get("Heightmaps").is_none() && nbtio::list(c0.get("sections"))[0].get("SkyLight").is_none());
+        assert!(read(&mut r, 33).get("Heightmaps").is_some(), "older data left as is");
+        // Without erasing: nothing rewritten, every chunk skipped.
+        let p = Optimize::default();
+        optimize(&world, false, &p);
+        assert_eq!((n(&p.total), n(&p.converted), n(&p.skipped)), (4, 0, 4));
+        // Cancelled before starting: counted, nothing processed.
+        let p = Optimize::default();
+        p.cancel.store(true, Ordering::Relaxed);
+        optimize(&world, true, &p);
+        assert_eq!((n(&p.total), n(&p.converted) + n(&p.skipped)), (4, 0));
+        assert_eq!(region_coords(Path::new("r.-1.+2.mca")), None);
+        assert_eq!(region_coords(Path::new("r.-1.2.mca")), Some((-1, 2)));
+        assert_eq!(region_coords(Path::new("r.1.2.3.mca")), None);
+    }
+
+    /// Micro-bench: optimisation of 4 region files of 1024 chunks, without then with erasing,
+    /// against a plain read of every chunk (what the pass without erasing used to do).
+    #[test]
+    #[ignore = "micro-bench"]
+    fn bench_optimize() {
+        let world = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-storage-ob-{}", std::process::id())));
+        let dir = crate::world::dimension_dir(&world, "minecraft:overworld").join("region");
+        let mut root = vec![("DataVersion".to_owned(), Nbt::Int(crate::chunk::DATA_VERSION))];
+        root.push(("Heightmaps".into(), Nbt::Compound(vec![("WORLD_SURFACE".into(), Nbt::LongArray(vec![7; 37]))])));
+        let sections = (0..24).map(|_| Nbt::Compound(vec![("SkyLight".into(), Nbt::ByteArray(vec![15; 2048]))]));
+        root.push(("sections".into(), Nbt::List(sections.collect())));
+        let bytes = nbtio::encode_root(&Nbt::Compound(root));
+        const FILES: i32 = 8;
+        let fill = || {
+            for f in 0..FILES {
+                let mut r = RegionFile::open_or_create(&dir.join(format!("r.{f}.0.mca"))).unwrap();
+                for i in 0..1024 {
+                    r.write(i, f * 32 + (i % 32) as i32, (i / 32) as i32, &bytes).unwrap();
+                }
+                r.close().unwrap();
+            }
+        };
+        fill();
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        for pass in 0..2 {
+            let t = std::time::Instant::now();
+            for f in 0..FILES {
+                let mut r = RegionFile::open(&dir.join(format!("r.{f}.0.mca")), false).unwrap();
+                for i in 0..1024 {
+                    let _ = std::hint::black_box(r.read(i, f * 32 + (i % 32) as i32, (i / 32) as i32));
+                }
+            }
+            let read_all = t.elapsed();
+            let t = std::time::Instant::now();
+            optimize(&world, false, &Optimize::default());
+            eprintln!("pass {pass}: read all {read_all:?}, optimise without erasing {:?}", t.elapsed());
+            let mut threads = 1;
+            while threads <= cores.min(FILES as usize) {
+                fill();
+                let t = std::time::Instant::now();
+                optimize_with(&world, true, &Optimize::default(), threads);
+                eprintln!("pass {pass}: optimise + erase, {threads} threads: {:?}", t.elapsed());
+                threads *= 2;
+            }
+        }
     }
 
     #[test]

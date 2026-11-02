@@ -504,8 +504,14 @@ impl crate::App {
         logs.bytes_prev = Some(bytes);
         // World rate of the client (`ticking_state`, singleplayer included).
         logs.mspt = 1000.0 / self.exact.rate.rate.max(1.0);
+        // F3+L in singleplayer: the integrated server's full ticks, for `server/`.
+        let solo = self.solo.is_some();
+        let mut recording = self.debug.profiling.as_mut().filter(|_| solo).map(|p| &mut p.server_ticks);
         for s in st.take_samples() {
             if s.len() >= 4 {
+                if let Some(r) = &mut recording {
+                    r.push((s[0], rc_sim::progress::now_ms()));
+                }
                 logs.tick.push([s[0], s[1], s[2], s[3]]);
                 logs.smoothed_tick_ms = logs.smoothed_tick_ms * 0.8 + s[1] as f32 / 1e6 * 0.199_999_99;
             }

@@ -1319,6 +1319,7 @@ impl App {
         profiler::push("tick");
         let depth = profiler::depth();
         for _ in 0..due {
+            profiler::increment("clientTick");
             self.game_tick();
             profiler::unwind(depth);
         }
@@ -3576,8 +3577,7 @@ impl ApplicationHandler for App {
                 {
                     return;
                 }
-                let step = if self.keys.contains(&KeyCode::ShiftLeft) { 1 } else { 7 };
-                self.chat.scroll(lines.signum() as i32 * step);
+                self.chat.scroll(chat::wheel_lines(lines, self.mods.shift_key()));
             }
             // Container screen: the wheel picks a bundle's item, never the bar.
             WindowEvent::MouseWheel { delta, .. } if self.screens.open => self.bundle_wheel(delta),

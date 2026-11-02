@@ -30,6 +30,8 @@ pub struct Collector {
     /// Length of `path` before each open zone, and opening instant.
     stack: Vec<(usize, Instant)>,
     pub entries: HashMap<String, Entry>,
+    /// Counters of each path (`clientTick`…), in order of first increment.
+    pub counters: HashMap<String, Vec<(&'static str, u64)>>,
     pub start: Option<Instant>,
     pub frames: u64,
     pub end: Option<Instant>,
@@ -82,6 +84,21 @@ impl Collector {
         e.max = e.max.max(ns);
         e.min = e.min.min(ns);
         self.path.truncate(len);
+    }
+
+    /// One more `name` on the open path.
+    fn increment(&mut self, name: &'static str) {
+        if !self.started {
+            return;
+        }
+        let list = match self.counters.get_mut(self.path.as_str()) {
+            Some(l) => l,
+            None => self.counters.entry(self.path.clone()).or_default(),
+        };
+        match list.iter_mut().find(|(n, _)| *n == name) {
+            Some(c) => c.1 += 1,
+            None => list.push((name, 1)),
+        }
     }
 
     fn duration(&self, path: &str) -> u64 {
@@ -156,13 +173,15 @@ impl Field {
     }
 }
 
-/// Collections of the main thread: 0 = pie chart, 1 = F3+L recording.
+/// Collections of the main thread: 0 = pie chart, 1 = F3+L recording, 2 = the recording's
+/// current frame alone (kept when the frame is much slower than the previous one).
 pub const PIE: usize = 0;
 pub const RECORD: usize = 1;
+pub const SINGLE: usize = 2;
 
 thread_local! {
     static ON: Cell<bool> = const { Cell::new(false) };
-    static COLLECTORS: RefCell<[Option<Collector>; 2]> = const { RefCell::new([None, None]) };
+    static COLLECTORS: RefCell<[Option<Collector>; 3]> = const { RefCell::new([None, None, None]) };
 }
 
 fn each(f: impl Fn(&mut Collector)) {
@@ -224,6 +243,13 @@ pub fn push(name: &str) {
 pub fn pop() {
     if ON.get() {
         each(Collector::pop);
+    }
+}
+
+/// Counter `name` of the open zone increased by one.
+pub fn increment(name: &'static str) {
+    if ON.get() {
+        each(|c| c.increment(name));
     }
 }
 

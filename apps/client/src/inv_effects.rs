@@ -33,9 +33,7 @@ fn duration(e: &Effect, tickrate: f32) -> Component {
     if e.duration < 0 {
         return Component::translate("effect.duration.infinite", vec![]);
     }
-    let s = (e.duration as f32 / tickrate.max(1.0)).floor() as i32;
-    let (h, m, s) = (s / 3600, s / 60 % 60, s % 60);
-    Component::text(if h > 0 { format!("{h:02}:{m:02}:{s:02}") } else { format!("{m:02}:{s:02}") })
+    Component::text(crate::tooltips::tick_duration(e.duration, tickrate.max(1.0)))
 }
 
 /// Name of the effect, followed by the level in Roman numerals for amplifiers 1 to 9.

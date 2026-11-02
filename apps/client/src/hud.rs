@@ -471,7 +471,8 @@ impl Hud {
     /// consumed; returns the notches (horizontal, vertical) of this event.
     pub fn wheel(&mut self, x: f64, y: f64) -> (i32, i32) {
         let step = |acc: &mut f64, v: f64| {
-            if *acc != 0.0 && v.signum() != acc.signum() {
+            // An idle axis (0) also resets its accumulation, as the game's sign of 0 is 0.
+            if *acc != 0.0 && rc_physics::signum(v) != rc_physics::signum(*acc) {
                 *acc = 0.0;
             }
             *acc += v;
@@ -1059,6 +1060,18 @@ mod tests {
         h.scroll(-0.6);
         h.scroll(0.6);
         assert_eq!(h.selected, 0);
+    }
+
+    /// An idle axis (0) resets its accumulation like a sign change: the game's sign of 0 is 0.
+    #[test]
+    fn wheel_idle_axis_resets_its_accumulation() {
+        let mut h = Hud::default();
+        assert_eq!(h.wheel(0.5, 0.0), (0, 0));
+        assert_eq!(h.wheel(0.0, 1.0), (0, 1));
+        assert_eq!(h.wheel(0.6, 0.0), (0, 0), "0.5 forgotten, 0.6 alone is no notch");
+        assert_eq!(crate::bundle::wheel(0.0, 0.7), (0, 0));
+        assert_eq!(crate::bundle::wheel(0.4, 0.0), (0, 0));
+        assert_eq!(crate::bundle::wheel(0.0, 0.4), (0, 0), "0.7 forgotten");
     }
 
     #[test]

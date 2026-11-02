@@ -286,6 +286,128 @@ pub fn bezier(c: [f32; 4], x: f32) -> f32 {
     f(ay, by, cy, t)
 }
 
+/// Tabulated sine of the game (65 536 steps per turn), entry computed on demand: the same
+/// value as the table, without keeping it (the named curves are rare and cheap).
+const SIN_SCALE: f64 = 10_430.378_350_470_453;
+
+fn table_entry(i: i64) -> f32 {
+    ((i & 65_535) as f64 / SIN_SCALE).sin() as f32
+}
+
+fn table_sin(a: f64) -> f32 {
+    table_entry((a * SIN_SCALE) as i64)
+}
+
+/// A quarter turn further in the table.
+fn table_cos(a: f64) -> f32 {
+    table_entry((a * SIN_SCALE + 16_384.0) as i64)
+}
+
+/// Named curve `i` of [`rc_data::EASE_NAMES`] at `x` in [0, 1], with the game's mix of single
+/// and double precision (an unknown rank is linear).
+pub fn named_ease(i: u8, x: f32) -> f32 {
+    use std::f32::consts::{FRAC_PI_2, PI};
+    let xd = f64::from(x);
+    let sq = |v: f32| v * v;
+    let cube = |v: f32| v * v * v;
+    // Elastic periods: single-precision constants widened to double.
+    let c4 = f64::from((std::f64::consts::PI * 2.0 / 3.0) as f32);
+    let pow2 = |e: f64| 2f64.powf(e);
+    let out_bounce = |x: f32| {
+        if x < 0.363_636_37 {
+            7.5625 * sq(x)
+        } else if x < 0.727_272_75 {
+            7.5625 * sq(x - 0.545_454_56) + 0.75
+        } else if f64::from(x) < 0.909_090_909_090_909_1 {
+            7.5625 * sq(x - 0.818_181_8) + 0.9375
+        } else {
+            7.5625 * sq(x - 0.954_545_44) + 0.984_375
+        }
+    };
+    // Elastic curves: exact at both ends.
+    let ends = if x == 0.0 {
+        Some(0.0)
+    } else if x == 1.0 {
+        Some(1.0)
+    } else {
+        None
+    };
+    match i {
+        0 => sq(x) * (2.701_58 * x - 1.701_58),
+        1 => 1.0 - out_bounce(1.0 - x),
+        2 => (-f64::from(1.0 - x * x).sqrt()) as f32 + 1.0,
+        3 => cube(x),
+        4 => ends.unwrap_or_else(|| (-pow2(10.0 * xd - 10.0) * ((xd * 10.0 - 10.75) * c4).sin()) as f32),
+        5 => {
+            if x == 0.0 {
+                0.0
+            } else {
+                pow2(10.0 * xd - 10.0) as f32
+            }
+        }
+        6 => x * x,
+        7 => sq(sq(x)),
+        8 => sq(sq(x)) * x,
+        9 => 1.0 - table_cos(f64::from(x * FRAC_PI_2)),
+        10 => {
+            if x < 0.5 {
+                4.0 * x * x * (7.189_819 * x - 2.594_909_4) / 2.0
+            } else {
+                let dt = 2.0 * x - 2.0;
+                (dt * dt * (3.594_909_4 * dt + 2.594_909_4) + 2.0) / 2.0
+            }
+        }
+        11 => {
+            if x < 0.5 {
+                (1.0 - out_bounce(1.0 - 2.0 * x)) / 2.0
+            } else {
+                (1.0 + out_bounce(2.0 * x - 1.0)) / 2.0
+            }
+        }
+        12 => {
+            if x < 0.5 {
+                ((1.0 - (1.0 - (2.0 * xd).powf(2.0)).sqrt()) / 2.0) as f32
+            } else {
+                (((1.0 - (-2.0 * xd + 2.0).powf(2.0)).sqrt() + 1.0) / 2.0) as f32
+            }
+        }
+        13 => if x < 0.5 { 4.0 * cube(x) } else { (1.0 - (-2.0 * xd + 2.0).powf(3.0) / 2.0) as f32 },
+        14 => ends.unwrap_or_else(|| {
+            // Period folded in single precision, then widened.
+            let s = ((20.0 * xd - 11.125) * f64::from(PI * 4.0 / 9.0)).sin();
+            if x < 0.5 {
+                (-(pow2(20.0 * xd - 10.0) * s) / 2.0) as f32
+            } else {
+                (pow2(-20.0 * xd + 10.0) * s / 2.0 + 1.0) as f32
+            }
+        }),
+        15 => {
+            if x < 0.5 {
+                if x == 0.0 { 0.0 } else { (pow2(20.0 * xd - 10.0) / 2.0) as f32 }
+            } else if x == 1.0 {
+                1.0
+            } else {
+                ((2.0 - pow2(-20.0 * xd + 10.0)) / 2.0) as f32
+            }
+        }
+        16 => if x < 0.5 { 2.0 * sq(x) } else { (1.0 - (-2.0 * xd + 2.0).powf(2.0) / 2.0) as f32 },
+        17 => if x < 0.5 { 8.0 * sq(sq(x)) } else { (1.0 - (-2.0 * xd + 2.0).powf(4.0) / 2.0) as f32 },
+        18 => if x < 0.5 { 16.0 * x * x * x * x * x } else { (1.0 - (-2.0 * xd + 2.0).powf(5.0) / 2.0) as f32 },
+        19 => -(table_cos(f64::from(PI * x)) - 1.0) / 2.0,
+        20 => 1.0 + 2.701_58 * cube(x - 1.0) + 1.701_58 * sq(x - 1.0),
+        21 => out_bounce(x),
+        22 => f64::from(1.0 - sq(x - 1.0)).sqrt() as f32,
+        23 => 1.0 - cube(1.0 - x),
+        24 => ends.unwrap_or_else(|| (pow2(-10.0 * xd) * ((xd * 10.0 - 0.75) * c4).sin() + 1.0) as f32),
+        25 => if x == 1.0 { 1.0 } else { 1.0 - pow2(-10.0 * xd) as f32 },
+        26 => 1.0 - sq(1.0 - x),
+        27 => 1.0 - sq(sq(1.0 - x)),
+        28 => 1.0 - (1.0 - xd).powf(5.0) as f32,
+        29 => table_sin(f64::from(x * FRAC_PI_2)),
+        _ => x,
+    }
+}
+
 /// Compiled timeline track for a tracked attribute.
 #[derive(Debug, Clone)]
 struct Track {
@@ -342,6 +464,7 @@ impl Track {
             Ease::Linear => alpha,
             Ease::Constant => 0.0,
             Ease::Bezier(c) => bezier(c, alpha),
+            Ease::Named(i) => named_ease(i, alpha),
         };
         lerp4(eased, va, vb)
     }
@@ -1123,6 +1246,9 @@ impl Flicker {
 
 #[cfg(test)]
 mod equiv_tests;
+
+#[cfg(test)]
+mod ease_tests;
 
 #[cfg(test)]
 mod tests {

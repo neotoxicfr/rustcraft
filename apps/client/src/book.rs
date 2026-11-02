@@ -90,7 +90,7 @@ pub(crate) fn truncate_u16(t: &mut Vec<char>, max: usize) {
 
 /// Character allowed in an input (no `§`, no control, no DEL; `\n` in multiline).
 fn allowed(c: char, multiline: bool) -> bool {
-    (c != '§' && c >= ' ' && c != '\u{7f}') || (multiline && c == '\n')
+    rc_text::allowed_chat_char(c) || (multiline && c == '\n')
 }
 
 fn advance(m: &dyn rc_text::Metrics, c: char) -> f32 {

@@ -235,6 +235,8 @@ pub struct Menu<'a> {
     pub carried: &'a mut Option<ItemStack>,
     pub rules: &'a dyn Rules,
     pub creative: bool,
+    /// Trading state of a merchant menu (offers, experience), updated when its result is taken.
+    pub trade: Option<&'a mut crate::screens_trade::Trade>,
 }
 
 impl Menu<'_> {
@@ -299,10 +301,21 @@ impl Menu<'_> {
             return None;
         }
         self.slots[i] = (c.count > t).then(|| with_count(&c, c.count - t));
+        self.on_take(i);
+        Some(with_count(&c, t))
+    }
+
+    /// After items were taken out of slot `i`: the crafting grid is consumed, or the merchant
+    /// trade is carried out.
+    fn on_take(&mut self, i: usize) {
         if self.def(i).craft_result {
             self.consume_grid();
+        } else if i == 2
+            && self.kind == Kind::Special(crate::menu_special::Sp::Merchant)
+            && let Some(t) = self.trade.as_deref_mut()
+        {
+            crate::screens_trade::take(t, self.slots, self.rules);
         }
-        Some(with_count(&c, t))
     }
 
     /// Taking the crafting result: one item from each grid slot.
@@ -495,9 +508,7 @@ impl Menu<'_> {
                 if self.may_pickup(i) {
                     self.slots[t] = Some(c);
                     self.slots[i] = None;
-                    if self.def(i).craft_result {
-                        self.consume_grid();
-                    }
+                    self.on_take(i);
                 }
             }
             (Some(s), None) => {
@@ -645,9 +656,7 @@ impl Menu<'_> {
             return false;
         }
         self.slots[i] = (s.count > 0).then_some(s);
-        if self.def(i).craft_result {
-            self.consume_grid();
-        }
+        self.on_take(i);
         true
     }
 
@@ -787,7 +796,7 @@ mod tests {
     }
 
     fn run(kind: Kind, slots: &mut Vec<Option<ItemStack>>, carried: &mut Option<ItemStack>, s: i16, b: i8, m: i32) {
-        let mut menu = Menu { kind, slots, carried, rules: &R, creative: false };
+        let mut menu = Menu { kind, slots, carried, rules: &R, creative: false, trade: None };
         let mut hot = |b: i8| (0..9).contains(&b).then(|| 36 + b as usize);
         menu.click(s, b, m, &mut hot);
     }
@@ -901,7 +910,7 @@ mod tests {
     fn drag_splits_evenly() {
         let mut slots = vec![None; 46];
         let mut carried = st(1, 10);
-        let mut m = Menu { kind: Kind::Player, slots: &mut slots, carried: &mut carried, rules: &R, creative: false };
+        let mut m = Menu { kind: Kind::Player, slots: &mut slots, carried: &mut carried, rules: &R, creative: false, trade: None };
         m.drag_end(&[9, 10, 11], 0);
         assert_eq!(slots[9].as_ref().unwrap().count, 3);
         assert_eq!(slots[11].as_ref().unwrap().count, 3);
