@@ -431,6 +431,26 @@ impl Server {
         self.cart_block_effects(c);
     }
 
+    /// Piston push: capped at 0.51 block per axis and per tick (the minecart's own total), a stuck
+    /// state cleared without slowing the push, collisions, the block effects of its own move,
+    /// then those the piston applies after every pushed entity (twice in all, like the game).
+    pub(crate) fn cart_piston_move(&mut self, c: &mut Cart, d: [f64; 3]) {
+        if c.removed {
+            return;
+        }
+        let d = c.piston_deltas.limit(self.time, d);
+        if d == [0.0; 3] {
+            return;
+        }
+        if l2(c.stuck) > 1.0e-7 {
+            c.stuck = [0.0; 3];
+            c.vel = [0.0; 3];
+        }
+        self.cart_move_raw(c, d);
+        self.cart_block_effects(c);
+        self.cart_block_effects(c);
+    }
+
     fn cart_move_raw(&mut self, c: &mut Cart, delta: [f64; 3]) {
         let start = c.bbox();
         let mv = collide::resolve(&self.world(), &start, delta, c.on_ground, 0.0);

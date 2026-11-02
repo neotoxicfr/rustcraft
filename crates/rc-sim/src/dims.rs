@@ -224,6 +224,7 @@ impl Server {
     pub(crate) fn exchange(&mut self, w: &mut World) {
         use std::mem::swap;
         self.end_on_park(); // F15: dragon bar removed when leaving the dimension
+        self.raids_on_park(); // L10-ENT: same for the raid bars
         swap(&mut self.dim, &mut w.dim);
         swap(&mut self.chunks, &mut w.chunks);
         swap(&mut self.entities, &mut w.entities);
@@ -238,6 +239,7 @@ impl Server {
         swap(&mut self.mobs.mounts.bolts, &mut w.mobs.mounts.bolts);
         swap(&mut self.mobs.poi, &mut w.mobs.poi);
         swap(&mut self.mobs.end, &mut w.mobs.end); // F15: crystals, dragon fight
+        swap(&mut self.mobs.ill.raids, &mut w.mobs.ill.raids); // L10-ENT: raids of the dimension
         // G3-F13: state of the block entities whose tickers live in `bs` (rung bells, vaults,
         // ominous item spawners), kept with their dimension.
         swap(&mut self.mobs.bells, &mut w.mobs.bells);
@@ -413,6 +415,7 @@ impl Server {
                 s.drops_save_jobs(jobs);
                 s.poi_save_jobs(jobs); // F05: points of interest of the parked dimension
                 s.end_save_jobs(jobs); // F15: dragon fight
+                s.raids_save_jobs(jobs); // L10-ENT: raids of the parked dimension
                 // Random sequences: a single set for the server, saved with the survival data.
                 s.chunk_jobs(jobs)
             });
@@ -441,6 +444,9 @@ impl Server {
         }
         self.player_portal_tick();
         self.parked_tick(runs);
+        if runs {
+            self.parked_raids_tick(); // L10-ENT: every world ticks its own raids
+        }
     }
 
     /// Parked dimensions: generation always collected; entities and tickets only if the world

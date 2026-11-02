@@ -31,6 +31,16 @@ pub struct Tracker {
     pub attr_hash: super::mob::AttrPrints,
 }
 
+impl Tracker {
+    /// A velocity sent outside the tracking (immediate send): the tracking compares the next
+    /// ones with it.
+    pub(crate) fn velocity_sent(&mut self, v: [f64; 3]) {
+        if self.seen {
+            self.last_vel = v;
+        }
+    }
+}
+
 /// Tracking range of the player entity type (chunks).
 const PLAYER_TRACKING: i32 = 32;
 

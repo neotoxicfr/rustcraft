@@ -16,6 +16,8 @@ use crate::server::Server;
 /// random ticks, thunder), 32 "ticking blocks" (scheduled ticks, block events, block entities).
 pub(crate) const ENTITY_TICKING: i32 = 31;
 pub(crate) const BLOCK_TICKING: i32 = 32;
+/// Ticket level of a loaded ("full") chunk.
+pub(crate) const FULL: i32 = 33;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {

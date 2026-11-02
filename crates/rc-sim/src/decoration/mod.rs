@@ -91,6 +91,13 @@ pub(crate) fn kind_of(e: &Nbt) -> Option<DKind> {
     e.get("id").and_then(Nbt::as_str).and_then(DKind::from_name)
 }
 
+/// Push scans reach each compound from its registry entry (`RUSTCRAFT_OPT_DECOSCAN=0`: by
+/// identifier, the former lookup).
+fn deco_scan_indexed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_DECOSCAN") != Some("0"))
+}
+
 /// Result of an item use on a block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Use {
@@ -112,11 +119,22 @@ struct Live {
     removed: bool,
     /// Network tracking of a decoration that moves (armor stand, mannequin).
     track: crate::mobs::track::Tracker,
+    /// Piston pushes of the current tick (armor stand, mannequin: each entity its own cap).
+    piston: rc_physics::piston::PistonDeltas,
 }
 
 impl Live {
     fn new(id: i32, kind: DKind, chunk: (i32, i32)) -> Live {
-        Live { id, kind, chunk, check: 0, last_hit: 0, removed: false, track: Default::default() }
+        Live {
+            id,
+            kind,
+            chunk,
+            check: 0,
+            last_hit: 0,
+            removed: false,
+            track: Default::default(),
+            piston: Default::default(),
+        }
     }
 }
 
@@ -616,7 +634,7 @@ impl Server {
                 }
             }
             if !self.deco_survives(l.id) {
-                let e = self.deco_nbt(l.id).cloned();
+                let e = self.live_nbt(i).cloned();
                 self.deco_remove(l.id);
                 if let Some(e) = e {
                     self.deco_drop_item(&e, None);
@@ -684,9 +702,10 @@ impl Server {
         let double = f64::from(radius * 2.0);
         let by_mob = matches!(by, Some(crate::mobs::mob::Ent::Mob(_)));
         let griefing = self.rule("minecraft:mob_griefing", true);
-        let ids: Vec<(i32, DKind)> = self.deco.live.iter().filter(|l| !l.removed).map(|l| (l.id, l.kind)).collect();
-        for (id, k) in ids {
-            let Some(e) = self.deco_nbt(id).cloned() else { continue };
+        let ids: Vec<(i32, DKind, (i32, i32))> =
+            self.deco.live.iter().filter(|l| !l.removed).map(|l| (l.id, l.kind, l.chunk)).collect();
+        for (id, k, chunk) in ids {
+            let Some(e) = self.deco_nbt_near(id, Some(chunk)).cloned() else { continue };
             let ignore = match k {
                 DKind::Stand => !blocklike || flag(&e, "Invisible"),
                 DKind::Mannequin => true,
@@ -745,17 +764,33 @@ impl Server {
     // ---------- Pushes (shulker, piston) ----------
 
     /// Decorations whose box touches `area`, with their kind; none when there is none (no
-    /// allocation on the usual path).
+    /// allocation on the usual path). Each compound is reached from its registry entry (its
+    /// chunk known) and its box built from the entry's kind; `RUSTCRAFT_OPT_DECOSCAN=0` looks
+    /// each one up by identifier again (a walk of the registry per decoration) and reads its
+    /// kind from the compound.
     pub(crate) fn deco_touching(&self, area: &Aabb, attached_only: bool) -> Vec<(i32, DKind)> {
+        self.deco_touching_with(area, attached_only, deco_scan_indexed())
+    }
+
+    /// [`Server::deco_touching`] with the lookup chosen (`indexed`: from the registry entry).
+    pub(crate) fn deco_touching_with(&self, area: &Aabb, attached_only: bool, indexed: bool) -> Vec<(i32, DKind)> {
         if self.deco.live.is_empty() {
             return Vec::new();
         }
-        self.deco
-            .live
-            .iter()
-            .filter(|l| !l.removed && (!attached_only || l.kind.attached()))
-            .filter(|l| self.deco_nbt(l.id).and_then(|e| self.deco_box(e)).is_some_and(|b| b.intersects(area)))
-            .map(|l| (l.id, l.kind))
+        (0..self.deco.live.len())
+            .filter(|&i| {
+                let l = &self.deco.live[i];
+                !l.removed && (!attached_only || l.kind.attached())
+            })
+            .filter(|&i| {
+                if indexed {
+                    let k = self.deco.live[i].kind;
+                    self.live_nbt(i).is_some_and(|e| self.deco_box_of(k, e).intersects(area))
+                } else {
+                    self.deco_nbt(self.deco.live[i].id).and_then(|e| self.deco_box(e)).is_some_and(|b| b.intersects(area))
+                }
+            })
+            .map(|i| (self.deco.live[i].id, self.deco.live[i].kind))
             .collect()
     }
 
@@ -858,7 +893,7 @@ impl Server {
 
     /// Push of a living decoration: the velocity is added to its saved motion and goes to the
     /// client with its next tracking; one that never moves by itself (no gravity, marker,
-    /// immovable mannequin, whose tick stops before the tracking) sends it at once.
+    /// immovable mannequin) sends it at once, its tracking told so it is not sent twice.
     pub(crate) fn deco_push(&mut self, id: i32, v: [f64; 3]) {
         if !v.iter().all(|x| x.is_finite()) {
             return;
@@ -873,6 +908,7 @@ impl Server {
         self.deco_edit(id, |n| nbtio::set(n, "Motion", dbl(nv)));
         if still {
             let _ = self.send(Event::Entity(EntityEvent::Motion { id, velocity: crate::mobs::track::lp_quantize(nv) }));
+            self.deco.live[i].track.velocity_sent(nv);
         } else {
             self.deco.live[i].track.needs_sync = true;
         }
@@ -1047,10 +1083,14 @@ impl Server {
 
     /// Box of a decoration (selectors, range, overlaps).
     pub(crate) fn deco_box(&self, e: &Nbt) -> Option<Aabb> {
-        let k = kind_of(e)?;
+        Some(self.deco_box_of(kind_of(e)?, e))
+    }
+
+    /// [`Server::deco_box`] of a decoration whose kind is known (registry entry).
+    fn deco_box_of(&self, k: DKind, e: &Nbt) -> Aabb {
         let p = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
         let around = |w: f64, h: f64| Aabb { min: [p[0] - w / 2.0, p[1], p[2] - w / 2.0], max: [p[0] + w / 2.0, p[1] + h, p[2] + w / 2.0] };
-        Some(match k {
+        match k {
             DKind::Painting => {
                 let (pos, d) = self.hang_place(k, e);
                 let (w, h) = self.painting_size(e);
@@ -1068,7 +1108,7 @@ impl Server {
             // The player's size, in single precision like the game.
             DKind::Mannequin => around(f64::from(0.6f32), f64::from(1.8f32)),
             DKind::Knot => around(0.375, 0.5),
-        })
+        }
     }
 
     /// Lead knot hung on block `p`, if any.
@@ -1077,8 +1117,8 @@ impl Server {
             .live
             .iter()
             .filter(|l| l.kind == DKind::Knot && !l.removed)
+            .find(|l| self.deco_nbt_near(l.id, Some(l.chunk)).is_some_and(|e| block_pos_of(e) == p))
             .map(|l| l.id)
-            .find(|&id| self.deco_nbt(id).is_some_and(|e| block_pos_of(e) == p))
     }
 
     /// Block position of an attached entity (`pos`).

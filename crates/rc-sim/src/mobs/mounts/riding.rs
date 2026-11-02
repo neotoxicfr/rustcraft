@@ -955,7 +955,8 @@ impl Server {
         self.root_of(-1, Some(pv)) == self.root_of(m.id, m.mount.vehicle)
     }
 
-    fn root_of(&self, id: i32, mut vehicle: Option<i32>) -> i32 {
+    /// Root vehicle of the entity `id` riding `vehicle` (itself if it rides nothing).
+    pub(crate) fn root_of(&self, id: i32, mut vehicle: Option<i32>) -> i32 {
         let mut root = id;
         let mut guard = 0;
         while let Some(v) = vehicle {

@@ -3303,3 +3303,39 @@ runs), so only the order of magnitude is claimed.
 - Multi-core and GPU not applicable (per-event or per-frame UI work of a few hundred
   nanoseconds at most). Scenes to re-measure on a quiet machine: `menu` and an in-game scene with
   the creative inventory open (no change expected beyond the removed allocation).
+
+## L10-ENT: entity pushes, ground item fields, raids per dimension (02/11, loaded machine)
+
+- Piston push (`push_targets`, per moving block and per tick): minecarts now walked (one box test
+  each), and every decoration instead of the attached ones only (armor stands and mannequins are
+  pushed). Micro-bench `tests_l10ent::bench_l10ent_piston_push_scan` (2 passes, 20,000 scans, a
+  slice touching nothing among 20 armor stands, 20 mannequins, 10 frames and 100 minecarts):
+  former decoration scan (attached only, looked up by identifier) 652-696 ns; new scan of every
+  decoration: looked up by identifier with the kind read from the compound 2,142-2,233 ns, from
+  the registry entry alone 1,900 ns, by identifier with the entry's kind alone 1,886-1,896 ns, both
+  leads together 1,647-1,663 ns (kept; `RUSTCRAFT_OPT_DECOSCAN=0` brings back the identifier
+  lookup and the compound's kind); minecart walk 141-142 ns for 100. Same decorations in the same
+  order for both lookups: `tests_l10ent::push_scan_lookups_agree`. The same lookup-per-entry walk
+  replaced by the entry's chunk in the cushion, frame-signal, knot, burst and survival loops of the
+  decorations (same compound found, speed only; no bench).
+- Leads noted, not taken at these counts: the position of each decoration cached in its registry
+  entry (every write of `Pos` would have to refresh it; about 1 µs per push with 40 living
+  decorations to win), a spatial grid of the minecarts shared with the mob push (G4-F08 lead).
+  Multi-core and GPU: not applicable (a few boxes per push, mutations in list order, the cap of
+  each entity depends on the pushes before it in the tick).
+- Opening shulker: the minecart walk is skipped while the world has none (empty list); otherwise
+  one box test per minecart per opening tick.
+- Raids of the parked worlds, every tick like the game: an empty list costs a counter increment
+  without visiting its world, 3 ns per tick; a world with raids is visited (`in_world`, two world
+  swaps) 291-293 ns per tick per world (`tests_l10ent::bench_l10ent_parked_raids`, 2 passes, 20,000
+  ticks, one inactive raid). Lead noted: tick an inactive raid of a parked world without the visit
+  (only its counter and the difficulty and rule stops would run), not taken at one raid.
+- Armor stands and mannequins without physics now run their tracking each tick (one interval test
+  per tick, a packet every 60 ticks like every entity). Cramming: one addition per pushed entity.
+- Ground items and orbs: one writer for the save and `/data` (the save's former writer and the
+  `/data` one built the compound twice in two shapes), ten common fields more per entity per save;
+  one reader for the chunk, the two summon paths and `/data`.
+- Fingerprints: only the new world's changes, for two causes (items alone b36c37ff..., raids alone
+  0947daba..., both reverted 700c26d9... again); mechanisms unchanged.
+- To re-measure on a quiet machine: the two micro-benches above. Scene bench not concerned (no
+  piston on an entity, no shulker, no parked raid in the scenes).

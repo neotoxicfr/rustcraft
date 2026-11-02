@@ -178,6 +178,8 @@ pub struct Cart {
     pub needs_sync: bool,
     meta: Vec<(u8, Meta, bool)>,
     pub track: CTrack,
+    /// Piston pushes of the current tick (its own cap).
+    pub piston_deltas: rc_physics::piston::PistonDeltas,
 }
 
 /// Minecarts of the open world (exchanged with the dimension, like projectiles).
@@ -268,6 +270,7 @@ impl Cart {
             needs_sync: false,
             meta: Vec::new(),
             track: CTrack::default(),
+            piston_deltas: Default::default(),
         };
         c.define_meta();
         c

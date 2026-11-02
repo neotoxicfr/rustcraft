@@ -6,11 +6,13 @@
 use rc_client::{EntityEvent, Event};
 use rc_physics::Aabb;
 use rc_physics::body::{Body, Follow};
+use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::{AddEntity, Meta};
 
 use crate::items::same;
 use crate::menus::inventory_add;
 use crate::mobs::recent::vibration::Src;
+use crate::nbtio::int;
 use crate::player::Stack;
 use crate::server::Server;
 
@@ -57,6 +59,64 @@ pub struct ItemEnt {
     /// item merges its neighbours into itself).
     born: u64,
     pub(crate) ticked: bool,
+    /// L10-ENT: entity fields kept and saved like the game's (`Air`, `Invulnerable`).
+    pub common: Common,
+}
+
+/// Common entity fields of a ground item or an orb that nothing of theirs changes: the air
+/// supply (300, a value read from the NBT is kept) and the permanent invulnerability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Common {
+    pub air: i32,
+    pub invulnerable: bool,
+}
+
+impl Default for Common {
+    fn default() -> Common {
+        Common { air: 300, invulnerable: false }
+    }
+}
+
+/// Common entity part of an item or orb compound, read like the game's load: fire ticks, ground
+/// flag, fall distance, kept fields (the portal delay is restored by its caller).
+fn read_common(n: &Nbt) -> (i32, bool, f64, Common) {
+    let fire = int(n, "Fire").unwrap_or(0) as i16 as i32;
+    let on_ground = int(n, "OnGround").is_some_and(|v| v != 0);
+    let fall = n.get("fall_distance").and_then(crate::mobs::mob::f64_of).unwrap_or(0.0);
+    let air = int(n, "Air").map_or(300, |v| v as i32);
+    (fire, on_ground, fall, Common { air, invulnerable: int(n, "Invulnerable").is_some_and(|v| v != 0) })
+}
+
+/// Common entity part of an item or an orb as the game writes it.
+struct Part {
+    pos: [f64; 3],
+    vel: [f64; 3],
+    yaw: f32,
+    fall: f64,
+    fire: i32,
+    on_ground: bool,
+    common: Common,
+    cooldown: i32,
+}
+
+/// The game's write of the common entity part (without the UUID), in its order.
+fn write_common(f: &mut Vec<(String, Nbt)>, p: Part) {
+    let dbl = |v: [f64; 3]| Nbt::List(v.iter().map(|&x| Nbt::Double(x)).collect());
+    f.push(("Pos".into(), dbl(p.pos)));
+    f.push(("Motion".into(), dbl(p.vel)));
+    f.push(("Rotation".into(), Nbt::List(vec![Nbt::Float(p.yaw), Nbt::Float(0.0)])));
+    f.push(("fall_distance".into(), Nbt::Double(p.fall)));
+    f.push(("Fire".into(), Nbt::Short(p.fire as i16)));
+    f.push(("Air".into(), Nbt::Short(p.common.air as i16)));
+    f.push(("OnGround".into(), Nbt::Byte(i8::from(p.on_ground))));
+    f.push(("Invulnerable".into(), Nbt::Byte(i8::from(p.common.invulnerable))));
+    f.push(("PortalCooldown".into(), Nbt::Int(p.cooldown)));
+}
+
+/// UUID shown and saved for a ground item or an orb (not kept from the world: derived from its
+/// identifier).
+pub(crate) fn ground_uuid(id: i32) -> u128 {
+    0x5332_0000_0000_0000_0000_0000_0000_0000 | id as u32 as u128
 }
 
 impl ItemEnt {
@@ -88,6 +148,8 @@ pub struct Orb {
     fire_flag: bool,
     /// G3-F13: entity walk of its birth (`Walk::born`).
     born: u64,
+    /// L10-ENT: `Air` and `Invulnerable` kept and saved like the game's.
+    pub common: Common,
 }
 
 /// Split of a reward into orbs (values of the game).
@@ -254,6 +316,7 @@ impl Server {
             fire_flag: false,
             born: self.walk.born(),
             ticked: false,
+            common: Common::default(),
         });
     }
 
@@ -418,12 +481,13 @@ impl Server {
             fire: 0,
             fire_flag: false,
             born: self.walk.born(),
+            common: Common::default(),
         });
     }
 
-    /// Orb summoned (`/summon`): value, count, age, health points and velocity from the NBT.
-    pub(crate) fn summon_orb(&mut self, pos: [f64; 3], nbt: Option<&rc_proto::nbt::Nbt>) -> i32 {
-        use crate::nbtio::int;
+    /// Orb summoned (`/summon`) or read with a chunk: value, count, age, health points,
+    /// velocity and the common entity fields from the NBT, like the game's load.
+    pub(crate) fn summon_orb(&mut self, pos: [f64; 3], nbt: Option<&Nbt>) -> i32 {
         let get = |k: &str, d: i64| nbt.and_then(|n| int(n, k)).unwrap_or(d) as i32;
         let (value, count, age, health) = (get("Value", 0), get("Count", 1).max(1), get("Age", 0), get("Health", 5));
         let vel = nbt.and_then(|n| crate::nbtio::motion(n.get("Motion"))).unwrap_or_default();
@@ -442,24 +506,90 @@ impl Server {
         };
         let _ = self.send(Event::Entity(EntityEvent::Add(Box::new(add))));
         let _ = self.send(Event::Entity(EntityEvent::Data { id, values: vec![(8, Meta::Int(value))] }));
+        let (fire, on_ground, fall, common) = nbt.map(read_common).unwrap_or_default();
+        let mut body = server_body(pos, vel, ORB_SIZE, 0.425);
+        body.fall = fall;
         self.life.orbs.push(Orb {
             id,
             value,
             count,
             pos,
             vel,
-            on_ground: false,
+            on_ground,
             age,
             ticks: 0,
             track: Default::default(),
             removed: false,
             health,
-            body: server_body(pos, vel, ORB_SIZE, 0.425),
-            fire: get("Fire", 0) as i16 as i32,
+            body,
+            fire,
             fire_flag: false,
             born: self.walk.born(),
+            common,
         });
+        if let Some(n) = nbt {
+            self.load_portal_cooldown(id, n);
+        }
         id
+    }
+
+    /// The game's compound of a ground item (common entity part, then its own fields).
+    pub(crate) fn item_ent_nbt(&self, d: &ItemEnt) -> Nbt {
+        let mut f = vec![("id".to_owned(), Nbt::String("minecraft:item".into()))];
+        let cooldown = self.portal_cooldown(d.id);
+        let (pos, vel, yaw, fall, fire, on_ground, common) = (d.pos, d.vel, d.yaw, d.body.fall, d.fire, d.on_ground, d.common);
+        write_common(&mut f, Part { pos, vel, yaw, fall, fire, on_ground, common, cooldown });
+        f.push(("UUID".into(), crate::nbtio::uuid_nbt(ground_uuid(d.id))));
+        f.push(("Health".into(), Nbt::Short(d.health as i16)));
+        f.push(("Age".into(), Nbt::Short(d.age as i16)));
+        f.push(("PickupDelay".into(), Nbt::Short(d.pickup_delay as i16)));
+        if d.thrower == Some(crate::mobs::mob::Ent::Player) {
+            f.push(("Thrower".into(), crate::nbtio::uuid_nbt(self.uuid))); // W8c
+        }
+        f.push(("Item".into(), d.stack.to_nbt(None)));
+        Nbt::Compound(f)
+    }
+
+    /// The game's compound of an experience orb.
+    pub(crate) fn orb_ent_nbt(&self, o: &Orb) -> Nbt {
+        let mut f = vec![("id".to_owned(), Nbt::String("minecraft:experience_orb".into()))];
+        let cooldown = self.portal_cooldown(o.id);
+        let (pos, vel, fall, fire, on_ground, common) = (o.pos, o.vel, o.body.fall, o.fire, o.on_ground, o.common);
+        write_common(&mut f, Part { pos, vel, yaw: 0.0, fall, fire, on_ground, common, cooldown });
+        f.push(("UUID".into(), crate::nbtio::uuid_nbt(ground_uuid(o.id))));
+        f.push(("Health".into(), Nbt::Short(o.health as i16)));
+        f.push(("Age".into(), Nbt::Short(o.age as i16)));
+        f.push(("Value".into(), Nbt::Short(o.value as i16)));
+        f.push(("Count".into(), Nbt::Int(o.count)));
+        Nbt::Compound(f)
+    }
+
+    /// Fields of the ground item at `k` read from `n` like the game's load (summon, chunk,
+    /// `data`): velocity, common entity part, health, age, pickup delay; the portal delay is
+    /// restored under its identifier.
+    pub(crate) fn item_read_nbt(&mut self, k: usize, n: &Nbt) {
+        let Some(d) = self.life.drops.get_mut(k) else { return };
+        let (fire, on_ground, fall, common) = read_common(n);
+        d.vel = crate::nbtio::motion(n.get("Motion")).unwrap_or_default();
+        (d.fire, d.on_ground, d.body.fall, d.common) = (fire, on_ground, fall, common);
+        d.health = int(n, "Health").unwrap_or(5) as i16 as i32;
+        d.age = int(n, "Age").unwrap_or(0) as i16 as i32;
+        d.pickup_delay = int(n, "PickupDelay").unwrap_or(0) as i16 as i32;
+        let id = d.id;
+        self.load_portal_cooldown(id, n);
+    }
+
+    /// Fields of the orb at `k` read back from `n` (`data`): health and the common entity part
+    /// (value, count and age stay: their reading at summon time is `summon_orb`'s).
+    pub(crate) fn orb_read_nbt(&mut self, k: usize, n: &Nbt) {
+        let Some(o) = self.life.orbs.get_mut(k) else { return };
+        let (fire, on_ground, fall, common) = read_common(n);
+        (o.fire, o.on_ground, o.body.fall, o.common) = (fire, on_ground, fall, common);
+        if let Some(v) = int(n, "Health") {
+            o.health = v as i32;
+        }
+        let id = o.id;
+        self.load_portal_cooldown(id, n);
     }
 
     /// G5-F05: "on fire" flag (data 0, bit 0x01) of an item or orb, sent when it changes.
@@ -807,7 +937,7 @@ impl Server {
             o.body.pos = o.pos;
             let lava = burn_due(o.fire, false) && o.body.touching_lava(&self.world(), &self.phys);
             if burn_step(&mut o.fire, false, lava) {
-                orb_take_damage(o, 1.0);
+                self.orb_hurt_ent(o, "minecraft:on_fire", 1.0);
             }
             self.fire_flag(o.id, o.fire, &mut o.fire_flag);
             if o.pos[1] < min_y {
@@ -949,15 +1079,13 @@ impl Server {
                 let pos = crate::nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
                 let vel = crate::nbtio::motion(e.get("Motion")).unwrap_or_default();
                 let delay = crate::nbtio::int(&e, "PickupDelay").unwrap_or(0) as i32;
-                let age = crate::nbtio::int(&e, "Age").unwrap_or(0) as i32;
-                let health = crate::nbtio::int(&e, "Health").unwrap_or(5) as i32;
                 // W8c: thrower re-read (only the player is recognized).
                 let thrower = crate::nbtio::uuid(e.get("Thrower")) == Some(self.uuid);
+                let before = self.life.drops.len();
                 self.spawn_item(pos, vel, stack, delay);
-                if let Some(d) = self.life.drops.last_mut() {
-                    d.age = age;
-                    d.health = health;
-                    d.fire = crate::nbtio::int(&e, "Fire").unwrap_or(0) as i16 as i32;
+                if self.life.drops.len() > before {
+                    self.item_read_nbt(before, &e);
+                    let d = &mut self.life.drops[before];
                     if let Some([yaw, _]) = crate::nbtio::f32s::<2>(e.get("Rotation")) {
                         d.yaw = yaw;
                     }
@@ -975,45 +1103,16 @@ impl Server {
         use rc_proto::nbt::Nbt;
         use std::collections::BTreeMap;
         let mut by_chunk: BTreeMap<(i32, i32), Vec<Nbt>> = BTreeMap::new();
+        // L10-ENT: the same compound as `/data` shows, with the game's common entity part
+        // (fall distance, air, invulnerability, portal delay included).
         for d in &self.life.drops {
             let c = ((d.pos[0].floor() as i32) >> 4, (d.pos[2].floor() as i32) >> 4);
-            let dbl = |v: [f64; 3]| Nbt::List(v.iter().map(|&x| Nbt::Double(x)).collect());
-            let uuid = [d.id, 0x5332_0000, 0, d.id.wrapping_mul(31)];
-            let thrower = (d.thrower == Some(crate::mobs::mob::Ent::Player))
-                .then(|| ("Thrower".to_owned(), crate::nbtio::uuid_nbt(self.uuid))); // W8c
-            let fields = [
-                ("id".into(), Nbt::String("minecraft:item".into())),
-                ("Pos".into(), dbl(d.pos)),
-                ("Motion".into(), dbl(d.vel)),
-                ("Rotation".into(), Nbt::List(vec![Nbt::Float(d.yaw), Nbt::Float(0.0)])),
-                ("OnGround".into(), Nbt::Byte(i8::from(d.on_ground))),
-                ("Fire".into(), Nbt::Short(d.fire as i16)),
-                ("Health".into(), Nbt::Short(d.health as i16)),
-                ("Age".into(), Nbt::Short(d.age as i16)),
-                ("PickupDelay".into(), Nbt::Short(d.pickup_delay as i16)),
-                ("UUID".into(), Nbt::IntArray(uuid.to_vec())),
-                ("Item".into(), d.stack.to_nbt(None)),
-            ];
-            by_chunk.entry(c).or_default().push(Nbt::Compound(thrower.into_iter().chain(fields).collect()));
+            by_chunk.entry(c).or_default().push(self.item_ent_nbt(d));
         }
         // G5-F05: experience orbs, written like the game (never saved before: lost on reload).
         for o in self.life.orbs.iter().filter(|o| !o.removed) {
             let c = ((o.pos[0].floor() as i32) >> 4, (o.pos[2].floor() as i32) >> 4);
-            let dbl = |v: [f64; 3]| Nbt::List(v.iter().map(|&x| Nbt::Double(x)).collect());
-            let uuid = [0x5332_0000, 0, 0, o.id];
-            by_chunk.entry(c).or_default().push(Nbt::Compound(vec![
-                ("id".into(), Nbt::String("minecraft:experience_orb".into())),
-                ("Pos".into(), dbl(o.pos)),
-                ("Motion".into(), dbl(o.vel)),
-                ("Rotation".into(), Nbt::List(vec![Nbt::Float(0.0), Nbt::Float(0.0)])),
-                ("OnGround".into(), Nbt::Byte(i8::from(o.on_ground))),
-                ("Fire".into(), Nbt::Short(o.fire as i16)),
-                ("Health".into(), Nbt::Short(o.health as i16)),
-                ("Age".into(), Nbt::Short(o.age as i16)),
-                ("Value".into(), Nbt::Short(o.value as i16)),
-                ("Count".into(), Nbt::Int(o.count)),
-                ("UUID".into(), Nbt::IntArray(uuid.to_vec())),
-            ]));
+            by_chunk.entry(c).or_default().push(self.orb_ent_nbt(o));
         }
         self.sim_entities_into_chunks(&mut by_chunk); // G4-F08: primed TNT, falling blocks
         self.mobs_into_chunks(&mut by_chunk); // S4: mobs
@@ -1464,7 +1563,7 @@ impl Server {
     /// with its contents (box, bag) spilled in its place. True if they landed.
     pub(crate) fn item_hurt(&mut self, id: i32, ty: &str, amount: f32, by_mob: bool) -> bool {
         let Some(k) = self.life.drops.iter().position(|d| d.id == id && !d.removed) else { return false };
-        if !self.item_may_hurt(&self.life.drops[k].stack, ty, by_mob) {
+        if self.invulnerable_to(self.life.drops[k].common, ty) || !self.item_may_hurt(&self.life.drops[k].stack, ty, by_mob) {
             return false;
         }
         let spill = item_take_damage(&mut self.life.drops[k], amount);
@@ -1477,7 +1576,7 @@ impl Server {
 
     /// [`Server::item_hurt`] on an item taken out of the list (its own tick).
     pub(crate) fn item_hurt_ent(&mut self, d: &mut ItemEnt, ty: &str, amount: f32, by_mob: bool) -> bool {
-        if d.removed || !self.item_may_hurt(&d.stack, ty, by_mob) {
+        if d.removed || self.invulnerable_to(d.common, ty) || !self.item_may_hurt(&d.stack, ty, by_mob) {
             return false;
         }
         for s in item_take_damage(d, amount) {
@@ -1497,10 +1596,29 @@ impl Server {
     }
 
     /// Damage to an experience orb: health points removed, orb removed at 0.
-    pub(crate) fn orb_hurt(&mut self, id: i32, amount: f32) -> bool {
-        let Some(o) = self.life.orbs.iter_mut().find(|o| o.id == id && !o.removed) else { return false };
+    pub(crate) fn orb_hurt(&mut self, id: i32, ty: &str, amount: f32) -> bool {
+        let Some(k) = self.life.orbs.iter().position(|o| o.id == id && !o.removed) else { return false };
+        if self.invulnerable_to(self.life.orbs[k].common, ty) {
+            return false;
+        }
+        orb_take_damage(&mut self.life.orbs[k], amount);
+        true
+    }
+
+    /// [`Server::orb_hurt`] on an orb taken out of the list (its own tick, the blocks it touches).
+    pub(crate) fn orb_hurt_ent(&self, o: &mut Orb, ty: &str, amount: f32) -> bool {
+        if self.invulnerable_to(o.common, ty) {
+            return false;
+        }
         orb_take_damage(o, amount);
         true
+    }
+
+    /// `Invulnerable` item or orb: only damage of the `bypasses_invulnerability` tag gets
+    /// through. The game also lets a creative player's damage through; the callers here never
+    /// carry that source (residue noted in `docs/gaps-protocol.md` § G).
+    fn invulnerable_to(&self, c: Common, ty: &str) -> bool {
+        c.invulnerable && !self.dmg_tag(ty, "minecraft:bypasses_invulnerability")
     }
 }
 
