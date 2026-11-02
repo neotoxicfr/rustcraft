@@ -458,7 +458,7 @@ impl Server {
                     s.joined_tick = s.tick + 1;
                     // Tickets of the previous tick applied, then the chunk source's purge.
                     s.proj.pearl_tickets_apply();
-                    s.proj.pearl_tickets_purge();
+                    s.proj.pearl_tickets_purge(s.time);
                     if ticket > 0 {
                         s.tick_sim_entities();
                         s.drops_tick();

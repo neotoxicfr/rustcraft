@@ -349,8 +349,10 @@ pub struct Projs {
     /// During the damage dealt directly by a thrown potion: true if it hurts those
     /// sensitive to water (the enderman only takes those, then teleports).
     pub direct_potion: Option<bool>,
-    /// L9-TICK: tickets of the players' ender pearls in this dimension.
+    /// L9-TICK: tickets of the players' ender pearls in this dimension, and the game time of
+    /// their last purge (a world parked or unparked during a tick is not purged twice).
     pub tickets: Vec<PearlTicket>,
+    pub purged: Option<i64>,
 }
 
 /// An Ender pearl of `owner` flies among these projectiles.
@@ -396,8 +398,12 @@ impl Projs {
         }
     }
 
-    /// Purge of the chunk source (once per ticking tick): one tick less, expired ones removed.
-    pub(crate) fn pearl_tickets_purge(&mut self) {
+    /// Purge of the chunk source (once per ticking tick, `now`: game time): one tick less,
+    /// expired ones removed.
+    pub(crate) fn pearl_tickets_purge(&mut self, now: i64) {
+        if self.purged.replace(now) == Some(now) {
+            return;
+        }
         self.tickets.retain_mut(|t| {
             t.left -= 1;
             t.left >= 0

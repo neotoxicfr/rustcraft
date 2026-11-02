@@ -249,7 +249,7 @@ impl Server {
         }
         // 9. Chunk source: purge of the expired tickets first (L9-TICK: a pearl's ticket
         // stops counting from here, its chunks no longer simulated for the rest of the tick).
-        self.proj.pearl_tickets_purge();
+        self.proj.pearl_tickets_purge(now);
         if world {
             // Then the spawning chunks (thunder, natural spawns).
             self.natural_spawn_tick();

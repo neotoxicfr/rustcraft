@@ -341,5 +341,14 @@ fn parked_world_kept_active_by_a_pearl_ticket() {
     assert_eq!(left(&p), Some((39, true)), "parked world ticked");
     game_ticks(&mut p, 40);
     assert_eq!(left(&p), None, "expired in the parked world");
+    // A world parked during a tick (player through a portal) is not purged a second time in
+    // that tick by the parked worlds' pass.
+    p.s.proj.pearl_ticket((0, 0), true);
+    p.s.time += 1;
+    p.s.tick_level_blocks(false);
+    p.s.enter_world(NETHER);
+    p.s.dims_tick();
+    let w = p.s.dims.parked.iter().find(|w| w.dim.name == OVERWORLD).expect("parked overworld");
+    assert_eq!(w.proj.tickets.first().map(|t| t.left), Some(39), "purged once in the tick");
     finish(p, dir);
 }
