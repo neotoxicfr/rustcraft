@@ -480,18 +480,11 @@ impl Loot<'_> {
                 s
             }
             "set_instrument" => {
-                let opts: Vec<String> = match &f["options"] {
-                    Value::String(t) if t.starts_with('#') => self
-                        .pack
-                        .get("tags/instrument", t.trim_start_matches('#'))
-                        .and_then(|v| v["values"].as_array().cloned())
-                        .unwrap_or_default()
-                        .iter()
-                        .filter_map(|x| x.as_str().map(str::to_owned))
-                        .collect(),
-                    Value::String(id) => vec![id.clone()],
+                let opts: std::sync::Arc<[String]> = match &f["options"] {
+                    Value::String(t) if t.starts_with('#') => self.pack.tag("instrument", t),
+                    Value::String(id) => std::sync::Arc::from([id.clone()]),
                     Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect(),
-                    _ => Vec::new(),
+                    _ => std::sync::Arc::from([]),
                 };
                 if !opts.is_empty() {
                     let k = rng.next_int_bound(opts.len() as i32) as usize;

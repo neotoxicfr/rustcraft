@@ -1276,7 +1276,8 @@ impl Server {
     }
 
     /// Contents by increasing slot: id, count, stack size from the stack's
-    /// `max_stack_size` component if set (clamped to 1..99 like the game).
+    /// `max_stack_size` component if set (clamped to 1..99 like the game), 1 if the patch
+    /// removes it.
     pub(crate) fn be_item_counts_full(&self, p: P) -> Vec<(String, i32, Option<i32>)> {
         self.slots(p)
             .into_iter()
@@ -1284,11 +1285,11 @@ impl Server {
             .filter_map(|it| {
                 let id = it.get("id").and_then(Nbt::as_str).unwrap_or("").to_owned();
                 let count = Self::item_count(&it);
-                let own = it
-                    .get("components")
-                    .and_then(|c| c.get("minecraft:max_stack_size"))
-                    .and_then(Nbt::as_i64)
-                    .map(|n| n.clamp(1, 99) as i32);
+                let comps = it.get("components");
+                let own = match comps.and_then(|c| c.get("minecraft:max_stack_size")).and_then(Nbt::as_i64) {
+                    Some(n) => Some(n.clamp(1, 99) as i32),
+                    None => comps.and_then(|c| c.get("!minecraft:max_stack_size")).map(|_| 1),
+                };
                 (!id.is_empty() && count > 0).then_some((id, count, own))
             })
             .collect()

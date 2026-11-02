@@ -662,6 +662,22 @@ fn container_comparator_own_stack_size() {
     assert_eq!(w.comparator(at, Dir::North), 10);
 }
 
+/// L10: a stack whose patch removes `max_stack_size` counts with the game's maximum of 1: a
+/// barrel holding one such stone per slot is full (15), not 1/64 full (1).
+#[test]
+fn container_comparator_removed_stack_size() {
+    let mut w = world("barrel-unstack");
+    let at = [3, Y, 8];
+    w.set(at, "minecraft:barrel[facing=up]");
+    let stone = Stack {
+        id: "minecraft:stone".into(),
+        count: 1,
+        components: Some(Nbt::Compound(vec![("!minecraft:max_stack_size".into(), Nbt::Compound(Vec::new()))])),
+    };
+    crate::containers::write_items(w.p.s.be_get_mut(at).unwrap(), &vec![Some(stone); 27]);
+    assert_eq!(w.comparator(at, Dir::North), 15);
+}
+
 /// Decorated pot with sealed loot: the loot is drawn on click, the dirt does not go in (failure), and
 /// breaking drops only the loot.
 #[test]

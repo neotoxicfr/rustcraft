@@ -3303,3 +3303,32 @@ runs), so only the order of magnitude is claimed.
 - Multi-core and GPU not applicable (per-event or per-frame UI work of a few hundred
   nanoseconds at most). Scenes to re-measure on a quiet machine: `menu` and an in-game scene with
   the creative inventory open (no change expected beyond the removed allocation).
+## L10-LOOT: value checks, set_contents order, removed components, pack tags (02/11, loaded machine)
+
+- Equivalence (A1/A2): `loot::bench_tests::loot_bench` fingerprint of the 1447 base pack tables
+  (16 seeds each) `af880b1baa83fb25` on 2b3094dd and on this branch, every per-table line
+  identical (`RUSTCRAFT_LOOT_PRINT` files compared). The base pack has no bound-free value check
+  and no set_contents with drawing children, so its draws do not move.
+- Entry expansion: candidates are handed to a callback (a pool's roll pushes them into its kept
+  buffer, set_contents creates each at once, its per-entry vector is gone). Three spellings
+  built and benched against the old code in the same series (best of 7 x 5000 draws, `essai`
+  profile, medians of alternated passes). Series A, 6 passes, old ns then generic `F: FnMut` /
+  `&mut dyn FnMut`: stone 444 +0.6 / +2.0 %, oak leaves 1287 +0.2 / -1.0 %, zombie 821 +0.9 /
+  +1.3 %, simple dungeon 5170 +0.9 / +0.9 %, fishing 821 +1.7 / +1.0 % (geometric mean +0.9 /
+  +0.8 %). Series B, 6 passes, two-case enum (direct push for a pool, creation for contents) /
+  `dyn`: stone +3.5 / +0.6 %, oak +2.0 / -1.4 %, zombie +4.1 / +2.4 %, dungeon +3.7 / +1.4 %,
+  fishing +4.7 / +1.8 % (mean +3.6 / +1.0 %). Two earlier 4-pass series: generic +1.2 %, `dyn`
+  +0.5 %. The enum, which does the least work, is the slowest: inlining and layout of the
+  incremental 16-unit build, not the algorithm; old-code passes alone spread 1.5-2 %. Kept:
+  `dyn` (one instance, best mean). To re-measure on a quiet machine with the full release
+  profile: the three spellings are one signature apart in `Loot::expand`.
+- `Items::max_stack`: the removal (`!max_stack_size`) is read in the same pass over the patch as
+  the value (one length test more per entry, no second scan); `damageable` answers a patch-free
+  stack with one item lookup (before: two empty component lookups then the same item lookup).
+- Pack tags (`DataPack::tag`): a registry folder's tags are all resolved on its first request with
+  the shared `packs::resolve_tags` and kept (`Arc<[String]>` per tag, no copy per read); before,
+  each read parsed-and-cached the raw file and walked it. Readers: nested loot tables, slot
+  sources, set_instrument, goat horns (one per horn), bone meal features (one per bone meal).
+  No measurable cost: none of them is on a per-tick path.
+- Not applicable: multi-core and GPU (a draw is one chain on one generator, a few
+  microseconds); the value-check change removes a draw, it adds no work.

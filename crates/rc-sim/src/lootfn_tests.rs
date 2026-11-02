@@ -236,6 +236,14 @@ fn missing_loot_functions() {
     check("set_components damageable and stackable refused", r.components.is_none(), &r);
     let r = ap(json!({"type": "minecraft:set_components", "components": {"max_stack_size": 16}}), stack("minecraft:stone", 64));
     check("set_components quantity over the maximum refused", r.components.is_none(), &r);
+    // L10: the removed `max_stack_size` leaves the game's maximum of 1: 64 stones refused, a
+    // single one kept with the removal.
+    let unstack = json!({"type": "minecraft:set_components", "components": {"!minecraft:max_stack_size": {}}});
+    let r = ap(unstack.clone(), stack("minecraft:stone", 64));
+    check("set_components !max_stack_size, 64 over the maximum of 1 refused", r.components.is_none(), &r);
+    let r = ap(unstack, stack("minecraft:stone", 1));
+    let ok = has(&r, "!minecraft:max_stack_size", "{}") && s.life.items.max_stack(&r) == 1;
+    check("set_components !max_stack_size kept on a single stone (maximum 1)", ok, &r);
 
     // `copy_components` from the tool (its value, defaults included) and the block entity name.
     let sword = stack("minecraft:diamond_sword", 1);
@@ -269,6 +277,17 @@ fn loot_entries_and_providers() {
         ("test:loot_table/b", r#"{"pools":[{"rolls":1,"entries":[{"type":"minecraft:item","name":"minecraft:dirt"}]}]}"#),
         ("test:tags/loot_table/t", r##"{"values":["test:a","#test:u"]}"##),
         ("test:tags/loot_table/u", r#"{"values":[{"id":"test:b","required":false}]}"#),
+        // L10: tags read like the game's loader (`{id}` members, duplicates, missing members).
+        ("test:tags/loot_table/dup", r##"{"values":["test:a","#test:t","test:a"]}"##),
+        ("test:tags/loot_table/bad", r#"{"values":["test:a","test:none"]}"#),
+        ("test:slot_source/held", r#"{"type":"minecraft:slot_range","source":"this","slots":"hotbar.0"}"#),
+        ("test:tags/slot_source/t", r#"{"values":[{"id":"test:held","required":false}]}"#),
+        ("test:tags/slot_source/twice", r##"{"values":[{"id":"test:held"},"#test:t"]}"##),
+        (
+            "test:instrument/horn",
+            r#"{"sound_event":"minecraft:item.goat_horn.sound.0","use_duration":7.0,"range":256.0,"description":"x"}"#,
+        ),
+        ("test:tags/instrument/h", r#"{"values":[{"id":"test:horn"}]}"#),
     ]);
     let s = &p.s;
     let no_tag = |_: &str, _: &str| false;
@@ -304,6 +323,27 @@ fn loot_entries_and_providers() {
     let out = names(&mine.run(&one(json!({"type": "minecraft:loot_table", "value": "#test:t"})), &ctx, &mut rng));
     if out != ["stonex1", "dirtx1"] {
         fails.push(format!("nested tag: {out:?}"));
+    }
+    // L10: tag members as the game's tag loader reads them: a table listed twice runs once, a
+    // missing required member refuses the whole tag; `{id}` members of slot source tags.
+    let out = names(&mine.run(&one(json!({"type": "minecraft:loot_table", "value": "#test:dup"})), &ctx, &mut rng));
+    if out != ["stonex1", "dirtx1"] {
+        fails.push(format!("nested tag, duplicates dropped: {out:?}"));
+    }
+    let out = names(&mine.run(&one(json!({"type": "minecraft:loot_table", "value": "#test:bad"})), &ctx, &mut rng));
+    if !out.is_empty() {
+        fails.push(format!("nested tag missing a required table, refused: {out:?}"));
+    }
+    for (tag, what) in [("#test:t", "{id} member"), ("#test:twice", "member listed twice")] {
+        let out = names(&mine.run(&one(json!({"type": "minecraft:slots", "slot_source": tag})), &ctx, &mut rng));
+        if out != ["diamondx2"] {
+            fails.push(format!("slot source tag ({what}): {out:?}"));
+        }
+    }
+    let f = json!({"type": "minecraft:set_instrument", "options": "#test:h"});
+    let r = mine.apply(&f, stack("minecraft:goat_horn", 1), &ctx, &mut rng);
+    if !has(&r, "minecraft:instrument", "\"test:horn\"") {
+        fails.push(format!("set_instrument from a tag with an {{id}} member: {}", show(&r)));
     }
     let out = names(&mine.drops("test:self", &ctx, &mut rng));
     if out != ["stonex1"] {
@@ -366,6 +406,54 @@ fn loot_entries_and_providers() {
         true,
         &mut rng,
     ));
+    // L10: a test without bounds passes without reading the value (the game never draws it);
+    // with a bound, the value is drawn first, then the bound.
+    let uniform = json!({"type": "minecraft:uniform", "min": 0, "max": 9});
+    for ty in ["int_value_check", "float_value_check"] {
+        let read = |r: &mut crate::mobs::jrand::JRand| {
+            if ty == "int_value_check" {
+                loot.int(&uniform, &ctx, r);
+            } else {
+                loot.float(&uniform, &ctx, r);
+            }
+        };
+        let (mut a, b) = (crate::mobs::jrand::JRand::new(11), crate::mobs::jrand::JRand::new(11));
+        let ok = loot.cond(&json!({"type": ty, "value": uniform, "test": {}}), &ctx, &mut a);
+        if !ok || a.clone().next_int() != b.clone().next_int() {
+            fails.push(format!("{ty} without bounds: {ok}, value drawn"));
+        }
+        let (mut a, mut b) = (crate::mobs::jrand::JRand::new(11), crate::mobs::jrand::JRand::new(11));
+        let ok = loot.cond(&json!({"type": ty, "value": uniform, "test": {"min": -1}}), &ctx, &mut a);
+        read(&mut b);
+        if !ok || a.clone().next_int() != b.clone().next_int() {
+            fails.push(format!("{ty} with a lower bound: {ok}, value not drawn once"));
+        }
+    }
+    // L10: `set_contents` creates each candidate as soon as it is expanded: the draws go
+    // condition 1, quantity 1, condition 2, quantity 2 (not both conditions first).
+    let child = |name: &str| {
+        json!({"type": "minecraft:item", "name": name,
+            "condition": {"type": "minecraft:random_chance", "chance": 1.0},
+            "modifier": {"type": "minecraft:set_count", "count": {"type": "minecraft:uniform", "min": 1, "max": 64}}})
+    };
+    let (stone, dirt) = (child("minecraft:stone"), child("minecraft:dirt"));
+    let f = json!({"type": "minecraft:set_contents", "component": "container", "entries": [
+        {"type": "minecraft:group", "children": [stone, dirt]}]});
+    for seed in [1, 2, 3] {
+        let mut g = crate::mobs::jrand::JRand::new(seed);
+        let mut want = Vec::new();
+        for (e, id) in [(&stone, "minecraft:stone"), (&dirt, "minecraft:dirt")] {
+            if loot.cond(&e["condition"], &ctx, &mut g) {
+                want.push(loot.apply(&e["modifier"], stack(id, 1), &ctx, &mut g).count);
+            }
+        }
+        let r = loot.apply(&f, stack("minecraft:shulker_box", 1), &ctx, &mut crate::mobs::jrand::JRand::new(seed));
+        let got: Vec<i32> =
+            crate::loot::held_stacks(&r, "minecraft:container").iter().flatten().map(|s| s.count).collect();
+        if got != want {
+            fails.push(format!("set_contents draw order (seed {seed}): {got:?}, expected {want:?}"));
+        }
+    }
     // Arithmetic fixed by G3-F08, kept: divisor read first (zero: NaN, the dividend not drawn),
     // ceiling through a saturated integer, 32-bit division wrapping, binomial refusing NaN.
     let mut a = crate::mobs::jrand::JRand::new(3);
@@ -393,6 +481,66 @@ fn loot_entries_and_providers() {
     );
     if !ok.0 {
         fails.push(format!("execute if predicate int_value_check: {ok:?}"));
+    }
+    assert!(fails.is_empty(), "{fails:#?}");
+}
+
+/// L10: a component the patch removes (`!name`) is read as absent, with the game's fallback,
+/// never the item's default: maximum stack 1, no equipment slot, no wear, no egg species. The
+/// vanilla tags read by the sweep (horns, bone meal features) resolve to their listed members.
+#[test]
+fn removed_components_read_like_the_game() {
+    let p = world("l10rm");
+    let items = &p.s.life.items;
+    assert!(!items.defaults("minecraft:diamond_sword")["minecraft:damage"].is_null(), "item component reports missing");
+    let rm = |id: &str, k: &str| with(id, 1, &format!("{{\"!minecraft:{k}\":{{}}}}"));
+    let mut fails: Vec<String> = Vec::new();
+    let mut check = |name: &str, ok: bool| {
+        if !ok {
+            fails.push(name.to_owned());
+        }
+    };
+    check(
+        "max_stack of a stone without max_stack_size",
+        items.max_stack(&rm("minecraft:stone", "max_stack_size")) == 1,
+    );
+    check("max_stack of a stone", items.max_stack(&stack("minecraft:stone", 1)) == 64);
+    check("helmet without equippable", items.equip_slot(&rm("minecraft:diamond_helmet", "equippable")).is_none());
+    check("helmet", items.equip_slot(&stack("minecraft:diamond_helmet", 1)) == Some(4));
+    check("sword without damage", !items.damageable(&rm("minecraft:diamond_sword", "damage")));
+    check("sword", items.damageable(&stack("minecraft:diamond_sword", 1)));
+    check("damaged sword", items.damageable(&with("minecraft:diamond_sword", 1, "{\"minecraft:damage\":3}")));
+    let stick = with("minecraft:stick", 1, "{\"minecraft:max_damage\":10,\"minecraft:max_stack_size\":1}");
+    check("stick given a durability but no wear", !items.damageable(&stick));
+    check("pig egg without entity_data", p.s.egg_kind(&rm("minecraft:pig_spawn_egg", "entity_data")).is_none());
+    check("pig egg", p.s.egg_kind(&stack("minecraft:pig_spawn_egg", 1)).is_some());
+    // Data behind the patch-free path of `damageable`: an item carries a default `damage`
+    // exactly when it has a durability.
+    for (i, info) in items.data.items.iter().enumerate() {
+        let name = items.name(i as i32).unwrap_or("");
+        let wear = !items.defaults(name)["minecraft:damage"].is_null();
+        check(&format!("default damage of {name}"), wear == (info.max_damage > 0));
+    }
+    // Vanilla tags now read through the shared resolver: the same members, in order (a tag
+    // nesting others: not empty).
+    for dir in ["instrument", "worldgen/feature"] {
+        for (name, t) in p.s.life.pack.all(&format!("tags/{dir}")) {
+            let listed: Vec<&str> = t["values"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+            let got = p.s.life.pack.tag(dir, &name);
+            let ok = if listed.iter().any(|x| x.starts_with('#')) {
+                !got.is_empty()
+            } else {
+                got.iter().map(String::as_str).eq(listed.iter().copied())
+            };
+            check(&format!("vanilla tag {dir} {name}: {got:?}"), ok);
+        }
+    }
+    for (dir, name) in [
+        ("instrument", "regular_goat_horns"),
+        ("instrument", "screaming_goat_horns"),
+        ("worldgen/feature", "can_spawn_from_bone_meal"),
+    ] {
+        check(&format!("vanilla tag {dir} {name} present"), !p.s.life.pack.tag(dir, name).is_empty());
     }
     assert!(fails.is_empty(), "{fails:#?}");
 }

@@ -511,15 +511,7 @@ impl Server {
         let Some(b) = self.life.pack.get("worldgen/biome", biome.trim_start_matches("minecraft:")) else {
             return Vec::new();
         };
-        let tag: Vec<String> = self
-            .life
-            .pack
-            .get("tags/worldgen/feature", "can_spawn_from_bone_meal")
-            .and_then(|t| t["values"].as_array().cloned())
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_owned))
-            .collect();
+        let tag = self.life.pack.tag("worldgen/feature", "can_spawn_from_bone_meal");
         let mut out = Vec::new();
         let steps = b["features"].as_array().cloned().unwrap_or_default();
         for step in &steps {
