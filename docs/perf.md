@@ -2910,3 +2910,37 @@ on a quiet machine with the others).
   melee path (one hit per spin). No hot path touched: the per-tick and per-hit costs above are
   unchanged (same bench, the mob melee path is identical). Multi-core and GPU not applicable
   (single events, ordered by the game).
+## G4-F17: trading uses, typed input, tooltips, smoothing, timeline curves, saves, profiling (02/11, loaded machine)
+
+Interface, save-folder and debug code driven by events, a screen or the F3+L recording; nothing
+added to a world loop outside these. Axes reviewed (client CPU, integrated server CPU,
+regularity, allocations, disk, RAM, startup, multi-core): figures below, the rest unchanged.
+
+- Optimize World (`rc_sim::storage::optimize`, three passes like the game): micro-bench
+  `storage::tests::bench_optimize` (8 region files of 1024 chunks, 2 passes, loaded machine).
+  Without erasing nothing can change, so no chunk is read again: 1.1-1.2 ms against 70-100 ms for
+  reading and inflating every chunk (what the old single pass did). With erasing, region files
+  shared among threads (one file per thread, `RUSTCRAFT_THREADS`, default the logical cores):
+  1 thread 359-371 ms, 2 threads 194-200 ms, 4 threads 118-212 ms, 8 threads 83-146 ms: kept
+  multi-core. Leads not taken: parallel chunks inside one region file (writes to one file stay
+  sequential, the inflate/deflate is per chunk and already spread by files); GPU not applicable
+  (zlib and NBT). The entity and POI passes only read region headers (8 KiB per file).
+- Named timeline curves (`rc_env::named_ease`, bit for bit with the game, values printed by the
+  game itself): `ease_tests::bench_named_curves`, 30 curves x 10 000 points, 4.77-4.84 ns per call
+  against 6.49-6.50 ns for the Bezier curve (2 passes). Sine and cosine of the game's table
+  computed on demand from the entry index (same value as the table, no 256 KiB table kept);
+  base-pack timelines never use them (no change in play).
+- Trading: the take of the result reuses the prediction (one offer lookup, at most 2 payment
+  checks); only on a click on the result slot. Not measured (a few comparisons per click).
+- Typed text: the event check reads only the first character (was: every character).
+- Tooltip effect durations: one atomic load of the tick rate per effect line (set once per
+  client tick with the other tooltip context bits).
+- Mouse smoothing, wheel accumulation, gliding roll: the game's sign (zero kept) replaces Rust's
+  `signum`: one more comparison; no measurable cost.
+- F3+L recording (only while it runs, 10 s): counters on the open path (at most 10 increments
+  per frame, `&'static` names, one path string per new zone), one single-frame collection per
+  frame like the game's per-tick profiler (rebuilt each frame; reusing its map would leave zero
+  entries in the tree), working-set read per frame (`heap MiB`), processor times read at most
+  every 501 ms (`NtQuerySystemInformation` / `/proc/stat`). Archive written once at the end.
+- To re-measure on a quiet machine: `bench_optimize` and `bench_named_curves` (2 passes each);
+  scene bench not concerned (nothing changed in the world loop).

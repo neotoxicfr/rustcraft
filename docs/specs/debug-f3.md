@@ -727,8 +727,23 @@ Details:
   the folder.
 - Content: `system.txt` (`key: value`), `client/options.txt` (options sorted `name: value`),
   `client/metrics/<category>.csv` (`@tick` then columns, CRLF, numbers in Java's `Double`
-  format, first partial frame not recorded), `client/profiling.txt` (profiling report
-  header, durations, tree `[nn] |   name(passes/per tick) - %local/%global`).
+  format, first partial frame not recorded): `ticking` (`ticktime`, frame ns), `chunk
+  rendering`, `gpu`, `jvm` (`heap MiB`, here the working set in whole MiB), `cpu` (`cpu#n`:
+  busy share of each logical processor, read again at most every 501 ms; absent when the system
+  does not tell); `client/deviations/ticktime/<frame>@<yyyy-MM-dd_HH.mm.ss.SSS>.txt` for each
+  frame whose time grew by 200 % or more over the previous one (report of that frame alone,
+  its time counted from the end of the previous frame, tick span 1); `client/profiling.txt`
+  (profiling report header, durations, tree `[nn] |   name(passes/per tick) - %local/%global`,
+  each zone's counters `#name total/per tick` listed before its children, then when a counter
+  was increased `--- BEGIN COUNTER DUMP ---`: per counter `-- Counter: name --` and the tree
+  `[nn] zone total:own/subtree average: own/subtree` per tick, children by decreasing subtree,
+  whole divisions). The client counts `clientTick` in `tick` for each client tick of the frame.
+- Singleplayer: the same under `server/` from the integrated server's ticks seen during the
+  recording (`metrics/ticking.csv` with the full tick time including the wait, deviations,
+  `profiling.txt` with the time and tick spans). Not reproduced: the server's zone tree and
+  counters, its debug report (`levels/`, `gamerules.txt`, `stats.txt`, `threads.txt`,
+  `classpath.txt`, `modules.txt`), and the Java executor tables (`event-loops`,
+  `consecutive-executors`, `chunk rendering dispatching`).
 
 ---
 

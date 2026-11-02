@@ -438,8 +438,14 @@ impl crate::App {
             stop: false,
             frame_start: None,
             rows: Vec::new(),
+            cpu: crate::profiling_zip::CpuStats::new(),
+            cpu_rows: Vec::new(),
+            last_frame: None,
+            deviations: Vec::new(),
+            server_ticks: Vec::new(),
         });
         crate::profiler::set(crate::profiler::RECORD, true);
+        crate::profiler::set(crate::profiler::SINGLE, true);
         // The game also passes the two keys ("rebindable" text taken under this key).
         let args = vec![
             rc_text::Arg::Text("10".into()),

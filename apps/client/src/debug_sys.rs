@@ -101,6 +101,22 @@ mod win {
         pub fn GetLocaleInfoEx(name: *const u16, lctype: u32, data: *mut u16, len: i32) -> i32;
     }
 
+    /// Times of a logical processor since boot (100 ns): idle, kernel (idle included), user, then
+    /// two reserved times and a counter.
+    #[repr(C)]
+    pub struct ProcessorTimes {
+        pub idle: i64,
+        pub kernel: i64,
+        pub user: i64,
+        pub _reserved: [i64; 2],
+        pub _count: u32,
+    }
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        pub fn NtQuerySystemInformation(class: u32, info: *mut std::ffi::c_void, len: u32, ret: *mut u32) -> i32;
+    }
+
     #[link(name = "user32")]
     unsafe extern "system" {
         pub fn OpenClipboard(owner: isize) -> i32;
@@ -250,6 +266,48 @@ pub fn allocator_commit() -> (u64, u64) {
         return (0, 0);
     }
     (s.committed[2].max(0) as u64, s.committed[1].max(0) as u64)
+}
+
+/// (busy, total) time of each logical processor since boot, in the system's units; empty if the
+/// system does not tell (F3+L processor loads).
+pub fn cpu_times() -> Vec<(u64, u64)> {
+    #[cfg(windows)]
+    {
+        const PROCESSOR_TIMES: u32 = 8;
+        let mut v: Vec<win::ProcessorTimes> = Vec::with_capacity(256);
+        let size = std::mem::size_of::<win::ProcessorTimes>();
+        let mut got = 0u32;
+        // SAFETY: buffer of 256 entries of the announced byte length; the system writes at most
+        // that many entries and returns the byte count actually written.
+        let status = unsafe {
+            win::NtQuerySystemInformation(PROCESSOR_TIMES, v.as_mut_ptr().cast(), (256 * size) as u32, &mut got)
+        };
+        if status < 0 {
+            return Vec::new();
+        }
+        // SAFETY: `got` bytes were written, whole entries of integers.
+        unsafe { v.set_len((got as usize / size).min(256)) };
+        v.iter()
+            .map(|t| {
+                let total = (t.kernel + t.user).max(0) as u64;
+                (total.saturating_sub(t.idle.max(0) as u64), total)
+            })
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        // `cpuN user nice system idle iowait irq softirq steal …`: idle = idle + iowait.
+        let Ok(stat) = std::fs::read_to_string("/proc/stat") else { return Vec::new() };
+        stat.lines()
+            .filter(|l| l.starts_with("cpu") && l.as_bytes().get(3).is_some_and(u8::is_ascii_digit))
+            .map(|l| {
+                let v: Vec<u64> = l.split_whitespace().skip(1).take(8).map(|x| x.parse().unwrap_or(0)).collect();
+                let total: u64 = v.iter().sum();
+                let idle = v.get(3).copied().unwrap_or(0) + v.get(4).copied().unwrap_or(0);
+                (total.saturating_sub(idle), total)
+            })
+            .collect()
+    }
 }
 
 /// CPU time of the whole process (kernel + user), in nanoseconds (measurements).

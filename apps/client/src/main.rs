@@ -1319,6 +1319,7 @@ impl App {
         profiler::push("tick");
         let depth = profiler::depth();
         for _ in 0..due {
+            profiler::increment("clientTick");
             self.game_tick();
             profiler::unwind(depth);
         }
