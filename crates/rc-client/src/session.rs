@@ -152,13 +152,14 @@ impl LauncherProxy {
 }
 
 /// Launcher settings for the services: proxy, game folder, `--disableMultiplayer`,
-/// `--disableChat`.
+/// `--disableChat`, `--offlineDeveloperMode`.
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub proxy: LauncherProxy,
     pub game_dir: Option<std::path::PathBuf>,
     pub disable_multiplayer: bool,
     pub disable_chat: bool,
+    pub offline_developer_mode: bool,
 }
 
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -170,6 +171,12 @@ pub fn configure(c: Config) {
 
 fn config() -> &'static Config {
     CONFIG.get_or_init(Config::default)
+}
+
+/// Launched with `--offlineDeveloperMode`: the friends list is unavailable (title and pause
+/// buttons inactive).
+pub fn offline_developer_mode() -> bool {
+    config().offline_developer_mode
 }
 
 /// Chat key pair file of a profile in the game folder.

@@ -1454,7 +1454,7 @@ impl crate::App {
     }
 
     pub(crate) fn op_wheel(&mut self, op: &mut OpScreen, m: (f32, f32), dy: f64) -> Vec<OpAction> {
-        if op.chat.is_some() && self.cmd.wheel(m, dy as f32) {
+        if op.chat.is_some() && self.cmd.wheel(m, dy) {
             return Vec::new();
         }
         let Some(gui) = self.renderer.as_ref().map(|r| &r.gui) else { return Vec::new() };

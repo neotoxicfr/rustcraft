@@ -130,6 +130,16 @@ pub fn inventory_slot_pos(i: usize) -> Option<(i32, i32)> {
     })
 }
 
+/// Key of a slot in the bundles' chosen-item table (`bundle.rs`): menu slots keep their index,
+/// grid slots come after every menu, the trash has none (`usize::MAX`).
+pub fn hit_key(h: Hit) -> usize {
+    match h {
+        Hit::Grid(i) => crate::bundle::CREATIVE_GRID + i,
+        Hit::Menu(i) => i,
+        Hit::Trash => usize::MAX,
+    }
+}
+
 /// Relative position of a slot (§ 5, § 6.1).
 pub fn hit_pos(h: Hit) -> Option<(i32, i32)> {
     match h {
@@ -158,20 +168,26 @@ impl CreativeScreen {
 
     /// Displayed slots of the current tab.
     pub fn hits(&self, data: &rc_data::VersionData) -> Vec<Hit> {
-        if self.kind(data) == CreativeKind::Inventory {
-            let mut v: Vec<Hit> = (5..46).map(Hit::Menu).collect();
-            v.push(Hit::Trash);
-            v
-        } else {
-            (0..45).map(Hit::Grid).chain((36..45).map(Hit::Menu)).collect()
-        }
+        self.hit_iter(data).collect()
+    }
+
+    /// Displayed slots of the current tab, without building a list.
+    fn hit_iter(&self, data: &rc_data::VersionData) -> impl Iterator<Item = Hit> {
+        let inventory = self.kind(data) == CreativeKind::Inventory;
+        let tab = (5..46).map(Hit::Menu).chain(std::iter::once(Hit::Trash)).filter(move |_| inventory);
+        let grid = (0..45).map(Hit::Grid).chain((36..45).map(Hit::Menu)).filter(move |_| !inventory);
+        tab.chain(grid)
     }
 
     /// Hovered slot, if the cursor is over a slot.
     pub fn hovered(&self, gui: &Gui, data: &rc_data::VersionData, mouse: (f32, f32)) -> Option<Hit> {
         let (gx, gy) = origin(gui);
-        let (mx, my) = (mouse.0.floor() as i32 - gx, mouse.1.floor() as i32 - gy);
-        self.hits(data).into_iter().find(|&h| {
+        self.hit_at(data, (mouse.0.floor() as i32 - gx, mouse.1.floor() as i32 - gy))
+    }
+
+    /// Slot under a point relative to the image's corner (checked every frame: no list built).
+    fn hit_at(&self, data: &rc_data::VersionData, (mx, my): (i32, i32)) -> Option<Hit> {
+        self.hit_iter(data).find(|&h| {
             let Some((x, y)) = hit_pos(h) else { return false };
             mx >= x - 1 && mx < x + 17 && my >= y - 1 && my < y + 17
         })
@@ -234,9 +250,11 @@ impl CreativeScreen {
         }
     }
 
-    pub fn wheel(&mut self, data: &rc_data::VersionData, delta: f32) {
+    /// Wheel (scaled offset): the offset divided by the rows over the grid in double, then cut to
+    /// a float, like the game.
+    pub fn wheel(&mut self, data: &rc_data::VersionData, delta: f64) {
         if self.can_scroll(data) {
-            self.scroll = (self.scroll - delta / self.rows_over() as f32).clamp(0.0, 1.0);
+            self.scroll = (self.scroll - (delta / f64::from(self.rows_over())) as f32).clamp(0.0, 1.0);
         }
     }
 
@@ -447,8 +465,10 @@ impl CreativeScreen {
         self.icons.resize_with(tabs.len(), || None);
         if let Some(models) = gui.items.as_ref().map(|a| &a.models) {
             for (i, s) in stacks.iter().enumerate() {
+                // Slot key: the item chosen in a bundle with the wheel shows in its model.
+                let hold = crate::stack::Hold { menu_slot: u16::try_from(hit_key(hits[i])).ok(), ..crate::stack::Hold::NONE };
                 match s {
-                    Some(st) => refresh(&mut self.cache[i], st, it, models, i as i32),
+                    Some(st) => crate::screens::refresh_held(&mut self.cache[i], st, it, models, i as i32, hold),
                     None => self.cache[i] = None,
                 }
             }
@@ -520,8 +540,12 @@ impl CreativeScreen {
             draw_tooltip(gui, queue, &[t], w, mx.floor() as i32, my.floor() as i32);
             return;
         }
-        if let (Some(h), None) = (hover, &inv.carried)
+        // With an item carried, only a container's tooltip (bundle) stays, like the container screens.
+        let ctx = crate::bundle::Ctx { ids: it.ids, data: it.data };
+        if let Some(h) = hover
             && let Some(st) = self.stack_at(inv, h)
+            && let Some(contents) = Some(ctx.contents(&st))
+            && (inv.carried.is_none() || contents.is_some())
         {
             let fresh = self.tooltip.as_ref().is_some_and(|t| t.0 == st && t.1 == self.tab);
             if !fresh {
@@ -534,7 +558,14 @@ impl CreativeScreen {
                 let view = crate::stack::StackRef { stack: st, info, ids: it.ids, data: it.data, hold: crate::stack::Hold::NONE };
                 let style = crate::screens::tooltip_style(&view);
                 let m = (mx.floor() as i32, my.floor() as i32);
-                crate::screens::draw_tooltip_ex(gui, queue, lines, *tw, m, true, style.as_deref());
+                match contents {
+                    // Container (bundle): grid of the items under the name, chosen item marked.
+                    Some(items) if !lines.is_empty() => {
+                        let sel = crate::bundle::selected(hit_key(h));
+                        crate::bundle::draw_tooltip(gui, queue, it, &ctx, lines, &items, sel, m, style.as_deref());
+                    }
+                    _ => crate::screens::draw_tooltip_ex(gui, queue, lines, *tw, m, true, style.as_deref()),
+                }
             }
         }
     }
@@ -588,4 +619,76 @@ impl CreativeScreen {
 fn icon_stack(t: &rc_data::CreativeTab, it: &HotbarItems<'_>) -> Option<ItemStack> {
     let id = it.names.iter().position(|n| *n == t.icon.item)?;
     Some(ItemStack { item: id as i32, count: 1, added: Vec::new(), removed: Vec::new() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Data with one tab of kind `kind` (selected tab 0).
+    fn data(kind: CreativeKind) -> rc_data::VersionData {
+        let mut d = rc_data::VersionData::default();
+        d.creative.tabs.push(rc_data::CreativeTab { kind, ..Default::default() });
+        d
+    }
+
+    /// Hit test of the former code: list of the displayed slots built at each call.
+    fn listed(c: &CreativeScreen, data: &rc_data::VersionData, (mx, my): (i32, i32)) -> Option<Hit> {
+        let hits: Vec<Hit> = if c.kind(data) == CreativeKind::Inventory {
+            let mut v: Vec<Hit> = (5..46).map(Hit::Menu).collect();
+            v.push(Hit::Trash);
+            v
+        } else {
+            (0..45).map(Hit::Grid).chain((36..45).map(Hit::Menu)).collect()
+        };
+        hits.into_iter().find(|&h| {
+            let Some((x, y)) = hit_pos(h) else { return false };
+            mx >= x - 1 && mx < x + 17 && my >= y - 1 && my < y + 17
+        })
+    }
+
+    /// The hovered slot is checked every frame now (bundle stop-hover rule): same slot as the
+    /// former list at every point of the image and around it, both kinds of tab, no list built.
+    #[test]
+    fn hit_test_without_a_list_finds_the_same_slot() {
+        let c = CreativeScreen::default();
+        for kind in [CreativeKind::Category, CreativeKind::Inventory] {
+            let d = data(kind);
+            let mut found = 0;
+            for my in -4..H + 4 {
+                for mx in -4..W + 4 {
+                    let h = c.hit_at(&d, (mx, my));
+                    assert_eq!(h, listed(&c, &d, (mx, my)), "{kind:?} at ({mx}, {my})");
+                    found += usize::from(h.is_some());
+                }
+            }
+            assert!(found > 0, "{kind:?}: no slot found");
+            assert_eq!(c.hits(&d).len(), if kind == CreativeKind::Inventory { 42 } else { 54 });
+        }
+    }
+
+    /// Micro-bench of the hit test (former list against no list), alternated passes.
+    /// `cargo test --release -p rc-app --bin rustcraft bench_creative_hit_test -- --ignored --nocapture`
+    #[test]
+    #[ignore = "micro-bench"]
+    fn bench_creative_hit_test() {
+        let c = CreativeScreen::default();
+        let d = data(CreativeKind::Category);
+        let points: Vec<(i32, i32)> = (0..64).map(|i| ((i * 37) % (W + 8) - 4, (i * 53) % (H + 8) - 4)).collect();
+        let n = 200_000;
+        for pass in 0..3 {
+            let t = std::time::Instant::now();
+            let mut k = 0usize;
+            for i in 0..n {
+                k += usize::from(listed(&c, &d, points[i % 64]).is_some());
+            }
+            let a = t.elapsed().as_nanos() as f64 / n as f64;
+            let t = std::time::Instant::now();
+            for i in 0..n {
+                k += usize::from(c.hit_at(&d, points[i % 64]).is_some());
+            }
+            let b = t.elapsed().as_nanos() as f64 / n as f64;
+            println!("pass {pass}: list {a:.1} ns, no list {b:.1} ns ({k})");
+        }
+    }
 }

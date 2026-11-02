@@ -22,6 +22,27 @@ pub fn tr(lang: &rc_text::Lang, key: &str, args: &[String]) -> String {
 }
 
 /// Styled characters of a text (§ codes included).
+/// Label lines of a checkbox `max` wide: two lines at most; when more remain, the second is cut
+/// to leave room for a plain "..." and ends with dots in `dots` style.
+pub fn checkbox_lines(m: &dyn rc_text::Metrics, msg: &[StyledChar], max: i32, dots: &rc_text::CharStyle) -> Vec<Vec<StyledChar>> {
+    let mut lines = rc_text::wrap(m, msg, max as f32);
+    if lines.len() > 2 {
+        lines.truncate(2);
+        let plain = rc_text::width(m, &chars("..."));
+        let last = &mut lines[1];
+        let keep = rc_text::fit(m, last, rc_text::width(m, last) - plain);
+        last.truncate(keep);
+        last.extend((0..3).map(|_| StyledChar { c: '.', style: dots.clone() }));
+    }
+    lines
+}
+
+/// Top of a checkbox's label lines: centred on the box in integer halves (one line 4 px below
+/// the box top, two lines 1 px above it).
+fn checkbox_text_top(y: i32, lines: usize) -> i32 {
+    y + 17 / 2 - (9 * lines as i32) / 2
+}
+
 pub fn chars(s: &str) -> Vec<StyledChar> {
     crate::gui::plain(s)
 }
@@ -475,8 +496,10 @@ pub enum Kind {
         steps: u32,
         adjusting: bool,
     },
+    /// Checkbox: state and label lines (`Widget::checkbox`).
     Checkbox {
         checked: bool,
+        lines: Vec<Vec<StyledChar>>,
     },
     Field(Box<TextField>),
     /// Section title (bold underlined, focusable).
@@ -526,6 +549,26 @@ impl Widget {
 
     pub fn button(id: u32, x: i32, y: i32, w: i32, msg: &str) -> Widget {
         Widget::new(id, Kind::Button, x, y, w, 20, chars(msg))
+    }
+
+    /// Checkbox: 17 px box, label 4 px to its right; as wide as box and label unless `max_width`
+    /// is smaller. The label is cut at the checkbox's whole width (box included, like the game)
+    /// into two lines at most, the second ending with "..." in `dots` style (the message's own
+    /// style) when more remain; height of the box or of the lines, whichever is taller.
+    pub fn checkbox(
+        m: &dyn rc_text::Metrics,
+        id: u32,
+        (x, y): (i32, i32),
+        checked: bool,
+        msg: Vec<StyledChar>,
+        max_width: Option<i32>,
+        dots: &rc_text::CharStyle,
+    ) -> Widget {
+        let natural = 17 + 4 + rc_text::width(m, &msg);
+        let w = max_width.map_or(natural, |mw| natural.min(mw));
+        let lines = checkbox_lines(m, &msg, w, dots);
+        let h = (9 * lines.len() as i32).max(17);
+        Widget::new(id, Kind::Checkbox { checked, lines }, x, y, w, h, msg)
     }
 
     pub fn inactive(mut self) -> Widget {
@@ -980,7 +1023,7 @@ impl Panel {
                 self.clicks += 1;
                 out.push(Event::Cycle(id, if shift { -1 } else { 1 }));
             }
-            Kind::Checkbox { checked } => {
+            Kind::Checkbox { checked, .. } => {
                 *checked = !*checked;
                 self.clicks += 1;
                 out.push(Event::Toggle(id, *checked));
@@ -1075,7 +1118,7 @@ impl Panel {
                             self.clicks += 1;
                             out.push(Event::Cycle(id, if mods.shift_key() { -1 } else { 1 }));
                         }
-                        Kind::Checkbox { checked } => {
+                        Kind::Checkbox { checked, .. } => {
                             *checked = !*checked;
                             self.clicks += 1;
                             out.push(Event::Toggle(id, *checked));
@@ -1304,7 +1347,7 @@ impl Panel {
                 gui.sprite(handle, hx as f32, yf, 8.0, hf, tint);
                 scrolling_text(gui, q, &w.msg, x + 2, y, x + ww - 2, y + hh, text_color, time);
             }
-            Kind::Checkbox { checked } => {
+            Kind::Checkbox { checked, lines } => {
                 let s = match (checked, focused) {
                     (true, true) => "widget/checkbox_selected_highlighted",
                     (true, false) => "widget/checkbox_selected",
@@ -1312,7 +1355,10 @@ impl Panel {
                     (false, false) => "widget/checkbox",
                 };
                 gui.sprite(s, xf, yf, 17.0, 17.0, tint);
-                gui.text(q, &w.msg, xf + 21.0, yf + 4.0, text_color, true, 0);
+                let top = checkbox_text_top(y, lines.len());
+                for (k, l) in lines.iter().enumerate() {
+                    gui.text(q, l, xf + 21.0, (top + 9 * k as i32) as f32, text_color, true, 0);
+                }
             }
             Kind::Field(t) => draw_field(gui, q, t, x, y, ww, hh, focused),
             Kind::TextArea(a) => {
@@ -1705,6 +1751,39 @@ pub fn take_cursor() -> Cursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Checkbox label: one line (17 high, text 4 px down) when it fits; cut at the checkbox width
+    /// (box included) and at line breaks into two lines (18 high, text 1 px up); a third line is
+    /// dropped and the second ends with dots in the message's style, room left for a plain "...".
+    #[test]
+    fn checkbox_label_wraps_to_two_lines() {
+        struct M;
+        impl rc_text::Metrics for M {
+            fn advance(&self, _font: &str, c: char) -> (f32, f32) {
+                (if c == '.' { 2.0 } else { 6.0 }, 1.0)
+            }
+        }
+        let text = |l: &[StyledChar]| l.iter().map(|s| s.c).collect::<String>();
+        let plain = rc_text::CharStyle::default();
+        let one = Widget::checkbox(&M, 1, (5, 10), true, chars("ab cd"), None, &plain);
+        assert_eq!((one.w, one.h), (21 + 30, 17));
+        let Kind::Checkbox { checked, lines } = &one.kind else { panic!("checkbox") };
+        assert!(*checked);
+        assert_eq!(lines.iter().map(|l| text(l)).collect::<Vec<_>>(), ["ab cd"]);
+        let two = Widget::checkbox(&M, 1, (0, 0), false, chars("ab\ncd"), None, &plain);
+        let Kind::Checkbox { lines, .. } = &two.kind else { panic!("checkbox") };
+        assert_eq!((lines.len(), two.h), (2, 18));
+        let gold = rc_text::CharStyle { color: Some(0xffaa00), ..Default::default() };
+        let cut = checkbox_lines(&M, &chars("ab\ncde\nf"), 60, &gold);
+        assert_eq!(cut.iter().map(|l| text(l)).collect::<Vec<_>>(), ["ab", "cd..."]);
+        assert_eq!(cut[1][2].style.color, Some(0xffaa00), "dots in the message's style");
+        assert_eq!(cut[1][0].style.color, None);
+        // Narrower than its label: the lines are cut at the checkbox width, box included.
+        let narrow = Widget::checkbox(&M, 1, (0, 0), false, chars("aa bb cc dd ee"), Some(40), &plain);
+        let Kind::Checkbox { lines, .. } = &narrow.kind else { panic!("checkbox") };
+        assert_eq!((narrow.w, lines.iter().map(|l| text(l)).collect::<Vec<_>>()), (40, vec!["aa bb".into(), "cc d...".to_owned()]));
+        assert_eq!((checkbox_text_top(10, 1), checkbox_text_top(10, 2)), (14, 9));
+    }
 
     /// Ctrl + letter types nothing (winit returns "a" without Ctrl, U+0001 with); AltGr (Ctrl + Alt)
     /// types its character; Ctrl + Alt without a character (layout without AltGr) types nothing.

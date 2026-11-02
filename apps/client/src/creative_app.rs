@@ -2,7 +2,7 @@
 //! opening in place of the inventory in instant-build mode, mode switches, input.
 
 use rc_data::CreativeKind;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::keyboard::KeyCode;
 
 use rc_proto_v777::item::ItemStack;
@@ -53,6 +53,7 @@ impl App {
             return;
         }
         let _ = self.session.link.send_container_close(0);
+        self.bundle_close();
         self.creative_ui.open = false;
         self.creative_ui.bar_drag = false;
         self.inventory.carried = None;
@@ -175,6 +176,10 @@ impl App {
     }
 
     fn creative_search_changed(&mut self) {
+        // The grid shows other stacks: a choice made on a grid bundle stays with the old stack.
+        if let Some(k) = crate::bundle::selected_slot().filter(|&k| k >= crate::bundle::CREATIVE_GRID) {
+            crate::bundle::set_selected(k, -1);
+        }
         if let Some(r) = &self.renderer {
             let env = self.hud_env();
 
@@ -217,12 +222,12 @@ impl App {
                 }
                 false
             }
+            // The hovered bundle first (like the container screens), then the grid's scrolling.
             WindowEvent::MouseWheel { delta, .. } => {
-                let y = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => *y,
-                    MouseScrollDelta::PixelDelta(p) => (p.y / 40.0) as f32,
-                };
-                self.creative_ui.wheel(&self.data, y);
+                let (x, y) = crate::keys::wheel_offsets(delta);
+                if !self.bundle_wheel(x, y) {
+                    self.creative_ui.wheel(&self.data, y);
+                }
                 true
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -758,7 +763,7 @@ impl App {
 /// Index of a slot in the creative screen's menu, as the game announces it to the server:
 /// grid 0..44, hotbar 45..53; the inventory tab recreates its slots without giving them an index
 /// (all 0, game quirk reproduced). Trash: never (always empty).
-fn creative_slot_index(hit: Hit, inventory_tab: bool) -> Option<i32> {
+pub(crate) fn creative_slot_index(hit: Hit, inventory_tab: bool) -> Option<i32> {
     match hit {
         Hit::Grid(i) => i32::try_from(i).ok(),
         Hit::Menu(_) if inventory_tab => Some(0),

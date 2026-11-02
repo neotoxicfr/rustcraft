@@ -64,47 +64,10 @@ impl D {
             D::F(f) => Val::F(f),
             D::S(s) => Val::S(s.to_owned()),
             D::L => Val::L(Vec::new()),
-            D::Japanese => Val::B(system_language_japanese()),
+            // System language Japanese (Windows, macOS and elsewhere: `syslocale.rs`).
+            D::Japanese => Val::B(crate::syslocale::japanese()),
         }
     }
-}
-
-/// The system language is Japanese, read once like the game reads its default locale: interface
-/// language of the user on Windows, `LC_ALL`, `LC_MESSAGES` then `LANG` elsewhere.
-fn system_language_japanese() -> bool {
-    static JA: OnceLock<bool> = OnceLock::new();
-    *JA.get_or_init(detect_japanese)
-}
-
-#[cfg(windows)]
-#[allow(unsafe_code)]
-fn detect_japanese() -> bool {
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetUserDefaultUILanguage() -> u16;
-    }
-    // SAFETY: reading a language identifier, no argument.
-    ui_language_japanese(unsafe { GetUserDefaultUILanguage() })
-}
-
-#[cfg(not(windows))]
-fn detect_japanese() -> bool {
-    locale_japanese(rc_data::env_str!("LC_ALL"), rc_data::env_str!("LC_MESSAGES"), rc_data::env_str!("LANG"))
-}
-
-/// Windows language identifier whose primary language (low 10 bits) is Japanese.
-#[cfg(any(windows, test))]
-fn ui_language_japanese(lang_id: u16) -> bool {
-    lang_id & 0x3ff == 0x11
-}
-
-/// POSIX locale of the messages (first non-empty of `LC_ALL`, `LC_MESSAGES`, `LANG`; none: "C",
-/// English) whose language is Japanese: `ja_JP.UTF-8`, `ja`, or the `japanese` alias.
-#[cfg(any(not(windows), test))]
-fn locale_japanese(all: Option<&str>, messages: Option<&str>, lang: Option<&str>) -> bool {
-    let name = [all, messages, lang].into_iter().flatten().find(|v| !v.is_empty()).unwrap_or("C");
-    let language = name.split(['_', '.', '@']).next().unwrap_or("");
-    language.eq_ignore_ascii_case("ja") || language.eq_ignore_ascii_case("japanese")
 }
 
 const UNIT: Ty = Ty::Real(0.0, 1.0);
@@ -835,17 +798,16 @@ preferredGraphicsBackend:vulkan
     /// Japanese glyph variants on by default only when the system language is Japanese.
     #[test]
     fn japanese_glyph_default_follows_the_system_language() {
-        assert!(ui_language_japanese(0x0411), "Japanese");
-        assert!(!ui_language_japanese(0x040c), "French");
-        assert!(!ui_language_japanese(0x0409), "English (US)");
-        assert!(locale_japanese(None, None, Some("ja_JP.UTF-8")));
-        assert!(locale_japanese(Some(""), Some("ja"), Some("en_US.UTF-8")), "empty LC_ALL skipped");
-        assert!(locale_japanese(None, None, Some("japanese")));
-        assert!(!locale_japanese(Some("C"), Some("ja_JP.UTF-8"), None), "LC_ALL first");
-        assert!(!locale_japanese(None, None, Some("jam_JM")));
-        assert!(!locale_japanese(None, None, None), "no locale: English");
+        use crate::syslocale::{apple, posix};
+        assert_eq!(posix(None, None, Some("ja_JP.UTF-8")).language, "ja");
+        assert_eq!(posix(Some(""), Some("ja"), Some("en_US.UTF-8")).language, "ja", "empty LC_ALL skipped");
+        assert_eq!(posix(None, None, Some("japanese")).language, "ja");
+        assert_ne!(posix(Some("C"), Some("ja_JP.UTF-8"), None).language, "ja", "LC_ALL first");
+        assert_ne!(posix(None, None, Some("jam_JM")).language, "ja");
+        assert_ne!(posix(None, None, None).language, "ja", "no locale: English");
+        assert_eq!(apple(Some("ja"), Some("en_US")).map(|l| l.language).as_deref(), Some("ja"), "macOS");
         let o = Options::default();
-        assert_eq!(o.b("japaneseGlyphVariants"), system_language_japanese());
+        assert_eq!(o.b("japaneseGlyphVariants"), crate::syslocale::japanese());
         assert!(o.is_default("japaneseGlyphVariants"));
         assert!(Options::parse("japaneseGlyphVariants:true\n").b("japaneseGlyphVariants"), "file value kept");
     }

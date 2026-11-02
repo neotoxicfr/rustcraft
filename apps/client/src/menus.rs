@@ -1541,10 +1541,21 @@ fn row_layout(row: &Row, top: i32, first: bool) -> (i32, i32) {
     }
 }
 
-/// Friends button of the pause screen (id 6): message of the game; when the friends list is not
-/// available (demo) it is inactive and has no tooltip.
-fn friends_button(m: &dyn rc_text::Metrics, t: &dyn Fn(&str) -> String, x: i32, y: i32, available: bool) -> Widget {
-    let mut w = Widget::new(6, Kind::Icon("friends/friends"), x, y, 20, 20, chars(&t("gui.friends.open")));
+/// The friends list can be opened: neither a demo launch nor `--offlineDeveloperMode`.
+pub(crate) fn friends_available() -> bool {
+    !rc_sim::demo::launch_demo() && !rc_client::session::offline_developer_mode()
+}
+
+/// Friends button of the pause and title screens: message of the game; when the friends list is
+/// not available it is inactive and has no tooltip.
+pub(crate) fn friends_button(
+    m: &dyn rc_text::Metrics,
+    t: &dyn Fn(&str) -> String,
+    id: u32,
+    (x, y): (i32, i32),
+    available: bool,
+) -> Widget {
+    let mut w = Widget::new(id, Kind::Icon("friends/friends"), x, y, 20, 20, chars(&t("gui.friends.open")));
     w.active = available;
     if available {
         w.set_tooltip(m, &t("gui.friends.open.tooltip"));
@@ -1590,7 +1601,7 @@ fn build(
                 icon(REPORT_BUGS, 60, "pause_menu/bug", "menu.reportBugs"),
                 icon(FEEDBACK, 84, "pause_menu/social_interactions", "menu.sendFeedback"),
             ];
-            widgets.push(friends_button(gui, &t, gx + 108, gy + 98, !rc_sim::demo::launch_demo()));
+            widgets.push(friends_button(gui, &t, 6, (gx + 108, gy + 98), friends_available()));
             let mut social = icon(SOCIAL, 132, "pause_menu/player_reporting", "menu.playerReporting");
             if world.ctx.solo && world.players.iter().all(|p| p.uuid == world.local) {
                 social.active = false;
@@ -1944,11 +1955,11 @@ mod tests {
         }
         let t = |k: &str| k.to_owned();
         let text = |l: &[StyledChar]| l.iter().map(|s| s.c).collect::<String>();
-        let on = friends_button(&Fixed, &t, 10, 20, true);
+        let on = friends_button(&Fixed, &t, 6, (10, 20), true);
         assert_eq!((on.id, on.x, on.y, on.active), (6, 10, 20, true));
         assert_eq!(text(&on.msg), "gui.friends.open");
         assert_eq!(on.tooltip.iter().map(|l| text(l)).collect::<String>(), "gui.friends.open.tooltip");
-        let off = friends_button(&Fixed, &t, 10, 20, false);
+        let off = friends_button(&Fixed, &t, 6, (10, 20), false);
         assert_eq!((off.active, text(&off.msg)), (false, "gui.friends.open".to_owned()));
         assert!(off.tooltip.is_empty(), "no tooltip in demo");
     }

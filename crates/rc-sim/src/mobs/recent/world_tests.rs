@@ -124,11 +124,37 @@ fn creaking_bound_to_heart() {
     assert!(frozen, "creaking looked at never frozen");
     // Player hit: no damage, heart distress call.
     let hp = mob(&p, c).unwrap().health;
+    let b = mob(&p, c).unwrap().bbox();
+    let _ = p.take_events();
     p.s.player_attack(c);
     let m = mob(&p, c).unwrap();
     assert_eq!(m.health, hp, "linked creaking hurt");
     assert!(m.rec.invul_anim > 0, "invulnerability animation missing");
     assert!(p.s.mobs.rec.hearts.map.get(&heart).is_some_and(|h| h.emitter > 0), "heart without distress call");
+    // Distress: 20 grey trails from the creaking's box to the heart's block, forced; then each tick
+    // of the call's first half one orange trail towards the creaking and one grey towards the heart.
+    let trail = p.s.data.registry("minecraft:particle_type").unwrap().entries.iter().position(|e| e == "minecraft:trail");
+    let trails = |evs: Vec<rc_client::Event>| -> Vec<rc_proto_v777::entity::LevelParticles> {
+        evs.into_iter()
+            .filter_map(|e| match e {
+                rc_client::Event::Particles(lp) if Some(lp.particle.kind as usize) == trail => Some(lp),
+                _ => None,
+            })
+            .collect()
+    };
+    let in_heart = |q: [f64; 3]| (0..3).all(|i| (f64::from(heart[i])..f64::from(heart[i]) + 1.0).contains(&q[i]));
+    let in_box = |q: [f64; 3]| (0..3).all(|i| (b.min[i]..=b.max[i]).contains(&q[i]));
+    let hurt = trails(p.take_events());
+    assert_eq!(hurt.len(), 20, "distress trails");
+    for t in &hurt {
+        let (to, ticks) = t.particle.trail.expect("trail target");
+        assert!(in_box(t.pos) && in_heart(to) && (10..50).contains(&ticks), "{t:?}");
+        assert_eq!((t.particle.color, t.force, t.always_visible), (0x5F_5F5F, true, true));
+    }
+    // The heart's own tick (the probe's tick drops the events it sends).
+    p.s.heart_tick(heart);
+    let tick: Vec<u32> = trails(p.take_events()).iter().map(|t| t.particle.color).collect();
+    assert_eq!(tick, [0xFC_7812, 0x5F_5F5F], "one trail each way per tick");
     // Heart broken: death with effects then breaking apart.
     p.run(&format!("break {} {} {}\n", heart[0], heart[1], heart[2]));
     step(&mut p, 60);

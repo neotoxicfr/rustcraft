@@ -115,7 +115,7 @@ kinds! {
     SquidInk = "squid_ink", GlowSquidInk = "glow_squid_ink", Soul = "soul", SculkSoul = "sculk_soul", Spit = "spit",
     Fishing = "fishing", DustPlume = "dust_plume", Infested = "infested", PauseMobGrowth = "pause_mob_growth",
     ResetMobGrowth = "reset_mob_growth", NoxiousGas = "noxious_gas", SulfurCubeGoo = "sulfur_cube_goo",
-    NoxiousGasCloud = "noxious_gas_cloud", Vibration = "vibration",
+    NoxiousGasCloud = "noxious_gas_cloud", Vibration = "vibration", Trail = "trail",
 }
 
 use Kind as K;
@@ -324,6 +324,8 @@ pub struct Options {
     pub rgb2: [f32; 3],
     /// `vibration`: destination and duration of the trip (ticks).
     pub vib: Option<(rc_proto_v777::entity::VibDest, i32)>,
+    /// `trail`: target point and duration of the trip (ticks); colour in `argb`.
+    pub trail: Option<([f64; 3], i32)>,
 }
 
 impl Default for Options {
@@ -338,6 +340,7 @@ impl Default for Options {
             force: false,
             rgb2: [1.0, 0.0, 0.0],
             vib: None,
+            trail: None,
         }
     }
 }
@@ -356,6 +359,7 @@ impl Options {
             force,
             rgb2: rgb_of(p.color2),
             vib: p.vib,
+            trail: p.trail,
         }
     }
 
@@ -1000,6 +1004,25 @@ impl P {
         self.param[0] = f64::from(d[1].atan2((d[0] * d[0] + d[2] * d[2]).sqrt()) as f32);
     }
 
+    /// Tick of a particle flying to its target (`start`): brought closer by a fraction
+    /// 1 / remaining ticks; the last tick (none remaining) sends it to infinity in the game, where
+    /// it is no longer seen: removed then. False once removed.
+    fn home_in(&mut self) -> bool {
+        self.old = self.pos;
+        let age = self.age;
+        self.age += 1;
+        let remaining = self.life - self.age;
+        if age >= self.life || remaining <= 0 {
+            self.removed = true;
+            return false;
+        }
+        let k = 1.0 / f64::from(remaining);
+        for i in 0..3 {
+            self.pos[i] += k * (self.start[i] - self.pos[i]);
+        }
+        true
+    }
+
     /// Interpolated pitch and sway, quantised on 14 bits each (bits 14 to 27 and 0 to 13
     /// of `tex`): error of at most 1e-4 rad, imperceptible.
     fn vib_angles(&self, pt: f32) -> u32 {
@@ -1457,21 +1480,12 @@ impl P {
                 self.vel[2] *= 0.96;
             }
             K::Vibration => {
-                // Brought closer to the target (`start`) by a fraction 1/remaining ticks; the last
-                // tick (0 remaining) sends it to infinity in the game: it disappears.
-                self.old = self.pos;
-                let age = self.age;
-                self.age += 1;
-                let remaining = self.life - self.age;
-                if age >= self.life || remaining <= 0 {
-                    self.removed = true;
-                    return;
+                if self.home_in() {
+                    self.face_target();
                 }
-                let k = 1.0 / f64::from(remaining);
-                for i in 0..3 {
-                    self.pos[i] += k * (self.start[i] - self.pos[i]);
-                }
-                self.face_target();
+            }
+            K::Trail => {
+                self.home_in();
             }
             K::Shriek => {
                 // Delay before appearing (ticks), then slow rise over 30 ticks.
@@ -1788,7 +1802,8 @@ impl P {
             | K::Gust
             | K::SmallGust
             | K::SquidInk
-            | K::GlowSquidInk => full,
+            | K::GlowSquidInk
+            | K::Trail => full,
             K::SculkSoul => 240 | (sky << 8),
             _ => block | (sky << 8),
         }
@@ -2207,6 +2222,24 @@ fn create(kind: Kind, o: &Options, pos: [f64; 3], p: [f64; 3], rng: Rng, spell: 
                     q.vib_target = Some((id, y_offset));
                 }
             }
+        }
+        K::Trail => {
+            // Trail (eyeblossom, creaking heart): target and duration from its options, opaque,
+            // 0.26 half-side, never moved by its speed; colour scaled by 0.875 to 1.125 on each
+            // channel, truncated to the byte.
+            let (target, ticks) = o.trail?;
+            q.vel = [0.0; 3];
+            q.collide = false;
+            q.size = 0.26;
+            q.life = ticks;
+            q.start = target;
+            let c = o.argb;
+            let mut scale = |shift: u32| {
+                let k = 0.875 + q.r() * 0.25;
+                ((((c >> shift) & 0xff) as f32 * k) as i32).clamp(0, 255) as f32 / 255.0
+            };
+            let rgb = [scale(16), scale(8), scale(0)];
+            q.color(rgb);
         }
         K::Shriek => {
             // `state` = delay in ticks; slow rise of 0.1 per tick over 30 ticks.
@@ -4022,6 +4055,7 @@ mod tests {
             scale: 2.0,
             color2: 0x0000_ff00,
             vib: None,
+            trail: None,
         };
         let o = Options::from_net(&net, false);
         assert_eq!((o.rgb, o.rgb2, o.scale), ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], 2.0));
@@ -4174,7 +4208,47 @@ mod tests {
             scale: 1.0,
             color2: 0,
             vib: Some((VibDest::Entity { id: 7, y_offset: 1.62 }, 9)),
+            trail: None,
         };
         assert_eq!(Options::from_net(&net, false).vib, net.vib);
+    }
+
+    /// L9: trail particle (eyeblossom, creaking heart): created only with its target, lives the
+    /// duration sent, brought closer to its target by 1/(remaining ticks) and gone at the last tick,
+    /// opaque, 0.26 half-side, colour scaled 0.875 to 1.125 per channel and
+    /// truncated to the byte; the packet carries target and duration down to its options.
+    #[test]
+    fn trail_flies_to_its_target() {
+        let a = assets();
+        let m = plain(&a);
+        let mut spell = Rng(1);
+        assert!(create(K::Trail, &Options::default(), [0.0; 3], [0.0; 3], Rng(2), &mut spell, &m).is_none());
+        let net = rc_proto_v777::entity::Particle {
+            color: 0xFC_7812,
+            trail: Some(([2.5, 3.0, 0.5], 4)),
+            ..rc_proto_v777::entity::Particle::plain(0)
+        };
+        let o = Options::from_net(&net, false);
+        assert_eq!(o.trail, net.trail);
+        let mut q = create(K::Trail, &o, [0.5, 1.0, 0.5], [0.0; 3], Rng(2), &mut spell, &m).expect("trail");
+        assert_eq!((q.life, q.size, q.start, q.translucent, q.vel), (4, 0.26, [2.5, 3.0, 0.5], false, [0.0; 3]));
+        for (c, base) in q.rgba[..3].iter().zip([0xFC, 0x78, 0x12]) {
+            let byte = c * 255.0;
+            assert!((byte - byte.round()).abs() < 1e-3, "whole byte {byte}");
+            assert!(byte >= (f64::from(base) * 0.875).floor() as f32 && byte <= (f64::from(base) * 1.125).min(255.0) as f32);
+        }
+        let mut xs = Vec::new();
+        for _ in 0..4 {
+            q.tick(&a, None);
+            if q.removed {
+                break;
+            }
+            xs.push(q.pos[0]);
+        }
+        let want = [0.5 + 2.0 / 3.0, 0.5 + 2.0 / 3.0 + (2.0 - 2.0 / 3.0) / 2.0, 2.5];
+        assert_eq!(xs.len(), 3, "removed at the 4th tick");
+        for (x, w) in xs.iter().zip(want) {
+            assert!((x - w).abs() < 1e-12, "{x} ≠ {w}");
+        }
     }
 }

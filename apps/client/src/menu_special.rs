@@ -381,6 +381,18 @@ pub fn locked(s: Sp, i: usize) -> bool {
     }
 }
 
+/// Result slot of a screen whose result container gives its whole stack on any removal (Q
+/// throws it all, a right click takes it all): merchant, grindstone, stonecutter, cartography,
+/// smithing and anvil. The loom's output container gives the amount asked.
+pub fn takes_whole(s: Sp, i: usize) -> bool {
+    match s {
+        Sp::Merchant | Sp::Grindstone | Sp::Cartography | Sp::Anvil => i == 2,
+        Sp::Stonecutter => i == 1,
+        Sp::Smithing => i == 3,
+        _ => false,
+    }
+}
+
 /// The gathering double-click does not use this slot (§ 1.2).
 pub fn no_gather(s: Sp, i: usize) -> bool {
     matches!(s, Sp::Merchant) && i < 3

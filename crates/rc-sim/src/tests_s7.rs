@@ -285,6 +285,28 @@ fn stonecutter_select_and_take() {
     assert!(m.own[0].is_none() && m.own[1].is_none());
 }
 
+/// Q on the stonecutter result: its result container hands over both slabs for one stone (the
+/// amount asked, one, is ignored); Ctrl+Q keeps cutting while the result stays slabs.
+#[test]
+fn stonecutter_result_thrown_whole() {
+    let Some(w) = world() else { return };
+    let mut env = TestEnv { w, creative: false, level: 0, events: Vec::new(), dropped: Vec::new() };
+    let mut inv = vec![None; crate::player::MENU_SLOTS];
+    let mut m = stations::open(1, St::Stonecutter, Vec::new());
+    inv[36] = Some(st("stone", 3));
+    m.click(&mut env, &mut inv, 29, 0, mode::QUICK_MOVE);
+    let k = m.st.cut.iter().position(|&i| w.st.stonecut[i].1.id == "minecraft:stone_slab").unwrap() as i32;
+    assert!(stations::stonecutter_select(&mut m, &mut env, k));
+    m.click(&mut env, &mut inv, 1, 0, mode::THROW);
+    let thrown: Vec<i32> = env.dropped.iter().map(|s| s.count).collect();
+    assert_eq!(thrown, [2], "one stone, two slabs thrown");
+    assert_eq!(m.own[0].as_ref().map(|s| s.count), Some(2));
+    m.click(&mut env, &mut inv, 1, 1, mode::THROW);
+    let thrown: Vec<i32> = env.dropped.iter().map(|s| s.count).collect();
+    assert_eq!(thrown, [2, 2, 2], "Ctrl+Q: every stone cut");
+    assert!(m.own[0].is_none() && m.own[1].is_none());
+}
+
 #[test]
 fn special_crafting() {
     let Some(w) = world() else { return };

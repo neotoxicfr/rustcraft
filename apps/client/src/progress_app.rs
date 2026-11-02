@@ -2,7 +2,7 @@
 //! notifications, screens (input, tick, draw).
 
 use rc_client::progress::Progress;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 
 use crate::App;
@@ -333,10 +333,7 @@ impl App {
                 if *state == ElementState::Pressed { Input::Press(m, b) } else { Input::Release }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let (dx, dy) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => (f64::from(*x), f64::from(*y)),
-                    MouseScrollDelta::PixelDelta(p) => (p.x / 20.0, p.y / 20.0),
-                };
+                let (dx, dy) = crate::keys::wheel_offsets(delta);
                 let Some(m) = mouse else { return true };
                 Input::Wheel(m, dx, dy)
             }

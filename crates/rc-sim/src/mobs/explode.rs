@@ -400,6 +400,7 @@ impl Server {
                 scale: 1.0,
                 color2: 0,
                 vib: None,
+                trail: None,
             };
             let ex = rc_client::extra::Explosion {
                 center,

@@ -175,6 +175,45 @@ fn csv(columns: &[&str], rows: &[(usize, Vec<f64>)]) -> String {
     out
 }
 
+/// Java's hash of a string (UTF-16 units, `31 h + c`).
+fn java_hash(s: &str) -> u32 {
+    s.encode_utf16().fold(0u32, |h, c| h.wrapping_mul(31).wrapping_add(u32::from(c)))
+}
+
+/// Samplers of a whole recording in the game, besides those we write: the per-processor loads,
+/// tick time, heap, the three chunk counters, the two section compile counters and the gpu load;
+/// then one per live executor queue: client loop, sound, telemetry log, and in singleplayer the
+/// integrated server's (server loop, world generation, light, dispatcher, entity loading, three
+/// region file workers, one chunk main thread per dimension of a new world).
+fn recorded_samplers(cpus: usize, singleplayer: bool) -> usize {
+    let executors = if singleplayer { 3 + 8 + 3 } else { 3 };
+    cpus + 8 + executors
+}
+
+/// Column order of a category's samplers, as the game writes them: the iteration order of a hash
+/// set copied from all the recording's samplers (`total`), i.e. by bucket (spread name hash masked
+/// by the table size, the smallest power of two above `total / 0.75 + 1`, 16 at least), then
+/// in the given order within a bucket. Indices into `names`.
+fn java_set_order(names: &[&str], total: usize) -> Vec<usize> {
+    let wanted = (((total as f32) / 0.75) as usize + 1).max(16);
+    let mask = wanted.next_power_of_two() - 1;
+    let bucket = |n: &str| {
+        let h = java_hash(n);
+        (h ^ (h >> 16)) as usize & mask
+    };
+    let mut order: Vec<usize> = (0..names.len()).collect();
+    order.sort_by_key(|&i| bucket(names[i]));
+    order
+}
+
+/// `csv` with the columns in the game's order (`java_set_order`).
+fn csv_game_order(columns: &[&str], rows: &[(usize, Vec<f64>)], total: usize) -> String {
+    let order = java_set_order(columns, total);
+    let cols: Vec<&str> = order.iter().map(|&i| columns[i]).collect();
+    let rows: Vec<(usize, Vec<f64>)> = rows.iter().map(|(t, v)| (*t, order.iter().map(|&i| v[i]).collect())).collect();
+    csv(&cols, &rows)
+}
+
 /// Options for the report: `name: value`, sorted, without the keys or the volumes.
 fn options_dump(text: &str) -> String {
     let mut v: Vec<String> = text
@@ -351,17 +390,20 @@ impl crate::App {
         let pick = |cols: &[usize]| -> Vec<(usize, Vec<f64>)> {
             rows.iter().map(|(t, r)| (*t, cols.iter().map(|&c| r[c]).collect())).collect()
         };
+        let cpus = p.cpu_rows.first().map_or(0, Vec::len);
+        let total = recorded_samplers(cpus, self.solo.is_some());
+        let chunks = ["totalChunks", "renderedChunks", "lastViewDistance"];
         let mut tables = vec![
             ("ticking", csv(&["ticktime"], &pick(&[0]))),
-            ("chunk rendering", csv(&["totalChunks", "renderedChunks", "lastViewDistance"], &pick(&[1, 2, 3]))),
+            ("chunk rendering", csv_game_order(&chunks, &pick(&[1, 2, 3]), total)),
             ("gpu", csv(&["gpuUtilization"], &pick(&[4]))),
             ("jvm", csv(&["heap MiB"], &pick(&[5]))),
         ];
-        if let Some(n) = p.cpu_rows.first().map(Vec::len) {
-            let names: Vec<String> = (0..n).map(|i| format!("cpu#{i}")).collect();
+        if cpus > 0 {
+            let names: Vec<String> = (0..cpus).map(|i| format!("cpu#{i}")).collect();
             let names: Vec<&str> = names.iter().map(String::as_str).collect();
             let cpu: Vec<(usize, Vec<f64>)> = p.cpu_rows.iter().enumerate().map(|(i, r)| (i + 1, r.clone())).collect();
-            tables.push(("cpu", csv(&names, &cpu)));
+            tables.push(("cpu", csv_game_order(&names, &cpu, total)));
         }
         let mut files: Vec<(String, String)> = vec![
             ("system.txt".into(), self.system_report()),
@@ -489,6 +531,30 @@ mod tests {
         let mut prev = None;
         let hits: Vec<bool> = [10.0, 29.0, 90.0, 90.0, 5.0, 15.0, 0.0, 1.0].iter().map(|&v| deviates(&mut prev, v)).collect();
         assert_eq!(hits, [false, false, true, false, false, true, false, true]);
+    }
+
+    /// CSV columns in the game's hash set order (reference values computed with Java's string
+    /// hash and table sizing): 16 processors in singleplayer (64 buckets), 8 in multiplayer (32).
+    #[test]
+    fn csv_columns_follow_the_game_hash_order() {
+        assert_eq!(java_hash("totalChunks"), 0xb833_700a);
+        assert_eq!(java_hash("cpu#10"), 0xaf4f_c6da);
+        let chunks = ["totalChunks", "renderedChunks", "lastViewDistance"];
+        let named = |order: Vec<usize>, names: &[&str]| order.iter().map(|&i| names[i].to_owned()).collect::<Vec<_>>();
+        let sp16 = recorded_samplers(16, true);
+        assert_eq!(sp16, 38);
+        assert_eq!(named(java_set_order(&chunks, sp16), &chunks), ["lastViewDistance", "renderedChunks", "totalChunks"]);
+        let mp8 = recorded_samplers(8, false);
+        assert_eq!(named(java_set_order(&chunks, mp8), &chunks), ["renderedChunks", "lastViewDistance", "totalChunks"]);
+        let cpu = |n: usize| (0..n).map(|i| format!("cpu#{i}")).collect::<Vec<_>>();
+        let c16 = cpu(16);
+        let c16: Vec<&str> = c16.iter().map(String::as_str).collect();
+        assert_eq!(java_set_order(&c16, sp16), [15, 14, 13, 12, 11, 10, 2, 1, 0, 9, 8, 7, 6, 5, 4, 3]);
+        let c8 = cpu(8);
+        let c8: Vec<&str> = c8.iter().map(String::as_str).collect();
+        assert_eq!(java_set_order(&c8, mp8), [2, 1, 0, 7, 6, 5, 4, 3]);
+        let t = csv_game_order(&chunks, &[(1, vec![10.0, 20.0, 30.0])], sp16);
+        assert_eq!(t, "@tick,lastViewDistance,renderedChunks,totalChunks\r\n1,30.0,20.0,10.0\r\n");
     }
 
     /// Processor load between two readings; the server side of a singleplayer archive.

@@ -729,13 +729,10 @@ impl App {
             }
             In::Release => s.panel.release(&mut ev),
             In::Wheel(delta) => {
-                let dy = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => *y,
-                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / 20.0,
-                };
+                let dy = crate::keys::wheel_offsets(delta).1;
                 if let Some(m) = mouse {
                     let side = if m.0 < (s.size.0 / 2) as f32 { 0 } else { 1 };
-                    s.scroll[side] -= dy * ENTRY_H as f32 / 2.0;
+                    s.scroll[side] = (f64::from(s.scroll[side]) - dy * f64::from(ENTRY_H) / 2.0) as f32;
                 }
             }
             In::Key(event) => {

@@ -303,6 +303,7 @@ impl Server {
                 scale: 1.0,
                 color2: 0,
                 vib: None,
+                trail: None,
             };
             // Radius of at least 2 with interaction (trigger): big burst, otherwise small.
             let emitter = if radius >= 2.0 { "minecraft:gust_emitter_large" } else { "minecraft:gust_emitter_small" };
