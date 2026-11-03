@@ -359,7 +359,7 @@ impl Server {
                     "commands.gamerule.set",
                     vec![rc_text::Arg::Text(rule.name.to_owned()), rc_text::Arg::Text(shown)],
                 );
-                let _ = self.send(Event::Chat { component: c, tag: rc_client::ChatTag::System });
+                let _ = self.send(Event::Chat { component: Box::new(c), tag: rc_client::ChatTag::System });
             }
         }
         Ok(())
@@ -557,7 +557,7 @@ impl Server {
         if !allow && any {
             let mut c = rc_text::Component::translate("sign.click_actions_disabled", Vec::new());
             c.style.color = Some(0xFF5555);
-            let _ = self.send(Event::ActionBar(c));
+            let _ = self.send(Event::ActionBar(Box::new(c)));
         }
         any
     }

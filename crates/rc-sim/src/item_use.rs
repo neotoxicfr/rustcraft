@@ -576,7 +576,7 @@ impl Server {
             .collect();
         if props.is_empty() {
             let msg = Component::translate("item.minecraft.debug_stick.empty", vec![Arg::Text(block)]);
-            let _ = self.send(Event::ActionBar(msg));
+            let _ = self.send(Event::ActionBar(Box::new(msg)));
             return false;
         }
         // Component removed from the stack: nothing. Otherwise map block → property (empty by default).
@@ -604,7 +604,7 @@ impl Server {
                 "item.minecraft.debug_stick.update",
                 vec![Arg::Text(name.clone()), Arg::Text(vals[next].clone())],
             );
-            let _ = self.send(Event::ActionBar(msg));
+            let _ = self.send(Event::ActionBar(Box::new(msg)));
             return true;
         } else if back {
             previous_index(props.len(), remembered)
@@ -622,7 +622,7 @@ impl Server {
             "item.minecraft.debug_stick.select",
             vec![Arg::Text(name.clone()), Arg::Text(vals[*cur].clone())],
         );
-        let _ = self.send(Event::ActionBar(msg));
+        let _ = self.send(Event::ActionBar(Box::new(msg)));
         self.broadcast_menus();
         true
     }

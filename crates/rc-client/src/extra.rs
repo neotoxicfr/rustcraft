@@ -102,7 +102,7 @@ pub(crate) fn common(link: &Link, ids: &Ids3, id: i32, r: &mut Reader<'_>) -> Re
         let url = str_owned(r, 32767)?;
         let hash = str_owned(r, 40)?;
         let required = bool::decode(r)?;
-        let prompt = if bool::decode(r)? { Some(read_text(r)?) } else { None };
+        let prompt = if bool::decode(r)? { Some(Box::new(read_text(r)?)) } else { None };
         // Invalid URL: 5 right away, nothing else; otherwise the game decides (prompt, preference).
         if !valid_url(&url) {
             link.names.detail(rc_data::Bound::ToClient, id, &format!("pack {url}: invalid URL → 5"));

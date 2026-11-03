@@ -81,7 +81,7 @@ impl App {
             Event::GameRuleValues(v) => self.menus.game_rules(v),
             Event::CodeOfConduct(text) => self.on_code_of_conduct(text),
             // Server resource packs (`server_packs.rs`).
-            Event::PackPush { id, url, hash, required, prompt } => self.on_pack_push(id, url, hash, required, prompt),
+            Event::PackPush { id, url, hash, required, prompt } => self.on_pack_push(id, url, hash, required, prompt.map(|p| *p)),
             Event::PackPop(which) => self.on_pack_pop(which),
             _ => {}
         }

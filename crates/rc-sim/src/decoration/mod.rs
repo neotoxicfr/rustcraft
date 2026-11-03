@@ -594,7 +594,7 @@ impl Server {
             count,
             mode: 0,
         };
-        let _ = self.send(Event::Particles(p));
+        let _ = self.send(Event::Particles(Box::new(p)));
     }
 
     // ---------- Tick ----------

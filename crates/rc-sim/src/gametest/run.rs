@@ -1151,7 +1151,7 @@ impl Server {
     /// Message to every player (the game's test reports).
     fn say(&self, color: u32, text: String) {
         let c = colored(lit(text), color);
-        self.send_all_players(rc_client::Event::Chat { component: c, tag: rc_client::ChatTag::System });
+        self.send_all_players(rc_client::Event::Chat { component: Box::new(c), tag: rc_client::ChatTag::System });
     }
 
     fn report_passed(&mut self, rn: &mut Runner, i: usize) {

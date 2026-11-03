@@ -4234,3 +4234,33 @@ frames; GPU = submit and wait of the pass minus an empty pass, 512 × 512):
 - To re-measure on a quiet machine: scene `structure-show-air` of `tools/bench/scenes.py` (to add:
   48³ save area with show air, camera outside then inside), CPU of the boxes and upload, bytes
   sent, GPU time of the segment pass, p99 of the frame.
+## C3-M31: size of the server → client events (03/11, loaded machine)
+
+- Every `rc_client::Event` takes `size_of::<Event>()` bytes in the crossbeam channel of the
+  singleplayer memory link (integrated server thread → main thread), in the network thread's
+  channel and in bundles (`Vec<Event>`). Measured before: 256 bytes, set by the rare variants
+  (resource pack push with its prompt ~248, `Misc` 200 through the server data MOTD, text
+  components 176 in chat, action bar, kick, death, open screen, test block status; scores 176;
+  particles 152; waypoints 96), while the frequent ones are small (entity packet 72, block update
+  16, section update 36, sound 88).
+- Change: the rare variants above 88 bytes are boxed (`Box<Component>` in chat, action bar,
+  kick, death, open screen, pack push prompt, test block status; `Box<ScoreEvent>`,
+  `Box<LevelParticles>`, `Box<Waypoint>`; the MOTD inside `Misc::ServerData`). `Event` is now
+  96 bytes (the sound packet, kept inline, plus the tag); `Misc` at most 48. Tests
+  `event_stays_small` / `frequent_payloads_stay_inline` assert the sizes (a sabotage variant of
+  120 bytes makes `Event` 128 bytes and the test fail). No runtime switch: a type layout; the
+  A/B is two executables (main against this branch).
+- Micro-bench `channel_slot_size_bench` (ignored test in `rc-client`, the same entity move event
+  padded to the old slot sizes, 2 M events, loaded machine): producer thread → consumer like
+  the memory link, 96 B 40.0-42.8 ns per event, 160 B (particles left inline) 55.3-61.5 ns,
+  256 B (before) 70.0-79.8 ns: about −45 % per event. One thread (all sent, then drained: the
+  channel's peak memory) 98-136 / 150-172 / 209-224 ns; peak channel memory −62 % (slot size).
+  Boxing a particle event costs one allocation and one free: 44.5 ns, against 15-20 ns saved on
+  every event by the 96 B slot over the 160 B one: particles boxed (they are a small share of
+  the server's events: commands, hits, sweeps, vibrations).
+- Not done (outside this mission's files, noted for later): `rc_text::Component` is 176 bytes
+  inline everywhere (chat lines, item names); shrinking it is the root fix. `SoundPacket` (88)
+  and `Inventory` (88) set the 96 B floor: merging the sound's position and entity options into
+  one source enum would bring `Event` to 80 bytes.
+- To measure on the quiet machine: `crowd-1000`, `tnt` (event send and receive time,
+  `perf_log::received`, channel RAM at peak).

@@ -137,18 +137,20 @@ fn events(session: &rc_client::Session) -> Vec<String> {
     use rc_proto_v777::scores::ScoreEvent;
     let mut out = Vec::new();
     while let Ok(e) = session.events.try_recv() {
-        match e {
-            rc_client::Event::Score(ScoreEvent::Team { name, mode, .. }) => out.push(format!("team {name} {mode}")),
-            rc_client::Event::Score(ScoreEvent::Objective { name, mode, .. }) => out.push(format!("obj {name} {mode}")),
-            rc_client::Event::Score(ScoreEvent::Display { slot, objective }) => {
-                out.push(format!("disp {slot} {objective}"))
+        let score = match e {
+            rc_client::Event::Score(score) => *score,
+            rc_client::Event::Chat { .. } => {
+                out.push("chat".into());
+                continue;
             }
-            rc_client::Event::Score(ScoreEvent::Score { holder, objective, value, .. }) => {
-                out.push(format!("score {holder} {objective} {value}"))
-            }
-            rc_client::Event::Score(_) => out.push("score?".into()),
-            rc_client::Event::Chat { .. } => out.push("chat".into()),
-            _ => {}
+            _ => continue,
+        };
+        match score {
+            ScoreEvent::Team { name, mode, .. } => out.push(format!("team {name} {mode}")),
+            ScoreEvent::Objective { name, mode, .. } => out.push(format!("obj {name} {mode}")),
+            ScoreEvent::Display { slot, objective } => out.push(format!("disp {slot} {objective}")),
+            ScoreEvent::Score { holder, objective, value, .. } => out.push(format!("score {holder} {objective} {value}")),
+            _ => out.push("score?".into()),
         }
     }
     out

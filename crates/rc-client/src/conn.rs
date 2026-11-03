@@ -334,7 +334,7 @@ fn run(
                                 dec.enable_encryption(&secret);
                             }
                             Err(reason) => {
-                                emit(next, Event::Kicked(*reason));
+                                emit(next, Event::Kicked(reason));
                                 link.shutdown();
                                 return Ok("account login failure".into());
                             }
@@ -359,7 +359,7 @@ fn run(
                             .ok()
                             .and_then(|v| crate::status::json_component(&v));
                         if let Some(c) = reason {
-                            emit(next, Event::Kicked(c));
+                            emit(next, Event::Kicked(Box::new(c)));
                         }
                         return Ok(format!("refused: {json}"));
                     }
@@ -460,7 +460,7 @@ fn run(
                     } else if id == ids.cfg_disconnect {
                         if let Some(c) = rc_proto::nbt::read(&mut r).ok().flatten().as_ref().and_then(rc_text::from_nbt)
                         {
-                            emit(next, Event::Kicked(c));
+                            emit(next, Event::Kicked(Box::new(c)));
                         }
                         return Ok("disconnected during configuration".into());
                     }
@@ -587,15 +587,15 @@ fn run(
                             .and_then(rc_text::from_nbt)
                             .unwrap_or_else(|| rc_text::Component::text(""));
                         if overlay {
-                            emit(next, Event::ActionBar(c));
+                            emit(next, Event::ActionBar(Box::new(c)));
                         } else if crate::chat::visibility() != 2 && crate::chat::system_message_shown(&c) {
                             // Chat hidden: even system messages are ignored; guessed sender
                             // blocked or non-friend: message hidden.
-                            emit(next, Event::Chat { component: c, tag: crate::ChatTag::System });
+                            emit(next, Event::Chat { component: Box::new(c), tag: crate::ChatTag::System });
                         }
                     } else if id == ids.action_bar {
                         let c = rc_proto::nbt::read(&mut r)?.as_ref().and_then(rc_text::from_nbt);
-                        emit(next, Event::ActionBar(c.unwrap_or_else(|| rc_text::Component::text(""))));
+                        emit(next, Event::ActionBar(Box::new(c.unwrap_or_else(|| rc_text::Component::text("")))));
                     } else if id == ids.player_chat {
                         let m = play::read_player_chat(&mut r)?;
                         if m.global_index != chat_index {
@@ -624,7 +624,7 @@ fn run(
                             return Ok(e);
                         }
                         if let Some(l) = line {
-                            emit(next, Event::Chat { component: l.component, tag: l.tag });
+                            emit(next, Event::Chat { component: Box::new(l.component), tag: l.tag });
                             if let Some(o) = l.original {
                                 emit(next, Event::ChatOriginal(o));
                             }
@@ -671,7 +671,7 @@ fn run(
                             crate::chat::decorate(&kind, &chat_types, content, sender.as_ref(), target.as_ref());
                         // Like a player message: absent if player chat is off.
                         if crate::chat::visibility() == 0 && crate::session::player_chat_allowed() {
-                            emit(next, Event::Chat { component, tag: crate::ChatTag::Disguised });
+                            emit(next, Event::Chat { component: Box::new(component), tag: crate::ChatTag::Disguised });
                         }
                     } else if id == ids.light_update {
                         let c = ctx.ok_or_else(|| invalid("light before entering the game"))?;
@@ -694,21 +694,21 @@ fn run(
                         }
                         emit(next, Event::PlayerInfo(u));
                     } else if id == ids.set_objective {
-                        emit(next, Event::Score(rc_proto_v777::scores::read_set_objective(&mut r)?));
+                        emit(next, Event::Score(Box::new(rc_proto_v777::scores::read_set_objective(&mut r)?)));
                     } else if id == ids.set_display_objective {
-                        emit(next, Event::Score(rc_proto_v777::scores::read_display_objective(&mut r)?));
+                        emit(next, Event::Score(Box::new(rc_proto_v777::scores::read_display_objective(&mut r)?)));
                     } else if id == ids.set_score {
-                        emit(next, Event::Score(rc_proto_v777::scores::read_set_score(&mut r)?));
+                        emit(next, Event::Score(Box::new(rc_proto_v777::scores::read_set_score(&mut r)?)));
                     } else if id == ids.reset_score {
-                        emit(next, Event::Score(rc_proto_v777::scores::read_reset_score(&mut r)?));
+                        emit(next, Event::Score(Box::new(rc_proto_v777::scores::read_reset_score(&mut r)?)));
                     } else if id == ids.set_player_team {
-                        emit(next, Event::Score(rc_proto_v777::scores::read_player_team(&mut r)?));
+                        emit(next, Event::Score(Box::new(rc_proto_v777::scores::read_player_team(&mut r)?)));
                     } else if id == ids.sound {
                         emit(next, Event::Sound(play::read_sound(&mut r)?));
                     } else if id == ids.sound_entity {
                         emit(next, Event::Sound(play::read_sound_entity(&mut r)?));
                     } else if id == ids.level_particles {
-                        emit(next, Event::Particles(meta.read_level_particles(&mut r)?));
+                        emit(next, Event::Particles(Box::new(meta.read_level_particles(&mut r)?)));
                     } else if id == ids.block_changed_ack {
                         emit(next, Event::BlockChangedAck(read_varint(&mut r)?));
                     } else if id == ids.block_destruction {
@@ -723,7 +723,7 @@ fn run(
                     } else if id == ids.boss_event {
                         emit(next, Event::Boss(play::read_boss_event(&mut r)?));
                     } else if id == ids.waypoint {
-                        emit(next, Event::Waypoint(rc_proto_v777::waypoint::read_waypoint(&mut r)?));
+                        emit(next, Event::Waypoint(Box::new(rc_proto_v777::waypoint::read_waypoint(&mut r)?)));
                     } else if id == ids.map_item_data {
                         emit(next, Event::MapData(rc_proto_v777::map::read_map_item_data(&mut r)?));
                     } else if id == ids.set_title_text {
@@ -788,7 +788,7 @@ fn run(
                         emit(next, Event::Recipes(ev));
                     } else if id == ids.open_screen {
                         let (window, kind, title) = rc_proto_v777::container::read_open_screen(&mut r)?;
-                        let title = title.as_ref().and_then(rc_text::from_nbt);
+                        let title = title.as_ref().and_then(rc_text::from_nbt).map(Box::new);
                         emit(next, Event::OpenScreen { window, kind, title });
                     } else if id == ids.merchant_offers {
                         let o = rc_proto_v777::special::read_merchant_offers(&items, &mut r)?;
@@ -809,7 +809,7 @@ fn run(
                         let nbt = rc_proto::nbt::read(&mut r)?;
                         emit(next, Event::TagQuery { id: transaction, nbt });
                     } else if id == ids.test_instance_block_status {
-                        let status = rc_proto::nbt::read(&mut r)?.as_ref().and_then(rc_text::from_nbt);
+                        let status = rc_proto::nbt::read(&mut r)?.as_ref().and_then(rc_text::from_nbt).map(Box::new);
                         let size = if bool::decode(&mut r)? {
                             Some([read_varint(&mut r)?, read_varint(&mut r)?, read_varint(&mut r)?])
                         } else {
@@ -831,7 +831,7 @@ fn run(
                         emit(next, Event::SpawnPosition { dimension, pos: [pos.x, pos.y, pos.z] });
                     } else if id == ids.player_combat_kill {
                         let entity = read_varint(&mut r)?;
-                        let message = rc_proto::nbt::read(&mut r)?.as_ref().and_then(rc_text::from_nbt);
+                        let message = rc_proto::nbt::read(&mut r)?.as_ref().and_then(rc_text::from_nbt).map(Box::new);
                         emit(next, Event::Died { entity, message });
                     } else if id == ids.set_held_slot {
                         emit(next, Event::HeldSlot(read_varint(&mut r)?));
@@ -850,7 +850,7 @@ fn run(
                     } else if id == ids.disconnect {
                         let reason = rc_proto::nbt::read(&mut r).ok().flatten();
                         if let Some(c) = reason.as_ref().and_then(rc_text::from_nbt) {
-                            emit(next, Event::Kicked(c));
+                            emit(next, Event::Kicked(Box::new(c)));
                         }
                         return Ok(format!("disconnected by the server: {reason:?}"));
                     }

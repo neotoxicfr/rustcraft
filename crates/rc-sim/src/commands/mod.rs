@@ -587,7 +587,7 @@ impl Server {
         }
         let name = self.player_display_name();
         let c = tr("chat.type.text", vec![name.into(), lit(text).into()]);
-        self.chat_out(Event::Chat { component: c, tag: ChatTag::NotSecure });
+        self.chat_out(Event::Chat { component: Box::new(c), tag: ChatTag::NotSecure });
     }
 
     /// Command typed by the player.
@@ -657,7 +657,7 @@ impl Server {
         match src.origin {
             Origin::Player => {
                 if feedback {
-                    self.chat_out(Event::Chat { component: msg, tag: ChatTag::System });
+                    self.chat_out(Event::Chat { component: Box::new(msg), tag: ChatTag::System });
                 }
             }
             Origin::Block(p) => self.cb_output(p, msg, true),
@@ -692,7 +692,7 @@ impl Server {
     /// System message to the host, whoever the current player is.
     pub(crate) fn to_host(&self, c: Component) {
         if self.lan.as_ref().is_some_and(|l| l.active.is_some()) {
-            let _ = self.peer.send(Event::Chat { component: c, tag: ChatTag::System });
+            let _ = self.peer.send(Event::Chat { component: Box::new(c), tag: ChatTag::System });
         } else {
             self.system(c);
         }
@@ -744,7 +744,7 @@ impl Server {
         c.extra.push(msg);
         match src.origin {
             Origin::Player => {
-                self.chat_out(Event::Chat { component: c, tag: ChatTag::System });
+                self.chat_out(Event::Chat { component: Box::new(c), tag: ChatTag::System });
             }
             Origin::Block(p) => self.cb_output(p, c, false),
             Origin::Minecart(_) | Origin::Server => {}
@@ -777,7 +777,7 @@ impl Server {
     }
 
     pub fn system(&self, msg: Component) {
-        self.chat_out(Event::Chat { component: msg, tag: ChatTag::System });
+        self.chat_out(Event::Chat { component: Box::new(msg), tag: ChatTag::System });
     }
 
     /// Tick: pending suggestions, scheduled functions, command blocks.

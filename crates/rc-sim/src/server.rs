@@ -146,7 +146,7 @@ pub fn start(opts: Options, data: Arc<VersionData>) -> Result<(rc_client::Sessio
             }
             Err((peer, e)) => {
                 eprintln!("singleplayer: {e}");
-                let _ = peer.send(Event::Kicked(rc_text::Component::text(e.to_string())));
+                let _ = peer.send(Event::Kicked(Box::new(rc_text::Component::text(e.to_string()))));
                 let _ = peer.send(Event::Disconnected(e.to_string()));
             }
         }
@@ -638,7 +638,7 @@ impl Server {
             ),
         };
         joined.style.color = Some(0xFFFF55);
-        let _ = self.send(Event::Chat { component: joined, tag: ChatTag::System });
+        let _ = self.send(Event::Chat { component: Box::new(joined), tag: ChatTag::System });
         self.teleport_to(self.pos);
         use rc_proto_v777::players::{InfoEntry, InfoUpdate, action};
         let _ = self.send(Event::PlayerInfo(InfoUpdate {

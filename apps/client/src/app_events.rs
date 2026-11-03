@@ -134,7 +134,7 @@ impl App {
             }
             Event::Chat { component, tag } => {
                 self.menus.world.chat_line();
-                self.chat.add(component, tag);
+                self.chat.add(*component, tag);
             }
             Event::ChatSignature(sig) => self.chat.attach_signature(sig),
             Event::ChatOriginal(text) => self.chat.attach_original(text),
@@ -189,7 +189,7 @@ impl App {
                 }
             }
             Event::OpenScreen { window, kind, title } => {
-                self.inventory.open(window, menu::Kind::from_registry(kind), title);
+                self.inventory.open(window, menu::Kind::from_registry(kind), title.map(|t| *t));
                 self.screens.show();
                 self.keys.clear();
                 self.grab(false);
@@ -207,7 +207,7 @@ impl App {
             | Event::OpenBook(_)
             | Event::OpenSignEditor { .. }) => self.special_apply(ev),
             Event::TagQuery { id, nbt } => self.tag_query(id, nbt),
-            Event::TestInstanceStatus { status, size } => self.op_test_status(status, size),
+            Event::TestInstanceStatus { status, size } => self.op_test_status(status.map(|s| *s), size),
             Event::GameTestHighlight { absolute, relative } => {
                 self.tech.highlight(absolute, relative, std::time::Instant::now());
             }
@@ -217,7 +217,7 @@ impl App {
                 }
                 self.inventory.set_data(window, prop, value)
             }
-            Event::Score(s) => self.scores.apply(s),
+            Event::Score(s) => self.scores.apply(*s),
             Event::Sound(s) => self.play_sound(s),
             Event::Particles(p) => self.level_particles(&p),
             Event::LevelEvent { kind, pos, data, global } => self.on_level_event(kind, pos, data, global),
@@ -320,8 +320,8 @@ impl App {
                 }
                 self.inventory.apply(inv);
             }
-            Event::Died { entity, message } if entity == self.player_id => self.open_death(message),
-            Event::ActionBar(c) => self.chat.action_bar(c),
+            Event::Died { entity, message } if entity == self.player_id => self.open_death(message.map(|m| *m)),
+            Event::ActionBar(c) => self.chat.action_bar(*c),
             Event::LightUpdate { x, z, light } => {
                 // Check of the client engine: differences between our light and the server's.
                 if rc_data::env_flag!("RUSTCRAFT_LIGHTCHECK")
@@ -512,7 +512,7 @@ impl App {
                     }
                 }
             }
-            Event::Waypoint(w) => self.hud.more.waypoint(w),
+            Event::Waypoint(w) => self.hud.more.waypoint(*w),
             Event::MapData(m) => maps::store().apply(m),
             Event::Tags(tags) => {
                 self.menus.world.set_tags(&tags);

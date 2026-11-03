@@ -137,7 +137,7 @@ fn creaking_bound_to_heart() {
     let trails = |evs: Vec<rc_client::Event>| -> Vec<rc_proto_v777::entity::LevelParticles> {
         evs.into_iter()
             .filter_map(|e| match e {
-                rc_client::Event::Particles(lp) if Some(lp.particle.kind as usize) == trail => Some(lp),
+                rc_client::Event::Particles(lp) if Some(lp.particle.kind as usize) == trail => Some(*lp),
                 _ => None,
             })
             .collect()

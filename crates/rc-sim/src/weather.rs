@@ -201,7 +201,7 @@ impl Server {
     }
 
     fn overlay(&self, c: rc_text::Component) {
-        let _ = self.send(Event::ActionBar(c));
+        let _ = self.send(Event::ActionBar(Box::new(c)));
     }
 
     fn overlay_key(&self, key: &str) {
@@ -266,7 +266,7 @@ impl Server {
             self.life.vit.respawn = Some((self.dim.name.clone(), head, self.yaw, self.pitch, false));
             if !same {
                 let _ = self.send(Event::Chat {
-                    component: rc_text::Component::translate("block.minecraft.set_spawn", Vec::new()),
+                    component: Box::new(rc_text::Component::translate("block.minecraft.set_spawn", Vec::new())),
                     tag: rc_client::ChatTag::System,
                 });
             }
@@ -504,7 +504,7 @@ impl Server {
             let n = |v: i32| rc_text::Arg::Text(v.to_string());
             rc_text::Component::translate("sleep.players_sleeping", vec![n(sleeping), n(needed)])
         };
-        self.send_all_players(Event::ActionBar(msg));
+        self.send_all_players(Event::ActionBar(Box::new(msg)));
     }
 
     /// Night skip, decided once per world tick (after the weather, before game time):

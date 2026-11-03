@@ -960,9 +960,9 @@ impl Server {
         self.stop_using();
         let msg = self.death_message();
         let show = self.rule("minecraft:show_death_messages", true);
-        let _ = self.send(Event::Died { entity: self.player_id, message: show.then(|| msg.clone()) });
+        let _ = self.send(Event::Died { entity: self.player_id, message: show.then(|| Box::new(msg.clone())) });
         if show {
-            let _ = self.send(Event::Chat { component: msg, tag: rc_client::ChatTag::System });
+            let _ = self.send(Event::Chat { component: Box::new(msg), tag: rc_client::ChatTag::System });
         }
         if self.life.menu.is_some() {
             self.close_menu(true);
@@ -1610,7 +1610,7 @@ impl Server {
         self.send_health();
         if let Some(m) = msg {
             let _ = self.send(Event::Chat {
-                component: rc_text::Component::translate(m, Vec::new()),
+                component: Box::new(rc_text::Component::translate(m, Vec::new())),
                 tag: rc_client::ChatTag::System,
             });
         }

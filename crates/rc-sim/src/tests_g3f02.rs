@@ -606,7 +606,7 @@ fn build_limit_message_is_red_with_the_right_limit() {
     let mut want = rc_text::Component::translate("build.tooHigh", vec![rc_text::Arg::Text(top.to_string())]);
     want.style.color = Some(0xFF5555);
     let bars: Vec<_> =
-        events(&t).into_iter().filter_map(|e| if let Event::ActionBar(c) = e { Some(c) } else { None }).collect();
+        events(&t).into_iter().filter_map(|e| if let Event::ActionBar(c) = e { Some(*c) } else { None }).collect();
     assert_eq!(bars, vec![want.clone(), want.clone()]);
 
     let q = [1, FLOOR + 1, 0];
@@ -619,7 +619,7 @@ fn build_limit_message_is_red_with_the_right_limit() {
     t.s.on_use_item_on(0, q, 1, [0.5, 0.5, 0.5], false, 2);
     assert_eq!(t.s.get(q), lever, "lever operated despite the pending teleport");
     let bars: Vec<_> =
-        events(&t).into_iter().filter_map(|e| if let Event::ActionBar(c) = e { Some(c) } else { None }).collect();
+        events(&t).into_iter().filter_map(|e| if let Event::ActionBar(c) = e { Some(*c) } else { None }).collect();
     assert_eq!(bars.len(), 1);
     assert!(matches!(&bars[0].content, rc_text::Content::Translate { key, .. } if key == "build.tooHigh"), "{bars:?}");
 }

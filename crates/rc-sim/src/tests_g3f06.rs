@@ -144,7 +144,7 @@ impl W {
             .take_events()
             .into_iter()
             .filter_map(|e| match e {
-                Event::Chat { component, .. } => Some(component),
+                Event::Chat { component, .. } => Some(*component),
                 _ => None,
             })
             .collect()
@@ -292,7 +292,7 @@ fn test_instance_screen_queries_and_runs() {
     assert!(w.cmd(&format!("setblock {} {} {} minecraft:test_instance_block", at[0], at[1], at[2])));
     let ev = w.action(at, 0, Some("minecraft:always_pass"));
     let status = ev.iter().find_map(|e| match e {
-        Event::TestInstanceStatus { status, size } => Some((status.clone(), *size)),
+        Event::TestInstanceStatus { status, size } => Some((status.as_deref().cloned(), *size)),
         _ => None,
     });
     let (status, size) = status.expect("status answered");

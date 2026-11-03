@@ -666,7 +666,7 @@ impl Server {
             count: 1,
             mode: 0,
         };
-        let _ = self.send(rc_client::Event::Particles(p));
+        let _ = self.send(rc_client::Event::Particles(Box::new(p)));
         true
     }
 

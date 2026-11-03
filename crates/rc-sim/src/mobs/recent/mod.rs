@@ -739,7 +739,7 @@ impl Server {
             count,
             mode: 0,
         };
-        let _ = self.send(rc_client::Event::Particles(p));
+        let _ = self.send(rc_client::Event::Particles(Box::new(p)));
     }
 
     /// Player push (`push`): velocity added, sent back to the client.

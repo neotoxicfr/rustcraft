@@ -105,14 +105,14 @@ impl Server {
     pub(crate) fn flush_scores(&mut self) {
         let out = std::mem::take(&mut self.cmd.scores.out);
         for ev in out {
-            let _ = self.send(Event::Score(ev));
+            let _ = self.send(Event::Score(Box::new(ev)));
         }
     }
 
     /// Entering the game: teams and displayed objectives.
     pub(crate) fn send_scoreboard(&self) {
         for ev in self.cmd.scores.join_packets() {
-            let _ = self.send(Event::Score(ev));
+            let _ = self.send(Event::Score(Box::new(ev)));
         }
         self.send_bossbars();
     }

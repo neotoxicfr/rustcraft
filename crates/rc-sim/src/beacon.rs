@@ -334,7 +334,7 @@ impl Server {
         match self.lan.as_ref().and_then(|l| l.active) {
             Some(i) => self.lan_kick(i, key),
             None => {
-                let _ = self.send(rc_client::Event::Kicked(rc_text::Component::translate(key, Vec::new())));
+                let _ = self.send(rc_client::Event::Kicked(Box::new(rc_text::Component::translate(key, Vec::new()))));
             }
         }
     }
