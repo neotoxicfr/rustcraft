@@ -428,9 +428,8 @@ impl Scene {
 /// early rejection and of the kept candidates (with kept "below name" keys) are the same tags in
 /// the same order, with the same text, anchor, light and discretion. Without the game data,
 /// skipped (`RUSTCRAFT_OPT_REQUIRE=1`: failure). Sabotages verified (failure): the distance of
-/// another entity for the "below name" line; the name tested after the team; the visible name not
-/// noted on data 3; a "below name" key kept across a score change; the aimed entity left out of
-/// the candidates.
+/// another entity for the "below name" line; players left out of the early rejection; the aimed
+/// entity left out of the candidates.
 #[test]
 fn name_tags_match_the_old_code() {
     let Some(data) = rc_testdata::version_data() else { return };
@@ -461,7 +460,8 @@ fn name_tags_match_the_old_code() {
 
 /// A "below name" key is built once, then kept while its stamp holds; a score of the slot, a
 /// profile, the language, or another entity under the same id builds it again, and a frame
-/// without the tag forgets it. Sabotage verified (failure): the UUID left out of the kept key.
+/// without the tag forgets it. Sabotages verified (failure): the UUID left out of the kept key; a
+/// score of the slot not moving the revision.
 #[test]
 fn below_line_keys_are_kept_while_their_stamp_holds() {
     let Some(data) = rc_testdata::version_data() else { return };
@@ -525,7 +525,7 @@ fn below_line_keys_are_kept_while_their_stamp_holds() {
 /// The glowing outlines, the ghosts (spectator or not) and the rare kinds read from the kept
 /// subsets equal the walk of every entity, frame after frame, through spawns, data, removals by
 /// `apply` and elsewhere, ids spawned again with another kind, respawn of the local player, ticks.
-/// Sabotages verified (failure): glowing not noted on data 0; the local player left out.
+/// Sabotage verified (failure): glowing not noted on data 0.
 #[test]
 fn kept_subsets_match_the_walk_of_every_entity() {
     let Some(data) = rc_testdata::version_data() else { return };
@@ -609,7 +609,8 @@ fn player_sets_match_the_old_code() {
     assert!(filled.iter().all(|&n| n > 20), "frames with spectators, upside down, ears: {filled:?}");
 }
 
-/// The UUID written in its fixed buffer is the old formatted text, for any value.
+/// The UUID written in its fixed buffer is the old formatted text, for any value. Sabotage
+/// verified (failure): a hyphen moved by one place.
 #[test]
 fn uuid_text_writes_the_old_form() {
     let mut rng = Rng(0x2545_F491_4F6C_DD1D);

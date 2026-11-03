@@ -363,8 +363,8 @@ fn list_revision_moves_with_what_the_list_shows() {
 
 /// After each event of a random sequence where slot 2 is often used: whenever the "below name"
 /// line of a holder changed, the "below name" revision changed too (keys kept by the name tags are
-/// never stale). Sabotages verified (failure): a score of the slot's objective, then the slot
-/// itself, leaving the revision unchanged.
+/// never stale). Sabotage verified (failure): a score of the slot's objective leaving the
+/// revision unchanged.
 #[test]
 fn below_name_revision_moves_with_the_below_lines() {
     let mut rng = Rng(0x2545_F491_4F6C_DD1D);

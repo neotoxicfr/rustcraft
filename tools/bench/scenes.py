@@ -232,6 +232,19 @@ def mobs1000_function(x, y, z):
     return "\n".join(lines) + "\n"
 
 
+def team_crowd_function(x, y, z):
+    """The 1,000 mobs of `mobs1000`, all in a coloured team with the player (the server case:
+    holder names looked up for the tag rules and the glowing colours), the 250 cows glowing."""
+    lines = [mobs1000_function(x, y, z),
+             "team add perf_crowd",
+             "team modify perf_crowd color aqua",
+             "team modify perf_crowd seeFriendlyInvisibles true",
+             "team join perf_crowd @e[type=!player]",
+             "team join perf_crowd @a",
+             "effect give @e[type=cow] glowing infinite 0 true"]
+    return "\n".join(lines) + "\n"
+
+
 def armor(head="diamond_helmet", hand="iron_sword"):
     pieces = {"head": head, "chest": "iron_chestplate", "legs": "golden_leggings", "feet": "chainmail_boots", "mainhand": hand}
     return "equipment:{" + ",".join(f'{k}:{{id:"minecraft:{v}",count:1}}' for k, v in pieces.items()) + "}"
@@ -338,6 +351,7 @@ def pack_functions(sites):
         "mobs": mobs_function(*f),
         "redstone": redstone_function(*r),
         "mobs1000": mobs1000_function(*f),
+        "team_crowd": team_crowd_function(*f),
         "humanoids": humanoids_function(*f),
         "keyframes": keyframes_function(*f),
         "items": items_function(*f),
@@ -653,6 +667,7 @@ SCENES.update({
     "crowd-close-up": {"site": "crowd", "d": [0.5, 2.0, -6.5], "rot": [0.0, 10.0], "rd": 12, "secs": 50, "from": 30,
                        "cmd": FUNCTION("mobs")},
     "crowd-1000": {**CROWD, "cmd": FUNCTION("mobs1000")},
+    "team-crowd": {**CROWD, "cmd": FUNCTION("team_crowd")},
     "equipped-humanoids": {**CROWD, "cmd": FUNCTION("humanoids")},
     "mobs-keyframes": {**CROWD, "cmd": FUNCTION("keyframes")},
     "dropped-items": {**CROWD, "cmd": FUNCTION("items")},

@@ -197,6 +197,7 @@ class Scenes(unittest.TestCase):
         count = lambda name, word: f[name].count(word)  # noqa: E731
         self.assertEqual(count("mobs", "summon"), 100)
         self.assertEqual(count("mobs1000", "summon"), 1000)
+        self.assertEqual((count("team_crowd", "summon"), count("team_crowd", "team join")), (1000, 2))
         self.assertEqual(count("names", "CustomNameVisible"), 200)
         self.assertEqual(count("glowing", "Glowing"), 100)
         self.assertEqual(count("humanoids", "summon"), 160)
