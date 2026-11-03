@@ -3509,3 +3509,15 @@ rounds, minimum of 5 passes of 400 ticks per scene, loaded machine (other agents
   test of a vehicle's passengers runs only when frozen, the plates also scan the server's item
   and orb lists during a series (empty unless something was born in it), a parked world is
   swept once per family after the player leaves (O(its entities), then a bit test per tick).
+
+### `main.rs` cut into modules by concern (X-M01, 03/11/2026, pure move)
+
+`apps/client/src/main.rs` (4,503 lines) became 549 lines plus eleven modules: `app_events`,
+`app_meshing`, `app_frame`, `app_tick`, `app_camera`, `app_effects`, `app_menus`, `app_window`,
+`startup`, `grid_world`, `app_entity_sets` (and `memstats` for the memory counter). Not one
+statement changed: `tools/check_pure_move.py` compares the base file with the new ones item by
+item (95 items identical, statement order included). No switch (nothing to switch), no
+measurement taken: the cut is within one crate, so inlining and code generation do not depend
+on the module of a function. Scenes to measure on a quiet machine: `plains12`, `crowd`, `title`,
+2 alternating passes against the exe built before the cut; expected neutral (otherwise
+`#[inline]` on the moved functions, noted here with the figures).
