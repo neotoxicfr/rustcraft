@@ -163,19 +163,32 @@ pub struct Opts {
     pub vol_pool: bool,
     /// Point spline without allocation or dynamic call.
     pub spline_stack: bool,
+    /// A buffer taken from the context keeps its old values instead of being zeroed.
+    pub take_without_zeroing: bool,
+    /// A buffer is taken from the spare one that fits it best, and the spares are capped in bytes.
+    pub best_fit_buffers: bool,
 }
 
 impl Opts {
-    /// Code from before the mission.
-    pub const OLD: Opts = Opts { range_yvol: false, vol_pool: false, spline_stack: false };
+    /// Code from before the optimisations.
+    pub const OLD: Opts = Opts {
+        range_yvol: false,
+        vol_pool: false,
+        spline_stack: false,
+        take_without_zeroing: false,
+        best_fit_buffers: false,
+    };
     /// All the tracks.
-    pub const NEW: Opts = Opts { range_yvol: true, vol_pool: true, spline_stack: true };
+    pub const NEW: Opts =
+        Opts { range_yvol: true, vol_pool: true, spline_stack: true, take_without_zeroing: true, best_fit_buffers: true };
 
     pub fn current() -> Opts {
         static P: std::sync::LazyLock<Opts> = std::sync::LazyLock::new(|| Opts {
             range_yvol: crate::opt::range_yvol(),
             vol_pool: crate::opt::vol_pool(),
             spline_stack: crate::opt::spline_stack(),
+            take_without_zeroing: crate::opt::take_without_zeroing(),
+            best_fit_buffers: crate::opt::best_fit_buffers(),
         });
         *P
     }
@@ -187,12 +200,37 @@ impl Default for Opts {
     }
 }
 
+/// Spare buffers kept by a context at most, the old way (count only).
+const SPARE_COUNT_CAP: usize = 64;
+
+/// Bytes of spare buffers kept by a context at most (`best_fit_buffers`). A context kept by a
+/// thread from one chunk to the next must hold a bounded reserve: a chunk volume is 393 KB, and
+/// the reserve settles at 2.4 to 3.5 MB on the overworld (micro-bench, 256 chunks).
+const SPARE_BYTES_CAP: usize = 8 << 20;
+
+/// Spare buffers kept by a context at most with `best_fit_buffers` (bounds the search of a fit).
+const SPARE_COUNT_CAP_BEST_FIT: usize = 128;
+
+/// Capacity of a new buffer of `n` elements (`best_fit_buffers`): the next size of the series
+/// 2^k, 3·2^(k-1) (… 64 Ki, 96 Ki, 128 Ki …; a chunk volume is exactly 96 Ki). The row
+/// sub-volumes of the choices have heights that change from chunk to chunk: rounded to a few
+/// sizes, they find a spare that fits instead of adding a new buffer each time.
+fn size_class(n: usize) -> usize {
+    let power = n.max(4).next_power_of_two();
+    let three_quarters = power / 4 * 3;
+    if n <= three_quarters { three_quarters } else { power }
+}
+
 /// Evaluation context: cache cells (like a context with caches in the game) and buffers.
 #[derive(Debug, Default)]
 pub struct Ctx {
     cells: Option<Vec<CacheCell>>,
     pool: Vec<Vec<f32>>,
+    /// Bytes held by `pool` (sum of the capacities).
+    pool_bytes: usize,
     opts: Opts,
+    /// Test hook: every taken buffer is filled with NaN (see [`Ctx::poison_taken_buffers`]).
+    poison: bool,
 }
 
 impl Ctx {
@@ -208,18 +246,49 @@ impl Ctx {
 
     /// Context without cache, paths forced (equivalence tests, benches).
     pub fn uncached_with(opts: Opts) -> Self {
-        Ctx { cells: None, pool: Vec::new(), opts }
+        Ctx { cells: None, opts, ..Ctx::default() }
     }
 
     /// Context with caches, paths forced (equivalence tests, benches).
     pub fn cached_with(opts: Opts) -> Self {
-        Ctx { cells: Some(Vec::new()), pool: Vec::new(), opts }
+        Ctx { cells: Some(Vec::new()), opts, ..Ctx::default() }
     }
 
     /// Hands a buffer (received from [`Generator::volume`](crate::Generator::volume)) back to the context, which
-    /// will take it again for the next volume (`vol_pool`).
+    /// will take it again for a later volume.
     pub fn recycle(&mut self, v: Vec<f32>) {
         self.give(v);
+    }
+
+    /// Makes a context reused for another chunk answer exactly like a fresh one: every cache
+    /// cell forgets its volume and its last point, and its buffer goes back to the spare buffers.
+    /// Without it, a point read inside the previous chunk's cached volume would return the volume
+    /// value where a fresh context computes the point value, and the two differ below an
+    /// interpolation or a noise whose scale is not a power of 2. Once reset, the context can
+    /// also serve another program (another dimension or seed).
+    pub fn reset_for_reuse(&mut self) {
+        let Some(mut cells) = self.cells.take() else { return };
+        for c in &mut cells {
+            c.volume = None;
+            c.key = 0;
+            c.value = f32::NAN;
+            if let Some(b) = c.buf.take() {
+                self.give(b);
+            }
+        }
+        self.cells = Some(cells);
+    }
+
+    /// Test hook: every buffer taken from now on is filled with NaN, so that a caller reading an
+    /// element it did not write changes the result (proof that no caller relies on the zeroing).
+    #[doc(hidden)]
+    pub fn poison_taken_buffers(&mut self) {
+        self.poison = true;
+    }
+
+    /// Bytes held by the spare buffers (bound of the reserve of a kept context).
+    pub fn spare_bytes(&self) -> usize {
+        self.pool_bytes
     }
 
     /// Output buffer of a volume: taken from the context (`vol_pool`) or new.
@@ -227,15 +296,56 @@ impl Ctx {
         if self.opts.vol_pool { self.take(n) } else { vec![0.0; n] }
     }
 
-    fn take(&mut self, n: usize) -> Vec<f32> {
-        let mut v = self.pool.pop().unwrap_or_default();
-        v.clear();
-        v.resize(n, 0.0);
+    /// Buffer of `n` elements, from the spare buffers when one is free (hand it back with
+    /// [`Ctx::recycle`]). Its values are unspecified with `take_without_zeroing`: the caller
+    /// writes every element it reads.
+    pub fn take(&mut self, n: usize) -> Vec<f32> {
+        let mut v = self.pop_spare(n);
+        if self.poison {
+            v.clear();
+            v.resize(n, f32::NAN);
+        } else if self.opts.take_without_zeroing {
+            // Only the part beyond the old length is written: the rest keeps old values,
+            // which every caller overwrites (393 KB of zeros not written for a chunk volume).
+            v.truncate(n);
+            v.resize(n, 0.0);
+        } else {
+            v.clear();
+            v.resize(n, 0.0);
+        }
         v
     }
 
+    fn pop_spare(&mut self, n: usize) -> Vec<f32> {
+        if !self.opts.best_fit_buffers {
+            let v = self.pool.pop().unwrap_or_default();
+            self.pool_bytes -= v.capacity() * size_of::<f32>();
+            return v;
+        }
+        let Some(at) = self.best_fit(n) else { return Vec::with_capacity(size_class(n)) };
+        let v = self.pool.swap_remove(at);
+        self.pool_bytes -= v.capacity() * size_of::<f32>();
+        v
+    }
+
+    /// Smallest spare buffer that holds `n` elements without growing (`None`: a new one is
+    /// allocated, the smaller spares stay for smaller requests). The last one given back (the old
+    /// choice) is often a chunk volume: a tiny request would take it, and the next chunk-sized
+    /// request would allocate again.
+    fn best_fit(&self, n: usize) -> Option<usize> {
+        let fits = self.pool.iter().enumerate().filter(|(_, b)| b.capacity() >= n);
+        fits.min_by_key(|(_, b)| b.capacity()).map(|(i, _)| i)
+    }
+
     fn give(&mut self, v: Vec<f32>) {
-        if self.pool.len() < 64 {
+        let bytes = v.capacity() * size_of::<f32>();
+        let keep = if self.opts.best_fit_buffers {
+            self.pool.len() < SPARE_COUNT_CAP_BEST_FIT && self.pool_bytes + bytes <= SPARE_BYTES_CAP
+        } else {
+            self.pool.len() < SPARE_COUNT_CAP
+        };
+        if keep {
+            self.pool_bytes += bytes;
             self.pool.push(v);
         }
     }
@@ -1539,5 +1649,22 @@ impl Program {
             }
         }
         ctx.give(cb);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::size_class;
+
+    #[test]
+    fn size_classes_cover_the_request_and_keep_a_chunk_volume_exact() {
+        assert_eq!(size_class(16 * 384 * 16), 16 * 384 * 16);
+        assert_eq!(size_class(8), 8);
+        assert_eq!(size_class(65), 96);
+        assert_eq!(size_class(97), 128);
+        for n in 0..5000 {
+            let c = size_class(n);
+            assert!(c >= n && c <= (n * 3 / 2).max(4), "{n} -> {c}");
+        }
     }
 }

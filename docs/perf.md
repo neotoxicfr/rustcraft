@@ -308,6 +308,66 @@ restricted cache at the first point access would give back the gain on the veins
 2 noises recomputed out of 39 in `final_density`, 0 in the climate and the veins, ceiling < 5%);
 GPU (f64, exact floating-point order). Operation band and climate memoized per quarter: not done.
 
+### Density evaluator: kept context, buffers without zeroing, best fit (C1-M06, 03/11/2026, micro-bench, loaded machine)
+
+Three tracks, each behind its switch (default 1, `=0` old path):
+- `RUSTCRAFT_OPT_TAKE_WITHOUT_ZEROING`: a buffer taken from the context keeps its old values
+  (only the part beyond its old length is written); every caller writes what it reads. The one
+  node that added into its buffer (shifted-B noise) now zeroes it itself (prior fix, result unchanged).
+- `RUSTCRAFT_OPT_BEST_FIT_BUFFERS`: the smallest spare that holds the request instead of the last one
+  given back (a request of 8 values no longer takes a 393 KB chunk volume), new buffers rounded to
+  the series 2^k, 3·2^(k−1) (a chunk volume is exactly 96 Ki values), spares capped at 8 MB.
+- `RUSTCRAFT_OPT_KEEP_EVAL_CONTEXT`: the terrain (chunk and base column) uses a context kept by the
+  thread, reset at the start of each chunk (each cache cell forgets its volume and last point, its
+  buffer goes back to the spares), the final density buffer taken from the spares and handed back.
+
+Allocations per chunk (deterministic, `bench_final_density`, 256 chunks, counter around mimalloc with
+the client's option, 1 thread):
+
+| Paths | new context | kept context | reserve of a kept context |
+|---|---|---|---|
+| old | 44.2, 2,379 KB | 6.5, 69 KB | 9,600 KB |
+| best fit alone | 46.1, 2,399 KB | 6.3, 19 KB | 2,395 KB |
+| range_yvol (default before) | 43.1, 2,053 KB | 3.6, 94 KB | 10,191 KB |
+| default now (range_yvol + no zeroing + best fit) | 41.9, 2,021 KB | 3.3, 25 KB | 3,541 KB |
+
+Without rounding (first version), best fit + range_yvol filled the reserve up to the cap (8,152 KB,
+759 KB reallocated per chunk): the row sub-volumes change height from chunk to chunk and each miss
+added a buffer. Replacing the largest spare on a miss instead brought range_yvol to 4,994 KB but
+best fit alone to 8,083 KB (small spares turned one by one into large ones): rounding kept.
+`VOL_POOL` with a kept context: no allocation saved (3.3, 25 KB with or without it, the output already
+comes from the spares), no time gained (below): stays off. Page faults: 0 to 5 per chunk in every
+case (mimalloc reuses its pages), no difference.
+
+Terrain (`bench_terrain_kept_context`, 64 chunks, filling + surface + caves, default switches):
+276 to 288 allocations and 2,285 to 2,334 KB per chunk → 233 and 238 KB (−90% of the bytes).
+
+Time, 1 thread, the six cases alternated over 12 rounds, minimum per chunk, two runs
+(`bench_kept_context_alternated`): final density before the mission (new context, without the two
+buffer tracks) 0.973 / 0.955 ms; default, new context 0.951 / 0.959; default, kept 0.912 / 0.919
+(≈ −4%); kept without no-zeroing 0.947 / 0.931; kept without best fit 0.993 / 0.936; kept + vol_pool
+0.954 / 0.921. Whole terrain: 3.773 → 3.776, 4.024 → 4.054, 3.805 → 3.777, 3.814 → 3.817,
+3.821 → 3.779 ms (within ±1%). Blocks of 1 to 32 threads (`bench_final_density`): ±50% between
+passes, no conclusion. Decision on the scene bench, quiet machine (generation, generation-1thread,
+crowd, crowd-1000, redstone, tnt, dropped-items, equipped-humanoids): ms/chunk, chunks/s, private
+memory (the kept reserve costs up to 3.5 MB per generating thread).
+
+Equivalence: `sampler_opt` (each new variant alone and in combination against the old code, plus all
+the paths with every taken buffer filled with NaN; context kept and reset against a fresh one,
+200 chunks × 3 seeds × 3 dimensions, final density and a built cache over an interpolation, point
+reads on every cache in the previous, current and next chunk; terrain chunks one after another with
+the kept context against a fresh one, base heights in between, 8 chunks × 3 dimensions × 3 seeds),
+`density_ref`, `terrain_ref`, `terrain_opt`. Sabotages: shifted-B noise without its zeroing →
+`density_ref` (46 differences) and both volume tests of `sampler_opt` fail, only on the variants
+without zeroing and the poisoned one; reset made a no-op → 45 chunks differ (the real overworld
+caches included). The terrain itself always refills a cell before reading it again (the terrain test
+passes even without the reset): the reset guards the evaluator in general.
+
+Leads noted, outside the files of the mission: the aquifer drops its surface buffer instead of
+handing it back (`aquifer.rs`, `max_surface_level`); the material state zeroes its spare buffers
+the same way (`material.rs`, `MatState::buf`); structures, monuments, `/locate` and the debug
+screen take a new context per call.
+
 ### Biome tree and zoom (C1-M04, 22/10/2026, micro-bench, loaded machine)
 
 Bench `rc-worldgen --test biome_opt` (ignored), real climates of 1,024 chunks of the main
