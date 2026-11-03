@@ -64,7 +64,7 @@ pub fn set_sprinting(m: &mut Mob, v: bool) {
 
 pub fn interact(s: &mut Server, m: &mut Mob, slot: usize, item: &str) -> Option<bool> {
     let tempting = m.goals.goals.iter().any(|w| w.running && matches!(w.goal, Goal::Tempt { .. }));
-    if tempting && !m.surf.trusting && s.item_tag(item, "minecraft:ocelot_food") && dist2(s.pos, m.pos) < 9.0 {
+    if tempting && !m.surf.trusting && s.item_tag(item, "minecraft:ocelot_food") && dist2(s.pos, m.pos()) < 9.0 {
         if s.game_mode != 1
             && let Some(st) = &mut s.slots[slot]
         {

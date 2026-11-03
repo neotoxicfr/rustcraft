@@ -463,13 +463,13 @@ impl Server {
         if !reach.intersects(&golem.bbox()) {
             return;
         }
-        let from = [cube.pos[0], cube.eye_y(), cube.pos[2]];
-        let to = [golem.pos[0], golem.eye_y(), golem.pos[2]];
+        let from = [cube.pos()[0], cube.eye_y(), cube.pos()[2]];
+        let to = [golem.pos()[0], golem.eye_y(), golem.pos()[2]];
         if super::mth::dist2(from, to) > 128.0 * 128.0 || self.clip_blocks(from, to) {
             return;
         }
         let dmg = cube.attack_damage();
-        if self.mob_hurt(golem, "minecraft:mob_attack", dmg, Some(Ent::Mob(cube.id)), Some(cube.pos)) {
+        if self.mob_hurt(golem, "minecraft:mob_attack", dmg, Some(Ent::Mob(cube.id)), Some(cube.pos())) {
             let pitch = (cube.rng.next_float() - cube.rng.next_float()) * 0.2 + 1.0;
             self.cube_sound(cube, "minecraft:entity.slime.attack", 1.0, pitch);
         }

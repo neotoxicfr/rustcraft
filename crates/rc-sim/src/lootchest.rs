@@ -127,9 +127,9 @@ impl Server {
             // Fixed seed, otherwise sequence declared by the table (`random_sequence`), otherwise the level's
             // random (table without sequence or nonexistent: nothing is created in the sequences). The
             // world's generator is taken out for the draw, the world being lent to it.
-            let seq =
-                self.life.pack.get("loot_table", table).and_then(|t| t["random_sequence"].as_str().map(str::to_owned));
-            let mut world_rng = match &seq {
+            let table_value = self.life.pack.get("loot_table", table);
+            let seq = table_value.as_deref().and_then(|t| t["random_sequence"].as_str());
+            let mut world_rng = match seq {
                 _ if seed != 0 => None,
                 Some(q) => Some(*self.life.seqs.get(q)),
                 None => Some(self.life.rng),
@@ -144,20 +144,22 @@ impl Server {
                     ..Default::default()
                 });
                 let ctx = crate::loot::Ctx { luck, world: Some(&view), ..Default::default() };
+                // The table read above is drawn as it is (not looked up again by name).
+                let resolved = table_value.as_deref();
                 match &mut world_rng {
                     None => {
                         let mut rng = crate::mobs::jrand::JRand::new(seed);
-                        let stacks = loot.drops(table, &ctx, &mut rng);
+                        let stacks = loot.drops_of_looked_up_table(table, resolved, &ctx, &mut rng);
                         fill(&mut items, stacks, &mut rng);
                     }
                     Some(rng) => {
-                        let stacks = loot.drops(table, &ctx, rng);
+                        let stacks = loot.drops_of_looked_up_table(table, resolved, &ctx, rng);
                         fill(&mut items, stacks, rng);
                     }
                 }
             }
             match (seq, world_rng) {
-                (Some(q), Some(r)) => *self.life.seqs.get(&q) = r,
+                (Some(q), Some(r)) => *self.life.seqs.get(q) = r,
                 (None, Some(r)) => self.life.rng = r,
                 _ => {}
             }

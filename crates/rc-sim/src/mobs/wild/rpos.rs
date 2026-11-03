@@ -4,9 +4,10 @@
 //! serve species that have none (bee, fox, panda).
 
 use super::super::env::Fluid;
-use super::super::goals::{rpos_restricted, static_type_of, within_home};
+use super::super::goals::{rpos_restricted, within_home};
 use super::super::mob::Mob;
 use super::super::mth;
+use super::super::nav::DrawView;
 use crate::server::Server;
 
 const SQRT_OF_TWO: f64 = std::f32::consts::SQRT_2 as f64;
@@ -46,9 +47,9 @@ pub fn direction_within_radians(
 /// The position draw toward a direction without residence: direction added to the position.
 pub fn toward(m: &Mob, d: [i32; 3]) -> [i32; 3] {
     [
-        (f64::from(d[0]) + m.pos[0]).floor() as i32,
-        (f64::from(d[1]) + m.pos[1]).floor() as i32,
-        (f64::from(d[2]) + m.pos[2]).floor() as i32,
+        (f64::from(d[0]) + m.pos()[0]).floor() as i32,
+        (f64::from(d[1]) + m.pos()[1]).floor() as i32,
+        (f64::from(d[2]) + m.pos()[2]).floor() as i32,
     ]
 }
 
@@ -58,12 +59,6 @@ fn max_y(s: &Server) -> i32 {
 
 fn outside_limits(s: &Server, p: [i32; 3]) -> bool {
     p[1] < s.dim.height.min_y || p[1] > max_y(s)
-}
-
-/// The path malus test (static type of the cell, species malus).
-pub fn has_malus(s: &Server, m: &Mob, p: [i32; 3]) -> bool {
-    let view = s.mob_view(m);
-    super::super::nav::mob_malus(m, static_type_of(s, &view, p)) != 0.0
 }
 
 fn is_water(s: &Server, p: [i32; 3]) -> bool {
@@ -106,12 +101,13 @@ pub fn up_to_above_solid(s: &Server, mut p: [i32; 3], amount: i32) -> [i32; 3] {
 fn best_of(
     s: &Server,
     m: &mut Mob,
-    mut make: impl FnMut(&Server, &mut Mob) -> Option<[i32; 3]>,
+    mut make: impl FnMut(&Server, &mut Mob, &DrawView) -> Option<[i32; 3]>,
     weight: impl Fn(&Server, &Mob, [i32; 3]) -> f64,
 ) -> Option<[f64; 3]> {
+    let view = DrawView::new(s, m);
     let mut best: Option<(f64, [i32; 3])> = None;
     for _ in 0..10 {
-        if let Some(p) = make(s, m) {
+        if let Some(p) = make(s, m, &view) {
             let w = weight(s, m, p);
             if w > best.map_or(f64::NEG_INFINITY, |b| b.0) {
                 best = Some((w, p));
@@ -126,13 +122,13 @@ fn walk_weight(s: &Server, m: &Mob, p: [i32; 3]) -> f64 {
 }
 
 /// The land position draw toward a direction + climbing out of the solid.
-fn land_candidate(s: &Server, m: &Mob, d: [i32; 3]) -> Option<[i32; 3]> {
+fn land_candidate(s: &Server, m: &Mob, view: &DrawView, d: [i32; 3]) -> Option<[i32; 3]> {
     let p = toward(m, d);
     if outside_limits(s, p) || !s.nav_stable(m, p) {
         return None;
     }
     let p = up_out_of_solid(s, p);
-    (!is_water(s, p) && !has_malus(s, m, p)).then_some(p)
+    (!is_water(s, p) && !view.has_malus(s, m, p)).then_some(p)
 }
 
 /// The land position draw with an own weight.
@@ -146,9 +142,9 @@ pub fn land_pos(
     best_of(
         s,
         m,
-        |s, m| {
+        |s, m, view| {
             let d = random_direction(m, h, v);
-            land_candidate(s, m, d)
+            land_candidate(s, m, view, d)
         },
         weight,
     )
@@ -170,7 +166,7 @@ pub fn hover_pos(
     best_of(
         s,
         m,
-        |s, m| {
+        |s, m, view| {
             let d = direction_within_radians(m, 0.0, f64::from(h), v, 0, xdir, zdir, f64::from(max_rad))?;
             let p = toward(m, d);
             if outside_limits(s, p) || !s.nav_stable(m, p) {
@@ -178,7 +174,7 @@ pub fn hover_pos(
             }
             let amount = m.rng.next_int_bound(hover_max - hover_min + 1) + hover_min;
             let p = up_to_above_solid(s, p, amount);
-            (!is_water(s, p) && !has_malus(s, m, p)).then_some(p)
+            (!is_water(s, p) && !view.has_malus(s, m, p)).then_some(p)
         },
         walk_weight,
     )
@@ -190,6 +186,7 @@ pub fn hover_pos(
 pub fn air_and_water_candidate(
     s: &Server,
     m: &mut Mob,
+    view: &DrawView,
     h: i32,
     v: i32,
     flying_height: i32,
@@ -204,7 +201,7 @@ pub fn air_and_water_candidate(
         return None;
     }
     let p = up_out_of_solid(s, p);
-    (!has_malus(s, m, p)).then_some(p)
+    (!view.has_malus(s, m, p)).then_some(p)
 }
 
 /// The aerial or aquatic position draw.
@@ -223,7 +220,7 @@ pub fn air_and_water_pos(
     best_of(
         s,
         m,
-        |s, m| air_and_water_candidate(s, m, h, v, flying_height, xdir, zdir, max_rad, restrict),
+        |s, m, view| air_and_water_candidate(s, m, view, h, v, flying_height, xdir, zdir, max_rad, restrict),
         walk_weight,
     )
 }
@@ -238,13 +235,13 @@ pub fn air_pos_towards(
     towards: [f64; 3],
     max_rad: f64,
 ) -> Option<[f64; 3]> {
-    let dir = [towards[0] - m.pos[0], towards[2] - m.pos[2]];
+    let dir = [towards[0] - m.pos()[0], towards[2] - m.pos()[2]];
     let restrict = rpos_restricted(m, f64::from(h));
     best_of(
         s,
         m,
-        |s, m| {
-            let p = air_and_water_candidate(s, m, h, v, flying_height, dir[0], dir[1], max_rad, restrict)?;
+        |s, m, view| {
+            let p = air_and_water_candidate(s, m, view, h, v, flying_height, dir[0], dir[1], max_rad, restrict)?;
             (!is_water(s, p)).then_some(p)
         },
         walk_weight,

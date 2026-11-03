@@ -27,7 +27,8 @@ fn argb(r: f32, g: f32, b: f32) -> u32 {
 }
 
 thread_local! {
-    /// Entities that touched the water at the previous tick (id; `LOCAL` for the player).
+    /// Entities that touched the water at the previous tick (id; `LOCAL` for the player): old path
+    /// of the splash check (`RUSTCRAFT_OPT_WET_FLAG_IN_ENTITY=0`).
     static WET: std::cell::RefCell<hashbrown::HashMap<i32, bool>> = std::cell::RefCell::new(Default::default());
 }
 
@@ -40,7 +41,7 @@ impl crate::App {
         self.tick_illusions();
         self.tick_dragon_fx();
         let game_time = self.env.env.clocks.game_time;
-        let crate::entities::Entities { map, dims, .. } = &mut self.entities;
+        let crate::entities::Entities { map, dims, subsets, .. } = &mut self.entities;
         let (ps, r) = (&mut self.particles, &mut self.world_random);
         let view =
             crate::environ::WorldView { grid: &self.world.grid, min_y: self.world.min_y, height: self.world.height };
@@ -52,19 +53,8 @@ impl crate::App {
         let mut fx_sounds = Vec::new();
         // Monster effects first: they advance counters kept on the entity (mutable pass); the
         // other effects read neighbouring entities (guardian target) in the second pass.
-        for e in map.values_mut() {
-            if matches!(
-                e.kind.as_str(),
-                "blaze"
-                    | "breeze"
-                    | "enderman"
-                    | "endermite"
-                    | "evoker"
-                    | "illusioner"
-                    | "phantom"
-                    | "ravager"
-                    | "warden"
-            ) {
+        let mut monster_effects = |e: &mut Entity| {
+            if has_monster_effects(&e.kind) {
                 let size = e.size(dims);
                 mob_fx(
                     e,
@@ -77,6 +67,16 @@ impl crate::App {
                     &mut fx_sounds,
                 );
             }
+        };
+        if crate::entities::rare_kind_lists_on() {
+            // Only the monsters listed at spawn: most worlds have none of them.
+            for id in &subsets.effect_mobs {
+                if let Some(e) = map.get_mut(id) {
+                    monster_effects(e);
+                }
+            }
+        } else {
+            map.values_mut().for_each(monster_effects);
         }
         let ents = &self.entities;
         let dims = &ents.dims;
@@ -181,15 +181,15 @@ impl crate::App {
     /// random over the width, y over the height, z at the edge + half-width like the game) and the
     /// mirror sound at the entity.
     fn tick_illusions(&mut self) {
-        let dims = &self.entities.dims;
-        let r = &mut self.world_random;
+        let crate::entities::Entities { map, dims, subsets, .. } = &mut self.entities;
+        let (r, particles) = (&mut self.world_random, &mut self.particles);
         let mut sounds = Vec::new();
-        for e in self.entities.map.values_mut() {
+        let mut illusions = |e: &mut Entity| {
             if e.kind != "illusioner" {
-                continue;
+                return;
             }
             if !crate::entity_render::illusion_tick(e, |n| ((r.f() * n as f32) as i32).min(n - 1)) {
-                continue;
+                return;
             }
             let s = e.size(dims);
             let (w, h) = (f64::from(s.w), f64::from(s.h));
@@ -197,9 +197,19 @@ impl crate::App {
                 let x = e.pos[0] + w * (2.0 * f64::from(r.f()) - 1.0) * 0.5;
                 let y = e.pos[1] + h * f64::from(r.f());
                 let z = e.pos[2] + w * 0.5;
-                self.particles.spawn(PKind::Cloud, &POptions::default(), [x, y, z], [0.0; 3]);
+                particles.spawn(PKind::Cloud, &POptions::default(), [x, y, z], [0.0; 3]);
             }
             sounds.push(e.pos);
+        };
+        if crate::entities::rare_kind_lists_on() {
+            // Illusioners are among the monsters listed at spawn.
+            for id in &subsets.effect_mobs {
+                if let Some(e) = map.get_mut(id) {
+                    illusions(e);
+                }
+            }
+        } else {
+            map.values_mut().for_each(illusions);
         }
         if let Some(a) = self.audio.get() {
             for pos in sounds {
@@ -220,38 +230,16 @@ impl crate::App {
             player: None,
             scope: None,
         };
-        let mut splashes: Vec<([f64; 3], [f64; 3], f64, bool)> = Vec::new();
-        WET.with_borrow_mut(|wet| {
-            let mut seen = hashbrown::HashSet::with_capacity(self.entities.map.len() + 1);
-            let mut check = |id: i32, pos: [f64; 3], vel: [f64; 3], width: f64, height: f64, silent: bool| {
-                seen.insert(id);
-                let now = touches_water(&w, pos, width, height);
-                if let Some(before) = wet.insert(id, now)
-                    && now
-                    && !before
-                    && !silent
-                {
-                    splashes.push((pos, vel, width, id == LOCAL));
-                }
-            };
-            for (&id, e) in &self.entities.map {
-                // Never a splash: passengers, entities with no base tick (their "first tick"
-                // flag never drops) and experience orb (empty effect).
-                if e.vehicle.is_some() || no_splash_kind(&e.kind) {
-                    continue;
-                }
-                // Spectator player: no splash.
-                let silent = e.kind == "player" && self.players.map.get(&e.uuid).is_some_and(|p| p.game_mode == 3);
-                let size = e.size(&self.entities.dims);
-                let (width, height) = (f64::from(size.w), f64::from(size.h));
-                check(id, e.pos, e.velocity, width, height, silent);
-            }
-            if self.positioned {
-                let (pw, ph) = self.player.dimensions();
-                check(LOCAL, self.player.pos, self.player.vel, pw, ph, self.env.game_mode == 3);
-            }
-            wet.retain(|id, _| seen.contains(id));
+        let touches = |pos, width, height| touches_water(&w, pos, width, height);
+        let local = self.positioned.then(|| {
+            let (width, height) = self.player.dimensions();
+            SplashBody { pos: self.player.pos, vel: self.player.vel, width, height, silent: self.env.game_mode == 3 }
         });
+        let splashes = if wet_flag_in_entity_on() {
+            entering_water(&mut self.entities, &self.players, local, &touches)
+        } else {
+            entering_water_by_table(&self.entities, &self.players, local, &touches)
+        };
         for (pos, vel, width, local) in splashes {
             let r = &mut self.world_random;
             // Sound: only for the local player (the server sends it to the others).
@@ -281,6 +269,113 @@ impl crate::App {
             }
         }
     }
+}
+
+/// `RUSTCRAFT_OPT_WET_FLAG_IN_ENTITY=0`: the previous water contact kept in a table by id, rebuilt
+/// with a set of every id seen on each tick (old path), instead of on the entity.
+pub(crate) fn wet_flag_in_entity_on() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_WET_FLAG_IN_ENTITY")
+}
+
+/// Monsters whose client effects `mob_fx` produces (the illusioner's copies included).
+pub(crate) fn has_monster_effects(kind: &str) -> bool {
+    matches!(
+        kind,
+        "blaze" | "breeze" | "enderman" | "endermite" | "evoker" | "illusioner" | "phantom" | "ravager" | "warden"
+    )
+}
+
+/// A splash: position, speed, width of the body, local player (its sound is played here).
+type Splash = ([f64; 3], [f64; 3], f64, bool);
+
+/// What a splash check reads of a body: position, speed, box, silent (spectator).
+#[derive(Clone, Copy)]
+struct SplashBody {
+    pos: [f64; 3],
+    vel: [f64; 3],
+    width: f64,
+    height: f64,
+    silent: bool,
+}
+
+/// Body of entity `e` for the splash check, `None` for those that never splash: passengers,
+/// entities with no base tick (their "first tick" flag never drops) and experience orb (empty effect).
+fn splash_body(e: &Entity, players: &crate::players::PlayerList, dims: &[[f32; 4]]) -> Option<SplashBody> {
+    if e.vehicle.is_some() || no_splash_kind(&e.kind) {
+        return None;
+    }
+    // Spectator player: no splash.
+    let silent = e.kind == "player" && players.map.get(&e.uuid).is_some_and(|p| p.game_mode == 3);
+    let size = e.size(dims);
+    Some(SplashBody { pos: e.pos, vel: e.velocity, width: f64::from(size.w), height: f64::from(size.h), silent })
+}
+
+/// The entities that entered the water since the previous check (table order), then the local
+/// player (`local`, when placed). The previous contact lives on the entity: a new entity starts
+/// without one (no splash on its first check), and one that is not checked forgets it.
+fn entering_water(
+    ents: &mut crate::entities::Entities,
+    players: &crate::players::PlayerList,
+    local: Option<SplashBody>,
+    touches: &impl Fn([f64; 3], f64, f64) -> bool,
+) -> Vec<Splash> {
+    let mut splashes = Vec::new();
+    let mut check = |was_wet: &mut Option<bool>, b: SplashBody, local: bool| {
+        let now = touches(b.pos, b.width, b.height);
+        if let Some(before) = was_wet.replace(now)
+            && now
+            && !before
+            && !b.silent
+        {
+            splashes.push((b.pos, b.vel, b.width, local));
+        }
+    };
+    let crate::entities::Entities { map, dims, local_was_wet, .. } = ents;
+    for e in map.values_mut() {
+        match splash_body(e, players, dims) {
+            Some(b) => check(&mut e.was_wet, b, false),
+            None => e.was_wet = None,
+        }
+    }
+    match local {
+        Some(b) => check(local_was_wet, b, true),
+        None => *local_was_wet = None,
+    }
+    splashes
+}
+
+/// [`entering_water`] with the previous contacts in the thread's table `WET` (old path).
+fn entering_water_by_table(
+    ents: &crate::entities::Entities,
+    players: &crate::players::PlayerList,
+    local: Option<SplashBody>,
+    touches: &impl Fn([f64; 3], f64, f64) -> bool,
+) -> Vec<Splash> {
+    let mut splashes = Vec::new();
+    WET.with_borrow_mut(|wet| {
+        let mut seen = hashbrown::HashSet::with_capacity(ents.map.len() + 1);
+        let mut check = |id: i32, b: SplashBody| {
+            seen.insert(id);
+            let now = touches(b.pos, b.width, b.height);
+            if let Some(before) = wet.insert(id, now)
+                && now
+                && !before
+                && !b.silent
+            {
+                splashes.push((b.pos, b.vel, b.width, id == LOCAL));
+            }
+        };
+        for (&id, e) in &ents.map {
+            if let Some(b) = splash_body(e, players, &ents.dims) {
+                check(id, b);
+            }
+        }
+        if let Some(b) = local {
+            check(LOCAL, b);
+        }
+        wet.retain(|id, _| seen.contains(id));
+    });
+    splashes
 }
 
 /// Sound of an entity client effect (hostile category).
@@ -1558,5 +1653,170 @@ mod tests {
         let (mean, var) = (sum / k as f64, sq / k as f64 - (sum / k as f64).powi(2));
         assert!(mean.abs() < 0.03, "{mean}");
         assert!((var - 0.32).abs() < 0.03, "{var}");
+    }
+}
+
+#[cfg(test)]
+mod splash_state_tests {
+    use super::*;
+    use crate::entities::Entities;
+    use rc_client::EntityEvent;
+
+    /// Water everywhere below y = 64.
+    fn touches(pos: [f64; 3], _width: f64, _height: f64) -> bool {
+        pos[1] < 64.0
+    }
+
+    const KINDS: [&str; 5] = ["zombie", "player", "experience_orb", "cow", "item_frame"];
+
+    fn add(all: &mut Entities, id: i32, kind: i32, y: f64) {
+        let add = rc_proto_v777::entity::AddEntity {
+            id,
+            uuid: 700 + id as u128,
+            kind,
+            pos: [f64::from(id), y, 0.0],
+            velocity: [0.1, -0.2, 0.0],
+            pitch: 0.0,
+            yaw: 0.0,
+            head_yaw: 0.0,
+            data: 0,
+        };
+        all.apply(EntityEvent::Add(Box::new(add)));
+    }
+
+    fn world() -> (Entities, crate::players::PlayerList) {
+        let all = Entities { type_names: KINDS.iter().map(|k| format!("minecraft:{k}")).collect(), ..Default::default() };
+        let mut players = crate::players::PlayerList::default();
+        // Entity 1 is a player in spectator mode: never a splash.
+        let entry = rc_proto_v777::players::InfoEntry {
+            uuid: 701,
+            profile: Some(("Ghost".into(), Vec::new())),
+            game_mode: Some(3),
+            ..Default::default()
+        };
+        players.apply(rc_proto_v777::players::InfoUpdate { actions: 0xff, entries: vec![entry] });
+        (all, players)
+    }
+
+    /// Fixed generator (xorshift 64): a value below `n`.
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+    }
+
+    /// Over 600 ticks of entities crossing the water line, mounting and dismounting, removed and
+    /// spawned (an id spawned again only after a tick without it), and a local player placed or
+    /// not, the state kept on the entity gives the splashes of the old table, in the same order.
+    /// Sabotages verified (failure): the state kept while an entity is not checked; the local
+    /// player's state kept while it is not placed.
+    #[test]
+    fn splash_state_on_the_entity_matches_the_table() {
+        let (mut all, players) = world();
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for id in 0..40 {
+            add(&mut all, id, id % 5, 63.0 + rng.below(3) as f64);
+        }
+        let (mut gone, mut splashes, mut local_splashes) = (Vec::<i32>::new(), 0, 0);
+        for tick in 0..600 {
+            // Spawned again from the previous ticks' removals only, half of them each tick.
+            for id in std::mem::take(&mut gone) {
+                if rng.below(2) == 0 {
+                    add(&mut all, id, rng.below(5) as i32, 63.0 + rng.below(3) as f64);
+                } else {
+                    gone.push(id);
+                }
+            }
+            for _ in 0..8 {
+                let id = rng.below(40) as i32;
+                match rng.below(10) {
+                    0..=5 => {
+                        let y = if rng.below(2) == 0 { 63.5 } else { 64.5 };
+                        if let Some(e) = all.map.get_mut(&id) {
+                            e.pos[1] = y;
+                        }
+                    }
+                    6 => {
+                        if let Some(e) = all.map.get_mut(&id) {
+                            e.vehicle = if e.vehicle.is_some() { None } else { Some(39 - id) };
+                        }
+                    }
+                    7 if all.map.contains_key(&id) && !gone.contains(&id) => {
+                        all.apply(EntityEvent::Remove(vec![id]));
+                        gone.push(id);
+                    }
+                    _ => {}
+                }
+            }
+            let placed = tick % 50 < 40;
+            let y = if tick % 7 < 3 { 63.5 } else { 64.5 };
+            let local = placed.then_some(SplashBody {
+                pos: [0.5, y, 0.5],
+                vel: [0.0, -0.5, 0.0],
+                width: 0.6,
+                height: 1.8,
+                silent: tick % 100 > 90,
+            });
+            let want = entering_water_by_table(&all, &players, local, &touches);
+            let got = entering_water(&mut all, &players, local, &touches);
+            assert_eq!(got, want, "tick {tick}");
+            splashes += got.len();
+            local_splashes += got.iter().filter(|s| s.3).count();
+        }
+        assert!(splashes - local_splashes > 150 && local_splashes > 20, "{splashes} splashes, {local_splashes} of the local player");
+    }
+
+    /// An entity removed and spawned again under the same id before the next check: the game makes
+    /// a new entity, whose first check never splashes. The state on the entity does the same; the
+    /// old table, keyed by id, carried the state of the removed entity over (difference of the old
+    /// path, `RUSTCRAFT_OPT_WET_FLAG_IN_ENTITY=0`).
+    #[test]
+    fn new_entity_under_a_reused_id_does_not_splash_on_its_first_check() {
+        let (mut all, players) = world();
+        add(&mut all, 5, 0, 64.5);
+        assert!(entering_water(&mut all, &players, None, &touches).is_empty());
+        assert!(entering_water_by_table(&all, &players, None, &touches).is_empty());
+        all.apply(EntityEvent::Remove(vec![5]));
+        add(&mut all, 5, 0, 63.5);
+        assert!(entering_water(&mut all, &players, None, &touches).is_empty(), "first check of the new entity");
+        assert_eq!(entering_water_by_table(&all, &players, None, &touches).len(), 1, "old table: state carried over");
+    }
+
+    /// Micro-bench (ignored; `cargo test --release -p rc-app bench_splash_state -- --ignored
+    /// --nocapture`): one tick of splash checks for 1,000 entities, old table against the state on
+    /// the entity (loaded machine).
+    #[test]
+    #[ignore]
+    fn bench_splash_state() {
+        let (mut all, players) = world();
+        for id in 0..1000 {
+            add(&mut all, id, 0, 64.5);
+        }
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            for _ in 0..1000 {
+                std::hint::black_box(entering_water_by_table(&all, &players, None, &touches));
+            }
+            let table = t0.elapsed().as_secs_f64() * 1e3;
+            let t0 = std::time::Instant::now();
+            for _ in 0..1000 {
+                std::hint::black_box(entering_water(&mut all, &players, None, &touches));
+            }
+            let entity = t0.elapsed().as_secs_f64() * 1e3;
+            let table_bytes = crate::debug_sys::allocated_bytes(|| {
+                std::hint::black_box(entering_water_by_table(&all, &players, None, &touches));
+            });
+            let entity_bytes = crate::debug_sys::allocated_bytes(|| {
+                std::hint::black_box(entering_water(&mut all, &players, None, &touches));
+            });
+            eprintln!(
+                "splash checks, 1,000 entities: table {table:.2} µs ({table_bytes} B), on the entity {entity:.2} µs ({entity_bytes} B) per tick (loaded machine)"
+            );
+        }
     }
 }

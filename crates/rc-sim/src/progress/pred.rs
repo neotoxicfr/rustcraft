@@ -783,7 +783,7 @@ impl Server {
     pub(crate) fn w_pos(&self, w: Who<'_>) -> [f64; 3] {
         match w {
             Who::E(e) => self.e_pos(e),
-            Who::Mob(m) => m.pos,
+            Who::Mob(m) => m.pos(),
             Who::Proj(p) => p.pos,
         }
     }
@@ -1057,12 +1057,13 @@ impl Server {
                 None => false,
             },
             "minecraft:team" => {
-                let holder = match w {
-                    Who::E(e) => self.ent_score_name(e),
-                    Who::Mob(m) => crate::nbtio::uuid_text(m.uuid),
-                    Who::Proj(p) => crate::nbtio::uuid_text(p.uuid),
+                // Found by UUID: evaluated for every entity a selector walks, nothing formatted.
+                let team = match w {
+                    Who::E(e) => self.ent_team(e),
+                    Who::Mob(m) => self.cmd.scores.team_of_uuid(m.uuid),
+                    Who::Proj(p) => self.cmd.scores.team_of_uuid(p.uuid),
                 };
-                self.cmd.scores.team_of(&holder).is_some_and(|t| Some(t.name.as_str()) == v.as_str())
+                team.is_some_and(|t| Some(t.name.as_str()) == v.as_str())
             }
             "minecraft:slots" => {
                 let Value::Object(slots) = v else { return true };

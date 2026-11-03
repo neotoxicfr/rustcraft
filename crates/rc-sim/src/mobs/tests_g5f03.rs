@@ -41,7 +41,7 @@ fn spawn(p: &mut Probe, k: Kind, pos: [f64; 3]) -> i32 {
     let mut m = p.s.new_mob(k, pos, 0.0);
     let mut g = super::spawn::Group::default();
     p.s.finalize_spawn(&mut m, super::spawn::Reason::SpawnEgg, &mut g);
-    m.pos = pos;
+    m.set_pos(pos);
     let id = m.id;
     p.s.add_mob(m);
     id
@@ -49,7 +49,7 @@ fn spawn(p: &mut Probe, k: Kind, pos: [f64; 3]) -> i32 {
 
 fn with<R>(p: &mut Probe, id: i32, f: impl FnOnce(&mut Mob) -> R) -> R {
     let i = p.s.mob_index(id).expect("mob");
-    f(p.s.mobs.list[i].as_mut().expect("mob"))
+    f(p.s.mobs.list.get_mut(i).expect("mob"))
 }
 
 fn hold(p: &mut Probe, id: &str, count: i32) -> usize {
@@ -63,7 +63,7 @@ fn count_of(p: &Probe, slot: usize) -> i32 {
 }
 
 fn mobs_of(p: &Probe, k: Kind) -> Vec<i32> {
-    p.s.mobs.list.iter().flatten().filter(|m| m.kind == k && !m.removed).map(|m| m.id).collect()
+    p.s.mobs.list.iter().filter(|m| m.kind == k && !m.removed).map(|m| m.id).collect()
 }
 
 // ---------- Without a world ----------
@@ -178,7 +178,7 @@ fn egg_on_the_same_species() {
     let cows = mobs_of(&p, Kind::Cow);
     assert_eq!(cows.len(), 2);
     let baby = *cows.iter().find(|&&i| i != cow).unwrap();
-    let (age, pos) = with(&mut p, baby, |m| (m.age, m.pos));
+    let (age, pos) = with(&mut p, baby, |m| (m.age, m.pos()));
     assert_eq!(age, -24000);
     assert_eq!(pos, [216.5, -59.0, 205.5]);
     assert_eq!(count_of(&p, slot), 1);
@@ -240,11 +240,11 @@ fn wolf_collar_and_armor() {
     assert_eq!(with(&mut p, wolf, |m| m.equipment[super::mounts::BODY].as_ref().map(|s| s.id.clone())).as_deref(), Some("minecraft:wolf_armor"));
     assert_eq!(count_of(&p, slot), 0);
     let i = p.s.mob_index(wolf).unwrap();
-    let mut m = p.s.mobs.list[i].take().unwrap();
+    let mut m = p.s.mobs.list.take(i).unwrap();
     p.s.mob_hurt(&mut m, "minecraft:cactus", 4.5, None, None);
     let health = m.health;
     let dmg = m.equipment[super::mounts::BODY].as_ref().map(|s| p.s.life.items.damage(s));
-    p.s.mobs.list[i] = Some(m);
+    p.s.mobs.list.put(i, m);
     assert_eq!(health, 40.0, "health moved under the armour");
     assert_eq!(dmg, Some(5), "wear = damage rounded up");
     cleanup(p, dir);
@@ -260,9 +260,9 @@ fn birth_inheritance() {
     with(&mut p, a, |m| m.wool = 14);
     with(&mut p, b, |m| m.wool = 4);
     let i = p.s.mob_index(a).unwrap();
-    let mut m = p.s.mobs.list[i].take().unwrap();
+    let mut m = p.s.mobs.list.take(i).unwrap();
     p.s.breed(&mut m, b);
-    p.s.mobs.list[i] = Some(m);
+    p.s.mobs.list.put(i, m);
     let lamb = mobs_of(&p, Kind::Sheep).into_iter().find(|&x| x != a && x != b).expect("lamb");
     assert_eq!(with(&mut p, lamb, |m| m.wool), 1, "orange expected");
     let c1 = spawn(&mut p, Kind::Cow, [219.5, -59.0, 205.5]);
@@ -271,9 +271,9 @@ fn birth_inheritance() {
     let other = if classic == 0 { 1 } else { 0 };
     with(&mut p, c1, |m| m.sound_variant = other);
     let i = p.s.mob_index(c1).unwrap();
-    let mut m = p.s.mobs.list[i].take().unwrap();
+    let mut m = p.s.mobs.list.take(i).unwrap();
     p.s.breed(&mut m, c2);
-    p.s.mobs.list[i] = Some(m);
+    p.s.mobs.list.put(i, m);
     let calf = mobs_of(&p, Kind::Cow).into_iter().find(|&x| x != c1 && x != c2).expect("calf");
     assert_eq!(with(&mut p, calf, |m| m.sound_variant), classic);
     cleanup(p, dir);
@@ -285,7 +285,7 @@ fn locked_lamb_does_not_grow() {
     let Some((mut p, dir)) = probe("g5f03-lamb") else { return };
     let s = spawn(&mut p, Kind::Sheep, [216.5, -59.0, 205.5]);
     let i = p.s.mob_index(s).unwrap();
-    let mut m = p.s.mobs.list[i].take().unwrap();
+    let mut m = p.s.mobs.list.take(i).unwrap();
     m.age = -24000;
     m.mount.age_locked = true;
     p.s.mob_ate(&mut m);
@@ -293,7 +293,7 @@ fn locked_lamb_does_not_grow() {
     m.mount.age_locked = false;
     p.s.mob_ate(&mut m);
     assert_eq!(m.age, -24000 + 1200);
-    p.s.mobs.list[i] = Some(m);
+    p.s.mobs.list.put(i, m);
     let _ = p.take_events();
     cleanup(p, dir);
 }
@@ -304,7 +304,7 @@ fn wolf_armor_break() {
     let Some((mut p, dir)) = probe("g5f03-break") else { return };
     let wolf = spawn(&mut p, Kind::Wolf, [214.5, -59.0, 205.5]);
     let i = p.s.mob_index(wolf).unwrap();
-    let mut m = p.s.mobs.list[i].take().unwrap();
+    let mut m = p.s.mobs.list.take(i).unwrap();
     let mut armor = Stack { id: "minecraft:wolf_armor".into(), count: 1, components: None };
     let max = p.s.life.items.max_damage(&armor);
     crate::lootfn::set_damage(&mut armor, max - 1);
@@ -314,7 +314,7 @@ fn wolf_armor_break() {
     p.s.mob_hurt(&mut m, "minecraft:cactus", 2.0, None, None);
     assert!(m.equipment[super::mounts::BODY].is_none(), "armour not broken");
     let id = m.id;
-    p.s.mobs.list[i] = Some(m);
+    p.s.mobs.list.put(i, m);
     let ev = p.take_events();
     let broke = ev.iter().position(|e| matches!(e, Event::Entity(EntityEvent::Event { id: x, event: 65 }) if *x == id));
     let empty = ev.iter().position(|e| matches!(e, Event::Entity(EntityEvent::Equipment { id: x, .. }) if *x == id));

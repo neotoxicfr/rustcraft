@@ -356,7 +356,9 @@ pub struct Mob {
     pub kind: Kind,
     pub rng: JRand,
     // Entity.
-    pub pos: [f64; 3],
+    /// Position of the feet (bottom centre of the box): read with `pos()`, written only with
+    /// `set_pos` / `set_pos_axis` / `add_pos_axis`.
+    pos: [f64; 3],
     pub old: [f64; 3],
     pub vel: [f64; 3],
     pub yaw: f32,
@@ -534,6 +536,42 @@ pub struct Mob {
 }
 
 impl Mob {
+    /// Position of the feet.
+    #[inline]
+    pub fn pos(&self) -> [f64; 3] {
+        self.pos
+    }
+
+    /// The only write of the position (the forms below go through it): a spatial index of the
+    /// mobs can follow every move, teleport and placement from here.
+    #[inline]
+    pub fn set_pos(&mut self, p: [f64; 3]) {
+        self.pos = p;
+    }
+
+    /// Position moved by `d` (each coordinate rounded as `pos[i] += d[i]`).
+    #[inline]
+    pub fn add_pos(&mut self, d: [f64; 3]) {
+        let p = self.pos;
+        self.set_pos([p[0] + d[0], p[1] + d[1], p[2] + d[2]]);
+    }
+
+    /// One coordinate (0 = x, 1 = y, 2 = z) set to `v`.
+    #[inline]
+    pub fn set_pos_axis(&mut self, axis: usize, v: f64) {
+        let mut p = self.pos;
+        p[axis] = v;
+        self.set_pos(p);
+    }
+
+    /// One coordinate moved by `d`.
+    #[inline]
+    pub fn add_pos_axis(&mut self, axis: usize, d: f64) {
+        let mut p = self.pos;
+        p[axis] += d;
+        self.set_pos(p);
+    }
+
     pub fn new(kind: Kind, id: i32, uuid: u128, pos: [f64; 3], yaw: f32, rng: JRand) -> Mob {
         let i = kind.info();
         let attrs = Attrs {
@@ -1223,7 +1261,7 @@ impl Mob {
     /// Fields read from a world entity (`entities/`).
     pub fn load(&mut self, e: &Nbt) {
         if let Some(p) = nbtio::f64s::<3>(e.get("Pos")) {
-            self.pos = p;
+            self.set_pos(p);
             self.old = p;
         }
         if let Some(v) = nbtio::motion(e.get("Motion")) {

@@ -1182,12 +1182,11 @@ impl Server {
                     .mobs
                     .list
                     .iter()
-                    .flatten()
                     .filter(|o| o.id != m.id && o.alive() && o.touches(&area))
-                    .map(|o| (dist2(m.pos, o.pos), Ent::Mob(o.id)))
+                    .map(|o| (dist2(m.pos(), o.pos()), Ent::Mob(o.id)))
                     .collect();
                 if self.ent_alive(Ent::Player) && self.player_aabb().intersects(&area) {
-                    list.push((dist2(m.pos, self.pos), Ent::Player));
+                    list.push((dist2(m.pos(), self.pos), Ent::Player));
                 }
                 list.sort_by(|a, c| a.0.partial_cmp(&c.0).unwrap_or(std::cmp::Ordering::Equal));
                 let ents: Vec<Ent> = list.into_iter().map(|x| x.1).collect();
@@ -1198,7 +1197,7 @@ impl Server {
             }
             Sn::Players => {
                 let r = m.follow_range();
-                let close = self.game_mode != 3 && self.ent_alive(Ent::Player) && dist2(m.pos, self.pos) < r * r;
+                let close = self.game_mode != 3 && self.ent_alive(Ent::Player) && dist2(m.pos(), self.pos) < r * r;
                 let players: Vec<Ent> = if close { vec![Ent::Player] } else { Vec::new() };
                 b.mem.players.set_opt((!players.is_empty()).then(|| players.clone()));
                 let visible: Vec<Ent> = players.into_iter().filter(|&e| self.bz_brain_targetable(m, b, e)).collect();
@@ -1258,13 +1257,13 @@ impl Server {
             }
             Sn::FrogAttackables => {
                 let unreachable = b.mem.unreachable.v.clone().unwrap_or_default();
-                let me = m.pos;
+                let me = m.pos();
                 let cands: Vec<Ent> = b.mem.visible.v.as_ref().map(|v| v.list.clone()).unwrap_or_default();
                 let mut found = None;
                 for e in cands {
                     let ok = match e {
                         Ent::Mob(id) => self.mob_ref(id).is_some_and(|o| {
-                            super::frog::can_eat(self, o) && !unreachable.contains(&o.uuid) && dist2(o.pos, me) < 100.0
+                            super::frog::can_eat(self, o) && !unreachable.contains(&o.uuid) && dist2(o.pos(), me) < 100.0
                         }),
                         Ent::Player => false,
                     };
@@ -1277,7 +1276,7 @@ impl Server {
             }
             Sn::AxolotlAttackables => {
                 let hunting = b.mem.hunting_cd.has();
-                let me = m.pos;
+                let me = m.pos();
                 let cands: Vec<Ent> = b.mem.visible.v.as_ref().map(|v| v.list.clone()).unwrap_or_default();
                 let mut found = None;
                 for e in cands {
@@ -1332,7 +1331,7 @@ impl Server {
             Bk::X(x) => self.x_trigger(m, b, x, t),
             Bk::LookSometimes { range, players, ticker, lo, hi } => {
                 let max = f64::from(*range * *range);
-                let me = m.pos;
+                let me = m.pos();
                 let pl = *players;
                 let f = move |s: &Server, e: Ent| {
                     (!pl || e == Ent::Player) && s.ent_pos(e).is_some_and(|p| dist2(p, me) <= max)
@@ -1354,7 +1353,7 @@ impl Server {
             }
             Bk::SetLook { range } => {
                 let max = f64::from(*range * *range);
-                let me = m.pos;
+                let me = m.pos();
                 let passengers = m.mount.passengers.clone();
                 let f = move |s: &Server, e: Ent| {
                     e == Ent::Player && s.ent_pos(e).is_some_and(|p| dist2(p, me) <= max) && !passengers.contains(&e)
@@ -1368,8 +1367,8 @@ impl Server {
                     return false;
                 }
                 let Some(a) = b.mem.adult.get() else { return false };
-                let Some(p) = self.mob_ref(a).map(|o| o.pos) else { return false };
-                let d = dist2(m.pos, p);
+                let Some(p) = self.mob_ref(a).map(|o| o.pos()) else { return false };
+                let d = dist2(m.pos(), p);
                 let close = *lo - 1;
                 let (lo, hi) = (f64::from(*lo), f64::from(*hi + 1));
                 if d < hi * hi && d >= lo * lo {
@@ -1602,7 +1601,7 @@ impl Server {
                 let pitch = (m.rng.next_float() * *range + *min_pitch).clamp(-90.0, 90.0);
                 let rot = super::super::mth::wrap(m.yaw + 2.0 * m.rng.next_float() * *yaw - *yaw);
                 let dir = direction(pitch, rot);
-                let eye = [m.pos[0], m.eye_y(), m.pos[2]];
+                let eye = [m.pos()[0], m.eye_y(), m.pos()[2]];
                 b.mem.look.set(Track::vec([eye[0] + dir[0], eye[1] + dir[1], eye[2] + dir[2]]));
                 let v = *lo + m.rng.next_int_bound(*hi - *lo + 1);
                 b.mem.gaze_cd.set(v);
@@ -1754,8 +1753,8 @@ impl Server {
             Bk::MakeLove { speed, close, at, .. } => {
                 let Some(pid) = b.mem.breed.get() else { return };
                 self.bz_lock_gaze(m, b, pid, *speed, *close);
-                let pp = self.mob_ref(pid).map(|p| p.pos);
-                if pp.is_some_and(|pp| dist2(m.pos, pp) < 9.0) && t >= *at {
+                let pp = self.mob_ref(pid).map(|p| p.pos());
+                if pp.is_some_and(|pp| dist2(m.pos(), pp) < 9.0) && t >= *at {
                     super::spawn_child(self, m, pid);
                     b.mem.breed.erase();
                     self.bz_with_brain(pid, |_, ob| ob.mem.breed.erase());
@@ -1774,8 +1773,8 @@ impl Server {
                         }
                     }
                 };
-                let pp = self.ent_pos(player).unwrap_or(m.pos);
-                if dist2(m.pos, pp) < c * c {
+                let pp = self.ent_pos(player).unwrap_or_else(|| m.pos());
+                if dist2(m.pos(), pp) < c * c {
                     b.mem.walk.erase();
                 } else {
                     let s = Self::bz_speed_of(m, *speed);
@@ -1979,11 +1978,11 @@ impl Server {
             target = match fallback {
                 None => self.random_swimmable_pos(m, h, v),
                 Some(f) => {
-                    let n = crate::mobs::mth::normalize([f[0] - m.pos[0], f[1] - m.pos[1], f[2] - m.pos[2]]);
+                    let n = crate::mobs::mth::normalize([f[0] - m.pos()[0], f[1] - m.pos()[1], f[2] - m.pos()[2]]);
                     Some([
-                        m.pos[0] + n[0] * f64::from(h),
-                        m.pos[1] + n[1] * f64::from(v),
-                        m.pos[2] + n[2] * f64::from(h),
+                        m.pos()[0] + n[0] * f64::from(h),
+                        m.pos()[1] + n[1] * f64::from(v),
+                        m.pos()[2] + n[2] * f64::from(h),
                     ])
                 }
             };
@@ -2026,7 +2025,7 @@ impl Server {
     /// Access to the brain of another mob of the family.
     pub(crate) fn bz_with_brain(&mut self, id: i32, f: impl FnOnce(&mut Mob, &mut Brain)) {
         if let Some(i) = self.mob_index(id)
-            && let Some(o) = self.mobs.list[i].as_mut()
+            && let Some(o) = self.mobs.list.get_mut(i)
             && let Some(mut ob) = o.bm.brain.take()
         {
             f(o, &mut ob);
@@ -2108,7 +2107,7 @@ impl Server {
             *next = t + 22;
             return true;
         }
-        let me = m.pos;
+        let me = m.pos();
         let mut found: Option<[i32; 3]> = None;
         let _ = super::manhattan_find(o, range, range, |p| {
             if (p[0] == o[0] && p[2] == o[2]) || self.bname(p) != "minecraft:water" || !self.mob_source_water(p) {

@@ -170,6 +170,18 @@ pub(crate) struct MixOpt {
     /// `AUDIO_MIXER_VOICE_IDS`: a voice is found by id in a compact list of ids (8 bytes each)
     /// instead of walking the voices themselves (~150 bytes each) for every command.
     pub voice_ids: bool,
+    /// `MIXER_AVX2`: with `simd`, buffer voices in groups of 8 frames compiled for AVX2 when the
+    /// processor has it (detected at run time), same operations per lane, no FMA.
+    pub avx2: bool,
+    /// `MIXER_PACKED_READS`: with `simd`, the points of a mono or stereo buffer gathered as rows of
+    /// 16-bit samples, each row converted to `f32` at once, instead of one conversion per point.
+    pub packed_reads: bool,
+    /// `MIXER_FIXED_POSITIONS`: with `simd`, lane positions of a group computed in 16-bit fixed
+    /// point (exact, like the muted voices) instead of f64 with a conversion per lane.
+    pub fixed_positions: bool,
+    /// `STREAM_SLICE_READ`: a stream whose ring already holds every frame of the block is read
+    /// from one slice of the ring instead of frame by frame.
+    pub stream_slice: bool,
 }
 
 impl MixOpt {
@@ -180,6 +192,10 @@ impl MixOpt {
             weights: crate::switch("MIXWEIGHTS", true),
             simd: crate::switch("MIXSIMD", true),
             voice_ids: crate::switch("AUDIO_MIXER_VOICE_IDS", true),
+            avx2: crate::switch("MIXER_AVX2", true),
+            packed_reads: crate::switch("MIXER_PACKED_READS", true),
+            fixed_positions: crate::switch("MIXER_FIXED_POSITIONS", true),
+            stream_slice: crate::switch("STREAM_SLICE_READ", true),
         })
     }
 }
@@ -324,17 +340,7 @@ impl Mixer {
                 v.gr = tr;
                 v.fresh = false;
             }
-            if opt.mute && tl == 0.0 && tr == 0.0 && v.gl == 0.0 && v.gr == 0.0 {
-                // Zero contribution over the whole block (x·0 added to a sum does not change it):
-                // position, looping, stream window and end advanced as in rendering.
-                advance(v, frames);
-            } else if opt.simd && matches!(v.src, Source::Buffer(_)) {
-                render_simd(v, out, frames, tl, tr);
-            } else if opt.weights {
-                render_fast(v, out, frames, tl, tr);
-            } else {
-                render(v, out, frames, tl, tr);
-            }
+            mix_voice(v, out, frames, tl, tr, opt);
             if let Source::Stream(s) = &v.src {
                 s.wake_if_drained();
             }
@@ -480,6 +486,30 @@ pub fn attenuation(d: f32, max: f32) -> f32 {
         return 0.0;
     }
     (1.0 - d / max).clamp(0.0, 1.0)
+}
+
+/// Mixes one voice into the block (or only advances it when muted) with the enabled paths; every
+/// path gives the same output bit for bit.
+fn mix_voice(v: &mut Voice, out: &mut [f32], frames: usize, tl: f32, tr: f32, opt: MixOpt) {
+    if opt.mute && tl == 0.0 && tr == 0.0 && v.gl == 0.0 && v.gr == 0.0 {
+        // Zero contribution over the whole block (x·0 added to a sum does not change it):
+        // position, looping, stream window and end advanced as in rendering.
+        if !(opt.stream_slice && advance_stream_slice(v, frames)) {
+            advance(v, frames);
+        }
+        return;
+    }
+    if opt.simd && matches!(v.src, Source::Buffer(_)) {
+        return render_simd(v, out, frames, tl, tr, opt);
+    }
+    if opt.stream_slice && render_stream_slice(v, out, frames, tl, tr) {
+        return;
+    }
+    if opt.weights {
+        render_fast(v, out, frames, tl, tr);
+    } else {
+        render(v, out, frames, tl, tr);
+    }
 }
 
 fn render(v: &mut Voice, out: &mut [f32], frames: usize, tl: f32, tr: f32) {
@@ -692,11 +722,7 @@ fn advance(v: &mut Voice, frames: usize) {
             let n = pcm.data.len() / v.channels;
             let looping = v.p.looping;
             const ONE: f64 = 65536.0;
-            let fixed = |x: f64| {
-                let q = (x * ONE) as i64;
-                (q as f64 / ONE == x && q < 1 << 52).then_some(q)
-            };
-            if let (Some(mut p), Some(s), Ok(nn)) = (fixed(v.pos), fixed(v.step), i64::try_from(n)) {
+            if let (Some(mut p), Some(s), Ok(nn)) = (to_fixed16(v.pos), to_fixed16(v.step), i64::try_from(n)) {
                 let nn = nn * 65536;
                 let mut left = frames as i64;
                 while left > 0 {
@@ -793,16 +819,9 @@ fn render_fast(v: &mut Voice, out: &mut [f32], frames: usize, tl: f32, tr: f32) 
         for o in out.as_chunks_mut::<2>().0.iter_mut().take(frames) {
             gl += dl;
             gr += dr;
-            let w = &v.win;
-            let k = weights(f as f32);
-            let l = dot4(k, w[0][0], w[1][0], w[2][0], w[3][0]);
-            if stereo {
-                o[0] += l * gl;
-                o[1] += dot4(k, w[0][1], w[1][1], w[2][1], w[3][1]) * gr;
-            } else {
-                o[0] += l * gl;
-                o[1] += l * gr;
-            }
+            let (l, r) = stream_sample(&v.win, f, stereo);
+            o[0] += l * gl;
+            o[1] += r * gr;
             f += v.step;
             if !stream_step(v, &mut f) && v.done {
                 break;
@@ -814,10 +833,332 @@ fn render_fast(v: &mut Voice, out: &mut [f32], frames: usize, tl: f32, tr: f32) 
     v.gr = tr;
 }
 
-/// Buffer in groups of 4 frames (`MIXSIMD`): f64 positions in order, weights and
-/// reads in 4-lane arrays (vectorised by the compiler, no FMA), gains ramped
-/// frame by frame like [`render`]. Group at the buffer edge: frame by frame.
-fn render_simd(v: &mut Voice, out: &mut [f32], frames: usize, tl: f32, tr: f32) {
+/// Stream window interpolated at fraction `f`: left and right samples (mono: the same twice).
+#[inline]
+fn stream_sample(win: &[[f32; 2]; 4], f: f64, stereo: bool) -> (f32, f32) {
+    let k = weights(f as f32);
+    let l = dot4(k, win[0][0], win[1][0], win[2][0], win[3][0]);
+    let r = if stereo { dot4(k, win[0][1], win[1][1], win[2][1], win[3][1]) } else { l };
+    (l, r)
+}
+
+/// Source frames a stream reads over `frames` output frames from fraction `pos`, plus one. The
+/// fraction and the step are multiples of 2⁻¹⁶ (see [`step_of`]), so the frame loop's sums are
+/// exact and it reads exactly `floor(pos + frames × step)` frames when it is not underfed.
+fn stream_frames_needed(pos: f64, step: f64, frames: usize) -> usize {
+    (pos + frames as f64 * step) as usize + 1
+}
+
+/// Slice of the ring holding every frame a primed mono or stereo stream reads over the block;
+/// `None` when the ring holds less (or the stream is not primed, or has more channels: [`pull`]
+/// reads those one sample per frame): the frame-by-frame paths then run as before.
+fn block_slice(
+    ring: &mut rtrb::Consumer<i16>,
+    primed: bool,
+    channels: usize,
+    pos: f64,
+    step: f64,
+    frames: usize,
+) -> Option<rtrb::chunks::ReadChunk<'_, i16>> {
+    if !primed || channels > 2 {
+        return None;
+    }
+    ring.read_chunk(stream_frames_needed(pos, step, frames) * channels).ok()
+}
+
+/// Stream frames taken in order from a slice of the ring (its two halves when it wraps).
+struct SliceFrames<'a> {
+    samples: std::iter::Chain<std::slice::Iter<'a, i16>, std::slice::Iter<'a, i16>>,
+    stereo: bool,
+    /// Samples taken so far, committed back to the ring at the end of the block.
+    taken: usize,
+}
+
+impl<'a> SliceFrames<'a> {
+    fn new(chunk: &'a rtrb::chunks::ReadChunk<'_, i16>, stereo: bool) -> Self {
+        let (first, second) = chunk.as_slices();
+        SliceFrames { samples: first.iter().chain(second), stereo, taken: 0 }
+    }
+
+    /// Next frame, converted like [`pull`].
+    #[inline]
+    fn next_frame(&mut self) -> Option<[f32; 2]> {
+        let a = f32::from(*self.samples.next()?) * I16;
+        let b = if self.stereo { f32::from(*self.samples.next()?) * I16 } else { a };
+        self.taken += 1 + usize::from(self.stereo);
+        Some([a, b])
+    }
+
+    /// Moves the window past every whole source frame in `f`, like [`stream_step`]. The slice
+    /// holds the whole block, so it never runs out; if it did, the window would be held as when
+    /// underfed.
+    #[inline]
+    fn slide(&mut self, win: &mut [[f32; 2]; 4], f: &mut f64) {
+        while *f >= 1.0 {
+            *f -= 1.0;
+            let Some(next) = self.next_frame() else {
+                *f = 0.0;
+                return;
+            };
+            *win = [win[1], win[2], win[3], next];
+        }
+    }
+}
+
+/// Stream voice read from one slice of its ring (`STREAM_SLICE_READ`). When the ring already holds
+/// every frame of the block, no frame-by-frame read could fail, so this reads exactly the samples
+/// [`render_fast`] reads and gives the same output, with one exchange of ring positions with the
+/// decoding thread per block instead of one or two per sample. `false`: nothing done, see
+/// [`block_slice`].
+fn render_stream_slice(v: &mut Voice, out: &mut [f32], frames: usize, tl: f32, tr: f32) -> bool {
+    let stereo = v.channels == 2;
+    let Source::Stream(s) = &mut v.src else { return false };
+    let Some(chunk) = block_slice(&mut s.ring, v.primed, v.channels, v.pos, v.step, frames) else { return false };
+    let mut source = SliceFrames::new(&chunk, stereo);
+    let inv = 1.0 / frames as f32;
+    let (dl, dr) = ((tl - v.gl) * inv, (tr - v.gr) * inv);
+    let (mut gl, mut gr) = (v.gl, v.gr);
+    let mut f = v.pos;
+    for o in out.as_chunks_mut::<2>().0.iter_mut().take(frames) {
+        gl += dl;
+        gr += dr;
+        let (l, r) = stream_sample(&v.win, f, stereo);
+        o[0] += l * gl;
+        o[1] += r * gr;
+        f += v.step;
+        source.slide(&mut v.win, &mut f);
+    }
+    let taken = source.taken;
+    chunk.commit(taken);
+    v.pos = f;
+    v.gl = tl;
+    v.gr = tr;
+    true
+}
+
+/// Muted stream advanced from one slice of its ring (`STREAM_SLICE_READ`): the reads of the
+/// frame loop of [`advance`], from the slice. `false`: nothing done, see [`block_slice`].
+fn advance_stream_slice(v: &mut Voice, frames: usize) -> bool {
+    let Source::Stream(s) = &mut v.src else { return false };
+    let Some(chunk) = block_slice(&mut s.ring, v.primed, v.channels, v.pos, v.step, frames) else { return false };
+    let mut source = SliceFrames::new(&chunk, v.channels == 2);
+    let mut f = v.pos;
+    for _ in 0..frames {
+        f += v.step;
+        source.slide(&mut v.win, &mut f);
+    }
+    let taken = source.taken;
+    chunk.commit(taken);
+    v.pos = f;
+    true
+}
+
+/// Buffer in groups of frames (`MIXSIMD`): 8 frames compiled for AVX2 when `MIXER_AVX2` is on and
+/// the processor has it, 4 frames otherwise. Same output bit for bit.
+fn render_simd(v: &mut Voice, out: &mut [f32], frames: usize, tl: f32, tr: f32, opt: MixOpt) {
+    let ways = GroupWays { packed_reads: opt.packed_reads, fixed_positions: opt.fixed_positions };
+    if opt.avx2 {
+        render_buffer_avx2(v, out, frames, tl, tr, ways);
+    } else {
+        render_buffer_groups::<4>(v, out, frames, tl, tr, ways);
+    }
+}
+
+/// How a group of frames finds and reads its points (each way gives the same output).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GroupWays {
+    /// `MIXER_PACKED_READS`: mono and stereo points gathered as 16-bit rows, then converted a
+    /// whole row at a time ([`row_samples`]).
+    packed_reads: bool,
+    /// `MIXER_FIXED_POSITIONS`: lane positions in 16-bit fixed point ([`fixed_lanes`]).
+    fixed_positions: bool,
+}
+
+/// [`render_buffer_groups`] with 8 lanes compiled for AVX2 (one 256-bit register per row of
+/// weights or samples); 4 lanes when the processor lacks AVX2.
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code)]
+fn render_buffer_avx2(v: &mut Voice, out: &mut [f32], frames: usize, tl: f32, tr: f32, ways: GroupWays) {
+    #[target_feature(enable = "avx2")]
+    fn groups_of_8(v: &mut Voice, out: &mut [f32], frames: usize, tl: f32, tr: f32, ways: GroupWays) {
+        render_buffer_groups::<8>(v, out, frames, tl, tr, ways);
+    }
+    // The switch says nothing about the processor: the detection (cached by the standard library,
+    // one atomic read) is the only guard of the call below.
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return render_buffer_groups::<4>(v, out, frames, tl, tr, ways);
+    }
+    // SAFETY: AVX2 has just been detected on this processor.
+    unsafe { groups_of_8(v, out, frames, tl, tr, ways) }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn render_buffer_avx2(v: &mut Voice, out: &mut [f32], frames: usize, tl: f32, tr: f32, ways: GroupWays) {
+    render_buffer_groups::<4>(v, out, frames, tl, tr, ways);
+}
+
+/// Frame index and fraction of the `LANES` frames of a group starting at `pos`, positions added
+/// one step at a time like the frame loop; and the position after the group.
+#[inline(always)]
+fn float_lanes<const LANES: usize>(pos: f64, step: f64) -> ([usize; LANES], [f32; LANES], f64) {
+    let mut p = [pos; LANES];
+    for j in 1..LANES {
+        p[j] = p[j - 1] + step;
+    }
+    let mut idx = [0usize; LANES];
+    let mut frac = [0.0f32; LANES];
+    for j in 0..LANES {
+        idx[j] = p[j] as usize;
+        frac[j] = (p[j] - idx[j] as f64) as f32;
+    }
+    (idx, frac, p[LANES - 1] + step)
+}
+
+/// [`float_lanes`] in 16-bit fixed point (`MIXER_FIXED_POSITIONS`), for a position and a step
+/// given as multiples of 2⁻¹⁶ ([`to_fixed16`]). Same values: every f64 sum of the frame loop is
+/// exact for such numbers, and the 16 fraction bits fit an f32 exactly. Integer additions, shifts
+/// and masks pack into vector registers, where the f64 to integer conversions of [`float_lanes`]
+/// go one lane at a time.
+#[inline(always)]
+fn fixed_lanes<const LANES: usize>(pos: i64, step: i64) -> ([usize; LANES], [f32; LANES], i64) {
+    let mut idx = [0usize; LANES];
+    let mut frac = [0.0f32; LANES];
+    for j in 0..LANES {
+        let q = pos + j as i64 * step;
+        idx[j] = (q >> 16) as usize;
+        frac[j] = (q & 0xFFFF) as i32 as f32 * (1.0 / 65_536.0);
+    }
+    (idx, frac, pos + LANES as i64 * step)
+}
+
+/// `x` in 16-bit fixed point if it is an exact multiple of 2⁻¹⁶ below 2³⁶ (positions and steps
+/// always are: [`step_of`] rounds the step, the position starts at 0 and only adds steps or wraps).
+fn to_fixed16(x: f64) -> Option<i64> {
+    let q = (x * 65_536.0) as i64;
+    (q as f64 / 65_536.0 == x && q < 1 << 52).then_some(q)
+}
+
+/// Cubic weights of every lane at fractions `frac`, row `t` = weight of point `t` (operations of
+/// [`weights`]).
+#[inline(always)]
+fn lane_weights<const LANES: usize>(frac: &[f32; LANES]) -> [[f32; LANES]; 4] {
+    let mut w = [[0.0f32; LANES]; 4];
+    for j in 0..LANES {
+        let f = frac[j];
+        let (fm1, fp1, fm2) = (f - 1.0, f + 1.0, f - 2.0);
+        w[0][j] = -f * fm1 * fm2 / 6.0;
+        w[1][j] = fp1 * fm1 * fm2 / 2.0;
+        w[2][j] = fp1 * f * fm2 / 2.0;
+        w[3][j] = fp1 * f * fm1 / 6.0;
+    }
+    w
+}
+
+/// Channel `c` of every lane interpolated and scaled to ±1 (operations of [`dot4`]), the 4
+/// points read straight from the buffer: every lane is away from the buffer edges.
+#[inline(always)]
+fn lane_samples<const LANES: usize>(
+    data: &[i16],
+    ch: usize,
+    c: usize,
+    idx: &[usize; LANES],
+    w: &[[f32; LANES]; 4],
+) -> [f32; LANES] {
+    let mut x = [[0.0f32; LANES]; 4];
+    for j in 0..LANES {
+        let b = (idx[j] - 1) * ch + c;
+        for t in 0..4 {
+            x[t][j] = f32::from(data[b + t * ch]);
+        }
+    }
+    let mut s = [0.0f32; LANES];
+    for j in 0..LANES {
+        s[j] = (w[0][j] * x[0][j] + w[1][j] * x[1][j] - w[2][j] * x[2][j] + w[3][j] * x[3][j]) * I16;
+    }
+    s
+}
+
+/// Mono points of every lane as 16-bit rows (`MIXER_PACKED_READS`), row `t` = point `t` of each
+/// lane: a row is gathered into one vector register before a single conversion.
+#[inline(always)]
+fn mono_rows<const LANES: usize>(data: &[i16], idx: &[usize; LANES]) -> [[i16; LANES]; 4] {
+    let mut x = [[0i16; LANES]; 4];
+    for t in 0..4 {
+        for j in 0..LANES {
+            x[t][j] = data[idx[j] - 1 + t];
+        }
+    }
+    x
+}
+
+/// Stereo points of every lane as 16-bit rows (`MIXER_PACKED_READS`), `[left, right]`, rows as
+/// in [`mono_rows`].
+#[inline(always)]
+fn stereo_rows<const LANES: usize>(data: &[i16], idx: &[usize; LANES]) -> [[[i16; LANES]; 4]; 2] {
+    let mut x = [[[0i16; LANES]; 4]; 2];
+    for t in 0..4 {
+        for j in 0..LANES {
+            x[0][t][j] = data[2 * (idx[j] - 1 + t)];
+            x[1][t][j] = data[2 * (idx[j] - 1 + t) + 1];
+        }
+    }
+    x
+}
+
+/// Rows of points converted to `f32` a whole row at a time (one packed conversion instead of one
+/// per point; exact either way), then interpolated and scaled like [`lane_samples`].
+#[inline(always)]
+fn row_samples<const LANES: usize>(points: &[[i16; LANES]; 4], w: &[[f32; LANES]; 4]) -> [f32; LANES] {
+    let mut x = [[0.0f32; LANES]; 4];
+    for t in 0..4 {
+        for j in 0..LANES {
+            x[t][j] = f32::from(points[t][j]);
+        }
+    }
+    let mut s = [0.0f32; LANES];
+    for j in 0..LANES {
+        s[j] = (w[0][j] * x[0][j] + w[1][j] * x[1][j] - w[2][j] * x[2][j] + w[3][j] * x[3][j]) * I16;
+    }
+    s
+}
+
+/// Left and right samples of every lane (mono: the same twice). `packed`: mono and stereo points
+/// gathered as rows ([`row_samples`]); other channel counts, and `packed` off, point by point
+/// ([`lane_samples`]).
+#[inline(always)]
+fn lane_pair<const LANES: usize>(
+    data: &[i16],
+    ch: usize,
+    idx: &[usize; LANES],
+    w: &[[f32; LANES]; 4],
+    packed: bool,
+) -> ([f32; LANES], [f32; LANES]) {
+    if packed && ch == 1 {
+        let s = row_samples(&mono_rows(data, idx), w);
+        return (s, s);
+    }
+    if packed && ch == 2 {
+        let [left, right] = stereo_rows(data, idx);
+        return (row_samples(&left, w), row_samples(&right, w));
+    }
+    let sl = lane_samples(data, ch, 0, idx, w);
+    let sr = if ch == 2 { lane_samples(data, ch, 1, idx, w) } else { sl };
+    (sl, sr)
+}
+
+/// Buffer in groups of `LANES` frames: lane positions in order ([`float_lanes`] or
+/// [`fixed_lanes`]), weights and reads in `LANES`-wide arrays (vectorised by the compiler, no
+/// FMA), gains ramped frame by frame like [`render`]. A group that touches the buffer edge, and the
+/// end of the block: frame by frame.
+#[inline(always)]
+fn render_buffer_groups<const LANES: usize>(
+    v: &mut Voice,
+    out: &mut [f32],
+    frames: usize,
+    tl: f32,
+    tr: f32,
+    ways: GroupWays,
+) {
     let Source::Buffer(pcm) = &v.src else { return render_fast(v, out, frames, tl, tr) };
     let inv = 1.0 / frames as f32;
     let (dl, dr) = ((tl - v.gl) * inv, (tr - v.gr) * inv);
@@ -829,50 +1170,32 @@ fn render_simd(v: &mut Voice, out: &mut [f32], frames: usize, tl: f32, tr: f32) 
     let looping = v.p.looping;
     let step = v.step;
     let mut pos = v.pos;
+    // Fixed point only when the position and the step are exact multiples of 2⁻¹⁶ (always, see
+    // `to_fixed16`); the position stays exact over the block, so one check per block suffices.
+    let fixed_step = to_fixed16(step).filter(|_| ways.fixed_positions && to_fixed16(pos).is_some());
     let out = &mut out.as_chunks_mut::<2>().0[..frames];
     let mut k = 0;
     while k < frames {
-        if k + 4 <= frames {
-            let p1 = pos + step;
-            let p2 = p1 + step;
-            let p3 = p2 + step;
-            let p = [pos, p1, p2, p3];
-            let idx = p.map(|x| x as usize);
-            if pos < n as f64 && idx[0] >= 1 && idx[3] + 2 < n {
-                let mut w = [[0.0f32; 4]; 4];
-                for j in 0..4 {
-                    let f = (p[j] - idx[j] as f64) as f32;
-                    let (fm1, fp1, fm2) = (f - 1.0, f + 1.0, f - 2.0);
-                    w[0][j] = -f * fm1 * fm2 / 6.0;
-                    w[1][j] = fp1 * fm1 * fm2 / 2.0;
-                    w[2][j] = fp1 * f * fm2 / 2.0;
-                    w[3][j] = fp1 * f * fm1 / 6.0;
+        if k + LANES <= frames {
+            let (idx, frac, next) = match fixed_step {
+                Some(s) => {
+                    let (idx, frac, next) = fixed_lanes::<LANES>((pos * 65_536.0) as i64, s);
+                    (idx, frac, next as f64 / 65_536.0)
                 }
-                let lane = |c: usize| -> [f32; 4] {
-                    let mut x = [[0.0f32; 4]; 4];
-                    for j in 0..4 {
-                        let b = (idx[j] - 1) * ch + c;
-                        for t in 0..4 {
-                            x[t][j] = f32::from(data[b + t * ch]);
-                        }
-                    }
-                    let mut s = [0.0f32; 4];
-                    for j in 0..4 {
-                        s[j] = (w[0][j] * x[0][j] + w[1][j] * x[1][j] - w[2][j] * x[2][j] + w[3][j] * x[3][j]) * I16;
-                    }
-                    s
-                };
-                let sl = lane(0);
-                let sr = if stereo { lane(1) } else { sl };
-                for j in 0..4 {
+                None => float_lanes::<LANES>(pos, step),
+            };
+            if pos < n as f64 && idx[0] >= 1 && idx[LANES - 1] + 2 < n {
+                let w = lane_weights(&frac);
+                let (sl, sr) = lane_pair(data, ch, &idx, &w, ways.packed_reads);
+                for j in 0..LANES {
                     gl += dl;
                     gr += dr;
                     let o = &mut out[k + j];
                     o[0] += sl[j] * gl;
                     o[1] += sr[j] * gr;
                 }
-                pos = p3 + step;
-                k += 4;
+                pos = next;
+                k += LANES;
                 continue;
             }
         }
@@ -1223,17 +1546,332 @@ mod tests {
     /// turns with the C library's `sin`/`cos`, whose last bits differ on Linux.
     const MIX_DIGEST: u64 = 0x9b76_17dd_9db9_66f2;
 
-    /// Every combination of the optimisations reproduces the old mixer bit for bit.
+    /// Every combination of the optimisations reproduces the old mixer bit for bit (the AVX2 ones
+    /// run the 4-lane path on a processor without AVX2).
     #[test]
     fn mix_digest() {
+        if !avx2_detected() {
+            eprintln!("no AVX2 on this processor: MIXER_AVX2 combinations run the 4-lane path");
+        }
         let mut seen = Vec::new();
-        for k in 0..16 {
-            let opt = MixOpt { mute: k & 1 != 0, weights: k & 2 != 0, simd: k & 4 != 0, voice_ids: k & 8 != 0 };
+        for k in 0..256 {
+            let opt = MixOpt {
+                mute: k & 1 != 0,
+                weights: k & 2 != 0,
+                simd: k & 4 != 0,
+                voice_ids: k & 8 != 0,
+                avx2: k & 16 != 0,
+                packed_reads: k & 32 != 0,
+                fixed_positions: k & 64 != 0,
+                stream_slice: k & 128 != 0,
+            };
+            if !opt.simd && (opt.avx2 || opt.packed_reads || opt.fixed_positions) {
+                // Ways of the buffer groups, unused without them: same run as with them off.
+                continue;
+            }
             seen.push((opt, mix_digest_with(opt)));
         }
+        assert_eq!(seen.len(), 144);
         let expected = if cfg!(windows) { MIX_DIGEST } else { seen[0].1 };
         for (opt, d) in &seen {
             assert_eq!(*d, expected, "{opt:?}: fingerprint {d:#018x}, expected {expected:#018x}; all: {seen:x?}");
+        }
+    }
+
+    fn avx2_detected() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::arch::is_x86_feature_detected!("avx2")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    }
+
+    /// Every optimisation on (the benches turn one off at a time).
+    const ALL_ON: MixOpt = MixOpt {
+        mute: true,
+        weights: true,
+        simd: true,
+        voice_ids: true,
+        avx2: true,
+        packed_reads: true,
+        fixed_positions: true,
+        stream_slice: true,
+    };
+
+    /// Width of the buffer groups under test.
+    #[derive(Debug, Clone, Copy)]
+    enum Width {
+        Four,
+        /// 8 lanes compiled for the baseline x86-64 (SSE2).
+        EightPortable,
+        /// 8 lanes compiled for AVX2 (4 without it).
+        EightAvx2,
+    }
+
+    /// One buffer group renderer: its width and its ways.
+    type Renderer = (Width, GroupWays);
+
+    /// The 4 combinations of the ways, the old one (both off) first.
+    const WAYS: [GroupWays; 4] = [
+        GroupWays { packed_reads: false, fixed_positions: false },
+        GroupWays { packed_reads: true, fixed_positions: false },
+        GroupWays { packed_reads: false, fixed_positions: true },
+        GroupWays { packed_reads: true, fixed_positions: true },
+    ];
+
+    fn render_with((width, ways): Renderer, v: &mut Voice, out: &mut [f32], frames: usize, tl: f32, tr: f32) {
+        match width {
+            Width::Four => render_buffer_groups::<4>(v, out, frames, tl, tr, ways),
+            Width::EightPortable => render_buffer_groups::<8>(v, out, frames, tl, tr, ways),
+            Width::EightAvx2 => render_buffer_avx2(v, out, frames, tl, tr, ways),
+        }
+    }
+
+    /// Every renderer, the old one (4 lanes, both ways off) first.
+    fn renderers() -> Vec<Renderer> {
+        [Width::Four, Width::EightPortable, Width::EightAvx2]
+            .into_iter()
+            .flat_map(|width| WAYS.map(|ways| (width, ways)))
+            .collect()
+    }
+
+    /// Median of `x` (sorted in place).
+    fn median(x: &mut [f64]) -> f64 {
+        x.sort_by(f64::total_cmp);
+        x[x.len() / 2]
+    }
+
+    /// Bench (ignored), loaded machine figures only. Buffer group renderers called directly on 64
+    /// and 247 looping voices of synthetic noise (one in four stereo, steps of pitches 0.5-2 from
+    /// 44.1 kHz, 6 shared buffers of 1 s), 31 rounds of 50 blocks per renderer, interleaved: best
+    /// time (the load of the other processes only ever adds some) and median, over the rounds, of
+    /// the ratio to the old renderer measured in the same round. Then whole mixer blocks with every
+    /// other voice out of range, and the read of a music (stereo) and a record (mono) stream whose
+    /// rings are kept full, slice against frame by frame; 2 alternating passes.
+    /// `cargo-file.ps1 test --release -p rc-audio mixer_lanes_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "bench"]
+    fn mixer_lanes_bench() {
+        const BLOCK: usize = 480;
+        const BLOCKS: usize = 2_000;
+        const ROUNDS: usize = 31;
+        println!("AVX2 detected: {}", avx2_detected());
+        let buffers: Vec<_> = (0..6u32).map(|k| noise(if k % 4 == 0 { 2 } else { 1 }, 44_100, k + 1, 44_100)).collect();
+        let all = renderers();
+        for voices in [64usize, 247] {
+            let mut set: Vec<Voice> = (0..voices)
+                .map(|id| {
+                    let pitch = 0.5 + (id % 7) as f32 * 0.25;
+                    let step = (step_of(44_100, pitch, 48_000) * 65_536.0) as u32;
+                    ready_voice(Source::Buffer(buffers[id % buffers.len()].clone()), true, (id * 97) as f64, step)
+                })
+                .collect();
+            let mut times = vec![Vec::with_capacity(ROUNDS); all.len()];
+            let mut out = vec![0.0f32; 2 * BLOCK];
+            for _ in 0..ROUNDS {
+                for (renderer, t_renderer) in all.iter().zip(&mut times) {
+                    let t = std::time::Instant::now();
+                    for _ in 0..50 {
+                        out.fill(0.0);
+                        for v in &mut set {
+                            render_with(*renderer, v, &mut out, BLOCK, 0.5, 0.4);
+                        }
+                    }
+                    t_renderer.push(t.elapsed().as_secs_f64() * 1e9 / (50 * BLOCK * voices) as f64);
+                }
+            }
+            for (renderer, t) in all.iter().zip(&times) {
+                let mut ratios: Vec<f64> = t.iter().zip(&times[0]).map(|(a, b)| a / b).collect();
+                println!(
+                    "{voices} voices, {renderer:?}: best {:.2} ns / voice·frame, median ratio to the old one {:.3}",
+                    t.iter().copied().fold(f64::INFINITY, f64::min),
+                    median(&mut ratios),
+                );
+            }
+        }
+        for pass in 0..2 {
+            for new in [false, true] {
+                let (_tx, rx) = crossbeam_channel::bounded(1);
+                let (etx, _erx) = crossbeam_channel::bounded(1);
+                let mut m = Mixer::new(48_000, 300, rx, etx);
+                m.opt = MixOpt { avx2: new, packed_reads: new, fixed_positions: new, ..ALL_ON };
+                for id in 0..247u64 {
+                    let a = id as f64 * 0.7;
+                    let r = if id % 2 == 1 { 40.0 } else { 6.0 };
+                    let pitch = 0.5 + (id % 7) as f32 * 0.25;
+                    let pcm = buffers[id as usize % buffers.len()].clone();
+                    m.command(Command::Play(params(id, [a.cos() * r, 0.0, a.sin() * r], pitch, true), Source::Buffer(pcm)));
+                }
+                let mut out = vec![0.0f32; 2 * BLOCK];
+                m.process(&mut out);
+                let t = std::time::Instant::now();
+                for _ in 0..BLOCKS {
+                    m.process(&mut out);
+                }
+                println!(
+                    "pass {pass}: mixer, 247 voices, half out of range, {}: {:.1} µs / block",
+                    if new { "8 lanes AVX2, packed reads, fixed positions" } else { "4 lanes (old)" },
+                    t.elapsed().as_secs_f64() * 1e6 / BLOCKS as f64,
+                );
+            }
+            for stream_slice in [false, true] {
+                let (_tx, rx) = crossbeam_channel::bounded(1);
+                let (etx, _erx) = crossbeam_channel::bounded(1);
+                let mut m = Mixer::new(48_000, 8, rx, etx);
+                m.opt = MixOpt { stream_slice, ..ALL_ON };
+                let feeds = [noise(2, 96_000, 41, 44_100), noise(1, 96_000, 42, 44_100)];
+                let mut producers = Vec::new();
+                for (id, feed) in feeds.iter().enumerate() {
+                    let (p, ring) = rtrb::RingBuffer::new(2 * 44_100 * usize::from(feed.channels));
+                    producers.push((p, 0usize));
+                    let src = Source::Stream(StreamIn::manual(feed.channels, feed.rate, ring));
+                    m.command(Command::Play(params(id as u64 + 1, [0.0; 3], 1.0, true), src));
+                }
+                let mut out = vec![0.0f32; 2 * BLOCK];
+                let mut timed = std::time::Duration::ZERO;
+                for _ in 0..BLOCKS {
+                    // Rings refilled outside the timed part, as the decoding threads do.
+                    for ((p, next), feed) in producers.iter_mut().zip(&feeds) {
+                        while p.slots() > 0 {
+                            p.push(feed.data[*next]).unwrap();
+                            *next = (*next + 1) % feed.data.len();
+                        }
+                    }
+                    let t = std::time::Instant::now();
+                    m.process(&mut out);
+                    timed += t.elapsed();
+                }
+                println!(
+                    "pass {pass}: 2 streams, {}: {:.2} µs / block",
+                    if stream_slice { "read from a slice" } else { "read frame by frame" },
+                    timed.as_secs_f64() * 1e6 / BLOCKS as f64,
+                );
+            }
+        }
+    }
+
+    /// A voice past its first block (gains ramping from 0.3 / 0.7) on source `src`, at `pos`
+    /// with a step of `step_units` / 65,536 (as [`step_of`] rounds it).
+    fn ready_voice(src: Source, looping: bool, pos: f64, step_units: u32) -> Voice {
+        let mut v = voice([0.0; 3], true, src.channels());
+        v.src = src;
+        v.p.looping = looping;
+        v.pos = pos;
+        v.step = f64::from(step_units) / 65_536.0;
+        v.gl = 0.3;
+        v.gr = 0.7;
+        v.fresh = false;
+        v
+    }
+
+    fn bits(out: &[f32]) -> Vec<u32> {
+        out.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// Steps below and above one source frame per output frame, and the largest one (pitch 2).
+    const STEPS: [u32; 5] = [1 << 14, 30_000, 1 << 16, 65_536 + 4_097, 150_000];
+
+    /// Every buffer group renderer (4 or 8 lanes, generic or AVX2, each combination of the ways)
+    /// gives the output, position and end of the old one (4 lanes, both ways off) bit for bit: mono
+    /// and stereo, short and long buffers, looping or not, starts at and near both buffer edges,
+    /// blocks shorter than a group and with a partial last group.
+    #[test]
+    fn group_renderers_match_the_old_one() {
+        let mut cases = 0;
+        for ch in [1u16, 2] {
+            for (len, looping) in [(3usize, true), (11, false), (40, true), (5_000, false), (5_000, true)] {
+                let pcm = noise(ch, len, 7 + len as u32, 44_100);
+                for step in STEPS {
+                    for start in [0.0, 1.5, len as f64 - 9.25, len as f64 - 0.5] {
+                        for frames in [1usize, 7, 8, 437, 480] {
+                            let run = |renderer: Renderer| {
+                                let mut v = ready_voice(Source::Buffer(pcm.clone()), looping, start.max(0.0), step);
+                                let mut out = vec![0.25f32; 2 * frames];
+                                render_with(renderer, &mut v, &mut out, frames, 0.9, 0.1);
+                                (bits(&out), v.pos.to_bits(), v.done)
+                            };
+                            let all = renderers();
+                            let old = run(all[0]);
+                            for renderer in &all[1..] {
+                                assert_eq!(run(*renderer), old, "{renderer:?}: {ch} ch, {len} frames, step {step}, start {start}");
+                            }
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 2 * 5 * STEPS.len() * 4 * 5);
+    }
+
+    /// Primed stream voice over a ring holding `feed`; the producer is returned so the ring is
+    /// not abandoned.
+    fn stream_voice(feed: &Pcm, step: u32) -> (rtrb::Producer<i16>, Voice) {
+        let (mut producer, ring) = rtrb::RingBuffer::new(feed.data.len());
+        for &s in &feed.data {
+            producer.push(s).unwrap();
+        }
+        let v = ready_voice(Source::Stream(StreamIn::manual(feed.channels, feed.rate, ring)), true, 0.0, step);
+        (producer, v)
+    }
+
+    fn ring_slots(v: &Voice) -> usize {
+        match &v.src {
+            Source::Stream(s) => s.ring.slots(),
+            Source::Buffer(_) => 0,
+        }
+    }
+
+    /// Two identical streams, one read from slices of its ring and the other frame by frame,
+    /// audible and muted blocks alternated until the ring runs dry: same output, fraction, window,
+    /// end and samples left after every block. A ring that does not hold the whole block is
+    /// refused untouched, the frame-by-frame path then underfeeds as before.
+    #[test]
+    fn stream_slice_matches_frame_reads() {
+        for ch in [1u16, 2] {
+            let feed = noise(ch, 20_000, 3, 44_100);
+            for step in STEPS {
+                let (_keep_a, mut a) = stream_voice(&feed, step);
+                let (_keep_b, mut b) = stream_voice(&feed, step);
+                let (mut sliced, mut refused) = (0, 0);
+                for block in 0..60 {
+                    let frames = if block % 3 == 0 { 437 } else { 480 };
+                    let (mut out_a, mut out_b) = (vec![0.0f32; 2 * frames], vec![0.0f32; 2 * frames]);
+                    let (before, primed) = (ring_slots(&b), b.primed);
+                    let took_slice = if block % 4 == 3 {
+                        advance(&mut a, frames);
+                        let ok = advance_stream_slice(&mut b, frames);
+                        if !ok {
+                            assert_eq!(ring_slots(&b), before, "refused slice consumed samples");
+                            advance(&mut b, frames);
+                        }
+                        ok
+                    } else {
+                        render_fast(&mut a, &mut out_a, frames, 0.8, 0.2);
+                        let ok = render_stream_slice(&mut b, &mut out_b, frames, 0.8, 0.2);
+                        if !ok {
+                            assert_eq!(ring_slots(&b), before, "refused slice consumed samples");
+                            render_fast(&mut b, &mut out_b, frames, 0.8, 0.2);
+                        }
+                        ok
+                    };
+                    if took_slice {
+                        sliced += 1;
+                    } else if primed {
+                        refused += 1;
+                    }
+                    let state = |v: &Voice| (v.pos.to_bits(), v.win.map(|f| f.map(f32::to_bits)), v.done, ring_slots(v));
+                    assert_eq!(bits(&out_b), bits(&out_a), "{ch} ch, step {step}, block {block}");
+                    assert_eq!(state(&b), state(&a), "{ch} ch, step {step}, block {block}");
+                }
+                assert!(sliced > 10, "{ch} ch, step {step}: only {sliced} blocks read from a slice");
+                if step > 1 << 15 {
+                    assert!(refused > 0, "{ch} ch, step {step}: the ring never ran dry");
+                }
+            }
         }
     }
 

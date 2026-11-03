@@ -181,13 +181,13 @@ impl Server {
         };
         if let Some(u) = new
             && let Some(i) = self.mobs.index_of_uuid(u)
-            && let Some(mut m) = self.mobs.list[i].take()
+            && let Some(mut m) = self.mobs.list.take(i)
         {
             if !m.removed {
-                self.play_sound("minecraft:block.conduit.attack.target", 4, m.pos, 1.0, 1.0);
+                self.play_sound("minecraft:block.conduit.attack.target", 4, m.pos(), 1.0, 1.0);
                 self.mob_hurt(&mut m, "minecraft:magic", 4.0, None, None);
             }
-            self.mobs.list[i] = Some(m);
+            self.mobs.list.put(i, m);
         }
         if new != old {
             if let Some(be) = self.be_get_mut(p) {
@@ -209,7 +209,6 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| !o.removed && is_enemy(o.kind) && o.touches(&area) && self.mob_in_water_or_rain(o))
             .map(|o| o.uuid)
             .collect();

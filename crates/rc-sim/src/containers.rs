@@ -356,7 +356,7 @@ impl Server {
         let g = 1.0e-7;
         let area = rc_physics::Aabb { min: b.min.map(|v| v - g), max: b.max.map(|v| v + g) };
         use crate::mobs::species::Kind;
-        !self.mobs.list.iter().flatten().any(|m| {
+        !self.mobs.list.iter().any(|m| {
             let solid = match m.kind {
                 Kind::Shulker => m.alive(),
                 Kind::HappyGhast => {
@@ -842,7 +842,7 @@ impl Server {
             id.is_some_and(|id| tags.get(tag).is_some_and(|v| v.binary_search(&id).is_ok()))
         };
         let loot = crate::loot::Loot { pack: &self.life.pack, items: &self.life.items, block_tag: &tag_fn };
-        let ctx = crate::loot::Ctx { block: Some((block, Vec::new())), ..Default::default() };
+        let ctx = crate::loot::Ctx { block: Some((block, crate::loot::BlockProps::NONE)), ..Default::default() };
         let mut rng = self.life.rng;
         let burn = loot.int(&c["burn_time"], &ctx, &mut rng);
         let speed =

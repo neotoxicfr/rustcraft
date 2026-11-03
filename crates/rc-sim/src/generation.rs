@@ -31,6 +31,7 @@ use rc_worldgen::terrain::BiomeCache;
 
 use crate::chunk::{Chunk, Height};
 use crate::generation_nbt::{Conv, DECORATED, RANK_FEATURES, RANK_FULL, RANK_TERRAIN, TERRAIN};
+use crate::generation_timing::{BatchClock, BatchTiming, Phase, SetupClock, generation_log};
 use crate::nbtio;
 use crate::states::States;
 use crate::world::Dimension;
@@ -399,6 +400,10 @@ pub(crate) struct Worker {
     prep: Arc<std::sync::OnceLock<Arc<crate::prep::Prep>>>,
     /// Proto-chunks written only on eviction and at flush (`RUSTCRAFT_OPT_PROTO_LAZY`).
     lazy: bool,
+    /// Per-phase clocks of each batch, logged (`RUSTCRAFT_GENLOG`; forced by the tests).
+    timed: bool,
+    /// Phases of the last batch measured (`timed` only).
+    last_timing: Option<BatchTiming>,
 }
 
 /// Decoration order of a batch (the result at the borders depends on it, as in the game).
@@ -415,22 +420,36 @@ pub enum DecorOrder {
 impl Worker {
     pub(crate) fn new(s: Setup, out: Sender<Out>) -> Result<Worker, String> {
         let t = std::time::Instant::now();
+        let mut setup = SetupClock::start();
         let jar = crate::registries::client_jar(&s.data).ok_or("game jar not found")?;
         let reports = reports_dir(&s.data);
         let wd = WorldData::shared(&jar, reports.is_dir().then_some(reports.as_path()), &s.data)
             .map_err(|e| format!("generation data: {e}"))?;
+        setup.lap("game data");
         let mut dg = DimGen::new(&wd, &s.spec, &s.dimension, s.seed).map_err(|e| format!("generator: {e}"))?;
+        setup.lap("dimension generator");
         if structures_enabled(&s.world) {
             dg.enable_structures(&wd).map_err(|e| format!("structures : {e}"))?;
+            setup.lap("structures");
             if rings_warm() {
                 dg.warm_rings();
+                setup.lap("stronghold rings");
             }
         }
         let has_sky = s.data.dimension_types.iter().find(|t| t.name == s.dimension).is_none_or(|t| t.has_skylight);
+        // Unchanged reading of the bench ("generator ready"): the tables below come after it.
         eprintln!("singleplayer: generator {} ready in {:.0} ms", s.dimension, t.elapsed().as_secs_f64() * 1e3);
+        let states = States::new(&s.data, s.biome_registry);
+        setup.lap("block states, after ready");
+        let light = rc_light::LightTables::new(&s.data);
+        setup.lap("light tables, after ready");
+        let timed = generation_log();
+        if timed {
+            eprintln!("{}", setup.line(&s.dimension));
+        }
         Ok(Worker {
-            states: States::new(&s.data, s.biome_registry),
-            light: rc_light::LightTables::new(&s.data),
+            states,
+            light,
             dim: Dimension::new(&s.world, &s.dimension, s.height),
             height: s.height,
             data: s.data,
@@ -452,6 +471,8 @@ impl Worker {
             saved: Arc::default(),
             prep: Arc::default(),
             lazy: proto_lazy(),
+            timed,
+            last_timing: None,
         })
     }
 
@@ -539,6 +560,7 @@ impl Worker {
 
     /// Makes the requested chunks full; returns their number.
     pub(crate) fn process(&mut self, batch: &[(i32, i32)]) -> usize {
+        let mut clock = BatchClock::start(self.timed);
         // A full chunk evicted but not yet saved stays full (never redone).
         self.restore(batch);
         let targets: Vec<(i32, i32)> =
@@ -570,10 +592,12 @@ impl Worker {
             near.into_iter().filter(|&p| self.stage(p).is_none_or(|s| s == Stage::Terrain)).collect();
         let terrain: Vec<(i32, i32)> = around(&decorate);
         self.load(&terrain);
+        clock.lap(Phase::Load);
         // (2) Terrain of the missing ones, in parallel.
         let missing: Vec<(i32, i32)> = terrain.into_iter().filter(|p| !self.map.contains_key(p)).collect();
         if !missing.is_empty() {
             self.dg.prepare_biomes(&mut self.biomes, &missing);
+            clock.lap(Phase::Biomes);
             let g = &self.dg;
             let cache = &self.biomes;
             let saved = &self.saved_structures;
@@ -585,6 +609,7 @@ impl Worker {
                     c
                 })
                 .collect();
+            clock.lap(Phase::Terrain);
             for c in &made {
                 self.saved_structures.remove(&(c.cx, c.cz));
             }
@@ -609,8 +634,11 @@ impl Worker {
         // (3) Decoration by disjoint classes.
         let todo: Vec<(i32, i32)> =
             decorate.iter().copied().filter(|&p| self.stage(p) == Some(Stage::Terrain)).collect();
-        self.decorate(&todo);
+        clock.lap(Phase::Bookkeeping);
+        self.decorate(&todo, &mut clock);
+        clock.lap(Phase::Decoration);
         self.mark(&todo, crate::prep::Status::Features);
+        clock.lap(Phase::Bookkeeping);
         // (4) Post-processing, light and conversion of the targets.
         for p in &targets {
             let Some(s) = self.map.get_mut(p) else { continue };
@@ -634,6 +662,7 @@ impl Worker {
                     b.is(s, k.brown_mushroom) || b.is(s, k.red_mushroom)
                 });
                 if mushrooms {
+                    clock.mushroom_chunk();
                     let (x, z) = *p;
                     let cols: rc_light::Columns = std::array::from_fn(|i| {
                         let q = (x + i as i32 % 3 - 1, z + i as i32 / 3 - 1);
@@ -659,6 +688,7 @@ impl Worker {
                 s.c = c;
             }
         }
+        clock.lap(Phase::PostProcessing);
         let conv = self.conv();
         let map = &self.map;
         let light = &self.light;
@@ -683,6 +713,7 @@ impl Worker {
                 Some((conv.full_chunk(&s.c, sky, block, 0, &s.bes), s.c.entities.clone()))
             })
             .collect();
+        clock.lap(Phase::LightAndConversion);
         // Neighbours already full (generated here): light redone with the newcomers.
         let mut relit: Vec<(i32, i32)> = Vec::new();
         for &(x, z) in &targets {
@@ -713,6 +744,7 @@ impl Worker {
                 ((x, z), sky, block)
             })
             .collect();
+        clock.lap(Phase::Relight);
         if rc_data::env_flag!("RUSTCRAFT_GENLOG") {
             eprintln!(
                 "singleplayer: light of {} new chunks, {} relit neighbours, {} columns scanned",
@@ -738,13 +770,16 @@ impl Worker {
         for (p, sky, block) in relights {
             let _ = self.out.send(Out::Relight(p, sky, block));
         }
+        clock.lap(Phase::Sending);
         // (5) Modified proto-chunks to disk: at every batch (old path); otherwise on
         // eviction (`evict`) and at save (`flush`) only.
         if !self.lazy {
             let dirty = self.unwritten();
             self.send_protos(&dirty);
+            clock.lap(Phase::ProtoChunks);
         }
         self.evict(targets[0]);
+        clock.lap(Phase::Eviction);
         if crate::mem_stats::enabled() {
             let mut g = crate::mem_stats::Gen { biome_cache: self.biomes.chunks.len() as u64, ..Default::default() };
             for s in self.map.values() {
@@ -766,7 +801,16 @@ impl Worker {
             crate::mem_stats::publish_gen(&self.dim_name, g);
         }
         let _ = self.out.send(Out::Batch(self.seq));
+        clock.lap(Phase::Bookkeeping);
+        self.log_batch(clock, n);
         n
+    }
+
+    /// Writes the batch's phases (log on) and keeps them for the tests.
+    fn log_batch(&mut self, clock: BatchClock, chunks: usize) {
+        let Some((timing, at_seconds)) = clock.finish() else { return };
+        eprintln!("{}", timing.line(at_seconds, self.seq, chunks, rayon::current_num_threads()));
+        self.last_timing = Some(timing);
     }
 
     /// Proto-chunks of the table modified since their last send (never a full one).
@@ -943,7 +987,7 @@ impl Worker {
     }
 
     /// Decorates the given chunks (at status `terrain`, neighbours ready), class by class.
-    fn decorate(&mut self, todo: &[(i32, i32)]) {
+    fn decorate(&mut self, todo: &[(i32, i32)], clock: &mut BatchClock) {
         let groups: Vec<Vec<(i32, i32)>> = match self.order {
             DecorOrder::Sequential => todo.iter().rev().map(|&p| vec![p]).collect(),
             o => {
@@ -966,6 +1010,7 @@ impl Worker {
             if centers.is_empty() {
                 continue;
             }
+            let group_started = clock.now();
             let mut jobs: Vec<Job> = centers
                 .iter()
                 .map(|&(x, z)| {
@@ -1003,6 +1048,7 @@ impl Worker {
                     s.stage = s.stage.max(Stage::Decorated);
                 }
             }
+            clock.decoration_group(group_started, centers.len());
         }
     }
 

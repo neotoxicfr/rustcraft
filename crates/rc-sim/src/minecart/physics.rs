@@ -886,21 +886,20 @@ impl Server {
                 .mobs
                 .list
                 .iter()
-                .flatten()
                 .filter(|m| m.alive() && m.touches(&hit) && !c.passengers.contains(&Ent::Mob(m.id)))
                 .filter(|m| self.mob_pushable(m))
                 .map(|m| m.id)
                 .collect();
             for id in ids {
                 let Some(i) = self.mob_index(id) else { continue };
-                let Some(mut m) = self.mobs.list[i].take() else { continue };
+                let Some(mut m) = self.mobs.list.take(i) else { continue };
                 let golem = m.kind == crate::mobs::species::Kind::IronGolem;
                 if !golem && !c.is_vehicle() && m.mount.vehicle.is_none() {
                     self.cart_mob_start_riding(c, &mut m);
                 } else {
                     self.cart_push_mob(c, &mut m);
                 }
-                self.mobs.list[i] = Some(m);
+                self.mobs.list.put(i, m);
             }
             // The player is pushed (never boarded).
             if self.cart_player_pushable(c) && self.player_aabb().intersects(&hit) {
@@ -1012,7 +1011,7 @@ impl Server {
 
     /// `mob.push(cart)` (general rule): the mob recoils, the minecart advances if it is empty.
     fn cart_push_mob(&mut self, c: &mut Cart, m: &mut crate::mobs::mob::Mob) {
-        let Some((xa, za)) = Self::entity_push_amount(m.pos, c.pos) else { return };
+        let Some((xa, za)) = Self::entity_push_amount(m.pos(), c.pos) else { return };
         if m.mount.passengers.is_empty() && self.mob_pushable(m) {
             m.vel[0] -= xa;
             m.vel[2] -= za;

@@ -388,7 +388,7 @@ fn campfire_signal_follows_hay_below() {
 }
 
 fn bees(w: &W) -> usize {
-    w.p.s.mobs.list.iter().flatten().filter(|m| m.kind == crate::mobs::species::Kind::Bee && !m.removed).count()
+    w.p.s.mobs.list.iter().filter(|m| m.kind == crate::mobs::species::Kind::Bee && !m.removed).count()
 }
 
 const HIVE_BEE: &str = "{bees:[{entity_data:{id:\"minecraft:bee\"},min_ticks_in_hive:600,ticks_in_hive:0}]}";

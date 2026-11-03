@@ -682,7 +682,6 @@ impl Server {
         self.mobs
             .list
             .iter()
-            .flatten()
             .find(|m| m.uuid == u && !m.removed)
             .map(|m| Ent::Mob(m.id))
             // Shooter taken out of the list during its own tick.

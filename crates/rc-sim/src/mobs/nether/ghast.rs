@@ -23,8 +23,8 @@ pub fn face_movement(s: &Server, m: &mut Mob) {
         }
         Some(t) => {
             let Some(tp) = s.ent_pos(t) else { return };
-            if super::super::mth::dist2(tp, m.pos) < 4096.0 {
-                m.yaw = -(atan2(tp[0] - m.pos[0], tp[2] - m.pos[2]) as f32) * deg;
+            if super::super::mth::dist2(tp, m.pos()) < 4096.0 {
+                m.yaw = -(atan2(tp[0] - m.pos()[0], tp[2] - m.pos()[2]) as f32) * deg;
                 m.body_yaw = m.yaw;
             }
         }
@@ -58,7 +58,7 @@ pub fn move_control(s: &Server, m: &mut Mob) {
     }
     m.neth.float_duration += m.rng.next_int_bound(5) + 2;
     let w = m.move_ctl.wanted;
-    let travel = [w[0] - m.pos[0], w[1] - m.pos[1], w[2] - m.pos[2]];
+    let travel = [w[0] - m.pos()[0], w[1] - m.pos()[1], w[2] - m.pos()[2]];
     if can_reach(s, m, travel) {
         let n = crate::mobs::mth::normalize(travel);
         let k = FLYING_SPEED * 5.0 / 3.0;
@@ -106,7 +106,7 @@ pub(crate) fn collided_along(entity: &rc_physics::Aabb, travel: [f64; 3], boxes:
 fn can_reach(s: &Server, m: &Mob, travel: [f64; 3]) -> bool {
     let bb = m.bbox();
     let at = bb.offset(travel[0], travel[1], travel[2]);
-    let start = m.pos;
+    let start = m.pos();
     let end = [start[0] + travel[0], start[1] + travel[1], start[2] + travel[2]];
     each_cell_between(start, end, &at, &mut |p| {
         let unit = rc_physics::Aabb {
@@ -133,7 +133,7 @@ pub fn float_can_use(m: &Mob) -> bool {
         return true;
     }
     let w = m.move_ctl.wanted;
-    let d = [w[0] - m.pos[0], w[1] - m.pos[1], w[2] - m.pos[2]];
+    let d = [w[0] - m.pos()[0], w[1] - m.pos()[1], w[2] - m.pos()[2]];
     let dd = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
     !(1.0..=3600.0).contains(&dd)
 }
@@ -142,7 +142,7 @@ pub fn float_can_use(m: &Mob) -> bool {
 /// restriction zone and with zero block distance, the first point is always kept:
 /// the height correction (point brought back under the surface) never happens for the ghast.
 pub fn float_start(_s: &mut Server, m: &mut Mob) {
-    let c = m.pos;
+    let c = m.pos();
     let mut r = [0.0; 3];
     for i in 0..3 {
         r[i] = c[i] + f64::from((m.rng.next_float() * 2.0 - 1.0) * 16.0);
@@ -162,21 +162,21 @@ pub fn view_vector(pitch: f32, yaw: f32) -> [f64; 3] {
 pub fn shoot_tick(s: &mut Server, m: &mut Mob, charge: &mut i32) {
     let Some(t) = m.target else { return };
     let (Some(tp), Some(tb)) = (s.ent_pos(t), s.ent_bbox(t)) else { return };
-    if super::super::mth::dist2(tp, m.pos) < 4096.0 && s.line_of_sight(m, t) {
+    if super::super::mth::dist2(tp, m.pos()) < 4096.0 && s.line_of_sight(m, t) {
         *charge += 1;
         if *charge == 10 {
             s.level_event(1015, m.block_pos(), 0);
         }
         if *charge == 20 {
             let v = view_vector(m.pitch, m.yaw);
-            let half = m.pos[1] + f64::from(m.height()) * 0.5;
-            let xd = tp[0] - (m.pos[0] + v[0] * 4.0);
+            let half = m.pos()[1] + f64::from(m.height()) * 0.5;
+            let xd = tp[0] - (m.pos()[0] + v[0] * 4.0);
             let yd = (tb.min[1] + (tb.max[1] - tb.min[1]) * 0.5) - (0.5 + half);
-            let zd = tp[2] - (m.pos[2] + v[2] * 4.0);
+            let zd = tp[2] - (m.pos()[2] + v[2] * 4.0);
             s.level_event(1016, m.block_pos(), 0);
             // Position: x and z offset by 4 blocks in the view direction; z added to the
             // position already set (the ghast's), like the game.
-            let pos = [m.pos[0] + v[0] * 4.0, half + 0.5, m.pos[2] + v[2] * 4.0];
+            let pos = [m.pos()[0] + v[0] * 4.0, half + 0.5, m.pos()[2] + v[2] * 4.0];
             let power = m.neth.explosion_power;
             s.shoot_fireball(Some(m.uuid), pos, [xd, yd, zd], (m.yaw, m.pitch), true, power);
             *charge = -40;

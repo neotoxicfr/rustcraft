@@ -505,7 +505,7 @@ fn add_pig(p: &mut Probe, id: i32, pos: [f64; 3]) {
 }
 
 fn pig(p: &Probe, id: i32) -> &crate::mobs::mob::Mob {
-    p.s.mobs.list.iter().flatten().find(|m| m.id == id).expect("pig")
+    p.s.mobs.list.iter().find(|m| m.id == id).expect("pig")
 }
 
 /// G5-F14: the head coming out pushes the mob and the item in front of it out of the cell where it
@@ -521,7 +521,7 @@ fn piston_head_pushes_mob_and_item() {
     p.run("setblock 101 -59 116 minecraft:redstone_block\n");
     tick_blocks(&mut p, 4);
     assert!(name_at(&p, [102, -59, 115]).starts_with("minecraft:piston_head"), "{}", name_at(&p, [102, -59, 115]));
-    let x = pig(&p, 900_001).pos[0];
+    let x = pig(&p, 900_001).pos()[0];
     assert!(x - 0.45 >= 103.0, "pig at x = {x}");
     let item = p.s.life.drops.iter().find(|d| d.stack.id == "minecraft:stone").expect("item");
     assert!(item.pos[0] - 0.125 >= 103.0, "item at x = {}", item.pos[0]);
@@ -540,7 +540,7 @@ fn slime_block_launches_mob() {
     tick_blocks(&mut p, 2);
     let m = pig(&p, 900_002);
     assert_eq!(m.vel[1], 1.0, "{:?}", m.vel);
-    assert!(m.pos[1] > -57.0, "{:?}", m.pos);
+    assert!(m.pos()[1] > -57.0, "{:?}", m.pos());
     done(p, dir);
 }
 
@@ -555,11 +555,11 @@ fn horizontal_push_ungrounds_mob() {
     add_pig(&mut p, 900_003, [102.5, -59.0, 115.5]);
     game_ticks(&mut p, 2);
     assert!(pig(&p, 900_003).on_ground, "pig standing");
-    let x0 = pig(&p, 900_003).pos[0];
+    let x0 = pig(&p, 900_003).pos()[0];
     p.run("setblock 101 -59 116 minecraft:redstone_block\n");
     game_ticks(&mut p, 1);
     let m = pig(&p, 900_003);
-    assert!(m.pos[0] > x0 + 0.2, "pig not pushed: x {} -> {}", x0, m.pos[0]);
+    assert!(m.pos()[0] > x0 + 0.2, "pig not pushed: x {} -> {}", x0, m.pos()[0]);
     assert!(!m.on_ground, "pushed pig still on the ground");
     done(p, dir);
 }
@@ -574,16 +574,16 @@ fn slime_launch_waits_for_next_mob_tick() {
     p.run("setblock 106 -59 110 minecraft:piston[facing=up]\nsetblock 106 -58 110 minecraft:slime_block\n");
     add_pig(&mut p, 900_004, [106.5, -57.0, 110.5]);
     game_ticks(&mut p, 2);
-    let y0 = pig(&p, 900_004).pos[1];
+    let y0 = pig(&p, 900_004).pos()[1];
     p.run("setblock 107 -59 110 minecraft:redstone_block\n");
     game_ticks(&mut p, 1);
     let m = pig(&p, 900_004);
-    assert!(m.pos[1] > y0, "pig not lifted: {:?}", m.pos);
+    assert!(m.pos()[1] > y0, "pig not lifted: {:?}", m.pos());
     assert_eq!(m.vel[1], 1.0, "momentum consumed on the launch tick: {:?}", m.vel);
-    let y1 = m.pos[1];
+    let y1 = m.pos()[1];
     game_ticks(&mut p, 1);
     let m = pig(&p, 900_004);
-    assert!(m.vel[1] < 1.0 && m.pos[1] > y1 + 0.5, "the pig did not tick: {:?} {:?}", m.pos, m.vel);
+    assert!(m.vel[1] < 1.0 && m.pos()[1] > y1 + 0.5, "the pig did not tick: {:?} {:?}", m.pos(), m.vel);
     done(p, dir);
 }
 

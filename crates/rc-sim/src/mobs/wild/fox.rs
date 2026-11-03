@@ -270,7 +270,7 @@ pub(crate) fn eat_mouth_item(s: &mut Server, m: &mut Mob) {
         s.run_mob_consume_effects(m, list);
     }
     let ev = if drink { "minecraft:drink" } else { "minecraft:eat" };
-    s.game_event_at(ev, m.pos, Some(crate::mobs::mob::Ent::Mob(m.id)));
+    s.game_event_at(ev, m.pos(), Some(crate::mobs::mob::Ent::Mob(m.id)));
     let remainder = s.life.items.default_component(&st, "minecraft:use_remainder");
     let mut left = st;
     left.count -= 1;
@@ -381,7 +381,7 @@ pub fn pickup(s: &mut Server, m: &mut Mob) {
     let Some((id, st)) = hit else { return };
     if st.count > 1 {
         let rest = Stack { count: st.count - 1, ..st.clone() };
-        s.spawn_item(m.pos, [0.0; 3], rest, 0);
+        s.spawn_item(m.pos(), [0.0; 3], rest, 0);
     }
     if let Some(old) = m.equipment[0].take() {
         spit_out(s, m, old);
@@ -396,7 +396,7 @@ pub fn pickup(s: &mut Server, m: &mut Mob) {
 fn spit_out(s: &mut Server, m: &Mob, st: Stack) {
     let (yr, xr) = (m.yaw.to_radians(), m.pitch.to_radians());
     let look = [-(yr.sin() * xr.cos()) as f64, -(xr.sin()) as f64, (yr.cos() * xr.cos()) as f64];
-    let at = [m.pos[0] + look[0], m.pos[1] + 1.0, m.pos[2] + look[2]];
+    let at = [m.pos()[0] + look[0], m.pos()[1] + 1.0, m.pos()[2] + look[2]];
     let r = &mut s.life.rng;
     let v = [r.next_double() * 0.2 - 0.1, 0.2, r.next_double() * 0.2 - 0.1];
     s.spawn_item(at, v, st, 40);
@@ -407,15 +407,15 @@ fn spit_out(s: &mut Server, m: &Mob, st: Stack) {
 
 /// Six steps toward the target, three replaceable cells above each.
 pub fn path_clear(s: &Server, m: &Mob, tp: [f64; 3]) -> bool {
-    let zd = tp[2] - m.pos[2];
-    let xd = tp[0] - m.pos[0];
+    let zd = tp[2] - m.pos()[2];
+    let xd = tp[0] - m.pos()[0];
     let slope = zd / xd;
     for i in 0..6 {
         let k = f64::from(i as f32 / 6.0);
         let z = if slope == 0.0 { 0.0 } else { zd * k };
         let x = if slope == 0.0 { xd * k } else { z / slope };
         for j in 1..4 {
-            let p = super::super::mth::block_of([m.pos[0] + x, m.pos[1] + f64::from(j), m.pos[2] + z]);
+            let p = super::super::mth::block_of([m.pos()[0] + x, m.pos()[1] + f64::from(j), m.pos()[2] + z]);
             if !s.sflag(p, rc_data::flags::REPLACEABLE) {
                 return false;
             }
@@ -426,7 +426,7 @@ pub fn path_clear(s: &Server, m: &Mob, tp: [f64; 3]) -> bool {
 
 /// Top cell of the box without sky, positive walk value.
 pub fn has_shelter(s: &Server, m: &Mob) -> bool {
-    let p = super::super::mth::block_of([m.pos[0], m.bbox().max[1], m.pos[2]]);
+    let p = super::super::mth::block_of([m.pos()[0], m.bbox().max[1], m.pos()[2]]);
     !s.can_see_sky(p) && s.walk_target_value(m, p) >= 0.0
 }
 
@@ -464,7 +464,6 @@ pub fn alertable(s: &Server, m: &mut Mob) -> bool {
         .mobs
         .list
         .iter()
-        .flatten()
         .filter(|o| o.id != m.id && o.alive() && o.touches(&area) && alertable_mob(o))
         .filter(|o| !trusts(m, o.uuid))
         .map(|o| o.id)

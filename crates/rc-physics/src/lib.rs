@@ -207,18 +207,15 @@ pub fn entity_boxes_in(boxes: &[Aabb], area: &Aabb, out: &mut Vec<Aabb>) {
 
 // ---------- Tabulated sine ----------
 
-fn sin_table() -> &'static [f32] {
-    use std::sync::OnceLock;
-    static T: OnceLock<Vec<f32>> = OnceLock::new();
-    T.get_or_init(|| (0..65_536).map(|i| (f64::from(i) / 10_430.378_350_470_453).sin() as f32).collect())
-}
-
+/// The game's tabulated sine of a float angle (the table shared by every crate).
+#[inline]
 pub fn sin_t(a: f32) -> f32 {
-    sin_table()[((f64::from(a) * 10_430.378_350_470_453) as i64 & 65_535) as usize]
+    rc_data::java_math::sin(f64::from(a))
 }
 
+#[inline]
 pub fn cos_t(a: f32) -> f32 {
-    sin_table()[((f64::from(a) * 10_430.378_350_470_453 + 16_384.0) as i64 & 65_535) as usize]
+    rc_data::java_math::cos(f64::from(a))
 }
 
 const DEG: f32 = std::f32::consts::PI / 180.0;

@@ -59,7 +59,7 @@ impl Server {
         let _ = self.send(Event::Sound(SoundPacket {
             sound: SoundRef::Id(id),
             category,
-            pos: Some(m.pos),
+            pos: Some(m.pos()),
             entity: None,
             volume,
             pitch,
@@ -90,7 +90,7 @@ impl Server {
     /// `shear` event on the sheared mob, attributed to the player.
     pub(crate) fn sheared_by_player(&mut self, m: &Mob) {
         let src = Some(super::recent::vibration::Src::Living(Ent::Player));
-        self.game_event_src("minecraft:shear", m.pos, src, None);
+        self.game_event_src("minecraft:shear", m.pos(), src, None);
     }
 
     /// Sound category of a mob.
@@ -268,7 +268,7 @@ impl Server {
     /// villager gossip, aimed knockback of the sulfur cube).
     pub(crate) fn mob_hurt_by(&mut self, m: &mut Mob, by: &Mob, ty: &str, amount: f32) -> bool {
         self.ghost_push(by);
-        let r = self.mob_hurt(m, ty, amount, Some(Ent::Mob(by.id)), Some(by.pos));
+        let r = self.mob_hurt(m, ty, amount, Some(Ent::Mob(by.id)), Some(by.pos()));
         self.ghost_pop();
         r
     }
@@ -471,7 +471,7 @@ impl Server {
                 m.track.sync_velocity = true;
             }
             if !self.dmg_tag(ty, "minecraft:no_knockback") {
-                let (xd, zd) = hurt_knockback_dir(dir, src, m.pos);
+                let (xd, zd) = hurt_knockback_dir(dir, src, m.pos());
                 self.mob_knockback(m, 0.4, xd, zd, by, damage, false);
             }
         }
@@ -489,7 +489,7 @@ impl Server {
                     .or_else(|| self.variant_sound(m, "death_sound"))
                     .unwrap_or_else(|| m.death_sound().to_owned());
                 self.make_sound(m, &d);
-                self.thorns_hit_sound(ty, 5, m.pos);
+                self.thorns_hit_sound(ty, 5, m.pos());
             }
             self.mob_die(m, ty, by);
         } else if full {
@@ -507,7 +507,7 @@ impl Server {
                 .or_else(|| self.variant_sound(m, "hurt_sound"))
                 .unwrap_or_else(|| m.hurt_sound().to_owned());
             self.make_sound(m, &h);
-            self.thorns_hit_sound(ty, 5, m.pos);
+            self.thorns_hit_sound(ty, 5, m.pos());
         }
         m.last_hit = Some(Hit { ty: ty.to_owned(), by, tick: self.time as u64 });
         self.mob_hurt_effects(m); // infestation
@@ -564,7 +564,7 @@ impl Server {
         let (mut world, mut own) = (self.mobs.rng, m.rng);
         let p = {
             let gear: [(usize, Option<&Stack>); 8] = std::array::from_fn(|k| (k, m.equipment[k].as_ref()));
-            let ctx = self.hurt_ctx(ty, crate::progress::pred::Who::Mob(m), m.pos, by);
+            let ctx = self.hurt_ctx(ty, crate::progress::pred::Who::Mob(m), m.pos(), by);
             self.ench_protection(&gear, &ctx, &mut world, &mut own)
         };
         (self.mobs.rng, m.rng) = (world, own);
@@ -584,7 +584,7 @@ impl Server {
         if let Some(w) = self.source_weapon(ty, by) {
             let mut own = m.rng;
             frac = {
-                let ctx = self.hurt_ctx(ty, crate::progress::pred::Who::Mob(m), m.pos, by);
+                let ctx = self.hurt_ctx(ty, crate::progress::pred::Who::Mob(m), m.pos(), by);
                 self.armor_fraction(frac, Some(&w), &ctx, &mut own)
             };
             m.rng = own;
@@ -719,7 +719,7 @@ impl Server {
         if xp_ok {
             let xp = self.mob_xp(m);
             if xp > 0 {
-                self.spawn_orbs(m.pos, xp);
+                self.spawn_orbs(m.pos(), xp);
             }
         }
         self.wither_rose_mob(m); // F16: victim of a wither
@@ -789,7 +789,7 @@ impl Server {
 
     fn drop_mob_item(&mut self, m: &Mob, s: Stack) {
         // At the position, raised by 0, random velocity.
-        let pos = [m.pos[0], m.pos[1], m.pos[2]];
+        let pos = [m.pos()[0], m.pos()[1], m.pos()[2]];
         let r = &mut self.mobs.rng;
         let v = [r.next_double() * 0.2 - 0.1, 0.2, r.next_double() * 0.2 - 0.1];
         self.spawn_item(pos, v, s, 10);
@@ -860,7 +860,7 @@ impl Server {
         };
         let world = self.loot_world(crate::progress::pred::Ctx {
             this: Some(Who::Mob(m)),
-            origin: Some(m.pos),
+            origin: Some(m.pos()),
             attacker: source,
             direct_attacker: direct_who,
             attacking_player: player_killed.then_some(Who::E(crate::commands::ents::E::Player)),
@@ -1026,7 +1026,7 @@ impl Server {
                     Ent::Player => Some(crate::progress::pred::Who::E(crate::commands::ents::E::Player)),
                     Ent::Mob(id) => self.mob_ref(id).map(crate::progress::pred::Who::Mob),
                 };
-                let origin = self.ent_pos(t).unwrap_or(m.pos);
+                let origin = self.ent_pos(t).unwrap_or_else(|| m.pos());
                 let own: &mut dyn crate::randsrc::Rand = if t == Ent::Player { &mut own_p } else { &mut own_m };
                 match victim {
                     Some(v) => {
@@ -1048,14 +1048,14 @@ impl Server {
         }
         let hurt = match t {
             Ent::Player => {
-                let kb = (m.pos[0] - self.pos[0], m.pos[2] - self.pos[2]);
+                let kb = (m.pos()[0] - self.pos[0], m.pos()[2] - self.pos[2]);
                 let r = self.player_hurt_by_mob(m, ty, dmg, Some(kb));
                 self.take_riposte(m);
                 r
             }
             Ent::Mob(id) => {
                 let Some(i) = self.mob_index(id) else { return false };
-                let mut o = self.mobs.list[i].take().expect("mob");
+                let mut o = self.mobs.list.take(i).expect("mob");
                 // F01: attacker's random source lent to the reaction to a kill (villager conversion).
                 self.mobs.killer = Some((m.rng, m.kind, m.id, m.block_pos()));
                 let r = self.mob_hurt_by(&mut o, m, ty, dmg);
@@ -1063,7 +1063,7 @@ impl Server {
                 if let Some((rng, _, _, _)) = self.mobs.killer.take() {
                     m.rng = rng;
                 }
-                self.mobs.list[i] = Some(o);
+                self.mobs.list.put(i, o);
                 r
             }
         };
@@ -1077,12 +1077,12 @@ impl Server {
                         // Victim's own knockback (full sulfur cube:
                         // attacker's aim), coming from an effect, with the hit's damage.
                         if let Some(i) = self.mob_index(id) {
-                            let mut o = self.mobs.list[i].take().expect("mob");
+                            let mut o = self.mobs.list.take(i).expect("mob");
                             self.ghost_push(m);
                             let by = Some(Ent::Mob(m.id));
                             self.mob_knockback(&mut o, f64::from(kb), f64::from(s), f64::from(-c), by, dmg, true);
                             self.ghost_pop();
-                            self.mobs.list[i] = Some(o);
+                            self.mobs.list.put(i, o);
                         }
                     }
                 }
@@ -1204,7 +1204,7 @@ impl Server {
     /// Entity push of the player against the mob `a`: moved apart from each other by
     /// 0.05 at most (the player on one side, the mob on the other).
     pub(crate) fn player_push_from(&mut self, a: &mut Mob) {
-        let (mut xa, mut za) = (a.pos[0] - self.pos[0], a.pos[2] - self.pos[2]);
+        let (mut xa, mut za) = (a.pos()[0] - self.pos[0], a.pos()[2] - self.pos[2]);
         let dd = xa.abs().max(za.abs());
         if dd < f64::from(0.01f32) {
             return;
@@ -1280,7 +1280,7 @@ impl Server {
             }
             return;
         };
-        let mut m = self.mobs.list[i].take().expect("mob");
+        let mut m = self.mobs.list.take(i).expect("mob");
         let reach_ok = {
             let b = m.bbox();
             let eye = [self.pos[0], self.player_eye_y(), self.pos[2]];
@@ -1291,7 +1291,7 @@ impl Server {
         if reach_ok && m.alive() {
             self.player_attack_mob(&mut m);
         }
-        self.mobs.list[i] = Some(m);
+        self.mobs.list.put(i, m);
     }
 
     pub(crate) fn player_attack_mob(&mut self, m: &mut Mob) {
@@ -1325,7 +1325,7 @@ impl Server {
                 let ctx = self.damage_ctx(
                     ty,
                     crate::progress::pred::Who::Mob(m),
-                    m.pos,
+                    m.pos(),
                     Some(crate::progress::pred::Who::E(crate::commands::ents::E::Player)),
                     true,
                 );
@@ -1404,7 +1404,7 @@ impl Server {
                 let n = (dealt * 0.5) as i32;
                 self.particles(
                     "minecraft:damage_indicator",
-                    [m.pos[0], m.pos[1] + f64::from(m.height()) * 0.5, m.pos[2]],
+                    [m.pos()[0], m.pos()[1] + f64::from(m.height()) * 0.5, m.pos()[2]],
                     [0.1, 0.0, 0.1],
                     0.2,
                     n,
@@ -1685,19 +1685,22 @@ impl Server {
             max: [tb.max[0] + 1.0, tb.max[1] + 0.25, tb.max[2] + 1.0],
         };
         let me = self.name.clone();
+        // Allies are spared: the player's team looked up once, each entity's team found by its
+        // UUID (never formatted).
+        let own_team = self.cmd.scores.team_of(&me).map(|t| t.name.clone());
+        let ally = |s: &Self, uuid: u128| own_team.as_ref().is_some_and(|own| s.cmd.scores.uuid_in_team(uuid, own));
         let ids: Vec<i32> = self
             .mobs
             .list
             .iter()
-            .flatten()
-            .filter(|o| Some(o.id) != target && o.touches(&area) && super::mth::dist2(o.pos, self.pos) < 9.0)
-            .filter(|o| !self.same_team(&me, &crate::nbtio::uuid_text(o.uuid)))
+            .filter(|o| Some(o.id) != target && o.touches(&area) && super::mth::dist2(o.pos(), self.pos) < 9.0)
+            .filter(|o| !ally(self, o.uuid))
             .map(|o| o.id)
             .collect();
         let (s, c) = (sin(self.yaw * DEG), cos(self.yaw * DEG));
         for id in ids {
             let Some(i) = self.mob_index(id) else { continue };
-            let mut o = self.mobs.list[i].take().expect("mob");
+            let mut o = self.mobs.list.take(i).expect("mob");
             let dmg = (sweep + weapon.map_or(0.0, |w| self.enchanted_bonus(w, &o))) * scale;
             if self.mob_hurt(&mut o, ty, dmg, Some(Ent::Player), Some(self.pos)) {
                 self.mob_knockback(&mut o, 0.4, f64::from(s), f64::from(-c), Some(Ent::Player), dmg, false);
@@ -1709,14 +1712,13 @@ impl Server {
                 };
                 self.post_attack(&mut hit, weapon);
             }
-            self.mobs.list[i] = Some(o);
+            self.mobs.list.put(i, o);
         }
         // Armor stands (markers left out) and mannequins: the stand takes the hit as a stand
         // (wobble or broken), the mannequin as a living entity.
         let bonus = weapon.map_or(0.0, |w| self.sharpness_bonus(w));
         for d in self.deco_living() {
-            let ally = self.same_team(&me, &crate::nbtio::uuid_text(d.uuid));
-            if d.marker || ally || !d.bbox.intersects(&area) || super::mth::dist2(d.pos, self.pos) >= 9.0 {
+            if d.marker || !d.bbox.intersects(&area) || super::mth::dist2(d.pos, self.pos) >= 9.0 || ally(self, d.uuid) {
                 continue;
             }
             let Some(e) = self.deco_nbt(d.id).cloned() else { continue };

@@ -6,7 +6,7 @@
 //! `RUSTCRAFT_OPT_SHAPECULL`); switch off, the old "one box covers the
 //! side" approximation. The current comes from `rc_physics::FluidTables::flow`, shared with the physics.
 
-use rc_data::{VersionData, flags};
+use rc_data::{VersionData, flags, java_math};
 
 use crate::blocks::Tint;
 use crate::wire::MeshJob;
@@ -138,17 +138,6 @@ pub(crate) fn color(tint: u32, factor: f32) -> u32 {
     (ch(16) << 16) | (ch(8) << 8) | ch(0) | 0xff00_0000
 }
 
-/// Sine table (65,536 entries), like the game.
-fn table_sin(a: f32) -> f32 {
-    let i = ((a * 10_430.378) as i64 & 0xffff) as f64;
-    (i * std::f64::consts::TAU / 65_536.0).sin() as f32
-}
-
-fn table_cos(a: f32) -> f32 {
-    let i = (((a * 10_430.378) as i64 + 16_384) & 0xffff) as f64;
-    (i * std::f64::consts::TAU / 65_536.0).sin() as f32
-}
-
 /// Faces of the fluid of block `(x, y, z)` (coordinates relative to the column).
 #[allow(clippy::too_many_arguments)]
 pub fn mesh_fluid<B: Blocks>(
@@ -228,7 +217,8 @@ pub fn mesh_fluid<B: Blocks>(
             (still, [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]])
         } else {
             let a = (fl_z.atan2(fl_x) - std::f64::consts::FRAC_PI_2) as f32;
-            let (s, k) = (table_sin(a) * 0.25, table_cos(a) * 0.25);
+            // The game widens the float angle before its table product (an index in double).
+            let (s, k) = (java_math::sin(f64::from(a)) * 0.25, java_math::cos(f64::from(a)) * 0.25);
             (
                 flow,
                 [

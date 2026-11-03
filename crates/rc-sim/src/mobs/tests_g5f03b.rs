@@ -41,7 +41,7 @@ fn spawn(p: &mut Probe, k: Kind, pos: [f64; 3]) -> i32 {
     let mut m = p.s.new_mob(k, pos, 0.0);
     let mut g = super::spawn::Group::default();
     p.s.finalize_spawn(&mut m, super::spawn::Reason::SpawnEgg, &mut g);
-    m.pos = pos;
+    m.set_pos(pos);
     let id = m.id;
     p.s.add_mob(m);
     id
@@ -57,7 +57,7 @@ fn bare(p: &mut Probe, k: Kind, pos: [f64; 3]) -> i32 {
 
 fn take(p: &mut Probe, id: i32) -> (usize, Box<Mob>) {
     let i = p.s.mob_index(id).expect("mob");
-    (i, p.s.mobs.list[i].take().expect("mob"))
+    (i, p.s.mobs.list.take(i).expect("mob"))
 }
 
 fn sounds(p: &Probe, events: &[Event]) -> Vec<String> {
@@ -89,7 +89,7 @@ fn dead_players_forgiven() {
     let far = spawn(&mut p, Kind::IronGolem, [216.5, -59.0, 250.5]);
     for id in [near, far] {
         let i = p.s.mob_index(id).unwrap();
-        let m = p.s.mobs.list[i].as_mut().unwrap();
+        let m = p.s.mobs.list.get_mut(i).unwrap();
         m.anger_target = Some(Ent::Player);
         m.golem.angry_at = Some(me);
         m.target = Some(Ent::Player);
@@ -131,7 +131,7 @@ fn wolf_shake() {
     p.s.wolf_shake_tick(&mut m);
     assert!(has_event(&p.take_events(), w, 56), "interruption missing");
     assert!(!m.x.shaking);
-    p.s.mobs.list[i] = Some(m);
+    p.s.mobs.list.put(i, m);
     cleanup(p, dir);
 }
 
@@ -159,14 +159,14 @@ fn creeper_lighter_fall_and_cloud() {
     assert_eq!(m.swell, 15);
     p.s.fall_on(&mut m, stone, 30.0);
     assert_eq!(m.swell, m.fuse - 5);
-    p.s.mobs.list[i] = Some(m);
+    p.s.mobs.list.put(i, m);
     // Cloud.
     let (i, mut m) = take(&mut p, c);
     p.s.give_mob_effect(&mut m, "minecraft:speed", 400, 0);
     m.swell = m.fuse - 1;
     let before = p.s.proj.clouds.len();
     assert!(p.s.creeper_tick(&mut m), "no explosion");
-    p.s.mobs.list[i] = Some(m);
+    p.s.mobs.list.put(i, m);
     let cloud = p.s.proj.clouds.get(before).expect("cloud missing");
     assert_eq!((cloud.radius, cloud.duration, cloud.wait_time), (2.5, 300, 10));
     cleanup(p, dir);
@@ -196,7 +196,7 @@ fn enderman_box_and_carried_block() {
     let c = out.get("carriedBlockState").unwrap();
     assert_eq!(c.get("id"), Some(&Nbt::String("minecraft:oak_log".into())));
     assert!(c.get("properties").is_some() && c.get("Name").is_none());
-    p.s.mobs.list[i] = Some(m);
+    p.s.mobs.list.put(i, m);
     cleanup(p, dir);
 }
 
@@ -218,7 +218,7 @@ fn conversion_copies_the_state() {
     assert!(n.nbt.as_ref().and_then(|e| e.get("Tags")).is_some(), "tags lost");
     assert_eq!(n.mount.vehicle, Some(chicken));
     assert_eq!(p.s.mob_ref(chicken).unwrap().mount.passengers, vec![Ent::Mob(n.id)]);
-    p.s.mobs.list[i] = Some(m);
+    p.s.mobs.list.put(i, m);
     cleanup(p, dir);
 }
 
@@ -255,7 +255,7 @@ fn synced_attributes() {
     assert_eq!(attrs(&p.take_events()), vec![1], "only the changed attribute, once");
     p.s.send_changes(&mut m);
     assert!(attrs(&p.take_events()).is_empty(), "sent twice");
-    p.s.mobs.list[i] = Some(m);
+    p.s.mobs.list.put(i, m);
     cleanup(p, dir);
 }
 
@@ -286,7 +286,7 @@ fn skeleton_bow_in_off_hand() {
     m.equipment[1] = Some(Stack { id: "minecraft:bow".into(), count: 1, components: None });
     super::brains::reassess_weapon(&p.s, &mut m);
     assert!(m.goals.goals.iter().any(|w| matches!(w.goal, Goal::Bow { .. })), "no bow");
-    p.s.mobs.list[i] = Some(m);
+    p.s.mobs.list.put(i, m);
     cleanup(p, dir);
 }
 
@@ -354,7 +354,7 @@ fn fire_reset_and_lightning() {
     assert_eq!(m.fire, 0, "negative fire kept");
     p.s.mob_thunder_hit_default(&mut m);
     assert_eq!(m.fire, 1, "lightning: a single tick of fire");
-    p.s.mobs.list[i] = Some(m);
+    p.s.mobs.list.put(i, m);
     cleanup(p, dir);
 }
 
@@ -402,7 +402,7 @@ fn silent_mob() {
     m.x.silent = false;
     p.s.make_sound(&mut m, "minecraft:entity.cow.ambient");
     assert_eq!(sounds(&p, &p.take_events()), vec!["minecraft:entity.cow.ambient".to_owned()]);
-    p.s.mobs.list[i] = Some(m);
+    p.s.mobs.list.put(i, m);
     cleanup(p, dir);
 }
 
@@ -417,7 +417,7 @@ fn saddle_and_name_tag_in_creative() {
     p.s.slots[slot] = Some(Stack { id: "minecraft:saddle".into(), count: 2, components: None });
     assert!(p.s.player_interact(strider, 0), "saddle refused");
     let i = p.s.mob_index(strider).unwrap();
-    assert!(p.s.mobs.list[i].as_ref().unwrap().equipment[super::mounts::SADDLE].is_some(), "saddle not placed");
+    assert!(p.s.mobs.list.get(i).unwrap().equipment[super::mounts::SADDLE].is_some(), "saddle not placed");
     assert_eq!(p.s.slots[slot].as_ref().map(|s| s.count), Some(2), "saddle removed in creative");
     let cow = spawn(&mut p, Kind::Cow, [212.5, -59.0, 206.5]);
     let mut tag = Stack { id: "minecraft:name_tag".into(), count: 2, components: None };
@@ -439,7 +439,7 @@ fn pig_meal() {
     let Some((mut p, dir)) = probe("g5f03-pig") else { return };
     let pig = spawn(&mut p, Kind::Pig, [216.5, -59.0, 206.5]);
     let i = p.s.mob_index(pig).unwrap();
-    p.s.mobs.list[i].as_mut().unwrap().age = 0;
+    p.s.mobs.list.get_mut(i).unwrap().age = 0;
     let slot = 36 + p.s.held as usize;
     p.s.slots[slot] = Some(Stack { id: "minecraft:carrot".into(), count: 3, components: None });
     let _ = p.take_events();

@@ -8,7 +8,7 @@ use rc_proto_v777::scores::ScoreEvent;
 use rc_text::{Component, HoverEvent};
 
 use super::cmds_basic::Track;
-use super::scores::{Board, Objective, SLOTS, Team};
+use super::scores::{Board, Objective, SLOTS, ScoreTarget, Team};
 use super::src::{Fail, Src};
 use super::text::{self, lit};
 use super::{Parsed, R, Seg};
@@ -59,8 +59,24 @@ impl Server {
 
     /// Writing a score: display name copied if the objective asks for it.
     pub(crate) fn score_set(&mut self, h: &str, obj: &str, v: i32) {
+        if self.cmd.scores.paths().one_lookup {
+            let target = self.cmd.scores.score_target(obj);
+            let name = self.copied_name(h, target.auto_update, None);
+            self.cmd.scores.update_score(h, obj, target, name, |_| v);
+            return;
+        }
         let mut sync = self.cmd.scores.touch(h, obj);
         self.score_write(h, obj, v, &mut sync, None);
+    }
+
+    /// Display name of `h` to copy into a score, computed only when the objective `copies` it
+    /// (automatic display name update). `shown`: the caller's, when the holder can no longer be
+    /// found by its UUID (mob that left the list during its tick).
+    fn copied_name(&self, h: &str, copies: bool, shown: Option<&Component>) -> Option<Nbt> {
+        if !copies {
+            return None;
+        }
+        shown.cloned().or_else(|| self.holder_display(h)).map(|c| text::to_nbt(&c))
     }
 
     /// Writing through an open access (`sync`: score created by this access and not yet sent;
@@ -73,6 +89,27 @@ impl Server {
             None
         };
         self.cmd.scores.write(h, obj, v, name, *sync);
+        *sync = false;
+    }
+
+    /// Opens a score for a command that reads it before writing (created silently): its value
+    /// and whether this access created it, in one lookup (`RUSTCRAFT_OPT_SCOREONELOOKUP=0`: two).
+    fn open_for_write(&mut self, h: &str, obj: &str) -> (i32, bool) {
+        if self.cmd.scores.paths().one_lookup {
+            return self.cmd.scores.open_score(h, obj);
+        }
+        let created = self.cmd.scores.touch(h, obj);
+        (self.cmd.scores.get(h, obj).unwrap_or(0), created)
+    }
+
+    /// [`Server::score_write`] with the objective state looked up once by the command
+    /// (`RUSTCRAFT_OPT_SCOREONELOOKUP=0`: looked up again at each write).
+    fn write_opened(&mut self, h: &str, obj: &str, target: ScoreTarget, v: i32, sync: &mut bool) {
+        if !self.cmd.scores.paths().one_lookup {
+            return self.score_write(h, obj, v, sync, None);
+        }
+        let name = self.copied_name(h, target.auto_update, None);
+        self.cmd.scores.write_score(h, obj, target, v, name, *sync);
         *sync = false;
     }
 
@@ -90,7 +127,16 @@ impl Server {
         shown: Option<&Component>,
         f: impl Fn(i32) -> i32,
     ) {
-        if !self.cmd.scores.objectives.iter().any(|o| o.criteria == criteria) {
+        let scores = &self.cmd.scores;
+        if !scores.objectives.iter().any(|o| o.criteria == criteria) {
+            return;
+        }
+        if scores.paths().one_lookup {
+            // The holder's display name, computed once for every objective that copies it.
+            let copies =
+                scores.objectives.iter().any(|o| o.criteria == criteria && scores.score_target(&o.name).auto_update);
+            let name = self.copied_name(h, copies, shown);
+            self.cmd.scores.update_criteria(criteria, h, name, f);
             return;
         }
         for o in self.cmd.scores.objectives_of(criteria) {
@@ -316,10 +362,8 @@ impl Server {
                     let entries: Vec<(String, i32)> = self
                         .cmd
                         .scores
-                        .scores
-                        .iter()
-                        .find(|(x, _)| *x == h)
-                        .map(|(_, m)| m.iter().map(|(o, sc)| (o.clone(), sc.value)).collect())
+                        .holder_scores(&h)
+                        .map(|m| m.iter().map(|(o, sc)| (o.clone(), sc.value)).collect())
                         .unwrap_or_default();
                     let hn = self.holder_name(&h);
                     if entries.is_empty() {
@@ -355,15 +399,23 @@ impl Server {
                 let hs = self.arg_score_holders(s, &a("targets"))?;
                 let o = self.writable(&a("objective"))?;
                 let v: i32 = a("score").parse().unwrap_or(0);
+                let new_value = |cur: i32| match op {
+                    "set" => v,
+                    "add" => cur.wrapping_add(v),
+                    _ => cur.wrapping_sub(v),
+                };
                 let mut t: Track<String> = Track::default();
+                let target = self.cmd.scores.score_target(&o.name);
                 for h in &hs {
-                    let cur = self.cmd.scores.get(h, &o.name).unwrap_or(0);
-                    let nv = match op {
-                        "set" => v,
-                        "add" => cur.wrapping_add(v),
-                        _ => cur.wrapping_sub(v),
+                    let nv = if self.cmd.scores.paths().one_lookup {
+                        let name = self.copied_name(h, target.auto_update, None);
+                        self.cmd.scores.update_score(h, &o.name, target, name, new_value)
+                    } else {
+                        let nv = new_value(self.cmd.scores.get(h, &o.name).unwrap_or(0));
+                        let mut sync = self.cmd.scores.touch(h, &o.name);
+                        self.score_write(h, &o.name, nv, &mut sync, None);
+                        nv
                     };
-                    self.score_set(h, &o.name, nv);
                     t.track(h.clone(), nv);
                 }
                 let on = objective_name(&o);
@@ -465,15 +517,18 @@ impl Server {
                 let so = self.objective_or_fail(&a("sourceObjective"))?;
                 let oper = a("operation");
                 let mut t: Track<String> = Track::default();
+                let (to_target, so_target) =
+                    (self.cmd.scores.score_target(&to.name), self.cmd.scores.score_target(&so.name));
                 // Like the game: target then each source opened (created without a packet), only
                 // writes send; a score created by the current access is sent at its
                 // first write, even unchanged.
                 for h in &ts {
-                    let mut tsync = self.cmd.scores.touch(h, &to.name);
+                    let (_, mut tsync) = self.open_for_write(h, &to.name);
                     for src in &ss {
-                        let mut ssync = self.cmd.scores.touch(src, &so.name);
+                        let (y, mut ssync) = self.open_for_write(src, &so.name);
+                        // Read again for each source: the previous one wrote it (the source may even
+                        // be the same score).
                         let x = self.cmd.scores.get(h, &to.name).unwrap_or(0);
-                        let y = self.cmd.scores.get(src, &so.name).unwrap_or(0);
                         let v = match oper.as_str() {
                             "=" => y,
                             "+=" => x.wrapping_add(y),
@@ -488,12 +543,12 @@ impl Server {
                             ">" => x.max(y),
                             _ => {
                                 // Swap: the target first, then the source.
-                                self.score_write(h, &to.name, y, &mut tsync, None);
-                                self.score_write(src, &so.name, x, &mut ssync, None);
+                                self.write_opened(h, &to.name, to_target, y, &mut tsync);
+                                self.write_opened(src, &so.name, so_target, x, &mut ssync);
                                 continue;
                             }
                         };
-                        self.score_write(h, &to.name, v, &mut tsync, None);
+                        self.write_opened(h, &to.name, to_target, v, &mut tsync);
                     }
                     t.track(h.clone(), self.cmd.scores.get(h, &to.name).unwrap_or(0));
                 }

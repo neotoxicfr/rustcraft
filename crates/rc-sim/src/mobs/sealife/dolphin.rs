@@ -56,7 +56,7 @@ pub fn smooth_move_control(m: &mut Mob, in_water: f32, outside: f32) {
     }
     if m.move_ctl.op == MoveOp::MoveTo && !m.nav.is_done() {
         let w = m.move_ctl.wanted;
-        let (xd, yd, zd) = (w[0] - m.pos[0], w[1] - m.pos[1], w[2] - m.pos[2]);
+        let (xd, yd, zd) = (w[0] - m.pos()[0], w[1] - m.pos()[1], w[2] - m.pos()[2]);
         let dd = xd * xd + yd * yd + zd * zd;
         if dd < f64::from(2.500_000_3e-7f32) {
             m.zza = 0.0;
@@ -97,7 +97,7 @@ pub fn smooth_look_control(m: &mut Mob) {
     if m.look.cooldown > 0 {
         m.look.cooldown -= 1;
         let w = m.look.wanted;
-        let (xd, zd) = (w[0] - m.pos[0], w[2] - m.pos[2]);
+        let (xd, zd) = (w[0] - m.pos()[0], w[2] - m.pos()[2]);
         if zd.abs() > f64::from(1.0e-5f32) || xd.abs() > f64::from(1.0e-5f32) {
             m.head_yaw = rotate_towards(m.head_yaw, yaw_to(xd, zd) + 20.0, m.look.y_max);
         }
@@ -241,7 +241,7 @@ impl Server {
             f64::from(0.3 * sin(xr) * 1.5),
             f64::from(0.3 * cos(yr) * cos(xr) + sin(dir) * pow2),
         ];
-        self.spawn_item([m.pos[0], y, m.pos[2]], v, st, 40);
+        self.spawn_item([m.pos()[0], y, m.pos()[2]], v, st, 40);
     }
 
     pub(crate) fn dolphin_can_use(&mut self, g: &mut AGoal, m: &mut Mob) -> bool {
@@ -253,7 +253,7 @@ impl Server {
             AGoal::SwimWithPlayer { on } => {
                 *on = self.ent_alive(Ent::Player)
                     && self.game_mode != 3
-                    && dist2(m.pos, self.pos) <= 100.0
+                    && dist2(m.pos(), self.pos) <= 100.0
                     && self.player_swimming()
                     && m.target != Some(Ent::Player);
                 *on
@@ -291,11 +291,11 @@ impl Server {
         match g {
             AGoal::Treasure { stuck } => {
                 let Some(t) = m.sea.treasure else { return false };
-                let c = [f64::from(t[0]) + 0.5, m.pos[1].floor() + 0.5, f64::from(t[2]) + 0.5];
-                dist2(c, m.pos) >= 16.0 && !*stuck && m.air >= 100
+                let c = [f64::from(t[0]) + 0.5, m.pos()[1].floor() + 0.5, f64::from(t[2]) + 0.5];
+                dist2(c, m.pos()) >= 16.0 && !*stuck && m.air >= 100
             }
             AGoal::SwimWithPlayer { on } => {
-                *on && self.player_swimming() && dist2(m.pos, self.pos) < 256.0 && self.ent_alive(Ent::Player)
+                *on && self.player_swimming() && dist2(m.pos(), self.pos) < 256.0 && self.ent_alive(Ent::Player)
             }
             AGoal::Jump { .. } => {
                 let yd = m.vel[1];
@@ -315,8 +315,8 @@ impl Server {
             }
             AGoal::FindLiquid => {
                 let b = m.block_pos();
-                let lo = [(m.pos[0] - 2.0).floor() as i32, (m.pos[1] - 2.0).floor() as i32, (m.pos[2] - 2.0).floor() as i32];
-                let hi = [(m.pos[0] + 2.0).floor() as i32, b[1], (m.pos[2] + 2.0).floor() as i32];
+                let lo = [(m.pos()[0] - 2.0).floor() as i32, (m.pos()[1] - 2.0).floor() as i32, (m.pos()[2] - 2.0).floor() as i32];
+                let hi = [(m.pos()[0] + 2.0).floor() as i32, b[1], (m.pos()[2] + 2.0).floor() as i32];
                 'z: for z in lo[2]..=hi[2] {
                     for y in lo[1]..=hi[1] {
                         for x in lo[0]..=hi[0] {
@@ -372,8 +372,8 @@ impl Server {
         match g {
             AGoal::Treasure { stuck } => {
                 let close = m.sea.treasure.is_some_and(|t| {
-                    let c = [f64::from(t[0]) + 0.5, m.pos[1].floor() + 0.5, f64::from(t[2]) + 0.5];
-                    dist2(c, m.pos) < 16.0
+                    let c = [f64::from(t[0]) + 0.5, m.pos()[1].floor() + 0.5, f64::from(t[2]) + 0.5];
+                    dist2(c, m.pos()) < 16.0
                 });
                 if m.sea.treasure.is_none() || close || *stuck {
                     m.sea.got_fish = false;
@@ -409,7 +409,7 @@ impl Server {
             AGoal::SwimWithPlayer { .. } => {
                 let eye = self.player_eye_y();
                 self.look_at(m, [self.pos[0], eye, self.pos[2]], 21.0, 1.0);
-                if dist2(m.pos, self.pos) < 6.25 {
+                if dist2(m.pos(), self.pos) < 6.25 {
                     m.nav.stop();
                 } else {
                     let p = self.pos;
@@ -466,14 +466,14 @@ impl Server {
                 }
             }
         }
-        let d = dest.unwrap_or_else(|| super::super::mth::block_of([m.pos[0], m.pos[1] + 8.0, m.pos[2]]));
+        let d = dest.unwrap_or_else(|| super::super::mth::block_of([m.pos()[0], m.pos()[1] + 8.0, m.pos()[2]]));
         self.move_to_pos(m, [f64::from(d[0]), f64::from(d[1] + 1), f64::from(d[2])], 1.0);
     }
 
     fn treasure_tick(&mut self, m: &mut Mob, stuck: &mut bool) {
         let Some(t) = m.sea.treasure else { return };
         let close_next = m.nav.target_pos.is_some_and(|p| {
-            dist2([f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5], m.pos) < 144.0
+            dist2([f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5], m.pos()) < 144.0
         });
         if !(close_next || m.nav.is_done()) {
             return;
@@ -536,7 +536,7 @@ impl Server {
         }
         *recalc = super::super::mth::reduced(10);
         let pb = super::super::mth::block_of(self.pos);
-        let d = dist2(m.pos, self.pos).sqrt();
+        let d = dist2(m.pos(), self.pos).sqrt();
         if !*toward {
             // Horizontal direction of the player, opposite.
             let (dx, dz) = facing(self.yaw);

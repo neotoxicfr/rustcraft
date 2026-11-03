@@ -39,27 +39,40 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
       - name: Toolchain from rust-toolchain.toml
         run: rustup toolchain install && rustup show active-toolchain
+      # Reproducible output (see docs/reproducible-builds.md): the same commit gives the same bytes.
+      # The archives take the commit date instead of the clock; the executable gets its linker flags
+      # from .cargo/config.toml and has the paths of this runner replaced by fixed names.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Commit date and path hiding
+        shell: bash
+        run: |
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+          python -I tools/release/hide_paths.py config "$RUNNER_TEMP/hide-paths.toml"
       - name: Build (full release profile)
-        run: cargo build --locked --release -p rc-app
+        shell: bash
+        run: cargo build --locked --release -p rc-app --config "$RUNNER_TEMP/hide-paths.toml"
       - name: Package for Windows
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $v = $env:GITHUB_REF_NAME.TrimStart("v")
-          $dir = "pkg\files"
-          New-Item -ItemType Directory -Force $dir | Out-Null
-          Copy-Item target\release\rustcraft.exe, packaging\windows\INSTALL.txt, LICENSE-MIT, LICENSE-APACHE $dir
-          $zip = "pkg\rustcraft-$v-windows-x64.zip"
-          Compress-Archive -Path "$dir\*" -DestinationPath $zip
+        shell: bash
+        run: python -I tools/release/pack.py windows "${GITHUB_REF_NAME#v}" target/release/rustcraft.exe pkg
       - name: Package for Linux
         if: runner.os == 'Linux'
+        shell: bash
         run: |
-          v="${GITHUB_REF_NAME#v}"
-          mkdir -p pkg/files
-          cp target/release/rustcraft packaging/linux/rustcraft.sh packaging/linux/INSTALL.txt LICENSE-MIT LICENSE-APACHE pkg/files/
-          strip pkg/files/rustcraft
-          chmod 755 pkg/files/rustcraft pkg/files/rustcraft.sh
-          tar --owner=0 --group=0 -czf "pkg/rustcraft-$v-linux-x64.tar.gz" -C pkg/files .
+          mkdir -p pkg
+          cp target/release/rustcraft pkg/rustcraft
+          strip pkg/rustcraft
+          python -I tools/release/pack.py linux "${GITHUB_REF_NAME#v}" pkg/rustcraft pkg
+      # On the file that is shipped: before `strip`, the Linux executable also holds the debug info,
+      # which is never published.
+      - name: No path of this runner left in the shipped executable
+        shell: bash
+        run: |
+          exe=pkg/rustcraft
+          if [ "$RUNNER_OS" = Windows ]; then exe=target/release/rustcraft.exe; fi
+          python -I tools/release/hide_paths.py check "$exe"
       # One step and one format for both systems. PowerShell's Set-Content ended the Windows sum
       # with CRLF: `sha256sum -c` then reads the CR as part of the file name and fails. Git Bash's
       # sha256sum writes " *name" where Linux writes "  name", so the line is written by hand:

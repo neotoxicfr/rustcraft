@@ -137,17 +137,24 @@ const fn pad_index(i: usize) -> usize {
 
 /// Properties of the six neighbours (`Dir` order) of cell `c` of the grid.
 #[inline(always)]
-fn neighbor_props(pp: &[u32], c: usize) -> [u32; 6] {
-    [pp[c - 324], pp[c + 324], pp[c - 18], pp[c + 18], pp[c - 1], pp[c + 1]]
+fn neighbor_props(cell_props: &[u32], c: usize) -> [u32; 6] {
+    let p = cell_props;
+    [p[c - 324], p[c + 324], p[c - 18], p[c + 18], p[c - 1], p[c + 1]]
 }
 
 /// Properties of the section interior read through its palette (a table of 2^bits entries);
 /// `false` if the container has none (direct identifiers or palette too wide).
-fn palette_props(cont: &rc_world::Container, ct: &crate::cull::CullTables, rule: usize, values: &[u32], pp: &mut [u32]) -> bool {
+fn palette_props(
+    cont: &rc_world::Container,
+    ct: &crate::cull::CullTables,
+    rule: usize,
+    values: &[u32],
+    cell_props: &mut [u32],
+) -> bool {
     match cont {
         rc_world::Container::Single(v) => {
             let p = ct.prop(rule, *v);
-            (0..SECTION_BLOCKS).for_each(|i| pp[pad_index(i)] = p);
+            (0..SECTION_BLOCKS).for_each(|i| cell_props[pad_index(i)] = p);
             true
         }
         rc_world::Container::Packed { bits, palette: Some(pal), data } if (1..=8).contains(bits) => {
@@ -164,13 +171,13 @@ fn palette_props(cont: &rc_world::Container, ct: &crate::cull::CullTables, rule:
                     if i == SECTION_BLOCKS {
                         break 'words;
                     }
-                    pp[pad_index(i)] = tab[(w & mask) as usize];
+                    cell_props[pad_index(i)] = tab[(w & mask) as usize];
                     w >>= b;
                     i += 1;
                 }
             }
             // Cells beyond the words: values as unfolded.
-            (i..SECTION_BLOCKS).for_each(|i| pp[pad_index(i)] = ct.prop(rule, values[i]));
+            (i..SECTION_BLOCKS).for_each(|i| cell_props[pad_index(i)] = ct.prop(rule, values[i]));
             true
         }
         _ => false,
@@ -179,15 +186,15 @@ fn palette_props(cont: &rc_world::Container, ct: &crate::cull::CullTables, rule:
 
 /// Indices of the blocks of the section that can produce a face or a fluid (`cull::candidate`),
 /// by rows of 16, in increasing order.
-fn row_candidates(pp: &[u32], out: &mut Vec<u16>) {
+fn row_candidates(cell_props: &[u32], out: &mut Vec<u16>) {
     out.clear();
     for yz in 0..256usize {
         let base = pad_index(yz << 4);
         let mut m = 0u32;
         for x in 0..16 {
             let c = base + x;
-            let p = pp[c];
-            let sure = crate::cull::sure_hidden(p, neighbor_props(pp, c));
+            let p = cell_props[c];
+            let sure = crate::cull::sure_hidden(p, neighbor_props(cell_props, c));
             m |= u32::from(crate::cull::candidate(p, sure)) << x;
         }
         while m != 0 {
@@ -197,14 +204,90 @@ fn row_candidates(pp: &[u32], out: &mut Vec<u16>) {
     }
 }
 
+/// [`row_candidates`] computed on fixed 16-cell slices (the cell and its six neighbours), with
+/// the surely hidden faces of each candidate kept in `sure`: the per-block loop reads them instead
+/// of computing them again. AVX2 version when the processor has it (8 cells per instruction
+/// instead of 4).
+#[allow(unsafe_code)]
+fn row_candidates_with_sure(cell_props: &[u32], candidates: &mut Vec<u16>, sure: &mut Vec<u8>) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        #[target_feature(enable = "avx2")]
+        fn avx2(cell_props: &[u32], candidates: &mut Vec<u16>, sure: &mut Vec<u8>) {
+            row_candidates_by_lanes(cell_props, candidates, sure);
+        }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: AVX2 has just been detected on this processor.
+            return unsafe { avx2(cell_props, candidates, sure) };
+        }
+    }
+    row_candidates_by_lanes(cell_props, candidates, sure);
+}
+
+/// Body of [`row_candidates_with_sure`], compiled once per instruction set.
+#[inline(always)]
+fn row_candidates_by_lanes(cell_props: &[u32], candidates: &mut Vec<u16>, sure: &mut Vec<u8>) {
+    candidates.clear();
+    sure.clear();
+    for row in 0..256usize {
+        let cell = pad_index(row << 4);
+        let lane = |step: isize| -> &[u32; 16] {
+            let first = cell.wrapping_add_signed(step);
+            cell_props[first..first + 16].try_into().expect("16 cells")
+        };
+        // Written out rather than `PAD_STEP.map(lane)`, which the compiler leaves as a call.
+        let [down, up, north, south, west, east] = PAD_STEP;
+        let neighbours = [lane(down), lane(up), lane(north), lane(south), lane(west), lane(east)];
+        let (mut mask, row_sure) = candidate_row(lane(0), neighbours);
+        while mask != 0 {
+            let x = mask.trailing_zeros() as usize;
+            candidates.push((row << 4 | x) as u16);
+            sure.push(row_sure[x] as u8);
+            mask &= mask - 1;
+        }
+    }
+}
+
+/// Candidate mask (bit x) and surely hidden faces of the 16 cells of a row, from the row and its
+/// six neighbouring rows (`Dir` order). Same computation for every lane, no branch: the
+/// compiler turns the loop into vector instructions.
+#[inline(always)]
+fn candidate_row(center: &[u32; 16], neighbours: [&[u32; 16]; 6]) -> (u32, [u32; 16]) {
+    let mut sure = [0u32; 16];
+    let mut mask = 0u32;
+    for x in 0..16 {
+        let s = crate::cull::sure_hidden(center[x], neighbours.map(|n| n[x]));
+        sure[x] = s;
+        mask |= crate::cull::candidate_bit(center[x], s) << x;
+    }
+    (mask, sure)
+}
+
+/// Bits of the solid render cells of 16 consecutive cells of the property grid.
+#[inline(always)]
+fn solid_row_bits(props: &[u32]) -> u64 {
+    props.iter().enumerate().fold(0, |m, (x, &p)| m | u64::from(p & crate::cull::SOLID_RENDER_BIT != 0) << x)
+}
+
+/// Solid render mask of the section (bit i = block i) read from the interior of the property grid.
+fn solid_mask_of_props(cell_props: &[u32]) -> [u64; 64] {
+    let mut bits = [0u64; 64];
+    for row in 0..256usize {
+        let cell = pad_index(row << 4);
+        // 16 cells per row, 4 rows per 64-bit word of the mask.
+        bits[row >> 2] |= solid_row_bits(&cell_props[cell..cell + 16]) << ((row & 3) * 16);
+    }
+    bits
+}
+
 /// [`sealed_section`] read from the property grid: same test (sealed inside,
 /// covering border on the section side).
-fn sealed_props(pp: &[u32]) -> bool {
+fn sealed_props(cell_props: &[u32]) -> bool {
     use crate::cull::{HS, SEALED_BIT};
-    if !(0..SECTION_BLOCKS).all(|i| pp[pad_index(i)] & SEALED_BIT != 0) {
+    if !(0..SECTION_BLOCKS).all(|i| cell_props[pad_index(i)] & SEALED_BIT != 0) {
         return false;
     }
-    let covers = |i: usize, d: Dir| pp[i] >> (HS + d as u32) & 1 == 1;
+    let covers = |i: usize, d: Dir| cell_props[i] >> (HS + d as u32) & 1 == 1;
     (1..17).all(|a| {
         (1..17).all(|b| {
             covers(a * 18 + b, Dir::Up)
@@ -215,6 +298,280 @@ fn sealed_props(pp: &[u32]) -> bool {
                 && covers(a * 324 + b * 18 + 17, Dir::West)
         })
     })
+}
+
+/// Blocks of one (y, z) row of a section.
+const ROW_BLOCKS: usize = 256;
+
+/// States of a section of the centre column, as decoded for this meshing.
+enum UnfoldedSection {
+    /// Empty (air), or not read by this meshing (partial remesh, far from the remeshed sections).
+    Absent,
+    /// All the states (index y << 8 | z << 4 | x).
+    Full(Box<[u32; SECTION_BLOCKS]>),
+    /// Only the rows y = 0 then y = 15: neighbour of a remeshed section, outside the remesh,
+    /// read only as the border of its neighbour (`CullPaths::border_rows_only`).
+    BorderRows(Box<[u32; 2 * ROW_BLOCKS]>),
+}
+
+/// Row y = 0 or y = 15 of a section, seen as the bottom or top border of its neighbour.
+#[derive(Clone, Copy)]
+enum BorderRow<'a> {
+    /// Below the bottom or above the top of the world.
+    Outside,
+    Air,
+    States(&'a [u32; ROW_BLOCKS]),
+}
+
+impl BorderRow<'_> {
+    /// Row `y` (0 or 15) of section `s` of the column (`None`: below the world).
+    fn of(sections: &[UnfoldedSection], s: Option<usize>, y: usize) -> BorderRow<'_> {
+        debug_assert!(y == 0 || y == 15, "border row {y}");
+        match s.and_then(|s| sections.get(s)) {
+            None => BorderRow::Outside,
+            Some(UnfoldedSection::Absent) => BorderRow::Air,
+            Some(UnfoldedSection::Full(v)) => BorderRow::States(&v.as_chunks::<ROW_BLOCKS>().0[y]),
+            Some(UnfoldedSection::BorderRows(r)) => {
+                BorderRow::States(&r.as_chunks::<ROW_BLOCKS>().0[usize::from(y == 15)])
+            }
+        }
+    }
+
+    /// State of block `xz` (z << 4 | x) of the row.
+    #[inline]
+    fn at(self, xz: usize) -> u32 {
+        match self {
+            BorderRow::Outside => OUTSIDE,
+            BorderRow::Air => 0,
+            BorderRow::States(r) => r[xz],
+        }
+    }
+}
+
+/// What the fill of a section's 18³ grids reads besides the section's own states.
+struct GridFill<'a> {
+    job: &'a MeshJob,
+    sections: &'a [UnfoldedSection],
+    height: i32,
+    paths: crate::cull::CullPaths,
+    cull_tables: &'a crate::cull::CullTables,
+    /// Face removal rule (index of `CullTables::props`).
+    rule: usize,
+    /// The property grid is filled along with the states one.
+    with_props: bool,
+}
+
+/// Fills the 18³ grids of section `si` (step x 1, z 18, y 324; `OUTSIDE` outside the available
+/// columns): states, and properties when the grid is used. Returns the solid render mask of the
+/// section when it is read from the properties (`CullPaths::solid_from_props`).
+fn fill_section_grids(
+    f: &GridFill<'_>,
+    si: usize,
+    values: &[u32; SECTION_BLOCKS],
+    state_grid: &mut [u32],
+    cell_props: &mut [u32],
+) -> Option<[u64; 64]> {
+    let paths = f.paths;
+    // Interior through the palette: the interior cells then skip their per-state lookup.
+    let interior_props_done = f.with_props
+        && paths.palprops
+        && palette_props(&f.job.center.sections[si].blocks, f.cull_tables, f.rule, &values[..], cell_props);
+    let mut solid = (f.with_props && paths.solid_from_props).then_some([0u64; 64]);
+    if paths.fill_rows {
+        fill_interior_rows(f, values, state_grid, cell_props, interior_props_done, solid.as_mut());
+        fill_bottom_and_top_rows(f, si, state_grid, cell_props);
+        for pz in 0..18 {
+            for px in 0..18 {
+                if px == 0 || px == 17 || pz == 0 || pz == 17 {
+                    fill_ring_stack(f, si, (px, pz), state_grid, cell_props);
+                }
+            }
+        }
+    } else {
+        fill_by_stacks(f, si, values, state_grid, cell_props, interior_props_done);
+        if let Some(s) = solid.as_mut() {
+            *s = solid_mask_of_props(cell_props);
+        }
+    }
+    solid
+}
+
+/// Interior of the grids by (y, z) rows: the 16 contiguous states of the section copied to 16
+/// contiguous cells, their properties looked up in the same pass (and their solid render bits
+/// gathered into `solid`).
+fn fill_interior_rows(
+    f: &GridFill<'_>,
+    values: &[u32; SECTION_BLOCKS],
+    state_grid: &mut [u32],
+    cell_props: &mut [u32],
+    props_done: bool,
+    mut solid: Option<&mut [u64; 64]>,
+) {
+    let table = &f.cull_tables.props[f.rule][..];
+    for (row, states) in values.as_chunks::<16>().0.iter().enumerate() {
+        let cell = pad_index(row << 4);
+        state_grid[cell..cell + 16].copy_from_slice(states);
+        if !f.with_props {
+            continue;
+        }
+        let props = &mut cell_props[cell..cell + 16];
+        if !props_done {
+            for (p, &s) in props.iter_mut().zip(states) {
+                *p = crate::cull::state_prop(table, s);
+            }
+        }
+        if let Some(solid) = solid.as_deref_mut() {
+            // 16 cells per row, 4 rows per 64-bit word of the mask.
+            solid[row >> 2] |= solid_row_bits(props) << ((row & 3) * 16);
+        }
+    }
+}
+
+/// Bottom and top layers of the grids inside x and z (y = -1 and 16): rows 15 and 0 of the
+/// sections below and above, copied 16 cells at a time.
+fn fill_bottom_and_top_rows(f: &GridFill<'_>, si: usize, state_grid: &mut [u32], cell_props: &mut [u32]) {
+    let below = BorderRow::of(f.sections, si.checked_sub(1), 15);
+    let above = BorderRow::of(f.sections, Some(si + 1), 0);
+    for (grid_y, row) in [(0, below), (17, above)] {
+        for z in 0..16 {
+            let cell = grid_y * 324 + (z + 1) * 18 + 1;
+            let states = &mut state_grid[cell..cell + 16];
+            match row {
+                BorderRow::Outside => states.fill(OUTSIDE),
+                BorderRow::Air => states.fill(0),
+                BorderRow::States(r) => states.copy_from_slice(&r[z * 16..z * 16 + 16]),
+            }
+            if f.with_props {
+                for (p, &s) in cell_props[cell..cell + 16].iter_mut().zip(&*states) {
+                    *p = f.cull_tables.prop(f.rule, s);
+                }
+            }
+        }
+    }
+}
+
+/// Old order of the fill: one vertical stack (step 324) per (x, z) of the grids.
+fn fill_by_stacks(
+    f: &GridFill<'_>,
+    si: usize,
+    values: &[u32; SECTION_BLOCKS],
+    state_grid: &mut [u32],
+    cell_props: &mut [u32],
+    props_done: bool,
+) {
+    let below = BorderRow::of(f.sections, si.checked_sub(1), 15);
+    let above = BorderRow::of(f.sections, Some(si + 1), 0);
+    let (ct, rule) = (f.cull_tables, f.rule);
+    for pz in 0..18usize {
+        for px in 0..18usize {
+            if !((1..17).contains(&px) && (1..17).contains(&pz)) {
+                fill_ring_stack(f, si, (px, pz), state_grid, cell_props);
+                continue;
+            }
+            let column_base = pz * 18 + px;
+            let xz = ((pz - 1) << 4) | (px - 1);
+            for y in 0..16 {
+                state_grid[column_base + (y + 1) * 324] = values[(y << 8) | xz];
+            }
+            if f.with_props && !props_done {
+                for y in 0..16 {
+                    cell_props[column_base + (y + 1) * 324] = ct.prop(rule, values[(y << 8) | xz]);
+                }
+            }
+            let top = column_base + 17 * 324;
+            state_grid[column_base] = below.at(xz);
+            state_grid[top] = above.at(xz);
+            if f.with_props {
+                cell_props[column_base] = ct.prop(rule, state_grid[column_base]);
+                cell_props[top] = ct.prop(rule, state_grid[top]);
+            }
+        }
+    }
+}
+
+/// Stack (px, pz) of the ring of the grids (x or z on the border), 18 cells from y = -1 to 16,
+/// read from the neighbouring column.
+fn fill_ring_stack(
+    f: &GridFill<'_>,
+    si: usize,
+    (px, pz): (usize, usize),
+    state_grid: &mut [u32],
+    cell_props: &mut [u32],
+) {
+    let (x, z) = (px as i32 - 1, pz as i32 - 1);
+    let column_base = pz * 18 + px;
+    let col = locate(f.job, x, z);
+    let (base, height) = (si as i32 * 16, f.height);
+    if f.paths.pile {
+        // Bottom and top read one by one, the 16 cells of the section in one go (one division
+        // per stack).
+        let at = |y: i32| match col {
+            Some((cc, lx, lz)) if (0..height).contains(&y) => cc.block(lx, y as usize, lz).unwrap_or(OUTSIDE),
+            _ => OUTSIDE,
+        };
+        state_grid[column_base] = at(base - 1);
+        state_grid[column_base + 17 * 324] = at(base + 16);
+        match col.and_then(|(cc, lx, lz)| Some((cc.sections.get(si)?, lx, lz))) {
+            Some((s, lx, lz)) => {
+                for (py, v) in (1..17).zip(s.blocks.column_iter(lx, lz, 0..16)) {
+                    state_grid[column_base + py * 324] = v;
+                }
+            }
+            None => (1..17).for_each(|py| state_grid[column_base + py * 324] = OUTSIDE),
+        }
+    } else {
+        for py in 0..18i32 {
+            let y = base + py - 1;
+            state_grid[column_base + py as usize * 324] = if (0..height).contains(&y) {
+                col.and_then(|(c, lx, lz)| c.block(lx, y as usize, lz)).unwrap_or(OUTSIDE)
+            } else {
+                OUTSIDE
+            };
+        }
+    }
+    if f.with_props {
+        for py in 0..18 {
+            let cell = column_base + py * 324;
+            cell_props[cell] = f.cull_tables.prop(f.rule, state_grid[cell]);
+        }
+    }
+}
+
+/// Decodes the sections of the column that this meshing reads: every non-empty one for a full
+/// mesh; for a partial one (`remeshed`), the remeshed sections and their neighbours above and
+/// below (border of the grids), those reduced to their two border rows if `border_rows_only`.
+/// Buffers taken from `scratch` (no allocation per section).
+fn unfold_sections(
+    c: &Column,
+    remeshed: Option<&crate::wire::Sections>,
+    border_rows_only: bool,
+    scratch: &mut Scratch,
+) -> Vec<UnfoldedSection> {
+    c.sections
+        .iter()
+        .enumerate()
+        .map(|(si, s)| {
+            let (full, border) = match remeshed {
+                None => (true, false),
+                Some(m) => {
+                    (m.contains(si), m.contains(si + 1) || si.checked_sub(1).is_some_and(|b| m.contains(b)))
+                }
+            };
+            if s.is_empty() || !(full || border) {
+                return UnfoldedSection::Absent;
+            }
+            if !full && border_rows_only {
+                let mut rows = scratch.border_rows.pop().unwrap_or_else(|| Box::new([0u32; 2 * ROW_BLOCKS]));
+                let (bottom, top) = rows.split_at_mut(ROW_BLOCKS);
+                s.blocks.unpack_range(0, bottom);
+                s.blocks.unpack_range(15 * ROW_BLOCKS, top);
+                return UnfoldedSection::BorderRows(rows);
+            }
+            let mut v = scratch.boxes.pop().unwrap_or_else(|| Box::new([0u32; SECTION_BLOCKS]));
+            s.blocks.unpack_into(&mut v[..]);
+            UnfoldedSection::Full(v)
+        })
+        .collect()
 }
 
 impl Tables {
@@ -283,7 +640,8 @@ impl Tables {
         let (offset_class, offset_classes) = offset_classes(&offset);
         let is_fluid: Vec<bool> =
             (0..d.states.len()).map(|s| fluid.flow.fluid(s as u32) != crate::fluid::Fluid::None).collect();
-        let cull = crate::cull::CullTables::new(d, &covers, &cull_dirs, &air, &leaves, &sealed, &is_fluid);
+        let light_info = crate::light::state_info(d);
+        let cull = crate::cull::CullTables::new(d, &covers, &cull_dirs, &air, &leaves, &sealed, &is_fluid, &light_info);
         Tables {
             cull,
             sealed,
@@ -293,7 +651,7 @@ impl Tables {
             offset_class,
             offset_classes,
             bucket: face_buckets(&models),
-            light_info: crate::light::state_info(d),
+            light_info,
             // Only if the path is used (switch off: neither the memory nor the walk).
             light_faces: if crate::light::LightPaths::from_env().facetab {
                 crate::light::FaceTables::new(models.quads.iter().map(|q| (&q.pos, q.dir)))
@@ -1248,7 +1606,7 @@ pub fn blend_matches_reference(job: &MeshJob, palette: &BiomePalette) -> bool {
 /// States around the column: decompressed sections at the centre, neighbours otherwise.
 struct Around<'a> {
     job: &'a MeshJob,
-    unpacked: &'a [Option<Box<[u32; SECTION_BLOCKS]>>],
+    unpacked: &'a [UnfoldedSection],
     height: i32,
 }
 
@@ -1259,9 +1617,10 @@ impl crate::fluid::Blocks for Around<'_> {
         }
         if (0..16).contains(&x) && (0..16).contains(&z) {
             return Some(match &self.unpacked[(y >> 4) as usize] {
-                Some(v) => v[((y as usize & 15) << 8) | ((z as usize) << 4) | x as usize],
-                // Empty section, or not decompressed (partial remeshing): read from the column.
-                None => self.job.center.block(x as usize, y as usize, z as usize).unwrap_or(0),
+                UnfoldedSection::Full(v) => v[((y as usize & 15) << 8) | ((z as usize) << 4) | x as usize],
+                // Empty section, not decompressed or only its border rows (partial remeshing):
+                // read from the column.
+                _ => self.job.center.block(x as usize, y as usize, z as usize).unwrap_or(0),
             });
         }
         let (col, lx, lz) = locate(self.job, x, z)?;
@@ -1287,27 +1646,11 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
         .as_ref()
         .and_then(|(m, w)| Some((*m, PackedView::new(w)?)))
         .filter(|(_, b)| b.x == c.x && b.z == c.z && b.sections == c.sections.len());
-    // Meshed sections, and their neighbours above and below (border of the 18³ grid).
-    let needed = |s: usize| {
-        reuse
-            .as_ref()
-            .is_none_or(|(m, _)| m.contains(s) || m.contains(s + 1) || s.checked_sub(1).is_some_and(|b| m.contains(b)))
-    };
-    // Unfolded sections and border grid in buffers kept by the thread (no
+    let cull_paths = job.cull;
+    // Unfolded sections and border grids in buffers kept by the thread (no
     // 16 KiB allocation per section at each meshing).
     let mut scratch = SCRATCH.with_borrow_mut(std::mem::take);
-    let unpacked: Vec<Option<Box<[u32; SECTION_BLOCKS]>>> = c
-        .sections
-        .iter()
-        .enumerate()
-        .map(|(si, s)| {
-            (!s.is_empty() && needed(si)).then(|| {
-                let mut v = scratch.boxes.pop().unwrap_or_else(|| Box::new([0u32; SECTION_BLOCKS]));
-                s.blocks.unpack_into(&mut v[..]);
-                v
-            })
-        })
-        .collect();
+    let unpacked = unfold_sections(c, reuse.as_ref().map(|(m, _)| m), cull_paths.border_rows_only, &mut scratch);
     let around = Around { job, unpacked: &unpacked, height };
     let state_at = |x, y, z| around.state(x, y, z);
     let mut fluids: [Vec<crate::fluid::FluidQuad>; 3] = Default::default();
@@ -1318,30 +1661,38 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
 
     let models = &t.models;
     let mut layers: [Vec<Face>; 3] = Default::default();
-    let lv = crate::light::LightView::new(job, &t.light_info);
+    let light_view = crate::light::LightView::new(job, &t.light_info);
     let paths = job.light;
     let mut lcache = crate::light::AnyCache::new(paths, &mut scratch.light);
     let mut selected = Vec::new();
     let tint = Tint::new(job, palette, job.tint, fast, std::mem::take(&mut scratch.tint));
-    // States of the section and its one-block border (18³ grid, step x 1, z 18, y 324;
-    // `OUTSIDE` outside the available columns): "buried block" test, face removal and
-    // fluids read their neighbours there without going through the columns.
-    let mut pad = std::mem::take(&mut scratch.pad);
-    pad.clear();
-    pad.resize(P3, OUTSIDE);
+    // States of the section and its one-block border (18³ grid): "buried block" test, face
+    // removal and fluids read their neighbours there without going through the columns.
+    let mut state_grid = std::mem::take(&mut scratch.pad);
+    state_grid.clear();
+    state_grid.resize(P3, OUTSIDE);
     // Per-cell properties of the same grid (`cull::CullPaths::props`), removal rule chosen.
-    let cp = job.cull;
-    let use_props = fast && cp.uses_props();
-    let rule = usize::from(cp.shape);
-    let ct = &t.cull;
+    let use_props = fast && cull_paths.uses_props();
+    let rule = usize::from(cull_paths.shape);
+    let cull_tables = &t.cull;
     // Fluids: same removal rule as the blocks (the game's face shapes, or old).
-    let shapes = cp.shape.then_some(ct);
-    let mut pp = std::mem::take(&mut scratch.props);
-    let mut cand = std::mem::take(&mut scratch.cand);
+    let shapes = cull_paths.shape.then_some(cull_tables);
+    let mut cell_props = std::mem::take(&mut scratch.props);
+    let mut candidates = std::mem::take(&mut scratch.cand);
+    let mut candidate_sure = std::mem::take(&mut scratch.sure);
     if use_props {
-        pp.clear();
-        pp.resize(P3, 0);
+        cell_props.clear();
+        cell_props.resize(P3, 0);
     }
+    let grid_fill = GridFill {
+        job,
+        sections: &unpacked,
+        height,
+        paths: cull_paths,
+        cull_tables,
+        rule,
+        with_props: use_props,
+    };
     let mut starts: [Vec<u32>; 3] = Default::default();
     let mut fluid_starts: [Vec<u32>; 3] = Default::default();
     let mut vis = Vec::with_capacity(unpacked.len());
@@ -1352,134 +1703,52 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
             fluids[l].reserve_exact(base.fluids[l].len() / FLUID_WORDS + 16);
         }
     }
-    for (si, sec) in unpacked.iter().enumerate() {
+    for (si, section) in unpacked.iter().enumerate() {
         for l in 0..3 {
             starts[l].push(layers[l].len() as u32);
             fluid_starts[l].push(fluids[l].len() as u32);
         }
-        // Section outside the remeshing: its faces taken from the previous mesh, group by group
-        // (the stable grouping puts them back in the same place).
         if let Some((mask, base)) = &reuse
             && !mask.contains(si)
         {
-            let s1 = base.sections + 1;
-            for l in 0..3 {
-                let bs = base.starts[l];
-                for g in 0..BUCKETS {
-                    let (a, e) = (bs[g * s1 + si] as usize, bs[g * s1 + si + 1] as usize);
-                    let words = &base.faces[l][a * 6..e * 6];
-                    layers[l].extend_from_slice(words.as_chunks::<6>().0);
-                }
-                let fs = base.fluid_starts[l];
-                let words = &base.fluids[l][fs[si] as usize * FLUID_WORDS..fs[si + 1] as usize * FLUID_WORDS];
-                fluids[l].extend(words.as_chunks::<FLUID_WORDS>().0.iter().map(decode_fluid));
-            }
-            vis.push(u64::from(base.vis[si * 2]) | u64::from(base.vis[si * 2 + 1]) << 32);
+            vis.push(copy_reused_section(base, si, &mut layers, &mut fluids));
             continue;
         }
-        let Some(values) = sec else {
+        let UnfoldedSection::Full(values) = section else {
             vis.push(crate::visibility::VIS_ALL);
             continue;
         };
-        vis.push(crate::visibility::section_vis(&values[..], &t.solid));
-        if fast {
-            // Vertical stack per (x, z): neighbouring column resolved once, centre sections read
-            // directly (same result as `around.state` cell by cell).
-            let base = si as i32 * 16;
-            let below = si.checked_sub(1).and_then(|s| unpacked.get(s));
-            let above = unpacked.get(si + 1);
-            // Interior through the palette: the centre stacks do not write their properties there.
-            let pal = use_props && cp.palprops && palette_props(&c.sections[si].blocks, ct, rule, &values[..], &mut pp);
-            for pz in 0..18i32 {
-                for px in 0..18i32 {
-                    let (x, z) = (px - 1, pz - 1);
-                    let p0 = (pz * 18 + px) as usize;
-                    if (0..16).contains(&x) && (0..16).contains(&z) {
-                        let xz = ((z << 4) | x) as usize;
-                        for y in 0..16 {
-                            pad[p0 + (y + 1) * 324] = values[(y << 8) | xz];
-                        }
-                        if use_props && !pal {
-                            for y in 0..16 {
-                                pp[p0 + (y + 1) * 324] = ct.prop(rule, values[(y << 8) | xz]);
-                            }
-                        }
-                        let edge = |s: Option<&Option<Box<[u32; SECTION_BLOCKS]>>>, y: usize| match s {
-                            None => OUTSIDE,
-                            Some(None) => 0,
-                            Some(Some(v)) => v[(y << 8) | xz],
-                        };
-                        pad[p0] = edge(below, 15);
-                        pad[p0 + 17 * 324] = edge(above, 0);
-                        if use_props {
-                            pp[p0] = ct.prop(rule, pad[p0]);
-                            pp[p0 + 17 * 324] = ct.prop(rule, pad[p0 + 17 * 324]);
-                        }
-                    } else {
-                        let col = locate(job, x, z);
-                        if cp.pile {
-                            // Stack of the neighbouring column: bottom and top read one by one, the 16 cells of
-                            // the section in one go (one division per stack).
-                            let at = |y: i32| match col {
-                                Some((cc, lx, lz)) if (0..height).contains(&y) => {
-                                    cc.block(lx, y as usize, lz).unwrap_or(OUTSIDE)
-                                }
-                                _ => OUTSIDE,
-                            };
-                            pad[p0] = at(base - 1);
-                            pad[p0 + 17 * 324] = at(base + 16);
-                            match col.and_then(|(cc, lx, lz)| Some((cc.sections.get(si)?, lx, lz))) {
-                                Some((s, lx, lz)) => {
-                                    for (py, v) in (1..17).zip(s.blocks.column_iter(lx, lz, 0..16)) {
-                                        pad[p0 + py * 324] = v;
-                                    }
-                                }
-                                None => (1..17).for_each(|py| pad[p0 + py * 324] = OUTSIDE),
-                            }
-                        } else {
-                            for py in 0..18i32 {
-                                let y = base + py - 1;
-                                pad[p0 + py as usize * 324] = if (0..height).contains(&y) {
-                                    col.and_then(|(c, lx, lz)| c.block(lx, y as usize, lz)).unwrap_or(OUTSIDE)
-                                } else {
-                                    OUTSIDE
-                                };
-                            }
-                        }
-                        if use_props {
-                            for py in 0..18 {
-                                pp[p0 + py * 324] = ct.prop(rule, pad[p0 + py * 324]);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let solid = fast.then(|| fill_section_grids(&grid_fill, si, values, &mut state_grid, &mut cell_props));
+        let solid = solid.flatten().unwrap_or_else(|| crate::visibility::solid_bits(&values[..], &t.solid));
+        vis.push(crate::visibility::section_vis_bits(&solid));
         // Sealed section (only covering cubes, covering border): no face.
-        if fast && if use_props { sealed_props(&pp) } else { sealed_section(&values[..], &pad, t) } {
+        if fast && if use_props { sealed_props(&cell_props) } else { sealed_section(&values[..], &state_grid, t) } {
             continue;
         }
-        let near = Padded { pad: &pad, base_y: si as i32 * 16, around: &around };
+        let near = Padded { pad: &state_grid, base_y: si as i32 * 16, around: &around };
         let st = |x: i32, y: i32, z: i32| {
             use crate::fluid::Blocks;
             if fast { near.state(x, y, z) } else { around.state(x, y, z) }.unwrap_or(0)
         };
-        let lum = |x: i32, y: i32, z: i32| lv.lum(x, y, z, st(x, y, z));
+        let lum = |x: i32, y: i32, z: i32| light_view.lum(x, y, z, st(x, y, z));
         // Cells served by the smoothing, and by the fluids if they read the cache.
-        lcache.reset(&lv, si as i32 * 16, job.opts.ao || paths.fluid);
+        lcache.reset(&light_view, si as i32 * 16, job.opts.ao || paths.fluid);
         tint.section(si as i32 * 16);
         // Rows: only the blocks that can produce something, in order.
-        let rows = use_props && cp.rows;
-        if rows {
-            row_candidates(&pp, &mut cand);
+        let rows = use_props && cull_paths.rows;
+        let sure_kept = rows && cull_paths.simd_candidates;
+        if sure_kept {
+            row_candidates_with_sure(&cell_props, &mut candidates, &mut candidate_sure);
+        } else if rows {
+            row_candidates(&cell_props, &mut candidates);
         }
-        let count = if rows { cand.len() } else { SECTION_BLOCKS };
+        let count = if rows { candidates.len() } else { SECTION_BLOCKS };
         for k in 0..count {
-            let i = if rows { cand.get(k).map_or(k, |&c| usize::from(c)) } else { k };
+            let i = if rows { usize::from(candidates[k]) } else { k };
             let state = values[i];
             // Properties of the cell (grid): air, fluid, faces to remove, neighbour coverages.
             let c0 = pad_index(i);
-            let p = if use_props { pp[c0] } else { 0 };
+            let p = if use_props { cell_props[c0] } else { 0 };
             if if use_props { p & crate::cull::AIR_BIT != 0 } else { t.air.get(state as usize).copied().unwrap_or(true) } {
                 continue;
             }
@@ -1494,7 +1763,7 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
                 let tex = &t.models.fluids;
                 let out = &mut fluids[fluid_layer(fk)];
                 // Light read through the section cache (same rule as the full read).
-                let mut cached = |x: i32, y: i32, z: i32| lcache.lum(&lv, [x, y, z], &st);
+                let mut cached = |x: i32, y: i32, z: i32| lcache.lum(&light_view, [x, y, z], &st);
                 let mut plain = |x: i32, y: i32, z: i32| lum(x, y, z);
                 let l: &mut dyn FnMut(i32, i32, i32) -> u16 = if paths.fluid { &mut cached } else { &mut plain };
                 if fast {
@@ -1522,33 +1791,34 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
                     continue;
                 }
                 if use_props {
-                    // Neighbours read in the property grid: sure coverages, leaves, then
-                    // (game rule) shape inclusion for the remaining faces.
+                    // Neighbours read in the property grid: sure coverages (kept by the
+                    // candidate rows, or computed here), leaves, then (game rule) shape
+                    // inclusion for the remaining faces.
                     use crate::cull::{LEAF_BIT, NE};
-                    let nb = neighbor_props(&pp, c0);
-                    hidden = crate::cull::sure_hidden(p, nb) as u8;
+                    let nb = neighbor_props(&cell_props, c0);
+                    hidden = if sure_kept { candidate_sure[k] } else { crate::cull::sure_hidden(p, nb) as u8 };
                     if opaque_leaves {
                         for (d, &n) in nb.iter().enumerate() {
                             hidden |= u8::from(n & LEAF_BIT != 0) << d;
                         }
                     }
-                    if cp.shape {
+                    if cull_paths.shape {
                         let mut open = need & !hidden & 0x3f;
                         while open != 0 {
                             let d = open.trailing_zeros() as usize;
                             open &= open - 1;
                             if p >> (NE + d as u32) & 1 == 1 && nb[d] >> (NE + (d ^ 1) as u32) & 1 == 1 {
-                                let n = pad[c0.wrapping_add_signed(PAD_STEP[d])];
-                                hidden |= u8::from(ct.hidden_by_shape(state, n, d)) << d;
+                                let n = state_grid[c0.wrapping_add_signed(PAD_STEP[d])];
+                                hidden |= u8::from(cull_tables.hidden_by_shape(state, n, d)) << d;
                             }
                         }
                     }
                 } else {
                     hidden = Dir::ALL.iter().fold(0u8, |m, &d| {
-                        let n = pad[c0.wrapping_add_signed(PAD_STEP[d as usize])];
+                        let n = state_grid[c0.wrapping_add_signed(PAD_STEP[d as usize])];
                         let leaf = u8::from(opaque_leaves && is_leaves(n));
-                        let cover = if cp.shape {
-                            u8::from(n != OUTSIDE && ct.hidden_by_shape(state, n, d as usize))
+                        let cover = if cull_paths.shape {
+                            u8::from(n != OUTSIDE && cull_tables.hidden_by_shape(state, n, d as usize))
                         } else {
                             t.covers.get(n as usize).copied().unwrap_or(0) >> opposite(d) as u8 & 1
                         };
@@ -1562,7 +1832,7 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
                 if skip_self != 0 {
                     let me = t.block.get(state as usize);
                     for d in Dir::ALL {
-                        let n = pad[c0.wrapping_add_signed(PAD_STEP[d as usize])];
+                        let n = state_grid[c0.wrapping_add_signed(PAD_STEP[d as usize])];
                         if skip_self >> d as u8 & 1 == 1 && n != OUTSIDE && t.block.get(n as usize) == me {
                             hidden |= 1 << d as u8;
                         }
@@ -1587,8 +1857,8 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
                             continue;
                         }
                     } else if let Some(n) = state_at(x + cull.offset()[0], y + cull.offset()[1], z + cull.offset()[2]) {
-                        let covered = if cp.shape {
-                            ct.hidden_by_shape(state, n, cull as usize)
+                        let covered = if cull_paths.shape {
+                            cull_tables.hidden_by_shape(state, n, cull as usize)
                         } else {
                             t.covers.get(n as usize).is_some_and(|m| m >> opposite(cull) as u8 & 1 == 1)
                         };
@@ -1626,7 +1896,7 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
                         .then(|| t.light_faces.faces.get(q as usize).map(|f| (f, &t.light_faces)))
                         .flatten(),
                 };
-                let verts = lcache.quad_light(&lv, &st, [x, y, z], state, &geom, smooth);
+                let verts = lcache.quad_light(&light_view, &st, [x, y, z], state, &geom, smooth);
                 let layer = if opaque_leaves { 0 } else { quad.layer as usize };
                 let pos = (x as u32) | ((z as u32) << 4) | ((y as u32) << 8);
                 // Offset model outside translucents: compact face (offset re-read by the shader).
@@ -1677,28 +1947,65 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
         fluid_starts[l].push(fluids[l].len() as u32);
     }
     for l in 0..3 {
-        (layers[l], starts[l]) = by_bucket(&layers[l], &starts[l], &t.bucket);
+        (layers[l], starts[l]) = group_faces_by_bucket(&layers[l], &starts[l], &t.bucket);
     }
     // Buffers handed back to the thread (at most one column of sections kept).
-    scratch.boxes.extend(unpacked.into_iter().flatten());
+    for section in unpacked {
+        match section {
+            UnfoldedSection::Full(v) => scratch.boxes.push(v),
+            UnfoldedSection::BorderRows(r) => scratch.border_rows.push(r),
+            UnfoldedSection::Absent => {}
+        }
+    }
     scratch.boxes.truncate(32);
-    scratch.pad = pad;
-    scratch.props = pp;
-    scratch.cand = cand;
+    scratch.border_rows.truncate(32);
+    scratch.pad = state_grid;
+    scratch.props = cell_props;
+    scratch.cand = candidates;
+    scratch.sure = candidate_sure;
     scratch.tint = tint.into_bufs();
     lcache.finish(&mut scratch.light);
     SCRATCH.with_borrow_mut(|s| *s = scratch);
     BlockMesh { x: c.x, z: c.z, version: job.version, layers, fluids, starts, fluid_starts, vis }
 }
 
+/// Section outside the remeshing: its faces taken from the previous mesh `base`, group by group
+/// (the stable grouping puts them back in the same place). Returns its visibility.
+fn copy_reused_section(
+    base: &PackedView<'_>,
+    si: usize,
+    layers: &mut [Vec<Face>; 3],
+    fluids: &mut [Vec<crate::fluid::FluidQuad>; 3],
+) -> crate::visibility::Vis {
+    let sections_plus_one = base.sections + 1;
+    for l in 0..3 {
+        let bs = base.starts[l];
+        for g in 0..BUCKETS {
+            let (a, e) = (bs[g * sections_plus_one + si] as usize, bs[g * sections_plus_one + si + 1] as usize);
+            let words = &base.faces[l][a * 6..e * 6];
+            layers[l].extend_from_slice(words.as_chunks::<6>().0);
+        }
+        let fs = base.fluid_starts[l];
+        let words = &base.fluids[l][fs[si] as usize * FLUID_WORDS..fs[si + 1] as usize * FLUID_WORDS];
+        fluids[l].extend(words.as_chunks::<FLUID_WORDS>().0.iter().map(decode_fluid));
+    }
+    u64::from(base.vis[si * 2]) | u64::from(base.vis[si * 2 + 1]) << 32
+}
+
 /// Working buffers of the mesher, per thread.
 #[derive(Default)]
 struct Scratch {
     boxes: Vec<Box<[u32; SECTION_BLOCKS]>>,
+    /// Border rows of the neighbours of a partial remesh (`CullPaths::border_rows_only`); boxed
+    /// so that they move into `UnfoldedSection` and back without copying their 2 KiB.
+    #[allow(clippy::vec_box)]
+    border_rows: Vec<Box<[u32; 2 * ROW_BLOCKS]>>,
     pad: Vec<u32>,
-    /// Per-cell properties of the grid (`cull::CullPaths::props`) and candidate blocks of a section.
+    /// Per-cell properties of the grid (`cull::CullPaths::props`), candidate blocks of a section
+    /// and their surely hidden faces (`CullPaths::simd_candidates`).
     props: Vec<u32>,
     cand: Vec<u16>,
+    sure: Vec<u8>,
     tint: TintBufs,
     /// Light cache cells (`LightPaths::scratch`).
     light: crate::light::LightStores,
@@ -1919,26 +2226,26 @@ pub fn in_place_diff(base: &[u32], m: &BlockMesh) -> Option<InPlace> {
 /// Sorts the faces by group then by section (stable sort: the order within a same section and a
 /// same group is kept, like that of a decal placed on its face). `starts` (S + 1 entries)
 /// becomes `BUCKETS × (S + 1)` entries: start of group g, section s at `g × (S + 1) + s`.
-fn by_bucket(faces: &[Face], starts: &[u32], bucket: &[u8]) -> (Vec<Face>, Vec<u32>) {
-    let s1 = starts.len();
+fn group_faces_by_bucket(faces: &[Face], starts: &[u32], bucket: &[u8]) -> (Vec<Face>, Vec<u32>) {
+    let sections_plus_one = starts.len();
     let group = |f: &Face| bucket.get(quad_of(f) as usize).map_or(BUCKETS - 1, |&b| b as usize);
-    let mut count = vec![0u32; BUCKETS * s1];
-    for s in 0..s1.saturating_sub(1) {
+    let mut count = vec![0u32; BUCKETS * sections_plus_one];
+    for s in 0..sections_plus_one.saturating_sub(1) {
         for f in &faces[starts[s] as usize..starts[s + 1] as usize] {
-            count[group(f) * s1 + s] += 1;
+            count[group(f) * sections_plus_one + s] += 1;
         }
     }
     let mut at = 0;
-    let mut out_starts = vec![0u32; BUCKETS * s1];
+    let mut out_starts = vec![0u32; BUCKETS * sections_plus_one];
     for (o, c) in out_starts.iter_mut().zip(&count) {
         *o = at;
         at += c;
     }
     let mut next = out_starts.clone();
     let mut out = vec![[0u32; 6]; faces.len()];
-    for s in 0..s1.saturating_sub(1) {
+    for s in 0..sections_plus_one.saturating_sub(1) {
         for f in &faces[starts[s] as usize..starts[s + 1] as usize] {
-            let k = group(f) * s1 + s;
+            let k = group(f) * sections_plus_one + s;
             out[next[k] as usize] = *f;
             next[k] += 1;
         }
@@ -2153,5 +2460,71 @@ mod biome_tests {
                 assert_eq!(a, b, "({x}, {z})");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod candidate_tests {
+    use super::*;
+
+    /// Property grid of random words, biased towards air and fluids so that every exit of the
+    /// candidate test is taken.
+    fn random_grid(seed: u64) -> Vec<u32> {
+        use crate::cull::{AIR_BIT, FLUID_BIT};
+        let mut x = seed;
+        (0..P3)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let w = x as u32;
+                match (x >> 40) % 8 {
+                    0 => w | AIR_BIT,
+                    1 => (w | FLUID_BIT) & !AIR_BIT,
+                    2 => !AIR_BIT,
+                    _ => w & !AIR_BIT,
+                }
+            })
+            .collect()
+    }
+
+    /// The candidates and surely hidden faces of the lanes version (and of the AVX2 one when the
+    /// processor has it) equal the cell-by-cell computation.
+    #[test]
+    fn lane_candidates_match_cell_by_cell() {
+        for seed in [1, 0x9e37_79b9_7f4a_7c15, 0x2545_f491_4f6c_dd1d, 77] {
+            let grid = random_grid(seed);
+            let mut want = Vec::new();
+            row_candidates(&grid, &mut want);
+            let want_sure: Vec<u8> = want
+                .iter()
+                .map(|&i| {
+                    let c = pad_index(usize::from(i));
+                    crate::cull::sure_hidden(grid[c], neighbor_props(&grid, c)) as u8
+                })
+                .collect();
+            let (mut got, mut sure) = (Vec::new(), Vec::new());
+            row_candidates_by_lanes(&grid, &mut got, &mut sure);
+            assert_eq!(got, want, "lanes, seed {seed}");
+            assert_eq!(sure, want_sure, "lanes, seed {seed}");
+            row_candidates_with_sure(&grid, &mut got, &mut sure);
+            assert_eq!(got, want, "dispatched, seed {seed}");
+            assert_eq!(sure, want_sure, "dispatched, seed {seed}");
+            assert!(!want.is_empty() && want.len() < SECTION_BLOCKS, "seed {seed}: {} candidates", want.len());
+        }
+    }
+
+    /// The solid render mask read from the grid equals the one of the states.
+    #[test]
+    fn solid_mask_of_props_matches_states() {
+        let grid = random_grid(5);
+        let mut want = [0u64; 64];
+        for i in 0..SECTION_BLOCKS {
+            if grid[pad_index(i)] & crate::cull::SOLID_RENDER_BIT != 0 {
+                want[i >> 6] |= 1 << (i & 63);
+            }
+        }
+        assert_eq!(solid_mask_of_props(&grid), want);
+        assert!(want.iter().any(|&w| w != 0) && want.iter().any(|&w| w != u64::MAX));
     }
 }

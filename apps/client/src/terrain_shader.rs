@@ -31,6 +31,13 @@ pub struct ShaderOpts {
     pub faceidx: bool,
     /// `RUSTCRAFT_OPT_STRIP`: block faces as a strip of 4 vertices (only without FACEIDX).
     pub strip: bool,
+    /// `RUSTCRAFT_OPT_ATLASTEXELUNIFORM`: texel size of the two block texture arrays read from
+    /// the camera uniform (computed once on the CPU) instead of a size query and a division per
+    /// fragment, and the screen footprint shared by the two frames of an animated texture.
+    pub atlas_texel_uniform: bool,
+    /// `RUSTCRAFT_OPT_LIGHTMAPBUFFER`: lightmap read per vertex from a buffer of its 256 colours
+    /// with the bilinear filter done by hand, instead of a texture sample.
+    pub lightmap_buffer: bool,
     pub probe: Probe,
 }
 
@@ -44,6 +51,8 @@ impl ShaderOpts {
         fadegpu: false,
         faceidx: false,
         strip: false,
+        atlas_texel_uniform: false,
+        lightmap_buffer: false,
         probe: Probe::Off,
     };
 
@@ -56,8 +65,25 @@ impl ShaderOpts {
         fadegpu: true,
         faceidx: true,
         strip: true,
+        atlas_texel_uniform: true,
+        lightmap_buffer: true,
         probe: Probe::Off,
     };
+
+    /// Variants the GPU can run: the lightmap buffer is a ninth storage buffer of the terrain
+    /// vertices (camera group 1, 4, 6, 9, 10 + column group 1 to 4), one more than the minimum
+    /// every WebGPU device offers; below that, the lightmap stays a texture.
+    pub fn within_limits(self, limits: &wgpu::Limits) -> ShaderOpts {
+        const STORAGE_WITH_LIGHTMAP_BUFFER: u32 = 9;
+        let fits = limits.max_storage_buffers_per_shader_stage >= STORAGE_WITH_LIGHTMAP_BUFFER;
+        if self.lightmap_buffer && !fits {
+            eprintln!(
+                "[opt] terrain lightmap buffer off: the GPU allows only {} storage buffers per stage",
+                limits.max_storage_buffers_per_shader_stage
+            );
+        }
+        ShaderOpts { lightmap_buffer: self.lightmap_buffer && fits, ..self }
+    }
 
     /// Strip in force (indexing wins).
     pub fn strip_on(self) -> bool {
@@ -85,6 +111,8 @@ impl ShaderOpts {
             "VARYINGS" => self.varyings,
             "FADEGPU" => self.fadegpu,
             "STRIP" => self.strip_on(),
+            "ATLASTEXELUNIFORM" => self.atlas_texel_uniform,
+            "LIGHTMAPBUFFER" => self.lightmap_buffer,
             "PROBE_VS" => self.probe == Probe::Vs,
             "PROBE_FS" => self.probe == Probe::Fs,
             _ => panic!("terrain.wgsl: unknown variant '{name}'"),
@@ -110,6 +138,8 @@ pub fn opts() -> ShaderOpts {
             fadegpu: !off(rc_data::env_str!("RUSTCRAFT_OPT_FADEGPU")),
             faceidx: !off(rc_data::env_str!("RUSTCRAFT_OPT_FACEIDX")),
             strip: !off(rc_data::env_str!("RUSTCRAFT_OPT_STRIP")),
+            atlas_texel_uniform: !off(rc_data::env_str!("RUSTCRAFT_OPT_ATLASTEXELUNIFORM")),
+            lightmap_buffer: !off(rc_data::env_str!("RUSTCRAFT_OPT_LIGHTMAPBUFFER")),
             probe,
         };
         eprintln!("[opt] terrain shader: {o:?}");
@@ -311,7 +341,7 @@ mod tests {
 
     fn variants() -> Vec<ShaderOpts> {
         let mut v = Vec::new();
-        for bits in 0..64u32 {
+        for bits in 0..256u32 {
             let b = |i: u32| bits & (1 << i) != 0;
             v.push(ShaderOpts {
                 vsread: b(0),
@@ -320,6 +350,8 @@ mod tests {
                 fadegpu: b(3),
                 faceidx: b(4),
                 strip: b(5),
+                atlas_texel_uniform: b(6),
+                lightmap_buffer: b(7),
                 probe: Probe::Off,
             });
         }
@@ -376,29 +408,72 @@ mod tests {
         }
     }
 
+    /// Functions called (recursively) from a block.
+    fn calls(block: &naga::Block, out: &mut Vec<naga::Handle<naga::Function>>) {
+        for s in block.iter() {
+            match s {
+                naga::Statement::Call { function, .. } => out.push(*function),
+                naga::Statement::Block(b) => calls(b, out),
+                naga::Statement::If { accept, reject, .. } => {
+                    calls(accept, out);
+                    calls(reject, out);
+                }
+                naga::Statement::Loop { body, continuing, .. } => {
+                    calls(body, out);
+                    calls(continuing, out);
+                }
+                naga::Statement::Switch { cases, .. } => cases.iter().for_each(|c| calls(&c.body, out)),
+                _ => {}
+            }
+        }
+    }
+
+    /// Texture size queries and divisions written in the code a fragment entry point reaches
+    /// (each function counted once, whatever the number of calls).
+    fn fragment_size_queries_and_divisions(o: ShaderOpts, entry: &str) -> (usize, usize) {
+        let src = terrain(o);
+        let (m, _) = validate(&src);
+        let ep = m.entry_points.iter().find(|e| e.name == entry).expect("entry point");
+        let mut bodies = vec![&ep.function];
+        let mut todo = Vec::new();
+        calls(&ep.function.body, &mut todo);
+        let mut seen = std::collections::HashSet::new();
+        while let Some(h) = todo.pop() {
+            if seen.insert(h) {
+                bodies.push(&m.functions[h]);
+                calls(&m.functions[h].body, &mut todo);
+            }
+        }
+        let expressions = || bodies.iter().flat_map(|f| f.expressions.iter().map(|(_, e)| e));
+        let queries = expressions().filter(|e| matches!(e, naga::Expression::ImageQuery { .. })).count();
+        let divisions = expressions()
+            .filter(|e| matches!(e, naga::Expression::Binary { op: naga::BinaryOperator::Divide, .. }))
+            .count();
+        (queries, divisions)
+    }
+
+    /// Texel size from the uniform: no texture size query left in the terrain fragments and two
+    /// divisions fewer (1 / size in the sharp sampling and in the RGSS filter); the old path
+    /// has the two queries (main and large array), which the check sees.
+    #[test]
+    fn atlas_texel_uniform_removes_size_queries_and_divisions() {
+        for entry in ["fs_solid", "fs_cutout", "fs_translucent"] {
+            let (old_queries, old_divisions) = fragment_size_queries_and_divisions(ShaderOpts::OLD, entry);
+            let new = ShaderOpts { atlas_texel_uniform: true, ..ShaderOpts::OLD };
+            let (new_queries, new_divisions) = fragment_size_queries_and_divisions(new, entry);
+            eprintln!(
+                "{entry}: size queries {old_queries} -> {new_queries}, divisions {old_divisions} -> {new_divisions}"
+            );
+            assert_eq!(old_queries, 2, "{entry}: size queries of the old path not seen");
+            assert_eq!(new_queries, 0, "{entry}: size query left");
+            assert_eq!(new_divisions + 2, old_divisions, "{entry}: divisions");
+        }
+    }
+
     /// Targeted read and corners in nibbles: no more array held by value and indexed in the
     /// terrain vertices; the old path has some (the check sees what it looks for).
     #[test]
     fn new_vertex_shaders_index_no_value_array() {
-        // Functions called (recursively) from a block.
-        fn calls(block: &naga::Block, out: &mut Vec<naga::Handle<naga::Function>>) {
-            for s in block.iter() {
-                match s {
-                    naga::Statement::Call { function, .. } => out.push(*function),
-                    naga::Statement::Block(b) => calls(b, out),
-                    naga::Statement::If { accept, reject, .. } => {
-                        calls(accept, out);
-                        calls(reject, out);
-                    }
-                    naga::Statement::Loop { body, continuing, .. } => {
-                        calls(body, out);
-                        calls(continuing, out);
-                    }
-                    naga::Statement::Switch { cases, .. } => cases.iter().for_each(|c| calls(&c.body, out)),
-                    _ => {}
-                }
-            }
-        }
         let count = |o: ShaderOpts| -> usize {
             let src = terrain(o);
             let (m, info) = validate(&src);

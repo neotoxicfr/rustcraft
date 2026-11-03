@@ -2150,6 +2150,8 @@ pub struct EntityRenderer {
     pub upside_down: hashbrown::HashSet<u128>,
     /// "deadmau5" players (ears); set by the caller before `prepare`.
     pub extra_ears: hashbrown::HashSet<u128>,
+    /// Inputs of `spectators`, `upside_down` and `extra_ears` (`app_entity_sets::refresh_player_sets`).
+    pub player_sets_stamp: Option<crate::app_entity_sets::PlayerSetsStamp>,
     /// "nether" dimension (piglins and hoglins do not shake from zombification there).
     nether: std::cell::Cell<bool>,
     /// Hand in first person: start of its instances in each pass (added after
@@ -2915,6 +2917,7 @@ impl EntityRenderer {
             camera: None,
             upside_down: hashbrown::HashSet::new(),
             extra_ears: hashbrown::HashSet::new(),
+            player_sets_stamp: None,
             nether: std::cell::Cell::new(false),
             hand_batch: 0,
             gui_from: None,

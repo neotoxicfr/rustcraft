@@ -687,7 +687,7 @@ impl Server {
         }
         // The species' own persistence cuts the evaluation BEFORE the random draw.
         let persistent = m.persistent || m.requires_custom_persistence();
-        let d = dist2(self.pos, m.pos);
+        let d = dist2(self.pos, m.pos());
         let cat = m.kind.info().category;
         let far = f64::from(cat.despawn_distance().pow(2));
         let near = f64::from(cat.no_despawn_distance().pow(2));
@@ -705,7 +705,7 @@ impl Server {
 
     fn remove_when_far_away(&self, m: &Mob) -> bool {
         // F07: patroller (128 blocks), raid raider (never).
-        if let Some(r) = super::illagers::remove_when_far_away(m, dist2(self.pos, m.pos)) {
+        if let Some(r) = super::illagers::remove_when_far_away(m, dist2(self.pos, m.pos())) {
             return r;
         }
         if let Some(r) = super::surface::remove_when_far_away(m)
@@ -1239,7 +1239,7 @@ impl Server {
         let mut counts = [0i32; 7];
         let mut pot: Vec<([i32; 3], f64)> = Vec::new();
         let centers = self.sim_centers();
-        for m in self.mobs.list.iter().flatten() {
+        for m in self.mobs.list.iter() {
             if m.persistent || m.requires_custom_persistence() || m.kind.info().category == Category::Misc {
                 continue;
             }
@@ -1400,7 +1400,7 @@ impl Server {
                 let mut full = ent.clone();
                 crate::nbtio::set(&mut full, "Pos", Nbt::List(pos.iter().map(|&v| Nbt::Double(v)).collect()));
                 self.load_mob(&mut m, &full);
-                m.pos = pos;
+                m.set_pos(pos);
                 m.old = pos;
                 m.sync_data();
             }
@@ -1570,7 +1570,7 @@ impl Server {
         if self.game_mode != 3 && self.player_aabb().intersects(bb) {
             return false;
         }
-        if self.mobs.list.iter().flatten().any(|o| o.id != except && !o.removed && o.touches(bb)) {
+        if self.mobs.list.iter().any(|o| o.id != except && !o.removed && o.touches(bb)) {
             return false;
         }
         !self.bs.entities.list.iter().any(|e| {

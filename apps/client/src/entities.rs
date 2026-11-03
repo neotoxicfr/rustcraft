@@ -7,6 +7,10 @@ use rc_client::EntityEvent;
 use rc_proto_v777::entity::{Meta, PositionPath};
 use rc_proto_v777::item::ItemStack;
 
+mod subsets;
+pub use subsets::EntitySubsets;
+pub(crate) use subsets::{entity_subsets_on, rare_kind_lists_on};
+
 /// Interpolation method of an entity type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Interp {
@@ -414,6 +418,9 @@ pub struct Entity {
     /// stare sound is allowed; breeze 0 whistle, 1 jump trail, 2 ambient sound;
     /// ravager 0 stun seen at the previous tick.
     pub fx: [i32; 3],
+    /// Touched the water at the previous splash check (`entity_fx`); `None` before the first one
+    /// (no splash on the first tick, like the game) and while the entity is not checked.
+    pub was_wet: Option<bool>,
 }
 
 impl Entity {
@@ -1115,6 +1122,10 @@ pub struct Entities {
     pub pending_sounds: Vec<crate::entity_fx::FxSound>,
     /// Vehicles that received passengers: the mob-rider pass of a tick walks only them.
     pub riders: Vec<i32>,
+    /// Rare subsets (glowing, invisible, name-tag candidates, rare kinds) kept by `apply`.
+    pub subsets: EntitySubsets,
+    /// The local player touched the water at the previous splash check (`Entity::was_wet`).
+    pub local_was_wet: Option<bool>,
 }
 
 /// `RUSTCRAFT_OPT_RIDERLIST=0`: the mob-rider pass walks every entity instead of the vehicles.
@@ -1126,6 +1137,7 @@ impl Entities {
     pub fn clear(&mut self) {
         self.map.clear();
         self.riders.clear();
+        self.subsets.clear();
     }
 
     /// Position of a sound attached to entity `id`, or nothing when it must be cut (entity
@@ -1194,6 +1206,7 @@ impl Entities {
             e.tick();
         }
         crate::entity_render::wither_track(self);
+        self.subsets.drop_stale(&self.map);
     }
 
     /// Entities whose first passenger is a mob (the body rotation of a standing mob depends on it).
@@ -1228,6 +1241,7 @@ impl Entities {
             }
         }
         crate::entity_render::wither_track(self);
+        self.subsets.drop_stale(&self.map);
     }
 
     /// Movement packet of a locally piloted vehicle: only the decoding base follows.
@@ -1376,8 +1390,12 @@ impl Entities {
                         in_water: false,
                         jukebox: None,
                         fx: [0; 3],
+                        was_wet: None,
                     },
                 );
+                if let Some(e) = self.map.get(&a.id) {
+                    self.subsets.note_spawn(a.id, e);
+                }
                 // Shulker: position recentred on its block from the spawn.
                 if let Some(e) = self.map.get_mut(&a.id)
                     && e.kind == "shulker"
@@ -1484,6 +1502,8 @@ impl Entities {
             }
             EntityEvent::Data { id, values } => {
                 let mut stare = false;
+                // Flags (0) and visible name (3) decide the rare subsets.
+                let subset_data = values.iter().any(|(i, _)| matches!(i, 0 | 3));
                 if let Some(e) = self.get_mut(id) {
                     for (i, v) in values {
                         // Enderman: data 17 (threatening) received while data 18 (stared at) is already
@@ -1503,6 +1523,10 @@ impl Entities {
                         e.meta.insert(i, v);
                         crate::entity_render::display_data(e, i);
                     }
+                }
+                // The local player is read directly by the frame: only table entities are noted.
+                if subset_data && let Some(e) = self.map.get(&id) {
+                    self.subsets.note_data(id, e);
                 }
                 if stare && let Some(e) = self.map.get(&id) {
                     let eye = f64::from(e.size(&self.dims).eye);
@@ -1988,7 +2012,14 @@ mod switch_reading_tests {
     type SwitchReader = fn() -> bool;
 
     /// Every converted switch with its reader (all on by default).
-    const SWITCHES: [(&str, SwitchReader); 14] = [
+    const SWITCHES: [(&str, SwitchReader); 21] = [
+        ("RUSTCRAFT_OPT_NAME_TAG_EARLY_REJECT", crate::app_entity_sets::name_tag_early_reject_on),
+        ("RUSTCRAFT_OPT_HOLDER_NAME_ON_STACK", crate::app_entity_sets::holder_name_on_stack_on),
+        ("RUSTCRAFT_OPT_BELOW_NAME_KEY_CACHE", crate::app_entity_sets::below_name_key_cache_on),
+        ("RUSTCRAFT_OPT_PLAYER_SET_REUSE", crate::app_entity_sets::player_set_reuse_on),
+        ("RUSTCRAFT_OPT_ENTITY_SUBSETS", super::entity_subsets_on),
+        ("RUSTCRAFT_OPT_RARE_KIND_LISTS", super::rare_kind_lists_on),
+        ("RUSTCRAFT_OPT_WET_FLAG_IN_ENTITY", crate::entity_fx::wet_flag_in_entity_on),
         ("RUSTCRAFT_OPT_VARIANTIDX", super::variant_idx_on),
         ("RUSTCRAFT_OPT_NAMECACHE", super::name_cache_on),
         ("RUSTCRAFT_OPT_RIDERLIST", super::rider_list_on),

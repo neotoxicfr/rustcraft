@@ -108,7 +108,7 @@ pub fn interact(s: &mut Server, m: &mut Mob, slot: usize, item: &str) -> Option<
         let Some((eff, dur)) = flower_effect(item) else {
             return bucket(s, m, slot, item);
         };
-        let center = [m.pos[0], m.pos[1] + f64::from(m.height()) * 0.5, m.pos[2]];
+        let center = [m.pos()[0], m.pos()[1] + f64::from(m.height()) * 0.5, m.pos()[2]];
         if m.surf.stew.is_some() {
             s.particles_full("minecraft:smoke", 0, center, [0.5, 0.0, 0.5], [0.0, 0.2, 0.0], 2, 2);
         } else {
@@ -145,7 +145,7 @@ fn shear(s: &mut Server, m: &mut Mob) {
     s.entity_sound(m.id, "minecraft:entity.mooshroom.shear", 7, 1.0, 1.0);
     // No spawn preparation: default variant ("temperate", set at
     // construction).
-    let mut cow = s.new_mob(Kind::Cow, m.pos, m.yaw);
+    let mut cow = s.new_mob(Kind::Cow, m.pos(), m.yaw);
     cow.pitch = m.pitch;
     cow.vel = m.vel;
     cow.fall_distance = m.fall_distance;
@@ -160,13 +160,13 @@ fn shear(s: &mut Server, m: &mut Mob) {
     cow.fire = m.fire;
     cow.surf.no_gravity = m.surf.no_gravity;
     cow.custom_name = m.custom_name.clone();
-    let center = [m.pos[0], m.pos[1] + f64::from(m.height()) * 0.5, m.pos[2]];
+    let center = [m.pos()[0], m.pos()[1] + f64::from(m.height()) * 0.5, m.pos()[2]];
     s.particles("minecraft:explosion", center, [0.0; 3], 0.0, 1);
     let variant = if m.variant == 1 { "brown" } else { "red" };
     let ctx =
         crate::loot::Ctx { comps: vec![("minecraft:mooshroom/variant".into(), variant.into())], ..Default::default() };
     let drops = super::loot(s, "minecraft:shearing/mooshroom", &ctx);
-    let top = [m.pos[0], m.pos[1] + f64::from(m.height()), m.pos[2]];
+    let top = [m.pos()[0], m.pos()[1] + f64::from(m.height()), m.pos()[2]];
     for d in drops {
         for _ in 0..d.count {
             // Creation of the item entity: velocity drawn on the world random.

@@ -89,7 +89,7 @@ fn player_projectiles_record_last_victim() {
     arrow.damage = 2.0;
     arrow.vel = [1.0, 0.0, 0.0];
     p.s.mobs.player_ticks = 77;
-    let pos = p.s.mob_ref(z1).expect("zombie").pos;
+    let pos = p.s.mob_ref(z1).expect("zombie").pos();
     p.s.proj_hit_entity(&mut arrow, living(z1, pos));
     assert_eq!(p.s.mobs.player_hit, Some((Ent::Mob(z1), 77)), "player's arrow");
 
@@ -97,7 +97,7 @@ fn player_projectiles_record_last_victim() {
     wind.owner = Some(p.s.uuid);
     wind.vel = [1.0, 0.0, 0.0];
     p.s.mobs.player_ticks = 90;
-    let pos = p.s.mob_ref(z2).expect("zombie").pos;
+    let pos = p.s.mob_ref(z2).expect("zombie").pos();
     p.s.proj_hit(&mut wind, Hit::Entity(living(z2, pos)));
     assert_eq!(p.s.mobs.player_hit, Some((Ent::Mob(z2), 90)), "player's wind charge");
 
@@ -114,7 +114,7 @@ fn player_projectiles_record_last_victim() {
     let mut trident = Proj::new(PKind::Trident, 900_105, [8.5, -59.0, 0.5], stack("minecraft:trident"));
     trident.owner = Some(p.s.uuid);
     trident.vel = [1.0, 0.0, 0.0];
-    let pos = p.s.mob_ref(z3).expect("zombie").pos;
+    let pos = p.s.mob_ref(z3).expect("zombie").pos();
     p.s.proj_hit_entity(&mut trident, living(z3, pos));
     assert!(p.s.mob_ref(z3).expect("zombie").health < 20.0, "the trident hurt");
     assert_eq!(p.s.mobs.player_hit, None, "the trident does not set the last victim");
@@ -132,7 +132,7 @@ fn projectiles_pass_dodging_enderman() {
     arrow.damage = 2.0;
     arrow.vel = [2.0, 0.0, 0.0];
     arrow.fire = 100;
-    let pos = p.s.mob_ref(e).expect("enderman").pos;
+    let pos = p.s.mob_ref(e).expect("enderman").pos();
     p.s.proj_hit_entity(&mut arrow, living(e, pos));
     let m = p.s.mob_ref(e).expect("enderman");
     assert_eq!(m.health, 40.0, "enderman unharmed");
@@ -145,7 +145,7 @@ fn projectiles_pass_dodging_enderman() {
     trident.owner = Some(p.s.uuid);
     trident.vel = [-2.0, 0.0, 0.0];
     let yaw = trident.yaw;
-    let pos = p.s.mob_ref(e2).expect("enderman").pos;
+    let pos = p.s.mob_ref(e2).expect("enderman").pos();
     p.s.proj_hit_entity(&mut trident, living(e2, pos));
     assert_eq!(p.s.mob_ref(e2).expect("enderman").health, 40.0, "enderman unharmed");
     assert_eq!(trident.vel, [-2.0, 0.0, 0.0], "trident neither sent back nor slowed");
@@ -164,7 +164,7 @@ fn thrown_potions_on_enderman() {
     p.s.proj_hit(&mut harm, ground([0.5, -59.5, 10.5]));
     let m = p.s.mob_ref(e).expect("enderman");
     assert_eq!(m.health, 40.0, "the damage potion does not hurt the enderman");
-    assert_ne!(m.pos, start, "the enderman teleported");
+    assert_ne!(m.pos(), start, "the enderman teleported");
 
     let start2 = [0.5, -60.0, -10.5];
     let e2 = mob(&mut p, Kind::Enderman, start2, 40.0);
@@ -172,7 +172,7 @@ fn thrown_potions_on_enderman() {
     p.s.proj_hit(&mut water, ground([0.5, -59.5, -10.5]));
     let m = p.s.mob_ref(e2).expect("enderman");
     assert_eq!(m.health, 39.0, "water hurts the enderman");
-    assert_ne!(m.pos, start2, "then it teleports");
+    assert_ne!(m.pos(), start2, "then it teleports");
     finish(p, dir);
 }
 
@@ -311,9 +311,9 @@ fn enderman_unattributed_hurt_draws() {
         let mut m = p.s.new_mob(Kind::Enderman, [0.5, -60.0, 5.5], 0.0);
         m.mount.vehicle = Some(999_999);
         m.rng = JRand::new(seed);
-        let start = m.pos;
+        let start = m.pos();
         p.s.mob_hurt(&mut m, "minecraft:drown", 1.0, None, None);
-        assert_eq!(m.pos, start, "passenger: no teleport (seed {seed})");
+        assert_eq!(m.pos(), start, "passenger: no teleport (seed {seed})");
         counts.insert(steps(JRand::new(seed), m.rng));
     }
     // 1-in-10 draw at zero: nothing more; otherwise the three draws of the destination (5 steps).

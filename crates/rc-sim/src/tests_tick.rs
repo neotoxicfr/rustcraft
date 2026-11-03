@@ -170,10 +170,10 @@ fn scheduled_function_before_entities() {
     )
     .unwrap();
     s.s9_reload();
-    let before: Vec<i32> = s.mobs.list.iter().flatten().map(|m| m.id).collect();
+    let before: Vec<i32> = s.mobs.list.iter().map(|m| m.id).collect();
     cmd(&mut s, "schedule function t:spawn 1t");
     step(&mut s, 1);
-    let pig = s.mobs.list.iter().flatten().find(|m| !before.contains(&m.id)).expect("pig summoned");
+    let pig = s.mobs.list.iter().find(|m| !before.contains(&m.id)).expect("pig summoned");
     // Game: scheduled functions run before the entity tick; the pig is ticked as of the tick
     // of its spawn.
     assert_eq!(pig.tick_count, 1, "pig summoned by a scheduled function ticked this tick");

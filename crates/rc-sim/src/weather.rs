@@ -324,7 +324,7 @@ impl Server {
         let area =
             rc_physics::Aabb { min: [c[0] - 8.0, c[1] - 5.0, c[2] - 8.0], max: [c[0] + 8.0, c[1] + 5.0, c[2] + 8.0] };
         let universal = self.rule("minecraft:universal_anger", false);
-        self.mobs.list.iter().flatten().any(|m| {
+        self.mobs.list.iter().any(|m| {
             m.alive()
                 && rest_breaker(m.kind)
                 && m.touches(&area)
@@ -337,20 +337,20 @@ impl Server {
 
     /// A villager sleeping in this bed is woken (true if there was one).
     fn kick_villager_out_of_bed(&mut self, head: [i32; 3]) -> bool {
-        let Some(i) = self.mobs.list.iter().position(|m| {
+        let Some(i) = self.mobs.list.slots().iter().position(|m| {
             m.as_ref()
                 .is_some_and(|m| m.kind == crate::mobs::species::Kind::Villager && self.npc_sleeping(m) == Some(head))
         }) else {
             return false;
         };
-        let Some(mut m) = self.mobs.list[i].take() else { return false };
+        let Some(mut m) = self.mobs.list.take(i) else { return false };
         if let Some(mut b) = m.npc.as_mut().and_then(|n| n.brain.take()) {
             self.stop_sleeping(&mut m, &mut b);
             if let Some(n) = m.npc.as_mut() {
                 n.brain = Some(b);
             }
         }
-        self.mobs.list[i] = Some(m);
+        self.mobs.list.put(i, m);
         true
     }
 

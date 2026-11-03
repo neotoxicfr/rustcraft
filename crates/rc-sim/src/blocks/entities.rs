@@ -865,16 +865,16 @@ impl Server {
         let damage = ((n as f32 * per).floor()).min(max as f32);
         // Living mobs and player (neither creative nor spectator) in the block's box.
         let bb = Self::entity_box(e);
-        let ids: Vec<i32> = self.mobs.list.iter().flatten().filter(|m| m.alive()).map(|m| m.id).collect();
+        let ids: Vec<i32> = self.mobs.list.iter().filter(|m| m.alive()).map(|m| m.id).collect();
         for id in ids {
             let Some(mb) = self.ent_bbox(crate::mobs::mob::Ent::Mob(id)) else { continue };
             if !mb.intersects(&bb) {
                 continue;
             }
             let Some(i) = self.mob_index(id) else { continue };
-            let Some(mut o) = self.mobs.list[i].take() else { continue };
+            let Some(mut o) = self.mobs.list.take(i) else { continue };
             self.mob_hurt(&mut o, ty, damage, None, Some(e.pos));
-            self.mobs.list[i] = Some(o);
+            self.mobs.list.put(i, o);
         }
         if !matches!(self.game_mode, 1 | 3)
             && !self.life.vit.dead
@@ -1208,7 +1208,6 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|m| {
                 !m.removed
                     && Some(m.id) != except

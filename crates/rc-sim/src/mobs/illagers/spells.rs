@@ -45,8 +45,7 @@ impl Server {
                     .mobs
                     .list
                     .iter()
-                    .flatten()
-                    .filter(|o| o.kind == Kind::Vex && o.alive() && o.touches(&area) && dist2(m.pos, o.pos) <= 256.0)
+                    .filter(|o| o.kind == Kind::Vex && o.alive() && o.touches(&area) && dist2(m.pos(), o.pos()) <= 256.0)
                     .count() as i32;
                 m.rng.next_int_bound(8) + 1 > vexes
             }
@@ -85,7 +84,6 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| o.kind == Kind::Sheep && o.alive() && (o.wool & 15) == 11 && o.touches(&area))
             .map(|o| o.id)
             .collect();
@@ -107,7 +105,7 @@ impl Server {
             Spell::Wololo => {
                 if let Some(id) = m.ill.wololo
                     && let Some(i) = self.mob_index(id)
-                    && let Some(o) = self.mobs.list[i].as_mut()
+                    && let Some(o) = self.mobs.list.get_mut(i)
                     && o.alive()
                 {
                     // Red (14).
@@ -125,9 +123,9 @@ impl Server {
                         }
                         Ent::Mob(id) => {
                             if let Some(i) = self.mob_index(id) {
-                                let mut o = self.mobs.list[i].take().expect("mob");
+                                let mut o = self.mobs.list.take(i).expect("mob");
                                 self.give_mob_effect(&mut o, "minecraft:blindness", 400, 0);
-                                self.mobs.list[i] = Some(o);
+                                self.mobs.list.put(i, o);
                             }
                         }
                     }
@@ -142,27 +140,27 @@ impl Server {
     fn cast_fangs(&mut self, m: &mut Mob) {
         let Some(t) = m.target else { return };
         let Some(tp) = self.ent_pos(t) else { return };
-        let min_y = tp[1].min(m.pos[1]);
-        let max_y = tp[1].max(m.pos[1]) + 1.0;
-        let angle = super::super::mth::atan2(tp[2] - m.pos[2], tp[0] - m.pos[0]) as f32;
-        if dist2(m.pos, tp) < 9.0 {
+        let min_y = tp[1].min(m.pos()[1]);
+        let max_y = tp[1].max(m.pos()[1]) + 1.0;
+        let angle = super::super::mth::atan2(tp[2] - m.pos()[2], tp[0] - m.pos()[0]) as f32;
+        if dist2(m.pos(), tp) < 9.0 {
             for i in 0..5 {
                 let a = angle + i as f32 * std::f32::consts::PI * 0.4;
-                let x = m.pos[0] + f64::from(cos(a)) * 1.5;
-                let z = m.pos[2] + f64::from(sin(a)) * 1.5;
+                let x = m.pos()[0] + f64::from(cos(a)) * 1.5;
+                let z = m.pos()[2] + f64::from(sin(a)) * 1.5;
                 self.create_fangs(m, x, z, min_y, max_y, a, 0);
             }
             for i in 0..8 {
                 let a = angle + i as f32 * std::f32::consts::PI * 2.0 / 8.0 + (std::f64::consts::PI * 2.0 / 5.0) as f32;
-                let x = m.pos[0] + f64::from(cos(a)) * 2.5;
-                let z = m.pos[2] + f64::from(sin(a)) * 2.5;
+                let x = m.pos()[0] + f64::from(cos(a)) * 2.5;
+                let z = m.pos()[2] + f64::from(sin(a)) * 2.5;
                 self.create_fangs(m, x, z, min_y, max_y, a, 3);
             }
         } else {
             for i in 0..16 {
                 let reach = 1.25 * f64::from(i + 1);
-                let x = m.pos[0] + f64::from(cos(angle)) * reach;
-                let z = m.pos[2] + f64::from(sin(angle)) * reach;
+                let x = m.pos()[0] + f64::from(cos(angle)) * reach;
+                let z = m.pos()[2] + f64::from(sin(angle)) * reach;
                 self.create_fangs(m, x, z, min_y, max_y, angle, i);
             }
         }
@@ -307,13 +305,13 @@ impl Server {
     fn fangs_damage(&mut self, f: &Fangs, bb: &rc_physics::Aabb) {
         let owner = f.owner.and_then(|id| self.mob_ref(id)).filter(|o| o.alive()).cloned();
         let ids: Vec<i32> =
-            self.mobs.list.iter().flatten().filter(|o| o.alive() && o.touches(bb)).map(|o| o.id).collect();
+            self.mobs.list.iter().filter(|o| o.alive() && o.touches(bb)).map(|o| o.id).collect();
         for id in ids {
             if Some(id) == f.owner {
                 continue;
             }
             let Some(i) = self.mob_index(id) else { continue };
-            let mut o = self.mobs.list[i].take().expect("mob");
+            let mut o = self.mobs.list.take(i).expect("mob");
             match &owner {
                 None => {
                     self.mob_hurt(&mut o, "minecraft:magic", 6.0, None, None);
@@ -323,13 +321,13 @@ impl Server {
                         && self.mob_hurt(&mut o, "minecraft:indirect_magic", 6.0, Some(Ent::Mob(ow.id)), Some(f.pos))
                     {
                         // G5-F04: thorns of the struck mob on the caster.
-                        self.mobs.list[i] = Some(o);
+                        self.mobs.list.put(i, o);
                         self.post_attack_by(Ent::Mob(id), Some(Ent::Mob(ow.id)), "minecraft:indirect_magic");
                         continue;
                     }
                 }
             }
-            self.mobs.list[i] = Some(o);
+            self.mobs.list.put(i, o);
         }
         if self.game_mode != 3 && self.ent_alive(Ent::Player) && self.player_aabb().intersects(bb) {
             match &owner {
@@ -366,7 +364,7 @@ impl Server {
             v.ill.bound = Some(p);
             v.ill.life = Some(20 * (30 + m.rng.next_int_bound(90)));
             // The evoker's scoreboard team, if any, before the vex enters the world.
-            if let Some(team) = self.cmd.scores.team_of(&crate::nbtio::uuid_text(m.uuid)).map(|t| t.name.clone()) {
+            if let Some(team) = self.cmd.scores.team_of_uuid(m.uuid).map(|t| t.name.clone()) {
                 self.cmd.scores.join_team(&crate::nbtio::uuid_text(v.uuid), &team);
             }
             self.add_mob(v);

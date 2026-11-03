@@ -83,6 +83,15 @@ impl Names {
         self.log(bound, self.phase(), id, 0, text);
     }
 
+    /// Detail line whose text is only built when the log is on: a disabled log no longer pays a
+    /// `format!` per packet (`RUSTCRAFT_OPT_LAZY_PACKET_LOG=0` builds it every time, as before).
+    pub fn detail_with(&self, bound: Bound, id: i32, text: impl FnOnce() -> String) {
+        if rc_data::opt_switch!("RUSTCRAFT_OPT_LAZY_PACKET_LOG") && !enabled() {
+            return;
+        }
+        self.detail(bound, id, &text());
+    }
+
     fn log(&self, bound: Bound, phase: Phase, id: i32, len: usize, text: &str) {
         let Some(f) = filter() else { return };
         let name = self.name(phase, bound, id);

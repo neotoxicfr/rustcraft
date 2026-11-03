@@ -91,7 +91,7 @@ pub fn on_fall(s: &mut Server, m: &Mob, distance: f64) {
 
 /// Yaw, pitch and head set directly.
 fn look_at_eyes(m: &mut Mob, p: [f64; 3]) {
-    let from = [m.pos[0], m.eye_y(), m.pos[2]];
+    let from = [m.pos()[0], m.eye_y(), m.pos()[2]];
     let (xd, yd, zd) = (p[0] - from[0], p[1] - from[1], p[2] - from[2]);
     let sd = (xd * xd + zd * zd).sqrt();
     let deg = 180.0f32 / std::f32::consts::PI;
@@ -102,7 +102,7 @@ fn look_at_eyes(m: &mut Mob, p: [f64; 3]) {
 
 /// Shot height: middle of the box + 0.3.
 pub fn firing_y(m: &Mob) -> f64 {
-    m.pos[1] + f64::from(m.height() / 2.0) + f64::from(0.3f32)
+    m.pos()[1] + f64::from(m.height() / 2.0) + f64::from(0.3f32)
 }
 
 // ---------- Shot (`Shoot`) ----------
@@ -114,7 +114,7 @@ pub fn shoot_check(s: &mut Server, m: &mut Mob, b: &mut Brain) -> bool {
     }
     let Some(t) = b.mem.attack.get() else { return false };
     let Some(tp) = s.ent_pos(t) else { return false };
-    let within = super::super::mth::dist2(m.pos, tp) < 256.0;
+    let within = super::super::mth::dist2(m.pos(), tp) < 256.0;
     if !within {
         b.mem.x.shoot.erase();
     }
@@ -141,11 +141,11 @@ pub fn shoot_tick(s: &mut Server, m: &mut Mob, b: &mut Brain) {
     b.mem.x.shoot_recovering.set_exp((), 4);
     let (Some(tb), riding) = (s.ent_bbox(t), s.ent_riding(t)) else { return };
     let h = tb.max[1] - tb.min[1];
-    let xd = tp[0] - m.pos[0];
+    let xd = tp[0] - m.pos()[0];
     let yd = tp[1] + h * if riding { 0.8 } else { 0.3 } - firing_y(m);
-    let zd = tp[2] - m.pos[2];
+    let zd = tp[2] - m.pos()[2];
     let unc = (5 - s.level.difficulty_id() * 4) as f32;
-    let start = [m.pos[0], firing_y(m), m.pos[2]];
+    let start = [m.pos()[0], firing_y(m), m.pos()[2]];
     s.shoot_wind_charge(m.uuid, start, [xd, yd, zd], 0.7, unc);
     s.mob_sound(m, "minecraft:entity.breeze.shoot", 1.5, 1.0);
 }
@@ -195,8 +195,8 @@ fn snap_to_surface(s: &Server, p: [f64; 3]) -> Option<[i32; 3]> {
 /// From the feet, 50 blocks at most (or the tracking range).
 fn has_line_of_sight(s: &Server, m: &Mob, to: [f64; 3]) -> bool {
     let max = 50.0f64.max(m.follow_range());
-    let d = super::super::mth::dist2(m.pos, to).sqrt();
-    d <= max && !s.clip_blocks(m.pos, to)
+    let d = super::super::mth::dist2(m.pos(), to).sqrt();
+    d <= max && !s.clip_blocks(m.pos(), to)
 }
 
 /// The dangerous-block test of the breeze's type (not fire immune: the lava cauldron counts).
@@ -218,7 +218,7 @@ pub fn jump_can_run(s: &mut Server, m: &mut Mob, b: &mut Brain) -> bool {
     }
     let Some(t) = b.mem.attack.get() else { return false };
     let Some(tp) = s.ent_pos(t) else { return false };
-    let d = super::super::mth::dist2(m.pos, tp).sqrt();
+    let d = super::super::mth::dist2(m.pos(), tp).sqrt();
     if d >= m.follow_range() {
         b.mem.attack.erase();
         return false;
@@ -332,7 +332,7 @@ fn optimal_jump(m: &mut Mob, target: [f64; 3]) -> Option<[f64; 3]> {
 
 /// The jump vector computation for an angle without collision control.
 fn jump_vector(m: &Mob, target: [f64; 3], max_v: f32, angle: i32) -> Option<[f64; 3]> {
-    let p = m.pos;
+    let p = m.pos();
     let half = super::super::mth::normalize([target[0] - p[0], 0.0, target[2] - p[2]]).map(|v| v * 0.5);
     let tp = [target[0] - half[0], target[1], target[2] - half[2]];
     let d = [tp[0] - p[0], tp[1] - p[1], tp[2] - p[2]];
@@ -375,7 +375,7 @@ pub fn slide_start(s: &mut Server, m: &mut Mob, b: &mut Brain) {
     if inner
         && let Some(p0) = s.default_random_pos_away(m, 5, 5, tp)
         && has_line_of_sight(s, m, p0)
-        && super::super::mth::dist2(tp, p0) > super::super::mth::dist2(tp, m.pos)
+        && super::super::mth::dist2(tp, p0) > super::super::mth::dist2(tp, m.pos())
     {
         position = Some(p0);
     }
@@ -385,11 +385,11 @@ pub fn slide_start(s: &mut Server, m: &mut Mob, b: &mut Brain) {
             if m.rng.next_bool() {
                 point_behind(s, m, t).unwrap_or(tp)
             } else {
-                let dir = [tp[0] - m.pos[0], tp[1] - m.pos[1], tp[2] - m.pos[2]];
+                let dir = [tp[0] - m.pos()[0], tp[1] - m.pos()[1], tp[2] - m.pos()[2]];
                 let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
                 let dist = len - (8.0 + m.rng.next_double() * (4.0 - 8.0));
                 let n = super::super::mth::normalize(dir);
-                [m.pos[0] + n[0] * dist, m.pos[1] + n[1] * dist, m.pos[2] + n[2] * dist]
+                [m.pos()[0] + n[0] * dist, m.pos()[1] + n[1] * dist, m.pos()[2] + n[2] * dist]
             }
         }
     };

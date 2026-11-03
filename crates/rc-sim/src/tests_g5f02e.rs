@@ -152,9 +152,9 @@ fn cobweb_slows_mobs_and_weaving() {
         m.vel = [0.2, 0.0, 0.0];
         w.p.s.tick_mob(m); // contact set
         m.vel = [0.2, 0.0, 0.0];
-        let x0 = m.pos[0];
+        let x0 = m.pos()[0];
         w.p.s.tick_mob(m); // slowed movement
-        dx.push(m.pos[0] - x0);
+        dx.push(m.pos()[0] - x0);
     }
     assert!(dx[0] > 0.0 && dx[0] < 0.06, "cobweb: {dx:?}");
     assert!((dx[1] / dx[0] - 2.0).abs() < 1.0e-6, "Weaving = half the slowdown: {dx:?}");
@@ -261,7 +261,7 @@ fn direct_contacts_before_the_deferred_effects() {
     pig.health = 1.0;
     pig.vel = [1.0, 0.0, 0.0];
     w.p.s.tick_mob(&mut pig);
-    assert!(pig.pos[0] > 3.0, "pig in the lava cell: {:?}", pig.pos);
+    assert!(pig.pos()[0] > 3.0, "pig in the lava cell: {:?}", pig.pos());
     assert!(pig.health <= 0.0, "killed by the bush");
     assert!(pig.fire <= 0, "set on fire after its death: {}", pig.fire);
 }
@@ -330,7 +330,7 @@ fn tripwire_tightened_only_by_its_shape() {
     z.on_ground = false;
     z.vel = [0.2, 0.0, 0.0];
     w.p.s.tick_mob(&mut z);
-    assert!(z.pos[1] > y + 2.5 / 16.0, "zombie stayed above: {}", z.pos[1]);
+    assert!(z.pos()[1] > y + 2.5 / 16.0, "zombie stayed above: {}", z.pos()[1]);
     assert!(w.block([10, Y, 14]).contains("powered=false"), "mob above: {}", w.block([10, Y, 14]));
     // Arrow at chest height (box from 0.6 to 1.1) through a loose wire (0 to 0.5).
     shoot(&mut w, PKind::Arrow, [5.6, y + 0.6, 14.5], [0.8, 0.0, 0.0]);
@@ -590,7 +590,7 @@ fn bench_mob_contacts() {
             let t = std::time::Instant::now();
             for _ in 0..100_000 {
                 z.old = [pos[0] - 0.2, pos[1], pos[2] - 0.1];
-                z.pos = pos;
+                z.set_pos(pos);
                 w.p.s.mob_contacts(&mut z);
             }
             best = best.min(t.elapsed().as_secs_f64() * 1.0e9 / 100_000.0);

@@ -35,6 +35,7 @@ ipconfig.workspace = true
 
 [dev-dependencies]
 mimalloc.workspace = true
+rc-testdata.workspace = true
 
 [lints]
 workspace = true

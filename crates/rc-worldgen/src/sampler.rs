@@ -2,9 +2,14 @@
 //! path, as the game uses them (they are not always bit-for-bit equal).
 
 use crate::density::{Axis, Metric, RoundKind, Unary, round_to_integer, squeeze};
-use crate::math::{clamp, floor_div, floor_f, floor_mod, jmax, jmin, lerp, lerp3, signum};
+use crate::math::{clamp, floor_div, floor_mod, jmax, jmin, lerp, lerp3, signum};
 use crate::noise::{NoiseStack, Simplex};
 use crate::volume::Volume;
+
+mod eval_counts;
+
+use eval_counts::count;
+pub use eval_counts::{EvalCounts, count_evaluations, take_eval_counts};
 
 /// Index of a sampler in the generator's table.
 pub type Sid = u32;
@@ -167,6 +172,16 @@ pub struct Opts {
     pub take_without_zeroing: bool,
     /// A buffer is taken from the spare one that fits it best, and the spares are capped in bytes.
     pub best_fit_buffers: bool,
+    /// A cache whose input is exact serves any volume whose points it already holds (sub-lattice).
+    pub sublattice_cache_read: bool,
+    /// Volume spline: the coordinate buffers are held on the stack (up to 8 coordinates).
+    pub spline_inputs_on_stack: bool,
+    /// A cache whose input never reads y has one point value per column: where the point would be
+    /// computed, the value already known from another height answers.
+    pub column_memo_y_independent: bool,
+    /// Scattered floors of the generator (surface levels, cell tops) through the shared floor,
+    /// not the C library (`RUSTCRAFT_OPT_FLOOR_JAVA`).
+    pub floor_java: bool,
 }
 
 impl Opts {
@@ -177,10 +192,23 @@ impl Opts {
         spline_stack: false,
         take_without_zeroing: false,
         best_fit_buffers: false,
+        sublattice_cache_read: false,
+        spline_inputs_on_stack: false,
+        column_memo_y_independent: false,
+        floor_java: false,
     };
     /// All the tracks.
-    pub const NEW: Opts =
-        Opts { range_yvol: true, vol_pool: true, spline_stack: true, take_without_zeroing: true, best_fit_buffers: true };
+    pub const NEW: Opts = Opts {
+        range_yvol: true,
+        vol_pool: true,
+        spline_stack: true,
+        take_without_zeroing: true,
+        best_fit_buffers: true,
+        sublattice_cache_read: true,
+        spline_inputs_on_stack: true,
+        column_memo_y_independent: true,
+        floor_java: true,
+    };
 
     pub fn current() -> Opts {
         static P: std::sync::LazyLock<Opts> = std::sync::LazyLock::new(|| Opts {
@@ -189,6 +217,10 @@ impl Opts {
             spline_stack: crate::opt::spline_stack(),
             take_without_zeroing: crate::opt::take_without_zeroing(),
             best_fit_buffers: crate::opt::best_fit_buffers(),
+            sublattice_cache_read: crate::opt::sublattice_cache_read(),
+            spline_inputs_on_stack: crate::opt::spline_inputs_on_stack(),
+            column_memo_y_independent: crate::opt::column_memo_y_independent(),
+            floor_java: crate::opt::floor_java(),
         });
         *P
     }
@@ -252,6 +284,19 @@ impl Ctx {
     /// Context with caches, paths forced (equivalence tests, benches).
     pub fn cached_with(opts: Opts) -> Self {
         Ctx { cells: Some(Vec::new()), opts, ..Ctx::default() }
+    }
+
+    /// The game's floor of a float, through the switch kept in the context (read once per context:
+    /// reading it at each floor cost 27% of the floor). `RUSTCRAFT_OPT_FLOOR_JAVA=0`: C library.
+    #[inline]
+    pub fn floor_f32_to_i32(&self, v: f32) -> i32 {
+        crate::math::floor_f32_to_i32(v, self.opts.floor_java)
+    }
+
+    /// The game's rounding of a float (halves up), same switch as [`Ctx::floor_f32_to_i32`].
+    #[inline]
+    pub fn round_f32_to_i32(&self, v: f32) -> i32 {
+        crate::math::round_f32_to_i32(v, self.opts.floor_java)
     }
 
     /// Hands a buffer (received from [`Generator::volume`](crate::Generator::volume)) back to the context, which
@@ -436,6 +481,63 @@ fn rows_of(full: &Volume, sub: &Volume, cell: i32) -> Option<usize> {
     Some(k as usize)
 }
 
+/// Copies into `out` (volume `v`) the rows `[k, k + v.sy[` of each column of `b` (volume `w`).
+fn copy_rows(b: &[f32], w: &Volume, k: usize, out: &mut [f32], v: &Volume) {
+    let (sy, len) = (w.sy as usize, v.sy as usize);
+    for (col, dst) in out.chunks_exact_mut(len).enumerate() {
+        let at = col * sy + k;
+        dst.copy_from_slice(&b[at..at + len]);
+    }
+}
+
+/// Where the points of a volume sit inside a larger volume that holds them all: per axis (x, y,
+/// z), index in the larger volume of the first point and index stride between two points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Sublattice {
+    first: [i32; 3],
+    stride: [i32; 3],
+}
+
+impl Sublattice {
+    /// `Some` if every point of `v` is a point of `w`.
+    fn of(w: &Volume, v: &Volume) -> Option<Sublattice> {
+        let x = lattice_axis((w.x0, w.stx, w.sx), (v.x0, v.stx, v.sx))?;
+        let y = lattice_axis((w.y0, w.sty, w.sy), (v.y0, v.sty, v.sy))?;
+        let z = lattice_axis((w.z0, w.stz, w.sz), (v.z0, v.stz, v.sz))?;
+        Some(Sublattice { first: [x.0, y.0, z.0], stride: [x.1, y.1, z.1] })
+    }
+
+    /// Copies the points of `v` from `b` (values of `w`) into `out`, in the order of `v`.
+    fn copy(&self, b: &[f32], w: &Volume, out: &mut [f32], v: &Volume) {
+        let ([fx, fy, fz], [rx, ry, rz]) = (self.first, self.stride);
+        let len = v.sy as usize;
+        for (col, dst) in out.chunks_exact_mut(len).enumerate() {
+            let (ix, iz) = (col as i32 % v.sx, col as i32 / v.sx);
+            let at = w.index(fx + ix * rx, fy, fz + iz * rz);
+            if ry == 1 {
+                dst.copy_from_slice(&b[at..at + len]);
+            } else {
+                dst.iter_mut().zip(b[at..].iter().step_by(ry as usize)).for_each(|(d, s)| *d = *s);
+            }
+        }
+    }
+}
+
+/// One axis of [`Sublattice::of`]: `(origin, step, size)` of the larger volume, then of the
+/// smaller one; `(first index, stride)` if the points of the smaller one are points of the larger.
+fn lattice_axis((w0, wst, wn): (i32, i32, i32), (v0, vst, vn): (i32, i32, i32)) -> Option<(i32, i32)> {
+    let offset = i64::from(v0) - i64::from(w0);
+    let wst = i64::from(wst);
+    if offset < 0 || offset % wst != 0 {
+        return None;
+    }
+    let first = offset / wst;
+    // A single point has no stride to match.
+    let stride = if vn == 1 { 1 } else if i64::from(vst) % wst == 0 { i64::from(vst) / wst } else { return None };
+    let last = first + i64::from(vn - 1) * stride;
+    (last < i64::from(wn)).then_some((first as i32, stride as i32))
+}
+
 /// Common mesh (lcm) of two branches: 0 = no interpolation, -1 = too large (the
 /// sub-volume then keeps the bottom of the volume).
 fn cell_join(a: i32, b: i32) -> i32 {
@@ -460,6 +562,30 @@ fn pack_pos(x: i32, y: i32, z: i32) -> i64 {
 /// Table of samplers and the objects they reference (noises, simplex).
 const EXACT: u8 = 1;
 const PINNED: u8 = 2;
+/// The point value may depend on y (see [`reads_y_itself`]).
+const READS_Y: u8 = 4;
+
+/// Does the node read y itself, children apart? Conservative: an interpolation is counted as
+/// reading y (away from a cell corner its point path goes through a small volume, whose value may
+/// differ from the point value of its input).
+fn reads_y_itself(s: &S) -> bool {
+    match s {
+        S::Noise { y, .. } | S::ShiftedXz { y, .. } | S::ShiftedXyz { y, .. } => *y != 0.0,
+        S::GradClamp { axis, .. } | S::GradRepeat { axis, .. } | S::GradMirror { axis, .. } => *axis == Axis::Y,
+        S::Distance { .. } | S::Interpolated { .. } => true,
+        _ => false,
+    }
+}
+
+/// Does `child` pass its dependence on y to `parent`? A slice in y reads its input at a fixed y,
+/// and a top surface search probes its density at its own heights.
+fn passes_y(parent: &S, child: Sid) -> bool {
+    match parent {
+        S::SliceY(..) => false,
+        S::FindTop { upper, .. } => child == *upper,
+        _ => true,
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct Program {
@@ -614,8 +740,8 @@ fn unary(u: Unary, v: f32) -> f32 {
 }
 
 #[inline]
-fn round_apply(k: RoundKind, v: f32, m: f32) -> f32 {
-    if m == 0.0 { v } else { round_to_integer(v / m, k) * m }
+fn round_apply(k: RoundKind, v: f32, m: f32, floor_java: bool) -> f32 {
+    if m == 0.0 { v } else { round_to_integer(v / m, k, floor_java) * m }
 }
 
 #[inline]
@@ -705,6 +831,11 @@ impl Program {
         let mut flags = match s {
             S::Interpolated { .. } => 0,
             S::Noise { xz, y, .. } if !(pow2(xz) && pow2(y)) => 0,
+            // At a point, a zero left side skips the right one and the comparisons go through the
+            // Java min and max; over a volume, the sides are multiplied and compared: −0, +0 and NaN
+            // can come out differently (the game does the same).
+            S::Mul(..) | S::Div(..) | S::Min(..) | S::Max(..) => 0,
+            S::ConstMin(_, c) | S::ConstMax(_, c) if c == 0.0 => 0,
             _ => EXACT,
         };
         if let S::Cache { input, .. } = s
@@ -712,13 +843,17 @@ impl Program {
         {
             flags |= PINNED;
         }
+        if reads_y_itself(&s) {
+            flags |= READS_Y;
+        }
         if matches!(s, S::Cache { .. }) {
             self.n_caches += 1;
         }
         s.children(|c| {
             cell = cell_join(cell, self.cell_of(c));
             let f = self.flags_of(c);
-            flags = (flags & f & EXACT) | ((flags | f) & PINNED);
+            let passed_y = if passes_y(&s, c) { f & READS_Y } else { 0 };
+            flags = (flags & f & EXACT) | ((flags | f) & PINNED) | (flags & READS_Y) | passed_y;
         });
         self.cells.push(cell);
         self.flags.push(flags);
@@ -743,6 +878,12 @@ impl Program {
         self.flags_of(s) & PINNED == 0
     }
 
+    /// Can the point value of `s` depend on y? Yes below a cache with a non-exact entry too: its
+    /// value then depends on which points its buffer holds.
+    fn reads_y(&self, s: Sid) -> bool {
+        self.flags_of(s) & (READS_Y | PINNED) != 0
+    }
+
     /// y mesh of the interpolated nodes under `s` (0: none; -1: unknown or too large).
     pub fn cell_of(&self, s: Sid) -> i32 {
         if self.cells.len() == self.nodes.len() { self.cells.get(s as usize).copied().unwrap_or(-1) } else { -1 }
@@ -765,6 +906,50 @@ impl Program {
             out[at..at + n].copy_from_slice(src);
         }
         ctx.give(b);
+    }
+
+    /// Counts (counting on) what the branch `branch` of a choice restricted in y costs over `v`:
+    /// the elements that read it (`reads` true on their selector value), the values computed over
+    /// the rows of the hull of every column, and the values a hull per column would compute.
+    fn count_branch(&self, branch: Sid, v: &Volume, selector: &[f32], reads: impl Fn(f32) -> bool) {
+        count(|c| {
+            let cell = self.cell_of(branch);
+            let rows = |hull: Option<(i32, i32)>| {
+                hull.map_or(0, |h| {
+                    let (r0, r1) = snap_rows(v, cell, h);
+                    (r1 - r0) as u64
+                })
+            };
+            let whole = (v.sx * v.sz) as u64 * rows(rows_hull(v, selector, &reads));
+            let columns = selector.chunks_exact(v.sy as usize);
+            let per_column = columns.map(|col| rows(rows_hull(v, col, &reads))).sum::<u64>();
+            // Only a branch without interpolation could be cut per column: an interpolated node
+            // would compute the corners shared by neighbouring columns again for each one.
+            let noises = if cell == 0 { self.noise_nodes_under(branch) } else { 0 };
+            c.choice_branches += 1;
+            c.branch_values_read += selector.iter().filter(|x| reads(**x)).count() as u64;
+            c.branch_values_whole_hull += whole;
+            c.branch_values_column_hulls += per_column;
+            c.plain_branch_noise_values_whole_hull += whole * noises;
+            c.plain_branch_noise_values_column_hulls += per_column * noises;
+        });
+    }
+
+    /// Noise nodes evaluated by `s` (each cache counted once).
+    fn noise_nodes_under(&self, s: Sid) -> u64 {
+        let (mut stack, mut seen, mut n) = (vec![s], Vec::new(), 0);
+        while let Some(x) = stack.pop() {
+            let node = self.node(x);
+            if let S::Cache { id, .. } = node {
+                if seen.contains(id) {
+                    continue;
+                }
+                seen.push(*id);
+            }
+            n += u64::from(matches!(node, S::Noise { .. } | S::ShiftedXz { .. } | S::ShiftedXyz { .. } | S::ShiftB { .. }));
+            node.children(|c| stack.push(c));
+        }
+        n
     }
 
     /// Read-only buffer of the values of `s`: that of a cache already filled for this volume is
@@ -795,24 +980,31 @@ impl Program {
         match self.node(s) {
             S::Const(v) => *v,
             S::Noise { noise, xz, y: ys, .. } => {
+                count(|c| c.point_noises += 1);
                 self.noises[*noise as usize].get(f64::from(x) * xz, f64::from(y) * ys, f64::from(z) * xz)
             }
             S::ShiftedXz { sx, sz, noise, xz, y: ys } => {
+                count(|c| c.point_noises += 1);
                 let nx = f64::from(x) * xz + f64::from(self.value(*sx, ctx, x, y, z));
                 let ny = f64::from(y) * ys;
                 let nz = f64::from(z) * xz + f64::from(self.value(*sz, ctx, x, y, z));
                 self.noises[*noise as usize].get(nx, ny, nz)
             }
             S::ShiftedXyz { sx, sy, sz, noise, xz, y: ys } => {
+                count(|c| c.point_noises += 1);
                 let nx = f64::from(x) * xz + f64::from(self.value(*sx, ctx, x, y, z));
                 let ny = f64::from(y) * ys + f64::from(self.value(*sy, ctx, x, y, z));
                 let nz = f64::from(z) * xz + f64::from(self.value(*sz, ctx, x, y, z));
                 self.noises[*noise as usize].get(nx, ny, nz)
             }
             S::ShiftB { noise } => {
+                count(|c| c.point_noises += 1);
                 self.noises[*noise as usize].get(f64::from(z) * 0.25, f64::from(x) * 0.25, 0.0) * 4.0
             }
-            S::EndIslands { simplex } => (island_height(&self.simplex[*simplex as usize], x / 8, z / 8) - 8.0) / 128.0,
+            S::EndIslands { simplex } => {
+                count(|c| c.point_noises += 1);
+                (island_height(&self.simplex[*simplex as usize], x / 8, z / 8) - 8.0) / 128.0
+            }
             S::Distance { p, metric: m } => metric(*m, (p[0] - x) as f32, (p[1] - y) as f32, (p[2] - z) as f32),
             S::GradClamp { axis, from, min, max, from_v, factor } => {
                 grad_clamp(axis.choose(x, y, z), *from, *min, *max, *from_v, *factor)
@@ -848,11 +1040,11 @@ impl Program {
             }
             S::ConstMax(a, c) => jmax(self.value(*a, ctx, x, y, z), *c),
             S::Unary(u, a) => unary(*u, self.value(*a, ctx, x, y, z)),
-            S::RoundInt(k, a) => round_to_integer(self.value(*a, ctx, x, y, z), *k),
+            S::RoundInt(k, a) => round_to_integer(self.value(*a, ctx, x, y, z), *k, ctx.opts.floor_java),
             S::Round(k, a, m) => {
                 let v = self.value(*a, ctx, x, y, z);
                 let m = self.value(*m, ctx, x, y, z);
-                round_apply(*k, v, m)
+                round_apply(*k, v, m, ctx.opts.floor_java)
             }
             S::PowConstBase(b, e) => b.powf(f64::from(self.value(*e, ctx, x, y, z))) as f32,
             S::PowConstExp(b, e) => f64::from(self.value(*b, ctx, x, y, z)).powf(*e) as f32,
@@ -862,6 +1054,7 @@ impl Program {
                 f64::from(b).powf(f64::from(e)) as f32
             }
             S::Spline { spline, coords } if ctx.opts.spline_stack && coords.len() <= 8 => {
+                count(|c| c.point_splines += 1);
                 let mut cache = [f32::NAN; 8];
                 let mut input = |i: usize| {
                     if cache[i].is_nan() {
@@ -872,6 +1065,7 @@ impl Program {
                 spline_sample(spline, &mut input)
             }
             S::Spline { spline, coords } => {
+                count(|c| c.point_splines += 1);
                 let mut cache = vec![f32::NAN; coords.len()];
                 let mut input = |i: usize| {
                     if cache[i].is_nan() {
@@ -972,12 +1166,13 @@ impl Program {
 
     #[allow(clippy::too_many_arguments)]
     fn find_top(&self, density: Sid, lower: i32, cell: i32, ctx: &mut Ctx, x: i32, z: i32, upper: f32) -> f32 {
-        let top = floor_f(upper / cell as f32).wrapping_mul(cell);
+        let top = ctx.floor_f32_to_i32(upper / cell as f32).wrapping_mul(cell);
         if top <= lower {
             return lower as f32;
         }
         let mut p = top;
         while p >= lower {
+            count(|c| c.top_probes += 1);
             if self.value(density, ctx, x, p, z) > 0.0 {
                 return p as f32;
             }
@@ -988,19 +1183,37 @@ impl Program {
 
     fn value_cached(&self, id: u32, input: Sid, ctx: &mut Ctx, x: i32, y: i32, z: i32) -> f32 {
         let key = pack_pos(x, y, z);
+        let column_memo = ctx.opts.column_memo_y_independent;
         match ctx.cell(id, self.n_caches) {
             None => return self.value(input, ctx, x, y, z),
             Some(c) => {
+                // The game's order: the last point, then the buffer.
                 if c.key == key && !c.value.is_nan() {
+                    count(|n| n.cache_point_last += 1);
                     return c.value;
                 }
                 if let (Some(b), Some(v)) = (&c.buf, &c.volume)
                     && let Some(i) = v.index_of_block(x, y, z)
                 {
+                    count(|n| n.cache_point_buffer += 1);
                     return b[i];
+                }
+                // Where the game would compute the point: an input that never reads y has one
+                // point value per column, already known from another height.
+                if column_memo
+                    && !self.reads_y(input)
+                    && let Some(v) = self.column_value(c, input, (x, z), key)
+                {
+                    count(|n| n.cache_point_same_column += 1);
+                    // Kept as the game keeps the point it computes: a later read back at the old
+                    // height must miss the key and find the buffer (−0 where the point gave +0).
+                    c.key = key;
+                    c.value = v;
+                    return v;
                 }
             }
         }
+        count(|n| n.cache_point_computed += 1);
         let v = self.value(input, ctx, x, y, z);
         if let Some(c) = ctx.cell(id, self.n_caches) {
             c.key = key;
@@ -1009,47 +1222,83 @@ impl Program {
         v
     }
 
+    /// Point value at the column (x, z) of a cache whose input never reads y, known from another
+    /// height: the last point computed (`key` is the point read), or for an exact input (its
+    /// volume value is its point value) the buffer at y = 0.
+    fn column_value(&self, c: &CacheCell, input: Sid, (x, z): (i32, i32), key: i64) -> Option<f32> {
+        // `pack_pos` keeps y in its 12 low bits.
+        if c.key >> 12 == key >> 12 && !c.value.is_nan() {
+            return Some(c.value);
+        }
+        let (b, v) = (c.buf.as_ref()?, c.volume.as_ref()?);
+        if self.flags_of(input) & EXACT == 0 {
+            return None;
+        }
+        v.index_of_block(x, 0, z).map(|i| b[i])
+    }
+
     fn volume_cached(&self, id: u32, input: Sid, ctx: &mut Ctx, out: &mut [f32], v: &Volume) {
-        let rows = ctx.opts.range_yvol;
-        let cell = self.cell_of(input);
-        let hit = match ctx.cell(id, self.n_caches) {
-            None => {
-                self.volume(input, ctx, out, v);
+        let opts = ctx.opts;
+        let Some(c) = ctx.cell(id, self.n_caches) else {
+            self.volume(input, ctx, out, v);
+            return;
+        };
+        if let (Some(b), Some(w)) = (&c.buf, &c.volume) {
+            if w == v {
+                count(|n| n.cache_volume_same += 1);
+                out.copy_from_slice(b);
                 return;
             }
-            Some(c) => match (&c.buf, &c.volume) {
-                (Some(_), Some(w)) if w == v => true,
-                // Rows of a volume already in cache (sub-volume of a choice restricted in y).
-                (Some(b), Some(w)) if rows => {
-                    if let Some(k) = rows_of(w, v, cell) {
-                        let (sy, len) = (w.sy as usize, v.sy as usize);
-                        for (col, dst) in out.chunks_exact_mut(len).enumerate() {
-                            let at = col * sy + k;
-                            dst.copy_from_slice(&b[at..at + len]);
-                        }
-                        return;
-                    }
-                    false
-                }
-                _ => false,
-            },
-        };
-        if !hit {
-            let old = ctx.cell(id, self.n_caches).and_then(|c| {
-                c.volume = Some(*v);
-                c.buf.take()
-            });
-            if let Some(o) = old {
-                ctx.give(o);
+            // Rows of a volume already in cache (sub-volume of a choice restricted in y).
+            if opts.range_yvol
+                && let Some(k) = rows_of(w, v, self.cell_of(input))
+            {
+                count(|n| n.cache_volume_rows += 1);
+                copy_rows(b, w, k, out, v);
+                return;
             }
-            let mut b = ctx.take(v.size());
-            self.volume(input, ctx, &mut b, v);
-            if let Some(c) = ctx.cell(id, self.n_caches) {
-                c.buf = Some(b);
+            // An exact input gives each point the same value whatever the volume around it, so the
+            // points already held serve as they are.
+            if opts.sublattice_cache_read
+                && self.flags_of(input) & EXACT != 0
+                && let Some(lattice) = Sublattice::of(w, v)
+            {
+                count(|n| n.cache_volume_sublattice += 1);
+                lattice.copy(b, w, out, v);
+                // Then the cache holds `v`, as if it had computed it: the point reads that follow
+                // find the buffer the game's cache holds.
+                let mut held = self.retarget_cache_to_volume(id, ctx, v);
+                held.copy_from_slice(out);
+                self.keep_in_cache(id, ctx, held);
+                return;
             }
         }
-        if let Some(b) = ctx.cell(id, self.n_caches).and_then(|c| c.buf.as_ref()) {
-            out.copy_from_slice(b);
+        count(|n| {
+            n.cache_volume_computed += 1;
+            n.cache_volume_values += v.size() as u64;
+        });
+        let mut held = self.retarget_cache_to_volume(id, ctx, v);
+        self.volume(input, ctx, &mut held, v);
+        out.copy_from_slice(&held);
+        self.keep_in_cache(id, ctx, held);
+    }
+
+    /// Makes the cache `id` hold the volume `v` (its old buffer goes back to the spares) and returns a
+    /// buffer for its values, to hand to [`Program::keep_in_cache`].
+    fn retarget_cache_to_volume(&self, id: u32, ctx: &mut Ctx, v: &Volume) -> Vec<f32> {
+        let old = ctx.cell(id, self.n_caches).and_then(|c| {
+            c.volume = Some(*v);
+            c.buf.take()
+        });
+        if let Some(o) = old {
+            ctx.give(o);
+        }
+        ctx.take(v.size())
+    }
+
+    fn keep_in_cache(&self, id: u32, ctx: &mut Ctx, values: Vec<f32>) {
+        if let Some(c) = ctx.cell(id, self.n_caches) {
+            c.buf = Some(values);
         }
     }
 
@@ -1197,9 +1446,13 @@ impl Program {
             }
             S::RoundInt(k, a) => {
                 self.volume(*a, ctx, out, v);
-                out.iter_mut().for_each(|o| *o = round_to_integer(*o, *k));
+                let floor_java = ctx.opts.floor_java;
+                out.iter_mut().for_each(|o| *o = round_to_integer(*o, *k, floor_java));
             }
-            S::Round(k, a, m) => self.binary_volume(*a, *m, ctx, out, v, |l, r| *l = round_apply(*k, *l, r)),
+            S::Round(k, a, m) => {
+                let floor_java = ctx.opts.floor_java;
+                self.binary_volume(*a, *m, ctx, out, v, |l, r| *l = round_apply(*k, *l, r, floor_java));
+            }
             S::PowConstBase(b, e) => {
                 self.volume(*e, ctx, out, v);
                 out.iter_mut().for_each(|o| *o = b.powf(f64::from(*o)) as f32);
@@ -1211,32 +1464,12 @@ impl Program {
             S::Pow(b, e) => {
                 self.binary_volume(*b, *e, ctx, out, v, |l, r| *l = f64::from(*l).powf(f64::from(r)) as f32)
             }
-            S::Spline { spline, coords } => {
-                let mut bufs: Vec<Option<Vec<f32>>> = vec![None; coords.len()];
-                let direct = ctx.opts.spline_stack;
-                for (i, o) in out.iter_mut().enumerate() {
-                    let mut input = |c: usize| {
-                        if bufs[c].is_none() {
-                            let mut b = ctx.take(v.size());
-                            self.volume(coords[c], ctx, &mut b, v);
-                            bufs[c] = Some(b);
-                        }
-                        bufs[c].as_ref().map_or(0.0, |b| b[i])
-                    };
-                    *o = if direct {
-                        spline_sample(spline, &mut input)
-                    } else {
-                        spline_sample::<dyn FnMut(usize) -> f32>(spline, &mut input)
-                    };
-                }
-                for b in bufs.into_iter().flatten() {
-                    ctx.give(b);
-                }
-            }
+            S::Spline { spline, coords } => self.spline_volume(spline, coords, ctx, out, v),
             // Choice: each branch only on the rows where an element reads it.
             S::LerpConstFirst(a, f, s2) if ctx.opts.range_yvol && self.restrictable(s) => {
                 self.volume(*a, ctx, out, v);
                 let mut sb = ctx.take(v.size());
+                self.count_branch(*s2, v, out, |a| a != 0.0);
                 self.volume_rows(*s2, ctx, &mut sb, v, rows_hull(v, out, |a| a != 0.0));
                 for (o, sv) in out.iter_mut().zip(&sb) {
                     *o = lerp_choice(*o, *f, *sv);
@@ -1246,6 +1479,7 @@ impl Program {
             S::LerpConstSecond(a, f, s2) if ctx.opts.range_yvol && self.restrictable(s) => {
                 self.volume(*a, ctx, out, v);
                 let mut fb = ctx.take(v.size());
+                self.count_branch(*f, v, out, |a| a != 1.0);
                 self.volume_rows(*f, ctx, &mut fb, v, rows_hull(v, out, |a| a != 1.0));
                 for (o, fv) in out.iter_mut().zip(&fb) {
                     *o = lerp_choice(*o, *fv, *s2);
@@ -1255,8 +1489,10 @@ impl Program {
             S::Lerp(a, f, s2) if ctx.opts.range_yvol && self.restrictable(s) => {
                 self.volume(*a, ctx, out, v);
                 let mut fb = ctx.take(v.size());
+                self.count_branch(*f, v, out, |a| a != 1.0);
                 self.volume_rows(*f, ctx, &mut fb, v, rows_hull(v, out, |a| a != 1.0));
                 let mut sb = ctx.take(v.size());
+                self.count_branch(*s2, v, out, |a| a != 0.0);
                 self.volume_rows(*s2, ctx, &mut sb, v, rows_hull(v, out, |a| a != 0.0));
                 for i in 0..out.len() {
                     out[i] = lerp_choice(out[i], fb[i], sb[i]);
@@ -1269,6 +1505,8 @@ impl Program {
                 let inr = |x: f32| x >= min && x < max;
                 let mut ib = ctx.take(v.size());
                 self.volume(*input, ctx, &mut ib, v);
+                self.count_branch(*inside, v, &ib, inr);
+                self.count_branch(*outside, v, &ib, |x| !inr(x));
                 self.volume_rows(*inside, ctx, out, v, rows_hull(v, &ib, inr));
                 if let Some(h) = rows_hull(v, &ib, |x| !inr(x)) {
                     let mut ob = ctx.take(v.size());
@@ -1288,6 +1526,8 @@ impl Program {
                 let is_below = |x: f32| x < t;
                 let mut ib = ctx.take(v.size());
                 self.volume(*input, ctx, &mut ib, v);
+                self.count_branch(*below, v, &ib, is_below);
+                self.count_branch(*above, v, &ib, |x| !is_below(x));
                 self.volume_rows(*below, ctx, out, v, rows_hull(v, &ib, is_below));
                 if let Some(h) = rows_hull(v, &ib, |x| !is_below(x)) {
                     let mut ab = ctx.take(v.size());
@@ -1313,6 +1553,7 @@ impl Program {
                 let mut fb = ctx.take(v.size());
                 for (k, f) in functions.iter().enumerate() {
                     let kf = k as f32;
+                    self.count_branch(*f, v, &kb, |x| x == kf);
                     let Some(h) = rows_hull(v, &kb, |x| x == kf) else { continue };
                     self.volume_rows(*f, ctx, &mut fb, v, Some(h));
                     for i in 0..out.len() {
@@ -1521,6 +1762,40 @@ impl Program {
                     }
                 }
             }
+        }
+    }
+
+    /// Spline over a volume. Each coordinate's volume is computed the first time an element reads
+    /// it, never all of them up front: a coordinate read only on some branches may stay uncomputed.
+    fn spline_volume(&self, spline: &SSpline, coords: &[Sid], ctx: &mut Ctx, out: &mut [f32], v: &Volume) {
+        // The 26.3 splines read at most 4 coordinates: their buffers fit on the stack, without an
+        // allocated list per call.
+        let mut on_stack: [Option<Vec<f32>>; 8] = Default::default();
+        let mut on_heap: Vec<Option<Vec<f32>>>;
+        let bufs: &mut [Option<Vec<f32>>] = if ctx.opts.spline_inputs_on_stack && coords.len() <= on_stack.len() {
+            &mut on_stack[..coords.len()]
+        } else {
+            on_heap = vec![None; coords.len()];
+            &mut on_heap
+        };
+        let direct = ctx.opts.spline_stack;
+        for (i, o) in out.iter_mut().enumerate() {
+            let mut input = |c: usize| {
+                if bufs[c].is_none() {
+                    let mut b = ctx.take(v.size());
+                    self.volume(coords[c], ctx, &mut b, v);
+                    bufs[c] = Some(b);
+                }
+                bufs[c].as_ref().map_or(0.0, |b| b[i])
+            };
+            *o = if direct {
+                spline_sample(spline, &mut input)
+            } else {
+                spline_sample::<dyn FnMut(usize) -> f32>(spline, &mut input)
+            };
+        }
+        for b in bufs.iter_mut().filter_map(Option::take) {
+            ctx.give(b);
         }
     }
 

@@ -30,7 +30,7 @@ pub fn post_tick(m: &mut Mob) {
     }
     if resting(m) {
         m.vel = [0.0; 3];
-        m.pos[1] = m.pos[1].floor() + 1.0 - f64::from(m.height());
+        m.set_pos_axis(1, m.pos()[1].floor() + 1.0 - f64::from(m.height()));
     } else {
         m.vel[1] *= 0.6;
     }
@@ -71,20 +71,20 @@ pub fn custom_ai_step(s: &mut Server, m: &mut Mob) {
         Some(t) => {
             m.rng.next_int_bound(30) == 0 || {
                 let c = [f64::from(t[0]) + 0.5, f64::from(t[1]) + 0.5, f64::from(t[2]) + 0.5];
-                mth::dist2(c, m.pos) < 4.0
+                mth::dist2(c, m.pos()) < 4.0
             }
         }
     };
     if renew {
-        let x = m.pos[0] + f64::from(m.rng.next_int_bound(7)) - f64::from(m.rng.next_int_bound(7));
-        let y = m.pos[1] + f64::from(m.rng.next_int_bound(6)) - 2.0;
-        let z = m.pos[2] + f64::from(m.rng.next_int_bound(7)) - f64::from(m.rng.next_int_bound(7));
+        let x = m.pos()[0] + f64::from(m.rng.next_int_bound(7)) - f64::from(m.rng.next_int_bound(7));
+        let y = m.pos()[1] + f64::from(m.rng.next_int_bound(6)) - 2.0;
+        let z = m.pos()[2] + f64::from(m.rng.next_int_bound(7)) - f64::from(m.rng.next_int_bound(7));
         m.surf.bat_target = Some(mth::block_of([x, y, z]));
     }
     let t = m.surf.bat_target.unwrap_or(pos);
-    let dx = f64::from(t[0]) + 0.5 - m.pos[0];
-    let dy = f64::from(t[1]) + 0.1 - m.pos[1];
-    let dz = f64::from(t[2]) + 0.5 - m.pos[2];
+    let dx = f64::from(t[0]) + 0.5 - m.pos()[0];
+    let dy = f64::from(t[1]) + 0.1 - m.pos()[1];
+    let dz = f64::from(t[2]) + 0.5 - m.pos()[2];
     let v = m.vel;
     let k = f64::from(0.1f32);
     let nv = [

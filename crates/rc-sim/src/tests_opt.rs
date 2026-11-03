@@ -802,13 +802,13 @@ fn bench_crowd() {
         // Gain bound of a "one lookup instead of 3-4" view: reads by id
         // per tick × measured cost of a read in this world (the gain cannot exceed that).
         let per_tick = (lookups() - l0) as f64 / d.len() as f64;
-        let ids: Vec<i32> = s.mobs.list.iter().flatten().map(|m| m.id).collect();
+        let ids: Vec<i32> = s.mobs.list.iter().map(|m| m.id).collect();
         let reps = 1_000_000 / ids.len().max(1) + 1;
         let t = std::time::Instant::now();
         let mut acc = 0.0;
         for _ in 0..reps {
             for &id in &ids {
-                acc += std::hint::black_box(&s).mob_ref(std::hint::black_box(id)).map_or(0.0, |m| m.pos[0]);
+                acc += std::hint::black_box(&s).mob_ref(std::hint::black_box(id)).map_or(0.0, |m| m.pos()[0]);
             }
         }
         let ns = t.elapsed().as_secs_f64() * 1e9 / (reps * ids.len()) as f64;
@@ -825,11 +825,12 @@ fn bench_crowd() {
     }
 }
 
-/// Bench of the integrated server's tick on the model world (not a proof: a measurement). Five sites
+/// Bench of the integrated server's tick on the model world (not a proof: a measurement). Six sites
 /// of the scene bench, chunks at 8 around, simulation at 6, spawns, time and weather
 /// running; 100 warm-up ticks then 400 measured per site. Run alone, quiet machine:
 /// `cargo test --release -p rc-sim bench_ticks -- --ignored --nocapture`; `RAYON_NUM_THREADS`
-/// sets the light threads (1 = one core).
+/// sets the light threads (1 = one core); `RUSTCRAFT_BENCH_SITES=redstone,nether` keeps only
+/// those sites (with `RUSTCRAFT_LIGHTTRACE`: the light trace of one site).
 #[test]
 #[ignore = "measurement bench"]
 fn bench_ticks() {
@@ -848,16 +849,18 @@ fn bench_ticks() {
     s.sim_req.store(6, std::sync::atomic::Ordering::Relaxed);
     // "redstone" site: platform of the model world (`tools/bench/scenes.py`, 128 observer
     // clocks placed by the `perf:redstone` function of the model's pack).
-    /// Name, dimension, position, rig command.
+    /// Name, dimension, position, rig function.
     type Site<'a> = (&'a str, &'a str, f64, f64, f64, Option<&'a str>);
-    let sites: [Site; 6] = [
+    let all_sites: [Site; 6] = [
         ("plains", crate::dims::OVERWORLD, 1600.5, 76.0, -447.5, None),
         ("forest", crate::dims::OVERWORLD, 64.5, 75.0, 4128.5, None),
         ("village", crate::dims::OVERWORLD, -1407.5, 76.0, 348.5, None),
         ("ocean", crate::dims::OVERWORLD, -479.5, 72.0, -703.5, None),
         ("nether", crate::dims::NETHER, -7.5, 34.0, -23.5, None),
-        ("redstone", crate::dims::OVERWORLD, 2240.5, 73.0, 166.5, Some("function perf:redstone")),
+        ("redstone", crate::dims::OVERWORLD, 2240.5, 73.0, 166.5, Some("perf:redstone")),
     ];
+    let only = std::env::var("RUSTCRAFT_BENCH_SITES").ok();
+    let sites = all_sites.into_iter().filter(|site| only.as_deref().is_none_or(|o| o.split(',').any(|n| n == site.0)));
     let mut all = 0.0;
     // Light of the measured ticks only (warm-up excluded): figure without the scene bench's
     // dispersion, relights after changes and lit chunks.
@@ -877,15 +880,19 @@ fn bench_ticks() {
             l.chunk_ns as f64 / 1e6
         );
     };
-    for (name, dim, x, y, z, setup_cmd) in sites {
+    for (name, dim, x, y, z, rig) in sites {
         s.enter_world(dim);
         s.pos = [x, y, z];
         let list = around(&s, 8);
         s.load_now(&list);
         s.loaded = true;
         s.teleport = None;
-        if let Some(c) = setup_cmd {
-            cmd(&mut s, c);
+        if let Some(f) = rig {
+            // A function without `return` reports no success (like the game): `cmd` would refuse
+            // it, so only its presence is checked.
+            assert!(s.cmd.functions.contains_key(f), "function {f} absent from the model world's pack");
+            let src = s.server_source();
+            let _ = s.perform(src, &format!("function {f}"));
         }
         ticks(&mut s, 100);
         let blocks0 = crate::server::BLOCKS_NS.with(std::cell::Cell::get);
@@ -917,7 +924,7 @@ fn bench_ticks() {
         light_line(name, &l);
         light_all = light_all.plus(&l);
     }
-    eprintln!("bench_ticks total {all:.1} ms (2400 ticks), rayon threads {}", rayon::current_num_threads());
+    eprintln!("bench_ticks total {all:.1} ms (400 ticks per site), rayon threads {}", rayon::current_num_threads());
     light_line("total", &light_all);
     {
         use crate::mobs::index::stats;
@@ -1125,7 +1132,7 @@ mod loading {
         }
         seen.state = total(&out);
         let mut uu = HashSet::new();
-        for w in std::iter::once(&s.mobs.list).chain(s.dims.parked.iter().map(|w| &w.mobs.list)) {
+        for w in std::iter::once(s.mobs.list.slots()).chain(s.dims.parked.iter().map(|w| w.mobs.list.slots())) {
             seen.twice.extend(w.iter().flatten().map(|m| m.uuid).filter(|u| !uu.insert(*u)));
         }
         s.stop_gen();

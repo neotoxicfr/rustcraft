@@ -56,7 +56,7 @@ fn mob(p: &Probe, id: i32) -> Option<&Mob> {
 
 fn mob_mut(p: &mut Probe, id: i32) -> Option<&mut Mob> {
     let i = p.s.mob_index(id)?;
-    p.s.mobs.list[i].as_deref_mut()
+    p.s.mobs.list.get_mut(i)
 }
 
 fn set_day_time(p: &mut Probe, t: i64) {
@@ -98,7 +98,7 @@ fn creaking_bound_to_heart() {
     let mut found = None;
     for _ in 0..200 {
         step(&mut p, 1);
-        found = p.s.mobs.list.iter().flatten().find(|m| m.kind == Kind::Creaking).map(|m| m.id);
+        found = p.s.mobs.list.iter().find(|m| m.kind == Kind::Creaking).map(|m| m.id);
         if found.is_some() {
             break;
         }
@@ -107,12 +107,12 @@ fn creaking_bound_to_heart() {
     let c = found.expect("creaking never appeared");
     assert_eq!(mob(&p, c).unwrap().rec.home, Some(heart), "creaking not linked to the heart");
     // Player right next to it, looking at it: activated then frozen.
-    let cp = mob(&p, c).unwrap().pos;
+    let cp = mob(&p, c).unwrap().pos();
     p.run(&format!("player {} -59 {} 0 0\n", cp[0], cp[2] - 4.0));
     let mut frozen = false;
     for _ in 0..60 {
         let eye = mob(&p, c).unwrap().eye_y();
-        let cp = mob(&p, c).unwrap().pos;
+        let cp = mob(&p, c).unwrap().pos();
         look_at(&mut p, [cp[0], eye, cp[2]]);
         step(&mut p, 1);
         let m = mob(&p, c).unwrap();
@@ -248,7 +248,7 @@ fn breeze_shoots_wind_charge() {
             break;
         }
     }
-    eprintln!("shot {shot:?}, push {pushed:?}, breeze {:?}", mob(&p, b).map(|m| m.pos));
+    eprintln!("shot {shot:?}, push {pushed:?}, breeze {:?}", mob(&p, b).map(|m| m.pos()));
     assert!(shot.is_some(), "no wind charge shot");
     assert!(pushed.is_some(), "player never pushed back");
     cleanup(p, dir);
@@ -319,8 +319,8 @@ fn shrieker_summons_warden() {
     step(&mut p, 100);
     walk(&mut p, [216.5, -59.0, 210.7]);
     step(&mut p, 100);
-    let w = p.s.mobs.list.iter().flatten().find(|m| m.kind == Kind::Warden);
-    eprintln!("level {}, warden {:?}", p.s.mobs.rec.warden_tracker.warning_level, w.map(|m| m.pos));
+    let w = p.s.mobs.list.iter().find(|m| m.kind == Kind::Warden);
+    eprintln!("level {}, warden {:?}", p.s.mobs.rec.warden_tracker.warning_level, w.map(|m| m.pos()));
     assert!(w.is_some(), "no warden summoned");
     cleanup(p, dir);
 }
@@ -353,7 +353,7 @@ fn dried_ghast_hatches() {
     let pos = [216, -59, 216];
     let st = p.s.get(pos);
     assert!(p.s.rec_block_tick(st, pos), "dried ghast tick not handled");
-    let g = p.s.mobs.list.iter().flatten().find(|m| m.kind == Kind::HappyGhast);
+    let g = p.s.mobs.list.iter().find(|m| m.kind == Kind::HappyGhast);
     assert!(g.is_some_and(|m| m.is_baby()), "no ghastling hatched");
     assert!(state_string(&p.s, p.s.get(pos)).starts_with("minecraft:water"), "block not replaced by water");
     cleanup(p, dir);
@@ -431,7 +431,7 @@ fn prep_recent_world() {
         if let Some(m) = mob_mut(&mut p, baby) {
             m.age = -24000;
         }
-        for m in p.s.mobs.list.iter_mut().flatten() {
+        for m in p.s.mobs.list.iter_mut() {
             m.yaw = 180.0;
             m.body_yaw = 180.0;
             m.head_yaw = 180.0;

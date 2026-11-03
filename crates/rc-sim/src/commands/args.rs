@@ -12,15 +12,15 @@ use crate::player::Stack;
 use crate::server::Server;
 use crate::tr;
 
-/// The tabulated sine / the tabulated cosine (table of 65,536 values).
+/// The tabulated sine / the tabulated cosine (the table shared by every crate), widened.
+#[inline]
 pub fn msin(x: f64) -> f64 {
-    let i = (x * 10430.378350470453) as i64 & 65535;
-    f64::from((i as f64 * std::f64::consts::PI * 2.0 / 65536.0).sin() as f32)
+    f64::from(rc_data::java_math::sin(x))
 }
 
+#[inline]
 pub fn mcos(x: f64) -> f64 {
-    let i = (x * 10430.378350470453 + 16384.0) as i64 & 65535;
-    f64::from((i as f64 * std::f64::consts::PI * 2.0 / 65536.0).sin() as f32)
+    f64::from(rc_data::java_math::cos(x))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

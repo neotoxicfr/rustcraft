@@ -205,15 +205,15 @@ impl Server {
             });
         }
         for i in 0..self.mobs.list.len() {
-            let hit = self.mobs.list[i].as_ref().is_some_and(|m| {
+            let hit = self.mobs.list.get(i).is_some_and(|m| {
                 !m.removed
                     && m.alive()
                     && m.touches(&area)
-                    && self.gas_reaches(src, [m.pos[0], m.eye_y(), m.pos[2]])
+                    && self.gas_reaches(src, [m.pos()[0], m.eye_y(), m.pos()[2]])
             });
-            if hit && let Some(mut m) = self.mobs.list[i].take() {
+            if hit && let Some(mut m) = self.mobs.list.take(i) {
                 self.add_mob_effect(&mut m, nausea());
-                self.mobs.list[i] = Some(m);
+                self.mobs.list.put(i, m);
             }
         }
     }
@@ -276,7 +276,7 @@ impl Server {
                 *fall = 1.0;
             }
         };
-        for m in self.mobs.list.iter_mut().flatten() {
+        for m in self.mobs.list.iter_mut() {
             if m.removed || !m.alive() || !m.touches(&area) {
                 continue;
             }

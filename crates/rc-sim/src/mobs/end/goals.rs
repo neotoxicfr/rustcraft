@@ -62,7 +62,7 @@ impl Server {
         match g {
             EGoal::LookAtPlayer { at, time } => {
                 let Some(e) = *at else { return false };
-                self.ent_alive(e) && self.ent_pos(e).is_some_and(|p| dist2(m.pos, p) <= 64.0) && *time > 0
+                self.ent_alive(e) && self.ent_pos(e).is_some_and(|p| dist2(m.pos(), p) <= 64.0) && *time > 0
             }
             EGoal::Peek { time } => m.target.is_none() && *time > 0,
             EGoal::Attack { .. } => self.end_can_use(g, m),

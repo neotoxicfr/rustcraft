@@ -127,25 +127,25 @@ fn zombie_reinforcements() {
     z.health = 1000.0;
     let id = z.id;
     p.s.add_mob(z);
-    let count = |p: &Probe| p.s.mobs.list.iter().flatten().filter(|m| m.kind == Kind::Zombie && !m.removed).count();
+    let count = |p: &Probe| p.s.mobs.list.iter().filter(|m| m.kind == Kind::Zombie && !m.removed).count();
     let before = count(&p);
     let mut called = false;
     for _ in 0..10 {
         let i = p.s.mob_index(id).unwrap();
-        let mut m = p.s.mobs.list[i].take().unwrap();
+        let mut m = p.s.mobs.list.take(i).unwrap();
         m.damage_cooldown = 0;
         let src = p.s.pos;
         p.s.mob_hurt(&mut m, "minecraft:player_attack", 1.0, Some(Ent::Player), Some(src));
-        p.s.mobs.list[i] = Some(m);
+        p.s.mobs.list.put(i, m);
         if count(&p) > before {
             called = true;
             break;
         }
     }
     assert!(called, "no reinforcement in 10 hits (chance 1, 50 position attempts per hit)");
-    let n = p.s.mobs.list.iter().flatten().find(|m| m.kind == Kind::Zombie && m.id != id).unwrap();
+    let n = p.s.mobs.list.iter().find(|m| m.kind == Kind::Zombie && m.id != id).unwrap();
     assert_eq!(n.target, Some(Ent::Player), "the reinforcement targets the player");
-    assert_eq!(n.pos.map(f64::fract), [0.0; 3], "placed at integer coordinates");
+    assert_eq!(n.pos().map(f64::fract), [0.0; 3], "placed at integer coordinates");
     let callee = n.attrs.reinforcements.as_ref().unwrap();
     assert!(callee.mods.iter().any(|x| x.0 == "minecraft:reinforcement_callee_charge" && (x.1 + 0.05).abs() < 1e-6));
     let caller = p.s.mob_ref(id).unwrap().attrs.reinforcements.as_ref().unwrap();
@@ -204,7 +204,7 @@ fn cure_drops_preserved_equipment() {
     assert!(p.s.variant_pre_tick(&mut z), "cure not completed");
     let new: Vec<&str> = p.s.life.drops[drops_before..].iter().map(|d| d.stack.id.as_str()).collect();
     assert_eq!(new, ["minecraft:iron_sword"], "items dropped");
-    let v = p.s.mobs.list.iter().flatten().find(|m| m.kind == Kind::Villager).expect("villager");
+    let v = p.s.mobs.list.iter().find(|m| m.kind == Kind::Villager).expect("villager");
     let inv = &v.npc.as_ref().expect("trader").inv;
     assert_eq!(inv[3].as_ref().map(|s| s.id.as_str()), Some("minecraft:diamond_helmet"));
     assert_eq!(inv.iter().flatten().count(), 1);
@@ -387,11 +387,11 @@ fn spawner_keeps_saved_variant() {
         crate::nbtio::set(be, "SpawnData", Nbt::Compound(vec![("entity".into(), entity.clone())]));
         crate::nbtio::set(be, "Delay", Nbt::Short(0));
         p.s.spawner_tick(at, &players);
-        if p.s.mobs.list.iter().flatten().any(|m| m.kind == Kind::Pig) {
+        if p.s.mobs.list.iter().any(|m| m.kind == Kind::Pig) {
             break;
         }
     }
-    let pigs: Vec<i32> = p.s.mobs.list.iter().flatten().filter(|m| m.kind == Kind::Pig).map(|m| m.variant).collect();
+    let pigs: Vec<i32> = p.s.mobs.list.iter().filter(|m| m.kind == Kind::Pig).map(|m| m.variant).collect();
     assert!(!pigs.is_empty(), "no pig in 20 passes of the spawner");
     assert!(pigs.iter().all(|&v| v == cold), "variants {pigs:?}, cold = {cold}");
     finish(p, dir);

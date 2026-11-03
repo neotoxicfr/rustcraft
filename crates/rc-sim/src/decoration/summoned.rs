@@ -10,7 +10,7 @@ use super::DKind;
 use super::stand::{self, POSES};
 use crate::nbtio;
 // The game floors then converts with saturation: below -2^31 and -inf give the minimum, NaN 0.
-use rc_worldgen::math::floor_i_java;
+use rc_data::java_math::floor_to_i32;
 
 /// Integer value of a numeric tag (a float floored, a long cut to its low bits), as the game's
 /// integer reads convert any number.
@@ -20,8 +20,8 @@ fn int_of(t: &Nbt) -> Option<i32> {
         Nbt::Short(v) => i32::from(*v),
         Nbt::Int(v) => *v,
         Nbt::Long(v) => *v as i32,
-        Nbt::Float(v) => floor_i_java(f64::from(*v)),
-        Nbt::Double(v) => floor_i_java(*v),
+        Nbt::Float(v) => floor_to_i32(f64::from(*v)),
+        Nbt::Double(v) => floor_to_i32(*v),
         _ => return None,
     })
 }

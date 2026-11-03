@@ -463,7 +463,7 @@ fn gate_ok(s: &Server, m: &Mob, gate: Gate, inner: &Goal) -> bool {
         },
         Gate::NotByDrowned => true,
         Gate::BeyondThree => match inner {
-            Goal::Nearest { target: Some(t), .. } => s.ent_pos(*t).is_some_and(|p| super::mth::dist2(p, m.pos) > 9.0),
+            Goal::Nearest { target: Some(t), .. } => s.ent_pos(*t).is_some_and(|p| super::mth::dist2(p, m.pos()) > 9.0),
             _ => false,
         },
     }

@@ -326,7 +326,7 @@ pub(super) fn kit() -> Option<Kit> {
     let textures = std::mem::take(&mut blocks.textures);
     let tex = EntityTextures::load(&assets, &items.sprites).with_blocks(Arc::new(blocks), &textures);
     let item_names = data.registry("minecraft:item").map(|r| r.entries.clone()).unwrap_or_default();
-    let layout = crate::render::camera_layout(&device);
+    let layout = crate::render::camera_layout(&device, false);
     let r = EntityRenderer::new(&device, &layout, wgpu::TextureFormat::Bgra8UnormSrgb, Arc::new(data), tex);
     Some(Kit { r, items, item_names })
 }

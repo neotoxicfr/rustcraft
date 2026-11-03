@@ -121,6 +121,12 @@ impl Rng {
     }
 }
 
+/// `RUSTCRAFT_OPT_RANDOM_SEQUENCE_LOOKUP_FIRST` (default 1; `0`: the old lookup that copies the name at every
+/// call), read once.
+pub(crate) fn sequence_looked_up_before_insert() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_RANDOM_SEQUENCE_LOOKUP_FIRST")
+}
+
 /// MD5 (RFC 1321): seed of a sequence drawn from its name.
 pub fn md5(input: &[u8]) -> [u8; 16] {
     const S: [u32; 64] = [
@@ -207,6 +213,21 @@ impl Sequences {
 
     /// Generator of a sequence (created on first use).
     pub fn get(&mut self, key: &str) -> &mut Rng {
+        if !sequence_looked_up_before_insert() {
+            return self.get_through_entry(key);
+        }
+        self.dirty = true;
+        // Looked up first: the name is copied into the map only when the sequence is created,
+        // not at every draw (a block broken or blown up asks for its table's sequence).
+        if !self.seqs.contains_key(key) {
+            let fresh = Self::fresh(key, self.world_seed, self.salt, self.include_world_seed, self.include_id);
+            self.seqs.insert(key.to_owned(), fresh);
+        }
+        self.seqs.get_mut(key).expect("sequence present or inserted just above")
+    }
+
+    /// Old lookup (`RUSTCRAFT_OPT_RANDOM_SEQUENCE_LOOKUP_FIRST=0`): the name copied at every call.
+    fn get_through_entry(&mut self, key: &str) -> &mut Rng {
         self.dirty = true;
         let (ws, salt, wsf, idf) = (self.world_seed, self.salt, self.include_world_seed, self.include_id);
         self.seqs.entry(key.to_owned()).or_insert_with(|| Self::fresh(key, ws, salt, wsf, idf))
@@ -337,5 +358,30 @@ mod tests {
         assert_ne!(salted, vec![7, 59, 47]);
         assert_eq!(s.clear(Some((5, false, true))), 1);
         assert_eq!(draw(&mut s), salted);
+    }
+
+    /// The lookup that copies a sequence name only at its creation gives the same draws and the
+    /// same saved file as the old one, through creations, repeated uses, a reset and a clear.
+    #[test]
+    fn lookup_before_insert_matches_the_old_lookup() {
+        let tmp = rc_testdata::scratch(std::env::temp_dir().join("rc-seq-lookup"));
+        let mut new = Sequences::load(&tmp, 6_470_889_051_986_534_830);
+        let mut old = new.clone();
+        let keys = ["minecraft:blocks/stone", "minecraft:blocks/gravel", "minecraft:entities/zombie"];
+        let mut drawn = (Vec::new(), Vec::new());
+        for i in 0..60usize {
+            let key = keys[(i * 7 + i / 5) % keys.len()];
+            drawn.0.push(new.get(key).next_int_bound(1000));
+            drawn.1.push(old.get_through_entry(key).next_int_bound(1000));
+            if i == 20 {
+                new.reset(key, None);
+                old.reset(key, None);
+            }
+            if i == 40 {
+                assert_eq!(new.clear(None), old.clear(None));
+            }
+        }
+        assert_eq!(drawn.0, drawn.1, "draws differ");
+        assert_eq!(new.to_nbt(), old.to_nbt(), "saved sequences differ");
     }
 }

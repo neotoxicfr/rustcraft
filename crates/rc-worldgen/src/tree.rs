@@ -642,8 +642,8 @@ fn place_trunk(cx: &mut Ctx, pl: &Placer, rng: &mut DecoRng, h: i32, o: [i32; 3]
                     let angle = rng.next_float() * (std::f64::consts::PI * 2.0) as f32;
                     let (mut bx, mut bz) = (0, 0);
                     for bb in 0..5 {
-                        bx = (1.5f32 + cx.d.sin.cos(f64::from(angle)) * bb as f32) as i32;
-                        bz = (1.5f32 + cx.d.sin.sin(f64::from(angle)) * bb as f32) as i32;
+                        bx = (1.5f32 + rc_data::java_math::cos(f64::from(angle)) * bb as f32) as i32;
+                        bz = (1.5f32 + rc_data::java_math::sin(f64::from(angle)) * bb as f32) as i32;
                         pl.log(cx, rng, [o[0] + bx, o[1] + bh - 3 + bb / 2, o[2] + bz], None);
                     }
                     att.push(Attachment { pos: [o[0] + bx, o[1] + bh, o[2] + bz], radius_offset: -2, double: false });

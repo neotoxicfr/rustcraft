@@ -423,8 +423,8 @@ impl Server {
         }
         m.mount.vehicle = Some(c.id);
         c.passengers.push(Ent::Mob(m.id));
-        m.pos = Self::cart_seat(c, Some(m));
-        m.old = m.pos;
+        m.set_pos(Self::cart_seat(c, Some(m)));
+        m.old = m.pos();
         self.game_event_src("minecraft:entity_mount", c.pos, Some(Src::Living(Ent::Mob(m.id))), None);
         true
     }
@@ -446,14 +446,14 @@ impl Server {
                 self.last_good = seat;
                 true
             }
-            E::Mob(r) => match self.mob_index(r).and_then(|i| self.mobs.list[i].take().map(|m| (i, m))) {
+            E::Mob(r) => match self.mob_index(r).and_then(|i| self.mobs.list.take(i).map(|m| (i, m))) {
                 Some((i, mut m)) => {
                     m.mount.vehicle = Some(c.id);
                     c.passengers.push(Ent::Mob(m.id));
-                    m.pos = Self::cart_seat(&c, Some(&m));
-                    m.old = m.pos;
+                    m.set_pos(Self::cart_seat(&c, Some(&m)));
+                    m.old = m.pos();
                     m.needs_sync = true;
-                    self.mobs.list[i] = Some(m);
+                    self.mobs.list.put(i, m);
                     true
                 }
                 None => false,
@@ -468,10 +468,10 @@ impl Server {
     pub(crate) fn cart_dismount_mob(&mut self, cid: i32, mob: i32) {
         let Some((ci, mut c)) = self.cart_take(cid) else { return };
         if let Some(i) = self.mob_index(mob)
-            && let Some(mut m) = self.mobs.list[i].take()
+            && let Some(mut m) = self.mobs.list.take(i)
         {
             self.cart_mob_dismount(&mut c, &mut m);
-            self.mobs.list[i] = Some(m);
+            self.mobs.list.put(i, m);
         }
         self.cart_put(ci, c);
     }
@@ -484,13 +484,13 @@ impl Server {
         let (w, h) = (m.width(), m.height());
         let poses: [(f32, f32, &[i32]); 1] = [(w, h, &[0, 1, -1])];
         let t = if m.removed {
-            m.pos
+            m.pos()
         } else if self.cart_gone_or_portal(c) {
-            self.cart_dismount_free(c, m.pos, f64::from(w), f64::from(h))
+            self.cart_dismount_free(c, m.pos(), f64::from(w), f64::from(h))
         } else {
             self.cart_dismount_location(c, &poses)
         };
-        m.pos = t;
+        m.set_pos(t);
         m.old = t;
         m.needs_sync = true;
     }
@@ -513,10 +513,10 @@ impl Server {
                 }
                 Ent::Mob(id) => {
                     if let Some(i) = self.mob_index(id)
-                        && let Some(mut m) = self.mobs.list[i].take()
+                        && let Some(mut m) = self.mobs.list.take(i)
                     {
                         self.cart_mob_dismount(c, &mut m);
-                        self.mobs.list[i] = Some(m);
+                        self.mobs.list.put(i, m);
                     } else {
                         c.passengers.retain(|q| *q != p);
                     }
@@ -544,13 +544,13 @@ impl Server {
                 }
                 Ent::Mob(pid) => {
                     let Some(i) = self.mob_index(pid) else { continue };
-                    let Some(mut r) = self.mobs.list[i].take() else { continue };
+                    let Some(mut r) = self.mobs.list.take(i) else { continue };
                     if r.removed || r.mount.vehicle != Some(id) {
                         if let Some((ci, mut c)) = self.cart_take(id) {
                             self.cart_mob_dismount(&mut c, &mut r);
                             self.cart_put(ci, c);
                         }
-                        self.mobs.list[i] = Some(r);
+                        self.mobs.list.put(i, r);
                         continue;
                     }
                     r.vel = [0.0; 3];
@@ -558,10 +558,10 @@ impl Server {
                     if r.mount.vehicle == Some(id)
                         && let Some(c) = self.cart_ref(id)
                     {
-                        r.pos = Self::cart_seat(c, Some(&r));
+                        r.set_pos(Self::cart_seat(c, Some(&r)));
                     }
                     r.fall_distance = 0.0;
-                    self.mobs.list[i] = Some(r);
+                    self.mobs.list.put(i, r);
                     self.tick_passengers(pid);
                 }
             }

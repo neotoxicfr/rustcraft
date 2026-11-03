@@ -3,12 +3,13 @@
 //! diagonals; the penalty of a cell without fluid (breach) climbs by 8.
 
 use super::super::env::Fluid;
-use super::{Eval, PathType};
+use super::{NodeEvaluator, PathType};
 
-impl Eval<'_> {
+impl NodeEvaluator<'_> {
     /// The path type of a swimming mob (cache by position).
     pub(super) fn swim_type(&mut self, x: i32, y: i32, z: i32) -> PathType {
-        if let Some(&t) = self.types.get(&(x, y, z)) {
+        let key = self.key(x, y, z);
+        if let Some(&t) = self.buffers.footprint_types.get(&key) {
             return t;
         }
         let s = self.s;
@@ -33,7 +34,7 @@ impl Eval<'_> {
             // Last cell walked: swim-traversable.
             if s.pathfindable_water(last) { PathType::Water } else { PathType::Blocked }
         };
-        self.types.insert((x, y, z), t);
+        self.buffers.footprint_types.insert(key, t);
         t
     }
 
@@ -55,10 +56,10 @@ impl Eval<'_> {
             return None;
         }
         let i = self.node(x, y, z);
-        self.nodes[i].ty = t;
-        self.nodes[i].malus = self.nodes[i].malus.max(cost);
+        self.buffers.nodes[i].ty = t;
+        self.buffers.nodes[i].malus = self.buffers.nodes[i].malus.max(cost);
         if self.s.mob_fluid([x, y, z]) == Fluid::None {
-            self.nodes[i].malus += 8.0;
+            self.buffers.nodes[i].malus += 8.0;
         }
         Some(i)
     }
@@ -66,13 +67,13 @@ impl Eval<'_> {
     /// Neighbours: down, up, north, south, west, east (the game's direction order), then the
     /// horizontal diagonals whose two sides have a positive penalty.
     pub(super) fn swim_neighbors(&mut self, cur: usize, out: &mut Vec<usize>) {
-        let c = self.nodes[cur];
+        let c = self.buffers.nodes[cur];
         let dirs = [(0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1), (-1, 0, 0), (1, 0, 0)];
         let mut found: [Option<usize>; 6] = [None; 6];
         for (k, (dx, dy, dz)) in dirs.iter().enumerate() {
             let n = self.swim_accepted(c.x + dx, c.y + dy, c.z + dz);
             found[k] = n;
-            if n.is_some_and(|i| !self.nodes[i].closed) {
+            if n.is_some_and(|i| !self.buffers.nodes[i].closed) {
                 out.push(n.unwrap_or_default());
             }
         }
@@ -81,10 +82,10 @@ impl Eval<'_> {
         for k in 0..4 {
             let (a, da) = horiz[k];
             let (b, db) = horiz[(k + 1) % 4];
-            let has = |n: Option<usize>| n.is_some_and(|i| self.nodes[i].malus >= 0.0);
+            let has = |n: Option<usize>| n.is_some_and(|i| self.buffers.nodes[i].malus >= 0.0);
             if has(found[a]) && has(found[b]) {
                 let n = self.swim_accepted(c.x + da.0 + db.0, c.y, c.z + da.1 + db.1);
-                if n.is_some_and(|i| !self.nodes[i].closed) {
+                if n.is_some_and(|i| !self.buffers.nodes[i].closed) {
                     out.push(n.unwrap_or_default());
                 }
             }

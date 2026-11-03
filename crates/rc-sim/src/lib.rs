@@ -14,6 +14,7 @@ pub mod demo;
 pub mod gen_debug;
 pub mod generation;
 pub mod generation_nbt;
+pub mod generation_timing;
 pub mod input;
 pub mod level;
 mod loader;
@@ -48,6 +49,7 @@ pub mod containers;
 pub mod datapack;
 pub mod packs;
 pub mod drops;
+mod block_loot;
 mod display; // G5-F05: display and interaction entities
 pub mod life;
 pub mod items;
@@ -136,7 +138,54 @@ pub use server::{Handle, Options, start};
 /// allocator behind an allocation counter (`bench_kit`).
 #[cfg(all(test, not(feature = "memstats")))]
 #[global_allocator]
-static TEST_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static TEST_ALLOC: test_alloc::Counting = test_alloc::Counting;
+
+/// The tests' allocator counts the allocations of each thread (each test has its own), so that
+/// a test can prove a path does not allocate.
+#[cfg(test)]
+pub(crate) mod test_alloc {
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::cell::Cell;
+
+    thread_local! {
+        static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Allocations made by the current thread so far.
+    pub(crate) fn allocations() -> u64 {
+        ALLOCATIONS.with(Cell::get)
+    }
+
+    pub(crate) struct Counting;
+
+    // Delegates to mimalloc; the counter is a const-initialised thread-local (no allocation,
+    // no destructor), safe to touch from inside the allocator.
+    #[allow(unsafe_code)]
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let _ = ALLOCATIONS.try_with(|c| c.set(c.get() + 1));
+            // SAFETY: same contract as the caller's, passed on unchanged.
+            unsafe { mimalloc::MiMalloc.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let _ = ALLOCATIONS.try_with(|c| c.set(c.get() + 1));
+            // SAFETY: same contract as the caller's, passed on unchanged.
+            unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let _ = ALLOCATIONS.try_with(|c| c.set(c.get() + 1));
+            // SAFETY: same contract as the caller's, passed on unchanged.
+            unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: same contract as the caller's, passed on unchanged.
+            unsafe { mimalloc::MiMalloc.dealloc(ptr, layout) }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests;
@@ -192,6 +241,10 @@ mod bench_l10order; // L10-ORDER: server tick with 1,000 entities of five famili
 mod bench_kit; // common kit of the micro-benches: flat world, perf pack, timed ticks, `[bench]` lines
 #[cfg(test)]
 mod bench_datapack_tick; // tick of the bench's `datapack` scene (crowd, #tick workload, command blocks)
+#[cfg(test)]
+mod bench_path_search; // mob path search on the village of the bench model world, each lead alone
+#[cfg(test)]
+mod bench_scores; // scoreboard switches: writes over every holder, save, entity removals, team lookups
 #[cfg(test)]
 mod tests_perf_pack; // the scene bench's `perf` data pack compiles with our command parser
 #[cfg(test)]

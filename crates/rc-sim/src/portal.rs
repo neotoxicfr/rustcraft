@@ -1495,7 +1495,7 @@ impl Server {
     pub(crate) fn mobs_portal_tick(&mut self) {
         let mut i = 0;
         while i < self.mobs.list.len() {
-            let Some(m) = self.mobs.list[i].as_ref() else {
+            let Some(m) = self.mobs.list.get(i) else {
                 i += 1;
                 continue;
             };
@@ -1511,7 +1511,7 @@ impl Server {
                 i += 1;
                 continue;
             }
-            let (id, pos) = (m.id, m.pos);
+            let (id, pos) = (m.id, m.pos());
             // Part of the mob's tick: frozen outside the "ticking entities" chunks.
             if !self.entity_ticks_at(pos) {
                 i += 1;
@@ -1532,9 +1532,9 @@ impl Server {
                 i += 1;
                 continue;
             };
-            let Some(mut m) = self.mobs.list[i].take() else { continue };
+            let Some(mut m) = self.mobs.list.take(i) else { continue };
             self.unpair(&mut m);
-            m.pos = t.pos;
+            m.set_pos(t.pos);
             m.old = t.pos;
             let (vel, yaw, pitch) = transition_motion(&t, m.vel, m.yaw, m.pitch);
             if t.relative & rel::Y_ROT != 0 {
@@ -1542,10 +1542,9 @@ impl Server {
             }
             (m.vel, m.yaw, m.head_yaw, m.pitch) = (vel, yaw, yaw, pitch);
             if t.dim == self.dim.name {
-                self.mobs.list[i] = Some(m);
+                self.mobs.list.put(i, m);
             } else {
-                self.mobs.list.remove(i);
-                self.mobs.index.mark_stale(); // shifted slots
+                self.mobs.remove_slot(i);
                 let dim = t.dim.clone();
                 self.in_world(&dim, move |s| s.mobs.push(m));
                 self.place_portal_ticket(&dim);

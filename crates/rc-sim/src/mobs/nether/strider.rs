@@ -175,7 +175,7 @@ pub fn float(s: &mut Server, m: &mut Mob) {
         return;
     }
     let b = m.block_pos();
-    let above_shape = m.pos[1] > f64::from(b[1]) + 0.5 - f64::from(1.0e-5f32);
+    let above_shape = m.pos()[1] > f64::from(b[1]) + 0.5 - f64::from(1.0e-5f32);
     if above_shape && s.mob_fluid([b[0], b[1] + 1, b[2]]) != Fluid::Lava {
         m.on_ground = true;
     } else {
@@ -214,7 +214,7 @@ pub fn lava_target(s: &Server, p: [i32; 3]) -> bool {
 /// Eyes in lava, lava height included.
 fn eyes_in_lava(s: &Server, m: &Mob) -> bool {
     let eye = m.eye_y();
-    let p = super::super::mth::block_of([m.pos[0], eye, m.pos[2]]);
+    let p = super::super::mth::block_of([m.pos()[0], eye, m.pos()[2]]);
     if s.mob_fluid(p) != Fluid::Lava {
         return false;
     }
@@ -251,7 +251,7 @@ pub fn interact(s: &mut Server, m: &mut Mob, slot: usize, item: &str) -> bool {
     }
     if food {
         let p = 1.0 + (m.rng.next_float() - m.rng.next_float()) * 0.2;
-        let at = m.pos;
+        let at = m.pos();
         s.world_sound("minecraft:entity.strider.eat", 6, at, 1.0, p);
     }
     true
@@ -340,7 +340,7 @@ pub fn dismount_location(s: &Server, v: &Mob, width: f32, poses: &[(f32, f32)], 
     let (top, bottom) = (b.max[1], b.min[1] - 0.5);
     let mut cells: Vec<[i32; 3]> = Vec::new();
     for d in dirs {
-        let (x, z) = ((v.pos[0] + d[0]).floor() as i32, (v.pos[2] + d[2]).floor() as i32);
+        let (x, z) = ((v.pos()[0] + d[0]).floor() as i32, (v.pos()[2] + d[2]).floor() as i32);
         let mut by = top.floor() as i32;
         let mut y = top;
         while y > bottom {
@@ -369,7 +369,7 @@ pub fn dismount_location(s: &Server, v: &Mob, width: f32, poses: &[(f32, f32)], 
             }
         }
     }
-    [v.pos[0], b.max[1], v.pos[2]]
+    [v.pos()[0], b.max[1], v.pos()[2]]
 }
 
 /// Acceleration of a mount steered by an item (strider's random source); true if the boost starts.
@@ -418,7 +418,7 @@ pub fn finalize(s: &mut Server, m: &mut Mob, group: &mut super::super::spawn::Gr
         // Zombie group data: baby drawn (5%) before the rider's finalization.
         let baby = s.mobs.rng.next_float() < 0.05;
         if let Some(k) = Kind::from_name("minecraft:zombified_piglin") {
-            let mut r = s.new_mob(k, m.pos, m.yaw);
+            let mut r = s.new_mob(k, m.pos(), m.yaw);
             r.pitch = 0.0;
             let mut g =
                 super::super::spawn::Group { zombie_baby: Some(baby), zombie_no_jockey: true, ..Default::default() };
@@ -433,7 +433,7 @@ pub fn finalize(s: &mut Server, m: &mut Mob, group: &mut super::super::spawn::Gr
         group.size = 0;
         group.no_baby = true;
     } else if s.mobs.rng.next_int_bound(10) == 0 {
-        let mut b = s.new_mob(Kind::Strider, m.pos, m.yaw);
+        let mut b = s.new_mob(Kind::Strider, m.pos(), m.yaw);
         b.age = -24000;
         b.pitch = 0.0;
         let mut g = super::super::spawn::Group::default();
@@ -463,9 +463,9 @@ impl Server {
         let Some(kind) = steered_by(&id) else { return false };
         let wear = stick_of(kind).map_or(1, |(_, w)| w);
         let ok = self.mobs.mounts.riding.vehicle.and_then(|vid| self.mob_index(vid)).is_some_and(|i| {
-            let Some(mut v) = self.mobs.list[i].take() else { return false };
+            let Some(mut v) = self.mobs.list.take(i) else { return false };
             let ok = v.kind == kind && player_steers(self, &v) && boost(&mut v);
-            self.mobs.list[i] = Some(v);
+            self.mobs.list.put(i, v);
             ok
         });
         if !ok {

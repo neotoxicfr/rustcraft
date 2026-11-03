@@ -4,6 +4,7 @@
 
 use super::super::mob::{Ent, Mob, MoveOp};
 use super::super::mth::{dist2, rotlerp_360, yaw_to};
+use super::super::nav::DrawView;
 use super::super::species::Kind;
 use super::AquaGoal;
 use crate::server::Server;
@@ -12,7 +13,7 @@ use crate::server::Server;
 pub fn move_control(s: &Server, m: &mut Mob) {
     if m.move_ctl.op == MoveOp::MoveTo && !m.nav.is_done() {
         let w = m.move_ctl.wanted;
-        let d = [w[0] - m.pos[0], w[1] - m.pos[1], w[2] - m.pos[2]];
+        let d = [w[0] - m.pos()[0], w[1] - m.pos()[1], w[2] - m.pos()[2]];
         let length = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
         let (xd, yd, zd) = (d[0] / length, d[1] / length, d[2] / length);
         let yr = yaw_to(d[0], d[2]);
@@ -31,7 +32,7 @@ pub fn move_control(s: &Server, m: &mut Mob) {
         m.vel[1] += y_push * (sin + cos) * 0.25 + f64::from(speed) * yd * 0.1;
         m.vel[2] += push * sin;
         // Smoothed gaze toward the front; the target pitch divides twice by the length (game).
-        let new = [m.pos[0] + xd * 2.0, m.eye_y() + yd / length, m.pos[2] + zd * 2.0];
+        let new = [m.pos()[0] + xd * 2.0, m.eye_y() + yd / length, m.pos()[2] + zd * 2.0];
         let old = if m.look.cooldown > 0 { m.look.wanted } else { new };
         let lerp = |a: f64, b: f64| a + 0.125 * (b - a);
         let p = [lerp(old[0], new[0]), lerp(old[1], new[1]), lerp(old[2], new[2])];
@@ -86,7 +87,7 @@ fn restricted(m: &Mob, h: f64) -> bool {
     m.aqua.home.is_some_and(|(c, r)| {
         let lim = f64::from(r) + h + 1.0;
         let cc = [f64::from(c[0]) + 0.5, f64::from(c[1]) + 0.5, f64::from(c[2]) + 0.5];
-        dist2(cc, m.pos) < lim * lim
+        dist2(cc, m.pos()) < lim * lim
     })
 }
 
@@ -96,36 +97,37 @@ fn toward(m: &mut Mob, xz: f64, d: [i32; 3]) -> [i32; 3] {
     if let Some((c, _)) = m.aqua.home
         && xz > 1.0
     {
-        if m.pos[0] > f64::from(c[0]) {
+        if m.pos()[0] > f64::from(c[0]) {
             xt -= m.rng.next_double() * xz / 2.0;
         } else {
             xt += m.rng.next_double() * xz / 2.0;
         }
-        if m.pos[2] > f64::from(c[2]) {
+        if m.pos()[2] > f64::from(c[2]) {
             zt -= m.rng.next_double() * xz / 2.0;
         } else {
             zt += m.rng.next_double() * xz / 2.0;
         }
     }
-    [(xt + m.pos[0]).floor() as i32, (f64::from(d[1]) + m.pos[1]).floor() as i32, (zt + m.pos[2]).floor() as i32]
+    [(xt + m.pos()[0]).floor() as i32, (f64::from(d[1]) + m.pos()[1]).floor() as i32, (zt + m.pos()[2]).floor() as i32]
 }
 
 impl Server {
-    fn guardian_pos_ok(&self, m: &Mob, restrict: bool, p: [i32; 3]) -> bool {
+    fn guardian_pos_ok(&self, m: &Mob, view: &DrawView, restrict: bool, p: [i32; 3]) -> bool {
         let h = self.dim.height;
         let inside = p[1] >= h.min_y && p[1] < h.min_y + h.sections as i32 * 16;
-        inside && !(restrict && !within_home(m, p)) && self.nav_stable(m, p) && !self.pos_has_malus(m, p)
+        inside && !(restrict && !within_home(m, p)) && self.nav_stable(m, p) && !view.has_malus(self, m, p)
     }
 
-    /// 10 tries, best walk value (strictly greater).
+    /// 10 tries, best walk value (strictly greater); one mob view shared by the tries.
     fn guardian_best(
         &self,
         m: &mut Mob,
-        mut generate: impl FnMut(&Server, &mut Mob) -> Option<[i32; 3]>,
+        mut generate: impl FnMut(&Server, &mut Mob, &DrawView) -> Option<[i32; 3]>,
     ) -> Option<[f64; 3]> {
+        let view = DrawView::new(self, m);
         let mut best: Option<(f32, [i32; 3])> = None;
         for _ in 0..10 {
-            if let Some(p) = generate(self, m) {
+            if let Some(p) = generate(self, m, &view) {
                 let w = self.walk_target_value(m, p);
                 if w > best.map_or(f32::NEG_INFINITY, |b| b.0) {
                     best = Some((w, p));
@@ -136,22 +138,22 @@ impl Server {
     }
 
     /// The default position draw with the residence zone.
-    fn guardian_random_pos(&self, m: &mut Mob, h: i32, v: i32) -> Option<[f64; 3]> {
+    pub(crate) fn guardian_random_pos(&self, m: &mut Mob, h: i32, v: i32) -> Option<[f64; 3]> {
         let restrict = restricted(m, f64::from(h));
-        self.guardian_best(m, |s, m| {
+        self.guardian_best(m, |s, m, view| {
             let x = m.rng.next_int_bound(2 * h + 1) - h;
             let y = m.rng.next_int_bound(2 * v + 1) - v;
             let z = m.rng.next_int_bound(2 * h + 1) - h;
             let p = toward(m, f64::from(h), [x, y, z]);
-            s.guardian_pos_ok(m, restrict, p).then_some(p)
+            s.guardian_pos_ok(m, view, restrict, p).then_some(p)
         })
     }
 
     /// The position draw toward a point with the residence zone.
-    fn guardian_pos_towards(&self, m: &mut Mob, h: i32, v: i32, to: [f64; 3], rad: f64) -> Option<[f64; 3]> {
-        let (dx, dz) = (to[0] - m.pos[0], to[2] - m.pos[2]);
+    pub(crate) fn guardian_pos_towards(&self, m: &mut Mob, h: i32, v: i32, to: [f64; 3], rad: f64) -> Option<[f64; 3]> {
+        let (dx, dz) = (to[0] - m.pos()[0], to[2] - m.pos()[2]);
         let restrict = restricted(m, f64::from(h));
-        self.guardian_best(m, |s, m| {
+        self.guardian_best(m, |s, m, view| {
             let center = super::super::mth::atan2(dz, dx) - f64::from(std::f32::consts::FRAC_PI_2);
             let yr = center + f64::from(2.0 * m.rng.next_float() - 1.0) * rad;
             let t = m.rng.next_double().sqrt();
@@ -164,7 +166,7 @@ impl Server {
             let yt = m.rng.next_int_bound(2 * v + 1) - v;
             let d = [xt.floor() as i32, yt, zt.floor() as i32];
             let p = toward(m, f64::from(h), d);
-            s.guardian_pos_ok(m, restrict, p).then_some(p)
+            s.guardian_pos_ok(m, view, restrict, p).then_some(p)
         })
     }
 
@@ -213,14 +215,13 @@ impl Server {
                     min: [bb.min[0] - 12.0, bb.min[1] - 3.0, bb.min[2] - 12.0],
                     max: [bb.max[0] + 12.0, bb.max[1] + 3.0, bb.max[2] + 12.0],
                 };
-                let eye = [m.pos[0], m.eye_y(), m.pos[2]];
+                let eye = [m.pos()[0], m.eye_y(), m.pos()[2]];
                 let cands: Vec<(i32, [f64; 3])> = self
                     .mobs
                     .list
                     .iter()
-                    .flatten()
                     .filter(|o| super::is_guardian(o.kind) && o.alive() && o.touches(&area))
-                    .map(|o| (o.id, o.pos))
+                    .map(|o| (o.id, o.pos()))
                     .collect();
                 let mut best: Option<(f64, i32)> = None;
                 for (id, p) in cands {
@@ -244,14 +245,14 @@ impl Server {
             AquaGoal::Beam { .. } => {
                 let use_ok = m.target.is_some_and(|t| self.ent_alive(t));
                 let close_ok = m.kind == Kind::ElderGuardian
-                    || m.target.and_then(|t| self.ent_pos(t)).is_some_and(|p| dist2(m.pos, p) > 9.0);
+                    || m.target.and_then(|t| self.ent_pos(t)).is_some_and(|p| dist2(m.pos(), p) > 9.0);
                 use_ok && close_ok
             }
             AquaGoal::TowardsHome { .. } | AquaGoal::Stroll { .. } => !m.nav.is_done(),
             AquaGoal::LookAtGuardian { at, time } => {
                 let Some(id) = *at else { return false };
                 let Some(o) = self.mob_ref(id).filter(|o| o.alive()) else { return false };
-                dist2(m.pos, o.pos) <= 144.0 && *time > 0
+                dist2(m.pos(), o.pos()) <= 144.0 && *time > 0
             }
             _ => false,
         }
@@ -327,7 +328,7 @@ impl Server {
                 }
             }
             AquaGoal::LookAtGuardian { at, time } => {
-                let Some(o) = at.and_then(|id| self.mob_ref(id)).filter(|o| o.alive()).map(|o| (o.pos, o.eye_y()))
+                let Some(o) = at.and_then(|id| self.mob_ref(id)).filter(|o| o.alive()).map(|o| (o.pos(), o.eye_y()))
                 else {
                     return;
                 };
@@ -344,14 +345,14 @@ impl Server {
         let ty = "minecraft:indirect_magic";
         match t {
             Ent::Player => {
-                let kb = (m.pos[0] - self.pos[0], m.pos[2] - self.pos[2]);
+                let kb = (m.pos()[0] - self.pos[0], m.pos()[2] - self.pos[2]);
                 self.player_hurt_by_mob(m, ty, dmg, Some(kb));
             }
             Ent::Mob(id) => {
                 let Some(i) = self.mob_index(id) else { return };
-                let mut o = self.mobs.list[i].take().expect("mob");
+                let mut o = self.mobs.list.take(i).expect("mob");
                 self.mob_hurt_by(&mut o, m, ty, dmg);
-                self.mobs.list[i] = Some(o);
+                self.mobs.list.put(i, o);
             }
         }
     }
@@ -371,17 +372,17 @@ pub fn before_hurt(s: &mut Server, m: &mut Mob, ty: &str, by: Option<Ent>) {
     {
         match cause {
             Ent::Player => {
-                let kb = (m.pos[0] - s.pos[0], m.pos[2] - s.pos[2]);
+                let kb = (m.pos()[0] - s.pos[0], m.pos()[2] - s.pos[2]);
                 s.player_hurt_by_mob(m, "minecraft:thorns", 2.0, Some(kb));
             }
             Ent::Mob(id) => match s.mob_index(id) {
                 Some(i) => {
-                    let mut o = s.mobs.list[i].take().expect("mob");
+                    let mut o = s.mobs.list.take(i).expect("mob");
                     s.mob_hurt_by(&mut o, m, "minecraft:thorns", 2.0);
-                    s.mobs.list[i] = Some(o);
+                    s.mobs.list.put(i, o);
                 }
                 // Attacker mid-tick (taken out of the list): thorns applied on return.
-                None => s.mobs.aqua.thorns.push((id, m.id, m.pos)),
+                None => s.mobs.aqua.thorns.push((id, m.id, m.pos())),
             },
         }
     }
@@ -393,7 +394,7 @@ pub fn before_hurt(s: &mut Server, m: &mut Mob, ty: &str, by: Option<Ent>) {
 pub fn elder_custom_ai(s: &mut Server, m: &mut Mob) {
     if (m.tick_count + m.id) % 1200 == 0 {
         let survival = s.game_mode == 0 || s.game_mode == 2;
-        let close = dist2(m.pos, s.pos) < 50.0 * 50.0;
+        let close = dist2(m.pos(), s.pos) < 50.0 * 50.0;
         let fx = s.fx().get("minecraft:mining_fatigue").cloned();
         let needs = match &fx {
             None => true,

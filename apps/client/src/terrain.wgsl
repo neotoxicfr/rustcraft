@@ -18,7 +18,10 @@ struct Camera {
     // render-distance start and end; end of the sky fog.
     fog_color: vec4<f32>,
     fog: vec4<f32>,
-    fog_sky: vec4<f32>,
+    fog_sky: vec2<f32>,
+    // 1 / size of a texel of the block texture arrays (both square): main, large
+    // (`ATLASTEXELUNIFORM`). The other shaders declare this slot as the end of a vec4 `fog_sky`.
+    atlas_texel: vec2<f32>,
     // Sky color and view projection without translation (sky dome).
     sky_color: vec4<f32>,
     sky_view_proj: mat4x4<f32>,
@@ -56,6 +59,10 @@ struct Column {
 @group(0) @binding(8) var lightmap_sampler: sampler;
 // Offsets of the compact-face models: [class − 1][axis][nibble] (rc_mesh offset_table).
 @group(0) @binding(9) var<storage, read> offsets: array<f32>;
+//#if LIGHTMAPBUFFER
+// Same lightmap as 256 RGBA8 words (row-major, 16 per sky level), written with the texture.
+@group(0) @binding(10) var<storage, read> lightmap_colors: array<u32, 256>;
+//#endif
 @group(1) @binding(0) var<uniform> col: Column;
 
 // Fluid or translucent quad in the old format (128 bytes), read by index for the sorted order.
@@ -68,10 +75,30 @@ struct FluidQuad {
 };
 
 // Lightmap color for a packed light (block × 16 | sky × 16 << 8).
+//#if LIGHTMAPBUFFER
+fn light_color(l: u32) -> vec3<f32> {
+    // Bilinear filter of the sampler done by hand. The texture coordinate of the old path, in
+    // texels from the first center, is l / 16 clamped to [0, 15]: its fraction is a multiple of
+    // 1/16, which every sampler represents exactly, so only the blend arithmetic can differ.
+    let t = min(vec2<f32>(f32(l & 0xffu), f32(l >> 8u)) / 16.0, vec2<f32>(15.0));
+    let lo = vec2<u32>(t);
+    let hi = min(lo + 1u, vec2<u32>(15u));
+    let f = t - vec2<f32>(lo);
+    let below = mix(lightmap_texel(lo.x, lo.y), lightmap_texel(hi.x, lo.y), f.x);
+    let above = mix(lightmap_texel(lo.x, hi.y), lightmap_texel(hi.x, hi.y), f.x);
+    return mix(below, above, f.y);
+}
+
+// Lightmap entry of block level `block`, sky level `sky`.
+fn lightmap_texel(block: u32, sky: u32) -> vec3<f32> {
+    return unpack4x8unorm(lightmap_colors[sky * 16u + block]).rgb;
+}
+//#else
 fn light_color(l: u32) -> vec3<f32> {
     let uv = clamp(vec2<f32>(f32(l & 0xffu), f32(l >> 8u)) / 256.0 + 1.0 / 32.0, vec2<f32>(1.0 / 32.0), vec2<f32>(31.0 / 32.0));
     return textureSampleLevel(lightmap, lightmap_sampler, uv, 0.0).rgb;
 }
+//#endif
 
 // Light of corner `corner` in two words (corners 0-1, 2-3, 16 bits each).
 fn corner_light(l: vec2<u32>, corner: u32) -> u32 {
@@ -245,6 +272,57 @@ fn animate(o: ptr<function, Frag>, t: u32) {
 }
 
 // Texture color, blended toward the next frame for interpolated animations.
+//#if ATLASTEXELUNIFORM
+fn texel(i: Frag) -> vec4<f32> {
+    let dx = dpdxFine(i.uv);
+    let dy = dpdyFine(i.uv);
+    // Size of a fragment in uv units, the same for both frames: computed once.
+    let screen = sqrt(dx * dx + dy * dy);
+    let c = sample_layer(i.uv, i.layer, dx, dy, screen);
+    if i.fade > 0.0 {
+        return mix(c, sample_layer(i.uv, i.next, dx, dy, screen), i.fade);
+    }
+    return c;
+}
+
+// Texel size of the array holding `layer` (bit 15: large textures), from the uniform: the CPU
+// value 1 / size is the one the old path computes (exact for the power-of-two sizes).
+fn layer_texel(layer: u32) -> vec2<f32> {
+    return vec2<f32>(select(cam.atlas_texel.x, cam.atlas_texel.y, (layer & 0x8000u) != 0u));
+}
+
+// Layer of one of the two arrays, sampled like the game (same computation as the old path).
+fn sample_layer(uv: vec2<f32>, layer: u32, dx: vec2<f32>, dy: vec2<f32>, screen: vec2<f32>) -> vec4<f32> {
+    let pixel = layer_texel(layer);
+    let near = fetch_grad(sharpen(uv, pixel, screen), layer, dx, dy);
+    // RGSS filtering (`textureFiltering` setting = 1, `cam.origin.w`), see the old path below.
+    if cam.origin.w == 0 {
+        return near;
+    }
+    let min_pixel = min(pixel.x, pixel.y);
+    let blend = smoothstep(min_pixel, min_pixel * 2.0, max(screen.x, screen.y));
+    let effective = sqrt(min(length(dx), length(dy)) * max(length(dx), length(dy)));
+    let lod = max(0.0, log2(effective / min_pixel));
+    let lo = floor(lod);
+    let offsets = array<vec2<f32>, 4>(vec2<f32>(0.125, 0.375), vec2<f32>(-0.125, -0.375), vec2<f32>(0.375, -0.125), vec2<f32>(-0.375, 0.125));
+    var a = vec4<f32>(0.0);
+    var b = vec4<f32>(0.0);
+    for (var k = 0; k < 4; k++) {
+        let s = uv + offsets[k] * pixel;
+        a += fetch_lod(s, layer, lo);
+        b += fetch_lod(s, layer, lo + 1.0);
+    }
+    return mix(near, mix(a * 0.25, b * 0.25, fract(lod)), blend);
+}
+
+// Coordinate brought toward the texel center, see the old path below.
+fn sharpen(uv: vec2<f32>, pixel: vec2<f32>, screen: vec2<f32>) -> vec2<f32> {
+    let coords = uv / pixel;
+    let center = round(coords) - 0.5;
+    let offset = clamp((coords - center - 0.5) * pixel / screen + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
+    return (center + offset) * pixel;
+}
+//#else
 fn texel(i: Frag) -> vec4<f32> {
     let dx = dpdxFine(i.uv);
     let dy = dpdyFine(i.uv);
@@ -286,6 +364,19 @@ fn sample_layer(uv: vec2<f32>, layer: u32, dx: vec2<f32>, dy: vec2<f32>) -> vec4
     return mix(near, mix(a * 0.25, b * 0.25, fract(lod)), blend);
 }
 
+// The game's sampling (default setting) with a linear filter: the coordinate is
+// brought toward the texel center according to the texel size on screen, which keeps pixels
+// sharp up close with softened edges, and a smooth image from afar.
+fn sharpen(uv: vec2<f32>, size: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>) -> vec2<f32> {
+    let pixel = 1.0 / size;
+    let screen = sqrt(dx * dx + dy * dy);
+    let coords = uv / pixel;
+    let center = round(coords) - 0.5;
+    let offset = clamp((coords - center - 0.5) * pixel / screen + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
+    return (center + offset) * pixel;
+}
+//#endif
+
 fn fetch_grad(uv: vec2<f32>, layer: u32, dx: vec2<f32>, dy: vec2<f32>) -> vec4<f32> {
     if (layer & 0x8000u) != 0u {
         return textureSampleGrad(atlas_big, atlas_sampler, uv, layer & 0x7fffu, dx, dy);
@@ -298,18 +389,6 @@ fn fetch_lod(uv: vec2<f32>, layer: u32, lod: f32) -> vec4<f32> {
         return textureSampleLevel(atlas_big, atlas_sampler, uv, layer & 0x7fffu, lod);
     }
     return textureSampleLevel(atlas, atlas_sampler, uv, layer, lod);
-}
-
-// The game's sampling (default setting) with a linear filter: the coordinate is
-// brought toward the texel center according to the texel size on screen, which keeps pixels
-// sharp up close with softened edges, and a smooth image from afar.
-fn sharpen(uv: vec2<f32>, size: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>) -> vec2<f32> {
-    let pixel = 1.0 / size;
-    let screen = sqrt(dx * dx + dy * dy);
-    let coords = uv / pixel;
-    let center = round(coords) - 0.5;
-    let offset = clamp((coords - center - 0.5) * pixel / screen + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
-    return (center + offset) * pixel;
 }
 
 // Corner of vertex v (0 to 5) of a quad drawn as two triangles 0-1-2 then 0-2-3.

@@ -51,11 +51,11 @@ impl Server {
         }
         if pct >= 0.2 && !self.mobs.ill.crossbow_start_played {
             self.mobs.ill.crossbow_start_played = true;
-            self.world_sound("minecraft:item.crossbow.loading_start", 7, m.pos, 0.5, 1.0);
+            self.world_sound("minecraft:item.crossbow.loading_start", 7, m.pos(), 0.5, 1.0);
         }
         if pct >= 0.5 && !self.mobs.ill.crossbow_mid_played {
             self.mobs.ill.crossbow_mid_played = true;
-            self.world_sound("minecraft:item.crossbow.loading_middle", 7, m.pos, 0.5, 1.0);
+            self.world_sound("minecraft:item.crossbow.loading_middle", 7, m.pos(), 0.5, 1.0);
         }
         if pct >= 1.0 && !Self::crossbow_charged(m) {
             // Ammunition held (off-hand then main hand: arrows,
@@ -143,7 +143,7 @@ impl Server {
             dir = -dir;
             let firework = ammo.id == "minecraft:firework_rocket";
             let mut p = if firework {
-                let pos = [m.pos[0], m.eye_y() - f64::from(0.15f32), m.pos[2]];
+                let pos = [m.pos()[0], m.eye_y() - f64::from(0.15f32), m.pos()[2]];
                 self.new_firework(pos, ammo.clone(), Some(m.uuid), true)
             } else {
                 let mut a = self.mob_create_arrow(m, &ammo, Some(&weapon));
@@ -152,8 +152,8 @@ impl Server {
             };
             // Firing one projectile toward the target: aim vector rotated by `angle` around its
             // "up" perpendicular.
-            let xd = tp[0] - m.pos[0];
-            let zd = tp[2] - m.pos[2];
+            let xd = tp[0] - m.pos()[0];
+            let zd = tp[2] - m.pos()[2];
             let dist = (xd * xd + zd * zd).sqrt();
             let yd =
                 tb.min[1] + (tb.max[1] - tb.min[1]) * 0.333_333_333_333_333_3 - p.pos[1] + dist * f64::from(0.2f32);

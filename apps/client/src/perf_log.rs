@@ -3,12 +3,18 @@
 //! and every second on the error output a `[perf]` line: frame distribution
 //! (median, 99th percentile, maximum), columns meshed, lighting (`rc_light::stats`, client and
 //! integrated server), process memory, last instant when meshing was working, and once
-//! the instant of entering the game. Without the variable: one boolean read per frame.
+//! the instant of entering the game; then generic `counter <name> <value>` lines (column
+//! `c:<name>` of `tools/bench/scenes.py`): GPU writes and draw-list stations per frame, visibility
+//! verdicts, relights of the client and of the integrated server, light changes by origin,
+//! propagation queues, mesh jobs by kind, base misses by cause, mesh cache shares, in-place
+//! uploads, column copies by writer. Without the variable: one boolean read per frame.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
+
+use crate::app_meshing::ChangeOrigin;
 
 /// Columns meshed received by the render thread (up to date or stale).
 static MESHED: AtomicU64 = AtomicU64::new(0);
@@ -19,10 +25,13 @@ static MESH_NS: AtomicU64 = AtomicU64::new(0);
 static GRAPHS: AtomicU64 = AtomicU64::new(0);
 static GRAPH_NS: AtomicU64 = AtomicU64::new(0);
 
-/// A mesh done (duration, sections actually meshed).
-pub fn mesh_work(d: std::time::Duration, sections: usize) {
+/// A mesh done (duration, sections actually meshed, kind of job).
+pub fn mesh_work(d: std::time::Duration, sections: usize, kind: MeshJobKind) {
+    let ns = d.as_nanos() as u64;
     SECTIONS.fetch_add(sections as u64, Relaxed);
-    MESH_NS.fetch_add(d.as_nanos() as u64, Relaxed);
+    MESH_NS.fetch_add(ns, Relaxed);
+    JOBS[kind as usize].fetch_add(1, Relaxed);
+    JOB_NS[kind as usize].fetch_add(ns, Relaxed);
 }
 
 /// Bytes and columns of the mesh cache (`remesh.rs`).
@@ -60,10 +69,15 @@ pub fn uploaded(total: std::time::Duration, done: std::time::Duration, send: std
     SENT.fetch_add(columns as u64, Relaxed);
 }
 
-/// Bytes of a column sent (prepared; an in-place write only sends a part of them).
-pub fn upload_bytes(bytes: usize, in_place: bool) {
+/// Bytes of a column sent; `whole`: bytes of the whole column (an in-place write only sends
+/// a part of them).
+pub fn upload_bytes(bytes: usize, whole: usize, in_place: bool) {
     SENT_BYTES.fetch_add(bytes as u64, Relaxed);
     IN_PLACE.fetch_add(u64::from(in_place), Relaxed);
+    if in_place {
+        IN_PLACE_SENT_BYTES.fetch_add(bytes as u64, Relaxed);
+        IN_PLACE_WHOLE_BYTES.fetch_add(whole as u64, Relaxed);
+    }
 }
 
 /// GPU buffer writes of the renderer (`render/upload.rs`): calls, staging buffers created,
@@ -99,8 +113,13 @@ pub fn prep_work(d: std::time::Duration) {
     PREP_NS.fetch_add(d.as_nanos() as u64, Relaxed);
 }
 
-pub fn mesh_base(hit: bool) {
+/// A partial remesh launched with its base (`hit`) or without; `evicted`: the base was
+/// dropped by the cache budget.
+pub fn mesh_base(hit: bool, evicted: bool) {
     if hit { &BASE_HIT } else { &BASE_MISS }.fetch_add(1, Relaxed);
+    if !hit {
+        if evicted { &BASE_MISS_EVICTED } else { &BASE_MISS_NEVER_KEPT }.fetch_add(1, Relaxed);
+    }
 }
 
 /// Reception of events by the render thread (server packets, chunks included): time
@@ -119,6 +138,93 @@ pub fn received(d: std::time::Duration, events: usize) {
 pub fn graph_work(d: std::time::Duration) {
     GRAPHS.fetch_add(1, Relaxed);
     GRAPH_NS.fetch_add(d.as_nanos() as u64, Relaxed);
+}
+
+/// Perf log on: the counters whose bookkeeping is not free (a set, a search, a table
+/// lookup per change) are only kept then; the others are a relaxed addition.
+pub fn on() -> bool {
+    rc_data::env_flag!("RUSTCRAFT_PERFLOG")
+}
+
+/// Relights made by the client itself (main thread, `light_engine`): count, changes, time.
+/// The rest of `rc_light::stats` belongs to the integrated server.
+static CLIENT_RELIGHTS: AtomicU64 = AtomicU64::new(0);
+static CLIENT_RELIGHT_CHANGES: AtomicU64 = AtomicU64::new(0);
+static CLIENT_RELIGHT_NS: AtomicU64 = AtomicU64::new(0);
+
+pub fn client_relight(d: std::time::Duration, changes: usize) {
+    CLIENT_RELIGHTS.fetch_add(1, Relaxed);
+    CLIENT_RELIGHT_CHANGES.fetch_add(changes as u64, Relaxed);
+    CLIENT_RELIGHT_NS.fetch_add(d.as_nanos() as u64, Relaxed);
+}
+
+/// Block changes that touch the light, by origin (`ChangeOrigin`): queued for the local
+/// relight, or skipped because the integrated server has just sent their light.
+static LIGHT_CHANGES: [AtomicU64; ChangeOrigin::ALL.len()] = [const { AtomicU64::new(0) }; ChangeOrigin::ALL.len()];
+
+pub fn light_changes(origin: ChangeOrigin, n: usize) {
+    LIGHT_CHANGES[origin as usize].fetch_add(n as u64, Relaxed);
+}
+
+/// Mesh jobs by kind (whole column, partial with its base, partial without it): count and
+/// pool time, to price a base miss.
+#[derive(Clone, Copy)]
+pub enum MeshJobKind {
+    Whole,
+    PartialWithBase,
+    PartialWithoutBase,
+}
+
+const JOB_KINDS: [&str; 3] = ["whole_column", "partial_with_base", "partial_without_base"];
+static JOBS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+static JOB_NS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Partial remeshes without base, by cause: dropped by the cache to stay within its budget, or
+/// never kept (the last mesh was a whole column, or too big for the budget). The cause is only
+/// told apart while the perf log is on (`remesh::Meshes`).
+static BASE_MISS_EVICTED: AtomicU64 = AtomicU64::new(0);
+static BASE_MISS_NEVER_KEPT: AtomicU64 = AtomicU64::new(0);
+/// Mesh cache gauges: bytes of fluid faces (27 words each, 6 for a face), and the columns whose
+/// last mesh is a base, kept or evicted (the cache size that would lose none).
+static CACHE_FLUID_BYTES: AtomicU64 = AtomicU64::new(0);
+static LIVE_COLUMNS: AtomicU64 = AtomicU64::new(0);
+
+pub fn mesh_cache_shares(fluid_bytes: usize, live_columns: usize) {
+    CACHE_FLUID_BYTES.store(fluid_bytes as u64, Relaxed);
+    LIVE_COLUMNS.store(live_columns as u64, Relaxed);
+}
+
+/// Partial remeshes launched on a column the last visibility walk reached, or did not.
+static PARTIALS_REACHED: AtomicU64 = AtomicU64::new(0);
+static PARTIALS_UNREACHED: AtomicU64 = AtomicU64::new(0);
+
+pub fn partial_reach(reached: bool) {
+    if reached { &PARTIALS_REACHED } else { &PARTIALS_UNREACHED }.fetch_add(1, Relaxed);
+}
+
+/// In-place uploads: bytes really sent, bytes a whole upload of the same columns would have sent;
+/// in-place writes refused because the GPU no longer holds the base version, or for another
+/// reason (column absent, sizes changed).
+static IN_PLACE_SENT_BYTES: AtomicU64 = AtomicU64::new(0);
+static IN_PLACE_WHOLE_BYTES: AtomicU64 = AtomicU64::new(0);
+static IN_PLACE_REFUSED_VERSION: AtomicU64 = AtomicU64::new(0);
+static IN_PLACE_REFUSED_OTHER: AtomicU64 = AtomicU64::new(0);
+
+pub fn in_place_refused(version_changed: bool) {
+    if version_changed { &IN_PLACE_REFUSED_VERSION } else { &IN_PLACE_REFUSED_OTHER }.fetch_add(1, Relaxed);
+}
+
+/// Calls of the frame's visibility test (`render::visibility`), by verdict
+/// (`render::BoxVerdict::ALL` order), read per frame.
+static VISIBILITY: [AtomicU64; crate::render::BoxVerdict::ALL.len()] =
+    [const { AtomicU64::new(0) }; crate::render::BoxVerdict::ALL.len()];
+
+pub fn visibility_calls(per_verdict: &[u32]) {
+    for (c, &n) in VISIBILITY.iter().zip(per_verdict) {
+        if n > 0 {
+            c.fetch_add(u64::from(n), Relaxed);
+        }
+    }
 }
 
 const WORK: usize = 17;
@@ -155,6 +261,9 @@ struct State {
     /// Sections, meshing ns, walks, walk ns, process CPU ns at the last reading.
     work: [u64; WORK],
     light: rc_light::stats::Totals,
+    /// Propagation queues and column copies at the last reading (totals of the process).
+    queues: rc_light::stats::Queues,
+    copies: rc_world::ColumnCopies,
     /// Last instant (s since startup) when a meshing was in progress or to do.
     busy_at: f64,
     in_game: bool,
@@ -180,6 +289,8 @@ fn state() -> Option<&'static Mutex<State>> {
             meshed: 0,
             work: work_now(),
             light: rc_light::stats::totals(),
+            queues: rc_light::stats::queues(),
+            copies: rc_world::column_copies(),
             busy_at: 0.0,
             in_game: false,
             cols: (0, 0.0),
@@ -306,6 +417,15 @@ pub fn frame(started: Instant, busy: bool, in_game: bool, cols: usize) {
     for (name, c) in LIST_STAGES.iter().zip(&LIST_NS) {
         eprintln!("[perf] [{t:>6.1} s] counter us_{name}_per_frame {:.2}", per_frame(c) / 1e3);
     }
+    for (verdict, c) in crate::render::BoxVerdict::ALL.iter().zip(&VISIBILITY) {
+        counter(t, &format!("visibility_{}_per_frame", verdict.name()), per_frame(c));
+    }
+    let queues = rc_light::stats::queues();
+    light_counters(t, window, &l.since(&p), &queues.since(&s.queues));
+    s.queues = queues;
+    let copies = rc_world::column_copies();
+    mesh_counters(t, window, &copies, &s.copies);
+    s.copies = copies;
     // Memory per subsystem, every 5 s: process, allocator (private − committed by
     // mimalloc = graphics driver and other allocations outside our heap), integrated server.
     if now.duration_since(s.ram_at).as_secs_f64() >= 5.0 {
@@ -328,4 +448,64 @@ pub fn frame(started: Instant, busy: bool, in_game: bool, cols: usize) {
     s.meshed = meshed;
     s.light = l;
     s.since = now;
+}
+
+/// Generic line `[perf] [t s] counter <name> <value>`, read by `tools/bench/scenes.py` (column
+/// `c:<name>`, mean over the measured window).
+fn counter(t: f64, name: &str, value: f64) {
+    eprintln!("[perf] [{t:>6.1} s] counter {name} {value:.2}");
+}
+
+/// Light counters of the window: relights of the client and of the integrated server, light
+/// changes by origin, propagation queues (entries per level, seeded or pushed, per kind of light).
+fn light_counters(t: f64, window: f64, light: &rc_light::stats::Totals, queues: &rc_light::stats::Queues) {
+    let rate = |c: &AtomicU64| c.swap(0, Relaxed) as f64 / window;
+    let (relights, ns) = (rate(&CLIENT_RELIGHTS), rate(&CLIENT_RELIGHT_NS));
+    counter(t, "client_relights_per_s", relights);
+    counter(t, "client_relight_changes_per_s", rate(&CLIENT_RELIGHT_CHANGES));
+    counter(t, "client_relight_ms_per_s", ns / 1e6);
+    // The client's timer wraps the engine's: the difference may dip below zero by a few µs.
+    counter(t, "server_relights_per_s", (light.relights as f64 / window - relights).max(0.0));
+    counter(t, "server_relight_ms_per_s", ((light.relight_ns as f64 / window - ns) / 1e6).max(0.0));
+    for origin in ChangeOrigin::ALL {
+        counter(t, &format!("light_changes_{}_per_s", origin.name()), rate(&LIGHT_CHANGES[origin as usize]));
+    }
+    let per_s = |v: u64| (v as f64 / window).round() as u64;
+    let mut levels = Vec::new();
+    for (kind, k) in [("block", 0), ("sky", 1)] {
+        let (seeded, queued): (u64, u64) = (queues.seeded[k].iter().sum(), queues.queued[k].iter().sum());
+        counter(t, &format!("light_{kind}_seeded_per_s"), seeded as f64 / window);
+        counter(t, &format!("light_{kind}_seeded_at_15_per_s"), queues.seeded[k][15] as f64 / window);
+        counter(t, &format!("light_{kind}_pushed_per_s"), queued.saturating_sub(seeded) as f64 / window);
+        counter(t, &format!("light_{kind}_cells_per_s"), queues.cells[k] as f64 / window);
+        counter(t, &format!("light_{kind}_entries_per_cell"), queued as f64 / queues.cells[k].max(1) as f64);
+        let by_level = |v: &[u64; 16]| v[1..].iter().rev().map(|&n| per_s(n).to_string()).collect::<Vec<_>>().join(" ");
+        levels.push(format!("{kind} seeded {}, queued {}", by_level(&queues.seeded[k]), by_level(&queues.queued[k])));
+    }
+    eprintln!("[perf] [{t:>6.1} s] light queue entries per s, levels 15 to 1: {}", levels.join("; "));
+}
+
+/// Meshing counters of the window: jobs by kind, base misses by cause, mesh cache shares,
+/// partials outside the last walk, in-place uploads, column copies by writer.
+fn mesh_counters(t: f64, window: f64, copies: &rc_world::ColumnCopies, before: &rc_world::ColumnCopies) {
+    let rate = |c: &AtomicU64| c.swap(0, Relaxed) as f64 / window;
+    for (k, kind) in JOB_KINDS.iter().enumerate() {
+        let (jobs, ns) = (JOBS[k].swap(0, Relaxed), JOB_NS[k].swap(0, Relaxed));
+        counter(t, &format!("mesh_{kind}_jobs_per_s"), jobs as f64 / window);
+        counter(t, &format!("mesh_{kind}_ms_per_job"), ns as f64 / 1e6 / jobs.max(1) as f64);
+    }
+    counter(t, "mesh_base_miss_evicted_per_s", rate(&BASE_MISS_EVICTED));
+    counter(t, "mesh_base_miss_never_kept_per_s", rate(&BASE_MISS_NEVER_KEPT));
+    counter(t, "mesh_cache_fluid_mb", CACHE_FLUID_BYTES.load(Relaxed) as f64 / 1_048_576.0);
+    counter(t, "mesh_live_columns", LIVE_COLUMNS.load(Relaxed) as f64);
+    counter(t, "mesh_partials_reached_per_s", rate(&PARTIALS_REACHED));
+    counter(t, "mesh_partials_unreached_per_s", rate(&PARTIALS_UNREACHED));
+    counter(t, "upload_in_place_sent_mb_per_s", rate(&IN_PLACE_SENT_BYTES) / 1_048_576.0);
+    counter(t, "upload_in_place_whole_mb_per_s", rate(&IN_PLACE_WHOLE_BYTES) / 1_048_576.0);
+    counter(t, "upload_in_place_refused_version_per_s", rate(&IN_PLACE_REFUSED_VERSION));
+    counter(t, "upload_in_place_refused_other_per_s", rate(&IN_PLACE_REFUSED_OTHER));
+    for writer in rc_world::ColumnWriter::ALL {
+        let k = writer as usize;
+        counter(t, &format!("column_copies_{}_per_s", writer.name()), (copies[k] - before[k]) as f64 / window);
+    }
 }

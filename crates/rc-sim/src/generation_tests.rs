@@ -13,6 +13,29 @@ use super::{Out, Setup, Worker};
 
 const DIM: &str = "minecraft:overworld";
 
+thread_local! {
+    /// Batches of `run` timed phase by phase (`RUSTCRAFT_GENLOG` path) and their timing checked.
+    static TIMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Timings of the timed batches of this thread (read by the phase micro-bench).
+    static TIMINGS: std::cell::RefCell<Vec<super::BatchTiming>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Batch timing coherent with what the batch sent: phases add up to the batch, the light of
+/// the new chunks counted in its own phase (≥: the light counter is process-wide, other tests add to it).
+fn check_batch_timing(w: &mut Worker, fulls: usize, relights: usize) {
+    use crate::generation_timing::Phase;
+    let t = w.last_timing.take().expect("timed batch without its timing");
+    let sum: std::time::Duration = t.phases.iter().sum();
+    assert_eq!(sum, t.total, "phases must add up to the batch");
+    let light = |p: Phase| t.light[p as usize].chunks as usize;
+    assert!(light(Phase::LightAndConversion) >= fulls, "light of {fulls} new chunks outside its phase: {t:?}");
+    assert!(light(Phase::Relight) >= relights, "light of {relights} relit chunks outside its phase: {t:?}");
+    assert!(light(Phase::PostProcessing) >= t.mushroom_chunks, "mushroom light outside post-processing: {t:?}");
+    assert!(t.decoration_groups.len() <= 9, "more than 9 decoration classes: {t:?}");
+    assert!(t.single_threaded() <= t.total);
+    TIMINGS.with_borrow_mut(|v| v.push(t));
+}
+
 /// Simulated write thread.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Disk {
@@ -96,6 +119,7 @@ fn run(
     let mut w = Worker::new(setup, tx).expect("generator");
     w.keep = keep;
     w.lazy = lazy;
+    w.timed = TIMED.get();
     let region = crate::world::dimension_dir(&dir, DIM).join("region");
     let mut fulls: hashbrown::HashMap<(i32, i32), crate::chunk::Chunk> = hashbrown::HashMap::new();
     let mut relit: hashbrown::HashMap<(i32, i32), u32> = hashbrown::HashMap::new();
@@ -111,10 +135,9 @@ fn run(
     // Last round: closing flush (no batch).
     for batch in batches.iter().map(Some).chain([None]) {
         let t = std::time::Instant::now();
+        let mut made = 0;
         match batch {
-            Some(b) => {
-                w.process(b);
-            }
+            Some(b) => made = w.process(b),
             None => w.flush(),
         }
         t_gen += t.elapsed();
@@ -122,9 +145,11 @@ fn run(
             t_flush = t.elapsed();
         }
         let mut touched = Vec::new();
+        let (mut batch_fulls, mut batch_relights) = (0, 0);
         for o in rx.try_iter() {
             match o {
                 Out::Full(c, _) => {
+                    batch_fulls += 1;
                     touched.push((c.x, c.z));
                     assert!(fulls.insert((c.x, c.z), *c).is_none(), "full chunk returned twice");
                 }
@@ -132,6 +157,7 @@ fn run(
                     let c = fulls.get_mut(&p).expect("relight of a returned full chunk");
                     c.sky = sky;
                     c.block = block;
+                    batch_relights += 1;
                     touched.push(p);
                     *relit.entry(p).or_default() += 1;
                 }
@@ -157,6 +183,9 @@ fn run(
                     w.written.fetch_max(s, std::sync::atomic::Ordering::Release);
                 }
             }
+        }
+        if w.timed && made > 0 {
+            check_batch_timing(&mut w, batch_fulls, batch_relights);
         }
     }
     eprintln!(
@@ -244,12 +273,12 @@ fn packed_blocks_round_trip() {
 /// a cap of 16 chunks with each writer, and without cap with save, protos written
 /// at each batch then lazily: everything must coincide.
 fn same_everywhere(batches: &[Vec<(i32, i32)>], min: usize) {
-    let (data, template, biomes) =
-        template(batches.len()).expect("26.3 data missing (rc-data cache and client jar)");
+    let (data, template, biomes) = template(batches.len()).expect("26.3 data missing (rc-data cache and client jar)");
     let reference = run(&data, &template, &biomes, usize::MAX, Disk::Slow, false, batches);
     assert!(reference.len() > min, "walk too short: {}", reference.len());
     assert!(reference.values().any(|v| v.1 != 0), "no proto-chunk stayed proto: nothing is compared");
-    let runs = [(16, Disk::Slow), (16, Disk::Fast), (16, Disk::Save), (usize::MAX, Disk::Save), (usize::MAX, Disk::Slow)];
+    let runs =
+        [(16, Disk::Slow), (16, Disk::Fast), (16, Disk::Save), (usize::MAX, Disk::Save), (usize::MAX, Disk::Slow)];
     let mut bad = Vec::new();
     for lazy in [false, true] {
         for (keep, disk) in runs {
@@ -273,6 +302,30 @@ fn same_everywhere(batches: &[Vec<(i32, i32)>], min: usize) {
 #[test]
 fn evicted_chunks_survive_slow_writer() {
     same_everywhere(&batches(), 100);
+}
+
+/// The per-phase clocks of the generation log change nothing that is generated, written or
+/// relit (eager and lazy proto writes, with evictions), and every timed batch is coherent.
+#[test]
+fn batch_timing_changes_nothing() {
+    // Six batches: `run` names its folders after the batch count, no other test walks six.
+    let walk = batches()[..6].to_vec();
+    let (data, template, biomes) = template(walk.len()).expect("26.3 data missing (rc-data cache and client jar)");
+    for (keep, disk, lazy) in [(usize::MAX, Disk::Slow, false), (16, Disk::Save, true)] {
+        let untimed = run(&data, &template, &biomes, keep, disk, lazy, &walk);
+        TIMED.set(true);
+        let timed = run(&data, &template, &biomes, keep, disk, lazy, &walk);
+        TIMED.set(false);
+        assert!(untimed.len() > 100, "walk too short: {}", untimed.len());
+        let d = diff(&untimed, &timed);
+        assert!(
+            d.is_empty(),
+            "cap {keep}, {disk:?}, lazy {lazy}: timing changed {} chunks, including {:?}",
+            d.len(),
+            &d[..d.len().min(8)]
+        );
+    }
+    let _ = std::fs::remove_dir_all(&template);
 }
 
 /// A forgotten and already written neighbour is read back from disk for the relight, not counted as absent.
@@ -322,6 +375,46 @@ fn long_flight_memory() {
     let batches: Vec<Vec<(i32, i32)>> = (0..rows).map(|z| (-4..=4).map(|x| (x, z)).collect()).collect();
     let (data, template, biomes) = template(batches.len()).expect("26.3 data missing");
     run(&data, &template, &biomes, 64, Disk::Slow, true, &batches);
+    let _ = std::fs::remove_dir_all(&template);
+}
+
+/// Micro-bench (run by hand, `--ignored --nocapture`): where a batch's time goes at 1, 2, 4…
+/// threads up to the logical cores. Flight of 12 rows of 24 chunks (the server's batch size),
+/// default cap, fast writer, lazy protos. Per thread count: ms per chunk of each phase and the
+/// single-threaded share (Amdahl). The test build lights every chunk twice (scan check of
+/// `light_scanned`): "light and conversion" and "relight" read about double the release.
+#[test]
+#[ignore]
+fn bench_batch_phases_by_threads() {
+    use crate::generation_timing::PHASES;
+    let batches: Vec<Vec<(i32, i32)>> = (0..12).map(|z| (-12..12).map(|x| (x, 2 * z)).collect()).collect();
+    let (data, template, biomes) = template(batches.len()).expect("26.3 data missing");
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let counts: Vec<usize> =
+        std::iter::successors(Some(1), |n| Some(n * 2)).take_while(|&n| n < cores).chain([cores]).collect();
+    for threads in counts {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().expect("pool");
+        let timings = pool.install(|| {
+            TIMED.set(true);
+            run(&data, &template, &biomes, super::KEEP, Disk::Fast, true, &batches);
+            TIMED.set(false);
+            TIMINGS.take()
+        });
+        let chunks = (batches.len() * batches[0].len()) as f64;
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+        let total: f64 = timings.iter().map(|t| ms(t.total)).sum();
+        let single: f64 = timings.iter().map(|t| ms(t.single_threaded())).sum();
+        let phases: Vec<String> = PHASES
+            .iter()
+            .map(|p| format!("{} {:.3}", p.name(), timings.iter().map(|t| ms(t.phase(*p))).sum::<f64>() / chunks))
+            .collect();
+        eprintln!(
+            "{threads:>2} threads: {:.3} ms/chunk, single-threaded {:.1} %; ms/chunk: {}",
+            total / chunks,
+            100.0 * single / total.max(1e-9),
+            phases.join(", ")
+        );
+    }
     let _ = std::fs::remove_dir_all(&template);
 }
 

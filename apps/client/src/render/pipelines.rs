@@ -97,88 +97,73 @@ pub(super) fn uniform_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
 }
 
 /// Layout of the camera bindings (uniforms, atlases, instance buffers), common
-/// to the terrain and to all the entity renderers.
-pub(crate) fn camera_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+/// to the terrain and to all the entity renderers. `lightmap_colors`: with the lightmap buffer of
+/// `RUSTCRAFT_OPT_LIGHTMAPBUFFER` (binding 10), left out otherwise so that the old path keeps its
+/// eight storage buffers per vertex stage.
+pub(crate) fn camera_layout(device: &wgpu::Device, lightmap_colors: bool) -> wgpu::BindGroupLayout {
     let entry = |binding, visibility, ty| wgpu::BindGroupLayoutEntry { binding, visibility, ty, count: None };
-    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: None,
-        entries: &[
-            entry(
-                0,
-                wgpu::ShaderStages::VERTEX_FRAGMENT,
-                wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-            ),
-            entry(
-                1,
-                wgpu::ShaderStages::VERTEX,
-                wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-            ),
-            entry(
-                2,
-                wgpu::ShaderStages::FRAGMENT,
-                wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2Array,
-                    multisampled: false,
-                },
-            ),
-            entry(3, wgpu::ShaderStages::FRAGMENT, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
-            entry(
-                5,
-                wgpu::ShaderStages::FRAGMENT,
-                wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2Array,
-                    multisampled: false,
-                },
-            ),
-            entry(
-                7,
-                wgpu::ShaderStages::VERTEX,
-                wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-            ),
-            entry(8, wgpu::ShaderStages::VERTEX, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
-            entry(
-                9,
-                wgpu::ShaderStages::VERTEX,
-                wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-            ),
-            entry(
-                6,
-                wgpu::ShaderStages::VERTEX,
-                wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-            ),
-            entry(
-                4,
-                wgpu::ShaderStages::VERTEX,
-                wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-            ),
-        ],
-    })
+    let mut entries = vec![
+        entry(
+            0,
+            wgpu::ShaderStages::VERTEX_FRAGMENT,
+            wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+        ),
+        vertex_storage(1),
+        entry(
+            2,
+            wgpu::ShaderStages::FRAGMENT,
+            wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2Array,
+                multisampled: false,
+            },
+        ),
+        entry(3, wgpu::ShaderStages::FRAGMENT, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+        entry(
+            5,
+            wgpu::ShaderStages::FRAGMENT,
+            wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2Array,
+                multisampled: false,
+            },
+        ),
+        entry(
+            7,
+            wgpu::ShaderStages::VERTEX,
+            wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+        ),
+        entry(8, wgpu::ShaderStages::VERTEX, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+        vertex_storage(9),
+        vertex_storage(6),
+        vertex_storage(4),
+    ];
+    if lightmap_colors {
+        entries.push(vertex_storage(10));
+    }
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &entries })
+}
+
+/// Read-only storage buffer of the vertex stage at `binding`.
+fn vertex_storage(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::VERTEX,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
 }
 
 /// Buffer of the baked faces of all the models (read by the shader).

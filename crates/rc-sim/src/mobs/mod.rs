@@ -27,6 +27,9 @@ pub(crate) mod jrand;
 pub(crate) mod leash; // G4-F07a: lead, fence knot
 #[cfg(test)]
 mod tests_leash;
+pub(crate) mod list;
+#[cfg(test)]
+mod tests_list;
 pub(crate) mod mob;
 pub(crate) mod mounts;
 pub(crate) mod mth;
@@ -97,8 +100,8 @@ use crate::server::Server;
 
 /// State of the mobs of the open world.
 pub struct Mobs {
-    /// Mobs in order of addition (list of ticking entities).
-    pub list: Vec<Option<Box<Mob>>>,
+    /// Mobs in order of addition (list of ticking entities), changed only through its small API.
+    pub list: list::MobList,
     /// Hint id/UUID → slot of `list` (checked at every read, see `index`).
     pub index: index::MobIndex,
     /// World random for mobs (spawns, finalisations, sounds).
@@ -179,7 +182,7 @@ pub struct Mobs {
 impl Default for Mobs {
     fn default() -> Mobs {
         Mobs {
-            list: Vec::new(),
+            list: list::MobList::default(),
             index: index::MobIndex::default(),
             rng: jrand::JRand::from_time(0x5345_4153),
             player_hurt_by: None,
@@ -222,75 +225,71 @@ impl Default for Mobs {
     }
 }
 
+// Adding, removing, compacting and sorting the slots, and the mutable per-species walk, are in
+// `list.rs` with the slots they change.
 impl Mobs {
-    /// Added at the end of the list (index kept up to date), with its rank in the entity walk.
-    pub(crate) fn push(&mut self, mut m: Box<Mob>) {
-        m.rank = crate::walk::next_rank();
-        self.index.pushed(&m, &self.list);
-        self.list.push(Some(m));
-    }
-
     /// Mob of the list with identifier `id`, mutable.
     #[inline]
     pub(crate) fn get_mut(&mut self, id: i32) -> Option<&mut Mob> {
         let i = self.index_of(id)?;
-        self.list[i].as_deref_mut()
+        self.list.get_mut(i)
     }
 
     /// First mob of the list with UUID `u` that satisfies `pred` (same result as
-    /// `list.iter().flatten().find(|o| o.uuid == u && pred(o))`).
+    /// `list.iter().find(|o| o.uuid == u && pred(o))`).
     pub(crate) fn find_uuid_where(&self, u: u128, pred: impl Fn(&Mob) -> bool) -> Option<&Mob> {
         let i = self.index_of_uuid(u)?;
         // No slot before `i` carries `u`: the scan resumes at `i`.
-        self.list[i..].iter().flatten().find(|o| o.uuid == u && pred(o)).map(|b| &**b)
+        self.list.slots()[i..].iter().flatten().find(|o| o.uuid == u && pred(o)).map(|b| &**b)
     }
 
     /// First slot of the list carrying the identifier `id`.
     #[inline]
     pub(crate) fn index_of(&self, id: i32) -> Option<usize> {
-        self.index.find(&self.list, id)
+        self.index.find(self.list.slots(), id)
     }
 
     /// Mob of the list with identifier `id` (frozen copies excluded).
     #[inline]
     pub(crate) fn get(&self, id: i32) -> Option<&Mob> {
-        self.index_of(id).and_then(|i| self.list[i].as_deref())
+        self.index_of(id).and_then(|i| self.list.get(i))
     }
 
     /// First slot of the list carrying the UUID `u`.
     #[inline]
     pub(crate) fn index_of_uuid(&self, u: u128) -> Option<usize> {
-        self.index.find_uuid(&self.list, u)
+        self.index.find_uuid(self.list.slots(), u)
     }
 
     /// Mob of the list with UUID `u`.
     #[inline]
     pub(crate) fn get_uuid(&self, u: u128) -> Option<&Mob> {
-        self.index_of_uuid(u).and_then(|i| self.list[i].as_deref())
+        self.index_of_uuid(u).and_then(|i| self.list.get(i))
     }
 
     /// Mobs of species `k` in the list's order (empty slots skipped): same sequence as
-    /// `list.iter().flatten().filter(|o| o.kind == k)`, through the per-species index when it is reliable.
+    /// `list.iter().filter(|o| o.kind == k)`, through the per-species index when it is reliable.
     pub(crate) fn of_kind(&self, k: Kind) -> impl Iterator<Item = &Mob> {
         self.of_kinds([k])
     }
 
     /// Mobs of any of the species `kinds` in the list's order: same sequence as
-    /// `list.iter().flatten().filter(|o| kinds.contains(&o.kind))`, through the per-species index
+    /// `list.iter().filter(|o| kinds.contains(&o.kind))`, through the per-species index
     /// when it is reliable (the species' slots merged), by scanning the list otherwise.
     pub(crate) fn of_kinds<const N: usize>(&self, kinds: [Kind; N]) -> impl Iterator<Item = &Mob> {
-        let slots = self.index.kinds_slots(&self.list, kinds);
+        let list = self.list.slots();
+        let slots = self.index.kinds_slots(list, kinds);
         #[cfg(test)]
         if index::verify() {
-            check_species_slots(&self.list, slots.clone(), kinds);
+            check_species_slots(list, slots.clone(), kinds);
         }
         // Only one of the two sequences is non-empty: indexed slots, or the whole list.
         let (slots, all) = match slots {
-            Some(s) => (s, &self.list[..0]),
-            None => (index::MergedSlots::empty(), &self.list[..]),
+            Some(s) => (s, &list[..0]),
+            None => (index::MergedSlots::empty(), list),
         };
         slots
-            .filter_map(|i| self.list[i].as_deref())
+            .filter_map(|i| list[i].as_deref())
             .chain(all.iter().flatten().map(|b| &**b))
             .filter(move |o| kinds.contains(&o.kind))
     }
@@ -298,84 +297,6 @@ impl Mobs {
     /// `of_kind`, mutable (alerts of the same species, anger reset).
     pub(crate) fn of_kind_mut(&mut self, k: Kind) -> impl Iterator<Item = &mut Mob> {
         self.of_kinds_mut([k])
-    }
-
-    /// `of_kinds`, mutable: same mobs in the same order as
-    /// `list.iter_mut().flatten().filter(|o| kinds.contains(&o.kind))`.
-    pub(crate) fn of_kinds_mut<const N: usize>(&mut self, kinds: [Kind; N]) -> impl Iterator<Item = &mut Mob> {
-        let Mobs { list, index, .. } = self;
-        let slots = index.kinds_slots(list, kinds);
-        #[cfg(test)]
-        if index::verify() {
-            check_species_slots(list, slots.clone(), kinds);
-        }
-        let (indexed, all) = match slots {
-            Some(s) => (SlotsMut { rest: &mut list[..], next_slot: 0, slots: s }, &mut [][..]),
-            None => (SlotsMut { rest: &mut [][..], next_slot: 0, slots: index::MergedSlots::empty() }, &mut list[..]),
-        };
-        indexed
-            .chain(all.iter_mut())
-            .filter_map(|o| o.as_deref_mut())
-            .filter(move |o| kinds.contains(&o.kind))
-    }
-
-    /// Emptied slots dropped from the list (end of the mob tick), index brought up to date: the
-    /// slots before the first emptied one do not move, only the rest is re-indexed.
-    pub(crate) fn drop_empty_slots(&mut self) {
-        let Some(first_gap) = self.list.iter().position(Option::is_none) else {
-            self.index.refresh(&self.list, false);
-            return;
-        };
-        let len_before = self.list.len();
-        self.list.retain(Option::is_some);
-        self.index.refresh_from(&self.list, first_gap, len_before);
-    }
-
-    /// List put back in rank order (stable), index brought up to date from the first slot the sort
-    /// moves.
-    pub(crate) fn sort_by_rank(&mut self) {
-        let rank = |m: &Option<Box<Mob>>| m.as_ref().map_or(0, |m| m.rank);
-        let first_moved = first_out_of_order(&self.list, rank);
-        self.list.sort_by_key(rank);
-        let len = self.list.len();
-        self.index.refresh_from(&self.list, first_moved.unwrap_or(len), len);
-    }
-}
-
-/// First slot a stable sort by `key` moves: the first one whose key is above a later one. Every
-/// slot before it is at most every later key, so a stable sort leaves it in place.
-fn first_out_of_order<T>(list: &[T], key: impl Fn(&T) -> u64) -> Option<usize> {
-    let mut first = None;
-    let mut min_after = u64::MAX;
-    for (i, x) in list.iter().enumerate().rev() {
-        let k = key(x);
-        if k > min_after {
-            first = Some(i);
-        }
-        min_after = min_after.min(k);
-    }
-    first
-}
-
-/// Mutable walk over increasing slots of the list: each slot is split off the remaining tail, so
-/// the borrows handed out never overlap.
-struct SlotsMut<'a, I> {
-    rest: &'a mut [Option<Box<Mob>>],
-    /// Slot number of `rest[0]`.
-    next_slot: usize,
-    slots: I,
-}
-
-impl<'a, I: Iterator<Item = usize>> Iterator for SlotsMut<'a, I> {
-    type Item = &'a mut Option<Box<Mob>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let s = self.slots.next()?;
-        let rest = std::mem::take(&mut self.rest);
-        let (slot, rest) = rest.get_mut(s.checked_sub(self.next_slot)?..)?.split_first_mut()?;
-        self.rest = rest;
-        self.next_slot = s + 1;
-        Some(slot)
     }
 }
 
@@ -415,7 +336,7 @@ impl Server {
 
     /// Mobs to write into the entity chunks (with the dropped items of S2).
     pub(crate) fn mobs_into_chunks(&self, by_chunk: &mut std::collections::BTreeMap<(i32, i32), Vec<Nbt>>) {
-        for m in self.mobs.list.iter().flatten() {
+        for m in self.mobs.list.iter() {
             // F04: a passenger is written in its vehicle.
             if m.removed
                 || m.dead
@@ -424,7 +345,7 @@ impl Server {
             {
                 continue;
             }
-            let c = ((m.pos[0].floor() as i32) >> 4, (m.pos[2].floor() as i32) >> 4);
+            let c = ((m.pos()[0].floor() as i32) >> 4, (m.pos()[2].floor() as i32) >> 4);
             by_chunk.entry(c).or_default().push(self.save_with_passengers(m));
         }
         self.end_into_chunks(by_chunk); // F15

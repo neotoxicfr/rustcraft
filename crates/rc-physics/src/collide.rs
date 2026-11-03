@@ -56,6 +56,16 @@ fn collect_in(w: &dyn World, b: &Aabb, out: &mut Vec<Aabb>, zyx: bool) {
     });
 }
 
+/// Cells walked for `b`: those it touches, widened by EPS, plus a one-cell margin.
+#[inline]
+fn scan_bounds(b: &Aabb) -> ([i32; 3], [i32; 3]) {
+    // Every collision walk starts here: six floors, a library call each on x86-64 without SSE4.1
+    // (`RUSTCRAFT_OPT_FLOOR_JAVA=0` restores it). Same results, NaN and saturation included.
+    let shared = rc_data::opt_switch!("RUSTCRAFT_OPT_FLOOR_JAVA");
+    let floor = |v: f64| if shared { rc_data::java_math::floor_to_i32(v) } else { v.floor() as i32 };
+    (b.min.map(|v| floor(v - EPS) - 1), b.max.map(|v| floor(v + EPS) + 1))
+}
+
 /// Walks the collision boxes (placed in the world) that touch `b`, according to the edge
 /// cell rules; `f` receives the cell and the box, and returns true to stop (the walk
 /// then returns true).
@@ -66,8 +76,7 @@ pub(crate) fn scan(
     cell: &mut Vec<Aabb>,
     mut f: impl FnMut([i32; 3], Aabb) -> bool,
 ) -> bool {
-    let lo = [0, 1, 2].map(|a| (b.min[a] - EPS).floor() as i32 - 1);
-    let hi = [0, 1, 2].map(|a| (b.max[a] + EPS).floor() as i32 + 1);
+    let (lo, hi) = scan_bounds(b);
     // Outer loops: (y, z) or (z, y); x always the fastest.
     let (o, m) = if zyx { (2, 1) } else { (1, 2) };
     for a in lo[o]..=hi[o] {

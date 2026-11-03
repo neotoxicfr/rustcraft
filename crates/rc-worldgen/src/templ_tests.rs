@@ -1,4 +1,5 @@
-//! Equivalence proofs of the templates, of the jigsaw assembly and of the placement (C1-M11). Each
+//! Equivalence proofs of the templates, of the jigsaw assembly and of the placement (C1-M11, then
+//! the assembly work savings of C1-M18). Each
 //! path is forced on the current thread (`opt::force`); game data absent: tests skipped,
 //! except `RUSTCRAFT_OPT_REQUIRE=1` (explicit failure, see `structure_tests`).
 
@@ -16,30 +17,85 @@ use crate::opt::TablesThread;
 use crate::template::{StateTransforms, TableBuild, Templates, TransformTables};
 
 const ALL: [&str; 10] = opt::C1M11;
+/// Switches of the assembly work savings (failed-element memo, expansion memo, free space test,
+/// buffers); a static, so that a mode can hold a slice of it.
+static ASSEMBLY: [&str; 6] = opt::JIGSAW_ASSEMBLY;
 const SEEDS: [i64; 3] = [20261011, 1, -4172144997902289642];
 
-/// Forced path: all old, all new, or a single new track.
+/// Forced path: all old, all new, a single new track, a few new tracks together, or all new
+/// but one track.
 #[derive(Debug, Clone, Copy)]
 enum Mode {
     Old,
     New,
     Only(&'static str),
+    OnlyThese(&'static [&'static str]),
+    AllBut(&'static str),
+    /// Every C1-M11 track new, and of the assembly savings only these.
+    Savings(&'static [&'static str]),
 }
 
 fn set(m: Mode) {
+    let every = |v: bool| {
+        opt::force(&ALL, Some(v));
+        opt::force(&ASSEMBLY, Some(v));
+    };
     match m {
-        Mode::Old => opt::force(&ALL, Some(false)),
-        Mode::New => opt::force(&ALL, Some(true)),
+        Mode::Old => every(false),
+        Mode::New => every(true),
         Mode::Only(n) => {
-            opt::force(&ALL, Some(false));
+            every(false);
             opt::force(&[n], Some(true));
         }
+        Mode::OnlyThese(names) => {
+            every(false);
+            opt::force(names, Some(true));
+        }
+        Mode::AllBut(n) => {
+            every(true);
+            opt::force(&[n], Some(false));
+        }
+        Mode::Savings(names) => {
+            opt::force(&ALL, Some(true));
+            opt::force(&ASSEMBLY, Some(false));
+            opt::force(names, Some(true));
+        }
     }
+}
+
+/// Paths timed by the assembly benches: old, all new, each assembly track of C1-M11 alone, then
+/// the C1-M11 tracks with no saving, with each saving alone, and all new but each saving.
+fn bench_modes() -> Vec<Mode> {
+    let mut v = vec![Mode::Old, Mode::New];
+    v.extend(ALL[..5].iter().map(|n| Mode::Only(n)));
+    v.push(Mode::Savings(&[]));
+    v.extend(ASSEMBLY.iter().map(|n| Mode::Savings(std::slice::from_ref(n))));
+    v.extend(ASSEMBLY.iter().map(|n| Mode::AllBut(n)));
+    v
+}
+
+/// Every switch back to the environment.
+fn reset() {
+    opt::force(&ALL, None);
+    opt::force(&ASSEMBLY, None);
 }
 
 fn modes() -> Vec<Mode> {
     let mut v = vec![Mode::Old, Mode::New];
     v.extend(ALL.iter().map(|n| Mode::Only(n)));
+    v
+}
+
+/// Paths of the assembly work savings, beyond all new: each saving alone over the old assembly,
+/// the failed-element memo over the two other junction views (precomputed, by indices), the
+/// reused buffers over the view by indices (the only one that uses them), and all new but each
+/// saving.
+fn assembly_modes() -> Vec<Mode> {
+    let mut v: Vec<Mode> = ASSEMBLY.iter().map(|n| Mode::Only(n)).collect();
+    v.push(Mode::OnlyThese(&["JIGSAW_FAILED_ELEMENT_MEMO", "JIGSAW_PRECALC"]));
+    v.push(Mode::OnlyThese(&["JIGSAW_FAILED_ELEMENT_MEMO", "JIGSAW_IDX"]));
+    v.push(Mode::OnlyThese(&["JIGSAW_REUSED_BUFFERS", "JIGSAW_IDX"]));
+    v.extend(ASSEMBLY.iter().map(|n| Mode::AllBut(n)));
     v
 }
 
@@ -114,8 +170,9 @@ fn shape(st: &[Start]) -> String {
     s
 }
 
-/// Jigsaw starts: each path (all old, all new, each track alone) gives the
-/// same pieces as the old code, chunk by chunk, on 3 seeds, main world and Nether.
+/// Jigsaw starts: each path (all old, all new, each track alone, the assembly savings) gives the
+/// same pieces as the old code, chunk by chunk, on 3 seeds, main world and Nether. One thread
+/// per path (the forced switches belong to their thread).
 #[test]
 fn jigsaw_starts_every_path_matches_old() {
     let Some(w) = world_data() else { return };
@@ -139,23 +196,31 @@ fn jigsaw_starts_every_path_matches_old() {
                     reference.push(shape(&st));
                 }
             }
-            for m in modes().into_iter().skip(1) {
-                set(m);
-                // All new on the whole square, each track alone on the central square.
-                let rr = if matches!(m, Mode::New) { r } else { 64 };
-                for cx in -rr..rr {
-                    for cz in -rr..rr {
-                        let i = ((cx + r) * 2 * r + (cz + r)) as usize;
-                        let got = shape(&sg.compute_starts(cx, cz, t, &dg.blocks, true));
-                        if got != reference[i] && !bad.iter().any(|b: &String| b.starts_with(&format!("{m:?}"))) {
-                            bad.push(format!("{m:?} seed {seed} chunk ({cx}, {cz})"));
-                        }
-                    }
-                }
-            }
+            let paths: Vec<Mode> = modes().into_iter().skip(1).chain(assembly_modes()).collect();
+            let first_differences: Vec<Option<String>> = std::thread::scope(|scope| {
+                let (sg, reference, dg) = (&sg, &reference, &dg);
+                let runs: Vec<_> = paths
+                    .iter()
+                    .map(|&m| {
+                        scope.spawn(move || {
+                            set(m);
+                            // All new on the whole square, each other path on the central square.
+                            let rr = if matches!(m, Mode::New) { r } else { 64 };
+                            let all = (-rr..rr).flat_map(|cx| (-rr..rr).map(move |cz| (cx, cz)));
+                            all.into_iter().find_map(|(cx, cz)| {
+                                let i = ((cx + r) * 2 * r + (cz + r)) as usize;
+                                let got = shape(&sg.compute_starts(cx, cz, t, &dg.blocks, true));
+                                (got != reference[i]).then(|| format!("{m:?} seed {seed} chunk ({cx}, {cz})"))
+                            })
+                        })
+                    })
+                    .collect();
+                runs.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            bad.extend(first_differences.into_iter().flatten());
         }
     }
-    opt::force(&ALL, None);
+    reset();
     eprintln!("jigsaw starts compared: {counts:?}");
     assert!(bad.is_empty(), "paths different from the old one: {bad:?}");
     let total: usize = counts.values().sum();
@@ -214,7 +279,7 @@ fn templates_table_one_decode_per_template() {
         let _ = write!(all, "{id}");
         content(&mut all, &a);
     }
-    opt::force(&ALL, None);
+    reset();
     eprintln!("template fingerprint: 0x{:016x} ({} templates)", all.0, ids.len());
     assert_eq!((all.0, ids.len()), STORED_TEMPLATES, "templates differ from the stored value");
 }
@@ -464,7 +529,7 @@ fn placement_every_path_matches_old() {
             n += 1;
         }
     }
-    opt::force(&ALL, None);
+    reset();
     eprintln!("{n} decorated areas compared");
     assert!(bad.is_empty(), "paths different from the old one: {bad:?}");
     assert!(n >= 20, "too few areas ({n}): pointless test");
@@ -519,7 +584,7 @@ fn locked_sources_do_not_waterlog() {
         let got = b.get_bool(r.get_p([9, 70, 8]), wl);
         assert_eq!(got, Some(pre_water), "set {set_on}, source above {pre_water}");
     }
-    opt::force(&ALL, None);
+    reset();
 }
 
 /// L9-STRUCT: journal for the live world of a template placement. A block that carries data is
@@ -731,8 +796,8 @@ fn local_box_is_exact_preimage() {
 
 /// Micro-bench (loaded machine): starts of a 128 × 128 chunk square, hot (templates
 /// and caches already filled by one pass of each path), 3 alternating passes (best kept)
-/// of the old path, the new one and each assembly track alone, at 1 thread then by
-/// powers of 2 up to the number of logical threads.
+/// of the paths of [`bench_modes`], at 1 thread then by powers of 2 up to the number of logical
+/// threads; then the work counters and the time of each start assembly, old and all new.
 /// `cargo test --release -p rc-worldgen bench_jigsaw_starts -- --ignored --nocapture`
 #[test]
 #[ignore = "benchmark"]
@@ -746,15 +811,7 @@ fn bench_jigsaw_starts() {
     }
     nts.push(threads);
     let list: Vec<(i32, i32)> = (-64..64).flat_map(|x| (-64..64).map(move |z| (x, z))).collect();
-    let ms = [
-        Mode::Old,
-        Mode::New,
-        Mode::Only("TEMPL_TABLE"),
-        Mode::Only("ELEM_ONCE"),
-        Mode::Only("POOLS_TABLE"),
-        Mode::Only("JIGSAW_PRECALC"),
-        Mode::Only("JIGSAW_IDX"),
-    ];
+    let ms = bench_modes();
     for (name, dg) in [("world", dim(w, Some(20261011))), ("nether", nether(w, 20261011))] {
         let sg = dg.structures.clone().unwrap();
         let t = dg.structure_terrain().unwrap();
@@ -790,10 +847,302 @@ fn bench_jigsaw_starts() {
             let row: Vec<String> = nts.iter().zip(&best[i]).map(|(n, d)| format!("{n} threads {d:.0} ms")).collect();
             eprintln!("{name} {m:?} ({count} starts): {}", row.join(", "));
         }
+        for m in [Mode::Old, Mode::New] {
+            set(m);
+            print_assembly_work(name, &format!("{m:?}"), &dg, &list);
+        }
     }
-    opt::force(&ALL, None);
+    reset();
 }
 
+/// Work counters of the assemblies of the square (1 thread), then the time of each jigsaw start
+/// assembly by structure (best of 3 per start): mean and worst.
+fn print_assembly_work(name: &str, path: &str, dg: &DimGen, list: &[(i32, i32)]) {
+    let sg = dg.structures.clone().unwrap();
+    let t = dg.structure_terrain().unwrap();
+    let mut jigsaw_starts = Vec::new();
+    let w = count_work(|| {
+        for &(x, z) in list {
+            for s in sg.compute_starts(x, z, t, &dg.blocks, true).iter() {
+                if matches!(sg.defs[s.structure].kind, Kind::Jigsaw(_)) {
+                    jigsaw_starts.push((s.structure, x, z));
+                }
+            }
+        }
+    });
+    let per_fit = w.placed_boxes_scanned as f64 / w.fits_calls.max(1) as f64;
+    let per_ground = w.ground_nanos as f64 / w.ground_reads.max(1) as f64 / 1e3;
+    eprintln!(
+        "{name} {path} work: {} free space tests (placed boxes {per_fit:.1} on average, {} at most, {} compared), \
+         {} ground reads ({:.1} ms, {per_ground:.2} µs each), {} pool lookups, {} element trials of which {} \
+         replayed (failed before at the same junction)",
+        w.fits_calls,
+        w.placed_boxes_max,
+        w.boxes_tested,
+        w.ground_reads,
+        w.ground_nanos as f64 / 1e6,
+        w.pool_lookups,
+        w.element_trials,
+        w.replayed_failures
+    );
+    let mut times: std::collections::BTreeMap<&str, Vec<f64>> = Default::default();
+    for &(s, x, z) in &jigsaw_starts {
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            std::hint::black_box(sg.try_start(s, x, z, t, &dg.blocks, true));
+            best = best.min(t0.elapsed().as_secs_f64() * 1e3);
+        }
+        times.entry(sg.defs[s].id.as_str()).or_default().push(best);
+    }
+    for (id, v) in &times {
+        let worst = v.iter().copied().fold(0.0, f64::max);
+        let mean = v.iter().sum::<f64>() / v.len() as f64;
+        eprintln!("{name} {path} {id}: {} starts, assembly {mean:.3} ms on average, {worst:.3} ms at worst", v.len());
+    }
+}
+
+
+/// Jigsaw structures assembled anywhere by the proofs and benches (every biome accepted), and
+/// whether they belong to the Nether.
+const ASSEMBLED_ANYWHERE: [(&str, bool); 9] = [
+    ("minecraft:village_plains", false),
+    ("minecraft:village_desert", false),
+    ("minecraft:village_savanna", false),
+    ("minecraft:village_snowy", false),
+    ("minecraft:village_taiga", false),
+    ("minecraft:pillager_outpost", false),
+    ("minecraft:trial_chambers", false),
+    ("minecraft:ancient_city", false),
+    ("minecraft:bastion_remnant", true),
+];
+
+/// Chunk of the `k`-th assembly anywhere: spread so that every start draws differently.
+fn anywhere_chunk(k: i32) -> (i32, i32) {
+    ((k % 25) * 13 - 160, (k / 25) * 17 - 200)
+}
+
+/// Assembly of the jigsaw structure `s` at the chunk (cx, cz), every biome accepted, as a start
+/// attempt does it: start position and pieces, and the next draw of the start's random source
+/// after the assembly (it proves that every draw was made).
+type AssembledStart = (Option<([i32; 3], Vec<Piece>)>, i64);
+
+fn assemble_anywhere(dg: &DimGen, s: usize, cx: i32, cz: i32) -> AssembledStart {
+    let sg = dg.structures.as_deref().unwrap();
+    let t = dg.structure_terrain().unwrap();
+    let def = &sg.defs[s];
+    let Kind::Jigsaw(cfg) = &def.kind else { panic!("{} is not a jigsaw structure", def.id) };
+    let mut rng = crate::decor_rng::DecoRng::legacy(0);
+    rng.set_large_feature_seed(sg.seed, cx, cz);
+    let bctx = Some(std::cell::RefCell::new(crate::sampler::Ctx::cached()));
+    let mut g = super::GenStart { sg, t, b: &dg.blocks, cx, cz, rng, hctx: t.gen_ctx(), def, bctx, any_biome: true };
+    let pieces = crate::jigsaw::generate(&mut g, cfg);
+    (pieces, g.rng.next_long())
+}
+
+/// Index of the structure `id` in the generator.
+fn structure_index(dg: &DimGen, id: &str) -> usize {
+    let sg = dg.structures.as_deref().unwrap();
+    sg.defs.iter().position(|d| d.id == id).unwrap_or_else(|| panic!("structure {id} missing"))
+}
+
+/// Stable form of an assembly anywhere, the random draw after it included.
+fn assembled_shape(s: usize, cx: i32, cz: i32, (pieces, next_draw): &AssembledStart) -> String {
+    match pieces {
+        Some((pos, pieces)) => {
+            let st = Start { structure: s, cx, cz, pieces: pieces.clone(), bbox: pieces[0].bbox() };
+            format!("{pos:?} {} next draw {next_draw}", shape(&[st]))
+        }
+        None => format!("- next draw {next_draw}"),
+    }
+}
+
+/// Starts assembled anywhere per structure: 100 per village kind (500 villages), 500 outposts,
+/// trial chambers and ancient cities, 100 bastions.
+fn anywhere_count(id: &str) -> i32 {
+    if id.contains("village") || id.contains("bastion") { 100 } else { 500 }
+}
+
+/// Stable forms of the assemblies anywhere of the structure `s` on the current path.
+fn anywhere_shapes(dg: &DimGen, s: usize, n: i32) -> Vec<String> {
+    (0..n)
+        .map(|k| {
+            let (cx, cz) = anywhere_chunk(k);
+            assembled_shape(s, cx, cz, &assemble_anywhere(dg, s, cx, cz))
+        })
+        .collect()
+}
+
+/// Assemblies anywhere (villages, outposts, trial chambers, ancient cities, bastions): pieces and
+/// the random draw that follows each assembly are the stored values on the old path, and the
+/// old path's on every other path.
+#[test]
+fn jigsaw_assembly_anywhere_every_path_matches_old() {
+    let Some(w) = world_data() else { return };
+    let (world, nether) = (dim(w, Some(20261011)), nether(w, 20261011));
+    let mut digests = Vec::new();
+    let mut bad: Vec<String> = Vec::new();
+    for (id, in_nether) in ASSEMBLED_ANYWHERE {
+        let dg = if in_nether { &nether } else { &world };
+        let s = structure_index(dg, id);
+        let n = anywhere_count(id);
+        set(Mode::Old);
+        let reference = anywhere_shapes(dg, s, n);
+        let mut h = Fnv::new();
+        for r in &reference {
+            let _ = write!(h, "{r}");
+        }
+        digests.push((id, h.0, reference.iter().filter(|r| !r.starts_with('-')).count()));
+        // The assembly paths only: all new, the first five tracks of C1-M11 alone (templates,
+        // elements, pools, precomputed and indexed junctions), then the work savings. One
+        // thread per path (the forced switches belong to their thread).
+        let mut paths = vec![Mode::New];
+        paths.extend(ALL[..5].iter().map(|n| Mode::Only(n)));
+        paths.extend(assembly_modes());
+        let reference = &reference;
+        let first_differences: Vec<Option<String>> = std::thread::scope(|scope| {
+            let runs: Vec<_> = paths
+                .iter()
+                .map(|&m| {
+                    scope.spawn(move || {
+                        set(m);
+                        let got = anywhere_shapes(dg, s, n);
+                        let k = got.iter().zip(reference).position(|(a, b)| a != b)?;
+                        Some(format!("{m:?} {id} start {k}"))
+                    })
+                })
+                .collect();
+            runs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        bad.extend(first_differences.into_iter().flatten());
+    }
+    reset();
+    for d in &digests {
+        eprintln!("    {d:?},");
+    }
+    assert!(bad.is_empty(), "paths different from the old one: {bad:?}");
+    assert_eq!(digests, STORED_ASSEMBLIES, "assemblies differ from the stored values");
+}
+
+/// Pools parsed at their first lookup = pools parsed at generator start: every pool of the data
+/// and an absent identifier, through the frozen table and through the old cache.
+#[test]
+fn lazy_pools_match_pools_read_at_start() {
+    use crate::jigsaw::Pools;
+    let Some(w) = world_data() else { return };
+    let (at_start, lazy) = (Pools::read(&w.decor, false), Pools::read(&w.decor, true));
+    let ids = w.decor.ids("template_pool");
+    assert!(ids.len() > 100, "pools missing: {}", ids.len());
+    for frozen_table in [true, false] {
+        opt::force(&["POOLS_TABLE"], Some(frozen_table));
+        for id in ids.iter().map(String::as_str).chain(["minecraft:never/seen"]) {
+            let (a, b) = (format!("{:?}", at_start.get(id)), format!("{:?}", lazy.get(id)));
+            assert_eq!(a, b, "pool {id} (frozen table {frozen_table})");
+        }
+    }
+    reset();
+}
+
+/// (structure, fingerprint of the assemblies anywhere and of the draw after each, starts placed),
+/// taken with the code from before the failed-element and expansion memos.
+const STORED_ASSEMBLIES: [(&str, u64, usize); 9] = [
+    ("minecraft:village_plains", 0xc61e_152d_09d3_695f, 100),
+    ("minecraft:village_desert", 0x6bb7_601d_a1bc_51a2, 100),
+    ("minecraft:village_savanna", 0xe8f0_d9f6_f032_46d2, 100),
+    ("minecraft:village_snowy", 0xbcb8_42d0_a13a_1379, 100),
+    ("minecraft:village_taiga", 0xbfc5_bc9f_5a73_8822, 100),
+    ("minecraft:pillager_outpost", 0xe5cb_f24f_06bf_4611, 500),
+    ("minecraft:trial_chambers", 0xdc46_df7d_64cd_fd21, 500),
+    ("minecraft:ancient_city", 0xfa8a_71f8_72fd_c287, 500),
+    ("minecraft:bastion_remnant", 0x6e13_e72c_39ab_ec56, 100),
+];
+
+/// Work counters of `f`, run on the current thread.
+fn count_work(f: impl FnOnce()) -> crate::jigsaw::work::AssemblyWork {
+    use crate::jigsaw::work;
+    work::take();
+    work::count_here(true);
+    f();
+    work::count_here(false);
+    work::take()
+}
+
+/// Time of the pools read at generator start, parsed or kept as bytes (best of 10).
+fn print_pools_read_time(w: &WorldData) {
+    for lazy in [false, true] {
+        let mut best = f64::MAX;
+        for _ in 0..10 {
+            let t0 = std::time::Instant::now();
+            std::hint::black_box(crate::jigsaw::Pools::read(&w.decor, lazy));
+            best = best.min(t0.elapsed().as_secs_f64() * 1e3);
+        }
+        let how = if lazy { "bytes kept, parsed at first lookup" } else { "all parsed" };
+        eprintln!("pools read at generator start, {how}: {best:.2} ms (best of 10)");
+    }
+}
+
+/// Micro-bench (loaded machine): 60 assemblies anywhere of each structure of
+/// [`ASSEMBLED_ANYWHERE`], best of 3 per start: old path, C1-M11 without then with each saving
+/// alone, all new, all new but each saving; mean and worst time, then the work counters of one
+/// pass.
+/// `cargo test --release -p rc-worldgen bench_jigsaw_assembly_per_structure -- --ignored --nocapture`
+#[test]
+#[ignore = "benchmark"]
+fn bench_jigsaw_assembly_per_structure() {
+    let Some(w) = world_data() else { return };
+    print_pools_read_time(w);
+    let (world, nether) = (dim(w, Some(20261011)), nether(w, 20261011));
+    let mut paths = vec![Mode::Old, Mode::Savings(&[])];
+    paths.extend(ASSEMBLY.iter().map(|n| Mode::Savings(std::slice::from_ref(n))));
+    paths.push(Mode::New);
+    paths.extend(ASSEMBLY.iter().map(|n| Mode::AllBut(n)));
+    const STARTS: i32 = 60;
+    for (id, in_nether) in ASSEMBLED_ANYWHERE {
+        let dg = if in_nether { &nether } else { &world };
+        let s = structure_index(dg, id);
+        // Paths interleaved start by start, 3 passes: a load peak of the machine falls on every
+        // path alike.
+        let mut best = vec![vec![f64::MAX; STARTS as usize]; paths.len()];
+        for _ in 0..3 {
+            for k in 0..STARTS {
+                let (cx, cz) = anywhere_chunk(k);
+                for (i, &m) in paths.iter().enumerate() {
+                    set(m);
+                    let t0 = std::time::Instant::now();
+                    std::hint::black_box(assemble_anywhere(dg, s, cx, cz));
+                    best[i][k as usize] = best[i][k as usize].min(t0.elapsed().as_secs_f64() * 1e3);
+                }
+            }
+        }
+        for (&m, times) in paths.iter().zip(&best) {
+            set(m);
+            let w = count_work(|| {
+                for k in 0..STARTS {
+                    let (cx, cz) = anywhere_chunk(k);
+                    assemble_anywhere(dg, s, cx, cz);
+                }
+            });
+            let worst = times.iter().copied().fold(0.0, f64::max);
+            let mean = times.iter().sum::<f64>() / times.len() as f64;
+            let per_start = |v: u64| v as f64 / STARTS as f64;
+            eprintln!(
+                "{id} {m:?}: {mean:.3} ms on average, {worst:.3} ms at worst; per start {:.0} free space tests \
+                 (placed boxes {:.1} on average, {} at most, {:.0} compared), {:.1} ground reads ({:.3} ms), \
+                 {:.0} pool lookups, {:.0} element trials of which {:.0} replayed",
+                per_start(w.fits_calls),
+                w.placed_boxes_scanned as f64 / w.fits_calls.max(1) as f64,
+                w.placed_boxes_max,
+                per_start(w.boxes_tested),
+                per_start(w.ground_reads),
+                w.ground_nanos as f64 / STARTS as f64 / 1e6,
+                per_start(w.pool_lookups),
+                per_start(w.element_trials),
+                per_start(w.replayed_failures)
+            );
+        }
+    }
+    reset();
+}
 
 /// Micro-bench (loaded machine): decoration of the areas of [`placement_every_path_matches_old`], old
 /// path, all new, each track alone (1 thread: the placement of an area is sequential).
@@ -821,7 +1170,7 @@ fn bench_placement() {
         }
         eprintln!("{m:?}: {best:.0} ms (best of 3)");
     }
-    opt::force(&ALL, None);
+    reset();
 }
 
 /// Micro-bench (loaded machine): placement of the 24 largest templates, each straddling the
@@ -883,7 +1232,7 @@ fn bench_place_template() {
             eprintln!("{m:?}: {best:.2} ms ({} templates, {total} blocks, list {pid})", big.len());
         }
     }
-    opt::force(&ALL, None);
+    reset();
 }
 
 // ---------------------------------------------------------------- G6-F14

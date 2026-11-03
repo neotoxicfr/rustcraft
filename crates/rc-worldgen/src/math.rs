@@ -1,74 +1,25 @@
 //! Arithmetic in the manner of the game's platform (spec § 0) and range intervals (§ 3.6).
+//! The conversions to integers shared by every crate live in `rc_data::java_math`.
 
-/// `floor` to i32 like the game (`RUSTCRAFT_OPT_FLOOR_JAVA=0`: old library call).
-#[inline]
-pub fn floor_i(v: f64) -> i32 {
-    if crate::opt::floor_java() { floor_i_java(v) } else { floor_i_libm(v) }
-}
-
-#[inline]
-pub fn floor_f(v: f32) -> i32 {
-    if crate::opt::floor_java() { floor_f_java(v) } else { floor_f_libm(v) }
-}
-
-/// Old path: library rounding then saturated conversion (NaN → 0, < −2³¹ → MIN).
+/// Old path of the generator's floors (`RUSTCRAFT_OPT_FLOOR_JAVA=0`): library rounding then
+/// saturated conversion (NaN → 0, < −2³¹ → MIN). Callers keep the switch read once (per volume,
+/// per evaluation context, per simplex noise): reading it at each call cost 27% of the floor.
 #[inline]
 pub fn floor_i_libm(v: f64) -> i32 {
     v.floor() as i32
 }
 
+/// The game's floor of a float; `floor_java` false: the old library call.
 #[inline]
-pub fn floor_f_libm(v: f32) -> i32 {
-    v.floor() as i32
+pub fn floor_f32_to_i32(v: f32, floor_java: bool) -> i32 {
+    if floor_java { rc_data::java_math::floor_f32_to_i32(v) } else { v.floor() as i32 }
 }
 
-/// Same result as the game, which rounds down then converts with saturation
-/// (NaN → 0, < −2³¹ and −∞ → MIN, ≥ 2³¹ and +∞ → MAX); without a library call in the range.
+/// The game's rounding of a float (halves up); `floor_java` false: the old path, the library
+/// floor of the sum in a double (exact; saturated, NaN gives 0).
 #[inline]
-pub fn floor_i_java(v: f64) -> i32 {
-    if v.abs() < 2_147_483_648.0 { floor_small(v).0 } else { floor_i_java_slow(v) }
-}
-
-/// Outside ]−2³¹, 2³¹[ (and NaN): Rust's saturated conversion is the game's.
-#[inline(never)]
-pub fn floor_i_java_slow(v: f64) -> i32 {
-    v.floor() as i32
-}
-
-/// `floor` of `|v| < 2³¹` in a single float. `v + 1.5·2⁵²` rounds `v` to the nearest integer
-/// (the f64 step is 1 at this magnitude) and this integer is read in the low 32 bits; one
-/// less if it rounded up. Also returns the value in f64, equal to `f64::from(integer)`
-/// (never −0), which avoids the conversion back and the saturation corrections.
-#[inline]
-pub fn floor_small(v: f64) -> (i32, f64) {
-    const M: f64 = 6_755_399_441_055_744.0;
-    let r = (v + M) - M;
-    // Written to stay branchless (mask comparison); the integer read back afterwards.
-    let f = r - if r > v { 1.0 } else { 0.0 };
-    (((f + M).to_bits() as u32) as i32, f)
-}
-
-/// Truncation then one less if it rounded up, exact in ]−2³¹, 2³¹[;
-/// beyond (and NaN), saturated conversion like the game.
-#[inline]
-pub fn floor_f_java(v: f32) -> i32 {
-    if v.abs() < 2_147_483_648.0 {
-        let t = v as i32;
-        t - i32::from(v < t as f32)
-    } else {
-        v.floor() as i32
-    }
-}
-
-/// `floor` to i64, same saturation as the game (< −2⁶³ and −∞ → MIN, NaN → 0).
-#[inline]
-pub fn floor_l_java(v: f64) -> i64 {
-    if v.abs() < 9_223_372_036_854_775_808.0 {
-        let t = v as i64;
-        t - i64::from(v < t as f64)
-    } else {
-        v.floor() as i64
-    }
+pub fn round_f32_to_i32(v: f32, floor_java: bool) -> i32 {
+    if floor_java { rc_data::java_math::round_f32_to_i32(v) } else { floor_i_libm(f64::from(v) + 0.5) }
 }
 
 #[inline]
@@ -150,18 +101,6 @@ pub fn floor_div(a: i32, b: i32) -> i32 {
 #[inline]
 pub fn floor_mod(a: i32, b: i32) -> i32 {
     a.wrapping_sub(floor_div(a, b).wrapping_mul(b))
-}
-
-/// "Half towards +∞" rounding of an f32 to i32 (saturated, NaN → 0).
-pub fn round_half_up(v: f32) -> i32 {
-    if v.is_nan() {
-        0
-    } else if v.abs() >= 8_388_608.0 {
-        v as i32
-    } else {
-        // |v| < 2^23: both floors coincide.
-        floor_i(f64::from(v) + 0.5)
-    }
 }
 
 /// Declared range of a function: f32 interval, or "undefined".
@@ -459,6 +398,26 @@ impl Interval {
 mod tests {
     use super::*;
 
+    /// `RUSTCRAFT_OPT_FLOOR_JAVA=0` keeps the old library path of the generator's floors and
+    /// roundings until the quiet-machine bench: both paths give the same bits, on one float in
+    /// 997, the halves and the limits.
+    #[test]
+    fn floor_switch_paths_agree() {
+        use crate::density::{RoundKind, round_to_integer};
+        let kinds = [RoundKind::Floor, RoundKind::Round, RoundKind::Ceil, RoundKind::Truncate];
+        let limits = [-0.5f32, 0.5, -1.5, 2.5, -0.0, 0.499_999_97, 8_388_609.0, -2.2e9, 3e9, f32::NAN, f32::INFINITY];
+        let sampled = (0..=u32::MAX / 997).map(|k| f32::from_bits(k * 997));
+        for v in limits.into_iter().chain(sampled) {
+            assert_eq!(floor_f32_to_i32(v, true), floor_f32_to_i32(v, false), "floor {v}");
+            assert_eq!(round_f32_to_i32(v, true), round_f32_to_i32(v, false), "round {v}");
+            for k in kinds {
+                let (shared, library) = (round_to_integer(v, k, true), round_to_integer(v, k, false));
+                assert!(shared.to_bits() == library.to_bits() || shared.is_nan() && library.is_nan(), "{k:?} {v}");
+            }
+        }
+        assert_eq!(round_f32_to_i32(-0.5, false), 0, "the old path rounds halves up too");
+    }
+
     #[test]
     fn java_min_max_and_divisions() {
         assert!(jmin(f32::NAN, 1.0).is_nan());
@@ -469,8 +428,5 @@ mod tests {
         assert_eq!(floor_mod(-7, 4), 1);
         assert_eq!(floor_div(7, -4), -2);
         assert_eq!(floor_mod(7, -4), -1);
-        assert_eq!(round_half_up(-2.5), -2);
-        assert_eq!(round_half_up(2.5), 3);
-        assert_eq!(round_half_up(0.499_999_97), 0);
     }
 }

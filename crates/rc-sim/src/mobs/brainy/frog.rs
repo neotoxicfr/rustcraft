@@ -251,16 +251,16 @@ pub fn tongue_tick(s: &mut Server, m: &mut Mob, b: &mut Brain, tg: &mut Tongue) 
     set_tongue_target(m, Some(target));
     match tg.state {
         0 => {
-            let tp = s.ent_pos(target).unwrap_or(m.pos);
-            if dist2(tp, m.pos).sqrt() < f64::from(1.75f32) {
+            let tp = s.ent_pos(target).unwrap_or_else(|| m.pos());
+            if dist2(tp, m.pos()).sqrt() < f64::from(1.75f32) {
                 s.bz_mob_sound_src(m, "minecraft:entity.frog.tongue", 6, 2.0, 1.0);
                 super::set_pose(m, super::POSE_USING_TONGUE);
                 // The prey is pulled toward the frog (× 0.75).
                 if let Ent::Mob(id) = target
                     && let Some(i) = s.mob_index(id)
-                    && let Some(o) = s.mobs.list[i].as_mut()
+                    && let Some(o) = s.mobs.list.get_mut(i)
                 {
-                    let n = crate::mobs::mth::normalize([m.pos[0] - o.pos[0], m.pos[1] - o.pos[1], m.pos[2] - o.pos[2]]);
+                    let n = crate::mobs::mth::normalize([m.pos()[0] - o.pos()[0], m.pos()[1] - o.pos()[1], m.pos()[2] - o.pos()[2]]);
                     o.vel = n.map(|x| x * 0.75);
                     o.needs_sync = true;
                 }
@@ -308,12 +308,12 @@ pub(crate) fn eat_entity(s: &mut Server, m: &mut Mob) {
     // "Killed" removal: the removal effects (burst, cobwebs, slimes) happen as at the end of the
     // 20 death ticks.
     if let Some(i) = s.mob_index(id)
-        && s.mobs.list[i].as_ref().is_some_and(|o| !o.alive())
-        && let Some(mut o) = s.mobs.list[i].take()
+        && s.mobs.list.get(i).is_some_and(|o| !o.alive())
+        && let Some(mut o) = s.mobs.list.take(i)
     {
         s.mob_removed_effects(&mut o);
         o.removed = true;
-        s.mobs.list[i] = Some(o);
+        s.mobs.list.put(i, o);
     }
 }
 
@@ -358,7 +358,7 @@ fn top_face(s: &Server, p: [i32; 3]) -> bool {
 /// Frog landing: no fluid (cell, below, above); preferred blocks accepted; a trapdoor cell (or
 /// air above a trapdoor) is accepted without further check (like the game, despite the malus);
 /// otherwise default landing.
-pub fn acceptable_landing(s: &Server, m: &Mob, p: [i32; 3]) -> bool {
+pub fn acceptable_landing(s: &Server, m: &Mob, view: &super::super::nav::DrawView, p: [i32; 3]) -> bool {
     let below = [p[0], p[1] - 1, p[2]];
     let above = [p[0], p[1] + 1, p[2]];
     if s.mob_fluid(p) != Fluid::None || s.mob_fluid(below) != Fluid::None || s.mob_fluid(above) != Fluid::None {
@@ -367,11 +367,10 @@ pub fn acceptable_landing(s: &Server, m: &Mob, p: [i32; 3]) -> bool {
     if s.btag_id(p, crate::tag_bits::TagId::FrogPreferJumpTo) || s.btag_id(below, crate::tag_bits::TagId::FrogPreferJumpTo) {
         return true;
     }
-    let view = s.mob_view(m);
-    let t = super::super::nav::static_path_type(s, &view, p);
-    let tb = super::super::nav::static_path_type(s, &view, below);
+    let t = view.static_type(s, m, p);
+    let tb = view.static_type(s, m, below);
     use super::super::nav::PathType::Trapdoor;
-    if t != Trapdoor && (!s.is_air(p) || tb != Trapdoor) { super::goat::default_landing(s, m, p) } else { true }
+    if t != Trapdoor && (!s.is_air(p) || tb != Trapdoor) { super::goat::default_landing(s, m, view, p) } else { true }
 }
 
 // ---------- Tadpole ----------

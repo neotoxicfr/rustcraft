@@ -336,7 +336,7 @@ impl Server {
                         self.mob_event(a, 39);
                         self.player_push_from(a);
                     } else {
-                        let (xd, zd) = (self.pos[0] - a.pos[0], self.pos[2] - a.pos[2]);
+                        let (xd, zd) = (self.pos[0] - a.pos()[0], self.pos[2] - a.pos()[2]);
                         let dd = (xd * xd + zd * zd).max(0.001);
                         self.player_add_velocity([xd / dd * 4.0, 0.2, zd / dd * 4.0]);
                     }
@@ -344,7 +344,7 @@ impl Server {
             }
             _ => {
                 if !full {
-                    self.player_knockback(0.5, self.pos[0] - a.pos[0], self.pos[2] - a.pos[2]);
+                    self.player_knockback(0.5, self.pos[0] - a.pos()[0], self.pos[2] - a.pos()[2]);
                 }
             }
         }
@@ -380,7 +380,7 @@ impl Server {
                 .and_then(|w| w["disable_blocking_for_seconds"].as_f64())
                 .unwrap_or(0.0) as f32
         };
-        DmgSrc { pos: Some(m.pos), direct_living, piercing_arrow: false, disable_secs, attacker_pos: Some(m.pos) }
+        DmgSrc { pos: Some(m.pos()), direct_living, piercing_arrow: false, disable_secs, attacker_pos: Some(m.pos()) }
     }
 
     /// Does the player parry a new ram hit (the application of the block by an item replayed by the
@@ -1061,14 +1061,14 @@ impl Server {
             self.sheared_by_player(m);
             let r = &mut self.mobs.rng;
             let vel = [r.next_double() * 0.2 - 0.1, 0.2, r.next_double() * 0.2 - 0.1];
-            self.spawn_item([m.pos[0] + off[0], m.pos[1] + off[1], m.pos[2] + off[2]], vel, worn.clone(), 10);
+            self.spawn_item([m.pos()[0] + off[0], m.pos()[1] + off[1], m.pos()[2] + off[2]], vel, worn.clone(), 10);
             self.trig_sheared_equipment(&worn, crate::progress::pred::Who::Mob(m));
             let sound = match &eq["shearing_sound"] {
                 Value::String(t) => t.clone(),
                 o => o["sound_id"].as_str().unwrap_or("minecraft:item.shears.snip").to_owned(),
             };
             let cat = Self::mob_sound_source(m);
-            self.world_sound(&sound, cat, m.pos, 1.0, 1.0);
+            self.world_sound(&sound, cat, m.pos(), 1.0, 1.0);
             return true;
         }
         false

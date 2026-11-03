@@ -112,19 +112,43 @@ switch!(
     "RUSTCRAFT_OPT_BEST_FIT_BUFFERS"
 );
 switch!(
-    /// Terrain: each thread keeps its evaluation context (cache cells, spare buffers) from one
-    /// chunk to the next, reset at the start of each chunk, instead of a new one per chunk.
-    keep_eval_context,
-    "RUSTCRAFT_OPT_KEEP_EVAL_CONTEXT"
+    /// Evaluator: a cache whose input is exact (point and volume give the same bits everywhere
+    /// below) serves any volume whose points it already holds, for instance the corners of the
+    /// final density inside the quart grid the aquifer filled first.
+    sublattice_cache_read,
+    "RUSTCRAFT_OPT_SUBLATTICE_CACHE_READ"
 );
-
-/// Spline: point coordinates kept on the stack, sampling without dynamic call.
-/// Off by default (`=1` enables it) until the quiet-machine bench (same figure as `vol_pool`).
+switch!(
+    /// Evaluator: a cache whose input never reads y has one point value per column; where a point
+    /// read would compute it, the value known from another height answers (the last point, or for
+    /// an exact input the buffer at y = 0).
+    column_memo_y_independent,
+    "RUSTCRAFT_OPT_COLUMN_MEMO_Y_INDEPENDENT"
+);
+switch!(
+    /// Evaluator: a volume spline holds its coordinate buffers on the stack (up to 8
+    /// coordinates) instead of in an allocated list.
+    spline_inputs_on_stack,
+    "RUSTCRAFT_OPT_SPLINE_INPUTS_ON_STACK"
+);
+/// Terrain: each thread keeps its evaluation context (cache cells, spare buffers) from one chunk
+/// to the next, reset at the start of each chunk, instead of a new one per chunk. Off by default
+/// (`=1` enables it): on the quiet-machine scene bench it costs 40 to 50 MB of private memory (the
+/// spares of every generation thread) for no measurable gain per generated chunk.
 #[inline]
-pub fn spline_stack() -> bool {
-    static S: LazyLock<bool> = LazyLock::new(|| opt_in("RUSTCRAFT_OPT_SPLINE_STACK"));
+pub fn keep_eval_context() -> bool {
+    static S: LazyLock<bool> = LazyLock::new(|| opt_in("RUSTCRAFT_OPT_KEEP_EVAL_CONTEXT"));
     *S
 }
+
+switch!(
+    /// Spline: point coordinates kept on the stack, sampling without dynamic call. On by default:
+    /// point climate −0.6% without caches, −1.2% with caches, one allocation per quarter less
+    /// (12 alternated rounds, loaded machine; docs/perf.md, density evaluator section); off before,
+    /// judged on a volume bench where it has no work.
+    spline_stack,
+    "RUSTCRAFT_OPT_SPLINE_STACK"
+);
 
 switch!(
     /// Biome tree: candidate distance carried, early exit at zero distance.
@@ -478,6 +502,59 @@ switch_f!(
     /// Assembly: candidates and junctions shuffled by indices (no copy of the elements).
     jigsaw_idx,
     "JIGSAW_IDX"
+);
+
+/// Switches of the jigsaw assembly work savings, in track order (names without the
+/// `RUSTCRAFT_OPT_` prefix).
+#[cfg(test)]
+pub(crate) const JIGSAW_ASSEMBLY: [&str; 6] = [
+    "JIGSAW_FAILED_ELEMENT_MEMO",
+    "JIGSAW_EXPAND_MEMO",
+    "JIGSAW_RECENT_FIRST",
+    "JIGSAW_SPATIAL_GRID",
+    "JIGSAW_REUSED_BUFFERS",
+    "LAZY_POOLS",
+];
+
+switch_f!(
+    /// Assembly: an element already tried at a junction is not tried again (it fails the same
+    /// way); only its random draws are replayed.
+    jigsaw_failed_element_memo,
+    "JIGSAW_FAILED_ELEMENT_MEMO"
+);
+switch_f!(
+    /// Assembly: expansion height of the village trick worked out once per (element, rotation)
+    /// and start.
+    jigsaw_expand_memo,
+    "JIGSAW_EXPAND_MEMO"
+);
+/// Assembly: free space test walks the placed boxes from the most recent one, only
+/// `RUSTCRAFT_OPT_JIGSAW_RECENT_FIRST=1` (off by default: a village compares 1.5 times as many
+/// boxes that way, the boxes its trials meet being mostly the oldest ones; see `docs/perf.md`).
+#[inline]
+pub fn jigsaw_recent_first() -> bool {
+    #[cfg(test)]
+    if let Some(v) = forced("JIGSAW_RECENT_FIRST") {
+        return v;
+    }
+    static S: LazyLock<bool> =
+        LazyLock::new(|| rc_data::env_str!("RUSTCRAFT_OPT_JIGSAW_RECENT_FIRST").is_some_and(|v| v.trim() == "1"));
+    *S
+}
+switch_f!(
+    /// Assembly: placed boxes of a crowded free space indexed by 16-block columns.
+    jigsaw_spatial_grid,
+    "JIGSAW_SPATIAL_GRID"
+);
+switch_f!(
+    /// Assembly: index buffers of the shuffles kept from one trial to the next.
+    jigsaw_reused_buffers,
+    "JIGSAW_REUSED_BUFFERS"
+);
+switch_f!(
+    /// Pools: text of each pool parsed at its first lookup, not at generator start.
+    lazy_pools,
+    "LAZY_POOLS"
 );
 switch_f!(
     /// Placement: shared processor list (prefix, common list, suffix) instead of a copy

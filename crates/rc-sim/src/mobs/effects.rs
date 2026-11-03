@@ -306,7 +306,7 @@ impl Server {
         Bearer {
             ent: Ent::Mob(m.id),
             kind: m.kind.info().name,
-            pos: m.pos,
+            pos: m.pos(),
             height: m.height(),
             bbox: m.bbox(),
             pitch: m.pitch,
@@ -402,7 +402,6 @@ impl Server {
                 .mobs
                 .list
                 .iter()
-                .flatten()
                 .filter(|o| o.kind == Kind::Slime && !o.removed && Ent::Mob(o.id) != b.ent && o.bbox().intersects(&area))
                 .take(cram as usize)
                 .count() as i32;
@@ -414,7 +413,7 @@ impl Server {
             c.head_yaw = 0.0;
             c.body_yaw = 0.0;
             c.set_size(2, true);
-            c.pos = pos;
+            c.set_pos(pos);
             c.old = pos;
             c.yaw = self.mobs.rng.next_float() * 360.0;
             c.pitch = 0.0;
@@ -455,7 +454,7 @@ impl Server {
             let mut s = self.new_mob(Kind::Silverfish, pos, 0.0);
             s.head_yaw = 0.0;
             s.body_yaw = 0.0;
-            s.pos = pos;
+            s.set_pos(pos);
             s.old = pos;
             s.yaw = self.mobs.rng.next_float() * 360.0;
             s.pitch = 0.0;

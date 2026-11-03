@@ -129,7 +129,7 @@ fn update_persistent_anger(s: &mut Server, m: &mut Mob) {
 /// Zombified piglins without target in the tracking box (±10 in height).
 fn alert_others(s: &mut Server, m: &Mob, t: Ent) {
     let r = m.follow_range();
-    let p = m.pos;
+    let p = m.pos();
     let area = rc_physics::Aabb {
         min: [p[0] - r, p[1] - 10.0, p[2] - r],
         max: [p[0] + 1.0 + r, p[1] + 1.0 + 10.0, p[2] + 1.0 + r],

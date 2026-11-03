@@ -812,14 +812,14 @@ impl Server {
             }
             if let Ent::Mob(id) = p
                 && let Some(i) = self.mob_index(id)
-                && let Some(mut o) = self.mobs.list[i].take()
+                && let Some(mut o) = self.mobs.list.take(i)
             {
                 let safe = o.attrs.safe_fall.value();
                 let dmg = ((dist + 1.0e-6 - safe) * mult * o.attrs.fall_mult.value()).floor() as i32;
                 if dmg > 0 && !o.kind.info().fall_immune {
                     self.mob_hurt(&mut o, ty, dmg as f32, None, None);
                 }
-                self.mobs.list[i] = Some(o);
+                self.mobs.list.put(i, o);
             }
         }
     }
@@ -976,16 +976,16 @@ fn follow_mommy(s: &mut Server, m: &mut Mob) {
     let bb = m.bbox();
     let area = rc_physics::Aabb { min: bb.min.map(|v| v - 16.0), max: bb.max.map(|v| v + 16.0) };
     let mut best: Option<(f64, [f64; 3])> = None;
-    for o in s.mobs.list.iter().flatten() {
+    for o in s.mobs.list.iter() {
         if o.id == m.id || !handles(o.kind) || !o.mount.flag(FLAG_BRED) || !o.alive() {
             continue;
         }
-        if !o.touches(&area) || super::mth::dist2(m.pos, o.pos) > 256.0 {
+        if !o.touches(&area) || super::mth::dist2(m.pos(), o.pos()) > 256.0 {
             continue;
         }
-        let d = super::mth::dist2(m.pos, o.pos);
+        let d = super::mth::dist2(m.pos(), o.pos());
         if best.is_none_or(|b| d < b.0) {
-            best = Some((d, o.pos));
+            best = Some((d, o.pos()));
         }
     }
     // Path computed then thrown away (the game does not follow it): only the navigation state changes.
@@ -1037,7 +1037,7 @@ impl Server {
     pub(crate) fn mount_spawn_at(&mut self, m: &Mob, s: Stack) {
         let r = &mut self.mobs.rng;
         let v = [r.next_double() * 0.2 - 0.1, 0.2, r.next_double() * 0.2 - 0.1];
-        self.spawn_item(m.pos, v, s, 10);
+        self.spawn_item(m.pos(), v, s, 10);
     }
 }
 

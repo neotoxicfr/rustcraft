@@ -1,5 +1,6 @@
-//! Per-block loop and face removal (C2-M10): each combination of the paths
-//! (`CullPaths`: property grid, palette, candidate rows, border stacks) returns,
+//! Per-block loop and face removal (C2-M10, C2-M08): each combination of the paths
+//! (`CullPaths`: property grid, palette, candidate rows, border stacks; rows fill, solid mask
+//! from the grid, vector candidates, border rows of the partial remesh) returns,
 //! for each removal rule, the fingerprint STORED here over the whole reference capture
 //! (compact formats; default settings, opaque leaves, no occlusion); the reference
 //! version (without shortcuts) and the partial remesh return it too.
@@ -25,9 +26,9 @@ use rc_mesh::wire::{MeshJob, Sections};
 
 /// Expected fingerprints per rule (old, game): default, opaque leaves, no occlusion.
 const EXPECTED: [[u64; 3]; 2] = [
-    [EXPECTED_COMPACT, 0x1b0f_f1b4_7b27_c532, 0x5dbd_7a6c_3e30_3263],
+    [EXPECTED_COMPACT, 0x8ff1_31b9_4bea_0b7a, 0x8f56_d4da_6fd0_83e3],
     // Game rule: 6,189,376 faces instead of 6,193,742 (−4,366, of which 5 fluid ones) default settings.
-    [0x6015_660c_daa2_d469, 0xc10a_24a5_6d12_3545, 0x660e_1344_bdf3_84ab],
+    [0xe684_40dc_dfe3_b631, 0x7cc0_d3af_93fe_c3e5, 0x43e6_1412_b904_93fb],
 ];
 
 fn total<'a>(meshes: impl Iterator<Item = &'a BlockMesh>) -> u64 {
@@ -53,11 +54,38 @@ fn mesh_all(keys: &[(i32, i32)], cols: &Cols, t: &Tables, p: &BiomePalette, cull
         .collect()
 }
 
-/// The 16 combinations of the loop paths for a rule.
+/// Combinations of the loop paths for a rule: the 16 of the grid paths (property grid, palette,
+/// rows, border stacks), each with the fill and candidate paths (rows fill, solid mask from the
+/// grid, vector candidates, border rows only) all off then all on; then the default with each of
+/// those turned off alone.
 fn combos(shape: bool) -> Vec<CullPaths> {
-    (0..16u8)
-        .map(|b| CullPaths { props: b & 1 != 0, palprops: b & 2 != 0, rows: b & 4 != 0, pile: b & 8 != 0, shape })
-        .collect()
+    let grid = |b: u8, newer: bool| CullPaths {
+        props: b & 1 != 0,
+        palprops: b & 2 != 0,
+        rows: b & 4 != 0,
+        pile: b & 8 != 0,
+        shape,
+        fill_rows: newer,
+        solid_from_props: newer,
+        simd_candidates: newer,
+        border_rows_only: newer,
+    };
+    let mut all: Vec<CullPaths> = (0..32u8).map(|b| grid(b & 15, b & 16 != 0)).collect();
+    let d = CullPaths { shape, ..CullPaths::DEFAULT };
+    all.extend([
+        CullPaths { fill_rows: false, ..d },
+        CullPaths { solid_from_props: false, ..d },
+        CullPaths { simd_candidates: false, ..d },
+        CullPaths { border_rows_only: false, ..d },
+    ]);
+    all
+}
+
+/// Paths of the partial remesh checks: default, and the default without the rows fill or
+/// without the border rows (the two ways the neighbours' border rows are read).
+fn partial_combos(shape: bool) -> [CullPaths; 3] {
+    let d = CullPaths { shape, ..CullPaths::DEFAULT };
+    [d, CullPaths { fill_rows: false, ..d }, CullPaths { border_rows_only: false, ..d }]
 }
 
 #[test]
@@ -99,21 +127,23 @@ fn cull_paths_match_stored() {
                 bad.push(format!("reference, rule {rule}, {name}: 0x{s:016x} instead of 0x{:016x}", got[v]));
             }
             if v == 0 {
-                // Partial remesh (sections 4 to 10) on the base of the full mesh, default paths.
+                // Partial remesh (sections 4 to 10) on the base of the full mesh.
                 let mut mask = Sections::default();
                 (4..=10).for_each(|s| mask.insert(s));
-                let reused: Vec<BlockMesh> = keys
-                    .par_iter()
-                    .zip(&base)
-                    .map(|(&(x, z), m)| {
-                        let mut j = job_with(&cols, x, z, CullPaths { shape, ..CullPaths::DEFAULT });
-                        j.reuse = Some((mask, Arc::new(rc_mesh::blocks::pack_exact(m)) as Packed));
-                        mesh(&j, &t, &palette, MIN_Y)
-                    })
-                    .collect();
-                let r = total(reused.iter());
-                if r != got[0] {
-                    bad.push(format!("partial remesh, rule {rule}: 0x{r:016x}"));
+                for p in partial_combos(shape) {
+                    let reused: Vec<BlockMesh> = keys
+                        .par_iter()
+                        .zip(&base)
+                        .map(|(&(x, z), m)| {
+                            let mut j = job_with(&cols, x, z, p);
+                            j.reuse = Some((mask, Arc::new(rc_mesh::blocks::pack_exact(m)) as Packed));
+                            mesh(&j, &t, &palette, MIN_Y)
+                        })
+                        .collect();
+                    let r = total(reused.iter());
+                    if r != got[0] {
+                        bad.push(format!("partial remesh, rule {rule}, {p:?}: 0x{r:016x}"));
+                    }
                 }
             }
         }
@@ -126,6 +156,79 @@ fn cull_paths_match_stored() {
     }
     eprintln!("fingerprints:\n{listing}");
     assert!(bad.is_empty(), "{}\ncurrent values:\n{listing}", bad.join("\n"));
+}
+
+/// Light bits of the property words (both rules): those of the light table, the solid bit equal
+/// to the visibility's solid render table, and the culling bits unchanged by them.
+#[test]
+fn property_light_bits_follow_the_light_table() {
+    use rc_mesh::cull::{DARK_SHADE_BIT, LIGHT_CLOSED_BIT, SOLID_RENDER_BIT, light_bits};
+    let Some((d, _cols, t, _palette)) = common::load() else { return };
+    let light = SOLID_RENDER_BIT | LIGHT_CLOSED_BIT | DARK_SHADE_BIT;
+    for rule in 0..2 {
+        for s in 0..d.states.len() {
+            let p = t.cull.props[rule][s];
+            assert_eq!(p & light, light_bits(t.light_info[s]), "rule {rule}, state {s}");
+            assert_eq!(p & SOLID_RENDER_BIT != 0, t.solid[s], "rule {rule}, state {s}: solid render");
+        }
+        // Air (state 0) carries no light bit: an `OUTSIDE` cell (word 0) reads like it.
+        assert_eq!(t.cull.props[rule][0] & light, 0);
+    }
+    let solid = (0..d.states.len()).filter(|&s| t.solid[s]).count();
+    eprintln!("{solid} solid render states out of {}", d.states.len());
+}
+
+/// Edge cases of the grid fill and candidate paths, every combination against the reference: a
+/// column without neighbours (`OUTSIDE` ring), states outside the table in the interior and on the
+/// borders of sections, blocks at the very bottom and top of the world; then a partial remesh of
+/// those sections.
+#[test]
+fn grid_fill_edge_cases_match_reference() {
+    let Some((d, cols, t, palette)) = common::load() else { return };
+    let mut keys: Vec<(i32, i32)> = cols.keys().copied().collect();
+    keys.sort_unstable();
+    let key = keys[keys.len() / 2];
+    let mut c = (*cols[&key]).clone();
+    let top = c.sections.len() - 1;
+    let unknown = d.states.len() as u32 + 7;
+    let stone = state(&d, "minecraft:stone", &[]);
+    let glass = state(&d, "minecraft:glass", &[]);
+    let at = |x: u16, y: u16, z: u16| y << 8 | z << 4 | x;
+    let bits = (u32::BITS - (unknown).leading_zeros()) as u8;
+    for (si, changes) in [
+        // Bottom of the world: unknown state on the floor and on a corner, stone and glass at y = 0.
+        (0, vec![(at(0, 0, 0), unknown), (at(5, 0, 5), stone), (at(6, 0, 5), glass), (at(8, 3, 8), unknown)]),
+        // Middle: unknown states on the section's borders (rows 0 and 15, sides).
+        (8, vec![(at(3, 0, 3), unknown), (at(3, 15, 3), unknown), (at(0, 7, 9), unknown), (at(15, 7, 9), stone)]),
+        // Top of the world: blocks in the top row, an unknown state next to them.
+        (top, vec![(at(4, 15, 4), stone), (at(5, 15, 4), glass), (at(6, 15, 4), unknown), (at(4, 14, 4), stone)]),
+    ] {
+        c.sections[si].set_blocks(&changes, bits, |s| t.air.get(s as usize).copied().unwrap_or(true));
+    }
+    let alone: common::Cols = [(key, Arc::new(c.clone()))].into_iter().collect();
+    let mut surrounded = cols.clone();
+    surrounded.insert(key, Arc::new(c));
+    let mut mask = Sections::default();
+    [0, 7, 8, 9, top as i32].into_iter().for_each(|s| mask.insert(s));
+    let mut bad = Vec::new();
+    for (name, world) in [("without neighbours", &alone), ("with neighbours", &surrounded)] {
+        for shape in [false, true] {
+            let reference = job_with(world, key.0, key.1, CullPaths { shape, ..CullPaths::OLD });
+            let want = digest(&mesh_reference(&reference, &t, &palette, MIN_Y));
+            for p in combos(shape) {
+                let full = mesh(&job_with(world, key.0, key.1, p), &t, &palette, MIN_Y);
+                if digest(&full) != want {
+                    bad.push(format!("{name}, {p:?}: full mesh differs from the reference"));
+                }
+                let mut j = job_with(world, key.0, key.1, p);
+                j.reuse = Some((mask, Arc::new(rc_mesh::blocks::pack_exact(&full)) as Packed));
+                if digest(&mesh(&j, &t, &palette, MIN_Y)) != want {
+                    bad.push(format!("{name}, {p:?}: partial remesh differs from the reference"));
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
 
 /// First state of block `name` whose properties contain all those of `props`.
@@ -154,7 +257,7 @@ fn face_rule_matches_known_states() {
     let Some(d) = rc_testdata::version_data() else { return };
     let empty: Vec<bool> = vec![false; d.states.len()];
     let zeros = vec![0u8; d.states.len()];
-    let ct = rc_mesh::cull::CullTables::new(&d, &zeros, &zeros, &empty, &empty, &empty, &empty);
+    let ct = rc_mesh::cull::CullTables::new(&d, &zeros, &zeros, &empty, &empty, &empty, &empty, &[]);
     eprintln!("{} distinct face shapes, {} outside sixteenths", ct.shapes(), ct.inexact());
     let (down, up, north, south) = (0, 1, 2, 3);
     let stone = state(&d, "minecraft:stone", &[]);

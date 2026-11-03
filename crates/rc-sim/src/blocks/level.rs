@@ -681,46 +681,10 @@ impl Server {
         if !self.rule("minecraft:block_drops", true) {
             return Vec::new();
         }
-        let Some(block) = self.data.block_of(state).map(|b| b.name.clone()) else { return Vec::new() };
-        let props: Vec<(String, String)> =
-            self.data.state_properties(state).map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
-        let be = self.block_entity(p).cloned();
-        let table_id = format!("minecraft:blocks/{}", block.trim_start_matches("minecraft:"));
-        let tags = &self.block_tags;
-        let data = &self.data;
-        let tag_fn = |tag: &str, name: &str| {
-            let id = data.blocks.iter().position(|b| b.name == name).map(|i| i as u32);
-            id.is_some_and(|id| tags.get(tag).is_some_and(|v| v.binary_search(&id).is_ok()))
-        };
-        let seq =
-            self.life.pack.get("loot_table", &table_id).and_then(|t| t["random_sequence"].as_str().map(str::to_owned));
-        // W8c: generator taken out for the time of the draw (the world is lent to the conditions).
-        let mut rng = match &seq {
-            Some(s) => *self.life.seqs.get(s),
-            None => self.life.rng,
-        };
-        let drops = {
-            let world = self.loot_world(crate::progress::pred::Ctx {
-                origin: Some([f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5]),
-                block: Some(state),
-                tool: Some(tool),
-                ..Default::default()
-            });
-            let loot = crate::loot::Loot { pack: &self.life.pack, items: &self.life.items, block_tag: &tag_fn };
-            let ctx = crate::loot::Ctx {
-                block: Some((block.as_str(), props)),
-                tool: Some(tool),
-                block_entity: be.as_ref(),
-                world: Some(&world),
-                ..Default::default()
-            };
-            loot.drops(&table_id, &ctx, &mut rng)
-        };
-        match &seq {
-            Some(s) => *self.life.seqs.get(s) = rng,
-            None => self.life.rng = rng,
+        if !crate::loot::loot_context_borrowed() {
+            return self.block_drops_with_owned_context(p, state, tool);
         }
-        drops
+        self.draw_block_loot(p, state, crate::block_loot::BlockRemoval::Mined { tool, by_player: false })
     }
 
     pub(crate) fn level_event(&self, kind: i32, p: P, data: i32) {

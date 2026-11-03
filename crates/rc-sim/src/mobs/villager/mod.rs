@@ -254,15 +254,13 @@ impl Server {
         f: impl FnOnce(&mut Server, &mut Mob, Option<&mut Brain>) -> R,
     ) -> Option<R> {
         let i = self.mob_index(id)?;
-        let mut o = self.mobs.list[i].take()?;
+        let mut o = self.mobs.list.take(i)?;
         let mut b = o.npc.as_mut().and_then(|n| n.brain.take());
         let r = f(self, &mut o, b.as_deref_mut());
         if let (Some(n), Some(b)) = (o.npc.as_mut(), b) {
             n.brain = Some(b);
         }
-        if let Some(slot) = self.mobs.list.get_mut(i) {
-            *slot = Some(o);
-        } else {
+        if let Err(o) = self.mobs.list.try_put(i, o) {
             self.mobs.push(o);
         }
         Some(r)
@@ -615,7 +613,7 @@ impl Server {
         let sound = std::mem::replace(&mut t.trade_sound, false);
         let offers = t.offers.clone();
         let Some(i) = self.mob_index(id) else { return };
-        let Some(mut m) = self.mobs.list[i].take() else { return };
+        let Some(mut m) = self.mobs.list.take(i) else { return };
         for valid in updated {
             // Yes/no sound, at most once per interval.
             let interval = m.kind.info().ambient_interval;
@@ -646,7 +644,7 @@ impl Server {
             self.reward_trade(&mut m, &off);
             self.s9_traded(&m, &off.result); // S9: statistic and trading trigger
         }
-        self.mobs.list[i] = Some(m);
+        self.mobs.list.put(i, m);
     }
 
     /// The experience reward of a trade (villager) or simple reward (wandering trader).
@@ -672,7 +670,7 @@ impl Server {
         }
         if off.reward_exp {
             // A single orb of the drawn value (neither splitting nor merging).
-            self.add_orb([m.pos[0], m.pos[1] + 0.5, m.pos[2]], pop);
+            self.add_orb([m.pos()[0], m.pos()[1] + 0.5, m.pos()[2]], pop);
         }
     }
 
@@ -705,7 +703,7 @@ impl Server {
     /// Trade closing: the trader no longer trades.
     pub(crate) fn merchant_closed(&mut self, id: i32) {
         if let Some(i) = self.mob_index(id)
-            && let Some(m) = self.mobs.list[i].as_mut()
+            && let Some(m) = self.mobs.list.get_mut(i)
             && let Some(n) = m.npc.as_mut()
         {
             n.trading = false;
@@ -785,7 +783,7 @@ impl Server {
         }
         let bb = m.bbox();
         let mut count = 0;
-        for o in self.mobs.list.iter().flatten() {
+        for o in self.mobs.list.iter() {
             if o.kind != Kind::Villager {
                 continue;
             }
@@ -807,7 +805,7 @@ impl Server {
         if count >= needed && self.summon_golem_for_villager(m.block_pos()) {
             // Golem born (F06): all villagers in the enlarged box of 10 have "seen" it.
             b.mem.golem = Some(599);
-            for o in self.mobs.list.iter_mut().flatten() {
+            for o in self.mobs.list.iter_mut() {
                 if o.kind != Kind::Villager {
                     continue;
                 }
@@ -892,7 +890,7 @@ impl Server {
         };
         m.age = 6000;
         self.with_villager(other, |_, o, _| o.age = 6000);
-        let mut baby = self.new_mob(Kind::Villager, m.pos, 0.0);
+        let mut baby = self.new_mob(Kind::Villager, m.pos(), 0.0);
         baby.villager = [ty, PROF_NONE, 1];
         baby.x.vdata_final = true;
         baby.age = -24000;
@@ -936,7 +934,7 @@ impl Server {
     pub(crate) fn spawn_at_location(&mut self, m: &Mob, s: Stack, dy: f64) {
         let r = &mut self.mobs.rng;
         let v = [r.next_double() * 0.2 - 0.1, 0.2, r.next_double() * 0.2 - 0.1];
-        self.spawn_item([m.pos[0], m.pos[1] + dy, m.pos[2]], v, s, 10);
+        self.spawn_item([m.pos()[0], m.pos()[1] + dy, m.pos()[2]], v, s, 10);
     }
 
     /// Composter: bone meal recovered at level 8, then up to 20 seeds (≥ 10 kept).
@@ -1224,8 +1222,8 @@ impl Server {
     /// toward the target × 0.3 (single precision) on each axis.
     pub(crate) fn throw_item(&mut self, m: &Mob, s: Stack, target: [f64; 3]) {
         let k = f64::from(0.3f32);
-        let pos = [m.pos[0], m.eye_y() - k, m.pos[2]];
-        let v = crate::mobs::mth::normalize([target[0] - m.pos[0], target[1] - m.pos[1], target[2] - m.pos[2]]).map(|c| c * k);
+        let pos = [m.pos()[0], m.eye_y() - k, m.pos()[2]];
+        let v = crate::mobs::mth::normalize([target[0] - m.pos()[0], target[1] - m.pos()[1], target[2] - m.pos()[2]]).map(|c| c * k);
         self.spawn_item(pos, v, s, 10);
     }
 
@@ -1254,7 +1252,7 @@ impl Server {
         let Some(h) = self.bed_sleep_height(bed) else { return false };
         let ns = self.view().set_bool(s, "occupied", true);
         self.set_block(bed, ns, 3);
-        m.pos = [f64::from(bed[0]) + 0.5, f64::from(bed[1]) + h + 0.125, f64::from(bed[2]) + 0.5];
+        m.set_pos([f64::from(bed[0]) + 0.5, f64::from(bed[1]) + h + 0.125, f64::from(bed[2]) + 0.5]);
         m.vel = [0.0; 3];
         m.needs_sync = true;
         if let Some(n) = m.npc.as_mut() {
@@ -1269,7 +1267,7 @@ impl Server {
     pub(crate) fn stop_sleeping(&mut self, m: &mut Mob, b: &mut Brain) {
         let Some(bed) = m.npc.as_mut().and_then(|n| n.sleeping.take()) else { return };
         if let Some((stand, yaw)) = self.leave_bed(bed, m.yaw, (0.6, 1.95), false) {
-            m.pos = stand;
+            m.set_pos(stand);
             m.yaw = yaw;
             m.pitch = 0.0;
         }

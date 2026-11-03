@@ -33,7 +33,7 @@ pub fn ok_target(s: &Server, t: Option<Ent>) -> bool {
 /// Tick of the drowned's movement control; true if it replaces the common control.
 pub fn move_control(s: &Server, m: &mut Mob) -> bool {
     if wants_to_swim(s, m) && m.in_water {
-        let higher = m.target.and_then(|t| s.ent_pos(t)).is_some_and(|p| p[1] > m.pos[1]);
+        let higher = m.target.and_then(|t| s.ent_pos(t)).is_some_and(|p| p[1] > m.pos()[1]);
         if higher || m.aqua.searching_for_land {
             m.vel[1] += 0.002;
         }
@@ -44,7 +44,7 @@ pub fn move_control(s: &Server, m: &mut Mob) -> bool {
             return true;
         }
         let w = m.move_ctl.wanted;
-        let (xd, mut yd, zd) = (w[0] - m.pos[0], w[1] - m.pos[1], w[2] - m.pos[2]);
+        let (xd, mut yd, zd) = (w[0] - m.pos()[0], w[1] - m.pos()[1], w[2] - m.pos()[2]);
         let dd = (xd * xd + yd * yd + zd * zd).sqrt();
         yd /= dd;
         let yr = yaw_to(xd, zd);
@@ -71,7 +71,7 @@ pub fn move_control(s: &Server, m: &mut Mob) -> bool {
 fn close_to_next_pos(m: &Mob) -> bool {
     m.nav.path.as_ref().is_some_and(|p| {
         let t = p.target;
-        dist2(m.pos, [f64::from(t[0]), f64::from(t[1]), f64::from(t[2])]) < 4.0
+        dist2(m.pos(), [f64::from(t[0]), f64::from(t[1]), f64::from(t[2])]) < 4.0
     })
 }
 
@@ -148,11 +148,11 @@ impl Server {
                 let Some(p) = find_beach(self, m) else { return false };
                 *pos = p;
                 let sea = super::super::surface::sea_level(self);
-                !self.bright_outside() && m.in_water && m.pos[1] >= f64::from(sea - 3)
+                !self.bright_outside() && m.in_water && m.pos()[1] >= f64::from(sea - 3)
             }
             AquaGoal::SwimUp { .. } => {
                 let sea = super::super::surface::sea_level(self);
-                !self.bright_outside() && m.in_water && m.pos[1] < f64::from(sea - 2)
+                !self.bright_outside() && m.in_water && m.pos()[1] < f64::from(sea - 2)
             }
             _ => false,
         }
@@ -225,7 +225,7 @@ impl Server {
                 const RADIUS: f32 = 10.0;
                 let Some(t) = *target else { return };
                 let (Some(tp), Some(eye)) = (self.ent_pos(t), self.ent_eye(t)) else { return };
-                let d2 = dist2(m.pos, tp);
+                let d2 = dist2(m.pos(), tp);
                 let sight = self.line_of_sight(m, t);
                 if sight {
                     *see_time += 1;
@@ -252,7 +252,7 @@ impl Server {
             }
             AquaGoal::GoToBeach { try_ticks, pos, .. } => {
                 let target = [pos[0], pos[1] + 1, pos[2]];
-                if !near_center(target, m.pos, 1.0) {
+                if !near_center(target, m.pos(), 1.0) {
                     *try_ticks += 1;
                     if *try_ticks % 40 == 0 {
                         let p = [f64::from(target[0]) + 0.5, f64::from(target[1]), f64::from(target[2]) + 0.5];
@@ -264,8 +264,8 @@ impl Server {
             }
             AquaGoal::SwimUp { stuck } => {
                 let sea = super::super::surface::sea_level(self);
-                if m.pos[1] < f64::from(sea - 1) && (m.nav.is_done() || close_to_next_pos(m)) {
-                    let to = [m.pos[0], f64::from(sea - 1), m.pos[2]];
+                if m.pos()[1] < f64::from(sea - 1) && (m.nav.is_done() || close_to_next_pos(m)) {
+                    let to = [m.pos()[0], f64::from(sea - 1), m.pos()[2]];
                     match self.pos_towards(m, 4, 8, to, std::f32::consts::FRAC_PI_2) {
                         None => *stuck = true,
                         Some(n) => {
@@ -316,10 +316,10 @@ impl Server {
             Some(s) if s.id == "minecraft:trident" => s.clone(),
             _ => Stack { id: "minecraft:trident".into(), count: 1, components: None },
         };
-        let start = [m.pos[0], m.eye_y() - f64::from(0.1f32), m.pos[2]];
-        let xd = tp[0] - m.pos[0];
+        let start = [m.pos()[0], m.eye_y() - f64::from(0.1f32), m.pos()[2]];
+        let xd = tp[0] - m.pos()[0];
         let yd = tb.min[1] + (tb.max[1] - tb.min[1]) * 0.333_333_333_333_333_3 - start[1];
-        let zd = tp[2] - m.pos[2];
+        let zd = tp[2] - m.pos()[2];
         let dist = (xd * xd + zd * zd).sqrt();
         let unc = (14 - self.level.difficulty_id() * 4) as f32;
         self.spawn_trident(m, start, [xd, yd + dist * f64::from(0.2f32), zd], unc, item);

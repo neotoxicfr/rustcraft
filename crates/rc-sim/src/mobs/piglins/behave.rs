@@ -86,7 +86,7 @@ impl Server {
         let Some(a) = a else { return b };
         let (pa, pb) = (self.ent_pos(a), self.ent_pos(b));
         match (pa, pb) {
-            (Some(pa), Some(pb)) if dist2(m.pos, pa) < dist2(m.pos, pb) => a,
+            (Some(pa), Some(pb)) if dist2(m.pos(), pa) < dist2(m.pos(), pb) => a,
             (Some(_), None) => a,
             _ => b,
         }
@@ -96,7 +96,7 @@ impl Server {
     fn pig_much_further(&self, m: &Mob, b: &Brain, other: Ent, more: f64) -> bool {
         let Some(cur) = b.mem.attack.get() else { return false };
         let (Some(pc), Some(po)) = (self.ent_pos(cur), self.ent_pos(other)) else { return false };
-        dist2(m.pos, po) > dist2(m.pos, pc) + more * more
+        dist2(m.pos(), po) > dist2(m.pos(), pc) + more * more
     }
 
     /// Player holding a loved item (main hand or off-hand).
@@ -113,12 +113,12 @@ impl Server {
     /// Mob (out of the list during its tick) and its brain.
     pub(crate) fn pig_with(&mut self, id: i32, f: impl FnOnce(&mut Server, &mut Mob, &mut Brain)) {
         let Some(i) = self.mob_index(id) else { return };
-        let Some(mut o) = self.mobs.list[i].take() else { return };
+        let Some(mut o) = self.mobs.list.take(i) else { return };
         if let Some(mut ob) = o.bm.brain.take() {
             f(self, &mut o, &mut ob);
             o.bm.brain = Some(ob);
         }
-        self.mobs.list[i] = Some(o);
+        self.mobs.list.put(i, o);
     }
 
     fn pig_visible(&self, m: &mut Mob, b: &mut Brain, e: Ent) -> bool {
@@ -292,7 +292,7 @@ impl Server {
     // ---------- Target search ----------
 
     fn pig_near_zombified(&self, m: &Mob, b: &Brain) -> bool {
-        b.mem.pig.zombified.get().and_then(|e| self.ent_pos(e)).is_some_and(|p| closer(m.pos, p, 6.0))
+        b.mem.pig.zombified.get().and_then(|e| self.ent_pos(e)).is_some_and(|p| closer(m.pos(), p, 6.0))
     }
 
     /// Closest valid attack target (by species).
@@ -635,14 +635,14 @@ impl Server {
         let ty = "minecraft:mob_attack";
         let hurt = match t {
             Ent::Player => {
-                let kb = (m.pos[0] - self.pos[0], m.pos[2] - self.pos[2]);
+                let kb = (m.pos()[0] - self.pos[0], m.pos()[2] - self.pos[2]);
                 self.player_hurt_by_mob(m, ty, dmg, Some(kb))
             }
             Ent::Mob(id) => {
                 let Some(i) = self.mob_index(id) else { return false };
-                let Some(mut o) = self.mobs.list[i].take() else { return false };
+                let Some(mut o) = self.mobs.list.take(i) else { return false };
                 let r = self.mob_hurt_by(&mut o, m, ty, dmg);
-                self.mobs.list[i] = Some(o);
+                self.mobs.list.put(i, o);
                 r
             }
         };
@@ -669,7 +669,7 @@ impl Server {
             return;
         }
         let Some(tp) = self.ent_pos(t) else { return };
-        let (xd, zd) = (tp[0] - m.pos[0], tp[2] - m.pos[2]);
+        let (xd, zd) = (tp[0] - m.pos()[0], tp[2] - m.pos()[2]);
         let angle = (self.mobs.rng.next_int_bound(21) - 10) as f32;
         let hscale = eff * f64::from(self.mobs.rng.next_float() * 0.5 + 0.2);
         let l = (xd * xd + zd * zd).sqrt();
@@ -689,7 +689,7 @@ impl Server {
             }
             Ent::Mob(id) => {
                 if let Some(i) = self.mob_index(id)
-                    && let Some(o) = self.mobs.list[i].as_mut()
+                    && let Some(o) = self.mobs.list.get_mut(i)
                 {
                     o.vel = [o.vel[0] + hx, o.vel[1] + v, o.vel[2] + hz];
                     o.track.sync_velocity = true;
@@ -766,11 +766,11 @@ impl Server {
     pub(crate) fn pig_stop_riding(&mut self, m: &mut Mob) {
         let Some(vid) = m.mount.vehicle.take() else { return };
         if let Some(i) = self.mob_index(vid)
-            && let Some(mut v) = self.mobs.list[i].take()
+            && let Some(mut v) = self.mobs.list.take(i)
         {
             v.mount.passengers.retain(|p| *p != Ent::Mob(m.id));
             self.send_passengers(&mut v);
-            self.mobs.list[i] = Some(v);
+            self.mobs.list.put(i, v);
         }
     }
 
@@ -789,11 +789,11 @@ impl Server {
             }
         }
         let Some(i) = self.mob_index(v) else { return };
-        let Some(mut veh) = self.mobs.list[i].take() else { return };
+        let Some(mut veh) = self.mobs.list.take(i) else { return };
         if self.mob_start_riding(m, &mut veh, false) {
             self.send_passengers(&mut veh);
         }
-        self.mobs.list[i] = Some(veh);
+        self.mobs.list.put(i, veh);
     }
 
     // ---------- Behaviors ----------
@@ -868,7 +868,7 @@ impl Server {
             }
             PB::LookAt { who, range } => {
                 let max = f64::from(*range * *range);
-                let me = m.pos;
+                let me = m.pos();
                 let w = *who;
                 let passengers = m.mount.passengers.clone();
                 let loved = self.player_holds_loved();
@@ -976,7 +976,7 @@ impl Server {
                 if self.bz_visible_closest(m, b, &valid).is_none() {
                     return false;
                 }
-                let me = m.pos;
+                let me = m.pos();
                 let close = move |s: &Server, e: Ent| valid(s, e) && s.ent_pos(e).is_some_and(|p| dist2(p, me) <= 64.0);
                 if let Some(e) = self.bz_visible_closest(m, b, &close) {
                     b.mem.pig.interaction_target.set(e);
@@ -995,7 +995,7 @@ impl Server {
             }
             PB::LookAndInteract { range } => {
                 let max = f64::from(*range * *range);
-                let me = m.pos;
+                let me = m.pos();
                 let f = move |s: &Server, e: Ent| e == Ent::Player && s.ent_pos(e).is_some_and(|p| dist2(p, me) <= max);
                 let Some(e) = self.bz_visible_closest(m, b, &f) else { return false };
                 b.mem.pig.interaction_target.set(e);
@@ -1021,7 +1021,7 @@ impl Server {
                     return false;
                 }
                 let Some(target) = b.mem.attack.get() else { return false };
-                let near = self.ent_pos(target).is_some_and(|p| closer(m.pos, p, f64::from(*dist)));
+                let near = self.ent_pos(target).is_some_and(|p| closer(m.pos(), p, f64::from(*dist)));
                 if !near || !self.pig_visible(m, b, target) {
                     return false;
                 }
@@ -1107,7 +1107,7 @@ impl Server {
                 let Some(id) = b.mem.wanted_item.get() else { return false };
                 let Some(ip) = self.life.drops.iter().find(|d| d.id == id).map(|d| d.pos) else { return false };
                 // In range and within the world border.
-                if !closer(ip, m.pos, 9.0) || !self.may_interact(super::super::mth::block_of(ip)) {
+                if !closer(ip, m.pos(), 9.0) || !self.may_interact(super::super::mth::block_of(ip)) {
                     return false;
                 }
                 b.mem.walk.set(Walk { target: Track::Item { id, eye: false }, speed: 1.0, close: 0 });
@@ -1123,7 +1123,7 @@ impl Server {
                     .wanted_item
                     .get()
                     .and_then(|id| self.life.drops.iter().find(|d| d.id == id))
-                    .is_some_and(|d| closer(d.pos, m.pos, 9.0));
+                    .is_some_and(|d| closer(d.pos, m.pos(), 9.0));
                 if near {
                     return false;
                 }
@@ -1163,7 +1163,7 @@ impl Server {
                 }
                 let Some(r) = b.mem.pig.ride_target.get() else { return false };
                 let Some(rp) = self.ent_pos(r) else { return false };
-                if closer(rp, m.pos, 1.0) {
+                if closer(rp, m.pos(), 1.0) {
                     if let Ent::Mob(id) = r {
                         self.pig_start_riding(m, id);
                     }
@@ -1202,7 +1202,7 @@ impl Server {
                 let cur = m.mount.vehicle.map(Ent::Mob);
                 let target = b.mem.pig.ride_target.get();
                 let Some(v) = cur.or(target) else { return false };
-                let valid = self.ent_alive(v) && self.ent_pos(v).is_some_and(|p| closer(p, m.pos, 8.0));
+                let valid = self.ent_alive(v) && self.ent_pos(v).is_some_and(|p| closer(p, m.pos(), 8.0));
                 if valid && !self.piglin_wants_to_stop_riding(b, v) {
                     return false;
                 }
@@ -1225,7 +1225,7 @@ impl Server {
             PB::StrollToHome { next } => {
                 let Some(h) = b.mem.pig.home.get() else { return false };
                 let here = super::super::villager::brain::DimKey::of(&self.dim.name);
-                if h.dim != here || !closer_center(h.pos, m.pos, 100.0) {
+                if h.dim != here || !closer_center(h.pos, m.pos(), 100.0) {
                     return false;
                 }
                 if t <= *next {
@@ -1238,7 +1238,7 @@ impl Server {
             PB::StrollAroundHome { next } => {
                 let Some(h) = b.mem.pig.home.get() else { return false };
                 let here = super::super::villager::brain::DimKey::of(&self.dim.name);
-                if h.dim != here || !closer_center(h.pos, m.pos, 5.0) {
+                if h.dim != here || !closer_center(h.pos, m.pos(), 5.0) {
                     return false;
                 }
                 if t <= *next {
@@ -1267,15 +1267,15 @@ impl Server {
         if cur.is_some() && !interrupt {
             return false;
         }
-        if !closer(m.pos, from, f64::from(dist)) {
+        if !closer(m.pos(), from, f64::from(dist)) {
             return false;
         }
         if let Some(w) = cur
             && w.speed == speed
             && let Some(tp) = self.bz_track_pos(w.target)
         {
-            let cd = [tp[0] - m.pos[0], tp[1] - m.pos[1], tp[2] - m.pos[2]];
-            let ad = [from[0] - m.pos[0], from[1] - m.pos[1], from[2] - m.pos[2]];
+            let cd = [tp[0] - m.pos()[0], tp[1] - m.pos()[1], tp[2] - m.pos()[2]];
+            let ad = [from[0] - m.pos()[0], from[1] - m.pos()[1], from[2] - m.pos()[2]];
             if cd[0] * ad[0] + cd[1] * ad[1] + cd[2] * ad[2] < 0.0 {
                 return false;
             }
@@ -1298,11 +1298,12 @@ impl Server {
         v: i32,
         from: [f64; 3],
     ) -> Option<[f64; 3]> {
-        let mut dir = [m.pos[0] - from[0], m.pos[2] - from[2]];
-        let dy = m.pos[1] - from[1];
+        let mut dir = [m.pos()[0] - from[0], m.pos()[2] - from[2]];
+        let dy = m.pos()[1] - from[1];
         if dir[0] * dir[0] + dy * dy + dir[1] * dir[1] == 0.0 {
             dir = [m.rng.next_double() - 0.5, m.rng.next_double() - 0.5];
         }
+        let view = super::super::nav::DrawView::new(self, m);
         let mut best: Option<(f32, [i32; 3])> = None;
         for _ in 0..10 {
             // The direction draw in a cone (π/2) then the position draw toward a direction.
@@ -1316,9 +1317,9 @@ impl Server {
             }
             let yt = m.rng.next_int_bound(2 * v + 1) - v;
             let p = [
-                (xt.floor() + m.pos[0]).floor() as i32,
-                (f64::from(yt) + m.pos[1]).floor() as i32,
-                (zt.floor() + m.pos[2]).floor() as i32,
+                (xt.floor() + m.pos()[0]).floor() as i32,
+                (f64::from(yt) + m.pos()[1]).floor() as i32,
+                (zt.floor() + m.pos()[2]).floor() as i32,
             ];
             let hgt = self.dim.height;
             if p[1] < hgt.min_y || p[1] >= hgt.min_y + hgt.sections as i32 * 16 || !self.nav_stable(m, p) {
@@ -1333,7 +1334,7 @@ impl Server {
                     q[1] += 1;
                 }
             }
-            if self.mob_fluid(q) == super::super::env::Fluid::Water || self.pos_has_malus(m, q) {
+            if self.mob_fluid(q) == super::super::env::Fluid::Water || view.has_malus(self, m, q) {
                 continue;
             }
             let w = self.walk_target_value(m, q);
@@ -1349,7 +1350,7 @@ impl Server {
         let main = m.equipment[0].as_ref().map(|s| s.id.as_str());
         if m.kind == Kind::Piglin && main == Some("minecraft:crossbow") {
             let r = f64::from(8 - margin);
-            return self.ent_pos(t).is_some_and(|p| closer(m.pos, p, r));
+            return self.ent_pos(t).is_some_and(|p| closer(m.pos(), p, r));
         }
         self.within_melee(m, t)
     }
@@ -1416,13 +1417,13 @@ impl Server {
                     keep.push(d);
                     continue;
                 }
-                if !closer_center(d, m.pos, 3.0) || !self.is_mob_door(d) || !self.view().get_bool(self.st(d), "open") {
+                if !closer_center(d, m.pos(), 3.0) || !self.is_mob_door(d) || !self.view().get_bool(self.st(d), "open") {
                     continue;
                 }
-                let others = self.mobs.list.iter().flatten().any(|o| {
+                let others = self.mobs.list.iter().any(|o| {
                     o.kind == m.kind
                         && o.id != m.id
-                        && closer_center(d, o.pos, 2.0)
+                        && closer_center(d, o.pos(), 2.0)
                         && o.nav.path.as_ref().is_some_and(|p| {
                             !p.is_done() && p.next > 0 && (p.nodes[p.next - 1].0 == d || p.nodes[p.next].0 == d)
                         })
@@ -1528,7 +1529,7 @@ impl Server {
 
 /// The choice of the piglin's sound according to activity.
 pub(crate) fn piglin_activity_sound(s: &Server, m: &Mob, b: &Brain) -> &'static str {
-    let near_avoid = b.mem.pig.avoid_target.get().and_then(|e| s.ent_pos(e)).is_some_and(|p| closer(p, m.pos, 12.0));
+    let near_avoid = b.mem.pig.avoid_target.get().and_then(|e| s.ent_pos(e)).is_some_and(|p| closer(p, m.pos(), 12.0));
     match b.act {
         Act::Fight => "minecraft:entity.piglin.angry",
         _ if super::is_converting(s, m) => "minecraft:entity.piglin.retreat",

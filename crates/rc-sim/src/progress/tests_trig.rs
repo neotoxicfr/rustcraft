@@ -85,7 +85,7 @@ fn iron_golem_build_summons() {
          setblock 112 -58 110 minecraft:iron_block\nsetblock 114 -58 110 minecraft:iron_block\n\
          setblock 113 -57 110 minecraft:carved_pumpkin",
     );
-    assert!(p.s.mobs.list.iter().flatten().any(|m| m.kind == Kind::IronGolem), "golem not built");
+    assert!(p.s.mobs.list.iter().any(|m| m.kind == Kind::IronGolem), "golem not built");
     assert!(adv(&p, "minecraft:adventure/summon_iron_golem"), "summoned_entity missing");
     done(p, dir);
 }

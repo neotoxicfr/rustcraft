@@ -260,7 +260,6 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| Some(o.id) != exclude && !super::recent::ignores_explosion(o))
             .map(|o| o.id)
             .collect();
@@ -281,7 +280,7 @@ impl Server {
                 eprintln!("explosion: {t:?} at {pos:?}, distance {dist:.3}, seen part {exposure}, damage {dmg}");
             }
             let Some(i) = self.mob_index(id) else { continue };
-            let mut o = self.mobs.list[i].take().expect("mob");
+            let mut o = self.mobs.list.take(i).expect("mob");
             // Ghast hit by the explosion of a fireball sent back by the player: 1,000.
             let dmg = if super::nether::reflected_fireball(&o, self.mobs.fireballs.direct_large, by) { 1000.0 } else { dmg };
             self.mob_hurt(&mut o, ty, dmg, by, Some(center));
@@ -290,7 +289,7 @@ impl Server {
             let kp = (1.0 - dist) * f64::from(exposure) * (1.0 - o.attrs.explosion_kb_resistance.value());
             o.vel = [o.vel[0] + dir[0] * kp, o.vel[1] + dir[1] * kp, o.vel[2] + dir[2] * kp];
             o.needs_sync = true;
-            self.mobs.list[i] = Some(o);
+            self.mobs.list.put(i, o);
         }
         // The current player, then the other players of the local network: hurt and pushed like
         // the host (W8c: the direct cause is the explosion's, whoever is installed).
@@ -354,10 +353,10 @@ impl Server {
                     continue;
                 }
                 let s = self.st(p);
-                let name = self.state_name(s).to_owned();
+                let is_tnt = self.state_name(s) == "minecraft:tnt";
                 self.heart_explosion_hit(p, s, ty, by);
                 // TNT: no loot, a primed TNT with a short fuse takes its place.
-                if name == "minecraft:tnt" {
+                if is_tnt {
                     let air = self.default_state("minecraft:air");
                     self.set_block(p, air, crate::blocks::flag::ALL);
                     self.tnt_was_exploded(p);
@@ -367,7 +366,7 @@ impl Server {
                 if hive {
                     self.hive_blown(p, hive_release);
                 }
-                let drops = self.explosion_drops(p, s, &name, if decay { Some(radius) } else { None });
+                let drops = self.explosion_drops(p, s, if decay { Some(radius) } else { None });
                 for d in drops {
                     let mut d = d;
                     for (_, st) in stacks.iter_mut() {
@@ -494,7 +493,7 @@ impl Server {
         self.prog.dmg_src = crate::item_use::DmgSrc {
             pos: Some(center),
             direct_living: source.is_some(),
-            attacker_pos: source.map(|s| s.pos),
+            attacker_pos: source.map(|s| s.pos()),
             ..Default::default()
         };
         let mut hit = (None, None);
@@ -577,49 +576,14 @@ impl Server {
     }
 
     /// Loot of a blown-up block (block table, explosion context).
-    fn explosion_drops(
-        &mut self,
-        p: [i32; 3],
-        state: u32,
-        name: &str,
-        radius: Option<f32>,
-    ) -> Vec<crate::player::Stack> {
+    fn explosion_drops(&mut self, p: [i32; 3], state: u32, radius: Option<f32>) -> Vec<crate::player::Stack> {
         if !self.rule("minecraft:block_drops", true) {
             return Vec::new();
         }
-        let props: Vec<(String, String)> =
-            self.data.state_properties(state).map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
-        let be = self.block_entity(p).cloned();
-        let table = format!("minecraft:blocks/{}", name.trim_start_matches("minecraft:"));
-        let tags = &self.block_tags;
-        let data = &self.data;
-        let tag_fn = |tag: &str, n: &str| {
-            let id = data.blocks.iter().position(|b| b.name == n).map(|i| i as u32);
-            id.is_some_and(|id| tags.get(tag).is_some_and(|v| v.binary_search(&id).is_ok()))
-        };
-        let loot = crate::loot::Loot { pack: &self.life.pack, items: &self.life.items, block_tag: &tag_fn };
-        let empty = None;
-        let ctx = crate::loot::Ctx {
-            block: Some((name, props)),
-            tool: Some(empty),
-            explosion: radius,
-            block_entity: be.as_ref(),
-            ..Default::default()
-        };
-        let seq =
-            self.life.pack.get("loot_table", &table).and_then(|t| t["random_sequence"].as_str().map(str::to_owned));
-        match seq {
-            Some(s) => {
-                let rng = self.life.seqs.get(&s);
-                loot.drops(&table, &ctx, rng)
-            }
-            None => {
-                let mut rng = self.life.rng;
-                let d = loot.drops(&table, &ctx, &mut rng);
-                self.life.rng = rng;
-                d
-            }
+        if !crate::loot::loot_context_borrowed() {
+            return self.explosion_drops_with_owned_context(p, state, radius);
         }
+        self.draw_block_loot(p, state, crate::block_loot::BlockRemoval::Blown { radius })
     }
 
     pub(crate) fn default_state(&self, name: &str) -> u32 {

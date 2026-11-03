@@ -35,7 +35,7 @@ fn step(p: &mut Probe, n: i32) {
 }
 
 fn golems(p: &Probe, k: Kind) -> Vec<([f64; 3], i32)> {
-    p.s.mobs.list.iter().flatten().filter(|m| m.kind == k && !m.removed).map(|m| (m.pos, m.id)).collect()
+    p.s.mobs.list.iter().filter(|m| m.kind == k && !m.removed).map(|m| (m.pos(), m.id)).collect()
 }
 
 fn name_at(p: &Probe, at: [i32; 3]) -> String {
@@ -54,7 +54,7 @@ fn golems_built_from_blocks() {
     eprintln!("iron: {iron:?}");
     assert_eq!(iron.len(), 1, "iron golem not built");
     assert_eq!(iron[0].0, [205.5, -59.0 + 0.05, 210.5]);
-    let g = p.s.mobs.list.iter().flatten().find(|m| m.kind == Kind::IronGolem).unwrap();
+    let g = p.s.mobs.list.iter().find(|m| m.kind == Kind::IronGolem).unwrap();
     assert!(g.golem.player_created);
     for q in [[205, -59, 210], [205, -58, 210], [205, -58, 209], [205, -58, 211], [205, -57, 210]] {
         assert_eq!(name_at(&p, q), "minecraft:air", "{q:?}");
@@ -87,7 +87,7 @@ fn copper_golem_built_with_chest() {
     eprintln!("copper: {cu:?}, block {}", name_at(&p, [220, -59, 212]));
     assert_eq!(cu.len(), 1, "copper golem not built");
     assert_eq!(cu[0].0, [220.5, -58.0 + 0.05, 212.5]);
-    let g = p.s.mobs.list.iter().flatten().find(|m| m.kind == Kind::CopperGolem).unwrap();
+    let g = p.s.mobs.list.iter().find(|m| m.kind == Kind::CopperGolem).unwrap();
     assert_eq!(g.golem.weather, 1);
     assert!(name_at(&p, [220, -59, 212]).starts_with("minecraft:exposed_copper_chest[facing=east,type=single"));
     assert!(p.s.be_get([220, -59, 212]).is_some(), "chest block entity");
@@ -236,7 +236,7 @@ fn prep_golems_world() {
         for w in 0..4 {
             let id = spawn(&mut p, Kind::CopperGolem, [213.5, -59.0, 207.5 + f64::from(w) * 1.6]);
             if let Some(i) = p.s.mob_index(id)
-                && let Some(m) = p.s.mobs.list[i].as_deref_mut()
+                && let Some(m) = p.s.mobs.list.get_mut(i)
             {
                 m.golem.weather = w;
                 m.golem.next_weather = -2;
@@ -248,7 +248,7 @@ fn prep_golems_world() {
                 "setblock 212 -59 216 minecraft:copper_chest[facing=west]\ndata merge block 212 -59 216 {Items:[{Slot:0b,id:\"minecraft:cobblestone\",count:40}]}\nsetblock 216 -59 217 minecraft:chest[facing=west]\n",
             );
         }
-        for m in p.s.mobs.list.iter_mut().flatten() {
+        for m in p.s.mobs.list.iter_mut() {
             m.yaw = 90.0;
             m.body_yaw = 90.0;
             m.head_yaw = 90.0;
@@ -279,7 +279,7 @@ fn golems_saved_and_reloaded() {
     let Some((mut p, dir)) = probe("f06save") else { return };
     let id = spawn(&mut p, Kind::CopperGolem, [210.5, -59.0, 210.5]);
     if let Some(i) = p.s.mob_index(id)
-        && let Some(m) = p.s.mobs.list[i].as_deref_mut()
+        && let Some(m) = p.s.mobs.list.get_mut(i)
     {
         m.golem.weather = 2;
         m.golem.next_weather = -2;
@@ -310,7 +310,7 @@ fn iron_golem_anger_reloaded_keeps_its_target() {
     let cow_uuid = p.s.mob_ref(cow).map(|c| c.uuid).unwrap();
     let time = p.s.time;
     let i = p.s.mob_index(golem).unwrap();
-    let g = p.s.mobs.list[i].as_deref_mut().unwrap();
+    let g = p.s.mobs.list.get_mut(i).unwrap();
     g.golem.angry_at = Some(cow_uuid);
     g.anger_target = Some(Ent::Mob(cow));
     g.anger_end = time + 600;

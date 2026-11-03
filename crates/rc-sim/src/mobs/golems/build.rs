@@ -234,10 +234,10 @@ impl Server {
             self.copper_block_to_chest(&mt, copper, pumpkin);
             let weather = copper_age(self.state_name(copper));
             if let Some(i) = self.mob_index(id) {
-                let mut g = self.mobs.list[i].take().expect("mob");
+                let mut g = self.mobs.list.take(i).expect("mob");
                 g.golem.weather = weather;
                 self.mob_sound(&g, "minecraft:entity.copper_golem.spawn", 1.0, 1.0);
-                self.mobs.list[i] = Some(g);
+                self.mobs.list.put(i, g);
             }
         }
     }

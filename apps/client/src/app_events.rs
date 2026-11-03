@@ -356,7 +356,7 @@ impl App {
                 // is not copied to put the same layers back there.
                 let changed = self.world.touch_light(x, z, &light.sky, &light.block, o.no_copy);
                 if (changed || !o.no_copy)
-                    && let Some(col) = self.world.grid.get_mut(x, z)
+                    && let Some(col) = self.world.grid.get_mut_by(x, z, rc_world::ColumnWriter::LightUpdate)
                 {
                     for (dst, src) in [(&mut col.sky_light, light.sky), (&mut col.block_light, light.block)] {
                         for (d, s) in dst.iter_mut().zip(src) {
@@ -447,14 +447,14 @@ impl App {
                 let (cx, cz) = (pos.x >> 4, pos.z >> 4);
                 let sy = (pos.y - self.world.min_y) >> 4;
                 let idx = rc_world::block_index((pos.x & 15) as usize, (pos.y & 15) as usize, (pos.z & 15) as usize);
-                let relight = self.server_relight(cx, sy, cz);
-                self.update_section_lit(cx, cz, sy, &[(idx as u16, state)], air, relight);
+                let origin = self.server_origin(cx, sy, cz);
+                self.update_section_lit(cx, cz, sy, &[(idx as u16, state)], air, origin);
             }
             Event::SectionUpdate { section, changes } => {
                 let sy = section[1] - (self.world.min_y >> 4);
                 let changes = self.act.filter_section(section, changes);
-                let relight = self.server_relight(section[0], sy, section[2]);
-                self.update_section_lit(section[0], section[2], sy, &changes, air, relight);
+                let origin = self.server_origin(section[0], sy, section[2]);
+                self.update_section_lit(section[0], section[2], sy, &changes, air, origin);
             }
             Event::Teleport(p) => {
                 // Passenger: position ignored, acknowledged with the current position (like the game).

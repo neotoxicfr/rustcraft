@@ -554,7 +554,12 @@ fn parallel_masked_matches_sequential() {
 }
 
 fn ctx(t: &LightTables) -> Ctx<'_> {
-    Ctx { height: 64, t, o: Opts { join_min: 0, par_min: 0, chunk: 64, ..Opts::from_bits(!DEDUP) } }
+    Ctx {
+        height: 64,
+        t,
+        o: Opts { join_min: 0, par_min: 0, chunk: 64, ..Opts::from_bits(!DEDUP) },
+        count_queues: false,
+    }
 }
 
 /// Scheduling: groups 32 blocks apart or more at the same level, overlapping groups
@@ -695,3 +700,4 @@ fn zone_once_off_reads_twice_with_join_and_groups() {
 
 mod bench;
 mod inc;
+mod queue_counters;

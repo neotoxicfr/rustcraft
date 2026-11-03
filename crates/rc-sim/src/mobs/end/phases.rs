@@ -209,7 +209,7 @@ impl Server {
             d.graph.build(|x, z| self.hm_no_leaves(x, z));
         }
         let inner = self.inner_only(d);
-        d.graph.closest(m.pos, inner)
+        d.graph.closest(m.pos(), inner)
     }
 
     fn dragon_closest_node_to(&self, d: &Dragon, t: [f64; 3]) -> usize {
@@ -246,7 +246,7 @@ impl Server {
         if range > 0.0 {
             let modi = self.visibility(Ent::Player, m);
             let vis = (range * modi).max(2.0);
-            if d2(self.pos, m.pos) > vis * vis {
+            if d2(self.pos, m.pos()) > vis * vis {
                 return false;
             }
         }
@@ -296,7 +296,7 @@ impl Server {
                     let e = self.egg_pos(d);
                     d.ph.landing_target = Some([f64::from(e[0]) + 0.5, f64::from(e[1]), f64::from(e[2]) + 0.5]);
                 }
-                if d.ph.landing_target.is_some_and(|t| d2(t, m.pos) < 1.0) {
+                if d.ph.landing_target.is_some_and(|t| d2(t, m.pos()) < 1.0) {
                     d.ph.flame_count = 0;
                     d.set_phase(Phase::SittingScanning);
                 }
@@ -325,7 +325,7 @@ impl Server {
                     }
                     Some(t) => {
                         // Collisions always false: the dragon passes through blocks.
-                        let dd = d2(t, m.pos);
+                        let dd = d2(t, m.pos());
                         if !(100.0..=22_500.0).contains(&dd) {
                             d.ph.charge_time += 1;
                         }
@@ -339,13 +339,13 @@ impl Server {
                     let y = self.hm_motion_blocking(o[0], o[2]);
                     d.ph.death_target = Some([f64::from(o[0]) + 0.5, f64::from(y), f64::from(o[2]) + 0.5]);
                 }
-                let t = d.ph.death_target.unwrap_or(m.pos);
-                let dd = d2(t, m.pos);
+                let t = d.ph.death_target.unwrap_or_else(|| m.pos());
+                let dd = d2(t, m.pos());
                 m.health = if !(100.0..=22_500.0).contains(&dd) { 0.0 } else { 1.0 };
             }
             Phase::Hover => {
                 if d.ph.hover_target.is_none() {
-                    d.ph.hover_target = Some(m.pos);
+                    d.ph.hover_target = Some(m.pos());
                 }
             }
         }
@@ -354,7 +354,7 @@ impl Server {
     // ---------- Circling flight ----------
 
     fn holding_tick(&mut self, m: &mut Mob, d: &mut Dragon) {
-        let dd = d.ph.hold_target.map_or(0.0, |t| d2(t, m.pos));
+        let dd = d.ph.hold_target.map_or(0.0, |t| d2(t, m.pos()));
         if dd < 100.0 || dd > 22_500.0 {
             self.holding_new_target(m, d);
         }
@@ -406,8 +406,8 @@ impl Server {
         let to = self.dragon_closest_node_to(d, tp);
         let fx = tp[0].floor() as i32;
         let fz = tp[2].floor() as i32;
-        let xd = f64::from(fx) - m.pos[0];
-        let zd = f64::from(fz) - m.pos[2];
+        let xd = f64::from(fx) - m.pos()[0];
+        let zd = f64::from(fz) - m.pos()[2];
         let sd = (xd * xd + zd * zd).sqrt();
         let ho = (f64::from(0.4f32) + sd / 80.0 - 1.0).min(10.0);
         let fy = (tp[1] + ho).floor() as i32;
@@ -432,19 +432,19 @@ impl Server {
             return;
         };
         if d.ph.strafe_path.as_ref().is_some_and(Path::is_done) {
-            let (xd, zd) = (tp[0] - m.pos[0], tp[2] - m.pos[2]);
+            let (xd, zd) = (tp[0] - m.pos()[0], tp[2] - m.pos()[2]);
             let dist = (xd * xd + zd * zd).sqrt();
             let ho = (f64::from(0.4f32) + dist / 80.0 - 1.0).min(10.0);
             d.ph.strafe_target = Some([tp[0], tp[1] + ho, tp[2]]);
         }
-        let dd = d.ph.strafe_target.map_or(0.0, |t| d2(t, m.pos));
+        let dd = d.ph.strafe_target.map_or(0.0, |t| d2(t, m.pos()));
         if dd < 100.0 || dd > 22_500.0 {
             self.strafe_new_target(m, d);
         }
-        if d2(tp, m.pos) < 4096.0 {
+        if d2(tp, m.pos()) < 4096.0 {
             if self.line_of_sight(m, target) {
                 d.ph.strafe_charge += 1;
-                let aim = norm([tp[0] - m.pos[0], 0.0, tp[2] - m.pos[2]]);
+                let aim = norm([tp[0] - m.pos()[0], 0.0, tp[2] - m.pos()[2]]);
                 let dir = norm([f64::from(sin(m.yaw * DEG)), 0.0, f64::from(-cos(m.yaw * DEG))]);
                 let dot = (dir[0] * aim[0] + dir[1] * aim[1] + dir[2] * aim[2]) as f32;
                 let angle =
@@ -501,7 +501,7 @@ impl Server {
     // ---------- Approach and takeoff ----------
 
     fn approach_tick(&mut self, m: &mut Mob, d: &mut Dragon) {
-        let dd = d.ph.approach_target.map_or(0.0, |t| d2(t, m.pos));
+        let dd = d.ph.approach_target.map_or(0.0, |t| d2(t, m.pos()));
         if !(dd < 100.0 || dd > 22_500.0) {
             return;
         }
@@ -532,7 +532,7 @@ impl Server {
         if !d.ph.takeoff_first && d.ph.takeoff_path.is_some() {
             let egg = self.egg_pos(d);
             let c = [f64::from(egg[0]) + 0.5, f64::from(egg[1]) + 0.5, f64::from(egg[2]) + 0.5];
-            if d2(c, m.pos) >= 100.0 {
+            if d2(c, m.pos()) >= 100.0 {
                 d.set_phase(Phase::HoldingPattern);
             }
             return;
@@ -559,7 +559,7 @@ impl Server {
         let pitch = if matches!(d.phase, Phase::Landing | Phase::Takeoff) {
             let egg = self.egg_pos(d);
             let c = [f64::from(egg[0]) + 0.5, f64::from(egg[1]) + 0.5, f64::from(egg[2]) + 0.5];
-            let dist = ((d2(c, m.pos).sqrt() as f32) / 4.0).max(1.0);
+            let dist = ((d2(c, m.pos()).sqrt() as f32) / 4.0).max(1.0);
             let y_off = 6.0 / dist;
             -y_off * 1.5 * 5.0
         } else if d.phase.sitting() {
@@ -582,7 +582,7 @@ impl Server {
             }
         } else if d.ph.flame_ticks == 10 {
             let head = d.parts[0];
-            let look = norm([head[0] - m.pos[0], 0.0, head[2] - m.pos[2]]);
+            let look = norm([head[0] - m.pos()[0], 0.0, head[2] - m.pos()[2]]);
             let x = head[0] + look[0] * 5.0 / 2.0;
             let z = head[2] + look[2] * 5.0 / 2.0;
             let initial = head[1] + 0.5;
@@ -604,13 +604,13 @@ impl Server {
 
     fn scanning_tick(&mut self, m: &mut Mob, d: &mut Dragon) {
         d.ph.scan_time += 1;
-        let my = m.pos[1];
+        let my = m.pos()[1];
         let near = self.dragon_target_player(m, 20.0, true, |s| (s.pos[1] - my).abs() <= 10.0);
         if near {
             if d.ph.scan_time > 25 {
                 d.set_phase(Phase::SittingAttacking);
             } else {
-                let aim = norm([self.pos[0] - m.pos[0], 0.0, self.pos[2] - m.pos[2]]);
+                let aim = norm([self.pos[0] - m.pos()[0], 0.0, self.pos[2] - m.pos()[2]]);
                 let dir = norm([f64::from(sin(m.yaw * DEG)), 0.0, f64::from(-cos(m.yaw * DEG))]);
                 let dot = (dir[0] * aim[0] + dir[2] * aim[2]) as f32;
                 let angle =

@@ -5,6 +5,7 @@
 use super::super::jrand::JRand;
 use super::super::mob::{Ent, Mob};
 use super::super::mth::{block_of, dist2};
+use super::super::nav::DrawView;
 use super::super::species::Kind;
 use super::brain::*;
 use crate::player::Stack;
@@ -120,7 +121,7 @@ pub fn age_boundary(m: &mut Mob) {
 /// Baby goat: memories, screaming inherited from a randomly chosen parent
 /// or 2%.
 pub fn offspring(s: &mut Server, m: &mut Mob, partner: i32) -> Mob {
-    let mut baby = s.new_mob(Kind::Goat, m.pos, 0.0);
+    let mut baby = s.new_mob(Kind::Goat, m.pos(), 0.0);
     init_memories(s, &mut baby);
     let pick_me = s.mobs.rng.next_bool();
     let parent_screams = if pick_me { m.bm.screaming } else { s.mob_ref(partner).is_some_and(|p| p.bm.screaming) };
@@ -144,7 +145,7 @@ pub fn long_jump_check(s: &mut Server, m: &mut Mob, b: &mut Brain, j: &mut LongJ
 pub fn long_jump_start(_s: &mut Server, m: &mut Mob, _b: &mut Brain, j: &mut LongJump) {
     j.chosen = None;
     j.tries = 20;
-    j.initial = Some(m.pos);
+    j.initial = Some(m.pos());
     let o = m.block_pos();
     j.candidates.clear();
     // Fastest X first, then y, then z; weight = ⌈distance²⌉.
@@ -168,7 +169,7 @@ pub fn long_jump_start(_s: &mut Server, m: &mut Mob, _b: &mut Brain, j: &mut Lon
 
 pub fn long_jump_continue(s: &mut Server, m: &mut Mob, b: &mut Brain, j: &mut LongJump) -> bool {
     let valid =
-        j.initial == Some(m.pos) && j.tries > 0 && !m.in_water && (j.chosen.is_some() || !j.candidates.is_empty());
+        j.initial == Some(m.pos()) && j.tries > 0 && !m.in_water && (j.chosen.is_some() || !j.candidates.is_empty());
     if !valid && !b.mem.lj_mid.has() {
         let v = j.lo + s.mobs.rng.next_int_bound(j.hi - j.lo + 1);
         b.mem.lj_cd.set(v / 2);
@@ -210,13 +211,18 @@ fn jump_boost(m: &Mob) -> f32 {
 }
 
 fn pick_candidate(s: &mut Server, m: &mut Mob, b: &mut Brain, j: &mut LongJump, t: i64) {
+    let mut view = DrawView::new(s, m);
     while !j.candidates.is_empty() {
         let Some((target, _)) = jump_candidate(s, j) else { continue };
         let o = m.block_pos();
         if o[0] == target[0] && o[2] == target[2] {
             continue;
         }
-        let ok = if j.frog { super::frog::acceptable_landing(s, m, target) } else { default_landing(s, m, target) };
+        let ok = if j.frog {
+            super::frog::acceptable_landing(s, m, &view, target)
+        } else {
+            default_landing(s, m, &view, target)
+        };
         if !ok {
             continue;
         }
@@ -229,6 +235,8 @@ fn pick_candidate(s: &mut Server, m: &mut Mob, b: &mut Brain, j: &mut LongJump, 
             j.prepare_start = t;
             return;
         }
+        // The path request changed the mob's navigation: the next candidate sees it afresh.
+        view = DrawView::new(s, m);
     }
 }
 
@@ -268,10 +276,8 @@ fn weighted_take(s: &mut Server, list: &mut Vec<([i32; 3], i32)>) -> Option<([i3
 }
 
 /// Default landing: block below full as rendered, cell without malus.
-pub fn default_landing(s: &Server, m: &Mob, p: [i32; 3]) -> bool {
-    let view = s.mob_view(m);
-    let t = super::super::nav::static_path_type(s, &view, p);
-    s.solid_render([p[0], p[1] - 1, p[2]]) && super::super::nav::mob_malus(m, t) == 0.0
+pub fn default_landing(s: &Server, m: &Mob, view: &DrawView, p: [i32; 3]) -> bool {
+    s.solid_render([p[0], p[1] - 1, p[2]]) && !view.has_malus(s, m, p)
 }
 
 /// Angles 65/70/75/80 shuffled (own random), speed clamped.
@@ -285,7 +291,7 @@ fn optimal_jump(s: &Server, m: &Mob, j: &mut LongJump, target: [f64; 3]) -> Opti
 /// The jump vector computation for an angle with collision checks along the parabola (box of the
 /// "long jump" pose).
 fn jump_vector(s: &Server, m: &Mob, target: [f64; 3], max_v: f32, angle: i32) -> Option<[f64; 3]> {
-    let p = m.pos;
+    let p = m.pos();
     let plane = crate::mobs::mth::normalize([target[0] - p[0], 0.0, target[2] - p[2]]).map(|v| v * 0.5);
     let tp = [target[0] - plane[0], target[1] - plane[1], target[2] - plane[2]];
     let dir = [tp[0] - p[0], tp[1] - p[1], tp[2] - p[2]];
@@ -364,20 +370,16 @@ fn ram_target_ok(s: &Server, m: &mut Mob, e: Ent) -> bool {
     s.targeting_ok(m, e, true, 0.0, true, true)
 }
 
-fn walkable(s: &Server, m: &Mob, p: [i32; 3]) -> bool {
-    if !s.nav_stable(m, p) {
-        return false;
-    }
-    let view = s.mob_view(m);
-    let t = super::super::nav::static_path_type(s, &view, p);
-    super::super::nav::mob_malus(m, t) == 0.0
+fn walkable(s: &Server, m: &Mob, view: &DrawView, p: [i32; 3]) -> bool {
+    s.nav_stable(m, p) && !view.has_malus(s, m, p)
 }
 
 /// North, east, south, west up to 7 walkable cells; at least
 /// 4 away; the closest reachable one.
 fn ram_start_pos(s: &Server, m: &mut Mob, target: Ent) -> Option<[i32; 3]> {
     let tp = block_of(s.ent_pos(target)?);
-    if !walkable(s, m, tp) {
+    let view = DrawView::new(s, m);
+    if !walkable(s, m, &view, tp) {
         return None;
     }
     let mut cands = Vec::new();
@@ -385,7 +387,7 @@ fn ram_start_pos(s: &Server, m: &mut Mob, target: Ent) -> Option<[i32; 3]> {
         let mut c = tp;
         for _ in 0..7 {
             c = [c[0] + d[0], c[1], c[2] + d[2]];
-            if !walkable(s, m, c) {
+            if !walkable(s, m, &view, c) {
                 c = [c[0] - d[0], c[1], c[2] - d[2]];
                 break;
             }
@@ -475,7 +477,7 @@ pub fn ram_tick(s: &mut Server, m: &mut Mob, b: &mut Brain, dir: [f64; 3]) {
     let bb = m.bbox();
     // Living entities hit (player after the mobs) satisfying the conditions.
     let mut hit: Option<Ent> = None;
-    let ids: Vec<i32> = s.mobs.list.iter().flatten().filter(|o| o.alive() && o.touches(&bb)).map(|o| o.id).collect();
+    let ids: Vec<i32> = s.mobs.list.iter().filter(|o| o.alive() && o.touches(&bb)).map(|o| o.id).collect();
     for id in ids {
         if id != m.id && ram_target_ok(s, m, Ent::Mob(id)) {
             hit = Some(Ent::Mob(id));
@@ -496,17 +498,17 @@ pub fn ram_tick(s: &mut Server, m: &mut Mob, b: &mut Brain, dir: [f64; 3]) {
         let force = if m.is_baby() { 1.0 } else { 2.5 };
         match target {
             Ent::Player => {
-                if s.player_hurt_by_mob(m, ty, dmg, Some((m.pos[0] - s.pos[0], m.pos[2] - s.pos[2]))) {
+                if s.player_hurt_by_mob(m, ty, dmg, Some((m.pos()[0] - s.pos[0], m.pos()[2] - s.pos[2]))) {
                     s.player_thorns(m, ty); // G5-F02d
                 }
                 // W8c: block replayed after the hit (the shield wears down a second time).
-                let blocking = s.reapply_blocking("minecraft:mob_attack", dmg, m.pos);
+                let blocking = s.reapply_blocking("minecraft:mob_attack", dmg, m.pos());
                 let bf = if blocking { 0.5 } else { 1.0 };
                 s.player_knockback(f64::from(bf * factor) * force, dir[0], dir[2]);
             }
             Ent::Mob(id) => {
                 if let Some(i) = s.mob_index(id) {
-                    let mut o = s.mobs.list[i].take().expect("mob");
+                    let mut o = s.mobs.list.take(i).expect("mob");
                     // G5-F04: after-hit effects of the struck mob (thorns), then the goat's weapon.
                     if s.mob_hurt_by(&mut o, m, ty, dmg) {
                         let w = m.equipment[0].clone();
@@ -523,7 +525,7 @@ pub fn ram_tick(s: &mut Server, m: &mut Mob, b: &mut Brain, dir: [f64; 3]) {
                     let by = Some(Ent::Mob(m.id));
                     s.mob_knockback(&mut o, f64::from(factor) * force, dir[0], dir[2], by, dmg, false);
                     s.ghost_pop();
-                    s.mobs.list[i] = Some(o);
+                    s.mobs.list.put(i, o);
                 }
             }
         }
@@ -558,7 +560,7 @@ fn finish_ram(s: &mut Server, m: &mut Mob, b: &mut Brain) {
 fn rammed_horn_block(s: &Server, m: &Mob) -> bool {
     let n = crate::mobs::mth::normalize([m.vel[0], 0.0, m.vel[2]]);
     let n = [n[0], n[2]];
-    let f = block_of([m.pos[0] + n[0], m.pos[1], m.pos[2] + n[1]]);
+    let f = block_of([m.pos()[0] + n[0], m.pos()[1], m.pos()[2] + n[1]]);
     s.btag_id(f, crate::tag_bits::TagId::SnapsGoatHorn) || s.btag_id([f[0], f[1] + 1, f[2]], crate::tag_bits::TagId::SnapsGoatHorn)
 }
 
@@ -583,7 +585,7 @@ fn drop_horn(s: &mut Server, m: &mut Mob) -> bool {
     let dx = f64::from(m.rng.next_float() * 0.4 - 0.2);
     let dy = f64::from(m.rng.next_float() * 0.4 + 0.3);
     let dz = f64::from(m.rng.next_float() * 0.4 - 0.2);
-    s.spawn_item(m.pos, [dx, dy, dz], horn, 10);
+    s.spawn_item(m.pos(), [dx, dy, dz], horn, 10);
     true
 }
 
@@ -623,7 +625,7 @@ pub fn interact(s: &mut Server, m: &mut Mob, slot: usize, item: &str) -> Option<
     if r == Some(true) && s.slots[slot].as_ref().is_some_and(|st| s.item_tag(&st.id, "minecraft:goat_food")) {
         let p = 0.8 + s.mobs.rng.next_float() * 0.4;
         let snd = if m.bm.screaming { "minecraft:entity.goat.screaming.eat" } else { "minecraft:entity.goat.eat" };
-        s.world_sound(snd, 6, m.pos, 1.0, p);
+        s.world_sound(snd, 6, m.pos(), 1.0, p);
     }
     r
 }

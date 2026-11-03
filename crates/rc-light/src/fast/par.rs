@@ -130,13 +130,18 @@ fn pair(
     let t0 = Instant::now();
     let go_b = seed(gr, c, z, blk, lane2, None, None, g, r0b, nyb, false);
     let work: usize = lane2.buckets.iter().enumerate().skip(2).map(|(l, b)| b.len() * l * l * l).sum();
+    let block_seeded = queue_lengths(&lane2.buckets);
     let seeded = t0.elapsed();
     let (ds, db) = if go_b && work > 0 && work >= c.o.join_min {
         both(|| sky_part(gr, c, z, lsky, lane, aux, g), || block_part(c, z, blk, lane2, g, r0b, nyb))
     } else {
         let ds = sky_part(gr, c, z, lsky, lane, aux, g);
-        (ds, if go_b { block_part(c, z, blk, lane2, g, r0b, nyb) } else { Duration::ZERO })
+        (ds, if go_b { block_part(c, z, blk, lane2, g, r0b, nyb) } else { (Duration::ZERO, [0; 16]) })
     };
+    let (db, block_queued) = db;
+    if go_b {
+        count_queues(c, false, &block_seeded, &block_queued, g, nyb);
+    }
     (go_b, seeded + db, ds)
 }
 
@@ -147,15 +152,15 @@ fn sky_part(gr: &impl LightGrid, c: &Ctx, z: &Cells, lsky: &mut [u8], lane: &mut
     t.elapsed()
 }
 
-/// Block propagation of [`pair`], timed.
-fn block_part(c: &Ctx, z: &Cells, blk: &[u8], lane2: &mut Lane, g: Geo, r0b: i32, nyb: i32) -> Duration {
+/// Block propagation of [`pair`], timed, with the entries each level held.
+fn block_part(c: &Ctx, z: &Cells, blk: &[u8], lane2: &mut Lane, g: Geo, r0b: i32, nyb: i32) -> (Duration, LevelCounts) {
     let t = Instant::now();
-    if c.o.par_solve && g.cells() >= c.o.par_min {
-        install(|| spread(c, z, blk, lane2, g, r0b, nyb));
+    let queued = if c.o.par_solve && g.cells() >= c.o.par_min {
+        install(|| spread(c, z, blk, lane2, g, r0b, nyb))
     } else {
-        propagate(c, z, blk, lane2, g, r0b, nyb);
-    }
-    t.elapsed()
+        propagate(c, z, blk, lane2, g, r0b, nyb)
+    };
+    (t.elapsed(), queued)
 }
 
 /// `LIGHTPARSOLVE`: [`compute`] spread over the thread pool.
@@ -180,7 +185,9 @@ pub(super) fn par_compute(
         if !seed(grid, c, z, lay, lane, aux, pre.as_deref(), g, r0, ny, sky) {
             return false;
         }
-        spread(c, z, lay, lane, g, r0, ny);
+        let seeded = queue_lengths(&lane.buckets);
+        let queued = spread(c, z, lay, lane, g, r0, ny);
+        count_queues(c, sky, &seeded, &queued, g, ny);
         true
     })
 }
@@ -262,16 +269,19 @@ fn sources(grid: &impl LightGrid, c: &Ctx, z: &Cells, sg: SecGeo, g: Geo, r0: i3
 
 /// Propagation by synchronous levels (same fixed point as `propagate`): the entries of level
 /// `l` are spread over tasks of `chunk` entries ([`CHUNK`] shipped); a neighbour rises through `fetch_max` and only enters the
-/// queue of its new value (always below `l`) if it really rose.
-fn spread(c: &Ctx, z: &Cells, lay: &[u8], lane: &mut Lane, g: Geo, r0: i32, ny: i32) {
+/// queue of its new value (always below `l`) if it really rose. Returns the entries each level
+/// held when its turn came, like `propagate`.
+fn spread(c: &Ctx, z: &Cells, lay: &[u8], lane: &mut Lane, g: Geo, r0: i32, ny: i32) -> LevelCounts {
     let n = g.cells();
     let Lane { level, buckets, shared, .. } = lane;
     shared.clear();
     shared.extend(level[..n].iter().map(|&v| AtomicU8::new(v)));
     let lv: &[AtomicU8] = shared;
     let step = |e: u64, l: usize, push: &mut dyn FnMut(usize, u64)| spread_one(c, z, lay, lv, g, r0, ny, e, l, push);
+    let mut queued = [0u32; 16];
     for l in (2..16usize).rev() {
         let mut front = std::mem::take(&mut buckets[l]);
+        queued[l] = front.len() as u32;
         let chunk = c.o.chunk.max(1);
         if front.len() <= chunk {
             for &e in &front {
@@ -301,9 +311,11 @@ fn spread(c: &Ctx, z: &Cells, lay: &[u8], lane: &mut Lane, g: Geo, r0: i32, ny: 
         front.clear();
         buckets[l] = front;
     }
+    queued[1] = buckets[1].len() as u32;
     for (d, a) in level[..n].iter_mut().zip(lv) {
         *d = a.load(Relaxed);
     }
+    queued
 }
 
 /// An entry of the queue of level `l` (same neighbours and same rules as `propagate`).

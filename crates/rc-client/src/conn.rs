@@ -1,6 +1,8 @@
 //! Network thread loop. Reads the socket, splits the frames, answers service packets
 //! and publishes the events in order; heavy play-phase packets go
 //! compressed to the pool (decompression + decoding), put back in order by the sequencer.
+//! Which handler reads a packet is decided by `dispatch.rs`; this module holds the handlers,
+//! one per phase, and in play one per group of packets.
 
 use std::io::Read;
 use std::net::TcpStream;
@@ -15,6 +17,11 @@ use rc_proto_v777::chunk::{ChunkContext, read_chunk};
 use rc_proto_v777::config::{DimensionHeight, read_login, read_registry_data, read_spawn_info};
 use rc_proto_v777::play::{self, ChunkBatchRate};
 
+use crate::dispatch::{
+    BorderPacket, ChatPacket, ConfigurationPacket, ContainerPacket, Dispatch, EntityPacket, HudPacket, LoginPacket,
+    PlayPacket, SessionPacket, WorldPacket,
+};
+use crate::extra::{CommonPacket, CommonReplies, Handled};
 use crate::ids::Ids;
 use crate::link::Link;
 use crate::seq::Sequencer;
@@ -26,7 +33,7 @@ const DEFER_FROM: usize = 16 * 1024;
 /// Connection and read timeouts (30 s, like the game).
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Phase {
     Login,
     Configuration,
@@ -70,9 +77,9 @@ pub fn connect(mut cfg: Config, data: Arc<VersionData>) -> Result<Session, Error
     crate::session::start_online_mode();
     let l = link.clone();
     std::thread::Builder::new().name("network".into()).spawn(move || {
-        let mut next = Emit { n: 0, bundle: None, bundled: 0 };
+        let mut out = Emit::new(&seq);
         let mut decoding = None;
-        let r = run(input, &cfg, &l, &d, &seq, &mut next, &mut decoding);
+        let r = run(input, &cfg, &l, &d, &mut out, &mut decoding);
         l.mark_closed();
         crate::session::stop_online_mode(); // block list consulted online only
         let reason = match r {
@@ -86,14 +93,15 @@ pub fn connect(mut cfg: Config, data: Arc<VersionData>) -> Result<Session, Error
             }
         };
         // Bundle not closed at disconnection: never applied.
-        seq.complete(next.n, Event::Disconnected(reason));
+        seq.complete(out.n, Event::Disconnected(reason));
     })?;
     Ok(Session { events: rx, data, link })
 }
 
 /// Numbering of the published events, and open bundle (`bundle_delimiter`,
 /// `protocol-supplements.md` § 1): its events are held then published as one block.
-struct Emit {
+struct Emit<'a> {
+    seq: &'a Arc<Sequencer<Event>>,
     n: u64,
     bundle: Option<Vec<Event>>,
     /// Packets received in the open bundle.
@@ -103,12 +111,16 @@ struct Emit {
 /// Maximum packets in a bundle.
 const BUNDLE_MAX: usize = 4096;
 
-impl Emit {
-    fn push(&mut self, seq: &Sequencer<Event>, e: Event) {
+impl<'a> Emit<'a> {
+    fn new(seq: &'a Arc<Sequencer<Event>>) -> Self {
+        Emit { seq, n: 0, bundle: None, bundled: 0 }
+    }
+
+    fn push(&mut self, e: Event) {
         match &mut self.bundle {
             Some(b) => b.push(e),
             None => {
-                seq.complete(self.n, e);
+                self.seq.complete(self.n, e);
                 self.n += 1;
             }
         }
@@ -119,56 +131,34 @@ fn invalid(e: impl std::fmt::Display) -> Error {
     Error::Invalid(e.to_string())
 }
 
+/// What follows a packet.
+#[derive(Debug, PartialEq)]
+enum Flow {
+    /// Read the next packet.
+    Next,
+    /// End of the session (disconnection by the server, transfer, refused chat), with its reason.
+    End(String),
+}
+
 /// Returns the reason for the end of the session (disconnection by the server or closing).
 fn run(
     mut input: TcpStream,
     cfg: &Config,
     link: &Arc<Link>,
     data: &VersionData,
-    seq: &Arc<Sequencer<Event>>,
-    next: &mut Emit,
+    out: &mut Emit<'_>,
     decoding: &mut Option<(rc_data::Phase, i32)>,
 ) -> Result<String, Error> {
-    use crate::extra::Handled;
-    let ids = link.ids;
+    let use_table = rc_data::opt_switch!("RUSTCRAFT_OPT_CLIENT_PACKET_TABLE");
+    let mut conn = Connection::new(cfg, link, data, use_table, crate::chat_verify::services_keys);
+    conn.greet()?;
+    // Local player of the chat (process-wide), set here rather than in `greet` so that the
+    // replay tests leave it alone.
+    crate::chat::set_local(conn.uuid);
     let mut dec = FrameDecoder::new();
-    let emit = |next: &mut Emit, e: Event| next.push(seq, e);
-    let x = extra_ids(&ids);
-    let dv = crate::misc::ids(&ids);
-    let pg = crate::progress::ids(&ids);
-
-    // Intent 3 for a connection opened by a transfer (§ 10).
-    let intent = if cfg.transfer { 3 } else { 2 };
-    link.send(ids.intention, |w| play::write_handshake(w, rc_proto_v777::PROTOCOL, &cfg.host, cfg.port, intent))?;
-    link.names.set_phase(rc_data::Phase::Login);
-    let uuid = cfg.uuid.unwrap_or_else(|| crate::offline_uuid(&cfg.name));
-    link.send(ids.hello, |w| play::write_hello(w, &cfg.name, uuid))?;
-    crate::chat::set_local(uuid);
-
-    let mut phase = Phase::Login;
-    let mut dims: Vec<Option<DimensionHeight>> = Vec::new();
-    let mut biome_names: Vec<String> = Vec::new();
-    let mut dim_names: Vec<String> = Vec::new();
-    let mut clock_names: Vec<String> = Vec::new();
-    let mut chat_types: Vec<rc_proto_v777::play::Decoration> = Vec::new();
-    let mut chat_index = 0i32;
-    // Known players and validation of their signed messages (`chat_verify.rs`).
-    let mut remote = crate::chat_verify::Remote::new(false, Arc::new(Vec::new()));
-    let names = |r: &str| data.registry(r).map(|r| r.entries.clone()).unwrap_or_default();
-    let items = rc_proto_v777::item::ItemCodec::new(
-        &names("minecraft:data_component_type"),
-        &names("minecraft:consume_effect_type"),
-    );
-    let meta = rc_proto_v777::entity::MetaCodec::new(items.clone(), &names("minecraft:particle_type"));
-    let heavy_items = std::sync::Arc::new(items.clone());
-    let mut ctx: Option<ChunkContext> = None;
-    let mut batch_start = Instant::now();
-    let mut rate = ChunkBatchRate::default();
     // Large blocks: online, an encrypted buffer ≥ 128 KiB is decrypted on the pool.
     let mut buf = vec![0u8; 1024 * 1024];
     let mut packet = Vec::new();
-    let states = data.states.len() as u32;
-
     loop {
         let n = input.read(&mut buf)?;
         if n == 0 {
@@ -179,8 +169,7 @@ fn run(
         loop {
             *decoding = None;
             // In a bundle, everything is decoded inline: the bundle is published as one block.
-            let defer =
-                if phase == Phase::Play && ctx.is_some() && next.bundle.is_none() { DEFER_FROM } else { usize::MAX };
+            let defer = if conn.can_defer() && out.bundle.is_none() { DEFER_FROM } else { usize::MAX };
             let size = match dec.next_or_deferred(&mut packet, defer)? {
                 Next::Pending => break,
                 Next::Ready => None,
@@ -188,826 +177,978 @@ fn run(
             };
             link.stats.received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if let Some(size) = size {
-                // Heavy packet: decompression and decoding on the pool, delivered at its rank.
-                let (s, c, compressed, heavy) = (
-                    next.n,
-                    ctx.expect("context"),
-                    std::mem::take(&mut packet),
-                    (ids.chunk, ids.light_update, ids.commands, ids.map_item_data, ids.recipe_book_add),
-                );
-                let heavy_items = heavy_items.clone();
-                next.n += 1;
-                let (seq, link) = (seq.clone(), link.clone());
-                rayon::spawn(move || {
-                    let mut raw = Vec::new();
-                    let ev = match rc_net::inflate(&compressed, size, &mut raw) {
-                        Err(e) => Event::Disconnected(crate::reason::from_net(&e)),
-                        Ok(()) => decode_heavy(&raw, heavy, &c, &heavy_items),
-                    };
-                    if let Event::Commands(t) = &ev {
-                        link.set_commands(t);
-                    }
-                    // Unreadable packet: end of session, like the game (decoding error).
-                    if matches!(ev, Event::Disconnected(_)) {
-                        link.shutdown();
-                    }
-                    seq.complete(s, ev);
-                });
+                conn.decode_on_pool(std::mem::take(&mut packet), size, out);
                 continue;
             }
-            let mut r = Reader::new(&packet);
-            let id = read_varint(&mut r)?;
-            *decoding = Some((link.names.phase(), id));
-            if crate::protolog::enabled() {
-                link.names.received(id, packet.len());
-            }
-            // Packets common to the phases: cookies, resource packs (immediate replies).
-            let common = match phase {
-                Phase::Login => &x.login,
-                Phase::Configuration => &x.cfg_common,
-                Phase::Play => &x.play_common,
-            };
-            match crate::extra::common(link, common, id, &mut r)? {
-                Handled::No => {}
-                Handled::Event(e) => {
-                    emit(next, e);
-                    continue;
-                }
-                _ => continue,
-            }
-            // Packets specific to the phase (configuration or play) of this module.
-            let own = match phase {
-                Phase::Login => Handled::No,
-                Phase::Configuration => crate::extra::config(&x.cfg, id, &mut r)?,
-                Phase::Play => {
-                    if id == ids.bundle_delimiter {
-                        // Opening or closing of a bundle (§ 1).
-                        match next.bundle.take() {
-                            Some(b) => {
-                                link.names.detail(
-                                    rc_data::Bound::ToClient,
-                                    id,
-                                    &format!("bundle of {} packets", next.bundled),
-                                );
-                                emit(next, Event::Bundle(b));
-                            }
-                            None => (next.bundle, next.bundled) = (Some(Vec::new()), 0),
-                        }
-                        continue;
-                    }
-                    if next.bundle.is_some() {
-                        next.bundled += 1;
-                        if next.bundled > BUNDLE_MAX {
-                            return Err(invalid(format!("bundle of more than {BUNDLE_MAX} packets")));
-                        }
-                        if id == ids.start_configuration {
-                            return Err(invalid("phase change in a bundle"));
-                        }
-                    }
-                    crate::extra::play(link, &x.play, id, &mut r, &meta, ctx.as_ref())?
-                }
-            };
-            // Isolated packets (`misc.rs`).
-            let misc = match (&own, phase) {
-                (Handled::No, Phase::Configuration) => crate::misc::config(&dv, id, &mut r)?,
-                (Handled::No, Phase::Play) => crate::misc::play(&dv, id, &mut r)?,
-                _ => None,
-            };
-            if let Some(e) = misc {
-                if let Some(e) = e {
-                    emit(next, e);
-                }
-                continue;
-            }
-            // Progress and statistics (`progress.rs`).
-            if matches!((&own, phase), (Handled::No, Phase::Play))
-                && let Some(e) = crate::progress::play(&pg, id, &mut r, &items)?
-            {
-                emit(next, e);
-                continue;
-            }
-            match own {
-                Handled::No => {}
-                Handled::Event(e) => {
-                    emit(next, e);
-                    continue;
-                }
-                Handled::Transfer(e) => {
-                    // Nothing is applied after the transfer: the connection is closed and the
-                    // game opens another (cookies carried over).
-                    next.bundle = None;
-                    emit(next, e);
-                    link.shutdown();
-                    return Ok("transfer".into());
-                }
-                Handled::Done => continue,
-            }
-            match phase {
-                Phase::Login => {
-                    if id == ids.login_compression {
-                        let t = read_varint(&mut r)?;
-                        link.set_compression(t);
-                        dec.set_compression_unvalidated(t);
-                    } else if id == ids.login_finished {
-                        emit(next, Event::LoginFinished);
-                        link.send(ids.login_acknowledged, |_| {})?;
-                        phase = Phase::Configuration;
-                        link.names.set_phase(rc_data::Phase::Configuration);
-                        // Client brand, before the client information (§ 13): that of the official game,
-                        // Rustcraft means to be indistinguishable.
-                        link.send(ids.cfg_custom_payload_out, |w| {
-                            rc_proto::write_str(w, "minecraft:brand");
-                            rc_proto::write_str(w, "vanilla");
-                        })?;
-                        let info = cfg.info.clone();
-                        link.send(ids.cfg_client_information, |w| play::write_client_information(w, &info))?;
-                    } else if id == ids.login_encryption_request {
-                        // Online server (`authentication.md` § 2): `join`, then plaintext reply
-                        // and encryption in both directions.
-                        let req = crate::session::read_encryption_request(&mut r)?;
-                        emit(next, Event::LoginStatus("connect.authorizing"));
-                        match crate::session::answer(&req, cfg.token.as_ref(), uuid) {
-                            Ok((body, secret)) => {
-                                emit(next, Event::LoginStatus("connect.encrypting"));
-                                link.send(ids.login_key, |w| w.extend_from_slice(&body))?;
-                                link.enable_encryption(&secret);
-                                dec.enable_encryption(&secret);
-                            }
-                            Err(reason) => {
-                                emit(next, Event::Kicked(reason));
-                                link.shutdown();
-                                return Ok("account login failure".into());
-                            }
-                        }
-                    } else if id == ids.login_custom_query {
-                        // Login plugin request: the game understands no channel and
-                        // always replies "no response" (payload absent), state "negotiating".
-                        let transaction = read_varint(&mut r)?;
-                        let _channel = rc_proto::read_str(&mut r, 32767)?;
-                        if r.remaining() > 1 << 20 {
-                            return Err(invalid("Payload may not be larger than 1048576 bytes"));
-                        }
-                        emit(next, Event::LoginStatus("connect.negotiating"));
-                        link.send(ids.login_custom_query_answer, |w| {
-                            write_varint(w, transaction);
-                            w.push(0);
-                        })?;
-                    } else if id == ids.login_disconnect {
-                        // Reason as JSON during login.
-                        let json = rc_proto::read_str(&mut r, 262_144).unwrap_or("?");
-                        let reason = serde_json::from_str::<serde_json::Value>(json)
-                            .ok()
-                            .and_then(|v| crate::status::json_component(&v));
-                        if let Some(c) = reason {
-                            emit(next, Event::Kicked(Box::new(c)));
-                        }
-                        return Ok(format!("refused: {json}"));
-                    }
-                }
-                Phase::Configuration => {
-                    if id == ids.cfg_select_known_packs {
-                        // Like the official client: the base pack is announced if it matches
-                        // our data (the server then no longer sends the registry content,
-                        // 9.7 KiB instead of 154 KiB). Otherwise empty list: full content.
-                        let offered = read_known_packs(&mut r)?;
-                        let known: Vec<_> = offered
-                            .into_iter()
-                            .filter(|(ns, id, v)| {
-                                ns == "minecraft"
-                                    && id == "core"
-                                    && *v == data.version
-                                    && !data.dimension_types.is_empty()
-                            })
-                            .collect();
-                        link.send(ids.cfg_select_known_packs_out, |w| {
-                            write_varint(w, known.len() as i32);
-                            for (ns, id, v) in &known {
-                                rc_proto::write_str(w, ns);
-                                rc_proto::write_str(w, id);
-                                rc_proto::write_str(w, v);
-                            }
-                        })?;
-                    } else if id == ids.cfg_registry_data {
-                        let reg = read_registry_data(&mut r)?;
-                        match reg.registry.as_str() {
-                            "minecraft:dimension_type" => {
-                                dim_names = reg.entries.iter().map(|(n, _)| n.clone()).collect();
-                                dims = reg
-                                    .entries
-                                    .iter()
-                                    .map(|(name, n)| match n {
-                                        Some(n) => DimensionHeight::from_nbt(n),
-                                        // Content omitted (known pack): height read from our data.
-                                        None => data.dimension_types.iter().find(|t| &t.name == name).map(|t| {
-                                            DimensionHeight {
-                                                min_y: t.min_y,
-                                                height: t.height,
-                                                nether_light: t.nether_light,
-                                            }
-                                        }),
-                                    })
-                                    .collect();
-                            }
-                            "minecraft:worldgen/biome" => {
-                                biome_names = reg.entries.iter().map(|(n, _)| n.clone()).collect();
-                            }
-                            "minecraft:world_clock" => {
-                                clock_names = reg.entries.iter().map(|(n, _)| n.clone()).collect();
-                            }
-                            "minecraft:chat_type" => {
-                                chat_types = reg
-                                    .entries
-                                    .iter()
-                                    .map(|(n, nbt)| crate::chat::chat_type(n, nbt.as_ref()))
-                                    .collect();
-                            }
-                            // Animal variants: order of the network identifiers and optional content.
-                            // Animal variants; enchantments (tooltips, click fingerprints).
-                            // Dialogs (`show_dialog` by identifier).
-                            name if name.ends_with("_variant")
-                                || name == "minecraft:enchantment"
-                                || name == "minecraft:dialog"
-                                || name == "minecraft:banner_pattern"
-                                || name == "minecraft:trim_material"
-                                || name == "minecraft:trim_pattern"
-                                || name == "minecraft:instrument"
-                                || name == "minecraft:jukebox_song"
-                                || name == "minecraft:damage_type"
-                                || name == "minecraft:test_instance" =>
-                            {
-                                emit(next, Event::Registry { name: name.to_owned(), entries: reg.entries });
-                            }
-                            _ => {}
-                        }
-                    } else if id == ids.cfg_keep_alive {
-                        let v = i64::decode(&mut r)?;
-                        link.send(ids.cfg_keep_alive_out, |w| v.encode(w))?;
-                    } else if id == ids.cfg_ping {
-                        let v = i32::decode(&mut r)?;
-                        link.send(ids.cfg_pong, |w| v.encode(w))?;
-                    } else if id == ids.cfg_code_of_conduct {
-                        // Player's reply (screen) or acceptance already remembered: application side,
-                        // `Link::send_accept_code_of_conduct` (the server waits).
-                        emit(next, Event::CodeOfConduct(rc_proto::read_str(&mut r, 32767)?.to_owned()));
-                    } else if id == ids.cfg_finish {
-                        link.send(ids.cfg_finish_out, |_| {})?;
-                        phase = Phase::Play;
-                        link.names.set_phase(rc_data::Phase::Play);
-                    } else if id == ids.cfg_update_tags {
-                        emit(next, Event::Tags(play::read_update_tags(&mut r)?));
-                    } else if id == ids.cfg_custom_payload {
-                        link.stats.custom_payload(&mut r)?;
-                    } else if id == ids.cfg_disconnect {
-                        if let Some(c) = rc_proto::nbt::read(&mut r).ok().flatten().as_ref().and_then(rc_text::from_nbt)
-                        {
-                            emit(next, Event::Kicked(Box::new(c)));
-                        }
-                        return Ok("disconnected during configuration".into());
-                    }
-                }
-                Phase::Play => {
-                    if id == ids.login || id == ids.respawn {
-                        let mut keep = 0u8;
-                        let (dim_type, flat, joined, last_death) = if id == ids.login {
-                            let l = read_login(&mut r)?;
-                            link.set_player_id(l.player_id);
-                            // New play session: chat reset; chat keys requested
-                            // only on an online server (`authentication.md` § 3.2).
-                            chat_index = 0;
-                            remote = crate::chat_verify::Remote::new(
-                                l.enforces_secure_chat,
-                                crate::chat_verify::services_keys(),
-                            );
-                            let generation = link.chat_reset(uuid, l.online_mode, l.enforces_secure_chat);
-                            if l.online_mode
-                                && let Some(t) = &cfg.token
-                            {
-                                crate::signing::spawn_key_task(Arc::downgrade(link), t.clone(), generation);
-                            }
-                            (l.spawn.dimension_type, l.spawn.flat, Some(l), None)
-                        } else {
-                            let s = read_spawn_info(&mut r)?;
-                            keep = r.u8()?;
-                            let death = s.last_death.map(|(d, p)| (d, [p.x, p.y, p.z]));
-                            (s.dimension_type, s.flat, None, death)
-                        };
-                        let dimension = dim_names.get(dim_type as usize).cloned().unwrap_or_default();
-                        let height = dims
-                            .get(dim_type as usize)
-                            .copied()
-                            .flatten()
-                            .ok_or_else(|| invalid(format!("unknown dimension type {dim_type}")))?;
-                        ctx = Some(ChunkContext::new(height.sections(), states, biome_names.len() as u32));
-                        match joined {
-                            Some(login) => emit(
-                                next,
-                                Event::Joined {
-                                    login: Box::new(login),
-                                    height,
-                                    biomes: biome_names.clone(),
-                                    dimension,
-                                    flat,
-                                },
-                            ),
-                            None => emit(next, Event::Respawn { height, dimension, flat, keep, last_death }),
-                        }
-                    } else if id == ids.chunk {
-                        let c = ctx.ok_or_else(|| invalid("chunk before entering the game"))?;
-                        match decode_heavy(
-                            &packet,
-                            (ids.chunk, ids.light_update, ids.commands, ids.map_item_data, ids.recipe_book_add),
-                            &c,
-                            &items,
-                        ) {
-                            Event::Disconnected(reason) => return Ok(reason),
-                            ev => emit(next, ev),
-                        }
-                    } else if id == ids.chunk_batch_start {
-                        batch_start = Instant::now();
-                    } else if id == ids.chunk_batch_finished {
-                        let size = read_varint(&mut r)?;
-                        rate.on_batch(size, batch_start.elapsed().as_nanos() as f64);
-                        let desired = rate.desired_chunks_per_tick();
-                        link.send(ids.chunk_batch_received, |w| desired.encode(w))?;
-                    } else if id == ids.forget_chunk {
-                        let (x, z) = play::read_chunk_pos(&mut r)?;
-                        emit(next, Event::ForgetChunk { x, z });
-                    } else if id == ids.keep_alive {
-                        let v = i64::decode(&mut r)?;
-                        link.send(ids.keep_alive_out, |w| v.encode(w))?;
-                    } else if id == ids.ping {
-                        let v = i32::decode(&mut r)?;
-                        link.send(ids.pong, |w| v.encode(w))?;
-                    } else if id == ids.player_position {
-                        emit(next, Event::Teleport(play::read_player_position(&mut r)?));
-                    } else if id == ids.chunk_center {
-                        let x = read_varint(&mut r)?;
-                        let z = read_varint(&mut r)?;
-                        emit(next, Event::ChunkCenter { x, z });
-                    } else if id == ids.chunk_radius {
-                        emit(next, Event::ViewDistance(read_varint(&mut r)?));
-                    } else if id == ids.block_update {
-                        let (pos, state) = play::read_block_update(&mut r)?;
-                        check_state(state, states)?;
-                        emit(next, Event::BlockUpdate { pos, state });
-                    } else if id == ids.section_update {
-                        let u = play::read_section_update(&mut r)?;
-                        for &(_, state) in &u.changes {
-                            check_state(state, states)?;
-                        }
-                        emit(next, Event::SectionUpdate { section: u.section, changes: u.changes });
-                    } else if id == ids.block_event {
-                        let (pos, b0, b1, block) = play::read_block_event(&mut r)?;
-                        emit(next, Event::BlockEvent { pos: [pos.x, pos.y, pos.z], b0, b1, block });
-                    } else if id == ids.block_entity_data {
-                        let (pos, kind, nbt) = play::read_block_entity_data(&mut r)?;
-                        emit(next, Event::BlockEntityData { pos: [pos.x, pos.y, pos.z], kind, nbt });
-                    } else if id == ids.start_configuration {
-                        link.leave_play()?;
-                        link.send(ids.configuration_acknowledged, |_| {})?;
-                        link.stats.reset_server();
-                        phase = Phase::Configuration;
-                        link.names.set_phase(rc_data::Phase::Configuration);
-                    } else if id == ids.update_tags {
-                        emit(next, Event::Tags(play::read_update_tags(&mut r)?));
-                    } else if id == ids.update_attributes {
-                        let (entity, attributes) = play::read_update_attributes(&mut r)?;
-                        emit(next, Event::Attributes { entity, attributes });
-                    } else if id == ids.set_time {
-                        let (game_time, clocks) = play::read_set_time(&mut r)?;
-                        let clocks = clocks
-                            .into_iter()
-                            .map(|(c, t, p, s)| (clock_names.get(c as usize).cloned().unwrap_or_default(), t, p, s))
-                            .collect();
-                        emit(next, Event::Time { game_time, clocks });
-                    } else if id == ids.system_chat {
-                        let (content, overlay) = play::read_system_chat(&mut r)?;
-                        let c = content
-                            .as_ref()
-                            .and_then(rc_text::from_nbt)
-                            .unwrap_or_else(|| rc_text::Component::text(""));
-                        if overlay {
-                            emit(next, Event::ActionBar(Box::new(c)));
-                        } else if crate::chat::visibility() != 2 && crate::chat::system_message_shown(&c) {
-                            // Chat hidden: even system messages are ignored; guessed sender
-                            // blocked or non-friend: message hidden.
-                            emit(next, Event::Chat { component: Box::new(c), tag: crate::ChatTag::System });
-                        }
-                    } else if id == ids.action_bar {
-                        let c = rc_proto::nbt::read(&mut r)?.as_ref().and_then(rc_text::from_nbt);
-                        emit(next, Event::ActionBar(Box::new(c.unwrap_or_else(|| rc_text::Component::text("")))));
-                    } else if id == ids.player_chat {
-                        let m = play::read_player_chat(&mut r)?;
-                        if m.global_index != chat_index {
-                            return Ok(crate::reason::key("multiplayer.disconnect.bad_chat_index"));
-                        }
-                        chat_index += 1;
-                        // Signature cache and last seen (`chat.md` § 1.7, § 2.4).
-                        let last_seen = match link.chat_unpack(&m) {
-                            Ok(l) => l,
-                            Err(e) => return Ok(e),
-                        };
-                        // Validation (sender's chat session), then display (§ 1.8).
-                        let now = crate::signing::now_ms();
-                        let verdict = remote.validate(&m, &last_seen, now);
-                        // Launcher and account restrictions: multiplayer server only.
-                        let visible = crate::chat::visibility() == 0 && crate::session::player_chat_allowed();
-                        let (line, shown) = crate::chat::player_message(&m, &chat_types, verdict, visible, now);
-                        // Signature kept by the displayed message only if it is signed and
-                        // verified; last seen tracked for any message carrying a signature
-                        // except the accepted unsigned one (signature removed).
-                        let kept = matches!(verdict, crate::chat_verify::Verdict::Accepted { signed: true });
-                        if let Some(s) = &m.signature
-                            && verdict != (crate::chat_verify::Verdict::Accepted { signed: false })
-                            && let Err(e) = link.chat_processed(s, shown && kept)
-                        {
-                            return Ok(e);
-                        }
-                        if let Some(l) = line {
-                            emit(next, Event::Chat { component: Box::new(l.component), tag: l.tag });
-                            if let Some(o) = l.original {
-                                emit(next, Event::ChatOriginal(o));
-                            }
-                            if kept && let Some(s) = m.signature.clone() {
-                                emit(next, Event::ChatSignature(s));
-                            }
-                            // Chat log: shown messages that passed validation (not the error line).
-                            if m.signature.is_some() && matches!(verdict, crate::chat_verify::Verdict::Accepted { .. }) {
-                                emit(next, Event::ChatSender(m.sender));
-                            }
-                        }
-                    } else if id == ids.delete_chat {
-                        let packed = match read_varint(&mut r)? {
-                            0 => Ok(r.take_array()?),
-                            v => Err(v as u32 - 1),
-                        };
-                        match link.chat_deleted(packed) {
-                            Ok(s) => emit(next, Event::DeleteChat(Box::new(s))),
-                            Err(e) => return Ok(e),
-                        }
-                    } else if id == ids.commands {
-                        match commands_event(&mut r) {
-                            Event::Disconnected(reason) => return Ok(reason),
-                            ev => {
-                                if let Event::Commands(t) = &ev {
-                                    link.set_commands(t);
-                                }
-                                emit(next, ev)
-                            }
-                        }
-                    } else if id == ids.command_suggestions {
-                        emit(
-                            next,
-                            Event::CommandSuggestions(rc_proto_v777::commands::read_command_suggestions(&mut r)?),
-                        );
-                    } else if id == ids.custom_chat_completions {
-                        let (action, entries) = rc_proto_v777::commands::read_chat_completions(&mut r)?;
-                        emit(next, Event::ChatCompletions { action, entries });
-                    } else if id == ids.disguised_chat {
-                        let (msg, kind, sender, target) = play::read_disguised_chat(&mut r)?;
-                        let content =
-                            msg.as_ref().and_then(rc_text::from_nbt).unwrap_or_else(|| rc_text::Component::text(""));
-                        let component =
-                            crate::chat::decorate(&kind, &chat_types, content, sender.as_ref(), target.as_ref());
-                        // Like a player message: absent if player chat is off.
-                        if crate::chat::visibility() == 0 && crate::session::player_chat_allowed() {
-                            emit(next, Event::Chat { component: Box::new(component), tag: crate::ChatTag::Disguised });
-                        }
-                    } else if id == ids.light_update {
-                        let c = ctx.ok_or_else(|| invalid("light before entering the game"))?;
-                        let x = read_varint(&mut r)?;
-                        let z = read_varint(&mut r)?;
-                        let light = rc_proto_v777::chunk::read_light(&mut r, c.sections)?;
-                        emit(next, Event::LightUpdate { x, z, light: Box::new(light) });
-                    } else if id == ids.game_event {
-                        let (kind, param) = play::read_game_event(&mut r)?;
-                        emit(next, Event::GameEvent { kind, param });
-                    } else if let Some(read) = border_reader(&ids, id) {
-                        emit(next, Event::Border(read(&mut r)?));
-                    } else if id == ids.player_info_update {
-                        let u = rc_proto_v777::players::read_info_update(&mut r)?;
-                        remote.apply(&u).map_err(invalid)?;
-                        for e in &u.entries {
-                            if let Some((name, _)) = &e.profile {
-                                crate::chat::discover(name, e.uuid);
-                            }
-                        }
-                        emit(next, Event::PlayerInfo(u));
-                    } else if id == ids.set_objective {
-                        emit(next, Event::Score(Box::new(rc_proto_v777::scores::read_set_objective(&mut r)?)));
-                    } else if id == ids.set_display_objective {
-                        emit(next, Event::Score(Box::new(rc_proto_v777::scores::read_display_objective(&mut r)?)));
-                    } else if id == ids.set_score {
-                        emit(next, Event::Score(Box::new(rc_proto_v777::scores::read_set_score(&mut r)?)));
-                    } else if id == ids.reset_score {
-                        emit(next, Event::Score(Box::new(rc_proto_v777::scores::read_reset_score(&mut r)?)));
-                    } else if id == ids.set_player_team {
-                        emit(next, Event::Score(Box::new(rc_proto_v777::scores::read_player_team(&mut r)?)));
-                    } else if id == ids.sound {
-                        emit(next, Event::Sound(play::read_sound(&mut r)?));
-                    } else if id == ids.sound_entity {
-                        emit(next, Event::Sound(play::read_sound_entity(&mut r)?));
-                    } else if id == ids.level_particles {
-                        emit(next, Event::Particles(Box::new(meta.read_level_particles(&mut r)?)));
-                    } else if id == ids.block_changed_ack {
-                        emit(next, Event::BlockChangedAck(read_varint(&mut r)?));
-                    } else if id == ids.block_destruction {
-                        let (id, pos, stage) = rc_proto_v777::interact::read_block_destruction(&mut r)?;
-                        emit(next, Event::BlockDestruction { id, pos, stage });
-                    } else if id == ids.level_event {
-                        let (kind, pos, data, global) = play::read_level_event(&mut r)?;
-                        emit(next, Event::LevelEvent { kind, pos: [pos.x, pos.y, pos.z], data, global });
-                    } else if id == ids.stop_sound {
-                        let (category, name) = play::read_stop_sound(&mut r)?;
-                        emit(next, Event::StopSound { category, name });
-                    } else if id == ids.boss_event {
-                        emit(next, Event::Boss(play::read_boss_event(&mut r)?));
-                    } else if id == ids.waypoint {
-                        emit(next, Event::Waypoint(Box::new(rc_proto_v777::waypoint::read_waypoint(&mut r)?)));
-                    } else if id == ids.map_item_data {
-                        emit(next, Event::MapData(rc_proto_v777::map::read_map_item_data(&mut r)?));
-                    } else if id == ids.set_title_text {
-                        emit(next, Event::Title(rc_proto::nbt::read(&mut r)?));
-                    } else if id == ids.set_subtitle_text {
-                        emit(next, Event::Subtitle(rc_proto::nbt::read(&mut r)?));
-                    } else if id == ids.set_titles_animation {
-                        emit(next, Event::TitleTimes(play::read_titles_animation(&mut r)?));
-                    } else if id == ids.clear_titles {
-                        emit(next, Event::ClearTitles(bool::decode(&mut r)?));
-                    } else if id == ids.tab_list {
-                        let (header, footer) = play::read_tab_list(&mut r)?;
-                        emit(next, Event::TabList { header, footer });
-                    } else if id == ids.player_info_remove {
-                        let gone = rc_proto_v777::players::read_info_remove(&mut r)?;
-                        remote.remove(&gone);
-                        emit(next, Event::PlayersRemoved(gone));
-                    } else if id == ids.cooldown {
-                        // Cooldown group (identifier) then duration in ticks.
-                        let raw = rc_proto::read_str(&mut r, 32767)?;
-                        let group = if raw.contains(':') { raw.to_owned() } else { format!("minecraft:{raw}") };
-                        let ticks = read_varint(&mut r)?;
-                        emit(next, Event::Cooldown { group, ticks });
-                    } else if id == ids.set_health {
-                        let (health, food, saturation) = play::read_set_health(&mut r)?;
-                        emit(next, Event::Health { health, food, saturation });
-                    } else if id == ids.set_experience {
-                        let (progress, level, total) = play::read_set_experience(&mut r)?;
-                        emit(next, Event::Experience { progress, level, total });
-                    } else if id == ids.container_set_content
-                        || id == ids.container_set_slot
-                        || id == ids.set_player_inventory
-                        || id == ids.set_cursor_item
-                    {
-                        let inv = if id == ids.container_set_content {
-                            items.read_content(&mut r)?
-                        } else if id == ids.container_set_slot {
-                            items.read_slot(&mut r)?
-                        } else if id == ids.set_player_inventory {
-                            items.read_player_slot(&mut r)?
-                        } else {
-                            items.read_cursor(&mut r)?
-                        };
-                        // No byte must remain: a badly read component shows up right away.
-                        r.finish()?;
-                        emit(next, Event::Inventory(inv));
-                    } else if id == ids.recipe_book_add
-                        || id == ids.recipe_book_remove
-                        || id == ids.recipe_book_settings
-                        || id == ids.place_ghost_recipe
-                    {
-                        let ev = if id == ids.recipe_book_add {
-                            crate::recipes::read_add(&mut r, &items)?
-                        } else if id == ids.recipe_book_remove {
-                            crate::recipes::read_remove(&mut r)?
-                        } else if id == ids.recipe_book_settings {
-                            crate::recipes::read_settings(&mut r)?
-                        } else {
-                            crate::recipes::read_ghost(&mut r, &items)?
-                        };
-                        r.finish()?;
-                        emit(next, Event::Recipes(ev));
-                    } else if id == ids.open_screen {
-                        let (window, kind, title) = rc_proto_v777::container::read_open_screen(&mut r)?;
-                        let title = title.as_ref().and_then(rc_text::from_nbt).map(Box::new);
-                        emit(next, Event::OpenScreen { window, kind, title });
-                    } else if id == ids.merchant_offers {
-                        let o = rc_proto_v777::special::read_merchant_offers(&items, &mut r)?;
-                        emit(next, Event::MerchantOffers(Box::new(o)));
-                    } else if id == ids.update_recipes {
-                        let rec = rc_proto_v777::special::read_update_recipes(&items, &mut r)?;
-                        emit(next, Event::UpdateRecipes(Box::new(rec)));
-                    } else if id == ids.mount_screen_open {
-                        let (window, columns, entity) = rc_proto_v777::special::read_mount_screen_open(&mut r)?;
-                        emit(next, Event::MountScreen { window, columns, entity });
-                    } else if id == ids.open_book {
-                        emit(next, Event::OpenBook(read_varint(&mut r)?));
-                    } else if id == ids.open_sign_editor {
-                        let (p, front) = rc_proto_v777::special::read_open_sign_editor(&mut r)?;
-                        emit(next, Event::OpenSignEditor { pos: [p.x, p.y, p.z], front });
-                    } else if id == ids.tag_query {
-                        let transaction = read_varint(&mut r)?;
-                        let nbt = rc_proto::nbt::read(&mut r)?;
-                        emit(next, Event::TagQuery { id: transaction, nbt });
-                    } else if id == ids.test_instance_block_status {
-                        let status = rc_proto::nbt::read(&mut r)?.as_ref().and_then(rc_text::from_nbt).map(Box::new);
-                        let size = if bool::decode(&mut r)? {
-                            Some([read_varint(&mut r)?, read_varint(&mut r)?, read_varint(&mut r)?])
-                        } else {
-                            None
-                        };
-                        emit(next, Event::TestInstanceStatus { status, size });
-                    } else if id == ids.game_test_highlight_pos {
-                        emit(next, read_game_test_highlight(&mut r)?);
-                    } else if id == ids.container_close {
-                        read_varint(&mut r)?;
-                        emit(next, Event::ContainerClosed);
-                    } else if id == ids.container_set_data {
-                        let (window, prop, value) = rc_proto_v777::container::read_set_data(&mut r)?;
-                        emit(next, Event::ContainerData { window, prop, value });
-                    } else if let Some(ev) = entity_packet(id, &ids, &meta, &mut r)? {
-                        emit(next, Event::Entity(ev));
-                    } else if id == ids.spawn_position {
-                        let (dimension, pos, _, _) = play::read_spawn_position(&mut r)?;
-                        emit(next, Event::SpawnPosition { dimension, pos: [pos.x, pos.y, pos.z] });
-                    } else if id == ids.player_combat_kill {
-                        let entity = read_varint(&mut r)?;
-                        let message = rc_proto::nbt::read(&mut r)?.as_ref().and_then(rc_text::from_nbt).map(Box::new);
-                        emit(next, Event::Died { entity, message });
-                    } else if id == ids.set_held_slot {
-                        emit(next, Event::HeldSlot(read_varint(&mut r)?));
-                    } else if id == ids.abilities {
-                        emit(next, Event::Abilities(play::read_abilities(&mut r)?));
-                    } else if id == ids.custom_payload {
-                        link.stats.custom_payload(&mut r)?;
-                    } else if id == ids.pong_response {
-                        link.stats.pong(&mut r)?;
-                    } else if id == ids.ticking_state {
-                        link.stats.ticking_state(&mut r)?;
-                    } else if id == ids.ticking_step {
-                        link.stats.ticking_step(&mut r)?;
-                    } else if id == ids.debug_sample {
-                        link.stats.debug_sample(&mut r)?;
-                    } else if id == ids.disconnect {
-                        let reason = rc_proto::nbt::read(&mut r).ok().flatten();
-                        if let Some(c) = reason.as_ref().and_then(rc_text::from_nbt) {
-                            emit(next, Event::Kicked(Box::new(c)));
-                        }
-                        return Ok(format!("disconnected by the server: {reason:?}"));
-                    }
-                }
+            if let Flow::End(reason) = conn.handle(&packet, out, &mut dec, decoding)? {
+                return Ok(reason);
             }
         }
     }
 }
 
-/// Entity packets (`entities.md` part 1); `None` if `id` is not one.
+/// State of the network thread for one connection: what the configuration taught (registries,
+/// dimension heights, chat types), the chat state and the decoders of the play phase.
+struct Connection<'a> {
+    cfg: &'a Config,
+    link: &'a Arc<Link>,
+    dispatch: Dispatch,
+    progress: crate::progress::ProgressIds,
+    /// Key set of the services for the chat sessions (`chat_verify::services_keys`).
+    services_keys: fn() -> Arc<Vec<Vec<u8>>>,
+    phase: Phase,
+    uuid: u128,
+    dims: Vec<Option<DimensionHeight>>,
+    dim_names: Vec<String>,
+    biome_names: Vec<String>,
+    clock_names: Vec<String>,
+    chat_types: Vec<rc_proto_v777::play::Decoration>,
+    chat_index: i32,
+    /// Known players and validation of their signed messages (`chat_verify.rs`).
+    remote: crate::chat_verify::Remote,
+    items: rc_proto_v777::item::ItemCodec,
+    meta: rc_proto_v777::entity::MetaCodec,
+    /// Item codec handed to the pool's decodings.
+    heavy_items: Arc<rc_proto_v777::item::ItemCodec>,
+    ctx: Option<ChunkContext>,
+    batch_start: Instant,
+    rate: ChunkBatchRate,
+    states: u32,
+    /// Known packs: the version, and whether our data holds the dimension types.
+    version: &'a str,
+    dimension_types: &'a [rc_data::DimensionType],
+}
+
+impl<'a> Connection<'a> {
+    fn new(
+        cfg: &'a Config,
+        link: &'a Arc<Link>,
+        data: &'a VersionData,
+        use_table: bool,
+        services_keys: fn() -> Arc<Vec<Vec<u8>>>,
+    ) -> Self {
+        let names = |r: &str| data.registry(r).map(|r| r.entries.clone()).unwrap_or_default();
+        let items = rc_proto_v777::item::ItemCodec::new(
+            &names("minecraft:data_component_type"),
+            &names("minecraft:consume_effect_type"),
+        );
+        let meta = rc_proto_v777::entity::MetaCodec::new(items.clone(), &names("minecraft:particle_type"));
+        Connection {
+            cfg,
+            link,
+            dispatch: Dispatch::new(&link.ids, use_table),
+            progress: crate::progress::ids(&link.ids),
+            services_keys,
+            phase: Phase::Login,
+            uuid: cfg.uuid.unwrap_or_else(|| crate::offline_uuid(&cfg.name)),
+            dims: Vec::new(),
+            dim_names: Vec::new(),
+            biome_names: Vec::new(),
+            clock_names: Vec::new(),
+            chat_types: Vec::new(),
+            chat_index: 0,
+            remote: crate::chat_verify::Remote::new(false, Arc::new(Vec::new())),
+            heavy_items: Arc::new(items.clone()),
+            items,
+            meta,
+            ctx: None,
+            batch_start: Instant::now(),
+            rate: ChunkBatchRate::default(),
+            states: data.states.len() as u32,
+            version: &data.version,
+            dimension_types: &data.dimension_types,
+        }
+    }
+
+    /// Handshake then login request.
+    fn greet(&self) -> Result<(), Error> {
+        let (cfg, link) = (self.cfg, self.link);
+        // Intent 3 for a connection opened by a transfer (§ 10).
+        let intent = if cfg.transfer { 3 } else { 2 };
+        link.send(link.ids.intention, |w| {
+            play::write_handshake(w, rc_proto_v777::PROTOCOL, &cfg.host, cfg.port, intent)
+        })?;
+        link.names.set_phase(rc_data::Phase::Login);
+        link.send(link.ids.hello, |w| play::write_hello(w, &cfg.name, self.uuid))?;
+        Ok(())
+    }
+
+    /// Heavy packets may be decoded on the pool once in play with a world entered.
+    fn can_defer(&self) -> bool {
+        self.phase == Phase::Play && self.ctx.is_some()
+    }
+
+    /// Identifiers of the packets `decode_heavy` reads.
+    fn heavy_ids(&self) -> (i32, i32, i32, i32, i32) {
+        let ids = &self.link.ids;
+        (ids.chunk, ids.light_update, ids.commands, ids.map_item_data, ids.recipe_book_add)
+    }
+
+    /// Heavy packet: decompression and decoding on the pool, delivered at its rank.
+    fn decode_on_pool(&self, compressed: Vec<u8>, size: usize, out: &mut Emit<'_>) {
+        let (s, c, heavy) = (out.n, self.ctx.expect("context"), self.heavy_ids());
+        out.n += 1;
+        let heavy_items = self.heavy_items.clone();
+        let (seq, link) = (out.seq.clone(), self.link.clone());
+        rayon::spawn(move || {
+            let mut raw = Vec::new();
+            let ev = match rc_net::inflate(&compressed, size, &mut raw) {
+                Err(e) => Event::Disconnected(crate::reason::from_net(&e)),
+                Ok(()) => decode_heavy(&raw, heavy, &c, &heavy_items),
+            };
+            if let Event::Commands(t) = &ev {
+                link.set_commands(t);
+            }
+            // Unreadable packet: end of session, like the game (decoding error).
+            if matches!(ev, Event::Disconnected(_)) {
+                link.shutdown();
+            }
+            seq.complete(s, ev);
+        });
+    }
+
+    /// One packet (identifier then body, decompressed), read inline.
+    fn handle(
+        &mut self,
+        packet: &[u8],
+        out: &mut Emit<'_>,
+        dec: &mut FrameDecoder,
+        decoding: &mut Option<(rc_data::Phase, i32)>,
+    ) -> Result<Flow, Error> {
+        let mut r = Reader::new(packet);
+        let id = read_varint(&mut r)?;
+        *decoding = Some((self.link.names.phase(), id));
+        if crate::protolog::enabled() {
+            self.link.names.received(id, packet.len());
+        }
+        match self.phase {
+            Phase::Login => {
+                let kind = self.dispatch.login.get(id);
+                self.login_packet(kind, id, &mut r, out, dec)
+            }
+            Phase::Configuration => {
+                let kind = self.dispatch.configuration.get(id);
+                self.configuration_packet(kind, id, &mut r, out)
+            }
+            Phase::Play => {
+                let kind = self.dispatch.play.get(id);
+                self.play_packet(kind, id, packet, &mut r, out)
+            }
+        }
+    }
+
+    /// Replies of the cookies and resource packs, in the current phase.
+    fn common_replies(&self) -> CommonReplies {
+        let ids = &self.link.ids;
+        match self.phase {
+            Phase::Login => CommonReplies { cookie_response: ids.login_cookie_response, pack_out: -1 },
+            Phase::Configuration => {
+                CommonReplies { cookie_response: ids.cfg_cookie_response, pack_out: ids.cfg_resource_pack_out }
+            }
+            Phase::Play => CommonReplies { cookie_response: ids.cookie_response, pack_out: ids.resource_pack_out },
+        }
+    }
+
+    /// Packets common to the phases: cookies, resource packs (immediate replies).
+    fn common_packet(
+        &self,
+        packet: CommonPacket,
+        id: i32,
+        r: &mut Reader<'_>,
+        out: &mut Emit<'_>,
+    ) -> Result<Flow, Error> {
+        if let Handled::Event(e) = crate::extra::common(self.link, &self.common_replies(), packet, id, r)? {
+            out.push(e);
+        }
+        Ok(Flow::Next)
+    }
+
+    /// Result of a packet of `extra.rs` (configuration or play).
+    fn extra_outcome(&self, handled: Handled, out: &mut Emit<'_>) -> Flow {
+        match handled {
+            Handled::Done => Flow::Next,
+            Handled::Event(e) => {
+                out.push(e);
+                Flow::Next
+            }
+            Handled::Transfer(e) => {
+                // Nothing is applied after the transfer: the connection is closed and the
+                // game opens another (cookies carried over).
+                out.bundle = None;
+                out.push(e);
+                self.link.shutdown();
+                Flow::End("transfer".into())
+            }
+        }
+    }
+
+    // ---------- Login ----------
+
+    fn login_packet(
+        &mut self,
+        packet: LoginPacket,
+        id: i32,
+        r: &mut Reader<'_>,
+        out: &mut Emit<'_>,
+        dec: &mut FrameDecoder,
+    ) -> Result<Flow, Error> {
+        let (cfg, link) = (self.cfg, self.link);
+        let ids = &link.ids;
+        match packet {
+            LoginPacket::Common(c) => return self.common_packet(c, id, r, out),
+            LoginPacket::Compression => {
+                let t = read_varint(r)?;
+                link.set_compression(t);
+                dec.set_compression_unvalidated(t);
+            }
+            LoginPacket::Finished => {
+                out.push(Event::LoginFinished);
+                link.send(ids.login_acknowledged, |_| {})?;
+                self.phase = Phase::Configuration;
+                link.names.set_phase(rc_data::Phase::Configuration);
+                // Client brand, before the client information (§ 13): that of the official game,
+                // Rustcraft means to be indistinguishable.
+                link.send(ids.cfg_custom_payload_out, |w| {
+                    rc_proto::write_str(w, "minecraft:brand");
+                    rc_proto::write_str(w, "vanilla");
+                })?;
+                link.send(ids.cfg_client_information, |w| play::write_client_information(w, &cfg.info))?;
+            }
+            LoginPacket::EncryptionRequest => {
+                // Online server (`authentication.md` § 2): `join`, then plaintext reply
+                // and encryption in both directions.
+                let req = crate::session::read_encryption_request(r)?;
+                out.push(Event::LoginStatus("connect.authorizing"));
+                match crate::session::answer(&req, cfg.token.as_ref(), self.uuid) {
+                    Ok((body, secret)) => {
+                        out.push(Event::LoginStatus("connect.encrypting"));
+                        link.send(ids.login_key, |w| w.extend_from_slice(&body))?;
+                        link.enable_encryption(&secret);
+                        dec.enable_encryption(&secret);
+                    }
+                    Err(reason) => {
+                        out.push(Event::Kicked(reason));
+                        link.shutdown();
+                        return Ok(Flow::End("account login failure".into()));
+                    }
+                }
+            }
+            LoginPacket::CustomQuery => {
+                // Login plugin request: the game understands no channel and
+                // always replies "no response" (payload absent), state "negotiating".
+                let transaction = read_varint(r)?;
+                let _channel = rc_proto::read_str(r, 32767)?;
+                if r.remaining() > 1 << 20 {
+                    return Err(invalid("Payload may not be larger than 1048576 bytes"));
+                }
+                out.push(Event::LoginStatus("connect.negotiating"));
+                link.send(ids.login_custom_query_answer, |w| {
+                    write_varint(w, transaction);
+                    w.push(0);
+                })?;
+            }
+            LoginPacket::Disconnect => {
+                // Reason as JSON during login.
+                let json = rc_proto::read_str(r, 262_144).unwrap_or("?");
+                let reason = serde_json::from_str::<serde_json::Value>(json)
+                    .ok()
+                    .and_then(|v| crate::status::json_component(&v));
+                if let Some(c) = reason {
+                    out.push(Event::Kicked(Box::new(c)));
+                }
+                return Ok(Flow::End(format!("refused: {json}")));
+            }
+            LoginPacket::Ignored => {}
+        }
+        Ok(Flow::Next)
+    }
+
+    // ---------- Configuration ----------
+
+    fn configuration_packet(
+        &mut self,
+        packet: ConfigurationPacket,
+        id: i32,
+        r: &mut Reader<'_>,
+        out: &mut Emit<'_>,
+    ) -> Result<Flow, Error> {
+        use ConfigurationPacket as C;
+        let link = self.link;
+        let ids = &link.ids;
+        match packet {
+            C::Common(c) => return self.common_packet(c, id, r, out),
+            C::Extra(e) => return Ok(self.extra_outcome(crate::extra::config(e, r)?, out)),
+            C::PostEffects => crate::misc::config_post_effects(r)?,
+            C::SelectKnownPacks => self.select_known_packs(r)?,
+            C::RegistryData => self.registry_data(r, out)?,
+            C::KeepAlive => {
+                let v = i64::decode(r)?;
+                link.send(ids.cfg_keep_alive_out, |w| v.encode(w))?;
+            }
+            C::Ping => {
+                let v = i32::decode(r)?;
+                link.send(ids.cfg_pong, |w| v.encode(w))?;
+            }
+            // Player's reply (screen) or acceptance already remembered: application side,
+            // `Link::send_accept_code_of_conduct` (the server waits).
+            C::CodeOfConduct => out.push(Event::CodeOfConduct(rc_proto::read_str(r, 32767)?.to_owned())),
+            C::Finish => {
+                link.send(ids.cfg_finish_out, |_| {})?;
+                self.phase = Phase::Play;
+                link.names.set_phase(rc_data::Phase::Play);
+            }
+            C::Tags => out.push(Event::Tags(play::read_update_tags(r)?)),
+            C::CustomPayload => link.stats.custom_payload(r)?,
+            C::Disconnect => {
+                if let Some(c) = rc_proto::nbt::read(r).ok().flatten().as_ref().and_then(rc_text::from_nbt) {
+                    out.push(Event::Kicked(Box::new(c)));
+                }
+                return Ok(Flow::End("disconnected during configuration".into()));
+            }
+            C::Ignored => {}
+        }
+        Ok(Flow::Next)
+    }
+
+    /// Like the official client: the base pack is announced if it matches our data (the
+    /// server then no longer sends the registry content, 9.7 KiB instead of 154 KiB).
+    /// Otherwise empty list: full content.
+    fn select_known_packs(&self, r: &mut Reader<'_>) -> Result<(), Error> {
+        let offered = read_known_packs(r)?;
+        let known: Vec<_> = offered
+            .into_iter()
+            .filter(|(ns, id, v)| {
+                ns == "minecraft" && id == "core" && v == self.version && !self.dimension_types.is_empty()
+            })
+            .collect();
+        self.link.send(self.link.ids.cfg_select_known_packs_out, |w| {
+            write_varint(w, known.len() as i32);
+            for (ns, id, v) in &known {
+                rc_proto::write_str(w, ns);
+                rc_proto::write_str(w, id);
+                rc_proto::write_str(w, v);
+            }
+        })?;
+        Ok(())
+    }
+
+    fn registry_data(&mut self, r: &mut Reader<'_>, out: &mut Emit<'_>) -> Result<(), Error> {
+        let reg = read_registry_data(r)?;
+        match reg.registry.as_str() {
+            "minecraft:dimension_type" => {
+                self.dim_names = reg.entries.iter().map(|(n, _)| n.clone()).collect();
+                let types = self.dimension_types;
+                self.dims = reg
+                    .entries
+                    .iter()
+                    .map(|(name, n)| match n {
+                        Some(n) => DimensionHeight::from_nbt(n),
+                        // Content omitted (known pack): height read from our data.
+                        None => types.iter().find(|t| &t.name == name).map(|t| DimensionHeight {
+                            min_y: t.min_y,
+                            height: t.height,
+                            nether_light: t.nether_light,
+                        }),
+                    })
+                    .collect();
+            }
+            "minecraft:worldgen/biome" => {
+                self.biome_names = reg.entries.iter().map(|(n, _)| n.clone()).collect();
+            }
+            "minecraft:world_clock" => {
+                self.clock_names = reg.entries.iter().map(|(n, _)| n.clone()).collect();
+            }
+            "minecraft:chat_type" => {
+                self.chat_types = reg.entries.iter().map(|(n, nbt)| crate::chat::chat_type(n, nbt.as_ref())).collect();
+            }
+            // Animal variants: order of the network identifiers and optional content.
+            // Animal variants; enchantments (tooltips, click fingerprints).
+            // Dialogs (`show_dialog` by identifier).
+            name if name.ends_with("_variant")
+                || name == "minecraft:enchantment"
+                || name == "minecraft:dialog"
+                || name == "minecraft:banner_pattern"
+                || name == "minecraft:trim_material"
+                || name == "minecraft:trim_pattern"
+                || name == "minecraft:instrument"
+                || name == "minecraft:jukebox_song"
+                || name == "minecraft:damage_type"
+                || name == "minecraft:test_instance" =>
+            {
+                out.push(Event::Registry { name: name.to_owned(), entries: reg.entries });
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    // ---------- Play ----------
+
+    fn play_packet(
+        &mut self,
+        packet: PlayPacket,
+        id: i32,
+        raw: &[u8],
+        r: &mut Reader<'_>,
+        out: &mut Emit<'_>,
+    ) -> Result<Flow, Error> {
+        match packet {
+            PlayPacket::Common(c) => return self.common_packet(c, id, r, out),
+            PlayPacket::BundleDelimiter => {
+                self.bundle_delimiter(id, out);
+                return Ok(Flow::Next);
+            }
+            _ => {}
+        }
+        if out.bundle.is_some() {
+            out.bundled += 1;
+            if out.bundled > BUNDLE_MAX {
+                return Err(invalid(format!("bundle of more than {BUNDLE_MAX} packets")));
+            }
+            if id == self.link.ids.start_configuration {
+                return Err(invalid("phase change in a bundle"));
+            }
+        }
+        match packet {
+            PlayPacket::Extra(e) => {
+                let handled = crate::extra::play(self.link, e, r, &self.meta, self.ctx.as_ref())?;
+                Ok(self.extra_outcome(handled, out))
+            }
+            PlayPacket::Misc(m) => {
+                if let Some(e) = crate::misc::play(m, r)? {
+                    out.push(e);
+                }
+                Ok(Flow::Next)
+            }
+            PlayPacket::Progress => {
+                if let Some(e) = crate::progress::play(&self.progress, id, r, &self.items)? {
+                    out.push(e);
+                }
+                Ok(Flow::Next)
+            }
+            PlayPacket::Session(s) => self.session_packet(s, r, out),
+            PlayPacket::World(w) => self.world_packet(w, raw, r, out),
+            PlayPacket::Chat(c) => self.chat_packet(c, r, out),
+            PlayPacket::Hud(h) => self.hud_packet(h, r, out).map(|()| Flow::Next),
+            PlayPacket::Container(c) => self.container_packet(c, r, out).map(|()| Flow::Next),
+            PlayPacket::Entity(e) => {
+                out.push(Event::Entity(entity_packet(e, &self.meta, r)?));
+                Ok(Flow::Next)
+            }
+            PlayPacket::Common(_) | PlayPacket::BundleDelimiter | PlayPacket::Ignored => Ok(Flow::Next),
+        }
+    }
+
+    /// Opening or closing of a bundle (§ 1).
+    fn bundle_delimiter(&self, id: i32, out: &mut Emit<'_>) {
+        match out.bundle.take() {
+            Some(b) => {
+                let bundled = out.bundled;
+                self.link.names.detail_with(rc_data::Bound::ToClient, id, || format!("bundle of {bundled} packets"));
+                out.push(Event::Bundle(b));
+            }
+            None => (out.bundle, out.bundled) = (Some(Vec::new()), 0),
+        }
+    }
+
+    fn session_packet(&mut self, packet: SessionPacket, r: &mut Reader<'_>, out: &mut Emit<'_>) -> Result<Flow, Error> {
+        let link = self.link;
+        let ids = &link.ids;
+        match packet {
+            SessionPacket::Login => self.enter_world(true, r, out)?,
+            SessionPacket::Respawn => self.enter_world(false, r, out)?,
+            SessionPacket::KeepAlive => {
+                let v = i64::decode(r)?;
+                link.send(ids.keep_alive_out, |w| v.encode(w))?;
+            }
+            SessionPacket::Ping => {
+                let v = i32::decode(r)?;
+                link.send(ids.pong, |w| v.encode(w))?;
+            }
+            SessionPacket::StartConfiguration => {
+                link.leave_play()?;
+                link.send(ids.configuration_acknowledged, |_| {})?;
+                link.stats.reset_server();
+                self.phase = Phase::Configuration;
+                link.names.set_phase(rc_data::Phase::Configuration);
+            }
+            SessionPacket::Tags => out.push(Event::Tags(play::read_update_tags(r)?)),
+            SessionPacket::CustomPayload => link.stats.custom_payload(r)?,
+            SessionPacket::PongResponse => link.stats.pong(r)?,
+            SessionPacket::DebugSample => link.stats.debug_sample(r)?,
+            SessionPacket::Disconnect => {
+                let reason = rc_proto::nbt::read(r).ok().flatten();
+                if let Some(c) = reason.as_ref().and_then(rc_text::from_nbt) {
+                    out.push(Event::Kicked(Box::new(c)));
+                }
+                return Ok(Flow::End(format!("disconnected by the server: {reason:?}")));
+            }
+        }
+        Ok(Flow::Next)
+    }
+
+    /// `login` (`first`) or `respawn`: dimension of the new world and context of its chunks.
+    fn enter_world(&mut self, first: bool, r: &mut Reader<'_>, out: &mut Emit<'_>) -> Result<(), Error> {
+        let link = self.link;
+        let mut keep = 0u8;
+        let (dim_type, flat, joined, last_death) = if first {
+            let l = read_login(r)?;
+            link.set_player_id(l.player_id);
+            // New play session: chat reset; chat keys requested
+            // only on an online server (`authentication.md` § 3.2).
+            self.chat_index = 0;
+            self.remote = crate::chat_verify::Remote::new(l.enforces_secure_chat, (self.services_keys)());
+            let generation = link.chat_reset(self.uuid, l.online_mode, l.enforces_secure_chat);
+            if l.online_mode
+                && let Some(t) = &self.cfg.token
+            {
+                crate::signing::spawn_key_task(Arc::downgrade(link), t.clone(), generation);
+            }
+            (l.spawn.dimension_type, l.spawn.flat, Some(l), None)
+        } else {
+            let s = read_spawn_info(r)?;
+            keep = r.u8()?;
+            let death = s.last_death.map(|(d, p)| (d, [p.x, p.y, p.z]));
+            (s.dimension_type, s.flat, None, death)
+        };
+        let dimension = self.dim_names.get(dim_type as usize).cloned().unwrap_or_default();
+        let height = self
+            .dims
+            .get(dim_type as usize)
+            .copied()
+            .flatten()
+            .ok_or_else(|| invalid(format!("unknown dimension type {dim_type}")))?;
+        self.ctx = Some(ChunkContext::new(height.sections(), self.states, self.biome_names.len() as u32));
+        out.push(match joined {
+            Some(login) => {
+                Event::Joined { login: Box::new(login), height, biomes: self.biome_names.clone(), dimension, flat }
+            }
+            None => Event::Respawn { height, dimension, flat, keep, last_death },
+        });
+        Ok(())
+    }
+
+    fn world_packet(
+        &mut self,
+        packet: WorldPacket,
+        raw: &[u8],
+        r: &mut Reader<'_>,
+        out: &mut Emit<'_>,
+    ) -> Result<Flow, Error> {
+        use WorldPacket as W;
+        let event = match packet {
+            W::Chunk => {
+                let c = self.ctx.ok_or_else(|| invalid("chunk before entering the game"))?;
+                match decode_heavy(raw, self.heavy_ids(), &c, &self.items) {
+                    Event::Disconnected(reason) => return Ok(Flow::End(reason)),
+                    ev => ev,
+                }
+            }
+            W::ChunkBatchStart => {
+                self.batch_start = Instant::now();
+                return Ok(Flow::Next);
+            }
+            W::ChunkBatchFinished => {
+                let size = read_varint(r)?;
+                self.rate.on_batch(size, self.batch_start.elapsed().as_nanos() as f64);
+                let desired = self.rate.desired_chunks_per_tick();
+                self.link.send(self.link.ids.chunk_batch_received, |w| desired.encode(w))?;
+                return Ok(Flow::Next);
+            }
+            W::ForgetChunk => {
+                let (x, z) = play::read_chunk_pos(r)?;
+                Event::ForgetChunk { x, z }
+            }
+            W::PlayerPosition => Event::Teleport(play::read_player_position(r)?),
+            W::ChunkCenter => {
+                let x = read_varint(r)?;
+                let z = read_varint(r)?;
+                Event::ChunkCenter { x, z }
+            }
+            W::ChunkRadius => Event::ViewDistance(read_varint(r)?),
+            W::BlockUpdate => {
+                let (pos, state) = play::read_block_update(r)?;
+                check_state(state, self.states)?;
+                Event::BlockUpdate { pos, state }
+            }
+            W::SectionUpdate => {
+                let u = play::read_section_update(r)?;
+                for &(_, state) in &u.changes {
+                    check_state(state, self.states)?;
+                }
+                Event::SectionUpdate { section: u.section, changes: u.changes }
+            }
+            W::BlockEvent => {
+                let (pos, b0, b1, block) = play::read_block_event(r)?;
+                Event::BlockEvent { pos: [pos.x, pos.y, pos.z], b0, b1, block }
+            }
+            W::BlockEntityData => {
+                let (pos, kind, nbt) = play::read_block_entity_data(r)?;
+                Event::BlockEntityData { pos: [pos.x, pos.y, pos.z], kind, nbt }
+            }
+            W::Attributes => {
+                let (entity, attributes) = play::read_update_attributes(r)?;
+                Event::Attributes { entity, attributes }
+            }
+            W::Time => {
+                let (game_time, clocks) = play::read_set_time(r)?;
+                let names = &self.clock_names;
+                let clocks = clocks
+                    .into_iter()
+                    .map(|(c, t, p, s)| (names.get(c as usize).cloned().unwrap_or_default(), t, p, s))
+                    .collect();
+                Event::Time { game_time, clocks }
+            }
+            W::LightUpdate => {
+                let c = self.ctx.ok_or_else(|| invalid("light before entering the game"))?;
+                let x = read_varint(r)?;
+                let z = read_varint(r)?;
+                let light = rc_proto_v777::chunk::read_light(r, c.sections)?;
+                Event::LightUpdate { x, z, light: Box::new(light) }
+            }
+            W::GameEvent => {
+                let (kind, param) = play::read_game_event(r)?;
+                Event::GameEvent { kind, param }
+            }
+            W::Border(b) => Event::Border(read_border(b, r)?),
+            W::Sound => Event::Sound(play::read_sound(r)?),
+            W::SoundEntity => Event::Sound(play::read_sound_entity(r)?),
+            W::LevelParticles => Event::Particles(Box::new(self.meta.read_level_particles(r)?)),
+            W::BlockChangedAck => Event::BlockChangedAck(read_varint(r)?),
+            W::BlockDestruction => {
+                let (id, pos, stage) = rc_proto_v777::interact::read_block_destruction(r)?;
+                Event::BlockDestruction { id, pos, stage }
+            }
+            W::LevelEvent => {
+                let (kind, pos, data, global) = play::read_level_event(r)?;
+                Event::LevelEvent { kind, pos: [pos.x, pos.y, pos.z], data, global }
+            }
+            W::StopSound => {
+                let (category, name) = play::read_stop_sound(r)?;
+                Event::StopSound { category, name }
+            }
+            W::MapData => Event::MapData(rc_proto_v777::map::read_map_item_data(r)?),
+            W::SpawnPosition => {
+                let (dimension, pos, _, _) = play::read_spawn_position(r)?;
+                Event::SpawnPosition { dimension, pos: [pos.x, pos.y, pos.z] }
+            }
+        };
+        out.push(event);
+        Ok(Flow::Next)
+    }
+
+    fn chat_packet(&mut self, packet: ChatPacket, r: &mut Reader<'_>, out: &mut Emit<'_>) -> Result<Flow, Error> {
+        match packet {
+            ChatPacket::SystemChat => {
+                let (content, overlay) = play::read_system_chat(r)?;
+                let c = content.as_ref().and_then(rc_text::from_nbt).unwrap_or_else(|| rc_text::Component::text(""));
+                if overlay {
+                    out.push(Event::ActionBar(Box::new(c)));
+                } else if crate::chat::visibility() != 2 && crate::chat::system_message_shown(&c) {
+                    // Chat hidden: even system messages are ignored; guessed sender
+                    // blocked or non-friend: message hidden.
+                    out.push(Event::Chat { component: Box::new(c), tag: crate::ChatTag::System });
+                }
+            }
+            ChatPacket::ActionBar => {
+                let c = rc_proto::nbt::read(r)?.as_ref().and_then(rc_text::from_nbt);
+                out.push(Event::ActionBar(Box::new(c.unwrap_or_else(|| rc_text::Component::text("")))));
+            }
+            ChatPacket::PlayerChat => return self.player_chat(r, out),
+            ChatPacket::DeleteChat => {
+                let packed = match read_varint(r)? {
+                    0 => Ok(r.take_array()?),
+                    v => Err(v as u32 - 1),
+                };
+                match self.link.chat_deleted(packed) {
+                    Ok(s) => out.push(Event::DeleteChat(Box::new(s))),
+                    Err(e) => return Ok(Flow::End(e)),
+                }
+            }
+            ChatPacket::Commands => match commands_event(r) {
+                Event::Disconnected(reason) => return Ok(Flow::End(reason)),
+                ev => {
+                    if let Event::Commands(t) = &ev {
+                        self.link.set_commands(t);
+                    }
+                    out.push(ev)
+                }
+            },
+            ChatPacket::CommandSuggestions => {
+                out.push(Event::CommandSuggestions(rc_proto_v777::commands::read_command_suggestions(r)?))
+            }
+            ChatPacket::ChatCompletions => {
+                let (action, entries) = rc_proto_v777::commands::read_chat_completions(r)?;
+                out.push(Event::ChatCompletions { action, entries });
+            }
+            ChatPacket::DisguisedChat => {
+                let (msg, kind, sender, target) = play::read_disguised_chat(r)?;
+                let content = msg.as_ref().and_then(rc_text::from_nbt).unwrap_or_else(|| rc_text::Component::text(""));
+                let component =
+                    crate::chat::decorate(&kind, &self.chat_types, content, sender.as_ref(), target.as_ref());
+                // Like a player message: absent if player chat is off.
+                if crate::chat::visibility() == 0 && crate::session::player_chat_allowed() {
+                    out.push(Event::Chat { component: Box::new(component), tag: crate::ChatTag::Disguised });
+                }
+            }
+        }
+        Ok(Flow::Next)
+    }
+
+    /// Signed player message (`chat.md` § 1.7 to 1.8).
+    fn player_chat(&mut self, r: &mut Reader<'_>, out: &mut Emit<'_>) -> Result<Flow, Error> {
+        let link = self.link;
+        let m = play::read_player_chat(r)?;
+        if m.global_index != self.chat_index {
+            return Ok(Flow::End(crate::reason::key("multiplayer.disconnect.bad_chat_index")));
+        }
+        self.chat_index += 1;
+        // Signature cache and last seen (`chat.md` § 1.7, § 2.4).
+        let last_seen = match link.chat_unpack(&m) {
+            Ok(l) => l,
+            Err(e) => return Ok(Flow::End(e)),
+        };
+        // Validation (sender's chat session), then display (§ 1.8).
+        let now = crate::signing::now_ms();
+        let verdict = self.remote.validate(&m, &last_seen, now);
+        // Launcher and account restrictions: multiplayer server only.
+        let visible = crate::chat::visibility() == 0 && crate::session::player_chat_allowed();
+        let (line, shown) = crate::chat::player_message(&m, &self.chat_types, verdict, visible, now);
+        // Signature kept by the displayed message only if it is signed and
+        // verified; last seen tracked for any message carrying a signature
+        // except the accepted unsigned one (signature removed).
+        let kept = matches!(verdict, crate::chat_verify::Verdict::Accepted { signed: true });
+        if let Some(s) = &m.signature
+            && verdict != (crate::chat_verify::Verdict::Accepted { signed: false })
+            && let Err(e) = link.chat_processed(s, shown && kept)
+        {
+            return Ok(Flow::End(e));
+        }
+        if let Some(l) = line {
+            out.push(Event::Chat { component: Box::new(l.component), tag: l.tag });
+            if let Some(o) = l.original {
+                out.push(Event::ChatOriginal(o));
+            }
+            if kept && let Some(s) = m.signature.clone() {
+                out.push(Event::ChatSignature(s));
+            }
+            // Chat log: shown messages that passed validation (not the error line).
+            if m.signature.is_some() && matches!(verdict, crate::chat_verify::Verdict::Accepted { .. }) {
+                out.push(Event::ChatSender(m.sender));
+            }
+        }
+        Ok(Flow::Next)
+    }
+
+    fn hud_packet(&mut self, packet: HudPacket, r: &mut Reader<'_>, out: &mut Emit<'_>) -> Result<(), Error> {
+        use HudPacket as H;
+        use rc_proto_v777::scores;
+        let event = match packet {
+            H::PlayerInfoUpdate => {
+                let u = rc_proto_v777::players::read_info_update(r)?;
+                self.remote.apply(&u).map_err(invalid)?;
+                for e in &u.entries {
+                    if let Some((name, _)) = &e.profile {
+                        crate::chat::discover(name, e.uuid);
+                    }
+                }
+                Event::PlayerInfo(u)
+            }
+            H::SetObjective => Event::Score(Box::new(scores::read_set_objective(r)?)),
+            H::DisplayObjective => Event::Score(Box::new(scores::read_display_objective(r)?)),
+            H::SetScore => Event::Score(Box::new(scores::read_set_score(r)?)),
+            H::ResetScore => Event::Score(Box::new(scores::read_reset_score(r)?)),
+            H::PlayerTeam => Event::Score(Box::new(scores::read_player_team(r)?)),
+            H::BossEvent => Event::Boss(play::read_boss_event(r)?),
+            H::Waypoint => Event::Waypoint(Box::new(rc_proto_v777::waypoint::read_waypoint(r)?)),
+            H::TitleText => Event::Title(rc_proto::nbt::read(r)?),
+            H::SubtitleText => Event::Subtitle(rc_proto::nbt::read(r)?),
+            H::TitlesAnimation => Event::TitleTimes(play::read_titles_animation(r)?),
+            H::ClearTitles => Event::ClearTitles(bool::decode(r)?),
+            H::TabList => {
+                let (header, footer) = play::read_tab_list(r)?;
+                Event::TabList { header, footer }
+            }
+            H::PlayerInfoRemove => {
+                let gone = rc_proto_v777::players::read_info_remove(r)?;
+                self.remote.remove(&gone);
+                Event::PlayersRemoved(gone)
+            }
+            H::Cooldown => {
+                // Cooldown group (identifier) then duration in ticks.
+                let raw = rc_proto::read_str(r, 32767)?;
+                let group = if raw.contains(':') { raw.to_owned() } else { format!("minecraft:{raw}") };
+                let ticks = read_varint(r)?;
+                Event::Cooldown { group, ticks }
+            }
+            H::Health => {
+                let (health, food, saturation) = play::read_set_health(r)?;
+                Event::Health { health, food, saturation }
+            }
+            H::Experience => {
+                let (progress, level, total) = play::read_set_experience(r)?;
+                Event::Experience { progress, level, total }
+            }
+            H::CombatKill => {
+                let entity = read_varint(r)?;
+                let message = rc_proto::nbt::read(r)?.as_ref().and_then(rc_text::from_nbt).map(Box::new);
+                Event::Died { entity, message }
+            }
+            H::HeldSlot => Event::HeldSlot(read_varint(r)?),
+            H::Abilities => Event::Abilities(play::read_abilities(r)?),
+        };
+        out.push(event);
+        Ok(())
+    }
+
+    fn container_packet(&self, packet: ContainerPacket, r: &mut Reader<'_>, out: &mut Emit<'_>) -> Result<(), Error> {
+        use ContainerPacket as K;
+        let items = &self.items;
+        let event = match packet {
+            K::SetContent | K::SetSlot | K::SetPlayerInventory | K::SetCursorItem => {
+                let inv = match packet {
+                    K::SetContent => items.read_content(r)?,
+                    K::SetSlot => items.read_slot(r)?,
+                    K::SetPlayerInventory => items.read_player_slot(r)?,
+                    _ => items.read_cursor(r)?,
+                };
+                // No byte must remain: a badly read component shows up right away.
+                r.finish()?;
+                Event::Inventory(inv)
+            }
+            K::RecipeBookAdd | K::RecipeBookRemove | K::RecipeBookSettings | K::PlaceGhostRecipe => {
+                let ev = match packet {
+                    K::RecipeBookAdd => crate::recipes::read_add(r, items)?,
+                    K::RecipeBookRemove => crate::recipes::read_remove(r)?,
+                    K::RecipeBookSettings => crate::recipes::read_settings(r)?,
+                    _ => crate::recipes::read_ghost(r, items)?,
+                };
+                r.finish()?;
+                Event::Recipes(ev)
+            }
+            K::OpenScreen => {
+                let (window, kind, title) = rc_proto_v777::container::read_open_screen(r)?;
+                let title = title.as_ref().and_then(rc_text::from_nbt).map(Box::new);
+                Event::OpenScreen { window, kind, title }
+            }
+            K::MerchantOffers => {
+                Event::MerchantOffers(Box::new(rc_proto_v777::special::read_merchant_offers(items, r)?))
+            }
+            K::UpdateRecipes => Event::UpdateRecipes(Box::new(rc_proto_v777::special::read_update_recipes(items, r)?)),
+            K::MountScreenOpen => {
+                let (window, columns, entity) = rc_proto_v777::special::read_mount_screen_open(r)?;
+                Event::MountScreen { window, columns, entity }
+            }
+            K::OpenBook => Event::OpenBook(read_varint(r)?),
+            K::OpenSignEditor => {
+                let (p, front) = rc_proto_v777::special::read_open_sign_editor(r)?;
+                Event::OpenSignEditor { pos: [p.x, p.y, p.z], front }
+            }
+            K::TagQuery => {
+                let transaction = read_varint(r)?;
+                let nbt = rc_proto::nbt::read(r)?;
+                Event::TagQuery { id: transaction, nbt }
+            }
+            K::TestInstanceStatus => {
+                let status = rc_proto::nbt::read(r)?.as_ref().and_then(rc_text::from_nbt).map(Box::new);
+                let size =
+                    if bool::decode(r)? { Some([read_varint(r)?, read_varint(r)?, read_varint(r)?]) } else { None };
+                Event::TestInstanceStatus { status, size }
+            }
+            K::GameTestHighlight => read_game_test_highlight(r)?,
+            K::Close => {
+                read_varint(r)?;
+                Event::ContainerClosed
+            }
+            K::SetData => {
+                let (window, prop, value) = rc_proto_v777::container::read_set_data(r)?;
+                Event::ContainerData { window, prop, value }
+            }
+        };
+        out.push(event);
+        Ok(())
+    }
+}
+
+/// Entity packets (`entities.md` part 1).
 fn entity_packet(
-    id: i32,
-    ids: &crate::ids::Ids,
+    packet: EntityPacket,
     meta: &rc_proto_v777::entity::MetaCodec,
     r: &mut Reader<'_>,
-) -> rc_proto::Result<Option<crate::EntityEvent>> {
+) -> rc_proto::Result<crate::EntityEvent> {
     use crate::EntityEvent as E;
     use rc_proto_v777::entity as en;
-    Ok(Some(if id == ids.add_entity {
-        E::Add(Box::new(en::read_add_entity(r)?))
-    } else if id == ids.remove_entities {
-        E::Remove(en::read_remove_entities(r)?)
-    } else if id == ids.move_entity_pos {
-        E::Move(en::read_move_pos(r, false)?)
-    } else if id == ids.move_entity_pos_rot {
-        E::Move(en::read_move_pos(r, true)?)
-    } else if id == ids.move_entity_rot {
-        E::Move(en::read_move_rot(r)?)
-    } else if id == ids.teleport_entity {
-        E::Teleport(en::read_teleport_entity(r)?)
-    } else if id == ids.entity_position_sync {
-        E::Sync(en::read_position_sync(r)?)
-    } else if id == ids.rotate_head {
-        let (id, yaw) = en::read_rotate_head(r)?;
-        E::Head { id, yaw }
-    } else if id == ids.set_entity_motion {
-        let (id, velocity) = en::read_motion(r)?;
-        E::Motion { id, velocity }
-    } else if id == ids.set_entity_data {
-        let (id, values) = meta.read_entity_data(r)?;
-        E::Data { id, values }
-    } else if id == ids.set_equipment {
-        let (id, slots) = meta.read_equipment(r)?;
-        E::Equipment { id, slots }
-    } else if id == ids.entity_event {
-        let (id, event) = en::read_entity_event(r)?;
-        E::Event { id, event }
-    } else if id == ids.swing_animation {
-        let (id, hand, kind, duration) = en::read_swing(r)?;
-        E::Swing { id, hand, kind, duration }
-    } else if id == ids.hurt_animation {
-        let (id, yaw) = en::read_hurt_animation(r)?;
-        E::Hurt { id, yaw }
-    } else if id == ids.damage_event {
-        let (id, source) = en::read_damage_event(r)?;
-        E::Damage { id, source }
-    } else if id == ids.set_passengers {
-        let (vehicle, passengers) = en::read_passengers(r)?;
-        E::Passengers { vehicle, passengers }
-    } else if id == ids.update_mob_effect {
-        let (id, effect, amplifier, duration, flags) = en::read_mob_effect(r)?;
-        E::Effect { id, effect, amplifier, duration, flags }
-    } else if id == ids.remove_mob_effect {
-        let (id, effect) = en::read_remove_mob_effect(r)?;
-        E::RemoveEffect { id, effect }
-    } else if id == ids.animate {
+    Ok(match packet {
+        EntityPacket::Add => E::Add(Box::new(en::read_add_entity(r)?)),
+        EntityPacket::Remove => E::Remove(en::read_remove_entities(r)?),
+        EntityPacket::MovePos => E::Move(en::read_move_pos(r, false)?),
+        EntityPacket::MovePosRot => E::Move(en::read_move_pos(r, true)?),
+        EntityPacket::MoveRot => E::Move(en::read_move_rot(r)?),
+        EntityPacket::Teleport => E::Teleport(en::read_teleport_entity(r)?),
+        EntityPacket::PositionSync => E::Sync(en::read_position_sync(r)?),
+        EntityPacket::RotateHead => {
+            let (id, yaw) = en::read_rotate_head(r)?;
+            E::Head { id, yaw }
+        }
+        EntityPacket::Motion => {
+            let (id, velocity) = en::read_motion(r)?;
+            E::Motion { id, velocity }
+        }
+        EntityPacket::Data => {
+            let (id, values) = meta.read_entity_data(r)?;
+            E::Data { id, values }
+        }
+        EntityPacket::Equipment => {
+            let (id, slots) = meta.read_equipment(r)?;
+            E::Equipment { id, slots }
+        }
+        EntityPacket::Event => {
+            let (id, event) = en::read_entity_event(r)?;
+            E::Event { id, event }
+        }
+        EntityPacket::Swing => {
+            let (id, hand, kind, duration) = en::read_swing(r)?;
+            E::Swing { id, hand, kind, duration }
+        }
+        EntityPacket::Hurt => {
+            let (id, yaw) = en::read_hurt_animation(r)?;
+            E::Hurt { id, yaw }
+        }
+        EntityPacket::Damage => {
+            let (id, source) = en::read_damage_event(r)?;
+            E::Damage { id, source }
+        }
+        EntityPacket::Passengers => {
+            let (vehicle, passengers) = en::read_passengers(r)?;
+            E::Passengers { vehicle, passengers }
+        }
+        EntityPacket::Effect => {
+            let (id, effect, amplifier, duration, flags) = en::read_mob_effect(r)?;
+            E::Effect { id, effect, amplifier, duration, flags }
+        }
+        EntityPacket::RemoveEffect => {
+            let (id, effect) = en::read_remove_mob_effect(r)?;
+            E::RemoveEffect { id, effect }
+        }
         // `animate`: entity, action (0 wake-up, 1 critical hit, 2 magic hit).
-        E::Animate { id: read_varint(r)?, action: u8::decode(r)? }
-    } else {
-        return Ok(None);
-    }))
+        EntityPacket::Animate => E::Animate { id: read_varint(r)?, action: u8::decode(r)? },
+    })
 }
 
-/// Identifiers of the packets of `extra.rs`, per phase.
-struct ExtraIds {
-    login: crate::extra::Ids3,
-    cfg_common: crate::extra::Ids3,
-    play_common: crate::extra::Ids3,
-    cfg: crate::extra::CfgIds,
-    play: crate::extra::PlayIds,
-}
-
-fn extra_ids(i: &Ids) -> ExtraIds {
-    use crate::extra::{CfgIds, Ids3, PlayIds};
-    ExtraIds {
-        // The login phase only has cookies.
-        login: Ids3 {
-            cookie_request: i.login_cookie_request,
-            cookie_response: i.login_cookie_response,
-            store_cookie: -1,
-            pack_push: -1,
-            pack_pop: -1,
-            pack_out: -1,
-        },
-        cfg_common: Ids3 {
-            cookie_request: i.cfg_cookie_request,
-            cookie_response: i.cfg_cookie_response,
-            store_cookie: i.cfg_store_cookie,
-            pack_push: i.cfg_resource_pack_push,
-            pack_pop: i.cfg_resource_pack_pop,
-            pack_out: i.cfg_resource_pack_out,
-        },
-        play_common: Ids3 {
-            cookie_request: i.cookie_request,
-            cookie_response: i.cookie_response,
-            store_cookie: i.store_cookie,
-            pack_push: i.resource_pack_push,
-            pack_pop: i.resource_pack_pop,
-            pack_out: i.resource_pack_out,
-        },
-        cfg: CfgIds {
-            transfer: i.cfg_transfer,
-            features: i.cfg_update_enabled_features,
-            reset_chat: i.cfg_reset_chat,
-            report: i.cfg_custom_report_details,
-            links: i.cfg_server_links,
-            show_dialog: i.cfg_show_dialog,
-            clear_dialog: i.cfg_clear_dialog,
-        },
-        play: PlayIds {
-            ticking_state: i.ticking_state,
-            ticking_step: i.ticking_step,
-            explode: i.explode,
-            rotation: i.player_rotation,
-            look_at: i.player_look_at,
-            camera: i.set_camera,
-            vehicle: i.move_vehicle,
-            transfer: i.transfer,
-            report: i.custom_report_details,
-            links: i.server_links,
-            show_dialog: i.show_dialog,
-            clear_dialog: i.clear_dialog,
-            biomes: i.chunks_biomes,
-            simulation: i.set_simulation_distance,
-            difficulty: i.change_difficulty,
-            game_rules: i.game_rule_values,
-        },
+/// One of the six world border packets.
+fn read_border(packet: BorderPacket, r: &mut Reader<'_>) -> rc_proto::Result<rc_proto_v777::border::BorderPacket> {
+    use rc_proto_v777::border as b;
+    match packet {
+        BorderPacket::Initialize => b::read_init(r),
+        BorderPacket::Center => b::read_center(r),
+        BorderPacket::LerpSize => b::read_lerp(r),
+        BorderPacket::Size => b::read_size(r),
+        BorderPacket::WarningDelay => b::read_warning_delay(r),
+        BorderPacket::WarningDistance => b::read_warning_distance(r),
     }
 }
 
 /// List of the packs offered by the server: (namespace, identifier, version).
-type BorderRead = fn(&mut Reader<'_>) -> rc_proto::Result<rc_proto_v777::border::BorderPacket>;
-
-/// Reader of the packet with boundary identifier `id`, if it is one.
-fn border_reader(ids: &Ids, id: i32) -> Option<BorderRead> {
-    use rc_proto_v777::border as b;
-    let table: [(i32, BorderRead); 6] = [
-        (ids.initialize_border, b::read_init),
-        (ids.set_border_center, b::read_center),
-        (ids.set_border_lerp_size, b::read_lerp),
-        (ids.set_border_size, b::read_size),
-        (ids.set_border_warning_delay, b::read_warning_delay),
-        (ids.set_border_warning_distance, b::read_warning_distance),
-    ];
-    table.iter().find(|t| t.0 == id).map(|t| t.1)
-}
-
 fn read_known_packs(r: &mut Reader<'_>) -> rc_proto::Result<Vec<(String, String, String)>> {
     let n = read_varint(r)?;
     if !(0..=64).contains(&n) {
@@ -1115,3 +1256,7 @@ mod highlight_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "conn_replay_tests.rs"]
+mod replay_tests;

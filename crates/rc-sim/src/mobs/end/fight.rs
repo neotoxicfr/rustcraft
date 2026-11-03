@@ -517,7 +517,7 @@ impl Server {
                 }
                 if !active {
                     if let Some(i) = self.mob_index(id)
-                        && let Some(o) = self.mobs.list[i].as_mut()
+                        && let Some(o) = self.mobs.list.get_mut(i)
                     {
                         o.removed = true;
                     }
@@ -1063,7 +1063,7 @@ mod summon_tests {
         p.s.mobs.end.fight = Some(Box::new(f));
         p.s.mobs.end.fight_checked = true;
         p.s.fight_set_stage(Stage::End);
-        assert!(p.s.mobs.list.iter().flatten().any(|m| m.kind == super::Kind::EnderDragon), "dragon not created");
+        assert!(p.s.mobs.list.iter().any(|m| m.kind == super::Kind::EnderDragon), "dragon not created");
         let i = p.s.prog.tree.get("minecraft:end/respawn_dragon").expect("progress");
         assert!(p.s.prog.done(i), "summoned_entity missing");
         drop(p);
@@ -1101,7 +1101,7 @@ mod summon_tests {
         for _ in 0..2 {
             p.s.mobs_tick();
         }
-        let y = p.s.mob_ref(id).expect("zombie").pos[1];
+        let y = p.s.mob_ref(id).expect("zombie").pos()[1];
         assert!(y < -50.0, "mob of the arena did not tick: y {y}");
         if let Some(f) = p.s.mobs.end.fight.as_mut() {
             f.bar_player = false;

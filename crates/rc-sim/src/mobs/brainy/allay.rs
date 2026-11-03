@@ -109,7 +109,7 @@ fn liked_player(s: &Server, m: &Mob, b: &Brain) -> Option<Ent> {
     let ok = u == s.uuid
         && (s.game_mode == 0 || s.game_mode == 1)
         && s.ent_alive(Ent::Player)
-        && dist2(s.pos, m.pos) < 64.0 * 64.0;
+        && dist2(s.pos, m.pos()) < 64.0 * 64.0;
     ok.then_some(Ent::Player)
 }
 
@@ -123,7 +123,7 @@ pub fn go_to_item(s: &mut Server, m: &mut Mob, b: &mut Brain) -> bool {
     let Some(id) = b.mem.wanted_item.get() else { return false };
     let Some(p) = s.life.drops.iter().find(|d| d.id == id && !d.is_removed()).map(|d| d.pos) else { return false };
     let in_border = s.may_interact(super::super::mth::block_of(p));
-    if b.mem.pickup_cd.has() || dist2(p, m.pos) >= 32.0 * 32.0 || !in_border || !can_pick_up(m, b) {
+    if b.mem.pickup_cd.has() || dist2(p, m.pos()) >= 32.0 * 32.0 || !in_border || !can_pick_up(m, b) {
         return false;
     }
     b.mem.look.set(Track::Item { id, eye: true });
@@ -143,7 +143,7 @@ pub fn stay_close(s: &mut Server, m: &mut Mob, b: &mut Brain) -> bool {
         return false;
     }
     let Some(c) = s.bz_track_pos(t) else { return false };
-    if dist2(m.pos, c) < 16.0 * 16.0 {
+    if dist2(m.pos(), c) < 16.0 * 16.0 {
         return false;
     }
     b.mem.look.set(t);
@@ -166,7 +166,7 @@ pub fn give_start(s: &mut Server, m: &mut Mob, b: &mut Brain) {
 pub fn give_tick(s: &mut Server, m: &mut Mob, b: &mut Brain) {
     let Some(t) = deposit_target(s, m, b) else { return };
     let Some(c) = s.bz_track_pos(t) else { return };
-    let eye = [m.pos[0], m.eye_y(), m.pos[2]];
+    let eye = [m.pos()[0], m.eye_y(), m.pos()[2]];
     if dist2(c, eye) < 9.0 {
         let liked = liked_player(s, m, b).is_some();
         throw_item(s, m, c, liked);
@@ -199,9 +199,9 @@ fn throw_item(s: &mut Server, m: &mut Mob, target: [f64; 3], liked: bool) {
 fn throw_stack(s: &mut Server, m: &Mob, st: Stack, target: [f64; 3], vel: [f64; 3], hand: f32) {
     let r = &mut s.mobs.rng;
     let _ = (r.next_double(), r.next_double());
-    let n = crate::mobs::mth::normalize([target[0] - m.pos[0], target[1] - m.pos[1], target[2] - m.pos[2]]);
+    let n = crate::mobs::mth::normalize([target[0] - m.pos()[0], target[1] - m.pos()[1], target[2] - m.pos()[2]]);
     let v = [n[0] * vel[0], n[1] * vel[1], n[2] * vel[2]];
-    let pos = [m.pos[0], m.eye_y() - f64::from(hand), m.pos[2]];
+    let pos = [m.pos()[0], m.eye_y() - f64::from(hand), m.pos()[2]];
     s.spawn_item(pos, v, st, 10);
     s.set_last_thrower(Ent::Mob(m.id)); // W8c: thrower
 }
@@ -232,12 +232,13 @@ pub fn fly_target_pos_with(
     let restrict = home.is_some_and(|(c, r)| {
         let lim = f64::from(r) + 10.0 + 1.0;
         let cc = [f64::from(c[0]) + 0.5, f64::from(c[1]) + 0.5, f64::from(c[2]) + 0.5];
-        super::super::mth::dist2(cc, m.pos) < lim * lim
+        super::super::mth::dist2(cc, m.pos()) < lim * lim
     });
     let mut best_w = f32::NEG_INFINITY;
     let v = view_vector(m);
     let max_y = s.dim.height.min_y + s.dim.height.sections as i32 * 16 - 1;
     let mut best: Option<[i32; 3]> = None;
+    let view = super::super::nav::DrawView::new(s, m);
     for _ in 0..10 {
         let center = super::super::mth::atan2(v[2], v[0]) - f64::from(std::f32::consts::FRAC_PI_2);
         let yr = center + f64::from(2.0 * m.rng.next_float() - 1.0) * f64::from(std::f32::consts::FRAC_PI_2);
@@ -252,18 +253,18 @@ pub fn fly_target_pos_with(
         let dir = block_of([xt, f64::from(yt), zt]);
         let (mut dx, mut dz) = (f64::from(dir[0]), f64::from(dir[2]));
         if let Some((c, _)) = home {
-            if m.pos[0] > f64::from(c[0]) {
+            if m.pos()[0] > f64::from(c[0]) {
                 dx -= m.rng.next_double() * 10.0 / 2.0;
             } else {
                 dx += m.rng.next_double() * 10.0 / 2.0;
             }
-            if m.pos[2] > f64::from(c[2]) {
+            if m.pos()[2] > f64::from(c[2]) {
                 dz -= m.rng.next_double() * 10.0 / 2.0;
             } else {
                 dz += m.rng.next_double() * 10.0 / 2.0;
             }
         }
-        let mut p = block_of([dx + m.pos[0], f64::from(dir[1]) + m.pos[1], dz + m.pos[2]]);
+        let mut p = block_of([dx + m.pos()[0], f64::from(dir[1]) + m.pos()[1], dz + m.pos()[2]]);
         if p[1] < s.dim.height.min_y || p[1] > max_y {
             continue;
         }
@@ -279,9 +280,7 @@ pub fn fly_target_pos_with(
                 p[1] += 1;
             }
         }
-        let view = s.mob_view(m);
-        let t = super::super::nav::static_path_type(s, &view, p);
-        if super::super::nav::mob_malus(m, t) != 0.0 {
+        if view.has_malus(s, m, p) {
             continue;
         }
         let w = weight(s, p);
@@ -298,7 +297,7 @@ pub fn fly_move_control(m: &mut Mob) {
     if m.move_ctl.op == MoveOp::MoveTo {
         m.move_ctl.op = MoveOp::Wait;
         let w = m.move_ctl.wanted;
-        let (xd, yd, zd) = (w[0] - m.pos[0], w[1] - m.pos[1], w[2] - m.pos[2]);
+        let (xd, yd, zd) = (w[0] - m.pos()[0], w[1] - m.pos()[1], w[2] - m.pos()[2]);
         let dd = xd * xd + yd * yd + zd * zd;
         if dd < f64::from(2.500_000_3e-7f32) {
             m.yya = 0.0;
@@ -411,7 +410,7 @@ fn should_stop_dancing(s: &Server, m: &Mob) -> bool {
         None => true,
         Some(j) => {
             let c = [f64::from(j[0]) + 0.5, f64::from(j[1]) + 0.5, f64::from(j[2]) + 0.5];
-            dist2(c, m.pos) >= 10.0 * 10.0 || s.bname(j) != "minecraft:jukebox"
+            dist2(c, m.pos()) >= 10.0 * 10.0 || s.bname(j) != "minecraft:jukebox"
         }
     }
 }
@@ -444,11 +443,11 @@ impl Server {
     /// block (integer distance² ≤ 100). Allays being updated (taken out of the list) hear nothing:
     /// the jukebox emits outside the mob tick.
     pub(crate) fn bz_allays_hear_jukebox(&mut self, j: [i32; 3], playing: bool) {
-        for o in self.mobs.list.iter_mut().flatten() {
+        for o in self.mobs.list.iter_mut() {
             if o.kind != super::super::species::Kind::Allay || o.removed {
                 continue;
             }
-            let ear = block_of([o.pos[0], o.eye_y(), o.pos[2]]);
+            let ear = block_of([o.pos()[0], o.eye_y(), o.pos()[2]]);
             let d: i64 = (0..3).map(|i| (i64::from(ear[i]) - i64::from(j[i])).pow(2)).sum();
             if d <= 10 * 10 {
                 set_jukebox_playing(o, j, playing);
@@ -466,7 +465,7 @@ pub(crate) fn can_receive_vibration(s: &Server, m: &Mob, origin: [i32; 3]) -> bo
         return false;
     }
     let Some(liked) = m.bm.brain.as_ref().and_then(|b| b.mem.liked_noteblock.get()) else { return true };
-    let me = block_of(m.pos);
+    let me = block_of(m.pos());
     let close = liked.dim == DimKey::of(&s.dim.name) && (0..3).all(|i| (liked.pos[i] - me[i]).abs() <= 1024);
     close && liked.pos == origin
 }
@@ -493,7 +492,7 @@ pub(crate) fn on_receive_vibration(s: &Server, m: &mut Mob, info: &super::super:
 
 /// End of the allay tick (server): listener moved to the eyes, then vibrations tick.
 pub fn post_tick(s: &mut Server, m: &mut Mob) {
-    s.listener_move(super::super::recent::vibration::Who::Mob(m.id), [m.pos[0], m.eye_y(), m.pos[2]]);
+    s.listener_move(super::super::recent::vibration::Who::Mob(m.id), [m.pos()[0], m.eye_y(), m.pos()[2]]);
     s.vib_tick_mob(m);
 }
 
@@ -503,7 +502,7 @@ pub fn post_tick(s: &mut Server, m: &mut Mob) {
 pub fn interact(s: &mut Server, m: &mut Mob, slot: usize, item: &str) -> Option<bool> {
     let held = s.slots[slot].clone();
     if m.bm.dancing && s.item_tag(item, "minecraft:duplicates_allays") && m.bm.dup_cooldown == 0 {
-        let mut a = s.new_mob(super::super::species::Kind::Allay, m.pos, 0.0);
+        let mut a = s.new_mob(super::super::species::Kind::Allay, m.pos(), 0.0);
         a.persistent = true;
         a.bm.dup_cooldown = 6000;
         m.bm.dup_cooldown = 6000;
@@ -531,7 +530,7 @@ pub fn interact(s: &mut Server, m: &mut Mob, slot: usize, item: &str) -> Option<
         s.bz_mob_sound_src(m, "minecraft:entity.allay.item_taken", 6, 2.0, 1.0);
         s.mob_swing(m);
         if let Some(inv) = m.bm.inventory.take() {
-            let pos = m.pos;
+            let pos = m.pos();
             throw_stack(s, m, inv, pos, [0.3, 0.3, 0.3], 0.3);
         }
         if let Some(b) = m.bm.brain.as_mut() {

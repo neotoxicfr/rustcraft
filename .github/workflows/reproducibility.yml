@@ -1,0 +1,122 @@
+name: Reproducibility
+
+# Dress rehearsal of a release, started by hand: builds the commit twice with the FULL release profile
+# (the one a tag builds and ci.yml never compiles), on two separate runners per system, packages
+# both builds like release.yml does, then compares the executables and the archives byte for byte.
+# A build that no longer links, or two builds that differ, show up here before the tag does.
+#
+# Never on every tag or push: it costs 4 full builds (about 2 hours each in the worst case).
+# Keep the build and package steps identical to release.yml.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }} (${{ matrix.attempt }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-22.04]
+        attempt: [first, second]
+        # The second build sits elsewhere (checkout, target folder and cargo home): a machine path left
+        # in the executable then makes the two builds differ instead of hiding in both.
+        include:
+          - attempt: first
+            root: .
+          - attempt: second
+            root: elsewhere/rustcraft
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: ${{ matrix.root }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ${{ matrix.root }}
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
+      - name: Toolchain from rust-toolchain.toml
+        run: rustup toolchain install && rustup show active-toolchain
+      - name: Another cargo home for the second build
+        if: matrix.attempt == 'second'
+        shell: bash
+        run: |
+          home="$RUNNER_TEMP/other-cargo-home"
+          if [ "$RUNNER_OS" = Windows ]; then home=$(cygpath -w "$home"); fi
+          echo "CARGO_HOME=$home" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Commit date and path hiding
+        shell: bash
+        run: |
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+          python -I tools/release/hide_paths.py config "$RUNNER_TEMP/hide-paths.toml"
+      - name: Build (full release profile)
+        shell: bash
+        run: cargo build --locked --release -p rc-app --config "$RUNNER_TEMP/hide-paths.toml"
+      # The executables compared are the shipped ones (Linux: after `strip`, as in the archive).
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p pkg out
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp target/release/rustcraft.exe out/
+            python -I tools/release/pack.py windows rehearsal target/release/rustcraft.exe pkg
+          else
+            cp target/release/rustcraft pkg/rustcraft
+            strip pkg/rustcraft
+            cp pkg/rustcraft out/
+            python -I tools/release/pack.py linux rehearsal pkg/rustcraft pkg
+          fi
+          cp pkg/rustcraft-rehearsal-* out/
+          (cd out && sha256sum * | tee ../sums.txt)
+      - name: No path of this runner left in the shipped executable
+        shell: bash
+        run: |
+          exe=pkg/rustcraft
+          if [ "$RUNNER_OS" = Windows ]; then exe=target/release/rustcraft.exe; fi
+          python -I tools/release/hide_paths.py check "$exe"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rehearsal-${{ matrix.os }}-${{ matrix.attempt }}
+          path: ${{ matrix.root }}/out
+          retention-days: 7
+
+  compare:
+    name: Compare the two builds
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: builds
+      - name: Same bytes, system by system
+        shell: bash
+        run: |
+          status=0
+          for first in builds/rehearsal-*-first; do
+            second="${first%-first}-second"
+            for file in "$first"/*; do
+              name=$(basename "$file")
+              sum=$(sha256sum "$file" | cut -d' ' -f1)
+              if cmp -s "$file" "$second/$name"; then
+                echo "same   $sum  ${first#builds/rehearsal-} $name" | tee -a "$GITHUB_STEP_SUMMARY"
+              else
+                echo "::error::$name differs between the two builds"
+                echo "DIFFERENT  ${first#builds/rehearsal-} $name" | tee -a "$GITHUB_STEP_SUMMARY"
+                cmp -l "$file" "$second/$name" | head -20 || true
+                status=1
+              fi
+            done
+          done
+          exit $status

@@ -17,9 +17,9 @@ pub fn post_ai_step(s: &mut Server, m: &mut Mob) {
     }
     let snow = s.default_state("minecraft:snow");
     for i in 0..4 {
-        let xx = (m.pos[0] + f64::from((i % 2 * 2 - 1) as f32 * 0.25)).floor() as i32;
-        let yy = m.pos[1].floor() as i32;
-        let zz = (m.pos[2] + f64::from((i / 2 % 2 * 2 - 1) as f32 * 0.25)).floor() as i32;
+        let xx = (m.pos()[0] + f64::from((i % 2 * 2 - 1) as f32 * 0.25)).floor() as i32;
+        let yy = m.pos()[1].floor() as i32;
+        let zz = (m.pos()[2] + f64::from((i / 2 % 2 * 2 - 1) as f32 * 0.25)).floor() as i32;
         let p = [xx, yy, zz];
         if s.is_air(p) && s.can_survive(snow, p) {
             s.set_block(p, snow, 3);
@@ -64,11 +64,11 @@ impl Server {
     /// Throw of a snowball.
     fn snow_golem_shoot(&mut self, m: &mut Mob, t: Ent) {
         let (Some(tp), Some(eye)) = (self.ent_pos(t), self.ent_eye(t)) else { return };
-        let xd = tp[0] - m.pos[0];
+        let xd = tp[0] - m.pos()[0];
         let yd = eye - f64::from(1.1f32);
-        let zd = tp[2] - m.pos[2];
+        let zd = tp[2] - m.pos()[2];
         let yo = (xd * xd + zd * zd).sqrt() * f64::from(0.2f32);
-        let start = [m.pos[0], m.eye_y() - f64::from(0.1f32), m.pos[2]];
+        let start = [m.pos()[0], m.eye_y() - f64::from(0.1f32), m.pos()[2]];
         let dir = [xd, yd + yo - start[1], zd];
         self.throw_snowball(m.uuid, start, dir, 1.6, 12.0);
         let p = 0.4 / (m.rng.next_float() * 0.4 + 0.8);
@@ -108,7 +108,7 @@ impl Server {
         let GolemGoal::Ranged { target, attack_time, see_time } = g else { return };
         let Some(t) = *target else { return };
         let (Some(tp), Some(eye)) = (self.ent_pos(t), self.ent_eye(t)) else { return };
-        let d2 = dist2(m.pos, tp);
+        let d2 = dist2(m.pos(), tp);
         let sight = self.line_of_sight(m, t);
         if sight {
             *see_time += 1;

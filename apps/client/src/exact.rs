@@ -97,7 +97,7 @@ impl App {
             {
                 continue;
             }
-            let Some(col) = self.world.grid.get_mut(x, z) else {
+            let Some(col) = self.world.grid.get_mut_by(x, z, rc_world::ColumnWriter::Biomes) else {
                 eprintln!("biomes of an absent column ({x}, {z}) ignored");
                 continue;
             };

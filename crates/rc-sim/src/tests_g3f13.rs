@@ -412,7 +412,7 @@ fn frozen_entities_do_not_go_through_portals() {
         let side = |x: f64| (x > 64.0) == far;
         (
             p.s.life.drops.iter().filter(|d| side(d.pos[0])).count(),
-            p.s.mobs.list.iter().flatten().filter(|m| side(m.pos[0])).count(),
+            p.s.mobs.list.iter().filter(|m| side(m.pos()[0])).count(),
             p.s.carts.list.iter().flatten().filter(|c| side(c.pos[0])).count(),
         )
     };

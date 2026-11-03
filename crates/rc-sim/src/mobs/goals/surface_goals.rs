@@ -4,6 +4,7 @@
 
 use super::super::mob::{Ent, Mob};
 use super::super::mth::{dist2, reduced};
+use super::super::nav::DrawView;
 use super::super::species::Kind;
 use super::super::surface;
 use super::{JUMP, LOOK, MOVE, TARGET, TBase};
@@ -269,7 +270,6 @@ impl Server {
                     .mobs
                     .list
                     .iter()
-                    .flatten()
                     .find(|o| {
                         o.kind != m.kind && o.id != m.id && o.alive() && o.touches(&area) && !o.invisible()
                     })
@@ -337,8 +337,8 @@ impl Server {
                 !m.nav.is_done() && !*stuck && !m.surf.going_home && !m.is_in_love() && !m.surf.has_egg
             }
             SGoal::FollowMob { following, .. } => {
-                let Some(o) = following.and_then(|id| self.mob_ref(id)).map(|o| o.pos) else { return false };
-                !m.nav.is_done() && dist2(m.pos, o) > 9.0
+                let Some(o) = following.and_then(|id| self.mob_ref(id)).map(|o| o.pos()) else { return false };
+                !m.nav.is_done() && dist2(m.pos(), o) > 9.0
             }
             SGoal::PolarHurtBy { base, .. } => self.target_continue(base, m),
             SGoal::PolarAttackPlayers { base, .. } => self.polar_target_continue(base, m),
@@ -373,13 +373,13 @@ impl Server {
                 let xt = m.rng.next_int_bound(1025) - 512;
                 let mut yt = m.rng.next_int_bound(9) - 4;
                 let zt = m.rng.next_int_bound(1025) - 512;
-                if f64::from(yt) + m.pos[1] > f64::from(surface::sea_level(self) - 1) {
+                if f64::from(yt) + m.pos()[1] > f64::from(surface::sea_level(self) - 1) {
                     yt = 0;
                 }
                 m.surf.travel = Some(super::super::mth::block_of([
-                    f64::from(xt) + m.pos[0],
-                    f64::from(yt) + m.pos[1],
-                    f64::from(zt) + m.pos[2],
+                    f64::from(xt) + m.pos()[0],
+                    f64::from(yt) + m.pos()[1],
+                    f64::from(zt) + m.pos()[2],
                 ]));
                 *stuck = false;
             }
@@ -499,7 +499,7 @@ impl Server {
                 }
             }
             SGoal::FollowMob { following, recalc, .. } => {
-                let Some(o) = following.and_then(|id| self.mob_ref(id)).map(|o| (o.pos, o.eye_y(), o.look.wanted))
+                let Some(o) = following.and_then(|id| self.mob_ref(id)).map(|o| (o.pos(), o.eye_y(), o.look.wanted))
                 else {
                     return;
                 };
@@ -507,14 +507,14 @@ impl Server {
                 *recalc -= 1;
                 if *recalc <= 0 {
                     *recalc = reduced(10);
-                    let d = dist2(m.pos, o.0);
+                    let d = dist2(m.pos(), o.0);
                     if d > 9.0 {
                         self.move_to_entity(m, o.0, 1.0);
                     } else {
                         m.nav.stop();
                         // Squared distance compared with 3 (not 9), like in the game.
-                        if d <= 3.0 || o.2 == m.pos {
-                            let p = [m.pos[0] - (o.0[0] - m.pos[0]), m.pos[1], m.pos[2] - (o.0[2] - m.pos[2])];
+                        if d <= 3.0 || o.2 == m.pos() {
+                            let p = [m.pos()[0] - (o.0[0] - m.pos()[0]), m.pos()[1], m.pos()[2] - (o.0[2] - m.pos()[2])];
                             self.move_to_pos(m, p, 1.0);
                         }
                     }
@@ -601,7 +601,7 @@ impl Server {
         };
         let target = [pos[0], pos[1] + 1, pos[2]];
         let accepted = if *kind == Mtb::RemoveEgg { 1.14 } else { 1.0 };
-        if !near_center(target, m.pos, accepted) {
+        if !near_center(target, m.pos(), accepted) {
             *reached = false;
             *try_ticks += 1;
             let every = if *kind == Mtb::TurtleWater { 160 } else { 40 };
@@ -714,16 +714,22 @@ impl Server {
 
     fn toward_dir(m: &Mob, d: [i32; 3]) -> [i32; 3] {
         super::super::mth::block_of([
-            f64::from(d[0]) + m.pos[0],
-            f64::from(d[1]) + m.pos[1],
-            f64::from(d[2]) + m.pos[2],
+            f64::from(d[0]) + m.pos()[0],
+            f64::from(d[1]) + m.pos()[1],
+            f64::from(d[2]) + m.pos()[2],
         ])
     }
 
-    fn best_of(&self, m: &mut Mob, f: &mut dyn FnMut(&Self, &mut Mob) -> Option<[i32; 3]>) -> Option<[f64; 3]> {
+    /// 10 tries, best walk value; one mob view shared by the tries (`DrawView`).
+    fn best_of(
+        &self,
+        m: &mut Mob,
+        mut f: impl FnMut(&Self, &mut Mob, &DrawView) -> Option<[i32; 3]>,
+    ) -> Option<[f64; 3]> {
+        let view = DrawView::new(self, m);
         let mut best: Option<(f32, [i32; 3])> = None;
         for _ in 0..10 {
-            if let Some(p) = f(self, m) {
+            if let Some(p) = f(self, m, &view) {
                 let w = self.walk_target_value(m, p);
                 if w > best.map_or(f32::NEG_INFINITY, |b| b.0) {
                     best = Some((w, p));
@@ -735,11 +741,11 @@ impl Server {
 
     /// The position draw towards a point.
     pub(crate) fn pos_towards(&self, m: &mut Mob, h: i32, v: i32, to: [f64; 3], max: f32) -> Option<[f64; 3]> {
-        let (xd, zd) = (to[0] - m.pos[0], to[2] - m.pos[2]);
-        self.best_of(m, &mut |s, m| {
+        let (xd, zd) = (to[0] - m.pos()[0], to[2] - m.pos()[2]);
+        self.best_of(m, |s, m, view| {
             let d = Self::dir_within(m, f64::from(h), v, 0, xd, zd, f64::from(max))?;
             let p = Self::toward_dir(m, d);
-            (!s.outside_limits(p) && s.nav_stable(m, p) && !s.has_malus(m, p)).then_some(p)
+            (!s.outside_limits(p) && s.nav_stable(m, p) && !view.has_malus(s, m, p)).then_some(p)
         })
     }
 
@@ -762,38 +768,38 @@ impl Server {
     /// air or water (F16: wither; the parrot falls back to it).
     pub(crate) fn fly_wander_pos(&self, m: &mut Mob) -> Option<[f64; 3]> {
         let (yr, pr) = (-m.yaw * super::super::mth::DEG, m.pitch * super::super::mth::DEG);
-        let view = [
+        let look = [
             f64::from(super::super::mth::sin(yr) * super::super::mth::cos(pr)),
             f64::from(super::super::mth::cos(yr) * super::super::mth::cos(pr)),
         ];
-        let hover = self.best_of(m, &mut |s, m| {
-            let d = Self::dir_within(m, 8.0, 7, 0, view[0], view[1], f64::from(std::f32::consts::FRAC_PI_2))?;
+        let hover = self.best_of(m, |s, m, view| {
+            let d = Self::dir_within(m, 8.0, 7, 0, look[0], look[1], f64::from(std::f32::consts::FRAC_PI_2))?;
             let p = Self::toward_dir(m, d);
             if s.outside_limits(p) || !s.nav_stable(m, p) {
                 return None;
             }
             let above = m.rng.next_int_bound(3) + 1;
             let p = s.move_up_to_above_solid(p, above);
-            (s.mob_fluid(p) != super::super::env::Fluid::Water && !s.has_malus(m, p)).then_some(p)
+            (s.mob_fluid(p) != super::super::env::Fluid::Water && !view.has_malus(s, m, p)).then_some(p)
         });
         if hover.is_some() {
             return hover;
         }
-        self.best_of(m, &mut |s, m| {
-            let d = Self::dir_within(m, 8.0, 4, -2, view[0], view[1], f64::from(std::f32::consts::FRAC_PI_2))?;
+        self.best_of(m, |s, m, view| {
+            let d = Self::dir_within(m, 8.0, 4, -2, look[0], look[1], f64::from(std::f32::consts::FRAC_PI_2))?;
             let p = Self::toward_dir(m, d);
             if s.outside_limits(p) {
                 return None;
             }
             let p = s.move_up_out_of_solid(p);
-            (!s.has_malus(m, p)).then_some(p)
+            (!view.has_malus(s, m, p)).then_some(p)
         })
     }
 
     fn tree_pos(&self, m: &Mob) -> Option<[f64; 3]> {
         let mp = m.block_pos();
-        let lo = [(m.pos[0] - 3.0).floor() as i32, (m.pos[1] - 6.0).floor() as i32, (m.pos[2] - 3.0).floor() as i32];
-        let hi = [(m.pos[0] + 3.0).floor() as i32, (m.pos[1] + 6.0).floor() as i32, (m.pos[2] + 3.0).floor() as i32];
+        let lo = [(m.pos()[0] - 3.0).floor() as i32, (m.pos()[1] - 6.0).floor() as i32, (m.pos()[2] - 3.0).floor() as i32];
+        let hi = [(m.pos()[0] + 3.0).floor() as i32, (m.pos()[1] + 6.0).floor() as i32, (m.pos()[2] + 3.0).floor() as i32];
         for z in lo[2]..=hi[2] {
             for y in lo[1]..=hi[1] {
                 for x in lo[0]..=hi[0] {
@@ -854,7 +860,7 @@ impl Server {
     /// Call for help: only adult bears join.
     fn polar_alert(&mut self, m: &Mob) {
         let follow = m.follow_range();
-        let p = m.pos;
+        let p = m.pos();
         let area = rc_physics::Aabb {
             min: [p[0] - follow, p[1] - 10.0, p[2] - follow],
             max: [p[0] + 1.0 + follow, p[1] + 1.0 + 10.0, p[2] + 1.0 + follow],
@@ -875,7 +881,7 @@ impl Server {
         }
         let follow = m.follow_range() * 0.5;
         let Some(p) = self.ent_pos(t) else { return false };
-        if dist2(m.pos, p) > follow * follow {
+        if dist2(m.pos(), p) > follow * follow {
             return false;
         }
         if self.line_of_sight(m, t) {

@@ -45,7 +45,7 @@ fn dragon_keeps_projectile_knockback_dir() {
     let Some((mut p, dir)) = probe("kbdragon") else { return };
     let mut m = p.s.new_mob(Kind::EnderDragon, [216.5, -40.0, 216.5], 0.0);
     m.end.dragon.as_mut().expect("dragon").set_phase(Phase::HoldingPattern);
-    let (id, pos, v0, res) = (m.id, m.pos, m.vel, m.attrs.knockback_resistance.value());
+    let (id, pos, v0, res) = (m.id, m.pos(), m.vel, m.attrs.knockback_resistance.value());
     p.s.add_mob(m);
     let kb = (0.1, 0.3);
     // The round trip through a position is not exact here: the test distinguishes the two paths.

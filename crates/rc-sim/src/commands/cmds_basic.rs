@@ -79,7 +79,8 @@ pub fn time_ticks(s: &str) -> i32 {
     } else {
         (s, 1.0)
     };
-    (num.parse::<f32>().unwrap_or(0.0) * f).round() as i32
+    // The game's rounding (halves up): `-0.5t` is 0 ticks, not -1.
+    rc_data::java_math::round_f32_to_i32(num.parse::<f32>().unwrap_or(0.0) * f)
 }
 
 impl Server {
@@ -347,8 +348,7 @@ impl Server {
     /// a player ("sent") and the players of the same team ("received"); returns their number.
     fn cmd_teammsg(&mut self, s: &Src, text: &str) -> R {
         let e = self.source_entity(s)?;
-        let holder = self.ent_score_name(e);
-        let Some(team) = self.cmd.scores.team_of(&holder).cloned() else {
+        let Some(team) = self.ent_team(e).cloned() else {
             return Err(Fail(tr!("commands.teammsg.failed.noteam")));
         };
         let same = |sv: &Server, name: &str| sv.cmd.scores.team_of(name).is_some_and(|t| t.name == team.name);

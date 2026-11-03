@@ -5,7 +5,7 @@
 
 use crate::Error;
 use crate::json::Json;
-use crate::math::{Interval, floor_i, lerp3, smoothstep};
+use crate::math::{Interval, lerp3, smoothstep};
 use crate::rng::Rng;
 use crate::volume::Volume;
 
@@ -79,14 +79,14 @@ impl Paths {
 
 #[inline]
 fn fl(v: f64, java: bool) -> i32 {
-    if java { crate::math::floor_i_java(v) } else { crate::math::floor_i_libm(v) }
+    if java { rc_data::java_math::floor_to_i32(v) } else { crate::math::floor_i_libm(v) }
 }
 
 /// Cell and its value in f64 (always `f64::from(cell)`, like the old computation).
 #[inline]
 fn fl2(v: f64, java: bool) -> (i32, f64) {
     if java && v.abs() < 2_147_483_648.0 {
-        crate::math::floor_small(v)
+        rc_data::java_math::floor_in_i32_range(v)
     } else {
         let i = fl(v, java);
         (i, f64::from(i))
@@ -100,7 +100,7 @@ fn wrap(x: f64, java: bool) -> f64 {
     } else {
         let q = x / ROUND_OFF + 0.5;
         // Identical for |q| < 2^63 (exact integer in both cases).
-        let k = if java { crate::math::floor_l_java(q) as f64 } else { q.floor() };
+        let k = if java { rc_data::java_math::floor_to_i64(q) as f64 } else { q.floor() };
         x - k * ROUND_OFF
     }
 }
@@ -613,13 +613,15 @@ impl Smeared {
 #[derive(Debug, Clone)]
 pub struct Simplex {
     base: Perlin,
+    /// `RUSTCRAFT_OPT_FLOOR_JAVA`, read once at construction rather than at each floor.
+    floor_java: bool,
 }
 
 const SQRT3: f64 = 1.732_050_807_568_877_2;
 
 impl Simplex {
     pub fn new_without_offset(r: &mut Rng) -> Self {
-        Simplex { base: Perlin::with_offset_scale(r, 0.0) }
+        Simplex { base: Perlin::with_offset_scale(r, 0.0), floor_java: crate::opt::floor_java() }
     }
 
     fn corner(g: i32, x: f64, y: f64) -> f64 {
@@ -640,8 +642,8 @@ impl Simplex {
         let xin = xin + b.ox;
         let yin = yin + b.oy;
         let s = (xin + yin) * f2;
-        let i = floor_i(xin + s);
-        let j = floor_i(yin + s);
+        let i = fl(xin + s, self.floor_java);
+        let j = fl(yin + s, self.floor_java);
         let t = f64::from(i.wrapping_add(j)) * g2;
         let x0 = xin - (f64::from(i) - t);
         let y0 = yin - (f64::from(j) - t);

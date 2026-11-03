@@ -116,9 +116,9 @@ pub fn can_sniff(m: &Mob, b: &Brain) -> bool {
 fn head_block(m: &Mob) -> [i32; 3] {
     let f = direction(m.pitch, m.yaw);
     [
-        (m.pos[0] + f[0] * 2.25).floor() as i32,
-        (m.pos[1] + f64::from(0.2f32)).floor() as i32,
-        (m.pos[2] + f[2] * 2.25).floor() as i32,
+        (m.pos()[0] + f[0] * 2.25).floor() as i32,
+        (m.pos()[1] + f64::from(0.2f32)).floor() as i32,
+        (m.pos()[2] + f[2] * 2.25).floor() as i32,
     ]
 }
 
@@ -181,7 +181,7 @@ pub fn dig_position(s: &mut Server, m: &mut Mob, b: &Brain) -> Option<[i32; 3]> 
 /// Successful dig: position under the feet added at the head (20 kept before the addition, so up
 /// to 21 in memory, as in the game).
 pub fn store_explored(s: &Server, m: &Mob, b: &mut Brain) {
-    let on = [m.pos[0].floor() as i32, (m.pos[1] - f64::from(0.2f32)).floor() as i32, m.pos[2].floor() as i32];
+    let on = [m.pos()[0].floor() as i32, (m.pos()[1] - f64::from(0.2f32)).floor() as i32, m.pos()[2].floor() as i32];
     let on = m.support.unwrap_or(on);
     let mut list: Vec<GPos> = b.mem.explored.v.clone().unwrap_or_default().into_iter().take(20).collect();
     list.insert(0, GPos { dim: DimKey::of(&s.dim.name), pos: on });
@@ -216,7 +216,7 @@ pub fn spawn_egg(s: &mut Server, m: &mut Mob, partner: i32) {
     super::finalize_breeding(s, m, partner, None);
     let p = (m.rng.next_float() - m.rng.next_float()) * 0.2 + 0.5;
     s.mob_sound(m, "minecraft:block.sniffer_egg.plop", 1.0, p);
-    s.spawn_item(m.pos, v, Stack { id: "minecraft:sniffer_egg".into(), count: 1, components: None }, 10);
+    s.spawn_item(m.pos(), v, Stack { id: "minecraft:sniffer_egg".into(), count: 1, components: None }, 10);
 }
 
 /// Jump: small push forward when the mob is almost motionless.

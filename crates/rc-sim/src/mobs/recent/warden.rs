@@ -191,23 +191,28 @@ fn sound(s: &mut Server, m: &mut Mob, name: &str, volume: f32) {
 /// not another warden (armor stands are not mobs here), not invulnerable, not dead, its box
 /// inside the world border.
 pub fn can_target(s: &Server, m: &Mob, e: Ent) -> bool {
-    // Same scoreboard team (names built only when some team exists).
-    let allied = |holder: &dyn Fn() -> String| {
-        !s.cmd.scores.teams.is_empty() && s.same_team(&crate::nbtio::uuid_text(m.uuid), &holder())
+    // Same scoreboard team; the teams found by UUID (nothing formatted), `None`: the player.
+    let allied = |target_uuid: Option<u128>| {
+        let scores = &s.cmd.scores;
+        !scores.teams.is_empty()
+            && scores.team_of_uuid(m.uuid).is_some_and(|own| match target_uuid {
+                Some(uuid) => scores.uuid_in_team(uuid, &own.name),
+                None => scores.team_of(&s.name).is_some_and(|t| t.name == own.name),
+            })
     };
     match e {
         Ent::Player => {
             s.dims.home.is_none()
                 && !matches!(s.game_mode, 1 | 3)
                 && s.ent_alive(Ent::Player)
-                && !allied(&|| s.name.clone())
+                && !allied(None)
                 && s.box_in_border(&s.player_aabb())
         }
         Ent::Mob(id) => s.mob_ref(id).is_some_and(|o| {
             o.alive()
                 && o.kind != Kind::Warden
                 && !o.invulnerable
-                && !allied(&|| crate::nbtio::uuid_text(o.uuid))
+                && !allied(Some(o.uuid))
                 && s.box_in_border(&o.bbox())
         }),
     }
@@ -329,7 +334,7 @@ pub fn apply_darkness_around(s: &mut Server, pos: [f64; 3], _source: Option<Ent>
 /// The warden's tick (server): vibrations, digging cooldown maintained if persistent,
 /// listener moved with the mob (eyes).
 pub fn pre_tick(s: &mut Server, m: &mut Mob) {
-    s.listener_move(Who::Mob(m.id), [m.pos[0], m.eye_y(), m.pos[2]]);
+    s.listener_move(Who::Mob(m.id), [m.pos()[0], m.eye_y(), m.pos()[2]]);
     s.vib_tick_mob(m);
     if (m.persistent || m.mount.vehicle.is_some())
         && let Some(b) = m.bm.brain.as_mut()
@@ -344,7 +349,7 @@ pub fn custom_ai_step(s: &mut Server, m: &mut Mob, b: &mut Brain) {
     s.bz_brain_tick(m, b);
     m.target = b.mem.attack.get();
     if (m.tick_count + m.id) % 120 == 0 {
-        apply_darkness_around(s, m.pos, Some(Ent::Mob(m.id)), 20.0);
+        apply_darkness_around(s, m.pos(), Some(Ent::Mob(m.id)), 20.0);
     }
     if m.tick_count % 20 == 0 {
         anger_tick(s, m);
@@ -450,7 +455,7 @@ pub fn after_hurt(s: &mut Server, m: &mut Mob, ty: &str, by: Option<Ent>) {
             s.mobs.rec.direct_source.unwrap_or_else(|| {
                 !s.dmg_tag(ty, "minecraft:is_projectile") && !s.dmg_tag(ty, "minecraft:is_explosion")
             });
-        let close = s.ent_pos(a).is_some_and(|p| super::super::mth::dist2(p, m.pos) < 25.0);
+        let close = s.ent_pos(a).is_some_and(|p| super::super::mth::dist2(p, m.pos()) < 25.0);
         if direct || close {
             set_attack_target(m, &mut b, a);
         }
@@ -594,7 +599,7 @@ pub fn sniffing_stop(s: &mut Server, m: &mut Mob, b: &mut Brain) {
     b.mem.x.is_sniffing.erase();
     let Some(e) = b.mem.attackable.get().filter(|&e| can_target(s, m, e)) else { return };
     let Some(p) = s.ent_pos(e) else { return };
-    if super::closer_than_xz_y(m.pos, p, 6.0, 20.0) {
+    if super::closer_than_xz_y(m.pos(), p, 6.0, 20.0) {
         increase_anger_at(s, m, b, Some(e), 35, true);
     }
     if !b.mem.x.disturbance.has() {
@@ -625,10 +630,10 @@ pub fn sonic_tick(s: &mut Server, m: &mut Mob, b: &mut Brain) {
     b.mem.x.sonic_sound_cooldown.set_exp((), i64::from(SONIC_DURATION) - SONIC_SOUND_DELAY);
     let Some(t) = b.mem.attack.get().filter(|&t| can_target(s, m, t)) else { return };
     let (Some(tp), Some(eye)) = (s.ent_pos(t), s.ent_eye(t)) else { return };
-    if !super::closer_than_xz_y(m.pos, tp, 15.0, 20.0) {
+    if !super::closer_than_xz_y(m.pos(), tp, 15.0, 20.0) {
         return;
     }
-    let src = [m.pos[0], m.pos[1] + f64::from(1.6f32), m.pos[2]];
+    let src = [m.pos()[0], m.pos()[1] + f64::from(1.6f32), m.pos()[2]];
     let d = [tp[0] - src[0], eye - src[1], tp[2] - src[2]];
     let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
     let n = crate::mobs::mth::normalize(d);
@@ -641,11 +646,11 @@ pub fn sonic_tick(s: &mut Server, m: &mut Mob, b: &mut Brain) {
     let hurt = match t {
         // Default knockback from the warden (direct source), then the boom's push.
         Ent::Player => {
-            s.player_hurt_by_mob(m, "minecraft:sonic_boom", 10.0, Some((m.pos[0] - tp[0], m.pos[2] - tp[2])))
+            s.player_hurt_by_mob(m, "minecraft:sonic_boom", 10.0, Some((m.pos()[0] - tp[0], m.pos()[2] - tp[2])))
         }
         Ent::Mob(id) => {
             let Some(i) = s.mob_index(id) else { return };
-            let Some(mut o) = s.mobs.list[i].take() else { return };
+            let Some(mut o) = s.mobs.list.take(i) else { return };
             let r = s.mob_hurt_by(&mut o, m, "minecraft:sonic_boom", 10.0);
             if r {
                 let res = o.attrs.knockback_resistance.value();
@@ -653,7 +658,7 @@ pub fn sonic_tick(s: &mut Server, m: &mut Mob, b: &mut Brain) {
                 o.vel = [o.vel[0] + n[0] * kh, o.vel[1] + n[1] * kv, o.vel[2] + n[2] * kh];
                 o.needs_sync = true;
             }
-            s.mobs.list[i] = Some(o);
+            s.mobs.list.put(i, o);
             return;
         }
     };
@@ -694,7 +699,7 @@ pub fn on_receive_vibration(s: &mut Server, m: &mut Mob, info: VibInfo, owner: O
     let mut suspicious = origin;
     let src = s.vib_source(&info).and_then(Src::living);
     if let Some(o) = owner {
-        if s.ent_pos(o).is_some_and(|op| super::super::mth::dist2(op, m.pos) < 900.0) {
+        if s.ent_pos(o).is_some_and(|op| super::super::mth::dist2(op, m.pos()) < 900.0) {
             if b.mem.x.recent_projectile.has() {
                 if can_target(s, m, o)
                     && let Some(op) = s.ent_pos(o)

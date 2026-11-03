@@ -609,7 +609,7 @@ impl Server {
                     return false;
                 }
                 *last_check = t;
-                self.here(b.mem.job_site).is_some_and(|p| closer_center(p, m.pos, 1.73))
+                self.here(b.mem.job_site).is_some_and(|p| closer_center(p, m.pos(), 1.73))
             }
             Beh::Harvest { pos, valid, .. } => {
                 if !self.rule("minecraft:mob_griefing", true) || m.villager[1] != PROF_FARMER {
@@ -620,7 +620,7 @@ impl Server {
                     for y in -1..=1 {
                         for z in -1..=1 {
                             let p =
-                                block_of([m.pos[0] + f64::from(x), m.pos[1] + f64::from(y), m.pos[2] + f64::from(z)]);
+                                block_of([m.pos()[0] + f64::from(x), m.pos()[1] + f64::from(y), m.pos()[2] + f64::from(z)]);
                             if self.harvest_valid(p) {
                                 valid.push(p);
                             }
@@ -666,7 +666,7 @@ impl Server {
                     }
                 }
                 let s = self.st(home);
-                closer_center(home, m.pos, 2.0)
+                closer_center(home, m.pos(), 2.0)
                     && self.btag_id(home, crate::tag_bits::TagId::VillagersCanSleepOnBed)
                     && !self.view().get_bool(s, "occupied")
             }
@@ -812,7 +812,7 @@ impl Server {
             }
             Beh::FollowTrader => self.follow_trader_ok(m),
             Beh::GoToPotentialJobSite => b.mem.potential_job_site.is_some(),
-            Beh::WorkAtPoi { .. } => self.here(b.mem.job_site).is_some_and(|p| closer_center(p, m.pos, 1.73)),
+            Beh::WorkAtPoi { .. } => self.here(b.mem.job_site).is_some_and(|p| closer_center(p, m.pos(), 1.73)),
             Beh::Harvest { worked, .. } => *worked < 200,
             Beh::Bonemeal { worked, crop, .. } => *worked < 80 && crop.is_some(),
             Beh::ShowTrades { look, .. } => self.show_trades_ok(m, b) && *look > 0 && b.mem.interaction.is_some(),
@@ -826,7 +826,7 @@ impl Server {
             }
             Beh::SleepInBed { .. } => {
                 let Some(home) = b.mem.home.map(|g| g.pos) else { return false };
-                b.is_active(Act::Rest) && m.pos[1] > f64::from(home[1]) + 0.4 && closer_center(home, m.pos, 1.14)
+                b.is_active(Act::Rest) && m.pos()[1] > f64::from(home[1]) + 0.4 && closer_center(home, m.pos(), 1.14)
             }
             Beh::TradeWithVillager { .. } => self.target_valid(m, b, b.mem.interaction),
             Beh::MakeLove { birth } => t <= *birth && self.breeding_possible(m, b),
@@ -882,7 +882,7 @@ impl Server {
             Beh::Harvest { pos, next_ok, worked, valid } => self.harvest_tick(m, b, pos, next_ok, worked, valid, t),
             Beh::Bonemeal { next_cycle, worked, crop, .. } => {
                 let Some(p) = *crop else { return };
-                if t >= *next_cycle && closer_center(p, m.pos, 1.0) {
+                if t >= *next_cycle && closer_center(p, m.pos(), 1.0) {
                     let has = self.npc_count(m, "minecraft:bone_meal") > 0;
                     if has && self.grow_crop(p) {
                         self.npc_remove(m, "minecraft:bone_meal", 1);
@@ -966,8 +966,8 @@ impl Server {
             }
             Beh::TradeWithVillager { trades } => {
                 let Some(Ent::Mob(id)) = b.mem.interaction else { return };
-                let Some(tp) = self.mob_ref(id).map(|o| o.pos) else { return };
-                if dist2(m.pos, tp) > 5.0 {
+                let Some(tp) = self.mob_ref(id).map(|o| o.pos()) else { return };
+                if dist2(m.pos(), tp) > 5.0 {
                     return;
                 }
                 self.lock_gaze(m, b, id, 0.5, 2);
@@ -987,8 +987,8 @@ impl Server {
             }
             Beh::MakeLove { birth } => {
                 let Some(Ent::Mob(id)) = b.mem.breed else { return };
-                let Some(tp) = self.mob_ref(id).map(|o| o.pos) else { return };
-                if dist2(m.pos, tp) > 5.0 {
+                let Some(tp) = self.mob_ref(id).map(|o| o.pos()) else { return };
+                if dist2(m.pos(), tp) > 5.0 {
                     return;
                 }
                 self.lock_gaze(m, b, id, 0.5, 2);
@@ -1125,7 +1125,7 @@ impl Server {
                 let d2: i32 = (0..3).map(|k| (p[k] - me[k]) * (p[k] - me[k])).sum();
                 if meet.dim == self.dim_key() && d2 < 9 && self.bname(p) == "minecraft:bell" {
                     self.villager_ring_bell(m, p);
-                    if closer_center(p, m.pos, 32.0) {
+                    if closer_center(p, m.pos(), 32.0) {
                         b.mem.heard_bell = Some(self.time);
                     }
                 }
@@ -1184,7 +1184,7 @@ impl Server {
                     .poi_in_range(home, here, close + 1, Occupancy::Any)
                     .first()
                     .map(|r| r.pos)
-                    .filter(|&p| closer_center(p, m.pos, f64::from(close)));
+                    .filter(|&p| closer_center(p, m.pos(), f64::from(close)));
                 let found = near
                     .or_else(|| {
                         let mut list: Vec<[i32; 3]> =
@@ -1199,7 +1199,7 @@ impl Server {
                     b.mem.breed = None;
                     b.mem.interaction = None;
                     b.mem.hiding_place = Some(p);
-                    if !closer_center(p, m.pos, f64::from(close)) {
+                    if !closer_center(p, m.pos(), f64::from(close)) {
                         b.mem.walk = Some(Walk { target: Track::Block(p), speed, close });
                     }
                 }
@@ -1226,7 +1226,7 @@ impl Server {
             Trig::Validate { mem, job } => {
                 let (mem, job) = (*mem, *job);
                 let Some(p) = self.here(mem.get(b)) else { return false };
-                if !closer_center(p, m.pos, 16.0) {
+                if !closer_center(p, m.pos(), 16.0) {
                     return false;
                 }
                 let ty = self.poi_type(p);
@@ -1263,7 +1263,7 @@ impl Server {
                 let Some(d) = self.life.drops.iter().find(|d| d.id == id) else { return false };
                 let p = d.pos;
                 // Followed item (gaze at its eyes), within 4 blocks and inside the world border.
-                if dist2(p, m.pos) < 16.0 && self.may_interact(block_of(p)) && m.can_pickup {
+                if dist2(p, m.pos()) < 16.0 && self.may_interact(block_of(p)) && m.can_pickup {
                     b.mem.look = Some(Track::Item(id, true));
                     b.mem.walk = Some(Walk { target: Track::Item(id, false), speed: 0.5, close: 0 });
                     true
@@ -1275,7 +1275,7 @@ impl Server {
             Trig::YieldJobSite => self.yield_job_site(m, b),
             Trig::AssignProfession => {
                 let Some(g) = b.mem.potential_job_site else { return false };
-                if !closer_center(g.pos, m.pos, 2.0) {
+                if !closer_center(g.pos, m.pos(), 2.0) {
                     return false;
                 }
                 b.mem.potential_job_site = None;
@@ -1312,7 +1312,7 @@ impl Server {
             }
             Trig::StrollAroundPoi { mem, speed, max, next } => {
                 let Some(p) = self.here(mem.get(b)) else { return false };
-                if !closer_center(p, m.pos, f64::from(*max)) {
+                if !closer_center(p, m.pos(), f64::from(*max)) {
                     return false;
                 }
                 if t <= *next {
@@ -1325,7 +1325,7 @@ impl Server {
             }
             Trig::StrollToPoi { mem, speed, close, max, next } => {
                 let Some(p) = self.here(mem.get(b)) else { return false };
-                if !closer_center(p, m.pos, f64::from(*max)) {
+                if !closer_center(p, m.pos(), f64::from(*max)) {
                     return false;
                 }
                 if t <= *next {
@@ -1341,7 +1341,7 @@ impl Server {
                     return false;
                 }
                 let target = list[self.mobs.rng.next_int_bound(list.len() as i32) as usize];
-                if closer_center(job.pos, m.pos, 6.0) {
+                if closer_center(job.pos, m.pos(), 6.0) {
                     if t > *next {
                         b.mem.walk = Some(Walk { target: Track::Block(target), speed: 0.5, close: 1 });
                         *next = t + 100;
@@ -1355,7 +1355,7 @@ impl Server {
                 if b.mem.interaction.is_some() || b.mem.visible.is_none() {
                     return false;
                 }
-                let me = m.pos;
+                let me = m.pos();
                 let found = self
                     .find_closest(m, b, |s, e| e == Ent::Player && s.ent_pos(e).is_some_and(|p| dist2(p, me) <= 16.0));
                 match found {
@@ -1413,7 +1413,7 @@ impl Server {
                 if b.mem.look.is_some() || b.mem.visible.is_none() {
                     return false;
                 }
-                let me = m.pos;
+                let me = m.pos();
                 let k = *kind;
                 let found = self
                     .find_closest(m, b, |s, e| s.ent_is(e, k) && s.ent_pos(e).is_some_and(|p| dist2(p, me) <= 64.0));
@@ -1438,7 +1438,7 @@ impl Server {
                 if self.find_closest(m, b, valid).is_none() {
                     return false;
                 }
-                let me = m.pos;
+                let me = m.pos();
                 let found =
                     self.find_closest(m, b, |s, e| s.ent_pos(e).is_some_and(|p| dist2(p, me) <= 64.0) && valid(s, e));
                 if let Some(e) = found {
@@ -1549,14 +1549,14 @@ impl Server {
                 let Some(meet) = b.mem.meeting_point else { return false };
                 if self.mobs.rng.next_int_bound(100) != 0
                     || meet.dim != self.dim_key()
-                    || !closer_center(meet.pos, m.pos, 4.0)
+                    || !closer_center(meet.pos, m.pos(), 4.0)
                 {
                     return false;
                 }
                 if self.find_closest(m, b, |s, e| s.ent_is(e, LookKind::Villager)).is_none() {
                     return false;
                 }
-                let me = m.pos;
+                let me = m.pos();
                 let found = self.find_closest(m, b, |s, e| {
                     s.ent_is(e, LookKind::Villager) && s.ent_pos(e).is_some_and(|p| dist2(p, me) <= 32.0)
                 });
@@ -1568,7 +1568,7 @@ impl Server {
                 true
             }
             Trig::CalmDown => {
-                let near = b.mem.hurt_by_entity.and_then(|e| self.ent_pos(e)).is_some_and(|p| dist2(p, m.pos) <= 36.0);
+                let near = b.mem.hurt_by_entity.and_then(|e| self.ent_pos(e)).is_some_and(|p| dist2(p, m.pos()) <= 36.0);
                 if !(b.mem.hurt_by || b.mem.hostile.is_some() || near) {
                     b.mem.hurt_by = false;
                     b.mem.hurt_by_entity = None;
@@ -1584,7 +1584,7 @@ impl Server {
                     return false;
                 }
                 let Some(avoid) = self.ent_pos(e) else { return false };
-                if dist2(m.pos, avoid) >= 36.0 {
+                if dist2(m.pos(), avoid) >= 36.0 {
                     return false;
                 }
                 for _ in 0..10 {
@@ -1664,7 +1664,7 @@ impl Server {
     }
 
     fn follow_trader_ok(&self, m: &Mob) -> bool {
-        m.alive() && self.npc_trading(m) && !m.in_water && !self.hurt_recently(m) && dist2(m.pos, self.pos) <= 16.0
+        m.alive() && self.npc_trading(m) && !m.in_water && !self.hurt_recently(m) && dist2(m.pos(), self.pos) <= 16.0
     }
 
     fn follow_trader(&self, b: &mut Brain) {
@@ -1702,7 +1702,7 @@ impl Server {
         valid: &mut Vec<[i32; 3]>,
         t: i64,
     ) {
-        if !pos.is_none_or(|p| closer_center(p, m.pos, 1.0)) {
+        if !pos.is_none_or(|p| closer_center(p, m.pos(), 1.0)) {
             return;
         }
         if let Some(p) = *pos
@@ -1758,7 +1758,7 @@ impl Server {
 
     fn show_trades_ok(&self, m: &Mob, b: &Brain) -> bool {
         let Some(t) = b.mem.interaction else { return false };
-        t == Ent::Player && m.alive() && self.ent_alive(t) && !m.is_baby() && dist2(m.pos, self.pos) <= 17.0
+        t == Ent::Player && m.alive() && self.ent_alive(t) && !m.is_baby() && dist2(m.pos(), self.pos) <= 17.0
     }
 
     fn hero_visible(&self, b: &Brain) -> bool {
@@ -1777,7 +1777,7 @@ impl Server {
     }
 
     fn villager_sleeping_at(&self, p: [i32; 3]) -> bool {
-        self.mobs.list.iter().flatten().any(|o| {
+        self.mobs.list.iter().any(|o| {
             o.kind == Kind::Villager
                 && o.npc.as_ref().is_some_and(|n| n.sleeping.is_some())
                 && o.touches(&rc_physics::Aabb {
@@ -2255,19 +2255,19 @@ impl Server {
                 keep.push(d);
                 continue;
             }
-            if !closer_center(d, m.pos, 3.0) || !self.is_mob_door(d) || !self.view().get_bool(self.st(d), "open") {
+            if !closer_center(d, m.pos(), 3.0) || !self.is_mob_door(d) || !self.view().get_bool(self.st(d), "open") {
                 continue;
             }
             let crossing = |o: &Mob| {
                 o.kind == m.kind
                     && o.id != m.id
-                    && closer_center(d, o.pos, 2.0)
+                    && closer_center(d, o.pos(), 2.0)
                     && o.nav.path.as_ref().is_some_and(|p| {
                         !p.is_done() && p.next > 0 && (p.nodes[p.next - 1].0 == d || p.nodes[p.next].0 == d)
                     })
             };
             let others = match near {
-                None => self.mobs.list.iter().flatten().any(|o| crossing(o)),
+                None => self.mobs.list.iter().any(crossing),
                 Some(n) => n.iter().any(|e| matches!(*e, Ent::Mob(id) if self.mob_ref(id).is_some_and(crossing))),
             };
             if !others {
@@ -2301,7 +2301,7 @@ impl Server {
     /// Visible sky and nothing blocking movement above the
     /// mob's height.
     pub(crate) fn no_blocks_above(&self, m: &Mob, p: [i32; 3]) -> bool {
-        self.can_see_sky(p) && f64::from(self.hm_motion_blocking(p[0], p[2])) <= m.pos[1]
+        self.can_see_sky(p) && f64::from(self.hm_motion_blocking(p[0], p[2])) <= m.pos()[1]
     }
 
     /// Celebration: cheer (1 in 100), rocket of a random color (1 in 200, under the sky).
@@ -2326,7 +2326,7 @@ impl Server {
             ]);
             let mut rocket = Stack { id: "minecraft:firework_rocket".into(), count: 1, components: None };
             crate::items::set_component(&mut rocket, "minecraft:fireworks", fw);
-            let at = [m.pos[0], m.eye_y(), m.pos[2]];
+            let at = [m.pos()[0], m.eye_y(), m.pos()[2]];
             let p = self.new_firework(at, rocket.clone(), Some(m.uuid), false);
             self.proj_spawn(p, &rocket);
         }
