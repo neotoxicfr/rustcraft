@@ -103,7 +103,7 @@ fn index_equals_scan() {
                     mobs.list.remove(r.below(n as u64) as usize);
                     mobs.index.mark_stale();
                 }
-                // End of tick: removals then rebuild.
+                // End of tick: removals then index brought up to date.
                 6 => {
                     taken.clear();
                     for s in mobs.list.iter_mut() {
@@ -111,10 +111,7 @@ fn index_equals_scan() {
                             *s = None;
                         }
                     }
-                    let before = mobs.list.len();
-                    mobs.list.retain(Option::is_some);
-                    let shifted = mobs.list.len() != before;
-                    mobs.index.refresh(&mobs.list, shifted);
+                    mobs.drop_empty_slots();
                 }
                 // Duplicate: same identifier and same UUID added twice.
                 7 if n > 0 && round % 4 == 0 => {
@@ -163,6 +160,72 @@ fn index_sabotage_vu() {
 
 fn kind_scan(mobs: &Mobs, k: Kind) -> Vec<i32> {
     mobs.list.iter().flatten().filter(|o| o.kind == k).map(|o| o.id).collect()
+}
+
+fn kinds_scan(mobs: &Mobs, ks: &[Kind]) -> Vec<i32> {
+    mobs.list.iter().flatten().filter(|o| ks.contains(&o.kind)).map(|o| o.id).collect()
+}
+
+/// World of `n` mobs of five species interleaved (the per-species lists cross each other).
+fn mixed_world(r: &mut Rng, n: usize) -> Mobs {
+    let kinds = [Kind::Cow, Kind::Zombie, Kind::Husk, Kind::Bee, Kind::Panda];
+    let mut mobs = Mobs::default();
+    for i in 0..n {
+        let mut m = random_mob(r, i as i32 * 2 + 1, 32.0);
+        m.kind = kinds[r.below(kinds.len() as u64) as usize];
+        mobs.push(Box::new(m));
+    }
+    mobs
+}
+
+/// Mass removals (TNT in a crowd, `/kill` of a part, first or last mob, a block, everything):
+/// after the tail re-index, the index has exactly the entries of an index rebuilt from scratch.
+#[test]
+fn tail_reindex_equals_rebuild() {
+    let mut r = Rng(0x7A11);
+    let n = 400;
+    type Removed<'a> = &'a dyn Fn(usize, &mut Rng) -> bool;
+    // Tails shorter than half the list go through the tail re-index, the others through a rebuild.
+    let patterns: [(&str, Removed); 8] = [
+        ("half", &|i, _| i % 2 == 0),
+        ("first", &|i, _| i == 0),
+        ("last ten", &|i, _| i >= n - 10),
+        ("early block", &|i, _| (150..230).contains(&i)),
+        ("late block", &|i, _| (250..330).contains(&i)),
+        ("random tenth of the second half", &|i, r| i >= n / 2 && r.below(10) == 0),
+        ("everything", &|_, _| true),
+        ("one late", &|i, _| i == n - 37),
+    ];
+    for (what, gone) in patterns {
+        let mut mobs = mixed_world(&mut r, n);
+        for i in 0..n {
+            if gone(i, &mut r) {
+                mobs.list[i] = None;
+            }
+        }
+        mobs.drop_empty_slots();
+        mobs.index.assert_same_as_rebuilt(&mobs.list, what);
+    }
+    // Sort after a mob came back with an older rank: same entries as a rebuild.
+    for _ in 0..50 {
+        let mut mobs = mixed_world(&mut r, 100);
+        let i = r.below(100) as usize;
+        if let Some(m) = mobs.list[i].as_mut() {
+            m.rank = r.below(m.rank);
+        }
+        mobs.sort_by_rank();
+        mobs.index.assert_same_as_rebuilt(&mobs.list, "sort");
+    }
+}
+
+/// The species list a zombie alerts is exactly the zombie class without the zombified piglin.
+#[test]
+fn zombie_class_matches_the_tag() {
+    use super::goals::ZOMBIE_CLASS;
+    for k in Kind::ALL {
+        let class = k.zombie_like() && k != Kind::ZombifiedPiglin;
+        assert_eq!(ZOMBIE_CLASS.contains(&k), class, "{k:?}");
+    }
 }
 
 /// Per-species index: repository mutations (additions by `push` or direct, take-outs/put-backs, portal
@@ -214,10 +277,14 @@ fn species_index_equals_scan() {
                             *s = None;
                         }
                     }
-                    let before = mobs.list.len();
-                    mobs.list.retain(Option::is_some);
-                    let shifted = mobs.list.len() != before;
-                    mobs.index.refresh(&mobs.list, shifted);
+                    mobs.drop_empty_slots();
+                }
+                // A mob back with an older rank (rejoined chunk), list put back in rank order.
+                6 if n > 0 && taken.is_empty() => {
+                    if let Some(m) = mobs.list[r.below(n as u64) as usize].as_mut() {
+                        m.rank = r.below(m.rank.max(1));
+                    }
+                    mobs.sort_by_rank();
                 }
                 _ => {}
             }
@@ -226,6 +293,12 @@ fn species_index_equals_scan() {
                 let got: Vec<i32> = mobs.of_kind(k).map(|o| o.id).collect();
                 assert_eq!(got, kind_scan(&mobs, k), "round {round} step {step} {k:?}");
             }
+            // Several species, one named twice, interleaved in the list: same sequence as the scan,
+            // read-only and mutable.
+            let pick = [kinds[step % 5], kinds[(step + 2) % 5], kinds[step % 5]];
+            let want = kinds_scan(&mobs, &pick);
+            assert_eq!(mobs.of_kinds(pick).map(|o| o.id).collect::<Vec<_>>(), want, "round {round} step {step}");
+            assert_eq!(mobs.of_kinds_mut(pick).map(|o| o.id).collect::<Vec<_>>(), want, "round {round} step {step}");
         }
         // The index is indeed serving (not only the fallback) after an end of tick.
         mobs.index.refresh(&mobs.list, true);
@@ -412,6 +485,98 @@ fn bench_of_kind() {
 
 fn kind_scan_count(mobs: &Mobs) -> usize {
     std::hint::black_box(mobs).list.iter().flatten().filter(|o| o.kind == Kind::Shulker).count()
+}
+
+/// The single-species walk as it was before `of_kinds` (bench reference).
+fn single_species_walk(mobs: &Mobs, k: Kind) -> impl Iterator<Item = &Mob> {
+    let (s, all) = match mobs.index.kind_slots(&mobs.list, k) {
+        Some(s) => (s, &mobs.list[..0]),
+        None => (&[][..], &mobs.list[..]),
+    };
+    s.iter()
+        .filter_map(|&i| mobs.list[i as usize].as_deref())
+        .chain(all.iter().flatten().map(|b| &**b))
+        .filter(move |o| o.kind == k)
+}
+
+/// ns per query on 1,000 mobs: species absent (the common case of an alert or a neighbour search
+/// far from its species), then 1 % present; one species and three merged.
+#[test]
+#[ignore = "measurement bench"]
+fn bench_of_kinds() {
+    super::index::set_verify(false);
+    let reps = 1_000_000u32;
+    for present in [false, true] {
+        let mut r = Rng(13);
+        let mut mobs = Mobs::default();
+        for i in 0..1000 {
+            let mut m = random_mob(&mut r, i, 32.0);
+            m.kind = match i % 100 {
+                0 if present => Kind::Shulker,
+                50 if present => Kind::Vex,
+                _ => Kind::Cow,
+            };
+            mobs.push(Box::new(m));
+        }
+        let three = [Kind::Shulker, Kind::Vex, Kind::Evoker];
+        let b = std::hint::black_box;
+        let ns = |t: f64| t * 1e6 / f64::from(reps);
+        let (a, t_scan) = time(|| (0..reps).map(|_| kind_scan_count(b(&mobs))).sum::<usize>());
+        let (c, t_before) = time(|| (0..reps).map(|_| single_species_walk(b(&mobs), Kind::Shulker).count()).sum::<usize>());
+        let (d, t_one) = time(|| (0..reps).map(|_| b(&mobs).of_kind(Kind::Shulker).count()).sum::<usize>());
+        let (e, t_scan3) = time(|| {
+            (0..reps).map(|_| b(&mobs).list.iter().flatten().filter(|o| three.contains(&o.kind)).count()).sum::<usize>()
+        });
+        let (f, t_three) = time(|| (0..reps).map(|_| b(&mobs).of_kinds(three).count()).sum::<usize>());
+        let (g, t_three_mut) =
+            time(|| (0..reps).map(|_| std::hint::black_box(&mut mobs).of_kinds_mut(three).count()).sum::<usize>());
+        assert!(a == c && c == d && e == f && f == g);
+        eprintln!(
+            "bench_of_kinds N=1000 present={present}: one species scan {:.1} ns, before {:.1} ns, of_kind {:.1} ns; \
+             three species scan {:.1} ns, of_kinds {:.1} ns, of_kinds_mut {:.1} ns",
+            ns(t_scan),
+            ns(t_before),
+            ns(t_one),
+            ns(t_scan3),
+            ns(t_three),
+            ns(t_three_mut)
+        );
+    }
+}
+
+/// End-of-tick refresh after removals on 1,000 and 5,000 mobs: whole rebuild against the tail
+/// re-index (µs per refresh). Removal patterns: one mob near the end, the last ten, half (TNT in
+/// the crowd), one mob at the front.
+#[test]
+#[ignore = "measurement bench"]
+fn bench_tail_refresh() {
+    super::index::set_verify(false);
+    for n in [1000usize, 5000] {
+        let mut r = Rng(17);
+        let before = mixed_world(&mut r, n);
+        let patterns: [(&str, &dyn Fn(usize) -> bool); 4] = [
+            ("one near the end", &|i| i == n - n / 20),
+            ("last ten", &|i| i >= n - 10),
+            ("half", &|i| i % 2 == 1),
+            ("first", &|i| i == 0),
+        ];
+        for (what, gone) in patterns {
+            let after: Vec<Option<Box<Mob>>> =
+                before.list.iter().enumerate().filter(|(i, _)| !gone(*i)).map(|(_, m)| m.clone()).collect();
+            let first = (0..n).position(gone).expect("a removal");
+            let reps = 2000;
+            let mut index = super::index::MobIndex::default();
+            let (mut t_full, mut t_tail) = (0.0, 0.0);
+            for _ in 0..reps {
+                index.rebuild(&before.list);
+                t_full += time(|| index.rebuild(std::hint::black_box(&after))).1;
+                index.rebuild(&before.list);
+                t_tail += time(|| index.refresh_from(std::hint::black_box(&after), first, n)).1;
+            }
+            let us = |t: f64| t * 1e3 / f64::from(reps);
+            eprintln!("bench_tail_refresh N={n} {what}: rebuild {:.1} µs, tail {:.1} µs", us(t_full), us(t_tail));
+        }
+    }
 }
 
 /// Neighbour sampling of each mob (core of `mob_push_entities`) at the density of the

@@ -174,13 +174,10 @@ impl Server {
         for b in bars {
             super::wither::boss::bar_removed(self, b);
         }
-        let before = self.mobs.list.len();
         for u in uuids {
             self.entity_scores_removed(u);
         }
-        self.mobs.list.retain(Option::is_some);
-        let shifted = self.mobs.list.len() != before;
-        self.mobs.index.refresh(&self.mobs.list, shifted);
+        self.mobs.drop_empty_slots();
         if !gone.is_empty() {
             let _ = self.send(rc_client::Event::Entity(rc_client::EntityEvent::Remove(gone)));
         }
