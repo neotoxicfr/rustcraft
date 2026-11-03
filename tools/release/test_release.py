@@ -1,8 +1,8 @@
 """Release tool tests (`python -I tools/release/test_release.py`): archives identical byte for byte
 whatever the date, the order and the place of the input files; path hiding writes a valid cargo
 config (C compiler included on Linux) and finds the paths left in a binary; the committed linker
-flag, the release/rehearsal build command, the check of the shipped file and the rehearsal's second
-place stay as they must be. Expected values are stored here."""
+flag, the release/rehearsal build command, the commit date set before every build (local recipe
+included), the check of the shipped file and the rehearsal's second place stay as they must be. Expected values are stored here."""
 import gzip
 import io
 import os
@@ -140,6 +140,20 @@ class Workflows(unittest.TestCase):
             text = read_text(os.path.join(pack.ROOT, ".github", "workflows", name))
             self.assertIn("exe=pkg/rustcraft\n", text, name)
             self.assertLess(text.index("strip pkg/rustcraft"), text.index("hide_paths.py check"), name)
+
+    def test_commit_date_is_set_before_every_build(self):
+        # On Linux gcc writes the clock into mimalloc's "built on" line unless SOURCE_DATE_EPOCH is set,
+        # so the local recipe and both workflows must set it before cargo builds the C code.
+        def date_comes_before_build(text):
+            date = text.find("SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)")
+            return date != -1 and date < text.index("cargo build --locked --release -p rc-app")
+
+        for name in ("release.yml", "reproducibility.yml"):
+            text = read_text(os.path.join(pack.ROOT, ".github", "workflows", name))
+            self.assertTrue(date_comes_before_build(text), name)
+        doc = read_text(os.path.join(pack.ROOT, "docs", "reproducible-builds.md"))
+        recipe = doc[doc.index("## Build the executable the way a release does"):]
+        self.assertTrue(date_comes_before_build(recipe), "docs/reproducible-builds.md")
 
     def test_rehearsal_builds_twice_at_different_paths(self):
         text = read_text(os.path.join(pack.ROOT, ".github", "workflows", "reproducibility.yml"))

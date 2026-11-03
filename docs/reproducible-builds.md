@@ -11,6 +11,7 @@ so anyone can check that a published file comes from the published source.
 | Absolute path of the `.pdb` in the debug directory | rustc already cuts it down to the file name (`/PDBALTPATH:%_PDB%`) |
 | Absolute paths of the dependencies' sources (`C:\Users\<name>\.cargo\registry\...`) in every panic message | `--remap-path-prefix` generated per machine by `tools/release/hide_paths.py config`, passed to cargo with `--config` |
 | Linux: the same paths in the debug info of the C dependencies (mimalloc, libdeflate, ring), built by the `cc` crate with `-g`, and through it in the GNU build id, which `strip` keeps | the same file sets `CFLAGS` to `-ffile-prefix-map=...` (`cc` does not translate rustc's remap flags; a `CFLAGS` already set in the environment wins over the file) |
+| Linux: the date and time of the C build, written by mimalloc into its "built on" line (printed in verbose mode, so kept in the executable), and through it in the GNU build id | gcc writes the date of `SOURCE_DATE_EPOCH` instead of the clock; the workflows set it to the commit date before the build |
 | Dates, order, owner and "created by" bytes of the archive entries | `tools/release/pack.py`, with the commit date as `SOURCE_DATE_EPOCH` |
 | The toolchain, the dependencies, the actions | `rust-toolchain.toml`, `--locked`, actions pinned to a commit |
 
@@ -32,7 +33,10 @@ a PDB (and so loses the file that names its functions), or keep `link.exe`.
 
 ## Build the executable the way a release does
 
+In a POSIX shell (Git Bash on Windows, as the workflows):
+
 ```
+export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
 python -I tools/release/hide_paths.py config target/hide-paths.toml
 cargo build --locked --release -p rc-app --config target/hide-paths.toml
 python -I tools/release/hide_paths.py check target/release/rustcraft.exe
