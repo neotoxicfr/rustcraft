@@ -4551,3 +4551,80 @@ the quiet-machine scene bench: "generator ready", first batch and in-game times 
 (dedicated thread against `rayon` against `0`), `plains12` and `crowd` as controls.
 Lead not done: read the tables from the official game through the extractor (each state as the
 game itself turns and mirrors it; a data change for ≈ 2 ms left).
+
+## C1-M18: jigsaw assembly, failed elements and expansion heights not worked out again (03/11, loaded machine)
+
+`jigsaw.rs`: the assembly (one 200-line function) is cut into short steps (`Assembly`: grow a
+piece, fill a junction, try an element, first fit, expansion height, place) with five work
+savings behind their switches, default = new, `=0` = old path:
+`RUSTCRAFT_OPT_JIGSAW_FAILED_ELEMENT_MEMO` (a pool lists an element once per unit of weight; a
+second trial of the same element at the same junction meets the same free space, so it fails
+again: only its draws are replayed, the shuffle of the four rotations then, per rotation, a shuffle
+of its junction count over a list of unit values, rejection loop included);
+`RUSTCRAFT_OPT_JIGSAW_EXPAND_MEMO` (expansion height of the village trick per (element, rotation)
+for the start: two pool lookups per junction of every rotation trial before);
+`RUSTCRAFT_OPT_JIGSAW_REUSED_BUFFERS` (candidate and junction order buffers kept from one trial to
+the next, candidates shuffled in place); `RUSTCRAFT_OPT_JIGSAW_SPATIAL_GRID` (removed boxes of a
+free space indexed by 16 × 16 columns past 100 boxes); `RUSTCRAFT_OPT_LAZY_POOLS` (pool files kept
+as bytes, shared with the data, parsed at their first lookup). `RUSTCRAFT_OPT_JIGSAW_RECENT_FIRST`
+(free space test from the most recent box) is OFF by default (`=1` enables it).
+
+Work counters (tests only, counted in a pass of their own: counting during the timed passes cost
+up to 80 % on a village), 60 assemblies anywhere per structure (every biome accepted), all new:
+a plains village did 100,835 pool lookups, 3,738 element trials of which 1,944 repeats at the same
+junction, 7,843 free space tests over 32 boxes on average (197 at most), 222 ground reads
+(0.085 ms in all: not a lead); trial chambers 4,046 trials of which 3,400 repeats (84 %).
+
+Bench `templ_tests::bench_jigsaw_assembly_per_structure` (`cargo test --release -p rc-worldgen
+--lib bench_jigsaw_assembly_per_structure -- --ignored --nocapture`), 1 thread, paths
+interleaved start by start (a load peak falls on all of them), best of 3 per start, ms per
+assembly, mean (worst):
+
+| Structure | old | C1-M11 (series 2 default) | all new | pool lookups, real trials (C1-M11 → new) |
+|---|---|---|---|---|
+| plains village | 7.58 (14.7) | 3.97 (7.79) | 0.83 (1.65) | 100,835 → 1,633; 3,738 → 1,794 |
+| desert village | 3.66 (11.2) | 1.89 (5.93) | 0.41 (1.15) | 49,691 → 1,062 |
+| savanna village | 5.53 (11.6) | 2.73 (5.77) | 0.66 (1.39) | 57,926 → 1,240 |
+| snowy village | 7.11 (18.5) | 3.44 (7.15) | 0.74 (1.66) | 81,214 → 1,360 |
+| taiga village | 9.44 (29.7) | 3.87 (9.25) | 0.82 (2.83) | 86,308 → 1,558 |
+| pillager outpost | 0.174 | 0.057 | 0.041 | |
+| trial chambers | 15.9 (35.8) | 5.44 (11.3) | 1.56 (3.79) | 4,046 → 646 trials |
+| ancient city | 1.29 | 0.455 | 0.260 | |
+| bastion remnant | 0.265 | 0.119 | 0.083 | |
+
+Each saving alone over C1-M11 (plains village): failed-element memo 1.82, expansion memo 1.74,
+reused buffers 3.49, spatial grid 3.92, recent first 3.99, lazy pools 3.91 (no effect on the
+assembly: the noise). All new but one (reference: all but the lazy pools, 0.81, since "all new"
+is timed right after the slowest path): without the failed-element memo 1.35, without the
+expansion memo 1.60, without the buffers 1.04, without the grid 0.81, without recent first 0.80.
+Trial chambers: without the failed-element memo 4.79 against 1.42-1.56.
+
+- Recent first: deterministic count of the boxes compared, plains village 69,288 → 110,347
+  (+59 %: its trials mostly meet the oldest, central boxes), trial chambers 30,361 → 14,056,
+  bastion 5,099 → 4,298; time within noise everywhere. Off by default, kept for the quiet-machine
+  bench.
+- Spatial grid: compared boxes −7 % (plains 69,288 → 64,129), time within noise (the grid only
+  exists past 100 boxes, and a village holds 32 on average). Kept on; to settle on the scene bench.
+- Lazy pools: generator start reads the pools in 4.65 ms (every file parsed) against 0.03 ms
+  (bytes kept); a world only parses the pools of the structures it meets, at their first lookup
+  (single cell per pool, as before). Memory: the parsed text of the unused pools is no longer
+  kept (the bytes are the data's, shared).
+- Starts of the 128 × 128 chunk square (`bench_jigsaw_starts`, seed 20261011; 15 trial chambers
+  are its only jigsaw starts), ms for 1, 2, 4, 8, 16, 32 threads: old 356, 200, 114, 224, 291, 298;
+  C1-M11 172, 87, 46, 26, 25, 18; all new 99, 50, 29, 17, 12, 11. Trial chambers start 17.7 ms
+  (old) → 1.6 ms. Nether square (13 bastions among 493 starts): within noise.
+- Placement: 1 core by nature (single random draw, priority queue); the parallelism stays between
+  starts (series 2). GPU: not applicable (branches, hash tables, sequential randomness).
+- Equivalence: `jigsaw_assembly_anywhere_every_path_matches_old` (500 villages, 500 outposts,
+  trial chambers and ancient cities, 100 bastions: pieces and the next draw of the start's random
+  source after each assembly = stored fingerprints taken with the code from before the mission,
+  then every path, one thread per path: each saving alone, the memo over the three junction views,
+  all new but each saving); `jigsaw_starts_every_path_matches_old` (same paths on the squares of 3
+  seeds, main world and Nether); `starts_match_stored_values` (EXPECTED_STARTS and
+  EXPECTED_STARTS_NBT); `lazy_pools_match_pools_read_at_start`. Sabotages, each detected: memo
+  kept between junctions, replay without the rotation shuffle, expansion memo keyed without the
+  element, grid missing its last cell, recent-first walk skipping a box, candidate buffer not
+  cleared, lazy pool without its fallback. (An expansion memo keyed without the rotation is not
+  detected, and rightly: a rotation turns the box and the junctions together.)
+- To re-measure on a quiet machine: scenes `fresh-village-rd16` (peak at the start chunk of a
+  village) and `generation` ("generator ready" for the lazy pools).
