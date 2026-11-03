@@ -34,13 +34,49 @@ pub struct CullPaths {
     pub pile: bool,
     /// Game rule by face shapes (`RUSTCRAFT_OPT_SHAPECULL`); off: old rule.
     pub shape: bool,
+    /// 18³ grids filled row by row: the 16 contiguous cells of each (y, z) row of the section
+    /// copied at once, the border rows and stacks apart (`RUSTCRAFT_OPT_MESHGRIDROWS`); off: one
+    /// vertical stack (step 324) per (x, z).
+    pub fill_rows: bool,
+    /// Solid render mask of the section visibility read from the property grid's
+    /// [`SOLID_RENDER_BIT`] instead of a second walk over the states (`RUSTCRAFT_OPT_MESHPROPBITS`,
+    /// with the grid).
+    pub solid_from_props: bool,
+    /// Candidate rows computed on fixed 16-cell slices (AVX2 version picked at run time), the
+    /// surely hidden faces kept per candidate for the per-block loop
+    /// (`RUSTCRAFT_OPT_MESHROWCANDSIMD`, with `rows`).
+    pub simd_candidates: bool,
+    /// Partial remesh: a section next to the remeshed ones, outside the remesh, decodes only its
+    /// two border rows instead of all its states (`RUSTCRAFT_OPT_MESHEDGEROWS`).
+    pub border_rows_only: bool,
 }
 
 impl CullPaths {
-    pub const ALL: CullPaths = CullPaths { props: true, palprops: true, rows: true, pile: true, shape: true };
-    pub const OLD: CullPaths = CullPaths { props: false, palprops: false, rows: false, pile: false, shape: false };
-    /// Default: paths that win in the micro-bench (`docs/perf.md`, C2-M10), game rule.
-    pub const DEFAULT: CullPaths = CullPaths { props: true, palprops: false, rows: true, pile: true, shape: true };
+    pub const ALL: CullPaths = CullPaths {
+        props: true,
+        palprops: true,
+        rows: true,
+        pile: true,
+        shape: true,
+        fill_rows: true,
+        solid_from_props: true,
+        simd_candidates: true,
+        border_rows_only: true,
+    };
+    pub const OLD: CullPaths = CullPaths {
+        props: false,
+        palprops: false,
+        rows: false,
+        pile: false,
+        shape: false,
+        fill_rows: false,
+        solid_from_props: false,
+        simd_candidates: false,
+        border_rows_only: false,
+    };
+    /// Default: paths that win in the micro-bench (`docs/perf.md`, C2-M10), game rule; the
+    /// paths of C2-M08 on until the quiet-machine scene bench decides.
+    pub const DEFAULT: CullPaths = CullPaths { palprops: false, ..CullPaths::ALL };
 
     /// Paths chosen by the environment (`=0` turns off, `=1` forces), read once.
     /// `RUSTCRAFT_OPT_MESHPROPS=0` really turns the grid off: the paths that read it (palette,
@@ -60,6 +96,10 @@ impl CullPaths {
                 rows: pick(rc_data::env_os!("RUSTCRAFT_OPT_MESHROWS"), d.rows),
                 pile: pick(rc_data::env_os!("RUSTCRAFT_OPT_MESHPILE"), d.pile),
                 shape: pick(rc_data::env_os!("RUSTCRAFT_OPT_SHAPECULL"), d.shape),
+                fill_rows: pick(rc_data::env_os!("RUSTCRAFT_OPT_MESHGRIDROWS"), d.fill_rows),
+                solid_from_props: pick(rc_data::env_os!("RUSTCRAFT_OPT_MESHPROPBITS"), d.solid_from_props),
+                simd_candidates: pick(rc_data::env_os!("RUSTCRAFT_OPT_MESHROWCANDSIMD"), d.simd_candidates),
+                border_rows_only: pick(rc_data::env_os!("RUSTCRAFT_OPT_MESHEDGEROWS"), d.border_rows_only),
             }
             .grid_cut()
         })
@@ -68,7 +108,11 @@ impl CullPaths {
     /// Grid off: its dependent paths are too (otherwise `uses_props` turns it back on).
     #[must_use]
     pub fn grid_cut(self) -> Self {
-        if self.props { self } else { CullPaths { palprops: false, rows: false, ..self } }
+        if self.props {
+            self
+        } else {
+            CullPaths { palprops: false, rows: false, solid_from_props: false, simd_candidates: false, ..self }
+        }
     }
 
     /// The property grid is used (requested, or required by a path that reads it).
@@ -98,6 +142,16 @@ pub const AIR_BIT: u32 = 1 << 25;
 pub const FLUID_BIT: u32 = 1 << 26;
 pub const LEAF_BIT: u32 = 1 << 27;
 pub const SEALED_BIT: u32 = 1 << 28;
+// Bits 29-31: light properties (`light::info`), the same for both rules, so that the section
+// visibility and the smoothed light read the grid instead of their own per-state tables.
+/// Solid render state.
+pub const SOLID_RENDER_BIT: u32 = 1 << 29;
+/// The smoothed light treats the cell as closed (solid render state that dampens light). Stored
+/// inverted ("not permeable") so that word 0, outside the columns, and an unknown state read as
+/// permeable, like the default of the light table.
+pub const LIGHT_CLOSED_BIT: u32 = 1 << 30;
+/// Dark side shade of the smoothed light.
+pub const DARK_SHADE_BIT: u32 = 1 << 31;
 /// Non-empty own face, non-empty neighbour without coverage: inclusion to read in the table.
 const SIX: u32 = 0x3f;
 
@@ -220,8 +274,19 @@ pub fn rects_within(a: &[Rect], b: &[Rect]) -> bool {
 }
 
 impl CullTables {
-    /// `covers`, `cull_dirs`, `air`, `leaves`, `sealed`, `fluid`: per-state tables of `Tables`.
-    pub fn new(d: &VersionData, covers: &[u8], cull_dirs: &[u8], air: &[bool], leaves: &[bool], sealed: &[bool], fluid: &[bool]) -> Self {
+    /// `covers`, `cull_dirs`, `air`, `leaves`, `sealed`, `fluid`: per-state tables of `Tables`;
+    /// `light_info`: light properties per state (`light::state_info`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        d: &VersionData,
+        covers: &[u8],
+        cull_dirs: &[u8],
+        air: &[bool],
+        leaves: &[bool],
+        sealed: &[bool],
+        fluid: &[bool],
+        light_info: &[u16],
+    ) -> Self {
         let full_rect: Vec<Rect> = vec![[0.0, 1.0, 0.0, 1.0]];
         let mut rects: Vec<Vec<Rect>> = vec![Vec::new(), full_rect.clone()];
         let mut masks: Vec<Option<[u64; 4]>> = vec![Some([0; 4]), Some([u64::MAX; 4])];
@@ -343,7 +408,7 @@ impl CullTables {
                             p |= flag;
                         }
                     }
-                    p
+                    p | light_bits(light_info.get(s).copied().unwrap_or(0))
                 })
                 .collect();
         }
@@ -439,6 +504,33 @@ fn sets_ref<'a>(sets: &'a [[u16; 6]], state_set: &[u32], s: usize) -> &'a [u16; 
     &sets[state_set.get(s).copied().unwrap_or(0) as usize]
 }
 
+/// Bits 29-31 of the property word from the light properties of a state (`light::info`).
+pub fn light_bits(info: u16) -> u32 {
+    use crate::light::info::{DARK_SHADE, NO_DAMPENING, SOLID_RENDER};
+    let solid = info & SOLID_RENDER != 0;
+    let mut p = 0;
+    if solid {
+        p |= SOLID_RENDER_BIT;
+    }
+    // Closed for the corners of the smoothed light: solid render and dampens light (the
+    // opposite of the light code's "permeable": not solid render, or no dampening).
+    if solid && info & NO_DAMPENING == 0 {
+        p |= LIGHT_CLOSED_BIT;
+    }
+    if info & DARK_SHADE != 0 {
+        p |= DARK_SHADE_BIT;
+    }
+    p
+}
+
+/// Properties of a state read inside a section, from the table of the rule in use. No
+/// `OUTSIDE` test: the identifiers of a section are checked at reception (and an out-of-table
+/// value reads as air, like [`CullTables::prop`]).
+#[inline(always)]
+pub fn state_prop(table: &[u32], s: u32) -> u32 {
+    table.get(s as usize).copied().unwrap_or(AIR_BIT)
+}
+
 /// Faces surely hidden of the property block `p` from its six neighbours `nb` (`Dir` order):
 /// full coverage, without the "same block" rule, leaves or shape inclusion.
 #[inline(always)]
@@ -457,6 +549,16 @@ pub fn sure_hidden(p: u32, nb: [u32; 6]) -> u32 {
 #[inline(always)]
 pub fn candidate(p: u32, sure: u32) -> bool {
     p & AIR_BIT == 0 && (p & (FLUID_BIT | ALWAYS_BIT) != 0 || (p >> NEED) & SIX & !sure != 0)
+}
+
+/// [`candidate`] as 0 or 1 without short-circuit, so that 16 cells run side by side in
+/// vector registers.
+#[inline(always)]
+pub fn candidate_bit(p: u32, sure: u32) -> u32 {
+    let not_air = u32::from(p & AIR_BIT == 0);
+    let always = u32::from(p & (FLUID_BIT | ALWAYS_BIT) != 0);
+    let open = u32::from((p >> NEED) & SIX & !sure != 0);
+    not_air & (always | open)
 }
 
 #[cfg(test)]
@@ -507,9 +609,38 @@ mod tests {
     fn props_off_cuts_the_grid() {
         let off = CullPaths { props: false, ..CullPaths::DEFAULT }.grid_cut();
         assert!(!off.uses_props(), "{off:?}");
+        assert!(!off.solid_from_props && !off.simd_candidates, "{off:?}");
         assert_eq!(off.pile, CullPaths::DEFAULT.pile);
         assert_eq!(off.shape, CullPaths::DEFAULT.shape);
+        assert_eq!(off.fill_rows, CullPaths::DEFAULT.fill_rows);
+        assert_eq!(off.border_rows_only, CullPaths::DEFAULT.border_rows_only);
         assert_eq!(CullPaths::ALL.grid_cut(), CullPaths::ALL);
+    }
+
+    #[test]
+    fn light_bits_follow_the_light_table() {
+        use crate::light::info::{DARK_SHADE, NO_DAMPENING, SOLID_RENDER};
+        // Word 0 (outside the columns, unknown state): permeable, not solid, no dark shade,
+        // like the light table's default (info 0).
+        assert_eq!(light_bits(0), 0);
+        assert_eq!(light_bits(SOLID_RENDER), SOLID_RENDER_BIT | LIGHT_CLOSED_BIT);
+        assert_eq!(light_bits(SOLID_RENDER | NO_DAMPENING), SOLID_RENDER_BIT);
+        assert_eq!(light_bits(NO_DAMPENING), 0);
+        assert_eq!(light_bits(DARK_SHADE), DARK_SHADE_BIT);
+        // The light bits are above all the culling bits.
+        assert_eq!((SOLID_RENDER_BIT | LIGHT_CLOSED_BIT | DARK_SHADE_BIT) & ((SEALED_BIT << 1) - 1), 0);
+    }
+
+    #[test]
+    fn candidate_bit_matches_candidate() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..200_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let (p, sure) = (x as u32, (x >> 32) as u32 & SIX);
+            assert_eq!(candidate_bit(p, sure) == 1, candidate(p, sure), "p {p:#x}, sure {sure:#x}");
+        }
     }
 
     #[test]

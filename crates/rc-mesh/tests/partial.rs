@@ -122,6 +122,56 @@ fn block_two_cells_from_edge_reaches_neighbour() {
     eprintln!("{trials} changes near the edges, {partial} partial meshes identical to the full ones");
 }
 
+/// Partial remesh of one section whose neighbours above and below stay outside the remesh:
+/// covering blocks on their border rows (row 15 below, row 0 above) hide the faces of the
+/// section's boundary blocks. The partial mesh reads those rows (decoded alone, or from the whole
+/// neighbour) and equals the full mesh, for both removal rules and both fill orders.
+#[test]
+fn partial_remesh_reads_the_border_rows_of_its_neighbours() {
+    use rc_mesh::cull::CullPaths;
+    let Some((d, cols, t, palette)) = load() else { return };
+    let first = |name: &str| d.blocks.iter().find(|b| b.name == name).expect(name).first_state;
+    let (stone, glass) = (first("minecraft:stone"), first("minecraft:glass"));
+    let bits = d.state_bits() as u8;
+    let mut keys: Vec<(i32, i32)> = cols.keys().copied().collect();
+    keys.sort_unstable();
+    let mut checked = 0;
+    for &(x, z) in keys.iter().step_by(keys.len().div_ceil(24)) {
+        let mut col = (*cols[&(x, z)]).clone();
+        // A section with neighbours above and below, near the surface (air above, often).
+        let top = (0..col.sections.len()).rev().find(|&s| !col.sections[s].is_empty()).unwrap_or(4);
+        let si = top.clamp(1, col.sections.len() - 2);
+        let at = |x: usize, y: usize, z: usize| rc_world::block_index(x, y, z) as u16;
+        let pattern = || (0..16).flat_map(|z| (0..16).map(move |x| (x, z))).filter(|&(x, z)| (x + 2 * z) % 3 == 0);
+        let below: Vec<(u16, u32)> = pattern().map(|(x, z)| (at(x, 15, z), stone)).collect();
+        let above: Vec<(u16, u32)> = pattern().map(|(x, z)| (at(x, 0, z), stone)).collect();
+        let inside: Vec<(u16, u32)> = pattern()
+            .flat_map(|(x, z)| [(at(x, 0, z), if x % 2 == 0 { stone } else { glass }), (at(x, 15, z), glass)])
+            .collect();
+        col.sections[si - 1].set_blocks(&below, bits, |s| t.air[s as usize]);
+        col.sections[si + 1].set_blocks(&above, bits, |s| t.air[s as usize]);
+        col.sections[si].set_blocks(&inside, bits, |s| t.air[s as usize]);
+        let mut world = cols.clone();
+        world.insert((x, z), Arc::new(col));
+        let mut mask = rc_mesh::wire::Sections::default();
+        mask.insert(si as i32);
+        for shape in [false, true] {
+            let d0 = CullPaths { shape, ..CullPaths::DEFAULT };
+            let full = mesh(&common::job_with(&world, x, z, d0), &t, &palette, -64);
+            let words: rc_mesh::blocks::Packed = Arc::new(rc_mesh::blocks::pack_exact(&full));
+            for p in [d0, CullPaths { border_rows_only: false, ..d0 }, CullPaths { fill_rows: false, ..d0 }] {
+                let mut j = common::job_with(&world, x, z, p);
+                j.reuse = Some((mask, words.clone()));
+                let part = mesh(&j, &t, &palette, -64);
+                assert!(same(&part, &full), "({x}, {z}), section {si}, {p:?}: partial mesh differs from the full one");
+                checked += 1;
+            }
+        }
+    }
+    eprintln!("{checked} partial meshes reading their neighbours' border rows identical to the full ones");
+    assert!(checked >= 24 * 3, "{checked} checks");
+}
+
 #[test]
 fn partial_remesh_equals_full_remesh() {
     let Some((d, cols, t, palette)) = load() else { return };
