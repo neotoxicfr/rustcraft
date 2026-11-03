@@ -4276,3 +4276,62 @@ frames; GPU = submit and wait of the pass minus an empty pass, 512 × 512):
   one source enum would bring `Event` to 80 bytes.
 - To measure on the quiet machine: `crowd-1000`, `tnt` (event send and receive time,
   `perf_log::received`, channel RAM at peak).
+
+## C5-M40: client network thread dispatch, lazy packet log, small client copies, block list snapshot (03/11, loaded machine)
+
+Micro-benches (ignored tests, 3 trials, loaded machine): `cargo test --release -p rc-client
+packet_dispatch_bench network_thread_handle_bench memory_send_bench hidden_rows_bench -- --ignored
+--nocapture`, `cargo test --release -p rc-sim entity_lookup_bench -- --ignored --nocapture`.
+Scenes to measure on the quiet machine: `lan-1` (network thread of the guest), `plains12`, `pause`;
+the social screen during an online connection (frame p99 while the block list is re-read).
+
+- Dispatch (`RUSTCRAFT_OPT_CLIENT_PACKET_TABLE`, ADOPTED, `=0` compares as before): every stage of
+  the network thread decides on the packet identifier alone, so the decision is a function of
+  (phase, identifier). `dispatch.rs` lists each phase's packets in the former comparison order;
+  a 256-entry table built once from that list answers in one index, and an identifier outside it
+  (malformed) still goes through the comparisons. `run` is cut into one handler per phase and,
+  in play, one per group (session, world, chat, HUD, containers, entities). Decision only, the
+  39 318 play identifiers of the reference capture: comparisons 27.6-34.7 ns per packet, table
+  0.71-1.28 ns; one stream per thread, M packets/s at 1/2/4/8/16/32 threads: comparisons 33 / 62 /
+  58 / 193 / 395 / 552, table 1,407 / 274 (noise) / 1,111 / 9,920 / 12,227 / 15,269. The
+  comparison path scans the ordered list; the old code made the same comparisons plus five calls
+  into the sub-modules, so the gain is a lower bound. Whole `handle` on the capture's light
+  packets (no chunk or light): comparisons 159-221 ns, table 132-180 ns (noisy, one trial
+  inverted). GPU not applicable (a per-packet decision in stream order); one network thread per
+  connection, so no splitting across cores.
+- Equivalence: the reference capture then a synthetic tail (cookies, resource packs, a bundle,
+  identifiers 0xF0, 300 and -1, HUD, extra, misc, entity and system chat packets, a configuration
+  round trip, the server's disconnection) replayed through `handle` with the table and with the
+  comparisons, and through the code before this change (former `run` over a loopback socket,
+  compressed frames, heavy packets on the pool): 39,413 events, 128 replies, same digests, frozen
+  in `conn_replay_tests.rs`. Sabotages (title shown as subtitle in a shared handler, two entity
+  packets swapped in the table) make the tests fail.
+- Packet log detail lines (`RUSTCRAFT_OPT_LAZY_PACKET_LOG`, ADOPTED): the text of a detail line
+  (bundle closing, cookies, resource packs) is only built when `RUSTCRAFT_PROTOLOG` is on; before,
+  one `format!` per bundle even with the log off. No bench of its own (one allocation per bundle).
+- In-memory send to the integrated server (`RUSTCRAFT_OPT_MOVE_SENT_PACKET`, ADOPTED): the packet
+  buffer is handed over and replaced by a fresh 64-byte one instead of being copied: 34-byte
+  packets to a consumer thread, copy 63.3-91.3 ns, move 34.2-71.4 ns per packet. Bytes received
+  identical (test, sizes 0 to 300).
+- Tick time samples (F3+2 graph): stored as `[i64; 4]` instead of one `Vec` per sample, the
+  remote server's samples read into a fixed array (one allocation less per tick, none per remote
+  sample). No runtime switch: a storage type; the A/B is two executables. Difference: a sample of
+  fewer than four values (never sent by the official server for tick times, and never drawn) no
+  longer takes one of the 1,024 places, which only matters if the graph stops reading for 51 s.
+- Hidden players on the social screen (`RUSTCRAFT_OPT_HIDDEN_ROW_LOOKUP`, kept OFF, `=1` to try):
+  one locked lookup per visible row instead of one copy of the list per frame, 8 rows: nobody
+  hidden (the usual case) copy 4-6 ns, per row 26 ns (loses); 1 hidden 35-38 / 26-27; 20 hidden
+  113-150 / 102-114 ns per frame.
+- Block list on the social screen (`RUSTCRAFT_OPT_BLOCKLIST_SNAPSHOT`, ADOPTED): the drawn rows
+  read the last known list without waiting for a refresh nor fetching it on the main thread (a
+  missing list is fetched in the background, ending on the same list); hiding a message still
+  waits for the refresh, like the game. Test: with a 300 ms refresh in progress the row reading
+  returns at once with the old list, the waiting reading returns the new one after 300 ms, then
+  both agree. Before, every visible row of every frame could wait for the HTTP request.
+- Entity by network identifier in the integrated server (`RUSTCRAFT_OPT_DIRECT_ENTITY_LOOKUP`,
+  ADOPTED): the entity lists searched in the order `all_ents` joins them, instead of building and
+  sorting that list (its sort is stable: same entity found, duplicates included); 1,001 entities:
+  9.0-10.5 µs -> 0.45-0.49 µs per lookup (entity tag query, spectator click, middle click).
+- Not done here: the server-side identifier chains (`input.rs`, `life.rs`, `solo_packets.rs`,
+  `lan/mod.rs`), mission "Table id -> handler"; the other `all_ents()` searches by UUID or kind
+  in `rc-sim` (`commands/ents.rs`, `select.rs`), where the sort order can matter.
