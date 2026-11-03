@@ -1974,6 +1974,8 @@ impl Server {
         };
         // Search by class: a zombie also alerts its subspecies (husk, zombie villager, drowned).
         // F13: the zombie does not alert zombified piglins.
+        // `[m.kind; 4]`: the same array type as `ZOMBIE_CLASS`; a species named several times is
+        // walked once (`MobIndex::kinds_slots`, and the scan filters by membership).
         let kinds = if m.kind == Kind::Zombie { ZOMBIE_CLASS } else { [m.kind; 4] };
         let mut wild_ok = Vec::new();
         for o in self.mobs.of_kinds(kinds) {

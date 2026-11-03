@@ -218,6 +218,29 @@ fn tail_reindex_equals_rebuild() {
     }
 }
 
+/// A mob put straight into the list (without `Mobs::push`) before a late removal: the tail re-index
+/// must not keep entries that never saw it, whatever the per-species switch, or a later mob with the
+/// same identifier would be served instead of that first one (run with `RUSTCRAFT_OPT_KINDINDEX=0`
+/// too: the per-species length check no longer covers it there).
+#[test]
+fn direct_addition_before_a_tail_removal() {
+    let mut r = Rng(0xD1);
+    let mut mobs = Mobs::default();
+    for i in 0..40 {
+        mobs.push(Box::new(random_mob(&mut r, 100 + i, 8.0)));
+    }
+    // Slot 40, the index is not told.
+    mobs.list.push(Some(Box::new(random_mob(&mut r, 7, 8.0))));
+    for i in 0..40 {
+        mobs.push(Box::new(random_mob(&mut r, 300 + i, 8.0)));
+    }
+    // One late removal: a tail short enough for the tail re-index.
+    mobs.list[75] = None;
+    mobs.drop_empty_slots();
+    mobs.push(Box::new(random_mob(&mut r, 7, 8.0)));
+    assert_eq!(mobs.index_of(7), Some(40), "the mob the index never saw is the first with this identifier");
+}
+
 /// The species list a zombie alerts is exactly the zombie class without the zombified piglin.
 #[test]
 fn zombie_class_matches_the_tag() {

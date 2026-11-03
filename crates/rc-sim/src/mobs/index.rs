@@ -83,13 +83,16 @@ impl<const N: usize> Iterator for MergedSlots<'_, N> {
 pub struct MobIndex {
     by_id: hashbrown::HashMap<i32, u32>,
     by_uuid: hashbrown::HashMap<u128, u32>,
-    /// Species → slots in the list's order. Valid as long as the list has `kind_len` slots and
+    /// Species → slots in the list's order. Valid as long as the list has `indexed_len` slots and
     /// no mutation outside `pushed` is signalled; assumption (checked at every query
     /// during tests): a slot only ever receives the mob that came out of it and
     /// the species of a mob does not change (conversions add a new mob).
     by_kind: hashbrown::HashMap<Kind, Vec<u32>>,
-    kind_len: usize,
-    kind_bad: bool,
+    /// Length of the list as the index saw it (last rebuild, then each `pushed`), kept whatever the
+    /// switches: a list longer than this got a mob the index never saw.
+    indexed_len: usize,
+    /// A mob was added without `Mobs::push`: entries are missing until the next whole rebuild.
+    missed_addition: bool,
     /// A search found by scanning what the hint did not give.
     stale: AtomicBool,
     /// Value seen twice (two living slots): searches of this kind by scan
@@ -104,14 +107,14 @@ impl MobIndex {
     /// Mob added at the end of the list at slot `at`.
     pub(crate) fn pushed(&mut self, m: &Mob, list: &List) {
         let at = list.len() as u32;
-        if kind_on() {
-            // Direct addition went unnoticed (unexpected length): per-species index to redo.
-            if !self.kind_bad && self.kind_len == list.len() {
+        // Direct addition went unnoticed (unexpected length): index to redo in full.
+        if !self.missed_addition && self.indexed_len == list.len() {
+            self.indexed_len += 1;
+            if kind_on() {
                 self.by_kind.entry(m.kind).or_default().push(at);
-                self.kind_len += 1;
-            } else {
-                self.kind_bad = true;
             }
+        } else {
+            self.missed_addition = true;
         }
         if !on() {
             return;
@@ -151,7 +154,8 @@ impl MobIndex {
     /// Rebuild if the hint has been served wrong or if `shifted` (slots removed).
     pub(crate) fn refresh(&mut self, list: &List, shifted: bool) {
         let ids = on() && (shifted || self.dup_id || self.dup_uuid || *self.stale.get_mut());
-        let kinds = kind_on() && (shifted || self.kind_bad || self.kind_len != list.len() || *self.stale.get_mut());
+        let kinds =
+            kind_on() && (shifted || self.missed_addition || self.indexed_len != list.len() || *self.stale.get_mut());
         if ids || kinds {
             self.rebuild(list);
         }
@@ -166,9 +170,13 @@ impl MobIndex {
         // the larger part (bench: half the crowd removed from slot 1 on, 19 µs against 7).
         let tail_is_short = first_moved >= list.len() / 2;
         if !tail_on() || first_moved == 0 || !tail_is_short || !self.tail_reusable(len_before) {
+            #[cfg(test)]
+            stats::count_refresh(false);
             self.refresh(list, true);
             return;
         }
+        #[cfg(test)]
+        stats::count_refresh(true);
         self.reindex_tail(list, first_moved);
         #[cfg(test)]
         if verify() {
@@ -176,28 +184,46 @@ impl MobIndex {
         }
     }
 
+    /// The entries before the tail are those a whole rebuild would give: no duplicate, nothing
+    /// served wrong, and every mob of the old list seen by the index (checked whatever the
+    /// switches, since an unseen mob before the tail would stay unindexed).
     fn tail_reusable(&mut self, len_before: usize) -> bool {
         let ids_ok = !on() || !(self.dup_id || self.dup_uuid);
-        let kinds_ok = !kind_on() || (!self.kind_bad && self.kind_len == len_before);
-        ids_ok && kinds_ok && !*self.stale.get_mut()
+        let all_seen = !self.missed_addition && self.indexed_len == len_before;
+        ids_ok && all_seen && !*self.stale.get_mut()
     }
 
     /// Entries of the slots from `first` on dropped, then those slots indexed again.
     fn reindex_tail(&mut self, list: &List, first: usize) {
         let first32 = first as u32;
-        let (ids, kinds) = (on(), kind_on());
-        if ids {
+        if on() {
             // A removed mob leaves no entry: every entry at `first` or after goes, then the
             // mobs still there come back at their new slot.
             self.by_id.retain(|_, s| *s < first32);
             self.by_uuid.retain(|_, s| *s < first32);
         }
-        if kinds {
+        if kind_on() {
             // Each list is ascending: the slots kept are a prefix.
             for v in self.by_kind.values_mut() {
                 v.truncate(v.partition_point(|&s| s < first32));
             }
         }
+        self.index_slots_from(list, first);
+    }
+
+    pub(crate) fn rebuild(&mut self, list: &List) {
+        self.by_id.clear();
+        self.by_uuid.clear();
+        self.by_kind.values_mut().for_each(Vec::clear);
+        self.index_slots_from(list, 0);
+        self.missed_addition = false;
+        *self.stale.get_mut() = false;
+    }
+
+    /// Adds the mobs of the slots from `first` on (their entries are absent) and records the
+    /// length seen; duplicates are judged on these slots, the ones before carrying none.
+    fn index_slots_from(&mut self, list: &List, first: usize) {
+        let (ids, kinds) = (on(), kind_on());
         let (mut dup_id, mut dup_uuid) = (false, false);
         for (i, m) in list.iter().enumerate().skip(first) {
             let Some(m) = m else { continue };
@@ -212,31 +238,7 @@ impl MobIndex {
             }
         }
         (self.dup_id, self.dup_uuid) = (dup_id, dup_uuid);
-        self.kind_len = list.len();
-    }
-
-    pub(crate) fn rebuild(&mut self, list: &List) {
-        self.by_id.clear();
-        self.by_uuid.clear();
-        self.by_kind.values_mut().for_each(Vec::clear);
-        let (mut dup_id, mut dup_uuid) = (false, false);
-        let (ids, kinds) = (on(), kind_on());
-        for (i, m) in list.iter().enumerate() {
-            if let Some(m) = m {
-                if ids {
-                    dup_id |= Self::insert(&mut self.by_id, m.id, i as u32);
-                    if m.uuid != 0 {
-                        dup_uuid |= Self::insert(&mut self.by_uuid, m.uuid, i as u32);
-                    }
-                }
-                if kinds {
-                    self.by_kind.entry(m.kind).or_default().push(i as u32);
-                }
-            }
-        }
-        (self.dup_id, self.dup_uuid) = (dup_id, dup_uuid);
-        (self.kind_len, self.kind_bad) = (list.len(), false);
-        *self.stale.get_mut() = false;
+        self.indexed_len = list.len();
     }
 
     /// Slots of species `k` in the list's order (empty slots possible for the duration of a
@@ -269,7 +271,7 @@ impl MobIndex {
     /// Per-species index in step with `list` (counted under test: served or fallback scan).
     fn kind_index_reliable(&self, list: &List) -> bool {
         let reliable =
-            kind_on() && !self.kind_bad && self.kind_len == list.len() && !self.stale.load(Ordering::Relaxed);
+            kind_on() && !self.missed_addition && self.indexed_len == list.len() && !self.stale.load(Ordering::Relaxed);
         #[cfg(test)]
         stats::count_kind_query(reliable);
         reliable
@@ -354,7 +356,8 @@ impl MobIndex {
         assert_eq!(self.by_id, fresh.by_id, "{what}: id entries");
         assert_eq!(self.by_uuid, fresh.by_uuid, "{what}: UUID entries");
         assert_eq!(kinds(self), kinds(&fresh), "{what}: per-species entries");
-        assert_eq!((self.dup_id, self.dup_uuid, self.kind_len), (fresh.dup_id, fresh.dup_uuid, fresh.kind_len), "{what}");
+        let flags = |ix: &MobIndex| (ix.dup_id, ix.dup_uuid, ix.indexed_len, ix.missed_addition);
+        assert_eq!(flags(self), flags(&fresh), "{what}");
     }
 
     /// After a tail re-index: every mob from `first` on is found at its slot by the hint (unless a
@@ -413,28 +416,45 @@ pub(crate) fn set_verify(on: bool) {
 }
 
 /// Test counters: reads served by the hint, found by scan, absent; per-species queries served by
-/// the index or sent back to the scan (index out of step, e.g. after a direct addition).
+/// the index or sent back to the scan (index out of step, e.g. after a direct addition); refreshes
+/// after a removal or a sort, by tail re-index or by whole rebuild.
 #[cfg(test)]
 pub(crate) mod stats {
+    use std::cell::Cell;
     use std::sync::atomic::AtomicU64;
     pub(crate) static HIT: AtomicU64 = AtomicU64::new(0);
     pub(crate) static FOUND: AtomicU64 = AtomicU64::new(0);
     pub(crate) static ABSENT: AtomicU64 = AtomicU64::new(0);
 
-    // Specific to the thread, so that a test counts only its own server's queries.
+    // Specific to the thread, so that a test counts only its own server's work.
     thread_local! {
-        static KIND_QUERIES: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+        static KIND_QUERIES: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+        static REFRESHES: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    }
+
+    /// Adds one to the first (`yes`) or the second count of the pair.
+    fn bump(pair: &'static std::thread::LocalKey<Cell<(u64, u64)>>, yes: bool) {
+        pair.with(|c| {
+            let (a, b) = c.get();
+            c.set(if yes { (a + 1, b) } else { (a, b + 1) });
+        });
     }
 
     pub(super) fn count_kind_query(served: bool) {
-        KIND_QUERIES.with(|c| {
-            let (s, f) = c.get();
-            c.set(if served { (s + 1, f) } else { (s, f + 1) });
-        });
+        bump(&KIND_QUERIES, served);
+    }
+
+    pub(super) fn count_refresh(tail: bool) {
+        bump(&REFRESHES, tail);
     }
 
     /// Per-species queries of this thread so far: (served by the index, sent to the scan).
     pub(crate) fn kind_queries() -> (u64, u64) {
-        KIND_QUERIES.with(std::cell::Cell::get)
+        KIND_QUERIES.with(Cell::get)
+    }
+
+    /// Refreshes after a removal or a sort on this thread so far: (tail re-index, whole rebuild).
+    pub(crate) fn refreshes() -> (u64, u64) {
+        REFRESHES.with(Cell::get)
     }
 }

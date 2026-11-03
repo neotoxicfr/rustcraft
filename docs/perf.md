@@ -668,8 +668,13 @@ final decision on the scene bench (crowd-1000, tnt, enclos-bebes).
   the one-species shortcut and with `Option`/`flatten` the single species cost 14-16 ns: fixed
   before delivery. Callers moved: zombie and same-species alerts (both passes), anger reset
   alert, polar bear, panda and zombified piglin alerts.
-- Fallback count (test counters `index::stats::kind_queries`, thread-local): world test with
-  `/kill` of half a crowd, TNT in it and zombie alerts, 5 queries served, 0 sent to the scan.
+- Fallback count (test counters `index::stats::kind_queries` and `refreshes`, thread-local):
+  world test `mobs::tests_index_world`, 120 mobs, `/kill` of the last 15 pigs (first removed
+  slot 90 of 120): 1 refresh by tail re-index (asserted), then a zombie alert: 2 queries served,
+  0 sent to the scan; TNT in the crowd (whole rebuild with this draw: the blast reaches early
+  slots) then an alert: 2 served, 0 to the scan. The test's own final check is read after the
+  counts. (A first version killed the 30 furthest pigs: slot 0 among them, so a whole rebuild,
+  and its 5 queries were all made before the removals or by the test itself.)
   Births go through `Mobs::push`, which keeps the per-species index in step: the only server
   mutation outside it is the portal removal (marks the index stale until the end of the tick).
   `bench_ticks` now prints the count.
@@ -679,7 +684,10 @@ final decision on the scene bench (crowd-1000, tnt, enclos-bebes).
   → 2.4-3.2, last ten 13.6-18.8 → 1.5-2.5; 5,000 mobs 98-102 → 15, 105-135 → 10-13. A tail
   longer than half the list goes to the whole rebuild: re-indexed one entry at a time it cost
   more (half removed from slot 1 on: 19.1 against 6.8 µs at 1,000, 126 against 49 at 5,000),
-  now equal (8.4 / 41.0). Removal from slot 0: equal (whole rebuild).
+  now equal (8.4 / 41.0). Removal from slot 0: equal (whole rebuild). The tail path also
+  checks that the index saw every mob of the old list (length kept whatever
+  `RUSTCRAFT_OPT_KINDINDEX`), and rebuild and tail share one insertion loop; re-measured after
+  that change: 1,000 mobs 13.4 → 2.1 and 13.7 → 1.3, 5,000 mobs 73.7 → 10.5 and 72.5 → 6.0.
 
 ### Palette container `rc_world::Container` (C5-M04, 22/10/2026)
 
