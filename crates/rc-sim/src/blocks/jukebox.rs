@@ -51,7 +51,7 @@ impl Server {
 
     /// Disc inserted into an empty jukebox.
     pub(crate) fn jukebox_use_item(&mut self, p: P, s: u32, slot: usize) -> ItemOn {
-        if self.v().get_bool(s, "has_record") {
+        if self.view().get_bool(s, "has_record") {
             return ItemOn::TryEmptyHand;
         }
         let Some(held) = self.slots[slot].clone() else { return ItemOn::TryEmptyHand };
@@ -70,7 +70,7 @@ impl Server {
 
     /// Disc ejected.
     pub(crate) fn jukebox_use_without_item(&mut self, p: P, s: u32) -> bool {
-        if !self.v().get_bool(s, "has_record") || self.be_get(p).is_none() {
+        if !self.view().get_bool(s, "has_record") || self.be_get(p).is_none() {
             return false;
         }
         self.jukebox_pop_out(p, s);
@@ -89,7 +89,7 @@ impl Server {
         let song = item.as_ref().and_then(|it| self.jukebox_song_of(it)).and_then(|id| self.song_info(&id));
         let mut be_state = be_state;
         if self.get(p) == be_state {
-            be_state = self.v().set_bool(be_state, "has_record", item.is_some());
+            be_state = self.view().set_bool(be_state, "has_record", item.is_some());
             self.set_block(p, be_state, flag::CLIENTS);
             self.game_event_block("minecraft:block_change", p, None, Some(be_state));
         }
@@ -132,7 +132,7 @@ impl Server {
     /// behind a full block), in the name of the jukebox itself even when the block was just
     /// replaced.
     fn jukebox_song_changed(&mut self, p: P) {
-        let b = self.tb().block_id("minecraft:jukebox");
+        let b = self.table().block_id("minecraft:jukebox");
         self.update_neighbors_at(p, b);
         self.update_neighbour_for_output_signal(p, b);
     }
@@ -176,7 +176,7 @@ impl Server {
     /// Ticker up to date after a state change: present while `has_record` (a new
     /// ticker at the end of the list when it reappears, like the game).
     pub(crate) fn jukebox_ticker_sync(&mut self, p: P, s: u32) {
-        let want = self.v().get_bool(s, "has_record");
+        let want = self.view().get_bool(s, "has_record");
         let have = matches!(self.bs.be_ticks.get(&p), Some((_, BeTick::Jukebox(_))));
         if want && !have {
             // Playback in progress (counter present): the disc's track, kept by the ticker.

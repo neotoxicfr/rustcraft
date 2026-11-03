@@ -228,12 +228,12 @@ fn split_block(text: &str) -> (String, Vec<(String, String)>, Option<Nbt>, bool)
 impl Server {
     pub fn block_input(&self, text: &str) -> Option<BlockInput> {
         let (name, props, nbt, _) = split_block(text);
-        let t = self.tb();
+        let t = self.table();
         let b = t.block_id(&name);
         if b == u16::MAX {
             return None;
         }
-        let v = self.v();
+        let v = self.view();
         let mut s = v.default_state(b);
         for (k, val) in &props {
             s = v.set(s, k, val);
@@ -256,7 +256,7 @@ impl Server {
         if !ok_block {
             return false;
         }
-        let v = self.v();
+        let v = self.view();
         for (k, val) in &props {
             if v.get(state, k) != Some(val.as_str()) {
                 return false;

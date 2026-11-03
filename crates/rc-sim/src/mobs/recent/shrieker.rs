@@ -210,7 +210,7 @@ impl Server {
         if let Some(n) = self.with_prop(s, "shrieking", "true") {
             self.set_block(p, n, 2);
         }
-        let b = self.v().block(self.st(p));
+        let b = self.view().block(self.st(p));
         self.schedule_tick(p, b, 90);
         self.level_event(3007, p, 0);
         self.game_event_block("minecraft:shriek", p, Some(Ent::Player), None);

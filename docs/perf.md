@@ -3509,3 +3509,44 @@ rounds, minimum of 5 passes of 400 ticks per scene, loaded machine (other agents
   test of a vehicle's passengers runs only when frozen, the plates also scan the server's item
   and orb lists during a series (empty unless something was born in it), a parked world is
   swept once per family after the player leaves (O(its entities), then a bit test per tick).
+
+## C5-M02: borrowed block view (03/11, loaded machine)
+
+The server's block view (`Server::view()`, formerly `v()`) cloned two `Arc`s on every call
+(`Arc<Table>`, `Arc<VersionData>`: two atomic increments and two decrements), and `table()`
+(formerly `tb()`) one; 1,237 call sites in `rc-sim`. The view is now
+`View<'a> { table: &'a Table, data: &'a VersionData }` (`Copy`; a constant assertion fails to
+compile if it stops being `Copy`), `table()` returns `&Table`. No switch: the old path cannot
+coexist with the type (A/B = executable of `main` against the branch's).
+
+- Callers: 53 borrow conflicts in 20 functions (a view held across a `&mut self` call or a
+  random draw): the view is made again after the call. Three pure reads moved across a draw
+  (vine tick, bamboo growth, frosted ice placement), none observable. Approach "hoist the view out
+  of the random tick loop of `tick_chunk` and read the state flag directly": absorbed, the view
+  in the loop is now two pointer copies and the same read.
+- Micro-bench `bench_block_view` (`cargo test --release -p rc-sim bench_block_view -- --ignored
+  --nocapture`, every state of 26.3 read 50 times, ns per view made and read; two passes):
+  one thread, borrowed 4.41 / 1.11 ns, counted 10.28 / 7.98 ns (−5.9 to −6.9 ns per view); all
+  threads sharing the counters (as the server and client threads share the version data),
+  borrowed then counted, pass 2: 2 threads 1.12 / 53.7 ns, 4: 1.17 / 106, 8: 1.29 / 311, 16:
+  1.50 / 636, 32 (every logical core): 2.86 / 1,319 (pass 1, counted: 28.9, 117, 316, 637,
+  1,342 ns). GPU: not applicable (a pointer copy).
+- Views made per server tick (`bench_ticks`, test counter): plains 3,849, forest 3,150,
+  village 3,451, ocean 1,430, nether 6,167. Expected saving, uncontended: 23-27 µs per tick in
+  plains (2-2.5 % of the mean tick), 8-10 µs in ocean (≈ 1.3 %), 37-43 µs in the Nether (≈ 2.5 %);
+  more if another thread touches the same counters.
+- `bench_ticks` A/B (executables of `main` 34e1be81 and of the branch, 4 passes each, both orders,
+  then 4 more with `RAYON_NUM_THREADS=1`): inconclusive on this machine, the ranges overlap and
+  the winner flips with the order (plains median 0.90-1.55 / 0.64-1.23 ms, nether 1.06-2.03 /
+  1.14-2.13 ms; the Nether's spread follows the light time, code untouched here). The redstone site
+  of `bench_ticks` cannot run on the current model world (no `perf:redstone` function). To settle
+  on a quiet machine: `scenes.py` redstone, tnt, village, plains32, plains12, cave, forest (tick
+  median and p99), 2 alternating passes.
+- Proofs: whole `rc-sim` suite; `fingerprint_new_world` and `fingerprint_mechanisms` unchanged
+  (both fail when a random tick is skipped in `tick_chunk`); bench world fingerprint
+  2a5918d4… (740 files, model world d49ce0cb…) identical on `main` and the branch, it changes
+  (89a3ba32…) under the same sabotage, but this model world has no recorded value yet (only its
+  determinism is asserted). New `draw_order_tests` (11 scenarios, 64 seeds each: blocks left, value
+  returned, next draw) with digests recorded on `main`: the world fingerprints miss an extra draw in
+  the vine tick and the bamboo stage drawn every time, these digests catch both.
+- Memory: none (the test executable is 0.5 MB smaller: no `Arc` clone and drop code at the sites).

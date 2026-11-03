@@ -105,7 +105,7 @@ fn bone_meal_grows_crops() {
     p.run("setblock 106 -60 104 minecraft:farmland\nsetblock 106 -59 104 minecraft:torchflower_crop[age=1]\n");
     hold(&mut p, "minecraft:bone_meal", 5);
     p.s.use_item_on_block([104, -59, 104], Dir::Up, [0.5, 0.5, 0.5]);
-    let age: i32 = p.s.v().get_int(p.s.get([104, -59, 104]), "age");
+    let age: i32 = p.s.view().get_int(p.s.get([104, -59, 104]), "age");
     assert!((2..=5).contains(&age), "age {age}");
     assert_eq!(held(&p).map(|s| s.count), Some(4));
     p.s.use_item_on_block([106, -59, 104], Dir::Up, [0.5, 0.5, 0.5]);

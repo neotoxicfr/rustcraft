@@ -105,7 +105,7 @@ impl Server {
             .iter()
             .filter(|o| {
                 let s = self.get([p[0] + o[0], p[1] + o[1], p[2] + o[2]]);
-                tag.binary_search(&u32::from(self.v().block(s))).is_ok()
+                tag.binary_search(&u32::from(self.view().block(s))).is_ok()
             })
             .count()
     }

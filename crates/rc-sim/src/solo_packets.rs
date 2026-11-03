@@ -436,7 +436,8 @@ impl Server {
             return false;
         }
         let wall = name.ends_with("_wall_hanging_sign");
-        let hits = if wall { face.axis() != self.v().facing(self.get(p)).axis() } else { face == crate::blocks::Dir::Down };
+        let hits =
+            if wall { face.axis() != self.view().facing(self.get(p)).axis() } else { face == crate::blocks::Dir::Down };
         if !hits {
             return false;
         }

@@ -896,7 +896,7 @@ impl Server {
     /// The heart's shape update: tick scheduled at the next tick.
     pub(crate) fn rec_update_shape(&mut self, state: u32, p: [i32; 3]) {
         if heart::is_heart_block(self.state_name(state)) {
-            let b = self.v().block(state);
+            let b = self.view().block(state);
             self.schedule_tick(p, b, 1);
         }
     }
@@ -941,7 +941,7 @@ impl Server {
         let full = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
         let r = &mut self.mobs.rec;
         r.player_move_dist += if climbing { (full * f64::from(0.6f32)) as f32 } else { (h * f64::from(0.6f32)) as f32 };
-        if self.mobs.rec.player_move_dist > self.mobs.rec.player_next_step && !self.v().is_air(on_st) {
+        if self.mobs.rec.player_move_dist > self.mobs.rec.player_next_step && !self.view().is_air(on_st) {
             // The step on the block at 0.2 vibrates only if it is also the supporting block.
             let same = on == effect;
             let mut produced = self.player_step_effects(es, same, d[1]);
@@ -961,7 +961,7 @@ impl Server {
     /// Player step on a block: nothing on air; on the ground, climbing or sneaking without
     /// vertical movement, and not swimming: possible vibration (the sound comes from the client).
     fn player_step_effects(&mut self, st: u32, vibrate: bool, dy: f64) -> bool {
-        if self.v().is_air(st) {
+        if self.view().is_air(st) {
             return false;
         }
         let climb = self.climbable_state(st);

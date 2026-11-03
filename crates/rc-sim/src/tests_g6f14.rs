@@ -320,7 +320,7 @@ fn copied_automatic_command_block_schedules_its_tick() {
     let at = [5, Y + 1, 5];
     assert!(w.name(at).starts_with("minecraft:command_block"), "placed: {}", w.name(at));
     assert_eq!(int_of(&w.be(at), "auto"), 1, "copied setting kept");
-    let b = w.p.s.v().block(w.p.s.get(at));
+    let b = w.p.s.view().block(w.p.s.get(at));
     assert!(w.p.s.has_scheduled_tick(at, b), "first tick scheduled");
 }
 
@@ -440,7 +440,7 @@ fn clone_copies_scheduled_ticks_and_reads_the_source_dimension() {
     let mut w = world("clone");
     let (src, dst) = ([0, Y, 30], [6, Y, 30]);
     w.cmd(&format!("setblock {} {} {} minecraft:stone", src[0], src[1], src[2]));
-    let b = w.p.s.v().block(w.p.s.get(src));
+    let b = w.p.s.view().block(w.p.s.get(src));
     w.p.s.schedule_tick_priority(src, b, 7, -1);
     let before = w.p.s.bs.block_ticks.in_box(src, src);
     assert_eq!(before.len(), 1);
@@ -547,7 +547,7 @@ fn count_non_air(w: &W, lo: [i32; 3], hi: [i32; 3]) -> usize {
     for x in lo[0]..=hi[0] {
         for y in lo[1]..=hi[1] {
             for z in lo[2]..=hi[2] {
-                if !w.p.s.v().is_air(w.p.s.get([x, y, z])) {
+                if !w.p.s.view().is_air(w.p.s.get([x, y, z])) {
                     n += 1;
                 }
             }
@@ -648,7 +648,7 @@ fn place_jigsaw_leaves_the_world_shapes_alone() {
         for x in lo[0]..=hi[0] {
             for y in lo[1]..=hi[1] {
                 for z in lo[2]..=hi[2] {
-                    v.insert([x, y, z], w.p.s.v().is_air(w.p.s.get([x, y, z])));
+                    v.insert([x, y, z], w.p.s.view().is_air(w.p.s.get([x, y, z])));
                 }
             }
         }
@@ -680,7 +680,7 @@ fn place_jigsaw_leaves_the_world_shapes_alone() {
     w.cmd(&format!("setblock {} {} {} minecraft:oak_fence", n[0], n[1], n[2]));
     assert!(w.name(n).contains("west=false"));
     w.cmd(&cmd(&target));
-    assert!(!w.p.s.v().is_air(w.p.s.get([n[0] - 1, n[1], n[2]])), "same placement");
+    assert!(!w.p.s.view().is_air(w.p.s.get([n[0] - 1, n[1], n[2]])), "same placement");
     assert!(w.name(n).contains("west=false"), "no shape update from a pool piece: {}", w.name(n));
 }
 

@@ -33,8 +33,8 @@ impl Server {
     /// search.
     pub(crate) fn hopper_suck_items(&mut self, p: P) -> bool {
         let up = self.get(above(p));
-        let block = self.v().block(up);
-        if self.v().full_collision(up) && !self.tag_id(crate::tag_bits::TagId::DoesNotBlockHoppers, block) {
+        let block = self.view().block(up);
+        if self.view().full_collision(up) && !self.tag_id(crate::tag_bits::TagId::DoesNotBlockHoppers, block) {
             return false;
         }
         if !self.life.drops.iter().any(|d| !d.is_removed() && in_suck_zone(p, d.pos)) {
@@ -123,7 +123,7 @@ impl Server {
             for y in y0..=y1 {
                 for z in z0..=z1 {
                     let p = [x, y, z];
-                    if self.v().kind(self.get(p)) != Kind::Hopper || !in_suck_zone(p, d.pos) {
+                    if self.view().kind(self.get(p)) != Kind::Hopper || !in_suck_zone(p, d.pos) {
                         continue;
                     }
                     self.hopper_try_move(p, Some(d));

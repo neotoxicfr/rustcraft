@@ -724,13 +724,13 @@ impl Server {
                     Some(Blk::Fire(2.0))
                 } else if b == id.cactus {
                     Some(Blk::Cactus)
-                } else if (b == id.campfire || b == id.soul_campfire) && self.v().get(st, "lit") == Some("true") {
+                } else if (b == id.campfire || b == id.soul_campfire) && self.view().get(st, "lit") == Some("true") {
                     Some(Blk::Campfire(if b == id.soul_campfire { 2.0 } else { 1.0 }))
                 } else if b == id.water_cauldron || b == id.powder_snow_cauldron || b == id.lava_cauldron {
                     // L9-TICK: entered only if the swept box meets its body or its contents
                     // (a cauldron passed over is no step at all).
                     let lava = b == id.lava_cauldron;
-                    let top = if lava { 15.0 } else { 6.0 + 3.0 * f64::from(self.v().get_int(st, "level")) };
+                    let top = if lava { 15.0 } else { 6.0 + 3.0 * f64::from(self.view().get_int(st, "level")) };
                     let mut shape = [Aabb { min: [0.0; 3], max: [0.0; 3] }; 14];
                     cauldron_inside([f64::from(p[0]), f64::from(p[1]), f64::from(p[2])], top, &mut shape);
                     let blk = if lava { Blk::LavaCauldron } else { Blk::Quench(st) };

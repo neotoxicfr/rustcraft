@@ -420,7 +420,7 @@ fn suffocating_blocks_follow_the_game() {
     }
     let piston = st("minecraft:piston");
     assert!(s.suffocating(piston));
-    assert!(!s.suffocating(s.v().set_bool(piston, "extended", true)));
+    assert!(!s.suffocating(s.view().set_bool(piston, "extended", true)));
     drop(p);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -460,7 +460,7 @@ impl Server {
                     entered.push(p);
                     m.fall_distance = 0.0;
                     m.stuck = [f64::from(0.8f32), 0.75, f64::from(0.8f32)];
-                    if self.v().get_int(s, "age") != 0 && berry_moved([from[0] - to[0], from[2] - to[2]]) {
+                    if self.view().get_int(s, "age") != 0 && berry_moved([from[0] - to[0], from[2] - to[2]]) {
                         self.mob_hurt(m, "minecraft:sweet_berry_bush", 1.0, None, None);
                     }
                 }
@@ -508,7 +508,7 @@ impl Server {
                 BERRY => {
                     entered.push(p);
                     self.life.vit.fall = 0.0;
-                    if self.v().get_int(s, "age") != 0 && berry_moved([k[0], k[2]]) {
+                    if self.view().get_int(s, "age") != 0 && berry_moved([k[0], k[2]]) {
                         self.hurt("minecraft:sweet_berry_bush", 1.0);
                     }
                 }
@@ -527,9 +527,9 @@ impl Server {
     /// Burning entity in a water or powder snow cauldron: one level less (the snow becomes
     /// water at the same level before lowering).
     pub(crate) fn cauldron_quench(&mut self, p: P, s: u32) {
-        let s = if self.v().block(s) == self.bs.t.id.powder_snow_cauldron {
+        let s = if self.view().block(s) == self.bs.t.id.powder_snow_cauldron {
             let w = self.default_state("minecraft:water_cauldron");
-            self.v().set_int(w, "level", self.v().get_int(s, "level"))
+            self.view().set_int(w, "level", self.view().get_int(s, "level"))
         } else {
             s
         };
@@ -569,7 +569,7 @@ impl Server {
                     continue;
                 }
                 let s = self.get(p);
-                if self.state_name(s) != "minecraft:water" || self.v().get_int(s, "level") != 0 {
+                if self.state_name(s) != "minecraft:water" || self.view().get_int(s, "level") != 0 {
                     continue;
                 }
                 if !matches!(

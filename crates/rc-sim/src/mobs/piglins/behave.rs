@@ -165,7 +165,7 @@ impl Server {
             }
             // Soul campfire: only when lit.
             if piglin && self.bname(p) == "minecraft:soul_campfire" {
-                return self.v().get_bool(self.st(p), "lit");
+                return self.view().get_bool(self.st(p), "lit");
             }
             true
         })
@@ -1402,7 +1402,7 @@ impl Server {
                 d.push(from);
             }
         }
-        if self.is_mob_door(next) && !self.v().get_bool(self.st(next), "open") {
+        if self.is_mob_door(next) && !self.view().get_bool(self.st(next), "open") {
             self.set_door_open(next, true, m.id);
             let d = b.mem.pig.doors_to_close.v.get_or_insert_with(Vec::new);
             if !d.contains(&next) {
@@ -1416,7 +1416,7 @@ impl Server {
                     keep.push(d);
                     continue;
                 }
-                if !closer_center(d, m.pos, 3.0) || !self.is_mob_door(d) || !self.v().get_bool(self.st(d), "open") {
+                if !closer_center(d, m.pos, 3.0) || !self.is_mob_door(d) || !self.view().get_bool(self.st(d), "open") {
                     continue;
                 }
                 let others = self.mobs.list.iter().flatten().any(|o| {

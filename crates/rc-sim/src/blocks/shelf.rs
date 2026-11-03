@@ -110,16 +110,16 @@ impl Part {
 
 impl Server {
     fn shelf_part(&self, s: u32) -> Part {
-        Part::parse(self.v().get(s, "side_chain"))
+        Part::parse(self.view().get(s, "side_chain"))
     }
 
     /// Shelf that can chain: tag `wooden_shelves`, powered.
     fn shelf_connectable(&self, s: u32) -> bool {
-        self.v().get_bool(s, "powered") && self.btag_state(s, "minecraft:wooden_shelves")
+        self.view().get_bool(s, "powered") && self.btag_state(s, "minecraft:wooden_shelves")
     }
 
     fn btag_state(&self, s: u32, tag: &str) -> bool {
-        let b = u32::from(self.v().block(s));
+        let b = u32::from(self.view().block(s));
         self.block_tags.get(tag).is_some_and(|t| t.binary_search(&b).is_ok())
     }
 
@@ -129,17 +129,17 @@ impl Server {
         let d = if left { facing.clockwise() } else { facing.counter_clockwise() };
         let q = rel_n(center, d, steps);
         let s = self.get(q);
-        let ok = self.v().kind(s) == Kind::Shelf && self.shelf_connectable(s) && self.v().facing(s) == facing;
+        let ok = self.view().kind(s) == Kind::Shelf && self.shelf_connectable(s) && self.view().facing(s) == facing;
         (q, ok.then(|| self.shelf_part(s)))
     }
 
     /// The chain from left to right (empty if it cannot chain).
     fn shelf_chain(&self, p: P) -> Vec<P> {
         let s = self.get(p);
-        if self.v().kind(s) != Kind::Shelf || !self.shelf_connectable(s) {
+        if self.view().kind(s) != Kind::Shelf || !self.shelf_connectable(s) {
             return Vec::new();
         }
-        let facing = self.v().facing(s);
+        let facing = self.view().facing(s);
         let mut out = std::collections::VecDeque::from([p]);
         for (left, end) in [(true, Part::Left), (false, Part::Right)] {
             for steps in 1..MAX_CHAIN {
@@ -163,14 +163,14 @@ impl Server {
     fn shelf_set_part(&mut self, q: P, part: Part) {
         let s = self.get(q);
         if self.shelf_part(s) != part {
-            let ns = self.v().set(s, "side_chain", part.name());
+            let ns = self.view().set(s, "side_chain", part.name());
             self.set_update(q, ns);
         }
     }
 
     /// The reaction to placing a shelf block: chain formed if powered, otherwise neighbours detached.
     pub(crate) fn shelf_on_place(&mut self, p: P, s: u32, old: u32) {
-        if self.v().get_bool(s, "powered") {
+        if self.view().get_bool(s, "powered") {
             self.shelf_powering_up(p, s, old);
         } else {
             self.shelf_powering_down(p, s);
@@ -180,7 +180,7 @@ impl Server {
     /// Left neighbour detached from its right, right neighbour
     /// detached from its left.
     pub(crate) fn shelf_powering_down(&mut self, p: P, s: u32) {
-        let facing = self.v().facing(s);
+        let facing = self.view().facing(s);
         let (lq, lp) = self.shelf_neighbor(p, facing, true, 1);
         let (rq, rp) = self.shelf_neighbor(p, facing, false, 1);
         if let Some(x) = lp {
@@ -198,11 +198,11 @@ impl Server {
             return;
         }
         let old_connected =
-            self.v().kind(old) == Kind::Shelf && self.shelf_connectable(old) && self.shelf_part(old).connected();
+            self.view().kind(old) == Kind::Shelf && self.shelf_connectable(old) && self.shelf_part(old).connected();
         if self.shelf_part(s).connected() || old_connected {
             return;
         }
-        let facing = self.v().facing(s);
+        let facing = self.view().facing(s);
         let (lq, lp) = self.shelf_neighbor(p, facing, true, 1);
         let (rq, rp) = self.shelf_neighbor(p, facing, false, 1);
         let left_len = if lp.is_some() { self.shelf_chain(lq).len() as i32 } else { 0 };
@@ -229,12 +229,12 @@ impl Server {
     /// Power followed (chain cut without current), sound, event.
     pub(crate) fn shelf_neighbor_changed(&mut self, p: P, s: u32) {
         let signal = self.has_neighbor_signal(p);
-        if self.v().get_bool(s, "powered") == signal {
+        if self.view().get_bool(s, "powered") == signal {
             return;
         }
-        let mut ns = self.v().set_bool(s, "powered", signal);
+        let mut ns = self.view().set_bool(s, "powered", signal);
         if !signal {
-            ns = self.v().set(ns, "side_chain", "unconnected");
+            ns = self.view().set(ns, "side_chain", "unconnected");
         }
         self.set_update(p, ns);
         let sound = if signal { "minecraft:block.shelf.activate" } else { "minecraft:block.shelf.deactivate" };
@@ -247,7 +247,7 @@ impl Server {
     /// game event if any (block state), contents sent back to the client.
     fn shelf_changed(&mut self, q: P, event: Option<&str>) {
         let s = self.get(q);
-        let b = self.v().block(s);
+        let b = self.view().block(s);
         self.update_neighbour_for_output_signal(q, b);
         if let Some(ev) = event {
             self.game_event_block(ev, q, None, Some(s));
@@ -260,9 +260,9 @@ impl Server {
         if self.be_get(p).is_none() {
             return ItemOn::Pass;
         }
-        let Some(hit) = hit_slot(p, face, at, self.v().facing(s), 1, 3) else { return ItemOn::Pass };
+        let Some(hit) = hit_slot(p, face, at, self.view().facing(s), 1, 3) else { return ItemOn::Pass };
         let held = self.slots[slot].clone();
-        if !self.v().get_bool(s, "powered") {
+        if !self.view().get_bool(s, "powered") {
             // The whole held stack against the slot's one.
             let mut items = self.be_get(p).map_or_else(|| vec![None; 3], |b| read_items(b, 3));
             let removed = std::mem::replace(&mut items[hit], held.clone());
@@ -329,7 +329,7 @@ impl Server {
 
     /// Shelf comparator output: only toward the back; one bit per full slot.
     pub(crate) fn shelf_comparator(&self, p: P, s: u32, from: Dir) -> i32 {
-        if from != self.v().facing(s).opposite() {
+        if from != self.view().facing(s).opposite() {
             return 0;
         }
         let Some(be) = self.be_get(p) else { return 0 };
@@ -348,8 +348,8 @@ impl Server {
         if !self.life.items.has_tag("minecraft:bookshelf_books", &held.id) {
             return ItemOn::TryEmptyHand;
         }
-        let Some(hit) = hit_slot(p, face, at, self.v().facing(s), 2, 3) else { return ItemOn::Pass };
-        if self.v().get_bool(s, &format!("slot_{hit}_occupied")) {
+        let Some(hit) = hit_slot(p, face, at, self.view().facing(s), 2, 3) else { return ItemOn::Pass };
+        if self.view().get_bool(s, &format!("slot_{hit}_occupied")) {
             return ItemOn::TryEmptyHand;
         }
         self.award_stat("minecraft:used", &held.id, 1);
@@ -371,8 +371,8 @@ impl Server {
         if self.be_get(p).is_none() {
             return false;
         }
-        let Some(hit) = hit_slot(p, face, at, self.v().facing(s), 2, 3) else { return false };
-        if !self.v().get_bool(s, &format!("slot_{hit}_occupied")) {
+        let Some(hit) = hit_slot(p, face, at, self.view().facing(s), 2, 3) else { return false };
+        if !self.view().get_bool(s, &format!("slot_{hit}_occupied")) {
             return true;
         }
         let book = self.be_get(p).and_then(|b| read_items(b, 6).swap_remove(hit));
@@ -408,7 +408,7 @@ impl Server {
         }
         let mut ns = self.get(p);
         for (i, it) in items.iter().enumerate() {
-            ns = self.v().set_bool(ns, &format!("slot_{i}_occupied"), it.is_some());
+            ns = self.view().set_bool(ns, &format!("slot_{i}_occupied"), it.is_some());
         }
         self.set_update(p, ns);
         self.game_event_block("minecraft:block_change", p, None, Some(ns));

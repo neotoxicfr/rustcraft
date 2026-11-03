@@ -16,14 +16,14 @@ impl Server {
 
     /// Block read by a comparator at `p` (same geometry as its input): loot drawn.
     pub(crate) fn comparator_unseal(&mut self, p: [i32; 3], s: u32) {
-        let d = self.v().facing(s);
+        let d = self.view().facing(s);
         let tp = crate::blocks::rel(p, d);
         let ts = self.get(tp);
-        let target = if self.v().has_analog(ts) {
+        let target = if self.view().has_analog(ts) {
             Some(tp)
-        } else if self.v().conductor(ts) {
+        } else if self.view().conductor(ts) {
             let t2 = crate::blocks::rel(tp, d);
-            self.v().has_analog(self.get(t2)).then_some(t2)
+            self.view().has_analog(self.get(t2)).then_some(t2)
         } else {
             None
         };

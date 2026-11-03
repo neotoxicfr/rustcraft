@@ -101,11 +101,11 @@ impl Probe {
         let (base, given) = self.parse_state(text);
         let old = self.s.get(p);
         let mut st = self.s.update_from_neighbour_shapes(base, p);
-        if self.s.v().is_air(st) {
+        if self.s.view().is_air(st) {
             st = base;
         }
         for (k, val) in &given {
-            st = self.s.v().set(st, k, val);
+            st = self.s.view().set(st, k, val);
         }
         self.s.set_block(p, st, flag::CLIENTS | flag::SKIP_BE_SIDE_EFFECTS).then_some(old)
     }
@@ -113,12 +113,12 @@ impl Probe {
     fn after_set(&mut self, p: P, old: u32) {
         let s = &mut self.s;
         let st = s.get(p);
-        let nb = s.v().block(st);
-        if s.v().block(old) != nb {
+        let nb = s.view().block(st);
+        if s.view().block(old) != nb {
             s.affect_after_removal(old, p, false);
         }
         s.update_neighbors_at(p, nb);
-        if s.v().has_analog(st) {
+        if s.view().has_analog(st) {
             s.update_neighbour_for_output_signal(p, nb);
         }
     }
@@ -244,7 +244,7 @@ impl Probe {
                     }
                     self.s.reload_live_be(p);
                     let st = self.s.get(p);
-                    let b = self.s.v().block(st);
+                    let b = self.s.view().block(st);
                     self.s.update_neighbour_for_output_signal(p, b);
                 }
                 "watchitems" => {
@@ -290,7 +290,7 @@ impl Probe {
 impl Server {
     /// Right click without an item (lever, button…) for the probe.
     pub(crate) fn probe_use(&mut self, p: P, s: u32) {
-        match self.v().kind(s) {
+        match self.view().kind(s) {
             super::Kind::Lever => self.lever_pull(p, s),
             super::Kind::Button { .. } => {
                 self.button_press(p, s, Some(crate::mobs::mob::Ent::Player));

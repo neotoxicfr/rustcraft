@@ -190,7 +190,7 @@ impl Server {
             match op {
                 LiveOp::Set(_, s, f) => n += usize::from(self.set_block(p, s, f)),
                 LiveOp::Notify(_) => {
-                    let b = self.v().block(self.get(p));
+                    let b = self.view().block(self.get(p));
                     self.update_neighbors_at(p, b);
                 }
                 LiveOp::Destroy(_) => {

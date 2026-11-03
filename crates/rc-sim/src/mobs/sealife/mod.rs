@@ -527,7 +527,7 @@ pub fn placement_ok(s: &Server, k: Kind, p: [i32; 3]) -> Option<bool> {
         return None;
     }
     let above = [p[0], p[1] + 1, p[2]];
-    Some(s.mob_fluid(p) == Fluid::Water && !s.v().conductor(s.st(above)))
+    Some(s.mob_fluid(p) == Fluid::Water && !s.view().conductor(s.st(above)))
 }
 
 /// Own spawn rule; `None`: common rule.

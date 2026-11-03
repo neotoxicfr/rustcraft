@@ -24,7 +24,7 @@ pub(crate) struct SimRay<'a>(pub &'a Server, pub bool);
 
 impl RayWorld for SimRay<'_> {
     fn outline(&self, p: P) -> &[rc_data::Aabb] {
-        let info = self.0.v().info(self.0.get(p));
+        let info = self.0.view().info(self.0.get(p));
         self.0.data.shape(if self.1 { info.collision } else { info.outline })
     }
 
@@ -98,8 +98,8 @@ impl Server {
     pub(crate) fn bucket_pickup_at(&mut self, p: P) -> Option<&'static str> {
         let s = self.get(p);
         let name = self.data.block_of(s).map(|b| b.name.clone()).unwrap_or_default();
-        let source = self.v().get_int(s, "level") == 0;
-        let wet = self.v().has(s, "waterlogged") && self.v().get_bool(s, "waterlogged");
+        let source = self.view().get_int(s, "level") == 0;
+        let wet = self.view().has(s, "waterlogged") && self.view().get_bool(s, "waterlogged");
         Some(match name.as_str() {
             "minecraft:water" | "minecraft:lava" if source => {
                 let air = self.air();
@@ -118,7 +118,7 @@ impl Server {
                 "minecraft:powder_snow_bucket"
             }
             _ if wet => {
-                let dry = self.v().set_bool(s, "waterlogged", false);
+                let dry = self.view().set_bool(s, "waterlogged", false);
                 self.set_update(p, dry);
                 if !self.can_place_at(dry, p) {
                     self.destroy_block(p, true, 512);
@@ -154,7 +154,7 @@ impl Server {
     /// Waterloggable block that accepts water: the double slab refuses, the
     /// barrier only accepts a player in creative (`by_creative`), not flowing water.
     pub(crate) fn accepts_water(&self, s: u32, by_creative: bool) -> bool {
-        let v = self.v();
+        let v = self.view();
         if matches!(v.kind(s), crate::blocks::Kind::Slab) && v.get(s, "type") == Some("double") {
             return false;
         }
@@ -166,7 +166,7 @@ impl Server {
 
     /// The block at `p` is a liquid container (waterloggable, seagrass, kelp).
     fn liquid_container(&self, p: P) -> bool {
-        self.v().sim(self.get(p)) & rc_data::model::sim_bits::LIQUID_CONTAINER != 0
+        self.view().sim(self.get(p)) & rc_data::model::sim_bits::LIQUID_CONTAINER != 0
     }
 
     /// Emptying at `p`; second attempt in `retry`, ignoring
@@ -174,14 +174,16 @@ impl Server {
     /// dispenser (sound for everyone).
     pub(crate) fn bucket_empty_at(&mut self, p: P, water: bool, retry: Option<P>, by: Option<Ent>) -> bool {
         let s = self.get(p);
-        let info = self.v().info(s);
-        let air = self.v().is_air(s);
+        let info = self.view().info(s);
+        let air = self.view().is_air(s);
         let portal = matches!(self.bname(p), "minecraft:end_portal" | "minecraft:end_gateway");
         let may_replace = !portal && (info.has(flags::REPLACEABLE) || !info.has(flags::LEGACY_SOLID));
         // Liquid container (waterloggables, seagrasses, kelps): water enters without breaking anything;
         // already waterlogged or refusal (seagrasses): success with no effect, like the game.
         let container = water && self.liquid_container(p);
-        let loggable = container && self.v().has(s, "waterlogged") && self.accepts_water(s, by == Some(Ent::Player) && self.game_mode == 1);
+        let loggable = container
+            && self.view().has(s, "waterlogged")
+            && self.accepts_water(s, by == Some(Ent::Player) && self.game_mode == 1);
         let inside = air || ((may_replace || loggable) && (!self.sneaking || retry.is_none()));
         if !inside {
             return retry.is_some_and(|q| self.bucket_empty_at(q, water, None, by));
@@ -191,7 +193,7 @@ impl Server {
             return true;
         }
         if container {
-            if loggable && !self.v().get_bool(s, "waterlogged") {
+            if loggable && !self.view().get_bool(s, "waterlogged") {
                 self.place_water_in(p, s); // G6-F01: campfire, dried ghast
             }
         } else {

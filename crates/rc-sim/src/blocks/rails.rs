@@ -51,11 +51,11 @@ impl Rail {
 impl Server {
     /// Positions linked by the rail shape.
     pub(crate) fn rail_connections(&self, p: P, s: u32) -> Vec<P> {
-        conns_of(p, self.v().get(s, "shape").unwrap_or("north_south"))
+        conns_of(p, self.view().get(s, "shape").unwrap_or("north_south"))
     }
 
     pub(crate) fn is_rail_state(&self, s: u32) -> bool {
-        matches!(self.v().kind(s), Kind::Rail | Kind::PoweredRail | Kind::DetectorRail)
+        matches!(self.view().kind(s), Kind::Rail | Kind::PoweredRail | Kind::DetectorRail)
     }
 
     fn is_rail_at(&self, p: P) -> bool {
@@ -63,7 +63,7 @@ impl Server {
     }
 
     fn rail_new(&self, p: P, s: u32) -> Rail {
-        let v = self.v();
+        let v = self.view();
         let shape = v.get(s, "shape").unwrap_or("north_south");
         Rail { pos: p, state: s, straight: v.kind(s) != Kind::Rail, conns: conns_of(p, shape) }
     }
@@ -167,7 +167,7 @@ impl Server {
             }
         }
         let shape = self.rail_slope(p, shape.unwrap_or("north_south"));
-        r.state = self.v().set(r.state, "shape", shape);
+        r.state = self.view().set(r.state, "shape", shape);
         self.set_update(p, r.state);
     }
 
@@ -229,7 +229,7 @@ impl Server {
             None => default,
         };
         me.conns = conns_of(p, shape);
-        me.state = self.v().set(me.state, "shape", shape);
+        me.state = self.view().set(me.state, "shape", shape);
         if first || self.get(p) != me.state {
             self.set_update(p, me.state);
             let mut i = 0;
@@ -259,7 +259,7 @@ impl Server {
             "north_west",
             "north_east",
         ];
-        let v = self.v();
+        let v = self.view();
         let cur = v.get(s, "shape").unwrap_or("north_south");
         ALL.iter().find(|&&x| x == cur).copied().unwrap_or("north_south")
     }
@@ -276,15 +276,15 @@ impl Server {
     /// "neighbour changed" on itself (power).
     pub(crate) fn rail_placed(&mut self, p: P, s: u32, moved: bool) {
         let s = self.rail_update_dir(p, s, true);
-        if self.v().kind(s) != Kind::Rail {
-            let b = self.v().block(s);
+        if self.view().kind(s) != Kind::Rail {
+            let b = self.view().block(s);
             self.neighbor_changed_full(s, p, b, moved);
         }
     }
 
     /// Simple rail: a neighbour that is a signal source retriggers the shape if three rails surround it.
     pub(crate) fn plain_rail_update(&mut self, s: u32, p: P, from: u16) {
-        let def = self.v().default_state(from);
+        let def = self.view().default_state(from);
         if self.is_signal_source(def) && self.rail_potential(p) == 3 {
             self.rail_update_dir(p, s, false);
         }

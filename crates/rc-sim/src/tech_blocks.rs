@@ -339,7 +339,7 @@ impl Server {
             return Ok(());
         }
         let s = self.get(p);
-        let front = self.v().get(s, "orientation").and_then(|o| o.split('_').next()).and_then(Dir::parse);
+        let front = self.view().get(s, "orientation").and_then(|o| o.split('_').next()).and_then(Dir::parse);
         let Some(front) = front else { return Ok(()) };
         let be = self.be_get(p).cloned().unwrap_or(Nbt::Compound(Vec::new()));
         let text = |k: &str| be.get(k).and_then(Nbt::as_str).unwrap_or("minecraft:empty").to_owned();
@@ -455,7 +455,7 @@ impl Server {
     /// block entity; the mode comes from the block state).
     pub(crate) fn tech_created(&mut self, p: P, s: u32) {
         // A new test block entity starts untriggered.
-        if self.v().kind(s) == Kind::Test {
+        if self.view().kind(s) == Kind::Test {
             self.test_block_mark(p, false);
         }
         self.tech_defaults(p, s, true);
@@ -466,7 +466,7 @@ impl Server {
     /// mode, structure block offsets and sizes clamped), as its next save writes them.
     pub(crate) fn tech_loaded(&mut self, p: P) {
         let s = self.get(p);
-        if self.v().kind(s) == Kind::Structure {
+        if self.view().kind(s) == Kind::Structure {
             if let Some(be) = self.be_get_mut(p) {
                 let sb = Sb::read(be);
                 sb.write(be);
@@ -477,7 +477,7 @@ impl Server {
     }
 
     fn tech_defaults(&mut self, p: P, s: u32, fresh: bool) {
-        let v = self.v();
+        let v = self.view();
         let fields: Vec<(&str, Nbt)> = match v.kind(s) {
             Kind::Structure => {
                 let mode = v.get(s, "mode").and_then(|m| MODES.iter().position(|x| x.0 == m)).unwrap_or(3);
@@ -548,7 +548,7 @@ impl Server {
 
     /// Placed by the player: the structure block records its author (plain name).
     pub(crate) fn tech_placed_by(&mut self, p: P, s: u32) {
-        if self.v().kind(s) == Kind::Structure && be_id(self.be_get(p)) == Some("minecraft:structure_block") {
+        if self.view().kind(s) == Kind::Structure && be_id(self.be_get(p)) == Some("minecraft:structure_block") {
             let name = self.name.clone();
             if let Some(be) = self.be_get_mut(p) {
                 set(be, "author", Nbt::String(name));
@@ -559,7 +559,7 @@ impl Server {
     /// Used by an operator in creative: the client opens the block's screen (nothing to send).
     pub(crate) fn tech_block_use(&self, p: P) -> bool {
         let s = self.get(p);
-        let id = match self.v().kind(s) {
+        let id = match self.view().kind(s) {
             Kind::Structure => "minecraft:structure_block",
             Kind::Jigsaw => "minecraft:jigsaw",
             Kind::Test => "minecraft:test_block",
@@ -572,7 +572,7 @@ impl Server {
     /// Neighbour changed: the structure and test blocks follow the redstone signal (edges);
     /// `false` if the block is neither.
     pub(crate) fn tech_neighbor_changed(&mut self, s: u32, p: P) -> bool {
-        match self.v().kind(s) {
+        match self.view().kind(s) {
             Kind::Structure => {
                 if be_id(self.be_get(p)) != Some("minecraft:structure_block") {
                     return true;
@@ -643,7 +643,7 @@ impl Server {
             if let Some(be) = self.be_get_mut(p) {
                 set(be, "powered", Nbt::Byte(1));
             }
-            let b = self.v().block(s);
+            let b = self.view().block(s);
             self.update_neighbors_at(p, b);
         } else {
             self.test_block_mark(p, true);
@@ -657,7 +657,7 @@ impl Server {
 
     /// Signal of a test block: 15 in start mode while powered, otherwise nothing.
     pub(crate) fn test_block_signal(&self, s: u32, p: P) -> i32 {
-        if self.v().get(s, "mode") != Some("start") {
+        if self.view().get(s, "mode") != Some("start") {
             return 0;
         }
         let powered = self.be_get(p).and_then(|b| int(b, "powered")).is_some_and(|v| v != 0);
@@ -676,8 +676,8 @@ impl Server {
     fn structure_set_mode(&mut self, p: P, sb: &mut Sb, mode: usize) {
         sb.mode = mode;
         let s = self.get(p);
-        if self.v().kind(s) == Kind::Structure {
-            let ns = self.v().set(s, "mode", MODES[mode].0);
+        if self.view().kind(s) == Kind::Structure {
+            let ns = self.view().set(s, "mode", MODES[mode].0);
             if ns != s {
                 self.set_block(p, ns, flag::CLIENTS);
             }
@@ -689,8 +689,8 @@ impl Server {
             set(be, "mode", Nbt::String(mode.to_owned()));
         }
         let s = self.get(p);
-        if self.v().kind(s) == Kind::Test {
-            let ns = self.v().set(s, "mode", mode);
+        if self.view().kind(s) == Kind::Test {
+            let ns = self.view().set(s, "mode", mode);
             if ns != s {
                 self.set_block(p, ns, flag::CLIENTS);
             }
@@ -796,7 +796,7 @@ impl Server {
         if sb.mode != 0 {
             return false;
         }
-        let corner_state = |s: &Server, st: u32| s.v().kind(st) == Kind::Structure;
+        let corner_state = |s: &Server, st: u32| s.view().kind(st) == Kind::Structure;
         let (min_y, top) = (self.dim.height.min_y, self.top_y());
         let (mut lo, mut hi, mut n) = ([i32::MAX; 3], [i32::MIN; 3], 0usize);
         let (x0, x1, z0, z1) = (p[0] - SCAN_RANGE, p[0] + SCAN_RANGE, p[2] - SCAN_RANGE, p[2] + SCAN_RANGE);
@@ -933,7 +933,7 @@ impl Server {
     pub(crate) fn state_nbt(&self, s: u32) -> Nbt {
         let name = self.data.block_of(s).map_or("minecraft:air", |b| b.name.as_str()).to_owned();
         let props: Vec<(String, Nbt)> = self
-            .v()
+            .view()
             .props_sorted(s)
             .into_iter()
             .filter_map(|(k, vals, i)| vals.get(i).map(|v| (k.to_owned(), Nbt::String(v.clone()))))
@@ -953,8 +953,8 @@ impl Server {
         let far = [origin[0] + size[0] - 1, origin[1] + size[1] - 1, origin[2] + size[2] - 1];
         let lo = [origin[0].min(far[0]), origin[1].min(far[1]), origin[2].min(far[2])];
         let hi = [origin[0].max(far[0]), origin[1].max(far[1]), origin[2].max(far[2])];
-        let void = self.tb().block_id("minecraft:structure_void");
-        let air = self.tb().block_id("minecraft:air");
+        let void = self.table().block_id("minecraft:structure_void");
+        let air = self.table().block_id("minecraft:air");
         // (y, x, z) order inside each category comes from the loops.
         let (mut full, mut other, mut with) = (Vec::new(), Vec::new(), Vec::new());
         for y in lo[1]..=hi[1] {
@@ -962,7 +962,7 @@ impl Server {
                 for z in lo[2]..=hi[2] {
                     let q = [x, y, z];
                     let st = self.get(q);
-                    let b = self.v().block(st);
+                    let b = self.view().block(st);
                     if b == void || (skip_air && b == air) {
                         continue;
                     }
@@ -1142,8 +1142,8 @@ fn place_live(
     }
     let integrity = s.integrity.clamp(0.0, 1.0);
     let barrier = {
-        let v = srv.v();
-        v.default_state(srv.tb().block_id("minecraft:barrier"))
+        let v = srv.view();
+        v.default_state(srv.table().block_id("minecraft:barrier"))
     };
     let mut placed: Vec<(P, bool)> = Vec::with_capacity(blocks.len());
     let (mut lo, mut hi) = ([i32::MAX; 3], [i32::MIN; 3]);
@@ -1183,8 +1183,8 @@ fn place_live(
         // the water that was there).
         if srv.fluid_of(st).source {
             locked.insert(p);
-        } else if srv.v().has(st, "waterlogged") {
-            if prev.kind == 1 && prev.source && !srv.v().get_bool(st, "waterlogged") {
+        } else if srv.view().has(st, "waterlogged") {
+            if prev.kind == 1 && prev.source && !srv.view().get_bool(st, "waterlogged") {
                 srv.place_water_in(p, st);
             }
             if !prev.source {
@@ -1212,8 +1212,8 @@ fn place_live(
                 }
             }
             let cur = srv.get(p);
-            if src.source && srv.v().has(cur, "waterlogged") {
-                if src.kind == 1 && !srv.v().get_bool(cur, "waterlogged") {
+            if src.source && srv.view().has(cur, "waterlogged") {
+                if src.kind == 1 && !srv.view().get_bool(cur, "waterlogged") {
                     srv.place_water_in(p, cur);
                 }
                 filled = true;
@@ -1231,7 +1231,7 @@ fn place_live(
             if ns != st {
                 srv.set_block(p, ns, (flags & !flag::NEIGHBORS) | flag::KNOWN_SHAPE);
             }
-            let b = srv.v().block(ns);
+            let b = srv.view().block(ns);
             srv.update_neighbors_at(p, b);
         }
     }

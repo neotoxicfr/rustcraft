@@ -736,7 +736,7 @@ impl Server {
         if area > 32768 {
             return Err(Fail(tr!("commands.execute.blocks.toobig", 32768, area)));
         }
-        let air = self.tb().block_id("air");
+        let air = self.table().block_id("air");
         let mut count = 0;
         for z in min[2]..=max[2] {
             for y in min[1]..=max[1] {
@@ -744,7 +744,7 @@ impl Server {
                     let sp = [x, y, z];
                     let dp = [d[0] + x - min[0], d[1] + y - min[1], d[2] + z - min[2]];
                     let st = self.get(sp);
-                    if masked && self.v().block(st) == air {
+                    if masked && self.view().block(st) == air {
                         continue;
                     }
                     if st != self.get(dp) {

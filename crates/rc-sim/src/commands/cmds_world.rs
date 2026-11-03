@@ -72,8 +72,8 @@ impl Server {
     /// their default value, no old value kept); counts as modified if the
     /// data changed.
     fn place_input(&mut self, p: [i32; 3], b: &args::BlockInput, strict: bool) -> bool {
-        let v = self.v();
         let mut st = if strict { b.state } else { self.update_from_neighbour_shapes(b.state, p) };
+        let v = self.view();
         if v.is_air(st) {
             st = b.state;
         }
@@ -96,14 +96,14 @@ impl Server {
 
     /// The neighbour update on placement.
     fn neighbours_on_set(&mut self, p: [i32; 3], old: u32) {
-        let v = self.v();
+        let v = self.view();
         let now = self.get(p);
         let nb = v.block(now);
         if v.block(old) != nb {
             self.affect_after_removal(old, p, false);
         }
         self.update_neighbors_at(p, nb);
-        if self.v().has_analog(now) {
+        if self.view().has_analog(now) {
             self.update_neighbour_for_output_signal(p, nb);
         }
     }
@@ -115,12 +115,12 @@ impl Server {
         };
         let mode = seg.path.get(3).map(String::as_str).unwrap_or("replace");
         let strict = mode == "strict";
-        if mode == "keep" && !self.v().is_air(self.get(pos)) {
+        if mode == "keep" && !self.view().is_air(self.get(pos)) {
             return Err(Fail(tr!("commands.setblock.failed")));
         }
         let place = if mode == "destroy" {
             self.destroy_block(pos, true, 512);
-            !self.v().is_air(b.state) || !self.v().is_air(self.get(pos))
+            !self.view().is_air(b.state) || !self.view().is_air(self.get(pos))
         } else {
             true
         };
@@ -159,7 +159,7 @@ impl Server {
             for y in min[1]..=max[1] {
                 for x in min[0]..=max[0] {
                     let pos = [x, y, z];
-                    if mode == Some("keep") && !self.v().is_air(self.get(pos)) {
+                    if mode == Some("keep") && !self.view().is_air(self.get(pos)) {
                         continue;
                     }
                     if let Some(f) = &filter
@@ -250,7 +250,7 @@ impl Server {
         // Source side: blocks sorted like the game (solid: opaque or full collision; block
         // entities; others), clear order of a move (others first).
         let (solid, bes, other, clear): Lists = self.in_world(&src_dim, |me| {
-            let air_block = me.tb().block_id("air");
+            let air_block = me.table().block_id("air");
             let mut l: Lists = Default::default();
             for z in min[2]..=max[2] {
                 for y in min[1]..=max[1] {
@@ -259,14 +259,14 @@ impl Server {
                         let dp = [dest[0] + x - min[0], dest[1] + y - min[1], dest[2] + z - min[2]];
                         let st = me.get(sp);
                         let ok = match mask {
-                            "masked" => me.v().block(st) != air_block,
+                            "masked" => me.view().block(st) != air_block,
                             "filtered" => filter.as_ref().is_some_and(|f| me.block_matches(f, sp)),
                             _ => true,
                         };
                         if !ok {
                             continue;
                         }
-                        let info = me.v().info(st);
+                        let info = me.view().info(st);
                         if let Some(be) = me.be_get(sp).cloned() {
                             l.1.push((dp, st, Some(be), 0));
                             l.3.push_back(sp);
@@ -283,7 +283,7 @@ impl Server {
             l
         });
         let base = flag::CLIENTS | if strict { 816 } else { 0 };
-        let barrier = self.v().default_state(self.tb().block_id("barrier"));
+        let barrier = self.view().default_state(self.table().block_id("barrier"));
         let air = self.air();
         let mut all: Vec<Info> = Vec::new();
         all.extend(solid);

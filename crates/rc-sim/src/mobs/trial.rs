@@ -389,7 +389,7 @@ impl Server {
         let target_cd = nbtio::int(&be, "target_cooldown_length").map_or(36000, |v| v.max(0));
         let range = nbtio::int(&be, "required_player_range").map_or(14, |v| v.clamp(1, 128) as i32);
         let s = self.get(p);
-        let mut ominous = self.v().get_bool(s, "ominous");
+        let mut ominous = self.view().get_bool(s, "ominous");
         let state = self.prop(p, "trial_spawner_state").unwrap_or_else(|| "inactive".into());
         let mut updated = false;
         let now = self.time;
@@ -515,7 +515,7 @@ impl Server {
                     "active"
                 } else if self.time >= t.cooldown_ends_at {
                     let s = self.get(p);
-                    let ns = self.v().set(s, "ominous", "false");
+                    let ns = self.view().set(s, "ominous", "false");
                     self.set_update(p, ns);
                     ominous = false;
                     t.mobs.clear();
@@ -530,7 +530,7 @@ impl Server {
         let changed = next != state;
         if changed {
             let s = self.get(p);
-            let ns = self.v().set(s, "trial_spawner_state", next);
+            let ns = self.view().set(s, "trial_spawner_state", next);
             self.set_update(p, ns);
         }
         let _ = ominous;
@@ -660,7 +660,7 @@ impl Server {
     fn trial_apply_ominous(&mut self, t: &mut TrialData, ctx: &TrialCtx, updated: &mut bool) {
         let p = ctx.p;
         let s = self.get(p);
-        let ns = self.v().set(s, "ominous", "true");
+        let ns = self.view().set(s, "ominous", "true");
         self.set_update(p, ns);
         self.level_event(3020, p, 1);
         for u in std::mem::take(&mut t.mobs) {
@@ -1060,7 +1060,7 @@ impl Server {
         let mut v = VaultData::load(&be);
         let state = self.prop(p, "vault_state").unwrap_or_else(|| "inactive".into());
         let s = self.get(p);
-        let ominous = self.v().get_bool(s, "ominous");
+        let ominous = self.view().get_bool(s, "ominous");
         if self.time % 20 == 0 && state == "active" {
             self.vault_cycle_display(&mut v, &state, p);
         }
@@ -1132,7 +1132,7 @@ impl Server {
 
     fn vault_set_state(&mut self, v: &mut VaultData, p: P, from: &str, to: &str, ominous: bool) {
         let s = self.get(p);
-        let ns = self.v().set(s, "vault_state", to);
+        let ns = self.view().set(s, "vault_state", to);
         self.set_update(p, ns);
         if from == "ejecting" {
             self.block_sound(p, "minecraft:block.vault.close_shutter", 1.0, 1.0);
@@ -1243,7 +1243,7 @@ impl Server {
         let next = v.to_eject.last().cloned();
         v.set_display(next);
         v.pause(now + 14);
-        let ominous = self.v().get_bool(self.get(p), "ominous");
+        let ominous = self.view().get_bool(self.get(p), "ominous");
         self.vault_set_state(&mut v, p, "active", "unlocking", ominous);
         v.rewarded.push(self.uuid);
         if v.rewarded.len() > 128 {
@@ -1333,7 +1333,7 @@ impl Server {
             let t = TrialData::default();
             self.trial_store(p, &t);
             let s = self.get(p);
-            let ns = self.v().set(s, "trial_spawner_state", "inactive");
+            let ns = self.view().set(s, "trial_spawner_state", "inactive");
             self.set_update(p, ns);
         }
         if id == TRIAL {

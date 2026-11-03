@@ -90,7 +90,7 @@ impl Server {
         if !self.btag_id(p, crate::tag_bits::TagId::Rails) {
             return None;
         }
-        Shape::parse(self.v().get(st, "shape")?)
+        Shape::parse(self.view().get(st, "shape")?)
     }
 
     /// The position of the current block or of the rail below (old behavior): a rail just below counts.
@@ -135,7 +135,7 @@ impl Server {
 
     /// Redstone conductive block.
     fn cart_conductor(&self, p: [i32; 3]) -> bool {
-        self.v().conductor(self.st(p))
+        self.view().conductor(self.st(p))
     }
 
     /// Maximum speed: 0.4, 0.2 in water; furnace × 0.5 (× 0.75 in water).
@@ -189,7 +189,7 @@ impl Server {
         if let Some(shape) = shape {
             self.cart_move_along_track(c, bp, shape);
             if self.bname(bp) == "minecraft:activator_rail" {
-                let powered = self.v().get(self.st(bp), "powered") == Some("true");
+                let powered = self.view().get(self.st(bp), "powered") == Some("true");
                 self.cart_activate(c, powered);
             }
         } else {
@@ -227,7 +227,7 @@ impl Server {
         let name = self.bname(p).to_owned();
         let (mut power, mut halt) = (false, false);
         if name == "minecraft:powered_rail" {
-            power = self.v().get(self.st(p), "powered") == Some("true");
+            power = self.view().get(self.st(p), "powered") == Some("true");
             halt = !power;
         }
         let mut slide = 0.007_812_5;
@@ -562,7 +562,7 @@ impl Server {
         let full = l2(mv).sqrt();
         let h = (mv[0] * mv[0] + mv[2] * mv[2]).sqrt();
         c.move_dist += if climbing { (full * f64::from(0.6f32)) as f32 } else { (h * f64::from(0.6f32)) as f32 };
-        if c.move_dist > c.next_step && !self.v().is_air(on_st) {
+        if c.move_dist > c.next_step && !self.view().is_air(on_st) {
             let same = on == effect;
             let mut produced = self.cart_step_event(c, effect, effect_st, same);
             if !same {
@@ -578,7 +578,7 @@ impl Server {
     }
 
     fn cart_step_event(&mut self, c: &Cart, _p: [i32; 3], st: u32, vibrate: bool) -> bool {
-        if self.v().is_air(st) {
+        if self.view().is_air(st) {
             return false;
         }
         let climb = self.climbable_state(st);
@@ -604,7 +604,8 @@ impl Server {
         match self.bname(p) {
             "minecraft:powder_snow" => return,
             "minecraft:pointed_dripstone"
-                if self.v().get(st, "vertical_direction") == Some("up") && self.v().get(st, "thickness") == Some("tip") =>
+                if self.view().get(st, "vertical_direction") == Some("up")
+                    && self.view().get(st, "thickness") == Some("tip") =>
             {
                 dist += 2.5;
                 mult = 2.0;
@@ -786,7 +787,7 @@ impl Server {
                         let s = self.st(p);
                         let s = if self.bname(p) == "minecraft:powder_snow_cauldron" {
                             let w = self.default_state("minecraft:water_cauldron");
-                            self.v().set_int(w, "level", self.v().get_int(s, "level"))
+                            self.view().set_int(w, "level", self.view().get_int(s, "level"))
                         } else {
                             s
                         };

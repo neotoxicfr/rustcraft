@@ -64,7 +64,7 @@ impl Server {
             _ => 0,
         };
         let def = self.default_state("minecraft:wither_skeleton_skull");
-        let st = self.v().set(def, "rotation", &seg.to_string());
+        let st = self.view().set(def, "rotation", &seg.to_string());
         self.set_update(front, st);
         self.game_event_block("minecraft:block_place", front, None, None);
         self.wither_check_spawn(front);

@@ -34,7 +34,7 @@ fn rtick(w: &mut W, at: P) {
 
 fn eggs(w: &W, at: P) -> i32 {
     let s = w.p.s.get(at);
-    if w.p.s.v().block(s) != w.p.s.bs.t.id.turtle_egg { 0 } else { w.p.s.v().get_int(s, "eggs") }
+    if w.p.s.view().block(s) != w.p.s.bs.t.id.turtle_egg { 0 } else { w.p.s.view().get_int(s, "eggs") }
 }
 
 /// Hatch chance of the day timeline: 1 from 21,062 to 21,904 in the overworld, 0.002 at the
@@ -69,7 +69,7 @@ fn turtle_eggs_hatch_on_sand() {
     for stage in 1..=2 {
         rtick(&mut w, nest);
         let s = w.p.s.get(nest);
-        assert_eq!(w.p.s.v().get_int(s, "hatch"), stage, "crack {stage}");
+        assert_eq!(w.p.s.view().get_int(s, "hatch"), stage, "crack {stage}");
     }
     let evs = w.events();
     assert_eq!(w.sounds(&evs, "minecraft:entity.turtle.egg_crack"), 2);
@@ -97,7 +97,7 @@ fn turtle_eggs_hatch_on_sand() {
     for _ in 0..50 {
         rtick(&mut w, rock);
     }
-    assert_eq!(w.p.s.v().get_int(w.p.s.get(rock), "hatch"), 0, "egg on stone hatched");
+    assert_eq!(w.p.s.view().get_int(w.p.s.get(rock), "hatch"), 0, "egg on stone hatched");
 }
 
 /// Eggs lost: landing (1 in 3, never a zombie or a turtle; a mob only with mob griefing),
@@ -260,7 +260,7 @@ fn eyeblossoms_follow_the_night() {
     w.p.s.mobs.rec.vib.log.clear();
     rtick(&mut w, c);
     assert_eq!(w.p.s.state_name(w.p.s.get(c)), "minecraft:open_eyeblossom");
-    let closed = w.p.s.v().default_state(w.p.s.bs.t.id.closed_eyeblossom);
+    let closed = w.p.s.view().default_state(w.p.s.bs.t.id.closed_eyeblossom);
     let ev = w.p.s.mobs.rec.vib.log.iter().find(|e| e.0 == "minecraft:block_change").expect("block_change");
     assert_eq!(ev.3, Some(closed), "event carries the old state");
     let b = w.p.s.bs.t.id.closed_eyeblossom;
@@ -343,7 +343,7 @@ fn pointed_dripstone_transfers_fluid() {
         let tip = drip_until_transfer(&mut w, [x, Y + 3, z]);
         assert_eq!(tip, [x, Y + 3, z]);
         let c = [x, Y, z];
-        let b = w.p.s.v().block(w.p.s.get(c));
+        let b = w.p.s.view().block(w.p.s.get(c));
         assert!(w.p.s.has_scheduled_tick(c, b), "cauldron {c:?} not scheduled");
     }
     let mut evs = Vec::new();
@@ -352,8 +352,8 @@ fn pointed_dripstone_transfers_fluid() {
     w.ticks(30, &mut evs);
     assert_eq!(w.p.s.state_name(w.p.s.get([2, Y, 2])), "minecraft:water_cauldron");
     assert_eq!(w.p.s.state_name(w.p.s.get([6, Y, 2])), "minecraft:lava_cauldron");
-    assert_eq!(w.p.s.v().get_int(w.p.s.get([2, Y, 6]), "level"), 2, "one level more");
-    assert_eq!(w.p.s.v().get_int(w.p.s.get([6, Y, 6]), "level"), 3, "full stays full");
+    assert_eq!(w.p.s.view().get_int(w.p.s.get([2, Y, 6]), "level"), 2, "one level more");
+    assert_eq!(w.p.s.view().get_int(w.p.s.get([6, Y, 6]), "level"), 3, "full stays full");
     let fills = level_events(&evs, 1047);
     assert!(fills.contains(&([2, Y, 2], 0)) && fills.contains(&([2, Y, 6], 0)), "{fills:?}");
     assert!(!fills.iter().any(|f| f.0 == [6, Y, 6]), "full cauldron");
@@ -373,10 +373,10 @@ fn pitcher_crop_grows() {
     }
     let low = w.p.s.get(at);
     let up = w.p.s.get([4, Y + 1, 4]);
-    assert_eq!(w.p.s.v().get_int(low, "age"), 4, "ripe");
+    assert_eq!(w.p.s.view().get_int(low, "age"), 4, "ripe");
     assert_eq!(w.p.s.state_name(up), "minecraft:pitcher_crop");
-    assert_eq!(w.p.s.v().get(up, "half"), Some("upper"));
-    assert_eq!(w.p.s.v().get_int(up, "age"), 4);
+    assert_eq!(w.p.s.view().get(up, "half"), Some("upper"));
+    assert_eq!(w.p.s.view().get_int(up, "age"), 4);
 }
 
 /// A mushroom on mycelium spreads at its random ticks, never past 5 in its 9×3×9 box.
@@ -390,12 +390,12 @@ fn mushrooms_spread_up_to_five() {
     for _ in 0..20_000 {
         rtick(&mut w, at);
     }
-    let b = w.p.s.v().block(w.p.s.get(at));
+    let b = w.p.s.view().block(w.p.s.get(at));
     let mut n = 0;
     for x in -4..=4 {
         for y in -1..=1 {
             for z in -4..=4 {
-                n += usize::from(w.p.s.v().block(w.p.s.get([8 + x, Y + y, 8 + z])) == b);
+                n += usize::from(w.p.s.view().block(w.p.s.get([8 + x, Y + y, 8 + z])) == b);
             }
         }
     }
@@ -413,11 +413,11 @@ fn redstone_ore_lit_by_click() {
     w.set(at, "minecraft:redstone_ore");
     w.hold(None);
     w.click(at, Dir::Up, [0.5, 1.0, 0.5]);
-    assert!(w.p.s.v().get_bool(w.p.s.get(at), "lit"), "lit by an empty-hand click");
+    assert!(w.p.s.view().get_bool(w.p.s.get(at), "lit"), "lit by an empty-hand click");
     w.set(at, "minecraft:redstone_ore[lit=false]");
     w.hold(stack("minecraft:stone", 4));
     w.click(at, Dir::Up, [0.5, 1.0, 0.5]);
-    assert!(w.p.s.v().get_bool(w.p.s.get(at), "lit"), "lit by a block item click");
+    assert!(w.p.s.view().get_bool(w.p.s.get(at), "lit"), "lit by a block item click");
     assert_eq!(w.p.s.state_name(w.p.s.get([9, Y + 1, 9])), "minecraft:stone", "the block is still placed");
     // Draws: stone above and grass below are opaque, four air sides: 8 floats.
     w.set(at, "minecraft:redstone_ore[lit=false]");
@@ -524,7 +524,7 @@ fn cane_and_cactus_age_stays_on_the_server() {
         let _ = w.events();
         assert!(w.p.s.changed.is_empty());
         rtick(&mut w, at);
-        assert_eq!(w.p.s.v().get_int(w.p.s.get(at), "age"), 1, "{name} aged");
+        assert_eq!(w.p.s.view().get_int(w.p.s.get(at), "age"), 1, "{name} aged");
         assert!(!w.p.s.changed.contains(&at), "{name} age queued for the clients");
     }
 }
@@ -557,7 +557,7 @@ fn bench_g6f08_scan_and_grass() {
         for x in -4..=4 {
             for y in -1..=1 {
                 for z in -4..=4 {
-                    if s.v().block(s.get([p[0] + x, p[1] + y, p[2] + z])) == vine {
+                    if s.view().block(s.get([p[0] + x, p[1] + y, p[2] + z])) == vine {
                         n -= 1;
                         if n < 0 {
                             return false;
@@ -601,14 +601,14 @@ fn bench_g6f08_scan_and_grass() {
         }
     }
     // Grass survival rule on the whole state table (above = every state in turn).
-    let grass = s.v().default_state(s.bs.t.id.grass_block);
+    let grass = s.view().default_state(s.bs.t.id.grass_block);
     let n = s.data.states.len() as u32;
     for pass in 0..2 {
         let t = std::time::Instant::now();
         let mut k = 0u32;
         for _ in 0..20 {
             for a in 0..n {
-                let i = s.v().info(a);
+                let i = s.view().info(a);
                 let d = if i.has(rc_data::flags::SOLID_RENDER) { 15 } else { i.light_dampening };
                 k += u32::from(d < 15);
             }
@@ -640,9 +640,9 @@ fn box_scan_order_and_limit() {
             }
         }
     }
-    let ob = w.p.s.v().block(w.p.s.get([15, -49, 15]));
+    let ob = w.p.s.view().block(w.p.s.get([15, -49, 15]));
     let mut seen = Vec::new();
-    let v = w.p.s.v();
+    let v = w.p.s.view();
     w.p.s.scan_box([15, -49, 15], [16, -48, 16], |s| v.block(s) == ob, |q, _| {
         seen.push(q);
         true
@@ -665,7 +665,7 @@ fn box_scan_order_and_limit() {
         for x in -4..=4 {
             for y in -1..=1 {
                 for z in -4..=4 {
-                    count += usize::from(w.p.s.v().block(w.p.s.get([p[0] + x, p[1] + y, p[2] + z])) == ob);
+                    count += usize::from(w.p.s.view().block(w.p.s.get([p[0] + x, p[1] + y, p[2] + z])) == ob);
                 }
             }
         }

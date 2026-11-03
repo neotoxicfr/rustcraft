@@ -8,7 +8,7 @@ use crate::server::Server;
 
 impl Server {
     pub(crate) fn shape_of(&mut self, s: u32, kind: Kind, p: P, dir: Dir, np: P, ns: u32) -> u32 {
-        let v = self.v();
+        let v = self.view();
         match kind {
             Kind::Wire => self.wire_update_shape(s, p, dir, ns),
             Kind::Repeater => {
@@ -16,7 +16,7 @@ impl Server {
                     self.air()
                 } else if dir.axis() != v.facing(s).axis() {
                     let locked = self.repeater_locked(p, s);
-                    self.v().set_bool(s, "locked", locked)
+                    self.view().set_bool(s, "locked", locked)
                 } else {
                     s
                 }
@@ -69,7 +69,7 @@ impl Server {
             Kind::ConcretePowder => {
                 if self.touches_liquid(p) {
                     let c = self.bs.t.pair[v.block(s) as usize];
-                    self.v().default_state(c)
+                    self.view().default_state(c)
                 } else {
                     let b = v.block(s);
                     self.schedule_tick(p, b, 2);
@@ -87,7 +87,7 @@ impl Server {
             Kind::Fence => {
                 if dir.horizontal() {
                     let c = self.fence_connects(s, ns, v.sturdy(ns, dir.opposite()), dir.opposite());
-                    self.v().set_bool(s, dir.name(), c)
+                    self.view().set_bool(s, dir.name(), c)
                 } else {
                     s
                 }
@@ -95,7 +95,7 @@ impl Server {
             Kind::Pane => {
                 if dir.horizontal() {
                     let c = self.pane_attaches(ns, v.sturdy(ns, dir.opposite()));
-                    self.v().set_bool(s, dir.name(), c)
+                    self.view().set_bool(s, dir.name(), c)
                 } else {
                     s
                 }
@@ -119,7 +119,7 @@ impl Server {
             Kind::Stairs => {
                 if dir.horizontal() {
                     let sh = self.stairs_shape(s, p);
-                    self.v().set(s, "shape", sh)
+                    self.view().set(s, "shape", sh)
                 } else {
                     s
                 }
@@ -130,7 +130,7 @@ impl Server {
                 } else {
                     let o = self.get(rel(p, dir.opposite()));
                     let in_wall = self.is_wall(ns) || self.is_wall(o);
-                    self.v().set_bool(s, "in_wall", in_wall)
+                    self.view().set_bool(s, "in_wall", in_wall)
                 }
             }
             Kind::Door { .. } => {
@@ -143,7 +143,7 @@ impl Server {
                         s
                     }
                 } else if matches!(v.kind(ns), Kind::Door { .. }) && v.get(ns, "half") != Some(half) {
-                    self.v().set(ns, "half", half)
+                    self.view().set(ns, "half", half)
                 } else {
                     self.air()
                 }
@@ -155,7 +155,7 @@ impl Server {
                 if dir == nd {
                     if v.block(ns) == v.block(s) && v.get(ns, "part") != Some(part) {
                         let occ = v.get_bool(ns, "occupied");
-                        self.v().set_bool(s, "occupied", occ)
+                        self.view().set_bool(s, "occupied", occ)
                     } else {
                         self.air()
                     }
@@ -193,14 +193,14 @@ impl Server {
             }
             Kind::AttachedStem => {
                 let fruit_ok = {
-                    let n = v.d.block_of(ns).map_or("", |b| b.name.as_str());
-                    let mine = v.d.block_of(s).map_or("", |b| b.name.as_str());
+                    let n = v.data.block_of(ns).map_or("", |b| b.name.as_str());
+                    let mine = v.data.block_of(s).map_or("", |b| b.name.as_str());
                     (mine.contains("pumpkin") && n == "minecraft:pumpkin")
                         || (mine.contains("melon") && n == "minecraft:melon")
                 };
                 if !fruit_ok && dir == v.facing(s) {
                     let stem = self.bs.t.pair[v.block(s) as usize];
-                    self.v().set_int(self.v().default_state(stem), "age", 7)
+                    self.view().set_int(self.view().default_state(stem), "age", 7)
                 } else if self.can_survive(s, p) {
                     s
                 } else {
@@ -231,7 +231,9 @@ impl Server {
                 s
             }
             Kind::StandingSign => {
-                if dir == Dir::Down && !self.v().info(self.support_state(below(p))).has(rc_data::flags::LEGACY_SOLID) {
+                if dir == Dir::Down
+                    && !self.view().info(self.support_state(below(p))).has(rc_data::flags::LEGACY_SOLID)
+                {
                     self.air()
                 } else {
                     s
@@ -240,7 +242,7 @@ impl Server {
             Kind::WallSign => {
                 let f = v.facing(s);
                 if dir.opposite() == f
-                    && !self.v().info(self.support_state(rel(p, f.opposite()))).has(rc_data::flags::LEGACY_SOLID)
+                    && !self.view().info(self.support_state(rel(p, f.opposite()))).has(rc_data::flags::LEGACY_SOLID)
                 {
                     self.air()
                 } else {
@@ -265,7 +267,7 @@ impl Server {
                 if self.can_survive(s, p) {
                     let age = v.get_int(s, "age");
                     let f = self.fire_state_for(p);
-                    if self.v().block(f) == self.bs.t.id.fire { self.v().set_int(f, "age", age) } else { f }
+                    if self.view().block(f) == self.bs.t.id.fire { self.view().set_int(f, "age", age) } else { f }
                 } else {
                     self.air()
                 }
@@ -289,7 +291,7 @@ impl Server {
             Kind::Tripwire => {
                 if dir.horizontal() {
                     let c = self.tripwire_connects(ns, dir);
-                    self.v().set_bool(s, dir.name(), c)
+                    self.view().set_bool(s, dir.name(), c)
                 } else {
                     s
                 }
@@ -343,7 +345,7 @@ impl Server {
     /// Linked halves of a double plant: the half that loses its sister → air; the lower one also tests
     /// its survival when the block below changes.
     fn double_plant_shape(&self, s: u32, p: P, dir: Dir, ns: u32) -> u32 {
-        let v = self.v();
+        let v = self.view();
         let half = v.get(s, "half").unwrap_or("lower");
         let lower = half == "lower";
         if dir.axis() != 1 || lower != (dir == Dir::Up) || (v.block(ns) == v.block(s) && v.get(ns, "half") != Some(half))
@@ -356,7 +358,7 @@ impl Server {
 
     /// Does the block hold in place?
     pub(crate) fn can_survive(&self, s: u32, p: P) -> bool {
-        let v = self.v();
+        let v = self.view();
         let bp = below(p);
         let b = self.support_state(bp);
         let bb = v.block(b);
@@ -470,24 +472,24 @@ impl Server {
     }
 
     pub(crate) fn face_full_up(&self, s: u32) -> bool {
-        let info = self.v().info(s);
+        let info = self.view().info(s);
         let m = self.bs.t.face_masks.get(info.collision as usize).map_or([0; 4], |m| m[Dir::Up as usize]);
         m.iter().all(|&w| w == u64::MAX)
     }
 
     pub(crate) fn wall_attach(&self, p: P, facing: Dir) -> bool {
         let q = rel(p, facing.opposite());
-        self.v().sturdy(self.support_state(q), facing)
+        self.view().sturdy(self.support_state(q), facing)
     }
 
     pub(crate) fn face_attach(&self, p: P, toward: Dir) -> bool {
         let q = rel(p, toward);
-        self.v().sturdy(self.support_state(q), toward.opposite())
+        self.view().sturdy(self.support_state(q), toward.opposite())
     }
 
     fn connection_exception(&self, s: u32) -> bool {
-        let v = self.v();
-        let n = v.d.block_of(s).map_or("", |b| b.name.as_str());
+        let v = self.view();
+        let n = v.data.block_of(s).map_or("", |b| b.name.as_str());
         v.kind(s) == Kind::Leaves
             || matches!(
                 n,
@@ -501,7 +503,7 @@ impl Server {
     }
 
     pub(crate) fn fence_connects(&self, me: u32, s: u32, solid: bool, d: Dir) -> bool {
-        let v = self.v();
+        let v = self.view();
         let same = self.tag_id(crate::tag_bits::TagId::Fences, v.block(s))
             && self.tag_id(crate::tag_bits::TagId::WoodenFences, v.block(s)) == self.tag_id(crate::tag_bits::TagId::WoodenFences, v.block(me));
         let gate = v.kind(s) == Kind::FenceGate && v.facing(s).axis() == d.clockwise().axis();
@@ -509,15 +511,15 @@ impl Server {
     }
 
     pub(crate) fn pane_attaches(&self, s: u32, solid: bool) -> bool {
-        (!self.connection_exception(s) && solid) || self.v().kind(s) == Kind::Pane || self.is_wall(s)
+        (!self.connection_exception(s) && solid) || self.view().kind(s) == Kind::Pane || self.is_wall(s)
     }
 
     pub(crate) fn is_wall(&self, s: u32) -> bool {
-        self.tag_id(crate::tag_bits::TagId::Walls, self.v().block(s))
+        self.tag_id(crate::tag_bits::TagId::Walls, self.view().block(s))
     }
 
     pub(crate) fn wall_connects(&self, s: u32, solid: bool, d: Dir) -> bool {
-        let v = self.v();
+        let v = self.view();
         let gate = v.kind(s) == Kind::FenceGate && v.facing(s).axis() == d.clockwise().axis();
         self.is_wall(s) || (!self.connection_exception(s) && solid) || v.kind(s) == Kind::Pane || gate
     }
@@ -525,7 +527,7 @@ impl Server {
     /// Sides and post of a wall from the connections (north, east, south, west) and the block
     /// above.
     pub(crate) fn wall_shape(&self, s: u32, _top: P, top_s: u32, c: [bool; 4]) -> u32 {
-        let v = self.v();
+        let v = self.view();
         let info = v.info(top_s);
         let above_mask = self.bs.t.face_masks.get(info.collision as usize).map_or([0; 4], |m| m[Dir::Down as usize]);
         let covered = |x0: usize, x1: usize, z0: usize, z1: usize| {
@@ -573,7 +575,7 @@ impl Server {
     }
 
     pub(crate) fn stairs_shape(&self, s: u32, p: P) -> &'static str {
-        let v = self.v();
+        let v = self.view();
         let facing = v.facing(s);
         let half = v.get(s, "half");
         let behind = self.get(rel(p, facing));
@@ -594,13 +596,13 @@ impl Server {
     }
 
     fn stairs_can_take(&self, s: u32, p: P, d: Dir) -> bool {
-        let v = self.v();
+        let v = self.view();
         let n = self.get(rel(p, d));
         v.kind(n) != Kind::Stairs || v.facing(n) != v.facing(s) || v.get(n, "half") != v.get(s, "half")
     }
 
     fn chest_connected_dir(&self, s: u32) -> Dir {
-        let v = self.v();
+        let v = self.view();
         let f = v.facing(s);
         if v.get(s, "type") == Some("left") { f.clockwise() } else { f.counter_clockwise() }
     }
@@ -608,7 +610,7 @@ impl Server {
     /// Can chest `me` join state `other`? Same block for wooden chests;
     /// for copper, any copper chest (oxidation and wax mixed).
     pub(crate) fn chest_connects(&self, me: u32, other: u32) -> bool {
-        let v = self.v();
+        let v = self.view();
         let (a, b) = (v.block(me), v.block(other));
         if self.copper_chest(a) { self.copper_chest(b) && v.has(other, "type") } else { a == b }
     }
@@ -618,7 +620,7 @@ impl Server {
     }
 
     fn chest_shape(&self, s: u32, dir: Dir, ns: u32) -> u32 {
-        let v = self.v();
+        let v = self.view();
         let connects = self.chest_connects(s, ns);
         let mut out = s;
         if connects && dir.horizontal() {
@@ -648,7 +650,7 @@ impl Server {
 
     /// Default state `target` that takes the values of the common properties of `from`.
     pub(crate) fn with_props_of(&self, target: u32, from: u32) -> u32 {
-        let v = self.v();
+        let v = self.view();
         let mut out = target;
         for (name, values, i) in v.props_sorted(from) {
             out = v.set(out, name, &values[i]);
@@ -657,7 +659,7 @@ impl Server {
     }
 
     pub(crate) fn chest_other_half(&self, s: u32, p: P) -> Option<P> {
-        let v = self.v();
+        let v = self.view();
         if v.kind(s) != Kind::Chest || v.get(s, "type").is_none_or(|t| t == "single") {
             return None;
         }
@@ -672,7 +674,7 @@ impl Server {
             if d != Dir::Down || self.can_solidify(self.get(t)) {
                 t = rel(p, d);
                 let s = self.get(t);
-                if self.can_solidify(s) && !self.v().sturdy(s, d.opposite()) {
+                if self.can_solidify(s) && !self.view().sturdy(s, d.opposite()) {
                     return true;
                 }
             }

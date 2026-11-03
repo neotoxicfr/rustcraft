@@ -164,14 +164,14 @@ fn portal_blocks(
     let list: Vec<(i32, i32)> = cx.flat_map(|x| cz.clone().map(move |z| (x, z))).collect();
     s.in_world(dim, |s| {
         s.ensure_loaded(&list);
-        let np = s.tb().block_id("nether_portal");
+        let np = s.table().block_id("nether_portal");
         let mut out = Vec::new();
         for &(x, z) in &list {
             for bx in 0..16 {
                 for bz in 0..16 {
                     for y in s.dim.height.min_y..s.top_y() {
                         let p = [x * 16 + bx, y, z * 16 + bz];
-                        if s.v().block(s.get(p)) == np {
+                        if s.view().block(s.get(p)) == np {
                             out.push(p);
                         }
                     }
@@ -279,14 +279,14 @@ fn prep_world() {
                     ([c[0] - 1, c[1], c[2] + i], Dir::East),
                     ([c[0] + 3, c[1], c[2] + i], Dir::West),
                 ] {
-                    let fs = s.v().set_dir(frame, "facing", d);
-                    let fs = s.v().set_bool(fs, "eye", true);
+                    let fs = s.view().set_dir(frame, "facing", d);
+                    let fs = s.view().set_bool(fs, "eye", true);
                     s.set_block(p, fs, crate::blocks::flag::ALL);
                 }
             }
             // Last eye placed by the item: the portal opens.
             let last = [c[0] + 1, c[1], c[2] + 3];
-            let fs = s.v().set_dir(frame, "facing", Dir::North);
+            let fs = s.view().set_dir(frame, "facing", Dir::North);
             s.set_block(last, fs, crate::blocks::flag::ALL);
             s.slots[36 + s.held as usize] =
                 Some(crate::player::Stack { id: "minecraft:ender_eye".into(), count: 1, components: None });
@@ -360,8 +360,8 @@ fn sounds_heard(s: &Server, session: &rc_client::Session, name: &str) -> usize {
 }
 
 fn st(s: &Server, name: &str) -> u32 {
-    let b = s.tb().block_id(name);
-    s.v().default_state(b)
+    let b = s.table().block_id(name);
+    s.view().default_state(b)
 }
 
 fn ready(s: &mut Server) {
@@ -381,7 +381,7 @@ fn ticks(s: &mut Server, n: usize) {
 fn build_lit_frame(s: &mut Server, at: P) -> P {
     s.load_now(&[(at[0] >> 4, at[2] >> 4), ((at[0] - 4) >> 4, at[2] >> 4)]);
     let mut y = s.top_y() - 1;
-    while y > s.dim.height.min_y && s.v().is_air(s.get([at[0], y, at[2]])) {
+    while y > s.dim.height.min_y && s.view().is_air(s.get([at[0], y, at[2]])) {
         y -= 1;
     }
     let base = [at[0], y + 1, at[2]];
@@ -407,10 +407,10 @@ fn nether_round_trip_and_end_on_new_world() {
     let spawn = s.level.spawn_pos;
     let at = [spawn[0] + 6, 0, spawn[2] + 3];
     let base = build_lit_frame(&mut s, at);
-    let np = s.tb().block_id("nether_portal");
+    let np = s.table().block_id("nether_portal");
     let lit: Vec<P> = (0..2).flat_map(|i| (0..3).map(move |j| [base[0] - i, base[1] + j, base[2]])).collect();
-    assert!(lit.iter().all(|&p| s.v().block(s.get(p)) == np), "portal lit");
-    assert_eq!(s.v().get(s.get(base), "axis"), Some("x"));
+    assert!(lit.iter().all(|&p| s.view().block(s.get(p)) == np), "portal lit");
+    assert_eq!(s.view().get(s.get(base), "axis"), Some("x"));
     // Player in the portal: 80 ticks of waiting (default rule), then the Nether.
     s.pos = [f64::from(base[0]), f64::from(base[1]), f64::from(base[2]) + 0.5];
     ticks(&mut s, 80);
@@ -420,7 +420,7 @@ fn nether_round_trip_and_end_on_new_world() {
     let arrive = s.pos;
     eprintln!("Nether arrival {arrive:?} (entry {base:?})");
     let b = [arrive[0].floor() as i32, arrive[1].floor() as i32, arrive[2].floor() as i32];
-    assert_eq!(s.v().block(s.get(b)), np, "exit portal created");
+    assert_eq!(s.view().block(s.get(b)), np, "exit portal created");
     assert!((arrive[0] - f64::from(base[0]) / 8.0).abs() < 20.0 && (arrive[2] - f64::from(base[2]) / 8.0).abs() < 20.0);
     // Stays in the portal: never sent back (return delay reset at each tick).
     ready(&mut s);
@@ -459,7 +459,7 @@ fn nether_round_trip_and_end_on_new_world() {
         })
         .collect();
     for (p, d) in &ring {
-        let fs = s.v().set_dir(frame, "facing", *d);
+        let fs = s.view().set_dir(frame, "facing", *d);
         s.set_block(*p, fs, crate::blocks::flag::ALL);
     }
     s.game_mode = 1;
@@ -468,8 +468,8 @@ fn nether_round_trip_and_end_on_new_world() {
             Some(crate::player::Stack { id: "minecraft:ender_eye".into(), count: 1, components: None });
         assert!(s.use_ender_eye(*p));
     }
-    let ep = s.tb().block_id("end_portal");
-    assert!((0..3).all(|x| (0..3).all(|z| s.v().block(s.get([c[0] + x, c[1], c[2] + z])) == ep)), "End portal");
+    let ep = s.table().block_id("end_portal");
+    assert!((0..3).all(|x| (0..3).all(|z| s.view().block(s.get([c[0] + x, c[1], c[2] + z])) == ep)), "End portal");
     // Return delay (10 ticks) elapsed outside portals, then in the End portal.
     s.pos = [f64::from(c[0]) + 1.5, f64::from(c[1]) + 3.0, f64::from(c[2]) + 1.5];
     ticks(&mut s, 11);
@@ -478,8 +478,8 @@ fn nether_round_trip_and_end_on_new_world() {
     ticks(&mut s, 1);
     assert_eq!(s.dim.name, "minecraft:the_end");
     assert_eq!(s.pos, [100.5, 49.0, 0.5]);
-    assert_eq!(s.v().block(s.get([100, 48, 0])), s.tb().block_id("obsidian"), "platform");
-    assert!(s.v().is_air(s.get([100, 49, 0])) && s.v().is_air(s.get([102, 51, 2])));
+    assert_eq!(s.view().block(s.get([100, 48, 0])), s.table().block_id("obsidian"), "platform");
+    assert!(s.view().is_air(s.get([100, 49, 0])) && s.view().is_air(s.get([102, 51, 2])));
     // Gateway without exit: exit created towards the outside (islands), player placed on it.
     ready(&mut s);
     ticks(&mut s, 11);
@@ -519,8 +519,8 @@ fn portal_search_and_creation_respect_the_world_border() {
     s.cmd.border.size = 20.0;
     let r = s.create_portal([100, 70, 100], Axis::X).expect("portal");
     assert_eq!((r.min, r.size1, r.size2), ([9, 70, 9], 2, 3));
-    let np = s.tb().block_id("nether_portal");
-    assert_eq!(s.v().block(s.get([10, 70, 9])), np, "second column (x = 10, outside the border)");
+    let np = s.table().block_id("nether_portal");
+    assert_eq!(s.view().block(s.get([10, 70, 9])), np, "second column (x = 10, outside the border)");
     assert_eq!(s.find_closest_portal([14, 70, 9], true), Some([9, 70, 9]));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -534,9 +534,9 @@ fn players_cannot_break_or_use_blocks_outside_the_world_border() {
     s.cmd.border.size = 20.0;
     assert!(s.may_interact([9, 70, 0]));
     assert!(!s.may_interact([10, 70, 0]));
-    let stone = s.tb().block_id("stone");
+    let stone = s.table().block_id("stone");
     let st = s.default_state("minecraft:stone");
-    assert_eq!(s.v().block(st), stone);
+    assert_eq!(s.view().block(st), stone);
     s.pos = [9.5, 70.0, 0.5];
     s.game_mode = 1;
     for p in [[9, 70, 1], [10, 70, 1]] {
@@ -715,13 +715,13 @@ fn tnt_that_used_a_portal_spares_nether_portal_blocks() {
     let spawn = s.level.spawn_pos;
     let base = build_lit_frame(&mut s, [spawn[0] + 6, 0, spawn[2] + 3]);
     s.pos = [f64::from(base[0]), f64::from(base[1]), f64::from(base[2]) + 30.5];
-    let np = s.tb().block_id("nether_portal");
+    let np = s.table().block_id("nether_portal");
     let lit: Vec<P> = (0..2).flat_map(|i| (0..3).map(move |j| [base[0] - i, base[1] + j, base[2]])).collect();
     let c = [f64::from(base[0]), f64::from(base[1]) + 1.5, f64::from(base[2]) + 1.5];
     s.tnt_explode(-1, c, 4.0, None, false, true);
-    assert!(lit.iter().all(|&p| s.v().block(s.get(p)) == np), "portal intact");
+    assert!(lit.iter().all(|&p| s.view().block(s.get(p)) == np), "portal intact");
     s.tnt_explode(-1, c, 4.0, None, false, false);
-    assert!(lit.iter().any(|&p| s.v().block(s.get(p)) != np), "portal blown up");
+    assert!(lit.iter().any(|&p| s.view().block(s.get(p)) != np), "portal blown up");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -841,7 +841,7 @@ fn anchor_deplete_sound_goes_to_the_respawning_player_only() {
             }
         }
         let a = st(w, "respawn_anchor");
-        let a = w.v().set_int(a, "charges", 1);
+        let a = w.view().set_int(a, "charges", 1);
         w.set_block(anchor, a, crate::blocks::flag::ALL);
     });
     s.life.vit.respawn = Some((NETHER.to_owned(), anchor, 0.0, 0.0, false));

@@ -44,7 +44,7 @@ impl Server {
 
     /// Any state change of a turtle egg placed on sand: growth particles (2012, 15).
     pub(crate) fn turtle_egg_on_place(&mut self, s: u32, p: P) {
-        if self.v().block(s) == self.bs.t.id.turtle_egg && self.turtle_egg_on_sand(p) {
+        if self.view().block(s) == self.bs.t.id.turtle_egg && self.turtle_egg_on_sand(p) {
             self.level_event(2012, p, 15);
         }
     }
@@ -54,11 +54,11 @@ impl Server {
         if !(chance > 0.0 && self.bs.rng.next_float() < chance) || !self.turtle_egg_on_sand(p) {
             return;
         }
-        let hatch = self.v().get_int(s, "hatch");
+        let hatch = self.view().get_int(s, "hatch");
         let pitch = 0.9 + self.bs.rng.next_float() * 0.2;
         if hatch < 2 {
             self.world_sound("minecraft:entity.turtle.egg_crack", 4, center(p), 0.7, pitch);
-            let ns = self.v().set_int(s, "hatch", hatch + 1);
+            let ns = self.view().set_int(s, "hatch", hatch + 1);
             self.set_block(p, ns, flag::CLIENTS);
             self.game_event_block("minecraft:block_change", p, None, Some(s));
             return;
@@ -66,7 +66,7 @@ impl Server {
         self.world_sound("minecraft:entity.turtle.egg_hatch", 4, center(p), 0.7, pitch);
         self.remove_block(p, false);
         self.game_event_block("minecraft:block_destroy", p, None, Some(s));
-        for i in 0..self.v().get_int(s, "eggs") {
+        for i in 0..self.view().get_int(s, "eggs") {
             self.level_event(2001, p, s as i32);
             let at = [f64::from(p[0]) + 0.3 + f64::from(i) * 0.2, f64::from(p[1]), f64::from(p[2]) + 0.3];
             let mut t = self.new_mob(MobKind::Turtle, at, 0.0);
@@ -88,7 +88,7 @@ impl Server {
     /// One chance in `odds` (world random) that the eggs at `p` lose one.
     fn turtle_egg_crush(&mut self, p: P, by: Option<MobKind>, odds: i32) {
         let s = self.get(p);
-        if self.v().block(s) == self.bs.t.id.turtle_egg
+        if self.view().block(s) == self.bs.t.id.turtle_egg
             && self.turtle_egg_breaker(by)
             && self.bs.rng.next_int_bound(odds) == 0
         {
@@ -115,11 +115,11 @@ impl Server {
     pub(crate) fn turtle_egg_decrease(&mut self, p: P, s: u32) {
         let pitch = 0.9 + self.bs.rng.next_float() * 0.2;
         self.world_sound("minecraft:entity.turtle.egg_break", 4, center(p), 0.7, pitch);
-        let eggs = self.v().get_int(s, "eggs");
+        let eggs = self.view().get_int(s, "eggs");
         if eggs <= 1 {
             self.destroy_block(p, false, 512);
         } else {
-            let ns = self.v().set_int(s, "eggs", eggs - 1);
+            let ns = self.view().set_int(s, "eggs", eggs - 1);
             self.set_block(p, ns, flag::CLIENTS);
             self.game_event_block("minecraft:block_destroy", p, None, Some(s));
             self.level_event(2001, p, s as i32);

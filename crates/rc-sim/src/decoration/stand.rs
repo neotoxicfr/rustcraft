@@ -572,7 +572,7 @@ impl Server {
                 self.world_sound("minecraft:entity.armor_stand.fall", 6, np, 1.0, 1.0);
                 let under = [np[0].floor() as i32, (np[1] - 0.2).floor() as i32, np[2].floor() as i32];
                 let s = self.st(under);
-                if !self.v().is_air(s)
+                if !self.view().is_air(s)
                     && let Some(t) = self.data.state(s).and_then(|i| self.data.sound_types.get(usize::from(i.sound)))
                 {
                     let (snd, vol, pit) = (t.fall.clone(), t.volume * 0.5, t.pitch * 0.75);

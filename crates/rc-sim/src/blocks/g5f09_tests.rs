@@ -49,7 +49,7 @@ fn hit(at: P, face: usize, loc: [f64; 3]) -> BlockHit {
 }
 
 fn tilt(w: &W, at: P) -> String {
-    w.p.s.v().get(w.p.s.get(at), "tilt").unwrap_or("?").to_owned()
+    w.p.s.view().get(w.p.s.get(at), "tilt").unwrap_or("?").to_owned()
 }
 
 /// Big dripleaf: projectile → full tilt (sound, 100 ticks) then back; entity on top →
@@ -132,7 +132,7 @@ fn note_block_plays_instrument_sound() {
     w.set([7, Y, 6], "minecraft:redstone_block");
     let mut evs = Vec::new();
     w.ticks(1, &mut evs);
-    let inst = w.p.s.v().get(w.p.s.get(at), "instrument").unwrap_or("harp").to_owned();
+    let inst = w.p.s.view().get(w.p.s.get(at), "instrument").unwrap_or("harp").to_owned();
     let s = sounds(&w, &evs, &format!("minecraft:block.note_block.{inst}"));
     assert_eq!(s.len(), 1, "one {inst} sound");
     assert_eq!(s[0].category, 2);
@@ -160,13 +160,13 @@ fn bell_redstone_projectile_and_support() {
     w.set(at, "minecraft:bell[attachment=floor,facing=north]");
     let _ = w.events();
     w.set([9, Y, 8], "minecraft:redstone_block");
-    assert!(w.p.s.v().get_bool(w.p.s.get(at), "powered"), "powered");
+    assert!(w.p.s.view().get_bool(w.p.s.get(at), "powered"), "powered");
     let mut evs = Vec::new();
     w.ticks(1, &mut evs);
     assert_eq!(sounds(&w, &evs, "minecraft:block.bell.use").len(), 1, "rings on the rising edge");
     assert_eq!(block_events(&evs, at), vec![(1, Dir::North as u8)]);
     w.set([9, Y, 8], "minecraft:air");
-    assert!(!w.p.s.v().get_bool(w.p.s.get(at), "powered"));
+    assert!(!w.p.s.view().get_bool(w.p.s.get(at), "powered"));
     let _ = w.events();
 
     // Projectile: from above → nothing; north face (axis of the ground orientation) → rings + statistic.
@@ -246,7 +246,8 @@ fn chorus_grows_and_collapses() {
     w.p.s.random_tick(s, at);
     let evs = w.events();
     assert!(name(&w, at).starts_with("minecraft:chorus_plant"), "plant: {}", name(&w, at));
-    assert!(w.p.s.v().get_bool(w.p.s.get(at), "up") && w.p.s.v().get_bool(w.p.s.get(at), "down"), "{}", name(&w, at));
+    let v = w.p.s.view();
+    assert!(v.get_bool(w.p.s.get(at), "up") && v.get_bool(w.p.s.get(at), "down"), "{}", name(&w, at));
     assert_eq!(name(&w, above(at)), "minecraft:chorus_flower[age=0]", "flower grown, same age");
     assert!(evs.iter().any(|e| matches!(e, Event::LevelEvent { kind: 1033, .. })), "1033");
     // Connections of one cell: plant below and flower above.
@@ -302,9 +303,9 @@ fn skull_follows_redstone() {
     let at = [2, Y, 12];
     w.set(at, "minecraft:dragon_head");
     w.set([3, Y, 12], "minecraft:redstone_block");
-    assert!(w.p.s.v().get_bool(w.p.s.get(at), "powered"), "{}", name(&w, at));
+    assert!(w.p.s.view().get_bool(w.p.s.get(at), "powered"), "{}", name(&w, at));
     w.set([3, Y, 12], "minecraft:air");
-    assert!(!w.p.s.v().get_bool(w.p.s.get(at), "powered"));
+    assert!(!w.p.s.view().get_bool(w.p.s.get(at), "powered"));
 }
 
 /// Amethyst hit by a projectile: chime (volume 1, pitch 0.5..1.7).
@@ -342,7 +343,7 @@ fn plain_candle_cake_survival_and_fire() {
 #[test]
 fn oxidized_neighbours_count_as_older() {
     let w = world("copper");
-    let v = w.p.s.v();
+    let v = w.p.s.view();
     let st = |n: &str| v.default_state(w.p.s.bs.t.block_id(n));
     assert_eq!(w.p.s.copper_stage(st("oxidized_copper")), Some(3));
     assert_eq!(w.p.s.copper_stage(st("oxidized_cut_copper_stairs")), Some(3));
@@ -381,9 +382,9 @@ fn campfire_signal_follows_hay_below() {
     w.set(below(at), "minecraft:stone");
     w.set(at, "minecraft:campfire");
     w.set(below(at), "minecraft:hay_block");
-    assert!(w.p.s.v().get_bool(w.p.s.get(at), "signal_fire"), "{}", name(&w, at));
+    assert!(w.p.s.view().get_bool(w.p.s.get(at), "signal_fire"), "{}", name(&w, at));
     w.set(below(at), "minecraft:stone");
-    assert!(!w.p.s.v().get_bool(w.p.s.get(at), "signal_fire"));
+    assert!(!w.p.s.view().get_bool(w.p.s.get(at), "signal_fire"));
 }
 
 fn bees(w: &W) -> usize {
@@ -442,7 +443,7 @@ fn bench_g5f09_tables() {
     let s = &w.p.s;
     let states: Vec<u32> = ["oxidized_copper", "copper_block", "stone", "exposed_cut_copper_slab", "dirt"]
         .iter()
-        .map(|n| s.v().default_state(s.bs.t.block_id(n)))
+        .map(|n| s.view().default_state(s.bs.t.block_id(n)))
         .collect();
     let n = 2_000_000;
     let t = std::time::Instant::now();

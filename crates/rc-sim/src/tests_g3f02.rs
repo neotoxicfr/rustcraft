@@ -94,7 +94,7 @@ fn st(s: &Server, spec: &str) -> u32 {
     assert!(s.data.block_of(x).is_some_and(|b| b.name == name), "unknown block: {name}");
     for kv in props.split(',').filter(|p| !p.is_empty()) {
         let (k, v) = kv.split_once('=').unwrap();
-        x = s.v().set(x, k, v);
+        x = s.view().set(x, k, v);
     }
     x
 }
@@ -179,7 +179,7 @@ fn delayed_destroy_uses_the_start_tick() {
     t.s.on_action(3, p, 1, 2);
     assert_eq!(t.s.get(p), stone, "broken too early");
     mining_tick(&mut t.s);
-    assert!(t.s.v().is_air(t.s.get(p)), "deferred breaking not done at the next tick");
+    assert!(t.s.view().is_air(t.s.get(p)), "deferred breaking not done at the next tick");
 
     t.s.set_block(p, stone, 2);
     t.s.mining = None;
@@ -215,7 +215,7 @@ fn block_attack_on_start() {
     t.s.set_block(p, egg, 2);
     events(&t);
     t.s.on_action(0, p, 1, 5);
-    assert!(t.s.v().is_air(t.s.get(p)), "egg stayed in place");
+    assert!(t.s.view().is_air(t.s.get(p)), "egg stayed in place");
     let evs = events(&t);
     let packed = evs
         .iter()
@@ -226,7 +226,7 @@ fn block_attack_on_start() {
         .expect("event 2015 missing");
     let to = [p[0] + ((packed >> 16) & 255) - 16, p[1] + ((packed >> 8) & 255) - 8, p[2] + (packed & 255) - 16];
     assert_eq!(t.s.get(to), egg, "egg missing from the announced cell");
-    assert!(!t.s.v().is_air(t.s.get([to[0], to[1] - 1, to[2]])), "egg placed in the air");
+    assert!(!t.s.view().is_air(t.s.get([to[0], to[1] - 1, to[2]])), "egg placed in the air");
 }
 
 /// Block pick: clone item (wall variants, crops, pots, piston…); block entity data

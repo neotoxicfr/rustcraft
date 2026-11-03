@@ -425,7 +425,7 @@ impl Server {
     /// Effects of a step on a block: nothing on air; on the
     /// ground or climbing, not swimming: sound and vibration according to the flags.
     fn mob_step_effects(&mut self, m: &mut Mob, p: [i32; 3], st: u32, sound: bool, vibrate: bool) -> bool {
-        if self.v().is_air(st) {
+        if self.view().is_air(st) {
             return false;
         }
         let climb = self.climbable_state(st);
@@ -644,7 +644,7 @@ impl Server {
     /// blocks; the random is drawn only on farmland. The trampling entity is raised with the
     /// others and becomes the source of the event; fall damage follows, unchanged.
     pub(crate) fn trample_farmland(&mut self, p: [i32; 3], st: u32, dist: f64, mob: Option<&mut Mob>, w: f32, h: f32) {
-        if self.v().block(st) != self.bs.t.id.farmland {
+        if self.view().block(st) != self.bs.t.id.farmland {
             return;
         }
         if f64::from(self.bs.rng.next_float()) < dist - 0.5
@@ -671,7 +671,7 @@ impl Server {
             return false;
         }
         let s = self.st(p);
-        let b = self.v().block(s);
+        let b = self.view().block(s);
         let ids = &self.bs.t.id;
         if b == ids.magma {
             return true;

@@ -345,7 +345,7 @@ fn detector_rail() {
     cmd(&mut s, &format!("setblock {} {} {} minecraft:detector_rail[shape=east_west]", x0 + 2, y0, z0));
     let cp = [f64::from(x0) + 0.5, f64::from(y0), f64::from(z0) + 0.5];
     cmd(&mut s, &format!("summon minecraft:minecart {} {} {} {{Motion:[0.3d,0.0d,0.0d]}}", cp[0], cp[1], cp[2]));
-    let powered = |s: &Server| s.v().get(s.st([x0 + 2, y0, z0]), "powered") == Some("true");
+    let powered = |s: &Server| s.view().get(s.st([x0 + 2, y0, z0]), "powered") == Some("true");
     let mut seen = false;
     for _ in 0..12 {
         step(&mut s, 1);

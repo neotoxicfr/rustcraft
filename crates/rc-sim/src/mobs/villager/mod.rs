@@ -942,11 +942,11 @@ impl Server {
     /// Composter: bone meal recovered at level 8, then up to 20 seeds (≥ 10 kept).
     pub(crate) fn compost(&mut self, m: &mut Mob, p: [i32; 3]) {
         let s0 = self.st(p);
-        let mut level = self.v().get_int(s0, "level");
+        let mut level = self.view().get_int(s0, "level");
         if level == 8 {
             self.pop_resource_up(p, Stack { id: "minecraft:bone_meal".into(), count: 1, components: None });
             level = 0;
-            let ns = self.v().set_int(s0, "level", 0);
+            let ns = self.view().set_int(s0, "level", 0);
             self.set_block(p, ns, 3);
             let c = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
             self.world_sound("minecraft:block.composter.empty", 4, c, 1.0, 1.0);
@@ -980,7 +980,7 @@ impl Server {
                     if layers > 0 {
                         level = (level + layers).clamp(0, 7);
                         let s = self.st(p);
-                        let ns = self.v().set_int(s, "level", level);
+                        let ns = self.view().set_int(s, "level", level);
                         self.set_block(p, ns, 3);
                         if level == 7 {
                             self.schedule_block_tick(p, 20);
@@ -1065,7 +1065,7 @@ impl Server {
 
     pub(crate) fn schedule_block_tick(&mut self, p: [i32; 3], delay: i32) {
         let s = self.st(p);
-        let b = self.v().block(s);
+        let b = self.view().block(s);
         self.schedule_tick(p, b, delay);
     }
 
@@ -1142,9 +1142,9 @@ impl Server {
         };
         let age = (age + inc).min(max);
         let ns = if torch && age == 2 {
-            self.v().default_state(self.bs.t.block_id("torchflower"))
+            self.view().default_state(self.bs.t.block_id("torchflower"))
         } else {
-            self.v().set_int(s, "age", age)
+            self.view().set_int(s, "age", age)
         };
         self.set_block(p, ns, 2);
         true
@@ -1252,7 +1252,7 @@ impl Server {
     pub(crate) fn start_sleeping(&mut self, m: &mut Mob, bed: [i32; 3]) -> bool {
         let s = self.st(bed);
         let Some(h) = self.bed_sleep_height(bed) else { return false };
-        let ns = self.v().set_bool(s, "occupied", true);
+        let ns = self.view().set_bool(s, "occupied", true);
         self.set_block(bed, ns, 3);
         m.pos = [f64::from(bed[0]) + 0.5, f64::from(bed[1]) + h + 0.125, f64::from(bed[2]) + 0.5];
         m.vel = [0.0; 3];
