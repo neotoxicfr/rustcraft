@@ -711,7 +711,9 @@ out-of-range voices play at gain 0 in OpenAL, so it is up to the mixer to skip t
   and new thread (`stream_matches_decode_all`). CPU of `rc-audio-stream` when paused: to measure.
 - On the read side, the ring is still read frame by frame: a read per slice would freeze what is
   available at the start of the block (different output if the decoder writes during the block) for
-  a few atomic loads per frame, on 1 or 2 streams.
+  a few atomic loads per frame, on 1 or 2 streams. Superseded by C4-M30 (`STREAM_SLICE_READ`,
+  below): the slice is read only when the ring already holds the whole block, so the output stays
+  identical.
 - lewton against symphonia 0.5.5 (`examples/vorbis_compare.rs`, 552 sounds, 248 M samples):
   symphonia 10.7 ns per sample against 18.6 (×1.74), but PCM identical for only 56 sounds,
   different length for 206 (end of stream), 109,822 samples at ±1. Ruled out (output
@@ -721,6 +723,70 @@ out-of-range voices play at gain 0 in OpenAL, so it is up to the mixer to skip t
   sample against 14.0 (×1.88); PCM identical for 10 sounds, different length for 337 (0.6 trims
   the end padding from the granule position, gapless decoding being the default; without it, it
   also returns the 128 priming samples lewton drops), 109,822 samples at ±1. Still ruled out.
+
+### Mixer: 8-lane AVX2 groups, row reads, fixed-point positions, stream slices, stereo output (C4-M30, 03/11/2026, loaded machine)
+
+All figures on a loaded machine (other agents compiling); the scene bench (plains32, village,
+CPU of `cpal_wasapi_out` and `rc-audio-stream`) is still to do on a quiet machine. Every switch
+gives the same output bit for bit: `mixer::tests::mix_digest` (144 combinations against the
+frozen fingerprint of the old mixer), `group_renderers_match_the_old_one` (12 renderers, 1,000
+edge cases), `stream_slice_matches_frame_reads`, `decode::tests::stream_matches_decode_all` (also
+read by slices), `engine::tests::stereo_f32_output_matches_write_out`; each checked to fail on a
+sabotage.
+
+Reading the generated code of the 4-lane groups (`MIXSIMD`) showed where the time goes: every point
+loaded, converted to `f32` and inserted into a vector one at a time, and every lane position
+converted from f64 to an integer and back (no packed form of these before AVX-512). Groups of 8
+alone change little; the three ways below are independent and measured alone, then combined.
+
+Renderers called directly (`mixer::tests::mixer_lanes_bench`, synthetic noise, one voice in four
+stereo, pitches 0.5-2): 31 interleaved rounds, median of the ratio to the old renderer measured
+in the same round (the load moves absolute times by ±20 % between runs, the ratio far less).
+
+| median ratio to the old renderer (4 lanes) | 64 voices | 247 voices |
+|---|---|---|
+| 8 lanes, AVX2, alone (`MIXER_AVX2`) | 0.919 | 0.908 |
+| 8 lanes, baseline x86-64 (not used) | 0.906 | 0.951 |
+| row reads alone (`MIXER_PACKED_READS`) | 0.903 | 0.908 |
+| fixed-point positions alone (`MIXER_FIXED_POSITIONS`) | 0.775 | 0.819 |
+| reads + positions, 4 lanes | 0.717 | 0.725 |
+| reads + positions, 8 lanes baseline x86-64 | 0.662 | 0.686 |
+| all three (default) | 0.619 (3.38 ns / voice·frame) | 0.626 (3.38) |
+
+Real sounds (`examples/mix_bench.rs`, quietest of 2 alternating passes, base exe = the code before
+the mission): 247 voices in range 7.57 → 3.87 ns / voice·frame (−49 %, 897 → 459 µs per 10 ms
+block, 9.0 → 4.6 % of a core), 64 voices 7.73 → 3.82 (−51 %), 247 voices half out of range 3.27 →
+1.89 (−42 %). The new code with its switches at 0 stays at the base level (7.05).
+
+- `RUSTCRAFT_OPT_MIXER_AVX2` (default 1): the same generic group body compiled for AVX2 in a
+  `#[target_feature]` function, chosen at run time (`is_x86_feature_detected!`, the only guard of
+  the call; 4 lanes without AVX2). Same operations per lane, no FMA.
+- `RUSTCRAFT_OPT_MIXER_PACKED_READS` (default 1): mono and stereo points gathered as rows of
+  16-bit samples, each row converted at once. Tried first: one slice of 4 (8 in stereo) samples
+  per lane, one bounds check per lane instead of per point: the compiler then keeps the points
+  lane by lane and falls back to scalar products; rows win. The 32 bounds checks per group remain
+  (the compiler cannot see that lane indices only grow).
+- `RUSTCRAFT_OPT_MIXER_FIXED_POSITIONS` (default 1): lane positions in 16-bit fixed point
+  (integer adds, shifts and masks pack into vector registers). Exact: the step is rounded to 2⁻¹⁶
+  and the position only adds steps or wraps, so the f64 sums of the frame loop are exact too;
+  checked once per block (`to_fixed16`, shared with the muted voices).
+- `RUSTCRAFT_OPT_STREAM_SLICE_READ` (default 1): when the ring already holds every frame the block
+  reads (`floor(pos + frames × step) + 1`, exact), the block is read from one slice and committed
+  once, instead of one load of the producer position and one store of the consumer position per
+  sample. Two streams (music stereo, record mono, rings kept full): 8.7 / 7.7 → 5.5 / 5.4 µs per
+  block (−30 to −37 %). Underfed, not primed or more than 2 channels: the old path.
+- `RUSTCRAFT_OPT_MIXER_STEREO_OUT` (default 1): on a stereo `f32` device, the mixer writes straight
+  into the device buffer, clipped in place (same blocks of 8,192 frames). Output stage alone
+  (`engine::tests::stereo_output_bench`, empty mixer): 0.48 → 0.20 ns per frame (median ratio
+  0.42), about 13 µs saved per second of sound.
+- Multi-core, new code (rayon, 247 voices over k mixers): 411 / 355 / 294 / 359 / 328 µs per block
+  for 1 / 2 / 4 / 8 / 16 mixers, worst blocks 20 to 30 ms (shared pool). Still ruled out for the
+  real-time output thread (decision of C4-M23).
+- GPU: still ruled out (10 ms blocks, a GPU round trip costs about a ms, 4.6 % of a core at 247
+  voices).
+- Leads left: constant gains over a block (static listener) would let the gain ramp go and the
+  output add vectorise; AVX2 gathers (`vpgatherdd`, two per row pair in mono) would replace the
+  per-point loads but need raw pointers.
 
 ### Mobs: id/UUID/species index, push and dimensions (C6-M07, 22/10/2026, loaded machine)
 
