@@ -286,8 +286,23 @@ pub fn object_font(font: &str) -> Option<ObjectFont<'_>> {
 /// components; set by the game at each change of keys.
 static KEYBINDS: std::sync::RwLock<Option<HashMap<String, String>>> = std::sync::RwLock::new(None);
 
+/// Moves each time the bound keys really change (text caches holding `keybind` components).
+static KEYBINDS_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn set_keybinds(binds: impl IntoIterator<Item = (String, String)>) {
-    *KEYBINDS.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(binds.into_iter().collect());
+    let binds: HashMap<String, String> = binds.into_iter().collect();
+    let mut kept = KEYBINDS.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The options are re-applied often with the same keys: the generation moves only on a change.
+    if kept.as_ref() != Some(&binds) {
+        *kept = Some(binds);
+        KEYBINDS_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Generation of the bound keys: a text flattened with `keybind` components stays valid as long
+/// as it does not change.
+pub fn keybinds_generation() -> u64 {
+    KEYBINDS_GENERATION.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Label of a key like the game: single character in uppercase, otherwise its translation;
@@ -748,6 +763,9 @@ pub struct Lang {
     /// Right-to-left language (the `bidirectional` flag of its declaration): default direction of
     /// paragraphs without a strong letter (bidi).
     pub bidirectional: bool,
+    /// Identity of the table, unique per [`Lang::load`] (0: built by hand). Text caches key on
+    /// it: a new language gives a new value, even with the same number of keys.
+    pub generation: u64,
 }
 
 impl Lang {
@@ -782,7 +800,9 @@ impl Lang {
         for v in map.values_mut() {
             *v = normalize_formats(v);
         }
-        Lang { map, bidirectional: false }
+        static LOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let generation = LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Lang { map, bidirectional: false, generation }
     }
 }
 
@@ -1185,7 +1205,8 @@ mod tests {
     }
 
     fn lang(pairs: &[(&str, &str)]) -> Lang {
-        Lang { map: pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(), bidirectional: false }
+        let map = pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+        Lang { map, bidirectional: false, generation: 0 }
     }
 
     /// Fake advances: "i" 2.5, "." 2, the rest 6 (bold + 1).
@@ -1400,8 +1421,29 @@ mod tests {
         }
     }
 
+    /// Tests that change the bound keys (one table for the whole process) run one at a time.
+    static KEYBINDS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The generations caches key on: a reload of the language or a real change of keys moves
+    /// them, the same keys applied again do not.
+    #[test]
+    fn language_and_key_generations() {
+        let _serial = KEYBINDS_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (a, b) = (Lang::load(b"{}", None, None), Lang::load(b"{}", None, None));
+        assert!(a.generation != 0 && a.generation != b.generation);
+        assert_eq!(a.clone().generation, a.generation, "a copy is the same table");
+        let keys = || [("key.jump".to_owned(), "key.keyboard.space".to_owned())];
+        set_keybinds(keys());
+        let g = keybinds_generation();
+        set_keybinds(keys());
+        assert_eq!(keybinds_generation(), g, "same keys");
+        set_keybinds([("key.jump".to_owned(), "key.keyboard.j".to_owned())]);
+        assert_ne!(keybinds_generation(), g, "changed keys");
+    }
+
     #[test]
     fn keybind_shows_the_bound_key_or_the_action_name() {
+        let _serial = KEYBINDS_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let l = lang(&[("key.keyboard.space", "Space"), ("key.sneak", "Sneak"), ("key.mouse", "Button %1$s")]);
         set_keybinds([
             ("key.jump".to_owned(), "key.keyboard.space".to_owned()),

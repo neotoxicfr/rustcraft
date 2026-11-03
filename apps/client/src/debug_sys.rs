@@ -9,6 +9,18 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub static COUNT_ALLOCS: AtomicBool = AtomicBool::new(false);
 pub static ALLOCATED: AtomicU64 = AtomicU64::new(0);
 
+/// Benches: bytes allocated while `f` runs (counter of the whole process: run the bench alone,
+/// other threads would count too).
+#[cfg(test)]
+pub fn allocated_bytes(f: impl FnOnce()) -> u64 {
+    COUNT_ALLOCS.store(true, Ordering::Relaxed);
+    let before = ALLOCATED.load(Ordering::Relaxed);
+    f();
+    let after = ALLOCATED.load(Ordering::Relaxed);
+    COUNT_ALLOCS.store(false, Ordering::Relaxed);
+    after - before
+}
+
 /// Global allocator: mimalloc, plus the allocated-bytes counter when requested.
 #[cfg_attr(feature = "memstats", allow(dead_code))]
 pub struct Gated;

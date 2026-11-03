@@ -1,4 +1,5 @@
-//! Sidebar kept per revision: equivalence with the full recompute, and micro-bench.
+//! Sidebar kept per revision (equivalence with the full recompute), styled lines kept (layers
+//! equal to the old draw), borrowed score keys, revision of the player list, micro-benches.
 
 use super::*;
 
@@ -247,5 +248,253 @@ fn bench_sidebar() {
             "n = {n:>5}: full {full:>9.2} µs, selection {select:>9.2} µs, kept {cached:>7.3} µs, \
              lowercase sort alone {lower:>9.2} µs"
         );
+    }
+}
+
+/// Oracle of the sidebar proofs: the draw of the kept rows as it was before the styled lines were
+/// kept (flattened, styled and measured on every frame, the score measured twice), frozen unchanged.
+fn reference_draw_sidebar(sidebar: &SidebarRows, gui: &mut Gui, queue: &wgpu::Queue, text_background: Option<u32>) {
+    let lang = &gui.lang;
+    let chars = |c: &Component| rc_text::styled_chars(&rc_text::flatten(c, lang));
+    let title = sidebar.title.as_ref().map(chars).unwrap_or_default();
+    let lines: Vec<(Vec<StyledChar>, Vec<StyledChar>)> =
+        sidebar.rows.iter().map(|(name, score)| (chars(name), score.as_ref().map(chars).unwrap_or_default())).collect();
+    gui.next_layer();
+    let w = |gui: &Gui, c: &[StyledChar]| rc_text::width(gui, c);
+    let lt = w(gui, &title);
+    let sep = w(gui, &rc_text::styled_chars(&rc_text::flatten(&Component::text(": "), &gui.lang)));
+    let mut width = lt;
+    for (n, s) in &lines {
+        let ls = w(gui, s);
+        width = width.max(w(gui, n) + if ls > 0 { sep + ls } else { 0 });
+    }
+    let (gw, gh) = (gui.width.floor() as i32, gui.height.floor() as i32);
+    let n = lines.len() as i32;
+    let bottom = gh / 2 + n * 9 / 3;
+    let left = gw - width - 3;
+    let right = gw - 1;
+    let top = bottom - n * 9;
+    let header = crate::hud::background_color(text_background, 0x6600_0000);
+    let body = crate::hud::background_color(text_background, 0x4C00_0000);
+    gui.fill((left - 2) as f32, (top - 10) as f32, right as f32, (top - 1) as f32, header);
+    gui.fill((left - 2) as f32, (top - 1) as f32, right as f32, bottom as f32, body);
+    gui.text(queue, &title, (left + width / 2 - lt / 2) as f32, (top - 9) as f32, 0xffff_ffff, false, 0);
+    for (i, (name, score)) in lines.iter().enumerate() {
+        let y = (bottom - (n - i as i32) * 9) as f32;
+        gui.text(queue, name, left as f32, y, 0xffff_ffff, false, 0);
+        let ls = w(gui, score);
+        gui.text(queue, score, (right - ls) as f32, y, 0xffff_ffff, false, 0);
+    }
+}
+
+/// Borrowed key of the score table: same hash as the owned key with the table's own hasher, and
+/// every lookup (holders, objectives, absent ones) finds the same score as the owned key, after
+/// each event of a random sequence. Sabotage verified (failure): fields swapped in the borrowed key.
+#[test]
+fn borrowed_score_key_finds_the_same_scores() {
+    use std::hash::BuildHasher;
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    let mut sb = Scoreboard::default();
+    for o in OBJECTIVES {
+        sb.apply(ScoreEvent::Objective { name: o.into(), mode: 0, display: text(o), hearts: false, format: None });
+    }
+    let objectives = OBJECTIVES.iter().copied().chain(["absent", ""]);
+    let mut found = 0;
+    for step in 0..5_000 {
+        sb.apply(event(&mut rng));
+        for h in HOLDERS.iter().copied().chain(["nobody"]) {
+            for o in objectives.clone() {
+                let owned = (h.to_owned(), o.to_owned());
+                let hasher = sb.scores.hasher();
+                assert_eq!(hasher.hash_one(ScoreKey(h, o)), hasher.hash_one(&owned), "hash of ({h}, {o})");
+                let (a, b) = (sb.score_borrowed(h, o), sb.score_owned(h, o));
+                assert!(a.map(std::ptr::from_ref) == b.map(std::ptr::from_ref), "step {step}: score of ({h}, {o})");
+                found += usize::from(a.is_some());
+            }
+        }
+    }
+    assert!(found > 50_000, "only {found} scores found: the sequence must fill the table");
+}
+
+/// What the player list shows from the scoreboard for one holder: list score (hearts, value,
+/// text), name formatted by the team, team name of the sort.
+type ListedHolder = (Option<(bool, i32, Option<Component>)>, Component, Option<String>);
+
+/// [`ListedHolder`] of every holder.
+fn list_view(sb: &Scoreboard) -> Vec<ListedHolder> {
+    HOLDERS
+        .iter()
+        .map(|h| {
+            let team = sb.team_named(h).map(|t| t.0.to_owned());
+            (sb.list_score(h), sb.decorate(h, Component::text(*h)), team)
+        })
+        .collect()
+}
+
+/// After each event of a random sequence where the list slot is often used: whenever what the
+/// player list shows changed, the list revision changed too (rows kept by the list are never
+/// stale). Sabotages verified (failure): a score of the list objective, then a team update,
+/// leaving the revision unchanged.
+#[test]
+fn list_revision_moves_with_what_the_list_shows() {
+    let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+    let mut sb = Scoreboard::default();
+    for o in OBJECTIVES {
+        sb.apply(ScoreEvent::Objective { name: o.into(), mode: 0, display: text(o), hearts: false, format: None });
+    }
+    sb.apply(ScoreEvent::Display { slot: 0, objective: "kills".into() });
+    let mut changes = 0;
+    for step in 0..20_000 {
+        // The list slot taken again regularly (the generator mostly moves the sidebar).
+        let ev = if step % 50 == 0 {
+            ScoreEvent::Display { slot: 0, objective: OBJECTIVES[rng.below(3)].to_owned() }
+        } else {
+            event(&mut rng)
+        };
+        let (before, revision) = (list_view(&sb), sb.list_revision());
+        sb.apply(ev);
+        if list_view(&sb) != before {
+            changes += 1;
+            assert_ne!(sb.list_revision(), revision, "step {step}: the list changed, its revision did not");
+        }
+    }
+    assert!(changes > 2_000, "only {changes} changes of the list");
+}
+
+/// Sidebar of the same kept rows drawn three ways: the old code, styled again on every frame,
+/// kept styled lines. Layers equal to the byte over 120 frames with score changes, a language
+/// change (frame 50), new fonts (frame 70) and another local player (frames 90 to 99); the
+/// styled lines are really kept (styled again only after a change). Without an installed game
+/// or a GPU, skipped (`RUSTCRAFT_OPT_REQUIRE=1`: failure).
+#[test]
+fn sidebar_styled_cache_draws_identical_layers() {
+    use crate::gui::tests_opt;
+    let Some(e) = tests_opt::env() else { return };
+    let mut reference = tests_opt::gui(&e, tests_opt::ALL);
+    let (mut old, mut new) = (tests_opt::gui(&e, tests_opt::ALL), tests_opt::gui(&e, tests_opt::ALL));
+    let mut sb = synthetic(40);
+    // Translated title and a keybind line, so that the language and the keys show.
+    sb.apply(ScoreEvent::Objective {
+        name: "o".into(),
+        mode: 2,
+        display: Some(Nbt::Compound(vec![("translate".into(), Nbt::String("gui.done".into()))])),
+        hearts: false,
+        format: None,
+    });
+    let base = e.assets.read("assets/minecraft/lang/en_us.json").unwrap_or_default();
+    let mut rng = Rng(0x0BAD_5EED_1234_5678);
+    let mut previous = None;
+    let (mut frames_changed, mut drawn) = (0, 0);
+    for frame in 0..120u32 {
+        if frame % 3 == 0 {
+            sb.apply(ScoreEvent::Score {
+                holder: format!("Player{}", rng.below(40)),
+                objective: "o".into(),
+                value: rng.below(1000) as i32,
+                display: None,
+                format: None,
+            });
+        }
+        for g in [&mut reference, &mut old, &mut new] {
+            match frame {
+                50 => g.lang = rc_text::Lang::load(&base, Some(r#"{"gui.done": "Terminé"}"#.as_bytes()), None),
+                70 => {
+                    let opts = rc_assets::font::FontOptions { uniform: true, jp: false };
+                    let load = |id: &&str| ((*id).to_owned(), rc_assets::font::Font::load(&e.assets, id, opts));
+                    g.set_fonts(crate::resources::FONT_IDS.iter().map(load).collect());
+                }
+                _ => {}
+            }
+            g.begin(1600, 900);
+        }
+        let local = if (90..100).contains(&frame) { "Player3" } else { LOCAL };
+        if let Some(rows) = sb.sidebar_rows(local) {
+            reference_draw_sidebar(rows, &mut reference, &e.queue, None);
+            StyledSidebar::build(&old, rows).draw(&mut old, &e.queue, None);
+        }
+        if let Some(styled) = sb.styled_sidebar(&new, local) {
+            styled.draw(&mut new, &e.queue, None);
+            drawn += 1;
+        }
+        let want = tests_opt::layer_bytes(&reference);
+        for (name, g) in [("styled every frame", &old), ("kept styled lines", &new)] {
+            let got = tests_opt::layer_bytes(g);
+            let first = want.iter().zip(&got).position(|(a, b)| a != b);
+            assert!(
+                got.len() == want.len() && first.is_none(),
+                "frame {frame}, {name}: layers differ (byte {first:?})"
+            );
+        }
+        frames_changed += usize::from(previous.as_ref() != Some(&want));
+        previous = Some(want);
+    }
+    assert!(drawn == 120 && frames_changed >= 20, "{drawn} frames drawn, {frames_changed} changed");
+    assert!((40..=60).contains(&sb.styled_builds), "{} stylings in 120 frames", sb.styled_builds);
+}
+
+/// Micro-bench of the sidebar drawn (15 lines kept): styled again on every frame against the
+/// kept styled lines. Main thread by nature (a few µs). Without a GPU: skipped.
+/// `cargo test --release -p rc-app bench_sidebar_draw -- --ignored --nocapture`.
+#[test]
+#[ignore = "bench"]
+fn bench_sidebar_draw() {
+    use crate::gui::tests_opt;
+    use std::time::Instant;
+    let Some(e) = tests_opt::env() else { return };
+    let mut g = tests_opt::gui(&e, tests_opt::ALL);
+    let mut sb = synthetic(200);
+    let frames = 5000;
+    for styled_cache in [false, true] {
+        let mut once = |g: &mut Gui| {
+            g.begin(1600, 900);
+            if styled_cache {
+                if let Some(s) = sb.styled_sidebar(g, LOCAL) {
+                    s.draw(g, &e.queue, None);
+                }
+            } else if let Some(rows) = sb.sidebar_rows(LOCAL) {
+                StyledSidebar::build(g, rows).draw(g, &e.queue, None);
+            }
+        };
+        for _ in 0..100 {
+            once(&mut g);
+        }
+        let t = Instant::now();
+        for _ in 0..frames {
+            once(&mut g);
+        }
+        let per_frame = t.elapsed().as_secs_f64() * 1e6 / f64::from(frames);
+        let bytes = crate::debug_sys::allocated_bytes(|| (0..100).for_each(|_| once(&mut g))) / 100;
+        let name = if styled_cache { "kept styled lines" } else { "styled every frame" };
+        println!("sidebar 15 lines, {name:<20}: {per_frame:>7.2} µs, {bytes:>6} bytes allocated per frame");
+    }
+}
+
+/// Micro-bench of a score lookup (list score per listed player, "below name" line per entity on
+/// every frame): owned key built against borrowed key, 200 holders.
+/// `cargo test --release -p rc-app bench_score_lookup -- --ignored --nocapture`.
+#[test]
+#[ignore = "bench"]
+fn bench_score_lookup() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    let sb = synthetic(200);
+    let holders: Vec<String> = (0..200).map(|i| format!("Player{i}")).collect();
+    let rounds = 2000;
+    for borrowed in [false, true] {
+        let lookups = || {
+            for h in &holders {
+                let s = if borrowed { sb.score_borrowed(h, "o") } else { sb.score_owned(h, "o") };
+                black_box(s.map(|s| s.value));
+            }
+        };
+        lookups();
+        let t = Instant::now();
+        for _ in 0..rounds {
+            lookups();
+        }
+        let per_lookup = t.elapsed().as_secs_f64() * 1e9 / f64::from(rounds) / holders.len() as f64;
+        let bytes = crate::debug_sys::allocated_bytes(lookups) / holders.len() as u64;
+        let name = if borrowed { "borrowed key" } else { "owned key" };
+        println!("score lookup, {name:<12}: {per_lookup:>6.1} ns, {bytes:>3} bytes allocated per lookup");
     }
 }
