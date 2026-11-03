@@ -518,6 +518,7 @@ fn optimize_file(path: &Path, chunks: &[usize], erase: bool, p: &Optimize) {
         p.skipped.fetch_add(chunks.len() as u32, Ordering::Relaxed);
         return;
     };
+    let mut encoder = nbtio::RootEncoder::default();
     for &i in chunks {
         let (cx, cz) = (rx * 32 + (i % 32) as i32, rz * 32 + (i / 32) as i32);
         let converted = match r.read(i, cx, cz) {
@@ -527,7 +528,7 @@ fn optimize_file(path: &Path, chunks: &[usize], erase: bool, p: &Optimize) {
                     // Counted as soon as it is sent to be written, like the game (a failed
                     // write only reaches its log).
                     current && erase_chunk_cache(&mut root) && {
-                        let _ = r.write(i, cx, cz, &nbtio::encode_root(&root));
+                        let _ = r.write(i, cx, cz, &encoder.encode(&root));
                         true
                     }
                 }

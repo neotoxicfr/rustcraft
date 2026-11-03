@@ -1168,6 +1168,58 @@ and messages only, outside the game loop. Multi-core and GPU not applicable (wor
 microseconds, order of the effects imposed). `\N{name}`: Unicode names table (crate `unicode_names2`,
 ≈ 500 KB of static data, nothing at run time outside this escape). To re-measure on a quiet machine
 with the bench's save scene.
+### NBT writing: strings without a buffer, arrays in one block, sized roots (C5-M10, 03/11, loaded machine)
+
+Writer used by every save (chunk columns, `.dat`), the generator's proto-chunks and the LAN.
+Three switches, default on, `=0` restores the old path:
+
+- `RUSTCRAFT_OPT_NBT_STRING_FAST_PATH`: a string without a null character and without a
+  character outside the base plane has the same bytes in UTF-8 and in modified UTF-8, so it is
+  copied as it is; the others are encoded straight into the output after a 2-byte length patched
+  at the end (back to an empty string past 65,535 bytes, like before). Old path: one temporary
+  `Vec` per key and per value, then a copy. The reader drops its two extra scans after the UTF-8
+  check (0xC0 never occurs in valid UTF-8; 0xED there only leads hangul, decoded the same).
+- `RUSTCRAFT_OPT_NBT_ARRAY_BULK`: int and long arrays written with one resize then a loop over
+  fixed-size blocks (byte swaps vectorised), instead of one `extend_from_slice` per element.
+- `RUSTCRAFT_OPT_NBT_SIZE_HINT`: `nbtio::RootEncoder` (save loop, generator batches with one
+  encoder per rayon worker, new world, cache erasing) starts each buffer at the size of the
+  previous root plus an eighth, never below 4 KiB, instead of 4 KiB grown by doubling.
+
+Proof: `nbt::write_tests` (rc-proto): 100,000 generated strings (ASCII, nulls, Latin-1, hangul,
+base plane, outside it, mixed) plus 11 boundary strings (0, 65,535, 65,536, 70,000 bytes,
+65,535 UTF-8 bytes with a 4-byte character that overflows in modified UTF-8, nulls at the
+limit, 21,845 and 21,846 hangul): same bytes as the old writer and round trip; frozen bytes for
+both writers; 4,000 random arrays; whole trees with the 4 option combinations. Sabotages
+checked: null test removed from the copy path (fails on the boundary and null strings), long
+arrays in little-endian, length patched one byte off (both fail). rc-sim
+`model_world_encodes_identically`: the 17,689 chunks of the model world (terrain, entities, POI;
+131.6 MB) give the same bytes with the old writer, the new one and `RootEncoder`.
+
+Only difference in behaviour (reader): valid UTF-8 holding both a 0xED lead (hangul) and a
+4-byte character was refused by the old path and is now accepted, like the same text without the
+hangul always was (150,000 inputs of the reader test: 5,854 such cases, all others identical). The
+game refuses every 4-byte form: a leniency of the reader that predates this change, never
+produced by our writer; left to a fidelity mission.
+
+Micro-benches (trial profile, loaded machine: other agents compiling, 3 passes):
+
+| Bench | Old | Strings | Arrays | Strings + arrays | + size hint |
+|---|---|---|---|---|---|
+| `list_write_bench`, typical column (24 sections, 40 entities) | 59.1–59.7 µs | 15.0–15.2 µs | 59.7–60.1 µs | 14.8–15.2 µs | n/a |
+| `encode_root_bench`, 17,676 real columns (7 KiB average) | 5.2–8.1 µs | 3.3–5.6 µs | 5.3–9.4 µs | 3.2–5.0 µs | 3.4–5.0 µs |
+| `encode_root_bench`, 9,626 full columns (10 KiB average) | 10.6–11.8 µs | 6.3–7.9 µs | 8.3–10.8 µs | 5.6–6.3 µs | 5.0–6.6 µs |
+| `array_write_bench`, 4,096 longs | 2.26–2.56 µs | | 1.80–1.81 µs | | |
+| `array_write_bench`, 4,096 ints | 2.06–3.01 µs | | 0.72–0.93 µs | | |
+
+Strings: ×4 on the typical column, −35 to −45% on the real ones. Arrays: −20% (longs) and ×2.5
+(ints) alone, lost in the noise inside a column. Size hint alone (old writer): 9.9–10.8 µs
+against 10.6–11.8, within noise. Arrays and size hint kept on behind their switch (C6) until the
+quiet-machine bench of the `autosave-1` and `generation` scenes. Multi-core: one root is a
+sequential walk; the generator already encodes its batch in parallel, the save loop in series
+(its parallel version is another mission: it must keep one `RootEncoder` per worker through
+`map_init`). GPU not applicable (tree walk, a few µs). Not done: AVX2 byte swaps behind runtime
+detection (≈ 1 µs per column at most); the same per-element long writing in the LAN chunk packet
+(`lan/encode.rs`, `container_raw`), left to the mission that owns that file.
 ### Piglins and spear (fidelity G4-F13, 23/10/2026)
 
 New code on the integrated server thread, off the hot path: decision by reading the code, no

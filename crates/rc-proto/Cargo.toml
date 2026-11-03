@@ -8,6 +8,8 @@ publish.workspace = true
 description = "Basic protocol types and codecs, independent of the version"
 
 [dependencies]
+# Only for the `RUSTCRAFT_OPT_*` switches (read through its `env_str!`).
+rc-data.workspace = true
 thiserror.workspace = true
 
 [lints]
