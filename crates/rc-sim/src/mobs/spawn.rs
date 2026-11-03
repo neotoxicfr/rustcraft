@@ -1239,7 +1239,7 @@ impl Server {
         let mut counts = [0i32; 7];
         let mut pot: Vec<([i32; 3], f64)> = Vec::new();
         let centers = self.sim_centers();
-        for m in self.mobs.list.iter().flatten() {
+        for m in self.mobs.list.iter() {
             if m.persistent || m.requires_custom_persistence() || m.kind.info().category == Category::Misc {
                 continue;
             }
@@ -1570,7 +1570,7 @@ impl Server {
         if self.game_mode != 3 && self.player_aabb().intersects(bb) {
             return false;
         }
-        if self.mobs.list.iter().flatten().any(|o| o.id != except && !o.removed && o.touches(bb)) {
+        if self.mobs.list.iter().any(|o| o.id != except && !o.removed && o.touches(bb)) {
             return false;
         }
         !self.bs.entities.list.iter().any(|e| {

@@ -10,7 +10,7 @@ use crate::mobs::mob::Mob;
 use crate::mobs::species::Kind;
 
 fn allays(w: &W) -> Vec<&Mob> {
-    w.p.s.mobs.list.iter().flatten().map(|m| &**m).filter(|m| m.kind == Kind::Allay && !m.removed).collect()
+    w.p.s.mobs.list.iter().filter(|m| m.kind == Kind::Allay && !m.removed).collect()
 }
 
 fn dancing_at(w: &W, x: f64) -> bool {

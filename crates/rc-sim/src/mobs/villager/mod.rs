@@ -254,15 +254,13 @@ impl Server {
         f: impl FnOnce(&mut Server, &mut Mob, Option<&mut Brain>) -> R,
     ) -> Option<R> {
         let i = self.mob_index(id)?;
-        let mut o = self.mobs.list[i].take()?;
+        let mut o = self.mobs.list.take(i)?;
         let mut b = o.npc.as_mut().and_then(|n| n.brain.take());
         let r = f(self, &mut o, b.as_deref_mut());
         if let (Some(n), Some(b)) = (o.npc.as_mut(), b) {
             n.brain = Some(b);
         }
-        if let Some(slot) = self.mobs.list.get_mut(i) {
-            *slot = Some(o);
-        } else {
+        if let Err(o) = self.mobs.list.try_put(i, o) {
             self.mobs.push(o);
         }
         Some(r)
@@ -615,7 +613,7 @@ impl Server {
         let sound = std::mem::replace(&mut t.trade_sound, false);
         let offers = t.offers.clone();
         let Some(i) = self.mob_index(id) else { return };
-        let Some(mut m) = self.mobs.list[i].take() else { return };
+        let Some(mut m) = self.mobs.list.take(i) else { return };
         for valid in updated {
             // Yes/no sound, at most once per interval.
             let interval = m.kind.info().ambient_interval;
@@ -646,7 +644,7 @@ impl Server {
             self.reward_trade(&mut m, &off);
             self.s9_traded(&m, &off.result); // S9: statistic and trading trigger
         }
-        self.mobs.list[i] = Some(m);
+        self.mobs.list.put(i, m);
     }
 
     /// The experience reward of a trade (villager) or simple reward (wandering trader).
@@ -705,7 +703,7 @@ impl Server {
     /// Trade closing: the trader no longer trades.
     pub(crate) fn merchant_closed(&mut self, id: i32) {
         if let Some(i) = self.mob_index(id)
-            && let Some(m) = self.mobs.list[i].as_mut()
+            && let Some(m) = self.mobs.list.get_mut(i)
             && let Some(n) = m.npc.as_mut()
         {
             n.trading = false;
@@ -785,7 +783,7 @@ impl Server {
         }
         let bb = m.bbox();
         let mut count = 0;
-        for o in self.mobs.list.iter().flatten() {
+        for o in self.mobs.list.iter() {
             if o.kind != Kind::Villager {
                 continue;
             }
@@ -807,7 +805,7 @@ impl Server {
         if count >= needed && self.summon_golem_for_villager(m.block_pos()) {
             // Golem born (F06): all villagers in the enlarged box of 10 have "seen" it.
             b.mem.golem = Some(599);
-            for o in self.mobs.list.iter_mut().flatten() {
+            for o in self.mobs.list.iter_mut() {
                 if o.kind != Kind::Villager {
                     continue;
                 }

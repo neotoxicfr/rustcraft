@@ -121,7 +121,7 @@ fn conduit_activates_gives_power_and_hunts() {
     let zid = w.p.s.mobs.of_kind(Kind::Zombie).next().expect("zombie").id;
     let zi = w.p.s.mob_index(zid).expect("zombie");
     let (zuuid, zhealth) = {
-        let z = w.p.s.mobs.list[zi].as_mut().expect("zombie");
+        let z = w.p.s.mobs.list.get_mut(zi).expect("zombie");
         z.in_water = true;
         (z.uuid, z.health)
     };
@@ -214,7 +214,7 @@ fn ender_chest_and_shulker_box_open_only_when_free() {
     let sid = w.p.s.mobs.of_kind(Kind::Shulker).next().expect("shulker").id;
     assert!(!opens(&mut w, top), "box under a shulker opened");
     let si = w.p.s.mob_index(sid).expect("shulker");
-    w.p.s.mobs.list[si].as_mut().expect("shulker").health = 0.0;
+    w.p.s.mobs.list.get_mut(si).expect("shulker").health = 0.0;
     assert!(opens(&mut w, top), "box under a dead shulker closed");
 }
 
@@ -230,7 +230,7 @@ fn bell_stops_ticking_outside_the_world_border() {
     let pid = w.p.s.mobs.of_kind(Kind::Pillager).next().expect("pillager").id;
     let glowing = |w: &W| {
         let i = w.p.s.mob_index(pid).expect("pillager");
-        w.p.s.mobs.list[i].as_ref().expect("pillager").x.effects.iter().any(|e| e.id == "minecraft:glowing")
+        w.p.s.mobs.list.get(i).expect("pillager").x.effects.iter().any(|e| e.id == "minecraft:glowing")
     };
     w.cmd("worldborder center 0 0");
     w.cmd("worldborder set 4");

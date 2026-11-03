@@ -1186,7 +1186,7 @@ pub fn finalize_breeding(s: &mut Server, m: &mut Mob, partner: i32, child: Optio
     m.age = 6000;
     m.reset_love();
     if let Some(i) = s.mob_index(partner)
-        && let Some(p) = s.mobs.list[i].as_mut()
+        && let Some(p) = s.mobs.list.get_mut(i)
     {
         p.age = 6000;
         p.reset_love();

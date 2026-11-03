@@ -123,11 +123,11 @@ fn evoker_fangs_and_vexes() {
                 assert!((f.pos[1] - -59.0).abs() < 1e-9, "fangs off the ground {:?}", f.pos);
             }
         }
-        if fangs > 0 && p.s.mobs.list.iter().flatten().any(|m| m.kind == Kind::Vex) {
+        if fangs > 0 && p.s.mobs.list.iter().any(|m| m.kind == Kind::Vex) {
             break;
         }
     }
-    let vexes: Vec<_> = p.s.mobs.list.iter().flatten().filter(|m| m.kind == Kind::Vex).collect();
+    let vexes: Vec<_> = p.s.mobs.list.iter().filter(|m| m.kind == Kind::Vex).collect();
     eprintln!("casting {casting}, fangs {fangs}, vex {}", vexes.len());
     assert!(casting, "no spell");
     assert!(fangs > 0 || !vexes.is_empty(), "neither fangs nor vex");
@@ -147,7 +147,7 @@ fn vex_flies_through_walls() {
     let id = spawn(&mut p, Kind::Vex, [216.5, -57.0, 212.5]);
     // Wall between them: the target is given (the game's targeting requires sight).
     if let Some(i) = p.s.mob_index(id)
-        && let Some(m) = p.s.mobs.list[i].as_deref_mut()
+        && let Some(m) = p.s.mobs.list.get_mut(i)
     {
         m.target = Some(Ent::Player);
     }
@@ -239,7 +239,7 @@ fn patrol_spawns() {
     for _ in 0..400 {
         p.s.mobs.ill.patrol_next = 1;
         p.s.patrol_spawner_tick();
-        spawned = p.s.mobs.list.iter().flatten().filter(|m| m.kind == Kind::Pillager).map(|m| (**m).clone()).collect();
+        spawned = p.s.mobs.list.iter().filter(|m| m.kind == Kind::Pillager).cloned().collect();
         if !spawned.is_empty() {
             break;
         }
@@ -287,7 +287,7 @@ fn raid_starts_in_village() {
             break;
         }
     }
-    let raiders: Vec<_> = p.s.mobs.list.iter().flatten().filter(|m| m.ill.raid.is_some()).collect();
+    let raiders: Vec<_> = p.s.mobs.list.iter().filter(|m| m.ill.raid.is_some()).collect();
     eprintln!("wave {wave}, pillagers {}", raiders.len());
     if !wave {
         eprintln!("no spawn position found (zone too small?)");
@@ -309,7 +309,7 @@ fn illagers_saved_and_reloaded() {
     let pid = spawn(&mut p, Kind::Pillager, [210.5, -59.0, 210.5]);
     let vid = spawn(&mut p, Kind::Vex, [212.5, -57.0, 210.5]);
     if let Some(i) = p.s.mob_index(pid)
-        && let Some(m) = p.s.mobs.list[i].as_deref_mut()
+        && let Some(m) = p.s.mobs.list.get_mut(i)
     {
         m.ill.patrol_target = Some([300, -59, 400]);
         m.ill.patrol_leader = true;
@@ -318,7 +318,7 @@ fn illagers_saved_and_reloaded() {
             vec![crate::player::Stack { id: "minecraft:white_banner".into(), count: 2, components: None }];
     }
     if let Some(i) = p.s.mob_index(vid)
-        && let Some(m) = p.s.mobs.list[i].as_deref_mut()
+        && let Some(m) = p.s.mobs.list.get_mut(i)
     {
         m.ill.bound = Some([212, -57, 210]);
         m.ill.life = Some(1234);
@@ -420,13 +420,13 @@ fn prep_illagers_world() {
             let id = spawn(&mut p, k, [x, y, z]);
             if k == Kind::Pillager
                 && let Some(i) = p.s.mob_index(id)
-                && let Some(m) = p.s.mobs.list[i].as_deref_mut()
+                && let Some(m) = p.s.mobs.list.get_mut(i)
             {
                 m.ill.patrol_leader = true;
                 m.equipment[5] = Some(super::ominous_banner());
             }
         }
-        for m in p.s.mobs.list.iter_mut().flatten() {
+        for m in p.s.mobs.list.iter_mut() {
             m.yaw = 90.0;
             m.body_yaw = 90.0;
             m.head_yaw = 90.0;
@@ -475,7 +475,7 @@ fn structure_mobs_are_finalized() {
         let n = p.s.next_entity;
         let n = p.s.adopt_with_passengers(n, &Nbt::Compound(f), None).expect("adopted");
         let i = p.s.mob_index(n).expect("indexed");
-        let m = p.s.mobs.list[i].as_deref().expect("mob");
+        let m = p.s.mobs.list.get(i).expect("mob");
         let bonus = m.attrs.follow.perm.contains(&"minecraft:random_spawn_bonus");
         assert_eq!(bonus, mark, "{id} (marker {mark}): follow bonus");
         if m.kind == Kind::Witch {
@@ -500,7 +500,7 @@ fn mansion_vindicator_is_finalized() {
     let id = p.s.next_entity;
     let id = p.s.adopt_with_passengers(id, &e, None).expect("adopted");
     let i = p.s.mob_index(id).expect("indexed");
-    let m = p.s.mobs.list[i].as_deref().expect("mob");
+    let m = p.s.mobs.list.get(i).expect("mob");
     assert_eq!(m.equipment[0].as_ref().map(|s| s.id.as_str()), Some("minecraft:iron_axe"));
     assert!(!m.ill.patrol_leader);
     assert!(m.save().get("rc_finalize_structure").is_none());

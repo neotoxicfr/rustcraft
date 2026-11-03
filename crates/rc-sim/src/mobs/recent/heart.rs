@@ -235,7 +235,7 @@ impl Server {
                 && let Some(id) = self.heart_spawn_protector(p)
             {
                 if let Some(i) = self.mob_index(id)
-                    && let Some(mut c) = self.mobs.list[i].take()
+                    && let Some(mut c) = self.mobs.list.take(i)
                 {
                     let uuid = c.uuid;
                     if let Some(h) = self.mobs.rec.hearts.map.get_mut(&p) {
@@ -243,13 +243,13 @@ impl Server {
                     }
                     self.heart_store(p);
                     self.make_sound(&mut c, "minecraft:entity.creaking.spawn");
-                    self.mobs.list[i] = Some(c);
+                    self.mobs.list.put(i, c);
                 }
                 self.block_sound(p, "minecraft:block.creaking_heart.spawn", 1.0, 1.0);
             }
         } else if let Some(id) = self.heart_protector(p)
             && let Some(i) = self.mob_index(id)
-            && let Some(mut c) = self.mobs.list[i].take()
+            && let Some(mut c) = self.mobs.list.take(i)
         {
             let dist = {
                 let b = [f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5];
@@ -258,7 +258,7 @@ impl Server {
             let remove = (!super::creaking_active(self) && !c.persistent)
                 || dist > 34.0
                 || super::creaking::player_stuck_in_you(self, &mut c);
-            self.mobs.list[i] = Some(c);
+            self.mobs.list.put(i, c);
             if remove {
                 self.heart_remove_protector(p, None);
             }
@@ -341,12 +341,12 @@ impl Server {
     fn heart_spawn_protector(&mut self, p: [i32; 3]) -> Option<i32> {
         let id = self.spawn_util(Kind::Creaking, super::super::spawn::Reason::Spawner, p, 5, 16, 8, true, true)?;
         if let Some(i) = self.mob_index(id)
-            && let Some(mut c) = self.mobs.list[i].take()
+            && let Some(mut c) = self.mobs.list.take(i)
         {
             let pos = c.pos;
             self.game_event_at("minecraft:entity_place", pos, Some(Ent::Mob(c.id)));
             super::creaking::set_transient(&mut c, p);
-            self.mobs.list[i] = Some(c);
+            self.mobs.list.put(i, c);
         }
         Some(id)
     }
@@ -484,13 +484,13 @@ impl Server {
     pub(crate) fn heart_remove_protector(&mut self, p: [i32; 3], src: Option<(&str, Option<Ent>)>) {
         let Some(id) = self.heart_protector(p) else { return };
         if let Some(i) = self.mob_index(id)
-            && let Some(mut c) = self.mobs.list[i].take()
+            && let Some(mut c) = self.mobs.list.take(i)
         {
             match src {
                 None => super::creaking::tear_down(self, &mut c),
                 Some((ty, by)) => super::creaking::death_effects(self, &mut c, ty, by),
             }
-            self.mobs.list[i] = Some(c);
+            self.mobs.list.put(i, c);
         }
         if let Some(h) = self.mobs.rec.hearts.map.get_mut(&p) {
             h.link = None;

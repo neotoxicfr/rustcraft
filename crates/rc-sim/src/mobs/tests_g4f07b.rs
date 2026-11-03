@@ -50,9 +50,9 @@ fn mob(p: &Probe, id: i32) -> &Mob {
 
 fn tick_one(p: &mut Probe, id: i32) {
     let i = p.s.mob_index(id).expect("mob");
-    let mut m = p.s.mobs.list[i].take().expect("mob");
+    let mut m = p.s.mobs.list.take(i).expect("mob");
     p.s.tick_mob(&mut m);
-    p.s.mobs.list[i] = Some(m);
+    p.s.mobs.list.put(i, m);
 }
 
 fn sounds(p: &Probe, events: &[Event]) -> Vec<String> {
@@ -120,7 +120,7 @@ fn carrot_on_a_stick_breaks() {
     let Some((mut p, dir)) = probe("g4f07b-break") else { return };
     let pig = bare(&mut p, Kind::Pig, [216.5, -59.0, 206.5]);
     let i = p.s.mob_index(pig).unwrap();
-    p.s.mobs.list[i].as_mut().unwrap().equipment[SADDLE] = stack("minecraft:saddle", 1);
+    p.s.mobs.list.get_mut(i).unwrap().equipment[SADDLE] = stack("minecraft:saddle", 1);
     let slot = 36 + p.s.held as usize;
     let mut st = Stack { id: "minecraft:carrot_on_a_stick".into(), count: 1, components: None };
     crate::items::set_component(&mut st, "minecraft:damage", rc_proto::nbt::Nbt::Int(20));
@@ -147,7 +147,7 @@ fn pig_dismounts_onto_neighbouring_cell() {
         let top = v.bbox().max[1];
         assert_eq!(p.s.dismount_location(&v, 0.6, &poses), [216.5, top, 206.5], "{k:?}: top of the box");
         let i = p.s.mob_index(id).unwrap();
-        p.s.mobs.list[i] = None;
+        p.s.mobs.list.take(i);
     }
     for k in [Kind::Pig, Kind::Chicken, Kind::Nautilus, Kind::ZombieNautilus] {
         let id = bare(&mut p, k, [216.5, -59.0, 206.5]);
@@ -157,7 +157,7 @@ fn pig_dismounts_onto_neighbouring_cell() {
         assert_eq!(p.s.dismount_location(&v, 0.6, &poses), [217.5, -59.0, 206.5], "{k:?}: east cell");
         p.run("setblock 215 -59 206 minecraft:air\nsetblock 215 -58 206 minecraft:air\n");
         let i = p.s.mob_index(id).unwrap();
-        p.s.mobs.list[i] = None;
+        p.s.mobs.list.take(i);
     }
     cleanup(p, dir);
 }
@@ -224,11 +224,11 @@ fn spit_spares_the_llama_passenger() {
     let llama = bare(&mut p, Kind::Llama, [210.5, -59.0, 210.5]);
     let hen = bare(&mut p, Kind::Chicken, [212.5, -59.0, 210.5]);
     let (il, ih) = (p.s.mob_index(llama).unwrap(), p.s.mob_index(hen).unwrap());
-    let mut l = p.s.mobs.list[il].take().unwrap();
-    let mut h = p.s.mobs.list[ih].take().unwrap();
+    let mut l = p.s.mobs.list.take(il).unwrap();
+    let mut h = p.s.mobs.list.take(ih).unwrap();
     assert!(p.s.mob_start_riding(&mut h, &mut l, true), "chicken not mounted");
-    p.s.mobs.list[il] = Some(l);
-    p.s.mobs.list[ih] = Some(h);
+    p.s.mobs.list.put(il, l);
+    p.s.mobs.list.put(ih, h);
     let seat = mob(&p, hen).pos;
     let (lmax, hmax) = (mob(&p, llama).health, mob(&p, hen).health);
     let y = seat[1] + f64::from(mob(&p, hen).height()) / 2.0;
@@ -283,15 +283,15 @@ fn seat_in_cart(p: &mut Probe, id: i32, pos: [f64; 3]) {
     p.s.next_entity += 1;
     let mut c = crate::minecart::Cart::new(crate::minecart::CKind::Rideable, p.s.next_entity, pos);
     let i = p.s.mob_index(id).expect("mob");
-    let mut m = p.s.mobs.list[i].take().expect("mob");
+    let mut m = p.s.mobs.list.take(i).expect("mob");
     assert!(p.s.cart_mob_start_riding(&mut c, &mut m), "mob not mounted in the minecart");
-    p.s.mobs.list[i] = Some(m);
+    p.s.mobs.list.put(i, m);
     p.s.cart_add(c);
 }
 
 fn set_target(p: &mut Probe, id: i32, t: Option<Ent>) {
     let i = p.s.mob_index(id).expect("mob");
-    p.s.mobs.list[i].as_mut().expect("mob").target = t;
+    p.s.mobs.list.get_mut(i).expect("mob").target = t;
 }
 
 fn proj_ticks(p: &Probe, id: i32) -> Option<i32> {
@@ -327,7 +327,7 @@ fn spit_first_tick_on_next_server_tick() {
 /// Next permitted use of an evoker spell (`i32::MAX`: never).
 fn spell_next(p: &mut Probe, id: i32, spell: super::illagers::Spell, at: i32) {
     let i = p.s.mob_index(id).expect("evoker");
-    let m = p.s.mobs.list[i].as_mut().expect("evoker");
+    let m = p.s.mobs.list.get_mut(i).expect("evoker");
     for w in &mut m.goals.goals {
         if let super::goals::Goal::Ill(super::illagers::IGoal::UseSpell { spell: s, next_tick, .. }) = &mut w.goal
             && *s == spell
@@ -480,9 +480,9 @@ fn frozen_birth(
     ticks: impl Fn(&Server, i32) -> Option<i32>,
 ) {
     let i = p.s.mob_index(id).expect("mount");
-    let mut v = p.s.mobs.list[i].take().expect("mount");
+    let mut v = p.s.mobs.list.take(i).expect("mount");
     assert!(p.s.player_start_riding(&mut v), "{who}: player not mounted");
-    p.s.mobs.list[i] = Some(v);
+    p.s.mobs.list.put(i, v);
     p.s.player_command("tick freeze");
     assert!(p.s.cmd.ticking.frozen(), "game not frozen");
     let e = until(p, 200, who, &born);
@@ -510,7 +510,7 @@ fn freeze_then_thaw_first_tick_on_thaw() {
     let llama = bare(&mut p, Kind::Llama, [212.5, -59.0, 210.5]);
     let golem = bare(&mut p, Kind::SnowGolem, [220.5, -59.0, 210.5]);
     let i = p.s.mob_index(llama).unwrap();
-    p.s.mobs.list[i].as_mut().unwrap().mount.set_flag(super::mounts::FLAG_TAME, true);
+    p.s.mobs.list.get_mut(i).unwrap().mount.set_flag(super::mounts::FLAG_TAME, true);
     set_target(&mut p, llama, Some(Ent::Mob(cow)));
     let spit = |s: &Server, e: i32| s.mobs.mounts.spits.iter().find(|x| x.id == e).map(|x| x.tick);
     frozen_birth(&mut p, "spit", llama, |s| s.mobs.mounts.spits.first().map(|x| x.id), spit);

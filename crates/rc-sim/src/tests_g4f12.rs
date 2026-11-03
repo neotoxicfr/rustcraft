@@ -68,7 +68,7 @@ impl W {
 
     fn mob_mut(&mut self, id: i32) -> &mut Mob {
         let i = self.p.s.mob_index(id).expect("mob");
-        self.p.s.mobs.list[i].as_deref_mut().expect("mob")
+        self.p.s.mobs.list.get_mut(i).expect("mob")
     }
 
     fn name(&self, at: [i32; 3]) -> String {
@@ -76,7 +76,7 @@ impl W {
     }
 
     fn count(&self, k: Kind) -> usize {
-        self.p.s.mobs.list.iter().flatten().filter(|m| m.kind == k && !m.removed).count()
+        self.p.s.mobs.list.iter().filter(|m| m.kind == k && !m.removed).count()
     }
 
     fn wall(&mut self, x: i32, block: &str) {

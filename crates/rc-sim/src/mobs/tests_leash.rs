@@ -82,9 +82,9 @@ impl W {
     /// One lead tick of mob `id` (taken out of the list for the duration of the tick).
     fn leash_tick(&mut self, id: i32) {
         let i = self.p.s.mob_index(id).expect("mob");
-        let mut m = self.p.s.mobs.list[i].take().expect("mob");
+        let mut m = self.p.s.mobs.list.take(i).expect("mob");
         self.p.s.leash_tick(&mut m);
-        self.p.s.mobs.list[i] = Some(m);
+        self.p.s.mobs.list.put(i, m);
     }
 
     fn hold(&mut self, id: &str, n: i32) {
@@ -154,10 +154,10 @@ fn pull_then_snap() {
     let u = w.p.s.uuid;
     {
         let i = w.p.s.mob_index(cow).unwrap();
-        let mut m = w.p.s.mobs.list[i].take().unwrap();
+        let mut m = w.p.s.mobs.list.take(i).unwrap();
         m.on_ground = false;
         w.p.s.leash_set(&mut m, Holder::Player, Anchor::Uuid(u), false);
-        w.p.s.mobs.list[i] = Some(m);
+        w.p.s.mobs.list.put(i, m);
     }
     w.leash_tick(cow);
     // Point of the cow (0; 0.5 h; 0.5 w) and of the player (0; 0.5 h; 0), null yaws.
@@ -181,7 +181,7 @@ fn pull_then_snap() {
     assert_eq!(leash::home(m), Some(([0, Y, 0], 5)), "home around the holder");
     // Snap.
     let i = w.p.s.mob_index(cow).unwrap();
-    w.p.s.mobs.list[i].as_mut().unwrap().pos = [13.0, f64::from(Y), 0.5];
+    w.p.s.mobs.list.get_mut(i).unwrap().pos = [13.0, f64::from(Y), 0.5];
     let _ = w.p.take_events();
     w.leash_tick(cow);
     let evs = w.p.take_events();
@@ -229,9 +229,9 @@ fn fence_knot_transfer_and_shears() {
     let _ = w.p.take_events();
     {
         let i = w.p.s.mob_index(cow).unwrap();
-        let mut m = w.p.s.mobs.list[i].take().unwrap();
+        let mut m = w.p.s.mobs.list.take(i).unwrap();
         w.p.s.leash_set(&mut m, Holder::Knot(k2), Anchor::Pos(fence), false);
-        w.p.s.mobs.list[i] = Some(m);
+        w.p.s.mobs.list.put(i, m);
     }
     assert!(w.p.s.knot_interact(k2, 36 + w.p.s.held as usize));
     assert_eq!(leash::holder(w.mob(cow)), Some(Holder::Player));
@@ -277,22 +277,22 @@ fn held_trader_llamas() {
     let u = w.mob(trader).uuid;
     {
         let i = w.p.s.mob_index(llama).unwrap();
-        let mut m = w.p.s.mobs.list[i].take().unwrap();
+        let mut m = w.p.s.mobs.list.take(i).unwrap();
         w.p.s.leash_set(&mut m, Holder::Mob(trader), Anchor::Uuid(u), false);
-        w.p.s.mobs.list[i] = Some(m);
+        w.p.s.mobs.list.put(i, m);
     }
     if let Some(n) = w.p.s.mobs.get_mut(trader).unwrap().npc.as_mut() {
         n.despawn_delay = 300;
     }
     {
         let i = w.p.s.mob_index(llama).unwrap();
-        let mut m = w.p.s.mobs.list[i].take().unwrap();
+        let mut m = w.p.s.mobs.list.take(i).unwrap();
         super::mounts::llama::maybe_despawn(&mut w.p.s, &mut m);
         assert_eq!(m.mount.despawn_delay, 299, "delay not modelled on the trader's");
         // Mounting refused.
         w.p.s.slots[36 + w.p.s.held as usize] = None;
         let before = w.p.s.mobs.mounts.riding.vehicle;
-        w.p.s.mobs.list[i] = Some(m);
+        w.p.s.mobs.list.put(i, m);
         w.p.s.player_interact(llama, 0);
         assert_eq!(w.p.s.mobs.mounts.riding.vehicle, before, "trader llama mounted");
     }
@@ -300,7 +300,7 @@ fn held_trader_llamas() {
     let z = w.spawn(Kind::Zombie, [0.5, f64::from(Y), 7.5]);
     w.p.s.mobs.get_mut(trader).unwrap().last_hurt_by_mob = Some((super::mob::Ent::Mob(z), 40));
     let i = w.p.s.mob_index(llama).unwrap();
-    let mut m = w.p.s.mobs.list[i].take().unwrap();
+    let mut m = w.p.s.mobs.list.take(i).unwrap();
     let mut g = super::goals::mount_goals::MGoal::DefendTrader {
         base: super::goals::TBase::new(false, false),
         stamp: 0,
@@ -319,16 +319,16 @@ fn held_trader_llamas() {
     super::mounts::llama::maybe_despawn(&mut w.p.s, &mut m);
     assert!(m.removed && m.leash.is_none());
     assert_eq!(W::links(&w.p.take_events()), vec![(llama, 0)]);
-    w.p.s.mobs.list[i] = Some(m);
+    w.p.s.mobs.list.put(i, m);
 }
 
 impl W {
     /// Ties `id` to holder `h` then plays one lead tick (home zone set).
     fn tie(&mut self, id: i32, h: Holder, anchor: Anchor) {
         let i = self.p.s.mob_index(id).expect("mob");
-        let mut m = self.p.s.mobs.list[i].take().expect("mob");
+        let mut m = self.p.s.mobs.list.take(i).expect("mob");
         self.p.s.leash_set(&mut m, h, anchor, false);
-        self.p.s.mobs.list[i] = Some(m);
+        self.p.s.mobs.list.put(i, m);
         self.leash_tick(id);
     }
 }
@@ -347,7 +347,7 @@ fn lead_home_for_goals() {
     let far = w.spawn(Kind::Zombie, [4.5, f64::from(Y), 7.5]);
     let near = w.spawn(Kind::Zombie, [0.5, f64::from(Y), 6.5]);
     let i = w.p.s.mob_index(llama).unwrap();
-    let mut m = w.p.s.mobs.list[i].take().unwrap();
+    let mut m = w.p.s.mobs.list.take(i).unwrap();
     let mut g = super::goals::mount_goals::MGoal::DefendTrader {
         base: super::goals::TBase::new(false, false),
         stamp: 0,
@@ -357,7 +357,7 @@ fn lead_home_for_goals() {
     assert!(!w.p.s.mount_can_use(&mut g, &mut m), "attacker outside the lead's zone targeted");
     w.p.s.mobs.get_mut(trader).unwrap().last_hurt_by_mob = Some((super::mob::Ent::Mob(near), 41));
     assert!(w.p.s.mount_can_use(&mut g, &mut m), "close attacker refused");
-    w.p.s.mobs.list[i] = Some(m);
+    w.p.s.mobs.list.put(i, m);
     // Held bee: the return to the known flower is cut.
     let bee = w.spawn(Kind::Bee, [2.5, f64::from(Y) + 1.0, 0.5]);
     {
@@ -367,14 +367,14 @@ fn lead_home_for_goals() {
     }
     let mut fg = super::wild::goals::WGoal::GoToFlower { travel: 0 };
     let i = w.p.s.mob_index(bee).unwrap();
-    let mut m = w.p.s.mobs.list[i].take().unwrap();
+    let mut m = w.p.s.mobs.list.take(i).unwrap();
     assert!(w.p.s.wild_can_use(&mut fg, &mut m), "free bee without return to the flower");
-    w.p.s.mobs.list[i] = Some(m);
+    w.p.s.mobs.list.put(i, m);
     let pu = w.p.s.uuid;
     w.tie(bee, Holder::Player, Anchor::Uuid(pu));
-    let mut m = w.p.s.mobs.list[i].take().unwrap();
+    let mut m = w.p.s.mobs.list.take(i).unwrap();
     assert!(!w.p.s.wild_can_use(&mut fg, &mut m), "held bee set off again towards its flower");
-    w.p.s.mobs.list[i] = Some(m);
+    w.p.s.mobs.list.put(i, m);
 }
 
 /// Held happy ghast at 7 blocks: every float point kept is within 9 blocks of the centre of
@@ -387,7 +387,7 @@ fn held_ghast_floats_in_the_lead_zone() {
     w.tie(g, Holder::Player, Anchor::Uuid(pu));
     assert_eq!(leash::home(w.mob(g)), Some(([0, Y, 0], 9)));
     let i = w.p.s.mob_index(g).unwrap();
-    let mut m = w.p.s.mobs.list[i].take().unwrap();
+    let mut m = w.p.s.mobs.list.take(i).unwrap();
     m.rec.restriction = Some(([7, Y + 1, 0], 64));
     let c = [0.5, f64::from(Y) + 0.5, 0.5];
     for n in 0..20 {
@@ -395,7 +395,7 @@ fn held_ghast_floats_in_the_lead_zone() {
         let d = (0..3).map(|a| (t[a] - c[a]).powi(2)).sum::<f64>();
         assert!(d < 81.0, "point {n} outside the lead's zone: {t:?}");
     }
-    w.p.s.mobs.list[i] = Some(m);
+    w.p.s.mobs.list.put(i, m);
 }
 
 /// Dispenser shears: a knot's lead falls (knot removed, shears sound in the neutral category);
@@ -443,14 +443,14 @@ fn sulfur_cube_drops_its_lead_before_exploding() {
     w.tie(c, Holder::Player, Anchor::Uuid(pu));
     let _ = w.p.take_events();
     let i = w.p.s.mob_index(c).unwrap();
-    let mut m = w.p.s.mobs.list[i].take().unwrap();
+    let mut m = w.p.s.mobs.list.take(i).unwrap();
     m.cube.explosion = Some((1, false, 1));
     m.cube.fuse = 1;
     assert!(w.p.s.cube_pre_tick(&mut m), "cube did not explode");
     let evs = w.p.take_events();
     assert!(m.leash.is_none());
     assert_eq!(W::links(&evs), vec![(c, 0)], "null link not sent");
-    w.p.s.mobs.list[i] = Some(m);
+    w.p.s.mobs.list.put(i, m);
     assert_eq!(w.leads_dropped(), 1, "lead not dropped on the ground");
 }
 
@@ -496,11 +496,11 @@ fn held_nautilus_keeps_the_lead_zone() {
     let pu = w.p.s.uuid;
     w.tie(n, Holder::Player, Anchor::Uuid(pu));
     let i = w.p.s.mob_index(n).unwrap();
-    let mut m = w.p.s.mobs.list[i].take().unwrap();
+    let mut m = w.p.s.mobs.list.take(i).unwrap();
     w.p.s.nautilus_brain_tick(&mut m);
     assert!(m.sea.home.is_none(), "nautilus zone set during the lead: {:?}", m.sea.home);
     assert_eq!(super::goals::rpos_home(&m), Some(([0, Y, 0], 5)));
-    w.p.s.mobs.list[i] = Some(m);
+    w.p.s.mobs.list.put(i, m);
 }
 
 /// Bench (ignored by default): cost of a taut (spring) and slack (close follow, path included)
@@ -513,7 +513,7 @@ fn bench_leash_tick() {
     for (x, label) in [(8.5, "taut"), (3.5, "close")] {
         let cow = w.spawn(Kind::Cow, [x, f64::from(Y), 0.5]);
         let i = w.p.s.mob_index(cow).unwrap();
-        let mut m = w.p.s.mobs.list[i].take().unwrap();
+        let mut m = w.p.s.mobs.list.take(i).unwrap();
         w.p.s.leash_set(&mut m, Holder::Player, Anchor::Uuid(u), false);
         let mut best = f64::MAX;
         for _ in 0..5 {
@@ -525,7 +525,7 @@ fn bench_leash_tick() {
             }
             best = best.min(t.elapsed().as_nanos() as f64 / 2000.0);
         }
-        w.p.s.mobs.list[i] = Some(m);
+        w.p.s.mobs.list.put(i, m);
         println!("lead {label}: {best:.0} ns per tick");
     }
 }

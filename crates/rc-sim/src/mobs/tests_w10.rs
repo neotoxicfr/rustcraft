@@ -43,7 +43,7 @@ fn spawn(p: &mut Probe, k: Kind, pos: [f64; 3]) -> i32 {
 /// Mob taken out of the list (as during its tick).
 fn take(p: &mut Probe, id: i32) -> (usize, Box<Mob>) {
     let i = p.s.mob_index(id).expect("mob");
-    (i, p.s.mobs.list[i].take().expect("mob"))
+    (i, p.s.mobs.list.take(i).expect("mob"))
 }
 
 // ---------- Without a world ----------
@@ -121,7 +121,7 @@ fn visibility_invisible_and_heads() {
         p.s.slots[slot] = Some(Stack { id: id.into(), count: 1, components: None });
     }
     assert!((p.s.visibility(Ent::Player, &zm) - 0.7).abs() < 1e-9);
-    p.s.mobs.list[i] = Some(zm);
+    p.s.mobs.list.put(i, zm);
     // Piglin head worn, without invisibility.
     p.s.life.fx = Default::default();
     for slot in 5..9 {
@@ -147,7 +147,7 @@ fn pursuit_without_path_keeps_the_trail() {
     assert!(!p.s.move_to_entity(&mut zm, [100_000.5, -59.0, 0.5], 1.0));
     let after = zm.nav.path.clone().expect("path cleared");
     assert_eq!(format!("{after:?}"), format!("{before:?}"));
-    p.s.mobs.list[i] = Some(zm);
+    p.s.mobs.list.put(i, zm);
 }
 
 /// Sulfur spike: caution like the stalactite (speleothem tag).
@@ -163,7 +163,7 @@ fn sulfur_spike_is_cautious() {
         assert_eq!(t, PathType::DamageCautious, "{q:?}");
     }
     assert!(!p.s.pathfindable_land([210, -59, 210]));
-    p.s.mobs.list[i] = Some(zm);
+    p.s.mobs.list.put(i, zm);
 }
 
 /// In Peaceful, the wild cat does not flee the player (combat conditions).
@@ -177,7 +177,7 @@ fn wild_cat_does_not_flee_in_peaceful() {
     for _ in 0..20 {
         assert!(!p.s.goal_can_use(&mut g, &mut cm), "flee in Peaceful");
     }
-    p.s.mobs.list[i] = Some(cm);
+    p.s.mobs.list.put(i, cm);
     // Control: in Normal, the same flee starts.
     let Some(mut p) = probe("w10peace2", "normal") else { return };
     let c = spawn(&mut p, Kind::Cat, [216.5, -59.0, 206.5]);
@@ -200,7 +200,7 @@ fn owner_following_swims() {
     assert_eq!(super::nav::mob_malus(&wm, PathType::Water), 0.0);
     p.s.goal_stop(&mut g, &mut wm);
     assert_eq!(super::nav::mob_malus(&wm, PathType::Water), 8.0);
-    p.s.mobs.list[i] = Some(wm);
+    p.s.mobs.list.put(i, wm);
 }
 
 /// Tamed cat: sits on a lit furnace (not an unlit one).
@@ -213,14 +213,14 @@ fn cat_sits_on_lit_furnace() {
     cm.tame = true;
     let mut g = Goal::Surf(SGoal::move_to_block(Mtb::CatSit, 0.8, 8, 1, 0));
     assert!(!p.s.goal_can_use(&mut g, &mut cm), "unlit furnace accepted");
-    p.s.mobs.list[i] = Some(cm);
+    p.s.mobs.list.put(i, cm);
     p.run("setblock 212 -59 210 minecraft:furnace[lit=true]\n");
     let (i, mut cm) = take(&mut p, c);
     let mut g = Goal::Surf(SGoal::move_to_block(Mtb::CatSit, 0.8, 8, 1, 0));
     assert!(p.s.goal_can_use(&mut g, &mut cm), "lit furnace refused");
     let Goal::Surf(SGoal::MoveToBlock { pos, .. }) = g else { unreachable!() };
     assert_eq!(pos, [212, -59, 210]);
-    p.s.mobs.list[i] = Some(cm);
+    p.s.mobs.list.put(i, cm);
 }
 
 /// Enderman: takes a holdable block (default state carried), puts it down later; the carried block
@@ -255,7 +255,7 @@ fn enderman_takes_and_places() {
         p.s.enderman_leave_tick(&mut em);
     }
     assert!(em.carried.is_none(), "block never placed");
-    p.s.mobs.list[i] = Some(em);
+    p.s.mobs.list.put(i, em);
 }
 
 /// Jockeys: skeleton on spider; new chicken under a baby zombie.
@@ -301,7 +301,7 @@ fn item_melee_range() {
     assert!(!p.s.within_melee(&zm, Ent::Player));
     zm.equipment[0] = None;
     assert!(p.s.within_melee(&zm, Ent::Player));
-    p.s.mobs.list[i] = Some(zm);
+    p.s.mobs.list.put(i, zm);
 }
 
 /// Goals set by the server: zombie (spear 2, crossing 6, doors 1 last), wolf (llama 3),

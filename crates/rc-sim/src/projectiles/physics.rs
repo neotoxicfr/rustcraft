@@ -266,7 +266,7 @@ impl Server {
         let mut out = Vec::new();
         let owner = self.proj_owner(p);
         let blocks_owner = |e: Ent| !p.left_owner && owner == Some(e);
-        for o in self.mobs.list.iter().flatten() {
+        for o in self.mobs.list.iter() {
             if !o.alive() || o.removed {
                 continue;
             }

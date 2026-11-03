@@ -435,12 +435,12 @@ impl Server {
             return;
         }
         let Some(pi) = self.mob_index(partner) else { return };
-        let Some(p) = self.mobs.list[pi].as_ref().map(|p| (p.variant, p.wool, p.collar)) else { return };
+        let Some(p) = self.mobs.list.get(pi).map(|p| (p.variant, p.wool, p.collar)) else { return };
         let baby = self.breed_offspring(m, Some(p));
         self.s9_bred(m, partner, Some(&baby)); // S9 (before love is forgotten, which erases its cause)
         m.age = 6000;
         m.reset_love();
-        if let Some(p) = self.mobs.list[pi].as_mut() {
+        if let Some(p) = self.mobs.list.get_mut(pi) {
             p.age = 6000;
             p.reset_love();
         }
@@ -842,7 +842,7 @@ impl Server {
             max: [b[0] + 33.0, b[1] + 11.0, b[2] + 33.0],
         };
         let uuid = self.uuid;
-        for m in self.mobs.list.iter_mut().flatten() {
+        for m in self.mobs.list.iter_mut() {
             let neutral = matches!(
                 m.kind,
                 Kind::Bee | Kind::IronGolem | Kind::PolarBear | Kind::Wolf | Kind::Enderman | Kind::ZombifiedPiglin
@@ -889,14 +889,14 @@ impl Server {
             _ => return false,
         };
         let Some(i) = self.mob_index(id) else { return false };
-        let mut m = self.mobs.list[i].take().expect("mob");
+        let mut m = self.mobs.list.take(i).expect("mob");
         let held_s9 = self.slots[slot].clone(); // S9
         let (r, with_item) = self.interact_mob(&mut m, slot);
         if r {
             // S9; an action without an item (lead detached, animals handed over) triggers without a stack.
             self.s9_entity_interact(held_s9.as_ref().filter(|_| with_item), &m);
         }
-        self.mobs.list[i] = Some(m);
+        self.mobs.list.put(i, m);
         if r {
             self.broadcast_menus();
         }
@@ -1188,7 +1188,6 @@ impl Server {
         self.mobs
             .list
             .iter()
-            .flatten()
             .any(|o| o.kind == Kind::Cat && o.id != m.id && (o.cat_lying || o.cat_relax) && o.touches(&area))
     }
 
@@ -1371,17 +1370,17 @@ impl Server {
                 min: [b.min[0] - 5.0, b.min[1] - 3.0, b.min[2] - 5.0],
                 max: [b.max[0] + 5.0, b.max[1] + 3.0, b.max[2] + 5.0],
             };
-            let found = self.mobs.list.iter().position(|o| {
+            let found = self.mobs.list.slots().iter().position(|o| {
                 o.as_ref().is_some_and(|o| {
                     o.kind == Kind::Chicken && !o.removed && o.mount.passengers.is_empty() && o.touches(&area)
                 })
             });
             if let Some(i) = found
-                && let Some(mut c) = self.mobs.list[i].take()
+                && let Some(mut c) = self.mobs.list.take(i)
             {
                 c.chicken_jockey = true;
                 self.mob_start_riding(m, &mut c, false);
-                self.mobs.list[i] = Some(c);
+                self.mobs.list.put(i, c);
             }
         } else if self.mobs.rng.next_float() < 0.05 {
             let mut c = self.new_mob(Kind::Chicken, m.pos, m.yaw);

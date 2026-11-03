@@ -1777,7 +1777,7 @@ impl Server {
     }
 
     fn villager_sleeping_at(&self, p: [i32; 3]) -> bool {
-        self.mobs.list.iter().flatten().any(|o| {
+        self.mobs.list.iter().any(|o| {
             o.kind == Kind::Villager
                 && o.npc.as_ref().is_some_and(|n| n.sleeping.is_some())
                 && o.touches(&rc_physics::Aabb {
@@ -2267,7 +2267,7 @@ impl Server {
                     })
             };
             let others = match near {
-                None => self.mobs.list.iter().flatten().any(|o| crossing(o)),
+                None => self.mobs.list.iter().any(crossing),
                 Some(n) => n.iter().any(|e| matches!(*e, Ent::Mob(id) if self.mob_ref(id).is_some_and(crossing))),
             };
             if !others {

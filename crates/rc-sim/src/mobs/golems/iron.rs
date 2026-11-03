@@ -151,14 +151,14 @@ impl Server {
             }
             Ent::Mob(id) => {
                 let Some(i) = self.mob_index(id) else { return false };
-                let mut o = self.mobs.list[i].take().expect("mob");
+                let mut o = self.mobs.list.take(i).expect("mob");
                 let r = self.mob_hurt_by(&mut o, m, ty, dmg);
                 if r {
                     let scale = (1.0 - o.attrs.knockback_resistance.value()).max(0.0);
                     o.vel[1] += f64::from(0.4f32) * scale;
                     o.needs_sync = true;
                 }
-                self.mobs.list[i] = Some(o);
+                self.mobs.list.put(i, o);
                 // G5-F04: the struck mob's thorns (and the golem's weapon, if any).
                 if r {
                     let w = m.equipment[0].clone();
@@ -285,7 +285,6 @@ impl Server {
                         .mobs
                         .list
                         .iter()
-                        .flatten()
                         .filter(|o| o.kind == Kind::Villager && o.touches(&area))
                         .map(|o| (o.id, self.villager_reputation(o)))
                         .collect();
@@ -350,7 +349,7 @@ impl Server {
                         min: [bb.min[0] - 6.0, bb.min[1] - 2.0, bb.min[2] - 6.0],
                         max: [bb.max[0] + 6.0, bb.max[1] + 2.0, bb.max[2] + 6.0],
                     };
-                    if let Some(o) = self.mobs.list[i].as_deref_mut()
+                    if let Some(o) = self.mobs.list.get_mut(i)
                         && o.kind == Kind::CopperGolem
                         && o.equipment[7].is_none()
                         && area.intersects(&o.bbox())
@@ -386,7 +385,6 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| (o.kind == Kind::Villager || o.kind == Kind::CopperGolem) && o.touches(&area))
             .map(|o| (o.id, o.pos))
             .collect();
@@ -436,7 +434,6 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| o.kind == Kind::Villager && o.touches(&area) && self.villager_wants_golem(o))
             .map(|o| o.pos)
             .collect();

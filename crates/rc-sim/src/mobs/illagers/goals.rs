@@ -739,7 +739,6 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| o.alive() && o.id != m.id && o.touches(&area))
             .map(|o| (o.id, o.pos))
             .collect();
@@ -770,7 +769,6 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| o.alive() && o.id != m.id && o.touches(&area))
             .map(|o| (Ent::Mob(o.id), o.pos))
             .collect();
@@ -795,7 +793,7 @@ impl Server {
     fn shout_to_raiders(&mut self, m: &Mob, target: Option<Ent>, aggressive: bool) {
         let b = m.bbox();
         let area = rc_physics::Aabb { min: b.min.map(|v| v - 8.0), max: b.max.map(|v| v + 8.0) };
-        for o in self.mobs.list.iter_mut().flatten() {
+        for o in self.mobs.list.iter_mut() {
             if o.id != m.id && is_raider(o.kind) && o.alive() && o.touches(&area) && dist2(m.pos, o.pos) <= 64.0 {
                 o.target = target;
                 if aggressive {
@@ -838,7 +836,7 @@ impl Server {
             } else if leader {
                 for id in companions {
                     if let Some(i) = self.mob_index(id)
-                        && let Some(o) = self.mobs.list[i].as_mut()
+                        && let Some(o) = self.mobs.list.get_mut(i)
                     {
                         o.ill.patrol_target = Some(pt);
                         o.ill.patrolling = true;
@@ -855,7 +853,6 @@ impl Server {
         self.mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| {
                 o.id != m.id
                     && is_raider(o.kind)

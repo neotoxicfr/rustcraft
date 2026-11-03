@@ -1055,7 +1055,7 @@ impl Server {
             }
             Ent::Mob(id) => {
                 let Some(i) = self.mob_index(id) else { return false };
-                let mut o = self.mobs.list[i].take().expect("mob");
+                let mut o = self.mobs.list.take(i).expect("mob");
                 // F01: attacker's random source lent to the reaction to a kill (villager conversion).
                 self.mobs.killer = Some((m.rng, m.kind, m.id, m.block_pos()));
                 let r = self.mob_hurt_by(&mut o, m, ty, dmg);
@@ -1063,7 +1063,7 @@ impl Server {
                 if let Some((rng, _, _, _)) = self.mobs.killer.take() {
                     m.rng = rng;
                 }
-                self.mobs.list[i] = Some(o);
+                self.mobs.list.put(i, o);
                 r
             }
         };
@@ -1077,12 +1077,12 @@ impl Server {
                         // Victim's own knockback (full sulfur cube:
                         // attacker's aim), coming from an effect, with the hit's damage.
                         if let Some(i) = self.mob_index(id) {
-                            let mut o = self.mobs.list[i].take().expect("mob");
+                            let mut o = self.mobs.list.take(i).expect("mob");
                             self.ghost_push(m);
                             let by = Some(Ent::Mob(m.id));
                             self.mob_knockback(&mut o, f64::from(kb), f64::from(s), f64::from(-c), by, dmg, true);
                             self.ghost_pop();
-                            self.mobs.list[i] = Some(o);
+                            self.mobs.list.put(i, o);
                         }
                     }
                 }
@@ -1280,7 +1280,7 @@ impl Server {
             }
             return;
         };
-        let mut m = self.mobs.list[i].take().expect("mob");
+        let mut m = self.mobs.list.take(i).expect("mob");
         let reach_ok = {
             let b = m.bbox();
             let eye = [self.pos[0], self.player_eye_y(), self.pos[2]];
@@ -1291,7 +1291,7 @@ impl Server {
         if reach_ok && m.alive() {
             self.player_attack_mob(&mut m);
         }
-        self.mobs.list[i] = Some(m);
+        self.mobs.list.put(i, m);
     }
 
     pub(crate) fn player_attack_mob(&mut self, m: &mut Mob) {
@@ -1689,7 +1689,6 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| Some(o.id) != target && o.touches(&area) && super::mth::dist2(o.pos, self.pos) < 9.0)
             .filter(|o| !self.same_team(&me, &crate::nbtio::uuid_text(o.uuid)))
             .map(|o| o.id)
@@ -1697,7 +1696,7 @@ impl Server {
         let (s, c) = (sin(self.yaw * DEG), cos(self.yaw * DEG));
         for id in ids {
             let Some(i) = self.mob_index(id) else { continue };
-            let mut o = self.mobs.list[i].take().expect("mob");
+            let mut o = self.mobs.list.take(i).expect("mob");
             let dmg = (sweep + weapon.map_or(0.0, |w| self.enchanted_bonus(w, &o))) * scale;
             if self.mob_hurt(&mut o, ty, dmg, Some(Ent::Player), Some(self.pos)) {
                 self.mob_knockback(&mut o, 0.4, f64::from(s), f64::from(-c), Some(Ent::Player), dmg, false);
@@ -1709,7 +1708,7 @@ impl Server {
                 };
                 self.post_attack(&mut hit, weapon);
             }
-            self.mobs.list[i] = Some(o);
+            self.mobs.list.put(i, o);
         }
         // Armor stands (markers left out) and mannequins: the stand takes the hit as a stand
         // (wobble or broken), the mannequin as a living entity.

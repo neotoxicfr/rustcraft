@@ -136,7 +136,7 @@ fn impact_break_needs_tag_rule_and_adventure_rights() {
 
     // Mob shooter: `can_break` component required (never carried), even with mob_griefing.
     w.cmd(&format!("summon minecraft:zombie 2.5 {Y} 2.5 {{NoAI:1b}}"));
-    let zombie = w.p.s.mobs.list.iter().flatten().find(|m| !m.removed).map(|m| m.uuid).expect("zombie");
+    let zombie = w.p.s.mobs.list.iter().find(|m| !m.removed).map(|m| m.uuid).expect("zombie");
     let mut a = proj(&w, PKind::Arrow, "minecraft:arrow");
     a.owner = Some(zombie);
     assert!(!broken(a, &mut w, pot), "mob's arrow: pot intact");

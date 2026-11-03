@@ -202,7 +202,7 @@ impl Server {
                     }
                 }
             };
-            for o in self.mobs.list.iter().flatten() {
+            for o in self.mobs.list.iter() {
                 if o.alive() && !o.removed {
                     try_hit(Ent::Mob(o.id), o.bbox());
                 }
@@ -272,7 +272,7 @@ impl Server {
 
     /// Spit on an entity: 1 damage (`spit`), the spit continues on its way.
     fn spit_hit(&mut self, s: &Spit, e: Ent) {
-        let owner = self.mob_index(s.owner).and_then(|i| self.mobs.list[i].as_ref().map(|m| (**m).clone()));
+        let owner = self.mob_index(s.owner).and_then(|i| self.mobs.list.get(i).cloned());
         let Some(owner) = owner else { return };
         // Projectile: the knockback follows its velocity (opposite, `xd`, `zd` of the game), not its position.
         let kb = (-s.vel[0], -s.vel[2]);
@@ -284,10 +284,10 @@ impl Server {
             }
             Ent::Mob(id) => {
                 let Some(i) = self.mob_index(id) else { return };
-                let Some(mut o) = self.mobs.list[i].take() else { return };
+                let Some(mut o) = self.mobs.list.take(i) else { return };
                 let hurt =
                     self.mob_hurt_dir(&mut o, "minecraft:spit", 1.0, Some(Ent::Mob(s.owner)), Some(s.pos), Some(kb));
-                self.mobs.list[i] = Some(o);
+                self.mobs.list.put(i, o);
                 // G5-F04: thorns of the struck mob on the llama.
                 if hurt {
                     self.post_attack_by(e, Some(Ent::Mob(s.owner)), "minecraft:spit");
@@ -331,7 +331,6 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| o.id != m.id && is_llama(o.kind) && o.touches(&area))
             .map(|o| {
                 (
@@ -366,7 +365,7 @@ impl Server {
         }
         m.mount.caravan_head = Some(id);
         if let Some(i) = self.mob_index(id)
-            && let Some(o) = self.mobs.list[i].as_mut()
+            && let Some(o) = self.mobs.list.get_mut(i)
         {
             o.mount.caravan_tail = Some(m.id);
         }
@@ -414,7 +413,7 @@ impl Server {
     pub(crate) fn leave_caravan(&mut self, m: &mut Mob) {
         if let Some(h) = m.mount.caravan_head.take()
             && let Some(i) = self.mob_index(h)
-            && let Some(o) = self.mobs.list[i].as_mut()
+            && let Some(o) = self.mobs.list.get_mut(i)
         {
             o.mount.caravan_tail = None;
         }

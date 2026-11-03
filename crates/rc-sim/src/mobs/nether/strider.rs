@@ -463,9 +463,9 @@ impl Server {
         let Some(kind) = steered_by(&id) else { return false };
         let wear = stick_of(kind).map_or(1, |(_, w)| w);
         let ok = self.mobs.mounts.riding.vehicle.and_then(|vid| self.mob_index(vid)).is_some_and(|i| {
-            let Some(mut v) = self.mobs.list[i].take() else { return false };
+            let Some(mut v) = self.mobs.list.take(i) else { return false };
             let ok = v.kind == kind && player_steers(self, &v) && boost(&mut v);
-            self.mobs.list[i] = Some(v);
+            self.mobs.list.put(i, v);
             ok
         });
         if !ok {

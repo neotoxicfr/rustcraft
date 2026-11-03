@@ -478,7 +478,6 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| o.kind == Kind::Piglin && o.touches(&area))
             .map(|o| o.id)
             .collect();

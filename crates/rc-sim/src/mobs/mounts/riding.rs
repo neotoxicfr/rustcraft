@@ -437,13 +437,13 @@ impl Server {
         let poses = [(0.6, 1.8), (0.6, 1.5), (0.6, 0.6)];
         let target = match self.mob_index(vid) {
             Some(i) => {
-                let mut v = self.mobs.list[i].take().expect("vehicle");
+                let mut v = self.mobs.list.take(i).expect("vehicle");
                 v.mount.passengers.retain(|p| *p != Ent::Player);
                 super::super::recent::happy_ghast::on_passenger_removed(self, &mut v);
                 let t = if v.removed { self.pos } else { self.dismount_location(&v, 0.6, &poses) };
                 // `entity_dismount` event to the former mount, emitted by the player.
                 self.game_event_at("minecraft:entity_dismount", v.pos, Some(Ent::Player));
-                self.mobs.list[i] = Some(v);
+                self.mobs.list.put(i, v);
                 t
             }
             None => self.pos,
@@ -488,10 +488,10 @@ impl Server {
                 Ent::Player => self.player_dismount_from(v),
                 Ent::Mob(id) => {
                     if let Some(i) = self.mob_index(id)
-                        && let Some(mut r) = self.mobs.list[i].take()
+                        && let Some(mut r) = self.mobs.list.take(i)
                     {
                         self.mob_dismount_from(&mut r, v);
-                        self.mobs.list[i] = Some(r);
+                        self.mobs.list.put(i, r);
                     } else {
                         v.mount.passengers.retain(|q| *q != p);
                     }
@@ -514,10 +514,10 @@ impl Server {
             return true;
         }
         if let Some(i) = self.mob_index(vid)
-            && let Some(mut v) = self.mobs.list[i].take()
+            && let Some(mut v) = self.mobs.list.take(i)
         {
             self.mob_dismount_from(m, &mut v);
-            self.mobs.list[i] = Some(v);
+            self.mobs.list.put(i, v);
         } else {
             m.mount.vehicle = None;
         }
@@ -533,16 +533,16 @@ impl Server {
                 Ent::Player => self.player_ride_tick(vid),
                 Ent::Mob(pid) => {
                     let Some(i) = self.mob_index(pid) else { continue };
-                    let Some(mut r) = self.mobs.list[i].take() else { continue };
+                    let Some(mut r) = self.mobs.list.take(i) else { continue };
                     let alive_vehicle = self.mob_ref(vid).is_some_and(|v| !v.removed);
                     if r.removed || r.mount.vehicle != Some(vid) || !alive_vehicle {
                         if let Some(vi) = self.mob_index(vid)
-                            && let Some(mut v) = self.mobs.list[vi].take()
+                            && let Some(mut v) = self.mobs.list.take(vi)
                         {
                             self.mob_dismount_from(&mut r, &mut v);
-                            self.mobs.list[vi] = Some(v);
+                            self.mobs.list.put(vi, v);
                         }
-                        self.mobs.list[i] = Some(r);
+                        self.mobs.list.put(i, r);
                         continue;
                     }
                     // Zero speed, full tick, then seat.
@@ -559,7 +559,7 @@ impl Server {
                         }
                     }
                     r.fall_distance = 0.0;
-                    self.mobs.list[i] = Some(r);
+                    self.mobs.list.put(i, r);
                     self.tick_passengers(pid);
                 }
             }
@@ -620,12 +620,12 @@ impl Server {
     pub(crate) fn mob_underwater_dismount(&mut self, m: &mut Mob) {
         let Some(vid) = m.mount.vehicle else { return };
         let Some(i) = self.mob_index(vid) else { return };
-        if !self.mobs.list[i].as_ref().is_some_and(|v| dismounts_underwater(v.kind)) {
+        if !self.mobs.list.get(i).is_some_and(|v| dismounts_underwater(v.kind)) {
             return;
         }
-        let Some(mut v) = self.mobs.list[i].take() else { return };
+        let Some(mut v) = self.mobs.list.take(i) else { return };
         self.mob_dismount_from(m, &mut v);
-        self.mobs.list[i] = Some(v);
+        self.mobs.list.put(i, v);
     }
 
     /// Mount piloted by the player: no server AI or movement; rotation taken from
@@ -670,7 +670,7 @@ impl Server {
     pub(crate) fn borrow_vehicle_nav(&mut self, rider: &mut Mob) -> Option<i32> {
         let vid = rider.mount.vehicle?;
         let i = self.mob_index(vid)?;
-        let v = self.mobs.list[i].as_mut()?;
+        let v = self.mobs.list.get_mut(i)?;
         if Self::mob_controller(v) != Some(rider.id) {
             return None;
         }
@@ -682,7 +682,7 @@ impl Server {
     pub(crate) fn return_vehicle_nav(&mut self, rider: &mut Mob, vid: Option<i32>) {
         let Some(vid) = vid else { return };
         let Some(i) = self.mob_index(vid) else { return };
-        let Some(v) = self.mobs.list[i].as_mut() else { return };
+        let Some(v) = self.mobs.list.get_mut(i) else { return };
         std::mem::swap(&mut rider.nav, &mut v.nav);
         std::mem::swap(&mut rider.move_ctl, &mut v.move_ctl);
     }
@@ -849,13 +849,13 @@ impl Server {
     pub(crate) fn mount_command(&mut self, action: i32, data: i32) {
         let Some(vid) = self.mobs.mounts.riding.vehicle else { return };
         let Some(i) = self.mob_index(vid) else { return };
-        let Some(mut v) = self.mobs.list[i].take() else { return };
+        let Some(mut v) = self.mobs.list.take(i) else { return };
         match action {
             3 if Self::player_controls(&v) && data > 0 && self.mount_can_jump(&v) => self.handle_start_jump(&mut v),
             5 => self.open_mount_menu(&mut v),
             _ => {}
         }
-        self.mobs.list[i] = Some(v);
+        self.mobs.list.put(i, v);
     }
 
     /// Mount with a commanded jump (equines, camels, nautiluses; neither strider nor pig),
@@ -905,9 +905,9 @@ impl Server {
         }
         let Some(vid) = self.mobs.mounts.riding.vehicle else { return };
         let Some(i) = self.mob_index(vid) else { return };
-        let Some(mut v) = self.mobs.list[i].take() else { return };
+        let Some(mut v) = self.mobs.list.take(i) else { return };
         if !Self::player_controls(&v) {
-            self.mobs.list[i] = Some(v);
+            self.mobs.list.put(i, v);
             return;
         }
         let to = [to[0].clamp(-3.0e7, 3.0e7), to[1].clamp(-2.0e7, 2.0e7), to[2].clamp(-3.0e7, 3.0e7)];
@@ -930,7 +930,7 @@ impl Server {
             v.yaw = super::super::mth::wrap(yaw);
             v.pitch = super::super::mth::wrap(pitch);
             self.send_vehicle_back(&v);
-            self.mobs.list[i] = Some(v);
+            self.mobs.list.put(i, v);
             return;
         }
         v.pos = to;
@@ -938,7 +938,7 @@ impl Server {
         v.pitch = super::super::mth::wrap(pitch);
         v.on_ground = on_ground;
         self.mobs.mounts.riding.last_good = v.pos;
-        self.mobs.list[i] = Some(v);
+        self.mobs.list.put(i, v);
     }
 
     /// `move_vehicle` packet (to the client): position and rotation imposed on the client.
@@ -1047,7 +1047,7 @@ impl Server {
             return;
         }
         let Some(i) = self.mobs.index_of_uuid(attach) else { return };
-        let Some(mut v) = self.mobs.list[i].take() else { return };
+        let Some(mut v) = self.mobs.list.take(i) else { return };
         self.mobs.mounts.riding.boarding_cooldown = 0;
         let was = self.sneaking;
         self.sneaking = false;
@@ -1055,7 +1055,7 @@ impl Server {
             self.player_start_riding(&mut v);
         }
         self.sneaking = was;
-        self.mobs.list[i] = Some(v);
+        self.mobs.list.put(i, v);
     }
 
     /// Departure of a LAN player (current player, already written to their file): like

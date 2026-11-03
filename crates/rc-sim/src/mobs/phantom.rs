@@ -108,17 +108,16 @@ impl Server {
                 .mobs
                 .list
                 .iter()
-                .flatten()
                 .filter(|o| o.kind == Kind::Cat && o.alive() && o.touches(&area))
                 .map(|o| o.id)
                 .collect();
             for id in &cats {
                 if let Some(i) = self.mob_index(*id) {
-                    let mut c = self.mobs.list[i].take().expect("chat");
+                    let mut c = self.mobs.list.take(i).expect("chat");
                     let hiss =
                         self.variant_sound(&c, "hiss_sound").unwrap_or_else(|| "minecraft:entity.cat.hiss".into());
                     self.make_sound(&mut c, &hiss);
-                    self.mobs.list[i] = Some(c);
+                    self.mobs.list.put(i, c);
                 }
             }
             *scared = !cats.is_empty();

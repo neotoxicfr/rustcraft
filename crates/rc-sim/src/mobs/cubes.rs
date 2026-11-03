@@ -945,20 +945,19 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| o.kind.is_cube() && !o.removed && o.touches(&area))
             .map(|o| o.id)
             .collect();
         for id in ids {
             let Some(i) = self.mob_index(id) else { continue };
-            let Some(mut m) = self.mobs.list[i].take() else { continue };
+            let Some(mut m) = self.mobs.list.take(i) else { continue };
             if m.can_deal_damage() {
                 self.cube_deal_damage(&mut m);
             }
             if m.kind == Kind::SulfurCube {
                 self.sulfur_player_push(&mut m);
             }
-            self.mobs.list[i] = Some(m);
+            self.mobs.list.put(i, m);
         }
     }
 

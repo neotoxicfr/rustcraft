@@ -582,17 +582,17 @@ impl Server {
     /// Mobs of the world left forgotten by the client (it clears its entities at `respawn`).
     pub(crate) fn forget_world_entities(&mut self, name: &str) {
         if let Some(w) = self.dims.parked.iter_mut().find(|w| w.dim.name == name) {
-            for m in w.mobs.list.iter_mut().flatten() {
+            for m in w.mobs.list.iter_mut() {
                 m.track.seen = false;
             }
         }
-        for m in self.mobs.list.iter_mut().flatten() {
+        for m in self.mobs.list.iter_mut() {
             m.track.seen = false;
         }
         // F16: the player leaves the wither bars.
         let mut bars = Vec::new();
         let parked = self.dims.parked.iter_mut().filter(|w| w.dim.name == name).flat_map(|w| w.mobs.list.iter_mut());
-        for m in parked.chain(self.mobs.list.iter_mut()).flatten() {
+        for m in parked.chain(self.mobs.list.iter_mut()) {
             if std::mem::take(&mut m.wither.bar_shown) {
                 bars.push(m.wither.bar);
             }

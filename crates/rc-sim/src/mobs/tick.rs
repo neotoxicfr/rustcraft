@@ -84,29 +84,29 @@ impl Server {
     /// Mob of slot `i`, at its rank in the entity walk. Frozen (`tick freeze`), only a mob
     /// carrying the player ticks, even through another passenger.
     pub(crate) fn mob_visit(&mut self, i: usize) {
-        let Some(mut m) = self.mobs.list.get_mut(i).and_then(Option::take) else { return };
+        let Some(mut m) = self.mobs.list.take(i) else { return };
         let frozen = !self.cmd.ticking.runs()
             && self.mobs.mounts.riding.vehicle != Some(m.id)
             && !self.carries_player(&m);
         if m.removed || frozen {
-            self.mobs.list[i] = Some(m);
+            self.mobs.list.put(i, m);
             return;
         }
         let ticking = self.entity_ticks_at(m.pos); // F15: arena ticket included
         // Back in a ticking chunk during the walk: in the list from the next walk (despawn
         // check included).
         if self.meet(&mut m.rank, ticking, crate::walk::Fam::Mob) == crate::walk::Meet::Joined {
-            self.mobs.list[i] = Some(m);
+            self.mobs.list.put(i, m);
             return;
         }
         if self.check_despawn(&mut m) {
             m.removed = true;
-            self.mobs.list[i] = Some(m);
+            self.mobs.list.put(i, m);
             return;
         }
         // F04: a passenger is ticked by its vehicle.
         if self.ticked_by_vehicle(&mut m) {
-            self.mobs.list[i] = Some(m);
+            self.mobs.list.put(i, m);
             return;
         }
         if ticking {
@@ -116,9 +116,8 @@ impl Server {
         // G6-F10: on the ground on a sculk sensor or a shrieker (effect block 0.2 under the feet).
         let step = (ticking && m.on_ground && !m.removed && !self.mobs.rec.vib_blocks.is_empty())
             .then(|| (m.support, m.pos, m.kind == Kind::Warden));
-        if let Some(slot) = self.mobs.list.get_mut(i) {
-            *slot = Some(m);
-        }
+        // Put back only if the slot still exists (otherwise the mob is dropped).
+        let _ = self.mobs.list.try_put(i, m);
         if let Some((support, pos, warden)) = step {
             let src = super::recent::vibration::Src::Living(super::mob::Ent::Mob(id));
             self.sensor_entity_on(pos, support, src, warden);
@@ -151,9 +150,9 @@ impl Server {
         let mut uuids = Vec::new(); // scoreboard: permanently removed entities
         let mut ears = Vec::new(); // vibration listeners (warden, allay) to forget
         let scored = self.cmd.scores.has_entries();
-        for slot in self.mobs.list.iter_mut() {
-            if slot.as_ref().is_some_and(|m| m.removed) {
-                let m = slot.take().expect("mob");
+        for i in 0..self.mobs.list.len() {
+            if self.mobs.list.get(i).is_some_and(|m| m.removed) {
+                let m = self.mobs.list.take(i).expect("mob");
                 if matches!(m.kind, Kind::Warden | Kind::Allay) {
                     ears.push(m.id);
                 }
@@ -182,9 +181,9 @@ impl Server {
             let _ = self.send(rc_client::Event::Entity(rc_client::EntityEvent::Remove(gone)));
         }
         for i in 0..self.mobs.list.len() {
-            let Some(mut m) = self.mobs.list[i].take() else { continue };
+            let Some(mut m) = self.mobs.list.take(i) else { continue };
             self.send_changes(&mut m);
-            self.mobs.list[i] = Some(m);
+            self.mobs.list.put(i, m);
         }
     }
 

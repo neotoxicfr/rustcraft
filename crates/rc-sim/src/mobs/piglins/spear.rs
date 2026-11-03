@@ -172,7 +172,7 @@ impl Server {
         }
         let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
         let mut cands: Vec<Ent> =
-            self.mobs.list.iter().flatten().filter(|o| o.id != m.id && o.alive()).map(|o| Ent::Mob(o.id)).collect();
+            self.mobs.list.iter().filter(|o| o.id != m.id && o.alive()).map(|o| Ent::Mob(o.id)).collect();
         if self.ent_alive(Ent::Player) && self.game_mode != 3 {
             cands.push(Ent::Player);
         }
@@ -259,13 +259,13 @@ impl Server {
                 }
                 Ent::Mob(id) => {
                     let Some(i) = self.mob_index(id) else { return false };
-                    let mut o = self.mobs.list[i].take().expect("mob");
+                    let mut o = self.mobs.list.take(i).expect("mob");
                     self.mobs.killer = Some((m.rng, m.kind, m.id, m.block_pos()));
                     let r = self.mob_hurt_by(&mut o, m, ty, dmg);
                     if let Some((rng, _, _, _)) = self.mobs.killer.take() {
                         m.rng = rng;
                     }
-                    self.mobs.list[i] = Some(o);
+                    self.mobs.list.put(i, o);
                     r
                 }
             };
@@ -284,13 +284,13 @@ impl Server {
                     Ent::Player => self.player_knockback(f64::from(power), f64::from(s), f64::from(-c)),
                     Ent::Mob(id) => {
                         if let Some(i) = self.mob_index(id) {
-                            let mut o = self.mobs.list[i].take().expect("mob");
+                            let mut o = self.mobs.list.take(i).expect("mob");
                             // Victim's own knockback (full sulfur cube: aim).
                             self.ghost_push(m);
                             let (by, eff) = (Some(Ent::Mob(m.id)), k == 1);
                             self.mob_knockback(&mut o, f64::from(power), f64::from(s), f64::from(-c), by, dmg, eff);
                             self.ghost_pop();
-                            self.mobs.list[i] = Some(o);
+                            self.mobs.list.put(i, o);
                         }
                     }
                 }

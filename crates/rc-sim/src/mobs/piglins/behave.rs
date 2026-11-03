@@ -113,12 +113,12 @@ impl Server {
     /// Mob (out of the list during its tick) and its brain.
     pub(crate) fn pig_with(&mut self, id: i32, f: impl FnOnce(&mut Server, &mut Mob, &mut Brain)) {
         let Some(i) = self.mob_index(id) else { return };
-        let Some(mut o) = self.mobs.list[i].take() else { return };
+        let Some(mut o) = self.mobs.list.take(i) else { return };
         if let Some(mut ob) = o.bm.brain.take() {
             f(self, &mut o, &mut ob);
             o.bm.brain = Some(ob);
         }
-        self.mobs.list[i] = Some(o);
+        self.mobs.list.put(i, o);
     }
 
     fn pig_visible(&self, m: &mut Mob, b: &mut Brain, e: Ent) -> bool {
@@ -640,9 +640,9 @@ impl Server {
             }
             Ent::Mob(id) => {
                 let Some(i) = self.mob_index(id) else { return false };
-                let Some(mut o) = self.mobs.list[i].take() else { return false };
+                let Some(mut o) = self.mobs.list.take(i) else { return false };
                 let r = self.mob_hurt_by(&mut o, m, ty, dmg);
-                self.mobs.list[i] = Some(o);
+                self.mobs.list.put(i, o);
                 r
             }
         };
@@ -689,7 +689,7 @@ impl Server {
             }
             Ent::Mob(id) => {
                 if let Some(i) = self.mob_index(id)
-                    && let Some(o) = self.mobs.list[i].as_mut()
+                    && let Some(o) = self.mobs.list.get_mut(i)
                 {
                     o.vel = [o.vel[0] + hx, o.vel[1] + v, o.vel[2] + hz];
                     o.track.sync_velocity = true;
@@ -766,11 +766,11 @@ impl Server {
     pub(crate) fn pig_stop_riding(&mut self, m: &mut Mob) {
         let Some(vid) = m.mount.vehicle.take() else { return };
         if let Some(i) = self.mob_index(vid)
-            && let Some(mut v) = self.mobs.list[i].take()
+            && let Some(mut v) = self.mobs.list.take(i)
         {
             v.mount.passengers.retain(|p| *p != Ent::Mob(m.id));
             self.send_passengers(&mut v);
-            self.mobs.list[i] = Some(v);
+            self.mobs.list.put(i, v);
         }
     }
 
@@ -789,11 +789,11 @@ impl Server {
             }
         }
         let Some(i) = self.mob_index(v) else { return };
-        let Some(mut veh) = self.mobs.list[i].take() else { return };
+        let Some(mut veh) = self.mobs.list.take(i) else { return };
         if self.mob_start_riding(m, &mut veh, false) {
             self.send_passengers(&mut veh);
         }
-        self.mobs.list[i] = Some(veh);
+        self.mobs.list.put(i, veh);
     }
 
     // ---------- Behaviors ----------
@@ -1419,7 +1419,7 @@ impl Server {
                 if !closer_center(d, m.pos, 3.0) || !self.is_mob_door(d) || !self.view().get_bool(self.st(d), "open") {
                     continue;
                 }
-                let others = self.mobs.list.iter().flatten().any(|o| {
+                let others = self.mobs.list.iter().any(|o| {
                     o.kind == m.kind
                         && o.id != m.id
                         && closer_center(d, o.pos, 2.0)

@@ -234,7 +234,6 @@ fn nearby_targets(s: &Server, m: &mut Mob) -> Vec<Ent> {
         .mobs
         .list
         .iter()
-        .flatten()
         .filter(|o| o.id != m.id && !o.kind.undead() && o.touches(&area))
         .map(|o| Ent::Mob(o.id))
         .collect();

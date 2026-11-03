@@ -588,7 +588,7 @@ pub fn obstruction_ok(s: &Server, m: &Mob) -> Option<bool> {
         return None;
     }
     let b = m.bbox();
-    let blocked = s.mobs.list.iter().flatten().any(|o| o.id != m.id && o.alive() && o.touches(&b))
+    let blocked = s.mobs.list.iter().any(|o| o.id != m.id && o.alive() && o.touches(&b))
         || (s.game_mode != 3 && s.player_aabb().intersects(&b));
     if blocked {
         return Some(false);

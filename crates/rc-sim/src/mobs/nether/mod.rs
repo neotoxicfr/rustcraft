@@ -442,10 +442,10 @@ pub fn on_hit(s: &mut Server, m: &Mob, t: Ent) {
         }
         Ent::Mob(id) => {
             if let Some(i) = s.mob_index(id)
-                && let Some(mut o) = s.mobs.list[i].take()
+                && let Some(mut o) = s.mobs.list.take(i)
             {
                 s.give_mob_effect(&mut o, "minecraft:wither", 200, 0);
-                s.mobs.list[i] = Some(o);
+                s.mobs.list.put(i, o);
             }
         }
     }

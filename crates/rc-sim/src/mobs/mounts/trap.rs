@@ -93,7 +93,6 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|m| m.alive() && m.touches(&col))
             .map(|m| m.block_pos())
             .filter(|b| self.can_see_sky(*b))
@@ -287,7 +286,6 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|m| m.alive() && m.touches(&area) && !b.hit.contains(&Ent::Mob(m.id)))
             .map(|m| Ent::Mob(m.id))
             .collect();
@@ -424,14 +422,14 @@ impl Server {
         let mut hit: Vec<Ent> = Vec::new();
         let n = self.mobs.list.len();
         for i in 0..n {
-            let inside = self.mobs.list[i].as_ref().is_some_and(|m| m.alive() && m.touches(&area));
+            let inside = self.mobs.list.get(i).is_some_and(|m| m.alive() && m.touches(&area));
             if !inside {
                 continue;
             }
-            let Some(mut m) = self.mobs.list[i].take() else { continue };
+            let Some(mut m) = self.mobs.list.take(i) else { continue };
             hit.push(Ent::Mob(m.id));
             super::super::surface::thunder_hit(self, &mut m, b.uuid);
-            self.mobs.list[i] = Some(m);
+            self.mobs.list.put(i, m);
         }
         if !self.life.vit.dead && self.player_aabb().intersects(&area) {
             hit.push(Ent::Player);
@@ -716,7 +714,7 @@ mod w9_tests {
         step(&mut p, 3);
         assert!(p.s.mob_ref(creeper).is_none_or(|m| m.powered), "charged creeper");
         assert!(p.s.mob_ref(pig).is_none_or(|m| m.removed), "pig converted");
-        let zp = p.s.mobs.list.iter().flatten().filter(|m| m.kind == Kind::ZombifiedPiglin).count();
+        let zp = p.s.mobs.list.iter().filter(|m| m.kind == Kind::ZombifiedPiglin).count();
         assert_eq!(zp, 1, "a zombified piglin");
         assert!(state_string(&p.s, p.s.get([210, -59, 210])).starts_with("minecraft:fire"), "fire under the lightning");
         p.s.spawn_lightning([205.5, -59.0, 205.5], false);
@@ -756,9 +754,9 @@ mod w9_tests {
         let mut c =
             crate::minecart::Cart::new(crate::minecart::CKind::Rideable, p.s.next_entity, [226.5, -59.0, 226.5]);
         let i = p.s.mob_index(carried).unwrap();
-        let mut h = p.s.mobs.list[i].take().unwrap();
+        let mut h = p.s.mobs.list.take(i).unwrap();
         assert!(p.s.cart_mob_start_riding(&mut c, &mut h), "horse not mounted in the minecart");
-        p.s.mobs.list[i] = Some(h);
+        p.s.mobs.list.put(i, h);
         p.s.cart_add(c);
         let mut seen = Vec::new();
         for (who, id, near) in [("free", free, [216.5, -59.0, 210.5]), ("minecart", carried, [226.5, -59.0, 220.5])] {
@@ -816,7 +814,7 @@ mod w9_tests {
         let z = mob(&mut p, Kind::Zombie, [222.5, -59.0, 215.5]);
         assert!(p.s.use_bed([216, -59, 210]));
         assert!(p.s.life.vit.sleeping.is_none(), "nearby zombie: no sleep");
-        p.s.mobs.list.iter_mut().flatten().filter(|m| m.id == z).for_each(|m| m.removed = true);
+        p.s.mobs.list.iter_mut().filter(|m| m.id == z).for_each(|m| m.removed = true);
         p.run("setblock 216 -58 211 minecraft:stone\n");
         assert!(p.s.use_bed([216, -59, 210]));
         assert!(p.s.life.vit.sleeping.is_none(), "obstructed bed: no sleep");
@@ -921,7 +919,6 @@ mod w9_tests {
             p.s.mobs
                 .list
                 .iter()
-                .flatten()
                 .map(|m| format!("{} {:.3} {:.3} {:.3}", m.kind.info().name, m.pos[0], m.pos[1], m.pos[2]))
                 .collect();
         lines.sort();
@@ -966,7 +963,7 @@ mod w9_tests {
         for _ in 0..200 {
             p.s.mobs.spawners.cat_next = 0;
             p.s.cat_spawner_tick();
-            if let Some(m) = p.s.mobs.list.iter().flatten().find(|m| m.kind == Kind::Cat) {
+            if let Some(m) = p.s.mobs.list.iter().find(|m| m.kind == Kind::Cat) {
                 cat = Some((m.pos, m.persistent));
                 break;
             }
@@ -995,7 +992,7 @@ mod w9_tests {
         for _ in 0..100 {
             p.s.village_siege_tick();
         }
-        let n = p.s.mobs.list.iter().flatten().filter(|m| m.kind == Kind::Zombie).count();
+        let n = p.s.mobs.list.iter().filter(|m| m.kind == Kind::Zombie).count();
         assert!((1..=20).contains(&n), "siege zombies: {n}");
         // By day, nothing.
         let before = n;
@@ -1009,7 +1006,7 @@ mod w9_tests {
         for _ in 0..100 {
             p.s.village_siege_tick();
         }
-        let after = p.s.mobs.list.iter().flatten().filter(|m| m.kind == Kind::Zombie).count();
+        let after = p.s.mobs.list.iter().filter(|m| m.kind == Kind::Zombie).count();
         assert_eq!(after, before, "no siege by day");
         finish(p, dir);
     }
@@ -1038,7 +1035,7 @@ mod w9_tests {
         // Player far away: nothing.
         p.run("player 216.5 -59 240.5 0 0\n");
         p.s.tick_block_entities();
-        let zombies = |p: &Probe| p.s.mobs.list.iter().flatten().filter(|m| m.kind == Kind::Zombie).count();
+        let zombies = |p: &Probe| p.s.mobs.list.iter().filter(|m| m.kind == Kind::Zombie).count();
         assert_eq!(zombies(&p), 0, "player at 28 blocks");
         p.run("player 216.5 -59 202.5 0 0\n");
         p.s.tick_block_entities();

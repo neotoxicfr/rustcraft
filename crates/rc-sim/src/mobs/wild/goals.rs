@@ -399,7 +399,7 @@ impl Server {
                         fox::clear_states(m);
                         if let Goal::Breed { partner: Some(p), .. } = **inner
                             && let Some(i) = self.mob_index(p)
-                            && let Some(o) = self.mobs.list[i].as_mut()
+                            && let Some(o) = self.mobs.list.get_mut(i)
                         {
                             fox::clear_states(o);
                         }

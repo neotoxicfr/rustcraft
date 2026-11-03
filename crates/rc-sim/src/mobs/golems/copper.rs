@@ -430,7 +430,6 @@ fn sensors(s: &mut Server, m: &mut Mob) {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| o.id != m.id && o.alive() && o.touches(&area))
             .map(|o| (dist2(m.pos, o.pos), Ent::Mob(o.id)))
             .collect();
@@ -823,7 +822,6 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .any(|o| o.id != m.id && o.golem.opened_chest.is_some_and(|c| set.contains(&c)));
         let player = self.life.menu.as_ref().is_some_and(|mn| mn.block.is_some_and(|b| set.contains(&b)));
         golem || player

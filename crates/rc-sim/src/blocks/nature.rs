@@ -561,7 +561,7 @@ impl Server {
             match e {
                 E::Player => self.teleport_up(dy),
                 E::Mob(i) => {
-                    if let Some(m) = self.mobs.list.iter_mut().flatten().find(|m| m.id == i) {
+                    if let Some(m) = self.mobs.list.iter_mut().find(|m| m.id == i) {
                         m.pos[1] += dy;
                         m.old = m.pos;
                         m.needs_sync = true;

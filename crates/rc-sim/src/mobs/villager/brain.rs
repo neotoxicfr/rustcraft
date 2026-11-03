@@ -608,7 +608,7 @@ impl Server {
                 && p[2] - w / 2.0 < bb.max[2] + r
         };
         let mut list: Vec<(f64, Ent)> = Vec::new();
-        for o in self.mobs.list.iter().flatten() {
+        for o in self.mobs.list.iter() {
             if o.id != m.id && o.alive() && inside(o.pos, f64::from(o.width()), f64::from(o.height())) {
                 list.push((dist2(m.pos, o.pos), Ent::Mob(o.id)));
             }

@@ -404,11 +404,11 @@ fn copper_statue_pose_and_axe() {
     assert_eq!(w.sounds(&evs, "minecraft:entity.copper_golem_become_statue"), 1);
     assert_eq!(w.comparator(at, Dir::North), 2);
     assert_eq!(w.held().map(|s| s.count), Some(1), "the block is not placed");
-    let before = w.p.s.mobs.list.iter().flatten().count();
+    let before = w.p.s.mobs.list.iter().count();
     w.hold(Some(Stack { id: "minecraft:iron_axe".into(), count: 1, components: None }));
     w.click(at, Dir::Up, [0.5, 0.875, 0.5]);
     assert_eq!(w.name(at), "minecraft:air");
-    assert_eq!(w.p.s.mobs.list.iter().flatten().count(), before + 1, "golem given back");
+    assert_eq!(w.p.s.mobs.list.iter().count(), before + 1, "golem given back");
 }
 
 /// Dragon egg: 2015 (packed difference), arrival on a non-empty block.

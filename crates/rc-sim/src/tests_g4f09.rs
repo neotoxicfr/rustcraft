@@ -69,7 +69,7 @@ impl W {
     }
 
     fn mobs_of(&self, k: Kind) -> Vec<&crate::mobs::mob::Mob> {
-        self.p.s.mobs.list.iter().flatten().filter(|m| m.kind == k && !m.removed).map(|m| &**m).collect()
+        self.p.s.mobs.list.iter().filter(|m| m.kind == k && !m.removed).collect()
     }
 
     fn cobwebs_around(&self, c: [i32; 3]) -> Vec<[i32; 3]> {

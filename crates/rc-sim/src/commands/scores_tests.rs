@@ -90,25 +90,25 @@ fn removed_entity_loses_scores_and_team_and_killed_by_team_counts() {
     assert!(run(&mut s, "team join me Sc"));
     assert!(run(&mut s, "scoreboard players set @e[type=pig] o 5"));
     assert!(run(&mut s, "team join t @e[type=pig]"));
-    let m = s.mobs.list.iter().flatten().find(|m| m.kind == crate::mobs::species::Kind::Pig).expect("pig");
+    let m = s.mobs.list.iter().find(|m| m.kind == crate::mobs::species::Kind::Pig).expect("pig");
     let (uuid, id) = (crate::nbtio::uuid_text(m.uuid), m.id);
     assert_eq!(s.cmd.scores.get(&uuid, "o"), Some(5));
     // Killed by the red team's player: the victim scores killedByTeam.red.
-    let m = s.mobs.list.iter().flatten().find(|m| m.id == id).unwrap().clone();
+    let m = s.mobs.list.iter().find(|m| m.id == id).unwrap().clone();
     s.s9_mob_died(&m, "minecraft:player_attack", None);
     assert_eq!(s.cmd.scores.get(&uuid, "k"), None, "player credit required");
-    if let Some(m) = s.mobs.list.iter_mut().flatten().find(|m| m.id == id) {
+    if let Some(m) = s.mobs.list.iter_mut().find(|m| m.id == id) {
         m.last_hurt_by_player = 100;
     }
-    let m = s.mobs.list.iter().flatten().find(|m| m.id == id).unwrap().clone();
+    let m = s.mobs.list.iter().find(|m| m.id == id).unwrap().clone();
     s.s9_mob_died(&m, "minecraft:player_attack", None);
     assert_eq!(s.cmd.scores.get(&uuid, "k"), Some(1));
     // Permanent removal: scores and team erased (before: kept).
-    if let Some(m) = s.mobs.list.iter_mut().flatten().find(|m| m.id == id) {
+    if let Some(m) = s.mobs.list.iter_mut().find(|m| m.id == id) {
         m.removed = true;
     }
     s.mobs_tick();
-    assert!(s.mobs.list.iter().flatten().all(|m| m.id != id));
+    assert!(s.mobs.list.iter().all(|m| m.id != id));
     assert_eq!(s.cmd.scores.get(&uuid, "o"), None);
     assert_eq!(s.cmd.scores.get(&uuid, "k"), None);
     assert!(s.cmd.scores.team_of(&uuid).is_none());
@@ -210,13 +210,13 @@ fn killed_by_team_copies_the_name_of_a_mob_dying_in_its_tick() {
     assert!(run(&mut s, "team add me"));
     assert!(run(&mut s, "team modify me color red"));
     assert!(run(&mut s, "team join me Sc"));
-    let i = s.mobs.list.iter().position(|m| m.as_ref().is_some_and(|m| m.kind == crate::mobs::species::Kind::Pig));
+    let i = s.mobs.list.slots().iter().position(|m| m.as_ref().is_some_and(|m| m.kind == crate::mobs::species::Kind::Pig));
     let i = i.expect("pig");
-    let mut m = s.mobs.list[i].take().unwrap();
+    let mut m = s.mobs.list.take(i).unwrap();
     m.last_hurt_by_player = 100;
     let uuid = crate::nbtio::uuid_text(m.uuid);
     s.mob_die(&mut m, "minecraft:on_fire", None);
-    s.mobs.list[i] = Some(m);
+    s.mobs.list.put(i, m);
     let sc = s.cmd.scores.score(&uuid, "k").expect("victim's score");
     assert_eq!(sc.value, 1);
     assert!(sc.display.is_some(), "victim's displayed name copied");

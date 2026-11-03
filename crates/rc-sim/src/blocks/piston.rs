@@ -413,12 +413,12 @@ impl Server {
             }
         };
         for i in 0..self.mobs.list.len() {
-            if !self.mobs.list[i].as_ref().is_some_and(|o| !o.removed && o.touches(&area)) {
+            if !self.mobs.list.get(i).is_some_and(|o| !o.removed && o.touches(&area)) {
                 continue;
             }
-            let Some(mut o) = self.mobs.list[i].take() else { continue };
+            let Some(mut o) = self.mobs.list.take(i) else { continue };
             apply(&mut MobTarget { s: self, m: &mut o });
-            self.mobs.list[i] = Some(o);
+            self.mobs.list.put(i, o);
         }
         for i in 0..self.carts.list.len() {
             if !self.carts.list[i].as_ref().is_some_and(|c| !c.removed && c.bbox().intersects(&area)) {

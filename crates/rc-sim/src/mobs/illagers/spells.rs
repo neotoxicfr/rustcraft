@@ -45,7 +45,6 @@ impl Server {
                     .mobs
                     .list
                     .iter()
-                    .flatten()
                     .filter(|o| o.kind == Kind::Vex && o.alive() && o.touches(&area) && dist2(m.pos, o.pos) <= 256.0)
                     .count() as i32;
                 m.rng.next_int_bound(8) + 1 > vexes
@@ -85,7 +84,6 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| o.kind == Kind::Sheep && o.alive() && (o.wool & 15) == 11 && o.touches(&area))
             .map(|o| o.id)
             .collect();
@@ -107,7 +105,7 @@ impl Server {
             Spell::Wololo => {
                 if let Some(id) = m.ill.wololo
                     && let Some(i) = self.mob_index(id)
-                    && let Some(o) = self.mobs.list[i].as_mut()
+                    && let Some(o) = self.mobs.list.get_mut(i)
                     && o.alive()
                 {
                     // Red (14).
@@ -125,9 +123,9 @@ impl Server {
                         }
                         Ent::Mob(id) => {
                             if let Some(i) = self.mob_index(id) {
-                                let mut o = self.mobs.list[i].take().expect("mob");
+                                let mut o = self.mobs.list.take(i).expect("mob");
                                 self.give_mob_effect(&mut o, "minecraft:blindness", 400, 0);
-                                self.mobs.list[i] = Some(o);
+                                self.mobs.list.put(i, o);
                             }
                         }
                     }
@@ -307,13 +305,13 @@ impl Server {
     fn fangs_damage(&mut self, f: &Fangs, bb: &rc_physics::Aabb) {
         let owner = f.owner.and_then(|id| self.mob_ref(id)).filter(|o| o.alive()).cloned();
         let ids: Vec<i32> =
-            self.mobs.list.iter().flatten().filter(|o| o.alive() && o.touches(bb)).map(|o| o.id).collect();
+            self.mobs.list.iter().filter(|o| o.alive() && o.touches(bb)).map(|o| o.id).collect();
         for id in ids {
             if Some(id) == f.owner {
                 continue;
             }
             let Some(i) = self.mob_index(id) else { continue };
-            let mut o = self.mobs.list[i].take().expect("mob");
+            let mut o = self.mobs.list.take(i).expect("mob");
             match &owner {
                 None => {
                     self.mob_hurt(&mut o, "minecraft:magic", 6.0, None, None);
@@ -323,13 +321,13 @@ impl Server {
                         && self.mob_hurt(&mut o, "minecraft:indirect_magic", 6.0, Some(Ent::Mob(ow.id)), Some(f.pos))
                     {
                         // G5-F04: thorns of the struck mob on the caster.
-                        self.mobs.list[i] = Some(o);
+                        self.mobs.list.put(i, o);
                         self.post_attack_by(Ent::Mob(id), Some(Ent::Mob(ow.id)), "minecraft:indirect_magic");
                         continue;
                     }
                 }
             }
-            self.mobs.list[i] = Some(o);
+            self.mobs.list.put(i, o);
         }
         if self.game_mode != 3 && self.ent_alive(Ent::Player) && self.player_aabb().intersects(bb) {
             match &owner {

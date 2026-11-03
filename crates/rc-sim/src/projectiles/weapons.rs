@@ -691,13 +691,13 @@ impl Server {
             return;
         }
         let b = self.player_aabb();
-        let hit = self.mobs.list.iter().flatten().find(|m| m.alive() && m.touches(&b)).map(|m| m.id);
+        let hit = self.mobs.list.iter().find(|m| m.alive() && m.touches(&b)).map(|m| m.id);
         if let Some(id) = hit {
             if let Some(i) = self.mob_index(id)
-                && let Some(mut m) = self.mobs.list[i].take()
+                && let Some(mut m) = self.mobs.list.take(i)
             {
                 self.player_attack_mob(&mut m);
-                self.mobs.list[i] = Some(m);
+                self.mobs.list.put(i, m);
             }
             self.proj_player.spin = 0;
             self.mobs.player_vel = self.mobs.player_vel.map(|v| v * -0.2);

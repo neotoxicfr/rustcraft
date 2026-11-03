@@ -335,9 +335,9 @@ pub fn sting(s: &mut Server, m: &mut Mob, t: Ent) -> bool {
         }
         Ent::Mob(id) => {
             let Some(i) = s.mob_index(id) else { return false };
-            let Some(mut o) = s.mobs.list[i].take() else { return false };
+            let Some(mut o) = s.mobs.list.take(i) else { return false };
             let r = s.mob_hurt_by(&mut o, m, ty, dmg);
-            s.mobs.list[i] = Some(o);
+            s.mobs.list.put(i, o);
             r
         }
     };
@@ -359,7 +359,7 @@ pub fn sting(s: &mut Server, m: &mut Mob, t: Ent) -> bool {
             }
             Ent::Mob(id) => {
                 if let Some(i) = s.mob_index(id)
-                    && let Some(mut o) = s.mobs.list[i].take()
+                    && let Some(mut o) = s.mobs.list.take(i)
                 {
                     let n = match o.get(13) {
                         Some(rc_proto_v777::entity::Meta::Int(n)) => *n,
@@ -369,7 +369,7 @@ pub fn sting(s: &mut Server, m: &mut Mob, t: Ent) -> bool {
                     if poison > 0 {
                         s.give_mob_effect(&mut o, "minecraft:poison", poison * 20, 0);
                     }
-                    s.mobs.list[i] = Some(o);
+                    s.mobs.list.put(i, o);
                 }
             }
         }

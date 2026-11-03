@@ -75,7 +75,7 @@ impl Server {
     /// Menu contents copied onto the mount (saddle and armor placement sounds included).
     pub(crate) fn mount_menu_back(&mut self, entity: i32, own: &[Option<crate::player::Stack>]) {
         let Some(i) = self.mob_index(entity) else { return };
-        let Some(mut m) = self.mobs.list[i].take() else { return };
+        let Some(mut m) = self.mobs.list.take(i) else { return };
         if let Some(s) = own.first() {
             if s.is_some() && m.equipment[SADDLE].is_none() {
                 m.drop_chance[SADDLE] = 2.0;
@@ -92,7 +92,7 @@ impl Server {
         for k in 0..n {
             m.mount.inventory[k] = own.get(2 + k).cloned().flatten();
         }
-        self.mobs.list[i] = Some(m);
+        self.mobs.list.put(i, m);
     }
 
     /// Validity of the mount menu: animal alive, within interaction range + 4,

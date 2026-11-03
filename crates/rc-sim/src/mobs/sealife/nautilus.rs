@@ -436,7 +436,6 @@ impl Server {
                 .mobs
                 .list
                 .iter()
-                .flatten()
                 .filter(|o| o.id != m.id && o.alive() && o.touches(&area))
                 .map(|o| (dist2(m.pos, o.pos), Ent::Mob(o.id)))
                 .collect();
@@ -717,7 +716,7 @@ impl Server {
                     self.nautilus_breed(m, pid);
                     b.breed = None;
                     if let Some(i) = self.mob_index(pid)
-                        && let Some(o) = self.mobs.list[i].as_mut()
+                        && let Some(o) = self.mobs.list.get_mut(i)
                         && let Some(ob) = o.sea.brain.as_mut()
                     {
                         ob.breed = None;
@@ -791,7 +790,7 @@ impl Server {
         let bb = m.bbox();
         let mut hit: Option<Ent> = None;
         let ids: Vec<i32> =
-            self.mobs.list.iter().flatten().filter(|o| o.touches(&bb) && o.alive()).map(|o| o.id).collect();
+            self.mobs.list.iter().filter(|o| o.touches(&bb) && o.alive()).map(|o| o.id).collect();
         for id in ids {
             if self.targeting_ok(m, Ent::Mob(id), true, 0.0, false, false) {
                 hit = Some(Ent::Mob(id));
@@ -820,7 +819,7 @@ impl Server {
             }
             Ent::Mob(id) => {
                 if let Some(i) = self.mob_index(id)
-                    && let Some(mut o) = self.mobs.list[i].take()
+                    && let Some(mut o) = self.mobs.list.take(i)
                 {
                     let hurt = self.mob_hurt_by(&mut o, m, "minecraft:mob_attack", dmg);
                     // G5-F04: the struck mob's thorns, brain put back like for the player's.
@@ -838,7 +837,7 @@ impl Server {
                             *b = *back;
                         }
                     }
-                    self.mobs.list[i] = Some(o);
+                    self.mobs.list.put(i, o);
                 }
             }
         }
@@ -850,14 +849,14 @@ impl Server {
             Ent::Player => self.player_knockback(f64::from(factor), f64::from(sn), f64::from(-cs)),
             Ent::Mob(id) => {
                 if let Some(i) = self.mob_index(id)
-                    && let Some(mut o) = self.mobs.list[i].take()
+                    && let Some(mut o) = self.mobs.list.take(i)
                 {
                     // Victim's own knockback (full sulfur cube: attacker's aim).
                     self.ghost_push(m);
                     let by = Some(Ent::Mob(m.id));
                     self.mob_knockback(&mut o, f64::from(factor), f64::from(sn), f64::from(-cs), by, dmg, false);
                     self.ghost_pop();
-                    self.mobs.list[i] = Some(o);
+                    self.mobs.list.put(i, o);
                 }
             }
         }
@@ -871,7 +870,7 @@ impl Server {
         b.walk = Some(WalkTarget { target: Track::Ent(Ent::Mob(pid), true), speed: 0.4, close: 2 });
         let me = m.id;
         if let Some(i) = self.mob_index(pid)
-            && let Some(o) = self.mobs.list[i].as_mut()
+            && let Some(o) = self.mobs.list.get_mut(i)
             && let Some(ob) = o.sea.brain.as_mut()
         {
             ob.breed = Some(me);
@@ -928,7 +927,7 @@ impl Server {
         self.s9_bred(m, partner, Some(&baby));
         m.age = 6000;
         m.reset_love();
-        if let Some(p) = self.mobs.list[pi].as_mut() {
+        if let Some(p) = self.mobs.list.get_mut(pi) {
             p.age = 6000;
             p.reset_love();
         }

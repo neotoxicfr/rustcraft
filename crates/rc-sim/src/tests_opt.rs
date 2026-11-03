@@ -802,7 +802,7 @@ fn bench_crowd() {
         // Gain bound of a "one lookup instead of 3-4" view: reads by id
         // per tick × measured cost of a read in this world (the gain cannot exceed that).
         let per_tick = (lookups() - l0) as f64 / d.len() as f64;
-        let ids: Vec<i32> = s.mobs.list.iter().flatten().map(|m| m.id).collect();
+        let ids: Vec<i32> = s.mobs.list.iter().map(|m| m.id).collect();
         let reps = 1_000_000 / ids.len().max(1) + 1;
         let t = std::time::Instant::now();
         let mut acc = 0.0;
@@ -1125,7 +1125,7 @@ mod loading {
         }
         seen.state = total(&out);
         let mut uu = HashSet::new();
-        for w in std::iter::once(&s.mobs.list).chain(s.dims.parked.iter().map(|w| &w.mobs.list)) {
+        for w in std::iter::once(s.mobs.list.slots()).chain(s.dims.parked.iter().map(|w| w.mobs.list.slots())) {
             seen.twice.extend(w.iter().flatten().map(|m| m.uuid).filter(|u| !uu.insert(*u)));
         }
         s.stop_gen();

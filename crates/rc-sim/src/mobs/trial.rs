@@ -667,11 +667,11 @@ impl Server {
             let Some(i) = self.mobs.index_of_uuid(u) else {
                 continue;
             };
-            let Some(mut m) = self.mobs.list[i].take() else { continue };
+            let Some(mut m) = self.mobs.list.take(i) else { continue };
             self.level_event(3012, m.block_pos(), 0);
             self.drop_preserved_equipment(&mut m);
             m.removed = true;
-            self.mobs.list[i] = Some(m);
+            self.mobs.list.put(i, m);
         }
         if !ctx.ominous_cfg.potentials.is_empty() {
             t.spawn_data = None;
@@ -1555,7 +1555,7 @@ mod tests {
     }
 
     fn zombies(p: &Probe) -> Vec<u128> {
-        p.s.mobs.list.iter().flatten().filter(|m| m.kind == Kind::Zombie && !m.removed).map(|m| m.uuid).collect()
+        p.s.mobs.list.iter().filter(|m| m.kind == Kind::Zombie && !m.removed).map(|m| m.uuid).collect()
     }
 
     fn trial_with_zombies(p: &mut Probe) {
@@ -1607,10 +1607,10 @@ mod tests {
             }
         }
         let first = first.expect("first zombie (broad daylight: light ignored)");
-        assert!(p.s.mobs.list.iter().flatten().any(|m| m.uuid == first && m.persistent));
+        assert!(p.s.mobs.list.iter().any(|m| m.uuid == first && m.persistent));
         run(&mut p, 60);
         assert_eq!(zombies(&p).len(), 1, "only one at a time");
-        for m in p.s.mobs.list.iter_mut().flatten() {
+        for m in p.s.mobs.list.iter_mut() {
             if m.uuid == first {
                 m.removed = true;
             }
@@ -1626,7 +1626,7 @@ mod tests {
         let second = second.expect("second zombie");
         assert_ne!(second, first);
         assert_eq!(nbtio::int(p.s.be_get(AT).unwrap(), "total_mobs_spawned"), Some(2));
-        for m in p.s.mobs.list.iter_mut().flatten() {
+        for m in p.s.mobs.list.iter_mut() {
             if m.uuid == second {
                 m.removed = true;
             }

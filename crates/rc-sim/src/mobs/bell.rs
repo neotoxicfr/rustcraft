@@ -45,7 +45,7 @@ impl Server {
                 max: [f64::from(p[0]) + 49.0, f64::from(p[1]) + 49.0, f64::from(p[2]) + 49.0],
             };
             let mut list: Vec<Ent> =
-                self.mobs.list.iter().flatten().filter(|m| m.touches(&area)).map(|m| Ent::Mob(m.id)).collect();
+                self.mobs.list.iter().filter(|m| m.touches(&area)).map(|m| Ent::Mob(m.id)).collect();
             if self.ent_bbox(Ent::Player).is_some_and(|bb| bb.intersects(&area)) {
                 list.push(Ent::Player);
             }
@@ -109,9 +109,9 @@ impl Server {
                         && let Ent::Mob(id) = e
                         && let Some(k) = self.mob_index(id)
                     {
-                        let mut m = self.mobs.list[k].take().expect("mob");
+                        let mut m = self.mobs.list.take(k).expect("mob");
                         self.give_mob_effect(&mut m, "minecraft:glowing", 60, 0);
-                        self.mobs.list[k] = Some(m);
+                        self.mobs.list.put(k, m);
                     }
                 }
                 b.resonating = false;

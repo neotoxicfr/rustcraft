@@ -164,7 +164,6 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| Ent::Mob(o.id) != attacker && Ent::Mob(o.id) != t.ent && o.touches(&area) && near(o.pos))
             .filter(|o| !(o.tame && o.owner == Some(t.uuid) && crate::mobs::species::tamable(o.kind)))
             .filter(|o| {

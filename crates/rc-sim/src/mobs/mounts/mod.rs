@@ -812,14 +812,14 @@ impl Server {
             }
             if let Ent::Mob(id) = p
                 && let Some(i) = self.mob_index(id)
-                && let Some(mut o) = self.mobs.list[i].take()
+                && let Some(mut o) = self.mobs.list.take(i)
             {
                 let safe = o.attrs.safe_fall.value();
                 let dmg = ((dist + 1.0e-6 - safe) * mult * o.attrs.fall_mult.value()).floor() as i32;
                 if dmg > 0 && !o.kind.info().fall_immune {
                     self.mob_hurt(&mut o, ty, dmg as f32, None, None);
                 }
-                self.mobs.list[i] = Some(o);
+                self.mobs.list.put(i, o);
             }
         }
     }
@@ -976,7 +976,7 @@ fn follow_mommy(s: &mut Server, m: &mut Mob) {
     let bb = m.bbox();
     let area = rc_physics::Aabb { min: bb.min.map(|v| v - 16.0), max: bb.max.map(|v| v + 16.0) };
     let mut best: Option<(f64, [f64; 3])> = None;
-    for o in s.mobs.list.iter().flatten() {
+    for o in s.mobs.list.iter() {
         if o.id == m.id || !handles(o.kind) || !o.mount.flag(FLAG_BRED) || !o.alive() {
             continue;
         }

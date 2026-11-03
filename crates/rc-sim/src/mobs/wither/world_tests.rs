@@ -39,7 +39,7 @@ fn name_at(p: &Probe, at: [i32; 3]) -> String {
 }
 
 fn withers(p: &Probe) -> Vec<i32> {
-    p.s.mobs.list.iter().flatten().filter(|m| m.kind == Kind::Wither && !m.removed).map(|m| m.id).collect()
+    p.s.mobs.list.iter().filter(|m| m.kind == Kind::Wither && !m.removed).map(|m| m.id).collect()
 }
 
 /// Soul sand T (x axis) at 209..211, skulls placed one by one: the last one summons the wither
@@ -123,7 +123,7 @@ fn wither_skulls_wither_the_player() {
     for (id, t) in trace.iter().take(6) {
         eprintln!("skull {id}: {t:?}");
     }
-    if let Some(w) = p.s.mobs.list.iter().flatten().find(|m| m.kind == Kind::Wither) {
+    if let Some(w) = p.s.mobs.list.iter().find(|m| m.kind == Kind::Wither) {
         eprintln!("wither {:?} target {:?} heads {:?}", w.pos, w.target, w.wither.targets);
     }
     assert!(seen >= 1, "no skull");
@@ -192,13 +192,13 @@ fn wither_star_and_rose() {
     assert!(pig.dead);
     assert_eq!(name_at(&p, [212, -59, 212]), "minecraft:wither_rose");
     let i = p.s.mob_index(wid).unwrap();
-    let mut w = p.s.mobs.list[i].take().unwrap();
+    let mut w = p.s.mobs.list.take(i).unwrap();
     w.last_hurt_by_player = 100;
     p.s.mob_hurt(&mut w, "minecraft:player_attack", 1000.0, Some(Ent::Player), None);
     assert!(w.dead);
     let star = p.s.life.drops.iter().find(|d| d.stack.id == "minecraft:nether_star").expect("Nether star");
     assert_eq!(star.age, -6000);
-    p.s.mobs.list[i] = Some(w);
+    p.s.mobs.list.put(i, w);
     drop(p);
     let _ = std::fs::remove_dir_all(&dir);
 }

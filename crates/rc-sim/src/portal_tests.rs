@@ -662,10 +662,10 @@ fn arrows_tnt_and_mobs_pass_nether_portal_but_not_wither() {
     let nether = parked_world(&s, NETHER);
     // Pig passed; wither stayed (false). Checked first: a passed wither
     // would wait for the arrow at arrival (shared exit portal) and stop it.
-    assert!(nether.mobs.list.iter().flatten().any(|m| m.kind == Kind::Pig), "pig passed");
-    assert!(s.mobs.list.iter().flatten().all(|m| m.id != pig_id));
-    assert!(s.mobs.list.iter().flatten().any(|m| m.id == wither_id), "wither stayed");
-    assert!(nether.mobs.list.iter().flatten().all(|m| m.kind != Kind::Wither));
+    assert!(nether.mobs.list.iter().any(|m| m.kind == Kind::Pig), "pig passed");
+    assert!(s.mobs.list.iter().all(|m| m.id != pig_id));
+    assert!(s.mobs.list.iter().any(|m| m.id == wither_id), "wither stayed");
+    assert!(nether.mobs.list.iter().all(|m| m.kind != Kind::Wither));
     assert!(arrow_seen, "arrow passed into the Nether");
     // TNT: passed with the "portal used" flag, nothing left on the surface.
     let tnt = |e: &&crate::blocks::entities::SimEntity| matches!(e.kind, crate::blocks::entities::EntKind::Tnt(_));

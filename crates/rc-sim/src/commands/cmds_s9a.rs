@@ -467,12 +467,12 @@ impl Server {
                 (E::Player, _) => self.player_stop_riding(),
                 (E::Mob(r), E::Mob(vid)) => {
                     if let (Some(ri), Some(vi)) = (self.mob_index(r), self.mob_index(vid))
-                        && let (Some(mut rider), Some(mut veh)) = (self.mobs.list[ri].take(), self.mobs.list[vi].take())
+                        && let (Some(mut rider), Some(mut veh)) = (self.mobs.list.take(ri), self.mobs.list.take(vi))
                     {
                         self.mob_dismount_from(&mut rider, &mut veh);
                         self.send_passengers(&mut veh);
-                        self.mobs.list[ri] = Some(rider);
-                        self.mobs.list[vi] = Some(veh);
+                        self.mobs.list.put(ri, rider);
+                        self.mobs.list.put(vi, veh);
                     }
                 }
                 _ => {}
@@ -516,7 +516,7 @@ impl Server {
         let Some(vi) = self.mob_index(vid) else {
             return Err(generic(self));
         };
-        let Some(mut veh) = self.mobs.list[vi].take() else {
+        let Some(mut veh) = self.mobs.list.take(vi) else {
             return Err(generic(self));
         };
         let ok = match target {
@@ -531,11 +531,11 @@ impl Server {
                 self.last_good = seat;
                 true
             }
-            E::Mob(r) => match self.mob_index(r).and_then(|ri| self.mobs.list[ri].take().map(|m| (ri, m))) {
+            E::Mob(r) => match self.mob_index(r).and_then(|ri| self.mobs.list.take(ri).map(|m| (ri, m))) {
                 Some((ri, mut rider)) => {
                     let ok = self.mob_start_riding(&mut rider, &mut veh, true);
                     rider.needs_sync = true;
-                    self.mobs.list[ri] = Some(rider);
+                    self.mobs.list.put(ri, rider);
                     ok
                 }
                 None => false,
@@ -545,7 +545,7 @@ impl Server {
         if ok {
             self.send_passengers(&mut veh);
         }
-        self.mobs.list[vi] = Some(veh);
+        self.mobs.list.put(vi, veh);
         if !ok {
             return Err(generic(self));
         }

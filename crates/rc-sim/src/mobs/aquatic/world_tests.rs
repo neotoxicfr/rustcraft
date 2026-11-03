@@ -102,10 +102,10 @@ fn guardian_swim_path_stays_in_water() {
     p.run("fill 200 -59 200 231 -53 231 minecraft:water\nfill 210 -59 214 212 -53 218 minecraft:stone\n");
     let g = spawn(&mut p, Kind::Guardian, [206.5, -57.0, 216.5]);
     let i = p.s.mob_index(g).unwrap();
-    let mut m = p.s.mobs.list[i].take().unwrap();
+    let mut m = p.s.mobs.list.take(i).unwrap();
     m.in_water = true;
     let path = p.s.create_path(&mut m, [214, -57, 216], 1).expect("swim path");
-    p.s.mobs.list[i] = Some(m);
+    p.s.mobs.list.put(i, m);
     eprintln!("nodes {:?}", path.nodes.iter().map(|n| n.0).collect::<Vec<_>>());
     assert!(path.reached, "target not reached");
     for (n, _) in &path.nodes {
@@ -125,7 +125,7 @@ fn elder_guardian_mining_fatigue() {
     let e = spawn(&mut p, Kind::ElderGuardian, [210.5, -58.0, 216.5]);
     // Next multiple of 1200 in a few ticks.
     if let Some(i) = p.s.mob_index(e)
-        && let Some(m) = p.s.mobs.list[i].as_deref_mut()
+        && let Some(m) = p.s.mobs.list.get_mut(i)
     {
         m.tick_count = 1200 - m.id - 3;
     }
@@ -175,7 +175,7 @@ fn drowned_goes_to_water_by_day() {
     p.run("fill 214 -59 210 222 -57 222 minecraft:water\nplayer 230.5 -59 230.5 0 0\n");
     let d = spawn(&mut p, Kind::Drowned, [206.5, -59.0, 216.5]);
     if let Some(i) = p.s.mob_index(d)
-        && let Some(m) = p.s.mobs.list[i].as_deref_mut()
+        && let Some(m) = p.s.mobs.list.get_mut(i)
     {
         // Helmet: no burning in sunlight during the test.
         m.equipment[5] =
@@ -203,7 +203,7 @@ fn drowned_throws_trident() {
     p.run("player 216.5 -59 216.5 90 0\n");
     let d = spawn(&mut p, Kind::Drowned, [208.5, -59.0, 216.5]);
     if let Some(i) = p.s.mob_index(d)
-        && let Some(m) = p.s.mobs.list[i].as_deref_mut()
+        && let Some(m) = p.s.mobs.list.get_mut(i)
     {
         m.equipment[0] = Some(crate::player::Stack { id: "minecraft:trident".into(), count: 1, components: None });
     }
@@ -248,7 +248,7 @@ fn zombie_converts_to_drowned() {
             break;
         }
     }
-    let drowned = p.s.mobs.list.iter().flatten().filter(|m| m.kind == Kind::Drowned).count();
+    let drowned = p.s.mobs.list.iter().filter(|m| m.kind == Kind::Drowned).count();
     eprintln!("conversion started {started:?}, drowned {drowned}");
     assert!(started.is_some_and(|t| (595..=605).contains(&t)), "conversion started at {started:?}");
     assert_eq!(drowned, 1, "zombie not converted into a drowned");
@@ -306,7 +306,7 @@ fn aquatic_saved_and_reloaded() {
     p.run("fill 200 -59 200 231 -53 231 minecraft:water\n");
     let d = spawn(&mut p, Kind::Drowned, [210.5, -59.0, 210.5]);
     if let Some(i) = p.s.mob_index(d)
-        && let Some(m) = p.s.mobs.list[i].as_deref_mut()
+        && let Some(m) = p.s.mobs.list.get_mut(i)
     {
         m.baby = true;
         m.equipment[0] = Some(crate::player::Stack { id: "minecraft:trident".into(), count: 1, components: None });
@@ -317,7 +317,7 @@ fn aquatic_saved_and_reloaded() {
     }
     let e = spawn(&mut p, Kind::ElderGuardian, [212.5, -58.0, 210.5]);
     if let Some(i) = p.s.mob_index(e)
-        && let Some(m) = p.s.mobs.list[i].as_deref_mut()
+        && let Some(m) = p.s.mobs.list.get_mut(i)
     {
         m.aqua.home = Some(([212, -58, 210], 16));
         m.no_ai = true;
@@ -371,14 +371,14 @@ fn prep_aquatic_world() {
         let d2 = spawn(&mut p, Kind::Drowned, [208.5, -59.0, 212.0]);
         for id in [d, d2] {
             if let Some(i) = p.s.mob_index(id)
-                && let Some(m) = p.s.mobs.list[i].as_deref_mut()
+                && let Some(m) = p.s.mobs.list.get_mut(i)
             {
                 m.equipment[0] =
                     Some(crate::player::Stack { id: "minecraft:trident".into(), count: 1, components: None });
             }
         }
         let _ = (g, e);
-        for m in p.s.mobs.list.iter_mut().flatten() {
+        for m in p.s.mobs.list.iter_mut() {
             m.yaw = 90.0;
             m.body_yaw = 90.0;
             m.head_yaw = 90.0;
@@ -419,7 +419,7 @@ fn loyalty_trident_returns_to_owner() {
     p.run("player 202.5 -59 202.5 0 0\n");
     let d = spawn(&mut p, Kind::Drowned, [208.5, -59.0, 216.5]);
     if let Some(i) = p.s.mob_index(d)
-        && let Some(m) = p.s.mobs.list[i].as_deref_mut()
+        && let Some(m) = p.s.mobs.list.get_mut(i)
     {
         m.no_ai = true;
         m.persistent = true;
@@ -448,7 +448,7 @@ fn plain_trident_stays_planted() {
     p.run("player 202.5 -59 202.5 0 0\n");
     let d = spawn(&mut p, Kind::Drowned, [208.5, -59.0, 216.5]);
     if let Some(i) = p.s.mob_index(d)
-        && let Some(m) = p.s.mobs.list[i].as_deref_mut()
+        && let Some(m) = p.s.mobs.list.get_mut(i)
     {
         m.no_ai = true;
         m.persistent = true;
@@ -476,7 +476,7 @@ fn zombie_and_drowned_crush_turtle_eggs() {
         p.s.game_mode = 1;
         let z = spawn(&mut p, k, [210.5, -59.0, 216.5]);
         if let Some(i) = p.s.mob_index(z)
-            && let Some(m) = p.s.mobs.list[i].as_deref_mut()
+            && let Some(m) = p.s.mobs.list.get_mut(i)
         {
             m.persistent = true;
         }

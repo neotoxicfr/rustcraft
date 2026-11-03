@@ -418,7 +418,6 @@ fn spectator_action_sets_the_camera() {
         t.s.mobs
             .list
             .iter()
-            .flatten()
             .find(|m| m.kind == crate::mobs::species::Kind::Pig)
             .map(|m| m.id)
             .expect("pig");

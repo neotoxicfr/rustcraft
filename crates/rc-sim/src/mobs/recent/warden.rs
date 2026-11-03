@@ -645,7 +645,7 @@ pub fn sonic_tick(s: &mut Server, m: &mut Mob, b: &mut Brain) {
         }
         Ent::Mob(id) => {
             let Some(i) = s.mob_index(id) else { return };
-            let Some(mut o) = s.mobs.list[i].take() else { return };
+            let Some(mut o) = s.mobs.list.take(i) else { return };
             let r = s.mob_hurt_by(&mut o, m, "minecraft:sonic_boom", 10.0);
             if r {
                 let res = o.attrs.knockback_resistance.value();
@@ -653,7 +653,7 @@ pub fn sonic_tick(s: &mut Server, m: &mut Mob, b: &mut Brain) {
                 o.vel = [o.vel[0] + n[0] * kh, o.vel[1] + n[1] * kv, o.vel[2] + n[2] * kh];
                 o.needs_sync = true;
             }
-            s.mobs.list[i] = Some(o);
+            s.mobs.list.put(i, o);
             return;
         }
     };

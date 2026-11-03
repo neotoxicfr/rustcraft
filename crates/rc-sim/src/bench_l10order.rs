@@ -43,7 +43,7 @@ fn scene(tag: &str, family_of: impl Fn(usize) -> usize) {
     let count = p.s.life.drops.len()
         + p.s.bs.entities.list.len()
         + p.s.life.orbs.len()
-        + p.s.mobs.list.iter().flatten().count()
+        + p.s.mobs.list.iter().count()
         + p.s.proj.list.len()
         + p.s.carts.list.len();
     let ticks = 400;

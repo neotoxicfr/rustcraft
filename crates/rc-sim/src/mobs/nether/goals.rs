@@ -115,7 +115,7 @@ impl Server {
                 };
                 let eye = [m.pos[0], m.eye_y(), m.pos[2]];
                 let mut best: Option<(f64, i32)> = None;
-                for o in self.mobs.list.iter().flatten() {
+                for o in self.mobs.list.iter() {
                     if o.kind != Kind::Strider || o.id == m.id || !o.alive() || !o.touches(&area) {
                         continue;
                     }

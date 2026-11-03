@@ -62,7 +62,7 @@ impl Server {
             out.push(E::Player);
         }
         let mut rest: Vec<E> = Vec::new();
-        rest.extend(self.mobs.list.iter().flatten().filter(|m| m.alive()).map(|m| E::Mob(m.id)));
+        rest.extend(self.mobs.list.iter().filter(|m| m.alive()).map(|m| E::Mob(m.id)));
         rest.extend(self.life.drops.iter().map(|d| E::Item(d.id)));
         rest.extend(self.life.orbs.iter().map(|o| E::Orb(o.id)));
         for l in self.entities.values() {
@@ -305,7 +305,7 @@ impl Server {
             }
             E::Mob(i) => {
                 if let Some(idx) = self.mobs.index_of(i)
-                    && let Some(mut m) = self.mobs.list[idx].take()
+                    && let Some(mut m) = self.mobs.list.take(idx)
                 {
                     let before = m.pos;
                     // Reading back keeps the entity's UUID (a provided `UUID` is ignored).
@@ -316,7 +316,7 @@ impl Server {
                         m.needs_sync = true;
                     }
                     m.sync_data();
-                    self.mobs.list[idx] = Some(m);
+                    self.mobs.list.put(idx, m);
                 }
             }
             E::Item(i) => {
@@ -719,10 +719,10 @@ impl Server {
             }
             E::Mob(i) => {
                 if let Some(idx) = self.mobs.index_of(i)
-                    && let Some(mut m) = self.mobs.list[idx].take()
+                    && let Some(mut m) = self.mobs.list.take(idx)
                 {
                     self.mob_hurt(&mut m, "minecraft:generic_kill", f32::MAX, None, None);
-                    self.mobs.list[idx] = Some(m);
+                    self.mobs.list.put(idx, m);
                 }
             }
             // During the entity walk (a command block minecart's command) the lists keep their
@@ -829,7 +829,7 @@ impl Server {
 impl crate::mobs::Mobs {
     /// Mob from its network identifier.
     pub fn mob_ref_any(&self, id: i32) -> Option<&crate::mobs::mob::Mob> {
-        self.list.iter().flatten().find(|m| m.id == id).map(|b| &**b)
+        self.list.iter().find(|m| m.id == id)
     }
 }
 

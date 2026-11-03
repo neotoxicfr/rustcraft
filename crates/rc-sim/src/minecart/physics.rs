@@ -886,21 +886,20 @@ impl Server {
                 .mobs
                 .list
                 .iter()
-                .flatten()
                 .filter(|m| m.alive() && m.touches(&hit) && !c.passengers.contains(&Ent::Mob(m.id)))
                 .filter(|m| self.mob_pushable(m))
                 .map(|m| m.id)
                 .collect();
             for id in ids {
                 let Some(i) = self.mob_index(id) else { continue };
-                let Some(mut m) = self.mobs.list[i].take() else { continue };
+                let Some(mut m) = self.mobs.list.take(i) else { continue };
                 let golem = m.kind == crate::mobs::species::Kind::IronGolem;
                 if !golem && !c.is_vehicle() && m.mount.vehicle.is_none() {
                     self.cart_mob_start_riding(c, &mut m);
                 } else {
                     self.cart_push_mob(c, &mut m);
                 }
-                self.mobs.list[i] = Some(m);
+                self.mobs.list.put(i, m);
             }
             // The player is pushed (never boarded).
             if self.cart_player_pushable(c) && self.player_aabb().intersects(&hit) {

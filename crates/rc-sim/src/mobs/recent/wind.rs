@@ -213,7 +213,7 @@ impl Server {
         // 2. Entities: knockback only (kind multiplier; the player flying in creative
         //    receives none).
         let double = f64::from(radius * 2.0);
-        let ids: Vec<i32> = self.mobs.list.iter().flatten().map(|o| o.id).collect();
+        let ids: Vec<i32> = self.mobs.list.iter().map(|o| o.id).collect();
         for id in ids {
             let t = Ent::Mob(id);
             let (Some(pos), Some(eye), Some(bb)) = (self.ent_pos(t), self.ent_eye(t), self.ent_bbox(t)) else {

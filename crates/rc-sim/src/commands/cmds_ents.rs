@@ -303,9 +303,9 @@ impl Server {
             inst.visible = ef.particles;
             inst.icon = ef.icon;
             let Some(k) = self.mob_index(i) else { return false };
-            let Some(mut m) = self.mobs.list[k].take() else { return false };
+            let Some(mut m) = self.mobs.list.take(k) else { return false };
             let r = self.add_mob_effect(&mut m, inst);
-            self.mobs.list[k] = Some(m);
+            self.mobs.list.put(k, m);
             return r;
         }
         let id = self.ent_id(e);
@@ -351,12 +351,12 @@ impl Server {
         }
         if let E::Mob(i) = e {
             let Some(k) = self.mob_index(i) else { return false };
-            let Some(mut m) = self.mobs.list[k].take() else { return false };
+            let Some(mut m) = self.mobs.list.take(k) else { return false };
             let r = match which {
                 Some(w) => self.remove_mob_effect(&mut m, w),
                 None => self.clear_mob_effects(&mut m),
             };
-            self.mobs.list[k] = Some(m);
+            self.mobs.list.put(k, m);
             return r;
         }
         let id = self.ent_id(e);
@@ -561,7 +561,7 @@ impl Server {
         };
         let take = |s: &mut Self, i: i32| {
             let k = s.mobs.index_of(i)?;
-            s.mobs.list[k].take().map(|m| (k, m))
+            s.mobs.list.take(k).map(|m| (k, m))
         };
         match e {
             E::Player => {
@@ -570,7 +570,7 @@ impl Server {
                     && let Some((k, m)) = take(self, i)
                 {
                     let r = self.player_hurt_by_mob(&m, ty, amount, Some(dir));
-                    self.mobs.list[k] = Some(m);
+                    self.mobs.list.put(k, m);
                     return r;
                 }
                 let full = self.life.vit.cooldown <= 10 || self.dmg_tag(ty, "minecraft:bypasses_cooldown");
@@ -585,7 +585,7 @@ impl Server {
                 self.mobs.rec.direct_source = by.map(|_| direct == causing);
                 let r = self.mob_hurt(&mut m, ty, amount, by, src);
                 self.mobs.rec.direct_source = None;
-                self.mobs.list[k] = Some(m);
+                self.mobs.list.put(k, m);
                 r
             }
             E::Item(i) => self.item_hurt(i, ty, amount, matches!(causing, Some(E::Mob(_)))),

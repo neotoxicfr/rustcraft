@@ -175,7 +175,6 @@ impl Server {
                         .mobs
                         .list
                         .iter()
-                        .flatten()
                         .filter(|o| {
                             o.id != m.id
                                 && o.alive()
@@ -485,7 +484,7 @@ impl Server {
             }
         }
         if let Some(i) = self.mob_index(tid)
-            && let Some(n) = self.mobs.list[i].as_mut().and_then(|t| t.npc.as_mut())
+            && let Some(n) = self.mobs.list.get_mut(i).and_then(|t| t.npc.as_mut())
         {
             n.despawn_delay = 48000;
             n.wander = Some(reference);

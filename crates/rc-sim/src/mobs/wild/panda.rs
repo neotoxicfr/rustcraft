@@ -350,11 +350,11 @@ fn after_sneeze(s: &mut Server, m: &mut Mob) {
         s.mobs.of_kind(Kind::Panda).filter(|o| o.touches(&area)).map(|o| o.id).collect();
     for id in ids {
         let Some(i) = s.mob_index(id) else { continue };
-        let Some(mut o) = s.mobs.list[i].take() else { continue };
+        let Some(mut o) = s.mobs.list.take(i) else { continue };
         if !o.is_baby() && o.on_ground && !o.in_water && can_perform_action(s, &o) {
             s.mob_jump_from_ground(&mut o);
         }
-        s.mobs.list[i] = Some(o);
+        s.mobs.list.put(i, o);
     }
     // The panda itself (out of the list during its tick) is also in the box.
     if !m.is_baby() && m.on_ground && !m.in_water && can_perform_action(s, m) {

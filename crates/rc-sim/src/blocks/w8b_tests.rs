@@ -505,7 +505,7 @@ fn add_pig(p: &mut Probe, id: i32, pos: [f64; 3]) {
 }
 
 fn pig(p: &Probe, id: i32) -> &crate::mobs::mob::Mob {
-    p.s.mobs.list.iter().flatten().find(|m| m.id == id).expect("pig")
+    p.s.mobs.list.iter().find(|m| m.id == id).expect("pig")
 }
 
 /// G5-F14: the head coming out pushes the mob and the item in front of it out of the cell where it

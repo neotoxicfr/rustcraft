@@ -356,7 +356,7 @@ impl Server {
         let g = 1.0e-7;
         let area = rc_physics::Aabb { min: b.min.map(|v| v - g), max: b.max.map(|v| v + g) };
         use crate::mobs::species::Kind;
-        !self.mobs.list.iter().flatten().any(|m| {
+        !self.mobs.list.iter().any(|m| {
             let solid = match m.kind {
                 Kind::Shulker => m.alive(),
                 Kind::HappyGhast => {

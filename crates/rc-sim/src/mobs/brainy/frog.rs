@@ -258,7 +258,7 @@ pub fn tongue_tick(s: &mut Server, m: &mut Mob, b: &mut Brain, tg: &mut Tongue) 
                 // The prey is pulled toward the frog (× 0.75).
                 if let Ent::Mob(id) = target
                     && let Some(i) = s.mob_index(id)
-                    && let Some(o) = s.mobs.list[i].as_mut()
+                    && let Some(o) = s.mobs.list.get_mut(i)
                 {
                     let n = crate::mobs::mth::normalize([m.pos[0] - o.pos[0], m.pos[1] - o.pos[1], m.pos[2] - o.pos[2]]);
                     o.vel = n.map(|x| x * 0.75);
@@ -308,12 +308,12 @@ pub(crate) fn eat_entity(s: &mut Server, m: &mut Mob) {
     // "Killed" removal: the removal effects (burst, cobwebs, slimes) happen as at the end of the
     // 20 death ticks.
     if let Some(i) = s.mob_index(id)
-        && s.mobs.list[i].as_ref().is_some_and(|o| !o.alive())
-        && let Some(mut o) = s.mobs.list[i].take()
+        && s.mobs.list.get(i).is_some_and(|o| !o.alive())
+        && let Some(mut o) = s.mobs.list.take(i)
     {
         s.mob_removed_effects(&mut o);
         o.removed = true;
-        s.mobs.list[i] = Some(o);
+        s.mobs.list.put(i, o);
     }
 }
 

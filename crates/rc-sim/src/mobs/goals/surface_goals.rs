@@ -269,7 +269,6 @@ impl Server {
                     .mobs
                     .list
                     .iter()
-                    .flatten()
                     .find(|o| {
                         o.kind != m.kind && o.id != m.id && o.alive() && o.touches(&area) && !o.invisible()
                     })

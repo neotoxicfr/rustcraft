@@ -475,7 +475,7 @@ pub fn ram_tick(s: &mut Server, m: &mut Mob, b: &mut Brain, dir: [f64; 3]) {
     let bb = m.bbox();
     // Living entities hit (player after the mobs) satisfying the conditions.
     let mut hit: Option<Ent> = None;
-    let ids: Vec<i32> = s.mobs.list.iter().flatten().filter(|o| o.alive() && o.touches(&bb)).map(|o| o.id).collect();
+    let ids: Vec<i32> = s.mobs.list.iter().filter(|o| o.alive() && o.touches(&bb)).map(|o| o.id).collect();
     for id in ids {
         if id != m.id && ram_target_ok(s, m, Ent::Mob(id)) {
             hit = Some(Ent::Mob(id));
@@ -506,7 +506,7 @@ pub fn ram_tick(s: &mut Server, m: &mut Mob, b: &mut Brain, dir: [f64; 3]) {
             }
             Ent::Mob(id) => {
                 if let Some(i) = s.mob_index(id) {
-                    let mut o = s.mobs.list[i].take().expect("mob");
+                    let mut o = s.mobs.list.take(i).expect("mob");
                     // G5-F04: after-hit effects of the struck mob (thorns), then the goat's weapon.
                     if s.mob_hurt_by(&mut o, m, ty, dmg) {
                         let w = m.equipment[0].clone();
@@ -523,7 +523,7 @@ pub fn ram_tick(s: &mut Server, m: &mut Mob, b: &mut Brain, dir: [f64; 3]) {
                     let by = Some(Ent::Mob(m.id));
                     s.mob_knockback(&mut o, f64::from(factor) * force, dir[0], dir[2], by, dmg, false);
                     s.ghost_pop();
-                    s.mobs.list[i] = Some(o);
+                    s.mobs.list.put(i, o);
                 }
             }
         }

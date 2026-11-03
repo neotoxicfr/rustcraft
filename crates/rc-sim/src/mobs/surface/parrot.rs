@@ -110,12 +110,12 @@ pub fn imitate_nearby(s: &mut Server, who: &Imitator) -> bool {
     let bbox = who.bbox;
     let area = rc_physics::Aabb { min: bbox.min.map(|v| v - 20.0), max: bbox.max.map(|v| v + 20.0) };
     let imitated = |o: &&Mob| IMITATED.iter().any(|(e, _)| *e == o.kind.info().name) && o.touches(&area);
-    let n = s.mobs.list.iter().flatten().map(|m| &**m).filter(imitated).count();
+    let n = s.mobs.list.iter().filter(imitated).count();
     if n == 0 {
         return false;
     }
     let k = s.mobs.rng.next_int_bound(n as i32) as usize;
-    let Some(o) = s.mobs.list.iter().flatten().map(|m| &**m).filter(imitated).nth(k) else { return false };
+    let Some(o) = s.mobs.list.iter().filter(imitated).nth(k) else { return false };
     if super::super::end::silent(o) {
         return false;
     }

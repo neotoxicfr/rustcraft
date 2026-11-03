@@ -218,7 +218,6 @@ impl Server {
                     .mobs
                     .list
                     .iter()
-                    .flatten()
                     .filter(|o| super::is_guardian(o.kind) && o.alive() && o.touches(&area))
                     .map(|o| (o.id, o.pos))
                     .collect();
@@ -349,9 +348,9 @@ impl Server {
             }
             Ent::Mob(id) => {
                 let Some(i) = self.mob_index(id) else { return };
-                let mut o = self.mobs.list[i].take().expect("mob");
+                let mut o = self.mobs.list.take(i).expect("mob");
                 self.mob_hurt_by(&mut o, m, ty, dmg);
-                self.mobs.list[i] = Some(o);
+                self.mobs.list.put(i, o);
             }
         }
     }
@@ -376,9 +375,9 @@ pub fn before_hurt(s: &mut Server, m: &mut Mob, ty: &str, by: Option<Ent>) {
             }
             Ent::Mob(id) => match s.mob_index(id) {
                 Some(i) => {
-                    let mut o = s.mobs.list[i].take().expect("mob");
+                    let mut o = s.mobs.list.take(i).expect("mob");
                     s.mob_hurt_by(&mut o, m, "minecraft:thorns", 2.0);
-                    s.mobs.list[i] = Some(o);
+                    s.mobs.list.put(i, o);
                 }
                 // Attacker mid-tick (taken out of the list): thorns applied on return.
                 None => s.mobs.aqua.thorns.push((id, m.id, m.pos)),

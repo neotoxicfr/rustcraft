@@ -56,7 +56,7 @@ fn mob(p: &Probe, id: i32) -> Option<&Mob> {
 
 fn mob_mut(p: &mut Probe, id: i32) -> Option<&mut Mob> {
     let i = p.s.mob_index(id)?;
-    p.s.mobs.list[i].as_deref_mut()
+    p.s.mobs.list.get_mut(i)
 }
 
 fn set_day_time(p: &mut Probe, t: i64) {
@@ -98,7 +98,7 @@ fn creaking_bound_to_heart() {
     let mut found = None;
     for _ in 0..200 {
         step(&mut p, 1);
-        found = p.s.mobs.list.iter().flatten().find(|m| m.kind == Kind::Creaking).map(|m| m.id);
+        found = p.s.mobs.list.iter().find(|m| m.kind == Kind::Creaking).map(|m| m.id);
         if found.is_some() {
             break;
         }
@@ -319,7 +319,7 @@ fn shrieker_summons_warden() {
     step(&mut p, 100);
     walk(&mut p, [216.5, -59.0, 210.7]);
     step(&mut p, 100);
-    let w = p.s.mobs.list.iter().flatten().find(|m| m.kind == Kind::Warden);
+    let w = p.s.mobs.list.iter().find(|m| m.kind == Kind::Warden);
     eprintln!("level {}, warden {:?}", p.s.mobs.rec.warden_tracker.warning_level, w.map(|m| m.pos));
     assert!(w.is_some(), "no warden summoned");
     cleanup(p, dir);
@@ -353,7 +353,7 @@ fn dried_ghast_hatches() {
     let pos = [216, -59, 216];
     let st = p.s.get(pos);
     assert!(p.s.rec_block_tick(st, pos), "dried ghast tick not handled");
-    let g = p.s.mobs.list.iter().flatten().find(|m| m.kind == Kind::HappyGhast);
+    let g = p.s.mobs.list.iter().find(|m| m.kind == Kind::HappyGhast);
     assert!(g.is_some_and(|m| m.is_baby()), "no ghastling hatched");
     assert!(state_string(&p.s, p.s.get(pos)).starts_with("minecraft:water"), "block not replaced by water");
     cleanup(p, dir);
@@ -431,7 +431,7 @@ fn prep_recent_world() {
         if let Some(m) = mob_mut(&mut p, baby) {
             m.age = -24000;
         }
-        for m in p.s.mobs.list.iter_mut().flatten() {
+        for m in p.s.mobs.list.iter_mut() {
             m.yaw = 180.0;
             m.body_yaw = 180.0;
             m.head_yaw = 180.0;

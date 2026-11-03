@@ -688,8 +688,8 @@ impl Server {
     fn x_unride(&mut self, m: &mut Mob) {
         let Some(vid) = m.mount.vehicle else { return };
         let Some(i) = self.mob_index(vid) else { return };
-        let Some(mut v) = self.mobs.list[i].take() else { return };
+        let Some(mut v) = self.mobs.list.take(i) else { return };
         self.mob_dismount_from(m, &mut v);
-        self.mobs.list[i] = Some(v);
+        self.mobs.list.put(i, v);
     }
 }

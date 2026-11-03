@@ -413,10 +413,10 @@ impl Server {
         // Each entity in the cell: its leads (its own and those it holds) first.
         // Walk order: mobs, knot, player (the game follows the order of its entity list).
         let ids: Vec<i32> =
-            self.mobs.list.iter().flatten().filter(|m| !m.removed && m.bbox().intersects(&cell)).map(|m| m.id).collect();
+            self.mobs.list.iter().filter(|m| !m.removed && m.bbox().intersects(&cell)).map(|m| m.id).collect();
         for id in ids {
             let Some(i) = self.mob_index(id) else { continue };
-            let Some(mut m) = self.mobs.list[i].take() else { continue };
+            let Some(mut m) = self.mobs.list.take(i) else { continue };
             let cut = self.shear_off_all(crate::mobs::leash::Holder::Mob(id), Some(&mut m), false);
             let shorn = !cut
                 && m.kind == crate::mobs::species::Kind::Sheep
@@ -426,7 +426,7 @@ impl Server {
             if shorn {
                 self.sheep_shear(&mut m, 4);
             }
-            self.mobs.list[i] = Some(m);
+            self.mobs.list.put(i, m);
             if cut {
                 return true;
             }

@@ -402,7 +402,6 @@ impl Server {
                 .mobs
                 .list
                 .iter()
-                .flatten()
                 .filter(|o| o.kind == Kind::Slime && !o.removed && Ent::Mob(o.id) != b.ent && o.bbox().intersects(&area))
                 .take(cram as usize)
                 .count() as i32;

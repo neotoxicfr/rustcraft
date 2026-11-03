@@ -464,7 +464,6 @@ pub fn alertable(s: &Server, m: &mut Mob) -> bool {
         .mobs
         .list
         .iter()
-        .flatten()
         .filter(|o| o.id != m.id && o.alive() && o.touches(&area) && alertable_mob(o))
         .filter(|o| !trusts(m, o.uuid))
         .map(|o| o.id)

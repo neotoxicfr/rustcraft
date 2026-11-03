@@ -137,7 +137,7 @@ fn raider_reads_raid_and_captain_state() {
         json!({"minecraft:type_specific/raider": Value::Object(o)})
     };
     let set = |p: &mut Probe, f: &dyn Fn(&mut crate::mobs::mob::Mob)| {
-        let m = p.s.mobs.list.iter_mut().flatten().find(|m| m.id == id).expect("pillager");
+        let m = p.s.mobs.list.iter_mut().find(|m| m.id == id).expect("pillager");
         f(m);
     };
     set(&mut p, &|m| m.equipment[5] = Some(Stack { id: "minecraft:white_banner".into(), count: 1, components: None }));
@@ -230,7 +230,7 @@ fn nbt_partial_components_movement_and_hook() {
     {
         fails.push("hook without field = true, with field = false outside a hook");
     }
-    p.s.mobs.list.iter_mut().flatten().find(|m| m.id == pig).expect("pig").vel = [0.1, 0.0, 0.0];
+    p.s.mobs.list.iter_mut().find(|m| m.id == pig).expect("pig").vel = [0.1, 0.0, 0.0];
     if !ent(&p, json!({"minecraft:movement": {"x": {"min": 1.9, "max": 2.1}}}), E::Mob(pig)) {
         fails.push("movement: speed × 20");
     }

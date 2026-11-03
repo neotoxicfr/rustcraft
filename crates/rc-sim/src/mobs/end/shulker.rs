@@ -216,7 +216,7 @@ impl Server {
     pub(crate) fn shulker_shove(&mut self, m: &Mob, area: &rc_physics::Aabb, d: [f64; 3]) {
         use rc_physics::body::Heft;
         for i in 0..self.mobs.list.len() {
-            let hit = self.mobs.list[i].as_ref().is_some_and(|o| {
+            let hit = self.mobs.list.get(i).is_some_and(|o| {
                 !o.removed
                     && o.id != m.id
                     && !matches!(o.kind, Kind::Shulker | Kind::EnderDragon)
@@ -227,9 +227,9 @@ impl Server {
             if !hit {
                 continue;
             }
-            let Some(mut o) = self.mobs.list[i].take() else { continue };
+            let Some(mut o) = self.mobs.list.take(i) else { continue };
             self.mob_move(&mut o, d);
-            self.mobs.list[i] = Some(o);
+            self.mobs.list.put(i, o);
         }
         if !self.carts.list.is_empty() {
             // A minecart never rides: it shares the shulker's root vehicle only when it is it.
@@ -351,7 +351,6 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| o.kind == Kind::Shulker && o.alive() && o.touches(&area))
             .count();
         if bbox(m).intersects(&area) {

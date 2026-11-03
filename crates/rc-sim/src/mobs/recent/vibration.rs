@@ -373,7 +373,7 @@ impl Server {
             match l.who {
                 Who::Mob(id) => {
                     let Some(i) = self.mob_index(id) else { continue };
-                    let Some(mut m) = self.mobs.list[i].take() else { continue };
+                    let Some(mut m) = self.mobs.list.take(i) else { continue };
                     // Warden and allay: radius 16 at the eyes.
                     if matches!(m.kind, Kind::Warden | Kind::Allay) && !m.removed {
                         let lp = [m.pos[0], m.eye_y(), m.pos[2]];
@@ -383,7 +383,7 @@ impl Server {
                             m.rec.vib = data;
                         }
                     }
-                    self.mobs.list[i] = Some(m);
+                    self.mobs.list.put(i, m);
                 }
                 Who::Block(p) => {
                     let lp = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];

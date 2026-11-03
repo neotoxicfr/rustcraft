@@ -724,7 +724,7 @@ impl Server {
         if who == Who::Player {
             cands.push(Ent::Player);
         } else {
-            for o in self.mobs.list.iter().flatten() {
+            for o in self.mobs.list.iter() {
                 let fits = match who {
                     Who::Villager => matches!(o.kind, Kind::Villager | Kind::WanderingTrader),
                     Who::ZombieClass => o.kind.zombie_like(),
@@ -894,7 +894,7 @@ impl Server {
                 let mut best: Option<(f64, i32)> = None;
                 // Same class or subclass: the baby llama also follows a trader's llama.
                 let same = |k: Kind| k == m.kind || (m.kind == Kind::Llama && k == Kind::TraderLlama);
-                for o in self.mobs.list.iter().flatten() {
+                for o in self.mobs.list.iter() {
                     if same(o.kind) && o.age >= 0 && o.touches(&area) {
                         let d = dist2(m.pos, o.pos);
                         if best.is_none_or(|b| d <= b.0) {
@@ -2055,7 +2055,7 @@ impl Server {
 
     /// Height of the seat point of a mounted entity.
     fn riding_position_y(&self, t: Ent) -> Option<f64> {
-        let (v, rank, animal) = self.mobs.list.iter().flatten().find_map(|v| {
+        let (v, rank, animal) = self.mobs.list.iter().find_map(|v| {
             let rank = v.mount.passengers.iter().position(|p| *p == t)?;
             let animal = matches!(t, Ent::Mob(id) if self.mob_ref(id).is_some_and(|o| o.kind.is_animal()));
             Some((v, rank, animal))
@@ -2115,7 +2115,7 @@ impl Server {
         let bb = m.bbox();
         let area = rc_physics::Aabb { min: bb.min.map(|v| v - 8.0), max: bb.max.map(|v| v + 8.0) };
         let mut best: Option<(f64, i32)> = None;
-        for o in self.mobs.list.iter().flatten() {
+        for o in self.mobs.list.iter() {
             if o.id == m.id || !o.touches(&area) {
                 continue;
             }

@@ -462,7 +462,7 @@ impl Server {
             return false;
         }
         let Some(pi) = self.mob_index(partner) else { return true };
-        let Some(p) = self.mobs.list[pi].as_ref().map(|p| (**p).clone()) else { return true };
+        let Some(p) = self.mobs.list.get(pi).cloned() else { return true };
         let child_kind = match (m.kind, p.kind) {
             (Kind::Horse, Kind::Donkey) | (Kind::Donkey, Kind::Horse) => Kind::Mule,
             (k, _) => k,
@@ -512,7 +512,7 @@ impl Server {
         self.s9_bred(m, partner, Some(&baby)); // S9 (before love is forgotten, which erases its cause)
         m.age = 6000;
         m.reset_love();
-        if let Some(o) = self.mobs.list[pi].as_mut() {
+        if let Some(o) = self.mobs.list.get_mut(pi) {
             o.age = 6000;
             o.reset_love();
         }

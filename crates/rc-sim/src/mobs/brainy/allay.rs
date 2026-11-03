@@ -444,7 +444,7 @@ impl Server {
     /// block (integer distance² ≤ 100). Allays being updated (taken out of the list) hear nothing:
     /// the jukebox emits outside the mob tick.
     pub(crate) fn bz_allays_hear_jukebox(&mut self, j: [i32; 3], playing: bool) {
-        for o in self.mobs.list.iter_mut().flatten() {
+        for o in self.mobs.list.iter_mut() {
             if o.kind != super::super::species::Kind::Allay || o.removed {
                 continue;
             }

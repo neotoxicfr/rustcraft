@@ -784,7 +784,6 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|m| m.track.seen && m.alive())
             .map(|m| {
                 (

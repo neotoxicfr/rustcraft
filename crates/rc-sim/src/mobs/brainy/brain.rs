@@ -1182,7 +1182,6 @@ impl Server {
                     .mobs
                     .list
                     .iter()
-                    .flatten()
                     .filter(|o| o.id != m.id && o.alive() && o.touches(&area))
                     .map(|o| (dist2(m.pos, o.pos), Ent::Mob(o.id)))
                     .collect();
@@ -2026,7 +2025,7 @@ impl Server {
     /// Access to the brain of another mob of the family.
     pub(crate) fn bz_with_brain(&mut self, id: i32, f: impl FnOnce(&mut Mob, &mut Brain)) {
         if let Some(i) = self.mob_index(id)
-            && let Some(o) = self.mobs.list[i].as_mut()
+            && let Some(o) = self.mobs.list.get_mut(i)
             && let Some(mut ob) = o.bm.brain.take()
         {
             f(o, &mut ob);

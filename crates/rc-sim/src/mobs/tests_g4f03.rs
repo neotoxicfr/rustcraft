@@ -49,12 +49,12 @@ fn spawn(p: &mut Probe, k: Kind, pos: [f64; 3]) -> i32 {
 /// Mob taken out of the list (as during its tick).
 fn take(p: &mut Probe, id: i32) -> (usize, Box<Mob>) {
     let i = p.s.mob_index(id).expect("mob");
-    (i, p.s.mobs.list[i].take().expect("mob"))
+    (i, p.s.mobs.list.take(i).expect("mob"))
 }
 
 fn with(p: &mut Probe, id: i32, f: impl FnOnce(&mut Mob)) {
     let i = p.s.mob_index(id).expect("mob");
-    f(p.s.mobs.list[i].as_mut().expect("mob"));
+    f(p.s.mobs.list.get_mut(i).expect("mob"));
 }
 
 // ---------- Without a world ----------
@@ -134,11 +134,11 @@ fn wolf_filters_the_owners_target() {
     p.s.life.vit.cooldown = 0;
     p.s.life.fx.absorption = 8.0;
     p.s.mobs.player_ticks = 50; // fresh timestamp for the goal
-    let zm = p.s.mobs.list[p.s.mob_index(zombie).expect("zombie")].as_deref().expect("zombie").clone();
+    let zm = p.s.mobs.list.get(p.s.mob_index(zombie).expect("zombie")).expect("zombie").clone();
     assert!(p.s.player_hurt_by_mob(&zm, "minecraft:mob_attack", 3.0, None), "absorbed hit refused");
     assert_eq!(p.s.life.vit.health, 20.0, "hit not absorbed");
     assert!(p.s.goal_can_use(&mut g, &mut wm), "no retaliation after an absorbed hit");
-    p.s.mobs.list[i] = Some(wm);
+    p.s.mobs.list.put(i, wm);
 }
 
 /// Wolves and cats: mating only when tamed; the wolf refuses a sitting partner.
@@ -155,16 +155,16 @@ fn wild_wolves_and_cats_do_not_breed() {
         assert!(!p.s.goal_can_use(&mut g, &mut am), "{k:?} wild ones mated");
         am.tame = true;
         assert!(!p.s.goal_can_use(&mut g, &mut am), "{k:?}: wild partner accepted");
-        p.s.mobs.list[i] = Some(am);
+        p.s.mobs.list.put(i, am);
         with(&mut p, b, |o| o.tame = true);
         let (i, mut am) = take(&mut p, a);
         assert!(p.s.goal_can_use(&mut g, &mut am), "{k:?} tamed ones refused");
-        p.s.mobs.list[i] = Some(am);
+        p.s.mobs.list.put(i, am);
         with(&mut p, b, |o| o.sitting = true);
         let (i, mut am) = take(&mut p, a);
         let ok = p.s.goal_can_use(&mut g, &mut am);
         assert_eq!(ok, k == Kind::Cat, "{k:?}: sitting partner");
-        p.s.mobs.list[i] = Some(am);
+        p.s.mobs.list.put(i, am);
         for id in [a, b] {
             with(&mut p, id, |o| o.removed = true);
         }
@@ -182,7 +182,7 @@ fn partner_at_eight_blocks() {
     am.in_love = 600;
     let mut g = Goal::Breed { speed: 1.0, partner: None, love_time: 0 };
     assert!(!p.s.goal_can_use(&mut g, &mut am), "partner at 9.9 blocks accepted");
-    p.s.mobs.list[i] = Some(am);
+    p.s.mobs.list.put(i, am);
     with(&mut p, b, |o| o.pos = [215.5, -59.0, 215.5]);
     let (_, mut am) = take(&mut p, a);
     assert!(p.s.goal_can_use(&mut g, &mut am), "partner at 7.1 blocks refused");
@@ -225,9 +225,9 @@ fn universal_anger_end() {
     assert!(am.last_hurt_by_mob.is_none() && am.target.is_none() && am.anger_target.is_none());
     assert!((t + 400..=t + 780).contains(&am.anger_end), "timer {} (time {t})", am.anger_end);
     assert!(!p.s.goal_can_use(&mut g, &mut am), "restarted without a new hit");
-    p.s.mobs.list[i] = Some(am);
+    p.s.mobs.list.put(i, am);
     let bi = p.s.mob_index(b).unwrap();
-    let bm = p.s.mobs.list[bi].as_ref().unwrap();
+    let bm = p.s.mobs.list.get(bi).unwrap();
     assert!(bm.target.is_none() && bm.last_hurt_by_mob.is_none(), "fellow not warned");
     assert!((t + 400..=t + 780).contains(&bm.anger_end));
 }
@@ -288,7 +288,7 @@ fn cat_tempt_and_posture() {
     cm.move_ctl.op = MoveOp::Wait;
     super::surface::custom_ai_step(&mut p.s, &mut cm);
     assert!(!cm.surf.crouching && !cm.surf.sprinting);
-    p.s.mobs.list[i] = Some(cm);
+    p.s.mobs.list.put(i, cm);
 }
 
 /// Trampled turtle egg: three egg crumbs per jump, twenty puffs on breaking.
@@ -352,7 +352,7 @@ fn jockey_spider_no_melee() {
     assert!(p.s.goal_can_use(&mut melee(), &mut sm), "lone spider without melee");
     sm.mount.passengers.push(Ent::Mob(z));
     assert!(!p.s.goal_can_use(&mut melee(), &mut sm), "jockey in melee");
-    p.s.mobs.list[i] = Some(sm);
+    p.s.mobs.list.put(i, sm);
 }
 
 /// Parrot: does not follow an invisible mob.
@@ -365,7 +365,7 @@ fn parrot_ignores_invisible_mobs() {
     let (i, mut pm) = take(&mut p, pr);
     let mut g = Goal::Surf(SGoal::FollowMob { following: None, recalc: 0, old_water: 0.0 });
     assert!(!p.s.goal_can_use(&mut g, &mut pm), "invisible mob followed");
-    p.s.mobs.list[i] = Some(pm);
+    p.s.mobs.list.put(i, pm);
     with(&mut p, z, |o| o.x.effects.clear());
     let (_, mut pm) = take(&mut p, pr);
     assert!(p.s.goal_can_use(&mut g, &mut pm), "visible mob ignored");
@@ -468,7 +468,7 @@ fn villager_goes_to_the_item() {
     if let Some(n) = vm.npc.as_mut() {
         n.brain = Some(b);
     }
-    p.s.mobs.list[i] = Some(vm);
+    p.s.mobs.list.put(i, vm);
 }
 
 /// Item sensor: 32/16/32 box against the item's box (a bread 17.5 blocks above is seen).
@@ -498,12 +498,12 @@ fn talked_to_a_villager() {
     vm.age = -24000;
     assert_eq!(p.s.npc_interact(&mut vm, ""), Some(true));
     assert_eq!(p.s.stat_value("minecraft:custom", key), 1, "baby counted");
-    p.s.mobs.list[i] = Some(vm);
+    p.s.mobs.list.put(i, vm);
     let t = spawn(&mut p, Kind::WanderingTrader, [218.5, -59.0, 205.5]);
     let (i, mut tm) = take(&mut p, t);
     p.s.npc_interact(&mut tm, "");
     assert_eq!(p.s.stat_value("minecraft:custom", key), 2, "trader not counted");
-    p.s.mobs.list[i] = Some(tm);
+    p.s.mobs.list.put(i, tm);
 }
 
 /// Breeding: "animals bred" statistic for the fox, the goat and the nautilus; cause forgotten.
@@ -527,6 +527,6 @@ fn breeding_counts_everywhere() {
         n += 1;
         assert_eq!(p.s.stat_value("minecraft:custom", key), n, "{k:?} not counted");
         assert!(!am.love_cause && am.in_love == 0, "{k:?}: love not forgotten");
-        p.s.mobs.list[i] = Some(am);
+        p.s.mobs.list.put(i, am);
     }
 }

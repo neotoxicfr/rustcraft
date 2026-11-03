@@ -966,7 +966,7 @@ impl Server {
         let mut list: Vec<(Ent, u32)> = Vec::new();
         // Pushed entities that ride something: pushed, but the cramming only counts the others.
         let mut riders = 0i32;
-        for (i, o) in self.mobs.list.iter().enumerate() {
+        for (i, o) in self.mobs.list.slots().iter().enumerate() {
             if let Some(o) = o
                 && o.alive()
                 && o.may_touch(&bb)
@@ -1023,14 +1023,14 @@ impl Server {
                     // slot as `mob_index` (identifiers are unique in the list).
                     let hit = push_idx()
                         && self.mobs.index.unique_ids()
-                        && self.mobs.list.get(at as usize).and_then(Option::as_ref).is_some_and(|o| o.id == id);
+                        && self.mobs.list.get(at as usize).is_some_and(|o| o.id == id);
                     let i = if hit { Some(at as usize) } else { self.mob_index(id) };
                     #[cfg(test)]
                     if super::index::verify() {
-                        assert_eq!(i, super::index::scan_id(&self.mobs.list, id), "push: wrong slot of {id}");
+                        assert_eq!(i, super::index::scan_id(self.mobs.list.slots(), id), "push: wrong slot of {id}");
                     }
                     let Some(i) = i else { continue };
-                    let mut o = self.mobs.list[i].take().expect("mob");
+                    let mut o = self.mobs.list.take(i).expect("mob");
                     // F06: the iron golem's push (sometimes targets the pushed enemy).
                     self.golem_pushed(m, &o);
                     let (po, pm) = (self.mob_pushable(&o), self.mob_pushable(m));
@@ -1041,7 +1041,7 @@ impl Server {
                     if m.kind == Kind::SulfurCube && !m.cube.contacts.is_empty() {
                         self.sulfur_contact_mob(m, &mut o);
                     }
-                    self.mobs.list[i] = Some(o);
+                    self.mobs.list.put(i, o);
                 }
                 Ent::Player => {
                     // The player's push on the server side has no visible effect (the client
@@ -1123,7 +1123,7 @@ impl Server {
         let ppos = self.pos;
         let team = self.push_team(None);
         let mut idx = Vec::new();
-        for (i, o) in self.mobs.list.iter().enumerate() {
+        for (i, o) in self.mobs.list.slots().iter().enumerate() {
             if let Some(o) = o
                 && o.alive()
                 && o.may_touch(&pb)
@@ -1135,7 +1135,7 @@ impl Server {
             }
         }
         for i in idx {
-            let Some(mut o) = self.mobs.list[i].take() else { continue };
+            let Some(mut o) = self.mobs.list.take(i) else { continue };
             let (xa, za) = Self::push_vec(o.pos, ppos);
             if let (Some(xa), Some(za)) = (xa, za)
                 && self.mob_pushable(&o)
@@ -1144,7 +1144,7 @@ impl Server {
                 o.vel[2] -= za;
                 o.needs_sync = true;
             }
-            self.mobs.list[i] = Some(o);
+            self.mobs.list.put(i, o);
         }
     }
 

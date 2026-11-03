@@ -152,7 +152,7 @@ fn warden_targets_and_anger_of_a_suspect_gone_elsewhere() {
     let (zid, zuuid) = (z.id, z.uuid);
     let wid = mob_at(&p, Kind::Warden, 80.5).id;
     let i = p.s.mob_index(wid).expect("warden");
-    p.s.mobs.list[i].as_mut().unwrap().rec.anger.suspects.push((Ent::Mob(zid), zuuid, 50));
+    p.s.mobs.list.get_mut(i).unwrap().rec.anger.suspects.push((Ent::Mob(zid), zuuid, 50));
     game_ticks(&mut p, 25);
     assert!(p.s.mob_ref(zid).is_none(), "the zombie did not go to the End");
     let w = p.s.mob_ref(wid).expect("warden");
@@ -165,11 +165,11 @@ fn warden_targets_and_anger_of_a_suspect_gone_elsewhere() {
 fn take(p: &mut Probe, k: Kind, x: f64) -> (usize, Mob) {
     let id = mob_at(p, k, x).id;
     let i = p.s.mob_index(id).expect("slot");
-    (i, *p.s.mobs.list[i].take().expect("mob"))
+    (i, *p.s.mobs.list.take(i).expect("mob"))
 }
 
 fn put(p: &mut Probe, i: usize, m: Mob) {
-    p.s.mobs.list[i] = Some(Box::new(m));
+    p.s.mobs.list.put(i, Box::new(m));
 }
 
 fn stack(id: &str, count: i32) -> Option<crate::player::Stack> {
@@ -616,7 +616,7 @@ fn bench_g4f08_shulker_push_scan() {
         let t0 = std::time::Instant::now();
         let mut n = 0;
         for _ in 0..1000 {
-            n += p.s.mobs.list.iter().flatten().filter(|o| o.id != sh.id && o.alive() && o.touches(&area)).count();
+            n += p.s.mobs.list.iter().filter(|o| o.id != sh.id && o.alive() && o.touches(&area)).count();
         }
         let old = t0.elapsed().as_secs_f64() * 1.0e3;
         let t0 = std::time::Instant::now();

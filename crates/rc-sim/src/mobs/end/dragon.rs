@@ -365,13 +365,12 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| o.id != m.id && o.alive() && o.touches(&area))
             .map(|o| o.id)
             .collect();
         for id in ids {
             let Some(i) = self.mob_index(id) else { continue };
-            let Some(mut o) = self.mobs.list[i].take() else { continue };
+            let Some(mut o) = self.mobs.list.take(i) else { continue };
             let (xd, zd) = (o.pos[0] - xm, o.pos[2] - zm);
             let dd = (xd * xd + zd * zd).max(0.1);
             o.vel = [o.vel[0] + xd / dd * 4.0, o.vel[1] + f64::from(0.2f32), o.vel[2] + zd / dd * 4.0];
@@ -381,7 +380,7 @@ impl Server {
                 self.mob_hurt_by(&mut o, m, "minecraft:mob_attack", 5.0);
                 self.dragon_post_attack(m, d, &mut o); // even without a hit dealt, like the game
             }
-            self.mobs.list[i] = Some(o);
+            self.mobs.list.put(i, o);
         }
         if self.game_mode != 1
             && self.game_mode != 3
@@ -406,16 +405,15 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| o.id != m.id && o.alive() && o.touches(&area))
             .map(|o| o.id)
             .collect();
         for id in ids {
             let Some(i) = self.mob_index(id) else { continue };
-            let Some(mut o) = self.mobs.list[i].take() else { continue };
+            let Some(mut o) = self.mobs.list.take(i) else { continue };
             self.mob_hurt_by(&mut o, m, "minecraft:mob_attack", 10.0);
             self.dragon_post_attack(m, d, &mut o); // even without a hit dealt, like the game
-            self.mobs.list[i] = Some(o);
+            self.mobs.list.put(i, o);
         }
         if self.game_mode != 1
             && self.game_mode != 3
@@ -620,7 +618,7 @@ impl Server {
 
     /// Player hit on a dragon part (dragon id + 1..8); true if handled.
     pub(crate) fn dragon_part_attacked(&mut self, id: i32) -> bool {
-        let Some(i) = self.mobs.list.iter().position(|o| {
+        let Some(i) = self.mobs.list.slots().iter().position(|o| {
             o.as_ref()
                 .is_some_and(|o| o.kind == super::super::species::Kind::EnderDragon && id > o.id && id <= o.id + 8)
         }) else {
@@ -629,7 +627,7 @@ impl Server {
         if self.game_mode == 3 || self.life.vit.dead {
             return true;
         }
-        let Some(mut m) = self.mobs.list[i].take() else { return true };
+        let Some(mut m) = self.mobs.list.take(i) else { return true };
         let part = (id - m.id - 1) as usize;
         let reach_ok = m.end.dragon.as_ref().is_some_and(|d| {
             let b = part_box(d, part);
@@ -644,7 +642,7 @@ impl Server {
             self.mobs.end.part_attack = false;
             self.mobs.end.part = None;
         }
-        self.mobs.list[i] = Some(m);
+        self.mobs.list.put(i, m);
         true
     }
 
@@ -652,7 +650,7 @@ impl Server {
     /// it was the followed crystal (attributed to the player), then the phase is notified.
     pub(crate) fn dragon_crystal_destroyed(&mut self, dragon: i32, crystal: i32, player: Option<Ent>) {
         let Some(i) = self.mob_index(dragon) else { return };
-        let Some(mut m) = self.mobs.list[i].take() else { return };
+        let Some(mut m) = self.mobs.list.take(i) else { return };
         if m.end.dragon.as_ref().is_some_and(|d| d.nearest_crystal == Some(crystal)) {
             self.mobs.end.part = Some(HEAD);
             let ty = if player.is_some() { "minecraft:player_explosion" } else { "minecraft:explosion" };
@@ -667,6 +665,6 @@ impl Server {
                 self.discard_cloud(id);
             }
         }
-        self.mobs.list[i] = Some(m);
+        self.mobs.list.put(i, m);
     }
 }

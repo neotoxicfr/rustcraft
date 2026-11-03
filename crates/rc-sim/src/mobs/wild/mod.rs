@@ -521,7 +521,7 @@ pub fn breed(s: &mut Server, m: &mut Mob, partner: i32) -> bool {
         return false;
     }
     let Some(pi) = s.mob_index(partner) else { return true };
-    let Some(p) = s.mobs.list[pi].take() else { return true };
+    let Some(p) = s.mobs.list.take(pi) else { return true };
     let mut baby = s.new_mob(m.kind, m.pos, 0.0);
     match m.kind {
         Kind::Fox => baby.variant = if m.rng.next_bool() { m.variant } else { p.variant },
@@ -540,12 +540,12 @@ pub fn breed(s: &mut Server, m: &mut Mob, partner: i32) -> bool {
     baby.age = -24000;
     baby.yaw = 0.0;
     baby.pitch = 0.0;
-    s.mobs.list[pi] = Some(p);
+    s.mobs.list.put(pi, p);
     // Breeding statistic and trigger (before love is forgotten, which erases its cause).
     s.s9_bred(m, partner, Some(&baby));
     m.age = 6000;
     m.reset_love();
-    if let Some(p) = s.mobs.list[pi].as_mut() {
+    if let Some(p) = s.mobs.list.get_mut(pi) {
         p.age = 6000;
         p.reset_love();
     }

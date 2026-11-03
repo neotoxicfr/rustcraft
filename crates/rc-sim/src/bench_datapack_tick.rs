@@ -33,7 +33,7 @@ fn case(name: &str, load: Load) {
     if load != Load::Crowd {
         cmd(&mut p, "tag @a add perf_datapack");
     }
-    let mobs = p.s.mobs.list.iter().flatten().count();
+    let mobs = p.s.mobs.list.iter().count();
     assert!(mobs >= 1000, "{name}: {mobs} mobs, the crowd function did not run");
     let t = bench_kit::time_ticks(&mut p, WARMUP_TICKS, MEASURED_TICKS, RUNS);
     check_workload_ran(&p, name, load);

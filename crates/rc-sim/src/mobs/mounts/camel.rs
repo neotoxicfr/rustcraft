@@ -348,7 +348,6 @@ impl Server {
                 .mobs
                 .list
                 .iter()
-                .flatten()
                 .filter(|o| o.id != m.id && o.alive() && o.touches(&area))
                 .map(|o| (dist2(m.pos, o.pos), Ent::Mob(o.id)))
                 .collect();
@@ -665,7 +664,7 @@ impl Server {
                     self.mount_breed(m, pid);
                     b.breed = None;
                     if let Some(i) = self.mob_index(pid)
-                        && let Some(o) = self.mobs.list[i].as_mut()
+                        && let Some(o) = self.mobs.list.get_mut(i)
                         && let Some(ob) = o.mount.brain.as_mut()
                     {
                         ob.breed = None;
@@ -820,7 +819,7 @@ impl Server {
         b.walk = Some(WalkTarget { target: Track::Ent(Ent::Mob(pid), true), speed: 1.0, close: 2 });
         let me = m.id;
         if let Some(i) = self.mob_index(pid)
-            && let Some(o) = self.mobs.list[i].as_mut()
+            && let Some(o) = self.mobs.list.get_mut(i)
             && let Some(ob) = o.mount.brain.as_mut()
         {
             ob.breed = Some(me);

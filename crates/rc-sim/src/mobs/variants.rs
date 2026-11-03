@@ -850,7 +850,7 @@ impl Server {
                     }
                     Ent::Mob(id) => {
                         if let Some(i) = self.mob_index(id)
-                            && let Some(o) = self.mobs.list[i].as_mut()
+                            && let Some(o) = self.mobs.list.get_mut(i)
                             && o.fire < ticks
                         {
                             o.fire = ticks;
@@ -931,9 +931,9 @@ impl Server {
             }
             Ent::Mob(mid) => {
                 if let Some(i) = self.mob_index(mid) {
-                    let mut o = self.mobs.list[i].take().expect("mob");
+                    let mut o = self.mobs.list.take(i).expect("mob");
                     self.give_mob_effect(&mut o, id, dur, amp);
-                    self.mobs.list[i] = Some(o);
+                    self.mobs.list.put(i, o);
                 }
             }
         }

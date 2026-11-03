@@ -309,7 +309,7 @@ fn egg_chicks_refitted() {
         crate::projectiles::Proj::new(crate::projectiles::PKind::Egg, 900_000, pos, item)
     };
     let chickens = |p: &Probe| {
-        p.s.mobs.list.iter().flatten().filter(|m| m.kind == Kind::Chicken).map(|m| (m.pos, m.dims_wh().1)).collect::<Vec<_>>()
+        p.s.mobs.list.iter().filter(|m| m.kind == Kind::Chicken).map(|m| (m.pos, m.dims_wh().1)).collect::<Vec<_>>()
     };
     p.run("setblock 210 -55 210 minecraft:stone");
     p.s.egg_chickens(&egg([210.5, -55.0, 210.5]), 1);
@@ -336,7 +336,7 @@ fn frog_refitted_from_tadpole() {
     let (tw, _) = t.dims_wh();
     t.pos[0] = 211.0 - f64::from(tw) / 2.0 - 0.001;
     super::brainy::frog::grow_up(&mut p.s, &mut t);
-    let f = p.s.mobs.list.iter().flatten().find(|m| m.kind == Kind::Frog).expect("frog");
+    let f = p.s.mobs.list.iter().find(|m| m.kind == Kind::Frog).expect("frog");
     let (fw, _) = f.dims_wh();
     assert!((f.pos[0] - (211.0 - f64::from(fw) / 2.0)).abs() < 1.0e-6, "x = {}", f.pos[0]);
     assert!((f.pos[1] + 59.0).abs() < 1.0e-5, "y = {}", f.pos[1]);
@@ -450,14 +450,14 @@ fn push_team_rule() {
     p.s.add_mob(a);
     let push = |p: &mut Probe| {
         let i = p.s.mob_index(aid).unwrap();
-        p.s.mobs.list[i].as_mut().unwrap().vel = [0.0; 3];
+        p.s.mobs.list.get_mut(i).unwrap().vel = [0.0; 3];
         let mut b = mob(p, Kind::Zombie, [210.8, -59.0, 210.5]);
         b.vel = [0.0; 3];
         (b.uuid, b)
     };
     let pushed = |p: &mut Probe, mut b: Mob| {
         let i = p.s.mob_index(aid).unwrap();
-        p.s.mobs.list[i].as_mut().unwrap().vel = [0.0; 3];
+        p.s.mobs.list.get_mut(i).unwrap().vel = [0.0; 3];
         p.s.mob_push_entities(&mut b);
         p.s.mob_ref(aid).unwrap().vel[0] != 0.0
     };

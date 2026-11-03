@@ -895,7 +895,7 @@ impl Server {
                 out.push(mid);
                 continue;
             };
-            let Some(o) = self.mobs.list[i].as_ref() else { continue };
+            let Some(o) = self.mobs.list.get(i) else { continue };
             let p = o.block_pos();
             let d: i64 = (0..3).map(|k| i64::from(center[k] - p[k]).pow(2)).sum();
             if o.removed || d >= 12544 {
@@ -903,7 +903,7 @@ impl Server {
             } else if o.tick_count > 600 {
                 let (idle, tc) = (o.no_action_time, o.ill.ticks_outside_raid);
                 let village = self.is_village(p);
-                let o = self.mobs.list[i].as_mut().expect("mob");
+                let o = self.mobs.list.get_mut(i).expect("mob");
                 if !village && idle > 2400 {
                     o.ill.ticks_outside_raid = tc + 1;
                 }
@@ -915,14 +915,14 @@ impl Server {
         for mid in out {
             match self.mob_index(mid) {
                 Some(i) => {
-                    let mut o = self.mobs.list[i].take().expect("mob");
+                    let mut o = self.mobs.list.take(i).expect("mob");
                     self.raid_remove(id, &mut o, true);
                     if o.ill.patrol_leader
                         && let Some(r) = self.raid_mut(id)
                     {
                         r.leaders.retain(|l| l.0 != o.ill.wave);
                     }
-                    self.mobs.list[i] = Some(o);
+                    self.mobs.list.put(i, o);
                 }
                 None => {
                     if let Some(r) = self.raid_mut(id) {
@@ -1021,7 +1021,6 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| {
                 is_raider(o.kind)
                     && o.touches(&area)
@@ -1035,9 +1034,9 @@ impl Server {
         let wave = self.raid_ref(id).map_or(0, |r| r.groups_spawned);
         for oid in ids {
             if let Some(i) = self.mob_index(oid) {
-                let mut o = self.mobs.list[i].take().expect("mob");
+                let mut o = self.mobs.list.take(i).expect("mob");
                 self.raid_join(id, wave, &mut o, None, true);
-                self.mobs.list[i] = Some(o);
+                self.mobs.list.put(i, o);
             }
         }
     }

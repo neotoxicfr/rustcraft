@@ -220,7 +220,7 @@ fn allay_hears_note_block_through_vibrations() {
     w.cmd(&format!("summon minecraft:allay 4.5 {Y} 10.5 {{NoGravity:1b}}"));
     w.cmd(&format!("summon minecraft:allay 10.5 {Y} 4.5 {{NoGravity:1b}}"));
     let ids: Vec<(i32, f64)> =
-        w.p.s.mobs.list.iter().flatten().filter(|m| m.kind == MobKind::Allay).map(|m| (m.id, m.pos[0])).collect();
+        w.p.s.mobs.list.iter().filter(|m| m.kind == MobKind::Allay).map(|m| (m.id, m.pos[0])).collect();
     assert_eq!(ids.len(), 2);
     let liked = |w: &W, x: f64| {
         let id = ids.iter().find(|e| e.1 == x).unwrap().0;
@@ -292,7 +292,7 @@ fn chest_blocked_like_the_game() {
     w.set([4, Y + 1, 4], "minecraft:air");
     w.cmd(&format!("summon minecraft:cat 4.5 {} 4.5 {{Sitting:1b,NoAI:1b}}", Y + 1));
     assert!(!opens(&mut w, c), "sitting cat: blocked");
-    for m in w.p.s.mobs.list.iter_mut().flatten() {
+    for m in w.p.s.mobs.list.iter_mut() {
         m.removed = true;
     }
     assert!(opens(&mut w, c), "cat gone: opens");

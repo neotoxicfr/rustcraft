@@ -375,7 +375,7 @@ impl Server {
     /// Animals held by `h` whose box touches the 32-block cube centred on `c`.
     fn leashed_in_area(&self, c: [f64; 3], h: Holder) -> Vec<i32> {
         let a = area(c);
-        self.mobs.list.iter().flatten().filter(|o| !o.removed && holder(o) == Some(h) && o.touches(&a)).map(|o| o.id).collect()
+        self.mobs.list.iter().filter(|o| !o.removed && holder(o) == Some(h) && o.touches(&a)).map(|o| o.id).collect()
     }
 
     // ---------- Attach and detach ----------
@@ -405,10 +405,10 @@ impl Server {
         }
         if let Some(vid) = m.mount.vehicle
             && let Some(i) = self.mob_index(vid)
-            && let Some(mut v) = self.mobs.list[i].take()
+            && let Some(mut v) = self.mobs.list.take(i)
         {
             self.mob_dismount_from(m, &mut v);
-            self.mobs.list[i] = Some(v);
+            self.mobs.list.put(i, v);
         }
     }
 
@@ -448,7 +448,7 @@ impl Server {
                 } else {
                     self.mobs
                         .index_of_uuid(u)
-                        .and_then(|i| self.mobs.list[i].as_ref())
+                        .and_then(|i| self.mobs.list.get(i))
                         .filter(|o| !o.removed)
                         .map(|o| Holder::Mob(o.id))
                 };
@@ -686,12 +686,12 @@ impl Server {
     /// Switches mob `id` to holder `h` if it can.
     fn leash_transfer(&mut self, id: i32, h: Holder, hi: &Hold, anchor: Anchor) -> bool {
         let Some(i) = self.mob_index(id) else { return false };
-        let Some(mut o) = self.mobs.list[i].take() else { return false };
+        let Some(mut o) = self.mobs.list.take(i) else { return false };
         let ok = self.can_attach(&o, h, hi);
         if ok {
             self.leash_set(&mut o, h, anchor, true);
         }
-        self.mobs.list[i] = Some(o);
+        self.mobs.list.put(i, o);
         ok
     }
 
@@ -723,10 +723,10 @@ impl Server {
         }
         for id in ids {
             if let Some(i) = self.mob_index(id)
-                && let Some(mut o) = self.mobs.list[i].take()
+                && let Some(mut o) = self.mobs.list.take(i)
             {
                 self.leash_drop(&mut o, true, true);
-                self.mobs.list[i] = Some(o);
+                self.mobs.list.put(i, o);
             }
         }
         if !dropped {
