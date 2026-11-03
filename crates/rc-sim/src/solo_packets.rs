@@ -769,6 +769,16 @@ impl Server {
 
     /// Entity from its network identifier.
     pub(crate) fn e_of_net(&self, id: i32) -> Option<E> {
+        if rc_data::opt_switch!("RUSTCRAFT_OPT_DIRECT_ENTITY_LOOKUP") {
+            self.e_of_net_direct(id)
+        } else {
+            self.e_of_net_sorted(id)
+        }
+    }
+
+    /// Old path (`RUSTCRAFT_OPT_DIRECT_ENTITY_LOOKUP=0`): every living entity listed and sorted
+    /// by identifier, then the first with `id`.
+    fn e_of_net_sorted(&self, id: i32) -> Option<E> {
         if id == self.player_id {
             return Some(E::Player);
         }
@@ -776,6 +786,28 @@ impl Server {
             E::Mob(i) | E::Item(i) | E::Orb(i) | E::Other(i) => *i == id,
             E::Player => false,
         })
+    }
+
+    /// The lists `all_ents` joins, searched in its order without building or sorting the list:
+    /// its sort is stable, so the first entity carrying `id` is the same one. Keep the lists in
+    /// step with `all_ents`.
+    fn e_of_net_direct(&self, id: i32) -> Option<E> {
+        if id == self.player_id {
+            return Some(E::Player);
+        }
+        if self.mobs.list.iter().flatten().any(|m| m.alive() && m.id == id) {
+            return Some(E::Mob(id));
+        }
+        if self.life.drops.iter().any(|d| d.id == id) {
+            return Some(E::Item(id));
+        }
+        if self.life.orbs.iter().any(|o| o.id == id) {
+            return Some(E::Orb(id));
+        }
+        let other = self.entities.values().any(|l| l.iter().any(|(i, _)| *i == id))
+            || self.mobs.end.snapshots.iter().any(|(i, _)| *i == id)
+            || self.carts.list.iter().flatten().any(|c| !c.removed && c.id == id);
+        other.then_some(E::Other(id))
     }
 
     /// Item of an entity chosen by middle click.
@@ -899,3 +931,7 @@ enum Applicator {
     Glow(bool),
     Dye(String),
 }
+
+#[cfg(test)]
+#[path = "solo_packets_lookup_tests.rs"]
+mod lookup_tests;
