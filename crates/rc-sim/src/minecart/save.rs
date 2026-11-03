@@ -196,7 +196,7 @@ impl Server {
                 let pid = self.next_entity;
                 if let Some(mid) = self.adopt_with_passengers(pid, p, None)
                     && let Some(i) = self.mob_index(mid)
-                    && let Some(m) = self.mobs.list[i].as_mut()
+                    && let Some(m) = self.mobs.list.get_mut(i)
                 {
                     m.mount.vehicle = Some(c.id);
                     c.passengers.push(Ent::Mob(mid));

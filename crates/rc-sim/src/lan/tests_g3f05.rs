@@ -400,9 +400,9 @@ fn departure_shared_vehicle() {
     t.s.add_mob(c);
     let saved = t.s.as_guest(0, |sv| {
         let i = sv.mob_index(cid).expect("camel");
-        let mut m = sv.mobs.list[i].take().expect("camel");
+        let mut m = sv.mobs.list.take(i).expect("camel");
         let ok = sv.player_start_riding(&mut m);
-        sv.mobs.list[i] = Some(m);
+        sv.mobs.list.put(i, m);
         assert!(ok, "guest mounted");
         sv.player_nbt()
     });

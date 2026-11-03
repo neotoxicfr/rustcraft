@@ -260,7 +260,6 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| Some(o.id) != exclude && !super::recent::ignores_explosion(o))
             .map(|o| o.id)
             .collect();
@@ -281,7 +280,7 @@ impl Server {
                 eprintln!("explosion: {t:?} at {pos:?}, distance {dist:.3}, seen part {exposure}, damage {dmg}");
             }
             let Some(i) = self.mob_index(id) else { continue };
-            let mut o = self.mobs.list[i].take().expect("mob");
+            let mut o = self.mobs.list.take(i).expect("mob");
             // Ghast hit by the explosion of a fireball sent back by the player: 1,000.
             let dmg = if super::nether::reflected_fireball(&o, self.mobs.fireballs.direct_large, by) { 1000.0 } else { dmg };
             self.mob_hurt(&mut o, ty, dmg, by, Some(center));
@@ -290,7 +289,7 @@ impl Server {
             let kp = (1.0 - dist) * f64::from(exposure) * (1.0 - o.attrs.explosion_kb_resistance.value());
             o.vel = [o.vel[0] + dir[0] * kp, o.vel[1] + dir[1] * kp, o.vel[2] + dir[2] * kp];
             o.needs_sync = true;
-            self.mobs.list[i] = Some(o);
+            self.mobs.list.put(i, o);
         }
         // The current player, then the other players of the local network: hurt and pushed like
         // the host (W8c: the direct cause is the explosion's, whoever is installed).
@@ -494,7 +493,7 @@ impl Server {
         self.prog.dmg_src = crate::item_use::DmgSrc {
             pos: Some(center),
             direct_living: source.is_some(),
-            attacker_pos: source.map(|s| s.pos),
+            attacker_pos: source.map(|s| s.pos()),
             ..Default::default()
         };
         let mut hit = (None, None);

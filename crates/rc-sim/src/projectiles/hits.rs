@@ -79,10 +79,10 @@ impl Server {
             },
             Ent::Mob(id) => {
                 let Some(i) = self.mob_index(id) else { return false };
-                let Some(mut m) = self.mobs.list[i].take() else { return false };
-                let src = [m.pos[0] + kb.0, m.pos[1], m.pos[2] + kb.1];
+                let Some(mut m) = self.mobs.list.take(i) else { return false };
+                let src = [m.pos()[0] + kb.0, m.pos()[1], m.pos()[2] + kb.1];
                 let r = self.mob_hurt_dir(&mut m, ty, amount, by, Some(src), Some(kb));
-                self.mobs.list[i] = Some(m);
+                self.mobs.list.put(i, m);
                 r
             }
         }
@@ -100,7 +100,7 @@ impl Server {
             }
             Ent::Mob(id) => {
                 let Some(i) = self.mob_index(id) else { return 0 };
-                let Some(m) = self.mobs.list[i].as_mut() else { return 0 };
+                let Some(m) = self.mobs.list.get_mut(i) else { return 0 };
                 let old = m.fire;
                 if !m.kind.info().fire_immune {
                     crate::inside_blocks::mob_ignite(m, ticks);
@@ -115,7 +115,7 @@ impl Server {
             Ent::Player => self.life.vit.fire = ticks,
             Ent::Mob(id) => {
                 if let Some(i) = self.mob_index(id)
-                    && let Some(m) = self.mobs.list[i].as_mut()
+                    && let Some(m) = self.mobs.list.get_mut(i)
                 {
                     m.fire = ticks;
                 }
@@ -135,7 +135,7 @@ impl Server {
             }
             Ent::Mob(id) => {
                 if let Some(i) = self.mob_index(id)
-                    && let Some(m) = self.mobs.list[i].as_mut()
+                    && let Some(m) = self.mobs.list.get_mut(i)
                 {
                     m.vel = [m.vel[0] + d[0], m.vel[1] + d[1], m.vel[2] + d[2]];
                     m.needs_sync = true;
@@ -351,10 +351,10 @@ impl Server {
             }
             Ent::Mob(id) => {
                 if let Some(i) = self.mob_index(id)
-                    && let Some(mut m) = self.mobs.list[i].take()
+                    && let Some(mut m) = self.mobs.list.take(i)
                 {
                     self.add_mob_effect(&mut m, e);
-                    self.mobs.list[i] = Some(m);
+                    self.mobs.list.put(i, m);
                 }
             }
         }
@@ -389,7 +389,7 @@ impl Server {
                 Ent::Player => self.heal(n as f32),
                 Ent::Mob(mid) => {
                     if let Some(i) = self.mob_index(mid)
-                        && let Some(m) = self.mobs.list[i].as_mut()
+                        && let Some(m) = self.mobs.list.get_mut(i)
                         && m.health > 0.0
                     {
                         m.health = (m.health + n as f32).clamp(0.0, m.max_health());
@@ -414,15 +414,15 @@ impl Server {
                 }
                 Ent::Mob(mid) => {
                     if let Some(i) = self.mob_index(mid)
-                        && let Some(mut m) = self.mobs.list[i].take()
+                        && let Some(mut m) = self.mobs.list.take(i)
                     {
                         // F07: the witch hit by her own potion takes nothing (the hit
                         // counts: animation, invulnerability).
                         let own = m.kind == Kind::Witch && causing == Some(t);
-                        let dir = origin.map(|o| (o[0] - m.pos[0], o[2] - m.pos[2]));
+                        let dir = origin.map(|o| (o[0] - m.pos()[0], o[2] - m.pos()[2]));
                         let amt = if own { 0.0 } else { n as f32 };
                         self.mob_hurt_dir(&mut m, ty, amt, causing, origin, dir);
-                        self.mobs.list[i] = Some(m);
+                        self.mobs.list.put(i, m);
                     }
                 }
             }
@@ -526,7 +526,7 @@ impl Server {
                 let at = if self.dims.home.is_some() { self.dims.home_pos } else { self.pos };
                 [at[0], at[1] + self.player_eye_h(), at[2]]
             }
-            Ent::Mob(id) => self.mob_ref(id).map_or(p.pos, |m| [m.pos[0], m.eye_y(), m.pos[2]]),
+            Ent::Mob(id) => self.mob_ref(id).map_or(p.pos, |m| [m.pos()[0], m.eye_y(), m.pos()[2]]),
         };
         if let Ent::Mob(id) = o {
             let w = self.mob_ref(id).map_or(0.6, |m| f64::from(m.width()));
@@ -1152,7 +1152,7 @@ impl Server {
                 }
             }
             // Axolotls hit (even outside the sphere of 4): 1,800 more air, cap 6,000.
-            for m in self.mobs.list.iter_mut().flatten() {
+            for m in self.mobs.list.iter_mut() {
                 if m.kind == Kind::Axolotl && !m.removed && m.touches(&area) {
                     m.air = (m.air + 1800).min(crate::mobs::brainy::axolotl::MAX_AIR);
                 }
@@ -1186,9 +1186,9 @@ impl Server {
     /// Living entities whose box touches `area`.
     pub(crate) fn living_in(&self, area: &rc_physics::Aabb) -> Vec<(Ent, [f64; 3])> {
         let mut out = Vec::new();
-        for m in self.mobs.list.iter().flatten() {
+        for m in self.mobs.list.iter() {
             if m.alive() && !m.removed && m.touches(area) {
-                out.push((Ent::Mob(m.id), m.pos));
+                out.push((Ent::Mob(m.id), m.pos()));
             }
         }
         if self.ent_alive(Ent::Player) && self.game_mode != 3 && self.player_aabb().intersects(area) {

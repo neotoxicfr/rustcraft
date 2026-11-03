@@ -283,10 +283,10 @@ impl Server {
             }
             Ent::Mob(id) => {
                 let Some(i) = self.mob_index(id) else { return };
-                let Some(mut o) = self.mobs.list[i].take() else { return };
+                let Some(mut o) = self.mobs.list.take(i) else { return };
                 let mut hit = Hit { ty, victim: Side::Mob(o.as_mut()), attacker: Some(Side::Mob(m)), direct: true };
                 self.post_attack(&mut hit, weapon);
-                self.mobs.list[i] = Some(o);
+                self.mobs.list.put(i, o);
             }
         }
     }
@@ -296,7 +296,7 @@ impl Server {
     pub(crate) fn post_attack_by(&mut self, t: Ent, by: Option<Ent>, ty: &str) {
         // Hit by its own projectile (`by == t`): the victim is its own attacker, like the game (its
         // thorns hurt it and wear the piece).
-        let take = |s: &mut Server, id: i32| s.mob_index(id).and_then(|i| Some((i, s.mobs.list[i].take()?)));
+        let take = |s: &mut Server, id: i32| s.mob_index(id).and_then(|i| Some((i, s.mobs.list.take(i)?)));
         let mut victim = match t {
             Ent::Player => None,
             Ent::Mob(id) => match take(self, id) {
@@ -321,10 +321,10 @@ impl Server {
         let mut hit = Hit { ty, victim: victim_side, attacker, direct: false };
         self.post_attack(&mut hit, None);
         if let Some((i, a)) = shooter {
-            self.mobs.list[i] = Some(a);
+            self.mobs.list.put(i, a);
         }
         if let Some((i, v)) = victim {
-            self.mobs.list[i] = Some(v);
+            self.mobs.list.put(i, v);
         }
     }
 
@@ -390,7 +390,7 @@ impl Server {
     fn side_pos(&self, s: &Side<'_>) -> [f64; 3] {
         match s {
             Side::Player => self.pos,
-            Side::Mob(m) => m.pos,
+            Side::Mob(m) => m.pos(),
             Side::Other(_, p) => *p,
             Side::Itself => unreachable!("resolved to the victim by Hit::side"),
         }
@@ -450,7 +450,7 @@ impl Server {
                 let dmg = self.life.rng.next_float() * (hi - lo) + lo;
                 match src {
                     Some(Side::Mob(o)) => {
-                        let kb = (o.pos[0] - self.pos[0], o.pos[2] - self.pos[2]);
+                        let kb = (o.pos()[0] - self.pos[0], o.pos()[2] - self.pos[2]);
                         self.player_hurt_by_mob(o, &ty, dmg, Some(kb));
                     }
                     _ => {
@@ -465,7 +465,7 @@ impl Server {
                     Some(Side::Mob(o)) => {
                         let o: &Mob = o;
                         self.ghost_push(o);
-                        self.mob_hurt(m, &ty, dmg, Some(Ent::Mob(o.id)), Some(o.pos));
+                        self.mob_hurt(m, &ty, dmg, Some(Ent::Mob(o.id)), Some(o.pos()));
                         self.ghost_pop();
                     }
                     _ => {
@@ -565,7 +565,7 @@ impl Server {
                     return;
                 }
                 let (v, p) = (sample(&e["volume"], &mut m.rng), sample(&e["pitch"], &mut m.rng));
-                (m.pos, Self::mob_sound_source(m), v, p)
+                (m.pos(), Self::mob_sound_source(m), v, p)
             }
             _ => return,
         };

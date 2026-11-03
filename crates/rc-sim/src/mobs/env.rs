@@ -209,7 +209,7 @@ impl Server {
 
     /// Mob in water or in the rain (at its feet or at the top of its box).
     pub(crate) fn mob_in_water_or_rain(&self, m: &super::mob::Mob) -> bool {
-        m.in_water || self.in_rain(m.pos, m.bbox().max[1])
+        m.in_water || self.in_rain(m.pos(), m.bbox().max[1])
     }
 
     /// Height of a height map (network identifier: 1 surface, 4 motion blocking).

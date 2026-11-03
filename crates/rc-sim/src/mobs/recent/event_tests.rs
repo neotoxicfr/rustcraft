@@ -200,11 +200,11 @@ fn mob_motion_events() {
     assert!(splash.iter().any(|e| e.1 == Some(Src::Living(Ent::Mob(diver)))), "cow without splash: {splash:?}");
     // Damage then death.
     let i = p.s.mob_index(pig).expect("pig");
-    let mut m = p.s.mobs.list[i].take().expect("pig");
+    let mut m = p.s.mobs.list.take(i).expect("pig");
     p.s.mob_hurt(&mut m, "minecraft:generic", 1.0, None, None);
     m.damage_cooldown = 0;
     p.s.mob_hurt(&mut m, "minecraft:generic", 100.0, None, None);
-    p.s.mobs.list[i] = Some(m);
+    p.s.mobs.list.put(i, m);
     assert!(!evs(&p, "entity_damage").is_empty(), "damage without event");
     assert_eq!(evs(&p, "entity_die").len(), 1, "death without event");
     cleanup(p, dir);
@@ -290,7 +290,7 @@ fn entity_sounds_and_variants() {
     let pig = spawn(&mut p, Kind::Pig, [220.5, -59.0, 204.5]);
     let big = p.s.regs.entries("minecraft:pig_sound_variant").iter().position(|e| e == "minecraft:big").expect("big");
     let i = p.s.mob_index(pig).expect("pig");
-    let mut m = p.s.mobs.list[i].take().expect("pig");
+    let mut m = p.s.mobs.list.take(i).expect("pig");
     m.sound_variant = big as i32;
     let _ = p.take_events();
     p.s.mob_hurt(&mut m, "minecraft:generic", 1.0, None, None);
@@ -301,7 +301,7 @@ fn entity_sounds_and_variants() {
     p.s.mob_hurt(&mut m, "minecraft:generic", 1.0, None, None);
     let snd = sounds(&p, &p.take_events());
     assert!(has_sound(&snd, "entity.baby_pig.hurt"), "baby sound missing: {snd:?}");
-    p.s.mobs.list[i] = Some(m);
+    p.s.mobs.list.put(i, m);
     // Player's positional sound: seed drawn, not zero.
     p.s.play_sound("minecraft:entity.player.burp", 7, p.s.pos, 0.5, 1.0);
     p.s.play_sound("minecraft:entity.player.burp", 7, p.s.pos, 0.5, 1.0);

@@ -68,10 +68,10 @@ impl Server {
                 }
                 Ent::Mob(id) => {
                     if let Some(i) = self.mob_index(id)
-                        && let Some(mut o) = self.mobs.list[i].take()
+                        && let Some(mut o) = self.mobs.list.take(i)
                     {
                         self.give_mob_effect(&mut o, "minecraft:wither", 20 * secs, 1);
-                        self.mobs.list[i] = Some(o);
+                        self.mobs.list.put(i, o);
                     }
                 }
             }

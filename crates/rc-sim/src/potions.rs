@@ -170,7 +170,7 @@ impl Server {
                 "play_sound" => {
                     if let Some(snd) = eff["sound"].as_str() {
                         let cat = Self::mob_sound_source(m);
-                        self.play_sound(snd, cat, m.pos, 1.0, 1.0);
+                        self.play_sound(snd, cat, m.pos(), 1.0, 1.0);
                     }
                 }
                 _ => {}

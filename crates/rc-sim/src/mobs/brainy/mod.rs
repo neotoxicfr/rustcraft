@@ -721,9 +721,9 @@ pub(super) fn age_lock_particles(s: &mut Server, m: &mut Mob) {
     if m.bm.lock_timer % 2 == 0 {
         let locked = m.mount.age_locked;
         let (w, h) = (f64::from(m.width()), f64::from(m.height()));
-        let x = m.pos[0] + w * ((2.0 * m.rng.next_double() - 1.0) * 1.0);
-        let y = m.pos[1] + h * ((2.0 * m.rng.next_double() - 1.0) * 0.2);
-        let z = m.pos[2] + w * ((2.0 * m.rng.next_double() - 1.0) * 1.0);
+        let x = m.pos()[0] + w * ((2.0 * m.rng.next_double() - 1.0) * 1.0);
+        let y = m.pos()[1] + h * ((2.0 * m.rng.next_double() - 1.0) * 0.2);
+        let z = m.pos()[2] + w * ((2.0 * m.rng.next_double() - 1.0) * 1.0);
         let y = y + h + if locked { f64::from(0.2_f32) } else { 0.0 };
         let name = if locked { "minecraft:pause_mob_growth" } else { "minecraft:reset_mob_growth" };
         s.particles_full(name, 0, [x, y, z], [0.0; 3], [0.0; 3], 1, 0);
@@ -838,7 +838,7 @@ fn plain_look(m: &mut Mob, reset: bool) {
     if m.look.cooldown > 0 {
         m.look.cooldown -= 1;
         let w = m.look.wanted;
-        let (xd, zd) = (w[0] - m.pos[0], w[2] - m.pos[2]);
+        let (xd, zd) = (w[0] - m.pos()[0], w[2] - m.pos()[2]);
         if zd.abs() > f64::from(1.0e-5f32) || xd.abs() > f64::from(1.0e-5f32) {
             m.head_yaw = rotate_towards(m.head_yaw, yaw_to(xd, zd), m.look.y_max);
         }
@@ -869,7 +869,7 @@ pub fn smooth_swim_move(m: &mut Mob, max_x: f32, max_y: f32, in_water: f32, outs
     }
     if m.move_ctl.op == MoveOp::MoveTo && !m.nav.is_done() {
         let w = m.move_ctl.wanted;
-        let (xd, yd, zd) = (w[0] - m.pos[0], w[1] - m.pos[1], w[2] - m.pos[2]);
+        let (xd, yd, zd) = (w[0] - m.pos()[0], w[1] - m.pos()[1], w[2] - m.pos()[2]);
         let dd = xd * xd + yd * yd + zd * zd;
         if dd < f64::from(2.500_000_3e-7f32) {
             m.zza = 0.0;
@@ -911,7 +911,7 @@ pub fn smooth_swim_look(m: &mut Mob, max_from_center: f32) {
     if m.look.cooldown > 0 {
         m.look.cooldown -= 1;
         let w = m.look.wanted;
-        let (xd, zd) = (w[0] - m.pos[0], w[2] - m.pos[2]);
+        let (xd, zd) = (w[0] - m.pos()[0], w[2] - m.pos()[2]);
         if zd.abs() > f64::from(1.0e-5f32) || xd.abs() > f64::from(1.0e-5f32) {
             m.head_yaw = rotate_towards(m.head_yaw, yaw_to(xd, zd) + 20.0, m.look.y_max);
         }
@@ -1161,12 +1161,12 @@ pub fn spawn_child(s: &mut Server, m: &mut Mob, partner: i32) {
             let baby = match m.kind {
                 Kind::Goat => goat::offspring(s, m, partner),
                 Kind::Axolotl => axolotl::offspring(s, m, partner),
-                k => s.new_mob(k, m.pos, 0.0),
+                k => s.new_mob(k, m.pos(), 0.0),
             };
             let mut baby = baby;
             baby.age = baby_start_age(baby.kind);
-            baby.pos = m.pos;
-            baby.old = m.pos;
+            baby.set_pos(m.pos());
+            baby.old = m.pos();
             baby.yaw = 0.0;
             baby.pitch = 0.0;
             // F13: the baby hoglin is persistent.
@@ -1186,7 +1186,7 @@ pub fn finalize_breeding(s: &mut Server, m: &mut Mob, partner: i32, child: Optio
     m.age = 6000;
     m.reset_love();
     if let Some(i) = s.mob_index(partner)
-        && let Some(p) = s.mobs.list[i].as_mut()
+        && let Some(p) = s.mobs.list.get_mut(i)
     {
         p.age = 6000;
         p.reset_love();
@@ -1194,7 +1194,7 @@ pub fn finalize_breeding(s: &mut Server, m: &mut Mob, partner: i32, child: Optio
     s.mob_event(m, 18);
     if s.rule("minecraft:mob_drops", true) {
         let xp = m.rng.next_int_bound(7) + 1;
-        s.spawn_orbs(m.pos, xp);
+        s.spawn_orbs(m.pos(), xp);
     }
 }
 

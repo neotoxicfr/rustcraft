@@ -257,12 +257,12 @@ fn release_occupant(s: &mut Server, p: [i32; 3], occ: &Nbt, status: Release, flo
         }
     }
     let delta = if blocked { 0.0 } else { 0.55 + f64::from(m.width() / 2.0) };
-    m.pos = [
+    m.set_pos([
         f64::from(p[0]) + 0.5 + delta * f64::from(f[0]),
         f64::from(p[1]) + 0.5 - f64::from(m.height() / 2.0),
         f64::from(p[2]) + 0.5 + delta * f64::from(f[2]),
-    ];
-    m.old = m.pos;
+    ]);
+    m.old = m.pos();
     let at = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
     s.world_sound("minecraft:block.beehive.exit", 4, at, 1.0, 1.0);
     s.add_mob(m);
@@ -298,8 +298,8 @@ pub fn empty_all(s: &mut Server, p: [i32; 3], player: bool, status: Release) {
     for id in released {
         let pp = s.pos;
         if let Some(i) = s.mob_index(id)
-            && let Some(b) = s.mobs.list[i].as_mut()
-            && super::super::mth::dist2(pp, b.pos) <= 16.0
+            && let Some(b) = s.mobs.list.get_mut(i)
+            && super::super::mth::dist2(pp, b.pos()) <= 16.0
         {
             if sedated {
                 b.wild.stay_out = 400;
@@ -324,10 +324,10 @@ pub fn anger_nearby(s: &mut Server, p: [i32; 3]) {
         s.mobs.of_kind(Kind::Bee).filter(|o| o.touches(&area)).map(|o| o.id).collect();
     for id in ids {
         let Some(i) = s.mob_index(id) else { continue };
-        if s.mobs.list[i].as_ref().is_some_and(|b| b.target.is_none()) {
+        if s.mobs.list.get(i).is_some_and(|b| b.target.is_none()) {
             // The random draw of an element on the player list (a single one): one draw.
             let _ = s.mobs.rng.next_int_bound(1);
-            if let Some(b) = s.mobs.list[i].as_mut() {
+            if let Some(b) = s.mobs.list.get_mut(i) {
                 b.target = Some(Ent::Player);
             }
         }

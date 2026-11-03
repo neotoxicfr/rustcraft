@@ -588,7 +588,7 @@ pub fn obstruction_ok(s: &Server, m: &Mob) -> Option<bool> {
         return None;
     }
     let b = m.bbox();
-    let blocked = s.mobs.list.iter().flatten().any(|o| o.id != m.id && o.alive() && o.touches(&b))
+    let blocked = s.mobs.list.iter().any(|o| o.id != m.id && o.alive() && o.touches(&b))
         || (s.game_mode != 3 && s.player_aabb().intersects(&b));
     if blocked {
         return Some(false);
@@ -632,7 +632,7 @@ pub fn is_converting(s: &Server, m: &Mob) -> bool {
     matches!(m.kind, Kind::Piglin | Kind::PiglinBrute | Kind::Hoglin)
         && !m.pig.immune
         && !m.no_ai
-        && zombifies_here(s, m.pos)
+        && zombifies_here(s, m.pos())
 }
 
 /// Start of the AI step: attack animation of the hoglin and the zoglin.
@@ -849,7 +849,7 @@ impl Server {
     pub(crate) fn pig_spawn_at_location(&mut self, m: &Mob, st: Stack) {
         let r = &mut self.mobs.rng;
         let v = [r.next_double() * 0.2 - 0.1, 0.2, r.next_double() * 0.2 - 0.1];
-        self.spawn_item(m.pos, v, st, 10);
+        self.spawn_item(m.pos(), v, st, 10);
     }
 
     /// Right click on a mob of the family; `None`: common handling.

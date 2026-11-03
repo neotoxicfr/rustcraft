@@ -238,7 +238,7 @@ impl Server {
         }
         let (x, y, z) = (f64::from(above[0]), f64::from(above[1]), f64::from(above[2]));
         let area = rc_physics::Aabb { min: [x, y, z], max: [x + 1.0, y + 2.0, z + 1.0] };
-        let busy = self.mobs.list.iter().flatten().any(|o| !o.removed && o.touches(&area))
+        let busy = self.mobs.list.iter().any(|o| !o.removed && o.touches(&area))
             || (self.game_mode != 3 && !self.life.vit.dead && self.player_aabb().intersects(&area))
             || self.mobs.end.crystals.iter().any(|c| !c.removed && c.bbox().intersects(&area))
             || self.life.drops.iter().any(|d| {

@@ -25,7 +25,7 @@ impl PistonTarget for MobTarget<'_> {
         self.m.bbox()
     }
     fn position(&self) -> [f64; 3] {
-        self.m.pos
+        self.m.pos()
     }
     fn grounded(&self) -> bool {
         self.m.on_ground
@@ -40,9 +40,7 @@ impl PistonTarget for MobTarget<'_> {
     fn piston_push(&mut self, d: [f64; 3]) {
         // Without physics (vex): placed as is, no ceiling.
         if crate::mobs::illagers::no_physics(self.m) {
-            for (p, v) in self.m.pos.iter_mut().zip(d) {
-                *p += v;
-            }
+            self.m.add_pos(d);
             return;
         }
         let d = self.m.piston_deltas.limit(self.s.time, d);
@@ -413,12 +411,12 @@ impl Server {
             }
         };
         for i in 0..self.mobs.list.len() {
-            if !self.mobs.list[i].as_ref().is_some_and(|o| !o.removed && o.touches(&area)) {
+            if !self.mobs.list.get(i).is_some_and(|o| !o.removed && o.touches(&area)) {
                 continue;
             }
-            let Some(mut o) = self.mobs.list[i].take() else { continue };
+            let Some(mut o) = self.mobs.list.take(i) else { continue };
             apply(&mut MobTarget { s: self, m: &mut o });
-            self.mobs.list[i] = Some(o);
+            self.mobs.list.put(i, o);
         }
         for i in 0..self.carts.list.len() {
             if !self.carts.list[i].as_ref().is_some_and(|c| !c.removed && c.bbox().intersects(&area)) {

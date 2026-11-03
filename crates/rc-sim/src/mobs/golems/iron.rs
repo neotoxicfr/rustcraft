@@ -135,7 +135,7 @@ impl Server {
         let ty = "minecraft:mob_attack";
         let hurt = match t {
             Ent::Player => {
-                let kb = (m.pos[0] - self.pos[0], m.pos[2] - self.pos[2]);
+                let kb = (m.pos()[0] - self.pos[0], m.pos()[2] - self.pos[2]);
                 let r = self.player_hurt_by_mob(m, ty, dmg, Some(kb));
                 if r {
                     // `0.4 × max(0, 1 − knockback resistance)` (player attribute).
@@ -151,14 +151,14 @@ impl Server {
             }
             Ent::Mob(id) => {
                 let Some(i) = self.mob_index(id) else { return false };
-                let mut o = self.mobs.list[i].take().expect("mob");
+                let mut o = self.mobs.list.take(i).expect("mob");
                 let r = self.mob_hurt_by(&mut o, m, ty, dmg);
                 if r {
                     let scale = (1.0 - o.attrs.knockback_resistance.value()).max(0.0);
                     o.vel[1] += f64::from(0.4f32) * scale;
                     o.needs_sync = true;
                 }
-                self.mobs.list[i] = Some(o);
+                self.mobs.list.put(i, o);
                 // G5-F04: the struck mob's thorns (and the golem's weapon, if any).
                 if r {
                     let w = m.equipment[0].clone();
@@ -211,7 +211,7 @@ impl Server {
                 *target = m.target;
                 let Some(t) = *target else { return false };
                 let Some(tp) = self.ent_pos(t) else { return false };
-                if dist2(tp, m.pos) > 32.0 * 32.0 {
+                if dist2(tp, m.pos()) > 32.0 * 32.0 {
                     return false;
                 }
                 match self.pos_towards(m, 16, 7, tp, std::f32::consts::FRAC_PI_2) {
@@ -285,7 +285,6 @@ impl Server {
                         .mobs
                         .list
                         .iter()
-                        .flatten()
                         .filter(|o| o.kind == Kind::Villager && o.touches(&area))
                         .map(|o| (o.id, self.villager_reputation(o)))
                         .collect();
@@ -306,7 +305,7 @@ impl Server {
         match g {
             GolemGoal::MoveTowardsTarget { target, .. } => {
                 let Some(t) = *target else { return false };
-                !m.nav.is_done() && self.ent_alive(t) && self.ent_pos(t).is_some_and(|p| dist2(p, m.pos) < 32.0 * 32.0)
+                !m.nav.is_done() && self.ent_alive(t) && self.ent_pos(t).is_some_and(|p| dist2(p, m.pos()) < 32.0 * 32.0)
             }
             GolemGoal::MoveBackToVillage { .. } | GolemGoal::VillageStroll { .. } => !m.nav.is_done(),
             GolemGoal::OfferFlower { tick, .. } => *tick > 0,
@@ -350,7 +349,7 @@ impl Server {
                         min: [bb.min[0] - 6.0, bb.min[1] - 2.0, bb.min[2] - 6.0],
                         max: [bb.max[0] + 6.0, bb.max[1] + 2.0, bb.max[2] + 6.0],
                     };
-                    if let Some(o) = self.mobs.list[i].as_deref_mut()
+                    if let Some(o) = self.mobs.list.get_mut(i)
                         && o.kind == Kind::CopperGolem
                         && o.equipment[7].is_none()
                         && area.intersects(&o.bbox())
@@ -386,9 +385,8 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| (o.kind == Kind::Villager || o.kind == Kind::CopperGolem) && o.touches(&area))
-            .map(|o| (o.id, o.pos))
+            .map(|o| (o.id, o.pos()))
             .collect();
         let mut best: Option<(f64, Ent)> = None;
         for (id, p) in cands {
@@ -396,7 +394,7 @@ impl Server {
             if !self.targeting_ok(m, Ent::Mob(id), false, 6.0, true, true) {
                 continue;
             }
-            let d = dist2(m.pos, p);
+            let d = dist2(m.pos(), p);
             if best.is_none_or(|b| d < b.0) {
                 best = Some((d, Ent::Mob(id)));
             }
@@ -436,9 +434,8 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| o.kind == Kind::Villager && o.touches(&area) && self.villager_wants_golem(o))
-            .map(|o| o.pos)
+            .map(|o| o.pos())
             .collect();
         if wants.is_empty() {
             return None;

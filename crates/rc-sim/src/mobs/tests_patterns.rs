@@ -38,11 +38,11 @@ fn spawn(p: &mut Probe, k: Kind, pos: [f64; 3]) -> i32 {
 /// Melee hit by `att` on `victim`, the attacker taken out of the list as during its tick.
 fn melee(s: &mut Server, att: i32, victim: i32) {
     let i = s.mob_index(att).expect("attacker");
-    let mut m: Box<Mob> = s.mobs.list[i].take().expect("attacker");
+    let mut m: Box<Mob> = s.mobs.list.take(i).expect("attacker");
     s.mobs.ticking.push((m.uuid, m.id));
     s.mob_attack(&mut m, Ent::Mob(victim));
     s.mobs.ticking.pop();
-    s.mobs.list[i] = Some(m);
+    s.mobs.list.put(i, m);
 }
 
 #[test]
@@ -86,12 +86,12 @@ fn victim_finds_attacker_mid_tick() {
     let z3 = spawn(&mut p, Kind::Zombie, [220.5, -59.0, 220.5]);
     let cube = spawn(&mut p, Kind::SulfurCube, [221.5, -59.0, 220.5]);
     let ci = p.s.mob_index(cube).unwrap();
-    let c = p.s.mobs.list[ci].as_mut().unwrap();
+    let c = p.s.mobs.list.get_mut(ci).unwrap();
     c.equipment[6] = Some(Stack { id: "minecraft:stone".into(), count: 1, components: None });
     c.vel = [0.0; 3];
-    let mut common = (**c).clone();
-    let zpos = p.s.mob_ref(z3).unwrap().pos;
-    let (xd, zd) = (zpos[0] - common.pos[0], zpos[2] - common.pos[2]);
+    let mut common = c.clone();
+    let zpos = p.s.mob_ref(z3).unwrap().pos();
+    let (xd, zd) = (zpos[0] - common.pos()[0], zpos[2] - common.pos()[2]);
     Server::knockback(&mut common, 0.4, xd, zd);
     melee(&mut p.s, z3, cube);
     let got = p.s.mob_ref(cube).unwrap().vel;

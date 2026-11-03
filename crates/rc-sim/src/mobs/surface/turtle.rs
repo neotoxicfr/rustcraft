@@ -29,7 +29,7 @@ pub fn on_sand(s: &Server, p: [i32; 3]) -> bool {
 pub fn home_within(m: &Mob, d: f64) -> bool {
     let h = m.surf.home;
     let c = [f64::from(h[0]) + 0.5, f64::from(h[1]) + 0.5, f64::from(h[2]) + 0.5];
-    mth::dist2(c, m.pos) < d * d
+    mth::dist2(c, m.pos()) < d * d
 }
 
 /// The speed setting (speed and advance).
@@ -56,7 +56,7 @@ pub fn move_control(_s: &Server, m: &mut Mob) {
     }
     if m.move_ctl.op == MoveOp::MoveTo && !m.nav.is_done() {
         let w = m.move_ctl.wanted;
-        let (xd, mut yd, zd) = (w[0] - m.pos[0], w[1] - m.pos[1], w[2] - m.pos[2]);
+        let (xd, mut yd, zd) = (w[0] - m.pos()[0], w[1] - m.pos()[1], w[2] - m.pos()[2]);
         let dd = (xd * xd + yd * yd + zd * zd).sqrt();
         if dd < f64::from(1.0e-5f32) {
             set_speed(m, 0.0);
@@ -114,14 +114,14 @@ pub fn breed(s: &mut Server, m: &mut Mob, partner: i32) {
     m.age = 6000;
     m.reset_love();
     if let Some(i) = s.mob_index(partner)
-        && let Some(p) = s.mobs.list[i].as_mut()
+        && let Some(p) = s.mobs.list.get_mut(i)
     {
         p.age = 6000;
         p.reset_love();
     }
     if s.rule("minecraft:mob_drops", true) {
         let xp = m.rng.next_int_bound(7) + 1;
-        s.spawn_orbs(m.pos, xp);
+        s.spawn_orbs(m.pos(), xp);
     }
 }
 
@@ -150,7 +150,7 @@ pub fn grew_up(s: &mut Server, m: &mut Mob) {
         for d in drops {
             let r = &mut s.mobs.rng;
             let v = [r.next_double() * 0.2 - 0.1, 0.2, r.next_double() * 0.2 - 0.1];
-            s.spawn_item(m.pos, v, d, 10);
+            s.spawn_item(m.pos(), v, d, 10);
         }
     }
 }

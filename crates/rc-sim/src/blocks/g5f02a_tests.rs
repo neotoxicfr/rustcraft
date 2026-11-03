@@ -34,13 +34,13 @@ fn player_tick(w: &mut W) -> Vec<Event> {
 fn cow(w: &mut W, pos: [f64; 3]) -> Mob {
     let mut m = w.p.s.new_mob(Kind::Cow, pos, 0.0);
     m.no_ai = true;
-    m.pos = pos;
+    m.set_pos(pos);
     m.old = pos;
     m
 }
 
 fn mob_tick(w: &mut W, m: &mut Mob) -> Vec<Event> {
-    m.old = m.pos;
+    m.old = m.pos();
     w.p.s.tick_mob(m);
     w.events()
 }
@@ -228,9 +228,9 @@ fn mob_command_teleport_forgets_moves() {
     let id = m.id;
     w.p.s.add_mob(m);
     let m = w.p.s.mobs.get_mut(id).expect("cow in the list");
-    let from = m.pos;
-    m.pos[0] += 0.1;
-    m.inside.record(from, m.pos, [0.1, 0.0, 0.0]);
+    let from = m.pos();
+    m.add_pos_axis(0, 0.1);
+    m.inside.record(from, m.pos(), [0.1, 0.0, 0.0]);
     w.p.s.command_teleport(crate::commands::ents::E::Mob(id), feet([12, Y, 12]), [false; 3], None, [false; 2]);
     let mut m = w.p.s.mobs.get_mut(id).expect("cow in the list").clone();
     let _ = w.p.s.inside_blocks(&mut Who::Mob(&mut m));
@@ -253,10 +253,10 @@ fn mob_rotate_keeps_moves_and_path() {
         let id = m.id;
         w.p.s.add_mob(m);
         let m = w.p.s.mobs.get_mut(id).expect("cow in the list");
-        let from = m.pos;
-        m.pos[0] += 2.0;
-        m.inside.record(from, m.pos, [2.0, 0.0, 0.0]);
-        let to = m.pos;
+        let from = m.pos();
+        m.add_pos_axis(0, 2.0);
+        m.inside.record(from, m.pos(), [2.0, 0.0, 0.0]);
+        let to = m.pos();
         let body = m.body_yaw;
         m.nav.path = some_path();
         if look {
@@ -266,10 +266,10 @@ fn mob_rotate_keeps_moves_and_path() {
         }
         let mut m = w.p.s.mobs.get_mut(id).expect("cow in the list").clone();
         let old = m.old;
-        m.old = m.pos; // start of the next tick: only the recorded path goes through the fire
+        m.old = m.pos(); // start of the next tick: only the recorded path goes through the fire
         let _ = w.p.s.inside_blocks(&mut Who::Mob(&mut m));
         assert_eq!(m.fire, 160, "path through the fire swept (look: {look})");
-        assert_eq!((old, m.pos), (from, to), "positions intact (look: {look})");
+        assert_eq!((old, m.pos()), (from, to), "positions intact (look: {look})");
         assert!(m.nav.path.is_some(), "path kept (look: {look})");
         assert_eq!(m.head_yaw, m.yaw, "head aligned (look: {look})");
         if look {
@@ -414,7 +414,7 @@ fn g5f02a_bench() {
     let mut m = cow(&mut w, feet([4, Y, 4]));
     let t = std::time::Instant::now();
     for _ in 0..n {
-        m.old = m.pos;
+        m.old = m.pos();
         std::hint::black_box(w.p.s.inside_blocks(&mut Who::Mob(&mut m)));
     }
     let still = t.elapsed().as_nanos() as f64 / f64::from(n);
@@ -422,8 +422,8 @@ fn g5f02a_bench() {
     for i in 0..n {
         let from = [4.5 + f64::from(i % 10) * 0.2, f64::from(Y), 4.5];
         m.old = from;
-        m.pos = [from[0] + 0.2, from[1], from[2]];
-        m.inside.record(from, m.pos, [0.2, 0.0, 0.0]);
+        m.set_pos([from[0] + 0.2, from[1], from[2]]);
+        m.inside.record(from, m.pos(), [0.2, 0.0, 0.0]);
         std::hint::black_box(w.p.s.inside_blocks(&mut Who::Mob(&mut m)));
     }
     let moving = t.elapsed().as_nanos() as f64 / f64::from(n);

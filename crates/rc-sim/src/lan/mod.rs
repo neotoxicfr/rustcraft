@@ -784,14 +784,13 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|m| m.track.seen && m.alive())
             .map(|m| {
                 (
                     m.id,
                     m.uuid,
                     self.entity_kind_id(m.kind.info().name),
-                    m.pos,
+                    m.pos(),
                     m.yaw,
                     m.pitch,
                     m.head_yaw,

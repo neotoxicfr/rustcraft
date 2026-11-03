@@ -205,7 +205,7 @@ fn arrow_hit_grants_take_aim() {
     use crate::projectiles::{PKind, Proj};
     let Some((mut p, _dir)) = probe("l9-take-aim") else { return };
     let z = tank(&mut p, [114.5, -59.0, 110.5]);
-    let (zid, pos) = (z.id, z.pos);
+    let (zid, pos) = (z.id, z.pos());
     p.s.add_mob(z);
     let mut arrow = Proj::new(PKind::Arrow, 900_001, [112.5, -58.5, 110.5], st("minecraft:arrow"));
     arrow.owner = Some(p.s.uuid);
@@ -250,7 +250,7 @@ fn arrow_hit_is_not_damage_dealt() {
     use crate::projectiles::{PKind, Proj};
     let Some((mut p, _dir)) = probe("l9-arrow-stat") else { return };
     let z = tank(&mut p, [114.5, -59.0, 110.5]);
-    let (zid, pos) = (z.id, z.pos);
+    let (zid, pos) = (z.id, z.pos());
     p.s.add_mob(z);
     let mut arrow = Proj::new(PKind::Arrow, 900_002, [112.5, -58.5, 110.5], st("minecraft:arrow"));
     arrow.owner = Some(p.s.uuid);

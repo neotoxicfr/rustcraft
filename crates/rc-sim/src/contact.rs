@@ -432,7 +432,7 @@ impl Server {
             return;
         }
         let (half, h) = (f64::from(m.width()) / 2.0, f64::from(m.height()));
-        let (from, to) = (m.old, m.pos);
+        let (from, to) = (m.old, m.pos());
         if contact_pal_mobs() {
             let (lo, hi) = envelope(from, to, half, h);
             if !self.contact_maybe(lo, hi, MOB_KINDS) {
@@ -706,12 +706,12 @@ impl Server {
         }
         let v = m.vel;
         let moving = (v[0] * 20.0).powi(2) + (v[2] * 20.0).powi(2) >= MIN_SPEED * MIN_SPEED;
-        let due = m.on_ground && moving && m.tick_count % 5 == 0 && self.soul_block_below(m.pos, m.support);
+        let due = m.on_ground && moving && m.tick_count % 5 == 0 && self.soul_block_below(m.pos(), m.support);
         if due {
             let w = f64::from(m.width());
             let rx = m.rng.next_double();
             let rz = m.rng.next_double();
-            let at = [m.pos[0] + (rx - 0.5) * w, m.pos[1] + 0.1, m.pos[2] + (rz - 0.5) * w];
+            let at = [m.pos()[0] + (rx - 0.5) * w, m.pos()[1] + 0.1, m.pos()[2] + (rz - 0.5) * w];
             self.particles("minecraft:soul", at, [(v[0] * -0.2) as f32, 0.1, (v[2] * -0.2) as f32], 1.0, 0);
         }
         let chance = self.life.rng.next_float() < 0.35;
@@ -744,12 +744,12 @@ impl Server {
         if m.alive() && (st.last != Some(pos) || landed || changed_boots) {
             let vehicle = m.mount.vehicle.is_some();
             if frost > 0 && m.on_ground && !vehicle {
-                self.frost_disk(m.pos, frost, Ent::Mob(m.id));
+                self.frost_disk(m.pos(), frost, Ent::Mob(m.id));
             }
             if soul > 0 {
                 // Mob gliding is not simulated: never "flying".
                 let flying = false;
-                let on_soul = self.soul_block_below(m.pos, m.support);
+                let on_soul = self.soul_block_below(m.pos(), m.support);
                 let want = soul_wanted(active, vehicle, flying, on_soul, m.on_ground);
                 if want && !active {
                     m.attrs.speed.set_mod(SOUL_ID, soul_speed_bonus(soul), 0);

@@ -60,7 +60,7 @@ impl Server {
             } else if m.rng.next_float() < 0.5
                 && m.target.is_some()
                 && !has(m, "minecraft:speed")
-                && m.target.and_then(|t| self.ent_pos(t)).is_some_and(|p| dist2(p, m.pos) > 121.0)
+                && m.target.and_then(|t| self.ent_pos(t)).is_some_and(|p| dist2(p, m.pos()) > 121.0)
             {
                 Some("minecraft:swiftness")
             } else {
@@ -92,7 +92,7 @@ impl Server {
         if self.level.difficulty_id() == 0 || v.removed {
             return false;
         }
-        let mut w = self.new_mob(Kind::Witch, v.pos, v.yaw);
+        let mut w = self.new_mob(Kind::Witch, v.pos(), v.yaw);
         w.pitch = v.pitch;
         w.head_yaw = v.head_yaw;
         w.body_yaw = v.body_yaw;
@@ -119,9 +119,9 @@ impl Server {
             Ent::Player => self.mobs.player_vel,
             Ent::Mob(id) => self.mob_ref(id).map_or([0.0; 3], |o| o.vel),
         };
-        let xd = tp[0] + tv[0] - m.pos[0];
-        let yd = eye - f64::from(1.1f32) - m.pos[1];
-        let zd = tp[2] + tv[2] - m.pos[2];
+        let xd = tp[0] + tv[0] - m.pos()[0];
+        let yd = eye - f64::from(1.1f32) - m.pos()[1];
+        let zd = tp[2] + tv[2] - m.pos()[2];
         let dist = (xd * xd + zd * zd).sqrt();
         let (t_health, t_raider, has) = match target {
             Ent::Player => (self.life.vit.health, false, self.fx().has("minecraft:slowness")),
@@ -158,7 +158,7 @@ impl Server {
     /// the distance, events 2002 / 2007).
     fn spawn_thrown_potion(&mut self, m: &Mob, potion: &str, dir: [f64; 3], pow: f32, unc: f32) {
         let id = self.proj_new_id();
-        let pos = [m.pos[0], m.eye_y() - f64::from(0.1f32), m.pos[2]];
+        let pos = [m.pos()[0], m.eye_y() - f64::from(0.1f32), m.pos()[2]];
         let one = potion_stack("minecraft:splash_potion", potion);
         let mut p = Proj::new(PKind::SplashPotion, id, pos, one.clone());
         p.owner = Some(m.uuid);

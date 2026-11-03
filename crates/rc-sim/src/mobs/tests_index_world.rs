@@ -22,7 +22,7 @@ fn game_ticks(p: &mut Probe, n: i32) {
 }
 
 fn count(p: &Probe, k: Kind) -> usize {
-    p.s.mobs.list.iter().flatten().filter(|m| m.kind == k && m.alive()).count()
+    p.s.mobs.list.iter().filter(|m| m.kind == k && m.alive()).count()
 }
 
 /// A zombie hurt by a pig calls its class for help: two per-species queries in the next ticks.
@@ -62,7 +62,7 @@ fn mass_removals_keep_the_index_serving() {
     assert_eq!(count(&p, Kind::Pig), 45);
     // Bodies leave the list once their death animation is over.
     game_ticks(&mut p, 25);
-    let pigs_listed = p.s.mobs.list.iter().flatten().filter(|m| m.kind == Kind::Pig).count();
+    let pigs_listed = p.s.mobs.list.iter().filter(|m| m.kind == Kind::Pig).count();
     assert_eq!(pigs_listed, 45, "dead pigs still in the list");
     let tails = refreshes().0 - before_kill.0;
     eprintln!("refreshes during the kill: {tails} by tail re-index");
@@ -96,7 +96,7 @@ fn mass_removals_keep_the_index_serving() {
     }
     // The index is serving at the end of the tick.
     assert!(
-        p.s.mobs.index.kind_slots(&p.s.mobs.list, Kind::Pig).is_some() == kind_on,
+        p.s.mobs.index.kind_slots(p.s.mobs.list.slots(), Kind::Pig).is_some() == kind_on,
         "per-species index out of step after the removals"
     );
     finish(p, dir);

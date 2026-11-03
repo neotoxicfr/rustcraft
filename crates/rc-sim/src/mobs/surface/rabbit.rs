@@ -119,7 +119,7 @@ pub fn start_jumping(s: &mut Server, m: &mut Mob) {
 }
 
 fn face_point(m: &mut Mob, x: f64, z: f64) {
-    m.yaw = (mth::atan2(z - m.pos[2], x - m.pos[0]) * 180.0 / std::f64::consts::PI) as f32 - 90.0;
+    m.yaw = (mth::atan2(z - m.pos()[2], x - m.pos()[0]) * 180.0 / std::f64::consts::PI) as f32 - 90.0;
 }
 
 /// The species' own server AI step.
@@ -143,7 +143,7 @@ pub fn custom_ai_step(s: &mut Server, m: &mut Mob) {
             && m.surf.jump_delay == 0
             && let Some(t) = m.target
             && let Some(tp) = s.ent_pos(t)
-            && mth::dist2(m.pos, tp) < 16.0
+            && mth::dist2(m.pos(), tp) < 16.0
         {
             face_point(m, tp[0], tp[2]);
             let sp = m.move_ctl.speed_mod;
@@ -189,11 +189,11 @@ pub fn jump_power(_s: &Server, m: &Mob) -> f32 {
     }
     if let Some(p) = &m.nav.path
         && !p.is_done()
-        && p.entity_pos_at(m.width(), p.next)[1] > m.pos[1] + 0.5
+        && p.entity_pos_at(m.width(), p.next)[1] > m.pos()[1] + 0.5
     {
         base = 0.5;
     }
-    if m.horizontal_collision || (m.jumping && m.move_ctl.wanted[1] > m.pos[1] + 0.5) {
+    if m.horizontal_collision || (m.jumping && m.move_ctl.wanted[1] > m.pos()[1] + 0.5) {
         base = 0.5;
     }
     base

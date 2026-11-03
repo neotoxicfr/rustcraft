@@ -535,7 +535,7 @@ impl Server {
         match e {
             E::Player => {}
             E::Mob(i) => {
-                if let Some(m) = self.mobs.index_of(i).and_then(|k| self.mobs.list[k].as_deref_mut()) {
+                if let Some(m) = self.mobs.index_of(i).and_then(|k| self.mobs.list.get_mut(k)) {
                     m.removed = true;
                 }
             }

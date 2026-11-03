@@ -1,9 +1,9 @@
 //! INDICATIVE index of mobs: identifier → slot of `Mobs::list`, UUID → slot.
 //!
-//! The list remains the only truth (public field, dozens of sites take it out slot by slot
-//! and put it back). The index is only a hint: each read checks that the designated slot
+//! The list remains the only truth (dozens of sites take a mob out of its slot and put it back,
+//! through `MobList`). The index is only a hint: each read checks that the designated slot
 //! does carry the requested identifier; otherwise (slot empty for the duration of a tick, slot replaced,
-//! list shifted by a removal, direct addition without `Mobs::push`) the earlier linear scan is redone
+//! list shifted by a removal, addition the index missed) the earlier linear scan is redone
 //! and the index is marked stale, rebuilt at the end of the mob tick. Forgetting a
 //! mutation therefore costs time, never correctness.
 //!
@@ -101,7 +101,7 @@ pub struct MobIndex {
     dup_uuid: bool,
 }
 
-type List = Vec<Option<Box<Mob>>>;
+type List = [Option<Box<Mob>>];
 
 impl MobIndex {
     /// Mob added at the end of the list at slot `at`.

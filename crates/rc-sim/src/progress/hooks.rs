@@ -214,7 +214,7 @@ impl Server {
         }
         // Display name taken from `m`: a mob that dies during its tick is out of the list, not
         // findable by its UUID.
-        self.s9_living_killed(m.kind.info().name, m.uuid, Who::Mob(m), m.pos, &|s| s.mob_display(m), ty, by);
+        self.s9_living_killed(m.kind.info().name, m.uuid, Who::Mob(m), m.pos(), &|s| s.mob_display(m), ty, by);
     }
 
     /// Kill of a non-player living entity credited to the player: statistics `killed` (its type
@@ -273,7 +273,7 @@ impl Server {
         }
         let attacker = self.prog.attacker.take();
         let src = attacker.as_deref().map(Who::Mob);
-        let dmg = Dmg { ty: ty.to_owned(), source: src, direct: src, pos: attacker.as_ref().map(|m| m.pos) };
+        let dmg = Dmg { ty: ty.to_owned(), source: src, direct: src, pos: attacker.as_ref().map(|m| m.pos()) };
         self.trig_entity_hurt_player(&dmg, hit.0, hit.1, parried > 0.0);
         self.prog.attacker = attacker;
     }
@@ -301,7 +301,7 @@ impl Server {
         self.reset_stat("minecraft:custom", "minecraft:time_since_rest");
         self.score_criteria_add("deathCount", 1);
         let src = killer.as_deref().map(Who::Mob);
-        let dmg = Dmg { ty: ty.to_owned(), source: src, direct: src, pos: killer.as_ref().map(|m| m.pos) };
+        let dmg = Dmg { ty: ty.to_owned(), source: src, direct: src, pos: killer.as_ref().map(|m| m.pos()) };
         self.trig_player_killed(src, &dmg);
     }
 

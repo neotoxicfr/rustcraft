@@ -229,10 +229,10 @@ fn in_clouds(s: &Server, m: &Mob) -> bool {
         return false;
     }
     let bottom = h as f32;
-    if m.pos[1] + f64::from(m.height()) < f64::from(bottom) {
+    if m.pos()[1] + f64::from(m.height()) < f64::from(bottom) {
         return false;
     }
-    m.pos[1] <= f64::from(bottom + 4.0)
+    m.pos()[1] <= f64::from(bottom + 4.0)
 }
 
 /// Baby brain, home area.
@@ -283,7 +283,7 @@ pub fn move_control(s: &Server, m: &mut Mob) -> bool {
     }
     m.rec.float_duration += m.rng.next_int_bound(5) + 2;
     let w = m.move_ctl.wanted;
-    let travel = [w[0] - m.pos[0], w[1] - m.pos[1], w[2] - m.pos[2]];
+    let travel = [w[0] - m.pos()[0], w[1] - m.pos()[1], w[2] - m.pos()[2]];
     if careful_can_reach(s, m, travel) {
         let n = crate::mobs::mth::normalize(travel);
         let k = FLYING_SPEED * 5.0 / 3.0;
@@ -300,7 +300,7 @@ fn fly_move_control(m: &mut Mob, max_turn: f32) {
     if m.move_ctl.op == MoveOp::MoveTo {
         m.move_ctl.op = MoveOp::Wait;
         let w = m.move_ctl.wanted;
-        let (xd, yd, zd) = (w[0] - m.pos[0], w[1] - m.pos[1], w[2] - m.pos[2]);
+        let (xd, yd, zd) = (w[0] - m.pos()[0], w[1] - m.pos()[1], w[2] - m.pos()[2]);
         let dd = xd * xd + yd * yd + zd * zd;
         if dd < f64::from(2.500_000_3e-7f32) {
             m.yya = 0.0;
@@ -345,7 +345,7 @@ fn careful_can_reach(s: &Server, m: &Mob, travel: [f64; 3]) -> bool {
             }
         }
     }
-    let start = m.pos;
+    let start = m.pos();
     let end = [start[0] + travel[0], start[1] + travel[1], start[2] + travel[2]];
     let (water, lava) = (m.in_water, m.lava_height > 0.0);
     super::super::nether::ghast::each_cell_between(start, end, &at, &mut |p| {
@@ -408,7 +408,7 @@ pub fn look_control(s: &Server, m: &mut Mob) -> bool {
         m.head_yaw = m.yaw;
     } else if m.look.cooldown > 0 {
         m.look.cooldown -= 1;
-        let (xd, zd) = (m.look.wanted[0] - m.pos[0], m.look.wanted[2] - m.pos[2]);
+        let (xd, zd) = (m.look.wanted[0] - m.pos()[0], m.look.wanted[2] - m.pos()[2]);
         let deg = 180.0f32 / std::f32::consts::PI;
         m.yaw = -(super::super::mth::atan2(xd, zd) as f32) * deg;
         m.body_yaw = m.yaw;
@@ -479,7 +479,7 @@ pub fn passenger_point(v: &Mob, rank: usize) -> Option<[f64; 3]> {
 
 /// Dismount location: top of the ghast.
 pub fn dismount_location(v: &Mob) -> Option<[f64; 3]> {
-    (v.kind == Kind::HappyGhast).then(|| [v.pos[0], v.bbox().max[1], v.pos[2]])
+    (v.kind == Kind::HappyGhast).then(|| [v.pos()[0], v.bbox().max[1], v.pos()[2]])
 }
 
 /// Passenger mounted: goggles lowered at the first; motionlessness lifted if
@@ -636,14 +636,14 @@ impl Server {
                 let y = super::super::goals::max_head_y(m.kind) + 20.0;
                 let x = super::super::goals::max_head_x(m);
                 self.look_at(m, [pp[0], eye, pp[2]], y, x);
-                if super::super::mth::dist2(m.pos, pp) < 49.0 {
+                if super::super::mth::dist2(m.pos(), pp) < 49.0 {
                     m.move_ctl.op = MoveOp::Wait;
                 } else {
                     let r = m.rng.next_double();
                     let t = [
-                        (pp[0] - m.pos[0]) * r + m.pos[0],
-                        (eye - m.pos[1]) * r + m.pos[1],
-                        (pp[2] - m.pos[2]) * r + m.pos[2],
+                        (pp[0] - m.pos()[0]) * r + m.pos()[0],
+                        (eye - m.pos()[1]) * r + m.pos()[1],
+                        (pp[2] - m.pos()[2]) * r + m.pos()[2],
                     ];
                     super::super::nav::set_wanted(m, t, 1.0);
                 }
@@ -658,7 +658,7 @@ impl Server {
             return None;
         }
         let range = m.attrs.tempt_range.value();
-        if super::super::mth::dist2(m.pos, self.pos) > range * range {
+        if super::super::mth::dist2(m.pos(), self.pos) > range * range {
             return None;
         }
         let tag = if !wearing_harness(m) && !m.is_baby() {
@@ -674,7 +674,7 @@ impl Server {
     /// and within 16 blocks of a block in one of the six directions; otherwise the last one drawn,
     /// brought under the surface if it is above.
     pub(crate) fn ghast_fly_to(&self, m: &mut Mob, dist_blocks: i32) -> [f64; 3] {
-        let c = m.pos;
+        let c = m.pos();
         let mut result: Option<[f64; 3]> = None;
         for _ in 0..64 {
             let t = [
@@ -706,7 +706,7 @@ impl Server {
         let b = r.map(|v| v.floor() as i32);
         let top = self.motion_blocking_height(b[0], b[2]);
         if top < b[1] && top > self.dim.height.min_y {
-            return [r[0], m.pos[1] - (m.pos[1] - r[1]).abs(), r[2]];
+            return [r[0], m.pos()[1] - (m.pos()[1] - r[1]).abs(), r[2]];
         }
         r
     }

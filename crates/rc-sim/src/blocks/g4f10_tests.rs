@@ -10,11 +10,11 @@ use crate::mobs::mob::Mob;
 use crate::mobs::species::Kind;
 
 fn allays(w: &W) -> Vec<&Mob> {
-    w.p.s.mobs.list.iter().flatten().map(|m| &**m).filter(|m| m.kind == Kind::Allay && !m.removed).collect()
+    w.p.s.mobs.list.iter().filter(|m| m.kind == Kind::Allay && !m.removed).collect()
 }
 
 fn dancing_at(w: &W, x: f64) -> bool {
-    allays(w).iter().find(|m| (m.pos[0] - x).abs() < 1e-9).expect("allay").bm.dancing
+    allays(w).iter().find(|m| (m.pos()[0] - x).abs() < 1e-9).expect("allay").bm.dancing
 }
 
 /// Jukebox at [4, Y, 4]: allays whose eye block is at distance² ≤ 100 dance from the
@@ -39,7 +39,7 @@ fn allay_dances_to_jukebox_and_duplicates() {
     assert!(dancing_at(&w, 4.5), "8 blocks: dance");
     assert!(dancing_at(&w, 4.25), "10 blocks: dance (≤ 100)");
     assert!(!dancing_at(&w, 4.75), "11 blocks: out of range");
-    let a = allays(&w).iter().find(|m| m.pos[0] == 4.5).map(|m| (m.id, m.bm.jukebox)).unwrap();
+    let a = allays(&w).iter().find(|m| m.pos()[0] == 4.5).map(|m| (m.id, m.bm.jukebox)).unwrap();
     assert_eq!(a.1, Some(j), "jukebox picked up");
     // Second jukebox k, in range of all three: b (which was not dancing) picks it up and dances; a and
     // c already dance for j. Stopping k cuts only b.

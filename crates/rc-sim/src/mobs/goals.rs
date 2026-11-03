@@ -522,7 +522,7 @@ impl Server {
     pub(crate) fn ent_pos(&self, e: Ent) -> Option<[f64; 3]> {
         match e {
             Ent::Player => Some(self.pos),
-            Ent::Mob(id) => self.mob_ref(id).map(|m| m.pos),
+            Ent::Mob(id) => self.mob_ref(id).map(|m| m.pos()),
         }
     }
 
@@ -670,7 +670,7 @@ impl Server {
             let modi = if invis { self.visibility(target, m) } else { 1.0 };
             let vis = (range * modi).max(2.0);
             let Some(p) = self.ent_pos(target) else { return false };
-            if dist2(m.pos, p) > vis * vis {
+            if dist2(m.pos(), p) > vis * vis {
                 return false;
             }
         }
@@ -690,7 +690,7 @@ impl Server {
         }
         let v = match (self.ent_pos(target), self.ent_eye(target)) {
             (Some(p), Some(eye)) => {
-                let from = [m.pos[0], m.eye_y(), m.pos[2]];
+                let from = [m.pos()[0], m.eye_y(), m.pos()[2]];
                 let to = [p[0], eye, p[2]];
                 dist2(from, to) <= 128.0 * 128.0 && !self.clip_blocks(from, to)
             }
@@ -724,7 +724,7 @@ impl Server {
         if who == Who::Player {
             cands.push(Ent::Player);
         } else {
-            for o in self.mobs.list.iter().flatten() {
+            for o in self.mobs.list.iter() {
                 let fits = match who {
                     Who::Villager => matches!(o.kind, Kind::Villager | Kind::WanderingTrader),
                     Who::ZombieClass => o.kind.zombie_like(),
@@ -768,7 +768,7 @@ impl Server {
                 cands.push(Ent::Player);
             }
         }
-        let from = [m.pos[0], if from_eye { m.eye_y() } else { m.pos[1] }, m.pos[2]];
+        let from = [m.pos()[0], if from_eye { m.eye_y() } else { m.pos()[1] }, m.pos()[2]];
         let mut best: Option<(f64, Ent)> = None;
         for e in cands {
             if !test(self, m, e) {
@@ -804,10 +804,10 @@ impl Server {
                 };
                 !d.is_removed() && ib.intersects(&area)
             })
-            .map(|(i, d)| (dist2(m.pos, d.pos), i))
+            .map(|(i, d)| (dist2(m.pos(), d.pos), i))
             .collect();
         list.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let eye = [m.pos[0], m.eye_y(), m.pos[2]];
+        let eye = [m.pos()[0], m.eye_y(), m.pos()[2]];
         list.into_iter()
             .map(|(d, i)| (d, &self.life.drops[i]))
             .find(|(d, it)| {
@@ -894,9 +894,9 @@ impl Server {
                 let mut best: Option<(f64, i32)> = None;
                 // Same class or subclass: the baby llama also follows a trader's llama.
                 let same = |k: Kind| k == m.kind || (m.kind == Kind::Llama && k == Kind::TraderLlama);
-                for o in self.mobs.list.iter().flatten() {
+                for o in self.mobs.list.iter() {
                     if same(o.kind) && o.age >= 0 && o.touches(&area) {
-                        let d = dist2(m.pos, o.pos);
+                        let d = dist2(m.pos(), o.pos());
                         if best.is_none_or(|b| d <= b.0) {
                             best = Some((d, o.id));
                         }
@@ -971,13 +971,13 @@ impl Server {
             Goal::Swell { .. } => {
                 m.swell_dir > 0
                     || m.target
-                        .is_some_and(|t| self.ent_alive(t) && self.ent_pos(t).is_some_and(|p| dist2(m.pos, p) < 9.0))
+                        .is_some_and(|t| self.ent_alive(t) && self.ent_pos(t).is_some_and(|p| dist2(m.pos(), p) < 9.0))
             }
             Goal::Leap { target, .. } => {
                 *target = m.target;
                 let Some(t) = m.target else { return false };
                 let Some(p) = self.ent_pos(t) else { return false };
-                let d = dist2(m.pos, p);
+                let d = dist2(m.pos(), p);
                 if !(4.0..=16.0).contains(&d) || !m.on_ground {
                     return false;
                 }
@@ -1001,7 +1001,7 @@ impl Server {
                 let Some(f) = f else { return false };
                 let Some(fp) = self.ent_pos(f) else { return false };
                 let Some(p) = self.default_random_pos_away(m, 16, 7, fp) else { return false };
-                if dist2(fp, p) < dist2(fp, m.pos) {
+                if dist2(fp, p) < dist2(fp, m.pos()) {
                     return false;
                 }
                 *path = self.create_path(m, super::mth::block_of(p), 0);
@@ -1060,7 +1060,7 @@ impl Server {
                 if !self.owner_here(m) {
                     return true;
                 }
-                if dist2(m.pos, self.pos) < 144.0 && self.mobs.player_hurt_by.is_some() {
+                if dist2(m.pos(), self.pos) < 144.0 && self.mobs.player_hurt_by.is_some() {
                     return false;
                 }
                 m.sitting
@@ -1070,7 +1070,7 @@ impl Server {
                 if !self.owner_here(m) || m.sitting || m.mount.vehicle.is_some() || self.game_mode == 3 {
                     return false;
                 }
-                dist2(m.pos, self.pos) >= f64::from(*start * *start)
+                dist2(m.pos(), self.pos) >= f64::from(*start * *start)
             }
             Goal::Beg { dist, .. } => {
                 let d = f64::from(*dist);
@@ -1095,7 +1095,7 @@ impl Server {
             Goal::EndermanFreeze { target } => {
                 *target = m.target;
                 let Some(Ent::Player) = m.target else { return false };
-                dist2(m.pos, self.pos) <= 256.0 && self.player_looking_at(m)
+                dist2(m.pos(), self.pos) <= 256.0 && self.player_looking_at(m)
             }
             Goal::HurtBy { base, stamp, .. } => {
                 let Some((by, ts)) = m.last_hurt_by_mob else { return false };
@@ -1128,7 +1128,7 @@ impl Server {
                 *target = if w == Who::Player {
                     // F03: cubes only aim at a player at most 4 blocks in height away.
                     let ok = creative_ok(self, Ent::Player)
-                        && (!m.kind.is_cube() || (self.pos[1] - m.pos[1]).abs() <= 4.0)
+                        && (!m.kind.is_cube() || (self.pos[1] - m.pos()[1]).abs() <= 4.0)
                         && super::nether::player_target_filter(self, m)
                         && (!angry
                             || m.anger_target == Some(Ent::Player)
@@ -1211,7 +1211,7 @@ impl Server {
             }
             Goal::Tempt { scare, p, prot, .. } => {
                 if *scare && super::surface::can_scare(m) {
-                    if dist2(m.pos, self.pos) < 36.0 {
+                    if dist2(m.pos(), self.pos) < 36.0 {
                         if dist2(self.pos, *p) > 0.010_000_000_000_000_002 {
                             return false;
                         }
@@ -1233,7 +1233,7 @@ impl Server {
                 if !p.alive() {
                     return false;
                 }
-                let d = dist2(m.pos, p.pos);
+                let d = dist2(m.pos(), p.pos());
                 (9.0..=256.0).contains(&d)
             }
             Goal::LookAtPlayer { dist, at, time, .. } => {
@@ -1242,7 +1242,7 @@ impl Server {
                     return false;
                 }
                 let d = f64::from(*dist);
-                self.ent_pos(e).is_some_and(|p| dist2(m.pos, p) <= d * d) && *time > 0
+                self.ent_pos(e).is_some_and(|p| dist2(m.pos(), p) <= d * d) && *time > 0
             }
             Goal::LookAround { time, .. } => *time >= 0,
             Goal::Melee { unseen, kind, .. } => {
@@ -1276,12 +1276,12 @@ impl Server {
                 {
                     return false;
                 }
-                dist2(m.pos, self.pos) > f64::from(*stop * *stop)
+                dist2(m.pos(), self.pos) > f64::from(*stop * *stop)
             }
             Goal::Beg { dist, time } => {
                 let d = f64::from(*dist);
                 self.ent_alive(Ent::Player)
-                    && dist2(m.pos, self.pos) <= d * d
+                    && dist2(m.pos(), self.pos) <= d * d
                     && *time > 0
                     && (self.holding(Food::Item("minecraft:bone")) || self.holding(Food::Tag("minecraft:wolf_food")))
             }
@@ -1291,14 +1291,14 @@ impl Server {
                     return false;
                 }
                 let Some(p) = self.ent_pos(t) else { return false };
-                if dist2(m.pos, p) > 225.0 {
+                if dist2(m.pos(), p) > 225.0 {
                     return false;
                 }
                 !m.nav.is_done() || self.goal_can_use(g, m)
             }
             Goal::EndermanFreeze { target } => {
                 let Some(t) = *target else { return false };
-                t == Ent::Player && dist2(m.pos, self.pos) <= 256.0 && self.player_looking_at(m)
+                t == Ent::Player && dist2(m.pos(), self.pos) <= 256.0 && self.player_looking_at(m)
             }
             Goal::Nearest { base, non_tame, target, .. } if *non_tame => {
                 let Some(t) = *target else { return false };
@@ -1370,7 +1370,7 @@ impl Server {
                 let Some(t) = *target else { return };
                 let Some(tp) = self.ent_pos(t) else { return };
                 let mv = m.vel;
-                let mut d = [tp[0] - m.pos[0], 0.0, tp[2] - m.pos[2]];
+                let mut d = [tp[0] - m.pos()[0], 0.0, tp[2] - m.pos()[2]];
                 let l = d[0] * d[0] + d[2] * d[2];
                 if l > 1.0e-7 {
                     let n = l.sqrt();
@@ -1449,7 +1449,7 @@ impl Server {
                 if *alert {
                     // Same-class kin (unit cube box + follow range, 10, follow range).
                     let follow = m.follow_range();
-                    let p = m.pos;
+                    let p = m.pos();
                     let area = rc_physics::Aabb {
                         min: [p[0] - follow, p[1] - 10.0, p[2] - follow],
                         max: [p[0] + 1.0 + follow, p[1] + 1.0 + 10.0, p[2] + 1.0 + follow],
@@ -1571,13 +1571,13 @@ impl Server {
             }
             Goal::Breed { speed, partner, love_time } => {
                 let Some(pid) = *partner else { return };
-                let Some(p) = self.mob_ref(pid).map(|p| (p.pos, p.eye_y())) else { return };
+                let Some(p) = self.mob_ref(pid).map(|p| (p.pos(), p.eye_y())) else { return };
                 let x = max_head_x(m);
                 self.look_at(m, [p.0[0], p.1, p.0[2]], 10.0, x);
                 let s = *speed;
                 self.move_to_entity(m, p.0, s);
                 *love_time += 1;
-                if *love_time >= reduced(60) && dist2(m.pos, p.0) < 9.0 {
+                if *love_time >= reduced(60) && dist2(m.pos(), p.0) < 9.0 {
                     self.breed(m, pid);
                 }
             }
@@ -1585,7 +1585,7 @@ impl Server {
                 let eye = self.player_eye_y();
                 // Look: species' max head deviation + 20, species' max pitch.
                 self.look_at(m, [self.pos[0], eye, self.pos[2]], max_head_y(m.kind) + 20.0, max_head_x(m));
-                if dist2(m.pos, self.pos) < *stop * *stop {
+                if dist2(m.pos(), self.pos) < *stop * *stop {
                     m.nav.stop();
                 } else {
                     let s = *speed;
@@ -1597,7 +1597,7 @@ impl Server {
                 *recalc -= 1;
                 if *recalc <= 0 {
                     *recalc = reduced(10);
-                    if let Some(p) = parent.and_then(|id| self.mob_ref(id)).map(|p| p.pos) {
+                    if let Some(p) = parent.and_then(|id| self.mob_ref(id)).map(|p| p.pos()) {
                         let s = *speed;
                         self.move_to_entity(m, p, s);
                     }
@@ -1615,7 +1615,7 @@ impl Server {
             Goal::LookAround { rel, time } => {
                 *time -= 1;
                 let eye = m.eye_y();
-                self.look_at(m, [m.pos[0] + rel[0], eye, m.pos[2] + rel[1]], 10.0, max_head_x(m));
+                self.look_at(m, [m.pos()[0] + rel[0], eye, m.pos()[2] + rel[1]], 10.0, max_head_x(m));
             }
             Goal::Melee { .. } => self.melee_tick(g, m),
             Goal::Surf(sg) => self.surf_tick(sg, m),
@@ -1628,7 +1628,7 @@ impl Server {
             Goal::Swell { target } => {
                 m.swell_dir = match *target {
                     Some(t) if self.ent_alive(t) => {
-                        let far = self.ent_pos(t).is_none_or(|p| dist2(m.pos, p) > 49.0);
+                        let far = self.ent_pos(t).is_none_or(|p| dist2(m.pos(), p) > 49.0);
                         if far || !self.line_of_sight(m, t) { -1 } else { 1 }
                     }
                     _ => -1,
@@ -1639,7 +1639,7 @@ impl Server {
                     m.target = None;
                 }
                 let Some(f) = from.and_then(|f| self.ent_pos(f)) else { return };
-                m.nav.speed_mod = if dist2(m.pos, f) < 49.0 { *sprint } else { *walk };
+                m.nav.speed_mod = if dist2(m.pos(), f) < 49.0 { *sprint } else { *walk };
             }
             Goal::EatBlock { tick } => {
                 *tick = (*tick - 1).max(0);
@@ -1666,7 +1666,7 @@ impl Server {
                 }
             }
             Goal::FollowOwner { speed, recalc, .. } => {
-                let far = dist2(m.pos, self.pos) >= 144.0;
+                let far = dist2(m.pos(), self.pos) >= 144.0;
                 if !far {
                     let (eye, x) = (self.player_eye_y(), max_head_x(m));
                     self.look_at(m, [self.pos[0], eye, self.pos[2]], 10.0, x);
@@ -1694,7 +1694,7 @@ impl Server {
                 self.look_at(m, [p[0], eye, p[2]], 30.0, 30.0);
                 let w = f64::from(m.width() * 2.0);
                 let r = w * w;
-                let d = dist2(m.pos, p);
+                let d = dist2(m.pos(), p);
                 let speed = if d > r && d < 16.0 {
                     1.33
                 } else if d < 225.0 {
@@ -1731,11 +1731,11 @@ impl Server {
                     }
                 } else if m.target == Some(Ent::Player) {
                     if self.player_looking_at(m) {
-                        if dist2(m.pos, self.pos) < 16.0 {
+                        if dist2(m.pos(), self.pos) < 16.0 {
                             self.enderman_teleport_random(m);
                         }
                         *teleport = 0;
-                    } else if dist2(m.pos, self.pos) > 256.0 {
+                    } else if dist2(m.pos(), self.pos) > 256.0 {
                         *teleport += 1;
                         if *teleport >= reduced(30) {
                             self.enderman_teleport_towards(m, self.pos);
@@ -1760,7 +1760,7 @@ impl Server {
         {
             *pathed = tp;
             *recalc = 4 + m.rng.next_int_bound(7);
-            let d = dist2(m.pos, tp);
+            let d = dist2(m.pos(), tp);
             if d > 1024.0 {
                 *recalc += 10;
             } else if d > 256.0 {
@@ -1783,7 +1783,7 @@ impl Server {
                 m.surf.standing = false;
             } else {
                 let tw = self.ent_bbox(t).map_or(0.6, |b| b.max[0] - b.min[0]) as f32 + 3.0;
-                if dist2(m.pos, tp) < f64::from(tw * tw) {
+                if dist2(m.pos(), tp) < f64::from(tw * tw) {
                     if *cd <= 0 {
                         m.surf.standing = false;
                         *cd = 20;
@@ -1820,7 +1820,7 @@ impl Server {
         let Goal::Bow { speed, min_interval, radius2, attack_time, see, cw, back, strafe } = g else { return };
         let Some(t) = m.target else { return };
         let (Some(tp), Some(eye)) = (self.ent_pos(t), self.ent_eye(t)) else { return };
-        let d = dist2(m.pos, tp);
+        let d = dist2(m.pos(), tp);
         let has = self.line_of_sight(m, t);
         let had = *see > 0;
         if has != had {
@@ -1936,7 +1936,7 @@ impl Server {
         }
         let follow = m.follow_range();
         let Some(p) = self.ent_pos(t) else { return false };
-        if dist2(m.pos, p) > follow * follow {
+        if dist2(m.pos(), p) > follow * follow {
             return false;
         }
         if base.must_see {
@@ -1957,7 +1957,7 @@ impl Server {
     /// calls its whole class, `ZOMBIE_CLASS`).
     fn alert_others(&mut self, m: &Mob) {
         let follow = m.follow_range();
-        let p = m.pos;
+        let p = m.pos();
         let area = rc_physics::Aabb {
             min: [p[0] - follow, p[1] - 10.0, p[2] - follow],
             max: [p[0] + 1.0 + follow, p[1] + 1.0 + 10.0, p[2] + 1.0 + follow],
@@ -1966,7 +1966,7 @@ impl Server {
         // F11: the bee only alerts if it sees the aggressor (computed once).
         let los = match (self.ent_pos(by), self.ent_eye(by)) {
             (Some(p), Some(eye)) if m.kind == Kind::Bee => {
-                let from = [m.pos[0], m.eye_y(), m.pos[2]];
+                let from = [m.pos()[0], m.eye_y(), m.pos()[2]];
                 let to = [p[0], eye, p[2]];
                 dist2(from, to) <= 128.0 * 128.0 && !self.clip_blocks(from, to)
             }
@@ -2055,12 +2055,12 @@ impl Server {
 
     /// Height of the seat point of a mounted entity.
     fn riding_position_y(&self, t: Ent) -> Option<f64> {
-        let (v, rank, animal) = self.mobs.list.iter().flatten().find_map(|v| {
+        let (v, rank, animal) = self.mobs.list.iter().find_map(|v| {
             let rank = v.mount.passengers.iter().position(|p| *p == t)?;
             let animal = matches!(t, Ent::Mob(id) if self.mob_ref(id).is_some_and(|o| o.kind.is_animal()));
             Some((v, rank, animal))
         })?;
-        Some(v.pos[1] + self.passenger_point(v, rank, animal)[1])
+        Some(v.pos()[1] + self.passenger_point(v, rank, animal)[1])
     }
 
     fn holds_bow(&self, m: &Mob) -> bool {
@@ -2115,7 +2115,7 @@ impl Server {
         let bb = m.bbox();
         let area = rc_physics::Aabb { min: bb.min.map(|v| v - 8.0), max: bb.max.map(|v| v + 8.0) };
         let mut best: Option<(f64, i32)> = None;
-        for o in self.mobs.list.iter().flatten() {
+        for o in self.mobs.list.iter() {
             if o.id == m.id || !o.touches(&area) {
                 continue;
             }
@@ -2141,7 +2141,7 @@ impl Server {
             if !self.targeting_ok(m, Ent::Mob(o.id), false, 8.0, false, true) {
                 continue;
             }
-            let d = dist2(m.pos, o.pos);
+            let d = dist2(m.pos(), o.pos());
             if best.is_none_or(|b| d < b.0) {
                 best = Some((d, o.id));
             }
@@ -2202,18 +2202,18 @@ impl Server {
         if let Some((c, _)) = rpos_home(m)
             && xz > 1.0
         {
-            if m.pos[0] > f64::from(c[0]) {
+            if m.pos()[0] > f64::from(c[0]) {
                 xt -= m.rng.next_double() * xz / 2.0;
             } else {
                 xt += m.rng.next_double() * xz / 2.0;
             }
-            if m.pos[2] > f64::from(c[2]) {
+            if m.pos()[2] > f64::from(c[2]) {
                 zt -= m.rng.next_double() * xz / 2.0;
             } else {
                 zt += m.rng.next_double() * xz / 2.0;
             }
         }
-        [(xt + m.pos[0]).floor() as i32, (f64::from(dir[1]) + m.pos[1]).floor() as i32, (zt + m.pos[2]).floor() as i32]
+        [(xt + m.pos()[0]).floor() as i32, (f64::from(dir[1]) + m.pos()[1]).floor() as i32, (zt + m.pos()[2]).floor() as i32]
     }
 
     fn outside_limits(&self, p: [i32; 3]) -> bool {
@@ -2278,7 +2278,7 @@ impl Server {
 
     /// The position draw opposite a point (cone of π/2 opposite).
     pub(crate) fn default_random_pos_away(&self, m: &mut Mob, h: i32, v: i32, from: [f64; 3]) -> Option<[f64; 3]> {
-        let away = [m.pos[0] - from[0], m.pos[2] - from[2]];
+        let away = [m.pos()[0] - from[0], m.pos()[2] - from[2]];
         let restrict = rpos_restricted(m, f64::from(h));
         let mut best: Option<(f32, [i32; 3])> = None;
         for _ in 0..10 {
@@ -2330,7 +2330,7 @@ impl Server {
             if !rc_physics::is_free(&self.world(), &b) {
                 continue;
             }
-            m.pos = [f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5];
+            m.set_pos([f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5]);
             m.nav.stop();
             m.needs_sync = true;
             return;
@@ -2345,14 +2345,14 @@ impl Server {
         let (yr, pr) = (self.yaw.to_radians(), self.pitch.to_radians());
         let look = [-(yr.sin() * pr.cos()) as f64, -(pr.sin()) as f64, (yr.cos() * pr.cos()) as f64];
         let eye = self.player_eye_y();
-        let to = [m.pos[0] - self.pos[0], m.eye_y() - eye, m.pos[2] - self.pos[2]];
+        let to = [m.pos()[0] - self.pos[0], m.eye_y() - eye, m.pos()[2] - self.pos[2]];
         let dist = (to[0] * to[0] + to[1] * to[1] + to[2] * to[2]).sqrt();
         if dist < 1.0e-6 {
             return false;
         }
         let n = to.map(|v| v / dist);
         let dot = look[0] * n[0] + look[1] * n[1] + look[2] * n[2];
-        dot > 1.0 - 0.025 / dist && !self.clip_blocks([self.pos[0], eye, self.pos[2]], [m.pos[0], m.eye_y(), m.pos[2]])
+        dot > 1.0 - 0.025 / dist && !self.clip_blocks([self.pos[0], eye, self.pos[2]], [m.pos()[0], m.eye_y(), m.pos()[2]])
     }
 }
 
@@ -2372,8 +2372,8 @@ pub(crate) fn forget_and_refresh_universal_anger(m: &mut Mob, time: i64) {
 
 /// Orientation of a mob towards a direct point (yaw and pitch of the body).
 pub fn mob_look_at_direct(m: &mut Mob, tp: [f64; 3], eye: f64, y_max: f32, x_max: f32) {
-    let xd = tp[0] - m.pos[0];
-    let zd = tp[2] - m.pos[2];
+    let xd = tp[0] - m.pos()[0];
+    let zd = tp[2] - m.pos()[2];
     let yd = eye - m.eye_y();
     let sd = (xd * xd + zd * zd).sqrt();
     let yrot = super::mth::yaw_to(xd, zd);
@@ -2456,7 +2456,7 @@ pub(crate) fn rpos_restricted(m: &Mob, h: f64) -> bool {
     rpos_home(m).is_some_and(|(c, r)| {
         let lim = f64::from(r) + h + 1.0;
         let cc = [f64::from(c[0]) + 0.5, f64::from(c[1]) + 0.5, f64::from(c[2]) + 0.5];
-        dist2(cc, m.pos) < lim * lim
+        dist2(cc, m.pos()) < lim * lim
     })
 }
 

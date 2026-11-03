@@ -45,7 +45,7 @@ impl Server {
                 max: [f64::from(p[0]) + 49.0, f64::from(p[1]) + 49.0, f64::from(p[2]) + 49.0],
             };
             let mut list: Vec<Ent> =
-                self.mobs.list.iter().flatten().filter(|m| m.touches(&area)).map(|m| Ent::Mob(m.id)).collect();
+                self.mobs.list.iter().filter(|m| m.touches(&area)).map(|m| Ent::Mob(m.id)).collect();
             if self.ent_bbox(Ent::Player).is_some_and(|bb| bb.intersects(&area)) {
                 list.push(Ent::Player);
             }
@@ -56,7 +56,7 @@ impl Server {
         for e in b.nearby.iter().flatten() {
             let Ent::Mob(id) = *e else { continue };
             let Some(o) = self.mobs.get_mut(id) else { continue };
-            if !o.alive() || o.removed || !near(p, o.pos, 32.0) {
+            if !o.alive() || o.removed || !near(p, o.pos(), 32.0) {
                 continue;
             }
             if let Some(br) = o.npc.as_mut().and_then(|n| n.brain.as_mut()) {
@@ -73,7 +73,7 @@ impl Server {
     fn bell_raider(&self, p: [i32; 3], e: Ent, d: f64) -> bool {
         let Ent::Mob(id) = e else { return false };
         self.mob_ref(id)
-            .is_some_and(|m| m.alive() && !m.removed && super::illagers::is_raider(m.kind) && near(p, m.pos, d))
+            .is_some_and(|m| m.alive() && !m.removed && super::illagers::is_raider(m.kind) && near(p, m.pos(), d))
     }
 
     /// Bell block entity created or loaded: its ticker (G3-F13, common block-entity list).
@@ -109,9 +109,9 @@ impl Server {
                         && let Ent::Mob(id) = e
                         && let Some(k) = self.mob_index(id)
                     {
-                        let mut m = self.mobs.list[k].take().expect("mob");
+                        let mut m = self.mobs.list.take(k).expect("mob");
                         self.give_mob_effect(&mut m, "minecraft:glowing", 60, 0);
-                        self.mobs.list[k] = Some(m);
+                        self.mobs.list.put(k, m);
                     }
                 }
                 b.resonating = false;

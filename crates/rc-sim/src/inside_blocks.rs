@@ -532,8 +532,8 @@ impl Server {
                 pos
             }
             Who::Mob(m) => {
-                m.inside.finish(m.old, m.pos, &mut sc.moves);
-                m.pos
+                m.inside.finish(m.old, m.pos(), &mut sc.moves);
+                m.pos()
             }
             Who::Item(d) => body_moves(&d.body, &mut sc.moves),
             Who::Orb(o) => body_moves(&o.body, &mut sc.moves),
@@ -907,7 +907,7 @@ impl Server {
     fn who_in_rain(&self, who: &Who) -> bool {
         match who {
             Who::Player => self.in_rain(self.pos, self.player_aabb().max[1]),
-            Who::Mob(m) => self.in_rain(m.pos, m.bbox().max[1]),
+            Who::Mob(m) => self.in_rain(m.pos(), m.bbox().max[1]),
             Who::Item(d) => self.in_rain(d.pos, d.body.bounding_box().max[1]),
             Who::Orb(o) => self.in_rain(o.pos, o.body.bounding_box().max[1]),
         }

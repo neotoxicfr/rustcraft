@@ -53,17 +53,18 @@ fn piglin_picks_up_every_wanted_pile_in_one_tick() {
     let i = s
         .mobs
         .list
+        .slots()
         .iter()
         .position(|m| m.as_ref().is_some_and(|m| m.kind == crate::mobs::species::Kind::Piglin))
         .expect("piglin summoned");
-    let mut m = s.mobs.list[i].take().unwrap();
+    let mut m = s.mobs.list.take(i).unwrap();
     m.can_pickup = true;
-    let p = m.pos;
+    let p = m.pos();
     for dx in [-0.5, 0.0, 0.5] {
         s.spawn_item([p[0] + dx, p[1] + 0.2, p[2]], [0.0; 3], stack("minecraft:gold_nugget", 10), 0);
     }
     s.piglin_pickup(&mut m);
-    s.mobs.list[i] = Some(m);
+    s.mobs.list.put(i, m);
     let left = s.life.drops.iter().filter(|d| !d.is_removed() && d.stack.id == "minecraft:gold_nugget").count();
     assert_eq!(left, 0, "the three stacks picked up in the same tick");
     let _ = std::fs::remove_dir_all(dir);

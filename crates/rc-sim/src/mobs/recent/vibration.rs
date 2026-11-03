@@ -326,7 +326,7 @@ impl Server {
 
     /// Event emitted by a mob at its position.
     pub(crate) fn mob_game_event(&mut self, m: &Mob, event: &str) {
-        let pos = m.pos;
+        let pos = m.pos();
         self.game_event_src(event, pos, Some(Src::Living(Ent::Mob(m.id))), None);
     }
 
@@ -373,17 +373,17 @@ impl Server {
             match l.who {
                 Who::Mob(id) => {
                     let Some(i) = self.mob_index(id) else { continue };
-                    let Some(mut m) = self.mobs.list[i].take() else { continue };
+                    let Some(mut m) = self.mobs.list.take(i) else { continue };
                     // Warden and allay: radius 16 at the eyes.
                     if matches!(m.kind, Kind::Warden | Kind::Allay) && !m.removed {
-                        let lp = [m.pos[0], m.eye_y(), m.pos[2]];
+                        let lp = [m.pos()[0], m.eye_y(), m.pos()[2]];
                         if dist_sqr_i(block_of(lp), c) <= 16.0 * 16.0 {
                             let mut data = std::mem::take(&mut m.rec.vib);
                             self.vib_handle(Who::Mob(id), Some(&mut m), &mut data, lp, event, pos, src, state);
                             m.rec.vib = data;
                         }
                     }
-                    self.mobs.list[i] = Some(m);
+                    self.mobs.list.put(i, m);
                 }
                 Who::Block(p) => {
                     let lp = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
@@ -588,8 +588,8 @@ impl Server {
     pub(crate) fn vib_tick_mob(&mut self, m: &mut Mob) {
         let mut data = std::mem::take(&mut m.rec.vib);
         let eye = m.eye_y();
-        let dest = [m.pos[0], eye, m.pos[2]];
-        let target = VibDest::Entity { id: m.id, y_offset: (eye - m.pos[1]) as f32 };
+        let dest = [m.pos()[0], eye, m.pos()[2]];
+        let target = VibDest::Entity { id: m.id, y_offset: (eye - m.pos()[1]) as f32 };
         let (_, received) = self.vib_tick(&mut data, dest, false, target);
         if let Some((info, owner)) = received {
             if m.kind == Kind::Allay {

@@ -76,19 +76,19 @@ fn turtle_eggs_hatch_on_sand() {
     let changes = w.p.s.mobs.rec.vib.log.iter().filter(|e| e.0 == "minecraft:block_change").count();
     assert_eq!(changes, 2, "block_change per crack");
     assert_eq!(level_events(&evs, 2012).len(), 2, "each crack on sand re-emits the growth particles");
-    let before = w.p.s.mobs.list.iter().flatten().filter(|m| m.kind == MobKind::Turtle).count();
+    let before = w.p.s.mobs.list.iter().filter(|m| m.kind == MobKind::Turtle).count();
     rtick(&mut w, nest);
     let evs = w.events();
     assert_eq!(w.p.s.state_name(w.p.s.get(nest)), "minecraft:air", "hatched nest removed");
     assert_eq!(w.sounds(&evs, "minecraft:entity.turtle.egg_hatch"), 1);
     assert_eq!(level_events(&evs, 2001).len(), 3, "one 2001 per egg");
-    let babies: Vec<_> = w.p.s.mobs.list.iter().flatten().filter(|m| m.kind == MobKind::Turtle).collect();
+    let babies: Vec<_> = w.p.s.mobs.list.iter().filter(|m| m.kind == MobKind::Turtle).collect();
     assert_eq!(babies.len() - before, 3, "one turtle per egg");
     for (i, t) in babies.iter().enumerate() {
         assert_eq!(t.age, -24_000, "baby");
         assert_eq!(t.surf.home, nest, "home at the nest");
         let x = 4.0 + 0.3 + i as f64 * 0.2;
-        assert!((t.pos[0] - x).abs() < 1e-9 && (t.pos[2] - 4.3).abs() < 1e-9 && t.pos[1] == f64::from(Y), "{:?}", t.pos);
+        assert!((t.pos()[0] - x).abs() < 1e-9 && (t.pos()[2] - 4.3).abs() < 1e-9 && t.pos()[1] == f64::from(Y), "{:?}", t.pos());
     }
     // On stone: never.
     let rock = [8, Y, 4];

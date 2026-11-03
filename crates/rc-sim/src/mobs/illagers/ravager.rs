@@ -121,25 +121,24 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| o.alive() && o.kind != Kind::Ravager && o.touches(&area))
             .map(|o| o.id)
             .collect();
         for id in ids {
             let Some(i) = self.mob_index(id) else { continue };
-            let mut o = self.mobs.list[i].take().expect("mob");
+            let mut o = self.mobs.list.take(i).expect("mob");
             if !super::is_illager(o.kind) {
                 self.mob_hurt_by(&mut o, m, "minecraft:mob_attack", 6.0);
             }
-            strong_knockback(m.pos, &mut o);
-            self.mobs.list[i] = Some(o);
+            strong_knockback(m.pos(), &mut o);
+            self.mobs.list.put(i, o);
         }
         if self.game_mode != 3 && self.ent_alive(Ent::Player) && self.player_aabb().intersects(&area) {
             self.player_hurt_by_mob(
                 m,
                 "minecraft:mob_attack",
                 6.0,
-                Some((m.pos[0] - self.pos[0], m.pos[2] - self.pos[2])),
+                Some((m.pos()[0] - self.pos[0], m.pos()[2] - self.pos[2])),
             );
         }
         self.mob_event(m, 69);
@@ -170,8 +169,8 @@ fn is_crop(name: &str) -> bool {
 
 /// Horizontal push 4 / d², vertical 0.2.
 fn strong_knockback(from: [f64; 3], o: &mut Mob) {
-    let xd = o.pos[0] - from[0];
-    let zd = o.pos[2] - from[2];
+    let xd = o.pos()[0] - from[0];
+    let zd = o.pos()[2] - from[2];
     let dd = (xd * xd + zd * zd).max(0.001);
     o.vel = [o.vel[0] + xd / dd * 4.0, o.vel[1] + 0.2, o.vel[2] + zd / dd * 4.0];
     o.needs_sync = true;

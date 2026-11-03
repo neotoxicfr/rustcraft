@@ -192,7 +192,7 @@ pub fn move_control(m: &mut Mob) {
         m.speed = sp;
         m.zza = sp;
         let w = m.move_ctl.wanted;
-        let (xd, yd, zd) = (w[0] - m.pos[0], w[1] - m.pos[1], w[2] - m.pos[2]);
+        let (xd, yd, zd) = (w[0] - m.pos()[0], w[1] - m.pos()[1], w[2] - m.pos()[2]);
         if yd != 0.0 {
             let dd = (xd * xd + yd * yd + zd * zd).sqrt();
             m.vel[1] += f64::from(sp) * (yd / dd) * 0.1;
@@ -285,7 +285,7 @@ pub fn puff_can_use(s: &Server, m: &Mob) -> bool {
     let b = m.bbox();
     let area = rc_physics::Aabb { min: b.min.map(|v| v - 2.0), max: b.max.map(|v| v + 2.0) };
     let player = s.player_aabb().intersects(&area) && scary(s, Ent::Player) && s.ent_alive(Ent::Player);
-    player || s.mobs.list.iter().flatten().any(|o| o.touches(&area) && scary(s, Ent::Mob(o.id)))
+    player || s.mobs.list.iter().any(|o| o.touches(&area) && scary(s, Ent::Mob(o.id)))
 }
 
 /// Stings of the mobs touched (after the common one), puffed only.
@@ -299,19 +299,18 @@ pub fn puff_touch(s: &mut Server, m: &mut Mob) {
         .mobs
         .list
         .iter()
-        .flatten()
         .filter(|o| o.touches(&area) && o.alive() && !not_scary(o.kind))
         .map(|o| o.id)
         .collect();
     let dmg = (1 + m.sea.puff) as f32;
     for id in ids {
         let Some(i) = s.mob_index(id) else { continue };
-        let Some(mut o) = s.mobs.list[i].take() else { continue };
+        let Some(mut o) = s.mobs.list.take(i) else { continue };
         if o.alive() && s.mob_hurt_by(&mut o, m, "minecraft:mob_attack", dmg) {
             s.give_mob_effect(&mut o, "minecraft:poison", 60 * m.sea.puff, 0);
             s.mob_sound(m, "minecraft:entity.puffer_fish.sting", 1.0, 1.0);
         }
-        s.mobs.list[i] = Some(o);
+        s.mobs.list.put(i, o);
     }
 }
 
@@ -330,16 +329,15 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| o.kind == Kind::Pufferfish && !o.removed && o.touches(&area))
             .map(|o| o.id)
             .collect();
         for id in ids {
             let Some(i) = self.mob_index(id) else { continue };
-            let Some(m) = self.mobs.list[i].take() else { continue };
+            let Some(m) = self.mobs.list.take(i) else { continue };
             let puff = m.sea.puff;
             if puff > 0 {
-                let kb = Some((m.pos[0] - self.pos[0], m.pos[2] - self.pos[2]));
+                let kb = Some((m.pos()[0] - self.pos[0], m.pos()[2] - self.pos[2]));
                 if self.player_hurt_by_mob(&m, "minecraft:mob_attack", (1 + puff) as f32, kb) {
                     let _ = self.send(rc_client::Event::GameEvent { kind: 9, param: 0.0 });
                     self.add_effect_from(
@@ -348,7 +346,7 @@ impl Server {
                     );
                 }
             }
-            self.mobs.list[i] = Some(m);
+            self.mobs.list.put(i, m);
         }
     }
 }
@@ -375,7 +373,7 @@ pub fn school_finalize(s: &mut Server, m: &mut Mob, group: &mut super::super::sp
 pub fn start_following(s: &mut Server, m: &mut Mob, leader: i32) {
     m.sea.leader = Some(leader);
     if let Some(i) = s.mob_index(leader)
-        && let Some(l) = s.mobs.list[i].as_mut()
+        && let Some(l) = s.mobs.list.get_mut(i)
     {
         l.sea.school += 1;
     }
@@ -384,7 +382,7 @@ pub fn start_following(s: &mut Server, m: &mut Mob, leader: i32) {
 pub fn stop_following(s: &mut Server, m: &mut Mob) {
     if let Some(l) = m.sea.leader.take()
         && let Some(i) = s.mob_index(l)
-        && let Some(o) = s.mobs.list[i].as_mut()
+        && let Some(o) = s.mobs.list.get_mut(i)
     {
         o.sea.school -= 1;
     }
@@ -423,9 +421,9 @@ impl Server {
         let b = m.bbox();
         let area = rc_physics::Aabb { min: b.min.map(|v| v - 8.0), max: b.max.map(|v| v + 8.0) };
         let max = max_school(m.kind);
-        let me_at = self.mobs.list.iter().position(Option::is_none);
+        let me_at = self.mobs.list.slots().iter().position(Option::is_none);
         let mut list: Vec<(Option<i32>, bool, bool)> = Vec::new(); // (other, follower, can be followed)
-        for (i, o) in self.mobs.list.iter().enumerate() {
+        for (i, o) in self.mobs.list.slots().iter().enumerate() {
             let entry = match o {
                 None if Some(i) == me_at => (None, is_follower(self, m), false),
                 Some(o) if o.kind == m.kind && o.touches(&area) => {
@@ -452,7 +450,7 @@ impl Server {
                 (None, Some(l)) => start_following(self, m, l),
                 (Some(id), _) => {
                     let Some(i) = self.mob_index(id) else { continue };
-                    let Some(mut o) = self.mobs.list[i].take() else { continue };
+                    let Some(mut o) = self.mobs.list.take(i) else { continue };
                     match leader {
                         Some(l) => start_following(self, &mut o, l),
                         None => {
@@ -460,7 +458,7 @@ impl Server {
                             m.sea.school += 1;
                         }
                     }
-                    self.mobs.list[i] = Some(o);
+                    self.mobs.list.put(i, o);
                 }
                 (None, None) => {}
             }
@@ -478,7 +476,7 @@ impl Server {
     }
 
     pub(crate) fn in_range_of_leader(&self, m: &Mob) -> bool {
-        m.sea.leader.and_then(|l| self.ent_pos(Ent::Mob(l))).is_some_and(|p| dist2(m.pos, p) <= 121.0)
+        m.sea.leader.and_then(|l| self.ent_pos(Ent::Mob(l))).is_some_and(|p| dist2(m.pos(), p) <= 121.0)
     }
 }
 

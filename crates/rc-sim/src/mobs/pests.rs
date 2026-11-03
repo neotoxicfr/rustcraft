@@ -137,7 +137,7 @@ impl Server {
     }
 
     fn merge_pos(&self, m: &Mob, dir: usize) -> [i32; 3] {
-        let b = super::mth::block_of([m.pos[0], m.pos[1] + 0.5, m.pos[2]]);
+        let b = super::mth::block_of([m.pos()[0], m.pos()[1] + 0.5, m.pos()[2]]);
         let d = DIRS[dir];
         [b[0] + d[0], b[1] + d[1], b[2] + d[2]]
     }

@@ -46,9 +46,9 @@ fn spear() -> Option<Stack> {
 /// Mob taken out of the list (as during its tick).
 fn with_mob<R>(p: &mut Probe, id: i32, f: impl FnOnce(&mut crate::server::Server, &mut Mob) -> R) -> R {
     let i = p.s.mob_index(id).expect("mob");
-    let mut m = p.s.mobs.list[i].take().expect("mob");
+    let mut m = p.s.mobs.list.take(i).expect("mob");
     let r = f(&mut p.s, &mut m);
-    p.s.mobs.list[i] = Some(m);
+    p.s.mobs.list.put(i, m);
     r
 }
 

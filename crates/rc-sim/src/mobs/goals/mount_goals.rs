@@ -93,7 +93,7 @@ impl Server {
                 quarter_range(m, false);
                 r
             }
-            MGoal::Trap => m.mount.trap && self.player_near_alive(m.pos, 10.0),
+            MGoal::Trap => m.mount.trap && self.player_near_alive(m.pos(), 10.0),
             MGoal::DefendTrader { base, stamp, by } => {
                 let Some(super::super::leash::Holder::Mob(tid)) = super::super::leash::holder(m) else {
                     return false;
@@ -139,7 +139,7 @@ impl Server {
                 quarter_range(m, false);
                 r
             }
-            MGoal::Trap => m.mount.trap && self.player_near_alive(m.pos, 10.0),
+            MGoal::Trap => m.mount.trap && self.player_near_alive(m.pos(), 10.0),
             MGoal::DefendTrader { base, .. } => self.target_continue(base, m),
         }
     }
@@ -258,7 +258,7 @@ impl Server {
     /// Tick of the spit: approach, stop at seen range 5 ticks, spit every 40 ticks.
     fn spit_tick(&mut self, m: &mut Mob, t: Ent, speed: f64, attack_time: &mut i32, see: &mut i32) {
         let Some(tp) = self.ent_pos(t) else { return };
-        let d2 = super::dist2(m.pos, tp);
+        let d2 = super::dist2(m.pos(), tp);
         let sight = self.line_of_sight(m, t);
         if sight {
             *see += 1;

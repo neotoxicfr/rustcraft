@@ -50,10 +50,10 @@ impl Struck {
         Struck {
             ent: Ent::Mob(m.id),
             uuid: m.uuid,
-            pos: m.pos,
+            pos: m.pos(),
             bbox: m.bbox(),
             on_ground: m.on_ground,
-            on_pos: s.on_pos(m.pos, m.support, 1.0e-5),
+            on_pos: s.on_pos(m.pos(), m.support, 1.0e-5),
         }
     }
 }
@@ -126,7 +126,7 @@ impl Server {
             (false, _) => "minecraft:item.mace.smash_air",
         };
         let cat = Self::mob_sound_source(m);
-        self.world_sound(sound, cat, m.pos, 1.0, 1.0);
+        self.world_sound(sound, cat, m.pos(), 1.0, 1.0);
         let name = crate::nbtio::uuid_text(m.uuid);
         self.ghost_push(m);
         self.smash_knockback(Ent::Mob(m.id), &name, fall, t);
@@ -164,8 +164,7 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
-            .filter(|o| Ent::Mob(o.id) != attacker && Ent::Mob(o.id) != t.ent && o.touches(&area) && near(o.pos))
+            .filter(|o| Ent::Mob(o.id) != attacker && Ent::Mob(o.id) != t.ent && o.touches(&area) && near(o.pos()))
             .filter(|o| !(o.tame && o.owner == Some(t.uuid) && crate::mobs::species::tamable(o.kind)))
             .filter(|o| {
                 let holder = crate::nbtio::uuid_text(o.uuid);
@@ -176,7 +175,7 @@ impl Server {
             .collect();
         for id in ids {
             let Some(o) = self.mobs.get_mut(id) else { continue };
-            let d = [o.pos[0] - t.pos[0], o.pos[1] - t.pos[1], o.pos[2] - t.pos[2]];
+            let d = [o.pos()[0] - t.pos[0], o.pos()[1] - t.pos[1], o.pos()[2] - t.pos[2]];
             let (p, kb) = power(d, o.attrs.knockback_resistance.value());
             if p > 0.0 {
                 o.vel = [o.vel[0] + kb[0], o.vel[1] + f64::from(0.7f32), o.vel[2] + kb[1]];

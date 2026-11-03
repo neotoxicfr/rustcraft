@@ -436,12 +436,11 @@ impl Server {
                 .mobs
                 .list
                 .iter()
-                .flatten()
                 .filter(|o| o.id != m.id && o.alive() && o.touches(&area))
-                .map(|o| (dist2(m.pos, o.pos), Ent::Mob(o.id)))
+                .map(|o| (dist2(m.pos(), o.pos()), Ent::Mob(o.id)))
                 .collect();
             if self.ent_alive(Ent::Player) && self.player_aabb().intersects(&area) {
-                list.push((dist2(m.pos, self.pos), Ent::Player));
+                list.push((dist2(m.pos(), self.pos), Ent::Player));
             }
             list.sort_by(|a, c| a.0.partial_cmp(&c.0).unwrap_or(std::cmp::Ordering::Equal));
             b.visible = Some(list.into_iter().map(|x| (x.1, None)).collect());
@@ -603,11 +602,11 @@ impl Server {
             target = match fallback {
                 None => self.random_swimmable_pos(m, h, v),
                 Some(f) => {
-                    let n = crate::mobs::mth::normalize([f[0] - m.pos[0], f[1] - m.pos[1], f[2] - m.pos[2]]);
+                    let n = crate::mobs::mth::normalize([f[0] - m.pos()[0], f[1] - m.pos()[1], f[2] - m.pos()[2]]);
                     Some([
-                        m.pos[0] + n[0] * f64::from(h),
-                        m.pos[1] + n[1] * f64::from(v),
-                        m.pos[2] + n[2] * f64::from(h),
+                        m.pos()[0] + n[0] * f64::from(h),
+                        m.pos()[1] + n[1] * f64::from(v),
+                        m.pos()[2] + n[2] * f64::from(h),
                     ])
                 }
             };
@@ -620,9 +619,9 @@ impl Server {
     }
 
     fn charge_start(&mut self, m: &mut Mob, b: &mut Brain) {
-        b.charge_start = m.pos;
+        b.charge_start = m.pos();
         let Some(tp) = b.attack.and_then(|e| self.ent_pos(e)) else { return };
-        let n = crate::mobs::mth::normalize([tp[0] - m.pos[0], tp[1] - m.pos[1], tp[2] - m.pos[2]]);
+        let n = crate::mobs::mth::normalize([tp[0] - m.pos()[0], tp[1] - m.pos()[1], tp[2] - m.pos()[2]]);
         let sp = if m.kind == Kind::ZombieNautilus { 0.5 } else { 0.6 };
         b.charge_vel = n.map(|x| x * f64::from(sp as f32));
         if self.charge_can_continue(m, b) {
@@ -640,11 +639,11 @@ impl Server {
         if m.tame {
             return false;
         }
-        if dist2(m.pos, b.charge_start) >= 144.0 {
+        if dist2(m.pos(), b.charge_start) >= 144.0 {
             return false;
         }
         let Some(tp) = self.ent_pos(e) else { return false };
-        if dist2(tp, m.pos) >= 121.0 {
+        if dist2(tp, m.pos()) >= 121.0 {
             return false;
         }
         self.line_of_sight(m, e) && b.charge_cd.is_none()
@@ -710,14 +709,14 @@ impl Server {
                 b.love_at = 0;
             } else if let Some(pid) = b.breed {
                 self.naut_lock_gaze(m, b, pid);
-                if let Some(pp) = self.mob_ref(pid).map(|p| p.pos)
-                    && dist2(m.pos, pp) < 9.0
+                if let Some(pp) = self.mob_ref(pid).map(|p| p.pos())
+                    && dist2(m.pos(), pp) < 9.0
                     && t >= b.love_at
                 {
                     self.nautilus_breed(m, pid);
                     b.breed = None;
                     if let Some(i) = self.mob_index(pid)
-                        && let Some(o) = self.mobs.list[i].as_mut()
+                        && let Some(o) = self.mobs.list.get_mut(i)
                         && let Some(ob) = o.sea.brain.as_mut()
                     {
                         ob.breed = None;
@@ -765,7 +764,7 @@ impl Server {
                 b.look = Some(Track::Ent(Ent::Player, true));
                 let close: f64 = if m.is_baby() { 2.5 } else { 3.5 };
                 let speed = if m.kind == Kind::ZombieNautilus { 0.9 } else { 1.3 };
-                if dist2(m.pos, self.pos) < close * close {
+                if dist2(m.pos(), self.pos) < close * close {
                     b.walk = None;
                 } else {
                     b.walk = Some(WalkTarget { target: Track::Ent(Ent::Player, false), speed, close: 2 });
@@ -791,7 +790,7 @@ impl Server {
         let bb = m.bbox();
         let mut hit: Option<Ent> = None;
         let ids: Vec<i32> =
-            self.mobs.list.iter().flatten().filter(|o| o.touches(&bb) && o.alive()).map(|o| o.id).collect();
+            self.mobs.list.iter().filter(|o| o.touches(&bb) && o.alive()).map(|o| o.id).collect();
         for id in ids {
             if self.targeting_ok(m, Ent::Mob(id), true, 0.0, false, false) {
                 hit = Some(Ent::Mob(id));
@@ -808,7 +807,7 @@ impl Server {
         let dmg = m.attrs.attack.value() as f32;
         match e {
             Ent::Player => {
-                let kb = Some((m.pos[0] - self.pos[0], m.pos[2] - self.pos[2]));
+                let kb = Some((m.pos()[0] - self.pos[0], m.pos()[2] - self.pos[2]));
                 if self.player_hurt_by_mob(m, "minecraft:mob_attack", dmg, kb) {
                     // G5-F02d: brain put back for the time of the thorns (anger of the hurt nautilus).
                     m.sea.brain = Some(Box::new(std::mem::take(b)));
@@ -820,7 +819,7 @@ impl Server {
             }
             Ent::Mob(id) => {
                 if let Some(i) = self.mob_index(id)
-                    && let Some(mut o) = self.mobs.list[i].take()
+                    && let Some(mut o) = self.mobs.list.take(i)
                 {
                     let hurt = self.mob_hurt_by(&mut o, m, "minecraft:mob_attack", dmg);
                     // G5-F04: the struck mob's thorns, brain put back like for the player's.
@@ -838,7 +837,7 @@ impl Server {
                             *b = *back;
                         }
                     }
-                    self.mobs.list[i] = Some(o);
+                    self.mobs.list.put(i, o);
                 }
             }
         }
@@ -850,14 +849,14 @@ impl Server {
             Ent::Player => self.player_knockback(f64::from(factor), f64::from(sn), f64::from(-cs)),
             Ent::Mob(id) => {
                 if let Some(i) = self.mob_index(id)
-                    && let Some(mut o) = self.mobs.list[i].take()
+                    && let Some(mut o) = self.mobs.list.take(i)
                 {
                     // Victim's own knockback (full sulfur cube: attacker's aim).
                     self.ghost_push(m);
                     let by = Some(Ent::Mob(m.id));
                     self.mob_knockback(&mut o, f64::from(factor), f64::from(sn), f64::from(-cs), by, dmg, false);
                     self.ghost_pop();
-                    self.mobs.list[i] = Some(o);
+                    self.mobs.list.put(i, o);
                 }
             }
         }
@@ -871,7 +870,7 @@ impl Server {
         b.walk = Some(WalkTarget { target: Track::Ent(Ent::Mob(pid), true), speed: 0.4, close: 2 });
         let me = m.id;
         if let Some(i) = self.mob_index(pid)
-            && let Some(o) = self.mobs.list[i].as_mut()
+            && let Some(o) = self.mobs.list.get_mut(i)
             && let Some(ob) = o.sea.brain.as_mut()
         {
             ob.breed = Some(me);
@@ -919,7 +918,7 @@ impl Server {
     /// Baby nautilus born from two nautiluses, tamed if the parent is.
     pub(crate) fn nautilus_breed(&mut self, m: &mut Mob, partner: i32) {
         let Some(pi) = self.mob_index(partner) else { return };
-        let mut baby = self.new_mob(Kind::Nautilus, m.pos, 0.0);
+        let mut baby = self.new_mob(Kind::Nautilus, m.pos(), 0.0);
         baby.age = -24000;
         if m.tame {
             baby.owner = m.owner;
@@ -928,7 +927,7 @@ impl Server {
         self.s9_bred(m, partner, Some(&baby));
         m.age = 6000;
         m.reset_love();
-        if let Some(p) = self.mobs.list[pi].as_mut() {
+        if let Some(p) = self.mobs.list.get_mut(pi) {
             p.age = 6000;
             p.reset_love();
         }
@@ -936,7 +935,7 @@ impl Server {
         self.s9_bred(m, partner, Some(&baby)); // S9: statistic and trigger, like the common routine
         if self.rule("minecraft:mob_drops", true) {
             let xp = m.rng.next_int_bound(7) + 1;
-            self.spawn_orbs(m.pos, xp);
+            self.spawn_orbs(m.pos(), xp);
         }
         self.add_mob(baby);
     }
@@ -1100,7 +1099,7 @@ impl Server {
         reason: super::super::spawn::Reason,
         persistent: bool,
     ) -> Option<i32> {
-        let mut z = self.new_mob(Kind::ZombieNautilus, rider.pos, rider.yaw);
+        let mut z = self.new_mob(Kind::ZombieNautilus, rider.pos(), rider.yaw);
         z.pitch = 0.0;
         z.head_yaw = z.yaw;
         z.body_yaw = z.yaw;

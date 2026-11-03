@@ -38,7 +38,7 @@ pub fn attack_tick(s: &mut Server, m: &mut Mob, step: &mut i32, time: &mut i32, 
     } else {
         *last_seen += 1;
     }
-    let d = dist2(m.pos, tp);
+    let d = dist2(m.pos(), tp);
     let follow = m.follow_range();
     if d < 4.0 {
         if !sight {
@@ -50,9 +50,9 @@ pub fn attack_tick(s: &mut Server, m: &mut Mob, step: &mut i32, time: &mut i32, 
         }
         want(m, tp);
     } else if d < follow * follow && sight {
-        let xd = tp[0] - m.pos[0];
-        let yd = (tb.min[1] + (tb.max[1] - tb.min[1]) * 0.5) - (m.pos[1] + f64::from(m.height()) * 0.5);
-        let zd = tp[2] - m.pos[2];
+        let xd = tp[0] - m.pos()[0];
+        let yd = (tb.min[1] + (tb.max[1] - tb.min[1]) * 0.5) - (m.pos()[1] + f64::from(m.height()) * 0.5);
+        let zd = tp[2] - m.pos()[2];
         if *time <= 0 {
             *step += 1;
             if *step == 1 {
@@ -70,8 +70,8 @@ pub fn attack_tick(s: &mut Server, m: &mut Mob, step: &mut i32, time: &mut i32, 
                 // Event 1018 (shot sound) at the blaze's position.
                 s.level_event(1018, m.block_pos(), 0);
                 let dir = [m.rng.triangle(xd, 2.297 * sqd), yd, m.rng.triangle(zd, 2.297 * sqd)];
-                let y = m.pos[1] + f64::from(m.height()) * 0.5 + 0.5;
-                s.shoot_fireball(Some(m.uuid), [m.pos[0], y, m.pos[2]], dir, (m.yaw, m.pitch), false, 1);
+                let y = m.pos()[1] + f64::from(m.height()) * 0.5 + 0.5;
+                s.shoot_fireball(Some(m.uuid), [m.pos()[0], y, m.pos()[2]], dir, (m.yaw, m.pitch), false, 1);
             }
         }
         s.look_at(m, [tp[0], s.ent_eye(t).unwrap_or(tp[1]), tp[2]], 10.0, 10.0);

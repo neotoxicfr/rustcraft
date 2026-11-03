@@ -204,13 +204,13 @@ fn check_can_move(s: &mut Server, m: &mut Mob) -> bool {
         potential = true;
         let disguised = s.slots[5].as_ref().is_some_and(|h| s.item_tag(&h.id, "minecraft:gaze_disguise_equipment"));
         let eye = m.eye_y();
-        let heights = [eye, m.pos[1] + 0.5, (eye + m.pos[1]) / 2.0];
+        let heights = [eye, m.pos()[1] + 0.5, (eye + m.pos()[1]) / 2.0];
         if (!active || !disguised) && s.player_looks_at(m, 0.5, &heights) {
             if active {
                 return false;
             }
             let pp = s.pos;
-            let d = (0..3).map(|i| (pp[i] - m.pos[i]).powi(2)).sum::<f64>();
+            let d = (0..3).map(|i| (pp[i] - m.pos()[i]).powi(2)).sum::<f64>();
             if d < ACTIVATION_RANGE_SQ {
                 activate(s, m);
                 return false;
@@ -268,12 +268,12 @@ impl Server {
         let look = crate::mobs::mth::normalize(look);
         let eye = self.player_eye_y();
         for &gh in heights {
-            let dir = [m.pos[0] - self.pos[0], gh - eye, m.pos[2] - self.pos[2]];
+            let dir = [m.pos()[0] - self.pos[0], gh - eye, m.pos()[2] - self.pos[2]];
             let n = crate::mobs::mth::normalize(dir);
             let dot = look[0] * n[0] + look[1] * n[1] + look[2] * n[2];
             if dot > 1.0 - cone {
                 let from = [self.pos[0], eye, self.pos[2]];
-                let to = [m.pos[0], gh, m.pos[2]];
+                let to = [m.pos()[0], gh, m.pos()[2]];
                 let d = ((0..3).map(|x| (to[x] - from[x]).powi(2)).sum::<f64>()).sqrt();
                 if d <= 128.0 && !self.clip_visual(from, to) {
                     return true;

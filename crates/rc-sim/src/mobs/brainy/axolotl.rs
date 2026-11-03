@@ -113,7 +113,7 @@ pub fn finalize(s: &mut Server, m: &mut Mob, group: &mut super::super::spawn::Gr
 
 /// Baby: 1 in 1,200 the rare variant, otherwise a parent's; persistent.
 pub fn offspring(s: &mut Server, m: &mut Mob, partner: i32) -> Mob {
-    let mut baby = s.new_mob(super::super::species::Kind::Axolotl, m.pos, 0.0);
+    let mut baby = s.new_mob(super::super::species::Kind::Axolotl, m.pos(), 0.0);
     baby.variant = if m.rng.next_int_bound(1200) == 0 {
         let _ = m.rng.next_int_bound(1);
         4

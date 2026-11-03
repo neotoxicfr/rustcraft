@@ -184,15 +184,15 @@ fn potent_sulfur_continuous_geyser_launches_entities() {
     w.cmd(&format!("summon minecraft:pig 8.5 {} 8.5 {{NoAI:1b}}", Y + 1));
     let pig = w.p.s.mobs.of_kind(Kind::Pig).next().expect("pig").id;
     let i = w.p.s.mob_index(pig).expect("pig");
-    w.p.s.mobs.list[i].as_mut().expect("pig").vel = [0.0; 3];
+    w.p.s.mobs.list.get_mut(i).expect("pig").vel = [0.0; 3];
     w.ticks(1, &mut evs);
     assert!(block_events(&evs, at) >= 1, "start block event");
-    let vy = w.p.s.mobs.list[i].as_ref().expect("pig").vel[1];
+    let vy = w.p.s.mobs.list.get(i).expect("pig").vel[1];
     assert!((vy - f64::from(0.2f32)).abs() < 1e-9, "pig launch: {vy}");
     // Already fast enough (0.3 + 0.1 × 1 block of water): no more push.
-    w.p.s.mobs.list[i].as_mut().expect("pig").vel = [0.0, 0.5, 0.0];
+    w.p.s.mobs.list.get_mut(i).expect("pig").vel = [0.0, 0.5, 0.0];
     w.ticks(1, &mut evs);
-    assert_eq!(w.p.s.mobs.list[i].as_ref().expect("pig").vel[1], 0.5);
+    assert_eq!(w.p.s.mobs.list.get(i).expect("pig").vel[1], 0.5);
 }
 
 /// Wet: 80-tick ambient nausea for a player whose eyes are above the water.

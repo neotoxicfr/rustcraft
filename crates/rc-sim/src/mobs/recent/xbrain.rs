@@ -497,7 +497,7 @@ impl Server {
                 let Some(target) = b.mem.attack.get() else { return false };
                 let range = m.follow_range();
                 let max = range * range;
-                let me = m.pos;
+                let me = m.pos();
                 let passengers = m.mount.passengers.clone();
                 let f = move |s: &Server, e: Ent| {
                     e == target && s.ent_pos(e).is_some_and(|p| dist2(p, me) <= max) && !passengers.contains(&e)
@@ -550,7 +550,7 @@ impl Server {
         }
         let Some(e) = target else { return false };
         let Some(p) = self.ent_pos(e) else { return false };
-        let d = dist2(m.pos, p);
+        let d = dist2(m.pos(), p);
         let (l, h) = (f64::from(lo), f64::from(hi + 1));
         if d < h * h && d >= l * l {
             let tr = Track::Ent { e, eye: true, target_eye: true };
@@ -583,7 +583,7 @@ impl Server {
                 .attack
                 .get()
                 .and_then(|e| self.ent_pos(e))
-                .is_some_and(|p| super::closer_than_xz_y(m.pos, p, 15.0, 20.0)),
+                .is_some_and(|p| super::closer_than_xz_y(m.pos(), p, 15.0, 20.0)),
             _ => true,
         }
     }
@@ -632,8 +632,8 @@ impl Server {
             XBk::TemptEye { speed, close } => {
                 let Some(player) = b.mem.tempting.get() else { return };
                 b.mem.look.set(Track::ent(player, true));
-                let pp = self.ent_pos(player).unwrap_or(m.pos);
-                if dist2(m.pos, pp) < *close * *close {
+                let pp = self.ent_pos(player).unwrap_or_else(|| m.pos());
+                if dist2(m.pos(), pp) < *close * *close {
                     b.mem.walk.erase();
                 } else {
                     let tr = Track::Ent { e: player, eye: true, target_eye: true };
@@ -688,8 +688,8 @@ impl Server {
     fn x_unride(&mut self, m: &mut Mob) {
         let Some(vid) = m.mount.vehicle else { return };
         let Some(i) = self.mob_index(vid) else { return };
-        let Some(mut v) = self.mobs.list[i].take() else { return };
+        let Some(mut v) = self.mobs.list.take(i) else { return };
         self.mob_dismount_from(m, &mut v);
-        self.mobs.list[i] = Some(v);
+        self.mobs.list.put(i, v);
     }
 }

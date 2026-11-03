@@ -88,9 +88,9 @@ impl Server {
     /// Does the player track this mob (tracking range and chunk sent)?
     fn tracks(&self, m: &Mob) -> bool {
         let range = (f64::from(self.effective_tracking(m)) * 16.0).min(f64::from(self.view) * 16.0);
-        let dx = self.pos[0] - m.pos[0];
-        let dz = self.pos[2] - m.pos[2];
-        let c = ((m.pos[0].floor() as i32) >> 4, (m.pos[2].floor() as i32) >> 4);
+        let dx = self.pos[0] - m.pos()[0];
+        let dz = self.pos[2] - m.pos()[2];
+        let c = ((m.pos()[0].floor() as i32) >> 4, (m.pos()[2].floor() as i32) >> 4);
         dx * dx + dz * dz <= range * range && self.sent.contains(&c) && !m.removed
     }
 
@@ -134,7 +134,7 @@ impl Server {
             id: m.id,
             uuid: m.uuid,
             kind: self.entity_kind_id(m.kind.info().name),
-            pos: m.pos,
+            pos: m.pos(),
             velocity: lp_quantize(m.vel),
             pitch: unpack(pack_degrees(m.pitch)),
             yaw: unpack(pack_degrees(m.yaw)),
@@ -156,9 +156,10 @@ impl Server {
         // Active effects: never sent at pairing (only a rider receives them).
         self.pair_mount(m); // F04: passengers, mount attributes
         self.pair_leash(m); // G4-F07a: held lead
+        let base = m.pos();
         let t = &mut m.track;
         t.seen = true;
-        t.base = m.pos;
+        t.base = base;
         t.last_yaw = pack_degrees(m.yaw);
         t.last_pitch = pack_degrees(m.pitch);
         t.last_head = pack_degrees(m.head_yaw);
@@ -208,7 +209,7 @@ impl Server {
             let rot = (i32::from(yaw) - i32::from(m.track.last_yaw)).abs() >= 1
                 || (i32::from(pitch) - i32::from(m.track.last_pitch)).abs() >= 1;
             m.track.teleport_delay += 1;
-            let pos = m.pos;
+            let pos = m.pos();
             let d = [pos[0] - m.track.base[0], pos[1] - m.track.base[1], pos[2] - m.track.base[2]];
             let changed = d[0] * d[0] + d[1] * d[1] + d[2] * d[2] >= f64::from(7.629_394_5e-6f32);
             // F04: a passenger sends only its rotation; on dismount, full sync.
@@ -375,7 +376,7 @@ impl Server {
     /// F14: position sync sent right away, coding base re-aligned.
     pub(crate) fn sync_position_now(&self, m: &mut Mob) {
         if m.track.seen {
-            m.track.base = m.pos;
+            m.track.base = m.pos();
             self.sync_full(m);
         }
     }
@@ -383,7 +384,7 @@ impl Server {
     fn sync_full(&self, m: &Mob) {
         let s = PositionSync {
             id: m.id,
-            path: PositionPath { linear: true, steps: vec![(m.pos, 0)] },
+            path: PositionPath { linear: true, steps: vec![(m.pos(), 0)] },
             yaw: m.yaw,
             pitch: m.pitch,
             on_ground: m.on_ground,

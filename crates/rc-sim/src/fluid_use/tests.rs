@@ -107,7 +107,7 @@ fn spawn_egg_into_water() {
     hold(&mut p, "minecraft:squid_spawn_egg", 1);
     assert!(p.s.ray_item_use(0));
     let squids: Vec<[f64; 3]> =
-        p.s.mobs.list.iter().flatten().filter(|m| m.kind == Kind::Squid).map(|m| m.pos).collect();
+        p.s.mobs.list.iter().filter(|m| m.kind == Kind::Squid).map(|m| m.pos()).collect();
     assert_eq!(squids, vec![[112.5, -60.0, 112.5]]);
     assert_eq!(held(&p), None);
     done(p, dir);

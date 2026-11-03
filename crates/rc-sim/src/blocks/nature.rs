@@ -533,8 +533,8 @@ impl Server {
     /// is raised with them, before its fall damage).
     pub(crate) fn push_mob_up(m: &mut crate::mobs::mob::Mob, p: P, lo: f64, hi: f64) {
         if let Some(dy) = push_up_dy(&m.bbox(), p, [0.0, lo, 0.0], [1.0, hi, 1.0]) {
-            m.pos[1] += dy;
-            m.old = m.pos;
+            m.add_pos_axis(1, dy);
+            m.old = m.pos();
             m.needs_sync = true;
         }
     }
@@ -561,9 +561,9 @@ impl Server {
             match e {
                 E::Player => self.teleport_up(dy),
                 E::Mob(i) => {
-                    if let Some(m) = self.mobs.list.iter_mut().flatten().find(|m| m.id == i) {
-                        m.pos[1] += dy;
-                        m.old = m.pos;
+                    if let Some(m) = self.mobs.list.iter_mut().find(|m| m.id == i) {
+                        m.add_pos_axis(1, dy);
+                        m.old = m.pos();
                         m.needs_sync = true;
                     }
                 }

@@ -783,7 +783,7 @@ impl Server {
     pub(crate) fn w_pos(&self, w: Who<'_>) -> [f64; 3] {
         match w {
             Who::E(e) => self.e_pos(e),
-            Who::Mob(m) => m.pos,
+            Who::Mob(m) => m.pos(),
             Who::Proj(p) => p.pos,
         }
     }

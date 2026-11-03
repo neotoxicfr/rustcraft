@@ -265,7 +265,7 @@ impl Server {
 
     /// Random position (4 × 2), otherwise its own.
     fn pig_throw_random(&mut self, m: &mut Mob, items: Vec<Option<Stack>>) {
-        let p = self.land_random_pos(m, 4, 2).unwrap_or(m.pos);
+        let p = self.land_random_pos(m, 4, 2).unwrap_or_else(|| m.pos());
         self.pig_throw_items(m, items, p);
     }
 
@@ -478,7 +478,6 @@ impl Server {
             .mobs
             .list
             .iter()
-            .flatten()
             .filter(|o| o.kind == Kind::Piglin && o.touches(&area))
             .map(|o| o.id)
             .collect();

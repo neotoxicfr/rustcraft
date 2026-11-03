@@ -333,7 +333,7 @@ impl Server {
         let WGoal::Ranged { target, attack_time, see_time } = g else { return };
         let Some(t) = *target else { return };
         let (Some(tp), Some(eye)) = (self.ent_pos(t), self.ent_eye(t)) else { return };
-        let d2 = mth::dist2(m.pos, tp);
+        let d2 = mth::dist2(m.pos(), tp);
         let sight = self.line_of_sight(m, t);
         if sight {
             *see_time += 1;
@@ -373,7 +373,7 @@ pub fn move_control(m: &mut Mob) -> bool {
         m.move_ctl.op = MoveOp::Wait;
         m.surf.no_gravity = true;
         let w = m.move_ctl.wanted;
-        let (xd, yd, zd) = (w[0] - m.pos[0], w[1] - m.pos[1], w[2] - m.pos[2]);
+        let (xd, yd, zd) = (w[0] - m.pos()[0], w[1] - m.pos()[1], w[2] - m.pos()[2]);
         let dd = xd * xd + yd * yd + zd * zd;
         if dd < f64::from(2.500_000_3e-7f32) {
             m.yya = 0.0;

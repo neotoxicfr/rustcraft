@@ -5092,3 +5092,33 @@ old path), GPU RTX 5080 Vulkan, micro-benches on a loaded machine (other agents 
   check reads the shipped file (Linux: after `strip`). The rehearsal builds its second copy at another checkout
   folder (`elsewhere/rustcraft`) with another cargo home, and compares the shipped files: before, both copies sat
   at the same path, so a path left in both was invisible. Not run: the Linux build itself (no Linux here).
+## C6-M37A: mob list and mob position behind a small API (03/11, loaded machine)
+
+Refactoring, no switch: prerequisite of the exact spatial index of the mobs (C5-M18), which has to
+follow every mob that changes cell, also one moved by another system during the entity walk. The
+slots of `Mobs::list` are private to `mobs/list.rs` (`MobList`: `get`, `get_mut`, `take`, `put`,
+`try_put`, `iter`, `iter_mut`, `slots` read-only; `Mobs::push`, `remove_slot`, `drop_empty_slots`,
+`sort_by_rank` and `of_kinds_mut` written in the same file), so every mutation goes through a few
+functions the compiler checks; a private field of `Mobs` would have stayed open to every submodule
+of `mobs`. `Mob::pos` is private, read with the inline `pos()`, written only by `set_pos` (`add_pos`,
+`set_pos_axis`, `add_pos_axis` go through it). About 600 list sites and 1,383 position sites moved.
+Hook points for the grid, not filled here (nothing would read them yet): `put`, `get_mut`,
+`iter_mut`, `push`, `remove_slot`, the compaction and the sort, and `set_pos`.
+
+Proof: whole rc-sim suite with the bench model world and `RUSTCRAFT_OPT_REQUIRE=1`, results equal
+to before (1357, plus the 2 list API tests), tests_opt fingerprints unchanged; sabotages (`put`
+appending, `set_pos` rounding to f32) caught by the list API test and the fingerprints.
+
+`tests_opt::bench_crowd`, tick median (ms), 8 alternating passes per variant, loaded machine (other
+agents compiling: medians of a variant spread over ×1.5 to ×1.9, p99 up to 138 ms):
+
+| Mobs | old, best pass | new, best pass | old, median of passes | new, median of passes |
+|---|---|---|---|---|
+| 100 | 0.551 | 0.570 (+3.4%) | 0.889 | 0.717 |
+| 400 | 2.582 | 2.688 (+4.1%) | 4.619 | 3.809 |
+| 1,600 | 19.714 | 19.236 (−2.4%) | 29.406 | 36.700 |
+
+No difference above the noise in either direction; the accessors are one-line inline functions
+over the same vector. To settle on the quiet-machine scene bench: `crowd-1000`, `crowd`, `village`
+(tick median and p99, 2 alternating passes). Not applicable: multi-core, GPU, memory (same
+structures, `MobList` is the vector itself).

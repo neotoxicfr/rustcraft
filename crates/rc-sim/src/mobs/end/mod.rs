@@ -373,13 +373,13 @@ impl Server {
     /// `kill` of the dragon: removed on the spot, fight notified (victory).
     pub(crate) fn end_kill_mob(&mut self, id: i32) -> bool {
         let Some(i) = self.mob_index(id) else { return false };
-        let Some(m) = self.mobs.list[i].as_mut() else { return false };
+        let Some(m) = self.mobs.list.get_mut(i) else { return false };
         if m.kind != Kind::EnderDragon {
             return false;
         }
         m.removed = true;
         let fight = m.end.dragon.as_ref().is_some_and(|d| d.fight);
-        let m = (**m).clone();
+        let m = m.clone();
         if fight {
             self.fight_update_dragon(&m);
             self.fight_dragon_killed(m.uuid);

@@ -580,9 +580,9 @@ fn functions_and_tp_like_the_game_2() {
         run(&mut s, "function t:partbad");
         assert_eq!(score(&s, "#pb"), None);
         assert!(!run(&mut s, "particle dust ~ ~ ~ 0 0 0 0 1").0);
-        let n = s.mobs.list.iter().flatten().count();
+        let n = s.mobs.list.iter().count();
         assert!(!run(&mut s, "execute summon pig run particle dust{scale:5} ~ ~ ~ 0 0 0 0 1").0);
-        assert_eq!(s.mobs.list.iter().flatten().count(), n);
+        assert_eq!(s.mobs.list.iter().count(), n);
         assert!(run(&mut s, "particle dust{color:16711680,scale:1} ~ ~ ~ 0 0 0 0 1").0);
 
         // `tp`: horizontal speed lost on absolute axes, kept on relative ones.
