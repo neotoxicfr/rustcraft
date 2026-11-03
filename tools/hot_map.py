@@ -1,6 +1,6 @@
 """Hot map: samply profiles of several scenes merged with the code, one sheet per crate.
 
-    python tools/hot_map.py <profiles folder> <output folder> [.map file] [--whole-profile]
+    python tools/hot_map.py <profiles folder> <output folder> [.pdb or .map file] [--whole-profile]
 
 Only each scene's measurement window counts (`window.json` written by `scenes.py` next to the
 profile: startup, initial generation and the first meshing are left out); `--whole-profile` keeps
@@ -12,8 +12,9 @@ whole process's CPU) per scene, the thread that runs it, file:line of its defini
 and callees weighted by time. Output: `INDEX.md` (crates and threads per scene) and one `<crate>.md`
 sheet per crate, functions ranked by their worst inclusive share.
 
-Names: an executable linked with `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only` gives full names
-in the .pdb; otherwise pass the linker's `/MAP` map (v0 names read roughly).
+Names: samply leaves our functions unnamed (`fun_33ec0`) even with the matching .pdb next to the
+exe, so pass the profiled exe's .pdb (the release profile writes one: `debug = "line-tables-only"`;
+keep it with the exe when copying it) or the linker's `/MAP` map (v0 names read roughly).
 """
 import bisect
 import collections
@@ -21,6 +22,7 @@ import gzip
 import json
 import os
 import re
+import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -40,6 +42,59 @@ def load_map(path):
                 rows.append((int(f[2], 16) - 0x140000000, f[1]))
             except ValueError:
                 pass
+    rows.sort()
+    return [r[0] for r in rows], rows
+
+
+PROC_RECORDS = {0x110F, 0x1110, 0x1146, 0x1147}  # local/global procedure symbols, plain and _ID
+
+
+def load_pdb(path):
+    """Function names and addresses read from the procedure symbols of every module of a .pdb
+    (MSF container: superblock, stream directory, DBI stream 3, section headers stream)."""
+    f = open(path, 'rb')
+    block_size, _, _, dir_bytes, _, dir_map = struct.unpack_from('<IIIIII', f.read(56), 32)
+
+    def block(n):
+        f.seek(n * block_size)
+        return f.read(block_size)
+
+    dir_blocks = struct.unpack_from(f'<{-(-dir_bytes // block_size)}I', block(dir_map))
+    directory = b''.join(block(n) for n in dir_blocks)[:dir_bytes]
+    count = struct.unpack_from('<I', directory)[0]
+    sizes = struct.unpack_from(f'<{count}I', directory, 4)
+    pos, streams = 4 + 4 * count, []
+    for size in sizes:
+        n = 0 if size == 0xFFFFFFFF else -(-size // block_size)
+        streams.append((struct.unpack_from(f'<{n}I', directory, pos), size))
+        pos += 4 * n
+
+    def stream(i):
+        blocks, size = streams[i]
+        return b''.join(block(n) for n in blocks)[:size]
+
+    dbi = stream(3)
+    mod_size, contrib_size, map_size, files_size, server_size, _, _, ec_size = struct.unpack_from('<iiiiiIii', dbi, 24)
+    # Entry 5 of the optional debug header: the stream of section headers (address of each segment).
+    debug_header = 64 + mod_size + contrib_size + map_size + files_size + server_size + ec_size
+    headers = stream(struct.unpack_from('<H', dbi, debug_header + 10)[0])
+    segment_rva = [struct.unpack_from('<I', headers, i * 40 + 12)[0] for i in range(len(headers) // 40)]
+    rows, pos = [], 64
+    while pos < 64 + mod_size:
+        sym_stream, sym_bytes = struct.unpack_from('<HI', dbi, pos + 34)
+        end = dbi.index(b'\0', dbi.index(b'\0', pos + 64) + 1) + 1  # module and object names
+        pos = (end + 3) & ~3
+        if sym_stream == 0xFFFF:
+            continue
+        syms, q = stream(sym_stream)[:sym_bytes], 4
+        while q + 4 <= len(syms):
+            length, kind = struct.unpack_from('<HH', syms, q)
+            if kind in PROC_RECORDS:
+                offset, segment = struct.unpack_from('<IH', syms, q + 32)
+                name = syms[q + 39:syms.index(b'\0', q + 39)].decode('utf-8', 'replace')
+                if 1 <= segment <= len(segment_rva):
+                    rows.append((segment_rva[segment - 1] + offset, name))
+            q += 2 + length
     rows.sort()
     return [r[0] for r in rows], rows
 
@@ -200,7 +255,8 @@ def pct(x, total):
 def main():
     argv, everything = window.strip_flag(sys.argv)
     src, out = argv[1], argv[2]
-    mapped = load_map(argv[3]) if len(argv) > 3 else None
+    names = argv[3] if len(argv) > 3 else None
+    mapped = (load_pdb if names.lower().endswith('.pdb') else load_map)(names) if names else None
     os.makedirs(out, exist_ok=True)
     scenes = {}
     for d in sorted(os.listdir(src)):
