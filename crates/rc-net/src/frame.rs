@@ -40,30 +40,115 @@ impl FrameEncoder {
         self.cipher = Some(Cfb8::new(shared_secret));
     }
 
-    /// Appends to `out` the frame of a packet (`packet` = VarInt identifier + body).
+    /// Appends to `out` the frame of a packet (`packet` = VarInt identifier + body), encrypted
+    /// once encryption is on: [`frame_compressed`](Self::frame_compressed) then
+    /// [`encrypt`](Self::encrypt).
     pub fn encode(&mut self, packet: &[u8], out: &mut Vec<u8>) -> Result<()> {
         let start = out.len();
-        match self.threshold {
-            None => write_frame(out, packet)?,
-            Some(threshold) => {
-                if packet.len() > MAX_UNCOMPRESSED_LEN {
-                    return Err(Error::PacketTooLarge { len: packet.len(), max: MAX_UNCOMPRESSED_LEN });
-                }
-                self.scratch.clear();
-                if packet.len() < threshold {
-                    write_varint(&mut self.scratch, 0);
-                    self.scratch.extend_from_slice(packet);
-                } else {
-                    write_varint(&mut self.scratch, packet.len() as i32);
-                    deflate_into(&mut self.deflate, packet, &mut self.scratch)?;
-                }
-                write_frame(out, &self.scratch)?;
-            }
-        }
-        if let Some(c) = &mut self.cipher {
-            c.encrypt(&mut out[start..]);
-        }
+        self.frame_compressed(packet, out)?;
+        self.encrypt(&mut out[start..]);
         Ok(())
+    }
+
+    /// Appends to `out` the UNENCRYPTED frame of a packet: length prefix, and once compression
+    /// is on, the threshold rule and zlib. It depends only on the threshold, never on the
+    /// connection's secret: a host sending the same packet to several guests with the same
+    /// threshold can build it once and hand each guest a copy to [`encrypt`](Self::encrypt).
+    /// On error, `out` is left unchanged.
+    pub fn frame_compressed(&mut self, packet: &[u8], out: &mut Vec<u8>) -> Result<()> {
+        let Some(threshold) = self.threshold else {
+            return write_frame(out, packet);
+        };
+        if packet.len() > MAX_UNCOMPRESSED_LEN {
+            return Err(Error::PacketTooLarge { len: packet.len(), max: MAX_UNCOMPRESSED_LEN });
+        }
+        if compress_in_place_enabled() {
+            self.compressed_frame_in_place(packet, threshold, out)
+        } else {
+            self.compressed_frame_via_scratch(packet, threshold, out)
+        }
+    }
+
+    /// Encrypts, in place, bytes produced by [`frame_compressed`](Self::frame_compressed) for this
+    /// connection, in the order they go on the wire. Does nothing before encryption is on.
+    pub fn encrypt(&mut self, wire: &mut [u8]) {
+        if let Some(c) = &mut self.cipher {
+            c.encrypt(wire);
+        }
+    }
+
+    /// Old path (`RUSTCRAFT_OPT_FRAME_COMPRESS_IN_PLACE=0`): content built in `scratch`, then
+    /// copied behind its length prefix.
+    fn compressed_frame_via_scratch(&mut self, packet: &[u8], threshold: usize, out: &mut Vec<u8>) -> Result<()> {
+        self.scratch.clear();
+        if packet.len() < threshold {
+            write_varint(&mut self.scratch, 0);
+            self.scratch.extend_from_slice(packet);
+        } else {
+            write_varint(&mut self.scratch, packet.len() as i32);
+            deflate_into(&mut self.deflate, packet, &mut self.scratch)?;
+        }
+        write_frame(out, &self.scratch)
+    }
+
+    /// Content written straight into `out`, without the intermediate copy.
+    fn compressed_frame_in_place(&mut self, packet: &[u8], threshold: usize, out: &mut Vec<u8>) -> Result<()> {
+        if packet.len() < threshold {
+            return write_uncompressed_content(out, packet);
+        }
+        // The compressed size is only known after deflate: room for the widest prefix first,
+        // then the content moves back if the minimal prefix turns out narrower.
+        let start = out.len();
+        out.resize(start + FRAME_PREFIX_MAX, 0);
+        write_varint(out, packet.len() as i32);
+        if let Err(e) = deflate_into(&mut self.deflate, packet, out) {
+            out.truncate(start);
+            return Err(e);
+        }
+        let content_len = out.len() - start - FRAME_PREFIX_MAX;
+        if content_len > MAX_FRAME_LEN {
+            out.truncate(start);
+            return Err(Error::PacketTooLarge { len: content_len, max: MAX_FRAME_LEN });
+        }
+        let prefix_len = varint_len(content_len as i32);
+        if prefix_len < FRAME_PREFIX_MAX {
+            out.copy_within(start + FRAME_PREFIX_MAX.., start + prefix_len);
+            out.truncate(start + prefix_len + content_len);
+        }
+        write_frame_prefix(&mut out[start..start + prefix_len], content_len);
+        Ok(())
+    }
+}
+
+/// Width of the widest frame length prefix: [`MAX_FRAME_LEN`] fits in 3 VarInt bytes.
+const FRAME_PREFIX_MAX: usize = 3;
+
+/// True (default): compressed frames are written straight into the output.
+/// `RUSTCRAFT_OPT_FRAME_COMPRESS_IN_PLACE=0` restores the copy through `scratch`. Read once.
+fn compress_in_place_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_FRAME_COMPRESS_IN_PLACE") != Some("0"))
+}
+
+/// Frame of a packet below the threshold: announced size 0, then the packet as is.
+fn write_uncompressed_content(out: &mut Vec<u8>, packet: &[u8]) -> Result<()> {
+    let content_len = 1 + packet.len();
+    if content_len > MAX_FRAME_LEN {
+        return Err(Error::PacketTooLarge { len: content_len, max: MAX_FRAME_LEN });
+    }
+    out.reserve(varint_len(content_len as i32) + content_len);
+    write_varint(out, content_len as i32);
+    out.push(0);
+    out.extend_from_slice(packet);
+    Ok(())
+}
+
+/// Writes `len` as a VarInt filling exactly `dst` (its minimal width, at most 3 bytes).
+fn write_frame_prefix(dst: &mut [u8], len: usize) {
+    let last = dst.len() - 1;
+    for (i, byte) in dst.iter_mut().enumerate() {
+        let continuation = if i < last { 0x80 } else { 0 };
+        *byte = ((len >> (7 * i)) & 0x7f) as u8 | continuation;
     }
 }
 
@@ -369,6 +454,152 @@ mod tests {
             }
         }
         assert_eq!(got, packets);
+    }
+
+    /// Packets whose frame content lands on each side of the 1/2/3-byte prefix widths, compressed
+    /// (random bytes: compressed content a little larger than the packet) or not.
+    fn prefix_edge_packets() -> Vec<Vec<u8>> {
+        // From 1 byte: a real packet always holds its identifier.
+        let sizes = (1..=4).chain(100..=140).chain(16_360..=16_400).chain([40 * 1024, 1 << 20]);
+        sizes
+            .map(|len| {
+                let mut p = crate::test_bytes::pseudo_random(len, len as u64 + 7);
+                if len % 3 == 0 {
+                    p.iter_mut().for_each(|b| *b &= 0x03); // compressible variant
+                }
+                p
+            })
+            .collect()
+    }
+
+    /// Frame written in place = frame built through `scratch`, byte for byte, after bytes
+    /// already in the output, on both sides of the threshold and of each prefix width.
+    #[test]
+    fn in_place_frames_match_scratch_frames() {
+        for threshold in [0, 256, 20_000] {
+            let (mut a, mut b) = (FrameEncoder::new(), FrameEncoder::new());
+            a.set_compression(threshold);
+            b.set_compression(threshold);
+            let (mut in_place, mut via_scratch) = (vec![0xee; 5], vec![0xee; 5]);
+            for p in prefix_edge_packets() {
+                let t = threshold as usize;
+                a.compressed_frame_in_place(&p, t, &mut in_place).unwrap();
+                b.compressed_frame_via_scratch(&p, t, &mut via_scratch).unwrap();
+                assert!(in_place == via_scratch, "threshold {threshold}, packet of {} bytes", p.len());
+            }
+            let mut d = FrameDecoder::new();
+            d.set_compression(threshold);
+            d.push(&in_place[5..]);
+            let mut buf = Vec::new();
+            for p in prefix_edge_packets() {
+                assert!(d.next_packet(&mut buf).unwrap());
+                assert!(buf == p);
+            }
+        }
+    }
+
+    /// A frame too large for the 3-byte prefix fails the same way on both paths and leaves
+    /// the output untouched.
+    #[test]
+    fn oversized_frames_leave_output_unchanged() {
+        let cases = [(i32::MAX, vec![1u8; MAX_FRAME_LEN]), (0, crate::test_bytes::pseudo_random(3 << 20, 5))];
+        for (threshold, packet) in cases {
+            let mut e = FrameEncoder::new();
+            e.set_compression(threshold);
+            for in_place in [true, false] {
+                let mut out = vec![1, 2, 3];
+                let t = threshold as usize;
+                let result = if in_place {
+                    e.compressed_frame_in_place(&packet, t, &mut out)
+                } else {
+                    e.compressed_frame_via_scratch(&packet, t, &mut out)
+                };
+                assert!(matches!(result, Err(Error::PacketTooLarge { max: MAX_FRAME_LEN, .. })), "{result:?}");
+                assert_eq!(out, [1, 2, 3], "threshold {threshold}, in place {in_place}");
+            }
+        }
+    }
+
+    /// One unencrypted frame shared by two guests: each encrypts its own copy with its own
+    /// secret, each decoder reads the same packets back, and the result is the stream that
+    /// `encode` would have produced for that guest.
+    #[test]
+    fn shared_frame_decrypts_on_two_connections() {
+        let packets = [packet(1, 5), packet(2, 5000), packet(3, 0), packet(4, 70_000)];
+        let mut shared_builder = FrameEncoder::new();
+        shared_builder.set_compression(256);
+        let mut shared = Vec::new();
+        for p in &packets {
+            shared_builder.frame_compressed(p, &mut shared).unwrap();
+        }
+        let mut wires = Vec::new();
+        for secret in [[0x11u8; 16], [0x77; 16]] {
+            let mut guest = FrameEncoder::new();
+            guest.set_compression(256);
+            guest.enable_encryption(&secret);
+            let mut expected = Vec::new();
+            for p in &packets {
+                guest.encode(p, &mut expected).unwrap();
+            }
+            let mut guest = FrameEncoder::new();
+            guest.enable_encryption(&secret);
+            let mut wire = shared.clone();
+            guest.encrypt(&mut wire);
+            assert!(wire == expected, "shared frame differs from per-guest encoding");
+            let mut d = FrameDecoder::new();
+            d.set_compression(256);
+            d.enable_encryption(&secret);
+            let mut got = Vec::new();
+            let mut buf = Vec::new();
+            for chunk in wire.chunks(999) {
+                d.push(chunk);
+                while d.next_packet(&mut buf).unwrap() {
+                    got.push(buf.clone());
+                }
+            }
+            assert_eq!(got, packets);
+            wires.push(wire);
+        }
+        assert_ne!(wires[0], wires[1], "two secrets must give two streams");
+    }
+
+    /// Micro-bench: `cargo test --release -p rc-net frame_encode_bench -- --ignored --nocapture`.
+    /// Unencrypted frames, so that only the copy saved by the in-place path is measured.
+    #[test]
+    #[ignore]
+    fn frame_encode_bench() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        let mixes: [(&str, Vec<Vec<u8>>); 3] = [
+            ("small 40 B (below threshold)", (0..4096).map(|i| packet(i % 90, 40)).collect()),
+            ("medium 2 KiB", (0..512).map(|i| packet(i % 90, 2048)).collect()),
+            ("chunk-like 40 KiB", (0..64).map(|i| packet(i % 90, 40 * 1024)).collect()),
+        ];
+        for (label, packets) in &mixes {
+            let total: usize = packets.iter().map(Vec::len).sum();
+            let mut e = FrameEncoder::new();
+            let mut out = Vec::new();
+            let mut best = [f64::MAX; 2];
+            // Both paths alternate inside each trial, so that a load spike hits both.
+            for _ in 0..21 {
+                for (in_place, best) in [false, true].into_iter().zip(&mut best) {
+                    out.clear();
+                    let t = Instant::now();
+                    for p in packets {
+                        if in_place {
+                            e.compressed_frame_in_place(black_box(p), 256, &mut out).unwrap();
+                        } else {
+                            e.compressed_frame_via_scratch(black_box(p), 256, &mut out).unwrap();
+                        }
+                    }
+                    black_box(&out);
+                    *best = best.min(t.elapsed().as_secs_f64());
+                }
+            }
+            for (path, best) in ["scratch", "in place"].into_iter().zip(best) {
+                println!("{label:30} {path:8}: {:8.1} MiB/s", total as f64 / best / (1 << 20) as f64);
+            }
+        }
     }
 
     #[test]
