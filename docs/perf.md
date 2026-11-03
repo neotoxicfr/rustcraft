@@ -1431,8 +1431,10 @@ Threads (surface = step − filling, earlier → new, ms/chunk, noisy): 2: 1.16 
 4: 0.55 → 0.36; 8: 0.33 → 0.23; 16: 0.24 → 0.16; 32: 0.11 → 0.05. Multi-core inside a chunk not
 done (the pool is already saturated by chunks, the columns are tied by the gradients and the eroded
 badlands). GPU not applicable (f64 noises, branching rules, positional randomness, a few hundred
-µs per chunk). Allocations: unchanged per chunk (the column levels are a 2 KB array on the stack
-and one boxed memo per thread).
+µs per chunk). Allocations (`material_opt_bench`, earlier → new): grid 7 and 0.17 MB per chunk
+both, badlands 8 and 0.21 MB both, caves 70 → 69 (the column levels are a 2 KB array on the
+stack, one boxed memo per thread); same bench, surface ms/chunk: grid 1.50-1.63 → 0.93-1.12,
+badlands 1.51-1.52 → 0.89-1.00.
 
 ### Effects and player (fidelity G4-F09, 24/10/2026, loaded-machine micro-bench)
 
