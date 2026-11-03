@@ -134,17 +134,23 @@ fn bits_for(n: usize) -> u8 {
     (usize::BITS - (n.max(1) - 1).leading_zeros()) as u8
 }
 
-/// Disk container (§ 4.3) → memory container with global identifiers. `lossy`: an unknown
-/// entry was replaced by `fallback`.
-fn container(
+/// A disk container (§ 4.3) with its palette resolved to global identifiers, before its indices
+/// are checked.
+enum DiskContainer {
+    Single(u32),
+    Packed { ids: Box<[u32]>, bits: u8, data: Box<[u64]> },
+}
+
+/// Palette resolved and `data` read and sized. `lossy`: an unknown entry was replaced by `fallback`.
+fn read_container(
     c: Option<&Nbt>,
     entries: usize,
     blocks: bool,
     fallback: u32,
     mut resolve: impl FnMut(&Nbt) -> Option<u32>,
     lossy: &mut bool,
-) -> Result<Container, String> {
-    let Some(c) = c else { return Ok(Container::Single(fallback)) };
+) -> Result<DiskContainer, String> {
+    let Some(c) = c else { return Ok(DiskContainer::Single(fallback)) };
     let palette = list(c.get("palette"));
     if palette.is_empty() {
         return Err("empty palette".into());
@@ -159,7 +165,7 @@ fn container(
         })
         .collect();
     if ids.len() == 1 {
-        return Ok(Container::Single(ids[0]));
+        return Ok(DiskContainer::Single(ids[0]));
     }
     let k = bits_for(ids.len());
     let bits = if blocks && k <= 4 { 4 } else { k };
@@ -170,16 +176,108 @@ fn container(
     if data.len() != longs_for(entries, bits) {
         return Err(format!("{} longs for {bits} bits", data.len()));
     }
-    // Indices outside the palette: corrupt.
+    Ok(DiskContainer::Packed { ids, bits, data })
+}
+
+/// Calls `visit` with each of the first `entries` packed indices, stopping at its first error.
+fn for_each_index(
+    data: &[u64],
+    entries: usize,
+    bits: u8,
+    mut visit: impl FnMut(usize) -> Result<(), String>,
+) -> Result<(), String> {
     let (vpl, mask) = (64 / bits as usize, (1u64 << bits) - 1);
     for (w, word) in data.iter().enumerate() {
         for j in 0..vpl.min(entries - (w * vpl).min(entries)) {
-            if ((word >> (j * bits as usize)) & mask) as usize >= ids.len() {
-                return Err("index outside the palette".into());
-            }
+            visit(((word >> (j * bits as usize)) & mask) as usize)?;
         }
     }
-    Container::packed(entries, bits, Some(ids), data).ok_or_else(|| "container".into())
+    Ok(())
+}
+
+fn outside_palette() -> String {
+    "index outside the palette".into()
+}
+
+/// Disk container (§ 4.3) → memory container with global identifiers. `lossy`: an unknown
+/// entry was replaced by `fallback`.
+pub(crate) fn container(
+    c: Option<&Nbt>,
+    entries: usize,
+    blocks: bool,
+    fallback: u32,
+    resolve: impl FnMut(&Nbt) -> Option<u32>,
+    lossy: &mut bool,
+) -> Result<Container, String> {
+    match read_container(c, entries, blocks, fallback, resolve, lossy)? {
+        DiskContainer::Single(v) => Ok(Container::Single(v)),
+        DiskContainer::Packed { ids, bits, data } => {
+            // Indices outside the palette: corrupt.
+            let n = ids.len();
+            for_each_index(&data, entries, bits, |i| if i >= n { Err(outside_palette()) } else { Ok(()) })?;
+            Container::packed(entries, bits, Some(ids), data).ok_or_else(|| "container".into())
+        }
+    }
+}
+
+/// Block container of a section and its number of non-empty blocks, the indices checked and
+/// counted in the same walk (`RUSTCRAFT_OPT_SECTION_ONE_PASS_COUNT`) instead of a check, then an
+/// unpacking of the 4,096 states and a lookup of each.
+pub(crate) fn block_container_counted(
+    c: Option<&Nbt>,
+    fallback: u32,
+    resolve: impl FnMut(&Nbt) -> Option<u32>,
+    lossy: &mut bool,
+    states: &States,
+) -> Result<(Container, i16), String> {
+    match read_container(c, SECTION_BLOCKS, true, fallback, resolve, lossy)? {
+        DiskContainer::Single(v) => {
+            let c = Container::Single(v);
+            let n = count_non_empty(&c, states);
+            Ok((c, n))
+        }
+        DiskContainer::Packed { ids, bits, data } => {
+            let n = check_and_count(&data, bits, &ids, states)?;
+            Ok((Container::packed(SECTION_BLOCKS, bits, Some(ids), data).ok_or_else(|| "container".to_owned())?, n))
+        }
+    }
+}
+
+/// Checks that every packed index points into the palette while counting the non-empty blocks.
+/// No walk at all when no index can fall outside (palette of `2^bits` entries) and the palette is
+/// all air or has none.
+fn check_and_count(data: &[u64], bits: u8, ids: &[u32], states: &States) -> Result<i16, String> {
+    let air_entries = ids.iter().filter(|&&s| states.is_air(s)).count();
+    let every_index_valid = ids.len() == 1usize << bits;
+    if every_index_valid && air_entries == 0 {
+        return Ok(SECTION_BLOCKS as i16);
+    }
+    if every_index_valid && air_entries == ids.len() {
+        return Ok(0);
+    }
+    // 1 per palette entry that is not air: the count is a sum of table reads.
+    let mut small = [0u8; 256];
+    let mut large = Vec::new();
+    let solid: &mut [u8] = if ids.len() <= small.len() {
+        &mut small[..ids.len()]
+    } else {
+        large.resize(ids.len(), 0);
+        &mut large
+    };
+    for (flag, &s) in solid.iter_mut().zip(ids) {
+        *flag = u8::from(!states.is_air(s));
+    }
+    let mut count = 0i16;
+    for_each_index(data, SECTION_BLOCKS, bits, |i| {
+        count += i16::from(*solid.get(i).ok_or_else(outside_palette)?);
+        Ok(())
+    })?;
+    Ok(count)
+}
+
+/// `RUSTCRAFT_OPT_SECTION_ONE_PASS_COUNT=0`: old block read (check, then a separate count).
+fn section_one_pass_count() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_SECTION_ONE_PASS_COUNT")
 }
 
 fn light_layer(v: Option<&Nbt>) -> Result<LightLayer, String> {
@@ -560,6 +658,17 @@ impl Chunk {
 
 /// Reads a chunk. Error: to be treated as absent (and never rewritten).
 pub fn parse(root: Nbt, data: &VersionData, states: &States, h: Height) -> Result<Chunk, Skip> {
+    parse_with(root, data, states, h, section_one_pass_count())
+}
+
+/// [`parse`], the block count of the sections taken in the index check (`one_pass_count`) or apart.
+pub(crate) fn parse_with(
+    root: Nbt,
+    data: &VersionData,
+    states: &States,
+    h: Height,
+    one_pass_count: bool,
+) -> Result<Chunk, Skip> {
     let status = root.get("Status").and_then(Nbt::as_str).unwrap_or("");
     if status.strip_prefix("minecraft:").unwrap_or(status) != "full" {
         return Err(Skip::NotFull(status.to_owned()));
@@ -588,15 +697,17 @@ pub fn parse(root: Nbt, data: &VersionData, states: &States, h: Height) -> Resul
         if !(0..n as i32).contains(&i) {
             continue;
         }
-        let blocks = container(
-            s.get("block_states"),
-            SECTION_BLOCKS,
-            true,
-            states.air_state,
-            |e| states.state_of(data, e),
-            &mut lossy,
-        )
-        .map_err(|e| corrupt(format!("section {y}, blocks: {e}")))?;
+        let resolve = |e: &Nbt| states.state_of(data, e);
+        let block_states = s.get("block_states");
+        let counted = if one_pass_count {
+            block_container_counted(block_states, states.air_state, resolve, &mut lossy, states)
+        } else {
+            container(block_states, SECTION_BLOCKS, true, states.air_state, resolve, &mut lossy).map(|b| {
+                let n = count_non_empty(&b, states);
+                (b, n)
+            })
+        };
+        let (blocks, non_empty) = counted.map_err(|e| corrupt(format!("section {y}, blocks: {e}")))?;
         let biomes = container(
             s.get("biomes"),
             SECTION_BIOMES,
@@ -606,7 +717,6 @@ pub fn parse(root: Nbt, data: &VersionData, states: &States, h: Height) -> Resul
             &mut lossy,
         )
         .map_err(|e| corrupt(format!("section {y}, biomes: {e}")))?;
-        let non_empty = count_non_empty(&blocks, states);
         sections[i as usize] = Section { non_empty, blocks, biomes };
     }
     let heightmaps = match root.get("Heightmaps") {
