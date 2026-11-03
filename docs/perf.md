@@ -4333,6 +4333,11 @@ Micro-benches (`--ignored`, model world `target/perf/model`, overworld, 20,373 c
   (with flate2) 0.48-1.47 s, palette lookups (`state_of`) 104 ms for 1.44 million entries
   (72 ns each, about 4 % of a one-core load): the per-block property table of the mission is
   not done (NBT parse and inflate dominate), to re-measure on the quiet machine.
+- `storage::tests::bench_optimize` (Optimize World, 8 region files of 1,024 chunks, every
+  region switch at 0 then at 1, two runs, machine at 45-100 %): reading every chunk one by one
+  88-90 → 30-41 ms; optimise with erasing (read, rewrite) 1 thread 606-829 → 398-448 ms,
+  2 threads 324-426 → 221-273, 4 threads 164-199 → 121-138, 8 threads 94-107 → 68-74 ms (one
+  run at 177 ms with the machine at 100 %).
 
 Section count (`RUSTCRAFT_OPT_SECTION_ONE_PASS_COUNT`, proof `world::tests::section_count_same_both_ways`:
 16 palette shapes and damages, then the 17,676 chunks of the test world parsed both ways; a
