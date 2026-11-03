@@ -416,4 +416,34 @@ mod tests {
         set_local(0);
         set_hidden(0x7701, false);
     }
+
+    /// Micro-bench (loaded machine figures in `docs/perf.md`):
+    /// `cargo test --release -p rc-client hidden_rows_bench -- --ignored --nocapture`.
+    /// One frame of the social screen, 8 visible rows: the hidden list copied once then searched,
+    /// against one locked lookup per row; 0, 1 and 20 hidden players.
+    #[test]
+    #[ignore]
+    fn hidden_rows_bench() {
+        use std::hint::black_box;
+        const FRAMES: usize = 200_000;
+        let rows: Vec<u128> = (0x9900..0x9908).collect();
+        for hidden in [0u128, 1, 20] {
+            (0..hidden).for_each(|i| set_hidden(0x9a00 + i, true));
+            for trial in 0..3 {
+                let t = std::time::Instant::now();
+                for _ in 0..FRAMES {
+                    let list = hidden_players();
+                    rows.iter().for_each(|r| _ = black_box(list.contains(r)));
+                }
+                let copy = t.elapsed().as_nanos() as f64 / FRAMES as f64;
+                let t = std::time::Instant::now();
+                for _ in 0..FRAMES {
+                    rows.iter().for_each(|r| _ = black_box(is_hidden(*r)));
+                }
+                let per_row = t.elapsed().as_nanos() as f64 / FRAMES as f64;
+                eprintln!("trial {trial}, {hidden} hidden: copy {copy:.0} ns, per row {per_row:.0} ns per frame");
+            }
+            (0..hidden).for_each(|i| set_hidden(0x9a00 + i, false));
+        }
+    }
 }

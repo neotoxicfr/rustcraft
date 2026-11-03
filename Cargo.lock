@@ -2282,6 +2282,7 @@ dependencies = [
  "rc-net",
  "rc-proto",
  "rc-proto-v777",
+ "rc-testdata",
  "rc-text",
  "rc-world",
  "ring",
