@@ -545,6 +545,64 @@ machine.
   threshold +1, counter not decremented, volume ×0.99, biome layer ignored, default weight
   changed in both draws (fingerprint).
 
+### Audio engine: per-frame work, subtitles, sound table, loading, devices (C4-M29, 03/11/2026)
+
+Micro-benches on a loaded machine (other agents compiling), 2 alternating passes in the same
+process; final decision on the scene bench (`village`, `plains12`, `title`, `crowd`, quiet machine).
+Placement: everything stays where it was (main thread for the engine, "audio-devices" and
+"rc-audio-load-*" threads); GPU not applicable (a few ns to a few ms of branchy work).
+
+- Per frame (`engine::tests_frame::frame_bench`, 32 loops, a block every 35 frames), ns/frame:
+  old 19.8 / 21.0 (22.6 / 20.0 on a re-run). `RUSTCRAFT_OPT_AUDIO_PUMP_SKIP_IDLE` (default 1: outbox
+  skipped when empty, loaded channel skipped while no load is in flight, counted per job; finished
+  voices still polled every frame since the poll that sees an end sets the relaunch tick of a
+  repeated sound): 18.9 / 19.7 (15.1 / 18.9). `RUSTCRAFT_OPT_AUDIO_LISTENER_DIFF` (default 0):
+  24.0 / 25.7 still, 34-39 moving: on x86 the cell write is 10 plain stores, cheaper than comparing
+  9 components. `RUSTCRAFT_OPT_AUDIO_PUMP_RATE_LIMIT` (default 0, poll at most once per ms): 33-47:
+  the clock read costs more than the poll; with it at 1, an end seen in the last millisecond before
+  a tick moves to the next tick (relaunch of a repeated sound one tick later, as random as before).
+- Commands (48 attached sounds, half still, + the 11 sliders applied every tick):
+  `RUSTCRAFT_OPT_AUDIO_COMMAND_DEDUP` (default 1: no position command for an unchanged position,
+  category volumes coalesced and sent at the next poll or before the next command, only if they
+  differ from the mixer's): 1,183 → 663 ns per tick (1,477 → 782), 59 → 24 commands per tick.
+  `RUSTCRAFT_OPT_AUDIO_MIXER_VOICE_IDS` (default 1, voice found in a list of ids): 247 voices
+  37.4 / 36.2 → 33.2 / 36.8 ns per command, 64 voices 9.8 / 10.7 → 9.7 / 10.2 (noise; 2 KB walked
+  instead of 37 KB).
+- Subtitles (`RUSTCRAFT_OPT_SUBTITLE_INTERNED`, default 1): key shared with the compiled table
+  (`Arc<str>`, found by event index) instead of looked up by name and copied; launch with subtitles
+  on 153 / 155 → 130 / 123 ns, repeated subtitle 65 / 55 → 31 / 23 ns. Client: each line keeps its
+  text and width, recomputed when the translated template or the GUI font generation changes
+  (`rc_text::Lang` has no identity; a translation without arguments depends only on its template).
+- Sound table: `RUSTCRAFT_OPT_SOUND_TABLE_COMPILED_ONLY` (default 1): source table dropped once
+  compiled, −1,565 KB of heap. `RUSTCRAFT_OPT_SOUND_TABLE_SORTED_LISTING` (default 0): binary
+  search in the sorted `.ogg` listing instead of a set, load 11.6 / 12.6 / 16.3 → 14.3 / 14.6 / 18.6
+  ms (the set costs 0.12 ms; the listing itself 3.2 ms, which only an existence query known to the
+  baked resource cache could avoid: not available, a direct query would open the jar on a warm start).
+- Loading: `RUSTCRAFT_OPT_AUDIO_LOADER_THREADS` (default 1): clamp(cores / 8, 2, 4) threads
+  (`RUSTCRAFT_THREADS` forces the core count; not the rayon pool). Burst of 50 first sounds
+  (`engine::tests_pcm::loader_bench`): 1 thread 53.1 / 56.3 ms, 2: 30.6 / 31.8, 4: 19.8 / 19.6,
+  8: 13.4 / 12.0. `RUSTCRAFT_OPT_AUDIO_PRELOAD_VARIANTS` (default 1): at the first playback of an
+  event whose sound is short (< 2 s), its other buffered variants decoded on a low-priority queue
+  (a waiting sound is always taken first). Village-like run (50 first sounds, then 3 per tick for
+  400 ticks): 107 → 5 of 1,200 launches waited for a decoding, burst unchanged (30.6-31.6 vs
+  30.2-31.5 ms). 30-minute session (`pcm_budget_bench`): 242 → 136 waiting launches unbounded,
+  983 → 876 at 32 MiB, same memory (89.2 / 33.2 MB) and evictions (797). The game also waits at the
+  first playback of each variant; we now wait only at the first of each event (sooner, never later).
+- Devices (`RUSTCRAFT_OPT_AUDIO_DEVICE_EVENTS`, default 1): Windows endpoint notifications (added,
+  removed, state, default, property = rename) raise a flag; the poll keeps its 1 s rhythm and reads
+  the names only after a notification, plus every 30 polls; without notifications (other systems,
+  refused subscription), identifiers probed every second, names read when they change and every 10
+  polls. Real devices (`devices::tests::device_poll_bench`): full read 4.737 / 4.203 ms per poll,
+  identifier probe 3.566 / 3.798 ms (barely cheaper here), notifications 0.102 / 0.095 ms on
+  average (−98%). CPU of the "audio-devices" thread in `title`, `plains12`, pause: scene bench.
+- Proofs: `engine::tests_frame` (`frame_savings_bit_exact`, `frame_savings_skip_the_work`,
+  `idle_poll_still_receives_loads`, `command_dedup_drops_only_no_ops`, `subtitle_keys_shared_with_table`,
+  `loader_threads_follow_the_machine`), `mixer::tests::mix_digest` (16 combinations),
+  `sound_ids_bit_exact` with copied keys, `sounds::tests::compiled_only_table_matches_source_table`,
+  `engine::tests_pcm::first_playback_preloads_the_other_variants`,
+  `devices::tests::device_events_replay_the_old_decisions`, client
+  `subtitles::tests::kept_line_text_matches_fresh_text`. Sabotages checked in the commits.
+
 ### Bounded PCM cache (I-05, 24/10/2026, micro-bench and simulated session, loaded machine)
 
 Prior measurement (`rc-audio/examples/pcm_census.rs`): 4,843 non-streamed files = 827 MB of
@@ -2046,7 +2104,10 @@ animated sprite up to 4 ms earlier (early, imperceptible). Not done: glint compu
 | Client column grid (`rc_world::ChunkGrid`, same micro-bench) | cell `x mod N` (N = 2R+3, not a power of 2: eviction like the game's cache) through Lemire's modulo instead of division | current grid 40% slower than foldhash in lookup (6.0 against 4.4 ns, neighbours 4.1 against 2.1 ns: two divisions per access); Lemire: 6.3 ns (no better) | kept as is; a power of 2 would change the eviction cell (difference from the game); to take up again if `environ::state`/`light` become hot |
 | Light after block changes (finding OPT1B, tick bench) | (measurement) share of `rc_light::relight` in `flush_block_changes` | 55% of the total tick time; spikes of 7 to 24 ms every 5 (water) or 30 (lava) ticks, groups of 20 to 50 changes of a flow; tick median < 1 ms, mean ×2 to ×3 | outside the wave's files (crate `rc-light`): next lead of the tick (zone per group too high for the sky, zone arrays allocated per resolution, background thread like the game's engine) |
 | Sound table (C4-M04, loaded machine) | baking of `SoundTable` into the resource cache | not implemented: table 7-25 ms (C4-M03: 15-94 ms), now read on the "audio-engine" thread (startup) or "resources" (F3+T); wait at the join 0.05-0.07 ms | under the 10 ms threshold on the path of the 1st frame: the cache would only shorten a background thread; `sounds.json` and the lists of the `.ogg` and `sounds.json` are in the cache snapshot (lists read before `finish` and files passed to `finish` at the first launch: guaranteed even if the "audio-engine" thread reads after the recording); to re-measure if the join waits on the scene bench |
-| Audio device tracking (C4-M03, loaded machine) | `RUSTCRAFT_OPT_AUDIODEVIDS=1`: re-read the names only when the ids change | ids 0.06-0.08 ms against full list 0.29-3.5 ms per readout (1 per second, background thread) | kept at 0: gain off the main thread (≤ 0.35% of a core) and a device renamed without changing its id would no longer be seen |
+| Audio device tracking (C4-M03, loaded machine) | `RUSTCRAFT_OPT_AUDIODEVIDS=1`: re-read the names only when the ids change | ids 0.06-0.08 ms against full list 0.29-3.5 ms per readout (1 per second, background thread) | kept at 0: gain off the main thread (≤ 0.35% of a core) and a device renamed without changing its id would no longer be seen; superseded by `AUDIO_DEVICE_EVENTS` (C4-M29), which only reads it when that one is 0 |
+| Audio listener written on change (C4-M29, loaded machine) | `RUSTCRAFT_OPT_AUDIO_LISTENER_DIFF=1` | 24.0 / 25.7 ns per frame still, 34-39 moving, against 19.8 / 21.0 | kept at 0: comparing 9 components costs more than 10 plain stores on x86 |
+| Audio poll rate limit (C4-M29, loaded machine) | `RUSTCRAFT_OPT_AUDIO_PUMP_RATE_LIMIT=1`: per-frame poll at most once per ms | 33-47 ns per frame against 19.8 / 21.0 | kept at 0: the clock read costs more than the poll it saves |
+| Sound table sorted listing (C4-M29, loaded machine) | `RUSTCRAFT_OPT_SOUND_TABLE_SORTED_LISTING=1`: binary search instead of a set of the `.ogg` paths | load 14.3 / 14.6 / 18.6 ms against 11.6 / 12.6 / 16.3 | kept at 0: the set costs 0.12 ms; the real cost is the 3.2 ms listing, which needs a cache-aware existence query |
 | Biome tint of block pieces (G2-F10) | without reusing the previous color (5 × 5 blend per piece) | 169 µs against 5.6 µs per break | 25 biome zooms per piece for the same color |
 | Shared fluid flow (rendering + physics) | generic function instead of `&dyn Fn` | 1.500 s against 1.502 s (1 t) | no gain: the +1.4% overhead (1.480 → 1.502 s; 88.2 → 89.4 ms all cores) comes from the `blocks_fluid_flow` tag now being honoured, not from the call; keeps the generic version |
 | Mob push (C6-M07) | 16³ section grid (`RUSTCRAFT_OPT_MOBGRID`) | **postponed, not measured** (not ruled out); prefiltered O(N²) residual: 22–27 ms per tick at 1,600 mobs, 0.06 ms at 100 | open lead, hottest remaining point of the push; not attempted here because the positions are written directly in ≈ 94 places and other mobs move during a mob's tick: a grid rebuilt once per tick does not see a mob that has entered the area since (re-checking the candidates is not enough); an exact grid requires intercepting every position write (candidates then re-sorted in list order: same result); dedicated mission to open; multi-core and GPU not applicable (sequential pushes, list order) |
