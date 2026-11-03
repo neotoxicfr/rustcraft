@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 
 use crate::blocks::probe::Probe;
+use crate::commands::ents::TEST_KILL_REWRITES_ONE_CHUNK;
 use rc_client::{EntityEvent, Event};
 use rc_proto::nbt::Nbt;
 
@@ -156,6 +157,37 @@ fn pushed_armor_stand_files_under_new_chunk() {
     let out = saved(&mut p);
     assert!(out.get(&HOME).is_some_and(|l| of_type(l, "minecraft:armor_stand").is_empty()));
     assert_eq!(out.get(&(7, 6)).map(|l| of_type(l, "minecraft:armor_stand").len()), Some(1));
+}
+
+/// Entities on disk after a full save then `kill` of a kept compound, with `kill` marking only
+/// its chunk (`one_chunk`) or every entity chunk; also the number of chunks the save wrote.
+fn disk_after_kill(one_chunk: bool) -> Option<(EntitiesByChunk, usize)> {
+    let (mut p, _dir) = probe(if one_chunk { "kept-kill-one" } else { "kept-kill-all" })?;
+    TEST_KILL_REWRITES_ONE_CHUNK.with(|c| c.set(Some(one_chunk)));
+    cmd(&mut p, "summon minecraft:marker 100.5 -59 100.5 {UUID:[I;1,2,3,4],Tags:[\"doomed\"]}");
+    cmd(&mut p, "summon minecraft:marker 120.5 -59 120.5 {UUID:[I;5,6,7,8]}");
+    p.s.life.drop_chunks.extend(p.s.entities.keys().copied().collect::<Vec<_>>());
+    let mut disk = saved(&mut p);
+    cmd(&mut p, "kill @e[type=minecraft:marker,tag=doomed]");
+    let after = saved(&mut p);
+    let written = after.len();
+    disk.extend(after);
+    TEST_KILL_REWRITES_ONE_CHUNK.with(|c| c.set(None));
+    Some((disk, written))
+}
+
+/// Equivalence of the two `kill` paths: the same entities on disk, the doomed one gone from its
+/// chunk; the new path rewrites fewer chunks.
+#[test]
+fn kill_marks_only_its_chunk_same_disk_contents() {
+    let Some((one, written_one)) = disk_after_kill(true) else { return };
+    let (all, written_all) = disk_after_kill(false).expect("second world");
+    assert_eq!(one, all, "entities on disk differ between the two kill paths");
+    let doomed = |l: &Vec<Nbt>| l.iter().any(|e| tags(e) == ["doomed"]);
+    assert!(!one.values().any(doomed), "killed marker still saved");
+    assert_eq!(one.get(&AWAY).map(|l| of_type(l, "minecraft:marker").len()), Some(1));
+    assert!(written_one < written_all, "one chunk path wrote {written_one}, all chunks path {written_all}");
+    eprintln!("kill then save: {written_one} entity chunks written (all chunks path: {written_all})");
 }
 
 /// Micro-bench (ignored, `--ignored --nocapture`): a decoration edit (weightless armor stand

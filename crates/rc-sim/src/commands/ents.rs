@@ -758,11 +758,18 @@ impl Server {
                 self.entity_scores_removed(self.ent_uuid(e));
                 // A marker was never announced: no removal either (G5-F05).
                 let visible = self.other(i).is_none_or(crate::decoration::client_visible);
+                let held_by = self.kept_entity_slot(i).map(|(c, _)| c);
                 for l in self.entities.values_mut() {
                     l.retain(|(x, _)| *x != i);
                 }
                 self.deco_forget(i);
-                self.life.drop_chunks.extend(self.entities.keys().copied().collect::<Vec<_>>());
+                // Only the chunk that held it changed: rewriting every entity chunk of the
+                // dimension at the next save wrote the same contents again.
+                if kill_rewrites_one_chunk() {
+                    self.life.drop_chunks.extend(held_by);
+                } else {
+                    self.life.drop_chunks.extend(self.entities.keys().copied().collect::<Vec<_>>());
+                }
                 if visible {
                     let _ = self.send(Event::Entity(EntityEvent::Remove(vec![i])));
                 }
@@ -825,6 +832,24 @@ impl crate::mobs::Mobs {
 }
 
 /// Resets the horizontal speed of the absolute axes of a command teleportation.
+/// `kill` of a kept compound marks only the chunk that held it for the next save
+/// (`RUSTCRAFT_OPT_KILL_REWRITES_ONE_CHUNK=0`: every entity chunk of the dimension, the former way).
+fn kill_rewrites_one_chunk() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_KILL_REWRITES_ONE_CHUNK.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    crate::generation::opt_switch(&ON, "RUSTCRAFT_OPT_KILL_REWRITES_ONE_CHUNK", true)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`kill_rewrites_one_chunk`] forced on this thread (both paths compared).
+    pub(crate) static TEST_KILL_REWRITES_ONE_CHUNK: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// What [`Server::refile_kept_entity`] did, for a caller that sends the move itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeptEntityMove {

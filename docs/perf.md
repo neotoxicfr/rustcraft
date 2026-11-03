@@ -3524,6 +3524,12 @@ rounds, minimum of 5 passes of 400 ticks per scene, loaded machine (other agents
   whole-map search runs only when a border is crossed. Lead noted, not taken: check only in the
   three edits that write `Pos` (saves the 7 ns on the other edits, at the price of a second edit
   function to keep in step).
+- `kill` of a kept compound marked every entity chunk of the dimension for the next save; it now
+  marks only the chunk that held it (`RUSTCRAFT_OPT_KILL_REWRITES_ONE_CHUNK=0`: the former way).
+  Deterministic count on the test world (25 entity chunks read): the save after the kill writes
+  1 entity chunk instead of 25; the entities on disk are the same for both paths
+  (`tests_kept_entity_chunks::kill_marks_only_its_chunk_same_disk_contents`). The scene bench
+  kills no kept compound: no scene to measure.
 - Multi-core and GPU: not applicable (one list search per command, mutations in order).
 - Remaining difference, noted: a compound teleported into a chunk whose entities were never read
   stays in its former list (the game reads the destination file at save time and merges; ours
