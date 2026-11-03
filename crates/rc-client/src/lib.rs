@@ -7,6 +7,7 @@ pub mod auth;
 pub mod chat;
 pub mod chat_verify;
 mod conn;
+mod dispatch;
 pub mod cooldowns;
 pub mod misc;
 mod dns;
