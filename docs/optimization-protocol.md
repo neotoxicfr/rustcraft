@@ -38,7 +38,11 @@ through `rc_data::env_str!` / `env_flag!` / `env_os!` (one read per site, `crate
 - [ ] B5. Read the code, not only the profiles: start from the hot map cards
   (`tools/hot_map.py`), then read every touched file in full.
 - [ ] B6. Root cause everywhere: every pattern found is searched for and fixed across the whole repository.
-- [ ] B7. Simplify the code when possible without changing the behaviour.
+- [ ] B7. Simplify the code when possible without changing the behaviour, and keep it readable by a
+  human (user request, 03/11): clear English names that say what the thing does (functions, types,
+  variables, files, tests, benches, `RUSTCRAFT_OPT_*` switches), never a cryptic abbreviation or a
+  lot or mission number in a name; short functions, split when they grow; a short comment saying
+  WHY before every non-obvious optimisation trick. At equal gain, the simpler version wins.
 - [ ] B8. Share the work: the same data walked or computed several times (two passes over the
   same list, the same neighbour search, the same lookup in several systems) becomes one pass or
   one shared structure (a spatial index shared by collisions, AI, explosions and pushes; one cache
