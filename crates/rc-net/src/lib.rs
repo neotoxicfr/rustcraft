@@ -32,3 +32,18 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod test_bytes {
+    /// Deterministic pseudo-random bytes (xorshift), so a failure is reproducible.
+    pub fn pseudo_random(len: usize, mut seed: u64) -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 32) as u8
+            })
+            .collect()
+    }
+}
