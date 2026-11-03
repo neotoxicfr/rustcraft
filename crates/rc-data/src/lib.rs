@@ -6,6 +6,7 @@ mod compile;
 pub mod env_flags;
 pub mod ids;
 pub mod jar;
+pub mod java_math;
 pub mod model;
 pub mod pack_filter;
 mod prepare;
