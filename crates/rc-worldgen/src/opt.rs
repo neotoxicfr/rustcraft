@@ -54,6 +54,28 @@ switch!(
     sincos,
     "RUSTCRAFT_OPT_SINCOS"
 );
+switch!(
+    /// `jmath` products: exact error through Veltkamp's split instead of the library `fma` call
+    /// (used when the FMA instruction is absent or `RUSTCRAFT_OPT_TWO_PROD_FMA=0`).
+    two_prod_split,
+    "RUSTCRAFT_OPT_TWO_PROD_SPLIT"
+);
+switch!(
+    /// `jmath` products: bodies compiled for the FMA instruction, if the processor has it.
+    /// Both `TWO_PROD` switches at 0 restore the library call.
+    two_prod_fma,
+    "RUSTCRAFT_OPT_TWO_PROD_FMA"
+);
+switch!(
+    /// `jmath` sin or cos alone: only the Taylor series it returns, not both.
+    sincos_only_needed_series,
+    "RUSTCRAFT_OPT_SINCOS_ONE_SERIES"
+);
+switch!(
+    /// `jmath`: when both Taylor series are needed, they advance in the same loop.
+    sincos_interleaved_series,
+    "RUSTCRAFT_OPT_SINCOS_INTERLEAVED"
+);
 
 switch!(
     /// Volume evaluator: choices (range, interval, lerp) that compute each branch only on

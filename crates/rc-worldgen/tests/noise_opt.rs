@@ -366,7 +366,7 @@ fn sincos_inputs(k: u32) -> [f64; 3] {
     ]
 }
 
-fn check_sincos(f: fn(f64) -> (f64, f64)) -> Option<f64> {
+fn check_sincos(f: impl Fn(f64) -> (f64, f64) + Sync) -> Option<f64> {
     let extra = [0.0, -0.0, 1e-9, -1e-9, 1e-8, 1e5, 1e5 + 1.0, -1e5, f64::NAN, f64::INFINITY, 1e300];
     if let Some(&x) = extra.iter().find(|&&x| {
         let (s, c) = f(x);
@@ -388,6 +388,26 @@ fn sincos_matches_sin_cos_exhaustive() {
     assert_eq!(check_sincos(jmath::sincos), None);
     // Sabotage: reduction shifted by one ulp.
     assert!(check_sincos(|x| jmath::sincos_shared(x.next_up())).is_some(), "sabotage not detected");
+}
+
+/// Every way of computing, through sin and cos taken separately and through `sincos_shared`,
+/// gives the bits of the selected one over the same exhaustive inputs.
+#[test]
+fn sincos_paths_match_exhaustive() {
+    use jmath::{ProductPath, SinCosPaths};
+    eprintln!("selected: {:?}, FMA on this processor: {}", SinCosPaths::selected(), jmath::fma_available());
+    for product in [ProductPath::LibraryFma, ProductPath::Split, ProductPath::HardwareFma] {
+        // Each series switch alone is checked by the unit tests of `jmath` (10⁷ angles).
+        for (only_needed_series, interleaved_series) in [(false, false), (true, true)] {
+            let paths = SinCosPaths { product, only_needed_series, interleaved_series };
+            assert_eq!(check_sincos(|x| (jmath::sin_with(x, paths), jmath::cos_with(x, paths))), None, "{paths:?}");
+            assert_eq!(check_sincos(|x| jmath::sincos_shared_with(x, paths)), None, "{paths:?}");
+        }
+    }
+    // Sabotage: cosine of the old path shifted by one ulp.
+    let old = SinCosPaths::OLD;
+    let bad = |x: f64| (jmath::sin_with(x, old), jmath::cos_with(x, old).next_up());
+    assert!(check_sincos(bad).is_some(), "sabotage not detected");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -506,6 +526,56 @@ fn noise_micro_bench() {
             })
             .sum::<f64>()
     });
+}
+
+/// Ways of computing `jmath` sin and cos, each alone then combined: 10⁶ angles in ±10, sin + cos
+/// separately and `sincos_shared`; then the old and the selected ways on 1 thread and powers of 2
+/// up to the number of logical cores (4 × 10⁶ angles in ±10⁵).
+#[test]
+#[ignore = "benchmark"]
+fn sincos_paths_bench() {
+    use jmath::{ProductPath, SinCosPaths};
+    let old = SinCosPaths::OLD;
+    let fma = ProductPath::HardwareFma;
+    let named = [
+        ("old", old),
+        ("split", SinCosPaths { product: ProductPath::Split, ..old }),
+        ("fma", SinCosPaths { product: fma, ..old }),
+        ("one series", SinCosPaths { only_needed_series: true, ..old }),
+        ("interleaved", SinCosPaths { interleaved_series: true, ..old }),
+        ("one series + interleaved", SinCosPaths { only_needed_series: true, interleaved_series: true, ..old }),
+        ("split + both series switches", SinCosPaths { product: ProductPath::Split, only_needed_series: true, interleaved_series: true }),
+        ("fma + both series switches", SinCosPaths { product: fma, only_needed_series: true, interleaved_series: true }),
+    ];
+    let sincos_sum = |xs: &[f64], paths: SinCosPaths| -> f64 {
+        xs.iter()
+            .map(|&x| {
+                let (s, c) = jmath::sincos_shared_with(x, paths);
+                s + c
+            })
+            .sum()
+    };
+    let mut r = Mix(11);
+    let xs: Vec<f64> = (0..1_000_000).map(|_| r.range(-10.0, 10.0)).collect();
+    eprintln!("FMA on this processor: {}, selected: {:?}", jmath::fma_available(), SinCosPaths::selected());
+    for (name, paths) in named {
+        time(&format!("sin+cos 10^6, {name}"), 5, || {
+            xs.iter().map(|&x| jmath::sin_with(x, paths) + jmath::cos_with(x, paths)).sum::<f64>()
+        });
+        time(&format!("sincos 10^6, {name}"), 5, || sincos_sum(&xs, paths));
+    }
+    let many: Vec<f64> = (0..4_000_000).map(|_| r.range(-1e5, 1e5)).collect();
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let mut threads = 1;
+    while threads <= cores {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        for (name, paths) in [("old", old), ("selected", SinCosPaths::selected())] {
+            time(&format!("sincos 4x10^6, {threads} threads, {name}"), 3, || {
+                pool.install(|| many.par_chunks(4096).map(|c| sincos_sum(c, paths)).sum::<f64>())
+            });
+        }
+        threads = if threads == cores { cores + 1 } else { (threads * 2).min(cores) };
+    }
 }
 
 /// `final_density_many` over 256 chunks, 1 thread then powers of 2 up to the number of cores;
