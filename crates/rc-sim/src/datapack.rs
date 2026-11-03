@@ -89,6 +89,9 @@ pub struct DataPack {
     pub(crate) ench: std::sync::OnceLock<crate::enchanting::Enchants>,
     /// Tags of a data-driven registry folder, all resolved at its first request.
     tags: Mutex<HashMap<Box<str>, Arc<FolderTags>>>,
+    /// Loot table of each block, by block id: `None` until the block is first broken,
+    /// `Some(None)` when it has no table. A new pack starts empty.
+    block_tables: Mutex<Vec<Option<Option<Arc<Value>>>>>,
 }
 
 /// Resolved tags of one registry folder: tag name (`ns:path`) → members (`ns:path`), in order.
@@ -124,6 +127,7 @@ impl DataPack {
     pub fn insert_test_file(&mut self, key: &str, json: &str) {
         self.files.insert(key.to_owned(), Arc::from(json.as_bytes()));
         self.cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
+        self.block_tables.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     fn key(dir: &str, id: &str) -> String {
@@ -140,6 +144,23 @@ impl DataPack {
         let v = self.files.get(&Self::key(dir, id)).and_then(|b| serde_json::from_slice::<Value>(b).ok()).map(Arc::new);
         self.cache.lock().unwrap_or_else(|e| e.into_inner()).insert(q.owned(), v.clone());
         v
+    }
+
+    /// Loot table of block `block_id` named `block_name` (`minecraft:blocks/<path>`), looked up
+    /// by name the first time only: breaking a block then costs neither the table name's text
+    /// nor a hashed lookup.
+    pub(crate) fn block_loot_table(&self, block_id: u32, block_name: &str) -> Option<Arc<Value>> {
+        let slot = block_id as usize;
+        if let Some(Some(known)) = self.block_tables.lock().unwrap_or_else(|e| e.into_inner()).get(slot) {
+            return known.clone();
+        }
+        let table = self.get("loot_table", &format!("minecraft:blocks/{}", block_name.trim_start_matches("minecraft:")));
+        let mut tables = self.block_tables.lock().unwrap_or_else(|e| e.into_inner());
+        if tables.len() <= slot {
+            tables.resize(slot + 1, None);
+        }
+        tables[slot] = Some(table.clone());
+        table
     }
 
     /// Spawn list `key` (category) of biome `biome` (empty without file or list), kept.

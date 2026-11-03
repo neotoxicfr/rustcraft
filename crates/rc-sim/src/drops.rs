@@ -1551,7 +1551,9 @@ impl Server {
         if self.game_mode == 1 {
             return;
         }
-        let Some(block) = self.data.block_of(state).map(|b| b.name.clone()) else { return };
+        // The version data held by its own handle: the block's name is lent, not copied.
+        let data = self.data.clone();
+        let Some(block) = data.block_of(state).map(|b| b.name.as_str()) else { return };
         let held = 36 + self.held as usize;
         let tool = self.slots[held].clone();
         // Wear: non-zero hardness; shears: any block outside `#fire` (G5-F05).
@@ -1580,61 +1582,33 @@ impl Server {
         if !correct {
             return;
         }
-        self.s9_block_mined(&block); // S9: destruction by a player
+        self.s9_block_mined(block); // S9: destruction by a player
         self.life.vit.exhaust(0.005, self.abilities().invulnerable);
-        let props: Vec<(String, String)> =
-            self.data.state_properties(state).map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
-        let be = self.block_entity(p).cloned();
-        let path = block.trim_start_matches("minecraft:");
-        let table_id = format!("minecraft:blocks/{path}");
-        let tags = &self.block_tags;
-        let data = &self.data;
-        let tag_fn = |tag: &str, name: &str| {
-            let id = data.blocks.iter().position(|b| b.name == name).map(|i| i as u32);
-            id.is_some_and(|id| tags.get(tag).is_some_and(|v| v.binary_search(&id).is_ok()))
+        let hive = block == "minecraft:beehive" || block == "minecraft:bee_nest";
+        // Bees inside when it breaks, read before the loot like the block entity it lends.
+        let bees_inside = if hive {
+            crate::nbtio::list(self.block_entity(p).and_then(|b| b.get("bees"))).len() as i32
+        } else {
+            0
         };
-        let seq =
-            self.life.pack.get("loot_table", &table_id).and_then(|t| t["random_sequence"].as_str().map(str::to_owned));
-        // W8c: generator taken out for the time of the draw; the world is lent to the conditions (location
-        // offset of tall grass, breaking player).
-        let mut rng = match &seq {
-            Some(s) => *self.life.seqs.get(s),
-            None => self.life.rng,
+        // The loot's draw lends the world to the conditions (location offset of tall grass,
+        // breaking player).
+        let drops = if crate::loot::loot_context_borrowed() {
+            let mined = crate::block_loot::BlockRemoval::Mined { tool: tool.as_ref(), by_player: true };
+            self.draw_block_loot(p, state, mined)
+        } else {
+            self.mined_block_loot_with_owned_context(p, state, block, tool.as_ref(), true)
         };
-        let drops = {
-            let world = self.loot_world(crate::progress::pred::Ctx {
-                this: Some(crate::progress::pred::Who::E(crate::commands::ents::E::Player)),
-                origin: Some([f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5]),
-                block: Some(state),
-                tool: Some(tool.as_ref()),
-                ..Default::default()
-            });
-            let loot = crate::loot::Loot { pack: &self.life.pack, items: &self.life.items, block_tag: &tag_fn };
-            let ctx = crate::loot::Ctx {
-                block: Some((block.as_str(), props)),
-                tool: Some(tool.as_ref()),
-                explosion: None,
-                block_entity: be.as_ref(),
-                luck: 0.0,
-                world: Some(&world),
-                ..Default::default()
-            };
-            loot.drops(&table_id, &ctx, &mut rng)
-        };
-        match &seq {
-            Some(s) => *self.life.seqs.get(s) = rng,
-            None => self.life.rng = rng,
-        }
         for d in drops {
             self.pop_resource(p, d);
         }
-        self.drop_block_xp(p, &block, tool.as_ref());
+        self.drop_block_xp(p, block, tool.as_ref());
         let silk = tool.as_ref().is_some_and(|t| self.life.items.enchantment(t, "minecraft:silk_touch") > 0);
-        self.infested_broken(p, &block, tool.as_ref()); // F01: silverfish of infested blocks
-        self.hive_broken(p, &block, tool.as_ref()); // F11: bees released, anger
+        self.infested_broken(p, block, tool.as_ref()); // F01: silverfish of infested blocks
+        self.hive_broken(p, block, tool.as_ref()); // F11: bees released, anger
         // W8c: `bee_nest_destroyed`: bees left inside (Silk Touch: all).
-        if block == "minecraft:beehive" || block == "minecraft:bee_nest" {
-            let bees = if silk { crate::nbtio::list(be.as_ref().and_then(|b| b.get("bees"))).len() as i32 } else { 0 };
+        if hive {
+            let bees = if silk { bees_inside } else { 0 };
             self.trig_bee_nest(state, tool.as_ref(), bees);
         }
     }

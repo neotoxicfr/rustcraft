@@ -4968,3 +4968,53 @@ old path), GPU RTX 5080 Vulkan, micro-benches on a loaded machine (other agents 
   `gui.wgsl` query `textureDimensions` per vertex or fragment on sheets that grow at run time
   (a uniform would need rewriting on growth); `block_text`, `leash`, `entity`, `nametag` sample
   the lightmap per vertex like the terrain (same buffer if the scene bench keeps it).
+## C6-M27: loot engine, borrowed context, table read once, sequences without allocation (03/11, loaded machine)
+
+- Three block loot draws (a block mined by the world, by the player, blown up) were the same code
+  three times: properties copied as owned strings, block entity cloned, table name written with
+  `format!`, the table looked up by name twice (its sequence, then the draw), the sequence name
+  copied, the sequence map keyed by a fresh `String` at each of its two lookups. Now one shared draw
+  (`block_loot.rs`, B8): table resolved once per block id (`DataPack::block_loot_table`, cache
+  emptied with the pack), properties lent by state (`BlockProps::State`, read from the version data
+  only when a condition or `copy_state` asks), block entity lent, the table at hand drawn
+  (`Loot::drops_of_table`; chests and brushes through `drops_of_looked_up_table`). Switch `RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT`
+  (default 1; `0`: the former draws and engine paths, kept in `block_loot.rs` and next to the new
+  ones). Sequences (`rng.rs`): looked up first, the name copied only at creation; switch
+  `RUSTCRAFT_OPT_RANDOM_SEQUENCE_LOOKUP_FIRST`.
+- Engine (same switch): `table_bonus` chances and the enchantment ids of an item predicate read in
+  place; stacks split as the table makes them (no second list); the first candidate of a roll and
+  the first four running tables kept inline; `set_random_potion` without cloning the potion
+  registry, stew effects borrowed, the attribute removal key a constant. Tag entries walk the tag's
+  names without a `Vec<String>` (simplification, no switch: same names in the same order; an
+  expanded tag entry of the base pack, the creeper's music discs when a skeleton kills it, is
+  frozen on the former walk at `ab047108cfc08943`, 64 deaths, 12 discs reached).
+  Blown-up blocks no longer copy their name; the player's mining lends it.
+- Equivalence (A1/A2): every block table of the base pack (1201) for up to 7 states and 4 tools
+  with the server's block tags, frozen before the change at `651fc71b4e039258` (properties listed and
+  lent give it); `loot_bench`'s `af880b1baa83fb25` now asserted by a non-ignored test; the shared draw
+  against the three former ones on a test table (block tag and state conditions, silk touch or fortune
+  test, table bonus, explosion pool, stacks of 40 to 100 split, copied state, a named barrel): same
+  stacks, same saved sequences, same level random. Sabotages caught: candidate order inverted (every
+  table fingerprint), generator not put back (shared draw test), table bonus index shifted (block
+  table fingerprint), sequence salt shifted (sequence lookup test), tag members walked backwards
+  (creeper fingerprint; the older disc test still passed). The loot tests pass with the two
+  switches in each of their four combinations; with a switch at 0 the allocation test only asks
+  the shared draw for no more than the former one (stone mined, former → shared: both at 1,
+  5 → 2; context 1 and lookup 0, 7 → 4; context 0 and lookup 1, 10 → 7; both at 0, 12 → 9).
+- Allocations per removal (deterministic, counting allocator of the tests), former draw with the old
+  engine → shared draw: stone mined 12 → 2 (the list and the stack's name), blown 6 → 0.4; oak leaves
+  mined 24.5 → 0.2, blown 14.9 → 0.1; named barrel mined 33 → 12, blown 21.5 → 2.8 (the rest is the
+  stack's components). Time per removal (`block_loot_bench`, best of 7 × 5 000, one thread, loaded
+  machine, pass 1): stone mined 740 → 546 ns, blown 407 → 294; leaves mined 1 718 → 1 326, blown
+  1 216 → 961; barrel mined 1 006 → 652, blown 503 → 245. Pass 2 the same within 2 %, except a
+  load spike on the all-new stone cells (863-911 ns, its leaves and barrel cells matching pass 1).
+  Leads alone (stone mined by the world, both passes): borrowed context only 494-504 ns (4
+  allocations, the sequence's name copied twice), sequence lookup only 566-586 ns (7): the
+  combination keeps both. Engine alone (`loot_bench`): stone 476-489 → 439-442 ns, leaves
+  1 358-1 381 → 1 228-1 245, zombie, dungeon chest and fishing within noise.
+- Multi-core and GPU: not applicable (one draw of a few hundred ns on the server thread, in the
+  order of the world's random). Not done (other files): the explosion's `default_state("minecraft:air")`
+  is a linear scan of the block names per blown block; the block tag closure scans the block list
+  (C6-M36); `Stack.id` is a `String` (one allocation per stack); a new sequence's MD5 allocates.
+- To measure on the quiet machine: `tnt-premiere-salve` (expected invisible in the scene: the draw
+  is about 1 % of an explosion).

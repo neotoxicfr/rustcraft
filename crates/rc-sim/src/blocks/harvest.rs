@@ -12,11 +12,9 @@ impl Server {
     /// Interaction table drawn for block `p` (state `s`), tool if any.
     fn block_interact_loot(&mut self, table: &str, p: P, s: u32, tool: Option<&Stack>) -> Vec<Stack> {
         let name = self.data.block_of(s).map(|b| b.name.clone()).unwrap_or_default();
-        let props: Vec<(String, String)> =
-            self.data.state_properties(s).map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
         let be = self.block_entity(p).cloned();
         let ctx = crate::loot::Ctx {
-            block: Some((name.as_str(), props)),
+            block: Some((name.as_str(), crate::loot::BlockProps::of_state(&self.data, s))),
             tool: Some(tool),
             block_entity: be.as_ref(),
             ..Default::default()

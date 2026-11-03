@@ -112,7 +112,7 @@ impl Server {
         {
             let (uses, speed) = self.loot_values(|loot, rng| {
                 let ctx =
-                    crate::loot::Ctx { block: Some(("minecraft:brewing_stand", Vec::new())), ..Default::default() };
+                    crate::loot::Ctx { block: Some(("minecraft:brewing_stand", crate::loot::BlockProps::NONE)), ..Default::default() };
                 let u = if c["uses"].is_null() { 0 } else { loot.int(&c["uses"], &ctx, rng) };
                 let s =
                     if c["speed_multiplier"].is_null() { 1.0 } else { loot.float(&c["speed_multiplier"], &ctx, rng) };

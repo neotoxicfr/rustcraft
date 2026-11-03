@@ -23,6 +23,43 @@ struct Cand<'v> {
     mods: Option<Box<[&'v Value]>>,
 }
 
+/// Candidates of one roll. Most rolls have a single one: it is kept inline, so the roll does not
+/// allocate; the others go to a list kept from one roll to the next.
+#[derive(Default)]
+struct Candidates<'v> {
+    first: Option<Cand<'v>>,
+    more: Vec<Cand<'v>>,
+}
+
+impl<'v> Candidates<'v> {
+    fn clear(&mut self) {
+        self.first = None;
+        self.more.clear();
+    }
+
+    fn push(&mut self, c: Cand<'v>) {
+        // The old context kept every candidate in the list (`RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT=0`).
+        if self.first.is_none() && loot_context_borrowed() {
+            self.first = Some(c);
+        } else {
+            self.more.push(c);
+        }
+    }
+
+    /// In the order they were pushed.
+    fn iter(&self) -> impl Iterator<Item = &Cand<'v>> {
+        self.first.iter().chain(&self.more)
+    }
+
+    fn len(&self) -> usize {
+        usize::from(self.first.is_some()) + self.more.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// Part of an entry a candidate stands for: all of it, one item of an expanded tag (registry
 /// id), or one table of an expanded nested set.
 #[derive(Clone, Copy)]
@@ -100,17 +137,89 @@ pub trait LootWorld {
     }
 }
 
+/// `RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT` (default 1; `0`: the old context, where the block's properties
+/// are copied as owned strings, its block entity cloned, the table looked up twice by name and
+/// the engine's inputs gathered in temporary lists), read once.
+pub(crate) fn loot_context_borrowed() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT")
+}
+
+/// Properties of the block of a draw.
+pub enum BlockProps {
+    /// Those of a block state, read from the version data when a condition or a function asks
+    /// for them: nothing is copied for the draw.
+    State(u32),
+    /// Written out by the caller (a block named without a state, or the old context).
+    Listed(Vec<(String, String)>),
+}
+
+impl BlockProps {
+    /// No property (a block named without a state; no allocation).
+    pub const NONE: BlockProps = BlockProps::Listed(Vec::new());
+
+    /// Properties of `state` for a draw: lent by state, or copied up front with
+    /// `RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT=0`.
+    pub fn of_state(data: &rc_data::VersionData, state: u32) -> BlockProps {
+        if loot_context_borrowed() {
+            BlockProps::State(state)
+        } else {
+            BlockProps::Listed(data.state_properties(state).map(|(k, v)| (k.to_owned(), v.to_owned())).collect())
+        }
+    }
+}
+
+impl From<Vec<(String, String)>> for BlockProps {
+    fn from(list: Vec<(String, String)>) -> BlockProps {
+        BlockProps::Listed(list)
+    }
+}
+
+/// Tables being run in a draw, innermost last (identity of their data): one already running is
+/// not entered again. Nesting is shallow, so the first levels are kept inline and a draw does not
+/// allocate for them.
+#[derive(Default)]
+pub struct RunningTables {
+    inline: [usize; 4],
+    inline_len: usize,
+    deeper: Vec<usize>,
+}
+
+impl RunningTables {
+    fn contains(&self, table: usize) -> bool {
+        self.inline[..self.inline_len].contains(&table) || self.deeper.contains(&table)
+    }
+
+    fn push(&mut self, table: usize) {
+        // The old context kept every level in the list (`RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT=0`).
+        if self.inline_len < self.inline.len() && loot_context_borrowed() {
+            self.inline[self.inline_len] = table;
+            self.inline_len += 1;
+        } else {
+            self.deeper.push(table);
+        }
+    }
+
+    fn pop(&mut self) {
+        // Inline levels are always the outer ones: the list holds the innermost.
+        if self.deeper.pop().is_none() {
+            self.inline_len = self.inline_len.saturating_sub(1);
+        }
+    }
+}
+
 /// Draw parameters.
 #[derive(Default)]
 pub struct Ctx<'a> {
-    /// Block concerned: id and properties.
-    pub block: Option<(&'a str, Vec<(String, String)>)>,
+    /// Block the draw is about: its id and its properties.
+    pub block: Option<(&'a str, BlockProps)>,
     /// Tool (present, possibly empty, when a player breaks).
     pub tool: Option<Option<&'a Stack>>,
+    /// Radius of the explosion the loot comes from (`survives_explosion`, `explosion_decay`).
     pub explosion: Option<f32>,
+    /// Block entity of the block, lent to the draw.
     pub block_entity: Option<&'a Nbt>,
     pub luck: f32,
-    // S4: mob loot.
+    /// Mob loot: killed by a player, the killed entity on fire, a baby.
     pub killed_by_player: bool,
     pub on_fire: bool,
     pub baby: bool,
@@ -119,30 +228,30 @@ pub struct Ctx<'a> {
     pub damage_type: Option<String>,
     /// Sheep: color (name) and sheared.
     pub sheep: Option<(String, bool)>,
-    /// Known entity components (`minecraft:mooshroom/variant` → `red`…), F02.
+    /// Known components of the killed entity (`minecraft:mooshroom/variant` → `red`…).
     pub comps: Vec<(String, String)>,
-    /// F03: size of a slime (predicate `type_specific/cube_mob`).
+    /// Size of a slime (predicate `type_specific/cube_mob`).
     pub cube_size: Option<i32>,
-    /// F07: raid raider (in a raid, captain) — predicate `type_specific/raider`.
+    /// Raid raider: in a raid, captain (predicate `type_specific/raider`).
     pub raider: Option<(bool, bool)>,
-    /// F10: source entity of the damage (type, known components) — `damage_source_properties`.
+    /// Source entity of the damage: type, known components (`damage_source_properties`).
     pub source_entity: Option<(String, Vec<(String, String)>)>,
-    /// S8: fishing bobber in open water (predicate `type_specific/fishing_hook`).
+    /// Fishing bobber in open water (predicate `type_specific/fishing_hook`).
     pub open_water: Option<bool>,
-    /// S8: biome of the origin (`location_check` on `biomes`).
+    /// Biome of the origin (`location_check` on `biomes`).
     pub biome: Option<String>,
     /// Type of the `this` entity (predicate `entity_type`, e.g. charged creeper heads).
     pub this_type: Option<String>,
     /// Author of the damage (`attacker`): entity type and type tags that contain it.
     pub attacker: Option<(String, Vec<String>)>,
-    /// W8c: world lent to the draw: draw-free conditions this context does not know (offset
+    /// World lent to the draw: draw-free conditions this context does not know (offset
     /// location, direct attacker and its equipment, source tags…), scores, storage, entities.
     pub world: Option<&'a dyn LootWorld>,
-    /// Tables being run (identity of their data): one already running is not entered again.
-    pub visited: RefCell<Vec<usize>>,
-    /// W8c: type of the direct entity of the damage when it is not alive (projectile).
+    /// Tables being run: one already running is not entered again.
+    pub visited: RefCell<RunningTables>,
+    /// Type of the direct entity of the damage when it is not alive (projectile).
     pub direct_type: Option<String>,
-    /// W8c: furnace smelting result of a stack (`furnace_smelt`).
+    /// Furnace smelting result of a stack (`furnace_smelt`).
     pub smelt: Option<&'a SmeltFn<'a>>,
 }
 
@@ -289,6 +398,31 @@ fn ench_name(v: &Value) -> &str {
     v.as_str().unwrap_or("")
 }
 
+/// Chance of a `table_bonus` at enchantment level `lvl`: the numbers of `chances` (other values
+/// skipped), the last one beyond the list; `None` when there is none. Read in place.
+fn table_bonus_chance(chances: &Value, lvl: i32) -> Option<f32> {
+    let numbers = || chances.as_array().into_iter().flatten().filter_map(Value::as_f64);
+    let count = numbers().count();
+    numbers().nth((lvl as usize).min(count.saturating_sub(1))).map(|f| f as f32)
+}
+
+/// Old reading (`RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT=0`): the chances copied into a list first.
+fn table_bonus_chance_listed(chances: &Value, lvl: i32) -> Option<f32> {
+    let chances: Vec<f32> =
+        chances.as_array().map(|a| a.iter().filter_map(Value::as_f64).map(|f| f as f32).collect()).unwrap_or_default();
+    chances.get((lvl as usize).min(chances.len().saturating_sub(1))).copied()
+}
+
+/// Enchantment ids an item predicate's `enchantments` field names (one id or a list), in order.
+fn named_enchantments(v: &Value) -> impl Iterator<Item = &str> {
+    let (one, list) = match v {
+        Value::String(x) => (Some(x.as_str()), None),
+        Value::Array(a) => (None, Some(a.iter().filter_map(Value::as_str))),
+        _ => (None, None),
+    };
+    one.into_iter().chain(list.into_iter().flatten())
+}
+
 /// Numeric tag read as the game's boxed number, integer side: reals truncated and saturated
 /// (NaN 0), a long cut to its low 32 bits; `None` if the tag is not numeric.
 fn tag_int(n: &Nbt) -> Option<i32> {
@@ -349,13 +483,12 @@ impl Loot<'_> {
                     },
                     "table_bonus" => {
                         let lvl = self.tool_level(ctx, ench_name(&v["enchantment"]));
-                        let chances: Vec<f32> = v["chances"]
-                            .as_array()
-                            .map(|a| a.iter().filter_map(Value::as_f64).map(|f| f as f32).collect())
-                            .unwrap_or_default();
-                        let Some(&c) = chances.get((lvl as usize).min(chances.len().saturating_sub(1))) else {
-                            return false;
+                        let chance = if loot_context_borrowed() {
+                            table_bonus_chance(&v["chances"], lvl)
+                        } else {
+                            table_bonus_chance_listed(&v["chances"], lvl)
                         };
+                        let Some(c) = chance else { return false };
                         rng.next_float() < c
                     }
                     // A world that knows the whole context answers for its tool, block and killer.
@@ -580,7 +713,7 @@ impl Loot<'_> {
         }
         if let Some(state) = v["state"].as_object() {
             for (k, want) in state {
-                let Some((_, have)) = props.iter().find(|(p, _)| p == k) else { return false };
+                let Some(have) = self.block_prop(props, k) else { return false };
                 let ok = match want {
                     Value::String(s) => s == have,
                     Value::Object(r) => {
@@ -590,7 +723,7 @@ impl Loot<'_> {
                         r.get("min").and_then(num).is_none_or(|m| m.parse::<i64>().is_ok_and(|m| h >= m))
                             && r.get("max").and_then(num).is_none_or(|m| m.parse::<i64>().is_ok_and(|m| h <= m))
                     }
-                    other => other.as_i64().map(|i| i.to_string()).as_deref() == Some(have.as_str()),
+                    other => other.as_i64().map(|i| i.to_string()).as_deref() == Some(have),
                 };
                 if !ok {
                     return false;
@@ -598,6 +731,24 @@ impl Loot<'_> {
             }
         }
         true
+    }
+
+    /// Value of property `key` of the draw's block.
+    fn block_prop<'s>(&'s self, props: &'s BlockProps, key: &str) -> Option<&'s str> {
+        match props {
+            BlockProps::State(state) => {
+                self.items.data.state_properties(*state).find(|(k, _)| *k == key).map(|(_, v)| v)
+            }
+            BlockProps::Listed(list) => list.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str()),
+        }
+    }
+
+    /// Every property of the draw's block, in the block's order.
+    fn for_each_block_prop(&self, props: &BlockProps, mut f: impl FnMut(&str, &str)) {
+        match props {
+            BlockProps::State(state) => self.items.data.state_properties(*state).for_each(|(k, v)| f(k, v)),
+            BlockProps::Listed(list) => list.iter().for_each(|(k, v)| f(k, v)),
+        }
     }
 
     /// Item predicate: `items`, `count`, `enchantments` component predicates.
@@ -633,12 +784,13 @@ impl Loot<'_> {
         if let Some(list) = p.get("predicates").and_then(|x| x.get("minecraft:enchantments")).and_then(Value::as_array)
         {
             for e in list {
-                let ids: Vec<String> = match &e["enchantments"] {
-                    Value::String(x) => vec![x.clone()],
-                    Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect(),
-                    _ => Vec::new(),
+                let lvl = if loot_context_borrowed() {
+                    named_enchantments(&e["enchantments"]).map(|id| self.items.enchantment(s, id)).max().unwrap_or(0)
+                } else {
+                    // Old reading: the ids copied into a list first.
+                    let ids: Vec<String> = named_enchantments(&e["enchantments"]).map(str::to_owned).collect();
+                    ids.iter().map(|id| self.items.enchantment(s, id)).max().unwrap_or(0)
                 };
-                let lvl = ids.iter().map(|id| self.items.enchantment(s, id)).max().unwrap_or(0);
                 let (min, max) = match &e["levels"] {
                     Value::Number(n) => (n.as_i64().unwrap_or(1), n.as_i64().unwrap_or(1)),
                     Value::Object(r) => (
@@ -1062,11 +1214,12 @@ impl Loot<'_> {
                                 .as_array()
                                 .map(|a| a.iter().filter_map(Value::as_str).collect())
                                 .unwrap_or_default();
-                            let fields: Vec<(String, Nbt)> = props
-                                .iter()
-                                .filter(|(k, _)| keep.contains(&k.as_str()))
-                                .map(|(k, v)| (k.clone(), Nbt::String(v.clone())))
-                                .collect();
+                            let mut fields: Vec<(String, Nbt)> = Vec::new();
+                            self.for_each_block_prop(props, |k, v| {
+                                if keep.contains(&k) {
+                                    fields.push((k.to_owned(), Nbt::String(v.to_owned())));
+                                }
+                            });
                             if !fields.is_empty() {
                                 crate::items::set_component(&mut s, "minecraft:block_state", Nbt::Compound(fields));
                             }
@@ -1248,13 +1401,11 @@ impl Loot<'_> {
             let mut push = |pick, rng: &mut dyn Rand| out(Cand { e, w, pick, mods: chain.clone() }, rng);
             match ty {
                 // Expanded tag: one candidate per item, each with the weight of the entry.
-                "tag" if expanded => {
-                    for id in self.tag_items(e) {
-                        if let Some(i) = self.items.id(&id) {
-                            push(Pick::Item(i), rng);
-                        }
+                "tag" if expanded => self.for_each_tag_item(e, &mut |name| {
+                    if let Some(i) = self.items.id(name) {
+                        push(Pick::Item(i), &mut *rng);
                     }
-                }
+                }),
                 // Expanded nested set: one candidate per table.
                 "loot_table" if expanded => {
                     (0..self.tables(&e["value"]).len() as u32).for_each(|i| push(Pick::Table(i), rng));
@@ -1285,35 +1436,36 @@ impl Loot<'_> {
         r
     }
 
-    /// Items of a set (`#tag`, single id or list), in the tag's order.
-    fn holder_items(&self, v: &Value) -> Vec<String> {
+    /// Items of a set (`#tag`, single id or list), by name, in the tag's order.
+    fn for_each_holder_item(&self, v: &Value, f: &mut dyn FnMut(&str)) {
         match v {
             Value::String(x) => match x.strip_prefix('#') {
-                Some(tag) => self
-                    .items
-                    .tags
-                    .get(tag.trim_start_matches("minecraft:"))
-                    .or_else(|| self.items.tags.get(tag))
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|id| self.items.name(id).map(str::to_owned))
-                    .collect(),
-                None => vec![x.clone()],
+                Some(tag) => self.for_each_tagged_item(tag, f),
+                None => f(x),
             },
-            Value::Array(a) => a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect(),
-            _ => Vec::new(),
+            Value::Array(a) => a.iter().filter_map(Value::as_str).for_each(f),
+            _ => {}
         }
     }
 
-    /// Items of a `tag` entry: its `items` set (tag, item or list); the old `name` field names
-    /// a tag.
-    fn tag_items(&self, e: &Value) -> Vec<String> {
+    /// Items of the item tag `tag` (`minecraft:` optional), by name, in the tag's order.
+    fn for_each_tagged_item(&self, tag: &str, f: &mut dyn FnMut(&str)) {
+        let ids = self.items.tags.get(tag.trim_start_matches("minecraft:")).or_else(|| self.items.tags.get(tag));
+        for &id in ids.into_iter().flatten() {
+            if let Some(name) = self.items.name(id) {
+                f(name);
+            }
+        }
+    }
+
+    /// Items of a `tag` entry, by name: its `items` set (tag, item or list); the old `name`
+    /// field names a tag.
+    fn for_each_tag_item(&self, e: &Value, f: &mut dyn FnMut(&str)) {
         match e.get("items") {
-            Some(v) => self.holder_items(v),
+            Some(v) => self.for_each_holder_item(v, f),
             None => match &e["name"] {
-                Value::String(x) if !x.starts_with('#') => self.holder_items(&Value::String(format!("#{x}"))),
-                v => self.holder_items(v),
+                Value::String(x) if !x.starts_with('#') => self.for_each_tagged_item(x, f),
+                v => self.for_each_holder_item(v, f),
             },
         }
     }
@@ -1432,11 +1584,7 @@ impl Loot<'_> {
             }
             "tag" => match c.pick {
                 Pick::Item(i) => out(one(self.items.name(i).unwrap_or("minecraft:air")), rng),
-                _ => {
-                    for id in self.tag_items(e) {
-                        out(one(&id), rng);
-                    }
-                }
+                _ => self.for_each_tag_item(e, &mut |name| out(one(name), &mut *rng)),
             },
             // Nested set: the table drawn (expanded) or every table in order, each one run
             // with this context (a table already running is refused).
@@ -1518,7 +1666,7 @@ impl Loot<'_> {
     /// game's). A table already running in this context is not entered again.
     fn run_raw(&self, table: &Value, ctx: &Ctx<'_>, rng: &mut dyn Rand, sink: &mut Sink<'_>) {
         let id = std::ptr::from_ref(table) as usize;
-        if ctx.visited.borrow().contains(&id) {
+        if ctx.visited.borrow().contains(id) {
             return;
         }
         ctx.visited.borrow_mut().push(id);
@@ -1527,7 +1675,7 @@ impl Loot<'_> {
             sink(s, rng);
         };
         // Candidates of a roll, the buffer kept from one roll and one pool to the next.
-        let mut cands: Vec<Cand<'_>> = Vec::new();
+        let mut cands = Candidates::default();
         for pool in table["pools"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
             if !self.cond(&pool["condition"], ctx, rng) {
                 continue;
@@ -1548,7 +1696,7 @@ impl Loot<'_> {
                     continue;
                 }
                 let chosen = if cands.len() == 1 {
-                    Some(&cands[0])
+                    cands.iter().next()
                 } else {
                     let mut r = rng.next_int_bound(total);
                     cands.iter().find(|c| {
@@ -1564,21 +1712,57 @@ impl Loot<'_> {
         ctx.visited.borrow_mut().pop();
     }
 
-    /// Named table, stacks split to their maximum size.
+    /// Table named `id`, looked up in the pack here, stacks split to their maximum size.
     pub fn drops(&self, id: &str, ctx: &Ctx<'_>, rng: &mut dyn Rand) -> Vec<Stack> {
         let Some(t) = self.pack.get("loot_table", id) else { return Vec::new() };
+        self.drops_of_table(&t, ctx, rng)
+    }
+
+    /// Table named `id` that the caller already looked up (`table`; `None`: no such table), stacks
+    /// split to their maximum size. With `RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT=0` it is looked up
+    /// again by name, as before.
+    pub fn drops_of_looked_up_table(&self, id: &str, table: Option<&Value>, ctx: &Ctx<'_>, rng: &mut dyn Rand) -> Vec<Stack> {
+        if !loot_context_borrowed() {
+            return self.drops(id, ctx, rng);
+        }
+        table.map_or_else(Vec::new, |t| self.drops_of_table(t, ctx, rng))
+    }
+
+    /// Table already read (not looked up by name), stacks split to their maximum size.
+    pub fn drops_of_table(&self, table: &Value, ctx: &Ctx<'_>, rng: &mut dyn Rand) -> Vec<Stack> {
+        if !loot_context_borrowed() {
+            return self.split_after_run(table, ctx, rng);
+        }
+        // Each stack split as soon as the table makes it: no second list.
         let mut out = Vec::new();
-        for mut s in self.run(&t, ctx, rng) {
-            let max = self.items.max_stack(&s);
-            while s.count > max {
-                out.push(Stack { count: max, ..s.clone() });
-                s.count -= max;
+        self.run_raw(table, ctx, rng, &mut |s, _| {
+            if s.count > 0 && s.id != DISCARDED {
+                self.push_split(&mut out, s);
             }
-            if s.count > 0 {
-                out.push(s);
-            }
+        });
+        out
+    }
+
+    /// Old splitting (`RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT=0`): the table's stacks gathered in a list,
+    /// then split into a second one.
+    fn split_after_run(&self, table: &Value, ctx: &Ctx<'_>, rng: &mut dyn Rand) -> Vec<Stack> {
+        let mut out = Vec::new();
+        for s in self.run(table, ctx, rng) {
+            self.push_split(&mut out, s);
         }
         out
+    }
+
+    /// `s` pushed in stacks of at most its maximum size, full ones first.
+    fn push_split(&self, out: &mut Vec<Stack>, mut s: Stack) {
+        let max = self.items.max_stack(&s);
+        while s.count > max {
+            out.push(Stack { count: max, ..s.clone() });
+            s.count -= max;
+        }
+        if s.count > 0 {
+            out.push(s);
+        }
     }
 }
 
@@ -1630,6 +1814,10 @@ pub mod be;
 #[cfg(test)]
 #[path = "loot_bench_tests.rs"]
 mod bench_tests;
+
+#[cfg(test)]
+#[path = "loot_block_context_tests.rs"]
+mod block_context_tests;
 
 #[cfg(test)]
 mod tests {
