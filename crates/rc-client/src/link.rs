@@ -50,6 +50,17 @@ pub struct Link {
     generation: AtomicU64,
 }
 
+/// Capacity of the send buffer that replaces a packet handed to the integrated server: a client
+/// packet is a few dozen bytes (a position is 34).
+const SEND_BUFFER: usize = 64;
+
+/// The packet handed to the integrated server. `move_out`: the buffer itself goes, a fresh one
+/// taking its place, which saves copying the packet (the allocation happens either way);
+/// otherwise a copy, as before (`RUSTCRAFT_OPT_MOVE_SENT_PACKET=0`).
+fn packet_for_channel(packet: &mut Vec<u8>, move_out: bool) -> Vec<u8> {
+    if move_out { std::mem::replace(packet, Vec::with_capacity(SEND_BUFFER)) } else { packet.clone() }
+}
+
 /// Content of a movement packet (the chosen packet follows the game's rule, see
 /// `docs/specs/connection.md` and `movement.md`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -122,7 +133,10 @@ impl Link {
                 enc.encode(packet, wire).map_err(std::io::Error::other)?;
                 stream.write_all(wire)
             }
-            Sink::Memory(tx) => tx.send(packet.clone()).map_err(|_| std::io::ErrorKind::BrokenPipe.into()),
+            Sink::Memory(tx) => {
+                let sent = packet_for_channel(packet, rc_data::opt_switch!("RUSTCRAFT_OPT_MOVE_SENT_PACKET"));
+                tx.send(sent).map_err(|_| std::io::ErrorKind::BrokenPipe.into())
+            }
         }
     }
 
@@ -673,5 +687,80 @@ impl Link {
             write_varint(w, transaction);
             write_varint(w, entity);
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Packets of every size around the buffer's capacity, written into the same send buffer.
+    fn handed_over(move_out: bool) -> Vec<Vec<u8>> {
+        let mut buffer = Vec::new();
+        [0usize, 1, 34, SEND_BUFFER, SEND_BUFFER + 1, 300]
+            .iter()
+            .map(|&n| {
+                buffer.clear();
+                buffer.extend((0..n).map(|i| i as u8));
+                packet_for_channel(&mut buffer, move_out)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn moved_or_copied_the_integrated_server_receives_the_same_bytes() {
+        let moved = handed_over(true);
+        assert_eq!(moved, handed_over(false));
+        assert_eq!(moved[2], (0..34).collect::<Vec<u8>>());
+        assert_eq!(moved.iter().map(Vec::len).collect::<Vec<_>>(), [0, 1, 34, 64, 65, 300]);
+    }
+
+    /// A position packet through the in-memory link, bytes written out by hand.
+    #[test]
+    fn position_packet_reaches_the_integrated_server_as_written() {
+        let Some(data) = rc_testdata::version_data() else { return };
+        let ids = Ids::resolve(&data).expect("packet identifiers");
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let link = Link::with_sink(Some(Sink::Memory(tx)), ids, crate::protolog::Names::new(&data), Default::default());
+        let m = Move::PosRot { pos: [1.5, -60.0, 1e6], yaw: 90.0, pitch: -10.0 };
+        link.send_move(m, true, false).unwrap();
+        link.send_move(m, false, true).unwrap();
+        let mut want = Vec::new();
+        write_varint(&mut want, ids.move_pos_rot);
+        for v in [1.5f64, -60.0, 1e6] {
+            want.extend_from_slice(&v.to_be_bytes());
+        }
+        want.extend_from_slice(&90f32.to_be_bytes());
+        want.extend_from_slice(&(-10f32).to_be_bytes());
+        let mut second = want.clone();
+        want.push(1);
+        second.push(2);
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), [want, second]);
+    }
+
+    /// Micro-bench (loaded machine figures in `docs/perf.md`):
+    /// `cargo test --release -p rc-client memory_send_bench -- --ignored --nocapture`.
+    /// A 34-byte packet written then handed to a consumer thread, like the integrated server.
+    #[test]
+    #[ignore]
+    fn memory_send_bench() {
+        const PACKETS: usize = 2_000_000;
+        for trial in 0..3 {
+            for (name, move_out) in [("copy", false), ("move", true)] {
+                let (tx, rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+                let consumer = std::thread::spawn(move || rx.iter().map(|p| p.len()).sum::<usize>());
+                let mut buffer = Vec::new();
+                let t = std::time::Instant::now();
+                for i in 0..PACKETS {
+                    buffer.clear();
+                    buffer.extend_from_slice(&[i as u8; 34]);
+                    tx.send(packet_for_channel(&mut buffer, move_out)).unwrap();
+                }
+                drop(tx);
+                let bytes = consumer.join().unwrap();
+                let ns = t.elapsed().as_nanos() as f64 / PACKETS as f64;
+                eprintln!("trial {trial}: {name}: {ns:.1} ns per packet ({bytes} bytes)");
+            }
+        }
     }
 }

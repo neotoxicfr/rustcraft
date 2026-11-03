@@ -846,15 +846,24 @@ fn force_fetch(mut b: std::sync::MutexGuard<'_, BlockList>) -> std::sync::MutexG
     b
 }
 
+fn has_account_token() -> bool {
+    crate::auth::account().and_then(|a| a.token.as_ref()).is_some()
+}
+
 /// Online entry (connection to a server): list re-read in a background task.
 pub fn start_online_mode() {
     let mut b = lock(&BLOCKS);
     b.online += 1;
-    if crate::auth::account().and_then(|a| a.token.as_ref()).is_none() || b.refreshing {
+    if !has_account_token() || b.refreshing {
         return;
     }
     b.refreshing = true;
     drop(b);
+    spawn_blocklist_refresh();
+}
+
+/// Re-reads the list in a background task; `refreshing` is already set by the caller.
+fn spawn_blocklist_refresh() {
     let r = std::thread::Builder::new().name("block list".into()).spawn(|| {
         let b = lock(&BLOCKS);
         let mut b = if b.list.is_none() || can_request(&b) { force_fetch(b) } else { b };
@@ -863,6 +872,8 @@ pub fn start_online_mode() {
     });
     if r.is_err() {
         lock(&BLOCKS).refreshing = false;
+        // A reader may already be waiting for this refresh.
+        BLOCKS_DONE.notify_all();
     }
 }
 
@@ -885,10 +896,39 @@ pub fn is_blocked(uuid: u128) -> bool {
         return false;
     }
     if b.list.is_none() {
-        if !can_request(&b) || crate::auth::account().and_then(|a| a.token.as_ref()).is_none() {
+        if !can_request(&b) || !has_account_token() {
             return false;
         }
         b = force_fetch(b);
+    }
+    b.list.as_ref().is_some_and(|l| l.contains(&uuid))
+}
+
+/// Player blocked by the account, for a screen drawn every frame: the last known list, without
+/// waiting for a refresh nor requesting the list on the calling thread; a missing list is
+/// requested in the background, which ends on the same list as [`is_blocked`]. Deciding to hide
+/// a message still goes through [`is_blocked`], which waits like the game
+/// (`RUSTCRAFT_OPT_BLOCKLIST_SNAPSHOT=0`: the waiting read here too, as before).
+pub fn is_blocked_last_known(uuid: u128) -> bool {
+    if rc_data::opt_switch!("RUSTCRAFT_OPT_BLOCKLIST_SNAPSHOT") {
+        in_last_known_blocklist(uuid)
+    } else {
+        is_blocked(uuid)
+    }
+}
+
+fn in_last_known_blocklist(uuid: u128) -> bool {
+    let mut b = lock(&BLOCKS);
+    if b.online == 0 || uuid == 0 {
+        return false;
+    }
+    if b.list.is_none() {
+        if !b.refreshing && can_request(&b) && has_account_token() {
+            b.refreshing = true;
+            drop(b);
+            spawn_blocklist_refresh();
+        }
+        return false;
     }
     b.list.as_ref().is_some_and(|l| l.contains(&uuid))
 }
@@ -1144,6 +1184,40 @@ mod tests {
         assert!(l.contains(&0x069a79f444e94726a5befca90e38aaf5));
         // Offline (no connection to a server): nobody is blocked, no request.
         assert!(!is_blocked(0x069a79f444e94726a5befca90e38aaf5));
+    }
+
+    /// A refresh of the block list in progress (simulated, 300 ms): the drawn rows read the last
+    /// known list at once, the decision to hide a message waits for the new list, and once the
+    /// refresh is over both readings agree.
+    #[test]
+    fn last_known_blocklist_does_not_wait_and_ends_on_the_same_list() {
+        let (old, new) = (0x11u128, 0x22u128);
+        {
+            let mut b = lock(&BLOCKS);
+            b.online += 1;
+            b.refreshing = true;
+            b.list = Some([old].into_iter().collect());
+        }
+        let refresh = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let mut b = lock(&BLOCKS);
+            b.list = Some([new].into_iter().collect());
+            b.refreshing = false;
+            BLOCKS_DONE.notify_all();
+        });
+        let start = std::time::Instant::now();
+        assert!(in_last_known_blocklist(old) && !in_last_known_blocklist(new), "last known list");
+        let snapshot_time = start.elapsed();
+        assert!(snapshot_time < Duration::from_millis(200), "the row reading waited {snapshot_time:?}");
+        assert!(is_blocked(new) && !is_blocked(old), "the waiting reading sees the new list");
+        assert!(start.elapsed() >= Duration::from_millis(300), "the waiting reading did not wait");
+        refresh.join().unwrap();
+        for uuid in [old, new, 0] {
+            assert_eq!(in_last_known_blocklist(uuid), is_blocked(uuid), "{uuid:#x} after the refresh");
+        }
+        let mut b = lock(&BLOCKS);
+        b.online -= 1;
+        b.list = None;
     }
 
     #[test]

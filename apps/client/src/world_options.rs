@@ -1434,15 +1434,20 @@ pub(crate) fn draw(id: Id, gui: &mut Gui, q: &wgpu::Queue, w: &World, panel: &Pa
 
 /// Player rows (background, name, state) in the clip of the list.
 pub(crate) fn draw_social_rows(gui: &mut Gui, q: &wgpu::Queue, w: &World, l: &List) {
-    let hidden = rc_client::chat::hidden_players();
+    // `RUSTCRAFT_OPT_HIDDEN_ROW_LOOKUP=1`: hidden state read per visible row instead of one copy
+    // of the list per frame. Off: one lock per row loses when nobody is hidden (the usual case,
+    // docs/perf.md C5-M40), and only wins a few dozen nanoseconds per frame otherwise.
+    let per_row = rc_data::opt_switch!("RUSTCRAFT_OPT_HIDDEN_ROW_LOOKUP", default_off);
+    let hidden = if per_row { Vec::new() } else { rc_client::chat::hidden_players() };
     for (i, uuid) in w.shown.iter().enumerate() {
         let Some((x, y, rw, rh)) = l.entry_rect(i) else { continue };
         if y + rh < l.y || y > l.y + l.h {
             continue;
         }
         let online = w.players.iter().any(|p| p.uuid == *uuid);
-        let is_hidden = hidden.contains(uuid);
-        let is_blocked = rc_client::session::is_blocked(*uuid);
+        let is_hidden = if per_row { rc_client::chat::is_hidden(*uuid) } else { hidden.contains(uuid) };
+        // Last known block list: a refresh in progress never holds the frame.
+        let is_blocked = rc_client::session::is_blocked_last_known(*uuid);
         let status = match (is_blocked, is_hidden, online) {
             (true, _, false) => Some("gui.socialInteractions.status_blocked_offline"),
             (_, true, false) => Some("gui.socialInteractions.status_hidden_offline"),
