@@ -343,7 +343,7 @@ impl EntityRenderer {
             Kind::TestInstance => self.push_test_beam(pos, bes.test_beam(e), t, f),
             Kind::EndPortal => self.push_end_portal(t),
             Kind::EndGateway => self.push_gateway(pos, e, t, f),
-            Kind::Piston => self.push_piston(e, t, light, f.pt, (f.biome_tints)(pos[0], pos[1], pos[2])),
+            Kind::Piston => self.push_piston(e, t, light, f.pt, || (f.biome_tints)(pos[0], pos[1], pos[2])),
             // Tracked only for its client tick (harmful gas): no rendering of its own.
             Kind::PotentSulfur => false,
         }
@@ -1091,11 +1091,17 @@ impl EntityRenderer {
 
     /// Moving piston block (§ 4.17), offset according to progress: head (short until
     /// mid-course), retracting base (short head past mid-course and extended base stationary), or
-    /// moved block. Nothing for air. Tints: those of the biome of the moving block (`biome`),
-    /// for the head as for the base.
-    fn push_piston(&mut self, e: &BlockEntity, t: Mat4, light: u32, pt: f32, biome: [u32; 4]) -> bool {
+    /// moved block. Nothing for air. Tints: those of the biome of the moving block
+    /// (`biome_colours`, read only if a drawn state takes them), for the head as for the base.
+    fn push_piston(
+        &mut self,
+        e: &BlockEntity,
+        t: Mat4,
+        light: u32,
+        pt: f32,
+        biome_colours: impl FnOnce() -> [u32; 4],
+    ) -> bool {
         let Data::Piston { state, facing, extending, source, .. } = e.data else { return false };
-        let tint = super::objects::BlockTint::World(biome);
         if state == 0 || self.source.states.get(state as usize).is_some_and(|i| i.has(rc_data::flags::AIR)) {
             return false;
         }
@@ -1107,6 +1113,7 @@ impl EntityRenderer {
         // The game tests "progress ≤ 4", always true: the head is always drawn this way.
         if let Some((f, sticky)) = ps.head_of(state) {
             let head = ps.head(f, sticky, p <= 0.5);
+            let tint = self.world_tint(&[head], biome_colours);
             return self.push_block_tinted(head, moved, light, NEUTRAL, tint);
         }
         if source
@@ -1114,9 +1121,11 @@ impl EntityRenderer {
             && let Some((f, sticky, ext)) = ps.base(state)
         {
             let head = ps.head(f, sticky, p >= 0.5);
+            let tint = self.world_tint(&[head, ext], biome_colours);
             let drawn = self.push_block_tinted(head, moved, light, NEUTRAL, tint);
             return self.push_block_tinted(ext, t, light, NEUTRAL, tint) || drawn;
         }
+        let tint = self.world_tint(&[state], biome_colours);
         self.push_block_tinted(state, moved, light, NEUTRAL, tint)
     }
 }

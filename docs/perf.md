@@ -1642,7 +1642,9 @@ Fidelity fixes, no optimization lead of their own. Cost added, by construction:
 - ominous spawner: same item group as the ground item (shared function, matrix
   product of the ground item unchanged bit for bit).
 No hot spot (a few entities per scene): multi-core and GPU not applicable. No
-switch (no competing lead). To check on the quiet-machine scene bench: entity
+switch (no competing lead). Correction (C2-M05, 03/11): wrong for the redstone scene, where the
+biome zoom of the pushed blocks costs 2.10 % of the process on the main thread; see the C2-M05
+entry. To check on the quiet-machine scene bench: entity
 scenes (displays, minecarts, running pistons) before/after, 1600×900 screenshots.
 ### Placement, survival and shapes per family (G6-F06, 24/10/2026, loaded-machine micro-bench)
 
@@ -3509,3 +3511,36 @@ rounds, minimum of 5 passes of 400 ticks per scene, loaded machine (other agents
   test of a vehicle's passengers runs only when frozen, the plates also scan the server's item
   and orb lists during a series (empty unless something was born in it), a parked world is
   swept once per family after the player leaves (O(its entities), then a bit test per tick).
+
+## C2-M05: biome tint of moving blocks and main-thread world reads (03/11, loaded machine)
+
+Hot spot: redstone scene, `zoom_corner` 2.10 % of the process on the main thread. Every pushed
+block (piston block entity), falling block and transient block read the biome colours of its
+block every frame, i.e. one full blur zoom (8 corners × 8 LCG steps), even for states with no
+biome-tinted layer (stone, piston heads and bases, lily pad with its constant colour).
+Switches (default on, `=0` old path, read once):
+- `RUSTCRAFT_OPT_BLOCKTINTLAZY` (`EntOpt::block_tint_lazy`): the biome colours are read only
+  when one of the drawn states (moved state, or head, or head + extended base) has a GRASS,
+  FOLIAGE, DRY_FOLIAGE or WATER layer; otherwise a white placeholder that the colour lookup never
+  reads for those states. Deterministic count: 1 → 0 zoom per untinted moving block per frame.
+- `RUSTCRAFT_OPT_BIOMEZOOMMEMO`: `biome_full` (moving blocks, rain columns, particles, F3) reads
+  the zoom from the mesher's per-thread memo (`rc_mesh::blocks::biome_zoom_cached`, now public;
+  ≈ 196 KB once on the main thread, exact: key = seed + block). Micro-bench, 64 blocks re-read per
+  frame, 20,000 frames, 2 alternating passes: 75.0 / 64.3 → 21.5 / 29.5 ns per read (≈ −65 %).
+- `RUSTCRAFT_OPT_LIGHTPAIRONCE`: `light_pair` and `raw_brightness` look the column up once for
+  both layers: 34.8 / 31.1 → 18.3 / 17.7 ns per block for the pair + brightness (≈ −45 %).
+Combination: independent (laziness removes reads, the memo makes the remaining tinted ones
+cheaper); all three on by default. Multi-core and GPU not applicable (a few dozen reads per
+frame on the main thread, the result feeds the instance colours built on the CPU). Proofs:
+`entity_render/tests_moving_block_tints.rs` (pushed, falling and transient grass block, oak
+leaves, vine, leaf litter, water cauldron, sugar cane, stone, lily pad, sand, extended piston,
+plus piston head and retracting base: same instances and matrices both ways, biome colour present
+when tinted, no read when not; the four biome kinds covered), `environ/world_read_tests.rs`
+(memo forward, backward and across two seeds, light reads with missing and holed layers and
+absent columns; stored fingerprints), `BLOCKTINTLAZY` added to the entity snapshot of
+`tests_c3m11.rs`. Sabotages seen failing: WATER left out of the laziness test, DRY_FOLIAGE left
+out of the shared slot table, memo key without the seed, light layers swapped. (A memo key
+without y is not caught: with y in the slot hash the stale hit practically never happens.)
+To measure on the quiet machine: `scenes.py` redstone (frames/s, CPU ms per frame, p99; samply:
+`zoom_corner` near 0), tnt and village (no effect expected), each switch at 0, and a 1600×900
+redstone screenshot pair in one launch.

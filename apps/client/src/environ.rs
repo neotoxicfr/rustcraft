@@ -20,6 +20,19 @@ pub fn biome_zoom_seed() -> i64 {
     BIOME_ZOOM_SEED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `RUSTCRAFT_OPT_BIOMEZOOMMEMO` (read once; `=0`: old path): the blur zoom of a block read
+/// on the main thread (moving blocks, rain columns, particles) comes from the per-thread memo
+/// of the mesher instead of being recomputed on every read, every frame.
+fn biome_zoom_memo_on() -> bool {
+    rc_data::env_str!("RUSTCRAFT_OPT_BIOMEZOOMMEMO") != Some("0")
+}
+
+/// `RUSTCRAFT_OPT_LIGHTPAIRONCE` (read once; `=0`: old path): a read of both light layers
+/// looks the column up once instead of once per layer.
+fn light_pair_once_on() -> bool {
+    rc_data::env_str!("RUSTCRAFT_OPT_LIGHTPAIRONCE") != Some("0")
+}
+
 /// Effects of the local player that change the light and the fog.
 #[derive(Default, Clone, Copy, Debug, PartialEq)]
 pub struct CameraEffects {
@@ -84,7 +97,17 @@ impl WorldView<'_> {
     /// Biome at the block (x, y, z) after the game's blur zoom (tints, precipitation, rain
     /// fog, F3 screen); column absent: `missing`.
     pub(crate) fn biome_full(&self, x: i32, y: i32, z: i32, missing: u32) -> u32 {
-        let (qx, qy, qz) = rc_mesh::blocks::biome_zoom(biome_zoom_seed(), x, y, z);
+        self.zoomed_biome(biome_zoom_memo_on(), biome_zoom_seed(), [x, y, z], missing)
+    }
+
+    /// `biome_full` for the zoom seed `seed`; `memo`: zoom read from the per-thread memo of the
+    /// mesher, exact because the zoom only depends on the seed and the block.
+    fn zoomed_biome(&self, memo: bool, seed: i64, [x, y, z]: [i32; 3], missing: u32) -> u32 {
+        let (qx, qy, qz) = if memo {
+            rc_mesh::blocks::biome_zoom_cached(seed, x, y, z)
+        } else {
+            rc_mesh::blocks::biome_zoom(seed, x, y, z)
+        };
         self.biome(qx, qy, qz, missing)
     }
 
@@ -114,11 +137,25 @@ impl WorldView<'_> {
 
     /// Raw light (block, sky) at the block.
     pub fn light_pair(&self, x: i32, y: i32, z: i32) -> (u8, u8) {
-        (self.light(false, x, y, z), self.light(true, x, y, z))
+        self.light_pair_with(light_pair_once_on(), x, y, z)
+    }
+
+    /// `light_pair`; `once`: the column is looked up once for both layers.
+    fn light_pair_with(&self, once: bool, x: i32, y: i32, z: i32) -> (u8, u8) {
+        if !once {
+            return (self.light(false, x, y, z), self.light(true, x, y, z));
+        }
+        let Some(c) = self.grid.get(x >> 4, z >> 4) else { return (0, 0) };
+        (self.column_light(c, false, x, y, z), self.column_light(c, true, x, y, z))
     }
 
     fn light(&self, sky: bool, x: i32, y: i32, z: i32) -> u8 {
         let Some(c) = self.grid.get(x >> 4, z >> 4) else { return 0 };
+        self.column_light(c, sky, x, y, z)
+    }
+
+    /// Raw light of one layer at the block, `c` being the column holding it.
+    fn column_light(&self, c: &rc_world::Column, sky: bool, x: i32, y: i32, z: i32) -> u8 {
         let sy = ((y - self.min_y) >> 4) + 1;
         let layers = if sky { &c.sky_light } else { &c.block_light };
         let Ok(mut s) = usize::try_from(sy) else { return 0 };
@@ -142,11 +179,22 @@ impl WorldView<'_> {
     /// Maximum raw light at the block: `max(block, sky − darkening)`; above the
     /// world the sky is 15.
     pub fn raw_brightness(&self, x: i32, y: i32, z: i32, has_sky: bool, darken: i32) -> i32 {
-        let block = i32::from(self.light(false, x, y, z));
+        self.raw_brightness_with(light_pair_once_on(), x, y, z, has_sky, darken)
+    }
+
+    /// `raw_brightness`; `once`: the column is looked up once for both layers.
+    fn raw_brightness_with(&self, once: bool, x: i32, y: i32, z: i32, has_sky: bool, darken: i32) -> i32 {
+        let column = if once { self.grid.get(x >> 4, z >> 4) } else { None };
+        let layer = |sky: bool| match (once, column) {
+            (true, Some(c)) => self.column_light(c, sky, x, y, z),
+            (true, None) => 0,
+            (false, _) => self.light(sky, x, y, z),
+        };
+        let block = i32::from(layer(false));
         let sky = match (has_sky, y >= self.min_y + self.height) {
             (false, _) => 0,
             (true, true) => 15,
-            (true, false) => i32::from(self.sky_light(x, y, z)),
+            (true, false) => i32::from(layer(true)),
         };
         block.max(sky - darken)
     }
@@ -671,3 +719,6 @@ mod cache_tests;
 
 #[cfg(test)]
 mod end_flash_tests;
+
+#[cfg(test)]
+mod world_read_tests;
