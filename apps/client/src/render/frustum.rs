@@ -9,26 +9,26 @@ use rc_mesh::blocks::BUCKETS;
 
 /// For each group of faces (order `Dir`, then unaligned), range of sections of the
 /// column where it can be seen from the front. A face oriented +x is only visible if the camera is
-/// beyond its plane; the planes of a section stay within `MARGE` blocks of its box (model
+/// beyond its plane; the planes of a section stay within `MARGIN` blocks of its box (model
 /// elements that overflow the block), hence a cautious test that only removes back faces.
 pub(super) fn facing(eye: [f64; 3], column: (i32, i32), min_y: i32) -> [(usize, usize); BUCKETS] {
-    const MARGE: f64 = 2.0;
+    const MARGIN: f64 = 2.0;
     let all = (0, usize::MAX);
     let none = (0, 0);
     let (x0, z0) = (f64::from(column.0 * 16), f64::from(column.1 * 16));
     let y = eye[1] - f64::from(min_y);
     // Top (+y): sections whose bottom − margin is below the eye; bottom (−y): those whose
     // top + margin is above.
-    let up_end = ((y + MARGE) / 16.0).ceil().max(0.0) as usize;
-    let down_start = ((y - MARGE - 16.0) / 16.0).floor().max(-1.0) as i64 + 1;
+    let up_end = ((y + MARGIN) / 16.0).ceil().max(0.0) as usize;
+    let down_start = ((y - MARGIN - 16.0) / 16.0).floor().max(-1.0) as i64 + 1;
     let side = |ok: bool| if ok { all } else { none };
     [
         (down_start as usize, usize::MAX),
         (0, up_end),
-        side(eye[2] < z0 + 16.0 + MARGE),
-        side(eye[2] > z0 - MARGE),
-        side(eye[0] < x0 + 16.0 + MARGE),
-        side(eye[0] > x0 - MARGE),
+        side(eye[2] < z0 + 16.0 + MARGIN),
+        side(eye[2] > z0 - MARGIN),
+        side(eye[0] < x0 + 16.0 + MARGIN),
+        side(eye[0] > x0 - MARGIN),
         all,
     ]
 }

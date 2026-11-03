@@ -151,7 +151,7 @@ impl Renderer {
     /// indirect draw.
     fn draw_instanced(&self, pass: &mut wgpu::RenderPass<'_>, b: usize, first: u32, count: u32) {
         let (list, first, count) = if self.shader_opts.faceidx {
-            (&self.fargs, self.ibatches[b].0, self.ibatches[b].1)
+            (&self.fluid_draw_args, self.indexed_batch_ranges[b].0, self.indexed_batch_ranges[b].1)
         } else {
             (&self.lists.args, first, count)
         };
@@ -166,13 +166,13 @@ impl Renderer {
 
     /// Indexed commands of batch `b` (block faces, `RUSTCRAFT_OPT_FACEIDX`).
     fn draw_indexed_faces(&self, pass: &mut wgpu::RenderPass<'_>, b: usize) {
-        let (first, count) = self.ibatches[b];
+        let (first, count) = self.indexed_batch_ranges[b];
         pass.set_vertex_buffer(0, self.face_ids.0.slice(..));
         pass.set_index_buffer(self.face_index.slice(..), wgpu::IndexFormat::Uint16);
         if self.indirect_ok {
             pass.multi_draw_indexed_indirect(&self.indirect_idx, u64::from(first) * 20, count);
         } else {
-            for a in &self.iargs[first as usize..(first + count) as usize] {
+            for a in &self.indexed_draw_args[first as usize..(first + count) as usize] {
                 pass.draw_indexed(0..a.index_count, 0, a.first_instance..a.first_instance + 1);
             }
         }

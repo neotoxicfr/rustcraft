@@ -214,9 +214,9 @@ impl Renderer {
             let cam_col = (eye[0].floor() as i32 >> 4, eye[2].floor() as i32 >> 4);
             // Radius: farthest loaded column (Chebyshev); only changes with the columns
             // or the camera's column (`RUSTCRAFT_OPT_VISORDER`: kept in cache).
-            let rkey = (self.columns_rev, cam_col);
+            let radius_key = (self.columns_rev, cam_col);
             let radius = match self.radius_cache {
-                Some((k, r)) if k == rkey && lists::vis_order() => r,
+                Some((k, r)) if k == radius_key && lists::vis_order() => r,
                 _ => {
                     let r = self
                         .columns
@@ -226,7 +226,7 @@ impl Renderer {
                         .max()
                         .unwrap_or(0)
                         .min(VIEW_LIMIT);
-                    self.radius_cache = Some((rkey, r));
+                    self.radius_cache = Some((radius_key, r));
                     r
                 }
             };
@@ -301,7 +301,7 @@ impl Renderer {
             // Runs of consecutive visible sections per column (`reached` is sorted by column
             // then height), in a reused buffer; each column points a range into it.
             let size = (self.config.width, self.config.height);
-            let dkey: DrawKey = (
+            let draw_key: DrawKey = (
                 eye.map(f64::to_bits),
                 yaw.to_bits(),
                 u64::from(pitch.to_bits()) | u64::from(self.view.cull_fov.to_bits()) << 32,
@@ -311,7 +311,7 @@ impl Renderer {
                 min_y,
                 sections,
             );
-            if self.draw_key != Some(dkey) {
+            if self.draw_key != Some(draw_key) {
                 crate::perf_log::list_stage(2, t_sort.elapsed());
                 let t_lists = Instant::now();
                 // Visible columns from the farthest to the nearest, runs of sections in the
@@ -338,27 +338,28 @@ impl Renderer {
                 let t_send = Instant::now();
                 // Indexed faces: indexed commands of each batch of block faces, split;
                 // only the instanced commands of the fluids remain, grouped.
-                let (mut iargs, mut fargs) = (std::mem::take(&mut self.iargs), std::mem::take(&mut self.fargs));
-                iargs.clear();
-                fargs.clear();
-                self.ibatches.clear();
+                let (mut indexed_draw_args, mut fluid_draw_args) =
+                    (std::mem::take(&mut self.indexed_draw_args), std::mem::take(&mut self.fluid_draw_args));
+                indexed_draw_args.clear();
+                fluid_draw_args.clear();
+                self.indexed_batch_ranges.clear();
                 if self.shader_opts.faceidx {
                     for &(_, fluid, _, first, count) in batches {
                         let cmds = &args[first as usize..(first + count) as usize];
                         if fluid {
-                            self.ibatches.push((fargs.len() as u32, count));
-                            fargs.extend_from_slice(cmds);
+                            self.indexed_batch_ranges.push((fluid_draw_args.len() as u32, count));
+                            fluid_draw_args.extend_from_slice(cmds);
                         } else {
-                            let at = iargs.len() as u32;
-                            indexed_args(cmds, &mut iargs);
-                            self.ibatches.push((at, iargs.len() as u32 - at));
+                            let at = indexed_draw_args.len() as u32;
+                            indexed_args(cmds, &mut indexed_draw_args);
+                            self.indexed_batch_ranges.push((at, indexed_draw_args.len() as u32 - at));
                         }
                     }
                 }
                 // Commands sent: with `RUSTCRAFT_OPT_ARGSKIP`, only the range that differs from what the
                 // buffer already holds (unless a new buffer).
                 let skip = lists::args_skip();
-                let instanced: &[DrawArgs] = if self.shader_opts.faceidx { &fargs } else { args };
+                let instanced: &[DrawArgs] = if self.shader_opts.faceidx { &fluid_draw_args } else { args };
                 if self.indirect_ok && !instanced.is_empty() {
                     let bytes = std::mem::size_of_val(instanced) as u64;
                     let mut fresh = !skip;
@@ -383,13 +384,13 @@ impl Renderer {
                     }
                 }
                 if self.shader_opts.faceidx {
-                    let need = iargs.iter().map(|a| a.first_instance + 1).max().unwrap_or(0);
+                    let need = indexed_draw_args.iter().map(|a| a.first_instance + 1).max().unwrap_or(0);
                     if need > self.face_ids.1 {
                         let n = need.next_power_of_two();
                         self.face_ids = (identity_buffer(&self.device, n), n);
                     }
-                    if self.indirect_ok && !iargs.is_empty() {
-                        let bytes = (iargs.len() * std::mem::size_of::<DrawIndexedArgs>()) as u64;
+                    if self.indirect_ok && !indexed_draw_args.is_empty() {
+                        let bytes = (indexed_draw_args.len() * std::mem::size_of::<DrawIndexedArgs>()) as u64;
                         let mut fresh = !skip;
                         if self.indirect_idx.size() < bytes {
                             self.indirect_idx = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -400,20 +401,29 @@ impl Renderer {
                             });
                             fresh = true;
                         }
-                        let range = if fresh { Some(0..iargs.len()) } else { lists::changed_range(&self.sent_iargs, &iargs) };
+                        let range = if fresh {
+                            Some(0..indexed_draw_args.len())
+                        } else {
+                            lists::changed_range(&self.sent_indexed_draw_args, &indexed_draw_args)
+                        };
                         if let Some(r) = range {
                             let at = (r.start * std::mem::size_of::<DrawIndexedArgs>()) as u64;
-                            self.up.write(&self.queue, &self.indirect_idx, at, bytemuck::cast_slice(&iargs[r]));
+                            self.up.write(
+                                &self.queue,
+                                &self.indirect_idx,
+                                at,
+                                bytemuck::cast_slice(&indexed_draw_args[r]),
+                            );
                         }
                         if skip {
-                            self.sent_iargs.clear();
-                            self.sent_iargs.extend_from_slice(&iargs);
+                            self.sent_indexed_draw_args.clear();
+                            self.sent_indexed_draw_args.extend_from_slice(&indexed_draw_args);
                         }
                     }
                 }
-                (self.iargs, self.fargs) = (iargs, fargs);
+                (self.indexed_draw_args, self.fluid_draw_args) = (indexed_draw_args, fluid_draw_args);
                 crate::perf_log::list_stage(4, t_send.elapsed());
-                (self.drawn_cache, self.draw_key) = (drawn, Some(dkey));
+                (self.drawn_cache, self.draw_key) = (drawn, Some(draw_key));
             } else {
                 drawn = self.drawn_cache;
             }
@@ -580,7 +590,8 @@ impl Renderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: self.stamp("hand and interface", if blur_radius.is_none() { Role::Last } else { Role::Inner }),
+                timestamp_writes: self
+                    .stamp("hand and interface", if blur_radius.is_none() { Role::Last } else { Role::Inner }),
                 ..Default::default()
             });
             if self.view.hand

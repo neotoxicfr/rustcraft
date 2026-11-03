@@ -129,7 +129,8 @@ impl Prepared {
             && self.fluids == o.fluids
             && self.trans == o.trans
             && b(&self.centers) == b(&o.centers)
-            && (self.counts, self.fluid_counts, self.free, self.formats) == (o.counts, o.fluid_counts, o.free, o.formats)
+            && (self.counts, self.fluid_counts, self.free, self.formats)
+                == (o.counts, o.fluid_counts, o.free, o.formats)
     }
 
     /// Check (`RUSTCRAFT_MESHCHECK`): bytes identical to those of the old upload.
@@ -313,44 +314,46 @@ impl Renderer {
             self.vis_rev += 1;
         }
         let formats = self.formats;
-        let p = if empty {
+        let prepared = if empty {
             None
         } else {
             Some(prep.unwrap_or_else(|| prepare_legacy(m, crate::remesh::opts().transfree, formats)))
         };
         let sort_all = self.sort_all;
-        let keep = p
-            .as_ref()
-            .and_then(|p| in_place_writes(old.as_ref().map(ColumnGpu::slot), p, !sort_all && p.free, in_place));
+        let in_place_plan = prepared.as_ref().and_then(|prepared| {
+            in_place_writes(old.as_ref().map(ColumnGpu::slot), prepared, !sort_all && prepared.free, in_place)
+        });
         let old_slot = old.as_ref().and_then(|o| o.trans_slot);
         if let Some(old) = old
-            && keep.is_none()
+            && in_place_plan.is_none()
         {
             self.release(&old);
         }
         self.fade_ring.birth((m.x, m.z), Instant::now());
         self.columns_rev += 1;
-        let Some(mut p) = p else {
+        let Some(mut prepared) = prepared else {
             self.empty_vis.insert((m.x, m.z), m.vis.as_slice().into());
             return;
         };
         // Compact translucents: the column's slot (kept in place, otherwise taken), its
         // absolute column written into the table, and set in each quad.
-        let trans_slot = if formats.trans_compact && p.trans_len() != 0 {
-            let s = match keep.as_ref().and(old_slot) {
+        let trans_slot = if formats.trans_compact && prepared.trans_len() != 0 {
+            let s = match in_place_plan.as_ref().and(old_slot) {
                 Some(s) => s,
                 None => self.take_slot(),
             };
             self.up.write(&self.queue, &self.trans_slots, u64::from(s) * 8, bytemuck::cast_slice(&[m.x, m.z]));
-            p.set_slot(s);
+            prepared.set_slot(s);
             Some(s)
         } else {
             None
         };
-        let sent = keep.as_ref().map_or_else(|| p.bytes(), |k| k.writes.iter().map(|(.., r)| r.len()).sum());
-        crate::perf_log::upload_bytes(sent, keep.is_some());
-        let (fluid_n, trans_n) = (p.fluid_len() as u32, p.trans_len() as u32);
-        let Prepared { faces: all, counts, fluids: fluid_all, fluid_counts, trans: trans_all, centers, free, .. } = p;
+        let sent =
+            in_place_plan.as_ref().map_or_else(|| prepared.bytes(), |k| k.writes.iter().map(|(.., r)| r.len()).sum());
+        crate::perf_log::upload_bytes(sent, in_place_plan.is_some());
+        let (fluid_n, trans_n) = (prepared.fluid_len() as u32, prepared.trans_len() as u32);
+        let Prepared { faces, counts, fluids: fluid_words, fluid_counts, trans: trans_words, centers, free, .. } =
+            prepared;
         let (fluid_bytes, trans_bytes) = (formats.fluid_bytes(), formats.trans_bytes());
         let trans_starts = m.fluid_starts[2].clone();
         let key = (m.x.div_euclid(REGION), m.z.div_euclid(REGION));
@@ -362,57 +365,69 @@ impl Renderer {
         // kept (`RUSTCRAFT_SORTALL=1` re-sorts everything, for comparison).
         let free = !self.sort_all && free;
         let eye = self.sort_eye.filter(|_| !free).map(|e| eye_in_column(e, (m.x, m.z), self.sort_min_y));
-        let order_of = |ts: u32| {
+        let order_of = |trans_start: u32| {
             if centers.len() == trans_n as usize {
-                translucent_order(&centers, &trans_starts, eye, ts)
+                translucent_order(&centers, &trans_starts, eye, trans_start)
             } else {
-                (ts..ts + trans_n).collect()
+                (trans_start..trans_start + trans_n).collect()
             }
         };
-        let (fs, ls, ts, os, order_len);
-        if let Some(k) = keep {
+        let (face_start, fluid_start, trans_start, order_start, order_len);
+        if let Some(k) = in_place_plan {
             // In place: only the changed ranges go out; the order is redone (it depends on
             // the exact eye of the last sort), except an unchanged identity order.
             let s = k.slot;
-            (fs, ls, ts, os) = (s.faces.0, s.fluids.0, s.trans.0, s.order.0);
+            (face_start, fluid_start, trans_start, order_start) = (s.faces.0, s.fluids.0, s.trans.0, s.order.0);
             for (t, at, r) in k.writes {
                 let (buf, b): (&wgpu::Buffer, &[u8]) = match t {
-                    Target::Faces => (&region.faces, bytemuck::cast_slice(&all)),
-                    Target::Fluids => (&region.fluids, bytemuck::cast_slice(&fluid_all)),
-                    Target::Trans => (&trans.fluids, bytemuck::cast_slice(&trans_all)),
+                    Target::Faces => (&region.faces, bytemuck::cast_slice(&faces)),
+                    Target::Fluids => (&region.fluids, bytemuck::cast_slice(&fluid_words)),
+                    Target::Trans => (&trans.fluids, bytemuck::cast_slice(&trans_words)),
                 };
                 up.write(queue, buf, at, &b[r]);
             }
             order_len = trans_n;
             if k.order {
-                let order = order_of(ts);
-                up.write(queue, &trans.order, u64::from(os) * ORDER_BYTES, bytemuck::cast_slice(&order));
+                let order = order_of(trans_start);
+                up.write(queue, &trans.order, u64::from(order_start) * ORDER_BYTES, bytemuck::cast_slice(&order));
             }
         } else {
             let faces_size = region.faces.size();
-            fs = alloc_in(device, queue, up, &mut region.faces, &mut region.face_arena, all.len() as u32, FACE_BYTES);
-            up.write(queue, &region.faces, u64::from(fs) * FACE_BYTES, bytemuck::cast_slice(&all));
+            face_start =
+                alloc_in(device, queue, up, &mut region.faces, &mut region.face_arena, faces.len() as u32, FACE_BYTES);
+            up.write(queue, &region.faces, u64::from(face_start) * FACE_BYTES, bytemuck::cast_slice(&faces));
             let fluids_size = region.fluids.size();
-            ls = alloc_in(device, queue, up, &mut region.fluids, &mut region.fluid_arena, fluid_n, fluid_bytes);
+            fluid_start =
+                alloc_in(device, queue, up, &mut region.fluids, &mut region.fluid_arena, fluid_n, fluid_bytes);
             if region.fluids.size() != fluids_size || region.faces.size() != faces_size {
                 region.bind = region_bind(device, layout, &region.pos, &region.fluids, slots, &region.faces);
             }
-            if !fluid_all.is_empty() {
-                up.write(queue, &region.fluids, u64::from(ls) * fluid_bytes, bytemuck::cast_slice(&fluid_all));
+            if !fluid_words.is_empty() {
+                up.write(
+                    queue,
+                    &region.fluids,
+                    u64::from(fluid_start) * fluid_bytes,
+                    bytemuck::cast_slice(&fluid_words),
+                );
             }
             let trans_size = trans.fluids.size();
-            ts = alloc_in(device, queue, up, &mut trans.fluids, &mut trans.fluid_arena, trans_n, trans_bytes);
+            trans_start = alloc_in(device, queue, up, &mut trans.fluids, &mut trans.fluid_arena, trans_n, trans_bytes);
             if trans.fluids.size() != trans_size {
                 trans.bind = region_bind(device, layout, &trans.pos, &trans.fluids, slots, &trans.faces);
             }
-            if !trans_all.is_empty() {
-                up.write(queue, &trans.fluids, u64::from(ts) * trans_bytes, bytemuck::cast_slice(&trans_all));
+            if !trans_words.is_empty() {
+                up.write(
+                    queue,
+                    &trans.fluids,
+                    u64::from(trans_start) * trans_bytes,
+                    bytemuck::cast_slice(&trans_words),
+                );
             }
-            let order = order_of(ts);
+            let order = order_of(trans_start);
             order_len = order.len() as u32;
-            os = alloc_in(device, queue, up, &mut trans.order, &mut trans.order_arena, order_len, ORDER_BYTES);
+            order_start = alloc_in(device, queue, up, &mut trans.order, &mut trans.order_arena, order_len, ORDER_BYTES);
             if !order.is_empty() {
-                up.write(queue, &trans.order, u64::from(os) * ORDER_BYTES, bytemuck::cast_slice(&order));
+                up.write(queue, &trans.order, u64::from(order_start) * ORDER_BYTES, bytemuck::cast_slice(&order));
             }
             region.columns += 1;
         }
@@ -424,7 +439,7 @@ impl Renderer {
         } else {
             column_povs(self.sort_eye, &trans_starts, (m.x, m.z), self.sort_min_y.div_euclid(16))
         };
-        let order_starts: Vec<u32> = trans_starts.iter().map(|&r| os + r).collect();
+        let order_starts: Vec<u32> = trans_starts.iter().map(|&r| order_start + r).collect();
         // Absolute ranges in the region's buffers.
         let place = |base: u32, counts: [u32; 3], rel: &[Vec<u32>; 3]| {
             let mut ranges: [std::ops::Range<u32>; 3] = Default::default();
@@ -437,16 +452,16 @@ impl Renderer {
             }
             (ranges, starts)
         };
-        let (ranges, starts) = place(fs, counts, &m.starts);
-        let (mut fluid_ranges, mut fluid_starts) = place(ls, fluid_counts, &m.fluid_starts);
-        fluid_ranges[2] = ts..ts + trans_n;
-        fluid_starts[2] = m.fluid_starts[2].iter().map(|&r| ts + r).collect();
+        let (ranges, starts) = place(face_start, counts, &m.starts);
+        let (mut fluid_ranges, mut fluid_starts) = place(fluid_start, fluid_counts, &m.fluid_starts);
+        fluid_ranges[2] = trans_start..trans_start + trans_n;
+        fluid_starts[2] = m.fluid_starts[2].iter().map(|&r| trans_start + r).collect();
         let column = ColumnGpu {
             digest: if crate::remesh::checking() { crate::remesh::digest(m) } else { 0 },
             region: key,
-            face_alloc: (fs, all.len() as u32),
-            fluid_alloc: (ls, fluid_n),
-            trans_alloc: (ts, trans_n),
+            face_alloc: (face_start, faces.len() as u32),
+            fluid_alloc: (fluid_start, fluid_n),
+            trans_alloc: (trans_start, trans_n),
             ranges,
             fluid_ranges,
             starts,
@@ -454,7 +469,7 @@ impl Renderer {
             vis: m.vis.as_slice().into(),
             trans_centers,
             trans_starts,
-            order_alloc: (os, order_len),
+            order_alloc: (order_start, order_len),
             order_starts,
             sorted_at,
             povs,
@@ -510,7 +525,8 @@ impl Renderer {
         if self.face_ids.1 > FACE_IDS_START {
             self.face_ids = (identity_buffer(&self.device, FACE_IDS_START), FACE_IDS_START);
         }
-        self.trans =RegionGpu::new(&self.device, &self.column_layout, (0, 0), self.formats.trans_bytes(), &self.trans_slots);
+        self.trans =
+            RegionGpu::new(&self.device, &self.column_layout, (0, 0), self.formats.trans_bytes(), &self.trans_slots);
         self.free_slots.clear();
         self.next_slot = 0;
         self.columns_rev += 1;

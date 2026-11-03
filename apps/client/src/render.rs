@@ -390,7 +390,7 @@ pub struct Renderer {
     /// Instanced and indexed commands as written in their GPU buffer
     /// (`RUSTCRAFT_OPT_ARGSKIP`: only the changed range is rewritten).
     sent_args: Vec<DrawArgs>,
-    sent_iargs: Vec<DrawIndexedArgs>,
+    sent_indexed_draw_args: Vec<DrawIndexedArgs>,
     /// Radius of the walk and its key (version of the columns, camera column).
     radius_cache: Option<(RadiusKey, i32)>,
     /// Grid of the sections reached by the last walk to arrive (`RUSTCRAFT_OPT_REACHGRID`).
@@ -444,10 +444,10 @@ pub struct Renderer {
     /// sent to the GPU), and (first, count) of each batch in the list of its kind.
     face_index: wgpu::Buffer,
     face_ids: (wgpu::Buffer, u32),
-    iargs: Vec<DrawIndexedArgs>,
-    fargs: Vec<DrawArgs>,
+    indexed_draw_args: Vec<DrawIndexedArgs>,
+    fluid_draw_args: Vec<DrawArgs>,
     indirect_idx: wgpu::Buffer,
-    ibatches: Vec<(u32, u32)>,
+    indexed_batch_ranges: Vec<(u32, u32)>,
     graph_tx: crossbeam_channel::Sender<GraphResult>,
     graph_rx: crossbeam_channel::Receiver<GraphResult>,
     /// Last walk result and its key (exact position, version of the columns, settings).
@@ -673,7 +673,7 @@ impl Renderer {
             lists: lists::Lists::default(),
             drawn_cache: (0, 0),
             sent_args: Vec::new(),
-            sent_iargs: Vec::new(),
+            sent_indexed_draw_args: Vec::new(),
             radius_cache: None,
             reached_grid: None,
             reached_gen: 0,
@@ -706,15 +706,15 @@ impl Renderer {
             shader_opts,
             face_index,
             face_ids: (face_ids, FACE_IDS_START),
-            iargs: Vec::new(),
-            fargs: Vec::new(),
+            indexed_draw_args: Vec::new(),
+            fluid_draw_args: Vec::new(),
             indirect_idx: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("indirect indexed commands"),
                 size: 1 << 16,
                 usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             }),
-            ibatches: Vec::new(),
+            indexed_batch_ranges: Vec::new(),
             graph_tx,
             graph_rx,
             reached: Vec::new(),
