@@ -40,6 +40,7 @@ pub(crate) mod upload;
 mod test_meshes;
 
 pub use column_upload::{Prepared, prepare};
+pub use frustum::BoxVerdict;
 pub(crate) use pipelines::camera_layout;
 
 use column_upload::ColumnGpu;

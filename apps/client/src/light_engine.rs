@@ -3,7 +3,38 @@
 use hashbrown::HashMap;
 use rc_world::{ChunkGrid, LightLayer};
 
-pub use rc_light::{LightTables, Received, relight_masked, relight_sections};
+pub use rc_light::{LightTables, Received};
+
+/// Client relight ([`rc_light::relight_masked`]), timed for the perf log: `rc_light::stats` adds
+/// up the client's and the integrated server's relights, the client's share is told apart here.
+pub fn relight_masked(
+    grid: &mut ChunkGrid,
+    height: i32,
+    t: &LightTables,
+    has_sky: bool,
+    changes: &[[i32; 3]],
+    sky_changes: &[[i32; 3]],
+) -> rc_light::Touched {
+    timed(changes.len(), || rc_light::relight_masked(grid, height, t, has_sky, changes, sky_changes))
+}
+
+/// Client relight ([`rc_light::relight_sections`]), timed like [`relight_masked`].
+pub fn relight_sections(
+    grid: &mut ChunkGrid,
+    height: i32,
+    t: &LightTables,
+    has_sky: bool,
+    changes: &[[i32; 3]],
+) -> rc_light::Touched {
+    timed(changes.len(), || rc_light::relight_sections(grid, height, t, has_sky, changes))
+}
+
+fn timed<R>(changes: usize, relight: impl FnOnce() -> R) -> R {
+    let t = std::time::Instant::now();
+    let out = relight();
+    crate::perf_log::client_relight(t.elapsed(), changes);
+    out
+}
 
 /// Switches of mission C2-M05 (`docs/perf.md`), read once at the first call.
 /// - `RUSTCRAFT_OPT_SOLONORELIGHT`: in singleplayer (LAN host included), a block change received from the

@@ -5184,3 +5184,80 @@ loop runs them in order today), and give
 decoration more regions per class (larger batches or overlapping the classes of two batches).
 Not done here (client and samply forbidden during the series): the samply pass of
 `@generation-zone` and samply on the terrain, density and biome micro-benches at 1..32 threads.
+## C2-M01: counters that settle the light and meshing leads, redstone light trace (03/11, loaded machine)
+
+Measurement mission: no gain claimed, no `RUSTCRAFT_OPT_*` switch (nothing changes a result).
+The new readings are generic `[perf] counter <name> <value>` lines (column `c:<name>` of
+`tools/bench/scenes.py`, mean over the window), written with `RUSTCRAFT_PERFLOG`:
+- Light queues (`rc_light::stats::queues`, zone resolutions; the incremental path is not
+  counted): per kind of light and per level, the entries the seeding placed and the entries each
+  level held when its turn came. Free: an entry pushed always lands on a lower level (opacity ≥ 1),
+  so the bucket lengths read at each level boundary are the count; nothing is added to the
+  propagation loop. Kept only while the perf log is on (one cached flag per relight).
+  `light_{block,sky}_seeded_per_s`, `…_seeded_at_15_per_s`, `…_pushed_per_s`, `…_cells_per_s`,
+  `…_entries_per_cell`, and a `light queue entries per s, levels 15 to 1` line.
+- Relights per caller: the client times its own (`light_engine`), the integrated server's are the
+  rest of the process totals: `client_relights_per_s`, `client_relight_changes_per_s`,
+  `client_relight_ms_per_s`, `server_relights_per_s`, `server_relight_ms_per_s`.
+- Client block changes that touch the light, by origin: `light_changes_{server_light_received,
+  server,piston_event,piston_finish,prediction}_per_s` (`server_light_received`: skipped by
+  `SOLONORELIGHT`, looked at only with the log on).
+- Meshing: `mesh_{whole_column,partial_with_base,partial_without_base}_{jobs_per_s,ms_per_job}`,
+  base misses by cause `mesh_base_miss_{evicted,never_kept}_per_s` (evicted by the cache budget,
+  or the last mesh was a whole column), `mesh_cache_fluid_mb` (27 words per fluid face against 6),
+  `mesh_live_columns` (kept plus evicted bases: the cache that would lose none),
+  `mesh_partials_{reached,unreached}_per_s` (column reached or not by the last visibility walk).
+- Uploads: `upload_in_place_{sent,whole}_mb_per_s` (bytes written in place against a whole upload of
+  the same columns), `upload_in_place_refused_{version,other}_per_s` (the GPU no longer holds the
+  base version, or another reason).
+- Visibility test of the frame (entities, particles, block entities): calls per frame by verdict
+  `visibility_{outside,unchecked,one_section_reached,one_section_hidden,straddling_reached,
+  straddling_hidden}_per_frame` (plain cells flushed when the frame's test is dropped).
+- Column copies by writer (`ChunkGrid::get_mut_by`, a copy happens when a meshing task still
+  holds the column): `column_copies_{blocks,light_update,biomes,relight,other}_per_s`.
+
+Redstone light trace for `benches/relight.rs`: the `redstone` site of `rc-sim`
+`tests_opt::bench_ticks` never ran (`cmd` demands a success, and a function without `return`
+reports none, like the game: this was the "function missing" noted above); fixed, plus
+`RUSTCRAFT_BENCH_SITES` to keep some sites. `RUSTCRAFT_BENCH_SITES=redstone RUSTCRAFT_LIGHTTRACE=…`
+gives `bench_ticks_redstone.rclt` (57 MB, 297 relights, 80,228 changes, fingerprints in `KNOWN`).
+
+Deterministic counts (relight bench, queue counting forced on the equivalence replay), per relight:
+
+| trace | sky seeded (at 15) | sky pushed | sky cells | sky entries / cell | block seeded | block pushed | block entries / cell |
+|---|---|---|---|---|---|---|---|
+| synthetic | 17,355 (16,291) | 8,242 | 38,410 | 0.666 | 36 | 659 | 0.033 |
+| surface | 1,832 (1,515) | 1,776 | 184,700 | 0.020 | 1,516 | 9,082 | 0.061 |
+| Nether | 0 | 0 | 0 | – | 20,368 | 96,830 | 0.344 |
+| redstone | 77,583 (74,636) | 31,145 | 171,255 | 0.635 | 540 | 29,079 | 0.175 |
+
+Left unspread at level 1 (pushed for nothing): redstone sky 2,568, block 4,076; Nether block 11,144.
+Decisions they settle:
+- C2-M02 (seed only the sky frontier): confirmed for redstone, 108,700 sky entries per relight of
+  which 69 % are level-15 seeds; the surface trace has only 3,600.
+- C2-M19 (dense propagation): entries per cell 0.02 to 0.67, block at most 0.34; the sky share
+  drops with C2-M02, so entries ≪ cells everywhere: the lead is very likely without object (to
+  re-check with these counters after C2-M02).
+- C2-M12 (incremental light): `LIGHTINC` gives the reference result on all 297 redstone relights
+  (0 differ at equal input, against 110 of 409 on the surface trace). Relight bench A B B A on the
+  redstone trace, 1 thread, LOADED machine (whole replay): work 1.235 / 2.696 s, counted 0.992 /
+  0.816 s, `LIGHTINC` 0.689 / 0.437 s, `LIGHTINCMAX=16` 1.164 / 1.241 s, reference 3.855 / 5.520 s.
+  The two passes of the same path differ by ×2.2: nothing is concluded; `LIGHTINC` was faster on
+  both passes, to confirm on the quiet machine. The counters' cost does not show (`counted` below
+  `work` on both passes).
+- Meshing, uploads, visibility and copies: the values come from the scene bench (client only).
+Proofs: `fast/tests/queue_counters.rs` (exact counts of a torch in air, 4 d² + 2 cells per distance
+shell; sheets and touched sections identical with the counting on and off, sequential and 1 or
+8 threads; sabotage 27 — counting that drops the level-14 seeds — caught; a manual sabotage
+dropping level 1 from the totals was seen failing), `remesh::tests::miss_tracking_keeps_the_same_cache`
+(same bases kept with and without the bookkeeping, kept plus evicted = columns whose last mesh is a
+live one within the budget, fluid bytes = 27 words per fluid face; seen failing when a received
+mesh does not clear its eviction mark), `remesh::tests::fluid_bytes_from_the_starts`,
+`render::frustum::tests` (100,000 boxes: same answer as the test of before, every verdict drawn;
+seen failing when the reached test reads one section column only), `app_meshing::tests`
+(origins relight like the boolean of before; light positions unchanged), `rc-world`
+`copies_counted_per_writer`; whole suites of `rc-light`, `rc-world`, `rc-sim` and `rc-app`.
+To run on the quiet machine (2 alternating passes, `main` and this branch): `scenes.py` redstone,
+cave, plains12, nether, generation, tnt, forest, plains32, flight, ocean, then redstone, cave,
+plains12, nether, generation with `--env=RUSTCRAFT_OPT_LIGHTINC=1` (upper bound of C2-M12), and the
+relight bench A B B A on the four traces (noise below 1 % before judging a light mission).

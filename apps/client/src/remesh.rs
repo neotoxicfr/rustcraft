@@ -194,8 +194,14 @@ pub fn finish(mut mesh: BlockMesh, live: bool, urgent: bool, base: Option<(&rc_m
     Done { mesh, live, urgent, packed, prep, in_place }
 }
 
-/// Mesh kept flat, its usage rank and its version.
-type Kept = (rc_mesh::blocks::Packed, u64, u64);
+/// Mesh kept flat, its usage rank, its version, and the bytes of fluid faces in it (perf log
+/// only, 0 otherwise).
+struct Kept {
+    packed: rc_mesh::blocks::Packed,
+    stamp: u64,
+    version: u64,
+    fluid_bytes: usize,
+}
 
 /// Meshes in progress and last meshes received.
 pub struct Meshes {
@@ -210,6 +216,11 @@ pub struct Meshes {
     bytes: usize,
     budget: usize,
     clock: u64,
+    /// Perf log: columns whose base the budget evicted (their last mesh is still a base for the
+    /// game), to tell an evicted base from one never kept; and the fluid bytes of the cache.
+    track: bool,
+    evicted: HashSet<(i32, i32)>,
+    fluid_bytes: usize,
     /// Flattening buffer reused.
     scratch: Vec<u32>,
     /// Columns already meshed once since their loading (the game compiles a section
@@ -238,6 +249,9 @@ impl Default for Meshes {
             bytes: 0,
             budget: budget(),
             clock: 0,
+            track: crate::perf_log::on(),
+            evicted: HashSet::new(),
+            fluid_bytes: 0,
             scratch: Vec::new(),
             compiled: HashSet::new(),
             waiting: HashMap::new(),
@@ -255,18 +269,21 @@ impl Meshes {
         mask.is_all() || !self.busy.contains_key(&key)
     }
 
-    fn drop_entry(&mut self, key: (i32, i32)) {
-        if let Some((w, stamp, _)) = self.cache.remove(&key) {
-            self.lru.remove(&stamp);
-            self.bytes -= w.len() * 4;
-        }
+    /// Entry removed from the cache (bytes given back), if there was one.
+    fn take_entry(&mut self, key: (i32, i32)) -> Option<Kept> {
+        let kept = self.cache.remove(&key)?;
+        self.lru.remove(&kept.stamp);
+        self.bytes -= kept.packed.len() * 4;
+        self.fluid_bytes -= kept.fluid_bytes;
+        Some(kept)
     }
 
     /// Mesh received. `live`: redone for changed blocks or light; only kept one (the bulk
     /// of the columns, meshed whole at loading, never changes). A whole mesh that is not
     /// kept removes the old one (it is no longer the base). `packed`: already flattened by the pool.
     fn put(&mut self, key: (i32, i32), m: &BlockMesh, live: bool, packed: Option<rc_mesh::blocks::Packed>) {
-        self.drop_entry(key);
+        self.take_entry(key);
+        self.evicted.remove(&key);
         if live {
             let w: rc_mesh::blocks::Packed = match (packed, opts().pack) {
                 (Some(w), _) => w,
@@ -278,35 +295,48 @@ impl Meshes {
             };
             let size = w.len() * 4;
             if size <= self.budget {
+                let fluid_bytes = if self.track { packed_fluid_bytes(m, w.len()) } else { 0 };
                 self.clock += 1;
-                self.cache.insert(key, (w, self.clock, m.version));
+                self.cache.insert(key, Kept { packed: w, stamp: self.clock, version: m.version, fluid_bytes });
                 self.lru.insert(self.clock, key);
                 self.bytes += size;
-                while self.bytes > self.budget {
-                    let Some((_, old)) = self.lru.pop_first() else { break };
-                    if let Some((w, _, _)) = self.cache.remove(&old) {
-                        self.bytes -= w.len() * 4;
-                    }
-                }
+                self.fluid_bytes += fluid_bytes;
+                self.evict_over_budget();
             }
         }
         crate::perf_log::mesh_cache(self.bytes, self.cache.len());
+        crate::perf_log::mesh_cache_shares(self.fluid_bytes, self.cache.len() + self.evicted.len());
+    }
+
+    /// Oldest bases dropped until the cache fits its budget again.
+    fn evict_over_budget(&mut self) {
+        while self.bytes > self.budget {
+            let Some((_, old)) = self.lru.pop_first() else { break };
+            if let Some(kept) = self.cache.remove(&old) {
+                self.bytes -= kept.packed.len() * 4;
+                self.fluid_bytes -= kept.fluid_bytes;
+                if self.track {
+                    self.evicted.insert(old);
+                }
+            }
+        }
     }
 
     /// Kept base of the column, flat (usage refreshed), and its version.
     fn base(&mut self, key: (i32, i32)) -> Option<(rc_mesh::blocks::Packed, u64)> {
-        let (w, stamp, version) = self.cache.get_mut(&key)?;
-        self.lru.remove(stamp);
+        let kept = self.cache.get_mut(&key)?;
+        self.lru.remove(&kept.stamp);
         self.clock += 1;
-        *stamp = self.clock;
+        kept.stamp = self.clock;
         self.lru.insert(self.clock, key);
-        Some((w.clone(), *version))
+        Some((kept.packed.clone(), kept.version))
     }
 
     /// Column forgotten: its mesh is no longer a valid base, and when it comes back it will wait
     /// for its neighbours again.
     pub fn forget(&mut self, key: (i32, i32)) {
-        self.drop_entry(key);
+        self.take_entry(key);
+        self.evicted.remove(&key);
         // Mesh still in progress: ignored on arrival (column from before the unloading).
         self.busy.remove(&key);
         self.compiled.remove(&key);
@@ -320,6 +350,8 @@ impl Meshes {
         self.cache.clear();
         self.lru.clear();
         self.bytes = 0;
+        self.fluid_bytes = 0;
+        self.evicted.clear();
         self.compiled.clear();
         self.waiting.clear();
         self.checked.clear();
@@ -465,7 +497,7 @@ impl World {
             return None;
         }
         let base = self.meshes.base(key);
-        crate::perf_log::mesh_base(base.is_some());
+        crate::perf_log::mesh_base(base.is_some(), self.meshes.evicted.contains(&key));
         if traced(key.0, key.1, false) {
             eprintln!("[meshtrace] launches v{version} sections {mask:?} base {}", base.is_some());
         }
@@ -691,6 +723,16 @@ impl crate::App {
     }
 }
 
+/// Bytes of fluid faces in the flat mesh of `m` (`words` long): whatever is neither a face
+/// (6 words) nor an index (lengths, starts, communications). The starts give the face counts,
+/// and stay when the pool has already freed the faces and fluids (`finish`).
+fn packed_fluid_bytes(m: &BlockMesh, words: usize) -> usize {
+    let faces: usize = m.starts.iter().map(|s| s.last().map_or(0, |&n| n as usize)).sum();
+    let index: usize =
+        3 + 2 * m.vis.len() + (0..3).map(|l| 4 + m.starts[l].len() + m.fluid_starts[l].len()).sum::<usize>();
+    words.saturating_sub(6 * faces + index) * 4
+}
+
 /// Edges of the cells whose level differs between two layers (0 if identical). By 64-bit
 /// words: one word = one row of 16 cells (x from 0 to 15, low nibble first) at fixed y and z;
 /// word i: y = i / 16, z = i % 16.
@@ -780,6 +822,101 @@ mod tests {
             dirty.push(d);
         }
         assert_eq!(dirty[0], dirty[1], "different sections to remesh");
+    }
+
+    /// Fluid bytes read from the starts alone = 27 words per fluid face of the flat format, the
+    /// faces and fluids themselves freed (as the pool leaves them).
+    #[test]
+    fn fluid_bytes_from_the_starts() {
+        let q = rc_mesh::fluid::FluidQuad { corners: [[0.0; 5]; 4], texture: 1, colors: [0; 4], light: [0; 4] };
+        let mut m = BlockMesh {
+            x: 0,
+            z: 0,
+            version: 1,
+            layers: [vec![[1; 6]; 3], Vec::new(), vec![[7; 6]]],
+            fluids: [vec![q; 2], Vec::new(), vec![q]],
+            starts: [vec![0, 1, 3], vec![0, 0, 0], vec![0, 1, 1]],
+            fluid_starts: [vec![0, 2], vec![0, 0], vec![0, 1]],
+            vis: vec![1, 2],
+        };
+        let words = rc_mesh::blocks::packed_len(&m);
+        m.layers = Default::default();
+        m.fluids = Default::default();
+        assert_eq!(packed_fluid_bytes(&m, words), 3 * 27 * 4);
+    }
+
+    /// Mesh of `faces` faces and `fluids` fluid faces in one section (starts as the mesher writes them).
+    fn kept_mesh(x: i32, version: u64, faces: usize, fluids: usize) -> BlockMesh {
+        let q = rc_mesh::fluid::FluidQuad { corners: [[0.0; 5]; 4], texture: 1, colors: [0; 4], light: [0; 4] };
+        BlockMesh {
+            x,
+            z: 0,
+            version,
+            layers: [vec![[0; 6]; faces], Vec::new(), Vec::new()],
+            fluids: [vec![q; fluids], Vec::new(), Vec::new()],
+            starts: [vec![0, faces as u32], vec![0, 0], vec![0, 0]],
+            fluid_starts: [vec![0, fluids as u32], vec![0, 0], vec![0, 0]],
+            vis: vec![0],
+        }
+    }
+
+    /// Base-miss bookkeeping of the perf log (`track`): the cache keeps the same bases with and
+    /// without it, kept and evicted bases are exactly the columns whose last mesh was a live one
+    /// that fits the budget, and the fluid bytes are those of the kept bases.
+    #[test]
+    fn miss_tracking_keeps_the_same_cache() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let mut plain = Meshes { budget: 40_000, track: false, ..Default::default() };
+        let mut tracked = Meshes { budget: 40_000, track: true, ..Default::default() };
+        let mut live_last: HashMap<(i32, i32), bool> = HashMap::new();
+        let mut fluid_faces: HashMap<(i32, i32), usize> = HashMap::new();
+        for version in 0..3000u64 {
+            let key = (next(40) as i32, 0);
+            match next(6) {
+                0 => {
+                    plain.forget(key);
+                    tracked.forget(key);
+                    live_last.remove(&key);
+                }
+                1 | 2 => {
+                    let (a, b) = (plain.base(key).map(|(_, v)| v), tracked.base(key).map(|(_, v)| v));
+                    assert_eq!(a, b, "base of {key:?}");
+                }
+                _ => {
+                    let (live, fluids) = (next(3) != 0, next(60) as usize);
+                    let m = kept_mesh(key.0, version, next(1200) as usize, fluids);
+                    let fits = rc_mesh::blocks::packed_len(&m) * 4 <= 40_000;
+                    plain.put(key, &m, live, None);
+                    tracked.put(key, &m, live, None);
+                    live_last.insert(key, live && fits);
+                    fluid_faces.insert(key, fluids);
+                }
+            }
+            let kept = |m: &Meshes| {
+                let mut v: Vec<_> = m.cache.iter().map(|(k, e)| (*k, e.version, e.stamp, e.packed.len())).collect();
+                v.sort_unstable();
+                v
+            };
+            assert_eq!(kept(&plain), kept(&tracked), "kept bases at step {version}");
+            assert_eq!(plain.bytes, tracked.bytes);
+            assert!(plain.evicted.is_empty() && plain.fluid_bytes == 0, "bookkeeping without the perf log");
+            let mut live: Vec<_> = tracked.cache.keys().chain(&tracked.evicted).copied().collect();
+            live.sort_unstable();
+            let mut want: Vec<_> = live_last.iter().filter(|(_, l)| **l).map(|(k, _)| *k).collect();
+            want.sort_unstable();
+            assert_eq!(live, want, "kept or evicted bases at step {version}");
+            assert!(tracked.evicted.iter().all(|k| !tracked.cache.contains_key(k)));
+            // 27 words per fluid face in the flat format.
+            let fluids: usize = tracked.cache.keys().map(|k| fluid_faces[k] * 27 * 4).sum();
+            assert_eq!(tracked.fluid_bytes, fluids, "fluid bytes of the kept bases at step {version}");
+        }
+        assert!(!tracked.evicted.is_empty(), "the budget never evicted: test without object");
     }
 
     #[test]

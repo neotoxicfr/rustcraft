@@ -82,6 +82,87 @@ pub mod stats {
             block_ns: BLOCK_NS.load(Relaxed),
         }
     }
+
+    /// Propagation queues of the zone resolutions (incremental path excluded), per kind of light
+    /// (index [`BLOCK`] or [`SKY`]) and per level 1 to 15: entries placed by the seeding, and every
+    /// entry a level held when its turn came (seeded plus pushed by the propagation; level 1 is
+    /// never spread: what it holds was pushed for nothing). `cells`: cells of the resolved rows,
+    /// margins included (the ratio entries / cells says how dense the propagation is). Only kept
+    /// while the perf log is on ([`queues_counted`]).
+    static SEEDED: [[AtomicU64; 16]; 2] = [const { [const { AtomicU64::new(0) }; 16] }; 2];
+    static QUEUED: [[AtomicU64; 16]; 2] = [const { [const { AtomicU64::new(0) }; 16] }; 2];
+    static CELLS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+    pub const BLOCK: usize = 0;
+    pub const SKY: usize = 1;
+
+    /// Totals of the propagation queues since startup (see [`queues_counted`]).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Queues {
+        pub seeded: [[u64; 16]; 2],
+        pub queued: [[u64; 16]; 2],
+        pub cells: [u64; 2],
+    }
+
+    impl Queues {
+        /// Difference between two readings (`self` after `before`).
+        pub fn since(&self, before: &Queues) -> Queues {
+            let levels = |a: &[[u64; 16]; 2], b: &[[u64; 16]; 2]| {
+                std::array::from_fn(|k| std::array::from_fn(|l| a[k][l] - b[k][l]))
+            };
+            Queues {
+                seeded: levels(&self.seeded, &before.seeded),
+                queued: levels(&self.queued, &before.queued),
+                cells: std::array::from_fn(|k| self.cells[k] - before.cells[k]),
+            }
+        }
+    }
+
+    pub fn queues() -> Queues {
+        let levels = |v: &[[AtomicU64; 16]; 2]| std::array::from_fn(|k| std::array::from_fn(|l| v[k][l].load(Relaxed)));
+        Queues {
+            seeded: levels(&SEEDED),
+            queued: levels(&QUEUED),
+            cells: std::array::from_fn(|k| CELLS[k].load(Relaxed)),
+        }
+    }
+
+    /// Queue lengths per level, read when a resolution has seeded (`seeded`) and when each level
+    /// is spread (`queued`): counting them costs no work in the propagation loop.
+    pub(crate) type LevelCounts = [u32; 16];
+
+    pub(crate) fn add_queues(sky: bool, seeded: &LevelCounts, queued: &LevelCounts, cells: usize) {
+        let k = if sky { SKY } else { BLOCK };
+        for l in 1..16 {
+            if seeded[l] > 0 {
+                SEEDED[k][l].fetch_add(u64::from(seeded[l]), Relaxed);
+            }
+            if queued[l] > 0 {
+                QUEUED[k][l].fetch_add(u64::from(queued[l]), Relaxed);
+            }
+        }
+        CELLS[k].fetch_add(cells as u64, Relaxed);
+    }
+
+    thread_local! {
+        /// Queue counting forced on or off for the relights started by this thread (tests and
+        /// benches compare both in one process; the environment cannot change after startup).
+        static FORCED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Queues counted for a relight started now on this thread: perf log on (`RUSTCRAFT_PERFLOG`,
+    /// the client's and the bench's measurement journal), unless forced by
+    /// [`force_queue_counting`].
+    pub(crate) fn queues_counted() -> bool {
+        FORCED.with(std::cell::Cell::get).unwrap_or_else(|| rc_data::env_flag!("RUSTCRAFT_PERFLOG"))
+    }
+
+    /// Tests and benches: queue counting forced (`Some`) or back to the environment (`None`) for
+    /// the relights this thread starts.
+    #[doc(hidden)]
+    pub fn force_queue_counting(on: Option<bool>) {
+        FORCED.with(|f| f.set(on));
+    }
 }
 
 /// Frozen copy of the resolutions (reference for the benches and equivalence tests): never
@@ -160,7 +241,7 @@ impl LightGrid for ChunkGrid {
     }
 
     fn layers_mut(&mut self, cx: i32, cz: i32, sky: bool) -> Option<&mut [LightLayer]> {
-        let c = self.get_mut(cx, cz)?;
+        let c = self.get_mut_by(cx, cz, rc_world::ColumnWriter::Relight)?;
         Some(if sky { &mut c.sky_light } else { &mut c.block_light })
     }
 }

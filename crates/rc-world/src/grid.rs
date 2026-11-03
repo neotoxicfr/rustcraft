@@ -21,6 +21,53 @@ fn stamp() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Who asks for write access to a column ([`ChunkGrid::get_mut_by`]): splits the column copies
+/// made because another thread (a meshing task) still holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColumnWriter {
+    /// Block changes of a section.
+    Blocks,
+    /// Light layers received from the server.
+    LightUpdate,
+    /// Biome containers received from the server.
+    Biomes,
+    /// Layers written by the local light engine.
+    Relight,
+    /// Any other writer.
+    Other,
+}
+
+impl ColumnWriter {
+    pub const ALL: [ColumnWriter; 5] = [
+        ColumnWriter::Blocks,
+        ColumnWriter::LightUpdate,
+        ColumnWriter::Biomes,
+        ColumnWriter::Relight,
+        ColumnWriter::Other,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ColumnWriter::Blocks => "blocks",
+            ColumnWriter::LightUpdate => "light_update",
+            ColumnWriter::Biomes => "biomes",
+            ColumnWriter::Relight => "relight",
+            ColumnWriter::Other => "other",
+        }
+    }
+}
+
+/// Column copies per writer since startup ([`ColumnWriter`] order).
+pub type ColumnCopies = [u64; ColumnWriter::ALL.len()];
+
+static COPIES: [std::sync::atomic::AtomicU64; ColumnWriter::ALL.len()] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; ColumnWriter::ALL.len()];
+
+/// Column copies made by write accesses since startup, per writer (perf log).
+pub fn column_copies() -> ColumnCopies {
+    std::array::from_fn(|k| COPIES[k].load(std::sync::atomic::Ordering::Relaxed))
+}
+
 impl ChunkGrid {
     pub fn new(radius: u32) -> Self {
         let size = Self::size_for(radius);
@@ -78,9 +125,20 @@ impl ChunkGrid {
     /// Write access: copies the column only if another thread is still reading it.
     #[inline]
     pub fn get_mut(&mut self, x: i32, z: i32) -> Option<&mut Column> {
+        self.get_mut_by(x, z, ColumnWriter::Other)
+    }
+
+    /// [`get_mut`](Self::get_mut), the copy (column still held elsewhere) counted for `writer`.
+    #[inline]
+    pub fn get_mut_by(&mut self, x: i32, z: i32, writer: ColumnWriter) -> Option<&mut Column> {
         let i = self.slot(x, z);
         self.stamps[i] = stamp();
-        self.slots[i].as_mut().filter(|c| c.x == x && c.z == z).map(Arc::make_mut)
+        let column = self.slots[i].as_mut().filter(|c| c.x == x && c.z == z)?;
+        // Same test as the copy inside `make_mut` (one load): only the copies are counted.
+        if Arc::strong_count(column) > 1 {
+            COPIES[writer as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Some(Arc::make_mut(column))
     }
 
     pub fn remove(&mut self, x: i32, z: i32) -> Option<Arc<Column>> {
@@ -146,6 +204,26 @@ mod tests {
         assert!(g.remove(-3 + 11, 7).is_none());
         assert!(g.remove(-3, 7).is_some());
         assert_eq!(g.len(), 1);
+    }
+
+    /// A write access copies a column only while another holder keeps it, and counts that copy
+    /// for its writer; alone, no copy and nothing counted (writers no other test of this crate uses).
+    #[test]
+    fn copies_counted_per_writer() {
+        let (biomes, relight) = (ColumnWriter::Biomes as usize, ColumnWriter::Relight as usize);
+        let mut g = ChunkGrid::new(4);
+        g.insert(col(1, 2));
+        let before = column_copies();
+        assert!(g.get_mut_by(1, 2, ColumnWriter::Relight).is_some());
+        let held = g.get_arc(1, 2).expect("column present");
+        g.get_mut_by(1, 2, ColumnWriter::Biomes).expect("column present").sky_light = Box::new([None]);
+        assert!(held.sky_light.is_empty(), "the holder keeps its own column");
+        assert_eq!(g.get(1, 2).map(|c| c.sky_light.len()), Some(1), "the grid holds the written copy");
+        drop(held);
+        assert!(g.get_mut_by(1, 2, ColumnWriter::Relight).is_some());
+        assert!(g.get_mut_by(9, 9, ColumnWriter::Biomes).is_none(), "absent column");
+        let after = column_copies();
+        assert_eq!((after[biomes] - before[biomes], after[relight] - before[relight]), (1, 0));
     }
 
     #[test]

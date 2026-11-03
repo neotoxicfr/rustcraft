@@ -8,7 +8,7 @@ pub mod heightmap;
 pub use container::{
     ColumnIter, Container, GetMode, is_canonical, longs_for, opt as container_opt, remap_first_seen, values_per_long,
 };
-pub use grid::ChunkGrid;
+pub use grid::{ChunkGrid, ColumnCopies, ColumnWriter, column_copies};
 
 pub const SECTION_BLOCKS: usize = 4096;
 pub const SECTION_BIOMES: usize = 64;

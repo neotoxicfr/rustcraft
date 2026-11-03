@@ -6,6 +6,7 @@
 use rc_physics::piston::{BodyTarget, Moving, carry_stuck, push_collided};
 use rc_sim::{MovingBlock, PistonWorld, ReplayOp, ReplayWorld};
 
+use crate::app_meshing::ChangeOrigin;
 use crate::block_entities::{BlockEntities, PistonTick};
 use crate::{App, GridWorld, entity_motion, environ, world_sounds};
 
@@ -53,12 +54,13 @@ impl App {
         self.fx_level_event(kind, pos, data);
     }
 
-    /// Block placed locally (replay), without prediction.
-    fn piston_set_block(&mut self, p: [i32; 3], state: u32) {
+    /// Block placed locally (replay), without prediction; local relight always.
+    fn piston_set_block(&mut self, p: [i32; 3], state: u32, origin: ChangeOrigin) {
         let (cx, cz) = (p[0] >> 4, p[2] >> 4);
         let sy = (p[1] - self.world.min_y) >> 4;
         let idx = rc_world::block_index((p[0] & 15) as usize, (p[1] & 15) as usize, (p[2] & 15) as usize);
-        self.update_section(cx, cz, sy, &[(idx as u16, state)], |s, t| t.air.get(s as usize).copied().unwrap_or(true));
+        let change = [(idx as u16, state)];
+        self.update_section_lit(cx, cz, sy, &change, |s, t| t.air.get(s as usize).copied().unwrap_or(true), origin);
     }
 
     /// `block_event` of a piston: local replay of the trigger.
@@ -71,7 +73,7 @@ impl App {
         let ops = self.piston_replay.replay(&w, pos, b0, b1);
         for op in ops {
             match op {
-                ReplayOp::Set(p, s) => self.piston_set_block(p, s),
+                ReplayOp::Set(p, s) => self.piston_set_block(p, s, ChangeOrigin::PistonEvent),
                 ReplayOp::Mover(p, m) => self.block_entities.set_mover(p, m),
                 ReplayOp::Destroyed(p, s) => self.on_level_event(2001, p, s as i32, false),
             }
@@ -163,7 +165,7 @@ impl App {
                         height: self.world.height,
                     };
                     if self.phys.is_moving_piston(view.state(pos[0], pos[1], pos[2])) {
-                        self.piston_set_block(pos, moved);
+                        self.piston_set_block(pos, moved, ChangeOrigin::PistonFinish);
                     }
                 }
             }

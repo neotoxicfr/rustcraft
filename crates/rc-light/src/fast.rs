@@ -35,6 +35,7 @@ use std::sync::{Arc, OnceLock};
 use hashbrown::HashMap;
 use rc_world::{Container, Section};
 
+use crate::stats::LevelCounts;
 use crate::{GROUP, LightGrid, LightTables, OPPOSITE, STEP, Touched, nibble, set_nibble};
 
 /// Switches of the new path.
@@ -366,6 +367,8 @@ struct Ctx<'a> {
     height: i32,
     t: &'a LightTables,
     o: Opts,
+    /// Propagation queues counted in `stats` (perf log on), decided once per relight.
+    count_queues: bool,
 }
 
 /// New path of `relight_zones`: block sections in `out[0]`, sky ones in the last
@@ -408,7 +411,7 @@ pub(crate) fn relight_zones(
         _ => None,
     }
     .filter(|s| *s != changes);
-    let c = Ctx { height, t, o };
+    let c = Ctx { height, t, o, count_queues: crate::stats::queues_counted() };
     // Resolutions in order: (changes, block, sky).
     let mut units: Vec<(Vec<[i32; 3]>, bool, bool)> = match sky_changes {
         None => groups(changes).into_iter().map(|g| (g, true, has_sky)).collect(),
@@ -966,8 +969,26 @@ fn compute(
     if !seed(grid, c, z, lay, lane, aux, None, g, r0, ny, sky) {
         return false;
     }
-    propagate(c, z, lay, lane, g, r0, ny);
+    let seeded = queue_lengths(&lane.buckets);
+    if c.count_queues && sabotage(27) {
+        lane.buckets[14].clear();
+    }
+    let queued = propagate(c, z, lay, lane, g, r0, ny);
+    count_queues(c, sky, &seeded, &queued, g, ny);
     true
+}
+
+/// Entries waiting in each level's queue.
+fn queue_lengths(buckets: &[Vec<u64>; 16]) -> LevelCounts {
+    std::array::from_fn(|l| buckets[l].len() as u32)
+}
+
+/// Queues of a resolution added to `stats` when the relight counts them (perf log on).
+fn count_queues(c: &Ctx, sky: bool, seeded: &LevelCounts, queued: &LevelCounts, g: Geo, ny: i32) {
+    if c.count_queues {
+        let cells = (g.size[0] * g.size[2] * ny) as usize;
+        crate::stats::add_queues(sky, seeded, queued, cells);
+    }
 }
 
 /// Starting values and queues: zone sources, margin seeds. `pre`: source heights
@@ -1051,7 +1072,10 @@ fn seed(
     sky || !o.block_early || any != 0
 }
 
-fn propagate(c: &Ctx, z: &Cells, lay: &[u8], lane: &mut Lane, g: Geo, r0: i32, ny: i32) {
+/// Spreads the queues by decreasing level; returns the entries each level held when its turn
+/// came (an entry pushed always has a lower level: the opacity is at least 1), level 1 being
+/// what is left unspread.
+fn propagate(c: &Ctx, z: &Cells, lay: &[u8], lane: &mut Lane, g: Geo, r0: i32, ny: i32) -> LevelCounts {
     let (t, o) = (c.t, c.o);
     let (face, prop) = (z.face, z.prop);
     let Lane { level, buckets, .. } = lane;
@@ -1060,7 +1084,9 @@ fn propagate(c: &Ctx, z: &Cells, lay: &[u8], lane: &mut Lane, g: Geo, r0: i32, n
     let r = g.ring;
     // Bounds (without sentinel ring): cells of the resolution zone, in array indices.
     let (xr, zr, yr) = (r..g.size[0] + r, r..g.size[2] + r, r0 + r..r0 + ny + r);
+    let mut queued = [0u32; 16];
     for l in (2..16usize).rev() {
+        queued[l] = buckets[l].len() as u32;
         while let Some(e) = buckets[l].pop() {
             let i = (e as u32) as usize;
             if level[i] as usize != l {
@@ -1100,6 +1126,8 @@ fn propagate(c: &Ctx, z: &Cells, lay: &[u8], lane: &mut Lane, g: Geo, r0: i32, n
             }
         }
     }
+    queued[1] = buckets[1].len() as u32;
+    queued
 }
 
 /// Changed cells of the interior stack `(dx, dz)`: (height, new value), bottom to top.

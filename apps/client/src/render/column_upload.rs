@@ -320,9 +320,15 @@ impl Renderer {
             Some(prep.unwrap_or_else(|| prepare_legacy(m, crate::remesh::opts().transfree, formats)))
         };
         let sort_all = self.sort_all;
+        let base_version = in_place.as_ref().map(|(v, _)| *v);
         let in_place_plan = prepared.as_ref().and_then(|prepared| {
             in_place_writes(old.as_ref().map(ColumnGpu::slot), prepared, !sort_all && prepared.free, in_place)
         });
+        if let Some(base) = base_version
+            && in_place_plan.is_none()
+        {
+            crate::perf_log::in_place_refused(old.as_ref().is_some_and(|o| o.version != base));
+        }
         let old_slot = old.as_ref().and_then(|o| o.trans_slot);
         if let Some(old) = old
             && in_place_plan.is_none()
@@ -350,7 +356,7 @@ impl Renderer {
         };
         let sent =
             in_place_plan.as_ref().map_or_else(|| prepared.bytes(), |k| k.writes.iter().map(|(.., r)| r.len()).sum());
-        crate::perf_log::upload_bytes(sent, in_place_plan.is_some());
+        crate::perf_log::upload_bytes(sent, prepared.bytes(), in_place_plan.is_some());
         let (fluid_n, trans_n) = (prepared.fluid_len() as u32, prepared.trans_len() as u32);
         let Prepared { faces, counts, fluids: fluid_words, fluid_counts, trans: trans_words, centers, free, .. } =
             prepared;
