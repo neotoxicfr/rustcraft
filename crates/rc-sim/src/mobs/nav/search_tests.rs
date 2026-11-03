@@ -538,7 +538,7 @@ const POSITION_DRAWS: &[PositionDraw] = &[
 /// position and the mob's random source afterwards. With `share`, also checks the mob views built.
 fn draws_with(s: &Server, m: &crate::mobs::mob::Mob, share: bool, home_at: [i32; 3]) -> String {
     super::FORCE_SHARED_DRAW_VIEW.set(Some(share));
-    let to = [m.pos[0] + 9.0, m.pos[1], m.pos[2] - 5.0];
+    let to = [m.pos()[0] + 9.0, m.pos()[1], m.pos()[2] - 5.0];
     let mut m = m.clone();
     let mut out = Vec::new();
     for (name, most_views, draw) in POSITION_DRAWS {

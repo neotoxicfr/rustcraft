@@ -795,7 +795,7 @@ impl Server {
         if id == self.player_id {
             return Some(E::Player);
         }
-        if self.mobs.list.iter().flatten().any(|m| m.alive() && m.id == id) {
+        if self.mobs.list.iter().any(|m| m.alive() && m.id == id) {
             return Some(E::Mob(id));
         }
         if self.life.drops.iter().any(|d| d.id == id) {
