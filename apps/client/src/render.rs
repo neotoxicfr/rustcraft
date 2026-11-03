@@ -112,7 +112,10 @@ struct CameraUniform {
     eye: [f32; 4],
     fog_color: [f32; 4],
     fog: [f32; 4],
-    fog_sky: [f32; 4],
+    fog_sky: [f32; 2],
+    /// Texel size (1 / side) of the main and large block texture arrays
+    /// (`RUSTCRAFT_OPT_ATLASTEXELUNIFORM`); the shaders other than the terrain ignore it.
+    atlas_texel: [f32; 2],
     sky_color: [f32; 4],
     sky_view_proj: [[f32; 4]; 4],
 }
@@ -190,6 +193,12 @@ const INDEXED_FACES: u32 = 1 << 14;
 const FACE_IDS_START: u32 = 1 << 16;
 
 /// Indices of the first `faces` faces: triangles 0-1-2 then 0-2-3 of each, vertices 4f to 4f + 3.
+/// Texel size (1 / side) of a square block texture array of side `side` (0: placeholder array of
+/// side 1), as the camera uniform carries it for the terrain fragments.
+fn texel_size(side: u32) -> f32 {
+    1.0 / side.max(1) as f32
+}
+
 pub(crate) fn face_indices(faces: u32) -> Vec<u16> {
     (0..faces)
         .flat_map(|f| {
@@ -381,6 +390,11 @@ pub struct Renderer {
     pub fade_secs: f64,
     fade: wgpu::Buffer,
     lightmap: wgpu::Texture,
+    /// Same lightmap as 256 RGBA8 words, read by the terrain vertices under
+    /// `RUSTCRAFT_OPT_LIGHTMAPBUFFER` (absent otherwise).
+    lightmap_colors: Option<wgpu::Buffer>,
+    /// Texel size of the two block texture arrays, for the camera uniform.
+    atlas_texel: [f32; 2],
     /// Commands of the last frame and what they depend on: as long as camera, walk and
     /// columns are unchanged, they are identical and reused as is.
     draw_key: Option<DrawKey>,
@@ -513,7 +527,7 @@ impl Renderer {
         let SurfaceSetup { config, can_capture, present_mode, present_modes_caps } =
             configure_surface(&surface, &adapter, &device, &window);
 
-        let shader_opts = crate::terrain_shader::opts();
+        let shader_opts = crate::terrain_shader::opts().within_limits(&device.limits());
         let cameras = upload::Slots::new(
             &device,
             ["camera", "hand camera", "totem animation camera", "interface model camera"],
@@ -558,10 +572,11 @@ impl Renderer {
         let (atlas_view, main_bytes) = block_texture_array(&device, &queue, "block textures", main_size, &main_layers);
         let (big_view, big_bytes) =
             block_texture_array(&device, &queue, "large block textures", big_size.max(1), &big_layers);
+        let atlas_texel = [texel_size(main_size), texel_size(big_size)];
         crate::boot::mark("block textures written (write_texture)");
         let atlas_bytes = main_bytes + big_bytes;
         let sampler = crate::video::atlas_sampler(&device, 4, 1);
-        let camera_layout = camera_layout(&device);
+        let camera_layout = camera_layout(&device, shader_opts.lightmap_buffer);
         // Animation: per texture, (displayed layer | next layer << 16, fade in thousandths).
         let layer_of = |i: u32| remap.get(i as usize).copied().filter(|&l| l != u32::MAX).unwrap_or(0);
         let frames: Vec<[u32; 2]> =
@@ -599,6 +614,15 @@ impl Renderer {
             view_formats: &[],
         });
         let lightmap_view = lightmap.create_view(&Default::default());
+        // Zeroed like the texture until the first computation.
+        let lightmap_colors = shader_opts.lightmap_buffer.then(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("lightmap colours"),
+                size: 256 * 4,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        });
         let lightmap_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("lightmap"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -615,6 +639,7 @@ impl Renderer {
             fade: fade.clone(),
             lightmap: lightmap_view.clone(),
             lightmap_sampler: lightmap_sampler.clone(),
+            lightmap_colors: lightmap_colors.clone(),
             offsets,
             key: (4, 1),
         };
@@ -669,6 +694,8 @@ impl Renderer {
             fade_secs: FADE_SECS,
             fade,
             lightmap,
+            lightmap_colors,
+            atlas_texel,
             draw_key: None,
             lists: lists::Lists::default(),
             drawn_cache: (0, 0),
@@ -978,6 +1005,9 @@ impl Renderer {
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(64), rows_per_image: Some(16) },
             wgpu::Extent3d { width: 16, height: 16, depth_or_array_layers: 1 },
         );
+        if let Some(colors) = &self.lightmap_colors {
+            self.queue.write_buffer(colors, 0, rgba);
+        }
     }
 
     /// Command queue (for sending the glyphs from the app).

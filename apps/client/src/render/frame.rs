@@ -68,7 +68,8 @@ impl Renderer {
             eye: [local.x, local.y, local.z, 0.0],
             fog_color: env.fog.color,
             fog: [env.fog.env_start, env.fog.env_end, env.fog.render_start, env.fog.render_end],
-            fog_sky: [env.fog.sky_end, env.fog.cloud_end, 0.0, 0.0],
+            fog_sky: [env.fog.sky_end, env.fog.cloud_end],
+            atlas_texel: self.atlas_texel,
             sky_color: env.sky,
             sky_view_proj: (proj * sky_view).to_cols_array_2d(),
         };

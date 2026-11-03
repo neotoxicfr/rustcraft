@@ -92,6 +92,8 @@ pub struct TerrainRes {
     pub fade: wgpu::Buffer,
     pub lightmap: wgpu::TextureView,
     pub lightmap_sampler: wgpu::Sampler,
+    /// Same lightmap as 256 RGBA8 words (binding 10), with `RUSTCRAFT_OPT_LIGHTMAPBUFFER` only.
+    pub lightmap_colors: Option<wgpu::Buffer>,
     /// Model offsets of the compact faces (binding 9).
     pub offsets: wgpu::Buffer,
     /// Mip levels and anisotropy of the sampler in place.
@@ -107,22 +109,22 @@ impl TerrainRes {
         sampler: &wgpu::Sampler,
     ) -> wgpu::BindGroup {
         use wgpu::BindingResource as R;
-        device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: camera },
-                wgpu::BindGroupEntry { binding: 1, resource: self.quads.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: R::TextureView(&self.atlas) },
-                wgpu::BindGroupEntry { binding: 3, resource: R::Sampler(sampler) },
-                wgpu::BindGroupEntry { binding: 4, resource: self.anim.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 5, resource: R::TextureView(&self.big) },
-                wgpu::BindGroupEntry { binding: 6, resource: self.fade.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 7, resource: R::TextureView(&self.lightmap) },
-                wgpu::BindGroupEntry { binding: 8, resource: R::Sampler(&self.lightmap_sampler) },
-                wgpu::BindGroupEntry { binding: 9, resource: self.offsets.as_entire_binding() },
-            ],
-        })
+        let mut entries = vec![
+            wgpu::BindGroupEntry { binding: 0, resource: camera },
+            wgpu::BindGroupEntry { binding: 1, resource: self.quads.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: R::TextureView(&self.atlas) },
+            wgpu::BindGroupEntry { binding: 3, resource: R::Sampler(sampler) },
+            wgpu::BindGroupEntry { binding: 4, resource: self.anim.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: R::TextureView(&self.big) },
+            wgpu::BindGroupEntry { binding: 6, resource: self.fade.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 7, resource: R::TextureView(&self.lightmap) },
+            wgpu::BindGroupEntry { binding: 8, resource: R::Sampler(&self.lightmap_sampler) },
+            wgpu::BindGroupEntry { binding: 9, resource: self.offsets.as_entire_binding() },
+        ];
+        if let Some(colors) = &self.lightmap_colors {
+            entries.push(wgpu::BindGroupEntry { binding: 10, resource: colors.as_entire_binding() });
+        }
+        device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.layout, entries: &entries })
     }
 }
 
