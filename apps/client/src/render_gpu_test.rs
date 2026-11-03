@@ -18,8 +18,12 @@
 #[path = "../../../crates/rc-mesh/tests/common/mod.rs"]
 mod common;
 
+use super::pipelines::{QuadGpu, instance_layout, quad_gpu};
+use super::terrain_draw::indexed_args;
 use super::*;
 use crate::terrain_shader::{FADE_RING, ShaderOpts};
+use glam::Vec4;
+use rc_mesh::blocks::BlockMesh;
 use rc_mesh::fluid::{DOUBLE_FACE, FluidQuad, back_face};
 use wgpu::util::DeviceExt;
 

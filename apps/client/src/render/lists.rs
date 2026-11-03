@@ -13,7 +13,11 @@ use std::sync::OnceLock;
 use glam::{Vec3, Vec4};
 use hashbrown::HashMap;
 
-use super::{BUCKETS, Batch, ColumnGpu, DrawArgs, TRANS_KEY, aabb_inside, aabb_visible, facing};
+use rc_mesh::blocks::BUCKETS;
+
+use super::column_upload::ColumnGpu;
+use super::frustum::{aabb_inside, aabb_visible, facing};
+use super::{Batch, DrawArgs, TRANS_KEY};
 
 fn switch(cell: &'static OnceLock<bool>, name: &str) -> bool {
     *cell.get_or_init(|| {
