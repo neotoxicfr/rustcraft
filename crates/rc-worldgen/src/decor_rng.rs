@@ -160,32 +160,3 @@ impl DecoRng {
         }
     }
 }
-
-/// The game's sine table (65 536 single floats).
-pub struct SinTable(Box<[f32; 65536]>);
-
-impl SinTable {
-    pub fn new() -> Self {
-        let mut t = Box::new([0f32; 65536]);
-        for (i, v) in t.iter_mut().enumerate() {
-            *v = (i as f64 / 10430.378350470453).sin() as f32;
-        }
-        SinTable(t)
-    }
-
-    #[inline]
-    pub fn sin(&self, x: f64) -> f32 {
-        self.0[((x * 10430.378350470453) as i64 & 65535) as usize]
-    }
-
-    #[inline]
-    pub fn cos(&self, x: f64) -> f32 {
-        self.0[((x * 10430.378350470453 + 16384.0) as i64 & 65535) as usize]
-    }
-}
-
-impl Default for SinTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}

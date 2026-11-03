@@ -8,7 +8,7 @@ use crate::decor_region::{BeData, Hm, Region, add};
 use crate::decor_rng::DecoRng;
 use crate::decor_rules::{Kind, can_survive};
 use crate::feature::{BlockColumn, Disk, Lake, Ore, Spring};
-use crate::math::round_half_up;
+use rc_data::java_math::round_f32_to_i32;
 
 /// Identical fluid states (type, source, level, falling).
 pub fn same_fluid(b: &Blocks, a: State, c: State) -> bool {
@@ -170,7 +170,7 @@ pub fn ore(cx: &mut Ctx, o: &Ore, rng: &mut DecoRng, p: [i32; 3]) -> bool {
         let yy = y0 + st * (y1 - y0);
         let zz = z0 + st * (z1 - z0);
         let ss = rng.next_double() * f64::from(size) / 16.0;
-        let rad = ((f64::from(cx.d.sin.sin(f64::from(std::f32::consts::PI * step))) + 1.0) * ss + 1.0) / 2.0;
+        let rad = ((f64::from(rc_data::java_math::sin(f64::from(std::f32::consts::PI * step))) + 1.0) * ss + 1.0) / 2.0;
         data[i * 4] = xx;
         data[i * 4 + 1] = yy;
         data[i * 4 + 2] = zz;
@@ -294,7 +294,7 @@ pub fn scattered_ore(cx: &mut Ctx, o: &Ore, rng: &mut DecoRng, p: [i32; 3]) -> b
         for v in &mut off {
             let a = rng.next_float();
             let c = rng.next_float();
-            *v = round_half_up((a - c) * m);
+            *v = round_f32_to_i32((a - c) * m);
         }
         let q = [p[0] + off[0], p[1] + off[1], p[2] + off[2]];
         let cur = r.get_p(q);

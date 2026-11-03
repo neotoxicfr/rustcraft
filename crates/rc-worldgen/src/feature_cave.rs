@@ -365,8 +365,8 @@ fn circle_embedded(cx: &Ctx, c: [i32; 3], radius: i32) -> bool {
     let mut a = 0.0f32;
     let two_pi = (std::f64::consts::PI * 2.0) as f32;
     while a < two_pi {
-        let dx = (cx.d.sin.cos(f64::from(a)) * radius as f32) as i32;
-        let dz = (cx.d.sin.sin(f64::from(a)) * radius as f32) as i32;
+        let dx = (rc_data::java_math::cos(f64::from(a)) * radius as f32) as i32;
+        let dz = (rc_data::java_math::sin(f64::from(a)) * radius as f32) as i32;
         if empty_water_lava(b, r.get(c[0] + dx, c[1], c[2] + dz)) {
             return false;
         }
@@ -407,8 +407,8 @@ pub fn large_dripstone(cx: &mut Ctx, s: &LargeDripstone, rng: &mut DecoRng, o: [
     let wind = if suitable(&top) && suitable(&bottom) {
         let speed = s.wind_speed.sample(rng);
         let dir = rng.next_float() * std::f32::consts::PI;
-        let vx = f64::from(cx.d.sin.cos(f64::from(dir)) * speed);
-        let vz = f64::from(cx.d.sin.sin(f64::from(dir)) * speed);
+        let vx = f64::from(rc_data::java_math::cos(f64::from(dir)) * speed);
+        let vz = f64::from(rc_data::java_math::sin(f64::from(dir)) * speed);
         Wind { origin_y: o[1], speed: Some((vx, vz)), max: 16 - radius }
     } else {
         Wind { origin_y: 0, speed: None, max: 0 }
