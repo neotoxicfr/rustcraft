@@ -41,22 +41,22 @@ fn net_id(s: &Server, e: Ent) -> i32 {
 /// Side heads at 1.3 blocks on either side of the body (index 3 ≡ index 1).
 pub fn head_x(m: &Mob, i: i32) -> f64 {
     if i <= 0 {
-        return m.pos[0];
+        return m.pos()[0];
     }
     let a = (m.body_yaw + (180 * (i - 1)) as f32) * mth::DEG;
-    m.pos[0] + f64::from(mth::cos(a)) * 1.3
+    m.pos()[0] + f64::from(mth::cos(a)) * 1.3
 }
 
 pub fn head_y(m: &Mob, i: i32) -> f64 {
-    m.pos[1] + f64::from(if i <= 0 { 3.0f32 } else { 2.2f32 })
+    m.pos()[1] + f64::from(if i <= 0 { 3.0f32 } else { 2.2f32 })
 }
 
 pub fn head_z(m: &Mob, i: i32) -> f64 {
     if i <= 0 {
-        return m.pos[2];
+        return m.pos()[2];
     }
     let a = (m.body_yaw + (180 * (i - 1)) as f32) * mth::DEG;
-    m.pos[2] + f64::from(mth::sin(a)) * 1.3
+    m.pos()[2] + f64::from(mth::sin(a)) * 1.3
 }
 
 /// A float draw between two bounds.
@@ -79,12 +79,12 @@ pub fn pre_ai_step(s: &Server, m: &mut Mob) {
     let mut v = [m.vel[0], m.vel[1] * 0.6, m.vel[2]];
     if let Some(p) = ent_of(s, m.wither.targets[0]).and_then(|e| s.ent_pos(e)) {
         let mut yd = v[1];
-        if m.pos[1] < p[1] || (!powered(m) && m.pos[1] < p[1] + 5.0) {
+        if m.pos()[1] < p[1] || (!powered(m) && m.pos()[1] < p[1] + 5.0) {
             yd = yd.max(0.0);
             yd += 0.3 - yd * f64::from(0.6f32);
         }
         v[1] = yd;
-        let (dx, dz) = (p[0] - m.pos[0], p[2] - m.pos[2]);
+        let (dx, dz) = (p[0] - m.pos()[0], p[2] - m.pos()[2]);
         if dx * dx + dz * dz > 9.0 {
             let n = crate::mobs::mth::normalize([dx, 0.0, dz]);
             let (nx, nz) = (n[0], n[2]);
@@ -151,7 +151,7 @@ pub fn custom_ai_step(s: &mut Server, m: &mut Mob) {
         let n = m.wither.inv - 1;
         set_progress(s, m, 1.0 - n as f32 / INVULNERABLE_TICKS as f32);
         if n <= 0 {
-            let c = [m.pos[0], m.eye_y(), m.pos[2]];
+            let c = [m.pos()[0], m.eye_y(), m.pos()[2]];
             s.explode_core(Some(m), Some(Ent::Mob(m.id)), Some(m.id), c, 7.0, false, "minecraft:player_explosion");
             if !silent(m) {
                 s.global_level_event(1023, m.block_pos(), 0);
@@ -187,9 +187,10 @@ fn side_heads(s: &mut Server, m: &mut Mob) {
             let idle = m.wither.idle_head_updates[i - 1];
             m.wither.idle_head_updates[i - 1] += 1;
             if idle > 15 {
-                let xt = next_double(&mut m.rng, m.pos[0] - 10.0, m.pos[0] + 10.0);
-                let yt = next_double(&mut m.rng, m.pos[1] - 5.0, m.pos[1] + 5.0);
-                let zt = next_double(&mut m.rng, m.pos[2] - 10.0, m.pos[2] + 10.0);
+                let p = m.pos();
+                let xt = next_double(&mut m.rng, p[0] - 10.0, p[0] + 10.0);
+                let yt = next_double(&mut m.rng, p[1] - 5.0, p[1] + 5.0);
+                let zt = next_double(&mut m.rng, p[2] - 10.0, p[2] + 10.0);
                 // Quirk of the game: the side heads shoot from indices 2 and 3
                 // (index 3 falls back onto head 1's position).
                 shoot(s, m, i as i32 + 1, [xt, yt, zt], true);
@@ -201,7 +202,7 @@ fn side_heads(s: &mut Server, m: &mut Mob) {
             let cur = ent_of(s, head_target);
             let ok = cur.is_some_and(|c| {
                 s.targeting_ok(m, c, true, 0.0, false, false)
-                    && s.ent_pos(c).is_some_and(|p| mth::dist2(m.pos, p) <= 900.0)
+                    && s.ent_pos(c).is_some_and(|p| mth::dist2(m.pos(), p) <= 900.0)
                     && s.line_of_sight(m, c)
             });
             match cur.filter(|_| ok) {
@@ -410,7 +411,7 @@ impl Server {
         let v = [r.next_double() * 0.2 - 0.1, 0.2, r.next_double() * 0.2 - 0.1];
         let star = Stack { id: "minecraft:nether_star".into(), count: 1, components: None };
         let before = self.life.drops.len();
-        self.spawn_item(m.pos, v, star, 10);
+        self.spawn_item(m.pos(), v, star, 10);
         if self.life.drops.len() > before
             && let Some(d) = self.life.drops.last_mut()
         {
@@ -423,7 +424,7 @@ impl Server {
     /// rule, empty cell, support), otherwise dropped.
     pub(crate) fn wither_rose_mob(&mut self, m: &Mob) {
         if self.wither_credit(m.last_hurt_by_mob, m.last_hurt_by_player > 0) {
-            self.wither_rose_at(m.pos);
+            self.wither_rose_at(m.pos());
         }
     }
 

@@ -730,7 +730,7 @@ impl Server {
             let mut full = ent.clone();
             nbtio::set(&mut full, "Pos", Nbt::List(pos.iter().map(|&v| Nbt::Double(v)).collect()));
             self.load_mob(&mut m, &full);
-            m.pos = pos;
+            m.set_pos(pos);
             m.old = pos;
             m.yaw = super::mth::wrap(yaw);
             m.pitch = 0.0;
@@ -872,8 +872,8 @@ impl Server {
             .mobs
             .iter()
             .filter_map(|u| self.mobs.get_uuid(*u))
-            .filter(|m| m.alive() && dist2(m.pos, c) <= r2)
-            .map(|m| (m.pos, f64::from(m.kind.info().height)))
+            .filter(|m| m.alive() && dist2(m.pos(), c) <= r2)
+            .map(|m| (m.pos(), f64::from(m.kind.info().height)))
             .collect();
         let use_mobs = self.mobs.rng.next_bool();
         let pool: Vec<([f64; 3], f64)> = if use_mobs { mobs } else { near.iter().map(|s| (s.pos, 1.8)).collect() };

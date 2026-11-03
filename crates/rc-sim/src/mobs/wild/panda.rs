@@ -524,7 +524,7 @@ impl Server {
 
     /// Closest player within 8 blocks (of the breeding goal).
     pub(crate) fn panda_near_player(&self, m: &mut Mob) -> Option<Ent> {
-        (dist2(m.pos, self.pos) <= 64.0 && self.targeting_ok(m, Ent::Player, false, 8.0, false, true))
+        (dist2(m.pos(), self.pos) <= 64.0 && self.targeting_ok(m, Ent::Player, false, 8.0, false, true))
             .then_some(Ent::Player)
     }
 }

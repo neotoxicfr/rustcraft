@@ -80,7 +80,7 @@ impl Server {
             Ent::Mob(id) => {
                 let Some(i) = self.mob_index(id) else { return false };
                 let Some(mut m) = self.mobs.list.take(i) else { return false };
-                let src = [m.pos[0] + kb.0, m.pos[1], m.pos[2] + kb.1];
+                let src = [m.pos()[0] + kb.0, m.pos()[1], m.pos()[2] + kb.1];
                 let r = self.mob_hurt_dir(&mut m, ty, amount, by, Some(src), Some(kb));
                 self.mobs.list.put(i, m);
                 r
@@ -419,7 +419,7 @@ impl Server {
                         // F07: the witch hit by her own potion takes nothing (the hit
                         // counts: animation, invulnerability).
                         let own = m.kind == Kind::Witch && causing == Some(t);
-                        let dir = origin.map(|o| (o[0] - m.pos[0], o[2] - m.pos[2]));
+                        let dir = origin.map(|o| (o[0] - m.pos()[0], o[2] - m.pos()[2]));
                         let amt = if own { 0.0 } else { n as f32 };
                         self.mob_hurt_dir(&mut m, ty, amt, causing, origin, dir);
                         self.mobs.list.put(i, m);
@@ -526,7 +526,7 @@ impl Server {
                 let at = if self.dims.home.is_some() { self.dims.home_pos } else { self.pos };
                 [at[0], at[1] + self.player_eye_h(), at[2]]
             }
-            Ent::Mob(id) => self.mob_ref(id).map_or(p.pos, |m| [m.pos[0], m.eye_y(), m.pos[2]]),
+            Ent::Mob(id) => self.mob_ref(id).map_or(p.pos, |m| [m.pos()[0], m.eye_y(), m.pos()[2]]),
         };
         if let Ent::Mob(id) = o {
             let w = self.mob_ref(id).map_or(0.6, |m| f64::from(m.width()));
@@ -1188,7 +1188,7 @@ impl Server {
         let mut out = Vec::new();
         for m in self.mobs.list.iter() {
             if m.alive() && !m.removed && m.touches(area) {
-                out.push((Ent::Mob(m.id), m.pos));
+                out.push((Ent::Mob(m.id), m.pos()));
             }
         }
         if self.ent_alive(Ent::Player) && self.game_mode != 3 && self.player_aabb().intersects(area) {

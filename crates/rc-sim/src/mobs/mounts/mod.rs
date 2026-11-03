@@ -980,12 +980,12 @@ fn follow_mommy(s: &mut Server, m: &mut Mob) {
         if o.id == m.id || !handles(o.kind) || !o.mount.flag(FLAG_BRED) || !o.alive() {
             continue;
         }
-        if !o.touches(&area) || super::mth::dist2(m.pos, o.pos) > 256.0 {
+        if !o.touches(&area) || super::mth::dist2(m.pos(), o.pos()) > 256.0 {
             continue;
         }
-        let d = super::mth::dist2(m.pos, o.pos);
+        let d = super::mth::dist2(m.pos(), o.pos());
         if best.is_none_or(|b| d < b.0) {
-            best = Some((d, o.pos));
+            best = Some((d, o.pos()));
         }
     }
     // Path computed then thrown away (the game does not follow it): only the navigation state changes.
@@ -1037,7 +1037,7 @@ impl Server {
     pub(crate) fn mount_spawn_at(&mut self, m: &Mob, s: Stack) {
         let r = &mut self.mobs.rng;
         let v = [r.next_double() * 0.2 - 0.1, 0.2, r.next_double() * 0.2 - 0.1];
-        self.spawn_item(m.pos, v, s, 10);
+        self.spawn_item(m.pos(), v, s, 10);
     }
 }
 

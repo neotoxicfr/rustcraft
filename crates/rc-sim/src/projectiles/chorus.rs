@@ -60,10 +60,10 @@ impl Server {
     pub(crate) fn chorus_teleport_mob(&mut self, m: &mut crate::mobs::mob::Mob, diameter: f64, trail: bool) -> bool {
         let (min_y, max_y) = self.chorus_bounds();
         for _ in 0..16 {
-            let xx = m.pos[0] + (m.rng.next_double() - 0.5) * diameter;
-            let yy = (m.pos[1] + (m.rng.next_double() - 0.5) * diameter).clamp(min_y, max_y);
-            let zz = m.pos[2] + (m.rng.next_double() - 0.5) * diameter;
-            let old = m.pos;
+            let xx = m.pos()[0] + (m.rng.next_double() - 0.5) * diameter;
+            let yy = (m.pos()[1] + (m.rng.next_double() - 0.5) * diameter).clamp(min_y, max_y);
+            let zz = m.pos()[2] + (m.rng.next_double() - 0.5) * diameter;
+            let old = m.pos();
             if self.mob_random_teleport(m, [xx, yy, zz], "minecraft:consumable_does_not_teleport_to") {
                 self.mob_event(m, 46);
                 self.game_event_at("minecraft:teleport", old, Some(crate::mobs::mob::Ent::Mob(m.id)));
@@ -72,9 +72,9 @@ impl Server {
                 } else {
                     ("minecraft:item.chorus_fruit.teleport", 7)
                 };
-                self.play_sound(snd, cat, m.pos, 1.0, 1.0);
+                self.play_sound(snd, cat, m.pos(), 1.0, 1.0);
                 if trail {
-                    self.chorus_trail(old, m.pos);
+                    self.chorus_trail(old, m.pos());
                 }
                 m.fall_distance = 0.0;
                 return true;

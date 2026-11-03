@@ -744,8 +744,8 @@ impl Server {
                     if let Some(rk) = rider {
                         let mut rm = self.new_mob(rk, [0.0; 3], 0.0);
                         self.raid_join(id, wave, &mut rm, Some(pos), false);
-                        rm.pos = [f64::from(pos[0]) + 0.5, f64::from(pos[1]), f64::from(pos[2]) + 0.5];
-                        rm.old = rm.pos;
+                        rm.set_pos([f64::from(pos[0]) + 0.5, f64::from(pos[1]), f64::from(pos[2]) + 0.5]);
+                        rm.old = rm.pos();
                         rm.yaw = 0.0;
                         self.mob_start_riding(&mut rm, &mut m, false);
                         self.add_mob(m);
@@ -799,8 +799,8 @@ impl Server {
         m.ill.can_join_raid = true;
         m.ill.ticks_outside_raid = 0;
         if !exists && let Some(p) = pos {
-            m.pos = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 1.0, f64::from(p[2]) + 0.5];
-            m.old = m.pos;
+            m.set_pos([f64::from(p[0]) + 0.5, f64::from(p[1]) + 1.0, f64::from(p[2]) + 0.5]);
+            m.old = m.pos();
             let mut g = Group::default();
             self.finalize_spawn(m, Reason::Event, &mut g);
             self.raid_buffs(id, wave, m);
@@ -1129,7 +1129,7 @@ impl Server {
         if let Some(cur) = m.equipment[5].clone()
             && (m.rng.next_float() - 0.1).max(0.0) < m.drop_chance[5]
         {
-            let pos = m.pos;
+            let pos = m.pos();
             let r = &mut self.mobs.rng;
             let v = [r.next_double() * 0.2 - 0.1, 0.2, r.next_double() * 0.2 - 0.1];
             self.spawn_item(pos, v, cur, 10);
@@ -1164,7 +1164,7 @@ impl Server {
         for i in 0..(path.next + 2).min(path.nodes.len()) {
             let n = path.nodes[i].0;
             let p = [n[0], n[1] + 1, n[2]];
-            let d = (f64::from(p[0]) - m.pos[0]).powi(2) + (f64::from(p[2]) - m.pos[2]).powi(2);
+            let d = (f64::from(p[0]) - m.pos()[0]).powi(2) + (f64::from(p[2]) - m.pos()[2]).powi(2);
             if d <= 2.25 && self.wooden_door(p) {
                 found = Some(p);
                 break;

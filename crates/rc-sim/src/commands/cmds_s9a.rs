@@ -526,7 +526,7 @@ impl Server {
                 veh.mount.passengers.push(Ent::Player);
                 let rank = veh.mount.passengers.len() - 1;
                 let seat = self.seat_of(&veh, rank, None);
-                self.mobs.mounts.riding.last_good = veh.pos;
+                self.mobs.mounts.riding.last_good = veh.pos();
                 self.teleport_to(seat);
                 self.last_good = seat;
                 true

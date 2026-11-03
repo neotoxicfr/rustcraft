@@ -124,7 +124,7 @@ pub fn random_move_tick(m: &mut Mob) {
 /// Flee: in water, aggressor known within 10 blocks.
 pub fn flee_can_use(s: &Server, m: &Mob) -> bool {
     let Some((e, _)) = m.last_hurt_by_mob else { return false };
-    m.in_water && s.ent_pos(e).is_some_and(|p| super::super::mth::dist2(m.pos, p) < 100.0)
+    m.in_water && s.ent_pos(e).is_some_and(|p| super::super::mth::dist2(m.pos(), p) < 100.0)
 }
 
 /// Tick of the squid's flee goal: vector opposite to the aggressor (never normalized: the result of the
@@ -132,8 +132,8 @@ pub fn flee_can_use(s: &Server, m: &Mob) -> bool {
 pub fn flee_tick(s: &Server, m: &mut Mob) {
     let Some((e, _)) = m.last_hurt_by_mob else { return };
     let Some(a) = s.ent_pos(e) else { return };
-    let mut to = [m.pos[0] - a[0], m.pos[1] - a[1], m.pos[2] - a[2]];
-    let p = super::super::mth::block_of([m.pos[0] + to[0], m.pos[1] + to[1], m.pos[2] + to[2]]);
+    let mut to = [m.pos()[0] - a[0], m.pos()[1] - a[1], m.pos()[2] - a[2]];
+    let p = super::super::mth::block_of([m.pos()[0] + to[0], m.pos()[1] + to[1], m.pos()[2] + to[2]]);
     let water = s.mob_fluid(p) == super::super::env::Fluid::Water;
     let air = s.is_air(p);
     if water || air {
@@ -170,7 +170,7 @@ pub fn spawn_ink(s: &mut Server, m: &mut Mob) {
     let snd = if m.kind == Kind::GlowSquid { "minecraft:entity.glow_squid.squirt" } else { "minecraft:entity.squid.squirt" };
     s.make_sound(m, snd);
     let base = rotate(m, [0.0, -1.0, 0.0]);
-    let pos = [base[0] + m.pos[0], base[1] + m.pos[1] + 0.5, base[2] + m.pos[2]];
+    let pos = [base[0] + m.pos()[0], base[1] + m.pos()[1] + 0.5, base[2] + m.pos()[2]];
     let name = if m.kind == Kind::GlowSquid { "minecraft:glow_squid_ink" } else { "minecraft:squid_ink" };
     let off = if m.is_baby() { 0.1f32 } else { 0.3 };
     for _ in 0..30 {

@@ -132,7 +132,7 @@ pub fn imitate_nearby(s: &mut Server, who: &Imitator) -> bool {
 pub fn pre_ai_step(s: &mut Server, m: &mut Mob) {
     if s.mobs.rng.next_int_bound(400) == 0 {
         let who = Imitator {
-            center: m.pos,
+            center: m.pos(),
             bbox: m.bbox(),
             alive: m.alive(),
             silent: super::super::end::silent(m),
@@ -179,7 +179,7 @@ pub fn move_control(m: &mut Mob) {
         m.move_ctl.op = MoveOp::Wait;
         m.surf.no_gravity = true;
         let w = m.move_ctl.wanted;
-        let (xd, yd, zd) = (w[0] - m.pos[0], w[1] - m.pos[1], w[2] - m.pos[2]);
+        let (xd, yd, zd) = (w[0] - m.pos()[0], w[1] - m.pos()[1], w[2] - m.pos()[2]);
         let dd = xd * xd + yd * yd + zd * zd;
         if dd < f64::from(2.500_000_3e-7f32) {
             m.yya = 0.0;
@@ -256,7 +256,7 @@ pub fn panic_tick(s: &mut Server, m: &mut Mob) {
     if m.sitting || !owner_here {
         return;
     }
-    if mth::dist2(m.pos, s.pos) >= 144.0 {
+    if mth::dist2(m.pos(), s.pos) >= 144.0 {
         s.teleport_to_owner_pub(m);
     }
 }
@@ -351,8 +351,8 @@ pub fn remove_from_shoulders(s: &mut Server) {
         m.id = id;
         m.tame = true;
         m.owner = Some(s.uuid);
-        m.pos = [s.pos[0], s.pos[1] + f64::from(0.7f32), s.pos[2]];
-        m.old = m.pos;
+        m.set_pos([s.pos[0], s.pos[1] + f64::from(0.7f32), s.pos[2]]);
+        m.old = m.pos();
         s.init_mob(&mut m);
         s.add_mob(m);
     }

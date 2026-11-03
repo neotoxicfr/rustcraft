@@ -390,7 +390,7 @@ impl Server {
     fn side_pos(&self, s: &Side<'_>) -> [f64; 3] {
         match s {
             Side::Player => self.pos,
-            Side::Mob(m) => m.pos,
+            Side::Mob(m) => m.pos(),
             Side::Other(_, p) => *p,
             Side::Itself => unreachable!("resolved to the victim by Hit::side"),
         }
@@ -450,7 +450,7 @@ impl Server {
                 let dmg = self.life.rng.next_float() * (hi - lo) + lo;
                 match src {
                     Some(Side::Mob(o)) => {
-                        let kb = (o.pos[0] - self.pos[0], o.pos[2] - self.pos[2]);
+                        let kb = (o.pos()[0] - self.pos[0], o.pos()[2] - self.pos[2]);
                         self.player_hurt_by_mob(o, &ty, dmg, Some(kb));
                     }
                     _ => {
@@ -465,7 +465,7 @@ impl Server {
                     Some(Side::Mob(o)) => {
                         let o: &Mob = o;
                         self.ghost_push(o);
-                        self.mob_hurt(m, &ty, dmg, Some(Ent::Mob(o.id)), Some(o.pos));
+                        self.mob_hurt(m, &ty, dmg, Some(Ent::Mob(o.id)), Some(o.pos()));
                         self.ghost_pop();
                     }
                     _ => {
@@ -565,7 +565,7 @@ impl Server {
                     return;
                 }
                 let (v, p) = (sample(&e["volume"], &mut m.rng), sample(&e["pitch"], &mut m.rng));
-                (m.pos, Self::mob_sound_source(m), v, p)
+                (m.pos(), Self::mob_sound_source(m), v, p)
             }
             _ => return,
         };

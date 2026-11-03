@@ -808,7 +808,7 @@ fn bench_crowd() {
         let mut acc = 0.0;
         for _ in 0..reps {
             for &id in &ids {
-                acc += std::hint::black_box(&s).mob_ref(std::hint::black_box(id)).map_or(0.0, |m| m.pos[0]);
+                acc += std::hint::black_box(&s).mob_ref(std::hint::black_box(id)).map_or(0.0, |m| m.pos()[0]);
             }
         }
         let ns = t.elapsed().as_secs_f64() * 1e9 / (reps * ids.len()) as f64;

@@ -59,7 +59,7 @@ fn piglin_picks_up_every_wanted_pile_in_one_tick() {
         .expect("piglin summoned");
     let mut m = s.mobs.list.take(i).unwrap();
     m.can_pickup = true;
-    let p = m.pos;
+    let p = m.pos();
     for dx in [-0.5, 0.0, 0.5] {
         s.spawn_item([p[0] + dx, p[1] + 0.2, p[2]], [0.0; 3], stack("minecraft:gold_nugget", 10), 0);
     }

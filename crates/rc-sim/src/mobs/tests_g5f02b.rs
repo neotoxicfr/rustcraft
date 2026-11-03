@@ -46,7 +46,7 @@ fn sounds_draw_nothing_from_world_random() {
     let mut before = p.s.mobs.rng;
     p.s.mob_sound(&m, "minecraft:entity.zombie.ambient", 1.0, 1.0);
     p.s.entity_sound(m.id, "minecraft:entity.zombie.ambient", 5, 1.0, 1.0);
-    p.s.world_sound("minecraft:entity.zombie.ambient", 5, m.pos, 1.0, 1.0);
+    p.s.world_sound("minecraft:entity.zombie.ambient", 5, m.pos(), 1.0, 1.0);
     assert_eq!(p.s.mobs.rng.next_long(), before.next_long(), "world random advanced by a sound");
     assert!(!p.take_events().is_empty(), "no sound sent");
     cleanup(p, dir);
@@ -155,7 +155,7 @@ fn farmland_trampled() {
         m.vel = [0.0, -0.3, 0.0];
         p.s.mob_move(&mut m, [0.0, -0.3, 0.0]);
         assert!(m.on_ground, "{k:?} not landed");
-        (state_string(&p.s, p.s.get([x, -60, 210])), m.pos[1], m.id)
+        (state_string(&p.s, p.s.get([x, -60, 210])), m.pos()[1], m.id)
     };
     let (st, y, id) = fall(&mut p, Kind::Zombie, 205);
     assert_eq!(st, "minecraft:dirt", "zombie");
@@ -309,7 +309,7 @@ fn egg_chicks_refitted() {
         crate::projectiles::Proj::new(crate::projectiles::PKind::Egg, 900_000, pos, item)
     };
     let chickens = |p: &Probe| {
-        p.s.mobs.list.iter().filter(|m| m.kind == Kind::Chicken).map(|m| (m.pos, m.dims_wh().1)).collect::<Vec<_>>()
+        p.s.mobs.list.iter().filter(|m| m.kind == Kind::Chicken).map(|m| (m.pos(), m.dims_wh().1)).collect::<Vec<_>>()
     };
     p.run("setblock 210 -55 210 minecraft:stone");
     p.s.egg_chickens(&egg([210.5, -55.0, 210.5]), 1);
@@ -334,12 +334,12 @@ fn frog_refitted_from_tadpole() {
     p.run("fill 211 -59 205 211 -55 215 minecraft:stone");
     let mut t = mob(&mut p, Kind::Tadpole, [210.5, -59.0, 210.5]);
     let (tw, _) = t.dims_wh();
-    t.pos[0] = 211.0 - f64::from(tw) / 2.0 - 0.001;
+    t.set_pos_axis(0, 211.0 - f64::from(tw) / 2.0 - 0.001);
     super::brainy::frog::grow_up(&mut p.s, &mut t);
     let f = p.s.mobs.list.iter().find(|m| m.kind == Kind::Frog).expect("frog");
     let (fw, _) = f.dims_wh();
-    assert!((f.pos[0] - (211.0 - f64::from(fw) / 2.0)).abs() < 1.0e-6, "x = {}", f.pos[0]);
-    assert!((f.pos[1] + 59.0).abs() < 1.0e-5, "y = {}", f.pos[1]);
+    assert!((f.pos()[0] - (211.0 - f64::from(fw) / 2.0)).abs() < 1.0e-6, "x = {}", f.pos()[0]);
+    assert!((f.pos()[1] + 59.0).abs() < 1.0e-5, "y = {}", f.pos()[1]);
     cleanup(p, dir);
 }
 
@@ -486,22 +486,22 @@ fn refit_after_growth() {
     let mut z = mob(&mut p, Kind::Zombie, [210.5, -59.0, 210.5]);
     z.baby = true;
     let (bw, bh) = z.dims_wh();
-    z.pos[0] = 211.0 - f64::from(bw) / 2.0 - 0.01;
-    let x0 = z.pos[0];
+    z.set_pos_axis(0, 211.0 - f64::from(bw) / 2.0 - 0.01);
+    let x0 = z.pos()[0];
     p.s.mob_refit(&mut z);
-    assert_eq!(z.pos[0], x0, "first reading: no refit");
+    assert_eq!(z.pos()[0], x0, "first reading: no refit");
     assert_eq!(z.body_fx.dims, Some((bw, bh)));
     z.baby = false;
     let (w, _) = z.dims_wh();
     assert!(w > bw);
     p.s.mob_refit(&mut z);
-    assert!((z.pos[0] - (211.0 - f64::from(w) / 2.0)).abs() < 1e-6, "x = {}", z.pos[0]);
-    assert!((z.pos[1] + 59.0).abs() < 1e-5, "y = {}", z.pos[1]);
+    assert!((z.pos()[0] - (211.0 - f64::from(w) / 2.0)).abs() < 1e-6, "x = {}", z.pos()[0]);
+    assert!((z.pos()[1] + 59.0).abs() < 1e-5, "y = {}", z.pos()[1]);
     // Shrinking moves nothing.
-    let before = z.pos;
+    let before = z.pos();
     z.baby = true;
     p.s.mob_refit(&mut z);
-    assert_eq!(z.pos, before);
+    assert_eq!(z.pos(), before);
     cleanup(p, dir);
 }
 

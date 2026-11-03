@@ -423,8 +423,8 @@ impl Server {
         }
         m.mount.vehicle = Some(c.id);
         c.passengers.push(Ent::Mob(m.id));
-        m.pos = Self::cart_seat(c, Some(m));
-        m.old = m.pos;
+        m.set_pos(Self::cart_seat(c, Some(m)));
+        m.old = m.pos();
         self.game_event_src("minecraft:entity_mount", c.pos, Some(Src::Living(Ent::Mob(m.id))), None);
         true
     }
@@ -450,8 +450,8 @@ impl Server {
                 Some((i, mut m)) => {
                     m.mount.vehicle = Some(c.id);
                     c.passengers.push(Ent::Mob(m.id));
-                    m.pos = Self::cart_seat(&c, Some(&m));
-                    m.old = m.pos;
+                    m.set_pos(Self::cart_seat(&c, Some(&m)));
+                    m.old = m.pos();
                     m.needs_sync = true;
                     self.mobs.list.put(i, m);
                     true
@@ -484,13 +484,13 @@ impl Server {
         let (w, h) = (m.width(), m.height());
         let poses: [(f32, f32, &[i32]); 1] = [(w, h, &[0, 1, -1])];
         let t = if m.removed {
-            m.pos
+            m.pos()
         } else if self.cart_gone_or_portal(c) {
-            self.cart_dismount_free(c, m.pos, f64::from(w), f64::from(h))
+            self.cart_dismount_free(c, m.pos(), f64::from(w), f64::from(h))
         } else {
             self.cart_dismount_location(c, &poses)
         };
-        m.pos = t;
+        m.set_pos(t);
         m.old = t;
         m.needs_sync = true;
     }
@@ -558,7 +558,7 @@ impl Server {
                     if r.mount.vehicle == Some(id)
                         && let Some(c) = self.cart_ref(id)
                     {
-                        r.pos = Self::cart_seat(c, Some(&r));
+                        r.set_pos(Self::cart_seat(c, Some(&r)));
                     }
                     r.fall_distance = 0.0;
                     self.mobs.list.put(i, r);

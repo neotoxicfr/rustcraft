@@ -105,7 +105,7 @@ fn defend_village_needs_line_of_sight() {
     assert!(can(&mut w, &mut golem), "golem does not defend the village in the open");
     // Player visible on the golem's side, ill-disposed villager alone behind the wall: sight of
     // the villager is required too.
-    w.mob_mut(v).pos = [11.5, f64::from(Y), 8.5];
+    w.mob_mut(v).set_pos([11.5, f64::from(Y), 8.5]);
     w.p.s.pos = [6.5, f64::from(Y), 8.5];
     w.wall(8, "minecraft:stone");
     assert!(!can(&mut w, &mut golem), "golem defends a villager it cannot see");
@@ -248,7 +248,7 @@ fn copper_golem_opens_doors() {
         w.p.s.mobs_world_tick();
         opened |= w.name([10, Y, 8]).contains("open=true");
         let m = w.p.s.mob_ref(id).expect("golem");
-        max_x = max_x.max(m.pos[0]);
+        max_x = max_x.max(m.pos()[0]);
         if m.golem.brain.walk.is_none() && max_x < 11.0 {
             let m = w.mob_mut(id);
             m.golem.brain.walk = Some(crate::mobs::golems::copper::Walk { pos: [14, Y, 8], speed: 1.0, close: 0 });

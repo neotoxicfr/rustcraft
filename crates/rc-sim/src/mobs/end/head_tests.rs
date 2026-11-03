@@ -18,14 +18,14 @@ use crate::projectiles::PKind;
 fn dragon(yaw: f32, head: f32) -> Mob {
     let mut m = Mob::new(Kind::EnderDragon, 1, 1, [0.5, 64.0, 0.5], yaw, JRand::new(1));
     m.head_yaw = head;
-    m.old = m.pos;
+    m.old = m.pos();
     m
 }
 
 /// Head after a tick where the dragon moved by `d` (body at 120°, head at 0).
 fn after_move(d: [f64; 3]) -> f32 {
     let mut m = dragon(120.0, 0.0);
-    m.pos = [m.pos[0] + d[0], m.pos[1] + d[1], m.pos[2] + d[2]];
+    m.add_pos(d);
     turn_head(&mut m);
     assert_eq!(m.body_yaw, 120.0, "body = yaw");
     m.head_yaw
@@ -43,12 +43,12 @@ fn dragon_head_turns_only_while_moving() {
     assert_eq!(after_move([5.000_003e-4, 0.0, 0.0]), 45.0, "above the threshold: 120 − 75");
     assert_eq!(after_move([0.0, 0.0, 0.01]), 45.0);
     let mut m = dragon(-100.0, 0.0);
-    m.pos[0] += 0.01;
+    m.add_pos_axis(0, 0.01);
     turn_head(&mut m);
     assert_eq!(m.head_yaw, -25.0, "−100 + 75");
     // Difference under 75°: head unchanged even when moving.
     let mut m = dragon(50.0, 0.0);
-    m.pos[2] += 0.01;
+    m.add_pos_axis(2, 0.01);
     turn_head(&mut m);
     assert_eq!(m.head_yaw, 0.0);
 }

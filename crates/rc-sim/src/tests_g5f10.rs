@@ -293,15 +293,15 @@ fn fox_chorus_teleports() {
         .comp_json(&stack("minecraft:chorus_fruit", 1), "minecraft:consumable")
         .and_then(|c| c["on_consume_effects"].as_array().cloned())
         .expect("chorus effects");
-    let before = m.pos;
+    let before = m.pos();
     p.s.run_mob_consume_effects(&mut m, &list);
-    assert_ne!(m.pos, before, "fox motionless");
+    assert_ne!(m.pos(), before, "fox motionless");
     assert_eq!(logged(&p, "minecraft:teleport"), 1);
     // Through the fox finishing its meal (fruit held in the mouth): teleported, `eat` event.
     m.equipment[0] = Some(stack("minecraft:chorus_fruit", 1));
-    let before = m.pos;
+    let before = m.pos();
     crate::mobs::wild::fox::eat_mouth_item(&mut p.s, &mut m);
-    assert_ne!(m.pos, before, "meal without consumption effect");
+    assert_ne!(m.pos(), before, "meal without consumption effect");
     assert_eq!(logged(&p, "minecraft:teleport"), 2);
     assert_eq!(logged(&p, "minecraft:eat"), 1);
     assert!(m.equipment[0].is_none());

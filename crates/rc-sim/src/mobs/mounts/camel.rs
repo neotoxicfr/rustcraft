@@ -209,7 +209,7 @@ pub fn can_change_pose(s: &Server, m: &Mob) -> bool {
     } else {
         (1.7, 2.375 - 1.43)
     };
-    let b = Mob::bbox_at(m.pos, w, h);
+    let b = Mob::bbox_at(m.pos(), w, h);
     let b = rc_physics::Aabb { min: b.min.map(|v| v + 1.0e-7), max: b.max.map(|v| v - 1.0e-7) };
     rc_physics::is_free(&s.world(), &b)
 }
@@ -349,10 +349,10 @@ impl Server {
                 .list
                 .iter()
                 .filter(|o| o.id != m.id && o.alive() && o.touches(&area))
-                .map(|o| (dist2(m.pos, o.pos), Ent::Mob(o.id)))
+                .map(|o| (dist2(m.pos(), o.pos()), Ent::Mob(o.id)))
                 .collect();
             if self.ent_alive(Ent::Player) && self.player_aabb().intersects(&area) {
-                list.push((dist2(m.pos, self.pos), Ent::Player));
+                list.push((dist2(m.pos(), self.pos), Ent::Player));
             }
             list.sort_by(|a, c| a.0.partial_cmp(&c.0).unwrap_or(std::cmp::Ordering::Equal));
             let ents: Vec<Ent> = list.into_iter().map(|x| x.1).collect();
@@ -414,7 +414,7 @@ impl Server {
             b.swim.end = t + self.behavior_duration(60, 60);
         }
         if b.look.is_none() && b.visible.is_some() {
-            let me = m.pos;
+            let me = m.pos();
             let f = move |s: &Server, e: Ent| e == Ent::Player && s.ent_pos(e).is_some_and(|p| dist2(p, me) <= 36.0);
             if let Some(target) = self.visible_closest(m, b, &f) {
                 let fire = if b.look_ticker == 0 {
@@ -495,7 +495,7 @@ impl Server {
             let pitch = (m.rng.next_float() * 0.0 + 0.0).clamp(-90.0, 90.0);
             let yaw = wrap(m.yaw + 2.0 * m.rng.next_float() * 30.0 - 30.0);
             let dir = direction(pitch, yaw);
-            let eye = [m.pos[0], m.eye_y(), m.pos[2]];
+            let eye = [m.pos()[0], m.eye_y(), m.pos()[2]];
             let p = [eye[0] + dir[0], eye[1] + dir[1], eye[2] + dir[2]];
             b.look = Some(Track::Pos(super::super::mth::block_of(p)));
             b.gaze_cd = Some(m.rng.next_int_bound(101) + 150);
@@ -657,8 +657,8 @@ impl Server {
                 b.love_at = 0;
             } else if let Some(pid) = b.breed {
                 self.lock_gaze_to_partner(m, b, pid);
-                if let Some(pp) = self.mob_ref(pid).map(|p| p.pos)
-                    && dist2(m.pos, pp) < 9.0
+                if let Some(pp) = self.mob_ref(pid).map(|p| p.pos())
+                    && dist2(m.pos(), pp) < 9.0
                     && t >= b.love_at
                 {
                     self.mount_breed(m, pid);
@@ -702,7 +702,7 @@ impl Server {
                     }
                     b.look = Some(Track::Ent(Ent::Player, true));
                     let close = if m.is_baby() { 2.5 } else { 3.5 };
-                    if dist2(m.pos, self.pos) < close * close {
+                    if dist2(m.pos(), self.pos) < close * close {
                         b.walk = None;
                     } else {
                         b.walk = Some(WalkTarget { target: Track::Ent(Ent::Player, false), speed: 2.5, close: 2 });
@@ -804,8 +804,8 @@ impl Server {
             return false;
         }
         let Some(a) = b.adult else { return false };
-        let Some(p) = self.mob_ref(a).map(|o| o.pos) else { return false };
-        let d = dist2(m.pos, p);
+        let Some(p) = self.mob_ref(a).map(|o| o.pos()) else { return false };
+        let d = dist2(m.pos(), p);
         if (5.0 * 5.0..17.0 * 17.0).contains(&d) {
             b.look = Some(Track::Ent(Ent::Mob(a), true));
             b.walk = Some(WalkTarget { target: Track::Ent(Ent::Mob(a), false), speed: 2.5, close: 4 });

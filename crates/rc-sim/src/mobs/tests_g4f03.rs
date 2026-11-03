@@ -40,7 +40,7 @@ fn spawn(p: &mut Probe, k: Kind, pos: [f64; 3]) -> i32 {
     let mut m = p.s.new_mob(k, pos, 0.0);
     let mut g = super::spawn::Group::default();
     p.s.finalize_spawn(&mut m, super::spawn::Reason::SpawnEgg, &mut g);
-    m.pos = pos;
+    m.set_pos(pos);
     let id = m.id;
     p.s.add_mob(m);
     id
@@ -183,7 +183,7 @@ fn partner_at_eight_blocks() {
     let mut g = Goal::Breed { speed: 1.0, partner: None, love_time: 0 };
     assert!(!p.s.goal_can_use(&mut g, &mut am), "partner at 9.9 blocks accepted");
     p.s.mobs.list.put(i, am);
-    with(&mut p, b, |o| o.pos = [215.5, -59.0, 215.5]);
+    with(&mut p, b, |o| o.set_pos([215.5, -59.0, 215.5]));
     let (_, mut am) = take(&mut p, a);
     assert!(p.s.goal_can_use(&mut g, &mut am), "partner at 7.1 blocks refused");
 }
@@ -241,7 +241,7 @@ fn flee_measured_from_the_feet() {
     // 5.29 + 1.445², eyes 5.29).
     let a = spawn(&mut p, Kind::Cat, [218.5, -59.0, 216.5]);
     let b = spawn(&mut p, Kind::Cat, [216.5, -59.0, 218.8]);
-    with(&mut p, b, |o| o.pos[1] = -59.0 + f64::from(1.7f32 * 0.85f32));
+    with(&mut p, b, |o| o.set_pos_axis(1, -59.0 + f64::from(1.7f32 * 0.85f32)));
     let (_, mut cm) = take(&mut p, cr);
     let mut g = Goal::Avoid { who: Who::Cat, max: 6.0, walk: 1.0, sprint: 1.2, from: None, path: None };
     let _ = p.s.goal_can_use(&mut g, &mut cm);

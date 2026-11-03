@@ -145,7 +145,7 @@ fn zombie_reinforcements() {
     assert!(called, "no reinforcement in 10 hits (chance 1, 50 position attempts per hit)");
     let n = p.s.mobs.list.iter().find(|m| m.kind == Kind::Zombie && m.id != id).unwrap();
     assert_eq!(n.target, Some(Ent::Player), "the reinforcement targets the player");
-    assert_eq!(n.pos.map(f64::fract), [0.0; 3], "placed at integer coordinates");
+    assert_eq!(n.pos().map(f64::fract), [0.0; 3], "placed at integer coordinates");
     let callee = n.attrs.reinforcements.as_ref().unwrap();
     assert!(callee.mods.iter().any(|x| x.0 == "minecraft:reinforcement_callee_charge" && (x.1 + 0.05).abs() < 1e-6));
     let caller = p.s.mob_ref(id).unwrap().attrs.reinforcements.as_ref().unwrap();

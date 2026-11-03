@@ -431,10 +431,10 @@ fn sensors(s: &mut Server, m: &mut Mob) {
             .list
             .iter()
             .filter(|o| o.id != m.id && o.alive() && o.touches(&area))
-            .map(|o| (dist2(m.pos, o.pos), Ent::Mob(o.id)))
+            .map(|o| (dist2(m.pos(), o.pos()), Ent::Mob(o.id)))
             .collect();
         if s.ent_alive(Ent::Player) && s.player_aabb().intersects(&area) {
-            list.push((dist2(m.pos, s.pos), Ent::Player));
+            list.push((dist2(m.pos(), s.pos), Ent::Player));
         }
         list.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mut visible = std::mem::take(&mut m.golem.brain.visible);
@@ -626,7 +626,7 @@ fn look_pos(s: &Server, l: Option<Look>) -> Option<[f64; 3]> {
 
 /// Gaze at the player at 6 blocks, interval 40 to 80 ticks (world random).
 fn look_sometimes(s: &mut Server, m: &mut Mob) -> bool {
-    let near = m.golem.brain.visible.iter().copied().find(|e| *e == Ent::Player && dist2(s.pos, m.pos) <= 36.0);
+    let near = m.golem.brain.visible.iter().copied().find(|e| *e == Ent::Player && dist2(s.pos, m.pos()) <= 36.0);
     let Some(t) = near else { return false };
     let b = &mut m.golem.brain;
     if b.look_ticker == 0 {
@@ -857,7 +857,7 @@ impl Server {
     }
 
     fn center_pos(m: &Mob) -> [f64; 3] {
-        [m.pos[0], m.pos[1] + f64::from(m.height()) / 2.0, m.pos[2]]
+        [m.pos()[0], m.pos()[1] + f64::from(m.height()) / 2.0, m.pos()[2]]
     }
 
     fn interaction_range(m: &Mob) -> f64 {
@@ -1122,7 +1122,7 @@ impl Server {
         let end = path.as_ref().and_then(|pt| pt.end());
         let from = match end {
             Some(e) => [f64::from(e[0]) + 0.5, f64::from(e[1]), f64::from(e[2]) + 0.5],
-            None => m.pos,
+            None => m.pos(),
         };
         let from = [from[0], from[1] + f64::from(m.height()) / 2.0, from[2]];
         let can = self.within_target(m, p, Self::interaction_range(m), from);
@@ -1177,9 +1177,9 @@ impl Server {
                     })
                     .collect();
                 for p in list {
-                    let d = (f64::from(p[0]) + 0.5 - m.pos[0]).powi(2)
-                        + (f64::from(p[1]) + 0.5 - m.pos[1]).powi(2)
-                        + (f64::from(p[2]) + 0.5 - m.pos[2]).powi(2);
+                    let d = (f64::from(p[0]) + 0.5 - m.pos()[0]).powi(2)
+                        + (f64::from(p[1]) + 0.5 - m.pos()[1]).powi(2)
+                        + (f64::from(p[2]) + 0.5 - m.pos()[2]).powi(2);
                     if d >= closest {
                         continue;
                     }
@@ -1214,10 +1214,10 @@ impl Server {
 
     /// Item thrown from the eyes − 0.3 toward the target (×0.3).
     pub(crate) fn throw_item_towards(&mut self, m: &Mob, item: Stack, to: [f64; 3]) {
-        let pos = [m.pos[0], m.eye_y() - f64::from(0.3f32), m.pos[2]];
+        let pos = [m.pos()[0], m.eye_y() - f64::from(0.3f32), m.pos()[2]];
         let r = &mut self.mobs.rng;
         let _ = (r.next_double(), r.next_double());
-        let v = crate::mobs::mth::normalize([to[0] - m.pos[0], to[1] - m.pos[1], to[2] - m.pos[2]]).map(|c| c * f64::from(0.3f32));
+        let v = crate::mobs::mth::normalize([to[0] - m.pos()[0], to[1] - m.pos()[1], to[2] - m.pos()[2]]).map(|c| c * f64::from(0.3f32));
         self.spawn_item(pos, v, item, 10);
     }
 
@@ -1227,7 +1227,7 @@ impl Server {
             if m.drop_chance[i] > 1.0
                 && let Some(s) = m.equipment[i].take()
             {
-                let pos = m.pos;
+                let pos = m.pos();
                 let r = &mut self.mobs.rng;
                 let v = [r.next_double() * 0.2 - 0.1, 0.2, r.next_double() * 0.2 - 0.1];
                 self.spawn_item(pos, v, s, 10);

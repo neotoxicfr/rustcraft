@@ -101,7 +101,7 @@ fn arbalistic_accumulates_pierced_kills() {
     arrow.vel = [3.0, 0.0, 0.0];
     for (n, &id) in ids.iter().enumerate() {
         assert!(!p.s.prog.done(a), "advancement obtained before the fifth victim ({n})");
-        let pos = p.s.mob_ref(id).expect("mob").pos;
+        let pos = p.s.mob_ref(id).expect("mob").pos();
         p.s.proj_hit_entity(&mut arrow, EntityHit { ent: Target::Living(Ent::Mob(id)), loc: pos });
         assert!(!p.s.ent_alive(Ent::Mob(id)), "victim {n} killed");
     }

@@ -1011,7 +1011,7 @@ impl Server {
 
     /// `mob.push(cart)` (general rule): the mob recoils, the minecart advances if it is empty.
     fn cart_push_mob(&mut self, c: &mut Cart, m: &mut crate::mobs::mob::Mob) {
-        let Some((xa, za)) = Self::entity_push_amount(m.pos, c.pos) else { return };
+        let Some((xa, za)) = Self::entity_push_amount(m.pos(), c.pos) else { return };
         if m.mount.passengers.is_empty() && self.mob_pushable(m) {
             m.vel[0] -= xa;
             m.vel[2] -= za;

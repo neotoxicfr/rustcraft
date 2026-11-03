@@ -522,7 +522,7 @@ pub fn breed(s: &mut Server, m: &mut Mob, partner: i32) -> bool {
     }
     let Some(pi) = s.mob_index(partner) else { return true };
     let Some(p) = s.mobs.list.take(pi) else { return true };
-    let mut baby = s.new_mob(m.kind, m.pos, 0.0);
+    let mut baby = s.new_mob(m.kind, m.pos(), 0.0);
     match m.kind {
         Kind::Fox => baby.variant = if m.rng.next_bool() { m.variant } else { p.variant },
         Kind::Panda => {
@@ -552,7 +552,7 @@ pub fn breed(s: &mut Server, m: &mut Mob, partner: i32) -> bool {
     s.mob_event(m, 18);
     if s.rule("minecraft:mob_drops", true) {
         let xp = m.rng.next_int_bound(7) + 1;
-        s.spawn_orbs(m.pos, xp);
+        s.spawn_orbs(m.pos(), xp);
     }
     s.add_mob(baby);
     true

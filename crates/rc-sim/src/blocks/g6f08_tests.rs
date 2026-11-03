@@ -88,7 +88,7 @@ fn turtle_eggs_hatch_on_sand() {
         assert_eq!(t.age, -24_000, "baby");
         assert_eq!(t.surf.home, nest, "home at the nest");
         let x = 4.0 + 0.3 + i as f64 * 0.2;
-        assert!((t.pos[0] - x).abs() < 1e-9 && (t.pos[2] - 4.3).abs() < 1e-9 && t.pos[1] == f64::from(Y), "{:?}", t.pos);
+        assert!((t.pos()[0] - x).abs() < 1e-9 && (t.pos()[2] - 4.3).abs() < 1e-9 && t.pos()[1] == f64::from(Y), "{:?}", t.pos());
     }
     // On stone: never.
     let rock = [8, Y, 4];

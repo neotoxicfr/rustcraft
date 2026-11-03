@@ -253,7 +253,7 @@ impl Server {
         {
             let dist = {
                 let b = [f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5];
-                super::super::mth::dist2(c.pos, b).sqrt()
+                super::super::mth::dist2(c.pos(), b).sqrt()
             };
             let remove = (!super::creaking_active(self) && !c.persistent)
                 || dist > 34.0
@@ -315,7 +315,7 @@ impl Server {
         let b = [f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5];
         self.heart_protector(p)
             .and_then(|id| self.mob_ref(id))
-            .map_or(0.0, |c| super::super::mth::dist2(c.pos, b).sqrt())
+            .map_or(0.0, |c| super::super::mth::dist2(c.pos(), b).sqrt())
     }
 
     /// 15 near the heart, 0 at 32 blocks or without a protector.
@@ -343,7 +343,7 @@ impl Server {
         if let Some(i) = self.mob_index(id)
             && let Some(mut c) = self.mobs.list.take(i)
         {
-            let pos = c.pos;
+            let pos = c.pos();
             self.game_event_at("minecraft:entity_place", pos, Some(Ent::Mob(c.id)));
             super::creaking::set_transient(&mut c, p);
             self.mobs.list.put(i, c);

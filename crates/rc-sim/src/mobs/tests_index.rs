@@ -120,7 +120,7 @@ fn index_equals_scan() {
                 // Duplicate: same identifier and same UUID added twice.
                 7 if n > 0 && round % 4 == 0 => {
                     if let Some(m) = mobs.list.get(r.below(n as u64) as usize) {
-                        let c = Mob::new(m.kind, m.id, m.uuid, m.pos, 0.0, JRand::new(1));
+                        let c = Mob::new(m.kind, m.id, m.uuid, m.pos(), 0.0, JRand::new(1));
                         mobs.push(Box::new(c));
                     }
                 }
@@ -370,7 +370,7 @@ fn static_bound_holds() {
         let m = random_mob(&mut r, i, 16.0);
         let Some((rr, hh)) = reach(m.kind) else { continue };
         let b = m.bbox();
-        let p = m.pos;
+        let p = m.pos();
         let within = |rr: f64, hh: f64| {
             b.min[0] >= p[0] - rr
                 && b.max[0] <= p[0] + rr
@@ -400,7 +400,7 @@ fn static_bound_holds() {
                         m.bm.pose = pose;
                         m.bm.sniffer = sniffer;
                         m.mount.camel_sitting_pose = sitting;
-                        let (b, p) = (m.bbox(), m.pos);
+                        let (b, p) = (m.bbox(), m.pos());
                         let ok = b.min[0] >= p[0] - rr
                             && b.max[0] <= p[0] + rr
                             && b.min[2] >= p[2] - rr
@@ -631,11 +631,11 @@ fn bench_push() {
             }
             c
         };
-        let (a, t_old) = time(|| run(&|o, bb| Mob::bbox_at(o.pos, o.width(), o.height()).intersects(bb)));
+        let (a, t_old) = time(|| run(&|o, bb| Mob::bbox_at(o.pos(), o.width(), o.height()).intersects(bb)));
         let (b, t_once) = time(|| {
             run(&|o, bb| {
                 let (w, h) = o.dims_wh();
-                Mob::bbox_at(o.pos, w, h).intersects(bb)
+                Mob::bbox_at(o.pos(), w, h).intersects(bb)
             })
         });
         let (c, t_filter) = time(|| run(&|o, bb| o.touches(bb)));

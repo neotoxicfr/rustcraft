@@ -85,13 +85,13 @@ impl Server {
         let mut rng = JRand::from_time(i64::from(id));
         let reach = f64::from(m.width() + 1.0) * 0.5;
         let start = [
-            m.pos[0] - reach * f64::from(sin(m.body_yaw * DEG)),
+            m.pos()[0] - reach * f64::from(sin(m.body_yaw * DEG)),
             m.eye_y() - f64::from(0.1f32),
-            m.pos[2] + reach * f64::from(cos(m.body_yaw * DEG)),
+            m.pos()[2] + reach * f64::from(cos(m.body_yaw * DEG)),
         ];
-        let xd = tp[0] - m.pos[0];
+        let xd = tp[0] - m.pos()[0];
         let yd = tb.min[1] + (tb.max[1] - tb.min[1]) * 0.333_333_333_333_333_3 - start[1];
-        let zd = tp[2] - m.pos[2];
+        let zd = tp[2] - m.pos()[2];
         let yo = (xd * xd + zd * zd).sqrt() * f64::from(0.2f32);
         let mut v = crate::mobs::mth::normalize([xd, yd + yo, zd]);
         for c in &mut v {
@@ -335,7 +335,7 @@ impl Server {
             .map(|o| {
                 (
                     o.id,
-                    dist2(m.pos, o.pos),
+                    dist2(m.pos(), o.pos()),
                     o.mount.caravan_head.is_some(),
                     o.mount.caravan_tail.is_some(),
                     Self::llama_leashed(o),
@@ -373,13 +373,13 @@ impl Server {
     }
 
     pub(crate) fn caravan_can_continue(&mut self, m: &mut Mob, speed: &mut f64, dist_check: &mut i32) -> bool {
-        let Some(head) = m.mount.caravan_head.and_then(|id| self.mob_ref(id)).map(|h| (h.alive(), h.pos)) else {
+        let Some(head) = m.mount.caravan_head.and_then(|id| self.mob_ref(id)).map(|h| (h.alive(), h.pos())) else {
             return false;
         };
         if !head.0 || !self.first_is_leashed(m, 0) {
             return false;
         }
-        if dist2(m.pos, head.1) > 676.0 {
+        if dist2(m.pos(), head.1) > 676.0 {
             if *speed <= 3.0 {
                 *speed *= 1.2;
                 *dist_check = super::super::mth::reduced(40);
@@ -400,12 +400,12 @@ impl Server {
         if matches!(super::super::leash::holder(m), Some(super::super::leash::Holder::Knot(_))) {
             return;
         }
-        let Some(h) = m.mount.caravan_head.and_then(|id| self.mob_ref(id)).map(|h| h.pos) else { return };
-        let d = [h[0] - m.pos[0], h[1] - m.pos[1], h[2] - m.pos[2]];
+        let Some(h) = m.mount.caravan_head.and_then(|id| self.mob_ref(id)).map(|h| h.pos()) else { return };
+        let d = [h[0] - m.pos()[0], h[1] - m.pos()[1], h[2] - m.pos()[2]];
         let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
         let n = crate::mobs::mth::normalize(d);
         let k = (dist - 2.0).max(0.0);
-        let to = [m.pos[0] + n[0] * k, m.pos[1] + n[1] * k, m.pos[2] + n[2] * k];
+        let to = [m.pos()[0] + n[0] * k, m.pos()[1] + n[1] * k, m.pos()[2] + n[2] * k];
         self.move_to_pos(m, to, speed);
     }
 

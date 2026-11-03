@@ -184,7 +184,7 @@ impl Server {
             && let Some(mut m) = self.mobs.list.take(i)
         {
             if !m.removed {
-                self.play_sound("minecraft:block.conduit.attack.target", 4, m.pos, 1.0, 1.0);
+                self.play_sound("minecraft:block.conduit.attack.target", 4, m.pos(), 1.0, 1.0);
                 self.mob_hurt(&mut m, "minecraft:magic", 4.0, None, None);
             }
             self.mobs.list.put(i, m);

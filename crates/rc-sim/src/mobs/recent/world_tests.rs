@@ -107,12 +107,12 @@ fn creaking_bound_to_heart() {
     let c = found.expect("creaking never appeared");
     assert_eq!(mob(&p, c).unwrap().rec.home, Some(heart), "creaking not linked to the heart");
     // Player right next to it, looking at it: activated then frozen.
-    let cp = mob(&p, c).unwrap().pos;
+    let cp = mob(&p, c).unwrap().pos();
     p.run(&format!("player {} -59 {} 0 0\n", cp[0], cp[2] - 4.0));
     let mut frozen = false;
     for _ in 0..60 {
         let eye = mob(&p, c).unwrap().eye_y();
-        let cp = mob(&p, c).unwrap().pos;
+        let cp = mob(&p, c).unwrap().pos();
         look_at(&mut p, [cp[0], eye, cp[2]]);
         step(&mut p, 1);
         let m = mob(&p, c).unwrap();
@@ -248,7 +248,7 @@ fn breeze_shoots_wind_charge() {
             break;
         }
     }
-    eprintln!("shot {shot:?}, push {pushed:?}, breeze {:?}", mob(&p, b).map(|m| m.pos));
+    eprintln!("shot {shot:?}, push {pushed:?}, breeze {:?}", mob(&p, b).map(|m| m.pos()));
     assert!(shot.is_some(), "no wind charge shot");
     assert!(pushed.is_some(), "player never pushed back");
     cleanup(p, dir);
@@ -320,7 +320,7 @@ fn shrieker_summons_warden() {
     walk(&mut p, [216.5, -59.0, 210.7]);
     step(&mut p, 100);
     let w = p.s.mobs.list.iter().find(|m| m.kind == Kind::Warden);
-    eprintln!("level {}, warden {:?}", p.s.mobs.rec.warden_tracker.warning_level, w.map(|m| m.pos));
+    eprintln!("level {}, warden {:?}", p.s.mobs.rec.warden_tracker.warning_level, w.map(|m| m.pos()));
     assert!(w.is_some(), "no warden summoned");
     cleanup(p, dir);
 }

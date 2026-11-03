@@ -125,18 +125,18 @@ impl Server {
     /// the same search at the old height. True if the mob moved.
     pub(crate) fn refit_after_growth(&mut self, m: &mut Mob, old: (f32, f32), new: (f32, f32)) -> bool {
         let ((ow, oh), (w, h)) = (old, new);
-        let center = [m.pos[0], m.pos[1] + f64::from(oh) / 2.0, m.pos[2]];
+        let center = [m.pos()[0], m.pos()[1] + f64::from(oh) / 2.0, m.pos()[2]];
         let wd = f64::from((w - ow).max(0.0)) + 1.0e-6;
         let hd = f64::from((h - oh).max(0.0)) + 1.0e-6;
         let (fw, fh, foh) = (f64::from(w), f64::from(h), f64::from(oh));
         if let Some(c) = self.find_free_position(&of_size(center, [wd, hd, wd]), center, [fw, fh, fw]) {
-            m.pos = [c[0], c[1] - fh / 2.0, c[2]];
+            m.set_pos([c[0], c[1] - fh / 2.0, c[2]]);
             return true;
         }
         if w > ow && h > oh {
             let allowed = of_size(center, [wd, 1.0e-6, wd]);
             if let Some(c) = self.find_free_position(&allowed, center, [fw, foh, fw]) {
-                m.pos = [c[0], c[1] - foh / 2.0 + 1.0e-6, c[2]];
+                m.set_pos([c[0], c[1] - foh / 2.0 + 1.0e-6, c[2]]);
                 return true;
             }
         }

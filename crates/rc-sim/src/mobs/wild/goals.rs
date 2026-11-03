@@ -156,7 +156,7 @@ impl Server {
                 let Some(t) = m.target else { return false };
                 self.ent_alive(t)
                     && fox::stalkable(self, t)
-                    && self.ent_pos(t).is_some_and(|p| dist2(m.pos, p) > 36.0)
+                    && self.ent_pos(t).is_some_and(|p| dist2(m.pos(), p) > 36.0)
                     && !fox::flag(m, fox::CROUCHING)
                     && !fox::flag(m, fox::INTERESTED)
                     && !m.jumping
@@ -378,7 +378,7 @@ impl Server {
             WGoal::PandaLook { at, time } => {
                 Self::panda_look_override(at, m);
                 at.is_some_and(|e| {
-                    self.ent_alive(e) && self.ent_pos(e).is_some_and(|p| dist2(m.pos, p) <= 36.0) && *time > 0
+                    self.ent_alive(e) && self.ent_pos(e).is_some_and(|p| dist2(m.pos(), p) <= 36.0) && *time > 0
                 })
             }
             WGoal::PandaHurtBy { base, .. } => {
@@ -458,7 +458,7 @@ impl Server {
                     && let (Some(p), Some(eye)) = (self.ent_pos(t), self.ent_eye(t))
                 {
                     self.look_at(m, [p[0], eye, p[2]], 60.0, 30.0);
-                    let u = crate::mobs::mth::normalize([p[0] - m.pos[0], p[1] - m.pos[1], p[2] - m.pos[2]]);
+                    let u = crate::mobs::mth::normalize([p[0] - m.pos()[0], p[1] - m.pos()[1], p[2] - m.pos()[2]]);
                     m.vel = [m.vel[0] + u[0] * 0.8, m.vel[1] + 0.9, m.vel[2] + u[2] * 0.8];
                     m.needs_sync = true;
                 }
@@ -476,7 +476,7 @@ impl Server {
                 m.jumping = false;
                 fox::set(m, fox::SLEEPING, true);
                 m.nav.stop();
-                m.move_ctl.wanted = m.pos;
+                m.move_ctl.wanted = m.pos();
                 m.move_ctl.speed_mod = 0.0;
                 m.move_ctl.op = super::super::mob::MoveOp::MoveTo;
             }
@@ -661,7 +661,7 @@ impl Server {
                 let Some(t) = m.target else { return };
                 let (Some(p), Some(eye)) = (self.ent_pos(t), self.ent_eye(t)) else { return };
                 self.look_at(m, [p[0], eye, p[2]], 75.0, 40.0);
-                if dist2(m.pos, p) <= 36.0 {
+                if dist2(m.pos(), p) <= 36.0 {
                     fox::set(m, fox::INTERESTED, true);
                     fox::set(m, fox::CROUCHING, true);
                     m.nav.stop();
@@ -672,7 +672,7 @@ impl Server {
             WGoal::Pounce => self.pounce_tick(m),
             WGoal::StrollVillage { wanted, .. } => {
                 let Some(w) = *wanted else { return };
-                if m.nav.is_done() && !bee::near_center(w, m.pos, 10.0) {
+                if m.nav.is_done() && !bee::near_center(w, m.pos(), 10.0) {
                     self.stroll_village_step(m, w);
                 }
             }
@@ -692,7 +692,7 @@ impl Server {
                     Self::perch_reset(m, rel, look_time);
                 }
                 let eye = m.eye_y();
-                let to = [m.pos[0] + rel[0], eye, m.pos[2] + rel[1]];
+                let to = [m.pos()[0] + rel[0], eye, m.pos()[2] + rel[1]];
                 self.look_at(m, to, 75.0, 40.0);
             }
             WGoal::PandaBreed { inner, .. } => self.goal_tick(inner, m),
@@ -782,7 +782,7 @@ impl Server {
 
     fn enter_hive_can_use(&mut self, m: &mut Mob) -> bool {
         let Some(h) = m.wild.hive else { return false };
-        if bee::wants_to_enter_hive(self, m) && bee::near_center(h, m.pos, 2.0) && bee::hive_entity(self, m).is_some() {
+        if bee::wants_to_enter_hive(self, m) && bee::near_center(h, m.pos(), 2.0) && bee::hive_entity(self, m).is_some() {
             if !super::hive::is_full(self, h) {
                 return true;
             }
@@ -978,13 +978,13 @@ impl Server {
             return;
         }
         let fp = [f64::from(f[0]) + 0.5, f64::from(f[1]) + f64::from(0.6f32), f64::from(f[2]) + 0.5];
-        if dist2(fp, m.pos).sqrt() > 1.0 {
+        if dist2(fp, m.pos()).sqrt() > 1.0 {
             *hover = Some(fp);
             set_wanted(m, fp);
             return;
         }
         let h = *hover.get_or_insert(fp);
-        let arrived = dist2(m.pos, h).sqrt() <= 0.1;
+        let arrived = dist2(m.pos(), h).sqrt() <= 0.1;
         let mut set_pos = true;
         if !arrived && *ticks > 600 {
             bee::drop_flower(m);
@@ -1018,7 +1018,7 @@ impl Server {
         let dir = match bee::hive_entity(self, m) {
             Some(h) if !bee::closer_than(m, h, threshold) => {
                 let c = [f64::from(h[0]) + 0.5, f64::from(h[1]) + 0.5, f64::from(h[2]) + 0.5];
-                crate::mobs::mth::normalize([c[0] - m.pos[0], c[1] - m.pos[1], c[2] - m.pos[2]])
+                crate::mobs::mth::normalize([c[0] - m.pos()[0], c[1] - m.pos()[1], c[2] - m.pos()[2]])
             }
             _ => view_vector(m),
         };
@@ -1107,7 +1107,7 @@ impl Server {
                 }
             }
         }
-        let close = target.and_then(|t| self.ent_pos(t)).is_some_and(|p| (dist2(m.pos, p).sqrt() as f32) <= 2.0);
+        let close = target.and_then(|t| self.ent_pos(t)).is_some_and(|p| (dist2(m.pos(), p).sqrt() as f32) <= 2.0);
         if let Some(t) = target
             && close
         {
@@ -1140,7 +1140,7 @@ impl Server {
 
     fn stroll_village_step(&mut self, m: &mut Mob, w: [i32; 3]) {
         let target = [f64::from(w[0]) + 0.5, f64::from(w[1]), f64::from(w[2]) + 0.5];
-        let me = m.pos;
+        let me = m.pos();
         let dist = [me[0] - target[0], me[1] - target[1], me[2] - target[2]];
         let far = [dist[0] * 0.4 + target[0], dist[1] * 0.4 + target[1], dist[2] * 0.4 + target[2]];
         let n = crate::mobs::mth::normalize([far[0] - me[0], far[1] - me[1], far[2] - me[2]]);
@@ -1195,7 +1195,7 @@ impl Server {
         }
         // Target above the block, accepted at 2, path every 100.
         let t = [pos[0], pos[1] + 1, pos[2]];
-        if !bee::near_center(t, m.pos, 2.0) {
+        if !bee::near_center(t, m.pos(), 2.0) {
             *reached = false;
             *try_ticks += 1;
             if *try_ticks % 100 == 0 {
@@ -1244,7 +1244,7 @@ impl Server {
     /// Panda retaliation: only aggressive pandas without a target join.
     fn panda_alert_others(&mut self, m: &Mob) {
         let follow = m.follow_range();
-        let p = m.pos;
+        let p = m.pos();
         let area = rc_physics::Aabb {
             min: [p[0] - follow, p[1] - 10.0, p[2] - follow],
             max: [p[0] + 1.0 + follow, p[1] + 1.0 + 10.0, p[2] + 1.0 + follow],

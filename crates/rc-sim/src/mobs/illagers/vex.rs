@@ -34,7 +34,7 @@ impl Server {
             return;
         }
         let w = m.move_ctl.wanted;
-        let d = [w[0] - m.pos[0], w[1] - m.pos[1], w[2] - m.pos[2]];
+        let d = [w[0] - m.pos()[0], w[1] - m.pos()[1], w[2] - m.pos()[2]];
         let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
         let b = m.bbox();
         let size = ((b.max[0] - b.min[0]) + (b.max[1] - b.min[1]) + (b.max[2] - b.min[2])) / 3.0;
@@ -52,7 +52,7 @@ impl Server {
                 m.yaw = -(atan2(v[0], v[2]) as f32) * deg;
             }
             Some(tp) => {
-                m.yaw = -(atan2(tp[0] - m.pos[0], tp[2] - m.pos[2]) as f32) * deg;
+                m.yaw = -(atan2(tp[0] - m.pos()[0], tp[2] - m.pos()[2]) as f32) * deg;
             }
         }
         m.body_yaw = m.yaw;
@@ -75,7 +75,7 @@ impl Server {
         }
         // Without physics: position advanced without collision, collision flags cleared.
         let v = m.vel;
-        m.pos = [m.pos[0] + v[0], m.pos[1] + v[1], m.pos[2] + v[2]];
+        m.add_pos(v);
         m.horizontal_collision = false;
         m.vertical_collision = false;
         if m.in_water {

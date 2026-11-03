@@ -56,7 +56,7 @@ impl Server {
         for e in b.nearby.iter().flatten() {
             let Ent::Mob(id) = *e else { continue };
             let Some(o) = self.mobs.get_mut(id) else { continue };
-            if !o.alive() || o.removed || !near(p, o.pos, 32.0) {
+            if !o.alive() || o.removed || !near(p, o.pos(), 32.0) {
                 continue;
             }
             if let Some(br) = o.npc.as_mut().and_then(|n| n.brain.as_mut()) {
@@ -73,7 +73,7 @@ impl Server {
     fn bell_raider(&self, p: [i32; 3], e: Ent, d: f64) -> bool {
         let Ent::Mob(id) = e else { return false };
         self.mob_ref(id)
-            .is_some_and(|m| m.alive() && !m.removed && super::illagers::is_raider(m.kind) && near(p, m.pos, d))
+            .is_some_and(|m| m.alive() && !m.removed && super::illagers::is_raider(m.kind) && near(p, m.pos(), d))
     }
 
     /// Bell block entity created or loaded: its ticker (G3-F13, common block-entity list).

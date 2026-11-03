@@ -1511,7 +1511,7 @@ impl Server {
                 i += 1;
                 continue;
             }
-            let (id, pos) = (m.id, m.pos);
+            let (id, pos) = (m.id, m.pos());
             // Part of the mob's tick: frozen outside the "ticking entities" chunks.
             if !self.entity_ticks_at(pos) {
                 i += 1;
@@ -1534,7 +1534,7 @@ impl Server {
             };
             let Some(mut m) = self.mobs.list.take(i) else { continue };
             self.unpair(&mut m);
-            m.pos = t.pos;
+            m.set_pos(t.pos);
             m.old = t.pos;
             let (vel, yaw, pitch) = transition_motion(&t, m.vel, m.yaw, m.pitch);
             if t.relative & rel::Y_ROT != 0 {

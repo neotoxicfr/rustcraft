@@ -261,11 +261,11 @@ impl Server {
             if super::ignores_explosion(o) {
                 continue;
             }
-            let dist = dist2(o.pos, center).sqrt() / double;
+            let dist = dist2(o.pos(), center).sqrt() / double;
             if dist > 1.0 {
                 continue;
             }
-            let dir = crate::mobs::mth::normalize([o.pos[0] - center[0], o.eye_y() - center[1], o.pos[2] - center[2]]);
+            let dir = crate::mobs::mth::normalize([o.pos()[0] - center[0], o.eye_y() - center[1], o.pos()[2] - center[2]]);
             let exposure = f64::from(self.seen_percent(center, &o.bbox()));
             let kp = (1.0 - dist) * exposure * kb_mult * (1.0 - o.attrs.explosion_kb_resistance.value());
             o.vel = [o.vel[0] + dir[0] * kp, o.vel[1] + dir[1] * kp, o.vel[2] + dir[2] * kp];

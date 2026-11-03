@@ -92,7 +92,7 @@ impl Server {
             self.mobs.list.put(i, m);
             return;
         }
-        let ticking = self.entity_ticks_at(m.pos); // F15: arena ticket included
+        let ticking = self.entity_ticks_at(m.pos()); // F15: arena ticket included
         // Back in a ticking chunk during the walk: in the list from the next walk (despawn
         // check included).
         if self.meet(&mut m.rank, ticking, crate::walk::Fam::Mob) == crate::walk::Meet::Joined {
@@ -115,7 +115,7 @@ impl Server {
         let (id, carries) = (m.id, !m.mount.passengers.is_empty());
         // G6-F10: on the ground on a sculk sensor or a shrieker (effect block 0.2 under the feet).
         let step = (ticking && m.on_ground && !m.removed && !self.mobs.rec.vib_blocks.is_empty())
-            .then(|| (m.support, m.pos, m.kind == Kind::Warden));
+            .then(|| (m.support, m.pos(), m.kind == Kind::Warden));
         // Put back only if the slot still exists (otherwise the mob is dropped).
         let _ = self.mobs.list.try_put(i, m);
         if let Some((support, pos, warden)) = step {
@@ -232,7 +232,7 @@ impl Server {
         // Growth since the last tick (command, interaction): refit.
         self.mob_refit(m);
         // Common tick.
-        m.old = m.pos;
+        m.old = m.pos();
         super::piglins::spear::compute_speed(m); // known speed
         m.pitch_o = m.pitch;
         m.head_yaw_o = m.head_yaw;
@@ -262,7 +262,7 @@ impl Server {
         if m.lava_height > 0.0 {
             m.fall_distance *= 0.5;
         }
-        if m.pos[1] < f64::from(self.dim.height.min_y - 64) {
+        if m.pos()[1] < f64::from(self.dim.height.min_y - 64) {
             m.removed = true;
             return;
         }
@@ -272,10 +272,10 @@ impl Server {
         }
         // Base tick of the living entity.
         if m.alive() {
-            let eye = super::mth::block_of([m.pos[0], m.eye_y(), m.pos[2]]);
+            let eye = super::mth::block_of([m.pos()[0], m.eye_y(), m.pos()[2]]);
             // F07: the vex passes through blocks (no physics: never "in a wall"). Only
             // suffocating blocks count: a parrot against a pane does not suffocate.
-            if !super::illagers::no_physics(m) && self.in_wall([m.pos[0], m.eye_y(), m.pos[2]], m.width()) {
+            if !super::illagers::no_physics(m) && self.in_wall([m.pos()[0], m.eye_y(), m.pos()[2]], m.width()) {
                 self.mob_hurt(m, "minecraft:in_wall", 1.0, None, None);
             }
             if m.eyes_in_water && self.bname(eye) != "minecraft:bubble_column" {
@@ -713,9 +713,9 @@ impl Server {
                 let dx = xa * c - za * s;
                 let dz = za * c + xa * s;
                 let p = [
-                    (m.pos[0] + f64::from(dx)).floor() as i32,
+                    (m.pos()[0] + f64::from(dx)).floor() as i32,
                     m.block_pos()[1],
-                    (m.pos[2] + f64::from(dz)).floor() as i32,
+                    (m.pos()[2] + f64::from(dz)).floor() as i32,
                 ];
                 let view = self.mob_view(m);
                 if super::nav::static_path_type(self, &view, p) != super::nav::PathType::Walkable {
@@ -731,7 +731,7 @@ impl Server {
             MoveOp::MoveTo => {
                 m.move_ctl.op = MoveOp::Wait;
                 let w = m.move_ctl.wanted;
-                let (xd, yd, zd) = (w[0] - m.pos[0], w[1] - m.pos[1], w[2] - m.pos[2]);
+                let (xd, yd, zd) = (w[0] - m.pos()[0], w[1] - m.pos()[1], w[2] - m.pos()[2]);
                 let dd = xd * xd + yd * yd + zd * zd;
                 if dd < f64::from(2.500_000_3e-7f32) {
                     m.zza = 0.0;
@@ -748,7 +748,7 @@ impl Server {
                 let door_or_fence = self.btag_id(bp, crate::tag_bits::TagId::Doors) || self.btag_id(bp, crate::tag_bits::TagId::Fences);
                 let _ = n;
                 if (yd > m.step_height() && xd * xd + zd * zd < f64::from(m.width().max(1.0)))
-                    || (top.is_some_and(|t| m.pos[1] < t + f64::from(bp[1])) && !door_or_fence)
+                    || (top.is_some_and(|t| m.pos()[1] < t + f64::from(bp[1])) && !door_or_fence)
                 {
                     m.jump_ctl = true;
                     m.move_ctl.op = MoveOp::Jumping;
@@ -771,7 +771,7 @@ impl Server {
         if m.look.cooldown > 0 {
             m.look.cooldown -= 1;
             let w = m.look.wanted;
-            let (xd, zd) = (w[0] - m.pos[0], w[2] - m.pos[2]);
+            let (xd, zd) = (w[0] - m.pos()[0], w[2] - m.pos()[2]);
             if zd.abs() > f64::from(1.0e-5f32) || xd.abs() > f64::from(1.0e-5f32) {
                 m.head_yaw = rotate_towards(m.head_yaw, yaw_to(xd, zd), m.look.y_max);
             }
@@ -804,7 +804,7 @@ impl Server {
             m.body_yaw = m.yaw;
             return;
         }
-        let (xd, zd) = (m.pos[0] - m.old[0], m.pos[2] - m.old[2]);
+        let (xd, zd) = (m.pos()[0] - m.old[0], m.pos()[2] - m.old[2]);
         if xd * xd + zd * zd > f64::from(2.500_000_3e-7f32) {
             m.body_yaw = m.yaw;
             m.head_yaw = rotate_if_necessary(m.head_yaw, m.body_yaw, max_head_y(m.kind));
@@ -886,7 +886,7 @@ impl Server {
             m.persistent = true;
         }
         let at = [f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5];
-        m.pos = at;
+        m.set_pos(at);
         m.old = at;
         m.yaw = 0.0;
         m.head_yaw = 0.0;
@@ -968,7 +968,7 @@ impl Server {
         let mut g = super::spawn::Group::default();
         self.finalize_spawn(&mut z, super::spawn::Reason::Event, &mut g);
         let yaw = self.mobs.rng.next_float() * 360.0;
-        z.pos = at;
+        z.set_pos(at);
         z.old = at;
         z.yaw = yaw;
         z.head_yaw = yaw;

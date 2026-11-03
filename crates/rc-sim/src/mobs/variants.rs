@@ -503,7 +503,7 @@ impl Server {
     pub(crate) fn drop_at_height(&mut self, m: &Mob, s: Stack, dy: f64) {
         let r = &mut self.mobs.rng;
         let v = [r.next_double() * 0.2 - 0.1, 0.2, r.next_double() * 0.2 - 0.1];
-        self.spawn_item([m.pos[0], m.pos[1] + dy, m.pos[2]], v, s, 10);
+        self.spawn_item([m.pos()[0], m.pos()[1] + dy, m.pos()[2]], v, s, 10);
     }
 
     // ---------- Ticks ----------
@@ -585,7 +585,7 @@ impl Server {
 
     /// New mob resulting from a "simple" conversion (position, velocity, equipment…).
     pub(crate) fn converted(&mut self, from: &mut Mob, to: Kind, keep_equipment: bool, keep_pickup: bool) -> Mob {
-        let mut n = self.new_mob(to, from.pos, from.yaw);
+        let mut n = self.new_mob(to, from.pos(), from.yaw);
         n.pitch = from.pitch;
         n.old = from.old;
         n.vel = from.vel;
@@ -750,7 +750,7 @@ impl Server {
         let mut amount = 1;
         if m.rng.next_float() < 0.01 {
             let mut count = 0;
-            let (x0, y0, z0) = (m.pos[0] as i32, m.pos[1] as i32, m.pos[2] as i32);
+            let (x0, y0, z0) = (m.pos()[0] as i32, m.pos()[1] as i32, m.pos()[2] as i32);
             'outer: for x in x0 - 4..x0 + 4 {
                 for y in y0 - 4..y0 + 4 {
                     for z in z0 - 4..z0 + 4 {
@@ -896,12 +896,12 @@ impl Server {
             if !self.spawn_placement_ok(n.kind, p) || !self.spawn_rules_for(n.kind, p, Reason::Reinforcement) {
                 continue;
             }
-            n.pos = p.map(f64::from);
-            n.old = n.pos;
+            n.set_pos(p.map(f64::from));
+            n.old = n.pos();
             let bb = n.bbox();
             // The no-obstacle test, caller included (taken out of the list during its hit).
             let entity_in_way = m.bbox().intersects(&bb) || !self.unobstructed(&bb, n.id);
-            if self.player_near_alive(n.pos, 7.0)
+            if self.player_near_alive(n.pos(), 7.0)
                 || entity_in_way
                 || !rc_physics::is_free(&self.world(), &bb)
                 || (n.kind != Kind::Drowned && self.box_has_liquid(&bb))

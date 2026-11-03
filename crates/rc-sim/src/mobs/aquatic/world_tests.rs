@@ -74,7 +74,7 @@ fn guardian_swims_and_beams() {
         let Some(m) = mob(&p, g) else { break };
         if std::env::var("F08_DEBUG").is_ok() && t < 120 {
             let running: Vec<i32> = m.goals.goals.iter().filter(|w| w.running).map(|w| w.prio).collect();
-            eprintln!("t{t} target {:?} beam {:?} goals {running:?} pos {:?}", m.target, m.aqua.beam, m.pos);
+            eprintln!("t{t} target {:?} beam {:?} goals {running:?} pos {:?}", m.target, m.aqua.beam, m.pos());
         }
         moved |= m.aqua.moving;
         if locked.is_none() && m.aqua.beam.is_some() {
@@ -86,7 +86,7 @@ fn guardian_swims_and_beams() {
         }
     }
     let m = mob(&p, g).unwrap();
-    eprintln!("moved {moved}, lock {locked:?}, hit {hit:?}, pos {:?}, HP {}", m.pos, p.s.life.vit.health);
+    eprintln!("moved {moved}, lock {locked:?}, hit {hit:?}, pos {:?}, HP {}", m.pos(), p.s.life.vit.health);
     assert!(m.in_water, "the guardian left the water");
     assert!(locked.is_some(), "beam never locked");
     let (l, h) = (locked.unwrap(), hit.expect("beam without damage"));
@@ -148,7 +148,7 @@ fn drowned_swims_to_player_at_night() {
     set_day_time(&mut p, 18000);
     p.run("fill 200 -59 200 231 -51 231 minecraft:water\nplayer 220.5 -54 216.5 90 0\n");
     let d = spawn(&mut p, Kind::Drowned, [208.5, -59.0, 216.5]);
-    let d0 = super::super::mth::dist2(mob(&p, d).unwrap().pos, p.s.pos);
+    let d0 = super::super::mth::dist2(mob(&p, d).unwrap().pos(), p.s.pos);
     let mut swam = false;
     let mut target = false;
     for _ in 0..300 {
@@ -158,8 +158,8 @@ fn drowned_swims_to_player_at_night() {
         target |= m.target == Some(Ent::Player);
     }
     let m = mob(&p, d).unwrap();
-    let d1 = super::super::mth::dist2(m.pos, p.s.pos);
-    eprintln!("target {target}, swim {swam}, distance² {d0:.1} → {d1:.1}, pos {:?}", m.pos);
+    let d1 = super::super::mth::dist2(m.pos(), p.s.pos);
+    eprintln!("target {target}, swim {swam}, distance² {d0:.1} → {d1:.1}, pos {:?}", m.pos());
     assert!(target, "the drowned does not target the player in the water");
     assert!(swam, "the drowned never swims");
     assert!(d1 < d0 * 0.5, "the drowned does not approach");
@@ -189,7 +189,7 @@ fn drowned_goes_to_water_by_day() {
             break;
         }
     }
-    eprintln!("water reached {reached:?}, pos {:?}", mob(&p, d).map(|m| m.pos));
+    eprintln!("water reached {reached:?}, pos {:?}", mob(&p, d).map(|m| m.pos()));
     assert!(reached.is_some(), "the drowned does not reach the water");
     drop(p);
     let _ = std::fs::remove_dir_all(&dir);

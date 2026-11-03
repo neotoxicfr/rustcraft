@@ -45,7 +45,7 @@ impl Server {
                     .mobs
                     .list
                     .iter()
-                    .filter(|o| o.kind == Kind::Vex && o.alive() && o.touches(&area) && dist2(m.pos, o.pos) <= 256.0)
+                    .filter(|o| o.kind == Kind::Vex && o.alive() && o.touches(&area) && dist2(m.pos(), o.pos()) <= 256.0)
                     .count() as i32;
                 m.rng.next_int_bound(8) + 1 > vexes
             }
@@ -140,27 +140,27 @@ impl Server {
     fn cast_fangs(&mut self, m: &mut Mob) {
         let Some(t) = m.target else { return };
         let Some(tp) = self.ent_pos(t) else { return };
-        let min_y = tp[1].min(m.pos[1]);
-        let max_y = tp[1].max(m.pos[1]) + 1.0;
-        let angle = super::super::mth::atan2(tp[2] - m.pos[2], tp[0] - m.pos[0]) as f32;
-        if dist2(m.pos, tp) < 9.0 {
+        let min_y = tp[1].min(m.pos()[1]);
+        let max_y = tp[1].max(m.pos()[1]) + 1.0;
+        let angle = super::super::mth::atan2(tp[2] - m.pos()[2], tp[0] - m.pos()[0]) as f32;
+        if dist2(m.pos(), tp) < 9.0 {
             for i in 0..5 {
                 let a = angle + i as f32 * std::f32::consts::PI * 0.4;
-                let x = m.pos[0] + f64::from(cos(a)) * 1.5;
-                let z = m.pos[2] + f64::from(sin(a)) * 1.5;
+                let x = m.pos()[0] + f64::from(cos(a)) * 1.5;
+                let z = m.pos()[2] + f64::from(sin(a)) * 1.5;
                 self.create_fangs(m, x, z, min_y, max_y, a, 0);
             }
             for i in 0..8 {
                 let a = angle + i as f32 * std::f32::consts::PI * 2.0 / 8.0 + (std::f64::consts::PI * 2.0 / 5.0) as f32;
-                let x = m.pos[0] + f64::from(cos(a)) * 2.5;
-                let z = m.pos[2] + f64::from(sin(a)) * 2.5;
+                let x = m.pos()[0] + f64::from(cos(a)) * 2.5;
+                let z = m.pos()[2] + f64::from(sin(a)) * 2.5;
                 self.create_fangs(m, x, z, min_y, max_y, a, 3);
             }
         } else {
             for i in 0..16 {
                 let reach = 1.25 * f64::from(i + 1);
-                let x = m.pos[0] + f64::from(cos(angle)) * reach;
-                let z = m.pos[2] + f64::from(sin(angle)) * reach;
+                let x = m.pos()[0] + f64::from(cos(angle)) * reach;
+                let z = m.pos()[2] + f64::from(sin(angle)) * reach;
                 self.create_fangs(m, x, z, min_y, max_y, angle, i);
             }
         }

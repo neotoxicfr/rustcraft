@@ -35,7 +35,7 @@ fn step(p: &mut Probe, n: i32) {
 }
 
 fn golems(p: &Probe, k: Kind) -> Vec<([f64; 3], i32)> {
-    p.s.mobs.list.iter().filter(|m| m.kind == k && !m.removed).map(|m| (m.pos, m.id)).collect()
+    p.s.mobs.list.iter().filter(|m| m.kind == k && !m.removed).map(|m| (m.pos(), m.id)).collect()
 }
 
 fn name_at(p: &Probe, at: [i32; 3]) -> String {

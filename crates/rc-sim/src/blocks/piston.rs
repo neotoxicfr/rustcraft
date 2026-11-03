@@ -25,7 +25,7 @@ impl PistonTarget for MobTarget<'_> {
         self.m.bbox()
     }
     fn position(&self) -> [f64; 3] {
-        self.m.pos
+        self.m.pos()
     }
     fn grounded(&self) -> bool {
         self.m.on_ground
@@ -40,9 +40,7 @@ impl PistonTarget for MobTarget<'_> {
     fn piston_push(&mut self, d: [f64; 3]) {
         // Without physics (vex): placed as is, no ceiling.
         if crate::mobs::illagers::no_physics(self.m) {
-            for (p, v) in self.m.pos.iter_mut().zip(d) {
-                *p += v;
-            }
+            self.m.add_pos(d);
             return;
         }
         let d = self.m.piston_deltas.limit(self.s.time, d);

@@ -192,7 +192,7 @@ pub fn move_control(m: &mut Mob) {
         m.speed = sp;
         m.zza = sp;
         let w = m.move_ctl.wanted;
-        let (xd, yd, zd) = (w[0] - m.pos[0], w[1] - m.pos[1], w[2] - m.pos[2]);
+        let (xd, yd, zd) = (w[0] - m.pos()[0], w[1] - m.pos()[1], w[2] - m.pos()[2]);
         if yd != 0.0 {
             let dd = (xd * xd + yd * yd + zd * zd).sqrt();
             m.vel[1] += f64::from(sp) * (yd / dd) * 0.1;
@@ -337,7 +337,7 @@ impl Server {
             let Some(m) = self.mobs.list.take(i) else { continue };
             let puff = m.sea.puff;
             if puff > 0 {
-                let kb = Some((m.pos[0] - self.pos[0], m.pos[2] - self.pos[2]));
+                let kb = Some((m.pos()[0] - self.pos[0], m.pos()[2] - self.pos[2]));
                 if self.player_hurt_by_mob(&m, "minecraft:mob_attack", (1 + puff) as f32, kb) {
                     let _ = self.send(rc_client::Event::GameEvent { kind: 9, param: 0.0 });
                     self.add_effect_from(
@@ -476,7 +476,7 @@ impl Server {
     }
 
     pub(crate) fn in_range_of_leader(&self, m: &Mob) -> bool {
-        m.sea.leader.and_then(|l| self.ent_pos(Ent::Mob(l))).is_some_and(|p| dist2(m.pos, p) <= 121.0)
+        m.sea.leader.and_then(|l| self.ent_pos(Ent::Mob(l))).is_some_and(|p| dist2(m.pos(), p) <= 121.0)
     }
 }
 

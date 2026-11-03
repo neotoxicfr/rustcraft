@@ -109,10 +109,10 @@ impl Server {
             m.ill.patrol_leader = true;
             // The game picks the target BEFORE placing the mob, still at the origin (0, 0, 0):
             // the leader's distant target is within ±500 blocks of the world center, y = 0.
-            let at = m.pos;
-            m.pos = [0.0; 3];
+            let at = m.pos();
+            m.set_pos([0.0; 3]);
             self.find_patrol_target(&mut m);
-            m.pos = at;
+            m.set_pos(at);
         }
         let mut g = Group::default();
         self.finalize_spawn(&mut m, Reason::Patrol, &mut g);

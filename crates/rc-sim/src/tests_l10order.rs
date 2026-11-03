@@ -54,7 +54,7 @@ fn arrow_hits_a_mob_summoned_after_it_before_it_moves() {
     let (mut p, dir) = open("l10-arrow");
     cmd(&mut p, "summon minecraft:arrow 2.0 -49.6 4.5 {Motion:[1.5d,0.0d,0.0d]}");
     cmd(&mut p, "summon minecraft:pig 3.5 -50 4.5 {NoGravity:1b,Motion:[0.0d,0.0d,1.5d]}");
-    let pig = |p: &Probe| p.s.mobs.list.iter().find(|m| m.kind == Kind::Pig).map(|m| (m.health, m.pos));
+    let pig = |p: &Probe| p.s.mobs.list.iter().find(|m| m.kind == Kind::Pig).map(|m| (m.health, m.pos()));
     let (full, _) = pig(&p).expect("pig");
     game_ticks(&mut p, 1);
     let (health, pos) = pig(&p).expect("pig");
@@ -491,7 +491,7 @@ fn mob_index_rebuilt_when_a_mob_rejoins() {
     p.s.sim_dist = 2;
     cmd(&mut p, "summon minecraft:pig 48.5 -60 4.5 {NoAI:1b}");
     cmd(&mut p, "summon minecraft:pig 4.5 -60 4.5 {NoAI:1b}");
-    let far = p.s.mobs.list.iter().find(|m| m.pos[0] > 40.0).expect("pig of chunk 3").id;
+    let far = p.s.mobs.list.iter().find(|m| m.pos()[0] > 40.0).expect("pig of chunk 3").id;
     game_ticks(&mut p, 1);
     p.s.sim_dist = 3;
     p.s.walk_rejoin();

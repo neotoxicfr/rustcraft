@@ -120,7 +120,7 @@ pub fn age_boundary(m: &mut Mob) {
 /// Baby goat: memories, screaming inherited from a randomly chosen parent
 /// or 2%.
 pub fn offspring(s: &mut Server, m: &mut Mob, partner: i32) -> Mob {
-    let mut baby = s.new_mob(Kind::Goat, m.pos, 0.0);
+    let mut baby = s.new_mob(Kind::Goat, m.pos(), 0.0);
     init_memories(s, &mut baby);
     let pick_me = s.mobs.rng.next_bool();
     let parent_screams = if pick_me { m.bm.screaming } else { s.mob_ref(partner).is_some_and(|p| p.bm.screaming) };
@@ -144,7 +144,7 @@ pub fn long_jump_check(s: &mut Server, m: &mut Mob, b: &mut Brain, j: &mut LongJ
 pub fn long_jump_start(_s: &mut Server, m: &mut Mob, _b: &mut Brain, j: &mut LongJump) {
     j.chosen = None;
     j.tries = 20;
-    j.initial = Some(m.pos);
+    j.initial = Some(m.pos());
     let o = m.block_pos();
     j.candidates.clear();
     // Fastest X first, then y, then z; weight = ⌈distance²⌉.
@@ -168,7 +168,7 @@ pub fn long_jump_start(_s: &mut Server, m: &mut Mob, _b: &mut Brain, j: &mut Lon
 
 pub fn long_jump_continue(s: &mut Server, m: &mut Mob, b: &mut Brain, j: &mut LongJump) -> bool {
     let valid =
-        j.initial == Some(m.pos) && j.tries > 0 && !m.in_water && (j.chosen.is_some() || !j.candidates.is_empty());
+        j.initial == Some(m.pos()) && j.tries > 0 && !m.in_water && (j.chosen.is_some() || !j.candidates.is_empty());
     if !valid && !b.mem.lj_mid.has() {
         let v = j.lo + s.mobs.rng.next_int_bound(j.hi - j.lo + 1);
         b.mem.lj_cd.set(v / 2);
@@ -285,7 +285,7 @@ fn optimal_jump(s: &Server, m: &Mob, j: &mut LongJump, target: [f64; 3]) -> Opti
 /// The jump vector computation for an angle with collision checks along the parabola (box of the
 /// "long jump" pose).
 fn jump_vector(s: &Server, m: &Mob, target: [f64; 3], max_v: f32, angle: i32) -> Option<[f64; 3]> {
-    let p = m.pos;
+    let p = m.pos();
     let plane = crate::mobs::mth::normalize([target[0] - p[0], 0.0, target[2] - p[2]]).map(|v| v * 0.5);
     let tp = [target[0] - plane[0], target[1] - plane[1], target[2] - plane[2]];
     let dir = [tp[0] - p[0], tp[1] - p[1], tp[2] - p[2]];
@@ -496,11 +496,11 @@ pub fn ram_tick(s: &mut Server, m: &mut Mob, b: &mut Brain, dir: [f64; 3]) {
         let force = if m.is_baby() { 1.0 } else { 2.5 };
         match target {
             Ent::Player => {
-                if s.player_hurt_by_mob(m, ty, dmg, Some((m.pos[0] - s.pos[0], m.pos[2] - s.pos[2]))) {
+                if s.player_hurt_by_mob(m, ty, dmg, Some((m.pos()[0] - s.pos[0], m.pos()[2] - s.pos[2]))) {
                     s.player_thorns(m, ty); // G5-F02d
                 }
                 // W8c: block replayed after the hit (the shield wears down a second time).
-                let blocking = s.reapply_blocking("minecraft:mob_attack", dmg, m.pos);
+                let blocking = s.reapply_blocking("minecraft:mob_attack", dmg, m.pos());
                 let bf = if blocking { 0.5 } else { 1.0 };
                 s.player_knockback(f64::from(bf * factor) * force, dir[0], dir[2]);
             }
@@ -558,7 +558,7 @@ fn finish_ram(s: &mut Server, m: &mut Mob, b: &mut Brain) {
 fn rammed_horn_block(s: &Server, m: &Mob) -> bool {
     let n = crate::mobs::mth::normalize([m.vel[0], 0.0, m.vel[2]]);
     let n = [n[0], n[2]];
-    let f = block_of([m.pos[0] + n[0], m.pos[1], m.pos[2] + n[1]]);
+    let f = block_of([m.pos()[0] + n[0], m.pos()[1], m.pos()[2] + n[1]]);
     s.btag_id(f, crate::tag_bits::TagId::SnapsGoatHorn) || s.btag_id([f[0], f[1] + 1, f[2]], crate::tag_bits::TagId::SnapsGoatHorn)
 }
 
@@ -583,7 +583,7 @@ fn drop_horn(s: &mut Server, m: &mut Mob) -> bool {
     let dx = f64::from(m.rng.next_float() * 0.4 - 0.2);
     let dy = f64::from(m.rng.next_float() * 0.4 + 0.3);
     let dz = f64::from(m.rng.next_float() * 0.4 - 0.2);
-    s.spawn_item(m.pos, [dx, dy, dz], horn, 10);
+    s.spawn_item(m.pos(), [dx, dy, dz], horn, 10);
     true
 }
 
@@ -623,7 +623,7 @@ pub fn interact(s: &mut Server, m: &mut Mob, slot: usize, item: &str) -> Option<
     if r == Some(true) && s.slots[slot].as_ref().is_some_and(|st| s.item_tag(&st.id, "minecraft:goat_food")) {
         let p = 0.8 + s.mobs.rng.next_float() * 0.4;
         let snd = if m.bm.screaming { "minecraft:entity.goat.screaming.eat" } else { "minecraft:entity.goat.eat" };
-        s.world_sound(snd, 6, m.pos, 1.0, p);
+        s.world_sound(snd, 6, m.pos(), 1.0, p);
     }
     r
 }

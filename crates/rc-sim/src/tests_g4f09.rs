@@ -214,7 +214,7 @@ fn player_infestation() {
     assert!(fish.len() >= 4 && fish.len() <= 60, "{} silverfish for 200 hits", fish.len());
     assert_eq!(sounds, fish.len(), "one sound per silverfish");
     for f in &fish {
-        assert_eq!(f.pos, [8.5, f64::from(Y) + f64::from(1.8f32) / 2.0, 8.5]);
+        assert_eq!(f.pos(), [8.5, f64::from(Y) + f64::from(1.8f32) / 2.0, 8.5]);
         let h = (f.vel[0] * f.vel[0] + f.vel[2] * f.vel[2]).sqrt();
         assert!((h - 0.3).abs() < 1.0e-6 && f.vel[1] == 0.0, "velocity {:?}", f.vel);
         // Gaze towards +Z (yaw 0): the drawn angle stays in [−π/2, π/2], hence vz ≥ 0.
@@ -236,7 +236,7 @@ fn mob_infestation() {
     let fish = w.mobs_of(Kind::Silverfish);
     assert!(!fish.is_empty(), "no silverfish for 200 hits");
     let mid = f64::from(Y) + f64::from(z.height()) / 2.0;
-    assert!(fish.iter().all(|f| f.pos == [4.5, mid, 4.5]), "silverfish outside the middle of the box");
+    assert!(fish.iter().all(|f| f.pos() == [4.5, mid, 4.5]), "silverfish outside the middle of the box");
 }
 
 /// Rotation around the game's Y: zero angle = identity; −π/2: (x, z) → (−z, x) exactly.
@@ -279,7 +279,7 @@ fn player_death_removal_effects() {
     assert_eq!(ev3018, webs.len(), "one event 3018 per cobweb");
     let slimes = w.mobs_of(Kind::Slime);
     assert_eq!(slimes.len(), 2, "slimes of the oozing");
-    assert!(slimes.iter().all(|m| m.cube.size == 2 && m.pos == [8.5, f64::from(Y) + 0.5, 8.5]));
+    assert!(slimes.iter().all(|m| m.cube.size == 2 && m.pos() == [8.5, f64::from(Y) + 0.5, 8.5]));
     let burst = evs.iter().find_map(|e| match e {
         Event::Explode(x) => Some(x.radius),
         _ => None,
@@ -391,7 +391,7 @@ fn dead_player_keeps_pose() {
     }
     let fish = w.mobs_of(Kind::Silverfish);
     assert!(!fish.is_empty(), "no silverfish on the fatal hit");
-    assert!(fish.iter().all(|f| f.pos[1] == mid), "silverfish outside the middle: {:?}", fish[0].pos);
+    assert!(fish.iter().all(|f| f.pos()[1] == mid), "silverfish outside the middle: {:?}", fish[0].pos());
 }
 
 /// Turtle helmet while swimming just under the surface: eyes at 0.4 (swimming pose) in the water, hence

@@ -607,7 +607,7 @@ impl Server {
             CubeGoal::Tempt { .. } => {
                 let eye = self.player_eye_y();
                 self.look_at(m, [self.pos[0], eye, self.pos[2]], 75.0 + 20.0, 0.0);
-                if dist2(m.pos, self.pos) < 1.0 {
+                if dist2(m.pos(), self.pos) < 1.0 {
                     m.set_wanted_movement(0.0);
                 } else {
                     super::goals::mob_look_at_direct(m, self.pos, eye, 10.0, 10.0);
@@ -657,7 +657,7 @@ impl Server {
             if !ib.intersects(&area) {
                 continue;
             }
-            let dd = dist2(m.pos, d.pos);
+            let dd = dist2(m.pos(), d.pos);
             if best.is_none_or(|x| dd < x.0) {
                 best = Some((dd, d.id));
             }
@@ -738,7 +738,7 @@ impl Server {
                 self.leash_drop(m, true, true);
                 m.dead = true;
                 if self.rule("minecraft:tnt_explodes", true) {
-                    let c = [m.pos[0], m.pos[1] + f64::from(m.height()) * 0.0625, m.pos[2]];
+                    let c = [m.pos()[0], m.pos()[1] + f64::from(m.height()) * 0.0625, m.pos()[2]];
                     // A TNT's interaction with the blocks if mobs may grief, none otherwise; the
                     // calculator of a TNT that went through a portal while its portal delay runs.
                     // The calculator does not depend on the interaction.
@@ -824,7 +824,7 @@ impl Server {
         for i in 0..count {
             let xd = ((i % 2) as f32 - 0.5) * off;
             let zd = ((i / 2) as f32 - 0.5) * off;
-            let mut c = self.new_mob(m.kind, m.pos, 0.0);
+            let mut c = self.new_mob(m.kind, m.pos(), 0.0);
             c.head_yaw = 0.0;
             c.body_yaw = 0.0;
             // The common conversion.
@@ -842,8 +842,8 @@ impl Server {
             c.custom_name = m.custom_name.clone();
             // Setting up the split cube.
             c.set_size(half, true);
-            c.pos = [m.pos[0] + f64::from(xd), m.pos[1] + 0.5, m.pos[2] + f64::from(zd)];
-            c.old = c.pos;
+            c.set_pos([m.pos()[0] + f64::from(xd), m.pos()[1] + 0.5, m.pos()[2] + f64::from(zd)]);
+            c.old = c.pos();
             c.yaw = m.rng.next_float() * 360.0;
             c.pitch = 0.0;
             if m.kind == Kind::SulfurCube {
@@ -969,13 +969,13 @@ impl Server {
         if !self.within_melee(m, Ent::Player) {
             return;
         }
-        let from = [m.pos[0], m.eye_y(), m.pos[2]];
+        let from = [m.pos()[0], m.eye_y(), m.pos()[2]];
         let to = [self.pos[0], self.player_eye_y(), self.pos[2]];
         if dist2(from, to) > 128.0 * 128.0 || self.clip_blocks(from, to) {
             return;
         }
         let dmg = m.attack_damage();
-        let kb = (m.pos[0] - self.pos[0], m.pos[2] - self.pos[2]);
+        let kb = (m.pos()[0] - self.pos[0], m.pos()[2] - self.pos[2]);
         if self.player_hurt_by_mob(m, "minecraft:mob_attack", dmg, Some(kb)) {
             let pitch = (m.rng.next_float() - m.rng.next_float()) * 0.2 + 1.0;
             self.cube_sound(m, "minecraft:entity.slime.attack", 1.0, pitch);
@@ -988,10 +988,10 @@ impl Server {
         if !m.has_body_item() {
             return;
         }
-        let c2p = [m.pos[0] - self.pos[0], m.pos[1] - self.pos[1], m.pos[2] - self.pos[2]];
+        let c2p = [m.pos()[0] - self.pos[0], m.pos()[1] - self.pos[1], m.pos()[2] - self.pos[2]];
         let hd = (c2p[0] * c2p[0] + c2p[2] * c2p[2]).sqrt();
         let ph = self.player_aabb().max[1] - self.pos[1];
-        let (feet, bottom) = (self.pos[1], m.pos[1]);
+        let (feet, bottom) = (self.pos[1], m.pos()[1]);
         let top = bottom + f64::from(m.height());
         if !(hd < f64::from(1.3f32) && feet <= top && feet + ph > bottom) {
             return;
@@ -1020,7 +1020,7 @@ impl Server {
     pub(crate) fn sulfur_contact_damage(&mut self, m: &mut Mob) {
         for (ty, amount, _attr) in m.cube.contacts.clone() {
             let a = crate::ench_fx::sample(&amount, &mut m.rng);
-            let kb = (m.pos[0] - self.pos[0], m.pos[2] - self.pos[2]);
+            let kb = (m.pos()[0] - self.pos[0], m.pos()[2] - self.pos[2]);
             self.player_hurt_by_mob(m, &ty, a, Some(kb));
         }
     }
@@ -1072,7 +1072,7 @@ impl Server {
             if self.dmg_tag(ty, "minecraft:sulfur_cube_with_block_immune_to") {
                 if !self.dmg_tag(ty, "minecraft:no_knockback") {
                     let (xd, zd) = match src {
-                        Some(s) => (s[0] - m.pos[0], s[2] - m.pos[2]),
+                        Some(s) => (s[0] - m.pos()[0], s[2] - m.pos()[2]),
                         None => (0.0, 0.0),
                     };
                     self.mob_knockback(m, 0.4, xd, zd, by, amount, false);
@@ -1136,7 +1136,7 @@ impl Server {
             Ent::Player => (self.pos, self.player_eye_y(), self.yaw, self.pitch),
             Ent::Mob(id) => {
                 let o = self.mob_ref(id)?;
-                (o.pos, o.eye_y(), o.yaw, o.pitch)
+                (o.pos(), o.eye_y(), o.yaw, o.pitch)
             }
         };
         Some(([feet[0], eye_y, feet[2]], feet, view_vector(pitch, yaw)))
@@ -1159,7 +1159,7 @@ impl Server {
             look: src.2,
             bbox: m.bbox(),
             height: m.height(),
-            pos: m.pos,
+            pos: m.pos(),
             powers: m.cube.kb,
             resistance: m.knockback_resistance(),
             dir: (xd, zd),
@@ -1303,7 +1303,7 @@ impl Server {
 
     /// Drops the body item at the passengers' attachment point.
     fn sulfur_eject(&mut self, m: &Mob, s: Stack) {
-        let pos = [m.pos[0], m.pos[1] + f64::from(m.height()), m.pos[2]];
+        let pos = [m.pos()[0], m.pos()[1] + f64::from(m.height()), m.pos()[2]];
         let r = &mut self.mobs.rng;
         let v = [r.next_double() * 0.2 - 0.1, 0.2, r.next_double() * 0.2 - 0.1];
         self.spawn_item(pos, v, s, 10);
@@ -1314,9 +1314,9 @@ impl Server {
         if m.cube.forced_age_timer > 0 {
             if m.cube.forced_age_timer % 4 == 0 {
                 let w = f64::from(m.width());
-                let x = m.pos[0] + w * (2.0 * m.rng.next_double() - 1.0);
-                let y = m.pos[1] + f64::from(m.height()) * m.rng.next_double() + 0.5;
-                let z = m.pos[2] + w * (2.0 * m.rng.next_double() - 1.0);
+                let x = m.pos()[0] + w * (2.0 * m.rng.next_double() - 1.0);
+                let y = m.pos()[1] + f64::from(m.height()) * m.rng.next_double() + 0.5;
+                let z = m.pos()[2] + w * (2.0 * m.rng.next_double() - 1.0);
                 self.particles("minecraft:happy_villager", [x, y, z], [0.0; 3], 0.0, 1);
             }
             m.cube.forced_age_timer -= 1;

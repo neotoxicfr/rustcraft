@@ -135,7 +135,7 @@ impl Server {
                 crate::nbtio::set(&mut full, "Pos", Nbt::List(pos.iter().map(|&x| Nbt::Double(x)).collect()));
                 self.load_mob(&mut m, &full);
                 self.load_portal_cooldown(m.id, &full);
-                m.pos = pos;
+                m.set_pos(pos);
                 m.old = pos;
                 m.sync_data();
             }

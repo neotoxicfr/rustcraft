@@ -181,7 +181,7 @@ fn pull_then_snap() {
     assert_eq!(leash::home(m), Some(([0, Y, 0], 5)), "home around the holder");
     // Snap.
     let i = w.p.s.mob_index(cow).unwrap();
-    w.p.s.mobs.list.get_mut(i).unwrap().pos = [13.0, f64::from(Y), 0.5];
+    w.p.s.mobs.list.get_mut(i).unwrap().set_pos([13.0, f64::from(Y), 0.5]);
     let _ = w.p.take_events();
     w.leash_tick(cow);
     let evs = w.p.take_events();
@@ -519,7 +519,7 @@ fn bench_leash_tick() {
         for _ in 0..5 {
             let t = std::time::Instant::now();
             for _ in 0..2000 {
-                m.pos = [x, f64::from(Y), 0.5];
+                m.set_pos([x, f64::from(Y), 0.5]);
                 m.vel = [0.0; 3];
                 w.p.s.leash_tick(&mut m);
             }

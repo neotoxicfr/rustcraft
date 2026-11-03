@@ -60,7 +60,7 @@ fn wither_built_and_summoned() {
     let w = withers(&p);
     assert_eq!(w.len(), 1, "wither not summoned");
     let m = p.s.mob_ref(w[0]).unwrap();
-    assert_eq!(m.pos, [210.5, -59.0 + 0.55, 216.5]);
+    assert_eq!(m.pos(), [210.5, -59.0 + 0.55, 216.5]);
     assert_eq!((m.yaw, m.body_yaw), (90.0, 90.0));
     assert_eq!((m.wither.inv, m.health), (220, 100.0));
     for q in [[210, -59, 216], [209, -58, 216], [211, -58, 216], [209, -57, 216], [211, -57, 216]] {
@@ -124,7 +124,7 @@ fn wither_skulls_wither_the_player() {
         eprintln!("skull {id}: {t:?}");
     }
     if let Some(w) = p.s.mobs.list.iter().find(|m| m.kind == Kind::Wither) {
-        eprintln!("wither {:?} target {:?} heads {:?}", w.pos, w.target, w.wither.targets);
+        eprintln!("wither {:?} target {:?} heads {:?}", w.pos(), w.target, w.wither.targets);
     }
     assert!(seen >= 1, "no skull");
     assert!(hit, "wither effect missing");

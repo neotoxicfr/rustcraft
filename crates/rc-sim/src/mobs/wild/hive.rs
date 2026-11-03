@@ -257,12 +257,12 @@ fn release_occupant(s: &mut Server, p: [i32; 3], occ: &Nbt, status: Release, flo
         }
     }
     let delta = if blocked { 0.0 } else { 0.55 + f64::from(m.width() / 2.0) };
-    m.pos = [
+    m.set_pos([
         f64::from(p[0]) + 0.5 + delta * f64::from(f[0]),
         f64::from(p[1]) + 0.5 - f64::from(m.height() / 2.0),
         f64::from(p[2]) + 0.5 + delta * f64::from(f[2]),
-    ];
-    m.old = m.pos;
+    ]);
+    m.old = m.pos();
     let at = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
     s.world_sound("minecraft:block.beehive.exit", 4, at, 1.0, 1.0);
     s.add_mob(m);
@@ -299,7 +299,7 @@ pub fn empty_all(s: &mut Server, p: [i32; 3], player: bool, status: Release) {
         let pp = s.pos;
         if let Some(i) = s.mob_index(id)
             && let Some(b) = s.mobs.list.get_mut(i)
-            && super::super::mth::dist2(pp, b.pos) <= 16.0
+            && super::super::mth::dist2(pp, b.pos()) <= 16.0
         {
             if sedated {
                 b.wild.stay_out = 400;

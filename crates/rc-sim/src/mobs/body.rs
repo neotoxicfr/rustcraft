@@ -122,7 +122,7 @@ impl Server {
         let eye = m.eye_y();
         let mut flow = m.vel;
         let (water, lava, eyes) =
-            rc_physics::scan_fluids_entity(&w, &self.phys, &m.bbox(), m.pos, eye, true, self.fast_lava(), &mut flow);
+            rc_physics::scan_fluids_entity(&w, &self.phys, &m.bbox(), m.pos(), eye, true, self.fast_lava(), &mut flow);
         // F09: aquatic fauna and nautiluses are not pushed by currents.
         if super::surface::pushed_by_fluid(m.kind)
             && super::aquatic::pushed_by_fluid(m)
@@ -142,7 +142,7 @@ impl Server {
 
     /// Block under the feet that acts on movement.
     pub(crate) fn mob_below(&self, m: &Mob, off: f32) -> [i32; 3] {
-        self.on_pos(m.pos, m.support, off)
+        self.on_pos(m.pos(), m.support, off)
     }
 
     /// Block under an entity at `off` below its feet (single-precision offset, like the game):
@@ -265,11 +265,9 @@ impl Server {
         };
         let ml = l2(mv);
         if ml > 1.0e-7 || l2(delta) - ml < 1.0e-7 {
-            let from = m.pos;
-            for (p, v) in m.pos.iter_mut().zip(mv) {
-                *p += v;
-            }
-            m.inside.record(from, m.pos, delta); // read back by the crossed-block pass
+            let from = m.pos();
+            m.add_pos(mv);
+            m.inside.record(from, m.pos(), delta); // read back by the crossed-block pass
         }
         let xc = (delta[0] - mv[0]).abs() >= 1.0e-5;
         let zc = (delta[2] - mv[2]).abs() >= 1.0e-5;
@@ -287,14 +285,14 @@ impl Server {
                     Some(l) => l,
                     None => &w,
                 };
-                rc_physics::support_of(wd, &m.bbox(), m.pos)
+                rc_physics::support_of(wd, &m.bbox(), m.pos())
             } else {
                 None
             };
         }
         // Fall; F12: strider in lava, fall reset to zero; nothing for the flyers.
         let effect_pos = self.mob_below(m, 0.2);
-        m.body_fx.effect = Some((m.tick_count, m.pos, m.support, effect_pos));
+        m.body_fx.effect = Some((m.tick_count, m.pos(), m.support, effect_pos));
         let lava_reset = super::nether::strider::fall_reset(m);
         if lava_reset {
             m.fall_distance = 0.0;
@@ -307,7 +305,7 @@ impl Server {
         // Landing dust: before the block's rule, on the fall from before this movement (none for
         // the flyers, which skip the whole fall check).
         if falls && m.on_ground && before > 0.0 {
-            self.fall_dust(m.pos, effect_pos, before, m.attrs.safe_fall.value());
+            self.fall_dust(m.pos(), effect_pos, before, m.attrs.safe_fall.value());
         }
         if falls && m.on_ground && !lava_reset {
             if m.fall_distance > 0.0 {
@@ -322,7 +320,7 @@ impl Server {
                 let st = self.st(m.support.unwrap_or(effect_pos));
                 self.game_event_src(
                     "minecraft:hit_ground",
-                    m.pos,
+                    m.pos(),
                     Some(super::recent::vibration::Src::Living(Ent::Mob(m.id))),
                     Some(st),
                 );
@@ -438,7 +436,7 @@ impl Server {
         if vibrate {
             self.game_event_src(
                 "minecraft:step",
-                m.pos,
+                m.pos(),
                 Some(super::recent::vibration::Src::Living(Ent::Mob(m.id))),
                 Some(st),
             );
@@ -529,7 +527,7 @@ impl Server {
     /// Fall sound of the block touched at 0.2 under the feet: volume ½,
     /// pitch ¾ of its sound set; nothing on air.
     pub(crate) fn mob_block_fall_sound(&mut self, m: &Mob) {
-        if let Some((s, v, p)) = self.block_fall_sound_at(m.pos) {
+        if let Some((s, v, p)) = self.block_fall_sound_at(m.pos()) {
             self.mob_sound(m, &s, v, p);
         }
     }
@@ -694,7 +692,7 @@ impl Server {
         // since (same computation, without re-reading the support).
         let p = match m.body_fx.effect {
             Some((tick, pos, support, e))
-                if stepon_cache() && tick == m.tick_count && pos == m.pos && support == m.support =>
+                if stepon_cache() && tick == m.tick_count && pos == m.pos() && support == m.support =>
             {
                 e
             }
@@ -742,7 +740,7 @@ impl Server {
         let falling = m.vel[1] <= 0.0;
         // F12: the strider whose cell holds lava walks on it like on the ground.
         if (m.in_water || m.lava_height > 0.0) && !super::nether::strider::stands_on_fluid(self, m) {
-            let y0 = m.pos[1];
+            let y0 = m.pos()[1];
             if m.in_water {
                 let slow = super::mounts::water_slow_down(m).unwrap_or_else(|| super::surface::water_slow_down(m));
                 Self::move_relative(m, 0.02);
@@ -770,7 +768,7 @@ impl Server {
             }
             // Leaving the fluid.
             if m.horizontal_collision {
-                let b = m.bbox().offset(m.vel[0], m.vel[1] + f64::from(0.6f32) - m.pos[1] + y0, m.vel[2]);
+                let b = m.bbox().offset(m.vel[0], m.vel[1] + f64::from(0.6f32) - m.pos()[1] + y0, m.vel[2]);
                 if rc_physics::is_free(&self.world(), &b) && !self.box_has_liquid(&b) {
                     m.vel[1] = f64::from(0.3f32);
                 }
@@ -814,7 +812,7 @@ impl Server {
         if self.state_at(below).is_some() {
             my -= gravity;
         } else {
-            my = if m.pos[1] > f64::from(self.dim.height.min_y) { -0.1 } else { 0.0 };
+            my = if m.pos()[1] > f64::from(self.dim.height.min_y) { -0.1 } else { 0.0 };
         }
         let drag = m.air_drag_modifier();
         let air = corrected(0.91, drag);
@@ -1046,7 +1044,7 @@ impl Server {
                 Ent::Player => {
                     // The player's push on the server side has no visible effect (the client
                     // pushes itself); the mob, on the other hand, is pushed.
-                    let (xa, za) = Self::push_vec(self.pos, m.pos);
+                    let (xa, za) = Self::push_vec(self.pos, m.pos());
                     if let Some((xa, za)) = xa.zip(za)
                         && self.mob_pushable(m)
                     {
@@ -1069,7 +1067,7 @@ impl Server {
             // The minecart's rule: it moves aside and gives the mob a quarter, except to its rider.
             if !super::illagers::no_physics(m)
                 && !c.passengers.contains(&Ent::Mob(m.id))
-                && let Some((xa, za)) = Self::cart_pushed_by(&mut c, m.pos)
+                && let Some((xa, za)) = Self::cart_pushed_by(&mut c, m.pos())
             {
                 m.vel[0] += xa;
                 m.vel[2] += za;
@@ -1100,7 +1098,7 @@ impl Server {
 
     /// `entity.push(this)`: `e` is the other, `src` the one who pushes.
     fn push_pair(e: &mut Mob, src: &mut Mob, e_pushable: bool, src_pushable: bool) {
-        let (xa, za) = Self::push_vec(e.pos, src.pos);
+        let (xa, za) = Self::push_vec(e.pos(), src.pos());
         let (Some(xa), Some(za)) = (xa, za) else { return };
         if e_pushable {
             e.vel[0] -= xa;
@@ -1136,7 +1134,7 @@ impl Server {
         }
         for i in idx {
             let Some(mut o) = self.mobs.list.take(i) else { continue };
-            let (xa, za) = Self::push_vec(o.pos, ppos);
+            let (xa, za) = Self::push_vec(o.pos(), ppos);
             if let (Some(xa), Some(za)) = (xa, za)
                 && self.mob_pushable(&o)
             {

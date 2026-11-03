@@ -220,7 +220,7 @@ fn allay_hears_note_block_through_vibrations() {
     w.cmd(&format!("summon minecraft:allay 4.5 {Y} 10.5 {{NoGravity:1b}}"));
     w.cmd(&format!("summon minecraft:allay 10.5 {Y} 4.5 {{NoGravity:1b}}"));
     let ids: Vec<(i32, f64)> =
-        w.p.s.mobs.list.iter().filter(|m| m.kind == MobKind::Allay).map(|m| (m.id, m.pos[0])).collect();
+        w.p.s.mobs.list.iter().filter(|m| m.kind == MobKind::Allay).map(|m| (m.id, m.pos()[0])).collect();
     assert_eq!(ids.len(), 2);
     let liked = |w: &W, x: f64| {
         let id = ids.iter().find(|e| e.1 == x).unwrap().0;

@@ -167,12 +167,12 @@ impl Server {
         if self.egg_kind(egg) != Some(m.kind) {
             return false;
         }
-        let mut baby = if bred_here(m.kind) { self.breed_offspring(m, None) } else { self.new_mob(m.kind, m.pos, 0.0) };
+        let mut baby = if bred_here(m.kind) { self.breed_offspring(m, None) } else { self.new_mob(m.kind, m.pos(), 0.0) };
         if !set_baby(&mut baby) {
             return false;
         }
-        baby.pos = m.pos;
-        baby.old = m.pos;
+        baby.set_pos(m.pos());
+        baby.old = m.pos();
         baby.yaw = 0.0;
         baby.pitch = 0.0;
         baby.head_yaw = 0.0;
@@ -198,7 +198,7 @@ impl Server {
     /// sheep); `partner`: (variant, wool, collar) of the second parent, `None` = the same.
     pub(crate) fn breed_offspring(&mut self, m: &mut Mob, partner: Option<(i32, u8, i32)>) -> Mob {
         let (pv, pw, pc) = partner.unwrap_or((m.variant, m.wool, m.collar));
-        let mut baby = self.new_mob(m.kind, m.pos, 0.0);
+        let mut baby = self.new_mob(m.kind, m.pos(), 0.0);
         baby.age = -24000;
         match m.kind {
             Kind::Cow | Kind::Pig | Kind::Chicken => baby.variant = if m.rng.next_bool() { m.variant } else { pv },
@@ -445,7 +445,7 @@ impl Server {
         };
         if wolf_armor_crack(before, max) != level_after {
             self.mob_sound(m, "minecraft:item.wolf_armor.crack", 1.0, 1.0);
-            self.item_particles("minecraft:armadillo_scute", [m.pos[0], m.pos[1] + 1.0, m.pos[2]], [0.2, 0.1, 0.2], 0.1, 20);
+            self.item_particles("minecraft:armadillo_scute", [m.pos()[0], m.pos()[1] + 1.0, m.pos()[2]], [0.2, 0.1, 0.2], 0.1, 20);
         }
         true
     }

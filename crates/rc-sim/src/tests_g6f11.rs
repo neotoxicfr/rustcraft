@@ -443,7 +443,7 @@ fn phantoms_consider_every_player() {
     }
     assert!(spawned > 0, "no phantom for the awake guest");
     let m = p.s.mobs.list.iter().find(|m| m.kind == Kind::Phantom).unwrap();
-    assert!((m.pos[0] - 8.5).abs() <= 11.0 && (m.pos[2] - 8.5).abs() <= 11.0, "above the guest: {:?}", m.pos);
+    assert!((m.pos()[0] - 8.5).abs() <= 11.0 && (m.pos()[2] - 8.5).abs() <= 11.0, "above the guest: {:?}", m.pos());
     finish(p, dir);
 }
 
@@ -464,7 +464,7 @@ fn patrols_pick_among_all_players() {
         p.s.mobs.ill.patrol_next = 1;
         p.s.patrol_spawner_tick();
         if let Some(m) = p.s.mobs.list.iter().find(|m| m.kind == Kind::Pillager) {
-            found = Some(m.pos);
+            found = Some(m.pos());
             break;
         }
     }

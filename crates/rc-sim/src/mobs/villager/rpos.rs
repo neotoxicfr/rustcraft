@@ -32,7 +32,7 @@ fn dir_within(m: &mut Mob, min_h: f64, max_h: f64, v: i32, dx: f64, dz: f64, rad
 
 fn restricted(m: &Mob, home: Home, h: f64) -> bool {
     home.is_some_and(|(c, r)| {
-        let d = [f64::from(c[0]) + 0.5 - m.pos[0], f64::from(c[1]) + 0.5 - m.pos[1], f64::from(c[2]) + 0.5 - m.pos[2]];
+        let d = [f64::from(c[0]) + 0.5 - m.pos()[0], f64::from(c[1]) + 0.5 - m.pos()[1], f64::from(c[2]) + 0.5 - m.pos()[2]];
         let lim = f64::from(r) + h + 1.0;
         d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < lim * lim
     })
@@ -54,18 +54,18 @@ fn toward(m: &mut Mob, home: Home, xz: f64, d: [i32; 3]) -> [i32; 3] {
     if let Some((c, _)) = home
         && xz > 1.0
     {
-        if m.pos[0] > f64::from(c[0]) {
+        if m.pos()[0] > f64::from(c[0]) {
             xt -= m.rng.next_double() * xz / 2.0;
         } else {
             xt += m.rng.next_double() * xz / 2.0;
         }
-        if m.pos[2] > f64::from(c[2]) {
+        if m.pos()[2] > f64::from(c[2]) {
             zt -= m.rng.next_double() * xz / 2.0;
         } else {
             zt += m.rng.next_double() * xz / 2.0;
         }
     }
-    [(xt + m.pos[0]).floor() as i32, (f64::from(d[1]) + m.pos[1]).floor() as i32, (zt + m.pos[2]).floor() as i32]
+    [(xt + m.pos()[0]).floor() as i32, (f64::from(d[1]) + m.pos()[1]).floor() as i32, (zt + m.pos()[2]).floor() as i32]
 }
 
 impl Server {
@@ -141,7 +141,7 @@ impl Server {
         to: [f64; 3],
         rad: f64,
     ) -> Option<[f64; 3]> {
-        let (dx, dz) = (to[0] - m.pos[0], to[2] - m.pos[2]);
+        let (dx, dz) = (to[0] - m.pos()[0], to[2] - m.pos()[2]);
         let restrict = restricted(m, home, f64::from(h));
         self.rbest_of(m, &|_, _| 0.0, |s, m| {
             let d = dir_within(m, 0.0, f64::from(h), v, dx, dz, rad)?;
@@ -192,14 +192,14 @@ impl Server {
 
     /// The land position draw toward a point (iron golem wandering in the village, F06).
     pub(crate) fn rpos_land_towards(&self, m: &mut Mob, home: Home, h: i32, v: i32, to: [f64; 3]) -> Option<[f64; 3]> {
-        let dir = [to[0] - m.pos[0], to[2] - m.pos[2]];
+        let dir = [to[0] - m.pos()[0], to[2] - m.pos()[2]];
         self.rpos_land_dir(m, home, 0.0, f64::from(h), v, dir)
     }
 
     /// The land position draw opposite a point.
     pub(crate) fn rpos_land_away(&self, m: &mut Mob, home: Home, h: i32, v: i32, from: [f64; 3]) -> Option<[f64; 3]> {
-        let mut dir = [m.pos[0] - from[0], m.pos[2] - from[2]];
-        let dy = m.pos[1] - from[1];
+        let mut dir = [m.pos()[0] - from[0], m.pos()[2] - from[2]];
+        let dy = m.pos()[1] - from[1];
         if dir[0] * dir[0] + dy * dy + dir[1] * dir[1] == 0.0 {
             dir = [m.rng.next_double() - 0.5, m.rng.next_double() - 0.5];
         }

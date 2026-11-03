@@ -107,11 +107,11 @@ impl Server {
                     && m.on_ground
                     && !self.hurt_recently(m)
                     && self.npc_trading(m)
-                    && super::brain::dist2(m.pos, self.pos) <= 16.0
+                    && super::brain::dist2(m.pos(), self.pos) <= 16.0
             }
             TGoal::LookAtTradingPlayer { .. } => self.npc_trading(m),
             TGoal::WanderToPosition => {
-                m.npc.as_ref().and_then(|n| n.wander).is_some_and(|w| !closer_center(w, m.pos, 2.0))
+                m.npc.as_ref().and_then(|n| n.wander).is_some_and(|w| !closer_center(w, m.pos(), 2.0))
             }
             TGoal::MoveTowardsRestriction { wanted } => {
                 let Some((c, r)) = home_of(m) else { return false };
@@ -178,16 +178,16 @@ impl Server {
                         .filter(|o| {
                             o.id != m.id
                                 && o.alive()
-                                && o.pos[0] > bb.min[0] - d - 0.5
-                                && o.pos[0] < bb.max[0] + d + 0.5
-                                && o.pos[1] + f64::from(o.height()) > bb.min[1] - 3.0
-                                && o.pos[1] < bb.max[1] + 3.0
-                                && o.pos[2] > bb.min[2] - d - 0.5
-                                && o.pos[2] < bb.max[2] + d + 0.5
+                                && o.pos()[0] > bb.min[0] - d - 0.5
+                                && o.pos()[0] < bb.max[0] + d + 0.5
+                                && o.pos()[1] + f64::from(o.height()) > bb.min[1] - 3.0
+                                && o.pos()[1] < bb.max[1] + 3.0
+                                && o.pos()[2] > bb.min[2] - d - 0.5
+                                && o.pos()[2] < bb.max[2] + d + 0.5
                         })
-                        .map(|o| (o.id, o.pos))
+                        .map(|o| (o.id, o.pos()))
                         .collect();
-                    let eye = [m.pos[0], m.eye_y(), m.pos[2]];
+                    let eye = [m.pos()[0], m.eye_y(), m.pos()[2]];
                     for (id, p) in ids {
                         let e = Ent::Mob(id);
                         if !self.targeting_ok(m, e, false, d, true, true) {
@@ -215,19 +215,19 @@ impl Server {
                     && m.on_ground
                     && !self.hurt_recently(m)
                     && self.npc_trading(m)
-                    && super::brain::dist2(m.pos, self.pos) <= 16.0
+                    && super::brain::dist2(m.pos(), self.pos) <= 16.0
             }
             TGoal::LookAtTradingPlayer { time } => {
-                self.ent_alive(Ent::Player) && super::brain::dist2(m.pos, self.pos) <= 64.0 && *time > 0
+                self.ent_alive(Ent::Player) && super::brain::dist2(m.pos(), self.pos) <= 64.0 && *time > 0
             }
             TGoal::WanderToPosition => {
-                m.npc.as_ref().and_then(|n| n.wander).is_some_and(|w| !closer_center(w, m.pos, 2.0))
+                m.npc.as_ref().and_then(|n| n.wander).is_some_and(|w| !closer_center(w, m.pos(), 2.0))
             }
             TGoal::MoveTowardsRestriction { .. } | TGoal::Stroll { .. } => !m.nav.is_done(),
             TGoal::Look { dist, at, time, .. } => {
                 let Some(e) = *at else { return false };
                 let Some(p) = self.ent_pos(e) else { return false };
-                self.ent_alive(e) && super::brain::dist2(m.pos, p) <= f64::from(*dist * *dist) && *time > 0
+                self.ent_alive(e) && super::brain::dist2(m.pos(), p) <= f64::from(*dist * *dist) && *time > 0
             }
         }
     }
@@ -314,13 +314,13 @@ impl Server {
                 if !m.nav.is_done() {
                     return;
                 }
-                if !closer_center(w, m.pos, 10.0) {
+                if !closer_center(w, m.pos(), 10.0) {
                     let n = crate::mobs::mth::normalize([
-                        f64::from(w[0]) - m.pos[0],
-                        f64::from(w[1]) - m.pos[1],
-                        f64::from(w[2]) - m.pos[2],
+                        f64::from(w[0]) - m.pos()[0],
+                        f64::from(w[1]) - m.pos()[1],
+                        f64::from(w[2]) - m.pos()[2],
                     ]);
-                    let t = [n[0] * 10.0 + m.pos[0], n[1] * 10.0 + m.pos[1], n[2] * 10.0 + m.pos[2]];
+                    let t = [n[0] * 10.0 + m.pos()[0], n[1] * 10.0 + m.pos()[1], n[2] * 10.0 + m.pos()[2]];
                     self.move_to_pos(m, t, 0.35);
                 } else {
                     self.move_to_pos(m, [f64::from(w[0]), f64::from(w[1]), f64::from(w[2])], 0.35);

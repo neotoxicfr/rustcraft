@@ -300,7 +300,7 @@ impl Server {
             o.vel
         };
         Hold {
-            pos: o.pos,
+            pos: o.pos(),
             center: center(&o.bbox()),
             yaw: o.yaw,
             w: o.width(),
@@ -540,7 +540,7 @@ impl Server {
         let mut any = false;
         for i in 0..ent_pts.len() {
             let ev = y_rot(mul(ent_pts[i], edim), -ey);
-            let ep = [m.pos[0] + ev[0], m.pos[1] + ev[1], m.pos[2] + ev[2]];
+            let ep = [m.pos()[0] + ev[0], m.pos()[1] + ev[1], m.pos()[2] + ev[2]];
             let hv = y_rot(mul(hold_pts[i], hdim), -hy);
             let hp = [hi.pos[0] + hv[0], hi.pos[1] + hv[1], hi.pos[2] + hv[2]];
             let distance = dist(ep, hp);
@@ -605,11 +605,11 @@ impl Server {
         }
         m.goals.disabled &= !MOVE;
         let f = |v: f64| v as f32;
-        let (xd, yd, zd) = (f(m.pos[0] - hi.pos[0]), f(m.pos[1] - hi.pos[1]), f(m.pos[2] - hi.pos[2]));
+        let (xd, yd, zd) = (f(m.pos()[0] - hi.pos[0]), f(m.pos()[1] - hi.pos[1]), f(m.pos()[2] - hi.pos[2]));
         let distance = f64::from(xd * xd + yd * yd + zd * zd).sqrt() as f32;
-        let n = normalize([hi.pos[0] - m.pos[0], hi.pos[1] - m.pos[1], hi.pos[2] - m.pos[2]]);
+        let n = normalize([hi.pos[0] - m.pos()[0], hi.pos[1] - m.pos()[1], hi.pos[2] - m.pos()[2]]);
         let s = f64::from((distance - 2.0).max(0.0));
-        let to = [m.pos[0] + n[0] * s, m.pos[1] + n[1] * s, m.pos[2] + n[2] * s];
+        let to = [m.pos()[0] + n[0] * s, m.pos()[1] + n[1] * s, m.pos()[2] + n[2] * s];
         self.move_to_pos(m, to, follow_speed(m.kind));
     }
 
@@ -665,7 +665,7 @@ impl Server {
             } else {
                 self.leash_drop(m, true, true);
             }
-            self.game_event_at("minecraft:entity_interact", m.pos, Some(Ent::Player));
+            self.game_event_at("minecraft:entity_interact", m.pos(), Some(Ent::Player));
             self.mob_sound(m, UNTIED, 1.0, 1.0);
             return Some(false);
         }
@@ -701,7 +701,7 @@ impl Server {
     /// sound in the category of the sheared entity.
     pub(crate) fn shear_off_all(&mut self, h: Holder, me: Option<&mut Mob>, by_player: bool) -> bool {
         let (c, pos) = match (&me, h) {
-            (Some(m), _) => (center(&m.bbox()), m.pos),
+            (Some(m), _) => (center(&m.bbox()), m.pos()),
             (None, _) => match self.hold(h) {
                 Some(hi) => (hi.center, hi.pos),
                 None => return false,

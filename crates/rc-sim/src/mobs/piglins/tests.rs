@@ -164,7 +164,7 @@ fn known_speed_is_the_last_tick_displacement() {
     let mut m = Mob::new(Kind::Piglin, 1, 1, [0.0; 3], 0.0, test_rng());
     super::spear::compute_speed(&mut m);
     assert_eq!(m.pig.known_speed, [0.0; 3]);
-    m.pos = [0.5, 0.0, -0.25];
+    m.set_pos([0.5, 0.0, -0.25]);
     super::spear::compute_speed(&mut m);
     assert_eq!(m.pig.known_speed, [0.5, 0.0, -0.25]);
 }

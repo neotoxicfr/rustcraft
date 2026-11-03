@@ -670,7 +670,7 @@ impl Server {
         }
         if off.reward_exp {
             // A single orb of the drawn value (neither splitting nor merging).
-            self.add_orb([m.pos[0], m.pos[1] + 0.5, m.pos[2]], pop);
+            self.add_orb([m.pos()[0], m.pos()[1] + 0.5, m.pos()[2]], pop);
         }
     }
 
@@ -890,7 +890,7 @@ impl Server {
         };
         m.age = 6000;
         self.with_villager(other, |_, o, _| o.age = 6000);
-        let mut baby = self.new_mob(Kind::Villager, m.pos, 0.0);
+        let mut baby = self.new_mob(Kind::Villager, m.pos(), 0.0);
         baby.villager = [ty, PROF_NONE, 1];
         baby.x.vdata_final = true;
         baby.age = -24000;
@@ -934,7 +934,7 @@ impl Server {
     pub(crate) fn spawn_at_location(&mut self, m: &Mob, s: Stack, dy: f64) {
         let r = &mut self.mobs.rng;
         let v = [r.next_double() * 0.2 - 0.1, 0.2, r.next_double() * 0.2 - 0.1];
-        self.spawn_item([m.pos[0], m.pos[1] + dy, m.pos[2]], v, s, 10);
+        self.spawn_item([m.pos()[0], m.pos()[1] + dy, m.pos()[2]], v, s, 10);
     }
 
     /// Composter: bone meal recovered at level 8, then up to 20 seeds (≥ 10 kept).
@@ -1222,8 +1222,8 @@ impl Server {
     /// toward the target × 0.3 (single precision) on each axis.
     pub(crate) fn throw_item(&mut self, m: &Mob, s: Stack, target: [f64; 3]) {
         let k = f64::from(0.3f32);
-        let pos = [m.pos[0], m.eye_y() - k, m.pos[2]];
-        let v = crate::mobs::mth::normalize([target[0] - m.pos[0], target[1] - m.pos[1], target[2] - m.pos[2]]).map(|c| c * k);
+        let pos = [m.pos()[0], m.eye_y() - k, m.pos()[2]];
+        let v = crate::mobs::mth::normalize([target[0] - m.pos()[0], target[1] - m.pos()[1], target[2] - m.pos()[2]]).map(|c| c * k);
         self.spawn_item(pos, v, s, 10);
     }
 
@@ -1252,7 +1252,7 @@ impl Server {
         let Some(h) = self.bed_sleep_height(bed) else { return false };
         let ns = self.view().set_bool(s, "occupied", true);
         self.set_block(bed, ns, 3);
-        m.pos = [f64::from(bed[0]) + 0.5, f64::from(bed[1]) + h + 0.125, f64::from(bed[2]) + 0.5];
+        m.set_pos([f64::from(bed[0]) + 0.5, f64::from(bed[1]) + h + 0.125, f64::from(bed[2]) + 0.5]);
         m.vel = [0.0; 3];
         m.needs_sync = true;
         if let Some(n) = m.npc.as_mut() {
@@ -1267,7 +1267,7 @@ impl Server {
     pub(crate) fn stop_sleeping(&mut self, m: &mut Mob, b: &mut Brain) {
         let Some(bed) = m.npc.as_mut().and_then(|n| n.sleeping.take()) else { return };
         if let Some((stand, yaw)) = self.leave_bed(bed, m.yaw, (0.6, 1.95), false) {
-            m.pos = stand;
+            m.set_pos(stand);
             m.yaw = yaw;
             m.pitch = 0.0;
         }

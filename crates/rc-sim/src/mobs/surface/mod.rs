@@ -785,7 +785,7 @@ pub fn breed(s: &mut Server, m: &mut Mob, partner: i32) -> bool {
         Kind::Rabbit | Kind::Mooshroom | Kind::Ocelot | Kind::PolarBear => {
             let Some(pi) = s.mob_index(partner) else { return true };
             let pv = s.mobs.list.get(pi).map_or(0, |p| p.variant);
-            let mut baby = s.new_mob(m.kind, m.pos, 0.0);
+            let mut baby = s.new_mob(m.kind, m.pos(), 0.0);
             baby.age = -24000;
             match m.kind {
                 Kind::Rabbit => {
@@ -817,7 +817,7 @@ pub fn breed(s: &mut Server, m: &mut Mob, partner: i32) -> bool {
             s.mob_event(m, 18);
             if s.rule("minecraft:mob_drops", true) {
                 let xp = m.rng.next_int_bound(7) + 1;
-                s.spawn_orbs(m.pos, xp);
+                s.spawn_orbs(m.pos(), xp);
             }
             s.add_mob(baby);
             true

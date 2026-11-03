@@ -135,7 +135,7 @@ impl Server {
         let ty = "minecraft:mob_attack";
         let hurt = match t {
             Ent::Player => {
-                let kb = (m.pos[0] - self.pos[0], m.pos[2] - self.pos[2]);
+                let kb = (m.pos()[0] - self.pos[0], m.pos()[2] - self.pos[2]);
                 let r = self.player_hurt_by_mob(m, ty, dmg, Some(kb));
                 if r {
                     // `0.4 × max(0, 1 − knockback resistance)` (player attribute).
@@ -211,7 +211,7 @@ impl Server {
                 *target = m.target;
                 let Some(t) = *target else { return false };
                 let Some(tp) = self.ent_pos(t) else { return false };
-                if dist2(tp, m.pos) > 32.0 * 32.0 {
+                if dist2(tp, m.pos()) > 32.0 * 32.0 {
                     return false;
                 }
                 match self.pos_towards(m, 16, 7, tp, std::f32::consts::FRAC_PI_2) {
@@ -305,7 +305,7 @@ impl Server {
         match g {
             GolemGoal::MoveTowardsTarget { target, .. } => {
                 let Some(t) = *target else { return false };
-                !m.nav.is_done() && self.ent_alive(t) && self.ent_pos(t).is_some_and(|p| dist2(p, m.pos) < 32.0 * 32.0)
+                !m.nav.is_done() && self.ent_alive(t) && self.ent_pos(t).is_some_and(|p| dist2(p, m.pos()) < 32.0 * 32.0)
             }
             GolemGoal::MoveBackToVillage { .. } | GolemGoal::VillageStroll { .. } => !m.nav.is_done(),
             GolemGoal::OfferFlower { tick, .. } => *tick > 0,
@@ -386,7 +386,7 @@ impl Server {
             .list
             .iter()
             .filter(|o| (o.kind == Kind::Villager || o.kind == Kind::CopperGolem) && o.touches(&area))
-            .map(|o| (o.id, o.pos))
+            .map(|o| (o.id, o.pos()))
             .collect();
         let mut best: Option<(f64, Ent)> = None;
         for (id, p) in cands {
@@ -394,7 +394,7 @@ impl Server {
             if !self.targeting_ok(m, Ent::Mob(id), false, 6.0, true, true) {
                 continue;
             }
-            let d = dist2(m.pos, p);
+            let d = dist2(m.pos(), p);
             if best.is_none_or(|b| d < b.0) {
                 best = Some((d, Ent::Mob(id)));
             }
@@ -435,7 +435,7 @@ impl Server {
             .list
             .iter()
             .filter(|o| o.kind == Kind::Villager && o.touches(&area) && self.villager_wants_golem(o))
-            .map(|o| o.pos)
+            .map(|o| o.pos())
             .collect();
         if wants.is_empty() {
             return None;

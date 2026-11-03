@@ -790,7 +790,7 @@ impl Server {
                     m.id,
                     m.uuid,
                     self.entity_kind_id(m.kind.info().name),
-                    m.pos,
+                    m.pos(),
                     m.yaw,
                     m.pitch,
                     m.head_yaw,

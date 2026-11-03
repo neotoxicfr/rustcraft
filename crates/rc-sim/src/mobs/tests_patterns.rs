@@ -90,8 +90,8 @@ fn victim_finds_attacker_mid_tick() {
     c.equipment[6] = Some(Stack { id: "minecraft:stone".into(), count: 1, components: None });
     c.vel = [0.0; 3];
     let mut common = c.clone();
-    let zpos = p.s.mob_ref(z3).unwrap().pos;
-    let (xd, zd) = (zpos[0] - common.pos[0], zpos[2] - common.pos[2]);
+    let zpos = p.s.mob_ref(z3).unwrap().pos();
+    let (xd, zd) = (zpos[0] - common.pos()[0], zpos[2] - common.pos()[2]);
     Server::knockback(&mut common, 0.4, xd, zd);
     melee(&mut p.s, z3, cube);
     let got = p.s.mob_ref(cube).unwrap().vel;

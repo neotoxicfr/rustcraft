@@ -229,7 +229,7 @@ fn spit_spares_the_llama_passenger() {
     assert!(p.s.mob_start_riding(&mut h, &mut l, true), "chicken not mounted");
     p.s.mobs.list.put(il, l);
     p.s.mobs.list.put(ih, h);
-    let seat = mob(&p, hen).pos;
+    let seat = mob(&p, hen).pos();
     let (lmax, hmax) = (mob(&p, llama).health, mob(&p, hen).health);
     let y = seat[1] + f64::from(mob(&p, hen).height()) / 2.0;
     let mut s = spit(llama, [seat[0] - 1.0, y, seat[2]], [0.8, 0.0, 0.0], 5);

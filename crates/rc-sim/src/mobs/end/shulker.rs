@@ -59,7 +59,7 @@ pub fn progress_box(dir: i32, to: f32, pos: [f64; 3]) -> rc_physics::Aabb {
 
 /// Current box.
 pub fn bbox(m: &Mob) -> rc_physics::Aabb {
-    progress_box(opposite(m.end.attach), physical_peek(m.end.peek_amount), m.pos)
+    progress_box(opposite(m.end.attach), physical_peek(m.end.peek_amount), m.pos())
 }
 
 /// Eye height: 0.5, stretched by the opening when it is placed on the ground.
@@ -104,7 +104,7 @@ pub fn look_control(m: &mut Mob) {
     if m.look.cooldown > 0 {
         m.look.cooldown -= 1;
         let w = m.look.wanted;
-        let out = [w[0] - m.pos[0], w[1] - m.eye_y(), w[2] - m.pos[2]];
+        let out = [w[0] - m.pos()[0], w[1] - m.eye_y(), w[2] - m.pos()[2]];
         let (fwd, right) = frame(m.end.attach);
         let dr = (right[0] * out[0] + right[1] * out[1] + right[2] * out[2]) as f32;
         let df = (fwd[0] * out[0] + fwd[1] * out[1] + fwd[2] * out[2]) as f32;
@@ -201,7 +201,7 @@ impl Server {
         if push <= 0.0 {
             return;
         }
-        let area = progress_delta_box(dir, old, now, m.pos);
+        let area = progress_delta_box(dir, old, now, m.pos());
         let s = step(dir).map(|v| f64::from(v as f32 * push));
         self.shulker_shove(m, &area, s);
     }
@@ -305,7 +305,7 @@ impl Server {
             m.mount.vehicle = None;
             m.end.attach = d;
             self.mob_sound(m, "minecraft:entity.shulker.teleport", 1.0, 1.0);
-            m.pos = snap([f64::from(t[0]) + 0.5, f64::from(t[1]), f64::from(t[2]) + 0.5]);
+            m.set_pos(snap([f64::from(t[0]) + 0.5, f64::from(t[1]), f64::from(t[2]) + 0.5]));
             self.game_event_block("minecraft:teleport", old, Some(Ent::Mob(m.id)), None);
             let n = m.block_pos();
             let packed =
@@ -341,7 +341,7 @@ impl Server {
     /// box, failure with probability (n − 1)/5 (world random), otherwise a new shulker of
     /// the same color at the old position.
     fn shulker_hit_by_bullet(&mut self, m: &mut Mob) {
-        let old_pos = m.pos;
+        let old_pos = m.pos();
         let old_box = bbox(m);
         if m.end.peek == 0 || !self.shulker_teleport(m) {
             return;
@@ -375,7 +375,7 @@ impl Server {
         let Some(t) = m.target else { return };
         let (Some(p), Some(eye)) = (self.ent_pos(t), self.ent_eye(t)) else { return };
         self.look_at(m, [p[0], eye, p[2]], 180.0, 180.0);
-        if super::super::mth::dist2(m.pos, p) < 400.0 {
+        if super::super::mth::dist2(m.pos(), p) < 400.0 {
             if *time <= 0 {
                 *time = 20 + m.rng.next_int_bound(10) * 20 / 2;
                 let axis = m.end.attach / 2;

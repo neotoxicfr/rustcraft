@@ -490,15 +490,15 @@ impl Server {
         h.mount.trap = false;
         h.mount.set_flag(super::FLAG_TAME, true);
         h.age = 0;
-        self.spawn_bolt(h.pos);
+        self.spawn_bolt(h.pos());
         let mut sk = self.trap_skeleton(h);
         self.mob_start_riding(&mut sk, h, false);
         self.add_mob(sk);
         for _ in 0..3 {
-            let mut o = self.new_mob(Kind::SkeletonHorse, h.pos, 0.0);
+            let mut o = self.new_mob(Kind::SkeletonHorse, h.pos(), 0.0);
             let mut g = Group::default();
             self.finalize_spawn(&mut o, Reason::SpawnEgg, &mut g);
-            o.pos = h.pos;
+            o.set_pos(h.pos());
             o.damage_cooldown = 60;
             o.persistent = true;
             o.mount.set_flag(super::FLAG_TAME, true);
@@ -518,10 +518,10 @@ impl Server {
     /// if it has none; weapon and helmet disenchanted then enchanted by the provider
     /// `mob_spawn_equipment` (horse's local difficulty, skeleton's random).
     fn trap_skeleton(&mut self, horse: &Mob) -> Mob {
-        let mut s = self.new_mob(Kind::Skeleton, horse.pos, 0.0);
+        let mut s = self.new_mob(Kind::Skeleton, horse.pos(), 0.0);
         let mut g = Group::default();
         self.finalize_spawn(&mut s, Reason::SpawnEgg, &mut g);
-        s.pos = horse.pos;
+        s.set_pos(horse.pos());
         s.damage_cooldown = 60;
         s.persistent = true;
         if s.equipment[5].is_none() {
@@ -591,7 +591,7 @@ impl Server {
 
     /// Natural zombie horse: a zombie (finalized first) with an iron spear rides it.
     fn zombie_horse_jockey(&mut self, h: &mut Mob) {
-        let mut z = self.new_mob(Kind::Zombie, h.pos, h.yaw);
+        let mut z = self.new_mob(Kind::Zombie, h.pos(), h.yaw);
         z.pitch = 0.0;
         let mut g = Group::default();
         self.finalize_spawn(&mut z, Reason::Natural, &mut g);
@@ -602,11 +602,11 @@ impl Server {
 
     /// Natural husk (10% if the space is free): camel husk ridden, parched at the back.
     pub(crate) fn husk_camel_jockey(&mut self, husk: &mut Mob) {
-        let mut c = self.new_mob(Kind::CamelHusk, husk.pos, 0.0);
+        let mut c = self.new_mob(Kind::CamelHusk, husk.pos(), 0.0);
         let mut g = Group::default();
         self.finalize_spawn(&mut c, Reason::Natural, &mut g);
         self.mob_start_riding(husk, &mut c, true);
-        let mut p = self.new_mob(Kind::Parched, husk.pos, husk.yaw);
+        let mut p = self.new_mob(Kind::Parched, husk.pos(), husk.yaw);
         p.pitch = 0.0;
         let mut g = Group::default();
         self.finalize_spawn(&mut p, Reason::Natural, &mut g);
@@ -919,7 +919,7 @@ mod w9_tests {
             p.s.mobs
                 .list
                 .iter()
-                .map(|m| format!("{} {:.3} {:.3} {:.3}", m.kind.info().name, m.pos[0], m.pos[1], m.pos[2]))
+                .map(|m| format!("{} {:.3} {:.3} {:.3}", m.kind.info().name, m.pos()[0], m.pos()[1], m.pos()[2]))
                 .collect();
         lines.sort();
         std::fs::write(out, lines.join("\n") + "\n").unwrap();
@@ -964,7 +964,7 @@ mod w9_tests {
             p.s.mobs.spawners.cat_next = 0;
             p.s.cat_spawner_tick();
             if let Some(m) = p.s.mobs.list.iter().find(|m| m.kind == Kind::Cat) {
-                cat = Some((m.pos, m.persistent));
+                cat = Some((m.pos(), m.persistent));
                 break;
             }
         }

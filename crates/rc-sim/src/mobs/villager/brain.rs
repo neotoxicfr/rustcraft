@@ -609,12 +609,12 @@ impl Server {
         };
         let mut list: Vec<(f64, Ent)> = Vec::new();
         for o in self.mobs.list.iter() {
-            if o.id != m.id && o.alive() && inside(o.pos, f64::from(o.width()), f64::from(o.height())) {
-                list.push((dist2(m.pos, o.pos), Ent::Mob(o.id)));
+            if o.id != m.id && o.alive() && inside(o.pos(), f64::from(o.width()), f64::from(o.height())) {
+                list.push((dist2(m.pos(), o.pos()), Ent::Mob(o.id)));
             }
         }
         if self.ent_alive(Ent::Player) && inside(self.pos, 0.6, 1.8) {
-            list.push((dist2(m.pos, self.pos), Ent::Player));
+            list.push((dist2(m.pos(), self.pos), Ent::Player));
         }
         list.sort_by(|a, c| a.0.partial_cmp(&c.0).unwrap_or(std::cmp::Ordering::Equal));
         let ents: Vec<Ent> = list.into_iter().map(|x| x.1).collect();
@@ -647,7 +647,7 @@ impl Server {
     fn sense_players(&mut self, m: &mut Mob, b: &mut Brain) {
         let r = m.follow_range();
         let mut players = Vec::new();
-        if self.game_mode != 3 && self.ent_alive(Ent::Player) && dist2(m.pos, self.pos) < r * r {
+        if self.game_mode != 3 && self.ent_alive(Ent::Player) && dist2(m.pos(), self.pos) < r * r {
             players.push(Ent::Player);
         }
         b.mem.players = (!players.is_empty()).then(|| players.clone());
@@ -710,12 +710,12 @@ impl Server {
     }
 
     fn sense_hostiles(&mut self, m: &mut Mob, b: &mut Brain) {
-        let me = m.pos;
+        let me = m.pos();
         let found = self.find_closest(m, b, |s, e| {
             let Ent::Mob(id) = e else { return false };
             let Some(o) = s.mob_ref(id) else { return false };
             let Some(d) = hostile_distance(o.kind.info().name) else { return false };
-            dist2(o.pos, me) <= d * d
+            dist2(o.pos(), me) <= d * d
         });
         b.mem.hostile = found;
     }

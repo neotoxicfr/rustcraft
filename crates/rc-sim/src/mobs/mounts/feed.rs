@@ -147,7 +147,7 @@ impl Server {
         let _ = self.send(rc_client::Event::Sound(SoundPacket {
             sound: SoundRef::Id(id as i32),
             category: 6,
-            pos: Some(m.pos),
+            pos: Some(m.pos()),
             entity: None,
             volume,
             pitch,
@@ -467,7 +467,7 @@ impl Server {
             (Kind::Horse, Kind::Donkey) | (Kind::Donkey, Kind::Horse) => Kind::Mule,
             (k, _) => k,
         };
-        let mut baby = self.new_mob(child_kind, m.pos, 0.0);
+        let mut baby = self.new_mob(child_kind, m.pos(), 0.0);
         match (m.kind, child_kind) {
             (Kind::Horse, Kind::Horse) => {
                 let pick = m.rng.next_int_bound(9);
@@ -506,7 +506,7 @@ impl Server {
             _ => offspring_attributes(m, &p, &mut baby),
         }
         baby.age = -24000;
-        baby.pos = m.pos;
+        baby.set_pos(m.pos());
         baby.yaw = 0.0;
         baby.pitch = 0.0;
         self.s9_bred(m, partner, Some(&baby)); // S9 (before love is forgotten, which erases its cause)
@@ -519,7 +519,7 @@ impl Server {
         self.mob_event(m, 18);
         if self.rule("minecraft:mob_drops", true) {
             let xp = m.rng.next_int_bound(7) + 1;
-            self.spawn_orbs(m.pos, xp);
+            self.spawn_orbs(m.pos(), xp);
         }
         self.add_mob(baby);
         true

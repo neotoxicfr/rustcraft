@@ -345,7 +345,7 @@ impl Server {
             {
                 continue;
             }
-            let c = ((m.pos[0].floor() as i32) >> 4, (m.pos[2].floor() as i32) >> 4);
+            let c = ((m.pos()[0].floor() as i32) >> 4, (m.pos()[2].floor() as i32) >> 4);
             by_chunk.entry(c).or_default().push(self.save_with_passengers(m));
         }
         self.end_into_chunks(by_chunk); // F15

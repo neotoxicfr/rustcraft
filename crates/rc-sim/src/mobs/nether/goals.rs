@@ -113,13 +113,13 @@ impl Server {
                     min: [bb.min[0] - 8.0, bb.min[1] - 3.0, bb.min[2] - 8.0],
                     max: [bb.max[0] + 8.0, bb.max[1] + 3.0, bb.max[2] + 8.0],
                 };
-                let eye = [m.pos[0], m.eye_y(), m.pos[2]];
+                let eye = [m.pos()[0], m.eye_y(), m.pos()[2]];
                 let mut best: Option<(f64, i32)> = None;
                 for o in self.mobs.list.iter() {
                     if o.kind != Kind::Strider || o.id == m.id || !o.alive() || !o.touches(&area) {
                         continue;
                     }
-                    let d = dist2(eye, o.pos);
+                    let d = dist2(eye, o.pos());
                     if d > 64.0 {
                         continue;
                     }
@@ -139,7 +139,7 @@ impl Server {
             NGoal::ToLava { pos, .. } => m.lava_height <= 0.0 && super::strider::lava_target(self, *pos),
             NGoal::LookAtStrider { at, time } => {
                 let Some(o) = at.and_then(|id| self.mob_ref(id)) else { return false };
-                o.alive() && dist2(m.pos, o.pos) <= 64.0 && *time > 0
+                o.alive() && dist2(m.pos(), o.pos()) <= 64.0 && *time > 0
             }
             _ => self.neth_can_use(g, m),
         }
@@ -186,7 +186,7 @@ impl Server {
                 // every 20 ticks.
                 let t = *pos;
                 let c = [f64::from(t[0]) + 0.5, f64::from(t[1]) + 0.5, f64::from(t[2]) + 0.5];
-                if dist2(c, m.pos) >= 1.0 {
+                if dist2(c, m.pos()) >= 1.0 {
                     *reached = false;
                     *try_ticks += 1;
                     if *try_ticks % 20 == 0 {
@@ -199,7 +199,7 @@ impl Server {
                 }
             }
             NGoal::LookAtStrider { at, time } => {
-                let Some((p, eye)) = at.and_then(|id| self.mob_ref(id)).map(|o| (o.pos, o.eye_y())) else { return };
+                let Some((p, eye)) = at.and_then(|id| self.mob_ref(id)).map(|o| (o.pos(), o.eye_y())) else { return };
                 self.look_at(m, [p[0], eye, p[2]], 10.0, max_head_x(m));
                 *time -= 1;
             }

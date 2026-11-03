@@ -276,7 +276,7 @@ impl Server {
             Fam::Sim => self.bs.entities.list.get(i)?.pos,
             Fam::Item => self.life.drops.get(i)?.pos,
             Fam::Orb => self.life.orbs.get(i)?.pos,
-            Fam::Mob => self.mobs.list.get(i)?.pos,
+            Fam::Mob => self.mobs.list.get(i)?.pos(),
             Fam::Fang => self.mobs.ill.fangs.get(i)?.pos,
             Fam::Spit => self.mobs.mounts.spits.get(i)?.pos,
             Fam::Bolt => self.mobs.mounts.bolts.get(i)?.pos,

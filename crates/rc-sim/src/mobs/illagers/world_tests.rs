@@ -156,9 +156,9 @@ fn vex_flies_through_walls() {
     for t in 0..400 {
         step(&mut p, 1);
         if let Some(v) = p.s.mob_ref(id) {
-            min_z = min_z.min(v.pos[2]);
+            min_z = min_z.min(v.pos()[2]);
             if t % 40 == 0 {
-                eprintln!("t {t} pos {:?} op {:?} target {:?}", v.pos, v.move_ctl.op, v.target);
+                eprintln!("t {t} pos {:?} op {:?} target {:?}", v.pos(), v.move_ctl.op, v.target);
             }
         }
         if p.s.life.vit.health < h0 {
@@ -253,7 +253,7 @@ fn patrol_spawns() {
     let t = leaders[0].ill.patrol_target.expect("leader's target");
     assert!(t[0].abs() <= 500 && t[2].abs() <= 500 && t[1] == 0, "target {t:?}");
     assert!(spawned.iter().all(|m| m.ill.patrolling));
-    let d = ((spawned[0].pos[0] - 216.5).abs(), (spawned[0].pos[2] - 216.5).abs());
+    let d = ((spawned[0].pos()[0] - 216.5).abs(), (spawned[0].pos()[2] - 216.5).abs());
     assert!(d.0 >= 23.0 && d.1 >= 23.0, "too close {d:?}");
     finish(p, dir);
 }

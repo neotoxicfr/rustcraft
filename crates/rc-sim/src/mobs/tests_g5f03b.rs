@@ -41,7 +41,7 @@ fn spawn(p: &mut Probe, k: Kind, pos: [f64; 3]) -> i32 {
     let mut m = p.s.new_mob(k, pos, 0.0);
     let mut g = super::spawn::Group::default();
     p.s.finalize_spawn(&mut m, super::spawn::Reason::SpawnEgg, &mut g);
-    m.pos = pos;
+    m.set_pos(pos);
     let id = m.id;
     p.s.add_mob(m);
     id

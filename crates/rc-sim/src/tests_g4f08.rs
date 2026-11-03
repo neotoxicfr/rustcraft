@@ -54,10 +54,10 @@ fn opening_shulker_pushes_entities_with_collisions() {
     p.s.life.orbs[0].body.no_gravity = true;
     game_ticks(&mut p, 25);
     assert!(mobs(&p, Kind::Shulker).iter().all(|m| m.end.peek_amount == 1.0), "shulkers not open");
-    close(mobs(&p, Kind::Zombie)[0].pos[1], -59.0 + 0.05, "zombie under the ceiling");
+    close(mobs(&p, Kind::Zombie)[0].pos()[1], -59.0 + 0.05, "zombie under the ceiling");
     close(p.s.life.drops[0].pos[1], -58.0, "item");
     close(p.s.life.orbs[0].pos[1], -58.0, "orb");
-    close(mobs(&p, Kind::Vex)[0].pos[1], -59.0, "vex");
+    close(mobs(&p, Kind::Vex)[0].pos()[1], -59.0, "vex");
     finish(p, dir);
 }
 
@@ -116,7 +116,7 @@ fn primed_tnt_keeps_power_and_block_through_a_save() {
 }
 
 fn mob_at(p: &Probe, k: Kind, x: f64) -> &Mob {
-    p.s.mobs.of_kind(k).find(|m| (m.pos[0] - x).abs() < 0.6).unwrap_or_else(|| panic!("no {k:?} at x = {x}"))
+    p.s.mobs.of_kind(k).find(|m| (m.pos()[0] - x).abs() < 0.6).unwrap_or_else(|| panic!("no {k:?} at x = {x}"))
 }
 
 /// Warden targets: a mob of the warden's team, an invulnerable one or one outside the world
@@ -611,7 +611,7 @@ fn bench_g4f08_shulker_push_scan() {
         p.s.summon_orb([f64::from(i) + 20.5, -60.0, 60.5], None);
     }
     let sh = p.s.new_mob(Kind::Shulker, [200.5, -60.0, 0.5], 0.0);
-    let area = crate::mobs::end::shulker::progress_delta_box(1, 0.1, 0.2, sh.pos);
+    let area = crate::mobs::end::shulker::progress_delta_box(1, 0.1, 0.2, sh.pos());
     for _ in 0..2 {
         let t0 = std::time::Instant::now();
         let mut n = 0;

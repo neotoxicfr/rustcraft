@@ -247,7 +247,7 @@ impl Server {
                 if m.rng.next_int_bound(reduced(7)) != 0 {
                     return false;
                 }
-                self.ent_pos(t).is_some_and(|p| dist2(m.pos, p) > 4.0)
+                self.ent_pos(t).is_some_and(|p| dist2(m.pos(), p) > 4.0)
             }
             IGoal::VexRandomMove => m.move_ctl.op != MoveOp::MoveTo && m.rng.next_int_bound(reduced(7)) == 0,
             IGoal::VexCopyOwner { .. } => {
@@ -320,7 +320,7 @@ impl Server {
             }
             IGoal::VillageWalk { poi, .. } => {
                 let Some(p) = *poi else { return false };
-                !m.nav.is_done() && !closer_to_center(p, m.pos, f64::from(m.width()) + 4.0)
+                !m.nav.is_done() && !closer_to_center(p, m.pos(), f64::from(m.width()) + 4.0)
             }
             IGoal::MoveThroughVillage { poi, stuck, .. } => {
                 if m.nav.is_done() {
@@ -328,7 +328,7 @@ impl Server {
                 }
                 let Some(p) = *poi else { return false };
                 let r = f64::from(m.width()) + 1.0;
-                m.target.is_none() && !closer_to_center(p, m.pos, r) && !*stuck
+                m.target.is_none() && !closer_to_center(p, m.pos(), r) && !*stuck
             }
             IGoal::Crossbow(_) => {
                 self.ent_valid(m.target)
@@ -348,7 +348,7 @@ impl Server {
                 (if *zombie { m.can_break_doors } else { self.raider_active_raid(m) })
                     && *time <= 240
                     && !self.door_is_open(d)
-                    && closer_to_center(d, m.pos, 2.0)
+                    && closer_to_center(d, m.pos(), 2.0)
                     && self.level.difficulty_id() >= min_diff
             }
             IGoal::OpenDoor { .. } => false,
@@ -365,7 +365,7 @@ impl Server {
                     return false;
                 }
                 let d = f64::from(*dist);
-                self.ent_pos(e).is_some_and(|p| dist2(m.pos, p) <= d * d) && *time > 0
+                self.ent_pos(e).is_some_and(|p| dist2(m.pos(), p) <= d * d) && *time > 0
             }
             IGoal::Ranged { .. } => {
                 self.ent_valid(m.target) || (m.target.is_some_and(|t| self.ent_alive(t)) && !m.nav.is_done())
@@ -469,14 +469,14 @@ impl Server {
             IGoal::ObtainBanner { item, .. } => *item = None,
             IGoal::MoveThroughVillage { poi, visited, .. } => {
                 if let Some(p) = *poi
-                    && closer_to_center(p, m.pos, 1.0)
+                    && closer_to_center(p, m.pos(), 1.0)
                 {
                     visited.push(p);
                 }
             }
             IGoal::VillageWalk { poi, visited, .. } => {
                 if let Some(p) = *poi
-                    && (m.nav.is_done() || closer_to_center(p, m.pos, 4.0))
+                    && (m.nav.is_done() || closer_to_center(p, m.pos(), 4.0))
                 {
                     visited.push(p);
                 }
@@ -537,7 +537,7 @@ impl Server {
                 let Some(p) = self.life.drops.iter().find(|d| d.id == id && !d.is_removed()).map(|d| d.pos) else {
                     return;
                 };
-                if dist2(p, m.pos) < 1.414 * 1.414 {
+                if dist2(p, m.pos()) < 1.414 * 1.414 {
                     self.raider_pick_up_banner(m, id);
                 }
             }
@@ -570,7 +570,7 @@ impl Server {
             IGoal::HoldGround { radius2 } => {
                 let Some(t) = m.target else { return };
                 let Some(p) = self.ent_pos(t) else { return };
-                if dist2(m.pos, p) > f64::from(*radius2) {
+                if dist2(m.pos(), p) > f64::from(*radius2) {
                     if let Some(eye) = self.ent_eye(t) {
                         self.look_at(m, [p[0], eye, p[2]], 30.0, 30.0);
                     }
@@ -618,7 +618,7 @@ impl Server {
                     self.mob_attack(m, t);
                     m.ill.vex_charging = false;
                 } else if let (Some(p), Some(eye)) = (self.ent_pos(t), self.ent_eye(t))
-                    && dist2(m.pos, p) < 9.0
+                    && dist2(m.pos(), p) < 9.0
                 {
                     super::vex::set_wanted(m, [p[0], eye, p[2]], 1.0);
                 }
@@ -734,13 +734,13 @@ impl Server {
             min: [b.min[0] - d, b.min[1] - 3.0, b.min[2] - d],
             max: [b.max[0] + d, b.max[1] + 3.0, b.max[2] + d],
         };
-        let eye = [m.pos[0], m.eye_y(), m.pos[2]];
+        let eye = [m.pos()[0], m.eye_y(), m.pos()[2]];
         let cands: Vec<(i32, [f64; 3])> = self
             .mobs
             .list
             .iter()
             .filter(|o| o.alive() && o.id != m.id && o.touches(&area))
-            .map(|o| (o.id, o.pos))
+            .map(|o| (o.id, o.pos()))
             .collect();
         let mut best: Option<(f64, i32)> = None;
         for (id, p) in cands {
@@ -764,13 +764,13 @@ impl Server {
             min: [b.min[0] - f, b.min[1] - 4.0, b.min[2] - f],
             max: [b.max[0] + f, b.max[1] + 4.0, b.max[2] + f],
         };
-        let eye = [m.pos[0], m.eye_y(), m.pos[2]];
+        let eye = [m.pos()[0], m.eye_y(), m.pos()[2]];
         let mut cands: Vec<(Ent, [f64; 3])> = self
             .mobs
             .list
             .iter()
             .filter(|o| o.alive() && o.id != m.id && o.touches(&area))
-            .map(|o| (Ent::Mob(o.id), o.pos))
+            .map(|o| (Ent::Mob(o.id), o.pos()))
             .collect();
         if self.player_aabb().intersects(&area) {
             cands.push((Ent::Player, self.pos));
@@ -794,7 +794,7 @@ impl Server {
         let b = m.bbox();
         let area = rc_physics::Aabb { min: b.min.map(|v| v - 8.0), max: b.max.map(|v| v + 8.0) };
         for o in self.mobs.list.iter_mut() {
-            if o.id != m.id && is_raider(o.kind) && o.alive() && o.touches(&area) && dist2(m.pos, o.pos) <= 64.0 {
+            if o.id != m.id && is_raider(o.kind) && o.alive() && o.touches(&area) && dist2(m.pos(), o.pos()) <= 64.0 {
                 o.target = target;
                 if aggressive {
                     o.aggressive = true;
@@ -814,18 +814,18 @@ impl Server {
         let tc = [f64::from(target[0]) + 0.5, f64::from(target[1]), f64::from(target[2]) + 0.5];
         if m.ill.patrolling && companions.is_empty() {
             m.ill.patrolling = false;
-        } else if leader && closer_to_center(target, m.pos, 10.0) {
+        } else if leader && closer_to_center(target, m.pos(), 10.0) {
             self.find_patrol_target(m);
         } else {
             // Game quirk: the rotation is 90 RADIANS (tabulated sine and cosine).
-            let d = [m.pos[0] - tc[0], m.pos[1] - tc[1], m.pos[2] - tc[2]];
+            let d = [m.pos()[0] - tc[0], m.pos()[1] - tc[1], m.pos()[2] - tc[2]];
             let (c, s) = (f64::from(super::super::mth::cos(90.0)), f64::from(super::super::mth::sin(90.0)));
             let r = [d[0] * c + d[2] * s, d[1], d[2] * c - d[0] * s];
             let ldt = [r[0] * 0.4 + tc[0], r[1] * 0.4 + tc[1], r[2] * 0.4 + tc[2]];
-            let v = [ldt[0] - m.pos[0], ldt[1] - m.pos[1], ldt[2] - m.pos[2]];
+            let v = [ldt[0] - m.pos()[0], ldt[1] - m.pos()[1], ldt[2] - m.pos()[2]];
             let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
             let n = if l < f64::from(1.0e-5f32) { [0.0; 3] } else { v.map(|x| x / l) };
-            let mt = [n[0] * 10.0 + m.pos[0], n[1] * 10.0 + m.pos[1], n[2] * 10.0 + m.pos[2]];
+            let mt = [n[0] * 10.0 + m.pos()[0], n[1] * 10.0 + m.pos()[1], n[2] * 10.0 + m.pos()[2]];
             let mut pt = block_of(mt);
             pt[1] = self.surface_y(pt[0], pt[2], 5);
             let speed = if leader { 0.595 } else { 0.7 };
@@ -895,7 +895,7 @@ impl Server {
         } else {
             st.see -= 1;
         }
-        let d = dist2(m.pos, tp);
+        let d = dist2(m.pos(), tp);
         let needs_move = (d > 64.0 || st.see < 5) && st.attack_delay == 0;
         if needs_move {
             st.update_path_delay -= 1;
@@ -951,7 +951,7 @@ impl Server {
     fn ranged_goal_tick(&mut self, m: &mut Mob, attack_time: &mut i32, see: &mut i32) {
         let Some(t) = m.target else { return };
         let (Some(tp), Some(eye)) = (self.ent_pos(t), self.ent_eye(t)) else { return };
-        let d = dist2(m.pos, tp);
+        let d = dist2(m.pos(), tp);
         let has = self.line_of_sight(m, t);
         if has {
             *see += 1;

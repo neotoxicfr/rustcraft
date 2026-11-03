@@ -120,7 +120,7 @@ fn end_use(m: &mut Mob) {
 
 /// Known velocity, computed at the start of the base tick.
 pub(crate) fn compute_speed(m: &mut Mob) {
-    let p = m.pos;
+    let p = m.pos();
     let last = m.pig.last_known.replace(p).unwrap_or(p);
     m.pig.known_speed = [p[0] - last[0], p[1] - last[1], p[2] - last[2]];
 }
@@ -156,7 +156,7 @@ impl Server {
     /// Entities hit by the tip (block: collision).
     fn spear_hits(&self, m: &Mob) -> Vec<Ent> {
         let look = view_vector(m.pitch, m.head_yaw);
-        let eye = [m.pos[0], m.pos[1] + m.eye_height(), m.pos[2]];
+        let eye = [m.pos()[0], m.pos()[1] + m.eye_height(), m.pos()[2]];
         // Spear reach (2.0 to 4.5), factor 0.5 for a mob, margin 0.125.
         let (min_r, max_r) = (f64::from(2.0f32 * 0.5), f64::from(4.5f32 * 0.5));
         let margin = f64::from(0.125f32);
@@ -254,7 +254,7 @@ impl Server {
         if deals_damage {
             let dealt = match e {
                 Ent::Player => {
-                    let kb = (m.pos[0] - self.pos[0], m.pos[2] - self.pos[2]);
+                    let kb = (m.pos()[0] - self.pos[0], m.pos()[2] - self.pos[2]);
                     self.player_hurt_by_mob(m, ty, dmg, Some(kb))
                 }
                 Ent::Mob(id) => {
@@ -327,7 +327,7 @@ impl Server {
                     return false;
                 }
                 let Some(tp) = b.mem.attack.get().and_then(|t| self.ent_pos(t)) else { return false };
-                let dist = dist2(m.pos, tp).sqrt();
+                let dist = dist2(m.pos(), tp).sqrt();
                 let (_, md) = self.spear_mount(m);
                 *away = self.pig_land_pos_away(m, (9.0 + md - dist).max(0.0), (11.0 + md - dist).max(1.0), 7, tp);
                 away.is_some()
@@ -360,7 +360,7 @@ impl Server {
         let able = Self::spear_able(m, b);
         match p {
             PB::SpearApproach => {
-                let far = b.mem.attack.get().and_then(|t| self.ent_pos(t)).is_some_and(|tp| dist2(m.pos, tp) > 100.0);
+                let far = b.mem.attack.get().and_then(|t| self.ent_pos(t)).is_some_and(|tp| dist2(m.pos(), tp) > 100.0);
                 able && far
             }
             PB::SpearAttack { engage, .. } => *engage > 0 && able,
@@ -380,7 +380,7 @@ impl Server {
                 self.move_to_entity(m, tp, sp);
             }
             PB::SpearAttack { engage, charge } => {
-                let d2 = dist2(m.pos, tp);
+                let d2 = dist2(m.pos(), tp);
                 *engage -= 1;
                 if let Some(c) = *charge {
                     self.move_to_pos(m, c, sp);
@@ -480,7 +480,7 @@ impl Server {
         }
         let Some(t) = m.target else { return };
         let (Some(tp), Some(eye)) = (self.ent_pos(t), self.ent_eye(t)) else { return };
-        let d2 = dist2(m.pos, tp);
+        let d2 = dist2(m.pos(), tp);
         // Goal speeds (1.0) multiplied by that of the mount; extended retreats if passenger.
         let (sp, md) = self.spear_mount(m);
         self.look_at(m, [tp[0], eye, tp[2]], 30.0, 30.0);

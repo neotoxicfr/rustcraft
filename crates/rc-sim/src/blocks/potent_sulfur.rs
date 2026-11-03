@@ -209,7 +209,7 @@ impl Server {
                 !m.removed
                     && m.alive()
                     && m.touches(&area)
-                    && self.gas_reaches(src, [m.pos[0], m.eye_y(), m.pos[2]])
+                    && self.gas_reaches(src, [m.pos()[0], m.eye_y(), m.pos()[2]])
             });
             if hit && let Some(mut m) = self.mobs.list.take(i) {
                 self.add_mob_effect(&mut m, nausea());

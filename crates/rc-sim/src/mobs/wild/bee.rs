@@ -244,7 +244,7 @@ pub fn post_ai_step(s: &mut Server, m: &mut Mob) {
         w.flower_cd -= 1;
     }
     let roll =
-        is_angry(s, m) && !has_stung(m) && m.target.and_then(|t| s.ent_pos(t)).is_some_and(|p| dist2(p, m.pos) < 4.0);
+        is_angry(s, m) && !has_stung(m) && m.target.and_then(|t| s.ent_pos(t)).is_some_and(|p| dist2(p, m.pos()) < 4.0);
     m.wild.set_flag(ROLL, roll);
     if m.tick_count % 20 == 0 && !hive_valid(s, m) {
         m.wild.hive = None;
@@ -259,7 +259,7 @@ pub fn move_control(m: &mut Mob) {
         m.move_ctl.op = MoveOp::Wait;
         m.surf.no_gravity = true;
         let w = m.move_ctl.wanted;
-        let (xd, yd, zd) = (w[0] - m.pos[0], w[1] - m.pos[1], w[2] - m.pos[2]);
+        let (xd, yd, zd) = (w[0] - m.pos()[0], w[1] - m.pos()[1], w[2] - m.pos()[2]);
         let dd = xd * xd + yd * yd + zd * zd;
         if dd < f64::from(2.500_000_3e-7f32) {
             m.yya = 0.0;
@@ -304,7 +304,7 @@ pub fn look_tick(m: &mut Mob, reset_pitch: bool) {
     if m.look.cooldown > 0 {
         m.look.cooldown -= 1;
         let w = m.look.wanted;
-        let (xd, zd) = (w[0] - m.pos[0], w[2] - m.pos[2]);
+        let (xd, zd) = (w[0] - m.pos()[0], w[2] - m.pos()[2]);
         if zd.abs() > f64::from(1.0e-5f32) || xd.abs() > f64::from(1.0e-5f32) {
             m.head_yaw = rotate_towards(m.head_yaw, mth::yaw_to(xd, zd), m.look.y_max);
         }
@@ -330,7 +330,7 @@ pub fn sting(s: &mut Server, m: &mut Mob, t: Ent) -> bool {
     let ty = "minecraft:sting";
     let hurt = match t {
         Ent::Player => {
-            let kb = (m.pos[0] - s.pos[0], m.pos[2] - s.pos[2]);
+            let kb = (m.pos()[0] - s.pos[0], m.pos()[2] - s.pos[2]);
             s.player_hurt_by_mob(m, ty, dmg, Some(kb))
         }
         Ent::Mob(id) => {

@@ -273,7 +273,7 @@ pub fn register_goals(m: &mut Mob) {
 
 /// Targeting of the player by a ghast: vertical gap of 4 blocks at most.
 pub fn player_target_filter(s: &Server, m: &Mob) -> bool {
-    m.kind != Kind::Ghast || (s.pos[1] - m.pos[1]).abs() <= 4.0
+    m.kind != Kind::Ghast || (s.pos[1] - m.pos()[1]).abs() <= 4.0
 }
 
 // ---------- Engine hooks ----------

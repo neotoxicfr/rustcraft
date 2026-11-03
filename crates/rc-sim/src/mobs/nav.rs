@@ -1060,7 +1060,7 @@ impl Server {
     pub(crate) fn mob_view(&self, m: &super::mob::Mob) -> MobView {
         MobView {
             kind: m.kind,
-            pos: m.pos,
+            pos: m.pos(),
             block: m.block_pos(),
             bbox: m.bbox(),
             width: m.width(),
@@ -1161,7 +1161,7 @@ impl Server {
         } else {
             self.surface_target(target)
         };
-        if m.pos[1] < f64::from(self.dim.height.min_y) || !Self::can_update_path(m) {
+        if m.pos()[1] < f64::from(self.dim.height.min_y) || !Self::can_update_path(m) {
             return None;
         }
         if let Some(p) = &m.nav.path
@@ -1224,7 +1224,7 @@ impl Server {
 
     fn trim_path(&self, m: &mut super::mob::Mob) {
         let avoid_sun = m.nav.avoid_sun;
-        let pos = m.pos;
+        let pos = m.pos();
         let Some(p) = m.nav.path.as_mut() else { return };
         for i in 0..p.nodes.len() {
             let n = p.nodes[i].0;
@@ -1250,14 +1250,14 @@ impl Server {
 
     fn temp_mob_pos(&self, m: &super::mob::Mob) -> [f64; 3] {
         if m.nav.fly {
-            return m.pos;
+            return m.pos();
         }
         if m.nav.amphibious || m.nav.swim {
-            return [m.pos[0], m.pos[1] + f64::from(m.height()) * 0.5, m.pos[2]];
+            return [m.pos()[0], m.pos()[1] + f64::from(m.height()) * 0.5, m.pos()[2]];
         }
         let y = if m.in_water && m.nav.can_float {
             let mut s = m.block_pos()[1];
-            let (x, z) = (m.pos[0].floor() as i32, m.pos[2].floor() as i32);
+            let (x, z) = (m.pos()[0].floor() as i32, m.pos()[2].floor() as i32);
             let mut steps = 0;
             loop {
                 if self.mob_fluid([x, s, z]) != Fluid::Water {
@@ -1270,9 +1270,9 @@ impl Server {
                 }
             }
         } else {
-            (m.pos[1] + 0.5).floor()
+            (m.pos()[1] + 0.5).floor()
         };
-        [m.pos[0], y, m.pos[2]]
+        [m.pos()[0], y, m.pos()[2]]
     }
 
     /// Navigation tick.
@@ -1285,10 +1285,10 @@ impl Server {
             if let Some(t) = m.nav.path_to {
                 let center = [f64::from(t[0]) + 0.5, f64::from(t[1]) + 0.5, f64::from(t[2]) + 0.5];
                 let w = f64::from(m.width());
-                let close = super::mth::dist2(center, m.pos) < w * w;
-                let above = m.pos[1] > f64::from(t[1]) && {
-                    let c2 = [f64::from(t[0]) + 0.5, m.pos[1].floor() + 0.5, f64::from(t[2]) + 0.5];
-                    super::mth::dist2(c2, m.pos) < w * w
+                let close = super::mth::dist2(center, m.pos()) < w * w;
+                let above = m.pos()[1] > f64::from(t[1]) && {
+                    let c2 = [f64::from(t[0]) + 0.5, m.pos()[1].floor() + 0.5, f64::from(t[2]) + 0.5];
+                    super::mth::dist2(c2, m.pos()) < w * w
                 };
                 if !close && !above {
                     let s = m.nav.speed_mod;
@@ -1309,7 +1309,7 @@ impl Server {
         if Self::can_update_path(m) {
             self.follow_path(m);
         } else if let w = m.width()
-            && let mp = [m.pos[0], (m.pos[1] + 0.5).floor(), m.pos[2]]
+            && let mp = [m.pos()[0], (m.pos()[1] + 0.5).floor(), m.pos()[2]]
             && let ground = m.on_ground
             && let Some(p) = m.nav.path.as_mut()
             && !p.is_done()
@@ -1352,9 +1352,9 @@ impl Server {
         let max_d = f64::from(if w > 0.75 { w / 2.0 } else { 0.75 - w / 2.0 });
         let Some(p) = m.nav.path.as_ref() else { return };
         let cur = p.nodes[p.next].0;
-        let xd = (m.pos[0] - (f64::from(cur[0]) + 0.5)).abs();
-        let yd = (m.pos[1] - f64::from(cur[1])).abs();
-        let zd = (m.pos[2] - (f64::from(cur[2]) + 0.5)).abs();
+        let xd = (m.pos()[0] - (f64::from(cur[0]) + 0.5)).abs();
+        let yd = (m.pos()[1] - f64::from(cur[1])).abs();
+        let zd = (m.pos()[2] - (f64::from(cur[2]) + 0.5)).abs();
         // F08/F09: vertical difference allowed of 0.5 for swimming navigation.
         let close = xd < max_d && zd < max_d && yd < if m.nav.swim { 0.5 } else { 1.0 };
         let ty = p.nodes[p.next].1;
@@ -1579,7 +1579,7 @@ impl Server {
     /// Without surface search; current path kept
     /// if it already targets one of the targets.
     pub(crate) fn create_path_multi(&self, m: &mut super::mob::Mob, targets: &[[i32; 3]], reach: i32) -> Option<Path> {
-        if targets.is_empty() || m.pos[1] < f64::from(self.dim.height.min_y) || !Self::can_update_path(m) {
+        if targets.is_empty() || m.pos()[1] < f64::from(self.dim.height.min_y) || !Self::can_update_path(m) {
             return None;
         }
         if let Some(p) = &m.nav.path

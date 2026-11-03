@@ -236,7 +236,7 @@ fn enderman_takes_and_places() {
             break;
         }
         // Height drawn 0..3: the grass blocks are under the feet, the enderman goes down one block.
-        em.pos[1] = -60.0;
+        em.set_pos_axis(1, -60.0);
         p.s.enderman_take_tick(&mut em);
     }
     let grass = p.s.default_state("minecraft:grass_block");
@@ -247,7 +247,7 @@ fn enderman_takes_and_places() {
     back.carried = None;
     p.s.enderman_load_carried(&mut back, &out);
     assert_eq!(back.carried, Some(grass));
-    em.pos[1] = -59.0;
+    em.set_pos_axis(1, -59.0);
     for _ in 0..400 {
         if em.carried.is_none() {
             break;

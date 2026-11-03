@@ -111,7 +111,7 @@ pub fn part_box(d: &Dragon, i: usize) -> rc_physics::Aabb {
 /// (takeoff, strafing fireball) and goes out in the spawn and head packets.
 pub(crate) fn turn_head(m: &mut Mob) {
     m.body_yaw = m.yaw;
-    let (dx, dz) = (m.pos[0] - m.old[0], m.pos[2] - m.old[2]);
+    let (dx, dz) = (m.pos()[0] - m.old[0], m.pos()[2] - m.old[2]);
     if dx * dx + dz * dz > f64::from(2.500_000_3e-7_f32) {
         m.head_yaw = rotate_if_necessary(m.head_yaw, m.body_yaw, 75.0);
     }
@@ -163,11 +163,11 @@ impl Server {
     /// Dragon tick (reduced to what the dragon uses).
     pub(crate) fn dragon_tick(&mut self, m: &mut Mob) {
         let Some(mut d) = m.end.dragon.take() else { return };
-        m.old = m.pos;
+        m.old = m.pos();
         m.pitch_o = m.pitch;
         m.head_yaw_o = m.head_yaw;
         m.tick_count += 1;
-        if m.pos[1] < f64::from(self.dim.height.min_y - 64) {
+        if m.pos()[1] < f64::from(self.dim.height.min_y - 64) {
             m.removed = true;
             m.end.dragon = Some(d);
             return;
@@ -234,7 +234,7 @@ impl Server {
         if m.no_ai {
             return;
         }
-        d.history.record(m.pos[1], m.yaw);
+        d.history.record(m.pos()[1], m.yaw);
         let before = d.phase;
         self.phase_tick(m, d);
         if d.phase != before {
@@ -249,7 +249,7 @@ impl Server {
         let (cc_tilt, ss_tilt) = (cos(tilt), sin(tilt));
         let rot1 = m.yaw * DEG;
         let (ss1, cc1) = (sin(rot1), cos(rot1));
-        let p = m.pos;
+        let p = m.pos();
         let set = |d: &mut Dragon, i: usize, x: f64, y: f64, z: f64| d.parts[i] = [p[0] + x, p[1] + y, p[2] + z];
         set(d, BODY, f64::from(ss1 * 0.5), 0.0, f64::from(-cc1 * 0.5));
         set(d, WING1, f64::from(cc1 * 4.5), 2.0, f64::from(ss1 * 4.5));
@@ -298,9 +298,9 @@ impl Server {
 
     /// Steering toward the phase target.
     fn dragon_fly(&mut self, m: &mut Mob, d: &mut Dragon, t: [f64; 3]) {
-        let xdd = t[0] - m.pos[0];
-        let mut ydd = t[1] - m.pos[1];
-        let zdd = t[2] - m.pos[2];
+        let xdd = t[0] - m.pos()[0];
+        let mut ydd = t[1] - m.pos()[1];
+        let zdd = t[2] - m.pos()[2];
         let dist = xdd * xdd + ydd * ydd + zdd * zdd;
         let max = f64::from(d.phase.fly_speed());
         let hd = (xdd * xdd + zdd * zdd).sqrt();
@@ -309,7 +309,7 @@ impl Server {
         }
         m.vel[1] += ydd * 0.01;
         m.yaw = wrap(m.yaw);
-        let aim = norm([t[0] - m.pos[0], t[1] - m.pos[1], t[2] - m.pos[2]]);
+        let aim = norm([t[0] - m.pos()[0], t[1] - m.pos()[1], t[2] - m.pos()[2]]);
         let dir = norm([f64::from(sin(m.yaw * DEG)), m.vel[1], f64::from(-cos(m.yaw * DEG))]);
         let dot = ((((dir[0] * aim[0] + dir[1] * aim[1] + dir[2] * aim[2]) as f32) + 0.5) / 1.5).max(0.0);
         if xdd.abs() > f64::from(1.0e-5f32) || zdd.abs() > f64::from(1.0e-5f32) {
@@ -327,7 +327,7 @@ impl Server {
         m.vel[0] += -(-sp) * f64::from(s);
         m.vel[2] += -sp * f64::from(c);
         let mv = if d.in_wall { m.vel.map(|v| v * f64::from(0.8f32)) } else { m.vel };
-        m.pos = [m.pos[0] + mv[0], m.pos[1] + mv[1], m.pos[2] + mv[2]];
+        m.add_pos(mv);
         let actual = norm(m.vel);
         let slide = 0.8 + 0.15 * (actual[0] * dir[0] + actual[1] * dir[1] + actual[2] * dir[2] + 1.0) / 2.0;
         m.vel = [m.vel[0] * slide, m.vel[1] * f64::from(0.91f32), m.vel[2] * slide];
@@ -346,7 +346,7 @@ impl Server {
             let area = inflate(m.bbox(), 32.0, 32.0, 32.0);
             let mut best: Option<(f64, i32)> = None;
             for c in self.mobs.end.crystals.iter().filter(|c| !c.removed && c.bbox().intersects(&area)) {
-                let dd = super::super::mth::dist2(c.pos, m.pos);
+                let dd = super::super::mth::dist2(c.pos, m.pos());
                 if best.is_none_or(|b| dd < b.0) {
                     best = Some((dd, c.id));
                 }
@@ -371,7 +371,7 @@ impl Server {
         for id in ids {
             let Some(i) = self.mob_index(id) else { continue };
             let Some(mut o) = self.mobs.list.take(i) else { continue };
-            let (xd, zd) = (o.pos[0] - xm, o.pos[2] - zm);
+            let (xd, zd) = (o.pos()[0] - xm, o.pos()[2] - zm);
             let dd = (xd * xd + zd * zd).max(0.1);
             o.vel = [o.vel[0] + xd / dd * 4.0, o.vel[1] + f64::from(0.2f32), o.vel[2] + zd / dd * 4.0];
             o.needs_sync = true;
@@ -392,7 +392,7 @@ impl Server {
             self.player_push([xd / dd * 4.0, f64::from(0.2f32), zd / dd * 4.0]);
             let stamp = self.mobs.player_hurt_by.map_or(0, |h| h.1);
             if !d.phase.sitting() && stamp < self.mobs.player_ticks - 2 {
-                let kb = Some((m.pos[0] - self.pos[0], m.pos[2] - self.pos[2]));
+                let kb = Some((m.pos()[0] - self.pos[0], m.pos()[2] - self.pos[2]));
                 self.player_hurt_by_mob(m, "minecraft:mob_attack", 5.0, kb);
                 self.dragon_thorns(m, d); // G5-F02d: even without a hit dealt, like the game
             }
@@ -420,7 +420,7 @@ impl Server {
             && self.ent_alive(Ent::Player)
             && self.player_aabb().intersects(&area)
         {
-            let kb = Some((m.pos[0] - self.pos[0], m.pos[2] - self.pos[2]));
+            let kb = Some((m.pos()[0] - self.pos[0], m.pos()[2] - self.pos[2]));
             self.player_hurt_by_mob(m, "minecraft:mob_attack", 10.0, kb);
             self.dragon_thorns(m, d); // G5-F02d: even without a hit dealt, like the game
         }
@@ -585,19 +585,19 @@ impl Server {
         let xp = if first { 12_000 } else { 500 };
         let drops = self.rule("minecraft:mob_drops", true);
         if d.death_time > 150 && d.death_time % 5 == 0 && drops {
-            self.spawn_orbs(m.pos, (xp as f32 * 0.08).floor() as i32);
+            self.spawn_orbs(m.pos(), (xp as f32 * 0.08).floor() as i32);
         }
         if d.death_time == 1 && !super::silent(m) {
             self.global_level_event(1028, m.block_pos(), 0);
         }
         let up = f64::from(0.1f32);
-        m.pos[1] += up;
+        m.add_pos_axis(1, up);
         for p in &mut d.parts {
             p[1] += up;
         }
         if d.death_time >= 200 {
             if drops {
-                self.spawn_orbs(m.pos, (xp as f32 * 0.2).floor() as i32);
+                self.spawn_orbs(m.pos(), (xp as f32 * 0.2).floor() as i32);
             }
             if d.fight {
                 self.fight_dragon_killed(m.uuid);

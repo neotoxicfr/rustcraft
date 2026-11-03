@@ -25,7 +25,7 @@ impl Server {
     /// at eye level − 0.1, owner the mob, pickup forbidden (except `intangible_projectile`:
     /// creative only).
     pub(crate) fn mob_create_arrow(&mut self, m: &Mob, ammo: &Stack, weapon: Option<&Stack>) -> Proj {
-        let pos = [m.pos[0], m.eye_y() - f64::from(0.1f32), m.pos[2]];
+        let pos = [m.pos()[0], m.eye_y() - f64::from(0.1f32), m.pos()[2]];
         let mut p = self.new_arrow(pos, ammo, weapon);
         p.owner = Some(m.uuid);
         p
@@ -52,9 +52,9 @@ impl Server {
             a.fire = a.fire.max(2000);
             a.sync_fire_flag();
         }
-        let xd = tp[0] - m.pos[0];
+        let xd = tp[0] - m.pos()[0];
         let yd = tb.min[1] + (tb.max[1] - tb.min[1]) * 0.333_333_333_333_333_3 - a.pos[1];
-        let zd = tp[2] - m.pos[2];
+        let zd = tp[2] - m.pos()[2];
         let dist = (xd * xd + zd * zd).sqrt();
         let unc = (14 - diff * 4) as f32;
         a.shoot([xd, yd + dist * f64::from(0.2f32), zd], 1.6, unc);

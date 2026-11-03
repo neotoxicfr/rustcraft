@@ -493,7 +493,7 @@ impl Server {
         self.prog.dmg_src = crate::item_use::DmgSrc {
             pos: Some(center),
             direct_living: source.is_some(),
-            attacker_pos: source.map(|s| s.pos),
+            attacker_pos: source.map(|s| s.pos()),
             ..Default::default()
         };
         let mut hit = (None, None);

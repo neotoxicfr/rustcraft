@@ -176,15 +176,15 @@ impl Server {
             *angle = m.rng.next_float() * 2.0 * std::f32::consts::PI;
             self.phantom_select_next(m, angle, *dist, *height, *cw);
         }
-        if dist2(m.x.move_target, m.pos) < 4.0 {
+        if dist2(m.x.move_target, m.pos()) < 4.0 {
             self.phantom_select_next(m, angle, *dist, *height, *cw);
         }
         let bp = m.block_pos();
-        if m.x.move_target[1] < m.pos[1] && !self.is_air([bp[0], bp[1] - 1, bp[2]]) {
+        if m.x.move_target[1] < m.pos()[1] && !self.is_air([bp[0], bp[1] - 1, bp[2]]) {
             *height = height.max(1.0);
             self.phantom_select_next(m, angle, *dist, *height, *cw);
         }
-        if m.x.move_target[1] > m.pos[1] && !self.is_air([bp[0], bp[1] + 1, bp[2]]) {
+        if m.x.move_target[1] > m.pos()[1] && !self.is_air([bp[0], bp[1] + 1, bp[2]]) {
             *height = height.min(-1.0);
             self.phantom_select_next(m, angle, *dist, *height, *cw);
         }
@@ -197,9 +197,9 @@ impl Server {
             m.x.fly_speed = 0.1;
         }
         let t = m.x.move_target;
-        let mut tdx = t[0] - m.pos[0];
-        let tdy = t[1] - m.pos[1];
-        let mut tdz = t[2] - m.pos[2];
+        let mut tdx = t[0] - m.pos()[0];
+        let tdy = t[1] - m.pos()[1];
+        let mut tdz = t[2] - m.pos()[2];
         let mut sd = (tdx * tdx + tdz * tdz).sqrt();
         if sd.abs() <= f64::from(1.0e-5f32) {
             return;

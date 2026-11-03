@@ -924,7 +924,7 @@ impl Server {
             }
             _ => None,
         };
-        let here = crate::mobs::mth::block_of(m.pos);
+        let here = crate::mobs::mth::block_of(m.pos());
         let fall_location = if self.phys.climbable(self.st(here)) {
             Some(climb_location(self.bname(here)))
         } else {

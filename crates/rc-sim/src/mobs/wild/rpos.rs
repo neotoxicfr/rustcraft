@@ -46,9 +46,9 @@ pub fn direction_within_radians(
 /// The position draw toward a direction without residence: direction added to the position.
 pub fn toward(m: &Mob, d: [i32; 3]) -> [i32; 3] {
     [
-        (f64::from(d[0]) + m.pos[0]).floor() as i32,
-        (f64::from(d[1]) + m.pos[1]).floor() as i32,
-        (f64::from(d[2]) + m.pos[2]).floor() as i32,
+        (f64::from(d[0]) + m.pos()[0]).floor() as i32,
+        (f64::from(d[1]) + m.pos()[1]).floor() as i32,
+        (f64::from(d[2]) + m.pos()[2]).floor() as i32,
     ]
 }
 
@@ -238,7 +238,7 @@ pub fn air_pos_towards(
     towards: [f64; 3],
     max_rad: f64,
 ) -> Option<[f64; 3]> {
-    let dir = [towards[0] - m.pos[0], towards[2] - m.pos[2]];
+    let dir = [towards[0] - m.pos()[0], towards[2] - m.pos()[2]];
     let restrict = rpos_restricted(m, f64::from(h));
     best_of(
         s,

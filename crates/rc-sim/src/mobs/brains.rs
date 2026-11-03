@@ -447,7 +447,7 @@ impl Server {
         self.mob_event(m, 18);
         if self.rule("minecraft:mob_drops", true) {
             let xp = m.rng.next_int_bound(7) + 1;
-            self.spawn_orbs(m.pos, xp);
+            self.spawn_orbs(m.pos(), xp);
         }
         self.add_mob(baby);
     }
@@ -458,18 +458,18 @@ impl Server {
         if !m.alive() {
             return false;
         }
-        let x = m.pos[0] + (m.rng.next_double() - 0.5) * 64.0;
-        let y = m.pos[1] + f64::from(m.rng.next_int_bound(64) - 32);
-        let z = m.pos[2] + (m.rng.next_double() - 0.5) * 64.0;
+        let x = m.pos()[0] + (m.rng.next_double() - 0.5) * 64.0;
+        let y = m.pos()[1] + f64::from(m.rng.next_int_bound(64) - 32);
+        let z = m.pos()[2] + (m.rng.next_double() - 0.5) * 64.0;
         self.enderman_teleport(m, [x, y, z])
     }
 
     pub(crate) fn enderman_teleport_towards(&mut self, m: &mut Mob, target: [f64; 3]) -> bool {
         let eye = self.player_eye_y();
-        let d = super::mth::normalize([m.pos[0] - target[0], m.pos[1] + f64::from(m.height()) * 0.5 - eye, m.pos[2] - target[2]]);
-        let x = m.pos[0] + (m.rng.next_double() - 0.5) * 8.0 - d[0] * 16.0;
-        let y = m.pos[1] + f64::from(m.rng.next_int_bound(16) - 8) - d[1] * 16.0;
-        let z = m.pos[2] + (m.rng.next_double() - 0.5) * 8.0 - d[2] * 16.0;
+        let d = super::mth::normalize([m.pos()[0] - target[0], m.pos()[1] + f64::from(m.height()) * 0.5 - eye, m.pos()[2] - target[2]]);
+        let x = m.pos()[0] + (m.rng.next_double() - 0.5) * 8.0 - d[0] * 16.0;
+        let y = m.pos()[1] + f64::from(m.rng.next_int_bound(16) - 8) - d[1] * 16.0;
+        let z = m.pos()[2] + (m.rng.next_double() - 0.5) * 8.0 - d[2] * 16.0;
         self.enderman_teleport(m, [x, y, z])
     }
 
@@ -478,7 +478,7 @@ impl Server {
         if m.mount.vehicle.is_some() {
             return false;
         }
-        let old = m.pos;
+        let old = m.pos();
         // Destination brought back inside the world border.
         let k = self.border_bounds();
         let e = f64::from(1.0e-5f32);
@@ -525,7 +525,7 @@ impl Server {
         if self.mob_fluid(below) == super::env::Fluid::Water {
             return false;
         }
-        m.pos = [to[0], y, to[2]];
+        m.set_pos([to[0], y, to[2]]);
         m.needs_sync = true;
         self.mob_event(m, 46);
         m.nav.stop();
@@ -581,7 +581,7 @@ impl Server {
             m.swell = m.fuse;
             let r = m.explosion_radius as f32 * if m.powered { 2.0 } else { 1.0 };
             m.dead = true;
-            let c = m.pos;
+            let c = m.pos();
             // Charged: the first victim that drops something from `charged_creeper/root`
             // (its head) uses up the creeper's right.
             let skull = std::mem::replace(&mut self.mobs.charged_skull, m.powered.then_some((m.id, false)));
@@ -601,7 +601,7 @@ impl Server {
         if m.x.effects.is_empty() {
             return;
         }
-        let mut c = crate::projectiles::cloud::Cloud::new(self.proj_new_id(), m.pos);
+        let mut c = crate::projectiles::cloud::Cloud::new(self.proj_new_id(), m.pos());
         c.radius = 2.5;
         c.radius_on_use = -0.5;
         c.wait_time = 10;
@@ -628,7 +628,7 @@ impl Server {
         let snd = if item == "minecraft:fire_charge" { "minecraft:item.firecharge.use" } else { "minecraft:item.flintandsteel.use" };
         let pitch = m.rng.next_float() * 0.4 + 0.8;
         let cat = Self::mob_sound_source(m);
-        self.world_sound(snd, cat, m.pos, 1.0, pitch);
+        self.world_sound(snd, cat, m.pos(), 1.0, pitch);
         m.ignited = true;
         let damageable = self.slots[slot].as_ref().is_some_and(|s| self.life.items.damageable(s));
         if damageable {
@@ -652,7 +652,7 @@ impl Server {
         if roll >= (br - 0.4) * 2.0 {
             return;
         }
-        let eye = super::mth::block_of([m.pos[0], m.eye_y(), m.pos[2]]);
+        let eye = super::mth::block_of([m.pos()[0], m.eye_y(), m.pos()[2]]);
         if self.mob_in_water_or_rain(m) || !self.can_see_sky(eye) {
             return;
         }
@@ -704,7 +704,7 @@ impl Server {
         if any {
             let p = (m.rng.next_float() - m.rng.next_float()) * 0.2 + 1.0;
             self.mob_sound(m, "minecraft:entity.chicken.egg", 1.0, p);
-            self.game_event_at("minecraft:entity_place", m.pos, Some(Ent::Mob(m.id)));
+            self.game_event_at("minecraft:entity_place", m.pos(), Some(Ent::Mob(m.id)));
         }
         m.egg_time = m.rng.next_int_bound(6000) + 6000;
     }
@@ -716,9 +716,9 @@ impl Server {
         if m.x.forced_timer > 0 {
             if m.x.forced_timer % 4 == 0 {
                 let (w, h) = (f64::from(m.width()), f64::from(m.height()));
-                let x = m.pos[0] + w * (2.0 * m.rng.next_double() - 1.0);
-                let y = m.pos[1] + h * m.rng.next_double() + 0.5;
-                let z = m.pos[2] + w * (2.0 * m.rng.next_double() - 1.0);
+                let x = m.pos()[0] + w * (2.0 * m.rng.next_double() - 1.0);
+                let y = m.pos()[1] + h * m.rng.next_double() + 0.5;
+                let z = m.pos()[2] + w * (2.0 * m.rng.next_double() - 1.0);
                 self.particles_full("minecraft:happy_villager", 0, [x, y, z], [0.0; 3], [0.0; 3], 1, 0);
             }
             m.x.forced_timer -= 1;
@@ -906,7 +906,7 @@ impl Server {
     /// (consumed, with the held item).
     fn interact_mob(&mut self, m: &mut Mob, slot: usize) -> (bool, bool) {
         let item = self.slots[slot].as_ref().map(|s| s.id.clone()).unwrap_or_default();
-        if !m.alive() || dist2(self.pos, m.pos) > 64.0 {
+        if !m.alive() || dist2(self.pos, m.pos()) > 64.0 {
             return (false, false);
         }
         // Name tag, egg of the same species: before everything else.
@@ -1095,7 +1095,7 @@ impl Server {
                     base[2] + f64::from((r.next_float() - r.next_float()) * 0.1),
                 ];
                 let one = Stack { count: 1, ..d.clone() };
-                self.spawn_item([m.pos[0], m.pos[1] + 1.0, m.pos[2]], v, one, 10);
+                self.spawn_item([m.pos()[0], m.pos()[1] + 1.0, m.pos()[2]], v, one, 10);
             }
         }
         m.sheared = true;
@@ -1111,9 +1111,9 @@ impl Server {
     /// Placement of the carried block: cell drawn within ±1 block (height 0..2), empty, placed on a
     /// full block that is not bedrock, block that can be held at that place, no entity inside.
     pub(crate) fn enderman_leave_tick(&mut self, m: &mut Mob) {
-        let x = (m.pos[0] - 1.0 + m.rng.next_double() * 2.0).floor() as i32;
-        let y = (m.pos[1] + m.rng.next_double() * 2.0).floor() as i32;
-        let z = (m.pos[2] - 1.0 + m.rng.next_double() * 2.0).floor() as i32;
+        let x = (m.pos()[0] - 1.0 + m.rng.next_double() * 2.0).floor() as i32;
+        let y = (m.pos()[1] + m.rng.next_double() * 2.0).floor() as i32;
+        let z = (m.pos()[2] - 1.0 + m.rng.next_double() * 2.0).floor() as i32;
         let p = [x, y, z];
         let below = [x, y - 1, z];
         let Some(carried) = m.carried else { return };
@@ -1135,9 +1135,9 @@ impl Server {
     /// from the center of the enderman's cell at the same height; the default state of the block
     /// is carried.
     pub(crate) fn enderman_take_tick(&mut self, m: &mut Mob) {
-        let x = (m.pos[0] - 2.0 + m.rng.next_double() * 4.0).floor() as i32;
-        let y = (m.pos[1] + m.rng.next_double() * 3.0).floor() as i32;
-        let z = (m.pos[2] - 2.0 + m.rng.next_double() * 4.0).floor() as i32;
+        let x = (m.pos()[0] - 2.0 + m.rng.next_double() * 4.0).floor() as i32;
+        let y = (m.pos()[1] + m.rng.next_double() * 3.0).floor() as i32;
+        let z = (m.pos()[2] - 2.0 + m.rng.next_double() * 4.0).floor() as i32;
         let p = [x, y, z];
         let b = m.block_pos();
         let from = [f64::from(b[0]) + 0.5, f64::from(y) + 0.5, f64::from(b[2]) + 0.5];
@@ -1202,7 +1202,7 @@ impl Server {
         if !m.tame || m.sitting || !self.cat_owner_sleeping(m) {
             return false;
         }
-        if dist2(m.pos, self.pos) > 100.0 {
+        if dist2(m.pos(), self.pos) > 100.0 {
             return false;
         }
         let op = self.pos.map(|v| v.floor() as i32);
@@ -1232,7 +1232,7 @@ impl Server {
         let Some(gp) = goal_pos else { return };
         m.cat_sit_pose = false;
         self.move_to_pos(m, gp.map(f64::from), f64::from(1.1f32));
-        if dist2(m.pos, self.pos) < 2.5 {
+        if dist2(m.pos(), self.pos) < 2.5 {
             *on_bed += 1;
             if *on_bed > super::mth::reduced(16) {
                 m.cat_lying = true;
@@ -1330,7 +1330,7 @@ impl Server {
                 }
             }
         }
-        m.pos = [to[0], y, to[2]];
+        m.set_pos([to[0], y, to[2]]);
         m.needs_sync = true;
         m.nav.stop();
         true
@@ -1383,7 +1383,7 @@ impl Server {
                 self.mobs.list.put(i, c);
             }
         } else if self.mobs.rng.next_float() < 0.05 {
-            let mut c = self.new_mob(Kind::Chicken, m.pos, m.yaw);
+            let mut c = self.new_mob(Kind::Chicken, m.pos(), m.yaw);
             c.pitch = 0.0;
             let mut g = super::spawn::Group::default();
             self.finalize_spawn(&mut c, super::spawn::Reason::Jockey, &mut g);
@@ -1395,7 +1395,7 @@ impl Server {
 
     /// Spider: skeleton rider (1 in 100), finalized with the same spawn reason.
     pub(crate) fn spider_skeleton_jockey(&mut self, m: &mut Mob, reason: super::spawn::Reason) {
-        let mut sk = self.new_mob(Kind::Skeleton, m.pos, m.yaw);
+        let mut sk = self.new_mob(Kind::Skeleton, m.pos(), m.yaw);
         sk.pitch = 0.0;
         let mut g = super::spawn::Group::default();
         self.finalize_spawn(&mut sk, reason, &mut g);

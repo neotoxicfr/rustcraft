@@ -181,7 +181,7 @@ impl Server {
         }
         match e {
             E::Player => self.pos,
-            E::Mob(i) => self.mobs.mob_ref_any(i).map_or([0.0; 3], |m| m.pos),
+            E::Mob(i) => self.mobs.mob_ref_any(i).map_or([0.0; 3], |m| m.pos()),
             E::Item(i) => self.life.drops.iter().find(|d| d.id == i).map_or([0.0; 3], |d| d.pos),
             E::Orb(i) => self.life.orbs.iter().find(|d| d.id == i).map_or([0.0; 3], |d| d.pos),
             E::Other(i) => self.other(i).and_then(|n| nbtio::f64s::<3>(n.get("Pos"))).unwrap_or_default(),
@@ -307,12 +307,12 @@ impl Server {
                 if let Some(idx) = self.mobs.index_of(i)
                     && let Some(mut m) = self.mobs.list.take(idx)
                 {
-                    let before = m.pos;
+                    let before = m.pos();
                     // Reading back keeps the entity's UUID (a provided `UUID` is ignored).
                     let uuid = m.uuid;
                     self.load_mob(&mut m, n);
                     m.uuid = uuid;
-                    if m.pos != before {
+                    if m.pos() != before {
                         m.needs_sync = true;
                     }
                     m.sync_data();
@@ -488,7 +488,7 @@ impl Server {
             }
             E::Mob(i) => {
                 if let Some(m) = self.mobs.get_mut(i) {
-                    m.pos = pos;
+                    m.set_pos(pos);
                     m.old = pos;
                     m.inside.clear(); // like the game: nothing is swept until arrival
                     if let Some([y, p]) = rot {

@@ -263,7 +263,7 @@ pub fn custom_ai_step(s: &mut Server, m: &mut Mob) {
 pub fn spawn_at_location(s: &mut Server, m: &Mob, st: crate::player::Stack) {
     let r = &mut s.mobs.rng;
     let v = [r.next_double() * 0.2 - 0.1, 0.2, r.next_double() * 0.2 - 0.1];
-    s.spawn_item(m.pos, v, st, 10);
+    s.spawn_item(m.pos(), v, st, 10);
 }
 
 /// End of the common tick: head stuck to the body when rolled up, state counter.
