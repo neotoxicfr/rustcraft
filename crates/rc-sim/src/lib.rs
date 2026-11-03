@@ -14,6 +14,7 @@ pub mod demo;
 pub mod gen_debug;
 pub mod generation;
 pub mod generation_nbt;
+pub mod generation_timing;
 pub mod input;
 pub mod level;
 mod loader;

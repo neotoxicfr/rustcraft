@@ -398,6 +398,27 @@ class TimedAnalysis(unittest.TestCase):
         load = scenes.load_metrics(lines, win)
         self.assertEqual((load["entities_drawn"], load["block_entities"], load["block_entities_drawn"]), (12, 40, 3))
 
+    def test_generation_phases(self):
+        # Shape written by `generation_timing.rs` (its test `batch_line_shape` pins the Rust side).
+        batch = ("[perf] [  12.3 s] generation batch {n}: {c} chunks, {t} ms, 32 threads; phases ms: load 1.00, "
+                 "biomes 2.00, terrain {terrain}, bookkeeping 0.10, decoration 6.00, post-processing {post}, "
+                 "light and conversion 3.00, relight 0.50, sending 0.01, proto-chunks 0.00, eviction 0.40; "
+                 "single-threaded {post} ms; decoration ms/regions: 0.25/4; light CPU ms: post-processing 0.00 "
+                 "(0 chunks) with 0 mushroom chunks, new 20.00 (24 chunks), relit 0.00 (0 chunks)")
+        lines = [batch.format(n=1, c=24, t=40.0, terrain=20.0, post=4.0),
+                 batch.format(n=2, c=8, t=20.0, terrain=4.0, post=1.0),
+                 "singleplayer: generator minecraft:overworld setup ms: game data 80.5, dimension generator 30.0, "
+                 "structures 9.0, block states, after ready 2.5, light tables, after ready 0.4"]
+        m = scenes.generation_phase_metrics(lines)
+        self.assertAlmostEqual(m["gen:terrain ms/chunk"], 24.0 / 32)
+        self.assertAlmostEqual(m["gen:light and conversion ms/chunk"], 6.0 / 32)
+        self.assertAlmostEqual(m["gen:proto-chunks ms/chunk"], 0.0)
+        self.assertAlmostEqual(m["gen:single-threaded %"], 100.0 * 5.0 / 60.0)
+        self.assertEqual(len([k for k in m if k.startswith("gen:") and k.endswith("ms/chunk")]), 11)
+        self.assertEqual((m["gen setup:game data ms"], m["gen setup:block states, after ready ms"],
+                          m["gen setup:light tables, after ready ms"]), (80.5, 2.5, 0.4))
+        self.assertEqual(scenes.generation_phase_metrics(["singleplayer: generated 24 chunks in 30.0 ms"]), {})
+
     def test_new_measures_shown(self):
         m = analyse("new.log", "images.txt")
         shown = {k for k, _, _ in scenes.KEYS}
