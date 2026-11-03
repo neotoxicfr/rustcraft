@@ -94,8 +94,8 @@ const REST: usize = 3;
 const COMPACT_MIN: usize = 4096;
 
 /// Glyphs kept on the GPU (`RUSTCRAFT_OPT_TAGPERSIST`, default 1), read once.
-fn persist_on() -> bool {
-    rc_data::env_str!("RUSTCRAFT_OPT_TAGPERSIST") != Some("0")
+pub(crate) fn persist_on() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_TAGPERSIST")
 }
 
 const GLYPH_ATTRS: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![

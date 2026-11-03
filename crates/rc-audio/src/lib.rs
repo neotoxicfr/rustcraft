@@ -82,13 +82,11 @@ pub fn sound_ids_enabled() -> bool {
 }
 
 /// Optimisation switch `RUSTCRAFT_OPT_<name>`: `0` = old path, `1` = new,
-/// absent = `default`. Read once by each caller (`OnceLock`).
+/// absent = `default` (rule shared by every switch, `rc_data::env_flags::switch_state`). Read
+/// once by each caller (`OnceLock`).
 pub(crate) fn switch(name: &str, default: bool) -> bool {
-    match rc_data::env_flags::read_os(&format!("RUSTCRAFT_OPT_{name}")).and_then(|v| v.into_string().ok()).as_deref() {
-        Some("0") => false,
-        Some("1") => true,
-        _ => default,
-    }
+    let value = rc_data::env_flags::read_os(&format!("RUSTCRAFT_OPT_{name}"));
+    rc_data::env_flags::switch_state(value.as_deref(), default)
 }
 
 #[derive(Debug)]

@@ -1965,16 +1965,15 @@ impl EntOpt {
         item_flags: false,
     };
 
-    fn from_env() -> EntOpt {
-        let on = |v: Option<&str>| v != Some("0");
+    pub(crate) fn from_env() -> EntOpt {
         EntOpt {
-            equip_flag: on(rc_data::env_str!("RUSTCRAFT_OPT_EQUIPFLAG")),
-            kind_info: on(rc_data::env_str!("RUSTCRAFT_OPT_KINDINFO")),
-            size_once: on(rc_data::env_str!("RUSTCRAFT_OPT_SIZEONCE")),
-            obj_early: on(rc_data::env_str!("RUSTCRAFT_OPT_OBJEARLY")),
-            light_once: on(rc_data::env_str!("RUSTCRAFT_OPT_LIGHTONCE")),
-            reg_idx: on(rc_data::env_str!("RUSTCRAFT_OPT_REGIDX")),
-            item_flags: on(rc_data::env_str!("RUSTCRAFT_OPT_ITEMFLAGS")),
+            equip_flag: rc_data::opt_switch!("RUSTCRAFT_OPT_EQUIPFLAG"),
+            kind_info: rc_data::opt_switch!("RUSTCRAFT_OPT_KINDINFO"),
+            size_once: rc_data::opt_switch!("RUSTCRAFT_OPT_SIZEONCE"),
+            obj_early: rc_data::opt_switch!("RUSTCRAFT_OPT_OBJEARLY"),
+            light_once: rc_data::opt_switch!("RUSTCRAFT_OPT_LIGHTONCE"),
+            reg_idx: rc_data::opt_switch!("RUSTCRAFT_OPT_REGIDX"),
+            item_flags: rc_data::opt_switch!("RUSTCRAFT_OPT_ITEMFLAGS"),
         }
     }
 }
