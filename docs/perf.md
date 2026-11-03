@@ -352,6 +352,10 @@ Three tracks, each behind its switch (default 1, `=0` old path):
 - `RUSTCRAFT_OPT_KEEP_EVAL_CONTEXT`: the terrain (chunk and base column) uses a context kept by the
   thread, reset at the start of each chunk (each cache cell forgets its volume and last point, its
   buffer goes back to the spares), the final density buffer taken from the spares and handed back.
+  Off by default since the quiet-machine scene bench of series 3 (03/11, `redstone` and
+  `crowd-1000`, 2 passes each, same exe with and without the switch): 1.37 / 1.38 and 1.52 / 1.51 ms
+  per generated chunk, private memory 1,536 / 1,498 MB and 1,520 / 1,470 MB. The kept spares of every
+  generation thread cost 40 to 50 MB for no gain at scene level; `=1` enables it.
 
 Allocations per chunk (deterministic, `bench_final_density`, 256 chunks, counter around mimalloc with
 the client's option, 1 thread):

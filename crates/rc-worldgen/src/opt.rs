@@ -131,12 +131,15 @@ switch!(
     spline_inputs_on_stack,
     "RUSTCRAFT_OPT_SPLINE_INPUTS_ON_STACK"
 );
-switch!(
-    /// Terrain: each thread keeps its evaluation context (cache cells, spare buffers) from one
-    /// chunk to the next, reset at the start of each chunk, instead of a new one per chunk.
-    keep_eval_context,
-    "RUSTCRAFT_OPT_KEEP_EVAL_CONTEXT"
-);
+/// Terrain: each thread keeps its evaluation context (cache cells, spare buffers) from one chunk
+/// to the next, reset at the start of each chunk, instead of a new one per chunk. Off by default
+/// (`=1` enables it): on the quiet-machine scene bench it costs 40 to 50 MB of private memory (the
+/// spares of every generation thread) for no measurable gain per generated chunk.
+#[inline]
+pub fn keep_eval_context() -> bool {
+    static S: LazyLock<bool> = LazyLock::new(|| opt_in("RUSTCRAFT_OPT_KEEP_EVAL_CONTEXT"));
+    *S
+}
 
 switch!(
     /// Spline: point coordinates kept on the stack, sampling without dynamic call. On by default:
