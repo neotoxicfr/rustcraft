@@ -9,12 +9,8 @@ use rc_proto::nbt::Nbt;
 use super::DKind;
 use super::stand::{self, POSES};
 use crate::nbtio;
-
-/// Java's `(int)` floor of a double (saturating, NaN read as 0).
-fn java_floor(d: f64) -> i32 {
-    let i = d as i32;
-    if d < f64::from(i) { i - 1 } else { i }
-}
+// The game floors then converts with saturation: below -2^31 and -inf give the minimum, NaN 0.
+use rc_worldgen::math::floor_i_java;
 
 /// Integer value of a numeric tag (a float floored, a long cut to its low bits), as the game's
 /// integer reads convert any number.
@@ -24,8 +20,8 @@ fn int_of(t: &Nbt) -> Option<i32> {
         Nbt::Short(v) => i32::from(*v),
         Nbt::Int(v) => *v,
         Nbt::Long(v) => *v as i32,
-        Nbt::Float(v) => java_floor(f64::from(*v)),
-        Nbt::Double(v) => java_floor(*v),
+        Nbt::Float(v) => floor_i_java(f64::from(*v)),
+        Nbt::Double(v) => floor_i_java(*v),
         _ => return None,
     })
 }
@@ -299,5 +295,36 @@ fn is_default_description(d: &Nbt) -> bool {
             c.len() == 1 && d.get("translate").and_then(Nbt::as_str) == Some("entity.minecraft.mannequin.label")
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn real_to_integer_saturates_like_the_game() {
+        assert_eq!(int_of(&Nbt::Double(-3e9)), Some(i32::MIN));
+        assert_eq!(int_of(&Nbt::Double(f64::NEG_INFINITY)), Some(i32::MIN));
+        assert_eq!(int_of(&Nbt::Float(-3e9)), Some(i32::MIN));
+        assert_eq!(int_of(&Nbt::Float(f32::NEG_INFINITY)), Some(i32::MIN));
+        assert_eq!(int_of(&Nbt::Double(f64::NAN)), Some(0));
+        assert_eq!(int_of(&Nbt::Float(f32::NAN)), Some(0));
+        assert_eq!(int_of(&Nbt::Double(3e9)), Some(i32::MAX));
+        assert_eq!(int_of(&Nbt::Float(f32::INFINITY)), Some(i32::MAX));
+        // In range: rounded down, the edges of the range included.
+        assert_eq!(int_of(&Nbt::Double(-1.5)), Some(-2));
+        assert_eq!(int_of(&Nbt::Double(-2_147_483_648.0)), Some(i32::MIN));
+        assert_eq!(int_of(&Nbt::Double(-2_147_483_647.5)), Some(i32::MIN));
+        assert_eq!(int_of(&Nbt::Float(2.75)), Some(2));
+    }
+
+    #[test]
+    fn huge_negative_real_gives_cleared_short_and_flag() {
+        // The minimum keeps no low bits: a short of 0 and a flag off, as the game saves them.
+        let given = Nbt::Compound(vec![("Fire".into(), Nbt::Double(-3e9)), ("OnGround".into(), Nbt::Double(-3e9))]);
+        let saved = summoned(DKind::Stand, [0.0; 3], 1, &given);
+        assert_eq!(saved.get("Fire"), Some(&Nbt::Short(0)));
+        assert_eq!(saved.get("OnGround"), Some(&Nbt::Byte(0)));
     }
 }
