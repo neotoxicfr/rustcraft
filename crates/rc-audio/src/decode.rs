@@ -279,29 +279,45 @@ mod tests {
         assert_eq!(old, PCM_DIGEST, "PCM fingerprint {old:#018x}, expected {PCM_DIGEST:#018x}");
     }
 
-    /// The stream read from the ring (two loop passes) == `decode_all` twice, old and
-    /// new write thread.
+    /// Moves samples from the ring into `got`, at most `limit` in all: one sample, or (`by_slice`)
+    /// one slice of up to 2,048 samples, as the mixer reads a block (`STREAM_SLICE_READ`). False
+    /// when the ring was empty.
+    fn read_some(ring: &mut rtrb::Consumer<i16>, got: &mut Vec<i16>, limit: usize, by_slice: bool) -> bool {
+        if !by_slice {
+            return ring.pop().map(|v| got.push(v)).is_ok();
+        }
+        let n = ring.slots().min(limit - got.len()).min(2_048);
+        let Ok(chunk) = ring.read_chunk(n) else { return false };
+        if n == 0 {
+            return false;
+        }
+        let (first, second) = chunk.as_slices();
+        got.extend_from_slice(first);
+        got.extend_from_slice(second);
+        chunk.commit_all();
+        true
+    }
+
+    /// The stream read from the ring (two loop passes) == `decode_all` twice: old and new write
+    /// thread, read sample by sample or by slices.
     #[test]
     fn stream_matches_decode_all() {
         let Some(files) = real_oggs() else { return };
         for (path, bytes) in files.iter().filter(|(p, _)| !p.contains("/music/")).take(6) {
             let pcm = decode_all_with(bytes.clone(), true).unwrap();
             let want: Vec<i16> = pcm.data.iter().chain(&pcm.data).copied().collect();
-            for chunked in [false, true] {
+            for (chunked, by_slice) in [(false, false), (true, false), (false, true), (true, true)] {
                 let mut s = spawn_stream_with(SharedBytes(Arc::new(bytes.clone())), true, chunked).unwrap();
                 let mut got = Vec::with_capacity(want.len());
                 let t = std::time::Instant::now();
                 while got.len() < want.len() {
-                    match s.ring.pop() {
-                        Ok(v) => got.push(v),
-                        Err(_) => {
-                            s.wake_if_drained();
-                            assert!(t.elapsed().as_secs() < 30, "{path}: stream stuck");
-                            std::thread::yield_now();
-                        }
+                    if !read_some(&mut s.ring, &mut got, want.len(), by_slice) {
+                        s.wake_if_drained();
+                        assert!(t.elapsed().as_secs() < 30, "{path}: stream stuck");
+                        std::thread::yield_now();
                     }
                 }
-                assert!(got == want, "{path} (slices {chunked}): stream differs from decode_all");
+                assert!(got == want, "{path} (written in slices {chunked}, read in slices {by_slice}): stream differs from decode_all");
             }
         }
     }
