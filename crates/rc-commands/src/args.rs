@@ -330,7 +330,8 @@ pub fn parse(ty: &ArgType, r: &mut Reader<'_>, data: &Data, src: Source) -> Resu
                 "t" | "" => 1.0,
                 _ => return Err(r.err0("argument.time.invalid_unit")),
             };
-            let ticks = (v * f).round() as i32;
+            // The game's rounding (halves up): -0.5t gives 0 ticks, not -1.
+            let ticks = rc_data::java_math::round_f32_to_i32(v * f);
             if ticks < *min {
                 return Err(r.err("argument.time.tick_count_too_low", vec![min.to_string(), ticks.to_string()]));
             }
@@ -1600,6 +1601,20 @@ mod tests {
         let c: Vec<char> = s.chars().collect();
         let mut r = Reader::new(&c, 0);
         parse(ty, &mut r, data, Source { restricted: true, selectors: true }).map(|_| r.cursor).map_err(|e| e.key)
+    }
+
+    /// Negative halves round up like the game: `-0.5t` is 0 ticks (accepted at minimum 0), and the
+    /// refusal of `-1.5` reports -1, not -2.
+    #[test]
+    fn time_rounds_negative_halves_up() {
+        let d = Data::default();
+        assert_eq!(run(&ArgType::Time(0), "-0.5t", &d), Ok(5));
+        assert_eq!(run(&ArgType::Time(0), "-0.5", &d), Ok(4));
+        let c: Vec<char> = "-1.5".chars().collect();
+        let mut r = Reader::new(&c, 0);
+        let refusal = parse(&ArgType::Time(0), &mut r, &d, Source { restricted: true, selectors: true }).unwrap_err();
+        assert_eq!(refusal.key, "argument.time.tick_count_too_low");
+        assert_eq!(refusal.args, ["0", "-1"]);
     }
 
     #[test]

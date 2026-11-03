@@ -15,6 +15,16 @@ fn texts(c: &[Component]) -> Vec<String> {
     c.iter().map(|x| format!("{x:?}")).collect()
 }
 
+/// Durations round like the game, negative halves up: `-0.5t` is 0 ticks, `-1.5` is -1.
+#[test]
+fn time_ticks_rounds_negative_halves_up() {
+    assert_eq!(cmds_basic::time_ticks("-0.5t"), 0);
+    assert_eq!(cmds_basic::time_ticks("-0.5"), 0);
+    assert_eq!(cmds_basic::time_ticks("-1.5"), -1);
+    assert_eq!(cmds_basic::time_ticks("2.5"), 3);
+    assert_eq!(cmds_basic::time_ticks("1.5d"), 36000);
+}
+
 #[test]
 fn tree_per_level() {
     let Some((lv, _)) = levels() else { return };

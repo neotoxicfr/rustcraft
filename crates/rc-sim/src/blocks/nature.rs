@@ -5,6 +5,31 @@
 use super::{Dir, Kind, P, above, add, below, flag, rel};
 use crate::server::Server;
 
+/// Daylight detector signal before the clamp: the sky level weighted by the game's tabulated
+/// cosine of the (pulled) sun angle, rounded halves up.
+fn daylight_power(sky: i32, sun_angle: f32) -> i32 {
+    rc_data::java_math::round_f32_to_i32(sky as f32 * rc_data::java_math::cos(f64::from(sun_angle)))
+}
+
+#[cfg(test)]
+#[test]
+fn daylight_power_reads_the_sine_table() {
+    // Angles where the table and the C library's cosine round to another signal: the old
+    // computation (library cosine) gave the other value there.
+    let mut differing = 0;
+    for sky in 1..=15 {
+        for step in 0..200_000 {
+            let angle = step as f32 * (std::f32::consts::TAU / 200_000.0);
+            let library = (sky as f32 * angle.cos()).round() as i32;
+            let table = rc_data::java_math::round_f32_to_i32(sky as f32 * rc_data::java_math::cos(f64::from(angle)));
+            assert_eq!(daylight_power(sky, angle), table, "sky {sky} angle {angle}");
+            differing += usize::from(library.clamp(0, 15) != table.clamp(0, 15));
+        }
+    }
+    eprintln!("daylight signals changed by the table cosine: {differing} of 3,000,000");
+    assert!(differing > 0, "table and library never differ: this test proves nothing");
+}
+
 /// Rise of a box `bb` that touches the part gained by the shape of a block `p` (fractions
 /// `lo` → `hi` on each axis): raised by a block then lowered onto the new top, by at most one
 /// block; `None` if it does not touch that part.
@@ -147,7 +172,7 @@ impl Server {
         } else if target > 0 {
             let offset = if angle < std::f32::consts::PI { 0.0 } else { std::f32::consts::TAU };
             angle += (offset - angle) * 0.2;
-            target = (target as f32 * angle.cos()).round() as i32;
+            target = daylight_power(target, angle);
         }
         let target = target.clamp(0, 15);
         if self.view().get_int(s, "power") != target {
