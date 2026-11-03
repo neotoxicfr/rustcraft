@@ -52,8 +52,8 @@ impl MobList {
         self.slots[slot] = Some(m);
     }
 
-    /// `put` if the slot still exists; otherwise the mob is handed back (the list was exchanged
-    /// with another dimension's while the mob was out).
+    /// `put` if the slot still exists; otherwise the mob is handed back (the list got shorter
+    /// while the mob was out).
     #[inline]
     pub(crate) fn try_put(&mut self, slot: usize, m: Box<Mob>) -> Result<(), Box<Mob>> {
         match self.slots.get_mut(slot) {
