@@ -238,11 +238,7 @@ fn civil(days: i64) -> (i64, u32, u32) {
 /// Singleplayer quick play world: given id, or the last world played if empty;
 /// `None` if no world of that name (the game's error screen).
 pub fn resolve_world(id: &str, game_dir: &Path) -> Option<PathBuf> {
-    let id = if id.trim().is_empty() {
-        crate::world_list::scan(game_dir).into_iter().next().map(|s| s.id)?
-    } else {
-        id.to_owned()
-    };
+    let id = if id.trim().is_empty() { crate::world_list::last_played_world(game_dir)? } else { id.to_owned() };
     // The game only checks the existence of the folder (a folder without a level fails on opening).
     let dir = game_dir.join("saves").join(&id);
     (!id.trim().is_empty() && dir.is_dir()).then_some(dir)

@@ -345,6 +345,53 @@ pub fn read_named(r: &mut Reader<'_>) -> Result<Option<(String, Nbt)>> {
     }
 }
 
+/// Reads a file root tag like [`read_named`], except inside the root's compound field `parent`:
+/// there, the compound fields named in `skipped` are walked (a truncated or badly typed tag is
+/// still an error) but never decoded nor kept, so a bad string inside them no longer matters.
+/// The game reads a world's summary this way, without the player and the old generation settings.
+pub fn read_named_skipping(r: &mut Reader<'_>, parent: &str, skipped: &[&str]) -> Result<Option<(String, Nbt)>> {
+    let ty = r.u8()?;
+    if ty != 10 {
+        // Not a compound root: nothing can be skipped.
+        return if ty == 0 { Ok(None) } else { read_string(r).and_then(|n| Ok(Some((n, read_payload(r, ty, 0)?)))) };
+    }
+    let name = read_string(r)?;
+    let mut fields = Vec::new();
+    loop {
+        let t = r.u8()?;
+        if t == 0 {
+            return Ok(Some((name, Nbt::Compound(fields))));
+        }
+        let key = read_string(r)?;
+        let value = if t == 10 && key == parent {
+            Nbt::Compound(read_fields_skipping(r, 1, skipped)?)
+        } else {
+            read_payload(r, t, 1)?
+        };
+        fields.push((key, value));
+    }
+}
+
+/// Fields of a compound at `depth`, the compound fields named in `skipped` walked and left out.
+fn read_fields_skipping(r: &mut Reader<'_>, depth: usize, skipped: &[&str]) -> Result<Vec<(String, Nbt)>> {
+    if depth > MAX_DEPTH {
+        return Err(Error::InvalidValue { what: "NBT depth", value: depth as i64 });
+    }
+    let mut fields = Vec::new();
+    loop {
+        let t = r.u8()?;
+        if t == 0 {
+            return Ok(fields);
+        }
+        let key = read_string(r)?;
+        if t == 10 && skipped.contains(&key.as_str()) {
+            skip_payload(r, t, depth + 1)?;
+        } else {
+            fields.push((key, read_payload(r, t, depth + 1)?));
+        }
+    }
+}
+
 /// Writes a file root tag (type, name, payload).
 pub fn write_named(w: &mut Vec<u8>, name: &str, v: &Nbt) {
     w.push(v.type_id());
@@ -521,6 +568,48 @@ mod tests {
         let mut w = Vec::new();
         write_string(&mut w, &"a".repeat(65_535));
         assert_eq!(w.len(), 2 + 65_535);
+    }
+
+    /// World summary read: same tree as the full read minus `Data.Player` and
+    /// `Data.WorldGenSettings` (compounds only, and only under `Data`); a bad string inside a
+    /// skipped field no longer fails the read, a truncated one still does.
+    #[test]
+    fn named_read_skipping_matches_full_read_without_the_fields() {
+        let player = Nbt::Compound(vec![("Inventory".into(), Nbt::List(vec![Nbt::String("MARK".into())]))]);
+        let data = |with_skipped: bool| {
+            let mut f = vec![("LevelName".to_owned(), Nbt::String("été".into())), ("LastPlayed".into(), Nbt::Long(7))];
+            if with_skipped {
+                f.insert(1, ("Player".into(), player.clone()));
+                f.push(("WorldGenSettings".into(), Nbt::Compound(vec![("seed".into(), Nbt::Long(1))])));
+            }
+            // Same names elsewhere, or under another type: kept.
+            f.push(("Version".into(), Nbt::Compound(vec![("Player".into(), Nbt::Int(3))])));
+            f.push(("WorldGenSettings".into(), Nbt::Int(9)));
+            Nbt::Compound(f)
+        };
+        let root = |with_skipped: bool| {
+            Nbt::Compound(vec![("Data".into(), data(with_skipped)), ("Player".into(), player.clone())])
+        };
+        let mut bytes = Vec::new();
+        write_named(&mut bytes, "", &root(true));
+        let read_skipping =
+            |b: &[u8]| read_named_skipping(&mut Reader::new(b), "Data", &["Player", "WorldGenSettings"]);
+        let (name, light) = read_skipping(&bytes).unwrap().unwrap();
+        assert_eq!(name, "");
+        assert_eq!(light, root(false));
+        assert_eq!(read_named(&mut Reader::new(&bytes)).unwrap().unwrap().1, root(true));
+        // A string the full read refuses, inside the skipped player of `Data` only.
+        let mut damaged = bytes.clone();
+        let at = damaged.windows(4).position(|w| w == b"MARK").unwrap();
+        damaged[at..at + 4].fill(0xff);
+        assert!(read_named(&mut Reader::new(&damaged)).is_err());
+        assert_eq!(read_skipping(&damaged).unwrap().unwrap().1.get("Data"), Some(&data(false)));
+        assert!(read_skipping(&bytes[..at]).is_err(), "truncated inside a skipped field");
+        // Roots that are not compounds, and an absent root.
+        let mut list = Vec::new();
+        write_named(&mut list, "n", &Nbt::List(vec![Nbt::Int(1)]));
+        assert_eq!(read_skipping(&list).unwrap(), read_named(&mut Reader::new(&list)).unwrap());
+        assert_eq!(read_skipping(&[0]).unwrap(), None);
     }
 
     #[test]

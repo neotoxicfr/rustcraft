@@ -34,6 +34,15 @@ Expected behaviour of the 26.3 client, described in our own words. Code: `apps/c
   `resources.zip` (`resource-packs.md` § 5.2); less than 64 MiB free on the volume →
   "Low Disk Space" (red title, "Proceed" / "Back"). An abort removes the world
   pack and goes back to the list (to the title screen for a quick launch).
+- Reading of the list, like the game: in the background (one task per world on the shared pool),
+  the list showing a single "Loading worlds" row (`selectWorld.loading_list`, gray dots below)
+  until the first reading arrives; worlds shown at the first frame after it, sorted by last played
+  then by folder name compared in UTF-16 units. Listed: folders with `level.dat` or, failing that,
+  `level.dat_old` (unreadable entry, dated by the file). `level.dat` read without `Data.Player`
+  and `Data.WorldGenSettings` (skipped, never decoded). Read again in the background on each
+  return the game reads again (edit, deletion and its cancel, creation, opening abandoned), the
+  current list staying shown until then, selection kept by folder; not read again back from a
+  notice (symbolic link) or the re-creation alert.
 - List re-read empty (last world deleted): creation opens in its place; cancelling it goes back to
   the title screen.
 - Alerts (re-creation impossible, recovery failed): a "Back" button (title at 70, message at
@@ -71,6 +80,7 @@ Expected behaviour of the 26.3 client, described in our own words. Code: `apps/c
 Centered column of 200 (height 234, spacing 5), title at y = 15: name (Enter = save),
 "Reset Icon" (deletes `icon.png`), world folder, "Make Backup"
 (zip `backups/YYYY-MM-DD_HH-MM-SS_<folder>.zip`, entries `<folder>/…`, without `session.lock`,
+dated with the local time of the copy like the game's entries,
 notification "Saved: … / Size: n MB" rounded up to the next MiB), backups
 folder, "Optimize World" (offered backup, "erase cache" checkbox, progress
 screen: count, converted, skipped, bar per dimension, percentage). The world is

@@ -4103,3 +4103,77 @@ compiling): figures to re-take on a quiet machine with the scenes `plains32`, `r
   through the block change, particles/sounds/steps bit for bit), random block changes against the
   eager path; 11 sabotages each caught by its test. Multi-core and GPU: not applicable (a few µs of
   serial work per tick).
+## C4-M32: world list read in the background, backup and deletion side by side (03/11, loaded machine)
+
+Menus only (nothing in a world loop). Micro-benches on a LOADED machine (other agents compiling),
+trial profile; the quiet-machine scene bench (`world-list`, image max at the opening of
+Singleplayer and at a cancelled return from Edit, `RUSTCRAFT_PERFLOG`) is still to do. Every lead
+stays behind its switch (`=0`: old path).
+
+- Reading of the list (`world_list::scan`, the game reads it in the background with one task per
+  world). Micro-bench `world_list::tests::bench_world_scan` (worlds made of the test world's
+  `level.dat`, a 64 × 64 icon and a `session.lock`, best of 5, 2 passes, warm cache only: emptying
+  the system file cache needs administrator rights): one by one 0.23-0.24 ms for 1 world,
+  4.6-5.3 ms for 20, 24-26 ms for 100, 30-50 ms for 200 (about 0.24 ms per world: icon decode,
+  `level.dat` inflate, lock test, link checks). That was a frozen frame on the main thread at
+  every opening and every return. Now:
+  - `RUSTCRAFT_OPT_WORLD_LIST_ASYNC_SCAN` (on): read on a thread, the main thread pays 48-64 µs
+    (thread start) whatever the count; "Loading worlds" row until the first reading (like the
+    game), current list kept on a re-reading.
+  - `RUSTCRAFT_OPT_WORLD_LIST_PARALLEL_READ` (on): one task per world on the shared pool; 20
+    worlds 2.7-3.5 ms on 2 threads, 1.6-1.8 ms on 16; 100 worlds 5.9-6.6 ms on 16-32 threads; 200
+    worlds 9.6-12.0 ms on 16-32 threads (÷3 to ÷5); 1 world: equal within noise (0.18-0.33 ms).
+    Time until the list appears, not main-thread time.
+  - `RUSTCRAFT_OPT_WORLD_LIST_NO_RELOAD_ON_CANCEL` (on): no reading back from the symbolic link
+    notice or the re-creation alert (the game shows the same list again), nor when the backup
+    question or the recovery screen gives way to the next step. Returns the game reads again
+    (edit closed, deletion and its cancel, creation cancelled, opening abandoned) still read
+    again, now in the background. Cache by modification date: ruled out (copied folders keep
+    their date).
+  - `RUSTCRAFT_OPT_WORLD_ICON_HEADER_FIRST` (on): the 24-byte PNG header read first, the rest only
+    for 64 × 64; saves reading a wrong-size icon whole (any size up to the file), same open count
+    otherwise. Not measured separately (inside the scan figures).
+  - `RUSTCRAFT_OPT_QUICK_PLAY_LIGHT_SCAN` (on): quick play without a world name takes the last
+    played world from `level.dat` alone, in parallel (no icon decode, no lock test).
+- Row texts (`RUSTCRAFT_OPT_WORLD_LIST_ROW_TEXT_CACHE`, on): the name, "folder (date)" and
+  information lines and their cut versions are built once per reading, like the game which builds
+  them with the row, instead of every frame (the date read the time zone from the system for each
+  row each frame). Micro-bench `bench_row_text` (15 visible rows, fixed-width metrics standing for
+  the font, 2 passes): 74.4-74.8 µs per frame rebuilt, 0.07-0.11 µs kept.
+- `level.dat` summary read (`storage::read_level_summary`, fidelity: the game skips
+  `Data.Player` and `Data.WorldGenSettings`; 26.3 writes neither, so only older worlds read
+  less): micro-bench `bench_level_summary_read` (player with 36 items and 800 recipes, best of
+  200, 2 passes): whole read 68-71 µs, summary read 41-51 µs.
+- Backup copy (`storage::backup`, `RUSTCRAFT_OPT_PARALLEL_BACKUP_ZIP`, on): every file
+  compressed on its own thread into an archive of one entry, then copied raw in the walk order:
+  the zip is byte for byte the old path's (test `backup_side_by_side_writes_the_old_zip`). Feeding
+  the deflater in 8 KiB pieces (a stream read, to bound the memory) changes its output (one byte
+  more on a 1 MiB file): ruled out, files read whole like the old path, at most 64 MiB of input
+  waiting (`BACKUP_BYTES_IN_FLIGHT`, the writer's entry always passes). Micro-bench `bench_backup`
+  (test world, 71 MB, 216 files, zip 8.1 MB, 2 passes): old path 150 / 232 ms, 1 thread 136 /
+  207, 2 threads 80 / 166, 4 threads 53 / 142, 8 threads 38 / 106, 16 threads 39 / 84, 32 threads
+  47 / 205 ms (÷2 to ÷4; 32 threads hit by the loaded machine). Memory: up to about twice the
+  budget (128 MiB) instead of the largest file.
+- Deletion (`storage::delete`, `RUSTCRAFT_OPT_PARALLEL_WORLD_DELETE`, on): the tree listed
+  without entering links, its files removed on all threads, then the folders deepest first; the
+  game deletes on its main thread too (frozen frame kept, shorter). Micro-bench `bench_delete`
+  (640 files of 64 KiB in 10 folders, 2 passes): 1 thread 70 / 124 ms, 2 threads 42 / 77, 4
+  threads 56 / 36, 8 threads 200 / 99, 16 threads 63 / 68, 32 threads 218 / 25 ms: too noisy here
+  to settle; to re-measure on a quiet machine (and with Defender scanning the folder).
+- Optimize World: already one region file per thread since G4-F17; now behind
+  `RUSTCRAFT_OPT_PARALLEL_WORLD_OPTIMIZE` (`0`: one thread) with an equivalence test (1 against
+  2, 4, 16 threads: same chunks read back, same counters and progress). The game works one
+  dimension after the other and so do we (the progress bars fill in that order): dimensions not
+  run together. `bench_optimize` this round: 1 thread 618-818 ms, 8 threads 97-222 ms.
+- Leads not taken: icon slots by world instead of by row (one 16 KiB upload per row entering the
+  view on a scroll, 32 slots for at most about 20 visible rows: nothing measurable); GPU (zlib,
+  NBT, PNG, file system: not applicable).
+- Fidelity fixes found on the way: worlds with only `level.dat_old` listed (unreadable, dated
+  by that file); folder names compared in UTF-16 units; backup entries dated with the local time
+  of the copy (were 1980-01-01).
+- Differences with the game noted, not fixed here: a `level.dat` without `version` 19133/19132
+  is unreadable for the game (shown normally here); a missing `LastPlayed` is 0 for the game
+  (date of 1970 shown), -1 here (no date); `Version` present without `Name` gives the current
+  version name in the game, "unknown" here; a failed access when opening Edit makes the game
+  re-read the list (toast only here); the game's backup walks the folder in its listing order
+  (entry order differs here, same content).

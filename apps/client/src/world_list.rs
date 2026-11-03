@@ -191,17 +191,53 @@ fn forbidden_link(p: &Path) -> bool {
     !refused.is_empty()
 }
 
+/// Modification time of `path` in ms since 1970.
+fn modified_ms(path: &Path) -> Option<i64> {
+    let t = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+    t.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_millis() as i64)
+}
+
+/// The 64 × 64 icon (`icon.png`) in RGBA: none behind a refused link, nor when the file is not a
+/// 64 × 64 PNG. The PNG header is read first, the rest only for that size
+/// (`RUSTCRAFT_OPT_WORLD_ICON_HEADER_FIRST=0`: the whole file read first, the old path).
+fn read_icon(dir: &Path) -> Option<Vec<u8>> {
+    let path = dir.join("icon.png");
+    if forbidden_link(&path) {
+        return None;
+    }
+    let first = rc_data::env_str!("RUSTCRAFT_OPT_WORLD_ICON_HEADER_FIRST") != Some("0");
+    let png = if first { read_png_if_icon_sized(&path) } else { std::fs::read(&path).ok() }?;
+    rc_client::status::Favicon::from_png(png).and_then(|f| f.rgba())
+}
+
+/// The PNG at `path`, read whole only when its header (24 bytes) announces 64 × 64 pixels.
+fn read_png_if_icon_sized(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut png = vec![0; 24];
+    file.read_exact(&mut png).ok()?;
+    let side = rc_client::status::ICON_SIDE;
+    if rc_client::status::png_size(&png) != Some((side, side)) {
+        return None;
+    }
+    file.read_to_end(&mut png).ok()?;
+    Some(png)
+}
+
 impl Summary {
+    /// Everything the list shows about a world: what `level.dat` says, the icon, the lock.
     pub fn read(dir: &Path) -> Summary {
+        let mut s = Summary::read_level_data(dir);
+        s.icon = read_icon(dir);
+        // A refused `level.dat` link stands for the whole world: never shown locked.
+        s.locked = !s.symlink && rc_sim::lock::SessionLock::is_locked(dir);
+        s
+    }
+
+    /// What `level.dat` says (name, last played, mode, version…), without the icon or the lock:
+    /// enough to place the world in the list.
+    fn read_level_data(dir: &Path) -> Summary {
         let id = dir.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        // Icon behind a refused link: no icon.
-        let icon_path = dir.join("icon.png");
-        let icon = (!forbidden_link(&icon_path))
-            .then(|| std::fs::read(&icon_path).ok())
-            .flatten()
-            .and_then(rc_client::status::Favicon::from_png)
-            .and_then(|f| f.rgba());
-        let locked = rc_sim::lock::SessionLock::is_locked(dir);
         let mut s = Summary {
             dir: dir.to_owned(),
             name: id.clone(),
@@ -214,26 +250,23 @@ impl Summary {
             version_name: None,
             series: "main".into(),
             data_version: 0,
-            locked,
+            locked: false,
             corrupted: false,
-            icon,
+            icon: None,
             symlink: false,
         };
         // `level.dat` behind a refused link: nothing else is read (name = folder, never played).
         if forbidden_link(&dir.join("level.dat")) {
             s.symlink = true;
-            s.locked = false;
             return s;
         }
-        let root = match rc_sim::storage::read_level(dir, false) {
+        let root = match rc_sim::storage::read_level_summary(dir) {
             Ok(r) => r,
             Err(_) => {
+                // Unreadable (or only `level.dat_old`): dated by the file, like the game.
                 s.corrupted = true;
-                s.last_played = std::fs::metadata(dir.join("level.dat"))
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map_or(-1, |d| d.as_millis() as i64);
+                s.last_played =
+                    ["level.dat", "level.dat_old"].iter().find_map(|f| modified_ms(&dir.join(f))).unwrap_or(-1);
                 return s;
             }
         };
@@ -296,40 +329,41 @@ impl Summary {
         !self.symlink && !self.corrupted && !self.disabled() && !self.older()
     }
 
-    fn version_text(&self, gui: &Gui) -> String {
-        self.version_name.clone().unwrap_or_else(|| t(gui, "selectWorld.versionUnknown"))
+    fn version_text(&self, lang: &rc_text::Lang) -> String {
+        self.version_name.clone().unwrap_or_else(|| tr(lang, "selectWorld.versionUnknown", &[]))
     }
 
     /// Third line: lock, incompatibility, otherwise mode, commands, experiments, version.
-    fn info(&self, gui: &Gui) -> Vec<StyledChar> {
+    fn info(&self, lang: &rc_text::Lang) -> Vec<StyledChar> {
         const GRAY: u32 = 0x80_8080;
+        let t = |key: &str| tr(lang, key, &[]);
         if self.symlink {
-            return colored(&t(gui, "symlink_warning.title"), 0xff_0000);
+            return colored(&t("symlink_warning.title"), 0xff_0000);
         }
         if self.corrupted {
-            return colored(&t(gui, "recover_world.warning"), 0xff_0000);
+            return colored(&t("recover_world.warning"), 0xff_0000);
         }
         if self.locked {
-            return colored(&t(gui, "selectWorld.locked"), 0xff_5555);
+            return colored(&t("selectWorld.locked"), 0xff_5555);
         }
         if !self.compatible() {
-            return colored(&tr(&gui.lang, "selectWorld.incompatible.info", &[self.version_text(gui)]), 0xff_5555);
+            return colored(&tr(lang, "selectWorld.incompatible.info", &[self.version_text(lang)]), 0xff_5555);
         }
         let mut v = if self.hardcore {
-            colored(&t(gui, "gameMode.hardcore"), 0xff_0000)
+            colored(&t("gameMode.hardcore"), 0xff_0000)
         } else {
             let mode = ["survival", "creative", "adventure", "spectator"][self.game_mode.clamp(0, 3) as usize];
-            colored(&t(gui, &format!("gameMode.{mode}")), GRAY)
+            colored(&t(&format!("gameMode.{mode}")), GRAY)
         };
         if self.commands {
-            v.extend(colored(&format!(", {}", t(gui, "selectWorld.commands")), GRAY));
+            v.extend(colored(&format!(", {}", t("selectWorld.commands")), GRAY));
         }
         if self.experimental {
             v.extend(colored(", ", GRAY));
-            v.extend(colored(&t(gui, "selectWorld.experimental"), 0xff_ff55));
+            v.extend(colored(&t("selectWorld.experimental"), 0xff_ff55));
         }
-        v.extend(colored(&format!(", {} ", t(gui, "selectWorld.version")), GRAY));
-        let name = self.version_text(gui);
+        v.extend(colored(&format!(", {} ", t("selectWorld.version")), GRAY));
+        let name = self.version_text(lang);
         if self.downgrade() {
             v.extend(colored(&name, 0xff_5555));
         } else if self.older() {
@@ -341,16 +375,47 @@ impl Summary {
     }
 }
 
-/// Worlds of `saves`: last played first, then by folder.
-pub fn scan(game_dir: &Path) -> Vec<Summary> {
-    let Ok(rd) = std::fs::read_dir(game_dir.join("saves")) else { return Vec::new() };
-    let mut out: Vec<Summary> = rd
+/// Folders of `saves` the list shows, like the game: a folder holding `level.dat`, or failing that
+/// `level.dat_old` (then shown unreadable, with recovery).
+fn world_dirs(game_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(game_dir.join("saves")) else { return Vec::new() };
+    entries
         .flatten()
-        .filter(|e| e.path().is_dir() && e.path().join("level.dat").is_file())
-        .map(|e| Summary::read(&e.path()))
-        .collect();
-    out.sort_by(|a, b| b.last_played.cmp(&a.last_played).then_with(|| a.id.cmp(&b.id)));
-    out
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && (p.join("level.dat").is_file() || p.join("level.dat_old").is_file()))
+        .collect()
+}
+
+/// List order: last played first, then by folder name compared like the game (UTF-16 units: a
+/// character beyond U+FFFF sorts by its surrogates).
+fn world_order(a: &Summary, b: &Summary) -> std::cmp::Ordering {
+    b.last_played.cmp(&a.last_played).then_with(|| a.id.encode_utf16().cmp(b.id.encode_utf16()))
+}
+
+/// Each world read with `read`: on the shared pool, one task per world like the game's background
+/// reads, or one after the other.
+fn read_each(dirs: &[PathBuf], read: fn(&Path) -> Summary, parallel: bool) -> Vec<Summary> {
+    use rayon::prelude::*;
+    if parallel { dirs.par_iter().map(|d| read(d)).collect() } else { dirs.iter().map(|d| read(d)).collect() }
+}
+
+/// Worlds of `saves` in list order (`RUSTCRAFT_OPT_WORLD_LIST_PARALLEL_READ=0`: read one after the
+/// other, the old path).
+pub fn scan(game_dir: &Path) -> Vec<Summary> {
+    let parallel = rc_data::env_str!("RUSTCRAFT_OPT_WORLD_LIST_PARALLEL_READ") != Some("0");
+    let mut worlds = read_each(&world_dirs(game_dir), Summary::read, parallel);
+    worlds.sort_by(world_order);
+    worlds
+}
+
+/// Folder of the world played last (the top of the list), for quick play: only `level.dat` is
+/// read, the icons and locks not changing the order (`RUSTCRAFT_OPT_QUICK_PLAY_LIGHT_SCAN=0`: the
+/// whole list read, the old path).
+pub fn last_played_world(game_dir: &Path) -> Option<String> {
+    if rc_data::env_str!("RUSTCRAFT_OPT_QUICK_PLAY_LIGHT_SCAN") == Some("0") {
+        return scan(game_dir).into_iter().next().map(|s| s.id);
+    }
+    read_each(&world_dirs(game_dir), Summary::read_level_data, true).into_iter().min_by(world_order).map(|s| s.id)
 }
 
 pub fn saves_dir() -> PathBuf {
@@ -398,7 +463,11 @@ type Tip = Option<(Vec<Vec<StyledChar>>, (i32, i32, i32, i32))>;
 
 /// Stack change requested by a screen.
 pub(crate) enum Msg {
+    /// Top screen closed; the list, if it shows again, is read again (the game's return to the list).
     Pop,
+    /// Top screen closed, the list below shown again as it was: the game re-reads nothing there
+    /// (back from a notice or an alert, or a screen replaced by the next step).
+    Close,
     Push(Scr),
     /// Back to the list (re-read), screens above closed.
     ToList,
@@ -439,17 +508,19 @@ pub(crate) enum Scr {
     Backup(Box<BackupConfirm>),
     Recover(Box<Recover>),
     /// Confirmation: buttons → continuation (Escape: the last one).
-    Ask(Box<Column>, Vec<(u32, Msg2)>),
+    Ask(Box<Column>, Vec<(u32, ConfirmAction)>),
     /// Alert with a single "Back" button → continuation. Game quirk reproduced: Escape closes it without a
     /// continuation, towards the title screen (default closing of an out-of-world screen).
-    Alert(Box<Column>, Msg2),
+    Alert(Box<Column>, ConfirmAction),
     Message(Box<Message>),
 }
 
 /// Continuation of a confirmation button (`Msg` without a screen: copyable).
 #[derive(Clone)]
-pub(crate) enum Msg2 {
+pub(crate) enum ConfirmAction {
     Pop,
+    /// See [`Msg::Close`].
+    Close,
     ToList,
     /// Title screen (singleplayer stack closed).
     Title,
@@ -512,15 +583,33 @@ impl Solo {
         (s, out)
     }
 
-    /// Top list empty (no world, or last one deleted): creation opens in its place,
+    /// Top list read and empty (no world, or last one deleted): creation opens in its place,
     /// like the game; cancelling it goes back to the title screen.
     fn list_or_create(&mut self) {
         if let Some(Scr::List(l)) = self.stack.last()
+            && l.loaded
             && l.worlds.is_empty()
         {
             self.stack.pop();
             let c = crate::create_world::CreateWorld::fresh(self.data.clone());
             self.stack.push(Scr::Create(Box::new(c)));
+        }
+    }
+
+    /// List back on top: read again (creation in its place once no world is left).
+    fn reload_list_on_top(&mut self) {
+        if let Some(Scr::List(l)) = self.stack.last_mut() {
+            l.reload();
+            self.list_or_create();
+        }
+    }
+
+    /// The top list's background reading ended: its worlds are shown; none: creation in its place.
+    fn show_finished_reading(&mut self) {
+        if let Some(Scr::List(l)) = self.stack.last_mut()
+            && l.take_finished_reading()
+        {
+            self.list_or_create();
         }
     }
 
@@ -573,13 +662,13 @@ impl Solo {
                     if let Event::Press(id) = e
                         && let Some((_, a)) = answers.iter().find(|(b, _)| *b == id)
                     {
-                        m.extend(msg2(a.clone()));
+                        m.extend(action_msgs(a.clone()));
                     }
                 }
                 if escape {
                     // Escape = last button ("Cancel", "Back").
                     if let Some((_, a)) = answers.last() {
-                        m.extend(msg2(a.clone()));
+                        m.extend(action_msgs(a.clone()));
                     }
                 }
                 m
@@ -609,8 +698,8 @@ impl Solo {
             lang,
             Component::translate("multiplayer.texturePrompt.failure.line1", vec![]),
             Component::translate("multiplayer.texturePrompt.failure.line2", vec![]),
-            ("gui.proceed", Msg2::Open(dir, Stage::Disk)),
-            ("gui.cancel", Msg2::CancelOpen),
+            ("gui.proceed", ConfirmAction::Open(dir, Stage::Disk)),
+            ("gui.cancel", ConfirmAction::CancelOpen),
         );
         vec![Msg::Push(ask)]
     }
@@ -661,8 +750,8 @@ impl Solo {
                             lang,
                             title,
                             Component::translate("selectWorld.warning.lowDiskSpace.description", vec![]),
-                            ("gui.continue", Msg2::Open(dir, Stage::Load)),
-                            ("gui.back", Msg2::CancelOpen),
+                            ("gui.continue", ConfirmAction::Open(dir, Stage::Load)),
+                            ("gui.back", ConfirmAction::CancelOpen),
                         ));
                         return;
                     }
@@ -682,9 +771,12 @@ impl Solo {
             match m {
                 Msg::Pop => {
                     self.stack.pop();
-                    if let Some(Scr::List(l)) = self.stack.last_mut() {
-                        l.reload();
-                        self.list_or_create();
+                    self.reload_list_on_top();
+                }
+                Msg::Close => {
+                    self.stack.pop();
+                    if !no_reload_on_cancel_on() {
+                        self.reload_list_on_top();
                     }
                 }
                 Msg::Push(s) => self.stack.push(s),
@@ -753,6 +845,7 @@ impl Solo {
 
     /// Out-of-world tick: end of the background jobs, screens that advance by themselves.
     pub fn tick(&mut self, lang: &rc_text::Lang) -> Vec<Out> {
+        self.show_finished_reading();
         let mut msgs = Vec::new();
         if self.running.as_ref().is_some_and(|r| match r {
             Running::Create(th, _) => th.is_finished(),
@@ -772,7 +865,12 @@ impl Solo {
                         Err(e) => {
                             eprintln!("world creation: {e}");
                             let _ = std::fs::remove_dir_all(&dir);
-                            msgs.push(Msg::Push(alert(lang, "selectWorld.create", Component::text(e), Msg2::Pop)));
+                            msgs.push(Msg::Push(alert(
+                                lang,
+                                "selectWorld.create",
+                                Component::text(e),
+                                ConfirmAction::Pop,
+                            )));
                         }
                     }
                 }
@@ -810,7 +908,9 @@ impl Solo {
                 Some(Running::Question(th, dir)) => {
                     self.stack.pop();
                     match th.join().ok().flatten() {
-                        Some(kind) => msgs.push(Msg::Push(Scr::Backup(Box::new(BackupConfirm::unstable(lang, &dir, kind))))),
+                        Some(kind) => {
+                            msgs.push(Msg::Push(Scr::Backup(Box::new(BackupConfirm::unstable(lang, &dir, kind)))))
+                        }
                         None => msgs.push(Msg::Open(dir, Stage::Pack)),
                     }
                 }
@@ -832,6 +932,8 @@ impl Solo {
     }
 
     pub fn draw(&mut self, gui: &mut Gui, q: &wgpu::Queue, o: &Options, mouse: Option<(f32, f32)>, time: f64) {
+        // Checked at drawing, like the game: the list appears on the first frame after the reading.
+        self.show_finished_reading();
         match self.stack.last_mut() {
             Some(Scr::List(s)) => s.draw(gui, q, o, mouse, time),
             Some(Scr::Create(s)) => s.draw(gui, q, o, mouse, time),
@@ -850,22 +952,23 @@ fn italic_gray(s: &str) -> Vec<StyledChar> {
     colored(s, 0xaa_aaaa)
 }
 
-fn msg2(a: Msg2) -> Vec<Msg> {
+fn action_msgs(a: ConfirmAction) -> Vec<Msg> {
     match a {
-        Msg2::Pop => vec![Msg::Pop],
-        Msg2::ToList => vec![Msg::ToList],
-        Msg2::Title => vec![Msg::Title],
-        Msg2::Open(d, stage) => vec![Msg::Open(d, stage)],
-        Msg2::CancelOpen => vec![Msg::Out(Out::DropWorldPack), Msg::ToList],
-        Msg2::OpenUrl(u) => {
+        ConfirmAction::Pop => vec![Msg::Pop],
+        ConfirmAction::Close => vec![Msg::Close],
+        ConfirmAction::ToList => vec![Msg::ToList],
+        ConfirmAction::Title => vec![Msg::Title],
+        ConfirmAction::Open(d, stage) => vec![Msg::Open(d, stage)],
+        ConfirmAction::CancelOpen => vec![Msg::Out(Out::DropWorldPack), Msg::ToList],
+        ConfirmAction::OpenUrl(u) => {
             crate::links::open_url(u);
             Vec::new()
         }
-        Msg2::CopyUrl(u) => {
+        ConfirmAction::CopyUrl(u) => {
             crate::links::set_clipboard(u);
             Vec::new()
         }
-        Msg2::Delete(dir) => match rc_sim::storage::delete(&dir) {
+        ConfirmAction::Delete(dir) => match rc_sim::storage::delete(&dir) {
             Ok(()) => vec![Msg::ToList],
             Err(e) => {
                 // Failure (world open elsewhere…): notification, back to the list.
@@ -879,20 +982,20 @@ fn msg2(a: Msg2) -> Vec<Msg> {
 }
 
 /// Warning of a refused world (symbolic link not allowed); "Back" (and Escape) goes back
-/// to the list, re-read.
+/// to the list as it was, like the game.
 fn symlink_notice(lang: &rc_text::Lang) -> Scr {
-    symlink_screen(lang, Msg2::Pop)
+    symlink_screen(lang, ConfirmAction::Close)
 }
 
 /// World refused on opening (symbolic link not allowed in the folder): same warning,
 /// but "Back" (and Escape) leads to the title screen, like the game; nothing of the world was read.
 fn symlink_refused(lang: &rc_text::Lang) -> Scr {
-    symlink_screen(lang, Msg2::Title)
+    symlink_screen(lang, ConfirmAction::Title)
 }
 
-fn symlink_screen(lang: &rc_text::Lang, back: Msg2) -> Scr {
+fn symlink_screen(lang: &rc_text::Lang, back: ConfirmAction) -> Scr {
     use crate::symlink_notice::{BACK, COPY, HELP, OPEN, column};
-    let answers = vec![(OPEN, Msg2::OpenUrl(HELP)), (COPY, Msg2::CopyUrl(HELP)), (BACK, back)];
+    let answers = vec![(OPEN, ConfirmAction::OpenUrl(HELP)), (COPY, ConfirmAction::CopyUrl(HELP)), (BACK, back)];
     Scr::Ask(Box::new(column(lang, true)), answers)
 }
 
@@ -914,7 +1017,7 @@ const ALERT_BUTTON: u32 = 1;
 
 /// Game alert (title at 70, message at 90, a single "Back" button) → continuation; Escape goes back to
 /// the title screen (see `Scr::Alert`).
-pub(crate) fn alert(lang: &rc_text::Lang, title: &str, message: Component, then: Msg2) -> Scr {
+pub(crate) fn alert(lang: &rc_text::Lang, title: &str, message: Component, then: ConfirmAction) -> Scr {
     let col = Column::new(
         Component::translate(title, vec![]),
         message,
@@ -931,11 +1034,10 @@ pub(crate) fn confirm(
     lang: &rc_text::Lang,
     title: Component,
     message: Component,
-    (yes, yes_then): (&str, Msg2),
-    (no, no_then): (&str, Msg2),
+    (yes, yes_then): (&str, ConfirmAction),
+    (no, no_then): (&str, ConfirmAction),
 ) -> Scr {
-    let col =
-        Column::new(title, message, vec![(1, tr(lang, yes, &[]), 150), (2, tr(lang, no, &[]), 150)], 20, 20);
+    let col = Column::new(title, message, vec![(1, tr(lang, yes, &[]), 150), (2, tr(lang, no, &[]), 150)], 20, 20);
     Scr::Ask(Box::new(col), vec![(1, yes_then), (2, no_then)])
 }
 
@@ -947,34 +1049,40 @@ fn restore(lang: &rc_text::Lang, dir: &Path) -> Scr {
             Component::translate("recover_world.done.title", vec![]),
             Component::translate("recover_world.done.success", vec![]),
             // "Continue": opening resumed (the game re-reads the world).
-            ("gui.continue", Msg2::Open(dir.to_owned(), Stage::Experimental)),
-            ("gui.back", Msg2::ToList),
+            ("gui.continue", ConfirmAction::Open(dir.to_owned(), Stage::Experimental)),
+            ("gui.back", ConfirmAction::ToList),
         )
     } else {
-        alert(lang, "recover_world.done.title", Component::translate("recover_world.done.failed", vec![]), Msg2::ToList)
+        alert(
+            lang,
+            "recover_world.done.title",
+            Component::translate("recover_world.done.failed", vec![]),
+            ConfirmAction::ToList,
+        )
     }
 }
 
 /// Input of an alert: its button → continuation; Escape → title screen (game quirk: the alert
 /// closes without a continuation, and a screen closed out of a world gives way to the title screen).
-fn alert_input(c: &mut Column, then: &Msg2, i: &In<'_>) -> Vec<Msg> {
+fn alert_input(c: &mut Column, then: &ConfirmAction, i: &In<'_>) -> Vec<Msg> {
     let (ev, escape) = feed(&mut c.panel, i);
     if escape {
         vec![Msg::Title]
     } else if ev.contains(&Event::Press(ALERT_BUTTON)) {
-        msg2(then.clone())
+        action_msgs(then.clone())
     } else {
         Vec::new()
     }
 }
 
-/// Re-creation impossible: alert with a single "Back" button (towards the list), like the game.
+/// Re-creation impossible: alert with a single "Back" button (towards the list as it was), like
+/// the game.
 fn recreate_error(lang: &rc_text::Lang) -> Scr {
     alert(
         lang,
         "selectWorld.recreate.error.title",
         Component::translate("selectWorld.recreate.error.text", vec![]),
-        Msg2::Pop,
+        ConfirmAction::Close,
     )
 }
 
@@ -1142,7 +1250,8 @@ impl BackupConfirm {
                         None => After::Optimize(self.dir.clone(), self.erase),
                         Some(stage) => After::Open(self.dir.clone(), stage),
                     };
-                    out.push(Msg::Pop);
+                    // Replaced by the next step: the list below is not shown again here.
+                    out.push(Msg::Close);
                     if b == B_BACKUP {
                         out.push(Msg::Job(Job::Backup(self.dir.clone(), after)));
                     } else {
@@ -1216,11 +1325,8 @@ impl Recover {
         if old && missing {
             return None;
         }
-        let time = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or_else(|| t(gui, "recover_world.state_entry.unknown"), |d| short_date(d.as_millis() as i64, lang));
+        let time =
+            modified_ms(&path).map_or_else(|| t(gui, "recover_world.state_entry.unknown"), |ms| short_date(ms, lang));
         let entry = tr(&gui.lang, "recover_world.state_entry", &["\u{1}".into()]);
         let mut v = Vec::new();
         let (a, b) = entry.split_once('\u{1}').unwrap_or((entry.as_str(), ""));
@@ -1294,7 +1400,8 @@ impl Recover {
                 Event::Press(R_BUGS) => crate::links::open_url(BUGS_URL),
                 Event::Press(R_RESTORE) if self.can => {
                     let _ = gui;
-                    out.push(Msg::Pop);
+                    // Replaced by the copy then the restoration: the list is not shown again here.
+                    out.push(Msg::Close);
                     out.push(Msg::Job(Job::Backup(self.dir.clone(), After::Restore(self.dir.clone()))));
                 }
                 _ => {}
@@ -1344,6 +1451,23 @@ const HEADER: i32 = 49;
 const FOOTER: i32 = 60;
 const GRAY: u32 = 0xff80_8080;
 
+/// `saves` read on a background thread (`RUSTCRAFT_OPT_WORLD_LIST_ASYNC_SCAN`, on unless `0`).
+fn async_scan_on() -> bool {
+    rc_data::env_str!("RUSTCRAFT_OPT_WORLD_LIST_ASYNC_SCAN") != Some("0")
+}
+
+/// Back from a notice or an alert, the list is not read again, like the game
+/// (`RUSTCRAFT_OPT_WORLD_LIST_NO_RELOAD_ON_CANCEL`, on unless `0`).
+fn no_reload_on_cancel_on() -> bool {
+    rc_data::env_str!("RUSTCRAFT_OPT_WORLD_LIST_NO_RELOAD_ON_CANCEL") != Some("0")
+}
+
+/// Row texts kept from one frame to the next (`RUSTCRAFT_OPT_WORLD_LIST_ROW_TEXT_CACHE`, on
+/// unless `0`).
+fn row_text_cache_on() -> bool {
+    rc_data::env_str!("RUSTCRAFT_OPT_WORLD_LIST_ROW_TEXT_CACHE") != Some("0")
+}
+
 pub struct SelectWorld {
     pub panel: Panel,
     size: (i32, i32),
@@ -1354,33 +1478,79 @@ pub struct SelectWorld {
     /// World written in each icon slot (`dyn/server_icon/<i>`).
     slots: Vec<Option<PathBuf>>,
     title: Vec<StyledChar>,
+    /// Reading of `saves` running on a background thread; the list shown stays until it ends.
+    reading: Option<JoinHandle<Vec<Summary>>>,
+    /// A first reading has arrived; until then the list shows the "loading" row, like the game.
+    loaded: bool,
+    /// Row texts by world (same indices as `worlds`), built at the first drawing of each row.
+    row_texts: Vec<Option<RowText>>,
+    /// Keep the row texts between frames (see [`row_text_cache_on`]).
+    cache_row_texts: bool,
 }
 
 impl SelectWorld {
     pub fn new() -> SelectWorld {
-        let worlds = scan(&crate::servers::game_dir());
-        let shown = (0..worlds.len()).collect();
-        SelectWorld {
+        let mut list = SelectWorld {
             panel: Panel::default(),
             size: (-1, -1),
-            worlds,
-            shown,
+            worlds: Vec::new(),
+            shown: Vec::new(),
             filter: String::new(),
             slots: vec![None; rc_assets::gui::SERVER_ICON_SLOTS],
             title: Vec::new(),
-        }
+            reading: None,
+            loaded: false,
+            row_texts: Vec::new(),
+            cache_row_texts: row_text_cache_on(),
+        };
+        list.reload();
+        list
     }
 
-    /// List re-read (return from a sub-screen): selection kept by folder.
+    /// Reading of `saves` (opening, return from a sub-screen): on a background thread like the
+    /// game, the current list staying shown until it ends (`RUSTCRAFT_OPT_WORLD_LIST_ASYNC_SCAN=0`:
+    /// read here, the old path). A reading still running is dropped for the new one.
     fn reload(&mut self) {
+        let game_dir = crate::servers::game_dir();
+        self.reading = None;
+        if async_scan_on() {
+            let dir = game_dir.clone();
+            match std::thread::Builder::new().name("world-list".into()).spawn(move || scan(&dir)) {
+                Ok(th) => {
+                    self.reading = Some(th);
+                    return;
+                }
+                Err(e) => eprintln!("world list read in place: {e}"),
+            }
+        }
+        self.show_worlds(scan(&game_dir));
+    }
+
+    /// Background reading ended: its worlds are shown. True when it ended now.
+    fn take_finished_reading(&mut self) -> bool {
+        if !self.reading.as_ref().is_some_and(JoinHandle::is_finished) {
+            return false;
+        }
+        let worlds = self.reading.take().and_then(|th| th.join().ok()).unwrap_or_default();
+        self.show_worlds(worlds);
+        true
+    }
+
+    /// Worlds of a reading shown: filtered, selection kept by folder, icons and row texts redone.
+    fn show_worlds(&mut self, worlds: Vec<Summary>) {
         let sel = self.selected().map(|w| w.dir.clone());
-        self.worlds = scan(&crate::servers::game_dir());
+        self.worlds = worlds;
+        self.loaded = true;
         self.refilter();
         if let Some(l) = &mut self.panel.list {
             l.selected = sel.and_then(|d| self.shown.iter().position(|&i| self.worlds[i].dir == d));
         }
         self.slots.iter_mut().for_each(|s| *s = None);
-        self.size = (-2, -2);
+        self.row_texts = vec![None; self.worlds.len()];
+        // Laid out again, unless never laid out yet (its first layout focuses the search).
+        if self.size != (-1, -1) {
+            self.size = (-2, -2);
+        }
     }
 
     fn refilter(&mut self) {
@@ -1411,7 +1581,8 @@ impl SelectWorld {
         let mut l = List::new(0, HEADER, w, h - HEADER - FOOTER, ROW_W, ROW_H);
         l.inworld = false;
         l.custom_rows = true;
-        let n = self.shown.len() as i32;
+        // Before the first reading, a single row: the "loading" one.
+        let n = if self.loaded { self.shown.len() as i32 } else { 1 };
         l.entries = (0..n).map(|i| Entry { top: i * ROW_H, h: ROW_H, label: Vec::new() }).collect();
         l.content = n * ROW_H + 4;
         if let Some(o) = old {
@@ -1609,8 +1780,8 @@ impl SelectWorld {
                             &gui.lang,
                             Component::translate("selectWorld.deleteQuestion", vec![]),
                             Component::translate("selectWorld.deleteWarning", vec![rc_text::Arg::Text(s.name.clone())]),
-                            ("selectWorld.deleteButton", Msg2::Delete(s.dir.clone())),
-                            ("gui.cancel", Msg2::Pop),
+                            ("selectWorld.deleteButton", ConfirmAction::Delete(s.dir.clone())),
+                            ("gui.cancel", ConfirmAction::Pop),
                         )));
                     }
                 }
@@ -1646,9 +1817,15 @@ impl SelectWorld {
         let lang = o.s("lang").to_owned();
         let focused = self.panel.focus.is_none();
         let selected = self.panel.list.as_ref().and_then(|l| l.selected);
-        let SelectWorld { panel, worlds, shown, slots, .. } = self;
+        let SelectWorld { panel, worlds, shown, slots, loaded, row_texts, cache_row_texts, .. } = self;
         let mut tooltip: Tip = None;
         panel.draw_with(gui, q, mouse, time, &mut |gui, q, l| {
+            if !*loaded {
+                if let Some((_, top, _, rh)) = l.entry_rect(0) {
+                    draw_loading_row(gui, q, top, rh);
+                }
+                return;
+            }
             let hovered = mouse.and_then(|m| l.entry_under(m));
             for k in 0..l.entries.len() {
                 let Some((left, top, rw, rh)) = l.entry_rect(k) else { continue };
@@ -1662,8 +1839,17 @@ impl SelectWorld {
                     gui.fill(f(left), f(top), f(left + rw), f(top + rh), c);
                     gui.fill(f(left + 1), f(top + 1), f(left + rw - 1), f(top + rh - 1), 0xff00_0000);
                 }
-                let (x, y) = (left + 2, top + 2);
-                let tip = draw_row(gui, q, s, k, slots, (x, y), &lang, hovered == Some(k), mouse);
+                let build = |i: usize| RowText::new(gui, &gui.lang, &lang, &worlds[i]);
+                let fresh;
+                let text = match row_text_at(row_texts, shown, k).filter(|_| *cache_row_texts) {
+                    Some((i, kept)) => kept.get_or_insert_with(|| build(i)),
+                    None => {
+                        fresh = RowText::new(gui, &gui.lang, &lang, s);
+                        &fresh
+                    }
+                };
+                let spot = RowSpot { rank: k, x: left + 2, y: top + 2, hovered: hovered == Some(k), mouse };
+                let tip = draw_row(gui, q, s, text, slots, &spot);
                 if tip.is_some() {
                     tooltip = tip;
                 }
@@ -1676,46 +1862,116 @@ impl SelectWorld {
     }
 }
 
-/// A row of the list: icon, name, folder and date, info; hover: veil and pictogram
-/// of the icon (play, warning, error). Returns the hovered tooltip, if any.
-#[allow(clippy::too_many_arguments)]
+/// Row shown until the first reading of the list arrives, like the game: "Loading worlds"
+/// centered on the screen, animated dots below in gray.
+fn draw_loading_row(gui: &mut Gui, q: &wgpu::Queue, top: i32, height: i32) {
+    let w = gui.width as i32;
+    let y = top + 2 + (height - 4 - 9) / 2;
+    for (text, dy, color) in [(t(gui, "selectWorld.loading_list"), 0, 0xffff_ffff), (loading_dots().into(), 9, GRAY)] {
+        let text = chars(&text);
+        let x = (w - rc_text::width(gui, &text)) / 2;
+        gui.text(q, &text, x as f32, (y + dy) as f32, color, true, 0);
+    }
+}
+
+/// Text width of a row: row minus its padding and the icon column.
+const ROW_TEXT_W: i32 = ROW_W - 4 - 35;
+
+/// The three lines of a world's row (name, folder and date, information), each as written and as
+/// shown (cut with "..." to the row width). Built once per reading and kept, like the game which
+/// builds them with the row: the date keeps the time zone of that moment, instead of a system
+/// call and three text cuts per row every frame.
+#[derive(Clone, Debug, PartialEq)]
+struct RowText {
+    lines: [(Vec<StyledChar>, Vec<StyledChar>); 3],
+}
+
+impl RowText {
+    /// `lang`: the translations; `date_lang`: the language code that picks the date format.
+    fn new(m: &dyn rc_text::Metrics, lang: &rc_text::Lang, date_lang: &str, s: &Summary) -> RowText {
+        let mut id_date = s.id.clone();
+        if s.last_played != -1 {
+            id_date.push_str(&format!(" ({})", short_date(s.last_played, date_lang)));
+        }
+        let full = [chars(&s.name), chars(&id_date), s.info(lang)];
+        RowText {
+            lines: full.map(|text| {
+                let shown = rc_text::clamp(m, &text, ROW_TEXT_W);
+                (text, shown)
+            }),
+        }
+    }
+}
+
+/// Kept text slot of the row at `rank`, with its world's index: texts are kept by world, not by
+/// rank, since a search changes which world a rank shows.
+fn row_text_at<'a>(
+    texts: &'a mut [Option<RowText>],
+    shown: &[usize],
+    rank: usize,
+) -> Option<(usize, &'a mut Option<RowText>)> {
+    let i = *shown.get(rank)?;
+    Some((i, texts.get_mut(i)?))
+}
+
+/// Where a row is drawn and where the mouse is.
+struct RowSpot {
+    /// Rank of the row in the list (gives its icon slot).
+    rank: usize,
+    /// Top left corner of the row's content.
+    x: i32,
+    y: i32,
+    /// The mouse is over this row.
+    hovered: bool,
+    mouse: Option<(f32, f32)>,
+}
+
+impl RowSpot {
+    fn mouse_in(&self, x: i32, y: i32, w: i32, h: i32) -> bool {
+        self.mouse.is_some_and(|m| m.0 >= x as f32 && m.0 < (x + w) as f32 && m.1 >= y as f32 && m.1 < (y + h) as f32)
+    }
+}
+
+/// A row of the list: its three lines, the icon, and on hover the veil and pictogram of the icon
+/// (play, warning, error). Returns the hovered tooltip, if any.
 fn draw_row(
     gui: &mut Gui,
     q: &wgpu::Queue,
     s: &Summary,
-    k: usize,
+    text: &RowText,
     slots: &mut [Option<PathBuf>],
-    (x, y): (i32, i32),
-    lang: &str,
-    hover: bool,
-    mouse: Option<(f32, f32)>,
+    spot: &RowSpot,
 ) -> Tip {
-    let (xf, yf) = (x as f32, y as f32);
-    let max = ROW_W - 4 - 35;
-    let name = chars(&s.name);
-    let mut tip = None;
-    let inside = |rx: i32, ry: i32, rw: i32, rh: i32| {
-        mouse.is_some_and(|m| m.0 >= rx as f32 && m.0 < (rx + rw) as f32 && m.1 >= ry as f32 && m.1 < (ry + rh) as f32)
-    };
-    let clamp_line = |gui: &mut Gui, text: &[StyledChar], ty: i32, color: u32, tip: &mut Option<_>| {
-        let c = clamp_text(gui, text, max);
-        if c.len() != text.len() && hover && inside(x + 35, ty, max, 9) {
-            *tip = Some((vec![text.to_vec()], (x + 35, ty, max, 9)));
-        }
-        gui.text(q, &c, (x + 35) as f32, ty as f32, color, true, 0);
-    };
-    clamp_line(gui, &name, y + 1, 0xffff_ffff, &mut tip);
-    let mut id_date = s.id.clone();
-    if s.last_played != -1 {
-        id_date.push_str(&format!(" ({})", short_date(s.last_played, lang)));
+    let mut tip = draw_row_lines(gui, q, text, spot);
+    draw_row_icon(gui, q, s, slots, spot);
+    if spot.hovered
+        && let Some(icon_tip) = draw_row_hover(gui, s, spot)
+    {
+        tip = Some(icon_tip);
     }
-    clamp_line(gui, &chars(&id_date), y + 12, GRAY, &mut tip);
-    let info = s.info(gui);
-    clamp_line(gui, &info, y + 21, GRAY, &mut tip);
-    // Icon: atlas slot rewritten if the displayed world changes.
+    tip
+}
+
+/// The three lines; a hovered line that was cut gives its whole text as tooltip.
+fn draw_row_lines(gui: &mut Gui, q: &wgpu::Queue, text: &RowText, spot: &RowSpot) -> Tip {
+    let mut tip = None;
+    let x = spot.x + 35;
+    for ((full, shown), (dy, color)) in text.lines.iter().zip([(1, 0xffff_ffff), (12, GRAY), (21, GRAY)]) {
+        let y = spot.y + dy;
+        if shown.len() != full.len() && spot.hovered && spot.mouse_in(x, y, ROW_TEXT_W, 9) {
+            tip = Some((vec![full.clone()], (x, y, ROW_TEXT_W, 9)));
+        }
+        gui.text(q, shown, x as f32, y as f32, color, true, 0);
+    }
+    tip
+}
+
+/// The world's icon, its atlas slot rewritten when the world shown in that slot changes; the
+/// "unknown" icon otherwise.
+fn draw_row_icon(gui: &mut Gui, q: &wgpu::Queue, s: &Summary, slots: &mut [Option<PathBuf>], spot: &RowSpot) {
     let mut icon = "tex/misc/unknown_server".to_owned();
     if let Some(rgba) = &s.icon {
-        let slot = k % slots.len().max(1);
+        let slot = spot.rank % slots.len().max(1);
         let name = format!("dyn/server_icon/{slot}");
         if slots[slot].as_deref() != Some(s.dir.as_path()) && gui.write_sprite(q, &name, (64, 64), rgba) {
             slots[slot] = Some(s.dir.clone());
@@ -1724,49 +1980,52 @@ fn draw_row(
             icon = name;
         }
     }
-    gui.sprite(&icon, xf, yf, 32.0, 32.0, 0xffff_ffff);
-    if hover {
-        gui.fill(xf, yf, xf + 32.0, yf + 32.0, 0xa090_9090);
-        let over = mouse.is_some_and(|m| m.0 - xf < 32.0 && m.0 >= xf);
-        let sp = |n: &str| if over { format!("world_list/{n}_highlighted") } else { format!("world_list/{n}") };
-        let tip175 = |gui: &Gui, keys: &[&str], rgb: u32| -> Vec<Vec<StyledChar>> {
-            keys.iter().flat_map(|k| rc_text::wrap(gui, &colored(&t(gui, k), rgb), 175.0)).collect()
-        };
-        let mut icon_tip = None;
-        if s.corrupted || s.symlink {
-            gui.sprite(&sp("error"), xf, yf, 32.0, 32.0, 0xffff_ffff);
-            gui.sprite(&sp("marked_join"), xf, yf, 32.0, 32.0, 0xffff_ffff);
-        } else if s.locked {
-            gui.sprite(&sp("error"), xf, yf, 32.0, 32.0, 0xffff_ffff);
-            icon_tip = Some(tip175(gui, &["selectWorld.locked"], 0xff_5555));
-        } else if !s.compatible() {
-            gui.sprite(&sp("error"), xf, yf, 32.0, 32.0, 0xffff_ffff);
-            icon_tip = Some(tip175(gui, &["selectWorld.incompatible.tooltip"], 0xff_5555));
-        } else if s.downgrade() {
-            gui.sprite(&sp("marked_join"), xf, yf, 32.0, 32.0, 0xffff_ffff);
-            gui.sprite(&sp("error"), xf, yf, 32.0, 32.0, 0xffff_ffff);
-            icon_tip = Some(
-                ["selectWorld.tooltip.fromNewerVersion1", "selectWorld.tooltip.fromNewerVersion2"]
-                    .iter()
-                    .map(|k| colored(&t(gui, k), 0xff_5555))
-                    .collect(),
-            );
-            if over {
-                widgets::request_cursor(widgets::Cursor::Hand);
-            }
-        } else if s.older() {
-            gui.sprite(&sp("marked_join"), xf, yf, 32.0, 32.0, 0xffff_ffff);
-        } else {
-            gui.sprite(&sp("join"), xf, yf, 32.0, 32.0, 0xffff_ffff);
-            if over {
-                widgets::request_cursor(widgets::Cursor::Hand);
-            }
+    gui.sprite(&icon, spot.x as f32, spot.y as f32, 32.0, 32.0, 0xffff_ffff);
+}
+
+/// Hovered row: veil over the icon and the pictogram of what "Play" does there (highlighted under
+/// the mouse); the icon's tooltip when the mouse is on it.
+fn draw_row_hover(gui: &mut Gui, s: &Summary, spot: &RowSpot) -> Tip {
+    let (x, y) = (spot.x as f32, spot.y as f32);
+    gui.fill(x, y, x + 32.0, y + 32.0, 0xa090_9090);
+    let over = spot.mouse.is_some_and(|m| m.0 - x < 32.0 && m.0 >= x);
+    let sprite_name = |n: &str| if over { format!("world_list/{n}_highlighted") } else { format!("world_list/{n}") };
+    let wrapped_tooltip =
+        |gui: &Gui, key: &str| -> Vec<Vec<StyledChar>> { rc_text::wrap(gui, &colored(&t(gui, key), 0xff_5555), 175.0) };
+    let draw = |gui: &mut Gui, names: &[&str]| {
+        for n in names {
+            gui.sprite(&sprite_name(n), x, y, 32.0, 32.0, 0xffff_ffff);
         }
-        if over && let Some(lines) = icon_tip {
-            tip = Some((lines, (x, y, 32, 32)));
+    };
+    let mut icon_tip = None;
+    if s.corrupted || s.symlink {
+        draw(gui, &["error", "marked_join"]);
+    } else if s.locked {
+        draw(gui, &["error"]);
+        icon_tip = Some(wrapped_tooltip(gui, "selectWorld.locked"));
+    } else if !s.compatible() {
+        draw(gui, &["error"]);
+        icon_tip = Some(wrapped_tooltip(gui, "selectWorld.incompatible.tooltip"));
+    } else if s.downgrade() {
+        draw(gui, &["marked_join", "error"]);
+        icon_tip = Some(
+            ["selectWorld.tooltip.fromNewerVersion1", "selectWorld.tooltip.fromNewerVersion2"]
+                .iter()
+                .map(|k| colored(&t(gui, k), 0xff_5555))
+                .collect(),
+        );
+        if over {
+            widgets::request_cursor(widgets::Cursor::Hand);
+        }
+    } else if s.older() {
+        draw(gui, &["marked_join"]);
+    } else {
+        draw(gui, &["join"]);
+        if over {
+            widgets::request_cursor(widgets::Cursor::Hand);
         }
     }
-    tip
+    icon_tip.filter(|_| over).map(|lines| (lines, (spot.x, spot.y, 32, 32)))
 }
 
 #[cfg(test)]
@@ -1791,20 +2050,38 @@ mod tests {
         }) {
             std::thread::yield_now();
         }
+        wait_for_reading(s);
         s.tick(&lang())
     }
 
-    fn list(worlds: Vec<Summary>) -> Scr {
+    /// Background reading of the top list finished (not yet shown: the next tick or frame does).
+    fn wait_for_reading(s: &Solo) {
+        while let Some(Scr::List(l)) = s.stack.last()
+            && l.reading.as_ref().is_some_and(|th| !th.is_finished())
+        {
+            std::thread::yield_now();
+        }
+    }
+
+    fn select_world(worlds: Vec<Summary>) -> SelectWorld {
         let shown = (0..worlds.len()).collect();
-        Scr::List(Box::new(SelectWorld {
+        SelectWorld {
             panel: Panel::default(),
             size: (-1, -1),
+            row_texts: vec![None; worlds.len()],
             worlds,
             shown,
             filter: String::new(),
             slots: Vec::new(),
             title: Vec::new(),
-        }))
+            reading: None,
+            loaded: true,
+            cache_row_texts: true,
+        }
+    }
+
+    fn list(worlds: Vec<Summary>) -> Scr {
+        Scr::List(Box::new(select_world(worlds)))
     }
 
     fn summary(dir: &Path) -> Summary {
@@ -1843,7 +2120,8 @@ mod tests {
             // Edit screen (replaced by an alert) then waiting for the copy above.
             s.stack.push(recreate_error(&lang()));
             s.stack.push(Scr::Message(Box::new(Message::new("selectWorld.waitingForBackup.title", None))));
-            let th = std::thread::spawn(move || if ok { Ok((PathBuf::from("c"), 1)) } else { Err("failure".to_string()) });
+            let th =
+                std::thread::spawn(move || if ok { Ok((PathBuf::from("c"), 1)) } else { Err("failure".to_string()) });
             while !th.is_finished() {
                 std::thread::yield_now();
             }
@@ -1851,6 +2129,8 @@ mod tests {
             let out = s.tick(&lang());
             assert_eq!(s.stack.len(), 1, "copy {ok}: back to the list");
             // The list is read again from the game folder: without any world, creation opens instead.
+            wait_for_reading(&s);
+            s.show_finished_reading();
             if scan(&crate::servers::game_dir()).is_empty() {
                 assert!(matches!(s.stack.last(), Some(Scr::Create(_))));
             } else {
@@ -1877,6 +2157,296 @@ mod tests {
         s.stack.push(list(vec![summary(Path::new("w"))]));
         s.list_or_create();
         assert!(matches!(s.stack.last(), Some(Scr::List(_))));
+    }
+
+    /// Background reading, like the game: the "loading" row until the first reading arrives (no
+    /// creation opened before it, entries ignored), then its worlds; an empty reading opens the
+    /// creation. A reading after a return keeps the list shown, then replaces it, selection kept.
+    #[test]
+    fn list_shows_its_reading_when_it_ends() {
+        let reading = |worlds: Vec<Summary>| Some(std::thread::spawn(move || worlds));
+        for found in [Vec::new(), vec![summary(Path::new("w"))]] {
+            let mut s = solo();
+            let mut l = select_world(Vec::new());
+            l.loaded = false;
+            l.reading = reading(found.clone());
+            s.stack.push(Scr::List(Box::new(l)));
+            s.list_or_create();
+            assert!(matches!(s.stack.last(), Some(Scr::List(l)) if !l.loaded), "loading row, no creation yet");
+            assert!(settle(&mut s).is_empty());
+            if found.is_empty() {
+                assert!(matches!(s.stack.last(), Some(Scr::Create(_))), "empty: creation");
+            } else {
+                assert!(matches!(s.stack.last(), Some(Scr::List(l)) if l.loaded && l.worlds == found));
+            }
+        }
+        let (a, b) = (summary(Path::new("a")), summary(Path::new("b")));
+        let mut l = select_world(vec![a.clone(), b.clone()]);
+        let mut rows = List::new(0, HEADER, 400, 300, ROW_W, ROW_H);
+        rows.selected = Some(1);
+        l.panel.list = Some(rows);
+        let mut b2 = b.clone();
+        b2.name = "b renamed".into();
+        l.reading = reading(vec![b2.clone(), a.clone()]);
+        while !l.take_finished_reading() {
+            assert_eq!(l.worlds, [a.clone(), b.clone()], "shown list kept while the reading runs");
+            std::thread::yield_now();
+        }
+        assert_eq!(l.worlds, [b2, a]);
+        assert_eq!(l.panel.list.as_ref().and_then(|r| r.selected), Some(0), "selection follows the folder");
+        assert_eq!(l.row_texts.len(), 2);
+    }
+
+    /// Back from a notice or an alert: the list shown again as it was (no reading), like the game;
+    /// a return the game reads again (cancel of a deletion…) starts a reading.
+    #[test]
+    fn notice_back_does_not_read_the_list_again() {
+        let Scr::Ask(_, answers) = symlink_notice(&lang()) else { panic!("notice expected") };
+        assert!(matches!(answers.last(), Some((_, ConfirmAction::Close))));
+        let Scr::Alert(_, back) = recreate_error(&lang()) else { panic!("alert expected") };
+        assert!(matches!(back, ConfirmAction::Close));
+        let mut s = solo();
+        s.stack.push(list(vec![summary(Path::new("w"))]));
+        s.stack.push(recreate_error(&lang()));
+        let _ = s.apply(&lang(), action_msgs(back));
+        let Some(Scr::List(l)) = s.stack.last() else { panic!("list expected") };
+        if no_reload_on_cancel_on() {
+            assert!(l.reading.is_none() && l.worlds.len() == 1, "same list, nothing read");
+        }
+        wait_for_reading(&s);
+        if async_scan_on() {
+            s.stack.push(recreate_error(&lang()));
+            let _ = s.apply(&lang(), vec![Msg::Pop]);
+            assert!(matches!(s.stack.last(), Some(Scr::List(l)) if l.reading.is_some()), "read again");
+            wait_for_reading(&s);
+        }
+    }
+
+    /// Fixed-width text metrics (6 per character).
+    struct Fixed;
+
+    impl rc_text::Metrics for Fixed {
+        fn advance(&self, _font: &str, _c: char) -> (f32, f32) {
+            (6.0, 1.0)
+        }
+    }
+
+    /// Row texts kept by world, not by row: after a search narrows the list, the row shows its
+    /// world's text; a long name is cut and keeps its whole text for the tooltip.
+    #[test]
+    fn row_texts_follow_their_world() {
+        let mut long = summary(Path::new("long"));
+        long.id = "long".into();
+        long.name = "A world with a name far too long for its row".into();
+        long.last_played = 1_700_000_000_000;
+        let mut short = summary(Path::new("short"));
+        short.id = "short".into();
+        short.name = "Short".into();
+        let lang = rc_text::Lang::default();
+        let text = RowText::new(&Fixed, &lang, "en_us", &long);
+        let (full, shown) = &text.lines[0];
+        assert!(shown.len() < full.len() && rc_text::width(&Fixed, shown) <= ROW_TEXT_W, "name cut");
+        assert!(text.lines[1].0.iter().map(|c| c.c).collect::<String>().starts_with("long ("), "dated");
+        let mut l = select_world(vec![long.clone(), short.clone()]);
+        l.row_texts[0] = Some(text.clone());
+        l.filter = "short".into();
+        l.refilter();
+        assert_eq!(l.shown, [1]);
+        let (i, kept) = row_text_at(&mut l.row_texts, &l.shown, 0).expect("row 0");
+        assert_eq!(i, 1);
+        let shown_text = kept.get_or_insert_with(|| RowText::new(&Fixed, &lang, "en_us", &l.worlds[i]));
+        assert_eq!(*shown_text, RowText::new(&Fixed, &lang, "en_us", &short));
+        assert!(row_text_at(&mut l.row_texts, &l.shown, 1).is_none(), "no row 1");
+        assert_eq!(l.row_texts[0], Some(text), "the other world's text untouched");
+    }
+
+    /// A folder of saves covering the list's cases: played worlds in both orders, a newer and an
+    /// older version, an unreadable `level.dat`, only `level.dat_old`, no level file at all (not
+    /// listed), a locked world, a 64 × 64 icon and an icon of another size, folder names that sort
+    /// differently in UTF-16 than in UTF-8.
+    fn sample_saves(root: &Path) -> rc_sim::lock::SessionLock {
+        let level = |dir: &str, last: i64, version: i32| {
+            let data = Nbt::Compound(vec![
+                ("LevelName".into(), Nbt::String(format!("Name of {dir}"))),
+                ("LastPlayed".into(), Nbt::Long(last)),
+                ("GameType".into(), Nbt::Int(1)),
+                ("DataVersion".into(), Nbt::Int(version)),
+                ("Version".into(), Nbt::Compound(vec![("Name".into(), Nbt::String("26.3".into()))])),
+            ]);
+            let path = root.join("saves").join(dir);
+            std::fs::create_dir_all(&path).expect("folder");
+            let root = Nbt::Compound(vec![("Data".into(), data)]);
+            std::fs::write(path.join("level.dat"), rc_sim::nbtio::gzip(&rc_sim::nbtio::encode_root(&root)))
+                .expect("level.dat");
+            path
+        };
+        let now = rc_sim::chunk::DATA_VERSION;
+        level("played", 3_000, now);
+        level("before", 1_000, now);
+        level("newer", 2_000, now + 1);
+        level("older", 2_000, now - 1);
+        // Same date: by folder, U+FFFD before U+1F600 in UTF-8, after it in UTF-16.
+        level("\u{fffd}", 500, now);
+        level("\u{1f600}", 500, now);
+        let broken = root.join("saves/broken");
+        std::fs::create_dir_all(&broken).expect("folder");
+        std::fs::write(broken.join("level.dat"), b"not nbt").expect("file");
+        let old_only = root.join("saves/old only");
+        std::fs::create_dir_all(&old_only).expect("folder");
+        std::fs::write(old_only.join("level.dat_old"), b"x").expect("file");
+        std::fs::create_dir_all(root.join("saves/empty")).expect("folder");
+        let icon = |dir: &Path, side: u32| {
+            let mut bytes = Vec::new();
+            let mut enc = png::Encoder::new(&mut bytes, side, side);
+            enc.set_color(png::ColorType::Rgba);
+            let mut w = enc.write_header().expect("png");
+            w.write_image_data(&vec![200; (side * side * 4) as usize]).expect("png");
+            drop(w);
+            std::fs::write(dir.join("icon.png"), bytes).expect("icon");
+        };
+        icon(&root.join("saves/played"), 64);
+        icon(&root.join("saves/before"), 32);
+        rc_sim::lock::SessionLock::take(&level("locked", 4_000, now)).expect("lock")
+    }
+
+    /// Micro-bench: what the old path paid per frame for the row texts (rebuilt for each visible
+    /// row: date with its time zone read from the system, information line, three cuts), on 15
+    /// visible rows, against the kept texts. Fixed-width metrics stand for the font. 2 passes.
+    #[test]
+    #[ignore = "micro-bench"]
+    fn bench_row_text() {
+        let lang = rc_text::Lang::default();
+        let worlds: Vec<Summary> = (0..15)
+            .map(|k| {
+                let mut s = summary(Path::new("w"));
+                s.id = format!("World number {k}");
+                s.name = format!("A long world name to cut, number {k}");
+                s.last_played = 1_700_000_000_000 + k;
+                s.commands = true;
+                s
+            })
+            .collect();
+        for pass in 0..2 {
+            let frames = 2000;
+            let t = std::time::Instant::now();
+            for _ in 0..frames {
+                for s in &worlds {
+                    std::hint::black_box(RowText::new(&Fixed, &lang, "en_us", s));
+                }
+            }
+            let rebuilt = t.elapsed() / frames;
+            let mut kept: Vec<Option<RowText>> = vec![None; worlds.len()];
+            let shown: Vec<usize> = (0..worlds.len()).collect();
+            let t = std::time::Instant::now();
+            for _ in 0..frames {
+                for rank in 0..worlds.len() {
+                    let (i, slot) = row_text_at(&mut kept, &shown, rank).expect("row");
+                    std::hint::black_box(slot.get_or_insert_with(|| RowText::new(&Fixed, &lang, "en_us", &worlds[i])));
+                }
+            }
+            let cached = t.elapsed() / frames;
+            eprintln!("pass {pass}: 15 rows per frame, rebuilt {rebuilt:?}, kept {cached:?}");
+        }
+    }
+
+    /// Micro-bench: reading of 1, 20, 100 and 200 worlds (`level.dat` of the test world
+    /// `RUSTCRAFT_SOLO_WORLD`, a 64 × 64 icon, a `session.lock`), one by one then on pools of 1, 2,
+    /// 4… threads up to the logical cores; and what the main thread pays to start a background
+    /// reading. Warm cache only (emptying the system's file cache needs administrator rights).
+    #[test]
+    #[ignore = "micro-bench"]
+    fn bench_world_scan() {
+        let Some(world) = rc_data::env_os!("RUSTCRAFT_SOLO_WORLD").map(PathBuf::from) else {
+            panic!("RUSTCRAFT_SOLO_WORLD missing: no level.dat to copy");
+        };
+        let level = std::fs::read(world.join("level.dat")).expect("level.dat");
+        let mut icon = Vec::new();
+        let mut enc = png::Encoder::new(&mut icon, 64, 64);
+        enc.set_color(png::ColorType::Rgba);
+        let pixels: Vec<u8> = (0..64 * 64 * 4).map(|i: u32| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+        enc.write_header().and_then(|mut w| w.write_image_data(&pixels)).expect("png");
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        for count in [1usize, 20, 100, 200] {
+            let root = rc_testdata::scratch(
+                std::env::temp_dir().join(format!("rc-world-bench-{count}-{}", std::process::id())),
+            );
+            for k in 0..count {
+                let dir = root.join("saves").join(format!("World {k}"));
+                std::fs::create_dir_all(&dir).expect("folder");
+                std::fs::write(dir.join("level.dat"), &level).expect("level.dat");
+                std::fs::write(dir.join("icon.png"), &icon).expect("icon");
+                std::fs::write(dir.join("session.lock"), "\u{2603}").expect("lock");
+            }
+            for pass in 0..2 {
+                let best = |f: &dyn Fn() -> usize| {
+                    (0..5)
+                        .map(|_| {
+                            let t = std::time::Instant::now();
+                            assert_eq!(f(), count);
+                            t.elapsed()
+                        })
+                        .min()
+                        .unwrap_or_default()
+                };
+                let one_by_one = best(&|| read_each(&world_dirs(&root), Summary::read, false).len());
+                let mut line = format!("{count} worlds, pass {pass}: one by one {one_by_one:?}");
+                let mut threads = 1;
+                loop {
+                    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().expect("pool");
+                    let t = best(&|| pool.install(|| read_each(&world_dirs(&root), Summary::read, true).len()));
+                    line.push_str(&format!(", {threads} threads {t:?}"));
+                    if threads >= cores {
+                        break;
+                    }
+                    threads = (threads * 2).min(cores);
+                }
+                let start = std::time::Instant::now();
+                let dir = root.clone();
+                let th = std::thread::Builder::new().spawn(move || scan(&dir)).expect("thread");
+                let main_thread = start.elapsed();
+                assert_eq!(th.join().expect("reading").len(), count);
+                eprintln!("{line}; main thread with a background reading: {main_thread:?}");
+            }
+        }
+    }
+
+    /// The list read in parallel is the list read one by one, and the expected one: order, dates
+    /// (a file's date for unreadable worlds), flags, icons; quick play takes its top world.
+    #[test]
+    fn parallel_reading_matches_one_by_one() {
+        let root = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-world-scan-{}", std::process::id())));
+        let _lock = sample_saves(&root);
+        let dirs = world_dirs(&root);
+        let mut parallel = read_each(&dirs, Summary::read, true);
+        let mut one_by_one = read_each(&dirs, Summary::read, false);
+        parallel.sort_by(world_order);
+        one_by_one.sort_by(world_order);
+        assert!(parallel == one_by_one, "parallel reading differs");
+        let ids: Vec<&str> = parallel.iter().map(|s| s.id.as_str()).collect();
+        let dated = |dir: &str, file: &str| modified_ms(&root.join("saves").join(dir).join(file)).expect("date");
+        let (broken, old_only) = (dated("broken", "level.dat"), dated("old only", "level.dat_old"));
+        let mut want: Vec<(&str, i64)> = vec![
+            ("locked", 4_000),
+            ("played", 3_000),
+            ("newer", 2_000),
+            ("older", 2_000),
+            ("before", 1_000),
+            ("\u{1f600}", 500),
+            ("\u{fffd}", 500),
+            ("broken", broken),
+            ("old only", old_only),
+        ];
+        want.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.encode_utf16().cmp(b.0.encode_utf16())));
+        assert_eq!(ids, want.iter().map(|w| w.0).collect::<Vec<_>>());
+        let get = |id: &str| parallel.iter().find(|s| s.id == id).expect("world");
+        assert!(get("locked").locked && !get("played").locked);
+        assert!(get("broken").corrupted && get("old only").corrupted && !get("played").corrupted);
+        assert!(get("newer").downgrade() && get("older").older());
+        assert_eq!(get("played").icon.as_ref().map(Vec::len), Some(64 * 64 * 4));
+        assert!(get("before").icon.is_none(), "32 × 32 icon refused");
+        assert_eq!((get("played").name.as_str(), get("played").game_mode), ("Name of played", 1));
+        assert_eq!(read_png_if_icon_sized(&root.join("saves/before/icon.png")), None);
+        assert_eq!(last_played_world(&root).as_deref(), Some(ids[0]));
     }
 
     /// Re-creation impossible: alert with a single "Back" button; Escape goes back to the title screen.
@@ -1908,11 +2478,8 @@ mod tests {
         let m = s.world_pack_msgs(&lang(), false);
         assert!(matches!(s.stack.last(), Some(Scr::List(_))), "wait closed");
         let Some(Msg::Push(Scr::Ask(_, answers))) = m.into_iter().next() else { panic!("confirmation expected") };
-        assert!(matches!(&answers[0].1, Msg2::Open(d, Stage::Disk) if *d == dir));
-        assert!(matches!(
-            msg2(answers[1].1.clone()).as_slice(),
-            [Msg::Out(Out::DropWorldPack), Msg::ToList]
-        ));
+        assert!(matches!(&answers[0].1, ConfirmAction::Open(d, Stage::Disk) if *d == dir));
+        assert!(matches!(action_msgs(answers[1].1.clone()).as_slice(), [Msg::Out(Out::DropWorldPack), Msg::ToList]));
         let _ = s.apply(&lang(), vec![Msg::Open(dir.clone(), Stage::Pack)]);
         let m = s.world_pack_msgs(&lang(), true);
         assert!(matches!(m.as_slice(), [Msg::Open(d, Stage::Disk)] if *d == dir));
@@ -2024,13 +2591,13 @@ mod tests {
         let msgs = SelectWorld::join(&lang(), &w);
         let [Msg::Push(Scr::Ask(_, answers))] = msgs.as_slice() else { panic!("warning expected") };
         let back = answers.last().map(|(_, a)| a.clone());
-        assert!(matches!(back, Some(Msg2::Title)), "'Back': title screen");
+        assert!(matches!(back, Some(ConfirmAction::Title)), "'Back': title screen");
         let mut s = solo();
         s.stack.push(list(vec![summary(&world)]));
         let out = s.apply(&lang(), msgs);
         assert!(out.iter().all(|o| !matches!(o, Out::WorldPack(_) | Out::Open(_))), "nothing loaded");
         assert!(s.world_pack.is_none());
-        let out = s.apply(&lang(), msg2(back.expect("back")));
+        let out = s.apply(&lang(), action_msgs(back.expect("back")));
         assert!(s.stack.is_empty() && matches!(out.as_slice(), [Out::Back]));
         let _ = std::fs::remove_dir_all(&root);
     }
