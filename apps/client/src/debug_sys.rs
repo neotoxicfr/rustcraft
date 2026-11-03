@@ -453,7 +453,9 @@ mod tests {
         assert!((48 * MIB as i64..=96 * MIB as i64).contains(&grown), "outside the allocator +{} MB", grown / MIB as i64);
 
         let (c0, _) = super::allocator_commit();
-        let v = vec![1u8; n];
+        // mimalloc can serve a block from memory it already committed for the earlier tests of
+        // this process: asking for more than all of it forces the commit to grow.
+        let v = vec![1u8; c0 as usize + n];
         let (c1, peak) = super::allocator_commit();
         assert!(c1 >= c0 + 48 * MIB, "mimalloc committed {} -> {} MB", c0 / MIB, c1 / MIB);
         assert!(peak >= c1);

@@ -191,7 +191,9 @@ fn reference_round_f64(v: f64) -> i64 {
 }
 
 fn same_real(a: f64, b: f64) -> bool {
-    a.to_bits() == b.to_bits()
+    // The C library's NaN payload depends on the platform (glibc can hand a signaling NaN back as
+    // is, Windows makes it quiet); the game sees one NaN and every conversion of it gives 0.
+    a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
 }
 
 /// One value through every conversion, against the C library; `None` if all agree.
