@@ -440,7 +440,7 @@ impl Server {
         if self.life.menu.is_some() {
             self.close_menu(true);
         }
-        let _ = self.send(Event::OpenScreen { window: menu.window, kind: menu.menu_type(), title });
+        let _ = self.send(Event::OpenScreen { window: menu.window, kind: menu.menu_type(), title: title.map(Box::new) });
         self.life.menu = Some(menu);
         if let Some(m) = &mut self.life.menu {
             m.send_all(&self.slots);
@@ -496,7 +496,7 @@ impl Server {
             let n = positions.len() as f64;
             let at = std::array::from_fn(|a| positions.iter().map(|p| f64::from(p[a]) + 0.5).sum::<f64>() / n);
             let args = name.map(rc_text::Arg::Component).into_iter().collect();
-            let _ = self.send(Event::ActionBar(rc_text::Component::translate("container.isLocked", args)));
+            let _ = self.send(Event::ActionBar(Box::new(rc_text::Component::translate("container.isLocked", args))));
             self.play_sound("minecraft:block.chest.locked", 4, at, 1.0, 1.0);
         }
         open

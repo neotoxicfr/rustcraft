@@ -72,7 +72,8 @@ fn run(s: &mut Server, c: &str) -> (bool, i32) {
 fn chats(t: &T) -> Vec<Component> {
     let mut out = Vec::new();
     while let Ok(e) = t.session.events.try_recv() {
-        if let Event::Chat { mut component, .. } = e {
+        if let Event::Chat { component, .. } = e {
+            let mut component = *component;
             if matches!(&component.content, Content::Text(s) if s.is_empty()) && component.extra.len() == 1 {
                 component = component.extra.remove(0);
             }

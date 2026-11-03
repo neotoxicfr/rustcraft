@@ -377,7 +377,7 @@ impl Server {
         if !same {
             self.life.vit.respawn = Some((dim, p, 0.0, 0.0, false));
             let _ = self.send(Event::Chat {
-                component: rc_text::Component::translate("block.minecraft.set_spawn", Vec::new()),
+                component: Box::new(rc_text::Component::translate("block.minecraft.set_spawn", Vec::new())),
                 tag: rc_client::ChatTag::System,
             });
             self.play_sound("minecraft:block.respawn_anchor.set_spawn", 4, at, 1.0, 1.0);

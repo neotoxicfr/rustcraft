@@ -879,7 +879,7 @@ impl Server {
             if too_high { ("build.tooHigh", self.top_y() - 1) } else { ("build.tooLow", self.dim.height.min_y) };
         let mut msg = rc_text::Component::translate(key, vec![rc_text::Arg::Text(limit.to_string())]);
         msg.style.color = Some(crate::commands::text::RED);
-        let _ = self.send(Event::ActionBar(msg));
+        let _ = self.send(Event::ActionBar(Box::new(msg)));
     }
 
     /// Middle click: the block's clone item in the hotbar, already present or in a free

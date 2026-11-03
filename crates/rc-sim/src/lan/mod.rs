@@ -730,7 +730,7 @@ impl Server {
         let _ = self.send(Event::PlayersRemoved(vec![uuid]));
         let mut left = rc_text::Component::translate("multiplayer.player.left", vec![rc_text::Arg::Component(shown)]);
         left.style.color = Some(0xFFFF55);
-        let _ = self.send(Event::Chat { component: left, tag: ChatTag::System });
+        let _ = self.send(Event::Chat { component: Box::new(left), tag: ChatTag::System });
         self.update_sleeping_list();
         eprintln!("lan: {name} left the game");
     }
@@ -1372,7 +1372,7 @@ impl Server {
     }
 
     fn publish_message(&self, c: rc_text::Component) {
-        let _ = self.send(Event::Chat { component: c, tag: ChatTag::System });
+        let _ = self.send(Event::Chat { component: Box::new(c), tag: ChatTag::System });
     }
 
     /// Close requested in game: guests kicked and saved, world back to singleplayer.
@@ -1551,7 +1551,7 @@ impl Server {
     /// next guest pickup.
     pub(crate) fn lan_kick_with(&mut self, i: usize, msg: rc_text::Component) {
         let mut out = Vec::new();
-        self.encode_event(&mut encode::EncState::default(), &Event::Kicked(msg), &mut out);
+        self.encode_event(&mut encode::EncState::default(), &Event::Kicked(Box::new(msg)), &mut out);
         if let Some(g) = self.lan.as_mut().and_then(|l| l.guests.get_mut(i)) {
             for p in out {
                 let _ = g.out.send(p);
@@ -1639,7 +1639,7 @@ impl Server {
             l.shared.stop.store(true, Ordering::Release);
             let msg = rc_text::Component::translate("multiplayer.disconnect.server_shutdown", Vec::new());
             let mut out = Vec::new();
-            self.encode_event(&mut encode::EncState::default(), &Event::Kicked(msg), &mut out);
+            self.encode_event(&mut encode::EncState::default(), &Event::Kicked(Box::new(msg)), &mut out);
             for g in &l.guests {
                 for p in &out {
                     let _ = g.out.send(p.clone());

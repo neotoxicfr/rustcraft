@@ -845,7 +845,7 @@ impl Server {
             None => {
                 let mut msg = rc_text::Component::translate("spectator.cannot_teleport", Vec::new());
                 msg.style.color = Some(crate::commands::text::RED);
-                let _ = self.send(rc_client::Event::ActionBar(msg));
+                let _ = self.send(rc_client::Event::ActionBar(Box::new(msg)));
             }
         }
         true

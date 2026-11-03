@@ -137,7 +137,7 @@ pub(super) fn particles(w: &W, evs: &[Event], name: &str) -> Vec<rc_proto_v777::
     let kind = w.p.s.data.registry("minecraft:particle_type").unwrap().entries.iter().position(|e| e == name).unwrap();
     evs.iter()
         .filter_map(|e| match e {
-            Event::Particles(p) if p.particle.kind == kind as i32 => Some(p.clone()),
+            Event::Particles(p) if p.particle.kind == kind as i32 => Some((**p).clone()),
             _ => None,
         })
         .collect()

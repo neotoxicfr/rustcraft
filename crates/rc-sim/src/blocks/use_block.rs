@@ -70,7 +70,7 @@ impl Server {
                     // Adventure mode refusal: nothing happens, but the action counts as successful.
                 } else {
                     let msg = rc_text::Component::translate("block.minecraft.tnt.disabled", Vec::new());
-                    let _ = self.send(rc_client::Event::ActionBar(msg));
+                    let _ = self.send(rc_client::Event::ActionBar(Box::new(msg)));
                     return ItemOn::Pass;
                 }
                 ItemOn::Done

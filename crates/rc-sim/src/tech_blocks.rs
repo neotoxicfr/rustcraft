@@ -397,7 +397,7 @@ impl Server {
                 None => crate::commands::text::colored(tr!("test_instance.description.no_test"), crate::commands::text::RED),
             };
             let size = if action == 1 { test.as_deref().and_then(|t| self.test_structure_size(t)) } else { None };
-            let _ = self.send(rc_client::Event::TestInstanceStatus { status: Some(status), size });
+            let _ = self.send(rc_client::Event::TestInstanceStatus { status: Some(Box::new(status)), size });
             return Ok(());
         }
         let status = u8::try_from(status).ok().filter(|s| *s <= 2).unwrap_or(0);

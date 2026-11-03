@@ -1267,7 +1267,7 @@ impl Server {
         }
         if !self.rule("minecraft:spawner_blocks_work", true) {
             let msg = rc_text::Component::translate("advMode.notEnabled.spawner", Vec::new());
-            self.chat_out(rc_client::Event::Chat { component: msg, tag: rc_client::ChatTag::System });
+            self.chat_out(rc_client::Event::Chat { component: Box::new(msg), tag: rc_client::ChatTag::System });
             return Some(false);
         }
         let only = |e: &str| {

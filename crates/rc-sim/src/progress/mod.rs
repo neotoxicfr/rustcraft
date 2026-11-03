@@ -770,7 +770,7 @@ impl Server {
 
     /// Broadcast of a system message (all players).
     pub(crate) fn adv_broadcast(&self, c: rc_text::Component) {
-        self.chat_out(Event::Chat { component: c, tag: rc_client::ChatTag::System });
+        self.chat_out(Event::Chat { component: Box::new(c), tag: rc_client::ChatTag::System });
     }
 
     /// Rewards: experience, loot, recipes, function.

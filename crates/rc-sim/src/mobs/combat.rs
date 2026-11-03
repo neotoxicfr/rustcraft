@@ -191,7 +191,7 @@ impl Server {
             count,
             mode: 0,
         };
-        let _ = self.send(Event::Particles(p));
+        let _ = self.send(Event::Particles(Box::new(p)));
     }
 
     /// Particles with color (ARGB; `effect` opaque white = 0xFFFF_FFFF), speed per axis and
@@ -222,7 +222,7 @@ impl Server {
             count,
             mode,
         };
-        let _ = self.send(Event::Particles(p));
+        let _ = self.send(Event::Particles(Box::new(p)));
     }
 
     /// One `trail` particle from `pos` towards `target`, reached in `duration` ticks, RGB `color`;
@@ -248,7 +248,7 @@ impl Server {
             count: 1,
             mode: 0,
         };
-        let _ = self.send(Event::Particles(p));
+        let _ = self.send(Event::Particles(Box::new(p)));
     }
 
     /// Damage taken by a mob; true if it landed.
@@ -743,7 +743,7 @@ impl Server {
         let empty = crate::vitals::Combat::default();
         let c = m.combat.as_deref().unwrap_or(&empty);
         let msg = self.death_message_of(c, self.mob_display(m), self.mob_kill_credit(m));
-        self.as_player(seat, |sv| sv.send_personal(Event::Chat { component: msg, tag: rc_client::ChatTag::System }));
+        self.as_player(seat, |sv| sv.send_personal(Event::Chat { component: Box::new(msg), tag: rc_client::ChatTag::System }));
     }
 
     fn mob_xp(&self, m: &mut Mob) -> i32 {

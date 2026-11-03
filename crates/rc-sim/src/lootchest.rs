@@ -184,7 +184,7 @@ impl Server {
             // Red message above the hotbar.
             let mut msg = rc_text::Component::translate("container.spectatorCantOpen", Vec::new());
             msg.style.color = Some(0xFF5555);
-            let _ = self.send(rc_client::Event::ActionBar(msg));
+            let _ = self.send(rc_client::Event::ActionBar(Box::new(msg)));
             return true;
         }
         for p in positions {
