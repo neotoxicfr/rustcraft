@@ -7,6 +7,7 @@ use rc_proto::nbt::Nbt;
 use super::ents::E;
 use super::snbt;
 use super::src::Src;
+use crate::progress::pred::{Ctx, Who};
 use crate::server::Server;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -57,6 +58,8 @@ pub struct Sel {
     pub scores: Vec<(String, Range)>,
     /// S9: `advancements={id=bool|{criterion=bool}}`.
     pub advancements: Vec<(String, serde_json::Value)>,
+    /// `predicate=[!]id`: (inverted, data pack predicate identifier with its namespace).
+    pub predicates: Vec<(bool, String)>,
     pub type_limited: bool,
 }
 
@@ -97,6 +100,7 @@ pub fn parse(text: &str) -> Option<Sel> {
         nbts: Vec::new(),
         scores: Vec::new(),
         advancements: Vec::new(),
+        predicates: Vec::new(),
         type_limited: false,
     };
     if chars.first() != Some(&'@') {
@@ -251,6 +255,7 @@ pub fn parse(text: &str) -> Option<Sel> {
                     "gamemode" => s.modes.push((neg, v)),
                     "team" => s.teams.push((neg, v)),
                     "tag" => s.tags.push((neg, v)),
+                    "predicate" => s.predicates.push((neg, super::args::id(&v))),
                     "type" => {
                         let id = if v.contains(':') { v } else { format!("minecraft:{v}") };
                         if !neg && !is_tag {
@@ -458,7 +463,18 @@ impl Server {
             }
         }
         let _ = src;
-        true
+        // Data pack predicates come last although the game tests them in the written order:
+        // they are the costliest test, and the order is unobservable (their only side effect
+        // is a draw on the local random source of `random_chance`, never the world's).
+        s.predicates.iter().all(|(inverted, id)| self.selector_predicate(id, *inverted, e))
+    }
+
+    /// `predicate=` option: the named predicate tested with the entity as `this` and its own
+    /// position as origin. An unknown identifier fails even when inverted, like the game.
+    fn selector_predicate(&self, id: &str, inverted: bool, e: E) -> bool {
+        let Some(condition) = self.life.pack.get("predicate", id) else { return false };
+        let ctx = Ctx { this: Some(Who::E(e)), origin: Some(self.e_pos(e)), ..Ctx::default() };
+        self.p_condition(&condition, &ctx) != inverted
     }
 
     /// Selected entities, in the game's order.
@@ -551,6 +567,52 @@ mod tests {
         assert_eq!(n.name.as_deref(), Some("Steve"));
         let s = parse("@s[nbt={OnGround:1b}]").unwrap();
         assert_eq!(s.nbts.len(), 1);
+        let s = parse("@e[predicate=test:a, predicate = ! b]").unwrap();
+        assert_eq!(s.predicates, vec![(false, "test:a".to_owned()), (true, "minecraft:b".to_owned())]);
+    }
+
+    /// Flat world with a pig 3 blocks east of the player and test predicates in the pack.
+    fn world_with_predicates() -> crate::blocks::probe::Probe {
+        let data = std::sync::Arc::new(rc_testdata::version_data().expect("version data 26.3 missing"));
+        let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-select-pred-{}", std::process::id())));
+        let mut w = crate::newworld::NewWorld::new("select-pred");
+        w.preset = crate::newworld::Preset::Flat;
+        w.allow_commands = true;
+        crate::newworld::create_world(&dir, &data, &w).expect("world creation");
+        let mut p = crate::blocks::probe::Probe::open(&dir, data);
+        let is_player = r#"{"condition":"minecraft:entity_properties","entity":"this","predicate":{"type":"minecraft:player"}}"#;
+        // True only when the origin is the tested entity's own position.
+        let at_origin = r#"{"condition":"minecraft:entity_properties","entity":"this",
+            "predicate":{"distance":{"absolute":{"max":0.001}}}}"#;
+        p.s.life.pack.insert_test_file("test:predicate/is_player", is_player);
+        p.s.life.pack.insert_test_file("predicate/at_origin", at_origin);
+        p.s.player_command("summon minecraft:pig ~3 ~ ~");
+        p
+    }
+
+    /// `predicate=` filters with the named predicate: tested entity as `this`, its own position
+    /// as origin, an unknown identifier false even inverted, several options all required.
+    #[test]
+    fn predicate_option_filters_like_the_game() {
+        let mut p = world_with_predicates();
+        let pig = p.s.all_ents().into_iter().find(|e| *e != E::Player).expect("summoned pig missing");
+        let mut src = p.s.player_source();
+        // Far from every entity: the origin must not be the command source's position.
+        src.pos = [src.pos[0] + 500.0, src.pos[1], src.pos[2]];
+        let mut select = |text: &str| p.s.select(&parse(text).unwrap(), &src);
+        assert_eq!(select("@e"), vec![E::Player, pig], "test setup");
+        assert_eq!(select("@e[predicate=test:is_player]"), vec![E::Player]);
+        assert_eq!(select("@e[predicate=!test:is_player]"), vec![pig]);
+        assert_eq!(select("@e[predicate=at_origin]"), vec![E::Player, pig]);
+        assert_eq!(select("@e[predicate=minecraft:at_origin,predicate=!test:is_player]"), vec![pig]);
+        assert_eq!(select("@e[predicate=test:is_player,predicate=!test:is_player]"), Vec::<E>::new());
+        assert_eq!(select("@e[predicate=test:missing]"), Vec::<E>::new());
+        assert_eq!(select("@e[predicate=!test:missing]"), Vec::<E>::new(), "unknown predicate inverted");
+        // Whole chain, through the command parser.
+        let (ok, _) = p.s.perform(p.s.player_source(), "execute if entity @e[type=minecraft:pig,predicate=test:is_player]");
+        assert!(!ok, "a pig is not a player");
+        let (ok, _) = p.s.perform(p.s.player_source(), "execute if entity @e[type=minecraft:pig,predicate=!test:is_player]");
+        assert!(ok, "the pig is not a player");
     }
 
     #[test]
