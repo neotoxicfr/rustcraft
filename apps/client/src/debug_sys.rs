@@ -181,7 +181,8 @@ pub fn process_memory() -> (u64, u64) {
 }
 
 /// Index of `mi_option_page_commit_on_demand` in the `mi_option_t` enumeration of the linked
-/// library (libmimalloc-sys 0.1.49, mimalloc v3, `include/mimalloc.h`): to recheck on every bump.
+/// library (libmimalloc-sys 0.1.49, mimalloc v3, `include/mimalloc.h`): to recheck on every bump,
+/// together with its copy in the allocation bench (`crates/rc-worldgen/tests/sampler_opt.rs`).
 const MI_OPTION_PAGE_COMMIT_ON_DEMAND: i32 = 40;
 
 /// mimalloc pages committed on demand instead of entirely at creation (equivalent of

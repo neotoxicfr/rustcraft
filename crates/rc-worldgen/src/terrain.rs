@@ -137,6 +137,28 @@ fn with_eval_context<R>(keep: bool, f: impl FnOnce(&mut Ctx) -> R) -> R {
     r
 }
 
+/// Memory of the context kept by the calling thread (benches), `None` if it has none.
+#[derive(Debug, Clone, Copy)]
+pub struct KeptContextMemory {
+    /// Spares plus the cache volumes of the last chunk, as held between two chunks.
+    pub held_bytes: usize,
+    /// Spares once reset: what stays held for as long as the thread lives, after the world is
+    /// left too (rayon threads of the global pool).
+    pub spare_bytes_after_reset: usize,
+}
+
+/// Measures the context kept by the calling thread, then resets it (the reset the next chunk
+/// would do anyway).
+pub fn kept_context_memory() -> Option<KeptContextMemory> {
+    KEPT_CONTEXT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let ctx = slot.as_mut()?;
+        let held_bytes = ctx.held_bytes();
+        ctx.reset_for_reuse();
+        Some(KeptContextMemory { held_bytes, spare_bytes_after_reset: ctx.spare_bytes() })
+    })
+}
+
 /// Identifiers resolved once (`TerrainOpts::ids`).
 #[derive(Debug, Clone, Copy)]
 struct TerrainIds {

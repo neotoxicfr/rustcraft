@@ -291,6 +291,14 @@ impl Ctx {
         self.pool_bytes
     }
 
+    /// Bytes held by every buffer of the context: the spares plus the volumes kept by the cache
+    /// cells (until [`Ctx::reset_for_reuse`] hands them back or drops them beyond the cap).
+    pub fn held_bytes(&self) -> usize {
+        let cells = self.cells.iter().flatten();
+        let in_cells: usize = cells.filter_map(|c| c.buf.as_ref()).map(|b| b.capacity() * size_of::<f32>()).sum();
+        self.pool_bytes + in_cells
+    }
+
     /// Output buffer of a volume: taken from the context (`vol_pool`) or new.
     pub(crate) fn output(&mut self, n: usize) -> Vec<f32> {
         if self.opts.vol_pool { self.take(n) } else { vec![0.0; n] }
