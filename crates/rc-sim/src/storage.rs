@@ -2,11 +2,16 @@
 //! rewriting of `level.dat` (name, data packs), zip backup copy in `backups`,
 //! restoration of `level.dat_old`, deletion and optimisation (chunk rewriting).
 
-use std::io::{Read, Write};
+use std::collections::BTreeMap;
+use std::io::{Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex, PoisonError};
 
-use rc_proto::nbt::Nbt;
+use rc_proto::Reader;
+use rc_proto::nbt::{self, Nbt};
+use zip::write::SimpleFileOptions;
+use zip::{ZipArchive, ZipWriter};
 
 use crate::Error;
 use crate::lock::SessionLock;
@@ -70,6 +75,29 @@ pub fn find_available_name(dir: &Path, base: &str, suffix: &str) -> String {
 /// Root of `level.dat` (`old`: `level.dat_old`), without fallback.
 pub fn read_level(dir: &Path, old: bool) -> Result<Nbt, Error> {
     nbtio::read_dat(&dir.join(if old { "level.dat_old" } else { "level.dat" }))
+}
+
+/// Root of `level.dat` as the world list reads it, like the game: the player (`Data.Player`) and
+/// the old generation settings (`Data.WorldGenSettings`) are skipped without being decoded, so
+/// damage in them no longer turns the world into an unreadable one (26.3 writes neither; older
+/// worlds do).
+pub fn read_level_summary(dir: &Path) -> Result<Nbt, Error> {
+    let path = dir.join("level.dat");
+    let raw = std::fs::read(&path).map_err(|e| Error::io(&path, e))?;
+    let bytes = nbtio::decompress_auto(&raw).map_err(|e| Error::io(&path, e))?;
+    match nbt::read_named_skipping(&mut Reader::new(&bytes), "Data", &["Player", "WorldGenSettings"]) {
+        Ok(Some((_, root @ Nbt::Compound(_)))) => Ok(root),
+        Ok(_) => Err(Error::Format(format!("{} : NBT root is not a compound", path.display()))),
+        Err(e) => Err(Error::Format(format!("{} : NBT : {e}", path.display()))),
+    }
+}
+
+/// Threads for the folder work spread over the cores (optimisation, backup copy, deletion):
+/// `RUSTCRAFT_THREADS`, otherwise the logical cores.
+fn worker_threads() -> usize {
+    rc_data::env_str!("RUSTCRAFT_THREADS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get))
 }
 
 /// Rewrites `level.dat` (the old one becomes `level.dat_old`), like a save.
@@ -293,24 +321,75 @@ pub fn civil_from_secs(s: i64) -> (i64, u32, u32, u32, u32, u32) {
 }
 
 /// Backup copy ("Make a backup"): `backups/<YYYY-MM-DD_HH-MM-SS>_<folder>.zip`,
-/// entries `<folder>/…`, without `session.lock`. Returns the path and the size of the zip.
+/// entries `<folder>/…`, without `session.lock`, dated with the local time of the copy like the
+/// game. The entries are compressed side by side (`RUSTCRAFT_OPT_PARALLEL_BACKUP_ZIP=0`: one
+/// after the other, the old path). Returns the path and the size of the zip.
 pub fn backup(world: &Path, backups: &Path) -> Result<(PathBuf, u64), Error> {
     std::fs::create_dir_all(backups).map_err(|e| Error::io(backups, e))?;
     let id = world.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let now = std::time::SystemTime::UNIX_EPOCH.elapsed().map_or(0, |d| d.as_millis() as i64);
-    let (y, mo, d, h, mi, s) = local_datetime(now);
+    let local = local_datetime(now);
+    let (y, mo, d, h, mi, s) = local;
     let stem = format!("{y:04}-{mo:02}-{d:02}_{h:02}-{mi:02}-{s:02}_{id}");
     let name = find_available_name(backups, &stem, ".zip");
     let path = backups.join(name);
-    let file = std::fs::File::create(&path).map_err(|e| Error::io(&path, e))?;
-    let mut zip = zip::ZipWriter::new(std::io::BufWriter::new(file));
-    let opts =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated).large_file(true);
+    let threads = if parallel_backup_on() { worker_threads() } else { 0 };
+    write_backup(world, &id, &path, zip_time(local), threads, BACKUP_BYTES_IN_FLIGHT)?;
+    let size = std::fs::metadata(&path).map_or(0, |m| m.len());
+    Ok((path, size))
+}
+
+/// Backup entries compressed side by side (`RUSTCRAFT_OPT_PARALLEL_BACKUP_ZIP`, on unless `0`).
+fn parallel_backup_on() -> bool {
+    rc_data::env_str!("RUSTCRAFT_OPT_PARALLEL_BACKUP_ZIP") != Some("0")
+}
+
+/// Zip date of a local date and time; 1980-01-01 (the zip default) outside the range zip dates hold.
+fn zip_time((y, mo, d, h, mi, s): (i64, u32, u32, u32, u32, u32)) -> zip::DateTime {
+    let small = |v: u32| u8::try_from(v).unwrap_or(0);
+    u16::try_from(y)
+        .ok()
+        .and_then(|y| zip::DateTime::from_date_and_time(y, small(mo), small(d), small(h), small(mi), small(s)).ok())
+        .unwrap_or_default()
+}
+
+/// Writes the backup zip of `world` at `path`: one by one (`threads` 0, the old path) or
+/// compressed on `threads` threads with at most `budget` bytes waiting; both give the same bytes.
+fn write_backup(
+    world: &Path,
+    id: &str,
+    path: &Path,
+    when: zip::DateTime,
+    threads: usize,
+    budget: u64,
+) -> Result<(), Error> {
+    let file = std::fs::File::create(path).map_err(|e| Error::io(path, e))?;
+    let mut zip = ZipWriter::new(std::io::BufWriter::new(file));
+    let opts = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .large_file(true)
+        .last_modified_time(when);
+    let entries = backup_entries(world, id)?;
+    if threads == 0 {
+        write_entries_one_by_one(&mut zip, &entries, opts, path)?;
+    } else {
+        write_entries_side_by_side(&mut zip, &entries, opts, threads, budget)?;
+    }
+    let mut w = zip.finish().map_err(zip_error)?;
+    w.flush().map_err(|e| Error::io(path, e))
+}
+
+fn zip_error(e: zip::result::ZipError) -> Error {
+    Error::Format(e.to_string())
+}
+
+/// Files of the copy as (path, entry name `<id>/…`), in the order the copy writes them: the files
+/// of a folder by name, then its sub-folders (the last one first); `session.lock` left out.
+fn backup_entries(world: &Path, id: &str) -> Result<Vec<(PathBuf, String)>, Error> {
+    let mut out = Vec::new();
     let mut stack = vec![world.to_owned()];
-    let mut buf = Vec::new();
     while let Some(dir) = stack.pop() {
-        let rd = std::fs::read_dir(&dir).map_err(|e| Error::io(&dir, e))?;
-        let mut entries: Vec<_> = rd.flatten().collect();
+        let mut entries: Vec<_> = std::fs::read_dir(&dir).map_err(|e| Error::io(&dir, e))?.flatten().collect();
         entries.sort_by_key(|e| e.file_name());
         for e in entries {
             let p = e.path();
@@ -322,23 +401,150 @@ pub fn backup(world: &Path, backups: &Path) -> Result<(PathBuf, u64), Error> {
             if p.file_name().is_some_and(|n| n == "session.lock") {
                 continue;
             }
-            let rel = p.strip_prefix(world).unwrap_or(&p);
-            let mut entry = id.clone();
-            for c in rel.components() {
+            let mut entry = id.to_owned();
+            for c in p.strip_prefix(world).unwrap_or(&p).components() {
                 entry.push('/');
                 entry.push_str(&c.as_os_str().to_string_lossy());
             }
-            buf.clear();
-            std::fs::File::open(&p).and_then(|mut f| f.read_to_end(&mut buf)).map_err(|er| Error::io(&p, er))?;
-            zip.start_file(entry, opts).map_err(|er| Error::Format(er.to_string()))?;
-            zip.write_all(&buf).map_err(|er| Error::io(&path, er))?;
+            out.push((p, entry));
         }
     }
-    let mut w = zip.finish().map_err(|er| Error::Format(er.to_string()))?;
-    w.flush().map_err(|e| Error::io(&path, e))?;
-    drop(w);
-    let size = std::fs::metadata(&path).map_or(0, |m| m.len());
-    Ok((path, size))
+    Ok(out)
+}
+
+/// The old path: each file read whole, then compressed into the zip.
+fn write_entries_one_by_one<W: Write + Seek>(
+    zip: &mut ZipWriter<W>,
+    entries: &[(PathBuf, String)],
+    opts: SimpleFileOptions,
+    zip_path: &Path,
+) -> Result<(), Error> {
+    let mut buf = Vec::new();
+    for (file, name) in entries {
+        buf.clear();
+        std::fs::File::open(file).and_then(|mut f| f.read_to_end(&mut buf)).map_err(|er| Error::io(file, er))?;
+        zip.start_file(name.as_str(), opts).map_err(zip_error)?;
+        zip.write_all(&buf).map_err(|er| Error::io(zip_path, er))?;
+    }
+    Ok(())
+}
+
+/// At most this many input bytes are taken by the compressing threads and not yet copied into the
+/// zip (the entry the writer waits for always passes, whatever its size): bounds the memory to
+/// about twice this (files read whole, their compressed copies waiting).
+const BACKUP_BYTES_IN_FLIGHT: u64 = 64 * 1024 * 1024;
+
+/// What the compressing threads hand to the writer.
+#[derive(Default)]
+struct Handover {
+    /// Memory budget: [`BACKUP_BYTES_IN_FLIGHT`] (smaller in the tests).
+    budget: u64,
+    /// Entry the writer copies next (all the ones before are in the zip).
+    next_to_write: usize,
+    /// Input bytes of the entries taken by a thread and not yet copied.
+    bytes_in_flight: u64,
+    /// Entries compressed and waiting, by rank: each one an archive of a single entry.
+    ready: BTreeMap<usize, Result<Vec<u8>, Error>>,
+    /// The writer gave up after an error: the threads stop.
+    stopped: bool,
+}
+
+fn lock(m: &Mutex<Handover>) -> std::sync::MutexGuard<'_, Handover> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Deflating is what costs and it splits by file: every file is compressed on its own thread into
+/// an archive of a single entry, then copied raw into the zip in the walk order. A raw copy keeps
+/// the compressed bytes and headers as they are, so the zip is the one the old path writes.
+fn write_entries_side_by_side<W: Write + Seek>(
+    zip: &mut ZipWriter<W>,
+    entries: &[(PathBuf, String)],
+    opts: SimpleFileOptions,
+    threads: usize,
+    budget: u64,
+) -> Result<(), Error> {
+    let sizes: Vec<u64> = entries.iter().map(|(p, _)| std::fs::metadata(p).map_or(0, |m| m.len())).collect();
+    let next = AtomicUsize::new(0);
+    let state = Mutex::new(Handover { budget, ..Handover::default() });
+    let changed = Condvar::new();
+    std::thread::scope(|s| {
+        for _ in 0..threads.clamp(1, entries.len().max(1)) {
+            s.spawn(|| compress_entries(entries, &sizes, opts, &next, &state, &changed));
+        }
+        let copied = copy_entries_in_order(zip, &sizes, &state, &changed);
+        if copied.is_err() {
+            lock(&state).stopped = true;
+            changed.notify_all();
+        }
+        copied
+    })
+}
+
+/// A compressing thread: takes the next entry, waits for room in the memory budget, compresses it.
+fn compress_entries(
+    entries: &[(PathBuf, String)],
+    sizes: &[u64],
+    opts: SimpleFileOptions,
+    next: &AtomicUsize,
+    state: &Mutex<Handover>,
+    changed: &Condvar,
+) {
+    loop {
+        let rank = next.fetch_add(1, Ordering::Relaxed);
+        let Some((file, name)) = entries.get(rank) else { return };
+        let mut st = lock(state);
+        // The entry the writer waits for always passes: no deadlock, whatever the file sizes.
+        while !st.stopped && rank != st.next_to_write && st.bytes_in_flight + sizes[rank] > st.budget {
+            st = changed.wait(st).unwrap_or_else(PoisonError::into_inner);
+        }
+        if st.stopped {
+            return;
+        }
+        st.bytes_in_flight += sizes[rank];
+        drop(st);
+        let packed = compress_entry(file, name, opts, sizes[rank]);
+        lock(state).ready.insert(rank, packed);
+        changed.notify_all();
+    }
+}
+
+/// One file compressed into an archive of a single entry, in memory. The file is read whole and
+/// written in one call, like the old path: the deflater's output depends on how its input is cut
+/// (a stream read of 8 KiB pieces gave one byte more on a 1 MiB file), and the zip must not change.
+fn compress_entry(file: &Path, name: &str, opts: SimpleFileOptions, size: u64) -> Result<Vec<u8>, Error> {
+    let content = std::fs::read(file).map_err(|e| Error::io(file, e))?;
+    let room = usize::try_from(size).unwrap_or(0).saturating_add(1024);
+    let mut one = ZipWriter::new(Cursor::new(Vec::with_capacity(room)));
+    one.start_file(name, opts).map_err(zip_error)?;
+    one.write_all(&content).map_err(|e| Error::io(file, e))?;
+    Ok(one.finish().map_err(zip_error)?.into_inner())
+}
+
+/// The writer: copies the compressed entries raw into the zip, in rank order.
+fn copy_entries_in_order<W: Write + Seek>(
+    zip: &mut ZipWriter<W>,
+    sizes: &[u64],
+    state: &Mutex<Handover>,
+    changed: &Condvar,
+) -> Result<(), Error> {
+    for (rank, size) in sizes.iter().enumerate() {
+        let packed = {
+            let mut st = lock(state);
+            loop {
+                if let Some(p) = st.ready.remove(&rank) {
+                    break p;
+                }
+                st = changed.wait(st).unwrap_or_else(PoisonError::into_inner);
+            }
+        };
+        zip.merge_archive(ZipArchive::new(Cursor::new(packed?)).map_err(zip_error)?).map_err(zip_error)?;
+        let mut st = lock(state);
+        st.next_to_write = rank + 1;
+        st.bytes_in_flight -= size;
+        drop(st);
+        changed.notify_all();
+    }
+    Ok(())
 }
 
 /// Deletion of the world ("Delete"): lock taken (refused if the world is open elsewhere),
@@ -352,9 +558,14 @@ pub fn delete(world: &Path) -> Result<(), Error> {
         lock.release();
         return r.map_err(|e| Error::io(world, e));
     }
+    let threads = if parallel_delete_on() { worker_threads() } else { 1 };
     let mut last = Ok(());
     for i in 0..5 {
-        last = remove_tree(world, Some(&world.join("session.lock")));
+        last = if threads > 1 {
+            remove_tree_side_by_side(world, &world.join("session.lock"), threads)
+        } else {
+            remove_tree(world, Some(&world.join("session.lock")))
+        };
         if last.is_ok() {
             break;
         }
@@ -384,6 +595,63 @@ fn remove_tree(dir: &Path, keep: Option<&Path>) -> std::io::Result<()> {
             std::fs::remove_dir(&p)?;
         } else {
             std::fs::remove_file(&p)?;
+        }
+    }
+    Ok(())
+}
+
+/// World files erased side by side (`RUSTCRAFT_OPT_PARALLEL_WORLD_DELETE`, on unless `0`).
+fn parallel_delete_on() -> bool {
+    rc_data::env_str!("RUSTCRAFT_OPT_PARALLEL_WORLD_DELETE") != Some("0")
+}
+
+/// Same erasing as [`remove_tree`], but the files (and links) of the whole tree are removed on
+/// `threads` threads, then the emptied folders deepest first: each removal waits on the file
+/// system, and several can wait at once.
+fn remove_tree_side_by_side(dir: &Path, keep: &Path, threads: usize) -> std::io::Result<()> {
+    let mut files = Vec::new();
+    let mut folders = Vec::new();
+    list_tree(dir, keep, &mut files, &mut folders)?;
+    let next = AtomicUsize::new(0);
+    let remove_some = || -> std::io::Result<()> {
+        while let Some((path, link)) = files.get(next.fetch_add(1, Ordering::Relaxed)) {
+            if *link {
+                // Link to a folder on Windows: removed like a folder.
+                std::fs::remove_file(path).or_else(|_| std::fs::remove_dir(path))?;
+            } else {
+                std::fs::remove_file(path)?;
+            }
+        }
+        Ok(())
+    };
+    std::thread::scope(|s| {
+        let helpers: Vec<_> = (1..threads.min(files.len())).map(|_| s.spawn(remove_some)).collect();
+        let mine = remove_some();
+        helpers.into_iter().map(|h| h.join().unwrap_or_else(|p| std::panic::resume_unwind(p))).fold(mine, Result::and)
+    })?;
+    // Listed parents first: the reverse order empties the deepest folders first.
+    folders.iter().rev().try_for_each(std::fs::remove_dir)
+}
+
+/// Files (with a "link" flag) and folders under `dir`, never entering a symbolic link; `keep` left out.
+fn list_tree(
+    dir: &Path,
+    keep: &Path,
+    files: &mut Vec<(PathBuf, bool)>,
+    folders: &mut Vec<PathBuf>,
+) -> std::io::Result<()> {
+    for e in std::fs::read_dir(dir)? {
+        let e = e?;
+        let p = e.path();
+        if p == keep {
+            continue;
+        }
+        let t = e.file_type()?;
+        if t.is_dir() && !t.is_symlink() {
+            folders.push(p.clone());
+            list_tree(&p, keep, files, folders)?;
+        } else {
+            files.push((p, t.is_symlink()));
         }
     }
     Ok(())
@@ -429,12 +697,11 @@ pub const OPTIMIZE_PASSES: [(&str, &str); 3] = [("entities", "entities"), ("poi"
 /// from an older version would be converted by the game's data fixers, not reproduced here: left
 /// as is and counted "skipped". Cancelling stops after the region files being processed.
 /// The region files of a dimension are shared among `RUSTCRAFT_THREADS` threads (default: the
-/// logical cores), one file per thread at a time.
+/// logical cores), one file per thread at a time; the dimensions stay one after the other, like the
+/// game's progress bars. `RUSTCRAFT_OPT_PARALLEL_WORLD_OPTIMIZE=0`: a single thread (the old path).
 pub fn optimize(world: &Path, erase_cache: bool, p: &Optimize) {
-    let threads = rc_data::env_str!("RUSTCRAFT_THREADS")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get));
-    optimize_with(world, erase_cache, p, threads);
+    let parallel = rc_data::env_str!("RUSTCRAFT_OPT_PARALLEL_WORLD_OPTIMIZE") != Some("0");
+    optimize_with(world, erase_cache, p, if parallel { worker_threads() } else { 1 });
 }
 
 fn optimize_with(world: &Path, erase_cache: bool, p: &Optimize, threads: usize) {
@@ -523,7 +790,8 @@ fn optimize_file(path: &Path, chunks: &[usize], erase: bool, p: &Optimize) {
         let converted = match r.read(i, cx, cz) {
             Ok(Some(bytes)) => match nbtio::parse_root(&bytes) {
                 Ok(mut root) => {
-                    let current = nbtio::int(&root, "DataVersion").is_some_and(|v| v >= i64::from(crate::chunk::DATA_VERSION));
+                    let current =
+                        nbtio::int(&root, "DataVersion").is_some_and(|v| v >= i64::from(crate::chunk::DATA_VERSION));
                     // Counted as soon as it is sent to be written, like the game (a failed
                     // write only reaches its log).
                     current && erase_chunk_cache(&mut root) && {
@@ -704,8 +972,14 @@ mod tests {
         // Block pass only: 4 chunks, 2 rewritten (cache, current version), an older one left.
         assert_eq!((n(&p.total), n(&p.converted), n(&p.skipped)), (4, 2, 2));
         assert_eq!((p.dim_progress(0), p.dim_progress(1), p.dim_progress(2), p.progress()), (0.5, 0.5, 0.0, 1.0));
-        let mut r = RegionFile::open(&crate::world::dimension_dir(&world, "minecraft:overworld").join("region/r.0.0.mca"), false).unwrap();
-        let read = |r: &mut RegionFile, i: usize| nbtio::parse_root(&r.read(i, (i % 32) as i32, (i / 32) as i32).unwrap().unwrap()).unwrap();
+        let mut r = RegionFile::open(
+            &crate::world::dimension_dir(&world, "minecraft:overworld").join("region/r.0.0.mca"),
+            false,
+        )
+        .unwrap();
+        let read = |r: &mut RegionFile, i: usize| {
+            nbtio::parse_root(&r.read(i, (i % 32) as i32, (i / 32) as i32).unwrap().unwrap()).unwrap()
+        };
         let c0 = read(&mut r, 0);
         assert!(c0.get("Heightmaps").is_none() && nbtio::list(c0.get("sections"))[0].get("SkyLight").is_none());
         assert!(read(&mut r, 33).get("Heightmaps").is_some(), "older data left as is");
@@ -782,12 +1056,310 @@ mod tests {
         assert!(size > 0);
         assert!(zip_path.file_name().unwrap().to_string_lossy().ends_with("_World.zip"));
         let mut a = zip::ZipArchive::new(std::fs::File::open(&zip_path).unwrap()).unwrap();
-        let mut names: Vec<String> = (0..a.len()).map(|i| a.by_index(i).unwrap().name().unwrap().into_owned()).collect();
+        let mut names: Vec<String> =
+            (0..a.len()).map(|i| a.by_index(i).unwrap().name().unwrap().into_owned()).collect();
         names.sort();
         assert_eq!(names, ["World/data/x.dat", "World/level.dat"]);
         delete(&w).unwrap();
         assert!(!w.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A small world of nested folders, files of varied sizes (empty, tiny, several MiB of
+    /// incompressible then repetitive bytes) and a `session.lock`; the same each call.
+    fn sample_world(world: &Path) {
+        let mut noise = 0x2545_f491_4f6c_dd1du64;
+        let mut bytes = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|i| {
+                    noise ^= noise << 13;
+                    noise ^= noise >> 7;
+                    noise ^= noise << 17;
+                    if i % 3 == 0 { b'a' } else { noise as u8 }
+                })
+                .collect()
+        };
+        let files: [(&str, usize); 9] = [
+            ("level.dat", 456),
+            ("level.dat_old", 0),
+            ("session.lock", 3),
+            ("data/raids.dat", 90),
+            ("dimensions/minecraft/overworld/region/r.0.0.mca", 3 << 20),
+            ("dimensions/minecraft/overworld/region/r.-1.0.mca", 700_000),
+            ("dimensions/minecraft/overworld/entities/r.0.0.mca", 8192),
+            ("dimensions/minecraft/the_nether/region/r.0.0.mca", 1 << 20),
+            ("players/data/0000.dat", 2000),
+        ];
+        for (rel, n) in files {
+            let p = world.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, bytes(n)).unwrap();
+        }
+    }
+
+    /// The backup compressed side by side is the zip of the old path, byte for byte (same entries,
+    /// order, compressed data, dates), on 1 to 8 threads and with a memory budget smaller than one
+    /// file (the writer's entry always passes); entries dated with the copy's local time.
+    #[test]
+    fn backup_side_by_side_writes_the_old_zip() {
+        let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-storage-bp-{}", std::process::id())));
+        let world = dir.join("World");
+        sample_world(&world);
+        let when = zip_time((2026, 11, 3, 14, 5, 36));
+        let zip_with = |threads: usize, budget: u64| {
+            let path = dir.join(format!("copy-{threads}-{budget}.zip"));
+            write_backup(&world, "World", &path, when, threads, budget).unwrap();
+            std::fs::read(&path).unwrap()
+        };
+        let old = zip_with(0, 0);
+        for threads in [1, 2, 3, 8] {
+            for budget in [BACKUP_BYTES_IN_FLIGHT, 1000] {
+                let new = zip_with(threads, budget);
+                if new != old {
+                    let at = old.iter().zip(&new).position(|(a, b)| a != b).unwrap_or_else(|| old.len().min(new.len()));
+                    let lo = at.saturating_sub(16);
+                    panic!(
+                        "{threads} threads, budget {budget}: other bytes at {at} (len {} / {}): {:02x?} / {:02x?}",
+                        old.len(),
+                        new.len(),
+                        &old[lo..(at + 32).min(old.len())],
+                        &new[lo..(at + 32).min(new.len())]
+                    );
+                }
+            }
+        }
+        let mut a = zip::ZipArchive::new(Cursor::new(&old)).unwrap();
+        let names: Vec<String> = a.file_names().map(|n| n.unwrap().into_owned()).collect();
+        assert_eq!(names.len(), 8, "{names:?}");
+        assert_eq!(names[..3], ["World/level.dat", "World/level.dat_old", "World/players/data/0000.dat"]);
+        let mut e = a.by_name("World/dimensions/minecraft/overworld/region/r.0.0.mca").unwrap();
+        assert_eq!(
+            e.last_modified().map(|t| (t.year(), t.month(), t.day(), t.hour(), t.minute())),
+            Some((2026, 11, 3, 14, 5))
+        );
+        let mut back = Vec::new();
+        e.read_to_end(&mut back).unwrap();
+        assert_eq!(back.len(), 3 << 20);
+        assert_eq!(zip_time((1970, 1, 1, 0, 0, 0)), zip::DateTime::default(), "before 1980");
+    }
+
+    /// Deletion side by side: the same tree erased (nested folders, `session.lock` kept for the
+    /// end), like the old path.
+    #[test]
+    fn delete_side_by_side_erases_like_one_by_one() {
+        let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-storage-dp-{}", std::process::id())));
+        for (name, threads) in [("old", 1), ("two", 2), ("many", 8)] {
+            let world = dir.join(name);
+            sample_world(&world);
+            let lock = world.join("session.lock");
+            if threads == 1 {
+                remove_tree(&world, Some(&lock)).unwrap();
+            } else {
+                remove_tree_side_by_side(&world, &lock, threads).unwrap();
+            }
+            let left: Vec<_> = std::fs::read_dir(&world).unwrap().flatten().map(|e| e.file_name()).collect();
+            assert_eq!(left, ["session.lock"], "{name}");
+        }
+    }
+
+    /// Optimisation on one thread or many: the same chunks rewritten (NBT read back identical) and
+    /// the same counters and progress.
+    #[test]
+    fn optimize_on_many_threads_matches_one_thread() {
+        let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-storage-op-{}", std::process::id())));
+        let chunk = |i: usize, cache: bool| {
+            let mut f = vec![
+                ("DataVersion".to_owned(), Nbt::Int(crate::chunk::DATA_VERSION)),
+                ("xPos".into(), Nbt::Int(i as i32)),
+            ];
+            if cache {
+                f.push(("isLightOn".into(), Nbt::Byte(1)));
+                let s = Nbt::Compound(vec![("BlockLight".into(), Nbt::ByteArray(vec![i as u8; 2048]))]);
+                f.push(("sections".into(), Nbt::List(vec![s])));
+            }
+            nbtio::encode_root(&Nbt::Compound(f))
+        };
+        let regions = [("minecraft:overworld", 6), ("minecraft:the_nether", 3), ("minecraft:the_end", 1)];
+        let build = |world: &Path| {
+            for (dim, files) in regions {
+                for f in 0..files {
+                    let path = crate::world::dimension_dir(world, dim).join("region").join(format!("r.{f}.0.mca"));
+                    let mut r = RegionFile::open_or_create(&path).unwrap();
+                    for i in (0..1024).step_by(7) {
+                        r.write(i, f * 32 + (i % 32) as i32, (i / 32) as i32, &chunk(i, i % 3 != 0)).unwrap();
+                    }
+                    r.close().unwrap();
+                }
+            }
+        };
+        let read_back = |world: &Path| {
+            let mut all = Vec::new();
+            for (dim, files) in regions {
+                for f in 0..files {
+                    let path = crate::world::dimension_dir(world, dim).join("region").join(format!("r.{f}.0.mca"));
+                    let mut r = RegionFile::open(&path, false).unwrap();
+                    for i in (0..1024).step_by(7) {
+                        let bytes = r.read(i, f * 32 + (i % 32) as i32, (i / 32) as i32).unwrap().unwrap();
+                        all.push(nbtio::parse_root(&bytes).unwrap());
+                    }
+                }
+            }
+            all
+        };
+        let run = |name: &str, threads: usize| {
+            let world = dir.join(name);
+            build(&world);
+            let p = Optimize::default();
+            optimize_with(&world, true, &p, threads);
+            let n = |a: &AtomicU32| a.load(Ordering::Relaxed);
+            let progress = [p.dim_progress(0), p.dim_progress(1), p.dim_progress(2), p.progress()];
+            ((n(&p.total), n(&p.converted), n(&p.skipped)), progress, read_back(&world))
+        };
+        let one = run("one", 1);
+        assert_eq!(one.0, (1470, 980, 490));
+        assert!(one.2[1].get("isLightOn").is_none() && one.2[0].get("isLightOn").is_none());
+        for threads in [2, 4, 16] {
+            assert!(run(&format!("t{threads}"), threads) == one, "{threads} threads");
+        }
+    }
+
+    /// `level.dat` of an older world whose player holds a string the full read refuses: the
+    /// summary read skips the player (like the game), the full read still fails.
+    #[test]
+    fn level_summary_skips_the_player() {
+        let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-storage-ls-{}", std::process::id())));
+        let player = Nbt::Compound(vec![("CustomName".into(), Nbt::String("MARK".into()))]);
+        let data = Nbt::Compound(vec![
+            ("Player".into(), player),
+            ("LevelName".into(), Nbt::String("Old".into())),
+            ("WorldGenSettings".into(), Nbt::Compound(vec![("seed".into(), Nbt::Long(3))])),
+        ]);
+        let mut raw = nbtio::encode_root(&Nbt::Compound(vec![("Data".into(), data)]));
+        let at = raw.windows(4).position(|w| w == b"MARK").unwrap();
+        raw[at..at + 4].fill(0xff);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("level.dat"), nbtio::gzip(&raw)).unwrap();
+        assert!(read_level(&dir, false).is_err());
+        let root = read_level_summary(&dir).unwrap();
+        let want = Nbt::Compound(vec![("LevelName".into(), Nbt::String("Old".into()))]);
+        assert_eq!(root.get("Data"), Some(&want));
+        std::fs::write(dir.join("level.dat"), nbtio::gzip(&raw[..at])).unwrap();
+        assert!(read_level_summary(&dir).is_err(), "truncated");
+    }
+
+    /// Micro-bench: `level.dat` of an older world (player with a full inventory and a recipe book
+    /// of 800 entries) read whole, then as the list reads it (player skipped); 26.3 worlds have no
+    /// player there, so both reads are the same size for them. 2 passes, best of 200.
+    #[test]
+    #[ignore = "micro-bench"]
+    fn bench_level_summary_read() {
+        let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-storage-lb-{}", std::process::id())));
+        std::fs::create_dir_all(&dir).unwrap();
+        let item = |k: usize| {
+            Nbt::Compound(vec![
+                ("Slot".into(), Nbt::Byte(k as i8)),
+                ("id".into(), Nbt::String(format!("minecraft:item_{k}"))),
+                ("count".into(), Nbt::Int(64)),
+                (
+                    "components".into(),
+                    Nbt::Compound(vec![("minecraft:custom_name".into(), Nbt::String("Sword".into()))]),
+                ),
+            ])
+        };
+        let recipes = Nbt::List((0..800).map(|k| Nbt::String(format!("minecraft:recipe_number_{k}"))).collect());
+        let player = Nbt::Compound(vec![
+            ("Inventory".into(), Nbt::List((0..36).map(item).collect())),
+            ("recipeBook".into(), Nbt::Compound(vec![("recipes".into(), recipes)])),
+        ]);
+        let data = Nbt::Compound(vec![
+            ("LevelName".into(), Nbt::String("Old".into())),
+            ("LastPlayed".into(), Nbt::Long(5)),
+            ("Player".into(), player),
+        ]);
+        let raw = nbtio::gzip(&nbtio::encode_root(&Nbt::Compound(vec![("Data".into(), data)])));
+        std::fs::write(dir.join("level.dat"), &raw).unwrap();
+        for pass in 0..2 {
+            let best = |f: &dyn Fn()| {
+                (0..200)
+                    .map(|_| {
+                        let t = std::time::Instant::now();
+                        f();
+                        t.elapsed()
+                    })
+                    .min()
+                    .unwrap_or_default()
+            };
+            let whole = best(&|| drop(std::hint::black_box(read_level(&dir, false).unwrap())));
+            let summary = best(&|| drop(std::hint::black_box(read_level_summary(&dir).unwrap())));
+            eprintln!("pass {pass}: {} bytes gzip, whole read {whole:?}, summary read {summary:?}", raw.len());
+        }
+    }
+
+    /// Micro-bench: backup copy of the test world (`RUSTCRAFT_SOLO_WORLD`), old path then side by
+    /// side on 1, 2, 4… threads up to the logical cores, 2 passes.
+    #[test]
+    #[ignore = "micro-bench"]
+    fn bench_backup() {
+        let Some(world) = rc_data::env_os!("RUSTCRAFT_SOLO_WORLD").map(PathBuf::from) else {
+            panic!("RUSTCRAFT_SOLO_WORLD missing: no world to copy");
+        };
+        let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-storage-bb-{}", std::process::id())));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let when = zip_time((2026, 11, 3, 12, 0, 0));
+        for pass in 0..2 {
+            let mut threads = 0;
+            loop {
+                let path = dir.join(format!("b{pass}-{threads}.zip"));
+                let t = std::time::Instant::now();
+                write_backup(&world, "world", &path, when, threads, BACKUP_BYTES_IN_FLIGHT).unwrap();
+                let size = std::fs::metadata(&path).unwrap().len();
+                eprintln!("pass {pass}: threads {threads} (0 = old path): {:?}, {size} bytes", t.elapsed());
+                std::fs::remove_file(&path).unwrap();
+                if threads >= cores {
+                    break;
+                }
+                threads = if threads == 0 { 1 } else { (threads * 2).min(cores) };
+            }
+        }
+    }
+
+    /// Micro-bench: deletion of a world of 640 files of 64 KiB in 10 folders, old path then side
+    /// by side on 2, 4… threads up to the logical cores, 2 passes.
+    #[test]
+    #[ignore = "micro-bench"]
+    fn bench_delete() {
+        let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-storage-db-{}", std::process::id())));
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let fill = |world: &Path| {
+            for f in 0..10 {
+                let sub = world.join(format!("region{f}"));
+                std::fs::create_dir_all(&sub).unwrap();
+                for i in 0..64 {
+                    std::fs::write(sub.join(format!("r.{i}.0.mca")), vec![f as u8; 64 << 10]).unwrap();
+                }
+            }
+            std::fs::write(world.join("session.lock"), b"x").unwrap();
+        };
+        for pass in 0..2 {
+            let mut threads = 1;
+            loop {
+                let world = dir.join(format!("w{pass}-{threads}"));
+                fill(&world);
+                let lock = world.join("session.lock");
+                let t = std::time::Instant::now();
+                if threads == 1 {
+                    remove_tree(&world, Some(&lock)).unwrap();
+                } else {
+                    remove_tree_side_by_side(&world, &lock, threads).unwrap();
+                }
+                eprintln!("pass {pass}: threads {threads} (1 = old path): {:?}", t.elapsed());
+                if threads >= cores {
+                    break;
+                }
+                threads = (threads * 2).min(cores);
+            }
+        }
     }
 
     /// Deletion of a world containing a link to an outside folder: the link goes, the
