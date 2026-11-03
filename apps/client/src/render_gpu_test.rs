@@ -45,7 +45,19 @@ fn fs_probe(o: Out) -> Probe {
     p.b = vec4<f32>(i.uv, i.vis, f32(i.layer));
     return p;
 }
+@fragment
+fn fs_texel_probe(o: Out) -> Probe {
+    let i = frag(o);
+    var p: Probe;
+    p.a = texel(i);
+    p.b = vec4<f32>(i.uv, i.fade, f32(i.layer));
+    return p;
+}
 ";
+
+/// Side of the test block texture arrays (main, large) and their layer counts.
+const ATLAS_SIDES: [u32; 2] = [16, 32];
+const ATLAS_LAYERS: [u32; 2] = [48, 12];
 
 struct Gpu {
     device: wgpu::Device,
@@ -85,16 +97,30 @@ fn probe_module(device: &wgpu::Device, source: &str) -> wgpu::ShaderModule {
     })
 }
 
-/// Variant drawn: shader, its options, face indices (sabotage possible).
+/// Variant drawn: shader, its options, face indices (sabotage possible), fragment entry point
+/// (`fs_probe`: vertex outputs; `fs_texel_probe`: sampled texture colour).
 struct Variant<'a> {
     module: &'a wgpu::ShaderModule,
     opts: ShaderOpts,
     index: Option<&'a [u16]>,
+    fragment: &'static str,
+}
+
+impl<'a> Variant<'a> {
+    /// Vertex outputs of `opts` drawn with `module`.
+    fn new(module: &'a wgpu::ShaderModule, opts: ShaderOpts) -> Self {
+        Variant { module, opts, index: None, fragment: "fs_probe" }
+    }
+
+    /// Sampled texture colour of `opts` drawn with `module`.
+    fn texel(module: &'a wgpu::ShaderModule, opts: ShaderOpts) -> Self {
+        Variant { fragment: "fs_texel_probe", ..Variant::new(module, opts) }
+    }
 }
 
 impl Gpu {
     fn default_variant(&self) -> Variant<'_> {
-        Variant { module: &self.module, opts: ShaderOpts::NEW, index: None }
+        Variant::new(&self.module, ShaderOpts::NEW)
     }
 }
 
@@ -117,8 +143,15 @@ struct Res {
     /// Same fade as birth instants (`FADEGPU`).
     fade_gpu: wgpu::Buffer,
     lightmap: wgpu::TextureView,
+    /// Same lightmap as 256 RGBA8 words (`LIGHTMAPBUFFER`).
+    lightmap_colors: wgpu::Buffer,
     sampler: wgpu::Sampler,
     slots: wgpu::Buffer,
+    /// Block texture arrays (main, large), their sampler (the game's) and the animation that
+    /// sends each texture to a layer of one of them, a third of them blended with a next frame.
+    atlases: [wgpu::TextureView; 2],
+    atlas_sampler: wgpu::Sampler,
+    atlas_anim: wgpu::Buffer,
 }
 
 fn storage(g: &Gpu, data: &[u8]) -> wgpu::Buffer {
@@ -205,7 +238,7 @@ fn render_timed(
             },
             fragment: Some(wgpu::FragmentState {
                 module: v.module,
-                entry_point: Some("fs_probe"),
+                entry_point: Some(v.fragment),
                 compilation_options: Default::default(),
                 targets: &[color.clone(), color.clone()],
             }),
@@ -280,13 +313,22 @@ fn render_timed(
             }
             let p = pipeline(vs);
             let fade = if v.opts.fadegpu { &r.fade_gpu } else { &r.fade };
-            let mut g0 = vec![
-                (0, cam_buf.as_entire_binding()),
-                (4, r.anim.as_entire_binding()),
-                (6, fade.as_entire_binding()),
-                (7, B::TextureView(&r.lightmap)),
-                (8, B::Sampler(&r.sampler)),
-            ];
+            let texel_probe = v.fragment == "fs_texel_probe";
+            let anim = if texel_probe { &r.atlas_anim } else { &r.anim };
+            let mut g0 =
+                vec![(0, cam_buf.as_entire_binding()), (4, anim.as_entire_binding()), (6, fade.as_entire_binding())];
+            if v.opts.lightmap_buffer {
+                g0.push((10, r.lightmap_colors.as_entire_binding()));
+            } else {
+                g0.extend([(7, B::TextureView(&r.lightmap)), (8, B::Sampler(&r.sampler))]);
+            }
+            if texel_probe {
+                g0.extend([
+                    (2, B::TextureView(&r.atlases[0])),
+                    (3, B::Sampler(&r.atlas_sampler)),
+                    (5, B::TextureView(&r.atlases[1])),
+                ]);
+            }
             if vs == "vs" || vs == "vs_idx" {
                 g0.extend([(1, r.quads.as_entire_binding()), (9, offsets.as_entire_binding())]);
             }
@@ -383,7 +425,8 @@ fn camera_tilted(origin: [i32; 3], eye: Vec3, target: Vec3, up: Vec3, shade: [f3
         eye: [eye.x, eye.y, eye.z, 0.0],
         fog_color: [0.5, 0.6, 0.7, 1.0],
         fog: [8.0, 40.0, 12.0, 60.0],
-        fog_sky: [0.0; 4],
+        fog_sky: [0.0; 2],
+        atlas_texel: ATLAS_SIDES.map(texel_size),
         sky_color: [0.0; 4],
         sky_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
     }
@@ -397,6 +440,8 @@ fn resources(g: &Gpu, t: &rc_mesh::blocks::Tables, col: (i32, i32)) -> Res {
     let fade_gpu: Vec<u32> = (0..FADE_RING * FADE_RING).map(|i| bench_fade(i).1).collect();
     let mut slots = vec![[0i32; 2]; 8];
     slots[usize::from(SLOT)] = [col.0, col.1];
+    let lightmap_bytes: Vec<u8> =
+        (0..256u32).flat_map(|i| [(i % 16 * 16) as u8, (i / 16 * 16) as u8, (i * 7 % 256) as u8, 255]).collect();
     let lm = g.device.create_texture_with_data(
         &g.queue,
         &wgpu::TextureDescriptor {
@@ -410,16 +455,19 @@ fn resources(g: &Gpu, t: &rc_mesh::blocks::Tables, col: (i32, i32)) -> Res {
             view_formats: &[],
         },
         wgpu::util::TextureDataOrder::LayerMajor,
-        &(0..256u32)
-            .flat_map(|i| [(i % 16 * 16) as u8, (i / 16 * 16) as u8, (i * 7 % 256) as u8, 255])
-            .collect::<Vec<u8>>(),
+        &lightmap_bytes,
     );
+    let texture_count = t.models.texture_names.len().max(1) as u32;
     Res {
         quads: storage(g, bytemuck::cast_slice(&quads)),
         anim: storage(g, bytemuck::cast_slice(&frames)),
         fade: storage(g, bytemuck::cast_slice(&fade)),
         fade_gpu: storage(g, bytemuck::cast_slice(&fade_gpu)),
         lightmap: lm.create_view(&Default::default()),
+        lightmap_colors: storage(g, &lightmap_bytes),
+        atlases: [0, 1].map(|a| test_atlas(g, ATLAS_SIDES[a], ATLAS_LAYERS[a], a as u64)),
+        atlas_sampler: crate::video::atlas_sampler(&g.device, 4, 1),
+        atlas_anim: storage(g, bytemuck::cast_slice(&atlas_frames(texture_count))),
         sampler: g.device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
@@ -427,6 +475,45 @@ fn resources(g: &Gpu, t: &rc_mesh::blocks::Tables, col: (i32, i32)) -> Res {
         }),
         slots: storage(g, bytemuck::cast_slice(&slots)),
     }
+}
+
+/// Block texture array of side `side` and `layers` layers, filled with noise (fixed seed
+/// `seed`) at every mip level.
+fn test_atlas(g: &Gpu, side: u32, layers: u32, seed: u64) -> wgpu::TextureView {
+    let mut s = 0x2545_F491_4F6C_DD1D ^ seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut noise = move || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        (s >> 24) as u8
+    };
+    let chains: Vec<Vec<rc_assets::texture::Image>> = (0..layers)
+        .map(|_| {
+            (0..=side.ilog2())
+                .map(|level| {
+                    let w = side >> level;
+                    rc_assets::texture::Image { width: w, height: w, rgba: (0..w * w * 4).map(|_| noise()).collect() }
+                })
+                .collect()
+        })
+        .collect();
+    let list: Vec<&Vec<rc_assets::texture::Image>> = chains.iter().collect();
+    super::pipelines::block_texture_array(&g.device, &g.queue, "test block textures", side, &list).0
+}
+
+/// Animation of the texel proofs, per texture: a layer of the main array, or of the large one
+/// for one texture in four; one texture in three blended toward a next frame of the same array
+/// at 30 %, one in three at 60 %.
+fn atlas_frames(textures: u32) -> Vec<[u32; 2]> {
+    (0..textures)
+        .map(|i| {
+            let big = i % 4 == 0;
+            let (count, bit) = if big { (ATLAS_LAYERS[1], BIG_LAYER) } else { (ATLAS_LAYERS[0], 0) };
+            let layer = (i % count) | bit;
+            let next = ((i + 1) % count) | bit;
+            [layer | next << 16, i % 3 * 300]
+        })
+        .collect()
 }
 
 /// Translucents alone (water, glass) in format `f`, slot set. For the images without blending
@@ -690,10 +777,12 @@ fn format_bench() {
     }
 }
 
-/// Shader variants drawn by the proofs and the bench: old path, each
-/// switch alone, then the combinations.
+/// Shader variants whose vertex outputs are the old path's to the bit, drawn by the proofs and
+/// the bench: each switch alone, then the combinations. The lightmap buffer, whose blend
+/// arithmetic differs from the sampler's, has its own measured proof.
 fn shader_variants() -> Vec<(&'static str, ShaderOpts)> {
     let old = ShaderOpts::OLD;
+    let all = ShaderOpts { lightmap_buffer: false, ..ShaderOpts::NEW };
     vec![
         ("VSREAD", ShaderOpts { vsread: true, ..old }),
         ("QUADBITS", ShaderOpts { quadbits: true, ..old }),
@@ -701,9 +790,19 @@ fn shader_variants() -> Vec<(&'static str, ShaderOpts)> {
         ("FADEGPU", ShaderOpts { fadegpu: true, ..old }),
         ("FACEIDX", ShaderOpts { faceidx: true, ..old }),
         ("STRIP", ShaderOpts { strip: true, ..old }),
+        ("ATLASTEXELUNIFORM", ShaderOpts { atlas_texel_uniform: true, ..old }),
         ("targeted read (VSREAD + QUADBITS)", ShaderOpts { vsread: true, quadbits: true, ..old }),
-        ("all except FACEIDX (strip)", ShaderOpts { faceidx: false, ..ShaderOpts::NEW }),
-        ("all (default)", ShaderOpts::NEW),
+        ("all except FACEIDX (strip)", ShaderOpts { faceidx: false, ..all }),
+        ("all except LIGHTMAPBUFFER", all),
+    ]
+}
+
+/// Variants of the lightmap read: texture (old path), buffer alone, and with all the others.
+fn lightmap_variants() -> [(&'static str, ShaderOpts); 3] {
+    [
+        ("lightmap texture (old)", ShaderOpts::OLD),
+        ("LIGHTMAPBUFFER", ShaderOpts { lightmap_buffer: true, ..ShaderOpts::OLD }),
+        ("all with LIGHTMAPBUFFER", ShaderOpts { lightmap_buffer: true, ..ShaderOpts::NEW }),
     ]
 }
 
@@ -752,7 +851,7 @@ fn shader_variants_render_identically_on_gpu() {
     let Some(g) = gpu() else { return };
     let Some((preps, res, table, key, views)) = scene(&g) else { return };
     let old_mod = probe_module(&g.device, &crate::terrain_shader::terrain(ShaderOpts::OLD));
-    let old = Variant { module: &old_mod, opts: ShaderOpts::OLD, index: None };
+    let old = Variant::new(&old_mod, ShaderOpts::OLD);
     let variants: Vec<(&str, ShaderOpts, wgpu::ShaderModule)> = shader_variants()
         .into_iter()
         .map(|(n, o)| (n, o, probe_module(&g.device, &crate::terrain_shader::terrain(o))))
@@ -764,7 +863,7 @@ fn shader_variants_render_identically_on_gpu() {
             let base_last = render_v(&g, &res, &d, cam, key, true, &old);
             assert!(covered(&base) > 2000, "view '{name}' almost empty");
             for (vname, o, m) in &variants {
-                let v = Variant { module: m, opts: *o, index: None };
+                let v = Variant::new(m, *o);
                 let a = render_v(&g, &res, &d, cam, key, false, &v);
                 let diff = a.iter().zip(&base).filter(|(p, q)| p != q).count();
                 assert_eq!(diff, 0, "{f:?}, view '{name}', {vname}: {diff} values differ");
@@ -785,7 +884,7 @@ fn shader_variants_render_identically_on_gpu() {
         let src = crate::terrain_shader::terrain(o);
         assert!(src.contains(from), "{name}: pattern '{from}' absent");
         let m = probe_module(&g.device, &src.replace(from, to));
-        let s = render_v(&g, &res, &d, cam, key, false, &Variant { module: &m, opts: o, index: None });
+        let s = render_v(&g, &res, &d, cam, key, false, &Variant::new(&m, o));
         assert_ne!(s, base, "sabotage '{name}' not seen");
     };
     let only = |set: fn(&mut ShaderOpts)| {
@@ -812,7 +911,7 @@ fn shader_variants_render_identically_on_gpu() {
         face_indices(INDEXED_FACES).chunks(6).flat_map(|t| [t[0], t[1], t[2], t[0], t[5], t[2]]).collect();
     let idx = only(|o| o.faceidx = true);
     let m = probe_module(&g.device, &crate::terrain_shader::terrain(idx));
-    let s = render_v(&g, &res, &d, cam, key, false, &Variant { module: &m, opts: idx, index: Some(&bad) });
+    let s = render_v(&g, &res, &d, cam, key, false, &Variant { index: Some(&bad), ..Variant::new(&m, idx) });
     assert_ne!(s, base, "sabotage 'index 0, 3, 2' not seen");
 }
 
@@ -828,6 +927,7 @@ fn shader_variants_cost() {
     const REPS: u32 = 400;
     let mut all = vec![("old", ShaderOpts::OLD)];
     all.extend(shader_variants());
+    all.extend(lightmap_variants().into_iter().skip(1));
     let modules: Vec<wgpu::ShaderModule> =
         all.iter().map(|(_, o)| probe_module(&g.device, &crate::terrain_shader::terrain(*o))).collect();
     for (p, f) in &preps {
@@ -837,7 +937,7 @@ fn shader_variants_cost() {
             let mut best = vec![f64::MAX; all.len()];
             for _ in 0..7 {
                 for (i, ((_, o), m)) in all.iter().zip(&modules).enumerate() {
-                    let v = Variant { module: m, opts: *o, index: None };
+                    let v = Variant::new(m, *o);
                     let (_, ms) = render_timed(&g, &res, &d, cam, key, false, REPS, &v);
                     best[i] = best[i].min(ms);
                 }
@@ -849,6 +949,180 @@ fn shader_variants_cost() {
                     (best[i] / best[0] - 1.0) * 100.0
                 );
             }
+        }
+    }
+}
+
+/// The two halves of an image of [`render_timed`] (targets a and b) as pixels of 4 floats.
+fn targets(img: &[u32]) -> (&[[u32; 4]], &[[u32; 4]]) {
+    let (a, b) = img.split_at(img.len() / 2);
+    (a.as_chunks::<4>().0, b.as_chunks::<4>().0)
+}
+
+/// Pixels of a texel image (`fs_texel_probe`): covered, blended toward a next frame, of the
+/// large array.
+fn texel_coverage(img: &[u32]) -> (usize, usize, usize) {
+    let (_, b) = targets(img);
+    let covered: Vec<[f32; 4]> = b.iter().map(|p| p.map(f32::from_bits)).filter(|p| p[0] > -1e8).collect();
+    let blended = covered.iter().filter(|p| p[2] > 0.0).count();
+    let large = covered.iter().filter(|p| p[3] >= BIG_LAYER as f32).count();
+    (covered.len(), blended, large)
+}
+
+/// Camera `cam` with the RGSS filtering (`textureFiltering` = 1) on or off.
+fn with_rgss(cam: &CameraUniform, rgss: bool) -> CameraUniform {
+    let [x, y, z, _] = cam.origin;
+    CameraUniform { origin: [x, y, z, i32::from(rgss)], ..*cam }
+}
+
+/// Proof C2-M20 (a): texel size of the arrays read from the uniform and screen footprint shared
+/// by the two animation frames give the texture colour of the old path to the bit (size query
+/// and division per fragment), in the three views, with the RGSS filtering off and on, for faces
+/// of both arrays and faces blended toward a next frame. Sabotages seen: large array read with
+/// the main texel size, wrong texel size sent by the CPU, footprint computed from one derivative.
+#[test]
+fn atlas_texel_uniform_samples_identically_on_gpu() {
+    let Some(g) = gpu() else { return };
+    let Some((preps, res, table, key, views)) = scene(&g) else { return };
+    let module = |o: ShaderOpts| probe_module(&g.device, &crate::terrain_shader::terrain(o));
+    let old_opts = ShaderOpts::OLD;
+    let old_m = module(old_opts);
+    let variants = [
+        ("ATLASTEXELUNIFORM", ShaderOpts { atlas_texel_uniform: true, ..old_opts }),
+        ("all (default)", ShaderOpts::NEW),
+    ];
+    let modules = variants.map(|(n, o)| (n, o, module(o)));
+    let (p, f) = &preps[1];
+    let d = Draw { p, f: *f, offsets: &table };
+    for rgss in [false, true] {
+        for (name, cam) in views.iter().take(3) {
+            let cam = with_rgss(cam, rgss);
+            let base = render_v(&g, &res, &d, &cam, key, false, &Variant::texel(&old_m, old_opts));
+            let (covered, blended, large) = texel_coverage(&base);
+            eprintln!("view '{name}', RGSS {rgss}: {covered} pixels, {blended} blended, {large} of the large array");
+            assert!(covered > 2000 && blended > 100 && large > 100, "view '{name}': too few pixels of each kind");
+            for (vname, o, m) in &modules {
+                let a = render_v(&g, &res, &d, &cam, key, false, &Variant::texel(m, *o));
+                let diff = a.iter().zip(&base).filter(|(p, q)| p != q).count();
+                assert_eq!(diff, 0, "view '{name}', RGSS {rgss}, {vname}: {diff} values differ");
+            }
+        }
+    }
+
+    // Sabotages, view from above with RGSS (every term of the filter in use).
+    let cam = with_rgss(&views[0].1, true);
+    let new = ShaderOpts { atlas_texel_uniform: true, ..old_opts };
+    let base = render_v(&g, &res, &d, &cam, key, false, &Variant::texel(&old_m, old_opts));
+    let src = crate::terrain_shader::terrain(new);
+    for (name, from, to) in [
+        ("large array with the main texel size", "cam.atlas_texel.y", "cam.atlas_texel.x"),
+        ("footprint from dx alone", "sqrt(dx * dx + dy * dy)", "sqrt(dx * dx + dx * dx)"),
+    ] {
+        assert!(src.contains(from), "{name}: pattern '{from}' absent");
+        let m = probe_module(&g.device, &src.replace(from, to));
+        let s = render_v(&g, &res, &d, &cam, key, false, &Variant::texel(&m, new));
+        assert_ne!(s, base, "sabotage '{name}' not seen");
+    }
+    let new_m = module(new);
+    let wrong = CameraUniform { atlas_texel: [texel_size(16), texel_size(16)], ..cam };
+    let s = render_v(&g, &res, &d, &wrong, key, false, &Variant::texel(&new_m, new));
+    assert_ne!(s, base, "sabotage 'wrong texel size from the CPU' not seen");
+}
+
+/// Proof C2-M20 (b): the lightmap read from a buffer with the bilinear filter done by hand against
+/// the texture sample, on the vertex outputs of the three views (both quad formats): fog,
+/// uv, fade and layer equal to the bit; the tint (vertex colour × lightmap) within
+/// `LIGHTMAP_BOUND`, the measured difference printed. Sabotages seen: block and sky levels swapped,
+/// vertical blend weight taken from the block level.
+#[test]
+fn lightmap_buffer_matches_the_sampler_on_gpu() {
+    /// Largest difference of a tint component accepted: a quarter of an 8-bit step of the
+    /// output, which the final rounding absorbs.
+    const LIGHTMAP_BOUND: f32 = 0.25 / 255.0;
+    let Some(g) = gpu() else { return };
+    let Some((preps, res, table, key, views)) = scene(&g) else { return };
+    let module = |o: ShaderOpts| probe_module(&g.device, &crate::terrain_shader::terrain(o));
+    let [(_, old_opts), variants @ ..] = lightmap_variants();
+    let old_m = module(old_opts);
+    let modules = variants.map(|(n, o)| (n, o, module(o)));
+    // Tint difference of `a` against `b`: values that differ, largest gap; panics when anything
+    // other than the tint differs.
+    let tint_gap = |a: &[u32], b: &[u32], what: &str| -> (usize, f32) {
+        let ((a_tint, a_rest), (b_tint, b_rest)) = (targets(a), targets(b));
+        assert!(a_rest == b_rest, "{what}: uv, fade or layer differ");
+        let (mut differ, mut gap) = (0, 0f32);
+        for (p, q) in a_tint.iter().zip(b_tint) {
+            assert_eq!(p[3], q[3], "{what}: fog distance differs");
+            for c in 0..3 {
+                let d = (f32::from_bits(p[c]) - f32::from_bits(q[c])).abs();
+                differ += usize::from(d > 0.0);
+                gap = gap.max(d);
+            }
+        }
+        (differ, gap)
+    };
+    for (p, f) in &preps {
+        let d = Draw { p, f: *f, offsets: &table };
+        for (name, cam) in views.iter().take(3) {
+            let base = render_v(&g, &res, &d, cam, key, false, &Variant::new(&old_m, old_opts));
+            for (vname, o, m) in &modules {
+                let a = render_v(&g, &res, &d, cam, key, false, &Variant::new(m, *o));
+                let what = format!("{f:?}, view '{name}', {vname}");
+                let (differ, gap) = tint_gap(&a, &base, &what);
+                eprintln!("{what}: {differ} tint values differ, largest gap {:.3} / 255", gap * 255.0);
+                assert!(gap <= LIGHTMAP_BOUND, "{what}: tint gap {gap} above {LIGHTMAP_BOUND}");
+            }
+        }
+    }
+
+    let (p, f) = &preps[1];
+    let d = Draw { p, f: *f, offsets: &table };
+    let cam = &views[0].1;
+    let new = variants[0].1;
+    let base = render_v(&g, &res, &d, cam, key, false, &Variant::new(&old_m, old_opts));
+    for (name, from, to) in [
+        ("levels swapped", "lightmap_colors[sky * 16u + block]", "lightmap_colors[block * 16u + sky]"),
+        ("vertical weight from the block level", "mix(below, above, f.y)", "mix(below, above, f.x)"),
+    ] {
+        let src = crate::terrain_shader::terrain(new);
+        assert!(src.contains(from), "{name}: pattern '{from}' absent");
+        let m = probe_module(&g.device, &src.replace(from, to));
+        let s = render_v(&g, &res, &d, cam, key, false, &Variant::new(&m, new));
+        let (_, gap) = tint_gap(&s, &base, name);
+        assert!(gap > LIGHTMAP_BOUND, "sabotage '{name}' not seen (gap {gap})");
+    }
+}
+
+/// GPU micro-bench of the texture sampling of the fragments: the rich column drawn `REPS` times
+/// per frame with the texel probe, best of 7 alternating rounds, RGSS off and on, view from
+/// above (fragment work dominates):
+/// `cargo test --release -p rc-app --bin rustcraft texel_sampling_cost -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn texel_sampling_cost() {
+    let Some(g) = gpu() else { return };
+    let Some((preps, res, table, key, views)) = scene(&g) else { return };
+    const REPS: u32 = 200;
+    let all =
+        [("old", ShaderOpts::OLD), ("ATLASTEXELUNIFORM", ShaderOpts { atlas_texel_uniform: true, ..ShaderOpts::OLD })];
+    let modules = all.map(|(_, o)| probe_module(&g.device, &crate::terrain_shader::terrain(o)));
+    let (p, f) = &preps[1];
+    let d = Draw { p, f: *f, offsets: &table };
+    for rgss in [false, true] {
+        let cam = with_rgss(&views[0].1, rgss);
+        let mut best = [f64::MAX; 2];
+        for _ in 0..7 {
+            for (i, ((_, o), m)) in all.iter().zip(&modules).enumerate() {
+                let (_, ms) = render_timed(&g, &res, &d, &cam, key, false, REPS, &Variant::texel(m, *o));
+                best[i] = best[i].min(ms);
+            }
+        }
+        for (i, (vname, _)) in all.iter().enumerate() {
+            eprintln!(
+                "  RGSS {rgss:5}, {vname:20}: {:7.2} ms ({:+.1}%) (loaded machine)",
+                best[i],
+                (best[i] / best[0] - 1.0) * 100.0
+            );
         }
     }
 }

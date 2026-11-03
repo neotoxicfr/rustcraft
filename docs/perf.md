@@ -4952,3 +4952,19 @@ the social screen during an online connection (frame p99 while the block list is
 - Not done here: the server-side identifier chains (`input.rs`, `life.rs`, `solo_packets.rs`,
   `lan/mod.rs`), mission "Table id -> handler"; the other `all_ents()` searches by UUID or kind
   in `rc-sim` (`commands/ents.rs`, `select.rs`), where the sort order can matter.
+## C2-M20: terrain shader, atlas texel size in the uniform, shared footprint, lightmap buffer (03/11, loaded machine)
+
+Two `terrain.wgsl` variants (`terrain_shader.rs`, `//#if` blocks, read once at startup, `=0`:
+old path), GPU RTX 5080 Vulkan, micro-benches on a loaded machine (other agents compiling).
+
+| Lead | Variant | Result (loaded machine) | Decision |
+|---|---|---|---|
+| Texel size in the uniform (`RUSTCRAFT_OPT_ATLASTEXELUNIFORM`) | 1 / side of the two square block arrays computed once on the CPU and carried in the free half of `fog_sky` (camera slot stays 256 B; the other shaders declare that slot as a `vec4` they never read past `.x`); the screen footprint `sqrt(dx² + dy²)` computed once per fragment and shared by the two frames of an animated texture | fragments: 2 texture size queries → 0 and 6 divisions → 4 written in the code each terrain fragment entry reaches (naga count, `atlas_texel_uniform_removes_size_queries_and_divisions`; per blended fragment the old path runs them twice). Texture colour identical to the bit (`atlas_texel_uniform_samples_identically_on_gpu`: 3 views, RGSS off and on, 95-142 k pixels each, 55-142 k blended toward a next frame, 35-82 k of the large array; 3 sabotages seen; a CPU texel size halved makes 367,330 values differ). `texel_sampling_cost` (200 draws, best of 7): 5.54 → 5.54 ms (RGSS off), 5.59 → 5.57 ms (RGSS on); this bench writes two Rgba32Float targets with max blending and is bound by that write, not by the shader | kept at 1 (exact, fewer instructions); fragment ms to measure on the scenes (plains32, forest, ocean, `RUSTCRAFT_GPUPASSES=1`, `RUSTCRAFT_GPUPROBE=fs`), and on an integrated GPU where the size query is a sampler message |
+| Lightmap from a buffer (`RUSTCRAFT_OPT_LIGHTMAPBUFFER`) | the 256 lightmap colours also written to a storage buffer (1 KiB per lightmap change, 20 per second, only under the switch), bilinear filter by hand in the vertices: 4 loads, 3 `mix` instead of one texture sample. The weights (multiples of 1/16) are exact in any sampler; only the blend arithmetic differs | tint (vertex colour × lightmap) within 0.002 / 255 of the sampler's (41-116 k of the values differ in the low bits; bound of the test 0.25 / 255, a quarter of an output step); fog, uv, fade, layer identical to the bit (`lightmap_buffer_matches_the_sampler_on_gpu`, both quad formats, 3 views; 2 sabotages seen, a coordinate /17 instead of /16 gives a gap of 79 / 255). `shader_variants_cost`: out of view 2.53 → 2.52 ms and 2.28 → 2.29 ms, from above 10.94 → 10.87 and 10.78 → 10.89 ms: noise (±1 %) | kept at 1 (default = new, no loss measured); ninth storage buffer of the terrain vertices, so switched off by `ShaderOpts::within_limits` on a GPU limited to 8 per stage (the camera layout then keeps its old bindings); decision at the scene bench: if the vertex ms do not drop, set it to 0 |
+
+- Not done: the 1600 × 900 screenshots of one launch with each switch (no client may run during
+  this series); the scene bench (quiet machine).
+- Same pattern elsewhere, outside this mission's files: `entity.wgsl`, `entity_oit.wgsl` and
+  `gui.wgsl` query `textureDimensions` per vertex or fragment on sheets that grow at run time
+  (a uniform would need rewriting on growth); `block_text`, `leash`, `entity`, `nametag` sample
+  the lightmap per vertex like the terrain (same buffer if the scene bench keeps it).
