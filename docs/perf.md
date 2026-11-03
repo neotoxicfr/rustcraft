@@ -4344,15 +4344,32 @@ profile, machine loaded by other agents compiling, best of 5 or 7; three runs, t
   saturated truncation): 14.8 ms in range against 6.7 with the branch (15.3 against 32.4 with 28%
   of the values beyond ±2³¹, which no caller reaches): branch kept.
 - Switch out of the call path (`noise_opt noise_micro_bench`, 10⁷ in ±3·10⁷): the generator's
-  scattered floors (2-D simplex, aquifer, surface rules, cell tops) read `RUSTCRAFT_OPT_FLOOR_JAVA`
-  at every call: 8.44 ms against 6.67 for the shared floor called directly (library 15.9). They now
-  call it directly; the switch still restores the library call in the noise kernel (read once per
-  volume through `Paths`) and in the collision walk (once per walk). The `floor`, `ceil` and
-  `truncate` density functions (evaluated per cell) use the shared floor and ceiling. Collision walk (`collide::scan`, shared by `resolve`, `support_of` and the free-space
+  scattered floors (2-D simplex, aquifer, surface rules, cell tops, clay bands, scattered ores)
+  read `RUSTCRAFT_OPT_FLOOR_JAVA` at every call: 8.44 ms against 6.67 for the shared floor called
+  directly (library 15.9). The switch is now read once by the hot caller and kept: per volume in
+  the noise kernel (`Paths`), per evaluation context (`sampler::Opts`: aquifer, surface rules, cell
+  tops, clay bands, the `floor`, `ceil`, `round` and `truncate` density functions), per simplex
+  noise (at construction), per scattered ore. `=0` restores every old library call until the
+  quiet-machine bench. `math::floor_switch_paths_agree` proves both paths give the same bits
+  (one float in 997, halves, limits; it fails if the old path truncates or rounds like Rust);
+  `sampler_opt` runs the `floor_java` variant alone on the real generator, but its surface levels
+  and cell tops are positive there, so it cannot see a negative-value difference on its own.
+- Collision walk (`collide::scan`, shared by `resolve`, `support_of` and the free-space
   tests): its six floors use the shared one (`RUSTCRAFT_OPT_FLOOR_JAVA=0` restores the library call);
   hot map v3: floor under 3% of `collect_in` (below its fourth callee), well under the scene bench's
   noise. Not done: the hot rc-sim functions of the mission (`mob_move`, `tick_living`, `ai_step`),
   after the server missions on those files; the other ~1,900 library roundings, none hot in the map.
+- Fidelity fix (commands): the duration argument and the server's tick count rounded with Rust's
+  `round` (halves away from zero) where the game rounds halves up: `/time add -0.5` (or `-0.5t`)
+  was refused with "-1" below the minimum 0, the game accepts it (0 ticks); a refused `-1.5`
+  reported -2 instead of -1. Both now use the shared rounding. Daylight detector: its rounding
+  too (negative results are clamped to 0, nothing changes there), and its cosine came from the C
+  library (single precision) where the game reads its sine table: on 3·10⁶ (sky level, angle)
+  pairs, 369 signals change by one (`daylight_power_reads_the_sine_table`). The 42 other
+  `.round() as <integer>` outside tests and the float `.round()` calls were reviewed: positive
+  inputs only (statistics in cm and tenths of a heart, delays, costs, velocity packing, UI sizes),
+  where Rust's rounding equals the game's, or not the game's
+  rounding (font outlines in 26.6 fixed point, our own sine reduction, tests).
 - To measure on the quiet machine: `title` (startup), `ocean` (fluids), `generation` (carver,
   decorations, noise floors), `crowd-1000`, `tnt`, `dropped-items` (collision walks); memstats at
   world opening (−1 MB of heap expected).
