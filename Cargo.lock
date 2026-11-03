@@ -2369,6 +2369,7 @@ dependencies = [
  "flate2",
  "libdeflater",
  "rayon",
+ "rc-data",
  "rc-proto",
  "thiserror 2.0.21",
 ]

@@ -9,6 +9,7 @@ description = "Transport: frame delimiting, compression, encryption"
 
 [dependencies]
 rc-proto.workspace = true
+rc-data.workspace = true
 thiserror.workspace = true
 aes.workspace = true
 libdeflater.workspace = true

@@ -16,6 +16,8 @@ development history before the first public release, which is not published.
 | CFB8 decryption, ≥ 128 KiB | 133 µs (128 KiB) | 26 µs | ×5 | 4 KiB pieces on the pool; 1 MiB ×8, 16 MiB ×11 (10.7 GiB/s) |
 | Frame decoding (decryption + decompression) | 286 MiB/s | 1.42 GiB/s | ×5 | libdeflate (known size) + AES batches |
 | Frame encoding | 102 MiB/s | 180 MiB/s | ×1.8 | libdeflate |
+| CFB8 encryption, 1 core (C5-M39, loaded machine) | 49.7 MiB/s | 56.2 MiB/s | +13 % | register kept in an SSE2 vector register (one 16-byte write of the AES input); `RUSTCRAFT_OPT_CFB8_VECTOR_REGISTER=0` restores the old path |
+| Frame of a packet below the compression threshold (C5-M39, loaded machine) | 4,149 MiB/s | 6,432 MiB/s | +55 % | written straight into the output instead of through `scratch`; `RUSTCRAFT_OPT_FRAME_COMPRESS_IN_PLACE=0` restores the old path |
 | Decoding of `data.bin` | 15.0 ms | 1.16 ms | ×13 | error messages built lazily |
 | Decoding of `data.bin` | 1.10 ms | 0.59 ms | ×1.9 | 4 sections in parallel + states in batches of 4,096 |
 | Preparation at 1st launch | 18.1 s | 4.6 s | ×3.9 | client jar installed (no download), generator and extractor simultaneous |
@@ -2166,6 +2168,7 @@ Same pattern left elsewhere: the generator recounts its whole map after every ba
 | CFB8 decryption | 16 KiB pieces | ×2 at 256 KiB against ×6.6 with 4 KiB | worse distribution |
 | Decoding of `data.bin` | states collected one by one in parallel | 1.77 ms against 0.86 ms on 1 thread | element-by-element collection too expensive; replaced by batches |
 | CFB8 encryption (sending) | any parallelization | impossible | each byte depends on the previous encrypted one; ceiling 67 MiB/s |
+| CFB8 encryption (sending, C5-M39, loaded machine) | sliding register view over a 16 + 256-byte window | 47.6 against 49.7 MiB/s (1 MiB, 1 core) | the 1-byte write then 16-byte read still cannot be forwarded; off behind `RUSTCRAFT_OPT_CFB8_SLIDING_WINDOW=1` until the quiet-machine scenes |
 | Textured meshing | 18³ grid of the fluid type to skip water surrounded by water | 0.598 s against 0.591 s | the grid costs what it saves; the ≈ 190 ms of the fluids are in the visible surfaces |
 | Section face communication | GPU (compute shader, label propagation, one group per section; RTX 5080) | 6.2 ms with mask upload, 1.8 ms resident data, against 1.9 ms CPU all cores (dilation) | the upload dominates and the CPU matches; to take up again if the sections live on the GPU (GPU meshing); result identical to the CPU on the 13,768 sections |
 | CPU per frame after the fidelity fixes (translucent sorting with water, 32 textures, game depth) | A/B 74ec2cb against 35aa698, 3 passes | 0.56–0.59 → 0.62–0.63 ms | cost spread out, each cause within noise (±0.03 ms): translucent series, re-sorts cut, 16 textures tested one by one without a clear difference; kept because necessary for fidelity; translucent column list cached and series buffer reused (no measurable gain) |
@@ -3973,3 +3976,33 @@ Decision: all at 1 by default until the quiet-machine generation scene bench.
 Still to do outside `jmath.rs`: the separate `sin(a)`, `cos(a)` pairs of `chunkgen.rs` (spawn search),
 `structure.rs` and `tree.rs` can call `jmath::sincos` (one reduction, interleaved series: 217
 against 360 ms per 10⁶).
+## C5-M39: CFB8 encryption register, frames compressed in place, shareable frame (03/11, loaded machine)
+
+Micro-benches (ignored tests, variants alternated inside each trial, minimum kept):
+`cargo test --release -p rc-net cfb8_encrypt_bench -- --ignored --nocapture` and
+`frame_encode_bench`. Scenes to measure on a quiet machine: `lan-4-spread`, `lan-2`
+(CPU of the LAN writer threads), and the client on the official server online.
+
+- Encryption (sending), 1 core, MiB/s for 16 B / 300 B / 8 KiB / 1 MiB packets: register shifted in
+  memory (old) 49.3 / 49.7 / 49.0 / 49.7; register kept in an SSE2 vector register 55.7 / 56.7 /
+  56.0 / 56.2 (+13 %, ADOPTED, `RUSTCRAFT_OPT_CFB8_VECTOR_REGISTER=0` for the old path); sliding
+  view over a 16 + 256-byte window 46.8 / 48.0 / 47.6 / 47.6 (−3 to −5 %, kept OFF behind
+  `RUSTCRAFT_OPT_CFB8_SLIDING_WINDOW=1`); bench-only `u128` register 50.9-51.6 (+3 %) and register
+  rebuilt as an array 41.6-42.5 (−15 %). Cause: every in-memory path builds the AES input from
+  several small writes then reads 16 bytes, which the processor cannot forward, on every byte of a
+  chain that is sequential anyway; the vector register writes it with one 16-byte store. All
+  cores (one 1 MiB stream per thread, i.e. one writer thread per LAN guest), total MiB/s, old ->
+  vector: 1 t 47.4 -> 53.1, 2 t 94.5 -> 107.4, 4 t 186 -> 211, 8 t 368 -> 416, 16 t 679 -> 735,
+  32 t 732 -> 840. GPU not applicable (byte-sequential chain of a few KB per tick). SSE2 is part of
+  the x86-64 baseline: no runtime detection needed; other architectures keep the old path.
+- Frame (unencrypted part), MiB/s of packet bytes, through `scratch` (old) -> written straight
+  into the output (`RUSTCRAFT_OPT_FRAME_COMPRESS_IN_PLACE=0` for the old path): 40 B below the
+  threshold 4,149 -> 6,432 (+55 %; 4,055 -> 6,381 on a second run); 2 KiB compressed 307 -> 307;
+  40 KiB chunk-like 798 -> 799 (libdeflate dominates; a compressed content under 16 KiB still moves
+  back by one byte for its 2-byte prefix). RAM: the encoder no longer keeps a scratch buffer as
+  large as the largest packet ever sent (up to 8 MiB per connection) on the default path.
+- `FrameEncoder::frame_compressed` (unencrypted frame, depends only on the threshold) and
+  `FrameEncoder::encrypt` (per connection): base for compressing a LAN packet once for every guest
+  (C5-M41/M42). No gain by itself.
+- Not done: interleaving several AES streams on one core, gated on lan-4 showing encryption as
+  the bottleneck of the writer threads (to measure first on the quiet machine).
