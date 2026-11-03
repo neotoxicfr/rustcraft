@@ -993,6 +993,8 @@ impl Program {
             S::ShiftB { noise } => {
                 let tv = Volume::stepped(v.sz, v.sx, 1, v.z0, v.x0, 0, v.stz, v.stx, 1);
                 let mut tb = ctx.take(tv.size());
+                // The noise adds to the buffer: it must start from zero, whatever the buffer held.
+                tb.fill(0.0);
                 self.noises[*noise as usize].add_to_volume(&mut tb, &tv, 0.25, 0.25, 4.0);
                 for iz in 0..v.sz {
                     for ix in 0..v.sx {
