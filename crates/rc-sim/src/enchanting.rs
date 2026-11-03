@@ -260,7 +260,7 @@ impl Enchants {
         let Some(ench_value) = enchantable(items, s) else { return results };
         let mut cost = cost + 1 + rng.next_int_bound(ench_value / 4 + 1) + rng.next_int_bound(ench_value / 4 + 1);
         let span = (rng.next_float() + rng.next_float() - 1.0) * 0.15;
-        cost = java_round(cost as f32 + cost as f32 * span).max(1);
+        cost = rc_data::java_math::round_f32_to_i32(cost as f32 + cost as f32 * span).max(1);
         let mut cands = self.available(items, cost, &s.id, source);
         if cands.is_empty() {
             return results;
@@ -296,11 +296,6 @@ impl Enchants {
         }
         s
     }
-}
-
-/// Game rounding on a float (rounds towards +∞ at 0.5).
-pub fn java_round(v: f32) -> i32 {
-    (v + 0.5).floor() as i32
 }
 
 /// `enchantable` value of the item.

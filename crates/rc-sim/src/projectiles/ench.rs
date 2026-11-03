@@ -68,12 +68,6 @@ pub fn level_value(v: &Value, lvl: i32) -> f32 {
     }
 }
 
-/// Java rounding of a double to the nearest integer, halves towards +∞ (exact near 0.5).
-pub fn java_round_f64(x: f64) -> i64 {
-    let f = x.floor();
-    (if x - f >= 0.5 { f + 1.0 } else { f }) as i64
-}
-
 /// `n` minus the successes of `n` trials of chance `p`. Beyond 128 trials with at least 20
 /// expected successes and failures, the game draws a normal approximation (one Gaussian draw,
 /// rounded, clamped to `[0, n]`); otherwise one draw per trial (`y < n` compared in float).
@@ -85,7 +79,7 @@ pub fn remove_binomial(p: f32, n: f32, rng: &mut dyn crate::randsrc::Rand) -> f3
     let drop = if not_le(n, 128.0) && not_lt(n * p, 20.0) && not_lt(n * (1.0 - p), 20.0) {
         let miu = f64::from(n * p).floor();
         let sigma = f64::from(n * p * (1.0 - p)).sqrt();
-        let d = java_round_f64(miu + rng.next_gaussian() * sigma) as i32;
+        let d = rc_data::java_math::round_to_i64(miu + rng.next_gaussian() * sigma) as i32;
         d.clamp(0, n as i32)
     } else {
         let mut d = 0;

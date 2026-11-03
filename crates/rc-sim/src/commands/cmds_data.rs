@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use rc_client::Event;
+use rc_data::java_math::{floor_to_i32, floor_to_i64};
 use rc_proto::nbt::Nbt;
 use rc_text::Component;
 
@@ -161,11 +162,6 @@ fn array_elem(v: &Nbt, i: usize) -> Nbt {
     }
 }
 
-/// Floor of a real to a 32-bit integer (saturated, NaN = 0).
-fn floor_i32(x: f64) -> i32 {
-    x.floor() as i32
-}
-
 /// Numeric conversions of tags: byte and short = integer truncated to their width (reals:
 /// from the floor); int = saturated floor; long = truncation of a single-precision float, floor
 /// of a double (asymmetry of the game reproduced).
@@ -175,8 +171,8 @@ fn byte_value(t: &Nbt) -> Option<i8> {
         Nbt::Short(v) => v as i8,
         Nbt::Int(v) => v as i8,
         Nbt::Long(v) => v as i8,
-        Nbt::Float(f) => floor_i32(f64::from(f)) as i8,
-        Nbt::Double(d) => floor_i32(d) as i8,
+        Nbt::Float(f) => floor_to_i32(f64::from(f)) as i8,
+        Nbt::Double(d) => floor_to_i32(d) as i8,
         _ => return None,
     })
 }
@@ -187,8 +183,8 @@ fn int_value(t: &Nbt) -> Option<i32> {
         Nbt::Short(v) => i32::from(v),
         Nbt::Int(v) => v,
         Nbt::Long(v) => v as i32,
-        Nbt::Float(f) => floor_i32(f64::from(f)),
-        Nbt::Double(d) => floor_i32(d),
+        Nbt::Float(f) => floor_to_i32(f64::from(f)),
+        Nbt::Double(d) => floor_to_i32(d),
         _ => return None,
     })
 }
@@ -196,7 +192,7 @@ fn int_value(t: &Nbt) -> Option<i32> {
 fn long_value(t: &Nbt) -> Option<i64> {
     Some(match *t {
         Nbt::Float(f) => f as i64,
-        Nbt::Double(d) => d.floor() as i64,
+        Nbt::Double(d) => floor_to_i64(d),
         _ => t.as_i64()?,
     })
 }
@@ -1033,7 +1029,7 @@ impl Server {
                 if let Some(sc) = p.arg(seg, "scale") {
                     let scale: f64 = sc.parse().unwrap_or(1.0);
                     let Some(x) = as_f64(v) else { return Err(Fail(tr!("commands.data.get.invalid", path))) };
-                    let r = (x * scale).floor() as i32;
+                    let r = floor_to_i32(x * scale);
                     let sc2 = format!("{scale:.2}");
                     let msg = match &acc {
                         Acc::Block(b) => tr!("commands.data.block.get", path.clone(), b[0], b[1], b[2], sc2, r),
@@ -1050,7 +1046,7 @@ impl Server {
                     Nbt::ByteArray(a) => a.len() as i32,
                     Nbt::IntArray(a) => a.len() as i32,
                     Nbt::LongArray(a) => a.len() as i32,
-                    n => as_f64(n).unwrap_or(0.0).floor() as i32,
+                    n => floor_to_i32(as_f64(n).unwrap_or(0.0)),
                 };
                 let msg = self.acc_print(&acc, v);
                 self.ok(s, msg);

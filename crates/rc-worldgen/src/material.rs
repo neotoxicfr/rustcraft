@@ -11,7 +11,6 @@ use crate::biome::{BiomeSource, ChunkBiomes, Searcher, zoom_cached};
 use crate::data::{DataPack, full_id};
 use crate::density::Axis;
 use crate::json::Json;
-use crate::math::{floor_f, round_half_up};
 use crate::noise::Simplex;
 use crate::palette::{AIR, BlockId, BlockTable};
 use crate::proto::ProtoTerrain;
@@ -19,6 +18,7 @@ use crate::rng::{Positional, Rng};
 use crate::sampler::{Ctx, Program, S, Sid};
 use crate::volume::Volume;
 use crate::{Error, Generator};
+use rc_data::java_math::{floor_f32_to_i32, round_f32_to_i32};
 
 pub type RuleId = u32;
 pub type CondId = u32;
@@ -1465,7 +1465,7 @@ impl MaterialSystem {
         if let Some(v) = st.min_surface {
             return v;
         }
-        let v = floor_f(self.preliminary_level(env, st, st.x, st.z)) + st.sd - 8;
+        let v = floor_f32_to_i32(self.preliminary_level(env, st, st.x, st.z)) + st.sd - 8;
         st.min_surface = Some(v);
         v
     }
@@ -1492,7 +1492,7 @@ impl MaterialSystem {
         for (i, c) in out.iter_mut().enumerate() {
             let (x, z) = (chunk.min_x() + (i & 15) as i32, chunk.min_z() + (i >> 4) as i32);
             c.depth = self.surface_depth(env.g, x, z);
-            c.min_surface = floor_f(self.preliminary_level(env, st, x, z)) + c.depth - 8;
+            c.min_surface = floor_f32_to_i32(self.preliminary_level(env, st, x, z)) + c.depth - 8;
         }
         out
     }
@@ -1632,16 +1632,16 @@ impl MaterialSystem {
     }
 
     fn band(&self, g: &Generator, x: i32, y: i32, z: i32) -> BlockId {
-        let o = round_half_up(self.noise(g, self.clay_offset, f64::from(x), 0.0, f64::from(z)) * 4.0);
+        let o = round_f32_to_i32(self.noise(g, self.clay_offset, f64::from(x), 0.0, f64::from(z)) * 4.0);
         self.bands[((y + o + 192) % 192) as usize]
     }
 
     /// [`MaterialSystem::band`] with the column offset kept (`MAT_COLCACHE`).
     fn band_cached(&self, g: &Generator, st: &mut MatState) -> BlockId {
         let (x, z) = (st.x, st.z);
-        let o = *st
-            .band_off
-            .get_or_insert_with(|| round_half_up(self.noise(g, self.clay_offset, f64::from(x), 0.0, f64::from(z)) * 4.0));
+        let o = *st.band_off.get_or_insert_with(|| {
+            round_f32_to_i32(self.noise(g, self.clay_offset, f64::from(x), 0.0, f64::from(z)) * 4.0)
+        });
         self.bands[((st.y + o + 192) % 192) as usize]
     }
 

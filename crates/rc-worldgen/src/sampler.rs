@@ -2,9 +2,10 @@
 //! path, as the game uses them (they are not always bit-for-bit equal).
 
 use crate::density::{Axis, Metric, RoundKind, Unary, round_to_integer, squeeze};
-use crate::math::{clamp, floor_div, floor_f, floor_mod, jmax, jmin, lerp, lerp3, signum};
+use crate::math::{clamp, floor_div, floor_mod, jmax, jmin, lerp, lerp3, signum};
 use crate::noise::{NoiseStack, Simplex};
 use crate::volume::Volume;
+use rc_data::java_math::floor_f32_to_i32;
 
 /// Index of a sampler in the generator's table.
 pub type Sid = u32;
@@ -854,7 +855,7 @@ impl Program {
 
     #[allow(clippy::too_many_arguments)]
     fn find_top(&self, density: Sid, lower: i32, cell: i32, ctx: &mut Ctx, x: i32, z: i32, upper: f32) -> f32 {
-        let top = floor_f(upper / cell as f32).wrapping_mul(cell);
+        let top = floor_f32_to_i32(upper / cell as f32).wrapping_mul(cell);
         if top <= lower {
             return lower as f32;
         }

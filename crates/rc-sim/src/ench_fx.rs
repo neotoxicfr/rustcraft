@@ -123,11 +123,6 @@ pub(crate) fn sample(v: &Value, rng: &mut dyn Rand) -> f32 {
     }
 }
 
-/// Java rounding of a float to the nearest integer, halves upwards.
-fn round_f32(x: f32) -> i32 {
-    crate::projectiles::ench::java_round_f64(f64::from(x)) as i32
-}
-
 impl Server {
     /// Requirements of an effect: the loot conditions, `random_chance` drawn on `rng` with a chance
     /// by enchantment level `lvl`.
@@ -491,8 +486,8 @@ impl Server {
         let (d0, d1, a0, a1) = (lv("min_duration"), lv("max_duration"), lv("min_amplifier"), lv("max_amplifier"));
         let draw = |r: &mut dyn Rand| {
             let id = ids[r.next_int_bound(ids.len() as i32) as usize].clone();
-            let ticks = round_f32((r.next_float() * (d1 - d0) + d0) * 20.0);
-            let amp = round_f32(r.next_float() * (a1 - a0) + a0).max(0);
+            let ticks = rc_data::java_math::round_f32_to_i32((r.next_float() * (d1 - d0) + d0) * 20.0);
+            let amp = rc_data::java_math::round_f32_to_i32(r.next_float() * (a1 - a0) + a0).max(0);
             (id, ticks, amp)
         };
         match hit.split(target).0 {
