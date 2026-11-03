@@ -87,6 +87,9 @@ pub(crate) struct Opt {
     /// `AUDIO_LOADER_THREADS`: decoding threads sized from the machine ([`loader_threads`]);
     /// 0: two threads, as before.
     pub loader_threads: bool,
+    /// `MIXER_STEREO_OUT`: on a stereo `f32` device, the mixer writes straight into the device
+    /// buffer, clipped in place ([`write_out_stereo_f32`]); 0: through the scratch buffer.
+    pub stereo_out: bool,
 }
 
 /// Minimum time between two per-frame polls (`AUDIO_PUMP_RATE_LIMIT`).
@@ -112,6 +115,7 @@ impl Opt {
             sorted_listing: crate::switch("SOUND_TABLE_SORTED_LISTING", false),
             preload_variants: crate::switch("AUDIO_PRELOAD_VARIANTS", true),
             loader_threads: crate::switch("AUDIO_LOADER_THREADS", true),
+            stereo_out: crate::switch("MIXER_STEREO_OUT", true),
         })
     }
 
@@ -134,6 +138,7 @@ impl Opt {
         sorted_listing: false,
         preload_variants: false,
         loader_threads: false,
+        stereo_out: false,
     };
     #[cfg(test)]
     pub(crate) const NEW: Opt = Opt {
@@ -153,6 +158,7 @@ impl Opt {
         sorted_listing: true,
         preload_variants: true,
         loader_threads: true,
+        stereo_out: true,
     };
 }
 
@@ -1780,22 +1786,24 @@ fn open_output(
         eprintln!("[audio] stream error: {e}");
     };
     macro_rules! build {
-        ($t:ty) => {
+        ($t:ty, $write:ident) => {
             device.build_output_stream::<$t, _, _>(
                 config,
                 move |out: &mut [$t], _: &cpal::OutputCallbackInfo| {
-                    write_out(&mut mixer, &mut scratch, out, channels);
+                    $write(&mut mixer, &mut scratch, out, channels);
                 },
                 err,
                 None,
             )
         };
     }
+    let stereo_out = Opt::get().stereo_out && channels == 2;
     let stream = match format {
-        cpal::SampleFormat::F32 => build!(f32),
-        cpal::SampleFormat::I16 => build!(i16),
-        cpal::SampleFormat::U16 => build!(u16),
-        cpal::SampleFormat::I32 => build!(i32),
+        cpal::SampleFormat::F32 if stereo_out => build!(f32, write_out_stereo_f32),
+        cpal::SampleFormat::F32 => build!(f32, write_out),
+        cpal::SampleFormat::I16 => build!(i16, write_out),
+        cpal::SampleFormat::U16 => build!(u16, write_out),
+        cpal::SampleFormat::I32 => build!(i32, write_out),
         f => return Err(Error(format!("unsupported sample format: {f}"))),
     }
     .map_err(|e| Error(e.to_string()))?;
@@ -1828,6 +1836,24 @@ fn write_out<T: cpal::Sample + cpal::FromSample<f32>>(
                     *x = T::EQUILIBRIUM;
                 }
             }
+        }
+    }
+}
+
+/// [`write_out`] for a stereo `f32` device (`MIXER_STEREO_OUT`): the mixer writes straight into
+/// the device buffer, which is then clipped in place, in the same blocks (as many frames as the
+/// scratch buffer holds; the gain ramps follow the blocks). Same samples, without the copy from
+/// the scratch buffer nor the per-frame loop over a channel count the compiler does not know.
+fn write_out_stereo_f32(mixer: &mut Mixer, scratch: &mut [f32], out: &mut [f32], _channels: usize) {
+    let max = scratch.len() / 2;
+    // Whole frames only, like `chunks_exact_mut` above: a trailing lone sample is left as is.
+    let (frames, _) = out.as_chunks_mut::<2>();
+    for block in frames.chunks_mut(max) {
+        let block = block.as_flattened_mut();
+        mixer.process(block);
+        for x in block {
+            // Hard clipping, as in `write_out`.
+            *x = x.clamp(-1.0, 1.0);
         }
     }
 }
@@ -1896,6 +1922,95 @@ mod tests {
         e.play_request(SoundRequest::new("minecraft:entity.cow.ambient", Category::Neutral)).expect("normal sound");
         e.play_request(SoundRequest::new("minecraft:music.menu", Category::Music)).expect("streamed music");
         assert_eq!(e.channel_counts(), ([1, 1], [247, 8]));
+    }
+
+    /// `MIXER_STEREO_OUT`: the stereo `f32` path writes the samples of `write_out` bit for bit,
+    /// clipping included (three full-scale voices summed past ±1), over callbacks shorter and
+    /// longer than a scratch block (gain ramps per block), empty, of one frame and of odd length.
+    #[test]
+    fn stereo_f32_output_matches_write_out() {
+        let run = |stereo_out: bool| -> Vec<u32> {
+            let (tx, rx) = crossbeam_channel::bounded(16);
+            let (etx, _erx) = crossbeam_channel::bounded(16);
+            let mut mixer = Mixer::new(48_000, 8, rx, etx);
+            for id in 0..3u64 {
+                let mut x = 0x9E37_79B9u32 + id as u32;
+                let data = (0..2 * 30_000)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 17;
+                        x ^= x << 5;
+                        (x >> 16) as i16
+                    })
+                    .collect();
+                let pcm = Arc::new(Pcm { channels: 2, rate: 44_100, data });
+                let p = VoiceParams {
+                    id,
+                    category: Category::Music,
+                    gain: 1.0,
+                    pitch: 1.0 + id as f32 * 0.25,
+                    pos: [0.0; 3],
+                    relative: true,
+                    linear: false,
+                    distance: 16.0,
+                    looping: true,
+                };
+                tx.send(Command::Play(p, Source::Buffer(pcm))).unwrap();
+            }
+            let mut scratch = vec![0.0f32; 2 * 8192];
+            let mut bits = Vec::new();
+            for samples in [960usize, 874, 2 * 8192, 2 * 20_000, 2, 0, 2 * 9_000 + 1] {
+                let mut out = vec![7.0f32; samples];
+                if stereo_out {
+                    write_out_stereo_f32(&mut mixer, &mut scratch, &mut out, 2);
+                } else {
+                    write_out(&mut mixer, &mut scratch, &mut out, 2);
+                }
+                bits.extend(out.iter().map(|x| x.to_bits()));
+            }
+            bits
+        };
+        let old = run(false);
+        assert!(old.contains(&1.0f32.to_bits()) && old.contains(&(-1.0f32).to_bits()), "nothing was clipped");
+        assert!(run(true) == old, "stereo f32 output differs from write_out");
+    }
+
+    /// Bench (ignored), loaded machine figures only: cost of the output stage alone (empty mixer,
+    /// so the mixer only clears the block), 10 ms device callbacks of 480 stereo `f32` frames,
+    /// through the scratch buffer against straight into the device buffer; 31 interleaved rounds of
+    /// 2,000 callbacks, best time and median ratio.
+    /// `cargo-file.ps1 test --release -p rc-audio stereo_output_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "bench"]
+    fn stereo_output_bench() {
+        let (_tx, rx) = crossbeam_channel::bounded(1);
+        let (etx, _erx) = crossbeam_channel::bounded(1);
+        let mut mixer = Mixer::new(48_000, 8, rx, etx);
+        let mut scratch = vec![0.0f32; 2 * 8192];
+        let mut out = vec![0.0f32; 2 * 480];
+        let mut times = [Vec::new(), Vec::new()];
+        for _ in 0..31 {
+            for (stereo_out, t_way) in [false, true].into_iter().zip(&mut times) {
+                let t = Instant::now();
+                for _ in 0..2_000 {
+                    if stereo_out {
+                        write_out_stereo_f32(&mut mixer, &mut scratch, &mut out, 2);
+                    } else {
+                        write_out(&mut mixer, &mut scratch, &mut out, 2);
+                    }
+                }
+                t_way.push(t.elapsed().as_secs_f64() * 1e9 / (2_000.0 * 480.0));
+            }
+        }
+        let mut ratios: Vec<f64> = times[1].iter().zip(&times[0]).map(|(a, b)| a / b).collect();
+        ratios.sort_by(f64::total_cmp);
+        let best = |t: &[f64]| t.iter().copied().fold(f64::INFINITY, f64::min);
+        println!(
+            "output stage, ns / frame: scratch buffer {:.3}, straight into the device buffer {:.3}; median ratio {:.3}",
+            best(&times[0]),
+            best(&times[1]),
+            ratios[ratios.len() / 2],
+        );
     }
 }
 

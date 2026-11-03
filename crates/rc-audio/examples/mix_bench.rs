@@ -3,7 +3,8 @@
 //! several threads (rayon, a share of the voices per mixer) and Vorbis decoding (µs and bytes
 //! allocated per sound).
 //! `cargo run --release -p rc-audio --example mix_bench [mix|decode] [rayon]`
-//! Switches: `RUSTCRAFT_OPT_MIXMUTE`, `MIXWEIGHTS`, `MIXSIMD`, `DECODECOPY` (0 = old).
+//! Switches: `RUSTCRAFT_OPT_MIXMUTE`, `MIXWEIGHTS`, `MIXSIMD`, `MIXER_AVX2`, `MIXER_PACKED_READS`,
+//! `MIXER_FIXED_POSITIONS`, `DECODECOPY` (0 = old).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
