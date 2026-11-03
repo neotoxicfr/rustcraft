@@ -160,6 +160,10 @@ impl Server {
             Ent::Mob(id) => self.mob_ref(id).cloned(),
             Ent::Player => None,
         };
+        // `same_team` with each entity, the attacker's team looked up once and the entities'
+        // UUIDs never formatted (team found by UUID).
+        let attacker_team = self.cmd.scores.team_of(attacker_name).map(|t| t.name.clone());
+        let ally = |s: &Self, uuid: u128| attacker_team.as_ref().is_some_and(|own| s.cmd.scores.uuid_in_team(uuid, own));
         let ids: Vec<i32> = self
             .mobs
             .list
@@ -167,9 +171,7 @@ impl Server {
             .filter(|o| Ent::Mob(o.id) != attacker && Ent::Mob(o.id) != t.ent && o.touches(&area) && near(o.pos()))
             .filter(|o| !(o.tame && o.owner == Some(t.uuid) && crate::mobs::species::tamable(o.kind)))
             .filter(|o| {
-                let holder = crate::nbtio::uuid_text(o.uuid);
-                !self.same_team(attacker_name, &holder)
-                    && !attacker_mob.as_ref().is_some_and(|a| crate::mobs::illagers::allied(self, a, o))
+                !ally(self, o.uuid) && !attacker_mob.as_ref().is_some_and(|a| crate::mobs::illagers::allied(self, a, o))
             })
             .map(|o| o.id)
             .collect();
@@ -189,7 +191,7 @@ impl Server {
             {
                 continue;
             }
-            if self.same_team(attacker_name, &crate::nbtio::uuid_text(d.uuid)) {
+            if ally(self, d.uuid) {
                 continue;
             }
             let res = self.deco_attribute(d.id, "minecraft:knockback_resistance").unwrap_or(0.0);

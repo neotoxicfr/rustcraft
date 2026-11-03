@@ -181,10 +181,44 @@ pub fn uuid_nbt(u: u128) -> Nbt {
     Nbt::IntArray((0..4).map(|i| (u >> (96 - 32 * i)) as u32 as i32).collect())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: UUIDs formatted by [`uuid_text`] in this thread (proof that a team found by UUID
+    /// formats none).
+    pub(crate) static UUID_TEXTS_FORMATTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// UUID as text with dashes (player file names).
 pub fn uuid_text(u: u128) -> String {
+    #[cfg(test)]
+    UUID_TEXTS_FORMATTED.with(|n| n.set(n.get() + 1));
     let h = format!("{u:032x}");
     format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
+}
+
+/// The UUID whose [`uuid_text`] is exactly `s` (32 lowercase hex digits grouped 8-4-4-4-12), read
+/// without allocating; `None` for any other text (uppercase, short groups, signs…).
+pub fn canonical_uuid(s: &str) -> Option<u128> {
+    let bytes = s.as_bytes();
+    if bytes.len() != 36 {
+        return None;
+    }
+    let mut u: u128 = 0;
+    for (i, &c) in bytes.iter().enumerate() {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            if c != b'-' {
+                return None;
+            }
+            continue;
+        }
+        let digit = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => return None,
+        };
+        u = u << 4 | u128::from(digit);
+    }
+    Some(u)
 }
 
 #[cfg(test)]
@@ -196,6 +230,35 @@ mod tests {
         let u = 0x6c36f763_6526_3b48_9820_8f008743cbebu128;
         assert_eq!(uuid(Some(&uuid_nbt(u))), Some(u));
         assert_eq!(uuid_text(u), "6c36f763-6526-3b48-9820-8f008743cbeb");
+    }
+
+    /// `canonical_uuid` = the command parser's UUID kept only when its text is canonical (the
+    /// test of the former scoreboard paths), without allocating.
+    #[test]
+    fn canonical_uuid_is_the_inverse_of_uuid_text() {
+        let former = |s: &str| crate::commands::snbt::parse_uuid(s).filter(|u| uuid_text(*u) == s);
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut samples = vec![0u128, u128::MAX, 1, 0x6c36f763_6526_3b48_9820_8f008743cbeb];
+        samples.extend((0..1000).map(|_| u128::from(next()) << 64 | u128::from(next())));
+        for u in samples {
+            let text = uuid_text(u);
+            assert_eq!(canonical_uuid(&text), Some(u), "{text}");
+            for other in [text.to_uppercase(), text.replacen('-', "", 1), format!("{text}0"), text[1..].to_owned()] {
+                assert_eq!(canonical_uuid(&other), former(&other), "{other}");
+            }
+        }
+        for s in
+            ["1-2-3-4-5", "", "Steve", "-0000001-0002-0003-0004-000000000005", "0000000g-0000-0000-0000-000000000000"]
+        {
+            assert_eq!(canonical_uuid(s), former(s), "{s}");
+            assert_eq!(canonical_uuid(s), None, "{s}");
+        }
     }
 
     /// Every chunk of the region files (terrain, entities, points of interest) of the test world,

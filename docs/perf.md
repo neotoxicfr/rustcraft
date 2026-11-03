@@ -5483,3 +5483,79 @@ blocks apart in x or z (or 256 in y), reachable by searches of follow range 64 a
 rules read the trapdoor, fire and campfire block tags and the water and lava fluid tags where
 Rustcraft compares names (identical with the vanilla data, different under a data pack that edits
 those tags).
+## C6-M24: scoreboard and teams, indexed holders, one lookup per write, entity removal without formatting (03/11, loaded machine)
+
+Before: the holders sat in a list searched linearly (a command write searched the holder up to
+four times: read, open, write, packet; the save and the start of tracking searched every holder
+again, O(H²)); every access copied the objective name; the team of a holder was a scan of every
+team's members (each decorated name, `team=`, friendly fire); the push index was rebuilt after
+every join or leave; every entity leaving the world formatted its UUID (two `format!`) and
+searched it as soon as a single score existed. Switches, default = new, `=0` = old (read once,
+`BoardPaths`):
+- `RUSTCRAFT_OPT_SCOREHOLDERMAP`: holders in a hash table (`score_holders.rs`); the order a player
+  or a save sees still comes from the game's table replayed (`HashOrder`, keys only).
+- `RUSTCRAFT_OPT_SCOREONELOOKUP`: `players set/add/remove` and the criteria find each score they
+  write once (`update_score`, `update_criteria` without the list of objective names);
+  `operation` opens each source then reads and writes its target again (`open_score`, `get`,
+  `write_score`: three holder lookups per source instead of five, the gain of its row comes mostly from
+  the hash table); the objective and display state once per command; no write copies the name
+  of an existing score.
+- `RUSTCRAFT_OPT_TEAMMEMBERINDEX`: member → team rank kept by `join_team`, `leave_team`,
+  `add_team`, `remove_team` and the read (`team_members.rs`, by UUID for canonical UUID names);
+  the push rules are a view of it. "First registered wins" kept (a member in two teams, from a
+  save, leaves to its next team).
+- `RUSTCRAFT_OPT_SCOREUUIDSET`: canonical UUID holders in a set; a removed entity whose UUID names
+  no holder and no member costs one lookup, nothing formatted.
+
+Proof: `scores_equivalence_tests` replays 10,000 random operations (every command shape, resets,
+objectives, slots, filled teams, joins, leaves, removals by name and by UUID, a save re-read every
+1,000) on the 16 combinations; each operation's results, the queued packets, the save flag and,
+every 25 operations, the save bytes, the holder listing, and the team, push rule, scores and
+decorated name of every holder and member, give a digest frozen from the board before the change
+(55,292 lines). `scores_world_equivalence_tests` plays a command script on a flat world on the
+former paths, on each switch alone and on all (30 pigs joined by `execute as @e run team join t
+@s`, scores by selectors, operation, store, feedback, kills, then 1,000 markers killed while one
+fake player holds a score): packets, chat, save and the team of every pig identical. Five
+sabotages fail them (see the commit). `canonical_uuid` (no allocation) = the parser's UUID kept
+only when its text is canonical, on 1,000 random UUIDs and their altered forms.
+
+| Board alone, ns per operation (allocations), loaded machine | former | each switch alone | all |
+|---|---|---|---|
+| `players add`, 1,000 UUID holders, objective displayed | 6,794 (4) | map 177, one lookup 1,127 (2) | 47 (2) |
+| `players add`, 10,000 holders | 43,407 (4) | map 151, one lookup 11,822 (2) | 54 (2) |
+| `operation += #c`, 1,000 / 10,000 holders | 5,177 / 59,983 (5) | map 227 / 265 | 90 / 99 (2) |
+| save, per holder, 1,000 / 10,000 | 1,330 / 18,923 | map 182 / 466 | 164 / 233 |
+| start of tracking, per holder, 1,000 / 10,000 | 1,141 / 14,620 | map 95 / 266 | 56 / 150 |
+| entity removed, 1 fake player score | 135 (5) | UUID set 1.5 (0) | 1.7 (0) |
+| team of 300 members + 300 others | 420 | member index 131 | 58 |
+| decorated name, same | 512 | member index 193 | 88 |
+| join then push lookup, 300 members | 91,076 (2,133) | member index 1,789 (7) | 795 (7) |
+| temporary fake player set then reset, beside 1,000 / 10,000 holders (pass 2) | 1,762 / 19,244 (8) | map 256 / 143 | 147 / 141 (7) |
+
+Second pass, machine more loaded (the former paths ran ≈ 1.5-2× slower): same ratios, `players
+add` 10,000 holders 88,767 → 58 ns, removal 255 → 1.6 ns, join then push 162,948 → 899 ns. The
+member index alone first made a removal slower when no team exists (377 against 135 ns: the UUID
+text read for nothing); an empty index now answers at once (165 against 255 ns in pass 2). The
+set-then-reset pair costs its allocations (both holder names, the score's objective name, three
+packet strings): hashing in the replayed order table is not visible, `hash_order.rs` unchanged.
+Same cause elsewhere (a UUID formatted to find a team): `team_of_uuid` serves the warden's
+target check (the target's name is no longer built when the warden has no team), the evoker's vex
+and the mace smash (attacker's team looked up once, not per bystander); a displayed entity name
+formats its UUID once for the team and the insertion instead of twice. Review pass: the player's
+sweep (mobs, armor stands and mannequins; the player's team looked up once, the stands' team
+tested after the area test), the `team` entity predicate (mobs, projectiles, any entity), the
+`team=` selector filter (`ent_team`), `/teammsg` and the kill criteria (`teamkill.<colour>` finds
+the victim's team by UUID; its name is formatted only for `killedByTeam.<colour>`) no longer format
+a UUID to find a team (`team_by_uuid_tests`: no UUID formatted by the team test, results as
+before). The `scores=` selector filter is left to C6-M13. The save of 10,000 holders goes from 189 ms to 2.3 ms (an
+autosave spike). The two remaining allocations of a write are those of the packet (holder and
+objective names); the eight of a saved score are its NBT. Memory: a holder costs ≈ 56-110 bytes in the hash table instead of
+48-96 in the list, plus ≈ 18-36 per UUID holder in the set and ≈ 36 per member in the index
+(≈ 80 KB for 1,000 holders and 300 members). Multi-core and GPU: not applicable (state of the
+server thread, mutations in command order). Discarded, as planned: objectives interned as `u32`
+(would change the objective order of `players list` and of the save), `Arc<str>` names (≈ 72 KB
+more for 1,000 holders), a member index rebuilt on demand (O(N²) when joins and reads alternate).
+Not done: `players enable` still looks its score up twice; `execute store … score` asks the
+objective state once per target (it lives in `exec.rs`); leaving a team still removes the member
+from the team's ordered list (O(team size)). To settle on the quiet-machine scene bench:
+`datapack` (2 passes, old exe as reference).

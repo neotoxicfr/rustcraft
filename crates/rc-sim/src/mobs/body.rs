@@ -917,19 +917,18 @@ impl Server {
                 (Some(i as u32), crate::commands::scores::collision_code(&teams[i].collision))
             });
         }
-        let ix = self.cmd.scores.collision_index();
-        let e = match who {
-            Some(u) => ix.by_uuid.get(&u),
-            None => ix.by_name.get(&self.name),
+        let rule = match who {
+            Some(u) => self.cmd.scores.collision_rule_by_uuid(u),
+            None => self.cmd.scores.collision_rule_by_name(&self.name),
         };
-        e.map_or((None, 0), |&(t, r)| (Some(t), r))
+        rule.map_or((None, 0), |(t, r)| (Some(t), r))
     }
 
     /// Team filter of the push as seen from `who` (`team_rule`): `None` when no team has a rule
     /// other than "always" (the filter then lets everything through, nothing is looked up).
     fn push_team(&self, who: Option<u128>) -> Option<(Option<u32>, u8)> {
         let active = if team_idx() {
-            self.cmd.scores.collision_index().active
+            self.cmd.scores.collision_rules_active()
         } else {
             self.cmd.scores.teams.iter().any(|t| t.collision != "always")
         };
