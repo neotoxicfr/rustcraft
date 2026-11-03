@@ -8,7 +8,7 @@ use crate::decor_region::{BeData, Hm, Region, add};
 use crate::decor_rng::DecoRng;
 use crate::decor_rules::{Kind, can_survive};
 use crate::feature::{BlockColumn, Disk, Lake, Ore, Spring};
-use rc_data::java_math::round_f32_to_i32;
+use crate::math::round_f32_to_i32;
 
 /// Identical fluid states (type, source, level, falling).
 pub fn same_fluid(b: &Blocks, a: State, c: State) -> bool {
@@ -288,13 +288,14 @@ pub fn scattered_ore(cx: &mut Ctx, o: &Ore, rng: &mut DecoRng, p: [i32; 3]) -> b
     let r = &mut *cx.r;
     let b = r.b;
     let tries = rng.next_int_bounded(o.size + 1);
+    let floor_java = crate::opt::floor_java();
     for i in 0..tries {
         let m = i.min(7) as f32;
         let mut off = [0i32; 3];
         for v in &mut off {
             let a = rng.next_float();
             let c = rng.next_float();
-            *v = round_f32_to_i32((a - c) * m);
+            *v = round_f32_to_i32((a - c) * m, floor_java);
         }
         let q = [p[0] + off[0], p[1] + off[1], p[2] + off[2]];
         let cur = r.get_p(q);

@@ -52,12 +52,13 @@ const SEED: i64 = 20_261_011;
 
 /// Each path alone, then the combinations with `range_yvol`, then all: a faulty track is
 /// named by its own failure.
-const VARIANTS: [(&str, Opts); 6] = [
-    ("range_yvol", Opts { range_yvol: true, vol_pool: false, spline_stack: false }),
-    ("vol_pool", Opts { range_yvol: false, vol_pool: true, spline_stack: false }),
-    ("spline_stack", Opts { range_yvol: false, vol_pool: false, spline_stack: true }),
-    ("yvol+pool", Opts { range_yvol: true, vol_pool: true, spline_stack: false }),
-    ("yvol+spline", Opts { range_yvol: true, vol_pool: false, spline_stack: true }),
+const VARIANTS: [(&str, Opts); 7] = [
+    ("range_yvol", Opts { range_yvol: true, ..Opts::OLD }),
+    ("vol_pool", Opts { vol_pool: true, ..Opts::OLD }),
+    ("spline_stack", Opts { spline_stack: true, ..Opts::OLD }),
+    ("floor_java", Opts { floor_java: true, ..Opts::OLD }),
+    ("yvol+pool", Opts { range_yvol: true, vol_pool: true, ..Opts::OLD }),
+    ("yvol+spline", Opts { range_yvol: true, spline_stack: true, ..Opts::OLD }),
     ("all", Opts::NEW),
 ];
 

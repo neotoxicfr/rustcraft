@@ -613,13 +613,15 @@ impl Smeared {
 #[derive(Debug, Clone)]
 pub struct Simplex {
     base: Perlin,
+    /// `RUSTCRAFT_OPT_FLOOR_JAVA`, read once at construction rather than at each floor.
+    floor_java: bool,
 }
 
 const SQRT3: f64 = 1.732_050_807_568_877_2;
 
 impl Simplex {
     pub fn new_without_offset(r: &mut Rng) -> Self {
-        Simplex { base: Perlin::with_offset_scale(r, 0.0) }
+        Simplex { base: Perlin::with_offset_scale(r, 0.0), floor_java: crate::opt::floor_java() }
     }
 
     fn corner(g: i32, x: f64, y: f64) -> f64 {
@@ -640,8 +642,8 @@ impl Simplex {
         let xin = xin + b.ox;
         let yin = yin + b.oy;
         let s = (xin + yin) * f2;
-        let i = rc_data::java_math::floor_to_i32(xin + s);
-        let j = rc_data::java_math::floor_to_i32(yin + s);
+        let i = fl(xin + s, self.floor_java);
+        let j = fl(yin + s, self.floor_java);
         let t = f64::from(i.wrapping_add(j)) * g2;
         let x0 = xin - (f64::from(i) - t);
         let y0 = yin - (f64::from(j) - t);

@@ -5,7 +5,6 @@ use crate::density::{Axis, Metric, RoundKind, Unary, round_to_integer, squeeze};
 use crate::math::{clamp, floor_div, floor_mod, jmax, jmin, lerp, lerp3, signum};
 use crate::noise::{NoiseStack, Simplex};
 use crate::volume::Volume;
-use rc_data::java_math::floor_f32_to_i32;
 
 /// Index of a sampler in the generator's table.
 pub type Sid = u32;
@@ -164,19 +163,23 @@ pub struct Opts {
     pub vol_pool: bool,
     /// Point spline without allocation or dynamic call.
     pub spline_stack: bool,
+    /// Scattered floors of the generator (surface levels, cell tops) through the shared floor,
+    /// not the C library (`RUSTCRAFT_OPT_FLOOR_JAVA`).
+    pub floor_java: bool,
 }
 
 impl Opts {
     /// Code from before the mission.
-    pub const OLD: Opts = Opts { range_yvol: false, vol_pool: false, spline_stack: false };
+    pub const OLD: Opts = Opts { range_yvol: false, vol_pool: false, spline_stack: false, floor_java: false };
     /// All the tracks.
-    pub const NEW: Opts = Opts { range_yvol: true, vol_pool: true, spline_stack: true };
+    pub const NEW: Opts = Opts { range_yvol: true, vol_pool: true, spline_stack: true, floor_java: true };
 
     pub fn current() -> Opts {
         static P: std::sync::LazyLock<Opts> = std::sync::LazyLock::new(|| Opts {
             range_yvol: crate::opt::range_yvol(),
             vol_pool: crate::opt::vol_pool(),
             spline_stack: crate::opt::spline_stack(),
+            floor_java: crate::opt::floor_java(),
         });
         *P
     }
@@ -215,6 +218,19 @@ impl Ctx {
     /// Context with caches, paths forced (equivalence tests, benches).
     pub fn cached_with(opts: Opts) -> Self {
         Ctx { cells: Some(Vec::new()), pool: Vec::new(), opts }
+    }
+
+    /// The game's floor of a float, through the switch kept in the context (read once per context:
+    /// reading it at each floor cost 27% of the floor). `RUSTCRAFT_OPT_FLOOR_JAVA=0`: C library.
+    #[inline]
+    pub fn floor_f32_to_i32(&self, v: f32) -> i32 {
+        crate::math::floor_f32_to_i32(v, self.opts.floor_java)
+    }
+
+    /// The game's rounding of a float (halves up), same switch as [`Ctx::floor_f32_to_i32`].
+    #[inline]
+    pub fn round_f32_to_i32(&self, v: f32) -> i32 {
+        crate::math::round_f32_to_i32(v, self.opts.floor_java)
     }
 
     /// Hands a buffer (received from [`Generator::volume`](crate::Generator::volume)) back to the context, which
@@ -497,8 +513,8 @@ fn unary(u: Unary, v: f32) -> f32 {
 }
 
 #[inline]
-fn round_apply(k: RoundKind, v: f32, m: f32) -> f32 {
-    if m == 0.0 { v } else { round_to_integer(v / m, k) * m }
+fn round_apply(k: RoundKind, v: f32, m: f32, floor_java: bool) -> f32 {
+    if m == 0.0 { v } else { round_to_integer(v / m, k, floor_java) * m }
 }
 
 #[inline]
@@ -731,11 +747,11 @@ impl Program {
             }
             S::ConstMax(a, c) => jmax(self.value(*a, ctx, x, y, z), *c),
             S::Unary(u, a) => unary(*u, self.value(*a, ctx, x, y, z)),
-            S::RoundInt(k, a) => round_to_integer(self.value(*a, ctx, x, y, z), *k),
+            S::RoundInt(k, a) => round_to_integer(self.value(*a, ctx, x, y, z), *k, ctx.opts.floor_java),
             S::Round(k, a, m) => {
                 let v = self.value(*a, ctx, x, y, z);
                 let m = self.value(*m, ctx, x, y, z);
-                round_apply(*k, v, m)
+                round_apply(*k, v, m, ctx.opts.floor_java)
             }
             S::PowConstBase(b, e) => b.powf(f64::from(self.value(*e, ctx, x, y, z))) as f32,
             S::PowConstExp(b, e) => f64::from(self.value(*b, ctx, x, y, z)).powf(*e) as f32,
@@ -855,7 +871,7 @@ impl Program {
 
     #[allow(clippy::too_many_arguments)]
     fn find_top(&self, density: Sid, lower: i32, cell: i32, ctx: &mut Ctx, x: i32, z: i32, upper: f32) -> f32 {
-        let top = floor_f32_to_i32(upper / cell as f32).wrapping_mul(cell);
+        let top = ctx.floor_f32_to_i32(upper / cell as f32).wrapping_mul(cell);
         if top <= lower {
             return lower as f32;
         }
@@ -1078,9 +1094,13 @@ impl Program {
             }
             S::RoundInt(k, a) => {
                 self.volume(*a, ctx, out, v);
-                out.iter_mut().for_each(|o| *o = round_to_integer(*o, *k));
+                let floor_java = ctx.opts.floor_java;
+                out.iter_mut().for_each(|o| *o = round_to_integer(*o, *k, floor_java));
             }
-            S::Round(k, a, m) => self.binary_volume(*a, *m, ctx, out, v, |l, r| *l = round_apply(*k, *l, r)),
+            S::Round(k, a, m) => {
+                let floor_java = ctx.opts.floor_java;
+                self.binary_volume(*a, *m, ctx, out, v, |l, r| *l = round_apply(*k, *l, r, floor_java));
+            }
             S::PowConstBase(b, e) => {
                 self.volume(*e, ctx, out, v);
                 out.iter_mut().for_each(|o| *o = b.powf(f64::from(*o)) as f32);
