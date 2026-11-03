@@ -67,8 +67,6 @@ impl Server {
     /// Non-player entity permanently removed (dead or deleted, not unloaded): its scores
     /// and team disappear.
     pub(crate) fn entity_scores_removed(&mut self, uuid: u128) {
-        if self.cmd.scores.has_entries() {
-            self.cmd.scores.entity_removed(&crate::nbtio::uuid_text(uuid));
-        }
+        self.cmd.scores.remove_entity(uuid);
     }
 }

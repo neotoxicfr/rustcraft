@@ -28,8 +28,10 @@ pub mod ents;
 pub mod exec;
 pub mod hash_order;
 pub mod itempred;
+pub mod score_holders;
 pub mod scores;
 pub mod select;
+pub mod team_members;
 pub mod snbt;
 pub mod src;
 pub mod suggest;
@@ -47,6 +49,10 @@ mod w11_tests;
 mod g3f10_tests;
 #[cfg(test)]
 mod scores_tests;
+#[cfg(test)]
+mod scores_equivalence_tests;
+#[cfg(test)]
+mod scores_world_equivalence_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 

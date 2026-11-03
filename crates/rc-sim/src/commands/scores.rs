@@ -9,6 +9,8 @@ use rc_proto_v777::scores::{NumberFormat, ScoreEvent, TeamParams};
 use rc_text::Component;
 
 use crate::commands::hash_order::HashOrder;
+use crate::commands::score_holders::{HolderScores, Holders, Reset};
+use crate::commands::team_members::TeamMembers;
 use crate::nbtio::{int, list};
 
 pub const SLOTS: [&str; 19] = [
@@ -104,60 +106,115 @@ pub fn collision_code(rule: &str) -> u8 {
     }
 }
 
-/// Team collision rules for the push: member → (team rank, rule code), like the game's
-/// "member → team" table; rebuilt on demand after a change.
+/// Team collision rules for the push, former way (`RUSTCRAFT_OPT_TEAMMEMBERINDEX=0`): member →
+/// (team rank, rule code), like the game's "member → team" table; rebuilt on demand after a change.
 #[derive(Debug, Clone, Default)]
-pub struct CollisionIndex {
+struct CollisionIndex {
     /// At least one team has a rule other than "always" (otherwise the push filters nothing).
-    pub active: bool,
+    active: bool,
     /// Members whose name is a UUID in canonical text (entities).
-    pub by_uuid: std::collections::HashMap<u128, (u32, u8)>,
+    by_uuid: std::collections::HashMap<u128, (u32, u8)>,
     /// Other members (players, free names).
-    pub by_name: std::collections::HashMap<String, (u32, u8)>,
+    by_name: std::collections::HashMap<String, (u32, u8)>,
+}
+
+/// Which optimised paths a board takes, each behind its switch (`0` restores the former way),
+/// read once per process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoardPaths {
+    /// `RUSTCRAFT_OPT_SCOREHOLDERMAP`: holders in a hash table (`score_holders`).
+    pub holder_map: bool,
+    /// `RUSTCRAFT_OPT_SCOREONELOOKUP`: a command finds each score it writes once, its objective
+    /// and display state once per command, and never copies the objective name of an existing score.
+    pub one_lookup: bool,
+    /// `RUSTCRAFT_OPT_TEAMMEMBERINDEX`: member → team index kept up to date (`team_members`).
+    pub member_index: bool,
+    /// `RUSTCRAFT_OPT_SCOREUUIDSET`: an entity removal formats its UUID only when it names a
+    /// holder or a member (most removed entities have neither score nor team).
+    pub uuid_set: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: paths of the boards created by this thread (every combination of the equivalence
+    /// proofs), without touching the environment.
+    pub(crate) static FORCED_PATHS: std::cell::Cell<Option<BoardPaths>> = const { std::cell::Cell::new(None) };
+}
+
+impl BoardPaths {
+    pub fn from_switches() -> BoardPaths {
+        #[cfg(test)]
+        if let Some(paths) = FORCED_PATHS.with(std::cell::Cell::get) {
+            return paths;
+        }
+        BoardPaths {
+            holder_map: rc_data::opt_switch!("RUSTCRAFT_OPT_SCOREHOLDERMAP"),
+            one_lookup: rc_data::opt_switch!("RUSTCRAFT_OPT_SCOREONELOOKUP"),
+            member_index: rc_data::opt_switch!("RUSTCRAFT_OPT_TEAMMEMBERINDEX"),
+            uuid_set: rc_data::opt_switch!("RUSTCRAFT_OPT_SCOREUUIDSET"),
+        }
+    }
+
+    /// The 16 combinations of the four switches, all off first.
+    #[cfg(test)]
+    pub fn every_combination() -> impl Iterator<Item = BoardPaths> {
+        (0..16u8).map(|bits| BoardPaths {
+            holder_map: bits & 1 != 0,
+            one_lookup: bits & 2 != 0,
+            member_index: bits & 4 != 0,
+            uuid_set: bits & 8 != 0,
+        })
+    }
+}
+
+/// What the writes of one command need to know about their objective, looked up once per
+/// command (`RUSTCRAFT_OPT_SCOREONELOOKUP`): neither changes while a command writes its scores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScoreTarget {
+    /// The holder's display name is copied into the score (automatic display name update).
+    pub auto_update: bool,
+    /// Displayed in a slot: every change of a score is sent to the client.
+    pub tracked: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct Board {
     pub objectives: Vec<Objective>,
-    /// Holder → objective → score (insertion order of the holders kept).
-    pub scores: Vec<(String, BTreeMap<String, Score>)>,
+    /// Holder → objective → score, and the game's listing order of the holders.
+    holders: Holders,
     pub slots: BTreeMap<usize, String>,
-    /// Teams; every write goes through the board's methods, or calls `touch_teams`.
+    /// Teams. Their options may be edited in place, followed by `touch_teams`; their members
+    /// change only through the board's methods (the member index follows them).
     pub teams: Vec<Team>,
     pub dirty: bool,
     /// Packets to send to the client (flushed by the server).
     pub out: Vec<ScoreEvent>,
-    /// Listing orders of the game (hash tables replayed): objectives, holders, teams.
+    /// Listing orders of the game (hash tables replayed): objectives, teams.
     obj_order: HashOrder,
-    holder_order: HashOrder,
     team_order: HashOrder,
-    /// Collision rule index (empty until the first use after a change).
+    /// Collision rule index of the former way (empty until the first use after a change).
     collision: std::cell::OnceCell<CollisionIndex>,
+    /// Team of every member (`RUSTCRAFT_OPT_TEAMMEMBERINDEX`; empty when off).
+    members: TeamMembers,
+    /// Some team has a collision rule other than "always" (kept by `touch_teams`).
+    collision_rules_active: bool,
+    paths: BoardPaths,
 }
 
 impl Default for Board {
     fn default() -> Board {
-        Board {
-            objectives: Vec::new(),
-            scores: Vec::new(),
-            slots: BTreeMap::new(),
-            teams: Vec::new(),
-            dirty: false,
-            out: Vec::new(),
-            obj_order: HashOrder::new(16, 0.5),
-            holder_order: HashOrder::new(16, 0.5),
-            team_order: HashOrder::new(16, 0.75),
-            collision: std::cell::OnceCell::new(),
-        }
+        Board::with_paths(BoardPaths::from_switches())
     }
 }
 
-fn s(v: &Nbt, k: &str) -> Option<String> {
+/// Text field of a saved compound.
+fn str_field(v: &Nbt, k: &str) -> Option<String> {
     v.get(k).and_then(Nbt::as_str).map(str::to_owned)
 }
 
-fn flag(v: &Nbt, k: &str, d: bool) -> bool {
-    int(v, k).map_or(d, |x| x != 0)
+/// Boolean field of a saved compound (a byte), `default` when absent.
+fn bool_field(v: &Nbt, k: &str, default: bool) -> bool {
+    int(v, k).map_or(default, |x| x != 0)
 }
 
 fn empty_text() -> Nbt {
@@ -190,7 +247,70 @@ pub fn format_net(f: &Option<Nbt>) -> Option<NumberFormat> {
     })
 }
 
+/// Score packet sent to the client.
+fn score_packet(holder: &str, obj: &str, sc: &Score) -> ScoreEvent {
+    ScoreEvent::Score {
+        holder: holder.to_owned(),
+        objective: obj.to_owned(),
+        value: sc.value,
+        display: sc.display.clone(),
+        format: format_net(&sc.format),
+    }
+}
+
+/// A write applied to an opened score: `name` (given only when the objective copies the
+/// holder's display name) and `value` stored; `true` if the score must be sent (changed, or
+/// `sync`: created by this access and not sent yet).
+fn apply_write(sc: &mut Score, value: i32, name: Option<Nbt>, sync: bool) -> bool {
+    let mut changed = sync;
+    if let Some(n) = name
+        && sc.display.as_ref().is_none_or(|d| !crate::items::nbt_eq(d, &n))
+    {
+        sc.display = Some(n);
+        changed = true;
+    }
+    if sc.value != value {
+        sc.value = value;
+        changed = true;
+    }
+    changed
+}
+
+/// Objective displayed in at least one slot.
+fn displayed(slots: &BTreeMap<usize, String>, obj: &str) -> bool {
+    slots.values().any(|o| o == obj)
+}
+
+/// Field written only when it differs from its default value (the game's codecs).
+fn push_unless_default(fields: &mut Vec<(String, Nbt)>, key: &str, value: Nbt, is_default: bool) {
+    if !is_default {
+        fields.push((key.into(), value));
+    }
+}
+
 impl Board {
+    /// Empty board taking the given paths.
+    pub fn with_paths(paths: BoardPaths) -> Board {
+        Board {
+            objectives: Vec::new(),
+            holders: Holders::new(paths.holder_map, paths.uuid_set),
+            slots: BTreeMap::new(),
+            teams: Vec::new(),
+            dirty: false,
+            out: Vec::new(),
+            obj_order: HashOrder::new(16, 0.5),
+            team_order: HashOrder::new(16, 0.75),
+            collision: std::cell::OnceCell::new(),
+            members: TeamMembers::default(),
+            collision_rules_active: false,
+            paths,
+        }
+    }
+
+    pub fn paths(&self) -> BoardPaths {
+        self.paths
+    }
+
     pub fn read(world: &Path) -> Board {
         let d = crate::nbtio::read_dat(&world.join("data").join("minecraft").join("scoreboard.dat"))
             .ok()
@@ -198,26 +318,26 @@ impl Board {
         let mut b = Board::default();
         let Some(d) = d else { return b };
         for o in list(d.get("Objectives")) {
-            let Some(name) = s(o, "Name") else { continue };
+            let Some(name) = str_field(o, "Name") else { continue };
             b.obj_order.insert(&name);
             b.objectives.push(Objective {
                 name,
-                criteria: s(o, "CriteriaName").unwrap_or_else(|| "dummy".into()),
+                criteria: str_field(o, "CriteriaName").unwrap_or_else(|| "dummy".into()),
                 display: o.get("DisplayName").cloned().unwrap_or_else(empty_text),
-                render: s(o, "RenderType").unwrap_or_else(|| "integer".into()),
-                auto_update: flag(o, "display_auto_update", false),
+                render: str_field(o, "RenderType").unwrap_or_else(|| "integer".into()),
+                auto_update: bool_field(o, "display_auto_update", false),
                 format: o.get("format").cloned(),
             });
         }
         for e in list(d.get("PlayerScores")) {
-            let (Some(name), Some(obj)) = (s(e, "Name"), s(e, "Objective")) else { continue };
+            let (Some(name), Some(obj)) = (str_field(e, "Name"), str_field(e, "Objective")) else { continue };
             let sc = Score {
                 value: int(e, "Score").unwrap_or(0) as i32,
-                locked: flag(e, "Locked", false),
+                locked: bool_field(e, "Locked", false),
                 display: e.get("display").cloned(),
                 format: e.get("format").cloned(),
             };
-            b.entry(&name).insert(obj, sc);
+            b.holders.entry(&name).insert(obj, sc);
         }
         if let Some(Nbt::Compound(f)) = d.get("DisplaySlots") {
             for (k, v) in f {
@@ -227,104 +347,36 @@ impl Board {
             }
         }
         for t in list(d.get("Teams")) {
-            let Some(name) = s(t, "Name") else { continue };
+            let Some(name) = str_field(t, "Name") else { continue };
             b.team_order.insert(&name);
             b.teams.push(Team {
                 display: t.get("DisplayName").cloned().unwrap_or_else(|| Nbt::String(name.clone())),
                 name,
-                color: s(t, "TeamColor").filter(|c| c != "reset"),
-                friendly_fire: flag(t, "AllowFriendlyFire", true),
-                see_invisibles: flag(t, "SeeFriendlyInvisibles", true),
+                color: str_field(t, "TeamColor").filter(|c| c != "reset"),
+                friendly_fire: bool_field(t, "AllowFriendlyFire", true),
+                see_invisibles: bool_field(t, "SeeFriendlyInvisibles", true),
                 prefix: t.get("MemberNamePrefix").cloned().unwrap_or_else(empty_text),
                 suffix: t.get("MemberNameSuffix").cloned().unwrap_or_else(empty_text),
-                nametag: s(t, "NameTagVisibility").unwrap_or_else(|| "always".into()),
-                death: s(t, "DeathMessageVisibility").unwrap_or_else(|| "always".into()),
-                collision: s(t, "CollisionRule").unwrap_or_else(|| "always".into()),
+                nametag: str_field(t, "NameTagVisibility").unwrap_or_else(|| "always".into()),
+                death: str_field(t, "DeathMessageVisibility").unwrap_or_else(|| "always".into()),
+                collision: str_field(t, "CollisionRule").unwrap_or_else(|| "always".into()),
                 players: list(t.get("Players")).iter().filter_map(|p| p.as_str().map(str::to_owned)).collect(),
             });
         }
+        b.index_members();
+        b.touch_teams();
         b
     }
 
     /// Writing: like the game's codecs, a field equal to its default value is omitted (an
     /// empty board is written `data: {}`, taken from a save of the official game).
     pub fn to_nbt(&self) -> Nbt {
-        let objs: Vec<Nbt> = self
-            .obj_order
-            .iter_stream()
-            .filter_map(|n| self.objective(n))
-            .map(|o| {
-                let mut f = vec![("Name".into(), Nbt::String(o.name.clone()))];
-                if o.criteria != "dummy" {
-                    f.push(("CriteriaName".into(), Nbt::String(o.criteria.clone())));
-                }
-                f.push(("DisplayName".into(), o.display.clone()));
-                if o.render != "integer" {
-                    f.push(("RenderType".into(), Nbt::String(o.render.clone())));
-                }
-                if o.auto_update {
-                    f.push(("display_auto_update".into(), Nbt::Byte(1)));
-                }
-                if let Some(fm) = &o.format {
-                    f.push(("format".into(), fm.clone()));
-                }
-                Nbt::Compound(f)
-            })
-            .collect();
-        let mut scores = Vec::new();
-        for (h, m) in self.holder_order.iter_stream().filter_map(|h| self.scores.iter().find(|(x, _)| x == h)) {
-            for (o, sc) in m {
-                let mut f = vec![("Name".into(), Nbt::String(h.clone())), ("Objective".into(), Nbt::String(o.clone()))];
-                if sc.value != 0 {
-                    f.push(("Score".into(), Nbt::Int(sc.value)));
-                }
-                if sc.locked {
-                    f.push(("Locked".into(), Nbt::Byte(1)));
-                }
-                if let Some(d) = &sc.display {
-                    f.push(("display".into(), d.clone()));
-                }
-                if let Some(fm) = &sc.format {
-                    f.push(("format".into(), fm.clone()));
-                }
-                scores.push(Nbt::Compound(f));
-            }
-        }
+        let (objectives, scores, teams) = (self.objectives_nbt(), self.scores_nbt(), self.teams_nbt());
         let slots: Vec<(String, Nbt)> =
             self.slots.iter().map(|(i, o)| (SLOTS[*i].to_owned(), Nbt::String(o.clone()))).collect();
-        let teams: Vec<Nbt> = self
-            .team_order
-            .iter_stream()
-            .filter_map(|n| self.team(n))
-            .map(|t| {
-                let mut f =
-                    vec![("Name".into(), Nbt::String(t.name.clone())), ("DisplayName".into(), t.display.clone())];
-                if let Some(c) = &t.color {
-                    f.push(("TeamColor".into(), Nbt::String(c.clone())));
-                }
-                let mut opt = |k: &str, v: Nbt, default: bool| {
-                    if !default {
-                        f.push((k.into(), v));
-                    }
-                };
-                opt("AllowFriendlyFire", Nbt::Byte(0), t.friendly_fire);
-                opt("SeeFriendlyInvisibles", Nbt::Byte(0), t.see_invisibles);
-                opt("MemberNamePrefix", t.prefix.clone(), is_empty_text(&t.prefix));
-                opt("MemberNameSuffix", t.suffix.clone(), is_empty_text(&t.suffix));
-                opt("NameTagVisibility", Nbt::String(t.nametag.clone()), t.nametag == "always");
-                opt("DeathMessageVisibility", Nbt::String(t.death.clone()), t.death == "always");
-                opt("CollisionRule", Nbt::String(t.collision.clone()), t.collision == "always");
-                opt(
-                    "Players",
-                    Nbt::List(t.players.iter().map(|p| Nbt::String(p.clone())).collect()),
-                    t.players.is_empty(),
-                );
-                Nbt::Compound(f)
-            })
-            .collect();
         let mut root = Vec::new();
-        if !objs.is_empty() {
-            root.push(("Objectives".into(), Nbt::List(objs)));
+        if !objectives.is_empty() {
+            root.push(("Objectives".into(), Nbt::List(objectives)));
         }
         if !scores.is_empty() {
             root.push(("PlayerScores".into(), Nbt::List(scores)));
@@ -338,14 +390,62 @@ impl Board {
         Nbt::Compound(root)
     }
 
-    fn entry(&mut self, holder: &str) -> &mut BTreeMap<String, Score> {
-        if let Some(i) = self.scores.iter().position(|(h, _)| h == holder) {
-            return &mut self.scores[i].1;
+    /// Saved objectives, in the game's stream order.
+    fn objectives_nbt(&self) -> Vec<Nbt> {
+        let saved = |o: &Objective| {
+            let mut f = vec![("Name".into(), Nbt::String(o.name.clone()))];
+            push_unless_default(&mut f, "CriteriaName", Nbt::String(o.criteria.clone()), o.criteria == "dummy");
+            f.push(("DisplayName".into(), o.display.clone()));
+            push_unless_default(&mut f, "RenderType", Nbt::String(o.render.clone()), o.render == "integer");
+            push_unless_default(&mut f, "display_auto_update", Nbt::Byte(1), !o.auto_update);
+            if let Some(fm) = &o.format {
+                f.push(("format".into(), fm.clone()));
+            }
+            Nbt::Compound(f)
+        };
+        self.obj_order.iter_stream().filter_map(|n| self.objective(n)).map(saved).collect()
+    }
+
+    /// Saved scores: holders in the game's stream order, each holder's objectives in name order.
+    fn scores_nbt(&self) -> Vec<Nbt> {
+        let mut scores = Vec::new();
+        for (h, m) in self.holders.streamed_scores() {
+            for (o, sc) in m {
+                let mut f =
+                    vec![("Name".into(), Nbt::String(h.to_owned())), ("Objective".into(), Nbt::String(o.clone()))];
+                push_unless_default(&mut f, "Score", Nbt::Int(sc.value), sc.value == 0);
+                push_unless_default(&mut f, "Locked", Nbt::Byte(1), !sc.locked);
+                if let Some(d) = &sc.display {
+                    f.push(("display".into(), d.clone()));
+                }
+                if let Some(fm) = &sc.format {
+                    f.push(("format".into(), fm.clone()));
+                }
+                scores.push(Nbt::Compound(f));
+            }
         }
-        self.scores.push((holder.to_owned(), BTreeMap::new()));
-        self.holder_order.insert(holder);
-        let n = self.scores.len() - 1;
-        &mut self.scores[n].1
+        scores
+    }
+
+    /// Saved teams, in the game's stream order.
+    fn teams_nbt(&self) -> Vec<Nbt> {
+        let saved = |t: &Team| {
+            let mut f = vec![("Name".into(), Nbt::String(t.name.clone())), ("DisplayName".into(), t.display.clone())];
+            if let Some(c) = &t.color {
+                f.push(("TeamColor".into(), Nbt::String(c.clone())));
+            }
+            push_unless_default(&mut f, "AllowFriendlyFire", Nbt::Byte(0), t.friendly_fire);
+            push_unless_default(&mut f, "SeeFriendlyInvisibles", Nbt::Byte(0), t.see_invisibles);
+            push_unless_default(&mut f, "MemberNamePrefix", t.prefix.clone(), is_empty_text(&t.prefix));
+            push_unless_default(&mut f, "MemberNameSuffix", t.suffix.clone(), is_empty_text(&t.suffix));
+            push_unless_default(&mut f, "NameTagVisibility", Nbt::String(t.nametag.clone()), t.nametag == "always");
+            push_unless_default(&mut f, "DeathMessageVisibility", Nbt::String(t.death.clone()), t.death == "always");
+            push_unless_default(&mut f, "CollisionRule", Nbt::String(t.collision.clone()), t.collision == "always");
+            let players = Nbt::List(t.players.iter().map(|p| Nbt::String(p.clone())).collect());
+            push_unless_default(&mut f, "Players", players, t.players.is_empty());
+            Nbt::Compound(f)
+        };
+        self.team_order.iter_stream().filter_map(|n| self.team(n)).map(saved).collect()
     }
 
     pub fn objective(&self, name: &str) -> Option<&Objective> {
@@ -353,21 +453,29 @@ impl Board {
     }
 
     pub fn get(&self, holder: &str, obj: &str) -> Option<i32> {
-        self.scores.iter().find(|(h, _)| h == holder)?.1.get(obj).map(|s| s.value)
+        self.holders.get(holder)?.get(obj).map(|s| s.value)
     }
 
     pub fn score(&self, holder: &str, obj: &str) -> Option<&Score> {
-        self.scores.iter().find(|(h, _)| h == holder)?.1.get(obj)
+        self.holders.get(holder)?.get(obj)
+    }
+
+    /// Every score of a holder, by objective name (`players list <holder>`).
+    pub fn holder_scores(&self, holder: &str) -> Option<&HolderScores> {
+        self.holders.get(holder)
     }
 
     /// Objective tracked by clients: displayed in at least one slot.
     pub fn tracked(&self, obj: &str) -> bool {
-        self.slots.values().any(|o| o == obj)
+        displayed(&self.slots, obj)
     }
 
     /// Score created if needed; `true` if it was just created (it will be sent at the first write).
     fn score_mut(&mut self, holder: &str, obj: &str) -> (&mut Score, bool) {
-        let m = self.entry(holder);
+        if self.paths.one_lookup {
+            return self.holders.open(holder, obj);
+        }
+        let m = self.holders.entry(holder);
         let created = !m.contains_key(obj);
         (m.entry(obj.to_owned()).or_default(), created)
     }
@@ -377,16 +485,82 @@ impl Board {
         if self.tracked(obj)
             && let Some(sc) = self.score(holder, obj)
         {
-            let ev = ScoreEvent::Score {
-                holder: holder.to_owned(),
-                objective: obj.to_owned(),
-                value: sc.value,
-                display: sc.display.clone(),
-                format: format_net(&sc.format),
-            };
+            let ev = score_packet(holder, obj, sc);
             self.out.push(ev);
         }
         self.dirty = true;
+    }
+
+    /// The objective state a command's writes need, looked up once (see [`ScoreTarget`]).
+    pub fn score_target(&self, obj: &str) -> ScoreTarget {
+        ScoreTarget { auto_update: self.objective(obj).is_some_and(|o| o.auto_update), tracked: self.tracked(obj) }
+    }
+
+    /// Opens a score for a command (created silently if needed, like [`Board::touch`]): its
+    /// value and whether this access created it, in one lookup.
+    pub fn open_score(&mut self, holder: &str, obj: &str) -> (i32, bool) {
+        let (sc, created) = self.holders.open(holder, obj);
+        (sc.value, created)
+    }
+
+    /// [`Board::write`] through an access opened by [`Board::open_score`], the objective state
+    /// given by the command: one lookup.
+    pub fn write_score(
+        &mut self,
+        holder: &str,
+        obj: &str,
+        target: ScoreTarget,
+        value: i32,
+        name: Option<Nbt>,
+        sync: bool,
+    ) {
+        let (sc, _) = self.holders.open(holder, obj);
+        if apply_write(sc, value, name.filter(|_| target.auto_update), sync) {
+            if target.tracked {
+                self.out.push(score_packet(holder, obj, sc));
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// Opens a score and writes `f(current value)` (0 for a new score, sent even unchanged) in one
+    /// lookup, like [`Board::touch`] then [`Board::write`]; returns the written value.
+    pub fn update_score(
+        &mut self,
+        holder: &str,
+        obj: &str,
+        target: ScoreTarget,
+        name: Option<Nbt>,
+        f: impl FnOnce(i32) -> i32,
+    ) -> i32 {
+        let (sc, created) = self.holders.open(holder, obj);
+        let value = f(sc.value);
+        if apply_write(sc, value, name.filter(|_| target.auto_update), created) {
+            if target.tracked {
+                self.out.push(score_packet(holder, obj, sc));
+            }
+            self.dirty = true;
+        }
+        value
+    }
+
+    /// Every objective of `criteria` written for `holder` (`f` receives the old value, 0 if
+    /// new), without listing the objectives first; `name`: the holder's display name, copied
+    /// into the objectives that ask for it.
+    pub fn update_criteria(&mut self, criteria: &str, holder: &str, name: Option<Nbt>, f: impl Fn(i32) -> i32) {
+        for o in self.objectives.iter().filter(|o| o.criteria == criteria) {
+            // By name, like a command naming the objective (a hand-edited save may repeat one).
+            let target = self.score_target(&o.name);
+            let (sc, created) = self.holders.open(holder, &o.name);
+            let value = f(sc.value);
+            let shown = if target.auto_update { name.clone() } else { None };
+            if apply_write(sc, value, shown, created) {
+                if target.tracked {
+                    self.out.push(score_packet(holder, &o.name, sc));
+                }
+                self.dirty = true;
+            }
+        }
     }
 
     /// Writes a score of a holder without a display name (name only).
@@ -412,19 +586,7 @@ impl Board {
     pub fn write(&mut self, holder: &str, obj: &str, value: i32, name: Option<Nbt>, sync: bool) {
         let auto = self.objective(obj).is_some_and(|o| o.auto_update);
         let (sc, _) = self.score_mut(holder, obj);
-        let mut changed = sync;
-        if auto
-            && let Some(n) = name
-            && sc.display.as_ref().is_none_or(|d| !crate::items::nbt_eq(d, &n))
-        {
-            sc.display = Some(n);
-            changed = true;
-        }
-        if sc.value != value {
-            sc.value = value;
-            changed = true;
-        }
-        if changed {
+        if apply_write(sc, value, name.filter(|_| auto), sync) {
             self.score_changed(holder, obj);
         }
     }
@@ -461,35 +623,46 @@ impl Board {
     /// Reset: unknown holder = nothing;
     /// emptied holder = forgotten, packet without objective (if an objective is tracked).
     pub fn reset(&mut self, holder: &str, obj: Option<&str>) {
-        let Some(i) = self.scores.iter().position(|(h, _)| h == holder) else { return };
-        let removed = match obj {
-            Some(o) => self.scores[i].1.remove(o).is_some(),
-            None => {
-                self.scores[i].1.clear();
-                false
+        match self.holders.reset(holder, obj) {
+            Reset::UnknownHolder | Reset::NothingRemoved => {}
+            Reset::HolderForgotten => {
+                if !self.slots.is_empty() {
+                    self.out.push(ScoreEvent::Reset { holder: holder.to_owned(), objective: None });
+                }
+                self.dirty = true;
             }
-        };
-        if self.scores[i].1.is_empty() {
-            self.scores.remove(i);
-            self.holder_order.remove(holder);
-            if !self.slots.is_empty() {
-                self.out.push(ScoreEvent::Reset { holder: holder.to_owned(), objective: None });
+            Reset::ScoreRemoved => {
+                if let Some(o) = obj.filter(|o| self.tracked(o)) {
+                    self.out.push(ScoreEvent::Reset { holder: holder.to_owned(), objective: Some(o.to_owned()) });
+                }
+                self.dirty = true;
             }
-            self.dirty = true;
-        } else if let Some(o) = obj.filter(|_| removed) {
-            if self.tracked(o) {
-                self.out.push(ScoreEvent::Reset { holder: holder.to_owned(), objective: Some(o.to_owned()) });
-            }
-            self.dirty = true;
         }
+    }
+
+    /// Rank of `holder`'s team (the first one listing it).
+    fn team_rank(&self, holder: &str) -> Option<usize> {
+        if self.paths.member_index {
+            // No member at all (the common case of an entity removal): no UUID text to read.
+            if self.members.is_empty() {
+                return None;
+            }
+            return self.members.rank(holder).map(|r| r as usize);
+        }
+        self.teams.iter().position(|t| t.players.iter().any(|p| p == holder))
     }
 
     /// Removal of a member from their team (removal packet).
     pub fn leave_team(&mut self, holder: &str) -> bool {
-        let Some(t) = self.teams.iter_mut().find(|t| t.players.iter().any(|p| p == holder)) else { return false };
+        let Some(rank) = self.team_rank(holder) else { return false };
+        let t = &mut self.teams[rank];
         t.players.retain(|p| p != holder);
         let name = t.name.clone();
-        self.touch_teams();
+        if self.paths.member_index {
+            self.members.remove(holder, &self.teams);
+        } else {
+            self.touch_teams();
+        }
         self.out.push(ScoreEvent::Team { name, mode: 4, params: None, members: vec![holder.to_owned()] });
         self.dirty = true;
         true
@@ -499,9 +672,13 @@ impl Board {
     /// this one (the game then counts a success and sends removal then addition).
     pub fn join_team(&mut self, holder: &str, team: &str) -> bool {
         self.leave_team(holder);
-        let Some(t) = self.teams.iter_mut().find(|t| t.name == team) else { return false };
-        t.players.push(holder.to_owned());
-        self.touch_teams();
+        let Some(rank) = self.teams.iter().position(|t| t.name == team) else { return false };
+        self.teams[rank].players.push(holder.to_owned());
+        if self.paths.member_index {
+            self.members.add(holder, rank as u32);
+        } else {
+            self.touch_teams();
+        }
         self.out.push(ScoreEvent::Team {
             name: team.to_owned(),
             mode: 3,
@@ -514,7 +691,7 @@ impl Board {
 
     /// Does it hold anything that an entity removal should erase (test without allocation)?
     pub fn has_entries(&self) -> bool {
-        !self.scores.is_empty() || self.teams.iter().any(|t| !t.players.is_empty())
+        !self.holders.is_empty() || self.teams.iter().any(|t| !t.players.is_empty())
     }
 
     /// Entity (non-player) permanently removed from the world: scores erased,
@@ -522,6 +699,30 @@ impl Board {
     pub fn entity_removed(&mut self, holder: &str) {
         self.reset(holder, None);
         self.leave_team(holder);
+    }
+
+    /// [`Board::entity_removed`] for the entity of `uuid` (named by its canonical text). Called for
+    /// every entity leaving the world once a single score or member exists: with
+    /// `RUSTCRAFT_OPT_SCOREUUIDSET`, an entity that has neither costs a set lookup, without
+    /// formatting its UUID.
+    pub fn remove_entity(&mut self, uuid: u128) {
+        if !self.has_entries() || (self.paths.uuid_set && !self.may_name_entity(uuid)) {
+            return;
+        }
+        self.entity_removed(&crate::nbtio::uuid_text(uuid));
+    }
+
+    /// Could the canonical text of `uuid` name a holder or a member? Exact for the holders; for
+    /// the members, exact with the member index, otherwise "yes" as soon as a team has members.
+    fn may_name_entity(&self, uuid: u128) -> bool {
+        if self.holders.names_uuid(uuid) != Some(false) {
+            return true;
+        }
+        if self.paths.member_index {
+            self.members.rank_by_uuid(uuid).is_some()
+        } else {
+            self.teams.iter().any(|t| !t.players.is_empty())
+        }
     }
 
     /// Objectives of a criterion, in creation order.
@@ -564,7 +765,7 @@ impl Board {
     /// Tracked holders, in the game's listing order (streaming traversal); those whose scores have all
     /// disappeared with their objective stay tracked (until they are reset or on reload).
     pub fn holders(&self) -> Vec<String> {
-        self.holder_order.iter_stream().map(str::to_owned).collect()
+        self.holders.streamed().map(str::to_owned).collect()
     }
 
     /// Objectives in the game's listing order.
@@ -591,14 +792,19 @@ impl Board {
             self.set_display_slot(i, None);
         }
         self.objectives.retain(|x| x.name != name);
-        for (_, m) in &mut self.scores {
-            m.remove(name);
-        }
+        self.holders.remove_objective(name);
         self.dirty = true;
     }
 
+    /// A team added (it may come with members: a save, a test).
     pub fn add_team(&mut self, t: Team) {
         self.team_order.insert(&t.name);
+        if self.paths.member_index {
+            let rank = self.teams.len() as u32;
+            for p in &t.players {
+                self.members.add(p, rank);
+            }
+        }
         self.teams.push(t);
         self.touch_teams();
     }
@@ -606,20 +812,57 @@ impl Board {
     pub fn remove_team(&mut self, name: &str) {
         self.team_order.remove(name);
         self.teams.retain(|x| x.name != name);
+        // The teams after it moved down one rank.
+        self.index_members();
         self.touch_teams();
     }
 
-    /// Teams modified outside the methods above (a team's options): the collision rule index
-    /// will be rebuilt at the next use.
-    pub fn touch_teams(&mut self) {
-        self.collision.take();
+    /// Member index rebuilt from the teams (`RUSTCRAFT_OPT_TEAMMEMBERINDEX`).
+    fn index_members(&mut self) {
+        if self.paths.member_index {
+            self.members = TeamMembers::of(&self.teams);
+        }
     }
 
-    /// Collision rule index, built at the first use after a team change. A member registered in
-    /// two teams (save) keeps the first, like `team_of`.
-    pub fn collision_index(&self) -> &CollisionIndex {
+    /// Teams modified outside the methods above (a team's options): push filter state
+    /// recomputed, collision rule index of the former way rebuilt at the next use.
+    pub fn touch_teams(&mut self) {
+        self.collision.take();
+        self.collision_rules_active = self.teams.iter().any(|t| t.collision != "always");
+    }
+
+    /// Push filter: some team has a collision rule other than "always" (otherwise nothing is
+    /// filtered and nothing needs to be looked up).
+    pub fn collision_rules_active(&self) -> bool {
+        if self.paths.member_index { self.collision_rules_active } else { self.collision_index().active }
+    }
+
+    /// Team rank and collision rule code of the member named by `uuid`'s canonical text (an
+    /// entity); `None` without team, or while no team has a rule (filter inactive).
+    pub fn collision_rule_by_uuid(&self, uuid: u128) -> Option<(u32, u8)> {
+        if !self.paths.member_index {
+            return self.collision_index().by_uuid.get(&uuid).copied();
+        }
+        let rank = self.members.rank_by_uuid(uuid).filter(|_| self.collision_rules_active)?;
+        Some((rank, collision_code(&self.teams[rank as usize].collision)))
+    }
+
+    /// [`Board::collision_rule_by_uuid`] for a member whose name is not a canonical UUID text (a
+    /// player); `None` for a name that is one.
+    pub fn collision_rule_by_name(&self, name: &str) -> Option<(u32, u8)> {
+        if !self.paths.member_index {
+            return self.collision_index().by_name.get(name).copied();
+        }
+        let rank = self.members.rank_by_plain_name(name).filter(|_| self.collision_rules_active)?;
+        Some((rank, collision_code(&self.teams[rank as usize].collision)))
+    }
+
+    /// Collision rule index of the former way, built at the first use after a team change. A
+    /// member registered in two teams (save) keeps the first, like `team_of`.
+    fn collision_index(&self) -> &CollisionIndex {
         self.collision.get_or_init(|| {
-            let mut ix = CollisionIndex { active: self.teams.iter().any(|t| t.collision != "always"), ..Default::default() };
+            let mut ix =
+                CollisionIndex { active: self.teams.iter().any(|t| t.collision != "always"), ..Default::default() };
             if !ix.active {
                 return ix;
             }
@@ -644,8 +887,18 @@ impl Board {
         self.teams.iter().find(|t| t.name == name)
     }
 
+    /// Team of `holder` (the first one listing it).
     pub fn team_of(&self, holder: &str) -> Option<&Team> {
-        self.teams.iter().find(|t| t.players.iter().any(|p| p == holder))
+        self.team_rank(holder).map(|r| &self.teams[r])
+    }
+
+    /// [`Board::team_of`] the entity of `uuid` (named by its canonical text): with the member
+    /// index, its text is never formatted.
+    pub fn team_of_uuid(&self, uuid: u128) -> Option<&Team> {
+        if !self.paths.member_index {
+            return self.team_of(&crate::nbtio::uuid_text(uuid));
+        }
+        self.members.rank_by_uuid(uuid).map(|r| &self.teams[r as usize])
     }
 
     /// Name decorated by the team: prefix, color, suffix.
@@ -672,18 +925,12 @@ impl Board {
             "hideForOwnTeam" => 3,
             _ => 0,
         };
-        let col = |v: &str| match v {
-            "never" => 1,
-            "pushOtherTeams" => 2,
-            "pushOwnTeam" => 3,
-            _ => 0,
-        };
         TeamParams {
             display: Some(t.display.clone()),
             prefix: Some(t.prefix.clone()),
             suffix: Some(t.suffix.clone()),
             nametag: vis(&t.nametag),
-            collision: col(&t.collision),
+            collision: i32::from(collision_code(&t.collision)),
             color: t.color.as_ref().and_then(|c| COLORS.iter().position(|x| x == c)).map(|i| i as i32),
             options: i8::from(t.friendly_fire) | if t.see_invisibles { 2 } else { 0 },
         }
@@ -725,18 +972,25 @@ impl Board {
                 out.push(ScoreEvent::Display { slot: *slot as i32, objective: o.name.clone() });
             }
         }
-        for (h, m) in self.holder_order.iter().filter_map(|h| self.scores.iter().find(|(x, _)| x == h)) {
+        for (h, m) in self.holders.listed_scores() {
             if let Some(sc) = m.get(&o.name) {
-                out.push(ScoreEvent::Score {
-                    holder: h.clone(),
-                    objective: o.name.clone(),
-                    value: sc.value,
-                    display: sc.display.clone(),
-                    format: format_net(&sc.format),
-                });
+                out.push(score_packet(h, &o.name, sc));
             }
         }
         out
+    }
+
+    /// The holders' table, listing order and UUID set, and the member index, agree with each
+    /// other and with the teams.
+    #[cfg(test)]
+    pub fn check_consistent(&self) {
+        self.holders.check_consistent();
+        if self.paths.member_index {
+            self.members.check_consistent(&self.teams);
+        } else {
+            assert!(self.members.is_empty(), "member index kept on the former path");
+        }
+        assert_eq!(self.collision_rules_active, self.teams.iter().any(|t| t.collision != "always"));
     }
 }
 
@@ -934,9 +1188,8 @@ mod tests {
         }
         assert_eq!(b.holders().join(","), "Notch,Dinnerbone,Steve,#fake,a,e,i,j,Grumm,h,jeb_,l,f,b,d,k");
         // Objective removed: holders without a score stay tracked.
-        for (_, m) in &mut b.scores {
-            m.remove("o");
-        }
+        b.remove_objective("o");
         assert_eq!(b.holders().len(), 16);
+        b.check_consistent();
     }
 }
