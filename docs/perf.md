@@ -3936,3 +3936,40 @@ generations planned by C4-M03, done here because the kept rows need them (proof
 Axes not concerned: integrated server, network, disk, chunk loading, startup (client interface
 code); GPU and VRAM: the same quads are sent (layers equal to the byte); energy: less CPU per
 frame while the list or the sidebar is shown.
+## C1-M09: `jmath` sine and cosine, exact product and series (03/11, loaded machine)
+
+Micro-bench `rc-worldgen --test noise_opt sincos_paths_bench -- --ignored` (trial profile, machine
+at 100% load: other agents compiling; best of 5), 10⁶ angles in ±10. Default = new, `=0` = old.
+Switches: `RUSTCRAFT_OPT_TWO_PROD_FMA` (bodies compiled for the FMA instruction, chosen by runtime
+detection), `RUSTCRAFT_OPT_TWO_PROD_SPLIT` (Veltkamp split and Dekker product, the fallback without
+FMA; both at 0 = old library `fma` call), `RUSTCRAFT_OPT_SINCOS_ONE_SERIES` (sin or cos alone runs
+only the Taylor series it returns), `RUSTCRAFT_OPT_SINCOS_INTERLEAVED` (both series advance in the
+same loop, their two chains of dependent divisions overlap). Every path gives the same bits by
+construction (the product error is exact, hence unique; each series does the same operations in
+the same order): frozen digest recorded with the old code (all 32 switch combinations), 10⁷ random
+angles in ±10⁵ plus edge angles against the old path, exhaustive `check_sincos`, `decor_ref` 0
+differences.
+
+| Lead (switch) | sin + cos separately, ms | `sincos`, ms | Note |
+|---|---|---|---|
+| old (library `fma`, both series one after the other) | 700 | 351 | — |
+| split alone (`TWO_PROD_SPLIT`, FMA off) | 946 | 482 | +35%: here the library `fma` already runs the instruction (call only); the split is for processors without FMA, where the library emulates it (not measurable on this machine) |
+| FMA compiled alone (`TWO_PROD_FMA`) | 633 | 328 | −10% / −7% |
+| one series alone (`SINCOS_ONE_SERIES`) | 367 | 359 | −48% on sin, cos alone (they computed both series and kept one) |
+| interleaved alone (`SINCOS_INTERLEAVED`) | 435 | 226 | −36% on `sincos` |
+| one series + interleaved | 360 | 217 | — |
+| split + both series switches (processor without FMA) | 500 | 306 | −29% / −13% against old |
+| FMA + both series switches (default here) | 350 | 211 | −50% / −40% |
+
+Threads (`sincos`, 4 × 10⁶ angles in ±10⁵, old → default, ms): 1 thread 1,466 → 855, 2: 701 → 462,
+4: 369 → 240, 8: 186 → 129, 16: 101 → 76, 32: 63 → 61 (the 32-thread run shares the cores with the
+compiling agents). Decoration (`decor_ref decoration_profile`, 61 cases, 2 alternating passes):
+52.8 / 52.9 → 51.1 / 51.5 ms (−3%; `ore_iron_upper` 3.09 → 2.27 ms). Spawn search: about 850
+sin/cos pairs, under 1 ms against the climate sampling, nothing to gain there. GPU: not relevant
+(f64 not guaranteed in WGSL, and the calls are scattered single angles). Memory: none.
+Wrong split constant (2²⁷ instead of 2²⁷ + 1) is not detected by the tests: it only alters the
+last bit of an error term near 2⁻¹⁰⁶, below the final rounding; dropping the error term is detected.
+Decision: all at 1 by default until the quiet-machine generation scene bench.
+Still to do outside `jmath.rs`: the separate `sin(a)`, `cos(a)` pairs of `chunkgen.rs` (spawn search),
+`structure.rs` and `tree.rs` can call `jmath::sincos` (one reduction, interleaved series: 217
+against 360 ms per 10⁶).
