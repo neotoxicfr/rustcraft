@@ -3024,6 +3024,18 @@ bench_g3f13 -- --ignored --nocapture`), loaded machine (other agents compiling).
     (test `generated_heightmaps_one_walk_match`, three seeds and flat, 25 chunks each; the stored
     fingerprints of generation pass). Kept, on by default; scene bench (chunk loading) to run on a
     quiet machine.
+    Adversarial review (series 3, 03/11): slices of 4096 cells match the index layout, the start
+    index and the stop at the bottom are exact, two maps sharing a bit are both filled; the one
+    assumption is that no map counts an air state (true with the game's data: block tags are read
+    from the jar only). The game's own priming also starts below the highest section that is not
+    all air and never counts plain air, so the result is the game's. No defect found. New tests
+    `decor_region::tests::air_states_count_for_no_height_map` (air, cave air and void air count
+    for no map; it alone catches cave air counted for the surface maps, which the generated-chunk
+    test misses because cave air lies underground) and
+    `top_non_air_is_the_top_of_the_highest_filled_slice`; sabotages checked (top one slice too
+    low, a map not released once found, cave air counted). `bench_prime_final` again, two runs,
+    loaded machine (other agents compiling): noise 5.08 / 5.40 ms → 0.53 / 0.62 ms, flat 9.83 /
+    9.38 ms → 0.82 / 0.97 ms, the same ratio as above (about 9 to 11 times).
   - GPU not applicable (a few hundred kilobytes copied and walked once, result needed at once by
     the server thread). Not built: reusing the 9 copies across the 128 attempts of a grass bone
     meal (the copies would have to follow the live side effects of each replay); lazy height

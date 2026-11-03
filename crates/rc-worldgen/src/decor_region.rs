@@ -820,3 +820,48 @@ pub fn add_n(p: [i32; 3], d: Dir, n: i32) -> [i32; 3] {
 pub fn offset(p: [i32; 3], dx: i32, dy: i32, dz: i32) -> [i32; 3] {
     [p[0] + dx, p[1] + dy, p[2] + dz]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{DecoChunk, Hm};
+
+    /// The one-walk priming skips every slice above the highest one that holds anything but plain
+    /// air, and walks the rest without testing for air: both are only right if no height map
+    /// counts an air state (the game never counts plain air either, and starts below the highest
+    /// section that is not all air).
+    #[test]
+    fn air_states_count_for_no_height_map() {
+        let Some(w) = crate::structure::tests::world_data() else { return };
+        let b = &*w.blocks;
+        for block in [b.k.air, b.k.cave_air, b.k.void_air] {
+            let s = b.default_state(block);
+            assert_eq!(b.facts(s).hm, 0, "state {s} (an air) counts for a height map");
+        }
+        let stone = b.state_from_str("minecraft:stone").expect("stone");
+        assert_ne!(b.facts(stone).hm & Hm::WorldSurface.bit(), 0, "stone must count: the check above would be empty");
+    }
+
+    /// Top of the highest slice that is not all plain air: a single block at the bottom or at the
+    /// top cell of a slice moves it to the top of that slice; cave air counts as "not plain air"
+    /// (harmless: it only starts the walk higher); an all-air chunk gives its bottom.
+    #[test]
+    fn top_non_air_is_the_top_of_the_highest_filled_slice() {
+        let Some(w) = crate::structure::tests::world_data() else { return };
+        let b = &*w.blocks;
+        let stone = b.state_from_str("minecraft:stone").expect("stone");
+        let cave_air = b.default_state(b.k.cave_air);
+        let empty = || {
+            let mut c = DecoChunk::new(0, 0, -64, 384);
+            c.blocks.fill(b.default_state(b.k.air));
+            c
+        };
+        assert_eq!(empty().top_non_air(b), -64, "all air");
+        let cases = [(-64, stone, -48), (-49, stone, -48), (79, stone, 80), (80, stone, 96), (319, stone, 320), (200, cave_air, 208)];
+        for (y, block, want) in cases {
+            let mut c = empty();
+            let i = c.index(5, y, 9);
+            c.blocks[i] = block;
+            assert_eq!(c.top_non_air(b), want, "single state {block} at y = {y}");
+        }
+    }
+}
