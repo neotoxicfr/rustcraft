@@ -37,7 +37,7 @@ impl Rng {
 }
 
 /// Kinds of the scene, by type id.
-const KINDS: [&str; 13] = [
+const KINDS: [&str; 14] = [
     "player",
     "zombie",
     "cow",
@@ -51,6 +51,7 @@ const KINDS: [&str; 13] = [
     "enderman",
     "elder_guardian",
     "illusioner",
+    "firework_rocket",
 ];
 
 const NAMES: [&str; 6] = ["deadmau5", "Dinnerbone", "Grumm", "Alex", "Steve", "Zoé"];
@@ -262,6 +263,10 @@ impl Scene {
         let kind = self.ents.map.get(&id).map(|e| e.kind.clone()).unwrap_or_default();
         if kind.ends_with("item_frame") {
             values.push((9, Meta::Item(Some(self.named_stack(id)))));
+        }
+        if kind == "firework_rocket" {
+            let holder = if self.rng.chance(2) { LOCAL_ID } else { 1 };
+            values.push((9, Meta::OptionalInt(Some(holder))));
         }
         if kind == "mannequin" && self.rng.chance(2) {
             let text = if self.rng.chance(2) { Some(Nbt::String("Vendor".into())) } else { None };
@@ -530,7 +535,7 @@ fn below_line_keys_are_kept_while_their_stamp_holds() {
 fn kept_subsets_match_the_walk_of_every_entity() {
     let Some(data) = rc_testdata::version_data() else { return };
     let mut s = Scene::new(&data, 0xD1B5_4A32_D192_ED03, 160);
-    let (mut glowing, mut ghosts, mut guardians) = (0, 0, 0);
+    let (mut glowing, mut ghosts, mut guardians, mut rockets) = (0, 0, 0, 0);
     let (mut glow, mut ghost) = (hashbrown::HashMap::new(), hashbrown::HashSet::new());
     for frame in 0..400 {
         s.step(frame);
@@ -548,13 +553,19 @@ fn kept_subsets_match_the_walk_of_every_entity() {
             (&subsets.guardians, EntitySubsets::is_guardian as fn(&entities::Entity) -> bool),
             (&subsets.bobbers, EntitySubsets::is_bobber),
             (&subsets.effect_mobs, EntitySubsets::is_effect_mob),
+            (&subsets.rockets, EntitySubsets::is_rocket),
         ] {
             let walked = id_set(s.ents.map.values().filter(|e| rule(e)));
             assert_eq!(id_set(s.ents.of_rare_kind(kept, rule)), walked, "frame {frame}: rare kind");
             guardians += walked.len();
         }
+        // Rockets attached to the local player, counted over every entity before.
+        let attached = |e: &&entities::Entity| matches!(e.meta.get(&9), Some(Meta::OptionalInt(Some(LOCAL_ID))));
+        let walked = s.ents.map.values().filter(|e| e.kind == "firework_rocket").filter(attached).count() as u32;
+        assert_eq!(crate::player_env::rockets(&s.ents, LOCAL_ID), walked, "frame {frame}: attached rockets");
+        rockets += walked;
     }
-    assert!(glowing > 2_000 && ghosts > 2_000 && guardians > 2_000, "{glowing} glowing, {ghosts} ghosts, {guardians} rare");
+    assert!(glowing > 2_000 && ghosts > 2_000 && guardians > 2_000 && rockets > 100, "{glowing} glowing, {ghosts} ghosts, {guardians} rare, {rockets} rockets");
 }
 
 fn id_set<'a>(entities: impl Iterator<Item = &'a entities::Entity>) -> hashbrown::HashSet<i32> {

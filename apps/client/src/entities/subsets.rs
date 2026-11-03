@@ -37,6 +37,8 @@ pub struct EntitySubsets {
     pub bobbers: HashSet<i32>,
     /// Monsters with client effects (`entity_fx::has_monster_effects`).
     pub effect_mobs: HashSet<i32>,
+    /// Firework rockets (those attached to the local player boost its glide).
+    pub rockets: HashSet<i32>,
 }
 
 impl EntitySubsets {
@@ -64,6 +66,10 @@ impl EntitySubsets {
         crate::entity_fx::has_monster_effects(&e.kind)
     }
 
+    pub fn is_rocket(e: &Entity) -> bool {
+        e.kind == "firework_rocket"
+    }
+
     pub fn clear(&mut self) {
         *self = EntitySubsets::default();
     }
@@ -82,6 +88,8 @@ impl EntitySubsets {
             self.bobbers.insert(id);
         } else if Self::is_effect_mob(e) {
             self.effect_mobs.insert(id);
+        } else if Self::is_rocket(e) {
+            self.rockets.insert(id);
         }
     }
 
@@ -111,6 +119,7 @@ impl EntitySubsets {
         keep(&mut self.guardians, Self::is_guardian);
         keep(&mut self.bobbers, Self::is_bobber);
         keep(&mut self.effect_mobs, Self::is_effect_mob);
+        keep(&mut self.rockets, Self::is_rocket);
     }
 }
 

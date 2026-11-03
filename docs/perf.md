@@ -4318,7 +4318,8 @@ spreading it over threads costs more than the work; no GPU form).
   The local player is read directly. Two tags at the same distance fall back to the full walk:
   their order is the table's, which only the walk knows (identical to the byte in a launch).
 - Rare kinds (`RUSTCRAFT_OPT_RARE_KIND_LISTS`): guardians and elder guardians (eyes, then beams),
-  fishing bobbers, monsters with client effects (`mob_fx`, illusioner copies) listed at spawn.
+  fishing bobbers, monsters with client effects (`mob_fx`, illusioner copies), firework rockets
+  (those attached to the local player, counted every tick by `player_env.rs`) listed at spawn.
   Their order is the list's: eyes and bobber owners go into tables, beams are opaque quads and
   fishing lines black opaque lines (order invisible); the monster effects draw client-side
   randomness in list order, which the decision of 19/10 allows (the table order was already
@@ -4346,7 +4347,9 @@ spreading it over threads costs more than the work; no GPU form).
   `below_name_revision_moves_with_the_below_lines` (20,000 events), `kept_subsets_match_the_walk_of_every_entity`,
   `player_sets_match_the_old_code`, `splash_state_on_the_entity_matches_the_table`,
   `uuid_text_writes_the_old_form`, `switches_follow_their_variable`; ten sabotages verified in all.
-- Memory: `Entity` + 1 byte (`was_wet`), six small id sets in `Entities` (members only), the kept
+- Same pattern elsewhere: the client block entity tick walked every entity twice for the same
+  player list (positions, then UUIDs and positions): one walk, same order (`app_tick.rs`).
+- Memory: `Entity` + 1 byte (`was_wet`), seven small id sets in `Entities` (members only), the kept
   keys (live tags with a line). Axes not concerned: integrated server, network, disk, chunk loading,
   startup, GPU and VRAM (the same tags, outlines and quads are drawn).
 - Not done: the entity kind as a number instead of a string (242 comparisons; mission of its

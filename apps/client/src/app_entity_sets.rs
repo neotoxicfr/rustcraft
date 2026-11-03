@@ -283,21 +283,15 @@ fn push_tags(
         let discrete = e.flags() & 0x02 != 0;
         // "Below name" line (`scoreboard-teams.md` § 7) under the attribute distance (10 by
         // default, fixed for non-living), name raised above.
-        if t.dist2 < e.below_dist * e.below_dist {
-            let lang = sink.lang();
-            let key = match below_keys.as_deref_mut() {
-                // A mannequin's line comes from its own data, which no stamp follows.
-                Some(keys) if e.kind != "mannequin" => keys.key(e, || below_line(e, rules, profile), lang).map(Cow::Borrowed),
-                _ => below_line(e, rules, profile).map(|line| Cow::Owned(below_line_key(&line, lang))),
+        if t.dist2 < e.below_dist * e.below_dist
+            && let Some(key) = below_key(e, rules, profile, below_keys.as_deref_mut(), sink.lang())
+        {
+            let line_chars = |lang: &rc_text::Lang| {
+                let line = below_line(e, rules, profile).unwrap_or_else(|| rc_text::Component::text(""));
+                rc_text::styled_chars(&rc_text::flatten(&line, lang))
             };
-            if let Some(key) = key {
-                let line_chars = |lang: &rc_text::Lang| {
-                    let line = below_line(e, rules, profile).unwrap_or_else(|| rc_text::Component::text(""));
-                    rc_text::styled_chars(&rc_text::flatten(&line, lang))
-                };
-                sink.push(t.id ^ 0x4000_0000, NameRef::Text(&key), line_chars, anchor, discrete, light);
-                anchor.y += 9.0 * 1.15 * 0.025;
-            }
+            sink.push(t.id ^ 0x4000_0000, NameRef::Text(&key), line_chars, anchor, discrete, light);
+            anchor.y += 9.0 * 1.15 * 0.025;
         }
         sink.push(t.id, source, chars, anchor, discrete, light);
     }
@@ -337,6 +331,22 @@ fn below_line(e: &entities::Entity, rules: &TagRules<'_>, profile: Option<&str>)
         "mannequin" => mannequin_description(e),
         _ if rules.scores.slots[2].is_some() => entity_holder(e, profile).and_then(|h| rules.scores.below_name(&h)),
         _ => None,
+    }
+}
+
+/// Cache key of the "below name" line of `e`, `None` without a line: kept in `keys` between frames,
+/// otherwise built.
+fn below_key<'k>(
+    e: &entities::Entity,
+    rules: &TagRules<'_>,
+    profile: Option<&str>,
+    keys: Option<&'k mut BelowLineKeys>,
+    lang: &rc_text::Lang,
+) -> Option<Cow<'k, str>> {
+    match keys {
+        // A mannequin's line comes from its own data, which no stamp follows.
+        Some(keys) if e.kind != "mannequin" => keys.key(e, || below_line(e, rules, profile), lang).map(Cow::Borrowed),
+        _ => below_line(e, rules, profile).map(|line| Cow::Owned(below_line_key(&line, lang))),
     }
 }
 
