@@ -482,7 +482,7 @@ class Launch(unittest.TestCase):
         self.assertEqual(scenes.chat_commands(script), ["function perf:x", "tp @s ~ ~1 ~"])
 
     def test_chat_commands_written_with_positions(self):
-        with tempfile.TemporaryDirectory(dir=os.path.join(scenes.ROOT, "target")) as out:
+        with bench_dir() as out:
             self.assertEqual(scenes.write_chat_commands(out), sum("cmd" in sc for sc in scenes.SCENES.values()))
             with open(os.path.join(out, "chat-commands", "first-nether-trip.txt"), encoding="utf-8") as f:
                 self.assertEqual(f.read().splitlines()[0], "execute in minecraft:the_nether run tp @s 64.50 -60.00 8.50")
