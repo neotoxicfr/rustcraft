@@ -69,7 +69,7 @@ fn pcm_bytes(p: &Pcm) -> usize {
     p.data.len() * 2
 }
 
-fn is_short(p: &Pcm) -> bool {
+pub(crate) fn is_short(p: &Pcm) -> bool {
     (p.frames() as u64).saturating_mul(1000) < SHORT_MS * u64::from(p.rate.max(1))
 }
 
@@ -147,7 +147,6 @@ impl PcmCache {
         self.bytes
     }
 
-    #[cfg(test)]
     pub(crate) fn contains(&self, path: &str) -> bool {
         self.map.contains_key(path)
     }

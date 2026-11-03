@@ -107,6 +107,12 @@ impl ListenerSlot {
         fence(Acquire);
         (self.seq.load(Relaxed) == s1).then_some(l)
     }
+
+    /// Writes since creation (each write adds 2 to the sequence; the creation writes once).
+    #[cfg(test)]
+    pub(crate) fn writes(&self) -> u64 {
+        self.seq.load(std::sync::atomic::Ordering::Relaxed) / 2
+    }
 }
 
 pub enum Command {
@@ -161,6 +167,9 @@ pub(crate) struct MixOpt {
     pub weights: bool,
     /// `MIXSIMD`: 4 frames at a time (weights and reads in arrays), mono and stereo buffer voices.
     pub simd: bool,
+    /// `AUDIO_MIXER_VOICE_IDS`: a voice is found by id in a compact list of ids (8 bytes each)
+    /// instead of walking the voices themselves (~150 bytes each) for every command.
+    pub voice_ids: bool,
 }
 
 impl MixOpt {
@@ -170,6 +179,7 @@ impl MixOpt {
             mute: crate::switch("MIXMUTE", true),
             weights: crate::switch("MIXWEIGHTS", true),
             simd: crate::switch("MIXSIMD", true),
+            voice_ids: crate::switch("AUDIO_MIXER_VOICE_IDS", true),
         })
     }
 }
@@ -178,6 +188,8 @@ pub struct Mixer {
     opt: MixOpt,
     rate: u32,
     voices: Vec<Voice>,
+    /// Id of each voice, same order as `voices` (kept by the same push and swap_remove).
+    ids: Vec<u64>,
     listener: Listener,
     categories: [f32; Category::COUNT],
     rx: Receiver<Command>,
@@ -194,6 +206,7 @@ impl Mixer {
             opt: MixOpt::get(),
             rate,
             voices: Vec::with_capacity(max_voices),
+            ids: Vec::with_capacity(max_voices),
             listener: Listener::default(),
             categories: [1.0; Category::COUNT],
             rx,
@@ -224,6 +237,7 @@ impl Mixer {
                 }
                 let channels = usize::from(src.channels());
                 let step = step_of(src.rate(), p.pitch, self.rate);
+                self.ids.push(p.id);
                 self.voices.push(Voice {
                     p,
                     src,
@@ -259,7 +273,13 @@ impl Mixer {
     }
 
     fn with(&mut self, id: u64, f: impl FnOnce(&mut Voice)) {
-        if let Some(v) = self.voices.iter_mut().find(|v| v.p.id == id) {
+        let found = if self.opt.voice_ids {
+            // First voice with this id, like the walk below.
+            self.ids.iter().position(|&x| x == id).map(|i| &mut self.voices[i])
+        } else {
+            self.voices.iter_mut().find(|v| v.p.id == id)
+        };
+        if let Some(v) = found {
             f(v);
         }
     }
@@ -326,6 +346,7 @@ impl Mixer {
         let mut i = 0;
         while i < self.voices.len() {
             if self.voices[i].done {
+                self.ids.swap_remove(i);
                 let v = self.voices.swap_remove(i);
                 let _ = self.tx.try_send(Event::Finished(v.p.id, v.src));
             } else {
@@ -340,22 +361,30 @@ impl Mixer {
     /// Pending commands, removed without being applied (log of the equivalence proofs;
     /// voice identifier set to 0 to compare two engines).
     pub(crate) fn drain_log(&mut self) -> Vec<String> {
+        self.drain_log_ids(false)
+    }
+
+    /// [`drain_log`](Self::drain_log) that keeps the voice identifiers when `ids` (two engines
+    /// launching the same sounds in the same order number them alike).
+    pub(crate) fn drain_log_ids(&mut self, ids: bool) -> Vec<String> {
+        let tag = |id: u64| if ids { format!("{id} ") } else { String::new() };
         let mut out = Vec::new();
         while let Ok(c) = self.rx.try_recv() {
             out.push(match c {
                 Command::Play(mut p, src) => {
+                    let id = tag(p.id);
                     p.id = 0;
                     let n = match &src {
                         Source::Buffer(b) => b.data.len(),
                         Source::Stream(_) => usize::MAX,
                     };
-                    format!("play {p:?} channels={} n={n}", src.channels())
+                    format!("play {id}{p:?} channels={} n={n}", src.channels())
                 }
-                Command::Stop(_) => "stop".into(),
+                Command::Stop(id) => format!("stop {}", tag(id)).trim_end().to_owned(),
                 Command::StopAll => "stop_all".into(),
-                Command::Position(_, p) => format!("pos {p:?}"),
-                Command::Gain(_, g) => format!("gain {g}"),
-                Command::Pitch(_, p) => format!("pitch {p}"),
+                Command::Position(id, p) => format!("pos {}{p:?}", tag(id)),
+                Command::Gain(id, g) => format!("gain {}{g}", tag(id)),
+                Command::Pitch(id, p) => format!("pitch {}{p}", tag(id)),
                 Command::Listener(l) => format!("listener {l:?}"),
                 Command::Categories(c) => format!("cat {c:?}"),
                 Command::Pause(m) => format!("pause {m:?}"),
@@ -1030,6 +1059,37 @@ mod tests {
         assert!((gl - 0.595_662).abs() < 1e-5 && (gl - gr).abs() < 1e-6);
     }
 
+    /// Bench (ignored), loaded machine figures only: cost of a command found by voice id
+    /// (position of an attached sound), 64 and 247 live voices, ids list against the voice walk.
+    /// `cargo-file.ps1 test --release -p rc-audio voice_lookup_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "bench"]
+    fn voice_lookup_bench() {
+        for pass in 0..2 {
+            for voices in [64u64, 247] {
+                for voice_ids in [false, true] {
+                    let (_tx, rx) = crossbeam_channel::bounded(1);
+                    let (etx, _erx) = crossbeam_channel::bounded(1);
+                    let mut m = Mixer::new(48_000, 300, rx, etx);
+                    m.opt.voice_ids = voice_ids;
+                    let pcm = noise(1, 100, 1, 48_000);
+                    for id in 0..voices {
+                        m.command(Command::Play(params(id, [0.0; 3], 1.0, true), Source::Buffer(pcm.clone())));
+                    }
+                    const N: u64 = 2_000_000;
+                    let t = std::time::Instant::now();
+                    for k in 0..N {
+                        // Spread over the voices like the attached sounds of a crowd.
+                        let id = k.wrapping_mul(0x9E37_79B9) % voices;
+                        m.command(Command::Position(id, [k as f64, 0.0, 0.0]));
+                    }
+                    let ns = t.elapsed().as_secs_f64() * 1e9 / N as f64;
+                    println!("pass {pass}: {voices} voices, voice_ids={voice_ids}: {ns:.1} ns/command");
+                }
+            }
+        }
+    }
+
     /// Deterministic noise (xorshift), `frames` frames of `ch` channels.
     fn noise(ch: u16, frames: usize, seed: u32, rate: u32) -> Arc<Pcm> {
         let mut x = seed | 1;
@@ -1167,8 +1227,8 @@ mod tests {
     #[test]
     fn mix_digest() {
         let mut seen = Vec::new();
-        for k in 0..8 {
-            let opt = MixOpt { mute: k & 1 != 0, weights: k & 2 != 0, simd: k & 4 != 0 };
+        for k in 0..16 {
+            let opt = MixOpt { mute: k & 1 != 0, weights: k & 2 != 0, simd: k & 4 != 0, voice_ids: k & 8 != 0 };
             seen.push((opt, mix_digest_with(opt)));
         }
         let expected = if cfg!(windows) { MIX_DIGEST } else { seen[0].1 };

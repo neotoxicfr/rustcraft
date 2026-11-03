@@ -4,13 +4,12 @@
 use hashbrown::{HashMap, HashSet};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use rc_assets::Assets;
 
 use crate::decode;
-#[cfg(test)]
 use crate::decode::Pcm;
 use crate::pcm_cache::{self, PcmCache};
 use crate::mixer::{Command, Event, Listener, ListenerSlot, Mixer, Source, VoiceParams};
@@ -58,7 +57,40 @@ pub(crate) struct Opt {
     /// `PCMBUDGET`: PCM cache bounded in bytes, short, frequent and held sounds protected
     /// (`pcm_cache.rs`); 0: unbounded, like the game.
     pub budget: bool,
+    /// `AUDIO_LISTENER_DIFF` (default 0): the listener cell is written only when one of its 9
+    /// components changes. Off: on x86 the write is 10 plain stores, cheaper than the comparison
+    /// (micro-bench in `docs/perf.md`).
+    pub listener_diff: bool,
+    /// `AUDIO_PUMP_SKIP_IDLE`: the per-frame poll skips the outbox when it is empty and the loaded
+    /// sounds when no load is in flight; finished voices are still polled at every frame (the
+    /// tick that sees an end sets the relaunch tick of a repeated sound).
+    pub pump_skip_idle: bool,
+    /// `AUDIO_PUMP_RATE_LIMIT` (default 0): the per-frame poll runs at most once per
+    /// [`PUMP_INTERVAL`]; the tick always polls. Off: reading the clock costs more than the poll
+    /// it saves.
+    pub pump_rate_limit: bool,
+    /// `AUDIO_COMMAND_DEDUP`: no command for an unchanged sound position, category volumes sent
+    /// once per poll (or before the next command) and only when they change.
+    pub command_dedup: bool,
+    /// `SUBTITLE_INTERNED`: subtitle keys shared with the compiled table (`Arc<str>`), found by
+    /// event index instead of a lookup by name and a copy (allocation-free launch path).
+    pub subtitle_interned: bool,
+    /// `SOUND_TABLE_COMPILED_ONLY`: the source table of `sounds.json` (1.6 MB) dropped once
+    /// compiled, with `ids` and `subtitle_interned`, which read only the compiled one.
+    pub compiled_only: bool,
+    /// `SOUND_TABLE_SORTED_LISTING` (default 0): `.ogg` existence checked by binary search in the
+    /// sorted listing instead of a set of every path. Off: the search costs more than the set.
+    pub sorted_listing: bool,
+    /// `AUDIO_PRELOAD_VARIANTS`: at the first playback of an event whose sound is short, its
+    /// other variants are decoded in the background at low priority (allocation-free path).
+    pub preload_variants: bool,
+    /// `AUDIO_LOADER_THREADS`: decoding threads sized from the machine ([`loader_threads`]);
+    /// 0: two threads, as before.
+    pub loader_threads: bool,
 }
+
+/// Minimum time between two per-frame polls (`AUDIO_PUMP_RATE_LIMIT`).
+pub(crate) const PUMP_INTERVAL: Duration = Duration::from_millis(1);
 
 impl Opt {
     pub(crate) fn get() -> Opt {
@@ -71,16 +103,57 @@ impl Opt {
             outbox: crate::switch("AUDIOOUTBOX", true),
             ids: crate::switch("SOUNDIDS", true),
             budget: crate::switch("PCMBUDGET", true),
+            listener_diff: crate::switch("AUDIO_LISTENER_DIFF", false),
+            pump_skip_idle: crate::switch("AUDIO_PUMP_SKIP_IDLE", true),
+            pump_rate_limit: crate::switch("AUDIO_PUMP_RATE_LIMIT", false),
+            command_dedup: crate::switch("AUDIO_COMMAND_DEDUP", true),
+            subtitle_interned: crate::switch("SUBTITLE_INTERNED", true),
+            compiled_only: crate::switch("SOUND_TABLE_COMPILED_ONLY", true),
+            sorted_listing: crate::switch("SOUND_TABLE_SORTED_LISTING", false),
+            preload_variants: crate::switch("AUDIO_PRELOAD_VARIANTS", true),
+            loader_threads: crate::switch("AUDIO_LOADER_THREADS", true),
         })
     }
 
     /// Old paths everywhere (equivalence proofs).
     #[cfg(test)]
-    pub(crate) const OLD: Opt =
-        Opt { background: false, file: false, reopen: false, listener: false, outbox: false, ids: false, budget: false };
+    pub(crate) const OLD: Opt = Opt {
+        background: false,
+        file: false,
+        reopen: false,
+        listener: false,
+        outbox: false,
+        ids: false,
+        budget: false,
+        listener_diff: false,
+        pump_skip_idle: false,
+        pump_rate_limit: false,
+        command_dedup: false,
+        subtitle_interned: false,
+        compiled_only: false,
+        sorted_listing: false,
+        preload_variants: false,
+        loader_threads: false,
+    };
     #[cfg(test)]
-    pub(crate) const NEW: Opt =
-        Opt { background: true, file: true, reopen: true, listener: true, outbox: true, ids: true, budget: true };
+    pub(crate) const NEW: Opt = Opt {
+        background: true,
+        file: true,
+        reopen: true,
+        listener: true,
+        outbox: true,
+        ids: true,
+        budget: true,
+        listener_diff: true,
+        pump_skip_idle: true,
+        pump_rate_limit: true,
+        command_dedup: true,
+        subtitle_interned: true,
+        compiled_only: true,
+        sorted_listing: true,
+        preload_variants: true,
+        loader_threads: true,
+    };
 }
 
 /// Event or file name of a sound: owned (old path, `SOUNDIDS=0`) or shared
@@ -329,6 +402,8 @@ struct Instance {
     state: State,
     /// Sound repeated with a delay: request and generator to relaunch it.
     repeat: Option<(SoundRequest, JavaRandom)>,
+    /// Index of the event in the compiled table (allocation-free launch path).
+    event_index: Option<u32>,
 }
 
 struct Delayed {
@@ -363,6 +438,8 @@ pub struct AudioEngine {
     cmd: Sender<Command>,
     events: Receiver<Event>,
     jobs: Sender<LoadJob>,
+    /// Low-priority decoding (`AUDIO_PRELOAD_VARIANTS`): taken only when no sound waits.
+    background_jobs: Sender<LoadJob>,
     loaded: Receiver<Loaded>,
     output: Output,
     opt: Opt,
@@ -400,13 +477,60 @@ pub struct AudioEngine {
     retiring: Output,
     /// Output openings requested (creation and reopenings), for the client tests.
     opens: u32,
+    /// Bits of the listener last written into the cell (`AUDIO_LISTENER_DIFF`).
+    listener_written: [u64; 9],
+    /// Last per-frame poll, the minimum time between two and the clock that dates them
+    /// (`AUDIO_PUMP_RATE_LIMIT`; the proofs drive a clock of their own).
+    last_pump: Instant,
+    pump_interval: Duration,
+    clock: fn() -> Instant,
+    /// Load jobs sent and not answered yet: while zero, the loaded channel is surely empty.
+    loads_in_flight: usize,
+    /// Category factors the mixer has once it applied every command sent (`AUDIO_COMMAND_DEDUP`).
+    sent_factors: [f32; Category::COUNT],
+    /// A volume or a fade changed since the last `Categories` command.
+    factors_pending: bool,
+    /// Per compiled event, where its first playback stands (`AUDIO_PRELOAD_VARIANTS`; empty
+    /// when off).
+    preload: Vec<Preload>,
+    /// Per-frame polls actually run (proof that the rate limit limits).
+    #[cfg(test)]
+    frame_pumps: u64,
+}
+
+/// First playback of an event, for the preloading of its other variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Preload {
+    /// Never played.
+    Unplayed,
+    /// Played, its sound being decoded: decided when the load answers.
+    Decoding,
+    /// Decided (variants queued, or not to preload).
+    Done,
+}
+
+/// Subtitle key of event `e`: shared with the compiled table (`SUBTITLE_INTERNED`), otherwise
+/// looked up by name in the source table and copied, as before.
+fn subtitle_key(table: &SoundTable, opt: Opt, e: u32) -> Option<Arc<str>> {
+    if opt.subtitle_interned {
+        table.event_subtitle(e).cloned()
+    } else {
+        table.get(table.event_id(e)).and_then(|ev| ev.subtitle.as_deref()).map(Arc::from)
+    }
+}
+
+/// The 9 components of a listener as bits: two listeners are the same value when their bits are.
+fn listener_bits(l: &Listener) -> [u64; 9] {
+    let d = |v: f32| u64::from(v.to_bits());
+    let [x, y, z] = l.pos.map(f64::to_bits);
+    [x, y, z, d(l.forward[0]), d(l.forward[1]), d(l.forward[2]), d(l.up[0]), d(l.up[1]), d(l.up[2])]
 }
 
 /// Subtitle conveyed by a launched (or audibly repeated) sound: translation key, position,
 /// range (infinite if relative or without attenuation), repeated sound.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubtitleEvent {
-    pub key: String,
+    pub key: Arc<str>,
     pub pos: [f64; 3],
     pub range: f32,
     pub repeated: bool,
@@ -430,7 +554,7 @@ impl AudioEngine {
     /// `distance`: attenuation distance `D` of the sound (`sounds.md` § 3.3).
     fn notify_subtitle(&mut self, event: &str, pos: [f64; 3], spatial: bool, distance: f32, repeated: bool) {
         let Some(list) = &mut self.subtitles else { return };
-        let Some(key) = self.table.get(event).and_then(|e| e.subtitle.clone()) else { return };
+        let Some(key) = self.table.get(event).and_then(|e| e.subtitle.as_deref()).map(Arc::from) else { return };
         let range = if spatial { distance } else { f32::INFINITY };
         list.push(SubtitleEvent { key, pos, range, repeated });
     }
@@ -567,21 +691,43 @@ impl AudioEngine {
         }
         self.cmd = cmd;
         self.events = events;
+        // A new mixer starts with every category at 1.
+        self.sent_factors = [1.0; Category::COUNT];
         mixer
     }
 
+    /// Sends a job to the loading threads; each job sent is answered once on `loaded`.
+    fn queue_load(&mut self, job: LoadJob) {
+        if self.jobs.send(job).is_ok() {
+            self.loads_in_flight += 1;
+        }
+    }
+
     fn build(assets: Arc<Assets>, table: SoundTable, rate: u32, opt: Opt) -> (Self, Mixer) {
+        Self::build_with_loaders(assets, table, rate, opt, loader_threads(opt))
+    }
+
+    /// [`build`](Self::build) with `loaders` decoding threads.
+    pub(crate) fn build_with_loaders(
+        assets: Arc<Assets>,
+        table: SoundTable,
+        rate: u32,
+        opt: Opt,
+        loaders: usize,
+    ) -> (Self, Mixer) {
         let flux = (SOURCES as f64).sqrt().floor().clamp(2.0, 8.0) as usize;
         let normal = (SOURCES - flux).clamp(8, 255);
         let (cmd, _) = crossbeam_channel::bounded(0);
         let (_, events) = crossbeam_channel::bounded(0);
         let (jobs, job_rx) = crossbeam_channel::unbounded::<LoadJob>();
+        let (background_jobs, background_rx) = crossbeam_channel::unbounded::<LoadJob>();
         let (loaded_tx, loaded) = crossbeam_channel::unbounded();
         let cache: Cache = Arc::new(Mutex::new(PcmCache::new(opt.budget.then_some(pcm_cache::BUDGET))));
-        for i in 0..2 {
-            let (rx, tx, assets, cache) = (job_rx.clone(), loaded_tx.clone(), assets.clone(), cache.clone());
+        for i in 0..loaders {
+            let (rx, low, tx) = (job_rx.clone(), background_rx.clone(), loaded_tx.clone());
+            let (assets, cache) = (assets.clone(), cache.clone());
             let _ = std::thread::Builder::new().name(format!("rc-audio-load-{i}")).spawn(move || {
-                for job in rx {
+                while let Some(job) = next_job(&rx, &low) {
                     let _ = tx.send(load(&assets, &cache, job));
                 }
             });
@@ -592,6 +738,7 @@ impl AudioEngine {
             cmd,
             events,
             jobs,
+            background_jobs,
             loaded,
             output: Output::None,
             opt,
@@ -617,16 +764,33 @@ impl AudioEngine {
             lost: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             retiring: Output::None,
             opens: 0,
+            listener_written: listener_bits(&Listener::default()),
+            last_pump: Instant::now(),
+            pump_interval: PUMP_INTERVAL,
+            clock: Instant::now,
+            loads_in_flight: 0,
+            sent_factors: [1.0; Category::COUNT],
+            factors_pending: false,
+            preload: Vec::new(),
+            #[cfg(test)]
+            frame_pumps: 0,
         };
         let mixer = engine.new_mixer(rate);
         if opt.ids {
             // Outside the first sound: the engine is built on its own thread (client).
             engine.table.prepare();
+            if opt.subtitle_interned && opt.compiled_only {
+                // Nothing reads the source table any more: launch, subtitles and draws are indexed.
+                engine.table.forget_source();
+            }
+            if opt.preload_variants {
+                engine.preload = vec![Preload::Unplayed; engine.table.len()];
+            }
         }
         // Preloading of the `preload` variants (none in vanilla).
         for path in engine.table.preloads() {
             let job = LoadJob { id: 0, path: Name::Owned(path), stream: false, looping: false, tick: 0, pin: true };
-            let _ = engine.jobs.send(job);
+            engine.queue_load(job);
         }
         (engine, mixer)
     }
@@ -698,7 +862,16 @@ impl AudioEngine {
     /// Sends a command to the audio thread; full channel: kept in the outbox (order
     /// preserved), otherwise lost (old path). Returns `true` if it entered the channel
     /// (or if the audio thread no longer exists); `false` if it waits in the outbox or is lost.
+    /// Pending category volumes go first, so that every command finds them applied, as when
+    /// each volume change was sent at once.
     fn send(&mut self, c: Command) -> bool {
+        if self.factors_pending {
+            self.flush_categories();
+        }
+        self.send_now(c)
+    }
+
+    fn send_now(&mut self, c: Command) -> bool {
         if !self.opt.outbox {
             return !matches!(self.cmd.try_send(c), Err(TrySendError::Full(_)));
         }
@@ -859,8 +1032,9 @@ impl AudioEngine {
         let r = self.table.pick_index(e, &mut rng)?;
         let volume = req.volume * r.volume;
         let distance = volume.max(1.0) * r.attenuation_distance as f32;
-        if let Some(list) = &mut self.subtitles
-            && let Some(key) = self.table.get(self.table.event_id(e)).and_then(|ev| ev.subtitle.clone())
+        if self.subtitles.is_some()
+            && let Some(key) = subtitle_key(&self.table, self.opt, e)
+            && let Some(list) = &mut self.subtitles
         {
             let spatial = !req.relative && req.linear;
             list.push(SubtitleEvent { key, pos: req.pos, range: if spatial { distance } else { f32::INFINITY }, repeated: false });
@@ -894,6 +1068,9 @@ impl AudioEngine {
         let repeat = (req.looping && req.repeat_delay > 0).then_some((req, rng));
         let now = self.ticks;
         let cached = if r.stream { None } else { self.cache.lock().ok().and_then(|mut c| c.get(&path, now)) };
+        if self.opt.preload_variants {
+            self.note_first_playback(e, r.stream, cached.as_deref());
+        }
         let state = if let Some(pcm) = cached {
             self.send(Command::Play(params, Source::Buffer(pcm)));
             State::Playing
@@ -906,7 +1083,7 @@ impl AudioEngine {
                 tick: now,
                 pin: false,
             };
-            let _ = self.jobs.send(job);
+            self.queue_load(job);
             State::Loading
         };
         let inst = Instance {
@@ -919,9 +1096,58 @@ impl AudioEngine {
             start_tick: self.ticks,
             state,
             repeat,
+            event_index: Some(e),
         };
         self.admit(id, inst);
         Some(id)
+    }
+
+    /// Playback of event `e` (`AUDIO_PRELOAD_VARIANTS`): at the first one, once its sound is
+    /// decoded (`pcm`, now or when its load answers), the other variants of a short sound are
+    /// decoded in the background, so that each starts without waiting for its decoding.
+    fn note_first_playback(&mut self, e: u32, stream: bool, pcm: Option<&Pcm>) {
+        let Some(&state) = self.preload.get(e as usize) else { return };
+        match (state, pcm) {
+            (Preload::Done, _) => {}
+            (_, Some(pcm)) => self.decide_preload(e, pcm),
+            (_, None) if stream => self.preload[e as usize] = Preload::Done,
+            (_, None) => self.preload[e as usize] = Preload::Decoding,
+        }
+    }
+
+    /// Long sounds (ambiences) are not preloaded: rare, and their PCM would crowd the cache.
+    fn decide_preload(&mut self, e: u32, pcm: &Pcm) {
+        self.preload[e as usize] = Preload::Done;
+        if pcm_cache::is_short(pcm) {
+            self.preload_variants_of(e);
+        }
+    }
+
+    /// Background decoding of the buffered variants of `e` not in the cache yet.
+    fn preload_variants_of(&mut self, e: u32) {
+        let files = self.table.buffered_files(e);
+        let missing: Vec<Arc<str>> = match self.cache.lock() {
+            Ok(c) => files.iter().map(|&f| self.table.file_path(f)).filter(|p| !c.contains(p)).cloned().collect(),
+            Err(_) => return,
+        };
+        for path in missing {
+            let job = LoadJob { id: 0, path: Name::Shared(path), stream: false, looping: false, tick: self.ticks, pin: false };
+            if self.background_jobs.send(job).is_ok() {
+                self.loads_in_flight += 1;
+            }
+        }
+    }
+
+    /// A load answered for instance `id`: event whose first sound was waiting for it.
+    fn preload_on_load(&mut self, id: u64, decoded: Option<&Pcm>) {
+        let Some(e) = self.instances.get(&id).and_then(|i| i.event_index) else { return };
+        if self.preload.get(e as usize) != Some(&Preload::Decoding) {
+            return;
+        }
+        match decoded {
+            Some(pcm) => self.decide_preload(e, pcm),
+            None => self.preload[e as usize] = Preload::Done,
+        }
     }
 
     /// Line of the sound log (`RUSTCRAFT_SOUNDLOG`).
@@ -1004,7 +1230,7 @@ impl AudioEngine {
                 tick: now,
                 pin: false,
             };
-            let _ = self.jobs.send(job);
+            self.queue_load(job);
             State::Loading
         };
         let inst = Instance {
@@ -1017,6 +1243,7 @@ impl AudioEngine {
             start_tick: self.ticks,
             state,
             repeat,
+            event_index: None,
         };
         self.admit(id, inst);
         Some(id)
@@ -1025,18 +1252,45 @@ impl AudioEngine {
     /// Polls loaded sounds and finished voices. Called by `tick` and `set_listener`.
     fn pump(&mut self) {
         self.poll_output();
-        self.flush();
+        self.flush_categories();
+        let skip_idle = self.opt.pump_skip_idle;
+        // An empty outbox at its base threshold leaves `flush` nothing to do.
+        if !skip_idle || !self.outbox.is_empty() || self.outbox_limit != OUTBOX_MAX {
+            self.flush();
+        }
+        // Every job sent is answered once: with none in flight, the channel is empty.
+        if !skip_idle || self.loads_in_flight > 0 {
+            self.receive_loaded();
+        }
+        self.receive_finished();
+    }
+
+    /// Loaded sounds: launched if their instance still waits for them.
+    fn receive_loaded(&mut self) {
         while let Ok(l) = self.loaded.try_recv() {
+            self.loads_in_flight = self.loads_in_flight.saturating_sub(1);
             match l {
-                Loaded::Ready(id, src) => match self.instances.get_mut(&id) {
-                    Some(inst) if inst.state == State::Loading => {
-                        inst.state = State::Playing;
-                        let params = inst.params;
-                        self.send(Command::Play(params, src));
+                Loaded::Ready(id, src) => {
+                    if !self.preload.is_empty() {
+                        let pcm = match &src {
+                            Source::Buffer(p) => Some(p.clone()),
+                            Source::Stream(_) => None,
+                        };
+                        self.preload_on_load(id, pcm.as_deref());
                     }
-                    _ => drop(src),
-                },
+                    match self.instances.get_mut(&id) {
+                        Some(inst) if inst.state == State::Loading => {
+                            inst.state = State::Playing;
+                            let params = inst.params;
+                            self.send(Command::Play(params, src));
+                        }
+                        _ => drop(src),
+                    }
+                }
                 Loaded::Failed(id, e) => {
+                    if !self.preload.is_empty() {
+                        self.preload_on_load(id, None);
+                    }
                     if let Some(inst) = self.instances.remove(&id) {
                         self.counts[usize::from(inst.stream)] -= 1;
                         if self.warned.insert(inst.event.to_string()) {
@@ -1046,6 +1300,10 @@ impl AudioEngine {
                 }
             }
         }
+    }
+
+    /// Voices finished by the mixer: channel kept 20 ticks, repeated sound queued again.
+    fn receive_finished(&mut self) {
         while let Ok(Event::Finished(id, src)) = self.events.try_recv() {
             drop(src);
             let Some(inst) = self.instances.get_mut(&id) else { continue };
@@ -1082,7 +1340,10 @@ impl AudioEngine {
                 if i.state == State::Playing
                     && (i.params.looping || i.repeat.is_some())
                     && i.params.gain * factor[i.params.category as usize] > 0.0
-                    && let Some(key) = self.table.get(&i.event).and_then(|e| e.subtitle.clone())
+                    && let Some(key) = match i.event_index {
+                        Some(e) => subtitle_key(&self.table, self.opt, e),
+                        None => self.table.get(&i.event).and_then(|e| e.subtitle.as_deref()).map(Arc::from),
+                    }
                 {
                     let spatial = !i.params.relative && i.params.linear;
                     let range = if spatial { i.params.distance } else { f32::INFINITY };
@@ -1137,11 +1398,37 @@ impl AudioEngine {
     pub fn set_listener(&mut self, pos: [f64; 3], forward: [f32; 3], up: [f32; 3]) {
         let l = Listener { pos, forward, up };
         if self.opt.listener {
-            self.slot.store(l);
+            self.store_listener(l);
         } else {
             self.send(Command::Listener(l));
         }
+        if self.opt.pump_rate_limit {
+            // Volumes are not delayed by the limit; loads and ends wait at most one interval.
+            self.flush_categories();
+            let now = (self.clock)();
+            if now.saturating_duration_since(self.last_pump) < self.pump_interval {
+                return;
+            }
+            self.last_pump = now;
+        }
+        #[cfg(test)]
+        {
+            self.frame_pumps += 1;
+        }
         self.pump();
+    }
+
+    /// Writes the listener cell; with `listener_diff`, only when a component changed (the cell
+    /// write costs 10 atomic stores and two fences, the mixer reads it 100 times a second).
+    fn store_listener(&mut self, l: Listener) {
+        if self.opt.listener_diff {
+            let bits = listener_bits(&l);
+            if bits == self.listener_written {
+                return;
+            }
+            self.listener_written = bits;
+        }
+        self.slot.store(l);
     }
 
     /// Volume slider of a category (0 – 1); applies to running sounds.
@@ -1161,11 +1448,36 @@ impl AudioEngine {
     }
 
     fn send_categories(&mut self) {
-        let mut f = [0.0; Category::COUNT];
-        for c in Category::ALL {
-            f[c as usize] = self.category_factor(c);
+        if self.opt.command_dedup {
+            // Sent at the next poll or before the next command: the 11 sliders applied together
+            // (or a slider dragged over several frames) cost one command.
+            self.factors_pending = true;
+            return;
         }
+        let f = self.category_factors();
         self.send(Command::Categories(f));
+    }
+
+    fn category_factors(&self) -> [f32; Category::COUNT] {
+        std::array::from_fn(|c| self.category_factor(Category::ALL[c]))
+    }
+
+    /// Pending category volumes (`AUDIO_COMMAND_DEDUP`), sent only if they differ from the
+    /// mixer's.
+    fn flush_categories(&mut self) {
+        if !self.factors_pending {
+            return;
+        }
+        self.factors_pending = false;
+        let f = self.category_factors();
+        if f.map(f32::to_bits) == self.sent_factors.map(f32::to_bits) {
+            return;
+        }
+        // Without the outbox, a command refused by a full channel is lost: the mixer keeps the
+        // previous factors.
+        if self.send_now(Command::Categories(f)) || self.opt.outbox {
+            self.sent_factors = f;
+        }
     }
 
     /// `stop_sound` (§ 1.5): category and/or event; neither = total stop.
@@ -1278,6 +1590,12 @@ impl AudioEngine {
     /// Moves a running sound (sound attached to an entity).
     pub fn set_position(&mut self, h: SoundHandle, pos: [f64; 3]) {
         if let Some(inst) = self.instances.get_mut(&h.0) {
+            // Same bits: the mixer already has this position (most attached sounds stand still);
+            // only while no command can be lost (outbox).
+            let same = inst.params.pos.map(f64::to_bits) == pos.map(f64::to_bits);
+            if self.opt.command_dedup && self.opt.outbox && same {
+                return;
+            }
             inst.params.pos = pos;
             self.send(Command::Position(h.0, pos));
         }
@@ -1322,6 +1640,31 @@ impl AudioEngine {
     pub fn cache_evicted(&self) -> u64 {
         self.cache.lock().map_or(0, |c| c.evicted)
     }
+}
+
+/// Next job of a loading thread: a sound waiting to play always before a background preload.
+/// `None` once the engine is gone.
+fn next_job(sounds: &Receiver<LoadJob>, preloads: &Receiver<LoadJob>) -> Option<LoadJob> {
+    if let Ok(job) = sounds.try_recv() {
+        return Some(job);
+    }
+    crossbeam_channel::select_biased! {
+        recv(sounds) -> job => job.ok(),
+        recv(preloads) -> job => job.ok().or_else(|| sounds.recv().ok()),
+    }
+}
+
+/// Loading threads: one per 8 logical cores (`RUSTCRAFT_THREADS` to force the count of cores),
+/// between 2 and 4, since a burst of first sounds (entering a village) decodes in parallel;
+/// 2 with `AUDIO_LOADER_THREADS=0`, as before.
+fn loader_threads(opt: Opt) -> usize {
+    if !opt.loader_threads {
+        return 2;
+    }
+    let cores = rc_data::env_str!("RUSTCRAFT_THREADS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, usize::from));
+    (cores / 8).clamp(2, 4)
 }
 
 fn load(assets: &Assets, cache: &Cache, job: LoadJob) -> Loaded {
@@ -1563,3 +1906,7 @@ mod tests_opt;
 #[cfg(test)]
 #[path = "engine_tests_pcm.rs"]
 mod tests_pcm;
+
+#[cfg(test)]
+#[path = "engine_tests_frame.rs"]
+mod tests_frame;
