@@ -20,6 +20,8 @@ thiserror.workspace = true
 
 [dev-dependencies]
 rc-testdata.workspace = true
+# Allocator of the client, under the allocation counter of the evaluator benches.
+mimalloc.workspace = true
 
 [lints]
 workspace = true

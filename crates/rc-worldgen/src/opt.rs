@@ -98,6 +98,26 @@ pub fn vol_pool() -> bool {
     *S
 }
 
+switch!(
+    /// Evaluator: a buffer taken from the context keeps its old values instead of being zeroed
+    /// (every caller writes the elements it reads).
+    take_without_zeroing,
+    "RUSTCRAFT_OPT_TAKE_WITHOUT_ZEROING"
+);
+switch!(
+    /// Evaluator: a buffer is taken from the smallest spare one that holds it, a new one is
+    /// allocated at a rounded size, and the spare buffers of a context are capped in bytes
+    /// (8 MB) instead of in count.
+    best_fit_buffers,
+    "RUSTCRAFT_OPT_BEST_FIT_BUFFERS"
+);
+switch!(
+    /// Terrain: each thread keeps its evaluation context (cache cells, spare buffers) from one
+    /// chunk to the next, reset at the start of each chunk, instead of a new one per chunk.
+    keep_eval_context,
+    "RUSTCRAFT_OPT_KEEP_EVAL_CONTEXT"
+);
+
 /// Spline: point coordinates kept on the stack, sampling without dynamic call.
 /// Off by default (`=1` enables it) until the quiet-machine bench (same figure as `vol_pool`).
 #[inline]
