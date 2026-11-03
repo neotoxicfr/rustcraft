@@ -247,7 +247,7 @@ const TABLE_NAMES: [&str; 5] = ["quarter turn", "half turn", "three-quarter turn
 /// State transformation tables: every build (each lead alone and every combination) gives the
 /// tables of the old build, state by state, and the old build gives the stored value.
 #[test]
-fn state_transforms_fast_matches_old() {
+fn every_table_build_matches_old_tables() {
     let Some(w) = world_data() else { return };
     let b = &*w.blocks;
     let old = StateTransforms::build(b, TableBuild::default());

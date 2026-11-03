@@ -741,31 +741,34 @@ struct PropertyRule {
     new_value: Vec<Option<u8>>,
 }
 
-/// Rule of one property of a block (`any`: one of its states), `None` when the change keeps
-/// every value.
-fn property_rule(
-    b: &Blocks,
+/// The block a plan is worked out for: `any` is one of its states, `props` its properties.
+struct PlannedBlock<'a> {
+    blocks: &'a Blocks,
     any: State,
-    props: &[(Prop, &str, &str)],
-    change: StateChange,
+    props: Vec<(Prop, &'a str, &'a str)>,
     family: BlockFamily,
-    prop: Prop,
-    name: &str,
-) -> Option<PropertyRule> {
-    let values = b.values_of(any, prop)?;
-    let (source, new_value): (Prop, Vec<Option<u8>>) = match side_of(name) {
-        Some(d) => {
-            let from = side_source(change, d)?;
-            let &(source, _, _) = props.iter().find(|(_, n, _)| *n == from.name())?;
-            (source, b.values_of(any, source)?.iter().map(|v| index_of(values, v)).collect())
-        }
-        None => {
-            let changed = |v: &String| changed_value(change, family, name, v).and_then(|new| index_of(values, &new));
-            (prop, values.iter().map(changed).collect())
-        }
-    };
-    let keeps_all = source == prop && new_value.iter().enumerate().all(|(i, v)| v.is_none_or(|v| v as usize == i));
-    (!keeps_all).then_some(PropertyRule { prop, source, new_value })
+}
+
+impl PlannedBlock<'_> {
+    /// Rule of the property `prop` (named `name`), `None` when the change keeps every value.
+    fn property_rule(&self, change: StateChange, prop: Prop, name: &str) -> Option<PropertyRule> {
+        let (b, any) = (self.blocks, self.any);
+        let values = b.values_of(any, prop)?;
+        let (source, new_value): (Prop, Vec<Option<u8>>) = match side_of(name) {
+            Some(d) => {
+                let from = side_source(change, d)?;
+                let &(source, _, _) = self.props.iter().find(|(_, n, _)| *n == from.name())?;
+                (source, b.values_of(any, source)?.iter().map(|v| index_of(values, v)).collect())
+            }
+            None => {
+                let changed =
+                    |v: &String| changed_value(change, self.family, name, v).and_then(|new| index_of(values, &new));
+                (prop, values.iter().map(changed).collect())
+            }
+        };
+        let keeps_all = source == prop && new_value.iter().enumerate().all(|(i, v)| v.is_none_or(|v| v as usize == i));
+        (!keeps_all).then_some(PropertyRule { prop, source, new_value })
+    }
 }
 
 /// One change worked out once for one block, then applied to each of its states by value index.
@@ -790,9 +793,9 @@ impl BlockPlan {
         {
             return plan;
         }
-        let props = b.props_of(any);
+        let block = PlannedBlock { blocks: b, any, props: b.props_of(any), family };
         let rules: Vec<PropertyRule> =
-            props.iter().filter_map(|&(p, name, _)| property_rule(b, any, &props, change, family, p, name)).collect();
+            block.props.iter().filter_map(|&(p, name, _)| block.property_rule(change, p, name)).collect();
         if rules.is_empty() { BlockPlan::Unchanged } else { BlockPlan::Rules(rules) }
     }
 

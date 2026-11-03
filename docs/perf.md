@@ -3529,12 +3529,14 @@ block state were rewritten as text, state by state (≈ 30,000 states × 5, a `V
 - `RUSTCRAFT_OPT_KEEP_TRANSFORMS`: tables (≈ 0.6 MB) kept by the process by jar and version, a
   world opened again skips the build although its generation data are rebuilt.
 
-Proof: `state_transforms_fast_matches_old` compares the 16 combinations of the four build leads
+Proof: `every_table_build_matches_old_tables` compares the 16 combinations of the four build leads
 with the old build state by state, and the old build with the stored fingerprint;
 `state_tables_off_the_critical_path` checks the three places of the build and the kept tables.
-Six sabotages fail them (front-back mirror composed from left-right and a half turn, ascending
+Seven sabotages fail them (front-back mirror composed from left-right and a half turn, ascending
 rail not turned, hinge not swapped, axis turned by a half turn, per-block rules read from the
-partly rewritten state, kept tables not stored).
+partly rewritten state, a side keeping its own value in the per-block rule, kept tables not
+stored). `STATETRANS_FAST` now only copies blocks without an oriented property; its name is left
+to the end-of-wave renaming (proposed: `SKIP_UNORIENTED_BLOCKS`).
 
 | Tables, 1 thread (ms, best of 5) | |
 |---|---|
