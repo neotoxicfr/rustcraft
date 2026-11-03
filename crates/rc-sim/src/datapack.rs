@@ -119,6 +119,13 @@ impl DataPack {
         }
     }
 
+    /// Adds or replaces one file of a loaded pack (tests); parsed copies are dropped.
+    #[cfg(test)]
+    pub fn insert_test_file(&mut self, key: &str, json: &str) {
+        self.files.insert(key.to_owned(), Arc::from(json.as_bytes()));
+        self.cache.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
     fn key(dir: &str, id: &str) -> String {
         let (ns, path) = id.split_once(':').unwrap_or(("minecraft", id));
         if ns == "minecraft" { format!("{dir}/{path}") } else { format!("{ns}:{dir}/{path}") }
