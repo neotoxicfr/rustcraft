@@ -3509,3 +3509,88 @@ rounds, minimum of 5 passes of 400 ticks per scene, loaded machine (other agents
   test of a vehicle's passengers runs only when frozen, the plates also scan the server's item
   and orb lists during a series (empty unless something was born in it), a parked world is
   swept once per family after the player leaves (O(its entities), then a bit test per tick).
+
+## C4-M09: player list (Tab), sidebar, revisions of the player list (03/11, loaded machine)
+
+Micro-benches of the client, real GPU and fonts of the installed game, LOADED machine (other
+agents compiling: absolute figures vary by ×1.5 between launches, the ratios hold). The scenes
+`tab-80`, `hud-busy` and `team-crowd` remain to be run on a quiet machine (`tools/bench/scenes.py`,
+two alternating passes, reference executable), with each switch at 0 and at 1.
+
+**Player list held open** (`tablist_bench`: 80 listed players, three teams with prefix, suffix and
+color, own display names, spectators, header and footer on several lines, heads; the old code,
+frozen in `tablist/tests/reference.rs`, and each switch drawn in turn on every frame so that a
+drifting load weighs on all of them alike; 2,000 frames, two launches):
+
+| Path | text scores, µs/frame | hearts, µs/frame | bytes allocated per frame (text / hearts) |
+|---|---|---|---|
+| old code | 106.2 / 157.4 | 142.4 / 201.6 | 297,597 / 271,998 |
+| rows rebuilt every frame (`TAB_LIST_CACHE=0`, `TAB_SORT_KEY=0`) | 100.4 / 145.9 | 143.4 / 190.4 | 298,365 / 272,766 |
+| sort keys alone (`TAB_LIST_CACHE=0`) | 95.4 / 137.8 | 137.9 / 185.0 | 300,413 / 274,814 |
+| kept rows alone (`TAB_SORT_KEY=0`) | 31.4 / 58.0 | 79.0 / 114.3 | 0 / 0 |
+| both (default) | 31.0 / 57.7 | 78.9 / 110.8 | 0 / 0 |
+
+- Kept rows (`RUSTCRAFT_OPT_TAB_LIST_CACHE`, default 1): sort, names (display name or name
+  formatted by the team), list scores flattened and measured, header and footer wrapped, built
+  once and kept while their inputs hold: revision of the player list (every write except the
+  latency alone), list revision of the scoreboard (score or reset of the objective in the list
+  slot, that slot, objectives, teams), text context of the interface (language, fonts, bound
+  keys), screen width, and header and footer compared by equality on every frame (the application
+  assigns them directly). Latencies refreshed on their own revision; hearts, heads, presence in
+  the world and placement stay per frame. The cleanup of the hearts and faces of departed players
+  runs only after a change of the list or the arrival of a skin (it removed nothing in between).
+  −70 % / −63 % (text), −45 % (hearts); allocations per frame 0 instead of ≈ 300 KB.
+- Sort keys (`RUSTCRAFT_OPT_TAB_SORT_KEY`, default 1): team of each player looked up once
+  instead of at each comparison that reaches it: −5 % of each rebuild; with kept rows, only on a
+  change.
+- A rebuild costs what the old frame cost (65 to 90 µs here): the frame of a change is no slower
+  than before (p99 not worse), the others are cheaper. Memory: the kept rows (≈ 150 KB for 80
+  players) live only while the list is open.
+- Remaining with hearts (≈ 48-56 µs more than text): about 1,600 heart sprites looked up by name
+  per frame, the subject of C4-M39 (resolved sprite ids extended to the hearts). Remaining with
+  text (31 µs): 80 slots of fills, heads, two texts and a latency icon placed through the
+  interface (text cache hashing). The face sprite names `dyn/tab_face/<i>` are built once
+  (80 strings formatted per frame before).
+- Leads not taken: one row rebuilt alone when a single score changes (a server updating a health
+  objective of the list every tick rebuilds 20 times per second); multi-core and GPU not
+  applicable (calls into the interface on the main thread, tens of µs).
+- Proof `tab_list_paths_draw_identical_layers`: 200 frames, text then hearts, changes at fixed
+  frames (one list score, a score of another objective, latencies alone, skin of a listed player
+  then of an unknown one, language, narrower screen, team update and move, display name and
+  spectator, 81st player, departure, unlisting, header, footer removed, bound key, fonts, heads
+  hidden, list hidden for one frame, list slot emptied then filled, list order); layers equal to
+  the byte to the old code for each switch alone and together, rebuilds counted (15 to 40). Ten
+  sabotages fail at their frame (latency not refreshed, language, fonts or keys out of the
+  context, list score or team not moving the list revision, header not compared, width out of the
+  key, removal not moving the player revision, sort keys without the team).
+
+**Sidebar styled lines kept** (`RUSTCRAFT_OPT_SIDEBAR_STYLED_CACHE`, default 1, acts with
+`RUSTCRAFT_OPT_SIDEBARCACHE=1`): the 15 kept rows were flattened, styled and measured on every
+frame (score width measured twice); title, lines, widths and panel width are now kept per
+(rows, text context). `bench_sidebar_draw` (two passes): 14.25 / 8.80 µs per frame styled
+every frame, 3.89 / 3.83 µs kept; 35,452 bytes allocated per frame, 0 kept. Proof
+`sidebar_styled_cache_draws_identical_layers` (120 frames, score changes, language, fonts, other
+local player; layers equal to the byte to the frozen old draw; context ignored: fails at frame 50).
+
+**Borrowed score key** (`RUSTCRAFT_OPT_SCORE_KEY_BORROW`, default 1): list score per listed
+player and "below name" line per entity and per frame looked up with a borrowed key hashed like
+the owned `(String, String)` one (same table, same walk order, the sidebar ties unchanged).
+`bench_score_lookup` (200 holders, two passes): 23.3 / 39.7 ns owned, 8.7 / 17.3 ns borrowed;
+2 allocations (9 bytes) per lookup removed. Proof `borrowed_score_key_finds_the_same_scores`
+(same hash with the table's hasher, same score found, 5,000 random events; swapped names: fails).
+Same pattern elsewhere: `rc-sim` statistics (C6-M28), and two cold lookups (resource cache list
+at startup, variant registry received) left as they are.
+
+**Revisions and generations**: `players::Revision` (stamps from one counter for the process: a
+list rebuilt after a disconnection never reuses one), revision and latency revision of the
+player list, list revision of the scoreboard (proof `list_revision_moves_with_what_the_list_shows`:
+whenever what the list shows changes over 20,000 random events, the revision moved; three
+sabotages fail). `rc_text::Lang::generation` (unique per load), `rc_text::keybinds_generation`
+(moves only when the keys really change), font identity of the interface unique in the process
+(a new interface after a resource reload never reuses one), `Gui::text_context()`: the
+generations planned by C4-M03, done here because the kept rows need them (proof
+`language_and_key_generations`, two sabotages fail).
+
+Axes not concerned: integrated server, network, disk, chunk loading, startup (client interface
+code); GPU and VRAM: the same quads are sent (layers equal to the byte); energy: less CPU per
+frame while the list or the sidebar is shown.
