@@ -41,6 +41,14 @@ impl Tracker {
             self.was_on_ground = on_ground;
         }
     }
+
+    /// The clients were just given the entity at `pos` (a fresh announce): once tracking began,
+    /// the next relative move is coded from there.
+    pub(crate) fn announced_at(&mut self, pos: [f64; 3]) {
+        if self.seen {
+            self.base = pos;
+        }
+    }
 }
 
 /// Tracking range of the player entity type (chunks).

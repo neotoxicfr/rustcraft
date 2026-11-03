@@ -1036,11 +1036,16 @@ impl Server {
         }
     }
 
-    pub(crate) fn show_entities(&self, p: (i32, i32)) {
+    pub(crate) fn show_entities(&mut self, p: (i32, i32)) {
         let Some(list) = self.entities.get(&p) else { return };
+        let mut tracked = Vec::new();
         for (id, e) in list {
             // Spawn (painting and frames at the attachment block), metadata, equipment.
             self.deco_announce(*id, e);
+            tracked.extend(crate::decoration::tracked_position(e).map(|pos| (*id, pos)));
+        }
+        for (id, pos) in tracked {
+            self.deco_announced_at(id, pos);
         }
     }
 

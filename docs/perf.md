@@ -4305,3 +4305,27 @@ frames; GPU = submit and wait of the pass minus an empty pass, 512 × 512):
   one source enum would bring `Event` to 80 bytes.
 - To measure on the quiet machine: `crowd-1000`, `tnt` (event send and receive time,
   `perf_log::received`, channel RAM at peak).
+## C6-F03: kept entity compounds, dirty chunk and refile on chunk change (03/11, loaded machine)
+
+- Fidelity first: a change of a kept compound (`/data merge`, `/tag`, `/tp`, the motion reset
+  after `/tp`) now marks its chunk for the next save (it was lost at reload), and a compound that
+  changes chunk (`/tp`, `/data merge` of `Pos`, an armor stand that falls or is pushed across a
+  border) moves to the list of its new chunk, as the game files an entity under the chunk of its
+  position. Clients see it leave or enter the chunks they were sent (removal, announcement).
+  Proof: `tests_kept_entity_chunks` (5 tests, all fail with the former code).
+- Cost of the refile check in the decorations' edit (every move of an armor stand or a
+  mannequin): `tests_kept_entity_chunks::bench_decoration_edit_chunk_check` (2 passes, 200,000
+  edits): edit 66-68 ns, of which 7.1 ns for the check (position read back, chunk compared). The
+  whole-map search runs only when a border is crossed. Lead noted, not taken: check only in the
+  three edits that write `Pos` (saves the 7 ns on the other edits, at the price of a second edit
+  function to keep in step).
+- `kill` of a kept compound marked every entity chunk of the dimension for the next save; it now
+  marks only the chunk that held it (`RUSTCRAFT_OPT_KILL_REWRITES_ONE_CHUNK=0`: the former way).
+  Deterministic count on the test world (25 entity chunks read): the save after the kill writes
+  1 entity chunk instead of 25; the entities on disk are the same for both paths
+  (`tests_kept_entity_chunks::kill_marks_only_its_chunk_same_disk_contents`). The scene bench
+  kills no kept compound: no scene to measure.
+- Multi-core and GPU: not applicable (one list search per command, mutations in order).
+- Remaining difference, noted: a compound teleported into a chunk whose entities were never read
+  stays in its former list (the game reads the destination file at save time and merges; ours
+  would overwrite it), and stays selectable (the game stops tracking it).
