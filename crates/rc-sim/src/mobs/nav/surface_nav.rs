@@ -4,12 +4,12 @@
 use super::super::env::Fluid;
 use super::super::jrand::JRand;
 use super::super::mob::Mob;
-use super::{Eval, Path, PathType};
+use super::{NodeEvaluator, Path, PathType};
 use crate::server::Server;
 
-impl Eval<'_> {
+impl NodeEvaluator<'_> {
     /// Type of a cell for a flyer.
-    pub(super) fn fly_type(&self, x: i32, y: i32, z: i32) -> PathType {
+    pub(super) fn fly_type(&mut self, x: i32, y: i32, z: i32) -> PathType {
         let mut t = self.type_from_state([x, y, z]);
         if t == PathType::Open && y > self.s.dim.height.min_y {
             let below = self.type_from_state([x, y - 1, z]);
@@ -28,29 +28,17 @@ impl Eval<'_> {
                 _ => PathType::Walkable,
             };
         }
-        if t == PathType::Walkable || t == PathType::Open {
-            for dx in -1..=1 {
-                for dy in -1..=1 {
-                    for dz in -1..=1 {
-                        if dx == 0 && dz == 0 {
-                            continue;
-                        }
-                        match self.type_from_state([x + dx, y + dy, z + dz]) {
-                            PathType::Damaging => return PathType::DamagingInNeighbor,
-                            PathType::Fire | PathType::Lava => return PathType::FireInNeighbor,
-                            PathType::Water => return PathType::WaterBorder,
-                            PathType::DamageCautious => return PathType::DamageCautious,
-                            _ => {}
-                        }
-                    }
-                }
-            }
+        // Same neighbour scan as the ground cells.
+        if (t == PathType::Walkable || t == PathType::Open)
+            && let Some(danger) = self.neighbour_danger(x, y, z)
+        {
+            return danger;
         }
         t
     }
 
     /// Water seen by the amphibious evaluator: border if a direct neighbour is blocking.
-    pub(super) fn amphibious_type(&self, x: i32, y: i32, z: i32) -> Option<PathType> {
+    pub(super) fn amphibious_type(&mut self, x: i32, y: i32, z: i32) -> Option<PathType> {
         if self.type_from_state([x, y, z]) != PathType::Water {
             return None;
         }
@@ -64,7 +52,7 @@ impl Eval<'_> {
     }
 
     fn can_start_fly(&mut self, x: i32, y: i32, z: i32) -> bool {
-        let t = self.mob_type(x, y, z);
+        let t = self.path_type_for_mob(x, y, z);
         self.malus(t) >= 0.0
     }
 
@@ -75,7 +63,7 @@ impl Eval<'_> {
         let (bx, bz) = (m.pos[0].floor() as i32, m.pos[2].floor() as i32);
         let start_y = if m.can_float && m.in_water {
             let mut y = m.block[1];
-            while s.mob_fluid([bx, y, bz]) == Fluid::Water && s.bname([bx, y, bz]) == "minecraft:water" {
+            while s.mob_fluid([bx, y, bz]) == Fluid::Water && s.is_water_block([bx, y, bz]) {
                 y += 1;
             }
             y
@@ -121,7 +109,7 @@ impl Eval<'_> {
     /// The penalty of a walkable cell climbs by 1 at each
     /// examination (node cached), as in the game.
     fn fly_accepted(&mut self, x: i32, y: i32, z: i32) -> Option<usize> {
-        let t = self.mob_type(x, y, z);
+        let t = self.path_type_for_mob(x, y, z);
         let cost = self.malus(t);
         if cost < 0.0 {
             return None;
@@ -199,8 +187,8 @@ impl Eval<'_> {
     /// Vertical neighbours in the water of the amphibious evaluator.
     pub(super) fn amphibious_neighbors(&mut self, cur: usize, out: &mut Vec<usize>) {
         let c = self.nodes[cur];
-        let above = self.mob_type(c.x, c.y + 1, c.z);
-        let here = self.mob_type(c.x, c.y, c.z);
+        let above = self.path_type_for_mob(c.x, c.y + 1, c.z);
+        let here = self.path_type_for_mob(c.x, c.y, c.z);
         let jump = if self.malus(above) >= 0.0 && here != PathType::StickyHoney {
             self.m.step.max(1.0).floor() as i32
         } else {
@@ -287,7 +275,7 @@ impl Server {
         }
         if m.nav.amphibious {
             if m.surf.travel.is_some() {
-                return self.bname(p) == "minecraft:water";
+                return self.is_water_block(p);
             }
             return !self.is_air([p[0], p[1] - 1, p[2]]);
         }

@@ -8,7 +8,11 @@ use rc_physics::Aabb;
 
 use super::env::Fluid;
 use super::species::Kind;
+use crate::chunk::Chunk;
 use crate::server::Server;
+use chunk_region::ChunkRegion;
+pub(crate) use search_buffers::MemoKind;
+use search_buffers::{SearchBuffers, TypeMemo, relative_key};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PathType {
@@ -42,6 +46,40 @@ pub enum PathType {
 }
 
 impl PathType {
+    /// Every path type in declaration order, the order the game's sorted type sets follow.
+    pub(crate) const ALL: [PathType; 27] = {
+        use PathType::*;
+        [
+            Blocked,
+            Open,
+            Walkable,
+            WalkableDoor,
+            Trapdoor,
+            PowderSnow,
+            OnTopOfPowderSnow,
+            Fence,
+            Lava,
+            Water,
+            WaterBorder,
+            Rail,
+            UnpassableRail,
+            FireInNeighbor,
+            Fire,
+            DamagingInNeighbor,
+            Damaging,
+            DoorOpen,
+            DoorWoodClosed,
+            DoorIronClosed,
+            Breach,
+            Leaves,
+            StickyHoney,
+            Cocoa,
+            DamageCautious,
+            OnTopOfTrapdoor,
+            BigMobsCloseToDanger,
+        ]
+    };
+
     pub fn default_malus(self) -> f32 {
         use PathType::*;
         match self {
@@ -287,6 +325,13 @@ impl Nav {
     }
 }
 
+/// Outcome of a path request: the current path kept (it already heads for the target), or a
+/// new one (`None`: no path).
+enum PathPlan {
+    KeepCurrent,
+    New(Option<Path>),
+}
+
 /// What the evaluator knows about the mob.
 pub struct MobView {
     pub kind: Kind,
@@ -313,13 +358,168 @@ pub struct MobView {
     pub malus_override: Vec<(PathType, f32)>,
 }
 
-struct Eval<'a> {
+/// Optimisation switches of the path search, read once from `RUSTCRAFT_OPT_PATH_*` (default:
+/// all on; `=0` restores the old path); the proofs and the bench set them one by one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SearchOptions {
+    /// How a block's path type is found (`RUSTCRAFT_OPT_PATH_TYPE_TABLE`: 0, 1, 2 by default).
+    pub(crate) type_rules: TypeRules,
+    /// Block and cell types kept per position for one search (`RUSTCRAFT_OPT_PATH_MEMO`: 0, 1, 2 by default).
+    pub(crate) memo: MemoKind,
+    /// Buffers kept per thread between searches, footprint types as bits (`RUSTCRAFT_OPT_PATH_SCRATCH`).
+    pub(crate) scratch: bool,
+    /// Chunks around the mob looked up once per search (`RUSTCRAFT_OPT_PATH_REGION`).
+    pub(crate) region: bool,
+    /// Danger-free neighbourhoods told by the section palettes (`RUSTCRAFT_OPT_PATH_PALETTE`).
+    pub(crate) palette: bool,
+}
+
+/// How the path type of a block is found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TypeRules {
+    /// Old path: block names compared, the block read again for each fact (level 0).
+    ByName,
+    /// The block read once, the rules applied to its state (level 1).
+    StateOnce,
+    /// Per-state table, then the speleothem, fence and wall tags (level 2).
+    Table,
+}
+
+impl SearchOptions {
+    /// Every switch at 0 (proofs and bench).
+    #[cfg(test)]
+    pub(crate) const OLD: SearchOptions = SearchOptions {
+        type_rules: TypeRules::ByName,
+        memo: MemoKind::Off,
+        scratch: false,
+        region: false,
+        palette: false,
+    };
+    /// Every switch at its default (proofs and bench).
+    #[cfg(test)]
+    pub(crate) const ALL_NEW: SearchOptions = SearchOptions {
+        type_rules: TypeRules::Table,
+        memo: MemoKind::DirectMapped,
+        scratch: true,
+        region: true,
+        palette: true,
+    };
+
+    pub(crate) fn current() -> SearchOptions {
+        static OPTS: std::sync::OnceLock<SearchOptions> = std::sync::OnceLock::new();
+        *OPTS.get_or_init(|| SearchOptions {
+            type_rules: match rc_data::env_str!("RUSTCRAFT_OPT_PATH_TYPE_TABLE").map(str::trim) {
+                Some("0") => TypeRules::ByName,
+                Some("1") => TypeRules::StateOnce,
+                _ => TypeRules::Table,
+            },
+            memo: match rc_data::env_str!("RUSTCRAFT_OPT_PATH_MEMO").map(str::trim) {
+                Some("0") => MemoKind::Off,
+                Some("1") => MemoKind::HashMap,
+                _ => MemoKind::DirectMapped,
+            },
+            scratch: rc_data::opt_switch!("RUSTCRAFT_OPT_PATH_SCRATCH"),
+            region: rc_data::opt_switch!("RUSTCRAFT_OPT_PATH_REGION"),
+            palette: rc_data::opt_switch!("RUSTCRAFT_OPT_PATH_PALETTE"),
+        })
+    }
+}
+
+/// Path types as bits, bit = declaration order: walking the bits upwards gives the order of the
+/// game's sorted type set, without sorting nor allocating.
+#[derive(Clone, Copy, Default)]
+struct TypeSet(u32);
+
+impl TypeSet {
+    fn insert(&mut self, t: PathType) {
+        self.0 |= 1 << t as u32;
+    }
+
+    /// The members in declaration order (array and count).
+    fn in_order(self) -> ([PathType; 27], usize) {
+        let mut out = [PathType::Blocked; 27];
+        let (mut bits, mut n) = (self.0, 0);
+        while bits != 0 {
+            out[n] = PathType::ALL[bits.trailing_zeros() as usize];
+            n += 1;
+            bits &= bits - 1;
+        }
+        (out, n)
+    }
+}
+
+/// Block types that stop the neighbour scan of a walkable cell (and of a flyer's cell).
+fn stops_neighbour_scan(t: PathType) -> bool {
+    matches!(t, PathType::Damaging | PathType::Fire | PathType::Lava | PathType::Water | PathType::DamageCautious)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Block path types computed by this thread (memo hits not counted), read by the bench.
+    static BLOCK_TYPES_COMPUTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn block_type_computations() -> u64 {
+    BLOCK_TYPES_COMPUTED.get()
+}
+
+/// The mob as the path evaluator sees it, for the penalty tests of one random position draw.
+/// With `RUSTCRAFT_OPT_RANDOM_POS_VIEW` (default) it is built once per draw: the ten tries
+/// only move the mob's random source, never what the view reads (position, size, navigation,
+/// penalties, health, tick); `=0` builds it again at each test.
+pub(crate) struct DrawView(Option<MobView>);
+
+impl DrawView {
+    pub(crate) fn new(s: &Server, m: &super::mob::Mob) -> DrawView {
+        DrawView(share_draw_view().then(|| s.mob_view(m)))
+    }
+
+    /// Penalty of the static type of `p` for the mob.
+    pub(crate) fn has_malus(&self, s: &Server, m: &super::mob::Mob, p: [i32; 3]) -> bool {
+        match &self.0 {
+            Some(view) => s.view_has_malus(view, m, p),
+            None => s.view_has_malus(&s.mob_view(m), m, p),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Proof tests: `RUSTCRAFT_OPT_RANDOM_POS_VIEW` forced on this thread (`None`: the switch).
+    pub(crate) static FORCE_SHARED_DRAW_VIEW: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+fn share_draw_view() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = FORCE_SHARED_DRAW_VIEW.get() {
+        return forced;
+    }
+    rc_data::opt_switch!("RUSTCRAFT_OPT_RANDOM_POS_VIEW")
+}
+
+struct NodeEvaluator<'a> {
     s: &'a Server,
     m: &'a MobView,
+    opts: SearchOptions,
+    /// Level of `RUSTCRAFT_OPT_TAG_BITS` for the tags of the path rules (set by the proofs).
+    tag_mode: u8,
+    /// A whole search (memos kept) rather than one cell type asked on its own.
+    in_search: bool,
+    /// Origin of the cell keys: the mob's block.
+    origin: [i32; 3],
+    region: ChunkRegion<'a>,
     nodes: Vec<Node>,
-    index: HashMap<(i32, i32, i32), usize>,
-    types: HashMap<(i32, i32, i32), PathType>,
+    index: HashMap<u64, usize>,
+    footprint_types: HashMap<u64, PathType>,
     collisions: HashMap<[u64; 6], bool>,
+    block_types: TypeMemo,
+    static_types: TypeMemo,
+    section_danger: HashMap<u64, bool>,
+    heap: Vec<usize>,
+    neighbours: Vec<usize>,
+    target_bests: Vec<(f32, usize)>,
+    target_reached: Vec<bool>,
     ew: i32,
     eh: i32,
 }
@@ -327,28 +527,85 @@ struct Eval<'a> {
 /// Horizontal directions of the game (north, east, south, west) and their clockwise order.
 const HORIZONTAL: [(i32, i32); 4] = [(0, -1), (1, 0), (0, 1), (-1, 0)];
 
-impl<'a> Eval<'a> {
-    fn new(s: &'a Server, m: &'a MobView) -> Eval<'a> {
-        Eval {
+impl<'a> NodeEvaluator<'a> {
+    /// Evaluator of a search, working in `b` (emptied).
+    fn new(s: &'a Server, m: &'a MobView, opts: SearchOptions, b: SearchBuffers) -> NodeEvaluator<'a> {
+        NodeEvaluator {
             s,
             m,
-            nodes: Vec::new(),
-            index: HashMap::new(),
-            types: HashMap::new(),
-            collisions: HashMap::new(),
+            opts,
+            tag_mode: crate::tag_bits::mode(),
+            in_search: true,
+            origin: m.block,
+            region: ChunkRegion::around(m.block),
+            nodes: b.nodes,
+            index: b.index,
+            footprint_types: b.footprint_types,
+            collisions: b.collisions,
+            block_types: b.block_types,
+            static_types: b.static_types,
+            section_danger: b.section_danger,
+            heap: b.heap,
+            neighbours: b.neighbours,
+            target_bests: b.target_bests,
+            target_reached: b.target_reached,
             ew: (m.width + 1.0).floor() as i32,
             eh: (m.height + 1.0).floor() as i32,
         }
     }
 
+    /// Evaluator of one cell type asked outside a search (random positions, penalties): no memo.
+    fn single_cell(s: &'a Server, m: &'a MobView) -> NodeEvaluator<'a> {
+        NodeEvaluator::single_cell_with(s, m, SearchOptions::current())
+    }
+
+    fn single_cell_with(s: &'a Server, m: &'a MobView, opts: SearchOptions) -> NodeEvaluator<'a> {
+        let mut e = NodeEvaluator::new(s, m, opts, SearchBuffers::default());
+        e.in_search = false;
+        e
+    }
+
+    fn into_buffers(self) -> SearchBuffers {
+        SearchBuffers {
+            nodes: self.nodes,
+            index: self.index,
+            footprint_types: self.footprint_types,
+            collisions: self.collisions,
+            block_types: self.block_types,
+            static_types: self.static_types,
+            section_danger: self.section_danger,
+            heap: self.heap,
+            neighbours: self.neighbours,
+            target_bests: self.target_bests,
+            target_reached: self.target_reached,
+        }
+    }
+
+    fn key(&self, x: i32, y: i32, z: i32) -> u64 {
+        relative_key(self.origin, x, y, z)
+    }
+
     fn node(&mut self, x: i32, y: i32, z: i32) -> usize {
-        if let Some(&i) = self.index.get(&(x, y, z)) {
+        let key = self.key(x, y, z);
+        if let Some(&i) = self.index.get(&key) {
             return i;
         }
         self.nodes.push(Node::new(x, y, z));
         let i = self.nodes.len() - 1;
-        self.index.insert((x, y, z), i);
+        self.index.insert(key, i);
         i
+    }
+
+    /// State of the block at `p`, through the chunks of the region when it is on.
+    fn block(&mut self, p: [i32; 3]) -> u32 {
+        if self.opts.region { self.region.state(self.s, p) } else { self.s.st(p) }
+    }
+
+    fn chunk(&mut self, cx: i32, cz: i32) -> Option<&'a Chunk> {
+        if self.opts.region {
+            return self.region.chunk(self.s, cx, cz);
+        }
+        self.s.chunks.get(&(cx, cz)).and_then(|c| c.as_deref())
     }
 
     fn malus(&self, t: PathType) -> f32 {
@@ -370,8 +627,52 @@ impl<'a> Eval<'a> {
         malus(self.m.kind, t)
     }
 
-    /// "Static" type of a single block.
-    fn type_from_state(&self, p: [i32; 3]) -> PathType {
+    /// "Static" type of a single block, kept per position for the search with the memo (the
+    /// search only reads the world: a block cannot change under it).
+    fn type_from_state(&mut self, p: [i32; 3]) -> PathType {
+        let memo = self.memo_kind();
+        if memo == MemoKind::Off {
+            return self.block_type(p);
+        }
+        let key = self.key(p[0], p[1], p[2]);
+        if let Some(t) = self.block_types.get(memo, key) {
+            #[cfg(test)]
+            search_tests::check_memo_hit(t, || self.block_type(p));
+            return t;
+        }
+        let t = self.block_type(p);
+        self.block_types.insert(memo, key, t);
+        t
+    }
+
+    /// The memo of a search (none for a cell type asked on its own).
+    fn memo_kind(&self) -> MemoKind {
+        if self.in_search { self.opts.memo } else { MemoKind::Off }
+    }
+
+    fn block_type(&mut self, p: [i32; 3]) -> PathType {
+        #[cfg(test)]
+        BLOCK_TYPES_COMPUTED.set(BLOCK_TYPES_COMPUTED.get() + 1);
+        if self.opts.type_rules == TypeRules::ByName {
+            return self.type_from_state_by_name(p);
+        }
+        let st = self.block(p);
+        self.type_of_state(st)
+    }
+
+    /// Path type of state `st`: rules of the state (from the table, or applied now), then the tags.
+    fn type_of_state(&self, st: u32) -> PathType {
+        let s = self.s;
+        let table = if self.opts.type_rules == TypeRules::Table { s.mob_states.path_rules.get(st) } else { None };
+        let rule = table.unwrap_or_else(|| {
+            path_states::state_rule(&s.data, &s.bs.t.fluid_mob, st, |st| s.land_ok(st, super::env::mob_states_on()))
+        });
+        let block = s.data.state(st).map_or(u32::MAX, |i| u32::from(i.block));
+        rule.resolve(|tag| s.tag_id_u32(tag, block, self.tag_mode))
+    }
+
+    /// Old rules: block names compared, the block read again for each fact.
+    fn type_from_state_by_name(&self, p: [i32; 3]) -> PathType {
         let s = self.s;
         if s.is_air(p) {
             return PathType::Open;
@@ -433,8 +734,25 @@ impl<'a> Eval<'a> {
         if fluid == Fluid::Water { PathType::Water } else { PathType::Open }
     }
 
-    /// The below and the neighbours.
-    fn static_type(&self, x: i32, y: i32, z: i32) -> PathType {
+    /// The below and the neighbours, kept per position for the search with the memo (the view
+    /// of the mob does not change during a search either).
+    fn static_type(&mut self, x: i32, y: i32, z: i32) -> PathType {
+        let memo = self.memo_kind();
+        if memo == MemoKind::Off {
+            return self.static_type_uncached(x, y, z);
+        }
+        let key = self.key(x, y, z);
+        if let Some(t) = self.static_types.get(memo, key) {
+            #[cfg(test)]
+            search_tests::check_memo_hit(t, || self.static_type_uncached(x, y, z));
+            return t;
+        }
+        let t = self.static_type_uncached(x, y, z);
+        self.static_types.insert(memo, key, t);
+        t
+    }
+
+    fn static_type_uncached(&mut self, x: i32, y: i32, z: i32) -> PathType {
         // F14: linked creaking: cell more than 32 blocks from the heart and no closer than the mob.
         if let Some(h) = self.m.home
             && super::recent::home_blocks(h, [x, y, z], self.m.block)
@@ -465,7 +783,18 @@ impl<'a> Eval<'a> {
         t
     }
 
-    fn check_neighbours(&self, x: i32, y: i32, z: i32) -> PathType {
+    fn check_neighbours(&mut self, x: i32, y: i32, z: i32) -> PathType {
+        self.neighbour_danger(x, y, z).unwrap_or(PathType::Walkable)
+    }
+
+    /// First dangerous block around the cell (3 × 3 × 3, centre column left out, walked x then y
+    /// then z like the game), as the type it gives the cell.
+    fn neighbour_danger(&mut self, x: i32, y: i32, z: i32) -> Option<PathType> {
+        // Only in a search: the palette verdict of a section pays off once kept for the many
+        // cells of the search that share the section.
+        if self.opts.palette && self.in_search && !self.neighbourhood_may_hold_danger(x, y, z) {
+            return None;
+        }
         for dx in -1..=1 {
             for dy in -1..=1 {
                 for dz in -1..=1 {
@@ -473,24 +802,81 @@ impl<'a> Eval<'a> {
                         continue;
                     }
                     match self.type_from_state([x + dx, y + dy, z + dz]) {
-                        PathType::Damaging => return PathType::DamagingInNeighbor,
-                        PathType::Fire | PathType::Lava => return PathType::FireInNeighbor,
-                        PathType::Water => return PathType::WaterBorder,
-                        PathType::DamageCautious => return PathType::DamageCautious,
+                        PathType::Damaging => return Some(PathType::DamagingInNeighbor),
+                        PathType::Fire | PathType::Lava => return Some(PathType::FireInNeighbor),
+                        PathType::Water => return Some(PathType::WaterBorder),
+                        PathType::DamageCautious => return Some(PathType::DamageCautious),
                         _ => {}
                     }
                 }
             }
         }
-        PathType::Walkable
+        None
+    }
+
+    /// Could the blocks around the cell hold one that stops the neighbour scan? A section's
+    /// palette lists every state the section holds, so a section whose palette has none of
+    /// them needs no block read.
+    fn neighbourhood_may_hold_danger(&mut self, x: i32, y: i32, z: i32) -> bool {
+        let min_y = self.s.dim.height.min_y;
+        for cx in (x - 1) >> 4..=(x + 1) >> 4 {
+            for cz in (z - 1) >> 4..=(z + 1) >> 4 {
+                for sy in (y - 1 - min_y) >> 4..=(y + 1 - min_y) >> 4 {
+                    if self.section_may_hold_danger(cx, sy, cz) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn section_may_hold_danger(&mut self, cx: i32, sy: i32, cz: i32) -> bool {
+        let key = relative_key([self.origin[0] >> 4, 0, self.origin[2] >> 4], cx, sy, cz);
+        if let Some(&d) = self.section_danger.get(&key) {
+            return d;
+        }
+        let d = self.section_danger_uncached(cx, sy, cz);
+        self.section_danger.insert(key, d);
+        d
+    }
+
+    fn section_danger_uncached(&mut self, cx: i32, sy: i32, cz: i32) -> bool {
+        let section = self.chunk(cx, cz).and_then(|c| usize::try_from(sy).ok().and_then(|i| c.sections.get(i)));
+        match section {
+            Some(sec) => sec.blocks.may_contain(|st| stops_neighbour_scan(self.type_of_state(st))),
+            // A missing chunk or section reads as state 0, like the block reads.
+            None => stops_neighbour_scan(self.type_of_state(0)),
+        }
     }
 
     /// Type of a cell for the mob (whole footprint).
-    fn mob_type(&mut self, x: i32, y: i32, z: i32) -> PathType {
-        if let Some(&t) = self.types.get(&(x, y, z)) {
+    fn path_type_for_mob(&mut self, x: i32, y: i32, z: i32) -> PathType {
+        let key = self.key(x, y, z);
+        if let Some(&t) = self.footprint_types.get(&key) {
             return t;
         }
-        let mut set: Vec<PathType> = Vec::new();
+        let r = if self.opts.scratch {
+            let mut set = TypeSet::default();
+            self.for_each_footprint_type(x, y, z, |t| set.insert(t));
+            let (types, n) = set.in_order();
+            self.footprint_verdict(x, y, z, &types[..n])
+        } else {
+            let mut set: Vec<PathType> = Vec::new();
+            self.for_each_footprint_type(x, y, z, |t| {
+                if !set.contains(&t) {
+                    set.push(t);
+                }
+            });
+            set.sort();
+            self.footprint_verdict(x, y, z, &set)
+        };
+        self.footprint_types.insert(key, r);
+        r
+    }
+
+    /// Type of each block of the footprint, doors and rails adjusted for the mob.
+    fn for_each_footprint_type(&mut self, x: i32, y: i32, z: i32, mut add: impl FnMut(PathType)) {
         let b = self.m.block;
         for dx in 0..self.ew {
             for dy in 0..self.eh {
@@ -505,14 +891,15 @@ impl<'a> Eval<'a> {
                     {
                         t = PathType::UnpassableRail;
                     }
-                    if !set.contains(&t) {
-                        set.push(t);
-                    }
+                    add(t);
                 }
             }
         }
-        set.sort();
-        let r = if set.len() == 1 {
+    }
+
+    /// The game's choice among the types of the footprint (`set`: no repeats, declaration order).
+    fn footprint_verdict(&mut self, x: i32, y: i32, z: i32, set: &[PathType]) -> PathType {
+        if set.len() == 1 {
             set[0]
         } else if set.contains(&PathType::Fence) {
             PathType::Fence
@@ -522,7 +909,7 @@ impl<'a> Eval<'a> {
             let mut best = PathType::Blocked;
             let mut best_m = self.malus(best);
             let mut neg = None;
-            for &t in &set {
+            for &t in set {
                 let m = self.malus(t);
                 if m < 0.0 {
                     neg = Some(t);
@@ -551,16 +938,22 @@ impl<'a> Eval<'a> {
                     }
                 }
             }
-        };
-        self.types.insert((x, y, z), r);
-        r
+        }
     }
 
-    fn floor_level(&self, p: [i32; 3]) -> f64 {
-        if (self.m.can_float || self.m.amphibious) && self.s.mob_fluid(p) == Fluid::Water {
+    fn floor_level(&mut self, p: [i32; 3]) -> f64 {
+        if !self.opts.region {
+            if (self.m.can_float || self.m.amphibious) && self.s.mob_fluid(p) == Fluid::Water {
+                return f64::from(p[1]) + 0.5;
+            }
+            return floor_level(self.s, p);
+        }
+        if (self.m.can_float || self.m.amphibious) && self.s.fluid_of_state(self.block(p)) == Fluid::Water {
             return f64::from(p[1]) + 0.5;
         }
-        floor_level(self.s, p)
+        let below = [p[0], p[1] - 1, p[2]];
+        let st = self.block(below);
+        f64::from(below[1]) + self.s.collision_top_of_state(st).unwrap_or(0.0)
     }
 
     fn has_collisions(&mut self, b: &Aabb) -> bool {
@@ -627,12 +1020,12 @@ impl<'a> Eval<'a> {
     }
 
     fn can_start_at(&mut self, x: i32, y: i32, z: i32) -> bool {
-        let t = self.mob_type(x, y, z);
+        let t = self.path_type_for_mob(x, y, z);
         t != PathType::Open && self.malus(t) >= 0.0
     }
 
     fn start_node(&mut self, x: i32, y: i32, z: i32) -> usize {
-        let t = self.mob_type(x, y, z);
+        let t = self.path_type_for_mob(x, y, z);
         let i = self.node(x, y, z);
         self.nodes[i].ty = t;
         self.nodes[i].malus = self.malus(t);
@@ -707,7 +1100,7 @@ impl<'a> Eval<'a> {
         if max_y - node_h > self.jump_height() {
             return None;
         }
-        let t = self.mob_type(x, y, z);
+        let t = self.path_type_for_mob(x, y, z);
         let cost = self.malus(t);
         let mut best = None;
         if cost >= 0.0 {
@@ -773,7 +1166,7 @@ impl<'a> Eval<'a> {
     fn first_non_water_below(&mut self, x: i32, y: i32, z: i32, mut best: Option<usize>) -> Option<usize> {
         let mut y = y - 1;
         while y > self.s.dim.height.min_y {
-            let t = self.mob_type(x, y, z);
+            let t = self.path_type_for_mob(x, y, z);
             if t != PathType::Water {
                 return best;
             }
@@ -791,7 +1184,7 @@ impl<'a> Eval<'a> {
             if y - cy > self.m.max_fall {
                 return self.blocked_node(x, cy, z);
             }
-            let t = self.mob_type(x, cy, z);
+            let t = self.path_type_for_mob(x, cy, z);
             let c = self.malus(t);
             if t != PathType::Open {
                 if c >= 0.0 {
@@ -816,8 +1209,8 @@ impl<'a> Eval<'a> {
         }
         let c = self.nodes[cur];
         let mut jump = 0;
-        let above = self.mob_type(c.x, c.y + 1, c.z);
-        let here = self.mob_type(c.x, c.y, c.z);
+        let above = self.path_type_for_mob(c.x, c.y + 1, c.z);
+        let here = self.path_type_for_mob(c.x, c.y, c.z);
         if self.malus(above) >= 0.0 && here != PathType::StickyHoney {
             jump = self.m.step.max(1.0).floor() as i32;
         }
@@ -871,7 +1264,7 @@ impl<'a> Eval<'a> {
 
 /// The static path type of a cell (without the mob's footprint).
 pub fn static_path_type(s: &Server, view: &MobView, p: [i32; 3]) -> PathType {
-    Eval::new(s, view).static_type(p[0], p[1], p[2])
+    NodeEvaluator::single_cell(s, view).static_type(p[0], p[1], p[2])
 }
 
 /// Ground level of a cell: top of the collision shape of the block below.
@@ -979,26 +1372,84 @@ pub fn find_path(
     reach: i32,
     max_visited: i32,
 ) -> Option<Path> {
-    let mut ev = Eval::new(s, m);
+    find_path_with(s, m, &[target], max_len, reach, max_visited, SearchOptions::current())
+}
+
+/// The game's A* towards a set of targets: stops as soon as a target is in range; path towards the
+/// best node of the shortest reached target, otherwise of the nearest target.
+pub fn find_path_multi(
+    s: &Server,
+    m: &MobView,
+    targets: &[[i32; 3]],
+    max_len: f32,
+    reach: i32,
+    max_visited: i32,
+) -> Option<Path> {
+    find_path_with(s, m, targets, max_len, reach, max_visited, SearchOptions::current())
+}
+
+/// Both searches with explicit switches: with one target, the set search is the single-target
+/// search (same heuristic, same stop, same choice of the best node).
+pub(crate) fn find_path_with(
+    s: &Server,
+    m: &MobView,
+    targets: &[[i32; 3]],
+    max_len: f32,
+    reach: i32,
+    max_visited: i32,
+    opts: SearchOptions,
+) -> Option<Path> {
+    if targets.is_empty() {
+        return None;
+    }
+    let buffers = if opts.scratch { search_buffers::take_kept() } else { SearchBuffers::default() };
+    let mut ev = NodeEvaluator::new(s, m, opts, buffers);
     let from = ev.start()?;
-    let tnode = Node::new(target[0], target[1], target[2]);
-    let mut best: (f32, usize) = (f32::MAX, from);
-    let h = |n: &Node| n.dist(&tnode);
-    {
-        let hv = h(&ev.nodes[from]);
-        if hv < best.0 {
-            best = (hv, from);
+    let mut best = std::mem::take(&mut ev.target_bests);
+    let mut reached = std::mem::take(&mut ev.target_reached);
+    best.resize(targets.len(), (f32::MAX, from));
+    reached.resize(targets.len(), false);
+    explore(&mut ev, targets, from, (max_len, reach, max_visited), &mut best, &mut reached);
+    let path = best_path(&ev.nodes, targets, &best, &reached);
+    (ev.target_bests, ev.target_reached) = (best, reached);
+    if opts.scratch {
+        search_buffers::keep(ev.into_buffers());
+    }
+    path
+}
+
+/// Node expansion of the A* from `from` (limits: walked length, reach, visited nodes); keeps
+/// per target the best node (distance, index) and whether it was reached.
+fn explore(
+    ev: &mut NodeEvaluator,
+    targets: &[[i32; 3]],
+    from: usize,
+    (max_len, reach, max_visited): (f32, i32, i32),
+    best: &mut [(f32, usize)],
+    reached: &mut [bool],
+) {
+    let nearest = |nodes: &[Node], n: usize, best: &mut [(f32, usize)]| -> f32 {
+        let mut b = f32::MAX;
+        for (i, t) in targets.iter().enumerate() {
+            let h = nodes[n].dist_to(*t);
+            if h < best[i].0 {
+                best[i] = (h, n);
+            }
+            b = b.min(h);
         }
+        b
+    };
+    let hv = nearest(&ev.nodes, from, best);
+    {
         let n = &mut ev.nodes[from];
         n.g = 0.0;
         n.h = hv;
         n.f = hv;
     }
-    let mut heap = Heap { items: Vec::new() };
+    let mut heap = Heap { items: std::mem::take(&mut ev.heap) };
     heap.insert(&mut ev.nodes, from);
+    let mut nb = std::mem::take(&mut ev.neighbours);
     let mut count = 0;
-    let mut reached = false;
-    let mut nb = Vec::with_capacity(8);
     let origin = ev.nodes[from];
     while !heap.items.is_empty() {
         count += 1;
@@ -1007,8 +1458,14 @@ pub fn find_path(
         }
         let cur = heap.pop(&mut ev.nodes);
         ev.nodes[cur].closed = true;
-        if ev.nodes[cur].manhattan(target) <= reach as f32 {
-            reached = true;
+        let mut any = false;
+        for (i, t) in targets.iter().enumerate() {
+            if ev.nodes[cur].manhattan(*t) <= reach as f32 {
+                reached[i] = true;
+                any = true;
+            }
+        }
+        if any {
             break;
         }
         if ev.nodes[cur].dist(&origin) >= max_len {
@@ -1023,10 +1480,7 @@ pub fn find_path(
             let g = c.g + d + ev.nodes[n].malus;
             let nn = ev.nodes[n];
             if nn.walked < max_len && (nn.heap < 0 || g < nn.g) {
-                let hv = h(&nn);
-                if hv < best.0 {
-                    best = (hv, n);
-                }
+                let hv = nearest(&ev.nodes, n, best);
                 let node = &mut ev.nodes[n];
                 node.came_from = Some(cur);
                 node.g = g;
@@ -1041,18 +1495,45 @@ pub fn find_path(
             }
         }
     }
-    // Path towards the best node of the target.
-    let mut list = Vec::new();
-    let mut i = Some(best.1);
-    while let Some(k) = i {
-        let n = ev.nodes[k];
-        list.push((n.pos(), n.ty));
-        i = n.came_from;
+    ev.heap = heap.items;
+    ev.neighbours = nb;
+}
+
+/// Path towards the best node of the shortest reached target, otherwise of the nearest target
+/// (equal distances: the shorter path).
+fn best_path(nodes: &[Node], targets: &[[i32; 3]], best: &[(f32, usize)], reached: &[bool]) -> Option<Path> {
+    let build = |i: usize, ok: bool| -> Path {
+        let mut list = Vec::new();
+        let mut k = Some(best[i].1);
+        while let Some(j) = k {
+            let n = nodes[j];
+            list.push((n.pos(), n.ty));
+            k = n.came_from;
+        }
+        list.reverse();
+        let dist = list.last().map_or(f32::MAX, |l| Node::new(l.0[0], l.0[1], l.0[2]).manhattan(targets[i]));
+        Path { nodes: list, next: 0, target: targets[i], dist_to_target: dist, reached: ok }
+    };
+    let any = reached.iter().any(|&r| r);
+    let mut out: Option<Path> = None;
+    for (i, &r) in reached.iter().enumerate() {
+        if any && !r {
+            continue;
+        }
+        let p = build(i, any);
+        let better = match &out {
+            None => true,
+            Some(o) if any => p.nodes.len() < o.nodes.len(),
+            Some(o) => {
+                p.dist_to_target < o.dist_to_target
+                    || (p.dist_to_target == o.dist_to_target && p.nodes.len() < o.nodes.len())
+            }
+        };
+        if better {
+            out = Some(p);
+        }
     }
-    list.reverse();
-    let dist = list.last().map_or(f32::MAX, |l| Node::new(l.0[0], l.0[1], l.0[2]).manhattan(target));
-    let _ = tnode.dist_to(target);
-    Some(Path { nodes: list, next: 0, target, dist_to_target: dist, reached })
+    out
 }
 
 impl Server {
@@ -1079,6 +1560,11 @@ impl Server {
             home: super::recent::path_home(m),
             malus_override: m.nav.malus_override.clone(),
         }
+    }
+
+    /// Penalty of the static type of `p` for the mob (random position tests).
+    pub(crate) fn view_has_malus(&self, view: &MobView, m: &super::mob::Mob, p: [i32; 3]) -> bool {
+        mob_malus(m, static_path_type(self, view, p)) != 0.0
     }
 
     /// The maximum fall tolerated (§ 3.5).
@@ -1148,13 +1634,21 @@ impl Server {
         reach: i32,
         max_len: f32,
     ) -> Option<Path> {
+        match self.plan_path(m, target, reach, max_len) {
+            PathPlan::KeepCurrent => m.nav.path.clone(),
+            PathPlan::New(p) => p,
+        }
+    }
+
+    /// Path towards `target`, or the current one when it already heads there.
+    fn plan_path(&self, m: &mut super::mob::Mob, target: [i32; 3], reach: i32, max_len: f32) -> PathPlan {
         // Wall climber: the asked position is kept as is (before the chunk test and the
         // surface adjustment), the one it heads for once its path is done.
         if m.nav.climber {
             m.nav.path_to = Some(target);
         }
         if !self.chunks.get(&(target[0] >> 4, target[2] >> 4)).is_some_and(Option::is_some) {
-            return None;
+            return PathPlan::New(None);
         }
         let target = if m.nav.fly || m.nav.amphibious || m.nav.swim || m.nav.below_surface {
             target
@@ -1162,20 +1656,34 @@ impl Server {
             self.surface_target(target)
         };
         if m.pos[1] < f64::from(self.dim.height.min_y) || !Self::can_update_path(m) {
-            return None;
+            return PathPlan::New(None);
         }
         if let Some(p) = &m.nav.path
             && !p.is_done()
             && m.nav.target_pos == Some(target)
         {
-            return Some(p.clone());
+            return PathPlan::KeepCurrent;
         }
         let view = self.mob_view(m);
-        let path = find_path(self, &view, target, max_len, reach, m.nav.max_visited)?;
+        let Some(path) = find_path(self, &view, target, max_len, reach, m.nav.max_visited) else {
+            return PathPlan::New(None);
+        };
         m.nav.target_pos = Some(path.target);
         m.nav.reach = reach;
         m.nav.reset_stuck_timeout();
-        Some(path)
+        PathPlan::New(Some(path))
+    }
+
+    /// Path asked by the movement helpers: with `RUSTCRAFT_OPT_PATH_KEEP` (default) a kept current
+    /// path is not copied (the copy would only be compared with it and dropped); `=0` copies it.
+    fn plan_path_for_move(&self, m: &mut super::mob::Mob, target: [i32; 3], reach: i32) -> PathPlan {
+        let max_len = (m.follow_range() as f32).max(m.nav.required_length);
+        match self.plan_path(m, target, reach, max_len) {
+            PathPlan::KeepCurrent if !rc_data::opt_switch!("RUSTCRAFT_OPT_PATH_KEEP") => {
+                PathPlan::New(m.nav.path.clone())
+            }
+            plan => plan,
+        }
     }
 
     /// Movement towards a point.
@@ -1188,6 +1696,11 @@ impl Server {
         if !same {
             m.nav.path = Some(p);
         }
+        self.start_current_path(m, speed)
+    }
+
+    /// Movement along the current path (just set, or kept).
+    fn start_current_path(&self, m: &mut super::mob::Mob, speed: f64) -> bool {
         if m.nav.is_done() {
             return false;
         }
@@ -1202,23 +1715,25 @@ impl Server {
     }
 
     pub(crate) fn move_to_pos(&self, m: &mut super::mob::Mob, p: [f64; 3], speed: f64) -> bool {
-        let path = self.create_path(m, super::mth::block_of(p), 1);
-        self.move_to_path(m, path, speed)
+        match self.plan_path_for_move(m, super::mth::block_of(p), 1) {
+            PathPlan::KeepCurrent => self.start_current_path(m, speed),
+            PathPlan::New(path) => self.move_to_path(m, path, speed),
+        }
     }
 
     pub(crate) fn move_to_entity(&self, m: &mut super::mob::Mob, target: [f64; 3], speed: f64) -> bool {
         let reach = if m.nav.climber { 0 } else { 1 };
-        let path = self.create_path(m, super::mth::block_of(target), reach);
-        if path.is_none() && m.nav.climber {
-            m.nav.path_to = Some(super::mth::block_of(target));
-            m.nav.speed_mod = speed;
-            return true;
-        }
-        // Towards an entity, the absence of a path leaves the current path in place (the mob
-        // keeps following the old route); only the call by path or position clears it.
-        match path {
-            Some(p) => self.move_to_path(m, Some(p), speed),
-            None => false,
+        match self.plan_path_for_move(m, super::mth::block_of(target), reach) {
+            PathPlan::KeepCurrent => self.start_current_path(m, speed),
+            PathPlan::New(Some(p)) => self.move_to_path(m, Some(p), speed),
+            PathPlan::New(None) if m.nav.climber => {
+                m.nav.path_to = Some(super::mth::block_of(target));
+                m.nav.speed_mod = speed;
+                true
+            }
+            // Towards an entity, the absence of a path leaves the current path in place (the mob
+            // keeps following the old route); only the call by path or position clears it.
+            PathPlan::New(None) => false,
         }
     }
 
@@ -1453,127 +1968,15 @@ pub fn set_wanted(m: &mut super::mob::Mob, p: [f64; 3], speed: f64) {
 mod surface_nav;
 // Swimming evaluator (F08 guardians, F09 fauna).
 mod swim_nav;
-
-// ---------- Path towards several targets (F05: villager POIs) ----------
-
-/// The game's A* towards a set of targets: stops as soon as a target is in range; path towards the
-/// best node of the shortest reached target, otherwise of the nearest target.
-pub fn find_path_multi(
-    s: &Server,
-    m: &MobView,
-    targets: &[[i32; 3]],
-    max_len: f32,
-    reach: i32,
-    max_visited: i32,
-) -> Option<Path> {
-    if targets.is_empty() {
-        return None;
-    }
-    let mut ev = Eval::new(s, m);
-    let from = ev.start()?;
-    // Best node (distance, index) and reached, per target.
-    let mut best: Vec<(f32, usize)> = vec![(f32::MAX, from); targets.len()];
-    let mut reached = vec![false; targets.len()];
-    let best_h = |nodes: &[Node], n: usize, best: &mut Vec<(f32, usize)>| -> f32 {
-        let mut b = f32::MAX;
-        for (i, t) in targets.iter().enumerate() {
-            let h = nodes[n].dist_to(*t);
-            if h < best[i].0 {
-                best[i] = (h, n);
-            }
-            b = b.min(h);
-        }
-        b
-    };
-    let hv = best_h(&ev.nodes, from, &mut best);
-    {
-        let n = &mut ev.nodes[from];
-        n.g = 0.0;
-        n.h = hv;
-        n.f = hv;
-    }
-    let mut heap = Heap { items: Vec::new() };
-    heap.insert(&mut ev.nodes, from);
-    let mut count = 0;
-    let mut nb = Vec::with_capacity(8);
-    let origin = ev.nodes[from];
-    while !heap.items.is_empty() {
-        count += 1;
-        if count >= max_visited {
-            break;
-        }
-        let cur = heap.pop(&mut ev.nodes);
-        ev.nodes[cur].closed = true;
-        let mut any = false;
-        for (i, t) in targets.iter().enumerate() {
-            if ev.nodes[cur].manhattan(*t) <= reach as f32 {
-                reached[i] = true;
-                any = true;
-            }
-        }
-        if any {
-            break;
-        }
-        if ev.nodes[cur].dist(&origin) >= max_len {
-            continue;
-        }
-        ev.neighbors(cur, &mut nb);
-        for &n in &nb {
-            let c = ev.nodes[cur];
-            // F14: the warden counts distances flat.
-            let d = if ev.m.kind == Kind::Warden { c.dist_xz(&ev.nodes[n]) } else { c.dist(&ev.nodes[n]) };
-            ev.nodes[n].walked = c.walked + d;
-            let g = c.g + d + ev.nodes[n].malus;
-            let nn = ev.nodes[n];
-            if nn.walked < max_len && (nn.heap < 0 || g < nn.g) {
-                let hv = best_h(&ev.nodes, n, &mut best);
-                let node = &mut ev.nodes[n];
-                node.came_from = Some(cur);
-                node.g = g;
-                node.h = hv * 1.5;
-                if node.heap >= 0 {
-                    let f = node.g + node.h;
-                    heap.change_cost(&mut ev.nodes, n, f);
-                } else {
-                    node.f = node.g + node.h;
-                    heap.insert(&mut ev.nodes, n);
-                }
-            }
-        }
-    }
-    let build = |i: usize, ok: bool| -> Path {
-        let mut list = Vec::new();
-        let mut k = Some(best[i].1);
-        while let Some(j) = k {
-            let n = ev.nodes[j];
-            list.push((n.pos(), n.ty));
-            k = n.came_from;
-        }
-        list.reverse();
-        let dist = list.last().map_or(f32::MAX, |l| Node::new(l.0[0], l.0[1], l.0[2]).manhattan(targets[i]));
-        Path { nodes: list, next: 0, target: targets[i], dist_to_target: dist, reached: ok }
-    };
-    let any = reached.iter().any(|&r| r);
-    let mut out: Option<Path> = None;
-    for (i, &r) in reached.iter().enumerate() {
-        if any && !r {
-            continue;
-        }
-        let p = build(i, any);
-        let better = match &out {
-            None => true,
-            Some(o) if any => p.nodes.len() < o.nodes.len(),
-            Some(o) => {
-                p.dist_to_target < o.dist_to_target
-                    || (p.dist_to_target == o.dist_to_target && p.nodes.len() < o.nodes.len())
-            }
-        };
-        if better {
-            out = Some(p);
-        }
-    }
-    out
-}
+// Path type rules of each block state, built once (`RUSTCRAFT_OPT_PATH_TYPE_TABLE`).
+pub(crate) mod path_states;
+// Working memory of a search, kept per thread (`RUSTCRAFT_OPT_PATH_SCRATCH`).
+mod search_buffers;
+// Chunks around the searching mob (`RUSTCRAFT_OPT_PATH_REGION`).
+mod chunk_region;
+// Equivalence proofs of the path search (village of the bench model world).
+#[cfg(test)]
+pub(crate) mod search_tests;
 
 impl Server {
     /// Without surface search; current path kept

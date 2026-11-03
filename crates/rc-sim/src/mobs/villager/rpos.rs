@@ -3,6 +3,7 @@
 //! supplied walk value (null for traders: the first valid position wins).
 
 use super::super::mob::Mob;
+use super::super::nav::DrawView;
 use crate::server::Server;
 
 /// Residence area of a mob (center, radius), `None` without restriction.
@@ -80,15 +81,15 @@ impl Server {
     }
 
     /// Common filter: height, residence, stable destination (and malus for the default shape).
-    fn rpos_valid(&self, m: &Mob, home: Home, restrict: bool, p: [i32; 3], malus: bool) -> bool {
+    fn rpos_valid(&self, m: &Mob, view: &DrawView, home: Home, restrict: bool, p: [i32; 3], malus: bool) -> bool {
         !self.outside_height(p)
             && !(restrict && !within_home(home, p))
             && self.nav_stable(m, p)
-            && !(malus && self.pos_has_malus(m, p))
+            && !(malus && view.has_malus(self, m, p))
     }
 
     /// Climbing out of the solid then refusing water and maluses.
-    fn up_out(&self, m: &Mob, mut p: [i32; 3]) -> Option<[i32; 3]> {
+    fn up_out(&self, m: &Mob, view: &DrawView, mut p: [i32; 3]) -> Option<[i32; 3]> {
         let max = self.dim.height.min_y + self.dim.height.sections as i32 * 16 - 1;
         if self.is_solid(p) {
             p[1] += 1;
@@ -96,7 +97,7 @@ impl Server {
                 p[1] += 1;
             }
         }
-        if self.mob_fluid(p) == super::super::env::Fluid::Water || self.pos_has_malus(m, p) {
+        if self.mob_fluid(p) == super::super::env::Fluid::Water || view.has_malus(self, m, p) {
             return None;
         }
         Some(p)
@@ -107,11 +108,12 @@ impl Server {
         &self,
         m: &mut Mob,
         weight: &dyn Fn(&Server, [i32; 3]) -> f64,
-        mut generate: impl FnMut(&Server, &mut Mob) -> Option<[i32; 3]>,
+        mut generate: impl FnMut(&Server, &mut Mob, &DrawView) -> Option<[i32; 3]>,
     ) -> Option<[f64; 3]> {
+        let view = DrawView::new(self, m);
         let mut best: Option<(f64, [i32; 3])> = None;
         for _ in 0..10 {
-            if let Some(p) = generate(self, m) {
+            if let Some(p) = generate(self, m, &view) {
                 let w = weight(self, p);
                 if w > best.map_or(f64::NEG_INFINITY, |b| b.0) {
                     best = Some((w, p));
@@ -124,10 +126,10 @@ impl Server {
     /// The default position draw.
     pub(crate) fn rpos_default(&self, m: &mut Mob, home: Home, h: i32, v: i32) -> Option<[f64; 3]> {
         let restrict = restricted(m, home, f64::from(h));
-        self.rbest_of(m, &|_, _| 0.0, |s, m| {
+        self.rbest_of(m, &|_, _| 0.0, |s, m, view| {
             let d = rand_dir(m, h, v);
             let p = toward(m, home, f64::from(h), d);
-            s.rpos_valid(m, home, restrict, p, true).then_some(p)
+            s.rpos_valid(m, view, home, restrict, p, true).then_some(p)
         })
     }
 
@@ -143,10 +145,10 @@ impl Server {
     ) -> Option<[f64; 3]> {
         let (dx, dz) = (to[0] - m.pos[0], to[2] - m.pos[2]);
         let restrict = restricted(m, home, f64::from(h));
-        self.rbest_of(m, &|_, _| 0.0, |s, m| {
+        self.rbest_of(m, &|_, _| 0.0, |s, m, view| {
             let d = dir_within(m, 0.0, f64::from(h), v, dx, dz, rad)?;
             let p = toward(m, home, f64::from(h), d);
-            s.rpos_valid(m, home, restrict, p, true).then_some(p)
+            s.rpos_valid(m, view, home, restrict, p, true).then_some(p)
         })
     }
 
@@ -160,13 +162,13 @@ impl Server {
         weight: &dyn Fn(&Server, [i32; 3]) -> f64,
     ) -> Option<[f64; 3]> {
         let restrict = restricted(m, home, f64::from(h));
-        self.rbest_of(m, weight, |s, m| {
+        self.rbest_of(m, weight, |s, m, view| {
             let d = rand_dir(m, h, v);
             let p = toward(m, home, f64::from(h), d);
-            if !s.rpos_valid(m, home, restrict, p, false) {
+            if !s.rpos_valid(m, view, home, restrict, p, false) {
                 return None;
             }
-            s.up_out(m, p)
+            s.up_out(m, view, p)
         })
     }
 
@@ -180,13 +182,13 @@ impl Server {
         dir: [f64; 2],
     ) -> Option<[f64; 3]> {
         let restrict = restricted(m, home, max_h);
-        self.rbest_of(m, &|_, _| 0.0, |s, m| {
+        self.rbest_of(m, &|_, _| 0.0, |s, m, view| {
             let d = dir_within(m, min_h, max_h, v, dir[0], dir[1], f64::from(std::f32::consts::FRAC_PI_2))?;
             let p = toward(m, home, max_h, d);
-            if !s.rpos_valid(m, home, restrict, p, false) {
+            if !s.rpos_valid(m, view, home, restrict, p, false) {
                 return None;
             }
-            s.up_out(m, p)
+            s.up_out(m, view, p)
         })
     }
 

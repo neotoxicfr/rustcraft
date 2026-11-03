@@ -3,12 +3,13 @@
 //! diagonals; the penalty of a cell without fluid (breach) climbs by 8.
 
 use super::super::env::Fluid;
-use super::{Eval, PathType};
+use super::{NodeEvaluator, PathType};
 
-impl Eval<'_> {
+impl NodeEvaluator<'_> {
     /// The path type of a swimming mob (cache by position).
     pub(super) fn swim_type(&mut self, x: i32, y: i32, z: i32) -> PathType {
-        if let Some(&t) = self.types.get(&(x, y, z)) {
+        let key = self.key(x, y, z);
+        if let Some(&t) = self.footprint_types.get(&key) {
             return t;
         }
         let s = self.s;
@@ -33,7 +34,7 @@ impl Eval<'_> {
             // Last cell walked: swim-traversable.
             if s.pathfindable_water(last) { PathType::Water } else { PathType::Blocked }
         };
-        self.types.insert((x, y, z), t);
+        self.footprint_types.insert(key, t);
         t
     }
 
