@@ -10,7 +10,7 @@ description = "Client-side world storage: paletted sections, columns, circular g
 [dependencies]
 
 [dev-dependencies]
-criterion = { version = "0.8.2", default-features = false }
+criterion.workspace = true
 
 [[bench]]
 name = "container"

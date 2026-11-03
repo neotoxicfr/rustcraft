@@ -3509,3 +3509,58 @@ rounds, minimum of 5 passes of 400 ticks per scene, loaded machine (other agents
   test of a vehicle's passengers runs only when frozen, the plates also scan the server's item
   and orb lists during a series (empty unless something was born in it), a parked world is
   swept once per family after the player leaves (O(its entities), then a bit test per tick).
+
+## C7-M03: wgpu without OpenGL and WebGPU, criterion as a workspace dependency, duplicate crates (03/11, loaded machine)
+
+Build-only change: no switch is possible, the comparison is two executables of the same commit
+(`target\notes\before` / `after` of the mission worktree), built through the compilation queue
+(trial profile: no LTO, 16 codegen units, rust-lld), other agents compiling.
+
+- wgpu was built with its default features, among them `gles` (OpenGL backend: `glow`, EGL/WGL
+  loaders, naga's GLSL output) and `webgpu` (compiles nothing on native targets), although the
+  client only ever asks for Vulkan and DX12 (`gpu_backend.rs`, `order`). Now
+  `default-features = false` with `std`, `parking_lot`, `dx12`, `vulkan`, `metal` (kept for a
+  later macOS port) and `wgsl`; no other crate turns `gles` back on (`cargo tree -e features`:
+  naga keeps `wgsl-in`, `hlsl-out`, `spv-out`, loses `glsl-out`).
+- Proof: `gpu_backend::tests::only_the_tried_backends_are_compiled` reads the backends wgpu was
+  compiled with (no GL, no browser WebGPU; Windows: exactly Vulkan + DX12). Sabotage (wgpu back
+  to its default features): fails with `Backends(VULKAN | GL | DX12)`. Linker map of the old
+  executable: 1,537 lines of `wgpu_hal::gles`, 325 of `glow`, 200 of `naga::back::glsl`; new one:
+  0, 0, 0 (same patterns find 1,643 `wgpu_hal::dx12` lines and 1,130 `wgpu_hal::vulkan` lines).
+  GPU tests were not using GL: they ask for a high-performance hardware adapter and skip
+  without one, as before.
+
+| Measure (trial profile, loaded machine) | Before | After | Difference |
+|---|---|---|---|
+| `.text` of `rustcraft.exe` | 36,019,014 B | 35,557,414 B | −461,600 B (−451 KiB, −1.3%) |
+| `.rdata` / `.pdata` | 9,285,080 / 1,211,796 B | 9,141,960 / 1,193,820 B | −143,120 / −17,976 B |
+| Executable file | 46,688,256 B | 46,062,592 B | −625,664 B (−611 KiB) |
+| Packages in `Cargo.lock` | — | 9 removed | `gl_generator`, `glow`, `glutin_wgl_sys`, `khronos-egl`, `khronos_api`, `slotmap`, `termcolor`, `wgpu-core-deps-emscripten`, `xml-rs` |
+| Crates in the client's tree (Windows, normal) | 260 | 255 | −5 |
+| Compile time wgpu-hal → wgpu-core → wgpu (serial chain before rc-app) | 12.8 + 16.1 + 8.7 = 37.6 s | 7.2 + 9.1 + 4.4 = 20.7 s | −16.9 s |
+| naga | 19.4 s | 20.6 s | noise (it lost only the GLSL writer) |
+| OpenGL crates (glow, xml-rs, khronos, gl_generator, glutin_wgl_sys) | ≈ 4.0 s | 0 | −4.0 s |
+
+To measure on a quiet machine: the full release (`RUSTCRAFT_FULL_RELEASE=1`: size of the final
+executable, clean build time) and `scenes.py` title, 3 passes (startup, adapter
+enumeration; expected neutral or better: the instance no longer loads the OpenGL backend).
+
+- criterion: declared once in `[workspace.dependencies]`, `criterion.workspace = true` in the 6
+  crates with benches (rc-data, rc-light, rc-mesh, rc-net, rc-proto-v777, rc-world). Same version
+  and features as the 6 old lines, so cargo already built it once: maintenance gain only (one
+  line to bump), no build time.
+- Duplicate crates (`cargo tree -d`, Windows): bit-set 0.8/0.10 and bit-vec 0.8/0.9
+  (fancy-regex 0.20 vs naga), getrandom 0.2/0.4 (ring 0.17, unicode_names2's build-time
+  generator), hashbrown 0.16/0.17 (gpu-allocator under wgpu-hal), miniz_oxide 0.8/0.9 (png vs
+  flate2), rand_core 0.6/0.10 (build-time generator), syn 2/3 (windows-implement,
+  zerocopy-derive), windows-sys 0.52/0.61 (winit 0.30). No bump aligns any of them: every
+  parent is at its latest stable release (fancy-regex 0.20.0, ring 0.17.14, png 0.18.1,
+  unicode_names2 4.0.0, gpu-allocator through wgpu-hal 30.0.1; winit 0.31 is only a beta), and
+  `cargo update --dry-run` only offers semver-compatible patches that remove none. Unchanged by
+  this mission; to re-check at the next bump of each parent.
+- Critical path for C7-M04 (same trial-profile build of the client, loaded machine, units
+  partly served by the incremental cache): rc-worldgen 19.1 s → rc-sim 109.1 s → rc-app 43.6 s,
+  (171.8 s summed, slightly overlapped by pipelining): the chain spans the whole 169.6 s wall
+  time, rc-sim alone 64% of it; everything else runs beside it. Touching `rc-sim/src/lib.rs` without a change: rc-sim 6.1 s + rc-app 6.2 s. The full
+  release profile (`RUSTCRAFT_FULL_RELEASE`) is not used by this series' agents: its timings
+  are left to C7-M04 on a quiet machine.
