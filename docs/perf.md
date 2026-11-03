@@ -4326,7 +4326,15 @@ frames; GPU = submit and wait of the pass minus an empty pass, 512 × 512):
   is not enough. Builds A and B differ in exactly 20 bytes (header stamp, the stamps of the debug directory and
   the repro hash; the code is identical) because lld writes a PDB whose GUID is a hash of its content. On a test
   program `/DEBUG:NONE` makes `rust-lld` identical (0 bytes) while `/timestamp:0` still leaves 8 bytes (the PDB
-  GUID). A release linked by `rust-lld` must write no PDB, or keep `link.exe`.
+  GUID). A release linked by `rust-lld` must write no PDB, or keep `link.exe`. Builds A and B sat at two paths;
+  the review asked for the same-path case, measured since (profile "essai", rust-lld, `/Brepro` and remap,
+  incremental off, `apps/client/src/main.rs` touched between builds so that only the game crate is compiled
+  and linked again): builds 2, 3 and 4 in the same folder differ two by two in the same 20 bytes, code
+  identical. Cause seen in the PDB: rustc hands the linker `target\release\deps\rustcXXXXXX\symbols.o`, in a
+  folder with a random name made for every link, and lld writes that path into the PDB it hashes. The rule
+  stands at the same path. (Build 1, the first after a rebuild of the dependencies, differs from the others
+  in 769 bytes spread over `.text` and `.rdata`; not explained, outside the conclusion: the earlier A/B with
+  `link.exe`, two complete builds from scratch, was identical.)
 - Not measured here (no CI run from the worktree, the full profile is forbidden through the queue): the full
   profile (thin LTO, one unit) on the real runners, the Linux executable (ELF, `strip`, tar.gz), the duration
   of the jobs. To do with the first manual start of `Reproducibility` before the next tag (4 builds); if the

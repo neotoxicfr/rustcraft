@@ -23,9 +23,12 @@ toolchain (1.99.0: "feature `trim-paths` is required"); switch to it when it is,
 The published Windows build is linked by MSVC `link.exe`, which gives the same bytes twice with `/Brepro`.
 `rust-lld` (used by the quick local profile) does not: it writes a PDB whose GUID is a hash of the PDB
 content, and two builds of the same commit then differ in 20 bytes (the header stamp, the stamps of the
-debug directory and the repro hash, all hash values; the code is identical; measured on the game). On a
-test program, `/DEBUG:NONE` makes `rust-lld` reproducible too, while `/timestamp:0` still leaves the PDB
-GUID. A release linked by `rust-lld` must therefore not write a PDB.
+debug directory and the repro hash, all hash values; the code is identical; measured on the game). This
+holds at the same path too: three links of the same objects in the same folder differ in the same 20 bytes,
+because the PDB names the linker's input `target/release/deps/rustcXXXXXX/symbols.o`, a folder that rustc
+creates with a random name for every link. On a test program, `/DEBUG:NONE` makes `rust-lld` reproducible
+too, while `/timestamp:0` still leaves the PDB GUID. A release linked by `rust-lld` must therefore not write
+a PDB (and so loses the file that names its functions), or keep `link.exe`.
 
 ## Build the executable the way a release does
 
