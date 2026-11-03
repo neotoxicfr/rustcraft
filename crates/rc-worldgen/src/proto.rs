@@ -103,6 +103,28 @@ impl ProtoTerrain {
         self.update_heightmaps(t, x, y, z, s);
     }
 
+    /// Overwrites a plain solid by another one in place (`RUSTCRAFT_OPT_DIRECT_SOLID_WRITE`), and
+    /// says whether it did. Same result as [`ProtoTerrain::set`]: the old block already counts in the
+    /// section and is at or below the top of both height maps, the new one counts in the same
+    /// ones and carries no fluid, so no count, map or mark can change. `y` must be inside the height.
+    #[inline]
+    pub fn replace_plain_solid(&mut self, t: &BlockTable, x: i32, y: i32, z: i32, s: BlockId) -> bool {
+        debug_assert!(y >= self.min_y && y <= self.max_y());
+        let i = self.index(x, y, z);
+        let replaceable = t.is_plain_solid(self.blocks[i]) && t.is_plain_solid(s);
+        if replaceable {
+            self.blocks[i] = s;
+        }
+        replaceable
+    }
+
+    /// The 256 states of the layer at world y (index `x + 16·z`), which must be inside the height.
+    #[inline]
+    pub fn layer_mut(&mut self, y: i32) -> &mut [BlockId] {
+        let start = self.index(0, y, 0);
+        &mut self.blocks[start..start + 256]
+    }
+
     /// Update of the two generation maps for a placement (game order: seabed then surface).
     pub fn update_heightmaps(&mut self, t: &BlockTable, x: i32, y: i32, z: i32, s: BlockId) {
         let of = self.ocean_floor_wg[col(x, z)];

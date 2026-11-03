@@ -13,7 +13,7 @@ use crate::density::Axis;
 use crate::json::Json;
 use crate::math::{floor_f, round_half_up};
 use crate::noise::Simplex;
-use crate::palette::{BlockId, BlockTable};
+use crate::palette::{AIR, BlockId, BlockTable};
 use crate::proto::ProtoTerrain;
 use crate::rng::{Positional, Rng};
 use crate::sampler::{Ctx, Program, S, Sid};
@@ -48,10 +48,20 @@ pub struct MatOpts {
     pub reuse: bool,
     /// `MAT_COLCACHE`: column constants kept, cold temperature discarded by bound.
     pub colcache: bool,
+    /// `SURFACE_BAND_KERNELS`: under the preliminary surface, stateless kernels per y band.
+    pub band_kernels: bool,
+    /// `SURFACE_ROW_KERNEL`: "single block" bands under every column done layer by layer (with `band_kernels`).
+    pub row_kernel: bool,
+    /// `DIRECT_SOLID_WRITE`: plain solid over plain solid written in place.
+    pub direct_solid_write: bool,
+    /// `VEIN_TOP_BOUND`: vein pre-filling stopped at the highest solid of the chunk (with `vein_yrange`).
+    pub vein_top_bound: bool,
+    /// `CAVE_TOP_COLUMN_MEMO`: cave top material reuses the column levels of the surface step.
+    pub cave_top_column_memo: bool,
 }
 
 impl MatOpts {
-    /// Code from before the mission.
+    /// Code from before the missions on the material rules.
     pub const OLD: MatOpts = MatOpts {
         ore_idx: false,
         ore_early: false,
@@ -62,6 +72,11 @@ impl MatOpts {
         vein_shared: false,
         reuse: false,
         colcache: false,
+        band_kernels: false,
+        row_kernel: false,
+        direct_solid_write: false,
+        vein_top_bound: false,
+        cave_top_column_memo: false,
     };
     pub const NEW: MatOpts = MatOpts {
         ore_idx: true,
@@ -73,6 +88,11 @@ impl MatOpts {
         vein_shared: true,
         reuse: true,
         colcache: true,
+        band_kernels: true,
+        row_kernel: true,
+        direct_solid_write: true,
+        vein_top_bound: true,
+        cave_top_column_memo: true,
     };
 
     pub fn from_env() -> MatOpts {
@@ -87,6 +107,11 @@ impl MatOpts {
             vein_shared: opt::vein_shared(),
             reuse: opt::mat_reuse(),
             colcache: opt::mat_colcache(),
+            band_kernels: opt::surface_band_kernels(),
+            row_kernel: opt::surface_row_kernel(),
+            direct_solid_write: opt::direct_solid_write(),
+            vein_top_bound: opt::vein_top_bound(),
+            cave_top_column_memo: opt::cave_top_column_memo(),
         }
     }
 }
@@ -238,6 +263,149 @@ fn specialize(
     memo.insert(r, out);
     out
 }
+
+/// How the cells of a y band under the preliminary surface are decided without the column walk
+/// (`SURFACE_BAND_KERNELS`): the band's tree reads none of the walk state there (stone depth,
+/// water, depth below a ceiling), so each solid cell only depends on its position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandKernel {
+    /// The rules surely return nothing: cells left as they are.
+    Nothing,
+    /// Every solid cell becomes this block.
+    Block(BlockId),
+    /// Vein `i`; the cells where it returns nothing are left as they are.
+    Vein(u32),
+    /// Vein `i`, and this block where the vein returns nothing.
+    VeinOrBlock(u32, BlockId),
+    /// Any other tree, evaluated cell by cell.
+    Tree(RuleId),
+}
+
+/// Kernels of the y bands under the preliminary surface, in the order of the bands.
+#[derive(Debug)]
+struct BelowSurfaceKernels {
+    /// Biome conditions left to the cells.
+    with_biomes: Vec<BandKernel>,
+    /// Every biome condition of these trees false: for the chunks where none of their biomes is possible.
+    without_biomes: Vec<BandKernel>,
+    /// Slots of the biome conditions read by the trees under the surface.
+    biome_slots: Vec<u32>,
+}
+
+/// Which kernels the surface walk of the current chunk uses under the preliminary surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KernelSet {
+    /// None: the column walk goes down to the bottom.
+    Off,
+    WithBiomes,
+    WithoutBiomes,
+}
+
+/// Conditions reachable from the rule `r` (inverted conditions included), each once.
+fn conditions_of(rules: &[Rule], conds: &[Cond], r: RuleId, out: &mut Vec<CondId>) {
+    fn add(conds: &[Cond], c: CondId, out: &mut Vec<CondId>) {
+        if !out.contains(&c) {
+            out.push(c);
+            if let Cond::Not(i) = conds[c as usize] {
+                add(conds, i, out);
+            }
+        }
+    }
+    match &rules[r as usize] {
+        Rule::Sequence(v) => v.iter().for_each(|c| conditions_of(rules, conds, *c, out)),
+        Rule::Condition(c, t) => {
+            add(conds, *c, out);
+            conditions_of(rules, conds, *t, out);
+        }
+        Rule::Block(_) | Rule::Bandlands | Rule::Ore(_) => {}
+    }
+}
+
+/// Does the condition read the state of the column walk (stone depth, water, depth below a ceiling)?
+fn reads_walk_state(c: &Cond) -> bool {
+    matches!(c, Cond::StoneDepth { .. } | Cond::Water { .. } | Cond::YAbove { add: true, .. })
+}
+
+/// Shape of a specialised tree (`None`: surely nothing).
+fn kernel_of(rules: &[Rule], r: Option<RuleId>) -> BandKernel {
+    let Some(r) = r else { return BandKernel::Nothing };
+    match &rules[r as usize] {
+        Rule::Block(b) => BandKernel::Block(*b),
+        Rule::Ore(i) => BandKernel::Vein(*i),
+        Rule::Sequence(v) => match v.as_slice() {
+            [first, second] => match (&rules[*first as usize], &rules[*second as usize]) {
+                (Rule::Ore(i), Rule::Block(b)) => BandKernel::VeinOrBlock(*i, *b),
+                _ => BandKernel::Tree(r),
+            },
+            _ => BandKernel::Tree(r),
+        },
+        Rule::Condition(..) | Rule::Bandlands => BandKernel::Tree(r),
+    }
+}
+
+/// Does the rule `r` test the preliminary surface somewhere?
+fn tests_preliminary_surface(rules: &[Rule], conds: &[Cond], r: RuleId) -> bool {
+    let mut read = Vec::new();
+    conditions_of(rules, conds, r, &mut read);
+    read.iter().any(|c| matches!(conds[*c as usize], Cond::AbovePreliminarySurface))
+}
+
+/// Kernels of the bands under the preliminary surface (the root must test it); `None` when a
+/// tree under it reads the walk state (the walk then goes to the bottom).
+fn below_surface_kernels(
+    rules: &mut Vec<Rule>,
+    conds: &[Cond],
+    root: RuleId,
+    bands: &[(i32, i32, RuleId)],
+    dead_row: impl Fn(i32) -> Vec<bool>,
+    biome_slots: u32,
+) -> Option<BelowSurfaceKernels> {
+    let never = vec![2u8; biome_slots as usize];
+    let mut k = BelowSurfaceKernels { with_biomes: Vec::new(), without_biomes: Vec::new(), biome_slots: Vec::new() };
+    for &(start, _, _) in bands {
+        let dead = dead_row(start);
+        let f = Facts { y: start, dead: &dead, biome_static: None, below_surface: true };
+        let tree = specialize(rules, conds, root, &f, &mut HashMap::new());
+        let mut read = Vec::new();
+        if let Some(t) = tree {
+            conditions_of(rules, conds, t, &mut read);
+        }
+        if read.iter().any(|c| reads_walk_state(&conds[*c as usize])) {
+            return None;
+        }
+        for c in read {
+            if let Cond::Biome { slot, .. } = conds[c as usize]
+                && !k.biome_slots.contains(&slot)
+            {
+                k.biome_slots.push(slot);
+            }
+        }
+        let f = Facts { biome_static: Some(&never), ..f };
+        let without = specialize(rules, conds, root, &f, &mut HashMap::new());
+        k.with_biomes.push(kernel_of(rules, tree));
+        k.without_biomes.push(kernel_of(rules, without));
+    }
+    Some(k)
+}
+
+/// Surface depth and preliminary surface level (`min_surface`) of a column.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ColumnLevels {
+    depth: i32,
+    min_surface: i32,
+}
+
+/// Column levels of the last surface step done on this thread, read back by the cave top
+/// material of the same chunk (`CAVE_TOP_COLUMN_MEMO`).
+struct ChunkLevels {
+    system: u64,
+    cx: i32,
+    cz: i32,
+    columns: [ColumnLevels; 256],
+}
+
+/// Distinguishes the material systems in the per-thread memo of the column levels.
+static NEXT_SYSTEM_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Vertical generation context (anchors): `min_gen_y`, `gen_depth`, sea.
 #[derive(Debug, Clone, Copy)]
@@ -405,6 +573,13 @@ pub struct MaterialSystem {
     y_bands: Vec<(i32, i32, RuleId)>,
     /// Band of each y row (from `y_min`).
     band_of: Vec<u16>,
+    /// Kernels of the bands under the preliminary surface (`SURFACE_BAND_KERNELS`), `None` if the
+    /// rules give no stateless zone there.
+    below_surface: Option<BelowSurfaceKernels>,
+    /// The rules test the preliminary surface (otherwise the column levels are never computed).
+    tests_preliminary_surface: bool,
+    /// Identifier of this system in the per-thread memo of the column levels.
+    id: u64,
 }
 
 /// Class of a y row for the root skip (`MatState::skip`).
@@ -650,6 +825,19 @@ fn generate_bands(r: &mut Rng, t: &mut BlockTable) -> [BlockId; 192] {
 pub enum BiomeView<'a> {
     Region { chunks: [&'a ChunkBiomes; 9], cx: i32, cz: i32, zoom_seed: i64, min_qy: i32, max_qy: i32 },
     Source { src: &'a BiomeSource, zoom_seed: i64, searcher: Searcher },
+    /// What `Source` returns, read from the 3 × 3 chunks already computed by the same source
+    /// (`RUSTCRAFT_OPT_CAVE_TOP_FROM_CHUNK_BIOMES`, carved caves): no climate recomputed. A quart
+    /// outside them in y (never clamped, unlike `Region`) asks the source.
+    ChunkThenSource {
+        chunks: [&'a ChunkBiomes; 9],
+        cx: i32,
+        cz: i32,
+        zoom_seed: i64,
+        min_qy: i32,
+        max_qy: i32,
+        src: &'a BiomeSource,
+        searcher: Searcher,
+    },
 }
 
 impl BiomeView<'_> {
@@ -664,6 +852,16 @@ impl BiomeView<'_> {
             BiomeView::Source { src, zoom_seed, searcher } => {
                 let (qx, qy, qz) = zoom_cached(*zoom_seed, x, y, z);
                 src.biome_at(g, &mut Ctx::uncached(), searcher, qx, qy, qz)
+            }
+            BiomeView::ChunkThenSource { chunks, cx, cz, zoom_seed, min_qy, max_qy, src, searcher } => {
+                let (qx, qy, qz) = zoom_cached(*zoom_seed, x, y, z);
+                let (dx, dz) = ((qx >> 2) - *cx, (qz >> 2) - *cz);
+                if (*min_qy..=*max_qy).contains(&qy) && (-1..=1).contains(&dx) && (-1..=1).contains(&dz) {
+                    let c = chunks[((dx + 1) * 3 + dz + 1) as usize];
+                    c.get(qx & 3, qy - c.min_qy, qz & 3)
+                } else {
+                    src.biome_at(g, &mut Ctx::uncached(), searcher, qx, qy, qz)
+                }
             }
         }
     }
@@ -709,11 +907,30 @@ pub struct MatState {
     frozen_cold: Option<bool>,
     /// Free buffers taken back by the next pre-filling.
     spare: Vec<Vec<f32>>,
+    /// Kernels used under the preliminary surface for this chunk (`SURFACE_BAND_KERNELS`).
+    kernels: KernelSet,
+    /// Rows of the vein volume pre-filled at most (`VEIN_TOP_BOUND`): the rules never read above.
+    vein_rows_end: i32,
 }
 
 thread_local! {
     /// Evaluation state reused per thread (`MAT_REUSE`).
     static STATE: RefCell<Option<MatState>> = const { RefCell::new(None) };
+    /// Positions (world x, y, z) of the cave top material calls, while a test or a bench records them.
+    static TOP_MATERIAL_CALLS: RefCell<Option<Vec<[i32; 3]>>> = const { RefCell::new(None) };
+    /// Column levels of the last surface step of this thread (`CAVE_TOP_COLUMN_MEMO`): the caves
+    /// step of the same chunk follows it on the same thread.
+    static LAST_CHUNK_LEVELS: RefCell<Option<Box<ChunkLevels>>> = const { RefCell::new(None) };
+}
+
+/// Runs `f` and returns the positions of the cave top material calls it made on this thread
+/// (equivalence tests and call counts of the benches).
+#[doc(hidden)]
+pub fn record_top_material_calls<R>(f: impl FnOnce() -> R) -> (R, Vec<[i32; 3]>) {
+    let outer = TOP_MATERIAL_CALLS.with(|c| c.borrow_mut().replace(Vec::new()));
+    let r = f();
+    let calls = TOP_MATERIAL_CALLS.with(|c| std::mem::replace(&mut *c.borrow_mut(), outer)).unwrap_or_default();
+    (r, calls)
 }
 
 impl MatState {
@@ -751,6 +968,8 @@ impl MatState {
             temp_noise: None,
             frozen_cold: None,
             spare: Vec::new(),
+            kernels: KernelSet::Off,
+            vein_rows_end: i32::MAX,
         }
     }
 
@@ -859,6 +1078,19 @@ impl MaterialSystem {
             band_of[k..(e - y_min) as usize].fill(y_bands.len() as u16);
             y_bands.push((a, e, r));
         }
+        let tests_preliminary_surface = tests_preliminary_surface(&rules, &conds, root);
+        let below_surface = if tests_preliminary_surface {
+            below_surface_kernels(
+                &mut rules,
+                &conds,
+                root,
+                &y_bands,
+                |y| row((y - y_min) as usize).to_vec(),
+                biome_slots,
+            )
+        } else {
+            None
+        };
         let random = g.positional();
         let bands = generate_bands(&mut random.from_hash_of("minecraft:clay_bands"), blocks);
         let mut climates = vec![BiomeClimate::default(); biome_names.len()];
@@ -905,7 +1137,17 @@ impl MaterialSystem {
             dead,
             y_bands,
             band_of,
+            below_surface,
+            tests_preliminary_surface,
+            id: NEXT_SYSTEM_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         })
+    }
+
+    /// Kernels of each y band under the preliminary surface (start, end excluded, biome conditions
+    /// left to the cells, biome conditions false), for the tests; `None` if the walk keeps them.
+    pub fn below_surface_kernels(&self) -> Option<Vec<(i32, i32, BandKernel, BandKernel)>> {
+        let k = self.below_surface.as_ref()?;
+        Some(self.y_bands.iter().enumerate().map(|(i, b)| (b.0, b.1, k.with_biomes[i], k.without_biomes[i])).collect())
     }
 
     /// y bands with constant facts and their specialised root (`None`: surely "nothing"), for
@@ -921,11 +1163,21 @@ impl MaterialSystem {
     }
 
     /// Buffers (density, richness) of the vein pre-filling over `v` through the paths `opts`
-    /// (equivalence tests; richness only makes sense where the density is not ≤ 0).
+    /// (equivalence tests; richness only makes sense where the density is not ≤ 0), with the rows
+    /// above `vein_top` left out when `opts.vein_top_bound` holds.
     #[doc(hidden)]
-    pub fn prefill_with(&self, env: &mut Env, v: Volume, opts: MatOpts) -> Vec<Option<(Vec<f32>, Vec<f32>)>> {
+    pub fn prefill_with(
+        &self,
+        env: &mut Env,
+        v: Volume,
+        opts: MatOpts,
+        vein_top: Option<i32>,
+    ) -> Vec<Option<(Vec<f32>, Vec<f32>)>> {
         let mut st = MatState::empty(opts);
         st.ore_vol = v;
+        if let Some(top) = vein_top.filter(|_| opts.vein_top_bound && v.sty == 1) {
+            st.vein_rows_end = (top - v.y0 + 1).max(0);
+        }
         st.ore_bufs.resize(self.ores.len(), None);
         for &i in &self.prefill {
             self.fill_ore(i, env, &mut st);
@@ -975,13 +1227,22 @@ impl MaterialSystem {
     /// shortcut of the biome conditions (`possible` = biomes present around, `None` = none).
     pub fn compile(&self, env: &mut Env, expected: Volume, possible: Option<&[bool]>) -> MatState {
         let mut st = MatState::empty(self.opts);
-        self.compile_into(env, expected, possible, false, &mut st);
+        self.compile_into(env, expected, possible, false, None, &mut st);
         st
     }
 
     /// [`MaterialSystem::compile`] into an existing state (buffers taken back); `lazy` = veins
-    /// computed at first need instead of pre-filling.
-    fn compile_into(&self, env: &mut Env, expected: Volume, possible: Option<&[bool]>, lazy: bool, st: &mut MatState) {
+    /// computed at first need instead of pre-filling; `vein_top` = highest y the rules will be
+    /// evaluated at (`VEIN_TOP_BOUND`, `None`: unknown).
+    fn compile_into(
+        &self,
+        env: &mut Env,
+        expected: Volume,
+        possible: Option<&[bool]>,
+        lazy: bool,
+        vein_top: Option<i32>,
+        st: &mut MatState,
+    ) {
         st.opts = self.opts;
         for (d, r) in st.ore_bufs.drain(..).flatten() {
             st.spare.extend([d, r]);
@@ -990,6 +1251,10 @@ impl MaterialSystem {
         st.ore_bufs.resize(self.ores.len(), None);
         st.ore_vol = expected;
         st.lazy = lazy;
+        st.vein_rows_end = match vein_top {
+            Some(top) if expected.sty == 1 => (top - expected.y0 + 1).max(0),
+            _ => i32::MAX,
+        };
         if !lazy {
             for &i in &self.prefill {
                 self.fill_ore(i, env, st);
@@ -1041,6 +1306,22 @@ impl MaterialSystem {
         if self.opts.surf_skip && possible.is_some() {
             self.classify_rows(st);
         }
+        st.kernels = self.kernel_set(st, possible);
+    }
+
+    /// Kernels of this chunk under the preliminary surface: only for the surface step of a chunk
+    /// (biomes known), without the biome conditions when none of their biomes is possible here.
+    fn kernel_set(&self, st: &MatState, possible: Option<&[bool]>) -> KernelSet {
+        match (&self.below_surface, possible) {
+            (Some(k), Some(_)) if self.opts.band_kernels => {
+                if k.biome_slots.iter().all(|s| st.biome_static[*s as usize] == 2) {
+                    KernelSet::WithoutBiomes
+                } else {
+                    KernelSet::WithBiomes
+                }
+            }
+            _ => KernelSet::Off,
+        }
     }
 
     /// Rows of the vein table to compute for `ores` (envelope of the live rows of the
@@ -1080,6 +1361,11 @@ impl MaterialSystem {
         } else {
             self.live_rows(std::iter::once(i), &v)
         };
+        // Rows above the highest solid of the chunk are never read (`VEIN_TOP_BOUND`).
+        let rows = rows.and_then(|(lo, hi)| {
+            let hi = hi.min(st.vein_rows_end);
+            (lo < hi).then_some((lo, hi))
+        });
         // Dead rows: the constant outside the range, exact value of the choice on y (point and volume).
         let mut d = st.buf(n);
         d.fill(self.gates[i as usize].map_or(0.0, |g| g.outside));
@@ -1136,13 +1422,18 @@ impl MaterialSystem {
     }
 
     pub fn update_xz(&self, g: &Generator, st: &mut MatState, x: i32, z: i32, grad_x: i32, grad_z: i32) {
+        self.enter_column(st, x, z, grad_x, grad_z, self.surface_depth(g, x, z));
+    }
+
+    /// [`MaterialSystem::update_xz`] with the surface depth of the column already known.
+    fn enter_column(&self, st: &mut MatState, x: i32, z: i32, grad_x: i32, grad_z: i32, depth: i32) {
         st.xz_stamp += 1;
         st.y_stamp += 1;
         st.x = x;
         st.z = z;
         st.grad_x = grad_x;
         st.grad_z = grad_z;
-        st.sd = self.surface_depth(g, x, z);
+        st.sd = depth;
         st.secondary = None;
         st.min_surface = None;
         st.band_off = None;
@@ -1174,7 +1465,15 @@ impl MaterialSystem {
         if let Some(v) = st.min_surface {
             return v;
         }
-        let p = match st.prelim_vol.index_of_block(st.x, 0, st.z) {
+        let v = floor_f(self.preliminary_level(env, st, st.x, st.z)) + st.sd - 8;
+        st.min_surface = Some(v);
+        v
+    }
+
+    /// Preliminary surface level of the column (x, z): from the volume of the compiled chunk when it
+    /// covers the column (computed once for all of them), at the point otherwise.
+    fn preliminary_level(&self, env: &mut Env, st: &mut MatState, x: i32, z: i32) -> f32 {
+        match st.prelim_vol.index_of_block(x, 0, z) {
             Some(i) => {
                 if st.prelim_buf.is_none() {
                     let mut b = st.buf(st.prelim_vol.size());
@@ -1183,11 +1482,19 @@ impl MaterialSystem {
                 }
                 st.prelim_buf.as_ref().map_or(0.0, |b| b[i])
             }
-            None => env.g.value(self.chunk_surface, env.ctx, st.x, 0, st.z),
-        };
-        let v = floor_f(p) + st.sd - 8;
-        st.min_surface = Some(v);
-        v
+            None => env.g.value(self.chunk_surface, env.ctx, x, 0, z),
+        }
+    }
+
+    /// Surface depth and preliminary surface level of the 256 columns of the chunk (index `x + 16·z`).
+    fn column_levels(&self, chunk: &ProtoTerrain, env: &mut Env, st: &mut MatState) -> [ColumnLevels; 256] {
+        let mut out = [ColumnLevels::default(); 256];
+        for (i, c) in out.iter_mut().enumerate() {
+            let (x, z) = (chunk.min_x() + (i & 15) as i32, chunk.min_z() + (i >> 4) as i32);
+            c.depth = self.surface_depth(env.g, x, z);
+            c.min_surface = floor_f(self.preliminary_level(env, st, x, z)) + c.depth - 8;
+        }
+        out
     }
 
     fn biome(&self, env: &mut Env, st: &mut MatState) -> u16 {
@@ -1344,6 +1651,11 @@ impl MaterialSystem {
         }
         let o = &self.ores[i as usize];
         let idx = if self.opts.ore_idx { st.ore_at } else { st.ore_vol.index_of_block(st.x, st.y, st.z) };
+        debug_assert!(
+            idx.is_none_or(|j| (j as i32 % st.ore_vol.sy.max(1)) < st.vein_rows_end),
+            "vein read above the pre-filled rows at y {}",
+            st.y
+        );
         if st.lazy && idx.is_some() && st.ore_bufs[i as usize].is_none() {
             self.fill_ore(i, env, st);
         }
@@ -1422,14 +1734,61 @@ impl MaterialSystem {
         let top_section = chunk.highest_filled_section().map_or(-1, |s| s as i32);
         let max_block_y = min_y + top_section * 16 + 15;
         let narrowed = Volume::new(full.sx, (max_block_y - full.y0 + 1).max(1), full.sz, full.x0, full.y0, full.z0);
+        let vein_top = self.vein_top(chunk, blocks, possible);
         with_state(self.opts.reuse, self.opts, |st| {
-            self.compile_into(env, narrowed, possible, false, st);
-            self.surface_columns(chunk, blocks, env, st);
+            self.compile_into(env, narrowed, possible, false, vein_top, st);
+            // The kernels need every column's preliminary surface first (layer kernel); the caves
+            // read the same levels back.
+            let wanted = st.kernels != KernelSet::Off || self.opts.cave_top_column_memo;
+            let levels = (wanted && self.tests_preliminary_surface).then(|| self.column_levels(chunk, env, st));
+            self.surface_columns(chunk, blocks, env, st, levels.as_ref());
+            if let Some(columns) = levels.filter(|_| self.opts.cave_top_column_memo) {
+                self.remember_levels(chunk, columns);
+            }
         });
     }
 
-    fn surface_columns(&self, chunk: &mut ProtoTerrain, blocks: &BlockTable, env: &mut Env, st: &mut MatState) {
-        let (min_y, max_y) = (chunk.min_y, chunk.max_y());
+    /// Highest y the rules will be evaluated at in the chunk (`VEIN_TOP_BOUND`): the highest
+    /// block that is neither air nor fluid. `None` (veins over the whole volume) when the eroded
+    /// badlands may add solids above it before the walk.
+    fn vein_top(&self, chunk: &ProtoTerrain, blocks: &BlockTable, possible: Option<&[bool]>) -> Option<i32> {
+        let possible = possible?;
+        let extension_possible =
+            self.eroded_badlands.is_some_and(|b| possible.get(b as usize).copied().unwrap_or(true));
+        if !self.opts.vein_top_bound || !self.opts.vein_yrange || extension_possible {
+            return None;
+        }
+        let mut top = chunk.min_y - 1;
+        for z in 0..16 {
+            for x in 0..16 {
+                // Only a higher solid can raise the maximum: stop the column there.
+                let mut y = chunk.surface_height(x, z);
+                while y > top && !blocks.is_solid(chunk.get(x, y, z)) {
+                    y -= 1;
+                }
+                top = top.max(y);
+            }
+        }
+        Some(top)
+    }
+
+    fn surface_columns(
+        &self,
+        chunk: &mut ProtoTerrain,
+        blocks: &BlockTable,
+        env: &mut Env,
+        st: &mut MatState,
+        levels: Option<&[ColumnLevels; 256]>,
+    ) {
+        let kernels = match (&self.below_surface, st.kernels) {
+            (Some(k), KernelSet::WithBiomes) if chunk.min_y >= self.y_min => Some(&k.with_biomes),
+            (Some(k), KernelSet::WithoutBiomes) if chunk.min_y >= self.y_min => Some(&k.without_biomes),
+            _ => None,
+        };
+        let layer_bands = match (kernels, levels) {
+            (Some(k), Some(l)) if self.opts.row_kernel => self.layer_bands(chunk, blocks, k, l),
+            _ => 0,
+        };
         let (bx0, bz0) = (chunk.min_x(), chunk.min_z());
         for x in 0..16 {
             for z in 0..16 {
@@ -1441,49 +1800,272 @@ impl MaterialSystem {
                 }
                 let height = chunk.surface_height(x, z) + 1;
                 let (gx, gz) = gradients(chunk, x, z);
-                self.update_xz(env.g, st, bx, bz, gx, gz);
-                let mut above = 0;
-                let mut water = i32::MIN;
-                let mut ceiling = i32::MAX;
-                let end = min_y;
-                let mut y = height;
-                while y >= end {
-                    let old = chunk.get(x, y, z);
-                    if blocks.is_air(old) {
-                        above = 0;
-                        water = i32::MIN;
-                    } else if blocks.has_fluid(old) {
-                        if water == i32::MIN {
-                            water = y + 1;
-                        }
-                    } else {
-                        if ceiling >= y {
-                            ceiling = crate::aquifer::WAY_BELOW_MIN_Y;
-                            let mut ly = y - 1;
-                            while ly >= end - 1 {
-                                let s = chunk.get(x, ly, z);
-                                if blocks.is_air(s) || blocks.has_fluid(s) {
-                                    ceiling = ly + 1;
-                                    break;
-                                }
-                                ly -= 1;
-                            }
-                        }
-                        above += 1;
-                        let below = y - ceiling + 1;
-                        Self::update_y(st, above, below, water, y);
-                        if y >= min_y
-                            && y <= max_y
-                            && let Some(s) = self.apply_root(env, st)
-                        {
-                            set_column(chunk, blocks, x, y, z, s);
-                        }
+                match levels {
+                    Some(l) => {
+                        let c = l[(x + 16 * z) as usize];
+                        self.enter_column(st, bx, bz, gx, gz, c.depth);
+                        st.min_surface = Some(c.min_surface);
                     }
-                    y -= 1;
+                    None => self.update_xz(env.g, st, bx, bz, gx, gz),
+                }
+                match (kernels, st.min_surface) {
+                    (Some(k), Some(min_surface)) => {
+                        // Under the preliminary surface the rules read no walk state: the walk stops
+                        // there and the kernels decide the cells below.
+                        let split = min_surface.clamp(chunk.min_y, self.y_min + self.depth);
+                        self.walk_column(chunk, blocks, env, st, x, z, height, split);
+                        let top = split.min(height + 1).min(chunk.max_y() + 1);
+                        self.below_surface_column(chunk, blocks, env, st, (x, z), (chunk.min_y, top), k, layer_bands);
+                    }
+                    _ => self.walk_column(chunk, blocks, env, st, x, z, height, chunk.min_y),
                 }
                 if self.frozen_oceans.contains(&Some(surface_biome)) {
                     let ms = self.min_surface(env, st);
                     self.frozen_ocean_extension(chunk, blocks, env.g, ms, surface_biome, x, z, start);
+                }
+            }
+        }
+        if let Some(k) = kernels {
+            self.rewrite_layer_bands(chunk, blocks, k, layer_bands);
+        }
+    }
+
+    /// Column walk (§ 4.2) from `height` down to `end` included: depth under the surface, water
+    /// above and depth above the ceiling below, root rule at each solid cell.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_column(
+        &self,
+        chunk: &mut ProtoTerrain,
+        blocks: &BlockTable,
+        env: &mut Env,
+        st: &mut MatState,
+        x: i32,
+        z: i32,
+        height: i32,
+        end: i32,
+    ) {
+        let (min_y, max_y) = (chunk.min_y, chunk.max_y());
+        let mut above = 0;
+        let mut water = i32::MIN;
+        let mut ceiling = i32::MAX;
+        let mut y = height;
+        while y >= end {
+            let old = chunk.get(x, y, z);
+            if blocks.is_air(old) {
+                above = 0;
+                water = i32::MIN;
+            } else if blocks.has_fluid(old) {
+                if water == i32::MIN {
+                    water = y + 1;
+                }
+            } else {
+                if ceiling >= y {
+                    // The ceiling search reads down to the bottom, even under a walk stopped early.
+                    ceiling = crate::aquifer::WAY_BELOW_MIN_Y;
+                    let mut ly = y - 1;
+                    while ly >= min_y - 1 {
+                        let s = chunk.get(x, ly, z);
+                        if blocks.is_air(s) || blocks.has_fluid(s) {
+                            ceiling = ly + 1;
+                            break;
+                        }
+                        ly -= 1;
+                    }
+                }
+                above += 1;
+                let below = y - ceiling + 1;
+                Self::update_y(st, above, below, water, y);
+                if y >= min_y
+                    && y <= max_y
+                    && let Some(s) = self.apply_root(env, st)
+                {
+                    self.write_solid(chunk, blocks, x, y, z, s);
+                }
+            }
+            y -= 1;
+        }
+    }
+
+    /// Writes the rule's block at a solid cell: in place when a plain solid replaces a plain solid
+    /// (`DIRECT_SOLID_WRITE`: no count, map or mark can change), otherwise like the game's placement.
+    #[inline]
+    fn write_solid(&self, chunk: &mut ProtoTerrain, blocks: &BlockTable, x: i32, y: i32, z: i32, s: BlockId) {
+        if !(self.opts.direct_solid_write && chunk.replace_plain_solid(blocks, x, y, z, s)) {
+            set_column(chunk, blocks, x, y, z, s);
+        }
+    }
+
+    /// Cells of the rows `[lo, hi[` of the column (all under its preliminary surface), band by band
+    /// from the top like the walk, through the kernels of the bands; the bands of `layer_bands` are
+    /// left to the layer kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn below_surface_column(
+        &self,
+        chunk: &mut ProtoTerrain,
+        blocks: &BlockTable,
+        env: &mut Env,
+        st: &mut MatState,
+        (x, z): (i32, i32),
+        (lo, hi): (i32, i32),
+        kernels: &[BandKernel],
+        layer_bands: u64,
+    ) {
+        let mut top = hi;
+        while top > lo {
+            let band = self.band_of[(top - 1 - self.y_min) as usize] as usize;
+            let start = self.y_bands[band].0.max(lo);
+            if !in_mask(layer_bands, band) {
+                self.run_kernel(kernels[band], chunk, blocks, env, st, (x, z), (start, top));
+            }
+            top = start;
+        }
+    }
+
+    /// One band kernel over the rows `[lo, hi[` of the column, from the top.
+    #[allow(clippy::too_many_arguments)]
+    fn run_kernel(
+        &self,
+        kernel: BandKernel,
+        chunk: &mut ProtoTerrain,
+        blocks: &BlockTable,
+        env: &mut Env,
+        st: &mut MatState,
+        (x, z): (i32, i32),
+        (lo, hi): (i32, i32),
+    ) {
+        match kernel {
+            BandKernel::Nothing => {}
+            BandKernel::Block(b) => {
+                for y in (lo..hi).rev() {
+                    if blocks.is_solid(chunk.get(x, y, z)) {
+                        self.write_solid(chunk, blocks, x, y, z, b);
+                    }
+                }
+            }
+            BandKernel::Vein(i) => self.vein_cells(i, None, chunk, blocks, env, st, (x, z), (lo, hi)),
+            BandKernel::VeinOrBlock(i, b) => self.vein_cells(i, Some(b), chunk, blocks, env, st, (x, z), (lo, hi)),
+            BandKernel::Tree(r) => {
+                for y in (lo..hi).rev() {
+                    if blocks.is_solid(chunk.get(x, y, z)) {
+                        // The walk state is not read under the surface: neutral values.
+                        Self::update_y(st, 1, 1, i32::MIN, y);
+                        if let Some(s) = self.apply(r, env, st) {
+                            self.write_solid(chunk, blocks, x, y, z, s);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Cells of the rows `[lo, hi[` for vein `i`, then `fallback` where the vein returns nothing.
+    /// The column's densities are tested 8 rows at a time: a vein returns nothing without a draw
+    /// where its density is ≤ 0, so only the other cells are evaluated.
+    #[allow(clippy::too_many_arguments)]
+    fn vein_cells(
+        &self,
+        i: u32,
+        fallback: Option<BlockId>,
+        chunk: &mut ProtoTerrain,
+        blocks: &BlockTable,
+        env: &mut Env,
+        st: &mut MatState,
+        (x, z): (i32, i32),
+        (lo, hi): (i32, i32),
+    ) {
+        let mut top = hi;
+        while top > lo {
+            let bottom = (top - 8).max(lo);
+            let candidates = Self::vein_densities(i, st, bottom, top).map_or(u8::MAX, vein_candidate_mask);
+            if candidates != 0 || fallback.is_some() {
+                for y in (bottom..top).rev() {
+                    if !blocks.is_solid(chunk.get(x, y, z)) {
+                        continue;
+                    }
+                    let vein = if candidates & (1 << (y - bottom)) != 0 {
+                        Self::update_y(st, 1, 1, i32::MIN, y);
+                        self.ore(i, env, st)
+                    } else {
+                        None
+                    };
+                    if let Some(s) = vein.or(fallback) {
+                        self.write_solid(chunk, blocks, x, y, z, s);
+                    }
+                }
+            }
+            top = bottom;
+        }
+    }
+
+    /// Pre-filled densities of vein `i` on the rows `[lo, hi[` of the current column, if the
+    /// buffer holds all of them (contiguous in y).
+    fn vein_densities(i: u32, st: &MatState, lo: i32, hi: i32) -> Option<&[f32]> {
+        let v = &st.ore_vol;
+        if v.stx != 1 || v.sty != 1 || v.stz != 1 {
+            return None;
+        }
+        let first = v.index_of_block(st.x, lo, st.z)?;
+        let last = v.index_of_block(st.x, hi - 1, st.z)?;
+        st.ore_bufs[i as usize].as_ref()?.0.get(first..=last)
+    }
+
+    /// Bands (bit per band) of "single block" kernels lying under every column's preliminary
+    /// surface, left to the layer kernel (`SURFACE_ROW_KERNEL`).
+    fn layer_bands(
+        &self,
+        chunk: &ProtoTerrain,
+        blocks: &BlockTable,
+        kernels: &[BandKernel],
+        levels: &[ColumnLevels; 256],
+    ) -> u64 {
+        if !blocks.is_plain_solid(self.default_block) {
+            return 0;
+        }
+        // Lowest top of the kernel zone over the columns (the eroded badlands only raise the heights).
+        let mut lowest = i32::MAX;
+        for (i, c) in levels.iter().enumerate() {
+            let height = chunk.surface_height((i & 15) as i32, (i >> 4) as i32) + 1;
+            lowest = lowest.min(c.min_surface.min(self.y_min + self.depth).min(height + 1));
+        }
+        let mut mask = 0u64;
+        for (band, &(_, end, _)) in self.y_bands.iter().enumerate().take(64) {
+            if let BandKernel::Block(b) = kernels[band]
+                && blocks.is_plain_solid(b)
+                && end <= lowest
+                && self.y_bands[band].0 >= chunk.min_y
+            {
+                mask |= 1 << band;
+            }
+        }
+        mask
+    }
+
+    /// Layer kernel: in each layer of the bands of `mask`, the default block becomes the band's
+    /// block through a compare and select over 256 contiguous states (vectorised by the compiler);
+    /// the rare other solids go through the cell write. Every write is a plain solid over a plain
+    /// solid or commutes, so the order against the column walks does not matter.
+    fn rewrite_layer_bands(&self, chunk: &mut ProtoTerrain, blocks: &BlockTable, kernels: &[BandKernel], mask: u64) {
+        for (band, &(start, end, _)) in self.y_bands.iter().enumerate().take(64) {
+            let BandKernel::Block(b) = kernels[band] else { continue };
+            if !in_mask(mask, band) {
+                continue;
+            }
+            for y in start..end {
+                let default = self.default_block;
+                let mut others = false;
+                for s in chunk.layer_mut(y) {
+                    let is_default = *s == default;
+                    others |= !is_default & (*s != AIR);
+                    *s = if is_default { b } else { *s };
+                }
+                if others {
+                    for i in 0..256 {
+                        let (x, z) = (i & 15, i >> 4);
+                        let s = chunk.get(x, y, z);
+                        if s != b && blocks.is_solid(s) {
+                            self.write_solid(chunk, blocks, x, y, z, b);
+                        }
+                    }
                 }
             }
         }
@@ -1594,13 +2176,75 @@ impl MaterialSystem {
         under_fluid: bool,
     ) -> Option<BlockId> {
         let (bx, bz) = (chunk.min_x() + x, chunk.min_z() + z);
+        TOP_MATERIAL_CALLS.with(|c| {
+            if let Some(v) = c.borrow_mut().as_mut() {
+                v.push([bx, y, bz]);
+            }
+        });
         let reuse = self.opts.reuse;
+        let levels = self.remembered_levels(chunk, x, z);
         with_state(reuse, self.opts, |st| {
-            self.compile_into(env, Volume::new(1, 1, 1, bx, y, bz), None, reuse, st);
+            self.compile_into(env, Volume::new(1, 1, 1, bx, y, bz), None, reuse, None, st);
             let (gx, gz) = gradients(chunk, x, z);
-            self.update_xz(env.g, st, bx, bz, gx, gz);
+            match levels {
+                Some(c) => {
+                    self.enter_column(st, bx, bz, gx, gz, c.depth);
+                    st.min_surface = Some(c.min_surface);
+                }
+                None => self.update_xz(env.g, st, bx, bz, gx, gz),
+            }
             Self::update_y(st, 1, 1, if under_fluid { y + 1 } else { i32::MIN }, y);
             self.apply_root(env, st)
+        })
+    }
+
+    /// Surface depth and preliminary surface of the local column (x, z) as the cave top material
+    /// computes them without the memo (a one-block volume), and as the last surface step of this
+    /// chunk on this thread kept them (equivalence tests).
+    #[doc(hidden)]
+    pub fn cave_column_levels(
+        &self,
+        env: &mut Env,
+        chunk: &ProtoTerrain,
+        x: i32,
+        z: i32,
+    ) -> ((i32, i32), Option<(i32, i32)>) {
+        let (bx, bz) = (chunk.min_x() + x, chunk.min_z() + z);
+        let mut st = MatState::empty(self.opts);
+        self.compile_into(env, Volume::new(1, 1, 1, bx, 0, bz), None, true, None, &mut st);
+        self.update_xz(env.g, &mut st, bx, bz, 0, 0);
+        let computed = (st.sd, self.min_surface(env, &mut st));
+        let kept = LAST_CHUNK_LEVELS.with(|c| {
+            c.borrow()
+                .as_ref()
+                .filter(|m| m.system == self.id && m.cx == chunk.cx && m.cz == chunk.cz)
+                .map(|m| m.columns[(x + 16 * z) as usize])
+        });
+        (computed, kept.map(|c| (c.depth, c.min_surface)))
+    }
+
+    /// Keeps the column levels of this chunk for its caves step on this thread (`CAVE_TOP_COLUMN_MEMO`).
+    fn remember_levels(&self, chunk: &ProtoTerrain, columns: [ColumnLevels; 256]) {
+        LAST_CHUNK_LEVELS.with(|c| {
+            let mut c = c.borrow_mut();
+            let kept = ChunkLevels { system: self.id, cx: chunk.cx, cz: chunk.cz, columns };
+            match c.as_mut() {
+                Some(b) => **b = kept,
+                None => *c = Some(Box::new(kept)),
+            }
+        });
+    }
+
+    /// Levels of the local column (x, z) kept by the surface step of this chunk on this thread.
+    fn remembered_levels(&self, chunk: &ProtoTerrain, x: i32, z: i32) -> Option<ColumnLevels> {
+        if !self.opts.cave_top_column_memo {
+            return None;
+        }
+        LAST_CHUNK_LEVELS.with(|c| {
+            c.borrow()
+                .as_ref()
+                .filter(|m| m.system == self.id && m.cx == chunk.cx && m.cz == chunk.cz)
+                .map(|m| m.columns[(x + 16 * z) as usize])
         })
     }
 }
@@ -1609,6 +2253,19 @@ impl MaterialSystem {
 pub fn gradients(chunk: &ProtoTerrain, x: i32, z: i32) -> (i32, i32) {
     let h = |x: i32, z: i32| chunk.surface_height(x, z);
     (h((x + 1).min(15), z) - h((x - 1).max(0), z), h(x, (z + 1).min(15)) - h(x, (z - 1).max(0)))
+}
+
+/// Is `band` one of the bands (bit per band, the first 64) of `mask`?
+#[inline]
+fn in_mask(mask: u64, band: usize) -> bool {
+    band < 64 && mask & (1 << band) != 0
+}
+
+/// Bit k set when the density of row k may place the vein: not ≤ 0, NaN included (the vein's own
+/// test). Folded without early exit so that the compiler tests the 8 lanes at once.
+#[inline]
+fn vein_candidate_mask(densities: &[f32]) -> u8 {
+    densities.iter().enumerate().fold(0u8, |m, (k, &d)| m | (u8::from(d > 0.0 || d.is_nan()) << k))
 }
 
 /// Placement of a surface column: within the world height, with mark if fluid.
