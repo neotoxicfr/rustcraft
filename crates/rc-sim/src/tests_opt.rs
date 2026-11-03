@@ -62,10 +62,18 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// one that followed the player), alone 0947daba…, 820; both reverted: 700c26d9… again.
 const EXPECTED_NEW: (&str, usize) = ("8af6e543cdc39ac6bf47103b865d4582ae4aaa5d2c6b0c55a00c69e4d10d0fb9", 820);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
+///
+/// The model world is the one `tools/bench/scenes.py prepare` builds with a temporary official
+/// server into `target/perf/model` (136 MB), the input of every scene of the bench. Its
+/// expected fingerprint was recorded on `main` 34e1be81 (series 3, before any change of the
+/// series): four simulations in two processes, all identical. The earlier entry (input 790b2d94…,
+/// expected 50fe98df…, 724 files) was dropped: no copy of that world is left, and its expected
+/// value dates from v0.0.1 (26/10), before the behavior fixes that moved the other fingerprints
+/// since, so an old copy would have failed anyway.
 const EXPECTED_MODEL: &[(&str, &str, usize)] = &[(
-    "790b2d94653a4243e68f2e0cb0ebc3f865f9f59815ed65149067cdd374c6b800",
-    "50fe98dff2e103f959adb0f342b5143554818edf090ff30401b221e2ae3be88c",
-    724,
+    "d49ce0cb6150573c6c6be36ed4acf7b4e63e5b9b0f30a114dd24aa870148ad24",
+    "2a5918d41578df373f8e5bf27070a2923c6be25ecc51ba5daa02e9f7d8bb02cb",
+    740,
 )];
 
 fn ticks(s: &mut Server, n: usize) {
