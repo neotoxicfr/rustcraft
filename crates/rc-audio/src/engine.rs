@@ -4,7 +4,7 @@
 use hashbrown::{HashMap, HashSet};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use rc_assets::Assets;
@@ -58,7 +58,25 @@ pub(crate) struct Opt {
     /// `PCMBUDGET`: PCM cache bounded in bytes, short, frequent and held sounds protected
     /// (`pcm_cache.rs`); 0: unbounded, like the game.
     pub budget: bool,
+    /// `AUDIO_LISTENER_DIFF` (default 0): the listener cell is written only when one of its 9
+    /// components changes. Off: on x86 the write is 10 plain stores, cheaper than the comparison
+    /// (micro-bench in `docs/perf.md`).
+    pub listener_diff: bool,
+    /// `AUDIO_PUMP_SKIP_IDLE`: the per-frame poll skips the outbox when it is empty and the loaded
+    /// sounds when no load is in flight; finished voices are still polled at every frame (the
+    /// tick that sees an end sets the relaunch tick of a repeated sound).
+    pub pump_skip_idle: bool,
+    /// `AUDIO_PUMP_RATE_LIMIT` (default 0): the per-frame poll runs at most once per
+    /// [`PUMP_INTERVAL`]; the tick always polls. Off: reading the clock costs more than the poll
+    /// it saves.
+    pub pump_rate_limit: bool,
+    /// `AUDIO_COMMAND_DEDUP`: no command for an unchanged sound position, category volumes sent
+    /// once per poll (or before the next command) and only when they change.
+    pub command_dedup: bool,
 }
+
+/// Minimum time between two per-frame polls (`AUDIO_PUMP_RATE_LIMIT`).
+pub(crate) const PUMP_INTERVAL: Duration = Duration::from_millis(1);
 
 impl Opt {
     pub(crate) fn get() -> Opt {
@@ -71,16 +89,42 @@ impl Opt {
             outbox: crate::switch("AUDIOOUTBOX", true),
             ids: crate::switch("SOUNDIDS", true),
             budget: crate::switch("PCMBUDGET", true),
+            listener_diff: crate::switch("AUDIO_LISTENER_DIFF", false),
+            pump_skip_idle: crate::switch("AUDIO_PUMP_SKIP_IDLE", true),
+            pump_rate_limit: crate::switch("AUDIO_PUMP_RATE_LIMIT", false),
+            command_dedup: crate::switch("AUDIO_COMMAND_DEDUP", true),
         })
     }
 
     /// Old paths everywhere (equivalence proofs).
     #[cfg(test)]
-    pub(crate) const OLD: Opt =
-        Opt { background: false, file: false, reopen: false, listener: false, outbox: false, ids: false, budget: false };
+    pub(crate) const OLD: Opt = Opt {
+        background: false,
+        file: false,
+        reopen: false,
+        listener: false,
+        outbox: false,
+        ids: false,
+        budget: false,
+        listener_diff: false,
+        pump_skip_idle: false,
+        pump_rate_limit: false,
+        command_dedup: false,
+    };
     #[cfg(test)]
-    pub(crate) const NEW: Opt =
-        Opt { background: true, file: true, reopen: true, listener: true, outbox: true, ids: true, budget: true };
+    pub(crate) const NEW: Opt = Opt {
+        background: true,
+        file: true,
+        reopen: true,
+        listener: true,
+        outbox: true,
+        ids: true,
+        budget: true,
+        listener_diff: true,
+        pump_skip_idle: true,
+        pump_rate_limit: true,
+        command_dedup: true,
+    };
 }
 
 /// Event or file name of a sound: owned (old path, `SOUNDIDS=0`) or shared
@@ -400,6 +444,29 @@ pub struct AudioEngine {
     retiring: Output,
     /// Output openings requested (creation and reopenings), for the client tests.
     opens: u32,
+    /// Bits of the listener last written into the cell (`AUDIO_LISTENER_DIFF`).
+    listener_written: [u64; 9],
+    /// Last per-frame poll, the minimum time between two and the clock that dates them
+    /// (`AUDIO_PUMP_RATE_LIMIT`; the proofs drive a clock of their own).
+    last_pump: Instant,
+    pump_interval: Duration,
+    clock: fn() -> Instant,
+    /// Load jobs sent and not answered yet: while zero, the loaded channel is surely empty.
+    loads_in_flight: usize,
+    /// Category factors the mixer has once it applied every command sent (`AUDIO_COMMAND_DEDUP`).
+    sent_factors: [f32; Category::COUNT],
+    /// A volume or a fade changed since the last `Categories` command.
+    factors_pending: bool,
+    /// Per-frame polls actually run (proof that the rate limit limits).
+    #[cfg(test)]
+    frame_pumps: u64,
+}
+
+/// The 9 components of a listener as bits: two listeners are the same value when their bits are.
+fn listener_bits(l: &Listener) -> [u64; 9] {
+    let d = |v: f32| u64::from(v.to_bits());
+    let [x, y, z] = l.pos.map(f64::to_bits);
+    [x, y, z, d(l.forward[0]), d(l.forward[1]), d(l.forward[2]), d(l.up[0]), d(l.up[1]), d(l.up[2])]
 }
 
 /// Subtitle conveyed by a launched (or audibly repeated) sound: translation key, position,
@@ -567,7 +634,16 @@ impl AudioEngine {
         }
         self.cmd = cmd;
         self.events = events;
+        // A new mixer starts with every category at 1.
+        self.sent_factors = [1.0; Category::COUNT];
         mixer
+    }
+
+    /// Sends a job to the loading threads; each job sent is answered once on `loaded`.
+    fn queue_load(&mut self, job: LoadJob) {
+        if self.jobs.send(job).is_ok() {
+            self.loads_in_flight += 1;
+        }
     }
 
     fn build(assets: Arc<Assets>, table: SoundTable, rate: u32, opt: Opt) -> (Self, Mixer) {
@@ -617,6 +693,15 @@ impl AudioEngine {
             lost: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             retiring: Output::None,
             opens: 0,
+            listener_written: listener_bits(&Listener::default()),
+            last_pump: Instant::now(),
+            pump_interval: PUMP_INTERVAL,
+            clock: Instant::now,
+            loads_in_flight: 0,
+            sent_factors: [1.0; Category::COUNT],
+            factors_pending: false,
+            #[cfg(test)]
+            frame_pumps: 0,
         };
         let mixer = engine.new_mixer(rate);
         if opt.ids {
@@ -626,7 +711,7 @@ impl AudioEngine {
         // Preloading of the `preload` variants (none in vanilla).
         for path in engine.table.preloads() {
             let job = LoadJob { id: 0, path: Name::Owned(path), stream: false, looping: false, tick: 0, pin: true };
-            let _ = engine.jobs.send(job);
+            engine.queue_load(job);
         }
         (engine, mixer)
     }
@@ -698,7 +783,16 @@ impl AudioEngine {
     /// Sends a command to the audio thread; full channel: kept in the outbox (order
     /// preserved), otherwise lost (old path). Returns `true` if it entered the channel
     /// (or if the audio thread no longer exists); `false` if it waits in the outbox or is lost.
+    /// Pending category volumes go first, so that every command finds them applied, as when
+    /// each volume change was sent at once.
     fn send(&mut self, c: Command) -> bool {
+        if self.factors_pending {
+            self.flush_categories();
+        }
+        self.send_now(c)
+    }
+
+    fn send_now(&mut self, c: Command) -> bool {
         if !self.opt.outbox {
             return !matches!(self.cmd.try_send(c), Err(TrySendError::Full(_)));
         }
@@ -906,7 +1000,7 @@ impl AudioEngine {
                 tick: now,
                 pin: false,
             };
-            let _ = self.jobs.send(job);
+            self.queue_load(job);
             State::Loading
         };
         let inst = Instance {
@@ -1004,7 +1098,7 @@ impl AudioEngine {
                 tick: now,
                 pin: false,
             };
-            let _ = self.jobs.send(job);
+            self.queue_load(job);
             State::Loading
         };
         let inst = Instance {
@@ -1025,8 +1119,23 @@ impl AudioEngine {
     /// Polls loaded sounds and finished voices. Called by `tick` and `set_listener`.
     fn pump(&mut self) {
         self.poll_output();
-        self.flush();
+        self.flush_categories();
+        let skip_idle = self.opt.pump_skip_idle;
+        // An empty outbox at its base threshold leaves `flush` nothing to do.
+        if !skip_idle || !self.outbox.is_empty() || self.outbox_limit != OUTBOX_MAX {
+            self.flush();
+        }
+        // Every job sent is answered once: with none in flight, the channel is empty.
+        if !skip_idle || self.loads_in_flight > 0 {
+            self.receive_loaded();
+        }
+        self.receive_finished();
+    }
+
+    /// Loaded sounds: launched if their instance still waits for them.
+    fn receive_loaded(&mut self) {
         while let Ok(l) = self.loaded.try_recv() {
+            self.loads_in_flight = self.loads_in_flight.saturating_sub(1);
             match l {
                 Loaded::Ready(id, src) => match self.instances.get_mut(&id) {
                     Some(inst) if inst.state == State::Loading => {
@@ -1046,6 +1155,10 @@ impl AudioEngine {
                 }
             }
         }
+    }
+
+    /// Voices finished by the mixer: channel kept 20 ticks, repeated sound queued again.
+    fn receive_finished(&mut self) {
         while let Ok(Event::Finished(id, src)) = self.events.try_recv() {
             drop(src);
             let Some(inst) = self.instances.get_mut(&id) else { continue };
@@ -1137,11 +1250,37 @@ impl AudioEngine {
     pub fn set_listener(&mut self, pos: [f64; 3], forward: [f32; 3], up: [f32; 3]) {
         let l = Listener { pos, forward, up };
         if self.opt.listener {
-            self.slot.store(l);
+            self.store_listener(l);
         } else {
             self.send(Command::Listener(l));
         }
+        if self.opt.pump_rate_limit {
+            // Volumes are not delayed by the limit; loads and ends wait at most one interval.
+            self.flush_categories();
+            let now = (self.clock)();
+            if now.saturating_duration_since(self.last_pump) < self.pump_interval {
+                return;
+            }
+            self.last_pump = now;
+        }
+        #[cfg(test)]
+        {
+            self.frame_pumps += 1;
+        }
         self.pump();
+    }
+
+    /// Writes the listener cell; with `listener_diff`, only when a component changed (the cell
+    /// write costs 10 atomic stores and two fences, the mixer reads it 100 times a second).
+    fn store_listener(&mut self, l: Listener) {
+        if self.opt.listener_diff {
+            let bits = listener_bits(&l);
+            if bits == self.listener_written {
+                return;
+            }
+            self.listener_written = bits;
+        }
+        self.slot.store(l);
     }
 
     /// Volume slider of a category (0 – 1); applies to running sounds.
@@ -1161,11 +1300,36 @@ impl AudioEngine {
     }
 
     fn send_categories(&mut self) {
-        let mut f = [0.0; Category::COUNT];
-        for c in Category::ALL {
-            f[c as usize] = self.category_factor(c);
+        if self.opt.command_dedup {
+            // Sent at the next poll or before the next command: the 11 sliders applied together
+            // (or a slider dragged over several frames) cost one command.
+            self.factors_pending = true;
+            return;
         }
+        let f = self.category_factors();
         self.send(Command::Categories(f));
+    }
+
+    fn category_factors(&self) -> [f32; Category::COUNT] {
+        std::array::from_fn(|c| self.category_factor(Category::ALL[c]))
+    }
+
+    /// Pending category volumes (`AUDIO_COMMAND_DEDUP`), sent only if they differ from the
+    /// mixer's.
+    fn flush_categories(&mut self) {
+        if !self.factors_pending {
+            return;
+        }
+        self.factors_pending = false;
+        let f = self.category_factors();
+        if f.map(f32::to_bits) == self.sent_factors.map(f32::to_bits) {
+            return;
+        }
+        // Without the outbox, a command refused by a full channel is lost: the mixer keeps the
+        // previous factors.
+        if self.send_now(Command::Categories(f)) || self.opt.outbox {
+            self.sent_factors = f;
+        }
     }
 
     /// `stop_sound` (§ 1.5): category and/or event; neither = total stop.
@@ -1278,6 +1442,12 @@ impl AudioEngine {
     /// Moves a running sound (sound attached to an entity).
     pub fn set_position(&mut self, h: SoundHandle, pos: [f64; 3]) {
         if let Some(inst) = self.instances.get_mut(&h.0) {
+            // Same bits: the mixer already has this position (most attached sounds stand still);
+            // only while no command can be lost (outbox).
+            let same = inst.params.pos.map(f64::to_bits) == pos.map(f64::to_bits);
+            if self.opt.command_dedup && self.opt.outbox && same {
+                return;
+            }
             inst.params.pos = pos;
             self.send(Command::Position(h.0, pos));
         }
@@ -1563,3 +1733,7 @@ mod tests_opt;
 #[cfg(test)]
 #[path = "engine_tests_pcm.rs"]
 mod tests_pcm;
+
+#[cfg(test)]
+#[path = "engine_tests_frame.rs"]
+mod tests_frame;
