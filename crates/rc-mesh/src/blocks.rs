@@ -519,8 +519,9 @@ fn corner_offsets(seed: i64, cx: i32, cy: i32, cz: i32) -> [f64; 3] {
 
 /// Zoom cached per thread (direct-access table): the result only depends on the seed and
 /// the absolute position, so an entry is never stale; the blend re-reads each block
-/// up to (2r + 1)² times.
-fn biome_zoom_cached(seed: i64, x: i32, y: i32, z: i32) -> (i32, i32, i32) {
+/// up to (2r + 1)² times, and the client's main thread re-reads the same blocks every frame
+/// (moving blocks, rain columns, biome probe). 8 192 entries of 24 bytes (≈ 196 KB) per thread.
+pub fn biome_zoom_cached(seed: i64, x: i32, y: i32, z: i32) -> (i32, i32, i32) {
     const N: usize = 1 << 13;
     thread_local! {
         static CACHE: std::cell::RefCell<Vec<(i64, [i32; 3], u8)>> = const { std::cell::RefCell::new(Vec::new()) };
