@@ -21,6 +21,11 @@ impl Server {
         self.data.block_of(self.st(p)).map_or("minecraft:air", |b| b.name.as_str())
     }
 
+    /// The block at `p` is `minecraft:water` (by its id: no name compared).
+    pub(crate) fn is_water_block(&self, p: [i32; 3]) -> bool {
+        self.data.state(self.st(p)).is_some_and(|i| i.block == self.bs.t.id.water)
+    }
+
     pub(crate) fn state_name(&self, s: u32) -> &str {
         self.data.block_of(s).map_or("minecraft:air", |b| b.name.as_str())
     }
@@ -43,7 +48,12 @@ impl Server {
     }
 
     pub(crate) fn mob_fluid(&self, p: [i32; 3]) -> Fluid {
-        let Some(i) = self.data.state(self.st(p)) else { return Fluid::None };
+        self.fluid_of_state(self.st(p))
+    }
+
+    /// Fluid of state `st` as seen by mobs.
+    pub(crate) fn fluid_of_state(&self, st: u32) -> Fluid {
+        let Some(i) = self.data.state(st) else { return Fluid::None };
         if i.fluid == 0 {
             return Fluid::None;
         }
@@ -73,7 +83,11 @@ impl Server {
 
     /// Top of the block's collision shape (`None` if empty).
     pub(crate) fn collision_top(&self, p: [i32; 3]) -> Option<f64> {
-        let s = self.st(p);
+        self.collision_top_of_state(self.st(p))
+    }
+
+    /// Top of the collision shape of state `s` (`None` if empty).
+    pub(crate) fn collision_top_of_state(&self, s: u32) -> Option<f64> {
         match shape_mode() {
             0 => {
                 let mut v = Vec::new();
@@ -387,6 +401,8 @@ pub(crate) const MOB_WATER: u8 = 2;
 #[derive(Default)]
 pub(crate) struct MobStates {
     bits: Box<[u8]>,
+    /// Path type rules of each state, tags left out (`RUSTCRAFT_OPT_PATH_TYPE_TABLE`).
+    pub(crate) path_rules: super::nav::path_states::PathRules,
 }
 
 impl MobStates {
@@ -394,14 +410,14 @@ impl MobStates {
         let bits = (0..d.states.len() as u32)
             .map(|s| (u8::from(land_rule(d, s)) * MOB_LAND) | (u8::from(water_rule(d, fluid_mob, s)) * MOB_WATER))
             .collect();
-        MobStates { bits }
+        let path_rules = super::nav::path_states::PathRules::new(d, fluid_mob, |s| land_rule(d, s));
+        MobStates { bits, path_rules }
     }
 
     /// Bits of the state, `None` outside the table.
     pub(crate) fn bits(&self, s: u32) -> Option<u8> {
         self.bits.get(s as usize).copied()
     }
-
 }
 
 fn state_name(d: &rc_data::VersionData, s: u32) -> &str {

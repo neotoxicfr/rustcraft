@@ -4,6 +4,7 @@
 
 use super::super::mob::{Ent, Mob};
 use super::super::mth::{dist2, reduced};
+use super::super::nav::DrawView;
 use super::super::species::Kind;
 use super::super::surface;
 use super::{JUMP, LOOK, MOVE, TARGET, TBase};
@@ -719,10 +720,16 @@ impl Server {
         ])
     }
 
-    fn best_of(&self, m: &mut Mob, f: &mut dyn FnMut(&Self, &mut Mob) -> Option<[i32; 3]>) -> Option<[f64; 3]> {
+    /// 10 tries, best walk value; one mob view shared by the tries (`DrawView`).
+    fn best_of(
+        &self,
+        m: &mut Mob,
+        mut f: impl FnMut(&Self, &mut Mob, &DrawView) -> Option<[i32; 3]>,
+    ) -> Option<[f64; 3]> {
+        let view = DrawView::new(self, m);
         let mut best: Option<(f32, [i32; 3])> = None;
         for _ in 0..10 {
-            if let Some(p) = f(self, m) {
+            if let Some(p) = f(self, m, &view) {
                 let w = self.walk_target_value(m, p);
                 if w > best.map_or(f32::NEG_INFINITY, |b| b.0) {
                     best = Some((w, p));
@@ -735,10 +742,10 @@ impl Server {
     /// The position draw towards a point.
     pub(crate) fn pos_towards(&self, m: &mut Mob, h: i32, v: i32, to: [f64; 3], max: f32) -> Option<[f64; 3]> {
         let (xd, zd) = (to[0] - m.pos()[0], to[2] - m.pos()[2]);
-        self.best_of(m, &mut |s, m| {
+        self.best_of(m, |s, m, view| {
             let d = Self::dir_within(m, f64::from(h), v, 0, xd, zd, f64::from(max))?;
             let p = Self::toward_dir(m, d);
-            (!s.outside_limits(p) && s.nav_stable(m, p) && !s.has_malus(m, p)).then_some(p)
+            (!s.outside_limits(p) && s.nav_stable(m, p) && !view.has_malus(s, m, p)).then_some(p)
         })
     }
 
@@ -761,31 +768,31 @@ impl Server {
     /// air or water (F16: wither; the parrot falls back to it).
     pub(crate) fn fly_wander_pos(&self, m: &mut Mob) -> Option<[f64; 3]> {
         let (yr, pr) = (-m.yaw * super::super::mth::DEG, m.pitch * super::super::mth::DEG);
-        let view = [
+        let look = [
             f64::from(super::super::mth::sin(yr) * super::super::mth::cos(pr)),
             f64::from(super::super::mth::cos(yr) * super::super::mth::cos(pr)),
         ];
-        let hover = self.best_of(m, &mut |s, m| {
-            let d = Self::dir_within(m, 8.0, 7, 0, view[0], view[1], f64::from(std::f32::consts::FRAC_PI_2))?;
+        let hover = self.best_of(m, |s, m, view| {
+            let d = Self::dir_within(m, 8.0, 7, 0, look[0], look[1], f64::from(std::f32::consts::FRAC_PI_2))?;
             let p = Self::toward_dir(m, d);
             if s.outside_limits(p) || !s.nav_stable(m, p) {
                 return None;
             }
             let above = m.rng.next_int_bound(3) + 1;
             let p = s.move_up_to_above_solid(p, above);
-            (s.mob_fluid(p) != super::super::env::Fluid::Water && !s.has_malus(m, p)).then_some(p)
+            (s.mob_fluid(p) != super::super::env::Fluid::Water && !view.has_malus(s, m, p)).then_some(p)
         });
         if hover.is_some() {
             return hover;
         }
-        self.best_of(m, &mut |s, m| {
-            let d = Self::dir_within(m, 8.0, 4, -2, view[0], view[1], f64::from(std::f32::consts::FRAC_PI_2))?;
+        self.best_of(m, |s, m, view| {
+            let d = Self::dir_within(m, 8.0, 4, -2, look[0], look[1], f64::from(std::f32::consts::FRAC_PI_2))?;
             let p = Self::toward_dir(m, d);
             if s.outside_limits(p) {
                 return None;
             }
             let p = s.move_up_out_of_solid(p);
-            (!s.has_malus(m, p)).then_some(p)
+            (!view.has_malus(s, m, p)).then_some(p)
         })
     }
 

@@ -5,6 +5,7 @@
 use super::super::jrand::JRand;
 use super::super::mob::{Ent, Mob};
 use super::super::mth::{block_of, dist2};
+use super::super::nav::DrawView;
 use super::super::species::Kind;
 use super::brain::*;
 use crate::player::Stack;
@@ -210,13 +211,18 @@ fn jump_boost(m: &Mob) -> f32 {
 }
 
 fn pick_candidate(s: &mut Server, m: &mut Mob, b: &mut Brain, j: &mut LongJump, t: i64) {
+    let mut view = DrawView::new(s, m);
     while !j.candidates.is_empty() {
         let Some((target, _)) = jump_candidate(s, j) else { continue };
         let o = m.block_pos();
         if o[0] == target[0] && o[2] == target[2] {
             continue;
         }
-        let ok = if j.frog { super::frog::acceptable_landing(s, m, target) } else { default_landing(s, m, target) };
+        let ok = if j.frog {
+            super::frog::acceptable_landing(s, m, &view, target)
+        } else {
+            default_landing(s, m, &view, target)
+        };
         if !ok {
             continue;
         }
@@ -229,6 +235,8 @@ fn pick_candidate(s: &mut Server, m: &mut Mob, b: &mut Brain, j: &mut LongJump, 
             j.prepare_start = t;
             return;
         }
+        // The path request changed the mob's navigation: the next candidate sees it afresh.
+        view = DrawView::new(s, m);
     }
 }
 
@@ -268,10 +276,8 @@ fn weighted_take(s: &mut Server, list: &mut Vec<([i32; 3], i32)>) -> Option<([i3
 }
 
 /// Default landing: block below full as rendered, cell without malus.
-pub fn default_landing(s: &Server, m: &Mob, p: [i32; 3]) -> bool {
-    let view = s.mob_view(m);
-    let t = super::super::nav::static_path_type(s, &view, p);
-    s.solid_render([p[0], p[1] - 1, p[2]]) && super::super::nav::mob_malus(m, t) == 0.0
+pub fn default_landing(s: &Server, m: &Mob, view: &DrawView, p: [i32; 3]) -> bool {
+    s.solid_render([p[0], p[1] - 1, p[2]]) && !view.has_malus(s, m, p)
 }
 
 /// Angles 65/70/75/80 shuffled (own random), speed clamped.
@@ -364,20 +370,16 @@ fn ram_target_ok(s: &Server, m: &mut Mob, e: Ent) -> bool {
     s.targeting_ok(m, e, true, 0.0, true, true)
 }
 
-fn walkable(s: &Server, m: &Mob, p: [i32; 3]) -> bool {
-    if !s.nav_stable(m, p) {
-        return false;
-    }
-    let view = s.mob_view(m);
-    let t = super::super::nav::static_path_type(s, &view, p);
-    super::super::nav::mob_malus(m, t) == 0.0
+fn walkable(s: &Server, m: &Mob, view: &DrawView, p: [i32; 3]) -> bool {
+    s.nav_stable(m, p) && !view.has_malus(s, m, p)
 }
 
 /// North, east, south, west up to 7 walkable cells; at least
 /// 4 away; the closest reachable one.
 fn ram_start_pos(s: &Server, m: &mut Mob, target: Ent) -> Option<[i32; 3]> {
     let tp = block_of(s.ent_pos(target)?);
-    if !walkable(s, m, tp) {
+    let view = DrawView::new(s, m);
+    if !walkable(s, m, &view, tp) {
         return None;
     }
     let mut cands = Vec::new();
@@ -385,7 +387,7 @@ fn ram_start_pos(s: &Server, m: &mut Mob, target: Ent) -> Option<[i32; 3]> {
         let mut c = tp;
         for _ in 0..7 {
             c = [c[0] + d[0], c[1], c[2] + d[2]];
-            if !walkable(s, m, c) {
+            if !walkable(s, m, &view, c) {
                 c = [c[0] - d[0], c[1], c[2] - d[2]];
                 break;
             }

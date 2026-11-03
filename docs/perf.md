@@ -5337,3 +5337,104 @@ Trial chambers: without the failed-element memo 4.79 against 1.42-1.56.
   detected, and rightly: a rotation turns the box and the junctions together.)
 - To re-measure on a quiet machine: scenes `fresh-village-rd16` (peak at the start chunk of a
   village) and `generation` ("generator ready" for the lazy pools).
+## C6-M02 (series 3): mob path search, per-state path types, memo, kept buffers (03/11, loaded machine)
+
+The ground evaluator asked the path type of a single block ≈ 13,600 times per search (village
+draws below), each one reading the block again for every fact (air, name, three tags, fluid,
+`lit`/`open`, walkability: up to 8 chunk-map lookups) and comparing about twelve names; the 24
+neighbours of every walkable cell were read again for each neighbouring cell; every search
+allocated ≈ 400 times (three hash maps, the node arena, the heap, a `Vec` per footprint type).
+Switches, default = new, `=0` = old path (`SearchOptions`, read once):
+- `RUSTCRAFT_OPT_PATH_TYPE_TABLE` (0, 1, 2 default): 1 the block read once and the rules applied to
+  its state; 2 a byte per state (`PathRules`, built with `MobStates` at server opening, 1.06 ms,
+  ≈ 30 KB): verdict of the state-only rules plus which tags come first (speleothems, then
+  fences and walls), the tags read afterwards through the tag bits, so the table holds after a
+  reload.
+- `RUSTCRAFT_OPT_PATH_MEMO` (0, 1, 2 default): block types and static cell types kept per position
+  for one search (the search only reads the world); 1 a hash map, 2 a direct-mapped table of
+  4,096 slots per memo (key checked, collisions evict, slots of an older search told apart by a
+  stamp: nothing to clear).
+- `RUSTCRAFT_OPT_PATH_SCRATCH`: node arena, maps, heap and lists kept per thread between searches
+  (cleared, capacity kept), footprint types as a 27-bit set walked upwards (the order of the
+  game's sorted set).
+- `RUSTCRAFT_OPT_PATH_REGION`: the 7 × 7 chunks around the mob looked up once, when first read.
+- `RUSTCRAFT_OPT_PATH_PALETTE`: a walkable cell (and a flyer's cell) skips its 24 neighbour reads
+  when none of the sections they touch has a dangerous state in its palette (damaging, fire,
+  lava, water, damage-cautious; verdict kept per section for the search; only inside a search).
+- `RUSTCRAFT_OPT_RANDOM_POS_VIEW`: the mob view of the penalty tests built once per random position
+  draw (ten tries) instead of once per test, in every ten-try draw that tests penalties
+  (villager, wild animal, goal, guardian, piglin and allay rules), a tamed pet's teleport to its
+  owner, and once per goat ram or long-jump choice (built again after each path request of the
+  long jump, which changes the mob's navigation).
+- `RUSTCRAFT_OPT_PATH_KEEP`: the movement helpers (towards a point, an entity) keep the current
+  path without the copy the path request made only to compare and drop it.
+- Without switch: the two A* (one target, several targets) are one (`find_path_with`; with one
+  target the set search is the single-target search); the dead distance at the end of the
+  single-target search is gone; `fly_type` shares the neighbour scan of the ground cells; the
+  amphibious and flyer water tests compare the block id, not its name; the evaluator is named
+  `NodeEvaluator` and its footprint type `path_type_for_mob`; cell and section keys are one `u64`
+  packed relative to the mob's block (21 bits per axis) instead of three `i32`, distinct within any
+  search's reach (`relative_keys_are_distinct_within_a_search_reach`), so every row of the table
+  below, `old` and `SCRATCH=0` included, hashes the packed keys.
+
+Proofs (`mobs::nav::search_tests`, village of the bench model world, `RUSTCRAFT_OPT_WORLD`): 2,000
+searches drawn with a fixed seed (20 bodies and evaluators: walkers 1×1 to 3×3, doors, flyers,
+amphibian, swimmer, warden, linked creaking, penalties set along the way, one to four targets)
+and 2,000 static types against the fingerprint recorded on the code before the series
+(`a68d8505…`); every lead alone, pairs and all together, twice each (kept buffers reused), each
+memo hit computed again and compared; every state written in the world, old rules by position
+against the state rules and the table at the three `TAG_BITS` levels, before and after a reload
+that changes fences, walls and speleothems; a wall built across 200 paths between two searches;
+1,000 mobs × 15 random position draws with and without the shared view, each shared draw building
+at most one view per ten-try loop; a block of every path type alone beside a cell, palette shortcut
+against the neighbour scan; 300 mobs × 4 movement
+requests kept against the old copy. Eight sabotages each fail at least one proof (type set walked
+downwards, memo kept across searches, table ignoring speleothems, palette forgetting water, shared
+view with the flyer flag flipped, two chunks of the region on one slot, kept path not restarted,
+20-bit keys); two weaker first sabotages were not caught and were replaced (view off by one block:
+only a heart-linked creaking or a fence under a flyer reads it; region slots transposed: still a
+one-to-one slot map, so not a fault).
+
+Micro-bench `bench_path_search` (same 2,000 searches; `villagers`: the 200 villager searches),
+LOADED machine, 3 passes × 3 runs, median (min–max), µs per search; allocations and block types
+computed per search are deterministic:
+
+| Lead | all | villagers | allocations | block types computed |
+|---|---|---|---|---|
+| old | 543 (506–662) | 453 (431–502) | 400 | 13,564 |
+| rules on the state read once (`TYPE_TABLE=1`) | 382–1,125 (noisy) | 321 (314–351) | 400 | 13,564 |
+| per-state table (`TYPE_TABLE=2`) | 472 (270–901) | 217 (216–233) | 400 | 13,564 |
+| memo, hash map / slots | 267 / 200 | 160 / 141 | 417 / 402 | 991 / 1,053 |
+| kept buffers (`SCRATCH`) | 680 (497–860) | 426 (425–463) | 3.4 | 13,564 |
+| region (`REGION`) | 630 (500–826) | 426 (425–445) | 400 | 13,564 |
+| palette (`PALETTE`) | 332 (295–486) | 260 (245–298) | 402 | 7,006 |
+| table + memo | 153 (130–234) | 116 (115–121) | 402 | 1,053 |
+| table + region | 253 (226–440) | 180 (179–188) | 400 | 13,564 |
+| all but memo | 154 (142–154) | 115 (114–123) | 3.4 | 7,006 |
+| all but palette | 113 (107–115) | 97 (95–160) | 3.4 | 1,053 |
+| all, memo as hash map | 120 (102–217) | 88 (87–89) | 3.4 | 807 |
+| all (default) | 96 (92–102) | 102 (87–116) | 3.4 | 835 |
+
+One block type (`bench_block_type_lookup`, 1 M random cells around the village, ns): old rules 52,
+state read once 36, table 21.6, table + region 17.2. A hit of a level-wide direct-mapped cache
+like the game's costs 1.4 ns, but such a cache is only exact if every block write, chunk load and
+unload and tag reload reaches it (dozens of write sites in rc-sim); the per-search memo already
+leaves ≈ 835 types computed per search (≈ 15 µs of the 96): lead not implemented, figure kept
+here. The kept buffers and the region gain nothing alone on this loaded machine (their share is
+inside the noise) but remove 397 of the 400 allocations and a chunk-map lookup per read; the memo
+as hash map against slots is undecided (each wins one set). Placement: the searches run on the
+server tick thread, synchronously (the mob uses its path in the same tick; their number and draws
+are the game's); the server is not shared between threads (its sky cache is a `Cell`), so no
+multi-thread run; GPU not applicable (branchy A* over a few hundred nodes). Memory: table ≈ 30 KB
+per server, per thread two memo tables of 64 KB plus maps sized by the largest search. Startup:
++1.06 ms at server opening (table). To settle on the quiet-machine scene bench: village,
+village-night, crowd-villagers, crowd, crowd-1000 (tick median and p99), each switch alone at 0.
+
+Fidelity gaps found while reading the game (not fixed here, separate fidelity lot): the game keeps
+a level-wide path type cache invalidated only by block updates sent to clients (not by writes
+without that flag, chunks below block-ticking, chunk loads or tag reloads), so it can serve a stale
+type where Rustcraft recomputes; its node map is keyed by a 32-bit hash that merges cells 128
+blocks apart in x or z (or 256 in y), reachable by searches of follow range 64 and more; its block
+rules read the trapdoor, fire and campfire block tags and the water and lava fluid tags where
+Rustcraft compares names (identical with the vanilla data, different under a data pack that edits
+those tags).

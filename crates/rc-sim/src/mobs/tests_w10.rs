@@ -159,7 +159,7 @@ fn sulfur_spike_is_cautious() {
     let (i, zm) = take(&mut p, z);
     let view = p.s.mob_view(&zm);
     for q in [[210, -59, 210], [212, -59, 210]] {
-        let t = super::goals::static_type_of(&p.s, &view, q);
+        let t = super::nav::static_path_type(&p.s, &view, q);
         assert_eq!(t, PathType::DamageCautious, "{q:?}");
     }
     assert!(!p.s.pathfindable_land([210, -59, 210]));

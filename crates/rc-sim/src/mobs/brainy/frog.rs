@@ -358,7 +358,7 @@ fn top_face(s: &Server, p: [i32; 3]) -> bool {
 /// Frog landing: no fluid (cell, below, above); preferred blocks accepted; a trapdoor cell (or
 /// air above a trapdoor) is accepted without further check (like the game, despite the malus);
 /// otherwise default landing.
-pub fn acceptable_landing(s: &Server, m: &Mob, p: [i32; 3]) -> bool {
+pub fn acceptable_landing(s: &Server, m: &Mob, view: &super::super::nav::DrawView, p: [i32; 3]) -> bool {
     let below = [p[0], p[1] - 1, p[2]];
     let above = [p[0], p[1] + 1, p[2]];
     if s.mob_fluid(p) != Fluid::None || s.mob_fluid(below) != Fluid::None || s.mob_fluid(above) != Fluid::None {
@@ -367,11 +367,10 @@ pub fn acceptable_landing(s: &Server, m: &Mob, p: [i32; 3]) -> bool {
     if s.btag_id(p, crate::tag_bits::TagId::FrogPreferJumpTo) || s.btag_id(below, crate::tag_bits::TagId::FrogPreferJumpTo) {
         return true;
     }
-    let view = s.mob_view(m);
-    let t = super::super::nav::static_path_type(s, &view, p);
-    let tb = super::super::nav::static_path_type(s, &view, below);
+    let t = view.static_type(s, m, p);
+    let tb = view.static_type(s, m, below);
     use super::super::nav::PathType::Trapdoor;
-    if t != Trapdoor && (!s.is_air(p) || tb != Trapdoor) { super::goat::default_landing(s, m, p) } else { true }
+    if t != Trapdoor && (!s.is_air(p) || tb != Trapdoor) { super::goat::default_landing(s, m, view, p) } else { true }
 }
 
 // ---------- Tadpole ----------

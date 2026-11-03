@@ -242,6 +242,8 @@ mod bench_kit; // common kit of the micro-benches: flat world, perf pack, timed 
 #[cfg(test)]
 mod bench_datapack_tick; // tick of the bench's `datapack` scene (crowd, #tick workload, command blocks)
 #[cfg(test)]
+mod bench_path_search; // mob path search on the village of the bench model world, each lead alone
+#[cfg(test)]
 mod tests_perf_pack; // the scene bench's `perf` data pack compiles with our command parser
 #[cfg(test)]
 mod tests_g4f08; // G4-F08: shulker push, TNT, sulfur cube, creaking, warden, smaller mob gaps
