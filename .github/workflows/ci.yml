@@ -59,6 +59,15 @@ jobs:
         run: cargo run --release -p rc-data --example prepare -- 26.3
       - name: Tests
         run: cargo test --release --workspace --no-fail-fast
+      # One invalid line makes the game refuse a whole function: the bench's `perf` pack is
+      # compiled with our command parser (`crates/rc-sim/src/tests_perf_pack.rs`).
+      - name: Bench data pack compiles
+        shell: bash
+        env:
+          RUSTCRAFT_PERF_PACK: ${{ github.workspace }}/target/perf-pack/datapacks/perf
+        run: |
+          python -I tools/bench/scenes.py pack-files target/perf-pack
+          cargo test --release -p rc-sim perf_pack_functions_compile -- --ignored
 
   tools:
     name: Python tools
@@ -69,3 +78,5 @@ jobs:
         with:
           python-version: "3.13"
       - run: python -I tools/bench/test_scenes.py
+      - run: python -I tools/bench/test_perf_pack.py
+      - run: python -I tools/bench/test_fixtures.py
