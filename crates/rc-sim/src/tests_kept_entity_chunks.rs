@@ -1,0 +1,188 @@
+//! Kept entity compounds (armor stands, markers, displays...) and their chunk: a command that
+//! changes one marks its chunk for the next save, and a move into another chunk files it under
+//! that chunk (saved there, shown and forgotten with it), as the game does. On a copy of the test
+//! world (`RUSTCRAFT_SOLO_WORLD`); absent: tests skipped.
+#![cfg(test)]
+
+use std::collections::BTreeMap;
+
+use crate::blocks::probe::Probe;
+use rc_client::{EntityEvent, Event};
+use rc_proto::nbt::Nbt;
+
+const BASE: &str = "fill 96 -60 96 143 -60 143 minecraft:stone\nfill 96 -59 96 143 -50 143 minecraft:air\n";
+/// Chunk (6, 6) holds x, z in 96..112; chunk (7, 7) holds 112..128.
+const HOME: (i32, i32) = (6, 6);
+const AWAY: (i32, i32) = (7, 7);
+
+fn probe(tag: &str) -> Option<(Probe, std::path::PathBuf)> {
+    let (world, data) = (crate::tests::test_world()?, rc_testdata::version_data()?);
+    let dir = crate::tests::fresh_copy(&world, tag);
+    let mut p = Probe::open(&dir, std::sync::Arc::new(data));
+    p.run(BASE);
+    p.s.pos = [104.5, -59.0, 104.5];
+    p.s.loaded = true;
+    assert!(p.s.chunks.contains_key(&HOME) && p.s.chunks.contains_key(&AWAY), "both chunks read");
+    p.take_events();
+    Some((p, dir))
+}
+
+fn cmd(p: &mut Probe, c: &str) {
+    let mut src = p.s.player_source();
+    src.level = 4;
+    assert!(p.s.perform(src, c).0, "command failed: {c}");
+}
+
+/// Entities of each entity chunk, by chunk position.
+type EntitiesByChunk = BTreeMap<(i32, i32), Vec<Nbt>>;
+
+/// Entities written per entity chunk by a save.
+fn saved(p: &mut Probe) -> EntitiesByChunk {
+    let mut jobs = Vec::new();
+    p.s.drops_save_jobs(&mut jobs);
+    jobs.iter()
+        .filter_map(|j| match j {
+            crate::save::Job::Chunk { cx, cz, nbt, .. } => {
+                let root = crate::nbtio::parse_root(nbt).expect("entity chunk NBT");
+                Some(((*cx, *cz), crate::nbtio::list(root.get("Entities")).to_vec()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn of_type<'a>(ents: &'a [Nbt], ty: &str) -> Vec<&'a Nbt> {
+    ents.iter().filter(|e| e.get("id").and_then(Nbt::as_str) == Some(ty)).collect()
+}
+
+/// Summons `ty` at `at` (chunk HOME unless said), saves once so no chunk is pending, and
+/// checks that a save without change leaves HOME alone (no live entity there).
+fn summon_settled(p: &mut Probe, ty: &str, at: &str) -> i32 {
+    cmd(p, &format!("summon {ty} {at}"));
+    let id = p.s.next_entity;
+    saved(p);
+    assert!(!saved(p).contains_key(&HOME), "precondition: nothing else rewrites the chunk");
+    p.take_events();
+    id
+}
+
+fn filed_under(p: &Probe, id: i32) -> Vec<(i32, i32)> {
+    p.s.entities.iter().filter(|(_, l)| l.iter().any(|e| e.0 == id)).map(|(c, _)| *c).collect()
+}
+
+fn tags(e: &Nbt) -> Vec<String> {
+    crate::nbtio::list(e.get("Tags")).iter().filter_map(|t| t.as_str().map(str::to_owned)).collect()
+}
+
+/// `/tag` and `/data merge` on a kept compound reach the save (its chunk was not rewritten).
+#[test]
+fn tag_and_data_merge_on_kept_entity_are_saved() {
+    let Some((mut p, _dir)) = probe("kept-dirty") else { return };
+    summon_settled(&mut p, "minecraft:marker", "100.5 -59 100.5");
+    cmd(&mut p, "tag @e[type=minecraft:marker] add kept");
+    let out = saved(&mut p);
+    let marker = out.get(&HOME).map(|l| of_type(l, "minecraft:marker")).unwrap_or_default();
+    assert_eq!(marker.len(), 1, "chunk rewritten after /tag");
+    assert_eq!(tags(marker[0]), ["kept"]);
+    cmd(&mut p, "data merge entity @e[type=minecraft:marker,limit=1] {data:{answer:42}}");
+    let out = saved(&mut p);
+    let marker = out.get(&HOME).map(|l| of_type(l, "minecraft:marker")).unwrap_or_default();
+    assert_eq!(marker.len(), 1, "chunk rewritten after /data merge");
+    let answer = marker[0].get("data").and_then(|d| crate::nbtio::int(d, "answer"));
+    assert_eq!(answer, Some(42));
+}
+
+/// `/tp` into another chunk: listed and saved under the new chunk, no longer under the old one.
+#[test]
+fn teleport_files_kept_entity_under_new_chunk() {
+    let Some((mut p, _dir)) = probe("kept-tp") else { return };
+    let id = summon_settled(&mut p, "minecraft:marker", "100.5 -59 100.5");
+    cmd(&mut p, "tp @e[type=minecraft:marker] 120.5 -59 120.5");
+    assert_eq!(filed_under(&p, id), [AWAY]);
+    let out = saved(&mut p);
+    let home = out.get(&HOME).expect("old chunk rewritten");
+    assert!(of_type(home, "minecraft:marker").is_empty(), "still saved in the old chunk");
+    let away = out.get(&AWAY).map(|l| of_type(l, "minecraft:marker")).unwrap_or_default();
+    assert_eq!(away.len(), 1, "saved in the new chunk");
+    assert_eq!(crate::nbtio::f64s::<3>(away[0].get("Pos")), Some([120.5, -59.0, 120.5]));
+    // A short move inside the chunk keeps it there.
+    cmd(&mut p, "tp @e[type=minecraft:marker] 121.5 -59 121.5");
+    assert_eq!(filed_under(&p, id), [AWAY]);
+}
+
+/// `/data merge` of a new `Pos` files the compound under the chunk of that position.
+#[test]
+fn data_merge_pos_files_kept_entity_under_new_chunk() {
+    let Some((mut p, _dir)) = probe("kept-datapos") else { return };
+    let id = summon_settled(&mut p, "minecraft:marker", "100.5 -59 100.5");
+    cmd(&mut p, "data merge entity @e[type=minecraft:marker,limit=1] {Pos:[120.5d,-59.0d,120.5d]}");
+    assert_eq!(filed_under(&p, id), [AWAY]);
+    let out = saved(&mut p);
+    assert!(out.get(&HOME).is_some_and(|l| of_type(l, "minecraft:marker").is_empty()));
+    assert_eq!(out.get(&AWAY).map(|l| of_type(l, "minecraft:marker").len()), Some(1));
+}
+
+/// A move between the chunks the client was sent and the others: removed when it leaves them,
+/// announced when it enters them, a plain teleport inside them.
+#[test]
+fn teleport_across_view_border_removes_or_announces() {
+    let Some((mut p, _dir)) = probe("kept-view") else { return };
+    p.s.sent = [HOME].into_iter().collect();
+    let id = summon_settled(&mut p, "minecraft:block_display", "100.5 -59 100.5");
+    let teleported = |ev: &[Event]| ev.iter().any(|e| matches!(e, Event::Entity(EntityEvent::Teleport(t)) if t.id == id));
+    let added = |ev: &[Event]| ev.iter().any(|e| matches!(e, Event::Entity(EntityEvent::Add(a)) if a.id == id));
+    let removed =
+        |ev: &[Event]| ev.iter().any(|e| matches!(e, Event::Entity(EntityEvent::Remove(ids)) if ids.contains(&id)));
+    cmd(&mut p, "tp @e[type=minecraft:block_display] 120.5 -59 120.5");
+    let ev = p.take_events();
+    assert!(removed(&ev) && !teleported(&ev), "left the view: removed, {ev:?}");
+    cmd(&mut p, "tp @e[type=minecraft:block_display] 100.5 -59 100.5");
+    let ev = p.take_events();
+    assert!(added(&ev) && !teleported(&ev) && !removed(&ev), "entered the view: announced, {ev:?}");
+    p.s.sent.insert(AWAY);
+    cmd(&mut p, "tp @e[type=minecraft:block_display] 120.5 -59 120.5");
+    let ev = p.take_events();
+    assert!(teleported(&ev) && !added(&ev) && !removed(&ev), "inside the view: teleported, {ev:?}");
+}
+
+/// A weightless armor stand pushed by a piston across a chunk border is filed there (the
+/// decorations' own edits go through the same refile).
+#[test]
+fn pushed_armor_stand_files_under_new_chunk() {
+    let Some((mut p, _dir)) = probe("kept-push") else { return };
+    let id = summon_settled(&mut p, "minecraft:armor_stand", "111.9 -59 100.5 {NoGravity:1b}");
+    p.s.deco_piston_move(id, [0.5, 0.0, 0.0]);
+    assert_eq!(filed_under(&p, id), [(7, 6)]);
+    let out = saved(&mut p);
+    assert!(out.get(&HOME).is_some_and(|l| of_type(l, "minecraft:armor_stand").is_empty()));
+    assert_eq!(out.get(&(7, 6)).map(|l| of_type(l, "minecraft:armor_stand").len()), Some(1));
+}
+
+/// Micro-bench (ignored, `--ignored --nocapture`): a decoration edit (weightless armor stand
+/// pushed back and forth inside its chunk) against the chunk check the edit now adds (its
+/// position read back and compared with the chunk it is filed under).
+#[test]
+#[ignore]
+fn bench_decoration_edit_chunk_check() {
+    let Some((mut p, _dir)) = probe("kept-bench") else { return };
+    let id = summon_settled(&mut p, "minecraft:armor_stand", "100.5 -59 100.5 {NoGravity:1b}");
+    let n = 200_000u32;
+    for _ in 0..2 {
+        let t = std::time::Instant::now();
+        for k in 0..n {
+            let dx = if k % 2 == 0 { 0.25 } else { -0.25 };
+            p.s.deco_piston_move(id, std::hint::black_box([dx, 0.0, 0.0]));
+        }
+        let edit = t.elapsed().as_nanos() as f64 / f64::from(n);
+        let e = p.s.entities[&HOME].iter().find(|e| e.0 == id).map(|e| e.1.clone()).expect("stand");
+        let t = std::time::Instant::now();
+        let mut moved = 0u32;
+        for _ in 0..n {
+            let pos = crate::nbtio::f64s::<3>(std::hint::black_box(&e).get("Pos")).unwrap_or_default();
+            moved += u32::from(crate::decoration::chunk_of(pos) != HOME);
+        }
+        let check = t.elapsed().as_nanos() as f64 / f64::from(n);
+        eprintln!("decoration edit {edit:.0} ns, of which chunk check {check:.1} ns ({moved} moves)");
+    }
+    assert_eq!(filed_under(&p, id), [HOME]);
+}

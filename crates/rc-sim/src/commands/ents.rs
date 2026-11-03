@@ -96,11 +96,52 @@ impl Server {
             .or_else(|| self.proj.blast_ent.as_ref().filter(|(i, _)| *i == id).map(|(_, n)| n))
     }
 
+    /// Compound of `id` for a change. A kept compound's chunk is marked so the next save
+    /// rewrites it (otherwise `/data`, `/tag` or `/tp` on it would be lost at reload).
     fn other_mut(&mut self, id: i32) -> Option<&mut Nbt> {
         if self.cart_ref(id).is_some() {
-            return self.cart_mut(id).map(|c| &mut c.nbt); // G5-F06
+            return self.cart_mut(id).map(|c| &mut c.nbt); // G5-F06: saved with the live minecarts
         }
-        self.entities.values_mut().flat_map(|l| l.iter_mut()).find(|(i, _)| *i == id).map(|(_, n)| n)
+        let (chunk, entry) = self
+            .entities
+            .iter_mut()
+            .find_map(|(c, l)| l.iter_mut().find(|(i, _)| *i == id).map(|entry| (*c, entry)))?;
+        self.life.drop_chunks.insert(chunk);
+        Some(&mut entry.1)
+    }
+
+    /// Chunk whose list holds the kept compound `id`, and its index there.
+    fn kept_entity_slot(&self, id: i32) -> Option<((i32, i32), usize)> {
+        self.entities.iter().find_map(|(c, l)| l.iter().position(|(i, _)| *i == id).map(|k| (*c, k)))
+    }
+
+    /// After a kept compound's position changed: when it now lies in another chunk, its entry
+    /// moves to that chunk's list, as the game files an entity under the chunk of its position
+    /// (saved there, shown and forgotten with it). Both chunks are rewritten at the next save,
+    /// and clients see it leave or enter the chunks they were sent. A destination never read
+    /// keeps nothing (its file would be overwritten without its own entities): the entry stays.
+    pub(crate) fn refile_kept_entity(&mut self, id: i32) -> KeptEntityMove {
+        let Some((from, k)) = self.kept_entity_slot(id) else { return KeptEntityMove::SameChunk };
+        let n = &self.entities[&from][k].1;
+        let to = crate::decoration::chunk_of(nbtio::f64s::<3>(n.get("Pos")).unwrap_or_default());
+        if to == from || !self.chunks.contains_key(&to) {
+            return KeptEntityMove::SameChunk;
+        }
+        let (_, n) = self.entities.get_mut(&from).expect("entry found above").remove(k);
+        let visible = crate::decoration::client_visible(&n);
+        self.entities.entry(to).or_default().push((id, n));
+        self.life.drop_chunks.extend([from, to]);
+        self.deco_moved_to_chunk(id, to);
+        let (seen_before, seen_now) = (self.sent.contains(&from), self.sent.contains(&to));
+        if !visible || seen_before == seen_now {
+            return if seen_before && seen_now { KeptEntityMove::InView } else { KeptEntityMove::OutOfView };
+        }
+        if seen_before {
+            let _ = self.send(Event::Entity(EntityEvent::Remove(vec![id])));
+        } else if let Some(n) = self.other(id).cloned() {
+            self.deco_announce(id, &n);
+        }
+        KeptEntityMove::ViewChanged
     }
 
     /// G5-F06: designated minecart.
@@ -308,6 +349,8 @@ impl Server {
                     }
                     old = Some(std::mem::replace(o, new.clone()));
                 }
+                // The game's reading sets the position: a new `Pos` files it under its new chunk.
+                let moved = self.refile_kept_entity(i);
                 // G5-F05: the reloaded text display resolves its text again (previous one kept
                 // on failure); own data of displays and interactions sent when changed.
                 if let Some(o) = &old
@@ -317,7 +360,10 @@ impl Server {
                     self.display_resolve_text(i, at, o.get("text").cloned());
                     new = self.other(i).cloned().unwrap_or(new);
                 }
-                self.send_entity_meta_after(i, &new, old.as_ref());
+                // Left the view (removed) or entered it (announced with its data): nothing more.
+                if matches!(moved, KeptEntityMove::SameChunk | KeptEntityMove::InView) {
+                    self.send_entity_meta_after(i, &new, old.as_ref());
+                }
             }
         }
     }
@@ -468,6 +514,10 @@ impl Server {
                     if let Some([y, p]) = rot {
                         nbtio::set(o, "Rotation", Nbt::List(vec![Nbt::Float(y), Nbt::Float(p)]));
                     }
+                }
+                let moved = self.refile_kept_entity(i);
+                if matches!(moved, KeptEntityMove::OutOfView | KeptEntityMove::ViewChanged) {
+                    return;
                 }
                 // A marker is unknown to the clients (G5-F05).
                 if self.other(i).is_some_and(|o| !crate::decoration::client_visible(o)) {
@@ -775,6 +825,19 @@ impl crate::mobs::Mobs {
 }
 
 /// Resets the horizontal speed of the absolute axes of a command teleportation.
+/// What [`Server::refile_kept_entity`] did, for a caller that sends the move itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeptEntityMove {
+    /// Still filed under the same chunk (or a destination never read).
+    SameChunk,
+    /// Moved between two chunks the clients were sent: they follow the move.
+    InView,
+    /// Moved between chunks the clients do not see (or a marker, never shown).
+    OutOfView,
+    /// Left or entered the clients' view: removal or announcement already sent.
+    ViewChanged,
+}
+
 fn zero_absolute(vel: &mut [f64; 3], rel: [bool; 3]) {
     for k in [0, 2] {
         if !rel[k] {
