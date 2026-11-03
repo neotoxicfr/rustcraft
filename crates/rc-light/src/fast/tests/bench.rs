@@ -213,7 +213,7 @@ fn bench_phases() {
     let t = tables();
     let base = bench_world(&t);
     let o = Opts::from_bits(!super::DEFAULT_OFF & 0x7ff);
-    let c = Ctx { height: H, t: &t, o };
+    let c = Ctx { height: H, t: &t, o, count_queues: false };
     for kind in ["plains", "torches", "building", "slab", "spread"] {
         let mut world = start_world(&t, &base, kind);
         let mut ns = [0u128; 5];

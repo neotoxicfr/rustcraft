@@ -23,6 +23,9 @@ const KNOWN: &[(u64, u64)] = &[
     // bench_ticks_nether.rclt: same bench, RUSTCRAFT_LIGHTTRACE_DIM=minecraft:the_nether
     // (39 MB, 100 relights, block light only).
     (0xdda0_8952_58eb_62ee, 0xac19_e329_f760_ded7),
+    // bench_ticks_redstone.rclt: same bench, RUSTCRAFT_BENCH_SITES=redstone (128 observer clocks of
+    // `perf:redstone`), recorded on 03/11/2026 (57 MB, 297 relights, 80,228 changes).
+    (0xbe0e_0924_13d2_6c9d, 0x8836_ba9a_3e52_d5c2),
 ];
 
 /// Version of the synthetic suite generator (changes its input fingerprint).
@@ -32,6 +35,14 @@ type Relight = fn(&mut MapGrid, i32, &LightTables, bool, &[[i32; 3]]) -> Touched
 
 fn work(g:&mut MapGrid, h: i32, t: &LightTables, sky: bool, c: &[[i32; 3]]) -> Touched {
     rc_light::relight_sections(g, h, t, sky, c)
+}
+
+/// Working path with the perf log's queue counters on (their cost in the scene bench).
+fn counted(g: &mut MapGrid, h: i32, t: &LightTables, sky: bool, c: &[[i32; 3]]) -> Touched {
+    rc_light::stats::force_queue_counting(Some(true));
+    let out = rc_light::relight_sections(g, h, t, sky, c);
+    rc_light::stats::force_queue_counting(Some(false));
+    out
 }
 
 fn frozen(g: &mut MapGrid, h: i32, t: &LightTables, sky: bool, c: &[[i32; 3]]) -> Touched {
@@ -160,6 +171,26 @@ fn synthetic(cap: &Capture, d: &rc_data::VersionData) -> Trace {
     Trace { name: "synthetic".into(), digest: dg.0, height: h, has_sky: true, direct_bits: cap.direct_bits, steps }
 }
 
+/// Queue entries of a replay per kind of light: seeded (at level 15 for the sky sources and lit
+/// margins), pushed by the propagation, left unspread at level 1, cells resolved and entries per
+/// cell (how dense the propagation is), per relight.
+fn print_queues(name: &str, relights: usize, q: &rc_light::stats::Queues) {
+    let n = relights.max(1) as f64;
+    for (kind, k) in [("block", rc_light::stats::BLOCK), ("sky", rc_light::stats::SKY)] {
+        let (seeded, queued): (u64, u64) = (q.seeded[k].iter().sum(), q.queued[k].iter().sum());
+        eprintln!(
+            "{name}: {kind} queues per relight: seeded {:.0} (at 15: {:.0}), pushed {:.0}, left at level 1 {:.0}; \
+             cells {:.0}, entries per cell {:.3}",
+            seeded as f64 / n,
+            q.seeded[k][15] as f64 / n,
+            queued.saturating_sub(seeded) as f64 / n,
+            q.queued[k][1] as f64 / n,
+            q.cells[k] as f64 / n,
+            queued as f64 / q.cells[k].max(1) as f64
+        );
+    }
+}
+
 fn bench(c: &mut Criterion) {
     let Some(d) = need(rc_testdata::version_data(), "26.3 data cache") else { return };
     let t = LightTables::new(&d);
@@ -180,10 +211,15 @@ fn bench(c: &mut Criterion) {
         // Equivalence first: working path = frozen copy, relight by relight.
         use std::sync::atomic::Ordering::Relaxed;
         let before = rc_light::stats::totals();
+        let queues_before = rc_light::stats::queues();
         let (ia, ib) = (IN_ALLOCS.load(Relaxed), IN_BYTES.load(Relaxed));
+        // Propagation queues counted on this replay only (deterministic counts, any machine).
+        rc_light::stats::force_queue_counting(Some(true));
         let (ga, ta, da) = replay(tr, &t, work);
+        rc_light::stats::force_queue_counting(Some(false));
         let (allocs_a, bytes_a) = (IN_ALLOCS.load(Relaxed) - ia, IN_BYTES.load(Relaxed) - ib);
         let st = rc_light::stats::totals().since(&before);
+        print_queues(&tr.name, tr.events(), &rc_light::stats::queues().since(&queues_before));
         let (ia, ib) = (IN_ALLOCS.load(Relaxed), IN_BYTES.load(Relaxed));
         let (gb, tb, db) = replay(tr, &t, frozen);
         let (allocs_b, bytes_b) = (IN_ALLOCS.load(Relaxed) - ia, IN_BYTES.load(Relaxed) - ib);
@@ -232,15 +268,18 @@ fn bench(c: &mut Criterion) {
         // passes of the same path give the bench's own spread (order, frequency, cache).
         // A gain is judged against the old working path (main), never against the frozen
         // copy: it has no counters nor `bounded` parameter and its machine code differs.
-        // `inc` and `inc16`: incremental relight (C2-M14), same order mirrored.
+        // `inc` and `inc16`: incremental relight (C2-M14), `counted`: queue counters on (C2-M01),
+        // same order mirrored.
         for (label, f) in [
             ("work_a", work as Relight),
+            ("counted_a", counted),
             ("inc_a", inc),
             ("inc16_a", inc16),
             ("reference_a", frozen),
             ("reference_b", frozen),
             ("inc16_b", inc16),
             ("inc_b", inc),
+            ("counted_b", counted),
             ("work_b", work),
         ] {
             g.bench_function(format!("{}_{label}_1t", tr.name), |b| {
