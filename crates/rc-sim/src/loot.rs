@@ -1632,6 +1632,10 @@ pub mod be;
 mod bench_tests;
 
 #[cfg(test)]
+#[path = "loot_block_context_tests.rs"]
+mod block_context_tests;
+
+#[cfg(test)]
 mod tests {
     use serde_json::json;
 
