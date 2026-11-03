@@ -326,6 +326,8 @@ struct App {
     local_uuid: u128,
     tab_list: tablist::TabList,
     scores: scoreboard::Scoreboard,
+    /// Keys of the "below name" lines kept between frames (`app_entity_sets.rs`).
+    below_line_keys: app_entity_sets::BelowLineKeys,
     /// Audio engine, joined at first use (`audio_slot.rs`); no sound with `RUSTCRAFT_NOAUDIO`.
     audio: audio_slot::Audio,
     /// Sounds attached to an entity: (sound, entity), position copied at each tick.

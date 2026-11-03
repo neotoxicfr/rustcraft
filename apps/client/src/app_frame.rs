@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use crate::app_entity_sets::{ghost_set, glow_colors, name_tags, spectator_set};
+use crate::app_entity_sets::{fill_ghost_set, fill_glow_colors, name_tags, refresh_player_sets};
 use crate::grid_world::draws_local_player;
 use crate::{
     App, FIRST_DRAWN, alloc_trace, camera, capseq, debug_render, debug_switcher, entity_render, environ, first_frame,
@@ -667,16 +667,18 @@ impl App {
             let hidden = self.exact.camera.filter(|_| !self.camera.view.detached());
             // Flying copies of the picked-up items, drawn like their entity (`misc.rs`).
             let pickups = self.misc.pickup_copies(pt);
-            er.glow = glow_colors(&self.entities, &self.players, &self.scores);
-            er.ghosts = ghost_set(&self.entities, &self.players, &self.scores, self.env.game_mode == 3);
-            er.spectators = spectator_set(&self.entities, &self.players, self.env.game_mode == 3);
+            let local_spectator = self.env.game_mode == 3;
+            fill_glow_colors(&mut er.glow, &self.entities, &self.players, &self.scores);
+            fill_ghost_set(&mut er.ghosts, &self.entities, &self.players, (&self.scores, local_spectator));
             er.world.clone_from(&env);
             er.camera = self.exact.camera;
-            er.upside_down = (self.players.map.iter())
-                .filter(|(_, p)| p.name == "Dinnerbone" || p.name == "Grumm")
-                .map(|(&u, _)| u)
-                .collect();
-            er.extra_ears = self.players.map.iter().filter(|(_, p)| p.name == "deadmau5").map(|(&u, _)| u).collect();
+            refresh_player_sets(
+                [&mut er.spectators, &mut er.upside_down, &mut er.extra_ears],
+                &mut er.player_sets_stamp,
+                &self.entities,
+                &self.players,
+                local_spectator,
+            );
             // Bobbers and fishing lines, text displays, guardian beams (`objects.rs`).
             let obj_frame = entity_render::ObjectsFrame {
                 pt,
@@ -882,6 +884,7 @@ impl App {
             target,
             (&self.scores, &self.local_name, self.env.game_mode == 3),
             &self.component_ids,
+            &mut self.below_line_keys,
         );
         r.show_panorama = self.front.is_open();
         if r.show_panorama && r.panorama.is_none() {

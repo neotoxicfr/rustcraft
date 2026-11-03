@@ -66,6 +66,9 @@ pub struct Scoreboard {
     /// Changes on every packet that can modify the player list: scores of the objective in the
     /// list slot, that slot, objectives, teams (formatted names and sort).
     list_revision: Revision,
+    /// Changes on every packet that can modify a "below name" line: scores of the objective in
+    /// slot 2 (or all the scores of a holder while the slot is used), that slot, objectives.
+    below_name_revision: Revision,
     /// Sidebar computed for (revision, local player).
     sidebar_cache: Option<SidebarCache>,
     /// Sidebars styled so far (the proofs check that the styled lines are really kept).
@@ -215,6 +218,9 @@ impl Scoreboard {
         if self.touches_list(&ev) {
             self.list_revision.bump();
         }
+        if self.touches_below_name(&ev) {
+            self.below_name_revision.bump();
+        }
         match ev {
             ScoreEvent::Objective { name, mode, display, hearts, format } => match mode {
                 0 => {
@@ -314,6 +320,27 @@ impl Scoreboard {
     /// Revision of what the player list shows from the scoreboard.
     pub fn list_revision(&self) -> Revision {
         self.list_revision
+    }
+
+    /// The event can change a "below name" line ([`Scoreboard::below_name`]): a score of the
+    /// objective in slot 2 (or all the scores of a holder while the slot is used), that slot, an
+    /// objective (its name or number format).
+    fn touches_below_name(&self, ev: &ScoreEvent) -> bool {
+        let below = self.slots[2].as_deref();
+        match ev {
+            ScoreEvent::Score { objective, .. } | ScoreEvent::Reset { objective: Some(objective), .. } => {
+                below == Some(objective.as_str())
+            }
+            ScoreEvent::Reset { objective: None, .. } => below.is_some(),
+            ScoreEvent::Display { slot, .. } => *slot == 2,
+            ScoreEvent::Objective { .. } => true,
+            ScoreEvent::Team { .. } => false,
+        }
+    }
+
+    /// Revision of the "below name" lines.
+    pub fn below_name_revision(&self) -> Revision {
+        self.below_name_revision
     }
 
     /// Score of a holder in an objective.

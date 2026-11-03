@@ -361,6 +361,36 @@ fn list_revision_moves_with_what_the_list_shows() {
     assert!(changes > 2_000, "only {changes} changes of the list");
 }
 
+/// After each event of a random sequence where slot 2 is often used: whenever the "below name"
+/// line of a holder changed, the "below name" revision changed too (keys kept by the name tags are
+/// never stale). Sabotages verified (failure): a score of the slot's objective, then the slot
+/// itself, leaving the revision unchanged.
+#[test]
+fn below_name_revision_moves_with_the_below_lines() {
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    let mut sb = Scoreboard::default();
+    for o in OBJECTIVES {
+        sb.apply(ScoreEvent::Objective { name: o.into(), mode: 0, display: text(o), hearts: false, format: None });
+    }
+    let lines = |sb: &Scoreboard| HOLDERS.iter().map(|h| sb.below_name(h)).collect::<Vec<_>>();
+    let mut changes = 0;
+    for step in 0..20_000 {
+        // Slot 2 taken again regularly (the generator mostly moves the sidebar).
+        let ev = if step % 50 == 0 {
+            ScoreEvent::Display { slot: 2, objective: OBJECTIVES[rng.below(3)].to_owned() }
+        } else {
+            event(&mut rng)
+        };
+        let (before, revision) = (lines(&sb), sb.below_name_revision());
+        sb.apply(ev);
+        if lines(&sb) != before {
+            changes += 1;
+            assert_ne!(sb.below_name_revision(), revision, "step {step}: a line changed, its revision did not");
+        }
+    }
+    assert!(changes > 2_000, "only {changes} changes of the lines");
+}
+
 /// Sidebar of the same kept rows drawn three ways: the old code, styled again on every frame,
 /// kept styled lines. Layers equal to the byte over 120 frames with score changes, a language
 /// change (frame 50), new fonts (frame 70) and another local player (frames 90 to 99); the
