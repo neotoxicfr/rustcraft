@@ -4276,3 +4276,125 @@ frames; GPU = submit and wait of the pass minus an empty pass, 512 × 512):
   one source enum would bring `Event` to 80 bytes.
 - To measure on the quiet machine: `crowd-1000`, `tnt` (event send and receive time,
   `perf_log::received`, channel RAM at peak).
+
+## C5-M08: region files, read outside the lock, one open file per region, header words, section count in the check (03/11, loaded machine)
+
+Region reads and writes (`rc-sim/src/region.rs`, `world.rs`) and the block read of a section
+(`chunk.rs`). Micro-benches on a LOADED machine (other agents compiling, load between 8 and
+45 %), trial profile, 2 or 3 passes; the quiet-machine scene bench (`plains32`, `plains12`,
+`generation`, `autosave-1`, `forest`, `village`) is still to do. Every lead stays behind its
+switch (`=0`: old path, read once).
+
+Before: a chunk read made six system calls under the region lock (seek, 4-byte slot word, file
+length, seek, 5-byte head, stream) and inflated the stream still under the lock, so the tasks of
+one region and the write thread waited behind every inflate; every task of 4 chunks reopened its
+region file (path canonicalised, file opened, length, 8 KiB header read, 1,024 slots checked).
+A write rewrote the 8 KiB header, rebuilt the sector map from the 1,024 slots and checked the
+`.mcc` file on disk.
+
+Read switches (proofs `region::tests::damaged_streams_read_the_same_for_every_plan`,
+`inflate_matches_the_old_decoder`, `concurrent_reader_never_sees_invalid_locations`,
+`world::tests::load_everything_same_for_every_plan`, `load_split_same_for_every_plan`,
+`damaged_regions_load_the_same`, `kept_files_see_rewritten_chunks`):
+- `RUSTCRAFT_OPT_REGION_POSITIONED_READS`: slot word and sectors read at their offset, the whole
+  run of sectors in one call bounded by the end of the file (like the game), the length asked
+  again only when a slot or its sectors go past the end known so far (files only grow while
+  open). 2 calls per chunk instead of 6; readers share the region lock (read lock), the writer
+  holds it alone.
+- `RUSTCRAFT_OPT_REGION_INFLATE_UNLOCKED`: the stream is inflated after the lock is released.
+- `RUSTCRAFT_OPT_REGION_LIBDEFLATE_READ`: zlib streams inflated by libdeflate (state and output
+  buffer kept per thread, buffer doubled until the result fits, kept up to 8 MiB); any refusal
+  (damaged, cut, wrong checksum, preset dictionary) goes back to flate2, so the outcome and its
+  error text stay the old ones (49,486 streams compared: the 17,689 of the test world and damaged
+  copies; 15,752 of them need the fall back to keep the old error). gzip (type 1) stays on flate2.
+- `RUSTCRAFT_OPT_REGION_SHARED_HANDLE`: each region file opened once per load and shared by all
+  its tasks (no file cursor with positioned reads); `load_everything` opens every file first,
+  then reads every chunk as its own task (a full region no longer keeps one thread busy).
+- `RUSTCRAFT_OPT_REGION_HANDLE_CACHE`: those files kept by the `Dimension` between loads (shared
+  by its clones, at most 256 like the game, a missing file never remembered), closed when the
+  world closes (`Server::close`) so that the folder can be deleted, renamed or recreated.
+- Unused region locks are forgotten once 1,024 are known (the table kept one entry per file ever
+  opened).
+
+Micro-benches (`--ignored`, model world `target/perf/model`, overworld, 20,373 chunks):
+- `region::tests::bench_region_inflate` (one thread, 23,714 streams, 68 MiB → 485 MiB): flate2
+  15.5-16.3 µs per stream, libdeflate 10.2-11.5 µs (×1.4-1.5, 1,260-1,320 → 1,780-2,010 MiB/s).
+- `world::tests::bench_load_slices` (the loader's way: slices of 32 chunks, tasks of 4, the three
+  folders, 41 × 41 chunks): old 136-286 ms whatever the thread count; all 54-69 ms on 1 to
+  16 threads in the quieter runs (125-134 ms in the noisy one), 60-92 ms on 32 threads (old
+  163-220). Alone (32 threads): positioned reads 119-154, shared handle 103-148, handle cache
+  95-133, inflate unlocked and libdeflate within the noise. The cache brings "all" from 74-78
+  to 60-63 ms (one open less per region and folder and slice).
+- `world::tests::bench_load_everything` (every chunk, 1 to 32 threads): too noisy on this
+  machine to rank the leads alone; together: 32 threads 288-306 → 220-225 ms (two quieter runs),
+  16 threads 340-351 → 248-249 ms, 1 thread 1,516-2,669 → 1,260-1,487 ms.
+- `world::tests::bench_load_stages` (one thread): NBT parse 1.0-1.7 s, chunk parse 1.1-2.4 s
+  (0.6-0.8 s of it is the clone of the root made by the bench), inflate 0.36-0.81 s, file reads
+  (with flate2) 0.48-1.47 s, palette lookups (`state_of`) 104 ms for 1.44 million entries
+  (72 ns each, about 4 % of a one-core load): the per-block property table of the mission is
+  not done (NBT parse and inflate dominate), to re-measure on the quiet machine.
+
+Section count (`RUSTCRAFT_OPT_SECTION_ONE_PASS_COUNT`, proof `world::tests::section_count_same_both_ways`:
+16 palette shapes and damages, then the 17,676 chunks of the test world parsed both ways; a
+damaged section read as empty and an air count instead of the solid count are seen): the indices
+are checked and the non-empty blocks counted in the same walk (one flag per palette entry), no
+walk at all when the palette has `2^bits` entries (no index can fall outside) and is all air or
+has none. `bench_section_count` (220,656 block sections of the model world, one thread, quieter
+runs): 324-397 → 192-199 ms (−40 %, about 0.6 µs per section). The mission's histogram is not
+needed: a flag per entry gives the count with one table read per block.
+
+Write switches (proofs `region::tests::writes_same_bytes_for_every_plan`: every one of the 8
+combinations leaves the same files byte for byte, region and `.mcc`, before and after closing,
+from a damaged start (two slots sharing a sector, an invalid slot, a `.mcc` to remove), with
+the clock fixed; the sabotages of each switch are seen; `crash_before_header_keeps_the_old_version`:
+header of before put back after a write, the old version read back intact for every plan, an
+allocation that frees the old sectors first is seen; `write_compressed_matches_write`):
+- `RUSTCRAFT_OPT_REGION_SECTOR_BITMAP`: sectors in use counted per sector (number of slots
+  covering it) and kept up to date at every slot change, instead of rebuilt from the 1,024 slots.
+  Same placement as the old code in every case, overlapping slots included (see
+  `docs/quirks-to-reproduce.md`: the game's bit set frees shared sectors; not reproduced, to
+  decide).
+- `RUSTCRAFT_OPT_REGION_HEADER_WORDS`: only the chunk's two header words written (slot,
+  timestamp), sectors and words written at their offset; the whole header when a word in memory
+  differs from the file (invalid slot cleared at opening, truncated header, failed write). The
+  game rewrites the 8 KiB at every chunk (`docs/specs/anvil-world.md` § 3.3). 8 KiB → 8 bytes
+  of header per chunk (a full save of 533 chunks: 4.2 MiB → 4.2 KiB handed to the system).
+- `RUSTCRAFT_OPT_REGION_EXTERNAL_LIST`: the region's `.mcc` streams listed once, at the first
+  write that needs it, instead of one file check per chunk written.
+- `RegionFile::write_compressed` takes a stream already compressed (for the save pipeline,
+  C5-M09).
+- `region::tests::bench_region_write` (4,096 writes of streams already compressed, one thread):
+  old 18.3-19.3 µs per chunk, sector map 14.9-15.9, header words 18.1-19.4 (no gain alone: the
+  8 KiB land in the same two cached pages), `.mcc` list 11.9-12.7 (the file check costs about
+  6 µs on Windows), all 8.2-8.7 (×2.2). With the others on, the header words still take
+  0.8-0.9 µs off (all but the header words 9.4 against 8.6 in the same run, machine at 90 %).
+  In a real save the zlib compression (hundreds of µs per chunk, on the write thread)
+  dominates: −10 µs per chunk written.
+- Header once per batch (`RUSTCRAFT_OPT_REGION_HEADER_PER_BATCH` of the mission): not done. With
+  the header words, what is left is two 4-byte writes per chunk (about 1 ms for a full save of
+  533 chunks), under the 2-10 ms threshold the mission set; it would also need the batch end
+  from the write thread (`save.rs`, C5-M09) and reserve the freed sectors until the header is
+  written (different placement from the game).
+- Not done: a seqlock instead of the read lock (the lock now covers two reads of cached data,
+  the inflate and the NBT parse are outside it); the 5 bytes reserved at the head of the
+  compressed stream (one copy of the stream per write, about 1 µs).
+
+Axes: integrated server CPU (chunk loading, generation reads of proto-chunks, Optimize World,
+write thread), regularity (the write thread no longer waits for an inflate; the loader's tasks
+of one region inflate side by side), disk (system calls per chunk read 6 → 2, per region opened
+by a task about 7 → 0 with the cache; per write 5 → 3 calls and 8 KiB → 8 bytes of header), RAM
+(one libdeflate state and an output buffer per pool thread, as large as the largest chunk it
+inflated, at least 64 KiB: about 2-6 MB on 32 threads; at most 256 kept files per dimension
+with their 8 KiB header copy), allocations (no 8 KiB header per task, inflate buffer reused).
+GPU, client, network, VRAM: not concerned (files, zlib, NBT). Placement: pool threads, nothing
+on the main thread.
+
+Found on the way (not changed): the game keeps a slot starting exactly at the end of the file
+(reads it as absent) where we drop it; the game frees shared sectors of overlapping slots;
+`rc-assets/src/cache.rs` inflates the baked asset cache with flate2 at startup (libdeflate lead
+for another mission).
+
+To measure on the quiet machine: the six scenes of the mission, `bench_load_everything`,
+`bench_load_slices`, `bench_region_inflate`, `bench_region_write`, `bench_section_count`,
+`storage::tests::bench_optimize` and `tests_opt::loading::bench_chunk_sending`, with each switch
+at 0 for the A/B.
