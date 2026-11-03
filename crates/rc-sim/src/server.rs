@@ -1337,6 +1337,9 @@ impl Server {
         self.mount_unload_with_player(); // F04: the vehicle leaves with the player
         self.award_custom("leave_game", 1); // S9: leaving statistic (like removing a player from the list)
         self.save(true);
+        // Region files kept open for reading: closed before the folder is deleted or reused.
+        self.dim.close_region_files();
+        self.dims.parked.iter().for_each(|w| w.dim.close_region_files());
         if let Some(l) = self.lock.take() {
             l.release();
         }

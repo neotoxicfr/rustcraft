@@ -2417,6 +2417,7 @@ dependencies = [
  "flate2",
  "getrandom 0.4.3",
  "hashbrown 0.17.1",
+ "libdeflater",
  "mimalloc",
  "rand_core 0.10.1",
  "rayon",

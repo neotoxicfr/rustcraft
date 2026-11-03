@@ -130,9 +130,16 @@ At `sector · 4096`: `u32 length` (= bytes of the compressed stream **+ 1**), `u
    Otherwise: reserve `sectors` sectors and write the data in them; delete any old `.mcc`
    after the header.
 3. Reservation: first free gap large enough in the map of occupied sectors (starting from the
-   beginning; the end of the file counts as free). Sectors 0–1 are always occupied.
+   beginning; the end of the file counts as free). Sectors 0–1 are always occupied. The game
+   keeps that map as a bit set and frees a chunk's old sectors without looking at the other
+   slots: with two slots sharing sectors (damaged file), the other chunk can be overwritten
+   later. Rustcraft counts the slots covering each sector and frees a sector only once no slot
+   points at it (difference kept from before, `docs/quirks-to-reproduce.md`).
 4. Update location and timestamp, **rewrite the whole header**, and only then free the
-   old sectors. An abrupt stop thus leaves the old chunk intact.
+   old sectors. An abrupt stop thus leaves the old chunk intact. Rustcraft writes only the two
+   words of the chunk (location, timestamp) when the rest of the header on disk already
+   matches memory, the whole header otherwise (invalid slot cleared at opening, truncated
+   header, failed write): the same bytes end up on disk.
 5. Erasing a chunk (e.g. no entity left, § 4.8): location 0, timestamp = now,
    header rewritten, `.mcc` deleted, sectors freed.
 6. On closing the file: **pad** up to the next multiple of 4,096 bytes (write a null byte

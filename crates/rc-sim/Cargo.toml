@@ -17,6 +17,8 @@ rc-proto.workspace = true
 rc-data.workspace = true
 rc-world.workspace = true
 flate2.workspace = true
+# Region chunks inflated in one call (`region.rs`, `RUSTCRAFT_OPT_REGION_LIBDEFLATE_READ`).
+libdeflater.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
 zip.workspace = true
