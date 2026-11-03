@@ -4478,6 +4478,88 @@ frames; GPU = submit and wait of the pass minus an empty pass, 512 × 512):
   one source enum would bring `Event` to 80 bytes.
 - To measure on the quiet machine: `crowd-1000`, `tnt` (event send and receive time,
   `perf_log::received`, channel RAM at peak).
+
+## C4-M10: name tags and rare entity subsets kept incrementally (03/11, loaded machine)
+
+Every frame walked the whole entity table five to seven times for subsets of a handful of
+entities (name tags, glowing outlines, ghosts, guardians twice and once more for their beams,
+fishing bobbers), collected three new player sets, and the name tag rules formatted two strings
+per living mob as soon as a team existed; every tick walked every entity twice more for the
+monster effects and rebuilt a set of N + 1 ids for the water splashes. Micro-benches of the
+client (`bench_entity_sets`, `bench_splash_state`, ignored tests), 1,000 cows, 20 players with
+a health line below the name, 10 always-visible names, one cow in ten glowing and one in twenty
+invisible; LOADED machine (other agents compiling), one core (main-thread work of a few µs:
+spreading it over threads costs more than the work; no GPU form).
+
+| Lead (switch, default 1) | old | new | allocated per frame (old → new) |
+|---|---|---|---|
+| name tag pick, early rejection (`NAME_TAG_EARLY_REJECT`) | 7.9-8.1 µs | 3.0-3.1 µs | 2,448 → 1,792 B |
+| … with every holder in a team (server case) | 91.7-93.7 µs | 4.6 µs | 2,448 → 1,792 B |
+| … from the kept candidates (`ENTITY_SUBSETS`) | 7.9-8.1 µs | 1.1 µs (2.5 with teams) | 1,792 B |
+| frame of tags, layouts kept (pick, anchors, light, keys) | 11.3 µs (97.3 teams) | 1.5 µs (2.9 teams) | 14,091 → 1,792 B |
+| … "below name" keys rebuilt (`BELOW_NAME_KEY_CACHE=0`) | | 3.5 µs (4.9 teams) | 12,115 B |
+| glowing outlines (`ENTITY_SUBSETS`) | 3.6-3.7 µs (10.5 teams) | 1.1-1.4 µs (8.3 teams) | 8,412 → 0 B |
+| ghosts (`ENTITY_SUBSETS`) | 2.0-2.1 µs | 0.4 µs | 2,188 → 0 B |
+| player sets (`PLAYER_SET_REUSE`) | 0.054 µs | 0.004 µs | 0 → 0 B (sets refilled in place) |
+| 1,000 holder names (`HOLDER_NAME_ON_STACK`) | 173-201 µs | 31-32 µs | 96,000 → 0 B |
+| splash checks per tick (`WET_FLAG_IN_ENTITY`) | 22.6-24.6 µs | 13.0-17.9 µs | 10,256 → 0 B |
+
+- Early rejection (`RUSTCRAFT_OPT_NAME_TAG_EARLY_REJECT`; the `NAME_TAG_FILTER` lead of C3-M22 is
+  the same): every tag rule needs a player, the aimed entity or an always-visible name (data 3),
+  so the others leave before the render position, the frame item and the team lookups; the name
+  is tested before the team rules (they only hide); frame item name, profile name and local team
+  looked up once; the "below name" distance is the tag's own instead of a search of the list
+  (O(k²): 40,000 comparisons per frame for the 200 named cows of `name-tags`).
+- Holder names (`RUSTCRAFT_OPT_HOLDER_NAME_ON_STACK`): the UUID of a non-player holder written in a
+  fixed 36-byte buffer, a player's profile name borrowed; the ghost set no longer copies team
+  names. Applies to the push rule of the player physics too (`player_env.rs`).
+- Kept subsets (`RUSTCRAFT_OPT_ENTITY_SUBSETS`; `ENTITY_FLAG_INDEXES` of C3-M22): glowing (0x40),
+  invisible (0x20) and name-tag candidates (players, data 3) noted by `Entities::apply` on spawn and
+  on data 0 or 3. They are supersets: entities are also removed elsewhere than by `apply` (picked
+  up items, lightning), so every reader checks the entity again and each tick drops the stale ids.
+  The local player is read directly. Two tags at the same distance fall back to the full walk:
+  their order is the table's, which only the walk knows (identical to the byte in a launch).
+- Rare kinds (`RUSTCRAFT_OPT_RARE_KIND_LISTS`): guardians and elder guardians (eyes, then beams),
+  fishing bobbers, monsters with client effects (`mob_fx`, illusioner copies), firework rockets
+  (those attached to the local player, counted every tick by `player_env.rs`) listed at spawn.
+  Their order is the list's: eyes and bobber owners go into tables, beams are opaque quads and
+  fishing lines black opaque lines (order invisible); the monster effects draw client-side
+  randomness in list order, which the decision of 19/10 allows (the table order was already
+  random per launch: the hasher is seeded per table).
+- "Below name" keys (`RUSTCRAFT_OPT_BELOW_NAME_KEY_CACHE`, acts with `NAME_TAG_EARLY_REJECT=1`): the
+  cache key of the line kept per entity (UUID and kind checked) while its stamp holds: new
+  `Scoreboard::below_name_revision` (score or reset of the slot 2 objective, that slot,
+  objectives; not `version`, which only follows teams and would miss a score change), player
+  list revision (profile names), language generation, bound keys. Mannequin lines (their own data)
+  are built every frame. A frame without the tag forgets its key.
+- Player sets (`RUSTCRAFT_OPT_PLAYER_SET_REUSE`): spectators, upside-down and eared players refilled
+  in place, only when (player list revision, local player, local spectator mode) changes; the
+  stamp lives in the entity renderer, so a new renderer refills them.
+- Water contact on the entity (`RUSTCRAFT_OPT_WET_FLAG_IN_ENTITY`): `Entity::was_wet` and
+  `Entities::local_was_wet` replace the thread table and its per-tick set. Difference of the old
+  path, faithful now: an entity removed and spawned again under the same id between two checks
+  inherited the removed one's state (a splash on its first check); the game makes a new entity,
+  which never splashes on its first tick. The old table also survived a world change.
+- Proofs: `name_tags_match_the_old_code` (400 frames of a scene of every holder kind, teams with
+  the four name-tag rules, frame items named, spectator and hidden interface, entities removed by
+  `apply` and elsewhere, ids spawned again with another kind, local player respawned, equal
+  distances; tags equal in order, origin, text, anchor, light and discretion for the walk and the
+  candidates; three sabotages fail), `below_line_keys_are_kept_while_their_stamp_holds` (built once,
+  rebuilt on score, profile, language, another entity under the id, return in range),
+  `below_name_revision_moves_with_the_below_lines` (20,000 events), `kept_subsets_match_the_walk_of_every_entity`,
+  `player_sets_match_the_old_code`, `splash_state_on_the_entity_matches_the_table`,
+  `uuid_text_writes_the_old_form`, `switches_follow_their_variable`; ten sabotages verified in all.
+- Same pattern elsewhere: the client block entity tick walked every entity twice for the same
+  player list (positions, then UUIDs and positions): one walk, same order (`app_tick.rs`).
+- Memory: `Entity` + 1 byte (`was_wet`), seven small id sets in `Entities` (members only), the kept
+  keys (live tags with a line). Axes not concerned: integrated server, network, disk, chunk loading,
+  startup, GPU and VRAM (the same tags, outlines and quads are drawn).
+- Not done: the entity kind as a number instead of a string (242 comparisons; mission of its
+  own); the main `entity_fx` pass (bees, wolves, pandas are not rare) and the dragon pass; a
+  UUID → id index for the Tab list's "in world" test (called only for "Dinnerbone"/"Grumm" rows).
+- To measure on the quiet machine, each switch at 0 then all at 1: `crowd-1000`, `crowd`,
+  `team-crowd` and `team-crowd-named` (the 1,000 mobs in one team, then with visible names),
+  `name-tags`, `glowing`, `forest`, `plains32`, `tnt`, `village` (CPU ms, p99).
 ## C6-F03: kept entity compounds, dirty chunk and refile on chunk change (03/11, loaded machine)
 
 - Fidelity first: a change of a kept compound (`/data merge`, `/tag`, `/tp`, the motion reset

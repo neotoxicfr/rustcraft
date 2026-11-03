@@ -218,6 +218,7 @@ pub(crate) fn run() {
         local_uuid,
         tab_list: tablist::TabList::default(),
         scores: scoreboard::Scoreboard::default(),
+        below_line_keys: Default::default(),
         audio,
         entity_sounds: Vec::new(),
         world_random: level_events::WorldRandom::default(),

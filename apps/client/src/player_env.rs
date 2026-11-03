@@ -74,7 +74,8 @@ pub(crate) fn gear(menu: &[Option<ItemStack>], data: &VersionData, names: &[Stri
 pub(crate) fn rockets(ents: &Entities, player_id: i32) -> u32 {
     let attached =
         |e: &crate::entities::Entity| matches!(e.meta.get(&9), Some(Meta::OptionalInt(Some(id))) if *id == player_id);
-    ents.map.values().filter(|e| e.kind == "firework_rocket" && attached(e)).count() as u32
+    let rockets = ents.of_rare_kind(&ents.subsets.rockets, crate::entities::EntitySubsets::is_rocket);
+    rockets.filter(|e| attached(e)).count() as u32
 }
 
 /// Does the neighbor with team rule `own` (its team `own_team`) push the local player with rule

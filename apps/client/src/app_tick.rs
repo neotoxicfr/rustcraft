@@ -20,14 +20,11 @@ impl App {
                 .find(|&y| !air.get(view.state(x, y, z) as usize).copied().unwrap_or(true))
                 .map_or(self.world.min_y, |y| y + 1)
         };
-        let mut players: Vec<[f64; 3]> =
-            self.entities.map.values().filter(|e| e.kind == "player").map(|e| e.pos).collect();
+        // Both lists from one walk, in the same order.
+        let (mut players, mut named): (Vec<_>, Vec<_>) =
+            self.entities.map.values().filter(|e| e.kind == "player").map(|e| (e.pos, (e.uuid, e.pos))).unzip();
         if self.positioned && self.env.game_mode != 3 {
             players.push(self.player.pos);
-        }
-        let mut named: Vec<(u128, [f64; 3])> =
-            self.entities.map.values().filter(|e| e.kind == "player").map(|e| (e.uuid, e.pos)).collect();
-        if self.positioned && self.env.game_mode != 3 {
             named.push((self.local_uuid, self.player.pos));
         }
         let w = block_entities::TickWorld {

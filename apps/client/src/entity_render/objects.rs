@@ -2280,7 +2280,8 @@ impl EntityRenderer {
         self.objects.local = f.local;
         self.objects.lines.clear();
         self.objects.guardian_eyes.clear();
-        for e in ents.map.values().filter(|e| matches!(e.kind.as_str(), "guardian" | "elder_guardian")) {
+        let subsets = &ents.subsets;
+        for e in ents.of_rare_kind(&subsets.guardians, crate::entities::EntitySubsets::is_guardian) {
             let id = e.meta_int(17).unwrap_or(0);
             // Announced attack target (even if absent: eye at rest), otherwise the camera entity.
             let look = if id != 0 { id } else { f.local };
@@ -2296,7 +2297,8 @@ impl EntityRenderer {
         let rod = self.item_id("minecraft:fishing_rod");
         let rel =
             |p: [f64; 3]| [(p[0] - f64::from(f.origin[0])) as f32, p[1] as f32, (p[2] - f64::from(f.origin[1])) as f32];
-        for e in ents.map.values().filter(|e| e.kind == "fishing_bobber") {
+        // Lines in the order of the list: black opaque lines, their order does not show.
+        for e in ents.of_rare_kind(&subsets.bobbers, crate::entities::EntitySubsets::is_bobber) {
             let Some(owner) = crate::misc::entity(ents, e.data).filter(|o| o.kind == "player") else { continue };
             self.objects.bobber_owners.insert(e.id);
             self.objects.fishers.insert(owner.id);
@@ -2319,7 +2321,8 @@ impl EntityRenderer {
     /// After `prepare`: beams of guardians attacking a known living target.
     pub fn push_guardian_beams(&mut self, ents: &crate::entities::Entities, f: &ObjectsFrame) {
         let pt = f.pt;
-        for e in ents.map.values().filter(|e| matches!(e.kind.as_str(), "guardian" | "elder_guardian")) {
+        // Beams in the order of the list: opaque quads, their order does not show.
+        for e in ents.of_rare_kind(&ents.subsets.guardians, crate::entities::EntitySubsets::is_guardian) {
             let id = e.meta_int(17).unwrap_or(0);
             if id == 0 || !self.within_view_distance(e, pt, f.cam) {
                 continue;
