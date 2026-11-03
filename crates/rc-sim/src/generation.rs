@@ -784,10 +784,11 @@ impl Worker {
         let map = &self.map;
         let encoded: Vec<((i32, i32), Vec<u8>)> = list
             .par_iter()
-            .map(|p| {
+            // One encoder per rayon task (not per thread): the size hint carries over within a task.
+            .map_init(nbtio::RootEncoder::default, |encoder, p| {
                 let s = &map[p];
                 let status = if s.stage == Stage::Decorated { DECORATED } else { TERRAIN };
-                (*p, nbtio::encode_root(&conv.proto_nbt(&s.c, status, 0, &s.bes)))
+                (*p, encoder.encode(&conv.proto_nbt(&s.c, status, 0, &s.bes)))
             })
             .collect();
         drop(conv);

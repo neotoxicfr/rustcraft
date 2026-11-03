@@ -2389,6 +2389,7 @@ dependencies = [
 name = "rc-proto"
 version = "0.1.0"
 dependencies = [
+ "rc-data",
  "thiserror 2.0.21",
 ]
 

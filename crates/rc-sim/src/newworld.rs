@@ -361,9 +361,10 @@ fn find_spawn(
     w.flush();
     sink.absorb(&mut fulls)?;
     let states = w.states();
+    let mut encoder = nbtio::RootEncoder::default();
     for c in fulls {
         if let Some(n) = c.encode(data, states, height, 0) {
-            sink.out.push(((c.x, c.z), nbtio::encode_root(&n)));
+            sink.out.push(((c.x, c.z), encoder.encode(&n)));
         }
     }
     write_entities(dir, dimension, &sink.ents)?;
