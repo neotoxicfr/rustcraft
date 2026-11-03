@@ -1,5 +1,5 @@
 //! Equivalence of the optimised NBT writer with the reference one ([`WriteOptions`]), and of the
-//! string reader with and without its redundant scans. Inputs come from a fixed seed (no clock).
+//! fast string reader with the old one. Inputs come from a fixed seed (no clock).
 
 use super::*;
 
@@ -120,11 +120,11 @@ fn string_writers_agree() {
     assert_eq!(checked, 100_011);
 }
 
-/// Valid UTF-8, modified UTF-8 and random bytes: the reader without the two extra scans gives
-/// the same result, except valid UTF-8 holding both a 0xED lead and a 4-byte character, refused
-/// before and taken as it is now (see `decode_mutf8`).
+/// Valid UTF-8, modified UTF-8 and random bytes: the fast reader gives the old reader's result,
+/// except valid UTF-8 holding a 4-byte form (a byte of 0xF0 or above), accepted by the old test
+/// and refused now, as by the game (see `decode_mutf8`).
 #[test]
-fn reader_without_redundant_scans_agrees() {
+fn fast_string_reader_agrees() {
     let mut rng = TestRng(0x6d75_7466_385f_7264);
     let mut inputs: Vec<Vec<u8>> = Vec::new();
     for _ in 0..50_000 {
@@ -136,20 +136,35 @@ fn reader_without_redundant_scans_agrees() {
         let noise_len = rng.below(12);
         inputs.push((0..noise_len).map(|_| rng.next() as u8).collect());
     }
-    let mut accepted_only_now = 0;
+    let mut refused_only_now = 0;
     for bytes in &inputs {
         match (decode_mutf8(bytes, false), decode_mutf8(bytes, true)) {
             (Ok(old), Ok(new)) => assert_eq!(old, new, "{bytes:x?}"),
             (Err(_), Err(_)) => {}
-            (Err(_), Ok(new)) => {
-                assert!(bytes.contains(&0xed) && bytes.iter().any(|&b| b >= 0xf0), "{bytes:x?}");
-                assert_eq!(new.as_bytes(), &bytes[..]);
-                accepted_only_now += 1;
+            (Ok(_), Err(_)) => {
+                let four_byte_form = bytes.iter().any(|&b| b >= 0xf0);
+                assert!(std::str::from_utf8(bytes).is_ok() && four_byte_form, "{bytes:x?}");
+                refused_only_now += 1;
             }
-            (Ok(old), Err(_)) => panic!("refused, accepted before as {old:?}: {bytes:x?}"),
+            (Err(_), Ok(new)) => panic!("accepted as {new:?}, refused before: {bytes:x?}"),
         }
     }
-    eprintln!("{} inputs, {accepted_only_now} valid UTF-8 with hangul and 4-byte forms now accepted", inputs.len());
+    // The generated strings outside the base plane must reach the changed case.
+    assert!(refused_only_now > 1_000, "only {refused_only_now} 4-byte forms");
+    eprintln!("{} inputs, {refused_only_now} valid UTF-8 with 4-byte forms now refused", inputs.len());
+}
+
+/// Frozen bytes: hangul then an emoji in standard UTF-8 (a 4-byte form) is refused, as by the
+/// game's reader, alone or after hangul; the same text in modified UTF-8 (surrogate pair) is read.
+#[test]
+fn four_byte_utf8_form_is_refused() {
+    let hangul_then_emoji_utf8: &[u8] = &[0xed, 0x95, 0x9c, 0xf0, 0x9f, 0x98, 0x80];
+    let emoji_utf8: &[u8] = &[0xf0, 0x9f, 0x98, 0x80];
+    for bytes in [hangul_then_emoji_utf8, emoji_utf8] {
+        assert!(decode_mutf8(bytes, true).is_err(), "{bytes:x?}");
+    }
+    let hangul_then_emoji_modified: &[u8] = &[0xed, 0x95, 0x9c, 0xed, 0xa0, 0xbd, 0xed, 0xb8, 0x80];
+    assert_eq!(decode_mutf8(hangul_then_emoji_modified, true).unwrap(), "\u{d55c}\u{1f600}");
 }
 
 /// Int and long arrays: expected bytes frozen, then 4,000 random arrays written in one block

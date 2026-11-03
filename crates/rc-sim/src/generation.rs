@@ -784,6 +784,7 @@ impl Worker {
         let map = &self.map;
         let encoded: Vec<((i32, i32), Vec<u8>)> = list
             .par_iter()
+            // One encoder per rayon task (not per thread): the size hint carries over within a task.
             .map_init(nbtio::RootEncoder::default, |encoder, p| {
                 let s = &map[p];
                 let status = if s.stage == Stage::Decorated { DECORATED } else { TERRAIN };

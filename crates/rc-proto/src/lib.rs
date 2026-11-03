@@ -3,6 +3,8 @@
 //! Zero-copy reading (`Reader` over a borrowed slice), writing into a `Vec<u8>`.
 //! Encoding and decoding in both directions: the same crate serves the client, the capture
 //! proxy and a possible server.
+//!
+//! Depends on rc-data only to read the `RUSTCRAFT_OPT_NBT_*` switches of the NBT codec.
 
 mod codec;
 mod error;

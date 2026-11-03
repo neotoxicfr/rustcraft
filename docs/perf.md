@@ -1171,19 +1171,30 @@ with the bench's save scene.
 ### NBT writing: strings without a buffer, arrays in one block, sized roots (C5-M10, 03/11, loaded machine)
 
 Writer used by every save (chunk columns, `.dat`), the generator's proto-chunks and the LAN.
-Three switches, default on, `=0` restores the old path:
+Four switches, default on, `=0` restores the old path:
 
-- `RUSTCRAFT_OPT_NBT_STRING_FAST_PATH`: a string without a null character and without a
-  character outside the base plane has the same bytes in UTF-8 and in modified UTF-8, so it is
-  copied as it is; the others are encoded straight into the output after a 2-byte length patched
-  at the end (back to an empty string past 65,535 bytes, like before). Old path: one temporary
-  `Vec` per key and per value, then a copy. The reader drops its two extra scans after the UTF-8
-  check (0xC0 never occurs in valid UTF-8; 0xED there only leads hangul, decoded the same).
+- `RUSTCRAFT_OPT_NBT_STRING_FAST_PATH` (writer only): a string without a null character and
+  without a character outside the base plane has the same bytes in UTF-8 and in modified UTF-8, so
+  it is copied as it is; the others are encoded straight into the output after a 2-byte length
+  patched at the end (back to an empty string past 65,535 bytes, like before). Old path: one
+  temporary `Vec` per key and per value, then a copy.
+- `RUSTCRAFT_OPT_NBT_STRING_READ_FAST_PATH` (reader, separate so each side is measured alone):
+  valid UTF-8 is copied as it is when no byte reaches 0xF0, one byte test instead of the old
+  two (0xC0 never occurs in valid UTF-8; 0xED there only leads hangul, decoded the same).
+  Anything else goes to the unit decoder, which refuses 4-byte forms like the game's reader.
 - `RUSTCRAFT_OPT_NBT_ARRAY_BULK`: int and long arrays written with one resize then a loop over
   fixed-size blocks (byte swaps vectorised), instead of one `extend_from_slice` per element.
-- `RUSTCRAFT_OPT_NBT_SIZE_HINT`: `nbtio::RootEncoder` (save loop, generator batches with one
-  encoder per rayon worker, new world, cache erasing) starts each buffer at the size of the
-  previous root plus an eighth, never below 4 KiB, instead of 4 KiB grown by doubling.
+- `RUSTCRAFT_OPT_NBT_SIZE_HINT`: `nbtio::RootEncoder` (save loop, generator batches, new world,
+  cache erasing) starts each buffer at the size of the previous root plus an eighth, never below
+  4 KiB, instead of 4 KiB grown by doubling. In the generator, `map_init` gives one encoder per
+  rayon task, not per thread: rayon splits a batch into as many tasks as it likes and the first
+  root of each starts at 4 KiB, so the hint helps less there than in the save loop. If the
+  `generation` scene shows a gain worth more, one encoder per thread (`thread_local`, or
+  `par_chunks` with an encoder per chunk) is the next step.
+
+rc-proto now depends on rc-data, only for `env_str!` (clippy.toml forbids any other environment
+read): rc-proto and rc-net compile after all of rc-data (HTTP client, zip, regex, rayon); the
+executable does not change. Moving `env_flags` into a crate without dependencies would undo it.
 
 Proof: `nbt::write_tests` (rc-proto): 100,000 generated strings (ASCII, nulls, Latin-1, hangul,
 base plane, outside it, mixed) plus 11 boundary strings (0, 65,535, 65,536, 70,000 bytes,
@@ -1195,11 +1206,14 @@ arrays in little-endian, length patched one byte off (both fail). rc-sim
 `model_world_encodes_identically`: the 17,689 chunks of the model world (terrain, entities, POI;
 131.6 MB) give the same bytes with the old writer, the new one and `RootEncoder`.
 
-Only difference in behaviour (reader): valid UTF-8 holding both a 0xED lead (hangul) and a
-4-byte character was refused by the old path and is now accepted, like the same text without the
-hangul always was (150,000 inputs of the reader test: 5,854 such cases, all others identical). The
-game refuses every 4-byte form: a leniency of the reader that predates this change, never
-produced by our writer; left to a fidelity mission.
+Only difference in behaviour (reader), closer to the game: valid UTF-8 holding a 4-byte form (a
+byte of 0xF0 or above) without hangul or 0xC0 was accepted by the old test and is now refused, as
+the game's reader refuses every 4-byte form (its string tag reads Java's standard modified UTF-8).
+A region written by a third-party tool with an emoji in standard UTF-8 now fails to read like in
+the game instead of loading. Our writer never produces such bytes (surrogate pairs). Proof:
+`fast_string_reader_agrees` (150,000 inputs: this case only, all others identical) and
+`four_byte_utf8_form_is_refused` (frozen bytes `ED 95 9C F0 9F 98 80` and `F0 9F 98 80`).
+`RUSTCRAFT_OPT_NBT_STRING_READ_FAST_PATH=0` restores the old leniency.
 
 Micro-benches (trial profile, loaded machine: other agents compiling, 3 passes):
 
@@ -1216,7 +1230,7 @@ Strings: ×4 on the typical column, −35 to −45% on the real ones. Arrays: �
 against 10.6–11.8, within noise. Arrays and size hint kept on behind their switch (C6) until the
 quiet-machine bench of the `autosave-1` and `generation` scenes. Multi-core: one root is a
 sequential walk; the generator already encodes its batch in parallel, the save loop in series
-(its parallel version is another mission: it must keep one `RootEncoder` per worker through
+(its parallel version is another mission: it must keep one `RootEncoder` per rayon task through
 `map_init`). GPU not applicable (tree walk, a few µs). Not done: AVX2 byte swaps behind runtime
 detection (≈ 1 µs per column at most); the same per-element long writing in the LAN chunk packet
 (`lan/encode.rs`, `container_raw`), left to the mission that owns that file.

@@ -82,19 +82,33 @@ fn len_i32(r: &mut Reader<'_>, elem: usize) -> Result<usize> {
 
 /// Decodes Java's modified UTF-8 (null on 2 bytes, surrogate pairs on 6 bytes).
 fn mutf8(bytes: &[u8]) -> Result<String> {
-    decode_mutf8(bytes, WriteOptions::from_env().string_fast_path)
+    decode_mutf8(bytes, string_read_fast_path_enabled())
 }
 
-/// `skip_redundant_scans` (same switch as the string writer): valid UTF-8 is taken as it is
-/// without two more scans. 0xC0 never occurs in valid UTF-8, and 0xED there only leads a
-/// character of U+D000..U+D7FF (hangul), which the unit decoder below gives back unchanged.
-/// Only difference: valid UTF-8 holding both a 0xED lead and a 4-byte character, refused by the
-/// old path (the unit decoder knows no 4-byte form), is now accepted like the same text without
-/// the 0xED character always was.
-fn decode_mutf8(bytes: &[u8], skip_redundant_scans: bool) -> Result<String> {
-    if let Ok(s) = std::str::from_utf8(bytes)
-        && (skip_redundant_scans || (!bytes.contains(&0xc0) && !bytes.contains(&0xed)))
-    {
+/// True (default): the string reader copies valid UTF-8 after one cheap byte test instead of
+/// two scans. `RUSTCRAFT_OPT_NBT_STRING_READ_FAST_PATH=0`: the old test, which also took 4-byte
+/// forms the game refuses. Separate from the writer's switch so each can be measured alone.
+fn string_read_fast_path_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_NBT_STRING_READ_FAST_PATH") != Some("0"))
+}
+
+/// Text whose bytes are both valid UTF-8 and the modified UTF-8 of the same characters is
+/// copied as it is; the rest goes to the unit decoder.
+///
+/// `fast_path`: valid UTF-8 without any byte of 0xF0 or above. Such bytes hold only characters of
+/// 1 to 3 bytes, decoded the same by the game's reader (0xC0 never occurs in valid UTF-8, 0xED
+/// there only leads hangul). A 0xF0+ byte goes to the unit decoder, which refuses it as the game
+/// does: its reader knows no 4-byte form.
+/// Without `fast_path` (old test): valid UTF-8 without 0xC0 nor 0xED, so a 4-byte form without
+/// hangul was accepted, unlike the game.
+fn decode_mutf8(bytes: &[u8], fast_path: bool) -> Result<String> {
+    let may_copy = if fast_path {
+        bytes.iter().all(|&b| b < 0xf0)
+    } else {
+        !bytes.contains(&0xc0) && !bytes.contains(&0xed)
+    };
+    if may_copy && let Ok(s) = std::str::from_utf8(bytes) {
         return Ok(s.to_owned());
     }
     decode_mutf8_units(bytes)

@@ -53,6 +53,8 @@ fn size_hint_enabled() -> bool {
 /// Encodes a run of similar roots (the chunk columns of one save, the proto-chunks of one
 /// batch). A column takes tens of KiB: starting at 4 KiB and doubling costs 3 to 5
 /// reallocations and copies, so each buffer starts at the size of the previous root instead.
+/// Under rayon's `map_init` there is one encoder per rayon task, not per thread: rayon splits a
+/// batch into as many tasks as it likes, and the first root of each task starts at 4 KiB.
 #[derive(Debug)]
 pub struct RootEncoder {
     next_capacity: usize,
