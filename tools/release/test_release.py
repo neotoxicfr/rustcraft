@@ -1,7 +1,8 @@
 """Release tool tests (`python -I tools/release/test_release.py`): archives identical byte for byte
 whatever the date, the order and the place of the input files; path hiding writes a valid cargo
-config and finds the paths left in a binary; the committed linker flag and the release/rehearsal
-build command stay as they must be. Expected values are stored here."""
+config (C compiler included on Linux) and finds the paths left in a binary; the committed linker
+flag, the release/rehearsal build command, the check of the shipped file and the rehearsal's second
+place stay as they must be. Expected values are stored here."""
 import gzip
 import io
 import os
@@ -133,6 +134,21 @@ class Workflows(unittest.TestCase):
         self.assertIn("hide-paths.toml", release[0])
         self.assertIn("--locked", release[0])
 
+    def test_path_check_reads_the_shipped_linux_file(self):
+        # The unstripped Linux executable holds debug info that is never published.
+        for name in ("release.yml", "reproducibility.yml"):
+            text = read_text(os.path.join(pack.ROOT, ".github", "workflows", name))
+            self.assertIn("exe=pkg/rustcraft\n", text, name)
+            self.assertLess(text.index("strip pkg/rustcraft"), text.index("hide_paths.py check"), name)
+
+    def test_rehearsal_builds_twice_at_different_paths(self):
+        text = read_text(os.path.join(pack.ROOT, ".github", "workflows", "reproducibility.yml"))
+        self.assertIn("root: .\n", text)
+        self.assertIn("root: elsewhere/rustcraft\n", text)
+        self.assertIn("path: ${{ matrix.root }}\n", text)
+        self.assertIn("working-directory: ${{ matrix.root }}\n", text)
+        self.assertIn('echo "CARGO_HOME=$home" >> "$GITHUB_ENV"', text)
+
 
 class HidePaths(unittest.TestCase):
     def test_config_is_valid_toml_with_both_remaps(self):
@@ -146,6 +162,22 @@ class HidePaths(unittest.TestCase):
     def test_config_refuses_a_path_it_cannot_quote(self):
         with self.assertRaises(SystemExit):
             hide_paths.config_text(["--remap-path-prefix=/home/o'brien=/src"])
+
+    def test_c_compiler_gets_the_same_renames_on_linux(self):
+        c_flags = hide_paths.c_remap_flags("/home/runner/.cargo", "/home/runner/work/r", os_name="posix")
+        config = tomllib.loads(hide_paths.config_text(hide_paths.remap_flags("/home/runner/.cargo", "/w"), c_flags))
+        self.assertEqual(
+            config["env"]["CFLAGS"],
+            "-ffile-prefix-map=/home/runner/.cargo=/cargo -ffile-prefix-map=/home/runner/work/r=/src",
+        )
+
+    def test_no_c_flags_on_windows(self):
+        self.assertEqual(hide_paths.c_remap_flags(r"C:\Users\some one\.cargo", r"D:\a", os_name="nt"), [])
+        self.assertNotIn("[env]", hide_paths.config_text(hide_paths.remap_flags(r"C:\x", r"D:\a"), []))
+
+    def test_c_flags_refuse_a_path_with_a_space(self):
+        with self.assertRaises(SystemExit):
+            hide_paths.config_text([], hide_paths.c_remap_flags("/home/some one/.cargo", "/w", os_name="posix"))
 
     def test_cargo_home_follows_the_environment(self):
         self.assertEqual(hide_paths.cargo_home({"CARGO_HOME": "/opt/cargo"}), "/opt/cargo")

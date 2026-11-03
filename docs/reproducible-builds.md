@@ -10,6 +10,7 @@ so anyone can check that a published file comes from the published source.
 | Build time written by the Windows linker into the executable header and debug directory | `-C link-arg=/Brepro` in `.cargo/config.toml` (the linker writes a hash of the content instead) |
 | Absolute path of the `.pdb` in the debug directory | rustc already cuts it down to the file name (`/PDBALTPATH:%_PDB%`) |
 | Absolute paths of the dependencies' sources (`C:\Users\<name>\.cargo\registry\...`) in every panic message | `--remap-path-prefix` generated per machine by `tools/release/hide_paths.py config`, passed to cargo with `--config` |
+| Linux: the same paths in the debug info of the C dependencies (mimalloc, libdeflate, ring), built by the `cc` crate with `-g`, and through it in the GNU build id, which `strip` keeps | the same file sets `CFLAGS` to `-ffile-prefix-map=...` (`cc` does not translate rustc's remap flags; a `CFLAGS` already set in the environment wins over the file) |
 | Dates, order, owner and "created by" bytes of the archive entries | `tools/release/pack.py`, with the commit date as `SOURCE_DATE_EPOCH` |
 | The toolchain, the dependencies, the actions | `rust-toolchain.toml`, `--locked`, actions pinned to a commit |
 
@@ -34,8 +35,14 @@ cargo build --locked --release -p rc-app --config target/hide-paths.toml
 python -I tools/release/hide_paths.py check target/release/rustcraft.exe
 ```
 
+On Linux, `strip` the executable first and `check` the stripped file, the one the archive holds: before
+`strip` it also carries debug info, which is never published.
+
 `check` fails when the cargo home, the checkout or the home directory (the user name) is still written in
-the binary. The result does not depend on the folder of the checkout or on the user.
+the binary. The result does not depend on the folder of the checkout or on the cargo home: the rehearsal
+below builds its second copy at another checkout folder (so another target folder) with another cargo
+home, and compares. The user name enters the build only through these paths; the two runners of the
+rehearsal share it, so a different user is not tested as such.
 
 ## Check a release
 
@@ -48,7 +55,8 @@ differ with another zlib, the files inside never do.
 ## Rehearsal
 
 The workflow `Reproducibility` (manual start, Actions tab) builds the selected commit twice per system
-with the full release profile, packages both like `release.yml`, and fails if an executable or an archive
-differs. It is also the only place besides a tag where the full profile (LTO, one code generation unit, and later the
+with the full release profile, the second time at another checkout folder and with another cargo home,
+packages both like `release.yml`, and fails if a shipped executable or an archive differs. Run it before
+merging a change of the build into the branch that is tagged. It is also the only place besides a tag where the full profile (LTO, one code generation unit, and later the
 profile-guided step) is compiled in CI, so a break of that profile is seen before the tag. It is not run on
 every tag: four full builds.

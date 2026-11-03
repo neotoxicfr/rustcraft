@@ -53,12 +53,6 @@ jobs:
       - name: Build (full release profile)
         shell: bash
         run: cargo build --locked --release -p rc-app --config "$RUNNER_TEMP/hide-paths.toml"
-      - name: No path of this runner left in the executable
-        shell: bash
-        run: |
-          exe=target/release/rustcraft
-          if [ "$RUNNER_OS" = Windows ]; then exe="$exe.exe"; fi
-          python -I tools/release/hide_paths.py check "$exe"
       - name: Package for Windows
         if: runner.os == 'Windows'
         shell: bash
@@ -71,6 +65,14 @@ jobs:
           cp target/release/rustcraft pkg/rustcraft
           strip pkg/rustcraft
           python -I tools/release/pack.py linux "${GITHUB_REF_NAME#v}" pkg/rustcraft pkg
+      # On the file that is shipped: before `strip`, the Linux executable also holds the debug info,
+      # which is never published.
+      - name: No path of this runner left in the shipped executable
+        shell: bash
+        run: |
+          exe=pkg/rustcraft
+          if [ "$RUNNER_OS" = Windows ]; then exe=target/release/rustcraft.exe; fi
+          python -I tools/release/hide_paths.py check "$exe"
       # One step and one format for both systems. PowerShell's Set-Content ended the Windows sum
       # with CRLF: `sha256sum -c` then reads the CR as part of the file name and fails. Git Bash's
       # sha256sum writes " *name" where Linux writes "  name", so the line is written by hand:

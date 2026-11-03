@@ -4331,3 +4331,15 @@ frames; GPU = submit and wait of the pass minus an empty pass, 512 × 512):
   profile (thin LTO, one unit) on the real runners, the Linux executable (ELF, `strip`, tar.gz), the duration
   of the jobs. To do with the first manual start of `Reproducibility` before the next tag (4 builds); if the
   Linux executables differ, `cmp -l` offsets are printed by the compare job.
+- Review follow-up (Linux and the rehearsal): the full profile has debug info, so the `cc` crate compiles the C
+  dependencies (mimalloc, libdeflate, ring) with `-g`, and `cc` 1.7.0 does not translate rustc's
+  `--remap-path-prefix` (it reads only the unstable trim-paths variables). Their debug info would name the
+  runner's cargo home and target folder, the path check on the unstripped Linux executable would fail the tag
+  after the empty release is created, and the GNU build id (a hash of the whole file, kept by `strip`) would
+  change with the paths. Measured with gcc 16.1 (MinGW, same flags as `cc`: absolute source and `-I`, `-g`):
+  one small object names its folder 4 times and two folders give two different objects; with
+  `-ffile-prefix-map=<folder>=/src`, 0 times and identical objects. `hide_paths.py config` now also writes
+  `CFLAGS = -ffile-prefix-map=...` (not on Windows: cl.exe puts its debug info in the `.pdb`), and the path
+  check reads the shipped file (Linux: after `strip`). The rehearsal builds its second copy at another checkout
+  folder (`elsewhere/rustcraft`) with another cargo home, and compares the shipped files: before, both copies sat
+  at the same path, so a path left in both was invisible. Not run: the Linux build itself (no Linux here).

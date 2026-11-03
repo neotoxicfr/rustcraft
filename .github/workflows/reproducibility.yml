@@ -24,15 +24,34 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-22.04]
         attempt: [first, second]
+        # The second build sits elsewhere (checkout, target folder and cargo home): a machine path left
+        # in the executable then makes the two builds differ instead of hiding in both.
+        include:
+          - attempt: first
+            root: .
+          - attempt: second
+            root: elsewhere/rustcraft
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: ${{ matrix.root }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ${{ matrix.root }}
       - name: Linux build dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
       - name: Toolchain from rust-toolchain.toml
         run: rustup toolchain install && rustup show active-toolchain
+      - name: Another cargo home for the second build
+        if: matrix.attempt == 'second'
+        shell: bash
+        run: |
+          home="$RUNNER_TEMP/other-cargo-home"
+          if [ "$RUNNER_OS" = Windows ]; then home=$(cygpath -w "$home"); fi
+          echo "CARGO_HOME=$home" >> "$GITHUB_ENV"
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
@@ -44,12 +63,7 @@ jobs:
       - name: Build (full release profile)
         shell: bash
         run: cargo build --locked --release -p rc-app --config "$RUNNER_TEMP/hide-paths.toml"
-      - name: No path of this runner left in the executable
-        shell: bash
-        run: |
-          exe=target/release/rustcraft
-          if [ "$RUNNER_OS" = Windows ]; then exe="$exe.exe"; fi
-          python -I tools/release/hide_paths.py check "$exe"
+      # The executables compared are the shipped ones (Linux: after `strip`, as in the archive).
       - name: Package
         shell: bash
         run: |
@@ -58,17 +72,23 @@ jobs:
             cp target/release/rustcraft.exe out/
             python -I tools/release/pack.py windows rehearsal target/release/rustcraft.exe pkg
           else
-            cp target/release/rustcraft out/
             cp target/release/rustcraft pkg/rustcraft
             strip pkg/rustcraft
+            cp pkg/rustcraft out/
             python -I tools/release/pack.py linux rehearsal pkg/rustcraft pkg
           fi
           cp pkg/rustcraft-rehearsal-* out/
           (cd out && sha256sum * | tee ../sums.txt)
+      - name: No path of this runner left in the shipped executable
+        shell: bash
+        run: |
+          exe=pkg/rustcraft
+          if [ "$RUNNER_OS" = Windows ]; then exe=target/release/rustcraft.exe; fi
+          python -I tools/release/hide_paths.py check "$exe"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: rehearsal-${{ matrix.os }}-${{ matrix.attempt }}
-          path: out
+          path: ${{ matrix.root }}/out
           retention-days: 7
 
   compare:
