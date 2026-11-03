@@ -479,6 +479,59 @@ switch_f!(
     jigsaw_idx,
     "JIGSAW_IDX"
 );
+
+/// Switches of the jigsaw assembly work savings, in track order (names without the
+/// `RUSTCRAFT_OPT_` prefix).
+#[cfg(test)]
+pub(crate) const JIGSAW_ASSEMBLY: [&str; 6] = [
+    "JIGSAW_FAILED_ELEMENT_MEMO",
+    "JIGSAW_EXPAND_MEMO",
+    "JIGSAW_RECENT_FIRST",
+    "JIGSAW_SPATIAL_GRID",
+    "JIGSAW_REUSED_BUFFERS",
+    "LAZY_POOLS",
+];
+
+switch_f!(
+    /// Assembly: an element already tried at a junction is not tried again (it fails the same
+    /// way); only its random draws are replayed.
+    jigsaw_failed_element_memo,
+    "JIGSAW_FAILED_ELEMENT_MEMO"
+);
+switch_f!(
+    /// Assembly: expansion height of the village trick worked out once per (element, rotation)
+    /// and start.
+    jigsaw_expand_memo,
+    "JIGSAW_EXPAND_MEMO"
+);
+/// Assembly: free space test walks the placed boxes from the most recent one, only
+/// `RUSTCRAFT_OPT_JIGSAW_RECENT_FIRST=1` (off by default: a village compares 1.5 times as many
+/// boxes that way, the boxes its trials meet being mostly the oldest ones; see `docs/perf.md`).
+#[inline]
+pub fn jigsaw_recent_first() -> bool {
+    #[cfg(test)]
+    if let Some(v) = forced("JIGSAW_RECENT_FIRST") {
+        return v;
+    }
+    static S: LazyLock<bool> =
+        LazyLock::new(|| rc_data::env_str!("RUSTCRAFT_OPT_JIGSAW_RECENT_FIRST").is_some_and(|v| v.trim() == "1"));
+    *S
+}
+switch_f!(
+    /// Assembly: placed boxes of a crowded free space indexed by 16-block columns.
+    jigsaw_spatial_grid,
+    "JIGSAW_SPATIAL_GRID"
+);
+switch_f!(
+    /// Assembly: index buffers of the shuffles kept from one trial to the next.
+    jigsaw_reused_buffers,
+    "JIGSAW_REUSED_BUFFERS"
+);
+switch_f!(
+    /// Pools: text of each pool parsed at its first lookup, not at generator start.
+    lazy_pools,
+    "LAZY_POOLS"
+);
 switch_f!(
     /// Placement: shared processor list (prefix, common list, suffix) instead of a copy
     /// per placed piece; inline processors of an element analysed once.
