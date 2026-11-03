@@ -413,7 +413,8 @@ impl Server {
 
     /// The block at `p` starts to fall.
     pub(crate) fn spawn_falling_block(&mut self, p: P, s: u32) {
-        let carried = if self.v().get_bool(s, "waterlogged") { self.v().set_bool(s, "waterlogged", false) } else { s };
+        let v = self.view();
+        let carried = if v.get_bool(s, "waterlogged") { v.set_bool(s, "waterlogged", false) } else { s };
         let id = self.alloc_entity();
         let pos = [f64::from(p[0]) + 0.5, f64::from(p[1]), f64::from(p[2]) + 0.5];
         let mut e = SimEntity::new(id, EntKind::Falling(carried), pos, [0.0; 3]);
@@ -476,7 +477,7 @@ impl Server {
                 let s = nbt
                     .and_then(|n| n.get("BlockState"))
                     .and_then(|e| self.states.state_of(&self.data, e))
-                    .filter(|&s| !self.v().is_air(s))
+                    .filter(|&s| !self.view().is_air(s))
                     .unwrap_or(sand);
                 EntKind::Falling(s)
             }
@@ -611,7 +612,7 @@ impl Server {
     }
 
     fn tick_falling(&mut self, e: &mut SimEntity, s: u32) {
-        if self.v().is_air(s) {
+        if self.view().is_air(s) {
             e.removed = true;
             return;
         }
@@ -647,7 +648,7 @@ impl Server {
             return;
         }
         let mut p = [e.pos[0].floor() as i32, e.pos[1].floor() as i32, e.pos[2].floor() as i32];
-        let concrete = self.v().kind(s) == Kind::ConcretePowder;
+        let concrete = self.view().kind(s) == Kind::ConcretePowder;
         let mut solidify = concrete && self.fluid_at(p).kind == 1;
         // Fast powder (more than one block per tick): ray from the position before the tick
         // (collision shapes, fluid sources); a water source it touches freezes it there.
@@ -671,21 +672,21 @@ impl Server {
         } else {
             let cur = self.get(p);
             e.vel = [e.vel[0] * 0.7, e.vel[1] * -0.5, e.vel[2] * 0.7];
-            if self.v().kind(cur) != Kind::MovingPiston {
+            if self.view().kind(cur) != Kind::MovingPiston {
                 let drops = e.drop_item && self.rule("minecraft:entity_drops", true);
                 if e.cancel_drop {
                     // Suspicious sand or gravel, anvil worn down to the end: broken on arrival.
                     e.removed = true;
                     self.falling_broken(e, orig, p);
                 } else {
-                    let may_replace = self.v().replaceable(cur) || self.v().is_air(cur);
+                    let may_replace = self.view().replaceable(cur) || self.view().is_air(cur);
                     let continue_falling = self.is_free_below(p) && (!concrete || !solidify);
-                    let mut st =
-                        if solidify { self.v().default_state(self.bs.t.pair[self.v().block(s) as usize]) } else { s };
+                    let v = self.view();
+                    let mut st = if solidify { v.default_state(v.table.pair[v.block(s) as usize]) } else { s };
                     let survive = self.can_survive(st, p) && !continue_falling;
                     if may_replace && survive {
-                        if self.v().has(st, "waterlogged") && self.fluid_at(p).kind == 1 && self.fluid_at(p).source {
-                            st = self.v().set_bool(st, "waterlogged", true);
+                        if self.view().has(st, "waterlogged") && self.fluid_at(p).kind == 1 && self.fluid_at(p).source {
+                            st = self.view().set_bool(st, "waterlogged", true);
                         }
                         if self.set_block(p, st, flag::ALL) {
                             self.send_block(p);
@@ -783,7 +784,7 @@ impl Server {
     /// fluid (1 under water).
     fn fall_reset_cell(&self, cell: P, from: [f64; 3], d: [f64; 3]) -> bool {
         let st = self.get(cell);
-        if self.v().is_air(st) {
+        if self.view().is_air(st) {
             return false;
         }
         let mut height = 0.0f64;
@@ -890,7 +891,7 @@ impl Server {
             match next {
                 None => e.cancel_drop = true,
                 Some(n) => {
-                    let v = self.v();
+                    let v = self.view();
                     let facing = v.get(s, "facing").unwrap_or("north").to_owned();
                     let d = v.default_state(self.bs.t.block_id(n));
                     e.kind = EntKind::Falling(v.set(d, "facing", &facing));
@@ -935,7 +936,7 @@ impl Server {
 
     fn is_free_below(&self, p: P) -> bool {
         let s = self.get(below(p));
-        let v = self.v();
+        let v = self.view();
         v.is_air(s)
             || matches!(v.kind(s), Kind::Fire | Kind::SoulFire)
             || v.info(s).has(rc_data::flags::LIQUID)
@@ -949,8 +950,10 @@ impl Server {
         }
         // Block replaced in water, or water touching a face (except through a
         // full face).
-        if self.v().kind(s) == Kind::ConcretePowder && (self.fluid_of(replaced).kind == 1 || self.touches_liquid(p)) {
-            let c = self.v().default_state(self.bs.t.pair[self.v().block(s) as usize]);
+        if self.view().kind(s) == Kind::ConcretePowder
+            && (self.fluid_of(replaced).kind == 1 || self.touches_liquid(p))
+        {
+            let c = self.view().default_state(self.bs.t.pair[self.view().block(s) as usize]);
             self.set_block(p, c, flag::ALL);
         }
     }
@@ -1265,7 +1268,7 @@ impl Server {
     pub(crate) fn player_touch_blocks(&mut self, from: [f64; 3]) {
         let p = [self.pos[0].floor() as i32, self.pos[1].floor() as i32, self.pos[2].floor() as i32];
         for q in [p, below(p)] {
-            if matches!(self.v().kind(self.get(q)), Kind::Plate { .. } | Kind::WeightedPlate { .. }) {
+            if matches!(self.view().kind(self.get(q)), Kind::Plate { .. } | Kind::WeightedPlate { .. }) {
                 self.plate_entity_inside(q);
             }
         }
@@ -1273,7 +1276,7 @@ impl Server {
         self.tripwire_entity_inside(p, self.game_mode == 3, from, self.pos, w / 2.0, h, false);
         // G5-F09: big dripleaf under the feet (the full pass over crossed blocks, G5-F02,
         // calls it for all entities; a second call has no effect).
-        if self.game_mode != 3 && self.v().kind(self.get(p)) == Kind::BigDripleaf {
+        if self.game_mode != 3 && self.view().kind(self.get(p)) == Kind::BigDripleaf {
             let (g, y) = (self.on_ground, self.pos[1]);
             self.dripleaf_entity_inside(p, g, y);
         }
@@ -1442,8 +1445,8 @@ impl Server {
     /// The "to save" mark of a block entity: neighbouring comparators reread the signal.
     pub(crate) fn container_changed(&mut self, p: P) {
         let s = self.get(p);
-        if self.v().has_analog(s) {
-            let b = self.v().block(s);
+        if self.view().has_analog(s) {
+            let b = self.view().block(s);
             self.update_neighbour_for_output_signal(p, b);
         }
     }
@@ -1548,9 +1551,9 @@ impl Server {
     pub(crate) fn container_at(&self, p: P) -> Option<Vec<P>> {
         let s = self.get(p);
         self.container_size(s)?;
-        if self.v().kind(s) == Kind::Chest && self.v().get(s, "type") != Some("single") {
+        if self.view().kind(s) == Kind::Chest && self.view().get(s, "type") != Some("single") {
             let other = self.chest_other_half(s, p)?;
-            return Some(if self.v().get(s, "type") == Some("right") { vec![other, p] } else { vec![p, other] });
+            return Some(if self.view().get(s, "type") == Some("right") { vec![other, p] } else { vec![p, other] });
         }
         Some(vec![p])
     }
@@ -1615,7 +1618,7 @@ impl Server {
         let Some(st) = crate::player::Stack::from_nbt(item).filter(|st| self.stack_has(st, "minecraft:compostable")) else {
             return Some(false);
         };
-        if face != Dir::Up || self.v().get_int(s, "level") >= 7 {
+        if face != Dir::Up || self.view().get_int(s, "level") >= 7 {
             return Some(false);
         }
         let ns = self.composter_add_layer(c, s, &st, None);
@@ -1626,7 +1629,7 @@ impl Server {
     /// Can the composter `c` receive through face `face`? (Hopper: otherwise it is
     /// "full" on that side.)
     fn composter_open(&self, c: P, face: Dir) -> bool {
-        face == Dir::Up && self.v().get_int(self.get(c), "level") < 7
+        face == Dir::Up && self.view().get_int(self.get(c), "level") < 7
     }
 
     /// Composter `c` above the hopper `hopper`: at level 8, the bone meal goes down and
@@ -1637,14 +1640,14 @@ impl Server {
         if self.state_name(s) != "minecraft:composter" {
             return None;
         }
-        if self.v().get_int(s, "level") != 8 {
+        if self.view().get_int(s, "level") != 8 {
             return Some(false);
         }
         // Like the game: the bone meal is first removed from the output, which already empties the
         // composter (level 0, `block_change`), then only offered to the hopper. Hopper
         // that refuses it: the bone meal is lost (quirk). Success and failure both re-emit a
         // second `block_change` (new change signal of the output).
-        let ns = self.v().set_int(s, "level", 0);
+        let ns = self.view().set_int(s, "level", 0);
         self.set_update(c, ns);
         self.game_event_block("minecraft:block_change", c, None, Some(ns));
         let meal = crate::player::Stack { id: "minecraft:bone_meal".into(), count: 1, components: None }.to_nbt(None);
@@ -1710,7 +1713,7 @@ impl Server {
         }
         self.bs.shulkers.insert(p, (id, status, progress));
         let s = self.get(p);
-        let b = self.v().block(s);
+        let b = self.view().block(s);
         for _ in 0..updates {
             self.update_neighbour_shapes(s, p, flag::ALL, 512);
             self.update_neighbors_at(p, b);
@@ -1719,12 +1722,12 @@ impl Server {
 
     pub(crate) fn hopper_ticker_alive(&self, id: u64, p: P) -> bool {
         self.bs.hoppers.get(&p).is_some_and(|h| h.0 == id)
-            && matches!(self.v().kind(self.get(p)), Kind::Hopper | Kind::DaylightDetector)
+            && matches!(self.view().kind(self.get(p)), Kind::Hopper | Kind::DaylightDetector)
     }
 
     /// Block entity created: the hoppers tick.
     pub(crate) fn after_block_entity_created(&mut self, p: P, s: u32) {
-        if matches!(self.v().kind(s), Kind::Hopper | Kind::DaylightDetector) {
+        if matches!(self.view().kind(s), Kind::Hopper | Kind::DaylightDetector) {
             let id = self.add_ticker(p);
             self.bs.hoppers.insert(p, (id, 0, i64::MIN));
         }
@@ -1743,11 +1746,11 @@ impl Server {
         }
         self.rec_block_entity_created(p, s); // F14: creaking heart, shrieker
         self.spawner_blocks_register(p); // W9: cages, trials, vaults
-        match self.v().kind(s) {
+        match self.view().kind(s) {
             Kind::Campfire => self.campfire_ticker_register(p), // G6-F01
             Kind::Beacon => self.beacon_ticker_register(p),     // G5-F11
             Kind::Bell => self.bell_ticker_register(p),         // G3-F13
-            _ if self.v().block(s) == self.bs.t.id.conduit => self.conduit_ticker_register(p), // G6-F12
+            _ if self.view().block(s) == self.bs.t.id.conduit => self.conduit_ticker_register(p), // G6-F12
             _ => {}
         }
         if self.state_name(s) == "minecraft:end_gateway" {
@@ -1884,11 +1887,11 @@ impl Server {
             LoadedBe::Brewing => self.ensure_brewer(p),
             LoadedBe::ByBlock => {
                 let s = self.get(p);
-                match self.v().kind(s) {
+                match self.view().kind(s) {
                     Kind::Campfire => self.campfire_ticker_register(p), // G6-F01
                     _ if self.state_name(s) == "minecraft:end_gateway" => self.gateway_ticker_register(p),
                     Kind::Beacon => self.beacon_ticker_register(p), // G5-F11
-                    _ if self.v().block(s) == self.bs.t.id.conduit => self.conduit_ticker_register(p), // G6-F12
+                    _ if self.view().block(s) == self.bs.t.id.conduit => self.conduit_ticker_register(p), // G6-F12
                     Kind::PotentSulfur => self.potent_sulfur_ticker_sync(p, s), // G6-F09a
                     Kind::Bell => self.bell_ticker_register(p),     // G3-F13
                     Kind::Jukebox => {
@@ -1903,7 +1906,7 @@ impl Server {
     }
 
     pub(crate) fn hopper_tick(&mut self, p: P) {
-        if self.v().kind(self.get(p)) == Kind::DaylightDetector {
+        if self.view().kind(self.get(p)) == Kind::DaylightDetector {
             if self.time % 20 == 0 {
                 self.daylight_update(p);
             }
@@ -1924,7 +1927,7 @@ impl Server {
     pub(crate) fn hopper_try_move(&mut self, p: P, item: Option<&mut crate::drops::ItemEnt>) -> bool {
         let Some(&(_, cd, _)) = self.bs.hoppers.get(&p) else { return false };
         let s = self.get(p);
-        if cd > 0 || !self.v().get_bool(s, "enabled") {
+        if cd > 0 || !self.view().get_bool(s, "enabled") {
             return false;
         }
         let mut changed = false;
@@ -1947,7 +1950,7 @@ impl Server {
     }
 
     fn hopper_eject(&mut self, p: P, s: u32) -> bool {
-        let f = self.v().facing(s);
+        let f = self.view().facing(s);
         let t = rel(p, f);
         let face = f.opposite();
         let composter = self.state_name(self.get(t)) == "minecraft:composter";
@@ -1994,7 +1997,7 @@ impl Server {
 
     /// Hopper at `t` is empty (false if it is not one).
     fn hopper_is_empty(&self, t: P) -> bool {
-        self.v().kind(self.get(t)) == Kind::Hopper && self.slots(t).iter().all(Option::is_none)
+        self.view().kind(self.get(t)) == Kind::Hopper && self.slots(t).iter().all(Option::is_none)
     }
 
     /// Item entered the hopper `t` that was empty, coming from the hopper `from` or another
@@ -2054,7 +2057,7 @@ impl Server {
     /// Tick of the triggered dispenser or dropper: slot drawn at random
     /// among the non-empty ones, item dispensed, slot rewritten with what remains.
     pub(crate) fn dispense_from(&mut self, s: u32, p: P) {
-        let kind = self.v().kind(s);
+        let kind = self.view().kind(s);
         if kind == Kind::Crafter {
             return;
         }
@@ -2079,7 +2082,7 @@ impl Server {
             return;
         };
         let Some(stack) = slots[i].as_ref().and_then(crate::player::Stack::from_nbt) else { return };
-        let f = self.v().facing(s);
+        let f = self.view().facing(s);
         let rest = if kind == Kind::Dropper { self.drop_from(p, f, stack) } else { self.dispense_item(p, f, i, stack) };
         let mut slots = self.slots(p);
         if let Some(slot) = slots.get_mut(i) {
@@ -2115,7 +2118,7 @@ impl Server {
     // --- Rails: survival (powering of powered rails remains to be done). ---
 
     fn rail_survives(&self, s: u32, p: P) -> bool {
-        let v = self.v();
+        let v = self.view();
         if !v.rigid_up(self.support_state(below(p))) {
             return false;
         }
@@ -2135,7 +2138,7 @@ impl Server {
     }
 
     pub(crate) fn rail_neighbor_changed(&mut self, s: u32, p: P, from: u16) {
-        if self.v().block(self.get(p)) != self.v().block(s) {
+        if self.view().block(self.get(p)) != self.view().block(s) {
             return;
         }
         if !self.rail_survives(s, p) {
@@ -2143,7 +2146,7 @@ impl Server {
             self.drop_resources(p, s, None);
             self.remove_block(p, false);
         } else {
-            match self.v().kind(s) {
+            match self.view().kind(s) {
                 Kind::PoweredRail => self.powered_rail_update(s, p),
                 Kind::Rail => self.plain_rail_update(s, p, from),
                 _ => {}
@@ -2153,14 +2156,14 @@ impl Server {
 
     /// Powered / activator rail (§ 3.10): powered directly or linked to a powered rail.
     fn powered_rail_update(&mut self, s: u32, p: P) {
-        let powered = self.v().get_bool(s, "powered");
+        let powered = self.view().get_bool(s, "powered");
         let should = self.has_neighbor_signal(p) || self.rail_signal(p, s, true, 0) || self.rail_signal(p, s, false, 0);
         if should != powered {
-            let ns = self.v().set_bool(s, "powered", should);
+            let ns = self.view().set_bool(s, "powered", should);
             self.set_update(p, ns);
-            let b = self.v().block(s);
+            let b = self.view().block(s);
             self.update_neighbors_at(below(p), b);
-            if self.v().get(s, "shape").is_some_and(|x| x.starts_with("ascending")) {
+            if self.view().get(s, "shape").is_some_and(|x| x.starts_with("ascending")) {
                 self.update_neighbors_at(above(p), b);
             }
         }
@@ -2172,7 +2175,7 @@ impl Server {
         }
         let [mut x, mut y, mut z] = p;
         let mut below_ok = true;
-        let shape = self.v().get(s, "shape").unwrap_or("north_south").to_owned();
+        let shape = self.view().get(s, "shape").unwrap_or("north_south").to_owned();
         let ns_axis = match shape.as_str() {
             "north_south" => {
                 z += if forward { 1 } else { -1 };
@@ -2230,17 +2233,17 @@ impl Server {
 
     fn rail_same_powered(&self, q: P, me: u32, forward: bool, depth: i32, ns_axis: bool) -> bool {
         let st = self.get(q);
-        if self.v().block(st) != self.v().block(me) {
+        if self.view().block(st) != self.view().block(me) {
             return false;
         }
-        let v = self.v();
+        let v = self.view();
         let shape = v.get(st, "shape").unwrap_or("");
         let cross = if ns_axis {
             matches!(shape, "east_west" | "ascending_east" | "ascending_west")
         } else {
             matches!(shape, "north_south" | "ascending_north" | "ascending_south")
         };
-        if cross || !self.v().get_bool(st, "powered") {
+        if cross || !self.view().get_bool(st, "powered") {
             return false;
         }
         self.has_neighbor_signal(q) || self.rail_signal(q, st, forward, depth + 1)
@@ -2248,11 +2251,11 @@ impl Server {
 
     pub(crate) fn rail_after_removal(&mut self, s: u32, p: P, moved: bool) {
         if !moved {
-            let b = self.v().block(s);
-            if self.v().get(s, "shape").is_some_and(|x| x.starts_with("ascending")) {
+            let b = self.view().block(s);
+            if self.view().get(s, "shape").is_some_and(|x| x.starts_with("ascending")) {
                 self.update_neighbors_at(above(p), b);
             }
-            if matches!(self.v().kind(s), Kind::PoweredRail | Kind::DetectorRail) {
+            if matches!(self.view().kind(s), Kind::PoweredRail | Kind::DetectorRail) {
                 self.update_neighbors_at(p, b);
                 self.update_neighbors_at(below(p), b);
             }

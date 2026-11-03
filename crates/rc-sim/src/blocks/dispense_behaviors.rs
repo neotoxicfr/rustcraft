@@ -67,7 +67,7 @@ impl Server {
             }
             "minecraft:wither_skeleton_skull" | "minecraft:carved_pumpkin" => {
                 let skull = id == "minecraft:wither_skeleton_skull";
-                let placed = self.v().is_air(self.get(front))
+                let placed = self.view().is_air(self.get(front))
                     && if skull { self.wither_can_spawn_mob(front) } else { self.can_spawn_golem(front) };
                 let ok = if placed {
                     if skull {
@@ -95,11 +95,11 @@ impl Server {
                 if self.state_name(s) != "minecraft:respawn_anchor" {
                     return self.dispense_default(p, f, stack);
                 }
-                let charges = self.v().get_int(s, "charges");
+                let charges = self.view().get_int(s, "charges");
                 let ok = charges != 4;
                 if ok {
                     // The charge of a respawn anchor without a player.
-                    let ns = self.v().set_int(s, "charges", charges + 1);
+                    let ns = self.view().set_int(s, "charges", charges + 1);
                     self.set_block(front, ns, flag::ALL);
                     self.game_event_block("minecraft:block_change", front, None, Some(ns));
                     self.block_sound(front, "minecraft:block.respawn_anchor.charge", 1.0, 1.0);
@@ -219,7 +219,7 @@ impl Server {
             "minecraft:water_bucket" => self.bucket_empty_at(front, true, None, None),
             "minecraft:lava_bucket" => self.bucket_empty_at(front, false, None, None),
             "minecraft:powder_snow_bucket" => {
-                let ok = self.in_build_height(front[1]) && self.v().is_air(self.get(front));
+                let ok = self.in_build_height(front[1]) && self.view().is_air(self.get(front));
                 if ok {
                     let snow = self.default_state("minecraft:powder_snow");
                     self.set_update(front, snow);
@@ -265,7 +265,7 @@ impl Server {
     /// candle lit, otherwise primed TNT; one point of wear when it was used.
     fn dispense_flint(&mut self, front: P, f: Dir, stack: Stack) -> (Option<Stack>, bool) {
         let s = self.get(front);
-        let v = self.v();
+        let v = self.view();
         let name = self.state_name(s).to_owned();
         let lightable = v.has(s, "lit")
             && !v.get_bool(s, "lit")
@@ -277,7 +277,7 @@ impl Server {
             self.game_event_block("minecraft:block_place", front, None, None);
             true
         } else if lightable {
-            let lit = self.v().set_bool(s, "lit", true);
+            let lit = self.view().set_bool(s, "lit", true);
             self.set_update(front, lit);
             self.game_event_block("minecraft:block_change", front, None, None);
             true
@@ -316,16 +316,16 @@ impl Server {
     /// Shulker box placed in front: facing `f` if the
     /// cell below is empty, otherwise upwards; components copied into the block entity.
     fn dispense_shulker_box(&mut self, front: P, f: Dir, it: &Stack) -> bool {
-        let block = self.tb().block_id(&it.id);
+        let block = self.table().block_id(&it.id);
         if block == u16::MAX || !self.in_build_height(front[1]) {
             return false;
         }
         let cur = self.get(front);
-        if !(self.v().is_air(cur) || self.v().replaceable(cur)) || self.v().block(cur) == block {
+        if !(self.view().is_air(cur) || self.view().replaceable(cur)) || self.view().block(cur) == block {
             return false;
         }
-        let face = if self.v().is_air(self.get(super::below(front))) { f } else { Dir::Up };
-        let st = self.v().set(self.v().default_state(block), "facing", face.name());
+        let face = if self.view().is_air(self.get(super::below(front))) { f } else { Dir::Up };
+        let st = self.view().set(self.view().default_state(block), "facing", face.name());
         if !self.can_place_at(st, front) || self.obstructed(st, front) {
             return false;
         }
@@ -378,7 +378,7 @@ impl Server {
             .and_then(|c| c.get("potion"))
             .and_then(Nbt::as_str)
             == Some("minecraft:water");
-        let b = self.v().block(self.get(front));
+        let b = self.view().block(self.get(front));
         if !water || !self.tag_id(crate::tag_bits::TagId::ConvertibleToMud, b) {
             let rest = self.dispense_default(p, f, stack);
             self.dispense_sounds(p, f, 1000);

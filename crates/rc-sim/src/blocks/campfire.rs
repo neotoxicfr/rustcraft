@@ -50,10 +50,10 @@ impl Server {
             return ItemOn::Done;
         }
         let douses = held.as_ref().is_some_and(|h| self.life.items.has_tag("minecraft:douses_campfires", &h.id));
-        if douses && self.v().get_bool(s, "lit") {
+        if douses && self.view().get_bool(s, "lit") {
             self.level_event(1009, p, 0);
             self.game_event_block("minecraft:block_change", p, Some(Ent::Player), None);
-            let ns = self.v().set_bool(s, "lit", false);
+            let ns = self.view().set_bool(s, "lit", false);
             self.set_update(p, ns);
             self.hurt_item(slot, 1);
             return ItemOn::Done;
@@ -99,7 +99,7 @@ impl Server {
     /// block entity, when there is nothing to cook (lit) or to cool (out).
     pub(crate) fn campfire_tick(&mut self, p: P, food: bool, warm: bool) {
         let s = self.get(p);
-        let lit = self.v().get_bool(s, "lit");
+        let lit = self.view().get_bool(s, "lit");
         if if lit { !food } else { !warm } {
             return;
         }
@@ -154,7 +154,7 @@ impl Server {
     /// Block entity rewritten from outside (`/data`, `/setblock`, `/clone`, `/item`: `old`, the
     /// data from before): state kept next to the re-read NBT, as reading its own fields re-reads it.
     pub(crate) fn be_ticks_reloaded(&mut self, p: P, old: &Nbt) {
-        match self.v().kind(self.get(p)) {
+        match self.view().kind(self.get(p)) {
             Kind::Campfire => {
                 let state = self.be_get(p).map(|be| flags(&read_items(be, SLOTS), &times(be, "CookingTimes")));
                 if let (Some(state), Some((_, t))) = (state, self.bs.be_ticks.get_mut(&p))
@@ -180,11 +180,11 @@ impl Server {
         }
         let s = self.get(p);
         let alive = match t {
-            BeTick::Jukebox(_) => self.v().kind(s) == Kind::Jukebox && self.v().get_bool(s, "has_record"),
-            BeTick::Campfire { .. } => self.v().kind(s) == Kind::Campfire,
+            BeTick::Jukebox(_) => self.view().kind(s) == Kind::Jukebox && self.view().get_bool(s, "has_record"),
+            BeTick::Campfire { .. } => self.view().kind(s) == Kind::Campfire,
             BeTick::Gateway => self.state_name(s) == "minecraft:end_gateway",
-            BeTick::Beacon(_) => self.v().kind(s) == Kind::Beacon,
-            BeTick::Conduit(_) => self.v().block(s) == self.bs.t.id.conduit,
+            BeTick::Beacon(_) => self.view().kind(s) == Kind::Beacon,
+            BeTick::Conduit(_) => self.view().block(s) == self.bs.t.id.conduit,
             BeTick::PotentSulfur => self.potent_sulfur_alive(s), // G6-F09a
             BeTick::Furnace | BeTick::Brewing | BeTick::Bell | BeTick::Spawner => true,
         } && self.be_get(p).is_some();
@@ -204,10 +204,10 @@ impl Server {
     /// Network update of the block entity for blocks with displayed contents, sent
     /// along with the state change; `None`: no packet for this block.
     pub(crate) fn be_update_tag(&self, p: P, s: u32) -> Option<Nbt> {
-        if self.v().block(s) == self.bs.t.id.conduit {
+        if self.view().block(s) == self.bs.t.id.conduit {
             return self.conduit_update_tag(p); // G6-F12
         }
-        let keys: &[&str] = match self.v().kind(s) {
+        let keys: &[&str] = match self.view().kind(s) {
             Kind::Campfire => &["Items"],
             Kind::Shelf => &["Items", "align_items_to_bottom"],
             Kind::DecoratedPot => &["sherds", "item"],

@@ -221,11 +221,11 @@ fn nether_straw_bed_breaks_without_explosion() {
         put(s, [2, 100, 1], "minecraft:straw_bed|facing=east|part=head");
         assert!(s.use_bed([1, 100, 1]));
         s.flush_block_changes();
-        let straw = s.v().is_air(s.get([1, 100, 1])) && s.v().is_air(s.get([2, 100, 1]));
+        let straw = s.view().is_air(s.get([1, 100, 1])) && s.view().is_air(s.get([2, 100, 1]));
         put(s, [5, 100, 1], "minecraft:red_bed|facing=east|part=foot");
         put(s, [6, 100, 1], "minecraft:red_bed|facing=east|part=head");
         assert!(s.use_bed([5, 100, 1]));
-        let bed = s.v().is_air(s.get([6, 100, 1]));
+        let bed = s.view().is_air(s.get([6, 100, 1]));
         (straw, bed)
     });
     assert!(straw_air, "straw bed broken on use");
@@ -562,8 +562,8 @@ fn global_sound_events_rule() {
                 ([base[0] - 1, base[1], base[2] + i], crate::blocks::Dir::East),
                 ([base[0] + 3, base[1], base[2] + i], crate::blocks::Dir::West),
             ] {
-                let fs = p.s.v().set_dir(frame, "facing", d);
-                let fs = p.s.v().set_bool(fs, "eye", !(q == [base[0] + 1, base[1], base[2] + 3]) || last_eye);
+                let fs = p.s.view().set_dir(frame, "facing", d);
+                let fs = p.s.view().set_bool(fs, "eye", !(q == [base[0] + 1, base[1], base[2] + 3]) || last_eye);
                 p.s.set_block(q, fs, crate::blocks::flag::ALL);
             }
         }
@@ -639,7 +639,7 @@ fn anchor_and_sniffer_egg_game_events() {
     let change: Vec<_> = log.iter().filter(|e| e.0 == "minecraft:block_change").collect();
     assert_eq!(change.len(), 1, "charge: one 'block changed' event: {log:?}");
     assert_eq!(change[0].2, Some(crate::mobs::recent::vibration::Src::Living(crate::mobs::mob::Ent::Player)));
-    assert_eq!(change[0].3.map(|s| p.s.v().get_int(s, "charges")), Some(1));
+    assert_eq!(change[0].3.map(|s| p.s.view().get_int(s, "charges")), Some(1));
     p.s.mobs.rec.vib.log.clear();
     cmd(&mut p, "setblock 4 -60 4 minecraft:sniffer_egg");
     let log = p.s.mobs.rec.vib.log.clone();

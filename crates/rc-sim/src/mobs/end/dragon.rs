@@ -473,7 +473,7 @@ impl Server {
                 for z in lo[2]..=hi[2] {
                     let p = [x, y, z];
                     let s = self.get(p);
-                    let v = self.v();
+                    let v = self.view();
                     if v.is_air(s) {
                         continue;
                     }

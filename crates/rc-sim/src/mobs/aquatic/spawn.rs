@@ -51,7 +51,7 @@ impl Server {
     /// "In water" placement: water at the position, block above non-conductive.
     pub(crate) fn in_water_placement_ok(&self, p: [i32; 3]) -> bool {
         let above = [p[0], p[1] + 1, p[2]];
-        self.mob_fluid(p) == Fluid::Water && !self.v().conductor(self.st(above))
+        self.mob_fluid(p) == Fluid::Water && !self.view().conductor(self.st(above))
     }
 
     /// Natural spawn rules of the family; `None` for the other species.

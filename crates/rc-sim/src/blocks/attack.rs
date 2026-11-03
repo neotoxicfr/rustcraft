@@ -12,7 +12,7 @@ impl Server {
     pub(crate) fn player_will_destroy(&mut self, p: P, s: u32, tool: Option<&Stack>) -> u32 {
         let name = self.data.block_of(s).map_or("", |b| b.name.as_str());
         let (tnt, pot) = (name == "minecraft:tnt", name == "minecraft:decorated_pot");
-        if tnt && self.game_mode != 1 && self.v().get_bool(s, "unstable") {
+        if tnt && self.game_mode != 1 && self.view().get_bool(s, "unstable") {
             self.tnt_prime_block(p, None);
         }
         if pot
@@ -21,15 +21,15 @@ impl Server {
                     && self.life.items.enchantment(t, "minecraft:silk_touch") == 0
             })
         {
-            let cracked = self.v().set_bool(s, "cracked", true);
+            let cracked = self.view().set_bool(s, "cracked", true);
             self.set_block(p, cracked, flag::INVISIBLE | flag::SKIP_BE_SIDE_EFFECTS);
             return cracked;
         }
         // Wire cut with shears (main hand): disarmed before the break, so the hooks
         // re-triggered by the removal (which reads the state placed here) do not receive a pulse.
         // The returned state stays the one from before, as in the game.
-        if self.v().kind(s) == Kind::Tripwire && tool.is_some_and(|t| t.count > 0 && t.id == "minecraft:shears") {
-            let disarmed = self.v().set_bool(s, "disarmed", true);
+        if self.view().kind(s) == Kind::Tripwire && tool.is_some_and(|t| t.count > 0 && t.id == "minecraft:shears") {
+            let disarmed = self.view().set_bool(s, "disarmed", true);
             self.set_block(p, disarmed, flag::INVISIBLE | flag::SKIP_BE_SIDE_EFFECTS);
             self.game_event_block("minecraft:shear", p, Some(crate::mobs::mob::Ent::Player), None);
         }
@@ -41,7 +41,7 @@ impl Server {
     /// → water (the Nether evaporates it).
     pub(crate) fn player_destroyed(&mut self, p: P, s: u32, tool: Option<&Stack>) {
         // G6-F08: turtle eggs broken after their loot: one egg fewer put back.
-        if self.v().block(s) == self.bs.t.id.turtle_egg {
+        if self.view().block(s) == self.bs.t.id.turtle_egg {
             self.turtle_egg_decrease(p, s);
             return;
         }
@@ -55,7 +55,7 @@ impl Server {
             return;
         }
         let under = self.get(below(p));
-        let ub = self.v().block(under);
+        let ub = self.view().block(under);
         let melts = self
             .block_tags
             .get("minecraft:ice_melts_when_destroyed_above")
@@ -64,13 +64,13 @@ impl Server {
             matches!(b.name.as_str(), "minecraft:water" | "minecraft:lava" | "minecraft:bubble_column")
         });
         if melts || liquid {
-            let water = self.v().default_state(self.bs.t.id.water);
+            let water = self.view().default_state(self.bs.t.id.water);
             self.set_block(p, water, flag::ALL);
         }
     }
     /// Reaction of block `s` at `p` hit by the player (before the mining progress is computed).
     pub(crate) fn block_attack(&mut self, p: P, s: u32) {
-        match self.v().kind(s) {
+        match self.view().kind(s) {
             Kind::DragonEgg => self.dragon_egg_teleport(p, s),
             Kind::NoteBlock => {
                 self.note_play(p, s, Some(crate::mobs::mob::Ent::Player));
@@ -85,17 +85,17 @@ impl Server {
     /// random, two floats per face whose neighbour is not opaque (the two coordinates across
     /// that face).
     pub(crate) fn redstone_ore_touch(&mut self, p: P, s: u32) {
-        let b = self.v().block(s);
+        let b = self.view().block(s);
         if b != self.bs.t.id.redstone_ore && b != self.bs.t.id.deepslate_redstone_ore {
             return;
         }
         for d in super::Dir::ALL {
-            if !self.v().info(self.get(super::rel(p, d))).has(rc_data::flags::SOLID_RENDER) {
+            if !self.view().info(self.get(super::rel(p, d))).has(rc_data::flags::SOLID_RENDER) {
                 let _ = (self.bs.rng.next_float(), self.bs.rng.next_float());
             }
         }
-        if !self.v().get_bool(s, "lit") {
-            let lit = self.v().set_bool(s, "lit", true);
+        if !self.view().get_bool(s, "lit") {
+            let lit = self.view().set_bool(s, "lit", true);
             self.set_block(p, lit, flag::ALL);
         }
     }

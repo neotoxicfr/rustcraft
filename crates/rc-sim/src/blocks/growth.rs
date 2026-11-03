@@ -150,14 +150,14 @@ impl Server {
             self.state_name(s),
             "minecraft:kelp" | "minecraft:weeping_vines" | "minecraft:twisting_vines" | "minecraft:cave_vines"
         );
-        if !head || self.v().get_int(s, "age") == 25 {
+        if !head || self.view().get_int(s, "age") == 25 {
             return false;
         }
         self.trig_location("minecraft:item_used_on_block", p, Some(stack));
         // The game client plays this sound itself for the one who trims: also sent to the player.
         let at = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
         self.play_sound("minecraft:block.growing_plant.crop", 4, at, 1.0, 1.0);
-        let ns = self.v().set(s, "age", "25");
+        let ns = self.view().set(s, "age", "25");
         self.set_block(p, ns, flag::ALL);
         self.game_event_block("minecraft:block_change", p, Some(Ent::Player), Some(ns));
         self.hurt_item(slot, 1);
@@ -172,7 +172,7 @@ impl Server {
     fn bone_meal_use(&mut self, slot: usize, p: P, face: Dir) -> bool {
         let p = if self.grow_with_bone_meal(p) {
             p
-        } else if self.v().sturdy(self.get(p), face) && self.grow_water_plant(rel(p, face), Some(face)) {
+        } else if self.view().sturdy(self.get(p), face) && self.grow_water_plant(rel(p, face), Some(face)) {
             rel(p, face)
         } else {
             return false;
@@ -194,7 +194,7 @@ impl Server {
     pub(crate) fn grow_with_bone_meal(&mut self, p: P) -> bool {
         let s = self.get(p);
         let name = self.state_name(s).to_owned();
-        let v = self.v();
+        let v = self.view();
         match name.as_str() {
             "minecraft:wheat"
             | "minecraft:carrots"
@@ -210,7 +210,7 @@ impl Server {
                     return false;
                 }
                 let age = (age + 2 + self.bs.rng.next_int_bound(4)).min(7);
-                let ns = self.v().set_int(s, "age", age);
+                let ns = self.view().set_int(s, "age", age);
                 self.set_block(p, ns, flag::CLIENTS);
                 if age == 7 {
                     self.stem_random_tick(ns, p);
@@ -222,7 +222,7 @@ impl Server {
                 if age >= 3 {
                     return false;
                 }
-                let ns = self.v().set_int(s, "age", (age + 1).min(3));
+                let ns = self.view().set_int(s, "age", (age + 1).min(3));
                 self.set_block(p, ns, flag::CLIENTS);
                 true
             }
@@ -231,7 +231,7 @@ impl Server {
                 if age >= 2 {
                     return false;
                 }
-                let ns = self.v().set_int(s, "age", age + 1);
+                let ns = self.view().set_int(s, "age", age + 1);
                 self.set_block(p, ns, flag::CLIENTS);
                 true
             }
@@ -239,7 +239,7 @@ impl Server {
                 let tall = grown_double(&name).unwrap_or_default();
                 let lower = self.default_state(tall);
                 let up = above(p);
-                if !self.can_survive(lower, p) || !self.v().is_air(self.get(up)) || !self.in_build_height(up[1]) {
+                if !self.can_survive(lower, p) || !self.view().is_air(self.get(up)) || !self.in_build_height(up[1]) {
                     return false;
                 }
                 self.place_double_plant(lower, p, flag::CLIENTS);
@@ -252,7 +252,7 @@ impl Server {
             "minecraft:pink_petals" | "minecraft:wildflowers" => {
                 let amount = v.get_int(s, "flower_amount");
                 if amount < 4 {
-                    let ns = self.v().set_int(s, "flower_amount", amount + 1);
+                    let ns = self.view().set_int(s, "flower_amount", amount + 1);
                     self.set_block(p, ns, flag::CLIENTS);
                 } else {
                     self.pop_resource(p, Stack { id: name.clone(), count: 1, components: None });
@@ -280,7 +280,7 @@ impl Server {
                 true
             }
             "minecraft:moss_block" | "minecraft:pale_moss_block" => {
-                if !self.v().is_air(self.get(above(p))) {
+                if !self.view().is_air(self.get(above(p))) {
                     return false;
                 }
                 let feature = bonemeal_feature(&name).unwrap_or_default();
@@ -291,7 +291,7 @@ impl Server {
             "minecraft:big_dripleaf_stem" => self.dripleaf_bone_meal(s, p, true),
             "minecraft:grass_block" => {
                 let up = above(p);
-                if !self.v().is_air(self.get(up)) || !self.in_build_height(up[1]) {
+                if !self.view().is_air(self.get(up)) || !self.in_build_height(up[1]) {
                     return false;
                 }
                 self.grass_bone_meal(p);
@@ -308,8 +308,8 @@ impl Server {
 
     /// Double plant placed (lower then upper half), given flags.
     fn place_double_plant(&mut self, lower: u32, p: P, flags: u32) {
-        let lower = self.v().set(lower, "half", "lower");
-        let upper = self.v().set(lower, "half", "upper");
+        let lower = self.view().set(lower, "half", "lower");
+        let upper = self.view().set(lower, "half", "upper");
         self.set_block(p, lower, flags);
         self.set_block(above(p), upper, flags);
     }
@@ -331,12 +331,12 @@ impl Server {
             }
         } else if name == "minecraft:mangrove_propagule" {
             // Hanging propagule: age + 1 up to 4 (no tree).
-            if self.v().get_bool(s, "hanging") {
-                let age = self.v().get_int(s, "age");
+            if self.view().get_bool(s, "hanging") {
+                let age = self.view().get_int(s, "age");
                 if age >= 4 {
                     return false;
                 }
-                let ns = self.v().set_int(s, "age", age + 1);
+                let ns = self.view().set_int(s, "age", age + 1);
                 self.set_block(p, ns, flag::CLIENTS);
                 return true;
             }
@@ -364,12 +364,12 @@ impl Server {
         let tree = weighted(list, &mut self.bs.rng);
         let mega = weighted(g.mega, &mut self.bs.rng);
         if tree.is_none() && mega.is_some() {
-            let block = self.v().block(s);
+            let block = self.view().block(s);
             let square = [0, -1].iter().any(|&dx| {
                 [0, -1].iter().any(|&dz| {
                     [[0, 0], [1, 0], [0, 1], [1, 1]]
                         .iter()
-                        .all(|&[a, b]| self.v().block(self.get([p[0] + dx + a, p[1], p[2] + dz + b])) == block)
+                        .all(|&[a, b]| self.view().block(self.get([p[0] + dx + a, p[1], p[2] + dz + b])) == block)
                 })
             });
             if !square {
@@ -396,8 +396,8 @@ impl Server {
 
     /// Stage 0 → 1, otherwise the tree grows.
     pub(crate) fn advance_tree(&mut self, p: P, s: u32) {
-        if self.v().has(s, "stage") && self.v().get_int(s, "stage") == 0 {
-            let ns = self.v().set_int(s, "stage", 1);
+        if self.view().has(s, "stage") && self.view().get_int(s, "stage") == 0 {
+            let ns = self.view().set_int(s, "stage", 1);
             self.set_block(p, ns, flag::INVISIBLE | flag::SKIP_BE_SIDE_EFFECTS);
         } else {
             let name = self.state_name(s).to_owned();
@@ -410,14 +410,14 @@ impl Server {
     /// failure.
     fn grow_tree(&mut self, p: P, s: u32, name: &str) -> bool {
         let Some(g) = grower_of(name) else { return false };
-        let block = self.v().block(s);
+        let block = self.view().block(s);
         if let Some(mega) = weighted(g.mega, &mut self.bs.rng) {
             let id = format!("minecraft:{mega}");
             if self.feature_exists(&id) {
                 for dx in [0, -1] {
                     for dz in [0, -1] {
                         let cells = [[0, 0], [1, 0], [0, 1], [1, 1]].map(|[a, b]| [p[0] + dx + a, p[1], p[2] + dz + b]);
-                        if cells.iter().any(|&q| self.v().block(self.get(q)) != block) {
+                        if cells.iter().any(|&q| self.view().block(self.get(q)) != block) {
                             continue;
                         }
                         let olds: Vec<(P, u32)> = cells.iter().map(|&q| (q, self.get(q))).collect();
@@ -467,7 +467,7 @@ impl Server {
     /// as the ground remains grass and the cell is not full; tall grass enlarged (10%), otherwise
     /// on air: biome flower (12.5%) or grass (`grass_bonemeal`).
     fn grass_bone_meal(&mut self, p: P) {
-        let grass = self.v().block(self.get(p));
+        let grass = self.view().block(self.get(p));
         let up = above(p);
         'attempt: for attempt in 0..128 {
             let mut t = up;
@@ -477,18 +477,21 @@ impl Server {
                 let dz = self.bs.rng.next_int_bound(3) - 1;
                 t = [t[0] + dx, t[1] + dy, t[2] + dz];
                 let below = self.get([t[0], t[1] - 1, t[2]]);
-                if self.v().block(below) != grass || self.v().full_collision(self.get(t)) {
+                if self.view().block(below) != grass || self.view().full_collision(self.get(t)) {
                     continue 'attempt;
                 }
             }
             let ts = self.get(t);
             if self.state_name(ts) == "minecraft:short_grass" && self.bs.rng.next_float() < 0.1 {
                 let lower = self.default_state("minecraft:tall_grass");
-                if self.can_survive(lower, t) && self.v().is_air(self.get(above(t))) && self.in_build_height(t[1] + 1) {
+                if self.can_survive(lower, t)
+                    && self.view().is_air(self.get(above(t)))
+                    && self.in_build_height(t[1] + 1)
+                {
                     self.place_double_plant(lower, t, flag::CLIENTS);
                 }
             }
-            if self.v().is_air(ts) && self.in_build_height(t[1]) {
+            if self.view().is_air(ts) && self.in_build_height(t[1]) {
                 if self.bs.rng.next_float() < 0.125 {
                     let flowers = self.biome_bone_meal_features(t);
                     if flowers.is_empty() {
@@ -721,7 +724,7 @@ impl Server {
             // Sound and particles sent to everyone except the player (predicted by their client).
             self.game_event_block("minecraft:block_change", p, Some(Ent::Player), Some(ns));
             if data["transform_type"].as_str() == Some("copper_chest")
-                && self.v().get(old, "type").is_some_and(|t| t != "single")
+                && self.view().get(old, "type").is_some_and(|t| t != "single")
             {
                 let q = self.connected_chest(p, old);
                 let qs = self.get(q);
@@ -734,8 +737,9 @@ impl Server {
 
     /// Neighbour of a double chest (left side: clockwise of the gaze, right: counter-clockwise).
     fn connected_chest(&self, p: P, s: u32) -> P {
-        let facing = self.v().facing(s);
-        let d = if self.v().get(s, "type") == Some("left") { facing.clockwise() } else { facing.counter_clockwise() };
+        let v = self.view();
+        let facing = v.facing(s);
+        let d = if v.get(s, "type") == Some("left") { facing.clockwise() } else { facing.counter_clockwise() };
         rel(p, d)
     }
 
@@ -854,7 +858,7 @@ impl Server {
         self.consume_held(slot);
         self.set_block(p, ns, 11);
         self.game_event_block("minecraft:block_change", p, Some(Ent::Player), Some(ns));
-        if name.ends_with("chest") && self.v().get(s, "type").is_some_and(|t| t != "single") {
+        if name.ends_with("chest") && self.view().get(s, "type").is_some_and(|t| t != "single") {
             let q = self.connected_chest(p, s);
             let qs = self.get(q);
             self.game_event_block("minecraft:block_change", q, Some(Ent::Player), Some(qs));

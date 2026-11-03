@@ -332,7 +332,7 @@ fn run_mech() -> Option<Vec<(String, String)>> {
         s.tick += 1;
         for (n, (p, prop)) in on.iter_mut().zip(probes) {
             let st = s.state_at(p).unwrap_or(0);
-            let v = s.v();
+            let v = s.view();
             *n += u32::from(if prop == "power" { v.get_int(st, prop) > 0 } else { v.get_bool(st, prop) });
         }
         if t == 397 {
@@ -872,6 +872,7 @@ fn bench_ticks() {
         }
         ticks(&mut s, 100);
         let blocks0 = crate::server::BLOCKS_NS.with(std::cell::Cell::get);
+        let views0 = crate::blocks::level::VIEWS_MADE.with(std::cell::Cell::get);
         let light0 = rc_light::stats::totals();
         let mut d: Vec<f64> = (0..400)
             .map(|_| {
@@ -893,6 +894,8 @@ fn bench_ticks() {
             sum / d.len() as f64,
             blocks / d.len() as f64
         );
+        let views = crate::blocks::level::VIEWS_MADE.with(std::cell::Cell::get) - views0;
+        eprintln!("bench_ticks {name} block views: {:.0} per tick", views as f64 / d.len() as f64);
         let l = rc_light::stats::totals().since(&light0);
         light_line(name, &l);
         light_all = light_all.plus(&l);

@@ -287,7 +287,7 @@ fn turn_to_statue(s: &mut Server, m: &mut Mob) {
     let p = m.block_pos();
     let pose = STATUE_POSES[m.rng.next_int_bound(4) as usize];
     let facing = ["south", "west", "north", "east"][super::super::mth::quarter(m.yaw)];
-    let v = s.v();
+    let v = s.view();
     let mut st = s.default_state("minecraft:oxidized_copper_golem_statue");
     st = v.set(st, "copper_golem_pose", pose);
     st = v.set(st, "facing", facing);
@@ -311,7 +311,7 @@ impl Server {
     /// turned like the statue, statue name kept, spawn sound. The golem is added
     /// to the world after the axe wears (game order): it is returned to the caller.
     pub(crate) fn statue_golem(&mut self, p: [i32; 3], state: u32) -> Mob {
-        let yaw = match self.v().facing(state) {
+        let yaw = match self.view().facing(state) {
             crate::blocks::Dir::South => 0.0,
             crate::blocks::Dir::West => 90.0,
             crate::blocks::Dir::North => 180.0,
@@ -759,7 +759,7 @@ impl Server {
 
     /// Linked half of a double chest.
     fn chest_other(&self, p: [i32; 3]) -> Option<[i32; 3]> {
-        let v = self.v();
+        let v = self.view();
         let s = self.st(p);
         let t = v.get(s, "type")?;
         if t == "single" {
@@ -787,7 +787,7 @@ impl Server {
         if self.chest_blocked_at(o) {
             return None;
         }
-        let right_first = self.v().get(self.st(p), "type") == Some("right");
+        let right_first = self.view().get(self.st(p), "type") == Some("right");
         Some(if right_first { vec![p, o] } else { vec![o, p] })
     }
 

@@ -96,7 +96,7 @@ impl Server {
             max: [next_down(b.max[0]), b.min[1], next_down(b.max[2])],
         };
         let search = anchor.expand_towards([0.0, -0.125, 0.0]);
-        let v = self.v();
+        let v = self.view();
         for p in cells(&search) {
             let shape = self.data.shape(v.info(self.get(p)).outline);
             if shape.is_empty() {
@@ -174,7 +174,7 @@ impl Server {
         // Unit ray (zero when the eye is on the point), 0.001 past the touched point.
         let n = crate::mobs::mth::normalize([at[0] - from[0], at[1] - from[1], at[2] - from[2]]);
         let to = std::array::from_fn(|i| at[i] + n[i] * 0.001);
-        let shape = self.data.shape(self.v().info(self.get(clicked)).collision);
+        let shape = self.data.shape(self.view().info(self.get(clicked)).collision);
         let mut best: Option<(f64, Dir)> = None;
         for s in shape {
             let b = Aabb { min: s.min, max: s.max }.offset(

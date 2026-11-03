@@ -283,7 +283,7 @@ fn locked_chest_and_ender_chest_menu() {
 fn placement_side_effects() {
     let Some((mut p, dir)) = probe("g5f01-place") else { return };
     p.run("setblock 104 -59 104 minecraft:frosted_ice\nsetblock 106 -59 104 minecraft:target[power=15]\n");
-    let ice = p.s.v().block(p.s.get([104, -59, 104]));
+    let ice = p.s.view().block(p.s.get([104, -59, 104]));
     assert!(p.s.has_scheduled_tick([104, -59, 104], ice), "frosted ice without melt");
     assert_eq!(name_at(&p, [106, -59, 104]), "minecraft:target[power=0]");
     p.run("setblock 108 -59 104 minecraft:dirt_path\n");

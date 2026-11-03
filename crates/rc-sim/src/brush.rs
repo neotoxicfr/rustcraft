@@ -87,7 +87,7 @@ impl Server {
         let name = self.state_name(state).to_owned();
         // Dust: client particles, but draws from the level's random on the server side too
         // (number 7..11, then two draws per particle).
-        if !self.v().is_air(state) && !NO_DUST.contains(&name.as_str()) {
+        if !self.view().is_air(state) && !NO_DUST.contains(&name.as_str()) {
             let r = &mut self.life.rng;
             let n = 7 + r.next_int_bound(5);
             for _ in 0..n {
@@ -134,11 +134,11 @@ impl Server {
         }
         self.bs.brushing.insert(p, b);
         let s = self.get(p);
-        let block = self.v().block(s);
+        let block = self.view().block(s);
         self.schedule_tick(p, block, 2);
         let after = completion(b.count);
         if before != after {
-            let ns = self.v().set(s, "dusted", &after.to_string());
+            let ns = self.view().set(s, "dusted", &after.to_string());
             self.set_block(p, ns, crate::blocks::flag::ALL);
             self.brush_send_update(p);
         }
@@ -229,7 +229,7 @@ impl Server {
             let after = completion(b.count);
             b.reset_at = now + 4;
             if before != after {
-                let ns = self.v().set(s, "dusted", &after.to_string());
+                let ns = self.view().set(s, "dusted", &after.to_string());
                 self.set_block(p, ns, crate::blocks::flag::ALL);
                 self.bs.brushing.insert(p, b);
                 self.brush_send_update(p);
@@ -239,7 +239,7 @@ impl Server {
             self.bs.brushing.remove(&p);
         } else {
             self.bs.brushing.insert(p, b);
-            let block = self.v().block(self.get(p));
+            let block = self.view().block(self.get(p));
             self.schedule_tick(p, block, 2);
         }
     }

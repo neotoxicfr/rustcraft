@@ -536,11 +536,11 @@ impl Server {
                 || n.ends_with("_leaves");
             let an = self.state_name(above);
             // "Liquid" blocks: water, lava and bubble column.
-            let above_ok = self.v().is_air(above)
+            let above_ok = self.view().is_air(above)
                 || an == "minecraft:water"
                 || an == "minecraft:lava"
                 || an == "minecraft:bubble_column";
-            if !excluded && above_ok && (self.v().legacy_solid(cur) || n == "minecraft:powder_snow") {
+            if !excluded && above_ok && (self.view().legacy_solid(cur) || n == "minecraft:powder_snow") {
                 return Some([p[0], p[1] + 1, p[2]]);
             }
             above = cur;

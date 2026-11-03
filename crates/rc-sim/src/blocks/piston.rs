@@ -166,7 +166,7 @@ impl PistonWorld for Server {
 impl Server {
     fn piston_state(&self, sticky: bool) -> u32 {
         let t = &self.bs.t;
-        self.v().default_state(if sticky { t.id.sticky_piston } else { t.id.piston })
+        self.view().default_state(if sticky { t.id.sticky_piston } else { t.id.piston })
     }
 
     /// Power by quasi-connectivity.
@@ -185,7 +185,7 @@ impl Server {
 
     /// Check.
     pub(crate) fn piston_check(&mut self, p: P, s: u32) {
-        let v = self.v();
+        let v = self.view();
         let dir = v.facing(s);
         let extend = self.piston_powered(p, dir);
         let extended = v.get_bool(s, "extended");
@@ -198,8 +198,8 @@ impl Server {
             let pushed = rel_n(p, dir, 2);
             let ps = self.get(pushed);
             let mut event = 1;
-            if self.v().kind(ps) == Kind::MovingPiston
-                && self.v().facing(ps) == dir
+            if self.view().kind(ps) == Kind::MovingPiston
+                && self.view().facing(ps) == dir
                 && let Some(m) = self.bs.movers.get(&pushed)
                 && m.extending
                 && (m.progress_o < 0.5 || self.time == m.last_ticked || self.bs.handling_tick)
@@ -211,8 +211,8 @@ impl Server {
     }
 
     pub(crate) fn piston_trigger(&mut self, s: u32, p: P, a: i32, b: i32, sticky: bool) -> bool {
-        let dir = self.v().facing(s);
-        let extended = self.v().set_bool(s, "extended", true);
+        let dir = self.view().facing(s);
+        let extended = self.view().set_bool(s, "extended", true);
         let extend = self.piston_powered(p, dir);
         if extend && (a == 1 || a == 2) {
             self.set_block(p, extended, flag::CLIENTS);
@@ -236,7 +236,7 @@ impl Server {
             }
             let mp = self.moving_piston_state(dir, sticky);
             self.set_block(p, mp, flag::INVISIBLE | flag::KNOWN_SHAPE | flag::SKIP_BE_SIDE_EFFECTS);
-            let base = self.v().set_dir(self.piston_state(sticky), "facing", Dir::from_index((b & 7) as usize));
+            let base = self.view().set_dir(self.piston_state(sticky), "facing", Dir::from_index((b & 7) as usize));
             self.add_mover(p, base, dir, false, true);
             let mpb = self.bs.t.id.moving_piston;
             self.update_neighbors_at(p, mpb);
@@ -245,7 +245,7 @@ impl Server {
                 let two = rel_n(p, dir, 2);
                 let ms = self.get(two);
                 let mut piece = false;
-                if self.v().kind(ms) == Kind::MovingPiston
+                if self.view().kind(ms) == Kind::MovingPiston
                     && let Some(m) = self.bs.movers.get(&two)
                     && m.dir == dir
                     && m.extending
@@ -254,7 +254,7 @@ impl Server {
                     piece = true;
                 }
                 if !piece {
-                    let v = self.v();
+                    let v = self.view();
                     let pull_ok = a == 1
                         && !v.is_air(ms)
                         && (Resolver { v: &v, w: self }).pushable(ms, two, dir.opposite(), false, dir)
@@ -276,18 +276,18 @@ impl Server {
     }
 
     fn moving_piston_state(&self, dir: Dir, sticky: bool) -> u32 {
-        let v = self.v();
+        let v = self.view();
         let s = v.set_dir(v.default_state(self.bs.t.id.moving_piston), "facing", dir);
         v.set(s, "type", if sticky { "sticky" } else { "normal" })
     }
 
     fn move_blocks(&mut self, piston: P, dir: Dir, extending: bool, sticky: bool) -> bool {
         let arm = rel(piston, dir);
-        if !extending && self.v().kind(self.get(arm)) == Kind::PistonHead {
+        if !extending && self.view().kind(self.get(arm)) == Kind::PistonHead {
             let air = self.air();
             self.set_block(arm, air, flag::INVISIBLE | flag::KNOWN_SHAPE | flag::SKIP_BE_SIDE_EFFECTS);
         }
-        let Some(st) = (Resolver { v: &self.v(), w: self }).resolve(piston, dir, extending) else { return false };
+        let Some(st) = (Resolver { v: &self.view(), w: self }).resolve(piston, dir, extending) else { return false };
         let mut delete: JavaMap<u32> = JavaMap::new();
         let mut shapes = Vec::with_capacity(st.to_push.len());
         for &q in &st.to_push {
@@ -314,13 +314,13 @@ impl Server {
             let t = rel(q, push_dir);
             delete.remove(t);
             let mp = self.moving_piston_state(dir, false);
-            let mp = self.v().set(mp, "type", "normal");
+            let mp = self.view().set(mp, "type", "normal");
             self.set_block(t, mp, flag::INVISIBLE | flag::MOVED | flag::SKIP_BE_SIDE_EFFECTS);
             self.add_mover(t, shapes[i], dir, extending, false);
             to_update.push(s);
         }
         if extending {
-            let v = self.v();
+            let v = self.view();
             let head = v.set_dir(v.default_state(self.bs.t.id.piston_head), "facing", dir);
             let head = v.set(head, "type", if sticky { "sticky" } else { "normal" });
             let mp = self.moving_piston_state(dir, sticky);
@@ -344,11 +344,11 @@ impl Server {
             k += 1;
             self.affect_after_removal(s, q, false);
             self.update_indirect_shapes(s, q, flag::CLIENTS, 512);
-            let b = self.v().block(s);
+            let b = self.view().block(s);
             self.update_neighbors_at(q, b);
         }
         for &q in st.to_push.iter().rev() {
-            let b = self.v().block(to_update[k]);
+            let b = self.view().block(to_update[k]);
             k += 1;
             self.update_neighbors_at(q, b);
         }
@@ -375,10 +375,10 @@ impl Server {
             return;
         }
         self.bs.movers.remove(&p);
-        if self.v().kind(self.get(p)) == Kind::MovingPiston {
+        if self.view().kind(self.get(p)) == Kind::MovingPiston {
             let ns = if m.source { self.air() } else { self.update_from_neighbour_shapes(m.moved, p) };
             self.set_update(p, ns);
-            let b = self.v().block(ns);
+            let b = self.view().block(ns);
             self.neighbor_changed_at(p, b);
         }
     }
@@ -482,19 +482,19 @@ impl Server {
         if m.progress_o >= 1.0 {
             let m = *m;
             self.bs.movers.remove(&p);
-            if self.v().kind(self.get(p)) == Kind::MovingPiston {
+            if self.view().kind(self.get(p)) == Kind::MovingPiston {
                 let ns = self.update_from_neighbour_shapes(m.moved, p);
-                if self.v().is_air(ns) {
+                if self.view().is_air(ns) {
                     self.set_block(p, m.moved, 340);
                     self.update_or_destroy(m.moved, ns, p, flag::ALL, 512);
                 } else {
-                    let ns = if self.v().get_bool(ns, "waterlogged") {
-                        self.v().set_bool(ns, "waterlogged", false)
+                    let ns = if self.view().get_bool(ns, "waterlogged") {
+                        self.view().set_bool(ns, "waterlogged", false)
                     } else {
                         ns
                     };
                     self.set_block(p, ns, flag::NEIGHBORS | flag::CLIENTS | flag::MOVED);
-                    let b = self.v().block(ns);
+                    let b = self.view().block(ns);
                     self.neighbor_changed_at(p, b);
                 }
             }
@@ -509,19 +509,19 @@ impl Server {
     }
 
     pub(crate) fn piston_head_fitting(&self, head: u32, base: u32) -> bool {
-        let v = self.v();
+        let v = self.view();
         let want = if v.get(head, "type") == Some("sticky") { self.bs.t.id.sticky_piston } else { self.bs.t.id.piston };
         v.block(base) == want && v.get_bool(base, "extended") && v.facing(base) == v.facing(head)
     }
 
     pub(crate) fn piston_head_survives(&self, head: u32, p: P) -> bool {
-        let v = self.v();
+        let v = self.view();
         let base = self.get(rel(p, v.facing(head).opposite()));
         self.piston_head_fitting(head, base) || (v.kind(base) == Kind::MovingPiston && v.facing(base) == v.facing(head))
     }
 
     pub(crate) fn piston_head_removed(&mut self, head: u32, p: P) {
-        let bp = rel(p, self.v().facing(head).opposite());
+        let bp = rel(p, self.view().facing(head).opposite());
         if self.piston_head_fitting(head, self.get(bp)) {
             self.destroy_block(bp, true, 512);
         }
@@ -529,7 +529,7 @@ impl Server {
 
     pub(crate) fn piston_head_neighbor_changed(&mut self, s: u32, p: P, from: u16) {
         if self.piston_head_survives(s, p) {
-            let bp = rel(p, self.v().facing(s).opposite());
+            let bp = rel(p, self.view().facing(s).opposite());
             self.neighbor_changed_at(bp, from);
         }
     }

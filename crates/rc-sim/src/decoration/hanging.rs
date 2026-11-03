@@ -86,7 +86,7 @@ impl Server {
     fn supported(&self, b: &Aabb) -> bool {
         let lo = b.min.map(|v| v.floor() as i32);
         let hi = b.max.map(|v| v.floor() as i32);
-        let v = self.v();
+        let v = self.view();
         for y in lo[1]..=hi[1] {
             for z in lo[2]..=hi[2] {
                 for x in lo[0]..=hi[0] {
@@ -151,7 +151,7 @@ impl Server {
             return false;
         }
         let s = self.get(rel(pos, d.opposite()));
-        let v = self.v();
+        let v = self.view();
         let ok = v.legacy_solid(s) || (d.horizontal() && matches!(v.kind(s), Kind::Repeater | Kind::Comparator));
         ok && self.hang_coexist(id, k, d, &pop, true)
     }
@@ -406,7 +406,7 @@ impl Server {
     /// (the neighbour update for the output signal from the frame's block).
     pub(super) fn frame_signal_changed(&mut self, k: DKind, e: &Nbt) {
         let p = self.hang_place(k, e).0;
-        let air = self.v().block(0);
+        let air = self.view().block(0);
         self.update_neighbour_for_output_signal(p, air);
     }
 

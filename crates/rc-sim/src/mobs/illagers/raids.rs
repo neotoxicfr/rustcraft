@@ -1145,7 +1145,7 @@ impl Server {
     // ---------- Doors ----------
 
     pub(crate) fn door_is_open(&self, p: [i32; 3]) -> bool {
-        self.wooden_door(p) && self.v().get_bool(self.st(p), "open")
+        self.wooden_door(p) && self.view().get_bool(self.st(p), "open")
     }
 
     pub(crate) fn wooden_door(&self, p: [i32; 3]) -> bool {

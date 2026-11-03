@@ -662,7 +662,7 @@ impl Server {
     fn dismount_floor_height(&self, p: [i32; 3]) -> f64 {
         let top = |q: [i32; 3]| -> Option<f64> {
             let st = self.st(q);
-            let open_trapdoor = self.bname(q).ends_with("_trapdoor") && self.v().get(st, "open") == Some("true");
+            let open_trapdoor = self.bname(q).ends_with("_trapdoor") && self.view().get(st, "open") == Some("true");
             if self.phys.climbable(st) || open_trapdoor {
                 return None;
             }

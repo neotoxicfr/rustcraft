@@ -891,7 +891,7 @@ impl Server {
                 return false;
             }
             let above = [x, y + 1, z];
-            let cam = if f.source && self.v().sturdy(self.get(above), crate::blocks::Dir::Down) {
+            let cam = if f.source && self.view().sturdy(self.get(above), crate::blocks::Dir::Down) {
                 1.0
             } else {
                 self.fluid_height_at([x, y, z])

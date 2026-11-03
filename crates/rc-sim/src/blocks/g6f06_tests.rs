@@ -38,7 +38,7 @@ fn copper_chests_join_across_variants_and_age_together() {
     assert!(a.starts_with("minecraft:copper_chest[facing=north,type=left"), "joined, less oxidized: {a}");
     assert!(w.name([3, Y, 3]).contains("type=right"), "neighbour joined: {}", w.name([3, Y, 3]));
     // The right half ages (direct placement, like oxidation): the left follows.
-    let v = w.p.s.v();
+    let v = w.p.s.view();
     let ex = w.p.s.bs.t.block_id("minecraft:exposed_copper_chest");
     let st = v.set(v.set(v.default_state(ex), "facing", "north"), "type", "right");
     w.p.s.set_block([3, Y, 3], st, flag::ALL);
@@ -80,7 +80,7 @@ fn plant_placement_rules() {
             w.hold(stack(block, 1));
             w.click(at, Dir::Up, [0.5, 0.1, 0.5]);
             let s = w.p.s.get(at);
-            assert_eq!(w.p.s.v().get_int(s, prop), n.min(4), "{block}: stacked ({})", w.name(at));
+            assert_eq!(w.p.s.view().get_int(s, prop), n.min(4), "{block}: stacked ({})", w.name(at));
         }
     }
     w.set([3, Y, 6], "minecraft:sea_pickle");
@@ -286,8 +286,8 @@ fn daylight_detector_inversion_updates_now() {
     w.hold(None);
     w.click([3, Y, 3], Dir::Up, [0.5, 0.375, 0.5]);
     let s = w.p.s.get([3, Y, 3]);
-    assert!(w.p.s.v().get_bool(s, "inverted"));
-    assert!(w.p.s.v().get_int(s, "power") > 0, "signal recomputed on click: {}", w.name([3, Y, 3]));
+    assert!(w.p.s.view().get_bool(s, "inverted"));
+    assert!(w.p.s.view().get_int(s, "power") > 0, "signal recomputed on click: {}", w.name([3, Y, 3]));
 }
 
 /// Own shapes: huge mushroom blocks, pale hanging moss, pale moss carpet.

@@ -370,8 +370,8 @@ impl Server {
             let z = c[2] - 1 + r.next_int_bound(3);
             let p = [x, y, z];
             if !picked.contains(&p)
-                && self.v().replaceable(self.st(p))
-                && self.v().sturdy(self.st([x, y - 1, z]), crate::blocks::Dir::Up)
+                && self.view().replaceable(self.st(p))
+                && self.view().sturdy(self.st([x, y - 1, z]), crate::blocks::Dir::Up)
             {
                 picked.push(p);
                 if picked.len() >= want {

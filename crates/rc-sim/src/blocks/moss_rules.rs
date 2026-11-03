@@ -16,7 +16,7 @@ impl Server {
     /// low, otherwise it keeps its value; low under a hanging carpet on the same side → tall; without base,
     /// erased above a carpet that does not have this side.
     pub(crate) fn moss_carpet_sides(&self, s: u32, p: P, create: bool) -> u32 {
-        let v = self.v();
+        let v = self.view();
         let carpet = v.block(s);
         let base = v.get_bool(s, "bottom");
         let create = create || base;
@@ -46,13 +46,13 @@ impl Server {
     }
 
     fn moss_carpet_has_faces(&self, s: u32) -> bool {
-        let v = self.v();
+        let v = self.view();
         v.get_bool(s, "bottom") || SIDES.iter().any(|d| v.get(s, d.name()) != Some("none"))
     }
 
     /// Base: anything but air below; hanging layer: a carpet with a base below.
     pub(crate) fn moss_carpet_survives(&self, s: u32, p: P) -> bool {
-        let v = self.v();
+        let v = self.view();
         let b = self.get(below(p));
         if v.get_bool(s, "bottom") {
             !v.is_air(b)
@@ -72,7 +72,7 @@ impl Server {
     /// Top layer of a carpet placed at `p`: without base, new sides, each side kept if
     /// `keep` (random draw) accepts it; air if nothing holds or nothing changes.
     pub(crate) fn moss_carpet_topper(&mut self, carpet_state: u32, p: P, mut keep: impl FnMut(&mut Self) -> bool) -> u32 {
-        let v = self.v();
+        let v = self.view();
         let carpet = v.block(carpet_state);
         let up = above(p);
         let prev = self.get(up);
@@ -82,8 +82,8 @@ impl Server {
         }
         let mut top = self.moss_carpet_sides(v.set_bool(v.default_state(carpet), "bottom", false), up, true);
         for d in SIDES {
-            if v.get(top, d.name()) != Some("none") && !keep(self) {
-                top = v.set(top, d.name(), "none");
+            if self.view().get(top, d.name()) != Some("none") && !keep(self) {
+                top = self.view().set(top, d.name(), "none");
             }
         }
         if self.moss_carpet_has_faces(top) && top != prev { top } else { self.air() }
@@ -92,7 +92,7 @@ impl Server {
     /// Carpet placed by a player: top layer drawn at random (one boolean per side).
     pub(crate) fn moss_carpet_placed(&mut self, s: u32, p: P) {
         let top = self.moss_carpet_topper(s, p, |sv| sv.bs.rng.next_bool());
-        if !self.v().is_air(top) {
+        if !self.view().is_air(top) {
             self.set_update(above(p), top);
         }
     }
@@ -101,15 +101,16 @@ impl Server {
 
     pub(crate) fn hanging_moss_survives(&self, s: u32, p: P) -> bool {
         let a = self.get(above(p));
-        self.multiface_can_attach(p, Dir::Up) || self.v().block(a) == self.v().block(s)
+        self.multiface_can_attach(p, Dir::Up) || self.view().block(a) == self.view().block(s)
     }
 
     /// No longer holds: tick to the next (broken with loot); tip if nothing similar below.
     pub(crate) fn hanging_moss_update_shape(&mut self, s: u32, p: P) -> u32 {
-        let v = self.v();
+        let v = self.view();
         if !self.hanging_moss_survives(s, p) {
             self.schedule_tick(p, v.block(s), 1);
         }
+        let v = self.view();
         let tip = v.block(self.get(below(p))) != v.block(s);
         v.set_bool(s, "tip", tip)
     }
@@ -124,7 +125,7 @@ impl Server {
 
     /// Placement: each visible face except against the same block.
     pub(crate) fn huge_mushroom_placement(&self, def: u32, p: P) -> u32 {
-        let v = self.v();
+        let v = self.view();
         let me = v.block(def);
         let mut s = def;
         for d in Dir::ALL {

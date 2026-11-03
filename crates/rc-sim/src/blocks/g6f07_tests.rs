@@ -20,7 +20,7 @@ fn block(w: &W, at: P) -> String {
 }
 
 fn prop(w: &W, at: P, key: &str) -> String {
-    w.p.s.v().get(w.p.s.get(at), key).unwrap_or("?").to_owned()
+    w.p.s.view().get(w.p.s.get(at), key).unwrap_or("?").to_owned()
 }
 
 fn count_around(w: &W, at: P, name: &str) -> usize {

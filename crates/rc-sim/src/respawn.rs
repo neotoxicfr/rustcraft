@@ -113,7 +113,7 @@ impl Server {
     /// Block dangerous for a player.
     fn dangerous(&self, p: P) -> bool {
         let s = self.get(p);
-        let v = self.v();
+        let v = self.view();
         let name = self.data.block_of(s).map(|b| b.name.as_str()).unwrap_or("");
         self.tag_id(crate::tag_bits::TagId::Fire, v.block(s))
             || matches!(
@@ -132,7 +132,7 @@ impl Server {
     /// Top of the collision shape of a block excluding climbables (empty: `None`).
     fn shape_top(&self, p: P) -> Option<(f64, f64)> {
         let s = self.get(p);
-        let v = self.v();
+        let v = self.view();
         let climb = self.tag_id(crate::tag_bits::TagId::Climbable, v.block(s));
         let open_trap =
             v.get(s, "open") == Some("true") && self.data.block_of(s).is_some_and(|b| b.name.ends_with("trapdoor"));
@@ -183,7 +183,7 @@ impl Server {
         if !collide::is_free(&self.world(), &b) {
             return None;
         }
-        let invalid = |q: P| self.tag_id(crate::tag_bits::TagId::InvalidSpawnInside, self.v().block(self.get(q)));
+        let invalid = |q: P| self.tag_id(crate::tag_bits::TagId::InvalidSpawnInside, self.view().block(self.get(q)));
         if player && (invalid(p) || invalid([p[0], p[1] + 1, p[2]])) {
             return None;
         }
@@ -260,7 +260,7 @@ impl Server {
     fn respawn_at(&mut self, p: P, yaw: f32, pitch: f32, forced: bool, consume: bool) -> Option<([f64; 3], f32, f32)> {
         self.load_now(&[(p[0] >> 4, p[2] >> 4)]);
         let s = self.get(p);
-        let v = self.v();
+        let v = self.view();
         let name = self.data.block_of(s).map(|b| b.name.clone()).unwrap_or_default();
         let dim = self.dim.name.clone();
         if name == "minecraft:respawn_anchor" && (forced || v.get_int(s, "charges") > 0) && self.anchor_works(&dim) {
@@ -281,7 +281,7 @@ impl Server {
         }
         let free = |q: P| {
             let st = self.get(q);
-            !self.v().legacy_solid(st) && self.fluid_of(st).is_empty()
+            !self.view().legacy_solid(st) && self.fluid_of(st).is_empty()
         };
         (free(p) && free([p[0], p[1] + 1, p[2]]))
             .then(|| ([f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.1, f64::from(p[2]) + 0.5], yaw, pitch))
@@ -343,7 +343,7 @@ impl Server {
         if self.data.block_of(s).is_none_or(|b| b.name != "minecraft:respawn_anchor") {
             return false;
         }
-        let v = self.v();
+        let v = self.view();
         let charges = v.get_int(s, "charges");
         let at = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
         if held == Some("minecraft:glowstone") && charges < 4 {
@@ -421,9 +421,9 @@ impl Server {
             return;
         }
         self.remove_block(head, false);
-        let facing = self.v().get_dir(s, "facing").unwrap_or(Dir::North);
+        let facing = self.view().get_dir(s, "facing").unwrap_or(Dir::North);
         let foot = crate::portal_shape::add(head, facing.opposite().step(), 1);
-        if self.v().block(self.get(foot)) == self.v().block(s) {
+        if self.view().block(self.get(foot)) == self.view().block(s) {
             self.remove_block(foot, false);
         }
         let c = [f64::from(head[0]) + 0.5, f64::from(head[1]) + 0.5, f64::from(head[2]) + 0.5];

@@ -14,7 +14,7 @@ const NETHER_VINE_KEEP: f64 = 0.826;
 
 impl Server {
     fn bm_default(&self, name: &str) -> u32 {
-        self.v().default_state(self.bs.t.block_id(name))
+        self.view().default_state(self.bs.t.block_id(name))
     }
 
     /// The four horizontals shuffled (the game's shuffle, from the last to the first).
@@ -39,7 +39,7 @@ impl Server {
 
     /// First empty horizontal neighbour (in the given order) where `place` would survive.
     fn bm_spread_target(&self, p: P, place: u32, order: [Dir; 4]) -> Option<P> {
-        order.into_iter().map(|d| rel(p, d)).find(|&q| self.v().is_air(self.get(q)) && self.can_survive(place, q))
+        order.into_iter().map(|d| rel(p, d)).find(|&q| self.view().is_air(self.get(q)) && self.can_survive(place, q))
     }
 
     /// Spread to a neighbour: valid if a free neighbour exists where `test` survives (plan
@@ -57,7 +57,7 @@ impl Server {
 
     /// Targets added by G6-F07; `None`: block unknown here (no bone meal effect).
     pub(crate) fn bone_meal_more(&mut self, s: u32, p: P, name: &str) -> Option<bool> {
-        let v = self.v();
+        let v = self.view();
         Some(match name {
             "minecraft:bush" | "minecraft:red_shrub" | "minecraft:firefly_bush" => {
                 let place = v.default_state(v.block(s));
@@ -149,7 +149,7 @@ impl Server {
                     return Some(false);
                 }
                 let top = self.moss_carpet_topper(s, p, |_| true);
-                if v.is_air(top) {
+                if self.view().is_air(top) {
                     return Some(false);
                 }
                 self.set_update(above(p), top);
@@ -180,7 +180,7 @@ impl Server {
     /// Netherrack: valid if the block above lets skylight through and a nylium touches the block
     /// (3×3×3 cube); becomes the neighbouring nylium, chosen by a coin flip if both are there.
     fn bm_netherrack(&mut self, p: P) -> bool {
-        let v = self.v();
+        let v = self.view();
         if !v.info(self.get(above(p))).has(rc_data::flags::SKYLIGHT_THROUGH) {
             return false;
         }
@@ -214,14 +214,14 @@ impl Server {
         } else {
             return true;
         };
-        self.set_update(p, v.default_state(to));
+        self.set_update(p, self.view().default_state(to));
         true
     }
 
     /// Bamboo: the column (16 at most) has not finished growing and the cell above the top is
     /// free; 1 or 2 stalks added at the top.
     fn bm_bamboo(&mut self, p: P) -> bool {
-        let v = self.v();
+        let v = self.view();
         let up = self.bamboo_run(p, true);
         let down = self.bamboo_run(p, false);
         let grow = rel_n(p, Dir::Up, up + 1);
@@ -237,6 +237,7 @@ impl Server {
             let (top, total) = (rel_n(p, Dir::Up, up + i), up + down + 1 + i);
             let ts = self.get(top);
             let g = above(top);
+            let v = self.view();
             if total >= 16 || v.get_int(ts, "stage") == 1 || !v.is_air(self.get(g)) || !self.in_build_height(g[1]) {
                 break;
             }
@@ -247,7 +248,7 @@ impl Server {
 
     /// Growth direction and the cell the head accepts (kelp: water; vines: air).
     fn bm_vine_dir(&self, s: u32) -> Dir {
-        match self.v().kind(s) {
+        match self.view().kind(s) {
             Kind::GrowingHead { up: true } | Kind::GrowingBody { up: true } => Dir::Up,
             _ => Dir::Down,
         }
@@ -255,7 +256,7 @@ impl Server {
 
     fn bm_vine_can_grow_into(&self, head: u32, q: P) -> bool {
         let into = self.get(q);
-        if self.is_kelp(head) { self.v().block(into) == self.bs.t.id.water } else { self.v().is_air(into) }
+        if self.is_kelp(head) { self.view().block(into) == self.bs.t.id.water } else { self.view().is_air(into) }
     }
 
     /// Head of a climbing plant: valid if the next cell accepts it; grows by 1 cell (kelp) or by
@@ -266,7 +267,7 @@ impl Server {
         if !self.bm_vine_can_grow_into(s, fwd) || !self.in_build_height(fwd[1]) {
             return false;
         }
-        let v = self.v();
+        let v = self.view();
         let mut age = (v.get_int(s, "age") + 1).min(25);
         let n = if self.is_kelp(s) {
             1
@@ -282,7 +283,7 @@ impl Server {
             if !self.bm_vine_can_grow_into(s, fwd) || !self.in_build_height(fwd[1]) {
                 break;
             }
-            self.set_update(fwd, v.set_int(s, "age", age));
+            self.set_update(fwd, self.view().set_int(s, "age", age));
             fwd = rel(fwd, d);
             age = (age + 1).min(25);
         }
@@ -293,7 +294,7 @@ impl Server {
     fn bm_vine_body(&mut self, s: u32, p: P) -> bool {
         let d = self.bm_vine_dir(s);
         let (head, body) = self.growing_parts(s);
-        let v = self.v();
+        let v = self.view();
         let mut q = rel(p, d);
         while v.block(self.get(q)) == body {
             q = rel(q, d);
@@ -310,7 +311,7 @@ impl Server {
     /// Cell where the lichen can take face `face`: air, lichen or source water, without that
     /// face yet, attachable face.
     fn bm_lichen_can_spread_into(&self, me: u16, q: P, face: Dir) -> bool {
-        let v = self.v();
+        let v = self.view();
         let e = self.get(q);
         let replaceable =
             v.is_air(e) || v.block(e) == me || (v.block(e) == self.bs.t.id.water && self.fluid_of(e).source);
@@ -320,7 +321,7 @@ impl Server {
     /// Spread target from face `from` towards `towards`: same cell, same plane, or around the
     /// edge (in that order).
     fn bm_lichen_target(&self, s: u32, p: P, from: Dir, towards: Dir) -> Option<(P, Dir)> {
-        let v = self.v();
+        let v = self.view();
         if towards.axis() == from.axis() || !v.get_bool(s, from.name()) || v.get_bool(s, towards.name()) {
             return None;
         }
@@ -331,21 +332,21 @@ impl Server {
     }
 
     fn bm_lichen(&mut self, s: u32, p: P) -> bool {
-        let v = self.v();
         let valid = Dir::ALL
             .iter()
             .any(|&f| Dir::ALL.iter().any(|&t| self.bm_lichen_target(s, p, f.opposite(), t).is_some()));
         if !valid {
             return false;
         }
-        let me = v.block(s);
+        let me = self.view().block(s);
         for from in self.bm_shuffled_all() {
-            if !v.get_bool(s, from.name()) {
+            if !self.view().get_bool(s, from.name()) {
                 continue;
             }
             for towards in self.bm_shuffled_all() {
                 let Some((q, face)) = self.bm_lichen_target(s, p, from, towards) else { continue };
                 let old = self.get(q);
+                let v = self.view();
                 let base = if v.block(old) == me {
                     old
                 } else if self.fluid_of(old).kind == 1 && self.fluid_of(old).source {
@@ -368,16 +369,16 @@ impl Server {
     /// from age 3, the cell above free (air or the plant itself).
     fn bm_pitcher_can_grow(&self, lp: P, ls: u32, age: i32) -> bool {
         let up = self.get(above(lp));
-        self.v().get_int(ls, "age") < 4
+        self.view().get_int(ls, "age") < 4
             && self.raw_brightness(lp) >= 8
             && self.in_build_height(lp[1] + 1)
-            && (age < 3 || self.v().is_air(up) || self.v().kind(up) == Kind::PitcherCrop)
+            && (age < 3 || self.view().is_air(up) || self.view().kind(up) == Kind::PitcherCrop)
     }
 
     /// Growth of the pitcher plant (lower half): age + `inc` (4 at most); upper half placed
     /// from age 3.
     pub(crate) fn pitcher_grow(&mut self, lp: P, ls: u32, inc: i32) {
-        let v = self.v();
+        let v = self.view();
         let age = (v.get_int(ls, "age") + inc).min(4);
         if !self.bm_pitcher_can_grow(lp, ls, age) {
             return;
@@ -385,12 +386,12 @@ impl Server {
         let low = v.set_int(ls, "age", age);
         self.set_block(lp, low, flag::CLIENTS);
         if age >= 3 {
-            self.set_update(above(lp), v.set(low, "half", "upper"));
+            self.set_update(above(lp), self.view().set(low, "half", "upper"));
         }
     }
 
     fn bm_pitcher(&mut self, s: u32, p: P) -> bool {
-        let v = self.v();
+        let v = self.view();
         let lower = |st: u32| v.kind(st) == Kind::PitcherCrop && v.get(st, "half") == Some("lower");
         let (lp, ls) = if lower(s) {
             (p, s)
@@ -409,16 +410,16 @@ impl Server {
     // --- Water plants. ---
 
     fn bm_tall_seagrass(&mut self, p: P) {
-        let v = self.v();
+        let v = self.view();
         let low = v.set(v.default_state(self.bs.t.id.tall_seagrass), "half", "lower");
         self.set_block(p, low, flag::CLIENTS);
-        self.set_block(above(p), v.set(low, "half", "upper"), flag::CLIENTS);
+        self.set_block(above(p), self.view().set(low, "half", "upper"), flag::CLIENTS);
     }
 
     /// Live sea pickles on a coral block: more pickles on the corals of a diamond 5 wide around,
     /// then 4 pickles here.
     fn bm_sea_pickle(&mut self, s: u32, p: P) -> bool {
-        let v = self.v();
+        let v = self.view();
         if !v.get_bool(s, "waterlogged") || !self.tag_id(TagId::CoralBlocks, v.block(self.get(below(p)))) {
             return false;
         }
@@ -428,10 +429,11 @@ impl Server {
             for z in 0..span {
                 for y in p[1] - 1..p[1] + 1 {
                     let q = [p[0] - 2 + x, y, p[2] - off + z];
-                    if q != p && self.bs.rng.next_int_bound(6) == 0 && v.block(self.get(q)) == water {
-                        let b = v.block(self.get(below(q)));
+                    if q != p && self.bs.rng.next_int_bound(6) == 0 && self.view().block(self.get(q)) == water {
+                        let b = self.view().block(self.get(below(q)));
                         if self.tag_id(TagId::CoralBlocks, b) {
                             let n = self.bs.rng.next_int_bound(4) + 1;
+                            let v = self.view();
                             let st = v.set_int(v.default_state(v.block(s)), "pickles", n);
                             self.set_update(q, st);
                         }
@@ -446,7 +448,7 @@ impl Server {
                 off -= 1;
             }
         }
-        self.set_block(p, v.set_int(s, "pickles", 4), flag::CLIENTS);
+        self.set_block(p, self.view().set_int(s, "pickles", 4), flag::CLIENTS);
         true
     }
 
@@ -468,7 +470,7 @@ impl Server {
         }
         let i = self.bs.rng.next_int_bound(n as i32) as usize;
         let b = self.bm_tag_members(tag)[i];
-        Some(self.v().default_state(b as u16))
+        Some(self.view().default_state(b as u16))
     }
 
     /// Bone meal in full water `p` (clicked face of a solid block, or a dispenser with no
@@ -477,9 +479,8 @@ impl Server {
     /// plant; existing seagrass grown one time in ten. True if `p` is full water.
     pub(crate) fn grow_water_plant(&mut self, p: P, face: Option<Dir>) -> bool {
         let water = self.bs.t.id.water;
-        let v = self.v();
         let f = self.fluid_at(p);
-        if v.block(self.get(p)) != water || f.amount != 8 {
+        if self.view().block(self.get(p)) != water || f.amount != 8 {
             return false;
         }
         let seagrass = self.bm_default("minecraft:seagrass");
@@ -491,25 +492,25 @@ impl Server {
                 let dy = (self.bs.rng.next_int_bound(3) - 1) * self.bs.rng.next_int_bound(3) / 2;
                 let dz = self.bs.rng.next_int_bound(3) - 1;
                 t = [t[0] + dx, t[1] + dy, t[2] + dz];
-                if v.full_collision(self.get(t)) {
+                if self.view().full_collision(self.get(t)) {
                     continue 'attempt;
                 }
             }
             if self.biome_tag_zoomed(t, "minecraft:produces_corals_from_bonemeal") {
                 if let Some(face) = face.filter(|d| j == 0 && d.axis() != 1) {
                     grow = self.bm_random_in_tag("minecraft:wall_corals").unwrap_or(grow);
-                    if v.has(grow, "facing") {
-                        grow = v.set_dir(grow, "facing", face);
+                    if self.view().has(grow, "facing") {
+                        grow = self.view().set_dir(grow, "facing", face);
                     }
                 } else if self.bs.rng.next_int_bound(4) == 0 {
                     grow = self.bm_random_in_tag("minecraft:underwater_bonemeals").unwrap_or(grow);
                 }
             }
-            if self.tag_id(TagId::WallCorals, v.block(grow)) && v.has(grow, "facing") {
+            if self.tag_id(TagId::WallCorals, self.view().block(grow)) && self.view().has(grow, "facing") {
                 let mut d = 0;
                 while !self.can_survive(grow, t) && d < 4 {
                     let h = Dir::HORIZONTAL[self.bs.rng.next_int_bound(4) as usize];
-                    grow = v.set_dir(grow, "facing", h);
+                    grow = self.view().set_dir(grow, "facing", h);
                     d += 1;
                 }
             }
@@ -517,10 +518,10 @@ impl Server {
                 continue;
             }
             let ts = self.get(t);
-            if v.block(ts) == water && self.fluid_of(ts).amount == 8 {
+            if self.view().block(ts) == water && self.fluid_of(ts).amount == 8 {
                 self.set_update(t, grow);
-            } else if v.block(ts) == self.bs.t.block_id("minecraft:seagrass")
-                && v.block(self.get(above(t))) == water
+            } else if self.view().block(ts) == self.bs.t.block_id("minecraft:seagrass")
+                && self.view().block(self.get(above(t))) == water
                 && self.bs.rng.next_int_bound(10) == 0
             {
                 self.bm_tall_seagrass(t);

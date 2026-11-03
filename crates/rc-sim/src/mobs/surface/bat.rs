@@ -20,7 +20,7 @@ fn set_resting(m: &mut Mob, v: bool) {
 /// Redstone conductor block above (the game's per-block flag, not the opacity: a redstone
 /// block, an observer or TNT does not hold a resting bat).
 fn conductor(s: &Server, p: [i32; 3]) -> bool {
-    s.v().conductor(s.get(p))
+    s.view().conductor(s.get(p))
 }
 
 /// End of `tick`: stuck to the ceiling at rest, otherwise vertical velocity damped.

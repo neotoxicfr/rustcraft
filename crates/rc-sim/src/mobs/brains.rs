@@ -1062,7 +1062,7 @@ struct OutlineRay<'a>(&'a Server);
 
 impl rc_physics::ray::RayWorld for OutlineRay<'_> {
     fn outline(&self, p: [i32; 3]) -> &[rc_data::Aabb] {
-        let info = self.0.v().info(self.0.get(p));
+        let info = self.0.view().info(self.0.get(p));
         self.0.data.shape(info.outline)
     }
 
@@ -1162,7 +1162,7 @@ impl Server {
         m.carried = e
             .get("carriedBlockState")
             .and_then(|s| self.states.state_of(&self.data, s))
-            .filter(|&s| !self.v().is_air(s));
+            .filter(|&s| !self.view().is_air(s));
     }
 
     /// Carried block written (`carriedBlockState`, 26.3 state format: name alone for the default

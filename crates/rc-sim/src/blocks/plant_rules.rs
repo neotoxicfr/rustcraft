@@ -24,8 +24,8 @@ impl Server {
 
     /// Tilt placed (flag 2); "block changed" when it changes, except toward "unstable".
     fn dripleaf_set_tilt(&mut self, s: u32, p: P, tilt: &str) {
-        let prev = self.v().get(s, "tilt") == Some(tilt);
-        let ns = self.v().set(s, "tilt", tilt);
+        let prev = self.view().get(s, "tilt") == Some(tilt);
+        let ns = self.view().set(s, "tilt", tilt);
         self.set_block(p, ns, flag::CLIENTS);
         if tilt != "unstable" && !prev {
             self.game_event_block("minecraft:block_change", p, None, None);
@@ -44,14 +44,14 @@ impl Server {
             self.dripleaf_sound(p, snd);
         }
         if let Some(d) = tilt_delay(tilt) {
-            let b = self.v().block(s);
+            let b = self.view().block(s);
             self.schedule_tick(p, b, d);
         }
     }
 
     fn dripleaf_reset(&mut self, s: u32, p: P) {
         self.dripleaf_set_tilt(s, p, "none");
-        if self.v().get(s, "tilt") != Some("none") {
+        if self.view().get(s, "tilt") != Some("none") {
             self.dripleaf_sound(p, "minecraft:block.big_dripleaf.tilt_up");
         }
     }
@@ -68,7 +68,7 @@ impl Server {
             return;
         }
         let down = Some("minecraft:block.big_dripleaf.tilt_down");
-        match self.v().get(s, "tilt") {
+        match self.view().get(s, "tilt") {
             Some("unstable") => self.dripleaf_tilt_and_schedule(s, p, "partial", down),
             Some("partial") => self.dripleaf_tilt_and_schedule(s, p, "full", down),
             Some("full") => self.dripleaf_reset(s, p),
@@ -85,7 +85,7 @@ impl Server {
     /// ground and higher than 11/16 of the block, without signal, the flat leaf becomes unstable.
     pub(crate) fn dripleaf_entity_inside(&mut self, p: P, on_ground: bool, y: f64) {
         let s = self.get(p);
-        if self.v().kind(s) != Kind::BigDripleaf || self.v().get(s, "tilt") != Some("none") {
+        if self.view().kind(s) != Kind::BigDripleaf || self.view().get(s, "tilt") != Some("none") {
             return;
         }
         // Threshold computed in single-precision float like the game (integer + 0.6875f).
@@ -96,7 +96,7 @@ impl Server {
     }
 
     pub(crate) fn dripleaf_update_shape(&mut self, s: u32, kind: Kind, p: P, dir: Dir, ns: u32) -> u32 {
-        let v = self.v();
+        let v = self.view();
         let leaf = self.block_named("big_dripleaf");
         if kind == Kind::BigDripleaf {
             if dir == Dir::Down && !self.plant_rule_survives(s, p) {
@@ -118,9 +118,9 @@ impl Server {
     /// Cell where the leaf can grow: within world height, air, water or small leaf.
     fn dripleaf_can_grow_into(&self, q: P) -> bool {
         let s = self.get(q);
-        let b = self.v().block(s);
+        let b = self.view().block(s);
         self.in_build_height(q[1])
-            && (self.v().is_air(s) || b == self.bs.t.id.water || b == self.block_named("small_dripleaf"))
+            && (self.view().is_air(s) || b == self.bs.t.id.water || b == self.block_named("small_dripleaf"))
     }
 
     fn water_source_at(&self, q: P) -> bool {
@@ -130,7 +130,7 @@ impl Server {
 
     fn dripleaf_place(&mut self, q: P, stem: bool, water: bool, facing: Dir) {
         let b = self.block_named(if stem { "big_dripleaf_stem" } else { "big_dripleaf" });
-        let v = self.v();
+        let v = self.view();
         let s = v.set_bool(v.set_dir(v.default_state(b), "facing", facing), "waterlogged", water);
         self.set_update(q, s);
     }
@@ -138,7 +138,7 @@ impl Server {
     /// Bone meal: leaf → stem + leaf above; stem → the top leaf goes up by one
     /// notch (orientation of the clicked stem). True if the target is valid.
     pub(crate) fn dripleaf_bone_meal(&mut self, s: u32, p: P, stem: bool) -> bool {
-        let v = self.v();
+        let v = self.view();
         let facing = v.facing(s);
         if !stem {
             let up = above(p);
@@ -170,7 +170,7 @@ impl Server {
     /// upper half removed (its fluid stays, flags 18), then a big dripleaf of 2 to 5 cells grown
     /// upward as long as the cell accepts it, stems then leaf, facing kept.
     pub(crate) fn small_dripleaf_bone_meal(&mut self, s: u32, p: P) -> bool {
-        let v = self.v();
+        let v = self.view();
         let (s, p) = if v.get(s, "half") == Some("upper") { (self.get(below(p)), below(p)) } else { (s, p) };
         let facing = v.facing(s);
         let up = above(p);
@@ -196,7 +196,7 @@ impl Server {
     // --- Common survival (leaf, stem, chorus). ---
 
     pub(crate) fn plant_rule_survives(&self, s: u32, p: P) -> bool {
-        let v = self.v();
+        let v = self.view();
         let bs = self.get(below(p));
         let bb = v.block(bs);
         match v.kind(s) {
@@ -258,7 +258,7 @@ impl Server {
     /// Chorus plant (default state) connected to its 6 neighbours: another plant or flower, and
     /// at the bottom also a block of the tag `supports_chorus_plant` (placement, growth).
     pub(crate) fn chorus_plant_state(&self, p: P) -> u32 {
-        let v = self.v();
+        let v = self.view();
         let plant = self.block_named("chorus_plant");
         let flower = self.block_named("chorus_flower");
         let mut s = v.default_state(plant);
@@ -274,17 +274,17 @@ impl Server {
         let survives = self.plant_rule_survives(s, p);
         if kind == Kind::ChorusFlower {
             if dir != Dir::Up && !survives {
-                let b = self.v().block(s);
+                let b = self.view().block(s);
                 self.schedule_tick(p, b, 1);
             }
             return s;
         }
         if !survives {
-            let b = self.v().block(s);
+            let b = self.view().block(s);
             self.schedule_tick(p, b, 1);
             return s;
         }
-        let v = self.v();
+        let v = self.view();
         let nb = v.block(ns);
         let c = nb == v.block(s)
             || nb == self.block_named("chorus_flower")
@@ -293,17 +293,17 @@ impl Server {
     }
 
     fn chorus_all_neighbors_empty(&self, q: P, ignore: Option<Dir>) -> bool {
-        Dir::HORIZONTAL.iter().all(|&d| Some(d) == ignore || self.v().is_air(self.get(rel(q, d))))
+        Dir::HORIZONTAL.iter().all(|&d| Some(d) == ignore || self.view().is_air(self.get(rel(q, d))))
     }
 
     fn chorus_grown_flower(&mut self, q: P, age: i32) {
-        let f = self.v().set_int(self.v().default_state(self.block_named("chorus_flower")), "age", age);
+        let f = self.view().set_int(self.view().default_state(self.block_named("chorus_flower")), "age", age);
         self.set_block(q, f, flag::CLIENTS);
         self.level_event(1033, q, 0);
     }
 
     fn chorus_dead_flower(&mut self, q: P) {
-        let f = self.v().set_int(self.v().default_state(self.block_named("chorus_flower")), "age", 5);
+        let f = self.view().set_int(self.view().default_state(self.block_named("chorus_flower")), "age", 5);
         self.set_block(q, f, flag::CLIENTS);
         self.level_event(1034, q, 0);
     }
@@ -312,23 +312,23 @@ impl Server {
     /// otherwise dies (age 5).
     pub(crate) fn chorus_flower_random_tick(&mut self, s: u32, p: P) {
         let up = above(p);
-        if !self.v().is_air(self.get(up)) || up[1] >= self.top_y() {
+        if !self.view().is_air(self.get(up)) || up[1] >= self.top_y() {
             return;
         }
-        let age = self.v().get_int(s, "age");
+        let age = self.view().get_int(s, "age");
         if age >= 5 {
             return;
         }
         let plant = self.block_named("chorus_plant");
         let (mut grow_up, mut pillar) = (false, false);
         let below_s = self.get(below(p));
-        let bb = self.v().block(below_s);
+        let bb = self.view().block(below_s);
         if self.tag_id(crate::tag_bits::TagId::SupportsChorusFlower, bb) {
             grow_up = true;
         } else if bb == plant {
             let mut height = 1;
             for _ in 0..4 {
-                let t = self.v().block(self.get([p[0], p[1] - (height + 1), p[2]]));
+                let t = self.view().block(self.get([p[0], p[1] - (height + 1), p[2]]));
                 if t != plant {
                     if self.tag_id(crate::tag_bits::TagId::SupportsChorusFlower, t) {
                         pillar = true;
@@ -340,10 +340,10 @@ impl Server {
             if height < 2 || height <= self.bs.rng.next_int_bound(if pillar { 5 } else { 4 }) {
                 grow_up = true;
             }
-        } else if self.v().is_air(below_s) {
+        } else if self.view().is_air(below_s) {
             grow_up = true;
         }
-        if grow_up && self.chorus_all_neighbors_empty(up, None) && self.v().is_air(self.get(above(up))) {
+        if grow_up && self.chorus_all_neighbors_empty(up, None) && self.view().is_air(self.get(above(up))) {
             let ps = self.chorus_plant_state(p);
             self.set_block(p, ps, flag::CLIENTS);
             self.chorus_grown_flower(up, age);
@@ -356,8 +356,8 @@ impl Server {
             for _ in 0..tries {
                 let d = Dir::HORIZONTAL[self.bs.rng.next_int_bound(4) as usize];
                 let t = rel(p, d);
-                if self.v().is_air(self.get(t))
-                    && self.v().is_air(self.get(below(t)))
+                if self.view().is_air(self.get(t))
+                    && self.view().is_air(self.get(below(t)))
                     && self.chorus_all_neighbors_empty(t, Some(d.opposite()))
                 {
                     self.chorus_grown_flower(t, age + 1);
@@ -386,7 +386,7 @@ impl Server {
         let d = Dir::ALL[self.bs.rng.next_int_bound(6) as usize];
         let q = rel(p, d);
         let r = self.get(q);
-        let v = self.v();
+        let v = self.view();
         let rb = v.block(r);
         let f = self.fluid_of(r);
         let stages = ["small_amethyst_bud", "medium_amethyst_bud", "large_amethyst_bud", "amethyst_cluster"];
@@ -409,22 +409,22 @@ impl Server {
 
     /// Support direction: floor at the bottom, ceiling at the top, wall behind (orientation).
     fn bell_support_dir(&self, s: u32) -> Dir {
-        match self.v().get(s, "attachment") {
+        match self.view().get(s, "attachment") {
             Some("ceiling") => Dir::Up,
-            Some("single_wall" | "double_wall") => self.v().facing(s),
+            Some("single_wall" | "double_wall") => self.view().facing(s),
             _ => Dir::Down,
         }
     }
 
     pub(crate) fn bell_survives(&self, s: u32, p: P) -> bool {
         match self.bell_support_dir(s) {
-            Dir::Up => self.v().center_down(self.get(above(p))),
+            Dir::Up => self.view().center_down(self.get(above(p))),
             d => self.face_attach(p, d),
         }
     }
 
     pub(crate) fn bell_update_shape(&mut self, s: u32, p: P, dir: Dir, _np: P, ns: u32) -> u32 {
-        let v = self.v();
+        let v = self.view();
         let att = v.get(s, "attachment").unwrap_or("floor");
         let support = self.bell_support_dir(s);
         if support == dir && att != "double_wall" && !self.bell_survives(s, p) {

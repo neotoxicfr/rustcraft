@@ -1457,7 +1457,7 @@ impl Server {
         }
         match at {
             SpawnerAt::Block(p) => {
-                let b = self.v().block(self.get(*p));
+                let b = self.view().block(self.get(*p));
                 self.block_event(*p, b, 1, 0);
             }
             // G5-F06: broadcast of an entity event.

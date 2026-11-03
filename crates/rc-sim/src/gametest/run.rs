@@ -459,7 +459,7 @@ impl Server {
     fn ti_encase(&mut self, g: &Geo) {
         let barrier = self.default_state("minecraft:barrier");
         for q in self.ti_boundary(g) {
-            if self.v().kind(self.get(q)) != BKind::TestInstance {
+            if self.view().kind(self.get(q)) != BKind::TestInstance {
                 self.set_block(q, barrier, flag::ALL);
             }
         }
@@ -471,10 +471,10 @@ impl Server {
     }
 
     fn ti_remove_barriers_of(&mut self, g: &Geo) {
-        let barrier = self.tb().block_id("minecraft:barrier");
+        let barrier = self.table().block_id("minecraft:barrier");
         let air = self.air();
         for q in self.ti_boundary(g) {
-            if self.v().block(self.get(q)) == barrier {
+            if self.view().block(self.get(q)) == barrier {
                 self.set_block(q, air, flag::ALL);
             }
         }
@@ -486,7 +486,7 @@ impl Server {
     pub(crate) fn clear_space(&mut self, (lo, hi): (P, P)) {
         self.load_now(&chunks_of((lo, hi)));
         let air = self.air();
-        let air_block = self.v().block(air);
+        let air_block = self.view().block(air);
         let flags = flag::CLIENTS | flag::KNOWN_SHAPE | flag::NO_DROPS | flag::SKIP_BE_SIDE_EFFECTS | flag::SKIP_ON_PLACE;
         for z in lo[2]..=hi[2] {
             for y in lo[1]..=hi[1] {
@@ -957,16 +957,16 @@ impl Server {
     }
 
     fn test_block_mode(&self, st: u32, test_block: u16) -> Option<usize> {
-        if self.v().block(st) != test_block {
+        if self.view().block(st) != test_block {
             return None;
         }
-        self.v().get(st, "mode").and_then(|m| MODES.iter().position(|x| *x == m))
+        self.view().get(st, "mode").and_then(|m| MODES.iter().position(|x| *x == m))
     }
 
     /// Every cell of the structure, in the game's order.
     pub(crate) fn test_blocks_cellwise(&self, origin: P, rot: Rot, rel: [i32; 3]) -> [Vec<P>; 4] {
         let mut out: [Vec<P>; 4] = Default::default();
-        let test_block = self.tb().block_id("minecraft:test_block");
+        let test_block = self.table().block_id("minecraft:test_block");
         for z in 0..rel[2] {
             for y in 0..rel[1] {
                 for x in 0..rel[0] {
@@ -987,7 +987,7 @@ impl Server {
         if rel.iter().any(|&v| v < 1) {
             return out;
         }
-        let test_block = self.tb().block_id("minecraft:test_block");
+        let test_block = self.table().block_id("minecraft:test_block");
         let far = transform([origin[0] + rel[0] - 1, origin[1] + rel[1] - 1, origin[2] + rel[2] - 1], Mirror::None, rot, origin);
         let (lo, hi) = (
             [origin[0].min(far[0]), origin[1].min(far[1]), origin[2].min(far[2])],
@@ -1003,7 +1003,7 @@ impl Server {
                 let Some(Some(c)) = self.chunks.get(&(cx, cz)) else { continue };
                 for sy in ((lo[1] - min_y).max(0) >> 4)..=((hi[1] - min_y) >> 4).min(sections - 1) {
                     let Some(sec) = c.sections.get(sy as usize) else { continue };
-                    if !sec.blocks.may_contain(|st| self.v().block(st) == test_block) {
+                    if !sec.blocks.may_contain(|st| self.view().block(st) == test_block) {
                         continue;
                     }
                     let base = [cx * 16, min_y + sy * 16, cz * 16];
@@ -1581,7 +1581,7 @@ impl Server {
             if let Some(be) = self.be_get_mut(p) {
                 crate::nbtio::set(be, "powered", Nbt::Byte(0));
             }
-            let b = self.v().block(self.get(p));
+            let b = self.view().block(self.get(p));
             self.update_neighbors_at(p, b);
         }
     }

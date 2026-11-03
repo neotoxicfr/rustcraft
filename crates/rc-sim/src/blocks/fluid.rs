@@ -103,8 +103,8 @@ impl Server {
 
     /// Passage between two cells (§ 2.1).
     fn pass_wall(&self, dir: Dir, src: u32, dst: u32) -> bool {
-        let (si, di) = (self.v().info(src), self.v().info(dst));
-        if self.v().full_collision(dst) || self.v().full_collision(src) {
+        let (si, di) = (self.view().info(src), self.view().info(dst));
+        if self.view().full_collision(dst) || self.view().full_collision(src) {
             return false;
         }
         if si.collision == 0 && di.collision == 0 {
@@ -117,14 +117,14 @@ impl Server {
     }
 
     fn can_hold_any(&self, s: u32) -> bool {
-        self.v().sim(s) & sim_bits::LIQUID_CONTAINER != 0
-            || self.tag_id(crate::tag_bits::TagId::WashedAwayByFluids, self.v().block(s))
+        self.view().sim(s) & sim_bits::LIQUID_CONTAINER != 0
+            || self.tag_id(crate::tag_bits::TagId::WashedAwayByFluids, self.view().block(s))
     }
 
     /// `fluid_type` = exact type (`Fluid::type_id`).
     fn can_hold_specific(&self, s: u32, fluid_type: u8) -> bool {
-        if self.v().sim(s) & sim_bits::LIQUID_CONTAINER != 0 {
-            fluid_type == 1 && self.v().sim(s) & sim_bits::PLACE_WATER != 0
+        if self.view().sim(s) & sim_bits::LIQUID_CONTAINER != 0 {
+            fluid_type == 1 && self.view().sim(s) & sim_bits::PLACE_WATER != 0
         } else {
             true
         }
@@ -173,7 +173,7 @@ impl Server {
         if sources >= 2 && self.convert_to_source(kind) {
             let bs = self.get(below(p));
             let bf = self.fluid_of(bs);
-            if self.v().legacy_solid(bs) || self.is_source_of(bf, kind) {
+            if self.view().legacy_solid(bs) || self.is_source_of(bf, kind) {
                 return Fluid { kind, source: true, amount: 8, falling: false };
             }
         }
@@ -344,25 +344,25 @@ impl Server {
 
     fn spread_to(&mut self, kind: u8, p: P, s: u32, dir: Dir, target: Fluid) {
         if kind == 2 && dir == Dir::Down && self.fluid_of(s).kind == 1 {
-            if self.v().kind(s) == Kind::Water {
-                let stone = self.v().default_state(self.bs.t.id.stone);
+            if self.view().kind(s) == Kind::Water {
+                let stone = self.view().default_state(self.bs.t.id.stone);
                 self.set_update(p, stone);
             }
             self.level_event(1501, p, 0);
             return;
         }
-        if self.v().sim(s) & sim_bits::LIQUID_CONTAINER != 0 {
+        if self.view().sim(s) & sim_bits::LIQUID_CONTAINER != 0 {
             if target.kind == 1
                 && target.source
-                && self.v().has(s, "waterlogged")
-                && !self.v().get_bool(s, "waterlogged")
+                && self.view().has(s, "waterlogged")
+                && !self.view().get_bool(s, "waterlogged")
                 && self.accepts_water(s, false)
             {
                 self.place_water_in(p, s);
             }
             return;
         }
-        if !self.v().is_air(s) {
+        if !self.view().is_air(s) {
             if kind == 2 {
                 self.level_event(1501, p, 0);
             } else {
@@ -378,22 +378,22 @@ impl Server {
 
     /// Water-lava meeting (in the lava block); false if the lava was transformed.
     fn should_spread_liquid(&mut self, s: u32, p: P) -> bool {
-        if self.v().kind(s) != Kind::Lava {
+        if self.view().kind(s) != Kind::Lava {
             return true;
         }
-        let soul = self.v().block(self.get(below(p))) == self.bs.t.id.soul_soil;
+        let soul = self.view().block(self.get(below(p))) == self.bs.t.id.soul_soil;
         for d in [Dir::Down, Dir::South, Dir::North, Dir::East, Dir::West] {
             let np = rel(p, d.opposite());
             if self.fluid_at(np).kind == 1 {
                 let t = &self.bs.t;
                 let b = if self.fluid_at(p).source { t.id.obsidian } else { t.id.cobblestone };
-                let ns = self.v().default_state(b);
+                let ns = self.view().default_state(b);
                 self.set_update(p, ns);
                 self.level_event(1501, p, 0);
                 return false;
             }
-            if soul && self.v().block(self.get(np)) == self.bs.t.id.blue_ice {
-                let ns = self.v().default_state(self.bs.t.id.basalt);
+            if soul && self.view().block(self.get(np)) == self.bs.t.id.blue_ice {
+                let ns = self.view().default_state(self.bs.t.id.basalt);
                 self.set_update(p, ns);
                 self.level_event(1501, p, 0);
                 return false;
@@ -439,13 +439,13 @@ impl Server {
                     return;
                 }
                 let s = self.get(t);
-                if self.v().is_air(s) {
+                if self.view().is_air(s) {
                     if Dir::ALL.iter().any(|&d| self.lava_flammable(rel(t, d))) {
                         let fire = self.fire_state_for(t);
                         self.set_update(t, fire);
                         return;
                     }
-                } else if self.tag_id(crate::tag_bits::TagId::BlocksLavaFireSpread, self.v().block(s)) {
+                } else if self.tag_id(crate::tag_bits::TagId::BlocksLavaFireSpread, self.view().block(s)) {
                     return;
                 }
             }
@@ -457,7 +457,7 @@ impl Server {
                 if !self.is_loaded(t) {
                     return;
                 }
-                if self.v().is_air(self.get(above(t))) && self.lava_flammable(t) {
+                if self.view().is_air(self.get(above(t))) && self.lava_flammable(t) {
                     let fire = self.fire_state_for(t);
                     self.set_update(above(t), fire);
                 }
@@ -469,21 +469,21 @@ impl Server {
         if self.in_build_height(q[1]) && !self.is_loaded(q) {
             return false;
         }
-        self.v().sim(self.get(q)) & sim_bits::IGNITED_BY_LAVA != 0
+        self.view().sim(self.get(q)) & sim_bits::IGNITED_BY_LAVA != 0
     }
 
     /// Placing a liquid in a waterloggable block that is not waterlogged (source water): waterlogged (flags 3), tick
     /// of water in 5. Lit campfire: put out (sound, event); dried ghast: sound. Single
     /// point for buckets, dispensers and flowing water (G6-F01).
     pub(crate) fn place_water_in(&mut self, p: P, s: u32) {
-        let wet = self.v().set_bool(s, "waterlogged", true);
-        match self.v().kind(s) {
+        let wet = self.view().set_bool(s, "waterlogged", true);
+        match self.view().kind(s) {
             Kind::Campfire => {
-                if self.v().get_bool(s, "lit") {
+                if self.view().get_bool(s, "lit") {
                     self.block_sound(p, "minecraft:entity.generic.extinguish_fire", 1.0, 1.0);
                     self.game_event_block("minecraft:block_change", p, None, None);
                 }
-                let ns = self.v().set_bool(wet, "lit", false);
+                let ns = self.view().set_bool(wet, "lit", false);
                 self.set_update(p, ns);
                 self.schedule_fluid_tick(p, 1, 5);
             }
@@ -552,7 +552,7 @@ impl Server {
         if f.kind != 1 {
             return false;
         }
-        let v = self.v();
+        let v = self.view();
         // Bucket pickup: source of a liquid block (flowing water: removed), or waterlogged
         // block emptied.
         if v.kind(s) == Kind::Water {

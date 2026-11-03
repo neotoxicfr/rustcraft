@@ -51,7 +51,7 @@ impl Server {
     /// State from the water above and the block below, and "the countdown restarts"
     /// (the block becomes dormant without having been dormant or erupting).
     pub(crate) fn potent_sulfur_state(&self, s: u32, p: P) -> (u32, bool) {
-        let v = self.v();
+        let v = self.view();
         let up = self.fluid_at(above(p));
         if !(up.kind == 1 && up.source) {
             return (v.set(s, STATE, "dry"), false);
@@ -81,7 +81,7 @@ impl Server {
 
     /// Reaction to placement (any state change included).
     pub(crate) fn potent_sulfur_on_place(&mut self, s: u32, p: P) {
-        let v = self.v();
+        let v = self.view();
         let sound = match v.get(s, STATE) {
             Some("erupting") => "minecraft:block.potent_sulfur.geyser_eruption",
             Some("continuous") => "minecraft:block.potent_sulfur.geyser_continuous_eruption",
@@ -94,7 +94,7 @@ impl Server {
 
     /// Ticker according to the placed state (block entity created, reloaded or state changed).
     pub(crate) fn potent_sulfur_ticker_sync(&mut self, p: P, s: u32) {
-        let dry = self.v().get(s, STATE) == Some("dry");
+        let dry = self.view().get(s, STATE) == Some("dry");
         let have = matches!(self.bs.be_ticks.get(&p), Some((_, BeTick::PotentSulfur)));
         if dry && have {
             self.bs.be_ticks.remove(&p);
@@ -106,13 +106,13 @@ impl Server {
 
     /// Ticker still valid: active sulfur outside the dry state.
     pub(crate) fn potent_sulfur_alive(&self, s: u32) -> bool {
-        self.v().kind(s) == Kind::PotentSulfur && self.v().get(s, STATE) != Some("dry")
+        self.view().kind(s) == Kind::PotentSulfur && self.view().get(s, STATE) != Some("dry")
     }
 
     /// Block entity tick.
     pub(crate) fn potent_sulfur_tick(&mut self, p: P) {
         let s = self.get(p);
-        match self.v().get(s, STATE) {
+        match self.view().get(s, STATE) {
             Some("wet") => self.sulfur_nausea(p),
             Some("dormant") => {
                 self.sulfur_countdown(s, p);
@@ -130,7 +130,7 @@ impl Server {
     /// Does the geyser pass through this state? Air, water, or empty collision shape (seen from a
     /// block above the block: scaffolding and powder snow stop nothing).
     fn geyser_passable(&self, s: u32) -> bool {
-        let v = self.v();
+        let v = self.view();
         let b = v.block(s);
         v.is_air(s)
             || b == self.bs.t.id.water
@@ -146,8 +146,8 @@ impl Server {
             let s = self.get(q);
             let f = self.fluid_of(s);
             let wet = f.kind == 1 && f.source;
-            if !wet || (self.v().block(s) != self.bs.t.id.water && !self.geyser_passable(s)) {
-                return (self.v().is_air(s) || self.geyser_passable(s)).then_some(q);
+            if !wet || (self.view().block(s) != self.bs.t.id.water && !self.geyser_passable(s)) {
+                return (self.view().is_air(s) || self.geyser_passable(s)).then_some(q);
             }
             q = above(q);
         }
@@ -224,7 +224,7 @@ impl Server {
             return;
         }
         let Some(src) = self.gas_source(p) else { return };
-        let dormant = self.v().get(s, STATE) == Some("dormant");
+        let dormant = self.view().get(s, STATE) == Some("dormant");
         let mut cd = self.be_get(p).and_then(|b| crate::nbtio::int(b, COUNTDOWN)).map_or(-1, |v| v as i32);
         if cd <= 0 {
             let water = src[1] - p[1] - 1;
@@ -242,7 +242,7 @@ impl Server {
         self.be_set_int(p, COUNTDOWN, cd);
         if cd == 0 {
             let to = if dormant { "erupting" } else { "dormant" };
-            let ns = self.v().set(s, STATE, to);
+            let ns = self.view().set(s, STATE, to);
             self.set_block(p, ns, flag::ALL);
             if !dormant {
                 self.game_event_block("minecraft:block_deactivate", p, None, Some(s));

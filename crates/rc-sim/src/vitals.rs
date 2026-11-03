@@ -1052,7 +1052,7 @@ impl Server {
     /// factor and damage type; `None` without damage (powder snow). `no_bounce`: the entity
     /// cancels the bounce (sneaking player), the slime becomes an ordinary block again.
     pub(crate) fn fall_rule(&self, st: u32, dist: f64, no_bounce: bool) -> Option<(f64, f64, &'static str)> {
-        let v = self.v();
+        let v = self.view();
         let name = self.data.block_of(st).map_or("", |b| b.name.as_str());
         Some(match name {
             "minecraft:powder_snow" => return None,
@@ -1373,7 +1373,7 @@ impl Server {
         } else if self.game_mode != 3 {
             let feet = crate::mobs::mth::block_of(self.pos);
             let s = self.get(feet);
-            let v = self.v();
+            let v = self.view();
             let climb = self.tag_id(crate::tag_bits::TagId::Climbable, v.block(s));
             let trap_ladder = v.get(s, "open") == Some("true")
                 && self.data.block_of(s).is_some_and(|b| b.name.ends_with("trapdoor"))

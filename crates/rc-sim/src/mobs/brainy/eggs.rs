@@ -11,7 +11,7 @@ impl Server {
         match self.state_name(state) {
             "minecraft:frogspawn" => {
                 let delay = 3600 + self.bs.rng.next_int_bound(12000 - 3600);
-                let b = self.v().block(state);
+                let b = self.view().block(state);
                 self.schedule_tick(p, b, delay);
             }
             "minecraft:sniffer_egg" => {
@@ -24,7 +24,7 @@ impl Server {
                 let c = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
                 self.game_event_src("minecraft:block_place", c, None, Some(state));
                 let delay = hatch / 3 + self.bs.rng.next_int_bound(300);
-                let b = self.v().block(state);
+                let b = self.view().block(state);
                 self.schedule_tick(p, b, delay);
             }
             _ => {}
@@ -59,11 +59,11 @@ impl Server {
                 true
             }
             "minecraft:sniffer_egg" => {
-                let hatch = self.v().get_int(state, "hatch");
+                let hatch = self.view().get_int(state, "hatch");
                 let pitch = 0.9 + self.bs.rng.next_float() * 0.2;
                 if hatch < 2 {
                     self.world_sound("minecraft:block.sniffer_egg.crack", 4, c, 0.7, pitch);
-                    let ns = self.v().set_int(state, "hatch", hatch + 1);
+                    let ns = self.view().set_int(state, "hatch", hatch + 1);
                     self.set_block(p, ns, 2);
                 } else {
                     self.world_sound("minecraft:block.sniffer_egg.hatch", 4, c, 0.7, pitch);

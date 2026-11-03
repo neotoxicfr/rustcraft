@@ -757,42 +757,52 @@ impl Table {
 }
 
 /// View of the table linked to the data: reading and writing the properties of a state.
-pub(crate) struct View {
-    pub t: std::sync::Arc<Table>,
-    pub d: std::sync::Arc<VersionData>,
+///
+/// Two borrowed references, so making one is free: the earlier owned version cloned two `Arc`s
+/// (four atomic operations) on every call, and the server makes one per block read.
+#[derive(Clone, Copy)]
+pub(crate) struct View<'a> {
+    pub table: &'a Table,
+    pub data: &'a VersionData,
 }
 
-impl View {
+// Fails to compile if the view stops being `Copy`, which an owned field (an `Arc`) would cause.
+const _: () = {
+    const fn must_be_copy<T: Copy>() {}
+    must_be_copy::<View<'static>>();
+};
+
+impl<'a> View<'a> {
     #[inline]
     pub fn block(&self, s: u32) -> u16 {
-        self.d.states.get(s as usize).map_or(u16::MAX, |i| i.block)
+        self.data.states.get(s as usize).map_or(u16::MAX, |i| i.block)
     }
 
     #[inline]
     pub fn kind(&self, s: u32) -> Kind {
-        self.t.kind.get(self.block(s) as usize).copied().unwrap_or(Kind::Other)
+        self.table.kind.get(self.block(s) as usize).copied().unwrap_or(Kind::Other)
     }
 
     #[inline]
     pub fn info(&self, s: u32) -> rc_data::StateInfo {
-        self.d.states.get(s as usize).copied().unwrap_or_default()
+        self.data.states.get(s as usize).copied().unwrap_or_default()
     }
 
     #[inline]
     pub fn sim(&self, s: u32) -> u16 {
-        self.d.sim.get(s as usize).copied().unwrap_or(0)
+        self.data.sim.get(s as usize).copied().unwrap_or(0)
     }
 
     pub fn default_state(&self, block: u16) -> u32 {
-        self.d.blocks.get(block as usize).map_or(0, |b| b.default_state)
+        self.data.blocks.get(block as usize).map_or(0, |b| b.default_state)
     }
 
     fn slot(&self, s: u32, name: &str) -> Option<(usize, Prop, u8)> {
-        let info = self.d.states.get(s as usize)?;
-        let props = self.t.props.get(info.block as usize)?;
+        let info = self.data.states.get(s as usize)?;
+        let props = self.table.props.get(info.block as usize)?;
         props.iter().enumerate().find_map(|(i, p)| {
-            (self.d.properties[p.property as usize].name == name)
-                .then(|| (i, *p, self.d.state_values[info.values as usize + i]))
+            (self.data.properties[p.property as usize].name == name)
+                .then(|| (i, *p, self.data.state_values[info.values as usize + i]))
         })
     }
 
@@ -802,24 +812,24 @@ impl View {
 
     /// Properties of state `s`: name, possible values (game order) and rank of the current
     /// value, sorted by name like the game's state definition (G5-F10, debug stick).
-    pub fn props_sorted(&self, s: u32) -> Vec<(&str, &[String], usize)> {
-        let Some(info) = self.d.states.get(s as usize) else { return Vec::new() };
-        let Some(props) = self.t.props.get(info.block as usize) else { return Vec::new() };
-        let mut out: Vec<(&str, &[String], usize)> = props
+    pub fn props_sorted(&self, s: u32) -> Vec<(&'a str, &'a [String], usize)> {
+        let Some(info) = self.data.states.get(s as usize) else { return Vec::new() };
+        let Some(props) = self.table.props.get(info.block as usize) else { return Vec::new() };
+        let mut out: Vec<(&'a str, &'a [String], usize)> = props
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                let d = &self.d.properties[p.property as usize];
-                (d.name.as_str(), d.values.as_slice(), usize::from(self.d.state_values[info.values as usize + i]))
+                let d = &self.data.properties[p.property as usize];
+                (d.name.as_str(), d.values.as_slice(), usize::from(self.data.state_values[info.values as usize + i]))
             })
             .collect();
         out.sort_by(|a, b| a.0.cmp(b.0));
         out
     }
 
-    pub fn get(&self, s: u32, name: &str) -> Option<&str> {
+    pub fn get(&self, s: u32, name: &str) -> Option<&'a str> {
         let (_, p, v) = self.slot(s, name)?;
-        Some(self.d.properties[p.property as usize].values[v as usize].as_str())
+        Some(self.data.properties[p.property as usize].values[v as usize].as_str())
     }
 
     pub fn get_bool(&self, s: u32, name: &str) -> bool {
@@ -841,7 +851,7 @@ impl View {
     /// State with `name = value` (unchanged if the property or the value does not exist).
     pub fn set(&self, s: u32, name: &str, value: &str) -> u32 {
         let Some((_, p, v)) = self.slot(s, name) else { return s };
-        let Some(nv) = self.d.properties[p.property as usize].values.iter().position(|x| x == value) else {
+        let Some(nv) = self.data.properties[p.property as usize].values.iter().position(|x| x == value) else {
             return s;
         };
         let delta = (nv as i64 - i64::from(v)) * i64::from(p.stride);
@@ -923,7 +933,7 @@ impl View {
     }
 
     pub fn hardness(&self, s: u32) -> f32 {
-        self.d.hardness.get(s as usize).copied().unwrap_or(0.0)
+        self.data.hardness.get(s as usize).copied().unwrap_or(0.0)
     }
 }
 
@@ -957,6 +967,66 @@ mod fire_tests {
             ("stone", 0, 0),
         ] {
             assert_eq!(fire_odds(&format!("minecraft:{n}")), (a, b), "{n}");
+        }
+    }
+}
+
+/// Measurement of the block view (not a proof: the proofs are the simulation fingerprints).
+#[cfg(test)]
+mod view_bench {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use super::{Table, View};
+
+    /// Views made per thread and per state.
+    const ROUNDS: u32 = 50;
+
+    /// Mean nanoseconds per view made and read once, with `threads` threads at the same time,
+    /// each reading the `states` states `ROUNDS` times.
+    fn ns_per_view(threads: usize, states: u32, read: impl Fn(u32) -> bool + Sync) -> f64 {
+        let start = Instant::now();
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    let mut hits = 0u32;
+                    for _ in 0..ROUNDS {
+                        for s in 0..states {
+                            hits += u32::from(read(std::hint::black_box(s)));
+                        }
+                    }
+                    std::hint::black_box(hits);
+                });
+            }
+        });
+        start.elapsed().as_nanos() as f64 / f64::from(ROUNDS * states)
+    }
+
+    /// Borrowed view against the former owned one (two `Arc` clones and two drops per view), on
+    /// 1 thread then powers of 2 up to `RUSTCRAFT_THREADS` or every logical core, all threads
+    /// sharing the same counters as the server and client threads share the version data.
+    /// `cargo test --release -p rc-sim bench_block_view -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement bench"]
+    fn bench_block_view() {
+        let Some(data) = rc_testdata::need(rc_testdata::version_data(), "26.3 data cache") else { return };
+        let table = Arc::new(Table::new(&data));
+        let data = Arc::new(data);
+        let states = data.states.len() as u32;
+        let cores = rc_data::env_str!("RUSTCRAFT_THREADS")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get));
+        let mut threads = 1;
+        while threads <= cores {
+            let borrowed = ns_per_view(threads, states, |s| View { table: &table, data: &data }.random_ticks(s));
+            let counted = ns_per_view(threads, states, |s| {
+                let (table, data) = (Arc::clone(&table), Arc::clone(&data));
+                View { table: &table, data: &data }.random_ticks(s)
+            });
+            eprintln!(
+                "bench_block_view {threads} threads: borrowed {borrowed:.2} ns, counted {counted:.2} ns per view"
+            );
+            threads *= 2;
         }
     }
 }

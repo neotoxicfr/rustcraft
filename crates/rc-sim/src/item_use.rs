@@ -569,7 +569,7 @@ impl Server {
         let state = self.get(p);
         let block = self.state_name(state).to_owned();
         let props: Vec<(String, Vec<String>, usize)> = self
-            .v()
+            .view()
             .props_sorted(state)
             .into_iter()
             .map(|(n, vals, i)| (n.to_owned(), vals.to_vec(), i))
@@ -598,7 +598,7 @@ impl Server {
             let k = remembered.unwrap_or(0);
             let (name, vals, cur) = &props[k];
             let next = if back { previous_index(vals.len(), Some(*cur)) } else { (cur + 1) % vals.len() };
-            let ns = self.v().set(state, name, &vals[next]);
+            let ns = self.view().set(state, name, &vals[next]);
             self.set_block(p, ns, crate::blocks::flag::CLIENTS | crate::blocks::flag::KNOWN_SHAPE);
             let msg = Component::translate(
                 "item.minecraft.debug_stick.update",
@@ -916,7 +916,7 @@ impl Server {
                 return Some(false);
             }
             let clicked = self.get(pos);
-            let container = self.v().sim(clicked) & rc_data::sim_bits::LIQUID_CONTAINER != 0;
+            let container = self.view().sim(clicked) & rc_data::sim_bits::LIQUID_CONTAINER != 0;
             let place = if container && kind == 1 { pos } else { side };
             if self.bucket_empty(kind, place, Some(side)) {
                 self.trig_location("minecraft:placed_block", place, Some(&stack));
@@ -936,9 +936,9 @@ impl Server {
         let s = self.get(pos);
         let name = self.data.block_of(s).map(|b| b.name.clone()).unwrap_or_default();
         let f = self.fluid_of(s);
-        let taken = if self.v().has(s, "waterlogged") {
-            if self.v().get_bool(s, "waterlogged") {
-                let ns = self.v().set_bool(s, "waterlogged", false);
+        let taken = if self.view().has(s, "waterlogged") {
+            if self.view().get_bool(s, "waterlogged") {
+                let ns = self.view().set_bool(s, "waterlogged", false);
                 self.set_block(pos, ns, crate::blocks::flag::ALL);
                 if !self.can_survive(ns, pos) {
                     self.destroy_block(pos, true, 512);
@@ -958,7 +958,7 @@ impl Server {
         } else if name == "minecraft:powder_snow" {
             let air = self.default_state("minecraft:air");
             self.set_block(pos, air, crate::blocks::flag::ALL | 8);
-            if !self.v().is_air(s) {
+            if !self.view().is_air(s) {
                 self.level_event(2001, pos, s as i32);
             }
             Some(("minecraft:powder_snow_bucket", "minecraft:item.bucket.fill_powder_snow"))
@@ -984,7 +984,7 @@ impl Server {
     /// slot on the face hit when the aimed slot does not receive the fluid.
     fn bucket_empty(&mut self, kind: u8, p: [i32; 3], retry: Option<[i32; 3]>) -> bool {
         let s = self.get(p);
-        let v = self.v();
+        let v = self.view();
         let name = self.data.block_of(s).map(|b| b.name.clone()).unwrap_or_default();
         let portal = name == "minecraft:end_portal" || name == "minecraft:end_gateway";
         let may_replace = !portal && (v.replaceable(s) || !v.legacy_solid(s));
