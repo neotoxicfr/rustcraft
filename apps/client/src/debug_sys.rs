@@ -9,6 +9,18 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub static COUNT_ALLOCS: AtomicBool = AtomicBool::new(false);
 pub static ALLOCATED: AtomicU64 = AtomicU64::new(0);
 
+/// Benches: bytes allocated while `f` runs (counter of the whole process: run the bench alone,
+/// other threads would count too).
+#[cfg(test)]
+pub fn allocated_bytes(f: impl FnOnce()) -> u64 {
+    COUNT_ALLOCS.store(true, Ordering::Relaxed);
+    let before = ALLOCATED.load(Ordering::Relaxed);
+    f();
+    let after = ALLOCATED.load(Ordering::Relaxed);
+    COUNT_ALLOCS.store(false, Ordering::Relaxed);
+    after - before
+}
+
 /// Global allocator: mimalloc, plus the allocated-bytes counter when requested.
 #[cfg_attr(feature = "memstats", allow(dead_code))]
 pub struct Gated;
@@ -181,7 +193,8 @@ pub fn process_memory() -> (u64, u64) {
 }
 
 /// Index of `mi_option_page_commit_on_demand` in the `mi_option_t` enumeration of the linked
-/// library (libmimalloc-sys 0.1.49, mimalloc v3, `include/mimalloc.h`): to recheck on every bump.
+/// library (libmimalloc-sys 0.1.49, mimalloc v3, `include/mimalloc.h`): to recheck on every bump,
+/// together with its copy in the allocation bench (`crates/rc-worldgen/tests/sampler_opt.rs`).
 const MI_OPTION_PAGE_COMMIT_ON_DEMAND: i32 = 40;
 
 /// mimalloc pages committed on demand instead of entirely at creation (equivalent of

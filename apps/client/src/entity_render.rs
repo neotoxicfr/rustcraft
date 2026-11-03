@@ -42,6 +42,8 @@ mod tests_g2f03;
 mod tests_g2f05;
 #[cfg(test)]
 mod tests_c3m11;
+#[cfg(test)]
+mod tests_moving_block_tints;
 // Dragon effects, creaking tearing itself down (mission G4-F16a).
 #[cfg(test)]
 mod tests_g4f16a;
@@ -1950,6 +1952,9 @@ pub(crate) struct EntOpt {
     /// `REGIDX`: item registry found once; `ITEMFLAGS`: flags per item.
     pub reg_idx: bool,
     pub item_flags: bool,
+    /// `BLOCKTINTLAZY`: biome colours of a moving block (pushed, falling, transient) read only
+    /// when one of its drawn states has a biome-tinted layer.
+    pub block_tint_lazy: bool,
 }
 
 impl EntOpt {
@@ -1963,18 +1968,32 @@ impl EntOpt {
         light_once: false,
         reg_idx: false,
         item_flags: false,
+        block_tint_lazy: false,
     };
 
-    fn from_env() -> EntOpt {
-        let on = |v: Option<&str>| v != Some("0");
+    /// New paths everywhere.
+    #[cfg(test)]
+    pub const NEW: EntOpt = EntOpt {
+        equip_flag: true,
+        kind_info: true,
+        size_once: true,
+        obj_early: true,
+        light_once: true,
+        reg_idx: true,
+        item_flags: true,
+        block_tint_lazy: true,
+    };
+
+    pub(crate) fn from_env() -> EntOpt {
         EntOpt {
-            equip_flag: on(rc_data::env_str!("RUSTCRAFT_OPT_EQUIPFLAG")),
-            kind_info: on(rc_data::env_str!("RUSTCRAFT_OPT_KINDINFO")),
-            size_once: on(rc_data::env_str!("RUSTCRAFT_OPT_SIZEONCE")),
-            obj_early: on(rc_data::env_str!("RUSTCRAFT_OPT_OBJEARLY")),
-            light_once: on(rc_data::env_str!("RUSTCRAFT_OPT_LIGHTONCE")),
-            reg_idx: on(rc_data::env_str!("RUSTCRAFT_OPT_REGIDX")),
-            item_flags: on(rc_data::env_str!("RUSTCRAFT_OPT_ITEMFLAGS")),
+            equip_flag: rc_data::opt_switch!("RUSTCRAFT_OPT_EQUIPFLAG"),
+            kind_info: rc_data::opt_switch!("RUSTCRAFT_OPT_KINDINFO"),
+            size_once: rc_data::opt_switch!("RUSTCRAFT_OPT_SIZEONCE"),
+            obj_early: rc_data::opt_switch!("RUSTCRAFT_OPT_OBJEARLY"),
+            light_once: rc_data::opt_switch!("RUSTCRAFT_OPT_LIGHTONCE"),
+            reg_idx: rc_data::opt_switch!("RUSTCRAFT_OPT_REGIDX"),
+            item_flags: rc_data::opt_switch!("RUSTCRAFT_OPT_ITEMFLAGS"),
+            block_tint_lazy: rc_data::opt_switch!("RUSTCRAFT_OPT_BLOCKTINTLAZY"),
         }
     }
 }

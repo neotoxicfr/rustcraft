@@ -9,10 +9,10 @@ use rc_world::{Column, Container, Section};
 
 use super::*;
 
-const MIN_Y: i32 = -64;
-const HEIGHT: i32 = 384;
+pub(super) const MIN_Y: i32 = -64;
+pub(super) const HEIGHT: i32 = 384;
 
-struct States {
+pub(super) struct States {
     stone: u32,
     water: u32,
     lava: u32,
@@ -20,7 +20,7 @@ struct States {
     direct_bits: u8,
 }
 
-fn states(d: &rc_data::VersionData) -> States {
+pub(super) fn states(d: &rc_data::VersionData) -> States {
     let def = |n: &str| d.blocks.iter().find(|b| b.name == n).map(|b| b.default_state).expect(n);
     States {
         stone: def("minecraft:stone"),
@@ -49,7 +49,7 @@ fn block(s: &States, x: i32, y: i32, z: i32) -> u32 {
     0
 }
 
-fn column(s: &States, cx: i32, cz: i32, shift: u32) -> Column {
+pub(super) fn column(s: &States, cx: i32, cz: i32, shift: u32) -> Column {
     let sections: Vec<Section> = (0..HEIGHT / 16)
         .map(|si| {
             let mut v = vec![0u32; 4096];

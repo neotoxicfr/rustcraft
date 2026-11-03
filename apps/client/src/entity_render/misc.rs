@@ -4,11 +4,11 @@
 use glam::{Mat4, Vec3};
 
 use super::EntityRenderer;
-use super::objects::BlockTint;
 
 impl EntityRenderer {
     /// After `prepare` and the block entities: `(position, state)` blocks as world instances,
-    /// tinted with the biome colours of their position (`biome_tints`, like a falling block).
+    /// tinted with the biome colours of their position (`biome_tints`, like a falling block,
+    /// read only for a biome-tinted state).
     pub fn push_transient(
         &mut self,
         blocks: impl Iterator<Item = ([i32; 3], u32)>,
@@ -21,7 +21,7 @@ impl EntityRenderer {
             let corner = Vec3::new((p[0] - origin[0]) as f32, p[1] as f32, (p[2] - origin[1]) as f32);
             let (b, s) = light(p[0], p[1], p[2]);
             let packed = (u32::from(b) * 16) | ((u32::from(s) * 16) << 8);
-            let tint = BlockTint::World(biome_tints(p[0], p[1], p[2]));
+            let tint = self.world_tint(&[state], || biome_tints(p[0], p[1], p[2]));
             any |= self.push_block_tinted(state, Mat4::from_translation(corner), packed, 10 << 16, tint);
         }
         if any {

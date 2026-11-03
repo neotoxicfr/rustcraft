@@ -100,7 +100,7 @@ impl Server {
     /// Does block `s` stop the beam (opaque to light, except bedrock)?
     fn beam_stopper(&self, s: u32) -> bool {
         self.data.state(s).is_some_and(|i| i.light_dampening >= 15)
-            && self.v().block(s) != self.bs.t.block_id("bedrock")
+            && self.view().block(s) != self.bs.t.block_id("bedrock")
     }
 
     /// Block entity tick.
@@ -117,7 +117,7 @@ impl Server {
         let mut i = 0;
         while i < 10 && cy <= surface {
             let s = self.get([x, cy, z]);
-            if self.bs.t.beam.get(usize::from(self.v().block(s))).copied().unwrap_or(false) {
+            if self.bs.t.beam.get(usize::from(self.view().block(s))).copied().unwrap_or(false) {
                 b.checking = true;
             } else if !b.checking || self.beam_stopper(s) {
                 b.checking = false;
@@ -334,7 +334,7 @@ impl Server {
         match self.lan.as_ref().and_then(|l| l.active) {
             Some(i) => self.lan_kick(i, key),
             None => {
-                let _ = self.send(rc_client::Event::Kicked(rc_text::Component::translate(key, Vec::new())));
+                let _ = self.send(rc_client::Event::Kicked(Box::new(rc_text::Component::translate(key, Vec::new()))));
             }
         }
     }

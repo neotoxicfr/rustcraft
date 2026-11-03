@@ -54,6 +54,28 @@ switch!(
     sincos,
     "RUSTCRAFT_OPT_SINCOS"
 );
+switch!(
+    /// `jmath` products: exact error through Veltkamp's split instead of the library `fma` call
+    /// (used when the FMA instruction is absent or `RUSTCRAFT_OPT_TWO_PROD_FMA=0`).
+    two_prod_split,
+    "RUSTCRAFT_OPT_TWO_PROD_SPLIT"
+);
+switch!(
+    /// `jmath` products: bodies compiled for the FMA instruction, if the processor has it.
+    /// Both `TWO_PROD` switches at 0 restore the library call.
+    two_prod_fma,
+    "RUSTCRAFT_OPT_TWO_PROD_FMA"
+);
+switch!(
+    /// `jmath` sin or cos alone: only the Taylor series it returns, not both.
+    sincos_only_needed_series,
+    "RUSTCRAFT_OPT_SINCOS_ONE_SERIES"
+);
+switch!(
+    /// `jmath`: when both Taylor series are needed, they advance in the same loop.
+    sincos_interleaved_series,
+    "RUSTCRAFT_OPT_SINCOS_INTERLEAVED"
+);
 
 switch!(
     /// Volume evaluator: choices (range, interval, lerp) that compute each branch only on
@@ -75,6 +97,26 @@ pub fn vol_pool() -> bool {
     static S: LazyLock<bool> = LazyLock::new(|| opt_in("RUSTCRAFT_OPT_VOL_POOL"));
     *S
 }
+
+switch!(
+    /// Evaluator: a buffer taken from the context keeps its old values instead of being zeroed
+    /// (every caller writes the elements it reads).
+    take_without_zeroing,
+    "RUSTCRAFT_OPT_TAKE_WITHOUT_ZEROING"
+);
+switch!(
+    /// Evaluator: a buffer is taken from the smallest spare one that holds it, a new one is
+    /// allocated at a rounded size, and the spare buffers of a context are capped in bytes
+    /// (8 MB) instead of in count.
+    best_fit_buffers,
+    "RUSTCRAFT_OPT_BEST_FIT_BUFFERS"
+);
+switch!(
+    /// Terrain: each thread keeps its evaluation context (cache cells, spare buffers) from one
+    /// chunk to the next, reset at the start of each chunk, instead of a new one per chunk.
+    keep_eval_context,
+    "RUSTCRAFT_OPT_KEEP_EVAL_CONTEXT"
+);
 
 /// Spline: point coordinates kept on the stack, sampling without dynamic call.
 /// Off by default (`=1` enables it) until the quiet-machine bench (same figure as `vol_pool`).
@@ -237,6 +279,49 @@ switch!(
     /// Materials: column constants (bands, temperature) kept per column.
     mat_colcache,
     "RUSTCRAFT_OPT_MAT_COLCACHE"
+);
+switch!(
+    /// Surface: under the preliminary surface, cells decided per y band by a stateless kernel
+    /// (block, vein, vein then block, or the band's tree) instead of the column walk.
+    surface_band_kernels,
+    "RUSTCRAFT_OPT_SURFACE_BAND_KERNELS"
+);
+/// Surface: the "single block" bands under every column's preliminary surface rewritten layer by
+/// layer over the 256 columns (with the band kernels). Off by default (`=1` enables it) until the
+/// quiet-machine bench: no measurable gain over the column kernels on the loaded-machine
+/// micro-bench (grid 1.21-1.26 against 1.25-1.28 ms/chunk), and the column kernels are simpler.
+#[inline]
+pub fn surface_row_kernel() -> bool {
+    static S: LazyLock<bool> = LazyLock::new(|| opt_in("RUSTCRAFT_OPT_SURFACE_ROW_KERNEL"));
+    *S
+}
+switch!(
+    /// Surface: a plain solid replaced by a plain solid is written in place, without the height map
+    /// and section count updates that cannot change.
+    direct_solid_write,
+    "RUSTCRAFT_OPT_DIRECT_SOLID_WRITE"
+);
+switch!(
+    /// Vein pre-filling of the surface: rows above the highest solid of the chunk skipped.
+    vein_top_bound,
+    "RUSTCRAFT_OPT_VEIN_TOP_BOUND"
+);
+switch!(
+    /// Cave top material: biomes read from the chunks already computed around (the source only
+    /// outside them), instead of recomputing the climate at each call. Read by the caves step.
+    cave_top_from_chunk_biomes,
+    "RUSTCRAFT_OPT_CAVE_TOP_FROM_CHUNK_BIOMES"
+);
+switch!(
+    /// Cave top material: surface depth and preliminary surface of each column kept from the
+    /// surface step of the same chunk.
+    cave_top_column_memo,
+    "RUSTCRAFT_OPT_CAVE_TOP_COLUMN_MEMO"
+);
+switch!(
+    /// Block tables: "same block" compared by block identifier numbered at interning, not by name.
+    base_block_ids,
+    "RUSTCRAFT_OPT_BASE_BLOCK_IDS"
 );
 switch!(
     /// Lookups by name (tags, placed features) without allocated string: full name borrowed,
@@ -421,6 +506,58 @@ switch_f!(
     statetrans_fast,
     "STATETRANS_FAST"
 );
+
+// ---- State transformation tables (C1-M07). The proofs pass every combination explicitly.
+
+switch!(
+    /// State transformation tables: half and three-quarter turns composed from the quarter turn
+    /// table; mirrored stairs read the half-turn table instead of turning again.
+    compose_rotations,
+    "RUSTCRAFT_OPT_COMPOSE_ROTATIONS"
+);
+switch!(
+    /// State transformation tables: each block's property rules worked out once, then applied
+    /// to its states by value index (no text rewrite per state).
+    transforms_per_block,
+    "RUSTCRAFT_OPT_TRANSFORMS_PER_BLOCK"
+);
+switch!(
+    /// State transformation tables kept by the process once built: a world opened again reuses
+    /// them although its generation data are rebuilt.
+    keep_transforms,
+    "RUSTCRAFT_OPT_KEEP_TRANSFORMS"
+);
+
+/// State transformation tables built across the rayon pool, only `RUSTCRAFT_OPT_PARALLEL_TRANSFORMS=1`
+/// (off by default: the sequential build is already short, see `docs/perf.md`).
+pub fn parallel_transforms() -> bool {
+    static S: LazyLock<bool> =
+        LazyLock::new(|| rc_data::env_str!("RUSTCRAFT_OPT_PARALLEL_TRANSFORMS").is_some_and(|v| v.trim() == "1"));
+    *S
+}
+
+/// Where the state transformation tables of a world's templates are built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TablesThread {
+    /// On the spot, before the generator is ready (old path).
+    Inline,
+    /// On a dedicated background thread.
+    Dedicated,
+    /// As a task of the rayon pool (which the stronghold rings occupy at the same time).
+    RayonPool,
+}
+
+/// `RUSTCRAFT_OPT_TRANSFORMS_IN_BACKGROUND`: `0` inline, `rayon` pool task, otherwise a dedicated
+/// thread.
+pub fn transforms_in_background() -> TablesThread {
+    static S: LazyLock<TablesThread> =
+        LazyLock::new(|| match rc_data::env_str!("RUSTCRAFT_OPT_TRANSFORMS_IN_BACKGROUND").map(str::trim) {
+            Some("0") => TablesThread::Inline,
+            Some("rayon") => TablesThread::RayonPool,
+            _ => TablesThread::Dedicated,
+        });
+    *S
+}
 switch_f!(
     /// Height maps of a generated chunk: every map from a single walk down each column, started
     /// at the top of the highest slice of 16 that is not all plain air (L9-STRUCT).

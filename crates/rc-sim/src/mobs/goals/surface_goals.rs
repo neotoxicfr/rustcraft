@@ -860,8 +860,8 @@ impl Server {
             max: [p[0] + 1.0 + follow, p[1] + 1.0 + 10.0, p[2] + 1.0 + follow],
         };
         let Some((by, _)) = m.last_hurt_by_mob else { return };
-        for o in self.mobs.list.iter_mut().flatten() {
-            if o.kind == Kind::PolarBear && o.id != m.id && o.target.is_none() && o.touches(&area) && !o.is_baby() {
+        for o in self.mobs.of_kind_mut(Kind::PolarBear) {
+            if o.id != m.id && o.target.is_none() && o.touches(&area) && !o.is_baby() {
                 o.target = Some(by);
             }
         }

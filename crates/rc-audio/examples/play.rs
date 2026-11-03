@@ -36,12 +36,14 @@ fn main() {
     // Same seed for display and playback: same variant.
     let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as i64);
     let id = rc_audio::sounds::full_id(&name);
-    if let Some(r) = engine.table().pick(&id, &mut rc_audio::JavaRandom::new(seed)) {
+    // Indexed draw: the engine may have dropped the source table (`SOUND_TABLE_COMPILED_ONLY`).
+    if let Some(r) = engine.table().pick_fast(&id, &mut rc_audio::JavaRandom::new(seed)) {
+        let path = engine.table().file_path(r.file);
         let info = assets
-            .read(&r.path)
+            .read(path)
             .and_then(|b| rc_audio::decode::decode_all(b).ok())
             .map(|p| format!("{} channel(s), {} Hz, {:.2} s", p.channels, p.rate, p.seconds()));
-        println!("variant {} (stream: {}): {}", r.path, r.stream, info.unwrap_or_default());
+        println!("variant {path} (stream: {}): {}", r.stream, info.unwrap_or_default());
     }
     let Some(h) = engine.play(&name, Category::Master, pos, 1.0, pitch, Some(seed)) else {
         eprintln!("nothing to play for {name}");

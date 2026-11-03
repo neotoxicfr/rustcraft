@@ -9,7 +9,7 @@ use rc_text::StyledChar;
 use wgpu::util::DeviceExt;
 
 #[cfg(test)]
-mod tests_opt;
+pub(crate) mod tests_opt;
 pub mod text_objects;
 
 /// Entry of the visual-order cache: (text, direction), order, last frame drawn.
@@ -398,6 +398,23 @@ fn scale_for(max_scale: u32, width: u32, height: u32, unicode: bool) -> u32 {
     s
 }
 
+/// What a text flattened and measured for the interface depends on besides its component: the
+/// language (translations), the fonts (widths) and the bound keys (`keybind` components). A
+/// styled text kept with an equal context is the one that would be built again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextContext {
+    lang: u64,
+    fonts: usize,
+    keybinds: u64,
+}
+
+/// Next font identity: one counter for the process, so that an interface rebuilt after a resource
+/// reload never reuses the identity of the previous one (text caches outside the interface key on it).
+fn next_font_generation() -> usize {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Projected size of the interface: window ÷ scale, without rounding.
 fn projection_size(window_w: u32, window_h: u32, scale: u32) -> [f32; 2] {
     [window_w as f32 / scale as f32, window_h as f32 / scale as f32]
@@ -569,7 +586,7 @@ pub struct Gui {
     fonts: Vec<(String, Font)>,
     /// Rank of `minecraft:default` in `fonts`.
     default_font: Option<usize>,
-    /// Font set in place (changes with `set_fonts`: distinct glyph keys).
+    /// Font set in place (changes with `set_fonts`: distinct glyph keys), unique in the process.
     font_gen: usize,
     pub lang: rc_text::Lang,
     white: Glyph,
@@ -843,7 +860,7 @@ impl Gui {
             atlas_size,
             default_font: default_font(&assets.fonts),
             fonts: assets.fonts,
-            font_gen: 0,
+            font_gen: next_font_generation(),
             lang: assets.lang,
             white: Glyph::white(),
             missing: Glyph::missing(),
@@ -1434,8 +1451,18 @@ impl Gui {
     pub fn set_fonts(&mut self, fonts: Vec<(String, Font)>) {
         self.fonts = fonts;
         self.default_font = default_font(&self.fonts);
-        self.font_gen += 1;
+        self.font_gen = next_font_generation();
         self.glyph_gen += 1;
+    }
+
+    /// What a text flattened and measured for this interface depends on besides its component.
+    pub fn text_context(&self) -> TextContext {
+        TextContext { lang: self.lang.generation, fonts: self.font_gen, keybinds: rc_text::keybinds_generation() }
+    }
+
+    /// Changes at every font replacement: text widths kept by a caller are stale once it moves.
+    pub fn font_generation(&self) -> usize {
+        self.font_gen
     }
 
     fn font_index(&self, font: &str) -> Option<usize> {

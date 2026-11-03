@@ -203,7 +203,8 @@ fn plays(e: &mut AudioEngine, m: &mut Mixer) -> Vec<String> {
 #[test]
 fn reopen_keeps_table_and_cache() {
     let (mut e, mut m) = headless(Opt::NEW, "reopen");
-    let ev = e.table.get("minecraft:test.mono").unwrap() as *const crate::sounds::Event;
+    let mono = e.table.event_index("minecraft:test.mono").expect("event");
+    let ev = Arc::as_ptr(e.table.event_id(mono));
     let cache = e.cache.clone();
     let (len, bytes) = (e.cache_len(), e.cache_bytes());
     e.set_volume(Category::Block, 0.4);
@@ -211,7 +212,7 @@ fn reopen_keeps_table_and_cache() {
     m.process(&mut [0.0; 960]);
     let mut m2 = e.reopen_headless();
     assert_eq!(m.drain_log().first().map(String::as_str), Some("stop_all"), "old output stopped");
-    assert!(std::ptr::eq(ev, e.table.get("minecraft:test.mono").unwrap()), "table re-read");
+    assert!(std::ptr::eq(ev, Arc::as_ptr(e.table.event_id(mono))), "table re-read");
     assert!(Arc::ptr_eq(&cache, &e.cache), "cache replaced");
     assert_eq!((e.cache_len(), e.cache_bytes()), (len, bytes), "cache emptied");
     assert_eq!(e.active(), 0, "channels not released");
@@ -523,6 +524,11 @@ fn sound_ids_bit_exact() {
     assert_eq!(first, None, "first difference at sample {first:?}");
     assert_eq!(old.1, new.1, "subtitles");
     assert_eq!(old.2, new.2, "channels");
+    // Subtitle keys copied from the source table (C4-M29 old path) on the same launch path.
+    let copied = ids_run(Opt { subtitle_interned: false, ..Opt::NEW }, "ids-copied-subtitles");
+    assert_eq!(copied.0, new.0, "subtitle switch changed the output");
+    assert_eq!(copied.1, new.1, "subtitles");
+    assert_eq!(copied.2, new.2, "channels");
 }
 
 /// 26.3 game table, all events, reserves saturated then released: same handles,

@@ -99,6 +99,8 @@ mod tests_g5f02e; // G5-F02e: contacts with crossed blocks, enchanted boots
 mod thorns; // G5-F02d: player thorns
 mod tests_g5f02d;
 mod tests_g5f05; // G5-F05: orbs, ground items, displays, interaction, marker
+#[cfg(test)]
+mod tests_kept_entity_chunks; // kept compounds: dirty chunk on change, refiled on chunk change
 mod ench_fx; // G5-F04: enchantment effects (protection, armor effectiveness, after-hit effects)
 mod mace; // G5-F04: smash attack
 #[cfg(test)]
@@ -130,8 +132,9 @@ pub use server::{Handle, Options, start};
 
 /// Tests on the game's allocator (mimalloc, that of `rc-app`). With Windows' system heap,
 /// the simultaneous server openings of the suite (unpacked jar, generation) stalled the
-/// whole process for tens of seconds, processor almost idle.
-#[cfg(test)]
+/// whole process for tens of seconds, processor almost idle. Feature `memstats`: the same
+/// allocator behind an allocation counter (`bench_kit`).
+#[cfg(all(test, not(feature = "memstats")))]
 #[global_allocator]
 static TEST_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -185,6 +188,12 @@ mod tests_l9tick; // L9-TICK: pearl and fight tickets, state kept with its dimen
 mod tests_l10order; // L10-ORDER: one entity walk, every kind in the order of arrival
 #[cfg(test)]
 mod bench_l10order; // L10-ORDER: server tick with 1,000 entities of five families
+#[cfg(test)]
+mod bench_kit; // common kit of the micro-benches: flat world, perf pack, timed ticks, `[bench]` lines
+#[cfg(test)]
+mod bench_datapack_tick; // tick of the bench's `datapack` scene (crowd, #tick workload, command blocks)
+#[cfg(test)]
+mod tests_perf_pack; // the scene bench's `perf` data pack compiles with our command parser
 #[cfg(test)]
 mod tests_g4f08; // G4-F08: shulker push, TNT, sulfur cube, creaking, warden, smaller mob gaps
 #[cfg(test)]

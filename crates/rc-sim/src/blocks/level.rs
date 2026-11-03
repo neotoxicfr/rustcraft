@@ -220,18 +220,29 @@ fn scan_palette() -> bool {
     *ON.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_SCAN_PALETTE") != Some("0"))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Block views made on this thread: `bench_ticks` prints them per tick, what the former
+    /// counted view cost is multiplied by.
+    pub(crate) static VIEWS_MADE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl Server {
+    /// Block view of the server: two borrowed references, free to make (no reference counting).
+    /// A view held across a `&mut self` call is made again after it.
     #[inline]
-    pub(crate) fn v(&self) -> View {
-        View { t: self.bs.t.clone(), d: self.data.clone() }
+    pub(crate) fn view(&self) -> View<'_> {
+        #[cfg(test)]
+        VIEWS_MADE.with(|n| n.set(n.get() + 1));
+        View { table: &self.bs.t, data: &self.data }
     }
 
-    pub(crate) fn tb(&self) -> Arc<Table> {
-        self.bs.t.clone()
+    #[inline]
+    pub(crate) fn table(&self) -> &Table {
+        &self.bs.t
     }
 
-    /// Block of a state, like `v().block(s)` without copying the view (two atomic counters): for
-    /// loops that read many cells.
+    /// Block of a state, same as `view().block(s)`: for loops that read many cells.
     #[inline]
     pub(crate) fn state_block(&self, s: u32) -> u16 {
         self.data.states.get(s as usize).map_or(u16::MAX, |i| i.block)
@@ -249,7 +260,7 @@ impl Server {
     #[inline]
     pub(crate) fn get(&self, p: P) -> u32 {
         crate::play::block_at(&self.chunks, self.dim.height.min_y, p)
-            .unwrap_or_else(|| self.v().default_state(self.bs.t.id.void_air))
+            .unwrap_or_else(|| self.view().default_state(self.bs.t.id.void_air))
     }
 
     /// Cells of the box `min..=max` (inclusive corners) whose state satisfies `pred`, in the
@@ -294,7 +305,7 @@ impl Server {
     /// vines and mushrooms).
     pub(crate) fn at_most_in_box(&self, p: P, lo: P, hi: P, b: u16, n: usize) -> bool {
         let mut seen = 0;
-        let v = self.v();
+        let v = self.view();
         let min = [p[0] + lo[0], p[1] + lo[1], p[2] + lo[2]];
         let max = [p[0] + hi[0], p[1] + hi[1], p[2] + hi[2]];
         !self.scan_box(min, max, |s| v.block(s) == b, |_, _| {
@@ -323,8 +334,8 @@ impl Server {
     }
 
     pub(crate) fn fluid_of(&self, s: u32) -> Fluid {
-        // Called several times per block in fluid ticks: neither a copy of the view (two
-        // atomic counters) nor a name comparison, the type comes from the table.
+        // Called several times per block in fluid ticks: no name comparison, the type comes
+        // from the table.
         let info = self.data.states.get(s as usize).copied().unwrap_or_default();
         let kind = self.bs.t.fluid_kind.get(info.fluid as usize).copied().unwrap_or(0);
         if kind == 0 {
@@ -345,7 +356,7 @@ impl Server {
     /// Liquid block of a fluid state, air if empty.
     pub(crate) fn legacy_block(&self, f: Fluid) -> u32 {
         let t = &self.bs.t;
-        let v = self.v();
+        let v = self.view();
         match f.kind {
             1 | 2 => {
                 let b = if f.kind == 1 { t.id.water } else { t.id.lava };
@@ -441,7 +452,7 @@ impl Server {
             return false;
         }
         let Some(old) = self.write_raw(p, state) else { return false };
-        let v = self.v();
+        let v = self.view();
         let (ob, nb) = (v.block(old), v.block(state));
         let block_changed = ob != nb;
         let moved = flags & flag::MOVED != 0;
@@ -453,37 +464,37 @@ impl Server {
                 // F14: creaking heart, shrieker.
                 self.rec_pre_remove(p, old);
                 // G6-F01: disc, book, pot item given back.
-                match self.v().kind(old) {
+                match self.view().kind(old) {
                     Kind::Jukebox => self.jukebox_pre_remove(p, old),
                     Kind::Lectern => self.lectern_pre_remove(p, old),
                     Kind::DecoratedPot => self.pot_pre_remove(p),
                     _ => {}
                 }
-            } else if self.v().kind(old) == Kind::Jukebox {
+            } else if self.view().kind(old) == Kind::Jukebox {
                 // The removal of the entity happens even without removal effects.
                 self.bs.be_ticks.remove(&p);
                 self.game_event_block("minecraft:jukebox_stop_play", p, None, Some(old));
                 self.level_event(1011, p, 0);
             }
             // G5-F11: the removed beacon turns off (sound), with or without removal effects.
-            if self.v().kind(old) == Kind::Beacon {
+            if self.view().kind(old) == Kind::Beacon {
                 self.beacon_removed(p);
             }
             self.remove_block_entity(p);
         }
-        let new_kind = self.v().kind(state);
+        let new_kind = self.view().kind(state);
         if (block_changed || matches!(new_kind, Kind::Rail | Kind::PoweredRail | Kind::DetectorRail))
             && (flags & flag::NEIGHBORS != 0 || moved)
         {
             self.affect_after_removal(old, p, moved);
         }
-        if self.v().block(self.get(p)) != nb {
+        if self.view().block(self.get(p)) != nb {
             return false;
         }
         if flags & flag::SKIP_ON_PLACE == 0 {
             self.on_place(state, p, old, moved);
         }
-        if self.v().has_block_entity(state) && self.v().block(self.get(p)) == nb {
+        if self.view().has_block_entity(state) && self.view().block(self.get(p)) == nb {
             self.ensure_block_entity(p, state);
             // G6-F01: jukebox ticker according to `has_record`.
             if new_kind == Kind::Jukebox && self.get(p) == state {
@@ -500,7 +511,7 @@ impl Server {
             }
             if flags & flag::NEIGHBORS != 0 {
                 self.update_neighbors_at(p, ob);
-                if self.v().has_analog(state) {
+                if self.view().has_analog(state) {
                     self.update_neighbour_for_output_signal(p, nb);
                 }
             }
@@ -550,12 +561,12 @@ impl Server {
         by: Option<crate::mobs::recent::vibration::Src>,
     ) -> bool {
         let state = self.get(p);
-        if self.v().is_air(state) {
+        if self.view().is_air(state) {
             return false;
         }
         // Break particles; the straw bed has its own, without sound (2014); fire (and soul fire)
         // breaks with no effect at all.
-        let fire = [self.bs.t.id.fire, self.bs.t.id.soul_fire].contains(&self.v().block(state));
+        let fire = [self.bs.t.id.fire, self.bs.t.id.soul_fire].contains(&self.view().block(state));
         if !fire {
             let straw = self.data.block_of(state).is_some_and(|b| b.name == "minecraft:straw_bed");
             self.level_event(if straw { 2014 } else { 2001 }, p, state as i32);
@@ -600,7 +611,7 @@ impl Server {
             _ => return false,
         };
         let name = self.state_name(state);
-        let id = u32::from(self.v().block(state));
+        let id = u32::from(self.view().block(state));
         let hit = |k: &str| match k.strip_prefix('#') {
             Some(tag) => self
                 .block_tags
@@ -742,7 +753,7 @@ impl Server {
     /// The update of a block or its destruction.
     pub(crate) fn update_or_destroy(&mut self, old: u32, new: u32, p: P, flags: u32, limit: i32) {
         if new != old {
-            if self.v().is_air(new) {
+            if self.view().is_air(new) {
                 self.destroy_block(p, flags & flag::NO_DROPS == 0, limit);
             } else {
                 self.set_block_limit(p, new, flags & !flag::NO_DROPS, limit);
@@ -838,7 +849,7 @@ impl Server {
 
     fn execute_shape_update(&mut self, dir: Dir, pos: P, npos: P, nstate: u32, flags: u32, limit: i32) {
         let cur = self.get(pos);
-        if flags & flag::SKIP_WIRE_SHAPE != 0 && self.v().kind(cur) == Kind::Wire {
+        if flags & flag::SKIP_WIRE_SHAPE != 0 && self.view().kind(cur) == Kind::Wire {
             return;
         }
         let new = self.update_shape(cur, pos, dir, npos, nstate);
@@ -881,7 +892,7 @@ impl Server {
 
     /// "Indirect" shapes (only dust has them, § 3.3).
     pub(crate) fn update_indirect_shapes(&mut self, state: u32, p: P, flags: u32, limit: i32) {
-        if self.v().kind(state) == Kind::Wire {
+        if self.view().kind(state) == Kind::Wire {
             self.wire_indirect_shapes(state, p, flags, limit);
         }
     }
@@ -894,12 +905,12 @@ impl Server {
                 continue;
             }
             let s = self.get(q);
-            if self.v().kind(s) == Kind::Comparator {
+            if self.view().kind(s) == Kind::Comparator {
                 self.neighbor_changed_full(s, q, block, false);
-            } else if self.v().conductor(s) {
+            } else if self.view().conductor(s) {
                 q = rel(q, d);
                 let s = self.get(q);
-                if self.v().kind(s) == Kind::Comparator {
+                if self.view().kind(s) == Kind::Comparator {
                     self.neighbor_changed_full(s, q, block, false);
                 }
             }
@@ -949,7 +960,7 @@ impl Server {
 
     /// Creates the block entity of a new state if missing (minimal NBT).
     fn ensure_block_entity(&mut self, p: P, state: u32) {
-        if self.be_index(p).is_some() || self.v().kind(state) == Kind::MovingPiston {
+        if self.be_index(p).is_some() || self.view().kind(state) == Kind::MovingPiston {
             return;
         }
         let name = self.data.block_of(state).map(|b| b.name.clone()).unwrap_or_default();
@@ -1040,7 +1051,7 @@ impl Server {
     // --- Dispatch. ---
 
     pub(crate) fn on_place(&mut self, state: u32, p: P, old: u32, moved: bool) {
-        let v = self.v();
+        let v = self.view();
         let same_block = v.block(old) == v.block(state);
         if !same_block && self.state_name(state) == "minecraft:sponge" {
             self.sponge_absorb(p);
@@ -1105,8 +1116,8 @@ impl Server {
             // Frosted ice: melt scheduled at each placement (age included), 60 to 120 ticks; the
             // shorter delay drawn afterwards by its tick is then ignored (26.3).
             Kind::FrostedIce => {
-                let delay = 60 + self.bs.rng.next_int_bound(61);
                 let b = v.block(state);
+                let delay = 60 + self.bs.rng.next_int_bound(61);
                 self.schedule_tick(p, b, delay);
             }
             // Lit target placed without a scheduled tick (command, structure): turned off (flags 18).
@@ -1147,7 +1158,7 @@ impl Server {
     }
 
     pub(crate) fn affect_after_removal(&mut self, old: u32, p: P, moved: bool) {
-        let v = self.v();
+        let v = self.view();
         match v.kind(old) {
             Kind::Wire => {
                 if !moved {
@@ -1199,6 +1210,7 @@ impl Server {
             _ if self.sensor_after_removal(old, p) => {} // G6-F10: active sensor removed
             _ if self.lightning_rod_removed(old, p) => {} // powered lightning rod removed
             _ => {
+                let v = self.view();
                 if v.has_analog(old) && v.has_block_entity(old) {
                     self.update_neighbour_for_output_signal(p, v.block(old));
                 }
@@ -1211,7 +1223,7 @@ impl Server {
             self.sponge_absorb(p);
             return;
         }
-        let v = self.v();
+        let v = self.view();
         match v.kind(state) {
             Kind::Wire => self.wire_neighbor_changed(state, p),
             Kind::Repeater | Kind::Comparator => self.diode_neighbor_changed(state, p),
@@ -1237,7 +1249,7 @@ impl Server {
             // frosted neighbours remain.
             Kind::FrostedIce if from == v.block(state) => {
                 let b = v.block(state);
-                let near = Dir::ALL.iter().filter(|&&d| self.v().block(self.get(rel(p, d))) == b).count();
+                let near = Dir::ALL.iter().filter(|&&d| self.view().block(self.get(rel(p, d))) == b).count();
                 if near < 2 {
                     self.frosted_ice_melt(p);
                 }
@@ -1250,7 +1262,7 @@ impl Server {
                     if signal {
                         self.bell_attempt_ring(p, None, None);
                     }
-                    let ns = self.v().set_bool(state, "powered", signal);
+                    let ns = self.view().set_bool(state, "powered", signal);
                     self.set_update(p, ns);
                 }
             }
@@ -1258,7 +1270,7 @@ impl Server {
             Kind::Skull => {
                 let signal = self.has_neighbor_signal(p);
                 if v.has(state, "powered") && signal != v.get_bool(state, "powered") {
-                    let ns = self.v().set_bool(state, "powered", signal);
+                    let ns = self.view().set_bool(state, "powered", signal);
                     self.set_block(p, ns, flag::CLIENTS);
                 }
             }
@@ -1273,7 +1285,7 @@ impl Server {
     }
 
     pub(crate) fn tick_block(&mut self, state: u32, p: P) {
-        let v = self.v();
+        let v = self.view();
         match v.kind(state) {
             Kind::Repeater => self.diode_tick(state, p),
             Kind::Comparator => self.comparator_refresh(p, state),
@@ -1324,7 +1336,7 @@ impl Server {
     }
 
     pub(crate) fn trigger_event(&mut self, state: u32, p: P, a: i32, b: i32) -> bool {
-        match self.v().kind(state) {
+        match self.view().kind(state) {
             Kind::Piston { sticky } => self.piston_trigger(state, p, a, b, sticky),
             // Bell: survey of nearby entities, shake (resonance at the next tick).
             Kind::Bell => {
@@ -1356,8 +1368,8 @@ impl Server {
     /// Reaction of a block to a shape update: new state (air = destroyed).
     pub(crate) fn update_shape(&mut self, state: u32, p: P, dir: Dir, np: P, ns: u32) -> u32 {
         // Waterlogged blocks: water tick at each shape (except the water block itself).
-        let kind = self.v().kind(state);
-        if !matches!(kind, Kind::Water | Kind::Lava) && self.v().get_bool(state, "waterlogged") {
+        let kind = self.view().kind(state);
+        if !matches!(kind, Kind::Water | Kind::Lava) && self.view().get_bool(state, "waterlogged") {
             self.schedule_fluid_tick(p, 1, 5);
         }
         if let Some(s) = self.portal_update_shape(state, p, dir, ns) {
@@ -1366,10 +1378,10 @@ impl Server {
         self.rec_update_shape(state, p); // F14: creaking heart
         // Grass, podzol, mycelium: snowy according to the block above (tag `snow`).
         if dir == Dir::Up && self.snowy_block(state) {
-            let snowy = self.v().block(ns);
+            let snowy = self.view().block(ns);
             let snowy =
                 self.block_tags.get("minecraft:snow").is_some_and(|t| t.binary_search(&u32::from(snowy)).is_ok());
-            return self.v().set_bool(state, "snowy", snowy);
+            return self.view().set_bool(state, "snowy", snowy);
         }
         self.shape_of(state, kind, p, dir, np, ns)
     }

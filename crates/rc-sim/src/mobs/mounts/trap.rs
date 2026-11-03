@@ -304,10 +304,10 @@ impl Server {
         if !self.bname(p).ends_with("lightning_rod") {
             return;
         }
-        let ns = self.v().set_bool(s, "powered", true);
+        let ns = self.view().set_bool(s, "powered", true);
         self.set_update(p, ns);
-        let facing = self.v().facing(s);
-        let block = self.v().block(s);
+        let facing = self.view().facing(s);
+        let block = self.view().block(s);
         self.update_neighbors_at(crate::blocks::rel(p, facing.opposite()), block);
         self.schedule_tick(p, block, 8);
         self.level_event(3002, p, i32::from(facing.axis()));
@@ -318,10 +318,10 @@ impl Server {
         if !self.state_name(s).ends_with("lightning_rod") {
             return false;
         }
-        let ns = self.v().set_bool(s, "powered", false);
+        let ns = self.view().set_bool(s, "powered", false);
         self.set_update(p, ns);
-        let facing = self.v().facing(s);
-        let block = self.v().block(s);
+        let facing = self.view().facing(s);
+        let block = self.view().block(s);
         self.update_neighbors_at(crate::blocks::rel(p, facing.opposite()), block);
         true
     }
@@ -329,11 +329,11 @@ impl Server {
     /// Lightning rod placed (block other than before) already powered, without a scheduled extinguish for
     /// it: extinguishing in 8 ticks.
     pub(crate) fn lightning_rod_on_place(&mut self, s: u32, p: [i32; 3], old: u32) {
-        let block = self.v().block(s);
-        if block == self.v().block(old) || !self.state_name(s).ends_with("lightning_rod") {
+        let block = self.view().block(s);
+        if block == self.view().block(old) || !self.state_name(s).ends_with("lightning_rod") {
             return;
         }
-        if self.v().get_bool(s, "powered") && !self.has_scheduled_tick(p, block) {
+        if self.view().get_bool(s, "powered") && !self.has_scheduled_tick(p, block) {
             self.schedule_tick(p, block, 8);
         }
     }
@@ -343,9 +343,9 @@ impl Server {
         if !self.state_name(old).ends_with("lightning_rod") {
             return false;
         }
-        if self.v().get_bool(old, "powered") {
-            let facing = self.v().facing(old);
-            let block = self.v().block(old);
+        if self.view().get_bool(old, "powered") {
+            let facing = self.view().facing(old);
+            let block = self.view().block(old);
             self.update_neighbors_at(crate::blocks::rel(p, facing.opposite()), block);
         }
         true
@@ -411,7 +411,7 @@ impl Server {
         if id == u16::MAX {
             return None;
         }
-        let first = self.data.blocks[self.v().block(s) as usize].first_state;
+        let first = self.data.blocks[self.view().block(s) as usize].first_state;
         Some(self.data.blocks[id as usize].first_state + (s - first))
     }
 

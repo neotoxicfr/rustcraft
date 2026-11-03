@@ -122,7 +122,7 @@ pub fn look_control(m: &mut Mob) {
 impl Server {
     /// Full face of a state in a direction (collision shape).
     fn face_full(&self, s: u32, d: Dir) -> bool {
-        let info = self.v().info(s);
+        let info = self.view().info(s);
         let m = self.bs.t.face_masks.get(info.collision as usize).map_or([0; 4], |m| m[d as usize]);
         m.iter().all(|&w| w == u64::MAX)
     }
@@ -299,7 +299,7 @@ impl Server {
             let Some(d) = self.shulker_attachable(m, t) else { continue };
             let s = step(d);
             let support = [t[0] + s[0], t[1] + s[1], t[2] + s[2]];
-            if self.tag_id(crate::tag_bits::TagId::ShulkerDoesNotTeleportTo, self.v().block(self.get(support))) {
+            if self.tag_id(crate::tag_bits::TagId::ShulkerDoesNotTeleportTo, self.view().block(self.get(support))) {
                 continue;
             }
             m.mount.vehicle = None;

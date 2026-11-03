@@ -668,7 +668,7 @@ impl Server {
                 let s = self.st(home);
                 closer_center(home, m.pos, 2.0)
                     && self.btag_id(home, crate::tag_bits::TagId::VillagersCanSleepOnBed)
-                    && !self.v().get_bool(s, "occupied")
+                    && !self.view().get_bool(s, "occupied")
             }
             Beh::TradeWithVillager { .. } => self.target_valid(m, b, b.mem.interaction),
             Beh::MakeLove { .. } => self.breeding_possible(m, b),
@@ -1688,7 +1688,7 @@ impl Server {
             "minecraft:torchflower_crop" => 2,
             _ => return None,
         };
-        Some((self.v().get_int(s, "age"), max))
+        Some((self.view().get_int(s, "age"), max))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1714,7 +1714,7 @@ impl Server {
             if crop.is_some_and(|(a, max)| a >= max) {
                 self.villager_destroy_block(m, p);
             }
-            if self.v().is_air(s) && below && self.npc_has_plantable(m) {
+            if self.view().is_air(s) && below && self.npc_has_plantable(m) {
                 self.plant_seed(m, p);
             }
             if crop.is_some_and(|(a, max)| a < max) {
@@ -1773,7 +1773,7 @@ impl Server {
 
     fn bed_occupied(&self, p: [i32; 3]) -> bool {
         let s = self.st(p);
-        self.btag_id(p, crate::tag_bits::TagId::VillagersCanSleepOnBed) && self.v().get_bool(s, "occupied")
+        self.btag_id(p, crate::tag_bits::TagId::VillagersCanSleepOnBed) && self.view().get_bool(s, "occupied")
     }
 
     fn villager_sleeping_at(&self, p: [i32; 3]) -> bool {
@@ -1896,7 +1896,9 @@ impl Server {
         for r in list {
             if kind == Acq::Home {
                 let s = self.st(r.pos);
-                if !(self.btag_id(r.pos, crate::tag_bits::TagId::VillagersCanSleepOnBed) && !self.v().get_bool(s, "occupied")) {
+                if !(self.btag_id(r.pos, crate::tag_bits::TagId::VillagersCanSleepOnBed)
+                    && !self.view().get_bool(s, "occupied"))
+                {
                     continue;
                 }
             }
@@ -2159,17 +2161,17 @@ impl Server {
 
     pub(crate) fn set_door_open(&mut self, p: [i32; 3], open: bool, by: i32) {
         let s = self.st(p);
-        if self.v().get_bool(s, "open") == open {
+        if self.view().get_bool(s, "open") == open {
             return;
         }
-        let ns = self.v().set_bool(s, "open", open);
+        let ns = self.view().set_bool(s, "open", open);
         let name = self.state_name(s).to_owned();
         self.set_block(p, ns, 10);
         let other =
-            if self.v().get(s, "half") == Some("lower") { [p[0], p[1] + 1, p[2]] } else { [p[0], p[1] - 1, p[2]] };
+            if self.view().get(s, "half") == Some("lower") { [p[0], p[1] + 1, p[2]] } else { [p[0], p[1] - 1, p[2]] };
         let os = self.st(other);
         if self.state_name(os) == name {
-            let ons = self.v().set_bool(os, "open", open);
+            let ons = self.view().set_bool(os, "open", open);
             self.set_block(other, ons, 10);
         }
         // Sound for everyone and event attributed to the mob that opens.
@@ -2217,7 +2219,7 @@ impl Server {
                 d.push(from);
             }
         }
-        if self.is_mob_door(next) && !self.v().get_bool(self.st(next), "open") {
+        if self.is_mob_door(next) && !self.view().get_bool(self.st(next), "open") {
             self.set_door_open(next, true, m.id);
             let d = doors.get_or_insert_with(Vec::new);
             if !d.contains(&next) {
@@ -2253,7 +2255,7 @@ impl Server {
                 keep.push(d);
                 continue;
             }
-            if !closer_center(d, m.pos, 3.0) || !self.is_mob_door(d) || !self.v().get_bool(self.st(d), "open") {
+            if !closer_center(d, m.pos, 3.0) || !self.is_mob_door(d) || !self.view().get_bool(self.st(d), "open") {
                 continue;
             }
             let crossing = |o: &Mob| {
@@ -2289,7 +2291,7 @@ impl Server {
             Some("west") => 4,
             _ => 5,
         };
-        let blk = self.v().block(s);
+        let blk = self.view().block(s);
         self.block_event(p, blk, 1, dir);
         let c = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
         self.play_sound("minecraft:block.bell.use", 4, c, 2.0, 1.0);

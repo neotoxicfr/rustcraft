@@ -257,7 +257,7 @@ impl Server {
         self.bs.block_ticks.collect(now, 65536, ticking);
         while let Some(t) = self.bs.block_ticks.pop_next() {
             let s = self.get(t.pos);
-            if u32::from(self.v().block(s)) == t.kind {
+            if u32::from(self.view().block(s)) == t.kind {
                 self.tick_block(s, t.pos);
             }
         }
@@ -343,7 +343,7 @@ impl Server {
             for _ in 0..speed {
                 let p = self.random_pos(x0, y0, z0);
                 let s = self.get(p);
-                if self.v().random_ticks(s) {
+                if self.view().random_ticks(s) {
                     self.random_tick(s, p);
                 }
                 let f = self.fluid_of(s);
@@ -361,7 +361,7 @@ impl Server {
         }
         let Some(Some(c)) = self.chunks.get(&(cx, cz)) else { return false };
         let Some(sec) = c.sections.get(si) else { return false };
-        let v = self.v();
+        let v = self.view();
         let b = sec.non_empty != 0
             && (0..4096).any(|i| {
                 let s = sec.blocks.get(i);
@@ -379,7 +379,7 @@ impl Server {
             self.bs.event_set.remove(&e);
             if self.ticking_at(e.pos) {
                 let s = self.get(e.pos);
-                if self.v().block(s) == e.block && self.trigger_event(s, e.pos, e.a, e.b) {
+                if self.view().block(s) == e.block && self.trigger_event(s, e.pos, e.a, e.b) {
                     let _ = self.send(rc_client::Event::BlockEvent {
                         pos: e.pos,
                         b0: e.a as u8,
@@ -533,7 +533,7 @@ impl Server {
     fn tick_ticker(&mut self, id: u64, p: P) {
         if self.bs.movers.get(&p).is_some_and(|m| m.id == id) {
             let s = self.get(p);
-            if self.v().kind(s) == super::Kind::MovingPiston {
+            if self.view().kind(s) == super::Kind::MovingPiston {
                 self.mover_tick(p);
             }
         } else if self.hive_is_ticker(id, p) {

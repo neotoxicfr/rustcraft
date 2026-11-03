@@ -140,7 +140,7 @@ fn wireside_matches_full_state() {
         s.write_raw(c, st);
         s.relight.clear();
         let st = s.get(c);
-        assert_eq!(s.v().block(st), s.bs.t.id.wire);
+        assert_eq!(s.view().block(st), s.bs.t.id.wire);
         let is_dot = s.wire_is_dot(st);
         for t in Dir::HORIZONTAL {
             let want = old_answer(&s, st, c, t);
@@ -151,7 +151,7 @@ fn wireside_matches_full_state() {
                 dots += 1;
             }
             // Side connected only by the line extension (no own neighbour on that side).
-            let can_up = !s.v().conductor(s.get(above(c)));
+            let can_up = !s.view().conductor(s.get(above(c)));
             if want && !s.wire_side(c, t, can_up).connected() {
                 ext += 1;
             }
@@ -161,7 +161,7 @@ fn wireside_matches_full_state() {
             let old = if !s.bs.wire_signal || d == Dir::Down {
                 0
             } else {
-                let power = s.v().get_int(st, "power");
+                let power = s.view().get_int(st, "power");
                 if power == 0 || (d != Dir::Up && !old_answer(&s, st, c, d.opposite())) { 0 } else { power }
             };
             assert_eq!(new, old, "weak signal {d:?}, state {st}");
@@ -210,7 +210,7 @@ fn wireside_bench_calls() {
     for i in 0..=21 {
         for dz in -1..=1 {
             let p = [o[0] + i, o[1], o[2] + dz];
-            if s.v().block(s.get(p)) == wire {
+            if s.view().block(s.get(p)) == wire {
                 cells.push((s.get(p), p));
             }
         }
@@ -259,7 +259,7 @@ fn wireside_bench_toggle() {
         if k == 0 {
             s.set_block(o, rb, flag::ALL);
             for i in 1..=15 {
-                assert_eq!(s.v().get_int(s.get([o[0] + i, o[1], o[2]]), "power"), 16 - i, "dust {i}");
+                assert_eq!(s.view().get_int(s.get([o[0] + i, o[1], o[2]]), "power"), 16 - i, "dust {i}");
             }
             s.set_block(o, s.air(), flag::ALL);
         }

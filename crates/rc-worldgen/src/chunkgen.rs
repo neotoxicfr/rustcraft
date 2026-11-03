@@ -45,7 +45,8 @@ impl WorldData {
         }
         let decor = DecorData::from_jar(jar)?;
         let blocks = Arc::new(Blocks::new(v, &decor)?);
-        let templates = Arc::new(crate::template::Templates::new(decor.files_of("template"), &blocks));
+        let templates =
+            Arc::new(crate::template::Templates::for_world(decor.files_of("template"), &blocks, blocks_key(jar, v)));
         Ok(WorldData { pack: Arc::new(pack), decor, blocks, templates })
     }
 
@@ -80,6 +81,13 @@ impl WorldData {
         c.push((key, Arc::downgrade(&wd)));
         Ok(wd)
     }
+}
+
+/// Names what the blocks of the generation data come from (jar and game version): the key of the
+/// state tables the process keeps (`RUSTCRAFT_OPT_KEEP_TRANSFORMS`).
+fn blocks_key(jar: &Path, v: &rc_data::VersionData) -> String {
+    let jar = std::fs::canonicalize(jar).unwrap_or_else(|_| jar.to_path_buf());
+    format!("{}|{}|{}|{}", jar.display(), v.version, v.states.len(), v.blocks.len())
 }
 
 /// Generator of a dimension as described by the world settings.

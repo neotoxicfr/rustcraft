@@ -89,8 +89,8 @@ impl Server {
 
     /// The replacement test of a state for a given item.
     pub(crate) fn replaceable_by(&self, s: u32, ctx_item: &str, replacing_clicked: bool, face: Dir, upper: bool) -> bool {
-        let v = self.v();
-        let block_name = v.d.block_of(s).map_or("", |b| b.name.as_str());
+        let v = self.view();
+        let block_name = v.data.block_of(s).map_or("", |b| b.name.as_str());
         match v.kind(s) {
             Kind::Slab => {
                 let t = v.get(s, "type").unwrap_or("bottom");
@@ -224,7 +224,7 @@ impl Server {
             return true;
         }
         let may_build = self.game_mode != 2;
-        let v = self.v();
+        let v = self.view();
         match v.kind(s) {
             Kind::Lever => {
                 self.lever_pull(p, s);
@@ -245,7 +245,7 @@ impl Server {
             Kind::Wire if may_build => self.wire_use(s, p),
             Kind::Door { .. } | Kind::Trapdoor { .. } | Kind::FenceGate => self.openable_use(p, s),
             Kind::NoteBlock => {
-                let ns = self.v().cycle(s, "note");
+                let ns = self.view().cycle(s, "note");
                 self.set_block(p, ns, flag::ALL);
                 self.note_play(p, ns, Some(crate::mobs::mob::Ent::Player));
                 self.award_stat("minecraft:custom", "minecraft:tune_noteblock", 1); // G6-F01
@@ -253,7 +253,7 @@ impl Server {
             }
             // Inversion: flag 2, `block_change` event, signal recomputed at once.
             Kind::DaylightDetector if may_build => {
-                let ns = self.v().cycle(s, "inverted");
+                let ns = self.view().cycle(s, "inverted");
                 self.set_block(p, ns, flag::CLIENTS);
                 self.game_event_block("minecraft:block_change", p, Some(crate::mobs::mob::Ent::Player), Some(ns));
                 self.daylight_signal(p);
@@ -281,7 +281,7 @@ impl Server {
         by_use: bool,
     ) -> bool {
         let block_name = item_block(item).to_owned();
-        let tb = self.tb();
+        let tb = self.table();
         let block = tb.block_id(&block_name);
         if block == u16::MAX {
             return false;
@@ -334,7 +334,7 @@ impl Server {
         }
         let mut placed = self.get(pos);
         let stack = self.slots[slot].clone();
-        if self.v().block(placed) == self.v().block(state) {
+        if self.view().block(placed) == self.view().block(state) {
             // Order of the game: `block_state` properties of the stack (flag 2), block entity data and
             // components, placement reaction, trigger.
             if let Some(st) = &stack {
@@ -379,7 +379,7 @@ impl Server {
         let Some(rc_proto::nbt::Nbt::Compound(props)) = crate::items::component(st, "minecraft:block_state") else {
             return placed;
         };
-        let v = self.v();
+        let v = self.view();
         let mut s = placed;
         for (k, val) in props {
             if let Some(val) = val.as_str() {
@@ -405,7 +405,7 @@ impl Server {
         face: Dir,
         at: [f64; 3],
     ) -> Option<(P, Dir, [f64; 3], bool)> {
-        let v = self.v();
+        let v = self.view();
         if v.block(self.get(pos)) != block {
             return (self.scaffold_distance(pos) != 7).then_some((pos, face, at, replace_clicked));
         }
@@ -444,7 +444,7 @@ impl Server {
     }
 
     pub(crate) fn obstructed(&self, state: u32, p: P) -> bool {
-        let info = self.v().info(state);
+        let info = self.view().info(state);
         let me = rc_physics::Aabb {
             min: [self.pos[0] - 0.3, self.pos[1], self.pos[2] - 0.3],
             max: [self.pos[0] + 0.3, self.pos[1] + if self.sneaking { 1.5 } else { 1.8 }, self.pos[2] + 0.3],
@@ -463,7 +463,7 @@ impl Server {
 
     /// The survival test of the block at placement (attached families included).
     pub(crate) fn can_place_at(&self, s: u32, p: P) -> bool {
-        let v = self.v();
+        let v = self.view();
         let b = self.get(below(p));
         match v.kind(s) {
             Kind::Torch | Kind::RedstoneTorch => v.center_up(b),
@@ -499,10 +499,10 @@ impl Server {
 
     /// Placement state of a block.
     pub(crate) fn placement_state(&self, block: u16, ctx: &PlaceCtx) -> Option<u32> {
-        let v = self.v();
+        let v = self.view();
         let def = v.default_state(block);
         let kind = self.bs.t.kind.get(block as usize).copied().unwrap_or(Kind::Other);
-        let name = v.d.blocks[block as usize].name.as_str();
+        let name = v.data.blocks[block as usize].name.as_str();
         let p = ctx.pos;
         let water = {
             let f = self.fluid_at(p);
@@ -923,7 +923,7 @@ impl Server {
 
     /// General rules of the usual properties (axis, orientation, half, waterlogged).
     fn generic_placement(&self, def: u32, name: &str, ctx: &PlaceCtx) -> u32 {
-        let v = self.v();
+        let v = self.view();
         let p = ctx.pos;
         let mut s = def;
         if v.has(s, "axis") {
@@ -935,9 +935,9 @@ impl Server {
             s = v.set(s, "axis", a);
         }
         let six = |s: u32| {
-            v.d.block_of(s).is_some_and(|b| {
+            v.data.block_of(s).is_some_and(|b| {
                 b.properties.iter().any(|&pi| {
-                    let pr = &v.d.properties[pi as usize];
+                    let pr = &v.data.properties[pi as usize];
                     pr.name == "facing" && pr.values.len() == 6
                 })
             })
@@ -984,8 +984,8 @@ impl Server {
     /// Item with a wall variant (torches, signs…): first state that holds in the order of the
     /// gaze.
     fn standing_or_wall(&self, block: u16, ctx: &PlaceCtx) -> Option<u32> {
-        let v = self.v();
-        let name = v.d.blocks[block as usize].name.clone();
+        let v = self.view();
+        let name = v.data.blocks[block as usize].name.clone();
         let wall_name = match name.rsplit_once('_') {
             Some((a, b)) => format!("{a}_wall_{b}"),
             None => format!("{name}_wall"),
@@ -1026,7 +1026,7 @@ impl Server {
     /// banner facing the player and placed on a solid block —, otherwise the wall variant — head
     /// in front of a non-replaceable block, banner against a solid block. `None`: other family.
     fn head_or_banner_placement(&self, block: u16, name: &str, ctx: &PlaceCtx) -> Option<Option<u32>> {
-        let v = self.v();
+        let v = self.view();
         let n = name.trim_start_matches("minecraft:");
         let (wall_name, head) = match n {
             "skeleton_skull" | "wither_skeleton_skull" => {
@@ -1081,7 +1081,7 @@ impl Server {
     /// bottom excluded, at the top the ceiling sign if the block above holds it, otherwise the wall
     /// variant if one side of its axis holds it.
     fn hanging_sign_placement(&self, block: u16, name: &str, ctx: &PlaceCtx) -> Option<u32> {
-        let v = self.v();
+        let v = self.view();
         let p = ctx.pos;
         let water = self.fluid_at(p);
         let water = water.kind == 1 && water.source;
@@ -1153,7 +1153,7 @@ impl Server {
     /// Wall hanging sign: one of the two sides of its axis is a full face, or another
     /// wall sign of the same axis.
     fn wall_hanging_sign_holds(&self, s: u32, p: P) -> bool {
-        let v = self.v();
+        let v = self.view();
         let f = v.facing(s);
         let attach = |side: Dir| {
             let q = self.get(rel(p, side));
@@ -1167,7 +1167,7 @@ impl Server {
     }
 
     fn door_hinge(&self, ctx: &PlaceCtx) -> &'static str {
-        let v = self.v();
+        let v = self.view();
         let p = ctx.pos;
         let d = ctx.horizontal;
         let ap = above(p);
@@ -1203,7 +1203,7 @@ impl Server {
     /// Second halves, repeaters and pistons.
     fn set_placed_by(&mut self, p: P, s: u32, stack: Option<&crate::player::Stack>) {
         self.wither_check_spawn(p); // F16: wither skeleton skull that completes a wither
-        let v = self.v();
+        let v = self.view();
         match v.kind(s) {
             Kind::Door { .. } => {
                 let up = v.set(s, "half", "upper");
@@ -1240,12 +1240,12 @@ impl Server {
     /// Random part of placement states (age of climbing plants, scheduled death of a coral
     /// block out of water), drawn at the same moment as the game.
     fn placement_random(&mut self, state: u32, p: P) -> u32 {
-        match self.v().kind(state) {
+        match self.view().kind(state) {
             Kind::GrowingHead { .. } => self.growing_placement(state),
             Kind::Support(super::attach::Sup::CoralBlock) => {
                 if !Dir::ALL.iter().any(|&d| self.fluid_at(rel(p, d)).kind == 1) {
                     let delay = 60 + self.bs.rng.next_int_bound(40);
-                    let b = self.v().block(state);
+                    let b = self.view().block(state);
                     self.schedule_tick(p, b, delay);
                 }
                 state
@@ -1276,7 +1276,7 @@ impl Server {
             if !self.rule("minecraft:block_drops", true) {
                 return;
             }
-            let honey = self.v().get_int(s, "honey_level");
+            let honey = self.view().get_int(s, "honey_level");
             let bees = matches!(be.get("bees"), Some(rc_proto::nbt::Nbt::List(l)) if !l.is_empty());
             if !bees && honey <= 0 {
                 return;
@@ -1303,7 +1303,7 @@ impl Server {
     pub(crate) fn player_destroy(&mut self, p: P) -> bool {
         let s = self.get(p);
         self.rec_player_will_destroy(p, s); // F14: creaking heart (protector undone)
-        let v = self.v();
+        let v = self.view();
         let creative = self.game_mode == 1;
         // Door: the lower half also goes without loot when the held tool is not the right one for a
         // block that requires one; the double plant only does so in creative.

@@ -136,7 +136,7 @@ fn camera(f: u32) -> ([f64; 3], f32, f32) {
 
 fn planes(eye: [f64; 3], yaw: f32, pitch: f32, far: f32) -> ([i32; 2], [Vec4; 6]) {
     let (origin, _, view_m) = crate::camera::view_matrix(eye, yaw, pitch);
-    (origin, super::super::frustum_planes(super::super::perspective(70.0, 16.0 / 9.0, 0.05, far) * view_m))
+    (origin, super::super::frustum::frustum_planes(super::super::perspective(70.0, 16.0 / 9.0, 0.05, far) * view_m))
 }
 
 fn fnv(h: &mut u64, bytes: &[u8]) {

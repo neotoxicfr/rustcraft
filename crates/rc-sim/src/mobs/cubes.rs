@@ -1369,7 +1369,7 @@ impl Server {
         if m.can_explode() && (item == "minecraft:flint_and_steel" || item == "minecraft:fire_charge") {
             if !self.rule("minecraft:tnt_explodes", true) {
                 let msg = rc_text::Component::translate("block.minecraft.tnt.disabled", Vec::new());
-                let _ = self.send(rc_client::Event::ActionBar(msg));
+                let _ = self.send(rc_client::Event::ActionBar(Box::new(msg)));
                 return Some(false);
             }
             self.sulfur_prime(m, false);

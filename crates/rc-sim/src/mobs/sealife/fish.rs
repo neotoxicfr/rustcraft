@@ -548,7 +548,7 @@ impl Server {
         let dirs = [[0, -1, 0], [0, 1, 0], [0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]];
         let d = dirs[face.min(5)];
         let side = [clicked[0] + d[0], clicked[1] + d[1], clicked[2] + d[2]];
-        let container = self.v().sim(self.get(clicked)) & rc_data::sim_bits::LIQUID_CONTAINER != 0;
+        let container = self.view().sim(self.get(clicked)) & rc_data::sim_bits::LIQUID_CONTAINER != 0;
         let place = if container { clicked } else { side };
         let sound = super::super::brainy::bucket_empty_sound(kind).unwrap_or("minecraft:item.bucket.empty_fish");
         if !self.empty_water(place, Some(side), sound) {
@@ -566,7 +566,7 @@ impl Server {
     /// touched face when the targeted cell cannot receive the water.
     pub(crate) fn empty_water(&mut self, p: [i32; 3], retry: Option<[i32; 3]>, sound: &str) -> bool {
         let s = self.get(p);
-        let v = self.v();
+        let v = self.view();
         let name = self.bname(p).to_owned();
         let portal = name == "minecraft:end_portal" || name == "minecraft:end_gateway";
         let may_replace = !portal && (v.replaceable(s) || !v.legacy_solid(s));

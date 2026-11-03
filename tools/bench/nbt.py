@@ -2,7 +2,8 @@
 
 Values: dict (compound, order kept), `List(element_type, [values])`, and for scalars a
 tuple (type, value): (1, byte), (2, short), (3, int), (4, long), (5, float), (6, double),
-(8, string), (7|11|12, array). `read_dat` / `write_dat` read and write a `.dat` file.
+(8, string), (7|11|12, array). `read_dat` / `write_dat` read and write a `.dat` file (gzip),
+`write_raw` an uncompressed one (`servers.dat`).
 """
 import gzip
 import struct
@@ -102,7 +103,8 @@ def _put(out, t, v):
 
 
 def read_dat(path):
-    raw = open(path, "rb").read()
+    with open(path, "rb") as f:
+        raw = f.read()
     if raw[:2] == b"\x1f\x8b":
         raw = gzip.decompress(raw)
     r = _R(raw)
@@ -111,8 +113,18 @@ def read_dat(path):
     return _payload(r, COMPOUND)
 
 
-def write_dat(path, root):
+def _encode(root):
     out = bytearray(b"\x0a\0\0")
     _put(out, COMPOUND, root)
+    return bytes(out)
+
+
+def write_dat(path, root):
     with open(path, "wb") as f:
-        f.write(gzip.compress(bytes(out)))
+        f.write(gzip.compress(_encode(root)))
+
+
+def write_raw(path, root):
+    """Uncompressed `.dat` (the game's `servers.dat`)."""
+    with open(path, "wb") as f:
+        f.write(_encode(root))

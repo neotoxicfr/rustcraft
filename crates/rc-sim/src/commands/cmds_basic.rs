@@ -299,7 +299,7 @@ impl Server {
 
     /// Chat message broadcast (singleplayer: to the player), "player" tag.
     pub fn chat_broadcast(&self, c: Component) {
-        self.chat_out(Event::Chat { component: c, tag: rc_client::ChatTag::NotSecure });
+        self.chat_out(Event::Chat { component: Box::new(c), tag: rc_client::ChatTag::NotSecure });
     }
 
     fn gamemode_message(&mut self, s: &Src, mode: i32) {
@@ -368,7 +368,7 @@ impl Server {
         text::hover_text(&mut tname, tr!("chat.type.team.hover"));
         text::suggest_click(&mut tname, "/teammsg ".into());
         let line = |key: &str| tr!(key, tname.clone(), s.display.clone(), msg.clone());
-        let chat = |c: Component| Event::Chat { component: c, tag: rc_client::ChatTag::NotSecure };
+        let chat = |c: Component| Event::Chat { component: Box::new(c), tag: rc_client::ChatTag::NotSecure };
         if me {
             let key = if e == E::Player { "chat.type.team.sent" } else { "chat.type.team.text" };
             let _ = self.send_to_current(chat(line(key)));
@@ -584,7 +584,7 @@ impl Server {
                     let n = text::to_nbt(&c);
                     let _ = self.send(match what.as_str() {
                         "subtitle" => Event::Subtitle(Some(n)),
-                        "actionbar" => Event::ActionBar(c),
+                        "actionbar" => Event::ActionBar(Box::new(c)),
                         _ => Event::Title(Some(n)),
                     });
                 }
@@ -1232,7 +1232,7 @@ impl Server {
             if d2 >= limit {
                 continue;
             }
-            let _ = self.send(Event::Particles(rc_proto_v777::entity::LevelParticles {
+            let _ = self.send(Event::Particles(Box::new(rc_proto_v777::entity::LevelParticles {
                 particle: particle.clone(),
                 force,
                 always_visible: false,
@@ -1241,7 +1241,7 @@ impl Server {
                 speed: [speed, 0.0, 0.0],
                 count,
                 mode: 0,
-            }));
+            })));
             n += 1;
         }
         if n == 0 {

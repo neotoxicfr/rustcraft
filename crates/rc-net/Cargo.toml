@@ -9,6 +9,7 @@ description = "Transport: frame delimiting, compression, encryption"
 
 [dependencies]
 rc-proto.workspace = true
+rc-data.workspace = true
 thiserror.workspace = true
 aes.workspace = true
 libdeflater.workspace = true
@@ -18,7 +19,7 @@ rayon.workspace = true
 workspace = true
 
 [dev-dependencies]
-criterion = { version = "0.8.2", default-features = false }
+criterion.workspace = true
 flate2.workspace = true
 
 [[bench]]

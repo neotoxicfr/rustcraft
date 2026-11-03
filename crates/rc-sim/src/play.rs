@@ -613,7 +613,7 @@ impl Server {
     }
 
     fn is_air_at(&self, p: [i32; 3]) -> bool {
-        self.state_at(p).is_none_or(|s| self.v().is_air(s))
+        self.state_at(p).is_none_or(|s| self.view().is_air(s))
     }
 
     /// Mining `player_action` (§ 6.1), 26.3 network numbering: 0 start, 1 face
@@ -662,7 +662,7 @@ impl Server {
                 }
                 m.start = self.mine_ticks;
                 let state = self.state_at(pos).unwrap_or(0);
-                let air = self.v().is_air(state);
+                let air = self.view().is_air(state);
                 let mut progress = 1.0;
                 if !air {
                     // Hit of the block (egg, note, ore), then progress from the previous state.
@@ -879,7 +879,7 @@ impl Server {
             if too_high { ("build.tooHigh", self.top_y() - 1) } else { ("build.tooLow", self.dim.height.min_y) };
         let mut msg = rc_text::Component::translate(key, vec![rc_text::Arg::Text(limit.to_string())]);
         msg.style.color = Some(crate::commands::text::RED);
-        let _ = self.send(Event::ActionBar(msg));
+        let _ = self.send(Event::ActionBar(Box::new(msg)));
     }
 
     /// Middle click: the block's clone item in the hotbar, already present or in a free

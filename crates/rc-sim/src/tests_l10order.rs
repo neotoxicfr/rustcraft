@@ -496,6 +496,7 @@ fn mob_index_rebuilt_when_a_mob_rejoins() {
     p.s.sim_dist = 3;
     p.s.walk_rejoin();
     assert_eq!(p.s.mobs.list.last().and_then(Option::as_ref).map(|m| m.id), Some(far), "back at the end");
-    assert!(p.s.mobs.index.kind_slots(&p.s.mobs.list, Kind::Pig).is_some(), "per-species index in use");
+    let in_use = p.s.mobs.index.kind_slots(&p.s.mobs.list, Kind::Pig).is_some();
+    assert_eq!(in_use, crate::mobs::index::kind_on(), "per-species index in use");
     finish(p, dir);
 }

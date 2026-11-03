@@ -51,8 +51,8 @@ impl Server {
     fn cb_mark_condition(&mut self, p: [i32; 3]) -> bool {
         let s = self.get(p);
         let mut met = true;
-        if self.v().get_bool(s, "conditional") {
-            let back = crate::blocks::rel(p, self.v().facing(s).opposite());
+        if self.view().get_bool(s, "conditional") {
+            let back = crate::blocks::rel(p, self.view().facing(s).opposite());
             met = self.cb_name(self.get(back)).is_some() && self.be_int(back, "SuccessCount") > 0;
         }
         self.cb_set(p, "conditionMet", Nbt::Byte(i8::from(met)));
@@ -79,7 +79,7 @@ impl Server {
                 return;
             }
             self.cb_mark_condition(p);
-            let b = self.v().block(s);
+            let b = self.view().block(s);
             self.schedule_tick(p, b, 1);
         }
     }
@@ -94,8 +94,8 @@ impl Server {
         }
         let mode = self.cb_mode(s);
         let was_met = self.cb_flag(p, "conditionMet");
-        let conditional = self.v().get_bool(s, "conditional");
-        let b = self.v().block(s);
+        let conditional = self.view().get_bool(s, "conditional");
+        let b = self.view().block(s);
         match mode {
             Mode::Auto => {
                 self.cb_mark_condition(p);
@@ -128,7 +128,7 @@ impl Server {
         } else {
             self.cb_set(p, "SuccessCount", Nbt::Int(0));
         }
-        self.cb_chain(p, self.v().facing(s));
+        self.cb_chain(p, self.view().facing(s));
     }
 
     /// Execution of a chain behind a block.
@@ -147,13 +147,13 @@ impl Server {
                     if !self.cb_perform(pos) {
                         break;
                     }
-                    let b = self.v().block(st);
+                    let b = self.view().block(st);
                     self.update_neighbour_for_output_signal(pos, b);
-                } else if self.v().get_bool(st, "conditional") {
+                } else if self.view().get_bool(st, "conditional") {
                     self.cb_set(pos, "SuccessCount", Nbt::Int(0));
                 }
             }
-            dir = self.v().facing(st);
+            dir = self.view().facing(st);
         }
     }
 
@@ -175,7 +175,7 @@ impl Server {
         if self.rule("minecraft:command_blocks_work", true) && !cmd.is_empty() {
             crate::nbtio::remove(self.be_get_mut(p).unwrap_or(&mut Nbt::Compound(Vec::new())), "LastOutput");
             let s = self.get(p);
-            let yaw = match self.v().facing(s) {
+            let yaw = match self.view().facing(s) {
                 Dir::South => 0.0,
                 Dir::West => 90.0,
                 Dir::North => 180.0,
@@ -285,14 +285,14 @@ impl Server {
         }
         let (track, conditional, auto) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
         let old = self.get(p);
-        let facing = self.v().facing(old);
+        let facing = self.view().facing(old);
         let block = match mode {
             0 => "chain_command_block",
             1 => "repeating_command_block",
             _ => "command_block",
         };
-        let b = self.tb().block_id(block);
-        let v = self.v();
+        let b = self.table().block_id(block);
+        let v = self.view();
         let mut st = v.set_dir(v.default_state(b), "facing", facing);
         st = v.set_bool(st, "conditional", conditional);
         if st != old {
@@ -400,7 +400,7 @@ impl Server {
         let auto = self.cb_flag(p, "auto");
         if !was_auto && auto && !self.cb_flag(p, "powered") && self.cb_mode(s) != Mode::Sequence {
             self.cb_mark_condition(p);
-            let blk = self.v().block(s);
+            let blk = self.view().block(s);
             self.schedule_tick(p, blk, 1);
         }
     }

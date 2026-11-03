@@ -11,7 +11,9 @@ use crate::decor_region::DecoChunk;
 use crate::jigsaw::Element;
 use crate::opt;
 use crate::structure::{Kind, Piece, Start};
-use crate::template::{StateTransforms, Templates};
+use crate::decor_blocks::State;
+use crate::opt::TablesThread;
+use crate::template::{StateTransforms, TableBuild, Templates, TransformTables};
 
 const ALL: [&str; 10] = opt::C1M11;
 const SEEDS: [i64; 3] = [20261011, 1, -4172144997902289642];
@@ -228,28 +230,127 @@ fn content(h: &mut Fnv, t: &Option<Arc<crate::template::Template>>) {
 /// Fingerprint of all the decoded templates (old code, 26.3) and their number.
 const STORED_TEMPLATES: (u64, usize) = (0x6368_39ae_8c5e_42c3, 1511);
 
-/// State transformation tables: fast path = old, element by element, and stored
-/// value.
+/// Every build of the state tables: each lead alone and every combination (16).
+fn every_table_build() -> Vec<TableBuild> {
+    (0..16u8)
+        .map(|m| TableBuild {
+            skip_unoriented: m & 1 != 0,
+            compose_rotations: m & 2 != 0,
+            per_block: m & 4 != 0,
+            parallel: m & 8 != 0,
+        })
+        .collect()
+}
+
+const TABLE_NAMES: [&str; 5] = ["quarter turn", "half turn", "three-quarter turn", "left-right mirror", "front-back mirror"];
+
+/// State transformation tables: every build (each lead alone and every combination) gives the
+/// tables of the old build, state by state, and the old build gives the stored value.
 #[test]
-fn state_transforms_fast_matches_old() {
+fn every_table_build_matches_old_tables() {
     let Some(w) = world_data() else { return };
     let b = &*w.blocks;
-    // Three alternating passes, best of each.
-    let (mut to, mut tf) = (f64::MAX, f64::MAX);
-    for _ in 0..3 {
-        let t0 = std::time::Instant::now();
-        drop(StateTransforms::new_mode(b, false));
-        let t1 = std::time::Instant::now();
-        drop(StateTransforms::new_mode(b, true));
-        to = to.min((t1 - t0).as_secs_f64() * 1e3);
-        tf = tf.min(t1.elapsed().as_secs_f64() * 1e3);
-    }
-    eprintln!("state transformations: old {to:.1} ms, fast {tf:.1} ms (loaded machine)");
-    let old = StateTransforms::new_mode(b, false);
-    let fast = StateTransforms::new_mode(b, true);
+    let old = StateTransforms::build(b, TableBuild::default());
     eprintln!("fingerprint: 0x{:016x}", old.digest());
-    assert_eq!(fast.digest(), old.digest(), "different tables");
     assert_eq!(old.digest(), STORED_TRANSFORMS, "tables differ from the stored value");
+    for how in every_table_build() {
+        let new = StateTransforms::build(b, how);
+        for (k, (o, n)) in old.tables().into_iter().zip(new.tables()).enumerate() {
+            assert_eq!(o.len(), n.len(), "{how:?}: length of the {} table", TABLE_NAMES[k]);
+            if let Some(s) = o.iter().zip(n).position(|(a, c)| a != c) {
+                panic!(
+                    "{how:?}: {} of {} gives {} instead of {}",
+                    TABLE_NAMES[k],
+                    b.describe(s as State),
+                    b.describe(n[s]),
+                    b.describe(o[s])
+                );
+            }
+        }
+    }
+}
+
+/// Tables built off the critical path: inline, on a dedicated thread and as a rayon task, they
+/// are the stored tables; 16 threads that need them at once share a single build; tables kept
+/// under a key are handed, already built, to the next world with that key.
+#[test]
+fn state_tables_off_the_critical_path() {
+    let Some(w) = world_data() else { return };
+    for thread in [TablesThread::Inline, TablesThread::Dedicated, TablesThread::RayonPool] {
+        let tables = TransformTables::start(&w.blocks, None, thread);
+        let seen: Vec<usize> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..16).map(|_| s.spawn(|| &*tables as *const StateTransforms as usize)).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(seen.iter().all(|&p| p == seen[0]), "{thread:?}: two builds of the tables");
+        assert_eq!(tables.digest(), STORED_TRANSFORMS, "{thread:?}: tables differ from the stored value");
+    }
+    let key = || Some("test|state tables kept".to_owned());
+    let first = TransformTables::start(&w.blocks, key(), TablesThread::Dedicated);
+    let first_ptr = &*first as *const StateTransforms;
+    let again = TransformTables::start(&w.blocks, key(), TablesThread::Dedicated);
+    assert!(again.is_built(), "kept tables rebuilt");
+    assert!(std::ptr::eq(first_ptr, &*again), "kept tables not shared");
+    assert!(TransformTables::start(&w.blocks, None, TablesThread::Inline).is_built(), "inline tables not built");
+}
+
+/// Bench (loaded machine, `--ignored`): the five state tables by lead and combination on one
+/// thread, the parallel build from 1 thread to all, and the tables built inline or in the
+/// background while the stronghold rings occupy the rayon pool (as at generator start).
+#[test]
+#[ignore = "bench"]
+fn bench_state_transforms() {
+    let Some(w) = world_data() else { return };
+    let b = &*w.blocks;
+    let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e3;
+    let mut procs = f64::MAX;
+    for _ in 0..10 {
+        let t = std::time::Instant::now();
+        std::hint::black_box(crate::structure_procs::ProcTables::new(b));
+        procs = procs.min(ms(t));
+    }
+    eprintln!("processor tables alone: {procs:.2} ms");
+    let sequential: Vec<TableBuild> = every_table_build().into_iter().filter(|h| !h.parallel).collect();
+    let mut best = vec![f64::MAX; sequential.len()];
+    for _ in 0..5 {
+        for (k, how) in sequential.iter().enumerate() {
+            let t = std::time::Instant::now();
+            std::hint::black_box(StateTransforms::build(b, *how));
+            best[k] = best[k].min(ms(t));
+        }
+    }
+    for (how, t) in sequential.iter().zip(&best) {
+        eprintln!("1 thread, {how:?}: {t:.2} ms");
+    }
+    let all = std::thread::available_parallelism().map_or(1, usize::from);
+    let fastest = TableBuild { skip_unoriented: true, compose_rotations: true, per_block: true, parallel: true };
+    let mut threads = 1;
+    while threads <= all {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+        let mut t_best = f64::MAX;
+        for _ in 0..10 {
+            let t = std::time::Instant::now();
+            pool.install(|| std::hint::black_box(StateTransforms::build(b, fastest)));
+            t_best = t_best.min(ms(t));
+        }
+        eprintln!("parallel build, {threads} threads: {t_best:.2} ms");
+        threads = if threads == all { all + 1 } else { (threads * 2).min(all) };
+    }
+    for _ in 0..2 {
+        for thread in [TablesThread::Inline, TablesThread::Dedicated, TablesThread::RayonPool] {
+            let dg = dim(w, Some(SEEDS[0]));
+            let t = std::time::Instant::now();
+            let tables = TransformTables::start(&w.blocks, None, thread);
+            let started = ms(t);
+            dg.warm_rings();
+            let rings = ms(t);
+            std::hint::black_box(tables.digest());
+            eprintln!(
+                "{thread:?}: start {started:.2} ms, rings done {rings:.1} ms, tables ready {:.1} ms",
+                ms(t)
+            );
+        }
+    }
 }
 
 /// Fingerprint of the tables rot[1..3] then mirror[0..1] (26.3; changed by G6-F14: mirror of the

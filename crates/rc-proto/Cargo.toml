@@ -8,6 +8,11 @@ publish.workspace = true
 description = "Basic protocol types and codecs, independent of the version"
 
 [dependencies]
+# Only for the `RUSTCRAFT_OPT_NBT_*` switches: clippy.toml makes every environment read go
+# through its `env_str!`. Cost: rc-proto and rc-net now compile after all of rc-data (its HTTP
+# client, zip, regex, rayon); the final executable does not change. Better later: move
+# `env_flags` into a crate without dependencies.
+rc-data.workspace = true
 thiserror.workspace = true
 
 [lints]

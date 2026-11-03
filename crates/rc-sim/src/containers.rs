@@ -189,7 +189,7 @@ impl Server {
         let blocked = if chest {
             self.chest_blocked(pos)
         } else if short == "ender_chest" {
-            self.v().conductor(self.get([pos[0], pos[1] + 1, pos[2]]))
+            self.view().conductor(self.get([pos[0], pos[1] + 1, pos[2]]))
         } else {
             // The spectator opens the box through its block entity, without a lid test.
             short.ends_with("shulker_box") && self.game_mode != 3 && !self.shulker_can_open(pos)
@@ -375,7 +375,7 @@ impl Server {
         if self.chest_blocked_at(p) {
             return true;
         }
-        let v = self.v();
+        let v = self.view();
         let s = self.get(p);
         let ty = v.get(s, "type").unwrap_or("single");
         if ty == "single" {
@@ -393,7 +393,7 @@ impl Server {
     /// sit or sitting on the chest) whose box intersects the cube above.
     pub(crate) fn chest_blocked_at(&self, q: [i32; 3]) -> bool {
         let up = [q[0], q[1] + 1, q[2]];
-        if self.v().conductor(self.get(up)) {
+        if self.view().conductor(self.get(up)) {
             return true;
         }
         let area = rc_physics::Aabb {
@@ -440,7 +440,7 @@ impl Server {
         if self.life.menu.is_some() {
             self.close_menu(true);
         }
-        let _ = self.send(Event::OpenScreen { window: menu.window, kind: menu.menu_type(), title });
+        let _ = self.send(Event::OpenScreen { window: menu.window, kind: menu.menu_type(), title: title.map(Box::new) });
         self.life.menu = Some(menu);
         if let Some(m) = &mut self.life.menu {
             m.send_all(&self.slots);
@@ -496,7 +496,7 @@ impl Server {
             let n = positions.len() as f64;
             let at = std::array::from_fn(|a| positions.iter().map(|p| f64::from(p[a]) + 0.5).sum::<f64>() / n);
             let args = name.map(rc_text::Arg::Component).into_iter().collect();
-            let _ = self.send(Event::ActionBar(rc_text::Component::translate("container.isLocked", args)));
+            let _ = self.send(Event::ActionBar(Box::new(rc_text::Component::translate("container.isLocked", args))));
             self.play_sound("minecraft:block.chest.locked", 4, at, 1.0, 1.0);
         }
         open
@@ -985,7 +985,7 @@ impl Server {
         if !lidded {
             return;
         }
-        let block = self.v().block(st);
+        let block = self.view().block(st);
         let prev = self.life.openers.get(&p).copied().unwrap_or(0);
         let cur = (prev + delta).max(0);
         if cur == prev {

@@ -49,17 +49,17 @@ pub(crate) struct Touch {
 
 impl Server {
     fn block_id_of(&self, name: &str) -> u16 {
-        self.tb().block_id(name)
+        self.table().block_id(name)
     }
 
     fn is_block(&self, s: u32, name: &str) -> bool {
-        self.v().block(s) == self.block_id_of(name)
+        self.view().block(s) == self.block_id_of(name)
     }
 
     /// Cell seen by the search for the Nether portal frame.
     pub(crate) fn portal_cell(&self, p: P) -> Cell {
         let s = self.get(p);
-        let v = self.v();
+        let v = self.view();
         let b = v.block(s);
         if b == self.block_id_of("nether_portal") {
             Cell::Portal
@@ -85,7 +85,7 @@ impl Server {
     }
 
     fn nether_portal_state(&self, axis: Axis) -> u32 {
-        let v = self.v();
+        let v = self.view();
         v.set(v.default_state(self.block_id_of("nether_portal")), "axis", axis.name())
     }
 
@@ -108,7 +108,7 @@ impl Server {
 
     /// Shape update of a Nether portal block: air if the frame is no longer complete.
     pub(crate) fn portal_update_shape(&self, state: u32, p: P, dir: Dir, ns: u32) -> Option<u32> {
-        let v = self.v();
+        let v = self.view();
         let pb = self.block_id_of("nether_portal");
         if v.block(state) != pb {
             return None;
@@ -133,11 +133,11 @@ impl Server {
     /// of the player.
     pub(crate) fn fire_can_be_placed(&self, p: P, facing: Dir) -> bool {
         let s = self.get(p);
-        if !self.v().is_air(s) {
+        if !self.view().is_air(s) {
             return false;
         }
         let fire = self.fire_state_for(p);
-        let survives = self.v().kind(fire) == Kind::SoulFire || self.can_survive(fire, p);
+        let survives = self.view().kind(fire) == Kind::SoulFire || self.can_survive(fire, p);
         survives || self.is_portal_spot(p, facing)
     }
 
@@ -177,7 +177,7 @@ impl Server {
         }
         let slot = 36 + self.held as usize;
         let s = self.get(clicked);
-        let v = self.v();
+        let v = self.view();
         let name = self.data.block_of(s).map(|b| b.name.clone()).unwrap_or_default();
         let lightable = v.has(s, "lit")
             && !v.get_bool(s, "lit")
@@ -232,7 +232,7 @@ impl Server {
     /// `MOTION_BLOCKING` height of a column: first Y above the last blocking block.
     fn portal_surface_height(&self, x: i32, z: i32) -> i32 {
         let min = self.dim.height.min_y;
-        let v = self.v();
+        let v = self.view();
         let cobweb = self.block_id_of("cobweb");
         let sapling = self.block_id_of("bamboo_sapling");
         for y in (min..self.top_y()).rev() {
@@ -279,7 +279,7 @@ impl Server {
     /// Nether portal blocks of a chunk (sections whose palette contains some).
     fn portal_blocks_in(&self, c: &crate::chunk::Chunk, out: &mut Vec<P>) {
         let pb = self.block_id_of("nether_portal");
-        let v = self.v();
+        let v = self.view();
         let min_y = self.dim.height.min_y;
         for (si, sec) in c.sections.iter().enumerate() {
             let maybe = match &sec.blocks {
@@ -334,12 +334,12 @@ impl Server {
         // Block re-read in the world (loaded chunk): it must still have an axis.
         self.load_now(&Self::chunks_around(best, 21));
         let s = self.get(best);
-        self.v().has(s, "axis").then_some(best)
+        self.view().has(s, "axis").then_some(best)
     }
 
     fn can_portal_replace(&self, p: P) -> bool {
         let s = self.get(p);
-        (self.v().replaceable(s) || self.v().is_air(s)) && self.fluid_of(s).is_empty()
+        (self.view().replaceable(s) || self.view().is_air(s)) && self.fluid_of(s).is_empty()
     }
 
     fn can_host_frame(&self, origin: P, dir: Dir, offset: i32) -> bool {
@@ -352,7 +352,7 @@ impl Server {
                     origin[1] + height,
                     origin[2] + d[2] * width + cw[2] * offset,
                 ];
-                if height < 0 && !self.v().legacy_solid(self.get(p)) {
+                if height < 0 && !self.view().legacy_solid(self.get(p)) {
                     return false;
                 }
                 if height >= 0 && !self.can_portal_replace(p) {
@@ -422,7 +422,7 @@ impl Server {
             full_p = part_p;
             full_d = part_d;
         }
-        let obsidian = self.v().default_state(self.block_id_of("obsidian"));
+        let obsidian = self.view().default_state(self.block_id_of("obsidian"));
         let air = self.air();
         let base = if full_d == -1.0 {
             let min_start = (min_y + 1).max(70);
@@ -470,7 +470,7 @@ impl Server {
     /// Rectangle of blocks identical to that of `p` (portal), axis of the state.
     fn portal_rect(&self, p: P) -> (Rect, Axis) {
         let s = self.get(p);
-        let axis = self.v().get(s, "axis").and_then(Axis::parse).unwrap_or(Axis::X);
+        let axis = self.view().get(s, "axis").and_then(Axis::parse).unwrap_or(Axis::X);
         let a1 = match axis {
             Axis::X => 0,
             Axis::Z => 2,
@@ -585,7 +585,7 @@ impl Server {
         let approx = Self::clamp_to_border(self.border_bounds(), pos[0] * scale, pos[1], pos[2] * scale);
         // Entry portal: axis, rectangle and relative position (departure world).
         let entry_state = self.get(entry);
-        let (entry_axis, offset) = match self.v().get(entry_state, "axis").and_then(Axis::parse) {
+        let (entry_axis, offset) = match self.view().get(entry_state, "axis").and_then(Axis::parse) {
             Some(axis) => {
                 let (rect, _) = self.portal_rect(entry);
                 (axis, ps::relative_position(rect, axis, pos, w, h))
@@ -609,7 +609,7 @@ impl Server {
             };
             let _ = ticket_at;
             let exit_state = s.get(rect.min);
-            let exit_axis = s.v().get(exit_state, "axis").and_then(Axis::parse).unwrap_or(Axis::X);
+            let exit_axis = s.view().get(exit_state, "axis").and_then(Axis::parse).unwrap_or(Axis::X);
             let (target, rotation) = ps::exit_position(rect, exit_axis, entry_axis, offset, w, h);
             let free = s.collision_free(target, w, h);
             Some(Transition {
@@ -628,17 +628,17 @@ impl Server {
     /// Obsidian platform of the End.
     pub(crate) fn create_end_platform(&mut self, origin: P, drop_resources: bool) {
         let obsidian = self.block_id_of("obsidian");
-        let air = self.v().default_state(self.tb().id.air);
+        let air = self.view().default_state(self.table().id.air);
         for dz in -2..=2 {
             for dx in -2..=2 {
                 for dy in -1..3 {
                     let p = [origin[0] + dx, origin[1] + dy, origin[2] + dz];
-                    let want = if dy == -1 { obsidian } else { self.tb().id.air };
-                    if self.v().block(self.get(p)) != want {
+                    let want = if dy == -1 { obsidian } else { self.table().id.air };
+                    if self.view().block(self.get(p)) != want {
                         if drop_resources {
                             self.destroy_block(p, true, 512);
                         }
-                        let st = if dy == -1 { self.v().default_state(obsidian) } else { air };
+                        let st = if dy == -1 { self.view().default_state(obsidian) } else { air };
                         self.set_block(p, st, flag::ALL);
                     }
                 }
@@ -714,7 +714,7 @@ impl Server {
             for y in lo[1]..=hi[1] {
                 for z in lo[2]..=hi[2] {
                     let p = [x, y, z];
-                    let b = self.v().block(self.get(p));
+                    let b = self.view().block(self.get(p));
                     let kind = if b == np {
                         PortalKind::Nether
                     } else if b == ep {
@@ -845,7 +845,7 @@ impl Server {
             None => {
                 let mut msg = rc_text::Component::translate("spectator.cannot_teleport", Vec::new());
                 msg.style.color = Some(crate::commands::text::RED);
-                let _ = self.send(rc_client::Event::ActionBar(msg));
+                let _ = self.send(rc_client::Event::ActionBar(Box::new(msg)));
             }
         }
         true
@@ -978,7 +978,7 @@ impl Server {
     }
 
     fn full_block(&self, p: P) -> bool {
-        self.v().full_collision(self.get(p))
+        self.view().full_collision(self.get(p))
     }
 
     /// The search for the highest block.
@@ -996,7 +996,7 @@ impl Server {
                 while y > floor {
                     let p = [around[0] + xd, y, around[2] + zd];
                     let s = self.get(p);
-                    if self.v().full_collision(s) && (bedrock || self.v().block(s) != bed) {
+                    if self.view().full_collision(s) && (bedrock || self.view().block(s) != bed) {
                         tallest = Some(p);
                         break;
                     }
@@ -1058,7 +1058,7 @@ impl Server {
         let stone = self.block_id_of("end_stone");
         let mut best: Option<(P, f64)> = None;
         for p in ps::between_closed([cx * 16, 30, cz * 16], [cx * 16 + 15, max_y, cz * 16 + 15]) {
-            if self.v().block(self.get(p)) != stone {
+            if self.view().block(self.get(p)) != stone {
                 continue;
             }
             if self.full_block([p[0], p[1] + 1, p[2]]) || self.full_block([p[0], p[1] + 2, p[2]]) {
@@ -1077,7 +1077,7 @@ impl Server {
         let packed =
             ((i64::from(o[0]) & 0x3FF_FFFF) << 38) | ((i64::from(o[2]) & 0x3FF_FFFF) << 12) | (i64::from(o[1]) & 0xFFF);
         let mut rng = crate::mobs::jrand::JRand::new(packed);
-        let stone = self.v().default_state(self.block_id_of("end_stone"));
+        let stone = self.view().default_state(self.block_id_of("end_stone"));
         let mut size = rng.next_int_bound(3) as f32 + 4.0;
         let mut y = 0;
         while size > 0.5 {
@@ -1096,8 +1096,8 @@ impl Server {
 
     /// Gateway at `o`, known exit `exit` (not exact).
     fn place_gateway(&mut self, o: P, exit: P) {
-        let gw = self.v().default_state(self.block_id_of("end_gateway"));
-        let bedrock = self.v().default_state(self.block_id_of("bedrock"));
+        let gw = self.view().default_state(self.block_id_of("end_gateway"));
+        let bedrock = self.view().default_state(self.block_id_of("bedrock"));
         let air = self.air();
         for p in ps::between_closed([o[0] - 1, o[1] - 2, o[2] - 1], [o[0] + 1, o[1] + 2, o[2] + 1]) {
             let (sx, sy, sz) = (p[0] == o[0], p[1] == o[1], p[2] == o[2]);
@@ -1153,14 +1153,14 @@ impl Server {
     /// Eye of Ender on a frame; true if the eye is placed.
     pub(crate) fn use_ender_eye(&mut self, clicked: P) -> bool {
         let s = self.get(clicked);
-        if !self.is_block(s, "end_portal_frame") || self.v().get_bool(s, "eye") {
+        if !self.is_block(s, "end_portal_frame") || self.view().get_bool(s, "eye") {
             return false;
         }
-        let ns = self.v().set_bool(s, "eye", true);
+        let ns = self.view().set_bool(s, "eye", true);
         // The eye adds a box 8/16 on a side, from 13/16 to 1: entities that touch it are lifted.
         self.push_entities_up_box(clicked, [0.25, 13.0 / 16.0, 0.25], [0.75, 1.0, 0.75]);
         self.set_block(clicked, ns, flag::CLIENTS);
-        let frame_block = self.v().block(ns);
+        let frame_block = self.view().block(ns);
         self.update_neighbour_for_output_signal(clicked, frame_block);
         let slot = 36 + self.held as usize;
         if self.game_mode != 1
@@ -1177,13 +1177,13 @@ impl Server {
         let found = {
             let eye = |p: P| {
                 let st = self.get(p);
-                (self.v().block(st) == frame && self.v().get_bool(st, "eye")).then(|| self.v().facing(st))
+                (self.view().block(st) == frame && self.view().get_bool(st, "eye")).then(|| self.view().facing(st))
             };
             ps::find_end_frame(clicked, &eye)
         };
         if let Some(ftl) = found {
             let base = [ftl[0] - 3, ftl[1], ftl[2] - 3];
-            let portal = self.v().default_state(self.block_id_of("end_portal"));
+            let portal = self.view().default_state(self.block_id_of("end_portal"));
             for x in 0..3 {
                 for z in 0..3 {
                     let p = [base[0] + x, base[1], base[2] + z];

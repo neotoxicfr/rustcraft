@@ -784,10 +784,11 @@ impl Worker {
         let map = &self.map;
         let encoded: Vec<((i32, i32), Vec<u8>)> = list
             .par_iter()
-            .map(|p| {
+            // One encoder per rayon task (not per thread): the size hint carries over within a task.
+            .map_init(nbtio::RootEncoder::default, |encoder, p| {
                 let s = &map[p];
                 let status = if s.stage == Stage::Decorated { DECORATED } else { TERRAIN };
-                (*p, nbtio::encode_root(&conv.proto_nbt(&s.c, status, 0, &s.bes)))
+                (*p, encoder.encode(&conv.proto_nbt(&s.c, status, 0, &s.bes)))
             })
             .collect();
         drop(conv);
@@ -1223,6 +1224,9 @@ impl crate::server::Server {
                 }
             }
             self.entities.entry(p).or_default().extend(list);
+            // They exist nowhere on disk yet (they left the generator with the full chunk): the
+            // next save writes them, even if nothing else changes in that chunk.
+            self.life.drop_chunks.insert(p);
             self.mobs.adopted.remove(&p);
             self.adopt_mobs(&[p]);
         }

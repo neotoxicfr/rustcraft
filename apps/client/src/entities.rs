@@ -244,21 +244,16 @@ struct Stepper {
 #[derive(Debug, Clone, Default)]
 pub struct MetaMap(Vec<Option<Meta>>, Vec<(u8, u8)>, Option<Box<str>>);
 
-/// Switch read once: `RUSTCRAFT_OPT_<name>=0` restores the old path.
-fn opt_on(cell: &'static std::sync::OnceLock<bool>, value: Option<&str>) -> bool {
-    *cell.get_or_init(|| value != Some("0"))
-}
-
 /// Variant read from the index held by `MetaMap` (otherwise search among all the data).
+#[inline]
 pub(crate) fn variant_idx_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    opt_on(&ON, rc_data::env_str!("RUSTCRAFT_OPT_VARIANTIDX"))
+    rc_data::opt_switch!("RUSTCRAFT_OPT_VARIANTIDX")
 }
 
 /// Custom name read from the plain text held by `MetaMap` (otherwise parsed on every read).
+#[inline]
 pub(crate) fn name_cache_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    opt_on(&ON, rc_data::env_str!("RUSTCRAFT_OPT_NAMECACHE"))
+    rc_data::opt_switch!("RUSTCRAFT_OPT_NAMECACHE")
 }
 
 /// Custom name (data 2) as plain text, default language; `None` without a name.
@@ -1124,8 +1119,7 @@ pub struct Entities {
 
 /// `RUSTCRAFT_OPT_RIDERLIST=0`: the mob-rider pass walks every entity instead of the vehicles.
 pub(crate) fn rider_list_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    opt_on(&ON, rc_data::env_str!("RUSTCRAFT_OPT_RIDERLIST"))
+    rc_data::opt_switch!("RUSTCRAFT_OPT_RIDERLIST")
 }
 
 impl Entities {
@@ -1979,5 +1973,82 @@ mod size_tests {
         let b = e.shulker_box();
         // Scale 2: cube of 2, open upwards by 2 × physical opening (1 → 1.0).
         assert!(close(b.max[0] - b.min[0], 2.0) && close(b.max[1], 64.0 + 2.0 + 2.0), "{b:?}");
+    }
+}
+
+/// Switches converted to `rc_data::opt_switch!`: each one still follows its own variable,
+/// with the rule of the reader it replaced (`env_str!(name) != Some("0")`). The environment
+/// cannot be modified in the process, so a child copy of this test binary is started with the
+/// variables set to each value.
+#[cfg(test)]
+mod switch_reading_tests {
+    use crate::entity_render::EntOpt;
+
+    /// Function that returns the state of one switch.
+    type SwitchReader = fn() -> bool;
+
+    /// Every converted switch with its reader (all on by default).
+    const SWITCHES: [(&str, SwitchReader); 14] = [
+        ("RUSTCRAFT_OPT_VARIANTIDX", super::variant_idx_on),
+        ("RUSTCRAFT_OPT_NAMECACHE", super::name_cache_on),
+        ("RUSTCRAFT_OPT_RIDERLIST", super::rider_list_on),
+        ("RUSTCRAFT_OPT_UPLOADRING", crate::render::upload::ring_on),
+        ("RUSTCRAFT_OPT_FRAMEUNIF", crate::render::upload::merged_on),
+        ("RUSTCRAFT_OPT_UNIFSKIP", crate::render::upload::skip_on),
+        ("RUSTCRAFT_OPT_TAGPERSIST", crate::nametag::persist_on),
+        ("RUSTCRAFT_OPT_EQUIPFLAG", || EntOpt::from_env().equip_flag),
+        ("RUSTCRAFT_OPT_KINDINFO", || EntOpt::from_env().kind_info),
+        ("RUSTCRAFT_OPT_SIZEONCE", || EntOpt::from_env().size_once),
+        ("RUSTCRAFT_OPT_OBJEARLY", || EntOpt::from_env().obj_early),
+        ("RUSTCRAFT_OPT_LIGHTONCE", || EntOpt::from_env().light_once),
+        ("RUSTCRAFT_OPT_REGIDX", || EntOpt::from_env().reg_idx),
+        ("RUSTCRAFT_OPT_ITEMFLAGS", || EntOpt::from_env().item_flags),
+    ];
+
+    /// Run in the child process only: prints the value of every switch.
+    #[test]
+    #[ignore = "started by switches_follow_their_variable with the variables set"]
+    fn print_switch_values() {
+        for (name, read) in SWITCHES {
+            // Read twice: the cached second read must give the first value.
+            let first = read();
+            assert_eq!(read(), first, "{name}");
+            println!("switch {name}={first}");
+        }
+    }
+
+    /// Values printed by a child started with `env` (the other switches removed).
+    fn child_values(env: &[(&str, &str)]) -> String {
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary path"));
+        child.args(["--exact", "entities::switch_reading_tests::print_switch_values", "--ignored", "--nocapture"]);
+        for (name, _) in SWITCHES {
+            child.env_remove(name);
+        }
+        child.envs(env.iter().copied());
+        let out = child.output().expect("child test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "child failed under {env:?}:\n{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+        stdout
+    }
+
+    #[test]
+    fn switches_follow_their_variable() {
+        // Every switch set to the same value, then each one alone at `0` (catches a site that
+        // reads the name of another switch).
+        let mut cases: Vec<Vec<(&str, &str)>> = vec![Vec::new()];
+        for value in ["0", "1", ""] {
+            cases.push(SWITCHES.iter().map(|&(name, _)| (name, value)).collect());
+        }
+        cases.extend(SWITCHES.iter().map(|&(name, _)| vec![(name, "0")]));
+        for env in cases {
+            let stdout = child_values(&env);
+            for (name, _) in SWITCHES {
+                // Old reader: `env_str!(name) != Some("0")`.
+                let value = env.iter().find(|(n, _)| *n == name).map(|&(_, v)| v);
+                let expected = value != Some("0");
+                let line = format!("switch {name}={expected}");
+                assert!(stdout.lines().any(|l| l == line), "{name} under {env:?}: expected {expected}\n{stdout}");
+            }
+        }
     }
 }

@@ -293,6 +293,7 @@ impl Server {
         let mut dirty: Vec<(i32, i32)> =
             self.chunks.iter().filter(|(_, c)| c.as_ref().is_some_and(|c| c.dirty)).map(|(p, _)| *p).collect();
         dirty.sort_unstable();
+        let mut encoder = nbtio::RootEncoder::default();
         for p in dirty {
             self.promote_packed_for_save(p); // L9-TICK
             self.export_chunk_ticks(p);
@@ -303,7 +304,7 @@ impl Server {
                 continue;
             };
             c.changed.iter_mut().for_each(|x| *x = false);
-            let nbt = nbtio::encode_root(&root);
+            let nbt = encoder.encode(&root);
             c.root = root;
             jobs.push(Job::Chunk { path: region_dir.join(region_name(p.0, p.1)), cx: p.0, cz: p.1, nbt });
             written += 1;

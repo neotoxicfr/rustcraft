@@ -513,9 +513,8 @@ impl Server {
             self.life.orbs.sort_by_key(|o| o.rank);
         }
         if has(Fam::Mob) {
-            self.mobs.list.sort_by_key(|m| m.as_ref().map_or(0, |m| m.rank));
-            // Rebuilt now: the walk that follows a return looks mobs up by the index.
-            self.mobs.index.refresh(&self.mobs.list, true);
+            // Index brought up to date now: the walk that follows a return looks mobs up by it.
+            self.mobs.sort_by_rank();
         }
         if has(Fam::Fang) {
             self.mobs.ill.fangs.sort_by_key(|f| f.rank);

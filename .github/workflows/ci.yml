@@ -30,22 +30,25 @@ jobs:
         os: [windows-latest, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
+    # Frozen inputs: actions pinned to a commit (the tag only in the comment, which Dependabot
+    # keeps up to date) and `--locked` on every cargo call, so a Cargo.lock that no longer
+    # matches the manifests fails instead of being rewritten silently on the runner.
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Linux build dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
       - name: Toolchain from rust-toolchain.toml
         run: rustup toolchain install && rustup show active-toolchain
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Clippy, warnings as errors
-        run: cargo clippy --release --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --release --workspace --all-targets -- -D warnings
       # Most tests compare with the official game's data: the game is downloaded from Mojang's
       # servers like the launcher does (nothing is stored in the repository), then prepared.
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
-      - uses: actions/setup-java@v6
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin
           java-version: "25"
@@ -56,16 +59,29 @@ jobs:
           echo "RUSTCRAFT_MC_DIR=$RUNNER_TEMP/minecraft" >> "$GITHUB_ENV"
           echo "RUSTCRAFT_CACHE=$RUNNER_TEMP/rustcraft-cache" >> "$GITHUB_ENV"
       - name: Game data
-        run: cargo run --release -p rc-data --example prepare -- 26.3
+        run: cargo run --locked --release -p rc-data --example prepare -- 26.3
       - name: Tests
-        run: cargo test --release --workspace --no-fail-fast
+        run: cargo test --locked --release --workspace --no-fail-fast
+      # One invalid line makes the game refuse a whole function, and one refused chat command
+      # leaves a scene measuring an empty view: the bench's `perf` pack functions and every
+      # scene's chat commands are compiled with our command parser
+      # (`crates/rc-sim/src/tests_perf_pack.rs`, both ignored tests of the module).
+      - name: Bench data pack compiles
+        shell: bash
+        env:
+          RUSTCRAFT_PERF_PACK: ${{ github.workspace }}/target/perf-pack/datapacks/perf
+        run: |
+          python -I tools/bench/scenes.py pack-files target/perf-pack
+          cargo test --locked --release -p rc-sim tests_perf_pack:: -- --ignored
 
   tools:
     name: Python tools
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
       - run: python -I tools/bench/test_scenes.py
+      - run: python -I tools/bench/test_perf_pack.py
+      - run: python -I tools/bench/test_fixtures.py

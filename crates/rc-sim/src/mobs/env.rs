@@ -571,12 +571,12 @@ impl Server {
             return true;
         }
         if matches!(name, "piston" | "sticky_piston") {
-            return !self.v().get_bool(s, "extended");
+            return !self.view().get_bool(s, "extended");
         }
         if name.ends_with("shulker_box") {
             return true;
         }
-        self.tag_id(crate::tag_bits::TagId::CausesSuffocation, self.v().block(s))
+        self.tag_id(crate::tag_bits::TagId::CausesSuffocation, self.view().block(s))
             && self.data.state(s).is_some_and(|i| i.has(flags::FULL_COLLISION))
     }
 

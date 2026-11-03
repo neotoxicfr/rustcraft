@@ -592,7 +592,7 @@ pub fn placement_ok(s: &Server, k: Kind, p: [i32; 3]) -> Option<bool> {
         return None;
     }
     let above = [p[0], p[1] + 1, p[2]];
-    Some(s.mob_fluid(p) == Fluid::Water && !s.v().conductor(s.st(above)))
+    Some(s.mob_fluid(p) == Fluid::Water && !s.view().conductor(s.st(above)))
 }
 
 /// Own spawn rules.
@@ -1272,7 +1272,7 @@ impl Server {
 
     /// Sturdy top face.
     pub(crate) fn bz_face_sturdy_up(&self, p: [i32; 3]) -> bool {
-        self.v().sturdy(self.st(p), crate::blocks::Dir::Up)
+        self.view().sturdy(self.st(p), crate::blocks::Dir::Up)
     }
 
     /// Exchanging an empty item for its filled result for a filled bucket (creative: the original stays).

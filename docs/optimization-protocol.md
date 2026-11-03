@@ -11,6 +11,9 @@ goes through this protocol before being delivered; there is no more code "to opt
 Switches (22/10): an environment variable, `RUSTCRAFT_OPT_*` included, is read only
 through `rc_data::env_str!` / `env_flag!` / `env_os!` (one read per site, `crates/rc-data/src/env_flags.rs`);
 `clippy.toml` rejects `std::env::var` and `var_os` elsewhere, and `set_var` / `remove_var` everywhere.
+A `RUSTCRAFT_OPT_*` switch is read at its use site by `rc_data::opt_switch!("RUSTCRAFT_OPT_X")`
+(on by default, `=0` = old path) or `opt_switch!("RUSTCRAFT_OPT_X", default_off)` (`=1` turns it
+on): the final `bool` is cached, never `env_flag!` (presence only) nor a value computed before its cache.
 
 ## A. What does not move
 

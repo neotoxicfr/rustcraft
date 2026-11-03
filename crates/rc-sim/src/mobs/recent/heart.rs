@@ -172,7 +172,7 @@ impl Server {
             if let Some(h) = self.mobs.rec.hearts.map.get_mut(&p) {
                 h.output = computed;
             }
-            let block = self.v().block(self.st(p));
+            let block = self.view().block(self.st(p));
             self.update_neighbour_for_output_signal(p, block);
         }
         // Distress call (100 ticks).

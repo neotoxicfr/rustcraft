@@ -43,7 +43,7 @@ pub(crate) fn can_receive(s: &Server, p: P, origin: P, event: &str) -> bool {
     let st = s.get(p);
     let Some(ear) = sensor(s.state_name(st)) else { return false };
     if ear == BlockEar::Calibrated {
-        let back = s.v().facing(st).opposite();
+        let back = s.view().facing(st).opposite();
         let wanted = s.signal(rel(p, back), back);
         if wanted != 0 && frequency(event) != wanted {
             return false;
@@ -52,7 +52,7 @@ pub(crate) fn can_receive(s: &Server, p: P, origin: P, event: &str) -> bool {
     if origin == p && matches!(event, "minecraft:block_destroy" | "minecraft:block_place") {
         return false;
     }
-    frequency(event) != 0 && s.v().get(st, PHASE) == Some("inactive")
+    frequency(event) != 0 && s.view().get(st, PHASE) == Some("inactive")
 }
 
 /// Vibration arrived (`dest`: sensor centre): frequency retained, power according to the
@@ -60,7 +60,7 @@ pub(crate) fn can_receive(s: &Server, p: P, origin: P, event: &str) -> bool {
 pub(crate) fn receive(s: &mut Server, p: P, info: &VibInfo, dest: [f64; 3]) {
     let st = s.get(p);
     let Some(ear) = sensor(s.state_name(st)) else { return };
-    if s.v().get(st, PHASE) != Some("inactive") {
+    if s.view().get(st, PHASE) != Some("inactive") {
         return;
     }
     let freq = frequency(&info.event);
@@ -77,7 +77,7 @@ pub(crate) fn receive(s: &mut Server, p: P, info: &VibInfo, dest: [f64; 3]) {
 
 impl Server {
     fn sensor_neighbours(&mut self, p: P, st: u32) {
-        let b = self.v().block(st);
+        let b = self.view().block(st);
         self.update_neighbors_at(p, b);
         self.update_neighbors_at(below(p), b);
     }
@@ -90,14 +90,14 @@ impl Server {
     /// to the source), sound except underwater.
     fn sensor_activate(&mut self, p: P, st: u32, ear: BlockEar, src: Option<Src>, power: i32, freq: i32) {
         let Some(ns) = self.with_prop(st, PHASE, "active") else { return };
-        let ns = self.v().set_int(ns, "power", power);
+        let ns = self.view().set_int(ns, "power", power);
         self.set_update(p, ns);
-        let b = self.v().block(st);
+        let b = self.view().block(st);
         self.schedule_tick(p, b, if ear == BlockEar::Calibrated { 10 } else { 30 });
         self.sensor_neighbours(p, st);
         self.sensor_resonate(p, src, freq);
         self.game_event_src("minecraft:sculk_sensor_tendrils_clicking", center(p), src, None);
-        if !self.v().get_bool(st, "waterlogged") {
+        if !self.view().get_bool(st, "waterlogged") {
             let pitch = self.sensor_pitch();
             self.block_sound(p, "minecraft:block.sculk_sensor.clicking", 1.0, pitch);
         }
@@ -124,12 +124,12 @@ impl Server {
         if sensor(self.state_name(st)).is_none() {
             return false;
         }
-        match self.v().get(st, PHASE) {
+        match self.view().get(st, PHASE) {
             Some("active") => {
                 let Some(ns) = self.with_prop(st, PHASE, "cooldown") else { return true };
-                let ns = self.v().set_int(ns, "power", 0);
+                let ns = self.view().set_int(ns, "power", 0);
                 self.set_update(p, ns);
-                let b = self.v().block(st);
+                let b = self.view().block(st);
                 self.schedule_tick(p, b, 10);
                 self.sensor_neighbours(p, st);
             }
@@ -137,7 +137,7 @@ impl Server {
                 if let Some(ns) = self.with_prop(st, PHASE, "inactive") {
                     self.set_update(p, ns);
                 }
-                if !self.v().get_bool(st, "waterlogged") {
+                if !self.view().get_bool(st, "waterlogged") {
                     let pitch = self.sensor_pitch();
                     self.block_sound(p, "minecraft:block.sculk_sensor.clicking_stop", 1.0, pitch);
                 }
@@ -177,11 +177,11 @@ impl Server {
             self.shrieker_step_on(p, src);
             return;
         }
-        let (b, ids) = (self.v().block(st), &self.bs.t.id);
+        let (b, ids) = (self.view().block(st), &self.bs.t.id);
         if warden || (b != ids.sculk_sensor && b != ids.calibrated_sculk_sensor) || self.block_entity(p).is_none() {
             return;
         }
-        if self.v().get(st, PHASE) == Some("inactive") && can_receive(self, p, p, "minecraft:step") {
+        if self.view().get(st, PHASE) == Some("inactive") && can_receive(self, p, p, "minecraft:step") {
             self.vib_force_schedule(p, "minecraft:step", origin, Some(src));
         }
     }
@@ -191,9 +191,9 @@ impl Server {
         if same_block || sensor(self.state_name(st)).is_none() {
             return;
         }
-        let b = self.v().block(st);
-        if self.v().get_int(st, "power") > 0 && !self.has_scheduled_tick(p, b) {
-            let off = self.v().set_int(st, "power", 0);
+        let b = self.view().block(st);
+        if self.view().get_int(st, "power") > 0 && !self.has_scheduled_tick(p, b) {
+            let off = self.view().set_int(st, "power", 0);
             self.set_block(p, off, flag::CLIENTS | flag::KNOWN_SHAPE);
         }
     }
@@ -203,7 +203,7 @@ impl Server {
         if sensor(self.state_name(old)).is_none() {
             return false;
         }
-        if self.v().get(old, PHASE) == Some("active") {
+        if self.view().get(old, PHASE) == Some("active") {
             self.sensor_neighbours(p, old);
         }
         true
@@ -211,11 +211,11 @@ impl Server {
 
     /// Comparator: last frequency received during the active phase, otherwise 0.
     pub(crate) fn sensor_comparator(&self, p: P, st: u32) -> i32 {
-        if self.v().get(st, PHASE) == Some("active") { self.be_int(p, "last_vibration_frequency") } else { 0 }
+        if self.view().get(st, PHASE) == Some("active") { self.be_int(p, "last_vibration_frequency") } else { 0 }
     }
 
     /// Calibrated: no signal toward the back (side of its input).
     pub(crate) fn sensor_signal_blocked(&self, st: u32, d: Dir) -> bool {
-        self.state_name(st) == "minecraft:calibrated_sculk_sensor" && self.v().facing(st) == d
+        self.state_name(st) == "minecraft:calibrated_sculk_sensor" && self.view().facing(st) == d
     }
 }

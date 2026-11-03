@@ -2,14 +2,15 @@
 //! (`RUSTCRAFT_PERFLOG`). Without the variable: a boolean read once at startup, no walk,
 //! no allocation.
 //!
-//! - Server: chunks walked in bounded batches at every tick on the singleplayer thread, the pass
-//!   resuming at the counter; totals published at the end of each pass. Bytes estimated from the
-//!   real capacity of vectors and strings (heap only, allocator headers excluded).
+//! - Server: one pass over the chunks per report period (100 ticks), walked in bounded batches of
+//!   `PER_TICK` chunks on the singleplayer thread (~11 ticks for 700 chunks), nothing between passes;
+//!   totals published at the end of each pass. Bytes estimated from the real capacity of vectors and
+//!   strings (heap only, allocator headers excluded).
 //! - Generator: entries of its map per stage, biome cache, after each batch.
 //! - Temporary counters to settle optimisation leads: writes of
 //!   proto-chunks (total, distinct positions, became full), re-reads of protos.
 
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 
 use hashbrown::{HashMap, HashSet};
@@ -142,6 +143,38 @@ pub fn root_parts(root: &Nbt, out: &mut [u64; 9]) {
     }
 }
 
+/// When a new pass over the chunks may start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassStart {
+    /// Old path (`RUSTCRAFT_OPT_MEMWALK_ONCE_PER_REPORT=0`): a new pass right after the previous one,
+    /// so ~11 passes per 5 s report on a 700-chunk world, 10 of them never read.
+    Continuous,
+    /// One pass every `TICKS_BETWEEN_PASSES` ticks (default), the first at the first tick.
+    EveryReportPeriod,
+    /// One pass when the `[perf] ram` report asked for one, the first at the first tick
+    /// (`RUSTCRAFT_OPT_MEMWALK_ON_REPORT_REQUEST=1`, default 0).
+    OnReportRequest,
+}
+
+/// Ticks between the starts of two passes: the `[perf] ram` line is written every 5 s, i.e. 100 ticks.
+const TICKS_BETWEEN_PASSES: u32 = 100;
+
+/// Pass start rule, read once at startup.
+fn pass_start() -> PassStart {
+    static ONCE_PER_REPORT: OnceLock<bool> = OnceLock::new();
+    static ON_REQUEST: OnceLock<bool> = OnceLock::new();
+    if !crate::generation::opt_switch(&ONCE_PER_REPORT, "RUSTCRAFT_OPT_MEMWALK_ONCE_PER_REPORT", true) {
+        PassStart::Continuous
+    } else if crate::generation::opt_switch(&ON_REQUEST, "RUSTCRAFT_OPT_MEMWALK_ON_REPORT_REQUEST", false) {
+        PassStart::OnReportRequest
+    } else {
+        PassStart::EveryReportPeriod
+    }
+}
+
+/// Set by `report` (client thread), consumed by the next pass start in `OnReportRequest` mode.
+static REPORT_ASKED_FOR_A_PASS: AtomicBool = AtomicBool::new(false);
+
 /// Pass in progress over the chunks of the singleplayer thread.
 #[derive(Default)]
 struct Walk {
@@ -151,6 +184,107 @@ struct Walk {
     /// Layers already seen in the pass, kept alive until its end: a layer freed during
     /// the pass cannot give its address to a new one, which would then be ignored.
     arcs: HashMap<usize, Layer>,
+    /// Ticks left before the next pass may start (`EveryReportPeriod`); 0 = due now.
+    ticks_until_next_pass: u32,
+    passes_started: u64,
+}
+
+impl Walk {
+    fn in_progress(&self) -> bool {
+        self.next < self.keys.len()
+    }
+
+    /// Should a new pass start at this tick? Called once per tick, before the batch.
+    fn pass_due(&mut self, start: PassStart, report_asked: &AtomicBool) -> bool {
+        let countdown_over = self.ticks_until_next_pass == 0;
+        self.ticks_until_next_pass = self.ticks_until_next_pass.saturating_sub(1);
+        if self.in_progress() {
+            return false;
+        }
+        let asked = report_asked.swap(false, Relaxed);
+        // The first pass starts at once in every mode, so that the first report already has totals.
+        self.passes_started == 0
+            || match start {
+                PassStart::Continuous => true,
+                PassStart::EveryReportPeriod => countdown_over,
+                PassStart::OnReportRequest => asked,
+            }
+    }
+
+    fn begin_pass(&mut self, chunks: &HashMap<(i32, i32), Slot>) {
+        self.arcs.clear();
+        self.keys.clear();
+        self.keys.extend(chunks.keys().copied());
+        self.next = 0;
+        self.passes_started += 1;
+        self.ticks_until_next_pass = TICKS_BETWEEN_PASSES - 1;
+    }
+
+    /// Adds the next `PER_TICK` chunks of the pass to the totals.
+    fn walk_batch(&mut self, chunks: &HashMap<(i32, i32), Slot>) {
+        let end = (self.next + PER_TICK).min(self.keys.len());
+        for &p in &self.keys[self.next..end] {
+            let Some(Some(c)) = chunks.get(&p) else { continue };
+            add_chunk(&mut self.acc, &mut self.arcs, c);
+        }
+        self.next = end;
+    }
+
+    /// Totals of the finished pass (none for an empty world, like the old path). The seen light
+    /// layers are released at once: kept until the next pass, they would hold freed layers for 5 s.
+    fn take_finished_pass(&mut self) -> Option<Server> {
+        let walked_something = !self.keys.is_empty();
+        self.arcs.clear();
+        self.keys.clear();
+        self.next = 0;
+        let done = std::mem::take(&mut self.acc);
+        walked_something.then_some(done)
+    }
+
+    /// One tick of sampling; gives the chunk totals of a pass to publish, if one is ready.
+    /// `report_asked`: the report's request flag (a parameter so that tests use their own).
+    fn tick(&mut self, chunks: &HashMap<(i32, i32), Slot>, start: PassStart, report_asked: &AtomicBool) -> Option<Server> {
+        if start == PassStart::Continuous {
+            return self.tick_continuous(chunks);
+        }
+        if self.pass_due(start, report_asked) {
+            self.begin_pass(chunks);
+        } else if !self.in_progress() {
+            return None;
+        }
+        self.walk_batch(chunks);
+        if self.in_progress() { None } else { self.take_finished_pass() }
+    }
+
+    /// Old path, kept as it was: a finished pass is published at the next tick, which starts the next pass.
+    fn tick_continuous(&mut self, chunks: &HashMap<(i32, i32), Slot>) -> Option<Server> {
+        let mut finished = None;
+        if !self.in_progress() {
+            if !self.keys.is_empty() {
+                finished = Some(std::mem::take(&mut self.acc));
+            }
+            self.begin_pass(chunks);
+        }
+        self.walk_batch(chunks);
+        finished
+    }
+}
+
+type Slot = Option<Box<crate::chunk::Chunk>>;
+
+/// Adds one chunk to the totals of the pass.
+fn add_chunk(a: &mut Server, arcs: &mut HashMap<usize, Layer>, c: &crate::chunk::Chunk) {
+    a.chunks += 1;
+    a.sections += c.sections.iter().map(|s| s.blocks.heap_bytes() + s.biomes.heap_bytes()).sum::<usize>() as u64;
+    for l in c.sky.iter().chain(&c.block).flatten() {
+        if first_sight(arcs, l) {
+            a.light += rc_world::LIGHT_BYTES as u64;
+            a.light_layers += 1;
+        }
+    }
+    a.heightmaps += c.heightmaps.iter().map(|h| h.1.len() * 8).sum::<usize>() as u64;
+    a.block_entities += c.block_entities.iter().map(nbt_heap).sum::<usize>() as u64;
+    root_parts(&c.root, &mut a.root);
 }
 
 type Layer = std::sync::Arc<[u8; rc_world::LIGHT_BYTES]>;
@@ -169,48 +303,26 @@ thread_local! {
 const PER_TICK: usize = 64;
 
 impl crate::server::Server {
-    /// One batch of the sampling pass (to call once per tick, sampling active only).
+    /// One tick of the sampling pass (to call once per tick, sampling active only): a bounded batch
+    /// of chunks while a pass runs, nothing between passes.
     pub(crate) fn mem_walk(&mut self) {
-        WALK.with(|w| {
-            let mut w = w.borrow_mut();
-            if w.next >= w.keys.len() {
-                if !w.keys.is_empty() {
-                    let mut done = std::mem::take(&mut w.acc);
-                    done.entities = self.entities.values().map(|v| v.len() as u64).sum();
-                    done.entity_bytes = self
-                        .entities
-                        .values()
-                        .map(|v| (v.capacity() * size_of::<(i32, Nbt)>() + v.iter().map(|e| nbt_heap(&e.1)).sum::<usize>()) as u64)
-                        .sum();
-                    done.gen_out = self.generator.as_ref().map_or(0, |g| g.rx.len() as u64);
-                    done.writer_queue = self.writer.as_ref().map_or(0, |wr| wr.queued() as u64);
-                    *SERVER.lock().unwrap_or_else(|e| e.into_inner()) = Some(done);
-                }
-                w.arcs.clear();
-                w.keys.clear();
-                w.keys.extend(self.chunks.keys().copied());
-                w.next = 0;
-            }
-            let end = (w.next + PER_TICK).min(w.keys.len());
-            for i in w.next..end {
-                let p = w.keys[i];
-                let Some(Some(c)) = self.chunks.get(&p) else { continue };
-                let w = &mut *w;
-                let a = &mut w.acc;
-                a.chunks += 1;
-                a.sections += c.sections.iter().map(|s| s.blocks.heap_bytes() + s.biomes.heap_bytes()).sum::<usize>() as u64;
-                for l in c.sky.iter().chain(&c.block).flatten() {
-                    if first_sight(&mut w.arcs, l) {
-                        a.light += rc_world::LIGHT_BYTES as u64;
-                        a.light_layers += 1;
-                    }
-                }
-                a.heightmaps += c.heightmaps.iter().map(|h| h.1.len() * 8).sum::<usize>() as u64;
-                a.block_entities += c.block_entities.iter().map(nbt_heap).sum::<usize>() as u64;
-                root_parts(&c.root, &mut a.root);
-            }
-            w.next = end;
-        });
+        let finished = WALK.with(|w| w.borrow_mut().tick(&self.chunks, pass_start(), &REPORT_ASKED_FOR_A_PASS));
+        if let Some(chunk_totals) = finished {
+            *SERVER.lock().unwrap_or_else(|e| e.into_inner()) = Some(self.with_pending_work(chunk_totals));
+        }
+    }
+
+    /// Completes the chunk totals of a pass with the frozen entities and the pending work.
+    fn with_pending_work(&self, mut done: Server) -> Server {
+        done.entities = self.entities.values().map(|v| v.len() as u64).sum();
+        done.entity_bytes = self
+            .entities
+            .values()
+            .map(|v| (v.capacity() * size_of::<(i32, Nbt)>() + v.iter().map(|e| nbt_heap(&e.1)).sum::<usize>()) as u64)
+            .sum();
+        done.gen_out = self.generator.as_ref().map_or(0, |g| g.rx.len() as u64);
+        done.writer_queue = self.writer.as_ref().map_or(0, |wr| wr.queued() as u64);
+        done
     }
 }
 
@@ -235,6 +347,7 @@ pub(crate) fn reset() {
     }
     PROTOS.with(|s| *s.borrow_mut() = HashSet::new());
     WALK.with(|w| *w.borrow_mut() = Walk::default());
+    REPORT_ASKED_FOR_A_PASS.store(false, Relaxed);
 }
 
 /// Proto positions tracked at most (≈ 1 MB): beyond that, new positions are no longer
@@ -281,6 +394,7 @@ pub fn snapshot() -> (Option<Server>, Vec<(String, Gen)>, [u64; 4]) {
 
 /// Readable sampling line (MB), for `[perf] ram`.
 pub fn report() -> String {
+    REPORT_ASKED_FOR_A_PASS.store(true, Relaxed);
     let (s, g, c) = snapshot();
     let mo = |b: u64| b as f64 / 1_048_576.0;
     let mut out = String::new();
@@ -398,5 +512,174 @@ mod tests {
         let (s, g, c) = snapshot();
         assert!(s.is_none() && g.is_empty() && c == [0; 4], "{s:?} {g:?} {c:?}");
         assert_eq!(PROTOS.with(|s| s.borrow().len()), 0);
+    }
+
+    /// Kept compound of a chunk: `sections` sections of `longs` block longs each, both light
+    /// arrays, height map, block entity, ticks and structures (every item of `ROOT_PARTS`).
+    fn chunk_root(sections: i8, longs: usize) -> Nbt {
+        let section = |y: i8| {
+            Nbt::Compound(vec![
+                ("Y".into(), Nbt::Byte(y)),
+                (
+                    "block_states".into(),
+                    Nbt::Compound(vec![
+                        ("palette".into(), Nbt::List((0..8).map(|i| Nbt::String(format!("minecraft:block_{i}"))).collect())),
+                        ("data".into(), Nbt::LongArray(vec![0; longs])),
+                    ]),
+                ),
+                ("biomes".into(), Nbt::Compound(vec![("palette".into(), Nbt::List(vec![Nbt::String("minecraft:plains".into())]))])),
+                ("SkyLight".into(), Nbt::ByteArray(vec![0; 2048])),
+                ("BlockLight".into(), Nbt::ByteArray(vec![0; 2048])),
+            ])
+        };
+        Nbt::Compound(vec![
+            ("sections".into(), Nbt::List((0..sections).map(section).collect())),
+            ("Heightmaps".into(), Nbt::Compound(vec![("WORLD_SURFACE".into(), Nbt::LongArray(vec![0; 37]))])),
+            ("block_entities".into(), Nbt::List(vec![Nbt::Compound(vec![("id".into(), Nbt::String("minecraft:chest".into()))])])),
+            ("block_ticks".into(), Nbt::List(vec![])),
+            ("structures".into(), Nbt::Compound(vec![("starts".into(), Nbt::Compound(vec![]))])),
+            ("Status".into(), Nbt::String("minecraft:full".into())),
+        ])
+    }
+
+    /// `n` chunks (and a few known but absent positions) whose sizes vary with their index; every
+    /// third chunk shares one sky layer, so that the light dedup is exercised across batches.
+    fn frozen_chunks(n: i32, sections: i8, longs: usize) -> HashMap<(i32, i32), Slot> {
+        use rc_world::{Container, Section};
+        let shared: Layer = std::sync::Arc::new([7; rc_world::LIGHT_BYTES]);
+        let mut map = HashMap::new();
+        for i in 0..n {
+            let packed = Container::Packed { bits: 4, palette: Some(vec![0; 16].into()), data: vec![0; 256].into() };
+            let blocks = if i % 2 == 0 { packed } else { Container::Single(1) };
+            let own_layer = || Some(std::sync::Arc::new([i as u8; rc_world::LIGHT_BYTES]));
+            let chunk = crate::chunk::Chunk {
+                x: i,
+                z: -i,
+                sections: vec![Section { non_empty: 1, blocks, biomes: Container::Single(0) }],
+                sky: vec![if i % 3 == 0 { Some(shared.clone()) } else { own_layer() }, None, Some(rc_world::zero_layer())],
+                block: vec![own_layer()],
+                light_on: true,
+                heightmaps: vec![(1, vec![0; 37].into())],
+                block_entities: (0..i % 4).map(|_| Nbt::Compound(vec![("id".into(), Nbt::String("minecraft:chest".into()))])).collect(),
+                inhabited_time: 0,
+                root: chunk_root(sections + (i % 3) as i8, longs),
+                lossy: false,
+                changed: Vec::new(),
+                dirty: false,
+            };
+            map.insert((i, -i), Some(Box::new(chunk)));
+        }
+        for i in 0..5 {
+            map.insert((10_000 + i, 0), None);
+        }
+        map
+    }
+
+    /// Ticks the walk until it publishes; gives the totals and the number of ticks it took.
+    fn ticks_until_published(walk: &mut Walk, chunks: &HashMap<(i32, i32), Slot>, start: PassStart) -> (Server, u32) {
+        let asked = AtomicBool::new(false);
+        for tick in 1..=1000 {
+            if let Some(done) = walk.tick(chunks, start, &asked) {
+                return (done, tick);
+            }
+        }
+        panic!("no pass published in 1000 ticks ({start:?})");
+    }
+
+    /// Totals of the 300 frozen chunks, written down once from the old continuous pass.
+    fn expected_totals() -> Server {
+        Server {
+            chunks: 300,
+            sections: 150 * (16 * 4 + 256 * 8),
+            // 300 block layers, 200 own sky layers, the shared sky layer and the zero layer.
+            light: 502 * rc_world::LIGHT_BYTES as u64,
+            light_layers: 502,
+            heightmaps: 300 * 37 * 8,
+            block_entities: EXPECTED_BLOCK_ENTITY_BYTES,
+            root: EXPECTED_ROOT_PARTS,
+            ..Default::default()
+        }
+    }
+    const EXPECTED_BLOCK_ENTITY_BYTES: u64 = 32_850;
+    const EXPECTED_ROOT_PARTS: [u64; 9] = [1_846_800, 467_100, 105_300, 3_702_600, 112_500, 35_700, 3_300, 21_600, 502_500];
+
+    /// Same frozen world: the spaced pass publishes exactly the totals of the old continuous pass,
+    /// and those totals are the stored ones (a pass published before its end would miss chunks).
+    #[test]
+    fn spaced_pass_publishes_the_same_totals_as_the_continuous_pass() {
+        let chunks = frozen_chunks(300, 2, 256);
+        let (old, old_ticks) = ticks_until_published(&mut Walk::default(), &chunks, PassStart::Continuous);
+        let (new, new_ticks) = ticks_until_published(&mut Walk::default(), &chunks, PassStart::EveryReportPeriod);
+        let (asked, _) = ticks_until_published(&mut Walk::default(), &chunks, PassStart::OnReportRequest);
+        assert_eq!(new, old, "spaced pass differs from the continuous pass");
+        assert_eq!(asked, old, "pass on request differs from the continuous pass");
+        assert_eq!(old, expected_totals(), "totals of the frozen world changed");
+        // 305 positions in batches of 64: 5 ticks; the old path publishes one tick later.
+        assert_eq!((old_ticks, new_ticks), (6, 5));
+    }
+
+    /// 100 ticks = 1 pass started and published; the next starts at tick 101; between the two,
+    /// no walk and no light layer kept alive.
+    #[test]
+    fn one_pass_per_hundred_ticks() {
+        let chunks = frozen_chunks(300, 1, 16);
+        let shared = chunks[&(0, 0)].as_ref().unwrap().sky[0].clone().unwrap();
+        let held_by_the_world = std::sync::Arc::strong_count(&shared) - 1;
+        let (mut walk, asked) = (Walk::default(), AtomicBool::new(false));
+        let mut published = Vec::new();
+        for tick in 1..=200 {
+            if walk.tick(&chunks, PassStart::EveryReportPeriod, &asked).is_some() {
+                published.push(tick);
+                assert_eq!(std::sync::Arc::strong_count(&shared) - 1, held_by_the_world, "layers kept after the pass");
+            }
+            if tick == 100 {
+                assert_eq!((walk.passes_started, published.len()), (1, 1), "100 ticks = one pass");
+            }
+        }
+        assert_eq!(published, [5, 105]);
+        assert_eq!(walk.passes_started, 2);
+    }
+
+    /// On request: the first pass at once, then nothing until the report asks, then one pass.
+    #[test]
+    fn pass_on_request_waits_for_the_report() {
+        let chunks = frozen_chunks(100, 1, 16);
+        let (mut walk, asked) = (Walk::default(), AtomicBool::new(false));
+        let first: Vec<u32> =
+            (1..=300).filter(|_| walk.tick(&chunks, PassStart::OnReportRequest, &asked).is_some()).collect();
+        assert_eq!((first.as_slice(), walk.passes_started), ([2].as_slice(), 1));
+        asked.store(true, Relaxed);
+        let second: Vec<(u32, u64)> = (1..=300)
+            .filter_map(|tick| walk.tick(&chunks, PassStart::OnReportRequest, &asked).map(|s| (tick, s.chunks)))
+            .collect();
+        assert_eq!((second.as_slice(), walk.passes_started), ([(2, 100)].as_slice(), 2));
+        assert!(!asked.load(Relaxed), "request not consumed");
+    }
+
+    /// Cost of one full pass (all batches) over a bench-sized world: 700 chunks of 24 sections.
+    /// `cargo test --release -p rc-sim -- --ignored --nocapture memory_walk_pass_cost`
+    #[test]
+    #[ignore]
+    fn memory_walk_pass_cost() {
+        let chunks = frozen_chunks(700, 24, 342);
+        let asked = AtomicBool::new(false);
+        for start in [PassStart::Continuous, PassStart::EveryReportPeriod] {
+            let mut walk = Walk::default();
+            let mut per_tick = Vec::new();
+            let t = std::time::Instant::now();
+            for _ in 0..1000 {
+                let tick = std::time::Instant::now();
+                std::hint::black_box(walk.tick(&chunks, start, &asked));
+                per_tick.push(tick.elapsed().as_secs_f64() * 1e3);
+            }
+            let total = t.elapsed().as_secs_f64() * 1e3;
+            per_tick.sort_by(f64::total_cmp);
+            eprintln!(
+                "{start:?}: {:.3} ms per 100 ticks, worst tick {:.3} ms, {} passes",
+                total / 10.0,
+                per_tick[per_tick.len() - 1],
+                walk.passes_started
+            );
+        }
     }
 }

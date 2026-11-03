@@ -97,13 +97,13 @@ impl Server {
         let n = self.state_name(state);
         match c {
             Any => true,
-            Air => self.v().is_air(state),
+            Air => self.view().is_air(state),
             Pumpkin => n == "minecraft:carved_pumpkin" || n == "minecraft:jack_o_lantern",
             Snow => n == "minecraft:snow_block",
             Iron => n == "minecraft:iron_block",
             Copper => COPPER_BLOCKS.iter().any(|(b, _)| *b == n),
             Cell::WitherSkull => n == "minecraft:wither_skeleton_skull" || n == "minecraft:wither_skeleton_wall_skull",
-            Cell::SoulBase => self.tag_id(crate::tag_bits::TagId::WitherSummonBaseBlocks, self.v().block(state)),
+            Cell::SoulBase => self.tag_id(crate::tag_bits::TagId::WitherSummonBaseBlocks, self.view().block(state)),
         }
     }
 
@@ -128,7 +128,7 @@ impl Server {
     /// Neighbors of each cell notified (source block: air).
     pub(crate) fn update_pattern_blocks(&mut self, mt: &Match) {
         let air = self.default_state("minecraft:air");
-        let air_block = self.v().block(air);
+        let air_block = self.view().block(air);
         for x in 0..mt.width {
             for y in 0..mt.height {
                 let p = mt.block(x, y);
@@ -213,7 +213,7 @@ impl Server {
         if n != "minecraft:carved_pumpkin" && n != "minecraft:jack_o_lantern" {
             return;
         }
-        if self.v().block(old) == self.v().block(state) {
+        if self.view().block(old) == self.view().block(state) {
             return;
         }
         if let Some(mt) = self.find_pattern(&SNOW_FULL, top) {
@@ -268,7 +268,7 @@ impl Server {
         let p = mt.block(0, 1);
         let name = self.state_name(copper).to_owned();
         let chest = COPPER_BLOCKS.iter().find(|(b, _)| *b == name).map_or("minecraft:copper_chest", |c| c.1);
-        let v = self.v();
+        let v = self.view();
         let facing = v.get(pumpkin, "facing").unwrap_or("north").to_owned();
         let def = self.default_state(chest);
         let mut s = v.set(def, "facing", &facing);
@@ -292,7 +292,7 @@ impl Server {
     /// A double chest takes the lowest oxidation
     /// of the two halves; mixed wax → both without wax.
     pub(crate) fn least_oxidized_chest(&self, s: u32, p: [i32; 3]) -> u32 {
-        let v = self.v();
+        let v = self.view();
         let t = v.get(s, "type").unwrap_or("single");
         if t == "single" {
             return s;

@@ -160,6 +160,19 @@ pub(crate) enum BlockTint {
     World([u32; 4]),
 }
 
+/// Biome colours of a moving block that has no biome-tinted layer (never read).
+pub(super) const UNREAD_BIOME: [u32; 4] = [0xff_ffff; 4];
+
+/// Index in the biome colours (grass, foliage, dry foliage, water) read by a tint layer of
+/// kind `kind`; `None` if that layer does not take a biome colour.
+fn biome_colour_slot(kind: u8) -> Option<usize> {
+    use rc_data::tint::{DRY_FOLIAGE, FOLIAGE, GRASS, WATER};
+    match kind {
+        GRASS | FOLIAGE | DRY_FOLIAGE | WATER => Some(usize::from(kind - GRASS)),
+        _ => None,
+    }
+}
+
 /// Text display placed this frame: entity, matrix (font pixels → camera frame, half-turn and
 /// scale −0.025 included), light, interpolated state.
 #[derive(Clone, Copy, Debug)]
@@ -744,8 +757,10 @@ impl EntityRenderer {
                 let m = t * Mat4::from_translation(Vec3::new(-0.5, 0.0, -0.5));
                 // Tint: biome of the containing block (x, top of the box, z).
                 let top = p[1] + f64::from(e.dims(&self.dims)[1]);
-                let biome = (world.biome_tints)(p[0].floor() as i32, top.floor() as i32, p[2].floor() as i32);
-                self.push_block_tinted(state, m, normal, NEUTRAL, BlockTint::World(biome))
+                let tint = self.world_tint(&[state], || {
+                    (world.biome_tints)(p[0].floor() as i32, top.floor() as i32, p[2].floor() as i32)
+                });
+                self.push_block_tinted(state, m, normal, NEUTRAL, tint)
             }
             "leash_knot" => {
                 let m =
@@ -1236,14 +1251,28 @@ impl EntityRenderer {
             },
             BlockTint::World(biome) => match cs.tint_kind[layer] {
                 rc_data::tint::CONSTANT => cs.tint_value[layer],
-                k @ (rc_data::tint::GRASS
-                | rc_data::tint::FOLIAGE
-                | rc_data::tint::DRY_FOLIAGE
-                | rc_data::tint::WATER) => biome[usize::from(k - rc_data::tint::GRASS)],
-                _ => white,
+                k => biome_colour_slot(k).map_or(white, |slot| biome[slot]),
             },
         };
         0xff00_0000 | c
+    }
+
+    /// True if a tint layer of `state` takes a biome colour: only then does `block_tint` read
+    /// the biome colours of a moving block.
+    pub(super) fn takes_biome_colour(&self, state: u32) -> bool {
+        let Some(cs) = self.source.client_states.get(state as usize) else { return false };
+        cs.tint_kind.iter().any(|&k| biome_colour_slot(k).is_some())
+    }
+
+    /// World tint of a moving block drawn as `states` (pushed, falling, transient). The biome
+    /// colours cost a blur zoom per block and per frame, so with `BLOCKTINTLAZY` they are only
+    /// read when one of the states takes them; otherwise `UNREAD_BIOME`, which `block_tint`
+    /// never looks at for these states.
+    pub(super) fn world_tint(&self, states: &[u32], biome_colours: impl FnOnce() -> [u32; 4]) -> BlockTint {
+        if self.opt.block_tint_lazy && !states.iter().any(|&s| self.takes_biome_colour(s)) {
+            return BlockTint::World(UNREAD_BIOME);
+        }
+        BlockTint::World(biome_colours())
     }
 
     /// Baked mesh with the given matrix (block cube from 0 to 1 from the origin); `tint`:
@@ -1336,7 +1365,7 @@ impl EntityRenderer {
             }
         };
         let (kind, sub, wall, props) = entry?;
-        Some(BlockEntity { kind, sub, wall, state, props, data: Data::None, rev: 0, anim: Anim::default() })
+        Some(BlockEntity { kind, sub, wall, state, props, data: Data::None, rev: 0, anim: Anim::default(), ticket: 0 })
     }
 
     /// Special model of a block drawn as an entity (`m`: block cube), like the game without

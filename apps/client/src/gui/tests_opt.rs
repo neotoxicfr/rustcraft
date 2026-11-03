@@ -14,7 +14,7 @@ use crate::render::upload::Uploader;
 
 const W: u32 = 1600;
 const H: u32 = 900;
-const ALL: GuiOpts = GuiOpts {
+pub(crate) const ALL: GuiOpts = GuiOpts {
     write_with: true,
     uniform: true,
     index: true,
@@ -26,13 +26,13 @@ const ALL: GuiOpts = GuiOpts {
     font_table: true,
 };
 
-struct Env {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    assets: rc_assets::Assets,
+pub(crate) struct Env {
+    pub(crate) device: wgpu::Device,
+    pub(crate) queue: wgpu::Queue,
+    pub(crate) assets: rc_assets::Assets,
 }
 
-fn env() -> Option<Env> {
+pub(crate) fn env() -> Option<Env> {
     let found =
         rc_data::locate("26.3").ok().and_then(|i| rc_assets::Assets::for_install(&i.client_jar, &[], None).ok());
     let assets = rc_testdata::need(found, "installed game 26.3")?;
@@ -52,7 +52,7 @@ fn env() -> Option<Env> {
     Some(Env { device, queue, assets })
 }
 
-fn gui(e: &Env, opts: GuiOpts) -> Gui {
+pub(crate) fn gui(e: &Env, opts: GuiOpts) -> Gui {
     let a = &e.assets;
     let fonts =
         crate::resources::FONT_IDS.iter().map(|id| ((*id).to_owned(), Font::load(a, id, Default::default()))).collect();
@@ -728,7 +728,7 @@ fn text_scene(g: &mut Gui, q: &wgpu::Queue, frame: u32) {
 }
 
 /// Bytes of the placed layers (shapes and text, in order).
-fn layer_bytes(g: &Gui) -> Vec<u8> {
+pub(crate) fn layer_bytes(g: &Gui) -> Vec<u8> {
     let mut out = Vec::new();
     for (blend, shapes, text) in &g.layers {
         out.push(*blend as u8);

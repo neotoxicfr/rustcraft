@@ -31,7 +31,9 @@ md-5 = "0.11.0"
 crossbeam-channel = "0.5.17"
 rayon = "1.12.0"
 mimalloc = { version = "0.1.52", default-features = false }
-wgpu = "30.0.1"
+# Only the backends the client can pick (`gpu_backend.rs`: Vulkan, DX12; Metal kept for macOS):
+# the default OpenGL (gles: glow, EGL, GLSL output) and WebGPU backends are dead code here.
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "dx12", "vulkan", "metal", "wgsl"] }
 winit = "0.30.13"
 glam = { version = "0.34.1", features = ["bytemuck"] }
 bytemuck = { version = "1.25.2", features = ["derive"] }
@@ -52,6 +54,8 @@ rc-audio = { path = "crates/rc-audio" }
 rc-commands = { path = "crates/rc-commands" }
 unicode-bidi = "0.3.18"
 unicode-bidi-mirroring = "0.4.0"
+# Micro-benches of several crates: one declaration so that every crate builds the same criterion.
+criterion = { version = "0.8.2", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

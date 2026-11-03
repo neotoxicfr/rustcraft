@@ -36,8 +36,9 @@ pub enum Misc {
     MinecartSteps { id: i32, steps: Vec<MinecartStep> },
     /// `low_disk_space_warning`.
     LowDiskSpace,
-    /// `server_data`: MOTD and optional PNG icon.
-    ServerData { motd: Component, icon: Option<Vec<u8>> },
+    /// `server_data`: MOTD and optional PNG icon. The MOTD is boxed: a 176-byte component inline
+    /// would make every `Misc` (item pickups included) and every `Event` that large.
+    ServerData { motd: Box<Component>, icon: Option<Vec<u8>> },
 }
 
 /// Identifiers of the packets of this module.
@@ -132,7 +133,7 @@ pub(crate) fn play(ids: &DiversIds, id: i32, r: &mut Reader<'_>) -> Result<Decod
         } else {
             None
         };
-        Misc::ServerData { motd, icon }
+        Misc::ServerData { motd: Box::new(motd), icon }
     } else if id == ids.combat_enter {
         // The client does nothing with the combat enter and exit events (§ 5.1).
         return Ok(Some(None));

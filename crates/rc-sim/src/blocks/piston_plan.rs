@@ -29,7 +29,7 @@ pub(crate) struct Structure {
 
 /// Resolution of a structure on a world `W`.
 pub(crate) struct Resolver<'a, W: PistonWorld + ?Sized> {
-    pub v: &'a View,
+    pub v: &'a View<'a>,
     pub w: &'a W,
 }
 
@@ -67,12 +67,12 @@ impl<W: PistonWorld + ?Sized> Resolver<'_, W> {
 
     fn sticky(&self, s: u32) -> bool {
         let b = self.v.block(s);
-        b == self.v.t.id.slime || b == self.v.t.id.honey
+        b == self.v.table.id.slime || b == self.v.table.id.honey
     }
 
     fn stick_together(&self, a: u32, b: u32) -> bool {
         let (ba, bb) = (self.v.block(a), self.v.block(b));
-        let id = &self.v.t.id;
+        let id = &self.v.table.id;
         if (ba == id.honey && bb == id.slime) || (ba == id.slime && bb == id.honey) {
             return false;
         }
@@ -221,7 +221,8 @@ pub enum ReplayOp {
 
 /// Client replay of the block event of a piston.
 pub struct PistonReplay {
-    v: View,
+    table: Arc<Table>,
+    data: Arc<VersionData>,
     fire: [u16; 2],
 }
 
@@ -274,14 +275,18 @@ impl Plan<'_> {
 
 impl PistonReplay {
     pub fn new(data: Arc<VersionData>) -> Self {
-        let t = Arc::new(Table::new(&data));
-        let fire = [t.id.fire, t.id.soul_fire];
-        PistonReplay { v: View { t, d: data }, fire }
+        let table = Arc::new(Table::new(&data));
+        let fire = [table.id.fire, table.id.soul_fire];
+        PistonReplay { table, data, fire }
+    }
+
+    fn view(&self) -> View<'_> {
+        View { table: &self.table, data: &self.data }
     }
 
     /// The block is a piston (normal or sticky): its event is replayed.
     pub fn is_piston(&self, s: u32) -> bool {
-        matches!(self.v.kind(s), Kind::Piston { .. })
+        matches!(self.view().kind(s), Kind::Piston { .. })
     }
 
     /// Local effects of the event (`b0` 0 extend, 1 retract, 2 retract without pulling; `b1`
@@ -289,8 +294,8 @@ impl PistonReplay {
     /// structure does not move.
     pub fn replay(&self, w: &dyn ReplayWorld, pos: [i32; 3], b0: u8, b1: u8) -> Vec<ReplayOp> {
         let s = w.state(pos);
-        let Kind::Piston { sticky } = self.v.kind(s) else { return Vec::new() };
-        let v = &self.v;
+        let Kind::Piston { sticky } = self.view().kind(s) else { return Vec::new() };
+        let v = self.view();
         let dir = v.facing(s);
         let extended = v.set_bool(s, "extended", true);
         let mut plan = Plan { o: Overlay { w, sets: Vec::new(), movers: Vec::new() }, ops: Vec::new() };
@@ -322,7 +327,7 @@ impl PistonReplay {
                     piece = true;
                 }
                 if !piece {
-                    let r = Resolver { v, w: &plan.o };
+                    let r = Resolver { v: &v, w: &plan.o };
                     let pull_ok = b0 == 1
                         && !v.is_air(ms)
                         && r.pushable(ms, two, dir.opposite(), false, dir)
@@ -341,16 +346,16 @@ impl PistonReplay {
     }
 
     fn air(&self) -> u32 {
-        self.v.default_state(self.v.t.id.air)
+        self.view().default_state(self.table.id.air)
     }
 
     fn base_block(&self, sticky: bool) -> u16 {
-        if sticky { self.v.t.id.sticky_piston } else { self.v.t.id.piston }
+        if sticky { self.table.id.sticky_piston } else { self.table.id.piston }
     }
 
     fn moving_state(&self, dir: Dir, sticky: bool) -> u32 {
-        let v = &self.v;
-        let s = v.set_dir(v.default_state(v.t.id.moving_piston), "facing", dir);
+        let v = self.view();
+        let s = v.set_dir(v.default_state(v.table.id.moving_piston), "facing", dir);
         v.set(s, "type", if sticky { "sticky" } else { "normal" })
     }
 
@@ -358,19 +363,19 @@ impl PistonReplay {
     fn final_tick(&self, plan: &mut Plan<'_>, p: P) {
         let Some(m) = plan.o.mover(p) else { return };
         plan.o.movers.push((p, None));
-        if self.v.kind(plan.o.state(p)) == Kind::MovingPiston {
+        if self.view().kind(plan.o.state(p)) == Kind::MovingPiston {
             let ns = if m.source { self.air() } else { m.moved };
             plan.set(p, ns);
         }
     }
 
     fn move_blocks(&self, plan: &mut Plan<'_>, piston: P, dir: Dir, extending: bool, sticky: bool) -> bool {
-        let v = &self.v;
+        let v = self.view();
         let arm = rel(piston, dir);
         if !extending && v.kind(plan.o.state(arm)) == Kind::PistonHead {
             plan.set(arm, self.air());
         }
-        let Some(st) = (Resolver { v, w: &plan.o }).resolve(piston, dir, extending) else { return false };
+        let Some(st) = (Resolver { v: &v, w: &plan.o }).resolve(piston, dir, extending) else { return false };
         let shapes: Vec<u32> = st.to_push.iter().map(|&q| plan.o.state(q)).collect();
         let mut delete: Vec<P> = st.to_push.clone();
         let push_dir = if extending { dir } else { dir.opposite() };
@@ -390,7 +395,7 @@ impl PistonReplay {
             plan.mover(t, MovingBlock { moved: shapes[i], dir: dir as u8, extending, source: false });
         }
         if extending {
-            let head = v.set_dir(v.default_state(v.t.id.piston_head), "facing", dir);
+            let head = v.set_dir(v.default_state(v.table.id.piston_head), "facing", dir);
             let head = v.set(head, "type", if sticky { "sticky" } else { "normal" });
             delete.retain(|&x| x != arm);
             plan.set(arm, self.moving_state(dir, sticky));
@@ -438,7 +443,7 @@ mod tests {
     /// State `name[key=value,…]` (missing properties: default values).
     pub(crate) fn parse(v: &View, n: &str) -> u32 {
         let (name, props) = n.split_once('[').map_or((n, ""), |(a, b)| (a, b.trim_end_matches(']')));
-        let b = v.t.block_id(name);
+        let b = v.table.block_id(name);
         assert_ne!(b, u16::MAX, "block {name}");
         let mut s = v.default_state(b);
         for kv in props.split(',').filter(|x| !x.is_empty()) {
@@ -453,8 +458,8 @@ mod tests {
     fn setup() -> (PistonReplay, Map, impl Fn(&str) -> u32) {
         let data = Arc::new(rc_testdata::version_data().expect("version data missing (extraction)"));
         let r = PistonReplay::new(data);
-        let v = View { t: r.v.t.clone(), d: r.v.d.clone() };
-        let st = move |n: &str| parse(&v, n);
+        let (table, data) = (r.table.clone(), r.data.clone());
+        let st = move |n: &str| parse(&View { table: &table, data: &data }, n);
         let air = st("minecraft:air");
         (r, Map { blocks: HashMap::new(), movers: HashMap::new(), air }, st)
     }
@@ -491,7 +496,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         let r = PistonReplay::new(data.clone());
         let built = t0.elapsed();
-        let v = View { t: r.v.t.clone(), d: r.v.d.clone() };
+        let v = r.view();
         let air = parse(&v, "minecraft:air");
         let mut w = Map { blocks: HashMap::new(), movers: HashMap::new(), air };
         w.blocks.insert([0, 64, 0], parse(&v, "minecraft:piston[facing=east,extended=false]"));

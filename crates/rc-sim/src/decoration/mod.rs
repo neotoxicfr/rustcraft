@@ -92,6 +92,14 @@ pub(crate) fn kind_of(e: &Nbt) -> Option<DKind> {
     e.get("id").and_then(Nbt::as_str).and_then(DKind::from_name)
 }
 
+/// Position of a decoration whose moves the network tracking sends (armor stand, mannequin).
+pub(crate) fn tracked_position(e: &Nbt) -> Option<[f64; 3]> {
+    if !matches!(kind_of(e), Some(DKind::Stand | DKind::Mannequin)) {
+        return None;
+    }
+    nbtio::f64s::<3>(e.get("Pos"))
+}
+
 /// Push scans reach each compound from its registry entry (`RUSTCRAFT_OPT_DECOSCAN=0`: by
 /// identifier, the former lookup).
 fn deco_scan_indexed() -> bool {
@@ -283,7 +291,8 @@ fn floor_pos(p: [f64; 3]) -> P {
     p.map(|v| v.floor() as i32)
 }
 
-fn chunk_of(p: [f64; 3]) -> (i32, i32) {
+/// Chunk column holding position `p` (kept compounds are filed by it).
+pub(crate) fn chunk_of(p: [f64; 3]) -> (i32, i32) {
     ((p[0].floor() as i32) >> 4, (p[2].floor() as i32) >> 4)
 }
 
@@ -387,22 +396,53 @@ impl Server {
         near.or_else(|| self.entities.values().flat_map(|l| l.iter()).find(|(i, _)| *i == id)).map(|(_, n)| n)
     }
 
-    /// Modifies the compound of a decoration; its chunk will be rewritten.
+    /// Modifies the compound of a decoration; its chunk will be rewritten, and a move into
+    /// another chunk files it there (armor stand that falls or is pushed across a border).
     fn deco_edit(&mut self, id: i32, f: impl FnOnce(&mut Nbt)) {
         let hint = self.deco.live.iter().find(|l| l.id == id).map(|l| l.chunk);
+        let mut edited = None;
         if let Some(c) = hint
             && let Some((_, n)) = self.entities.get_mut(&c).and_then(|v| v.iter_mut().find(|(i, _)| *i == id))
         {
             f(n);
-            self.life.drop_chunks.insert(c);
-            return;
+            edited = Some((c, chunk_of(nbtio::f64s::<3>(n.get("Pos")).unwrap_or_default())));
+        } else if let Some((c, n)) =
+            self.entities.iter_mut().find_map(|(c, l)| l.iter_mut().find(|(i, _)| *i == id).map(|(_, n)| (*c, n)))
+        {
+            f(n);
+            edited = Some((c, chunk_of(nbtio::f64s::<3>(n.get("Pos")).unwrap_or_default())));
         }
-        for (c, l) in self.entities.iter_mut() {
-            if let Some((_, n)) = l.iter_mut().find(|(i, _)| *i == id) {
-                f(n);
-                self.life.drop_chunks.insert(*c);
-                return;
-            }
+        let Some((filed_under, now_in)) = edited else { return };
+        self.life.drop_chunks.insert(filed_under);
+        // Cheap check first: the refile searches the whole map, rare (a border crossed).
+        if now_in != filed_under {
+            self.refile_kept_entity(id);
+        }
+    }
+
+    /// Announces decoration `id` (`e`: its compound) and, for one whose tracking began (armor
+    /// stand, mannequin), codes its next relative move from the announced position. The game
+    /// announces at the tracking's last sent position, then sends the move to the current one in
+    /// the same tick, even frozen or outside the entity simulation range; announcing straight at
+    /// the current position leaves the clients in that same state.
+    pub(crate) fn deco_announce_tracked(&mut self, id: i32, e: &Nbt) {
+        self.deco_announce(id, e);
+        if let Some(pos) = tracked_position(e) {
+            self.deco_announced_at(id, pos);
+        }
+    }
+
+    /// The clients were just given tracked decoration `id` at `pos`.
+    pub(crate) fn deco_announced_at(&mut self, id: i32, pos: [f64; 3]) {
+        if let Some(l) = self.deco.live.iter_mut().find(|l| l.id == id && !l.removed) {
+            l.track.announced_at(pos);
+        }
+    }
+
+    /// The compound of decoration `id` is now filed under `chunk` (fast lookup kept right).
+    pub(crate) fn deco_moved_to_chunk(&mut self, id: i32, chunk: (i32, i32)) {
+        for l in self.deco.live.iter_mut().filter(|l| l.id == id) {
+            l.chunk = chunk;
         }
     }
 
@@ -594,7 +634,7 @@ impl Server {
             count,
             mode: 0,
         };
-        let _ = self.send(Event::Particles(p));
+        let _ = self.send(Event::Particles(Box::new(p)));
     }
 
     // ---------- Tick ----------

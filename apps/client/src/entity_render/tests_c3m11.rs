@@ -277,15 +277,7 @@ fn prepare_snapshot_same_under_every_switch() {
     // Invisible glowing entity and ghost seen by the local player.
     k.r.glow.insert(5000 + KINDS.iter().position(|n| *n == "spider").unwrap() as u128, 0xff00ff);
     k.r.ghosts.insert(5000 + KINDS.iter().position(|n| *n == "enderman").unwrap() as u128);
-    let all_new = EntOpt {
-        equip_flag: true,
-        kind_info: true,
-        size_once: true,
-        obj_early: true,
-        light_once: true,
-        reg_idx: true,
-        item_flags: true,
-    };
+    let all_new = EntOpt::NEW;
     // First pass: caches (layers, item meshes, atlas) filled.
     run(&mut k, &ents, all_new);
     let reference = run(&mut k, &ents, EntOpt::OLD);
@@ -306,6 +298,7 @@ fn prepare_snapshot_same_under_every_switch() {
         ("LIGHTONCE", off(&|o| o.light_once = false)),
         ("REGIDX", off(&|o| o.reg_idx = false)),
         ("ITEMFLAGS", off(&|o| o.item_flags = false)),
+        ("BLOCKTINTLAZY", off(&|o| o.block_tint_lazy = false)),
     ] {
         assert_eq!(run(&mut k, &ents, o), reference, "{name}=0");
     }
@@ -517,15 +510,7 @@ fn meta_map_indexes_match_scan() {
 fn bench_entity_prepare() {
     let Some(mut k) = kit() else { return };
     let base = scene(&k);
-    let all_new = EntOpt {
-        equip_flag: true,
-        kind_info: true,
-        size_once: true,
-        obj_early: true,
-        light_once: true,
-        reg_idx: true,
-        item_flags: true,
-    };
+    let all_new = EntOpt::NEW;
     let configs = [
         ("old", EntOpt::OLD),
         ("all", all_new),

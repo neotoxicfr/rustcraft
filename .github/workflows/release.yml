@@ -30,15 +30,17 @@ jobs:
         os: [windows-latest, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
+    # Frozen inputs: action pinned to a commit (the tag in the comment, kept up to date by
+    # Dependabot) and `--locked`, so the published binary is built from the committed Cargo.lock.
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Linux build dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev pkg-config
       - name: Toolchain from rust-toolchain.toml
         run: rustup toolchain install && rustup show active-toolchain
       - name: Build (full release profile)
-        run: cargo build --release -p rc-app
+        run: cargo build --locked --release -p rc-app
       - name: Package for Windows
         if: runner.os == 'Windows'
         shell: pwsh
@@ -49,8 +51,6 @@ jobs:
           Copy-Item target\release\rustcraft.exe, packaging\windows\INSTALL.txt, LICENSE-MIT, LICENSE-APACHE $dir
           $zip = "pkg\rustcraft-$v-windows-x64.zip"
           Compress-Archive -Path "$dir\*" -DestinationPath $zip
-          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-          "$hash  $(Split-Path $zip -Leaf)" | Set-Content -Path "$zip.sha256" -Encoding ascii
       - name: Package for Linux
         if: runner.os == 'Linux'
         run: |
@@ -60,9 +60,46 @@ jobs:
           strip pkg/files/rustcraft
           chmod 755 pkg/files/rustcraft pkg/files/rustcraft.sh
           tar --owner=0 --group=0 -czf "pkg/rustcraft-$v-linux-x64.tar.gz" -C pkg/files .
-          (cd pkg && sha256sum "rustcraft-$v-linux-x64.tar.gz" > "rustcraft-$v-linux-x64.tar.gz.sha256")
+      # One step and one format for both systems. PowerShell's Set-Content ended the Windows sum
+      # with CRLF: `sha256sum -c` then reads the CR as part of the file name and fails. Git Bash's
+      # sha256sum writes " *name" where Linux writes "  name", so the line is written by hand:
+      # "<hash>  <name>" and a LF, the format of the Linux sums of earlier releases.
+      - name: Checksum
+        shell: bash
+        working-directory: pkg
+        run: |
+          shopt -s nullglob
+          archives=(rustcraft-*.zip rustcraft-*.tar.gz)
+          [ "${#archives[@]}" -eq 1 ] || { echo "::error::expected one archive, found: ${archives[*]}"; exit 1; }
+          name="${archives[0]}"
+          hash=$(sha256sum "$name" | cut -d' ' -f1)
+          printf '%s  %s\n' "$hash" "$name" > "$name.sha256"
+          cat "$name.sha256"
       - name: Upload to the release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$GITHUB_REF_NAME" pkg/rustcraft-* --repo "$GITHUB_REPOSITORY"
+
+  # Checks the published files the way a user does: download them, then `sha256sum -c`.
+  verify:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      - name: Download the release and check every checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir assets && cd assets
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --pattern 'rustcraft-*'
+          ls -l
+          for name in rustcraft-*-windows-x64.zip rustcraft-*-linux-x64.tar.gz; do
+            [ -f "$name" ] && [ -f "$name.sha256" ] || { echo "::error::missing archive or checksum: $name"; exit 1; }
+          done
+          # A CRLF ending is the defect this job guards against: name it rather than leave a
+          # bare "FAILED open or read". `-U` keeps the CR visible to grep under Git Bash too.
+          if grep -lU $'\r' ./*.sha256; then echo "::error::checksum file with a CRLF ending"; exit 1; fi
+          sha256sum --check --strict ./*.sha256

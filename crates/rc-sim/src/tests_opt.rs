@@ -60,12 +60,23 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// air, invulnerability, portal delay; UUID the one `/data` shows), alone b36c37ff…, 820; raids
 /// kept per dimension (the Nether's raids file carries the Nether's own counter instead of the
 /// one that followed the player), alone 0947daba…, 820; both reverted: 700c26d9… again.
-const EXPECTED_NEW: (&str, usize) = ("8af6e543cdc39ac6bf47103b865d4582ae4aaa5d2c6b0c55a00c69e4d10d0fb9", 820);
+/// Structure entities of a generated chunk marked for the save, the only cause of the change:
+/// four entity chunks more, each a mineshaft chest minecart never written before (without the
+/// marking: 8af6e543…, 820 again; every other file identical).
+const EXPECTED_NEW: (&str, usize) = ("972d121d2e75466b47bc291d7efc4c34e54ef7dd9def4b0ba6a1d6f21eb7bfcf", 824);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
+///
+/// The model world is the one `tools/bench/scenes.py prepare` builds with a temporary official
+/// server into `target/perf/model` (136 MB), the input of every scene of the bench. Its
+/// expected fingerprint was recorded on `main` 34e1be81 (series 3, before any change of the
+/// series): four simulations in two processes, all identical. The earlier entry (input 790b2d94…,
+/// expected 50fe98df…, 724 files) was dropped: no copy of that world is left, and its expected
+/// value dates from v0.0.1 (26/10), before the behavior fixes that moved the other fingerprints
+/// since, so an old copy would have failed anyway.
 const EXPECTED_MODEL: &[(&str, &str, usize)] = &[(
-    "790b2d94653a4243e68f2e0cb0ebc3f865f9f59815ed65149067cdd374c6b800",
-    "50fe98dff2e103f959adb0f342b5143554818edf090ff30401b221e2ae3be88c",
-    724,
+    "d49ce0cb6150573c6c6be36ed4acf7b4e63e5b9b0f30a114dd24aa870148ad24",
+    "2a5918d41578df373f8e5bf27070a2923c6be25ecc51ba5daa02e9f7d8bb02cb",
+    740,
 )];
 
 fn ticks(s: &mut Server, n: usize) {
@@ -214,7 +225,10 @@ fn run_new() -> Option<Vec<(String, String)>> {
 /// G4-F08 resumption: mobs write their live `PortalCooldown` (the game writes it for every
 /// entity), the only cause of the change (without it: a551d272…, 380 again).
 /// Lot 9 integration: all together.
-const EXPECTED_MECH: (&str, usize) = ("304c0b39d8961896bf4a8c4d1f90342ef19701aac82e67a005136f19b0d9ff3c", 380);
+/// Structure entities of a generated chunk marked for the save, the only cause of the change: one
+/// entity chunk more (-2 6, a mineshaft chest minecart, lost before; without the marking:
+/// 304c0b39…, 380 again).
+const EXPECTED_MECH: (&str, usize) = ("3171468bfd3aa6a8b5d828bfdb5f7cb16adc0711df89454ab55b4f1b7f4c17e9", 381);
 
 /// Server command (refusal = failure: the rig would be incomplete).
 pub(crate) fn cmd(s: &mut Server, c: &str) {
@@ -332,7 +346,7 @@ fn run_mech() -> Option<Vec<(String, String)>> {
         s.tick += 1;
         for (n, (p, prop)) in on.iter_mut().zip(probes) {
             let st = s.state_at(p).unwrap_or(0);
-            let v = s.v();
+            let v = s.view();
             *n += u32::from(if prop == "power" { v.get_int(st, prop) > 0 } else { v.get_bool(st, prop) });
         }
         if t == 397 {
@@ -364,7 +378,10 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 /// G4-F08 resumption: mobs write their live `PortalCooldown` (the game writes it for every
 /// entity), the only cause of the change (without it: 9c406245… again).
 /// Lot 9 integration: all together.
-const EXPECTED_REGIONS: (&str, usize) = ("054d4766947e49aff86433df1c37fd3cbe32520d5967caa948e56b4ad1192377", 1243);
+/// Structure entities of a generated chunk marked for the save, the only cause of the change: six
+/// entity chunks more, each holding a mineshaft chest minecart that was never written before
+/// (without the marking: 054d4766…, 1243 again; every other chunk identical).
+const EXPECTED_REGIONS: (&str, usize) = ("a055ca7443b428eeeaaeca70708bdcda84280bd8b40512074b9b0cb29719c0c9", 1249);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all
 /// dimensions): SHA-256 of the decompressed NBT per chunk. Sector locations and
@@ -872,6 +889,7 @@ fn bench_ticks() {
         }
         ticks(&mut s, 100);
         let blocks0 = crate::server::BLOCKS_NS.with(std::cell::Cell::get);
+        let views0 = crate::blocks::level::VIEWS_MADE.with(std::cell::Cell::get);
         let light0 = rc_light::stats::totals();
         let mut d: Vec<f64> = (0..400)
             .map(|_| {
@@ -893,6 +911,8 @@ fn bench_ticks() {
             sum / d.len() as f64,
             blocks / d.len() as f64
         );
+        let views = crate::blocks::level::VIEWS_MADE.with(std::cell::Cell::get) - views0;
+        eprintln!("bench_ticks {name} block views: {:.0} per tick", views as f64 / d.len() as f64);
         let l = rc_light::stats::totals().since(&light0);
         light_line(name, &l);
         light_all = light_all.plus(&l);
@@ -908,6 +928,8 @@ fn bench_ticks() {
             stats::FOUND.load(Relaxed),
             stats::ABSENT.load(Relaxed)
         );
+        let (served, fallback) = stats::kind_queries();
+        eprintln!("per-species queries: served {served}, sent to the scan {fallback}");
     }
     s.stop_gen();
     s.stop_parked();

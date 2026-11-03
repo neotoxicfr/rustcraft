@@ -95,6 +95,12 @@ impl ChatTag {
     }
 }
 
+/// Event published by the network thread or by the integrated server (memory link).
+///
+/// Layout: every event takes `size_of::<Event>()` bytes in the channel and in bundles, so the
+/// frequent ones (entity moves, block updates, sounds) pay for the largest variant. Rare variants
+/// above 88 bytes (text components, scores, particles, waypoints) are therefore boxed;
+/// `event_layout_tests` asserts the size.
 #[derive(Debug)]
 pub enum Event {
     /// Entering the game (or dimension change): height of the current world.
@@ -130,7 +136,7 @@ pub enum Event {
     },
     /// Decorated chat line, ready to display, with its tag (`chat.md` § 3.6).
     Chat {
-        component: rc_text::Component,
+        component: Box<rc_text::Component>,
         tag: ChatTag,
     },
     /// Signature of the player message emitted just before (for `delete_chat`).
@@ -152,7 +158,7 @@ pub enum Event {
         entries: Vec<String>,
     },
     /// Action bar text.
-    ActionBar(rc_text::Component),
+    ActionBar(Box<rc_text::Component>),
     /// Game event (rain: types 1, 2, 7, 8).
     GameEvent {
         kind: u8,
@@ -165,7 +171,7 @@ pub enum Event {
     /// One-shot sound or one attached to an entity (`sounds.md` § 1.3, 1.4).
     Sound(rc_proto_v777::play::SoundPacket),
     /// Particles (`particles.md` § 1.1).
-    Particles(rc_proto_v777::entity::LevelParticles),
+    Particles(Box<rc_proto_v777::entity::LevelParticles>),
     /// World event (`sounds.md` § 1.6, `particles.md`): type, block, data, global.
     LevelEvent {
         kind: i32,
@@ -179,11 +185,11 @@ pub enum Event {
         name: Option<String>,
     },
     /// Scoreboard and teams (`scoreboard-teams.md`).
-    Score(rc_proto_v777::scores::ScoreEvent),
+    Score(Box<rc_proto_v777::scores::ScoreEvent>),
     /// Boss bar (`hud-advanced.md` § 1).
     Boss(rc_proto_v777::play::BossEvent),
     /// Waypoint of the locator bar (`hud.md` § 4.8).
-    Waypoint(rc_proto_v777::waypoint::Waypoint),
+    Waypoint(Box<rc_proto_v777::waypoint::Waypoint>),
     /// Map data (`maps.md` § 1).
     MapData(rc_proto_v777::map::MapItemData),
     /// Titles (§ 3): title, subtitle, durations, clear (with durations reset).
@@ -217,7 +223,7 @@ pub enum Event {
     OpenScreen {
         window: i32,
         kind: i32,
-        title: Option<rc_text::Component>,
+        title: Option<Box<rc_text::Component>>,
     },
     /// Close imposed by the server.
     ContainerClosed,
@@ -260,7 +266,7 @@ pub enum Event {
     /// Death of a player (death screen if it is the local player).
     Died {
         entity: i32,
-        message: Option<rc_text::Component>,
+        message: Option<Box<rc_text::Component>>,
     },
     Chunk(Box<ChunkPacket>),
     ForgetChunk {
@@ -307,7 +313,7 @@ pub enum Event {
     Disconnected(String),
     /// Disconnection reason sent by the server (login, configuration or play), just
     /// before `Disconnected`.
-    Kicked(rc_text::Component),
+    Kicked(Box<rc_text::Component>),
     /// Connection accepted (`login_finished`): the connection screen switches to "joining".
     LoginFinished,
     /// State of the connection screen during the login phase (translation key:
@@ -371,7 +377,7 @@ pub enum Event {
         url: String,
         hash: String,
         required: bool,
-        prompt: Option<rc_text::Component>,
+        prompt: Option<Box<rc_text::Component>>,
     },
     /// Removal of a server pack (`None`: all).
     PackPop(Option<u128>),
@@ -408,7 +414,7 @@ pub enum Event {
     },
     /// State of a test instance block (screen open): text, optional size.
     TestInstanceStatus {
-        status: Option<rc_text::Component>,
+        status: Option<Box<rc_text::Component>>,
         size: Option<[i32; 3]>,
     },
     /// Position reported by `/test pos`: absolute block, coordinates relative to the test.
@@ -500,3 +506,6 @@ mod tests {
 
     const REFERENCE: &str = "6c36f763-6526-3b48-9820-8f008743cbeb";
 }
+
+#[cfg(test)]
+mod event_layout_tests;

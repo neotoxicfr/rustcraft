@@ -68,6 +68,8 @@ mod g6f09a_tests;
 #[cfg(test)]
 mod g6f07_tests;
 #[cfg(test)]
+mod draw_order_tests;
+#[cfg(test)]
 mod g6f08_tests;
 
 pub(crate) use table::{Kind, Table};

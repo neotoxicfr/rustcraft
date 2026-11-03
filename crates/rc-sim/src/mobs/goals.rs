@@ -14,6 +14,10 @@ pub const JUMP: u8 = 4;
 pub const TARGET: u8 = 8;
 const FLAGS: [u8; 4] = [MOVE, LOOK, JUMP, TARGET];
 
+/// Species a zombie calls for help: its own and its subspecies (the zombie tag without the
+/// zombified piglin). A test checks it against `Kind::zombie_like`.
+pub(crate) const ZOMBIE_CLASS: [Kind; 4] = [Kind::Zombie, Kind::Husk, Kind::ZombieVillager, Kind::Drowned];
+
 /// What a targeting or fleeing goal aims at.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Who {
@@ -1450,8 +1454,8 @@ impl Server {
                         min: [p[0] - follow, p[1] - 10.0, p[2] - follow],
                         max: [p[0] + 1.0 + follow, p[1] + 1.0 + 10.0, p[2] + 1.0 + follow],
                     };
-                    for o in self.mobs.list.iter_mut().flatten() {
-                        if o.kind == m.kind && o.id != m.id && o.touches(&area) {
+                    for o in self.mobs.of_kind_mut(m.kind) {
+                        if o.id != m.id && o.touches(&area) {
                             forget_and_refresh_universal_anger(o, time);
                         }
                     }
@@ -1949,7 +1953,8 @@ impl Server {
         true
     }
 
-    /// Call for help in retaliation (same species, box ±follow/±10 around a unit cube).
+    /// Call for help in retaliation (same species, box ±follow/±10 around a unit cube; a zombie
+    /// calls its whole class, `ZOMBIE_CLASS`).
     fn alert_others(&mut self, m: &Mob) {
         let follow = m.follow_range();
         let p = m.pos;
@@ -1967,20 +1972,22 @@ impl Server {
             }
             _ => false,
         };
+        // Search by class: a zombie also alerts its subspecies (husk, zombie villager, drowned).
+        // F13: the zombie does not alert zombified piglins.
+        // `[m.kind; 4]`: the same array type as `ZOMBIE_CLASS`; a species named several times is
+        // walked once (`MobIndex::kinds_slots`, and the scan filters by membership).
+        let kinds = if m.kind == Kind::Zombie { ZOMBIE_CLASS } else { [m.kind; 4] };
         let mut wild_ok = Vec::new();
-        for o in self.mobs.list.iter().flatten() {
+        for o in self.mobs.of_kinds(kinds) {
             if let Some(ok) = self.wild_alert_ok(m, o, los) {
                 wild_ok.push((o.id, ok));
             }
         }
-        for o in self.mobs.list.iter_mut().flatten() {
+        for o in self.mobs.of_kinds_mut(kinds) {
             if wild_ok.iter().any(|(id, ok)| *id == o.id && !ok) {
                 continue;
             }
-            // Search by class: a zombie also alerts its subspecies (husk, zombie villager).
-            // F13: the zombie does not alert zombified piglins.
-            if (o.kind == m.kind || (m.kind == Kind::Zombie && o.kind.zombie_like() && o.kind != Kind::ZombifiedPiglin))
-                && o.id != m.id
+            if o.id != m.id
                 && o.target.is_none()
                 && o.touches(&area)
                 && (!m.tame || o.owner == m.owner)

@@ -1,14 +1,17 @@
 //! Scoreboard and teams on the client (`docs/specs/scoreboard-teams.md`): model, sidebar,
 //! formatting of names by team, score in the Tab list.
 
+use std::sync::OnceLock;
+
 use hashbrown::HashMap;
 use rc_commands::suggest::cmp_ignore_case;
 
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::scores::{NumberFormat, ScoreEvent, TeamParams};
-use rc_text::{Component, Lang, StyledChar};
+use rc_text::{Component, StyledChar};
 
-use crate::gui::Gui;
+use crate::gui::{Gui, TextContext};
+use crate::players::Revision;
 
 const COLOR_NAMES: [&str; 16] = [
     "black",
@@ -60,8 +63,40 @@ pub struct Scoreboard {
     /// Changes on every packet that can modify the sidebar (objectives, slots, scores
     /// of an objective shown in the sidebar, teams).
     revision: u64,
+    /// Changes on every packet that can modify the player list: scores of the objective in the
+    /// list slot, that slot, objectives, teams (formatted names and sort).
+    list_revision: Revision,
     /// Sidebar computed for (revision, local player).
     sidebar_cache: Option<SidebarCache>,
+    /// Sidebars styled so far (the proofs check that the styled lines are really kept).
+    #[cfg(test)]
+    styled_builds: usize,
+}
+
+/// Borrowed key (holder, objective) of the score table: its derived hash is the one of the owned
+/// `(String, String)` key (the two strings hashed in order), so a lookup copies neither name.
+#[derive(Hash)]
+struct ScoreKey<'a>(&'a str, &'a str);
+
+impl hashbrown::Equivalent<(String, String)> for ScoreKey<'_> {
+    fn equivalent(&self, k: &(String, String)) -> bool {
+        k.0 == self.0 && k.1 == self.1
+    }
+}
+
+/// Scores looked up with a borrowed key (default); `RUSTCRAFT_OPT_SCORE_KEY_BORROW=0`: both
+/// names copied into an owned key at each lookup (old path). Read once.
+fn score_key_borrow_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| rc_data::env_os!("RUSTCRAFT_OPT_SCORE_KEY_BORROW").is_none_or(|v| v != "0"))
+}
+
+/// Sidebar styled and measured once per rows and text context (default);
+/// `RUSTCRAFT_OPT_SIDEBAR_STYLED_CACHE=0`: flattened and measured on every frame (old path). Only
+/// acts with the kept rows (`RUSTCRAFT_OPT_SIDEBARCACHE`). Read once.
+fn sidebar_styled_cache_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| rc_data::env_os!("RUSTCRAFT_OPT_SIDEBAR_STYLED_CACHE").is_none_or(|v| v != "0"))
 }
 
 /// Title and lines (formatted name, value) of the sidebar, in display order.
@@ -78,6 +113,69 @@ struct SidebarCache {
     revision: u64,
     local: String,
     rows: Option<SidebarRows>,
+    /// The rows styled and measured, for the text context they were styled with.
+    styled: Option<(TextContext, StyledSidebar)>,
+}
+
+/// One line of the sidebar ready to draw.
+struct StyledLine {
+    name: Vec<StyledChar>,
+    score: Vec<StyledChar>,
+    score_width: i32,
+}
+
+/// Sidebar ready to draw: styled title and lines, their widths and the width of the panel.
+struct StyledSidebar {
+    title: Vec<StyledChar>,
+    title_width: i32,
+    lines: Vec<StyledLine>,
+    /// Widest of the title and of the lines (name, then ": " and the score if it has one).
+    width: i32,
+}
+
+impl StyledSidebar {
+    fn build(gui: &Gui, rows: &SidebarRows) -> StyledSidebar {
+        let chars = |c: &Component| rc_text::styled_chars(&rc_text::flatten(c, &gui.lang));
+        let title = rows.title.as_ref().map(chars).unwrap_or_default();
+        let title_width = rc_text::width(gui, &title);
+        let separator = rc_text::width(gui, &chars(&Component::text(": ")));
+        let mut width = title_width;
+        let lines = rows
+            .rows
+            .iter()
+            .map(|(name, score)| {
+                let (name, score) = (chars(name), score.as_ref().map(chars).unwrap_or_default());
+                let score_width = rc_text::width(gui, &score);
+                let after_name = if score_width > 0 { separator + score_width } else { 0 };
+                width = width.max(rc_text::width(gui, &name) + after_name);
+                StyledLine { name, score, score_width }
+            })
+            .collect();
+        StyledSidebar { title, title_width, lines, width }
+    }
+
+    /// Panel on the right of the screen, in a new stratum.
+    fn draw(&self, gui: &mut Gui, queue: &wgpu::Queue, text_background: Option<u32>) {
+        gui.next_layer();
+        let (gw, gh) = (gui.width.floor() as i32, gui.height.floor() as i32);
+        let n = self.lines.len() as i32;
+        let bottom = gh / 2 + n * 9 / 3;
+        let left = gw - self.width - 3;
+        let right = gw - 1;
+        let top = bottom - n * 9;
+        // Backgrounds: 0.4 and 0.3 by default, or the opacity of the "everywhere" text background (option).
+        let header = crate::hud::background_color(text_background, 0x6600_0000);
+        let body = crate::hud::background_color(text_background, 0x4C00_0000);
+        gui.fill((left - 2) as f32, (top - 10) as f32, right as f32, (top - 1) as f32, header);
+        gui.fill((left - 2) as f32, (top - 1) as f32, right as f32, bottom as f32, body);
+        let title_left = left + self.width / 2 - self.title_width / 2;
+        gui.text(queue, &self.title, title_left as f32, (top - 9) as f32, 0xffff_ffff, false, 0);
+        for (i, line) in self.lines.iter().enumerate() {
+            let y = (bottom - (n - i as i32) * 9) as f32;
+            gui.text(queue, &line.name, left as f32, y, 0xffff_ffff, false, 0);
+            gui.text(queue, &line.score, (right - line.score_width) as f32, y, 0xffff_ffff, false, 0);
+        }
+    }
 }
 
 /// Lines at most in the sidebar.
@@ -113,6 +211,9 @@ impl Scoreboard {
         };
         if bump {
             self.revision = self.revision.wrapping_add(1);
+        }
+        if self.touches_list(&ev) {
+            self.list_revision.bump();
         }
         match ev {
             ScoreEvent::Objective { name, mode, display, hearts, format } => match mode {
@@ -196,6 +297,39 @@ impl Scoreboard {
         }
     }
 
+    /// The event can change what the player list shows: a score of the objective in the list slot
+    /// (or all the scores of a holder while the slot is used), that slot, an objective, a team.
+    fn touches_list(&self, ev: &ScoreEvent) -> bool {
+        let list = self.slots[0].as_deref();
+        match ev {
+            ScoreEvent::Score { objective, .. } | ScoreEvent::Reset { objective: Some(objective), .. } => {
+                list == Some(objective.as_str())
+            }
+            ScoreEvent::Reset { objective: None, .. } => list.is_some(),
+            ScoreEvent::Display { slot, .. } => *slot == 0,
+            ScoreEvent::Objective { .. } | ScoreEvent::Team { .. } => true,
+        }
+    }
+
+    /// Revision of what the player list shows from the scoreboard.
+    pub fn list_revision(&self) -> Revision {
+        self.list_revision
+    }
+
+    /// Score of a holder in an objective.
+    fn score(&self, holder: &str, objective: &str) -> Option<&Score> {
+        if score_key_borrow_on() { self.score_borrowed(holder, objective) } else { self.score_owned(holder, objective) }
+    }
+
+    fn score_borrowed(&self, holder: &str, objective: &str) -> Option<&Score> {
+        self.scores.get(&ScoreKey(holder, objective))
+    }
+
+    /// Old path: two names copied for each lookup.
+    fn score_owned(&self, holder: &str, objective: &str) -> Option<&Score> {
+        self.scores.get(&(holder.to_owned(), objective.to_owned()))
+    }
+
     /// Team of a holder, with its name.
     pub fn team_named(&self, holder: &str) -> Option<(&str, &Team)> {
         let n = self.members.get(holder)?;
@@ -255,7 +389,7 @@ impl Scoreboard {
     pub fn list_score(&self, holder: &str) -> Option<(bool, i32, Option<Component>)> {
         let name = self.slots[0].as_ref()?;
         let o = self.objectives.get(name)?;
-        let s = self.scores.get(&(holder.to_owned(), name.clone()));
+        let s = self.score(holder, name);
         let text = s.and_then(|s| self.format_value(s, o, Place::List));
         Some((o.hearts, s.map_or(0, |s| s.value), text))
     }
@@ -264,7 +398,7 @@ impl Scoreboard {
     pub fn below_name(&self, holder: &str) -> Option<Component> {
         let name = self.slots[2].as_ref()?;
         let o = self.objectives.get(name)?;
-        let s = self.scores.get(&(holder.to_owned(), name.clone()))?;
+        let s = self.score(holder, name)?;
         let mut c = Component::text("");
         if let Some(v) = self.format_value(s, o, Place::BelowName) {
             c.extra.push(v);
@@ -352,55 +486,40 @@ impl Scoreboard {
         let stale = self.sidebar_cache.as_ref().is_none_or(|c| c.revision != self.revision || c.local != local);
         if stale {
             let rows = self.sidebar_rows_select(local);
-            self.sidebar_cache = Some(SidebarCache { revision: self.revision, local: local.to_owned(), rows });
+            self.sidebar_cache =
+                Some(SidebarCache { revision: self.revision, local: local.to_owned(), rows, styled: None });
         }
         self.sidebar_cache.as_ref().and_then(|c| c.rows.as_ref())
     }
 
+    /// Kept sidebar styled and measured, again only when its rows or the text context change.
+    fn styled_sidebar(&mut self, gui: &Gui, local: &str) -> Option<&StyledSidebar> {
+        self.sidebar_rows(local)?;
+        let cache = self.sidebar_cache.as_mut()?;
+        let rows = cache.rows.as_ref()?;
+        let context = gui.text_context();
+        if cache.styled.as_ref().is_none_or(|(c, _)| *c != context) {
+            cache.styled = Some((context, StyledSidebar::build(gui, rows)));
+            #[cfg(test)]
+            {
+                self.styled_builds += 1;
+            }
+        }
+        cache.styled.as_ref().map(|(_, s)| s)
+    }
+
     /// Sidebar (§ 5), new stratum; `local` = profile name of the local player.
     pub fn draw_sidebar(&mut self, gui: &mut Gui, queue: &wgpu::Queue, local: &str, text_background: Option<u32>) {
-        let full;
-        let sidebar = if sidebar_cache_on() {
-            self.sidebar_rows(local)
-        } else {
-            full = self.sidebar_rows_full(local);
-            full.as_ref()
-        };
-        let Some(sidebar) = sidebar else { return };
-        let lang: &Lang = &gui.lang;
-        let chars = |c: &Component| rc_text::styled_chars(&rc_text::flatten(c, lang));
-        let title = sidebar.title.as_ref().map(chars).unwrap_or_default();
-        let lines: Vec<(Vec<StyledChar>, Vec<StyledChar>)> = sidebar
-            .rows
-            .iter()
-            .map(|(name, score)| (chars(name), score.as_ref().map(chars).unwrap_or_default()))
-            .collect();
-        gui.next_layer();
-        let w = |gui: &Gui, c: &[StyledChar]| rc_text::width(gui, c);
-        let lt = w(gui, &title);
-        let sep = w(gui, &rc_text::styled_chars(&rc_text::flatten(&Component::text(": "), &gui.lang)));
-        let mut width = lt;
-        for (n, s) in &lines {
-            let ls = w(gui, s);
-            width = width.max(w(gui, n) + if ls > 0 { sep + ls } else { 0 });
-        }
-        let (gw, gh) = (gui.width.floor() as i32, gui.height.floor() as i32);
-        let n = lines.len() as i32;
-        let bottom = gh / 2 + n * 9 / 3;
-        let left = gw - width - 3;
-        let right = gw - 1;
-        let top = bottom - n * 9;
-        // Backgrounds: 0.4 and 0.3 by default, or the opacity of the "everywhere" text background (option).
-        let header = crate::hud::background_color(text_background, 0x6600_0000);
-        let body = crate::hud::background_color(text_background, 0x4C00_0000);
-        gui.fill((left - 2) as f32, (top - 10) as f32, right as f32, (top - 1) as f32, header);
-        gui.fill((left - 2) as f32, (top - 1) as f32, right as f32, bottom as f32, body);
-        gui.text(queue, &title, (left + width / 2 - lt / 2) as f32, (top - 9) as f32, 0xffff_ffff, false, 0);
-        for (i, (name, score)) in lines.iter().enumerate() {
-            let y = (bottom - (n - i as i32) * 9) as f32;
-            gui.text(queue, name, left as f32, y, 0xffff_ffff, false, 0);
-            let ls = w(gui, score);
-            gui.text(queue, score, (right - ls) as f32, y, 0xffff_ffff, false, 0);
+        if !sidebar_cache_on() {
+            if let Some(rows) = self.sidebar_rows_full(local) {
+                StyledSidebar::build(gui, &rows).draw(gui, queue, text_background);
+            }
+        } else if !sidebar_styled_cache_on() {
+            if let Some(rows) = self.sidebar_rows(local) {
+                StyledSidebar::build(gui, rows).draw(gui, queue, text_background);
+            }
+        } else if let Some(styled) = self.styled_sidebar(gui, local) {
+            styled.draw(gui, queue, text_background);
         }
     }
 }

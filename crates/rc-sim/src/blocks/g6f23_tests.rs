@@ -48,7 +48,7 @@ fn line(w: &mut W) -> Vec<Event> {
 
 fn hook(w: &W, p: P, prop: &str) -> bool {
     let s = w.p.s.get(p);
-    w.p.s.v().get_bool(s, prop)
+    w.p.s.view().get_bool(s, prop)
 }
 
 /// Closed line: an attach sound and a `block_attach` at the receiver then at the source; taut
@@ -64,7 +64,7 @@ fn hooks_play_sounds_and_events_receiver_first() {
     w.p.s.mobs.rec.vib.log.clear();
     let mid = WIRES[1];
     let st = w.p.s.get(mid);
-    let pressed = w.p.s.v().set_bool(st, "powered", true);
+    let pressed = w.p.s.view().set_bool(st, "powered", true);
     w.p.s.tripwire_update_source(mid, pressed);
     let evs = w.events();
     assert!(hook(&w, SRC, "powered") && hook(&w, RCV, "powered"), "line powered");
@@ -126,7 +126,7 @@ fn reset(w: &mut W, p: P, cells: &[(P, u32)], air: u32) {
 fn state(w: &W, block: &str, on: &[&str]) -> u32 {
     let id = w.p.s.bs.t.block_id(block);
     assert_ne!(id, u16::MAX, "unknown block {block}");
-    let v = w.p.s.v();
+    let v = w.p.s.view();
     on.iter().fold(v.default_state(id), |s, f| v.set_bool(s, f, true))
 }
 
@@ -148,8 +148,8 @@ fn vine_wraps_around_the_corner_of_its_support() {
         for (d, face) in [(Dir::North, "south"), (Dir::South, "north")] {
             let q = rel(e, d);
             let s = w.p.s.get(q);
-            if w.p.s.v().kind(s) == Kind::Vine {
-                assert!(w.p.s.v().get_bool(s, face), "face turned towards the stone");
+            if w.p.s.view().kind(s) == Kind::Vine {
+                assert!(w.p.s.view().get_bool(s, face), "face turned towards the stone");
                 wrapped = Some(q);
             }
         }
@@ -175,8 +175,8 @@ fn vine_spreads_under_a_ceiling() {
     for _ in 0..20_000 {
         w.p.s.vine_random_tick(vine, p);
         let s = w.p.s.get(n);
-        if w.p.s.v().kind(s) == Kind::Vine {
-            assert!(w.p.s.v().get_bool(s, "up"), "vine placed on the ceiling");
+        if w.p.s.view().kind(s) == Kind::Vine {
+            assert!(w.p.s.view().get_bool(s, "up"), "vine placed on the ceiling");
             grew = true;
             break;
         }
@@ -199,8 +199,8 @@ fn vine_grows_upward_along_its_wall() {
         reset(&mut w, p, &[(rel(p, Dir::East), stone), (rel(ap, Dir::East), stone), (p, vine)], air);
         w.p.s.vine_random_tick(vine, p);
         let s = w.p.s.get(ap);
-        if w.p.s.v().kind(s) == Kind::Vine {
-            assert!(w.p.s.v().get_bool(s, "east"), "east face kept");
+        if w.p.s.view().kind(s) == Kind::Vine {
+            assert!(w.p.s.view().get_bool(s, "east"), "east face kept");
             grew = true;
             break;
         }
@@ -219,6 +219,6 @@ fn vine_up_face_reads_the_top_of_the_block_above() {
         let vine = state(&w, "minecraft:vine", &["up"]);
         let got = w.p.s.vine_update_shape(vine, p, Dir::Up);
         assert_eq!(got == vine, kept, "slab {slab}");
-        assert_eq!(w.p.s.v().kind(got) == Kind::Vine, kept, "slab {slab}: vine kept?");
+        assert_eq!(w.p.s.view().kind(got) == Kind::Vine, kept, "slab {slab}: vine kept?");
     }
 }

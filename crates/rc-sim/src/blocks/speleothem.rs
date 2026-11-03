@@ -43,13 +43,13 @@ const DRIP_SCAN: i32 = 11;
 impl Server {
     /// Speleothem (either block) whose tip points towards `d`.
     pub(crate) fn spel_with_dir(&self, s: u32, d: Dir) -> bool {
-        let v = self.v();
+        let v = self.view();
         self.tag_id(TagId::Speleothems, v.block(s)) && v.get_dir(s, TIP_DIR) == Some(d)
     }
 
     /// Tip (merged included if `merged`).
     fn spel_is_tip(&self, s: u32, merged: bool) -> bool {
-        let v = self.v();
+        let v = self.view();
         if !self.tag_id(TagId::Speleothems, v.block(s)) {
             return false;
         }
@@ -62,24 +62,24 @@ impl Server {
 
     /// Unmerged tip of block `block`, pointing towards `d`.
     fn spel_unmerged_tip(&self, s: u32, d: Dir, block: u16) -> bool {
-        self.spel_is_tip(s, false) && self.v().get_dir(s, TIP_DIR) == Some(d) && self.v().block(s) == block
+        self.spel_is_tip(s, false) && self.view().get_dir(s, TIP_DIR) == Some(d) && self.view().block(s) == block
     }
 
     /// Does block `block` hold at `p` with the tip towards `tip`?
     pub(crate) fn spel_valid_at(&self, p: P, block: u16, tip: Dir) -> bool {
         let b = self.get(rel(p, tip.opposite()));
-        self.v().sturdy(b, tip) || (self.spel_with_dir(b, tip) && self.v().block(b) == block)
+        self.view().sturdy(b, tip) || (self.spel_with_dir(b, tip) && self.view().block(b) == block)
     }
 
     /// Survival of a placed state (shape and placement rule).
     pub(crate) fn speleothem_survives(&self, s: u32, p: P) -> bool {
-        let v = self.v();
+        let v = self.view();
         self.spel_valid_at(p, v.block(s), v.get_dir(s, TIP_DIR).unwrap_or(Dir::Up))
     }
 
     /// Thickness at `p` from the block in front of the tip and the one behind the base.
     fn spel_thickness(&self, p: P, block: u16, tip: Dir, merge: bool) -> &'static str {
-        let v = self.v();
+        let v = self.view();
         let base = tip.opposite();
         let front = self.get(rel(p, tip));
         if self.spel_with_dir(front, base) && v.block(front) == block {
@@ -102,7 +102,7 @@ impl Server {
 
     /// Placement state (`None`: no direction holds). `water`: source water at the position.
     pub(crate) fn speleothem_placement(&self, def: u32, p: P, sneaking: bool, water: bool) -> Option<u32> {
-        let v = self.v();
+        let v = self.view();
         let block = v.block(def);
         let first = if self.pitch < 0.0 { Dir::Down } else { Dir::Up };
         let tip = [first, first.opposite()].into_iter().find(|&d| self.spel_valid_at(p, block, d))?;
@@ -116,7 +116,7 @@ impl Server {
         if dir.axis() != 1 {
             return s;
         }
-        let v = self.v();
+        let v = self.view();
         let block = v.block(s);
         let tip = v.get_dir(s, TIP_DIR).unwrap_or(Dir::Up);
         if tip == Dir::Down && self.has_scheduled_tick(p, block) {
@@ -162,14 +162,14 @@ impl Server {
         }
         if self.bs.rng.next_float() < GROWTH_CHANCE
             && self.spel_with_dir(s, Dir::Down)
-            && self.v().block(self.get(above(p))) != self.v().block(s)
+            && self.view().block(self.get(above(p))) != self.view().block(s)
         {
             self.speleothem_grow(s, p, dripstone);
         }
     }
 
     fn speleothem_grow(&mut self, s: u32, p: P, dripstone: bool) {
-        let v = self.v();
+        let v = self.view();
         let block = v.block(s);
         let t = &self.bs.t.id;
         let feeder = if dripstone { t.dripstone_block } else { t.sulfur };
@@ -200,7 +200,7 @@ impl Server {
         if self.spel_is_tip(s, false) {
             return Some(p);
         }
-        let v = self.v();
+        let v = self.view();
         let d = v.get_dir(s, TIP_DIR)?;
         let block = v.block(s);
         let mut q = p;
@@ -219,28 +219,29 @@ impl Server {
 
     /// Can the tip lengthen (free block with no fluid, or opposite tip to merge with)?
     fn spel_tip_can_grow(&self, ts: u32, tip: P, block: u16) -> bool {
-        let Some(d) = self.v().get_dir(ts, TIP_DIR) else { return false };
+        let Some(d) = self.view().get_dir(ts, TIP_DIR) else { return false };
         let st = self.get(rel(tip, d));
         if !self.fluid_of(st).is_empty() {
             return false;
         }
-        self.v().is_air(st) || self.spel_unmerged_tip(st, d.opposite(), block)
+        self.view().is_air(st) || self.spel_unmerged_tip(st, d.opposite(), block)
     }
 
     fn spel_grow_into(&mut self, from: P, d: Dir, block: u16) {
         let q = rel(from, d);
         let st = self.get(q);
         if self.spel_unmerged_tip(st, d.opposite(), block) {
-            let (top, bottom) = if self.v().get_dir(st, TIP_DIR) == Some(Dir::Up) { (above(q), q) } else { (q, below(q)) };
+            let (top, bottom) =
+                if self.view().get_dir(st, TIP_DIR) == Some(Dir::Up) { (above(q), q) } else { (q, below(q)) };
             self.spel_create(top, Dir::Down, "tip_merge", block);
             self.spel_create(bottom, Dir::Up, "tip_merge", block);
-        } else if self.v().is_air(st) || self.v().block(st) == self.bs.t.id.water {
+        } else if self.view().is_air(st) || self.view().block(st) == self.bs.t.id.water {
             self.spel_create(q, d, "tip", block);
         }
     }
 
     fn spel_create(&mut self, q: P, d: Dir, th: &str, block: u16) {
-        let v = self.v();
+        let v = self.view();
         let f = self.fluid_at(q);
         let s = v.set(v.set_dir(v.default_state(block), TIP_DIR, d), THICK, th);
         let s = v.set_bool(s, "waterlogged", f.kind == 1 && f.source);
@@ -282,7 +283,7 @@ impl Server {
         if !self.spel_with_dir(s, Dir::Down) {
             return None;
         }
-        let v = self.v();
+        let v = self.view();
         let block = v.block(s);
         let mut q = p;
         for _ in 1..DRIP_SCAN {
@@ -312,7 +313,7 @@ impl Server {
     /// The cauldron state `s` takes a drop of `fluid` (empty: water or lava; water cauldron:
     /// water, even when full).
     fn cauldron_takes_drip(&self, s: u32, fluid: u8) -> bool {
-        let (b, id) = (self.v().block(s), &self.bs.t.id);
+        let (b, id) = (self.view().block(s), &self.bs.t.id);
         (b == id.cauldron && fluid != 0) || (b == id.water_cauldron && fluid == 1)
     }
 
@@ -339,7 +340,7 @@ impl Server {
     /// cauldron that takes the fluid below the tip gets a tick in 50 + the fall height. Event
     /// 1504 at the tip in both cases.
     fn dripstone_transfer(&mut self, s: u32, p: P, r: f32) {
-        if r > DRIP_WATER || self.v().block(self.get(above(p))) == self.v().block(s) {
+        if r > DRIP_WATER || self.view().block(self.get(above(p))) == self.view().block(s) {
             return;
         }
         let Some((src, fluid, src_state)) = self.drip_source(s, p) else { return };
@@ -352,17 +353,18 @@ impl Server {
             return;
         }
         let Some(tip) = self.spel_find_tip(s, p, DRIP_SCAN) else { return };
-        if fluid == 1 && self.v().block(src_state) == self.bs.t.id.mud {
-            let clay = self.v().default_state(self.bs.t.id.clay);
+        if fluid == 1 && self.view().block(src_state) == self.bs.t.id.mud {
+            let clay = self.view().default_state(self.bs.t.id.clay);
             self.set_update(src, clay);
             // Gained part: from the top of the mud's collision shape to the full block.
-            let mud_top = self.data.shape(self.v().info(src_state).collision).iter().map(|b| b.max[1]).fold(0.0, f64::max);
+            let mud_shape = self.data.shape(self.view().info(src_state).collision);
+            let mud_top = mud_shape.iter().map(|b| b.max[1]).fold(0.0, f64::max);
             self.push_entities_up(src, mud_top, 1.0);
             self.game_event_block("minecraft:block_change", src, None, Some(clay));
             self.level_event(1504, tip, 0);
         } else if let Some(c) = self.drip_walk(tip, Dir::Down, |st| self.cauldron_takes_drip(st, fluid)) {
             self.level_event(1504, tip, 0);
-            let cb = self.v().block(self.get(c));
+            let cb = self.view().block(self.get(c));
             self.schedule_tick(c, cb, 50 + tip[1] - c[1]);
         }
     }
@@ -373,7 +375,7 @@ impl Server {
     /// full (1047). "Block changed" with the new state.
     pub(crate) fn cauldron_drip_tick(&mut self, s: u32, p: P) {
         let free_tip = |st: u32| {
-            let v = self.v();
+            let v = self.view();
             self.spel_with_dir(st, Dir::Down) && v.get(st, THICK) == Some("tip") && !v.get_bool(st, "waterlogged")
         };
         let Some(tip) = self.drip_walk(p, Dir::Up, free_tip) else { return };
@@ -384,7 +386,7 @@ impl Server {
         if !self.cauldron_takes_drip(s, fluid) {
             return;
         }
-        let v = self.v();
+        let v = self.view();
         let (ns, event) = if v.block(s) == self.bs.t.id.cauldron {
             if fluid == 1 {
                 (v.default_state(self.bs.t.id.water_cauldron), 1047)
@@ -406,7 +408,7 @@ impl Server {
     /// Does a drop pass through this state? Air yes; opaque block or fluid no; otherwise
     /// only if its collision shape leaves the central column free.
     fn drip_passes(&self, s: u32) -> bool {
-        let v = self.v();
+        let v = self.view();
         if v.is_air(s) {
             return true;
         }

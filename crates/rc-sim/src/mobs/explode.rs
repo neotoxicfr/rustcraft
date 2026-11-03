@@ -196,7 +196,7 @@ impl Server {
             self.rule("minecraft:mob_griefing", true) || matches!(blast, Blast::Block | Blast::Tnt(_) | Blast::TntCart { .. });
         let rail_safe = matches!(blast, Blast::TntCart { primed: true });
         let portal_immune = matches!(blast, Blast::Tnt(true) | Blast::None(true));
-        let nether_portal = self.tb().block_id("nether_portal");
+        let nether_portal = self.table().block_id("nether_portal");
         // 1. Blocks hit.
         let mut toblow: Vec<[i32; 3]> = Vec::new();
         let h = self.dim.height;
@@ -226,7 +226,7 @@ impl Server {
                         };
                         // TNT that went through a portal: the Nether portal without resistance or
                         // destruction.
-                        let immune = portal_immune && self.v().block(self.st(p)) == nether_portal;
+                        let immune = portal_immune && self.view().block(self.st(p)) == nether_portal;
                         // G5-F06: primed TNT minecart, rails and their support spared.
                         let spared = rail_safe
                             && (self.btag_id(p, crate::tag_bits::TagId::Rails) || self.btag_id([p[0], p[1] + 1, p[2]], crate::tag_bits::TagId::Rails));
@@ -363,7 +363,7 @@ impl Server {
                     self.tnt_was_exploded(p);
                     continue;
                 }
-                let hive = self.v().kind(s) == crate::blocks::Kind::Beehive;
+                let hive = self.view().kind(s) == crate::blocks::Kind::Beehive;
                 if hive {
                     self.hive_blown(p, hive_release);
                 }

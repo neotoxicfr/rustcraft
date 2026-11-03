@@ -13,7 +13,7 @@ const SPIKE: &str = "minecraft:sulfur_spike";
 
 fn prop(w: &W, at: P, name: &str) -> String {
     let s = w.p.s.get(at);
-    w.p.s.v().get(s, name).unwrap_or("?").to_owned()
+    w.p.s.view().get(s, name).unwrap_or("?").to_owned()
 }
 
 fn block_events(evs: &[Event], at: P) -> usize {

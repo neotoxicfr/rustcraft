@@ -525,7 +525,7 @@ impl App {
                 None
             }
             Event::Kicked(c) => {
-                self.front.kicked = Some(c);
+                self.front.kicked = Some(*c);
                 None
             }
             Event::Joined { .. } => {

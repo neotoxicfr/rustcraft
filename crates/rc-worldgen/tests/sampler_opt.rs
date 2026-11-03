@@ -1,65 +1,146 @@
-//! Density evaluator (C1-M05): new paths (`sampler::Opts::NEW`) against the old code
-//! (`Opts::OLD`) bit for bit, on the router roots and the vein functions; micro-benches.
+//! Density evaluator (C1-M05, C1-M06): new paths (`sampler::Opts::NEW`) against the old code
+//! (`Opts::OLD`) bit for bit, on the router roots and the vein functions; a context kept from
+//! one chunk to the next against a fresh one; micro-benches.
 //! Without game data, the tests are skipped (explicit failure under `RUSTCRAFT_OPT_REQUIRE=1`).
 //!
 //! Benches (quiet machine): `cargo test --release -p rc-worldgen --test sampler_opt -- --ignored --nocapture`.
 
 mod common;
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::{GlobalAlloc, Layout};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use rc_worldgen::sampler::{Opts, Sid};
+use rayon::prelude::*;
+use rc_worldgen::proto::ProtoTerrain;
+use rc_worldgen::sampler::{Opts, S, Sid};
+use rc_worldgen::terrain::{BiomeCache, TerrainGenerator};
 use rc_worldgen::{Ctx, Generator, Volume};
 
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
 
-/// Allocation counter of the test binary (per-chunk allocation bench), around
-/// the system allocator.
+/// Allocation counter of the test binary (per-chunk allocation bench), around the client's
+/// allocator (mimalloc), so that the counts and timings are those of the game.
 #[allow(unsafe_code)]
 mod counting {
-    use super::{ALLOCS, BYTES, GlobalAlloc, Layout, Ordering, System};
+    use super::{ALLOCS, BYTES, GlobalAlloc, Layout, Ordering};
+    use mimalloc::MiMalloc;
 
     struct Counting;
 
-    // SAFETY: delegates as is to the system allocator; only two counters are added.
+    fn count(bytes: usize) {
+        ALLOCS.fetch_add(1, Ordering::Relaxed);
+        BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    // SAFETY: delegates as is to mimalloc; only two counters are added.
     unsafe impl GlobalAlloc for Counting {
         unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-            BYTES.fetch_add(l.size() as u64, Ordering::Relaxed);
+            count(l.size());
             // SAFETY: same preconditions as the caller.
-            unsafe { System.alloc(l) }
+            unsafe { MiMalloc.alloc(l) }
+        }
+        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+            count(l.size());
+            // SAFETY: same preconditions as the caller.
+            unsafe { MiMalloc.alloc_zeroed(l) }
         }
         unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-            // SAFETY: `p` comes from this allocator, hence from the system.
-            unsafe { System.dealloc(p, l) }
+            // SAFETY: `p` comes from this allocator, hence from mimalloc.
+            unsafe { MiMalloc.dealloc(p, l) }
         }
         unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-            ALLOCS.fetch_add(1, Ordering::Relaxed);
-            BYTES.fetch_add(n as u64, Ordering::Relaxed);
+            count(n);
             // SAFETY: same preconditions as the caller.
-            unsafe { System.realloc(p, l, n) }
+            unsafe { MiMalloc.realloc(p, l, n) }
         }
     }
 
     #[global_allocator]
     static A: Counting = Counting;
+
+    /// Index of `mi_option_page_commit_on_demand` in the `mi_option_t` enumeration of the linked
+    /// library (libmimalloc-sys 0.1.49, mimalloc v3, `include/mimalloc.h`): to recheck on every
+    /// bump, together with the same constant of the client (`apps/client/src/debug_sys.rs`).
+    const MI_OPTION_PAGE_COMMIT_ON_DEMAND: i32 = 40;
+
+    /// Setting of the allocator in the client (`debug_sys::commit_on_demand`): pages committed
+    /// on demand.
+    pub fn client_options() {
+        unsafe extern "C" {
+            fn mi_option_set(option: i32, value: std::ffi::c_long);
+        }
+        // SAFETY: function of the linked mimalloc library (global allocator); the value 1 is documented.
+        unsafe { mi_option_set(MI_OPTION_PAGE_COMMIT_ON_DEMAND, 1) }
+    }
+}
+
+/// Page faults and private bytes of the process (Windows; `None` elsewhere).
+#[allow(unsafe_code)]
+mod process {
+    #[cfg(windows)]
+    pub fn memory() -> Option<(u64, u64)> {
+        // Layout of the system structure: only two fields are read.
+        #[allow(dead_code)]
+        #[repr(C)]
+        #[derive(Default)]
+        struct Counters {
+            cb: u32,
+            page_fault_count: u32,
+            peak_working_set_size: usize,
+            working_set_size: usize,
+            quota_peak_paged_pool_usage: usize,
+            quota_paged_pool_usage: usize,
+            quota_peak_non_paged_pool_usage: usize,
+            quota_non_paged_pool_usage: usize,
+            pagefile_usage: usize,
+            peak_pagefile_usage: usize,
+            private_usage: usize,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn K32GetProcessMemoryInfo(process: isize, counters: *mut Counters, cb: u32) -> i32;
+        }
+        let mut c = Counters { cb: size_of::<Counters>() as u32, ..Counters::default() };
+        // SAFETY: documented call of kernel32 on the current process with a structure of the
+        // size given in `cb` (PROCESS_MEMORY_COUNTERS_EX).
+        let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) } != 0;
+        ok.then_some((u64::from(c.page_fault_count), c.private_usage as u64))
+    }
+
+    #[cfg(not(windows))]
+    pub fn memory() -> Option<(u64, u64)> {
+        None
+    }
 }
 
 const SEED: i64 = 20_261_011;
 
 /// Each path alone, then the combinations with `range_yvol`, then all: a faulty track is
 /// named by its own failure.
-const VARIANTS: [(&str, Opts); 6] = [
-    ("range_yvol", Opts { range_yvol: true, vol_pool: false, spline_stack: false }),
-    ("vol_pool", Opts { range_yvol: false, vol_pool: true, spline_stack: false }),
-    ("spline_stack", Opts { range_yvol: false, vol_pool: false, spline_stack: true }),
-    ("yvol+pool", Opts { range_yvol: true, vol_pool: true, spline_stack: false }),
-    ("yvol+spline", Opts { range_yvol: true, vol_pool: false, spline_stack: true }),
+const VARIANTS: [(&str, Opts); 8] = [
+    ("range_yvol", Opts { range_yvol: true, ..Opts::OLD }),
+    ("vol_pool", Opts { vol_pool: true, ..Opts::OLD }),
+    ("spline_stack", Opts { spline_stack: true, ..Opts::OLD }),
+    ("take_without_zeroing", Opts { take_without_zeroing: true, ..Opts::OLD }),
+    ("best_fit_buffers", Opts { best_fit_buffers: true, ..Opts::OLD }),
+    ("yvol+pool", Opts { range_yvol: true, vol_pool: true, ..Opts::OLD }),
+    ("yvol+spline", Opts { range_yvol: true, spline_stack: true, ..Opts::OLD }),
     ("all", Opts::NEW),
 ];
+
+/// Contexts of the new paths: each variant, plus all the paths with every taken buffer filled
+/// with NaN (a caller that reads an element it did not write changes the result).
+fn variant_contexts(cached: bool) -> Vec<(&'static str, Ctx)> {
+    let mk = |o: Opts| if cached { Ctx::cached_with(o) } else { Ctx::uncached_with(o) };
+    let mut v: Vec<(&str, Ctx)> = VARIANTS.iter().map(|(label, o)| (*label, mk(*o))).collect();
+    let mut poisoned = mk(Opts::NEW);
+    poisoned.poison_taken_buffers();
+    v.push(("all, taken buffers poisoned", poisoned));
+    v
+}
 
 /// Pseudo-random chunks (near, far, negative), reproducible.
 fn chunks(n: usize) -> Vec<(i32, i32)> {
@@ -137,13 +218,12 @@ fn check_volumes(preset: &str, n: usize, veins: bool) {
         // Fewer side volumes to fit the test time; the whole volume always.
         let vols: Vec<Volume> = if k % 8 == 0 { vols } else { vec![vols[0], vols[1 + k % 5]] };
         for cached in [true, false] {
-            let mk = |o: Opts| if cached { Ctx::cached_with(o) } else { Ctx::uncached_with(o) };
-            let mut old_ctx = mk(Opts::OLD);
-            let mut new_ctx: Vec<Ctx> = VARIANTS.iter().map(|(_, o)| mk(*o)).collect();
+            let mut old_ctx = if cached { Ctx::cached_with(Opts::OLD) } else { Ctx::uncached_with(Opts::OLD) };
+            let mut new_ctx = variant_contexts(cached);
             for v in &vols {
                 for (name, s) in &roots {
                     let want = g.volume(*s, &mut old_ctx, v);
-                    for ((label, _), ctx) in VARIANTS.iter().zip(&mut new_ctx) {
+                    for (label, ctx) in &mut new_ctx {
                         let got = g.volume(*s, ctx, v);
                         if let Some((bad, i)) = first_diff(&got, &want) {
                             failures.push(format!(
@@ -331,6 +411,213 @@ fn point_after_volume_cache_under_choice() {
     assert!(failures.is_empty(), "{} differences:\n{}", failures.len(), failures.join("\n"));
 }
 
+const KEEP_SEEDS: [i64; 3] = [0, -6_214_586_474_519_478_921, 1_234_567_890_123_456_789];
+
+/// Function built so that a stale cache cell shows (no 26.3 cache is read this way): a cache over
+/// an interpolated noise whose y scale is not a power of 2, so that its point value differs
+/// from its volume value away from the cell corners.
+const CACHE_OVER_INTERPOLATION: &str = r#"{"type":"minecraft:cache","input":{"type":"minecraft:interpolated",
+    "cell_size_xz":4,"cell_size_y":8,"input":{"type":"minecraft:noise","noise":"minecraft:cave_cheese",
+    "xz_scale":1.0,"y_scale":0.6666666666666666}}}"#;
+
+/// Positions read in a chunk (offsets x, z; world y): away from the interpolation corners.
+const SPOTS: [(i32, i32, i32); 3] = [(5, 37, 7), (13, 101, 2), (2, 66, 11)];
+
+fn compile_text(g: &mut Generator, text: &str) -> Sid {
+    let f = rc_worldgen::density::parse(&rc_worldgen::json::parse(text).unwrap()).unwrap();
+    g.compile_function(&f).unwrap()
+}
+
+fn cache_nodes(g: &Generator) -> Vec<Sid> {
+    (0..g.program.nodes.len() as Sid).filter(|&s| matches!(g.program.nodes[s as usize], S::Cache { .. })).collect()
+}
+
+/// 200 chunks: 8 runs of 25 neighbours along x, from the test chunks.
+fn chunk_walk() -> Vec<(i32, i32)> {
+    chunks(8).into_iter().flat_map(|(cx, cz)| (0..25).map(move |k| (cx + k, cz))).collect()
+}
+
+fn read_spots<'a>(
+    g: &Generator,
+    ctx: &mut Ctx,
+    caches: &[Sid],
+    (cx, cz): (i32, i32),
+    spots: impl Iterator<Item = &'a (i32, i32, i32)>,
+    out: &mut Vec<f32>,
+) {
+    for &(ox, y, oz) in spots {
+        for &c in caches {
+            out.push(g.value(c, ctx, cx * 16 + ox, y, cz * 16 + oz));
+        }
+    }
+}
+
+/// Values seen by one chunk in `ctx`, in the order of the terrain: point reads on every cache in
+/// the previous chunk (whose volumes a kept context could still hold), the volumes of the chunk
+/// (buffers handed back), then point reads in the chunk (in reverse order: the first one is
+/// the last point the previous chunk read) and in the next chunk.
+fn chunk_reads(g: &Generator, ctx: &mut Ctx, roots: &[Sid], caches: &[Sid], (cx, cz): (i32, i32)) -> Vec<f32> {
+    let mut out = Vec::new();
+    read_spots(g, ctx, caches, (cx - 1, cz), SPOTS.iter(), &mut out);
+    let v = g.chunk_volume(cx, cz);
+    for &root in roots {
+        let b = g.volume(root, ctx, &v);
+        out.extend_from_slice(&b);
+        ctx.recycle(b);
+    }
+    read_spots(g, ctx, caches, (cx, cz), SPOTS.iter().rev(), &mut out);
+    read_spots(g, ctx, caches, (cx + 1, cz), SPOTS.iter(), &mut out);
+    out
+}
+
+/// Chunks of the walk in a context kept and reset at each chunk, against a fresh context.
+fn kept_context_failures(pack: &rc_worldgen::data::DataPack, preset: &str, seed: i64) -> Vec<String> {
+    let mut g = Generator::new(pack, preset, seed).unwrap();
+    let built = compile_text(&mut g, CACHE_OVER_INTERPOLATION);
+    let roots = [g.router.final_density, built];
+    let caches = cache_nodes(&g);
+    let mut kept = Ctx::cached_with(Opts::NEW);
+    let mut failures = Vec::new();
+    for pos in chunk_walk() {
+        kept.reset_for_reuse();
+        let got = chunk_reads(&g, &mut kept, &roots, &caches, pos);
+        let want = chunk_reads(&g, &mut Ctx::cached_with(Opts::NEW), &roots, &caches, pos);
+        if let Some((bad, i)) = first_diff(&got, &want) {
+            failures.push(format!("{preset} seed {seed} chunk {pos:?}: {bad} differences, first {i}: {} ≠ {}", got[i], want[i]));
+            if failures.len() >= 5 {
+                break;
+            }
+        }
+    }
+    failures
+}
+
+/// A context kept from one chunk to the next and reset at each one (like the terrain) gives
+/// what a fresh context gives, bit for bit: 200 chunks × 3 seeds × 3 dimensions, final density
+/// and the built cache over an interpolation, point reads on every cache around the chunk.
+#[test]
+fn kept_context_matches_fresh_context() {
+    let Some(pack) = common::data_pack() else { return };
+    let jobs: Vec<(&str, i64)> =
+        ["overworld", "nether", "end"].into_iter().flat_map(|p| KEEP_SEEDS.map(|s| (p, s))).collect();
+    let failures: Vec<String> =
+        jobs.par_iter().flat_map_iter(|&(preset, seed)| kept_context_failures(&pack, preset, seed)).collect();
+    assert!(failures.is_empty(), "{} chunks differ:\n{}", failures.len(), failures.join("\n"));
+}
+
+/// One terrain chunk, then the base heights of two columns inside it (a kept context still holds
+/// its volumes) and of two columns of the next chunk (base columns go through the same kept
+/// context).
+fn terrain_step(t: &TerrainGenerator, cache: &BiomeCache, (cx, cz): (i32, i32)) -> (ProtoTerrain, Vec<i32>) {
+    let chunk = t.generate(cx, cz, cache, None);
+    let columns = [cx, cx + 1].into_iter().flat_map(|x0| SPOTS[..2].iter().map(move |&(ox, _, oz)| (x0 * 16 + ox, cz * 16 + oz)));
+    let heights = columns.flat_map(|(x, z)| [t.base_height(x, z, false), t.base_height(x, z, true)]);
+    (chunk, heights.collect())
+}
+
+/// Chunks of `walk` in order on this thread (see [`terrain_step`]).
+fn terrain_walk(t: &TerrainGenerator, cache: &BiomeCache, walk: &[(i32, i32)]) -> Vec<(ProtoTerrain, Vec<i32>)> {
+    walk.iter().map(|&pos| terrain_step(t, cache, pos)).collect()
+}
+
+/// Each chunk of `walk` generated by every generator in turn on this thread, with or without the
+/// kept context.
+fn interleaved_walk(
+    gens: &mut [(TerrainGenerator, BiomeCache)],
+    walk: &[(i32, i32)],
+    keep: bool,
+) -> Vec<(ProtoTerrain, Vec<i32>)> {
+    let mut out = Vec::new();
+    for &pos in walk {
+        for (t, cache) in gens.iter_mut() {
+            t.opts.keep_eval_context = keep;
+            out.push(terrain_step(t, cache, pos));
+        }
+    }
+    out
+}
+
+fn terrain_diff((a, ha): &(ProtoTerrain, Vec<i32>), (b, hb): &(ProtoTerrain, Vec<i32>)) -> Option<String> {
+    if let Some(i) = a.blocks.iter().zip(&b.blocks).position(|(x, y)| x != y) {
+        return Some(format!("block {i}: {} ≠ {}", a.blocks[i], b.blocks[i]));
+    }
+    if !a.world_surface_wg.iter().eq(b.world_surface_wg.iter()) || !a.ocean_floor_wg.iter().eq(b.ocean_floor_wg.iter()) {
+        return Some("height maps".into());
+    }
+    if a.post_processing != b.post_processing {
+        return Some("fluid marks".into());
+    }
+    (ha != hb).then(|| format!("base heights {ha:?} ≠ {hb:?}"))
+}
+
+/// Terrain chunks generated one after another on this thread with the kept context against a
+/// fresh context per chunk: same blocks, height maps, fluid marks and base heights. The kept
+/// context also passes from one generator (dimension, seed) to the next, as on a server thread.
+#[test]
+fn kept_context_terrain_matches_fresh() {
+    let Some(pack) = common::data_pack() else { return };
+    let dims = ["minecraft:overworld", "minecraft:the_nether", "minecraft:the_end"];
+    let mut failures = Vec::new();
+    let mut solid = 0usize;
+    for dim in dims {
+        for seed in KEEP_SEEDS {
+            let mut t = TerrainGenerator::from_preset(&pack, "minecraft:normal", dim, seed).expect("generator");
+            // Every base height computes its column.
+            t.opts.baseh_memo = false;
+            let walk: Vec<(i32, i32)> = chunks(2).into_iter().flat_map(|(cx, cz)| (0..4).map(move |k| (cx + k, cz))).collect();
+            let mut cache = BiomeCache::default();
+            t.prepare_biomes(&mut cache, &walk);
+            t.opts.keep_eval_context = false;
+            let fresh = terrain_walk(&t, &cache, &walk);
+            t.opts.keep_eval_context = true;
+            let kept = terrain_walk(&t, &cache, &walk);
+            solid += kept.iter().map(|(c, _)| c.blocks.iter().filter(|&&b| b != rc_worldgen::palette::AIR).count()).sum::<usize>();
+            for ((pos, a), b) in walk.iter().zip(&kept).zip(&fresh) {
+                if let Some(d) = terrain_diff(a, b) {
+                    failures.push(format!("{dim} seed {seed} chunk {pos:?}: {d}"));
+                }
+            }
+        }
+    }
+    eprintln!("{} chunks compared, {solid} solid blocks", dims.len() * KEEP_SEEDS.len() * 8);
+    assert!(solid > 0, "empty chunks: nothing compared");
+    assert!(failures.is_empty(), "{} chunks differ:\n{}", failures.len(), failures.join("\n"));
+}
+
+/// The same chunk generated by several generators one after another on this thread (a server
+/// thread serves every dimension, and after leaving a world it serves the next world's seed):
+/// the kept context then holds the volumes and last point of another program under the same cache
+/// numbers, which only the reset at the start of each chunk forgets.
+#[test]
+fn kept_context_survives_generator_switch() {
+    let Some(pack) = common::data_pack() else { return };
+    let sources = [
+        ("minecraft:overworld", KEEP_SEEDS[0]),
+        ("minecraft:overworld", KEEP_SEEDS[1]),
+        ("minecraft:the_nether", KEEP_SEEDS[0]),
+        ("minecraft:overworld", KEEP_SEEDS[2]),
+    ];
+    let walk: Vec<(i32, i32)> = chunks(2).into_iter().flat_map(|(cx, cz)| (0..2).map(move |k| (cx + k, cz))).collect();
+    let mut gens: Vec<(TerrainGenerator, BiomeCache)> = sources
+        .iter()
+        .map(|&(dim, seed)| {
+            let mut t = TerrainGenerator::from_preset(&pack, "minecraft:normal", dim, seed).expect("generator");
+            t.opts.baseh_memo = false;
+            let mut cache = BiomeCache::default();
+            t.prepare_biomes(&mut cache, &walk);
+            (t, cache)
+        })
+        .collect();
+    let fresh = interleaved_walk(&mut gens, &walk, false);
+    let kept = interleaved_walk(&mut gens, &walk, true);
+    let labels = walk.iter().flat_map(|pos| sources.iter().map(move |src| (pos, src)));
+    let failures: Vec<String> = labels
+        .zip(kept.iter().zip(&fresh))
+        .filter_map(|((pos, (dim, seed)), (a, b))| terrain_diff(a, b).map(|d| format!("{dim} seed {seed} chunk {pos:?}: {d}")))
+        .collect();
+    assert!(failures.is_empty(), "{} chunks differ:\n{}", failures.len(), failures.join("\n"));
+}
+
 /// Survey of the common subexpressions (SAMPLER_CSE track): uncached nodes that
 /// the volume evaluation of a root computes several times identically (same structure,
 /// same children), with the number of noises under each.
@@ -338,7 +625,6 @@ fn point_after_volume_cache_under_choice() {
 #[ignore = "benchmark"]
 fn cse_census() {
     use hashbrown::HashMap;
-    use rc_worldgen::sampler::S;
     let Some(pack) = common::data_pack() else { return };
     for preset in ["overworld", "nether", "end"] {
         let mut g = Generator::new(&pack, preset, SEED).unwrap();
@@ -400,57 +686,200 @@ fn final_density_with(g: &Generator, o: Opts, cx: i32, cz: i32) -> Vec<f32> {
     g.volume(g.router.final_density, &mut Ctx::cached_with(o), &g.chunk_volume(cx, cz))
 }
 
+/// Final density of a chunk in a context kept from one chunk to the next, like the terrain:
+/// reset first, output taken from the spare buffers and handed back.
+fn final_density_kept(g: &Generator, ctx: &mut Ctx, cx: i32, cz: i32) -> usize {
+    ctx.reset_for_reuse();
+    let v = g.chunk_volume(cx, cz);
+    let mut b = ctx.take(v.size());
+    g.program.volume(g.router.final_density, ctx, &mut b, &v);
+    let n = b.len();
+    ctx.recycle(b);
+    n
+}
+
+/// Allocations, allocated KB, page faults and private KB per chunk since `before`.
+fn per_chunk_costs(before: (u64, u64, Option<(u64, u64)>), chunks: usize) -> String {
+    let n = chunks as f64;
+    let (allocs, bytes) = (ALLOCS.load(Ordering::Relaxed) - before.0, BYTES.load(Ordering::Relaxed) - before.1);
+    let mut s = format!("{:.1} alloc, {:.0} KB", allocs as f64 / n, bytes as f64 / n / 1024.0);
+    if let (Some((f0, p0)), Some((f1, p1))) = (before.2, process::memory()) {
+        s += &format!(", {:.1} page faults, private {:+.0} KB", (f1 - f0) as f64 / n, (p1 as f64 - p0 as f64) / n / 1024.0);
+    }
+    s + " / chunk"
+}
+
+fn costs_now() -> (u64, u64, Option<(u64, u64)>) {
+    (ALLOCS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed), process::memory())
+}
+
 /// Final density of 256 chunks: each path alone, then all; 1 thread then powers of 2
-/// up to the number of cores; allocations per chunk (1 thread).
+/// up to the number of cores; allocations, page faults and private memory per chunk (1 thread).
+/// `kept`: one context per rayon job kept from one chunk to the next and reset at each one, output
+/// taken from its spare buffers and handed back (the terrain with `KEEP_EVAL_CONTEXT`);
+/// `new`: a new context per chunk (the terrain without it).
 #[test]
 #[ignore = "benchmark"]
 fn bench_final_density() {
     let Some(pack) = common::data_pack() else { return };
+    counting::client_options();
     let g = Generator::new(&pack, "overworld", 42).unwrap();
     let chunks: Vec<(i32, i32)> = (0..16).flat_map(|x| (0..16).map(move |z| (x - 8, z - 8))).collect();
     let mut cases = vec![("old", Opts::OLD)];
     cases.extend(VARIANTS);
+    // Each track of C1-M06 removed from all the others (combinations).
+    cases.extend([
+        ("all but best_fit", Opts { best_fit_buffers: false, ..Opts::NEW }),
+        ("all but no_zeroing", Opts { take_without_zeroing: false, ..Opts::NEW }),
+        ("all but vol_pool", Opts { vol_pool: false, ..Opts::NEW }),
+    ]);
     let max = std::thread::available_parallelism().map_or(1, |n| n.get());
-    // `kept`: one context per thread kept from one chunk to the next, output buffer handed back (case where
-    // `vol_pool` has something to take back); otherwise a new context per chunk (the terrain).
     for pass in 0..2 {
         for ((label, o), keep) in cases.iter().flat_map(|c| [(c, false), (c, true)]) {
             let mut t = 1;
-            let mut line = format!("pass {pass} {label:12} {}", if keep { "kept " } else { "new  " });
+            let mut line = format!("pass {pass} {label:20} {}", if keep { "kept" } else { "new " });
             while t <= max {
                 let pool = rayon::ThreadPoolBuilder::new().num_threads(t).build().unwrap();
                 let run = |cs: &[(i32, i32)]| {
-                    use rayon::prelude::*;
                     pool.install(|| {
                         if keep {
-                            cs.par_iter()
-                                .map_init(
-                                    || Ctx::cached_with(*o),
-                                    |ctx, &(x, z)| {
-                                        let b = g.volume(g.router.final_density, ctx, &g.chunk_volume(x, z));
-                                        let n = b.len();
-                                        ctx.recycle(b);
-                                        n
-                                    },
-                                )
-                                .sum::<usize>()
+                            let one = |ctx: &mut Ctx, &(x, z): &(i32, i32)| final_density_kept(&g, ctx, x, z);
+                            cs.par_iter().map_init(|| Ctx::cached_with(*o), one).sum::<usize>()
                         } else {
                             cs.par_iter().map(|&(x, z)| final_density_with(&g, *o, x, z).len()).sum::<usize>()
                         }
                     })
                 };
                 run(&chunks[..8]);
-                let (a0, b0) = (ALLOCS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed));
+                let before = costs_now();
                 let s = Instant::now();
                 std::hint::black_box(run(&chunks));
                 let dt = s.elapsed().as_secs_f64() * 1e3 / chunks.len() as f64;
                 if t == 1 {
-                    let n = chunks.len() as u64;
-                    let (a, b) = (ALLOCS.load(Ordering::Relaxed) - a0, BYTES.load(Ordering::Relaxed) - b0);
-                    line += &format!(" | {} alloc, {:.0} KB / chunk", a / n, b as f64 / n as f64 / 1024.0);
+                    line += &format!(" | {}", per_chunk_costs(before, chunks.len()));
                 }
                 line += &format!(" | {t} threads {dt:.3} ms");
                 t *= 2;
+            }
+            eprintln!("{line}");
+        }
+    }
+    // Reserve held by a kept context after 256 chunks (bound of the memory kept per thread).
+    for (label, o) in &cases {
+        let mut ctx = Ctx::cached_with(*o);
+        for &(x, z) in &chunks {
+            final_density_kept(&g, &mut ctx, x, z);
+        }
+        ctx.reset_for_reuse();
+        eprintln!("{label:20} reserve of a kept context: {} KB", ctx.spare_bytes() / 1024);
+    }
+}
+
+/// Minimum and median of the samples, ms.
+fn min_and_median(mut samples: Vec<f64>) -> (f64, f64) {
+    samples.sort_by(f64::total_cmp);
+    (samples[0], samples[samples.len() / 2])
+}
+
+/// Time per chunk of `run` over `chunks`, ms.
+fn ms_per_chunk(chunks: &[(i32, i32)], mut run: impl FnMut(i32, i32)) -> f64 {
+    let s = Instant::now();
+    for &(x, z) in chunks {
+        run(x, z);
+    }
+    s.elapsed().as_secs_f64() * 1e3 / chunks.len() as f64
+}
+
+/// New context per chunk against the kept one, on 1 thread, alternated over 15 rounds (final
+/// density, switches of the environment) then 8 rounds (whole terrain): minimum and median per
+/// chunk. Alternating and keeping the minimum resists a loaded machine better than two blocks.
+#[test]
+#[ignore = "benchmark"]
+fn bench_kept_context_alternated() {
+    let Some(pack) = common::data_pack() else { return };
+    counting::client_options();
+    let g = Generator::new(&pack, "overworld", 42).unwrap();
+    let chunks: Vec<(i32, i32)> = (0..8).flat_map(|x| (0..8).map(move |z| (x - 4, z - 4))).collect();
+    // (label, paths, kept context): the default paths, then each track of C1-M06 taken out.
+    let cases = [
+        ("default, new context", Opts::current(), false),
+        ("default, kept", Opts::current(), true),
+        ("default but no_zeroing, kept", Opts { take_without_zeroing: false, ..Opts::current() }, true),
+        ("default but best_fit, kept", Opts { best_fit_buffers: false, ..Opts::current() }, true),
+        ("default + vol_pool, kept", Opts { vol_pool: true, ..Opts::current() }, true),
+        ("default but both, new context", Opts { take_without_zeroing: false, best_fit_buffers: false, ..Opts::current() }, false),
+    ];
+    let mut kept_contexts: Vec<Ctx> = cases.iter().map(|(_, o, _)| Ctx::cached_with(*o)).collect();
+    let mut samples = vec![Vec::new(); cases.len()];
+    for _ in 0..12 {
+        for (i, (_, o, keep)) in cases.iter().enumerate() {
+            let ctx = &mut kept_contexts[i];
+            samples[i].push(ms_per_chunk(&chunks, |x, z| {
+                let n = if *keep { final_density_kept(&g, ctx, x, z) } else { final_density_with(&g, *o, x, z).len() };
+                std::hint::black_box(n);
+            }));
+        }
+    }
+    for ((label, ..), s) in cases.iter().zip(samples) {
+        let (min, median) = min_and_median(s);
+        eprintln!("final density, {label:32} ms/chunk min {min:.3} median {median:.3}");
+    }
+    let mut t = TerrainGenerator::from_preset(&pack, "minecraft:normal", "minecraft:overworld", 42).unwrap();
+    let mut cache = BiomeCache::default();
+    t.prepare_biomes(&mut cache, &chunks);
+    let (mut new, mut kept) = (Vec::new(), Vec::new());
+    for _ in 0..8 {
+        for keep in [false, true] {
+            t.opts.keep_eval_context = keep;
+            let ms = ms_per_chunk(&chunks, |x, z| {
+                std::hint::black_box(t.generate(x, z, &cache, None));
+            });
+            if keep { kept.push(ms) } else { new.push(ms) }
+        }
+    }
+    let (n, k) = (min_and_median(new), min_and_median(kept));
+    eprintln!("terrain, ms/chunk min / median: new {:.3} / {:.3} | kept {:.3} / {:.3}", n.0, n.1, k.0, k.1);
+}
+
+/// Terrain of 64 chunks (filling, surface, caves): a new context per chunk against the context
+/// kept by each thread; 1 thread then powers of 2; allocations, page faults and private memory
+/// per chunk at 1 thread. Other switches: those of the environment.
+#[test]
+#[ignore = "benchmark"]
+fn bench_terrain_kept_context() {
+    let Some(pack) = common::data_pack() else { return };
+    counting::client_options();
+    let mut t = TerrainGenerator::from_preset(&pack, "minecraft:normal", "minecraft:overworld", 42).unwrap();
+    let targets: Vec<(i32, i32)> = (0..8).flat_map(|x| (0..8).map(move |z| (x - 4, z - 4))).collect();
+    let mut cache = BiomeCache::default();
+    t.prepare_biomes(&mut cache, &targets);
+    let max = std::thread::available_parallelism().map_or(1, |n| n.get());
+    for pass in 0..2 {
+        for keep in [false, true] {
+            t.opts.keep_eval_context = keep;
+            let t = &t;
+            let mut line = format!("pass {pass} terrain {}", if keep { "kept" } else { "new " });
+            let mut threads = 1;
+            while threads <= max {
+                let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+                let run = |cs: &[(i32, i32)]| {
+                    pool.install(|| cs.par_iter().map(|&(x, z)| t.generate(x, z, &cache, None).blocks.len()).sum::<usize>())
+                };
+                run(&targets[..8]);
+                let before = costs_now();
+                let s = Instant::now();
+                std::hint::black_box(run(&targets));
+                let dt = s.elapsed().as_secs_f64() * 1e3 / targets.len() as f64;
+                if threads == 1 {
+                    line += &format!(" | {}", per_chunk_costs(before, targets.len()));
+                    // The single thread saw every chunk: the largest context a thread keeps.
+                    if let Some(m) = pool.install(rc_worldgen::terrain::kept_context_memory) {
+                        let (held, after) = (m.held_bytes / 1024, m.spare_bytes_after_reset / 1024);
+                        line += &format!(" | kept context {held} KB held, {after} KB after reset");
+                    }
+                }
+                line += &format!(" | {threads} threads {dt:.2} ms");
+                threads *= 2;
             }
             eprintln!("{line}");
         }

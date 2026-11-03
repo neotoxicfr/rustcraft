@@ -98,6 +98,117 @@ fn evicted_sound_reloads_bit_identical() {
     }
 }
 
+/// Polls the engine until `done` (10 s at most).
+fn pump_until(e: &mut AudioEngine, done: impl Fn(&AudioEngine) -> bool) -> bool {
+    let t = Instant::now();
+    while t.elapsed().as_secs() < 10 {
+        e.pump();
+        if done(e) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    false
+}
+
+/// Files of an event in the cache.
+fn cached_files(e: &AudioEngine, event: &str) -> (usize, usize) {
+    let ev = e.table.event_index(event).expect("event");
+    let files = e.table.buffered_files(ev);
+    let c = e.cache.lock().unwrap();
+    (files.iter().filter(|&&f| c.contains(e.table.file_path(f))).count(), files.len())
+}
+
+/// `AUDIO_PRELOAD_VARIANTS`: after the first playback of a short sound, every variant of its event
+/// reaches the cache, decoded bit for bit like a direct decoding; a long sound (cave ambience)
+/// preloads nothing, and neither does the old path.
+#[test]
+fn first_playback_preloads_the_other_variants() {
+    let Some((assets, _)) = real() else { return };
+    let (mut e, _m) = AudioEngine::headless_with(assets.clone(), SoundTable::load(&[&assets]), 48_000, Opt::NEW);
+    let step = "minecraft:block.stone.step";
+    e.play_request(SoundRequest::new(step, Category::Block).at([1.0, 64.0, 0.0]).seed(Some(1))).expect("step");
+    assert!(pump_until(&mut e, |e| { let (n, all) = cached_files(e, step); n == all }), "variants never all decoded");
+    let (n, _) = cached_files(&e, step);
+    assert!(n >= 4, "{n} variants: empty proof");
+    let ev = e.table.event_index(step).expect("event");
+    for f in e.table.buffered_files(ev) {
+        let path = e.table.file_path(f);
+        let kept = e.cache.lock().unwrap().get(path, 0).expect("cached");
+        let fresh = decode::decode_all(assets.read(path).expect("file")).expect("decoded");
+        assert_eq!(digest(&kept), digest(&fresh), "{path}");
+    }
+    assert!(pump_until(&mut e, |e| e.loads_in_flight == 0), "loads never answered");
+    let cave = "minecraft:ambient.cave";
+    e.play_request(SoundRequest::new(cave, Category::Ambient).at([1.0, 64.0, 0.0]).seed(Some(2))).expect("cave");
+    assert!(pump_until(&mut e, |e| e.loads_in_flight == 0 && cached_files(e, cave).0 == 1), "cave never decoded");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    e.pump();
+    assert_eq!(cached_files(&e, cave).0, 1, "long sound: variants preloaded");
+    let (mut old, _m) = AudioEngine::headless_with(
+        assets.clone(),
+        SoundTable::load(&[&assets]),
+        48_000,
+        Opt { preload_variants: false, ..Opt::NEW },
+    );
+    old.play_request(SoundRequest::new(step, Category::Block).at([1.0, 64.0, 0.0]).seed(Some(1))).expect("step");
+    assert!(pump_until(&mut old, |e| e.loads_in_flight == 0), "load never answered");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    old.pump();
+    assert_eq!(cached_files(&old, step).0, 1, "old path preloaded");
+}
+
+/// Village-like burst: the first playbacks of 50 common events at once (cold cache), then 3
+/// sounds per tick for 400 ticks. Time until the burst is decoded, launches that waited for a
+/// decoding.
+fn village_entry(assets: &Arc<Assets>, opt: Opt, loaders: usize) -> (f64, u32) {
+    let (mut e, mut m) = AudioEngine::build_with_loaders(assets.clone(), SoundTable::load(&[&**assets]), 48_000, opt, loaders);
+    e.headless = true;
+    let t = Instant::now();
+    for (k, ev) in COMMON.iter().enumerate() {
+        e.play_request(SoundRequest::new(ev, Category::Neutral).at([2.0, 64.0, 2.0]).seed(Some(k as i64)));
+    }
+    assert!(pump_until(&mut e, |e| e.instances.values().all(|i| i.state != State::Loading)), "burst never decoded");
+    let burst = t.elapsed().as_secs_f64() * 1e3;
+    let mut rng = JavaRandom::new(7);
+    let (mut waited, mut out) = (0, vec![0.0f32; 2 * 480]);
+    for _ in 0..400 {
+        for _ in 0..3 {
+            let ev = COMMON[rng.next_int_bounded(50) as usize];
+            let req = SoundRequest::new(ev, Category::Neutral).at([2.0, 64.0, 2.0]).seed(Some(i64::from(rng.next_int())));
+            if let Some(h) = e.play_request(req) {
+                waited += u32::from(e.instances[&h.0].state == State::Loading);
+            }
+        }
+        for _ in 0..5 {
+            m.process(&mut out);
+        }
+        e.tick();
+        // A tick lasts 50 ms in game: decodings started in the tick are done by the next one.
+        pump_until(&mut e, |e| e.loads_in_flight == 0);
+    }
+    (burst, waited)
+}
+
+/// Bench (ignored), loaded machine figures only: decoding threads 1, 2, 4, 8 on a burst of first
+/// sounds, and the launches that wait for a decoding with and without the variant preloading.
+/// `cargo-file.ps1 test --release -p rc-audio loader_bench -- --ignored --nocapture`
+#[test]
+#[ignore = "bench"]
+fn loader_bench() {
+    let Some((assets, _)) = real() else { return };
+    for pass in 0..2 {
+        for loaders in [1, 2, 4, 8] {
+            let (burst, _) = village_entry(&assets, Opt { preload_variants: false, ..Opt::NEW }, loaders);
+            println!("pass {pass}: {loaders} loading thread(s): burst of 50 first sounds decoded in {burst:.1} ms");
+        }
+        for preload in [false, true] {
+            let (burst, waited) = village_entry(&assets, Opt { preload_variants: preload, ..Opt::NEW }, 2);
+            println!("pass {pass}: preload {preload}: burst {burst:.1} ms, {waited} of 1,200 launches waited for a decoding");
+        }
+    }
+}
+
 /// Common sounds of a game (step, hits, doors, mobs, interface).
 const COMMON: [&str; 50] = [
     "block.stone.step",
@@ -166,6 +277,8 @@ const LONG: [&str; 6] = [
 struct Run {
     /// Common sounds launched "loading" although their file had already been loaded.
     common_waits: u32,
+    /// Launches that waited for a decoding (first playback of a file included).
+    loading_launches: u32,
     long_reloads: u32,
     plays: u32,
     peak: usize,
@@ -175,8 +288,8 @@ struct Run {
 
 /// Simulated game: 1.5 common sounds per tick, one long sound every 20 ticks, mixer and `tick`
 /// at the game's pace (2,400 frames per tick at 48 kHz).
-fn session(assets: Arc<Assets>, table: SoundTable, budget: Option<usize>, ticks: u32) -> Run {
-    let (mut e, mut m) = AudioEngine::headless_with(assets, table, 48_000, Opt::NEW);
+fn session(assets: Arc<Assets>, table: SoundTable, budget: Option<usize>, ticks: u32, opt: Opt) -> Run {
+    let (mut e, mut m) = AudioEngine::headless_with(assets, table, 48_000, opt);
     e.cache.lock().unwrap().budget = budget;
     let mut rng = JavaRandom::new(42);
     let mut seen: HashSet<Arc<str>> = HashSet::new();
@@ -198,6 +311,7 @@ fn session(assets: Arc<Assets>, table: SoundTable, budget: Option<usize>, ticks:
             run.plays += 1;
             let inst = &e.instances[&h.0];
             if inst.state == State::Loading {
+                run.loading_launches += 1;
                 if seen.contains(&*inst.path) {
                     if common {
                         run.common_waits += 1;
@@ -248,7 +362,7 @@ fn common_sounds_never_wait() {
     for ev in COMMON.iter().chain(&LONG) {
         assert!(table.get(&full_id(ev)).is_some(), "event {ev} absent");
     }
-    let r = session(assets, table, Some(pcm_cache::BUDGET), 36_000);
+    let r = session(assets, table, Some(pcm_cache::BUDGET), 36_000, Opt::NEW);
     assert!(r.evicted > 0, "budget never reached: pointless test ({r:?})");
     assert_eq!(r.common_waits, 0, "common sound delayed by forgetting ({r:?})");
 }
@@ -259,18 +373,26 @@ fn common_sounds_never_wait() {
 #[ignore = "bench"]
 fn pcm_budget_bench() {
     let Some((assets, _)) = real() else { return };
-    for budget in [None, Some(pcm_cache::BUDGET)] {
+    let runs = [
+        (None, Opt { preload_variants: false, ..Opt::NEW }),
+        (Some(pcm_cache::BUDGET), Opt { preload_variants: false, ..Opt::NEW }),
+        (None, Opt::NEW),
+        (Some(pcm_cache::BUDGET), Opt::NEW),
+    ];
+    for (budget, opt) in runs {
         let table = SoundTable::load(&[&assets]);
         let t = Instant::now();
-        let r = session(assets.clone(), table, budget, 36_000);
+        let r = session(assets.clone(), table, budget, 36_000, opt);
         println!(
-            "budget {:?} MiB: end {:.1} MB, peak {:.1} MB, {} forgotten, {} re-reads of long sounds, {} waits for common sounds, {} sounds, {:.1} s",
+            "preload {}, budget {:?} MiB: end {:.1} MB, peak {:.1} MB, {} forgotten, {} re-reads of long sounds, {} waits for common sounds, {} launches waiting for a decoding, {} sounds, {:.1} s",
+            opt.preload_variants,
             budget.map(|b| b >> 20),
             r.end as f64 / 1e6,
             r.peak as f64 / 1e6,
             r.evicted,
             r.long_reloads,
             r.common_waits,
+            r.loading_launches,
             r.plays,
             t.elapsed().as_secs_f64()
         );

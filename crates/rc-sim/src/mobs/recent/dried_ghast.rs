@@ -34,7 +34,7 @@ impl Server {
         if !is_dried_ghast(self.state_name(state)) {
             return false;
         }
-        let block = self.v().block(state);
+        let block = self.view().block(state);
         if (waterlogged(self, state) || hydration(self, state) > 0) && !self.has_scheduled_tick(p, block) {
             self.schedule_tick(p, block, 5000);
         }

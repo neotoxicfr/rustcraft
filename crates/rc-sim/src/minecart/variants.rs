@@ -389,14 +389,14 @@ impl Server {
     /// Minecart entered an unpowered detector rail.
     pub(crate) fn detector_rail_inside(&mut self, p: P) {
         let s = self.get(p);
-        if self.v().kind(s) == crate::blocks::Kind::DetectorRail && !self.v().get_bool(s, "powered") {
+        if self.view().kind(s) == crate::blocks::Kind::DetectorRail && !self.view().get_bool(s, "powered") {
             self.detector_check(p, s);
         }
     }
 
     /// Scheduled tick of the powered detector rail.
     pub(crate) fn detector_rail_tick(&mut self, s: u32, p: P) {
-        if self.v().get_bool(s, "powered") {
+        if self.view().get_bool(s, "powered") {
             self.detector_check(p, s);
         }
     }
@@ -406,14 +406,14 @@ impl Server {
     fn detector_check(&mut self, p: P, s: u32) {
         // The ticking minecart is out of the list: it counts too (caller in progress).
         let pressed = self.carts_on_detector(p).next().is_some() || self.detector_ticking_cart(p);
-        let was = self.v().get_bool(s, "powered");
-        let b = self.v().block(s);
+        let was = self.view().get_bool(s, "powered");
+        let b = self.view().block(s);
         if pressed != was {
-            let ns = self.v().set_bool(s, "powered", pressed);
+            let ns = self.view().set_bool(s, "powered", pressed);
             self.set_block(p, ns, flag::ALL);
             for q in self.rail_connections(p, ns) {
                 let qs = self.get(q);
-                let qb = self.v().block(qs);
+                let qb = self.view().block(qs);
                 self.neighbor_changed(qs, q, qb, false);
             }
             self.update_neighbors_at(p, b);
@@ -428,7 +428,7 @@ impl Server {
     /// Comparator output of a powered detector rail: success of a command block minecart, otherwise
     /// fill of a container minecart, otherwise 0.
     pub(crate) fn detector_analog(&self, p: P, s: u32) -> i32 {
-        if !self.v().get_bool(s, "powered") {
+        if !self.view().get_bool(s, "powered") {
             return 0;
         }
         if let Some(c) = self.carts_on_detector(p).find(|c| c.kind == CKind::Command) {
