@@ -7,6 +7,10 @@ license.workspace = true
 publish.workspace = true
 description = "Singleplayer: integrated server (Anvil worlds, tick loop, player), no graphics layer"
 
+[features]
+# Allocation counter of the test binary, for the micro-benches (`src/bench_kit.rs`).
+memstats = []
+
 [dependencies]
 hashbrown = { workspace = true }
 rc-proto.workspace = true
