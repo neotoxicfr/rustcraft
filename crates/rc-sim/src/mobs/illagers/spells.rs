@@ -366,7 +366,7 @@ impl Server {
             v.ill.bound = Some(p);
             v.ill.life = Some(20 * (30 + m.rng.next_int_bound(90)));
             // The evoker's scoreboard team, if any, before the vex enters the world.
-            if let Some(team) = self.cmd.scores.team_of(&crate::nbtio::uuid_text(m.uuid)).map(|t| t.name.clone()) {
+            if let Some(team) = self.cmd.scores.team_of_uuid(m.uuid).map(|t| t.name.clone()) {
                 self.cmd.scores.join_team(&crate::nbtio::uuid_text(v.uuid), &team);
             }
             self.add_mob(v);

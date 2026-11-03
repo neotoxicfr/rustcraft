@@ -448,11 +448,8 @@ impl Server {
             uuid: self.ent_uuid(e),
             name: hover_name,
         }));
-        c.style.insertion = Some(std::sync::Arc::from(if e == E::Player {
-            self.name.clone()
-        } else {
-            nbtio::uuid_text(self.ent_uuid(e))
-        }));
+        // The scoreboard name is the insertion text (player name, or the UUID's text formatted once).
+        c.style.insertion = Some(std::sync::Arc::from(score_name));
         if e == E::Player {
             super::text::suggest_click(&mut c, format!("/tell {} ", self.name));
         }

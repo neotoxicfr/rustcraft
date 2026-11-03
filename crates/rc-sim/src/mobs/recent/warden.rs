@@ -191,9 +191,13 @@ fn sound(s: &mut Server, m: &mut Mob, name: &str, volume: f32) {
 /// not another warden (armor stands are not mobs here), not invulnerable, not dead, its box
 /// inside the world border.
 pub fn can_target(s: &Server, m: &Mob, e: Ent) -> bool {
-    // Same scoreboard team (names built only when some team exists).
+    // Same scoreboard team (the target's name built only when the warden has a team).
     let allied = |holder: &dyn Fn() -> String| {
-        !s.cmd.scores.teams.is_empty() && s.same_team(&crate::nbtio::uuid_text(m.uuid), &holder())
+        let scores = &s.cmd.scores;
+        !scores.teams.is_empty()
+            && scores
+                .team_of_uuid(m.uuid)
+                .is_some_and(|own| scores.team_of(&holder()).is_some_and(|t| t.name == own.name))
     };
     match e {
         Ent::Player => {
