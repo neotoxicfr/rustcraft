@@ -928,6 +928,8 @@ fn bench_ticks() {
             stats::FOUND.load(Relaxed),
             stats::ABSENT.load(Relaxed)
         );
+        let (served, fallback) = stats::kind_queries();
+        eprintln!("per-species queries: served {served}, sent to the scan {fallback}");
     }
     s.stop_gen();
     s.stop_parked();
