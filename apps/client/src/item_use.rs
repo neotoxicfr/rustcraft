@@ -29,8 +29,6 @@ pub struct UseIds {
     potion_contents: Option<u16>,
     banner_patterns: Option<u16>,
     compostable: Option<u16>,
-    /// Names of the `minecraft:sound_event` registry (sounds referenced by id).
-    sounds: Vec<String>,
 }
 
 impl UseIds {
@@ -56,7 +54,6 @@ impl UseIds {
             potion_contents: id("potion_contents"),
             banner_patterns: id("banner_patterns"),
             compostable: id("compostable"),
-            sounds: data.registry("minecraft:sound_event").map(|r| r.entries.clone()).unwrap_or_default(),
         }
     }
 }
@@ -154,11 +151,18 @@ pub struct ItemView<'a> {
     pub stack: &'a ItemStack,
     pub info: Option<&'a ItemInfo>,
     pub ids: &'a UseIds,
+    /// Version data: the `minecraft:sound_event` registry names the sounds referenced by id.
+    data: &'a VersionData,
 }
 
 impl<'a> ItemView<'a> {
     pub fn new(stack: &'a ItemStack, data: &'a VersionData, ids: &'a UseIds) -> Self {
-        ItemView { stack, info: usize::try_from(stack.item).ok().and_then(|i| data.items.get(i)), ids }
+        ItemView { stack, info: usize::try_from(stack.item).ok().and_then(|i| data.items.get(i)), ids, data }
+    }
+
+    /// Names of the sound registry (sounds of a patched component referenced by id).
+    fn sounds(&self) -> &'a [String] {
+        self.data.registry("minecraft:sound_event").map_or(&[], |r| r.entries.as_slice())
     }
 
     fn comp(&self, id: Option<u16>) -> Comp<'a> {
@@ -188,7 +192,7 @@ impl<'a> ItemView<'a> {
     pub fn consumable(&self) -> Option<Cow<'a, Consumable>> {
         match self.comp(self.ids.consumable) {
             Comp::Removed => None,
-            Comp::Patched(b) => decode_consumable(b, &self.ids.sounds).map(Cow::Owned),
+            Comp::Patched(b) => decode_consumable(b, self.sounds()).map(Cow::Owned),
             Comp::Default => self.info.and_then(|i| i.consumable.as_ref()).map(Cow::Borrowed),
         }
     }
@@ -420,5 +424,29 @@ mod tests {
         assert_eq!(tool_speed(Some(&t), &tags, 1), (8.0, true));
         assert_eq!(tool_speed(Some(&t), &tags, 2), (1.0, false));
         assert_eq!(tool_speed(None, &tags, 1), (1.0, false));
+    }
+
+    /// A patched `consumable` naming its sound by registry id reads the name in the version data
+    /// (no copy of the 1,700-entry sound registry kept beside the component ids).
+    #[test]
+    fn patched_consumable_names_its_sound_from_the_registry() {
+        let Some(data) = rc_testdata::version_data() else { return };
+        let ids = UseIds::new(&data);
+        let sounds = &data.registry("minecraft:sound_event").expect("sound registry").entries;
+        let eat = sounds.iter().position(|s| s == "minecraft:entity.generic.eat").expect("eating sound");
+        // 1.6 s, animation 1, sound id + 1 (registry reference), particles.
+        let mut value = 1.6f32.to_be_bytes().to_vec();
+        value.push(1);
+        rc_proto::varint::write_varint(&mut value, eat as i32 + 1);
+        value.push(1);
+        let stack = ItemStack {
+            item: 0,
+            count: 1,
+            added: vec![(ids.consumable.expect("consumable component"), value.into_boxed_slice())],
+            removed: Vec::new(),
+        };
+        let c = ItemView::new(&stack, &data, &ids).consumable().expect("patched consumable");
+        assert_eq!(c.sound, "minecraft:entity.generic.eat");
+        assert_eq!((c.seconds, c.animation, c.particles), (1.6, 1, true));
     }
 }
