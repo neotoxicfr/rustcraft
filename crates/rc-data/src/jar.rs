@@ -143,18 +143,9 @@ pub struct Opts {
     pub threads: usize,
 }
 
-fn opt(name: &str, default: bool) -> bool {
-    match crate::env_flags::read_os(name).as_deref().and_then(std::ffi::OsStr::to_str) {
-        Some("0") => false,
-        Some("1") => true,
-        _ => default,
-    }
-}
-
 /// Shared index in service (default); `RUSTCRAFT_OPT_JARINDEX=0`: each reader re-reads the jar.
 pub fn enabled() -> bool {
-    static C: OnceLock<bool> = OnceLock::new();
-    *C.get_or_init(|| opt("RUSTCRAFT_OPT_JARINDEX", true))
+    crate::opt_switch!("RUSTCRAFT_OPT_JARINDEX")
 }
 
 /// Process settings (switches read once).
@@ -167,15 +158,15 @@ pub fn opts() -> Opts {
             Some("read") => Io::Read,
             _ => DEFAULT_IO,
         };
-        let par = opt("RUSTCRAFT_OPT_JARPAR", DEFAULT_PAR);
-        Opts { io, filter: opt("RUSTCRAFT_OPT_JARFILTER", true), threads: if par { rayon::current_num_threads() } else { 1 } }
+        // Parallel decompression on by default (micro-bench `examples/jar.rs`).
+        let par = crate::opt_switch!("RUSTCRAFT_OPT_JARPAR");
+        let filter = crate::opt_switch!("RUSTCRAFT_OPT_JARFILTER");
+        Opts { io, filter, threads: if par { rayon::current_num_threads() } else { 1 } }
     })
 }
 
 /// Default I/O mode (micro-bench `examples/jar.rs`, see `docs/perf.md`).
 const DEFAULT_IO: Io = Io::Mmap;
-/// Default parallel decompression.
-const DEFAULT_PAR: bool = true;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Key {

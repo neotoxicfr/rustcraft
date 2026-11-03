@@ -149,7 +149,8 @@ CHATTEST, NOENT ×2, SOLOLOG, GENLOG…). All of them now go through `rc_data::e
 `clippy.toml` forbids `std::env::var`, `var_os`, `set_var`, `remove_var`; explicit exceptions:
 tests, bench, example, `build.rs`, `rc-capture`. Common mechanism of the `RUSTCRAFT_OPT_*` switches
 of the series (a switch is read `rc_data::env_str!("RUSTCRAFT_OPT_X") != Some("0")`).
-Switch `RUSTCRAFT_OPT_ENVONCE=0`: re-read at every call (A/B in the same executable).
+Switch `RUSTCRAFT_OPT_ENVONCE=0`: re-read at every call (A/B in the same executable; removed in
+series 3, see below).
 
 Micro-bench `cargo test --release -p rc-data env_bench -- --ignored --nocapture`, loaded machine
 (other compilations running), 1 M calls:
@@ -165,6 +166,34 @@ lock on the main thread and the singleplayer thread), with no scene CPU figure u
 (crowd, building, plains12, redstone, nether; `samply`: getenv absent from both threads) is
 replayed on a quiet machine. A demonstration variable that was set (TICKLOG, INVLOG…) cost an
 allocation and a conversion per call.
+
+Series 3 (C4-M02, 03/11/2026): the site body is `#[inline]` and reduced to its own cell (one atomic
+load once filled; the cold first read stays out of line in `get_or_init`). `RUSTCRAFT_OPT_ENVONCE`
+and its re-read path are removed: the A/B against the re-read reader is done with two executables
+(reference = `main` before the series). `env_str!` keeps the validated text in its cell instead of
+redoing the UTF-8 check at every call while the variable is set. New `rc_data::opt_switch!` caches
+the final `bool` of a `RUSTCRAFT_OPT_*` switch (rule `0` off, `1` on, otherwise the default:
+identical to the `!= Some("0")`, `== Some("1")` and three-way readers it replaces, test
+`switch_state_matches_the_replaced_readers`). Root cause fixed with it: the client helper that
+took the value as an argument (`VARIANTIDX`, `NAMECACHE`, `RIDERLIST`) read the site and
+converted it BEFORE looking at its `bool` cache, at every call (`Entity::variant` and the custom
+name: per entity and per frame in crowd). Proofs: `each_site_reads_the_environment_once`
+(counter of raw reads = 1 after 50 calls; 50 when the value is read outside the cache) and, in the
+client, `switches_follow_their_variable` (child test processes under absent, `0`, `1`, empty and
+each switch alone at `0`; fails on a wrong default or a wrong name).
+
+Micro-bench `env_bench`, 10 M calls, loaded machine (other compilations running), previous reader
+(two cells, out of line) against the current one:
+
+| Read | previous, 1 thread | now, 1 thread | previous, 32 threads | now, 32 threads |
+|---|---|---|---|---|
+| `env_flag!`, absent key | 1.37 ns | 0.29 ns | 6.37 ns | 2.64 ns |
+| `env_str!`, set key (`PATH`) | 31.68 ns | 0.29 ns | 79.81 ns | 2.83 ns |
+| switch, value read before its cache | 1.88 ns | 0.47 ns | 8.00 ns | 2.62 ns |
+
+(32-thread figures: wall time per call and per thread.) Scene check still to do on a quiet
+machine: `env_flags::site` share in samply on crowd-1000 and crowd (0.02-0.21 % self before, must
+fall to about 0; no conclusion in frames/s, under the noise).
 
 ### Generation: forgotten chunks not yet written (fix, 22/10/2026)
 

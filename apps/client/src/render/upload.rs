@@ -36,17 +36,17 @@ pub const SLOT: usize = 256;
 
 /// Transit ring active (`RUSTCRAFT_OPT_UPLOADRING`, default 1), read once.
 pub fn ring_on() -> bool {
-    rc_data::env_str!("RUSTCRAFT_OPT_UPLOADRING") != Some("0")
+    rc_data::opt_switch!("RUSTCRAFT_OPT_UPLOADRING")
 }
 
 /// Frame uniforms grouped (`RUSTCRAFT_OPT_FRAMEUNIF`, default 1), read once.
 pub fn merged_on() -> bool {
-    rc_data::env_str!("RUSTCRAFT_OPT_FRAMEUNIF") != Some("0")
+    rc_data::opt_switch!("RUSTCRAFT_OPT_FRAMEUNIF")
 }
 
 /// Writes of unchanged uniforms skipped (`RUSTCRAFT_OPT_UNIFSKIP`, default 1), read once.
 pub fn skip_on() -> bool {
-    rc_data::env_str!("RUSTCRAFT_OPT_UNIFSKIP") != Some("0")
+    rc_data::opt_switch!("RUSTCRAFT_OPT_UNIFSKIP")
 }
 
 /// Counters since the last sample: writes, transit buffers created, bytes written.
