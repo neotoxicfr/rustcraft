@@ -101,7 +101,9 @@ pub struct DebugLines {
     opaque_faces: bool,
     opaque_texts: bool,
     /// Camera (relative eye, direction) for segment clipping.
-    clip: Option<([f32; 3], [f32; 3])>,
+    pub(crate) clip: Option<([f32; 3], [f32; 3])>,
+    /// Invisible blocks of the structure blocks' save areas (one GPU instance per cell).
+    pub(crate) show_air: crate::tech_blocks::ShowAirCells,
     /// Axes of the text panel (right, up).
     right_up: [[f32; 4]; 2],
     /// Instance ranges sent, per list; number of faces and glyphs sent.
@@ -354,6 +356,7 @@ impl DebugLines {
             opaque_faces: false,
             opaque_texts: false,
             clip: None,
+            show_air: crate::tech_blocks::ShowAirCells::new(format),
             right_up: [[0.0; 4]; 2],
             ranges: Default::default(),
             face_count: 0,
@@ -414,6 +417,7 @@ impl DebugLines {
     /// Improved transparency: opaque segments of the "depth" layer, with the solids.
     pub fn draw_solid(&self, pass: &mut wgpu::RenderPass<'_>) {
         self.draw_segments(pass, OPAQUE, 0);
+        self.show_air.draw(pass, &self.bind);
     }
 
     /// Improved transparency, stage `f`: faces, translucent segments and texts of the
@@ -453,10 +457,18 @@ impl DebugLines {
         self.front_texts.clear();
         self.opaque_faces = false;
         self.opaque_texts = false;
+        self.show_air.begin_frame();
+    }
+
+    /// Segments of every list (bytes sent per frame = this × the size of a segment).
+    #[cfg(test)]
+    pub(crate) fn segment_count(&self) -> usize {
+        self.lists.iter().map(Vec::len).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.lists.iter().all(Vec::is_empty)
+        self.show_air.cells().is_empty()
+            && self.lists.iter().all(Vec::is_empty)
             && self.faces.is_empty()
             && self.texts.is_empty()
             && self.front_texts.is_empty()
@@ -585,8 +597,16 @@ impl DebugLines {
             (self.face_count, self.text_count, self.front_text_count) = (0, 0, 0);
             return;
         }
+        self.upload_geometry(device, queue, size);
+        self.upload_texts(device, queue, gui);
+    }
+
+    /// Segments, faces and show-air cells of the frame (texts apart: they need the interface's
+    /// glyph sheet).
+    pub(crate) fn upload_geometry(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, size: (u32, u32)) {
         let style: [f32; 4] = [size.0 as f32, size.1.max(1) as f32, 0.0, 0.0];
         queue.write_buffer(&self.style, 0, bytemuck::cast_slice(&style));
+        self.show_air.upload(device, queue, (&self.layouts.0, &self.layouts.1), self.clip);
         let total: usize = self.lists.iter().map(Vec::len).sum();
         let mut at = 0u32;
         if total > 0 {
@@ -614,6 +634,9 @@ impl DebugLines {
             let buf = ensure(device, &mut self.face_buf, bytes, "debug faces");
             queue.write_buffer(buf, 0, bytemuck::cast_slice(&self.faces));
         }
+    }
+
+    fn upload_texts(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, gui: &crate::gui::Gui) {
         self.text_count = self.texts.len() as u32;
         self.front_text_count = self.front_texts.len() as u32;
         if !self.front_texts.is_empty() {
@@ -710,6 +733,7 @@ impl DebugLines {
                     self.draw_faces(pass);
                 }
                 self.draw_segments(pass, OPAQUE, 0);
+                self.show_air.draw(pass, &self.bind);
                 if self.opaque_texts {
                     self.draw_texts(pass);
                 }
@@ -769,7 +793,7 @@ fn text_glyphs<'a>(
 }
 
 /// Vertex buffer of at least `bytes` bytes (grown to a power of two).
-fn ensure<'a>(
+pub(crate) fn ensure<'a>(
     device: &wgpu::Device,
     slot: &'a mut Option<(wgpu::Buffer, u64)>,
     bytes: u64,
