@@ -1186,6 +1186,10 @@ impl Program {
                     && let Some(v) = self.column_value(c, input, (x, z), key)
                 {
                     count(|n| n.cache_point_same_column += 1);
+                    // Kept as the game keeps the point it computes: a later read back at the old
+                    // height must miss the key and find the buffer (−0 where the point gave +0).
+                    c.key = key;
+                    c.value = v;
                     return v;
                 }
             }
@@ -1244,7 +1248,7 @@ impl Program {
                 lattice.copy(b, w, out, v);
                 // Then the cache holds `v`, as if it had computed it: the point reads that follow
                 // find the buffer the game's cache holds.
-                let mut held = self.point_cache_at(id, ctx, v);
+                let mut held = self.retarget_cache_to_volume(id, ctx, v);
                 held.copy_from_slice(out);
                 self.keep_in_cache(id, ctx, held);
                 return;
@@ -1254,15 +1258,15 @@ impl Program {
             n.cache_volume_computed += 1;
             n.cache_volume_values += v.size() as u64;
         });
-        let mut held = self.point_cache_at(id, ctx, v);
+        let mut held = self.retarget_cache_to_volume(id, ctx, v);
         self.volume(input, ctx, &mut held, v);
         out.copy_from_slice(&held);
         self.keep_in_cache(id, ctx, held);
     }
 
-    /// Points the cache `id` at the volume `v` (its old buffer goes back to the spares) and returns a
+    /// Makes the cache `id` hold the volume `v` (its old buffer goes back to the spares) and returns a
     /// buffer for its values, to hand to [`Program::keep_in_cache`].
-    fn point_cache_at(&self, id: u32, ctx: &mut Ctx, v: &Volume) -> Vec<f32> {
+    fn retarget_cache_to_volume(&self, id: u32, ctx: &mut Ctx, v: &Volume) -> Vec<f32> {
         let old = ctx.cell(id, self.n_caches).and_then(|c| {
             c.volume = Some(*v);
             c.buf.take()

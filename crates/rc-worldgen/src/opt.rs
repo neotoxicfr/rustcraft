@@ -139,9 +139,10 @@ switch!(
 );
 
 switch!(
-    /// Spline: point coordinates kept on the stack, sampling without dynamic call. On by default
-    /// since C1-M13: point climate −1.0 to −1.3% and one allocation per quarter less (loaded machine,
-    /// alternated micro-bench); off before, judged on a volume bench where it has no work.
+    /// Spline: point coordinates kept on the stack, sampling without dynamic call. On by default:
+    /// point climate −0.6% without caches, −1.2% with caches, one allocation per quarter less
+    /// (12 alternated rounds, loaded machine; docs/perf.md, density evaluator section); off before,
+    /// judged on a volume bench where it has no work.
     spline_stack,
     "RUSTCRAFT_OPT_SPLINE_STACK"
 );

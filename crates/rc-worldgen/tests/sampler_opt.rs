@@ -545,7 +545,23 @@ fn column_reads(g: &Generator, o: Opts, surface: Sid, roots: &[Sid], (cx, cz): (
     let corners = Volume::stepped(5, g.settings.height / 8 + 1, 5, x, g.settings.min_y, z, 4, 8, 4);
     out.extend(g.volume(g.router.final_density, &mut ctx, &corners));
     read_all(&mut ctx, &mut out);
+    back_to_a_point_after_its_volume(g, &mut ctx, roots, &spots, &mut out);
     out
+}
+
+/// A point, the one-block volume holding it, the same column higher, then the point again. The
+/// volume keeps the key on the point but its buffer may give −0 where the point gave +0: a cache
+/// answering the higher read from its column must move its key there too, as the game's computed
+/// point does, or the last read finds the stale point instead of the buffer.
+fn back_to_a_point_after_its_volume(g: &Generator, ctx: &mut Ctx, roots: &[Sid], spots: &[(i32, i32, i32)], out: &mut Vec<f32>) {
+    for &(px, py, pz) in spots {
+        for &r in roots {
+            out.push(g.value(r, ctx, px, py, pz));
+            out.extend(g.volume(r, ctx, &Volume::new(1, 1, 1, px, py, pz)));
+            out.push(g.value(r, ctx, px, py + 16, pz));
+            out.push(g.value(r, ctx, px, py, pz));
+        }
+    }
 }
 
 /// A cache whose input never reads y answers a point read at any height from its last point (and
@@ -1190,7 +1206,7 @@ fn bench_fill_sequence() {
         ("default but sublattice", Opts { sublattice_cache_read: false, ..d }),
         ("default but column memo", Opts { column_memo_y_independent: false, ..d }),
         ("default but spline inputs on stack", Opts { spline_inputs_on_stack: false, ..d }),
-        ("default + spline_stack", Opts { spline_stack: true, ..d }),
+        ("default but spline_stack", Opts { spline_stack: false, ..d }),
         (
             "default but the three",
             Opts { sublattice_cache_read: false, column_memo_y_independent: false, spline_inputs_on_stack: false, ..d },

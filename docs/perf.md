@@ -425,7 +425,7 @@ x, z: nothing to share per column); 16 base heights cost 63 noises, 24 splines a
 | Lead | Switch (default) | Result | Decision |
 |---|---|---|---|
 | Sub-lattice cache read: a cache whose input is exact serves a volume whose points it holds (the final density's 5 × 5 corners inside the aquifer's 11 × 11 grid, the surface's step-16 corners), then holds that volume as if it had computed it | `RUSTCRAFT_OPT_SUBLATTICE_CACHE_READ` (1) | filling: cache volumes computed 23.0 → 16.0, 8,447 → 8,272 values; surface 9.0 → 2.0; 16 base heights 374 → 262, 21,316 → 20,952 values. Aquifer + final density, 1 thread, 12 alternated rounds: 0.974 / 0.999 → 0.956 / 0.982 ms (min / median, −1.8%); 32 threads 0.078-0.082 either way | kept |
-| Column memo: a cache whose input never reads y answers, where the game would compute the point, from another height of the column (last point, or buffer at y = 0 for an exact input) | `RUSTCRAFT_OPT_COLUMN_MEMO_Y_INDEPENDENT` (1) | 0 answers in the 26.3 terrain (slice rule); built test: 119,736 → 73,872 cache points computed; time unchanged (0.955 / 0.977) | kept for data packs, scene bench decides |
+| Column memo: a cache whose input never reads y answers, where the game would compute the point, from another height of the column (last point, or buffer at y = 0 for an exact input) | `RUSTCRAFT_OPT_COLUMN_MEMO_Y_INDEPENDENT` (1) | 0 answers in the 26.3 terrain (slice rule); built test: 171,300 → 100,980 cache points computed; a memo answer moves the key to the point read, as the game's computed point does; time unchanged (0.955 / 0.977) | kept for data packs, scene bench decides |
 | Volume spline: coordinate buffers on the stack (≤ 8) | `RUSTCRAFT_OPT_SPLINE_INPUTS_ON_STACK` (1) | 9 → 6 allocations per chunk (aquifer + final density); time within noise | kept |
 | Point spline on the stack, re-measured on point benches | `RUSTCRAFT_OPT_SPLINE_STACK` (now 1, was opt-in) | point climate (6 roots, 20,000 quarts, 12 alternated rounds): no caches 2.916 → 2.898 µs (−0.6%), with caches 1.149 → 1.135 (−1.2%); first run −1.0 / −1.3%; 1 → 0 allocation per quart | on by default |
 | Top surface probes by volume slices | none | 1 probe per column, no noise: nothing to save | not coded |
@@ -445,13 +445,13 @@ Equivalence: `sampler_opt` (each new variant alone and combined with the old cod
 shapes; `sublattice_reads_match_old_code`: nested volume pairs over overworld, amplified, nether and end,
 every root, the vein and cave functions, built caches, point reads after on every cache, 1,536 reads served
 by a sub-lattice; `column_memo_reads_match_old_code`: 3 overworld presets, point heights changing between
-reads, every cache and five built ones), `point_after_volume_*`, `kept_context_*`, the whole rc-worldgen
+reads, every cache and five built ones, then a point, its one-block volume, the column higher and the point again), `point_after_volume_*`, `kept_context_*`, the whole rc-worldgen
 suite (`density_ref`, `terrain_ref`, `terrain_opt`, `biome_opt`, `material_opt`). Sabotages, each caught:
 sub-lattice without the exactness rule → 88 differences (vein caches over an interpolation); rows read from
 the bottom of the larger volume → 48; first index + 1 → out-of-bounds panic; y gradient marked as not
 reading y → 96 differences per chunk; noise y scale ignored → 36 chunks; buffer at y = 0 for an inexact
 input → −0 ≠ 0 on 24 chunks; product, min and max counted exact again → −0 ≠ 0 (12 chunks memo, 15
-sub-lattice); volume spline reading zero coordinates → 32 volumes. Placement: one chunk per task already
+sub-lattice); volume spline reading zero coordinates → 32 volumes; memo answer leaving the key on the old point → 0 ≠ −0, 54 chunks. Placement: one chunk per task already
 (1 core per chunk); GPU without object (f64, exact order). To measure on the scene bench, quiet machine:
 generation, generation-1thread, fresh-mountain-rd16.
 
