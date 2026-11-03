@@ -87,6 +87,8 @@ struct CVariant {
 #[derive(Debug)]
 struct CEvent {
     id: Arc<str>,
+    /// Translation key of the subtitle, shared with every subtitle conveyed.
+    subtitle: Option<Arc<str>>,
     /// Sum of the effective weights.
     total: u32,
     /// Longest chain of redirects under the event; `None`: cycle.
@@ -107,6 +109,38 @@ pub struct SoundTable {
     events: HashMap<String, Event>,
     /// Built at the first indexed draw, forgotten at each merge.
     compiled: OnceLock<Compiled>,
+    /// `events` dropped once compiled ([`forget_source`](Self::forget_source)).
+    source_dropped: bool,
+}
+
+/// `.ogg` paths present in the layers, for the existence check of the `file` variants.
+enum Listed {
+    /// Old path: every path hashed into a set.
+    Set(HashSet<String>),
+    /// `SOUND_TABLE_SORTED_LISTING`: the listed paths sorted (one layer: already sorted, kept as
+    /// listed), found by binary search; no second container.
+    Sorted(Vec<String>),
+}
+
+impl Listed {
+    fn new(lists: Vec<Vec<String>>, sorted: bool) -> Self {
+        if !sorted {
+            return Listed::Set(lists.into_iter().flatten().collect());
+        }
+        let mut all: Vec<String> = lists.into_iter().flatten().collect();
+        if !all.is_sorted() {
+            all.sort_unstable();
+        }
+        all.dedup();
+        Listed::Sorted(all)
+    }
+
+    fn contains(&self, path: &str) -> bool {
+        match self {
+            Listed::Set(s) => s.contains(path),
+            Listed::Sorted(v) => v.binary_search_by(|p| p.as_str().cmp(path)).is_ok(),
+        }
+    }
 }
 
 /// Full `namespace:path` (default namespace `minecraft`).
@@ -124,12 +158,19 @@ impl SoundTable {
     /// Reads `sounds.json` in each layer, from the lowest to the highest priority.
     /// `file` variants whose `.ogg` exists in no layer are discarded.
     pub fn load(layers: &[&Assets]) -> Self {
-        let mut oggs = HashSet::new();
+        Self::load_listing(layers, crate::engine::Opt::get().sorted_listing)
+    }
+
+    /// [`load`](Self::load) with the existence check through a sorted list (`sorted`) or a set.
+    pub(crate) fn load_listing(layers: &[&Assets], sorted: bool) -> Self {
+        let mut oggs = Vec::new();
         let mut files = Vec::new();
         for a in layers {
-            oggs.extend(a.list("assets/", ".ogg"));
+            oggs.push(a.list("assets/", ".ogg"));
             files.push(a.list("assets/", "/sounds.json"));
         }
+        let oggs = Listed::new(oggs, sorted);
+        let exists = |p: &str| oggs.contains(p);
         let mut table = SoundTable::default();
         for (a, names) in layers.iter().zip(&files) {
             for path in names {
@@ -142,7 +183,7 @@ impl SoundTable {
                 }
                 let Some(bytes) = a.read(path) else { continue };
                 match serde_json::from_slice::<Value>(&bytes) {
-                    Ok(v) => table.merge(ns, &v, &oggs),
+                    Ok(v) => table.merge_checked(ns, &v, &exists),
                     Err(e) => eprintln!("[audio] {path} ignored: {e}"),
                 }
             }
@@ -152,10 +193,15 @@ impl SoundTable {
 
     /// Merges a `sounds.json` file of namespace `ns`. Whole file ignored if invalid.
     pub fn merge(&mut self, ns: &str, v: &Value, oggs: &HashSet<String>) {
+        self.merge_checked(ns, v, &|p| oggs.contains(p));
+    }
+
+    /// [`merge`](Self::merge), a `file` variant kept if `exists(path)`.
+    fn merge_checked(&mut self, ns: &str, v: &Value, exists: &dyn Fn(&str) -> bool) {
         let Some(obj) = v.as_object() else { return };
         let mut parsed = Vec::with_capacity(obj.len());
         for (key, entry) in obj {
-            match parse_entry(ns, entry, oggs) {
+            match parse_entry(ns, entry, exists) {
                 Some(e) => parsed.push((format!("{ns}:{key}"), e)),
                 None => {
                     eprintln!("[audio] sounds.json of {ns} invalid ({key}), file ignored");
@@ -176,24 +222,54 @@ impl SoundTable {
         }
     }
 
+    /// Source entry of an event (`None` once the source is dropped).
     pub fn get(&self, id: &str) -> Option<&Event> {
         self.events.get(id)
     }
 
     pub fn len(&self) -> usize {
-        self.events.len()
+        if self.source_dropped { self.compiled().events.len() } else { self.events.len() }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.events.is_empty()
+        self.len() == 0
     }
 
-    pub fn ids(&self) -> impl Iterator<Item = &str> {
-        self.events.keys().map(String::as_str)
+    pub fn ids(&self) -> Box<dyn Iterator<Item = &str> + '_> {
+        if self.source_dropped {
+            Box::new(self.compiled().events.iter().map(|e| &*e.id))
+        } else {
+            Box::new(self.events.keys().map(String::as_str))
+        }
+    }
+
+    /// Drops the source table once compiled (`SOUND_TABLE_COMPILED_ONLY`): the allocation-free
+    /// launch reads only the compiled one, which holds the same events. Afterwards `get` and
+    /// the recursive `pick` find nothing; `len`, `ids`, `preloads` and the indexed draw answer
+    /// from the compiled table. Only for a table that will not be merged again.
+    pub fn forget_source(&mut self) {
+        self.prepare();
+        self.events = HashMap::new();
+        self.source_dropped = true;
     }
 
     /// All `file` variants marked `preload`.
     pub fn preloads(&self) -> Vec<String> {
+        if self.source_dropped {
+            let c = self.compiled();
+            let mut out: Vec<String> = c
+                .events
+                .iter()
+                .flat_map(|e| &e.variants)
+                .filter_map(|v| match v.target {
+                    Target::File(f) if v.preload => Some(c.files[f as usize].to_string()),
+                    _ => None,
+                })
+                .collect();
+            out.sort_unstable();
+            out.dedup();
+            return out;
+        }
         let mut out: Vec<String> = self
             .events
             .values()
@@ -278,9 +354,10 @@ impl SoundTable {
         let mut ids: Vec<&String> = self.events.keys().collect();
         ids.sort_unstable();
         for (i, id) in ids.iter().enumerate() {
+            let subtitle = self.events[*id].subtitle.as_deref().map(Arc::from);
             let id: Arc<str> = Arc::from(id.as_str());
             c.index.insert(id.clone(), i as u32);
-            c.events.push(CEvent { id, total: 0, height: None, variants: Vec::new() });
+            c.events.push(CEvent { id, subtitle, total: 0, height: None, variants: Vec::new() });
         }
         let mut files: HashMap<&str, u32> = HashMap::new();
         for (i, id) in ids.iter().enumerate() {
@@ -384,9 +461,37 @@ impl SoundTable {
         &self.compiled().events[e as usize].id
     }
 
+    /// Subtitle key of the event of index `e`.
+    pub fn event_subtitle(&self, e: u32) -> Option<&Arc<str>> {
+        self.compiled().events[e as usize].subtitle.as_ref()
+    }
+
     /// Path in the sources of the file of index `f` (`assets/minecraft/sounds/….ogg`).
     pub fn file_path(&self, f: u32) -> &Arc<str> {
         &self.compiled().files[f as usize]
+    }
+
+    /// Files the event of index `e` can play from a decoded buffer (redirects followed down to
+    /// the depth bound, streamed variants left out), each once, in variant order.
+    pub fn buffered_files(&self, e: u32) -> Vec<u32> {
+        let c = self.compiled();
+        let mut out = Vec::new();
+        let mut seen = vec![e];
+        let mut todo = vec![(e, 0u32)];
+        while let Some((ev, depth)) = todo.pop() {
+            for v in &c.events[ev as usize].variants {
+                match v.target {
+                    Target::File(f) if !v.stream && !out.contains(&f) => out.push(f),
+                    // A streamed redirect streams every file under it.
+                    Target::Event(t) if !v.stream && depth < MAX_DEPTH && !seen.contains(&t) => {
+                        seen.push(t);
+                        todo.push((t, depth + 1));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out
     }
 
     /// Same draw as [`pick`](Self::pick) (same generator calls, same variant), without
@@ -457,7 +562,7 @@ impl SoundTable {
 
 type Entry = (bool, Option<String>, Vec<Variant>);
 
-fn parse_entry(ns: &str, e: &Value, oggs: &HashSet<String>) -> Option<Entry> {
+fn parse_entry(ns: &str, e: &Value, exists: &dyn Fn(&str) -> bool) -> Option<Entry> {
     let o = e.as_object()?;
     let replace = match o.get("replace") {
         None => false,
@@ -472,7 +577,7 @@ fn parse_entry(ns: &str, e: &Value, oggs: &HashSet<String>) -> Option<Entry> {
         for s in list.as_array()? {
             let v = parse_variant(ns, s)?;
             if let VariantKind::File(p) = &v.kind
-                && !oggs.contains(p)
+                && !exists(p)
             {
                 eprintln!("[audio] missing file: {p}");
                 continue;
@@ -661,6 +766,143 @@ mod tests {
 
     const SYNTH_PRINT: u64 = 0xea4c_8ae8_3293_7e74;
     const SYNTH_PICKED: usize = 265_243;
+
+    /// 26.3 game resources, `None` (test skipped with a message) without an installation.
+    fn vanilla_assets() -> Option<rc_assets::Assets> {
+        let install = rc_testdata::need(rc_data::locate("26.3").ok(), "installed 26.3 game")?;
+        let index = rc_testdata::need(install.asset_index(), "26.3 sound files and fonts (asset index)")?;
+        rc_testdata::need(
+            rc_assets::Assets::for_install(&install.client_jar, &[], Some((index.0.as_path(), index.1.as_path()))).ok(),
+            "26.3 game resources",
+        )
+    }
+
+    /// Every source event, sorted: id, subtitle, variants.
+    fn dump(t: &SoundTable) -> Vec<String> {
+        let mut out: Vec<String> = t.events.iter().map(|(id, e)| format!("{id} {:?} {:?}", e.subtitle, e.variants)).collect();
+        out.sort_unstable();
+        out
+    }
+
+    /// Indexed draw of every event × 50 seeds: file path, settings, generator state afterwards.
+    fn draws(t: &SoundTable) -> Vec<String> {
+        let mut ids: Vec<&str> = t.ids().collect();
+        ids.sort_unstable();
+        let mut out = Vec::new();
+        for id in ids {
+            for seed in 0..50 {
+                let mut r = JavaRandom::new(seed);
+                let p = t.pick_fast(id, &mut r).map(|p| (t.file_path(p.file).to_string(), p.volume.to_bits(), p.pitch.to_bits(), p.stream));
+                out.push(format!("{id} {seed} {p:?} {}", r.next_int()));
+            }
+        }
+        out
+    }
+
+    /// `SOUND_TABLE_SORTED_LISTING`: the sorted listing keeps exactly the variants the set kept
+    /// (one layer, and two layers whose listings must be merged). `SOUND_TABLE_COMPILED_ONLY`:
+    /// the compiled table alone, source dropped, draws the same variants and reports the same
+    /// events and preloads.
+    #[test]
+    fn compiled_only_table_matches_source_table() {
+        // Two layers, each with one of the files: the union decides, the listings arrive unsorted.
+        let root = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-audio-listing-{}", std::process::id())));
+        let layer = |name: &str, files: &[(&str, &str)]| {
+            let dir = root.join(name);
+            for (p, body) in files {
+                let f = dir.join(p);
+                std::fs::create_dir_all(f.parent().expect("parent")).expect("directory");
+                std::fs::write(f, body).expect("write");
+            }
+            rc_assets::Assets::new(vec![rc_assets::Source::dir(&dir)])
+        };
+        let json = r#"{ "x": { "subtitle": "s.x", "sounds": ["z", { "name": "b", "preload": true }, "missing"] } }"#;
+        let low = layer("low", &[("assets/minecraft/sounds/z.ogg", "z"), ("assets/minecraft/sounds.json", json)]);
+        let high = layer("high", &[("assets/minecraft/sounds/b.ogg", "b")]);
+        let set = SoundTable::load_listing(&[&low, &high], false);
+        let mut sorted = SoundTable::load_listing(&[&low, &high], true);
+        assert_eq!(set.get("minecraft:x").map(|e| e.variants.len()), Some(2), "missing file discarded, others kept");
+        assert_eq!(dump(&set), dump(&sorted), "synthetic layers");
+        assert_eq!(sorted.preloads(), ["assets/minecraft/sounds/b.ogg"]);
+        compiled_alone_answers_alike(&mut sorted);
+        let Some(assets) = vanilla_assets() else { return };
+        for layers in [vec![&assets], vec![&assets, &assets]] {
+            let set = SoundTable::load_listing(&layers, false);
+            let sorted = SoundTable::load_listing(&layers, true);
+            assert_eq!(set.len(), VANILLA_EVENTS);
+            assert_eq!(dump(&set), dump(&sorted), "{} layer(s)", layers.len());
+        }
+        compiled_alone_answers_alike(&mut SoundTable::load_listing(&[&assets], true));
+    }
+
+    /// Source dropped: same events, preloads, indexed draws and subtitles as before.
+    fn compiled_alone_answers_alike(t: &mut SoundTable) {
+        let subtitles = |t: &SoundTable| -> Vec<Option<String>> {
+            let mut ids: Vec<&str> = t.ids().collect();
+            ids.sort_unstable();
+            ids.iter().map(|id| t.event_index(id).and_then(|e| t.event_subtitle(e)).map(|s| s.to_string())).collect()
+        };
+        let (before, preloads, len, subs) = (draws(t), t.preloads(), t.len(), subtitles(t));
+        assert!(subs.iter().any(Option::is_some), "no subtitle: empty proof");
+        t.forget_source();
+        assert!(t.events.is_empty() && t.get("minecraft:x").is_none(), "source kept");
+        assert_eq!((t.len(), t.preloads(), subtitles(t)), (len, preloads, subs));
+        let after = draws(t);
+        assert_eq!(before.len(), after.len());
+        let first = before.iter().zip(&after).position(|(a, b)| a != b);
+        assert_eq!(first, None, "first draw that differs: {:?}", first.map(|i| (&before[i], &after[i])));
+    }
+
+    /// Heap held by the source table (keys, entries, variants, paths, subtitles, map slots).
+    fn source_heap_bytes(t: &SoundTable) -> usize {
+        let slot = size_of::<(String, Event)>() + 1;
+        let entries: usize = t
+            .events
+            .iter()
+            .map(|(k, e)| {
+                let paths: usize = e
+                    .variants
+                    .iter()
+                    .map(|v| match &v.kind {
+                        VariantKind::File(p) | VariantKind::Event(p) => p.capacity(),
+                    })
+                    .sum();
+                k.capacity() + e.variants.capacity() * size_of::<Variant>() + paths + e.subtitle.as_ref().map_or(0, String::capacity)
+            })
+            .sum();
+        entries + t.events.capacity() * slot
+    }
+
+    /// Bench (ignored), loaded machine figures only: table load with the set and with the sorted
+    /// listing (alternating), and the heap the source table holds beside the compiled one.
+    /// `cargo-file.ps1 test --release -p rc-audio table_load_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "bench"]
+    fn table_load_bench() {
+        let Some(assets) = vanilla_assets() else { return };
+        for pass in 0..3 {
+            for sorted in [false, true] {
+                let t = std::time::Instant::now();
+                let table = SoundTable::load_listing(&[&assets], sorted);
+                let load = t.elapsed().as_secs_f64() * 1e3;
+                let t = std::time::Instant::now();
+                table.prepare();
+                let compile = t.elapsed().as_secs_f64() * 1e3;
+                println!(
+                    "pass {pass} sorted={sorted}: load {load:.1} ms, compile {compile:.1} ms, source table {:.0} KB",
+                    source_heap_bytes(&table) as f64 / 1e3
+                );
+            }
+        }
+        let t = std::time::Instant::now();
+        let lists = assets.list("assets/", ".ogg");
+        let list = t.elapsed().as_secs_f64() * 1e3;
+        let n = lists.len();
+        let t = std::time::Instant::now();
+        let set: HashSet<String> = lists.into_iter().collect();
+        println!("listing {n} .ogg {list:.2} ms, set built {:.2} ms", t.elapsed().as_secs_f64() * 1e3);
+        drop(set);
+    }
 
     /// All the events of the 26.3 game's `sounds.json` × 10,000 seeds.
     #[test]

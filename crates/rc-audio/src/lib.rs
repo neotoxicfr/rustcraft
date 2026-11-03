@@ -81,6 +81,12 @@ pub fn sound_ids_enabled() -> bool {
     engine::Opt::get().ids
 }
 
+/// Subtitle keys shared instead of copied (`RUSTCRAFT_OPT_SUBTITLE_INTERNED`, default 1): the
+/// client also keeps the text and width of each subtitle line between frames.
+pub fn subtitle_interned_enabled() -> bool {
+    engine::Opt::get().subtitle_interned
+}
+
 /// Optimisation switch `RUSTCRAFT_OPT_<name>`: `0` = old path, `1` = new,
 /// absent = `default`. Read once by each caller (`OnceLock`).
 pub(crate) fn switch(name: &str, default: bool) -> bool {

@@ -1438,6 +1438,11 @@ impl Gui {
         self.glyph_gen += 1;
     }
 
+    /// Changes at every font replacement: text widths kept by a caller are stale once it moves.
+    pub fn font_generation(&self) -> usize {
+        self.font_gen
+    }
+
     fn font_index(&self, font: &str) -> Option<usize> {
         if font.is_empty() && self.opts.font_table {
             return self.default_font;

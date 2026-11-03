@@ -247,6 +247,33 @@ fn command_dedup_drops_only_no_ops() {
     assert_eq!(first, None, "first difference at sample {first:?}");
 }
 
+/// Interned subtitles: every subtitle of an event carries the table's own key (no copy); the
+/// old path copies it at every launch. Same text either way.
+#[test]
+fn subtitle_keys_shared_with_table() {
+    for (interned, name) in [(true, "subtitles-shared"), (false, "subtitles-copied")] {
+        let (mut e, _m) = headless(Opt { subtitle_interned: interned, ..Opt::NEW }, name);
+        e.set_subtitles(true);
+        for seed in 0..2 {
+            e.play("test.mono", Category::Block, Some([1.0, 64.0, 0.0]), 1.0, 1.0, Some(seed));
+        }
+        let s = e.take_subtitles();
+        assert_eq!(s.len(), 2, "{name}");
+        assert!(s.iter().all(|s| &*s.key == "subtitles.test.mono"), "{name}: {s:?}");
+        assert_eq!(Arc::ptr_eq(&s[0].key, &s[1].key), interned, "{name}: key shared");
+    }
+}
+
+/// Decoding threads: 2 on the old path; one per 8 cores between 2 and 4 otherwise.
+#[test]
+fn loader_threads_follow_the_machine() {
+    assert_eq!(loader_threads(Opt { loader_threads: false, ..Opt::NEW }), 2);
+    let cores = rc_data::env_str!("RUSTCRAFT_THREADS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, usize::from));
+    assert_eq!(loader_threads(Opt::NEW), (cores / 8).clamp(2, 4), "{cores} cores");
+}
+
 /// Main-thread cost of one frame: listener + poll, camera still then moving (real clock).
 fn frame_cost(opt: Opt, moving: bool) -> f64 {
     let (mut e, mut m) = headless(opt, "bench-frame");
@@ -324,5 +351,45 @@ fn frame_bench() {
             let (ns, cmds) = command_cost(opt);
             println!("pass {pass} {name:>16}: {ns:.0} ns/tick, {cmds:.1} commands/tick");
         }
+        for (name, interned) in [("copied", false), ("interned", true)] {
+            let (launch, repeat) = subtitle_cost(Opt { subtitle_interned: interned, ..Opt::NEW });
+            println!("pass {pass} subtitles {name:>8}: {launch:.0} ns/launch, {repeat:.0} ns per repeated subtitle");
+        }
     }
+}
+
+/// Launch with subtitles on (cost per sound, drained every 10 launches like a frame), and the
+/// repeated subtitles of 64 audible loops (cost per subtitle, every 10th tick).
+fn subtitle_cost(opt: Opt) -> (f64, f64) {
+    let (mut e, m) = headless(opt, "bench-subtitles");
+    // No mixer: commands are dropped at once instead of piling up in the outbox.
+    drop(m);
+    e.set_subtitles(true);
+    const N: u32 = 200_000;
+    let t = Instant::now();
+    for k in 0..N {
+        let h = e.play("test.mono", Category::Block, Some([1.0, 64.0, 0.0]), 1.0, 1.0, Some(i64::from(k)));
+        if let Some(h) = h {
+            e.stop_handle(h);
+        }
+        if k % 10 == 9 {
+            std::hint::black_box(e.take_subtitles());
+            e.instances.clear();
+            e.counts = [0; 2];
+        }
+    }
+    let launch = t.elapsed().as_secs_f64() * 1e9 / f64::from(N);
+    for i in 0..64 {
+        let req = SoundRequest::new("test.mono", Category::Neutral).at([f64::from(i), 64.0, 0.0]).seed(Some(i64::from(i)));
+        e.play_request(req.looping(0));
+    }
+    e.take_subtitles();
+    let ticks = 20_000u32;
+    let t = Instant::now();
+    for _ in 0..ticks {
+        e.tick();
+        std::hint::black_box(e.take_subtitles());
+    }
+    let repeats = f64::from(ticks / 10) * 64.0;
+    (launch, t.elapsed().as_secs_f64() * 1e9 / repeats)
 }
