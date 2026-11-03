@@ -2017,6 +2017,37 @@ animated sprite up to 4 ms earlier (early, imperceptible). Not done: glint compu
 (depends on C4-M14, to decide after measurement). All three kept at 1; decision on the
 `inventory-enchanted` / `inventory` scene bench on a quiet machine.
 
+### Bench memory readout: one pass per report period (C5-M01, 03/11/2026, loaded-machine micro-bench)
+
+Only runs under `RUSTCRAFT_PERFLOG` (bench), never in normal play. The integrated server walked its
+chunks in batches of 64 at every tick and restarted a pass as soon as one ended (~11 ticks for 700
+chunks), while the `[perf] ram` line reads the totals every 5 s: 10 passes out of 11 thrown away,
+~13 % of the singleplayer thread in the bench profiles (`root_parts` on the kept compound), outside
+the tick measurement but in the process CPU. Now (`RUSTCRAFT_OPT_MEMWALK_ONCE_PER_REPORT`, default 1,
+`=0` old path) a pass starts every 100 ticks, the first at the first tick; batches of 64 kept;
+totals published at the end of the last batch (the old path published one tick later) and the
+light layers held for the dedup released at once. Not spread over 5 s: it would hold freed layers
+and mix states 5 s apart. Variant `RUSTCRAFT_OPT_MEMWALK_ON_REPORT_REQUEST=1` (default 0): a pass
+starts when the report asked for one; same 5 s rhythm, kept off since a whole pass costs well
+under the 2 ms that would have justified it.
+
+Micro-bench `cargo test --release -p rc-sim --lib -- --ignored --nocapture memory_walk_pass_cost`
+(700 synthetic chunks of 24 sections, 1,000 ticks, 1 thread, loaded machine):
+
+| Path | Walk per 100 ticks | Worst tick | Passes in 1,000 ticks |
+|---|---|---|---|
+| continuous (old) | 7.161 ms | 0.232 ms | 84 |
+| one per 100 ticks | 0.926 ms | 0.101 ms | 10 |
+
+Equivalence: same frozen world, the three rules publish the same totals, equal to stored ones
+(`spaced_pass_publishes_the_same_totals_as_the_continuous_pass`); 100 ticks = one pass started and
+published, no layer held between passes. Multi-core and GPU not applicable (≈ 1 ms every 5 s on
+the singleplayer thread). To measure on a quiet machine: `samply` share of `root_parts` +
+`nbt_heap` (expected ~0.5 % -> < 0.05 % of the process) and process CPU on plains12, plains32,
+forest, cave, village, generation, crowd-1000; median tick unchanged (measured before the walk).
+Same pattern left elsewhere: the generator recounts its whole map after every batch under
+`RUSTCRAFT_PERFLOG` (plain counters, no NBT).
+
 ## Ruled out (to re-measure)
 
 | Building block | Variant | Result | Why |
