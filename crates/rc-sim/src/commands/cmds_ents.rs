@@ -215,7 +215,7 @@ impl Server {
         {
             n = crate::decoration::summoned(k, pos, crate::nbtio::uuid(n.get("UUID")).unwrap_or(uuid), &n);
         }
-        let chunk = ((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4);
+        let chunk = crate::decoration::chunk_of(pos);
         self.entities.entry(chunk).or_default().push((id, n));
         self.life.drop_chunks.insert(chunk);
         self.display_resolve_text(id, load_pos, None); // G5-F05

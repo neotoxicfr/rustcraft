@@ -2389,6 +2389,7 @@ dependencies = [
 name = "rc-proto"
 version = "0.1.0"
 dependencies = [
+ "rc-data",
  "thiserror 2.0.21",
 ]
 
@@ -2473,6 +2474,7 @@ dependencies = [
  "flate2",
  "hashbrown 0.17.1",
  "md-5",
+ "mimalloc",
  "rayon",
  "rc-data",
  "rc-proto",

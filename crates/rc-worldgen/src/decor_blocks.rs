@@ -1070,6 +1070,12 @@ impl Blocks {
         self.value_lists[l.values as usize].iter().position(|x| x == value).map(|i| i as u8)
     }
 
+    /// Text values of the property in the block of `s`, by value index (`None` if the block
+    /// lacks it).
+    pub(crate) fn values_of(&self, s: State, p: Prop) -> Option<&[String]> {
+        self.layout(s, p).map(|l| self.value_lists[l.values as usize].as_slice())
+    }
+
     /// Changes the property by its text value (no effect if absent).
     pub fn with_str(&self, s: State, p: Prop, value: &str) -> State {
         match self.value_index(s, p, value) {

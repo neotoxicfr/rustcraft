@@ -134,8 +134,8 @@ fn alert_others(s: &mut Server, m: &Mob, t: Ent) {
         min: [p[0] - r, p[1] - 10.0, p[2] - r],
         max: [p[0] + 1.0 + r, p[1] + 1.0 + 10.0, p[2] + 1.0 + r],
     };
-    for o in s.mobs.list.iter_mut().flatten() {
-        if o.kind == Kind::ZombifiedPiglin && o.id != m.id && o.target.is_none() && o.touches(&area) {
+    for o in s.mobs.of_kind_mut(Kind::ZombifiedPiglin) {
+        if o.id != m.id && o.target.is_none() && o.touches(&area) {
             before_set_target(o, Some(t));
             o.target = Some(t);
         }

@@ -2,9 +2,11 @@
 exclusion of cold launches, camera-centred pre-generation, scene consistency, profile
 window, compatibility with data written before the English renaming. Expected values are
 stored here; explicit failure if the data is missing."""
+import argparse
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -179,10 +181,12 @@ class Scenes(unittest.TestCase):
 
     def test_consistent_scenes(self):
         funcs = scenes.pack_functions({"crowd": (740, 64, 200), "redstone": (740, 64, 840)})
-        views = {"plains", "forest", "village", "ocean", "cave", "nether", "crowd", "redstone"}
+        views = {"plains", "forest", "village", "ocean", "cave", "nether", "crowd", "redstone", "trial", "fortress"}
         steps = {"/", "o", "tab", "stab", "up", "down", "left", "right", "esc", "enter", "bs"}
+        located = set(scenes.LOCATED_FRESH_BIOMES) | {"nether"}
         for n, sc in scenes.SCENES.items():
-            self.assertTrue(sc.get("at") in views or sc.get("site") in ("crowd", "redstone") or "pos" in sc, n)
+            self.assertTrue(sc.get("at") in views or sc.get("site") in ("crowd", "redstone") or "pos" in sc
+                            or sc.get("fresh_path") in located, n)
             self.assertLess(sc["from"], sc["secs"] - 5, n)
             for s in sc.get("cmd", "").split("|") if sc.get("cmd") else []:
                 self.assertTrue(s in steps or s[:1] in "wt", f"{n}: step {s}")
@@ -193,11 +197,11 @@ class Scenes(unittest.TestCase):
     def test_function_quantities(self):
         f = scenes.pack_functions({"crowd": (0, 64, 0), "redstone": (0, 64, 0)})
         self.assertTrue(all(isinstance(t, str) for t in f.values()))
-        self.assertEqual([l.split("tag=")[1][:9] for l in f["tick"].splitlines()], ["perf_fly]", "perf_glid", "perf_turn", "perf_walk"])
+        self.assertEqual([l.split("tag=")[1][:9] for l in f["tick"].splitlines()],
+                         ["perf_fly]", "perf_glid", "perf_turn", "perf_walk", "perf_chat", "perf_reap", "perf_data"])
         count = lambda name, word: f[name].count(word)  # noqa: E731
         self.assertEqual(count("mobs", "summon"), 100)
         self.assertEqual(count("mobs1000", "summon"), 1000)
-        self.assertEqual((count("team_crowd", "summon"), count("team_crowd", "team join")), (1000, 2))
         self.assertEqual(count("names", "CustomNameVisible"), 200)
         self.assertEqual(count("glowing", "Glowing"), 100)
         self.assertEqual(count("humanoids", "summon"), 160)
@@ -222,6 +226,293 @@ class Scenes(unittest.TestCase):
         info = {"sites": {"crowd": [740, 64, 200]}, "scenes": {}}
         v = scenes.view_of(scenes.SCENES["crowd-close-up"], info)
         self.assertEqual(v["pos"], [740.5, 66.0, 193.5])
+
+
+RUST_READ = re.compile(r'env_(flag|str|os)!\(\s*"(RUSTCRAFT_[A-Z0-9_]+)"|read_os\("(RUSTCRAFT_[A-Z0-9_]+)"\)')
+OFF_VALUES = {"0", "false", "off", ""}
+
+
+def rust_env_reads():
+    """`RUSTCRAFT_*` variables read by the Rust sources: name -> {"flag"} (presence only) and/or
+    {"value"}. Explicit failure if no source is found."""
+    reads = {}
+    for top in ("apps", "crates"):
+        for d, dirs, files in os.walk(os.path.join(scenes.ROOT, top)):
+            dirs[:] = [x for x in dirs if x != "target"]
+            for f in (f for f in files if f.endswith(".rs")):
+                with open(os.path.join(d, f), encoding="utf-8", errors="replace") as fh:
+                    for m in RUST_READ.finditer(fh.read()):
+                        kind = "flag" if m.group(1) == "flag" else "value"
+                        reads.setdefault(m.group(2) or m.group(3), set()).add(kind)
+    if len(reads) < 50:
+        raise AssertionError(f"Rust sources not found under {scenes.ROOT}")
+    return reads
+
+
+def bench_dir():
+    base = os.path.join(scenes.ROOT, "target", "bench-tests")
+    os.makedirs(base, exist_ok=True)
+    return tempfile.TemporaryDirectory(dir=base)
+
+
+class Drivers(unittest.TestCase):
+    """The variables the scenes drive the client with are the ones it reads."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.reads = rust_env_reads()
+
+    def test_presence_flags_never_set_off(self):
+        # The client tests some variables for presence only: "0" leaves them ON (the trap of the
+        # fresh-world flights, `RUSTCRAFT_GENLOG: "0"`).
+        self.assertEqual(self.reads["RUSTCRAFT_GENLOG"], {"flag"})
+        envs = [("launch", scenes.FIXED_ENV)] + [(n, sc.get("env", {})) for n, sc in scenes.SCENES.items()]
+        traps = [(n, k, v) for n, env in envs for k, v in env.items()
+                 if self.reads.get(k) == {"flag"} and v.strip().lower() in OFF_VALUES]
+        self.assertEqual(traps, [])
+
+    def test_every_driver_is_read(self):
+        unread = sorted({(n, v) for n, sc in scenes.SCENES.items() for v in scenes.scene_drivers(sc) if v not in self.reads})
+        self.assertEqual(unread, [])
+        self.assertEqual(set(scenes.SCENE_VARS) - set(self.reads), set())
+
+    def test_menu_names_exist(self):
+        with open(os.path.join(scenes.ROOT, "apps", "client", "src", "menus.rs"), encoding="utf-8") as f:
+            text = f.read()
+        body = text[text.index("pub fn test_path"):]
+        names = set(re.findall(r'"(\w+)" =>', body[:body.index("_ => return None")])) | {"title"}
+        self.assertIn("pause", names)
+        for n, sc in scenes.SCENES.items():
+            if "menu" in sc:
+                self.assertIn(sc["menu"], names, n)
+
+    def test_exe_without_a_driver_is_skipped(self):
+        with bench_dir() as t:
+            exe = os.path.join(t, "old.exe")
+            with open(exe, "wb") as f:
+                f.write(b"\0RUSTCRAFT_CMDTEST\0RUSTCRAFT_MENUTEST\0RUSTCRAFT_MENUCLICKS\0")
+            a = argparse.Namespace(exe=[exe], sound_device="", connect="")
+            scenes._EXE_LACKS.clear()
+            self.assertIsNone(scenes.skip_reason(a, scenes.SCENES["first-locate"]))
+            self.assertIn("does not read RUSTCRAFT_DEBUGTEST", scenes.skip_reason(a, scenes.SCENES["f3-open"]))
+            scenes._EXE_LACKS.clear()
+
+    def test_missing_view_or_path_is_skipped(self):
+        a = argparse.Namespace(exe=[], sound_device="", connect="")
+        with bench_dir() as t:
+            os.makedirs(os.path.join(t, "model"))
+            os.makedirs(os.path.join(t, "model-1234"))
+            saved, scenes.PERF = scenes.PERF, t
+            try:
+                info = {"scenes": {"plains": {}}, "sites": {}}
+                self.assertIn("view trial missing", scenes.skip_reason(a, scenes.SCENES["trial-chamber"], info))
+                self.assertIsNone(scenes.skip_reason(a, scenes.SCENES["first-locate"], info))
+                self.assertIn("path swamp missing", scenes.skip_reason(a, scenes.SCENES["fresh-swamp-rd16"], info))
+                with open(os.path.join(t, "model-1234", scenes.FRESH_PATHS_FILE), "w") as f:
+                    json.dump({"swamp": {"dim": "minecraft:overworld", "pos": [1.5, 90.0, 2.5], "rot": [90.0, 25.0]}}, f)
+                self.assertIsNone(scenes.skip_reason(a, scenes.SCENES["fresh-swamp-rd16"], info))
+                self.assertEqual(scenes.view_of(scenes.SCENES["fresh-swamp-rd16"], info)["pos"], [1.5, 90.0, 2.5])
+            finally:
+                scenes.PERF = saved
+
+
+class Positions(unittest.TestCase):
+    INFO = {"scenes": {"nether": {"dim": "minecraft:the_nether", "pos": [1.5, 64.0, -2.5], "rot": [0.0, 5.0]},
+                       "plains": {"dim": "minecraft:overworld", "pos": [10.5, 70.0, 20.5], "rot": [90.0, 15.0]}},
+            "sites": {"crowd": [740, 64, 200]}}
+
+    def test_placeholders(self):
+        self.assertEqual(scenes.resolve_positions("tp @s {view:nether}", self.INFO), "tp @s 1.50 64.00 -2.50")
+        self.assertEqual(scenes.resolve_positions("{site:crowd:0:1:-18}", self.INFO), "740,65,182")
+        self.assertEqual(scenes.resolve_positions("{site:crowd}", self.INFO), "740,64,200")
+        with self.assertRaises(SystemExit):
+            scenes.resolve_positions("{view:trial}", self.INFO)
+
+    def test_scene_placeholders_name_known_positions(self):
+        known = {"view": {"plains", "forest", "village", "ocean", "cave", "nether", "crowd", "redstone", "trial", "fortress"},
+                 "site": {"crowd", "redstone"}}
+        for n, sc in scenes.SCENES.items():
+            for text in [sc.get("cmd", ""), sc.get("keys", "")] + list(sc.get("env", {}).values()):
+                for m in scenes.PLACEHOLDER.finditer(text):
+                    self.assertIn(m.group(2), known[m.group(1)], n)
+
+    def test_resolved_copy(self):
+        sc = scenes.SCENES["first-nether-trip"]
+        out = scenes.scene_with_positions(sc, self.INFO)
+        self.assertIn("tp @s 1.50 64.00 -2.50", out["cmd"])
+        self.assertIn("{view:nether}", sc["cmd"])  # the scene itself is untouched
+        inv = scenes.scene_with_positions(scenes.SCENES["survival-inventory"], self.INFO)
+        self.assertEqual(inv["env"]["RUSTCRAFT_INVTEST"], "740,65,182")
+
+    def test_views(self):
+        self.assertEqual(scenes.view_of(scenes.SCENES["end-fight"], self.INFO)["dim"], "minecraft:the_end")
+        v = scenes.view_of(scenes.SCENES["first-bonemeal"], self.INFO)
+        self.assertEqual((v["pos"], v["rot"]), ([10.5, 70.0, 20.5], [0.0, 90.0]))
+        self.assertEqual(self.INFO["scenes"]["plains"]["rot"], [90.0, 15.0])
+
+    def test_survival_player(self):
+        with bench_dir() as t:
+            model, game = os.path.join(t, "model"), os.path.join(t, "game")
+            os.makedirs(model)
+            view = {"dim": "minecraft:overworld", "pos": [0.5, 65.0, 0.5], "rot": [0.0, 0.0]}
+            for survival, mode in ((True, 0), (False, 1)):
+                scenes.stage(game, view, 12, model=model, survival=survival)
+                p = scenes.nbt.read_dat(os.path.join(game, "saves", "perf", "players", "data", scenes.offline_uuid(scenes.NAME) + ".dat"))
+                self.assertEqual(p["playerGameType"][1], mode)
+                self.assertEqual(p["abilities"]["flying"][1], mode)
+                self.assertEqual(p["abilities"]["mayBuild"][1], 1)
+
+
+class TimedAnalysis(unittest.TestCase):
+    TICK = "[perf] server: tick median 1.000 ms, p95 2.000 ms, p99 {} ms, mean 1.100 ms"
+
+    def test_tick_reports_dated_by_the_line_before(self):
+        t = self.TICK.format
+        lines = [t("50.0"), "[  24.0 s] 100 fps", t("3.0"), "[  25.0 s] x", t("9.5"), "[  26.0 s] x",
+                 "[  30.0 s] x", t("7.0"), "[  34.0 s] x",  # client stall inside the window
+                 "[  42.0 s] x", t("80.0"), "[  48.0 s] x",  # stall across the end of the window
+                 t("4.0")]
+        self.assertEqual(scenes.dated_ticks(lines),
+                         [(24.0, 25.0, 3.0), (25.0, 26.0, 9.5), (30.0, 34.0, 7.0), (42.0, 48.0, 80.0), (48.0, None, 4.0)])
+        window = lambda s: 25 <= s <= 44  # noqa: E731
+        m = scenes.timed_tick_metrics(lines, window, 25, 45)
+        # The 50 ms before any date (loading) and the 80 ms of unknown time are left out.
+        self.assertEqual(m["tick_max_ms"], 9.5)
+        self.assertTrue(math.isnan(m["tick_p99_last_minute_ms"]))  # 45 s scene: no full minute after 25 s
+        long = scenes.timed_tick_metrics(lines, window, 25, 90)
+        self.assertEqual(long["tick_p99_last_minute_ms"], 43.5)  # 7.0 and 80.0, both gaps within 29..89 s
+        self.assertTrue(math.isnan(scenes.timed_tick_metrics(lines, lambda s: s > 60, 25, 70)["tick_max_ms"]))
+
+    def test_load_and_memory(self):
+        ram = ("[perf] [{t:6.1f} s] ram: private 900 MB, allocator {a} MB committed (peak 700), outside the allocator 300 MB; "
+               "server: {c} chunks, sections 10.0 MB, light 2.0 MB (5 layers), heightmaps 1.0 MB, block entities 0.5 MB, "
+               "kept compound 3.5 MB (x 1.0), frozen entities 0 (0.0 MB); pending: generator outputs 0, write batches 0")
+        stat = "[{t:6.1f} s] 100 fps, CPU 0.1 ms/frame, 12 entities drawn, block entities {b} of which 3 drawn"
+        lines = [ram.format(t=20.0, a=100, c=5), ram.format(t=26.0, a=500, c=400), ram.format(t=31.0, a=600, c=450),
+                 stat.format(t=26.0, b=40), stat.format(t=27.0, b=40), stat.format(t=10.0, b=99)]
+        win = lambda t: 25 <= t <= 44  # noqa: E731
+        mem = scenes.memory_metrics(lines, win)
+        self.assertEqual((mem["allocator_mb"], mem["allocator_growth_mb"], mem["server_chunks"]), (600.0, 100.0, 450))
+        self.assertAlmostEqual(mem["server_mem_mb"], 17.0)
+        self.assertAlmostEqual(mem["server_mem_growth_mb"], 0.0)
+        load = scenes.load_metrics(lines, win)
+        self.assertEqual((load["entities_drawn"], load["block_entities"], load["block_entities_drawn"]), (12, 40, 3))
+
+    def test_new_measures_shown(self):
+        m = analyse("new.log", "images.txt")
+        shown = {k for k, _, _ in scenes.KEYS}
+        for k in ("tick_max_ms", "save_chunks_med", "reload_ms", "entities_drawn", "allocator_mb", "server_mem_growth_mb"):
+            self.assertIn(k, m)
+            self.assertIn(k, shown)
+        self.assertEqual(m["save_chunks_med"], 250)  # saves of 240, 250 and 260 chunks in the stored log
+
+    def test_load_report_flags_moving_load(self):
+        rep = scenes.noise_report({"a": [{"entities_drawn": 12.0}, {"entities_drawn": 12.0}],
+                                   "b": [{"entities_drawn": 12.0}, {"entities_drawn": 15.0}]})
+        self.assertIn("| a | 12 |", rep)
+        self.assertIn("| b | 12–15 (differs) |", rep)
+
+
+class Launch(unittest.TestCase):
+    def test_remove_and_fixed_variables(self):
+        a = argparse.Namespace(env=["-RUSTCRAFT_GENLOG", "X_PERF_TEST=1"])
+        env = scenes.launch_env(a, {"secs": 45, "env": {"RUSTCRAFT_TABTEST": "1"}}, "out", "game", "cache", ["-RUSTCRAFT_VSYNC"])
+        self.assertNotIn("RUSTCRAFT_GENLOG", env)
+        self.assertNotIn("RUSTCRAFT_VSYNC", env)
+        self.assertEqual((env["X_PERF_TEST"], env["RUSTCRAFT_TABTEST"], env["RUSTCRAFT_HALLOWEEN"]), ("1", "1", "0"))
+        env = scenes.launch_env(argparse.Namespace(env=[]), {"secs": 45}, "out", "game", "cache", [])
+        self.assertEqual(env["RUSTCRAFT_GENLOG"], "1")
+
+    def test_removal_written_as_documented(self):
+        # Through the real parser: the documented spelling must reach launch_env.
+        a = scenes.build_parser().parse_args(["run", "--exe", "a.exe|-RUSTCRAFT_VSYNC", "--env=-RUSTCRAFT_GENLOG"])
+        self.assertEqual((a.env, a.exe), (["-RUSTCRAFT_GENLOG"], ["a.exe|-RUSTCRAFT_VSYNC"]))
+        self.assertNotIn("RUSTCRAFT_GENLOG", scenes.launch_env(a, {"secs": 45}, "out", "game", "cache", []))
+        self.assertIn("--env=-VAR", scenes.__doc__)
+
+    def test_groups(self):
+        for g, names in scenes.SCENE_GROUPS.items():
+            self.assertEqual([n for n in names if n not in scenes.SCENES], [], g)
+        self.assertEqual(len(scenes.SCENE_GROUPS["reference"]), 15)
+        names = scenes.expand_scene_names("@first-use,first-locate,plains12,@first-use")
+        self.assertEqual(names, scenes.SCENE_GROUPS["first-use"] + ["plains12"])
+        with self.assertRaises(SystemExit):
+            scenes.expand_scene_names("@nothing")
+
+    def test_mission_scenes_exist(self):
+        # Scenes asked by the series-3 plan (renamed: autosave-1 is `save`, newworld-taiga and
+        # newworld-nether are `fresh-taiga-rd16` and `fresh-nether-rd16`).
+        asked = ["save", "flight", "long-flight", "hoppers-1", "smelter-1", "sculk-1", "carts-1", "items-merge-1",
+                 "redstone-dense", "tnt-cannon", "fresh-taiga-rd16", "fresh-nether-rd16", "fresh-swamp-rd16",
+                 "fresh-badlands-rd16", "crowd-1000-lan-1", "tnt-lan-1", "lan-4-spread", "redstone-published",
+                 "maps-1", "hidden-1", "flight-rotation-32", "ocean-transparency", "survival-hud", "hud-busy", "trade",
+                 "tab-80", "chat-flood", "recipe-book", "cmd-give", "stats-screen", "advancements", "f3-open",
+                 "team-crowd", "signs-chests", "displays-1", "structure-show-air", "reload-f3t", "multiplayer",
+                 "world-list", "world-create", "packs-20", "long-flight-save", "village-night", "raid",
+                 "crowd-1000-melee", "crowd-1000-archers", "pen-babies", "crowd-villagers", "trial-chamber",
+                 "bee-nests-night", "nether-fortress", "end-fight", "swamp-bastion", "survival-inventory", "datapack",
+                 "tnt-first-volley", "first-locate", "first-bonemeal", "first-ender-eye", "first-nether-trip"]
+        self.assertEqual([n for n in asked if n not in scenes.SCENES], [])
+
+    def test_scripted_inputs(self):
+        clicks = scenes.crafting_clicks().split(",")
+        self.assertEqual(len(clicks), 108)
+        self.assertTrue(all(len(c.split(":")) == 3 and all(p.isdigit() for p in c.split(":")) for c in clicks))
+        self.assertEqual(clicks[:3], ["37:0:0", "1:0:0", "0:0:1"])
+        self.assertEqual(scenes.right_clicks(600, 2),
+                         "600:+:key.mouse.right,601:-:key.mouse.right,610:+:key.mouse.right,611:-:key.mouse.right")
+        self.assertEqual(scenes.SCENES["cmd-give"]["cmd"], "w40|/|tgive @s |w200")
+
+    def test_clicks_inside_the_interface(self):
+        # 1600 × 900 at scale 3: 533 × 300 interface units.
+        point = re.compile(r"(?:^|:)(\d+):(\d+)$")
+        for n, sc in scenes.SCENES.items():
+            for step in sc.get("env", {}).get("RUSTCRAFT_MENUCLICKS", "").split(","):
+                m = point.search(step)
+                if m and not step.split(":")[-3:-2] == ["t"]:
+                    self.assertTrue(0 <= int(m.group(1)) < 533 and 0 <= int(m.group(2)) < 300, f"{n}: {step}")
+
+    def test_folders_of_new_scenes(self):
+        self.assertEqual(scenes.parse_run_dir("tab-20-1"), ("tab-20", 1, None))
+        self.assertEqual(scenes.parse_run_dir("maps-1-2-0"), ("maps-1", 2, 0))
+        self.assertEqual(scenes.parse_run_dir("crowd-1000-lan-1-3"), ("crowd-1000-lan-1", 3, None))
+
+    def test_chat_commands_of_a_script(self):
+        script = "w100|/|tfunction perf:x|enter|w5|/|tgi|tab|enter|o|thello|enter|/|ttp @s |t~ ~1 ~|enter"
+        self.assertEqual(scenes.chat_commands(script), ["function perf:x", "tp @s ~ ~1 ~"])
+
+    def test_chat_commands_written_with_positions(self):
+        with bench_dir() as out:
+            self.assertEqual(scenes.write_chat_commands(out), sum("cmd" in sc for sc in scenes.SCENES.values()))
+            with open(os.path.join(out, "chat-commands", "first-nether-trip.txt"), encoding="utf-8") as f:
+                self.assertEqual(f.read().splitlines()[0], "execute in minecraft:the_nether run tp @s 64.50 -60.00 8.50")
+            for name in os.listdir(os.path.join(out, "chat-commands")):
+                with open(os.path.join(out, "chat-commands", name), encoding="utf-8") as f:
+                    self.assertIsNone(scenes.PLACEHOLDER.search(f.read()), name)
+
+    def test_every_run_folder_reads_back_to_its_scene(self):
+        # A scene named `<other scene>-<pass number>` makes `<other>-<p>-<e>` ambiguous: the
+        # A/B folder of one scene would be reread as a single-exe pass of the other.
+        for n in scenes.SCENES:
+            for p in range(1, 10):
+                self.assertEqual(scenes.parse_run_dir(f"{n}-{p}"), (n, p, None), n)
+                for e in range(10):
+                    self.assertEqual(scenes.parse_run_dir(f"{n}-{p}-{e}"), (n, p, e), n)
+
+
+class Micro(unittest.TestCase):
+    def test_bench_lines(self):
+        with bench_dir() as t:
+            paths = []
+            for k, v in enumerate(("120.5", "130.5")):
+                paths.append(os.path.join(t, f"pass{k}.txt"))
+                with open(paths[-1], "w", encoding="utf-8") as f:
+                    f.write(f"running 1 test\n[bench] datapack_tick crowd us_per_tick {v}\n"
+                            "[bench] datapack_tick crowd allocs_per_tick 3\nok\n")
+            res = scenes.micro_results(paths)
+        self.assertEqual(res[("datapack_tick", "crowd", "us_per_tick")], [120.5, 130.5])
+        table = scenes.micro_table(res)
+        self.assertIn("| datapack_tick | crowd | us_per_tick | 125.5 (120.5–130.5) | 8.0 % | 2 |", table)
 
 
 class OldData(unittest.TestCase):

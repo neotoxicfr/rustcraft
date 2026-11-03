@@ -62,6 +62,17 @@ jobs:
         run: cargo run --locked --release -p rc-data --example prepare -- 26.3
       - name: Tests
         run: cargo test --locked --release --workspace --no-fail-fast
+      # One invalid line makes the game refuse a whole function, and one refused chat command
+      # leaves a scene measuring an empty view: the bench's `perf` pack functions and every
+      # scene's chat commands are compiled with our command parser
+      # (`crates/rc-sim/src/tests_perf_pack.rs`, both ignored tests of the module).
+      - name: Bench data pack compiles
+        shell: bash
+        env:
+          RUSTCRAFT_PERF_PACK: ${{ github.workspace }}/target/perf-pack/datapacks/perf
+        run: |
+          python -I tools/bench/scenes.py pack-files target/perf-pack
+          cargo test --locked --release -p rc-sim tests_perf_pack:: -- --ignored
 
   tools:
     name: Python tools
@@ -72,3 +83,5 @@ jobs:
         with:
           python-version: "3.13"
       - run: python -I tools/bench/test_scenes.py
+      - run: python -I tools/bench/test_perf_pack.py
+      - run: python -I tools/bench/test_fixtures.py

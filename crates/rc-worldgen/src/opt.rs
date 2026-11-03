@@ -98,6 +98,26 @@ pub fn vol_pool() -> bool {
     *S
 }
 
+switch!(
+    /// Evaluator: a buffer taken from the context keeps its old values instead of being zeroed
+    /// (every caller writes the elements it reads).
+    take_without_zeroing,
+    "RUSTCRAFT_OPT_TAKE_WITHOUT_ZEROING"
+);
+switch!(
+    /// Evaluator: a buffer is taken from the smallest spare one that holds it, a new one is
+    /// allocated at a rounded size, and the spare buffers of a context are capped in bytes
+    /// (8 MB) instead of in count.
+    best_fit_buffers,
+    "RUSTCRAFT_OPT_BEST_FIT_BUFFERS"
+);
+switch!(
+    /// Terrain: each thread keeps its evaluation context (cache cells, spare buffers) from one
+    /// chunk to the next, reset at the start of each chunk, instead of a new one per chunk.
+    keep_eval_context,
+    "RUSTCRAFT_OPT_KEEP_EVAL_CONTEXT"
+);
+
 /// Spline: point coordinates kept on the stack, sampling without dynamic call.
 /// Off by default (`=1` enables it) until the quiet-machine bench (same figure as `vol_pool`).
 #[inline]
@@ -486,6 +506,58 @@ switch_f!(
     statetrans_fast,
     "STATETRANS_FAST"
 );
+
+// ---- State transformation tables (C1-M07). The proofs pass every combination explicitly.
+
+switch!(
+    /// State transformation tables: half and three-quarter turns composed from the quarter turn
+    /// table; mirrored stairs read the half-turn table instead of turning again.
+    compose_rotations,
+    "RUSTCRAFT_OPT_COMPOSE_ROTATIONS"
+);
+switch!(
+    /// State transformation tables: each block's property rules worked out once, then applied
+    /// to its states by value index (no text rewrite per state).
+    transforms_per_block,
+    "RUSTCRAFT_OPT_TRANSFORMS_PER_BLOCK"
+);
+switch!(
+    /// State transformation tables kept by the process once built: a world opened again reuses
+    /// them although its generation data are rebuilt.
+    keep_transforms,
+    "RUSTCRAFT_OPT_KEEP_TRANSFORMS"
+);
+
+/// State transformation tables built across the rayon pool, only `RUSTCRAFT_OPT_PARALLEL_TRANSFORMS=1`
+/// (off by default: the sequential build is already short, see `docs/perf.md`).
+pub fn parallel_transforms() -> bool {
+    static S: LazyLock<bool> =
+        LazyLock::new(|| rc_data::env_str!("RUSTCRAFT_OPT_PARALLEL_TRANSFORMS").is_some_and(|v| v.trim() == "1"));
+    *S
+}
+
+/// Where the state transformation tables of a world's templates are built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TablesThread {
+    /// On the spot, before the generator is ready (old path).
+    Inline,
+    /// On a dedicated background thread.
+    Dedicated,
+    /// As a task of the rayon pool (which the stronghold rings occupy at the same time).
+    RayonPool,
+}
+
+/// `RUSTCRAFT_OPT_TRANSFORMS_IN_BACKGROUND`: `0` inline, `rayon` pool task, otherwise a dedicated
+/// thread.
+pub fn transforms_in_background() -> TablesThread {
+    static S: LazyLock<TablesThread> =
+        LazyLock::new(|| match rc_data::env_str!("RUSTCRAFT_OPT_TRANSFORMS_IN_BACKGROUND").map(str::trim) {
+            Some("0") => TablesThread::Inline,
+            Some("rayon") => TablesThread::RayonPool,
+            _ => TablesThread::Dedicated,
+        });
+    *S
+}
 switch_f!(
     /// Height maps of a generated chunk: every map from a single walk down each column, started
     /// at the top of the highest slice of 16 that is not all plain air (L9-STRUCT).

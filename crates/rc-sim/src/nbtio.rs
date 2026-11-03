@@ -29,11 +29,58 @@ pub fn parse_root(bytes: &[u8]) -> Result<Nbt, Error> {
     }
 }
 
+/// Starting capacity of an encoded root when nothing better is known.
+const DEFAULT_ROOT_CAPACITY: usize = 4096;
+
 /// Empty named root, uncompressed.
 pub fn encode_root(v: &Nbt) -> Vec<u8> {
-    let mut w = Vec::with_capacity(4096);
+    encode_root_with_capacity(v, DEFAULT_ROOT_CAPACITY)
+}
+
+fn encode_root_with_capacity(v: &Nbt, capacity: usize) -> Vec<u8> {
+    let mut w = Vec::with_capacity(capacity);
     nbt::write_named(&mut w, "", v);
     w
+}
+
+/// True (default): [`RootEncoder`] sizes each buffer from the previous root.
+/// `RUSTCRAFT_OPT_NBT_SIZE_HINT=0`: every root starts at 4 KiB.
+fn size_hint_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_NBT_SIZE_HINT") != Some("0"))
+}
+
+/// Encodes a run of similar roots (the chunk columns of one save, the proto-chunks of one
+/// batch). A column takes tens of KiB: starting at 4 KiB and doubling costs 3 to 5
+/// reallocations and copies, so each buffer starts at the size of the previous root instead.
+/// Under rayon's `map_init` there is one encoder per rayon task, not per thread: rayon splits a
+/// batch into as many tasks as it likes, and the first root of each task starts at 4 KiB.
+#[derive(Debug)]
+pub struct RootEncoder {
+    next_capacity: usize,
+}
+
+impl Default for RootEncoder {
+    fn default() -> Self {
+        RootEncoder { next_capacity: DEFAULT_ROOT_CAPACITY }
+    }
+}
+
+impl RootEncoder {
+    pub fn encode(&mut self, v: &Nbt) -> Vec<u8> {
+        let bytes = encode_root_with_capacity(v, self.next_capacity);
+        if size_hint_enabled() {
+            self.next_capacity = capacity_after(bytes.len());
+        }
+        bytes
+    }
+}
+
+/// Capacity for the root that follows one of `len` bytes: an eighth more, so that a slightly
+/// bigger root still fits without a doubling; never below the default, so that small roots grow
+/// no more often than before.
+fn capacity_after(len: usize) -> usize {
+    (len + len / 8).max(DEFAULT_ROOT_CAPACITY)
 }
 
 pub fn gzip(bytes: &[u8]) -> Vec<u8> {
@@ -149,6 +196,122 @@ mod tests {
         let u = 0x6c36f763_6526_3b48_9820_8f008743cbebu128;
         assert_eq!(uuid(Some(&uuid_nbt(u))), Some(u));
         assert_eq!(uuid_text(u), "6c36f763-6526-3b48-9820-8f008743cbeb");
+    }
+
+    /// Every chunk of the region files (terrain, entities, points of interest) of the test world,
+    /// parsed; `None` without the test world.
+    fn test_world_roots() -> Option<Vec<Nbt>> {
+        let world = crate::tests::test_world()?;
+        let mut roots = Vec::new();
+        for entry in walk_files(&world) {
+            let Some(name) = entry.file_name().and_then(|n| n.to_str()) else { continue };
+            let mut parts = name.split('.');
+            let (Some("r"), Some(rx), Some(rz), Some("mca")) = (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let (Ok(rx), Ok(rz)) = (rx.parse::<i32>(), rz.parse::<i32>()) else { continue };
+            let mut region = crate::region::RegionFile::open(&entry, false).expect("region");
+            let present: Vec<usize> = region.present().collect();
+            for i in present {
+                let (cx, cz) = (rx * 32 + (i % 32) as i32, rz * 32 + (i / 32) as i32);
+                if let Ok(Some(bytes)) = region.read(i, cx, cz) {
+                    roots.push(parse_root(&bytes).expect("chunk NBT"));
+                }
+            }
+        }
+        Some(roots)
+    }
+
+    fn walk_files(dir: &Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() { files.extend(walk_files(&path)) } else { files.push(path) }
+        }
+        files
+    }
+
+    fn encode_with(v: &Nbt, capacity: usize, options: nbt::WriteOptions) -> Vec<u8> {
+        let mut w = Vec::with_capacity(capacity);
+        nbt::write_named_with(&mut w, "", v, options);
+        w
+    }
+
+    /// Model world: every chunk encodes to the same bytes with the reference and the optimised
+    /// writer, and the run encoder gives the bytes of `encode_root`.
+    #[test]
+    fn model_world_encodes_identically() {
+        let Some(roots) = test_world_roots() else { return };
+        assert!(roots.len() > 100, "{} chunks", roots.len());
+        let mut encoder = RootEncoder::default();
+        let mut bytes = 0;
+        for (i, root) in roots.iter().enumerate() {
+            let reference = encode_with(root, DEFAULT_ROOT_CAPACITY, nbt::WriteOptions::REFERENCE);
+            assert_eq!(encode_with(root, 0, nbt::WriteOptions::OPTIMISED), reference, "chunk {i}");
+            assert_eq!(encoder.encode(root), reference, "chunk {i}");
+            bytes += reference.len();
+        }
+        eprintln!("{} chunks, {bytes} bytes: same encoding", roots.len());
+    }
+
+    /// Bench (loaded machine): encoding the real columns of the test world, reference writer
+    /// with 4 KiB buffers against each option. `RUSTCRAFT_SOLO_WORLD=<world> cargo test --release
+    /// -p rc-sim -- --ignored encode_root_bench --nocapture`.
+    #[test]
+    #[ignore = "bench"]
+    fn encode_root_bench() {
+        let roots = test_world_roots().expect("test world (RUSTCRAFT_SOLO_WORLD)");
+        let columns: Vec<&Nbt> = roots.iter().filter(|r| r.get("sections").is_some()).collect();
+        bench_columns("every column", &columns);
+        // The columns an autosave writes: full ones, around the players.
+        let full: Vec<&Nbt> = columns
+            .iter()
+            .copied()
+            .filter(|r| r.get("Status").and_then(Nbt::as_str) == Some("minecraft:full"))
+            .collect();
+        bench_columns("full columns", &full);
+    }
+
+    fn bench_columns(label: &str, columns: &[&Nbt]) {
+        let total: usize = columns.iter().map(|r| encode_root(r).len()).sum();
+        eprintln!("{label}: {} columns, {} KiB on average", columns.len(), total / columns.len() / 1024);
+        let time = |encode: &mut dyn FnMut(&Nbt) -> Vec<u8>| {
+            let t = std::time::Instant::now();
+            let mut sink = 0;
+            for _ in 0..5 {
+                for r in columns {
+                    sink += encode(r).len();
+                }
+            }
+            assert_eq!(sink, total * 5);
+            t.elapsed() / (5 * columns.len() as u32)
+        };
+        use nbt::WriteOptions;
+        let strings_only = WriteOptions { string_fast_path: true, array_bulk: false };
+        let arrays_only = WriteOptions { string_fast_path: false, array_bulk: true };
+        for pass in 0..3 {
+            let reference = time(&mut |r| encode_with(r, DEFAULT_ROOT_CAPACITY, WriteOptions::REFERENCE));
+            let strings = time(&mut |r| encode_with(r, DEFAULT_ROOT_CAPACITY, strings_only));
+            let arrays = time(&mut |r| encode_with(r, DEFAULT_ROOT_CAPACITY, arrays_only));
+            let both = time(&mut |r| encode_with(r, DEFAULT_ROOT_CAPACITY, WriteOptions::OPTIMISED));
+            let mut hint = DEFAULT_ROOT_CAPACITY;
+            let reference_with_hint = time(&mut |r| {
+                let bytes = encode_with(r, hint, WriteOptions::REFERENCE);
+                hint = capacity_after(bytes.len());
+                bytes
+            });
+            let mut hint = DEFAULT_ROOT_CAPACITY;
+            let all = time(&mut |r| {
+                let bytes = encode_with(r, hint, WriteOptions::OPTIMISED);
+                hint = capacity_after(bytes.len());
+                bytes
+            });
+            eprintln!(
+                "pass {pass}, per column: reference {reference:?}, strings {strings:?}, arrays {arrays:?}, \
+                 both {both:?}, size hint alone {reference_with_hint:?}, all three {all:?}"
+            );
+        }
     }
 
     #[test]

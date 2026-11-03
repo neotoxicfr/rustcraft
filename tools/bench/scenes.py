@@ -4,8 +4,10 @@ Two steps, a quiet machine is mandatory for the second:
 
     python tools/bench/scenes.py prepare --java <java.exe> --server-jar <server.jar> [--seed 20261011]
                                         [--pregen-radius 16] [--pregen-center camera|site]
-    python tools/bench/scenes.py pack        (rewrites the `perf` pack of the existing model)
-    python tools/bench/scenes.py run --exe <rustcraft.exe> [--exe <other.exe>] [--scenes plains12,forest] [--passes 3]
+    python tools/bench/scenes.py pack        (rewrites the `perf` pack and the maps of the existing model)
+    python tools/bench/scenes.py pack-files <out>   (pack and scene chat commands for the flat world of `rc-sim` tests_perf_pack)
+    python tools/bench/scenes.py micro <pass1.txt> [<pass2.txt>…]   (table of `[bench]` micro-bench lines)
+    python tools/bench/scenes.py run --exe <rustcraft.exe> [--exe <other.exe>] [--scenes plains12,@server] [--passes 3]
                                     [--label name] [--env VAR=value] [--matrix VAR=value]… [--samply]
                                     [--warmup 0|1] [--cold] [--dry-run] [--sound-device NAME]
                                     [--connect connect.exe] [--cache-source FOLDER]
@@ -13,12 +15,13 @@ Two steps, a quiet machine is mandatory for the second:
 
 `prepare` builds the model world with a temporary official server (127.0.0.1 only, stopped at
 the end): fixed seed, locations found with `locate` (plains, dark forest, village, deep ocean,
-lush caves, Nether), zones generated in advance with tickets (radius 33 chunks around the
+lush caves, Nether, trial chambers, Nether fortress), zones generated in advance with tickets (radius 33 chunks around the
 plains; elsewhere `--pregen-radius`, 16 ≥ distance 12 + 2, centred on the chunk of the scene's
 CAMERA; `--pregen-radius 13 --pregen-center site` = old model), time set to noon, weather and
-spawning switched off, two flat pads (crowd, redstone); a `perf` data pack (staging functions,
-flight, rotation and walking by teleporting every tick). Output: `target/perf/model/` and
-`target/perf/scenes.json`.
+spawning switched off, two flat pads (crowd, redstone); a `perf` data pack (`perf_pack.py`:
+staging functions, flight, rotation and walking by teleporting every tick) and 900 locked maps.
+Output: `target/perf/model/` and `target/perf/scenes.json`. `seed-model` also locates the
+fresh-world flights of the swamp, badlands, old-growth taiga and Nether (`fresh-paths.json`).
 
 `run` launches each scene `--passes` times (3 by default: 2 give no median) in rotation
 (A B C A B C…, executables order rotated on each pass) on a fresh copy of the model (player placed
@@ -32,18 +35,25 @@ of `--exe`. A launch whose log says "cache to write" is marked cold and left out
 (`--cold` includes it), except in the scenes made for that (cold-resources, first-launch,
 fresh-install). `--matrix VAR=val` (repeatable) launches each `--exe` without a switch, with each
 one alone, then all together. `--dry-run` prepares each launch without starting anything (scene
-check).
+check). `--scenes` takes names and groups (`@reference`, `@server`, `@interface`… see
+`SCENE_GROUPS`). `--env=-VAR` and `--exe "path|-VAR"` remove a variable (the client tests
+some only for presence: `=0` would leave them on); the `=` is needed, `--env -VAR` is read as
+an unknown option. A scene whose view, located path or model is
+missing, or that drives the client through a variable the exe does not contain (older version),
+is skipped with the reason.
 
 Readings: frame time (median, 99th percentile), CPU and GPU per frame, columns meshed, light,
 memory, VRAM, integrated server ticks, startup (milestones `[startup] <step> at N ms`, audio,
 world opening, generator) and loading, generation (ms/chunk, chunks/s, first batch), saves, LAN
-guests, and any generic counter `[perf] [ t s] counter <name> <value>` (mean over the window,
+guests, longest tick of the window, entities drawn, allocator and server chunk data over the
+window, and any generic counter `[perf] [ t s] counter <name> <value>` (mean over the window,
 column `c:<name>`). Output: `target/perf/<label>/resultats.json`, Markdown table (median of the
 passes and min–max spread) and `bruit.md` (spread of the passes of one exe per scene; an A/B whose
 difference is within that noise does not conclude). With `--samply`, `window.json` bounds the
 profile to the measurement window (`tools/window.py`).
 """
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -58,7 +68,10 @@ import time
 import uuid as uuidlib
 
 sys.path.insert(0, os.path.dirname(__file__))
+import fixtures  # noqa: E402
 import nbt  # noqa: E402
+# The `perf` data pack (one function per staged scene) and the map data.
+from perf_pack import pack_functions, write_maps, write_pack  # noqa: E402
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 # `RUSTCRAFT_PERF_DIR`: bench folder of another copy of the repository (worktree that rereads a past bench).
@@ -187,200 +200,6 @@ def pad(r, x, y, z, half=24):
             r.cmd(f"fill {x0} {y + 13} {z0} {x1} {y + 24} {z1} minecraft:air")
 
 
-def mobs_function(x, y, z):
-    """100 mobs (25 of each kind) in a 10 × 10 grid in a 24 × 24 pen."""
-    kinds = ["cow", "sheep", "pig", "chicken"]
-    lines = [
-        f"fill {x - 12} {y + 1} {z - 12} {x + 12} {y + 1} {z + 12} minecraft:oak_fence hollow",
-    ]
-    for i in range(100):
-        gx, gz = i % 10, i // 10
-        lines.append(f"summon minecraft:{kinds[i % 4]} {x - 9 + gx * 2}.5 {y + 1} {z - 9 + gz * 2}.5 {{PersistenceRequired:1b}}")
-    return "\n".join(lines) + "\n"
-
-
-def redstone_function(x, y, z):
-    """128 clocks of observers facing each other: each one lights a lamp and pushes a block."""
-    lines = []
-    for row in range(16):
-        for col in range(8):
-            bx, bz = x - 20 + col * 6, z - 16 + row * 2
-            lines += [
-                f"setblock {bx - 1} {y + 1} {bz} minecraft:redstone_lamp",
-                f"setblock {bx + 2} {y + 1} {bz} minecraft:sticky_piston[facing=east]",
-                f"setblock {bx + 3} {y + 1} {bz} minecraft:slime_block",
-                f"setblock {bx} {y + 1} {bz} minecraft:observer[facing=east]",
-                f"setblock {bx + 1} {y + 1} {bz} minecraft:observer[facing=west]",
-            ]
-    return "\n".join(lines) + "\n"
-
-
-def grid(n, cols, step, x0, z0):
-    """`n` positions (x, z) in a grid of `cols` columns at step `step` from (x0, z0)."""
-    return [(x0 + (i % cols) * step, z0 + (i // cols) * step) for i in range(n)]
-
-
-KEEP_MOB = "PersistenceRequired:1b,NoAI:1b"
-
-
-def mobs1000_function(x, y, z):
-    """1,000 mobs (4 kinds) in a 32 × 32 grid at a step of 1.4 in a 46 × 46 pen."""
-    kinds = ["cow", "sheep", "pig", "chicken"]
-    lines = [f"fill {x - 23} {y + 1} {z - 23} {x + 23} {y + 1} {z + 23} minecraft:oak_fence hollow"]
-    for i, (gx, gz) in enumerate(grid(1000, 32, 1.4, x - 21.7, z - 21.7)):
-        lines.append(f"summon minecraft:{kinds[i % 4]} {gx:.2f} {y + 1} {gz:.2f} {{PersistenceRequired:1b}}")
-    return "\n".join(lines) + "\n"
-
-
-def team_crowd_function(x, y, z):
-    """The 1,000 mobs of `mobs1000`, all in a coloured team with the player (the server case:
-    holder names looked up for the tag rules and the glowing colours), the 250 cows glowing."""
-    lines = [mobs1000_function(x, y, z),
-             "team add perf_crowd",
-             "team modify perf_crowd color aqua",
-             "team modify perf_crowd seeFriendlyInvisibles true",
-             "team join perf_crowd @e[type=!player]",
-             "team join perf_crowd @a",
-             "effect give @e[type=cow] glowing infinite 0 true"]
-    return "\n".join(lines) + "\n"
-
-
-def armor(head="diamond_helmet", hand="iron_sword"):
-    pieces = {"head": head, "chest": "iron_chestplate", "legs": "golden_leggings", "feet": "chainmail_boots", "mainhand": hand}
-    return "equipment:{" + ",".join(f'{k}:{{id:"minecraft:{v}",count:1}}' for k, v in pieces.items()) + "}"
-
-
-def humanoids_function(x, y, z):
-    """160 equipped humanoids (full armour and weapon): zombies, skeletons, armor stands, mannequins."""
-    kinds = [("zombie", "iron_sword"), ("skeleton", "bow"), ("armor_stand", "iron_sword"), ("mannequin", "iron_sword")]
-    lines = []
-    for i, (gx, gz) in enumerate(grid(160, 16, 2.5, x - 19.5, z - 12.5)):
-        kind, hand = kinds[i % 4]
-        lines.append(f"summon minecraft:{kind} {gx} {y + 1} {gz} {{{KEEP_MOB},Rotation:[180.0f,0.0f],{armor(hand=hand)}}}")
-    return "\n".join(lines) + "\n"
-
-
-def keyframes_function(x, y, z):
-    """≈ 200 mobs animated by keyframes: camels, breezes, wardens (without AI, in place)."""
-    kinds = ["camel", "breeze", "warden"]
-    return "".join(f"summon minecraft:{kinds[i % 3]} {gx} {y + 1} {gz} {{{KEEP_MOB}}}\n"
-                   for i, (gx, gz) in enumerate(grid(201, 15, 3, x - 20.5, z - 20.5)))
-
-
-def items_function(x, y, z):
-    """500 dropped items (never picked up nor despawned), 100 item frames placed on the ground, 100 filled shelves."""
-    items = ["diamond", "apple", "iron_sword", "oak_log", "redstone", "compass", "golden_apple", "stone"]
-    lines = []
-    for i, (gx, gz) in enumerate(grid(500, 25, 1.5, x - 18.0, z - 20.0)):
-        lines.append(f'summon minecraft:item {gx} {y + 1} {gz} {{Item:{{id:"minecraft:{items[i % 8]}",count:1}},PickupDelay:32767,Age:-32768}}')
-    for i, (gx, gz) in enumerate(grid(100, 25, 1, x - 12, z + 12)):
-        lines.append(f'summon minecraft:item_frame {gx} {y + 1} {gz} {{Facing:1b,Fixed:1b,Item:{{id:"minecraft:{items[i % 8]}",count:1}}}}')
-    for i, (gx, gz) in enumerate(grid(100, 25, 1, x - 12, z + 16)):
-        slots = ",".join(f'{{Slot:{s}b,id:"minecraft:{items[(i + s) % 8]}",count:1}}' for s in range(3))
-        lines.append(f"setblock {gx} {y + 1} {gz} minecraft:oak_shelf[facing=north]{{Items:[{slots}]}}")
-    return "\n".join(lines) + "\n"
-
-
-def glowing_function(x, y, z):
-    """100 glowing cows (outline of the entities that glow)."""
-    return "".join(f"summon minecraft:cow {gx} {y + 1} {gz} {{{KEEP_MOB},Glowing:1b}}\n" for gx, gz in grid(100, 10, 2, x - 9.5, z - 9.5))
-
-
-def names_function(x, y, z):
-    """200 named cows, name always visible (name tags)."""
-    return "".join(f'summon minecraft:cow {gx} {y + 1} {gz} {{{KEEP_MOB},CustomName:"Cow {i}",CustomNameVisible:1b}}\n'
-                   for i, (gx, gz) in enumerate(grid(200, 20, 2, x - 19.5, z - 19.5)))
-
-
-def signs_function(x, y, z):
-    """50 glowing-text signs (every other one with a scrambled `§k` line), facing the camera,
-    10 fixed text displays and 10 turned toward the camera."""
-    lines = []
-    for i, (gx, gz) in enumerate(grid(50, 10, 2, x - 9, z - 6)):
-        second = '"§kscramble§r"' if i % 2 == 0 else f'"sign {i}"'
-        lines.append(f'setblock {gx} {y + 1} {gz} minecraft:oak_sign[rotation=8]'
-                     f'{{front_text:{{has_glowing_text:1b,color:"yellow",messages:["Rustcraft",{second},"line 3","line 4"]}}}}')
-    for i, (gx, gz) in enumerate(grid(20, 10, 2, x - 9, z + 6)):
-        mode = "fixed" if i < 10 else "center"
-        lines.append(f'summon minecraft:text_display {gx} {y + 3} {gz} {{billboard:"{mode}",Rotation:[180.0f,0.0f],text:"Display {i}"}}')
-    return "\n".join(lines) + "\n"
-
-
-def block_entities_function(x, y, z):
-    """Block entities: 2,016 chests (42 × 48), 500 signs on top, 200 spawners, 50 beacons
-    on a layer of iron (the pad is 48 × 48)."""
-    return "\n".join([
-        f"fill {x - 21} {y + 1} {z - 24} {x + 20} {y + 1} {z + 23} minecraft:chest[facing=north]",
-        f"fill {x - 21} {y + 2} {z - 24} {x - 2} {y + 2} {z} minecraft:oak_sign[rotation=8]",
-        f"fill {x} {y + 2} {z - 24} {x + 19} {y + 2} {z - 15} minecraft:spawner",
-        f"fill {x} {y + 2} {z + 19} {x + 9} {y + 2} {z + 23} minecraft:iron_block",
-        f"fill {x} {y + 3} {z + 19} {x + 9} {y + 3} {z + 23} minecraft:beacon",
-    ]) + "\n"
-
-
-def tnt_function(x, y, z):
-    """64 primed TNT (4 s fuse) in an 8 × 8 grid at a step of 3, primed again every 5 s."""
-    return "".join(f"summon minecraft:tnt {gx} {y + 1} {gz} {{fuse:80s}}\n" for gx, gz in grid(64, 8, 3, x - 10.5, z - 10.5)) \
-        + "schedule function perf:tnt 100t\n"
-
-
-def fireworks_function(x, y, z):
-    """16 firework rockets (large ball, trail, twinkle) every second."""
-    rocket = ('{LifeTime:20,FireworksItem:{id:"minecraft:firework_rocket",count:1,components:{"minecraft:fireworks":'
-              '{flight_duration:1b,explosions:[{shape:"large_ball",colors:[I;16711680,65280,255],has_trail:1b,has_twinkle:1b}]}}}}')
-    lines = [f"summon minecraft:firework_rocket {gx} {y + 2} {gz} {rocket}" for gx, gz in grid(16, 4, 6, x - 9, z - 9)]
-    lines.append("schedule function perf:fireworks 20t")
-    return "\n".join(lines) + "\n"
-
-
-# Pack lines run every tick: flight (2 blocks/tick), slow flight of the fresh-world paths (0.8 block/tick =
-# 16 blocks/s, pitch kept), rotation (4°/tick), walking (0.22 block/tick).
-TICK_FUNCTION = (
-    "execute as @a[tag=perf_fly] at @s rotated ~ 0 run tp @s ^ ^ ^2\n"
-    "execute as @a[tag=perf_glide] at @s rotated ~ 0 run tp @s ^ ^ ^0.8\n"
-    "execute as @a[tag=perf_turn] at @s run tp @s ~ ~ ~ ~4 ~\n"
-    "execute as @a[tag=perf_walk] at @s rotated ~ 0 run tp @s ^ ^ ^0.22\n"
-)
-
-
-def pack_functions(sites):
-    """Functions of the `perf` pack: name -> text."""
-    f, r = sites["crowd"], sites["redstone"]
-    return {
-        "tick": TICK_FUNCTION,
-        "mobs": mobs_function(*f),
-        "redstone": redstone_function(*r),
-        "mobs1000": mobs1000_function(*f),
-        "team_crowd": team_crowd_function(*f),
-        "humanoids": humanoids_function(*f),
-        "keyframes": keyframes_function(*f),
-        "items": items_function(*f),
-        "glowing": glowing_function(*f),
-        "names": names_function(*f),
-        "signs": signs_function(*f),
-        "tnt": tnt_function(*f),
-        "fireworks": fireworks_function(*f),
-        "block_entities": block_entities_function(*r),
-    }
-
-
-def write_pack(world, sites):
-    pack = os.path.join(world, "datapacks", "perf")
-    fn = os.path.join(pack, "data", "perf", "function")
-    tags = os.path.join(pack, "data", "minecraft", "tags", "function")
-    os.makedirs(fn, exist_ok=True)
-    os.makedirs(tags, exist_ok=True)
-
-    def w(path, text):
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(text)
-
-    w(os.path.join(pack, "pack.mcmeta"), json.dumps({"pack": {"description": "perf bench", "pack_format": 121, "min_format": 121, "max_format": 121}}))
-    w(os.path.join(tags, "tick.json"), json.dumps({"values": ["perf:tick"]}))
-    for name, text in pack_functions(sites).items():
-        w(os.path.join(fn, f"{name}.mcfunction"), text)
-
-
 def pregen_zones(found, sites_xz, radius=16, center="camera"):
     """Zones generated in advance: (dimension, chunk x, chunk z, radius in chunks).
 
@@ -397,8 +216,21 @@ def pregen_zones(found, sites_xz, radius=16, center="camera"):
     zones = [(ow, px >> 4, pz >> 4, 33)]
     for k, (x, z) in sites.items():
         dx, dz = cam.get(k, (0, 0)) if center == "camera" else (0, 0)
-        zones.append((ne if k == "nether" else ow, (x + dx) >> 4, (z + dz) >> 4, radius))
+        zones.append((ne if k in NETHER_VIEWS else ow, (x + dx) >> 4, (z + dz) >> 4, radius))
     return zones
+
+
+# Located views that are in the Nether (the others are in the overworld).
+NETHER_VIEWS = {"nether", "fortress"}
+
+
+def underground_view(r, dim, x, z, ys, fallback_y):
+    """Camera in the first air pocket of `ys` at (x, z), or in a pocket dug at `fallback_y`."""
+    y = air_pocket(r, dim, x, z, ys)
+    if y is None:
+        y = fallback_y
+        r.cmd(f"execute in {dim} run fill {x - 2} {y} {z - 1} {x + 2} {y + 3} {z + 8} minecraft:air")
+    return [x + 0.5, y + 0.0, z + 0.5]
 
 
 def prepare(a):
@@ -448,6 +280,9 @@ def prepare(a):
             "ocean": locate(r, "biome minecraft:deep_ocean"),
             "cave": locate(r, "biome minecraft:lush_caves"),
             "nether": locate(r, "biome minecraft:nether_wastes", ne),
+            # Series 3: spawners and vaults of a trial chamber, natural spawning of a fortress.
+            "trial": locate(r, "structure minecraft:trial_chambers"),
+            "fortress": locate(r, "structure minecraft:fortress", ne),
         }
         print("locations:", found)
         px, _, pz = found["plains"]
@@ -483,6 +318,12 @@ def prepare(a):
             ny = 64
             r.cmd(f"execute in {ne} run fill {x - 2} {ny} {z - 1} {x + 2} {ny + 3} {z + 8} minecraft:air")
         scenes["nether"] = {"dim": ne, "pos": [x + 0.5, ny + 0.0, z + 0.5], "rot": [0.0, 5.0]}
+        x, _, z = found["trial"]
+        scenes["trial"] = {"dim": ow, "pos": underground_view(r, ow, x, z, list(range(-40, -10)) + list(range(-56, -40)), -30),
+                           "rot": [0.0, 10.0]}
+        x, _, z = found["fortress"]
+        scenes["fortress"] = {"dim": ne, "pos": underground_view(r, ne, x, z, list(range(64, 90)) + list(range(40, 64)), 70),
+                              "rot": [0.0, 10.0]}
         sites = {}
         for k, (x, z) in sites_xz.items():
             y = surface(r, x, z, "motion_blocking_no_leaves")
@@ -507,6 +348,7 @@ def prepare(a):
         shutil.rmtree(model)
     shutil.copytree(world, model, ignore=shutil.ignore_patterns("session.lock"))
     write_pack(model, sites)
+    write_maps(model)
     level = nbt.read_dat(os.path.join(model, "level.dat"))
     d = level["Data"]
     d["allowCommands"] = (nbt.BYTE, 1)
@@ -519,6 +361,32 @@ def prepare(a):
     with open(os.path.join(PERF, "scenes.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump({"seed": a.seed, "found": found, "sites": sites, "scenes": scenes}, f, indent=1)
     print("model ready:", model)
+
+
+# Fresh-world paths located by `seed-model` (file of the model): biome -> located start.
+FRESH_PATHS_FILE = "fresh-paths.json"
+LOCATED_FRESH_BIOMES = {
+    # Mushrooms marked for the light post-processing (swamp, Nether wastes, old-growth taiga),
+    # eroded surface (badlands).
+    "swamp": "minecraft:swamp", "badlands": "minecraft:badlands", "taiga": "minecraft:old_growth_spruce_taiga",
+}
+
+
+def locate_fresh_paths(r):
+    """Start of a 192-block flight that stays inside each biome of `LOCATED_FRESH_BIOMES`
+    (20 blocks above the ground), and a Nether wastes flight at y 72 (through the caverns)."""
+    ow, ne = "minecraft:overworld", "minecraft:the_nether"
+    paths = {}
+    for name, biome in LOCATED_FRESH_BIOMES.items():
+        x, z, yaw = find_view(r, biome)
+        forceload(r, ow, x >> 4, z >> 4, 0)
+        wait_loaded(r, ow, x >> 4, z >> 4, 0)
+        y = surface(r, x, z, "motion_blocking_no_leaves")
+        forceload(r, ow, x >> 4, z >> 4, 0, add=False)
+        paths[name] = {"dim": ow, "pos": [x + 0.5, y + 20.0, z + 0.5], "rot": [yaw, 25.0]}
+    x, _, z = locate(r, "biome minecraft:nether_wastes", ne)
+    paths["nether"] = {"dim": ne, "pos": [x + 0.5, 72.0, z + 0.5], "rot": [0.0, 10.0]}
+    return paths
 
 
 def prepare_seed(a):
@@ -554,6 +422,8 @@ def prepare_seed(a):
                     raise SystemExit("the server stopped (see console.log)")
         if r is None:
             raise SystemExit("RCON unreachable")
+        paths = locate_fresh_paths(r)
+        print("fresh-world paths:", paths)
         print("save:", r.cmd("save-all flush")[:80])
         r.cmd("stop")
         p.wait(timeout=180)
@@ -566,6 +436,8 @@ def prepare_seed(a):
         shutil.rmtree(model)
     shutil.copytree(os.path.join(srv, "world"), model,
                     ignore=shutil.ignore_patterns("session.lock", "region", "entities", "poi"))
+    with open(os.path.join(model, FRESH_PATHS_FILE), "w", encoding="utf-8", newline="\n") as f:
+        json.dump(paths, f, indent=1)
     write_pack(model, {"crowd": (0, 64, 0), "redstone": (0, 64, 0)})
     level = nbt.read_dat(os.path.join(model, "level.dat"))
     d = level["Data"]
@@ -623,6 +495,8 @@ RAIN = (100, "weather rain")
 FLIGHT = (300, "tag @s add perf_fly")
 STANDARD = {"rd": 12, "secs": 45, "from": 25}
 CROWD = {"at": "crowd", "rd": 12, "secs": 50, "from": 30}
+# 26.3 syntax: `publish [allowCommands] [port]`, no game mode: guests join in the default one.
+PUBLISH = ((60, "defaultgamemode creative"), (1, "publish false 25599"))
 
 # Scenes of optimisation series 2. Extra keys: `cache` (cold:
 # empty resource cache; first: fresh exe + empty cache; fresh: fresh exe + empty cache folder,
@@ -667,7 +541,6 @@ SCENES.update({
     "crowd-close-up": {"site": "crowd", "d": [0.5, 2.0, -6.5], "rot": [0.0, 10.0], "rd": 12, "secs": 50, "from": 30,
                        "cmd": FUNCTION("mobs")},
     "crowd-1000": {**CROWD, "cmd": FUNCTION("mobs1000")},
-    "team-crowd": {**CROWD, "cmd": FUNCTION("team_crowd")},
     "equipped-humanoids": {**CROWD, "cmd": FUNCTION("humanoids")},
     "mobs-keyframes": {**CROWD, "cmd": FUNCTION("keyframes")},
     "dropped-items": {**CROWD, "cmd": FUNCTION("items")},
@@ -681,7 +554,7 @@ SCENES.update({
     "generation-1thread": {"at": "plains", "rd": 12, "secs": 60, "from": 40, "world": "fresh", "env": {"RUSTCRAFT_THREADS": "1"}},
     # Integrated server: local network (host + 1, 2, 4 windowless guests), close-together saves.
     **{f"lan-{n}": {"at": "plains", "rd": 12, "secs": 50, "from": 25, "guests": n,
-                    "cmd": cmd_of((60, "publish false creative 25599")), "env": {"RUSTCRAFT_LAN_AUTH": "0"}} for n in (1, 2, 4)},
+                    "cmd": cmd_of(*PUBLISH), "env": {"RUSTCRAFT_LAN_AUTH": "0"}} for n in (1, 2, 4)},
     "save": {"at": "plains", "rd": 12, "secs": 60, "from": 22, "cmd": cmd_of(FLIGHT),
              "env": {"RUSTCRAFT_AUTOSAVE_TICKS": "200"}},
 })
@@ -695,15 +568,211 @@ FRESH_PATHS = {
     "ocean": ((-300.0, 85.0, -420.0), (-300.0, 85.0, -228.0), 10.0),
     "mountain": ((560.0, 260.0, 860.0), (752.0, 260.0, 860.0), 30.0),
 }
+FRESH_FLIGHT = cmd_of((20, "time set noon"), (380, "tag @s add perf_glide"), (240, "tag @s remove perf_glide"))
 for _n, (_a, _b, _pitch) in FRESH_PATHS.items():
     _yaw = 0.0 if _b[2] != _a[2] else -90.0
     for _rd in (8, 16, 32):
+        # Generation log kept on (launch default `RUSTCRAFT_GENLOG=1`): the generation figures of
+        # the flight come from it. A `RUSTCRAFT_GENLOG: "0"` here used to leave it on all the
+        # same (the client only tests that the variable exists); `--exe a.exe|-RUSTCRAFT_GENLOG`
+        # removes it to price the log.
         SCENES[f"fresh-{_n}-rd{_rd}"] = {
             "pos": list(_a), "rot": [_yaw, _pitch], "model": "model-1234", "world": "fresh", "rd": _rd,
-            "env": {"RUSTCRAFT_GENLOG": "0"},
-            "secs": 40, "from": 22, "cmd": cmd_of((20, "time set noon"), (380, "tag @s add perf_glide"),
-                                                  (240, "tag @s remove perf_glide")),
+            "secs": 40, "from": 22, "cmd": FRESH_FLIGHT,
         }
+
+# Scenes of optimisation series 3. Extra keys: `fresh_path` (start located by `seed-model`,
+# file `fresh-paths.json` of the model), `dim` (with `pos`), `rot` (with `at`: camera turned),
+# `survival` (player in survival mode, no flight), `servers` (`servers.dat` + as many fake
+# status servers), `worlds` (extra worlds in the list), `packs` (zipped resource packs).
+# Text values may name a position of `scenes.json`: `{view:NAME}` = "x y z" of the camera,
+# `{site:NAME:dx:dy:dz}` = "x,y,z" of a pad block (the `RUSTCRAFT_INVTEST` format).
+LAN = {"RUSTCRAFT_LAN_AUTH": "0"}
+# Standing on the crowd pad 2.5 blocks north of the block at (site x, y + 1, z - 18).
+ON_CROWD_PAD = {"site": "crowd", "d": [0.5, 1.0, -20.5], "rd": 12, "secs": 50, "from": 30}
+CHEST_ON_PAD = "{site:crowd:0:1:-18}"
+
+
+def right_clicks(first_tick, n, every=10):
+    """`RUSTCRAFT_KEYTEST` script: `n` right clicks (press, release a tick later)."""
+    return ",".join(f"{t}:+:key.mouse.right,{t + 1}:-:key.mouse.right" for t in range(first_tick, first_tick + n * every, every))
+
+
+def crafting_clicks(rounds=4):
+    """`RUSTCRAFT_INVCLICKS` of the crafting table: for each hotbar slot, take its logs, put
+    them in the grid, shift-click the result (slot:button:mode, 0 = pick up, 1 = quick move)."""
+    return ",".join(f"{37 + k}:0:0,1:0:0,0:0:1" for _ in range(rounds) for k in range(9))
+
+
+# Title-screen clicks (GUI units at 1600 × 900, scale 3: 533 × 300).
+TITLE_SINGLEPLAYER, TITLE_MULTIPLAYER = "266:133", "266:157"
+WORLD_LIST_FIRST, WORLD_LIST_CREATE = "266:69", "345:258"
+CREATE_WORLD_TAB, CREATE_SEED_FIELD, CREATE_BUTTON = "266:12", "265:96", "187:284"
+PAUSE_ADVANCEMENTS, PAUSE_STATISTICS = "213:117", "319:117"
+OFF_WORLD = {"at": "plains", "rd": 12, "title": True, "menu": "title"}
+
+SCENES.update({
+    # Generation (C1): fresh worlds rich in marked mushrooms or eroded surface; first uses.
+    **{f"fresh-{b}-rd16": {"fresh_path": b, "model": "model-1234", "world": "fresh", "rd": 16, "secs": 40, "from": 22,
+                           "cmd": FRESH_FLIGHT} for b in ("nether", "swamp", "badlands", "taiga")},
+    "first-locate": {"at": "plains", **STANDARD, "cmd": cmd_of((600, "locate structure #minecraft:village"))},
+    "first-place": {"at": "plains", **STANDARD, "cmd": cmd_of((600, "execute at @s positioned ~ ~ ~8 positioned over "
+                                                                    "motion_blocking_no_leaves run place feature minecraft:oak"))},
+    # Looking straight down at a sapling on a floating grass block, 16 uses of bone meal.
+    "first-bonemeal": {"at": "plains", "rot": [0.0, 90.0], **STANDARD, "keys": right_clicks(600, 16),
+                       "cmd": cmd_of((100, "execute at @s run setblock ~ ~-3 ~ minecraft:grass_block"),
+                                     (1, "execute at @s run setblock ~ ~-2 ~ minecraft:oak_sapling"),
+                                     (1, "item replace entity @s weapon.mainhand with minecraft:bone_meal 64"))},
+    "first-ender-eye": {"at": "plains", **STANDARD, "keys": right_clicks(600, 1),
+                        "cmd": cmd_of((100, "item replace entity @s weapon.mainhand with minecraft:ender_eye 16"))},
+    "first-nether-trip": {"at": "plains", "rd": 12, "secs": 50, "from": 25,
+                          "cmd": cmd_of((600, "execute in minecraft:the_nether run tp @s {view:nether}"),
+                                        (200, "execute in minecraft:overworld run tp @s {view:plains}"))},
+    # Rendering (C3): culling, maps, arenas, improved transparency.
+    "maps-1": {"site": "crowd", "d": [0.5, 11.0, -14.5], "rot": [0.0, 0.0], "rd": 12, "secs": 50, "from": 30,
+               "cmd": FUNCTION("maps_wall")},
+    "hidden-1": {"site": "crowd", "d": [0.5, 6.0, -23.5], "rot": [0.0, 15.0], "rd": 12, "secs": 50, "from": 30,
+                 "cmd": FUNCTION("hidden_cows")},
+    "flight-rotation-32": {"at": "plains", "rd": 32, "secs": 90, "from": 25, "cmd": cmd_of(
+        (100, "tag @s add perf_turn"), (800, "tp @s ~512 ~ ~"), (200, "tp @s ~-512 ~ ~"), (200, "tp @s ~ ~ ~512"),
+        (200, "tp @s ~ ~ ~-512"))},
+    **{f"{v}-transparency": {"at": v, **STANDARD, "opts": {"improvedTransparency": "true"}} for v in ("ocean", "forest", "village")},
+    # Interface (C4).
+    "survival-hud": {"at": "ocean", **STANDARD, "survival": True, "cmd": FUNCTION("survival_hud")},
+    "hud-busy": {"at": "plains", **STANDARD, "cmd": FUNCTION("hud_busy")},
+    "inventory-enchanted-36": {"at": "plains", **STANDARD, "cmd": FUNCTION("enchanted_36"),
+                               "env": {"RUSTCRAFT_CREATIVETEST": "inventory"}},
+    # Right click on the librarian at 21 s, cursor held over the first offer.
+    "trade": {**ON_CROWD_PAD, "rot": [0.0, 0.0], "cmd": FUNCTION("trade"), "keys": right_clicks(420, 1),
+              "env": {"RUSTCRAFT_INVMOUSE": "177,95"}},
+    **{f"tab-{n + 1}": {"at": "plains", "rd": 12, "secs": 55, "from": 30, "guests": n,
+                        "cmd": cmd_of(*PUBLISH, (440, "function perf:tab_list")), "env": {**LAN, "RUSTCRAFT_TABTEST": "1"}}
+       for n in (19, 79)},
+    "chat-flood": {"at": "plains", **STANDARD, "cmd": FUNCTION("chat_flood")},
+    "creative-search": {"at": "plains", **STANDARD, "env": {"RUSTCRAFT_CREATIVETEST": "search:diamond"}},
+    "creative-tab": {"at": "plains", **STANDARD, "env": {"RUSTCRAFT_CREATIVETEST": "building_blocks"}},
+    "recipe-book": {**ON_CROWD_PAD, "rot": [0.0, 10.0], "survival": True, "cmd": cmd_of((100, "recipe give @s *")),
+                    "env": {"RUSTCRAFT_INVTEST": "e", "RUSTCRAFT_BOOKTEST": "open"}},
+    # Command typed without Enter: the item suggestions stay open.
+    "cmd-give": {"at": "plains", **STANDARD, "cmd": "w40|/|tgive @s |w200"},
+    "stats-screen": {"at": "plains", **STANDARD, "menu": "pause", "env": {"RUSTCRAFT_MENUCLICKS": PAUSE_STATISTICS}},
+    "advancements": {"at": "plains", **STANDARD, "menu": "pause", "env": {"RUSTCRAFT_MENUCLICKS": PAUSE_ADVANCEMENTS}},
+    "f3-open": {"at": "plains", **STANDARD, "env": {"RUSTCRAFT_DEBUGTEST": "f3"}},
+    "team-crowd": {**CROWD, "cmd": FUNCTION("team_crowd")},
+    "team-crowd-named": {**CROWD, "cmd": FUNCTION("team_crowd_named")},
+    "signs-chests": {**CROWD, "cmd": FUNCTION("signs_chests")},
+    "displays-1": {**CROWD, "cmd": FUNCTION("displays")},
+    "structure-show-air": {**CROWD, "cmd": FUNCTION("structure_air")},
+    "packs-20": {"at": "plains", "rd": 12, "secs": 50, "from": 24, "packs": 20, "env": {"RUSTCRAFT_PACKSCREEN": "26"}},
+    "reload-f3t": {"at": "plains", "rd": 12, "secs": 50, "from": 24, "packs": 20, "env": {"RUSTCRAFT_RELOADTEST": "28"}},
+    # Outside a world (title screen driven by clicks; `~N:` = N ticks before the next step).
+    "multiplayer": {**OFF_WORLD, "secs": 50, "from": 20, "servers": 6,
+                    "env": {"RUSTCRAFT_MENUCLICKS": f"~200:m:0:0,~800:{TITLE_MULTIPLAYER},quit"}},
+    "world-list": {**OFF_WORLD, "secs": 50, "from": 20, "worlds": 20,
+                   "env": {"RUSTCRAFT_MENUCLICKS": f"~200:m:0:0,~800:{TITLE_SINGLEPLAYER},quit"}},
+    "world-create": {**OFF_WORLD, "secs": 50, "from": 20,
+                     "env": {"RUSTCRAFT_MENUCLICKS": f"~200:m:0:0,~60:{TITLE_SINGLEPLAYER},~800:{WORLD_LIST_CREATE},quit"}},
+    # Disk: new world (seed 1234) up to the game, world opened from the list, long flight then save.
+    "world-create-play": {**OFF_WORLD, "secs": 75, "from": 40, "env": {"RUSTCRAFT_MENUCLICKS": ",".join([
+        "~200:m:0:0", f"~60:{TITLE_SINGLEPLAYER}", f"~60:{WORLD_LIST_CREATE}", f"~20:{CREATE_WORLD_TAB}",
+        f"~10:{CREATE_SEED_FIELD}", "~10:t:1234", f"~1200:{CREATE_BUTTON}", "quit"])}},
+    "open-from-list": {**OFF_WORLD, "secs": 60, "from": 30, "env": {"RUSTCRAFT_MENUCLICKS": ",".join([
+        "~200:m:0:0", f"~40:{TITLE_SINGLEPLAYER}", f"~1000:dc:{WORLD_LIST_FIRST}", "quit"])}},
+    "long-flight-save": {"at": "plains", "rd": 12, "secs": 200, "from": 22, "cmd": cmd_of(FLIGHT),
+                         "env": {"RUSTCRAFT_AUTOSAVE_TICKS": "600"}},
+    # Integrated server (C5): long flight (server memory over time), block entities and entities.
+    "long-flight": {"at": "plains", "rd": 12, "secs": 620, "from": 22, "cmd": cmd_of(FLIGHT)},
+    "hoppers-1": {**CROWD, "cmd": FUNCTION("hoppers")},
+    "smelter-1": {**CROWD, "cmd": FUNCTION("furnaces")},
+    "sculk-1": {**CROWD, "cmd": FUNCTION("sculk")},
+    "carts-1": {**CROWD, "cmd": FUNCTION("minecarts")},
+    "items-merge-1": {**CROWD, "cmd": FUNCTION("items_merge")},
+    "redstone-dense": {"at": "redstone", "rd": 12, "secs": 50, "from": 30, "cmd": FUNCTION("redstone_dense")},
+    "tnt-cannon": {**CROWD, "cmd": FUNCTION("tnt_cannon")},
+    # Local network (C5): guests brought to the host (`tp Invite0 @s`) or spread out, join in the window.
+    "crowd-1000-lan-1": {**CROWD, "guests": 1, "env": LAN,
+                         "cmd": cmd_of(*PUBLISH, (40, "function perf:mobs1000"), (340, "tp Invite0 @s"))},
+    # TNT primed at 520 ticks, as in `tnt`.
+    "tnt-lan-1": {**CROWD, "guests": 1, "env": LAN, "cmd": cmd_of(*PUBLISH, (340, "tp Invite0 @s"), (120, "function perf:tnt"))},
+    "lan-4-spread": {"at": "plains", "rd": 12, "secs": 50, "from": 25, "guests": 4, "env": LAN, "cmd": cmd_of(
+        *PUBLISH, (340, "execute at @s run tp Invite0 ~160 ~ ~"), (1, "execute at @s run tp Invite1 ~-160 ~ ~"),
+        (1, "execute at @s run tp Invite2 ~ ~ ~160"), (1, "execute at @s run tp Invite3 ~ ~ ~-160"))},
+    "lan-1-join": {"at": "plains", "rd": 12, "secs": 50, "from": 10, "guests": 1, "env": LAN, "cmd": cmd_of(*PUBLISH)},
+    "redstone-published": {"at": "redstone", "rd": 12, "secs": 50, "from": 30,
+                           "cmd": cmd_of(*PUBLISH, (40, "function perf:redstone"))},
+    # Mobs, villages, commands (C6).
+    "village-night": {"at": "village", "rd": 12, "secs": 50, "from": 30,
+                      "cmd": cmd_of((100, "time set midnight"), (1, "function perf:village_night"))},
+    # Bad omen at 5 s, raid 30 s later, first wave after its 15 s countdown.
+    "raid": {"at": "village", "rd": 12, "secs": 110, "from": 55, "cmd": FUNCTION("raid")},
+    "crowd-1000-melee": {**CROWD, "cmd": FUNCTION("melee")},
+    "crowd-1000-archers": {**ON_CROWD_PAD, "rot": [0.0, 10.0], "survival": True, "cmd": FUNCTION("archers")},
+    "pen-babies": {**CROWD, "cmd": FUNCTION("pen_babies")},
+    "crowd-villagers": {**CROWD, "cmd": FUNCTION("villagers")},
+    # Out of the spawners' reach (60 blocks up) from 1 s to 26 s, then back inside; save every 10 s.
+    "trial-chamber": {"at": "trial", "rd": 12, "secs": 60, "from": 15, "survival": True,
+                      "env": {"RUSTCRAFT_AUTOSAVE_TICKS": "200"},
+                      "cmd": cmd_of((20, "effect give @s minecraft:resistance infinite 4 true"), (1, "tp @s ~ ~60 ~"),
+                                    (500, "tp @s ~ ~-60 ~"))},
+    # Nests saved every 10 s (`save-all` is a dedicated-server command: refused in singleplayer).
+    **{f"bee-nests-{k}": {**CROWD, "env": {"RUSTCRAFT_AUTOSAVE_TICKS": "200"},
+                          "cmd": cmd_of((100, setup), (1, "function perf:bee_nests"))}
+       for k, setup in (("night", "time set midnight"), ("rain", "weather rain"))},
+    # Natural spawning on, every mob killed each tick (the cap never fills).
+    "nether-fortress": {"at": "fortress", "rd": 12, "secs": 50, "from": 30,
+                        "cmd": cmd_of((100, "gamerule spawn_mobs true"), (1, "tag @s add perf_reap"))},
+    "end-fight": {"pos": [0.5, 90.0, -60.5], "dim": "minecraft:the_end", "rot": [0.0, 15.0], "rd": 12, "secs": 60,
+                  "from": 35, "cmd": FUNCTION("end_fight", 200)},
+    "swamp-bastion": {**CROWD, "cmd": FUNCTION("swamp_bastion")},
+    "survival-inventory": {**ON_CROWD_PAD, "rot": [0.0, 30.0], "survival": True, "cmd": FUNCTION("survival_inventory"),
+                           "env": {"RUSTCRAFT_INVTEST": CHEST_ON_PAD}},
+    "survival-crafting": {**ON_CROWD_PAD, "rot": [0.0, 30.0], "survival": True, "cmd": FUNCTION("crafting"),
+                          "env": {"RUSTCRAFT_INVTEST": CHEST_ON_PAD, "RUSTCRAFT_INVCLICKS": crafting_clicks()}},
+    "datapack": {**CROWD, "cmd": FUNCTION("datapack")},
+    "tnt-first-volley": {**CROWD, "cmd": FUNCTION("tnt_once", 520)},
+})
+
+# Named lists for `--scenes @name` (C3-M01: the extended reference pass is `reference-extended`).
+SCENE_GROUPS = {
+    "reference": ["plains12", "plains32", "forest", "village", "nether", "ocean", "cave", "crowd", "redstone",
+                  "crowd-1000", "dropped-items", "equipped-humanoids", "generation", "title", "tnt"],
+    "reference-extended": ["plains32-rotation", "flight", "flight-clouds128", "rain", "rain-forest", "rain-redstone",
+                           "rain-flight", "fireworks", "particles-1000", "particles-4000", "particles-16000",
+                           "mobs-keyframes", "name-tags", "glowing", "signs", "block-entities", "crowd-close-up", "pause",
+                           "inventory", "pause-enchanted", "building", "vsync"],
+    "generation": ["fresh-nether-rd16", "fresh-swamp-rd16", "fresh-badlands-rd16", "fresh-taiga-rd16",
+                   "fresh-village-rd16", "fresh-forest-rd16", "fresh-ocean-rd16", "fresh-mountain-rd16"],
+    "first-use": ["first-locate", "first-place", "first-bonemeal", "first-ender-eye", "first-nether-trip"],
+    "render": ["maps-1", "hidden-1", "flight-rotation-32", "ocean-transparency", "forest-transparency",
+               "village-transparency"],
+    "interface": ["survival-hud", "hud-busy", "inventory-enchanted-36", "trade", "tab-20", "tab-80", "chat-flood",
+                  "creative-search", "creative-tab", "recipe-book", "cmd-give", "stats-screen", "advancements", "f3-open",
+                  "team-crowd", "team-crowd-named", "signs-chests", "displays-1", "structure-show-air", "packs-20", "reload-f3t"],
+    "off-world": ["multiplayer", "world-list", "world-create"],
+    "disk": ["world-create-play", "open-from-list", "long-flight-save", "save"],
+    "server": ["save", "flight", "long-flight", "hoppers-1", "smelter-1", "sculk-1", "carts-1", "items-merge-1",
+               "redstone-dense", "tnt-cannon"],
+    "lan": ["crowd-1000-lan-1", "tnt-lan-1", "lan-4-spread", "lan-1-join", "redstone-published", "lan-1", "lan-2", "lan-4"],
+    "mobs": ["village-night", "raid", "crowd-1000-melee", "crowd-1000-archers", "pen-babies", "crowd-villagers",
+             "trial-chamber", "bee-nests-night", "bee-nests-rain", "nether-fortress", "end-fight", "swamp-bastion",
+             "survival-inventory", "survival-crafting", "datapack", "tnt-first-volley"],
+}
+
+
+def expand_scene_names(spec):
+    """`--scenes` list: names and `@group`s, in order, each scene once."""
+    out = []
+    for token in (t for t in spec.split(",") if t):
+        if token.startswith("@"):
+            if token[1:] not in SCENE_GROUPS:
+                raise SystemExit(f"unknown scene group {token}: {', '.join(sorted(SCENE_GROUPS))}")
+            names = SCENE_GROUPS[token[1:]]
+        else:
+            names = [token]
+        out += [n for n in names if n not in out]
+    return out
+
+
 COLD_SCENES = {n for n, sc in SCENES.items() if sc.get("cache")}
 LAN_PORT = 25599
 
@@ -771,14 +840,55 @@ def upgrade_results(res):
 
 
 def view_of(sc, info):
-    """Viewpoint of a scene: view from `scenes.json`, site + offset (`site`, `d`, `rot`), or
-    given position (`pos`, `rot`)."""
+    """Viewpoint of a scene: view from `scenes.json` (`at`, camera turned by `rot`), site + offset
+    (`site`, `d`, `rot`), given position (`pos`, `rot`, `dim`), or start located by `seed-model`
+    (`fresh_path`)."""
+    if "fresh_path" in sc:
+        return fresh_paths(sc["model"])[sc["fresh_path"]]
     if "pos" in sc:
-        return {"dim": "minecraft:overworld", "pos": sc["pos"], "rot": sc["rot"]}
+        return {"dim": sc.get("dim", "minecraft:overworld"), "pos": sc["pos"], "rot": sc["rot"]}
     if "site" in sc:
         x, y, z = info["sites"][sc["site"]]
         return {"dim": "minecraft:overworld", "pos": [x + sc["d"][0], y + sc["d"][1], z + sc["d"][2]], "rot": sc["rot"]}
-    return info["scenes"][sc["at"]]
+    view = info["scenes"][sc["at"]]
+    return {**view, "rot": sc["rot"]} if "rot" in sc else view
+
+
+def fresh_paths(model):
+    """Located fresh-world starts of a model (`seed-model`), {} if the model has none."""
+    path = os.path.join(PERF, model, FRESH_PATHS_FILE)
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+PLACEHOLDER = re.compile(r"\{(view|site):([a-z0-9_-]+)((?::-?\d+){3})?\}")
+
+
+def resolve_positions(text, info):
+    """`{view:NAME}` -> "x y z" of that camera, `{site:NAME:dx:dy:dz}` -> "x,y,z" of the pad
+    block at that offset; an unknown name stops the bench (explicit failure)."""
+    def sub(m):
+        kind, name, offset = m.group(1), m.group(2), m.group(3)
+        table = info["scenes" if kind == "view" else "sites"]
+        if name not in table:
+            raise SystemExit(f"{m.group(0)}: no {kind} {name} in scenes.json (run `prepare` again)")
+        if kind == "view":
+            return " ".join(f"{v:.2f}" for v in table[name]["pos"])
+        d = [int(v) for v in offset[1:].split(":")] if offset else [0, 0, 0]
+        return ",".join(str(int(c) + dc) for c, dc in zip(table[name], d))
+    return PLACEHOLDER.sub(sub, text)
+
+
+def scene_with_positions(sc, info):
+    """Copy of the scene whose command, keys and variables have their positions resolved."""
+    out = dict(sc)
+    for k in ("cmd", "keys"):
+        if k in out:
+            out[k] = resolve_positions(out[k], info)
+    out["env"] = {k: resolve_positions(v, info) for k, v in sc.get("env", {}).items()}
+    return out
 
 
 def offline_uuid(name):
@@ -788,9 +898,10 @@ def offline_uuid(name):
     return str(uuidlib.UUID(bytes=bytes(h)))
 
 
-def stage(run_dir, view, rd, extra_opts=None, fresh_world=False, model=None):
+def stage(run_dir, view, rd, extra_opts=None, fresh_world=False, model=None, survival=False):
     """Fresh game folder: copy of the model, player placed, options fixed. `fresh_world`: without
-    the regions (terrain, entities, points of interest) of all dimensions, everything is generated."""
+    the regions (terrain, entities, points of interest) of all dimensions, everything is generated.
+    `survival`: player in survival mode (no flight, no instant building, not invulnerable)."""
     if os.path.exists(run_dir):
         shutil.rmtree(run_dir)
     world = os.path.join(run_dir, "saves", "perf")
@@ -804,10 +915,10 @@ def stage(run_dir, view, rd, extra_opts=None, fresh_world=False, model=None):
         "Rotation": nbt.List(nbt.FLOAT, [(nbt.FLOAT, float(v)) for v in view["rot"]]),
         "Motion": nbt.List(nbt.DOUBLE, [(nbt.DOUBLE, 0.0)] * 3),
         "Dimension": (nbt.STRING, view["dim"]),
-        "playerGameType": (nbt.INT, 1),
+        "playerGameType": (nbt.INT, 0 if survival else 1),
         "abilities": {
-            "flying": (nbt.BYTE, 1), "mayfly": (nbt.BYTE, 1), "instabuild": (nbt.BYTE, 1),
-            "invulnerable": (nbt.BYTE, 1), "mayBuild": (nbt.BYTE, 1),
+            **{k: (nbt.BYTE, 0 if survival else 1) for k in ("flying", "mayfly", "instabuild", "invulnerable")},
+            "mayBuild": (nbt.BYTE, 1),
             "flySpeed": (nbt.FLOAT, 0.05), "walkSpeed": (nbt.FLOAT, 0.1),
         },
     }
@@ -865,10 +976,89 @@ SAVE_END = re.compile(r"singleplayer: closing save: (\d+) chunks, snapshot ([\d.
 # Generic counter of a mission: `[perf] [  12.0 s] counter <name> <value>` (column `c:<name>`).
 COUNTER = re.compile(r"\[perf\] \[\s*([\d.]+) s\] counter (\S+) (-?[\d.]+)")
 GUEST = re.compile(r"in game \((\d+) ms\)")
+# Any dated line (`[  12.0 s]`): the server's tick report has no date of its own.
+DATED = re.compile(r"\[\s*([\d.]+) s\]")
+ENTITIES = re.compile(r"\[\s*([\d.]+) s\] .*?(\d+) entities drawn, block entities (\d+) of which (\d+) drawn")
+RAM = re.compile(r"\[perf\] \[\s*([\d.]+) s\] ram: private [\d.]+ MB, allocator ([\d.]+) MB committed")
+SERVER_RAM = re.compile(r"server: (\d+) chunks, sections ([\d.]+) MB, light ([\d.]+) MB \(\d+ layers\), heightmaps ([\d.]+) MB, "
+                        r"block entities ([\d.]+) MB, kept compound ([\d.]+) MB")
+RELOAD = re.compile(r"resource reload: applied in ([\d.]+) ms")
 
 
 def med(v):
     return statistics.median(v) if v else float("nan")
+
+
+# The client writes a dated line about every second; a longer gap means it stalled.
+DATED_LINE_GAP_S = 1.5
+
+
+def dated_ticks(lines):
+    """Server tick reports with the dated lines around them: (date before, date after or None,
+    p99). The server line carries no date of its own. A report covers the last 100 ticks, and its
+    p99 (rank 99 of 100) is their maximum."""
+    out, before, undated = [], None, []
+    for line in lines:
+        tick = TICK.search(line)
+        if tick:
+            if before is not None:  # a report before any date is loading: left out
+                undated.append(float(tick.group(3)))
+            continue
+        d = DATED.search(line)
+        if d:
+            after = float(d.group(1))
+            out += [(before, after, p99) for p99 in undated]
+            before, undated = after, []
+    return out + [(before, None, p99) for p99 in undated]
+
+
+def report_inside(before, after, inside):
+    """Whether a report written between two dated lines lies in a range. Dated by the line
+    before when the next one follows within `DATED_LINE_GAP_S`; across a longer gap (client
+    stall) or after the last line, its time is unknown, so it counts only if the whole gap does."""
+    if after is not None and after - before <= DATED_LINE_GAP_S:
+        return inside(before)
+    return after is not None and inside(before) and inside(after)
+
+
+def timed_tick_metrics(lines, win, start, secs):
+    """Longest tick of the window (first uses, volleys, saves) and median p99 of the last
+    minute (end of a long flight; NaN when the scene has no full minute after `start`, it would
+    count loading ticks)."""
+    ticks = dated_ticks(lines)
+    in_window = [p99 for b, a, p99 in ticks if report_inside(b, a, win)]
+    last_minute = lambda t: secs - 61 <= t <= secs - 1  # noqa: E731
+    p99_last_minute = med([p99 for b, a, p99 in ticks if report_inside(b, a, last_minute)])
+    return {"tick_max_ms": max(in_window) if in_window else float("nan"),
+            "tick_p99_last_minute_ms": p99_last_minute if secs >= start + 61 else float("nan")}
+
+
+def load_metrics(lines, win):
+    """What the frame holds (must not move between two passes of one exe): entities and block
+    entities drawn, block entities loaded (medians of the window)."""
+    e = [x for x in (ENTITIES.search(l) for l in lines) if x and win(float(x.group(1)))]
+    return {"entities_drawn": med([int(x.group(2)) for x in e]), "block_entities": med([int(x.group(3)) for x in e]),
+            "block_entities_drawn": med([int(x.group(4)) for x in e])}
+
+
+def memory_metrics(lines, win):
+    """Allocator and integrated-server chunk data (`[perf] ram` line, every 5 s): last value of
+    the window and growth over it."""
+    alloc, server = [], []
+    for line in lines:
+        r = RAM.search(line)
+        if not r or not win(float(r.group(1))):
+            continue
+        alloc.append(float(r.group(2)))
+        s = SERVER_RAM.search(line)
+        if s:
+            server.append((int(s.group(1)), sum(float(s.group(i)) for i in range(2, 7))))
+    nan = float("nan")
+    return {
+        "allocator_mb": alloc[-1] if alloc else nan, "allocator_growth_mb": alloc[-1] - alloc[0] if alloc else nan,
+        "server_chunks": server[-1][0] if server else nan, "server_mem_mb": server[-1][1] if server else nan,
+        "server_mem_growth_mb": server[-1][1] - server[0][1] if server else nan,
+    }
 
 
 def analyse(log_path, frames_path, frm, secs):
@@ -917,6 +1107,9 @@ def analyse(log_path, frames_path, frm, secs):
     m["tick_med_ms"] = med([float(t.group(1)) for t in tkw])
     m["tick_p99_ms"] = med([float(t.group(3)) for t in tkw])
     m["tick_mean_ms"] = med([float(t.group(4)) for t in tkw])
+    m.update(timed_tick_metrics(lines, win, frm, secs))
+    m.update(load_metrics(lines, win))
+    m.update(memory_metrics(lines, win))
     c = [x for x in (LOADED.search(l) for l in lines) if x]
     m["load_ms"] = float(c[0].group(1)) if c else float("nan")
     st = [x for x in (STABLE.search(l) for l in lines) if x]
@@ -950,7 +1143,10 @@ def analyse(log_path, frames_path, frm, secs):
     for x in (STARTUP.search(l) for l in lines):
         if x:
             m.setdefault(f"startup:{x.group(1)}", float(x.group(2)))
-    sv = [float(x.group(2)) for x in (SAVE.search(l) for l in lines) if x]
+    m["reload_ms"] = first(RELOAD)
+    saves = [x for x in (SAVE.search(l) for l in lines) if x]
+    sv = [float(x.group(2)) for x in saves]
+    m["save_chunks_med"] = med([int(x.group(1)) for x in saves])
     m["saves"] = len(sv)
     m["save_snapshot_ms"] = med(sv)
     m["save_snapshot_max_ms"] = max(sv) if sv else float("nan")
@@ -1018,19 +1214,31 @@ def split_exe(spec):
 # Test variables cleared before each launch (only the scene sets them).
 SCENE_VARS = ("RUSTCRAFT_CMDTEST", "RUSTCRAFT_KEYTEST", "RUSTCRAFT_MENUTEST", "RUSTCRAFT_MENUCLICKS",
               "RUSTCRAFT_CREATIVETEST", "RUSTCRAFT_PARTICLES_BENCH", "RUSTCRAFT_THREADS",
-              "RUSTCRAFT_AUTOSAVE_TICKS", "RUSTCRAFT_LAN_AUTH")
+              "RUSTCRAFT_AUTOSAVE_TICKS", "RUSTCRAFT_LAN_AUTH", "RUSTCRAFT_INVTEST", "RUSTCRAFT_INVCLICKS",
+              "RUSTCRAFT_INVMOUSE", "RUSTCRAFT_BOOKTEST", "RUSTCRAFT_TABTEST", "RUSTCRAFT_DEBUGTEST",
+              "RUSTCRAFT_PACKSCREEN", "RUSTCRAFT_RELOADTEST")
+# Variables of every launch (with the folders of the launch, set in `launch_env`).
+FIXED_ENV = {
+    "RUSTCRAFT_BACKGROUND": "1", "RUSTCRAFT_LAN_BIND": "127.0.0.1", "RUSTCRAFT_SOLO": "perf",
+    "RUSTCRAFT_VSYNC": "0", "RUSTCRAFT_GENLOG": "1",
+    # Special dates frozen: an Oct 31 (Halloween heads) or a Dec 24-26 would change the world
+    # or the frame being measured.
+    "RUSTCRAFT_HALLOWEEN": "0", "RUSTCRAFT_CHRISTMAS": "0",
+}
+
+
+def scene_drivers(sc):
+    """`RUSTCRAFT_*` variables the scene drives the client with (the exe must read them)."""
+    implied = {"menu": "RUSTCRAFT_MENUTEST", "cmd": "RUSTCRAFT_CMDTEST", "keys": "RUSTCRAFT_KEYTEST"}
+    return sorted({v for k, v in implied.items() if k in sc} | set(sc.get("env", {})))
 
 
 def launch_env(a, sc, out, game, cache_dir, own):
     env = dict(os.environ)
+    env.update(FIXED_ENV)
     env.update({
-        "RUSTCRAFT_BACKGROUND": "1", "RUSTCRAFT_LAN_BIND": "127.0.0.1", "RUSTCRAFT_GAME_DIR": game,
-        "RUSTCRAFT_SOLO": "perf", "RUSTCRAFT_CAPTURE": f"{out}/fin.bmp;{sc['secs']}",
-        "RUSTCRAFT_PERFLOG": f"{out}/images.txt", "RUSTCRAFT_VSYNC": "0", "RUSTCRAFT_GENLOG": "1",
-        "RUSTCRAFT_CACHE": cache_dir,
-        # Special dates frozen: an Oct 31 (Halloween heads) or a Dec 24-26 would change the world
-        # or the frame being measured.
-        "RUSTCRAFT_HALLOWEEN": "0", "RUSTCRAFT_CHRISTMAS": "0",
+        "RUSTCRAFT_GAME_DIR": game, "RUSTCRAFT_CAPTURE": f"{out}/fin.bmp;{sc['secs']}",
+        "RUSTCRAFT_PERFLOG": f"{out}/images.txt", "RUSTCRAFT_CACHE": cache_dir,
     })
     for k in SCENE_VARS:
         env.pop(k, None)
@@ -1043,8 +1251,12 @@ def launch_env(a, sc, out, game, cache_dir, own):
     if "keys" in sc:
         env["RUSTCRAFT_KEYTEST"] = sc["keys"]
     env.update(sc.get("env", {}))
-    # `--env` for all, then `--exe path|VAR=val|VAR2=val`: variables specific to that exe.
+    # `--env` for all, then `--exe path|VAR=val|VAR2=val`: variables specific to that exe;
+    # `-VAR` removes one (a variable the client only tests for presence cannot be set to "off").
     for kv in a.env + own:
+        if kv.startswith("-") and "=" not in kv:
+            env.pop(kv[1:], None)
+            continue
         k, v = kv.split("=", 1)
         env[k] = v
     return env
@@ -1075,18 +1287,30 @@ def guest_stats(out, n):
 WARMUP = {"at": "plains", "rd": 12, "secs": 15, "from": 5}
 
 
-def run_one(a, name, sc, info, pass_no, exe_no=0, warm=False):
-    exe, own = split_exe(a.exe[exe_no])
-    tag = f"{name}-{pass_no}" + (f"-{exe_no}" if len(a.exe) > 1 else "")
-    out = os.path.join(PERF, a.label, f"warmup-{exe_no}" if warm else tag)
-    game = os.path.join(PERF, "game")
+def stage_scene(a, sc, info, game):
+    """Game folder of a launch: model copy, player, options, then the off-world fixtures."""
     opts = dict(sc.get("opts", {}))
     if sc.get("sound"):
         opts["soundDevice"] = json.dumps(a.sound_device)
     if a.fullscreen:
         opts["fullscreen"] = "true"
-    model = os.path.join(PERF, sc["model"]) if "model" in sc else None
-    stage(game, view_of(sc, info), sc["rd"], opts, sc.get("world") == "fresh", model)
+    model = os.path.join(PERF, sc.get("model", "model"))
+    stage(game, view_of(sc, info), sc["rd"], opts, sc.get("world") == "fresh", model, sc.get("survival", False))
+    if sc.get("servers"):
+        fixtures.write_servers(game, sc["servers"])
+    if sc.get("worlds"):
+        fixtures.write_worlds(game, model, sc["worlds"])
+    if sc.get("packs"):
+        fixtures.write_resource_packs(game, sc["packs"])
+
+
+def run_one(a, name, sc, info, pass_no, exe_no=0, warm=False):
+    exe, own = split_exe(a.exe[exe_no])
+    tag = f"{name}-{pass_no}" + (f"-{exe_no}" if len(a.exe) > 1 else "")
+    out = os.path.join(PERF, a.label, f"warmup-{exe_no}" if warm else tag)
+    game = os.path.join(PERF, "game")
+    sc = scene_with_positions(sc, info)
+    stage_scene(a, sc, info, game)
     os.makedirs(out, exist_ok=True)
     # Measurement window, reread by `tools/window.py` to bound the samply profile.
     with open(os.path.join(out, "window.json"), "w", encoding="utf-8", newline="\n") as f:
@@ -1122,7 +1346,8 @@ def run_one(a, name, sc, info, pass_no, exe_no=0, warm=False):
             print(f"  dry run {'warm-up' if warm else tag}: {' '.join(cmd)}\n    {shown}")
             return {}
         log = os.path.join(out, "client.log")
-        with open(log, "w", encoding="utf-8") as f:
+        status = fixtures.StatusServers(sc["servers"]) if sc.get("servers") else contextlib.nullcontext()
+        with open(log, "w", encoding="utf-8") as f, status:
             p = subprocess.Popen(cmd, env=env, stdout=f, stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
             guests = start_guests(a, sc, out, env) if sc.get("guests") and not warm else []
             try:
@@ -1174,6 +1399,12 @@ KEYS = [
     ("save_snapshot_ms", "save snapshot med. ms", ".2f"), ("save_snapshot_max_ms", "save snapshot max ms", ".2f"),
     ("closing_total_ms", "closing save ms", ".1f"), ("guests_joined", "guests joined", ".0f"),
     ("guest_join_ms", "guest join ms", ".0f"), ("heap_mb", "heap MB", ".1f"),
+    ("tick_max_ms", "tick max ms", ".3f"), ("tick_p99_last_minute_ms", "tick p99 last minute ms", ".3f"),
+    ("save_chunks_med", "chunks per save", ".0f"), ("reload_ms", "resource reload ms", ".0f"),
+    ("entities_drawn", "entities drawn", ".0f"), ("block_entities", "block entities", ".0f"),
+    ("block_entities_drawn", "block entities drawn", ".0f"), ("allocator_mb", "allocator MB", ".0f"),
+    ("allocator_growth_mb", "allocator growth MB", ".1f"), ("server_chunks", "server chunks", ".0f"),
+    ("server_mem_mb", "server chunk data MB", ".1f"), ("server_mem_growth_mb", "server chunk data growth MB", ".1f"),
 ]
 
 
@@ -1195,24 +1426,57 @@ def rotated(n, pass_no):
     return list(range(n))[k:] + list(range(n))[:k]
 
 
-def skip_reason(a, sc):
+def missing_data(sc, info):
+    """What the scene needs that the model lacks (view, located path, model), or None."""
+    if "at" in sc and sc["at"] not in info["scenes"]:
+        return f"view {sc['at']} missing from scenes.json (run `prepare` again)"
+    model = sc.get("model", "model")
+    if not os.path.isdir(os.path.join(PERF, model)):
+        return f"model {model} missing (run `seed-model` or `prepare`)"
+    if "fresh_path" in sc and sc["fresh_path"] not in fresh_paths(model):
+        return f"path {sc['fresh_path']} missing from {model}/{FRESH_PATHS_FILE} (run `seed-model` again)"
+    return None
+
+
+_EXE_LACKS = {}
+
+
+def exe_lacks(exe):
+    """Driver variables of the scenes whose name the exe does not contain, so that it cannot
+    read them (an older version): read once per exe."""
+    key = os.path.abspath(exe).lower()
+    if key not in _EXE_LACKS:
+        wanted = {v for sc in SCENES.values() for v in scene_drivers(sc)}
+        with open(exe, "rb") as f:
+            data = f.read()
+        _EXE_LACKS[key] = {v for v in wanted if v.encode() not in data}
+    return _EXE_LACKS[key]
+
+
+def skip_reason(a, sc, info=None):
     if sc.get("sound") and not a.sound_device:
         return "no --sound-device"
     if sc.get("guests") and not (a.connect and os.path.exists(a.connect)):
         return "no --connect (compiled `connect` example of rc-client)"
+    if info is not None and (why := missing_data(sc, info)):
+        return why
+    for spec in a.exe:
+        exe = split_exe(spec)[0]
+        if os.path.exists(exe) and (lacking := [v for v in scene_drivers(sc) if v in exe_lacks(exe)]):
+            return f"{exe} does not read {', '.join(lacking)} (driver missing from that version)"
     return None
 
 
 def run(a):
     info = load_info()
     a.exe = expand_matrix(a.exe, a.matrix)
-    names = a.scenes.split(",") if a.scenes else list(SCENES)
+    names = expand_scene_names(a.scenes) if a.scenes else list(SCENES)
     unknown = [n for n in names if n not in SCENES]
     if unknown:
         raise SystemExit(f"unknown scenes: {unknown}")
     kept_names = []
     for n in names:
-        why = skip_reason(a, SCENES[n])
+        why = skip_reason(a, SCENES[n], info)
         if why:
             print(f"scene {n} skipped: {why}")
         else:
@@ -1324,6 +1588,30 @@ def noise_report(res, include_cold=False):
                 verdict = "noise unknown" if noise != noise else "within noise" if abs(d) <= noise else "above"
                 cells.append(f"{d:+.1f} % ({verdict})")
             out.append(f"| {n} | " + " | ".join(cells) + " |")
+    return "\n".join(out + ["", load_report(res, include_cold)])
+
+
+LOAD_KEYS = [("entities_drawn", "entities drawn"), ("block_entities", "block entities"), ("columns", "columns")]
+
+
+def load_report(res, include_cold=False):
+    """Load of each pass (medians of the window): a deterministic scene gives the same values on
+    every pass of one exe; "differs" flags a scene whose load moved (wandering mobs, deaths,
+    a slower load), whose timings then compare different work."""
+    res = {k: v for k, v in res.items() if k != "exe"}
+    out = ["## Load of the passes (identical on a deterministic scene)", "",
+           "| scene | " + " | ".join(l for _, l in LOAD_KEYS) + " |", "|---|" + "---|" * len(LOAD_KEYS)]
+    for n, runs in res.items():
+        cells = []
+        for k, _ in LOAD_KEYS:
+            v = [r[k] for r in kept(n, runs, include_cold) if k in r and r[k] == r[k]]
+            if not v:
+                cells.append("—")
+            elif min(v) == max(v):
+                cells.append(f"{v[0]:.0f}")
+            else:
+                cells.append(f"{min(v):.0f}–{max(v):.0f} (differs)")
+        out.append(f"| {n} | " + " | ".join(cells) + " |")
     return "\n".join(out)
 
 
@@ -1356,14 +1644,103 @@ def reanalyse(label):
 
 
 def pack(_a):
-    """Rewrites the `perf` pack of the existing model (new scenes without redoing `prepare`)."""
+    """Rewrites the `perf` pack and the maps of the existing model (new scenes without redoing `prepare`)."""
     info = load_info()
-    write_pack(os.path.join(PERF, "model"), {k: tuple(v) for k, v in info["sites"].items()})
+    model = os.path.join(PERF, "model")
+    write_pack(model, {k: tuple(v) for k, v in info["sites"].items()})
+    write_maps(model)
     print("perf pack rewritten:", ", ".join(pack_functions(info["sites"])))
 
 
-def main():
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+# Pads of the flat test world of rc-sim (`tests_perf_pack.rs`): grass at y -61, chunks -2..=9 × -2..=2.
+FLAT_SITES = {"crowd": (64, -61, 8), "redstone": (64, -61, 8)}
+
+
+def chat_commands(script):
+    """Commands a `RUSTCRAFT_CMDTEST` script types in the chat: the `t` steps between `/` and
+    `enter`. A command edited by other keys (completion, erasing) is left out: its final text is
+    not in the script."""
+    out, typed = [], None
+    for step in script.split("|"):
+        if step == "/":
+            typed = ""
+        elif typed is not None and step.startswith("t") and step != "tab":
+            typed += step[1:]
+        elif typed is not None and step == "enter":
+            out.append(typed)
+            typed = None
+        elif typed is not None and not step.startswith("w"):
+            typed = None
+    return out
+
+
+def flat_world_positions(texts):
+    """Stand-in `scenes.json` positions for the flat test world: every view and pad named in
+    `texts` sits on the crowd pad, so placeholders resolve to coordinates the parser accepts."""
+    x, y, z = FLAT_SITES["crowd"]
+    names = {(kind, name) for t in texts for kind, name, _ in PLACEHOLDER.findall(t)}
+    return {"scenes": {n: {"pos": [x + 0.5, y + 1.0, z + 0.5]} for k, n in names if k == "view"},
+            "sites": {n: FLAT_SITES.get(n, FLAT_SITES["crowd"]) for k, n in names if k == "site"}}
+
+
+def write_chat_commands(out):
+    """`<out>/chat-commands/<scene>.txt`: the staging commands each scene types in the chat, one
+    per line, so that a typo or a command our parser refuses fails a test instead of leaving the
+    scene measuring an empty view."""
+    scripts = {n: sc["cmd"] for n, sc in SCENES.items() if "cmd" in sc}
+    info = flat_world_positions(scripts.values())
+    folder = os.path.join(out, "chat-commands")
+    os.makedirs(folder, exist_ok=True)
+    for name, script in scripts.items():
+        lines = chat_commands(resolve_positions(script, info))
+        with open(os.path.join(folder, f"{name}.txt"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("".join(line + "\n" for line in lines))
+    return len(scripts)
+
+
+def pack_files(a):
+    """The `perf` pack for the flat test world, in `<out>/datapacks/perf`, and the chat commands
+    of the scenes in `<out>/chat-commands`: read by `crates/rc-sim/src/tests_perf_pack.rs`
+    (`RUSTCRAFT_PERF_PACK=<out>/datapacks/perf`)."""
+    write_pack(a.out, FLAT_SITES)
+    write_chat_commands(a.out)
+    print(os.path.join(os.path.abspath(a.out), "datapacks", "perf"))
+
+
+BENCH_LINE = re.compile(r"\[bench\] (\S+) (\S+) (\S+) (-?[\d.]+(?:e-?\d+)?)")
+
+
+def micro_results(paths):
+    """`[bench] <bench> <case> <metric> <value>` lines of micro-bench outputs (one file per pass):
+    (bench, case, metric) -> values in file order."""
+    out = {}
+    for p in paths:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if m := BENCH_LINE.search(line):
+                    out.setdefault(m.groups()[:3], []).append(float(m.group(4)))
+    return out
+
+
+def micro_number(v):
+    return f"{v:.1f}" if abs(v) >= 100 else f"{v:.4g}"
+
+
+def micro_table(res):
+    """Median (min–max) and noise (max − min) / median of each micro-bench measure."""
+    rows = ["| bench | case | metric | median (min–max) | noise | n |", "|---|---|---|---|---|---|"]
+    for (bench, case, metric), v in sorted(res.items()):
+        noise = spread(v)
+        rows.append(f"| {bench} | {case} | {metric} | {micro_number(med(v))} ({micro_number(min(v))}–{micro_number(max(v))}) | "
+                    + (f"{noise:.1f} %" if noise == noise else "—") + f" | {len(v)} |")
+    return "\n".join(rows)
+
+
+def micro(a):
+    print(micro_table(micro_results(a.files)))
+
+
+def build_parser():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("prepare")
@@ -1378,12 +1755,18 @@ def main():
     g.add_argument("--seed", default="1234")
     g.add_argument("--name", default="model-1234")
     sub.add_parser("pack")
+    pf = sub.add_parser("pack-files", help="perf pack for the flat test world of rc-sim (function compile check)")
+    pf.add_argument("out")
+    mi = sub.add_parser("micro", help="table of `[bench]` lines of micro-bench outputs (one file per pass)")
+    mi.add_argument("files", nargs="+")
     r = sub.add_parser("run")
     r.add_argument("--exe", action="append", required=True, help="repeatable: alternating A/B; path|VAR=val for a setting of its own")
     r.add_argument("--scenes", default="")
     r.add_argument("--passes", type=int, default=3)
     r.add_argument("--label", default="reference")
-    r.add_argument("--env", action="append", default=[], help="VAR=value added to every launch")
+    r.add_argument("--env", action="append", default=[],
+                   help="VAR=value added to every launch; --env=-VAR removes VAR (the `=` is needed: "
+                        "`--env -VAR` reads -VAR as an option)")
     r.add_argument("--matrix", action="append", default=[], help="VAR=value: switch alone then combined, same exe")
     r.add_argument("--samply", action="store_true", help="records a samply profile per launch")
     r.add_argument("--warmup", type=int, choices=[0, 1], default=1, help="unmeasured warm-up launch per exe")
@@ -1398,13 +1781,22 @@ def main():
     t.add_argument("--label", default="reference")
     t.add_argument("--reanalyse", action="store_true", help="rereads the logs with the current analysis")
     t.add_argument("--cold", action="store_true", help="also counts the cold-cache launches")
-    a = ap.parse_args()
+    return ap
+
+
+def main():
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    a = build_parser().parse_args()
     if a.cmd == "prepare":
         prepare(a)
     elif a.cmd == "seed-model":
         prepare_seed(a)
     elif a.cmd == "pack":
         pack(a)
+    elif a.cmd == "pack-files":
+        pack_files(a)
+    elif a.cmd == "micro":
+        micro(a)
     elif a.cmd == "run":
         run(a)
     else:

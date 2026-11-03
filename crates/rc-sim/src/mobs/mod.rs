@@ -61,6 +61,8 @@ mod tests_f01;
 #[cfg(test)]
 mod tests_index;
 #[cfg(test)]
+mod tests_index_world;
+#[cfg(test)]
 mod tests_g4f02;
 #[cfg(test)]
 mod tests_integ;
@@ -270,25 +272,124 @@ impl Mobs {
     /// Mobs of species `k` in the list's order (empty slots skipped): same sequence as
     /// `list.iter().flatten().filter(|o| o.kind == k)`, through the per-species index when it is reliable.
     pub(crate) fn of_kind(&self, k: Kind) -> impl Iterator<Item = &Mob> {
-        let slots = self.index.kind_slots(&self.list, k);
+        self.of_kinds([k])
+    }
+
+    /// Mobs of any of the species `kinds` in the list's order: same sequence as
+    /// `list.iter().flatten().filter(|o| kinds.contains(&o.kind))`, through the per-species index
+    /// when it is reliable (the species' slots merged), by scanning the list otherwise.
+    pub(crate) fn of_kinds<const N: usize>(&self, kinds: [Kind; N]) -> impl Iterator<Item = &Mob> {
+        let slots = self.index.kinds_slots(&self.list, kinds);
         #[cfg(test)]
-        if index::verify()
-            && let Some(s) = slots
-        {
-            let fast: Vec<i32> = s.iter().filter_map(|&i| self.list[i as usize].as_deref()).map(|o| o.id).collect();
-            let scan: Vec<i32> = self.list.iter().flatten().filter(|o| o.kind == k).map(|o| o.id).collect();
-            assert_eq!(fast, scan, "per-species index: {k:?} wrong");
+        if index::verify() {
+            check_species_slots(&self.list, slots.clone(), kinds);
         }
         // Only one of the two sequences is non-empty: indexed slots, or the whole list.
-        let (s, all) = match slots {
+        let (slots, all) = match slots {
             Some(s) => (s, &self.list[..0]),
-            None => (&[][..], &self.list[..]),
+            None => (index::MergedSlots::empty(), &self.list[..]),
         };
-        s.iter()
-            .filter_map(|&i| self.list[i as usize].as_deref())
+        slots
+            .filter_map(|i| self.list[i].as_deref())
             .chain(all.iter().flatten().map(|b| &**b))
-            .filter(move |o| o.kind == k)
+            .filter(move |o| kinds.contains(&o.kind))
     }
+
+    /// `of_kind`, mutable (alerts of the same species, anger reset).
+    pub(crate) fn of_kind_mut(&mut self, k: Kind) -> impl Iterator<Item = &mut Mob> {
+        self.of_kinds_mut([k])
+    }
+
+    /// `of_kinds`, mutable: same mobs in the same order as
+    /// `list.iter_mut().flatten().filter(|o| kinds.contains(&o.kind))`.
+    pub(crate) fn of_kinds_mut<const N: usize>(&mut self, kinds: [Kind; N]) -> impl Iterator<Item = &mut Mob> {
+        let Mobs { list, index, .. } = self;
+        let slots = index.kinds_slots(list, kinds);
+        #[cfg(test)]
+        if index::verify() {
+            check_species_slots(list, slots.clone(), kinds);
+        }
+        let (indexed, all) = match slots {
+            Some(s) => (SlotsMut { rest: &mut list[..], next_slot: 0, slots: s }, &mut [][..]),
+            None => (SlotsMut { rest: &mut [][..], next_slot: 0, slots: index::MergedSlots::empty() }, &mut list[..]),
+        };
+        indexed
+            .chain(all.iter_mut())
+            .filter_map(|o| o.as_deref_mut())
+            .filter(move |o| kinds.contains(&o.kind))
+    }
+
+    /// Emptied slots dropped from the list (end of the mob tick), index brought up to date: the
+    /// slots before the first emptied one do not move, only the rest is re-indexed.
+    pub(crate) fn drop_empty_slots(&mut self) {
+        let Some(first_gap) = self.list.iter().position(Option::is_none) else {
+            self.index.refresh(&self.list, false);
+            return;
+        };
+        let len_before = self.list.len();
+        self.list.retain(Option::is_some);
+        self.index.refresh_from(&self.list, first_gap, len_before);
+    }
+
+    /// List put back in rank order (stable), index brought up to date from the first slot the sort
+    /// moves.
+    pub(crate) fn sort_by_rank(&mut self) {
+        let rank = |m: &Option<Box<Mob>>| m.as_ref().map_or(0, |m| m.rank);
+        let first_moved = first_out_of_order(&self.list, rank);
+        self.list.sort_by_key(rank);
+        let len = self.list.len();
+        self.index.refresh_from(&self.list, first_moved.unwrap_or(len), len);
+    }
+}
+
+/// First slot a stable sort by `key` moves: the first one whose key is above a later one. Every
+/// slot before it is at most every later key, so a stable sort leaves it in place.
+fn first_out_of_order<T>(list: &[T], key: impl Fn(&T) -> u64) -> Option<usize> {
+    let mut first = None;
+    let mut min_after = u64::MAX;
+    for (i, x) in list.iter().enumerate().rev() {
+        let k = key(x);
+        if k > min_after {
+            first = Some(i);
+        }
+        min_after = min_after.min(k);
+    }
+    first
+}
+
+/// Mutable walk over increasing slots of the list: each slot is split off the remaining tail, so
+/// the borrows handed out never overlap.
+struct SlotsMut<'a, I> {
+    rest: &'a mut [Option<Box<Mob>>],
+    /// Slot number of `rest[0]`.
+    next_slot: usize,
+    slots: I,
+}
+
+impl<'a, I: Iterator<Item = usize>> Iterator for SlotsMut<'a, I> {
+    type Item = &'a mut Option<Box<Mob>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let s = self.slots.next()?;
+        let rest = std::mem::take(&mut self.rest);
+        let (slot, rest) = rest.get_mut(s.checked_sub(self.next_slot)?..)?.split_first_mut()?;
+        self.rest = rest;
+        self.next_slot = s + 1;
+        Some(slot)
+    }
+}
+
+/// Tests: the indexed sequence of `of_kinds` equals the filtered scan (same mobs, same order).
+#[cfg(test)]
+fn check_species_slots<const N: usize>(
+    list: &[Option<Box<Mob>>],
+    slots: Option<index::MergedSlots<'_, N>>,
+    kinds: [Kind; N],
+) {
+    let Some(slots) = slots else { return };
+    let fast: Vec<i32> = slots.filter_map(|i| list[i].as_deref()).map(|o| o.id).collect();
+    let scan: Vec<i32> = list.iter().flatten().filter(|o| kinds.contains(&o.kind)).map(|o| o.id).collect();
+    assert_eq!(fast, scan, "per-species index: {kinds:?} wrong");
 }
 
 impl Server {
