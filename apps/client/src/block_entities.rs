@@ -71,6 +71,29 @@ impl Kind {
         }
     }
 
+    /// Kinds with a client tick (animation, particles, sounds); moving pistons tick apart. Heads
+    /// always tick: their animation counter only runs while powered.
+    fn ticks_on_client(self) -> bool {
+        matches!(
+            self,
+            Kind::Chest
+                | Kind::TrappedChest
+                | Kind::EnderChest
+                | Kind::ShulkerBox
+                | Kind::Bell
+                | Kind::Skull
+                | Kind::Campfire
+                | Kind::Spawner
+                | Kind::TrialSpawner
+                | Kind::Vault
+                | Kind::Beacon
+                | Kind::EndGateway
+                | Kind::Conduit
+                | Kind::EnchantingTable
+                | Kind::PotentSulfur
+        )
+    }
+
     const ALL: [Kind; 26] = [
         Kind::Sign,
         Kind::HangingSign,
@@ -144,6 +167,12 @@ pub struct Carrier {
     pub wall: bool,
 }
 
+/// Copper chests and statues keep their entity when the block changes within the family
+/// (oxidation, wax): their contents and animation survive.
+fn keeps_entity_across_blocks(c: Carrier) -> bool {
+    (c.kind == Kind::Chest && c.sub > 0) || c.kind == Kind::CopperGolemStatue
+}
+
 /// Oxidation of a copper block name (wax ignored): 0 to 3.
 fn oxidation(name: &str) -> u8 {
     if name.contains("exposed") {
@@ -213,8 +242,34 @@ pub fn carrier(name: &str) -> Option<Carrier> {
     None
 }
 
-/// State properties useful for rendering, read once on each state change.
-#[derive(Clone, Copy, Default, Debug)]
+/// `trial_spawner_state` of a trial spawner, in the block's value order.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum TrialState {
+    #[default]
+    Inactive,
+    WaitingForPlayers,
+    Active,
+    WaitingForRewardEjection,
+    EjectingReward,
+    Cooldown,
+}
+
+impl TrialState {
+    /// Unknown value: inactive (no particle, no spin).
+    fn from_name(v: &str) -> Self {
+        match v {
+            "waiting_for_players" => TrialState::WaitingForPlayers,
+            "active" => TrialState::Active,
+            "waiting_for_reward_ejection" => TrialState::WaitingForRewardEjection,
+            "ejecting_reward" => TrialState::EjectingReward,
+            "cooldown" => TrialState::Cooldown,
+            _ => TrialState::Inactive,
+        }
+    }
+}
+
+/// State properties used by rendering and by the client tick, read once on each state change.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
 pub struct Props {
     /// 3D direction (0 down, 1 up, 2 north, 3 south, 4 west, 5 east), 255 for none.
     pub facing: u8,
@@ -229,11 +284,17 @@ pub struct Props {
     /// Trial spawner: spin speed of the mob (200 while waiting for players, 1000 when active,
     /// 0 = spin frozen in every other state).
     pub trial_spin: f64,
+    pub trial_state: TrialState,
     /// Ominous trial spawner and vault.
     pub ominous: bool,
     pub dusted: u8,
     /// Bell: 0 floor, 1 ceiling, 2 wall, 3 between two walls.
     pub attachment: u8,
+    /// Campfire: lit, signal smoke (`signal_fire`).
+    pub lit: bool,
+    pub signal_fire: bool,
+    /// Potent sulfur wet or dormant: it lets out gas.
+    pub sulfur_gassing: bool,
 }
 
 pub fn dir_index(name: &str) -> u8 {
@@ -273,12 +334,16 @@ impl Props {
                     }
                 }
                 "trial_spawner_state" => {
-                    p.trial_spin = match v {
-                        "waiting_for_players" => 200.0,
-                        "active" => 1000.0,
+                    p.trial_state = TrialState::from_name(v);
+                    p.trial_spin = match p.trial_state {
+                        TrialState::WaitingForPlayers => 200.0,
+                        TrialState::Active => 1000.0,
                         _ => 0.0,
                     }
                 }
+                "lit" => p.lit = v == "true",
+                "signal_fire" => p.signal_fire = v == "true",
+                "potent_sulfur_state" => p.sulfur_gassing = matches!(v, "wet" | "dormant"),
                 "ominous" => p.ominous = v == "true",
                 "dusted" => p.dusted = v.parse().unwrap_or(0),
                 "attachment" => {
@@ -427,6 +492,9 @@ pub struct BlockEntity {
     /// Data version number (text formatting kept as long as it does not change).
     pub rev: u32,
     pub anim: Anim,
+    /// Serial number given when the entity enters the world (0 outside it): the ticker lists
+    /// tell a replaced entity from the one they listed at the same position.
+    pub ticket: u32,
 }
 
 /// What the client tick reads from the world.
@@ -460,6 +528,80 @@ struct Tables {
     gas: crate::particles::GasTables,
     /// Note block (block events: note particle).
     note_block: Option<u16>,
+    /// Water fluid per fluid id (conduit frame).
+    water_fluid: Vec<bool>,
+}
+
+/// Optimisation switches, read once at startup: `RUSTCRAFT_OPT_<name>=0` restores the old path.
+#[derive(Clone, Copy, Debug)]
+struct Switches {
+    /// `BLOCK_ENTITY_PROPS`: the tick reads the block-state facts kept in `BlockEntity::props`
+    /// instead of re-reading the state from the world.
+    props_in_tick: bool,
+    /// `BLOCK_ENTITY_TICKER_LIST`: the tick skips the columns without a ticking entity, and moving
+    /// pistons step from their own list, in creation order.
+    ticker_list: bool,
+    /// `BLOCK_ENTITY_TICKER_ORDER=1` (off by default: one lookup more per entity, 2.7 times slower
+    /// on 512 chests): with the list above, every ticking entity steps from a list in the order it
+    /// entered the world, like the game's.
+    ticker_order: bool,
+    /// `BLOCK_ENTITY_CHANGE_EARLY_EXIT`: a block change builds nothing it does not keep.
+    change_early_exit: bool,
+    /// `CONDUIT_WATER_TABLE`: water test of the conduit frame by table, not by fluid name.
+    conduit_water_table: bool,
+}
+
+impl Switches {
+    fn from_env() -> Self {
+        Switches {
+            props_in_tick: rc_data::env_str!("RUSTCRAFT_OPT_BLOCK_ENTITY_PROPS") != Some("0"),
+            ticker_list: rc_data::env_str!("RUSTCRAFT_OPT_BLOCK_ENTITY_TICKER_LIST") != Some("0"),
+            ticker_order: rc_data::env_str!("RUSTCRAFT_OPT_BLOCK_ENTITY_TICKER_ORDER") == Some("1"),
+            change_early_exit: rc_data::env_str!("RUSTCRAFT_OPT_BLOCK_ENTITY_CHANGE_EARLY_EXIT") != Some("0"),
+            conduit_water_table: rc_data::env_str!("RUSTCRAFT_OPT_CONDUIT_WATER_TABLE") != Some("0"),
+        }
+    }
+}
+
+/// A listed entity: position and ticket.
+type Listed = ([i32; 3], u32);
+
+/// Block entities in the order they entered the world, like the game's ticker list: moving
+/// pistons (their pushes keep the creation order), and every ticking entity under
+/// `BLOCK_ENTITY_TICKER_ORDER`. An entry whose entity was removed or replaced (other ticket at its
+/// position) is dropped at the next walk, so a removal costs nothing.
+#[derive(Default)]
+struct TickerLists {
+    /// Entities with a client tick, moving pistons apart.
+    tickers: Vec<Listed>,
+    /// Moving pistons.
+    movers: Vec<Listed>,
+    last_ticket: u32,
+    /// Lengths after the last walk (bound of the dead entries piled up while the tick is frozen).
+    live: usize,
+}
+
+impl TickerLists {
+    /// Ticket of an entity of `kind` entering the world at `pos`; listed according to `switches`.
+    fn enlist(&mut self, pos: [i32; 3], kind: Kind, switches: Switches) -> u32 {
+        self.last_ticket = self.last_ticket.wrapping_add(1);
+        if switches.ticker_list {
+            if kind == Kind::Piston {
+                self.movers.push((pos, self.last_ticket));
+            } else if switches.ticker_order && kind.ticks_on_client() {
+                self.tickers.push((pos, self.last_ticket));
+            }
+        }
+        self.last_ticket
+    }
+}
+
+/// The entity listed as `(pos, ticket)`, if it is still in the world.
+fn listed_entity(
+    chunks: &mut HashMap<(i32, i32), HashMap<[i32; 3], BlockEntity>>,
+    (pos, ticket): Listed,
+) -> Option<&mut BlockEntity> {
+    chunks.get_mut(&(pos[0] >> 4, pos[2] >> 4))?.get_mut(&pos).filter(|e| e.ticket == ticket)
 }
 
 pub struct BlockEntities {
@@ -478,6 +620,12 @@ pub struct BlockEntities {
     pub moving: usize,
     /// Ambient sounds requested by the last tick (trial spawner, vault).
     pub sounds: Vec<BeSound>,
+    lists: TickerLists,
+    /// Columns holding at least one ticking entity (moving pistons apart), and the `version` they
+    /// were gathered at: every addition or removal of an entity moves the version.
+    ticking_columns: Vec<(i32, i32)>,
+    ticking_columns_version: Option<u64>,
+    switches: Switches,
 }
 
 /// What the tick of a moving block asks of the application.
@@ -542,6 +690,7 @@ impl BlockEntities {
                 items,
                 gas: crate::particles::GasTables::new(&data),
                 note_block: data.blocks.iter().position(|b| b.name == "minecraft:note_block").map(|i| i as u16),
+                water_fluid: data.fluids.iter().map(|f| f.contains("water")).collect(),
             },
             data,
             version: 0,
@@ -549,6 +698,10 @@ impl BlockEntities {
             tests: Default::default(),
             moving: 0,
             sounds: Vec::new(),
+            lists: TickerLists::default(),
+            ticking_columns: Vec::new(),
+            ticking_columns_version: None,
+            switches: Switches::from_env(),
         }
     }
 
@@ -616,6 +769,8 @@ impl BlockEntities {
 
     pub fn clear(&mut self) {
         self.chunks.clear();
+        self.lists.tickers.clear();
+        self.lists.movers.clear();
         self.version += 1;
     }
 
@@ -645,7 +800,20 @@ impl BlockEntities {
             data: Data::None,
             rev: 0,
             anim,
+            ticket: 0,
         }
+    }
+
+    /// New entity entering the world at `pos`: its ticket, and its place in the ticker lists.
+    fn enter_world(&mut self, pos: [i32; 3], e: &mut BlockEntity) {
+        e.ticket = self.lists.enlist(pos, e.kind, self.switches);
+    }
+
+    /// Puts a new entity at `pos` (the one there, if any, leaves the world). The caller moves
+    /// `version`.
+    fn place(&mut self, pos: [i32; 3], mut e: BlockEntity) {
+        self.enter_world(pos, &mut e);
+        self.chunks.entry((pos[0] >> 4, pos[2] >> 4)).or_default().insert(pos, e);
     }
 
     /// Chunk packet (§ 1.1): the column's block entities replaced; `state` = block state
@@ -657,12 +825,13 @@ impl BlockEntities {
         list: &[rc_proto_v777::chunk::BlockEntity],
         state: impl Fn(i32, i32, i32) -> u32,
     ) {
-        let mut map = HashMap::new();
+        let mut map = HashMap::with_capacity(list.len());
         for be in list {
             let pos = [cx * 16 + i32::from(be.x), i32::from(be.y), cz * 16 + i32::from(be.z)];
             let s = state(pos[0], pos[1], pos[2]);
             let Some(c) = self.carrier_of(s) else { continue };
             let mut e = self.create(s, c);
+            self.enter_world(pos, &mut e);
             let typed = usize::try_from(be.kind).ok().and_then(|k| self.tables.types.get(k)).copied().flatten();
             if typed == Some(c.kind)
                 && let Some(n) = &be.data
@@ -678,6 +847,20 @@ impl BlockEntities {
             self.chunks.insert((cx, cz), map);
         }
         self.version += 1;
+        self.drop_dead_listings_if_piled_up();
+    }
+
+    /// While the tick is frozen, nothing walks the ticker lists: the entries of the reloaded
+    /// columns pile up. Past twice the live count (plus a margin), the dead ones are dropped.
+    fn drop_dead_listings_if_piled_up(&mut self) {
+        let lists = &mut self.lists;
+        if lists.tickers.len() + lists.movers.len() <= 2 * lists.live + 1024 {
+            return;
+        }
+        let chunks = &mut self.chunks;
+        lists.tickers.retain(|&l| listed_entity(chunks, l).is_some());
+        lists.movers.retain(|&l| listed_entity(chunks, l).is_some());
+        lists.live = lists.tickers.len() + lists.movers.len();
     }
 
     pub fn forget_chunk(&mut self, cx: i32, cz: i32) {
@@ -692,26 +875,75 @@ impl BlockEntities {
         if old == new {
             return;
         }
+        if self.switches.change_early_exit {
+            self.on_block_change_lazy(pos, old, new);
+        } else {
+            self.on_block_change_eager(pos, old, new);
+        }
+    }
+
+    /// Block change that builds only what it keeps: most changed blocks carry no entity (redstone
+    /// wire, pistons, crops), so the carrier is looked up first and nothing is created for them.
+    fn on_block_change_lazy(&mut self, pos: [i32; 3], old: u32, new: u32) {
         let key = (pos[0] >> 4, pos[2] >> 4);
-        let old_block = self.data.states.get(old as usize).map(|s| s.block);
-        let new_block = self.data.states.get(new as usize).map(|s| s.block);
-        let carrier = self.carrier_of(new);
-        let keeps = |c: Option<Carrier>| {
-            c.is_some_and(|c| (c.kind == Kind::Chest && c.sub > 0) || c.kind == Kind::CopperGolemStatue)
+        let block_changes = self.block_of(old) != self.block_of(new);
+        let Some(c) = self.carrier_of(new) else {
+            // No entity on the new block: the old one leaves with its block.
+            if block_changes && let Some(map) = self.chunks.get_mut(&key) {
+                if map.remove(&pos).is_some() {
+                    self.version += 1;
+                }
+                if map.is_empty() {
+                    self.chunks.remove(&key);
+                }
+            }
+            return;
         };
+        let existing = self.get(pos).map(|e| e.kind);
+        let kept = existing == Some(c.kind) && (!block_changes || keeps_entity_across_blocks(c));
+        if existing.is_some() && block_changes && !kept {
+            // Removal then creation: two list changes, as on the eager path.
+            self.version += 1;
+        }
+        if kept {
+            let props = Props::read(&self.data, new);
+            if let Some(e) = self.get_mut(pos) {
+                e.state = new;
+                e.sub = c.sub;
+                e.wall = c.wall;
+                e.props = props;
+            }
+        } else {
+            self.place(pos, self.create(new, c));
+        }
+        self.version += 1;
+    }
+
+    /// Old path (`RUSTCRAFT_OPT_BLOCK_ENTITY_CHANGE_EARLY_EXIT=0`): the replacement entity and its
+    /// properties are built before knowing whether they are used, the column entry is created
+    /// then removed again for a block without an entity.
+    fn on_block_change_eager(&mut self, pos: [i32; 3], old: u32, new: u32) {
+        let key = (pos[0] >> 4, pos[2] >> 4);
+        let old_block = self.block_of(old);
+        let new_block = self.block_of(new);
+        let carrier = self.carrier_of(new);
         let props = Props::read(&self.data, new);
-        let fresh = carrier.map(|c| self.create_with(new, c, props));
+        let fresh = carrier.map(|c| {
+            let mut e = self.create(new, c);
+            e.props = props;
+            e
+        });
         let map = self.chunks.entry(key).or_default();
         if old_block != new_block
             && let Some(e) = map.get(&pos)
         {
-            let same_family = keeps(carrier) && carrier.is_some_and(|c| c.kind == e.kind);
+            let same_family = carrier.is_some_and(|c| keeps_entity_across_blocks(c) && c.kind == e.kind);
             if !same_family {
                 map.remove(&pos);
                 self.version += 1;
             }
         }
-        if let (Some(c), Some(fresh)) = (carrier, fresh) {
+        if let (Some(c), Some(mut fresh)) = (carrier, fresh) {
             match map.get_mut(&pos) {
                 Some(e) if e.kind == c.kind => {
                     e.state = new;
@@ -720,6 +952,7 @@ impl BlockEntities {
                     e.props = props;
                 }
                 _ => {
+                    fresh.ticket = self.lists.enlist(pos, fresh.kind, self.switches);
                     map.insert(pos, fresh);
                 }
             }
@@ -729,10 +962,8 @@ impl BlockEntities {
         }
     }
 
-    fn create_with(&self, state: u32, c: Carrier, props: Props) -> BlockEntity {
-        let mut e = self.create(state, c);
-        e.props = props;
-        e
+    fn block_of(&self, state: u32) -> Option<u16> {
+        self.data.states.get(state as usize).map(|s| s.block)
     }
 
     pub fn get(&self, pos: [i32; 3]) -> Option<&BlockEntity> {
@@ -1032,37 +1263,63 @@ impl BlockEntities {
     /// blocks are only counted: they advance in `tick_pistons`, after the local
     /// player's tick (the game ticks entities before block entities).
     pub fn tick(&mut self, w: &TickWorld<'_>, out: &mut Vec<Emit>) {
-        let tables = &self.tables;
-        let data = &self.data;
+        if self.switches.ticker_list && !self.switches.ticker_order {
+            self.refresh_ticking_columns();
+        }
+        let inputs = TickInputs {
+            w,
+            tables: &self.tables,
+            data: &self.data,
+            props_in_tick: self.switches.props_in_tick,
+            conduit_water_table: self.switches.conduit_water_table,
+        };
         let sounds = &mut self.sounds;
-        let mut moving = 0;
-        for map in self.chunks.values_mut() {
-            for (pos, e) in map.iter_mut() {
-                if e.kind == Kind::Piston {
-                    moving += 1;
-                    continue;
+        if !self.switches.ticker_list {
+            // Old path: every entity walked, moving blocks counted on the way.
+            let mut moving = 0;
+            for map in self.chunks.values_mut() {
+                for (pos, e) in map.iter_mut() {
+                    if e.kind == Kind::Piston {
+                        moving += 1;
+                    } else {
+                        tick_entity(e, *pos, &inputs, sounds, out);
+                    }
                 }
-                if e.anim.seed == 0 {
-                    // Per-block visual randomness: two neighbouring spawners or vaults never
-                    // draw their particles and sounds on the same tick.
-                    e.anim.seed = pos_seed(*pos);
-                }
-                if e.kind == Kind::Spawner {
-                    spawner_tick(e, *pos, w, out);
-                    continue;
-                }
-                tick_one(e, *pos, w, tables, data);
-                if matches!(e.kind, Kind::Vault | Kind::TrialSpawner) {
-                    emit_particles(e, *pos, w, data, out);
-                    ambient_sound(e, *pos, sounds);
-                } else if e.kind == Kind::Campfire {
-                    campfire_particles(e, *pos, w, data, out);
-                } else if e.kind == Kind::PotentSulfur && w.game_time % 20 == 0 {
-                    sulfur_gas(*pos, w, tables, data, out);
+            }
+            self.moving = moving;
+            return;
+        }
+        let chunks = &mut self.chunks;
+        let lists = &mut self.lists;
+        if self.switches.ticker_order {
+            lists.tickers.retain(|&listed| {
+                let Some(e) = listed_entity(chunks, listed) else { return false };
+                tick_entity(e, listed.0, &inputs, sounds, out);
+                true
+            });
+        } else {
+            // Signs, banners, pots… have no tick: their columns are not walked at all.
+            for key in &self.ticking_columns {
+                let Some(map) = chunks.get_mut(key) else { continue };
+                for (pos, e) in map.iter_mut().filter(|(_, e)| e.kind.ticks_on_client()) {
+                    tick_entity(e, *pos, &inputs, sounds, out);
                 }
             }
         }
-        self.moving = moving;
+        lists.movers.retain(|&listed| listed_entity(chunks, listed).is_some());
+        lists.live = lists.tickers.len() + lists.movers.len();
+        self.moving = lists.movers.len();
+    }
+
+    /// Gathers again the columns holding a ticking entity if an entity came or went since.
+    fn refresh_ticking_columns(&mut self) {
+        if self.ticking_columns_version == Some(self.version) {
+            return;
+        }
+        let ticking = |map: &HashMap<[i32; 3], BlockEntity>| map.values().any(|e| e.kind.ticks_on_client());
+        self.ticking_columns.clear();
+        self.ticking_columns.extend(self.chunks.iter().filter(|(_, map)| ticking(map)).map(|(key, _)| *key));
+        self.ticking_columns_version = Some(self.version);
     }
 
     /// Step of the moving blocks; `out` receives their pushes and their ends. Nothing to walk
@@ -1071,12 +1328,97 @@ impl BlockEntities {
         if self.moving == 0 {
             return;
         }
-        for map in self.chunks.values_mut() {
-            for (pos, e) in map.iter_mut().filter(|(_, e)| e.kind == Kind::Piston) {
-                piston_tick(e, *pos, out);
+        if !self.switches.ticker_list {
+            for map in self.chunks.values_mut() {
+                for (pos, e) in map.iter_mut().filter(|(_, e)| e.kind == Kind::Piston) {
+                    piston_tick(e, *pos, out);
+                }
+            }
+            return;
+        }
+        let chunks = &mut self.chunks;
+        self.lists.movers.retain(|&listed| {
+            let Some(e) = listed_entity(chunks, listed) else { return false };
+            piston_tick(e, listed.0, out);
+            true
+        });
+    }
+}
+
+/// What the tick of one entity reads, besides the entity.
+struct TickInputs<'a, 'w> {
+    w: &'a TickWorld<'w>,
+    tables: &'a Tables,
+    data: &'a VersionData,
+    props_in_tick: bool,
+    conduit_water_table: bool,
+}
+
+/// Client tick of one block entity (moving pistons apart, see `tick_pistons`).
+fn tick_entity(
+    e: &mut BlockEntity,
+    pos: [i32; 3],
+    inputs: &TickInputs<'_, '_>,
+    sounds: &mut Vec<BeSound>,
+    out: &mut Vec<Emit>,
+) {
+    let w = inputs.w;
+    if e.anim.seed == 0 {
+        // Per-block visual randomness: two neighbouring spawners or vaults never
+        // draw their particles and sounds on the same tick.
+        e.anim.seed = pos_seed(pos);
+    }
+    if e.kind == Kind::Spawner {
+        spawner_tick(e, pos, w, out);
+        return;
+    }
+    tick_one(e, pos, inputs);
+    let reads_state = matches!(e.kind, Kind::Vault | Kind::TrialSpawner | Kind::Campfire)
+        || (e.kind == Kind::PotentSulfur && w.game_time % 20 == 0);
+    if !reads_state {
+        return;
+    }
+    // The entity's properties follow every state change (`on_block_change`): reading them avoids
+    // decoding the world state again on every tick.
+    let props = if inputs.props_in_tick { e.props } else { props_reread_from_world(e.kind, pos, w, inputs.data) };
+    match e.kind {
+        Kind::Vault | Kind::TrialSpawner => {
+            emit_particles(e, &props, pos, w, out);
+            ambient_sound(e, pos, sounds);
+        }
+        Kind::Campfire => campfire_particles(e, &props, pos, out),
+        _ => sulfur_gas(&props, pos, w, inputs.tables, out),
+    }
+}
+
+/// Old path (`RUSTCRAFT_OPT_BLOCK_ENTITY_PROPS=0`): the facts the tick readers need, re-read from
+/// the world state on every tick the way they were before (properties collected or scanned,
+/// looked up by name).
+fn props_reread_from_world(kind: Kind, pos: [i32; 3], w: &TickWorld<'_>, data: &VersionData) -> Props {
+    let state = (w.state)(pos[0], pos[1], pos[2]);
+    let mut p = Props { facing: 255, ..Default::default() };
+    match kind {
+        Kind::Vault | Kind::TrialSpawner => {
+            let props: Vec<(&str, &str)> = data.state_properties(state).collect();
+            let prop = |k: &str| props.iter().find(|p| p.0 == k).map(|p| p.1);
+            p.ominous = prop("ominous") == Some("true");
+            p.facing = prop("facing").map_or(255, dir_index);
+            p.trial_state = prop("trial_spawner_state").map_or(TrialState::Inactive, TrialState::from_name);
+        }
+        Kind::Campfire => {
+            let prop = |k: &str| data.state_properties(state).find(|p| p.0 == k).map(|p| p.1);
+            p.lit = prop("lit") == Some("true");
+            if p.lit {
+                p.signal_fire = prop("signal_fire") == Some("true");
+                p.facing = prop("facing").map_or(255, dir_index);
             }
         }
+        _ => {
+            p.sulfur_gassing =
+                data.state_properties(state).any(|(k, v)| k == "potent_sulfur_state" && matches!(v, "wet" | "dormant"));
+        }
     }
+    p
 }
 
 /// Client tick of a moving block: step of 0.5 (entities pushed before the step), then
@@ -1116,7 +1458,8 @@ fn next_int(seed: &mut u64, bound: u32) -> i32 {
     ((*seed >> 33) % u64::from(bound)) as i32
 }
 
-fn tick_one(e: &mut BlockEntity, pos: [i32; 3], w: &TickWorld<'_>, t: &Tables, data: &VersionData) {
+fn tick_one(e: &mut BlockEntity, pos: [i32; 3], inputs: &TickInputs<'_, '_>) {
+    let (w, t, data) = (inputs.w, inputs.tables, inputs.data);
     let a = &mut e.anim;
     let center = [f64::from(pos[0]) + 0.5, f64::from(pos[1]) + 0.5, f64::from(pos[2]) + 0.5];
     let nearest = |r: f64| {
@@ -1216,7 +1559,7 @@ fn tick_one(e: &mut BlockEntity, pos: [i32; 3], w: &TickWorld<'_>, t: &Tables, d
         Kind::Conduit => {
             a.ticks += 1;
             if w.game_time % 40 == 0 {
-                let (active, count) = conduit_shape(pos, w, t, data);
+                let (active, count) = conduit_shape(pos, w, t, data, inputs.conduit_water_table);
                 a.active = active;
                 a.hunting = count >= 42;
             }
@@ -1292,25 +1635,23 @@ fn ambient_sound(e: &mut BlockEntity, pos: [i32; 3], sounds: &mut Vec<BeSound>) 
     }
 }
 
-/// Particles emitted by the client tick of the vault and the trial spawner (states read
-/// from the block: `ominous`, `facing`, `trial_spawner_state`).
-fn emit_particles(e: &mut BlockEntity, pos: [i32; 3], w: &TickWorld<'_>, data: &VersionData, out: &mut Vec<Emit>) {
+/// Particles emitted by the client tick of the vault and the trial spawner (block state
+/// `props`: `ominous`, `facing`, `trial_spawner_state`).
+fn emit_particles(e: &mut BlockEntity, props: &Props, pos: [i32; 3], w: &TickWorld<'_>, out: &mut Vec<Emit>) {
     use crate::particles::Kind as P;
-    let state = (w.state)(pos[0], pos[1], pos[2]);
-    let props: Vec<(&str, &str)> = data.state_properties(state).collect();
-    let prop = |k: &str| props.iter().find(|p| p.0 == k).map(|p| p.1);
-    let ominous = prop("ominous") == Some("true");
+    let ominous = props.ominous;
     let p = [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])];
     let seed = &mut e.anim.seed;
     let none = [0.0; 3];
     match e.kind {
         Kind::Vault => {
             if w.game_time % 20 == 0 && !e.anim.vault_players.is_empty() {
-                let (dx, dz) = match prop("facing") {
-                    Some("north") => (0.0, -0.5),
-                    Some("south") => (0.0, 0.5),
-                    Some("west") => (-0.5, 0.0),
-                    Some("east") => (0.5, 0.0),
+                // Facing: 2 north, 3 south, 4 west, 5 east (`dir_index`).
+                let (dx, dz) = match props.facing {
+                    2 => (0.0, -0.5),
+                    3 => (0.0, 0.5),
+                    4 => (-0.5, 0.0),
+                    5 => (0.5, 0.0),
                     _ => (0.0, 0.0),
                 };
                 let keyhole = [p[0] + 0.5 + dx, p[1] + 1.75, p[2] + 0.5 + dz];
@@ -1342,18 +1683,18 @@ fn emit_particles(e: &mut BlockEntity, pos: [i32; 3], w: &TickWorld<'_>, data: &
         Kind::TrialSpawner => {
             let c = [p[0] + 0.5, p[1] + 0.5, p[2] + 0.5];
             let around = |s: &mut u64, k: f64| c.map(|v| v + (next_f(s) - 0.5) * k);
-            match prop("trial_spawner_state") {
-                Some("waiting_for_players" | "waiting_for_reward_ejection" | "ejecting_reward") => {
+            match props.trial_state {
+                TrialState::WaitingForPlayers | TrialState::WaitingForRewardEjection | TrialState::EjectingReward => {
                     if next_int(seed, 2) == 0 {
                         out.push((if ominous { P::SoulFireFlame } else { P::SmallFlame }, around(seed, 0.9), none));
                     }
                 }
-                Some("active") => {
+                TrialState::Active => {
                     let at = around(seed, 1.0);
                     out.push((P::Smoke, at, none));
                     out.push((if ominous { P::SoulFireFlame } else { P::Flame }, at, none));
                 }
-                Some("cooldown") => {
+                TrialState::Cooldown => {
                     let at = around(seed, 0.9);
                     if next_int(seed, 3) == 0 {
                         out.push((P::Smoke, at, none));
@@ -1400,12 +1741,14 @@ fn vault_shared(n: &Nbt) -> (Vec<u128>, f64) {
 }
 
 /// Conduit frame (§ 4.12): 27 water cells then effect blocks at the distance-2 crosses.
-fn conduit_shape(pos: [i32; 3], w: &TickWorld<'_>, t: &Tables, data: &VersionData) -> (bool, usize) {
+fn conduit_shape(pos: [i32; 3], w: &TickWorld<'_>, t: &Tables, data: &VersionData, water_table: bool) -> (bool, usize) {
     let water = |s: u32| {
-        data.states
-            .get(s as usize)
-            .and_then(|i| data.fluids.get(usize::from(i.fluid)))
-            .is_some_and(|f| f.contains("water"))
+        let fluid = data.states.get(s as usize).map(|i| usize::from(i.fluid));
+        if water_table {
+            fluid.and_then(|f| t.water_fluid.get(f)).copied().unwrap_or(false)
+        } else {
+            fluid.and_then(|f| data.fluids.get(f)).is_some_and(|f| f.contains("water"))
+        }
     };
     for ox in -1..=1 {
         for oy in -1..=1 {
@@ -1526,12 +1869,8 @@ pub fn dye_rgb(d: u8) -> [u8; 3] {
 
 /// Client tick of wet or dormant potent sulfur (every 20 game ticks): cloud of
 /// noxious gas at the centre of the water outlet above, if there is one.
-fn sulfur_gas(pos: [i32; 3], w: &TickWorld<'_>, t: &Tables, data: &VersionData, out: &mut Vec<Emit>) {
-    let state = (w.state)(pos[0], pos[1], pos[2]);
-    let wet = data
-        .state_properties(state)
-        .any(|(k, v)| k == "potent_sulfur_state" && matches!(v, "wet" | "dormant"));
-    if !wet {
+fn sulfur_gas(props: &Props, pos: [i32; 3], w: &TickWorld<'_>, t: &Tables, out: &mut Vec<Emit>) {
+    if !props.sulfur_gassing {
         return;
     }
     if let Some(s) = t.gas.source(w.state, pos) {
@@ -1542,17 +1881,15 @@ fn sulfur_gas(pos: [i32; 3], w: &TickWorld<'_>, t: &Tables, data: &VersionData, 
 /// Client tick of a lit campfire: 11% chance per tick of 2 or 3 smoke columns
 /// (signal smoke on a hay bale), and 4 smokes above each cooking food item
 /// (20% per cell and per tick), at 0.3125 from the centre towards its corner.
-fn campfire_particles(e: &mut BlockEntity, pos: [i32; 3], w: &TickWorld<'_>, data: &VersionData, out: &mut Vec<Emit>) {
+fn campfire_particles(e: &mut BlockEntity, props: &Props, pos: [i32; 3], out: &mut Vec<Emit>) {
     use crate::particles::Kind as P;
-    let state = (w.state)(pos[0], pos[1], pos[2]);
-    let prop = |k: &str| data.state_properties(state).find(|p| p.0 == k).map(|p| p.1);
-    if prop("lit") != Some("true") {
+    if !props.lit {
         return;
     }
     let seed = &mut e.anim.seed;
     let p = [f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])];
     if next_f(seed) < 0.11 {
-        let smoke = if prop("signal_fire") == Some("true") { P::CampfireSignalSmoke } else { P::CampfireCosySmoke };
+        let smoke = if props.signal_fire { P::CampfireSignalSmoke } else { P::CampfireCosySmoke };
         for _ in 0..next_int(seed, 2) + 2 {
             let side = |s: &mut u64| next_f(s) / 3.0 * if next_int(s, 2) == 0 { 1.0 } else { -1.0 };
             let x = p[0] + 0.5 + side(seed);
@@ -1563,10 +1900,11 @@ fn campfire_particles(e: &mut BlockEntity, pos: [i32; 3], w: &TickWorld<'_>, dat
     }
     // 2D rotation: south 0, west 1, north 2, east 3; step (x, z) and clockwise.
     const STEP: [[f64; 2]; 4] = [[0.0, 1.0], [-1.0, 0.0], [0.0, -1.0], [1.0, 0.0]];
-    let rot = match prop("facing") {
-        Some("west") => 1,
-        Some("north") => 2,
-        Some("east") => 3,
+    // `dir_index` facing: 4 west, 2 north, 5 east, anything else south.
+    let rot = match props.facing {
+        4 => 1,
+        2 => 2,
+        5 => 3,
         _ => 0,
     };
     let Data::Items(slots, _) = &e.data else { return };
@@ -1584,6 +1922,9 @@ fn campfire_particles(e: &mut BlockEntity, pos: [i32; 3], w: &TickWorld<'_>, dat
         }
     }
 }
+
+#[cfg(test)]
+mod switch_equivalence_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1611,8 +1952,8 @@ mod tests {
                 _ => 0,
             };
             let e = bes.create(s, carrier("potent_sulfur").unwrap());
-            bes.chunks.clear();
-            bes.chunks.entry((0, 0)).or_default().insert([5, 0, 5], e);
+            bes.clear();
+            bes.place([5, 0, 5], e);
             let w = TickWorld {
                 state: &state,
                 surface: &|_, _| 0,
@@ -1743,8 +2084,8 @@ mod tests {
     fn lone(bes: &mut BlockEntities, s: u32, name: &str, data: Data) {
         let mut e = bes.create(s, carrier(name).unwrap());
         e.data = data;
-        bes.chunks.clear();
-        bes.chunks.entry((0, 0)).or_default().insert([5, 64, 5], e);
+        bes.clear();
+        bes.place([5, 64, 5], e);
     }
 
     fn tick_at(bes: &mut BlockEntities, s: u32, players: &[[f64; 3]], game_time: i64) -> Vec<Emit> {

@@ -3509,3 +3509,40 @@ rounds, minimum of 5 passes of 400 ticks per scene, loaded machine (other agents
   test of a vehicle's passengers runs only when frozen, the plates also scan the server's item
   and orb lists during a series (empty unless something was born in it), a parked world is
   swept once per family after the player leaves (O(its entities), then a bit test per tick).
+
+## C4-M28: client block entities, state facts kept on the entity, ticking columns, block-change early exit (03/11, loaded machine)
+
+`apps/client/src/block_entities.rs`. Micro-benches `bench_block_entity_tick` and
+`bench_on_block_change` (`cargo test --release -p rc-app block_entities::switch_equivalence_tests::bench
+-- --ignored --nocapture --test-threads=1`), two passes each, loaded machine (other agents
+compiling): figures to re-take on a quiet machine with the scenes `plains32`, `redstone`, `village`
+(expected gain under the scene noise: the audit put the whole block entity tick at 0.13 % of
+`plains32`).
+
+- `RUSTCRAFT_OPT_BLOCK_ENTITY_PROPS` (default on): the vault, trial spawner, campfire and potent
+  sulfur ticks read `lit`, `signal_fire`, `facing`, `ominous`, the trial spawner state and the wet
+  sulfur from the entity's properties (read once per state change, `Props` stays 24 bytes) instead
+  of fetching the world state and collecting its properties into a `Vec` every tick. Mix of 256
+  signs, 64 lit campfires, 16 active trial spawners: 6.0-6.3 µs per tick → 2.3 µs (full walk),
+  4.6 → 1.06 µs (ticking columns); one allocation per vault and trial spawner per tick removed.
+- `RUSTCRAFT_OPT_BLOCK_ENTITY_TICKER_LIST` (default on): columns without a ticking entity (signs,
+  banners, pots, shelves, lecterns, statues…) are skipped (column list gathered again when
+  `version` moves); moving pistons step from their own list, in creation order (the game's
+  ticker-list order: fidelity gain for the order of the pushes, `pistons_push_in_creation_order`),
+  `moving` = live entries of that list (exact). Mix above: 6.0 → 4.6 µs alone, 2.3 → 1.06 µs with
+  the props; 512 chests (all ticking): 2.9 / 2.9 µs (no loss).
+- `RUSTCRAFT_OPT_BLOCK_ENTITY_TICKER_ORDER=1` (default OFF, kept for the scenes): every ticking
+  entity steps from a list in insertion order (the game's order for everything), one lookup in the
+  two maps per entity: mix 2.2-2.7 µs (props on), 512 chests 9.0-9.8 µs against 2.9 µs: loses
+  wherever most entities tick.
+- `RUSTCRAFT_OPT_BLOCK_ENTITY_CHANGE_EARLY_EXIT` (default on): a block change whose new state
+  carries no entity leaves at once (removal only if the block changes); an entity kept is updated
+  with one property read, otherwise one is created (one read). 10^6 changes (70 % wire power,
+  20 % stone/air, 10 % chests and signs): 38-45 ns → 18-25 ns per change.
+- `RUSTCRAFT_OPT_CONDUIT_WATER_TABLE` (default on): water test of the conduit frame by a table per
+  fluid instead of a substring search of the fluid name (27 cells every 40 ticks per conduit; not
+  measured alone, negligible).
+- Proofs: `switch_equivalence_tests.rs` (scripted world with every kind, 400 ticks, states changed
+  through the block change, particles/sounds/steps bit for bit), random block changes against the
+  eager path; 11 sabotages each caught by its test. Multi-core and GPU: not applicable (a few µs of
+  serial work per tick).

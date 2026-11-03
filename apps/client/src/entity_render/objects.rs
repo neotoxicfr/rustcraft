@@ -1336,7 +1336,7 @@ impl EntityRenderer {
             }
         };
         let (kind, sub, wall, props) = entry?;
-        Some(BlockEntity { kind, sub, wall, state, props, data: Data::None, rev: 0, anim: Anim::default() })
+        Some(BlockEntity { kind, sub, wall, state, props, data: Data::None, rev: 0, anim: Anim::default(), ticket: 0 })
     }
 
     /// Special model of a block drawn as an entity (`m`: block cube), like the game without
