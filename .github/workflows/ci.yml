@@ -85,3 +85,4 @@ jobs:
       - run: python -I tools/bench/test_scenes.py
       - run: python -I tools/bench/test_perf_pack.py
       - run: python -I tools/bench/test_fixtures.py
+      - run: python -I tools/release/test_release.py

@@ -5018,3 +5018,77 @@ old path), GPU RTX 5080 Vulkan, micro-benches on a loaded machine (other agents 
   (C6-M36); `Stack.id` is a `String` (one allocation per stack); a new sequence's MD5 allocates.
 - To measure on the quiet machine: `tnt-premiere-salve` (expected invisible in the scene: the draw
   is about 1 % of an explosion).
+## C7-M10: reproducible release builds and rehearsal of the full profile (03/11, loaded machine)
+
+- Before: two builds of one commit never gave the same bytes. The Windows linker wrote the link time into the
+  executable header and debug directory; the executable held 1,180 absolute dependency paths
+  (`C:\Users\<name>\.cargo\registry\src\...`, one per panic location) and the user name with them; the Windows
+  archive came from `Compress-Archive` and the Linux one from a bare `tar` (dates, order, owner, system bytes of
+  the archive entries).
+- Change (no runtime switch: build configuration, packaging and CI): `.cargo/config.toml` passes `/Brepro` to
+  the Windows linker (the rustc default `/PDBALTPATH:%_PDB%` already cuts the `.pdb` path to its file name: seen
+  on the executable before any change); `tools/release/hide_paths.py config` writes a per-machine cargo config
+  that remaps the cargo home to `/cargo` and the checkout to `/src` (`cargo build --config <file>`), and its
+  `check` command fails if the cargo home, the checkout or the home directory is still inside a binary;
+  `tools/release/pack.py` builds the zip and the tar.gz (commit date as `SOURCE_DATE_EPOCH`, sorted entries,
+  fixed owner, permissions, zip "created by" byte, gzip name and date); `release.yml` uses them;
+  `reproducibility.yml` (manual start) builds the commit twice per system with the full profile, packages like
+  the release and compares executables and archives byte for byte.
+- `trim-paths` of the cargo profile is not stable in the pinned cargo 1.99.0 ("feature `trim-paths` is
+  required"): the remap flags are used instead. They cannot be committed (they hold the user's home path), hence
+  the generated file; cargo joins it with the committed flags (rustc line: `-C link-arg=/Brepro
+  --remap-path-prefix=... --remap-path-prefix=...`). `RUSTFLAGS` in the environment would replace the committed
+  flags: nothing in the repository sets it.
+- Side effect on messages: our own files are given to rustc as relative paths, so `file!()` and panic locations of
+  our code are unchanged (`apps/client/src/...`); a panic inside a dependency now reads
+  `/cargo/registry/src/index.crates.io-.../<crate>/src/<file>.rs` in the crash report and on stderr. The crash
+  report test uses hand-written locations; run with the remap on: `crash_report::tests` ok.
+- Measures, profile "essai" through the queue (no LTO, 16 units, incremental off for the A/B), loaded machine:
+  - Baseline executable (rust-lld, incremental): 46,113,280 bytes, 1,180 machine paths, header stamp = link time.
+  - Same settings with and without the remap (MSVC `link.exe`, as the published build): file 47,310,848 →
+    47,295,488 bytes (−15,360, −0.03 %), `.rdata` 9,366,016 → 9,350,656 (−0.16 %); machine paths 1,173 → 0.
+    1,173 strings × 13 characters saved (a 3-letter user name: `C:\Users\<name>\.cargo` → `/cargo`); on a runner
+    (`C:\Users\runneradmin\.cargo`, 8 characters longer) about 25 KB. Memory effect negligible: the benefit is
+    that no user name is in the executable.
+  - Equivalence, MSVC `link.exe`: build A in the worktree and build B from a copy of the same commit at another
+    path (other checkout root, other target folder, other time, in parallel): IDENTICAL, sha256
+    `099c4e80a97b11ea837208bfeba3e8e12d4ec36461c56d84fadc52acdc596cd8`, 0 machine paths in both.
+  - Sabotage: test program, `link.exe` without `/Brepro` (`RUSTFLAGS` replaces the committed flags), two links
+    2 s apart: 20 bytes differ (header stamp = real time); with `/Brepro` 0 bytes differ. `hide_paths.py check`
+    on the baseline executable: exit 1 (1,180 × cargo home, 1,180 × home); on the new one: exit 0.
+  - Archives: `pack.py windows` 18,481,990 bytes in 1.9 s against `Compress-Archive` 19,351,651 bytes in 1.0 s
+    (−4.5 %, level 9 fixed); the same sha256 from two working directories 3 s apart; Linux tar.gz 18,483,831
+    bytes. 14 unit tests (`tools/release/test_release.py`, run in the CI `tools` job); each guard failed on
+    a sabotage: the zip date, the zip system byte, the zip and tar order, the gzip date, the tar entry date,
+    the committed `/Brepro`, the rehearsal's build command, the path spellings and the generated config's table.
+  - Tests with the remap and `link.exe` on: `rc-app` 780 passed, 0 failed, 41 ignored (including
+    `crash_report::tests::report_follows_the_game_layout`); `clippy -D warnings --all-targets -p rc-app` clean.
+- Finding for the linker mission: with `rust-lld` (the quick local profile; a candidate for the release) `/Brepro`
+  is not enough. Builds A and B differ in exactly 20 bytes (header stamp, the stamps of the debug directory and
+  the repro hash; the code is identical) because lld writes a PDB whose GUID is a hash of its content. On a test
+  program `/DEBUG:NONE` makes `rust-lld` identical (0 bytes) while `/timestamp:0` still leaves 8 bytes (the PDB
+  GUID). A release linked by `rust-lld` must write no PDB, or keep `link.exe`. Builds A and B sat at two paths;
+  the review asked for the same-path case, measured since (profile "essai", rust-lld, `/Brepro` and remap,
+  incremental off, `apps/client/src/main.rs` touched between builds so that only the game crate is compiled
+  and linked again): builds 2, 3 and 4 in the same folder differ two by two in the same 20 bytes, code
+  identical. Cause seen in the PDB: rustc hands the linker `target\release\deps\rustcXXXXXX\symbols.o`, in a
+  folder with a random name made for every link, and lld writes that path into the PDB it hashes. The rule
+  stands at the same path. (Build 1, the first after a rebuild of the dependencies, differs from the others
+  in 769 bytes spread over `.text` and `.rdata`; not explained, outside the conclusion: the earlier A/B with
+  `link.exe`, two complete builds from scratch, was identical.)
+- Not measured here (no CI run from the worktree, the full profile is forbidden through the queue): the full
+  profile (thin LTO, one unit) on the real runners, the Linux executable (ELF, `strip`, tar.gz), the duration
+  of the jobs. To do with the first manual start of `Reproducibility` before the next tag (4 builds); if the
+  Linux executables differ, `cmp -l` offsets are printed by the compare job.
+- Review follow-up (Linux and the rehearsal): the full profile has debug info, so the `cc` crate compiles the C
+  dependencies (mimalloc, libdeflate, ring) with `-g`, and `cc` 1.7.0 does not translate rustc's
+  `--remap-path-prefix` (it reads only the unstable trim-paths variables). Their debug info would name the
+  runner's cargo home and target folder, the path check on the unstripped Linux executable would fail the tag
+  after the empty release is created, and the GNU build id (a hash of the whole file, kept by `strip`) would
+  change with the paths. Measured with gcc 16.1 (MinGW, same flags as `cc`: absolute source and `-I`, `-g`):
+  one small object names its folder 4 times and two folders give two different objects; with
+  `-ffile-prefix-map=<folder>=/src`, 0 times and identical objects. `hide_paths.py config` now also writes
+  `CFLAGS = -ffile-prefix-map=...` (not on Windows: cl.exe puts its debug info in the `.pdb`), and the path
+  check reads the shipped file (Linux: after `strip`). The rehearsal builds its second copy at another checkout
+  folder (`elsewhere/rustcraft`) with another cargo home, and compares the shipped files: before, both copies sat
+  at the same path, so a path left in both was invisible. Not run: the Linux build itself (no Linux here).
