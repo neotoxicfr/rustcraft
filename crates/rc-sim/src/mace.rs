@@ -163,9 +163,7 @@ impl Server {
         // `same_team` with each entity, the attacker's team looked up once and the entities'
         // UUIDs never formatted (team found by UUID).
         let attacker_team = self.cmd.scores.team_of(attacker_name).map(|t| t.name.clone());
-        let ally = |s: &Self, uuid: u128| {
-            attacker_team.as_ref().is_some_and(|own| s.cmd.scores.team_of_uuid(uuid).is_some_and(|t| t.name == *own))
-        };
+        let ally = |s: &Self, uuid: u128| attacker_team.as_ref().is_some_and(|own| s.cmd.scores.uuid_in_team(uuid, own));
         let ids: Vec<i32> = self
             .mobs
             .list

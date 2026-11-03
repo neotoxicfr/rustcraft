@@ -181,8 +181,17 @@ pub fn uuid_nbt(u: u128) -> Nbt {
     Nbt::IntArray((0..4).map(|i| (u >> (96 - 32 * i)) as u32 as i32).collect())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: UUIDs formatted by [`uuid_text`] in this thread (proof that a team found by UUID
+    /// formats none).
+    pub(crate) static UUID_TEXTS_FORMATTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// UUID as text with dashes (player file names).
 pub fn uuid_text(u: u128) -> String {
+    #[cfg(test)]
+    UUID_TEXTS_FORMATTED.with(|n| n.set(n.get() + 1));
     let h = format!("{u:032x}");
     format!("{}-{}-{}-{}-{}", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..])
 }

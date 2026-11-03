@@ -111,7 +111,9 @@ impl Holders {
     /// Removes one score of `holder` (`Some`) or all of them (`None`); a holder left without any
     /// score is forgotten.
     pub fn reset(&mut self, holder: &str, objective: Option<&str>) -> Reset {
-        let emptied = match &mut self.table {
+        // A holder left with scores returns at once; an emptied one leaves the table here and
+        // is forgotten below.
+        match &mut self.table {
             Table::List(l) => {
                 let Some(i) = l.iter().position(|(h, _)| h == holder) else { return Reset::UnknownHolder };
                 let removed = remove_scores(&mut l[i].1, objective);
@@ -119,7 +121,6 @@ impl Holders {
                     return removed;
                 }
                 l.remove(i);
-                true
             }
             Table::Map(m) => {
                 let Some(scores) = m.get_mut(holder) else { return Reset::UnknownHolder };
@@ -128,10 +129,8 @@ impl Holders {
                     return removed;
                 }
                 m.remove(holder);
-                true
             }
-        };
-        debug_assert!(emptied);
+        }
         self.order.remove(holder);
         if let (Some(uuids), Some(u)) = (&mut self.uuids, canonical_uuid(holder)) {
             uuids.remove(&u);
@@ -194,13 +193,15 @@ impl Holders {
     }
 }
 
+/// What removing one score (`Some`) or all of them (`None`) did, as long as the holder keeps
+/// other scores (an emptied holder is forgotten).
 fn remove_scores(scores: &mut HolderScores, objective: Option<&str>) -> Reset {
     match objective {
         Some(o) if scores.remove(o).is_some() => Reset::ScoreRemoved,
         Some(_) => Reset::NothingRemoved,
         None => {
             scores.clear();
-            Reset::NothingRemoved
+            Reset::HolderForgotten
         }
     }
 }

@@ -1,7 +1,8 @@
 //! Scoreboard switches end to end on a fresh flat world (26.3 version data required): the same
 //! command script (scores written by selectors, `execute as @e run team join t @s` then the team
 //! of every entity, operations, `store`, decorated names in the feedback, mobs killed, then 1,000
-//! markers removed while a single fake player holds a score) run on the former paths and on the
+//! markers removed while a single fake player holds a score; criteria scores the server writes with
+//! the display name of a killed pig) run on the former paths and on the
 //! optimised ones, each in its own thread (same seeds). The scoreboard packets, the chat lines,
 //! the save and the team of each entity must be identical.
 
@@ -117,6 +118,24 @@ fn script(paths: BoardPaths) -> String {
         run_command(&mut p, c, &mut trace);
     }
     team_of_every_pig(&p, &mut trace);
+    // Scores the server writes itself (criteria), copying the holder's display name: the player
+    // of a blue team kills two pigs of the red team `u`; each victim scores `killedByTeam.blue`
+    // under the name of a mob already out of the list, the player scores `teamkill.red`.
+    for c in [
+        "team add b",
+        "team modify b color blue",
+        "team join b @p",
+        "scoreboard objectives add kbt killedByTeam.blue",
+        "scoreboard objectives modify kbt displayautoupdate true",
+        "scoreboard objectives setdisplay below_name kbt",
+        "scoreboard objectives add tk teamkill.red",
+        "scoreboard objectives modify tk displayautoupdate true",
+        "scoreboard objectives setdisplay sidebar.team.blue tk",
+        "execute as @e[type=pig,team=u,limit=2,sort=nearest] run damage @s 100 minecraft:player_attack by @p",
+    ] {
+        run_command(&mut p, c, &mut trace);
+    }
+    ticks(&mut p, 30, &mut trace);
     run_command(&mut p, "kill @e[type=pig,limit=10,sort=arbitrary]", &mut trace);
     ticks(&mut p, 30, &mut trace);
     team_of_every_pig(&p, &mut trace);
@@ -170,6 +189,16 @@ fn optimised_paths_play_the_script_like_the_former_ones() {
             assert!(trace.matches("Team { name: \"t\", mode: 3").count() >= PIGS as usize, "pigs did not join t");
             assert!(trace.contains("chat"), "no feedback recorded");
             assert!(trace.contains("pig 0 team=Some(\"t\") push=Some((0, 3))"), "team of the pigs not recorded");
+            let named = |obj: &str| {
+                trace
+                    .lines()
+                    .filter(|l| l.contains(&format!("objective: \"{obj}\"")) && l.contains("display: Some("))
+                    .count()
+            };
+            let around: Vec<&str> =
+                trace.lines().filter(|l| l.contains("damage") || l.contains("kbt") || l.contains("\"tk\"")).collect();
+            assert_eq!(named("kbt"), 2, "the killed pigs' killedByTeam scores lack their display name: {around:#?}");
+            assert!(named("tk") >= 1, "the player's teamkill score lacks its display name");
             let last_save = trace.lines().rev().find(|l| l.starts_with("holders")).expect("final holders");
             assert_eq!(last_save, "holders [\"#only\"]", "the marker's score survived, or #only went");
             reference = Some(trace);

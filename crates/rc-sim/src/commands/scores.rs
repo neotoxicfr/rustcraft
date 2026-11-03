@@ -124,8 +124,10 @@ struct CollisionIndex {
 pub struct BoardPaths {
     /// `RUSTCRAFT_OPT_SCOREHOLDERMAP`: holders in a hash table (`score_holders`).
     pub holder_map: bool,
-    /// `RUSTCRAFT_OPT_SCOREONELOOKUP`: a command finds each score it writes once, its objective
-    /// and display state once per command, and never copies the objective name of an existing score.
+    /// `RUSTCRAFT_OPT_SCOREONELOOKUP`: `players set/add/remove` and the criteria find each score
+    /// they write once (`operation` reads its target again at each source: three holder lookups per
+    /// source instead of five), the objective and display state once per command, and no write
+    /// copies the objective name of an existing score.
     pub one_lookup: bool,
     /// `RUSTCRAFT_OPT_TEAMMEMBERINDEX`: member → team index kept up to date (`team_members`).
     pub member_index: bool,
@@ -274,6 +276,15 @@ fn apply_write(sc: &mut Score, value: i32, name: Option<Nbt>, sync: bool) -> boo
         changed = true;
     }
     changed
+}
+
+/// What follows a write [`apply_write`] says must be sent: the packet when clients track the
+/// objective, and the save to redo. One place for every write through an opened score.
+fn record_write(out: &mut Vec<ScoreEvent>, dirty: &mut bool, tracked: bool, holder: &str, obj: &str, sc: &Score) {
+    if tracked {
+        out.push(score_packet(holder, obj, sc));
+    }
+    *dirty = true;
 }
 
 /// Objective displayed in at least one slot.
@@ -516,10 +527,7 @@ impl Board {
     ) {
         let (sc, _) = self.holders.open(holder, obj);
         if apply_write(sc, value, name.filter(|_| target.auto_update), sync) {
-            if target.tracked {
-                self.out.push(score_packet(holder, obj, sc));
-            }
-            self.dirty = true;
+            record_write(&mut self.out, &mut self.dirty, target.tracked, holder, obj, sc);
         }
     }
 
@@ -536,10 +544,7 @@ impl Board {
         let (sc, created) = self.holders.open(holder, obj);
         let value = f(sc.value);
         if apply_write(sc, value, name.filter(|_| target.auto_update), created) {
-            if target.tracked {
-                self.out.push(score_packet(holder, obj, sc));
-            }
-            self.dirty = true;
+            record_write(&mut self.out, &mut self.dirty, target.tracked, holder, obj, sc);
         }
         value
     }
@@ -555,10 +560,7 @@ impl Board {
             let value = f(sc.value);
             let shown = if target.auto_update { name.clone() } else { None };
             if apply_write(sc, value, shown, created) {
-                if target.tracked {
-                    self.out.push(score_packet(holder, &o.name, sc));
-                }
-                self.dirty = true;
+                record_write(&mut self.out, &mut self.dirty, target.tracked, holder, &o.name, sc);
             }
         }
     }
@@ -899,6 +901,11 @@ impl Board {
             return self.team_of(&crate::nbtio::uuid_text(uuid));
         }
         self.members.rank_by_uuid(uuid).map(|r| &self.teams[r as usize])
+    }
+
+    /// Is the entity of `uuid` on the team named `team`? (See [`Board::team_of_uuid`].)
+    pub fn uuid_in_team(&self, uuid: u128, team: &str) -> bool {
+        self.team_of_uuid(uuid).is_some_and(|t| t.name == team)
     }
 
     /// Name decorated by the team: prefix, color, suffix.

@@ -4563,9 +4563,12 @@ searched it as soon as a single score existed. Switches, default = new, `=0` = o
 `BoardPaths`):
 - `RUSTCRAFT_OPT_SCOREHOLDERMAP`: holders in a hash table (`score_holders.rs`); the order a player
   or a save sees still comes from the game's table replayed (`HashOrder`, keys only).
-- `RUSTCRAFT_OPT_SCOREONELOOKUP`: a command finds each score once (`update_score`,
-  `open_score`/`write_score`, `update_criteria` without the list of objective names), its
-  objective and display state once per command, and never copies the name of an existing score.
+- `RUSTCRAFT_OPT_SCOREONELOOKUP`: `players set/add/remove` and the criteria find each score they
+  write once (`update_score`, `update_criteria` without the list of objective names);
+  `operation` opens each source then reads and writes its target again (`open_score`, `get`,
+  `write_score`: three holder lookups per source instead of five, the gain of its row comes mostly from
+  the hash table); the objective and display state once per command; no write copies the name
+  of an existing score.
 - `RUSTCRAFT_OPT_TEAMMEMBERINDEX`: member → team rank kept by `join_team`, `leave_team`,
   `add_team`, `remove_team` and the read (`team_members.rs`, by UUID for canonical UUID names);
   the push rules are a view of it. "First registered wins" kept (a member in two teams, from a
@@ -4607,8 +4610,13 @@ packet strings): hashing in the replayed order table is not visible, `hash_order
 Same cause elsewhere (a UUID formatted to find a team): `team_of_uuid` serves the warden's
 target check (the target's name is no longer built when the warden has no team), the evoker's vex
 and the mace smash (attacker's team looked up once, not per bystander); a displayed entity name
-formats its UUID once for the team and the insertion instead of twice. The `scores=` and `team=`
-selector filters are left to C6-M13. The save of 10,000 holders goes from 189 ms to 2.3 ms (an
+formats its UUID once for the team and the insertion instead of twice. Review pass: the player's
+sweep (mobs, armor stands and mannequins; the player's team looked up once, the stands' team
+tested after the area test), the `team` entity predicate (mobs, projectiles, any entity), the
+`team=` selector filter (`ent_team`), `/teammsg` and the kill criteria (`teamkill.<colour>` finds
+the victim's team by UUID; its name is formatted only for `killedByTeam.<colour>`) no longer format
+a UUID to find a team (`team_by_uuid_tests`: no UUID formatted by the team test, results as
+before). The `scores=` selector filter is left to C6-M13. The save of 10,000 holders goes from 189 ms to 2.3 ms (an
 autosave spike). The two remaining allocations of a write are those of the packet (holder and
 objective names); the eight of a saved score are its NBT. Memory: a holder costs ≈ 56-110 bytes in the hash table instead of
 48-96 in the list, plus ≈ 18-36 per UUID holder in the set and ≈ 36 per member in the index

@@ -53,6 +53,8 @@ mod scores_tests;
 mod scores_equivalence_tests;
 #[cfg(test)]
 mod scores_world_equivalence_tests;
+#[cfg(test)]
+mod team_by_uuid_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 

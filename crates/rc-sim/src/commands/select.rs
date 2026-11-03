@@ -414,8 +414,8 @@ impl Server {
             }
         }
         for (neg, t) in &s.teams {
-            let team = self.cmd.scores.team_of(&self.ent_score_name(e)).map(|t| t.name.clone());
-            let hit = if t.is_empty() { team.is_none() } else { team.as_deref() == Some(t.as_str()) };
+            let team = self.ent_team(e).map(|t| t.name.as_str());
+            let hit = if t.is_empty() { team.is_none() } else { team == Some(t.as_str()) };
             if hit == *neg {
                 return false;
             }

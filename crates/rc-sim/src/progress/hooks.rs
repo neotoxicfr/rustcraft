@@ -236,14 +236,15 @@ impl Server {
         self.award_custom("mob_kills", 1);
         self.score_criteria_add("totalKillCount", 1);
         if !self.cmd.scores.objectives.is_empty() {
-            let name = crate::nbtio::uuid_text(uuid);
-            let team = self.cmd.scores.team_of(&name).and_then(|t| t.color.clone());
+            let team = self.cmd.scores.team_of_uuid(uuid).and_then(|t| t.color.clone());
             if let Some(c) = team {
                 self.score_criteria_add(&format!("teamkill.{c}"), 1);
             }
-            // The victim scores `killedByTeam.<colour of the player's team>`.
+            // The victim scores `killedByTeam.<colour of the player's team>`: its name formatted
+            // only then.
             let mine = self.cmd.scores.team_of(&self.name).and_then(|t| t.color.clone());
             if let Some(c) = mine {
+                let name = crate::nbtio::uuid_text(uuid);
                 let shown = shown(self);
                 self.criteria_update_shown(&format!("killedByTeam.{c}"), &name, Some(&shown), |v| v.wrapping_add(1));
             }

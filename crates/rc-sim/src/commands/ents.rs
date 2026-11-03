@@ -408,6 +408,15 @@ impl Server {
         }
     }
 
+    /// Team of an entity, like the team of its [`Server::ent_score_name`], without formatting
+    /// its UUID (found by UUID).
+    pub fn ent_team(&self, e: E) -> Option<&super::scores::Team> {
+        match e {
+            E::Player => self.cmd.scores.team_of(&self.name),
+            _ => self.cmd.scores.team_of_uuid(self.ent_uuid(e)),
+        }
+    }
+
     /// Raw name (without style): custom name or translated name of the type.
     pub fn ent_custom_name(&self, e: E) -> Option<Component> {
         let n = match e {

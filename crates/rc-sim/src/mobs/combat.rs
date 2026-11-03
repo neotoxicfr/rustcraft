@@ -1685,13 +1685,17 @@ impl Server {
             max: [tb.max[0] + 1.0, tb.max[1] + 0.25, tb.max[2] + 1.0],
         };
         let me = self.name.clone();
+        // Allies are spared: the player's team looked up once, each entity's team found by its
+        // UUID (never formatted).
+        let own_team = self.cmd.scores.team_of(&me).map(|t| t.name.clone());
+        let ally = |s: &Self, uuid: u128| own_team.as_ref().is_some_and(|own| s.cmd.scores.uuid_in_team(uuid, own));
         let ids: Vec<i32> = self
             .mobs
             .list
             .iter()
             .flatten()
             .filter(|o| Some(o.id) != target && o.touches(&area) && super::mth::dist2(o.pos, self.pos) < 9.0)
-            .filter(|o| !self.same_team(&me, &crate::nbtio::uuid_text(o.uuid)))
+            .filter(|o| !ally(self, o.uuid))
             .map(|o| o.id)
             .collect();
         let (s, c) = (sin(self.yaw * DEG), cos(self.yaw * DEG));
@@ -1715,8 +1719,7 @@ impl Server {
         // (wobble or broken), the mannequin as a living entity.
         let bonus = weapon.map_or(0.0, |w| self.sharpness_bonus(w));
         for d in self.deco_living() {
-            let ally = self.same_team(&me, &crate::nbtio::uuid_text(d.uuid));
-            if d.marker || ally || !d.bbox.intersects(&area) || super::mth::dist2(d.pos, self.pos) >= 9.0 {
+            if d.marker || !d.bbox.intersects(&area) || super::mth::dist2(d.pos, self.pos) >= 9.0 || ally(self, d.uuid) {
                 continue;
             }
             let Some(e) = self.deco_nbt(d.id).cloned() else { continue };

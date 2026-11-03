@@ -191,27 +191,28 @@ fn sound(s: &mut Server, m: &mut Mob, name: &str, volume: f32) {
 /// not another warden (armor stands are not mobs here), not invulnerable, not dead, its box
 /// inside the world border.
 pub fn can_target(s: &Server, m: &Mob, e: Ent) -> bool {
-    // Same scoreboard team (the target's name built only when the warden has a team).
-    let allied = |holder: &dyn Fn() -> String| {
+    // Same scoreboard team; the teams found by UUID (nothing formatted), `None`: the player.
+    let allied = |target_uuid: Option<u128>| {
         let scores = &s.cmd.scores;
         !scores.teams.is_empty()
-            && scores
-                .team_of_uuid(m.uuid)
-                .is_some_and(|own| scores.team_of(&holder()).is_some_and(|t| t.name == own.name))
+            && scores.team_of_uuid(m.uuid).is_some_and(|own| match target_uuid {
+                Some(uuid) => scores.uuid_in_team(uuid, &own.name),
+                None => scores.team_of(&s.name).is_some_and(|t| t.name == own.name),
+            })
     };
     match e {
         Ent::Player => {
             s.dims.home.is_none()
                 && !matches!(s.game_mode, 1 | 3)
                 && s.ent_alive(Ent::Player)
-                && !allied(&|| s.name.clone())
+                && !allied(None)
                 && s.box_in_border(&s.player_aabb())
         }
         Ent::Mob(id) => s.mob_ref(id).is_some_and(|o| {
             o.alive()
                 && o.kind != Kind::Warden
                 && !o.invulnerable
-                && !allied(&|| crate::nbtio::uuid_text(o.uuid))
+                && !allied(Some(o.uuid))
                 && s.box_in_border(&o.bbox())
         }),
     }
