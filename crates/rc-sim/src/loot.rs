@@ -38,7 +38,7 @@ impl<'v> Candidates<'v> {
     }
 
     fn push(&mut self, c: Cand<'v>) {
-        // The old context kept every candidate in the list (`RUSTCRAFT_OPT_LOOTCTXBORROW=0`).
+        // The old context kept every candidate in the list (`RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT=0`).
         if self.first.is_none() && loot_context_borrowed() {
             self.first = Some(c);
         } else {
@@ -137,11 +137,11 @@ pub trait LootWorld {
     }
 }
 
-/// `RUSTCRAFT_OPT_LOOTCTXBORROW` (default 1; `0`: the old context, where the block's properties
+/// `RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT` (default 1; `0`: the old context, where the block's properties
 /// are copied as owned strings, its block entity cloned, the table looked up twice by name and
 /// the engine's inputs gathered in temporary lists), read once.
 pub(crate) fn loot_context_borrowed() -> bool {
-    rc_data::opt_switch!("RUSTCRAFT_OPT_LOOTCTXBORROW")
+    rc_data::opt_switch!("RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT")
 }
 
 /// Properties of the block of a draw.
@@ -158,7 +158,7 @@ impl BlockProps {
     pub const NONE: BlockProps = BlockProps::Listed(Vec::new());
 
     /// Properties of `state` for a draw: lent by state, or copied up front with
-    /// `RUSTCRAFT_OPT_LOOTCTXBORROW=0`.
+    /// `RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT=0`.
     pub fn of_state(data: &rc_data::VersionData, state: u32) -> BlockProps {
         if loot_context_borrowed() {
             BlockProps::State(state)
@@ -190,7 +190,7 @@ impl RunningTables {
     }
 
     fn push(&mut self, table: usize) {
-        // The old context kept every level in the list (`RUSTCRAFT_OPT_LOOTCTXBORROW=0`).
+        // The old context kept every level in the list (`RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT=0`).
         if self.inline_len < self.inline.len() && loot_context_borrowed() {
             self.inline[self.inline_len] = table;
             self.inline_len += 1;
@@ -406,7 +406,7 @@ fn table_bonus_chance(chances: &Value, lvl: i32) -> Option<f32> {
     numbers().nth((lvl as usize).min(count.saturating_sub(1))).map(|f| f as f32)
 }
 
-/// Old reading (`RUSTCRAFT_OPT_LOOTCTXBORROW=0`): the chances copied into a list first.
+/// Old reading (`RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT=0`): the chances copied into a list first.
 fn table_bonus_chance_listed(chances: &Value, lvl: i32) -> Option<f32> {
     let chances: Vec<f32> =
         chances.as_array().map(|a| a.iter().filter_map(Value::as_f64).map(|f| f as f32).collect()).unwrap_or_default();
@@ -1712,23 +1712,24 @@ impl Loot<'_> {
         ctx.visited.borrow_mut().pop();
     }
 
-    /// Named table, stacks split to their maximum size.
+    /// Table named `id`, looked up in the pack here, stacks split to their maximum size.
     pub fn drops(&self, id: &str, ctx: &Ctx<'_>, rng: &mut dyn Rand) -> Vec<Stack> {
         let Some(t) = self.pack.get("loot_table", id) else { return Vec::new() };
-        self.drops_from(&t, ctx, rng)
+        self.drops_of_table(&t, ctx, rng)
     }
 
-    /// Named table `id` the caller already looked up (`table`, `None`: no such table), stacks
-    /// split to their maximum size. With `RUSTCRAFT_OPT_LOOTCTXBORROW=0`, looked up again by name.
-    pub fn drops_of(&self, id: &str, table: Option<&Value>, ctx: &Ctx<'_>, rng: &mut dyn Rand) -> Vec<Stack> {
+    /// Table named `id` that the caller already looked up (`table`; `None`: no such table), stacks
+    /// split to their maximum size. With `RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT=0` it is looked up
+    /// again by name, as before.
+    pub fn drops_of_looked_up_table(&self, id: &str, table: Option<&Value>, ctx: &Ctx<'_>, rng: &mut dyn Rand) -> Vec<Stack> {
         if !loot_context_borrowed() {
             return self.drops(id, ctx, rng);
         }
-        table.map_or_else(Vec::new, |t| self.drops_from(t, ctx, rng))
+        table.map_or_else(Vec::new, |t| self.drops_of_table(t, ctx, rng))
     }
 
-    /// Table already at hand, stacks split to their maximum size.
-    pub fn drops_from(&self, table: &Value, ctx: &Ctx<'_>, rng: &mut dyn Rand) -> Vec<Stack> {
+    /// Table already read (not looked up by name), stacks split to their maximum size.
+    pub fn drops_of_table(&self, table: &Value, ctx: &Ctx<'_>, rng: &mut dyn Rand) -> Vec<Stack> {
         if !loot_context_borrowed() {
             return self.split_after_run(table, ctx, rng);
         }
@@ -1742,7 +1743,7 @@ impl Loot<'_> {
         out
     }
 
-    /// Old splitting (`RUSTCRAFT_OPT_LOOTCTXBORROW=0`): the table's stacks gathered in a list,
+    /// Old splitting (`RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT=0`): the table's stacks gathered in a list,
     /// then split into a second one.
     fn split_after_run(&self, table: &Value, ctx: &Ctx<'_>, rng: &mut dyn Rand) -> Vec<Stack> {
         let mut out = Vec::new();

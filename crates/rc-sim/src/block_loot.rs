@@ -3,7 +3,7 @@
 //! block, its properties and its block entity lent to the context, the table's sequence (or the
 //! level's random) taken out for the draw and put back after.
 //!
-//! `RUSTCRAFT_OPT_LOOTCTXBORROW=0` keeps the three former draws (below), which copied the
+//! `RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT=0` keeps the three former draws (below), which copied the
 //! properties, cloned the block entity, wrote the table's name and looked it up twice.
 
 use std::sync::Arc;
@@ -67,7 +67,7 @@ impl Server {
                     block_entity,
                     ..Default::default()
                 };
-                loot.drops_from(table, &ctx, rng)
+                loot.drops_of_table(table, &ctx, rng)
             }
             BlockRemoval::Mined { tool, by_player } => {
                 let world = self.loot_world(WorldCtx {
@@ -84,12 +84,12 @@ impl Server {
                     world: Some(&world),
                     ..Default::default()
                 };
-                loot.drops_from(table, &ctx, rng)
+                loot.drops_of_table(table, &ctx, rng)
             }
         }
     }
 
-    /// Former draw of a block removed by the world (`RUSTCRAFT_OPT_LOOTCTXBORROW=0`).
+    /// Former draw of a block removed by the world (`RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT=0`).
     pub(crate) fn block_drops_with_owned_context(
         &mut self,
         p: [i32; 3],
@@ -100,7 +100,7 @@ impl Server {
         self.mined_block_loot_with_owned_context(p, state, &block, tool, false)
     }
 
-    /// Former draw of a mined block (`RUSTCRAFT_OPT_LOOTCTXBORROW=0`): the player's and the
+    /// Former draw of a mined block (`RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT=0`): the player's and the
     /// world's were the same code, `by_player` aside.
     pub(crate) fn mined_block_loot_with_owned_context(
         &mut self,
@@ -151,7 +151,7 @@ impl Server {
         drops
     }
 
-    /// Former draw of a blown-up block (`RUSTCRAFT_OPT_LOOTCTXBORROW=0`).
+    /// Former draw of a blown-up block (`RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT=0`).
     pub(crate) fn explosion_drops_with_owned_context(
         &mut self,
         p: [i32; 3],

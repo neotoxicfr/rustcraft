@@ -168,11 +168,11 @@ impl Server {
             let resolved = table_value.as_deref();
             let stacks = if seed != 0 {
                 let mut rng = crate::mobs::jrand::JRand::new(seed);
-                loot.drops_of(&table, resolved, &ctx, &mut rng)
+                loot.drops_of_looked_up_table(&table, resolved, &ctx, &mut rng)
             } else if let Some(q) = resolved.and_then(|t| t["random_sequence"].as_str()) {
-                loot.drops_of(&table, resolved, &ctx, life.seqs.get(q))
+                loot.drops_of_looked_up_table(&table, resolved, &ctx, life.seqs.get(q))
             } else {
-                loot.drops_of(&table, resolved, &ctx, &mut life.rng)
+                loot.drops_of_looked_up_table(&table, resolved, &ctx, &mut life.rng)
             };
             stacks.into_iter().next()
         };

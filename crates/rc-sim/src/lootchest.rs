@@ -149,11 +149,11 @@ impl Server {
                 match &mut world_rng {
                     None => {
                         let mut rng = crate::mobs::jrand::JRand::new(seed);
-                        let stacks = loot.drops_of(table, resolved, &ctx, &mut rng);
+                        let stacks = loot.drops_of_looked_up_table(table, resolved, &ctx, &mut rng);
                         fill(&mut items, stacks, &mut rng);
                     }
                     Some(rng) => {
-                        let stacks = loot.drops_of(table, resolved, &ctx, rng);
+                        let stacks = loot.drops_of_looked_up_table(table, resolved, &ctx, rng);
                         fill(&mut items, stacks, rng);
                     }
                 }

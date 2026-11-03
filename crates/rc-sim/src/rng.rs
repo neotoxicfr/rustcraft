@@ -121,10 +121,10 @@ impl Rng {
     }
 }
 
-/// `RUSTCRAFT_OPT_LOOTSEQGETMUT` (default 1; `0`: the old lookup that copies the name at every
+/// `RUSTCRAFT_OPT_RANDOM_SEQUENCE_LOOKUP_FIRST` (default 1; `0`: the old lookup that copies the name at every
 /// call), read once.
 pub(crate) fn sequence_looked_up_before_insert() -> bool {
-    rc_data::opt_switch!("RUSTCRAFT_OPT_LOOTSEQGETMUT")
+    rc_data::opt_switch!("RUSTCRAFT_OPT_RANDOM_SEQUENCE_LOOKUP_FIRST")
 }
 
 /// MD5 (RFC 1321): seed of a sequence drawn from its name.
@@ -226,7 +226,7 @@ impl Sequences {
         self.seqs.get_mut(key).expect("sequence present or inserted just above")
     }
 
-    /// Old lookup (`RUSTCRAFT_OPT_LOOTSEQGETMUT=0`): the name copied at every call.
+    /// Old lookup (`RUSTCRAFT_OPT_RANDOM_SEQUENCE_LOOKUP_FIRST=0`): the name copied at every call.
     fn get_through_entry(&mut self, key: &str) -> &mut Rng {
         self.dirty = true;
         let (ws, salt, wsf, idf) = (self.world_seed, self.salt, self.include_world_seed, self.include_id);

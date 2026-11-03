@@ -1,5 +1,5 @@
 //! Proof that the loot engine reads a block the same way after the borrowed context
-//! (`RUSTCRAFT_OPT_LOOTCTXBORROW`): every block table of the base pack is drawn for several states
+//! (`RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT`): every block table of the base pack is drawn for several states
 //! of its block and several tools, with the server's block tags, and the stacks are fingerprinted.
 //! The expected value was recorded on the code before the change (properties copied into the
 //! context as owned strings).
@@ -143,7 +143,7 @@ fn split_while_running_matches_split_after() {
     for (id, table) in &tables {
         for seed in 0..4 {
             let after = loot.split_after_run(table, &ctx, &mut crate::mobs::jrand::JRand::new(seed));
-            let during = loot.drops_from(table, &ctx, &mut crate::mobs::jrand::JRand::new(seed));
+            let during = loot.drops_of_table(table, &ctx, &mut crate::mobs::jrand::JRand::new(seed));
             let text = |v: &[Stack]| format!("{v:?}");
             assert_eq!(text(&during), text(&after), "{id} seed {seed}");
             stacks += after.len();

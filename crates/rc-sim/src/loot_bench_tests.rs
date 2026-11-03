@@ -29,13 +29,60 @@ fn loot_bench() {
     assert_eq!(fingerprint_and_bench(true), EVERY_TABLE_FINGERPRINT, "the loot of a base pack table changed");
 }
 
-fn fingerprint_and_bench(timed: bool) -> u64 {
+/// Fingerprint of the creeper's table killed by a skeleton, 64 deaths, recorded on the code
+/// before the tag entries lent their names (each item of the tag was copied into a list). Its
+/// pool of music discs is an expanded tag entry: the disc a given random gives depends on the
+/// order of the tag's members, which the fingerprint of every table never reaches (no attacker).
+const CREEPER_KILLED_BY_SKELETON_FINGERPRINT: u64 = 0xab04_7108_cfc0_8943;
+
+#[test]
+fn creeper_killed_by_skeleton_draws_like_before() {
+    let p = flat_world("creeper");
+    let s = &p.s;
+    let no_tag = |_: &str, _: &str| false;
+    let loot = Loot { pack: &s.life.pack, items: &s.life.items, block_tag: &no_tag };
+    // The creeper's table only asks whether the attacker is in the `skeletons` entity tag.
+    let skeleton = ("minecraft:skeleton".to_owned(), vec!["minecraft:skeletons".to_owned()]);
+    let ctx = Ctx { attacker: Some(skeleton), ..Default::default() };
+    let mut h = FNV_START;
+    let mut discs = hashbrown::HashSet::new();
+    // 16 deaths in a row per generator: the first draws of generators with neighbouring seeds
+    // are close to each other and would only reach a few discs.
+    for seed in 0..4 {
+        let mut rng = crate::mobs::jrand::JRand::new(seed);
+        for _ in 0..16 {
+            for st in loot.drops("minecraft:entities/creeper", &ctx, &mut rng) {
+                if st.id.contains("music_disc") {
+                    discs.insert(st.id.clone());
+                }
+                h = fnv(h, format!("{} {};", st.id, st.count).as_bytes());
+            }
+        }
+    }
+    eprintln!("creeper killed by a skeleton: {} discs, {h:016x}", discs.len());
+    // The fingerprint is only worth something if the draw walks most of the tag.
+    assert!(discs.len() >= 8, "too few discs drawn: {discs:?}");
+    assert_eq!(h, CREEPER_KILLED_BY_SKELETON_FINGERPRINT, "the creeper's disc changed");
+}
+
+const FNV_START: u64 = 0xcbf2_9ce4_8422_2325;
+
+fn fnv(h: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(h, |h, &x| (h ^ u64::from(x)).wrapping_mul(0x100_0000_01b3))
+}
+
+/// A new flat world on the base pack (its folder removed when the test ends).
+fn flat_world(name: &str) -> crate::blocks::probe::Probe {
     let data = Arc::new(rc_testdata::version_data().expect("version data 26.3 missing"));
-    let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-lootbench-{timed}-{}", std::process::id())));
+    let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-lootbench-{name}-{}", std::process::id())));
     let mut w = crate::newworld::NewWorld::new("lootbench");
     w.preset = crate::newworld::Preset::Flat;
     crate::newworld::create_world(&dir, &data, &w).expect("world creation");
-    let p = crate::blocks::probe::Probe::open(&dir, data);
+    crate::blocks::probe::Probe::open(&dir, data)
+}
+
+fn fingerprint_and_bench(timed: bool) -> u64 {
+    let p = flat_world(if timed { "timed" } else { "fingerprint" });
     let s = &p.s;
     let no_tag = |_: &str, _: &str| false;
     let loot = Loot { pack: &s.life.pack, items: &s.life.items, block_tag: &no_tag };
@@ -47,11 +94,10 @@ fn fingerprint_and_bench(timed: bool) -> u64 {
     let ctx = Ctx { tool: Some(Some(&pick)), luck: 1.0, killed_by_player: true, looting: 2, ..Default::default() };
     let ids: Vec<String> = s.life.pack.all("loot_table").into_iter().map(|(k, _)| k).collect();
     assert!(ids.len() > 1000, "base pack tables missing: {}", ids.len());
-    let fnv = |h: u64, b: &[u8]| b.iter().fold(h, |h, &x| (h ^ u64::from(x)).wrapping_mul(0x100_0000_01b3));
     let mut lines = String::new();
-    let mut total = 0xcbf2_9ce4_8422_2325u64;
+    let mut total = FNV_START;
     for id in &ids {
-        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        let mut h = FNV_START;
         for seed in 0..16 {
             let mut rng = crate::mobs::jrand::JRand::new(seed);
             for st in loot.drops(id, &ctx, &mut rng) {

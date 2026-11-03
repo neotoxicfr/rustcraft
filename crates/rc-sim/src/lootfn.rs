@@ -99,7 +99,7 @@ impl Loot<'_> {
                 }
                 s
             }
-            // Old reading (`RUSTCRAFT_OPT_LOOTCTXBORROW=0`): the options copied into a list.
+            // Old reading (`RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT=0`): the options copied into a list.
             "set_random_potion" => {
                 let all = || items.data.registry("minecraft:potion").map(|r| r.entries.clone()).unwrap_or_default();
                 let list: Vec<String> = match &f["options"] {
@@ -459,7 +459,7 @@ impl Loot<'_> {
                 s
             }
             "set_stew_effect" => {
-                // Old reading (`RUSTCRAFT_OPT_LOOTCTXBORROW=0`): the effects copied first.
+                // Old reading (`RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT=0`): the effects copied first.
                 let copied;
                 let list: &[Value] = if crate::loot::loot_context_borrowed() {
                     f["effects"].as_array().map_or(&[], Vec::as_slice)
@@ -704,7 +704,7 @@ fn attribute_entries(items: &Items, s: &Stack) -> Vec<Nbt> {
     if let Some(Nbt::List(l)) = crate::items::component(s, K) {
         return l.clone();
     }
-    // Old reading (`RUSTCRAFT_OPT_LOOTCTXBORROW=0`): the removal key written out at each call.
+    // Old reading (`RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT=0`): the removal key written out at each call.
     let removed = if crate::loot::loot_context_borrowed() {
         crate::items::component(s, REMOVED).is_some()
     } else {

@@ -1,4 +1,4 @@
-//! The shared block loot draw (`RUSTCRAFT_OPT_LOOTCTXBORROW`) against the three former draws it
+//! The shared block loot draw (`RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT`) against the three former draws it
 //! replaces: same stacks, same state of the random sequences and of the level's random, for a
 //! block mined by the world, mined by the player and blown up. Plus its allocation count.
 
@@ -58,19 +58,39 @@ enum Draw {
     Former,
 }
 
-/// Removal `kind` (0 mined by the world, 1 by the player, 2 blown up) of `state` at `at`.
-fn remove(p: &mut Probe, draw: Draw, kind: usize, at: [i32; 3], state: u32, tool: Option<&Stack>) -> Vec<Stack> {
+/// How the block leaves the world.
+#[derive(Clone, Copy, Debug)]
+enum Removal {
+    MinedByWorld,
+    MinedByPlayer,
+    Blown,
+}
+
+impl Removal {
+    const ALL: [Removal; 3] = [Removal::MinedByWorld, Removal::MinedByPlayer, Removal::Blown];
+
+    fn label(self) -> &'static str {
+        match self {
+            Removal::MinedByWorld => "mined by the world",
+            Removal::MinedByPlayer => "mined by the player",
+            Removal::Blown => "blown up",
+        }
+    }
+}
+
+/// `state` at `at` removed by `removal`, drawn by the shared or the former code.
+fn remove(p: &mut Probe, draw: Draw, removal: Removal, at: [i32; 3], state: u32, tool: Option<&Stack>) -> Vec<Stack> {
     let s = &mut p.s;
-    match (kind, draw) {
-        (0, Draw::Shared) => s.draw_block_loot(at, state, BlockRemoval::Mined { tool, by_player: false }),
-        (0, Draw::Former) => s.block_drops_with_owned_context(at, state, tool),
-        (1, Draw::Shared) => s.draw_block_loot(at, state, BlockRemoval::Mined { tool, by_player: true }),
-        (1, Draw::Former) => {
+    match (removal, draw) {
+        (Removal::MinedByWorld, Draw::Shared) => s.draw_block_loot(at, state, BlockRemoval::Mined { tool, by_player: false }),
+        (Removal::MinedByWorld, Draw::Former) => s.block_drops_with_owned_context(at, state, tool),
+        (Removal::MinedByPlayer, Draw::Shared) => s.draw_block_loot(at, state, BlockRemoval::Mined { tool, by_player: true }),
+        (Removal::MinedByPlayer, Draw::Former) => {
             let name = s.data.block_of(state).map(|b| b.name.clone()).unwrap_or_default();
             s.mined_block_loot_with_owned_context(at, state, &name, tool, true)
         }
-        (_, Draw::Shared) => s.draw_block_loot(at, state, BlockRemoval::Blown { radius: Some(4.0) }),
-        (_, Draw::Former) => s.explosion_drops_with_owned_context(at, state, Some(4.0)),
+        (Removal::Blown, Draw::Shared) => s.draw_block_loot(at, state, BlockRemoval::Blown { radius: Some(4.0) }),
+        (Removal::Blown, Draw::Former) => s.explosion_drops_with_owned_context(at, state, Some(4.0)),
     }
 }
 
@@ -93,7 +113,8 @@ fn run_all(p: &mut Probe, draw: Draw) -> (String, Option<Nbt>, (u64, u64)) {
             _ => (LOG, oak + (i as u32 / 4) % 3),
         };
         let tool = tools[i % 3].as_ref();
-        for st in remove(p, draw, (i / 3) % 3, at, state, tool) {
+        // Each removal in turn, three draws in a row (the same order as before the enum).
+        for st in remove(p, draw, Removal::ALL[(i / 3) % 3], at, state, tool) {
             let c = st.components.as_ref().map_or_else(String::new, crate::commands::snbt::to_snbt);
             out.push_str(&format!("{i}: {} {} {c}\n", st.id, st.count));
         }
@@ -121,12 +142,12 @@ fn shared_draw_matches_the_former_draws() {
 
 /// Allocations of one removal of `state`, averaged over `n` after a first one (tables and
 /// sequences then known).
-fn allocations_per_removal(p: &mut Probe, draw: Draw, kind: usize, at: [i32; 3], state: u32, n: u64) -> f64 {
+fn allocations_per_removal(p: &mut Probe, draw: Draw, removal: Removal, at: [i32; 3], state: u32, n: u64) -> f64 {
     let tool = enchanted("minecraft:diamond_pickaxe", "minecraft:fortune", 3);
-    drop(remove(p, draw, kind, at, state, Some(&tool)));
+    drop(remove(p, draw, removal, at, state, Some(&tool)));
     let before = crate::test_alloc::allocations();
     for _ in 0..n {
-        drop(remove(p, draw, kind, at, state, Some(&tool)));
+        drop(remove(p, draw, removal, at, state, Some(&tool)));
     }
     (crate::test_alloc::allocations() - before) as f64 / n as f64
 }
@@ -138,16 +159,22 @@ fn allocations_per_removal(p: &mut Probe, draw: Draw, kind: usize, at: [i32; 3],
 fn shared_draw_allocates_less() {
     let (mut p, _dir) = open("allocs");
     let stone = p.s.data.default_state_of("minecraft:stone").expect("stone");
-    for kind in 0..3 {
-        let former = allocations_per_removal(&mut p, Draw::Former, kind, LOG, stone, 100);
-        let shared = allocations_per_removal(&mut p, Draw::Shared, kind, LOG, stone, 100);
-        eprintln!("removal {kind}: {former:.1} allocations before, {shared:.1} after");
-        // The exact count needs the whole new path (the engine and the sequences' lookup).
-        let switches_on = crate::loot::loot_context_borrowed() && crate::rng::sequence_looked_up_before_insert();
-        if kind < 2 && switches_on {
-            assert_eq!(shared, 2.0, "mined stone (removal {kind}): only the list and the stack");
+    // The counts and the margin need the whole new path (the engine and the sequences' lookup);
+    // with a switch at 0, the shared draw only has to allocate no more than the former one.
+    let switches_on = crate::loot::loot_context_borrowed() && crate::rng::sequence_looked_up_before_insert();
+    for removal in Removal::ALL {
+        let former = allocations_per_removal(&mut p, Draw::Former, removal, LOG, stone, 100);
+        let shared = allocations_per_removal(&mut p, Draw::Shared, removal, LOG, stone, 100);
+        let label = removal.label();
+        eprintln!("stone {label}: {former:.1} allocations before, {shared:.1} after");
+        if !switches_on {
+            assert!(shared <= former, "stone {label}: {shared} allocations, the former draw {former}");
+            continue;
         }
-        assert!(shared + 2.5 <= former, "removal {kind}: {shared} allocations, the former draw {former}");
+        if !matches!(removal, Removal::Blown) {
+            assert_eq!(shared, 2.0, "stone {label}: only the list and the stack");
+        }
+        assert!(shared + 2.5 <= former, "stone {label}: {shared} allocations, the former draw {former}");
     }
 }
 
@@ -162,25 +189,25 @@ fn block_loot_bench() {
     let barrel = p.s.st(BARREL);
     let tool = enchanted("minecraft:diamond_pickaxe", "minecraft:fortune", 3);
     for (label, at, state) in [("stone", LOG, stone), ("oak leaves", LOG, oak), ("barrel", BARREL, barrel)] {
-        for (kind, removal) in ["mined by the world", "mined by the player", "blown up"].iter().enumerate() {
+        for removal in Removal::ALL {
             let mut best = [f64::MAX; 2];
             let mut allocs = [0.0; 2];
             for (d, draw) in [Draw::Former, Draw::Shared].into_iter().enumerate() {
-                allocs[d] = allocations_per_removal(&mut p, draw, kind, at, state, 1_000);
+                allocs[d] = allocations_per_removal(&mut p, draw, removal, at, state, 1_000);
             }
             // Best of 7 trials of 5 000 removals, the two draws alternated (the minimum resists the load).
             for _ in 0..7 {
                 for (d, draw) in [Draw::Former, Draw::Shared].into_iter().enumerate() {
                     let t = std::time::Instant::now();
                     for _ in 0..5_000 {
-                        drop(remove(&mut p, draw, kind, at, state, Some(&tool)));
+                        drop(remove(&mut p, draw, removal, at, state, Some(&tool)));
                     }
                     best[d] = best[d].min(t.elapsed().as_nanos() as f64 / 5_000.0);
                 }
             }
             eprintln!(
-                "{label:10} {removal:20}: before {:6.0} ns {:5.1} allocations, after {:6.0} ns {:5.1} allocations",
-                best[0], allocs[0], best[1], allocs[1]
+                "{label:10} {:20}: before {:6.0} ns {:5.1} allocations, after {:6.0} ns {:5.1} allocations",
+                removal.label(), best[0], allocs[0], best[1], allocs[1]
             );
         }
     }

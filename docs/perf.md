@@ -4286,15 +4286,17 @@ frames; GPU = submit and wait of the pass minus an empty pass, 512 × 512):
   (`block_loot.rs`, B8): table resolved once per block id (`DataPack::block_loot_table`, cache
   emptied with the pack), properties lent by state (`BlockProps::State`, read from the version data
   only when a condition or `copy_state` asks), block entity lent, the table at hand drawn
-  (`Loot::drops_from`; chests and brushes through `drops_of`). Switch `RUSTCRAFT_OPT_LOOTCTXBORROW`
+  (`Loot::drops_of_table`; chests and brushes through `drops_of_looked_up_table`). Switch `RUSTCRAFT_OPT_LOOT_BORROWED_CONTEXT`
   (default 1; `0`: the former draws and engine paths, kept in `block_loot.rs` and next to the new
   ones). Sequences (`rng.rs`): looked up first, the name copied only at creation; switch
-  `RUSTCRAFT_OPT_LOOTSEQGETMUT`.
+  `RUSTCRAFT_OPT_RANDOM_SEQUENCE_LOOKUP_FIRST`.
 - Engine (same switch): `table_bonus` chances and the enchantment ids of an item predicate read in
   place; stacks split as the table makes them (no second list); the first candidate of a roll and
   the first four running tables kept inline; `set_random_potion` without cloning the potion
   registry, stew effects borrowed, the attribute removal key a constant. Tag entries walk the tag's
-  names without a `Vec<String>` (simplification, no switch: no expanded tag entry in the base pack).
+  names without a `Vec<String>` (simplification, no switch: same names in the same order; an
+  expanded tag entry of the base pack, the creeper's music discs when a skeleton kills it, is
+  frozen on the former walk at `ab047108cfc08943`, 64 deaths, 12 discs reached).
   Blown-up blocks no longer copy their name; the player's mining lends it.
 - Equivalence (A1/A2): every block table of the base pack (1201) for up to 7 states and 4 tools
   with the server's block tags, frozen before the change at `651fc71b4e039258` (properties listed and
@@ -4303,8 +4305,11 @@ frames; GPU = submit and wait of the pass minus an empty pass, 512 × 512):
   test, table bonus, explosion pool, stacks of 40 to 100 split, copied state, a named barrel): same
   stacks, same saved sequences, same level random. Sabotages caught: candidate order inverted (every
   table fingerprint), generator not put back (shared draw test), table bonus index shifted (block
-  table fingerprint), sequence salt shifted (sequence lookup test). All tests also pass with both
-  switches at 0.
+  table fingerprint), sequence salt shifted (sequence lookup test), tag members walked backwards
+  (creeper fingerprint; the older disc test still passed). The loot tests pass with the two
+  switches in each of their four combinations; with a switch at 0 the allocation test only asks
+  the shared draw for no more than the former one (stone mined, former → shared: both at 1,
+  5 → 2; context 1 and lookup 0, 7 → 4; context 0 and lookup 1, 10 → 7; both at 0, 12 → 9).
 - Allocations per removal (deterministic, counting allocator of the tests), former draw with the old
   engine → shared draw: stone mined 12 → 2 (the list and the stack's name), blown 6 → 0.4; oak leaves
   mined 24.5 → 0.2, blown 14.9 → 0.1; named barrel mined 33 → 12, blown 21.5 → 2.8 (the rest is the
