@@ -195,8 +195,65 @@ fn client_position(ev: &[Event], id: i32, mut at: Option<[f64; 3]>) -> Option<[f
     at
 }
 
-/// A tracked armor stand pushed into the view is announced where its tracking last sent it, so
-/// the next relative move (coded from there) lands it where it is on the server.
+/// Checks that the client holds the entity at the server position (to the protocol precision).
+fn assert_client_at(at: [f64; 3], server: [f64; 3]) {
+    assert!(at.iter().zip(server).all(|(c, s)| (c - s).abs() < 1.0 / 4096.0), "client at {at:?}, server at {server:?}");
+}
+
+/// A tracked armor stand teleported into the view with no tick after it (world frozen: the
+/// stands do not tick) is shown where it is, and its later moves are coded from there.
+#[test]
+fn tracked_stand_teleported_into_view_without_tick_is_shown_where_it_is() {
+    let Some((mut p, _dir)) = probe("kept-stand-tp-frozen") else { return };
+    p.s.sent = [HOME].into_iter().collect();
+    let id = summon_settled(&mut p, "minecraft:armor_stand", "112.2 -59 100.5 {NoGravity:1b}");
+    (0..4).for_each(|_| {
+        p.s.time += 1;
+        p.s.deco_tick();
+    });
+    p.take_events();
+    cmd(&mut p, "tp @e[type=minecraft:armor_stand] 100.5 -59 100.5");
+    let mut ev = p.take_events();
+    let server = [100.5, -59.0, 100.5];
+    assert_client_at(client_position(&ev, id, None).expect("announced"), server);
+    // Ticks afterwards: no stale move from the old tracking base.
+    (0..6).for_each(|_| {
+        p.s.time += 1;
+        p.s.deco_tick();
+    });
+    ev.extend(p.take_events());
+    assert_client_at(client_position(&ev, id, None).expect("announced"), server);
+}
+
+/// A tracked armor stand moved while its chunk was not sent is shown where it is when the
+/// chunk is sent again, and its later moves are coded from there.
+#[test]
+fn tracked_stand_moved_out_of_view_is_shown_where_it_is_on_chunk_resend() {
+    let Some((mut p, _dir)) = probe("kept-stand-resend") else { return };
+    p.s.sent = [HOME].into_iter().collect();
+    let id = summon_settled(&mut p, "minecraft:armor_stand", "100.5 -59 100.5 {NoGravity:1b}");
+    (0..4).for_each(|_| {
+        p.s.time += 1;
+        p.s.deco_tick();
+    });
+    p.s.sent.clear();
+    cmd(&mut p, "tp @e[type=minecraft:armor_stand] 104.5 -59 104.5");
+    p.take_events();
+    p.s.sent.insert(HOME);
+    p.s.show_entities(HOME);
+    let mut ev = p.take_events();
+    let server = [104.5, -59.0, 104.5];
+    assert_client_at(client_position(&ev, id, None).expect("announced"), server);
+    (0..6).for_each(|_| {
+        p.s.time += 1;
+        p.s.deco_tick();
+    });
+    ev.extend(p.take_events());
+    assert_client_at(client_position(&ev, id, None).expect("announced"), server);
+}
+
+/// A tracked armor stand pushed into the view is shown where it is, and its next relative
+/// move is coded from there.
 #[test]
 fn stand_pushed_into_view_lands_where_it_is() {
     let Some((mut p, _dir)) = probe("kept-stand-view") else { return };

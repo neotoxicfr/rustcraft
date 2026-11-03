@@ -42,9 +42,12 @@ impl Tracker {
         }
     }
 
-    /// Position the next relative move is coded from (the last one sent), once tracking began.
-    pub(crate) fn sent_position(&self) -> Option<[f64; 3]> {
-        self.seen.then_some(self.base)
+    /// The clients were just given the entity at `pos` (a fresh announce): once tracking began,
+    /// the next relative move is coded from there.
+    pub(crate) fn announced_at(&mut self, pos: [f64; 3]) {
+        if self.seen {
+            self.base = pos;
+        }
     }
 }
 

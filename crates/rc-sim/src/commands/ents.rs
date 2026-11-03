@@ -139,7 +139,7 @@ impl Server {
         if seen_before {
             let _ = self.send(Event::Entity(EntityEvent::Remove(vec![id])));
         } else if let Some(n) = self.other(id).cloned() {
-            self.deco_announce(id, &n);
+            self.deco_announce_tracked(id, &n);
         }
         KeptEntityMove::ViewChanged
     }

@@ -92,6 +92,14 @@ pub(crate) fn kind_of(e: &Nbt) -> Option<DKind> {
     e.get("id").and_then(Nbt::as_str).and_then(DKind::from_name)
 }
 
+/// Position of a decoration whose moves the network tracking sends (armor stand, mannequin).
+pub(crate) fn tracked_position(e: &Nbt) -> Option<[f64; 3]> {
+    if !matches!(kind_of(e), Some(DKind::Stand | DKind::Mannequin)) {
+        return None;
+    }
+    nbtio::f64s::<3>(e.get("Pos"))
+}
+
 /// Push scans reach each compound from its registry entry (`RUSTCRAFT_OPT_DECOSCAN=0`: by
 /// identifier, the former lookup).
 fn deco_scan_indexed() -> bool {
@@ -412,14 +420,23 @@ impl Server {
         }
     }
 
-    /// Last position the network tracking of decoration `id` sent (`e`: its compound), when it
-    /// is one that moves (armor stand, mannequin) and its tracking began.
-    fn deco_sent_position(&self, id: i32, e: &Nbt) -> Option<[f64; 3]> {
-        // Only those two kinds are tracked: the registry walk is skipped for every other one.
-        if !matches!(kind_of(e), Some(DKind::Stand | DKind::Mannequin)) {
-            return None;
+    /// Announces decoration `id` (`e`: its compound) and, for one whose tracking began (armor
+    /// stand, mannequin), codes its next relative move from the announced position. The game
+    /// announces at the tracking's last sent position, then sends the move to the current one in
+    /// the same tick, even frozen or outside the entity simulation range; announcing straight at
+    /// the current position leaves the clients in that same state.
+    pub(crate) fn deco_announce_tracked(&mut self, id: i32, e: &Nbt) {
+        self.deco_announce(id, e);
+        if let Some(pos) = tracked_position(e) {
+            self.deco_announced_at(id, pos);
         }
-        self.deco.live.iter().find(|l| l.id == id && !l.removed)?.track.sent_position()
+    }
+
+    /// The clients were just given tracked decoration `id` at `pos`.
+    pub(crate) fn deco_announced_at(&mut self, id: i32, pos: [f64; 3]) {
+        if let Some(l) = self.deco.live.iter_mut().find(|l| l.id == id && !l.removed) {
+            l.track.announced_at(pos);
+        }
     }
 
     /// The compound of decoration `id` is now filed under `chunk` (fast lookup kept right).
@@ -499,10 +516,6 @@ impl Server {
             // Knot: announced at the corner of its block, null data.
             pos = block_pos_of(e).map(f64::from);
             data = 0;
-        } else if let Some(sent) = self.deco_sent_position(id, e) {
-            // The game announces at the tracking's last sent position: its next relative move is
-            // coded from there, so announcing the current position would offset the entity.
-            pos = sent;
         }
         let add = rc_proto_v777::entity::AddEntity {
             id,
