@@ -5,7 +5,7 @@ Two steps, a quiet machine is mandatory for the second:
     python tools/bench/scenes.py prepare --java <java.exe> --server-jar <server.jar> [--seed 20261011]
                                         [--pregen-radius 16] [--pregen-center camera|site]
     python tools/bench/scenes.py pack        (rewrites the `perf` pack and the maps of the existing model)
-    python tools/bench/scenes.py pack-files <out>   (pack for the flat world of `rc-sim` tests_perf_pack)
+    python tools/bench/scenes.py pack-files <out>   (pack and scene chat commands for the flat world of `rc-sim` tests_perf_pack)
     python tools/bench/scenes.py micro <pass1.txt> [<pass2.txt>…]   (table of `[bench]` micro-bench lines)
     python tools/bench/scenes.py run --exe <rustcraft.exe> [--exe <other.exe>] [--scenes plains12,@server] [--passes 3]
                                     [--label name] [--env VAR=value] [--matrix VAR=value]… [--samply]
@@ -36,8 +36,9 @@ of `--exe`. A launch whose log says "cache to write" is marked cold and left out
 fresh-install). `--matrix VAR=val` (repeatable) launches each `--exe` without a switch, with each
 one alone, then all together. `--dry-run` prepares each launch without starting anything (scene
 check). `--scenes` takes names and groups (`@reference`, `@server`, `@interface`… see
-`SCENE_GROUPS`). In `--env` and `--exe path|…`, `-VAR` removes a variable (the client tests
-some only for presence: `=0` would leave them on). A scene whose view, located path or model is
+`SCENE_GROUPS`). `--env=-VAR` and `--exe "path|-VAR"` remove a variable (the client tests
+some only for presence: `=0` would leave them on); the `=` is needed, `--env -VAR` is read as
+an unknown option. A scene whose view, located path or model is
 missing, or that drives the client through a variable the exe does not contain (older version),
 is skipped with the reason.
 
@@ -494,6 +495,8 @@ RAIN = (100, "weather rain")
 FLIGHT = (300, "tag @s add perf_fly")
 STANDARD = {"rd": 12, "secs": 45, "from": 25}
 CROWD = {"at": "crowd", "rd": 12, "secs": 50, "from": 30}
+# 26.3 syntax: `publish [allowCommands] [port]`, no game mode: guests join in the default one.
+PUBLISH = ((60, "defaultgamemode creative"), (1, "publish false 25599"))
 
 # Scenes of optimisation series 2. Extra keys: `cache` (cold:
 # empty resource cache; first: fresh exe + empty cache; fresh: fresh exe + empty cache folder,
@@ -551,7 +554,7 @@ SCENES.update({
     "generation-1thread": {"at": "plains", "rd": 12, "secs": 60, "from": 40, "world": "fresh", "env": {"RUSTCRAFT_THREADS": "1"}},
     # Integrated server: local network (host + 1, 2, 4 windowless guests), close-together saves.
     **{f"lan-{n}": {"at": "plains", "rd": 12, "secs": 50, "from": 25, "guests": n,
-                    "cmd": cmd_of((60, "publish false creative 25599")), "env": {"RUSTCRAFT_LAN_AUTH": "0"}} for n in (1, 2, 4)},
+                    "cmd": cmd_of(*PUBLISH), "env": {"RUSTCRAFT_LAN_AUTH": "0"}} for n in (1, 2, 4)},
     "save": {"at": "plains", "rd": 12, "secs": 60, "from": 22, "cmd": cmd_of(FLIGHT),
              "env": {"RUSTCRAFT_AUTOSAVE_TICKS": "200"}},
 })
@@ -584,7 +587,6 @@ for _n, (_a, _b, _pitch) in FRESH_PATHS.items():
 # status servers), `worlds` (extra worlds in the list), `packs` (zipped resource packs).
 # Text values may name a position of `scenes.json`: `{view:NAME}` = "x y z" of the camera,
 # `{site:NAME:dx:dy:dz}` = "x,y,z" of a pad block (the `RUSTCRAFT_INVTEST` format).
-PUBLISH = (60, "publish false creative 25599")
 LAN = {"RUSTCRAFT_LAN_AUTH": "0"}
 # Standing on the crowd pad 2.5 blocks north of the block at (site x, y + 1, z - 18).
 ON_CROWD_PAD = {"site": "crowd", "d": [0.5, 1.0, -20.5], "rd": 12, "secs": 50, "from": 30}
@@ -644,7 +646,7 @@ SCENES.update({
     "trade": {**ON_CROWD_PAD, "rot": [0.0, 0.0], "cmd": FUNCTION("trade"), "keys": right_clicks(420, 1),
               "env": {"RUSTCRAFT_INVMOUSE": "177,95"}},
     **{f"tab-{n + 1}": {"at": "plains", "rd": 12, "secs": 55, "from": 30, "guests": n,
-                        "cmd": cmd_of(PUBLISH, (440, "function perf:tab_list")), "env": {**LAN, "RUSTCRAFT_TABTEST": "1"}}
+                        "cmd": cmd_of(*PUBLISH, (440, "function perf:tab_list")), "env": {**LAN, "RUSTCRAFT_TABTEST": "1"}}
        for n in (19, 79)},
     "chat-flood": {"at": "plains", **STANDARD, "cmd": FUNCTION("chat_flood")},
     "creative-search": {"at": "plains", **STANDARD, "env": {"RUSTCRAFT_CREATIVETEST": "search:diamond"}},
@@ -658,7 +660,7 @@ SCENES.update({
     "f3-open": {"at": "plains", **STANDARD, "env": {"RUSTCRAFT_DEBUGTEST": "f3"}},
     "team-crowd": {**CROWD, "cmd": FUNCTION("team_crowd")},
     "team-crowd-named": {**CROWD, "cmd": FUNCTION("team_crowd_named")},
-    "signs-1": {**CROWD, "cmd": FUNCTION("signs_chests")},
+    "signs-chests": {**CROWD, "cmd": FUNCTION("signs_chests")},
     "displays-1": {**CROWD, "cmd": FUNCTION("displays")},
     "structure-show-air": {**CROWD, "cmd": FUNCTION("structure_air")},
     "packs-20": {"at": "plains", "rd": 12, "secs": 50, "from": 24, "packs": 20, "env": {"RUSTCRAFT_PACKSCREEN": "26"}},
@@ -689,15 +691,15 @@ SCENES.update({
     "tnt-cannon": {**CROWD, "cmd": FUNCTION("tnt_cannon")},
     # Local network (C5): guests brought to the host (`tp Invite0 @s`) or spread out, join in the window.
     "crowd-1000-lan-1": {**CROWD, "guests": 1, "env": LAN,
-                         "cmd": cmd_of(PUBLISH, (40, "function perf:mobs1000"), (340, "tp Invite0 @s"))},
+                         "cmd": cmd_of(*PUBLISH, (40, "function perf:mobs1000"), (340, "tp Invite0 @s"))},
     # TNT primed at 520 ticks, as in `tnt`.
-    "tnt-lan-1": {**CROWD, "guests": 1, "env": LAN, "cmd": cmd_of(PUBLISH, (340, "tp Invite0 @s"), (120, "function perf:tnt"))},
+    "tnt-lan-1": {**CROWD, "guests": 1, "env": LAN, "cmd": cmd_of(*PUBLISH, (340, "tp Invite0 @s"), (120, "function perf:tnt"))},
     "lan-4-spread": {"at": "plains", "rd": 12, "secs": 50, "from": 25, "guests": 4, "env": LAN, "cmd": cmd_of(
-        PUBLISH, (340, "execute at @s run tp Invite0 ~160 ~ ~"), (1, "execute at @s run tp Invite1 ~-160 ~ ~"),
+        *PUBLISH, (340, "execute at @s run tp Invite0 ~160 ~ ~"), (1, "execute at @s run tp Invite1 ~-160 ~ ~"),
         (1, "execute at @s run tp Invite2 ~ ~ ~160"), (1, "execute at @s run tp Invite3 ~ ~ ~-160"))},
-    "lan-1-join": {"at": "plains", "rd": 12, "secs": 50, "from": 10, "guests": 1, "env": LAN, "cmd": cmd_of(PUBLISH)},
+    "lan-1-join": {"at": "plains", "rd": 12, "secs": 50, "from": 10, "guests": 1, "env": LAN, "cmd": cmd_of(*PUBLISH)},
     "redstone-published": {"at": "redstone", "rd": 12, "secs": 50, "from": 30,
-                           "cmd": cmd_of(PUBLISH, (40, "function perf:redstone"))},
+                           "cmd": cmd_of(*PUBLISH, (40, "function perf:redstone"))},
     # Mobs, villages, commands (C6).
     "village-night": {"at": "village", "rd": 12, "secs": 50, "from": 30,
                       "cmd": cmd_of((100, "time set midnight"), (1, "function perf:village_night"))},
@@ -712,7 +714,9 @@ SCENES.update({
                       "env": {"RUSTCRAFT_AUTOSAVE_TICKS": "200"},
                       "cmd": cmd_of((20, "effect give @s minecraft:resistance infinite 4 true"), (1, "tp @s ~ ~60 ~"),
                                     (500, "tp @s ~ ~-60 ~"))},
-    **{f"bee-nests-{k}": {**CROWD, "cmd": cmd_of((100, setup), (1, "function perf:bee_nests"), (600, "save-all"))}
+    # Nests saved every 10 s (`save-all` is a dedicated-server command: refused in singleplayer).
+    **{f"bee-nests-{k}": {**CROWD, "env": {"RUSTCRAFT_AUTOSAVE_TICKS": "200"},
+                          "cmd": cmd_of((100, setup), (1, "function perf:bee_nests"))}
        for k, setup in (("night", "time set midnight"), ("rain", "weather rain"))},
     # Natural spawning on, every mob killed each tick (the cap never fills).
     "nether-fortress": {"at": "fortress", "rd": 12, "secs": 50, "from": 30,
@@ -743,7 +747,7 @@ SCENE_GROUPS = {
                "village-transparency"],
     "interface": ["survival-hud", "hud-busy", "inventory-enchanted-36", "trade", "tab-20", "tab-80", "chat-flood",
                   "creative-search", "creative-tab", "recipe-book", "cmd-give", "stats-screen", "advancements", "f3-open",
-                  "team-crowd", "team-crowd-named", "signs-1", "displays-1", "structure-show-air", "packs-20", "reload-f3t"],
+                  "team-crowd", "team-crowd-named", "signs-chests", "displays-1", "structure-show-air", "packs-20", "reload-f3t"],
     "off-world": ["multiplayer", "world-list", "world-create"],
     "disk": ["world-create-play", "open-from-list", "long-flight-save", "save"],
     "server": ["save", "flight", "long-flight", "hoppers-1", "smelter-1", "sculk-1", "carts-1", "items-merge-1",
@@ -985,28 +989,48 @@ def med(v):
     return statistics.median(v) if v else float("nan")
 
 
+# The client writes a dated line about every second; a longer gap means it stalled.
+DATED_LINE_GAP_S = 1.5
+
+
 def dated_ticks(lines):
-    """Server tick reports, each dated by the last dated line before it (within 1 s): (time, p99).
-    A report covers the last 100 ticks, and its p99 (rank 99 of 100) is their maximum."""
-    out, t = [], None
+    """Server tick reports with the dated lines around them: (date before, date after or None,
+    p99). The server line carries no date of its own. A report covers the last 100 ticks, and its
+    p99 (rank 99 of 100) is their maximum."""
+    out, before, undated = [], None, []
     for line in lines:
         tick = TICK.search(line)
-        if tick and t is not None:
-            out.append((t, float(tick.group(3))))
+        if tick:
+            if before is not None:  # a report before any date is loading: left out
+                undated.append(float(tick.group(3)))
             continue
         d = DATED.search(line)
         if d:
-            t = float(d.group(1))
-    return out
+            after = float(d.group(1))
+            out += [(before, after, p99) for p99 in undated]
+            before, undated = after, []
+    return out + [(before, None, p99) for p99 in undated]
 
 
-def timed_tick_metrics(lines, win, secs):
+def report_inside(before, after, inside):
+    """Whether a report written between two dated lines lies in a range. Dated by the line
+    before when the next one follows within `DATED_LINE_GAP_S`; across a longer gap (client
+    stall) or after the last line, its time is unknown, so it counts only if the whole gap does."""
+    if after is not None and after - before <= DATED_LINE_GAP_S:
+        return inside(before)
+    return after is not None and inside(before) and inside(after)
+
+
+def timed_tick_metrics(lines, win, start, secs):
     """Longest tick of the window (first uses, volleys, saves) and median p99 of the last
-    minute (end of a long flight)."""
+    minute (end of a long flight; NaN when the scene has no full minute after `start`, it would
+    count loading ticks)."""
     ticks = dated_ticks(lines)
-    in_window = [p99 for t, p99 in ticks if win(t)]
-    last_minute = [p99 for t, p99 in ticks if secs - 61 <= t <= secs - 1]
-    return {"tick_max_ms": max(in_window) if in_window else float("nan"), "tick_p99_last_minute_ms": med(last_minute)}
+    in_window = [p99 for b, a, p99 in ticks if report_inside(b, a, win)]
+    last_minute = lambda t: secs - 61 <= t <= secs - 1  # noqa: E731
+    p99_last_minute = med([p99 for b, a, p99 in ticks if report_inside(b, a, last_minute)])
+    return {"tick_max_ms": max(in_window) if in_window else float("nan"),
+            "tick_p99_last_minute_ms": p99_last_minute if secs >= start + 61 else float("nan")}
 
 
 def load_metrics(lines, win):
@@ -1083,7 +1107,7 @@ def analyse(log_path, frames_path, frm, secs):
     m["tick_med_ms"] = med([float(t.group(1)) for t in tkw])
     m["tick_p99_ms"] = med([float(t.group(3)) for t in tkw])
     m["tick_mean_ms"] = med([float(t.group(4)) for t in tkw])
-    m.update(timed_tick_metrics(lines, win, secs))
+    m.update(timed_tick_metrics(lines, win, frm, secs))
     m.update(load_metrics(lines, win))
     m.update(memory_metrics(lines, win))
     c = [x for x in (LOADED.search(l) for l in lines) if x]
@@ -1632,10 +1656,54 @@ def pack(_a):
 FLAT_SITES = {"crowd": (64, -61, 8), "redstone": (64, -61, 8)}
 
 
+def chat_commands(script):
+    """Commands a `RUSTCRAFT_CMDTEST` script types in the chat: the `t` steps between `/` and
+    `enter`. A command edited by other keys (completion, erasing) is left out: its final text is
+    not in the script."""
+    out, typed = [], None
+    for step in script.split("|"):
+        if step == "/":
+            typed = ""
+        elif typed is not None and step.startswith("t") and step != "tab":
+            typed += step[1:]
+        elif typed is not None and step == "enter":
+            out.append(typed)
+            typed = None
+        elif typed is not None and not step.startswith("w"):
+            typed = None
+    return out
+
+
+def flat_world_positions(texts):
+    """Stand-in `scenes.json` positions for the flat test world: every view and pad named in
+    `texts` sits on the crowd pad, so placeholders resolve to coordinates the parser accepts."""
+    x, y, z = FLAT_SITES["crowd"]
+    names = {(kind, name) for t in texts for kind, name, _ in PLACEHOLDER.findall(t)}
+    return {"scenes": {n: {"pos": [x + 0.5, y + 1.0, z + 0.5]} for k, n in names if k == "view"},
+            "sites": {n: FLAT_SITES.get(n, FLAT_SITES["crowd"]) for k, n in names if k == "site"}}
+
+
+def write_chat_commands(out):
+    """`<out>/chat-commands/<scene>.txt`: the staging commands each scene types in the chat, one
+    per line, so that a typo or a command our parser refuses fails a test instead of leaving the
+    scene measuring an empty view."""
+    scripts = {n: sc["cmd"] for n, sc in SCENES.items() if "cmd" in sc}
+    info = flat_world_positions(scripts.values())
+    folder = os.path.join(out, "chat-commands")
+    os.makedirs(folder, exist_ok=True)
+    for name, script in scripts.items():
+        lines = chat_commands(resolve_positions(script, info))
+        with open(os.path.join(folder, f"{name}.txt"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("".join(line + "\n" for line in lines))
+    return len(scripts)
+
+
 def pack_files(a):
-    """The `perf` pack for the flat test world, in `<out>/datapacks/perf`: read by
-    `crates/rc-sim/src/tests_perf_pack.rs` (`RUSTCRAFT_PERF_PACK=<out>/datapacks/perf`)."""
+    """The `perf` pack for the flat test world, in `<out>/datapacks/perf`, and the chat commands
+    of the scenes in `<out>/chat-commands`: read by `crates/rc-sim/src/tests_perf_pack.rs`
+    (`RUSTCRAFT_PERF_PACK=<out>/datapacks/perf`)."""
     write_pack(a.out, FLAT_SITES)
+    write_chat_commands(a.out)
     print(os.path.join(os.path.abspath(a.out), "datapacks", "perf"))
 
 
@@ -1672,8 +1740,7 @@ def micro(a):
     print(micro_table(micro_results(a.files)))
 
 
-def main():
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+def build_parser():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("prepare")
@@ -1697,7 +1764,9 @@ def main():
     r.add_argument("--scenes", default="")
     r.add_argument("--passes", type=int, default=3)
     r.add_argument("--label", default="reference")
-    r.add_argument("--env", action="append", default=[], help="VAR=value added to every launch")
+    r.add_argument("--env", action="append", default=[],
+                   help="VAR=value added to every launch; --env=-VAR removes VAR (the `=` is needed: "
+                        "`--env -VAR` reads -VAR as an option)")
     r.add_argument("--matrix", action="append", default=[], help="VAR=value: switch alone then combined, same exe")
     r.add_argument("--samply", action="store_true", help="records a samply profile per launch")
     r.add_argument("--warmup", type=int, choices=[0, 1], default=1, help="unmeasured warm-up launch per exe")
@@ -1712,7 +1781,12 @@ def main():
     t.add_argument("--label", default="reference")
     t.add_argument("--reanalyse", action="store_true", help="rereads the logs with the current analysis")
     t.add_argument("--cold", action="store_true", help="also counts the cold-cache launches")
-    a = ap.parse_args()
+    return ap
+
+
+def main():
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    a = build_parser().parse_args()
     if a.cmd == "prepare":
         prepare(a)
     elif a.cmd == "seed-model":

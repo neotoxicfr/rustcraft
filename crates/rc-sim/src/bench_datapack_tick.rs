@@ -35,10 +35,33 @@ fn case(name: &str, load: Load) {
     }
     let mobs = p.s.mobs.list.iter().flatten().count();
     assert!(mobs >= 1000, "{name}: {mobs} mobs, the crowd function did not run");
-    let t = bench_kit::time_ticks(&mut p, 40, 200, 3);
+    let t = bench_kit::time_ticks(&mut p, WARMUP_TICKS, MEASURED_TICKS, RUNS);
+    check_workload_ran(&p, name, load);
     bench_kit::report("datapack_tick", name, "mobs", mobs as f64);
     bench_kit::report_timing("datapack_tick", name, &t);
     crate::tests_g3f13::finish(p, dir);
+}
+
+const WARMUP_TICKS: u32 = 40;
+const MEASURED_TICKS: u32 = 200;
+const RUNS: usize = 3;
+
+/// The case measured what it claims: the `#tick` workload ran (its macro wrote 7) and the
+/// command blocks ran every tick (32 of the 256 add 1 to `#blocks`). Without this, a refused
+/// `setblock` or a broken tick tag would leave the case timing the crowd alone.
+fn check_workload_ran(p: &crate::blocks::probe::Probe, name: &str, load: Load) {
+    let score = |holder: &str| p.s.cmd.scores.get(holder, "perf_dp");
+    if load != Load::Crowd {
+        assert_eq!(score("#macro"), Some(7), "{name}: the #tick workload did not run");
+    }
+    if load == Load::CrowdTickAndCommandBlocks {
+        let ticks = i32::try_from(MEASURED_TICKS as usize * RUNS).expect("tick count");
+        let blocks = score("#blocks").unwrap_or(0);
+        assert!(
+            blocks >= 32 * ticks,
+            "{name}: #blocks = {blocks} after {ticks} ticks, the command blocks did not all run"
+        );
+    }
 }
 
 #[test]

@@ -41,3 +41,35 @@ fn perf_pack_functions_compile() {
     crate::tests_g3f13::finish(p, dir);
     assert!(refused.is_empty(), "{} functions refused:\n{}", refused.len(), refused.join("\n"));
 }
+
+/// The staging commands the scenes type in the chat (`pack-files` writes them in
+/// `<out>/chat-commands`, next to the pack): the singleplayer host types them at level 4
+/// (cheats on). A refused one shows an error in the chat and its scene measures an empty
+/// view while nothing fails.
+#[test]
+#[ignore = "needs RUSTCRAFT_PERF_PACK (tools/bench/scenes.py pack-files)"]
+fn scene_chat_commands_compile() {
+    let pack = bench_kit::perf_pack_dir();
+    let folder = pack.parent().and_then(std::path::Path::parent).expect("<out>/datapacks/perf").join("chat-commands");
+    let mut files: Vec<_> = std::fs::read_dir(&folder)
+        .unwrap_or_else(|e| panic!("{}: {e} (run pack-files again)", folder.display()))
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    files.sort();
+    let (p, dir) = bench_kit::flat_world_with_pack("perf-chat-commands", &pack);
+    assert!(p.s.cmd.levels.len() > 4, "command tree missing: nothing was checked");
+    let (mut refused, mut checked) = (Vec::new(), 0);
+    for file in &files {
+        let text = std::fs::read_to_string(file).expect("commands file");
+        for line in text.lines() {
+            checked += 1;
+            if let Err(e) = crate::commands::exec::compile_function(&[line], p.s.cmd.levels.get(4), &p.s.cmd.data) {
+                refused.push(format!("{}: {line}: {e}", file.display()));
+            }
+        }
+    }
+    crate::tests_g3f13::finish(p, dir);
+    assert!(checked >= 100, "only {checked} commands in {} files of {}", files.len(), folder.display());
+    assert!(refused.is_empty(), "{} commands refused:\n{}", refused.len(), refused.join("\n"));
+}

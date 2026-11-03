@@ -367,13 +367,21 @@ class TimedAnalysis(unittest.TestCase):
     TICK = "[perf] server: tick median 1.000 ms, p95 2.000 ms, p99 {} ms, mean 1.100 ms"
 
     def test_tick_reports_dated_by_the_line_before(self):
-        lines = [self.TICK.format("50.0"), "[  20.0 s] 100 fps", self.TICK.format("3.0"), "[  30.0 s] x",
-                 self.TICK.format("9.5"), "[  50.0 s] x", self.TICK.format("4.0")]
-        self.assertEqual(scenes.dated_ticks(lines), [(20.0, 3.0), (30.0, 9.5), (50.0, 4.0)])
-        m = scenes.timed_tick_metrics(lines, lambda t: 25 <= t <= 44, 45)
-        self.assertEqual(m["tick_max_ms"], 9.5)  # the 50 ms before any date (loading) is left out
-        self.assertEqual(m["tick_p99_last_minute_ms"], 6.25)
-        self.assertTrue(math.isnan(scenes.timed_tick_metrics(lines, lambda t: t > 60, 70)["tick_max_ms"]))
+        t = self.TICK.format
+        lines = [t("50.0"), "[  24.0 s] 100 fps", t("3.0"), "[  25.0 s] x", t("9.5"), "[  26.0 s] x",
+                 "[  30.0 s] x", t("7.0"), "[  34.0 s] x",  # client stall inside the window
+                 "[  42.0 s] x", t("80.0"), "[  48.0 s] x",  # stall across the end of the window
+                 t("4.0")]
+        self.assertEqual(scenes.dated_ticks(lines),
+                         [(24.0, 25.0, 3.0), (25.0, 26.0, 9.5), (30.0, 34.0, 7.0), (42.0, 48.0, 80.0), (48.0, None, 4.0)])
+        window = lambda s: 25 <= s <= 44  # noqa: E731
+        m = scenes.timed_tick_metrics(lines, window, 25, 45)
+        # The 50 ms before any date (loading) and the 80 ms of unknown time are left out.
+        self.assertEqual(m["tick_max_ms"], 9.5)
+        self.assertTrue(math.isnan(m["tick_p99_last_minute_ms"]))  # 45 s scene: no full minute after 25 s
+        long = scenes.timed_tick_metrics(lines, window, 25, 90)
+        self.assertEqual(long["tick_p99_last_minute_ms"], 43.5)  # 7.0 and 80.0, both gaps within 29..89 s
+        self.assertTrue(math.isnan(scenes.timed_tick_metrics(lines, lambda s: s > 60, 25, 70)["tick_max_ms"]))
 
     def test_load_and_memory(self):
         ram = ("[perf] [{t:6.1f} s] ram: private 900 MB, allocator {a} MB committed (peak 700), outside the allocator 300 MB; "
@@ -415,6 +423,13 @@ class Launch(unittest.TestCase):
         env = scenes.launch_env(argparse.Namespace(env=[]), {"secs": 45}, "out", "game", "cache", [])
         self.assertEqual(env["RUSTCRAFT_GENLOG"], "1")
 
+    def test_removal_written_as_documented(self):
+        # Through the real parser: the documented spelling must reach launch_env.
+        a = scenes.build_parser().parse_args(["run", "--exe", "a.exe|-RUSTCRAFT_VSYNC", "--env=-RUSTCRAFT_GENLOG"])
+        self.assertEqual((a.env, a.exe), (["-RUSTCRAFT_GENLOG"], ["a.exe|-RUSTCRAFT_VSYNC"]))
+        self.assertNotIn("RUSTCRAFT_GENLOG", scenes.launch_env(a, {"secs": 45}, "out", "game", "cache", []))
+        self.assertIn("--env=-VAR", scenes.__doc__)
+
     def test_groups(self):
         for g, names in scenes.SCENE_GROUPS.items():
             self.assertEqual([n for n in names if n not in scenes.SCENES], [], g)
@@ -432,7 +447,7 @@ class Launch(unittest.TestCase):
                  "fresh-badlands-rd16", "crowd-1000-lan-1", "tnt-lan-1", "lan-4-spread", "redstone-published",
                  "maps-1", "hidden-1", "flight-rotation-32", "ocean-transparency", "survival-hud", "hud-busy", "trade",
                  "tab-80", "chat-flood", "recipe-book", "cmd-give", "stats-screen", "advancements", "f3-open",
-                 "team-crowd", "signs-1", "displays-1", "structure-show-air", "reload-f3t", "multiplayer",
+                 "team-crowd", "signs-chests", "displays-1", "structure-show-air", "reload-f3t", "multiplayer",
                  "world-list", "world-create", "packs-20", "long-flight-save", "village-night", "raid",
                  "crowd-1000-melee", "crowd-1000-archers", "pen-babies", "crowd-villagers", "trial-chamber",
                  "bee-nests-night", "nether-fortress", "end-fight", "swamp-bastion", "survival-inventory", "datapack",
@@ -461,6 +476,28 @@ class Launch(unittest.TestCase):
         self.assertEqual(scenes.parse_run_dir("tab-20-1"), ("tab-20", 1, None))
         self.assertEqual(scenes.parse_run_dir("maps-1-2-0"), ("maps-1", 2, 0))
         self.assertEqual(scenes.parse_run_dir("crowd-1000-lan-1-3"), ("crowd-1000-lan-1", 3, None))
+
+    def test_chat_commands_of_a_script(self):
+        script = "w100|/|tfunction perf:x|enter|w5|/|tgi|tab|enter|o|thello|enter|/|ttp @s |t~ ~1 ~|enter"
+        self.assertEqual(scenes.chat_commands(script), ["function perf:x", "tp @s ~ ~1 ~"])
+
+    def test_chat_commands_written_with_positions(self):
+        with tempfile.TemporaryDirectory(dir=os.path.join(scenes.ROOT, "target")) as out:
+            self.assertEqual(scenes.write_chat_commands(out), sum("cmd" in sc for sc in scenes.SCENES.values()))
+            with open(os.path.join(out, "chat-commands", "first-nether-trip.txt"), encoding="utf-8") as f:
+                self.assertEqual(f.read().splitlines()[0], "execute in minecraft:the_nether run tp @s 64.50 -60.00 8.50")
+            for name in os.listdir(os.path.join(out, "chat-commands")):
+                with open(os.path.join(out, "chat-commands", name), encoding="utf-8") as f:
+                    self.assertIsNone(scenes.PLACEHOLDER.search(f.read()), name)
+
+    def test_every_run_folder_reads_back_to_its_scene(self):
+        # A scene named `<other scene>-<pass number>` makes `<other>-<p>-<e>` ambiguous: the
+        # A/B folder of one scene would be reread as a single-exe pass of the other.
+        for n in scenes.SCENES:
+            for p in range(1, 10):
+                self.assertEqual(scenes.parse_run_dir(f"{n}-{p}"), (n, p, None), n)
+                for e in range(10):
+                    self.assertEqual(scenes.parse_run_dir(f"{n}-{p}-{e}"), (n, p, e), n)
 
 
 class Micro(unittest.TestCase):
