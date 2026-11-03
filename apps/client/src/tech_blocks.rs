@@ -5,11 +5,20 @@
 //! (the state beam goes through `block_entities.rs`).
 
 use hashbrown::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rc_proto::nbt::Nbt;
 
 use crate::debug_render::{DebugLines, Layer};
+use crate::environ::WorldView;
+
+mod cells;
+#[cfg(test)]
+mod cells_tests;
+
+pub use cells::ShowAirCells;
+use cells::{Classifier, MARKER_LINE_WIDTH, marker_corners, marker_style};
 
 /// Display duration of a `/test pos` position.
 const HIGHLIGHT_TIME: Duration = Duration::from_secs(10);
@@ -220,9 +229,10 @@ pub struct TestDef {
     pub rotation: i32,
 }
 
-/// `test_instance` registry received at configuration (id → settings).
+/// `test_instance` registry received at configuration (id → settings), shared by the boxes and the
+/// beams (a clone shares the table).
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct TestDefs(HashMap<String, TestDef>);
+pub struct TestDefs(Arc<HashMap<String, TestDef>>);
 
 impl TestDefs {
     /// Registry entries; content omitted (base pack known): settings of the base pack's only
@@ -241,7 +251,7 @@ impl TestDefs {
             },
             None => TestDef { required: name != "minecraft:always_pass", padding: 0, rotation: 0 },
         };
-        TestDefs(entries.iter().map(|(name, n)| (name.clone(), def(name, n.as_ref()))).collect())
+        TestDefs(Arc::new(entries.iter().map(|(name, n)| (name.clone(), def(name, n.as_ref()))).collect()))
     }
 
     /// Settings of a test; test absent or unknown: required, no margin.
@@ -350,6 +360,8 @@ pub struct TechBlocks {
     pub tests: TestDefs,
     /// `/test pos` positions: absolute block → (relative coordinates, end of display).
     highlights: HashMap<[i32; 3], (String, Instant)>,
+    /// Marker kind of every block state (invisible blocks of the save areas).
+    marker_kinds: Vec<u8>,
 }
 
 impl TechBlocks {
@@ -358,7 +370,7 @@ impl TechBlocks {
             .registry("minecraft:block_entity_type")
             .map(|r| r.entries.iter().map(|n| TechKind::ALL.into_iter().find(|k| k.registry_name() == n)).collect())
             .unwrap_or_default();
-        TechBlocks { types, transaction: -1, ..Default::default() }
+        TechBlocks { types, transaction: -1, marker_kinds: cells::marker_kinds(data), ..Default::default() }
     }
 
     fn kind(&self, k: i32) -> Option<TechKind> {
@@ -477,30 +489,33 @@ pub fn draw_boxes(
     eye: [f64; 3],
     visible: bool,
     render_distance: i32,
-    state: &dyn Fn(i32, i32, i32) -> u32,
+    world: &WorldView<'_>,
     data: &rc_data::VersionData,
 ) {
     if !visible || tech.map.is_empty() {
         return;
     }
     let origin = [eye[0].floor() as i32, eye[2].floor() as i32];
-    let rel = |x: f64, y: f64, z: f64| [(x - f64::from(origin[0])) as f32, y as f32, (z - f64::from(origin[1])) as f32];
+    let to_camera_relative =
+        |x: f64, y: f64, z: f64| [(x - f64::from(origin[0])) as f32, y as f32, (z - f64::from(origin[1])) as f32];
+    let options = lines.show_air.options;
+    let classify = if options.table { Classifier::Table(&tech.marker_kinds) } else { Classifier::Names(data) };
     for (pos, t) in &tech.map {
         if !in_range(t, *pos, eye, render_distance) {
             continue;
         }
-        let (mode, (lp, size)) = match t {
+        let (render_mode, (box_offset, size)) = match t {
             Tech::Structure(s) => (s.render_mode(), s.renderable_box()),
             Tech::TestInstance(i) => (1, i.renderable_box(tech.tests.get(i.test.as_deref()))),
             _ => continue,
         };
-        if mode == 0 || size.iter().any(|&v| v < 1) {
+        if render_mode == 0 || size.iter().any(|&v| v < 1) {
             continue;
         }
-        let p = [pos[0] + lp[0], pos[1] + lp[1], pos[2] + lp[2]];
-        let f = |i: usize, o: i32| f64::from(p[i] + o);
-        let a = rel(f(0, 0), f(1, 0), f(2, 0));
-        let b = rel(f(0, size[0]), f(1, size[1]), f(2, size[2]));
+        let box_start = [pos[0] + box_offset[0], pos[1] + box_offset[1], pos[2] + box_offset[2]];
+        let corner_coord = |i: usize, o: i32| f64::from(box_start[i] + o);
+        let a = to_camera_relative(corner_coord(0, 0), corner_coord(1, 0), corner_coord(2, 0));
+        let b = to_camera_relative(corner_coord(0, size[0]), corner_coord(1, size[1]), corner_coord(2, size[2]));
         // Edges of the origin corner tinted (x red, y green, z blue), then the other nine.
         lines.line(Layer::Depth, a, [b[0], a[1], a[2]], multiply(BOX, 0xFFFF_7777), 2.5);
         lines.line(Layer::Depth, a, [a[0], b[1], a[2]], multiply(BOX, 0xFF77_FF77), 2.5);
@@ -519,41 +534,42 @@ pub fn draw_boxes(
         for (u, v) in edges {
             lines.line(Layer::Depth, u, v, BOX, 2.5);
         }
-        if mode == 2 {
-            invisible_blocks(lines, p, size, state, data, &rel);
+        if render_mode == 2 {
+            if options.instances {
+                lines.show_air.add_area(box_start, size, world);
+            } else {
+                invisible_blocks(lines, box_start, size, world, classify, &to_camera_relative);
+            }
         }
     }
+    lines.show_air.finish_frame(world, classify, origin);
 }
 
 /// Markers of the invisible blocks of a save area (air, structure void, barrier,
-/// light).
+/// light) as twelve segments per cell, built every frame (`RUSTCRAFT_OPT_STRUCTURE_CELL_INSTANCES=0`).
 fn invisible_blocks(
     lines: &mut DebugLines,
     start: [i32; 3],
     size: [i32; 3],
-    state: &dyn Fn(i32, i32, i32) -> u32,
-    data: &rc_data::VersionData,
-    rel: &dyn Fn(f64, f64, f64) -> [f32; 3],
+    world: &WorldView<'_>,
+    classify: Classifier<'_>,
+    to_camera_relative: &dyn Fn(f64, f64, f64) -> [f32; 3],
 ) {
     for x in 0..size[0] {
         for y in 0..size[1] {
             for z in 0..size[2] {
                 let (bx, by, bz) = (start[0] + x, start[1] + y, start[2] + z);
-                let Some(b) = data.block_of(state(bx, by, bz)) else { continue };
-                let (color, scale) = match b.name.as_str() {
-                    "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air" => (0xFF7F_7FFF, 0.05),
-                    "minecraft:structure_void" => (0xFFFF_BFBF, 0.0),
-                    "minecraft:barrier" => (0xFFFF_0000, 0.0),
-                    "minecraft:light" => (0xFFFF_FF00, 0.0),
-                    _ => continue,
+                let kind = classify.kind(world.state(bx, by, bz));
+                if kind == cells::NOT_MARKED {
+                    continue;
+                }
+                let (color, growth) = marker_style(kind);
+                let (lo, hi) = marker_corners(growth);
+                let corner = |v: f32| {
+                    let v = f64::from(v);
+                    to_camera_relative(f64::from(bx) + v, f64::from(by) + v, f64::from(bz) + v)
                 };
-                let lo = 0.45f32 - scale;
-                let hi = 0.55f32 + scale;
-                let min =
-                    rel(f64::from(bx) + f64::from(lo), f64::from(by) + f64::from(lo), f64::from(bz) + f64::from(lo));
-                let max =
-                    rel(f64::from(bx) + f64::from(hi), f64::from(by) + f64::from(hi), f64::from(bz) + f64::from(hi));
-                lines.cuboid(Layer::Depth, min, max, color, 2.5);
+                lines.cuboid(Layer::Depth, corner(lo), corner(hi), color, MARKER_LINE_WIDTH);
             }
         }
     }

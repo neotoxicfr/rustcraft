@@ -854,9 +854,8 @@ impl App {
             let view =
                 environ::WorldView { grid: &self.world.grid, min_y: self.world.min_y, height: self.world.height };
             let visible = self.env.game_mode == 3 || (self.env.game_mode == 1 && self.debug.op_level >= 2);
-            let state = |x, y, z| view.state(x, y, z);
             let rd = self.options.i("renderDistance").min(self.env.server_view.max(2));
-            tech_blocks::draw_boxes(&mut r.debug_lines, &self.tech, shot.pos, visible, rd, &state, &self.data);
+            tech_blocks::draw_boxes(&mut r.debug_lines, &self.tech, shot.pos, visible, rd, &view, &self.data);
             let q = r.queue_handle();
             let now = std::time::Instant::now();
             tech_blocks::draw_markers(&mut r.debug_lines, &mut r.gui, &q, &mut self.tech, shot.pos, rd, now);

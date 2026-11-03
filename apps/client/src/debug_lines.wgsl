@@ -48,7 +48,11 @@ fn vs(
     @location(2) color: vec4<f32>,
     @location(3) width: f32,
 ) -> Out {
-    let k = array<u32, 6>(0u, 1u, 2u, 2u, 1u, 3u)[vi];
+    return segment_vertex(array<u32, 6>(0u, 1u, 2u, 2u, 1u, 3u)[vi], a, b, color, width);
+}
+
+// Corner `k` (0..3) of the quadrilateral of segment `a`-`b` (shared with tech_cells.wgsl).
+fn segment_vertex(k: u32, a: vec3<f32>, b: vec3<f32>, color: vec4<f32>, width: f32) -> Out {
     let e = cam.eye.xyz;
     var o: Out;
     o.color = color;

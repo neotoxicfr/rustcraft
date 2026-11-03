@@ -4177,3 +4177,60 @@ stays behind its switch (`=0`: old path).
   version name in the game, "unknown" here; a failed access when opening Edit makes the game
   re-read the list (toast only here); the game's backup walks the folder in its listing order
   (entry order differs here, same content).
+## C4-M37: invisible blocks of a structure block's save area, one GPU instance per cell (03/11, loaded machine)
+
+Structure block in save mode with "show air": a small cube outline on every air, structure void,
+barrier and light cell of the area (up to 48³ = 110,592 cells). Before: every frame, a state read
+and four block-name comparisons per cell, then twelve debug segments per marked cell (near-plane
+cut on the CPU) and their upload. After: one 16-byte instance per marked cell (absolute block,
+kind) that `tech_cells.wgsl` widens into the twelve edges with the debug segments' own function
+(same corners, colours, 2.5 px, cut at 0.1 block in front of the eye); the instances stay on the
+GPU while the areas and the stamps of the columns they cover are unchanged. Micro-bench
+`tech_blocks::cells_tests::bench_show_air_frames` (`cargo test --release -p rc-app bench_show_air
+-- --ignored --nocapture`, RTX 5080 Vulkan, 48³ area of air seen from outside, median of 30
+frames; GPU = submit and wait of the pass minus an empty pass, 512 × 512):
+
+| Variant (switches) | CPU per frame (boxes + upload) | Sent per frame | GPU pass |
+|---|---|---|---|
+| Old: segments, names (`..._CELL_INSTANCES=0`, `..._MARKER_TABLE=0`) | 65.7 ms | 42.47 MB | 1.13 ms |
+| Segments, byte table (`..._CELL_INSTANCES=0`) | 64.2 ms | 42.47 MB | 1.26 ms |
+| Instances, walk every frame (`..._CELL_CACHE=0`) | 0.576 ms | 1.77 MB | 0.587 ms |
+| Instances, cache (default) | 0.020 ms | 96 B | 0.586 ms |
+| Instances, cache, parallel walk (`..._PARALLEL_WALK=1`) | 0.021 ms | 96 B | 0.540 ms |
+
+- Memory: the old segment buffer grew to 64 MB of VRAM (power of two above 42.5 MB) and the
+  segment lists kept 42 MB of RAM capacity after a show-air session; now a 2 MB instance buffer and
+  1.77 MB of cells. Same vertex count (72 per cell either way); the GPU gain comes from 16 bytes
+  read per cell instead of 384.
+- Rebuild after a change in a covered column (block, light, biome or column packet), walk alone
+  (`bench_show_air_walk`, random area): names 2.35 ms, byte table 1.40 ms on one thread; parallel
+  walk 1.46 / 0.84 / 0.45 / 0.47 / 0.47 / 0.48 ms on 1 / 2 / 4 / 8 / 16 / 32 threads (no gain past
+  4: small work). All-air area: 0.58 ms including the 1.77 MB upload. The parallel walk stays off
+  by default: the walk only runs after a change, and the pool is the meshing one, whose queued
+  jobs the main thread would wait behind (risk on p99 during chunk loading); to re-measure on a
+  quiet machine with chunks loading.
+- Equivalence: `cell_list_matches_the_old_outline_list` (list (cell, colour, growth) equal to the
+  old algorithm, three areas, table and parallel on and off), `cached_cells_follow_100_changes`
+  (blocks set, covered column removed and put back, far column replaced, frames without change:
+  list equal to a fresh rebuild every frame, rebuild exactly when a covered column changed),
+  `marker_table_matches_the_names` (every state), `instanced_cells_draw_the_segment_image_on_vulkan`
+  and `..._on_dx12`: five views (outside, inside, eye inside a cube, edges behind the eye, eye 0.04
+  block beside an edge crossing the cut plane), 0 pixel different on both backends (93 k to 455 k
+  segments dropped behind the eye depending on the view). Sabotages seen: an edge corner changed
+  in the shader (29,141 px), stamps left out of the key, light missing from the table, parallel
+  slices in reverse order, cut plane at 0.11 (423 px on the edge view).
+- Leads not taken: an 8-byte instance (offset in the area + area index): nothing gained per frame,
+  the buffer is only rewritten after a change; incremental rebuild per column (re-walk only the
+  column whose stamp changed, about a ninth of the area): not done, the rebuild is already an
+  event of 0.6 to 1.4 ms; walk off the main thread: the markers would lag a few frames behind a
+  block change while meshing jobs are queued. Error texts of the test instances cached per
+  language: needs a language-change signal from the interface (about 1 µs per marker per frame,
+  only while a failed test is shown). Raw block-entity data kept only for F3+I: not possible
+  without changing what F3+I+Shift copies when operator rights are granted later.
+- Also: the `test_instance` settings shared by the boxes and the beams (`Arc`, cloned twice
+  before), the interactions no longer copy the 1,700 names of the sound registry (read from the
+  version data when a patched `consumable` is decoded; same copy left in `commands.rs` for the
+  command data).
+- To re-measure on a quiet machine: scene `structure-show-air` of `tools/bench/scenes.py` (to add:
+  48³ save area with show air, camera outside then inside), CPU of the boxes and upload, bytes
+  sent, GPU time of the segment pass, p99 of the frame.
