@@ -58,11 +58,11 @@ fn frozen_table_is_the_game_table() {
     assert_ne!(table_hash(&sabotaged), GAME_TABLE_HASH, "sabotage not detected");
 }
 
-/// The C library tables, as every old copy computed them. Bit for bit on Windows; the C library
-/// of other systems is only reported (known gap between the libraries' sines).
 /// Entry `i` of a sine table.
 type EntryFormula = fn(usize) -> f32;
 
+/// The C library tables, as every old copy computed them. Bit for bit on Windows; the C library
+/// of other systems is only reported (known gap between the libraries' sines).
 #[test]
 fn frozen_table_equals_every_old_formula() {
     let formulas: [(&str, EntryFormula); 4] = [
@@ -109,27 +109,35 @@ fn sin_arguments() -> Vec<f64> {
     args
 }
 
-/// Index and value as the game reads them: the long conversion saturates (NaN gives 0).
-fn game_sin(x: f64) -> f32 {
-    FROZEN_SIN_TABLE[((x * 10_430.378_350_470_453) as i64 & 65_535) as usize]
+/// Entry `i` of a source, read without its index code: the reference compares each source with
+/// itself, so the index is proven on every system (the C library may differ from the frozen
+/// table outside Windows; that equality is the subject of the test above).
+fn source_entry(source: SinSource, i: usize) -> f32 {
+    source.table().map_or_else(|| library_entry(i), |table| table[i])
 }
 
-fn game_cos(x: f64) -> f32 {
-    FROZEN_SIN_TABLE[((x * 10_430.378_350_470_453 + 16_384.0) as i64 & 65_535) as usize]
+/// Index and value as the game reads them: the long conversion saturates (NaN gives 0).
+fn game_sin(x: f64, source: SinSource) -> f32 {
+    source_entry(source, ((x * 10_430.378_350_470_453) as i64 & 65_535) as usize)
+}
+
+fn game_cos(x: f64, source: SinSource) -> f32 {
+    source_entry(source, ((x * 10_430.378_350_470_453 + 16_384.0) as i64 & 65_535) as usize)
 }
 
 #[test]
 fn every_source_reads_the_same_entries() {
+    let selected = SinSource::selected();
     for x in sin_arguments() {
         for source in SinSource::ALL {
-            assert_eq!(sin_with(x, source).to_bits(), game_sin(x).to_bits(), "sin {x} {source:?}");
-            assert_eq!(cos_with(x, source).to_bits(), game_cos(x).to_bits(), "cos {x} {source:?}");
+            assert_eq!(sin_with(x, source).to_bits(), game_sin(x, source).to_bits(), "sin {x} {source:?}");
+            assert_eq!(cos_with(x, source).to_bits(), game_cos(x, source).to_bits(), "cos {x} {source:?}");
         }
-        assert_eq!(sin(x).to_bits(), game_sin(x).to_bits(), "sin {x}");
-        assert_eq!(cos(x).to_bits(), game_cos(x).to_bits(), "cos {x}");
+        assert_eq!(sin(x).to_bits(), game_sin(x, selected).to_bits(), "sin {x}");
+        assert_eq!(cos(x).to_bits(), game_cos(x, selected).to_bits(), "cos {x}");
     }
     assert_eq!(sin(f64::NAN), 0.0);
-    assert_eq!(sin(f64::INFINITY), FROZEN_SIN_TABLE[65_535]);
+    assert_eq!(sin(f64::INFINITY), source_entry(selected, 65_535));
     assert_eq!(sin(f64::NEG_INFINITY), 0.0);
 }
 

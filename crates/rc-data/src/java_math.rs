@@ -251,7 +251,7 @@ fn floor_by_shift(v: f64) -> f64 {
 /// 2^52: from there up every double is an integer.
 const TWO_POW_52: f64 = 4_503_599_627_370_496.0;
 
-/// The game's floor of a double, bits included: a negative value above -1 gives -0, NaN stays NaN.
+/// The game's floor of a double, bits included: -0 stays -0, NaN stays NaN (made quiet).
 #[inline]
 pub fn floor(v: f64) -> f64 {
     // NaN fails the test too, the infinities are beyond.
