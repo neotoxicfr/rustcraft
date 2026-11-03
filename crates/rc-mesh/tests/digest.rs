@@ -12,7 +12,9 @@
 //! branch whose `src/` differs from 08df4a1 only by the addition of `digest` and the removal of the
 //! wireframe (no line of the textured mesher or of `MeshJob` touched). Replaced by G2-F12
 //! (intended fix: canonical vertex order of the turned faces, `bake.rs`); with that
-//! fix alone turned off, the old values all passed again.
+//! fix alone turned off, the old values all passed again. Replaced by C7-M05 (intended fix: the
+//! fluid flow angle widened before the sine table product, as the game does); with the old
+//! single-precision product, the previous values all passed again.
 //!
 //! These values are those of the old format (`old_job`); the compact formats (C3-M03) have
 //! their own fingerprint (`EXPECTED_COMPACT`).
@@ -31,15 +33,15 @@ use rc_mesh::wire::{MeshJob, SHADE_NETHER, Sections};
 
 /// Expected fingerprints, per variant.
 const EXPECTED: &[(&str, u64)] = &[
-    ("default", 0xa1ec_3f83_bb51_b4b8),
-    ("blend 0", 0x4d9c_04ac_e557_a9c9),
-    ("blend 1", 0x5f7e_0e78_ed08_6d0a),
-    ("blend 7", 0x3a99_5f2c_8626_6b59),
-    ("no occlusion", 0x34cf_e294_3531_8947),
-    ("opaque leaves", 0x3577_3532_ca5a_0ed0),
-    ("no sky, nether shading", 0xd11d_801f_f21f_f42c),
-    ("absent columns as desert", 0x0517_1882_b549_0701),
-    ("partial remesh", 0xa1ec_3f83_bb51_b4b8),
+    ("default", 0xc0ea_08e4_4cd0_5ccc),
+    ("blend 0", 0x05fe_3c17_f080_dbd5),
+    ("blend 1", 0x8f2a_453b_0c80_19ce),
+    ("blend 7", 0xb434_8261_bf91_76bd),
+    ("no occlusion", 0x1e68_6311_8e06_dfe3),
+    ("opaque leaves", 0xf645_6528_fb83_128c),
+    ("no sky, nether shading", 0x470d_58fa_0bb0_ab98),
+    ("absent columns as desert", 0xb3ba_868f_7cdf_6e9d),
+    ("partial remesh", 0xc0ea_08e4_4cd0_5ccc),
 ];
 
 /// Inputs of the computation: ((size, fingerprint) of the capture, number of states, number of biomes).

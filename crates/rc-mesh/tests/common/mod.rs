@@ -23,8 +23,10 @@ pub const MIN_Y: i32 = -64;
 pub const ZOOM_SEED: i64 = 293_737_985_876_514_017;
 /// Fingerprint of the compact formats over the whole capture, default settings (default since
 /// C3-M03): single source of `tests/digest.rs` and `tests/light_paths.rs`. Replaced by G2-F12
-/// (canonical vertex order of the turned faces, `bake.rs`).
-pub const EXPECTED_COMPACT: u64 = 0xed99_c527_6a39_023e;
+/// (canonical vertex order of the turned faces, `bake.rs`), then by C7-M05 (fluid flow angle widened
+/// before the sine table product, as the game does; with the old single-precision product every
+/// previous value passed again).
+pub const EXPECTED_COMPACT: u64 = 0xac72_bdc3_1c59_1906;
 
 /// Index of `minecraft:plains` in the data's biomes, set by `load()` (the game puts it
 /// in each task: biome of absent columns).
