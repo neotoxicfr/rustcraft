@@ -3509,3 +3509,51 @@ rounds, minimum of 5 passes of 400 ticks per scene, loaded machine (other agents
   test of a vehicle's passengers runs only when frozen, the plates also scan the server's item
   and orb lists during a series (empty unless something was born in it), a parked world is
   swept once per family after the player leaves (O(its entities), then a bit test per tick).
+
+## C1-M07: state transformation tables off the critical path (03/11, loaded machine)
+
+The five tables (quarter, half, three-quarter turn; left-right and front-back mirror) of every
+block state were rewritten as text, state by state (≈ 30,000 states × 5, a `Vec` and three
+`String`s per property, a map of the sides, a formatted value), inside `WorldData::load`: in
+"generator ready" and at every world (re)opening. Switches, default = new, `=0` = old:
+- `RUSTCRAFT_OPT_COMPOSE_ROTATIONS`: half turn = quarter ∘ quarter, three quarters = quarter ∘
+  half; mirrored stairs read the half-turn table instead of turning again.
+- `RUSTCRAFT_OPT_TRANSFORMS_PER_BLOCK`: rules worked out once per block (new value index for
+  each value index; the sides take the value of the side that turns onto them; mirrored stairs
+  by their facing and shape), then applied to its states by index.
+- `RUSTCRAFT_OPT_PARALLEL_TRANSFORMS=1` (default OFF): blocks and states across the rayon pool,
+  only on the inline build (a build in the background cell stays sequential: its waiters block
+  inside the cell).
+- `RUSTCRAFT_OPT_TRANSFORMS_IN_BACKGROUND`: `0` inline, `rayon` a pool task, otherwise a dedicated
+  thread (default); the first use waits for the build, or does it if it has not started.
+- `RUSTCRAFT_OPT_KEEP_TRANSFORMS`: tables (≈ 0.6 MB) kept by the process by jar and version, a
+  world opened again skips the build although its generation data are rebuilt.
+
+Proof: `state_transforms_fast_matches_old` compares the 16 combinations of the four build leads
+with the old build state by state, and the old build with the stored fingerprint;
+`state_tables_off_the_critical_path` checks the three places of the build and the kept tables.
+Six sabotages fail them (front-back mirror composed from left-right and a half turn, ascending
+rail not turned, hinge not swapped, axis turned by a half turn, per-block rules read from the
+partly rewritten state, kept tables not stored).
+
+| Tables, 1 thread (ms, best of 5) | |
+|---|---|
+| old | 93.5 |
+| blocks without an oriented property copied (`STATETRANS_FAST`, main) | 89.0 |
+| composed rotations alone / + copy | 50.4 / 48.6 |
+| per block alone / + copy | 3.6 / 3.5 |
+| composed + per block (default) | 1.97 |
+
+Parallel build, rayon pool of 1, 2, 4, 8, 16, 32 threads: 2.06, 1.13, 0.70, 0.79, 0.87, 1.28 ms:
+less than 10 ms remain after the two first leads, so it stays off (−1.3 ms at best, inline path
+only). Processor tables built alongside: 0.05 ms. Generation data (`examples/worlddata`, load
+from the jar index, min of 7, 2 passes): main 91.6 / 99.7 ms; composed + per block, inline 14.3 /
+13.3; + background thread 11.4 / 11.6; + kept 12.7 / 11.5 (the remaining ≈ 2 ms build is in the
+background already: within noise here, kept for the reopening). Background while the stronghold
+rings occupy the rayon pool (as in the generator start): call returns in 0.01-0.05 ms instead of
+2.3-3.5; dedicated thread and pool task indistinguishable (tables ready 43-44 / 41-43 ms, the rings
+finishing first). GPU: not applicable (≈ 2 ms of branches over text values, once). To settle on
+the quiet-machine scene bench: "generator ready", first batch and in-game times of `generation`
+(dedicated thread against `rayon` against `0`), `plains12` and `crowd` as controls.
+Lead not done: read the tables from the official game through the extractor (each state as the
+game itself turns and mirrors it; a data change for ≈ 2 ms left).
