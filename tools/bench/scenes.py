@@ -742,6 +742,10 @@ SCENE_GROUPS = {
                            "inventory", "pause-enchanted", "building", "vsync"],
     "generation": ["fresh-nether-rd16", "fresh-swamp-rd16", "fresh-badlands-rd16", "fresh-taiga-rd16",
                    "fresh-village-rd16", "fresh-forest-rd16", "fresh-ocean-rd16", "fresh-mountain-rd16"],
+    # Generation measured end to end (profile with `--samply`, then `tools/hot_map.py`): the
+    # 1-thread run gives clean self times, the fresh flights steady generation inside the window.
+    "generation-zone": ["generation", "generation-1thread", "fresh-village-rd16", "fresh-ocean-rd16",
+                        "fresh-mountain-rd16", "crowd"],
     "first-use": ["first-locate", "first-place", "first-bonemeal", "first-ender-eye", "first-nether-trip"],
     "render": ["maps-1", "hidden-1", "flight-rotation-32", "ocean-transparency", "forest-transparency",
                "village-transparency"],
@@ -963,6 +967,11 @@ INGAME = re.compile(r"\[perf\] in game at (\d+) ms")
 LOADED = re.compile(r"\[perf\] initial load meshed at (\d+) ms")
 FIRST = re.compile(r"first frame: (\d+) ms")
 GEN = re.compile(r"singleplayer: generated (\d+) chunks in ([\d.]+) ms")
+# Phases of a generation batch and steps of the generator setup (`rc-sim/src/generation_timing.rs`).
+GEN_BATCH = re.compile(r"generation batch \d+: (\d+) chunks, ([\d.]+) ms, \d+ threads; phases ms: (.*?); "
+                       r"single-threaded ([\d.]+) ms")
+GEN_SETUP = re.compile(r"singleplayer: generator minecraft:overworld setup ms: (.*)")
+NAMED_MS = re.compile(r"([a-z][a-z ,-]*?) ([\d.]+)(?:, |$)")
 HEAP = re.compile(r"Rust heap: ([\d.]+) MB")
 # Cache of the resources baked at startup (`resources.rs`): "to write" = cold launch.
 COLD = re.compile(r"resources: \d+ pack\(s\), cache (valid|to write)")
@@ -1061,6 +1070,28 @@ def memory_metrics(lines, win):
     }
 
 
+def generation_phase_metrics(lines):
+    """Split of the generation batches (every batch, like `gen_ms_per_chunk`): ms per chunk of
+    each phase, share of the single-threaded phases (what more threads cannot shorten), and the
+    steps of the first overworld generator setup."""
+    phases, single, chunks, total = {}, 0.0, 0, 0.0
+    for b in (GEN_BATCH.search(l) for l in lines):
+        if not b:
+            continue
+        chunks += int(b.group(1))
+        total += float(b.group(2))
+        single += float(b.group(4))
+        for name, ms in NAMED_MS.findall(b.group(3)):
+            phases[name] = phases.get(name, 0.0) + float(ms)
+    m = {f"gen:{name} ms/chunk": ms / chunks for name, ms in phases.items()} if chunks else {}
+    if total > 0:
+        m["gen:single-threaded %"] = 100.0 * single / total
+    setup = next((s for s in (GEN_SETUP.search(l) for l in lines) if s), None)
+    for name, ms in NAMED_MS.findall(setup.group(1)) if setup else []:
+        m[f"gen setup:{name} ms"] = float(ms)
+    return m
+
+
 def analyse(log_path, frames_path, frm, secs):
     with open(log_path, encoding="utf-8", errors="replace") as f:
         lines = f.read().splitlines()
@@ -1124,6 +1155,7 @@ def analyse(log_path, frames_path, frm, secs):
     m["gen_first_batch_ms"] = float(ge[0].group(2)) if ge else float("nan")
     gen_ms = sum(float(x.group(2)) for x in ge)
     m["gen_chunks_s"] = m["generated"] * 1e3 / gen_ms if gen_ms > 0 else float("nan")
+    m.update(generation_phase_metrics(lines))
     ta = [x for x in (HEAP.search(l) for l in lines) if x]
     m["heap_mb"] = med([float(x.group(1)) for x in ta[-10:]])
     m["last_mesh_ms"] = m["last_mesh_s"] * 1e3
@@ -1529,7 +1561,7 @@ def kept(name, runs, include_cold=False):
 def table(res, include_cold=False):
     res = {k: v for k, v in res.items() if k != "exe"}
     rows = ["| measurement | " + " | ".join(res) + " |", "|---|" + "---|" * len(res)]
-    dyn = sorted({k for runs in res.values() for r in runs for k in r if k.startswith(("startup:", "c:"))})
+    dyn = sorted({k for runs in res.values() for r in runs for k in r if k.startswith(("startup:", "c:", "gen:", "gen setup:"))})
     for k, label, fmt in KEYS + [(k, k, ".1f") for k in dyn]:
         cells = []
         for n, runs in res.items():

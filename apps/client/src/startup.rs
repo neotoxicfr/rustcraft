@@ -77,6 +77,8 @@ pub(crate) fn run() {
         .expect("compute pool");
 
     let started = Instant::now();
+    // Generation batch lines dated like the client's `[perf] [t s]` lines (bench window).
+    rc_sim::generation_timing::set_log_origin(started);
     boot::start();
     boot::mark("entering main");
     let data = Arc::new(rc_data::load_or_prepare("26.3", |s| eprintln!("data: {s}")).unwrap_or_else(|e| {

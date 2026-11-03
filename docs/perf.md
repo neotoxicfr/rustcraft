@@ -4551,3 +4551,66 @@ the quiet-machine scene bench: "generator ready", first batch and in-game times 
 (dedicated thread against `rayon` against `0`), `plains12` and `crowd` as controls.
 Lead not done: read the tables from the official game through the extractor (each state as the
 game itself turns and mirrors it; a data change for ≈ 2 ms left).
+
+## C1-M01 (series 3): measuring generation, prerequisite of the zone (03/11, loaded machine)
+
+Measurement only, no switch: nothing generated, written or relit changes.
+
+**Whole-length profiles.** `python -I tools/hot_map.py target/perf/avant-optim-main-profils <out>
+target/perf/ref-main/rustcraft.pdb --whole-profile` over the main bench profiles. The windowed v3
+map sees rc_worldgen at 0.0 % because generation ends before the window; over the whole profile it
+is 11.3 % of the process CPU in `generation` (crowd 4.6, dropped-items 5.0, equipped-humanoids 5.0,
+redstone 4.9, tnt 4.6, crowd-1000 4.2; pregenerated scenes ≈ 2 % or less). `generation`, inclusive:
+terrain 9.75 % (column generation 8.70, structure references 13 % of terrain), stronghold ring
+search 1.93, full light of the new chunks 1.09, decoration only 0.41, conversion to a full chunk
+0.24, structure starts NBT 0.14, proto NBT 0.12, generator setup 0.16. Self time: surface material
+1.81, density volume 1.33, light propagation 0.98, Perlin (y precomputed, AVX2) 0.90, Perlin 512
+table 0.90, biome distances 0.53, aquifer window 0.49. In `crowd` the ring search (1.76 %) is the
+largest worldgen item. No `generation-1thread` profile exists in that folder: to record.
+
+**Per-phase clocks of a batch** (`crates/rc-sim/src/generation_timing.rs`, under `RUSTCRAFT_GENLOG`,
+which the bench launches with). One dated line per batch, `[perf] [t s] generation batch N: …`
+(dated from the client's `main` like its other `[perf]` lines): wall ms of load, biomes, terrain,
+bookkeeping, decoration, post-processing, light and conversion, relight, sending, proto-chunks,
+eviction (consecutive laps: they add up to the batch), the single-threaded share (bookkeeping,
+post-processing, sending, eviction), wall ms and region count of each decoration class, light CPU
+(process-wide `rc_light::stats`) of the post-processing (mushroom chunks), new and relit chunks.
+Generator setup: one line `generator <dim> setup ms:` with game data, dimension generator,
+structures, stronghold rings, then the block-state and light tables built after "generator ready"
+(that reading is unchanged). `tools/bench/scenes.py` turns them into `gen:<phase> ms/chunk`,
+`gen:single-threaded %` and `gen setup:<step> ms` columns; `@generation-zone` groups the zone's
+scenes (generation, generation-1thread, fresh village / ocean / mountain rd16, crowd) for the
+quiet-machine samply pass. Cost: 3.0 µs per batch with the log on (laps, nine classes, the line
+built; ≈ 0.01 % of a 37 ms batch), 0.03 µs off (`bench_batch_clock_cost`).
+
+Proof: `batch_timing_changes_nothing` generates the same walk timed and untimed (eager writes
+without cap; lazy writes, cap 16, saves) and compares every full chunk, light, relight count and
+proto-chunk; every timed batch must add up and count the light of its new and relit chunks in its
+own phases. Sabotages caught: relights not sent when timed (7 chunks differ); the light lap set
+before the light loop (light of 9 new chunks outside its phase); the bench parser without `-` in
+phase names (`proto-chunks` missing).
+
+Micro-bench `bench_batch_phases_by_threads` (test build: every chunk lit twice by the scan check,
+so light reads about double; loaded machine, 12 rows of 24 chunks, ms per chunk):
+
+| threads | total | terrain | biomes | decoration | post-processing | light and conversion | single-threaded |
+|---|---|---|---|---|---|---|---|
+| 1 | 20.72 | 13.39 | 1.33 | 2.42 | 0.46 | 3.12 | 2.2 % |
+| 2 | 9.42 | 5.92 | 0.57 | 1.11 | 0.40 | 1.41 | 4.2 % |
+| 4 | 5.22 | 3.07 | 0.29 | 0.73 | 0.38 | 0.75 | 7.3 % |
+| 8 | 2.95 | 1.57 | 0.16 | 0.46 | 0.35 | 0.40 | 11.8 % |
+| 16 | 2.81 | 1.42 | 0.12 | 0.54 | 0.38 | 0.34 | 13.5 % |
+| 32 | 3.19 | 1.45 | 0.18 | 0.61 | 0.47 | 0.44 | 14.8 % |
+
+Reading (to confirm on the quiet machine, other agents were compiling): past 8 threads nothing
+shortens. The single-threaded post-processing stays at ≈ 0.4 ms per chunk whatever the thread
+count: it is the light of the chunks with marked mushrooms (1.1-1.9 ms each, up to 4 per 9-chunk
+batch, up to 7.6 ms of a 45 ms batch in `batch_timing_changes_nothing`), run one after the other on
+the generation thread. Decoration can only use as many threads as a class has regions (1 to 4 in
+a 9-chunk batch, about 8 in a 24-chunk one), and grows past 8 threads. Leads for the zone's
+missions: light the mushroom chunks of a batch in parallel before their post-processing (only once
+proved that the post-processing of one target never changes blocks the light of another reads; the
+loop runs them in order today), and give
+decoration more regions per class (larger batches or overlapping the classes of two batches).
+Not done here (client and samply forbidden during the series): the samply pass of
+`@generation-zone` and samply on the terrain, density and biome micro-benches at 1..32 threads.
