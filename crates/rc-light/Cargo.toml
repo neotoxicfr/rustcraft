@@ -21,7 +21,7 @@ memstats = []
 rc-testdata.workspace = true
 rc-proto.workspace = true
 rc-proto-v777.workspace = true
-criterion = { version = "0.8.2", default-features = false }
+criterion.workspace = true
 mimalloc.workspace = true
 
 [[bench]]

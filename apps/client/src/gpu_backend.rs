@@ -286,6 +286,18 @@ mod tests {
         assert_eq!(order(Some("vulkan"), "opengl"), &[wgpu::Backends::VULKAN]);
     }
 
+    /// wgpu is built without its OpenGL and WebGPU backends (workspace `Cargo.toml`): `order` never
+    /// asks for them and they weighed 450 KiB of code. Fails if a dependency turns them back on.
+    #[test]
+    fn only_the_tried_backends_are_compiled() {
+        let compiled = wgpu::Instance::enabled_backend_features();
+        let unused = wgpu::Backends::GL | wgpu::Backends::BROWSER_WEBGPU;
+        assert!(!compiled.intersects(unused), "unused wgpu backends compiled in: {compiled:?}");
+        if cfg!(windows) {
+            assert_eq!(compiled, wgpu::Backends::VULKAN | wgpu::Backends::DX12);
+        }
+    }
+
     /// Vendor names of the game, hexadecimal otherwise; Vulkan driver line with the API version.
     #[test]
     fn adapter_text_like_the_game() {

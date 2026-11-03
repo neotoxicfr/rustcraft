@@ -15,7 +15,7 @@ thiserror.workspace = true
 [dev-dependencies]
 rc-data.workspace = true
 rc-testdata.workspace = true
-criterion = { version = "0.8.2", default-features = false }
+criterion.workspace = true
 mimalloc.workspace = true
 rayon.workspace = true
 libdeflater.workspace = true
