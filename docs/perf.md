@@ -302,7 +302,8 @@ combined: ruled out, code removed (C3, B7). To re-measure if a context lives acr
 
 Reintroduced (C1-M05B, 23/10): a removal on a loaded-machine measurement goes against C6. Code
 restored identically, next to the PINNED rule, behind `RUSTCRAFT_OPT_VOL_POOL` and
-`RUSTCRAFT_OPT_SPLINE_STACK`, default OFF (`=1` enables) until the quiet-machine bench. Equivalence:
+`RUSTCRAFT_OPT_SPLINE_STACK`, default OFF (`=1` enables) until the quiet-machine bench (SPLINE_STACK on
+by default since C1-M13, measured on the point paths, see below). Equivalence:
 `sampler_opt`, 6 variants (each lead alone, RANGE_YVOL + each one, all), buffers given back to the
 context after each volume; sabotages verified (cache lent without checking the volume's shape:
 up to 92,160 differences per volume; point spline that only reads its 1st coordinate: 4 tests
@@ -409,6 +410,50 @@ them the same treatment, with its proof of equivalence; protocol item B6 stays o
 `MatState::buf`); structures (`structure.rs`), monuments (`structure_monument.rs`), `/locate`
 (`rc-sim` `cmds_locate.rs`) and the debug screen (`rc-sim` `gen_debug.rs`) take a new context per
 call, so they keep the cost of a fresh context (41.9 allocations, 2 MB per chunk-sized volume).
+
+### Density evaluator: column probes, splines, sub-lattice reads (C1-M13, 03/11/2026, counts and micro-bench, loaded machine)
+
+Counted first (`sampler_opt::point_evaluation_census`, 64 chunks, seed 42, per chunk, deterministic;
+`sampler::count_evaluations` turns per-thread counters on, off in the game: one static load and a
+branch per counting site). Overworld: the aquifer's creation probes the top surface 121 times, one
+probe per column of its 11 × 11 quart grid, with 0 point noise and 0 spline: the 2D caches (offset,
+factor) answer from the buffer their upper-bound volume just filled (242 reads). The game's slice
+rule already reads a 2D child of a 3D parent at y = 0, so the probes of a column share the cache
+key. The filling then evaluates 488 point noises and 140 splines (the aquifer's cells, at random
+x, z: nothing to share per column); 16 base heights cost 63 noises, 24 splines and 61 probes each.
+
+| Lead | Switch (default) | Result | Decision |
+|---|---|---|---|
+| Sub-lattice cache read: a cache whose input is exact serves a volume whose points it holds (the final density's 5 × 5 corners inside the aquifer's 11 × 11 grid, the surface's step-16 corners), then holds that volume as if it had computed it | `RUSTCRAFT_OPT_SUBLATTICE_CACHE_READ` (1) | filling: cache volumes computed 23.0 → 16.0, 8,447 → 8,272 values; surface 9.0 → 2.0; 16 base heights 374 → 262, 21,316 → 20,952 values. Aquifer + final density, 1 thread, 12 alternated rounds: 0.974 / 0.999 → 0.956 / 0.982 ms (min / median, −1.8%); 32 threads 0.078-0.082 either way | kept |
+| Column memo: a cache whose input never reads y answers, where the game would compute the point, from another height of the column (last point, or buffer at y = 0 for an exact input) | `RUSTCRAFT_OPT_COLUMN_MEMO_Y_INDEPENDENT` (1) | 0 answers in the 26.3 terrain (slice rule); built test: 119,736 → 73,872 cache points computed; time unchanged (0.955 / 0.977) | kept for data packs, scene bench decides |
+| Volume spline: coordinate buffers on the stack (≤ 8) | `RUSTCRAFT_OPT_SPLINE_INPUTS_ON_STACK` (1) | 9 → 6 allocations per chunk (aquifer + final density); time within noise | kept |
+| Point spline on the stack, re-measured on point benches | `RUSTCRAFT_OPT_SPLINE_STACK` (now 1, was opt-in) | point climate (6 roots, 20,000 quarts, 12 alternated rounds): no caches 2.916 → 2.898 µs (−0.6%), with caches 1.149 → 1.135 (−1.2%); first run −1.0 / −1.3%; 1 → 0 allocation per quart | on by default |
+| Top surface probes by volume slices | none | 1 probe per column, no noise: nothing to save | not coded |
+| Choice branches cut per column (hull per column, sub-volumes 1 × k × 1) | none | filling: 25.4 restricted branches, 105,269 values read, 116,284 computed over the hull of all columns, 110,181 with a hull per column; branches without interpolation (the only ones that could be cut): 8,978 → 8,598 noise values (−4.2%), nether −3% | not coded: one sub-volume per column redoes the y work per column for 4% |
+
+Exactness tightened (fidelity of the shortcuts, A3): at a point the game skips the right side of a
+product or quotient whose left side is zero and compares through Java's min and max; over a volume it
+multiplies and compares. −0, +0 and NaN can then differ between the two paths, in the game as here,
+so `mul`, `div`, `min`, `max` (and a constant min or max at zero) are no longer counted exact. Found by
+`point_after_volume_on_every_cache` (−0 against 0 on 6 reads when the memo answered before the buffer);
+the memo now keeps the game's order (last point, buffer, then the column). The 26.3 choices restricted in
+y are unchanged (25.4 branches per chunk before and after). Lead noted: the rows read of a restricted
+choice (`rows_of`) keeps the larger volume where the game's cache would hold the smaller one; with the
+tightened rule only exact caches are affected, whose buffer and point give the same bits.
+
+Equivalence: `sampler_opt` (each new variant alone and combined with the old code, 200 chunks, six volume
+shapes; `sublattice_reads_match_old_code`: nested volume pairs over overworld, amplified, nether and end,
+every root, the vein and cave functions, built caches, point reads after on every cache, 1,536 reads served
+by a sub-lattice; `column_memo_reads_match_old_code`: 3 overworld presets, point heights changing between
+reads, every cache and five built ones), `point_after_volume_*`, `kept_context_*`, the whole rc-worldgen
+suite (`density_ref`, `terrain_ref`, `terrain_opt`, `biome_opt`, `material_opt`). Sabotages, each caught:
+sub-lattice without the exactness rule → 88 differences (vein caches over an interpolation); rows read from
+the bottom of the larger volume → 48; first index + 1 → out-of-bounds panic; y gradient marked as not
+reading y → 96 differences per chunk; noise y scale ignored → 36 chunks; buffer at y = 0 for an inexact
+input → −0 ≠ 0 on 24 chunks; product, min and max counted exact again → −0 ≠ 0 (12 chunks memo, 15
+sub-lattice); volume spline reading zero coordinates → 32 volumes. Placement: one chunk per task already
+(1 core per chunk); GPU without object (f64, exact order). To measure on the scene bench, quiet machine:
+generation, generation-1thread, fresh-mountain-rd16.
 
 ### Biome tree and zoom (C1-M04, 22/10/2026, micro-bench, loaded machine)
 

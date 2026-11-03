@@ -1,6 +1,7 @@
-//! Density evaluator (C1-M05, C1-M06): new paths (`sampler::Opts::NEW`) against the old code
-//! (`Opts::OLD`) bit for bit, on the router roots and the vein functions; a context kept from
-//! one chunk to the next against a fresh one; micro-benches.
+//! Density evaluator (C1-M05, C1-M06, C1-M13): new paths (`sampler::Opts::NEW`) against the old
+//! code (`Opts::OLD`) bit for bit, on the router roots and the vein functions; a context kept from
+//! one chunk to the next against a fresh one; cache reads of a sub-lattice; evaluation counts;
+//! micro-benches.
 //! Without game data, the tests are skipped (explicit failure under `RUSTCRAFT_OPT_REQUIRE=1`).
 //!
 //! Benches (quiet machine): `cargo test --release -p rc-worldgen --test sampler_opt -- --ignored --nocapture`.
@@ -13,8 +14,8 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 use rc_worldgen::proto::ProtoTerrain;
-use rc_worldgen::sampler::{Opts, S, Sid};
-use rc_worldgen::terrain::{BiomeCache, TerrainGenerator};
+use rc_worldgen::sampler::{EvalCounts, Opts, S, Sid};
+use rc_worldgen::terrain::{BiomeCache, Stage, TerrainGenerator};
 use rc_worldgen::{Ctx, Generator, Volume};
 
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
@@ -120,14 +121,19 @@ const SEED: i64 = 20_261_011;
 
 /// Each path alone, then the combinations with `range_yvol`, then all: a faulty track is
 /// named by its own failure.
-const VARIANTS: [(&str, Opts); 8] = [
+const VARIANTS: [(&str, Opts); 13] = [
+    ("column_memo_y_independent", Opts { column_memo_y_independent: true, ..Opts::OLD }),
+    ("memo+sublattice", Opts { column_memo_y_independent: true, sublattice_cache_read: true, ..Opts::OLD }),
     ("range_yvol", Opts { range_yvol: true, ..Opts::OLD }),
     ("vol_pool", Opts { vol_pool: true, ..Opts::OLD }),
     ("spline_stack", Opts { spline_stack: true, ..Opts::OLD }),
     ("take_without_zeroing", Opts { take_without_zeroing: true, ..Opts::OLD }),
     ("best_fit_buffers", Opts { best_fit_buffers: true, ..Opts::OLD }),
+    ("sublattice_cache_read", Opts { sublattice_cache_read: true, ..Opts::OLD }),
+    ("spline_inputs_on_stack", Opts { spline_inputs_on_stack: true, ..Opts::OLD }),
     ("yvol+pool", Opts { range_yvol: true, vol_pool: true, ..Opts::OLD }),
     ("yvol+spline", Opts { range_yvol: true, spline_stack: true, ..Opts::OLD }),
+    ("yvol+sublattice", Opts { range_yvol: true, sublattice_cache_read: true, ..Opts::OLD }),
     ("all", Opts::NEW),
 ];
 
@@ -409,6 +415,274 @@ fn point_after_volume_cache_under_choice() {
         }
     }
     assert!(failures.is_empty(), "{} differences:\n{}", failures.len(), failures.join("\n"));
+}
+
+/// Pairs of volumes of a chunk evaluated one after the other in one context: a larger one, then
+/// one whose points it holds. The aquifer's quart grid then the corners of the final density (the
+/// order of the terrain); a block volume then a grid of step 4 inside it; a block volume then a
+/// smaller one that starts in the middle of an interpolation cell.
+fn nested_volumes(g: &Generator, cx: i32, cz: i32) -> [(Volume, Volume); 3] {
+    let (x, z, y0, h) = (cx * 16, cz * 16, g.settings.min_y, g.settings.height);
+    [
+        (Volume::stepped(11, 1, 11, x - 16, 0, z - 16, 4, 1, 4), Volume::stepped(5, h / 8 + 1, 5, x, y0, z, 4, 8, 4)),
+        (Volume::new(16, 120, 16, x, y0, z), Volume::stepped(4, 15, 4, x, y0, z, 4, 8, 4)),
+        (Volume::new(16, 120, 16, x, y0, z), Volume::new(8, 50, 8, x + 3, y0 + 3, z + 5)),
+    ]
+}
+
+/// Values seen in a fresh context with the paths `o`: `root` over `first`, then over `second`, then
+/// point reads on every cache inside `second`, on its points and between them.
+fn nested_reads(g: &Generator, o: Opts, root: Sid, caches: &[Sid], (first, second): (Volume, Volume)) -> Vec<f32> {
+    let mut ctx = Ctx::cached_with(o);
+    let mut out = g.volume(root, &mut ctx, &first);
+    out.extend(g.volume(root, &mut ctx, &second));
+    let spots = [
+        (second.bx(1), second.by(2), second.bz(1)),
+        (second.x0 + 1, second.by(1) + 3, second.z0 + 2),
+        (second.bx(second.sx - 1), second.by(second.sy - 1), second.bz(0)),
+    ];
+    for &c in caches {
+        for &(x, y, z) in &spots {
+            out.push(g.value(c, &mut ctx, x, y, z));
+        }
+    }
+    out
+}
+
+/// A cache read through a sub-lattice of the volume it holds gives, bit for bit, what the old code
+/// computes: the volume itself and the point reads that follow on every cache. Router roots, vein
+/// functions and noodle caves (overworld, amplified, nether, end), plus the built cache over an
+/// interpolation, whose input is not exact and must not be served that way.
+#[test]
+fn sublattice_reads_match_old_code() {
+    let Some(pack) = common::data_pack() else { return };
+    rc_worldgen::sampler::count_evaluations(true);
+    rc_worldgen::sampler::take_eval_counts();
+    let mut failures = Vec::new();
+    for preset in ["overworld", "amplified", "nether", "end"] {
+        let mut g = Generator::new(&pack, preset, SEED).unwrap();
+        let mut roots = roots(&mut g, preset == "overworld");
+        roots.push(("cache over interpolation".into(), compile_text(&mut g, CACHE_OVER_INTERPOLATION)));
+        // The 26.3 caches read in three dimensions sit under interpolations, whose corner grids
+        // start on a cell: the built ones (one is an exact noise in 3D) are read with a y offset.
+        for (k, text) in CACHES_OVER_Y.iter().enumerate() {
+            roots.push((format!("built cache over y {k}"), compile_text(&mut g, text)));
+        }
+        let caches = cache_nodes(&g);
+        for (cx, cz) in chunks(if preset == "overworld" { 12 } else { 4 }) {
+            for pair in nested_volumes(&g, cx, cz) {
+                for (name, s) in &roots {
+                    let want = nested_reads(&g, Opts::OLD, *s, &caches, pair);
+                    for (label, o) in [("sublattice", Opts { sublattice_cache_read: true, ..Opts::OLD }), ("all", Opts::NEW)] {
+                        let got = nested_reads(&g, o, *s, &caches, pair);
+                        if let Some((bad, i)) = first_diff(&got, &want) {
+                            failures.push(format!(
+                                "{preset} {label} {name} chunk {cx},{cz} {pair:?}: {bad} differences, first {i}: {} ≠ {}",
+                                got[i], want[i]
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let served = rc_worldgen::sampler::take_eval_counts().cache_volume_sublattice;
+    rc_worldgen::sampler::count_evaluations(false);
+    eprintln!("{served} cache reads served by a sub-lattice");
+    assert!(served > 0, "no cache read went through a sub-lattice: the test proves nothing");
+    assert!(failures.is_empty(), "{} differences:\n{}", failures.len(), failures.join("\n"));
+}
+
+/// Caches built so that a wrong shortcut shows: over a y gradient plus a flat noise, over a noise
+/// with a y scale (a cache keyed without y would answer wrongly); over a product of two flat noises
+/// (served once per column); over products whose left side is often exactly zero, flat and nested
+/// in 3D (the volume gives −0 where the point gives +0, so their buffer must not answer for a point).
+const CACHES_OVER_Y: [&str; 5] = [
+    r#"{"type":"minecraft:cache","input":{"type":"minecraft:add",
+        "left":{"type":"minecraft:gradient","axis":"y","from_coordinate":-64,"from_value":1.5,"to_coordinate":320,"to_value":-1.5},
+        "right":{"type":"minecraft:noise","noise":"minecraft:erosion","xz_scale":0.25,"y_scale":0.0}}}"#,
+    r#"{"type":"minecraft:cache","input":{"type":"minecraft:noise","noise":"minecraft:cave_cheese","xz_scale":1.0,"y_scale":0.5}}"#,
+    r#"{"type":"minecraft:cache","input":{"type":"minecraft:mul",
+        "left":{"type":"minecraft:noise","noise":"minecraft:erosion","xz_scale":0.25,"y_scale":0.0},
+        "right":{"type":"minecraft:noise","noise":"minecraft:ridge","xz_scale":0.25,"y_scale":0.0}}}"#,
+    r#"{"type":"minecraft:cache","input":{"type":"minecraft:mul",
+        "left":{"type":"minecraft:clamp","min":0.0,"max":1.0,
+            "input":{"type":"minecraft:noise","noise":"minecraft:erosion","xz_scale":0.25,"y_scale":0.0}},
+        "right":{"type":"minecraft:add","left":-2.0,
+            "right":{"type":"minecraft:noise","noise":"minecraft:ridge","xz_scale":0.25,"y_scale":0.0}}}}"#,
+    r#"{"type":"minecraft:cache","input":{"type":"minecraft:add","left":1.0,
+        "right":{"type":"minecraft:cache","input":{"type":"minecraft:mul",
+            "left":{"type":"minecraft:clamp","min":0.0,"max":1.0,
+                "input":{"type":"minecraft:noise","noise":"minecraft:cave_cheese","xz_scale":1.0,"y_scale":0.5}},
+            "right":{"type":"minecraft:add","left":-2.0,
+                "right":{"type":"minecraft:noise","noise":"minecraft:cave_layer","xz_scale":1.0,"y_scale":0.5}}}}}}"#,
+];
+
+/// Point reads in a fresh context with the paths `o`, in the order of the terrain: the aquifer's
+/// quart grid of the preliminary surface (and of every root), point reads of every root at heights
+/// that change from one read to the next (the aquifer reads its cells), the corners of the final
+/// density, then the same point reads again.
+fn column_reads(g: &Generator, o: Opts, surface: Sid, roots: &[Sid], (cx, cz): (i32, i32)) -> Vec<f32> {
+    let mut ctx = Ctx::cached_with(o);
+    let (x, z) = (cx * 16, cz * 16);
+    let quarts = Volume::stepped(11, 1, 11, x - 16, 0, z - 16, 4, 1, 4);
+    let mut out = g.volume(surface, &mut ctx, &quarts);
+    // Every cache gets a buffer at y = 0, which a point read at another height could wrongly use.
+    for &r in roots {
+        out.extend(g.volume(r, &mut ctx, &quarts));
+    }
+    let spots: Vec<(i32, i32, i32)> =
+        (0..24).map(|k| (x + (k * 5) % 16, g.settings.min_y + (k * 37) % g.settings.height, z + (k * 11) % 16)).collect();
+    let read_all = |ctx: &mut Ctx, out: &mut Vec<f32>| {
+        for &(px, py, pz) in &spots {
+            for &r in roots {
+                out.push(g.value(r, ctx, px, py, pz));
+                out.push(g.value(r, ctx, px, py + 8, pz));
+            }
+        }
+    };
+    read_all(&mut ctx, &mut out);
+    let corners = Volume::stepped(5, g.settings.height / 8 + 1, 5, x, g.settings.min_y, z, 4, 8, 4);
+    out.extend(g.volume(g.router.final_density, &mut ctx, &corners));
+    read_all(&mut ctx, &mut out);
+    out
+}
+
+/// A cache whose input never reads y answers a point read at any height from its last point (and
+/// its buffer at y = 0) with the bits the old code computes: every cache of the overworld programs
+/// (normal, large biomes, amplified), the climate roots and the built caches over y, in a context
+/// with caches, point heights changing from one read to the next. Counted: the memo must compute
+/// fewer cache points than the old code, or the test proves nothing.
+#[test]
+fn column_memo_reads_match_old_code() {
+    let Some(pack) = common::data_pack() else { return };
+    rc_worldgen::sampler::count_evaluations(true);
+    let mut failures = Vec::new();
+    let (mut old_computed, mut memo_computed) = (0, 0);
+    for (preset, folder) in [("overworld", "overworld"), ("large_biomes", "overworld_large_biomes"), ("amplified", "overworld_amplified")] {
+        let mut g = Generator::new(&pack, preset, SEED).unwrap();
+        let surface = g.compile_named(&format!("minecraft:{folder}/preliminary_surface_level")).unwrap();
+        let built: Vec<Sid> = CACHES_OVER_Y.iter().map(|t| compile_text(&mut g, t)).collect();
+        let r = g.router;
+        let mut roots = vec![r.temperature, r.vegetation, r.continents, r.erosion, r.depth, r.ridges];
+        roots.extend(built);
+        roots.extend(cache_nodes(&g));
+        for (cx, cz) in chunks(12) {
+            rc_worldgen::sampler::take_eval_counts();
+            let want = column_reads(&g, Opts::OLD, surface, &roots, (cx, cz));
+            old_computed += rc_worldgen::sampler::take_eval_counts().cache_point_computed;
+            for (label, o) in [("memo", Opts { column_memo_y_independent: true, ..Opts::OLD }), ("all", Opts::NEW)] {
+                let got = column_reads(&g, o, surface, &roots, (cx, cz));
+                if label == "memo" {
+                    memo_computed += rc_worldgen::sampler::take_eval_counts().cache_point_computed;
+                }
+                if let Some((bad, i)) = first_diff(&got, &want) {
+                    failures.push(format!("{preset} {label} chunk {cx},{cz}: {bad} differences, first {i}: {} ≠ {}", got[i], want[i]));
+                }
+            }
+        }
+    }
+    rc_worldgen::sampler::count_evaluations(false);
+    eprintln!("cache points computed: old {old_computed}, memo {memo_computed}");
+    assert!(memo_computed < old_computed, "no cache answered from its column: the test proves nothing");
+    assert!(failures.is_empty(), "{} differences:\n{}", failures.len(), failures.join("\n"));
+}
+
+/// The counts per chunk of a step, one line.
+fn census_line(step: &str, c: EvalCounts, chunks: usize) -> String {
+    let n = chunks as f64;
+    let per = |v: u64| v as f64 / n;
+    format!(
+        "{step:28} noises {:9.1} | splines {:8.1} | top probes {:7.1} | cache point last/buffer/column/computed {:8.1} {:8.1} {:6.1} {:8.1} \
+         | cache volume same/rows/sublattice/computed {:5.1} {:5.1} {:5.1} {:5.1}, {:8.0} values \
+         | choice branches {:5.1}: read {:8.0}, whole hull {:8.0}, column hulls {:8.0}, \
+         plain branches noise values whole hull {:8.0}, column hulls {:8.0}",
+        per(c.point_noises),
+        per(c.point_splines),
+        per(c.top_probes),
+        per(c.cache_point_last),
+        per(c.cache_point_buffer),
+        per(c.cache_point_same_column),
+        per(c.cache_point_computed),
+        per(c.cache_volume_same),
+        per(c.cache_volume_rows),
+        per(c.cache_volume_sublattice),
+        per(c.cache_volume_computed),
+        per(c.cache_volume_values),
+        per(c.choice_branches),
+        per(c.branch_values_read),
+        per(c.branch_values_whole_hull),
+        per(c.branch_values_column_hulls),
+        per(c.plain_branch_noise_values_whole_hull),
+        per(c.plain_branch_noise_values_column_hulls),
+    )
+}
+
+/// Runs `f` on a pool of one thread, so that its parallel work stays on the thread whose counts are
+/// read, and returns what it counted.
+fn counted(f: impl FnOnce() + Send) -> EvalCounts {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    pool.install(|| {
+        rc_worldgen::sampler::take_eval_counts();
+        f();
+        rc_worldgen::sampler::take_eval_counts()
+    })
+}
+
+/// What a terrain chunk evaluates, per step (64 chunks, seed 42; counts, so they hold on a loaded
+/// machine): biomes of the chunks, creation of the aquifer (top surface search), filling, surface,
+/// caves, and the base heights of 16 columns per chunk (memo off). Counted with the paths of the
+/// environment: run it again with a switch at 0 to see what that switch changes.
+#[test]
+#[ignore = "benchmark"]
+fn point_evaluation_census() {
+    let Some(pack) = common::data_pack() else { return };
+    rc_worldgen::sampler::count_evaluations(true);
+    let targets: Vec<(i32, i32)> = (0..8).flat_map(|x| (0..8).map(move |z| (x - 4, z - 4))).collect();
+    let n = targets.len();
+    let sources = [
+        ("minecraft:normal", "minecraft:overworld"),
+        ("minecraft:amplified", "minecraft:overworld"),
+        ("minecraft:large_biomes", "minecraft:overworld"),
+        ("minecraft:normal", "minecraft:the_nether"),
+        ("minecraft:normal", "minecraft:the_end"),
+    ];
+    for (preset, dim) in sources {
+        let mut t = TerrainGenerator::from_preset(&pack, preset, dim, 42).expect("generator");
+        t.opts.baseh_memo = false;
+        let mut cache = BiomeCache::default();
+        let biomes = counted(|| t.prepare_biomes(&mut cache, &targets));
+        let aquifers = counted(|| {
+            for &(x, z) in &targets {
+                if let Some(v) = t.fill_volume(x, z) {
+                    std::hint::black_box(t.new_aquifer(&mut Ctx::cached(), &v));
+                }
+            }
+        });
+        let until = |stage: Stage| {
+            counted(|| {
+                for &(x, z) in &targets {
+                    std::hint::black_box(t.generate_until(x, z, &cache, None, stage));
+                }
+            })
+        };
+        let (fill, surface, carvers) = (until(Stage::Fill), until(Stage::Surface), until(Stage::Carvers));
+        let heights = counted(|| {
+            for &(cx, cz) in &targets {
+                for k in 0..16 {
+                    std::hint::black_box(t.base_height(cx * 16 + k, cz * 16 + (k * 7) % 16, false));
+                }
+            }
+        });
+        eprintln!("{preset} {dim}");
+        eprintln!("{}", census_line("  biomes", biomes, n));
+        eprintln!("{}", census_line("  aquifer creation", aquifers, n));
+        eprintln!("{}", census_line("  filling (with the aquifer)", fill, n));
+        eprintln!("{}", census_line("  surface", surface - fill, n));
+        eprintln!("{}", census_line("  caves", carvers - surface, n));
+        eprintln!("{}", census_line("  16 base heights", heights, n));
+    }
+    rc_worldgen::sampler::count_evaluations(false);
 }
 
 const KEEP_SEEDS: [i64; 3] = [0, -6_214_586_474_519_478_921, 1_234_567_890_123_456_789];
@@ -883,6 +1157,127 @@ fn bench_terrain_kept_context() {
             }
             eprintln!("{line}");
         }
+    }
+}
+
+/// Aquifer creation then final density of a chunk in a context kept by the thread and reset, the
+/// order of the terrain's filling (the aquifer fills the quart grid of the flat caches first).
+fn fill_sequence(t: &TerrainGenerator, ctx: &mut Ctx, (cx, cz): (i32, i32)) -> usize {
+    ctx.reset_for_reuse();
+    let Some(v) = t.fill_volume(cx, cz) else { return 0 };
+    std::hint::black_box(t.new_aquifer(ctx, &v));
+    let mut b = ctx.take(v.size());
+    t.g.program.volume(t.g.router.final_density, ctx, &mut b, &v);
+    let n = b.len();
+    ctx.recycle(b);
+    n
+}
+
+/// Aquifer creation + final density (see [`fill_sequence`]), 64 chunks on 1 thread: the default
+/// paths, then each track of C1-M13 taken out, alternated over 12 rounds; minimum and median per
+/// chunk, allocations per chunk. Then the default paths and all three tracks out on 1 thread up to
+/// every core.
+#[test]
+#[ignore = "benchmark"]
+fn bench_fill_sequence() {
+    let Some(pack) = common::data_pack() else { return };
+    counting::client_options();
+    let t = TerrainGenerator::from_preset(&pack, "minecraft:normal", "minecraft:overworld", 42).unwrap();
+    let chunks: Vec<(i32, i32)> = (0..8).flat_map(|x| (0..8).map(move |z| (x - 4, z - 4))).collect();
+    let d = Opts::current();
+    let cases = [
+        ("default", d),
+        ("default but sublattice", Opts { sublattice_cache_read: false, ..d }),
+        ("default but column memo", Opts { column_memo_y_independent: false, ..d }),
+        ("default but spline inputs on stack", Opts { spline_inputs_on_stack: false, ..d }),
+        ("default + spline_stack", Opts { spline_stack: true, ..d }),
+        (
+            "default but the three",
+            Opts { sublattice_cache_read: false, column_memo_y_independent: false, spline_inputs_on_stack: false, ..d },
+        ),
+    ];
+    let mut contexts: Vec<Ctx> = cases.iter().map(|(_, o)| Ctx::cached_with(*o)).collect();
+    let mut samples = vec![Vec::new(); cases.len()];
+    let mut allocs = vec![0.0; cases.len()];
+    for round in 0..12 {
+        for (i, ctx) in contexts.iter_mut().enumerate() {
+            let before = ALLOCS.load(Ordering::Relaxed);
+            samples[i].push(ms_per_chunk(&chunks, |x, z| {
+                std::hint::black_box(fill_sequence(&t, ctx, (x, z)));
+            }));
+            if round == 11 {
+                allocs[i] = (ALLOCS.load(Ordering::Relaxed) - before) as f64 / chunks.len() as f64;
+            }
+        }
+    }
+    for (((label, _), s), a) in cases.iter().zip(samples).zip(allocs) {
+        let (min, median) = min_and_median(s);
+        eprintln!("aquifer + final density, {label:36} ms/chunk min {min:.3} median {median:.3} | {a:.1} alloc / chunk");
+    }
+    let max = std::thread::available_parallelism().map_or(1, |n| n.get());
+    for pass in 0..2 {
+        for (label, o) in [cases[0], cases[5]] {
+            let mut line = format!("pass {pass} {label:24}");
+            let mut threads = 1;
+            while threads <= max {
+                let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+                let run = |cs: &[(i32, i32)]| {
+                    pool.install(|| {
+                        cs.par_iter().map_init(|| Ctx::cached_with(o), |ctx, &pos| fill_sequence(&t, ctx, pos)).sum::<usize>()
+                    })
+                };
+                run(&chunks[..8]);
+                let s = Instant::now();
+                std::hint::black_box(run(&chunks));
+                line += &format!(" | {threads} threads {:.3} ms", s.elapsed().as_secs_f64() * 1e3 / chunks.len() as f64);
+                threads *= 2;
+            }
+            eprintln!("{line}");
+        }
+    }
+}
+
+/// Point climate (the 6 roots at 20,000 quarts, as a biome lookup at a point reads them), the point
+/// spline on the stack or not, in a context without caches (structures, surface) and with caches
+/// (`/locate biome`); alternated over 12 rounds, minimum and median in µs per quart, allocations.
+#[test]
+#[ignore = "benchmark"]
+fn bench_point_climate_alternated() {
+    let Some(pack) = common::data_pack() else { return };
+    counting::client_options();
+    let g = Generator::new(&pack, "overworld", 42).unwrap();
+    let r = g.router;
+    let roots = [r.temperature, r.vegetation, r.continents, r.erosion, r.depth, r.ridges];
+    let d = Opts::current();
+    let cases = [
+        ("spline on the heap, no caches", Opts { spline_stack: false, ..d }, false),
+        ("spline on the stack, no caches", Opts { spline_stack: true, ..d }, false),
+        ("spline on the heap, caches", Opts { spline_stack: false, ..d }, true),
+        ("spline on the stack, caches", Opts { spline_stack: true, ..d }, true),
+    ];
+    let quarts = 20_000i32;
+    let mut samples = vec![Vec::new(); cases.len()];
+    let mut allocs = vec![0.0; cases.len()];
+    for _ in 0..12 {
+        for (i, (_, o, cached)) in cases.iter().enumerate() {
+            let mut ctx = if *cached { Ctx::cached_with(*o) } else { Ctx::uncached_with(*o) };
+            let before = ALLOCS.load(Ordering::Relaxed);
+            let s = Instant::now();
+            let mut acc = 0.0f32;
+            for q in 0..quarts {
+                let (qx, qy, qz) = (q % 317 * 7 - 1000, q % 23 - 16, q / 317 * 5 - 700);
+                for &root in &roots {
+                    acc += g.value(root, &mut ctx, qx << 2, qy << 2, qz << 2);
+                }
+            }
+            std::hint::black_box(acc);
+            samples[i].push(s.elapsed().as_secs_f64() * 1e6 / f64::from(quarts));
+            allocs[i] = (ALLOCS.load(Ordering::Relaxed) - before) as f64 / f64::from(quarts);
+        }
+    }
+    for (((label, ..), s), a) in cases.iter().zip(samples).zip(allocs) {
+        let (min, median) = min_and_median(s);
+        eprintln!("point climate, {label:32} µs/quart min {min:.3} median {median:.3} | {a:.2} alloc / quart");
     }
 }
 
