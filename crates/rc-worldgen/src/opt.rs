@@ -112,19 +112,40 @@ switch!(
     "RUSTCRAFT_OPT_BEST_FIT_BUFFERS"
 );
 switch!(
+    /// Evaluator: a cache whose input is exact (point and volume give the same bits everywhere
+    /// below) serves any volume whose points it already holds, for instance the corners of the
+    /// final density inside the quart grid the aquifer filled first.
+    sublattice_cache_read,
+    "RUSTCRAFT_OPT_SUBLATTICE_CACHE_READ"
+);
+switch!(
+    /// Evaluator: a cache whose input never reads y has one point value per column; where a point
+    /// read would compute it, the value known from another height answers (the last point, or for
+    /// an exact input the buffer at y = 0).
+    column_memo_y_independent,
+    "RUSTCRAFT_OPT_COLUMN_MEMO_Y_INDEPENDENT"
+);
+switch!(
+    /// Evaluator: a volume spline holds its coordinate buffers on the stack (up to 8
+    /// coordinates) instead of in an allocated list.
+    spline_inputs_on_stack,
+    "RUSTCRAFT_OPT_SPLINE_INPUTS_ON_STACK"
+);
+switch!(
     /// Terrain: each thread keeps its evaluation context (cache cells, spare buffers) from one
     /// chunk to the next, reset at the start of each chunk, instead of a new one per chunk.
     keep_eval_context,
     "RUSTCRAFT_OPT_KEEP_EVAL_CONTEXT"
 );
 
-/// Spline: point coordinates kept on the stack, sampling without dynamic call.
-/// Off by default (`=1` enables it) until the quiet-machine bench (same figure as `vol_pool`).
-#[inline]
-pub fn spline_stack() -> bool {
-    static S: LazyLock<bool> = LazyLock::new(|| opt_in("RUSTCRAFT_OPT_SPLINE_STACK"));
-    *S
-}
+switch!(
+    /// Spline: point coordinates kept on the stack, sampling without dynamic call. On by default:
+    /// point climate −0.6% without caches, −1.2% with caches, one allocation per quarter less
+    /// (12 alternated rounds, loaded machine; docs/perf.md, density evaluator section); off before,
+    /// judged on a volume bench where it has no work.
+    spline_stack,
+    "RUSTCRAFT_OPT_SPLINE_STACK"
+);
 
 switch!(
     /// Biome tree: candidate distance carried, early exit at zero distance.
