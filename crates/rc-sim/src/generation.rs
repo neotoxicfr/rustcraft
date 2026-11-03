@@ -1223,6 +1223,9 @@ impl crate::server::Server {
                 }
             }
             self.entities.entry(p).or_default().extend(list);
+            // They exist nowhere on disk yet (they left the generator with the full chunk): the
+            // next save writes them, even if nothing else changes in that chunk.
+            self.life.drop_chunks.insert(p);
             self.mobs.adopted.remove(&p);
             self.adopt_mobs(&[p]);
         }

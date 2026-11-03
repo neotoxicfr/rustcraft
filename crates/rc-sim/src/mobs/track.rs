@@ -41,6 +41,11 @@ impl Tracker {
             self.was_on_ground = on_ground;
         }
     }
+
+    /// Position the next relative move is coded from (the last one sent), once tracking began.
+    pub(crate) fn sent_position(&self) -> Option<[f64; 3]> {
+        self.seen.then_some(self.base)
+    }
 }
 
 /// Tracking range of the player entity type (chunks).

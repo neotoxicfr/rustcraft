@@ -349,8 +349,6 @@ impl Server {
                     }
                     old = Some(std::mem::replace(o, new.clone()));
                 }
-                // The game's reading sets the position: a new `Pos` files it under its new chunk.
-                let moved = self.refile_kept_entity(i);
                 // G5-F05: the reloaded text display resolves its text again (previous one kept
                 // on failure); own data of displays and interactions sent when changed.
                 if let Some(o) = &old
@@ -360,6 +358,10 @@ impl Server {
                     self.display_resolve_text(i, at, o.get("text").cloned());
                     new = self.other(i).cloned().unwrap_or(new);
                 }
+                // The game's reading sets the position: a new `Pos` files it under its new chunk.
+                // After the text resolution, so that an entity entering the view is announced
+                // with the resolved text, as the game reads the whole compound before showing it.
+                let moved = self.refile_kept_entity(i);
                 // Left the view (removed) or entered it (announced with its data): nothing more.
                 if matches!(moved, KeptEntityMove::SameChunk | KeptEntityMove::InView) {
                     self.send_entity_meta_after(i, &new, old.as_ref());
@@ -831,7 +833,6 @@ impl crate::mobs::Mobs {
     }
 }
 
-/// Resets the horizontal speed of the absolute axes of a command teleportation.
 /// `kill` of a kept compound marks only the chunk that held it for the next save
 /// (`RUSTCRAFT_OPT_KILL_REWRITES_ONE_CHUNK=0`: every entity chunk of the dimension, the former way).
 fn kill_rewrites_one_chunk() -> bool {
@@ -857,12 +858,14 @@ pub(crate) enum KeptEntityMove {
     SameChunk,
     /// Moved between two chunks the clients were sent: they follow the move.
     InView,
-    /// Moved between chunks the clients do not see (or a marker, never shown).
+    /// Moved between chunks the clients do not see, or a marker (never shown) leaving or
+    /// entering their view.
     OutOfView,
     /// Left or entered the clients' view: removal or announcement already sent.
     ViewChanged,
 }
 
+/// Resets the horizontal speed of the absolute axes of a command teleportation.
 fn zero_absolute(vel: &mut [f64; 3], rel: [bool; 3]) {
     for k in [0, 2] {
         if !rel[k] {

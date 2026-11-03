@@ -60,7 +60,10 @@ pub(crate) const SEED: i64 = 0x0B7_1C0DE;
 /// air, invulnerability, portal delay; UUID the one `/data` shows), alone b36c37ff…, 820; raids
 /// kept per dimension (the Nether's raids file carries the Nether's own counter instead of the
 /// one that followed the player), alone 0947daba…, 820; both reverted: 700c26d9… again.
-const EXPECTED_NEW: (&str, usize) = ("8af6e543cdc39ac6bf47103b865d4582ae4aaa5d2c6b0c55a00c69e4d10d0fb9", 820);
+/// Structure entities of a generated chunk marked for the save, the only cause of the change:
+/// four entity chunks more, each a mineshaft chest minecart never written before (without the
+/// marking: 8af6e543…, 820 again; every other file identical).
+const EXPECTED_NEW: (&str, usize) = ("972d121d2e75466b47bc291d7efc4c34e54ef7dd9def4b0ba6a1d6f21eb7bfcf", 824);
 /// Known bench model worlds: (fingerprint of the input files, expected fingerprint, files).
 const EXPECTED_MODEL: &[(&str, &str, usize)] = &[(
     "790b2d94653a4243e68f2e0cb0ebc3f865f9f59815ed65149067cdd374c6b800",
@@ -214,7 +217,10 @@ fn run_new() -> Option<Vec<(String, String)>> {
 /// G4-F08 resumption: mobs write their live `PortalCooldown` (the game writes it for every
 /// entity), the only cause of the change (without it: a551d272…, 380 again).
 /// Lot 9 integration: all together.
-const EXPECTED_MECH: (&str, usize) = ("304c0b39d8961896bf4a8c4d1f90342ef19701aac82e67a005136f19b0d9ff3c", 380);
+/// Structure entities of a generated chunk marked for the save, the only cause of the change: one
+/// entity chunk more (-2 6, a mineshaft chest minecart, lost before; without the marking:
+/// 304c0b39…, 380 again).
+const EXPECTED_MECH: (&str, usize) = ("3171468bfd3aa6a8b5d828bfdb5f7cb16adc0711df89454ab55b4f1b7f4c17e9", 381);
 
 /// Server command (refusal = failure: the rig would be incomplete).
 pub(crate) fn cmd(s: &mut Server, c: &str) {
@@ -364,7 +370,10 @@ fn run_mech() -> Option<Vec<(String, String)>> {
 /// G4-F08 resumption: mobs write their live `PortalCooldown` (the game writes it for every
 /// entity), the only cause of the change (without it: 9c406245… again).
 /// Lot 9 integration: all together.
-const EXPECTED_REGIONS: (&str, usize) = ("054d4766947e49aff86433df1c37fd3cbe32520d5967caa948e56b4ad1192377", 1243);
+/// Structure entities of a generated chunk marked for the save, the only cause of the change: six
+/// entity chunks more, each holding a mineshaft chest minecart that was never written before
+/// (without the marking: 054d4766…, 1243 again; every other chunk identical).
+const EXPECTED_REGIONS: (&str, usize) = ("a055ca7443b428eeeaaeca70708bdcda84280bd8b40512074b9b0cb29719c0c9", 1249);
 
 /// Content of all the regions of a world (chunks, entities, points of interest, all
 /// dimensions): SHA-256 of the decompressed NBT per chunk. Sector locations and

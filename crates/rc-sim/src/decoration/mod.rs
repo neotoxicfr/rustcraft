@@ -412,6 +412,16 @@ impl Server {
         }
     }
 
+    /// Last position the network tracking of decoration `id` sent (`e`: its compound), when it
+    /// is one that moves (armor stand, mannequin) and its tracking began.
+    fn deco_sent_position(&self, id: i32, e: &Nbt) -> Option<[f64; 3]> {
+        // Only those two kinds are tracked: the registry walk is skipped for every other one.
+        if !matches!(kind_of(e), Some(DKind::Stand | DKind::Mannequin)) {
+            return None;
+        }
+        self.deco.live.iter().find(|l| l.id == id && !l.removed)?.track.sent_position()
+    }
+
     /// The compound of decoration `id` is now filed under `chunk` (fast lookup kept right).
     pub(crate) fn deco_moved_to_chunk(&mut self, id: i32, chunk: (i32, i32)) {
         for l in self.deco.live.iter_mut().filter(|l| l.id == id) {
@@ -489,6 +499,10 @@ impl Server {
             // Knot: announced at the corner of its block, null data.
             pos = block_pos_of(e).map(f64::from);
             data = 0;
+        } else if let Some(sent) = self.deco_sent_position(id, e) {
+            // The game announces at the tracking's last sent position: its next relative move is
+            // coded from there, so announcing the current position would offset the entity.
+            pos = sent;
         }
         let add = rc_proto_v777::entity::AddEntity {
             id,
