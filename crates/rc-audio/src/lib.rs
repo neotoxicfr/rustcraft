@@ -4,6 +4,8 @@
 
 pub mod ambience;
 pub mod decode;
+#[cfg(windows)]
+mod device_watch;
 pub mod devices;
 mod engine;
 pub mod mixer;

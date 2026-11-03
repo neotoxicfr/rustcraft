@@ -2301,6 +2301,8 @@ dependencies = [
  "rtrb",
  "serde_json",
  "symphonia",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]
