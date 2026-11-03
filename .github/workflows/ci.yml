@@ -72,3 +72,4 @@ jobs:
         with:
           python-version: "3.13"
       - run: python -I tools/bench/test_scenes.py
+      - run: python -I tools/release/test_release.py
