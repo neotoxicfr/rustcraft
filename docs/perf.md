@@ -3861,6 +3861,74 @@ without y is not caught: with y in the slot hash the stale hit practically never
 To measure on the quiet machine: `scenes.py` redstone (frames/s, CPU ms per frame, p99; samply:
 `zoom_corner` near 0), tnt and village (no effect expected), each switch at 0, and a 1600×900
 redstone screenshot pair in one launch.
+
+## C2-M08: section grids filled by rows, light bits in the property word, vector candidates, border rows (03/11, loaded machine)
+
+Hot spot: `mesh_with` (cave 3.64 % self of the process, pool). Reading the code: the 18³ state and
+property grids were filled one vertical stack per (x, z), so every write landed 324 cells (1.3 KB)
+after the previous one; the section visibility walked the 4,096 states a second time for their
+solid render flag; the candidate rows recomputed the surely hidden faces that the per-block loop
+then computed again; a partial remesh decoded the whole neighbouring sections above and below
+although only one row of each is read. Switches in `MeshJob::cull` (`rc_mesh::cull::CullPaths`,
+default on, `=0` old path, read once):
+- `RUSTCRAFT_OPT_MESHGRIDROWS` (`fill_rows`): interior copied one (y, z) row of 16 contiguous cells
+  at a time, properties looked up in the same pass without the `OUTSIDE` test (identifiers are
+  checked at reception; an out-of-table value reads as air either way); bottom and top layers
+  copied 16 cells at a time from the rows of the sections below and above; the 68 ring stacks of
+  the neighbouring columns unchanged (one function shared by both orders).
+- `RUSTCRAFT_OPT_MESHPROPBITS` (`solid_from_props`): bits 29-31 of the property word (both rules)
+  carry the light properties: solid render, closed for the smoothed light (solid render that
+  dampens light, stored inverted so that word 0 — outside the columns — and an unknown state read
+  as permeable, like the light table's default), dark shade. The visibility mask is gathered from
+  the solid bit during the rows fill (in a pass over the grid in the stacks order) instead of
+  `solid_bits(values)`; the path without the grid and the reference keep `solid_bits` as cross
+  check. The grid with those bits is ready for the smoothed light (C2-M09 reads it).
+- `RUSTCRAFT_OPT_MESHROWCANDSIMD` (`simd_candidates`): candidate rows computed on fixed 16-cell
+  slices of the cell and its six neighbours, branch-free candidate test; AVX2 version chosen at
+  run time (`is_x86_feature_detected`, the release stays portable), SSE2 otherwise. Assembly
+  checked: 140 ymm instructions, mask built by `vpsllvd`, no call left (the `array::map` of the
+  six neighbour slices stayed out of line, written out by hand). The surely hidden faces are kept
+  per candidate (`Vec<u8>`) and read back by the per-block loop.
+- `RUSTCRAFT_OPT_MESHEDGEROWS` (`border_rows_only`): in a partial remesh, a neighbour of a remeshed
+  section that is itself outside the remesh decodes only its rows 0 and 15
+  (`Container::unpack_range`, 512 values instead of 4,096); the border reads them (the old "empty
+  neighbour → 0" rule kept for really empty sections); the light reads two rows away fall back
+  to the column, as before for the sections that are not decoded.
+Readability: the fill moved out of `mesh_with` (`fill_section_grids`, `fill_interior_rows`,
+`fill_bottom_and_top_rows`, `fill_by_stacks`, `fill_ring_stack`), with `unfold_sections` and
+`copy_reused_section` (`mesh_with` 410 → 334 lines); local names spelled out (`cell_props`,
+`state_grid`, `candidates`, `cull_tables`, `light_view`, `group_faces_by_bucket`…).
+
+Interleaved micro-bench `tests/cull_bench.rs`, 1,248 columns of the capture, best of 5, two passes,
+loaded machine (CPU load 85-100 %), 1 thread, against the default without the four paths
+(1,758.9 / 1,741.2 ms): rows fill alone −3.4 / −1.9 %; solid mask from the grid alone −2.5 /
+−1.5 %; vector candidates alone −0.7 / −3.5 %; rows fill + vector −3.7 / −4.3 %; default without
+the rows fill −4.1 / −4.8 %; default (all four) −5.7 / −3.8 %. All threads: ±20 % noise from one
+pass to the next, not interpretable. Partial remesh of one section per column (best of 20):
+border rows only −1.6 / −0.9 % on 1 thread (all threads ±1 %, noise). Every lead gains alone and
+in combination on 1 thread: all four on. Multi-core: the work stays one section per pool task
+(the pool already spreads the columns); GPU ruled out as for C2-M10 (sending the grids costs more
+than the test). Memory: at most 4 KiB per pool thread for the kept faces of the candidates, and
+2 KiB per pooled pair of border rows (a few per thread, 32 at most); the full boxes of the
+neighbours are no longer taken in a partial remesh.
+
+Proofs: `tests/cull_paths.rs` — 36 combinations per rule (the 16 of the grid paths with the four
+paths off then on, and the default with each one off) × 3 settings against the stored
+fingerprints and the reference version, partial remesh with the rows fill and the border rows
+each off; `grid_fill_edge_cases_match_reference` (a column without neighbours, states outside the
+table inside and on the borders of sections, blocks at the very bottom and top of the world, full
+and partial, every combination); `property_light_bits_follow_the_light_table` (bits 29-31 equal to
+the light table for every state, solid bit = the visibility's table, air without light bits);
+`tests/partial.rs` `partial_remesh_reads_the_border_rows_of_its_neighbours` (covering blocks on the
+neighbours' border rows, 24 columns × 2 rules × 3 paths); unit tests `lane_candidates_match_cell_by_cell`
+(lanes and AVX2 against the cell-by-cell computation, candidates and surely hidden faces),
+`solid_mask_of_props_matches_states`, `light_bits_follow_the_light_table`,
+`candidate_bit_matches_candidate`, rc-world `unpack_range_matches_reference`. Sabotages seen
+failing: solid bit inverted, border row shifted by one z, border rows read as air, a candidate
+dropped in the vector version, `unpack_range` shifted by one cell.
+To measure on the quiet machine: `scenes.py` cave, redstone, forest (meshing ms/s of the pool,
+delay from placing a block to the image), 2 passes, each switch at 0; then the 1 thread of the
+micro-bench again.
 ## C1-M08 (series 3): structure beard, only the elements that can contribute (03/11, loaded machine)
 
 `structure_beard.rs`: the terrain adaptation around structures summed, for every point of the
