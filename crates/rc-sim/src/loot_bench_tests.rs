@@ -12,11 +12,26 @@ use rc_proto::nbt::Nbt;
 use crate::loot::{Ctx, Loot};
 use crate::player::Stack;
 
+/// Fingerprint of every table of the base pack, recorded on the code before the series
+/// (G6-F17) and unchanged since.
+const EVERY_TABLE_FINGERPRINT: u64 = 0xaf88_0b1b_aa83_fb25;
+
+/// The fingerprint of the bench, checked at every run of the tests (the bench's timing stays
+/// ignored).
+#[test]
+fn every_table_draws_like_before() {
+    assert_eq!(fingerprint_and_bench(false), EVERY_TABLE_FINGERPRINT, "the loot of a base pack table changed");
+}
+
 #[test]
 #[ignore]
 fn loot_bench() {
+    assert_eq!(fingerprint_and_bench(true), EVERY_TABLE_FINGERPRINT, "the loot of a base pack table changed");
+}
+
+fn fingerprint_and_bench(timed: bool) -> u64 {
     let data = Arc::new(rc_testdata::version_data().expect("version data 26.3 missing"));
-    let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-lootbench-{}", std::process::id())));
+    let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-lootbench-{timed}-{}", std::process::id())));
     let mut w = crate::newworld::NewWorld::new("lootbench");
     w.preset = crate::newworld::Preset::Flat;
     crate::newworld::create_world(&dir, &data, &w).expect("world creation");
@@ -51,6 +66,9 @@ fn loot_bench() {
         std::fs::write(path, &lines).expect("fingerprint file");
     }
     eprintln!("loot fingerprint: {} tables, {total:016x}", ids.len());
+    if !timed {
+        return total;
+    }
     for id in ["minecraft:blocks/stone", "minecraft:blocks/oak_leaves", "minecraft:entities/zombie", "minecraft:chests/simple_dungeon", "minecraft:gameplay/fishing"] {
         // Best of 7 trials of 5 000 draws (the minimum resists the load of the machine).
         let mut rng = crate::mobs::jrand::JRand::new(1);
@@ -69,4 +87,5 @@ fn loot_bench() {
         }
         eprintln!("loot draw {id}: {best:.0} ns ({made} stacks)");
     }
+    total
 }

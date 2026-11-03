@@ -856,8 +856,7 @@ impl Server {
         rng: &mut crate::rng::Rng,
     ) -> Vec<Stack> {
         let name = self.data.block_of(st).map_or("", |b| b.name.as_str()).to_owned();
-        let props: Vec<(String, String)> =
-            self.data.state_properties(st).map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
+        let props = crate::loot::BlockProps::of_state(&self.data, st);
         let be = self.be_get(pos).cloned();
         let id = format!("minecraft:blocks/{}", name.trim_start_matches("minecraft:"));
         let bt = |tag: &str, n: &str| self.block_name_tagged(tag, n);

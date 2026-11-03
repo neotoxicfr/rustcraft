@@ -48,6 +48,7 @@ pub mod containers;
 pub mod datapack;
 pub mod packs;
 pub mod drops;
+mod block_loot;
 mod display; // G5-F05: display and interaction entities
 pub mod life;
 pub mod items;
@@ -133,7 +134,54 @@ pub use server::{Handle, Options, start};
 /// whole process for tens of seconds, processor almost idle.
 #[cfg(test)]
 #[global_allocator]
-static TEST_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static TEST_ALLOC: test_alloc::Counting = test_alloc::Counting;
+
+/// The tests' allocator counts the allocations of each thread (each test has its own), so that
+/// a test can prove a path does not allocate.
+#[cfg(test)]
+pub(crate) mod test_alloc {
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::cell::Cell;
+
+    thread_local! {
+        static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Allocations made by the current thread so far.
+    pub(crate) fn allocations() -> u64 {
+        ALLOCATIONS.with(Cell::get)
+    }
+
+    pub(crate) struct Counting;
+
+    // Delegates to mimalloc; the counter is a const-initialised thread-local (no allocation,
+    // no destructor), safe to touch from inside the allocator.
+    #[allow(unsafe_code)]
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let _ = ALLOCATIONS.try_with(|c| c.set(c.get() + 1));
+            // SAFETY: same contract as the caller's, passed on unchanged.
+            unsafe { mimalloc::MiMalloc.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let _ = ALLOCATIONS.try_with(|c| c.set(c.get() + 1));
+            // SAFETY: same contract as the caller's, passed on unchanged.
+            unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let _ = ALLOCATIONS.try_with(|c| c.set(c.get() + 1));
+            // SAFETY: same contract as the caller's, passed on unchanged.
+            unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: same contract as the caller's, passed on unchanged.
+            unsafe { mimalloc::MiMalloc.dealloc(ptr, layout) }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests;

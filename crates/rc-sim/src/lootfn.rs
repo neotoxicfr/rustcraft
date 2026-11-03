@@ -93,6 +93,13 @@ impl Loot<'_> {
                 s
             }
             // A potion drawn among the options (`#tag`, id or list), every potion without them.
+            "set_random_potion" if crate::loot::loot_context_borrowed() => {
+                if let Some(p) = self.draw_random_potion(&f["options"], rng) {
+                    put_potion(&mut s, p);
+                }
+                s
+            }
+            // Old reading (`RUSTCRAFT_OPT_LOOTCTXBORROW=0`): the options copied into a list.
             "set_random_potion" => {
                 let all = || items.data.registry("minecraft:potion").map(|r| r.entries.clone()).unwrap_or_default();
                 let list: Vec<String> = match &f["options"] {
@@ -452,7 +459,14 @@ impl Loot<'_> {
                 s
             }
             "set_stew_effect" => {
-                let list = f["effects"].as_array().cloned().unwrap_or_default();
+                // Old reading (`RUSTCRAFT_OPT_LOOTCTXBORROW=0`): the effects copied first.
+                let copied;
+                let list: &[Value] = if crate::loot::loot_context_borrowed() {
+                    f["effects"].as_array().map_or(&[], Vec::as_slice)
+                } else {
+                    copied = f["effects"].as_array().cloned().unwrap_or_default();
+                    &copied
+                };
                 if s.id == "minecraft:suspicious_stew" && !list.is_empty() {
                     let e = &list[rng.next_int_bound(list.len() as i32) as usize];
                     let id = e["type"].as_str().unwrap_or("").to_owned();
@@ -511,6 +525,40 @@ impl Loot<'_> {
             _ => s,
         }
     }
+
+    /// Potion drawn among `options` (`#tag` of potions, one id or a list), among every
+    /// registered potion without them; one draw, none when there is nothing to draw from. Read
+    /// in place: the registry and the options are not copied.
+    fn draw_random_potion<'s>(&'s self, options: &'s Value, rng: &mut dyn Rand) -> Option<&'s str> {
+        let names = self.items.data.registry("minecraft:potion").map_or(&[][..], |r| r.entries.as_slice());
+        let pick = |count: usize, rng: &mut dyn Rand| (count > 0).then(|| rng.next_int_bound(count as i32) as usize);
+        match options {
+            Value::Null => pick(names.len(), rng).map(|k| names[k].as_str()),
+            Value::String(t) => match t.strip_prefix('#') {
+                Some(tag) => {
+                    let members = self.items.potion_tags.iter().find(|(n, _)| same_id(n, tag)).map_or(&[][..], |(_, ids)| ids);
+                    let known = || members.iter().filter_map(|&i| names.get(i as usize));
+                    pick(known().count(), rng).and_then(|k| known().nth(k)).map(String::as_str)
+                }
+                None => pick(1, rng).map(|_| t.as_str()),
+            },
+            Value::Array(a) => {
+                let listed = || a.iter().filter_map(Value::as_str);
+                pick(listed().count(), rng).and_then(|k| listed().nth(k))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// `a` and `b` are the same identifier once `minecraft:` is put before a bare one (as
+/// `args::id` does), compared without building either.
+fn same_id(a: &str, b: &str) -> bool {
+    fn full(x: &str) -> (&str, &str) {
+        if x.contains(':') { ("", x) } else { ("minecraft:", x) }
+    }
+    let ((na, pa), (nb, pb)) = (full(a), full(b));
+    na.len() + pa.len() == nb.len() + pb.len() && na.bytes().chain(pa.bytes()).eq(nb.bytes().chain(pb.bytes()))
 }
 
 /// S8: `exploration_map` parameters kept in `custom_data` (`rustcraft:explore`).
@@ -652,10 +700,17 @@ fn put_custom_data(s: &mut Stack, cd: Nbt) {
 /// default with its amounts read as doubles.
 fn attribute_entries(items: &Items, s: &Stack) -> Vec<Nbt> {
     const K: &str = "minecraft:attribute_modifiers";
+    const REMOVED: &str = "!minecraft:attribute_modifiers";
     if let Some(Nbt::List(l)) = crate::items::component(s, K) {
         return l.clone();
     }
-    if crate::items::component(s, &format!("!{K}")).is_some() {
+    // Old reading (`RUSTCRAFT_OPT_LOOTCTXBORROW=0`): the removal key written out at each call.
+    let removed = if crate::loot::loot_context_borrowed() {
+        crate::items::component(s, REMOVED).is_some()
+    } else {
+        crate::items::component(s, &format!("!{K}")).is_some()
+    };
+    if removed {
         return Vec::new();
     }
     let d = items.defaults(&s.id);

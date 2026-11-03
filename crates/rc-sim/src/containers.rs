@@ -842,7 +842,7 @@ impl Server {
             id.is_some_and(|id| tags.get(tag).is_some_and(|v| v.binary_search(&id).is_ok()))
         };
         let loot = crate::loot::Loot { pack: &self.life.pack, items: &self.life.items, block_tag: &tag_fn };
-        let ctx = crate::loot::Ctx { block: Some((block, Vec::new())), ..Default::default() };
+        let ctx = crate::loot::Ctx { block: Some((block, crate::loot::BlockProps::NONE)), ..Default::default() };
         let mut rng = self.life.rng;
         let burn = loot.int(&c["burn_time"], &ctx, &mut rng);
         let speed =

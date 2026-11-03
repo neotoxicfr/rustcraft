@@ -163,15 +163,16 @@ impl Server {
             let life = &mut *self.life;
             let loot = crate::loot::Loot { pack: &life.pack, items: &life.items, block_tag: &tag_fn };
             let ctx = crate::loot::Ctx { luck, tool: Some(brush), ..Default::default() };
-            let seq =
-                life.pack.get("loot_table", &table).and_then(|t| t["random_sequence"].as_str().map(str::to_owned));
+            // The table is read once: its sequence, then the draw.
+            let table_value = life.pack.get("loot_table", &table);
+            let resolved = table_value.as_deref();
             let stacks = if seed != 0 {
                 let mut rng = crate::mobs::jrand::JRand::new(seed);
-                loot.drops(&table, &ctx, &mut rng)
-            } else if let Some(q) = seq {
-                loot.drops(&table, &ctx, life.seqs.get(&q))
+                loot.drops_of(&table, resolved, &ctx, &mut rng)
+            } else if let Some(q) = resolved.and_then(|t| t["random_sequence"].as_str()) {
+                loot.drops_of(&table, resolved, &ctx, life.seqs.get(q))
             } else {
-                loot.drops(&table, &ctx, &mut life.rng)
+                loot.drops_of(&table, resolved, &ctx, &mut life.rng)
             };
             stacks.into_iter().next()
         };

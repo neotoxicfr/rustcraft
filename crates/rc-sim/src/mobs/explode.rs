@@ -354,10 +354,10 @@ impl Server {
                     continue;
                 }
                 let s = self.st(p);
-                let name = self.state_name(s).to_owned();
+                let is_tnt = self.state_name(s) == "minecraft:tnt";
                 self.heart_explosion_hit(p, s, ty, by);
                 // TNT: no loot, a primed TNT with a short fuse takes its place.
-                if name == "minecraft:tnt" {
+                if is_tnt {
                     let air = self.default_state("minecraft:air");
                     self.set_block(p, air, crate::blocks::flag::ALL);
                     self.tnt_was_exploded(p);
@@ -367,7 +367,7 @@ impl Server {
                 if hive {
                     self.hive_blown(p, hive_release);
                 }
-                let drops = self.explosion_drops(p, s, &name, if decay { Some(radius) } else { None });
+                let drops = self.explosion_drops(p, s, if decay { Some(radius) } else { None });
                 for d in drops {
                     let mut d = d;
                     for (_, st) in stacks.iter_mut() {
@@ -577,49 +577,14 @@ impl Server {
     }
 
     /// Loot of a blown-up block (block table, explosion context).
-    fn explosion_drops(
-        &mut self,
-        p: [i32; 3],
-        state: u32,
-        name: &str,
-        radius: Option<f32>,
-    ) -> Vec<crate::player::Stack> {
+    fn explosion_drops(&mut self, p: [i32; 3], state: u32, radius: Option<f32>) -> Vec<crate::player::Stack> {
         if !self.rule("minecraft:block_drops", true) {
             return Vec::new();
         }
-        let props: Vec<(String, String)> =
-            self.data.state_properties(state).map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
-        let be = self.block_entity(p).cloned();
-        let table = format!("minecraft:blocks/{}", name.trim_start_matches("minecraft:"));
-        let tags = &self.block_tags;
-        let data = &self.data;
-        let tag_fn = |tag: &str, n: &str| {
-            let id = data.blocks.iter().position(|b| b.name == n).map(|i| i as u32);
-            id.is_some_and(|id| tags.get(tag).is_some_and(|v| v.binary_search(&id).is_ok()))
-        };
-        let loot = crate::loot::Loot { pack: &self.life.pack, items: &self.life.items, block_tag: &tag_fn };
-        let empty = None;
-        let ctx = crate::loot::Ctx {
-            block: Some((name, props)),
-            tool: Some(empty),
-            explosion: radius,
-            block_entity: be.as_ref(),
-            ..Default::default()
-        };
-        let seq =
-            self.life.pack.get("loot_table", &table).and_then(|t| t["random_sequence"].as_str().map(str::to_owned));
-        match seq {
-            Some(s) => {
-                let rng = self.life.seqs.get(&s);
-                loot.drops(&table, &ctx, rng)
-            }
-            None => {
-                let mut rng = self.life.rng;
-                let d = loot.drops(&table, &ctx, &mut rng);
-                self.life.rng = rng;
-                d
-            }
+        if !crate::loot::loot_context_borrowed() {
+            return self.explosion_drops_with_owned_context(p, state, radius);
         }
+        self.draw_block_loot(p, state, crate::block_loot::BlockRemoval::Blown { radius })
     }
 
     pub(crate) fn default_state(&self, name: &str) -> u32 {

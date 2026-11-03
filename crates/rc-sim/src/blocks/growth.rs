@@ -819,7 +819,7 @@ impl Server {
         let name = self.state_name(s).to_owned();
         let be = self.block_entity(p).cloned();
         let ctx = crate::loot::Ctx {
-            block: Some((name.as_str(), self.props_of(s))),
+            block: Some((name.as_str(), crate::loot::BlockProps::of_state(&self.data, s))),
             tool: Some(Some(tool)),
             block_entity: be.as_ref(),
             ..Default::default()

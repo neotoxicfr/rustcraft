@@ -970,8 +970,7 @@ impl Server {
         };
         let block = state.as_ref().map(|(st, _)| {
             let name = self.data.block_of(*st).map_or("minecraft:air", |b| b.name.as_str());
-            let props = self.data.state_properties(*st).map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
-            (name, props)
+            (name, crate::loot::BlockProps::of_state(&self.data, *st))
         });
         let this_type = s.entity.map(|e| self.ent_type(e));
         let (tags, data) = (&self.block_tags, &self.data);
