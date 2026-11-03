@@ -286,6 +286,29 @@ impl Container {
         }
     }
 
+    /// Decompresses only the values `start .. start + out.len()` into `out` (a row of a section,
+    /// for example): the same values as [`Container::unpack_reference`] over the whole container
+    /// would give there, cells beyond the words included (content kept, palette applied).
+    pub fn unpack_range(&self, start: usize, out: &mut [u32]) {
+        let Container::Packed { bits, palette, data } = self else {
+            return self.unpack_reference(out);
+        };
+        let bits = *bits as usize;
+        let vpl = 64 / bits;
+        let mask = (1u64 << bits) - 1;
+        // One division for the whole range, then the slot advances word by word.
+        let (mut word, mut slot) = (start / vpl, start % vpl);
+        for v in out.iter_mut() {
+            let raw = data.get(word).map_or(*v, |w| ((w >> (slot * bits)) & mask) as u32);
+            *v = map_palette(palette, raw);
+            slot += 1;
+            if slot == vpl {
+                slot = 0;
+                word += 1;
+            }
+        }
+    }
+
     /// Decompression in one pass, width as a constant (inner loop unrolled), palette
     /// applied on the fly by a zero-padded table (outside the palette → 0).
     #[doc(hidden)]
@@ -1118,6 +1141,42 @@ mod tests {
         c.unpack_reference(&mut a);
         c.unpack_mono(&mut b);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn unpack_range_matches_reference() {
+        for (c, entries) in unpack_cases() {
+            let mut want = vec![0u32; entries];
+            c.unpack_reference(&mut want);
+            // Rows 0 and 15 of a section, two rows at once, ranges across words, the last value.
+            let ranges = [(0, 256), (15 * 256, 256), (0, 512), (7, 1), (13, 50), (entries - 1, 1), (0, entries)];
+            for (start, len) in ranges {
+                if start + len > entries {
+                    continue;
+                }
+                let mut got = vec![u32::MAX; len];
+                c.unpack_range(start, &mut got);
+                assert_eq!(got, want[start..start + len], "{c:?}, start {start}, length {len}");
+            }
+        }
+        // Output beyond the words: content kept then palette applied, as in the reference.
+        let c = Container::packed(3, 4, Some(vec![7, 8].into()), vec![0x10].into()).unwrap();
+        let (mut whole, mut range) = (vec![1u32; 20], vec![1u32; 6]);
+        c.unpack_reference(&mut whole);
+        c.unpack_range(14, &mut range);
+        assert_eq!(range, whole[14..]);
+    }
+
+    /// The cases tell neighbouring rows apart: a range read one row too low would be caught above.
+    #[test]
+    fn unpack_cases_tell_neighbouring_rows_apart() {
+        let five_bits = |(c, n): &(Container, usize)| *n == 4096 && matches!(c, Container::Packed { bits: 5, .. });
+        let (c, entries) = unpack_cases().into_iter().find(five_bits).expect("a 5-bit case");
+        let mut want = vec![0u32; entries];
+        c.unpack_reference(&mut want);
+        let mut got = vec![0u32; 256];
+        c.unpack_range(14 * 256, &mut got);
+        assert_ne!(got, want[15 * 256..16 * 256]);
     }
 
     #[test]
