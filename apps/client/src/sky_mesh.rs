@@ -42,15 +42,15 @@ impl JavaRandom {
     }
 }
 
-/// The game's tabulated sine (65536 entries).
+/// The game's tabulated sine of a float angle (the table shared by every crate).
+#[inline]
 pub fn table_sin(x: f32) -> f32 {
-    let i = ((f64::from(x) * 10_430.378_350_470_453) as i64 & 65_535) as f64;
-    (i / 10_430.378_350_470_453).sin() as f32
+    rc_data::java_math::sin(f64::from(x))
 }
 
+#[inline]
 pub fn table_cos(x: f32) -> f32 {
-    let i = ((f64::from(x) * 10_430.378_350_470_453 + 16_384.0) as i64 & 65_535) as f64;
-    (i / 10_430.378_350_470_453).sin() as f32
+    rc_data::java_math::cos(f64::from(x))
 }
 
 /// Stars: 6 vertices (two triangles) per accepted star, at distance 100 (§ 4.2).

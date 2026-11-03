@@ -7,8 +7,9 @@ mod common;
 use std::time::Instant;
 
 use rayon::prelude::*;
+use rc_data::java_math::floor_to_i32;
 use rc_worldgen::jmath;
-use rc_worldgen::math::{floor_f_java, floor_f_libm, floor_i_java, floor_i_libm, floor_l_java, floor_small};
+use rc_worldgen::math::floor_i_libm;
 use rc_worldgen::noise::{Layer, NoiseStack, Octave, Paths, Perlin, Smeared};
 use rc_worldgen::rng::Rng;
 use rc_worldgen::volume::Volume;
@@ -36,153 +37,7 @@ impl Mix {
 }
 
 // ---------------------------------------------------------------------------------------------
-// floor
-
-/// Reference of the game's 26.3 `floor` to i32: round down then saturated conversion,
-/// hence NaN → 0, ≥ 2³¹ (and +∞) → MAX, < −2³¹ (and −∞) → MIN.
-fn java_floor_ref(v: f64) -> i32 {
-    if v.is_nan() {
-        0
-    } else if v >= 2_147_483_648.0 {
-        i32::MAX
-    } else if v < -2_147_483_648.0 {
-        i32::MIN
-    } else {
-        v.floor() as i32
-    }
-}
-
-fn java_floor_ref_f(v: f32) -> i32 {
-    java_floor_ref(f64::from(v))
-}
-
-/// All the f32 values (2³²), in f32 and converted to f64; returns the first difference.
-fn check_floor_all_f32(fi: fn(f64) -> i32, ff: fn(f32) -> i32) -> Option<u32> {
-    (0..=u32::MAX).into_par_iter().find_any(|&b| {
-        let v = f32::from_bits(b);
-        ff(v) != java_floor_ref_f(v) || fi(f64::from(v)) != java_floor_ref(f64::from(v))
-    })
-}
-
-fn floor_limits() -> Vec<f64> {
-    let mut l = vec![
-        0.0,
-        -0.0,
-        f64::NAN,
-        -f64::NAN,
-        f64::INFINITY,
-        f64::NEG_INFINITY,
-        f64::MIN_POSITIVE,
-        -f64::MIN_POSITIVE,
-        f64::from_bits(1),
-        -f64::from_bits(1),
-        f64::MAX,
-        f64::MIN,
-        2_147_483_647.0,
-        2_147_483_647.5,
-        2_147_483_648.0,
-        -2_147_483_648.0,
-        -2_147_483_648.5,
-        -2_147_483_649.0,
-        -2_147_483_647.5,
-        16_777_216.0,
-        -16_777_216.0,
-        9.007_199_254_740_992e15,
-        -9.007_199_254_740_992e15,
-    ];
-    for n in -40..40 {
-        let n = f64::from(n);
-        for d in [0.5, 0.25, 0.999_999_999_999_999_9, 1e-12] {
-            l.push(n + d);
-            l.push(n - d);
-        }
-        l.push(n);
-        l.push(n.next_up());
-        l.push(n.next_down());
-    }
-    for e in [31, 32, 52, 53, 62, 63, 64] {
-        let p = 2f64.powi(e);
-        for v in [p, p.next_up(), p.next_down(), -p, (-p).next_up(), (-p).next_down()] {
-            l.push(v);
-        }
-    }
-    l
-}
-
-fn check_floor_f64(fi: fn(f64) -> i32, n: u64) -> Option<f64> {
-    if let Some(v) = floor_limits().into_iter().find(|&v| fi(v) != java_floor_ref(v)) {
-        return Some(v);
-    }
-    (0..n / 1_000_000).into_par_iter().find_map_any(|chunk| {
-        let mut r = Mix(chunk.wrapping_mul(0x1234_5678_9ABC_DEF1) ^ 0xF00D);
-        for i in 0..1_000_000u32 {
-            let v = match i % 4 {
-                0 => f64::from_bits(r.next()),
-                1 => r.range(-3e9, 3e9),
-                2 => r.range(-100.0, 100.0),
-                _ => (r.range(-2.2e9, 2.2e9)).round() + [0.0, 0.5, -0.5, 1e-9][r.below(4) as usize],
-            };
-            if fi(v) != java_floor_ref(v) {
-                return Some(v);
-            }
-        }
-        None
-    })
-}
-
-/// "Without correction of the negatives" floor: truncation alone.
-fn sabotaged_floor(v: f64) -> i32 {
-    v as i32
-}
-
-fn sabotaged_floor_f(v: f32) -> i32 {
-    v as i32
-}
-
-/// Old form of `floor` (truncation then −1 without saturation): MAX under −2³¹.
-fn sabotaged_floor_wrap(v: f64) -> i32 {
-    let t = v as i32;
-    t.wrapping_sub(i32::from(v < f64::from(t)))
-}
-
-/// `floor_small`: returned f64 value = `f64::from(integer)` bit for bit (never −0).
-fn floor_small_ok(v: f64) -> bool {
-    let (i, f) = floor_small(v);
-    i == java_floor_ref(v) && f.to_bits() == f64::from(i).to_bits()
-}
-
-#[test]
-fn floor_java_exhaustive_f32_and_sabotage() {
-    assert_eq!(check_floor_all_f32(floor_i_java, floor_f_java), None);
-    let bad = (0..=u32::MAX).into_par_iter().find_any(|&b| {
-        let v = f64::from(f32::from_bits(b));
-        v.abs() < 2_147_483_648.0 && !floor_small_ok(v)
-    });
-    assert_eq!(bad, None);
-    assert!(floor_limits().into_iter().filter(|v| v.abs() < 2_147_483_648.0).all(floor_small_ok));
-    assert!(check_floor_all_f32(sabotaged_floor, sabotaged_floor_f).is_some(), "sabotage not detected");
-}
-
-#[test]
-fn floor_java_random_f64_and_limits() {
-    assert_eq!(check_floor_f64(floor_i_java, 100_000_000), None);
-    assert!(check_floor_f64(sabotaged_floor, 1_000_000).is_some(), "sabotage not detected");
-    assert!(check_floor_f64(sabotaged_floor_wrap, 1_000_000).is_some(), "overflow not detected");
-    // The game saturates everywhere: the old library path and the new one are equal everywhere.
-    for v in floor_limits().into_iter().chain([-1e10, 1e10, -1e19, 1e19, -1e300]) {
-        assert_eq!(floor_i_libm(v), floor_i_java(v), "{v}");
-        assert_eq!(floor_l_java(v), v.floor() as i64, "{v}");
-    }
-    assert_eq!(floor_i_java(-1e10), i32::MIN);
-    assert_eq!(floor_i_java(f64::NEG_INFINITY), i32::MIN);
-    assert_eq!(floor_l_java(-1e19), i64::MIN);
-    assert_eq!(floor_l_java(f64::NEG_INFINITY), i64::MIN);
-    assert_eq!(floor_f_java(-1e10), i32::MIN);
-    for b in [0u32, 0x8000_0000, 0x7F80_0000, 0xFF80_0000, 0x4F00_0000, 0xCF00_0000, 0xCF00_0001, 0x7FC0_0000] {
-        let v = f32::from_bits(b);
-        assert_eq!(floor_f_libm(v), floor_f_java(v), "{v}");
-    }
-}
+// floor: its equivalence proofs moved with the shared code (`rc-data`, `java_math` tests).
 
 // ---------------------------------------------------------------------------------------------
 // Noise: volumes
@@ -481,7 +336,13 @@ fn noise_micro_bench() {
     for (lo, label) in [(3e7, "±3e7"), (3e9, "±3e9 (28% out of range)")] {
         let xs: Vec<f64> = (0..10_000_000).map(|_| r.range(-lo, lo)).collect();
         time(&format!("floor libm 10^7 {label}"), 5, || xs.iter().map(|&v| i64::from(floor_i_libm(v))).sum::<i64>());
-        time(&format!("floor java 10^7 {label}"), 5, || xs.iter().map(|&v| i64::from(floor_i_java(v))).sum::<i64>());
+        time(&format!("floor java 10^7 {label}"), 5, || xs.iter().map(|&v| i64::from(floor_to_i32(v))).sum::<i64>());
+        // The generator's old scattered floors read their switch at every call (an atomic load and
+        // a branch); they now call the shared floor directly.
+        let switch_per_call = |v: f64| if rc_worldgen::opt::floor_java() { floor_to_i32(v) } else { floor_i_libm(v) };
+        time(&format!("floor java, switch read per call, 10^7 {label}"), 5, || {
+            xs.iter().map(|&v| i64::from(switch_per_call(v))).sum::<i64>()
+        });
     }
 
     let mut rng = Rng::xoroshiro(1);

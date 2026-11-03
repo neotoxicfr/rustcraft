@@ -5559,3 +5559,100 @@ Not done: `players enable` still looks its score up twice; `execute store … sc
 objective state once per target (it lives in `exec.rs`); leaving a team still removes the member
 from the team's ordered list (O(team size)). To settle on the quiet-machine scene bench:
 `datapack` (2 passes, old exe as reference).
+## C7-M05: shared Java arithmetic, one sine table, floors without the C library (03/11, loaded machine)
+
+Module `rc_data::java_math`, shared by the client and the integrated server (same process: one copy).
+Micro-benches `cargo test --release -p rc-data --lib java_math -- --ignored --nocapture` (trial
+profile, machine loaded by other agents compiling, best of 5 or 7; three runs, the third quoted).
+
+- Sine table. Before: seven copies. Physics and carver: a 256 KB table each, filled by the C library
+  at first use; decorations: one 256 KB table per decorator (surface, Nether, End), filled at world
+  opening; environment curves, fluid mesh, sky and command coordinates: the entry recomputed by the C
+  library at every call. Now one table, computed by the compiler (`const fn`: quarter-turn reduction
+  with π/2 in three pieces, then Taylor series to r^17 / r^18), stored once in the executable (256 KB,
+  read-only, paged in on demand). Same bits as the game's virtual machine (FNV-1a hash of the table
+  dumped by the launcher's Java 25.0.1, intrinsic on or off) and, on Windows, as each of the four old
+  formulas (`i / scale`, `i * 2π / 65536`, `i * π * 2 / 65536`, library entry): the test fails if one
+  entry moves by one unit of the last bit. On other systems the old tables followed the local C
+  library; the frozen one is the same everywhere. Compile time: rc-data builds in under 5 s.
+- Switches, read once (first call): `RUSTCRAFT_OPT_SHARED_SIN_TABLE=0` computes each entry per call
+  (old path of the four recomputing copies), `RUSTCRAFT_OPT_FROZEN_SIN_TABLE=0` fills the shared table
+  with the C library at first use (old path of the three table copies, now shared).
+
+| sin + cos, 10⁶ calls | 1 thread, ms | 32 threads (10⁶ each), ms |
+|---|---|---|
+| entry recomputed per call (old env, fluid, sky, commands) | 20.5 | 36.6 |
+| table filled at first use (old physics, carver, decorations) | 1.36 | 5.23 |
+| frozen table, read directly | 1.11 | 3.65 |
+| frozen table through the switches (default) | 1.39 | — |
+
+  Filling one table with the C library: 0.28 ms; before, up to five were filled (physics, carver, three
+  decorators: about 1.4 ms, half of it at world opening) and held 1.25 MB of heap; now nothing at
+  startup and no heap. The switch check costs 0.14 ns per read (1.39 against 1.11 ms): the same as the
+  old OnceLock tables. GPU: not relevant (scattered single angles).
+- Fidelity fix (fluid mesh): the old copy multiplied the float angle by the table scale in single
+  precision; the game widens the angle and multiplies in double. 163 of the float angles in [−7, 7]
+  sampled one in 97 land on another entry. The flowing texture's rotation changes by one table step
+  (≈ 10⁻⁴ rad, a few ten-thousandths of a texel) on those angles. The reference capture has such
+  flows: every rc-mesh fingerprint changed and was replaced; with the old single-precision product
+  (and the shared table) all the previous values passed again, so the table itself moved nothing.
+  Still different from the game in that line (outside this mission): the angle comes from the library
+  `atan2` and the quarter turn is taken off in double, where the game uses its tabulated `atan2`
+  (`rc-sim mobs::mth::atan2`) and subtracts in single precision.
+- Floors and Java rounding: one shared set instead of the copies of worldgen (`floor_i_java`,
+  `floor_small`, `floor_f_java`, `floor_l_java`, `round_half_up`), of the data command (`floor_i32`),
+  of enchanting, enchantment effects, projectiles, font and mip levels (five copies of the game's
+  float rounding, one of its double rounding). Two copies rounded through a single-precision sum
+  (wrong for 0.49999997 and odd integers in [2²³, 2²⁴[, values those callers never reach); one
+  truncated its long to an int instead of saturating. Proof: every float (2³²) and each widened to a
+  double, against the library and the game's rules; 10⁸ random doubles and the limits (±0, NaN
+  quiet and signaling, ±∞, subnormals, ±2³¹, ±2⁵², ±2⁶³); sabotages (truncation without correction,
+  correction without saturation, floor without the sign copied back, rounding through a float sum)
+  detected. 10⁷ values in ±3·10⁷, ms:
+
+| Operation | C library (old) | Shared | Variant measured, not kept |
+|---|---|---|---|
+| floor to i32 | 18.1 | 6.4 (1.5·2⁵² shift) | truncation + saturating correction 12.8 |
+| floor to i64 | 13.3 | 6.1 (shift, integer read in the bits) | truncation + saturating correction 10.6 |
+| floor of a float to i32 | 13.7 | 7.3 (widened, shift) | old worldgen single-precision truncation 11.1 |
+| floor f64 → f64 (sign of −0 kept) | 12.5 | 7.4 (±2⁵² shift + copysign) | truncation through a long 13.0 |
+| ceil f64 → f64 | 12.5 | 8.3 | — |
+| Java rounding of a float | 13.8 (float sum + library floor) | 8.6 | — |
+| Java rounding of a double | 14.6 | 15.5 | cold code (enchanting), formula kept for clarity |
+
+  The saturating `as` conversions of x86-64 cost extra tests: the shift reads the integer without
+  them. First version of the double rounding (integer select with `saturating_add`): 86.8 ms,
+  replaced. Floor to i32 without a branch (`select_unpredictable` between the shift and the
+  saturated truncation): 14.8 ms in range against 6.7 with the branch (15.3 against 32.4 with 28%
+  of the values beyond ±2³¹, which no caller reaches): branch kept.
+- Switch out of the call path (`noise_opt noise_micro_bench`, 10⁷ in ±3·10⁷): the generator's
+  scattered floors (2-D simplex, aquifer, surface rules, cell tops, clay bands, scattered ores)
+  read `RUSTCRAFT_OPT_FLOOR_JAVA` at every call: 8.44 ms against 6.67 for the shared floor called
+  directly (library 15.9). The switch is now read once by the hot caller and kept: per volume in
+  the noise kernel (`Paths`), per evaluation context (`sampler::Opts`: aquifer, surface rules, cell
+  tops, clay bands, the `floor`, `ceil`, `round` and `truncate` density functions), per simplex
+  noise (at construction), per scattered ore. `=0` restores every old library call until the
+  quiet-machine bench. `math::floor_switch_paths_agree` proves both paths give the same bits
+  (one float in 997, halves, limits; it fails if the old path truncates or rounds like Rust);
+  `sampler_opt` runs the `floor_java` variant alone on the real generator, but its surface levels
+  and cell tops are positive there, so it cannot see a negative-value difference on its own.
+- Collision walk (`collide::scan`, shared by `resolve`, `support_of` and the free-space
+  tests): its six floors use the shared one (`RUSTCRAFT_OPT_FLOOR_JAVA=0` restores the library call);
+  hot map v3: floor under 3% of `collect_in` (below its fourth callee), well under the scene bench's
+  noise. Not done: the hot rc-sim functions of the mission (`mob_move`, `tick_living`, `ai_step`),
+  after the server missions on those files; the other ~1,900 library roundings, none hot in the map.
+- Fidelity fix (commands): the duration argument and the server's tick count rounded with Rust's
+  `round` (halves away from zero) where the game rounds halves up: `/time add -0.5` (or `-0.5t`)
+  was refused with "-1" below the minimum 0, the game accepts it (0 ticks); a refused `-1.5`
+  reported -2 instead of -1. Both now use the shared rounding. Daylight detector: its rounding
+  too (negative results are clamped to 0, nothing changes there), and its cosine came from the C
+  library (single precision) where the game reads its sine table: on 3·10⁶ (sky level, angle)
+  pairs, 369 signals change by one (`daylight_power_reads_the_sine_table`). The 42 other
+  `.round() as <integer>` outside tests and the float `.round()` calls were reviewed: positive
+  inputs only (statistics in cm and tenths of a heart, delays, costs, velocity packing, UI sizes),
+  where Rust's rounding equals the game's, or not the game's
+  rounding (font outlines in 26.6 fixed point, our own sine reduction, tests).
+- To measure on the quiet machine: `title` (startup), `ocean` (fluids), `generation` (carver,
+  decorations, noise floors), `crowd-1000`, `tnt`, `dropped-items` (collision walks); memstats at
+  world opening (−1 MB of heap expected).
+

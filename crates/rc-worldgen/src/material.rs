@@ -11,7 +11,6 @@ use crate::biome::{BiomeSource, ChunkBiomes, Searcher, zoom_cached};
 use crate::data::{DataPack, full_id};
 use crate::density::Axis;
 use crate::json::Json;
-use crate::math::{floor_f, round_half_up};
 use crate::noise::Simplex;
 use crate::palette::{AIR, BlockId, BlockTable};
 use crate::proto::ProtoTerrain;
@@ -1465,7 +1464,8 @@ impl MaterialSystem {
         if let Some(v) = st.min_surface {
             return v;
         }
-        let v = floor_f(self.preliminary_level(env, st, st.x, st.z)) + st.sd - 8;
+        let level = self.preliminary_level(env, st, st.x, st.z);
+        let v = env.ctx.floor_f32_to_i32(level) + st.sd - 8;
         st.min_surface = Some(v);
         v
     }
@@ -1492,7 +1492,8 @@ impl MaterialSystem {
         for (i, c) in out.iter_mut().enumerate() {
             let (x, z) = (chunk.min_x() + (i & 15) as i32, chunk.min_z() + (i >> 4) as i32);
             c.depth = self.surface_depth(env.g, x, z);
-            c.min_surface = floor_f(self.preliminary_level(env, st, x, z)) + c.depth - 8;
+            let level = self.preliminary_level(env, st, x, z);
+            c.min_surface = env.ctx.floor_f32_to_i32(level) + c.depth - 8;
         }
         out
     }
@@ -1631,18 +1632,21 @@ impl MaterialSystem {
         t - (v + st.y as f32 - snow_level as f32) * 0.05 / 40.0 < 0.15
     }
 
-    fn band(&self, g: &Generator, x: i32, y: i32, z: i32) -> BlockId {
-        let o = round_half_up(self.noise(g, self.clay_offset, f64::from(x), 0.0, f64::from(z)) * 4.0);
+    fn band(&self, env: &Env, x: i32, y: i32, z: i32) -> BlockId {
+        let o = self.band_offset(env, x, z);
         self.bands[((y + o + 192) % 192) as usize]
     }
 
     /// [`MaterialSystem::band`] with the column offset kept (`MAT_COLCACHE`).
-    fn band_cached(&self, g: &Generator, st: &mut MatState) -> BlockId {
+    fn band_cached(&self, env: &Env, st: &mut MatState) -> BlockId {
         let (x, z) = (st.x, st.z);
-        let o = *st
-            .band_off
-            .get_or_insert_with(|| round_half_up(self.noise(g, self.clay_offset, f64::from(x), 0.0, f64::from(z)) * 4.0));
+        let o = *st.band_off.get_or_insert_with(|| self.band_offset(env, x, z));
         self.bands[((st.y + o + 192) % 192) as usize]
+    }
+
+    /// Offset of the clay bands in the column (x, z).
+    fn band_offset(&self, env: &Env, x: i32, z: i32) -> i32 {
+        env.ctx.round_f32_to_i32(self.noise(env.g, self.clay_offset, f64::from(x), 0.0, f64::from(z)) * 4.0)
     }
 
     fn ore(&self, i: u32, env: &mut Env, st: &mut MatState) -> Option<BlockId> {
@@ -1701,9 +1705,9 @@ impl MaterialSystem {
                 }
             }
             Rule::Bandlands => Some(if self.opts.colcache {
-                self.band_cached(env.g, st)
+                self.band_cached(env, st)
             } else {
-                self.band(env.g, st.x, st.y, st.z)
+                self.band(env, st.x, st.y, st.z)
             }),
             Rule::Ore(i) => self.ore(*i, env, st),
         }

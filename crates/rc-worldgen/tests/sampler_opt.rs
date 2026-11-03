@@ -121,7 +121,7 @@ const SEED: i64 = 20_261_011;
 
 /// Each path alone, then the combinations with `range_yvol`, then all: a faulty track is
 /// named by its own failure.
-const VARIANTS: [(&str, Opts); 13] = [
+const VARIANTS: [(&str, Opts); 14] = [
     ("column_memo_y_independent", Opts { column_memo_y_independent: true, ..Opts::OLD }),
     ("memo+sublattice", Opts { column_memo_y_independent: true, sublattice_cache_read: true, ..Opts::OLD }),
     ("range_yvol", Opts { range_yvol: true, ..Opts::OLD }),
@@ -131,6 +131,7 @@ const VARIANTS: [(&str, Opts); 13] = [
     ("best_fit_buffers", Opts { best_fit_buffers: true, ..Opts::OLD }),
     ("sublattice_cache_read", Opts { sublattice_cache_read: true, ..Opts::OLD }),
     ("spline_inputs_on_stack", Opts { spline_inputs_on_stack: true, ..Opts::OLD }),
+    ("floor_java", Opts { floor_java: true, ..Opts::OLD }),
     ("yvol+pool", Opts { range_yvol: true, vol_pool: true, ..Opts::OLD }),
     ("yvol+spline", Opts { range_yvol: true, spline_stack: true, ..Opts::OLD }),
     ("yvol+sublattice", Opts { range_yvol: true, sublattice_cache_read: true, ..Opts::OLD }),

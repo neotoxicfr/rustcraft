@@ -79,7 +79,8 @@ pub fn time_ticks(s: &str) -> i32 {
     } else {
         (s, 1.0)
     };
-    (num.parse::<f32>().unwrap_or(0.0) * f).round() as i32
+    // The game's rounding (halves up): `-0.5t` is 0 ticks, not -1.
+    rc_data::java_math::round_f32_to_i32(num.parse::<f32>().unwrap_or(0.0) * f)
 }
 
 impl Server {

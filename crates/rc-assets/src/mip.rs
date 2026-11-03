@@ -34,10 +34,6 @@ impl Strategy {
 /// Mip levels of the game below the original image (default setting).
 pub const GAME_LEVELS: u32 = 4;
 
-fn round_f32(v: f32) -> i32 {
-    (f64::from(v) + 0.5).floor() as i32
-}
-
 /// sRGB → linear tables (out of 1023) and linear (out of 1023) → sRGB.
 fn tables() -> &'static ([u16; 256], [u8; 1024]) {
     static T: OnceLock<([u16; 256], [u8; 1024])> = OnceLock::new();
@@ -54,11 +50,11 @@ fn tables() -> &'static ([u16; 256], [u8; 1024]) {
         };
         let mut lin = [0u16; 256];
         for (i, v) in lin.iter_mut().enumerate() {
-            *v = round_f32(to_linear(i as f32 / 255.0) * 1023.0) as u16;
+            *v = rc_data::java_math::round_f32_to_i32(to_linear(i as f32 / 255.0) * 1023.0) as u16;
         }
         let mut srgb = [0u8; 1024];
         for (i, v) in srgb.iter_mut().enumerate() {
-            *v = round_f32(to_srgb(i as f32 / 1023.0) * 255.0) as u8;
+            *v = rc_data::java_math::round_f32_to_i32(to_srgb(i as f32 / 1023.0) * 255.0) as u8;
         }
         (lin, srgb)
     })

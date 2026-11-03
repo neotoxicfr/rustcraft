@@ -293,7 +293,7 @@ impl NoiseAquifer {
         let mut max = i32::MIN;
         for z in 0..v.sz {
             for x in 0..v.sx {
-                let s = crate::math::floor_f(buf[v.index(x, 0, z)]);
+                let s = ctx.floor_f32_to_i32(buf[v.index(x, 0, z)]);
                 self.surface.put(v.bx(x) >> 2, v.bz(z) >> 2, s);
                 max = max.max(s);
             }
@@ -306,7 +306,8 @@ impl NoiseAquifer {
         if let Some(v) = self.surface.get(qx, qz) {
             return v;
         }
-        let v = crate::math::floor_f(g.value(self.cfg.surface_level, ctx, qx << 2, 0, qz << 2));
+        let level = g.value(self.cfg.surface_level, ctx, qx << 2, 0, qz << 2);
+        let v = ctx.floor_f32_to_i32(level);
         self.surface.put(qx, qz, v);
         v
     }

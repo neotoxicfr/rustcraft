@@ -81,7 +81,7 @@ fn level_values_and_value_effects() {
     let mut b = JRand::new(42);
     let out = crate::projectiles::ench::remove_binomial(0.5, 200.0, &mut a);
     let g = b.next_gaussian();
-    let expect = 200.0 - crate::projectiles::ench::java_round_f64(100.0 + g * 50f64.sqrt()).clamp(0, 200) as f32;
+    let expect = 200.0 - rc_data::java_math::round_to_i64(100.0 + g * 50f64.sqrt()).clamp(0, 200) as f32;
     assert_eq!(out, expect, "normal approximation");
     assert_eq!(a.next_int(), b.next_int(), "more than one draw for the approximation");
     // 2.5 trials: three draws (0, 1, 2 < 2.5).

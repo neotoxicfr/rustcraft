@@ -286,23 +286,6 @@ pub fn bezier(c: [f32; 4], x: f32) -> f32 {
     f(ay, by, cy, t)
 }
 
-/// Tabulated sine of the game (65 536 steps per turn), entry computed on demand: the same
-/// value as the table, without keeping it (the named curves are rare and cheap).
-const SIN_SCALE: f64 = 10_430.378_350_470_453;
-
-fn table_entry(i: i64) -> f32 {
-    ((i & 65_535) as f64 / SIN_SCALE).sin() as f32
-}
-
-fn table_sin(a: f64) -> f32 {
-    table_entry((a * SIN_SCALE) as i64)
-}
-
-/// A quarter turn further in the table.
-fn table_cos(a: f64) -> f32 {
-    table_entry((a * SIN_SCALE + 16_384.0) as i64)
-}
-
 /// Named curve `i` of [`rc_data::EASE_NAMES`] at `x` in [0, 1], with the game's mix of single
 /// and double precision (an unknown rank is linear).
 pub fn named_ease(i: u8, x: f32) -> f32 {
@@ -348,7 +331,7 @@ pub fn named_ease(i: u8, x: f32) -> f32 {
         6 => x * x,
         7 => sq(sq(x)),
         8 => sq(sq(x)) * x,
-        9 => 1.0 - table_cos(f64::from(x * FRAC_PI_2)),
+        9 => 1.0 - rc_data::java_math::cos(f64::from(x * FRAC_PI_2)),
         10 => {
             if x < 0.5 {
                 4.0 * x * x * (7.189_819 * x - 2.594_909_4) / 2.0
@@ -393,7 +376,7 @@ pub fn named_ease(i: u8, x: f32) -> f32 {
         16 => if x < 0.5 { 2.0 * sq(x) } else { (1.0 - (-2.0 * xd + 2.0).powf(2.0) / 2.0) as f32 },
         17 => if x < 0.5 { 8.0 * sq(sq(x)) } else { (1.0 - (-2.0 * xd + 2.0).powf(4.0) / 2.0) as f32 },
         18 => if x < 0.5 { 16.0 * x * x * x * x * x } else { (1.0 - (-2.0 * xd + 2.0).powf(5.0) / 2.0) as f32 },
-        19 => -(table_cos(f64::from(PI * x)) - 1.0) / 2.0,
+        19 => -(rc_data::java_math::cos(f64::from(PI * x)) - 1.0) / 2.0,
         20 => 1.0 + 2.701_58 * cube(x - 1.0) + 1.701_58 * sq(x - 1.0),
         21 => out_bounce(x),
         22 => f64::from(1.0 - sq(x - 1.0)).sqrt() as f32,
@@ -403,7 +386,7 @@ pub fn named_ease(i: u8, x: f32) -> f32 {
         26 => 1.0 - sq(1.0 - x),
         27 => 1.0 - sq(sq(1.0 - x)),
         28 => 1.0 - (1.0 - xd).powf(5.0) as f32,
-        29 => table_sin(f64::from(x * FRAC_PI_2)),
+        29 => rc_data::java_math::sin(f64::from(x * FRAC_PI_2)),
         _ => x,
     }
 }

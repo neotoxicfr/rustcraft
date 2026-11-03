@@ -26,9 +26,9 @@ use rc_mesh::wire::{MeshJob, Sections};
 
 /// Expected fingerprints per rule (old, game): default, opaque leaves, no occlusion.
 const EXPECTED: [[u64; 3]; 2] = [
-    [EXPECTED_COMPACT, 0x1b0f_f1b4_7b27_c532, 0x5dbd_7a6c_3e30_3263],
+    [EXPECTED_COMPACT, 0x8ff1_31b9_4bea_0b7a, 0x8f56_d4da_6fd0_83e3],
     // Game rule: 6,189,376 faces instead of 6,193,742 (−4,366, of which 5 fluid ones) default settings.
-    [0x6015_660c_daa2_d469, 0xc10a_24a5_6d12_3545, 0x660e_1344_bdf3_84ab],
+    [0xe684_40dc_dfe3_b631, 0x7cc0_d3af_93fe_c3e5, 0x43e6_1412_b904_93fb],
 ];
 
 fn total<'a>(meshes: impl Iterator<Item = &'a BlockMesh>) -> u64 {

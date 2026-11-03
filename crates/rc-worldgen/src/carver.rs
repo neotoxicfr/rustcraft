@@ -1,31 +1,13 @@
 //! Carved caves (spec generation-terrain § 7): `cave` caves and `canyon` canyons, size mask of
 //! the target chunk, then mask application (aquifers, top material on grass).
 
-use std::sync::OnceLock;
+use rc_data::java_math;
 
 use crate::data::DataPack;
 use crate::json::Json;
 use crate::material::GenContext;
 use crate::rng::LegacyRandom;
 use crate::{Error, data::full_id};
-
-// ---------------------------------------------------------------- table sine
-
-fn sin_table() -> &'static [f32] {
-    static T: OnceLock<Vec<f32>> = OnceLock::new();
-    T.get_or_init(|| (0..65536).map(|i| (f64::from(i) / 10_430.378_350_470_453).sin() as f32).collect())
-}
-
-/// The game's table sine (argument converted to f64).
-#[inline]
-pub fn sin_t(a: f64) -> f32 {
-    sin_table()[((a * 10_430.378_350_470_453) as i64 & 65535) as usize]
-}
-
-#[inline]
-pub fn cos_t(a: f64) -> f32 {
-    sin_table()[((a * 10_430.378_350_470_453 + 16384.0) as i64 & 65535) as usize]
-}
 
 // ---------------------------------------------------------------- value providers
 
@@ -462,7 +444,7 @@ impl CaveDef {
             if r.next_int_bounded(4) == 0 {
                 let ys = f64::from(self.room_vertical.sample(r));
                 let th = 1.0 + r.next_float() * 6.0;
-                let hr = 1.5 + f64::from(sin_t(f64::from(PI_F / 2.0)) * th);
+                let hr = 1.5 + f64::from(java_math::sin(f64::from(PI_F / 2.0)) * th);
                 let vr = hr * ys;
                 t.ellipsoid(x + 1.0, y, z, hr, vr, skip);
                 tunnels += r.next_int_bounded(4);
@@ -532,12 +514,12 @@ fn tunnel_body(
     let mut y_rota = 0.0f32;
     let mut x_rota = 0.0f32;
     for p in step..dist {
-        let hr = 1.5 + f64::from(sin_t(f64::from(PI_F * p as f32 / dist as f32)) * th);
+        let hr = 1.5 + f64::from(java_math::sin(f64::from(PI_F * p as f32 / dist as f32)) * th);
         let vr = hr * y_scale;
-        let cos_x = cos_t(f64::from(rot_v));
-        x += f64::from(cos_t(f64::from(rot_h)) * cos_x);
-        y += f64::from(sin_t(f64::from(rot_v)));
-        z += f64::from(sin_t(f64::from(rot_h)) * cos_x);
+        let cos_x = java_math::cos(f64::from(rot_v));
+        x += f64::from(java_math::cos(f64::from(rot_h)) * cos_x);
+        y += f64::from(java_math::sin(f64::from(rot_v)));
+        z += f64::from(java_math::sin(f64::from(rot_h)) * cos_x);
         rot_v *= if steep { 0.92 } else { 0.7 };
         rot_v += x_rota * 0.1;
         rot_h += y_rota * 0.1;
@@ -609,17 +591,17 @@ impl CanyonDef {
         let mut y_rota = 0.0f32;
         let mut x_rota = 0.0f32;
         for p in 0..distance {
-            let mut hr = 1.5 + f64::from(sin_t(f64::from(p as f32 * PI_F / distance as f32)) * th);
+            let mut hr = 1.5 + f64::from(java_math::sin(f64::from(p as f32 * PI_F / distance as f32)) * th);
             let mut vr = hr * y_scale;
             hr *= f64::from(self.horizontal_radius_factor.sample(&mut r));
             let m = 1.0 - (0.5 - p as f32 / distance as f32).abs() * 2.0;
             let factor = self.vertical_default + self.vertical_center * m;
             vr = f64::from(factor) * vr * f64::from(r.next_float() * (1.0 - 0.75) + 0.75);
-            let xc = cos_t(f64::from(rot_v));
-            let xs = sin_t(f64::from(rot_v));
-            x += f64::from(cos_t(f64::from(rot_h)) * xc);
+            let xc = java_math::cos(f64::from(rot_v));
+            let xs = java_math::sin(f64::from(rot_v));
+            x += f64::from(java_math::cos(f64::from(rot_h)) * xc);
             y += f64::from(xs);
-            z += f64::from(sin_t(f64::from(rot_h)) * xc);
+            z += f64::from(java_math::sin(f64::from(rot_h)) * xc);
             rot_v *= 0.7;
             rot_v += x_rota * 0.05;
             rot_h += y_rota * 0.05;

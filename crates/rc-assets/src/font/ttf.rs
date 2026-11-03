@@ -45,11 +45,6 @@ impl std::fmt::Debug for TtfFace {
     }
 }
 
-/// "Half towards +∞" rounding of a float, like the game's integer rounding.
-fn round_half_up(v: f32) -> i32 {
-    (v + 0.5).floor() as i32
-}
-
 impl TtfFace {
     /// Font read; `None` if it is not in TrueType format (`glyf` outlines).
     pub fn new(data: Arc<[u8]>, params: TtfParams) -> Option<TtfFace> {
@@ -67,10 +62,10 @@ impl TtfFace {
             .collect();
         cps.sort_unstable_by_key(|e| e.0);
         cps.dedup_by_key(|e| e.0);
-        let ppem = round_half_up(params.size * params.oversample).max(1) as u32;
+        let ppem = rc_data::java_math::round_f32_to_i32(params.size * params.oversample).max(1) as u32;
         let delta = (
-            round_half_up(params.shift.0 * params.oversample * 64.0),
-            round_half_up(-params.shift.1 * params.oversample * 64.0),
+            rc_data::java_math::round_f32_to_i32(params.shift.0 * params.oversample * 64.0),
+            rc_data::java_math::round_f32_to_i32(-params.shift.1 * params.oversample * 64.0),
         );
         Some(TtfFace { data, params, cps, ppem, delta, hinting: Mutex::new(None), done: Mutex::new(HashMap::new()) })
     }
@@ -308,8 +303,6 @@ mod tests {
     fn params_defaults_and_skip_list() {
         let p = params(&serde_json::json!({"file": "x.ttf", "skip": ["ab", "c"], "shift": [0.5, 1]}));
         assert_eq!(p, TtfParams { size: 11.0, oversample: 1.0, shift: (0.5, 1.0), skip: "abc".into() });
-        assert_eq!(round_half_up(2.5), 3);
-        assert_eq!(round_half_up(-2.5), -2);
     }
 
     /// Comparison with the official game's FreeType probe. `RUSTCRAFT_TTF_PROBE`:

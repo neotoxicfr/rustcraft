@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use crate::Error;
 use crate::json::Json;
-use crate::math::{Interval, jmax, round_half_up};
+use crate::math::{Interval, jmax};
+use rc_data::java_math;
 
 pub const AX_X: u8 = 1;
 pub const AX_Y: u8 = 2;
@@ -538,10 +539,32 @@ pub fn squeeze(v: f32) -> f32 {
     c / 2.0 - c * c * c / 24.0
 }
 
-pub fn round_to_integer(v: f32, k: RoundKind) -> f32 {
+/// Floors and ceilings without the C library call (same bits, sign of -0 included): evaluated
+/// for every cell of a volume. `floor_java` false (`RUSTCRAFT_OPT_FLOOR_JAVA=0`, read once by the
+/// caller): the old library calls.
+pub fn round_to_integer(v: f32, k: RoundKind, floor_java: bool) -> f32 {
+    if !floor_java {
+        return round_to_integer_with_library(v, k);
+    }
+    match k {
+        RoundKind::Floor => java_math::floor(f64::from(v)) as f32,
+        RoundKind::Round => java_math::round_f32_to_i32(v) as f32,
+        RoundKind::Ceil => java_math::ceil(f64::from(v)) as f32,
+        RoundKind::Truncate => {
+            if v > 0.0 {
+                java_math::floor(f64::from(v)) as f32
+            } else {
+                java_math::ceil(f64::from(v)) as f32
+            }
+        }
+    }
+}
+
+/// Old path of [`round_to_integer`]: the C library's floor and ceiling.
+fn round_to_integer_with_library(v: f32, k: RoundKind) -> f32 {
     match k {
         RoundKind::Floor => f64::from(v).floor() as f32,
-        RoundKind::Round => round_half_up(v) as f32,
+        RoundKind::Round => crate::math::round_f32_to_i32(v, false) as f32,
         RoundKind::Ceil => f64::from(v).ceil() as f32,
         RoundKind::Truncate => {
             if v > 0.0 {
@@ -581,7 +604,7 @@ pub fn range(df: &Df, r: &dyn Resolver) -> Interval {
         }
         Df::Round(k, i, m) => {
             let m = range(m, r);
-            Interval::mul(Interval::map_monotonic(Interval::div(range(i, r), m), |v| round_to_integer(v, *k)), m)
+            Interval::mul(Interval::map_monotonic(Interval::div(range(i, r), m), |v| round_to_integer(v, *k, crate::opt::floor_java())), m)
         }
         Df::Binary(b, x, y) => {
             let (x, y) = (range(x, r), range(y, r));

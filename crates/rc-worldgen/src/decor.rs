@@ -10,7 +10,7 @@ use crate::decor_blocks::{Blocks, State};
 use crate::decor_data::DecorData;
 use crate::decor_pred::{ParseCtx, jclamp_f};
 use crate::decor_region::Region;
-use crate::decor_rng::{DecoRng, SinTable};
+use crate::decor_rng::DecoRng;
 use crate::feature::{PlacedId, Registry};
 use crate::json::Json;
 use crate::noise::Simplex;
@@ -80,7 +80,6 @@ pub struct Decorator {
     pub info_noise: Simplex,
     pub temperature_noise: Simplex,
     pub frozen_noise: [(Simplex, f64, f32); 3],
-    pub sin: SinTable,
     pub seed: i64,
     geode: crate::noise::NoiseStack,
     /// Templates and processor lists ("template" features and fossils).
@@ -356,7 +355,6 @@ impl Decorator {
             info_noise,
             temperature_noise,
             frozen_noise,
-            sin: SinTable::new(),
             seed,
             geode: crate::feature_geode::geode_noise(seed),
             templates: None,
