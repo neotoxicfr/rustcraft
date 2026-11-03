@@ -3509,3 +3509,71 @@ rounds, minimum of 5 passes of 400 ticks per scene, loaded machine (other agents
   test of a vehicle's passengers runs only when frozen, the plates also scan the server's item
   and orb lists during a series (empty unless something was born in it), a parked world is
   swept once per family after the player leaves (O(its entities), then a bit test per tick).
+
+## C1-M08 (series 3): structure beard, only the elements that can contribute (03/11, loaded machine)
+
+`structure_beard.rs`: the terrain adaptation around structures summed, for every point of the
+chunk zone (16 × 16 columns, structure height + 48 blocks), the term of EVERY rigid piece and
+junction of the chunk. Each element only reaches a small box (beard kernel offsets −12 to +11,
+burial sphere of radius 6): outside it the term is exactly +0.0, no term is ever −0.0 and a point's
+sum starts at +0.0, so skipping it leaves the sum bit for bit unchanged (test
+`reach_is_exact_for_every_adaptation`: +0.0 everywhere outside, non-zero on every face).
+
+Micro-bench `bench_beard` (`cargo test --release -p rc-worldgen --lib bench_beard -- --ignored
+--nocapture`): 44 chunks of the test world's village (seed 20261011 around (−1408, 368), 43
+elements per chunk), 32 chunks of an ancient city, stronghold, trail ruins and trial chambers
+placed at chunk (10, 10); 1 thread, best of 5 to 9, 2 or 3 alternating passes per run, four runs,
+LOADED machine (other agents compiling; the terrain step itself varied from 5.3 to 16 ms per
+chunk between passes). Ranges below are over passes and runs, ms per chunk.
+
+| Path (switch) | village | ancient city | stronghold | trail ruins | trial chambers |
+|---|---|---|---|---|---|
+| old, point by point | 1.08–1.57 | 0.49–0.91 | 1.37–2.82 | 0.45–0.87 | 4.21–4.31 |
+| column lists alone (`COLUMN_LISTS`) | 0.77–1.95 | 0.38–0.63 | 0.25–0.62 | 0.17–0.54 | 2.32–4.32 |
+| column buffer (`COLUMN_BUFFER`) | 0.15–0.22 | 0.095–0.22 | 0.033–0.061 | 0.033–0.058 | 0.34–0.54 |
+| buffer + tables (`KERNEL_TABLES`), default | 0.066–0.10 | 0.079–0.18 | 0.023–0.061 | 0.015–0.027 | 0.18–0.22 |
+| buffer + tables + lists | 0.069–0.12 | 0.078–0.19 | 0.021–0.054 | 0.016–0.030 | 0.19–0.26 |
+
+- Default (buffer + tables) against old: village ×15, stronghold ×40 to ×60, trail ruins ×30,
+  trial chambers ×20, ancient city ×6 (its box beards keep a computed term: the distance to the
+  ground is bounded by the box height only). Terrain step of the village chunks (1 thread, beard
+  included, last run): 5.65–6.73 ms with the old beard, 4.32–4.80 with the new one: the beard was
+  about 20 % of the terrain of a village chunk. `Beard::new`: 0.0007 ms per chunk (not a hot spot).
+- Column buffer: within a column, element after element over its own y range (≤ 24 blocks for
+  a junction, a thin beard, a burial; box height + 22 for a box beard or an encapsulation), into a
+  buffer of the column's zone that starts at +0.0, then added to the volume over the whole zone
+  (the old path added +0.0 to every zone point, which turns a −0.0 density into +0.0). The y step
+  of the filling volume is 1: other volumes keep the point-by-point path.
+- Kernel tables (79 KB once per process): terms of junctions (24³), thin beards (12 × 24 × 12),
+  burials (6 × 23 × 6) and encapsulations (12³), filled by calling the point-by-point terms on a
+  one-block element at the origin, so with the very same operations; a column's y range is a run
+  of a table (encapsulation: three runs, below, inside and above the box). Box beards: kernel row
+  read once per column, logical shift in the inverse square root (bits of a positive value,
+  `psrlq` in SSE2) and a `min(11)` that proves the kernel index in bounds; 2.34 → 1.0–1.4 ns per
+  slot.
+- Column lists (CSR of the elements per column, built once per chunk): alone, ×1.2 to ×5 against
+  old; with the buffer, LOSES on the heaviest chunks (village 157–121 elements: 0.177/0.230 ms
+  without, 0.216/0.264 with; trial chambers 304–233: 0.385/0.382 without, 0.428/0.423 with): the
+  per-column bounding-box test of every element costs less than building the lists. Off by default
+  (`RUSTCRAFT_OPT_BEARD_COLUMN_LISTS=1` enables it), for the quiet-machine scene bench.
+- Rows in parallel (`par_chunks_mut` over z rows above 2¹⁶ column slots): one chunk at a time
+  with 16 idle threads, trial chambers 0.207 → 0.132 ms; but in a batch (chunks already in
+  parallel, the generation case) it costs: stronghold 0.052 → 0.108 ms, trail ruins 0.013 → 0.043
+  at 16 threads, others within noise. After the two leads above, no structure chunk's beard holds
+  the end of a batch (≤ 0.26 ms against a terrain of 4 ms and more). Off by default
+  (`RUSTCRAFT_OPT_BEARD_PARALLEL=1` enables it). Thread counts 1, 2, 4, 8, 16, 32 measured (bench
+  prints them all).
+- GPU: ruled out (f32 square root and the f64 bit trick not guaranteed bit for bit in WGSL, the
+  dedicated server has no GPU, and the remaining cost is about 0.1 ms per structure chunk).
+- Equivalence: `beard_fingerprints_match_the_point_by_point_path` (stored FNV of the volume bits
+  for each scene, taken with the code from before the mission: old path and environment paths),
+  `beard_paths_match_bit_for_bit` (every combination of switches against the old path, chunk by
+  chunk, rows forced onto the threads), `beard_paths_match_on_synthetic_bounds` (600 random
+  beards of every adaptation across the reach bounds and the chunk edges, the zone cutting the
+  reaches, plus a stepped volume). Each fails on these sabotages: direct add into the volume,
+  first junction skipped, junction x margin 11 instead of 12, thin beard y bound −11 instead of −12,
+  junction y bound +10 instead of +11, burial reach 4 instead of 5, column without element not
+  added, encapsulation run below the box off by one, junctions summed before the rigid pieces.
+- Memory: the tables (79 KB, once), per chunk the reached elements (≈ 40 B each) and one column
+  buffer (≤ 1.5 KB); lists, when on, 4 B per (column, element). To re-measure on a quiet machine:
+  scenes `generation`, `generation-1thread`, `fresh-village-rd16`.
