@@ -24,7 +24,11 @@ const FLAG_UNCARVABLE: u8 = 32;
 pub struct BlockTable {
     names: Vec<String>,
     flags: Vec<u8>,
+    /// Per state: identifier of its block (name without the properties), numbered in order of appearance.
+    base_ids: Vec<u16>,
     index: HashMap<String, BlockId>,
+    /// Block name (without the properties) to its base identifier.
+    base_index: HashMap<String, u16>,
     motion: HashSet<String>,
     uncarvable: HashSet<String>,
 }
@@ -41,7 +45,9 @@ impl BlockTable {
         let mut t = BlockTable {
             names: Vec::new(),
             flags: Vec::new(),
+            base_ids: Vec::new(),
             index: HashMap::new(),
+            base_index: HashMap::new(),
             motion: resolve_tag(pack, "minecraft:blocks_motion_in_heightmap"),
             uncarvable: resolve_tag(pack, "minecraft:uncarvable"),
         };
@@ -74,8 +80,11 @@ impl BlockTable {
             f |= FLAG_UNCARVABLE;
         }
         let id = BlockId::try_from(self.names.len()).expect("more than 65,536 states");
+        let next_base = self.base_index.len() as u16;
+        let base = *self.base_index.entry_ref(b).or_insert(next_base);
         self.names.push(state.clone());
         self.flags.push(f);
+        self.base_ids.push(base);
         self.index.insert(state, id);
         id
     }
@@ -133,9 +142,34 @@ impl BlockTable {
         self.flags[id as usize] & FLAG_UNCARVABLE != 0
     }
 
+    /// Neither air nor fluid: a cell the surface rules are evaluated at.
+    #[inline]
+    pub fn is_solid(&self, id: BlockId) -> bool {
+        self.flags[id as usize] & (FLAG_AIR | FLAG_FLUID) == 0
+    }
+
+    /// A solid the surface rules can overwrite in place: not air, no fluid, and it blocks motion
+    /// (so it already counts in both generation height maps).
+    #[inline]
+    pub fn is_plain_solid(&self, id: BlockId) -> bool {
+        self.flags[id as usize] & (FLAG_AIR | FLAG_FLUID | FLAG_MOTION) == FLAG_MOTION
+    }
+
     /// Same block (properties ignored).
+    #[inline]
     pub fn same_block(&self, a: BlockId, b: BlockId) -> bool {
+        if crate::opt::base_block_ids() { self.same_block_by_base_id(a, b) } else { self.same_block_by_name(a, b) }
+    }
+
+    /// [`BlockTable::same_block`] by comparing the names cut at the properties (old path).
+    pub fn same_block_by_name(&self, a: BlockId, b: BlockId) -> bool {
         a == b || block_of(self.name(a)) == block_of(self.name(b))
+    }
+
+    /// [`BlockTable::same_block`] by the block identifiers numbered at interning (`RUSTCRAFT_OPT_BASE_BLOCK_IDS`).
+    #[inline]
+    pub fn same_block_by_base_id(&self, a: BlockId, b: BlockId) -> bool {
+        self.base_ids[a as usize] == self.base_ids[b as usize]
     }
 }
 

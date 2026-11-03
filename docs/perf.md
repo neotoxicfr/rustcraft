@@ -1389,6 +1389,82 @@ pre-fill). No temperature condition in the 26.3 rules: the temperature part of
 kept at 1 until the quiet bench (C6). Byte code of the biome conditions: not done (low
 priority, to decide after the scene bench).
 
+### Surface under the preliminary surface, vein bound, cave top material (C1-M04, 03/11/2026, loaded-machine micro-bench)
+
+Measured first (`surface_phases_bench`, 1 thread, seed 0, 12 × 12 grid): with the paths above,
+the surface step was 1.70-2.28 ms/chunk, of which the column walk 1.30-1.82, the vein
+pre-filling 0.43-0.53 and the row classes ≈ 0; the caves replay the top material 11.9 times per
+chunk at 4.9-5.1 µs each (≈ 0.06 ms/chunk). The walk, not the veins, was the hot part.
+
+Leads (each alone over the earlier paths, then combined; "step" = whole surface step, 2 passes,
+LOADED machine: ±0.5 ms between passes, the second pass was the calmer one):
+
+| Lead (switch) | grid | badlands | deep ocean | mountain | Note |
+|---|---|---|---|---|---|
+| old | 2.15-3.61 | 2.24-4.51 | 1.70-2.48 | 3.07-6.48 | |
+| earlier paths | 1.47-2.64 | 1.63-2.87 | 1.24-2.08 | 1.66-2.48 | reference |
+| `SURFACE_BAND_KERNELS` | 0.96-1.18 | 0.95-1.15 | 0.82-0.88 | 1.08-1.11 | walk ÷ 2 to 3 |
+| + `SURFACE_ROW_KERNEL` | 0.99-1.49 | 0.95-1.15 | 0.85-1.33 | 1.06-2.16 | no gain: off |
+| `DIRECT_SOLID_WRITE` | 1.43-1.45 | 1.40-1.51 | 1.17 | 1.56-1.98 | alone |
+| kernels + direct write | 0.90-0.91 | 0.89-0.90 | 0.77-0.78 | 0.99-1.01 | best measured |
+| `VEIN_TOP_BOUND` | 1.46-1.55 | 1.46-1.62 | 1.18-1.25 | 1.62-1.79 | see veins alone |
+| all (row kernel on) | 0.90-1.36 | 0.86-1.55 | 0.74-1.41 | 0.99-1.36 | |
+
+Band kernels: under the preliminary surface the 26.3 overworld trees read no walk state (stone
+depth, water, depth under a ceiling are all behind `above_preliminary_surface`), so the walk stops
+there and each y band is decided by a kernel: nothing (above the veins), one block (bedrock bottom
+row, deepslate [−8, 0[), a vein (copper [8, 50[, densities tested 8 rows at a time, only
+the cells whose density is not ≤ 0 are evaluated), a vein then a block (iron over deepslate
+[−59, −8[, copper over deepslate at y = 0), or the band's tree cell by cell (bedrock and
+deepslate gradients). The underground rule reads the biome (sulfur caves bands): chunks where
+sulfur caves are possible use the "tree" kernels with the biome read per cell (still no walk),
+the others the shapes above (23 of the 90 overworld test chunks had sulfur caves around). Kernels
+are off if a tree under the surface reads the walk state (checked on the compiled tree) and for the
+dimensions that never test the preliminary surface (nether, end, caves, floating islands).
+
+Direct solid write: a plain solid (not air, no fluid, blocks motion) over a plain solid changes
+no section count, height map or mark; written in place, by the walk as well as by the kernels.
+
+Layer kernel (`SURFACE_ROW_KERNEL`, compare and select over the 256 states of a layer): within
+the noise (grid 1.21-1.26 against 1.25-1.28 ms/chunk without it, the other sets both ways): the
+"one block" bands are only 9 layers of ≈ 130 and the column kernel already writes them in place.
+Kept behind its switch, OFF by default (`=1` enables it) until the quiet-machine bench (C6).
+
+Vein bound (`VEIN_TOP_BOUND`): pre-filling stopped at the highest solid of the chunk (the rules
+are only evaluated at solids; the whole range when eroded badlands, which add solids before the
+walk, are possible). Pre-filling alone: deep ocean 0.351-0.380 → 0.321-0.330 ms/chunk (−8 to
+−13 %), unchanged on land (the highest solid is above the copper range). Frozen oceans are not
+excluded: their icebergs are placed after the walk and no rule is evaluated there.
+
+Cave top material (11.9 calls per chunk on the grid): 4.6-7.0 µs per call; column levels (surface
+depth, preliminary surface) kept from the surface step of the same chunk on the same thread
+(`CAVE_TOP_COLUMN_MEMO`): 3.8-5.6 µs (−18 %); biomes read from the chunks around
+(`BiomeView::ChunkThenSource`, `CAVE_TOP_FROM_CHUNK_BIOMES`, to be wired into the caves step by
+the owner of `terrain.rs`): 1.05-1.35 µs; both: 0.24-0.41 µs (−92 to −95 %, ≈ 60-80 µs/chunk
+saved). Faithful-to-the-game difference (A3): on 13,028 real calls (4,500 chunks, 3 settings,
+3 seeds), 37 differ, all on a quart whose climate is tied between biomes; the last leaf of the
+search decides there, which the game keeps per thread (so the game itself depends on the history
+of the thread); never at an untied quart. No clamp in y: outside the world height the view asks the
+source (routing checked on marker chunks; the real biomes cannot tell, the quarts just inside give
+the same biome on 368,000 built calls).
+
+`MIN_SURFACE_FROM_AQUIFER`: not applicable, no switch. The aquifer keeps
+`preliminary_surface_level` floored to an integer at quart positions; the material rules read
+`chunk_surface_level`, an interpolation of it over 16-block cells, per block, in f32: another
+function, other positions, another precision.
+
+`BASE_BLOCK_IDS` ("same block" by an identifier numbered at interning instead of the names cut at
+the properties, eroded badlands only): 8.84-8.89 → 0.68-0.70 ns per pair.
+
+Threads (surface = step − filling, earlier → new, ms/chunk, noisy): 2: 1.16 → 0.53;
+4: 0.55 → 0.36; 8: 0.33 → 0.23; 16: 0.24 → 0.16; 32: 0.11 → 0.05. Multi-core inside a chunk not
+done (the pool is already saturated by chunks, the columns are tied by the gradients and the eroded
+badlands). GPU not applicable (f64 noises, branching rules, positional randomness, a few hundred
+µs per chunk). Allocations (`material_opt_bench`, earlier → new): grid 7 and 0.17 MB per chunk
+both, badlands 8 and 0.21 MB both, caves 70 → 69 (the column levels are a 2 KB array on the
+stack, one boxed memo per thread); same bench, surface ms/chunk: grid 1.50-1.63 → 0.93-1.12,
+badlands 1.51-1.52 → 0.89-1.00.
+
 ### Effects and player (fidelity G4-F09, 24/10/2026, loaded-machine micro-bench)
 
 New code on the integrated server thread, off the hot path. Turtle helmet: bench

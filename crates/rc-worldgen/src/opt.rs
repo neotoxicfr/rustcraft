@@ -239,6 +239,49 @@ switch!(
     "RUSTCRAFT_OPT_MAT_COLCACHE"
 );
 switch!(
+    /// Surface: under the preliminary surface, cells decided per y band by a stateless kernel
+    /// (block, vein, vein then block, or the band's tree) instead of the column walk.
+    surface_band_kernels,
+    "RUSTCRAFT_OPT_SURFACE_BAND_KERNELS"
+);
+/// Surface: the "single block" bands under every column's preliminary surface rewritten layer by
+/// layer over the 256 columns (with the band kernels). Off by default (`=1` enables it) until the
+/// quiet-machine bench: no measurable gain over the column kernels on the loaded-machine
+/// micro-bench (grid 1.21-1.26 against 1.25-1.28 ms/chunk), and the column kernels are simpler.
+#[inline]
+pub fn surface_row_kernel() -> bool {
+    static S: LazyLock<bool> = LazyLock::new(|| opt_in("RUSTCRAFT_OPT_SURFACE_ROW_KERNEL"));
+    *S
+}
+switch!(
+    /// Surface: a plain solid replaced by a plain solid is written in place, without the height map
+    /// and section count updates that cannot change.
+    direct_solid_write,
+    "RUSTCRAFT_OPT_DIRECT_SOLID_WRITE"
+);
+switch!(
+    /// Vein pre-filling of the surface: rows above the highest solid of the chunk skipped.
+    vein_top_bound,
+    "RUSTCRAFT_OPT_VEIN_TOP_BOUND"
+);
+switch!(
+    /// Cave top material: biomes read from the chunks already computed around (the source only
+    /// outside them), instead of recomputing the climate at each call. Read by the caves step.
+    cave_top_from_chunk_biomes,
+    "RUSTCRAFT_OPT_CAVE_TOP_FROM_CHUNK_BIOMES"
+);
+switch!(
+    /// Cave top material: surface depth and preliminary surface of each column kept from the
+    /// surface step of the same chunk.
+    cave_top_column_memo,
+    "RUSTCRAFT_OPT_CAVE_TOP_COLUMN_MEMO"
+);
+switch!(
+    /// Block tables: "same block" compared by block identifier numbered at interning, not by name.
+    base_block_ids,
+    "RUSTCRAFT_OPT_BASE_BLOCK_IDS"
+);
+switch!(
     /// Lookups by name (tags, placed features) without allocated string: full name borrowed,
     /// `minecraft:` prefix composed on the stack.
     tag_borrow,
