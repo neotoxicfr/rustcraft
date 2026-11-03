@@ -2,8 +2,6 @@
 //! strict comparisons, walked distance, heuristic ×1.5), ground evaluator (cell types,
 //! climbing, descending, diagonals), path following and blockage detection.
 
-use hashbrown::HashMap;
-
 use rc_physics::Aabb;
 
 use super::env::Fluid;
@@ -12,7 +10,7 @@ use crate::chunk::Chunk;
 use crate::server::Server;
 use chunk_region::ChunkRegion;
 pub(crate) use search_buffers::MemoKind;
-use search_buffers::{SearchBuffers, TypeMemo, relative_key};
+use search_buffers::{SearchBuffers, relative_key};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PathType {
@@ -367,6 +365,7 @@ pub(crate) struct SearchOptions {
     /// Block and cell types kept per position for one search (`RUSTCRAFT_OPT_PATH_MEMO`: 0, 1, 2 by default).
     pub(crate) memo: MemoKind,
     /// Buffers kept per thread between searches, footprint types as bits (`RUSTCRAFT_OPT_PATH_SCRATCH`).
+    /// The packed cell keys (`relative_key`) are not behind it: every search uses them.
     pub(crate) scratch: bool,
     /// Chunks around the mob looked up once per search (`RUSTCRAFT_OPT_PATH_REGION`).
     pub(crate) region: bool,
@@ -448,9 +447,21 @@ impl TypeSet {
     }
 }
 
-/// Block types that stop the neighbour scan of a walkable cell (and of a flyer's cell).
+/// Type a dangerous neighbouring block gives a walkable cell (and a flyer's cell); `None` for a
+/// block that does not stop the neighbour scan.
+fn neighbour_verdict(t: PathType) -> Option<PathType> {
+    match t {
+        PathType::Damaging => Some(PathType::DamagingInNeighbor),
+        PathType::Fire | PathType::Lava => Some(PathType::FireInNeighbor),
+        PathType::Water => Some(PathType::WaterBorder),
+        PathType::DamageCautious => Some(PathType::DamageCautious),
+        _ => None,
+    }
+}
+
+/// Block types that stop the neighbour scan; the section palette test reads the same rule.
 fn stops_neighbour_scan(t: PathType) -> bool {
-    matches!(t, PathType::Damaging | PathType::Fire | PathType::Lava | PathType::Water | PathType::DamageCautious)
+    neighbour_verdict(t).is_some()
 }
 
 #[cfg(test)]
@@ -475,13 +486,29 @@ impl DrawView {
         DrawView(share_draw_view().then(|| s.mob_view(m)))
     }
 
-    /// Penalty of the static type of `p` for the mob.
-    pub(crate) fn has_malus(&self, s: &Server, m: &super::mob::Mob, p: [i32; 3]) -> bool {
+    /// Static path type of `p` for the mob.
+    pub(crate) fn static_type(&self, s: &Server, m: &super::mob::Mob, p: [i32; 3]) -> PathType {
         match &self.0 {
-            Some(view) => s.view_has_malus(view, m, p),
-            None => s.view_has_malus(&s.mob_view(m), m, p),
+            Some(view) => static_path_type(s, view, p),
+            None => static_path_type(s, &s.mob_view(m), p),
         }
     }
+
+    /// Penalty of the static type of `p` for the mob.
+    pub(crate) fn has_malus(&self, s: &Server, m: &super::mob::Mob, p: [i32; 3]) -> bool {
+        mob_malus(m, self.static_type(s, m, p)) != 0.0
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Mob views built by this thread, read by the proof that a draw builds one.
+    static MOB_VIEWS_BUILT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn mob_views_built() -> u64 {
+    MOB_VIEWS_BUILT.get()
 }
 
 #[cfg(test)]
@@ -509,17 +536,9 @@ struct NodeEvaluator<'a> {
     /// Origin of the cell keys: the mob's block.
     origin: [i32; 3],
     region: ChunkRegion<'a>,
-    nodes: Vec<Node>,
-    index: HashMap<u64, usize>,
-    footprint_types: HashMap<u64, PathType>,
-    collisions: HashMap<[u64; 6], bool>,
-    block_types: TypeMemo,
-    static_types: TypeMemo,
-    section_danger: HashMap<u64, bool>,
-    heap: Vec<usize>,
-    neighbours: Vec<usize>,
-    target_bests: Vec<(f32, usize)>,
-    target_reached: Vec<bool>,
+    /// Node arena, per-position tables, heap and lists of the search (kept per thread when
+    /// `RUSTCRAFT_OPT_PATH_SCRATCH` is on).
+    buffers: SearchBuffers,
     ew: i32,
     eh: i32,
 }
@@ -529,7 +548,7 @@ const HORIZONTAL: [(i32, i32); 4] = [(0, -1), (1, 0), (0, 1), (-1, 0)];
 
 impl<'a> NodeEvaluator<'a> {
     /// Evaluator of a search, working in `b` (emptied).
-    fn new(s: &'a Server, m: &'a MobView, opts: SearchOptions, b: SearchBuffers) -> NodeEvaluator<'a> {
+    fn new(s: &'a Server, m: &'a MobView, opts: SearchOptions, buffers: SearchBuffers) -> NodeEvaluator<'a> {
         NodeEvaluator {
             s,
             m,
@@ -538,17 +557,7 @@ impl<'a> NodeEvaluator<'a> {
             in_search: true,
             origin: m.block,
             region: ChunkRegion::around(m.block),
-            nodes: b.nodes,
-            index: b.index,
-            footprint_types: b.footprint_types,
-            collisions: b.collisions,
-            block_types: b.block_types,
-            static_types: b.static_types,
-            section_danger: b.section_danger,
-            heap: b.heap,
-            neighbours: b.neighbours,
-            target_bests: b.target_bests,
-            target_reached: b.target_reached,
+            buffers,
             ew: (m.width + 1.0).floor() as i32,
             eh: (m.height + 1.0).floor() as i32,
         }
@@ -565,34 +574,18 @@ impl<'a> NodeEvaluator<'a> {
         e
     }
 
-    fn into_buffers(self) -> SearchBuffers {
-        SearchBuffers {
-            nodes: self.nodes,
-            index: self.index,
-            footprint_types: self.footprint_types,
-            collisions: self.collisions,
-            block_types: self.block_types,
-            static_types: self.static_types,
-            section_danger: self.section_danger,
-            heap: self.heap,
-            neighbours: self.neighbours,
-            target_bests: self.target_bests,
-            target_reached: self.target_reached,
-        }
-    }
-
     fn key(&self, x: i32, y: i32, z: i32) -> u64 {
         relative_key(self.origin, x, y, z)
     }
 
     fn node(&mut self, x: i32, y: i32, z: i32) -> usize {
         let key = self.key(x, y, z);
-        if let Some(&i) = self.index.get(&key) {
+        if let Some(&i) = self.buffers.index.get(&key) {
             return i;
         }
-        self.nodes.push(Node::new(x, y, z));
-        let i = self.nodes.len() - 1;
-        self.index.insert(key, i);
+        self.buffers.nodes.push(Node::new(x, y, z));
+        let i = self.buffers.nodes.len() - 1;
+        self.buffers.index.insert(key, i);
         i
     }
 
@@ -635,13 +628,13 @@ impl<'a> NodeEvaluator<'a> {
             return self.block_type(p);
         }
         let key = self.key(p[0], p[1], p[2]);
-        if let Some(t) = self.block_types.get(memo, key) {
+        if let Some(t) = self.buffers.block_types.get(memo, key) {
             #[cfg(test)]
             search_tests::check_memo_hit(t, || self.block_type(p));
             return t;
         }
         let t = self.block_type(p);
-        self.block_types.insert(memo, key, t);
+        self.buffers.block_types.insert(memo, key, t);
         t
     }
 
@@ -742,13 +735,13 @@ impl<'a> NodeEvaluator<'a> {
             return self.static_type_uncached(x, y, z);
         }
         let key = self.key(x, y, z);
-        if let Some(t) = self.static_types.get(memo, key) {
+        if let Some(t) = self.buffers.static_types.get(memo, key) {
             #[cfg(test)]
             search_tests::check_memo_hit(t, || self.static_type_uncached(x, y, z));
             return t;
         }
         let t = self.static_type_uncached(x, y, z);
-        self.static_types.insert(memo, key, t);
+        self.buffers.static_types.insert(memo, key, t);
         t
     }
 
@@ -801,12 +794,9 @@ impl<'a> NodeEvaluator<'a> {
                     if dx == 0 && dz == 0 {
                         continue;
                     }
-                    match self.type_from_state([x + dx, y + dy, z + dz]) {
-                        PathType::Damaging => return Some(PathType::DamagingInNeighbor),
-                        PathType::Fire | PathType::Lava => return Some(PathType::FireInNeighbor),
-                        PathType::Water => return Some(PathType::WaterBorder),
-                        PathType::DamageCautious => return Some(PathType::DamageCautious),
-                        _ => {}
+                    let verdict = neighbour_verdict(self.type_from_state([x + dx, y + dy, z + dz]));
+                    if verdict.is_some() {
+                        return verdict;
                     }
                 }
             }
@@ -833,11 +823,11 @@ impl<'a> NodeEvaluator<'a> {
 
     fn section_may_hold_danger(&mut self, cx: i32, sy: i32, cz: i32) -> bool {
         let key = relative_key([self.origin[0] >> 4, 0, self.origin[2] >> 4], cx, sy, cz);
-        if let Some(&d) = self.section_danger.get(&key) {
+        if let Some(&d) = self.buffers.section_danger.get(&key) {
             return d;
         }
         let d = self.section_danger_uncached(cx, sy, cz);
-        self.section_danger.insert(key, d);
+        self.buffers.section_danger.insert(key, d);
         d
     }
 
@@ -853,7 +843,7 @@ impl<'a> NodeEvaluator<'a> {
     /// Type of a cell for the mob (whole footprint).
     fn path_type_for_mob(&mut self, x: i32, y: i32, z: i32) -> PathType {
         let key = self.key(x, y, z);
-        if let Some(&t) = self.footprint_types.get(&key) {
+        if let Some(&t) = self.buffers.footprint_types.get(&key) {
             return t;
         }
         let r = if self.opts.scratch {
@@ -871,7 +861,7 @@ impl<'a> NodeEvaluator<'a> {
             set.sort();
             self.footprint_verdict(x, y, z, &set)
         };
-        self.footprint_types.insert(key, r);
+        self.buffers.footprint_types.insert(key, r);
         r
     }
 
@@ -965,11 +955,11 @@ impl<'a> NodeEvaluator<'a> {
             b.max[1].to_bits(),
             b.max[2].to_bits(),
         ];
-        if let Some(&c) = self.collisions.get(&key) {
+        if let Some(&c) = self.buffers.collisions.get(&key) {
             return c;
         }
         let c = !rc_physics::is_free(&self.s.world(), b);
-        self.collisions.insert(key, c);
+        self.buffers.collisions.insert(key, c);
         c
     }
 
@@ -1027,30 +1017,30 @@ impl<'a> NodeEvaluator<'a> {
     fn start_node(&mut self, x: i32, y: i32, z: i32) -> usize {
         let t = self.path_type_for_mob(x, y, z);
         let i = self.node(x, y, z);
-        self.nodes[i].ty = t;
-        self.nodes[i].malus = self.malus(t);
+        self.buffers.nodes[i].ty = t;
+        self.buffers.nodes[i].malus = self.malus(t);
         i
     }
 
     fn node_cost_max(&mut self, x: i32, y: i32, z: i32, t: PathType, cost: f32) -> usize {
         let i = self.node(x, y, z);
-        self.nodes[i].ty = t;
-        self.nodes[i].malus = self.nodes[i].malus.max(cost);
+        self.buffers.nodes[i].ty = t;
+        self.buffers.nodes[i].malus = self.buffers.nodes[i].malus.max(cost);
         i
     }
 
     fn blocked_node(&mut self, x: i32, y: i32, z: i32) -> usize {
         let i = self.node(x, y, z);
-        self.nodes[i].ty = PathType::Blocked;
-        self.nodes[i].malus = -1.0;
+        self.buffers.nodes[i].ty = PathType::Blocked;
+        self.buffers.nodes[i].malus = -1.0;
         i
     }
 
     fn closed_node(&mut self, x: i32, y: i32, z: i32, t: PathType) -> usize {
         let i = self.node(x, y, z);
-        self.nodes[i].closed = true;
-        self.nodes[i].ty = t;
-        self.nodes[i].malus = t.default_malus();
+        self.buffers.nodes[i].closed = true;
+        self.buffers.nodes[i].ty = t;
+        self.buffers.nodes[i].malus = t.default_malus();
         i
     }
 
@@ -1064,7 +1054,7 @@ impl<'a> NodeEvaluator<'a> {
 
     fn can_reach_without_collision(&mut self, n: usize) -> bool {
         let mut b = self.m.bbox;
-        let node = self.nodes[n];
+        let node = self.buffers.nodes[n];
         let size = [b.max[0] - b.min[0], b.max[1] - b.min[1], b.max[2] - b.min[2]];
         let mut d = [
             f64::from(node.x) - self.m.pos[0] + size[0] / 2.0,
@@ -1108,7 +1098,7 @@ impl<'a> NodeEvaluator<'a> {
         }
         if Self::partial(cur_t)
             && let Some(b) = best
-            && self.nodes[b].malus >= 0.0
+            && self.buffers.nodes[b].malus >= 0.0
             && !self.can_reach_without_collision(b)
         {
             best = None;
@@ -1116,7 +1106,7 @@ impl<'a> NodeEvaluator<'a> {
         if t == PathType::Walkable || (self.m.amphibious && t == PathType::Water) {
             return best;
         }
-        let neg = best.is_none_or(|b| self.nodes[b].malus < 0.0);
+        let neg = best.is_none_or(|b| self.buffers.nodes[b].malus < 0.0);
         if neg
             && jump > 0
             && t != PathType::Fence
@@ -1150,7 +1140,7 @@ impl<'a> NodeEvaluator<'a> {
         if self.m.width >= 1.0 {
             return Some(above);
         }
-        let n = self.nodes[above];
+        let n = self.buffers.nodes[above];
         if n.ty != PathType::Open && n.ty != PathType::Walkable {
             return Some(above);
         }
@@ -1207,7 +1197,7 @@ impl<'a> NodeEvaluator<'a> {
             self.fly_neighbors(cur, out);
             return;
         }
-        let c = self.nodes[cur];
+        let c = self.buffers.nodes[cur];
         let mut jump = 0;
         let above = self.path_type_for_mob(c.x, c.y + 1, c.z);
         let here = self.path_type_for_mob(c.x, c.y, c.z);
@@ -1220,7 +1210,7 @@ impl<'a> NodeEvaluator<'a> {
             let n = self.find_accepted(c.x + d.0, c.y, c.z + d.1, jump, h, *d, here);
             around[k] = n;
             if let Some(n) = n {
-                let nn = self.nodes[n];
+                let nn = self.buffers.nodes[n];
                 if !nn.closed && (nn.malus >= 0.0 || c.malus < 0.0) {
                     out.push(n);
                 }
@@ -1234,7 +1224,7 @@ impl<'a> NodeEvaluator<'a> {
             let (d1, d2) = (HORIZONTAL[k], HORIZONTAL[k2]);
             let n = self.find_accepted(c.x + d1.0 + d2.0, c.y, c.z + d1.1 + d2.1, jump, h, d1, here);
             if let Some(n) = n {
-                let nn = self.nodes[n];
+                let nn = self.buffers.nodes[n];
                 if !nn.closed && nn.ty != PathType::WalkableDoor && nn.malus >= 0.0 {
                     out.push(n);
                 }
@@ -1247,7 +1237,7 @@ impl<'a> NodeEvaluator<'a> {
 
     fn diagonal_ok(&self, pos: &Node, ew: Option<usize>, ns: Option<usize>) -> bool {
         let (Some(ew), Some(ns)) = (ew, ns) else { return false };
-        let (ew, ns) = (self.nodes[ew], self.nodes[ns]);
+        let (ew, ns) = (self.buffers.nodes[ew], self.buffers.nodes[ns]);
         if ns.y > pos.y || ew.y > pos.y {
             return false;
         }
@@ -1405,15 +1395,17 @@ pub(crate) fn find_path_with(
     let buffers = if opts.scratch { search_buffers::take_kept() } else { SearchBuffers::default() };
     let mut ev = NodeEvaluator::new(s, m, opts, buffers);
     let from = ev.start()?;
-    let mut best = std::mem::take(&mut ev.target_bests);
-    let mut reached = std::mem::take(&mut ev.target_reached);
+    // Taken out of the buffers so that `explore` can borrow them while it borrows `ev`; put
+    // back afterwards to keep their capacity for the next search.
+    let mut best = std::mem::take(&mut ev.buffers.target_bests);
+    let mut reached = std::mem::take(&mut ev.buffers.target_reached);
     best.resize(targets.len(), (f32::MAX, from));
     reached.resize(targets.len(), false);
     explore(&mut ev, targets, from, (max_len, reach, max_visited), &mut best, &mut reached);
-    let path = best_path(&ev.nodes, targets, &best, &reached);
-    (ev.target_bests, ev.target_reached) = (best, reached);
+    let path = best_path(&ev.buffers.nodes, targets, &best, &reached);
+    (ev.buffers.target_bests, ev.buffers.target_reached) = (best, reached);
     if opts.scratch {
-        search_buffers::keep(ev.into_buffers());
+        search_buffers::keep(ev.buffers);
     }
     path
 }
@@ -1439,28 +1431,30 @@ fn explore(
         }
         b
     };
-    let hv = nearest(&ev.nodes, from, best);
+    let hv = nearest(&ev.buffers.nodes, from, best);
     {
-        let n = &mut ev.nodes[from];
+        let n = &mut ev.buffers.nodes[from];
         n.g = 0.0;
         n.h = hv;
         n.f = hv;
     }
-    let mut heap = Heap { items: std::mem::take(&mut ev.heap) };
-    heap.insert(&mut ev.nodes, from);
-    let mut nb = std::mem::take(&mut ev.neighbours);
+    // Heap and neighbour list taken out of the buffers for the same reason (the evaluator is
+    // borrowed while they are filled), put back at the end.
+    let mut heap = Heap { items: std::mem::take(&mut ev.buffers.heap) };
+    heap.insert(&mut ev.buffers.nodes, from);
+    let mut nb = std::mem::take(&mut ev.buffers.neighbours);
     let mut count = 0;
-    let origin = ev.nodes[from];
+    let origin = ev.buffers.nodes[from];
     while !heap.items.is_empty() {
         count += 1;
         if count >= max_visited {
             break;
         }
-        let cur = heap.pop(&mut ev.nodes);
-        ev.nodes[cur].closed = true;
+        let cur = heap.pop(&mut ev.buffers.nodes);
+        ev.buffers.nodes[cur].closed = true;
         let mut any = false;
         for (i, t) in targets.iter().enumerate() {
-            if ev.nodes[cur].manhattan(*t) <= reach as f32 {
+            if ev.buffers.nodes[cur].manhattan(*t) <= reach as f32 {
                 reached[i] = true;
                 any = true;
             }
@@ -1468,35 +1462,36 @@ fn explore(
         if any {
             break;
         }
-        if ev.nodes[cur].dist(&origin) >= max_len {
+        if ev.buffers.nodes[cur].dist(&origin) >= max_len {
             continue;
         }
         ev.neighbors(cur, &mut nb);
         for &n in &nb {
-            let c = ev.nodes[cur];
+            let c = ev.buffers.nodes[cur];
             // F14: the warden counts distances flat.
-            let d = if ev.m.kind == Kind::Warden { c.dist_xz(&ev.nodes[n]) } else { c.dist(&ev.nodes[n]) };
-            ev.nodes[n].walked = c.walked + d;
-            let g = c.g + d + ev.nodes[n].malus;
-            let nn = ev.nodes[n];
+            let d =
+                if ev.m.kind == Kind::Warden { c.dist_xz(&ev.buffers.nodes[n]) } else { c.dist(&ev.buffers.nodes[n]) };
+            ev.buffers.nodes[n].walked = c.walked + d;
+            let g = c.g + d + ev.buffers.nodes[n].malus;
+            let nn = ev.buffers.nodes[n];
             if nn.walked < max_len && (nn.heap < 0 || g < nn.g) {
-                let hv = nearest(&ev.nodes, n, best);
-                let node = &mut ev.nodes[n];
+                let hv = nearest(&ev.buffers.nodes, n, best);
+                let node = &mut ev.buffers.nodes[n];
                 node.came_from = Some(cur);
                 node.g = g;
                 node.h = hv * 1.5;
                 if node.heap >= 0 {
                     let f = node.g + node.h;
-                    heap.change_cost(&mut ev.nodes, n, f);
+                    heap.change_cost(&mut ev.buffers.nodes, n, f);
                 } else {
                     node.f = node.g + node.h;
-                    heap.insert(&mut ev.nodes, n);
+                    heap.insert(&mut ev.buffers.nodes, n);
                 }
             }
         }
     }
-    ev.heap = heap.items;
-    ev.neighbours = nb;
+    ev.buffers.heap = heap.items;
+    ev.buffers.neighbours = nb;
 }
 
 /// Path towards the best node of the shortest reached target, otherwise of the nearest target
@@ -1539,6 +1534,8 @@ fn best_path(nodes: &[Node], targets: &[[i32; 3]], best: &[(f32, usize)], reache
 impl Server {
     /// View of the mob for the evaluator.
     pub(crate) fn mob_view(&self, m: &super::mob::Mob) -> MobView {
+        #[cfg(test)]
+        MOB_VIEWS_BUILT.set(MOB_VIEWS_BUILT.get() + 1);
         MobView {
             kind: m.kind,
             pos: m.pos,
@@ -1560,11 +1557,6 @@ impl Server {
             home: super::recent::path_home(m),
             malus_override: m.nav.malus_override.clone(),
         }
-    }
-
-    /// Penalty of the static type of `p` for the mob (random position tests).
-    pub(crate) fn view_has_malus(&self, view: &MobView, m: &super::mob::Mob, p: [i32; 3]) -> bool {
-        mob_malus(m, static_path_type(self, view, p)) != 0.0
     }
 
     /// The maximum fall tolerated (§ 3.5).

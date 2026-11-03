@@ -4571,20 +4571,26 @@ Switches, default = new, `=0` = old path (`SearchOptions`, read once):
   stamp: nothing to clear).
 - `RUSTCRAFT_OPT_PATH_SCRATCH`: node arena, maps, heap and lists kept per thread between searches
   (cleared, capacity kept), footprint types as a 27-bit set walked upwards (the order of the
-  game's sorted set), cell keys packed relative to the mob's block (21 bits per axis).
+  game's sorted set).
 - `RUSTCRAFT_OPT_PATH_REGION`: the 7 × 7 chunks around the mob looked up once, when first read.
 - `RUSTCRAFT_OPT_PATH_PALETTE`: a walkable cell (and a flyer's cell) skips its 24 neighbour reads
   when none of the sections they touch has a dangerous state in its palette (damaging, fire,
   lava, water, damage-cautious; verdict kept per section for the search; only inside a search).
 - `RUSTCRAFT_OPT_RANDOM_POS_VIEW`: the mob view of the penalty tests built once per random position
-  draw (ten tries) instead of once per test.
+  draw (ten tries) instead of once per test, in every ten-try draw that tests penalties
+  (villager, wild animal, goal, guardian, piglin and allay rules), a tamed pet's teleport to its
+  owner, and once per goat ram or long-jump choice (built again after each path request of the
+  long jump, which changes the mob's navigation).
 - `RUSTCRAFT_OPT_PATH_KEEP`: the movement helpers (towards a point, an entity) keep the current
   path without the copy the path request made only to compare and drop it.
 - Without switch: the two A* (one target, several targets) are one (`find_path_with`; with one
   target the set search is the single-target search); the dead distance at the end of the
   single-target search is gone; `fly_type` shares the neighbour scan of the ground cells; the
   amphibious and flyer water tests compare the block id, not its name; the evaluator is named
-  `NodeEvaluator` and its footprint type `path_type_for_mob`.
+  `NodeEvaluator` and its footprint type `path_type_for_mob`; cell and section keys are one `u64`
+  packed relative to the mob's block (21 bits per axis) instead of three `i32`, distinct within any
+  search's reach (`relative_keys_are_distinct_within_a_search_reach`), so every row of the table
+  below, `old` and `SCRATCH=0` included, hashes the packed keys.
 
 Proofs (`mobs::nav::search_tests`, village of the bench model world, `RUSTCRAFT_OPT_WORLD`): 2,000
 searches drawn with a fixed seed (20 bodies and evaluators: walkers 1×1 to 3×3, doors, flyers,
@@ -4594,7 +4600,9 @@ and 2,000 static types against the fingerprint recorded on the code before the s
 memo hit computed again and compared; every state written in the world, old rules by position
 against the state rules and the table at the three `TAG_BITS` levels, before and after a reload
 that changes fences, walls and speleothems; a wall built across 200 paths between two searches;
-1,000 mobs × 6 random position draws with and without the shared view; 300 mobs × 4 movement
+1,000 mobs × 15 random position draws with and without the shared view, each shared draw building
+at most one view per ten-try loop; a block of every path type alone beside a cell, palette shortcut
+against the neighbour scan; 300 mobs × 4 movement
 requests kept against the old copy. Eight sabotages each fail at least one proof (type set walked
 downwards, memo kept across searches, table ignoring speleothems, palette forgetting water, shared
 view with the flyer flag flipped, two chunks of the region on one slot, kept path not restarted,

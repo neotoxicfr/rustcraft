@@ -115,25 +115,25 @@ impl NodeEvaluator<'_> {
             return None;
         }
         let i = self.node(x, y, z);
-        self.nodes[i].ty = t;
-        self.nodes[i].malus = self.nodes[i].malus.max(cost);
+        self.buffers.nodes[i].ty = t;
+        self.buffers.nodes[i].malus = self.buffers.nodes[i].malus.max(cost);
         if t == PathType::Walkable {
-            self.nodes[i].malus += 1.0;
+            self.buffers.nodes[i].malus += 1.0;
         }
         Some(i)
     }
 
     fn open(&self, n: Option<usize>) -> bool {
-        n.is_some_and(|i| !self.nodes[i].closed)
+        n.is_some_and(|i| !self.buffers.nodes[i].closed)
     }
 
     fn has_m(&self, n: Option<usize>) -> bool {
-        n.is_some_and(|i| self.nodes[i].malus >= 0.0)
+        n.is_some_and(|i| self.buffers.nodes[i].malus >= 0.0)
     }
 
     /// Neighbours of a flyer: 6 faces, 12 edges, 8 corners (the game's order).
     pub(super) fn fly_neighbors(&mut self, cur: usize, out: &mut Vec<usize>) {
-        let c = self.nodes[cur];
+        let c = self.buffers.nodes[cur];
         let (x, y, z) = (c.x, c.y, c.z);
         let f = |e: &mut Self, dx: i32, dy: i32, dz: i32| e.fly_accepted(x + dx, y + dy, z + dz);
         let south = f(self, 0, 0, 1);
@@ -186,7 +186,7 @@ impl NodeEvaluator<'_> {
 
     /// Vertical neighbours in the water of the amphibious evaluator.
     pub(super) fn amphibious_neighbors(&mut self, cur: usize, out: &mut Vec<usize>) {
-        let c = self.nodes[cur];
+        let c = self.buffers.nodes[cur];
         let above = self.path_type_for_mob(c.x, c.y + 1, c.z);
         let here = self.path_type_for_mob(c.x, c.y, c.z);
         let jump = if self.malus(above) >= 0.0 && here != PathType::StickyHoney {
@@ -199,7 +199,7 @@ impl NodeEvaluator<'_> {
         let down = self.find_accepted(c.x, c.y - 1, c.z, jump, h, (0, 0), here);
         let valid = |e: &Self, n: Option<usize>| {
             n.is_some_and(|i| {
-                let nn = e.nodes[i];
+                let nn = e.buffers.nodes[i];
                 !nn.closed && (nn.malus >= 0.0 || c.malus < 0.0) && nn.ty == PathType::Water
             })
         };

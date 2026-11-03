@@ -3,7 +3,7 @@
 
 use super::mob::{Ent, Mob};
 use super::mth::{dist2, reduced};
-use super::nav::Path;
+use super::nav::{DrawView, Path};
 use super::species::Kind;
 use crate::player::Stack;
 use crate::server::Server;
@@ -2183,11 +2183,6 @@ impl Server {
         0.0
     }
 
-    fn has_malus(&self, m: &Mob, p: [i32; 3]) -> bool {
-        let view = self.mob_view(m);
-        super::nav::mob_malus(m, static_type_of(self, &view, p)) != 0.0
-    }
-
     fn random_dir(m: &mut Mob, h: i32, v: i32) -> [i32; 3] {
         let x = m.rng.next_int_bound(2 * h + 1) - h;
         let y = m.rng.next_int_bound(2 * v + 1) - v;
@@ -2224,6 +2219,7 @@ impl Server {
     /// 10 draws, best walking value.
     pub(crate) fn default_random_pos(&self, m: &mut Mob, h: i32, v: i32) -> Option<[f64; 3]> {
         let restrict = rpos_restricted(m, f64::from(h));
+        let view = DrawView::new(self, m);
         let mut best: Option<(f32, [i32; 3])> = None;
         for _ in 0..10 {
             let dir = Self::random_dir(m, h, v);
@@ -2231,7 +2227,7 @@ impl Server {
             if self.outside_limits(p)
                 || (restrict && !within_home(m, p))
                 || !self.nav_stable(m, p)
-                || self.has_malus(m, p)
+                || view.has_malus(self, m, p)
             {
                 continue;
             }
@@ -2246,6 +2242,7 @@ impl Server {
     /// The land position draw.
     pub(crate) fn land_random_pos(&self, m: &mut Mob, h: i32, v: i32) -> Option<[f64; 3]> {
         let restrict = rpos_restricted(m, f64::from(h));
+        let view = DrawView::new(self, m);
         let mut best: Option<(f32, [i32; 3])> = None;
         for _ in 0..10 {
             let dir = Self::random_dir(m, h, v);
@@ -2253,7 +2250,7 @@ impl Server {
             if self.outside_limits(p) || (restrict && !within_home(m, p)) || !self.nav_stable(m, p) {
                 continue;
             }
-            let Some(p) = self.up_out_of_solid(m, p) else { continue };
+            let Some(p) = self.up_out_of_solid(m, &view, p) else { continue };
             let w = self.walk_target_value(m, p);
             if w > best.map_or(f32::NEG_INFINITY, |b| b.0) {
                 best = Some((w, p));
@@ -2262,7 +2259,7 @@ impl Server {
         best.map(|b| [f64::from(b.1[0]) + 0.5, f64::from(b.1[1]), f64::from(b.1[2]) + 0.5])
     }
 
-    fn up_out_of_solid(&self, m: &Mob, mut p: [i32; 3]) -> Option<[i32; 3]> {
+    fn up_out_of_solid(&self, m: &Mob, view: &DrawView, mut p: [i32; 3]) -> Option<[i32; 3]> {
         let max = self.dim.height.min_y + self.dim.height.sections as i32 * 16 - 1;
         if self.is_solid(p) {
             p[1] += 1;
@@ -2270,7 +2267,7 @@ impl Server {
                 p[1] += 1;
             }
         }
-        if self.mob_fluid(p) == super::env::Fluid::Water || self.has_malus(m, p) {
+        if self.mob_fluid(p) == super::env::Fluid::Water || view.has_malus(self, m, p) {
             return None;
         }
         Some(p)
@@ -2280,6 +2277,7 @@ impl Server {
     pub(crate) fn default_random_pos_away(&self, m: &mut Mob, h: i32, v: i32, from: [f64; 3]) -> Option<[f64; 3]> {
         let away = [m.pos[0] - from[0], m.pos[2] - from[2]];
         let restrict = rpos_restricted(m, f64::from(h));
+        let view = DrawView::new(self, m);
         let mut best: Option<(f32, [i32; 3])> = None;
         for _ in 0..10 {
             let center = super::mth::atan2(away[1], away[0]) - f64::from(std::f32::consts::FRAC_PI_2);
@@ -2296,7 +2294,7 @@ impl Server {
             if self.outside_limits(p)
                 || (restrict && !within_home(m, p))
                 || !self.nav_stable(m, p)
-                || self.has_malus(m, p)
+                || view.has_malus(self, m, p)
             {
                 continue;
             }
@@ -2310,6 +2308,7 @@ impl Server {
 
     fn teleport_to_owner(&mut self, m: &mut Mob) {
         let o = super::mth::block_of(self.pos);
+        let view = DrawView::new(self, m);
         for _ in 0..10 {
             let dx = m.rng.int_between(-3, 3);
             let dz = m.rng.int_between(-3, 3);
@@ -2318,8 +2317,7 @@ impl Server {
             }
             let dy = m.rng.int_between(-1, 1);
             let p = [o[0] + dx, o[1] + dy, o[2] + dz];
-            let view = self.mob_view(m);
-            if static_type_of(self, &view, p) != super::nav::PathType::Walkable {
+            if view.static_type(self, m, p) != super::nav::PathType::Walkable {
                 continue;
             }
             if m.kind != Kind::Parrot && self.bname([p[0], p[1] - 1, p[2]]).ends_with("_leaves") {
@@ -2387,11 +2385,6 @@ pub fn bow_power(t: i32) -> f32 {
     let mut p = t as f32 / 20.0;
     p = (p * p + p * 2.0) / 3.0;
     p.min(1.0)
-}
-
-/// Static type of a cell for the mob (evaluator without cache).
-pub fn static_type_of(s: &Server, view: &super::nav::MobView, p: [i32; 3]) -> super::nav::PathType {
-    super::nav::static_path_type(s, view, p)
 }
 
 // Goals of simple surface animals (F02).

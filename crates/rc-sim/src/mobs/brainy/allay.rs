@@ -238,6 +238,7 @@ pub fn fly_target_pos_with(
     let v = view_vector(m);
     let max_y = s.dim.height.min_y + s.dim.height.sections as i32 * 16 - 1;
     let mut best: Option<[i32; 3]> = None;
+    let view = super::super::nav::DrawView::new(s, m);
     for _ in 0..10 {
         let center = super::super::mth::atan2(v[2], v[0]) - f64::from(std::f32::consts::FRAC_PI_2);
         let yr = center + f64::from(2.0 * m.rng.next_float() - 1.0) * f64::from(std::f32::consts::FRAC_PI_2);
@@ -279,9 +280,7 @@ pub fn fly_target_pos_with(
                 p[1] += 1;
             }
         }
-        let view = s.mob_view(m);
-        let t = super::super::nav::static_path_type(s, &view, p);
-        if super::super::nav::mob_malus(m, t) != 0.0 {
+        if view.has_malus(s, m, p) {
             continue;
         }
         let w = weight(s, p);

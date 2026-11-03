@@ -432,6 +432,42 @@ fn state_table_matches_the_rules_of_every_state_and_after_a_reload() {
     s.stop_parked();
 }
 
+/// The section palette shortcut agrees with the neighbour scan for a block of every path type:
+/// one block of each type alone in empty sections high above the village, the cell beside it gets
+/// the same neighbour verdict with and without the shortcut (a dangerous type the palette test
+/// forgot would leave the cell walkable).
+#[test]
+fn palette_shortcut_agrees_with_the_neighbour_scan_for_every_block_type() {
+    let Some(mut s) = village_server("path-palette") else { return };
+    let view = draw_searches(&s, 1).remove(0).view;
+    let p = [VILLAGE[0], 300, VILLAGE[1]];
+    let cell = [p[0] + 1, p[1], p[2]];
+    let mut first_state = std::collections::BTreeMap::new();
+    {
+        let e = NodeEvaluator::single_cell_with(&s, &view, SearchOptions::ALL_NEW);
+        for st in 0..s.data.states.len() as u32 {
+            let t = e.type_of_state(st);
+            first_state.entry(format!("{t:?}")).or_insert((st, t));
+        }
+    }
+    for t in ["Damaging", "Fire", "Lava", "Water", "DamageCautious", "Open", "Blocked"] {
+        assert!(first_state.contains_key(t), "no state of type {t}: {first_state:?}");
+    }
+    for &(st, t) in first_state.values() {
+        put_state(&mut s, p, st);
+        let verdict = |palette: bool| {
+            let opts = SearchOptions { palette, ..SearchOptions::ALL_NEW };
+            NodeEvaluator::new(&s, &view, opts, super::SearchBuffers::default())
+                .neighbour_danger(cell[0], cell[1], cell[2])
+        };
+        let scanned = verdict(false);
+        assert_eq!(verdict(true), scanned, "state {st} of type {t:?}: palette shortcut against the scan");
+        assert_eq!(scanned, super::neighbour_verdict(t), "state {st} of type {t:?}: verdict of the scan");
+    }
+    put_state(&mut s, p, 0);
+    s.stop_parked();
+}
+
 /// The kept buffers start each search empty: a block changed between two searches is seen by the
 /// second one (a memo kept from the first would serve the old type).
 #[test]
@@ -461,29 +497,64 @@ fn kept_buffers_see_a_block_changed_between_searches() {
     assert!(checked > 50, "paths changed by the wall: {checked}");
 }
 
-/// One random position draw of each kind, with the draw view shared (`share`) or rebuilt at each
-/// test: drawn position and the mob's random source afterwards.
+/// A random position draw of the proofs: name, most mob views one call may build when the view is
+/// shared (one per ten-try loop it runs), and the call (mob, residence centre, aimed point).
+type PositionDraw = (&'static str, u64, fn(&Server, &mut crate::mobs::mob::Mob, [i32; 3], [f64; 3]) -> String);
+
+/// Every random position draw that tests penalties, each through its own ten-try loop.
+const POSITION_DRAWS: &[PositionDraw] = &[
+    ("villager land", 1, |s, m, _, _| format!("{:?}", s.rpos_land(m, None, 10, 7, &|_, p| f64::from(p[1])))),
+    ("villager land at home", 1, |s, m, home, _| {
+        format!("{:?}", s.rpos_land(m, Some((home, 12)), 10, 7, &|_, p| f64::from(p[1])))
+    }),
+    ("villager default", 1, |s, m, home, _| format!("{:?}", s.rpos_default(m, Some((home, 16)), 10, 7))),
+    ("villager towards", 1, |s, m, _, to| {
+        format!("{:?}", s.rpos_default_towards(m, None, 10, 7, to, std::f64::consts::FRAC_PI_2))
+    }),
+    ("wild land", 1, |s, m, _, _| {
+        format!("{:?}", crate::mobs::wild::rpos::land_pos(s, m, 10, 7, |_, _, p| f64::from(p[1])))
+    }),
+    ("wild air and water", 1, |s, m, _, _| {
+        let pos = crate::mobs::wild::rpos::air_and_water_pos(s, m, 8, 7, 3, 1.0, 0.5, std::f64::consts::FRAC_PI_2);
+        format!("{pos:?}")
+    }),
+    ("goal default", 1, |s, m, _, _| format!("{:?}", s.default_random_pos(m, 10, 7))),
+    ("goal land", 1, |s, m, _, _| format!("{:?}", s.land_random_pos(m, 10, 7))),
+    ("goal away", 1, |s, m, _, to| format!("{:?}", s.default_random_pos_away(m, 10, 7, to))),
+    ("goal towards", 1, |s, m, _, to| format!("{:?}", s.pos_towards(m, 10, 7, to, std::f32::consts::FRAC_PI_2))),
+    // Hovering first, then air or water: two loops.
+    ("goal fly wander", 2, |s, m, _, _| format!("{:?}", s.fly_wander_pos(m))),
+    ("guardian default", 1, |s, m, _, _| format!("{:?}", s.guardian_random_pos(m, 10, 7))),
+    ("guardian towards", 1, |s, m, _, to| {
+        format!("{:?}", s.guardian_pos_towards(m, 10, 7, to, std::f64::consts::FRAC_PI_2))
+    }),
+    ("piglin away", 1, |s, m, _, to| format!("{:?}", s.pig_land_pos_away(m, 4.0, 8.0, 7, to))),
+    ("allay fly", 1, |s, m, home, _| {
+        format!("{:?}", crate::mobs::brainy::allay::fly_target_pos_with(s, m, Some((home, 12)), |_, _| 0.0))
+    }),
+];
+
+/// Every random position draw, with the draw view shared (`share`) or rebuilt at each test: drawn
+/// position and the mob's random source afterwards. With `share`, also checks the mob views built.
 fn draws_with(s: &Server, m: &crate::mobs::mob::Mob, share: bool, home_at: [i32; 3]) -> String {
-    use crate::mobs::wild::rpos;
     super::FORCE_SHARED_DRAW_VIEW.set(Some(share));
-    let height = |_: &Server, p: [i32; 3]| f64::from(p[1]);
     let to = [m.pos[0] + 9.0, m.pos[1], m.pos[2] - 5.0];
     let mut m = m.clone();
     let mut out = Vec::new();
-    out.push(format!("{:?}", s.rpos_land(&mut m, None, 10, 7, &height)));
-    out.push(format!("{:?}", s.rpos_land(&mut m, Some((home_at, 12)), 10, 7, &height)));
-    out.push(format!("{:?}", s.rpos_default(&mut m, Some((home_at, 16)), 10, 7)));
-    out.push(format!("{:?}", s.rpos_default_towards(&mut m, None, 10, 7, to, std::f64::consts::FRAC_PI_2)));
-    out.push(format!("{:?}", rpos::land_pos(s, &mut m, 10, 7, |_, _, p| f64::from(p[1]))));
-    out.push(format!("{:?}", rpos::air_and_water_pos(s, &mut m, 8, 7, 3, 1.0, 0.5, std::f64::consts::FRAC_PI_2)));
+    for (name, most_views, draw) in POSITION_DRAWS {
+        let views_before = super::mob_views_built();
+        out.push(draw(s, &mut m, home_at, to));
+        let views = super::mob_views_built() - views_before;
+        assert!(!share || views <= *most_views, "draw {name} built {views} mob views");
+    }
     out.push(format!("{}", m.rng.next_long()));
     super::FORCE_SHARED_DRAW_VIEW.set(None);
     out.join(" ")
 }
 
-/// 1,000 draws of each random position kind (villager rules and wild animal rules) on the village:
-/// the view built once per draw gives the positions and the random sequence of the view built at
-/// each test.
+/// 1,000 draws of each random position kind (villager, wild animal, goal, guardian, piglin and
+/// allay rules) on the village: the view built once per draw gives the positions and the random
+/// sequence of the view built at each test, and no draw builds more than one view per loop.
 #[test]
 fn random_position_draws_match_with_one_view_per_draw() {
     use crate::mobs::mob::Mob;
@@ -504,7 +575,8 @@ fn random_position_draws_match_with_one_view_per_draw() {
         found += shared.matches("Some").count();
     }
     s.stop_parked();
-    assert!(found > 3000, "positions found: {found}");
+    eprintln!("positions found: {found}");
+    assert!(found > 8000, "positions found: {found}");
 }
 
 /// The movement helpers keep the current path without copying it: same answers and same navigation

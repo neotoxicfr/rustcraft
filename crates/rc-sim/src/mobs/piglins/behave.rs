@@ -1303,6 +1303,7 @@ impl Server {
         if dir[0] * dir[0] + dy * dy + dir[1] * dir[1] == 0.0 {
             dir = [m.rng.next_double() - 0.5, m.rng.next_double() - 0.5];
         }
+        let view = super::super::nav::DrawView::new(self, m);
         let mut best: Option<(f32, [i32; 3])> = None;
         for _ in 0..10 {
             // The direction draw in a cone (π/2) then the position draw toward a direction.
@@ -1333,7 +1334,7 @@ impl Server {
                     q[1] += 1;
                 }
             }
-            if self.mob_fluid(q) == super::super::env::Fluid::Water || self.pos_has_malus(m, q) {
+            if self.mob_fluid(q) == super::super::env::Fluid::Water || view.has_malus(self, m, q) {
                 continue;
             }
             let w = self.walk_target_value(m, q);

@@ -75,11 +75,6 @@ impl Server {
         p[1] < h.min_y || p[1] >= h.min_y + h.sections as i32 * 16
     }
 
-    pub(crate) fn pos_has_malus(&self, m: &Mob, p: [i32; 3]) -> bool {
-        let view = self.mob_view(m);
-        super::super::nav::mob_malus(m, super::super::goals::static_type_of(self, &view, p)) != 0.0
-    }
-
     /// Common filter: height, residence, stable destination (and malus for the default shape).
     fn rpos_valid(&self, m: &Mob, view: &DrawView, home: Home, restrict: bool, p: [i32; 3], malus: bool) -> bool {
         !self.outside_height(p)
