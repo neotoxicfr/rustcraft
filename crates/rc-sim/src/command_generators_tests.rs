@@ -1,4 +1,4 @@
-//! Proofs of the generators shared by the commands (C1-M03): one per dimension and structure
+//! Proofs of the generators shared by the commands: one per dimension and structure
 //! setting, the generation thread's one used by the commands, the spawn search's one handed to the
 //! server of a world just created; same searches, same placements, same files as private ones.
 
@@ -32,7 +32,7 @@ fn world(tag: &str, seed: i64, structures: bool) -> Option<(Server, std::path::P
     force(&NEW_PATHS, Some(true));
     let data = Arc::new(rc_testdata::version_data()?);
     crate::registries::client_jar(&data)?;
-    let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-c1m03-{tag}-{}", std::process::id())));
+    let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-command-generators-{tag}-{}", std::process::id())));
     let mut w = crate::newworld::NewWorld::new(tag);
     w.seed = seed;
     w.generate_structures = structures;
@@ -274,7 +274,7 @@ fn bench_new_world_opening() {
             force(&["KEEP_NEW_WORLD_DATA"], Some(keep));
             force(&["REUSE_SPAWN_GENERATOR"], Some(reuse));
             force(&["EARLY_GENERATOR_START"], Some(early));
-            let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-c1m03-open-{keep}{reuse}{early}{round}")));
+            let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-new-world-opening-{keep}{reuse}{early}{round}")));
             let mut w = crate::newworld::NewWorld::new("bench");
             w.seed = SEED + i64::from(round);
             let t = std::time::Instant::now();
@@ -305,7 +305,7 @@ fn new_world_hands_its_generator_to_the_server() {
     for reuse in [true, false] {
         force(&NEW_PATHS, Some(true));
         force(&["REUSE_SPAWN_GENERATOR"], Some(reuse));
-        let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-c1m03-hand-{reuse}-{}", std::process::id())));
+        let dir = rc_testdata::scratch(std::env::temp_dir().join(format!("rc-spawn-generator-handover-{reuse}-{}", std::process::id())));
         let mut w = crate::newworld::NewWorld::new("hand");
         w.seed = SEED;
         crate::newworld::create_world(&dir, &data, &w).expect("world creation");

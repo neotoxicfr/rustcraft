@@ -1,4 +1,4 @@
-//! Generators of the dimensions used outside the generation thread (C1-M03): structure and biome
+//! Generators of the dimensions used outside the generation thread: structure and biome
 //! searches, `/place`, bone meal and saplings, the eye of Ender, exploration maps, the jigsaw and
 //! structure blocks. One per dimension and structure setting for the whole session, taken from the
 //! dimension's generation thread when it built the same one; and the generator of a world just
