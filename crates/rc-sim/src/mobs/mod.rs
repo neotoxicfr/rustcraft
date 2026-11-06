@@ -41,7 +41,7 @@ pub(crate) mod sealife;
 pub(crate) mod recent; // F14: warden, breeze, creaking, happy ghast
 pub(crate) mod spawn;
 pub(crate) mod species;
-mod structure_spawn; // F07: spawn lists of structures
+pub(crate) mod structure_spawn; // F07: spawn lists of structures
 pub(crate) mod surface;
 mod tick;
 
@@ -87,6 +87,8 @@ mod tests_g5f03b;
 mod tests_g4f07b;
 #[cfg(test)]
 mod tests_g5f02b;
+#[cfg(test)]
+pub(crate) mod tests_spawn_paths; // spawner blocks and natural spawns: former and optimised paths compared
 
 use rc_proto::Reader;
 use rc_proto::nbt::Nbt;

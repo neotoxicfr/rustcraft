@@ -10,6 +10,7 @@ use super::jrand::JRand;
 use super::mob::{Ent, Mob};
 use super::mth::dist2;
 use super::species::{Category, Kind};
+use super::structure_spawn::DecodedStarts;
 use crate::server::Server;
 
 /// Simulation levels of a chunk (lower is stronger): 31 or less "ticking entities" (entities,
@@ -89,6 +90,96 @@ pub struct Census {
 pub(crate) enum SpawnerAt<'a> {
     Block([i32; 3]),
     Cart(&'a mut crate::minecart::Cart),
+}
+
+/// Optimised paths of the spawner blocks and the natural spawns (`RUSTCRAFT_OPT_*`, on by
+/// default, `=0` for the former path, read once); a test picks its own per thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SpawnPaths {
+    /// Trial spawner: its block entity rewritten only when the write changes it (the chunk is no
+    /// longer marked for saving on every tick).
+    pub trial_write_on_change: bool,
+    /// Trial spawner: block entity read in place instead of copied, configuration shared with
+    /// the pack, state read from the block property without a string, block entity found once.
+    pub trial_borrow: bool,
+    /// Vault: a paused vault that shows nothing new leaves its tick before decoding anything;
+    /// its data is read in place instead of from a copy.
+    pub vault_early_exit: bool,
+    /// Monster spawner: player range read on the block entity before copying it.
+    pub spawner_range_first: bool,
+    /// Monster spawner: the countdown between two spawns is written in place, without a copy
+    /// (implies the range test first).
+    pub spawner_borrow: bool,
+    /// Natural spawns: spawn chunks counted without sets, spawn costs memoized per biome, charges
+    /// gathered only when a category may spawn.
+    pub spawn_census: bool,
+    /// Natural spawns: structure starts decoded once per pass, pieces grouped by chunk column,
+    /// spawn list not read twice at the drawing position.
+    pub structure_starts: bool,
+    /// Natural spawns: a position's placement tested before its spawn list (off by default: with
+    /// the decoded lists, the list is the cheaper test away from structures, where the placement
+    /// test allocates a block name; to settle on the fortress scene).
+    pub placement_first: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: paths used by this thread (equivalence proofs), without touching the environment.
+    pub(crate) static FORCED_SPAWN_PATHS: std::cell::Cell<Option<SpawnPaths>> = const { std::cell::Cell::new(None) };
+}
+
+impl SpawnPaths {
+    pub(crate) fn current() -> SpawnPaths {
+        #[cfg(test)]
+        if let Some(paths) = FORCED_SPAWN_PATHS.with(std::cell::Cell::get) {
+            return paths;
+        }
+        SpawnPaths {
+            trial_write_on_change: rc_data::opt_switch!("RUSTCRAFT_OPT_TRIAL_WRITE_ON_CHANGE"),
+            trial_borrow: rc_data::opt_switch!("RUSTCRAFT_OPT_TRIAL_BORROW"),
+            vault_early_exit: rc_data::opt_switch!("RUSTCRAFT_OPT_VAULT_EARLY_EXIT"),
+            spawner_range_first: rc_data::opt_switch!("RUSTCRAFT_OPT_SPAWNER_RANGE_FIRST"),
+            spawner_borrow: rc_data::opt_switch!("RUSTCRAFT_OPT_SPAWNER_BORROW"),
+            spawn_census: rc_data::opt_switch!("RUSTCRAFT_OPT_SPAWN_CENSUS"),
+            structure_starts: rc_data::opt_switch!("RUSTCRAFT_OPT_STRUCTURE_STARTS"),
+            placement_first: rc_data::opt_switch!("RUSTCRAFT_OPT_SPAWN_PLACEMENT_FIRST", default_off),
+        }
+    }
+
+    /// The default paths (every new one, the placement-first order excepted).
+    #[cfg(test)]
+    pub(crate) const NEW: SpawnPaths = SpawnPaths {
+        trial_write_on_change: true,
+        trial_borrow: true,
+        vault_early_exit: true,
+        spawner_range_first: true,
+        spawner_borrow: true,
+        spawn_census: true,
+        structure_starts: true,
+        placement_first: false,
+    };
+
+    /// Every former path.
+    #[cfg(test)]
+    pub(crate) const OLD: SpawnPaths = SpawnPaths {
+        trial_write_on_change: false,
+        trial_borrow: false,
+        vault_early_exit: false,
+        spawner_range_first: false,
+        spawner_borrow: false,
+        spawn_census: false,
+        structure_starts: false,
+        placement_first: false,
+    };
+
+    /// Runs `f` with these paths on the current thread.
+    #[cfg(test)]
+    pub(crate) fn run<R>(self, f: impl FnOnce() -> R) -> R {
+        let before = FORCED_SPAWN_PATHS.with(|c| c.replace(Some(self)));
+        let out = f();
+        FORCED_SPAWN_PATHS.with(|c| c.set(before));
+        out
+    }
 }
 
 /// State of the special "cats" and "zombie siege" spawners (not saved, like the
@@ -743,27 +834,18 @@ impl Server {
     pub(crate) fn natural_spawn_tick(&mut self) {
         #[cfg(test)]
         crate::server::phase("spawns");
+        let paths = SpawnPaths::current();
         let do_spawn = self.rule("minecraft:spawn_mobs", true);
         // Players (host and guests): position and spectator state. Spawn chunks
         // (the spawn chunk collection): within 8 of a player at most, loaded, and within 128 blocks
         // of a non-spectator player.
         let players = self.spawn_players();
         let host_active = self.game_mode != 3;
-        let mut chunks: Vec<(i32, i32)> = Vec::new();
-        {
-            let mut seen = hashbrown::HashSet::new();
-            for (pos, _) in &players {
-                let pc = ((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4);
-                for dx in -8..=8 {
-                    for dz in -8..=8 {
-                        let c = (pc.0 + dx, pc.1 + dz);
-                        if self.chunks.get(&c).is_some_and(Option::is_some) && seen.insert(c) {
-                            chunks.push(c);
-                        }
-                    }
-                }
-            }
-        }
+        let mut chunks = if paths.spawn_census {
+            self.spawn_chunks_near(&players)
+        } else {
+            self.spawn_chunks_near_with_set(&players)
+        };
         let near = |pos: &[f64; 3], c: &(i32, i32)| {
             let dx = f64::from(c.0 * 16 + 8) - pos[0];
             let dz = f64::from(c.1 * 16 + 8) - pos[2];
@@ -771,20 +853,21 @@ impl Server {
         };
         chunks.retain(|c| players.iter().any(|(pos, spectator)| !spectator && near(pos, c)));
         // Game counter: chunks within 8 of a player at most, loaded or not (289 only).
-        let spawnable = {
-            let centers = self.sim_centers();
-            let mut all = hashbrown::HashSet::new();
-            for c in &centers {
-                for dx in -8..=8 {
-                    for dz in -8..=8 {
-                        all.insert((c.0 + dx, c.1 + dz));
-                    }
-                }
-            }
-            all.len() as i32
-        };
+        let centers = self.sim_centers();
+        let spawnable =
+            if paths.spawn_census { spawn_chunk_count(&centers) } else { spawn_chunk_count_with_set(&centers) };
         let slot = Category::slot;
-        let (mut counts, mut pot) = self.spawn_state_counts();
+        let mut pass = SpawnPass {
+            paths,
+            costs: SpawnCostMemo::default(),
+            starts: DecodedStarts::default(),
+            entry_drawn_at: None,
+        };
+        let (mut counts, mut pot) = if paths.spawn_census {
+            (self.mob_counts_for_caps(&centers), Vec::new())
+        } else {
+            self.spawn_state_counts()
+        };
         let monsters_ok = self.rule("minecraft:spawn_monsters", true) && self.level.difficulty_id() != 0;
         let persistent_tick = self.time % 400 == 0;
         let mut cats: Vec<Category> = Vec::new();
@@ -801,10 +884,15 @@ impl Server {
             }
             cats.push(c);
         }
+        // The charges are only read by spawn attempts, so not gathered when no category may
+        // spawn; still gathered before the chunk loop, whose thunderstorms may add or convert
+        // mobs before the first attempt.
+        if paths.spawn_census && !cats.is_empty() {
+            pot = self.spawn_charges(&centers, &mut pass.costs);
+        }
         // Candidate chunks, shuffled; groups are only drawn around the host.
         let mut cand = chunks;
         self.mobs.rng.shuffle(&mut cand);
-        let centers = self.sim_centers();
         for c in cand {
             if let Some(Some(ch)) = self.chunks.get_mut(&c) {
                 ch.inhabited_time += 1;
@@ -820,7 +908,7 @@ impl Server {
                 if counts[i] >= cat.max() {
                     continue;
                 }
-                let n = self.spawn_category_in_chunk(cat, c, &mut pot);
+                let n = self.spawn_category_in_chunk(cat, c, &mut pot, &mut pass);
                 counts[i] += n;
             }
         }
@@ -830,22 +918,46 @@ impl Server {
         (census.chunks, census.counts) = (spawnable, counts);
     }
 
-    /// Spawn cost of the type in the biome (charge, energy budget), if it has one.
-    fn spawn_cost(&self, kind: Kind, p: [i32; 3]) -> Option<(f64, f64)> {
+    /// Spawn cost of the type in the biome (charge, energy budget), if it has one. The species'
+    /// names carry their namespace: the cost key is the name itself.
+    pub(super) fn spawn_cost(&self, kind: Kind, p: [i32; 3]) -> Option<(f64, f64)> {
         let def = self.life.pack.get("worldgen/biome", self.biome_str(p))?;
-        let costs = &def["attributes"]["minecraft:gameplay/natural_mob_spawns"]["argument"]["spawn_costs"];
-        let name = kind.info().name;
-        let c = if name.contains(':') { &costs[name] } else { &costs[format!("minecraft:{name}").as_str()] };
+        let c =
+            &def["attributes"]["minecraft:gameplay/natural_mob_spawns"]["argument"]["spawn_costs"][kind.info().name];
         Some((c["charge"].as_f64()?, c["energy_budget"].as_f64()?))
     }
 
+    /// Spawn cost for a pass: memoized on the census path, read from the pack otherwise.
+    fn spawn_cost_in_pass(&self, pass: &mut SpawnPass, kind: Kind, p: [i32; 3]) -> Option<(f64, f64)> {
+        if pass.paths.spawn_census { self.spawn_cost_memo(&mut pass.costs, kind, p) } else { self.spawn_cost(kind, p) }
+    }
+
+    /// `spawn_cost`, read once per biome and species: the pack cannot change during a pass, and
+    /// a pass meets a few biomes and species many times.
+    pub(super) fn spawn_cost_memo(&self, memo: &mut SpawnCostMemo, kind: Kind, p: [i32; 3]) -> Option<(f64, f64)> {
+        // Same biome index as `biome_str` reads.
+        let biome = self.biome_at(p).unwrap_or(0);
+        if let Some(known) = memo.known.iter().find(|e| e.biome == biome && e.kind == kind) {
+            return known.cost;
+        }
+        let cost = self.spawn_cost(kind, p);
+        memo.known.push(KnownCost { biome, kind, cost });
+        cost
+    }
+
     /// Does the potential of the charges already placed allow this type here?
-    fn spawn_potential_ok(&self, kind: Kind, p: [i32; 3], pot: &[([i32; 3], f64)]) -> bool {
-        let Some((charge, budget)) = self.spawn_cost(kind, p) else { return true };
+    fn spawn_potential_ok(&self, pass: &mut SpawnPass, kind: Kind, p: [i32; 3], pot: &[([i32; 3], f64)]) -> bool {
+        let Some((charge, budget)) = self.spawn_cost_in_pass(pass, kind, p) else { return true };
         potential_ok(charge, budget, p, pot)
     }
 
-    fn spawn_category_in_chunk(&mut self, cat: Category, c: (i32, i32), pot: &mut Vec<([i32; 3], f64)>) -> i32 {
+    fn spawn_category_in_chunk(
+        &mut self,
+        cat: Category,
+        c: (i32, i32),
+        pot: &mut Vec<([i32; 3], f64)>,
+        pass: &mut SpawnPass,
+    ) -> i32 {
         let x = c.0 * 16 + self.mobs.rng.next_int_bound(16);
         let z = c.1 * 16 + self.mobs.rng.next_int_bound(16);
         let top = self.surface_y(x, z, 1) + 1;
@@ -882,11 +994,12 @@ impl Server {
                     continue;
                 }
                 if current.is_none() && known {
-                    match self.pick_spawn_entry(cat, p) {
+                    match self.pick_spawn_entry(cat, p, pass) {
                         None => break,
                         Some((name, count, e)) => {
                             max = count;
                             entry = e;
+                            pass.entry_drawn_at = Some(p);
                             match Kind::from_name(&name) {
                                 Some(k) => current = Some((k, count)),
                                 None => {
@@ -897,7 +1010,9 @@ impl Server {
                     }
                 }
                 let Some((kind, _)) = current else { continue };
-                if !self.valid_spawn_position(kind, p, d, cat, &entry) || !self.spawn_potential_ok(kind, p, pot) {
+                if !self.valid_spawn_position(kind, p, d, cat, &entry, pass)
+                    || !self.spawn_potential_ok(pass, kind, p, pot)
+                {
                     continue;
                 }
                 let yaw = self.mobs.rng.next_float() * 360.0;
@@ -908,7 +1023,7 @@ impl Server {
                 self.finalize_spawn(&mut m, Reason::Natural, &mut group);
                 // Charge placed where the mob is (biome cost at its position).
                 let bp = m.block_pos();
-                if let Some((charge, _)) = self.spawn_cost(kind, bp)
+                if let Some((charge, _)) = self.spawn_cost_in_pass(pass, kind, bp)
                     && charge != 0.0
                 {
                     pot.push((bp, charge));
@@ -939,7 +1054,12 @@ impl Server {
     }
 
     /// Entry drawn from the biome's list (name, group size).
-    fn pick_spawn_entry(&mut self, cat: Category, p: [i32; 3]) -> Option<(String, i32, serde_json::Value)> {
+    fn pick_spawn_entry(
+        &mut self,
+        cat: Category,
+        p: [i32; 3],
+        pass: &mut SpawnPass,
+    ) -> Option<(String, i32, serde_json::Value)> {
         let key = spawn_key(cat)?;
         // F07: structures that replace the list (outpost, hut, fortress, monument), otherwise biome.
         // F09: rarefied aquatic ambience (98% refusal) in the biomes of the tag.
@@ -949,7 +1069,7 @@ impl Server {
         {
             return None;
         }
-        let list = self.spawn_list_at(cat, key, p);
+        let list = self.spawn_list_in_pass(pass, cat, key, p);
         let total: i32 = list.iter().map(|e| e["weight"].as_i64().unwrap_or(0) as i32).sum();
         if total <= 0 {
             return None;
@@ -969,14 +1089,31 @@ impl Server {
                 self.mobs.rng.next_int_bound(hi - lo + 1) + lo
             }
         };
-        Some((name, count, e.clone()))
+        Some((name, count, e))
     }
 
     /// The drawn entry still appears in the position's list (type and
     /// count; the weight is not part of it).
-    fn can_spawn_entry_at(&self, cat: Category, entry: &serde_json::Value, p: [i32; 3]) -> bool {
+    fn can_spawn_entry_at(&self, pass: &mut SpawnPass, cat: Category, entry: &serde_json::Value, p: [i32; 3]) -> bool {
         let Some(key) = spawn_key(cat) else { return false };
-        self.spawn_list_at(cat, key, p).iter().any(|e| e["type"] == entry["type"] && e["count"] == entry["count"])
+        self.spawn_list_in_pass(pass, cat, key, p)
+            .iter()
+            .any(|e| e["type"] == entry["type"] && e["count"] == entry["count"])
+    }
+
+    /// Spawn list at `p`, from the starts decoded for the pass (structure path).
+    fn spawn_list_in_pass(
+        &self,
+        pass: &mut SpawnPass,
+        cat: Category,
+        key: &str,
+        p: [i32; 3],
+    ) -> std::sync::Arc<[serde_json::Value]> {
+        if pass.paths.structure_starts {
+            self.spawn_list_decoded(&mut pass.starts, cat, key, p)
+        } else {
+            self.spawn_list_at(cat, key, p)
+        }
     }
 
     /// Distance, ground placement, spawn rule, free box.
@@ -987,6 +1124,7 @@ impl Server {
         d: f64,
         list_cat: Category,
         entry: &serde_json::Value,
+        pass: &mut SpawnPass,
     ) -> bool {
         let cat = kind.info().category;
         if cat == Category::Misc {
@@ -996,11 +1134,21 @@ impl Server {
         if kind != Kind::Pillager && d > f64::from(cat.despawn_distance().pow(2)) {
             return false;
         }
-        // F07: the entry must appear in the list of the new position.
-        if !self.can_spawn_entry_at(list_cat, entry, p) {
-            return false;
-        }
-        if !self.spawn_placement_ok(kind, p) {
+        // F07: the entry must appear in the list of the new position. Structure path: the list
+        // of the position the entry was drawn from holds it (the lists cannot change during a
+        // pass), not read again there.
+        let drawn_here = pass.paths.structure_starts && pass.entry_drawn_at == Some(p);
+        let placement_first = pass.paths.placement_first;
+        let mut listed = |s: &Self| drawn_here || s.can_spawn_entry_at(pass, list_cat, entry, p);
+        // Both tests only read the world (no random draw): their order does not change the answer.
+        let placed_and_listed = if placement_first {
+            let placed = self.spawn_placement_ok(kind, p);
+            placed && listed(self)
+        } else {
+            let in_list = listed(self);
+            in_list && self.spawn_placement_ok(kind, p)
+        };
+        if !placed_and_listed {
             return false;
         }
         if !self.spawn_rules(kind, p) {
@@ -1205,9 +1353,10 @@ impl Server {
         }
         self.lan.as_ref().is_some_and(|l| {
             l.guests.iter().any(|g| {
-                g.ctx.as_ref().filter(|ctx| g.joined && !g.gone && self.holds_tickets(ctx.game_mode)).is_some_and(
-                    |ctx| near(((ctx.pos[0].floor() as i32) >> 4, (ctx.pos[2].floor() as i32) >> 4)),
-                )
+                g.ctx
+                    .as_ref()
+                    .filter(|ctx| g.joined && !g.gone && self.holds_tickets(ctx.game_mode))
+                    .is_some_and(|ctx| near(((ctx.pos[0].floor() as i32) >> 4, (ctx.pos[2].floor() as i32) >> 4)))
             })
         })
     }
@@ -1239,15 +1388,9 @@ impl Server {
         let mut counts = [0i32; 7];
         let mut pot: Vec<([i32; 3], f64)> = Vec::new();
         let centers = self.sim_centers();
-        for m in self.mobs.list.iter() {
-            if m.persistent || m.requires_custom_persistence() || m.kind.info().category == Category::Misc {
-                continue;
-            }
-            let bp = m.block_pos();
-            if !self.entities_loaded_at((bp[0] >> 4, bp[2] >> 4), &centers) {
-                continue;
-            }
+        for m in self.mobs_under_caps(&centers) {
             counts[Category::slot(m.kind.info().category)] += 1;
+            let bp = m.block_pos();
             if self.chunks.get(&(bp[0] >> 4, bp[2] >> 4)).is_some_and(Option::is_some)
                 && let Some((charge, _)) = self.spawn_cost(m.kind, bp)
                 && charge != 0.0
@@ -1256,6 +1399,82 @@ impl Server {
             }
         }
         (counts, pot)
+    }
+
+    /// The mobs the caps count: not persistent, not miscellaneous, in a chunk with loaded entities.
+    fn mobs_under_caps<'a>(&'a self, centers: &'a [(i32, i32)]) -> impl Iterator<Item = &'a Mob> + 'a {
+        self.mobs.list.iter().filter(move |m| {
+            if m.persistent || m.requires_custom_persistence() || m.kind.info().category == Category::Misc {
+                return false;
+            }
+            let bp = m.block_pos();
+            self.entities_loaded_at((bp[0] >> 4, bp[2] >> 4), centers)
+        })
+    }
+
+    /// The counts of `spawn_state_counts` alone (census path: the charges are read apart, only
+    /// when a category may spawn).
+    fn mob_counts_for_caps(&self, centers: &[(i32, i32)]) -> [i32; 7] {
+        let mut counts = [0i32; 7];
+        for m in self.mobs_under_caps(centers) {
+            counts[Category::slot(m.kind.info().category)] += 1;
+        }
+        counts
+    }
+
+    /// The charges of `spawn_state_counts` (mobs counted by the caps standing in a loaded chunk),
+    /// with the pass's memoized costs.
+    fn spawn_charges(&self, centers: &[(i32, i32)], costs: &mut SpawnCostMemo) -> Vec<([i32; 3], f64)> {
+        let mut pot = Vec::new();
+        for m in self.mobs_under_caps(centers) {
+            let bp = m.block_pos();
+            if self.chunks.get(&(bp[0] >> 4, bp[2] >> 4)).is_some_and(Option::is_some)
+                && let Some((charge, _)) = self.spawn_cost_memo(costs, m.kind, bp)
+                && charge != 0.0
+            {
+                pot.push((bp, charge));
+            }
+        }
+        pot
+    }
+
+    /// Loaded chunks within 8 (Chebyshev) of a player, in the players' order, each once: a chunk
+    /// already covered by an earlier player's square was listed with it (no set needed; one
+    /// player, the common case, has no earlier square at all).
+    fn spawn_chunks_near(&self, players: &[([f64; 3], bool)]) -> Vec<(i32, i32)> {
+        let chunk_of = |pos: &[f64; 3]| ((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4);
+        let mut chunks = Vec::new();
+        for (i, (pos, _)) in players.iter().enumerate() {
+            let pc = chunk_of(pos);
+            for dx in -8..=8 {
+                for dz in -8..=8 {
+                    let c = (pc.0 + dx, pc.1 + dz);
+                    let listed = players[..i].iter().any(|(q, _)| within_8(chunk_of(q), c));
+                    if !listed && self.chunks.get(&c).is_some_and(Option::is_some) {
+                        chunks.push(c);
+                    }
+                }
+            }
+        }
+        chunks
+    }
+
+    /// `spawn_chunks_near`, former path (a set of the chunks seen).
+    fn spawn_chunks_near_with_set(&self, players: &[([f64; 3], bool)]) -> Vec<(i32, i32)> {
+        let mut chunks: Vec<(i32, i32)> = Vec::new();
+        let mut seen = hashbrown::HashSet::new();
+        for (pos, _) in players {
+            let pc = ((pos[0].floor() as i32) >> 4, (pos[2].floor() as i32) >> 4);
+            for dx in -8..=8 {
+                for dz in -8..=8 {
+                    let c = (pc.0 + dx, pc.1 + dz);
+                    if self.chunks.get(&c).is_some_and(Option::is_some) && seen.insert(c) {
+                        chunks.push(c);
+                    }
+                }
+            }
+        }
+        chunks
     }
 
     /// Chunk with loaded entities: players' loading ticket (view, Chebyshev) or
@@ -1278,9 +1497,10 @@ impl Server {
         }
         self.lan.as_ref().is_some_and(|l| {
             l.guests.iter().any(|g| {
-                g.ctx.as_ref().filter(|ctx| g.joined && !g.gone && self.holds_tickets(ctx.game_mode)).is_some_and(
-                    |ctx| near(((ctx.pos[0].floor() as i32) >> 4, (ctx.pos[2].floor() as i32) >> 4)),
-                )
+                g.ctx
+                    .as_ref()
+                    .filter(|ctx| g.joined && !g.gone && self.holds_tickets(ctx.game_mode))
+                    .is_some_and(|ctx| near(((ctx.pos[0].floor() as i32) >> 4, (ctx.pos[2].floor() as i32) >> 4)))
             })
         })
     }
@@ -1313,6 +1533,17 @@ impl Server {
     /// Spawner of a block or carried by a minecart (G5-F06: data in its compound,
     /// entity event instead of the block event, nothing sent to the client).
     pub(crate) fn spawner_tick_at(&mut self, mut at: SpawnerAt<'_>, players: &[[f64; 3]]) {
+        let paths = SpawnPaths::current();
+        // Most ticks end here (no player in range, or counting down): settled on the block entity
+        // itself, before the copy the rest of the tick works on.
+        if paths.spawner_range_first || paths.spawner_borrow {
+            if !self.spawner_player_in_range(&at, players) {
+                return;
+            }
+            if paths.spawner_borrow && self.spawner_count_down(&mut at) {
+                return;
+            }
+        }
         let (p, be) = match &at {
             SpawnerAt::Block(p) => match self.be_get(*p).cloned() {
                 Some(be) => (*p, be),
@@ -1320,11 +1551,8 @@ impl Server {
             },
             SpawnerAt::Cart(c) => (c.block_pos(), c.nbt.clone()),
         };
-        let geti = |k: &str, d: i32| crate::nbtio::int(&be, k).map_or(d, |v| v as i32);
-        let range = geti("RequiredPlayerRange", 16);
-        let c = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
-        let r2 = f64::from(range) * f64::from(range);
-        if !players.iter().any(|q| range < 0 || dist2(*q, c) < r2) {
+        let geti = |k: &str, d: i32| spawner_int(&be, k, d);
+        if !player_in_spawner_range(p, geti("RequiredPlayerRange", 16), players) {
             return;
         }
         let mut st = SpawnerState {
@@ -1411,8 +1639,7 @@ impl Server {
                 f64::from(p[2] + 1 + spawn_range),
             ];
             let area = rc_physics::Aabb { min: lo, max: hi };
-            let near =
-                self.mobs.of_kind(kind).filter(|o| o.alive() && o.touches(&area)).count();
+            let near = self.mobs.of_kind(kind).filter(|o| o.alive() && o.touches(&area)).count();
             if near as i32 >= max_near {
                 self.spawner_delay(&mut at, &mut st);
                 self.spawner_store(&mut at, &st);
@@ -1447,6 +1674,41 @@ impl Server {
         self.spawner_store(&mut at, &st);
     }
 
+    /// A living player within `RequiredPlayerRange` of the spawner, read on its data in place.
+    /// No block entity: false (the tick does nothing, like the former path).
+    fn spawner_player_in_range(&self, at: &SpawnerAt<'_>, players: &[[f64; 3]]) -> bool {
+        let (p, nbt) = match at {
+            SpawnerAt::Block(p) => match self.be_get(*p) {
+                Some(be) => (*p, be),
+                None => return false,
+            },
+            SpawnerAt::Cart(c) => (c.block_pos(), &c.nbt),
+        };
+        player_in_spawner_range(p, spawner_int(nbt, "RequiredPlayerRange", 16), players)
+    }
+
+    /// Spawner counting down (delay above zero): the tick only lowers the delay, written in place
+    /// without marking the chunk, like the full tick does (whose rewrite of the unchanged
+    /// `SpawnData` changes nothing). The block entity is no longer copied on each of the 200 to
+    /// 800 ticks between two spawns. False: the full tick must run (first delay, spawn).
+    fn spawner_count_down(&mut self, at: &mut SpawnerAt<'_>) -> bool {
+        let nbt = match at {
+            SpawnerAt::Block(p) => {
+                let p = *p;
+                let Some(Some(c)) = self.chunks.get_mut(&(p[0] >> 4, p[2] >> 4)) else { return false };
+                let Some(be) = c.block_entities.iter_mut().find(|v| be_is_at(v, p)) else { return false };
+                be
+            }
+            SpawnerAt::Cart(c) => &mut c.nbt,
+        };
+        let delay = spawner_int(nbt, "Delay", 20);
+        if delay <= 0 {
+            return false;
+        }
+        crate::nbtio::set(nbt, "Delay", Nbt::Short((delay - 1) as i16));
+        true
+    }
+
     /// `delay`: delay drawn between the bounds, next data drawn from the list, block
     /// event 1 (the client resets its rotation to the minimal delay).
     fn spawner_delay(&mut self, at: &mut SpawnerAt<'_>, st: &mut SpawnerState) {
@@ -1479,11 +1741,7 @@ impl Server {
             }
         };
         let Some(Some(c)) = self.chunks.get_mut(&(p[0] >> 4, p[2] >> 4)) else { return };
-        let Some(be) = c.block_entities.iter_mut().find(|v| {
-            crate::nbtio::int(v, "x") == Some(i64::from(p[0]))
-                && crate::nbtio::int(v, "y") == Some(i64::from(p[1]))
-                && crate::nbtio::int(v, "z") == Some(i64::from(p[2]))
-        }) else {
+        let Some(be) = c.block_entities.iter_mut().find(|v| be_is_at(v, p)) else {
             return;
         };
         crate::nbtio::set(be, "Delay", Nbt::Short(st.delay as i16));
@@ -1677,7 +1935,8 @@ impl Server {
                 || ((n == "campfire" || n == "soul_campfire")
                     && self.data.state_properties(self.st(p)).any(|kv| kv == ("lit", "true")))
         };
-        matches!(n, "wither_rose" | "sweet_berry_bush" | "cactus" | "powder_snow") || (!kind.info().fire_immune && burning())
+        matches!(n, "wither_rose" | "sweet_berry_bush" | "cactus" | "powder_snow")
+            || (!kind.info().fire_immune && burning())
     }
 
     /// Own rules of a spawn data (`custom_spawn_rules`): block light and
@@ -1771,7 +2030,8 @@ impl Server {
             return self.variant_sky_rule(kind, p);
         }
         if kind == Kind::Wolf {
-            return self.btag_id(below, crate::tag_bits::TagId::WolvesSpawnableOn) && self.light(p).0.max(self.light(p).1) > 8;
+            return self.btag_id(below, crate::tag_bits::TagId::WolvesSpawnableOn)
+                && self.light(p).0.max(self.light(p).1) > 8;
         }
         self.btag_id(below, crate::tag_bits::TagId::AnimalsSpawnableOn) && {
             let (s, b) = self.light(p);
@@ -1856,6 +2116,84 @@ struct SpawnerState {
     next: Option<Nbt>,
     potentials: Vec<Nbt>,
     changed: bool,
+}
+
+/// What a natural spawn pass shares between its attempts (nothing a spawn can change: the
+/// pack, the structures of the loaded chunks).
+struct SpawnPass {
+    paths: SpawnPaths,
+    costs: SpawnCostMemo,
+    starts: DecodedStarts,
+    /// Position whose spawn list the group's current entry was drawn from.
+    entry_drawn_at: Option<[i32; 3]>,
+}
+
+/// Spawn costs already read during a pass (a few biomes and species: a list beats a map).
+#[derive(Default)]
+pub(crate) struct SpawnCostMemo {
+    known: Vec<KnownCost>,
+}
+
+/// Spawn cost of a species in a biome (registry index), `None` when it has none.
+struct KnownCost {
+    biome: usize,
+    kind: Kind,
+    cost: Option<(f64, f64)>,
+}
+
+/// Chunk `c` lies in the 17 × 17 square around `center`.
+fn within_8(center: (i32, i32), c: (i32, i32)) -> bool {
+    (c.0 - center.0).abs() <= 8 && (c.1 - center.1).abs() <= 8
+}
+
+/// Chunks within 8 of a center, loaded or not: the union of the 17 × 17 squares, counted
+/// without a set (a chunk counts for the first center whose square covers it): 289 for one
+/// center, 0 without any.
+pub(super) fn spawn_chunk_count(centers: &[(i32, i32)]) -> i32 {
+    let mut n = 0;
+    for (i, &center) in centers.iter().enumerate() {
+        for dx in -8..=8 {
+            for dz in -8..=8 {
+                let c = (center.0 + dx, center.1 + dz);
+                if !centers[..i].iter().any(|&o| within_8(o, c)) {
+                    n += 1;
+                }
+            }
+        }
+    }
+    n
+}
+
+/// `spawn_chunk_count`, former path (a set of every chunk).
+pub(super) fn spawn_chunk_count_with_set(centers: &[(i32, i32)]) -> i32 {
+    let mut all = hashbrown::HashSet::new();
+    for c in centers {
+        for dx in -8..=8 {
+            for dz in -8..=8 {
+                all.insert((c.0 + dx, c.1 + dz));
+            }
+        }
+    }
+    all.len() as i32
+}
+
+/// Integer field of a monster spawner's data (any width, truncated like the game's read).
+fn spawner_int(nbt: &Nbt, key: &str, default: i32) -> i32 {
+    crate::nbtio::int(nbt, key).map_or(default, |v| v as i32)
+}
+
+/// A living player strictly within `range` of the spawner's center (negative range: always).
+fn player_in_spawner_range(p: [i32; 3], range: i32, players: &[[f64; 3]]) -> bool {
+    let c = [f64::from(p[0]) + 0.5, f64::from(p[1]) + 0.5, f64::from(p[2]) + 0.5];
+    let r2 = f64::from(range) * f64::from(range);
+    players.iter().any(|q| range < 0 || dist2(*q, c) < r2)
+}
+
+/// Block entity of position `p` (its `x`, `y`, `z` fields).
+fn be_is_at(be: &Nbt, p: [i32; 3]) -> bool {
+    crate::nbtio::int(be, "x") == Some(i64::from(p[0]))
+        && crate::nbtio::int(be, "y") == Some(i64::from(p[1]))
+        && crate::nbtio::int(be, "z") == Some(i64::from(p[2]))
 }
 
 /// Weighted draw in `[{data, weight}]`: no draw if the list
