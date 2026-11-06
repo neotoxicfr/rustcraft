@@ -5660,3 +5660,32 @@ profile, machine loaded by other agents compiling, best of 5 or 7; three runs, t
   decorations, noise floors), `crowd-1000`, `tnt`, `dropped-items` (collision walks); memstats at
   world opening (−1 MB of heap expected).
 
+## C6-F05: containers read live by the commands, slot writes per family, storage edited in place (06/11, fidelity)
+
+- Fidelity lot, prerequisite of the container-slot optimisation (its differential must start
+  from the game's behaviour). No switch: the former paths were wrong, not slower.
+- Furnaces and brewing stands: `item`, `execute if items`, `loot … mine` and `data get|merge|modify
+  block` now read the simulated state (their NBT is only rewritten before a save). Before, a
+  command read the last saved contents, and any write reloaded the stand from that stale NBT:
+  cooking, burning fuel and brewing went back to the last save (an `item replace` of the result
+  slot put out a lit furnace).
+- A command's slot write is the container's own write, no longer a reload of the whole block
+  data: furnace (only another ingredient, an emptied slot included, restarts cooking and tells
+  the comparators), jukebox (`RecordItem`, `has_record`, song), decorated pot (`item`, no
+  comparator update), hopper (no comparator update, the game's quirk), crafter (a disabled slot
+  that receives an item is enabled), chiseled bookshelf (block state), shelf (its change mark),
+  other containers (comparators told). No block entity packet for a slot write (the game sends
+  none). `loot insert` grows a stack in place and marks the container changed once per drop.
+- Sealed loot is drawn by a slot read or write (`execute if items`, `item`, `loot insert|replace`),
+  never by `execute if slots` or `data get`.
+- Command storage: a `data modify` or `execute store` that fails after creating nodes keeps them
+  (the game edits the stored compound itself); an emptied identifier is removed; only the
+  namespaces written are saved (one dirty mark per namespace, an emptied namespace written empty).
+- Proof: `commands::container_commands_tests` (7 tests); each fails when its former code path is
+  put back (see the commit). Cost: none measured (one command at a time; the slot read decodes
+  the same `Items` list as before, the live read skips it for furnaces and brewing stands).
+- Not done, noted: a menu write of an empty stack into a furnace's ingredient slot (number-key
+  swap) also restarts cooking in the game, not in our menu path; `data merge block` sends a block
+  entity packet for every type (the game only for types with an update packet); the loot of a
+  furnace broken by a player reads its stale NBT (only a datapack slot range would see it).
+

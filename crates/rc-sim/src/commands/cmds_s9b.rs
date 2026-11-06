@@ -145,15 +145,21 @@ impl Server {
         }
     }
 
+    /// Slot read by a command (`item`, `execute if items`, `loot insert`): like the game's
+    /// container read, a sealed loot container draws its loot first.
+    pub(crate) fn command_slot_get(&mut self, s: Slot) -> Option<Stack> {
+        if let Slot::Block(p, _) = s {
+            self.unseal_for_access(p);
+        }
+        self.slot_get(s)
+    }
+
     pub(crate) fn slot_get(&self, s: Slot) -> Option<Stack> {
         match s {
             Slot::Player(i) => self.slots.get(i).cloned().flatten(),
             Slot::Ender(i) => self.life.vit.ender.get(i).cloned().flatten(),
             Slot::Mob(id, i) => self.mobs.mob_ref_any(id).and_then(|m| m.equipment[i].clone()),
-            Slot::Block(p, i) => {
-                let be = self.be_get(p)?;
-                crate::containers::read_items(be, self.s9_container_size(p)).get(i).cloned().flatten()
-            }
+            Slot::Block(p, i) => self.container_item(p, i, self.s9_container_size(p)),
             Slot::Drop(i) => self.life.drops.iter().find(|d| d.id == i).map(|d| d.stack.clone()),
             Slot::Nbt(e, k, sub) => {
                 let n = self.ent_nbt(e);
@@ -203,17 +209,13 @@ impl Server {
                 }
                 None => false,
             },
+            // The container's own slot write (not a reload of its whole data).
             Slot::Block(p, i) => {
                 let size = self.s9_container_size(p);
-                let Some(be) = self.be_get(p).cloned() else { return false };
-                let mut items = crate::containers::read_items(&be, size);
-                if i >= items.len() {
+                if self.be_get(p).is_none() || i >= size {
                     return false;
                 }
-                items[i] = v;
-                let mut n = be;
-                crate::containers::write_items(&mut n, &items);
-                self.set_block_data(p, n);
+                self.container_set_item(p, i, size, v);
                 true
             }
             // Emptied stack: the item on the ground keeps its own (the game removes it at the next tick;
@@ -360,7 +362,7 @@ impl Server {
             for (who, slots) in self.holder_slots(&target, &range) {
                 let mut n = 0;
                 for sl in slots {
-                    let Some(cur) = self.slot_get(sl) else { continue };
+                    let Some(cur) = self.command_slot_get(sl) else { continue };
                     selected += 1;
                     let new = self.apply_modifier(s, &modifier, cur.clone());
                     if !crate::items::matches(Some(&new), Some(&cur)) || new.count != cur.count {
@@ -426,7 +428,7 @@ impl Server {
             for (_, slots) in self.holder_slots(&source, &srange) {
                 for sl in slots {
                     any = true;
-                    let st = self.slot_get(sl).unwrap_or_else(|| Stack {
+                    let st = self.command_slot_get(sl).unwrap_or_else(|| Stack {
                         id: "minecraft:air".into(),
                         count: 0,
                         components: None,
@@ -674,10 +676,12 @@ impl Server {
                         if st.count <= 0 {
                             break;
                         }
+                        // The game reads the slot (drawing sealed loot) before its placement test.
+                        let current = self.command_slot_get(Slot::Block(pos, i));
                         if !self.container_accepts(pos, i, &st) {
                             continue;
                         }
-                        match self.slot_get(Slot::Block(pos, i)) {
+                        match current {
                             None => {
                                 self.slot_set(Slot::Block(pos, i), Some(st.clone()));
                                 changed = true;
@@ -685,13 +689,14 @@ impl Server {
                             }
                             // Same item: merged as far as the stack allows, and counted as a
                             // change even when the stack was already full (the game's quirk).
+                            // The stack grows in place: no slot write, so no write rule runs.
                             Some(mut c) if crate::items::same(&c, &st) && c.count <= self.life.items.max_stack(&c) => {
                                 let space = self.life.items.max_stack(&st) - c.count;
                                 let n = st.count.min(space);
                                 if n > 0 {
                                     c.count += n;
                                     st.count -= n;
-                                    self.slot_set(Slot::Block(pos, i), Some(c));
+                                    self.container_store_item(pos, i, size, Some(c));
                                 }
                                 changed = true;
                             }
@@ -699,6 +704,8 @@ impl Server {
                         }
                     }
                     if changed {
+                        // One "changed" mark per drop that went in, like the game.
+                        self.container_mark_changed(pos);
                         t.track(d.clone(), 1);
                     }
                 }
@@ -857,7 +864,8 @@ impl Server {
     ) -> Vec<Stack> {
         let name = self.data.block_of(st).map_or("", |b| b.name.as_str()).to_owned();
         let props = crate::loot::BlockProps::of_state(&self.data, st);
-        let be = self.be_get(pos).cloned();
+        // The live block entity (a furnace's or brewing stand's NBT lags behind it).
+        let be = self.live_block_data(pos);
         let id = format!("minecraft:blocks/{}", name.trim_start_matches("minecraft:"));
         let bt = |tag: &str, n: &str| self.block_name_tagged(tag, n);
         let loot = crate::loot::Loot { pack: &self.life.pack, items: &self.life.items, block_tag: &bt };
@@ -1154,7 +1162,12 @@ pub(crate) fn be_slot_range(be: &Nbt, range: &str) -> Vec<Option<Stack>> {
         return Vec::new();
     }
     let size = container_size(id);
-    let items = crate::containers::read_items(be, size);
+    // The jukebox and the decorated pot keep their single slot under their own key.
+    let items = match id {
+        "minecraft:jukebox" => vec![be.get("RecordItem").and_then(Stack::from_nbt)],
+        "minecraft:decorated_pot" => vec![be.get("item").and_then(Stack::from_nbt)],
+        _ => crate::containers::read_items(be, size),
+    };
     slot_ids(range)
         .into_iter()
         .filter_map(|i| usize::try_from(i).ok().filter(|&i| i < size))

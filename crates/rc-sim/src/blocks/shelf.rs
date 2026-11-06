@@ -245,7 +245,7 @@ impl Server {
 
     /// Shelf block entity modified: comparators notified,
     /// game event if any (block state), contents sent back to the client.
-    fn shelf_changed(&mut self, q: P, event: Option<&str>) {
+    pub(crate) fn shelf_changed(&mut self, q: P, event: Option<&str>) {
         let s = self.get(q);
         let b = self.view().block(s);
         self.update_neighbour_for_output_signal(q, b);
@@ -398,7 +398,7 @@ impl Server {
 
     /// Putting an item in place / removing an item then the state update: slot changed, last slot touched, state
     /// of the 6 slots set, game event.
-    fn bookshelf_set(&mut self, p: P, slot: usize, item: Option<Stack>) {
+    pub(crate) fn bookshelf_set(&mut self, p: P, slot: usize, item: Option<Stack>) {
         let Some(be) = self.be_get(p) else { return };
         let mut items = read_items(be, 6);
         items[slot] = item;
