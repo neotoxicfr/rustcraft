@@ -246,6 +246,7 @@ pub(super) fn terrain_pipelines(
         label: Some("terrain"),
         source: wgpu::ShaderSource::Wgsl(crate::terrain_shader::terrain(shader_opts).into()),
     });
+    crate::boot::mark("renderer: terrain shader module");
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: None,
         bind_group_layouts: &[Some(camera_layout), Some(column_layout)],

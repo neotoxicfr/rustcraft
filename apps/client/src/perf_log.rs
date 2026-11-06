@@ -7,7 +7,9 @@
 //! `c:<name>` of `tools/bench/scenes.py`): GPU writes and draw-list stations per frame, visibility
 //! verdicts, relights of the client and of the integrated server, light changes by origin,
 //! propagation queues, mesh jobs by kind, base misses by cause, mesh cache shares, in-place
-//! uploads, column copies by writer. Without the variable: one boolean read per frame.
+//! uploads, column copies by writer, and the generic counters any module adds by name
+//! ([`counter`], [`counter_per_second`], [`stage_time`], [`StageTimer`]) without touching this file.
+//! Without the variable: one boolean read per frame.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -99,14 +101,127 @@ pub fn trans_resorts(sections: usize) {
     TRANS_RESORTS.fetch_add(sections as u64, Relaxed);
 }
 
-/// Stations of the render thread's draw lists (cumulated ns, read as mean µs per frame,
-/// frames without a rebuild included): ray, sections reached, translucent re-sort, lists
-/// (view, order, batches), command submission.
-const LIST_STAGES: [&str; 5] = ["ray", "reached", "resort", "lists", "command_submit"];
-static LIST_NS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// Stations of the render thread's draw lists, every frame (cumulated ns, read as mean µs per
+/// frame, frames without a rebuild included).
+#[derive(Clone, Copy)]
+pub enum ListStage {
+    /// Radius of the walk (farthest loaded column); printed `ray`, the name the reference logs use.
+    Radius,
+    /// Sections reached as a set, for the entity visibility.
+    ReachedSet,
+    /// Translucent re-sort (runs every frame, lists rebuilt or not).
+    Resort,
+    /// Lists rebuilt: view, order, batches.
+    Lists,
+    /// Indirect commands sent.
+    CommandSubmit,
+    /// Finished walks received, visibility snapshot, next walk launched.
+    WalkLaunch,
+}
 
-pub fn list_stage(stage: usize, d: std::time::Duration) {
-    LIST_NS[stage].fetch_add(d.as_nanos() as u64, Relaxed);
+const LIST_STAGES: [&str; 6] = ["ray", "reached", "resort", "lists", "command_submit", "walk_launch"];
+static LIST_NS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+pub fn list_stage(stage: ListStage, d: std::time::Duration) {
+    LIST_NS[stage as usize].fetch_add(d.as_nanos() as u64, Relaxed);
+}
+
+/// Time recorded so far for `stage` (ns), for the tests.
+#[cfg(test)]
+pub fn list_stage_ns(stage: ListStage) -> u64 {
+    LIST_NS[stage as usize].load(Relaxed)
+}
+
+/// How a generic counter is printed: its sum over the window divided by the frames of the window,
+/// or by its seconds; a time is summed in ns and printed in µs per frame.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Rate {
+    PerFrame,
+    PerSecond,
+    MicrosPerFrame,
+}
+
+/// A named sum of the generic counters.
+struct GenericCounter {
+    name: &'static str,
+    rate: Rate,
+    sum: u64,
+}
+
+/// Generic counters in the order of their first use: printed every second as `counter <name>
+/// <value>`, then reset to zero but kept (a counter that did not move prints 0).
+static GENERIC: Mutex<Vec<GenericCounter>> = Mutex::new(Vec::new());
+
+fn add_generic(name: &'static str, rate: Rate, value: u64) {
+    let Ok(mut all) = GENERIC.lock() else { return };
+    // A call site passes the same literal every time: a scan of the addresses alone finds it
+    // without comparing any text; the text only settles a name written at two sites.
+    let at = all.iter().position(|c| std::ptr::eq(c.name, name)).or_else(|| all.iter().position(|c| c.name == name));
+    match at {
+        Some(i) => all[i].sum += value,
+        None => all.push(GenericCounter { name, rate, sum: value }),
+    }
+}
+
+/// Generic counter: adds `value` to `name`, printed as its mean per frame (`counter <name>
+/// <value>`, column `c:<name>` of `tools/bench/scenes.py`). Lets a mission add a reading without
+/// touching this file; while the perf log is off, one cached boolean read. The rate of a name is
+/// that of its first call.
+pub fn counter(name: &'static str, value: u64) {
+    if on() {
+        add_generic(name, Rate::PerFrame, value);
+    }
+}
+
+/// Generic counter printed per second (rare events, such as buffer growths).
+pub fn counter_per_second(name: &'static str, value: u64) {
+    if on() {
+        add_generic(name, Rate::PerSecond, value);
+    }
+}
+
+/// Generic time: adds `d` to `name`, printed in µs per frame (frames where it did not run included).
+pub fn stage_time(name: &'static str, d: std::time::Duration) {
+    if on() {
+        add_generic(name, Rate::MicrosPerFrame, d.as_nanos() as u64);
+    }
+}
+
+/// Splits a span of work into consecutive stages timed with [`stage_time`]: each `lap` charges
+/// the time since the previous one to its stage. No clock read while the perf log is off.
+pub struct StageTimer(Option<Instant>);
+
+impl StageTimer {
+    pub fn start() -> Self {
+        StageTimer(on().then(Instant::now))
+    }
+
+    /// Charges the time since the previous lap (or the start) to `name`.
+    pub fn lap(&mut self, name: &'static str) {
+        if let Some(last) = &mut self.0 {
+            let now = Instant::now();
+            add_generic(name, Rate::MicrosPerFrame, now.duration_since(*last).as_nanos() as u64);
+            *last = now;
+        }
+    }
+}
+
+/// Values of the generic counters over a window of `frames` frames and `window` seconds, sums
+/// reset to zero.
+fn drain_generic(frames: usize, window: f64) -> Vec<(&'static str, f64)> {
+    let Ok(mut all) = GENERIC.lock() else { return Vec::new() };
+    let frames = frames.max(1) as f64;
+    all.iter_mut()
+        .map(|c| {
+            let sum = std::mem::take(&mut c.sum) as f64;
+            let value = match c.rate {
+                Rate::PerFrame => sum / frames,
+                Rate::PerSecond => sum / window,
+                Rate::MicrosPerFrame => sum / 1e3 / frames,
+            };
+            (c.name, value)
+        })
+        .collect()
 }
 
 pub fn prep_work(d: std::time::Duration) {
@@ -418,7 +533,10 @@ pub fn frame(started: Instant, busy: bool, in_game: bool, cols: usize) {
         eprintln!("[perf] [{t:>6.1} s] counter us_{name}_per_frame {:.2}", per_frame(c) / 1e3);
     }
     for (verdict, c) in crate::render::BoxVerdict::ALL.iter().zip(&VISIBILITY) {
-        counter(t, &format!("visibility_{}_per_frame", verdict.name()), per_frame(c));
+        print_counter(t, &format!("visibility_{}_per_frame", verdict.name()), per_frame(c));
+    }
+    for (name, value) in drain_generic(n, window) {
+        print_counter(t, name, value);
     }
     let queues = rc_light::stats::queues();
     light_counters(t, window, &l.since(&p), &queues.since(&s.queues));
@@ -452,7 +570,7 @@ pub fn frame(started: Instant, busy: bool, in_game: bool, cols: usize) {
 
 /// Generic line `[perf] [t s] counter <name> <value>`, read by `tools/bench/scenes.py` (column
 /// `c:<name>`, mean over the measured window).
-fn counter(t: f64, name: &str, value: f64) {
+fn print_counter(t: f64, name: &str, value: f64) {
     eprintln!("[perf] [{t:>6.1} s] counter {name} {value:.2}");
 }
 
@@ -461,24 +579,24 @@ fn counter(t: f64, name: &str, value: f64) {
 fn light_counters(t: f64, window: f64, light: &rc_light::stats::Totals, queues: &rc_light::stats::Queues) {
     let rate = |c: &AtomicU64| c.swap(0, Relaxed) as f64 / window;
     let (relights, ns) = (rate(&CLIENT_RELIGHTS), rate(&CLIENT_RELIGHT_NS));
-    counter(t, "client_relights_per_s", relights);
-    counter(t, "client_relight_changes_per_s", rate(&CLIENT_RELIGHT_CHANGES));
-    counter(t, "client_relight_ms_per_s", ns / 1e6);
+    print_counter(t, "client_relights_per_s", relights);
+    print_counter(t, "client_relight_changes_per_s", rate(&CLIENT_RELIGHT_CHANGES));
+    print_counter(t, "client_relight_ms_per_s", ns / 1e6);
     // The client's timer wraps the engine's: the difference may dip below zero by a few µs.
-    counter(t, "server_relights_per_s", (light.relights as f64 / window - relights).max(0.0));
-    counter(t, "server_relight_ms_per_s", ((light.relight_ns as f64 / window - ns) / 1e6).max(0.0));
+    print_counter(t, "server_relights_per_s", (light.relights as f64 / window - relights).max(0.0));
+    print_counter(t, "server_relight_ms_per_s", ((light.relight_ns as f64 / window - ns) / 1e6).max(0.0));
     for origin in ChangeOrigin::ALL {
-        counter(t, &format!("light_changes_{}_per_s", origin.name()), rate(&LIGHT_CHANGES[origin as usize]));
+        print_counter(t, &format!("light_changes_{}_per_s", origin.name()), rate(&LIGHT_CHANGES[origin as usize]));
     }
     let per_s = |v: u64| (v as f64 / window).round() as u64;
     let mut levels = Vec::new();
     for (kind, k) in [("block", 0), ("sky", 1)] {
         let (seeded, queued): (u64, u64) = (queues.seeded[k].iter().sum(), queues.queued[k].iter().sum());
-        counter(t, &format!("light_{kind}_seeded_per_s"), seeded as f64 / window);
-        counter(t, &format!("light_{kind}_seeded_at_15_per_s"), queues.seeded[k][15] as f64 / window);
-        counter(t, &format!("light_{kind}_pushed_per_s"), queued.saturating_sub(seeded) as f64 / window);
-        counter(t, &format!("light_{kind}_cells_per_s"), queues.cells[k] as f64 / window);
-        counter(t, &format!("light_{kind}_entries_per_cell"), queued as f64 / queues.cells[k].max(1) as f64);
+        print_counter(t, &format!("light_{kind}_seeded_per_s"), seeded as f64 / window);
+        print_counter(t, &format!("light_{kind}_seeded_at_15_per_s"), queues.seeded[k][15] as f64 / window);
+        print_counter(t, &format!("light_{kind}_pushed_per_s"), queued.saturating_sub(seeded) as f64 / window);
+        print_counter(t, &format!("light_{kind}_cells_per_s"), queues.cells[k] as f64 / window);
+        print_counter(t, &format!("light_{kind}_entries_per_cell"), queued as f64 / queues.cells[k].max(1) as f64);
         let by_level = |v: &[u64; 16]| v[1..].iter().rev().map(|&n| per_s(n).to_string()).collect::<Vec<_>>().join(" ");
         levels.push(format!("{kind} seeded {}, queued {}", by_level(&queues.seeded[k]), by_level(&queues.queued[k])));
     }
@@ -491,21 +609,88 @@ fn mesh_counters(t: f64, window: f64, copies: &rc_world::ColumnCopies, before: &
     let rate = |c: &AtomicU64| c.swap(0, Relaxed) as f64 / window;
     for (k, kind) in JOB_KINDS.iter().enumerate() {
         let (jobs, ns) = (JOBS[k].swap(0, Relaxed), JOB_NS[k].swap(0, Relaxed));
-        counter(t, &format!("mesh_{kind}_jobs_per_s"), jobs as f64 / window);
-        counter(t, &format!("mesh_{kind}_ms_per_job"), ns as f64 / 1e6 / jobs.max(1) as f64);
+        print_counter(t, &format!("mesh_{kind}_jobs_per_s"), jobs as f64 / window);
+        print_counter(t, &format!("mesh_{kind}_ms_per_job"), ns as f64 / 1e6 / jobs.max(1) as f64);
     }
-    counter(t, "mesh_base_miss_evicted_per_s", rate(&BASE_MISS_EVICTED));
-    counter(t, "mesh_base_miss_never_kept_per_s", rate(&BASE_MISS_NEVER_KEPT));
-    counter(t, "mesh_cache_fluid_mb", CACHE_FLUID_BYTES.load(Relaxed) as f64 / 1_048_576.0);
-    counter(t, "mesh_live_columns", LIVE_COLUMNS.load(Relaxed) as f64);
-    counter(t, "mesh_partials_reached_per_s", rate(&PARTIALS_REACHED));
-    counter(t, "mesh_partials_unreached_per_s", rate(&PARTIALS_UNREACHED));
-    counter(t, "upload_in_place_sent_mb_per_s", rate(&IN_PLACE_SENT_BYTES) / 1_048_576.0);
-    counter(t, "upload_in_place_whole_mb_per_s", rate(&IN_PLACE_WHOLE_BYTES) / 1_048_576.0);
-    counter(t, "upload_in_place_refused_version_per_s", rate(&IN_PLACE_REFUSED_VERSION));
-    counter(t, "upload_in_place_refused_other_per_s", rate(&IN_PLACE_REFUSED_OTHER));
+    print_counter(t, "mesh_base_miss_evicted_per_s", rate(&BASE_MISS_EVICTED));
+    print_counter(t, "mesh_base_miss_never_kept_per_s", rate(&BASE_MISS_NEVER_KEPT));
+    print_counter(t, "mesh_cache_fluid_mb", CACHE_FLUID_BYTES.load(Relaxed) as f64 / 1_048_576.0);
+    print_counter(t, "mesh_live_columns", LIVE_COLUMNS.load(Relaxed) as f64);
+    print_counter(t, "mesh_partials_reached_per_s", rate(&PARTIALS_REACHED));
+    print_counter(t, "mesh_partials_unreached_per_s", rate(&PARTIALS_UNREACHED));
+    print_counter(t, "upload_in_place_sent_mb_per_s", rate(&IN_PLACE_SENT_BYTES) / 1_048_576.0);
+    print_counter(t, "upload_in_place_whole_mb_per_s", rate(&IN_PLACE_WHOLE_BYTES) / 1_048_576.0);
+    print_counter(t, "upload_in_place_refused_version_per_s", rate(&IN_PLACE_REFUSED_VERSION));
+    print_counter(t, "upload_in_place_refused_other_per_s", rate(&IN_PLACE_REFUSED_OTHER));
     for writer in rc_world::ColumnWriter::ALL {
         let k = writer as usize;
-        counter(t, &format!("column_copies_{}_per_s", writer.name()), (copies[k] - before[k]) as f64 / window);
+        print_counter(t, &format!("column_copies_{}_per_s", writer.name()), (copies[k] - before[k]) as f64 / window);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn value(drained: &[(&'static str, f64)], name: &str) -> Option<f64> {
+        drained.iter().find(|(n, _)| *n == name).map(|&(_, v)| v)
+    }
+
+    /// A drain empties every counter: the tests that drain take turns.
+    static DRAINING: Mutex<()> = Mutex::new(());
+
+    /// Each rate divides its sum by the right quantity; a drained counter is kept at zero.
+    #[test]
+    fn generic_counters_print_their_rate_then_restart_at_zero() {
+        let _turn = DRAINING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        add_generic("test_items_per_frame", Rate::PerFrame, 6);
+        add_generic("test_items_per_frame", Rate::PerFrame, 4);
+        add_generic("test_events_per_s", Rate::PerSecond, 9);
+        add_generic("test_us_per_frame", Rate::MicrosPerFrame, 3_000_000);
+        let drained = drain_generic(4, 3.0);
+        assert_eq!(value(&drained, "test_items_per_frame"), Some(2.5));
+        assert_eq!(value(&drained, "test_events_per_s"), Some(3.0));
+        assert_eq!(value(&drained, "test_us_per_frame"), Some(750.0));
+        let again = drain_generic(4, 3.0);
+        assert_eq!(value(&again, "test_items_per_frame"), Some(0.0), "a quiet counter still prints, at 0");
+    }
+
+    /// The same text from another literal (another address) reaches the same counter.
+    #[test]
+    fn generic_counters_are_found_by_name() {
+        let _turn = DRAINING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let name: &'static str = String::from("test_same_name_per_frame").leak();
+        add_generic("test_same_name_per_frame", Rate::PerFrame, 1);
+        add_generic(name, Rate::PerFrame, 1);
+        let drained = drain_generic(1, 1.0);
+        assert_eq!(drained.iter().filter(|(n, _)| *n == name).count(), 1);
+        assert_eq!(value(&drained, name), Some(2.0));
+    }
+
+    /// Cost of a generic counter while the perf log is on, with 40 counters registered (the name
+    /// looked for last), and of a stage lap (two clock reads and an addition):
+    /// `cargo test --release -p rc-app --bin rustcraft -- --ignored generic_counter_cost --nocapture`.
+    #[test]
+    #[ignore]
+    fn generic_counter_cost() {
+        let _turn = DRAINING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let names: Vec<&'static str> = (0..40).map(|i| &*format!("test_cost_{i}_per_frame").leak()).collect();
+        for &n in &names {
+            add_generic(n, Rate::PerFrame, 0);
+        }
+        const CALLS: u32 = 2_000_000;
+        let started = Instant::now();
+        for i in 0..CALLS {
+            add_generic(names[39], Rate::PerFrame, u64::from(i & 1));
+        }
+        let add_ns = started.elapsed().as_nanos() as f64 / f64::from(CALLS);
+        let mut timer = StageTimer(Some(Instant::now()));
+        let started = Instant::now();
+        for _ in 0..CALLS {
+            timer.lap(names[39]);
+        }
+        let lap_ns = started.elapsed().as_nanos() as f64 / f64::from(CALLS);
+        drain_generic(1, 1.0);
+        eprintln!("generic counter: {add_ns:.1} ns per add, {lap_ns:.1} ns per stage lap (40 counters, last one)");
     }
 }

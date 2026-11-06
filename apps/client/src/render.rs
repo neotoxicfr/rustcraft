@@ -527,6 +527,7 @@ impl Renderer {
 
         let SurfaceSetup { config, can_capture, present_mode, present_modes_caps } =
             configure_surface(&surface, &adapter, &device, &window);
+        crate::boot::mark("renderer: surface configured");
 
         let shader_opts = crate::terrain_shader::opts().within_limits(&device.limits());
         let cameras = upload::Slots::new(
@@ -570,6 +571,7 @@ impl Renderer {
                 remap.push(u32::MAX);
             }
         }
+        crate::boot::mark("renderer: block texture arrays started");
         let (atlas_view, main_bytes) = block_texture_array(&device, &queue, "block textures", main_size, &main_layers);
         let (big_view, big_bytes) =
             block_texture_array(&device, &queue, "large block textures", big_size.max(1), &big_layers);
@@ -651,6 +653,7 @@ impl Renderer {
         let totem_bind = make_bind(CAM_TOTEM);
         let TerrainPipelines { blocks: pipelines, fluids: fluid_pipelines, sorted: sorted_pipeline, sky: sky_pipeline } =
             terrain_pipelines(&device, &camera_layout, &column_layout, config.format, wire_mode, shader_opts, formats);
+        crate::boot::mark("renderer: terrain and sky pipelines");
         let timer = timestamps.then(|| {
             let mode = crate::gpu_time::GpuTimer::mode_for(features);
             crate::gpu_time::GpuTimer::new(&device, &queue, mode, crate::gpu_time::settings().passes)
@@ -658,10 +661,14 @@ impl Renderer {
         let (graph_tx, graph_rx) = crossbeam_channel::unbounded();
         let trans = RegionGpu::new(&device, &column_layout, (0, 0), formats.trans_bytes(), &trans_slots);
         let sky = crate::sky::Sky::new(&device, &queue, config.format, sky_assets);
+        crate::boot::mark("renderer: sky");
         let gui = crate::gui::Gui::new(&device, &queue, config.format, gui_assets);
+        crate::boot::mark("renderer: interface");
         let blur = crate::blur::Blur::new(&device, config.format);
+        crate::boot::mark("renderer: blur");
         let leash = crate::leash::LeashRenderer::new(&device, &camera_layout, config.format);
         let post_fx = crate::post_fx::PostFx::new(&device, config.format);
+        crate::boot::mark("renderer: leashes and screen effects");
         let tags = crate::nametag::NameTags::new(&device, &camera_layout, config.format);
         let block_text = crate::block_text::BlockText::new(&device, &camera_layout, config.format);
         let text_displays = crate::text_display::TextDisplays::new(&device, &camera_layout, config.format);
@@ -670,15 +677,19 @@ impl Renderer {
         let entity_outline = crate::entity_outline::EntityOutline::new(&device, config.format);
         let cracks = crate::crack::Cracks::new(&device, &camera_layout, config.format);
         let debug_lines = crate::debug_render::DebugLines::new(&device, &camera_layout, config.format);
+        crate::boot::mark("renderer: labels, texts, outlines, cracks and debug lines");
         // Block fragments: layers of the main array only.
         let particle_layers =
             remap.iter().map(|&l| if l == u32::MAX || l & BIG_LAYER != 0 { u32::MAX } else { l }).collect();
         let particles =
             crate::particles::ParticleRenderer::new(&device, &camera_layout, config.format, particle_layers);
+        crate::boot::mark("renderer: particles");
         let entities = entity_assets.map(|(data, tex)| {
             crate::entity_render::EntityRenderer::new(&device, &camera_layout, config.format, data, tex)
         });
+        crate::boot::mark("renderer: entities");
         let weather = crate::weather_render::WeatherRenderer::new(&device, &camera_layout, config.format);
+        crate::boot::mark("renderer: weather");
         Renderer {
             weather,
             anim,
