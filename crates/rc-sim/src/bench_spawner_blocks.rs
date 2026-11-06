@@ -1,5 +1,5 @@
 //! Micro-bench of the spawner blocks and natural spawn paths (`SpawnPaths`, the
-//! `RUSTCRAFT_OPT_TRIAL_*`, `VAULT_EARLY_EXIT`, `SPAWNER_*`, `SPAWN_CENSUS`, `STRUCTURE_STARTS`
+//! `RUSTCRAFT_OPT_TRIAL_*`, `VAULT_*`, `SPAWNER_*`, `SPAWN_CENSUS`, `STRUCTURE_STARTS`
 //! switches), each case on the former paths, the new ones, and each new path alone:
 //! - block entity phase of 64 waiting trial spawners, 64 active ones with nobody near, 32 idle
 //!   vaults, 32 monster spawners out of range, 32 counting down in range (µs per tick);
@@ -31,6 +31,7 @@ fn path_sets() -> Vec<(&'static str, SpawnPaths)> {
         ("trial_write_on_change", SpawnPaths { trial_write_on_change: true, ..old }),
         ("trial_borrow", SpawnPaths { trial_borrow: true, ..old }),
         ("vault_early_exit", SpawnPaths { vault_early_exit: true, ..old }),
+        ("vault_borrow", SpawnPaths { vault_borrow: true, ..old }),
         ("spawner_range_first", SpawnPaths { spawner_range_first: true, ..old }),
         ("spawner_borrow", SpawnPaths { spawner_borrow: true, ..old }),
         ("spawn_census", SpawnPaths { spawn_census: true, ..old }),

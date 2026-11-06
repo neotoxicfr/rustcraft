@@ -102,13 +102,16 @@ pub(crate) struct SpawnPaths {
     /// Trial spawner: block entity read in place instead of copied, configuration shared with
     /// the pack, state read from the block property without a string, block entity found once.
     pub trial_borrow: bool,
-    /// Vault: a paused vault that shows nothing new leaves its tick before decoding anything;
-    /// its data is read in place instead of from a copy.
+    /// Vault: a paused vault that shows nothing new leaves its tick before decoding anything.
     pub vault_early_exit: bool,
+    /// Vault: its data decoded from the block entity in place instead of from a copy (tick and
+    /// item use).
+    pub vault_borrow: bool,
     /// Monster spawner: player range read on the block entity before copying it.
     pub spawner_range_first: bool,
-    /// Monster spawner: the countdown between two spawns is written in place, without a copy
-    /// (implies the range test first).
+    /// Monster spawner: the countdown between two spawns is written in place, without a copy.
+    /// It needs the range test first, so it runs that test even with `spawner_range_first` off:
+    /// measuring the former range order takes both switches off.
     pub spawner_borrow: bool,
     /// Natural spawns: spawn chunks counted without sets, spawn costs memoized per biome, charges
     /// gathered only when a category may spawn.
@@ -138,6 +141,7 @@ impl SpawnPaths {
             trial_write_on_change: rc_data::opt_switch!("RUSTCRAFT_OPT_TRIAL_WRITE_ON_CHANGE"),
             trial_borrow: rc_data::opt_switch!("RUSTCRAFT_OPT_TRIAL_BORROW"),
             vault_early_exit: rc_data::opt_switch!("RUSTCRAFT_OPT_VAULT_EARLY_EXIT"),
+            vault_borrow: rc_data::opt_switch!("RUSTCRAFT_OPT_VAULT_BORROW"),
             spawner_range_first: rc_data::opt_switch!("RUSTCRAFT_OPT_SPAWNER_RANGE_FIRST"),
             spawner_borrow: rc_data::opt_switch!("RUSTCRAFT_OPT_SPAWNER_BORROW"),
             spawn_census: rc_data::opt_switch!("RUSTCRAFT_OPT_SPAWN_CENSUS"),
@@ -152,6 +156,7 @@ impl SpawnPaths {
         trial_write_on_change: true,
         trial_borrow: true,
         vault_early_exit: true,
+        vault_borrow: true,
         spawner_range_first: true,
         spawner_borrow: true,
         spawn_census: true,
@@ -165,6 +170,7 @@ impl SpawnPaths {
         trial_write_on_change: false,
         trial_borrow: false,
         vault_early_exit: false,
+        vault_borrow: false,
         spawner_range_first: false,
         spawner_borrow: false,
         spawn_census: false,

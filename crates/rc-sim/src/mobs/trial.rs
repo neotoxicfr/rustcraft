@@ -122,6 +122,27 @@ impl TrialSpawnSettings {
     }
 }
 
+/// Former path (`RUSTCRAFT_OPT_TRIAL_BORROW=0`): the copies the former decode made on every tick
+/// and then dropped, so that the switch off costs what the former code cost. It built the
+/// defaults first (eject list and ominous loot table) and, for a configuration found, copied its
+/// spawn potentials, eject list and ominous loot table; the configuration itself was borrowed.
+fn replay_former_config_copies(settings: &TrialSpawnSettings, found: bool) {
+    let defaults: (Vec<(String, i32)>, String) = (
+        DEFAULT_LOOT_TABLES_TO_EJECT.iter().map(|t| ((*t).to_owned(), 1)).collect(),
+        DEFAULT_ITEMS_TO_DROP_WHEN_OMINOUS.to_owned(),
+    );
+    std::hint::black_box(&defaults);
+    if found {
+        let copies = (
+            settings.spawn_potentials().to_vec(),
+            settings.loot_tables_to_eject(),
+            // A missing field took the default string over, without a copy.
+            settings.source.get("items_to_drop_when_ominous").and_then(Nbt::as_str).map(str::to_owned),
+        );
+        std::hint::black_box(&copies);
+    }
+}
+
 /// Configuration compound of the defaults (no allocation per tick).
 fn empty_config() -> Arc<Nbt> {
     static EMPTY: std::sync::OnceLock<Arc<Nbt>> = std::sync::OnceLock::new();
@@ -415,19 +436,22 @@ impl Server {
     // ---------- Trial spawner ----------
 
     /// Configuration: id of the `trial_spawner` registry (the pack's NBT, shared) or inline
-    /// compound; anything else: the defaults. `shared` false: the former path, which copied the
-    /// configuration on every tick.
+    /// compound; anything else: the defaults. `shared` false: the former path, which made on
+    /// every tick the copies `replay_former_config_copies` repeats.
     fn trial_config(&self, raw: Option<&Nbt>, shared: bool) -> TrialSpawnSettings {
-        let source = match raw {
+        let (source, found) = match raw {
             Some(Nbt::String(id)) => match self.life.pack.get_nbt("trial_spawner", id) {
-                Some(entry) if !shared => Arc::new((*entry).clone()),
-                Some(entry) => entry,
-                None => empty_config(),
+                Some(entry) => (entry, true),
+                None => (empty_config(), false),
             },
-            Some(c @ Nbt::Compound(_)) => Arc::new(c.clone()),
-            _ => empty_config(),
+            Some(c @ Nbt::Compound(_)) => (Arc::new(c.clone()), true),
+            _ => (empty_config(), false),
         };
-        TrialSpawnSettings::read(source)
+        let settings = TrialSpawnSettings::read(source);
+        if !shared {
+            replay_former_config_copies(&settings, found);
+        }
+        settings
     }
 
     fn trial_load(be: &Nbt) -> TrialData {
@@ -1251,11 +1275,11 @@ impl Server {
     // ---------- Vault ----------
 
     fn vault_tick(&mut self, p: P, rank: usize) {
-        let early_exit = SpawnPaths::current().vault_early_exit;
-        if early_exit && self.vault_waits(p, rank) {
+        let paths = SpawnPaths::current();
+        if paths.vault_early_exit && self.vault_waits(p, rank) {
             return;
         }
-        let Some(mut v) = self.vault_load(p, Some(rank), early_exit) else { return };
+        let Some(mut v) = self.vault_load(p, Some(rank), paths.vault_borrow) else { return };
         let state = self.prop(p, "vault_state").unwrap_or_else(|| "inactive".into());
         let s = self.get(p);
         let ominous = self.view().get_bool(s, "ominous");
@@ -1414,7 +1438,7 @@ impl Server {
         if self.prop(p, "vault_state").as_deref() != Some("active") {
             return None;
         }
-        let mut v = self.vault_load(p, None, SpawnPaths::current().vault_early_exit)?;
+        let mut v = self.vault_load(p, None, SpawnPaths::current().vault_borrow)?;
         let key = v.key.clone()?;
         let now = self.time;
         let fail = |s: &mut Server, sound: &str| {

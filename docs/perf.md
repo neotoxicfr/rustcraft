@@ -5682,11 +5682,17 @@ list was read twice at the drawing position). Switches, default = new, `=0` = ol
   reward is ejected; an inline configuration is still copied, rare), state read from the block
   property, block entity found once per tick (its rank rechecked before the write: a state change
   may shift the chunk's list). `trial_tick` split into one function per state (`TrialState`).
+  `=0` repeats the copies the former decode made (spawn potentials, eject list, ominous loot
+  table, the defaults built first) and borrows the pack entry as the former code did.
 - `RUSTCRAFT_OPT_VAULT_EARLY_EXIT`: paused vault that does not cycle its display leaves before
-  decoding (exact: nothing would be dirty); otherwise decoded in place.
+  decoding (exact: nothing would be dirty).
+- `RUSTCRAFT_OPT_VAULT_BORROW`: vault data decoded from the block entity in place instead of from
+  a copy (tick and item use).
 - `RUSTCRAFT_OPT_SPAWNER_RANGE_FIRST`, `RUSTCRAFT_OPT_SPAWNER_BORROW`: range read on the block
   entity; countdown written in place (`Delay`, chunk not marked, like the former store); copy only
-  when it fires (the borrow implies the range test first). Spawner minecarts too.
+  when it fires. Spawner minecarts too. The countdown in place needs the range test before it, so
+  `SPAWNER_BORROW` on runs that test even with `SPAWNER_RANGE_FIRST=0`: the former range order
+  takes both at `=0`.
 - `RUSTCRAFT_OPT_SPAWN_CENSUS`: spawn chunks counted (union of the 17 × 17 squares by a Chebyshev
   test) and listed (a chunk covered by an earlier player's square is skipped) without sets;
   centers read once; costs memoized per (biome index, species) for the pass; charges gathered
@@ -5706,27 +5712,41 @@ path alone): trial chamber over 2,000 ticks (normal then ominous, player leaving
 with Bad Omen, mobs killed, key inserted, `/data merge` in a non-normalized form): blocks, block
 entities, every packet, mobs, world random and the vault chunk's dirty flag identical on every
 tick; the trial spawner's chunk is marked on 23 ticks instead of 2,000, never while idle. Monster
-spawner over 1,000 ticks in and out of range. Natural spawns over 2,000 ticks with a LAN guest
+spawner over 1,000 ticks in and out of range, and a spawner minecart over the same 1,000 ticks
+(its own data counted down in place: a frozen or retyped `Delay` fails it). Natural spawns over 2,000 ticks with a LAN guest
 (overlapping squares, census 340), day, night, thunderstorm with skeleton horse traps forced on
 every tick, spawns cut for a while, soul sand valley costs and structures. Structure lists of
 10,000 positions around a 300-piece fortress, an outpost, a witch hut, an `INVALID` start, a
 start without readable box and a reference to an unloaded start (fingerprint frozen), then a
 start placed live and a start chunk loaded later. Memoized costs = pack for every biome and
-species; union count = set; `trial_write_skipped_only_when_unchanged`. Nine sabotages fail them
-(see the commit).
+species; union count = set; `trial_write_skipped_only_when_unchanged`. Eleven sabotages fail them
+(see the commits).
+
+Save timing (A3, faithful): a chunk holding an idle trial spawner is no longer rewritten by every
+autosave, so the fields written without marking the chunk reach the disk only with its next real
+write, as in the official game (its inhabited-time increment does not mark the chunk, its spawner
+marks it only on a change): `InhabitedTime` (incremented by every spawn pass) and the `Delay` of a
+monster spawner in the same chunk. Each save holds the same content as before for what it writes;
+the file on disk at a given moment may hold older values of those fields than the former path's.
+
+Figures corrected on 07/11: the first table compared against a former trial path that copied the
+whole pack configuration on every tick (the former code borrowed it): 4,612 and 5,767 allocations
+per tick were overstated. The `=0` path now repeats the former copies only; one run, every row.
 
 | Block entity phase, flat world, loaded machine, 2 passes | allocations per tick | ns per block (former → new) | chunks marked per 1,000 ticks |
 |---|---|---|---|
-| 64 trial spawners waiting (registry configs) | 4,612 → 324 (borrow alone 644) | 1,416-2,249 → 734-821 | 6 → 0 |
-| 64 trial spawners fighting, nobody near | 5,767 → 455 | 3,088-3,139 → 1,253-1,330 | 6 → 0 |
-| 32 vaults idle | 422 → 10.6 | 451-705 → 213-250 | 3 → 3 |
-| 32 monster spawners out of range | 481 → 1 | 550-834 → 229-357 | 0 → 0 |
-| 32 monster spawners counting down | 976 → 5.4 | 1,085-1,403 → 477-519 | 0 → 0 |
+| 64 trial spawners waiting (registry configs) | 4,100 → 324 (borrow alone 644, write alone 3,780) | 1,281-1,305 → 438-462 | 6 → 0 |
+| 64 trial spawners fighting, nobody near | 5,255 → 455 (borrow alone 1,159, write alone 4,551) | 1,971-1,985 → 817-829 | 6 → 0 |
+| 32 vaults idle | 422 → 10.6 (early exit alone 26.6, read in place alone 101.8) | 450-452 → 146 | 3 → 3 |
+| 32 monster spawners out of range | 481 → 1 | 358-361 → 178-180 | 0 → 0 |
+| 32 monster spawners counting down | 976 → 5.4 (range first alone 886) | 670-678 → 301-303 | 0 → 0 |
 
-Each switch alone: write on change alone keeps the allocations (an idle spawner's store
-allocated nothing) and removes the marks; borrow alone gives most of the time and allocations;
-range first alone removes the copy out of range (976 → 886 counting down: the copy then happens
-after the test); the countdown in place removes the rest. Natural spawn pass (flat world at night,
+Each switch alone: write on change alone saves 320 allocations per tick waiting and 704 fighting, and removes
+the marks; borrow alone gives most of the time and allocations; the vault's early exit gives most of
+its gain, reading in place the rest (early exit alone 157-163 ns, read in place alone 231-233);
+range first alone removes the copy out of range but is SLOWER counting down (759-770 ns against
+670-678: the range is read twice, the copy still made after the test), kept for its out-of-range
+gain and because the countdown in place builds on it. Natural spawn pass (flat world at night,
 70 zombies, a LAN guest, half in soul sand valley): allocations 661.2 → 647.6 per pass (census
 647.2, structure starts 661.6, placement first 668.3), time 116-122 → 98-190 µs (too noisy on
 this machine). Structure list per position, one pass of 10,000 positions: 2,024-3,658 → 174-281
