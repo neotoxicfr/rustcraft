@@ -742,7 +742,7 @@ impl Server {
         }
     }
 
-    /// End of the tick (vex: limited life).
+    /// End of the tick (vex: no gravity, limited life).
     pub(crate) fn illager_post_tick(&mut self, m: &mut Mob) {
         if m.kind == Kind::Vex {
             self.vex_post_tick(m);
