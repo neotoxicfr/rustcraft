@@ -4,6 +4,7 @@
 use hashbrown::HashMap;
 
 use rc_client::EntityEvent;
+use rc_data::java_math::wrap_degrees;
 use rc_proto_v777::entity::{Meta, PositionPath};
 use rc_proto_v777::item::ItemStack;
 
@@ -195,25 +196,16 @@ fn baby_size(kind: &str, ty: Size, pose: i32) -> Size {
     }
 }
 
-fn wrap(a: f32) -> f32 {
-    let mut a = a % 360.0;
-    if a >= 180.0 {
-        a -= 360.0;
-    }
-    if a < -180.0 {
-        a += 360.0;
-    }
-    a
-}
-
 /// "Physical" opening of a shulker for an opening `peek` in 0..1: 0.5 − sin((0.5 + peek)·π)·0.5.
 pub fn shulker_physical(peek: f32) -> f32 {
     0.5 - rc_physics::sin_t((0.5 + peek) * std::f32::consts::PI) * 0.5
 }
 
-/// Shortest-way angular interpolation.
+/// Shortest-way angular interpolation in degrees (the shared fold of the game, which skips the
+/// library remainder below one turn).
+#[inline]
 pub fn rot_lerp(t: f32, a: f32, b: f32) -> f32 {
-    a + t * wrap(b - a)
+    rc_data::java_math::lerp_angle_degrees(t, a, b)
 }
 
 fn lerp3(t: f64, a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
@@ -868,7 +860,7 @@ impl Entity {
         if let Some((p, yaw, pitch, n)) = self.linear {
             let a = 1.0 / n as f64;
             self.pos = lerp3(a, self.pos, p);
-            self.yaw += a as f32 * wrap(yaw - self.yaw);
+            self.yaw += a as f32 * wrap_degrees(yaw - self.yaw);
             self.pitch += a as f32 * (pitch - self.pitch);
             self.linear = if n > 1 { Some((p, yaw, pitch, n - 1)) } else { None };
         }
@@ -940,20 +932,20 @@ impl Entity {
                 let mut target = self.body;
                 if d2 > 0.002_500_000_2 {
                     let dir = (dz.atan2(dx).to_degrees() - 90.0) as f32;
-                    let diff = (wrap(self.yaw) - dir).abs();
+                    let diff = (wrap_degrees(self.yaw) - dir).abs();
                     target = if diff > 95.0 && diff < 265.0 { dir - 180.0 } else { dir };
                 }
                 if self.swing.is_some() {
                     target = self.yaw;
                 }
-                self.body += wrap(target - self.body) * 0.3;
-                let off = wrap(self.yaw - self.body);
+                self.body += wrap_degrees(target - self.body) * 0.3;
+                let off = wrap_degrees(self.yaw - self.body);
                 if off.abs() > 50.0 {
                     self.body = self.yaw - 50.0 * off.signum();
                 }
             }
             Kind::Mob => {
-                let clamp_to = |base: f32, target: f32, m: f32| target - wrap(target - base).clamp(-m, m);
+                let clamp_to = |base: f32, target: f32, m: f32| target - wrap_degrees(target - base).clamp(-m, m);
                 if d2 > 2.5e-7 {
                     self.body = self.yaw;
                     self.head = clamp_to(self.head, self.body, 75.0);
@@ -975,9 +967,9 @@ impl Entity {
             }
         }
         // Previous values within 180° of the current ones.
-        self.body_o = self.body - wrap(self.body - self.body_o);
-        self.head_o = self.head - wrap(self.head - self.head_o);
-        self.yaw_o = self.yaw - wrap(self.yaw - self.yaw_o);
+        self.body_o = self.body - wrap_degrees(self.body - self.body_o);
+        self.head_o = self.head - wrap_degrees(self.head - self.head_o);
+        self.yaw_o = self.yaw - wrap_degrees(self.yaw - self.yaw_o);
         // Limb swing.
         if self.class != Kind::Other {
             self.walk_speed_o = self.walk_speed;

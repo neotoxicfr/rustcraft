@@ -101,23 +101,13 @@ pub(super) fn animate(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) -> b
 
 /// (u, v) offset of the armor texture, in [0, 1[: `(cos(0.02 t) × 3, 0.01 t)` modulo 1.
 pub(super) fn swirl_offset(t: f32) -> (f32, f32) {
-    ((t * 0.02).cos() * 3.0 % 1.0, t * 0.01 % 1.0)
-}
-
-fn wrap(a: f32) -> f32 {
-    let a = a % 360.0;
-    if a >= 180.0 {
-        a - 360.0
-    } else if a < -180.0 {
-        a + 360.0
-    } else {
-        a
-    }
+    use rc_data::java_math::remainder_by_one;
+    (remainder_by_one((t * 0.02).cos() * 3.0), remainder_by_one(t * 0.01))
 }
 
 /// Moves `a` towards `b` by at most `max` degrees.
 fn rotlerp(a: f32, b: f32, max: f32) -> f32 {
-    a + wrap(b - a).clamp(-max, max)
+    a + rc_data::java_math::wrap_degrees(b - a).clamp(-max, max)
 }
 
 /// One aiming tick of the side heads of each wither: pitch 40°/tick and yaw 10°/tick

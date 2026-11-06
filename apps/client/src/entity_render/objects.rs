@@ -525,7 +525,7 @@ pub(super) fn ominous_spawner_pose(age: f32) -> Mat4 {
 /// Light and overlay words of the wind charge: flags "no cardinal lighting" and
 /// "scrolling", offset u = age × 0.03 (fraction, in 1/65535) in the overlay word.
 fn wind_charge_scroll(light: u32, age: f32) -> (u32, u32) {
-    let u = (age * 0.03 % 1.0).rem_euclid(1.0);
+    let u = rc_data::java_math::euclid_remainder_by_one(age * 0.03);
     (light | super::LIGHT_FLAT | super::LIGHT_SCROLL, (u * 65535.0) as u32)
 }
 
@@ -2227,7 +2227,7 @@ fn guardian_beam_quads(m: Mat4, d: Vec3, time: f32, scale: f32, rect: [f32; 4], 
     let (ex, ez) = at(0.0, 0.2);
     let (nx, nz) = at(PI / 2.0, 0.2);
     let (sx, sz) = at(PI * 3.0 / 2.0, 0.2);
-    let tex_v_off = time * 0.5 % 1.0;
+    let tex_v_off = rc_data::java_math::remainder_by_one(time * 0.5);
     let min_v = -1.0 + tex_v_off;
     let max_v = min_v + len * 2.5;
     let vert = |x: f32, y: f32, z: f32, u: f32, v: f32| FreeVertex {

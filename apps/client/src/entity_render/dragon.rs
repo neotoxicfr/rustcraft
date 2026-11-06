@@ -18,6 +18,8 @@
 
 use std::f32::consts::TAU;
 
+// Angles in degrees brought into [−180, 180) (float and double: the game folds both).
+use rc_data::java_math::{wrap_degrees as wrap, wrap_degrees_f64 as wrap64};
 use rc_physics::{cos_t, sin_t};
 
 use super::*;
@@ -54,28 +56,6 @@ pub(super) fn skin(_r: &EntityRenderer, e: &Entity) -> Option<u32> {
     (e.kind == KIND).then_some(0)
 }
 
-/// Angle in degrees brought into [−180, 180).
-fn wrap(a: f32) -> f32 {
-    let a = a % 360.0;
-    if a >= 180.0 {
-        a - 360.0
-    } else if a < -180.0 {
-        a + 360.0
-    } else {
-        a
-    }
-}
-
-fn wrap64(a: f64) -> f64 {
-    let a = a % 360.0;
-    if a >= 180.0 {
-        a - 360.0
-    } else if a < -180.0 {
-        a + 360.0
-    } else {
-        a
-    }
-}
 
 /// Dying: the history and the wing flap are frozen.
 fn dying(e: &Entity) -> bool {

@@ -1052,9 +1052,10 @@ fn valid(data: &rc_data::VersionData, block: &rc_data::BlockInfo, k: &str, v: &s
         .any(|p| p.name == k && p.values.iter().any(|x| x == v))
 }
 
-pub(super) fn rotations(e: &Entity, pt: f32, m: &mut Mat4) -> bool {
+/// Body rotations of the fish, squids, iron golem and phantom; `body`: interpolated body yaw
+/// (degrees).
+pub(super) fn rotations(e: &Entity, pt: f32, body: f32, m: &mut Mat4) -> bool {
     let age = e.age as f32 + pt;
-    let body = rot_lerp(pt, e.body_o, e.body);
     match e.kind.as_str() {
         "cod" | "salmon" | "tropical_fish" | "pufferfish" => {
             let water = in_water(e);

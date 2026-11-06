@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use glam::{Mat4, Vec3};
 use rc_assets::texture::Image;
+use rc_data::java_math::{euclid_remainder_by_one, remainder_by_one};
 use rc_data::{EntityLayer, VersionData};
 
 use crate::entities::{Entity, Kind, Size, rot_lerp};
@@ -1350,9 +1351,16 @@ fn humanoid(p: &mut Pose<'_>, s: &AnimState) {
     }
 }
 
-/// Angular interpolation along the shortest path (radians).
-fn rot_lerp_rad(t: f32, a: f32, b: f32) -> f32 {
-    let mut d = (b - a) % (2.0 * PI);
+/// Angular interpolation along the shortest path (radians), the game's folding loops, shared by
+/// every model. `RUSTCRAFT_OPT_ANGLE_WRAP_FAST_PATH=0`: the old library remainder first, which
+/// gives the same bits for the differences under one turn that animations hand over
+/// (`radian_fold_is_the_game_loops`).
+fn lerp_angle_radians(t: f32, a: f32, b: f32) -> f32 {
+    use rc_data::java_math::{TurnRemainder, radians_remainder_with};
+    if TurnRemainder::selected() != TurnRemainder::Library {
+        return rc_data::java_math::lerp_angle_radians(t, a, b);
+    }
+    let mut d = radians_remainder_with(b - a, TurnRemainder::Library);
     if d >= PI {
         d -= 2.0 * PI;
     }
@@ -1368,7 +1376,7 @@ fn rot_lerp_rad(t: f32, a: f32, b: f32) -> f32 {
 fn swim_arms(p: &mut Pose<'_>, s: &AnimState) {
     let w = s.swim;
     if !s.fall_flying {
-        p.set("head", |h| h[3] = rot_lerp_rad(w, h[3], -PI / 4.0));
+        p.set("head", |h| h[3] = lerp_angle_radians(w, h[3], -PI / 4.0));
     }
     let pos = s.walk_pos % 26.0;
     let swinging = s.swing_on;
@@ -1389,9 +1397,9 @@ fn swim_arms(p: &mut Pose<'_>, s: &AnimState) {
             ([PI / 2.0 - PI / 2.0 * t, PI, PI], [PI / 2.0 - PI / 2.0 * t, PI, PI])
         };
         p.set("left_arm", |a| {
-            a[3] = rot_lerp_rad(lw, a[3], lt[0]);
-            a[4] = rot_lerp_rad(lw, a[4], lt[1]);
-            a[5] = rot_lerp_rad(lw, a[5], lt[2]);
+            a[3] = lerp_angle_radians(lw, a[3], lt[0]);
+            a[4] = lerp_angle_radians(lw, a[4], lt[1]);
+            a[5] = lerp_angle_radians(lw, a[5], lt[2]);
         });
         p.set("right_arm", |a| {
             a[3] += rw * (rt[0] - a[3]);
@@ -1408,12 +1416,12 @@ fn drowned_swim(p: &mut Pose<'_>, s: &AnimState) {
     let w = s.swim;
     let o = (0.1 * s.age).sin();
     p.set("right_arm", |a| {
-        a[3] = rot_lerp_rad(w, a[3], -PI * 4.0 / 5.0) + w * 0.35 * o;
-        a[5] = rot_lerp_rad(w, a[5], -0.15);
+        a[3] = lerp_angle_radians(w, a[3], -PI * 4.0 / 5.0) + w * 0.35 * o;
+        a[5] = lerp_angle_radians(w, a[5], -0.15);
     });
     p.set("left_arm", |a| {
-        a[3] = rot_lerp_rad(w, a[3], -PI * 4.0 / 5.0) - w * 0.35 * o;
-        a[5] = rot_lerp_rad(w, a[5], 0.15);
+        a[3] = lerp_angle_radians(w, a[3], -PI * 4.0 / 5.0) - w * 0.35 * o;
+        a[5] = lerp_angle_radians(w, a[5], 0.15);
     });
     p.set("left_leg", |l| l[3] -= w * 0.55 * o);
     p.set("right_leg", |l| l[3] += w * 0.55 * o);
@@ -1955,6 +1963,15 @@ pub(crate) struct EntOpt {
     /// `BLOCKTINTLAZY`: biome colours of a moving block (pushed, falling, transient) read only
     /// when one of its drawn states has a biome-tinted layer.
     pub block_tint_lazy: bool,
+    /// `DRAGON_EFFECTS_GATE`: the dragon's rays and crystal beam looked for only when the kind
+    /// table says the entity is the dragon (needs `KINDINFO`).
+    pub dragon_effects_gate: bool,
+    /// `SHARED_BODY_ANGLE`: the interpolated body yaw computed once per entity and handed to
+    /// the family rotations, which recomputed it.
+    pub shared_body_angle: bool,
+    /// `SKIP_IDENTITY_ROOT_FACTORS`: root factors that are the identity (no shaking, scales of
+    /// 1) not multiplied in.
+    pub skip_identity_root_factors: bool,
 }
 
 impl EntOpt {
@@ -1969,6 +1986,9 @@ impl EntOpt {
         reg_idx: false,
         item_flags: false,
         block_tint_lazy: false,
+        dragon_effects_gate: false,
+        shared_body_angle: false,
+        skip_identity_root_factors: false,
     };
 
     /// New paths everywhere.
@@ -1982,6 +2002,9 @@ impl EntOpt {
         reg_idx: true,
         item_flags: true,
         block_tint_lazy: true,
+        dragon_effects_gate: true,
+        shared_body_angle: true,
+        skip_identity_root_factors: true,
     };
 
     pub(crate) fn from_env() -> EntOpt {
@@ -1994,6 +2017,9 @@ impl EntOpt {
             reg_idx: rc_data::opt_switch!("RUSTCRAFT_OPT_REGIDX"),
             item_flags: rc_data::opt_switch!("RUSTCRAFT_OPT_ITEMFLAGS"),
             block_tint_lazy: rc_data::opt_switch!("RUSTCRAFT_OPT_BLOCKTINTLAZY"),
+            dragon_effects_gate: rc_data::opt_switch!("RUSTCRAFT_OPT_DRAGON_EFFECTS_GATE"),
+            shared_body_angle: rc_data::opt_switch!("RUSTCRAFT_OPT_SHARED_BODY_ANGLE"),
+            skip_identity_root_factors: rc_data::opt_switch!("RUSTCRAFT_OPT_SKIP_IDENTITY_ROOT_FACTORS"),
         }
     }
 }
@@ -4264,8 +4290,13 @@ impl EntityRenderer {
             }
             // Scale of the living entity before the rotations (shulker attach pivot included);
             // brought back to 1 in the interface, like the game.
+            let skip_identity = self.opt.skip_identity_root_factors;
             if self.gui_root.is_none() {
-                m *= Mat4::from_scale(Vec3::splat(living_scale(e)));
+                let s = living_scale(e);
+                // A scale of 1 returns the matrix up to the sign of zeros (see the shaking).
+                if !(skip_identity && s == 1.0) {
+                    m *= Mat4::from_scale(Vec3::splat(s));
+                }
             }
             let ctx = RotCtx {
                 shaking: self.shaking(e),
@@ -4274,6 +4305,8 @@ impl EntityRenderer {
                 swim: state.swim,
                 env,
                 height: self.size_of(e).h,
+                shared_body_angle: self.opt.shared_body_angle,
+                skip_identity_factors: skip_identity,
             };
             pose_rotations(e, pt, body, &mut m, &ctx);
             shulker::attach(e, &mut m);
@@ -4299,7 +4332,9 @@ impl EntityRenderer {
             creatures::scale(e, pt, matches!(swallowed, Some(creatures::Swallowed::Block(_))), &mut scale);
             dragon::scale(e, pt, &mut scale);
             wither::scale(e, pt, &mut scale);
-            m *= Mat4::from_scale(scale);
+            if !(skip_identity && scale == Vec3::ONE) {
+                m *= Mat4::from_scale(scale);
+            }
             m *= Mat4::from_translation(creatures::model_offset(e) + Vec3::new(0.0, -1.501, 0.0));
         } else if e.kind == "evoker_fangs" {
             m *= Mat4::from_rotation_y(deg(90.0 - e.yaw));
@@ -4421,18 +4456,20 @@ impl EntityRenderer {
                 Pass::Swirl => {
                     // Charged creeper: linear scroll; wither armor: oscillating u.
                     let (u, v) = if e.kind == "creeper" {
-                        (state.age * 0.01 % 1.0, state.age * 0.01 % 1.0)
+                        let scroll = remainder_by_one(state.age * 0.01);
+                        (scroll, scroll)
                     } else {
                         wither::swirl_offset(state.age)
                     };
-                    let q = |f: f32| (f.rem_euclid(1.0) * 65535.0) as u32;
+                    let q = |f: f32| (euclid_remainder_by_one(f) * 65535.0) as u32;
                     (7, 0xf0f0, q(u) | q(v) << 16)
                 }
                 // Damage overlay without white; no lightmap.
                 Pass::Emissive => (1, packed | LIGHT_EMISSIVE, overlay & 0xffff_0000),
-                // Breeze wind: scroll in u of 0.02 per tick.
+                // Breeze wind: scroll in u of 0.02 per tick (the Euclidean fraction of the
+                // fraction is that of the value itself, bit for bit).
                 Pass::Wind => {
-                    let u = (state.age * 0.02 % 1.0).rem_euclid(1.0);
+                    let u = euclid_remainder_by_one(state.age * 0.02);
                     (1, packed | LIGHT_FLAT | LIGHT_SCROLL, (u * 65535.0) as u32)
                 }
                 // Interior of the sulfur cube (layer 0 without content): fuse blinking.
@@ -4530,7 +4567,10 @@ impl EntityRenderer {
                 self.push_mob_item(e, base, m, models, &state, pt, packed);
             }
         }
-        self.dragon_effects(e, m, rel, pt, packed);
+        // The kind flag spares the call and its name comparison for every other entity.
+        if !(new && self.opt.dragon_effects_gate) || ki.has(K_ENDER_DRAGON) {
+            self.dragon_effects(e, m, rel, pt, packed);
+        }
         if living && let Some(base) = base_model {
             // Spectator avatar: no layers (cape, armor, held items).
             let spectator = self.spectators.contains(&e.uuid);
@@ -5016,8 +5056,9 @@ impl EntityRenderer {
             self.push_posed(layer, rect, m, 0, light, |p| {
                 for (i, name) in ["box0", "box1"].into_iter().enumerate() {
                     let a = age * -(45.0 + (i as f32 + 1.0) * 5.0);
-                    let wrapped = (a + 180.0).rem_euclid(360.0) - 180.0;
-                    p.set(name, |b| b[4] = deg(wrapped));
+                    // The game's fold; the old shift by 180 around a Euclidean remainder
+                    // could round the last bit differently.
+                    p.set(name, |b| b[4] = deg(rc_data::java_math::wrap_degrees(a)));
                 }
             });
         }
@@ -6534,6 +6575,9 @@ struct RotCtx {
     env: PoseEnv,
     /// Current height of the box (scale attribute included).
     height: f32,
+    /// Switches `SHARED_BODY_ANGLE` and `SKIP_IDENTITY_ROOT_FACTORS` of the frame.
+    shared_body_angle: bool,
+    skip_identity_factors: bool,
 }
 
 /// Rotations of a living entity after its scaling: shaking, body yaw (or those
@@ -6547,14 +6591,18 @@ fn pose_rotations(e: &Entity, pt: f32, body: f32, m: &mut Mat4, c: &RotCtx) {
     // (coincident axes, the families' translations are vertical).
     let shake = if base_rot && c.shaking { ((e.age as f32 + pt).floor() * 3.25).cos() * PI * 0.4 } else { 0.0 };
     let sleeping = base_rot && e.pose() == 2;
-    if !sleeping {
+    // A zero shake is the identity rotation (sine +0, cosine 1): the product would return the
+    // matrix up to the sign of zeros, which no pixel shows (`identity_product_keeps_matrix`).
+    if !sleeping && !(c.skip_identity_factors && shake == 0.0) {
         *m *= Mat4::from_rotation_y(deg(-shake));
     }
+    // `body` is the same interpolation the families used to redo, bit for bit.
+    let family_body = if c.shared_body_angle { body } else { rot_lerp(pt, e.body_o, e.body) };
     let family = !sleeping
-        && (animals::rotations(e, pt, m)
-            || creatures::rotations(e, pt, m)
+        && (animals::rotations(e, pt, family_body, m, c.shared_body_angle)
+            || creatures::rotations(e, pt, family_body, m)
             || dragon::rotations(e, pt, m)
-            || shulker::rotations(e, pt, m));
+            || shulker::rotations(e, family_body, m));
     if !family && !sleeping {
         *m *= Mat4::from_rotation_y(deg(180.0 - body));
     }
@@ -7441,7 +7489,8 @@ fn hoglin(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
 fn armor_stand(p: &mut Pose<'_>, e: &Entity) {
     let rot = |i: u8, d: [f32; 3]| match e.meta.get(&i) {
         Some(rc_proto_v777::entity::Meta::Rotations(r)) => {
-            r.map(|v| if v.is_finite() { deg(v.rem_euclid(360.0)) } else { 0.0 })
+            // The game keeps the truncated remainder (a negative angle stays negative).
+            r.map(|v| if v.is_finite() { deg(rc_data::java_math::degrees_remainder(v)) } else { 0.0 })
         }
         _ => d.map(deg),
     };
@@ -7722,6 +7771,8 @@ mod tests {
             swim: 0.0,
             env: PoseEnv::default(),
             height: 1.8,
+            shared_body_angle: true,
+            skip_identity_factors: true,
         }
     }
 

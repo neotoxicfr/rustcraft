@@ -684,26 +684,7 @@ fn feline(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
 /// Angle interpolation whose difference is brought into [−180, 180[ ("degrees" version of the game, applied
 /// as is to radians by the felines: no wrap-around effect for these differences).
 fn rot_lerp_deg(t: f32, a: f32, b: f32) -> f32 {
-    let mut d = (b - a) % 360.0;
-    if d >= 180.0 {
-        d -= 360.0;
-    }
-    if d < -180.0 {
-        d += 360.0;
-    }
-    a + t * d
-}
-
-/// Angle interpolation in radians along the shortest path (of the game).
-fn rot_lerp_rad(t: f32, a: f32, b: f32) -> f32 {
-    let mut d = b - a;
-    while d < -PI {
-        d += 2.0 * PI;
-    }
-    while d >= PI {
-        d -= 2.0 * PI;
-    }
-    a + t * d
+    rc_data::java_math::lerp_angle_degrees(t, a, b)
 }
 
 /// Walk: target min(d × 4, 1) smoothed at 0.4; camel standing, not dashing
@@ -1108,7 +1089,7 @@ fn panda(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     if sit > 0.0 {
         if s.baby {
             p.set("body", |b| {
-                b[3] = rot_lerp_rad(sit, b[3], PI / 18.0);
+                b[3] = lerp_angle_radians(sit, b[3], PI / 18.0);
                 b[2] = lerp(sit, b[2], -1.5);
             });
             p.set("head", |h| {
@@ -1121,8 +1102,8 @@ fn panda(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
                 p.set(leg, |l| l[2] = lerp(sit, l[2], z));
             }
         } else {
-            p.set("body", |b| b[3] = rot_lerp_rad(sit, b[3], 1.740_796_3));
-            p.set("head", |h| h[3] = rot_lerp_rad(sit, h[3], PI / 2.0));
+            p.set("body", |b| b[3] = lerp_angle_radians(sit, b[3], 1.740_796_3));
+            p.set("head", |h| h[3] = lerp_angle_radians(sit, h[3], PI / 2.0));
         }
         p.set("right_front_leg", |l| l[5] = -0.270_796_42);
         p.set("left_front_leg", |l| l[5] = 0.270_796_42);
@@ -1149,10 +1130,10 @@ fn panda(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
         p.set("left_hind_leg", |l| l[3] = 0.6 * (age * 0.15).sin());
         p.set("right_front_leg", |l| l[3] = 0.3 * (age * 0.25).sin());
         p.set("left_front_leg", |l| l[3] = -0.3 * (age * 0.25).sin());
-        p.set("head", |h| h[3] = rot_lerp_rad(back, h[3], PI / 2.0));
+        p.set("head", |h| h[3] = lerp_angle_radians(back, h[3], PI / 2.0));
     }
     if roll > 0.0 {
-        p.set("head", |h| h[3] = rot_lerp_rad(roll, h[3], 2.056_194_5));
+        p.set("head", |h| h[3] = lerp_angle_radians(roll, h[3], 2.056_194_5));
         p.set("right_hind_leg", |l| l[3] = -0.5 * (age * 0.5).sin());
         p.set("left_hind_leg", |l| l[3] = 0.5 * (age * 0.5).sin());
         p.set("right_front_leg", |l| l[3] = 0.5 * (age * 0.5).sin());
@@ -1337,7 +1318,7 @@ fn bee(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     }
     let roll = lerp(pt, e.extra[1], e.extra[0]);
     if roll > 0.0 {
-        p.set("bone", |b| b[3] = rot_lerp_rad(roll, b[3], 3.091_592_8));
+        p.set("bone", |b| b[3] = lerp_angle_radians(roll, b[3], 3.091_592_8));
     }
 }
 
@@ -1463,8 +1444,14 @@ fn parrot(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
 
 /// Own render rotations, after "Y(180 − body)" (the death tilt, placed afterwards by the
 /// engine, precedes these additions in the game: difference limited to dying mobs in these poses).
-pub(super) fn rotations(e: &Entity, pt: f32, m: &mut Mat4) -> bool {
-    let body = rot_lerp(pt, e.body_o, e.body);
+/// Body rotations of the felines and the panda; `body`: interpolated body yaw (degrees).
+/// `lazy_base`: the base rotation is built only for these three kinds (it cost a sine and a
+/// cosine for every living entity); otherwise built first, the old path.
+pub(super) fn rotations(e: &Entity, pt: f32, body: f32, m: &mut Mat4, lazy_base: bool) -> bool {
+    let has_family_rotation = matches!(e.kind.as_str(), "cat" | "fox" | "panda");
+    if lazy_base && !has_family_rotation {
+        return false;
+    }
     let x_rot = e.pitch_o + pt * (e.pitch - e.pitch_o);
     let base = Mat4::from_rotation_y(deg(180.0 - body));
     match e.kind.as_str() {
@@ -2264,7 +2251,7 @@ mod tests {
         e.age = 10;
         let calm = part(&posed(&l, e, 0.0), "head")[3];
         let mut calm_m = Mat4::IDENTITY;
-        rotations(e, 0.0, &mut calm_m);
+        rotations(e, 0.0, rot_lerp(0.0, e.body_o, e.body), &mut calm_m, true);
         e.meta.insert(21, Meta::Byte(2));
         assert!(panda_scared(e));
         let p = posed(&l, e, 0.0);
@@ -2273,7 +2260,7 @@ mod tests {
         assert_eq!(part(&p, "right_front_leg")[3], -0.9);
         assert_eq!(part(&p, "left_front_leg")[3], -0.9);
         let mut m = Mat4::IDENTITY;
-        rotations(e, 0.0, &mut m);
+        rotations(e, 0.0, rot_lerp(0.0, e.body_o, e.body), &mut m, true);
         let shake = (f64::from(10.0f32 * 1.25).cos() * std::f64::consts::PI * 0.05) as f32;
         let want = calm_m * Mat4::from_rotation_y(deg(shake));
         assert!(m.abs_diff_eq(want, 1e-6), "{m:?}");
@@ -2295,11 +2282,13 @@ mod tests {
         player.pos = [2.5, 64.2, 0.5];
         all.map.insert(8, player);
         let mut alone = Mat4::IDENTITY;
-        rotations(&all.map[&7], 0.0, &mut alone);
+        let cat = &all.map[&7];
+        rotations(cat, 0.0, rot_lerp(0.0, cat.body_o, cat.body), &mut alone, true);
         cat_track(&mut all);
         assert_eq!(all.map[&7].extra[6], 1.0);
         let mut m = Mat4::IDENTITY;
-        rotations(&all.map[&7], 0.0, &mut m);
+        let cat = &all.map[&7];
+        rotations(cat, 0.0, rot_lerp(0.0, cat.body_o, cat.body), &mut m, true);
         assert!(m.abs_diff_eq(alone * Mat4::from_translation(Vec3::new(0.15, 0.0, 0.0)), 1e-6));
         // Outside the block widened by 2 (x ≥ 3 + 0.1): nothing.
         all.map.get_mut(&8).unwrap().pos[0] = 3.11;

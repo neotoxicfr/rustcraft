@@ -155,11 +155,11 @@ pub(super) fn render_offset(e: &Entity, pt: f32) -> Option<[f64; 3]> {
 
 /// Body rotation offset by 180° by the game: `180 − (body + 180)` = −body. The body
 /// stays at 0° client-side (empty rotation control), unless set by a mount.
-pub(super) fn rotations(e: &Entity, pt: f32, m: &mut Mat4) -> bool {
+pub(super) fn rotations(e: &Entity, body: f32, m: &mut Mat4) -> bool {
     if e.kind != KIND {
         return false;
     }
-    *m *= Mat4::from_rotation_y(-rot_lerp(pt, e.body_o, e.body) * (PI / 180.0));
+    *m *= Mat4::from_rotation_y(-body * (PI / 180.0));
     true
 }
 

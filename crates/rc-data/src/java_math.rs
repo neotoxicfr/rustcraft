@@ -197,6 +197,185 @@ const fn cos_near_zero(r: f64) -> f64 {
     1.0 + z * rest
 }
 
+// ---------------------------------------------------------------- angles
+
+/// How the remainder of an angle by a full turn is computed. All give the bits of the
+/// library remainder (`%`, sign of the operand); they differ in when the library is called.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnRemainder {
+    /// Always the library call (`RUSTCRAFT_OPT_ANGLE_WRAP_FAST_PATH=0`, the old path).
+    Library,
+    /// Below one turn the remainder is the operand itself: no call (default).
+    BelowOneTurnSkipped,
+    /// Also from one to two turns: one exact subtraction (`RUSTCRAFT_OPT_ANGLE_WRAP_STERBENZ=1`).
+    BelowTwoTurnsSubtracted,
+}
+
+impl TurnRemainder {
+    pub const ALL: [TurnRemainder; 3] =
+        [TurnRemainder::Library, TurnRemainder::BelowOneTurnSkipped, TurnRemainder::BelowTwoTurnsSubtracted];
+
+    /// Path chosen by the switches, read once for the process.
+    #[inline]
+    pub fn selected() -> Self {
+        static PATH: OnceLock<TurnRemainder> = OnceLock::new();
+        *PATH.get_or_init(|| {
+            if !crate::opt_switch!("RUSTCRAFT_OPT_ANGLE_WRAP_FAST_PATH") {
+                TurnRemainder::Library
+            } else if crate::opt_switch!("RUSTCRAFT_OPT_ANGLE_WRAP_STERBENZ", default_off) {
+                TurnRemainder::BelowTwoTurnsSubtracted
+            } else {
+                TurnRemainder::BelowOneTurnSkipped
+            }
+        })
+    }
+}
+
+/// `angle % turn` as the game computes it, through `path`. Without a rounding instruction the
+/// library remainder is a call costing as much as a sine, and nearly every angle a caller hands
+/// over is already under one turn, where the remainder is exact and equal to the operand (zeros
+/// keep their sign). NaN and the infinities fail both tests and reach the library.
+macro_rules! turn_remainder {
+    ($angle:expr, $turn:expr, $path:expr) => {{
+        let (angle, turn, path) = ($angle, $turn, $path);
+        let magnitude = angle.abs();
+        if path != TurnRemainder::Library && magnitude < turn {
+            angle
+        } else if path == TurnRemainder::BelowTwoTurnsSubtracted && magnitude < 2.0 * turn {
+            // From one turn to two the operand is within a factor 2 of the turn, so the
+            // difference is exact (Sterbenz lemma) and is the remainder; copying the sign back
+            // gives -360 the -0 of the library.
+            (angle - turn.copysign(angle)).copysign(angle)
+        } else {
+            angle % turn
+        }
+    }};
+}
+
+/// `angle % 360` (degrees, float), the remainder the game takes before folding an angle.
+#[inline]
+pub fn degrees_remainder(angle: f32) -> f32 {
+    degrees_remainder_with(angle, TurnRemainder::selected())
+}
+
+/// [`degrees_remainder`] through an explicit path (equivalence tests and benches).
+#[inline]
+pub fn degrees_remainder_with(angle: f32, path: TurnRemainder) -> f32 {
+    turn_remainder!(angle, 360.0f32, path)
+}
+
+/// `angle % 360` of a double.
+#[inline]
+pub fn degrees_remainder_f64(angle: f64) -> f64 {
+    degrees_remainder_f64_with(angle, TurnRemainder::selected())
+}
+
+#[inline]
+pub fn degrees_remainder_f64_with(angle: f64, path: TurnRemainder) -> f64 {
+    turn_remainder!(angle, 360.0f64, path)
+}
+
+/// `angle % 2π` (radians, float; the turn is the float nearest 2π, twice the float π).
+#[inline]
+pub fn radians_remainder_with(angle: f32, path: TurnRemainder) -> f32 {
+    turn_remainder!(angle, std::f32::consts::TAU, path)
+}
+
+/// The game's angle folded into [-180, 180[ degrees: remainder by a turn, then one turn off
+/// or on.
+#[inline]
+pub fn wrap_degrees(angle: f32) -> f32 {
+    let mut a = degrees_remainder(angle);
+    if a >= 180.0 {
+        a -= 360.0;
+    }
+    if a < -180.0 {
+        a += 360.0;
+    }
+    a
+}
+
+/// [`wrap_degrees`] of a double.
+#[inline]
+pub fn wrap_degrees_f64(angle: f64) -> f64 {
+    let mut a = degrees_remainder_f64(angle);
+    if a >= 180.0 {
+        a -= 360.0;
+    }
+    if a < -180.0 {
+        a += 360.0;
+    }
+    a
+}
+
+/// The game's interpolation of an angle in degrees along the shorter way, from `from` to `to`
+/// at `t`.
+#[inline]
+pub fn lerp_angle_degrees(t: f32, from: f32, to: f32) -> f32 {
+    from + t * wrap_degrees(to - from)
+}
+
+/// Beyond this many radians the game's folding loops would run for thousands of turns (and
+/// forever once a turn no longer changes the float): the remainder is taken first.
+const RADIANS_LOOP_LIMIT: f32 = 65_536.0;
+
+/// The game's interpolation of an angle in radians along the shorter way.
+#[inline]
+pub fn lerp_angle_radians(t: f32, from: f32, to: f32) -> f32 {
+    from + t * fold_radians(to - from)
+}
+
+/// A difference of radians brought into [-π, π[ by whole float turns, one at a time, as the
+/// game loops (no remainder call: an animation hands over less than a turn).
+#[inline]
+pub fn fold_radians(mut d: f32) -> f32 {
+    use std::f32::consts::{PI, TAU};
+    if d.abs() >= RADIANS_LOOP_LIMIT {
+        // Never reached by an animation (NaN fails the test and passes through the loops
+        // untouched); the game would hang here, we take the exact remainder.
+        d %= TAU;
+    }
+    while d < -PI {
+        d += TAU;
+    }
+    while d >= PI {
+        d -= TAU;
+    }
+    d
+}
+
+/// `x % 1` of a float (fraction with the sign of `x`), the scroll of animated textures. Below
+/// 2^23 the float minus its truncation is exact (both are within a factor 2 from 1 up), and the
+/// conversion to an integer is one instruction where the library remainder and `trunc` are
+/// calls; the copied sign gives a negative integer the library's -0. Beyond, every float is an
+/// integer and the library answers. `RUSTCRAFT_OPT_ANGLE_WRAP_FAST_PATH=0`: always the library.
+#[inline]
+pub fn remainder_by_one(x: f32) -> f32 {
+    remainder_by_one_with(x, TurnRemainder::selected())
+}
+
+/// [`remainder_by_one`] through an explicit path (any path but the library's takes the
+/// truncation).
+#[inline]
+pub fn remainder_by_one_with(x: f32, path: TurnRemainder) -> f32 {
+    if path != TurnRemainder::Library && x.abs() < 8_388_608.0 { (x - (x as i32) as f32).copysign(x) } else { x % 1.0 }
+}
+
+/// `x.rem_euclid(1)` (fraction in [0, 1[ for a finite `x`) without the library remainder.
+#[inline]
+pub fn euclid_remainder_by_one(x: f32) -> f32 {
+    let r = remainder_by_one(x);
+    if r < 0.0 { r + 1.0 } else { r }
+}
+
+/// `angle.rem_euclid(360)` (degrees in [0, 360[ for a finite angle) through
+/// [`degrees_remainder`].
+#[inline]
+pub fn euclid_degrees_remainder(angle: f32) -> f32 {
+    let r = degrees_remainder(angle);
+    if r < 0.0 { r + 360.0 } else { r }
+}
+
 // ---------------------------------------------------------------- reals to integers
 
 /// Rounding down then saturated conversion, as the game turns a double into an int: NaN gives 0,

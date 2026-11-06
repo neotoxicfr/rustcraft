@@ -299,6 +299,9 @@ fn prepare_snapshot_same_under_every_switch() {
         ("REGIDX", off(&|o| o.reg_idx = false)),
         ("ITEMFLAGS", off(&|o| o.item_flags = false)),
         ("BLOCKTINTLAZY", off(&|o| o.block_tint_lazy = false)),
+        ("DRAGON_EFFECTS_GATE", off(&|o| o.dragon_effects_gate = false)),
+        ("SHARED_BODY_ANGLE", off(&|o| o.shared_body_angle = false)),
+        ("SKIP_IDENTITY_ROOT_FACTORS", off(&|o| o.skip_identity_root_factors = false)),
     ] {
         assert_eq!(run(&mut k, &ents, o), reference, "{name}=0");
     }
@@ -309,6 +312,9 @@ fn prepare_snapshot_same_under_every_switch() {
         ("SIZEONCE", EntOpt { size_once: true, ..EntOpt::OLD }),
         ("OBJEARLY", EntOpt { obj_early: true, ..EntOpt::OLD }),
         ("LIGHTONCE", EntOpt { light_once: true, ..EntOpt::OLD }),
+        ("DRAGON_EFFECTS_GATE", EntOpt { dragon_effects_gate: true, kind_info: true, ..EntOpt::OLD }),
+        ("SHARED_BODY_ANGLE", EntOpt { shared_body_angle: true, ..EntOpt::OLD }),
+        ("SKIP_IDENTITY_ROOT_FACTORS", EntOpt { skip_identity_root_factors: true, ..EntOpt::OLD }),
     ] {
         assert_eq!(run(&mut k, &ents, o), reference, "{name} alone");
     }

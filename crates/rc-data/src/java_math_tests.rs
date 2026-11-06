@@ -358,6 +358,181 @@ fn checkers_detect_sabotage() {
     assert!((0..=u32::MAX).into_par_iter().map(f32::from_bits).any(|v| float_sum(v) != reference_round_f32(v)));
 }
 
+// ---------------------------------------------------------------- angles
+
+/// First float (bit pattern) where `f` differs from the library remainder `x % turn`, bit for
+/// bit (NaN payloads included).
+fn first_remainder_mismatch(turn: f32, f: impl Fn(f32) -> f32 + Sync) -> Option<u32> {
+    (0..=u32::MAX).into_par_iter().find_map_any(|b| {
+        let x = f32::from_bits(b);
+        (f(x).to_bits() != (x % turn).to_bits()).then_some(b)
+    })
+}
+
+/// Floats where a remainder path can go wrong: both sides of zero, one and two turns (degrees
+/// and radians), the folding bounds, the integer limit of floats, NaN, infinities.
+fn angle_limits() -> Vec<f32> {
+    let mut l = vec![0.0, -0.0, f32::NAN, -f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::from_bits(1), f32::MAX];
+    let tau = std::f32::consts::TAU;
+    let pi = std::f32::consts::PI;
+    for v in [1.0, 2.0, 3.0, 180.0, 360.0, 540.0, 720.0, 1080.0, pi, tau, 2.0 * tau, 3.0 * tau, 8_388_608.0, 65_536.0] {
+        for w in [v, v.next_up(), v.next_down()] {
+            l.extend([w, -w]);
+        }
+    }
+    l
+}
+
+/// Every float, through each path: the remainder by 360 and by 2π are the library's, bit for
+/// bit (the wrap test alone would not see a `<=` at the fast path: only ±360 tell it).
+/// About a minute on 32 threads: run once per change of these paths (passed on 06/11).
+#[test]
+#[ignore = "exhaustive, about a minute"]
+fn turn_remainders_exhaustive_over_floats() {
+    for path in TurnRemainder::ALL {
+        assert_eq!(first_remainder_mismatch(360.0, |x| degrees_remainder_with(x, path)), None, "degrees {path:?}");
+        assert_eq!(
+            first_remainder_mismatch(std::f32::consts::TAU, |x| radians_remainder_with(x, path)),
+            None,
+            "radians {path:?}"
+        );
+    }
+    for path in TurnRemainder::ALL {
+        assert_eq!(first_remainder_mismatch(1.0, |x| remainder_by_one_with(x, path)), None, "remainder by one {path:?}");
+    }
+}
+
+/// The same on one float in 61 and the limits (every run).
+#[test]
+fn turn_remainders_on_sampled_floats() {
+    let floats: Vec<f32> = (0..=u32::MAX).step_by(61).map(f32::from_bits).chain(angle_limits()).collect();
+    let same = |turn: f32, f: &(dyn Fn(f32) -> f32 + Sync)| {
+        floats.par_iter().find_any(|&&x| f(x).to_bits() != (x % turn).to_bits()).copied()
+    };
+    for path in TurnRemainder::ALL {
+        assert_eq!(same(360.0, &|x| degrees_remainder_with(x, path)), None, "degrees {path:?}");
+        assert_eq!(same(std::f32::consts::TAU, &|x| radians_remainder_with(x, path)), None, "radians {path:?}");
+        assert_eq!(same(1.0, &|x| remainder_by_one_with(x, path)), None, "remainder by one {path:?}");
+    }
+}
+
+/// The double remainder on the widened floats (one in 7), the limits and random doubles.
+#[test]
+fn double_degrees_remainder_matches_library() {
+    let mut r = Mix(11);
+    let widened = (0..=u32::MAX).step_by(7).map(|b| f64::from(f32::from_bits(b)));
+    let draws: Vec<f64> = (0..2_000_000).map(|i| if i % 2 == 0 { r.range(-2000.0, 2000.0) } else { random_double(&mut r, i) }).collect();
+    let values: Vec<f64> = widened.chain(limits()).chain(draws).chain([360.0, -360.0, 720.0, -720.0, 719.999_999_999_999_9]).collect();
+    for path in TurnRemainder::ALL {
+        let bad = values.par_iter().find_any(|&&v| degrees_remainder_f64_with(v, path).to_bits() != (v % 360.0).to_bits());
+        assert_eq!(bad, None, "{path:?}");
+    }
+}
+
+/// The folds and Euclidean remainders built on the shared remainders give the bits of the
+/// formulas they replace: the game's wrap, Rust's `rem_euclid`.
+#[test]
+fn folded_angles_match_their_formulas() {
+    let game_wrap = |a: f32| {
+        let mut r = a % 360.0;
+        if r >= 180.0 {
+            r -= 360.0;
+        }
+        if r < -180.0 {
+            r += 360.0;
+        }
+        r
+    };
+    let bad = (0..=u32::MAX).into_par_iter().map(f32::from_bits).find_any(|&a| {
+        wrap_degrees(a).to_bits() != game_wrap(a).to_bits()
+            || euclid_degrees_remainder(a).to_bits() != a.rem_euclid(360.0).to_bits()
+            || euclid_remainder_by_one(a).to_bits() != a.rem_euclid(1.0).to_bits()
+    });
+    assert_eq!(bad, None);
+    for a in limits() {
+        let game = {
+            let mut r = a % 360.0;
+            if r >= 180.0 {
+                r -= 360.0;
+            }
+            if r < -180.0 {
+                r += 360.0;
+            }
+            r
+        };
+        assert_eq!(wrap_degrees_f64(a).to_bits(), game.to_bits(), "{a}");
+    }
+    assert_eq!(lerp_angle_degrees(0.5, 350.0, 10.0), 360.0);
+    assert_eq!(lerp_angle_degrees(0.5, 10.0, 350.0), 0.0);
+}
+
+/// The game's folding loops in radians, without our guard (it hangs beyond about 2^26).
+fn game_fold_radians(mut d: f32) -> f32 {
+    use std::f32::consts::{PI, TAU};
+    while d < -PI {
+        d += TAU;
+    }
+    while d >= PI {
+        d -= TAU;
+    }
+    d
+}
+
+/// The old fold of the humanoid swim and drowned arms: library remainder by 2π first.
+fn old_fold_radians_by_remainder(d: f32) -> f32 {
+    use std::f32::consts::{PI, TAU};
+    let mut r = d % TAU;
+    if r >= PI {
+        r -= TAU;
+    }
+    if r < -PI {
+        r += TAU;
+    }
+    r
+}
+
+/// Below the guard the shared fold is the game's loops, bit for bit; below one turn it is also
+/// the old remainder fold (so the humanoid swim moves no bit), which differs beyond (counted).
+#[test]
+fn radian_fold_is_the_game_loops() {
+    let tau = std::f32::consts::TAU;
+    let bad = (0..=u32::MAX).into_par_iter().map(f32::from_bits).find_any(|&d| {
+        let shared = fold_radians(d).to_bits();
+        let game = (d.abs() < 1024.0 || d.is_nan()).then(|| game_fold_radians(d).to_bits());
+        game.is_some_and(|g| g != shared) || d.abs() < tau && shared != old_fold_radians_by_remainder(d).to_bits()
+    });
+    assert_eq!(bad, None);
+    let beyond_a_turn = (0..=u32::MAX)
+        .into_par_iter()
+        .map(f32::from_bits)
+        .filter(|d| (tau..1024.0).contains(&d.abs()))
+        .filter(|&d| fold_radians(d).to_bits() != old_fold_radians_by_remainder(d).to_bits())
+        .count();
+    eprintln!("floats in [2π, 1024[ where the old remainder fold differs from the game's loops: {beyond_a_turn}");
+    assert!(fold_radians(f32::NEG_INFINITY).is_nan() && fold_radians(f32::NAN).is_nan());
+    assert_eq!(fold_radians(1.0e30).to_bits(), old_fold_radians_by_remainder(1.0e30).to_bits());
+}
+
+/// The checkers catch the classic slips: fast path at `<=` (only ±360 differ), the subtraction
+/// without its sign, bounded at `<=` two turns, the fraction without its sign.
+#[test]
+fn angle_checkers_detect_sabotage() {
+    let limits = angle_limits();
+    let differs = |turn: f32, f: &dyn Fn(f32) -> f32| limits.iter().any(|&x| f(x).to_bits() != (x % turn).to_bits());
+    assert!(differs(360.0, &|a| if a.abs() <= 360.0 { a } else { a % 360.0 }));
+    assert!(differs(360.0, &|a| if (360.0..720.0).contains(&a.abs()) { a - 360f32.copysign(a) } else { a % 360.0 }));
+    assert!(differs(360.0, &|a| if (360.0..=720.0).contains(&a.abs()) {
+        (a - 360f32.copysign(a)).copysign(a)
+    } else {
+        a % 360.0
+    }));
+    assert!(differs(1.0, &|x| if x.abs() < 8_388_608.0 { x - (x as i32) as f32 } else { x % 1.0 }));
+    // And the sampled limits pass on the real paths.
+    for path in TurnRemainder::ALL {
+        assert!(!differs(360.0, &|a| degrees_remainder_with(a, path)), "{path:?}");
+    }
+}
+
 // ---------------------------------------------------------------- micro-benches
 
 fn time<T>(label: &str, reps: u32, mut f: impl FnMut() -> T) -> f64 {
@@ -438,4 +613,49 @@ fn rounding_micro_bench() {
     time("round f32 10^7, shared", 5, || fs.iter().map(|&v| i64::from(round_f32_to_i32(v))).sum::<i64>());
     time("round f64 10^7, old library floor", 5, || xs.iter().map(|&v| reference_round_f64(v)).sum::<i64>());
     time("round f64 10^7, shared", 5, || xs.iter().map(|&v| round_to_i64(v)).sum::<i64>());
+}
+
+/// Angle folds of the entity render: per-tick yaw differences (a few degrees), head minus body
+/// (tens of degrees, one in 50 beyond a turn), texture scroll ages; one thread, then every
+/// thread (each its own copy of the work).
+#[test]
+#[ignore = "benchmark"]
+fn angle_wrap_micro_bench() {
+    let mut r = Mix(5);
+    let diffs: Vec<f32> =
+        (0..1_000_000).map(|i| (if i % 50 == 0 { r.range(-700.0, 700.0) } else { r.range(-90.0, 90.0) }) as f32).collect();
+    let ages: Vec<f32> = (0..1_000_000).map(|_| r.range(0.0, 2e5) as f32).collect();
+    let threads = rayon::current_num_threads();
+    let both = |label: &str, f: &(dyn Fn() -> f32 + Sync)| {
+        time(&format!("{label}, 1 thread"), 7, f);
+        time(&format!("{label}, {threads} threads"), 5, || (0..threads).into_par_iter().map(|_| f()).sum::<f32>());
+    };
+    for path in TurnRemainder::ALL {
+        both(&format!("wrap degrees 10^6, {path:?}"), &|| {
+            diffs.iter().map(|&d| {
+                let mut a = degrees_remainder_with(d, path);
+                if a >= 180.0 {
+                    a -= 360.0;
+                }
+                if a < -180.0 {
+                    a += 360.0;
+                }
+                a
+            }).sum::<f32>()
+        });
+    }
+    let radians: Vec<f32> = diffs.iter().map(|d| d.to_radians() * 0.1).collect();
+    both("fold radians 10^6, old library remainder", &|| radians.iter().map(|&d| old_fold_radians_by_remainder(d)).sum());
+    both("fold radians 10^6, game loops", &|| radians.iter().map(|&d| fold_radians(d)).sum());
+    let scrolls: Vec<f32> = ages.iter().map(|a| a * 0.01).collect();
+    both("scroll fraction 10^6, library % 1 then rem_euclid", &|| scrolls.iter().map(|&x| (x % 1.0).rem_euclid(1.0)).sum());
+    both("scroll fraction 10^6, shared", &|| {
+        scrolls
+            .iter()
+            .map(|&x| {
+                let r = remainder_by_one_with(x, TurnRemainder::BelowOneTurnSkipped);
+                if r < 0.0 { r + 1.0 } else { r }
+            })
+            .sum()
+    });
 }
