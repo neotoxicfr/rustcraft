@@ -5660,3 +5660,122 @@ profile, machine loaded by other agents compiling, best of 5 or 7; three runs, t
   decorations, noise floors), `crowd-1000`, `tnt`, `dropped-items` (collision walks); memstats at
   world opening (−1 MB of heap expected).
 
+## C6-M04: explosion and wind burst rays, one walker, cells read once, borrowed shapes, mobs in the box (06/11, loaded machine)
+
+The tnt scene's spike (p99 66.7 ms, 64 TNT in one tick) sits in the rays of each explosion:
+1,352 rays stepping 0.3 block, every step reading its cell four to six times (state, air flag,
+fluid twice, portal and rail tests) then searching the list of the cells already hit, which
+grows to hundreds of entries. Counted on a TNT on the grass: 18,745 cells worked out for 667
+hit ones. The wind burst had its own copy of the walk (a tag test per step, a hash set).
+
+- One walker (`mobs/blast_rays.rs`) for explosions and bursts: a cell's effect (power taken,
+  hittable or not) worked out once per explosion into arrays over the cube the rays can reach
+  (side `2 × (1.74 r + 1.5)`, 5 bytes a cell: 29 KB for a TNT, 10 MB at most, radius 36 or so;
+  hash maps beyond, and for any cell outside the cube, which a test proves never happens), with a
+  bit per cell for "already hit". The world does not change during the walk, so the cached effect
+  is the one every ray would read. The power floats are drawn up front, one per ray in ray order
+  (the walk draws nothing else), and the 1,352 steps are a table built once.
+- Leads, each behind its switch (`=0`: former path), micro-bench `tests_explosion_rays::
+  bench_explosion_rays` (best of 3 alternated rounds, two passes, µs per explosion without
+  destruction unless said): every former path → every new path: TNT on the grass 2,199-2,572 →
+  243-256, in the air 4,559-4,732 → 254-303, in water 40-41 → 12-15, radius 7 12,023-12,539 →
+  367-440, radius 20 214,785-225,890 → 1,136-1,286, TNT destroying a 512-block mix 730-767 →
+  398-454. Before the change (same bench, `main` 2e768c2f): 1,967-1,975, 4,108-4,164, 34.6-35.6,
+  11,103-11,132, 262,831-266,947, 1,010-1,036 (the "all former" row matches it within noise).
+  - `RUSTCRAFT_OPT_BLAST_HIT_BITS` (bit per cell instead of the list search): alone 585-874 on the
+    grass, 605-966 in the air, radius 20 2,434-3,796; every other lead on without it: 1,289-1,648.
+    The biggest lead (the list search was quadratic in the hit cells).
+  - `RUSTCRAFT_OPT_BLAST_LAST_CELL` (a step in the cell of the step before takes the same power
+    and skips the lookup and the hit test, exact: power only falls along a ray, so that cell was
+    already hit or never hittable): cells worked out 18,745 → 8,228 without the cache; alone
+    1,027-1,055 on the grass; every other lead on, it off: 252-333 against 243-256.
+  - `RUSTCRAFT_OPT_BLAST_CELL_CACHE`: cells worked out 8,228 → 675; every other lead on, it off:
+    304-336.
+  - `RUSTCRAFT_OPT_BLAST_ONE_STATE_READ` (resistance, fluid, air test, portal, rails and blue
+    skull rules from one state read through a view the threads can share; the tag test has one
+    implementation for the server and the view): every other lead on, it off: 266-273; alone it
+    read slower (2,629-3,723), which the deterministic count does not explain (fewer reads per
+    step): load of the moment, to settle on the quiet machine.
+  - `RUSTCRAFT_OPT_SHARED_RAY_WALKER` (the burst through the same walker): burst radius 3, it off
+    → on: 379-395 → 245-299; radius 1.2: 127-168 → 94-113. Alone (every other lead off) it is
+    worse, 1,811-3,142, since the walk then searches the hit list: the shared walker only pays
+    with the hit bits.
+  - `RUSTCRAFT_OPT_BLAST_PARALLEL_RAYS` (off by default): rays shared in contiguous slices between
+    threads (one cell cache each), merged in ray order. Radius 20: 1 thread 1,302, 2 threads 916,
+    4 threads 805, 8 threads 892, 16 threads 1,347, 32 threads 1,870; radius 7: 447 / 398 / 334 /
+    463 / 797 / 1,365; TNT (radius 4) 255 / 265 / 293 / 378 / 679 / 1,334; in water 19 → 134-1,152.
+    Starting the threads (about 50 to 100 µs a thread on Windows) costs more than the walk below
+    radius 7; above, only 2 to 4 threads gain. Kept behind its switch from radius 7
+    (`parallel_min_radius`), threads from `RUSTCRAFT_THREADS` or every logical core. Lead left to
+    measure: a pool kept between explosions (the rayon pool is shared with chunk generation, which
+    would make an explosion wait for a generation task).
+  - SIMD (4 to 8 rays at once): not done. After the cache, a step is three floors, a compare and an
+    array read with rays of different lengths; the expected gain is small against the readability
+    cost. GPU: discarded (one blocking readback per explosion, explosions of a tick depend on each
+    other, no device in `rc-sim`, f64 positions).
+- Around the rays:
+  - `RUSTCRAFT_OPT_CLIP_SHAPE_REF`: the visible-part rays (`seen_percent`, 27 to 54 per entity in
+    reach) borrow each cell's collision shape instead of copying it into a new list. 24 boxes
+    behind fences, panes, slabs, stairs and walls: 1,387 allocations → 0 (counted), 279-281 →
+    179-209 µs. The same copy pattern elsewhere (frog, env, copper, spells, ghast, creaking, happy
+    ghast, fishing, projectile physics, respawn, weather: 15 sites) is left to the C6-M36 sweep.
+  - `RUSTCRAFT_OPT_BLAST_MOBS_IN_BOX`: mobs gathered in the game's box around the explosion (twice
+    the radius plus one block each way, whole blocks: every mob within reach meets it) instead of
+    the whole list, then the distance tested again when hit; same for the bursts. TNT on the grass
+    with 500 mobs out of reach: 503 → 205. Closer to the game, which gathers the entities of that
+    box when the explosion starts: a mob that would move into reach while the others are hurt is
+    no longer hit (none does in the proofs).
+  - `RUSTCRAFT_OPT_BLAST_LOOKUPS_ONCE`: the TNT block id (by id, not by name), air, the drop rule,
+    particle and sound ids (registry index instead of a walk) looked up once per explosion; the
+    mob rule read once. Within the noise of the destruction bench (it saves a rule lookup and a
+    name comparison per destroyed block).
+  - `RUSTCRAFT_OPT_BLAST_OPEN_STACKS`: a drop is compared only with the loot stacks that still have
+    room (a full stack takes nothing more, so the result is the same). 300 drops of 8 kinds: 14.8-
+    17.1 → 10.1-10.6 µs (about 1% of a destroying TNT).
+  - `default_state` (54 sites) and the projectile's `default_state_of` go through the block name
+    index (`RUSTCRAFT_OPT_NAMEINDEX=0`: the walk over the block list).
+- Equivalence (A1/A2): `tests_explosion_rays` fingerprints a flat world frozen on the code before
+  the change: a chain of 64 TNT (8 × 8, every 3 blocks, mixed blocks, a chest, a hive, a partial
+  wall of fences, panes, slabs and walls, zombies, an iron golem, armor stands, a creative player
+  in reach), TNT in water, TNT through a portal, blue skull among obsidian and bedrock, radius 7,
+  primed TNT minecart on rails, respawn anchor in water with fire, world floor (bedrock removed)
+  and ceiling, radius 20, three wind bursts among levers, doors, trapdoors, gates, candles, a bell,
+  barriers and bedrock; cells of every explosion in order, blocks, items, primed TNT each tick,
+  mobs, decorations, player. Identical for every former path, each new path alone, every new path,
+  each former path alone, the parallel rays on 1, 2, 4, 8 and 32 threads at every radius, the hash
+  maps only. The walker matches a reference walk (the former loop) on a made-up world for every
+  path, thread count and cube size, radius 0, negative and NaN included; the cube holds every cell
+  a ray reaches up to radius 30; the visible parts of half-hidden boxes are frozen; the open stacks
+  group like the walk over every stack; every block state is read by the shared view like the
+  former reads (resistance, fluid, rails, wither-immune and wind tags). Sabotages, each caught by
+  its own switch's runs: the last-cell step not taking the drop (scenes, walker test), a cache kept
+  between explosions (scenes), the hit bit ignored (scenes), the burst cells never stopped
+  (scenes: cells, blocks), the TNT found by the wrong block id (scenes: no chain), the mob box
+  shrunk on one side (scenes: mobs), a stack of 15 taken as full (scenes: items; grouping test),
+  only the first box of a shape (visible-part test; the scenes' mobs do not see it); the fluid
+  ignored by the shared view: the scenes do not see it (water and lava resist 100 in the registry
+  anyway), the state test does (state 46). Two hit cells swapped: every one-thread run and the
+  walker test; the thread shares merged backwards: every run on 2 to 32 threads.
+- Fidelity (A3): the hit cells keep the order the rays first reached them, which the shuffle of
+  the destruction starts from; the game's hash set has another order, so a given random shuffles
+  them differently (the distribution is the same). Pre-existing, unchanged here; a fidelity
+  decision of its own if parity at a fixed seed is wanted.
+- Memory: 29 KB per TNT explosion while its rays are walked (two arrays, freed at once), 10 MB at
+  most; allocations per explosion without destruction 14 → 17 (the two arrays); the table of
+  steps 32 KB once. Disk, network, startup: unchanged (same packets, same blocks).
+- Multi-core: above. Placement: server thread (the destruction is an ordered cascade: blocks set,
+  hives, chained TNT, draws).
+- Not done: the visible-part rays sharing the explosion's cells (they need the collision shapes,
+  another datum than the power drops, and a check that no block changed between two entity
+  passes); the visible parts on several threads (about 60 µs per explosion with 20 entities in
+  reach, needs the shared view and a sequential redo when a box or a block changed); the air
+  short cut of the visible-part rays (exact only when the whole segment is in air, which entities
+  standing on the ground almost never are); a cell read through a kept section instead of the
+  chunk map (675 reads per TNT once cached: below the noise); keeping the cube's arrays between
+  explosions (clearing them costs what allocating them does). The loot table is already looked up
+  once per state (C6-M27); the blown block's name is no longer copied (L10-COMBAT). Coordination:
+  the items and orbs pass of an explosion (`explosion_hits_objects`, blocks/entities.rs) gathers
+  every item then searches each one linearly (quadratic), left to the blocks group.
+- To measure on the quiet machine: `tnt`, `tnt-first-volley` (salvo tick max and median),
+  `crowd-1000` (mobs gathered), `tnt-cannon`; expected: the salvo spike from about 66 ms towards
+  10-20 ms (rays were about 2 ms of each explosion).
