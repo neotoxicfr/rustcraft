@@ -5663,7 +5663,9 @@ profile, machine loaded by other agents compiling, best of 5 or 7; three runs, t
 
 ## C7-M09: processor-specific code, ceiling per crate measured on v2 / v3 builds, shared detection (06/11, loaded machine)
 
-- Shared detection `rc_data::cpu` (`has_avx2`, `has_sse41`, `has_fma`, read once). The five sites
+- Shared detection `rc_data::cpu` (`has_avx2`, `has_fma`, read once; no SSE4.1 answer, no body
+  needs one). A test of `rc_data::cpu` fails on any other processor query in the workspace, so a
+  branch that adds one cannot slip past the switch. The five sites
   that asked the processor themselves now ask there: noise kernel and flattened biome tree
   (rc-worldgen, AVX2), `jmath` sine and cosine (FMA), mixer lanes (rc-audio, AVX2), meshing candidate
   rows (rc-mesh, AVX2, chosen once per section). Each keeps its local `unsafe`, its SAFETY comment and

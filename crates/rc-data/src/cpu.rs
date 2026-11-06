@@ -7,7 +7,8 @@
 //!
 //! `RUSTCRAFT_OPT_CPU_SPECIFIC_CODE=0` makes every answer `false`, so the generic bodies run
 //! everywhere on the same executable (scene bench of the whole family against plain x86-64).
-//! The switch can only hide a feature, never claim one the processor lacks.
+//! The switch can only hide a feature, never claim one the processor lacks. It only holds if no
+//! other code asks the processor itself: a test below fails on any such call in the workspace.
 
 use std::sync::LazyLock;
 
@@ -15,10 +16,8 @@ use std::sync::LazyLock;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Features {
     /// 256-bit integer vectors. A body compiled with `avx2` also gets AVX, SSE4.2 and SSE4.1
-    /// (native `floor`, `round`, `trunc` instead of a library call).
+    /// (native `floor`, `round`, `trunc` instead of a library call): every AVX2 processor has them.
     pub avx2: bool,
-    /// Native rounding instructions (`floor`, `ceil`, `trunc`, `round`).
-    pub sse41: bool,
     /// Fused multiply-add in one instruction (`mul_add` without a library call).
     pub fma: bool,
 }
@@ -30,7 +29,6 @@ impl Features {
         {
             Self {
                 avx2: std::arch::is_x86_feature_detected!("avx2"),
-                sse41: std::arch::is_x86_feature_detected!("sse4.1"),
                 fma: std::arch::is_x86_feature_detected!("fma"),
             }
         }
@@ -49,22 +47,10 @@ impl Features {
 static USABLE: LazyLock<Features> =
     LazyLock::new(|| Features::detected().allowed_if(crate::opt_switch!("RUSTCRAFT_OPT_CPU_SPECIFIC_CODE")));
 
-/// Features the code may use: detected once, hidden by `RUSTCRAFT_OPT_CPU_SPECIFIC_CODE=0`.
-#[inline]
-pub fn usable() -> Features {
-    *USABLE
-}
-
 /// AVX2 may be used (detected on this processor and not hidden by the switch).
 #[inline]
 pub fn has_avx2() -> bool {
     USABLE.avx2
-}
-
-/// SSE4.1 may be used (detected on this processor and not hidden by the switch).
-#[inline]
-pub fn has_sse41() -> bool {
-    USABLE.sse41
 }
 
 /// FMA may be used (detected on this processor and not hidden by the switch).
@@ -76,6 +62,7 @@ pub fn has_fma() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
 
     /// The answers are those of the processor (all of them, so the faster bodies do run under the
     /// tests), or none at all when the switch is at 0: never a feature it lacks.
@@ -84,14 +71,13 @@ mod tests {
         let detected = Features::detected();
         let switch = crate::env_flags::read_os("RUSTCRAFT_OPT_CPU_SPECIFIC_CODE");
         let expected = detected.allowed_if(crate::env_flags::switch_state(switch.as_deref(), true));
-        assert_eq!(usable(), expected, "detected {detected:?}");
-        assert_eq!((has_avx2(), has_sse41(), has_fma()), (expected.avx2, expected.sse41, expected.fma));
+        assert_eq!((has_avx2(), has_fma()), (expected.avx2, expected.fma), "detected {detected:?}");
         eprintln!("detected {detected:?}, usable {expected:?}");
     }
 
     #[test]
     fn the_switch_hides_every_feature() {
-        let all = Features { avx2: true, sse41: true, fma: true };
+        let all = Features { avx2: true, fma: true };
         assert_eq!(all.allowed_if(true), all);
         assert_eq!(all.allowed_if(false), Features::default());
     }
@@ -103,9 +89,40 @@ mod tests {
     fn each_field_reads_its_own_feature() {
         let d = Features::detected();
         assert_eq!(d.avx2, std::arch::is_x86_feature_detected!("avx2"));
-        assert_eq!(d.sse41, std::arch::is_x86_feature_detected!("sse4.1"));
         assert_eq!(d.fma, std::arch::is_x86_feature_detected!("fma"));
         // Every processor with AVX2 has SSE4.1: the AVX2 bodies may round natively.
-        assert!(!d.avx2 || d.sse41);
+        assert!(!d.avx2 || std::arch::is_x86_feature_detected!("sse4.1"));
+    }
+
+    /// No source file of the workspace asks the processor itself: a site that did would keep its
+    /// faster body under `RUSTCRAFT_OPT_CPU_SPECIFIC_CODE=0` and skew the generic-code bench.
+    #[test]
+    fn no_feature_detection_outside_this_module() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut sources = Vec::new();
+        for dir in ["crates", "apps", "tools"] {
+            collect_rust_sources(&root.join(dir), &mut sources);
+        }
+        assert!(sources.len() > 100, "workspace sources not found under {}", root.display());
+        let this_module = Path::new("rc-data").join("src").join("cpu.rs");
+        let offenders: Vec<_> = sources
+            .iter()
+            .filter(|path| !path.ends_with(&this_module))
+            .filter(|path| std::fs::read_to_string(path).is_ok_and(|text| text.contains("feature_detected!")))
+            .collect();
+        assert!(offenders.is_empty(), "ask rc_data::cpu instead of the processor in {offenders:#?}");
+    }
+
+    fn collect_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for path in entries.flatten().map(|entry| entry.path()) {
+            if path.is_dir() {
+                if path.file_name().is_some_and(|name| name != "target") {
+                    collect_rust_sources(&path, out);
+                }
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
     }
 }
