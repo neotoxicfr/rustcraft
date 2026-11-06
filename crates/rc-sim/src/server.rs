@@ -170,9 +170,10 @@ pub struct Server {
     pub(crate) regs: Registries,
     pub(crate) dim: Dimension,
     pub(crate) chunks: HashMap<(i32, i32), Slot>,
-    /// Bumped by every insertion into `chunks` and every swap of the map: a memo of which
-    /// chunks are present (the End arena ticket) stays valid while it does not move.
-    pub(crate) chunk_map_generation: u64,
+    /// Bumped by every swap of the whole map, the only way a chunk leaves it: a memo saying every
+    /// chunk of a set is present (the End arena ticket) stays true while it does not move, since
+    /// insertions only add keys.
+    pub(crate) chunk_map_swaps: u64,
     /// Frozen entities (raw NBT) per chunk, with their entity id.
     pub(crate) entities: HashMap<(i32, i32), Vec<(i32, Nbt)>>,
     pub(crate) next_entity: i32,
@@ -457,7 +458,7 @@ impl Server {
             regs,
             dim,
             chunks: HashMap::new(),
-            chunk_map_generation: 0,
+            chunk_map_swaps: 0,
             entities: HashMap::new(),
             next_entity: 2,
             paused,
@@ -860,7 +861,6 @@ impl Server {
                 }
             };
             self.chunks.insert(p, slot);
-            self.chunk_map_generation += 1;
             self.import_chunk_ticks(p);
         }
         if let Some(g) = &mut self.generator {

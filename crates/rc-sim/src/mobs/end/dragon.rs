@@ -1,4 +1,4 @@
-//! Ender Dragon (F15): own tick (the game calls neither the common AI nor movement), flight
+//! Ender Dragon: own tick (the game calls neither the common AI nor movement), flight
 //! history, eight parts (ids reserved right after the dragon), healing by the closest crystal,
 //! flight toward the phase target, contacts (wings: knockback and 5 damage, head and neck: 10),
 //! blocks crossed (removed if the rule allows, otherwise a "wall" that slows), damage by the part
@@ -147,12 +147,11 @@ pub(super) fn contact_boxes_union(d: &Dragon) -> rc_physics::Aabb {
     })
 }
 
-/// `RUSTCRAFT_OPT_DRAGON_STATE_LEND_WITHOUT_CLONE=1`: the dragon's state is moved into the mob
-/// for every thorns or after-hit effect instead of deep-copied. Off: on the micro-bench the two
-/// copies of the whole state it makes cost as much as the copy of its few lists (95 against
-/// 88 ns per lend, loaded machine); kept for the quiet-machine bench.
+/// `RUSTCRAFT_OPT_DRAGON_STATE_LEND_WITHOUT_CLONE=0`: the dragon's state is deep-copied into the
+/// mob for every thorns or after-hit effect instead of moved (95 to 98 against 104 to 110 ns per
+/// lend of the 1,768-byte state, real lend both ways, loaded machine).
 fn lend_without_clone_enabled() -> bool {
-    rc_data::opt_switch!("RUSTCRAFT_OPT_DRAGON_STATE_LEND_WITHOUT_CLONE", default_off)
+    rc_data::opt_switch!("RUSTCRAFT_OPT_DRAGON_STATE_LEND_WITHOUT_CLONE")
 }
 
 /// `RUSTCRAFT_OPT_DRAGON_SHARED_CONTACT_SCAN=0`: each of the four contact boxes walks the mob
@@ -510,10 +509,23 @@ impl Server {
     /// mob (damage reception reads the phase and accumulates the sitting-phase damage), then
     /// takes it again with what changed.
     fn with_dragon_state_lent(&mut self, m: &mut Mob, d: &mut Dragon, f: impl FnOnce(&mut Server, &mut Mob)) {
+        self.lend_dragon_state(m, d, lend_without_clone_enabled(), f);
+    }
+
+    /// [`Server::with_dragon_state_lent`] with the way of lending chosen by the caller, so tests
+    /// and the bench run both ways in one process: `move_out` moves the state into the mob,
+    /// otherwise the mob gets a deep copy.
+    pub(super) fn lend_dragon_state(
+        &mut self,
+        m: &mut Mob,
+        d: &mut Dragon,
+        move_out: bool,
+        f: impl FnOnce(&mut Server, &mut Mob),
+    ) {
         // Moving the state out leaves an empty default behind (no list allocated) instead of a
         // deep copy of its flight graph and paths. Nothing called here takes the state out of the
         // mob for good, so it always comes back.
-        let lent = if lend_without_clone_enabled() { std::mem::take(d) } else { d.clone() };
+        let lent = if move_out { std::mem::take(d) } else { d.clone() };
         m.end.dragon = Some(Box::new(lent));
         f(self, m);
         if let Some(back) = m.end.dragon.take() {
@@ -542,7 +554,7 @@ impl Server {
         });
     }
 
-    // Player push (`push`): `player_push`, shared with F14 (`recent/mod.rs`).
+    // The wings push the player through `player_push`, shared with the other recent mobs (`recent/mod.rs`).
 
     /// Non-empty blocks outside `dragon_transparent` removed (without loot) if the
     /// rule allows and outside `dragon_immune`, otherwise "wall". A removed block: event 2008

@@ -1199,7 +1199,6 @@ impl crate::server::Server {
                     let p = (c.x, c.z);
                     g.pending.remove(&p);
                     self.chunks.insert(p, Some(c));
-                    self.chunk_map_generation += 1;
                     arrived.push((p, ents));
                 }
                 Out::Relight(p, sky, block) => relit.push((p, sky, block)),

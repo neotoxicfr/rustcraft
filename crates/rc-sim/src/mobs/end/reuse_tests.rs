@@ -126,8 +126,8 @@ fn command_view_of_crystals_follows_random_changes() {
     crate::tests_g3f13::finish(p, dir);
 }
 
-/// The arena ticket memo is dropped when the chunk map changes: a ticket chunk that left the map
-/// is loaded again on the next fight tick.
+/// The arena ticket memo survives chunk insertions and is dropped when the chunk map is swapped:
+/// a ticket chunk that left the map is loaded again on the next fight tick.
 #[test]
 fn arena_ticket_memo_follows_the_chunk_map() {
     let (mut p, dir) = crate::tests_g3f13::open("end-arena-memo");
@@ -140,10 +140,15 @@ fn arena_ticket_memo_follows_the_chunk_map() {
     p.s.fight_tick();
     assert!(p.s.chunks.contains_key(&(9, -9)), "ticket chunk not loaded");
     p.s.fight_tick();
-    assert_eq!(p.s.mobs.end.arena_ticket_present_at, Some(p.s.chunk_map_generation), "memo not taken");
-    // A chunk leaving the map always comes with a new generation (a swap of the map).
+    assert_eq!(p.s.mobs.end.arena_ticket_present_at, Some(p.s.chunk_map_swaps), "memo not taken");
+    // A chunk entering the map (the player flying toward new chunks) keeps the memo.
+    let swaps = p.s.chunk_map_swaps;
+    p.s.ensure_loaded(&[(30, 30)]);
+    assert!(p.s.chunks.contains_key(&(30, 30)), "far chunk not loaded");
+    assert_eq!(p.s.chunk_map_swaps, swaps, "a chunk insertion dropped the arena memo");
+    // A chunk leaving the map always comes with a swap of the map.
     p.s.chunks.remove(&(9, -9));
-    p.s.chunk_map_generation += 1;
+    p.s.chunk_map_swaps += 1;
     p.s.fight_tick();
     assert!(p.s.chunks.contains_key(&(9, -9)), "stale memo: missing ticket chunk not reloaded");
     crate::tests_g3f13::finish(p, dir);
@@ -243,6 +248,33 @@ fn shared_dragon_contact_walk_matches_a_walk_per_box() {
     crate::tests_g3f13::finish(p, dir);
 }
 
+/// A dragon state with lists in it: flight graph and a hold path.
+fn dragon_with_lists(p: &mut crate::blocks::probe::Probe, at: [f64; 3]) -> (super::super::mob::Mob, Box<Dragon>) {
+    let (m, mut d) = dragon_at(p, at);
+    d.graph.build(|_, _| 64);
+    d.ph.hold_path = Some(super::graph::Path { nodes: vec![[0, 64, 0]; 8], next: 0 });
+    (m, d)
+}
+
+/// Both ways of lending the state to the mob for a thorns hit hand the mob the whole state and
+/// get it back whole, whatever the switch says in this process.
+#[test]
+fn dragon_state_lent_both_ways_comes_back_whole() {
+    let (mut p, dir) = crate::tests_g3f13::open("end-dragon-lend");
+    for move_out in [false, true] {
+        let (mut m, mut d) = dragon_with_lists(&mut p, [24.5, -59.0, 24.5]);
+        let state = debug_text(&d);
+        p.s.lend_dragon_state(&mut m, &mut d, move_out, |s, m| {
+            let lent = m.end.dragon.as_ref().map(debug_text);
+            assert_eq!(lent.as_ref(), Some(&state), "mob not lent the whole state (move_out {move_out})");
+            s.player_thorns(m, "minecraft:mob_attack");
+        });
+        assert_eq!(debug_text(&d), state, "dragon state lost while lent (move_out {move_out})");
+        assert!(m.end.dragon.is_none(), "state left in the mob after the lend (move_out {move_out})");
+    }
+    crate::tests_g3f13::finish(p, dir);
+}
+
 // ---------- Micro-benches (one core: this work is serial within a tick) ----------
 
 /// Nanoseconds per call of `f`, best of 5 rounds of `n` calls.
@@ -276,20 +308,24 @@ fn bench_end_crystal_snapshots() {
 #[test]
 #[ignore = "measurement bench"]
 fn bench_end_dragon_state_lend() {
-    let mut d = Dragon::default();
-    d.set_phase_initial();
-    d.graph.build(|_, _| 64);
-    d.ph.hold_path = Some(super::graph::Path { nodes: vec![[0, 64, 0]; 8], next: 0 });
-    let clone = ns_per_call(200_000, || {
-        let lent = Some(Box::new(std::hint::black_box(&d).clone()));
-        std::hint::black_box(lent);
-    });
-    let take = ns_per_call(200_000, || {
-        let lent = Some(Box::new(std::mem::take(&mut d)));
-        if let Some(back) = std::hint::black_box(lent) {
-            d = *back;
-        }
-    });
+    // The real lend, both ways, around an empty effect: each pays the same Box and the same move
+    // back (which frees the old lists after a copy).
+    let (mut p, dir) = crate::tests_g3f13::open("end-bench-lend");
+    let (mut m, mut d) = dragon_with_lists(&mut p, [24.5, -59.0, 24.5]);
+    let mut lend = |move_out: bool| {
+        ns_per_call(200_000, || {
+            p.s.lend_dragon_state(&mut m, &mut d, move_out, |_, m| {
+                std::hint::black_box(m);
+            });
+        })
+    };
+    // Alternating passes, best of each: the order of the two ways does not favour one.
+    let (mut clone, mut take) = (f64::MAX, f64::MAX);
+    for _ in 0..3 {
+        clone = clone.min(lend(false));
+        take = take.min(lend(true));
+    }
+    crate::tests_g3f13::finish(p, dir);
     let size = std::mem::size_of::<Dragon>();
     eprintln!(
         "bench_end_dragon_state_lend ({size} bytes): deep copy {clone:.0} ns, move out and back {take:.0} ns per lend"

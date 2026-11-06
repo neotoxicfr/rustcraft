@@ -5678,17 +5678,18 @@ deep-copied the dragon's state. Switches, default = new, `=0` = old (read once):
   tick: rejected (functions before the walk must see the previous tick).
 - `RUSTCRAFT_OPT_CRYSTAL_TRACKING_SKIP_EMPTY`: no crystal, no tracking pass.
 - `RUSTCRAFT_OPT_ARENA_TICKET_MEMO`: "every ticket chunk is present" remembered with a new chunk map
-  generation (`chunk_map_generation`, bumped by every insertion and by the dimension swap, the only
-  way a chunk leaves the map).
+  swap count (`chunk_map_swaps`, bumped only by the dimension swap, the only way a chunk leaves
+  the map; an insertion only adds keys, so chunks arriving while the player flies keep the memo).
 - `RUSTCRAFT_OPT_DRAGON_SHARED_CONTACT_SCAN`: one walk over the union of the four contact boxes,
   each box filters it while no box has touched anyone; after the first contact (something may
   have moved, died, teleported or appeared, a reinforcement in a reused slot included) every
   remaining box walks the list again, as before.
 - `RUSTCRAFT_OPT_DRAGON_NAME_CLONE_ON_CHANGE`: the name is cloned only when the bar takes it.
-- `RUSTCRAFT_OPT_DRAGON_STATE_LEND_WITHOUT_CLONE` (OFF by default, `=1` turns it on): the state is
-  moved into the mob and back instead of copied. It allocates one block instead of four, but
-  moving the whole state twice costs what the copy of its few lists costs: kept for the
-  quiet-machine bench.
+- `RUSTCRAFT_OPT_DRAGON_STATE_LEND_WITHOUT_CLONE`: the state is moved into the mob and back
+  instead of copied (one block allocated instead of four, the old lists no longer freed after
+  each hit). A first bench, which left out the move back in the copy case only, had it losing
+  (95 against 88 ns) and the switch off; measured on the real lend both ways (same box, same move
+  back, alternating passes), it wins.
 
 Proof (`mobs/end/reuse_tests.rs`, plus test-only checks inside the code that every End test
 runs): reused compounds against a full rebuild after 4,000 random changes (signed zero, NaN,
@@ -5696,8 +5697,10 @@ reversed order, removals, a loaded compound with extra tags) and after every tic
 crystals are added, killed, beamed and pushed at random ticks (the compound a command reads equals
 the crystal's save); an unchanged End rebuilds nothing; each box's shared list against a walk of
 its own (zombie bitten by the head only, dying zombie killed by the head and no longer seen by the
-neck); the dragon state comes back whole; the arena memo dropped by a map change (missing chunk
-loaded again); a named dragon renames the bar once. Seven sabotages fail them (see the commit).
+neck); the dragon state lent both ways (moved and copied, called directly, whatever the switch)
+reaches the mob whole and comes back whole; the arena memo kept by a chunk insertion and dropped
+by a map swap (missing chunk loaded again); a named dragon renames the bar once. Eight sabotages
+fail them (see the commits).
 
 | One core, loaded machine | former | new |
 |---|---|---|
@@ -5705,7 +5708,7 @@ loaded again); a named dragon renames the bar once. Seven sabotages fail them (s
 | crystal tracking without crystals, per tick (all scenes) | ≈ 33 ns (kind lookup) | 0 |
 | arena ticket, per fight tick | 594 ns (361 lookups) | 1 comparison |
 | dragon contacts, 300 mobs in the world, no contact | 3,968 ns (4 walks) | 1,027 ns |
-| dragon state lent to the mob, per target hit (state 1,4xx bytes) | 88 ns | 95 ns (kept off) |
+| dragon state lent to the mob, per target hit (state 1,768 bytes) | 104 to 110 ns (copy) | 95 to 98 ns (move) |
 
 Multi-core and GPU: not applicable (server thread state, game order of the hits). Not done:
 `rule()` read once per dragon tick in the wall test (C6-M33); `arena_loaded` (17 + 9 lookups:

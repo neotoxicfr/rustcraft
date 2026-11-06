@@ -291,17 +291,17 @@ impl Server {
     /// within 8 have their neighbours and tick their blocks. Missing chunks are loaded.
     fn fight_hold_arena_ticket(&mut self) {
         let memo = arena_ticket_memo_enabled();
-        // Chunks are only dropped by a swap of the whole map, which bumps the generation: while it
-        // has not moved since every ticket chunk was seen, they are all still there.
-        let generation = self.chunk_map_generation;
-        if memo && self.mobs.end.arena_ticket_present_at == Some(generation) {
+        // Chunks are only dropped by a swap of the whole map and insertions only add keys: while no
+        // swap happened since every ticket chunk was seen, they are all still there.
+        let swaps = self.chunk_map_swaps;
+        if memo && self.mobs.end.arena_ticket_present_at == Some(swaps) {
             #[cfg(test)]
             assert!(self.arena_ticket_present(), "arena ticket memo kept after a chunk left the map");
             return;
         }
         if self.arena_ticket_present() {
             if memo {
-                self.mobs.end.arena_ticket_present_at = Some(generation);
+                self.mobs.end.arena_ticket_present_at = Some(swaps);
             }
             return;
         }
@@ -1089,7 +1089,7 @@ impl Server {
 mod summon_tests {
     use super::{Fight, Stage};
 
-    /// G1-F02: dragon respawned, player in the fight bar: `summoned_entity`
+    /// Dragon respawned, player in the fight bar: `summoned_entity`
     /// ("The End... Again..."); test world absent: test skipped.
     #[test]
     fn respawned_dragon_summons() {
@@ -1110,7 +1110,7 @@ mod summon_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// L9-TICK: the fight's ticket also ticks the blocks of the arena (see the shared body).
+    /// The fight's ticket also ticks the blocks of the arena (see the shared body).
     #[test]
     fn fight_ticket_ticks_the_blocks_of_the_arena() {
         crate::tests_l9tick::fight_ticket_ticks_the_blocks_of_the_arena(|| {
@@ -1120,7 +1120,7 @@ mod summon_tests {
         });
     }
 
-    /// G3-F13: the fight's ticket (players in the fight) makes the arena "ticking entities" for
+    /// The fight's ticket (players in the fight) makes the arena "ticking entities" for
     /// every entity, not only the dragon: a mob 6 chunks from the origin, beyond the simulation
     /// distance, ticks (falls); 8 chunks away, or without players in the fight, it waits.
     #[test]

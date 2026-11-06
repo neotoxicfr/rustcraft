@@ -1,4 +1,4 @@
-//! Ender Dragon, the End fight and shulker (family F15, `server-mobs.md` § 4.F15).
+//! Ender Dragon, the End fight and shulker (`server-mobs.md` § 4.F15).
 //! Info sheets, own mob state (dragon, shulker), world state (crystals, breath clouds, dragon
 //! fireballs, shulker bullets, fight) and hooks called by the common engine (`mobs/`). The
 //! dragon has its own tick (`dragon.rs`, without common AI or movement), its phases
@@ -17,7 +17,7 @@ pub(crate) mod shulker;
 
 #[cfg(test)]
 mod tests;
-// Dragon gaze along its head (mission G4-F16a).
+// Dragon gaze along its head.
 #[cfg(test)]
 mod head_tests;
 #[cfg(test)]
@@ -120,8 +120,8 @@ pub struct EndWorld {
     pub snapshots: Vec<(i32, Nbt)>,
     /// Fields each entry of `snapshots` was built from, to rebuild only the changed ones.
     pub(crate) snapshot_fields: Vec<crystal::SavedFields>,
-    /// Chunk map generation (`Server::chunk_map_generation`) at which every chunk of the arena
-    /// ticket was found present: the 19 × 19 lookups are skipped until the map changes.
+    /// Chunk map swap count (`Server::chunk_map_swaps`) at which every chunk of the arena
+    /// ticket was found present: the 19 × 19 lookups are skipped until the map is swapped.
     pub(crate) arena_ticket_present_at: Option<u64>,
     /// Direct entity of the current damage (arrow, wind charge: nothing in the sitting phase;
     /// shulker bullet: teleportation and duplication).

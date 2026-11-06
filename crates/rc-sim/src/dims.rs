@@ -231,7 +231,7 @@ impl Server {
         self.raids_on_park(); // L10-ENT: same for the raid bars
         swap(&mut self.dim, &mut w.dim);
         swap(&mut self.chunks, &mut w.chunks);
-        self.chunk_map_generation += 1;
+        self.chunk_map_swaps += 1;
         swap(&mut self.entities, &mut w.entities);
         swap(&mut self.bs, &mut w.bs);
         swap(&mut self.generator, &mut w.generator);
