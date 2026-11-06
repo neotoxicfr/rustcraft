@@ -5660,3 +5660,85 @@ profile, machine loaded by other agents compiling, best of 5 or 7; three runs, t
   decorations, noise floors), `crowd-1000`, `tnt`, `dropped-items` (collision walks); memstats at
   world opening (−1 MB of heap expected).
 
+## C6-M09: trial spawners, vaults, monster spawners and natural spawns without per-tick copies or rewrites (07/11, loaded machine)
+
+Before: every loaded trial spawner copied its whole block entity on every tick, decoded both
+configurations by copying their spawn potentials and strings, read its state as a string, then
+rewrote seven fields through `be_get_mut`, which marked its chunk for saving on every tick (every
+autosave re-encoded every chunk holding a trial spawner, idle or not; the official spawner marks
+its chunk only on a state change, new spawn data or the ominous switch: a save-timing fidelity
+gain, A3). A vault decoded a copy of its block entity on the 19 ticks out of 20 where nothing
+happens; a monster spawner copied its block entity before testing the player range, and on each
+of the 200 to 800 ticks of its countdown. A natural spawn pass rebuilt two hash sets (289+
+insertions), called `sim_centers` three times, read the biome JSON for every counted mob, and
+walked the NBT of every structure piece on every attempt (a fortress has hundreds; the spawn
+list was read twice at the drawing position). Switches, default = new, `=0` = old, read once
+(`SpawnPaths`, spawn.rs):
+- `RUSTCRAFT_OPT_TRIAL_WRITE_ON_CHANGE`: the block entity is written only when the write would
+  change it (`trial_stored_as`, field by field, no allocation); a field kept in another form (`Int`
+  time, duplicated UUID, empty list, `Long` total, spawn data without entity) is still normalized.
+- `RUSTCRAFT_OPT_TRIAL_BORROW`: block entity read in place, configuration sharing the pack's NBT
+  (`TrialSpawnSettings`: six numbers decoded, lists read in place, eject list built only when a
+  reward is ejected; an inline configuration is still copied, rare), state read from the block
+  property, block entity found once per tick (its rank rechecked before the write: a state change
+  may shift the chunk's list). `trial_tick` split into one function per state (`TrialState`).
+- `RUSTCRAFT_OPT_VAULT_EARLY_EXIT`: paused vault that does not cycle its display leaves before
+  decoding (exact: nothing would be dirty); otherwise decoded in place.
+- `RUSTCRAFT_OPT_SPAWNER_RANGE_FIRST`, `RUSTCRAFT_OPT_SPAWNER_BORROW`: range read on the block
+  entity; countdown written in place (`Delay`, chunk not marked, like the former store); copy only
+  when it fires (the borrow implies the range test first). Spawner minecarts too.
+- `RUSTCRAFT_OPT_SPAWN_CENSUS`: spawn chunks counted (union of the 17 × 17 squares by a Chebyshev
+  test) and listed (a chunk covered by an earlier player's square is skipped) without sets;
+  centers read once; costs memoized per (biome index, species) for the pass; charges gathered
+  only when a category may spawn, still before the chunk loop (its thunderstorms add mobs).
+- `RUSTCRAFT_OPT_STRUCTURE_STARTS`: starts decoded once per pass (`DecodedStarts`: exact without
+  invalidation, a pass changes no structure and loads no chunk; dropped at its end, so a
+  `/place structure` or a start chunk loaded later is seen by the next pass), pieces grouped by
+  chunk column on the first piece query (pieces wider than 32 chunks per axis tested apart), the
+  list not read again at the position the entry was drawn from.
+- `RUSTCRAFT_OPT_SPAWN_PLACEMENT_FIRST`, OFF by default: placement tested before the list. With
+  decoded lists the list is the cheaper test away from structures (the placement test allocates a
+  block name): +7 allocations per pass on the flat world (deterministic count). Kept behind its
+  switch for the fortress scene.
+
+Proof: `tests_spawn_paths` (each run in its own thread, former paths against the default and each
+path alone): trial chamber over 2,000 ticks (normal then ominous, player leaving and coming back
+with Bad Omen, mobs killed, key inserted, `/data merge` in a non-normalized form): blocks, block
+entities, every packet, mobs, world random and the vault chunk's dirty flag identical on every
+tick; the trial spawner's chunk is marked on 23 ticks instead of 2,000, never while idle. Monster
+spawner over 1,000 ticks in and out of range. Natural spawns over 2,000 ticks with a LAN guest
+(overlapping squares, census 340), day, night, thunderstorm with skeleton horse traps forced on
+every tick, spawns cut for a while, soul sand valley costs and structures. Structure lists of
+10,000 positions around a 300-piece fortress, an outpost, a witch hut, an `INVALID` start, a
+start without readable box and a reference to an unloaded start (fingerprint frozen), then a
+start placed live and a start chunk loaded later. Memoized costs = pack for every biome and
+species; union count = set; `trial_write_skipped_only_when_unchanged`. Nine sabotages fail them
+(see the commit).
+
+| Block entity phase, flat world, loaded machine, 2 passes | allocations per tick | ns per block (former → new) | chunks marked per 1,000 ticks |
+|---|---|---|---|
+| 64 trial spawners waiting (registry configs) | 4,612 → 324 (borrow alone 644) | 1,416-2,249 → 734-821 | 6 → 0 |
+| 64 trial spawners fighting, nobody near | 5,767 → 455 | 3,088-3,139 → 1,253-1,330 | 6 → 0 |
+| 32 vaults idle | 422 → 10.6 | 451-705 → 213-250 | 3 → 3 |
+| 32 monster spawners out of range | 481 → 1 | 550-834 → 229-357 | 0 → 0 |
+| 32 monster spawners counting down | 976 → 5.4 | 1,085-1,403 → 477-519 | 0 → 0 |
+
+Each switch alone: write on change alone keeps the allocations (an idle spawner's store
+allocated nothing) and removes the marks; borrow alone gives most of the time and allocations;
+range first alone removes the copy out of range (976 → 886 counting down: the copy then happens
+after the test); the countdown in place removes the rest. Natural spawn pass (flat world at night,
+70 zombies, a LAN guest, half in soul sand valley): allocations 661.2 → 647.6 per pass (census
+647.2, structure starts 661.6, placement first 668.3), time 116-122 → 98-190 µs (too noisy on
+this machine). Structure list per position, one pass of 10,000 positions: 2,024-3,658 → 174-281
+ns (× 11-13); a pass of a single attempt (worst case: decoding for one query) 4,800-9,500 ns, i.e.
+≈ 3 former reads per start touched per pass. Remaining per trial spawner tick: about 5
+allocations (spawn data copied by `trial_load`; reading it in place would need the block entity
+borrowed across the tick). Memory: per pass, the decoded starts (≈ 24 bytes per piece plus the
+column table) and a few cost entries, dropped at its end. Multi-core and GPU: not applicable
+(server thread, the spawner blocks and spawns draw from the shared world random in order).
+Not done: a persistent starts cache kept with the chunk (needs a single setter for
+`root.structures` in chunk.rs, cmds_locate, generation: blocks/chunks group); `p_structure_at`
+(progress/pred.rs, same walk) is left to C6-M14; `be_index` stays linear (P13). To settle on the
+quiet-machine scene bench: `chambre-epreuve` (Job::Chunk per autosave, bytes written), `plains12`,
+`plains32`, `village`, `redstone` (be_tick_run at the profile), `forteresse-nether` (tick median
+and p99, with placement first on and off).
