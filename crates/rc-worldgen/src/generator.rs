@@ -94,6 +94,9 @@ pub struct NoiseSettings {
     /// Fields for part 2 (aquifers, material rules), raw.
     pub aquifers: Option<Json>,
     pub material_rule: Option<Json>,
+    /// Spawn search targets, raw (`RUSTCRAFT_OPT_NOISE_SETTINGS_READ_ONCE`; `None` on the old path,
+    /// which parses the file again).
+    pub spawn_target: Option<Json>,
 }
 
 pub const ROUTER_FIELDS: [&str; 8] =
@@ -132,6 +135,7 @@ impl NoiseSettings {
             ],
             aquifers: j.get("aquifers").cloned(),
             material_rule: j.get("material_rule").cloned(),
+            spawn_target: if crate::opt::noise_settings_read_once() { j.get("spawn_target").cloned() } else { None },
         })
     }
 }
@@ -166,7 +170,8 @@ pub struct Generator {
 
 impl Generator {
     pub fn new(pack: &DataPack, settings_id: &str, seed: i64) -> Result<Self, Error> {
-        Self::with_defs(Arc::new(Defs::load(pack)?), NoiseSettings::load(pack, settings_id)?, seed)
+        let defs = if crate::opt::shared_generator_defs() { pack.generator_defs()? } else { Arc::new(Defs::load(pack)?) };
+        Self::with_defs(defs, NoiseSettings::load(pack, settings_id)?, seed)
     }
 
     pub fn with_defs(defs: Arc<Defs>, settings: NoiseSettings, seed: i64) -> Result<Self, Error> {
@@ -276,6 +281,9 @@ impl Generator {
 
     /// Instance of the noise `id` (shared with the density functions), created as needed.
     pub fn noise(&mut self, id: &str) -> Result<u32, Error> {
+        if crate::opt::noise_lookup_before_clone() {
+            return self.noise_instance(id);
+        }
         let params = self.defs.noises.get(id).ok_or_else(|| Error::Missing(format!("noise {id}")))?.clone();
         let legacy_offset = match id {
             "minecraft:nether/temperature" => Some(0),
@@ -294,6 +302,34 @@ impl Generator {
         self.program.noises.push(stack);
         let i = (self.program.noises.len() - 1) as u32;
         self.noise_index.insert(id.to_owned(), i);
+        Ok(i)
+    }
+
+    /// [`Self::noise`] that looks for an instance already created before touching the parameters,
+    /// and reads them in place (the old path copied them at every use, found or not). The
+    /// Nether's two legacy noises still get a fresh instance at each use.
+    fn noise_instance(&mut self, id: &str) -> Result<u32, Error> {
+        let legacy_offset = match id {
+            "minecraft:nether/temperature" => Some(0),
+            "minecraft:nether/vegetation" => Some(1),
+            _ => None,
+        };
+        if legacy_offset.is_none()
+            && let Some(&i) = self.noise_index.get(id)
+        {
+            return Ok(i);
+        }
+        let defs = self.defs.clone();
+        let params = defs.noises.get(id).ok_or_else(|| Error::Missing(format!("noise {id}")))?;
+        let stack = match legacy_offset {
+            Some(o) => params.create_legacy_nether(&mut Rng::legacy(self.seed.wrapping_add(o))),
+            None => params.create(&mut self.positional.from_hash_of(id)),
+        };
+        self.program.noises.push(stack);
+        let i = (self.program.noises.len() - 1) as u32;
+        if legacy_offset.is_none() {
+            self.noise_index.insert(id.to_owned(), i);
+        }
         Ok(i)
     }
 
