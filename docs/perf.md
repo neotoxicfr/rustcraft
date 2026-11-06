@@ -5660,3 +5660,99 @@ profile, machine loaded by other agents compiling, best of 5 or 7; three runs, t
   decorations, noise floors), `crowd-1000`, `tnt`, `dropped-items` (collision walks); memstats at
   world opening (−1 MB of heap expected).
 
+## C7-M04: build profile, the shipped `dist` profile, the build matrix, rule B11 (06/11, loaded machine)
+
+Build-only mission: no runtime switch exists for a compiler setting. Its switch is a matrix of
+executables of one commit, each a clean build with one setting changed, compared on the scene bench.
+Every lead needs the full profile and a quiet machine: the expected gain (0 to 2 % of our CPU for
+fat LTO) is far below the noise of a loaded machine (medians of one variant spread ×1.5 to ×1.9,
+C6-M37A), and the build time and memory peak are results. This mission puts the means in place,
+proves them, measures what a loaded machine can show, and leaves every decision to the quiet bench.
+
+- Shipped profile: `[profile.dist] inherits = "release"`, no setting of its own yet. `release.yml`
+  and `reproducibility.yml` build `cargo build --locked --profile dist -p rc-app` and package
+  `target/dist/rustcraft(.exe)`; the local recipe of `docs/reproducible-builds.md` likewise. A
+  setting meant for the shipped file only (fat LTO if it wins, `panic = "abort"` if the user
+  decides it, C7-M14) goes into `dist`; tests, clippy and the `prepare` example keep `release`
+  (unwinding: the test harness needs it), so nothing is compiled twice, and `ci.yml` never builds
+  `dist`. While `dist` has no setting of its own, the launcher copy built with
+  `RUSTCRAFT_FULL_RELEASE=1 ... build --release` is the same program; once it has one, the copy is
+  built with `--profile dist` (`target/dist/rustcraft.exe`).
+  Proof (`tools/release/test_release.py`, 22 tests): `test_shipped_file_comes_from_the_dist_profile`
+  (both workflows build `dist` and package `target/dist`, no `target/release/` left, the local
+  recipe checks `target/dist`) and `test_dist_starts_from_release_and_release_keeps_unwinding`.
+  Sabotages, each failing: `panic = "abort"` in `release`; `dist` inheriting `dev`; `release.yml`
+  packaging `target/release`; the rehearsal building `--release` (3 tests fail).
+  Through the compilation queue, whose `CARGO_PROFILE_RELEASE_*` are merged into `release` before
+  `dist` inherits it (so the codegen is the trial one; the queue proves the plumbing):
+  `cargo build --profile dist -p rc-app` builds (214 crates, 217 s, executable 46,765,568 B), and
+  `cargo test --profile dist -p rc-app` with the test world: 797 passed, 0 failed, 44 ignored.
+  `clippy --release -p rc-app --all-targets -D warnings`: clean.
+- Build matrix: `tools/bench/build_matrix.py` (`list`, `build <out> [--variant ...]`,
+  `test <out> --variant V [--package P] [-- args]`). Each variant is
+  `cargo build --locked --profile dist -p rc-app --timings` in its own target folder with its
+  settings as `--config`; the environment of the trial profile (`CARGO_PROFILE_*`, `RUSTFLAGS`, a
+  linker, target folder, job count or compiler wrapper) is removed from cargo's environment, so a
+  variant differs from the shipped build by its own setting only. It records the clean build time,
+  the memory peak of the build processes (sampled twice a second: quiet machine only), the `.text`
+  size, the file size and the sha256 in `<out>/matrix.json`, and copies the executable, its PDB and
+  cargo's timing page (critical path) to `<out>/exes/`. `test` builds and runs the suite with the
+  same settings (it refuses to run without `RUSTCRAFT_SOLO_WORLD`). Variants:
+
+  | Variant | Setting on top of `dist` | Lead |
+  |---|---|---|
+  | `shipped` | none | reference |
+  | `shipped-layout-salt` | `-C metadata=layout-salt` on every crate | code-layout noise |
+  | `fat-lto` | `lto = "fat"` | fat against thin |
+  | `fat-lto-panic-abort` | `lto = "fat"`, `panic = "abort"` | with C7-M14 (user decision) |
+  | `critical-path-units-4` / `-8` / `-16` | `codegen-units = N` for rc-sim and rc-app | build time of the critical path |
+  | `cold-crates-opt-2` / `cold-crates-opt-size` | `opt-level = 2` / `"s"` for naga, rustls, ureq, regex, zip, skrifa | size and build time of cold code |
+  | `rust-lld` | Windows linker `rust-lld` | link time |
+
+  Never rc-commands (command blocks and `/test` run every tick) nor wgpu / wgpu-core (they encode
+  every frame) among the cold crates. Under LTO the cold opt-level only changes the optimisation
+  before the LTO step: to be measured before it is adopted. Tests
+  (`tools/bench/test_build_matrix.py`, 11, CI tools job): every variant is the shipped build plus
+  its own settings, every setting is valid cargo TOML, the named crates are in `Cargo.lock` (a
+  misspelt package in a profile override is only a warning), the hot crates stay out, the trial
+  environment never reaches cargo, `.text` comes from the PE section table (virtual size), memory
+  figures are read in any locale. Sabotages, each failing: the `CARGO_PROFILE_` variables kept,
+  rc-commands marked cold, a misspelt crate, the raw size read instead of the virtual size, tests
+  without `--workspace`, no timing page. The settings reach rustc (queue, `cargo build --profile
+  dist -p rc-env -v` with three `--config`): 88 rustc runs, all with `-C metadata=layout-salt`
+  and the committed `/Brepro` (cargo joins the two rustflags lists), `-C codegen-units=4` on
+  rc-env only, `-C opt-level=s` on zip only.
+- Method (written into the protocol, B11): every build or micro-bench of a toolchain lead uses the
+  shipped settings (`--profile dist`, `RUSTCRAFT_FULL_RELEASE=1` in the queue), never the trial
+  profile. Two builds with the same settings are byte-identical since C7-M10, so the "two base
+  executables" of the plan would measure run noise only; the code-layout noise comes from
+  `shipped-layout-salt` (an extra metadata salt changes every symbol hash, so the order of the
+  generic instances inside each object and every address, the code staying the same). Checked
+  through the queue (trial codegen, rust-lld, same target folder, only the salt changed): `.text`
+  36,006,518 → 36,006,454 B (−64 B), 91.3 % of its bytes differ, the first at offset 0.
+- rust-lld for the release: not adopted. Link alone on the trial objects (no LTO, 16 units, no debug
+  info), the linkers' own timers (`-C link-arg=/time -W linker-messages`), 2 alternating passes:
+  rust-lld 434 / 485 ms, MSVC `link.exe` 14.51 781 / 782 ms, so about −0.3 s per link. Against it:
+  an lld executable with a PDB is not reproducible (C7-M10: the PDB GUID hashes the random
+  `rustcXXXXXX/symbols.o` folder), `rust-lld -flavor link` of 1.99.0 has no option that renames the
+  object paths in the PDB (`/pdbsourcepath` only completes relative source paths), and `/DEBUG:NONE`
+  drops the PDB (function names for samply and `tools/hot_map.py`, the crash report's backtrace).
+  The local full build and the release are already linked alike (`link.exe`; only the trial
+  profile uses lld), so `.cargo/config.toml` keeps `link.exe`. The `rust-lld` variant measures the
+  link time with LTO and line tables and the scene CPU on the quiet machine; to adopt it, the
+  hot map regenerated from its PDB must name the same functions on one scene.
+- Fat LTO on the runners: the release job has 16 GB and 120 minutes. Before `lto = "fat"` goes into
+  `dist`, a branch with it and a manual start of `Reproducibility` (4 builds of `dist`) gives the
+  build time and shows whether the runner holds the memory.
+- To do on the quiet machine, one compilation at a time: `build_matrix.py build target/matrix`
+  (10 clean builds of the full profile); `scenes.py run --exe target/matrix/exes/shipped.exe --exe
+  target/matrix/exes/<variant>.exe`, 2 alternating passes, CPU of the main thread per frame, tick
+  median and p99: `crowd-1000`, `tnt`, `redstone`, `cave`, `plains32` for the LTO, unit and linker
+  variants, plus `title` (naga compiles the shaders at startup) for the cold crates, `generation`
+  and `village`; the tick micro-bench per variant (`test target/matrix --variant V --package rc-sim
+  -- bench_ticks -- --ignored --nocapture`, 1 thread and all threads); then `test` of every variant
+  kept, twice (the second time with `RUSTCRAFT_OPT_NOISE_AVX2=0`): tests_opt fingerprints
+  (`6a557b6a…`, `9abd8cbe…`), generation reference, mesh fingerprint, relight replay; 1600×900
+  screenshots (two executables are two launches: compare within the launch-to-launch noise,
+  about 76,000 pixels). A lead is adopted only beyond the `shipped-layout-salt` distance.
+

@@ -50,19 +50,20 @@ jobs:
         run: |
           echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
           python -I tools/release/hide_paths.py config "$RUNNER_TEMP/hide-paths.toml"
-      - name: Build (full release profile)
+      # `dist` is the shipped profile (Cargo.toml): `release` plus what only the shipped file gets.
+      - name: Build (shipped profile, dist)
         shell: bash
-        run: cargo build --locked --release -p rc-app --config "$RUNNER_TEMP/hide-paths.toml"
+        run: cargo build --locked --profile dist -p rc-app --config "$RUNNER_TEMP/hide-paths.toml"
       - name: Package for Windows
         if: runner.os == 'Windows'
         shell: bash
-        run: python -I tools/release/pack.py windows "${GITHUB_REF_NAME#v}" target/release/rustcraft.exe pkg
+        run: python -I tools/release/pack.py windows "${GITHUB_REF_NAME#v}" target/dist/rustcraft.exe pkg
       - name: Package for Linux
         if: runner.os == 'Linux'
         shell: bash
         run: |
           mkdir -p pkg
-          cp target/release/rustcraft pkg/rustcraft
+          cp target/dist/rustcraft pkg/rustcraft
           strip pkg/rustcraft
           python -I tools/release/pack.py linux "${GITHUB_REF_NAME#v}" pkg/rustcraft pkg
       # On the file that is shipped: before `strip`, the Linux executable also holds the debug info,
@@ -71,7 +72,7 @@ jobs:
         shell: bash
         run: |
           exe=pkg/rustcraft
-          if [ "$RUNNER_OS" = Windows ]; then exe=target/release/rustcraft.exe; fi
+          if [ "$RUNNER_OS" = Windows ]; then exe=target/dist/rustcraft.exe; fi
           python -I tools/release/hide_paths.py check "$exe"
       # One step and one format for both systems. PowerShell's Set-Content ended the Windows sum
       # with CRLF: `sha256sum -c` then reads the CR as part of the file name and fails. Git Bash's

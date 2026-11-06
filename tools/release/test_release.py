@@ -2,7 +2,8 @@
 whatever the date, the order and the place of the input files; path hiding writes a valid cargo
 config (C compiler included on Linux) and finds the paths left in a binary; the committed linker
 flag, the release/rehearsal build command, the commit date set before every build (local recipe
-included), the check of the shipped file and the rehearsal's second place stay as they must be. Expected values are stored here."""
+included), the check of the shipped file, the shipped `dist` profile and the rehearsal's second
+place stay as they must be. Expected values are stored here."""
 import gzip
 import io
 import os
@@ -21,6 +22,7 @@ import hide_paths  # noqa: E402
 import pack  # noqa: E402
 
 EPOCH = 1_767_225_600  # 2026-01-01 00:00:00 UTC
+SHIPPED_BUILD = "cargo build --locked --profile dist -p rc-app"
 PROGRAM = bytes(range(256)) * 40  # compressible but not trivial
 
 
@@ -146,7 +148,7 @@ class Workflows(unittest.TestCase):
         # so the local recipe and both workflows must set it before cargo builds the C code.
         def date_comes_before_build(text):
             date = text.find("SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)")
-            return date != -1 and date < text.index("cargo build --locked --release -p rc-app")
+            return date != -1 and date < text.index(SHIPPED_BUILD)
 
         for name in ("release.yml", "reproducibility.yml"):
             text = read_text(os.path.join(pack.ROOT, ".github", "workflows", name))
@@ -154,6 +156,25 @@ class Workflows(unittest.TestCase):
         doc = read_text(os.path.join(pack.ROOT, "docs", "reproducible-builds.md"))
         recipe = doc[doc.index("## Build the executable the way a release does"):]
         self.assertTrue(date_comes_before_build(recipe), "docs/reproducible-builds.md")
+
+    def test_shipped_file_comes_from_the_dist_profile(self):
+        # Settings meant for the published file only (fat LTO, panic = "abort") live in `dist`:
+        # both workflows and the local recipe build it and package what it writes.
+        for name in ("release.yml", "reproducibility.yml"):
+            text = read_text(os.path.join(pack.ROOT, ".github", "workflows", name))
+            self.assertIn(SHIPPED_BUILD, text, name)
+            self.assertIn("target/dist/rustcraft", text, name)
+            self.assertNotIn("target/release/", text, name)
+        doc = read_text(os.path.join(pack.ROOT, "docs", "reproducible-builds.md"))
+        self.assertIn("hide_paths.py check target/dist/rustcraft.exe", doc)
+
+    def test_dist_starts_from_release_and_release_keeps_unwinding(self):
+        # Tests, clippy and the `prepare` example build with `release`: a test harness needs
+        # unwinding, and `dist` must start from the settings everything else is checked with.
+        with open(os.path.join(pack.ROOT, "Cargo.toml"), "rb") as f:
+            profiles = tomllib.load(f)["profile"]
+        self.assertEqual(profiles["dist"]["inherits"], "release")
+        self.assertNotEqual(profiles["release"].get("panic"), "abort")
 
     def test_rehearsal_builds_twice_at_different_paths(self):
         text = read_text(os.path.join(pack.ROOT, ".github", "workflows", "reproducibility.yml"))
