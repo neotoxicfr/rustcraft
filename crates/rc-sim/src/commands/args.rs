@@ -184,9 +184,13 @@ pub fn angle(src: &Src, text: &str) -> f32 {
     }
 }
 
-/// Full identifier (`minecraft:` added).
+/// Full identifier: a missing or empty namespace (`stone`, `:stone`) is `minecraft`, like the game.
 pub fn id(s: &str) -> String {
-    if s.contains(':') { s.to_owned() } else { format!("minecraft:{s}") }
+    match s.split_once(':') {
+        None => format!("minecraft:{s}"),
+        Some(("", path)) => format!("minecraft:{path}"),
+        Some(_) => s.to_owned(),
+    }
 }
 
 /// Block state read: state, optional compound.

@@ -44,14 +44,13 @@ fn previous_index(len: usize, cur: Option<usize>) -> usize {
     }
 }
 
-/// Does a set of damage types (`#tag`, id or list) contain `ty`?
-fn holder_set_has(s: &Server, set: &Value, ty: &str) -> bool {
+/// Does a set of damage types (`#tag`, id or list of ids) contain `ty`? Identifiers without a
+/// namespace are in `minecraft`, like the game.
+pub(crate) fn damage_set_has(s: &Server, set: &Value, ty: &str) -> bool {
     match set {
-        Value::String(x) => match x.strip_prefix('#') {
-            Some(tag) => s.dmg_tag(ty, tag),
-            None => x == ty,
-        },
-        Value::Array(a) => a.iter().any(|v| holder_set_has(s, v, ty)),
+        Value::String(entry) => s.damage_set_entry_has(entry, ty),
+        // A list holds damage types only, never tags.
+        Value::Array(a) => a.iter().any(|v| v.as_str().is_some_and(|id| crate::mobs::combat::same_identifier(ty, id))),
         _ => false,
     }
 }
@@ -234,7 +233,7 @@ impl Server {
             return 0.0;
         }
         let Some((slot, _hand, ba)) = self.blocking_item() else { return 0.0 };
-        if ba.get("bypassed_by").is_some_and(|b| holder_set_has(self, b, ty)) {
+        if ba.get("bypassed_by").is_some_and(|b| damage_set_has(self, b, ty)) {
             return 0.0;
         }
         if src.piercing_arrow {
@@ -258,7 +257,7 @@ impl Server {
             if angle > f64::from(limit) {
                 continue;
             }
-            if r.get("type").is_some_and(|t| !holder_set_has(self, t, ty)) {
+            if r.get("type").is_some_and(|t| !damage_set_has(self, t, ty)) {
                 continue;
             }
             let base = r["base"].as_f64().unwrap_or(0.0) as f32;

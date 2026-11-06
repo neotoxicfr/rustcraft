@@ -423,20 +423,14 @@ impl Server {
 
     /// Damage type in a tag (`tags/damage_type`).
     fn damage_tag(&self, ty: &str, tag: &str) -> bool {
-        // Tags are stored under their full name (`minecraft:is_fall`): a short name is completed.
-        let full;
-        let tag = if tag.contains(':') {
-            tag
-        } else {
-            full = format!("minecraft:{tag}");
-            &full
-        };
+        // Tags are stored under their full name (`minecraft:is_fall`): a short name (`is_fall`,
+        // `:is_fall`) is read in `minecraft`, like the game.
         let Some(idx) = self.regs.entries("minecraft:damage_type").iter().position(|e| e == ty) else { return false };
         self.regs
             .tags
             .iter()
             .find(|(r, _)| r == "minecraft:damage_type")
-            .and_then(|(_, t)| t.iter().find(|(n, _)| n == tag))
+            .and_then(|(_, t)| t.iter().find(|(n, _)| crate::mobs::combat::same_identifier(n, tag)))
             .is_some_and(|(_, ids)| ids.contains(&(idx as i32)))
     }
 
@@ -519,7 +513,7 @@ impl Server {
         if !h.as_bool().or_else(|| h.as_i64().map(|n| n != 0)).unwrap_or(true) {
             return false;
         }
-        !self.resistant_tag(s).is_some_and(|t| self.damage_tag(ty, t.trim_start_matches('#')))
+        !self.item_resists(s, ty)
     }
 
     /// Damage refused outright: player dead or not ready, invulnerable, game rule.
