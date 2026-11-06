@@ -2,14 +2,17 @@
 //! block resistance, damage and knockback of entities (visible part), blocks destroyed with their
 //! loot (decay according to the rule), explosion packet to the player.
 
-use rc_client::{EntityEvent, Event};
+use rc_client::Event;
 use rc_proto_v777::entity::Particle;
 use rc_proto_v777::play::SoundRef;
 
+use super::blast_rays::{self, BlastPaths, CellEffect, ExplosionRules};
 use super::env::Fluid;
 use super::mob::{Ent, Mob};
 use super::mth::dist2;
+use crate::player::Stack;
 use crate::server::Server;
+use crate::tag_bits::TagId;
 
 /// Player behind an explosion's damage, read before any other player is installed.
 pub(crate) struct BlastAuthor {
@@ -34,6 +37,70 @@ thread_local! {
 #[cfg(test)]
 pub(crate) type BlastCells = ([f64; 3], Vec<[i32; 3]>);
 
+/// What the destruction phase looks up once per explosion (`RUSTCRAFT_OPT_BLAST_LOOKUPS_ONCE`).
+struct DestroyLookups {
+    tnt: u16,
+    air: u32,
+    block_drops: bool,
+}
+
+/// Size of the stacks an explosion groups its loot in.
+const BLAST_STACK: i32 = 16;
+
+/// An explosion's loot, grouped in stacks of at most 16, each dropped where its first item came
+/// from.
+#[derive(Default)]
+pub(crate) struct BlastLoot {
+    pub stacks: Vec<([i32; 3], Stack)>,
+    /// Indices of the stacks below 16, in order (`RUSTCRAFT_OPT_BLAST_OPEN_STACKS`): a full stack
+    /// takes nothing more, so a new drop is only compared with these.
+    open: Vec<usize>,
+    open_only: bool,
+}
+
+impl BlastLoot {
+    pub(crate) fn new(open_only: bool) -> BlastLoot {
+        BlastLoot { open_only, ..BlastLoot::default() }
+    }
+
+    /// Loot `d` of the block at `p` merged into the stacks of the same item, in order; what is
+    /// left starts a new stack at `p`.
+    pub(crate) fn add(&mut self, p: [i32; 3], mut d: Stack) {
+        if !self.open_only {
+            for (_, st) in self.stacks.iter_mut() {
+                if fill_stack(st, &mut d) {
+                    break;
+                }
+            }
+        } else {
+            for &i in &self.open {
+                if fill_stack(&mut self.stacks[i].1, &mut d) {
+                    break;
+                }
+            }
+            let stacks = &self.stacks;
+            self.open.retain(|&i| stacks[i].1.count < BLAST_STACK);
+        }
+        if d.count > 0 {
+            if d.count < BLAST_STACK {
+                self.open.push(self.stacks.len());
+            }
+            self.stacks.push((p, d));
+        }
+    }
+}
+
+/// Moves what fits of `d` into `st` when they are the same item; true once `d` is used up.
+fn fill_stack(st: &mut Stack, d: &mut Stack) -> bool {
+    if !crate::items::same(st, d) {
+        return false;
+    }
+    let room = (BLAST_STACK - st.count).max(0).min(d.count);
+    st.count += room;
+    d.count -= room;
+    d.count <= 0
+}
+
 /// Interaction of an explosion with blocks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Blast {
@@ -56,8 +123,10 @@ pub(crate) enum Blast {
 }
 
 impl Server {
+    /// Resistance of the cell at `p` to an explosion, `None` for air without fluid, read the
+    /// former way (one world read per test; the rays now read it once, `BlastWorld`).
     fn block_resistance(&self, p: [i32; 3]) -> Option<f32> {
-        let s = self.st(p);
+        let state = self.st(p);
         if self.is_air(p) && self.mob_fluid(p) == Fluid::None {
             return None;
         }
@@ -66,17 +135,17 @@ impl Server {
             Fluid::None => 0.0,
             _ => 100.0,
         };
-        let block = self.data.blast.get(s as usize).copied().unwrap_or(0.0);
+        let block = self.data.blast.get(state as usize).copied().unwrap_or(0.0);
         Some(block.max(fluid))
     }
 
     /// Visible part of a box from the centre.
     pub(crate) fn seen_percent(&self, center: [f64; 3], b: &rc_physics::Aabb) -> f32 {
-        let xs = 1.0 / ((b.max[0] - b.min[0]) * 2.0 + 1.0);
-        let ys = 1.0 / ((b.max[1] - b.min[1]) * 2.0 + 1.0);
-        let zs = 1.0 / ((b.max[2] - b.min[2]) * 2.0 + 1.0);
-        let xo = (1.0 - (1.0 / xs).floor() * xs) / 2.0;
-        let zo = (1.0 - (1.0 / zs).floor() * zs) / 2.0;
+        let step_x = 1.0 / ((b.max[0] - b.min[0]) * 2.0 + 1.0);
+        let step_y = 1.0 / ((b.max[1] - b.min[1]) * 2.0 + 1.0);
+        let step_z = 1.0 / ((b.max[2] - b.min[2]) * 2.0 + 1.0);
+        let offset_x = (1.0 - (1.0 / step_x).floor() * step_x) / 2.0;
+        let offset_z = (1.0 - (1.0 / step_z).floor() * step_z) / 2.0;
         let (mut hits, mut count) = (0, 0);
         let mut xx = 0.0;
         while xx <= 1.0 {
@@ -87,15 +156,15 @@ impl Server {
                     let x = b.min[0] + xx * (b.max[0] - b.min[0]);
                     let y = b.min[1] + yy * (b.max[1] - b.min[1]);
                     let z = b.min[2] + zz * (b.max[2] - b.min[2]);
-                    if !self.clip_blocks([x + xo, y, z + zo], center) {
+                    if !self.clip_blocks([x + offset_x, y, z + offset_z], center) {
                         hits += 1;
                     }
                     count += 1;
-                    zz += zs;
+                    zz += step_z;
                 }
-                yy += ys;
+                yy += step_y;
             }
-            xx += xs;
+            xx += step_x;
         }
         if count == 0 { 0.0 } else { hits as f32 / count as f32 }
     }
@@ -164,6 +233,7 @@ impl Server {
         ty: &str,
         blast: Blast,
     ) {
+        let paths = BlastPaths::current();
         // G5-F06: projectile direct source (taken before any chain explosion).
         let direct = self.carts.blast_direct.take();
         // L10-COMBAT: the projectile being resolved is the direct entity of its own explosion
@@ -182,115 +252,30 @@ impl Server {
             let src = Some(super::recent::vibration::Src::Living(Ent::Mob(m.id)));
             self.game_event_src("minecraft:explode", center, src, None);
         }
+        let mob_griefing = self.rule("minecraft:mob_griefing", true);
         let (griefing, decay) = match blast {
-            Blast::Mob => {
-                (self.rule("minecraft:mob_griefing", true), self.rule("minecraft:mob_explosion_drop_decay", true))
-            }
+            Blast::Mob => (mob_griefing, self.rule("minecraft:mob_explosion_drop_decay", true)),
             Blast::Block | Blast::Respawn(_) => (true, self.rule("minecraft:block_explosion_drop_decay", true)),
             Blast::Tnt(_) | Blast::TntCart { .. } => (true, self.rule("minecraft:tnt_explosion_drop_decay", false)),
             Blast::None(_) => (false, false),
         };
         // Dropped items, orbs, falling blocks: touched if the mob rule allows it
         // or if the explosion destroys blocks.
-        let blocklike =
-            self.rule("minecraft:mob_griefing", true) || matches!(blast, Blast::Block | Blast::Tnt(_) | Blast::TntCart { .. });
-        let rail_safe = matches!(blast, Blast::TntCart { primed: true });
-        let portal_immune = matches!(blast, Blast::Tnt(true) | Blast::None(true));
-        let nether_portal = self.table().block_id("nether_portal");
-        // 1. Blocks hit.
-        let mut toblow: Vec<[i32; 3]> = Vec::new();
-        let h = self.dim.height;
-        for xx in 0..16 {
-            for yy in 0..16 {
-                for zz in 0..16 {
-                    if !(xx == 0 || xx == 15 || yy == 0 || yy == 15 || zz == 0 || zz == 15) {
-                        continue;
-                    }
-                    let mut xd = f64::from(xx as f32 / 15.0 * 2.0 - 1.0);
-                    let mut yd = f64::from(yy as f32 / 15.0 * 2.0 - 1.0);
-                    let mut zd = f64::from(zz as f32 / 15.0 * 2.0 - 1.0);
-                    let d = (xd * xd + yd * yd + zd * zd).sqrt();
-                    xd /= d;
-                    yd /= d;
-                    zd /= d;
-                    let mut power = radius * (0.7 + self.mobs.rng.next_float() * 0.6);
-                    let (mut xp, mut yp, mut zp) = (center[0], center[1], center[2]);
-                    while power > 0.0 {
-                        let p = [xp.floor() as i32, yp.floor() as i32, zp.floor() as i32];
-                        if p[1] < h.min_y || p[1] >= h.min_y + h.sections as i32 * 16 {
-                            break;
-                        }
-                        let water = match blast {
-                            Blast::Respawn(Some(w)) if w == p => Some(100.0),
-                            _ => None,
-                        };
-                        // TNT that went through a portal: the Nether portal without resistance or
-                        // destruction.
-                        let immune = portal_immune && self.view().block(self.st(p)) == nether_portal;
-                        // G5-F06: primed TNT minecart, rails and their support spared.
-                        let spared = rail_safe
-                            && (self.btag_id(p, crate::tag_bits::TagId::Rails) || self.btag_id([p[0], p[1] + 1, p[2]], crate::tag_bits::TagId::Rails));
-                        if !immune && let Some(r) = water.or_else(|| self.block_resistance(p)) {
-                            let r = if spared { 0.0 } else { self.wither_blast_resistance(p, r) }; // F16: blue skull
-                            power -= (r + 0.3) * 0.3;
-                        }
-                        if power > 0.0 && !immune && !spared && !toblow.contains(&p) {
-                            toblow.push(p);
-                        }
-                        xp += xd * f64::from(0.3f32);
-                        yp += yd * f64::from(0.3f32);
-                        zp += zd * f64::from(0.3f32);
-                        power -= 0.225_000_01;
-                    }
-                }
-            }
-        }
-        // Order of a hash set of the game: the order only matters for the next shuffle.
-        let count = toblow.len() as i32;
+        let blocklike = mob_griefing || matches!(blast, Blast::Block | Blast::Tnt(_) | Blast::TntCart { .. });
+        // 1. Blocks hit. They keep the order the rays first reached them, which the shuffle of
+        // the destruction starts from; the game's own hash set has another order, so a given
+        // random shuffles them differently (the distribution is the same).
+        let mut blast_cells = self.explosion_cells(center, radius, blast, paths);
+        let count = blast_cells.len() as i32;
         #[cfg(test)]
-        BLAST_CELLS.with_borrow_mut(|v| v.push((center, toblow.clone())));
+        BLAST_CELLS.with_borrow_mut(|v| v.push((center, blast_cells.clone())));
         // 2. Entities. The author held out of the list (creeper, wither being ticked) stays
         // findable by identifier for the time of the damage (warden anger, gossip…).
         if let Some(s) = source {
             self.ghost_push(s);
         }
         let double = radius * 2.0;
-        // A digging or emerging warden ignores explosions (neither hurt nor pushed).
-        let ids: Vec<i32> = self
-            .mobs
-            .list
-            .iter()
-            .filter(|o| Some(o.id) != exclude && !super::recent::ignores_explosion(o))
-            .map(|o| o.id)
-            .collect();
-        for id in ids {
-            let t = Ent::Mob(id);
-            let (Some(pos), Some(eye), Some(bb)) = (self.ent_pos(t), self.ent_eye(t), self.ent_bbox(t)) else {
-                continue;
-            };
-            let dist = dist2(pos, center).sqrt() / f64::from(double);
-            if dist > 1.0 {
-                continue;
-            }
-            let dir = super::mth::normalize([pos[0] - center[0], eye - center[1], pos[2] - center[2]]);
-            let exposure = self.seen_percent(center, &bb);
-            let pow = (1.0 - dist) * f64::from(exposure);
-            let dmg = ((pow * pow + pow) / 2.0 * 7.0 * f64::from(double) + 1.0) as f32;
-            if rc_data::env_flag!("RUSTCRAFT_S4LOG") {
-                eprintln!("explosion: {t:?} at {pos:?}, distance {dist:.3}, seen part {exposure}, damage {dmg}");
-            }
-            let Some(i) = self.mob_index(id) else { continue };
-            let mut o = self.mobs.list.take(i).expect("mob");
-            // Ghast hit by the explosion of a fireball sent back by the player: 1,000.
-            let dmg = if super::nether::reflected_fireball(&o, self.mobs.fireballs.direct_large, by) { 1000.0 } else { dmg };
-            self.mob_hurt(&mut o, ty, dmg, by, Some(center));
-            // Knockback power, then along the direction; reduced by the explosion
-            // knockback resistance (Blast Protection), like the game.
-            let kp = (1.0 - dist) * f64::from(exposure) * (1.0 - o.attrs.explosion_kb_resistance.value());
-            o.vel = [o.vel[0] + dir[0] * kp, o.vel[1] + dir[1] * kp, o.vel[2] + dir[2] * kp];
-            o.needs_sync = true;
-            self.mobs.list.put(i, o);
-        }
+        self.explosion_hits_mobs(center, double, exclude, by, ty, paths);
         // The current player, then the other players of the local network: hurt and pushed like
         // the host (W8c: the direct cause is the explosion's, whoever is installed).
         let cause = match (source, blast) {
@@ -346,57 +331,13 @@ impl Server {
             let hive_release = (source.is_none() && matches!(blast, Blast::Tnt(_) | Blast::TntCart { .. }))
                 || source.is_some_and(|m| matches!(m.kind, super::species::Kind::Creeper | super::species::Kind::Wither))
                 || self.prog.expl_cause_next == Some("minecraft:wither_skull");
-            self.mobs.rng.shuffle(&mut toblow);
-            let mut stacks: Vec<([i32; 3], crate::player::Stack)> = Vec::new();
-            for p in toblow.iter().copied() {
-                if self.is_air(p) {
-                    continue;
-                }
-                let s = self.st(p);
-                let is_tnt = self.state_name(s) == "minecraft:tnt";
-                self.heart_explosion_hit(p, s, ty, by);
-                // TNT: no loot, a primed TNT with a short fuse takes its place.
-                if is_tnt {
-                    let air = self.default_state("minecraft:air");
-                    self.set_block(p, air, crate::blocks::flag::ALL);
-                    self.tnt_was_exploded(p);
-                    continue;
-                }
-                let hive = self.view().kind(s) == crate::blocks::Kind::Beehive;
-                if hive {
-                    self.hive_blown(p, hive_release);
-                }
-                let drops = self.explosion_drops(p, s, if decay { Some(radius) } else { None });
-                for d in drops {
-                    let mut d = d;
-                    for (_, st) in stacks.iter_mut() {
-                        if crate::items::same(st, &d) {
-                            let room = (16 - st.count).max(0).min(d.count);
-                            st.count += room;
-                            d.count -= room;
-                            if d.count <= 0 {
-                                break;
-                            }
-                        }
-                    }
-                    if d.count > 0 {
-                        stacks.push((p, d));
-                    }
-                }
-                let air = self.default_state("minecraft:air");
-                // Contents thrown by the removal itself (`container_broken` in `set_block`).
-                self.set_block(p, air, crate::blocks::flag::ALL);
-                if hive {
-                    crate::mobs::wild::hive::anger_nearby(self, p);
-                }
-            }
-            for (p, s) in stacks {
-                self.pop_resource(p, s);
-            }
+            self.mobs.rng.shuffle(&mut blast_cells);
+            let decay_radius = decay.then_some(radius);
+            self.destroy_blown_blocks(&blast_cells, ty, by, hive_release, decay_radius, paths);
         }
         // F12: fire: one cell in three, empty, above a full block.
         if fire {
-            for p in toblow.iter().copied() {
+            for p in blast_cells.iter().copied() {
                 if self.mobs.rng.next_int_bound(3) == 0 && self.is_air(p) && self.solid_render([p[0], p[1] - 1, p[2]]) {
                     let f = self.fire_state_for(p);
                     self.set_block(p, f, crate::blocks::flag::ALL);
@@ -405,43 +346,219 @@ impl Server {
         }
         // 4. Packet to each player within 64 blocks, carrying that player's own knockback, also
         //    given to its server velocity.
-        {
-            let small = radius < 2.0 || !griefing;
-            let pt = |s: &Server, n: &str| Particle {
-                kind: s
-                    .data
-                    .registry("minecraft:particle_type")
-                    .and_then(|r| r.entries.iter().position(|e| e == n))
-                    .unwrap_or(0) as i32,
-                color: 0,
-                state: 0,
-                item: -1,
-                scale: 1.0,
-                color2: 0,
-                vib: None,
-                trail: None,
-            };
-            let ex = rc_client::extra::Explosion {
-                center,
-                radius,
-                blocks: count,
-                knockback: None,
-                particle: pt(self, if small { "minecraft:explosion" } else { "minecraft:explosion_emitter" }),
-                sound: SoundRef::Id(
-                    self.data
-                        .registry("minecraft:sound_event")
-                        .and_then(|r| r.entries.iter().position(|e| e == "minecraft:entity.generic.explode"))
-                        .unwrap_or(0) as i32,
-                ),
-                block_particles: vec![
-                    (pt(self, "minecraft:poof"), 0.5, 1.0, 1),
-                    (pt(self, "minecraft:smoke"), 1.0, 1.0, 1),
-                ],
-                play_sound: true,
-            };
-            self.send_explosion(ex, player_kb, &peers);
+        let small = radius < 2.0 || !griefing;
+        let indexed = paths.lookups_once;
+        let ex = rc_client::extra::Explosion {
+            center,
+            radius,
+            blocks: count,
+            knockback: None,
+            particle: self
+                .blast_particle(if small { "minecraft:explosion" } else { "minecraft:explosion_emitter" }, indexed),
+            sound: SoundRef::Id(self.sound_event_id("minecraft:entity.generic.explode", indexed)),
+            block_particles: vec![
+                (self.blast_particle("minecraft:poof", indexed), 0.5, 1.0, 1),
+                (self.blast_particle("minecraft:smoke", indexed), 1.0, 1.0, 1),
+            ],
+            play_sound: true,
+        };
+        self.send_explosion(ex, player_kb, &peers);
+    }
+
+    /// The cells hit by the rays of an explosion (phase 1), in the order first reached.
+    fn explosion_cells(&mut self, center: [f64; 3], radius: f32, blast: Blast, paths: BlastPaths) -> Vec<[i32; 3]> {
+        let rules = ExplosionRules {
+            water_cell: match blast {
+                Blast::Respawn(w) => w,
+                _ => None,
+            },
+            portal_immune: matches!(blast, Blast::Tnt(true) | Blast::None(true)),
+            nether_portal: self.table().block_id("nether_portal"),
+            rail_safe: matches!(blast, Blast::TntCart { primed: true }),
+            dangerous_wither: self.mobs.wither.dangerous_blast,
+        };
+        if paths.one_state_read {
+            return self.walk_blast_rays(center, radius, paths, |world, p| world.explosion_effect(p, &rules));
         }
-        let _ = EntityEvent::Remove(Vec::new());
+        let draws = self.ray_draws();
+        let heights = self.world_heights();
+        blast_rays::hit_cells(center, radius, &draws, heights, paths, |p| self.explosion_effect_by_reads(p, &rules))
+    }
+
+    /// What cell `p` does to the rays, read the former way, a read of the world per test
+    /// (`RUSTCRAFT_OPT_BLAST_ONE_STATE_READ=0`).
+    fn explosion_effect_by_reads(&self, p: [i32; 3], rules: &ExplosionRules) -> CellEffect {
+        let water = match rules.water_cell {
+            Some(w) if w == p => Some(100.0),
+            _ => None,
+        };
+        // TNT that went through a portal: the Nether portal without resistance or destruction.
+        let immune = rules.portal_immune && self.view().block(self.st(p)) == rules.nether_portal;
+        // G5-F06: primed TNT minecart, rails and their support spared.
+        let spared = rules.rail_safe
+            && (self.btag_id(p, TagId::Rails) || self.btag_id([p[0], p[1] + 1, p[2]], TagId::Rails));
+        if immune {
+            return CellEffect::IGNORED;
+        }
+        match water.or_else(|| self.block_resistance(p)) {
+            // F16: blue skull.
+            Some(r) => CellEffect::resisting(if spared { 0.0 } else { self.wither_blast_resistance(p, r) }, !spared),
+            None => CellEffect { drop: 0.0, hittable: !spared },
+        }
+    }
+
+    /// Mobs hurt and pushed by an explosion; `double`: twice its radius. A digging or emerging
+    /// warden ignores explosions (neither hurt nor pushed).
+    fn explosion_hits_mobs(
+        &mut self,
+        center: [f64; 3],
+        double: f32,
+        exclude: Option<i32>,
+        by: Option<Ent>,
+        ty: &str,
+        paths: BlastPaths,
+    ) {
+        let ids = self.mobs_in_blast_reach(center, f64::from(double), paths, |o| {
+            Some(o.id) != exclude && !super::recent::ignores_explosion(o)
+        });
+        for id in ids {
+            let t = Ent::Mob(id);
+            let (Some(pos), Some(eye), Some(bb)) = (self.ent_pos(t), self.ent_eye(t), self.ent_bbox(t)) else {
+                continue;
+            };
+            let dist = dist2(pos, center).sqrt() / f64::from(double);
+            if dist > 1.0 {
+                continue;
+            }
+            let dir = super::mth::normalize([pos[0] - center[0], eye - center[1], pos[2] - center[2]]);
+            let exposure = self.seen_percent(center, &bb);
+            let pow = (1.0 - dist) * f64::from(exposure);
+            let dmg = ((pow * pow + pow) / 2.0 * 7.0 * f64::from(double) + 1.0) as f32;
+            if rc_data::env_flag!("RUSTCRAFT_S4LOG") {
+                eprintln!("explosion: {t:?} at {pos:?}, distance {dist:.3}, seen part {exposure}, damage {dmg}");
+            }
+            let Some(i) = self.mob_index(id) else { continue };
+            let mut o = self.mobs.list.take(i).expect("mob");
+            // Ghast hit by the explosion of a fireball sent back by the player: 1,000.
+            let reflected = super::nether::reflected_fireball(&o, self.mobs.fireballs.direct_large, by);
+            let dmg = if reflected { 1000.0 } else { dmg };
+            self.mob_hurt(&mut o, ty, dmg, by, Some(center));
+            // Knockback power, then along the direction; reduced by the explosion
+            // knockback resistance (Blast Protection), like the game.
+            let knockback = (1.0 - dist) * f64::from(exposure) * (1.0 - o.attrs.explosion_kb_resistance.value());
+            o.vel = [o.vel[0] + dir[0] * knockback, o.vel[1] + dir[1] * knockback, o.vel[2] + dir[2] * knockback];
+            o.needs_sync = true;
+            self.mobs.list.put(i, o);
+        }
+    }
+
+    /// Identifiers of the mobs an explosion may reach, in list order, `keep` deciding for each:
+    /// with `RUSTCRAFT_OPT_BLAST_MOBS_IN_BOX`, only those whose box meets the game's box around
+    /// the explosion (twice the radius plus one block each way, whole blocks), which holds every
+    /// mob within reach; their distance is tested again when hit.
+    pub(crate) fn mobs_in_blast_reach(
+        &self,
+        center: [f64; 3],
+        double: f64,
+        paths: BlastPaths,
+        keep: impl Fn(&Mob) -> bool,
+    ) -> Vec<i32> {
+        let reach = rc_physics::Aabb {
+            min: center.map(|c| (c - double - 1.0).floor()),
+            max: center.map(|c| (c + double + 1.0).floor()),
+        };
+        self.mobs
+            .list
+            .iter()
+            .filter(|o| !paths.mobs_in_box || reach.intersects(&o.bbox()))
+            .filter(|o| keep(o))
+            .map(|o| o.id)
+            .collect()
+    }
+
+    /// Blocks destroyed by an explosion, `cells` already shuffled: TNT primed in place, the
+    /// others dropping their loot (grouped in stacks of 16, `decay_radius` for the explosion
+    /// decay) and beehives emptied (`hive_release`: the bees' emergency exit).
+    fn destroy_blown_blocks(
+        &mut self,
+        cells: &[[i32; 3]],
+        ty: &str,
+        by: Option<Ent>,
+        hive_release: bool,
+        decay_radius: Option<f32>,
+        paths: BlastPaths,
+    ) {
+        // Looked up once per explosion instead of once per block (by name).
+        let once = paths.lookups_once.then(|| DestroyLookups {
+            tnt: self.table().block_id("tnt"),
+            air: self.default_state("minecraft:air"),
+            block_drops: self.rule("minecraft:block_drops", true),
+        });
+        let mut loot = BlastLoot::new(paths.open_stacks);
+        for p in cells.iter().copied() {
+            if self.is_air(p) {
+                continue;
+            }
+            let s = self.st(p);
+            let is_tnt = match &once {
+                Some(l) => l.tnt != u16::MAX && self.view().block(s) == l.tnt,
+                None => self.state_name(s) == "minecraft:tnt",
+            };
+            self.heart_explosion_hit(p, s, ty, by);
+            let air = once.as_ref().map_or_else(|| self.default_state("minecraft:air"), |l| l.air);
+            // TNT: no loot, a primed TNT with a short fuse takes its place.
+            if is_tnt {
+                self.set_block(p, air, crate::blocks::flag::ALL);
+                self.tnt_was_exploded(p);
+                continue;
+            }
+            let hive = self.view().kind(s) == crate::blocks::Kind::Beehive;
+            if hive {
+                self.hive_blown(p, hive_release);
+            }
+            let block_drops = once.as_ref().map_or_else(|| self.rule("minecraft:block_drops", true), |l| l.block_drops);
+            for d in self.explosion_drops(p, s, decay_radius, block_drops) {
+                loot.add(p, d);
+            }
+            // Contents thrown by the removal itself (`container_broken` in `set_block`).
+            self.set_block(p, air, crate::blocks::flag::ALL);
+            if hive {
+                crate::mobs::wild::hive::anger_nearby(self, p);
+            }
+        }
+        for (p, s) in loot.stacks {
+            self.pop_resource(p, s);
+        }
+    }
+
+    /// Particle of an explosion packet named `name`; `indexed`: found through the registry's
+    /// name index (otherwise by a walk over its entries).
+    pub(crate) fn blast_particle(&self, name: &str, indexed: bool) -> Particle {
+        Particle {
+            kind: self.registry_entry_id("minecraft:particle_type", name, indexed),
+            color: 0,
+            state: 0,
+            item: -1,
+            scale: 1.0,
+            color2: 0,
+            vib: None,
+            trail: None,
+        }
+    }
+
+    /// Network id of sound event `name` (0 when unknown), like [`Server::blast_particle`].
+    pub(crate) fn sound_event_id(&self, name: &str, indexed: bool) -> i32 {
+        self.registry_entry_id("minecraft:sound_event", name, indexed)
+    }
+
+    fn registry_entry_id(&self, registry: &str, name: &str, indexed: bool) -> i32 {
+        let registry = self.data.registry(registry);
+        let id = if indexed {
+            registry.and_then(|r| r.id(name))
+        } else {
+            registry.and_then(|r| r.entries.iter().position(|e| e == name)).map(|i| i as u32)
+        };
+        id.unwrap_or(0) as i32
     }
 
     /// The explosion reaching the installed player (spectators excluded): impact point and cause
@@ -575,9 +692,9 @@ impl Server {
         }
     }
 
-    /// Loot of a blown-up block (block table, explosion context).
-    fn explosion_drops(&mut self, p: [i32; 3], state: u32, radius: Option<f32>) -> Vec<crate::player::Stack> {
-        if !self.rule("minecraft:block_drops", true) {
+    /// Loot of a blown-up block (block table, explosion context); `block_drops`: the rule.
+    fn explosion_drops(&mut self, p: [i32; 3], state: u32, radius: Option<f32>, block_drops: bool) -> Vec<Stack> {
+        if !block_drops {
             return Vec::new();
         }
         if !crate::loot::loot_context_borrowed() {
@@ -586,7 +703,9 @@ impl Server {
         self.draw_block_loot(p, state, crate::block_loot::BlockRemoval::Blown { radius })
     }
 
+    /// Default state of block `name` (0, air, when unknown), through the block name index
+    /// (`RUSTCRAFT_OPT_NAMEINDEX=0`: a walk over the block list).
     pub(crate) fn default_state(&self, name: &str) -> u32 {
-        self.data.blocks.iter().find(|b| b.name == name).map_or(0, |b| b.default_state)
+        self.data.default_state_of(name).unwrap_or(0)
     }
 }

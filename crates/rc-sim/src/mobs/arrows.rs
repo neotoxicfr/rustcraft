@@ -121,64 +121,75 @@ impl Server {
 
     /// Test of a cell on the original segment.
     fn clip_cell(&self, cell: [i32; 3], from: [f64; 3], to: [f64; 3]) -> Option<(f64, [i32; 3])> {
+        let state = self.st(cell);
+        if super::blast_rays::BlastPaths::current().clip_shape_ref {
+            return clip_boxes(self.phys.shape(state), cell, from, to);
+        }
+        // Former path: the shape copied into a new list for every cell.
         let mut boxes = Vec::new();
-        self.phys.collision(self.st(cell), &mut boxes);
-        if boxes.is_empty() {
-            return None;
-        }
-        let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
-        if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < 1.0e-7 {
-            return None;
-        }
-        let p = [from[0] + d[0] * 0.001, from[1] + d[1] * 0.001, from[2] + d[2] * 0.001];
-        let c = cell.map(f64::from);
-        if boxes.iter().any(|b| (0..3).all(|k| p[k] - c[k] >= b.min[k] && p[k] - c[k] < b.max[k])) {
-            // Interior origin: face opposite to the direction closest to the movement
-            // (order down, up, north, south, west, east; the first of the maximum).
-            let cand = [(1usize, -d[1], -1), (1, d[1], 1), (2, -d[2], -1), (2, d[2], 1), (0, -d[0], -1), (0, d[0], 1)];
-            let mut top = cand[0];
-            for c in &cand[1..] {
-                if c.1 > top.1 {
-                    top = *c;
-                }
-            }
-            let mut n = [0; 3];
-            n[top.0] = -top.2;
-            return Some((0.001, n));
-        }
-        let mut best = 1.0f64;
-        let mut normal = [0; 3];
-        let mut hit = false;
-        for b in &boxes {
-            let bb = b.offset(c[0], c[1], c[2]);
-            for a in 0..3 {
-                let (b1, b2) = ((a + 1) % 3, (a + 2) % 3);
-                let plane = if d[a] > 1.0e-7 {
-                    bb.min[a]
-                } else if d[a] < -1.0e-7 {
-                    bb.max[a]
-                } else {
-                    continue;
-                };
-                let s = (plane - from[a]) / d[a];
-                let pb = from[b1] + s * d[b1];
-                let pc = from[b2] + s * d[b2];
-                if 0.0 < s
-                    && s < best
-                    && bb.min[b1] - 1.0e-7 < pb
-                    && pb < bb.max[b1] + 1.0e-7
-                    && bb.min[b2] - 1.0e-7 < pc
-                    && pc < bb.max[b2] + 1.0e-7
-                {
-                    best = s;
-                    hit = true;
-                    normal = [0; 3];
-                    normal[a] = if d[a] > 0.0 { -1 } else { 1 };
-                }
-            }
-        }
-        hit.then_some((best, normal))
+        self.phys.collision(state, &mut boxes);
+        clip_boxes(&boxes, cell, from, to)
     }
+}
+
+/// Test of the collision boxes `boxes` of `cell` on the segment from `from` to `to`: fraction
+/// of the hit and normal of the face hit.
+fn clip_boxes(boxes: &[rc_physics::Aabb], cell: [i32; 3], from: [f64; 3], to: [f64; 3]) -> Option<(f64, [i32; 3])> {
+    if boxes.is_empty() {
+        return None;
+    }
+    let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+    if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < 1.0e-7 {
+        return None;
+    }
+    let p = [from[0] + d[0] * 0.001, from[1] + d[1] * 0.001, from[2] + d[2] * 0.001];
+    let c = cell.map(f64::from);
+    if boxes.iter().any(|b| (0..3).all(|k| p[k] - c[k] >= b.min[k] && p[k] - c[k] < b.max[k])) {
+        // Interior origin: face opposite to the direction closest to the movement
+        // (order down, up, north, south, west, east; the first of the maximum).
+        let cand = [(1usize, -d[1], -1), (1, d[1], 1), (2, -d[2], -1), (2, d[2], 1), (0, -d[0], -1), (0, d[0], 1)];
+        let mut top = cand[0];
+        for c in &cand[1..] {
+            if c.1 > top.1 {
+                top = *c;
+            }
+        }
+        let mut n = [0; 3];
+        n[top.0] = -top.2;
+        return Some((0.001, n));
+    }
+    let mut best = 1.0f64;
+    let mut normal = [0; 3];
+    let mut hit = false;
+    for b in boxes {
+        let bb = b.offset(c[0], c[1], c[2]);
+        for a in 0..3 {
+            let (b1, b2) = ((a + 1) % 3, (a + 2) % 3);
+            let plane = if d[a] > 1.0e-7 {
+                bb.min[a]
+            } else if d[a] < -1.0e-7 {
+                bb.max[a]
+            } else {
+                continue;
+            };
+            let s = (plane - from[a]) / d[a];
+            let pb = from[b1] + s * d[b1];
+            let pc = from[b2] + s * d[b2];
+            if 0.0 < s
+                && s < best
+                && bb.min[b1] - 1.0e-7 < pb
+                && pb < bb.max[b1] + 1.0e-7
+                && bb.min[b2] - 1.0e-7 < pc
+                && pc < bb.max[b2] + 1.0e-7
+            {
+                best = s;
+                hit = true;
+                normal = [0; 3];
+                normal[a] = if d[a] > 0.0 { -1 } else { 1 };
+            }
+        }
+    }
+    hit.then_some((best, normal))
 }
 
 /// Effect added to the carried stack's own effects, colour (data 11).

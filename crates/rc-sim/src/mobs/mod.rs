@@ -5,6 +5,7 @@
 pub(crate) mod aquatic;
 pub(crate) mod arrows;
 mod bell;
+pub(crate) mod blast_rays;
 mod body;
 mod resize; // refit after the box grows
 pub(crate) mod fireballs;
@@ -75,6 +76,8 @@ mod tests_loot_rng;
 mod tests_patterns;
 #[cfg(test)]
 mod tests_respawn_blast;
+#[cfg(test)]
+mod tests_explosion_rays;
 #[cfg(test)]
 mod tests_w10;
 #[cfg(test)]

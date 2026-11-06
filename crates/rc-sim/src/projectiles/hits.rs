@@ -937,9 +937,9 @@ impl Server {
         }
     }
 
-    /// Default state of a named block.
+    /// Default state of a named block, through the block name index (like `default_state`).
     pub(crate) fn default_state_of(&self, name: &str) -> Option<u32> {
-        self.data.blocks.iter().find(|b| b.name == name).map(|b| b.default_state)
+        self.data.default_state_of(name)
     }
 
     /// Fire destroyed, candle put out, campfire put out.

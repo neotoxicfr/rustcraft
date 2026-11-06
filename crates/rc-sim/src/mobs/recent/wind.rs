@@ -8,9 +8,9 @@
 //! doors, trapdoors, fence gates, candles). The breeze deflects other projectiles.
 
 use rc_client::Event;
-use rc_proto_v777::entity::Particle;
 use rc_proto_v777::play::{SoundPacket, SoundRef};
 
+use super::super::blast_rays::BlastPaths;
 use super::super::mob::Ent;
 use super::super::mth::dist2;
 use super::vibration::Src;
@@ -172,48 +172,19 @@ impl Server {
         held: &mut [&mut super::super::mob::Mob],
     ) {
         self.game_event_src("minecraft:explode", center, src, None);
-        // 1. Blocks hit (set; only the number of draws matters for the random).
-        let h = self.dim.height;
-        let mut toblow: Vec<[i32; 3]> = Vec::new();
-        let mut seen = hashbrown::HashSet::new();
-        for xx in 0..16 {
-            for yy in 0..16 {
-                for zz in 0..16 {
-                    if !(xx == 0 || xx == 15 || yy == 0 || yy == 15 || zz == 0 || zz == 15) {
-                        continue;
-                    }
-                    let mut xd = f64::from(xx as f32 / 15.0 * 2.0 - 1.0);
-                    let mut yd = f64::from(yy as f32 / 15.0 * 2.0 - 1.0);
-                    let mut zd = f64::from(zz as f32 / 15.0 * 2.0 - 1.0);
-                    let d = (xd * xd + yd * yd + zd * zd).sqrt();
-                    xd /= d;
-                    yd /= d;
-                    zd /= d;
-                    let mut power = radius * (0.7 + self.mobs.rng.next_float() * 0.6);
-                    let (mut xp, mut yp, mut zp) = (center[0], center[1], center[2]);
-                    while power > 0.0 {
-                        let p = [xp.floor() as i32, yp.floor() as i32, zp.floor() as i32];
-                        if p[1] < h.min_y || p[1] >= h.min_y + h.sections as i32 * 16 {
-                            break;
-                        }
-                        if self.btag_id(p, crate::tag_bits::TagId::BlocksWindChargeExplosions) {
-                            power -= (3_600_000.0 + 0.3) * 0.3;
-                        }
-                        if power > 0.0 && seen.insert(p) {
-                            toblow.push(p);
-                        }
-                        xp += xd * f64::from(0.3f32);
-                        yp += yd * f64::from(0.3f32);
-                        zp += zd * f64::from(0.3f32);
-                        power -= 0.225_000_01;
-                    }
-                }
-            }
-        }
+        let paths = BlastPaths::current();
+        // 1. Blocks hit, in the order first reached (shuffled below).
+        let mut blast_cells = if paths.shared_walker {
+            self.walk_blast_rays(center, radius, paths, |world, p| world.wind_effect(p))
+        } else {
+            self.wind_cells_with_hash_set(center, radius)
+        };
+        #[cfg(test)]
+        crate::mobs::explode::BLAST_CELLS.with_borrow_mut(|v| v.push((center, blast_cells.clone())));
         // 2. Entities: knockback only (kind multiplier; the player flying in creative
         //    receives none).
         let double = f64::from(radius * 2.0);
-        let ids: Vec<i32> = self.mobs.list.iter().map(|o| o.id).collect();
+        let ids = self.mobs_in_blast_reach(center, double, paths, |_| true);
         for id in ids {
             let t = Ent::Mob(id);
             let (Some(pos), Some(eye), Some(bb)) = (self.ent_pos(t), self.ent_eye(t), self.ent_bbox(t)) else {
@@ -277,34 +248,20 @@ impl Server {
         self.explosion_projectiles(center, radius, uuid, kb_mult, false);
         self.blast_push_still(center, radius, kb_mult);
         // 3. Triggered blocks (shuffled order on the world random).
-        self.mobs.rng.shuffle(&mut toblow);
-        for p in toblow.iter().copied() {
+        self.mobs.rng.shuffle(&mut blast_cells);
+        for p in blast_cells.iter().copied() {
             self.wind_trigger_block(p);
         }
         // 4. Packet to each player within 64 blocks, with its own knockback.
-        let pt = |s: &Server, n: &str| Particle {
-            kind: s.data.registry("minecraft:particle_type").and_then(|r| r.entries.iter().position(|e| e == n)).unwrap_or(0)
-                as i32,
-            color: 0,
-            state: 0,
-            item: -1,
-            scale: 1.0,
-            color2: 0,
-            vib: None,
-            trail: None,
-        };
         // Radius of at least 2 with interaction (trigger): big burst, otherwise small.
         let emitter = if radius >= 2.0 { "minecraft:gust_emitter_large" } else { "minecraft:gust_emitter_small" };
         let ex = rc_client::extra::Explosion {
             center,
             radius,
-            blocks: toblow.len() as i32,
+            blocks: blast_cells.len() as i32,
             knockback: None,
-            particle: pt(self, emitter),
-            sound: SoundRef::Id(
-                self.data.registry("minecraft:sound_event").and_then(|r| r.entries.iter().position(|e| e == sound)).unwrap_or(0)
-                    as i32,
-            ),
+            particle: self.blast_particle(emitter, paths.lookups_once),
+            sound: SoundRef::Id(self.sound_event_id(sound, paths.lookups_once)),
             block_particles: Vec::new(),
             play_sound: true,
         };
@@ -317,6 +274,49 @@ impl Server {
         if let Some(kb) = player_kb {
             self.add_player_vel(kb);
         }
+    }
+
+    /// Former walk of the burst's rays (`RUSTCRAFT_OPT_SHARED_RAY_WALKER=0`): its own loop, a tag
+    /// test at every step and a hash set of the cells already hit.
+    fn wind_cells_with_hash_set(&mut self, center: [f64; 3], radius: f32) -> Vec<[i32; 3]> {
+        let h = self.dim.height;
+        let mut cells: Vec<[i32; 3]> = Vec::new();
+        let mut seen = hashbrown::HashSet::new();
+        for xx in 0..16 {
+            for yy in 0..16 {
+                for zz in 0..16 {
+                    if !(xx == 0 || xx == 15 || yy == 0 || yy == 15 || zz == 0 || zz == 15) {
+                        continue;
+                    }
+                    let mut xd = f64::from(xx as f32 / 15.0 * 2.0 - 1.0);
+                    let mut yd = f64::from(yy as f32 / 15.0 * 2.0 - 1.0);
+                    let mut zd = f64::from(zz as f32 / 15.0 * 2.0 - 1.0);
+                    let d = (xd * xd + yd * yd + zd * zd).sqrt();
+                    xd /= d;
+                    yd /= d;
+                    zd /= d;
+                    let mut power = radius * (0.7 + self.mobs.rng.next_float() * 0.6);
+                    let (mut xp, mut yp, mut zp) = (center[0], center[1], center[2]);
+                    while power > 0.0 {
+                        let p = [xp.floor() as i32, yp.floor() as i32, zp.floor() as i32];
+                        if p[1] < h.min_y || p[1] >= h.min_y + h.sections as i32 * 16 {
+                            break;
+                        }
+                        if self.btag_id(p, crate::tag_bits::TagId::BlocksWindChargeExplosions) {
+                            power -= (3_600_000.0 + 0.3) * 0.3;
+                        }
+                        if power > 0.0 && seen.insert(p) {
+                            cells.push(p);
+                        }
+                        xp += xd * f64::from(0.3f32);
+                        yp += yd * f64::from(0.3f32);
+                        zp += zd * f64::from(0.3f32);
+                        power -= 0.225_000_01;
+                    }
+                }
+            }
+        }
+        cells
     }
 
     /// The burst reaching the installed player (spectators and the dead excluded): impact point
