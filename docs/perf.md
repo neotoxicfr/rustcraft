@@ -5660,3 +5660,86 @@ profile, machine loaded by other agents compiling, best of 5 or 7; three runs, t
   decorations, noise floors), `crowd-1000`, `tnt`, `dropped-items` (collision walks); memstats at
   world opening (−1 MB of heap expected).
 
+
+## C7-M09: processor-specific code, ceiling per crate measured on v2 / v3 builds, shared detection (06/11, loaded machine)
+
+- Shared detection `rc_data::cpu` (`has_avx2`, `has_sse41`, `has_fma`, read once). The five sites
+  that asked the processor themselves now ask there: noise kernel and flattened biome tree
+  (rc-worldgen, AVX2), `jmath` sine and cosine (FMA), mixer lanes (rc-audio, AVX2), meshing candidate
+  rows (rc-mesh, AVX2, chosen once per section). Each keeps its local `unsafe`, its SAFETY comment and
+  the check right before the call. `RUSTCRAFT_OPT_CPU_SPECIFIC_CODE=0` hides every feature: the
+  generic bodies run everywhere on the same executable (it can only hide a feature, never claim
+  one). Sabotage of each body (noise amplitude, one biome distance, one meshing candidate dropped,
+  one mixer gain, one sine argument) is caught by its equivalence test (`noise_volume_paths_match_old_bitwise`,
+  `tree_paths_match_old`, `lane_candidates_match_cell_by_cell` and `cull_paths_match_stored`,
+  `mix_digest`, `sin_cos_paths_match_old_bitwise`): the bodies are still reached through the shared
+  detection. No macro: fewer than three sites have proved a gain of their own.
+- SSE4.1 inside the AVX2 bodies: already implied by `avx2` in the compiler's feature model. Static
+  check: the AVX2 noise body holds 4 native roundings (`vroundsd`) where its generic twin calls the
+  library `floor` 4 times; the FMA sine and cosine bodies round natively too. No third variant.
+- Measurement builds, never delivered: the whole program with `RUSTFLAGS=-C target-cpu=x86-64-v2`,
+  then `-C target-cpu=x86-64-v3 -C target-feature=-fma` (no contraction, `mul_add` stays a library
+  call), each in its own `--target-dir` (trial profile). Equivalence: in both builds the 43 test
+  suites of rc-data, rc-worldgen, rc-audio, rc-mesh, rc-light (stored fingerprints of the noise,
+  biome, terrain, mixer, meshing and light paths) and the 14 `tests_opt` of rc-sim pass; the three
+  simulation fingerprints are the same bits as plain x86-64 (bench world `2a5918d4…`, new world
+  `972d121d…`, mechanisms `3171468b…`). No undefined behaviour shows up.
+- Static counts (disassembly of each crate's library, client binary from its kept objects): calls
+  to the C library rounding functions (`floor`, `ceil`, `round`, `trunc`, float and double), native
+  rounding instructions, `popcnt`, 256-bit instructions.
+
+| crate | rounding calls v1 → v2/v3 | native roundings v2 | `popcnt` v1 → v2 | ymm instructions v3 | instructions v1 |
+|---|---|---|---|---|---|
+| rc-sim | 2 687 → 0 | 2 629 | 0 → 10 | 94 114 | 3 160 701 |
+| client (rustcraft) | 948 → 0 | 926 | 0 → 7 | 53 112 | 2 148 778 |
+| rc-physics | 217 → 0 | 217 | 0 | 1 274 | 47 688 |
+| rc-worldgen | 121 → 0 | 129 (7 before: AVX2 and FMA bodies) | 0 → 7 | 17 560 | 758 192 |
+| rc-assets | 94 → 0 | 59 | 0 → 2 | 7 830 | 298 009 |
+| rc-text | 13 → 0 | 13 | 0 | 994 | 40 806 |
+| rc-mesh | 10 → 0 | 10 | 0 → 143 | 4 770 | 74 578 |
+| rc-audio, rc-env | 7 + 7 → 0 | 7 + 7 | 0 | 4 249 + 180 | — |
+| rc-light | 4 → 0 | 4 | 0 | 1 150 | 39 284 |
+
+  4 109 library rounding calls in all at plain x86-64 (≈ 1 ns each against the inline instruction:
+  13.3 against 5.1 ms per 10⁷ below), all inline from v2 on. rc-sim's are spread over mob AI and movement (block position
+  of an entity: villager behaviour 54 sites, goals 37, brains 37, packet handling 36, family walk 34,
+  stepped cells 30, path search 29…): no hot function to multiversion, only a whole-crate build or
+  the shared floor of `rc_data::java_math` (C7-M05) would remove them. `count_ones` in rc-mesh (143
+  sites, about twelve instructions each at plain x86-64) becomes one instruction. The other library
+  calls (trigonometry, powers) stay at every level (rc-sim 548 at v1, 579 at v3; client 1 517, 1 502).
+- Micro-benches per crate (test executables of the three builds, run directly in alternation,
+  above-normal priority, best of 3 passes; the machine is loaded by other agents compiling: one
+  pass differs from the next by up to ±40 %, so only large gaps mean something):
+
+| bench (best of 3) | v1 | v2 | v3 without FMA |
+|---|---|---|---|
+| worldgen: library `floor` to i32, 10⁷ | 13.3 ms | 5.1 (−62 %) | 7.3 (−45 %) |
+| worldgen: shared Java floor (the generator's path), 10⁷ | 6.0 ms | 6.2 (+4 %) | 8.3 (+38 %) |
+| worldgen: noise volume 16×384×16, 8 octaves, all paths | 2.24 ms | 2.28 (+2 %) | 2.33 (+4 %) |
+| worldgen: final density, 1 thread, per chunk | 1.64 ms | 1.54 (−6 %) | 1.60 (−2 %) |
+| worldgen: terrain radius 12 (625 chunks, all threads) | 188 ms | 180 (−4 %) | 172 (−9 %) |
+| mixer: 247 voices, 8 AVX2 lanes (default path) | 3.35 ns | 3.47 (+4 %) | 3.36 (0 %) |
+| mixer: 247 voices, old 4 lanes | 4.96 ns | 4.81 (−3 %) | 4.59 (−7 %) |
+| rc-sim: crowd 1 600 mobs, tick median | 29.0 ms | 28.1 (−3 %) | 27.5 (−5 %) |
+| rc-sim: bench ticks, redstone, median | 4.35 ms | 4.42 (+2 %) | 4.09 (−6 %) |
+| rc-sim: bench ticks, village, median | 0.94 ms | 0.95 (0 %) | 0.86 (−9 %) |
+
+  Meshing (`cull_bench`, all columns of the capture, default paths, best of 2): all threads 94.8 ms
+  at v1, 95.2 (0 %) at v2, 90.6 (−4 %) at v3; one thread 1 689, 1 790, 1 869 ms. Light
+  (`bench_relight`, every path on, best of 2, µs): plains 456 / 458 / 458, cave 404 / 348 / 367,
+  redstone 161 / 122 / 124, building 607 / 530 / 609. rc-light has 4 rounding calls and no bit
+  count to gain at v2: those gaps are the machine's noise, not the level. The existing dispatched bodies already give their AVX2 gain at plain x86-64 (mixer 8 lanes, noise
+  kernel): the whole-program v3 build adds nothing there. Ceiling per crate so far: a few percent at
+  most, inside the noise of this machine; no crate shows a gain large enough to justify a new
+  multiversioned body before the quiet-machine bench. The AVX2 bodies of meshing and light stay
+  with their zones, with this ceiling.
+- To measure on the quiet machine (decides the ceiling per crate): build the three executables in
+  the real profile (`RUSTCRAFT_FULL_RELEASE=1` through the queue, `RUSTFLAGS` as above, one
+  `--target-dir` each), then `python tools/bench/scenes.py run --exe <v1> --exe <v2> --exe <v3>
+  --exe "<v1>|RUSTCRAFT_OPT_CPU_SPECIFIC_CODE=0" --scenes cave,redstone,generation,crowd-1000,village
+  --passes 3 --samply`, and `tools/hot_map.py` for the CPU per thread and per crate.
+- Open question for the user (contrary to the decision of 22/10, not adopted): build the Windows
+  release for x86-64-v2 (every PC able to run Windows 11 24H2, which already requires POPCNT and
+  SSE4.2). Gain: the 4 109 rounding calls and the 143 emulated bit counts above; cost: processors
+  without SSE4.2 (before about 2008 for Intel, 2011 for AMD) could no longer start the game. Linux
+  stays at plain x86-64 (its C library already picks an SSE4.1 `floor` at run time).
