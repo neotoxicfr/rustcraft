@@ -119,10 +119,10 @@ impl Server {
         None
     }
 
-    /// Test of a cell on the original segment.
+    /// Test of a cell on the original segment (every sightline of `clip_blocks` goes through it).
     fn clip_cell(&self, cell: [i32; 3], from: [f64; 3], to: [f64; 3]) -> Option<(f64, [i32; 3])> {
         let state = self.st(cell);
-        if super::blast_rays::BlastPaths::current().clip_shape_ref {
+        if super::blast_rays::BlastPaths::current().sightline_borrowed_shapes {
             return clip_boxes(self.phys.shape(state), cell, from, to);
         }
         // Former path: the shape copied into a new list for every cell.

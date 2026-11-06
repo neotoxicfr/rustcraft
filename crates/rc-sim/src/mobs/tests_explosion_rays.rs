@@ -1,9 +1,9 @@
 //! Equivalence proofs of the explosion and wind burst engine. A fixed set of explosions and
 //! bursts in a flat world is fingerprinted: cells hit by each explosion (in order), blocks
-//! left, items on the ground, primed TNT tick by tick, mobs, decorations and the player. The
-//! digests were recorded on the code before the ray walker was shared; every switch
-//! combination must give them again. Each run gets a thread of its own, so the test random
-//! seeds and the recorded cells start afresh.
+//! left, items on the ground, primed TNT tick by tick, mobs, decorations and the player. Every
+//! switch combination must give the digests of the former paths, run in the same process (and,
+//! on Windows, frozen from the code before the ray walker was shared). Each run gets a thread
+//! of its own, so the test random seeds and the recorded cells start afresh.
 
 use crate::blocks::entities::EntKind;
 use crate::blocks::probe::Probe;
@@ -274,7 +274,7 @@ fn run_scenes(tag: &str, before: impl FnOnce() + Send + 'static) -> Option<Vec<(
         .ok()
 }
 
-/// Digests of the code before the shared walker (recorded on `main` 2e768c2f).
+/// Digests of the code before the shared walker (recorded on Windows, on `main` 2e768c2f).
 const FROZEN: &[(&str, &str)] = &[
     ("primed tnt", "14b14d27de93c87f"),
     ("cells", "f8f3aca12fd38e89"),
@@ -579,23 +579,41 @@ fn explosion_work_and_allocations_are_counted() {
     assert!(counted[1].1 > 0 && counted[2].1 == 0, "allocations of the visible parts: {counted:?}");
 }
 
-/// The parts whose digests differ from the frozen ones when the scenes run with `paths`
-/// (`None`: the switches), named after `tag`.
+/// Digests of the former code (every switch at its old path), run once in this process; on
+/// Windows they must also be the frozen ones. The TNT are primed through the C library's
+/// sin/cos, whose last bits differ on Linux: there the former code run here is the only
+/// reference, which still proves every path against it.
+fn former_code_digests() -> &'static [(&'static str, String)] {
+    static FORMER: std::sync::OnceLock<Vec<(&'static str, String)>> = std::sync::OnceLock::new();
+    FORMER.get_or_init(|| {
+        let former = run_scenes("former", || FORCED_BLAST_PATHS.set(Some(BlastPaths::OLD)))
+            .expect("the scenes failed on the former code");
+        if cfg!(windows) {
+            let frozen: Vec<(&str, String)> = FROZEN.iter().map(|(n, d)| (*n, (*d).to_owned())).collect();
+            assert_eq!(former, frozen, "the former code no longer gives the frozen digests");
+        }
+        former
+    })
+}
+
+/// The parts whose digests differ from those of the former code when the scenes run with
+/// `paths` (`None`: the switches), named after `tag`.
 fn differing_parts(tag: &str, paths: Option<BlastPaths>) -> Vec<String> {
-    assert!(!FROZEN.is_empty(), "no frozen digests");
+    let expected = former_code_digests();
+    assert!(!expected.is_empty(), "no reference digests");
     let Some(got) = run_scenes(tag, move || FORCED_BLAST_PATHS.set(paths)) else {
         return vec![format!("{tag}: a scene failed")];
     };
-    assert_eq!(got.len(), FROZEN.len(), "{tag}: parts {got:?}");
+    assert_eq!(got.len(), expected.len(), "{tag}: parts {got:?}");
     got.iter()
-        .zip(FROZEN)
-        .filter(|((name, digest), (frozen_name, frozen))| name != frozen_name || digest.as_str() != *frozen)
+        .zip(expected)
+        .filter(|((name, digest), (expected_name, expected))| name != expected_name || digest != expected)
         .map(|((name, digest), _)| format!("{tag}: {name} {digest}"))
         .collect()
 }
 
-/// Asserts every run of `runs` gives the frozen digests (all runs made, then every difference
-/// listed).
+/// Asserts every run of `runs` gives the digests of the former code (all runs made, then every
+/// difference listed).
 fn check_runs(runs: Vec<(String, Option<BlastPaths>)>) {
     let differences: Vec<String> = runs.iter().flat_map(|(tag, paths)| differing_parts(tag, *paths)).collect();
     assert!(differences.is_empty(), "explosion digests differ: {differences:#?}");
@@ -616,7 +634,7 @@ fn with_switch(mut paths: BlastPaths, i: usize, on: bool) -> BlastPaths {
         2 => &mut paths.hit_bits,
         3 => &mut paths.one_state_read,
         4 => &mut paths.shared_walker,
-        5 => &mut paths.clip_shape_ref,
+        5 => &mut paths.sightline_borrowed_shapes,
         6 => &mut paths.lookups_once,
         7 => &mut paths.mobs_in_box,
         _ => &mut paths.open_stacks,
@@ -626,13 +644,13 @@ fn with_switch(mut paths: BlastPaths, i: usize, on: bool) -> BlastPaths {
 }
 
 #[test]
-fn explosion_scenes_match_the_frozen_digests() {
+fn explosion_scenes_match_the_former_code() {
     check_paths("current", None);
 }
 
 /// Every former path, then each new path alone.
 #[test]
-fn each_new_path_alone_gives_the_frozen_digests() {
+fn each_new_path_alone_matches_the_former_code() {
     let mut runs = vec![("old".to_owned(), Some(BlastPaths::OLD))];
     runs.extend((0..SWITCHES).map(|i| (format!("only{i}"), Some(with_switch(BlastPaths::OLD, i, true)))));
     check_runs(runs);
@@ -640,7 +658,7 @@ fn each_new_path_alone_gives_the_frozen_digests() {
 
 /// Every new path, then each former path alone.
 #[test]
-fn each_former_path_alone_gives_the_frozen_digests() {
+fn each_former_path_alone_matches_the_former_code() {
     let mut runs = vec![("new".to_owned(), Some(BlastPaths::NEW))];
     runs.extend((0..SWITCHES).map(|i| (format!("but{i}"), Some(with_switch(BlastPaths::NEW, i, false)))));
     check_runs(runs);
@@ -648,7 +666,7 @@ fn each_former_path_alone_gives_the_frozen_digests() {
 
 /// Rays shared between 1 to 32 threads at every radius, and the cells kept in hash maps only.
 #[test]
-fn parallel_rays_and_hash_maps_give_the_frozen_digests() {
+fn parallel_rays_and_hash_maps_match_the_former_code() {
     let parallel = BlastPaths { parallel_rays: true, parallel_min_radius: 0.0, ..BlastPaths::NEW };
     let mut runs: Vec<(String, Option<BlastPaths>)> = [1, 2, 4, 8, 32]
         .iter()
@@ -702,8 +720,8 @@ fn seen_percent_of_half_hidden_boxes_is_frozen() {
             [0.0, 0.3].map(|dz| rc_physics::Aabb { min: [x, -60.0, 0.2 + dz], max: [x + 0.6, -58.2, 0.8 + dz] })
         })
         .collect();
-    let seen = |p: &Probe, shape_ref: bool| -> Vec<f32> {
-        FORCED_BLAST_PATHS.set(Some(BlastPaths { clip_shape_ref: shape_ref, ..BlastPaths::NEW }));
+    let seen = |p: &Probe, borrowed: bool| -> Vec<f32> {
+        FORCED_BLAST_PATHS.set(Some(BlastPaths { sightline_borrowed_shapes: borrowed, ..BlastPaths::NEW }));
         boxes.iter().map(|b| p.s.seen_percent([b.min[0] - 2.5, -59.5, 0.5], b)).collect()
     };
     let frozen: [f32; 10] =

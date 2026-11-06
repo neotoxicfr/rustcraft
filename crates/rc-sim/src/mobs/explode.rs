@@ -394,14 +394,14 @@ impl Server {
         };
         // TNT that went through a portal: the Nether portal without resistance or destruction.
         let immune = rules.portal_immune && self.view().block(self.st(p)) == rules.nether_portal;
-        // G5-F06: primed TNT minecart, rails and their support spared.
+        // Primed TNT minecart: rails and their support spared.
         let spared = rules.rail_safe
             && (self.btag_id(p, TagId::Rails) || self.btag_id([p[0], p[1] + 1, p[2]], TagId::Rails));
         if immune {
             return CellEffect::IGNORED;
         }
         match water.or_else(|| self.block_resistance(p)) {
-            // F16: blue skull.
+            // Blue wither skull: destructible blocks resist less.
             Some(r) => CellEffect::resisting(if spared { 0.0 } else { self.wither_blast_resistance(p, r) }, !spared),
             None => CellEffect { drop: 0.0, hittable: !spared },
         }
@@ -489,7 +489,7 @@ impl Server {
         paths: BlastPaths,
     ) {
         // Looked up once per explosion instead of once per block (by name).
-        let once = paths.lookups_once.then(|| DestroyLookups {
+        let lookups = paths.lookups_once.then(|| DestroyLookups {
             tnt: self.table().block_id("tnt"),
             air: self.default_state("minecraft:air"),
             block_drops: self.rule("minecraft:block_drops", true),
@@ -500,12 +500,12 @@ impl Server {
                 continue;
             }
             let s = self.st(p);
-            let is_tnt = match &once {
+            let is_tnt = match &lookups {
                 Some(l) => l.tnt != u16::MAX && self.view().block(s) == l.tnt,
                 None => self.state_name(s) == "minecraft:tnt",
             };
             self.heart_explosion_hit(p, s, ty, by);
-            let air = once.as_ref().map_or_else(|| self.default_state("minecraft:air"), |l| l.air);
+            let air = lookups.as_ref().map_or_else(|| self.default_state("minecraft:air"), |l| l.air);
             // TNT: no loot, a primed TNT with a short fuse takes its place.
             if is_tnt {
                 self.set_block(p, air, crate::blocks::flag::ALL);
@@ -516,7 +516,7 @@ impl Server {
             if hive {
                 self.hive_blown(p, hive_release);
             }
-            let block_drops = once.as_ref().map_or_else(|| self.rule("minecraft:block_drops", true), |l| l.block_drops);
+            let block_drops = lookups.as_ref().map_or_else(|| self.rule("minecraft:block_drops", true), |l| l.block_drops);
             for d in self.explosion_drops(p, s, decay_radius, block_drops) {
                 loot.add(p, d);
             }

@@ -43,7 +43,8 @@ impl CellEffect {
     }
 }
 
-/// Paths of the explosion engine, one switch each (`=0`: the former path), read once.
+/// Paths of the explosion engine, and of the mobs' block clip its visible parts go through, one
+/// switch each (`=0`: the former path), read once.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct BlastPaths {
     /// `RUSTCRAFT_OPT_BLAST_LAST_CELL`: a step in the same cell as the step before takes the
@@ -64,9 +65,13 @@ pub(crate) struct BlastPaths {
     /// `RUSTCRAFT_OPT_SHARED_RAY_WALKER`: the wind burst walks its rays with this walker
     /// (formerly its own loop with a hash set and a tag test per step).
     pub shared_walker: bool,
-    /// `RUSTCRAFT_OPT_CLIP_SHAPE_REF`: the visible-part rays borrow each cell's collision shape
-    /// (formerly copied into a new list per cell).
-    pub clip_shape_ref: bool,
+    /// `RUSTCRAFT_OPT_SIGHTLINE_BORROWED_SHAPES`: every block clip of the mobs' segments
+    /// (`clip_blocks` / `clip_t`: mob sight and targeting, breeze, golems, llama spit, spears,
+    /// surface navigation, slimes, advancement predicates, and the visible part of an
+    /// explosion's targets) borrows each cell's collision shape (formerly copied into a new list
+    /// per cell). Kept here so that the explosion proofs switch it with the rest; it is not an
+    /// explosion path only.
+    pub sightline_borrowed_shapes: bool,
     /// `RUSTCRAFT_OPT_BLAST_LOOKUPS_ONCE`: rules, block ids, particle and sound ids looked up
     /// once per explosion (formerly per destroyed block, and by name).
     pub lookups_once: bool,
@@ -102,7 +107,7 @@ impl BlastPaths {
         one_state_read: true,
         parallel_rays: false,
         shared_walker: true,
-        clip_shape_ref: true,
+        sightline_borrowed_shapes: true,
         lookups_once: true,
         mobs_in_box: true,
         open_stacks: true,
@@ -118,7 +123,7 @@ impl BlastPaths {
         hit_bits: false,
         one_state_read: false,
         shared_walker: false,
-        clip_shape_ref: false,
+        sightline_borrowed_shapes: false,
         lookups_once: false,
         mobs_in_box: false,
         open_stacks: false,
@@ -138,7 +143,7 @@ impl BlastPaths {
             one_state_read: rc_data::opt_switch!("RUSTCRAFT_OPT_BLAST_ONE_STATE_READ"),
             parallel_rays: rc_data::opt_switch!("RUSTCRAFT_OPT_BLAST_PARALLEL_RAYS", default_off),
             shared_walker: rc_data::opt_switch!("RUSTCRAFT_OPT_SHARED_RAY_WALKER"),
-            clip_shape_ref: rc_data::opt_switch!("RUSTCRAFT_OPT_CLIP_SHAPE_REF"),
+            sightline_borrowed_shapes: rc_data::opt_switch!("RUSTCRAFT_OPT_SIGHTLINE_BORROWED_SHAPES"),
             lookups_once: rc_data::opt_switch!("RUSTCRAFT_OPT_BLAST_LOOKUPS_ONCE"),
             mobs_in_box: rc_data::opt_switch!("RUSTCRAFT_OPT_BLAST_MOBS_IN_BOX"),
             open_stacks: rc_data::opt_switch!("RUSTCRAFT_OPT_BLAST_OPEN_STACKS"),
@@ -148,8 +153,12 @@ impl BlastPaths {
     }
 
     /// Threads the rays of an explosion of `radius` are shared between (1: walked in place).
+    /// The shared walk always takes the new cell paths (shared view, last cell, cell cache, hit
+    /// bits): with any of them switched off, the rays stay on one thread so that the former path
+    /// really runs.
     fn ray_threads(&self, radius: f32) -> usize {
-        if !self.parallel_rays || !self.one_state_read || radius < self.parallel_min_radius {
+        let new_cell_paths = self.one_state_read && self.last_cell && self.cell_cache && self.hit_bits;
+        if !self.parallel_rays || !new_cell_paths || radius < self.parallel_min_radius {
             return 1;
         }
         let threads = match self.threads {
@@ -206,13 +215,35 @@ struct CellCube {
 }
 
 impl CellCube {
+    /// The cells every ray of an explosion of `radius` at `center` can reach.
     fn new(center: [f64; 3], radius: f32, max_cells: usize) -> CellCube {
         let reach = ray_reach(radius);
-        let lo = center.map(|c| (c - reach).floor());
-        let hi = center.map(|c| (c + reach).floor());
+        CellCube::spanning(center.map(|c| c - reach), center.map(|c| c + reach), reach.is_finite(), max_cells)
+    }
+
+    /// The cells the rays `steps` of an explosion of `radius` at `center` can reach: the box of
+    /// the centre and of each ray's farthest point (a segment's cells lie in its ends' box).
+    fn around_rays(center: [f64; 3], steps: &[[f64; 3]], radius: f32, max_cells: usize) -> CellCube {
+        let reach = ray_reach(radius);
+        let steps_to_reach = reach / f64::from(0.3f32);
+        let (mut lo, mut hi) = (center, center);
+        for step in steps {
+            for axis in 0..3 {
+                let end = center[axis] + step[axis] * steps_to_reach;
+                lo[axis] = lo[axis].min(end);
+                hi[axis] = hi[axis].max(end);
+            }
+        }
+        CellCube::spanning(lo, hi, reach.is_finite(), max_cells)
+    }
+
+    /// Arrays over the cells from `lo` to `hi` when they are finite and at most `max_cells`,
+    /// otherwise none (every cell then goes to the hash map).
+    fn spanning(lo: [f64; 3], hi: [f64; 3], finite: bool, max_cells: usize) -> CellCube {
+        let lo = lo.map(f64::floor);
+        let hi = hi.map(f64::floor);
         let size: [usize; 3] = std::array::from_fn(|i| (hi[i] - lo[i] + 1.0).max(0.0) as usize);
-        let cells =
-            size.iter().try_fold(1usize, |n, &s| n.checked_mul(s)).filter(|&n| reach.is_finite() && n <= max_cells);
+        let cells = size.iter().try_fold(1usize, |n, &s| n.checked_mul(s)).filter(|&n| finite && n <= max_cells);
         let (size, cells) = match cells {
             Some(n) => (size, n),
             None => ([0; 3], 0),
@@ -238,7 +269,8 @@ impl CellCube {
         Some(index)
     }
 
-    fn flags_mut(&mut self, p: [i32; 3]) -> (&mut f32, &mut u8) {
+    /// Power drop and flags kept for cell `p`.
+    fn cell_mut(&mut self, p: [i32; 3]) -> (&mut f32, &mut u8) {
         match self.slot(p) {
             Some(i) => (&mut self.drops[i], &mut self.flags[i]),
             None => {
@@ -250,7 +282,7 @@ impl CellCube {
 
     /// Effect of cell `p`, worked out by `effect_of` the first time only.
     fn effect(&mut self, p: [i32; 3], effect_of: &impl Fn([i32; 3]) -> CellEffect) -> CellEffect {
-        let (drop, flags) = self.flags_mut(p);
+        let (drop, flags) = self.cell_mut(p);
         if *flags & KNOWN == 0 {
             let e = effect_of(p);
             *drop = e.drop;
@@ -261,7 +293,7 @@ impl CellCube {
 
     /// Marks cell `p` hit; true if it was not yet.
     fn mark_hit(&mut self, p: [i32; 3]) -> bool {
-        let (_, flags) = self.flags_mut(p);
+        let (_, flags) = self.cell_mut(p);
         let new = *flags & HIT == 0;
         *flags |= HIT;
         new
@@ -381,7 +413,9 @@ pub(crate) fn hit_cells(
 }
 
 /// `hit_cells` with the rays shared between `threads` threads (contiguous shares, each with
-/// its own cell cache), merged in ray order: the same cells in the same order.
+/// its own cell cache), merged in ray order: the same cells in the same order. It always takes
+/// the last-cell step, the cell cache and the hit bits (`ray_threads` keeps the former paths on
+/// one thread).
 pub(crate) fn hit_cells_parallel(
     center: [f64; 3],
     radius: f32,
@@ -399,7 +433,9 @@ pub(crate) fn hit_cells_parallel(
             .zip(draws.chunks(per))
             .map(|(steps, draws)| {
                 scope.spawn(move || {
-                    let cache = CellCube::new(center, radius, paths.max_cube_cells);
+                    // Only the cells this share's rays can reach: a whole cube per thread would
+                    // multiply the memory of the walk by the thread count.
+                    let cache = CellCube::around_rays(center, steps, radius, paths.max_cube_cells);
                     let mut cells = ReachedCells { cache, reached: Vec::new(), effect_of };
                     for (step, &draw) in steps.iter().zip(draws) {
                         walk_ray(center, *step, ray_power(radius, draw), heights, true, &mut cells);
@@ -688,6 +724,49 @@ mod tests {
                 "radius {radius}: {} cells outside the cube",
                 cells.cube.outside.len()
             );
+        }
+    }
+
+    /// The cube of a thread's share of the rays holds every cell those rays can reach, and is
+    /// smaller than the whole cube (cells printed: the memory of the walk on several threads).
+    #[test]
+    fn share_cube_holds_every_cell_its_rays_reach() {
+        let heights = Heights { bottom: i32::MIN, top: i32::MAX };
+        let center = [0.75, 0.25, -0.5];
+        for radius in [4.0, 7.0, 20.0, 30.0] {
+            let whole = CellCube::new(center, radius, MAX_CUBE_CELLS).drops.len();
+            for threads in [2, 4, 8, 32, RAY_COUNT / 32] {
+                let per = RAY_COUNT.div_ceil(threads);
+                let mut largest = 0;
+                for steps in ray_steps().chunks(per) {
+                    let cache = CellCube::around_rays(center, steps, radius, MAX_CUBE_CELLS);
+                    let mut cells = ReachedCells { cache, reached: Vec::new(), effect_of: &|_| CellEffect::OPEN };
+                    for step in steps {
+                        walk_ray(center, *step, ray_power(radius, 0.999_999_94), heights, true, &mut cells);
+                    }
+                    let outside = cells.cache.outside.len();
+                    assert_eq!(outside, 0, "radius {radius}, {threads} threads: {outside} cells outside the share's cube");
+                    largest = largest.max(cells.cache.drops.len());
+                }
+                assert!(largest < whole, "radius {radius}, {threads} threads: share cube {largest} of {whole} cells");
+                eprintln!("radius {radius}, {threads} threads: largest share cube {largest} cells, whole cube {whole}");
+            }
+        }
+    }
+
+    /// The shared walk always takes the new cell paths: with any of them switched off, the rays
+    /// stay on one thread so that the former path runs.
+    #[test]
+    fn parallel_rays_leave_every_former_cell_path_on_one_thread() {
+        let parallel = BlastPaths { parallel_rays: true, threads: 4, ..BlastPaths::NEW };
+        assert_eq!(parallel.ray_threads(20.0), 4);
+        for former in [
+            BlastPaths { last_cell: false, ..parallel },
+            BlastPaths { cell_cache: false, ..parallel },
+            BlastPaths { hit_bits: false, ..parallel },
+            BlastPaths { one_state_read: false, ..parallel },
+        ] {
+            assert_eq!(former.ray_threads(20.0), 1, "{former:?}");
         }
     }
 }
