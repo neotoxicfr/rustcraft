@@ -5660,3 +5660,68 @@ profile, machine loaded by other agents compiling, best of 5 or 7; three runs, t
   decorations, noise floors), `crowd-1000`, `tnt`, `dropped-items` (collision walks); memstats at
   world opening (−1 MB of heap expected).
 
+## C7-M07: global allocator, direct mimalloc calls, one flag byte, option indices from the header, v2 against v3 (06/11, loaded machine)
+
+Global allocator of the client (`debug_sys::CountingAllocator`, the integrated server shares it) and
+the memstats one. Tests `cargo test --release -p rc-app --bin rustcraft debug_sys`; micro-bench
+`allocator_micro_bench` (ignored, `--ignored --nocapture --test-threads=1`); trial profile, machine
+loaded by other agents compiling.
+
+- Direct calls (`RUSTCRAFT_OPT_ALLOC_DIRECT`, default 1, `=0`: old path). The `mimalloc` crate always
+  calls the aligned entry points. Above 1 KiB they leave the inlined fast path for an out-of-line one
+  that pads the request by `align - 1` bytes unless the size class is a power of two: a size that
+  sits exactly on a class bound (classes by quarters: 1,280, 1,536, 1,792, 2,048…) moves up one
+  class. The plain entry points give 16-byte alignment from 16 bytes up (8 for the 8-byte class), so
+  `align <= 16 && align <= size` now takes them (the rule of Rust's own unix allocator); larger
+  alignments and smaller sizes keep the aligned calls; reallocation likewise on the new size.
+  Block bytes (`direct_calls_take_no_bigger_blocks_above_one_kib`): every multiple of 8 from 1 KiB to
+  64 KiB +0.03 % (22 of 8,064 sizes one class up); doubling `Vec` capacities of 1- to 64-byte
+  elements +5.15 % (84 of 383 one class up; 12-byte elements at 128: 1,536 → 1,792 bytes). The
+  tracer (`RUSTCRAFT_ALLOCTRACE=1`) now prints per second the allocations up to 1 KiB, above as a
+  power of two and above otherwise, to size the real share on the scenes.
+- One flag byte (`RUSTCRAFT_OPT_ALLOCATOR_SINGLE_FLAG`, default 1): counting (`memory` entry),
+  tracing and the two old-path switches in one `AtomicU8`; all clear = one load, one branch, the
+  direct call; anything set goes to a `#[cold]` out-of-line function. The old aligned path is kept
+  inline (its A/B stays fair). `=0` re-reads counting and tracing separately in the cold function:
+  it pays one call more than the true old code, so the micro-bench also runs the old allocator as it
+  was (`TwoFlagAllocator`).
+
+| ns per alloc + free, best of 5, 256 live | 8 B, 1 thread | 8 B, 4 threads | 8 B, 32 threads | 1,536 B, 1 thread | 1,536 B, 32 threads |
+|---|---|---|---|---|---|
+| new (direct, one flag) | 3.81 | 5.53 | 7.78 | 17.55 | 110.1 |
+| `ALLOC_DIRECT=0` | 4.01 | 6.61 | 8.80 | 21.17 | 134.6 |
+| `ALLOCATOR_SINGLE_FLAG=0` | 5.02 | 7.92 | 11.26 | 16.60 | 111.0 |
+| both `=0` | 5.15 | 8.57 | 11.85 | 21.78 | 135.3 |
+| old allocator as it was | 3.80 | 6.61 | 8.35 | 21.47 | 132.6 |
+| bare `mimalloc::MiMalloc`, no wrapper | 3.76 | 6.37 | 8.45 | 20.76 | 132.3 |
+| bare direct calls, no wrapper | 3.77 | 5.98 | 7.91 | 15.60 | 112.1 |
+
+  1,536 bytes: −18 % on 1 thread, −17 % on 32 against the old allocator; 8 bytes: equal on 1 thread
+  (the plain fast path and the aligned one are both inlined), −7 to −16 % on 4 to 32 threads (within
+  the noise of a loaded machine). The wrapper costs nothing measurable against the bare calls: kept.
+- Option indices (`build.rs`): `mi_option_set` takes the position of the option in the library's
+  enumeration; it was hard-coded (40), so a bump that inserts an option would have set another one
+  silently. The build script now reads the enumeration in the header of the linked library
+  (`DEP_MIMALLOC_INCLUDE_DIR`, `libmimalloc-sys` added as a direct dependency, same version) and
+  fails on an explicit value before the end marker; the generated indices are checked against those
+  read by hand per library version (`mimalloc_option_indices_were_checked_for_this_version`: an
+  unknown version fails until its header is read). Still hard-coded: the copy in
+  `crates/rc-worldgen/tests/sampler_opt.rs` (another crate's test; to point at the same guard).
+- mimalloc v2 against v3 (feature `mimalloc-v2`, two executables of the same commit): v2 has no
+  on-demand page commit (the startup line says so); `mi_stats_t` layout picked by the linked version
+  (v2: version 4, 4,168 bytes). V2_ARM_FIGURES
+- Low settings, nothing thrown away: `RUSTCRAFT_OPT_MI_PURGE_LONG=1` (default OFF: it can only trade
+  memory for processor time) sets the purge delay to 10 s instead of v3's 1 s (`MIMALLOC_PURGE_DELAY`
+  set by the user wins); the arena multiplier (1 in v3, the header comment saying 10 is stale) is
+  left alone. Feature `mimalloc-win-direct-tls` (two executables): mimalloc's thread heap read from the
+  64 direct TLS slots only (one predictable branch, ≈ 0.2 ns); the startup line logs the lowest free
+  slot (mimalloc took its own before `main`, when fewer were in use). `allow_thp`: Linux only, for
+  the port.
+- To measure on the quiet machine: `crowd-1000`, `tnt`, `dropped-items`, `generation`, `plains32`,
+  3 passes, p99, `committed` of the `[perf] ram` line and private memory, with `ALLOC_DIRECT` and
+  `ALLOCATOR_SINGLE_FLAG` at 0 and 1; `generation` and `flight` for pool ms/s and tick; v2 and v3
+  executables, private memory first (−735 MB when paused was gained with v3); then
+  `MI_PURGE_LONG=1` and the direct-TLS executable. Repeated > 1 KiB allocations per frame
+  (`push_item_layer`, `prepare` sorts, NBT clones, rc-mesh `to_vec`) belong to their zones: a
+  reused buffer beats any allocator setting.
+

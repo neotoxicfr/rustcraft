@@ -2,69 +2,222 @@
 //! (F3+C, F3+I): direct calls to the system, no dependencies. Outside Windows: null values.
 #![allow(unsafe_code)]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::alloc::{GlobalAlloc, Layout};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-/// Allocation rate: counter of allocated bytes, kept only when the `memory` entry
-/// is active (otherwise one boolean read per allocation).
-pub static COUNT_ALLOCS: AtomicBool = AtomicBool::new(false);
+use libmimalloc_sys as mi;
+
+#[cfg(test)]
+mod allocator_tests;
+
+/// Bytes allocated while counting is on (`memory` entry of the debug screen, benches).
 pub static ALLOCATED: AtomicU64 = AtomicU64::new(0);
+
+// Bits of `ALLOCATOR_FLAGS`. All bits clear is the usual case and the fast path: one load, one
+// branch, then a direct mimalloc call.
+/// Allocated bytes added to `ALLOCATED`.
+const COUNT_BYTES: u8 = 1;
+/// Sampling by the allocation tracer (`alloc_trace.rs`).
+const TRACE: u8 = 1 << 1;
+/// `RUSTCRAFT_OPT_ALLOC_DIRECT=0`: mimalloc's aligned entry points for every request (old path).
+const ALIGNED_CALLS: u8 = 1 << 2;
+/// `RUSTCRAFT_OPT_ALLOCATOR_SINGLE_FLAG=0`: counting and tracing each re-read before use, as when
+/// they were two separate flags (old path).
+const SEPARATE_CHECKS: u8 = 1 << 3;
+
+/// Starts with every bit clear (new paths): allocations happen before `main`, and the allocator
+/// never reads the environment itself (that would allocate).
+static ALLOCATOR_FLAGS: AtomicU8 = AtomicU8::new(0);
+
+fn set_allocator_flag(flag: u8, on: bool) {
+    if on {
+        ALLOCATOR_FLAGS.fetch_or(flag, Ordering::Relaxed);
+    } else {
+        ALLOCATOR_FLAGS.fetch_and(!flag, Ordering::Relaxed);
+    }
+}
+
+/// Counts the allocated bytes into `ALLOCATED` (allocation rate of the `memory` entry).
+pub fn count_allocated_bytes(on: bool) {
+    set_allocator_flag(COUNT_BYTES, on);
+}
+
+/// Hands every allocation to the allocation tracer.
+pub fn trace_allocations(on: bool) {
+    set_allocator_flag(TRACE, on);
+}
+
+/// The allocation tracer is on.
+pub fn tracing_allocations() -> bool {
+    ALLOCATOR_FLAGS.load(Ordering::Relaxed) & TRACE != 0
+}
+
+/// Applies the allocator switches; to call at the start of `main`. Returns (direct calls,
+/// single flag), both `true` by default.
+pub fn read_allocator_switches() -> (bool, bool) {
+    let direct = rc_data::opt_switch!("RUSTCRAFT_OPT_ALLOC_DIRECT");
+    let single_flag = rc_data::opt_switch!("RUSTCRAFT_OPT_ALLOCATOR_SINGLE_FLAG");
+    set_allocator_flag(ALIGNED_CALLS, !direct);
+    set_allocator_flag(SEPARATE_CHECKS, !single_flag);
+    (direct, single_flag)
+}
 
 /// Benches: bytes allocated while `f` runs (counter of the whole process: run the bench alone,
 /// other threads would count too).
 #[cfg(test)]
 pub fn allocated_bytes(f: impl FnOnce()) -> u64 {
-    COUNT_ALLOCS.store(true, Ordering::Relaxed);
+    count_allocated_bytes(true);
     let before = ALLOCATED.load(Ordering::Relaxed);
     f();
     let after = ALLOCATED.load(Ordering::Relaxed);
-    COUNT_ALLOCS.store(false, Ordering::Relaxed);
+    count_allocated_bytes(false);
     after - before
 }
 
-/// Global allocator: mimalloc, plus the allocated-bytes counter when requested.
+/// Global allocator: mimalloc, plus the optional byte counter and allocation tracer.
 #[cfg_attr(feature = "memstats", allow(dead_code))]
-pub struct Gated;
+pub struct CountingAllocator;
 
-// SAFETY: delegates every call to mimalloc with the same arguments.
-unsafe impl std::alloc::GlobalAlloc for Gated {
+// SAFETY: every call goes to mimalloc with the caller's layout (see `mimalloc_alloc`).
+unsafe impl GlobalAlloc for CountingAllocator {
     #[inline]
-    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
-        if COUNT_ALLOCS.load(Ordering::Relaxed) {
-            ALLOCATED.fetch_add(l.size() as u64, Ordering::Relaxed);
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY (the three arms): same contract as the caller's, passed on unchanged.
+        match ALLOCATOR_FLAGS.load(Ordering::Relaxed) {
+            0 => unsafe { mimalloc_alloc(layout, false) },
+            // Old path kept inline, so that its A/B against the direct call is fair.
+            ALIGNED_CALLS => unsafe { mimalloc::MiMalloc.alloc(layout) },
+            flags => unsafe { alloc_with_flags(flags, layout, false) },
         }
-        if crate::alloc_trace::TRACE.load(Ordering::Relaxed) {
-            crate::alloc_trace::sample(l.size());
-        }
-        // SAFETY: same contract as the wrapped allocator.
-        unsafe { mimalloc::MiMalloc.alloc(l) }
     }
     #[inline]
-    unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
-        if COUNT_ALLOCS.load(Ordering::Relaxed) {
-            ALLOCATED.fetch_add(l.size() as u64, Ordering::Relaxed);
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY (the three arms): same contract as the caller's, passed on unchanged.
+        match ALLOCATOR_FLAGS.load(Ordering::Relaxed) {
+            0 => unsafe { mimalloc_alloc(layout, true) },
+            ALIGNED_CALLS => unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) },
+            flags => unsafe { alloc_with_flags(flags, layout, true) },
         }
-        if crate::alloc_trace::TRACE.load(Ordering::Relaxed) {
-            crate::alloc_trace::sample(l.size());
-        }
-        // SAFETY: same contract as the wrapped allocator.
-        unsafe { mimalloc::MiMalloc.alloc_zeroed(l) }
     }
     #[inline]
-    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
-        // SAFETY: `p` comes from `alloc` with the same layout.
-        unsafe { mimalloc::MiMalloc.dealloc(p, l) }
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+        // SAFETY: `ptr` comes from mimalloc (plain or aligned entry point: both are freed alike).
+        unsafe { mi::mi_free(ptr.cast()) }
     }
     #[inline]
-    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, n: usize) -> *mut u8 {
-        if COUNT_ALLOCS.load(Ordering::Relaxed) && n > l.size() {
-            ALLOCATED.fetch_add((n - l.size()) as u64, Ordering::Relaxed);
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY (the three arms): same contract as the caller's, passed on unchanged.
+        match ALLOCATOR_FLAGS.load(Ordering::Relaxed) {
+            0 => unsafe { mimalloc_realloc(ptr, layout, new_size) },
+            ALIGNED_CALLS => unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) },
+            flags => unsafe { realloc_with_flags(flags, ptr, layout, new_size) },
         }
-        if n > l.size() && crate::alloc_trace::TRACE.load(Ordering::Relaxed) {
-            crate::alloc_trace::sample(n - l.size());
-        }
-        // SAFETY: same contract as the wrapped allocator.
-        unsafe { mimalloc::MiMalloc.realloc(p, l, n) }
     }
+}
+
+/// Allocation while counting, tracing or an old path is on: out of line, so that the usual path
+/// stays a load, a branch and a call.
+#[cold]
+#[inline(never)]
+unsafe fn alloc_with_flags(flags: u8, layout: Layout, zeroed: bool) -> *mut u8 {
+    record_allocation(flags, layout.size());
+    // SAFETY: same contract as the caller's, passed on unchanged.
+    unsafe {
+        match (flags & ALIGNED_CALLS != 0, zeroed) {
+            (false, _) => mimalloc_alloc(layout, zeroed),
+            (true, false) => mimalloc::MiMalloc.alloc(layout),
+            (true, true) => mimalloc::MiMalloc.alloc_zeroed(layout),
+        }
+    }
+}
+
+/// Reallocation while counting, tracing or an old path is on (see `alloc_with_flags`).
+#[cold]
+#[inline(never)]
+unsafe fn realloc_with_flags(flags: u8, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+    if new_size > layout.size() {
+        record_allocation(flags, new_size - layout.size());
+    }
+    // SAFETY: same contract as the caller's, passed on unchanged.
+    unsafe {
+        if flags & ALIGNED_CALLS == 0 {
+            mimalloc_realloc(ptr, layout, new_size)
+        } else {
+            mimalloc::MiMalloc.realloc(ptr, layout, new_size)
+        }
+    }
+}
+
+/// Counts and traces `bytes` newly allocated.
+fn record_allocation(flags: u8, bytes: usize) {
+    let (count, trace) = if flags & SEPARATE_CHECKS == 0 {
+        (flags & COUNT_BYTES != 0, flags & TRACE != 0)
+    } else {
+        // Old sequence: one load per check, as when counting and tracing were two flags.
+        (ALLOCATOR_FLAGS.load(Ordering::Relaxed) & COUNT_BYTES != 0, ALLOCATOR_FLAGS.load(Ordering::Relaxed) & TRACE != 0)
+    };
+    if count {
+        ALLOCATED.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+    if trace {
+        crate::alloc_trace::sample(bytes);
+    }
+}
+
+/// Largest alignment that mimalloc's plain entry points give every block of at least that size:
+/// size classes from 16 bytes up are multiples of 16 (the 8-byte class is 8-aligned), like the
+/// system `malloc`.
+const PLAIN_CALL_ALIGN: usize = 16;
+
+/// A plain mimalloc call already returns `align` for a block of `size` bytes. The aligned entry
+/// points take a slower, out-of-line path above 1 KiB, which pads the request by `align - 1`
+/// bytes: 1,536 bytes aligned on 8 then come from the 1,792-byte size class.
+#[inline]
+fn plain_call_aligns(size: usize, align: usize) -> bool {
+    align <= PLAIN_CALL_ALIGN && align <= size
+}
+
+/// Block of mimalloc for `layout`, zeroed or not: plain call when it gives the alignment.
+///
+/// # Safety
+/// Same contract as [`GlobalAlloc::alloc`].
+#[inline]
+pub(crate) unsafe fn mimalloc_alloc(layout: Layout, zeroed: bool) -> *mut u8 {
+    let (size, align) = (layout.size(), layout.align());
+    // SAFETY: mimalloc takes any size; the aligned entry points any power-of-two alignment,
+    // which `Layout` guarantees.
+    let block = unsafe {
+        match (plain_call_aligns(size, align), zeroed) {
+            (true, false) => mi::mi_malloc(size),
+            (true, true) => mi::mi_zalloc(size),
+            (false, false) => mi::mi_malloc_aligned(size, align),
+            (false, true) => mi::mi_zalloc_aligned(size, align),
+        }
+    };
+    block.cast()
+}
+
+/// Reallocation of a mimalloc block: plain call when a fresh plain block of `new_size` bytes
+/// would have the alignment (a block that stays in place keeps the alignment it had).
+///
+/// # Safety
+/// Same contract as [`GlobalAlloc::realloc`].
+#[inline]
+pub(crate) unsafe fn mimalloc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+    // SAFETY: `ptr` comes from mimalloc; the alignment is a power of two (`Layout`).
+    let block = unsafe {
+        if plain_call_aligns(new_size, layout.align()) {
+            mi::mi_realloc(ptr.cast(), new_size)
+        } else {
+            mi::mi_realloc_aligned(ptr.cast(), new_size, layout.align())
+        }
+    };
+    block.cast()
+}
+
+/// Indices of the mimalloc options we set, read from the linked header by `build.rs`.
+mod mimalloc_options {
+    include!(concat!(env!("OUT_DIR"), "/mimalloc_options.rs"));
 }
 
 #[cfg(windows)]
@@ -192,10 +345,26 @@ pub fn process_memory() -> (u64, u64) {
     (0, 0)
 }
 
-/// Index of `mi_option_page_commit_on_demand` in the `mi_option_t` enumeration of the linked
-/// library (libmimalloc-sys 0.1.49, mimalloc v3, `include/mimalloc.h`): to recheck on every bump,
-/// together with its copy in the allocation bench (`crates/rc-worldgen/tests/sampler_opt.rs`).
-const MI_OPTION_PAGE_COMMIT_ON_DEMAND: i32 = 40;
+/// Sets a mimalloc option by its index in the linked header (`mimalloc_options`).
+fn set_mimalloc_option(index: i32, value: i64) {
+    unsafe extern "C" {
+        fn mi_option_set(option: i32, value: std::ffi::c_long);
+    }
+    // SAFETY: function of the linked mimalloc library (global allocator); the index comes from
+    // the header of that very library (`build.rs`). `c_long` is 32 bits on Windows: our values fit.
+    unsafe { mi_option_set(index, value as std::ffi::c_long) }
+}
+
+/// What `commit_on_demand` did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitOnDemand {
+    /// Switch value applied (`false`: library default kept).
+    Applied(bool),
+    /// The user's `MIMALLOC_PAGE_COMMIT_ON_DEMAND` decides (mimalloc already read it).
+    UserVariable,
+    /// The linked library has no such option (mimalloc v2, feature `mimalloc-v2`).
+    NotInLibrary,
+}
 
 /// mimalloc pages committed on demand instead of entirely at creation (equivalent of
 /// `MIMALLOC_PAGE_COMMIT_ON_DEMAND=1`). To call first thing in `main`, before the large
@@ -203,21 +372,54 @@ const MI_OPTION_PAGE_COMMIT_ON_DEMAND: i32 = 40;
 /// library). A `MIMALLOC_PAGE_COMMIT_ON_DEMAND` variable set by the user always
 /// wins (mimalloc already read it). Quiet-machine bench (`target/perf/ram-table.md`): private
 /// memory when paused 1666 → 931 MB, flight 2376 → 1612, cave 2066 → 1164, fps, p99 and CPU equal.
-/// Returns the applied value (`None`: nothing touched).
-pub fn commit_on_demand() -> Option<bool> {
-    unsafe extern "C" {
-        fn mi_option_set(option: i32, value: std::ffi::c_long);
-    }
+pub fn commit_on_demand() -> CommitOnDemand {
+    let Some(index) = mimalloc_options::PAGE_COMMIT_ON_DEMAND else { return CommitOnDemand::NotInLibrary };
     if rc_data::env_os!("MIMALLOC_PAGE_COMMIT_ON_DEMAND").is_some() {
+        return CommitOnDemand::UserVariable;
+    }
+    let on = rc_data::opt_switch!("RUSTCRAFT_OPT_COMMITDEMAND");
+    if on {
+        set_mimalloc_option(index, 1);
+    }
+    CommitOnDemand::Applied(on)
+}
+
+/// Purge delay set by `RUSTCRAFT_OPT_MI_PURGE_LONG`: freed pages stay committed 10 s instead of
+/// the library's 1 s (v3), fewer decommit/recommit cycles while chunks come and go.
+const LONG_PURGE_DELAY_MS: i64 = 10_000;
+
+/// Longer purge delay of mimalloc, OFF by default (`RUSTCRAFT_OPT_MI_PURGE_LONG=1` turns it on):
+/// it can only trade memory for processor time, to decide on the scene bench. A
+/// `MIMALLOC_PURGE_DELAY` set by the user wins. Returns the delay set, if any.
+pub fn long_purge_delay() -> Option<i64> {
+    let index = mimalloc_options::PURGE_DELAY?;
+    if rc_data::env_os!("MIMALLOC_PURGE_DELAY").is_some() || !rc_data::opt_switch!("RUSTCRAFT_OPT_MI_PURGE_LONG", default_off) {
         return None;
     }
-    let on = rc_data::env_os!("RUSTCRAFT_OPT_COMMITDEMAND").is_none_or(|v| v != "0");
-    if on {
-        // SAFETY: function of the linked mimalloc library (global allocator); the index is
-        // that of the option in the header of the linked version, the value 1 is documented.
-        unsafe { mi_option_set(MI_OPTION_PAGE_COMMIT_ON_DEMAND, 1) }
+    set_mimalloc_option(index, LONG_PURGE_DELAY_MS);
+    Some(LONG_PURGE_DELAY_MS)
+}
+
+/// Build with `mimalloc-win-direct-tls`: mimalloc reads its thread heap from one of the 64 direct
+/// TLS slots only, and reports an error if the one it took at its start was higher. Returns the
+/// lowest slot still free now (taken and given back): below 64, mimalloc's slots, taken earlier
+/// while fewer were in use, are below 64 too, unless one was freed in between.
+#[cfg(all(windows, feature = "mimalloc-win-direct-tls"))]
+pub fn free_tls_slot_probe() -> Option<u32> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn TlsAlloc() -> u32;
+        fn TlsFree(index: u32) -> i32;
     }
-    Some(on)
+    const TLS_OUT_OF_INDEXES: u32 = u32::MAX;
+    // SAFETY: a slot taken and given back at once, never used.
+    let index = unsafe { TlsAlloc() };
+    if index == TLS_OUT_OF_INDEXES {
+        return None;
+    }
+    // SAFETY: slot obtained just above.
+    unsafe { TlsFree(index) };
+    Some(index)
 }
 
 /// The calling thread reclaims the blocks that other threads handed back to it (mimalloc keeps them in a
@@ -230,9 +432,18 @@ pub fn reclaim_freed() {
     unsafe { mi_collect(false) }
 }
 
-/// Global statistics of mimalloc v3 (header `mimalloc-stats.h`, version 5): only the first three
-/// counters are named, the rest (4280 bytes) is opaque. The library refuses the
-/// copy if the size or the version do not match, so a wrong layout shows.
+/// mimalloc v3 or later is linked (v2 with the feature `mimalloc-v2`).
+const MIMALLOC_V3: bool = mimalloc_options::LIBRARY_VERSION >= 30_000;
+
+/// Version of `mi_stats_t` (header `mimalloc-stats.h`): 5 in v3, 4 in v2.
+const MI_STATS_VERSION: usize = if MIMALLOC_V3 { 5 } else { 4 };
+
+/// 64-bit words of `mi_stats_t` after the `committed` counter: v2 has fewer counters.
+const MI_STATS_REST_WORDS: usize = if MIMALLOC_V3 { 535 } else { 510 };
+
+/// Global statistics of mimalloc (header `mimalloc-stats.h`): only the first three counters are
+/// named, the rest is opaque. The library refuses the copy if the size or the version do not
+/// match, so a wrong layout shows.
 #[repr(C)]
 struct MiStats {
     _size: usize,
@@ -241,10 +452,10 @@ struct MiStats {
     _reserved: [i64; 3],
     /// Bytes committed by the allocator: total, peak, current.
     committed: [i64; 3],
-    _rest: [i64; 535],
+    _rest: [i64; MI_STATS_REST_WORDS],
 }
-// Size of `mi_stats_t` of the linked library (libmimalloc-sys 0.1.49, mimalloc v3).
-const _: () = assert!(std::mem::size_of::<MiStats>() == 4368);
+// Size of `mi_stats_t` of the linked library (libmimalloc-sys 0.1.49: v3 4,368 bytes, v2 4,168).
+const _: () = assert!(std::mem::size_of::<MiStats>() == if MIMALLOC_V3 { 4368 } else { 4168 });
 
 /// Memory committed by mimalloc: (current, peak), bytes (`[perf] ram` reading). Reads the
 /// allocator's internal counter: on Windows, mimalloc's "process info" call replaces this
@@ -256,11 +467,11 @@ pub fn allocator_commit() -> (u64, u64) {
     }
     let mut s = MiStats {
         _size: std::mem::size_of::<MiStats>(),
-        _version: 5,
+        _version: MI_STATS_VERSION,
         _pages: [0; 3],
         _reserved: [0; 3],
         committed: [0; 3],
-        _rest: [0; 535],
+        _rest: [0; MI_STATS_REST_WORDS],
     };
     // SAFETY: function of the linked mimalloc library (global allocator); it checks the
     // announced size and version before writing into the structure.

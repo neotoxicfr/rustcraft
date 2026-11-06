@@ -7,34 +7,37 @@ pub use counting::{LIVE, step};
 #[cfg(feature = "memstats")]
 #[allow(unsafe_code)]
 mod counting {
+    use crate::debug_sys::{mimalloc_alloc, mimalloc_realloc};
     use std::alloc::{GlobalAlloc, Layout};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     pub static LIVE: AtomicUsize = AtomicUsize::new(0);
+    /// Same mimalloc calls as the game's allocator (`debug_sys::CountingAllocator`), so that the
+    /// measured heap is the one of the game.
     pub struct Counting;
 
     unsafe impl GlobalAlloc for Counting {
-        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-            LIVE.fetch_add(l.size(), Ordering::Relaxed);
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            LIVE.fetch_add(layout.size(), Ordering::Relaxed);
             // SAFETY: same contract as the wrapped allocator.
-            unsafe { mimalloc::MiMalloc.alloc(l) }
+            unsafe { mimalloc_alloc(layout, false) }
         }
-        unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-            LIVE.fetch_add(l.size(), Ordering::Relaxed);
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            LIVE.fetch_add(layout.size(), Ordering::Relaxed);
             // SAFETY: same contract as the wrapped allocator (fresh pages already zero, as without
             // the measurement: private memory stays comparable).
-            unsafe { mimalloc::MiMalloc.alloc_zeroed(l) }
+            unsafe { mimalloc_alloc(layout, true) }
         }
-        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-            LIVE.fetch_sub(l.size(), Ordering::Relaxed);
-            // SAFETY: `p` comes from `alloc` with the same layout.
-            unsafe { mimalloc::MiMalloc.dealloc(p, l) }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+            // SAFETY: `ptr` comes from `alloc` with the same layout.
+            unsafe { mimalloc::MiMalloc.dealloc(ptr, layout) }
         }
-        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-            LIVE.fetch_add(n, Ordering::Relaxed);
-            LIVE.fetch_sub(l.size(), Ordering::Relaxed);
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            LIVE.fetch_add(new_size, Ordering::Relaxed);
+            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
             // SAFETY: same contract as the wrapped allocator.
-            unsafe { mimalloc::MiMalloc.realloc(p, l, n) }
+            unsafe { mimalloc_realloc(ptr, layout, new_size) }
         }
     }
 

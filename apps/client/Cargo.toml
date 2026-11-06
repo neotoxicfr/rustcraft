@@ -14,6 +14,11 @@ path = "src/main.rs"
 [features]
 # Counter of live bytes on the heap (memory measurements only).
 memstats = []
+# A/B of the allocator library: mimalloc v2 instead of v3 (no on-demand page commit under v2).
+mimalloc-v2 = ["mimalloc/v2"]
+# mimalloc's thread-local heap read from the 64 direct TLS slots only (Windows; startup logs
+# whether a slot was still free below 64).
+mimalloc-win-direct-tls = ["mimalloc/win_direct_tls"]
 
 [dependencies]
 hashbrown = { workspace = true }
@@ -38,6 +43,9 @@ pollster.workspace = true
 rayon.workspace = true
 crossbeam-channel.workspace = true
 mimalloc.workspace = true
+# The C library under `mimalloc` (same version, nothing new compiled): the global allocator calls
+# its plain entry points, and the build script reads the option indices from its header.
+libmimalloc-sys = { version = "0.1.49", default-features = false }
 ureq.workspace = true
 rc-audio.workspace = true
 rc-commands.workspace = true
