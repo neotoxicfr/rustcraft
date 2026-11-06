@@ -5660,3 +5660,52 @@ profile, machine loaded by other agents compiling, best of 5 or 7; three runs, t
   decorations, noise floors), `crowd-1000`, `tnt`, `dropped-items` (collision walks); memstats at
   world opening (−1 MB of heap expected).
 
+## C2-M04: only the dirty sections in view are remeshed, like the game; mesh tasks let their columns go early (06/11, loaded machine)
+
+The game rebuilds a dirty section only once it is in its visible list (reached by the walk and in
+the frustum); the others keep their mark (`docs/specs/visibility.md` § 3). We remeshed every dirty
+column whatever the view: the C2-M01 counter `mesh_partials_unreached_per_s` counts that waste.
+Two leads, default = new, `=0` = old path:
+- `RUSTCRAFT_OPT_MESHVISIBLEONLY`: a column the renderer already draws launches only its dirty
+  sections reached by the last walk and kept by the field of the last frame drawn (the very boxes
+  of the draw lists, `frustum::section_box` / `column_box`, now shared with `lists::column_runs`);
+  the other marks stay until those sections show. Never held: a column the renderer holds no mesh
+  of (the walk cannot enter it: loading unchanged) and a priority remesh (`prioritizeChunkUpdates`
+  unchanged). A column without a kept base, or to redo whole, goes with all its marks once one is
+  in view (its task meshes the whole column anyway). Cautious variant
+  `RUSTCRAFT_OPT_MESH_HIDDEN_IN_SPARE_SLOTS=1` (off): the held columns still take the task slots the
+  visible ones leave free. Counters: `mesh_columns_held_out_of_view` (gauge),
+  `mesh_columns_partly_launched_per_s`. The `RUSTCRAFT_MESHCHECK` report counts the columns still
+  marked apart (they are expected to differ from a complete mesh).
+- `RUSTCRAFT_OPT_MESHDROPJOBEARLY`: the task drops its job (nine columns shared with the client
+  world) right after the meshing instead of after the upload preparation and the send; a main-thread
+  write to a column a task still holds copies it whole (`column_copies_*_per_s`).
+- Difference faithful to the game, reduced: we no longer remesh what the game does not. Remaining
+  differences, without visible effect, in the spec (view of the last frame drawn, so a section
+  entering the view is launched one frame later; frustum of the draw instead of the game's one
+  moved back; per-column player mark).
+- Proofs: `app_meshing::filter_tests` — a model of the client over 400 frames (turning view, block
+  changes, columns received again, evicted bases, new columns): a section in view on two frames in a
+  row is fresh on the second, priority columns are never held, no column is left unmeshed, and once
+  everything is in view the meshes equal the old path's; stored work 2,667 sections (old) against
+  2,339 (filter, −12 % on the model), 1,228 meshed after being held. Automatic sabotages caught: a
+  filter that holds the never-meshed columns (hole), a view three frames old (stale sections drawn).
+  Manual sabotages seen failing: marks dropped instead of kept (stale section drawn at frame 7), a
+  per-section frustum test that keeps one section in five (`render::lists::tests::
+  meshing_view_matches_the_drawn_runs`: the meshing's view must equal the drawn runs on 240 frames,
+  columns out, across and wholly inside the field), a release that keeps the job (`early_release_
+  lets_the_columns_go_before_the_end_of_the_task`). The draw-list fingerprint is unchanged.
+- Micro-bench (`meshing_view_bench`, one core, LOADED machine): 52 ns per column at distance 12
+  (625 columns), 41 ns at distance 32 (4,225): 1,000 dirty columns cost about 0.05 ms per frame on
+  the main thread. `lists_bench` on the same run swung from −27 % to +159 % between passes of an
+  unchanged path (loaded machine): the shared box helpers are to be checked there on the quiet machine.
+  Multi-core and GPU: without object (a few hundred dirty columns at most per frame, ns each, on
+  the thread that owns the marks).
+- To measure on the quiet machine (2 alternating passes against `main`, then `=0` of each switch,
+  then the variant `=1`): `scenes.py` cave, redstone, forest, plains32, flight and a rotation in
+  place — pool meshing ms/s, `mesh_*_jobs_per_s`, sections/s, `mesh_partials_unreached_per_s`
+  (should fall near 0), `mesh_columns_held_out_of_view`, placement-to-image delay, frame p99 while
+  turning (held columns coming into view at once); redstone, plains12, tnt for
+  `RUSTCRAFT_OPT_MESHDROPJOBEARLY` (`column_copies_*_per_s`). 1600 × 900 captures in one launch
+  along a camera turn and after a change behind a wall.
+

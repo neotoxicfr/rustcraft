@@ -467,6 +467,8 @@ pub struct Renderer {
     graph_rx: crossbeam_channel::Receiver<GraphResult>,
     /// Last walk result and its key (exact position, version of the columns, settings).
     reached: Vec<(i32, i32, i32)>,
+    /// Field of view of the last frame drawn (`frustum::Renderer::sections_in_view`).
+    drawn_view: Option<frustum::DrawnView>,
     reached_key: Option<([i64; 3], u64, bool, i32, i32)>,
     columns_rev: u64,
     /// Version of the sections' connectivity (column appeared, disappeared, or one of whose sections
@@ -746,6 +748,7 @@ impl Renderer {
             graph_tx,
             graph_rx,
             reached: Vec::new(),
+            drawn_view: None,
             reached_key: None,
             columns_rev: 0,
             vis_rev: 0,

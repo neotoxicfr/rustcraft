@@ -202,6 +202,16 @@ pub fn partial_reach(reached: bool) {
     if reached { &PARTIALS_REACHED } else { &PARTIALS_UNREACHED }.fetch_add(1, Relaxed);
 }
 
+/// Visibility filter of the meshing (`RUSTCRAFT_OPT_MESHVISIBLEONLY`): dirty columns held out of
+/// view at the last scheduling, and launched columns that kept some marks (sections out of view).
+static HELD_COLUMNS: AtomicU64 = AtomicU64::new(0);
+static PARTLY_LAUNCHED: AtomicU64 = AtomicU64::new(0);
+
+pub fn mesh_held(columns: usize, partly_launched: usize) {
+    HELD_COLUMNS.store(columns as u64, Relaxed);
+    PARTLY_LAUNCHED.fetch_add(partly_launched as u64, Relaxed);
+}
+
 /// In-place uploads: bytes really sent, bytes a whole upload of the same columns would have sent;
 /// in-place writes refused because the GPU no longer holds the base version, or for another
 /// reason (column absent, sizes changed).
@@ -500,6 +510,8 @@ fn mesh_counters(t: f64, window: f64, copies: &rc_world::ColumnCopies, before: &
     counter(t, "mesh_live_columns", LIVE_COLUMNS.load(Relaxed) as f64);
     counter(t, "mesh_partials_reached_per_s", rate(&PARTIALS_REACHED));
     counter(t, "mesh_partials_unreached_per_s", rate(&PARTIALS_UNREACHED));
+    counter(t, "mesh_columns_held_out_of_view", HELD_COLUMNS.load(Relaxed) as f64);
+    counter(t, "mesh_columns_partly_launched_per_s", rate(&PARTLY_LAUNCHED));
     counter(t, "upload_in_place_sent_mb_per_s", rate(&IN_PLACE_SENT_BYTES) / 1_048_576.0);
     counter(t, "upload_in_place_whole_mb_per_s", rate(&IN_PLACE_WHOLE_BYTES) / 1_048_576.0);
     counter(t, "upload_in_place_refused_version_per_s", rate(&IN_PLACE_REFUSED_VERSION));

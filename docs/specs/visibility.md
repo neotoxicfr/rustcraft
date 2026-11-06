@@ -49,6 +49,39 @@ the order down, up, north, south, west, east.
 - The "smart" test (rules 2 to 4) is turned off when the camera is inside an opaque block
   as a spectator.
 
+## 3. Which dirty sections are rebuilt (per frame)
+
+- The list of visible sections holds the sections the walk reached whose box is in the view
+  frustum, the frustum being moved back until the camera's 8-block cell lies wholly inside it. The
+  list is refreshed when the walk changes or when the camera turns (yaw or pitch rounded down to a
+  multiple of 2 degrees).
+- Each frame, only the sections of that list are looked at: a dirty one is rebuilt if it already
+  has a mesh, or, never built, once the 8 columns around it are loaded; its mark is then cleared.
+  A dirty section outside the list keeps its mark and is rebuilt on the first frame it enters the
+  list. Its old mesh stays drawn meanwhile, and while its rebuild runs.
+- The walk enters a never-built section (so it is in the list and gets built) but does not cross
+  it: its faces communicate only once it has a mesh, and the walk then resumes from it.
+- Priority (`prioritizeChunkUpdates`): among the sections rebuilt, one changed by the player
+  (setting 1 or 2), or whose centre is within √768 blocks of the camera (setting 2), is rebuilt
+  before the frame is drawn; the others in the background.
+- Our version (`RUSTCRAFT_OPT_MESHVISIBLEONLY`, default; `=0`: every dirty column whatever the
+  view, as before), same rule per section of a column, with these differences without visible
+  effect:
+  - our walk does not enter a column without a mesh, so a column the renderer holds no mesh of
+    (never meshed, or its first mesh still on its way) is meshed whatever the view: the loading
+    order does not change;
+  - the view is that of the last frame drawn, with the frustum of the draw (section box plus one
+    block, not moved back): what is drawn is exactly what may be rebuilt, and a section entering
+    the view is launched on the next frame (its rebuild runs in the background anyway);
+  - a column whose remesh would be a priority one is never held (priority unchanged);
+  - a column whose last mesh is no longer kept as a base, or that must be redone whole, is meshed
+    whole (all its marks) as soon as one of its dirty sections is in view: its task meshes the
+    whole column in any case;
+  - the player mark is per column (the game's is per section), so a player change makes the whole
+    column a priority one.
+- Cautious variant (`RUSTCRAFT_OPT_MESH_HIDDEN_IN_SPARE_SLOTS=1`, off by default): the held
+  columns take the task slots the visible ones leave free.
+
 ## Sorting of translucent surfaces (translucent layer without improved transparency)
 
 - Within each section, the translucent quads are drawn from farthest to nearest

@@ -269,6 +269,12 @@ impl Meshes {
         mask.is_all() || !self.busy.contains_key(&key)
     }
 
+    /// The column's last mesh is kept as a base: a partial remesh redoes only its sections
+    /// (without one, the task meshes the whole column). Usage rank left as is.
+    pub fn has_base(&self, key: (i32, i32)) -> bool {
+        self.cache.contains_key(&key)
+    }
+
     /// Entry removed from the cache (bytes given back), if there was one.
     fn take_entry(&mut self, key: (i32, i32)) -> Option<Kept> {
         let kept = self.cache.remove(&key)?;
@@ -624,13 +630,16 @@ impl crate::App {
             jobs.par_iter().map(|job| rc_mesh::blocks::mesh(job, tables, palette, min_y)).collect();
         let fresh: Vec<((i32, i32), Option<u64>)> =
             fresh_meshes.iter().map(|m| ((m.x, m.z), (!m.is_empty()).then(|| digest(m)))).collect();
-        let (mut same, mut differ, mut parked) = (0, Vec::new(), 0);
+        let (mut same, mut differ, mut parked, mut marked) = (0, Vec::new(), 0, 0);
         for (k, d) in &fresh {
             if !gpu.contains_key(k) && self.world.meshes.waiting(*k) && !self.world.surrounded(k.0, k.1) {
                 // Never meshed: one of its neighbours is missing (game rule).
                 parked += 1;
             } else if gpu.get(k).copied() == *d || (!gpu.contains_key(k) && d.is_none()) {
                 same += 1;
+            } else if self.world.dirty.contains_key(k) {
+                // Still marked: out of view (`RUSTCRAFT_OPT_MESHVISIBLEONLY`), or not launched yet.
+                marked += 1;
             } else {
                 differ.push(*k);
             }
@@ -644,8 +653,8 @@ impl crate::App {
             .count();
         eprintln!(
             "[meshcheck] {} columns: {same} identical to the complete mesh, {} different (of which {inner} without \
-             an absent neighbour) {:?}, {parked} never meshed (absent neighbour); waiting {}; walk \
-             identical: {reached:?}",
+             an absent neighbour) {:?}, {parked} never meshed (absent neighbour), {marked} still marked to \
+             remesh; waiting {}; walk identical: {reached:?}",
             fresh.len(),
             differ.len(),
             &differ[..differ.len().min(12)],

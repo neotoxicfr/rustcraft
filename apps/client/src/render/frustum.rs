@@ -6,6 +6,7 @@ use glam::{Mat4, Vec3, Vec4};
 
 use super::{Renderer, perspective};
 use rc_mesh::blocks::BUCKETS;
+use rc_mesh::wire::Sections;
 
 /// For each group of faces (order `Dir`, then unaligned), range of sections of the
 /// column where it can be seen from the front. A face oriented +x is only visible if the camera is
@@ -63,6 +64,50 @@ pub(super) fn aabb_inside(planes: &[Vec4; 6], min: Vec3, max: Vec3) -> bool {
         );
         p.truncate().dot(v) + p.w >= 0.0
     })
+}
+
+/// Box of section `sy` of column `(x, z)` in the frame relative to the camera's integer `origin`,
+/// with one block of margin (a model can overflow its block).
+pub(super) fn section_box(origin: [i32; 2], min_y: i32, (x, z): (i32, i32), sy: i32) -> (Vec3, Vec3) {
+    let min = Vec3::new((x * 16 - origin[0]) as f32, (min_y + sy * 16) as f32, (z * 16 - origin[1]) as f32) - 1.0;
+    (min, min + Vec3::splat(18.0))
+}
+
+/// Box of the whole column `(x, z)` (`sections` high), same frame and margin as [`section_box`].
+pub(super) fn column_box(origin: [i32; 2], min_y: i32, sections: i32, (x, z): (i32, i32)) -> (Vec3, Vec3) {
+    let min = Vec3::new((x * 16 - origin[0]) as f32, min_y as f32, (z * 16 - origin[1]) as f32) - 1.0;
+    (min, min + Vec3::new(18.0, (sections * 16) as f32 + 2.0, 18.0))
+}
+
+/// Field of view of the last frame drawn, as its section test read it: planes, camera integer
+/// origin (x, z), bottom of the world, number of sections.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DrawnView {
+    pub planes: [Vec4; 6],
+    pub origin: [i32; 2],
+    pub min_y: i32,
+    pub sections: i32,
+}
+
+impl DrawnView {
+    /// Sections among `reached` (the reached sections of column `key`) whose box the frame keeps:
+    /// the same test as the draw lists (`lists::column_runs`), as a set.
+    pub fn sections_in_view(&self, key: (i32, i32), reached: &[(i32, i32, i32)]) -> Sections {
+        let mut seen = Sections::default();
+        let (min, max) = column_box(self.origin, self.min_y, self.sections, key);
+        if !aabb_visible(&self.planes, min, max) {
+            return seen;
+        }
+        // Column entirely in the field: every section is, without a per-section test.
+        let all = aabb_inside(&self.planes, min, max);
+        for &(_, sy, _) in reached {
+            let (min, max) = section_box(self.origin, self.min_y, key, sy);
+            if all || aabb_visible(&self.planes, min, max) {
+                seen.insert(sy);
+            }
+        }
+        seen
+    }
 }
 
 /// Verdict of the frame's visibility test for one box; the perf log counts the calls per verdict
@@ -205,6 +250,22 @@ impl Renderer {
         // Sorted by column then height (`frame.rs`).
         let i = self.reached.partition_point(|&(rx, _, rz)| (rx, rz) < (x, z));
         Some(self.reached.get(i).is_some_and(|&(rx, _, rz)| (rx, rz) == (x, z)))
+    }
+
+    /// Sections of column `(x, z)` the meshing treats as seen: reached by the last walk and kept
+    /// by the field of the last frame drawn (the test of the draw lists). `None` when that cannot be
+    /// told: no frame or no walk yet, or no mesh of the column held here (the walk only enters the
+    /// columns it holds, so it would never reach a column left unmeshed).
+    pub fn sections_in_view(&self, x: i32, z: i32) -> Option<Sections> {
+        let view = self.drawn_view.as_ref()?;
+        let held = self.columns.contains_key(&(x, z)) || self.empty_vis.contains_key(&(x, z));
+        if !held || self.reached.is_empty() {
+            return None;
+        }
+        // Sorted by column then height (`frame.rs`): the column's sections are one run.
+        let lo = self.reached.partition_point(|&(rx, _, rz)| (rx, rz) < (x, z));
+        let len = self.reached[lo..].partition_point(|&(rx, _, rz)| (rx, rz) == (x, z));
+        Some(view.sections_in_view((x, z), &self.reached[lo..lo + len]))
     }
 
     /// Appearance fade (0 to 1) of the already meshed column `(x, z)`, `None` before.

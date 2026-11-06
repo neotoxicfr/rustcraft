@@ -379,7 +379,14 @@ impl VideoState {
     /// player, 2 = also those whose centre is within √768 blocks of the eye (the game
     /// measures at the centre of each section; here at eye height). Consumes the mark.
     pub fn mesh_sync(&mut self, x: i32, z: i32, eye: [f64; 3], mode: i32) -> bool {
-        let player = self.player_changed.remove(&(x, z));
+        let sync = self.wants_sync(x, z, eye, mode);
+        self.player_changed.remove(&(x, z));
+        sync
+    }
+
+    /// [`Self::mesh_sync`] without consuming the mark.
+    pub fn wants_sync(&self, x: i32, z: i32, eye: [f64; 3], mode: i32) -> bool {
+        let player = self.player_changed.contains(&(x, z));
         let (dx, dz) = (f64::from(x * 16 + 8) - eye[0], f64::from(z * 16 + 8) - eye[2]);
         match mode {
             1 => player,

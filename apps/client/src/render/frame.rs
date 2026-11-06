@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::capture::surface_state;
-use super::frustum::frustum_planes;
+use super::frustum::{DrawnView, frustum_planes};
 use super::regions::identity_buffer;
 use super::terrain_draw::indexed_args;
 use super::{
@@ -140,6 +140,8 @@ impl Renderer {
             }
         }
         let planes = frustum_planes(cull_view_proj);
+        // Kept for the meshing, which only remeshes the dirty sections this frame keeps.
+        self.drawn_view = Some(DrawnView { planes, origin, min_y, sections: height / 16 });
         // Improved transparency: targets and pipelines prepared as needed, targets freed otherwise.
         if oit_on {
             self.prepare_oit(proj);

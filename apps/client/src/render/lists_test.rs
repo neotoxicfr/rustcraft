@@ -302,6 +302,83 @@ fn changed_range_rebuilds_the_new_commands() {
     assert!(skipped > 1000, "no-change cases too rare ({skipped})");
 }
 
+/// The meshing's view of a column (`DrawnView::sections_in_view`, `RUSTCRAFT_OPT_MESHVISIBLEONLY`)
+/// keeps exactly the sections the draw lists draw for it, along the trajectory of the draw test;
+/// columns out of the field, wholly in it and across its edge all met.
+#[test]
+fn meshing_view_matches_the_drawn_runs() {
+    use super::super::frustum::DrawnView;
+    use rc_mesh::wire::Sections;
+    let mut rng = Lcg(SEED ^ 7);
+    let (cols, mut reached) = world(&mut rng, 12, 5);
+    let (mut outside, mut across, mut inside) = (0, 0, 0);
+    let mut runs = Vec::new();
+    for f in 0..240u32 {
+        if f % 7 == 6 {
+            reach(&mut rng, 12, 5, &mut reached);
+        }
+        // The last frames from high above, looking down: whole columns in the field.
+        let ((eye, yaw, pitch), far) =
+            if f < 200 { (camera(f), 12.0 * 16.0) } else { (([0.5, 900.0, 0.5], f as f32, 89.0), 2000.0) };
+        let (origin, pl) = planes(eye, yaw, pitch, far);
+        let inp = ListIn {
+            columns: &cols,
+            reached: &reached,
+            planes: &pl,
+            origin,
+            eye,
+            min_y: MIN_Y,
+            sections: SECTIONS,
+            face_vertices: 4,
+            split_draws: false,
+            reached_gen: 0,
+            columns_rev: 0,
+        };
+        let view = DrawnView { planes: pl, origin, min_y: MIN_Y, sections: SECTIONS };
+        for secs in reached.chunk_by(|a, b| (a.0, a.2) == (b.0, b.2)) {
+            let k = (secs[0].0, secs[0].2);
+            runs.clear();
+            column_runs(&inp, k, secs, &mut runs);
+            let mut drawn = Sections::default();
+            runs.iter().flat_map(Range::clone).for_each(|s| drawn.insert(s as i32));
+            assert_eq!(view.sections_in_view(k, secs), drawn, "frame {f}, column {k:?}");
+            match drawn.count(SECTIONS as usize) {
+                0 => outside += 1,
+                n if n == secs.len() => inside += 1,
+                _ => across += 1,
+            }
+        }
+    }
+    assert!(outside > 1000 && across > 100 && inside > 1000, "cases {outside} / {across} / {inside}");
+}
+
+/// Micro-bench of the meshing's view (`cargo test --release -- --ignored meshing_view_bench
+/// --nocapture`): sections in view of every reached column, distance 12 and 32, one core.
+#[test]
+#[ignore]
+fn meshing_view_bench() {
+    use super::super::frustum::DrawnView;
+    for r in [12, 32] {
+        let mut rng = Lcg(SEED);
+        let (_, reached) = world(&mut rng, r, 5);
+        let columns: Vec<&[(i32, i32, i32)]> = reached.chunk_by(|a, b| (a.0, a.2) == (b.0, b.2)).collect();
+        let frames = 200u32;
+        let mut seen = 0usize;
+        let t = std::time::Instant::now();
+        for f in 0..frames {
+            let eye = [0.5, 70.0, 0.5];
+            let (origin, pl) = planes(eye, f as f32 * 0.9, 10.0, r as f32 * 16.0);
+            let view = DrawnView { planes: pl, origin, min_y: MIN_Y, sections: SECTIONS };
+            for secs in &columns {
+                let s = view.sections_in_view((secs[0].0, secs[0].2), secs);
+                seen += s.count(SECTIONS as usize);
+            }
+        }
+        let ns = t.elapsed().as_secs_f64() * 1e9 / f64::from(frames) / columns.len() as f64;
+        println!("meshing view distance {r}: {ns:.1} ns per column ({} columns, {seen} sections seen)", columns.len());
+    }
+}
+
 /// Grid of reached sections = set of the same sections, over the whole box and beyond.
 #[test]
 fn reach_grid_matches_the_set() {
