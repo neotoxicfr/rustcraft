@@ -35,6 +35,11 @@ fn digest(r: &EntityRenderer) -> u64 {
             fnv(&mut h, &b.to_le_bytes());
         }
     }
+    digest_all_but_matrices(r, h)
+}
+
+/// The rest of [`digest`]: everything `prepare` placed but the part matrices.
+fn digest_all_but_matrices(r: &EntityRenderer, mut h: u64) -> u64 {
     for (p, list) in r.instances.iter().enumerate() {
         fnv(&mut h, &(p as u32).to_le_bytes());
         for (src, first, count, inst) in list {
@@ -266,20 +271,37 @@ fn prep(k: &mut Kit, ents: &[Entity], opt: EntOpt) {
 /// places makes it fail. Batch 5 integration: 0xf3e2_3c99_f7b8_6fb5 -> current value, sole
 /// cause G2-F05 fidelity (items and blocks drawn as entities; fixed white biome tint
 /// in `prep`), verified on c3-m11 + g2-f05 alone: same value, all variants equal.
-/// Since C3-M21 this is the fingerprint of the old paths with the C library's sine
-/// (`ANIMATION_SINE_TABLE=0`): unchanged, it proves every other new path moves no bit.
+/// Since the animations read the game's sine table, this is the fingerprint of the old paths
+/// with the C library's sine (`ANIMATION_SINE_TABLE=0`, library rotations): unchanged, it
+/// proves every other exact path moves no bit.
 const GOLDEN_LIBRARY_SINE: u64 = 0x7f87_d9a9_7d93_dba3;
 
-/// The scene animated through the game's sine table (the default). Validated against the
+/// The scene animated through the game's sine table, library rotations. Validated against the
 /// game by its parts: the table is the game's bit for bit (`frozen_table_is_the_game_table`),
 /// each animation site was checked in the game's code to read that table (the few that take
 /// the library sine in double precision do so here too), and the cow and zombie walk angles
 /// equal the game's formulas (`walk_angles_follow_the_game_sine_table`).
 const GOLDEN: u64 = 0xe50f_7c48_fa18_9cc8;
 
+/// Every path new, the polynomial root rotations included (the default).
+const GOLDEN_POLY_ROTATIONS: u64 = 0x0ffc_de87_4213_3a49;
+
+/// Largest difference between two lists of part matrices, relative to each entry's size
+/// (at least 1: translations of a few blocks are compared absolutely).
+fn worst_matrix_difference(a: &[PartMat], b: &[PartMat]) -> f32 {
+    assert_eq!(a.len(), b.len(), "matrix counts");
+    let entries = |m: &PartMat| m.m.iter().flatten().chain(m.n.iter().flatten()).copied().collect::<Vec<f32>>();
+    a.iter()
+        .zip(b)
+        .flat_map(|(x, y)| entries(x).into_iter().zip(entries(y)))
+        .map(|(x, y)| (x - y).abs() / y.abs().max(1.0))
+        .fold(0.0, f32::max)
+}
+
 /// `prepare` places exactly the same thing under each switch turned off, alone or all, and
 /// the fingerprint is the kept one. The sine table changes the animations (fidelity): every
-/// other switch is compared at equal sine, and each sine has its golden value.
+/// other switch is compared at equal sine, and each sine has its golden value. The polynomial
+/// rotations are a rendering tolerance: compared apart, matrix by matrix.
 #[test]
 fn prepare_snapshot_same_under_every_switch() {
     let Some(mut k) = kit() else { return };
@@ -287,7 +309,8 @@ fn prepare_snapshot_same_under_every_switch() {
     // Invisible glowing entity and ghost seen by the local player.
     k.r.glow.insert(5000 + KINDS.iter().position(|n| *n == "spider").unwrap() as u128, 0xff00ff);
     k.r.ghosts.insert(5000 + KINDS.iter().position(|n| *n == "enderman").unwrap() as u128);
-    let all_new = EntOpt::NEW;
+    // Every exact path new; the polynomial rotations are checked at the end.
+    let all_new = EntOpt { poly_rotations: false, ..EntOpt::NEW };
     // First pass: caches (layers, item meshes, atlas) filled.
     run(&mut k, &ents, all_new);
     let library_sine = run(&mut k, &ents, EntOpt::OLD);
@@ -338,6 +361,16 @@ fn prepare_snapshot_same_under_every_switch() {
     }
     assert_eq!(library_sine, GOLDEN_LIBRARY_SINE, "fingerprint of the library sine changed: {library_sine:#x}");
     assert_eq!(reference, GOLDEN, "scene fingerprint changed: {reference:#x}");
+    // Polynomial rotations: the same instances and geometry, every matrix within 1e-5.
+    prep(&mut k, &ents, all_new);
+    let (exact_mats, exact_rest) = (k.r.mats.clone(), digest_all_but_matrices(&k.r, 0));
+    let poly = run(&mut k, &ents, EntOpt::NEW);
+    assert_eq!(digest_all_but_matrices(&k.r, 0), exact_rest, "the rotations moved more than matrices");
+    let worst = worst_matrix_difference(&k.r.mats, &exact_mats);
+    eprintln!("polynomial rotations: worst matrix difference {worst:e}");
+    assert!(worst < 1e-5, "{worst}");
+    assert!(worst > 0.0, "the polynomial rotations change nothing: the test sees nothing");
+    assert_eq!(poly, GOLDEN_POLY_ROTATIONS, "fingerprint of the polynomial rotations changed: {poly:#x}");
 }
 
 /// Keyframe families, adults and babies, every client animation state started at tick 10:
@@ -610,8 +643,9 @@ fn bench_entity_prepare() {
         ("all except OBJEARLY", EntOpt { obj_early: false, ..all_new }),
         ("all except ITEMFLAGS", EntOpt { reg_idx: false, item_flags: false, ..all_new }),
         (
-            "all, 6 animation ones off",
+            "all, 7 animation ones off",
             EntOpt {
+                poly_rotations: false,
                 dragon_effects_gate: false,
                 shared_body_angle: false,
                 skip_identity_root_factors: false,
@@ -627,6 +661,7 @@ fn bench_entity_prepare() {
         ("all except ANIMATION_SINE_TABLE", EntOpt { animation_sine_table: false, ..all_new }),
         ("all except KNOWN_PART_NAMES", EntOpt { known_part_names: false, ..all_new }),
         ("all except KEYFRAME_STATIC_NAMES", EntOpt { keyframe_static_names: false, ..all_new }),
+        ("all except POLY_ROTATIONS", EntOpt { poly_rotations: false, ..all_new }),
     ];
     for n in [100usize, 1000, 5000] {
         let mut ents = Vec::with_capacity(n);

@@ -1343,16 +1343,20 @@ struct AnimationPaths {
     widened_part_names: bool,
     /// `KEYFRAME_STATIC_NAMES`: keyframe animations named by literals, not formatted.
     static_keyframe_names: bool,
+    /// `POLY_ROTATIONS`: root and family rotations through the rendering polynomials.
+    poly_rotations: bool,
 }
 
 impl AnimationPaths {
-    const NEW: AnimationPaths = AnimationPaths { sine_table: true, widened_part_names: true, static_keyframe_names: true };
+    const NEW: AnimationPaths =
+        AnimationPaths { sine_table: true, widened_part_names: true, static_keyframe_names: true, poly_rotations: true };
 
     fn of(opt: &EntOpt) -> AnimationPaths {
         AnimationPaths {
             sine_table: opt.animation_sine_table,
             widened_part_names: opt.known_part_names,
             static_keyframe_names: opt.keyframe_static_names,
+            poly_rotations: opt.poly_rotations,
         }
     }
 }
@@ -1377,6 +1381,42 @@ fn table_sin(x: f32) -> f32 {
 #[inline]
 fn table_cos(x: f32) -> f32 {
     if animation_paths().sine_table { rc_physics::cos_t(x) } else { x.cos() }
+}
+
+/// Sine and cosine of an angle in degrees for a rendering matrix: folded exactly into
+/// [−180, 180[ first (a yaw grows without bound and the polynomials are only precise under
+/// 20 rad; in degrees the turn is exact), then the rendering polynomials of [`sin_cos`].
+fn rendering_sin_cos_degrees(degrees: f32) -> (f32, f32) {
+    sin_cos(deg(rc_data::java_math::wrap_degrees(degrees)))
+}
+
+/// Rotation about Y by `degrees`, for the entity roots and the family rotation stacks: the
+/// rendering sine (within 1e-6, invisible) where the library sine is a call per axis
+/// (`RUSTCRAFT_OPT_POLY_ROTATIONS=0`: the library's, the old path).
+fn rotation_y_degrees(degrees: f32) -> Mat4 {
+    if !animation_paths().poly_rotations {
+        return Mat4::from_rotation_y(deg(degrees));
+    }
+    let (s, c) = rendering_sin_cos_degrees(degrees);
+    Mat4::from_cols(glam::Vec4::new(c, 0.0, -s, 0.0), glam::Vec4::Y, glam::Vec4::new(s, 0.0, c, 0.0), glam::Vec4::W)
+}
+
+/// Rotation about X by `degrees` (see [`rotation_y_degrees`]).
+fn rotation_x_degrees(degrees: f32) -> Mat4 {
+    if !animation_paths().poly_rotations {
+        return Mat4::from_rotation_x(deg(degrees));
+    }
+    let (s, c) = rendering_sin_cos_degrees(degrees);
+    Mat4::from_cols(glam::Vec4::X, glam::Vec4::new(0.0, c, s, 0.0), glam::Vec4::new(0.0, -s, c, 0.0), glam::Vec4::W)
+}
+
+/// Rotation about Z by `degrees` (see [`rotation_y_degrees`]).
+fn rotation_z_degrees(degrees: f32) -> Mat4 {
+    if !animation_paths().poly_rotations {
+        return Mat4::from_rotation_z(deg(degrees));
+    }
+    let (s, c) = rendering_sin_cos_degrees(degrees);
+    Mat4::from_cols(glam::Vec4::new(c, s, 0.0, 0.0), glam::Vec4::new(-s, c, 0.0, 0.0), glam::Vec4::Z, glam::Vec4::W)
 }
 
 /// Pitch of the humanoid head: raised by 45° forwards while gliding.
@@ -2099,6 +2139,9 @@ pub(crate) struct EntOpt {
     /// `KEYFRAME_STATIC_NAMES`: keyframe animations named by literals instead of names
     /// formatted at every frame (camel, rabbit, armadillo, breeze, warden).
     pub keyframe_static_names: bool,
+    /// `POLY_ROTATIONS`: root and family rotations through the rendering polynomials (within
+    /// 1e-6 of the library sine, an approximation of the rendering like the part matrices).
+    pub poly_rotations: bool,
 }
 
 impl EntOpt {
@@ -2119,6 +2162,7 @@ impl EntOpt {
         animation_sine_table: false,
         known_part_names: false,
         keyframe_static_names: false,
+        poly_rotations: false,
     };
 
     /// New paths everywhere.
@@ -2138,6 +2182,7 @@ impl EntOpt {
         animation_sine_table: true,
         known_part_names: true,
         keyframe_static_names: true,
+        poly_rotations: true,
     };
 
     pub(crate) fn from_env() -> EntOpt {
@@ -2156,6 +2201,7 @@ impl EntOpt {
             animation_sine_table: rc_data::opt_switch!("RUSTCRAFT_OPT_ANIMATION_SINE_TABLE"),
             known_part_names: rc_data::opt_switch!("RUSTCRAFT_OPT_KNOWN_PART_NAMES"),
             keyframe_static_names: rc_data::opt_switch!("RUSTCRAFT_OPT_KEYFRAME_STATIC_NAMES"),
+            poly_rotations: rc_data::opt_switch!("RUSTCRAFT_OPT_POLY_ROTATIONS"),
         }
     }
 }
@@ -4474,20 +4520,20 @@ impl EntityRenderer {
             }
             m *= Mat4::from_translation(creatures::model_offset(e) + Vec3::new(0.0, -1.501, 0.0));
         } else if e.kind == "evoker_fangs" {
-            m *= Mat4::from_rotation_y(deg(90.0 - e.yaw));
+            m *= rotation_y_degrees(90.0 - e.yaw);
             m *= Mat4::from_scale(Vec3::new(-1.0, -1.0, 1.0));
             m *= Mat4::from_translation(Vec3::new(0.0, -1.501, 0.0));
         } else if matches!(e.kind.as_str(), "arrow" | "spectral_arrow") {
             // Yaw − 90° then pitch; shaking after the impact.
             let yaw = e.yaw_o + (e.yaw - e.yaw_o) * pt;
             let pitch = e.pitch_o + (e.pitch - e.pitch_o) * pt;
-            m *= Mat4::from_rotation_y(deg(yaw - 90.0)) * Mat4::from_rotation_z(deg(pitch));
+            m *= rotation_y_degrees(yaw - 90.0) * rotation_z_degrees(pitch);
             let s = e.shake as f32 - pt;
             if s > 0.0 {
-                m *= Mat4::from_rotation_z(deg(-table_sin(3.0 * s) * s));
+                m *= rotation_z_degrees(-table_sin(3.0 * s) * s);
             }
         } else {
-            m *= Mat4::from_rotation_y(deg(-e.yaw));
+            m *= rotation_y_degrees(-e.yaw);
         }
         let overlay = (white * 15.0) as u32 | (if red { 3 } else { 10 }) << 16;
         let wool = e.meta_byte(18) as u8;
@@ -6739,7 +6785,7 @@ fn pose_rotations(e: &Entity, pt: f32, body: f32, m: &mut Mat4, c: &RotCtx) {
     // A zero shake is the identity rotation (sine +0, cosine 1): the product would return the
     // matrix up to the sign of zeros, which no pixel shows (`identity_product_keeps_matrix`).
     if !sleeping && !(c.skip_identity_factors && shake == 0.0) {
-        *m *= Mat4::from_rotation_y(deg(-shake));
+        *m *= rotation_y_degrees(-shake);
     }
     // `body` is the same interpolation the families used to redo, bit for bit.
     let family_body = if c.shared_body_angle { body } else { rot_lerp(pt, e.body_o, e.body) };
@@ -6749,12 +6795,12 @@ fn pose_rotations(e: &Entity, pt: f32, body: f32, m: &mut Mat4, c: &RotCtx) {
             || dragon::rotations(e, pt, m)
             || shulker::rotations(e, family_body, m));
     if !family && !sleeping {
-        *m *= Mat4::from_rotation_y(deg(180.0 - body));
+        *m *= rotation_y_degrees(180.0 - body);
     }
     // Armor stand hit (event 32): 5-tick oscillation around Y.
     if e.kind == "armor_stand" && e.timers[0] > 0 {
         let w = (5 - e.timers[0]) as f32 + pt;
-        *m *= Mat4::from_rotation_y(deg(table_sin(w / 1.5 * std::f32::consts::PI) * 3.0));
+        *m *= rotation_y_degrees(table_sin(w / 1.5 * std::f32::consts::PI) * 3.0);
     }
     // Pitch of the entity in degrees (inverted upside down).
     let x_rot = (e.pitch_o + pt * (e.pitch - e.pitch_o)) * if c.upside_down { -1.0 } else { 1.0 };
@@ -6766,14 +6812,14 @@ fn pose_rotations(e: &Entity, pt: f32, body: f32, m: &mut Mat4, c: &RotCtx) {
         // Death tilt (not for a creaking tearing itself down: counter rendered as zero).
         let t = e.death_time as f32 - 1.0 + pt;
         let f = (t / 20.0 * 1.6).sqrt().min(1.0);
-        *m *= Mat4::from_rotation_z(deg(f * flip));
+        *m *= rotation_z_degrees(f * flip);
     } else if spin {
         // Spin attack (Riptide): lying along the gaze axis, spinning top.
-        *m *= Mat4::from_rotation_x(deg(-90.0 - x_rot)) * Mat4::from_rotation_y(deg((e.age as f32 + pt) * -75.0));
+        *m *= rotation_x_degrees(-90.0 - x_rot) * rotation_y_degrees((e.age as f32 + pt) * -75.0);
     } else if sleeping {
         // Lying: head towards the head of the bed (bed direction), otherwise body yaw.
         let angle = c.env.bed.map_or(body + shake, |b| b.2);
-        *m *= Mat4::from_rotation_y(deg(angle)) * Mat4::from_rotation_z(deg(flip)) * Mat4::from_rotation_y(deg(270.0));
+        *m *= rotation_y_degrees(angle) * rotation_z_degrees(flip) * rotation_y_degrees(270.0);
     } else if c.upside_down {
         let h = c.height;
         let s = living_scale(e);
@@ -6785,14 +6831,14 @@ fn pose_rotations(e: &Entity, pt: f32, body: f32, m: &mut Mat4, c: &RotCtx) {
             // Glide: lying forward as the flight sets in, then
             // turned towards the movement direction.
             if !spin {
-                *m *= Mat4::from_rotation_x(deg(pa.fly_scale(pt) * (-90.0 - x_rot)));
+                *m *= rotation_x_degrees(pa.fly_scale(pt) * (-90.0 - x_rot));
             }
             if let Some(a) = flying_y_rot(e, pt) {
                 *m *= Mat4::from_rotation_y(a);
             }
         } else if c.swim > 0.0 {
             let target = if c.env.in_water { -90.0 - x_rot } else { -90.0 };
-            *m *= Mat4::from_rotation_x(deg(c.swim * target));
+            *m *= rotation_x_degrees(c.swim * target);
             if visually_swimming(e) {
                 *m *= Mat4::from_translation(Vec3::new(0.0, -1.0, 0.3));
             }
@@ -6802,7 +6848,7 @@ fn pose_rotations(e: &Entity, pt: f32, body: f32, m: &mut Mat4, c: &RotCtx) {
     if e.kind == "drowned" && c.swim > 0.0 {
         let pivot = Vec3::new(0.0, c.height / 2.0 / living_scale(e), 0.0);
         *m *= Mat4::from_translation(pivot)
-            * Mat4::from_rotation_x(deg(c.swim * (-10.0 - x_rot)))
+            * rotation_x_degrees(c.swim * (-10.0 - x_rot))
             * Mat4::from_translation(-pivot);
     }
 }
@@ -8216,6 +8262,37 @@ mod tests {
             assert_eq!(((a.0 + 0.0).to_bits(), (a.1 + 0.0).to_bits()), ((b.0 + 0.0).to_bits(), (b.1 + 0.0).to_bits()), "{x}");
             x += 0.000_37;
         }
+    }
+
+    /// The polynomial rotations about each axis stay within 2e-6 of the double-precision
+    /// rotation for angles up to ±10^5 degrees (the library path of the unfolded angle drifts
+    /// there), and sit where glam puts each entry (a transposed or mis-signed entry is caught).
+    #[test]
+    fn polynomial_rotations_match_double_reference() {
+        let reference = |axis: usize, degrees: f32| {
+            let (s, c) = f64::from(degrees).to_radians().sin_cos();
+            let (s, c) = (s as f32, c as f32);
+            match axis {
+                0 => Mat4::from_cols(glam::Vec4::X, glam::Vec4::new(0.0, c, s, 0.0), glam::Vec4::new(0.0, -s, c, 0.0), glam::Vec4::W),
+                1 => Mat4::from_cols(glam::Vec4::new(c, 0.0, -s, 0.0), glam::Vec4::Y, glam::Vec4::new(s, 0.0, c, 0.0), glam::Vec4::W),
+                _ => Mat4::from_cols(glam::Vec4::new(c, s, 0.0, 0.0), glam::Vec4::new(-s, c, 0.0, 0.0), glam::Vec4::Z, glam::Vec4::W),
+            }
+        };
+        let helpers: [fn(f32) -> Mat4; 3] = [rotation_x_degrees, rotation_y_degrees, rotation_z_degrees];
+        let glam_helpers: [fn(f32) -> Mat4; 3] = [Mat4::from_rotation_x, Mat4::from_rotation_y, Mat4::from_rotation_z];
+        let mut worst = 0.0f32;
+        let mut d = -100_000.0f32;
+        while d < 100_000.0 {
+            for axis in 0..3 {
+                let got = helpers[axis](d);
+                worst = worst.max((got - reference(axis, d)).abs().to_cols_array().into_iter().fold(0.0, f32::max));
+                if d.abs() < 360.0 {
+                    assert!(got.abs_diff_eq(glam_helpers[axis](deg(d)), 2e-6), "axis {axis} at {d}");
+                }
+            }
+            d += 0.731;
+        }
+        assert!(worst < 2e-6, "{worst}");
     }
 
     /// Each declared part name finds its own index (dense, unique): a shifted or repeated id

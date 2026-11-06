@@ -1078,15 +1078,15 @@ pub(super) fn rotations(e: &Entity, pt: f32, body: f32, m: &mut Mat4) -> bool {
             if e.kind == "pufferfish" {
                 *m *= Mat4::from_translation(Vec3::new(0.0, table_cos(age * 0.05) * 0.08, 0.0));
             }
-            *m *= Mat4::from_rotation_y(deg(180.0 - body));
+            *m *= rotation_y_degrees(180.0 - body);
             if e.kind == "pufferfish" {
                 return true;
             }
             let (a, b) = if e.kind == "salmon" && !water { (1.3, 1.7) } else { (1.0, 1.0) };
-            *m *= Mat4::from_rotation_y(deg(a * 4.3 * table_sin(b * 0.6 * age)));
+            *m *= rotation_y_degrees(a * 4.3 * table_sin(b * 0.6 * age));
             if !water {
                 let t = if e.kind == "cod" { Vec3::new(0.1, 0.1, -0.1) } else { Vec3::new(0.2, 0.1, 0.0) };
-                *m *= Mat4::from_translation(t) * Mat4::from_rotation_z(deg(90.0));
+                *m *= Mat4::from_translation(t) * rotation_z_degrees(90.0);
             }
             true
         }
@@ -1096,26 +1096,26 @@ pub(super) fn rotations(e: &Entity, pt: f32, body: f32, m: &mut Mat4) -> bool {
             let xb = lerp(pt, e.extra[7], e.extra[6]);
             let zb = lerp(pt, e.extra[9], e.extra[8]);
             *m *= Mat4::from_translation(Vec3::new(0.0, up, 0.0))
-                * Mat4::from_rotation_y(deg(180.0 - yb))
-                * Mat4::from_rotation_x(deg(xb))
-                * Mat4::from_rotation_y(deg(zb))
+                * rotation_y_degrees(180.0 - yb)
+                * rotation_x_degrees(xb)
+                * rotation_y_degrees(zb)
                 * Mat4::from_translation(Vec3::new(0.0, down, 0.0));
             true
         }
         // Iron golem: walking sway (triangle wave, ±6.5° in z).
         "iron_golem" => {
-            *m *= Mat4::from_rotation_y(deg(180.0 - body));
+            *m *= rotation_y_degrees(180.0 - body);
             let (pos, v) = e.walk_at(pt);
             if v >= 0.01 {
                 let w = ((pos + 6.0) % 13.0 - 6.5).abs();
-                *m *= Mat4::from_rotation_z(deg(6.5 * (w - 3.25) / 3.25));
+                *m *= rotation_z_degrees(6.5 * (w - 3.25) / 3.25);
             }
             true
         }
         // Phantom: pitch of the entity (scale and offset: `scale`, `model_offset`).
         "phantom" => {
             let x_rot = e.pitch_o + pt * (e.pitch - e.pitch_o);
-            *m *= Mat4::from_rotation_y(deg(180.0 - body)) * Mat4::from_rotation_x(deg(x_rot));
+            *m *= rotation_y_degrees(180.0 - body) * rotation_x_degrees(x_rot);
             true
         }
         _ => false,

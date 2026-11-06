@@ -1491,14 +1491,14 @@ pub(super) fn rotations(e: &Entity, pt: f32, body: f32, m: &mut Mat4, lazy_base:
         return false;
     }
     let x_rot = e.pitch_o + pt * (e.pitch - e.pitch_o);
-    let base = Mat4::from_rotation_y(deg(180.0 - body));
+    let base = rotation_y_degrees(180.0 - body);
     match e.kind.as_str() {
         "cat" => {
             let lie = lerp(pt, e.extra[1], e.extra[0]);
             *m *= base;
             if lie > 0.0 {
                 *m *= Mat4::from_translation(Vec3::new(0.4 * lie, 0.15 * lie, 0.1 * lie))
-                    * Mat4::from_rotation_z(deg(rot_lerp_deg(lie, 0.0, 90.0)));
+                    * rotation_z_degrees(rot_lerp_deg(lie, 0.0, 90.0));
                 // Lying on a sleeping player (`cat_track`, extra 6): offset by 0.15.
                 if e.extra[6] != 0.0 {
                     *m *= Mat4::from_translation(Vec3::new(0.15 * lie, 0.0, 0.0));
@@ -1509,7 +1509,7 @@ pub(super) fn rotations(e: &Entity, pt: f32, body: f32, m: &mut Mat4, lazy_base:
         "fox" => {
             *m *= base;
             if e.meta_byte(19) & (16 | 64) != 0 {
-                *m *= Mat4::from_rotation_x(deg(-x_rot));
+                *m *= rotation_x_degrees(-x_rot);
             }
             true
         }
@@ -1550,19 +1550,19 @@ fn panda_rotations(e: &Entity, pt: f32, x_rot: f32, m: &mut Mat4) {
             (0.0, 0.0)
         };
         if pos < 32 {
-            *m *= Mat4::from_translation(Vec3::new(0.0, dy, 0.0)) * Mat4::from_rotation_x(deg(-a));
+            *m *= Mat4::from_translation(Vec3::new(0.0, dy, 0.0)) * rotation_x_degrees(-a);
         }
     }
     let sit = lerp(pt, x[1], x[0]);
     if sit > 0.0 {
         *m *= Mat4::from_translation(Vec3::new(0.0, 0.8 * sit, 0.0))
-            * Mat4::from_rotation_x(deg(lerp(sit, x_rot, x_rot + 90.0)))
+            * rotation_x_degrees(lerp(sit, x_rot, x_rot + 90.0))
             * Mat4::from_translation(Vec3::new(0.0, -sit, 0.0));
         // Scared (worried gene, thunderstorm): yaw shaking; the baby is realigned.
         if panda_scared(e) {
             let age = e.age as f32 + pt;
             let shake = (f64::from(age * 1.25).cos() * std::f64::consts::PI * 0.05) as f32;
-            *m *= Mat4::from_rotation_y(deg(shake));
+            *m *= rotation_y_degrees(shake);
             if baby {
                 *m *= Mat4::from_translation(Vec3::new(0.0, 0.8, 0.55));
             }
@@ -1572,7 +1572,7 @@ fn panda_rotations(e: &Entity, pt: f32, x_rot: f32, m: &mut Mat4) {
     if back > 0.0 {
         let y = if baby { 0.5 } else { 1.3 };
         *m *= Mat4::from_translation(Vec3::new(0.0, y * back, 0.0))
-            * Mat4::from_rotation_x(deg(lerp(back, x_rot, x_rot + 180.0)));
+            * rotation_x_degrees(lerp(back, x_rot, x_rot + 180.0));
     }
 }
 
