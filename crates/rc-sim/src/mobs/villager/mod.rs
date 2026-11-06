@@ -1275,6 +1275,16 @@ impl Server {
         b.mem.last_woken = Some(self.time);
     }
 
+    /// `stop_sleeping` for a villager whose brain is still in place (bed kicked, death).
+    pub(crate) fn npc_wake(&mut self, m: &mut Mob) {
+        if let Some(mut b) = m.npc.as_mut().and_then(|n| n.brain.take()) {
+            self.stop_sleeping(m, &mut b);
+            if let Some(n) = m.npc.as_mut() {
+                n.brain = Some(b);
+            }
+        }
+    }
+
     // ---------- Life cycle ----------
 
     /// Trader state of a new or read-back mob, villager brain.
