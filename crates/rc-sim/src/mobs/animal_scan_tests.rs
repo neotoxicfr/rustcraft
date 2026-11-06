@@ -254,11 +254,13 @@ fn compare_alerts_and_charges(s: &mut Server) -> (Seen, Seen) {
     (alert, charge)
 }
 
+type EntityFilter = dyn Fn(&Server, Ent) -> bool;
+
 /// Nautilus brain: the closest visible entity accepted by a filter, list walked in place or
 /// copied; same answer, same verdicts kept in the brain, same mob.
 fn compare_visible(s: &mut Server) -> Seen {
     let mut seen = Seen::default();
-    let filters: [&dyn Fn(&Server, Ent) -> bool; 4] = [
+    let filters: [&EntityFilter; 4] = [
         &|_, _| true,
         &|_, e| e == Ent::Player,
         &|s, e| matches!(e, Ent::Mob(id) if s.mob_ref(id).is_some_and(|o| o.kind == Kind::Pufferfish)),
