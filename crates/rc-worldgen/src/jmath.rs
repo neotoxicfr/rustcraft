@@ -54,7 +54,7 @@ impl SinCosPaths {
     /// split, else the library call.
     pub fn selected() -> Self {
         static PATHS: LazyLock<SinCosPaths> = LazyLock::new(|| {
-            let product = if crate::opt::two_prod_fma() && fma_available() {
+            let product = if crate::opt::two_prod_fma() && rc_data::cpu::has_fma() {
                 ProductPath::HardwareFma
             } else if crate::opt::two_prod_split() {
                 ProductPath::Split
@@ -344,18 +344,6 @@ mod fma_compiled {
     }
 }
 
-/// The processor has the FMA instruction (detection done once by the standard library).
-pub fn fma_available() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        std::arch::is_x86_feature_detected!("fma")
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        false
-    }
-}
-
 /// [`sin`] through given paths (equivalence tests and benches).
 #[allow(unsafe_code)]
 pub fn sin_with(x: f64, paths: SinCosPaths) -> f64 {
@@ -363,7 +351,7 @@ pub fn sin_with(x: f64, paths: SinCosPaths) -> f64 {
         ProductPath::LibraryFma => sin_body::<FusedProduct>(x, paths),
         #[cfg(target_arch = "x86_64")]
         // SAFETY: the FMA instruction was detected on this processor.
-        ProductPath::HardwareFma if fma_available() => unsafe { fma_compiled::sin(x, paths) },
+        ProductPath::HardwareFma if rc_data::cpu::has_fma() => unsafe { fma_compiled::sin(x, paths) },
         ProductPath::Split | ProductPath::HardwareFma => sin_body::<SplitProduct>(x, paths),
     }
 }
@@ -375,7 +363,7 @@ pub fn cos_with(x: f64, paths: SinCosPaths) -> f64 {
         ProductPath::LibraryFma => cos_body::<FusedProduct>(x, paths),
         #[cfg(target_arch = "x86_64")]
         // SAFETY: the FMA instruction was detected on this processor.
-        ProductPath::HardwareFma if fma_available() => unsafe { fma_compiled::cos(x, paths) },
+        ProductPath::HardwareFma if rc_data::cpu::has_fma() => unsafe { fma_compiled::cos(x, paths) },
         ProductPath::Split | ProductPath::HardwareFma => cos_body::<SplitProduct>(x, paths),
     }
 }
@@ -387,7 +375,7 @@ pub fn sincos_shared_with(x: f64, paths: SinCosPaths) -> (f64, f64) {
         ProductPath::LibraryFma => sincos_body::<FusedProduct>(x, paths),
         #[cfg(target_arch = "x86_64")]
         // SAFETY: the FMA instruction was detected on this processor.
-        ProductPath::HardwareFma if fma_available() => unsafe { fma_compiled::sincos(x, paths) },
+        ProductPath::HardwareFma if rc_data::cpu::has_fma() => unsafe { fma_compiled::sincos(x, paths) },
         ProductPath::Split | ProductPath::HardwareFma => sincos_body::<SplitProduct>(x, paths),
     }
 }
@@ -497,7 +485,7 @@ mod tests {
 
     #[test]
     fn sin_cos_paths_match_old_bitwise() {
-        if !fma_available() {
+        if !rc_data::cpu::has_fma() {
             eprintln!("no FMA on this processor: the hardware path is the split one");
         }
         for paths in all_paths().into_iter().filter(|&p| p != SinCosPaths::OLD) {

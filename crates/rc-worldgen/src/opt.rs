@@ -202,7 +202,7 @@ switch!(
 /// Flattened biome tree: distances of the children in AVX2, if the processor has it.
 #[inline]
 pub fn btree_simd() -> bool {
-    static S: LazyLock<bool> = LazyLock::new(|| on(&["RUSTCRAFT_OPT_BTREE_SIMD"]) && avx2_available());
+    static S: LazyLock<bool> = LazyLock::new(|| on(&["RUSTCRAFT_OPT_BTREE_SIMD"]) && rc_data::cpu::has_avx2());
     *S
 }
 
@@ -645,18 +645,6 @@ switch_f!(
 /// Vectorised kernel compiled for AVX2, if the processor has it (detection done once).
 #[inline]
 pub fn noise_avx2() -> bool {
-    static S: LazyLock<bool> = LazyLock::new(|| on(&["RUSTCRAFT_OPT_NOISE_AVX2"]) && avx2_available());
+    static S: LazyLock<bool> = LazyLock::new(|| on(&["RUSTCRAFT_OPT_NOISE_AVX2"]) && rc_data::cpu::has_avx2());
     *S
-}
-
-/// AVX2 present on this processor.
-pub fn avx2_available() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        std::arch::is_x86_feature_detected!("avx2")
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        false
-    }
 }
