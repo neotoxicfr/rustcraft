@@ -122,7 +122,7 @@ struct ChamberRun {
 /// a player who comes, leaves and comes back with Bad Omen, mobs killed, a key inserted, a
 /// `/data merge` in a non-normalized form while the fight goes on.
 fn chamber_scenario() -> Option<ChamberRun> {
-    let tag = format!("c6m09-chamber-{}", SpawnPaths::current() == SpawnPaths::NEW);
+    let tag = format!("spawn-paths-chamber-{}", SpawnPaths::current() == SpawnPaths::NEW);
     let (mut p, _dir) = open(&tag)?;
     nbtio::set(&mut p.s.rules, "minecraft:spawn_mobs", Nbt::Byte(1));
     p.run("setblock 216 -59 212 minecraft:trial_spawner\nsetblock 218 -59 207 minecraft:vault\n");
@@ -187,7 +187,8 @@ fn trial_chamber_paths_match() {
     for (label, paths) in [
         ("former write", SpawnPaths { trial_write_on_change: false, ..SpawnPaths::NEW }),
         ("former trial read", SpawnPaths { trial_borrow: false, ..SpawnPaths::NEW }),
-        ("former vault", SpawnPaths { vault_early_exit: false, ..SpawnPaths::NEW }),
+        ("former vault exit", SpawnPaths { vault_early_exit: false, ..SpawnPaths::NEW }),
+        ("former vault read", SpawnPaths { vault_borrow: false, ..SpawnPaths::NEW }),
     ] {
         let alone = play(paths, chamber_scenario).expect("same data");
         assert_same_ticks(label, &old.ticks, &alone.ticks);
@@ -204,7 +205,7 @@ fn trial_chamber_paths_match() {
 /// Monster spawner over 1,000 ticks: player out of range, then in range (short delays, several
 /// spawns), killed mobs: same block entity, packets, mobs, random draws and chunk flags.
 fn cage_scenario() -> Option<Vec<u64>> {
-    let tag = format!("c6m09-cage-{}", SpawnPaths::current() == SpawnPaths::NEW);
+    let tag = format!("spawn-paths-cage-{}", SpawnPaths::current() == SpawnPaths::NEW);
     let (mut p, _dir) = open(&tag)?;
     p.run("setblock 216 -59 212 minecraft:spawner\n");
     cmd(
@@ -248,6 +249,57 @@ fn monster_spawner_paths_match() {
     assert_same_ticks("monster spawner, every new path", &old, &new);
     let range_only = play(SpawnPaths { spawner_borrow: false, ..SpawnPaths::NEW }, cage_scenario).expect("same data");
     assert_same_ticks("monster spawner, range first only", &old, &range_only);
+}
+
+/// Spawner minecart over 1,000 ticks, same moves of the player as the block's scenario: its
+/// countdown lives in the minecart's own data, written in place on the new path.
+fn cart_cage_scenario() -> Option<Vec<u64>> {
+    let tag = format!("spawn-paths-cart-cage-{}", SpawnPaths::current() == SpawnPaths::NEW);
+    let (mut p, _dir) = open(&tag)?;
+    cmd(
+        &mut p,
+        "summon minecraft:spawner_minecart 216.5 -59 212.5 {MinSpawnDelay:20s,MaxSpawnDelay:40s,SpawnCount:2s,\
+         RequiredPlayerRange:12s,SpawnData:{entity:{id:\"minecraft:zombie\"},custom_spawn_rules:{block_light_limit:\
+         {min_inclusive:0,max_inclusive:15},sky_light_limit:{min_inclusive:0,max_inclusive:15}}}}",
+    );
+    let mut ticks = Vec::new();
+    for t in 0..1000 {
+        match t {
+            300 => p.run(NEAR),
+            700 => p.run("player 216.5 -59 224.5 0 0\n"),
+            850 => p.run(NEAR),
+            _ => {}
+        }
+        if t % 100 == 0 {
+            for m in p.s.mobs.list.iter_mut() {
+                m.removed = true;
+            }
+        }
+        p.s.time += 1;
+        p.s.minecarts_tick();
+        let mut h = fresh_hash();
+        for c in p.s.carts.list.iter().flatten() {
+            mix(&mut h, &format!("{:?}|{:?}", c.nbt, c.pos));
+        }
+        mix_world(&mut h, &p, &[]);
+        for e in &p.take_events() {
+            mix(&mut h, &format!("{e:?}"));
+        }
+        ticks.push(h);
+    }
+    let spawned = p.s.mobs.list.iter().filter(|m| m.kind == Kind::Zombie).count();
+    assert!(spawned >= 4, "the spawner minecart fired several times ({spawned} zombies)");
+    Some(ticks)
+}
+
+#[test]
+fn spawner_minecart_paths_match() {
+    let Some(old) = play(SpawnPaths::OLD, cart_cage_scenario) else { return };
+    let new = play(SpawnPaths::NEW, cart_cage_scenario).expect("same data");
+    assert_same_ticks("spawner minecart, every new path", &old, &new);
+    let range_only =
+        play(SpawnPaths { spawner_borrow: false, ..SpawnPaths::NEW }, cart_cage_scenario).expect("same data");
+    assert_same_ticks("spawner minecart, range first only", &old, &range_only);
 }
 
 /// Opens the world to the LAN and adds a guest without a connection (state installed).
@@ -299,7 +351,7 @@ fn forced_trap_seed() -> i64 {
 /// night, a thunderstorm with a trap forced on every tick, spawns cut for a while (no category:
 /// no charges gathered). Fingerprint: world random, mobs, census of each tick.
 fn natural_scenario() -> Option<Vec<u64>> {
-    let tag = format!("c6m09-natural-{}", SpawnPaths::current() == SpawnPaths::NEW);
+    let tag = format!("spawn-paths-natural-{}", SpawnPaths::current() == SpawnPaths::NEW);
     let (mut p, _dir) = open(&tag)?;
     p.run(NEAR);
     nbtio::set(&mut p.s.rules, "minecraft:spawn_mobs", Nbt::Byte(1));
@@ -394,7 +446,7 @@ fn species_names_carry_their_namespace() {
 /// in the order of a pass (hits after misses).
 #[test]
 fn memoized_spawn_costs_match_the_pack() {
-    let Some((mut p, _dir)) = open("c6m09-costs") else { return };
+    let Some((mut p, _dir)) = open("spawn-costs") else { return };
     let at = [216, -59, 216];
     let biomes = p.s.regs.entries("minecraft:worldgen/biome").to_vec();
     assert!(biomes.len() > 50, "biome registry");
@@ -498,7 +550,7 @@ fn compare_lists(p: &Probe, positions: &[[i32; 3]]) -> u64 {
 /// a fresh pass sees a structure placed live and a start chunk loaded after its reference.
 #[test]
 fn structure_spawn_lists_match() {
-    let Some((mut p, _dir)) = open("c6m09-structures") else { return };
+    let Some((mut p, _dir)) = open("structure-spawn-lists") else { return };
     write_structures(&mut p);
     let positions = probe_positions(10_000);
     let h = compare_lists(&p, &positions);
