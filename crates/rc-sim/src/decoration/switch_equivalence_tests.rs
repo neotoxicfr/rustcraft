@@ -167,12 +167,22 @@ fn explosion_scene(p: &mut Probe, trace: &mut Vec<String>) {
     record_events(p, trace);
     game_ticks(p, 30);
     record_events(p, trace);
+    // Wind bursts (knockback alone, same reach reckoning as the explosion): on the frames and
+    // mannequins left at the end of the wall, then on the far stands, block-like or not.
+    p.s.deco_blast_push([41.5, -59.0, 7.0], 2.5, 1.2, true);
+    p.s.deco_blast_push([94.5, -60.0, 2.0], 3.0, 1.0, false);
+    p.s.deco_blast_push([94.5, -60.0, 2.0], 3.0, 1.0, true);
+    record_events(p, trace);
+    game_ticks(p, 10);
+    record_events(p, trace);
 }
 
-const EXPLOSION_FINGERPRINT: u64 = 0x50bb_40e1_45d1_4292;
+const EXPLOSION_FINGERPRINT: u64 = 0xe705_965b_85a1_c8c9;
 
 /// The explosion reads the compounds in place: same events, drops and compounds as the former
-/// copy of every compound. Sabotage seen failing: the reach taken as the radius instead of twice it.
+/// copy of every compound, and the wind bursts (sharing its reach reckoning) keep their stored
+/// result. Sabotages seen failing: the reach taken as the radius instead of twice it; a killed
+/// attached decoration decided before the reach test; a blast push given to the next entry.
 #[test]
 fn explosion_paths_agree() {
     let borrow_only = DecoSwitches { explosion_borrow: true, ..ALL_OLD };
@@ -234,6 +244,8 @@ const TICK_FINGERPRINT: u64 = 0x663c_417e_54b2_43ad;
 
 /// The lookups by registry index and by remembered slot find the same compounds as the walks by
 /// identifier: same packets and same entity lists over 400 ticks, each lead alone and together.
+/// Sabotages seen failing: the remembered slot used without its identifier check; the survival
+/// check always true; the edit by index applied to the next entry.
 #[test]
 fn tick_lookup_paths_agree() {
     assert_paths_agree(
@@ -288,6 +300,18 @@ fn still_scene(p: &mut Probe, trace: &mut Vec<String>) {
 
 const STILL_FINGERPRINT: u64 = 0x80ef_103d_3e84_e275;
 
+/// The still compounds' blast pass tests the distance before or after the type: same motions
+/// and packets. Sabotage seen failing: the reach halved on the distance-first path.
+#[test]
+fn still_push_paths_agree() {
+    assert_paths_agree(
+        "still-push",
+        still_scene,
+        &[("old", ALL_OLD), ("distance-first", DecoSwitches { still_distance_first: true, ..ALL_OLD })],
+        STILL_FINGERPRINT,
+    );
+}
+
 // ---------- Micro-benches (ignored: `--ignored --nocapture`, release build) ----------
 
 /// `rows` rows of fixed item frames holding a diamond, x from 10 to 134, on a stone wall at z 10.
@@ -335,6 +359,55 @@ fn bench_explosion_among_decorations() {
             let scan = micros_per_call(64, || p.s.deco_explosion([0.5, 100.0, 0.5], 4.0, "minecraft:explosion", None, false, true));
             let near = micros_per_call(64, || p.s.deco_explosion([60.5, -58.0, 8.0], 4.0, "minecraft:explosion", mob, false, true));
             eprintln!("pass {pass}, {label}: blast out of reach {scan:.1} us, blast among frames {near:.1} us");
+        }
+    }
+    finish(p, dir);
+}
+
+/// 40 item frames holding a diamond (4 rows, x 56 to 65, wall at z 10) and 20 equipped armor
+/// stands in front of them: everything an ordinary blast at (60.5, -58, 8) of radius 4 breaks.
+fn breakable_wall(p: &mut Probe) {
+    for y in -60..-56 {
+        for x in 56..66 {
+            summon(
+                p,
+                &format!(
+                    "minecraft:item_frame {x}.5 {y}.5 9.96875 {{Facing:2b,block_pos:[I;{x},{y},9],\
+                     Item:{{id:\"minecraft:diamond\",count:1}}}}"
+                ),
+            );
+        }
+    }
+    let equipped = "{equipment:{mainhand:{id:\"minecraft:diamond_sword\",count:1},head:{id:\"minecraft:iron_helmet\",count:1}}}";
+    for k in 0..20 {
+        summon(p, &format!("minecraft:armor_stand {}.5 -60 {}.5 {equipped}", 56 + k % 10, 7 + k / 10));
+    }
+}
+
+/// An ordinary blast (no author) that breaks everything in reach: the wall of
+/// [`breakable_wall`] rebuilt before each of the 32 blasts (rebuild and clean-up not timed),
+/// each path; microseconds per blast.
+#[test]
+#[ignore]
+fn bench_explosion_breaking_everything() {
+    let (mut p, dir) = open("deco-bench-blast-breaking");
+    cmd(&mut p, "fill 50 -60 10 70 -55 10 minecraft:stone");
+    for pass in 0..3 {
+        for (label, borrow) in [("copy of every compound", false), ("read in place", true)] {
+            p.s.deco.switches.explosion_borrow = borrow;
+            let mut timed = std::time::Duration::ZERO;
+            for _ in 0..32 {
+                breakable_wall(&mut p);
+                let start = std::time::Instant::now();
+                p.s.deco_explosion([60.5, -58.0, 8.0], 4.0, "minecraft:explosion", None, false, true);
+                timed += start.elapsed();
+                assert!(p.s.deco.live.iter().all(|l| l.removed), "the blast left a decoration standing");
+                // Drops, packets and removed entries cleared, so every blast starts the same.
+                p.s.life.drops.clear();
+                p.s.deco_post();
+                let _ = p.take_events();
+            }
+            eprintln!("pass {pass}, {label}: {:.1} us per blast", timed.as_secs_f64() * 1e6 / 32.0);
         }
     }
     finish(p, dir);
@@ -391,14 +464,4 @@ fn bench_decoration_ticks_with_falling_stands() {
             finish(p, dir);
         }
     }
-}
-
-#[test]
-fn still_push_paths_agree() {
-    assert_paths_agree(
-        "still-push",
-        still_scene,
-        &[("old", ALL_OLD), ("distance-first", DecoSwitches { still_distance_first: true, ..ALL_OLD })],
-        STILL_FINGERPRINT,
-    );
 }

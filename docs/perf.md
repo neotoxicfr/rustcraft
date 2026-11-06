@@ -5672,6 +5672,18 @@ profile, machine loaded by other agents compiling, best of 5 or 7; three runs, t
   the frames (in reach, nothing broken) 436-452 us → 137-144 us. The distance is now tested before
   the box (a painting's box reads its variant's size). Multi-core and GPU: not applicable (the hits
   mutate the server in registry order).
+- Exposure only when the outcome reads it: an armor stand smashed and something attached killed
+  by an allowed hit are decided before the eye height and the rays cast towards the box (pure
+  reads, so the same events); only a decoration left standing or a refused hit casts them. Bench
+  `bench_explosion_breaking_everything` (ordinary blast, no author, breaking 40 frames holding
+  items + 20 equipped armor stands, rebuilt before each of 32 blasts, 3 passes): copy of every
+  compound 270-283 us per blast; read in place with the exposure first (former order) 272-274 us
+  (the rays dominate, the copies did not); exposure last 103-109 us. No switch of its own: the
+  order only skips work, and `RUSTCRAFT_OPT_DECO_EXPLOSION_BORROW=0` restores the former path.
+- One reach reckoning (`deco_blast_reach`, `deco_blast_exposure`, `deco_knockback_resistance`)
+  shared by the explosion and the wind burst (`deco_blast_push`), which had their own copy of
+  the distance, box, eye, direction and resistance. The explosion scene now ends with wind
+  bursts, so its stored fingerprint covers both (taken before the change, unchanged after).
 - Lookups by registry index (`RUSTCRAFT_OPT_DECO_SINGLE_LOOKUP`): the edit of a falling or pushed
   armor stand, a mannequin's countdowns, a push from a blast and the survival check reach the
   compound from the registry entry instead of walking the registry for the identifier (a walk per
@@ -5697,7 +5709,10 @@ profile, machine loaded by other agents compiling, best of 5 or 7; three runs, t
   run each scene in its own thread on every path (all old, all new, each lead alone) and compare
   every event, the ground items and each chunk's encoded entity list, plus a stored fingerprint
   (Windows). Seen failing on sabotage: reach taken as the radius (explosion), remembered slot used
-  without its identifier check (explosion and ticks), still reach halved (still pass).
+  without its identifier check (explosion and ticks), still reach halved (still pass), an
+  attached kill decided before the reach test (explosion), and for the lookups by index: survival
+  check always true, edit applied to the next entry (ticks), blast push given to the next entry
+  (explosion).
 - To measure on the quiet machine: scenes `tnt` and `dropped-items` (2 alternating passes, main
   before the series and this branch with the four switches at 0).
 

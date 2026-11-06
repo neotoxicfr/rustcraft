@@ -234,6 +234,15 @@ enum DecoBlastEffect {
     KillAttached { compound: Nbt, credited: bool },
 }
 
+/// Where a decoration stands in a blast (explosion or wind burst): the part both read before
+/// deciding anything. The exposure, costly, is reckoned apart ([`Server::deco_blast_exposure`]).
+struct BlastReach {
+    pos: [f64; 3],
+    /// Distance to the center over the blast's diameter, at most 1.
+    dist: f64,
+    bbox: Aabb,
+}
+
 /// Fields of an entry read by the tick (without copying the network tracking).
 struct Brief {
     id: i32,
@@ -1022,29 +1031,24 @@ impl Server {
         if ignored {
             return None;
         }
-        let center = blast.center;
-        let pos = nbtio::f64s::<3>(compound.get("Pos")).unwrap_or_default();
-        let offset = [pos[0] - center[0], pos[1] - center[1], pos[2] - center[2]];
-        let dist = (offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]).sqrt() / blast.diameter;
-        // Distance before the box: a painting's box reads its variant's size.
-        if dist > 1.0 {
-            return None;
-        }
-        let bbox = self.deco_box(compound)?;
-        let eye = self.deco_eye(kind, compound);
-        let to_eye = [offset[0], pos[1] + eye - center[1], offset[2]];
-        let exposure = f64::from(self.seen_percent(center, &bbox));
+        let reach = self.deco_blast_reach(compound, blast.center, blast.diameter)?;
         // The hit: refused for a mob without the `mob_griefing` rule, or invulnerable.
         let refused = blast.refused_by_rule || flag(compound, "Invulnerable");
-        if matches!(kind, DKind::Stand | DKind::Mannequin) {
-            if kind == DKind::Stand && !refused && !flag(compound, "Marker") {
-                return Some(DecoBlastEffect::BreakStand(compound.clone()));
-            }
+        let living = matches!(kind, DKind::Stand | DKind::Mannequin);
+        // A smashed stand or a killed attached decoration does not read its exposure: deciding
+        // these first spares the rays cast towards its box (the blast's dominant cost).
+        if kind == DKind::Stand && !refused && !flag(compound, "Marker") {
+            return Some(DecoBlastEffect::BreakStand(compound.clone()));
+        }
+        if !living && !refused {
+            return Some(DecoBlastEffect::KillAttached { compound: compound.clone(), credited: true });
+        }
+        let (to_eye, exposure) = self.deco_blast_exposure(kind, compound, &reach, blast.center);
+        let dist = reach.dist;
+        if living {
             // Still there (refused, marker, mannequin): pushed like any living entity, reduced
             // by the resistance read before any hurt (as the former copy did).
-            let resistance =
-                self.nbt_attribute(compound, kind.name(), "minecraft:explosion_knockback_resistance").unwrap_or(0.0);
-            let strength = (1.0 - dist) * exposure * (1.0 - resistance);
+            let strength = (1.0 - dist) * exposure * (1.0 - self.deco_knockback_resistance(kind, compound));
             let knockback = crate::mobs::mth::normalize(to_eye).map(|v| v * strength);
             if kind == DKind::Mannequin {
                 let power = (1.0 - dist) * exposure;
@@ -1053,16 +1057,43 @@ impl Server {
             }
             return Some(DecoBlastEffect::Push(knockback));
         }
-        if !refused {
-            return Some(DecoBlastEffect::KillAttached { compound: compound.clone(), credited: true });
-        }
-        // Non-zero push: the hung item is knocked off (fixed frame excepted).
+        // Refused hit: a non-zero push still knocks the hung item off (fixed frame excepted).
         let to_eye_len = (to_eye[0] * to_eye[0] + to_eye[1] * to_eye[1] + to_eye[2] * to_eye[2]).sqrt();
         let pushed = to_eye_len >= f64::from(1.0e-5f32) && (1.0 - dist) * exposure != 0.0;
         if pushed && !(kind.frame() && flag(compound, "Fixed")) {
             return Some(DecoBlastEffect::KillAttached { compound: compound.clone(), credited: false });
         }
         None
+    }
+
+    /// Reach of a blast centred on `center` over a decoration (`None`: beyond `diameter`, or
+    /// no box). Shared by the explosion and the wind burst, so their physics cannot drift
+    /// apart (the former copy of every compound, [`Server::deco_explosion`] switched off, keeps
+    /// its own reckoning, the reference of the equivalence tests).
+    fn deco_blast_reach(&self, compound: &Nbt, center: [f64; 3], diameter: f64) -> Option<BlastReach> {
+        let pos = nbtio::f64s::<3>(compound.get("Pos")).unwrap_or_default();
+        let offset = [pos[0] - center[0], pos[1] - center[1], pos[2] - center[2]];
+        let dist = (offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]).sqrt() / diameter;
+        // Distance before the box: a painting's box reads its variant's size.
+        if dist > 1.0 {
+            return None;
+        }
+        let bbox = self.deco_box(compound)?;
+        Some(BlastReach { pos, dist, bbox })
+    }
+
+    /// From the blast's center to the decoration's eye, and the share of its box the center
+    /// sees (rays cast to its box: called only when the outcome needs it).
+    fn deco_blast_exposure(&self, kind: DKind, compound: &Nbt, reach: &BlastReach, center: [f64; 3]) -> ([f64; 3], f64) {
+        let eye = self.deco_eye(kind, compound);
+        let pos = reach.pos;
+        let to_eye = [pos[0] - center[0], pos[1] + eye - center[1], pos[2] - center[2]];
+        (to_eye, f64::from(self.seen_percent(center, &reach.bbox)))
+    }
+
+    /// Explosion knockback resistance of a living decoration (0 when it has none).
+    fn deco_knockback_resistance(&self, kind: DKind, compound: &Nbt) -> f64 {
+        self.nbt_attribute(compound, kind.name(), "minecraft:explosion_knockback_resistance").unwrap_or(0.0)
     }
 
     // ---------- Pushes (shulker, piston) ----------
@@ -1144,19 +1175,12 @@ impl Server {
             if k == DKind::Stand && flag(e, "Invisible") {
                 continue;
             }
-            let pos = nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
-            let dist = crate::mobs::mth::dist2(pos, center).sqrt() / double;
-            if dist > 1.0 {
-                continue;
-            }
-            let Some(b) = self.deco_box(e) else { continue };
-            let eye = self.deco_eye(k, e);
-            let dir = crate::mobs::mth::normalize([pos[0] - center[0], pos[1] + eye - center[1], pos[2] - center[2]]);
+            let Some(reach) = self.deco_blast_reach(e, center, double) else { continue };
+            let (to_eye, exposure) = self.deco_blast_exposure(k, e, &reach, center);
             let living = matches!(k, DKind::Stand | DKind::Mannequin);
-            let res =
-                if living { self.nbt_attribute(e, k.name(), "minecraft:explosion_knockback_resistance").unwrap_or(0.0) } else { 0.0 };
-            let kp = (1.0 - dist) * f64::from(self.seen_percent(center, &b)) * mult * (1.0 - res);
-            let kb = dir.map(|v| v * kp);
+            let res = if living { self.deco_knockback_resistance(k, e) } else { 0.0 };
+            let kp = (1.0 - reach.dist) * exposure * mult * (1.0 - res);
+            let kb = crate::mobs::mth::normalize(to_eye).map(|v| v * kp);
             if living {
                 self.deco_push_at(i, kb);
             } else if kb.iter().any(|&v| v != 0.0) && !(k.frame() && flag(e, "Fixed")) {
