@@ -65,14 +65,15 @@ the order down, up, north, south, west, east.
   (setting 1 or 2), or whose centre is within √768 blocks of the camera (setting 2), is rebuilt
   before the frame is drawn; the others in the background.
 - Our version (`RUSTCRAFT_OPT_MESHVISIBLEONLY`, default; `=0`: every dirty column whatever the
-  view, as before), same rule per section of a column, with these differences without visible
-  effect:
+  view, as before), same rule per section of a column, on the same frustum moved back (steps of 4
+  blocks until the camera's 8-block cell lies inside it), with these differences:
   - our walk does not enter a column without a mesh, so a column the renderer holds no mesh of
     (never meshed, or its first mesh still on its way) is meshed whatever the view: the loading
     order does not change;
-  - the view is that of the last frame drawn, with the frustum of the draw (section box plus one
-    block, not moved back): what is drawn is exactly what may be rebuilt, and a section entering
-    the view is launched on the next frame (its rebuild runs in the background anyway);
+  - the view is that of the last frame drawn (section box plus one block): a section entering the
+    view is launched on the next frame. Thanks to the moved-back frustum, the sections next to the
+    camera are already in it before a turn shows them; a section entering the view farther away is
+    rebuilt in the background in both games, and ours waits one frame more before it starts;
   - a column whose remesh would be a priority one is never held (priority unchanged);
   - a column whose last mesh is no longer kept as a base, or that must be redone whole, is meshed
     whole (all its marks) as soon as one of its dirty sections is in view: its task meshes the

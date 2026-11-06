@@ -79,19 +79,64 @@ pub(super) fn column_box(origin: [i32; 2], min_y: i32, sections: i32, (x, z): (i
     (min, min + Vec3::new(18.0, (sections * 16) as f32 + 2.0, 18.0))
 }
 
-/// Field of view of the last frame drawn, as its section test read it: planes, camera integer
-/// origin (x, z), bottom of the world, number of sections.
+/// Planes moved back along the look direction `forward` (unit), in steps of 4 blocks, until the
+/// 8-block cell holding the eye lies wholly inside them. The game picks the sections to rebuild in
+/// such a frustum, so the sections just behind and beside the camera are rebuilt before a turn
+/// shows them. Frame relative to the camera's integer `origin` (x, z), like the planes.
+pub(super) fn planes_holding_camera_cell(
+    planes: [Vec4; 6],
+    origin: [i32; 2],
+    eye: [f64; 3],
+    forward: Vec3,
+) -> [Vec4; 6] {
+    const CELL: f64 = 8.0;
+    const STEP: f32 = 4.0;
+    // Bound for a degenerate view (NaN planes never hold the cell); a 7-degree zoom needs ~30 steps.
+    const MAX_STEPS: u32 = 256;
+    let offset = [f64::from(origin[0]), 0.0, f64::from(origin[1])];
+    let corner =
+        |round: fn(f64) -> f64| Vec3::from(std::array::from_fn(|i| (round(eye[i] / CELL) * CELL - offset[i]) as f32));
+    let (low, high) = (corner(f64::floor), corner(f64::ceil));
+    let mut moved = planes;
+    let mut back = 0.0;
+    for _ in 0..MAX_STEPS {
+        if aabb_inside(&moved, low, high) {
+            break;
+        }
+        back += STEP;
+        // Eye moved by −back·forward: each plane tests p + back·forward with the old planes.
+        moved = planes.map(|p| p + Vec4::new(0.0, 0.0, 0.0, p.truncate().dot(forward * back)));
+    }
+    moved
+}
+
+/// What the meshing treats as in view, from the last frame drawn: the draw's frustum moved back
+/// to hold the camera's cell ([`planes_holding_camera_cell`]), camera integer origin (x, z), bottom
+/// of the world, number of sections.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct DrawnView {
+pub(super) struct MeshingView {
     pub planes: [Vec4; 6],
     pub origin: [i32; 2],
     pub min_y: i32,
     pub sections: i32,
 }
 
-impl DrawnView {
-    /// Sections among `reached` (the reached sections of column `key`) whose box the frame keeps:
-    /// the same test as the draw lists (`lists::column_runs`), as a set.
+impl MeshingView {
+    /// View of a frame whose draw frustum is `drawn_planes`, eye `eye` looking along `forward`.
+    pub fn new(
+        drawn_planes: [Vec4; 6],
+        origin: [i32; 2],
+        eye: [f64; 3],
+        forward: Vec3,
+        min_y: i32,
+        sections: i32,
+    ) -> Self {
+        let planes = planes_holding_camera_cell(drawn_planes, origin, eye, forward);
+        MeshingView { planes, origin, min_y, sections }
+    }
+
+    /// Sections among `reached` (the reached sections of column `key`) whose box lies in the
+    /// view: the box test of the draw lists (`lists::column_runs`), as a set, on the moved planes.
     pub fn sections_in_view(&self, key: (i32, i32), reached: &[(i32, i32, i32)]) -> Sections {
         let mut seen = Sections::default();
         let (min, max) = column_box(self.origin, self.min_y, self.sections, key);
@@ -252,12 +297,12 @@ impl Renderer {
         Some(self.reached.get(i).is_some_and(|&(rx, _, rz)| (rx, rz) == (x, z)))
     }
 
-    /// Sections of column `(x, z)` the meshing treats as seen: reached by the last walk and kept
-    /// by the field of the last frame drawn (the test of the draw lists). `None` when that cannot be
-    /// told: no frame or no walk yet, or no mesh of the column held here (the walk only enters the
-    /// columns it holds, so it would never reach a column left unmeshed).
+    /// Sections of column `(x, z)` the meshing treats as seen: reached by the last walk and in the
+    /// meshing view of the last frame drawn ([`MeshingView`]). `None` when that cannot be told: no
+    /// frame or no walk yet, or no mesh of the column held here (the walk only enters the columns
+    /// it holds, so it would never reach a column left unmeshed).
     pub fn sections_in_view(&self, x: i32, z: i32) -> Option<Sections> {
-        let view = self.drawn_view.as_ref()?;
+        let view = self.meshing_view.as_ref()?;
         let held = self.columns.contains_key(&(x, z)) || self.empty_vis.contains_key(&(x, z));
         if !held || self.reached.is_empty() {
             return None;

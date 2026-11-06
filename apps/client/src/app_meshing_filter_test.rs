@@ -273,6 +273,20 @@ fn pick_columns_serves_what_is_in_view_first() {
     assert_eq!(keys(&picked), [3, 5], "a column in progress waits");
 }
 
+/// The held-columns gauge of the perf log stays current with a full queue: the pick still runs,
+/// launches nothing and leaves every mark; without the perf log, a full queue skips it.
+#[test]
+fn full_queue_still_counts_the_held_columns() {
+    assert!(pick_this_frame(0, 5, true), "full queue, perf log on: the gauge would go stale");
+    assert!(pick_this_frame(0, 0, true), "nothing dirty: the gauge falls to zero");
+    assert!(!pick_this_frame(0, 5, false) && !pick_this_frame(3, 0, false));
+    assert!(pick_this_frame(3, 5, false));
+    let mut dirty: HashMap<(i32, i32), Sections> = (0..4).map(|x| ((x, 0), sections(&[1]))).collect();
+    let before = dirty.clone();
+    let picked = pick_columns(&mut dirty, 0, (0, 0), |_, _| true, |(x, _), m| (x < 2).then_some(m), true);
+    assert!(picked.is_empty() && dirty == before, "a full queue launches nothing");
+}
+
 /// The early release hands over the same base and lets the job's nine columns go before the end
 /// of the task; the old path keeps them in the job until the result is sent.
 #[test]

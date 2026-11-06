@@ -175,10 +175,7 @@ impl App {
             *DEPTH.get_or_init(|| rc_data::env_str!("RUSTCRAFT_MESHQUEUE").and_then(|v| v.parse().ok()).unwrap_or(4));
         let limit = rayon::current_num_threads() * depth;
         let free = limit.saturating_sub(self.in_flight);
-        if self.world.dirty.is_empty() && perf_log::on() {
-            perf_log::mesh_held(0, 0);
-        }
-        if free == 0 || self.world.dirty.is_empty() {
+        if !pick_this_frame(free, self.world.dirty.len(), perf_log::on()) {
             return;
         }
         // The closest to the camera first: the world appears around the player.
@@ -308,6 +305,13 @@ pub(crate) fn sections_to_launch(
     } else {
         Some(seen)
     }
+}
+
+/// The frame runs [`pick_columns`]: something to launch (`free` task slots, `dirty` columns), or the
+/// perf log on (`counting_held`), whose held-columns gauge must stay current even with a full queue
+/// or nothing dirty (the pick then launches nothing and leaves the marks as they are).
+fn pick_this_frame(free: usize, dirty: usize, counting_held: bool) -> bool {
+    counting_held || (free > 0 && dirty > 0)
 }
 
 /// A dirty column and the sections it launches.

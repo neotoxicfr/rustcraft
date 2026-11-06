@@ -631,14 +631,15 @@ impl crate::App {
         let fresh: Vec<((i32, i32), Option<u64>)> =
             fresh_meshes.iter().map(|m| ((m.x, m.z), (!m.is_empty()).then(|| digest(m)))).collect();
         let (mut same, mut differ, mut parked, mut marked) = (0, Vec::new(), 0, 0);
-        for (k, d) in &fresh {
+        for ((k, d), new) in fresh.iter().zip(&fresh_meshes) {
             if !gpu.contains_key(k) && self.world.meshes.waiting(*k) && !self.world.surrounded(k.0, k.1) {
                 // Never meshed: one of its neighbours is missing (game rule).
                 parked += 1;
             } else if gpu.get(k).copied() == *d || (!gpu.contains_key(k) && d.is_none()) {
                 same += 1;
-            } else if self.world.dirty.contains_key(k) {
-                // Still marked: out of view (`RUSTCRAFT_OPT_MESHVISIBLEONLY`), or not launched yet.
+            } else if self.differences_still_marked(*k, new) {
+                // Out of view (`RUSTCRAFT_OPT_MESHVISIBLEONLY`) or not launched yet: every section
+                // that differs keeps its mark.
                 marked += 1;
             } else {
                 differ.push(*k);
@@ -668,21 +669,7 @@ impl crate::App {
                 continue;
             };
             let n = new.vis.len();
-            let faces = |m: &BlockMesh, s: usize| {
-                let mut v = Vec::new();
-                for l in 0..3 {
-                    for g in 0..rc_mesh::blocks::BUCKETS {
-                        let st = &m.starts[l];
-                        if let (Some(&a), Some(&e)) = (st.get(g * (n + 1) + s), st.get(g * (n + 1) + s + 1)) {
-                            v.extend(m.layers[l][a as usize..e as usize].iter().map(|f| (l, *f)));
-                        }
-                    }
-                }
-                v
-            };
-            let fluids = |m: &BlockMesh, s: usize| {
-                (0..3).map(|l| m.fluid_starts[l].get(s + 1).copied().unwrap_or(0) - m.fluid_starts[l][s]).sum::<u32>()
-            };
+            let (faces, fluids) = (section_faces, section_fluid_faces);
             // Cells of the neighbourhood read by the mesh sent and changed since.
             if let Some((c0, n0)) = self.world.meshes.checked_world.get(k) {
                 let olds = std::iter::once((0, 0, Some(c0)))
@@ -710,13 +697,10 @@ impl crate::App {
                     }
                 }
             }
-            for s in 0..n {
+            for s in (0..n).filter(|&s| section_differs(&old, new, s)) {
                 let (a, b) = (faces(&old, s), faces(new, s));
                 let fl = (fluids(&old, s), fluids(new, s));
                 let vis = old.vis.get(s) == new.vis.get(s);
-                if a == b && fl.0 == fl.1 && vis {
-                    continue;
-                }
                 let first = a.iter().zip(&b).find(|(x, y)| x != y).map(|(x, y)| (x.0, x.1, y.1));
                 eprintln!(
                     "[meshcheck] ({}, {}) section {s}: GPU faces {} / full {}, fluids {:?}, identical communication {vis}, \
@@ -730,6 +714,61 @@ impl crate::App {
             }
         }
     }
+
+    /// MESHCHECK: column `key`, whose sent mesh differs from the complete mesh `new`, is still
+    /// marked for every section that differs.
+    fn differences_still_marked(&self, key: (i32, i32), new: &BlockMesh) -> bool {
+        let sent = || self.world.meshes.checked.get(&key).and_then(|w| rc_mesh::blocks::unpack(w, 0));
+        differences_inside_marks(self.world.dirty.get(&key).copied(), sent, new)
+    }
+}
+
+/// MESHCHECK: every section where the `sent` mesh (unpacked only if needed) differs from the
+/// complete mesh `new` is among the column's `marks`. A difference outside them, or no mark or no
+/// sent mesh to compare, is a meshing fault to list.
+fn differences_inside_marks(
+    marks: Option<Sections>,
+    sent: impl FnOnce() -> Option<BlockMesh>,
+    new: &BlockMesh,
+) -> bool {
+    let Some(marks) = marks else { return false };
+    if marks.is_all() {
+        return true;
+    }
+    let Some(sent) = sent() else { return false };
+    (0..new.vis.len()).all(|s| marks.contains(s) || !section_differs(&sent, new, s))
+}
+
+/// Section `s` differs between two meshes of a column: faces, fluid faces or face communication.
+fn section_differs(old: &BlockMesh, new: &BlockMesh, s: usize) -> bool {
+    section_faces(old, s) != section_faces(new, s)
+        || section_fluid_faces(old, s) != section_fluid_faces(new, s)
+        || old.vis.get(s) != new.vis.get(s)
+}
+
+/// Faces of section `s` of `m`, with their layer, layer by layer then group by group.
+fn section_faces(m: &BlockMesh, s: usize) -> Vec<(usize, rc_mesh::blocks::Face)> {
+    let n = m.vis.len();
+    let mut v = Vec::new();
+    for l in 0..3 {
+        for g in 0..rc_mesh::blocks::BUCKETS {
+            let st = &m.starts[l];
+            if let (Some(&a), Some(&e)) = (st.get(g * (n + 1) + s), st.get(g * (n + 1) + s + 1)) {
+                v.extend(m.layers[l][a as usize..e as usize].iter().map(|f| (l, *f)));
+            }
+        }
+    }
+    v
+}
+
+/// Fluid faces of section `s` of `m`, all layers.
+fn section_fluid_faces(m: &BlockMesh, s: usize) -> u32 {
+    (0..3)
+        .map(|l| {
+            let starts = &m.fluid_starts[l];
+            starts.get(s + 1).copied().unwrap_or(0).saturating_sub(starts.get(s).copied().unwrap_or(0))
+        })
+        .sum()
 }
 
 /// Bytes of fluid faces in the flat mesh of `m` (`words` long): whatever is neither a face
@@ -852,6 +891,36 @@ mod tests {
         m.layers = Default::default();
         m.fluids = Default::default();
         assert_eq!(packed_fluid_bytes(&m, words), 3 * 27 * 4);
+    }
+
+    /// MESHCHECK (`RUSTCRAFT_MESHCHECK`): a column counts as still marked only if every section
+    /// that differs from the complete mesh keeps its mark; a difference in a section without a mark
+    /// stays listed as a fault, whatever the column's other marks.
+    #[test]
+    fn meshcheck_hides_only_the_differences_inside_the_marks() {
+        // Three sections, one face each (layer 0, group 0).
+        let mesh = |faces: [u32; 3]| BlockMesh {
+            x: 0,
+            z: 0,
+            version: 1,
+            layers: [faces.iter().map(|&f| [f; 6]).collect(), Vec::new(), Vec::new()],
+            fluids: Default::default(),
+            starts: [vec![0, 1, 2, 3], Vec::new(), Vec::new()],
+            fluid_starts: [vec![0; 4], Vec::new(), Vec::new()],
+            vis: vec![0; 3],
+        };
+        let marks = |list: &[i32]| {
+            let mut m = Sections::default();
+            list.iter().for_each(|&s| m.insert(s));
+            Some(m)
+        };
+        let (sent, complete) = (|| Some(mesh([1, 2, 3])), mesh([1, 2, 9]));
+        assert!(differences_inside_marks(marks(&[2]), sent, &complete), "section 2 marked");
+        assert!(differences_inside_marks(marks(&[0, 2]), sent, &complete), "section 2 among the marks");
+        assert!(!differences_inside_marks(marks(&[0]), sent, &complete), "section 2 differs without a mark");
+        assert!(!differences_inside_marks(None, sent, &complete), "no mark at all");
+        assert!(!differences_inside_marks(marks(&[0]), || None, &complete), "nothing sent to compare");
+        assert!(differences_inside_marks(Some(Sections::ALL), || None, &complete), "whole column marked");
     }
 
     /// Mesh of `faces` faces and `fluids` fluid faces in one section (starts as the mesher writes them).
