@@ -275,6 +275,8 @@ pub struct Server {
     pub(crate) deco: Box<crate::decoration::Decos>,
     /// Generation of missing chunks (`generation.rs`).
     pub(crate) generator: Option<crate::generation::Gen>,
+    /// Generators of the commands and live features, per dimension (`command_generators.rs`).
+    pub(crate) command_gens: crate::generation::command_generators::CommandGenerators,
     /// Other dimensions and portals (S6, `dims.rs`).
     pub(crate) dims: Box<crate::dims::Dims>,
     /// Sends cut off (tick of a parked dimension).
@@ -376,6 +378,16 @@ impl Server {
             crate::packs::write_config(d, &packs);
         }
         step("lock, level.dat, jar and packs read");
+        // The player's dimension is known from here: its generation thread builds its generator
+        // while the registries, tables and survival data load.
+        let pdata = PlayerData::read(&world, uuid);
+        let dim_name = pdata
+            .dimension
+            .clone()
+            .filter(|d| DIMENSIONS.contains(&d.as_str()))
+            .unwrap_or_else(|| level.spawn_dimension.clone());
+        let early_generator = crate::generation::command_generators::early_generator_start()
+            .then(|| crate::generation::start_before_registries(&data, &world, &dim_name));
         let regs = crate::registries::load_jar(&jar, &data);
         let block_tags = block_tag_map(&regs.tags);
         let tag_bits = crate::tag_bits::TagBits::new(&block_tags, &data);
@@ -387,12 +399,13 @@ impl Server {
         let states = States::new(&data, regs.entries("minecraft:worldgen/biome").to_vec())
             .with_heightmap_rules(&data, &block_tags);
         step("registries and tables");
-        let pdata = PlayerData::read(&world, uuid);
-        let dim_name = pdata
-            .dimension
-            .clone()
-            .filter(|d| DIMENSIONS.contains(&d.as_str()))
-            .unwrap_or_else(|| level.spawn_dimension.clone());
+        // The early thread only waited for the biome registry: it goes on now.
+        let early_generator = early_generator.map(|started| {
+            started.map(|(generator, biomes)| {
+                let _ = biomes.send(regs.entries("minecraft:worldgen/biome").to_vec());
+                generator
+            })
+        });
         let dim = Dimension::new(&world, &dim_name, crate::dimension_height(&data, &dim_name));
         let read = |f: &str| nbtio::read_dat(&world.join("data").join("minecraft").join(f)).ok();
         let rules = read("game_rules.dat").and_then(|v| v.get("data").cloned()).unwrap_or(Nbt::Compound(Vec::new()));
@@ -411,7 +424,10 @@ impl Server {
         // (up to 1.5 s measured under load, the other servers waiting for the same load).
         crate::commands::cmds_ents::SERVER_LANG.get_or_init(|| crate::stations::en_us(&life.items));
         step("player, survival and language");
-        let generator = crate::generation::start_for(&data, &world, &dim_name, &regs);
+        let generator = match early_generator {
+            Some(started) => started,
+            None => crate::generation::start_for(&data, &world, &dim_name, &regs),
+        };
         step("generator started");
         let mut cmd = Box::new(crate::commands::Cmds::new(
             &jar,
@@ -519,6 +535,7 @@ impl Server {
             writer: None,
             bs: crate::blocks::level::Sim::new(&data),
             generator,
+            command_gens: Default::default(),
             dims: Box::default(),
             muted: false,
             pdata,

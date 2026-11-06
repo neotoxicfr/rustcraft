@@ -184,6 +184,10 @@ pub fn out_from_origin(origin: i32, lo: i32, hi: i32, step: i32) -> Vec<i32> {
 impl Server {
     /// Generator of the open dimension for the searches (built once).
     pub(crate) fn locate_gen(&mut self) -> Option<Arc<DimGen>> {
+        if crate::generation::command_generators::one_command_generator() {
+            let structures = self.world_has_structures();
+            return self.command_generator(structures);
+        }
         if let Some((d, g)) = &self.cmd.locgen
             && *d == self.dim.name
         {
