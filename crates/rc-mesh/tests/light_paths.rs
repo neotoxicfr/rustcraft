@@ -63,6 +63,7 @@ fn variants() -> Vec<(String, LightPaths)> {
     // The addressed reader with the old cell format and its memos.
     v.push(("addressed, 6 B cells".to_string(), LightPaths { cell8: true, ..LightPaths::DEFAULT }));
     v.push(("addressed, kept neighbourhood".to_string(), LightPaths { neigh: true, ..LightPaths::DEFAULT }));
+    v.push(("addressed, zero sheets".to_string(), LightPaths { zero_layers: true, ..LightPaths::DEFAULT }));
     v
 }
 
@@ -241,7 +242,13 @@ fn kept_cache_across_tasks_and_epoch_wrap() {
     let b = (a.0 + 1, a.1);
     let fresh = two_on_fresh_thread(&cols, &t, &palette, b, b, LightPaths::OLD, None);
     let kept = LightPaths { scratch: true, ..LightPaths::OLD };
-    for (name, p) in [("16 B", kept), ("6 B", LightPaths { cell8: true, ..kept }), ("default", LightPaths::DEFAULT)] {
+    let addressed_zero = LightPaths { zero_layers: true, ..LightPaths::DEFAULT };
+    for (name, p) in [
+        ("wide cells", kept),
+        ("narrow cells", LightPaths { cell8: true, ..kept }),
+        ("default", LightPaths::DEFAULT),
+        ("default with zero sheets", addressed_zero),
+    ] {
         // Second task of the thread: the generation continues (reset to 1, the cells of the first
         // would be taken for valid).
         let m = two_on_fresh_thread(&cols, &t, &palette, a, b, p, None);
@@ -253,14 +260,14 @@ fn kept_cache_across_tasks_and_epoch_wrap() {
     }
 }
 
-/// Default = best proven combination (D + A + B, then the addressed reads and the zero sheets on
-/// top); C, E, F, G are only turned on after a calm machine bench that gives them as winners
+/// Default = best proven combination (D + A + B, then the addressed reads on top); C, E, F, G and
+/// the zero sheets are only turned on after a calm machine bench that gives them as winners
 /// (then update this test and `docs/perf.md`). Without any `RUSTCRAFT_OPT_AO*` variable, the
 /// environment gives the default.
 #[test]
 fn default_is_best_proven_combination() {
     let dab = LightPaths { cell: true, corners: true, scratch: true, ..LightPaths::OLD };
-    let addressed = LightPaths { fixed_offsets: true, prop_bits: true, raw_grid: true, zero_layers: true, ..dab };
+    let addressed = LightPaths { fixed_offsets: true, prop_bits: true, raw_grid: true, ..dab };
     assert_eq!(LightPaths::DEFAULT, addressed);
     assert_eq!(LightPaths::DEFAULT.raw_grid_min, 64);
     let set = std::env::vars_os().any(|(k, _)| k.to_string_lossy().starts_with("RUSTCRAFT_OPT_AO"));

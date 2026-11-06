@@ -4,7 +4,8 @@
 //! (`RC_LIGHT_AO=0`: occlusion off). Identical output proven by `tests/light_paths.rs`;
 //! here only the time of the full meshing. `light_paths_bench` compares the paths of the cell
 //! cache (D, A, B…); `addressed_reads_bench` the addressed reads and the zero sheets on top of
-//! D + A + B.
+//! D + A + B; `zero_sheets_and_raw_threshold_bench` the zero sheets and the raw grid's threshold
+//! on top of the default, with the default repeated as noise reference.
 
 mod common;
 
@@ -165,19 +166,40 @@ fn run_interleaved(variants: &[(&str, LightPaths)]) {
         par[0].len(),
         t.light_faces.heap_bytes()
     );
-    let (b0, _) = stat(&mut t1[0].clone());
+    let (b0, bm0) = stat(&mut t1[0].clone());
     let (k0, _) = stat(&mut c1[0].clone());
-    let (p0, _) = stat(&mut tp[0].clone());
+    let (p0, pm0) = stat(&mut tp[0].clone());
+    let pct = |x: f64, reference: f64| (x / reference - 1.0) * 100.0;
     for i in 0..n {
         let (a, am) = stat(&mut t1[i]);
         let (k, km) = stat(&mut c1[i]);
         let (b, bm) = stat(&mut tp[i]);
         eprintln!(
-            "  {:<20} 1 thread {a:7.1} / {am:7.1} ({:+5.1} %) {k:7.0} / {km:7.0} ({:+5.1} %)   all {b:6.1} / {bm:6.1} ({:+5.1} %)",
+            "  {:<22} 1 thread {a:7.1} / {am:7.1} ({:+5.1} / {:+5.1} %) {k:7.0} / {km:7.0} ({:+5.1} %)   all {b:6.1} / {bm:6.1} ({:+5.1} / {:+5.1} %)",
             variants[i].0,
-            (a / b0 - 1.0) * 100.0,
-            (k / k0 - 1.0) * 100.0,
-            (b / p0 - 1.0) * 100.0
+            pct(a, b0),
+            pct(am, bm0),
+            pct(k, k0),
+            pct(b, p0),
+            pct(bm, pm0)
         );
     }
+}
+
+/// The two settings the first bench could not decide: zero sheets on top of the default, and the
+/// raw grid's threshold. The default is repeated to show the bench's own noise.
+#[test]
+#[ignore]
+fn zero_sheets_and_raw_threshold_bench() {
+    let d = LightPaths::DEFAULT;
+    let variants = [
+        ("default", d),
+        ("default again", d),
+        ("+zero sheets", LightPaths { zero_layers: true, ..d }),
+        ("raw from 0", LightPaths { raw_grid_min: 0, ..d }),
+        ("raw from 256", LightPaths { raw_grid_min: 256, ..d }),
+        ("raw from 1024", LightPaths { raw_grid_min: 1024, ..d }),
+        ("default third time", d),
+    ];
+    run_interleaved(&variants);
 }

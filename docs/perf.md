@@ -5671,8 +5671,9 @@ Geometry of the reads (block `p` inside the section, base `p` or `p + d` for a g
 diagonals, front and centre always fall inside the section's 18³ grid; only the four cells beyond
 the edges of a glued face of a block on the section boundary, looking out, reach the second ring
 (`p + 2d`), and those are property reads. Every LIGHT read of a face is inside the 18³ grid.
-Switches in `MeshJob::light` (`rc_mesh::light::LightPaths`, read once, on by default, `=0` old
-path; the seven older ones now go through `opt_switch!` with the same defaults):
+Switches in `MeshJob::light` (`rc_mesh::light::LightPaths`, read once; the first three on by
+default, `=0` old path; the zero sheets off by default, `=1` on; the seven older ones now go
+through `opt_switch!` with the same defaults):
 - `RUSTCRAFT_OPT_AOOFFSETS` (`fixed_offsets`): the 14 reads of a face as a constant table per
   (direction, glued), each with its vector, its step in the 20³ cache and its step in the 18³
   grids: one addition per read, one test per face for the second ring.
@@ -5710,16 +5711,30 @@ raw grid alone −4.1 / −12.1 %; zero sheets alone +13.5 / −3.1 % (median �
 −12.7 / −19.0 %, from 256 −34.9 / −22.8 %, from 1,024 −25.3 / −23.6 %; default (all four, 64)
 −14.6 / −23.0 %. A first pass of 7 long runs gave the same order for the paths alone and
 indistinct combinations (from −2 to −16 % all threads): the thread cycles follow the wall time
-exactly (4.49 GHz), the noise is contention, not preemption. Decision: the addressed reader wins in
-every combination (1-thread medians −17 to −27 %); between the combinations and the thresholds
-everything is inside the noise, so all four on with the threshold at 64 until the quiet bench; the
-zero sheets do nothing measurable on the capture (a surface region): kept on for the cave scene,
-where most layers are the shared zero sheet. Multi-core: the pool already spreads the columns, a
-2 µs fill is not worth splitting; GPU ruled out as for C2-M07 (reads made while building the faces).
+exactly (4.49 GHz), the noise is contention, not preemption. On this bench the 1-thread best is
+the noisiest column: for the thresholds and the zero sheets in combination the medians are flat
+(254.0 all four, 251.8 without zero sheets, 254.9 / 258.5 / 257.3 from 64 / 256 / 1,024, 255.8
+default), the spread of the bests (171 to 230 ms) is noise.
+
+Second micro-bench `zero_sheets_and_raw_threshold_bench`, on top of the new default, the default
+repeated three times as noise reference, two runs of 15 passes (best / median, 1 thread; best all
+threads), loaded machine: the default repeated moves by up to −8.2 / −5.6 % and −3.3 % all;
+zero sheets +1.0 / −4.9 / +0.7 % then −5.0 / +1.7 / −4.4 %; raw grid from 0 +0.1 / +14.0 / +1.9 %
+then −4.3 / +3.1 / −6.3 %; from 256 +0.5 / +15.1 / +2.0 % then −5.1 / −0.7 / −2.9 %; from 1,024
++2.3 / +18.8 / +1.2 % then −5.8 / +1.4 / −4.6 % (the median step of the first run is gone in the
+second): all inside the noise.
+
+Decision: the addressed reader wins in every combination (1-thread medians −17 to −27 %): offsets,
+property bits and raw grid on by default. The zero sheets show no gain on the capture (a surface
+region) and no proven gain anywhere else: OFF by default (`RUSTCRAFT_OPT_AOZEROLAYER=1` turns them
+on), to measure on the cave scene where most layers are the shared zero sheet. Threshold kept at 64
+(the fill cost, 2 µs, against some 400 lazy reads): no threshold beats another beyond the noise,
+to measure again on the quiet machine. Multi-core: the pool already spreads the columns, a 2 µs
+fill is not worth splitting; GPU ruled out as for C2-M07 (reads made while building the faces).
 
 Proofs: `tests/light_paths.rs` — the 11 paths each alone and all but one, all, the default, the raw
 grid from 1 candidate and never (alone and in the default), the addressed reader with the 6-byte
-cells and with the memorised neighbourhood: 29 variants × default / without occlusion / without sky
+cells, with the memorised neighbourhood and with the zero sheets: 32 variants × default / without occlusion / without sky
 over the whole capture against the old path and the stored fingerprint, and on the built scene
 (glass added); unit tests in `light.rs` (no data needed): raw grid against the lazy read of every
 cell (baseline body and AVX2, with and without the zero sheet shortcut, own layers, bottom of a
@@ -5736,7 +5751,7 @@ fail, the meshes do not change — no state of 26.3 is solid render without damp
 of that info looks at); the mapping stays so that the state is the closure's.
 
 To measure on the quiet machine: `scenes.py` cave, forest, plains32, flight, redstone (meshing
-ms/s in the pool, meshed sections/s), each of `AOOFFSETS`, `AOPROPBITS`, `AORAWGRID`,
-`AOZEROLAYER` at 0, `AORAWGRIDMIN` at 0, 256 and 1024; memstats per pool thread. Not done: the
+ms/s in the pool, meshed sections/s), each of `AOOFFSETS`, `AOPROPBITS`, `AORAWGRID` at 0,
+`AOZEROLAYER` at 1 (cave first), `AORAWGRIDMIN` at 0, 256 and 1024; memstats per pool thread. Not done: the
 flat path (emissive blocks, occlusion off) and the fluids still read the layers, not the raw grid.
 

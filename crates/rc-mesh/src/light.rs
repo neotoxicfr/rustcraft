@@ -265,7 +265,9 @@ pub struct LightPaths {
 
 /// Candidate blocks from which a section's raw light grid is filled (`raw_grid_min`): a fill
 /// costs about 2 µs (5,832 cells, loaded machine), some 400 lazy reads, or a few tens of blocks
-/// with faces. 0, 64, 256 and 1,024 could not be told apart in the micro-bench (`docs/perf.md`).
+/// with faces, hence 64. On the loaded machine 0, 64, 256 and 1,024 stayed inside the bench's own
+/// noise (the same setting repeated moves up to 8 %): to measure again on a calm machine
+/// (`docs/perf.md`).
 pub const RAW_GRID_MIN: u16 = 64;
 
 impl LightPaths {
@@ -297,9 +299,9 @@ impl LightPaths {
         raw_grid_min: RAW_GRID_MIN,
         zero_layers: false,
     };
-    /// Paths active by default: D + A + B, best combination proven in the micro-bench (C2-M07),
-    /// with the addressed reads and the zero sheets (C2-M09). C, E, F and G showed no gain (C
-    /// loses once combined): turned off until the calm-machine bench, see `docs/perf.md`.
+    /// Paths active by default: D + A + B, best combination proven in the micro-bench, with the
+    /// addressed reads (offsets, property bits, raw grid). C, E, F, G and the zero sheets showed
+    /// no gain (C loses once combined): turned off until the calm-machine bench, see `docs/perf.md`.
     pub const DEFAULT: LightPaths = LightPaths {
         cell: true,
         corners: true,
@@ -307,7 +309,6 @@ impl LightPaths {
         fixed_offsets: true,
         prop_bits: true,
         raw_grid: true,
-        zero_layers: true,
         ..Self::OLD
     };
 
@@ -329,7 +330,7 @@ impl LightPaths {
             raw_grid_min: rc_data::env_str!("RUSTCRAFT_OPT_AORAWGRIDMIN")
                 .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(RAW_GRID_MIN),
-            zero_layers: opt_switch!("RUSTCRAFT_OPT_AOZEROLAYER"),
+            zero_layers: opt_switch!("RUSTCRAFT_OPT_AOZEROLAYER", default_off),
         })
     }
 
@@ -744,8 +745,6 @@ macro_rules! each {
 
 impl<'a> AnyCache<'a> {
     /// Cache of a task: cells taken from `stores` (kept by the thread) if `paths.scratch`,
-    /// otherwise allocated for the task.
-    /// Cache of a task: cells taken from `stores` (kept by the thread) if `paths.scratch`,
     /// otherwise allocated for the task; the raw light grid is always the thread's.
     pub fn new(paths: LightPaths, stores: &mut LightStores) -> Self {
         let raw_light = std::mem::take(&mut stores.raw_light);
@@ -788,19 +787,15 @@ impl<'a> AnyCache<'a> {
     }
 
     /// [`quad_light`] in this cache.
-    #[allow(clippy::too_many_arguments)]
-    pub fn quad_light(
+    pub fn quad_light<F: Fn(i32, i32, i32) -> u32>(
         &mut self,
-        v: &LightView<'_>,
-        state_at: &impl Fn(i32, i32, i32) -> u32,
-        grids: Option<SectionGrids<'_>>,
+        src: &Sources<'_, '_, F>,
         p: [i32; 3],
         s: u32,
         q: &QuadGeom<'_>,
         smooth: bool,
     ) -> Vertices {
-        let src = Sources { view: v, state_at, grids };
-        each!(self, c => quad_light(&src, c, p, s, q, smooth))
+        each!(self, c => quad_light(src, c, p, s, q, smooth))
     }
 }
 

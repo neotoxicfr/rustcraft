@@ -1745,6 +1745,7 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
         lcache.reset(&light_view, si as i32 * 16, job.opts.ao || paths.fluid, count);
         // The light reads the properties and states of the section's grids when they are filled.
         let grids = use_props.then_some(crate::light::SectionGrids { states: &state_grid, props: &cell_props });
+        let light_sources = crate::light::Sources { view: &light_view, state_at: &st, grids };
         for k in 0..count {
             let i = if rows { usize::from(candidates[k]) } else { k };
             let state = values[i];
@@ -1898,7 +1899,7 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
                         .then(|| t.light_faces.faces.get(q as usize).map(|f| (f, &t.light_faces)))
                         .flatten(),
                 };
-                let verts = lcache.quad_light(&light_view, &st, grids, [x, y, z], state, &geom, smooth);
+                let verts = lcache.quad_light(&light_sources, [x, y, z], state, &geom, smooth);
                 let layer = if opaque_leaves { 0 } else { quad.layer as usize };
                 let pos = (x as u32) | ((z as u32) << 4) | ((y as u32) << 8);
                 // Offset model outside translucents: compact face (offset re-read by the shader).
