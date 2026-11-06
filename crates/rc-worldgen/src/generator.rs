@@ -94,8 +94,8 @@ pub struct NoiseSettings {
     /// Fields for part 2 (aquifers, material rules), raw.
     pub aquifers: Option<Json>,
     pub material_rule: Option<Json>,
-    /// Spawn search targets, raw (`RUSTCRAFT_OPT_NOISE_SETTINGS_READ_ONCE`; `None` on the old path,
-    /// which parses the file again).
+    /// Spawn search targets, raw. Always kept, whatever the switch: only the spawn search reads
+    /// `RUSTCRAFT_OPT_NOISE_SETTINGS_READ_ONCE`, so two reads of the switch can never disagree.
     pub spawn_target: Option<Json>,
 }
 
@@ -135,7 +135,7 @@ impl NoiseSettings {
             ],
             aquifers: j.get("aquifers").cloned(),
             material_rule: j.get("material_rule").cloned(),
-            spawn_target: if crate::opt::noise_settings_read_once() { j.get("spawn_target").cloned() } else { None },
+            spawn_target: j.get("spawn_target").cloned(),
         })
     }
 }

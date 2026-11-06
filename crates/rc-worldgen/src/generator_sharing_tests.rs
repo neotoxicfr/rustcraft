@@ -1,6 +1,6 @@
 // Direct read allowed (tests and benches: settings read at launch, outside the measured path); the game goes through rc_data::env_*!.
 #![allow(clippy::disallowed_methods)]
-//! Equivalence proofs and bench of the generator setup shared per world data (C1-M03): density
+//! Equivalence proofs and bench of the generator setup shared per world data: density
 //! functions and noises parsed once per pack, biome parameter lists and processor lists once per
 //! world data, noise settings read once, spawn search scored on every core. Game data required
 //! (jar 26.3 and rc-data cache); absent: tests skipped, except `RUSTCRAFT_OPT_REQUIRE=1`.
@@ -259,6 +259,24 @@ fn parallel_spawn_search_matches_sequential() {
         got.push((settings, seed, sequential));
     }
     assert_eq!(got.as_slice(), expected.as_slice(), "spawn chunks differ from the stored values");
+}
+
+/// Noise settings parsed while the read-once switch is off still keep their spawn targets: a
+/// generator whose settings were loaded under one switch value and whose targets are read under
+/// the other must not end up with an empty target list (silent spawn at chunk 0, 0).
+#[test]
+fn spawn_targets_kept_whatever_the_switch() {
+    let Some(w) = world_data() else { return };
+    let spec = noise_spec("minecraft:overworld");
+    let dg = dim_gen(w, &spec, "minecraft:overworld", 20_261_011, true, false);
+    for on in [false, true] {
+        crate::opt::force(&["NOISE_SETTINGS_READ_ONCE"], Some(on));
+        let settings = NoiseSettings::load(&w.pack, "minecraft:overworld").expect("noise settings");
+        crate::opt::force(&["NOISE_SETTINGS_READ_ONCE"], None);
+        assert!(settings.spawn_target.is_some(), "switch {on}: spawn targets dropped by the settings");
+    }
+    assert!(!dg.spawn_targets.is_empty(), "spawn targets of the main world");
+    assert_ne!(dg.spawn_chunk(), (0, 0), "spawn search ran on real targets");
 }
 
 fn ms(t: std::time::Instant) -> f64 {
