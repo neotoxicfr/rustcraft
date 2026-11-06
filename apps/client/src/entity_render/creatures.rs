@@ -784,7 +784,7 @@ fn axolotl(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     let k = m.min(w);
     if k > 1e-5 {
         let a = age * 0.33;
-        let (sa, ca) = a.sin_cos();
+        let (sa, ca) = (table_sin(a), table_cos(a));
         let b = 0.13 * sa;
         p.set("body", |x| {
             x[3] += (s.pitch + b) * k;
@@ -841,7 +841,7 @@ fn axolotl(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     let k = n.min(g);
     if k > 1e-5 {
         let a = age * 0.09;
-        let (sa, ca) = a.sin_cos();
+        let (sa, ca) = (table_sin(a), table_cos(a));
         let mm = sa * sa - 2.0 * sa;
         let m2 = ca * ca - 3.0 * sa;
         p.set("head", |x| {
@@ -1552,6 +1552,44 @@ mod tests {
     use super::super::keyframes::testkit::*;
     use super::*;
     use rc_proto_v777::entity::Meta;
+
+    /// Adult axolotl swimming, then still on the ground: the sway reads the game's sine table,
+    /// bit for bit (top gills while swimming, head while still); the library sine differs.
+    #[test]
+    fn axolotl_swim_and_rest_follow_the_game_sine_table() {
+        let l = test_layer(&[("body", None), ("head", None), ("top_gills", None), ("tail", None)]);
+        let mut all = spawn("axolotl");
+        let e = all.map.get_mut(&7).unwrap();
+        // Smoothed factors (`extra[0..4]` now, `extra[4..8]` before) of: dead, water, ground, moving.
+        let full = (1.0 - rc_physics::cos_t(PI)) / 2.0;
+        let mut library_differs = [0usize; 2];
+        for (behaviour, factors) in [(0, [0.0, 10.0, 0.0, 10.0]), (1, [0.0, 0.0, 10.0, 0.0])] {
+            e.extra[..4].copy_from_slice(&factors);
+            e.extra[4..8].copy_from_slice(&factors);
+            for age in 0..2000u32 {
+                e.age = age;
+                let s = state(e, 0.0);
+                let mut p = Pose::reset(&l, Vec::new(), Vec::new());
+                axolotl(&mut p, e, &s, 0.0);
+                let (got, want, library) = if behaviour == 0 {
+                    let a = s.age * 0.33;
+                    // Added to the rest pose's zero, as the animation does (−0 becomes +0).
+                    let sway = |sine: f32| 0.0 + (-0.5 * sine - 0.8) * full;
+                    (part(&p, "top_gills")[3], sway(rc_physics::sin_t(a)), sway(a.sin()))
+                } else {
+                    let a = s.age * 0.09;
+                    let nod = |sine: f32| 0.0 + -0.09 * (sine * sine - 2.0 * sine) * full;
+                    (part(&p, "head")[3], nod(rc_physics::sin_t(a)), nod(a.sin()))
+                };
+                assert_eq!(got.to_bits(), want.to_bits(), "behaviour {behaviour}, age {age}");
+                library_differs[behaviour] += usize::from(library != want);
+            }
+        }
+        assert!(
+            library_differs.iter().all(|&n| n > 0),
+            "the library sine gives the table's angles: {library_differs:?}"
+        );
+    }
 
     const GOLEM: [(&str, Option<usize>); 5] =
         [("head", None), ("right_arm", None), ("left_arm", None), ("right_leg", None), ("left_leg", None)];

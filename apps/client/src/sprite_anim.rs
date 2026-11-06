@@ -66,7 +66,7 @@ impl SpriteAnim {
         let next = pick(self.steps[(self.step + 1) % self.steps.len()].0).filter(|n| n.rgba.len() == cur.rgba.len())?;
         // Share of the next one truncated to the thousandth, like the game.
         let p = ((self.sub as f32 / time as f32) * 1000.0) as u32 as f32 / 1000.0;
-        let by_truncation = rc_data::opt_switch!("RUSTCRAFT_OPT_ROUND_TRICK");
+        let by_truncation = rc_data::opt_switch!("RUSTCRAFT_OPT_ROUND_BY_TRUNCATION");
         let rgba = cur
             .rgba
             .iter()
@@ -79,7 +79,7 @@ impl SpriteAnim {
 
 /// `v.round() as u8` of a blended channel. `by_truncation`: for a value of [0, 255.5[ the
 /// truncation is one instruction and the fraction it leaves is exact, where the library
-/// rounding is a call per channel (`RUSTCRAFT_OPT_ROUND_TRICK=0`: the library, the old path).
+/// rounding is a call per channel (`RUSTCRAFT_OPT_ROUND_BY_TRUNCATION=0`: the library, the old path).
 fn round_channel(v: f32, by_truncation: bool) -> u8 {
     if by_truncation && (0.0..255.5).contains(&v) {
         let whole = v as u32;

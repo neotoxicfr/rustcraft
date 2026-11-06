@@ -2065,7 +2065,7 @@ pitch and relative head inverted). Squids, armor stand and dragon have none.
 Shaking: full freeze (data 7 ≥ 140); zombie/drowned/husk (18), zombie villager (19),
 skeleton alone (16, without the freeze), piglins outside the Nether (immunity 16, AI), hoglin (18), strider (19).
 Avatars then: gliding → X o × (−90 − pitch) (not during the spin attack), then Y
-of the signed angle between horizontal movement and gaze (if both > 1e-5); otherwise swimming → X
+of the signed angle between horizontal movement and gaze (head yaw; if both squared lengths > the float 1e-5); otherwise swimming → X
 w × (−90 − pitch in water, −90 out of water), then (0; −1; 0.3) in visible swimming. Drowned: X
 w × (−10 − pitch) around the middle of its box. Crouching avatar: render lowered by 2/16 × scale
 (not the shadow). Upside down: name "Dinnerbone"/"Grumm" (avatar: only if cape displayed).

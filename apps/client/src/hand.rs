@@ -218,12 +218,17 @@ fn whack(i: f32, a: f32) -> Mat4 {
 }
 
 /// Power 27 of the eating progress, as the game takes it: in double precision, rounded back to
-/// a float. `RUSTCRAFT_OPT_ROUND_TRICK` (default): by multiplications (same bits as the library
-/// power on every float of [0, 2[, `eat_jiggle_power_matches_library_power`); `=0`: the library
-/// power in double.
+/// a float. The double precision is a fidelity fix and is not behind any switch (the old
+/// single-precision power moved bits). `RUSTCRAFT_OPT_EAT_POWER_BY_MULTIPLICATION` (default):
+/// by multiplications, which avoid the library call and give the same bits on every float of
+/// [0, 2[ (`eat_jiggle_power_matches_library_power`); `=0`: the library power in double.
 fn eat_jiggle_power(scaled: f32) -> f32 {
     let x = f64::from(scaled);
-    if rc_data::opt_switch!("RUSTCRAFT_OPT_ROUND_TRICK") { x.powi(27) as f32 } else { x.powf(27.0) as f32 }
+    if rc_data::opt_switch!("RUSTCRAFT_OPT_EAT_POWER_BY_MULTIPLICATION") {
+        x.powi(27) as f32
+    } else {
+        x.powf(27.0) as f32
+    }
 }
 
 /// "Stab" attack (spear, § 2.8).

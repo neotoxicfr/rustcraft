@@ -262,15 +262,56 @@ struct PoseEnv {
     in_water: bool,
 }
 
-/// Horizontal components (x, z) of the game's view vector of `e` at `pt`: yaw interpolated the
-/// shorter way (both angles exact at `pt` = 1), degrees to radians in floats, the sine table,
-/// products in single precision.
+/// Dragon jaw and piglin ears of a skull (`kind` 4 and 5), worn or placed, at the rhythm
+/// `anim`; the other skulls do not move.
+pub(super) fn animate_head(p: &mut Pose<'_>, kind: usize, anim: f32) {
+    match kind {
+        4 => p.set("jaw", |q| q[3] = dragon_head_jaw_angle(anim)),
+        5 => {
+            let [left, right] = piglin_head_ear_angles(anim);
+            p.set("left_ear", |q| q[5] = left);
+            p.set("right_ear", |q| q[5] = right);
+        }
+        _ => {}
+    }
+}
+
+/// The game takes this sine in double precision (the library, not its table): the float angle
+/// widened first, rounded back to a float after adding the offset.
+fn dragon_head_jaw_angle(anim: f32) -> f32 {
+    (f64::from(anim * PI * 0.2).sin() + 1.0) as f32 * 0.2
+}
+
+/// Roll of the left and right ears, the cosines in double precision like the dragon jaw.
+fn piglin_head_ear_angles(anim: f32) -> [f32; 2] {
+    let left = -((f64::from(anim * PI * 0.2 * 1.2).cos() + 2.5) as f32) * 0.2;
+    let right = (f64::from(anim * PI * 0.2).cos() + 2.5) as f32 * 0.2;
+    [left, right]
+}
+
+/// Yaw offset (degrees) of a shaking body at `age` ticks: the game takes this cosine in double
+/// precision (the library, not its table), the phase being a float product.
+fn shaking_yaw_offset(age: f32) -> f32 {
+    let phase = age.floor() * 3.25;
+    (f64::from(phase).cos() * std::f64::consts::PI * f64::from(0.4f32)) as f32
+}
+
+/// Sideways shift of a stunned ravager's neck: the library sine in double precision, the stun
+/// ticks widened before the division.
+fn ravager_stunned_neck_shift(stun_ticks: f32) -> f32 {
+    (f64::from(stun_ticks) / 40.0 * 10.0).sin() as f32 * 3.0
+}
+
+/// Horizontal components (x, z) of the game's view vector of the living entity `e` at `pt`:
+/// the HEAD yaw (a living entity looks where its head turns) interpolated the shorter way
+/// (both angles exact at `pt` = 1), degrees to radians in floats, the sine table, products in
+/// single precision.
 fn flat_view_vector(e: &Entity, pt: f32) -> [f64; 2] {
     const RADIANS_PER_DEGREE: f32 = 0.017_453_292;
     let (pitch, yaw) = if pt == 1.0 {
-        (e.pitch, e.yaw)
+        (e.pitch, e.head)
     } else {
-        (e.pitch_o + pt * (e.pitch - e.pitch_o), rot_lerp(pt, e.yaw_o, e.yaw))
+        (e.pitch_o + pt * (e.pitch - e.pitch_o), rot_lerp(pt, e.head_o, e.head))
     };
     let pitch_cos = table_cos(pitch * RADIANS_PER_DEGREE);
     let yaw_radians = -yaw * RADIANS_PER_DEGREE;
@@ -1123,7 +1164,7 @@ fn part_matrix(p: &[f32; 9]) -> Mat4 {
 /// Sine and cosine (rendering only): reduction to a quarter turn, minimax polynomials on
 /// [−π/4, π/4]; error < 1e-6 on [−20, 20] (a few ulp of f32), invisible when rendered.
 fn sin_cos(x: f32) -> (f32, f32) {
-    sin_cos_with(x, rc_data::opt_switch!("RUSTCRAFT_OPT_ROUND_TRICK"))
+    sin_cos_with(x, rc_data::opt_switch!("RUSTCRAFT_OPT_ROUND_BY_TRUNCATION"))
 }
 
 /// The library's rounding of `v` (halves away from zero) for `|v| < 2^22`, without its call:
@@ -5485,16 +5526,7 @@ impl EntityRenderer {
         };
         let Some(rect) = rect else { return };
         let lay = if !offset || self.gui_root.is_some() { Mat4::IDENTITY } else { self.layering };
-        self.push_posed(layer, rect, lay * mtx, pass, light, |p| match kind {
-            // These two heads animate with the library sine in double precision, the float
-            // angle widened first, rounded back to a float after adding the offset.
-            4 => p.set("jaw", |q| q[3] = (f64::from(walk * PI * 0.2).sin() + 1.0) as f32 * 0.2),
-            5 => {
-                p.set("left_ear", |q| q[5] = -((f64::from(walk * PI * 0.2 * 1.2).cos() + 2.5) as f32) * 0.2);
-                p.set("right_ear", |q| q[5] = (f64::from(walk * PI * 0.2).cos() + 2.5) as f32 * 0.2);
-            }
-            _ => {}
-        });
+        self.push_posed(layer, rect, lay * mtx, pass, light, |p| animate_head(p, kind, walk));
     }
 
     /// Instance of a baked layer (white, no overlay) placed by `anim` under matrix `m`.
@@ -6775,13 +6807,7 @@ fn pose_rotations(e: &Entity, pt: f32, body: f32, m: &mut Mat4, c: &RotCtx) {
     let base_rot = !matches!(e.kind.as_str(), "squid" | "glow_squid" | "ender_dragon" | "armor_stand");
     // Shaking: body yaw offset; Y rotation applied before that of the body
     // (coincident axes, the families' translations are vertical).
-    // The game takes this cosine in double precision (library, not its table).
-    let shake = if base_rot && c.shaking {
-        let phase = (e.age as f32 + pt).floor() * 3.25;
-        (f64::from(phase).cos() * std::f64::consts::PI * f64::from(0.4f32)) as f32
-    } else {
-        0.0
-    };
+    let shake = if base_rot && c.shaking { shaking_yaw_offset(e.age as f32 + pt) } else { 0.0 };
     let sleeping = base_rot && e.pose() == 2;
     // A zero shake is the identity rotation (sine +0, cosine 1): the product would return the
     // matrix up to the sign of zeros, which no pixel shows (`identity_product_keeps_matrix`).
@@ -7637,8 +7663,7 @@ fn ravager(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
         if st > 0.0 {
             p.set("neck", |n| {
                 n[3] = 0.219_911_49;
-                // Library sine in double precision here, the stun ticks widened before the division.
-                n[0] = (f64::from(st) / 40.0 * 10.0).sin() as f32 * 3.0;
+                n[0] = ravager_stunned_neck_shift(st);
             });
             p.set("mouth", |x| x[3] = 0.05 * PI);
         } else {
@@ -8042,6 +8067,166 @@ mod tests {
         assert!(flying_y_rot(e, 0.0).is_none());
     }
 
+    /// The gaze of a gliding avatar is its HEAD yaw: body turned towards −x, head towards +z,
+    /// movement towards +x → +π/2 (the body yaw would give 0).
+    #[test]
+    fn flying_yaw_looks_where_the_head_turns() {
+        let mut all = testkit::spawn("player");
+        let e = all.map.get_mut(&7).unwrap();
+        e.velocity = [1.0, 0.0, 0.0];
+        e.pose_anim.vel_o = [1.0, 0.0, 0.0];
+        (e.yaw, e.yaw_o, e.head, e.head_o) = (90.0, 90.0, 0.0, 0.0);
+        for pt in [0.0, 0.5, 1.0] {
+            let a = flying_y_rot(e, pt).unwrap();
+            assert!((a - PI / 2.0).abs() < 1e-5, "pt {pt}: {a}");
+        }
+    }
+
+    /// The game compares both squared horizontal lengths with the float 1e-5 widened
+    /// (9.99999974e-6), not the double 1e-5: a movement in between still turns the glide.
+    #[test]
+    fn flying_yaw_threshold_is_the_float_one() {
+        let mut all = testkit::spawn("player");
+        let e = all.map.get_mut(&7).unwrap();
+        let x = 9.999_999_9e-6f64.sqrt();
+        assert!(x * x > f64::from(1.0e-5f32) && x * x <= 1.0e-5, "{}", x * x);
+        e.velocity = [x, 0.0, 0.0];
+        e.pose_anim.vel_o = e.velocity;
+        assert!(flying_y_rot(e, 1.0).is_some());
+    }
+
+    /// Glide yaw, bit for bit, against the game's steps written out: view vector from the
+    /// float angles and the sine table, both horizontal vectors normalised, then their dot
+    /// product. The body yaw (the old path) moves the angle.
+    #[test]
+    fn flying_yaw_matches_the_game_bit_for_bit() {
+        fn game(pitch: f32, head: f32, mv: [f64; 2]) -> f32 {
+            let (x_rot, y_rot) = (pitch * 0.017_453_292f32, -head * 0.017_453_292f32);
+            let x_cos = rc_physics::cos_t(x_rot);
+            let look = [f64::from(rc_physics::sin_t(y_rot) * x_cos), f64::from(rc_physics::cos_t(y_rot) * x_cos)];
+            let normalized = |v: [f64; 2]| {
+                let length = (v[0] * v[0] + v[1] * v[1]).sqrt();
+                [v[0] / length, v[1] / length]
+            };
+            let (m, l) = (normalized(mv), normalized(look));
+            let dot = m[0] * l[0] + m[1] * l[1];
+            let sign = mv[0] * look[1] - mv[1] * look[0];
+            let signum = if sign > 0.0 {
+                1.0
+            } else if sign < 0.0 {
+                -1.0
+            } else {
+                0.0
+            };
+            (signum * dot.abs().min(1.0).acos()) as f32
+        }
+        let mut all = testkit::spawn("player");
+        let e = all.map.get_mut(&7).unwrap();
+        let mut seed = 0x9e37_79b9u32;
+        let mut random = |lo: f32, hi: f32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            lo + (hi - lo) * (seed as f32 / u32::MAX as f32)
+        };
+        let (mut body_yaw_differs, mut division_differs) = (0, 0);
+        for _ in 0..2000 {
+            (e.pitch, e.head) = (random(-89.0, 89.0), random(-720.0, 720.0));
+            e.yaw = random(-180.0, 180.0);
+            e.velocity = [f64::from(random(-2.0, 2.0)), 0.0, f64::from(random(-2.0, 2.0))];
+            e.pose_anim.vel_o = e.velocity;
+            let mv = [e.velocity[0], e.velocity[2]];
+            let want = game(e.pitch, e.head, mv);
+            let got = flying_y_rot(e, 1.0).unwrap();
+            assert_eq!(got.to_bits(), want.to_bits(), "pitch {} head {} movement {mv:?}", e.pitch, e.head);
+            body_yaw_differs += usize::from(game(e.pitch, e.yaw, mv) != want);
+            let look = flat_view_vector(e, 1.0);
+            let (m2, l2) = (mv[0] * mv[0] + mv[1] * mv[1], look[0] * look[0] + look[1] * look[1]);
+            let old_dot = (mv[0] * look[0] + mv[1] * look[1]) / (m2.sqrt() * l2.sqrt());
+            division_differs += usize::from(got.abs() != old_dot.abs().min(1.0).acos() as f32);
+        }
+        assert!(body_yaw_differs > 0, "the body yaw gives the head's angles: the test sees nothing");
+        // The dot product's last bits are lost in the float angle: noted, not required.
+        eprintln!("glide angles where dividing the dot product by both lengths differs: {division_differs} of 2000");
+    }
+
+    /// Shaking, stunned ravager, dragon jaw and piglin ears: each takes the library sine in
+    /// double precision like the game, bit for bit; the old single-precision formulas differ.
+    #[test]
+    fn double_precision_angles_match_the_game() {
+        let pi64 = std::f64::consts::PI;
+        let mut single_differs = [0usize; 4];
+        for step in 0..4000 {
+            let t = step as f32 * 0.37 + 0.013;
+            let shake = (f64::from(t.floor() * 3.25f32).cos() * pi64 * f64::from(0.4f32)) as f32;
+            assert_eq!(shaking_yaw_offset(t).to_bits(), shake.to_bits(), "shake at {t}");
+            let neck = (f64::from(t) / 40.0 * 10.0).sin() as f32 * 3.0;
+            assert_eq!(ravager_stunned_neck_shift(t).to_bits(), neck.to_bits(), "ravager at {t}");
+            let jaw = (f64::from(t * PI * 0.2).sin() + 1.0) as f32 * 0.2;
+            assert_eq!(dragon_head_jaw_angle(t).to_bits(), jaw.to_bits(), "dragon jaw at {t}");
+            let ears = [
+                -((f64::from(t * PI * 0.2 * 1.2).cos() + 2.5) as f32) * 0.2,
+                (f64::from(t * PI * 0.2).cos() + 2.5) as f32 * 0.2,
+            ];
+            assert_eq!(piglin_head_ear_angles(t).map(f32::to_bits), ears.map(f32::to_bits), "piglin ears at {t}");
+            let single = [
+                ((t.floor() * 3.25).cos() * PI * 0.4) != shake,
+                ((t / 40.0 * 10.0).sin() * 3.0) != neck,
+                (((t * PI * 0.2).sin() + 1.0) * 0.2) != jaw,
+                (-((t * PI * 0.2 * 1.2).cos() + 2.5) * 0.2) != ears[0],
+            ];
+            for (count, differs) in single_differs.iter_mut().zip(single) {
+                *count += usize::from(differs);
+            }
+        }
+        assert!(
+            single_differs.iter().all(|&n| n > 0),
+            "a single-precision formula equals the game's: {single_differs:?}"
+        );
+    }
+
+    /// Boat in a bubble column: the tilt is the library sine of half the tick count in double
+    /// precision, like the game, bit for bit; the old single-precision product differs.
+    #[test]
+    fn boat_bubble_tilt_matches_the_game() {
+        let mut all = testkit::spawn("oak_boat");
+        let e = all.map.get_mut(&7).unwrap();
+        e.meta.insert(13, Meta::Int(60));
+        let mut single_differs = 0;
+        for age in 0..4000u32 {
+            e.age = age;
+            objects::tick(e);
+            let multiplier = e.extra[4];
+            let want = 10.0 * (0.5 * f64::from(age)).sin() as f32 * multiplier;
+            assert_eq!(e.extra[5].to_bits(), want.to_bits(), "tick {age}");
+            single_differs += usize::from(10.0 * (0.5 * age as f32).sin() * multiplier != want);
+        }
+        assert_eq!(e.extra[4], 1.0, "the bubble multiplier never filled up");
+        assert!(single_differs > 0, "the single-precision sine gives the same tilt: the test sees nothing");
+    }
+
+    /// Swimming legs: a third of the walk position as the game takes it, times the float
+    /// nearest 1/3, through its sine table, bit for bit; dividing by 3 moves table indexes.
+    #[test]
+    fn swimming_legs_take_a_third_like_the_game() {
+        let parts = [("head", None), ("right_arm", None), ("left_arm", None), ("right_leg", None), ("left_leg", None)];
+        let l = testkit::test_layer(&parts);
+        let all = testkit::spawn("player");
+        let mut divided_differs = 0;
+        for step in 0..2000 {
+            let mut s = testkit::state(&all.map[&7], 0.0);
+            s.walk_pos = step as f32 * 0.37 + 0.11;
+            s.walk_speed = 0.0;
+            s.swim = 1.0;
+            let mut p = Pose::reset(&l, Vec::new(), Vec::new());
+            humanoid(&mut p, &s);
+            let want = 0.3 * rc_physics::cos_t(s.walk_pos * 0.333_333_34);
+            assert_eq!(p.parts[3][3].to_bits(), want.to_bits(), "walk position {}", s.walk_pos);
+            divided_differs += usize::from(0.3 * rc_physics::cos_t(s.walk_pos / 3.0) != want);
+        }
+        assert!(divided_differs > 0, "dividing by 3 gives the same angles: the test sees nothing");
+    }
+
     /// Breaststroke at time 7 of the cycle: right arm (x, y, z) = (0, π, π − 1.8708 × q(7)/q(14)),
     /// legs 0.3 cos(7/3); head at −π/4.
     #[test]
@@ -8107,7 +8292,7 @@ mod tests {
         c.shaking = true;
         let mut m = Mat4::IDENTITY;
         pose_rotations(e, 0.0, 30.0, &mut m, &c);
-        let shake = (2.0f32 * 3.25).cos() * PI * 0.4;
+        let shake = (f64::from(2.0f32 * 3.25).cos() * std::f64::consts::PI * f64::from(0.4f32)) as f32;
         close(m, Mat4::from_rotation_y(deg(180.0 - 30.0 - shake)));
     }
 

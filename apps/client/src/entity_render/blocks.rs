@@ -10,8 +10,8 @@ use glam::{EulerRot, Mat4, Vec3};
 use rc_proto_v777::item::ItemStack;
 
 use super::{
-    EntityRenderer, HeldEnv, Instance, PASS_CUTOUT_CULL, PASS_SOLID, PartMat, Pass, Pose, SKINS, default_skin, deg,
-    items_in, part_matrix, table_cos, table_sin,
+    EntityRenderer, HeldEnv, Instance, PASS_CUTOUT_CULL, PASS_SOLID, PartMat, Pass, Pose, SKINS, animate_head,
+    default_skin, deg, items_in, part_matrix, table_cos, table_sin,
 };
 use crate::block_entities::{BlockEntities, BlockEntity, Data, Kind, Stack, dye_rgb, head_key};
 use crate::block_fx::{BeamVertex, PortalVertex};
@@ -542,16 +542,7 @@ impl EntityRenderer {
                 * Mat4::from_scale(Vec3::new(-1.0, -1.0, 1.0))
         };
         let anim = e.anim.ticks as f32 + if e.props.powered { pt } else { 0.0 };
-        let pose = |p: &mut Pose<'_>| match kind {
-            // These two heads animate with the library sine in double precision (see the worn
-            // skulls in `push_worn_skull`).
-            4 => p.set("jaw", |q| q[3] = (f64::from(anim * PI * 0.2).sin() + 1.0) as f32 * 0.2),
-            5 => {
-                p.set("left_ear", |q| q[5] = -((f64::from(anim * PI * 0.2 * 1.2).cos() + 2.5) as f32) * 0.2);
-                p.set("right_ear", |q| q[5] = (f64::from(anim * PI * 0.2).cos() + 2.5) as f32 * 0.2);
-            }
-            _ => {}
-        };
+        let pose = |p: &mut Pose<'_>| animate_head(p, kind, anim);
         let Some(&l) = self.layer_index.get(layer) else { return false };
         if kind == 6 {
             // Profile: downloaded skin, otherwise the default skin of its UUID; without a profile: slim Steve.
