@@ -51,8 +51,8 @@ fn vs(
     return place(vi, anchor, light, rect, skew, uvr, color, mode);
 }
 
-// Kept glyphs (`RUSTCRAFT_OPT_TAGPERSIST`): same fields, aligned to 16 bytes.
-struct Stored {
+// Kept glyphs (`RUSTCRAFT_OPT_TAGPERSIST`, shared glyph pool): same fields, aligned to 16 bytes.
+struct PooledGlyph {
     rect: vec4<f32>,
     uv: vec4<f32>,
     skew: f32,
@@ -60,7 +60,7 @@ struct Stored {
     mode: u32,
     pad: u32,
 };
-@group(1) @binding(3) var<storage, read> stored: array<Stored>;
+@group(1) @binding(3) var<storage, read> pool: array<PooledGlyph>;
 
 // One instance per tag: `count` glyphs starting at `first`; the glyph of a vertex is
 // vi / 6, those beyond the count (tags shorter than the longest) are degenerate.
@@ -78,7 +78,7 @@ fn vs_tag(
         o.pos = vec4<f32>(2.0, 2.0, 0.5, 1.0);
         return o;
     }
-    let s = stored[first + g];
+    let s = pool[first + g];
     return place(vi % 6u, anchor, light, s.rect, s.skew, s.uv, unpack4x8unorm(s.color), s.mode);
 }
 

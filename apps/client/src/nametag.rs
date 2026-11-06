@@ -8,22 +8,21 @@
 //!
 //! **Kept glyphs** (`RUSTCRAFT_OPT_TAGPERSIST`, default 1). Old path (`=0`): one instance
 //! per glyph (anchor, light and glyph copied on every frame, 60 bytes). New path: the
-//! glyphs of each layout live in a pool (storage buffer) sent back only
-//! for new layouts; per frame, a 24-byte reference per tag and per
+//! glyphs of each layout live in the shared glyph pool (`glyph_pool.rs`, sent back only
+//! for new layouts); per frame, a 24-byte reference per tag and per
 //! pass (anchor, light, first glyph, count), drawn as instances of `6 × n` vertices (`n`
 //! = longest name of the draw; a pass is cut into contiguous draws whose vertices stay
 //! under twice those of their glyphs). The normal pass keeps the glyph order; in
 //! improved transparency, the opaque glyphs come from a copy sorted solids first
-//! (kept only when the original order is not already so). Forgotten glyphs are counted
-//! and the pool is compacted at the start of a frame when they exceed the live ones and 4096 (pool
-//! at most live + max(live, 4096); the GPU buffer does not shrink). All writes
-//! go through the common transit.
+//! (kept only when the original order is not already so). All writes go through the
+//! common transit.
 
 use hashbrown::HashMap;
 
 use glam::Vec3;
 use rc_text::StyledChar;
 
+use crate::glyph_pool::{DrawSplitter, GlyphPool, PoolUpload, PooledRun, RefDraw, draw_refs};
 use crate::gui::Gui;
 use crate::render::upload::Uploader;
 
@@ -55,24 +54,6 @@ struct TagInstance {
     glyph: Glyph,
 }
 
-/// Glyph of the pool (same fields as [`Glyph`], aligned to 16 bytes for storage).
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Stored {
-    rect: [f32; 4],
-    uv: [f32; 4],
-    skew: f32,
-    color: u32,
-    mode: u32,
-    pad: u32,
-}
-
-impl Stored {
-    fn new(g: &Glyph) -> Self {
-        Stored { rect: g.rect, uv: g.uv, skew: g.skew, color: g.color, mode: g.mode, pad: 0 }
-    }
-}
-
 /// A tag in a pass: `count` glyphs of the pool starting at `first`.
 #[repr(C)]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
@@ -89,9 +70,6 @@ const NORMAL: usize = 0;
 const SEE: usize = 1;
 const SOLID: usize = 2;
 const REST: usize = 3;
-
-/// Forgotten glyphs tolerated before compaction (beyond, if they also exceed the live ones).
-const COMPACT_MIN: usize = 4096;
 
 /// Glyphs kept on the GPU (`RUSTCRAFT_OPT_TAGPERSIST`, default 1), read once.
 pub(crate) fn persist_on() -> bool {
@@ -160,14 +138,18 @@ impl NameSource {
     }
 }
 
-/// Starts of the ranges of a layout in the pool: normal pass, see-through, normal
-/// sorted solids first (equal to `normal` if the original order already is), and number of solids.
+/// Ranges of a layout in the pool: normal pass (with its solids-first copy), first glyph of
+/// the see-through pass.
 #[derive(Clone, Copy, Default)]
 struct Spans {
-    normal: u32,
+    normal: PooledRun,
     see: u32,
-    sorted: u32,
-    solid: u32,
+}
+
+impl Spans {
+    fn add(pool: &mut GlyphPool, normal: &[Glyph], see: &[Glyph]) -> Self {
+        Spans { normal: pool.push_run(normal), see: pool.push(see) }
+    }
 }
 
 struct Cached {
@@ -183,65 +165,20 @@ struct Cached {
 impl Cached {
     /// Glyphs occupied in the pool.
     fn stored(&self) -> usize {
-        let copy = if self.spans.sorted != self.spans.normal { self.normal.len() } else { 0 };
-        self.normal.len() + self.see.len() + copy
+        self.spans.normal.pooled() + self.see.len()
     }
 
     /// References of the tag in each pass.
     fn refs(&self, anchor: [f32; 3], normal_light: u32, light: u32) -> [TagRef; 4] {
-        let s = self.spans;
-        let n = self.normal.len() as u32;
+        let (n, see) = (self.spans.normal, self.spans.see);
         let r = |light, first, count| TagRef { anchor, light, first, count };
         [
-            r(normal_light, s.normal, n),
-            r(light, s.see, self.see.len() as u32),
-            r(normal_light, s.sorted, s.solid),
-            r(normal_light, s.sorted + s.solid, n - s.solid),
+            r(normal_light, n.first, n.count),
+            r(light, see, self.see.len() as u32),
+            r(normal_light, n.sorted, n.solids),
+            r(normal_light, n.sorted + n.solids, n.count - n.solids),
         ]
     }
-}
-
-/// Glyph pool (CPU copy of the storage buffer).
-#[derive(Default)]
-struct Store {
-    glyphs: Vec<Stored>,
-    /// First glyph not yet sent.
-    dirty: usize,
-    /// Glyphs no longer referenced by any kept layout.
-    dead: usize,
-    /// Capacity of the GPU buffer in glyphs (0 = not yet created).
-    cap: usize,
-    /// Test sabotage: additions never sent.
-    #[cfg(test)]
-    sabotage: bool,
-    #[cfg(test)]
-    compactions: u32,
-}
-
-impl Store {
-    fn add(&mut self, normal: &[Glyph], see: &[Glyph]) -> Spans {
-        // Append at the tail: always beyond `dirty`, hence sent at the end of the frame.
-        let at = self.glyphs.len();
-        self.glyphs.extend(normal.iter().map(Stored::new));
-        let see_at = self.glyphs.len();
-        self.glyphs.extend(see.iter().map(Stored::new));
-        let solid = normal.iter().filter(|g| g.solid()).count();
-        let sorted = if normal[..solid].iter().all(Glyph::solid) {
-            at
-        } else {
-            let s = self.glyphs.len();
-            self.glyphs.extend(normal.iter().filter(|g| g.solid()).map(Stored::new));
-            self.glyphs.extend(normal.iter().filter(|g| !g.solid()).map(Stored::new));
-            s
-        };
-        Spans { normal: at as u32, see: see_at as u32, sorted: sorted as u32, solid: solid as u32 }
-    }
-}
-
-/// Upload of the pool for the frame: buffer recreated at `grow` glyphs, glyphs `from..` to write.
-struct StoreSend {
-    grow: Option<usize>,
-    from: usize,
 }
 
 /// Lists of the frame where a tag is added.
@@ -285,14 +222,14 @@ struct Lists {
     right_up: [[f32; 4]; 2],
     /// Colours (see-through text, background) of the current background opacity (`tag_colors`).
     colors: (u32, u32),
-    store: Store,
+    store: GlyphPool,
     /// New path: tags of the frame, one reference per pass.
     tags: Vec<[TagRef; 4]>,
     /// References sent, passes one after another (new path).
     refs: Vec<TagRef>,
-    /// Draws of the frame: (first instance, instances, glyphs at most per instance); a
-    /// pass is a contiguous range of them (`passes`, start..end), drawn in that order.
-    segs: Vec<(u32, u32, u32)>,
+    /// Draws of the frame; a pass is a contiguous range of them (`passes`, start..end),
+    /// drawn in that order.
+    segs: Vec<RefDraw>,
     passes: [(u32, u32); 4],
     /// Test sabotage: a pass in a single draw.
     #[cfg(test)]
@@ -312,7 +249,7 @@ impl Lists {
             version: 0,
             right_up: [[0.0; 4]; 2],
             colors: tag_colors(DEFAULT_OPACITY),
-            store: Store::default(),
+            store: GlyphPool::default(),
             tags: Vec::new(),
             refs: Vec::new(),
             segs: Vec::new(),
@@ -324,7 +261,7 @@ impl Lists {
 
     /// All layouts forgotten.
     fn forget(&mut self) {
-        self.store.dead += self.cache.values().map(Cached::stored).sum::<usize>();
+        self.store.forget(self.cache.values().map(Cached::stored).sum());
         self.cache.clear();
     }
 
@@ -354,17 +291,9 @@ impl Lists {
         self.frame += 1;
         self.right_up = [right.extend(0.0).to_array(), up.extend(0.0).to_array()];
         // No reference of the frame exists yet: the pool can be rebuilt.
-        let s = &mut self.store;
-        if self.persist && s.dead > (s.glyphs.len() - s.dead).max(COMPACT_MIN) {
-            s.glyphs.clear();
-            s.dead = 0;
-            s.dirty = 0;
-            #[cfg(test)]
-            {
-                s.compactions += 1;
-            }
+        if self.persist && self.store.compact_if_worth() {
             for c in self.cache.values_mut() {
-                c.spans = s.add(&c.normal, &c.see);
+                c.spans = Spans::add(&mut self.store, &c.normal, &c.see);
             }
         }
     }
@@ -389,30 +318,31 @@ impl Lists {
             return;
         }
         let (normal, see, obfuscated) = layout(self.colors);
-        let spans = if self.persist { self.store.add(&normal, &see) } else { Spans::default() };
+        let spans = if self.persist { Spans::add(&mut self.store, &normal, &see) } else { Spans::default() };
         let c = Cached { source: NameSource::new(source), discrete, normal, see, frame, spans };
         out.emit(&c, anchor, discrete, light);
         // Obfuscated text: glyphs drawn on every frame, no cache.
-        if obfuscated {
-            self.store.dead += c.stored();
-            if let Some(old) = self.cache.remove(&id) {
-                self.store.dead += old.stored();
-            }
-        } else if let Some(old) = self.cache.insert(id, c) {
-            self.store.dead += old.stored();
+        let replaced = if obfuscated {
+            self.store.forget(c.stored());
+            self.cache.remove(&id)
+        } else {
+            self.cache.insert(id, c)
+        };
+        if let Some(old) = replaced {
+            self.store.forget(old.stored());
         }
     }
 
     /// End of frame: unseen layouts forgotten, passes sorted. New path: upload of
     /// the pool (none if nothing is drawn).
-    fn finish(&mut self, oit: bool) -> Option<StoreSend> {
+    fn finish(&mut self, oit: bool) -> Option<PoolUpload> {
         // Entities without a tag this frame: layout forgotten.
         let frame = self.frame;
-        let dead = &mut self.store.dead;
+        let pool = &mut self.store;
         self.cache.retain(|_, c| {
             let keep = c.frame == frame;
             if !keep {
-                *dead += c.stored();
+                pool.forget(c.stored());
             }
             keep
         });
@@ -427,10 +357,10 @@ impl Lists {
             self.counts = (n, s);
             let solid = self.solid.min(n);
             // One instance per glyph: one draw per pass.
-            for (p, start, count) in [(NORMAL, 0, n), (SEE, n, s), (SOLID, 0, solid), (REST, solid, n - solid)] {
+            for (p, first, count) in [(NORMAL, 0, n), (SEE, n, s), (SOLID, 0, solid), (REST, solid, n - solid)] {
                 let at = self.segs.len() as u32;
                 if count > 0 {
-                    self.segs.push((start, count, 1));
+                    self.segs.push(RefDraw { first, count, glyphs_each: 1 });
                 }
                 self.passes[p] = (at, self.segs.len() as u32);
             }
@@ -444,46 +374,18 @@ impl Lists {
         let order: &[usize] = if oit { &[SOLID, REST, SEE] } else { &[NORMAL, SEE] };
         for &p in order {
             let at = self.segs.len() as u32;
-            // Draw in progress: first instance, instances, glyphs at most, useful glyphs.
-            let mut seg = (self.refs.len() as u32, 0u32, 0u32, 0u64);
-            for t in &self.tags {
-                let c = t[p].count;
-                if c == 0 {
-                    continue;
-                }
-                // All the instances of a draw have the vertices of the longest: a draw
-                // is closed before its vertices exceed twice those of its glyphs, so a
-                // long name does not make the short ones pay. Contiguous ranges: the order is kept.
-                let most = seg.2.max(c);
-                if split && seg.1 > 0 && u64::from(most) * u64::from(seg.1 + 1) > 2 * (seg.3 + u64::from(c)) {
-                    self.segs.push((seg.0, seg.1, seg.2));
-                    seg = (self.refs.len() as u32, 0, 0, 0);
-                }
-                seg = (seg.0, seg.1 + 1, seg.2.max(c), seg.3 + u64::from(c));
+            let mut draws = DrawSplitter::new(self.refs.len() as u32, split);
+            for t in self.tags.iter().filter(|t| t[p].count > 0) {
+                draws.add(t[p].count, &mut self.segs);
                 self.refs.push(t[p]);
             }
-            if seg.1 > 0 {
-                self.segs.push((seg.0, seg.1, seg.2));
-            }
+            draws.finish(&mut self.segs);
             self.passes[p] = (at, self.segs.len() as u32);
         }
         if self.refs.is_empty() {
             return None;
         }
-        let s = &mut self.store;
-        let len = s.glyphs.len();
-        let grow = (s.cap < len).then(|| {
-            s.cap = len.next_power_of_two().max(1024);
-            s.dirty = 0;
-            s.cap
-        });
-        #[cfg(test)]
-        if s.sabotage && grow.is_none() {
-            s.dirty = len;
-        }
-        let from = s.dirty;
-        s.dirty = len;
-        Some(StoreSend { grow, from })
+        Some(self.store.plan_upload())
     }
 }
 
@@ -672,16 +574,14 @@ impl NameTags {
         self.oit_set = Some(layouts.set(device, &spec));
     }
 
-    /// Draws of a pass: (first instance, instances, glyphs at most per instance).
-    fn segments(&self, pass: usize) -> &[(u32, u32, u32)] {
+    /// Draws of a pass.
+    fn segments(&self, pass: usize) -> &[RefDraw] {
         let (a, b) = self.lists.passes[pass];
         &self.lists.segs[a as usize..b as usize]
     }
 
     fn draw_segments(&self, pass: &mut wgpu::RenderPass<'_>, which: usize) {
-        for &(start, n, most) in self.segments(which) {
-            pass.draw(0..6 * most, start..start + n);
-        }
+        draw_refs(pass, self.segments(which));
     }
 
     /// Improved transparency: opaque glyphs of the normal pass, with the solids.
@@ -762,19 +662,9 @@ impl NameTags {
     ) {
         let persist = self.lists.persist;
         let send = self.lists.finish(self.oit);
-        let mut from = usize::MAX;
         if persist {
             let Some(send) = send else { return };
-            from = send.from;
-            if let Some(cap) = send.grow {
-                self.store_buf = Some(device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("name tags (glyphs)"),
-                    size: (cap * size_of::<Stored>()) as u64,
-                    usage: wgpu::BufferUsages::STORAGE
-                        | wgpu::BufferUsages::COPY_DST
-                        | if cfg!(test) { wgpu::BufferUsages::COPY_SRC } else { wgpu::BufferUsages::empty() },
-                    mapped_at_creation: false,
-                }));
+            if self.lists.store.upload(send, device, queue, up, &mut self.store_buf, "name tags (glyphs)") {
                 self.bind = None;
             }
         }
@@ -800,10 +690,6 @@ impl NameTags {
         let l = &self.lists;
         if persist {
             up.write(queue, &self.axes, 0, bytemuck::cast_slice(&l.right_up));
-            if let Some(g) = l.store.glyphs.get(from..).filter(|g| !g.is_empty()) {
-                let store = self.store_buf.as_ref().expect("pool created on first upload");
-                up.write(queue, store, (from * size_of::<Stored>()) as u64, bytemuck::cast_slice(g));
-            }
             let bytes: &[u8] = bytemuck::cast_slice(&l.refs);
             let buf = Self::instances(&mut self.buf, device, bytes.len() as u64);
             up.write(queue, buf, 0, bytes);
