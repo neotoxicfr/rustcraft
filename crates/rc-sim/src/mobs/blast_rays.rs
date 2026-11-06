@@ -451,7 +451,7 @@ impl BlastWorld<'_> {
         crate::play::block_at(self.chunks, self.bottom, p).unwrap_or(0)
     }
 
-    fn has_tag(&self, state: u32, t: TagId) -> bool {
+    pub(crate) fn has_tag(&self, state: u32, t: TagId) -> bool {
         let block = self.data.state(state).map_or(u32::MAX, |s| u32::from(s.block));
         crate::mobs::env::block_tag_member(self.tag_bits, self.block_tags, t, block, self.tag_mode)
     }
@@ -461,7 +461,7 @@ impl BlastWorld<'_> {
     }
 
     /// The registry resistance of a state, 100 for water and lava, `None` for air without fluid.
-    fn resistance(&self, state: u32) -> Option<f32> {
+    pub(crate) fn resistance(&self, state: u32) -> Option<f32> {
         let fluid = self.data.state(state).filter(|i| i.fluid != 0).and_then(|i| self.fluid_mob.get(i.fluid as usize));
         let in_fluid = matches!(fluid, Some(1 | 2));
         if self.is_air(state) && !in_fluid {

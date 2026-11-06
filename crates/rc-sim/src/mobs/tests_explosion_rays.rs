@@ -253,8 +253,9 @@ fn wind_bursts(p: &mut Probe, t: &mut Trace) {
     record_entities(p, t);
 }
 
-/// Every scene in a fresh world, on a thread of its own; digests of each part.
-fn run_scenes(tag: &str, before: impl FnOnce() + Send + 'static) -> Vec<(&'static str, String)> {
+/// Every scene in a fresh world, on a thread of its own; digests of each part (`None`: a scene
+/// failed, its message printed).
+fn run_scenes(tag: &str, before: impl FnOnce() + Send + 'static) -> Option<Vec<(&'static str, String)>> {
     let tag = tag.to_owned();
     std::thread::Builder::new()
         .stack_size(32 << 20)
@@ -270,7 +271,7 @@ fn run_scenes(tag: &str, before: impl FnOnce() + Send + 'static) -> Vec<(&'stati
         })
         .expect("scene thread")
         .join()
-        .expect("scene run")
+        .ok()
 }
 
 /// Digests of the code before the shared walker (recorded on `main` 2e768c2f).
@@ -582,7 +583,9 @@ fn explosion_work_and_allocations_are_counted() {
 /// (`None`: the switches), named after `tag`.
 fn differing_parts(tag: &str, paths: Option<BlastPaths>) -> Vec<String> {
     assert!(!FROZEN.is_empty(), "no frozen digests");
-    let got = run_scenes(tag, move || FORCED_BLAST_PATHS.set(paths));
+    let Some(got) = run_scenes(tag, move || FORCED_BLAST_PATHS.set(paths)) else {
+        return vec![format!("{tag}: a scene failed")];
+    };
     assert_eq!(got.len(), FROZEN.len(), "{tag}: parts {got:?}");
     got.iter()
         .zip(FROZEN)
@@ -654,6 +657,34 @@ fn parallel_rays_and_hash_maps_give_the_frozen_digests() {
     runs.push(("maps".to_owned(), Some(BlastPaths { max_cube_cells: 0, ..BlastPaths::NEW })));
     runs.push(("maps-threads4".to_owned(), Some(BlastPaths { max_cube_cells: 0, threads: 4, ..parallel })));
     check_runs(runs);
+}
+
+/// The view shared with the threads reads every block state of 26.3 like the former reads:
+/// resistance (air test, fluid as mobs see it, registry resistance) and the rails,
+/// wither-immune and wind-stopping tags. The scenes cannot see a fluid read gone wrong (water
+/// and lava resist 100 in the registry anyway): the waterlogged states do.
+#[test]
+fn every_state_reads_like_the_former_reads() {
+    use crate::mobs::env::Fluid;
+    use crate::tag_bits::TagId;
+    let (p, _dir) = open("blastrays-states");
+    let world = p.s.blast_world();
+    let mode = crate::tag_bits::mode();
+    let mut waterlogged = 0;
+    for state in 0..p.s.data.states.len() as u32 {
+        let info = p.s.data.state(state).expect("state");
+        let air = info.has(rc_data::flags::AIR);
+        let fluid = p.s.fluid_of_state(state);
+        let registry = p.s.data.blast.get(state as usize).copied().unwrap_or(0.0);
+        let former = (!air || fluid != Fluid::None).then(|| registry.max(if fluid == Fluid::None { 0.0 } else { 100.0 }));
+        assert_eq!(world.resistance(state), former, "resistance of state {state}");
+        waterlogged += usize::from(fluid != Fluid::None && registry < 100.0);
+        for t in [TagId::Rails, TagId::WitherImmune, TagId::BlocksWindChargeExplosions] {
+            let former = p.s.tag_id_u32(t, u32::from(info.block), mode);
+            assert_eq!(world.has_tag(state, t), former, "tag {} of state {state}", t.name());
+        }
+    }
+    assert!(waterlogged > 100, "too few waterlogged states to prove the fluid read: {waterlogged}");
 }
 
 /// Visible part of boxes half hidden behind a slab, a fence, a pane, stairs and a full block,
