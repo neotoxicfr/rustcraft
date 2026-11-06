@@ -266,10 +266,20 @@ fn prep(k: &mut Kit, ents: &[Entity], opt: EntOpt) {
 /// places makes it fail. Batch 5 integration: 0xf3e2_3c99_f7b8_6fb5 -> current value, sole
 /// cause G2-F05 fidelity (items and blocks drawn as entities; fixed white biome tint
 /// in `prep`), verified on c3-m11 + g2-f05 alone: same value, all variants equal.
-const GOLDEN: u64 = 0x7f87_d9a9_7d93_dba3;
+/// Since C3-M21 this is the fingerprint of the old paths with the C library's sine
+/// (`ANIMATION_SINE_TABLE=0`): unchanged, it proves every other new path moves no bit.
+const GOLDEN_LIBRARY_SINE: u64 = 0x7f87_d9a9_7d93_dba3;
+
+/// The scene animated through the game's sine table (the default). Validated against the
+/// game by its parts: the table is the game's bit for bit (`frozen_table_is_the_game_table`),
+/// each animation site was checked in the game's code to read that table (the few that take
+/// the library sine in double precision do so here too), and the cow and zombie walk angles
+/// equal the game's formulas (`walk_angles_follow_the_game_sine_table`).
+const GOLDEN: u64 = 0xe50f_7c48_fa18_9cc8;
 
 /// `prepare` places exactly the same thing under each switch turned off, alone or all, and
-/// the fingerprint is the kept one.
+/// the fingerprint is the kept one. The sine table changes the animations (fidelity): every
+/// other switch is compared at equal sine, and each sine has its golden value.
 #[test]
 fn prepare_snapshot_same_under_every_switch() {
     let Some(mut k) = kit() else { return };
@@ -280,11 +290,15 @@ fn prepare_snapshot_same_under_every_switch() {
     let all_new = EntOpt::NEW;
     // First pass: caches (layers, item meshes, atlas) filled.
     run(&mut k, &ents, all_new);
-    let reference = run(&mut k, &ents, EntOpt::OLD);
+    let library_sine = run(&mut k, &ents, EntOpt::OLD);
+    let reference = run(&mut k, &ents, EntOpt { animation_sine_table: true, ..EntOpt::OLD });
     assert!(k.r.drawn > 60, "scene almost empty: {} entities drawn", k.r.drawn);
     assert!(k.r.mats.len() > 500, "{} matrices", k.r.mats.len());
     let new = run(&mut k, &ents, all_new);
     assert_eq!(new, reference, "all the switches");
+    let new_with_library_sine = run(&mut k, &ents, EntOpt { animation_sine_table: false, ..all_new });
+    assert_eq!(new_with_library_sine, library_sine, "all the switches, library sine");
+    assert_ne!(reference, library_sine, "the sine table changes no animation of the scene");
     let off = |f: &dyn Fn(&mut EntOpt)| {
         let mut o = all_new;
         f(&mut o);
@@ -302,6 +316,8 @@ fn prepare_snapshot_same_under_every_switch() {
         ("DRAGON_EFFECTS_GATE", off(&|o| o.dragon_effects_gate = false)),
         ("SHARED_BODY_ANGLE", off(&|o| o.shared_body_angle = false)),
         ("SKIP_IDENTITY_ROOT_FACTORS", off(&|o| o.skip_identity_root_factors = false)),
+        ("KNOWN_PART_NAMES", off(&|o| o.known_part_names = false)),
+        ("KEYFRAME_STATIC_NAMES", off(&|o| o.keyframe_static_names = false)),
     ] {
         assert_eq!(run(&mut k, &ents, o), reference, "{name}=0");
     }
@@ -315,10 +331,71 @@ fn prepare_snapshot_same_under_every_switch() {
         ("DRAGON_EFFECTS_GATE", EntOpt { dragon_effects_gate: true, kind_info: true, ..EntOpt::OLD }),
         ("SHARED_BODY_ANGLE", EntOpt { shared_body_angle: true, ..EntOpt::OLD }),
         ("SKIP_IDENTITY_ROOT_FACTORS", EntOpt { skip_identity_root_factors: true, ..EntOpt::OLD }),
+        ("KNOWN_PART_NAMES", EntOpt { known_part_names: true, ..EntOpt::OLD }),
+        ("KEYFRAME_STATIC_NAMES", EntOpt { keyframe_static_names: true, ..EntOpt::OLD }),
     ] {
-        assert_eq!(run(&mut k, &ents, o), reference, "{name} alone");
+        assert_eq!(run(&mut k, &ents, o), library_sine, "{name} alone");
     }
+    assert_eq!(library_sine, GOLDEN_LIBRARY_SINE, "fingerprint of the library sine changed: {library_sine:#x}");
     assert_eq!(reference, GOLDEN, "scene fingerprint changed: {reference:#x}");
+}
+
+/// Keyframe families, adults and babies, every client animation state started at tick 10:
+/// camels standing (idle, dash) and sitting, rabbits hopping and tilting, armadillos, warden,
+/// breeze; all at age `age`.
+fn keyframe_scene(k: &Kit, age: u32) -> Vec<Entity> {
+    let names = k.r.source.registry("minecraft:entity_type").expect("type registry").entries.clone();
+    let mut all = crate::entities::Entities { type_names: names.clone(), ..Default::default() };
+    let kinds = ["camel", "camel", "camel", "rabbit", "rabbit", "armadillo", "armadillo", "warden", "breeze"];
+    let mut out = Vec::new();
+    for (i, kind) in kinds.into_iter().enumerate() {
+        let id = names.iter().position(|n| n.strip_prefix("minecraft:") == Some(kind)).expect("kind in the registry");
+        let add = rc_proto_v777::entity::AddEntity {
+            id: i as i32 + 1,
+            uuid: 9000 + i as u128,
+            kind: id as i32,
+            pos: [i as f64 * 3.0 - 12.0, 64.0, 8.0],
+            velocity: [0.0; 3],
+            pitch: 0.0,
+            yaw: 0.0,
+            head_yaw: 0.0,
+            data: 0,
+        };
+        all.apply(rc_client::EntityEvent::Add(Box::new(add)));
+        let mut e = all.map.remove(&(i as i32 + 1)).expect("entity added");
+        e.age = age;
+        e.walk_pos = age as f32 * 0.4;
+        e.walk_speed = 0.6;
+        e.walk_speed_o = 0.6;
+        // Every state of `Entity::extra` started at tick 10 (encoded start + 0.5).
+        e.extra[..9].fill(10.5);
+        if i % 2 == 1 {
+            e.meta.insert(16, Meta::Bool(true));
+        }
+        if i == 2 {
+            e.meta.insert(20, Meta::Long(-1));
+        }
+        out.push(e);
+    }
+    out
+}
+
+/// Keyframe animations named by literals pose exactly like the old formatted names, over 300
+/// frames of every state (the baby falling back to the adult's animation included).
+#[test]
+fn keyframe_static_names_pose_like_formatted_names() {
+    let Some(mut k) = kit() else { return };
+    let formatted = EntOpt { keyframe_static_names: false, ..EntOpt::NEW };
+    let first = keyframe_scene(&k, 20);
+    run(&mut k, &first, EntOpt::NEW);
+    let mut seen = std::collections::HashSet::new();
+    for age in 20..320 {
+        let ents = keyframe_scene(&k, age);
+        let literal = run(&mut k, &ents, EntOpt::NEW);
+        assert_eq!(literal, run(&mut k, &ents, formatted), "age {age}");
+        seen.insert(literal);
+    }
+    assert!(seen.len() > 200, "the animations hardly move: {} poses", seen.len());
 }
 
 /// Kind table (by type id) = old string predicates for every registry name; family = first
@@ -532,6 +609,24 @@ fn bench_entity_prepare() {
         ("all except SIZEONCE", EntOpt { size_once: false, ..all_new }),
         ("all except OBJEARLY", EntOpt { obj_early: false, ..all_new }),
         ("all except ITEMFLAGS", EntOpt { reg_idx: false, item_flags: false, ..all_new }),
+        (
+            "all, 6 animation ones off",
+            EntOpt {
+                dragon_effects_gate: false,
+                shared_body_angle: false,
+                skip_identity_root_factors: false,
+                animation_sine_table: false,
+                known_part_names: false,
+                keyframe_static_names: false,
+                ..all_new
+            },
+        ),
+        ("all except DRAGON_EFFECTS_GATE", EntOpt { dragon_effects_gate: false, ..all_new }),
+        ("all except SHARED_BODY_ANGLE", EntOpt { shared_body_angle: false, ..all_new }),
+        ("all except SKIP_IDENTITY_ROOT", EntOpt { skip_identity_root_factors: false, ..all_new }),
+        ("all except ANIMATION_SINE_TABLE", EntOpt { animation_sine_table: false, ..all_new }),
+        ("all except KNOWN_PART_NAMES", EntOpt { known_part_names: false, ..all_new }),
+        ("all except KEYFRAME_STATIC_NAMES", EntOpt { keyframe_static_names: false, ..all_new }),
     ];
     for n in [100usize, 1000, 5000] {
         let mut ents = Vec::with_capacity(n);

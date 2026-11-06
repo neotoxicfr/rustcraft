@@ -200,7 +200,7 @@ fn creeper_legs_are_crossed() {
     s.walk_pos = 1.3;
     s.walk_speed = 0.8;
     let q = 1.3f32 * 0.6662;
-    let (a, b) = (q.cos() * 1.4 * 0.8, (q + PI).cos() * 1.4 * 0.8);
+    let (a, b) = (table_cos(q) * 1.4 * 0.8, table_cos(q + PI) * 1.4 * 0.8);
     let mut p = Pose::reset(&l, Vec::new(), Vec::new());
     animate(&mut p, &all.map[&7], &s, 0.0, true);
     assert_eq!([p.parts[1][3], p.parts[2][3], p.parts[3][3], p.parts[4][3]], [b, a, a, b]);
@@ -276,7 +276,7 @@ fn illusioner_copies() {
     assert_eq!(e.history[4], [0.0; 3]);
     assert_eq!(e.history[0], [-3.0, 1.0, 2.5]);
     let w = illusion_wobble(2, 10.0);
-    let c = |k: f32| f64::from((2.0f32 + 10.0 * k).cos());
+    let c = |k: f32| f64::from(table_cos(2.0f32 + 10.0 * k));
     assert_eq!(w, [c(0.5) * 0.025, c(0.75) * 0.0125, c(0.7) * 0.025]);
 }
 

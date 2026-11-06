@@ -11,7 +11,7 @@ use rc_proto_v777::item::ItemStack;
 
 use super::{
     EntityRenderer, HeldEnv, Instance, PASS_CUTOUT_CULL, PASS_SOLID, PartMat, Pass, Pose, SKINS, default_skin, deg,
-    items_in, part_matrix,
+    items_in, part_matrix, table_cos, table_sin,
 };
 use crate::block_entities::{BlockEntities, BlockEntity, Data, Kind, Stack, dye_rgb, head_key};
 use crate::block_fx::{BeamVertex, PortalVertex};
@@ -425,7 +425,7 @@ impl EntityRenderer {
         let (mut x, mut z) = (0.0, 0.0);
         if e.anim.shaking {
             let tau = e.anim.ticks as f32 + pt;
-            let b = (tau / PI).sin() / (4.0 + tau / 3.0);
+            let b = table_sin(tau / PI) / (4.0 + tau / 3.0);
             match e.anim.dir {
                 2 => x = -b,
                 3 => x = b,
@@ -501,7 +501,7 @@ impl EntityRenderer {
         }
         let k = i64::from(pos[0]) * 7 + i64::from(pos[1]) * 9 + i64::from(pos[2]) * 13 + f.game_time;
         let phase = (k.rem_euclid(100) as f32 + f.pt) / 100.0;
-        let x_rot = (-0.0125 + 0.01 * (2.0 * PI * phase).cos()) * PI;
+        let x_rot = (-0.0125 + 0.01 * table_cos(2.0 * PI * phase)) * PI;
         let wave = |p: &mut Pose<'_>| p.set("flag", |q| q[3] = x_rot);
         let argb = |d: u8| {
             let [r, g, b] = dye_rgb(d);
@@ -543,10 +543,12 @@ impl EntityRenderer {
         };
         let anim = e.anim.ticks as f32 + if e.props.powered { pt } else { 0.0 };
         let pose = |p: &mut Pose<'_>| match kind {
-            4 => p.set("jaw", |q| q[3] = ((anim * PI * 0.2).sin() + 1.0) * 0.2),
+            // These two heads animate with the library sine in double precision (see the worn
+            // skulls in `push_worn_skull`).
+            4 => p.set("jaw", |q| q[3] = (f64::from(anim * PI * 0.2).sin() + 1.0) as f32 * 0.2),
             5 => {
-                p.set("left_ear", |q| q[5] = -((anim * PI * 0.2 * 1.2).cos() + 2.5) * 0.2);
-                p.set("right_ear", |q| q[5] = ((anim * PI * 0.2).cos() + 2.5) * 0.2);
+                p.set("left_ear", |q| q[5] = -((f64::from(anim * PI * 0.2 * 1.2).cos() + 2.5) as f32) * 0.2);
+                p.set("right_ear", |q| q[5] = (f64::from(anim * PI * 0.2).cos() + 2.5) as f32 * 0.2);
             }
             _ => {}
         };
@@ -585,8 +587,8 @@ impl EntityRenderer {
 
     /// Book (§ 4.13): covers, pages and turning pages depending on the effective opening.
     pub(super) fn push_book(&mut self, m: Mat4, light: u32, tau: f32, f1: f32, f2: f32, open: f32) -> bool {
-        let o = ((0.02 * tau).sin() * 0.1 + 1.25) * open;
-        let x = o.sin();
+        let o = (table_sin(0.02 * tau) * 0.1 + 1.25) * open;
+        let x = table_sin(o);
         self.push_named(
             "minecraft:book#main",
             "entity/enchantment/enchanting_table_book",
@@ -637,7 +639,7 @@ impl EntityRenderer {
         let open = a.open_o + (a.open - a.open_o) * pt;
         let m = t
             * Mat4::from_translation(Vec3::new(0.5, 0.75, 0.5))
-            * Mat4::from_translation(Vec3::new(0.0, 0.1 + (tau * 0.1).sin() * 0.01, 0.0))
+            * Mat4::from_translation(Vec3::new(0.0, 0.1 + table_sin(tau * 0.1) * 0.01, 0.0))
             * Mat4::from_rotation_y(-rot)
             * Mat4::from_rotation_z(deg(80.0));
         self.push_book(m, light, tau, f1, f2, open)
@@ -676,7 +678,7 @@ impl EntityRenderer {
         if let Some((start, dur)) = e.anim.wobble {
             let p = ((f.game_time - start) as f32 + f.pt) / dur as f32;
             if (0.0..=1.0).contains(&p) {
-                let turn = (-p * 3.0 * PI).sin() * 0.125 * (1.0 - p);
+                let turn = table_sin(-p * 3.0 * PI) * 0.125 * (1.0 - p);
                 m *= around(Mat4::from_rotation_y(turn), Vec3::new(0.5, 0.0, 0.5));
             }
         }
@@ -755,7 +757,7 @@ impl EntityRenderer {
             );
         }
         let tau = a.ticks as f32 + pt;
-        let mut hh = (0.1 * tau).sin() / 2.0 + 0.5;
+        let mut hh = table_sin(0.1 * tau) / 2.0 + 0.5;
         hh = hh * hh + hh;
         let lift = t * Mat4::from_translation(Vec3::new(0.5, 0.3 + 0.2 * hh, 0.5));
         let axis = Vec3::new(0.5, 1.0, 0.5).normalize();
@@ -1080,7 +1082,7 @@ impl EntityRenderer {
         } else {
             return true;
         };
-        let s = (PI * p).sin();
+        let s = table_sin(PI * p);
         let h = (s * max).floor();
         if h > 0.0 {
             let time = f.game_time.rem_euclid(40) as f32 + f.pt;

@@ -85,6 +85,21 @@ pub(super) fn apply_walk_at(
     apply(p, anim, ms as f32 / 1000.0, (speed * scale_factor).min(1.0));
 }
 
+/// The animation `name`, a literal chosen by the caller; `formatted` builds the same name the
+/// old way, at every frame (`RUSTCRAFT_OPT_KEYFRAME_STATIC_NAMES=0`).
+pub(super) fn get_named(name: &'static str, formatted: impl FnOnce() -> String) -> Option<&'static KeyframeAnimation> {
+    if animation_paths().static_keyframe_names { get(name) } else { get(&formatted()) }
+}
+
+/// [`play`] by a literal name (see [`get_named`]): nothing is built for a stopped state.
+pub(super) fn play_named(p: &mut Pose<'_>, name: &'static str, formatted: impl FnOnce() -> String, st: f32, age: f32) {
+    if animation_paths().static_keyframe_names {
+        play(p, name, st, age);
+    } else {
+        play(p, &formatted(), st, age);
+    }
+}
+
 /// Plays state `st` (encoded by [`State`]) by name if it is started.
 pub(super) fn play(p: &mut Pose<'_>, name: &str, st: f32, age: f32) {
     if let Some(start) = State::start_of(st)
@@ -191,11 +206,14 @@ pub(super) mod testkit {
         all.apply(EntityEvent::Event { id: 7, event });
     }
 
-    /// Layer of named parts (parent by index, `None` = root), zero poses.
+    /// Layer of named parts (parent by index, `None` = root), zero poses; a repeated name is
+    /// known by its first part, as the baking does.
     pub fn test_layer(parts: &[(&str, Option<usize>)]) -> BakedLayer {
         let mut known = [u16::MAX; KNOWN];
         for (i, (n, _)) in parts.iter().enumerate() {
-            if let Some(k) = known_id(n) {
+            if let Some(k) = known_id(n)
+                && known[k] == u16::MAX
+            {
                 known[k] = i as u16;
             }
         }

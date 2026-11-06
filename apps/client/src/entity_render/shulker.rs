@@ -198,12 +198,12 @@ pub(super) fn animate(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) -> b
         return false;
     }
     let bs = (0.5 + peek(e, pt)) * PI;
-    let q = -1.0 + bs.sin();
-    let extra = if bs > PI { (s.age * 0.1).sin() * 0.7 } else { 0.0 };
+    let q = -1.0 + table_sin(bs);
+    let extra = if bs > PI { table_sin(s.age * 0.1) * 0.7 } else { 0.0 };
     let peek = peek(e, pt);
     p.set("lid", |l| {
         l[0] = 0.0;
-        l[1] = 16.0 + bs.sin() * 8.0 + extra;
+        l[1] = 16.0 + table_sin(bs) * 8.0 + extra;
         l[2] = 0.0;
         l[4] = if peek > 0.3 { q * q * q * q * PI * 0.125 } else { 0.0 };
     });

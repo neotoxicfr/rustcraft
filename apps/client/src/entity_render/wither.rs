@@ -84,12 +84,12 @@ pub(super) fn animate(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) -> b
             h[4] = (y - body) * DEG;
         });
     }
-    let anim = (s.age * 0.1).cos();
+    let anim = table_cos(s.age * 0.1);
     let rib = (0.065 + 0.05 * anim) * PI;
     p.set("ribcage", |r| r[3] = rib);
     p.set("tail", |t| {
-        t[1] = 6.9 + rib.cos() * 10.0;
-        t[2] = -0.5 + rib.sin() * 10.0;
+        t[1] = 6.9 + table_cos(rib) * 10.0;
+        t[2] = -0.5 + table_sin(rib) * 10.0;
         t[3] = (0.265 + 0.1 * anim) * PI;
     });
     p.set("center_head", |h| {
@@ -102,7 +102,7 @@ pub(super) fn animate(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) -> b
 /// (u, v) offset of the armor texture, in [0, 1[: `(cos(0.02 t) × 3, 0.01 t)` modulo 1.
 pub(super) fn swirl_offset(t: f32) -> (f32, f32) {
     use rc_data::java_math::remainder_by_one;
-    (remainder_by_one((t * 0.02).cos() * 3.0), remainder_by_one(t * 0.01))
+    (remainder_by_one(table_cos(t * 0.02) * 3.0), remainder_by_one(t * 0.01))
 }
 
 /// Moves `a` towards `b` by at most `max` degrees.
@@ -131,9 +131,9 @@ pub(super) fn track(ents: &mut Entities) {
             match target_of(i) {
                 Some(t) => {
                     let a = (e.body + 180.0 * i as f32) * DEG;
-                    let hx = e.pos[0] + f64::from(a.cos()) * 1.3;
+                    let hx = e.pos[0] + f64::from(table_cos(a)) * 1.3;
                     let hy = e.pos[1] + 2.2;
-                    let hz = e.pos[2] + f64::from(a.sin()) * 1.3;
+                    let hz = e.pos[2] + f64::from(table_sin(a)) * 1.3;
                     let eye = f64::from(t.dims(&ents.dims)[1]);
                     let (xd, yd, zd) = (t.pos[0] - hx, t.pos[1] + eye - hy, t.pos[2] - hz);
                     let sd = (xd * xd + zd * zd).sqrt();

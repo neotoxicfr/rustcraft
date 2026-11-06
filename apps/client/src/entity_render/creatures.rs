@@ -254,7 +254,7 @@ pub(super) fn animate(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) -> b
         }
         "tadpole" => {
             let a = if in_water(e) { 1.0 } else { 1.5 };
-            p.set("tail", |t| t[4] = -a * 0.25 * (0.3 * age).sin());
+            p.set("tail", |t| t[4] = -a * 0.25 * table_sin(0.3 * age));
         }
         "dolphin" => {
             let v = e.velocity;
@@ -263,7 +263,7 @@ pub(super) fn animate(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) -> b
                 b[4] = s.yaw;
             });
             if v[0] * v[0] + v[2] * v[2] > 1.0e-7 {
-                let c = (age * 0.3).cos();
+                let c = table_cos(age * 0.3);
                 p.set("body", |b| b[3] += -0.05 - 0.05 * c);
                 p.set("tail", |t| t[3] = -0.1 * c);
                 p.set("tail_fin", |t| t[3] = -0.2 * c);
@@ -277,7 +277,7 @@ pub(super) fn animate(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) -> b
             });
             let y = s.yaw * 0.25;
             p.set("upper_body", |b| b[4] = y);
-            let (sn, cs) = (y.sin(), y.cos());
+            let (sn, cs) = (table_sin(y), table_cos(y));
             p.set("left_arm", |a| {
                 a[4] = y;
                 a[0] = cs * 5.0;
@@ -297,7 +297,7 @@ pub(super) fn animate(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) -> b
             });
             if e.kind == "villager" && e.meta_int(18).unwrap_or(0) > 0 {
                 p.set("head", |h| {
-                    h[5] = 0.3 * (0.45 * age).sin();
+                    h[5] = 0.3 * table_sin(0.45 * age);
                     h[3] = 0.4;
                 });
             } else if e.kind != "witch" {
@@ -305,18 +305,18 @@ pub(super) fn animate(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) -> b
             }
             let q = s.walk_pos * 0.6662;
             p.set("right_leg", |l| {
-                l[3] = q.cos() * 1.4 * s.walk_speed * 0.5;
+                l[3] = table_cos(q) * 1.4 * s.walk_speed * 0.5;
                 l[4] = 0.0;
             });
             p.set("left_leg", |l| {
-                l[3] = (q + PI).cos() * 1.4 * s.walk_speed * 0.5;
+                l[3] = table_cos(q + PI) * 1.4 * s.walk_speed * 0.5;
                 l[4] = 0.0;
             });
             if e.kind == "witch" {
                 let sp = 0.01 * (e.id.rem_euclid(10)) as f32;
                 p.set("nose", |n| {
-                    n[3] = (age * sp).sin() * 4.5 * PI / 180.0;
-                    n[5] = (age * sp).cos() * 2.5 * PI / 180.0;
+                    n[3] = table_sin(age * sp) * 4.5 * PI / 180.0;
+                    n[5] = table_cos(age * sp) * 2.5 * PI / 180.0;
                 });
                 if e.equipment[0].is_some() {
                     p.set("nose", |n| {
@@ -341,9 +341,9 @@ pub(super) fn animate(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) -> b
                 let (start, y, step, f, r) = rings[i / 4];
                 let a = start + (i % 4) as f32 * (PI / 2.0);
                 p.set(name, |x| {
-                    x[1] = y + ((i as f32 * step + age) * f).cos();
-                    x[0] = a.cos() * r;
-                    x[2] = a.sin() * r;
+                    x[1] = y + table_cos((i as f32 * step + age) * f);
+                    x[0] = table_cos(a) * r;
+                    x[2] = table_sin(a) * r;
                 });
             }
             p.set("head", |h| {
@@ -354,12 +354,12 @@ pub(super) fn animate(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) -> b
         "phantom" => {
             let flap = (e.id * 3) as f32 + age;
             let an = flap * 7.448_451 * PI / 180.0;
-            let w = an.cos() * 16.0 * PI / 180.0;
+            let w = table_cos(an) * 16.0 * PI / 180.0;
             p.set("left_wing_base", |x| x[5] = w);
             p.set("left_wing_tip", |x| x[5] = w);
             p.set("right_wing_base", |x| x[5] = -w);
             p.set("right_wing_tip", |x| x[5] = -w);
-            let t = -(5.0 + (an * 2.0).cos() * 5.0) * PI / 180.0;
+            let t = -(5.0 + table_cos(an * 2.0) * 5.0) * PI / 180.0;
             p.set("tail_base", |x| x[3] = t);
             p.set("tail_tip", |x| x[3] = t);
         }
@@ -391,8 +391,8 @@ pub(super) fn animate(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) -> b
             for (i, sg) in seg.iter_mut().enumerate().take(n) {
                 let ph = age * 0.9 + i as f32 * 0.15 * PI;
                 let d = (i as i32 - 2).abs() as f32;
-                sg[0] = ph.cos() * PI * ky * (1.0 + d);
-                sg[1] = ph.sin() * PI * kx * d;
+                sg[0] = table_cos(ph) * PI * ky * (1.0 + d);
+                sg[1] = table_sin(ph) * PI * kx * d;
                 p.set(SEGMENTS[i], |x| {
                     x[4] = sg[0];
                     x[0] = sg[1];
@@ -426,21 +426,29 @@ pub(super) fn animate(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) -> b
             keyframes::play(p, "creaking.death", e.extra[2], age);
         }
         "breeze" => {
-            for (i, n) in ["idle", "shoot", "slide", "slide_back", "inhale", "jump"].iter().enumerate() {
-                keyframes::play(p, &format!("breeze.{n}"), e.extra[i], age);
+            const BREEZE: [(&str, &str); 6] = [
+                ("idle", "breeze.idle"),
+                ("shoot", "breeze.shoot"),
+                ("slide", "breeze.slide"),
+                ("slide_back", "breeze.slide_back"),
+                ("inhale", "breeze.inhale"),
+                ("jump", "breeze.jump"),
+            ];
+            for (i, (short, name)) in BREEZE.into_iter().enumerate() {
+                keyframes::play_named(p, name, || format!("breeze.{short}"), e.extra[i], age);
             }
         }
         "cod" | "tropical_fish" => {
             let a = if in_water(e) { 1.0 } else { 1.5 };
             let part = if e.kind == "cod" { "tail_fin" } else { "tail" };
-            p.set(part, |t| t[4] = -a * 0.45 * (0.6 * age).sin());
+            p.set(part, |t| t[4] = -a * 0.45 * table_sin(0.6 * age));
         }
         "salmon" => {
             let (a, b) = if in_water(e) { (1.0, 1.0) } else { (1.3, 1.7) };
-            p.set("body_back", |t| t[4] = -a * 0.25 * (b * 0.6 * age).sin());
+            p.set("body_back", |t| t[4] = -a * 0.25 * table_sin(b * 0.6 * age));
         }
         "pufferfish" => {
-            let f = 0.4 * (age * 0.2).sin();
+            let f = 0.4 * table_sin(age * 0.2);
             let (r, l) =
                 if p.has("right_fin") { ("right_fin", "left_fin") } else { ("right_blue_fin", "left_blue_fin") };
             p.set(r, |x| x[5] = -0.2 + f);
@@ -462,7 +470,7 @@ pub(super) fn animate(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) -> b
         }
         "ghast" | "happy_ghast" => {
             for (i, t) in TENTACLES.iter().enumerate() {
-                p.set(t, |x| x[3] = 0.2 * (age * 0.3 + i as f32).sin() + 0.4);
+                p.set(t, |x| x[3] = 0.2 * table_sin(age * 0.3 + i as f32) + 0.4);
             }
             if e.kind == "happy_ghast" {
                 if e.equipment[6].is_some() {
@@ -617,33 +625,33 @@ fn strider(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
             b[3] = s.pitch;
             b[4] = s.yaw;
         }
-        b[5] = 0.1 * (pos * 1.5).sin() * 4.0 * v;
+        b[5] = 0.1 * table_sin(pos * 1.5) * 4.0 * v;
     });
     let h = pos * 1.5 * 0.5;
     p.set("left_leg", |l| {
-        l[3] = h.sin() * 2.0 * v;
-        l[5] = PI / 18.0 * h.cos() * v;
+        l[3] = table_sin(h) * 2.0 * v;
+        l[5] = PI / 18.0 * table_cos(h) * v;
     });
     p.set("right_leg", |l| {
-        l[3] = (h + PI).sin() * 2.0 * v;
-        l[5] = PI / 18.0 * (h + PI).cos() * v;
+        l[3] = table_sin(h + PI) * 2.0 * v;
+        l[5] = PI / 18.0 * table_cos(h + PI) * v;
     });
-    let flow = (pos * 1.5 + PI).cos() * v;
+    let flow = table_cos(pos * 1.5 + PI) * v;
     let age = s.age;
     let bristle = |p: &mut Pose<'_>, names: [&str; 3], axis: usize| {
         let adds = [
-            flow * 0.6 + 0.1 * (age * 0.4).sin(),
-            flow * 1.2 + 0.1 * (age * 0.2).sin(),
-            flow * 1.3 + 0.05 * (age * -0.4).sin(),
+            flow * 0.6 + 0.1 * table_sin(age * 0.4),
+            flow * 1.2 + 0.1 * table_sin(age * 0.2),
+            flow * 1.3 + 0.05 * table_sin(age * -0.4),
         ];
         for (n, d) in names.iter().zip(adds) {
             p.set(n, |x| x[axis] += d);
         }
     };
     if s.baby {
-        p.set("body", |b| b[1] = 17.25 - (pos * 1.5).cos() * 2.0 * v);
-        p.set("left_leg", |l| l[1] = 20.0 + 2.0 * (h + PI).sin() * 2.0 * v);
-        p.set("right_leg", |l| l[1] = 20.0 + 2.0 * h.sin() * 2.0 * v);
+        p.set("body", |b| b[1] = 17.25 - table_cos(pos * 1.5) * 2.0 * v);
+        p.set("left_leg", |l| l[1] = 20.0 + 2.0 * table_sin(h + PI) * 2.0 * v);
+        p.set("right_leg", |l| l[1] = 20.0 + 2.0 * table_sin(h) * 2.0 * v);
         bristle(p, ["bristle2", "bristle1", "bristle0"], 3);
     } else {
         for (n, z) in [
@@ -658,9 +666,9 @@ fn strider(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
         }
         bristle(p, ["right_top_bristle", "right_middle_bristle", "right_bottom_bristle"], 5);
         bristle(p, ["left_top_bristle", "left_middle_bristle", "left_bottom_bristle"], 5);
-        p.set("body", |b| b[1] = 2.0 - 2.0 * (pos * 1.5).cos() * 2.0 * v);
-        p.set("left_leg", |l| l[1] = 8.0 + 2.0 * (h + PI).sin() * 2.0 * v);
-        p.set("right_leg", |l| l[1] = 8.0 + 2.0 * h.sin() * 2.0 * v);
+        p.set("body", |b| b[1] = 2.0 - 2.0 * table_cos(pos * 1.5) * 2.0 * v);
+        p.set("left_leg", |l| l[1] = 8.0 + 2.0 * table_sin(h + PI) * 2.0 * v);
+        p.set("right_leg", |l| l[1] = 8.0 + 2.0 * table_sin(h) * 2.0 * v);
     }
 }
 
@@ -696,18 +704,18 @@ fn warden(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     // Walk.
     let sm = (3.0 * s.walk_speed).min(0.5);
     let ap = s.walk_pos * 0.8662;
-    let (c, sn) = (ap.cos(), ap.sin());
+    let (c, sn) = (table_cos(ap), table_sin(ap));
     let smm = sm.min(0.35);
     p.set("head", |h| {
         h[5] += 0.3 * sn * sm;
-        h[3] += 1.2 * (ap + PI / 2.0).cos() * smm;
+        h[3] += 1.2 * table_cos(ap + PI / 2.0) * smm;
     });
     p.set("body", |b| {
         b[5] = 0.1 * sn * sm;
         b[3] = c * smm;
     });
     p.set("left_leg", |l| l[3] = c * sm);
-    p.set("right_leg", |l| l[3] = (ap + PI).cos() * sm);
+    p.set("right_leg", |l| l[3] = table_cos(ap + PI) * sm);
     p.set("left_arm", |a| {
         a[3] = -(0.8 * c * sm);
         a[5] = 0.0;
@@ -727,12 +735,12 @@ fn warden(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     // Rest.
     let sa = s.age * 0.1;
     p.set("head", |h| {
-        h[5] += 0.06 * sa.cos();
-        h[3] += 0.06 * sa.sin();
+        h[5] += 0.06 * table_cos(sa);
+        h[3] += 0.06 * table_sin(sa);
     });
     p.set("body", |b| {
-        b[5] += 0.025 * sa.sin();
-        b[3] += 0.025 * sa.cos();
+        b[5] += 0.025 * table_sin(sa);
+        b[3] += 0.025 * table_cos(sa);
     });
     // Tentacles (event 61).
     let x = &e.extra;
@@ -740,8 +748,16 @@ fn warden(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     let tx = tendril * ((f64::from(s.age) * 2.25).cos() * std::f64::consts::PI * f64::from(0.1f32)) as f32;
     p.set("left_tendril", |t| t[3] = tx);
     p.set("right_tendril", |t| t[3] = -tx);
-    for (i, n) in ["attack", "sonic_boom", "dig", "emerge", "roar", "sniff"].iter().enumerate() {
-        keyframes::play(p, &format!("warden.{n}"), x[3 + i], s.age);
+    const WARDEN: [(&str, &str); 6] = [
+        ("attack", "warden.attack"),
+        ("sonic_boom", "warden.sonic_boom"),
+        ("dig", "warden.dig"),
+        ("emerge", "warden.emerge"),
+        ("roar", "warden.roar"),
+        ("sniff", "warden.sniff"),
+    ];
+    for (i, (short, name)) in WARDEN.into_iter().enumerate() {
+        keyframes::play_named(p, name, || format!("warden.{short}"), x[3 + i], s.age);
     }
 }
 
@@ -757,7 +773,7 @@ fn add_rot(p: &mut Pose<'_>, name: &str, r: [f32; 3]) {
 fn axolotl(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     let f = |i: usize| {
         let v = lerp(pt, e.extra[4 + i], e.extra[i]) / 10.0;
-        (1.0 - (PI * v).cos()) / 2.0
+        (1.0 - table_cos(PI * v)) / 2.0
     };
     let (d, w, g, m) = (f(0), f(1), f(2), f(3));
     let n = 1.0 - m;
@@ -779,7 +795,7 @@ fn axolotl(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
         let gl = (0.3 * sa + 0.9) * k;
         p.set("left_gills", |x| x[4] += gl);
         p.set("right_gills", |x| x[4] -= gl);
-        p.set("tail", |x| x[4] += 0.3 * (0.9 * a).cos() * k);
+        p.set("tail", |x| x[4] += 0.3 * table_cos(0.9 * a) * k);
         add_rot(p, "left_hind_leg", [1.884_955_8 * k, -0.4 * sa * k, PI / 2.0 * k]);
         add_rot(p, "left_front_leg", [1.884_955_8 * k, (-0.2 * ca - 0.1) * k, PI / 2.0 * k]);
     }
@@ -787,8 +803,8 @@ fn axolotl(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     let k = n.min(w);
     if k > 1e-5 {
         let a = age * 0.075;
-        let c = a.cos();
-        let sv = 0.15 * a.sin();
+        let c = table_cos(a);
+        let sv = 0.15 * table_sin(a);
         let bx = (-0.15 + 0.075 * c) * k;
         p.set("body", |x| {
             x[3] += bx;
@@ -807,12 +823,12 @@ fn axolotl(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     let k = m.min(g);
     if k > 1e-5 {
         let a = age * 0.11;
-        let c = a.cos();
+        let c = table_cos(a);
         let h = (c * c - 2.0 * c) / 5.0;
         let fw = 0.7 * c;
         p.set("head", |x| x[4] += 0.09 * c * k);
         p.set("tail", |x| x[4] += 0.09 * c * k);
-        let gl = (0.6 - 0.08 * (c * c + 2.0 * a.sin())) * k;
+        let gl = (0.6 - 0.08 * (c * c + 2.0 * table_sin(a))) * k;
         p.set("top_gills", |x| x[3] += gl);
         p.set("left_gills", |x| x[4] -= gl);
         p.set("right_gills", |x| x[4] += gl);
@@ -872,14 +888,14 @@ fn guardian(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     let sp = lerp(pt, e.extra[4], e.extra[3]);
     let r = (1.0 - sp) * 0.55;
     for (i, name) in SPIKES.iter().enumerate() {
-        let o = 1.0 + (s.age * 1.5 + i as f32).cos() * 0.01 - r;
+        let o = 1.0 + table_cos(s.age * 1.5 + i as f32) * 0.01 - r;
         p.set(name, |x| {
             x[0] = SX[i] * o;
             x[1] = 16.0 + SY[i] * o;
             x[2] = SZ[i] * o;
         });
     }
-    let q = lerp(pt, e.extra[1], e.extra[0]).sin() * PI;
+    let q = table_sin(lerp(pt, e.extra[1], e.extra[0])) * PI;
     p.set("tail0", |x| x[4] = q * 0.05);
     p.set("tail1", |x| x[4] = q * 0.1);
     p.set("tail2", |x| x[4] = q * 0.15);
@@ -1060,14 +1076,14 @@ pub(super) fn rotations(e: &Entity, pt: f32, body: f32, m: &mut Mat4) -> bool {
         "cod" | "salmon" | "tropical_fish" | "pufferfish" => {
             let water = in_water(e);
             if e.kind == "pufferfish" {
-                *m *= Mat4::from_translation(Vec3::new(0.0, (age * 0.05).cos() * 0.08, 0.0));
+                *m *= Mat4::from_translation(Vec3::new(0.0, table_cos(age * 0.05) * 0.08, 0.0));
             }
             *m *= Mat4::from_rotation_y(deg(180.0 - body));
             if e.kind == "pufferfish" {
                 return true;
             }
             let (a, b) = if e.kind == "salmon" && !water { (1.3, 1.7) } else { (1.0, 1.0) };
-            *m *= Mat4::from_rotation_y(deg(a * 4.3 * (b * 0.6 * age).sin()));
+            *m *= Mat4::from_rotation_y(deg(a * 4.3 * table_sin(b * 0.6 * age)));
             if !water {
                 let t = if e.kind == "cod" { Vec3::new(0.1, 0.1, -0.1) } else { Vec3::new(0.2, 0.1, 0.0) };
                 *m *= Mat4::from_translation(t) * Mat4::from_rotation_z(deg(90.0));
@@ -1426,7 +1442,7 @@ fn tick_squid(e: &mut Entity) {
     if water {
         if x[0] < PI {
             let u = x[0] / PI;
-            x[3] = (u * u * PI).sin() * PI * 0.25;
+            x[3] = table_sin(u * u * PI) * PI * 0.25;
             if u > 0.75 {
                 x[5] = 1.0;
             } else {
@@ -1443,7 +1459,7 @@ fn tick_squid(e: &mut Entity) {
         let pitch = -(hl.atan2(v[1]).to_degrees() as f32);
         x[6] += (pitch - x[6]) * 0.1;
     } else {
-        x[3] = x[0].sin().abs() * PI * 0.25;
+        x[3] = table_sin(x[0]).abs() * PI * 0.25;
         x[6] += (-90.0 - x[6]) * 0.02;
     }
 }

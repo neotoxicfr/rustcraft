@@ -128,7 +128,7 @@ fn use_transform(i: f32, hh: f32, pt: f32, anim: UseAnim, remaining: f32, durati
             if scaled < 0.8 {
                 m *= t(0.0, ((cur / 4.0 * PI).cos() * 0.1).abs(), 0.0);
             }
-            let jig = 1.0 - scaled.powf(27.0);
+            let jig = 1.0 - eat_jiggle_power(scaled);
             m * t(jig * 0.6 * i, jig * -0.5, 0.0)
                 * ry(i * jig * 90.0)
                 * rx(jig * 10.0)
@@ -215,6 +215,15 @@ fn whack(i: f32, a: f32) -> Mat4 {
         * rz(-20.0 * i * (s * PI).sin())
         * rx(-80.0 * (s * PI).sin())
         * ry(-45.0 * i)
+}
+
+/// Power 27 of the eating progress, as the game takes it: in double precision, rounded back to
+/// a float. `RUSTCRAFT_OPT_ROUND_TRICK` (default): by multiplications (same bits as the library
+/// power on every float of [0, 2[, `eat_jiggle_power_matches_library_power`); `=0`: the library
+/// power in double.
+fn eat_jiggle_power(scaled: f32) -> f32 {
+    let x = f64::from(scaled);
+    if rc_data::opt_switch!("RUSTCRAFT_OPT_ROUND_TRICK") { x.powi(27) as f32 } else { x.powf(27.0) as f32 }
 }
 
 /// "Stab" attack (spear, § 2.8).
@@ -776,6 +785,21 @@ pub fn push(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every float of [0, 2[ (the eating progress): power 27 by multiplications in double, then
+    /// rounded to a float, is the library power's float, bit for bit; the old single-precision
+    /// power differs (the game computes in double).
+    #[test]
+    fn eat_jiggle_power_matches_library_power() {
+        use rayon::prelude::*;
+        let floats = || (0..2.0f32.to_bits()).into_par_iter().map(f32::from_bits);
+        let library = |x: f32| (f64::from(x).powf(27.0)) as f32;
+        let mismatch = floats().find_any(|&x| (f64::from(x).powi(27)) as f32 != library(x));
+        assert_eq!(mismatch, None);
+        let single = floats().filter(|&x| x.powf(27.0).to_bits() != library(x).to_bits()).count();
+        eprintln!("floats of [0, 2[ where the single-precision power differs from the game's: {single}");
+        assert!(single > 0);
+    }
 
     fn stack(item: i32) -> ItemStack {
         ItemStack { item, count: 1, added: Vec::new(), removed: Vec::new() }

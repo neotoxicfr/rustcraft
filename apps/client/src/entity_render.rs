@@ -261,6 +261,21 @@ struct PoseEnv {
     in_water: bool,
 }
 
+/// Horizontal components (x, z) of the game's view vector of `e` at `pt`: yaw interpolated the
+/// shorter way (both angles exact at `pt` = 1), degrees to radians in floats, the sine table,
+/// products in single precision.
+fn flat_view_vector(e: &Entity, pt: f32) -> [f64; 2] {
+    const RADIANS_PER_DEGREE: f32 = 0.017_453_292;
+    let (pitch, yaw) = if pt == 1.0 {
+        (e.pitch, e.yaw)
+    } else {
+        (e.pitch_o + pt * (e.pitch - e.pitch_o), rot_lerp(pt, e.yaw_o, e.yaw))
+    };
+    let pitch_cos = table_cos(pitch * RADIANS_PER_DEGREE);
+    let yaw_radians = -yaw * RADIANS_PER_DEGREE;
+    [f64::from(table_sin(yaw_radians) * pitch_cos), f64::from(table_cos(yaw_radians) * pitch_cos)]
+}
+
 /// Glide yaw (radians) towards the movement direction: signed angle between the
 /// horizontal movement (interpolated from the previous tick) and the horizontal gaze; none
 /// if either is almost zero.
@@ -268,15 +283,16 @@ fn flying_y_rot(e: &Entity, pt: f32) -> Option<f32> {
     let pt64 = f64::from(pt);
     let a = &e.pose_anim;
     let mv: [f64; 3] = std::array::from_fn(|i| a.vel_o[i] + pt64 * (e.velocity[i] - a.vel_o[i]));
-    let yaw = f64::from(e.yaw_o + pt * (e.yaw - e.yaw_o)).to_radians();
-    let pitch = f64::from(e.pitch_o + pt * (e.pitch - e.pitch_o)).to_radians();
-    let look = [-yaw.sin() * pitch.cos(), yaw.cos() * pitch.cos()];
+    let look = flat_view_vector(e, pt);
     let m2 = mv[0] * mv[0] + mv[2] * mv[2];
     let l2 = look[0] * look[0] + look[1] * look[1];
-    if m2 <= 1.0e-5 || l2 <= 1.0e-5 {
+    let threshold = f64::from(1.0e-5f32);
+    if !(m2 > threshold && l2 > threshold) {
         return None;
     }
-    let dot = (mv[0] * look[0] + mv[2] * look[1]) / (m2.sqrt() * l2.sqrt());
+    // Both horizontal vectors normalised first, then their dot product, as the game rounds it.
+    let (m_len, l_len) = (m2.sqrt(), l2.sqrt());
+    let dot = (mv[0] / m_len) * (look[0] / l_len) + (mv[2] / m_len) * (look[1] / l_len);
     let sign = mv[0] * look[1] - mv[2] * look[0];
     let s = if sign > 0.0 {
         1.0
@@ -873,51 +889,68 @@ struct BakedPart {
     quads: Vec<Quad>,
 }
 
-/// Known animated parts: their index in each layer is computed at baking time (the
-/// animations designate them without hashing a string at every frame).
-const KNOWN: usize = 36;
+/// Declares the known part names with their index, once: the table of names and the lookup,
+/// a `match` that the compiler folds to a constant when the name is a literal and the call is
+/// inlined (nearly every animation site), so a part is found by one load.
+macro_rules! known_part_names {
+    ($($name:literal => $id:literal),* $(,)?) => {
+        const KNOWN_PART_NAMES: &[&str] = &[$($name),*];
 
-fn known_id(name: &str) -> Option<usize> {
-    Some(match name {
-        "head" => 0,
-        "body" => 1,
-        "right_arm" => 2,
-        "left_arm" => 3,
-        "right_leg" => 4,
-        "left_leg" => 5,
-        "right_hind_leg" => 6,
-        "left_hind_leg" => 7,
-        "right_front_leg" => 8,
-        "left_front_leg" => 9,
-        "right_wing" => 10,
-        "left_wing" => 11,
-        "right_middle_hind_leg" => 12,
-        "left_middle_hind_leg" => 13,
-        "right_middle_front_leg" => 14,
-        "left_middle_front_leg" => 15,
-        "jacket" => 16,
-        "left_sleeve" => 17,
-        "right_sleeve" => 18,
-        "left_pants" => 19,
-        "right_pants" => 20,
-        "hat" => 21,
-        "left_ear" => 22,
-        "right_ear" => 23,
-        "arms" => 24,
-        "mushrooms" => 25,
-        "neck" => 26,
-        "mouth" => 27,
-        "base_plate" => 28,
-        "right_body_stick" => 29,
-        "left_body_stick" => 30,
-        "shoulder_stick" => 31,
-        "upper_jaw" => 32,
-        "lower_jaw" => 33,
-        "base" => 34,
-        "root" => 35,
-        _ => return None,
-    })
+        #[cfg_attr(not(feature = "part-lookup-not-inlined"), inline(always))]
+        fn known_id(name: &str) -> Option<usize> {
+            Some(match name {
+                $($name => $id,)*
+                _ => return None,
+            })
+        }
+    };
 }
+
+// Known animated parts: their index in each layer is computed at baking time (the animations
+// designate them without comparing strings at every frame). The first 36 were the whole table
+// before `KNOWN_PART_NAMES`; the others are every name the animations use.
+known_part_names! {
+    "head" => 0, "body" => 1, "right_arm" => 2, "left_arm" => 3, "right_leg" => 4, "left_leg" => 5,
+    "right_hind_leg" => 6, "left_hind_leg" => 7, "right_front_leg" => 8, "left_front_leg" => 9,
+    "right_wing" => 10, "left_wing" => 11, "right_middle_hind_leg" => 12, "left_middle_hind_leg" => 13,
+    "right_middle_front_leg" => 14, "left_middle_front_leg" => 15, "jacket" => 16, "left_sleeve" => 17,
+    "right_sleeve" => 18, "left_pants" => 19, "right_pants" => 20, "hat" => 21, "left_ear" => 22,
+    "right_ear" => 23, "arms" => 24, "mushrooms" => 25, "neck" => 26, "mouth" => 27, "base_plate" => 28,
+    "right_body_stick" => 29, "left_body_stick" => 30, "shoulder_stick" => 31, "upper_jaw" => 32,
+    "lower_jaw" => 33, "base" => 34, "root" => 35,
+    "tail" => 36, "tail0" => 37, "tail1" => 38, "tail2" => 39, "tail3" => 40, "tail4" => 41, "tail5" => 42,
+    "tail6" => 43, "tail7" => 44, "tail8" => 45, "tail9" => 46, "tail10" => 47, "tail11" => 48,
+    "tail_base" => 49, "tail_fin" => 50, "tail_tip" => 51, "real_tail" => 52, "jaw" => 53, "nose" => 54,
+    "eye" => 55, "lid" => 56, "left_lid" => 57, "right_lid" => 58, "left_horn" => 59, "right_horn" => 60,
+    "left_antenna" => 61, "right_antenna" => 62, "left_chest" => 63, "right_chest" => 64,
+    "left_gills" => 65, "right_gills" => 66, "top_gills" => 67, "left_tendril" => 68,
+    "right_tendril" => 69, "left_wing_base" => 70, "right_wing_base" => 71, "left_wing_tip" => 72,
+    "right_wing_tip" => 73, "left_pages" => 74, "right_pages" => 75, "flip_page1" => 76,
+    "flip_page2" => 77, "left_saddle_line" => 78, "right_saddle_line" => 79, "reins" => 80,
+    "right_fin" => 81, "upper_body" => 82, "body_back" => 83, "bell_body" => 84, "croaking_body" => 85,
+    "egg_belly" => 86, "head_parts" => 87, "real_head" => 88, "center_head" => 89, "left_head" => 90,
+    "right_head" => 91, "neck0" => 92, "neck1" => 93, "neck2" => 94, "neck3" => 95, "neck4" => 96,
+    "ribcage" => 97, "bone" => 98, "stinger" => 99, "corals" => 100, "goggles" => 101,
+    "front_legs" => 102, "middle_legs" => 103, "back_legs" => 104, "cube" => 105, "cube0" => 106,
+    "cube1" => 107, "cube2" => 108, "cube3" => 109, "cube4" => 110, "cube5" => 111, "cube6" => 112,
+    "cube7" => 113, "inner_glass" => 114, "outer_glass" => 115, "lock" => 116, "flag" => 117,
+    "main" => 118, "layer0" => 119, "layer1" => 120, "layer2" => 121, "wind" => 122,
+    "wind_charge" => 123, "box0" => 124, "box1" => 125, "left_paddle" => 126, "right_paddle" => 127,
+    "tentacle0" => 128, "tentacle1" => 129, "tentacle2" => 130, "tentacle3" => 131, "tentacle4" => 132,
+    "tentacle5" => 133, "tentacle6" => 134, "tentacle7" => 135, "tentacle8" => 136, "spike0" => 137,
+    "spike1" => 138, "spike2" => 139, "spike3" => 140, "spike4" => 141, "spike5" => 142,
+    "spike6" => 143, "spike7" => 144, "spike8" => 145, "spike9" => 146, "spike10" => 147,
+    "spike11" => 148, "part0" => 149, "part1" => 150, "part2" => 151, "part3" => 152, "part4" => 153,
+    "part5" => 154, "part6" => 155, "part7" => 156, "part8" => 157, "part9" => 158, "part10" => 159,
+    "part11" => 160, "segment0" => 161, "segment1" => 162, "segment2" => 163, "segment3" => 164,
+    "segment4" => 165, "segment5" => 166, "segment6" => 167,
+}
+
+const KNOWN: usize = KNOWN_PART_NAMES.len();
+
+/// Size of the table before every animated name was added: under
+/// `RUSTCRAFT_OPT_KNOWN_PART_NAMES=0` the later ones are searched among the layer's names.
+const FIRST_KNOWN_PARTS: usize = 36;
 
 /// Baked layer: parts in drawing order, index of the known parts.
 pub struct BakedLayer {
@@ -1008,8 +1041,12 @@ pub struct Pose<'a> {
     layer: &'a BakedLayer,
     pub parts: Vec<[f32; 9]>,
     pub visible: Vec<bool>,
+    /// `KNOWN_PART_NAMES` of the frame, read once per layer.
+    widened_part_names: bool,
 }
 
+// The lookups are inlined everywhere (feature `part-lookup-not-inlined` builds the other
+// executable for the A/B): with a literal name the whole search folds to one table load.
 impl<'a> Pose<'a> {
     /// Definition pose of the layer, in reused buffers.
     fn reset(layer: &'a BakedLayer, mut parts: Vec<[f32; 9]>, mut visible: Vec<bool>) -> Self {
@@ -1017,35 +1054,41 @@ impl<'a> Pose<'a> {
         parts.extend(layer.parts.iter().map(|p| p.pose));
         visible.clear();
         visible.resize(layer.parts.len(), true);
-        Pose { layer, parts, visible }
+        Pose { layer, parts, visible, widened_part_names: animation_paths().widened_part_names }
     }
 
-    /// Part by name: table of known parts, otherwise search in the layer's names.
+    /// Part by name: table of known parts (the first of that name, like the search), otherwise
+    /// search in the layer's names.
+    #[cfg_attr(not(feature = "part-lookup-not-inlined"), inline(always))]
     fn index(&self, name: &str) -> Option<usize> {
         match known_id(name) {
-            Some(k) => {
+            Some(k) if k < FIRST_KNOWN_PARTS || self.widened_part_names => {
                 let i = self.layer.known[k];
                 (i != u16::MAX).then_some(usize::from(i))
             }
-            None => self.layer.names.iter().position(|n| n == name),
+            _ => self.layer.names.iter().position(|n| n == name),
         }
     }
 
+    #[cfg_attr(not(feature = "part-lookup-not-inlined"), inline(always))]
     fn get(&mut self, name: &str) -> Option<&mut [f32; 9]> {
         let i = self.index(name)?;
         Some(&mut self.parts[i])
     }
 
+    #[cfg_attr(not(feature = "part-lookup-not-inlined"), inline(always))]
     fn set(&mut self, name: &str, f: impl FnOnce(&mut [f32; 9])) {
         if let Some(p) = self.get(name) {
             f(p);
         }
     }
 
+    #[cfg_attr(not(feature = "part-lookup-not-inlined"), inline(always))]
     fn has(&self, name: &str) -> bool {
         self.index(name).is_some()
     }
 
+    #[cfg_attr(not(feature = "part-lookup-not-inlined"), inline(always))]
     fn hide(&mut self, name: &str) {
         if let Some(i) = self.index(name) {
             self.visible[i] = false;
@@ -1079,7 +1122,34 @@ fn part_matrix(p: &[f32; 9]) -> Mat4 {
 /// Sine and cosine (rendering only): reduction to a quarter turn, minimax polynomials on
 /// [−π/4, π/4]; error < 1e-6 on [−20, 20] (a few ulp of f32), invisible when rendered.
 fn sin_cos(x: f32) -> (f32, f32) {
-    let q = (x * std::f32::consts::FRAC_2_PI).round();
+    sin_cos_with(x, rc_data::opt_switch!("RUSTCRAFT_OPT_ROUND_TRICK"))
+}
+
+/// The library's rounding of `v` (halves away from zero) for `|v| < 2^22`, without its call:
+/// the truncation to an integer is one instruction and leaves an exact fraction. Exact halves
+/// are frequent here (a right angle halved for the quaternion is a half quarter), so a
+/// rounding to even would move bits.
+fn round_half_away_from_zero(v: f32) -> f32 {
+    let whole = (v as i32) as f32;
+    let fraction = v - whole;
+    if fraction >= 0.5 {
+        whole + 1.0
+    } else if fraction <= -0.5 {
+        whole - 1.0
+    } else {
+        whole
+    }
+}
+
+/// [`sin_cos`], the quarter turn rounded by [`round_half_away_from_zero`] (`by_truncation`)
+/// or by the library (the old path): the same quotient, so the same bits.
+fn sin_cos_with(x: f32, by_truncation: bool) -> (f32, f32) {
+    let quotient = x * std::f32::consts::FRAC_2_PI;
+    let q = if by_truncation && quotient.abs() < 4_194_304.0 {
+        round_half_away_from_zero(quotient)
+    } else {
+        quotient.round()
+    };
     // Two-step reduction (π/2 = high + low) to keep the precision.
     let r = (x - q * 1.570_796_4) + q * 4.371_139e-8;
     let r2 = r * r;
@@ -1262,6 +1332,53 @@ const fn deg(d: f32) -> f32 {
     d * PI / 180.0
 }
 
+/// Switches of the frame read by animation helpers that have no access to the renderer (about
+/// 250 trigonometric sites in the family modules): set by `prepare` from `EntOpt` for the
+/// thread that animates. A thread that never prepared keeps the new paths.
+#[derive(Clone, Copy, Debug)]
+struct AnimationPaths {
+    /// `ANIMATION_SINE_TABLE`: the game's tabulated sine.
+    sine_table: bool,
+    /// `KNOWN_PART_NAMES`: every part name of the animations has its index baked.
+    widened_part_names: bool,
+    /// `KEYFRAME_STATIC_NAMES`: keyframe animations named by literals, not formatted.
+    static_keyframe_names: bool,
+}
+
+impl AnimationPaths {
+    const NEW: AnimationPaths = AnimationPaths { sine_table: true, widened_part_names: true, static_keyframe_names: true };
+
+    fn of(opt: &EntOpt) -> AnimationPaths {
+        AnimationPaths {
+            sine_table: opt.animation_sine_table,
+            widened_part_names: opt.known_part_names,
+            static_keyframe_names: opt.keyframe_static_names,
+        }
+    }
+}
+
+thread_local! {
+    static ANIMATION_PATHS: std::cell::Cell<AnimationPaths> = const { std::cell::Cell::new(AnimationPaths::NEW) };
+}
+
+fn animation_paths() -> AnimationPaths {
+    ANIMATION_PATHS.with(std::cell::Cell::get)
+}
+
+/// The game's tabulated sine, the one its models and entity renders animate with (65,536
+/// steps per turn, the angle widened to a double; a few in ten thousand of a radian from the
+/// exact sine). `RUSTCRAFT_OPT_ANIMATION_SINE_TABLE=0`: the C library's sine, the old path.
+#[inline]
+fn table_sin(x: f32) -> f32 {
+    if animation_paths().sine_table { rc_physics::sin_t(x) } else { x.sin() }
+}
+
+/// The game's tabulated cosine (see [`table_sin`]).
+#[inline]
+fn table_cos(x: f32) -> f32 {
+    if animation_paths().sine_table { rc_physics::cos_t(x) } else { x.cos() }
+}
+
 /// Pitch of the humanoid head: raised by 45° forwards while gliding.
 fn head_pitch(s: &AnimState) -> f32 {
     if s.fall_flying { -PI / 4.0 } else { s.pitch }
@@ -1275,15 +1392,15 @@ fn humanoid(p: &mut Pose<'_>, s: &AnimState) {
     });
     let q = pp * 0.6662;
     let sp = s.speed;
-    p.set("right_arm", |a| a[3] = (q + PI).cos() * 2.0 * v * 0.5 / sp);
-    p.set("left_arm", |a| a[3] = q.cos() * 2.0 * v * 0.5 / sp);
+    p.set("right_arm", |a| a[3] = table_cos(q + PI) * 2.0 * v * 0.5 / sp);
+    p.set("left_arm", |a| a[3] = table_cos(q) * 2.0 * v * 0.5 / sp);
     p.set("right_leg", |l| {
-        l[3] = q.cos() * 1.4 * v / sp;
+        l[3] = table_cos(q) * 1.4 * v / sp;
         l[4] = 0.005;
         l[5] = 0.005;
     });
     p.set("left_leg", |l| {
-        l[3] = (q + PI).cos() * 1.4 * v / sp;
+        l[3] = table_cos(q + PI) * 1.4 * v / sp;
         l[4] = -0.005;
         l[5] = -0.005;
     });
@@ -1307,32 +1424,32 @@ fn humanoid(p: &mut Pose<'_>, s: &AnimState) {
     }
     // `whack` attack (§ 2.1.2).
     if s.swing > 0.0 && s.swing_on {
-        let mut body = (s.swing.sqrt() * 2.0 * PI).sin() * 0.2;
+        let mut body = table_sin(s.swing.sqrt() * 2.0 * PI) * 0.2;
         if !s.swing_right {
             body = -body;
         }
         let age_scale = if s.baby { 0.5 } else { 1.0 };
         p.set("body", |b| b[4] = body);
         p.set("right_arm", |a| {
-            a[2] = body.sin() * 5.0 * age_scale;
-            a[0] = -body.cos() * 5.0 * age_scale;
+            a[2] = table_sin(body) * 5.0 * age_scale;
+            a[0] = -table_cos(body) * 5.0 * age_scale;
             a[4] += body;
         });
         p.set("left_arm", |a| {
-            a[2] = -body.sin() * 5.0 * age_scale;
-            a[0] = body.cos() * 5.0 * age_scale;
+            a[2] = -table_sin(body) * 5.0 * age_scale;
+            a[0] = table_cos(body) * 5.0 * age_scale;
             a[4] += body;
             a[3] += body;
         });
         if s.swing_kind == 1 {
             let out = 1.0 - (1.0 - s.swing).powi(4);
-            let a = (out * PI).sin();
+            let a = table_sin(out * PI);
             let head_x = p.get("head").map_or(0.0, |h| h[3]);
-            let b = (s.swing * PI).sin() * -(head_x - 0.7) * 0.75;
+            let b = table_sin(s.swing * PI) * -(head_x - 0.7) * 0.75;
             p.set(if s.swing_right { "right_arm" } else { "left_arm" }, |arm| {
                 arm[3] -= a * 1.2 + b;
                 arm[4] += body * 2.0;
-                arm[5] += (s.swing * PI).sin() * -0.4;
+                arm[5] += table_sin(s.swing * PI) * -0.4;
             });
         } else if s.swing_kind == 2 {
             // Lunge: body rotation removed from the arms, then thrust of the striking arm.
@@ -1407,14 +1524,15 @@ fn swim_arms(p: &mut Pose<'_>, s: &AnimState) {
             a[5] += rw * (rt[2] - a[5]);
         });
     }
-    p.set("left_leg", |l| l[3] += w * (0.3 * (s.walk_pos / 3.0 + PI).cos() - l[3]));
-    p.set("right_leg", |l| l[3] += w * (0.3 * (s.walk_pos / 3.0).cos() - l[3]));
+    // A third of the walk position as the game rounds it: times the float nearest 1/3.
+    p.set("left_leg", |l| l[3] += w * (0.3 * table_cos(s.walk_pos * 0.333_333_34 + PI) - l[3]));
+    p.set("right_leg", |l| l[3] += w * (0.3 * table_cos(s.walk_pos * 0.333_333_34) - l[3]));
 }
 
 /// Drowned swim: arms stretched forward that wave, alternating legs, head straight.
 fn drowned_swim(p: &mut Pose<'_>, s: &AnimState) {
     let w = s.swim;
-    let o = (0.1 * s.age).sin();
+    let o = table_sin(0.1 * s.age);
     p.set("right_arm", |a| {
         a[3] = lerp_angle_radians(w, a[3], -PI * 4.0 / 5.0) + w * 0.35 * o;
         a[5] = lerp_angle_radians(w, a[5], -0.15);
@@ -1450,8 +1568,8 @@ fn idle_and_crouch(p: &mut Pose<'_>, s: &AnimState) {
             continue;
         }
         p.set(arm, |a| {
-            a[5] += f * ((s.age * 0.09).cos() * 0.05 + 0.05);
-            a[3] += f * (s.age * 0.067).sin() * 0.05;
+            a[5] += f * (table_cos(s.age * 0.09) * 0.05 + 0.05);
+            a[3] += f * table_sin(s.age * 0.067) * 0.05;
         });
     }
 }
@@ -1543,8 +1661,8 @@ fn skeleton_arms(p: &mut Pose<'_>, s: &AnimState, aggressive: bool) {
     if !aggressive || s.arm_pose.contains(&arm::BOW) {
         return;
     }
-    let swing2 = (s.swing * PI).sin();
-    let swing = ((1.0 - (1.0 - s.swing) * (1.0 - s.swing)) * PI).sin();
+    let swing2 = table_sin(s.swing * PI);
+    let swing = table_sin((1.0 - (1.0 - s.swing) * (1.0 - s.swing)) * PI);
     let x = -PI / 2.0 - (swing2 * 1.2 - swing * 0.4);
     let y = 0.1 - swing2 * 0.6;
     for (arm, f) in [("right_arm", -1.0f32), ("left_arm", 1.0)] {
@@ -1556,8 +1674,8 @@ fn skeleton_arms(p: &mut Pose<'_>, s: &AnimState, aggressive: bool) {
     }
     for (arm, f) in [("right_arm", 1.0f32), ("left_arm", -1.0)] {
         p.set(arm, |a| {
-            a[5] += f * ((s.age * 0.09).cos() * 0.05 + 0.05);
-            a[3] += f * (s.age * 0.067).sin() * 0.05;
+            a[5] += f * (table_cos(s.age * 0.09) * 0.05 + 0.05);
+            a[3] += f * table_sin(s.age * 0.067) * 0.05;
         });
     }
 }
@@ -1565,8 +1683,8 @@ fn skeleton_arms(p: &mut Pose<'_>, s: &AnimState, aggressive: bool) {
 /// Zombie arms (§ 2.2), after the humanoid animation.
 fn zombie_arms(p: &mut Pose<'_>, s: &AnimState, aggressive: bool, raise: bool) {
     let fall = if raise { -PI / if aggressive { 1.5 } else { 2.25 } } else { 0.0 };
-    let ay = (if raise { 1.0 } else { -1.0 }) * (s.swing * PI).sin();
-    let ax = ((1.0 - (1.0 - s.swing).powi(2)) * PI).sin();
+    let ay = (if raise { 1.0 } else { -1.0 }) * table_sin(s.swing * PI);
+    let ax = table_sin((1.0 - (1.0 - s.swing).powi(2)) * PI);
     let x = fall + ay * 1.2 - ax * 0.4;
     let y = 0.1 - ay * 0.6;
     // A held spear or a lunge leaves both arms in their walking pose.
@@ -1604,7 +1722,7 @@ fn quadruped_legs(p: &mut Pose<'_>, s: &AnimState, crossed: bool) {
         h[4] = s.yaw;
     });
     let q = s.walk_pos * 0.6662;
-    let (a, b) = (q.cos() * 1.4 * s.walk_speed, (q + PI).cos() * 1.4 * s.walk_speed);
+    let (a, b) = (table_cos(q) * 1.4 * s.walk_speed, table_cos(q + PI) * 1.4 * s.walk_speed);
     let (a, b) = if crossed { (b, a) } else { (a, b) };
     p.set("right_hind_leg", |l| l[3] = a);
     p.set("left_front_leg", |l| l[3] = a);
@@ -1620,16 +1738,16 @@ fn spider(p: &mut Pose<'_>, s: &AnimState) {
     let q = s.walk_pos * 0.6662;
     let v = s.walk_speed;
     let g = [
-        -(2.0 * q).cos() * 0.4 * v,
-        -(2.0 * q + PI).cos() * 0.4 * v,
-        -(2.0 * q + PI / 2.0).cos() * 0.4 * v,
-        -(2.0 * q + 3.0 * PI / 2.0).cos() * 0.4 * v,
+        -table_cos(2.0 * q) * 0.4 * v,
+        -table_cos(2.0 * q + PI) * 0.4 * v,
+        -table_cos(2.0 * q + PI / 2.0) * 0.4 * v,
+        -table_cos(2.0 * q + 3.0 * PI / 2.0) * 0.4 * v,
     ];
     let l = [
-        (q.sin() * 0.4).abs() * v,
-        ((q + PI).sin() * 0.4).abs() * v,
-        ((q + PI / 2.0).sin() * 0.4).abs() * v,
-        ((q + 3.0 * PI / 2.0).sin() * 0.4).abs() * v,
+        (table_sin(q) * 0.4).abs() * v,
+        (table_sin(q + PI) * 0.4).abs() * v,
+        (table_sin(q + PI / 2.0) * 0.4).abs() * v,
+        (table_sin(q + 3.0 * PI / 2.0) * 0.4).abs() * v,
     ];
     let pairs = [
         ("right_hind_leg", "left_hind_leg"),
@@ -1972,6 +2090,15 @@ pub(crate) struct EntOpt {
     /// `SKIP_IDENTITY_ROOT_FACTORS`: root factors that are the identity (no shaking, scales of
     /// 1) not multiplied in.
     pub skip_identity_root_factors: bool,
+    /// `ANIMATION_SINE_TABLE`: animations through the game's sine table (fidelity: the C
+    /// library's sine is a few ten-thousandths of a radian away from it).
+    pub animation_sine_table: bool,
+    /// `KNOWN_PART_NAMES`: every part name the animations use has its index baked; otherwise
+    /// only the first 36 and a search through the layer's names for the others.
+    pub known_part_names: bool,
+    /// `KEYFRAME_STATIC_NAMES`: keyframe animations named by literals instead of names
+    /// formatted at every frame (camel, rabbit, armadillo, breeze, warden).
+    pub keyframe_static_names: bool,
 }
 
 impl EntOpt {
@@ -1989,6 +2116,9 @@ impl EntOpt {
         dragon_effects_gate: false,
         shared_body_angle: false,
         skip_identity_root_factors: false,
+        animation_sine_table: false,
+        known_part_names: false,
+        keyframe_static_names: false,
     };
 
     /// New paths everywhere.
@@ -2005,6 +2135,9 @@ impl EntOpt {
         dragon_effects_gate: true,
         shared_body_angle: true,
         skip_identity_root_factors: true,
+        animation_sine_table: true,
+        known_part_names: true,
+        keyframe_static_names: true,
     };
 
     pub(crate) fn from_env() -> EntOpt {
@@ -2020,6 +2153,9 @@ impl EntOpt {
             dragon_effects_gate: rc_data::opt_switch!("RUSTCRAFT_OPT_DRAGON_EFFECTS_GATE"),
             shared_body_angle: rc_data::opt_switch!("RUSTCRAFT_OPT_SHARED_BODY_ANGLE"),
             skip_identity_root_factors: rc_data::opt_switch!("RUSTCRAFT_OPT_SKIP_IDENTITY_ROOT_FACTORS"),
+            animation_sine_table: rc_data::opt_switch!("RUSTCRAFT_OPT_ANIMATION_SINE_TABLE"),
+            known_part_names: rc_data::opt_switch!("RUSTCRAFT_OPT_KNOWN_PART_NAMES"),
+            keyframe_static_names: rc_data::opt_switch!("RUSTCRAFT_OPT_KEYFRAME_STATIC_NAMES"),
         }
     }
 }
@@ -3178,8 +3314,8 @@ impl EntityRenderer {
             rect[3] / 4.0,
         ];
         let a = e.age as f32 + pt;
-        let r = (((a / 2.0).sin() + 1.0) * 0.5 * 255.0).floor() as u32;
-        let b = (((a / 2.0 + std::f32::consts::PI * 4.0 / 3.0).sin() + 1.0) * 0.1 * 255.0).floor() as u32;
+        let r = ((table_sin(a / 2.0) + 1.0) * 0.5 * 255.0).floor() as u32;
+        let b = ((table_sin(a / 2.0 + std::f32::consts::PI * 4.0 / 3.0) + 1.0) * 0.1 * 255.0).floor() as u32;
         let color = r | 255 << 8 | b << 16 | 128 << 24;
         // Light at the eyes' block (the game's light probe), not at the feet.
         let (bl, sl) = self.eye_light(e, p, light);
@@ -3667,6 +3803,7 @@ impl EntityRenderer {
         }
         self.set_current(None, None);
         let opt = self.opt;
+        ANIMATION_PATHS.with(|p| p.set(AnimationPaths::of(&opt)));
         // From farthest to nearest (translucent order). Sizes (base, full)
         // computed once per entity (`SIZEONCE`); kind flags (`KINDINFO`).
         let mut list: Vec<(&Entity, f64, Option<Sizes>, KindInfo)> = entities
@@ -4317,7 +4454,7 @@ impl EntityRenderer {
             }
             if e.kind == "creeper" {
                 let g = (e.swell.0 as f32 + pt * (e.swell.1 - e.swell.0) as f32) / 28.0;
-                let w = 1.0 + (g * 100.0).sin() * g * 0.01;
+                let w = 1.0 + table_sin(g * 100.0) * g * 0.01;
                 let h = g.clamp(0.0, 1.0).powi(4);
                 let sxz = (1.0 + h * 0.4) * w;
                 scale = Vec3::new(sxz, (1.0 + h * 0.1) / w, sxz);
@@ -4347,7 +4484,7 @@ impl EntityRenderer {
             m *= Mat4::from_rotation_y(deg(yaw - 90.0)) * Mat4::from_rotation_z(deg(pitch));
             let s = e.shake as f32 - pt;
             if s > 0.0 {
-                m *= Mat4::from_rotation_z(deg(-(3.0 * s).sin() * s));
+                m *= Mat4::from_rotation_z(deg(-table_sin(3.0 * s) * s));
             }
         } else {
             m *= Mat4::from_rotation_y(deg(-e.yaw));
@@ -5020,7 +5157,7 @@ impl EntityRenderer {
                 0.0,
             ));
             let (pitch, yaw) = (s.pitch, s.yaw);
-            let tail = (s.walk_pos * 0.6662).cos() * 0.3 * s.walk_speed;
+            let tail = table_cos(s.walk_pos * 0.6662) * 0.3 * s.walk_speed;
             self.push_posed(layer, rect, at, 0, light, |p| {
                 p.set("head", |h| {
                     h[3] = pitch;
@@ -5201,7 +5338,7 @@ impl EntityRenderer {
                 }
                 let (mut y, mut z) = (1.4f32, -0.6f32);
                 if e.meta_int(20).unwrap_or(0) > 0 {
-                    let w = (s.age * 0.6).sin();
+                    let w = table_sin(s.age * 0.6);
                     z -= 0.2 * w + 0.2;
                     y -= 0.09 * w;
                 }
@@ -5299,10 +5436,12 @@ impl EntityRenderer {
         let Some(rect) = rect else { return };
         let lay = if !offset || self.gui_root.is_some() { Mat4::IDENTITY } else { self.layering };
         self.push_posed(layer, rect, lay * mtx, pass, light, |p| match kind {
-            4 => p.set("jaw", |q| q[3] = ((walk * PI * 0.2).sin() + 1.0) * 0.2),
+            // These two heads animate with the library sine in double precision, the float
+            // angle widened first, rounded back to a float after adding the offset.
+            4 => p.set("jaw", |q| q[3] = (f64::from(walk * PI * 0.2).sin() + 1.0) as f32 * 0.2),
             5 => {
-                p.set("left_ear", |q| q[5] = -((walk * PI * 0.2 * 1.2).cos() + 2.5) * 0.2);
-                p.set("right_ear", |q| q[5] = ((walk * PI * 0.2).cos() + 2.5) * 0.2);
+                p.set("left_ear", |q| q[5] = -((f64::from(walk * PI * 0.2 * 1.2).cos() + 2.5) as f32) * 0.2);
+                p.set("right_ear", |q| q[5] = (f64::from(walk * PI * 0.2).cos() + 2.5) as f32 * 0.2);
             }
             _ => {}
         });
@@ -6074,7 +6213,7 @@ impl EntityRenderer {
         let Some(rc_proto_v777::entity::Meta::Item(Some(stack))) = e.meta.get(&8) else { return false };
         let bob_offs = (e.uuid as u32 >> 8) as f32 / (1u32 << 24) as f32 * 2.0 * PI;
         let age = e.age as f32 + pt;
-        let bob = (age / 10.0 + bob_offs).sin() * 0.1 + 0.1;
+        let bob = table_sin(age / 10.0 + bob_offs) * 0.1 + 0.1;
         // Light at the eyes' block (the game's light probe), not at the feet.
         let (b, s) = self.eye_light(e, world, light);
         let block = if e.flags() & 1 != 0 { 15 } else { b };
@@ -6547,8 +6686,8 @@ fn pulse_alpha(e: &Entity, id: u8, pt: f32) -> f32 {
     let age = e.age as f32 + pt;
     match id {
         0 => 1.0,
-        1 => ((age * 0.045).cos() * 0.25).max(0.0),
-        2 => ((age * 0.045 + PI).cos() * 0.25).max(0.0),
+        1 => (table_cos(age * 0.045) * 0.25).max(0.0),
+        2 => (table_cos(age * 0.045 + PI) * 0.25).max(0.0),
         3 => (e.extra[2] + pt * (e.extra[1] - e.extra[2])) / 10.0,
         // Heart counter held by the tick (`creatures::tick`, extra 9 current, 10 old): a change
         // of anger does not interrupt a beat in progress.
@@ -6589,7 +6728,13 @@ fn pose_rotations(e: &Entity, pt: f32, body: f32, m: &mut Mat4, c: &RotCtx) {
     let base_rot = !matches!(e.kind.as_str(), "squid" | "glow_squid" | "ender_dragon" | "armor_stand");
     // Shaking: body yaw offset; Y rotation applied before that of the body
     // (coincident axes, the families' translations are vertical).
-    let shake = if base_rot && c.shaking { ((e.age as f32 + pt).floor() * 3.25).cos() * PI * 0.4 } else { 0.0 };
+    // The game takes this cosine in double precision (library, not its table).
+    let shake = if base_rot && c.shaking {
+        let phase = (e.age as f32 + pt).floor() * 3.25;
+        (f64::from(phase).cos() * std::f64::consts::PI * f64::from(0.4f32)) as f32
+    } else {
+        0.0
+    };
     let sleeping = base_rot && e.pose() == 2;
     // A zero shake is the identity rotation (sine +0, cosine 1): the product would return the
     // matrix up to the sign of zeros, which no pixel shows (`identity_product_keeps_matrix`).
@@ -6609,7 +6754,7 @@ fn pose_rotations(e: &Entity, pt: f32, body: f32, m: &mut Mat4, c: &RotCtx) {
     // Armor stand hit (event 32): 5-tick oscillation around Y.
     if e.kind == "armor_stand" && e.timers[0] > 0 {
         let w = (5 - e.timers[0]) as f32 + pt;
-        *m *= Mat4::from_rotation_y(deg((w / 1.5 * std::f32::consts::PI).sin() * 3.0));
+        *m *= Mat4::from_rotation_y(deg(table_sin(w / 1.5 * std::f32::consts::PI) * 3.0));
     }
     // Pitch of the entity in degrees (inverted upside down).
     let x_rot = (e.pitch_o + pt * (e.pitch - e.pitch_o)) * if c.upside_down { -1.0 } else { 1.0 };
@@ -6707,7 +6852,7 @@ fn animate(pose: &mut Pose<'_>, e: &Entity, state: &AnimState, pt: f32, living: 
                     -(c - 40.0 - pt) / 4.0
                 };
                 let ah = if c > 4.0 && c <= 36.0 {
-                    PI / 5.0 + 0.219_911_49 * ((c - 4.0 - pt) / 32.0 * 28.7).sin()
+                    PI / 5.0 + 0.219_911_49 * table_sin((c - 4.0 - pt) / 32.0 * 28.7)
                 } else {
                     PI / 5.0
                 };
@@ -6756,8 +6901,8 @@ fn animate(pose: &mut Pose<'_>, e: &Entity, state: &AnimState, pt: f32, living: 
         "evoker_fangs" => fangs(pose, e, pt),
         "chicken" => {
             let q = state.walk_pos * 0.6662;
-            pose.set("right_leg", |l| l[3] = q.cos() * 1.4 * state.walk_speed);
-            pose.set("left_leg", |l| l[3] = (q + PI).cos() * 1.4 * state.walk_speed);
+            pose.set("right_leg", |l| l[3] = table_cos(q) * 1.4 * state.walk_speed);
+            pose.set("left_leg", |l| l[3] = table_cos(q + PI) * 1.4 * state.walk_speed);
             if !state.baby {
                 pose.set("head", |h| {
                     h[3] = state.pitch;
@@ -6766,7 +6911,7 @@ fn animate(pose: &mut Pose<'_>, e: &Entity, state: &AnimState, pt: f32, living: 
             }
             let f = e.flap[0] + pt * (e.flap[1] - e.flap[0]);
             let fs = e.flap[2] + pt * (e.flap[3] - e.flap[2]);
-            let angle = (f.sin() + 1.0) * fs;
+            let angle = (table_sin(f) + 1.0) * fs;
             pose.set("right_wing", |w| w[5] = angle);
             pose.set("left_wing", |w| w[5] = -angle);
         }
@@ -7065,9 +7210,9 @@ fn illusion_offsets(e: &Entity, pt: f32) -> [[f64; 3]; 4] {
 fn illusion_wobble(i: usize, age: f32) -> [f64; 3] {
     let i = i as f32;
     [
-        f64::from((i + age * 0.5).cos()) * 0.025,
-        f64::from((i + age * 0.75).cos()) * 0.0125,
-        f64::from((i + age * 0.7).cos()) * 0.025,
+        f64::from(table_cos(i + age * 0.5)) * 0.025,
+        f64::from(table_cos(i + age * 0.75)) * 0.0125,
+        f64::from(table_cos(i + age * 0.7)) * 0.025,
     ]
 }
 
@@ -7125,14 +7270,14 @@ fn piglin_ears(p: &mut Pose<'_>, s: &AnimState) {
     let d = deg(if s.baby { 5.0 } else { 30.0 });
     let f = s.age * 0.1 + s.walk_pos * 0.5;
     let a = 0.08 + s.walk_speed * 0.4;
-    p.set("left_ear", |e| e[5] = -d - (1.2 * f).cos() * a);
-    p.set("right_ear", |e| e[5] = d + f.cos() * a);
+    p.set("left_ear", |e| e[5] = -d - table_cos(1.2 * f) * a);
+    p.set("right_ear", |e| e[5] = d + table_cos(f) * a);
 }
 
 /// Downward weapon strike (armed piglin, illagers): main arm M, other arm O.
 fn strike_down(p: &mut Pose<'_>, s: &AnimState, right: bool) {
-    let a2 = (s.swing * PI).sin();
-    let a1 = ((1.0 - (1.0 - s.swing).powi(2)) * PI).sin();
+    let a2 = table_sin(s.swing * PI);
+    let a1 = table_sin((1.0 - (1.0 - s.swing).powi(2)) * PI);
     let (m, o) = if right { ("right_arm", "left_arm") } else { ("left_arm", "right_arm") };
     p.set("right_arm", |a| {
         a[5] = 0.0;
@@ -7142,8 +7287,8 @@ fn strike_down(p: &mut Pose<'_>, s: &AnimState, right: bool) {
         a[5] = 0.0;
         a[4] = -PI / 20.0;
     });
-    p.set(m, |a| a[3] = -1.884_955_8 + (s.age * 0.09).cos() * 0.15 + a2 * 2.2 - a1 * 0.4);
-    p.set(o, |a| a[3] = (s.age * 0.19).cos() * 0.5 + a2 * 1.2 - a1 * 0.4);
+    p.set(m, |a| a[3] = -1.884_955_8 + table_cos(s.age * 0.09) * 0.15 + a2 * 2.2 - a1 * 0.4);
+    p.set(o, |a| a[3] = table_cos(s.age * 0.19) * 0.5 + a2 * 1.2 - a1 * 0.4);
     idle_and_crouch(p, &AnimState { crouching: false, ..*s });
 }
 
@@ -7178,22 +7323,22 @@ fn piglin(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
     piglin_ears(p, s);
     if dancing {
         let t = s.age / 60.0;
-        p.set("right_ear", |x| x[5] = PI / 6.0 + deg((30.0 * t).sin() * 10.0));
-        p.set("left_ear", |x| x[5] = -PI / 6.0 - deg((30.0 * t).cos() * 10.0));
+        p.set("right_ear", |x| x[5] = PI / 6.0 + deg(table_sin(30.0 * t) * 10.0));
+        p.set("left_ear", |x| x[5] = -PI / 6.0 - deg(table_cos(30.0 * t) * 10.0));
         p.set("head", |h| {
-            h[0] += (10.0 * t).sin();
-            h[1] += (40.0 * t).sin() + 0.4;
+            h[0] += table_sin(10.0 * t);
+            h[1] += table_sin(40.0 * t) + 0.4;
         });
-        let rz = deg(70.0 + (40.0 * t).cos() * 10.0);
+        let rz = deg(70.0 + table_cos(40.0 * t) * 10.0);
         p.set("right_arm", |a| {
             a[5] = rz;
-            a[1] += (40.0 * t).sin() * 0.5 - 0.5;
+            a[1] += table_sin(40.0 * t) * 0.5 - 0.5;
         });
         p.set("left_arm", |a| {
             a[5] = -rz;
-            a[1] += (40.0 * t).sin() * 0.5 + 0.5;
+            a[1] += table_sin(40.0 * t) * 0.5 + 0.5;
         });
-        p.set("body", |b| b[1] += (40.0 * t).sin() * 0.35);
+        p.set("body", |b| b[1] += table_sin(40.0 * t) * 0.35);
     } else if melee {
         if s.swing == 0.0 {
             p.set(if right { "right_arm" } else { "left_arm" }, |a| a[3] = -1.8);
@@ -7254,22 +7399,22 @@ fn illager(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
         h[4] = s.yaw;
     });
     p.set("right_arm", |a| {
-        a[3] = (pp + PI).cos() * v;
+        a[3] = table_cos(pp + PI) * v;
         a[4] = 0.0;
         a[5] = 0.0;
     });
     p.set("left_arm", |a| {
-        a[3] = pp.cos() * v;
+        a[3] = table_cos(pp) * v;
         a[4] = 0.0;
         a[5] = 0.0;
     });
     p.set("right_leg", |l| {
-        l[3] = pp.cos() * 0.7 * v;
+        l[3] = table_cos(pp) * 0.7 * v;
         l[4] = 0.0;
         l[5] = 0.0;
     });
     p.set("left_leg", |l| {
-        l[3] = (pp + PI).cos() * 0.7 * v;
+        l[3] = table_cos(pp + PI) * 0.7 * v;
         l[4] = 0.0;
         l[5] = 0.0;
     });
@@ -7324,7 +7469,7 @@ fn illager(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
         Arm::CrossbowHold => crossbow_hold(p, s, true),
         Arm::CrossbowCharge => crossbow_charge(p, s, true),
         Arm::Spell => {
-            let x = (s.age * 0.6662).cos() * 0.25;
+            let x = table_cos(s.age * 0.6662) * 0.25;
             p.set("right_arm", |a| {
                 a[0] = -5.0;
                 a[2] = 0.0;
@@ -7352,7 +7497,7 @@ fn illager(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
             });
         }
         Arm::Celebrate => {
-            let x = (s.age * 0.6662).cos() * 0.05;
+            let x = table_cos(s.age * 0.6662) * 0.05;
             p.set("right_arm", |a| {
                 a[0] = -5.0;
                 a[2] = 0.0;
@@ -7378,7 +7523,7 @@ fn vex(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
         h[3] = s.pitch;
         h[4] = s.yaw;
     });
-    let b = deg(s.age * 5.5).cos() * 0.1;
+    let b = table_cos(deg(s.age * 5.5)) * 0.1;
     p.set("right_arm", |a| a[5] = PI / 5.0 + b);
     p.set("left_arm", |a| a[5] = -(PI / 5.0 + b));
     if e.meta_byte(16) & 1 != 0 {
@@ -7406,7 +7551,7 @@ fn vex(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
     } else {
         p.set("body", |x| x[3] = PI / 20.0);
     }
-    let w = 1.099_557_4 + deg(s.age * 45.836_624).cos() * deg(16.2);
+    let w = 1.099_557_4 + table_cos(deg(s.age * 45.836_624)) * deg(16.2);
     p.set("left_wing", |x| {
         x[4] = w;
         x[3] = 0.471_238_88;
@@ -7431,7 +7576,7 @@ fn ravager(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
             n[2] = -6.5 + h;
             n[1] = -7.0;
         });
-        let m = if a > 5.0 { ((a - 4.0) / 4.0).sin() * 0.4 * PI } else { PI / 20.0 * (PI * a / 10.0).sin() };
+        let m = if a > 5.0 { table_sin((a - 4.0) / 4.0) * 0.4 * PI } else { PI / 20.0 * table_sin(PI * a / 10.0) };
         p.set("mouth", |x| x[3] = m);
     } else {
         p.set("neck", |n| {
@@ -7442,11 +7587,12 @@ fn ravager(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
         if st > 0.0 {
             p.set("neck", |n| {
                 n[3] = 0.219_911_49;
-                n[0] = (st / 40.0 * 10.0).sin() * 3.0;
+                // Library sine in double precision here, the stun ticks widened before the division.
+                n[0] = (f64::from(st) / 40.0 * 10.0).sin() as f32 * 3.0;
             });
             p.set("mouth", |x| x[3] = 0.05 * PI);
         } else {
-            let m = if g > 0.0 { PI / 2.0 * (g * PI * 0.25).sin() } else { 0.01 * PI };
+            let m = if g > 0.0 { PI / 2.0 * table_sin(g * PI * 0.25) } else { 0.01 * PI };
             p.set("mouth", |x| x[3] = m);
         }
     }
@@ -7457,18 +7603,18 @@ fn ravager(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     let q = s.walk_pos * 0.6662;
     let l = 0.4 * s.walk_speed;
     for leg in ["right_hind_leg", "left_front_leg"] {
-        p.set(leg, |x| x[3] = q.cos() * l);
+        p.set(leg, |x| x[3] = table_cos(q) * l);
     }
     for leg in ["left_hind_leg", "right_front_leg"] {
-        p.set(leg, |x| x[3] = (q + PI).cos() * l);
+        p.set(leg, |x| x[3] = table_cos(q + PI) * l);
     }
 }
 
 /// Hoglin and zoglin (§ 5): ears, head butt, legs.
 fn hoglin(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
     let (pp, v) = (s.walk_pos, s.walk_speed);
-    p.set("right_ear", |x| x[5] = -2.0 * PI / 9.0 - v * pp.sin());
-    p.set("left_ear", |x| x[5] = 2.0 * PI / 9.0 + v * pp.sin());
+    p.set("right_ear", |x| x[5] = -2.0 * PI / 9.0 - v * table_sin(pp));
+    p.set("left_ear", |x| x[5] = 2.0 * PI / 9.0 + v * table_sin(pp));
     p.set("head", |h| h[4] = s.yaw);
     let r = e.timers[0] as f32;
     let f = 1.0 - (10.0 - 2.0 * r).abs() / 10.0;
@@ -7478,7 +7624,7 @@ fn hoglin(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
             h[1] += f * 2.5;
         }
     });
-    let (a, b) = (pp.cos() * 1.2 * v, (pp + PI).cos() * 1.2 * v);
+    let (a, b) = (table_cos(pp) * 1.2 * v, table_cos(pp + PI) * 1.2 * v);
     p.set("right_front_leg", |x| x[3] = a);
     p.set("left_front_leg", |x| x[3] = b);
     p.set("right_hind_leg", |x| x[3] = b);
@@ -7540,7 +7686,7 @@ fn fangs(p: &mut Pose<'_>, e: &Entity, pt: f32) {
     let m = 1.0 - (2.0 * b).min(1.0).powi(3);
     p.set("upper_jaw", |x| x[5] = PI - 0.35 * PI * m);
     p.set("lower_jaw", |x| x[5] = PI + 0.35 * PI * m);
-    p.set("base", |x| x[1] -= (b + (2.7 * b).sin()) * 7.2);
+    p.set("base", |x| x[1] -= (b + table_sin(2.7 * b)) * 7.2);
     let k = if b > 0.9 { (1.0 - b) / 0.1 } else { 1.0 };
     p.set("root", |x| {
         x[1] = 24.0 - 20.0 * k;
@@ -7862,7 +8008,7 @@ mod tests {
         let ra = p.parts[1];
         assert!(ra[3].abs() < 1e-5 && (ra[4] - PI).abs() < 1e-5, "{ra:?}");
         assert!((ra[5] - (PI - 1.870_796_4 * q(7.0) / q(14.0))).abs() < 1e-5, "{ra:?}");
-        assert!((p.parts[3][3] - 0.3 * (7.0f32 / 3.0).cos()).abs() < 1e-5);
+        assert!((p.parts[3][3] - 0.3 * table_cos(7.0f32 * 0.333_333_34)).abs() < 1e-5);
         assert!((p.parts[0][3] + PI / 4.0).abs() < 1e-5);
     }
 
@@ -8042,6 +8188,96 @@ mod tests {
             x += 0.000_37;
         }
         assert!(worst < 1e-6, "{worst}");
+    }
+
+    /// Floats of magnitude under 2^22 that `round` rounds to another integer than the library.
+    fn rounding_mismatches(round: impl Fn(f32) -> f32 + Sync) -> usize {
+        use rayon::prelude::*;
+        (0..4_194_304.0f32.to_bits())
+            .into_par_iter()
+            .flat_map_iter(|b| [f32::from_bits(b), -f32::from_bits(b)])
+            .filter(|&v| round(v) != v.round())
+            .count()
+    }
+
+    /// Every float quotient under 2^22: the truncation rounds it to the library's integer (a
+    /// zero may lose its sign, which no product or sum of `sin_cos` keeps), so `sin_cos` picks
+    /// the same quadrant and gives the same bits. Sabotage: rounding halves to even (the
+    /// 1.5·2^23 shift) is caught, on the halves `sin_cos` really meets.
+    #[test]
+    fn truncated_quadrant_matches_library_rounding() {
+        assert_eq!(rounding_mismatches(round_half_away_from_zero), 0);
+        let to_even = |v: f32| (v + 12_582_912.0) - 12_582_912.0;
+        assert!(rounding_mismatches(to_even) > 0, "sabotage not detected");
+        assert_eq!(PI / 2.0 * 0.5 * std::f32::consts::FRAC_2_PI, 0.5, "a halved right angle is a half quarter");
+        let mut x = -20.0f32;
+        while x < 20.0 {
+            let (a, b) = (sin_cos_with(x, true), sin_cos_with(x, false));
+            assert_eq!(((a.0 + 0.0).to_bits(), (a.1 + 0.0).to_bits()), ((b.0 + 0.0).to_bits(), (b.1 + 0.0).to_bits()), "{x}");
+            x += 0.000_37;
+        }
+    }
+
+    /// Each declared part name finds its own index (dense, unique): a shifted or repeated id
+    /// would point an animation at another part.
+    #[test]
+    fn known_part_names_find_their_index() {
+        assert!(KNOWN >= 160, "{KNOWN}");
+        for (i, name) in KNOWN_PART_NAMES.iter().enumerate() {
+            assert_eq!(known_id(name), Some(i), "{name}");
+        }
+        assert_eq!(known_id("not_a_part"), None);
+        // A late name found by the table and by the search alike, the first of two equal names.
+        let l = testkit::test_layer(&[("tail", None), ("head", None), ("tail", None), ("segment6", None)]);
+        let widened = Pose::reset(&l, Vec::new(), Vec::new());
+        let searched = Pose { widened_part_names: false, ..Pose::reset(&l, Vec::new(), Vec::new()) };
+        for name in ["tail", "head", "segment6", "jaw"] {
+            assert_eq!(widened.index(name), searched.index(name), "{name}");
+        }
+    }
+
+    /// Walk angles of a cow's legs and a zombie's legs at 20 instants are the game's formulas
+    /// through its sine table, bit for bit; through the C library (the old path) they differ.
+    #[test]
+    fn walk_angles_follow_the_game_sine_table() {
+        let legs4 = testkit::test_layer(&[
+            ("right_hind_leg", None),
+            ("left_hind_leg", None),
+            ("right_front_leg", None),
+            ("left_front_leg", None),
+        ]);
+        let biped = testkit::test_layer(&[("right_leg", None), ("left_leg", None)]);
+        let all = testkit::spawn("zombie");
+        let cos = |x: f32| rc_data::java_math::cos(f64::from(x));
+        let mut library_matches = true;
+        for library in [false, true] {
+            ANIMATION_PATHS.with(|p| p.set(AnimationPaths { sine_table: !library, ..AnimationPaths::NEW }));
+            for step in 0..20 {
+                let mut s = testkit::state(&all.map[&7], 0.0);
+                s.walk_pos = step as f32 * 1.37 + 0.11;
+                s.walk_speed = 0.8;
+                let q = s.walk_pos * 0.6662;
+                let mut cow = Pose::reset(&legs4, Vec::new(), Vec::new());
+                quadruped_legs(&mut cow, &s, false);
+                let (a, b) = (cos(q) * 1.4 * s.walk_speed, cos(q + PI) * 1.4 * s.walk_speed);
+                let mut zombie = Pose::reset(&biped, Vec::new(), Vec::new());
+                humanoid(&mut zombie, &s);
+                let leg = |c: f32| c * 1.4 * s.walk_speed / s.speed;
+                let got = [cow.parts[0][3], cow.parts[1][3], cow.parts[2][3], cow.parts[3][3]]
+                    .into_iter()
+                    .chain([zombie.parts[0][3], zombie.parts[1][3]])
+                    .map(f32::to_bits);
+                let want = [a, b, b, a, leg(cos(q)), leg(cos(q + PI))].map(f32::to_bits);
+                let same = got.eq(want);
+                if library {
+                    library_matches &= same;
+                } else {
+                    assert!(same, "step {step}");
+                }
+            }
+        }
+        ANIMATION_PATHS.with(|p| p.set(AnimationPaths::NEW));
+        assert!(!library_matches, "the library sine gives the table's angles: the test sees nothing");
     }
 
     #[test]
