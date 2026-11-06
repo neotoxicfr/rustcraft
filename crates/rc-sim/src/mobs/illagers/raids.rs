@@ -13,7 +13,6 @@ use super::super::mob::{Ent, Mob};
 use super::super::mth::block_of;
 use super::super::spawn::{Group, Reason};
 use super::super::species::Kind;
-use super::is_raider;
 use crate::nbtio::{self, int};
 use crate::player::Stack;
 use crate::server::Server;
@@ -314,7 +313,7 @@ impl Server {
 
     /// The village proximity test.
     pub(crate) fn close_to_village(&mut self, p: [i32; 3], d: i32) -> bool {
-        d <= 6 && self.sections_to_village(p) <= d
+        d <= 6 && self.within_sections_of_village(p, d)
     }
 
     // ---------- Omens ----------
@@ -493,11 +492,20 @@ impl Server {
         if !active {
             return;
         }
-        if !self.is_village(center) {
+        let was_village = self.is_village(center);
+        if !was_village {
             self.move_raid_center(id);
         }
-        let center = self.raid_ref(id).map_or(center, |r| r.center);
-        if !self.is_village(center) {
+        let moved_to = self.raid_ref(id).map_or(center, |r| r.center);
+        // A centre left in place gives the same answer: nothing it reads changed in between
+        // (`RUSTCRAFT_OPT_VILLAGEBATCH`).
+        let still_village = if self.mobs.poi.paths.village_batch && moved_to == center {
+            crate::poi::note_search_path("raid centre test reused");
+            was_village
+        } else {
+            self.is_village(moved_to)
+        };
+        if !still_village {
             if self.raid_ref(id).is_some_and(|r| r.groups_spawned > 0) {
                 self.raid_mut(id).expect("raid").status = LOSS;
             } else {
@@ -611,12 +619,24 @@ impl Server {
     fn move_raid_center(&mut self, id: i32) {
         let Some(c) = self.raid_ref(id).map(|r| r.center) else { return };
         let s = [c[0] >> 4, c[1] >> 4, c[2] >> 4];
+        // `RUSTCRAFT_OPT_VILLAGEBATCH`: the squares the 125 tests index, in their order (x
+        // slowest, z fastest, each column once), then one collection of the village sections
+        // within ±3 serves every "within one section" test.
+        let villages = self.mobs.poi.paths.village_batch.then(|| {
+            crate::poi::note_search_path("raid centre move batch");
+            self.poi_prepare_village_batch((-2..=2).flat_map(|dx| (-2..=2).map(move |dz| (s[0] + dx, s[2] + dz))));
+            self.mobs.poi.village_sections_in_cube((s[0], s[1], s[2]), 3)
+        });
         let mut best: Option<(i64, [i32; 3])> = None;
         for dx in -2..=2 {
             for dy in -2..=2 {
                 for dz in -2..=2 {
                     let p = [((s[0] + dx) << 4) + 7, ((s[1] + dy) << 4) + 7, ((s[2] + dz) << 4) + 7];
-                    if !self.is_village(p) {
+                    let in_village = match &villages {
+                        Some(v) => crate::poi::village_distance_among(v, (s[0] + dx, s[1] + dy, s[2] + dz)) <= 1,
+                        None => self.is_village(p),
+                    };
+                    if !in_village {
                         continue;
                     }
                     let d: i64 = (0..3).map(|k| i64::from(p[k] - c[k]).pow(2)).sum();
@@ -937,9 +957,9 @@ impl Server {
     /// Living HP / total on the bar.
     pub(crate) fn raid_update_bossbar(&mut self, id: i32) {
         let Some(r) = self.raid_ref(id) else { return };
-        let ids: Vec<i32> = r.raiders.iter().map(|x| x.1).collect();
         let total = r.total_health;
-        let health: f32 = ids.iter().filter_map(|&i| self.mob_ref(i)).map(|o| o.health).sum();
+        // Same order of addition as before (the raid's list): the same f32 sum.
+        let health: f32 = r.raiders.iter().filter_map(|x| self.mob_ref(x.1)).map(|o| o.health).sum();
         self.bar_set_progress(id, (health / total).clamp(0.0, 1.0));
     }
 
@@ -1019,11 +1039,9 @@ impl Server {
         let area = rc_physics::Aabb { min: b.min.map(|v| v - 16.0), max: b.max.map(|v| v + 16.0) };
         let ids: Vec<i32> = self
             .mobs
-            .list
-            .iter()
+            .of_kinds(super::RAIDER_KINDS)
             .filter(|o| {
-                is_raider(o.kind)
-                    && o.touches(&area)
+                o.touches(&area)
                     && !o.ill.raid.is_some_and(|r| self.raid_is_active(r))
                     && o.alive()
                     && o.ill.can_join_raid
@@ -1070,16 +1088,22 @@ impl Server {
     }
 
     /// Start condition of the "retrieve the raid leader's banner" goal: ominous banner on the ground, reachable.
-    pub(crate) fn banner_can_use(&mut self, m: &mut Mob, item: &mut Option<i32>, store: &mut Vec<(i32, i64)>) -> bool {
+    pub(crate) fn banner_can_use(
+        &mut self,
+        m: &mut Mob,
+        item: &mut Option<i32>,
+        retry_until: &mut Vec<(i32, i64)>,
+    ) -> bool {
         if self.cannot_pick_up_banner(m) {
             return false;
         }
-        let f = m.follow_range();
-        let b = m.bbox();
+        let range = m.follow_range();
+        let bbox = m.bbox();
         let area = rc_physics::Aabb {
-            min: [b.min[0] - f, b.min[1] - 8.0, b.min[2] - f],
-            max: [b.max[0] + f, b.max[1] + 8.0, b.max[2] + f],
+            min: [bbox.min[0] - range, bbox.min[1] - 8.0, bbox.min[2] - range],
+            max: [bbox.max[0] + range, bbox.max[1] + 8.0, bbox.max[2] + range],
         };
+        // The box first: the banner test compares components, the box only six numbers.
         let banners: Vec<(i32, [f64; 3])> = self
             .life
             .drops
@@ -1087,32 +1111,32 @@ impl Server {
             .filter(|d| {
                 !d.is_removed()
                     && d.pickup_delay <= 0
-                    && super::is_ominous_banner(&d.stack)
                     && d.pos[0] >= area.min[0]
                     && d.pos[0] <= area.max[0]
                     && d.pos[1] >= area.min[1]
                     && d.pos[1] <= area.max[1]
                     && d.pos[2] >= area.min[2]
                     && d.pos[2] <= area.max[2]
+                    && super::is_ominous_banner(&d.stack)
             })
             .map(|d| (d.id, d.pos))
             .collect();
         let now = self.time;
-        let mut cache: Vec<(i32, i64)> = Vec::new();
-        for (bid, bp) in banners {
-            let until = store.iter().find(|c| c.0 == bid).map_or(i64::MIN, |c| c.1);
+        let mut kept: Vec<(i32, i64)> = Vec::new();
+        for (banner_id, banner_pos) in banners {
+            let until = retry_until.iter().find(|c| c.0 == banner_id).map_or(i64::MIN, |c| c.1);
             if now < until {
-                cache.push((bid, until));
+                kept.push((banner_id, until));
                 continue;
             }
-            let path = self.create_path(m, block_of(bp), 1);
+            let path = self.create_path(m, block_of(banner_pos), 1);
             if path.as_ref().is_some_and(|p| p.reached) {
-                *item = Some(bid);
+                *item = Some(banner_id);
                 return true;
             }
-            cache.push((bid, now + 600));
+            kept.push((banner_id, now + 600));
         }
-        *store = cache;
+        *retry_until = kept;
         false
     }
 

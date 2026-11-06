@@ -15,13 +15,24 @@ pub fn post_ai_step(s: &mut Server, m: &mut Mob) {
     if !s.rule("minecraft:mob_griefing", true) {
         return;
     }
-    let snow = s.default_state("minecraft:snow");
+    // `RUSTCRAFT_OPT_SNOWSTATELAZY`: the snow state is read from the block table, and only for a
+    // cell that is air (a golem standing still has snow under it at every corner), instead of
+    // a walk over all blocks by name every tick.
+    let lazy = crate::poi::new_search_path(rc_data::opt_switch!("RUSTCRAFT_OPT_SNOWSTATELAZY"));
+    let snow_by_name = (!lazy).then(|| s.default_state("minecraft:snow"));
     for i in 0..4 {
         let xx = (m.pos()[0] + f64::from((i % 2 * 2 - 1) as f32 * 0.25)).floor() as i32;
         let yy = m.pos()[1].floor() as i32;
         let zz = (m.pos()[2] + f64::from((i / 2 % 2 * 2 - 1) as f32 * 0.25)).floor() as i32;
         let p = [xx, yy, zz];
-        if s.is_air(p) && s.can_survive(snow, p) {
+        if !s.is_air(p) {
+            continue;
+        }
+        let snow = snow_by_name.unwrap_or_else(|| {
+            crate::poi::note_search_path("snow state from the block table");
+            s.view().default_state(s.bs.t.id.snow)
+        });
+        if s.can_survive(snow, p) {
             s.set_block(p, snow, 3);
             s.game_event_block("minecraft:block_place", p, Some(super::super::mob::Ent::Mob(m.id)), Some(snow));
         }

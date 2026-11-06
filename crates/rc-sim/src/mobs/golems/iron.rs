@@ -192,6 +192,20 @@ impl Server {
         self.sections_to_village([section[0] * 16, section[1] * 16, section[2] * 16])
     }
 
+    /// `section_closest_to_village(center, radius)` with one collection of the village sections
+    /// of the cube ±(radius + 6) instead of one ±6 search per section: 17³ reads instead of up to
+    /// 126 × 13³ for radius 2 (`RUSTCRAFT_OPT_VILLAGEBATCH`).
+    pub(crate) fn section_closest_to_village_batched(&mut self, center: [i32; 3], radius: i32) -> [i32; 3] {
+        crate::poi::note_search_path("closest village section batch");
+        // The chunks those calls index, in their order: the centre's square, then one square
+        // per column of the cube (rows of z, x fastest; the y levels repeat the same square).
+        let around = (-radius..=radius).flat_map(|z| (-radius..=radius).map(move |x| (center[0] + x, center[2] + z)));
+        self.poi_prepare_village_batch(std::iter::once((center[0], center[2])).chain(around));
+        let key = (center[0], center[1], center[2]);
+        let villages = self.mobs.poi.village_sections_in_cube(key, radius + 6);
+        closest_section(center, radius, |s| crate::poi::village_distance_among(&villages, (s[0], s[1], s[2])))
+    }
+
     /// Does a villager want a golem: slept less than a day ago, no golem seen recently
     /// (memories of the F05 brain).
     pub(crate) fn villager_wants_golem(&self, villager: &Mob) -> bool {
@@ -226,14 +240,18 @@ impl Server {
                 let b = m.block_pos();
                 let sec = [b[0] >> 4, b[1] >> 4, b[2] >> 4];
                 // "In the village": within one section at most.
-                if self.section_to_village(sec) <= 1 {
+                if self.within_sections_of_village(b, 1) {
                     return false;
                 }
                 // The random stroll objective (interval 10, no idle delay).
                 if m.rng.next_int_bound(super::super::mth::reduced(10)) != 0 {
                     return false;
                 }
-                let best = self.section_closest_to_village(sec, 2);
+                let best = if self.mobs.poi.paths.village_batch {
+                    self.section_closest_to_village_batched(sec, 2)
+                } else {
+                    self.section_closest_to_village(sec, 2)
+                };
                 if best == sec {
                     return false;
                 }
@@ -281,15 +299,12 @@ impl Server {
                 let player_near =
                     self.player_feet_in(&area) && self.targeting_ok(m, Ent::Player, true, 64.0, true, true);
                 if player_near {
-                    let villagers: Vec<(i32, i32)> = self
-                        .mobs
-                        .list
-                        .iter()
-                        .filter(|o| o.kind == Kind::Villager && o.touches(&area))
-                        .map(|o| (o.id, self.villager_reputation(o)))
-                        .collect();
-                    for (id, rep) in villagers {
-                        if rep <= -100 && self.targeting_ok(m, Ent::Mob(id), true, 64.0, true, true) {
+                    // Villagers only, through the per-species index; the checks read the server
+                    // without changing it, so they run during the walk (no list collected).
+                    for o in self.mobs.of_kind(Kind::Villager).filter(|o| o.touches(&area)) {
+                        if self.villager_reputation(o) <= -100
+                            && self.targeting_ok(m, Ent::Mob(o.id), true, 64.0, true, true)
+                        {
                             *potential = Some(Ent::Player);
                         }
                     }
@@ -381,22 +396,15 @@ impl Server {
             min: [bb.min[0] - 6.0, bb.min[1] - 2.0, bb.min[2] - 6.0],
             max: [bb.max[0] + 6.0, bb.max[1] + 2.0, bb.max[2] + 6.0],
         };
-        let cands: Vec<(i32, [f64; 3])> = self
-            .mobs
-            .list
-            .iter()
-            .filter(|o| (o.kind == Kind::Villager || o.kind == Kind::CopperGolem) && o.touches(&area))
-            .map(|o| (o.id, o.pos()))
-            .collect();
         let mut best: Option<(f64, Ent)> = None;
-        for (id, p) in cands {
+        for o in self.mobs.of_kinds([Kind::Villager, Kind::CopperGolem]).filter(|o| o.touches(&area)) {
             // Non-combat conditions at 6 blocks, line of sight included.
-            if !self.targeting_ok(m, Ent::Mob(id), false, 6.0, true, true) {
+            if !self.targeting_ok(m, Ent::Mob(o.id), false, 6.0, true, true) {
                 continue;
             }
-            let d = dist2(m.pos(), p);
+            let d = dist2(m.pos(), o.pos());
             if best.is_none_or(|b| d < b.0) {
-                best = Some((d, Ent::Mob(id)));
+                best = Some((d, Ent::Mob(o.id)));
             }
         }
         best.map(|b| b.1)
@@ -432,9 +440,8 @@ impl Server {
         };
         let wants: Vec<[f64; 3]> = self
             .mobs
-            .list
-            .iter()
-            .filter(|o| o.kind == Kind::Villager && o.touches(&area) && self.villager_wants_golem(o))
+            .of_kind(Kind::Villager)
+            .filter(|o| o.touches(&area) && self.villager_wants_golem(o))
             .map(|o| o.pos())
             .collect();
         if wants.is_empty() {
@@ -448,13 +455,25 @@ impl Server {
     fn golem_towards_poi(&mut self, m: &mut Mob) -> Option<[f64; 3]> {
         let b = m.block_pos();
         let c = [b[0] >> 4, b[1] >> 4, b[2] >> 4];
+        let batch = self.mobs.poi.paths.village_batch;
+        if batch {
+            crate::poi::note_search_path("golem village sections batch");
+            // Distance 0 is the section itself: index the squares the 125 tests would (same
+            // order, each column once), then read each section alone.
+            self.poi_prepare_village_batch((-2..=2).flat_map(|z| (-2..=2).map(move |x| (c[0] + x, c[2] + z))));
+        }
         let mut secs = Vec::new();
         // Traversal order of a cube of sections: x fastest, then y, then z.
         for z in -2..=2 {
             for y in -2..=2 {
                 for x in -2..=2 {
                     let s = [c[0] + x, c[1] + y, c[2] + z];
-                    if self.section_to_village(s) == 0 {
+                    let in_village = if batch {
+                        self.mobs.poi.section_has_occupied_village((s[0], s[1], s[2]))
+                    } else {
+                        self.section_to_village(s) == 0
+                    };
+                    if in_village {
                         secs.push(s);
                     }
                 }
