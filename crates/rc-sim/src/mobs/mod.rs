@@ -62,6 +62,8 @@ mod tests;
 #[cfg(test)]
 mod tests_f01;
 #[cfg(test)]
+mod tests_steady_synced_data;
+#[cfg(test)]
 mod tests_index;
 #[cfg(test)]
 mod tests_index_world;

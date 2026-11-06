@@ -251,10 +251,7 @@ pub fn define_data(m: &mut Mob) {
 }
 
 pub fn sync_data(m: &mut Mob) {
-    // Shared flags (ocelot sprint included) and no gravity: common tick. Crouching posture.
-    if !m.dead {
-        m.set(6, Meta::Pose(if m.surf.crouching { 5 } else { 0 }));
-    }
+    // Shared flags (ocelot sprint included), no gravity and crouching pose: common values.
     if m.kind == Kind::Bat {
         m.set(16, Meta::Byte(m.surf.bat_flags));
         return;

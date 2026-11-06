@@ -5660,3 +5660,24 @@ profile, machine loaded by other agents compiling, best of 5 or 7; three runs, t
   decorations, noise floors), `crowd-1000`, `tnt`, `dropped-items` (collision walks); memstats at
   world opening (−1 MB of heap expected).
 
+## C6-F01: steady mobs no longer resend metadata and moves every tick (06/11, fidelity fix)
+
+No switch (fidelity fix, prerequisite of C6-M07: its reference fingerprint is taken after this
+commit). The base mob sync wrote the shared flags (index 0), no gravity (5) and the pose (6), then
+some families rewrote them: the value flipped twice per tick and stayed marked changed, so the
+tracker sent a metadata packet every tick, and changed metadata forces its tracking pass, so
+position, rotation and velocity were checked and sent every tick instead of every 3. Cases: swimming
+drowned, sleeping villager and wandering trader, sitting camel, crouching ocelot, vex after its first
+tick. The final values are now computed once (`synced_shared_flags`, `synced_no_gravity`,
+`synced_pose`); the families no longer touch those slots, and four rewrites with the same value are
+gone. One deliberate change: a villager that dies sleeping shows the dying pose, as in the game.
+
+Deterministic packet count (`tests_steady_synced_data`, tracker on the test world, one mob of each
+case moving 0.01 block per tick): before, 1 metadata + 1 move packet per tick; after, no metadata
+and 1 move every 3 ticks. A static mob of these cases: 1 metadata packet per tick before, none
+after. With the old code restored the tests list 7 of the 8 cases (the cat, already right, is the
+control). CPU: less work per tick for these mobs (no metadata clone, no tracking pass on two ticks
+out of three), not measured (loaded machine); scenes where it shows: `village-night` (sleeping
+villagers), `crowd-villagers`, `raid` (vexes), `crowd-1000-lan-1` (packets to a LAN guest).
+Other axes not concerned.
+
