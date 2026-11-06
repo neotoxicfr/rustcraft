@@ -74,8 +74,8 @@ pub fn allocated_bytes(f: impl FnOnce()) -> u64 {
     after - before
 }
 
-/// Global allocator: mimalloc, plus the optional byte counter and allocation tracer.
-#[cfg_attr(feature = "memstats", allow(dead_code))]
+/// Global allocator: mimalloc, plus the optional byte counter and allocation tracer (wrapped by
+/// the live-bytes counter of `memstats.rs` in that build).
 pub struct CountingAllocator;
 
 // SAFETY: every call goes to mimalloc with the caller's layout (see `mimalloc_alloc`).
@@ -182,7 +182,7 @@ fn plain_call_aligns(size: usize, align: usize) -> bool {
 /// # Safety
 /// Same contract as [`GlobalAlloc::alloc`].
 #[inline]
-pub(crate) unsafe fn mimalloc_alloc(layout: Layout, zeroed: bool) -> *mut u8 {
+unsafe fn mimalloc_alloc(layout: Layout, zeroed: bool) -> *mut u8 {
     let (size, align) = (layout.size(), layout.align());
     // SAFETY: mimalloc takes any size; the aligned entry points any power-of-two alignment,
     // which `Layout` guarantees.
@@ -203,7 +203,7 @@ pub(crate) unsafe fn mimalloc_alloc(layout: Layout, zeroed: bool) -> *mut u8 {
 /// # Safety
 /// Same contract as [`GlobalAlloc::realloc`].
 #[inline]
-pub(crate) unsafe fn mimalloc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+unsafe fn mimalloc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
     // SAFETY: `ptr` comes from mimalloc; the alignment is a power of two (`Layout`).
     let block = unsafe {
         if plain_call_aligns(new_size, layout.align()) {

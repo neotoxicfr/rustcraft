@@ -5682,7 +5682,8 @@ loaded by other agents compiling.
 - One flag byte (`RUSTCRAFT_OPT_ALLOCATOR_SINGLE_FLAG`, default 1): counting (`memory` entry),
   tracing and the two old-path switches in one `AtomicU8`; all clear = one load, one branch, the
   direct call; anything set goes to a `#[cold]` out-of-line function. The old aligned path is kept
-  inline (its A/B stays fair). `=0` re-reads counting and tracing separately in the cold function:
+  inline (its A/B stays fair). The memstats build wraps this same allocator (switches and tracer
+  included). `=0` re-reads counting and tracing separately in the cold function:
   it pays one call more than the true old code, so the micro-bench also runs the old allocator as it
   was (`TwoFlagAllocator`).
 
@@ -5709,7 +5710,16 @@ loaded by other agents compiling.
   `crates/rc-worldgen/tests/sampler_opt.rs` (another crate's test; to point at the same guard).
 - mimalloc v2 against v3 (feature `mimalloc-v2`, two executables of the same commit): v2 has no
   on-demand page commit (the startup line says so); `mi_stats_t` layout picked by the linked version
-  (v2: version 4, 4,168 bytes). V2_ARM_FIGURES
+  (v2: version 4, 4,168 bytes, confirmed by the committed-memory test). rc-app suite: v3 803
+  passed; v2 802 passed, the 803rd expected v3's padding and now expects per version (rerun
+  passes). v2's aligned calls do not pad
+  small alignments (block bytes equal in both sweeps): the padding is v3's alone. Micro-bench
+  (same table, v2 executable): 8 B 4.36 / 5.88 / 9.31 ns (1, 4, 32 threads), against v3's 3.81 /
+  5.53 / 7.78; 1,536 B 14.70 (1 thread) and 30.53 (32 threads), against v3's 17.55 and 110.1: v3
+  scales badly when many threads each empty and refill pages of mid-size blocks (each thread frees
+  only its own blocks here; cause not established, possibly emptied pages going back to the shared
+  arena every round). Decision on the scene bench, private memory first (v2 loses the
+  on-demand commit: −735 MB when paused was gained with v3).
 - Low settings, nothing thrown away: `RUSTCRAFT_OPT_MI_PURGE_LONG=1` (default OFF: it can only trade
   memory for processor time) sets the purge delay to 10 s instead of v3's 1 s (`MIMALLOC_PURGE_DELAY`
   set by the user wins); the arena multiplier (1 in v3, the header comment saying 10 is stale) is

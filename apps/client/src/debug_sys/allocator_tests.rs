@@ -158,7 +158,7 @@ fn block_bytes(layouts: impl Iterator<Item = Layout>) -> (usize, usize, usize) {
 /// The aligned call pads by `align - 1` bytes, so a size that sits exactly on a size-class bound
 /// (classes go by quarters: 1,280, 1,536, 1,792, 2,048…) moves up one class. That is what a
 /// `Vec` that doubles does for every element size that is not a power of two (12-byte elements:
-/// 1,536 bytes at 128). Sweeps: every multiple of 8 from 1 KiB to 64 KiB (align 8), and the
+/// 1,536 bytes at 128; mimalloc v3 only). Sweeps: every multiple of 8 from 1 KiB to 64 KiB (align 8), and the
 /// doubling capacities of elements of 1 to 64 bytes (alignment: largest power of two dividing
 /// the size, at most 8).
 #[test]
@@ -187,7 +187,8 @@ fn direct_calls_take_no_bigger_blocks_above_one_kib() {
         let layout = Layout::from_size_align(1536, 4).unwrap();
         (block_size(layout, direct_alloc), block_size(layout, aligned_alloc))
     };
-    assert_eq!(twelve_byte_elements, (1536, 1792));
+    // mimalloc v2 serves small alignments from the plain size class: only v3 pads.
+    assert_eq!(twelve_byte_elements, (1536, if MIMALLOC_V3 { 1792 } else { 1536 }));
 }
 
 /// Bytes the fixed script allocates: 1,000 then 2,000 more by growth, then 40.
@@ -320,7 +321,9 @@ fn allocator_micro_bench() {
         ALLOCATOR_FLAGS.store(0, Ordering::Relaxed);
         ns
     };
-    let variants: [(&str, &dyn Fn(Layout, usize) -> f64); 7] = [
+    /// Name of an allocator path and its timing for (layout, threads).
+    type Variant<'a> = (&'a str, &'a dyn Fn(Layout, usize) -> f64);
+    let variants: [Variant; 7] = [
         ("new", &|l, t| with_flags(0, l, t)),
         ("aligned calls", &|l, t| with_flags(ALIGNED_CALLS, l, t)),
         ("separate checks", &|l, t| with_flags(SEPARATE_CHECKS, l, t)),
