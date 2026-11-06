@@ -38,21 +38,38 @@ def minimal_pe(sections):
 class Variants(unittest.TestCase):
     def test_every_variant_is_the_shipped_build_plus_its_own_settings(self):
         for variant, settings in build_matrix.VARIANTS.items():
-            command = build_matrix.cargo_command(["cargo"], "build", variant, "T")
+            command = build_matrix.cargo_command(["cargo"], "build", variant, "T", "H.toml")
             self.assertEqual(command[:8], ["cargo", "build", "--locked", "--profile", "dist", "--target-dir", "T", "-p"], variant)
             self.assertEqual(command[8], "rc-app", variant)
-            self.assertEqual(config_entries(command), settings, variant)
+            self.assertEqual(config_entries(command), ["H.toml", *settings], variant)
             self.assertIn("--timings", command, variant)
 
     def test_tests_cover_the_whole_workspace_with_the_same_settings(self):
-        command = build_matrix.cargo_command(["cargo"], "test", "fat-lto", "T", ["--", "--ignored"])
+        command = build_matrix.cargo_command(["cargo"], "test", "fat-lto", "T", "H.toml", ["--", "--ignored"])
         self.assertEqual(command[:7], ["cargo", "test", "--locked", "--profile", "dist", "--target-dir", "T"])
         self.assertIn("--workspace", command)
         self.assertNotIn("-p", command)
-        self.assertEqual(config_entries(command), ['profile.dist.lto="fat"'])
+        self.assertEqual(config_entries(command), ["H.toml", 'profile.dist.lto="fat"'])
         self.assertEqual(command[-2:], ["--", "--ignored"])
-        bench = build_matrix.cargo_command(["cargo"], "test", "shipped", "T", ["bench_ticks"], ["rc-sim"])
-        self.assertEqual(bench[7:], ["-p", "rc-sim", "--no-fail-fast", "bench_ticks"])
+        bench = build_matrix.cargo_command(["cargo"], "test", "shipped", "T", "H.toml", ["bench_ticks"], ["rc-sim"])
+        self.assertEqual(bench[7:], ["-p", "rc-sim", "--no-fail-fast", "--config", "H.toml", "bench_ticks"])
+
+    def test_every_variant_builds_in_the_same_folder_with_the_release_path_config(self):
+        # A folder named after the variant would change the length of the paths written into the
+        # executable, so its layout: the variants would differ by more than their settings.
+        with tempfile.TemporaryDirectory() as out:
+            args = mock.Mock(cargo=["cargo"], out=out, variant=None, dry_run=True)
+            with mock.patch("builtins.print") as printed:
+                build_matrix.build(args)
+            commands = [call.args[-1].split() for call in printed.call_args_list]
+            self.assertEqual(len(commands), len(build_matrix.VARIANTS))
+            target_dirs = {c[c.index("--target-dir") + 1] for c in commands}
+            self.assertEqual(target_dirs, {os.path.join(out, "target")})
+            hide_paths_config = os.path.join(out, "hide-paths.toml")
+            with open(hide_paths_config, encoding="utf-8") as f:
+                self.assertIn("--remap-path-prefix=", f.read())
+            for c in commands:
+                self.assertEqual(config_entries(c)[0], hide_paths_config)
 
     def test_settings_are_valid_cargo_config(self):
         for variant, settings in build_matrix.VARIANTS.items():
@@ -107,6 +124,35 @@ class Environment(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PATH": os.environ.get("PATH", "")}, clear=True):
             with self.assertRaises(SystemExit):
                 build_matrix.test(args)
+
+    def test_tests_refuse_a_panic_abort_variant(self):
+        # cargo test builds every test target and its dependencies with unwinding: the figure
+        # would be the one of the same variant without panic = "abort".
+        self.assertEqual(build_matrix.panic_abort_settings("fat-lto"), [])
+        with tempfile.TemporaryDirectory() as out:
+            args = mock.Mock(cargo=["cargo"], variant="fat-lto-panic-abort", out=out, rest=[], package=None, dry_run=True)
+            with mock.patch.dict(os.environ, {"RUSTCRAFT_SOLO_WORLD": "w"}):
+                with self.assertRaises(SystemExit) as refused:
+                    build_matrix.test(args)
+                self.assertIn("panic", str(refused.exception.code))
+                args.variant = "fat-lto"
+                with mock.patch("builtins.print"):
+                    build_matrix.test(args)  # dry run: no refusal
+
+    def test_cargo_keeps_its_temporary_files_in_the_output_folder(self):
+        # The tests copy their worlds under the system temporary folder: with the shell's TMP they
+        # would land on the system drive.
+        shell = {"TMP": r"C:\Users\x\AppData\Local\Temp", "TEMP": r"C:\Users\x\AppData\Local\Temp", "PATH": "p"}
+        with tempfile.TemporaryDirectory() as out:
+            env = build_matrix.cargo_environment(shell, out, "1700000000")
+            tmp = os.path.join(out, "tmp")
+            self.assertTrue(os.path.isdir(tmp))
+            self.assertEqual((env["TMP"], env["TEMP"], env["TMPDIR"]), (tmp, tmp, tmp))
+            self.assertEqual(env["RUSTCRAFT_LAN_BIND"], "127.0.0.1")
+            self.assertEqual(env["SOURCE_DATE_EPOCH"], "1700000000")
+            self.assertEqual(env["PATH"], "p")
+            chosen = build_matrix.cargo_environment({"RUSTCRAFT_LAN_BIND": "10.0.0.2"}, out, "0")
+            self.assertEqual(chosen["RUSTCRAFT_LAN_BIND"], "10.0.0.2")
 
 
 class Measures(unittest.TestCase):

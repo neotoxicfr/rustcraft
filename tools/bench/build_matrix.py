@@ -9,9 +9,18 @@ linker, `panic = "abort"`. Quiet machine only: the build time and the memory pea
 
 Tick micro-bench of a variant, built like the shipped executable (protocol B11):
 `test target/matrix --variant fat-lto --package rc-sim -- bench_ticks -- --ignored --nocapture`.
+`panic = "abort"` cannot be measured that way: cargo builds every test target and all its
+dependencies with unwinding, whatever the profile says, so `test` refuses such a variant; that
+lead is measured on the executable only (scenes).
 
-`build` makes a clean `cargo build --profile dist -p rc-app` per variant in `<out>/<variant>/target`,
-copies the executable, its PDB and cargo's timing page to `<out>/exes/`, and records the build
+Run it with cargo itself, not through another wrapper: it sets what a run needs (temporary
+folder `<out>/tmp`, so the copies of the test worlds never land on the system drive; the LAN
+server of the tests bound to 127.0.0.1; `SOURCE_DATE_EPOCH` from the commit; the path-hiding
+config of the release, `<out>/hide-paths.toml`).
+
+`build` makes a clean `cargo build --profile dist -p rc-app` per variant, all in the same folder
+`<out>/target` (emptied before each build, so that the paths written into the executable are the
+same for every variant), copies the executable, its PDB and cargo's timing page to `<out>/exes/`, and records the build
 time, the memory peak of the build processes, the size of `.text` and the sha256 in
 `<out>/matrix.json`. `test` runs the whole test suite built with the same settings (equivalence:
 every stored fingerprint must still match); run it twice, the second time with
@@ -20,7 +29,8 @@ every stored fingerprint must still match); run it twice, the second time with
 
 The variant settings are passed as `--config`, and the profile variables of the trial build
 (`CARGO_PROFILE_*`, `RUSTFLAGS`, a linker or target folder from the environment) are removed
-from cargo's environment: every variant differs from the shipped profile by its own settings only.
+from cargo's environment: the variants differ from one another by their settings only. They are
+not byte-identical to the published file, whose target folder is `target/dist`.
 """
 import argparse
 import hashlib
@@ -35,6 +45,7 @@ import threading
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+HIDE_PATHS = os.path.join(ROOT, "tools", "release", "hide_paths.py")
 PACKAGE = "rc-app"
 PROGRAM = "rustcraft"
 
@@ -85,7 +96,27 @@ def build_environment(environ):
     return {k: v for k, v in environ.items() if not FOREIGN_BUILD_SETTINGS.match(k.upper())}
 
 
-def cargo_command(cargo, subcommand, variant, target_dir, extra=(), packages=()):
+def cargo_environment(environ, out, source_date_epoch):
+    """The environment of every cargo run of the matrix: the trial profile removed, and what the
+    tests need to stay on this machine and in the output folder."""
+    env = build_environment(environ)
+    # The tests copy their worlds under the system temporary folder: keep those copies here,
+    # never on the system drive.
+    tmp = os.path.abspath(os.path.join(out, "tmp"))
+    os.makedirs(tmp, exist_ok=True)
+    env["TMP"] = env["TEMP"] = env["TMPDIR"] = tmp
+    # The LAN server of the tests listens on this machine only: no firewall prompt per test program.
+    env.setdefault("RUSTCRAFT_LAN_BIND", "127.0.0.1")
+    # Like the release workflows: the C code of the dependencies writes this date, not the clock.
+    env["SOURCE_DATE_EPOCH"] = source_date_epoch
+    return env
+
+
+def panic_abort_settings(variant):
+    return [entry for entry in VARIANTS[variant] if re.search(r'panic\s*=\s*"abort"', entry)]
+
+
+def cargo_command(cargo, subcommand, variant, target_dir, hide_paths_config, extra=(), packages=()):
     """`build`: the executable. `test`: the given packages, or the whole workspace."""
     command = [*cargo, subcommand, "--locked", "--profile", "dist", "--target-dir", target_dir]
     if subcommand == "build":
@@ -93,6 +124,7 @@ def cargo_command(cargo, subcommand, variant, target_dir, extra=(), packages=())
     else:
         command += [arg for p in packages for arg in ("-p", p)] or ["--workspace"]
         command.append("--no-fail-fast")
+    command += ["--config", hide_paths_config]
     for entry in VARIANTS[variant]:
         command += ["--config", entry]
     if subcommand == "build":
@@ -180,10 +212,12 @@ def sha256(path):
     return digest.hexdigest()
 
 
+def git(*args):
+    return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True).stdout.strip()
+
+
 def commit():
-    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
-    dirty = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
-    return head + ("-dirty" if dirty else "")
+    return git("rev-parse", "HEAD") + ("-dirty" if git("status", "--porcelain") else "")
 
 
 def keep_outputs(target_dir, exes_dir, variant):
@@ -213,15 +247,25 @@ def record(out, variant, entry):
         json.dump(results, f, indent=1, sort_keys=True)
 
 
-def target_dir_of(out, variant):
-    return os.path.abspath(os.path.join(out, variant, "target"))
+def target_dir_of(out):
+    # One folder for every variant: a folder named after the variant would change the length of
+    # the paths written into the executable (build-script outputs), and so its layout.
+    return os.path.abspath(os.path.join(out, "target"))
+
+
+def prepare_output(out):
+    """Environment and path-hiding config shared by every cargo run of the matrix."""
+    os.makedirs(out, exist_ok=True)
+    hide_paths_config = os.path.abspath(os.path.join(out, "hide-paths.toml"))
+    subprocess.run([sys.executable, "-I", HIDE_PATHS, "config", hide_paths_config], check=True)
+    return cargo_environment(os.environ, out, git("log", "-1", "--format=%ct")), hide_paths_config
 
 
 def build(args):
-    env = build_environment(os.environ)
+    env, hide_paths_config = prepare_output(args.out)
+    target_dir = target_dir_of(args.out)
     for variant in args.variant or list(VARIANTS):
-        target_dir = target_dir_of(args.out, variant)
-        command = cargo_command(args.cargo, "build", variant, target_dir)
+        command = cargo_command(args.cargo, "build", variant, target_dir, hide_paths_config)
         print("[matrix]", variant, ":", subprocess.list2cmdline(command), flush=True)
         if args.dry_run:
             continue
@@ -241,12 +285,17 @@ def build(args):
 
 
 def test(args):
-    env = build_environment(os.environ)
-    if not env.get("RUSTCRAFT_SOLO_WORLD"):
+    if not os.environ.get("RUSTCRAFT_SOLO_WORLD"):
         # Without it the tests on the test world stop at once and pass: nothing would be proven.
         sys.exit("[matrix] set RUSTCRAFT_SOLO_WORLD to the pristine test world first")
-    target_dir = target_dir_of(args.out, args.variant)
-    command = cargo_command(args.cargo, "test", args.variant, target_dir, args.rest, args.package or ())
+    if panic_abort_settings(args.variant):
+        # Cargo builds test targets and all their dependencies with unwinding whatever the profile
+        # says: the figure would be the one of the same variant without `panic = "abort"`.
+        sys.exit(f"[matrix] {args.variant}: panic = \"abort\" is ignored by cargo test; "
+                 "measure it on the executable (scenes)")
+    env, hide_paths_config = prepare_output(args.out)
+    command = cargo_command(args.cargo, "test", args.variant, target_dir_of(args.out), hide_paths_config,
+                            args.rest, args.package or ())
     print("[matrix]", subprocess.list2cmdline(command), flush=True)
     if not args.dry_run:
         sys.exit(subprocess.run(command, cwd=ROOT, env=env).returncode)

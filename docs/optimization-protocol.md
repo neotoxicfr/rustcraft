@@ -67,11 +67,14 @@ on): the final `bool` is cached, never `env_flag!` (presence only) nor a value c
   whose keys no outsider controls, cold/inline hints on measured paths. CPU-specific code only
   behind runtime detection: the release runs on any x86-64. Measurement rule (06/11): every
   build or micro-bench of a toolchain lead (LTO, codegen units, opt-level, linker, panic strategy,
-  PGO) is built with the settings of the shipped executable: `--profile dist` with
-  `RUSTCRAFT_FULL_RELEASE=1` in `cargo-file.ps1` (`cargo test --profile dist` for a micro-bench),
-  the lead's own setting passed as `--config profile.dist.<key>=<value>`; never with the trial
-  profile: without LTO and with 16 codegen units it measures a program nobody ships.
-  `tools/bench/build_matrix.py` builds the variants of one commit that way. Two builds with the
+  PGO) is built with the settings of the shipped executable: built by
+  `tools/bench/build_matrix.py`, or by `cargo --profile dist` with no `CARGO_PROFILE_*`,
+  `RUSTFLAGS` or linker variable in the environment (`cargo test --profile dist` for a
+  micro-bench), the lead's own setting passed as `--config profile.dist.<key>=<value>`; never
+  with a quicker local profile: without LTO and with 16 codegen units it measures a program
+  nobody ships. `panic = "abort"` is the exception: cargo builds test targets and all their
+  dependencies with unwinding whatever the profile says, so that lead is measured on the
+  executable only (scenes), never by `cargo test`. Two builds with the
   same settings are byte-identical (reproducible build), so their distance is run noise only; the
   code-layout noise (about 1 to 2 %) is the distance to the `shipped-layout-salt` variant (same
   code, other order and addresses), and a toolchain lead is concluded only beyond it.

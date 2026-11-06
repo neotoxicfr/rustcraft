@@ -5690,14 +5690,25 @@ proves them, measures what a loaded machine can show, and leaves every decision 
   `clippy --release -p rc-app --all-targets -D warnings`: clean.
 - Build matrix: `tools/bench/build_matrix.py` (`list`, `build <out> [--variant ...]`,
   `test <out> --variant V [--package P] [-- args]`). Each variant is
-  `cargo build --locked --profile dist -p rc-app --timings` in its own target folder with its
-  settings as `--config`; the environment of the trial profile (`CARGO_PROFILE_*`, `RUSTFLAGS`, a
-  linker, target folder, job count or compiler wrapper) is removed from cargo's environment, so a
-  variant differs from the shipped build by its own setting only. It records the clean build time,
+  `cargo build --locked --profile dist -p rc-app --timings` with its settings as `--config`, all in
+  one target folder `<out>/target` emptied before each build (a folder named after the variant
+  would change the length of the paths written into the executable, and so its layout), with the
+  path-hiding config of the release (`hide_paths.py config`, `<out>/hide-paths.toml`) and
+  `SOURCE_DATE_EPOCH` from the commit. The environment of the trial profile (`CARGO_PROFILE_*`,
+  `RUSTFLAGS`, a linker, target folder, job count or compiler wrapper) is removed from cargo's
+  environment, so the variants differ from one another by their settings only (not byte-identical
+  to the published file, whose target folder is `target/dist`). The tool is run with cargo itself:
+  it sets `TMP`/`TEMP`/`TMPDIR` to `<out>/tmp` (the tests copy their worlds there, never to the
+  system drive) and `RUSTCRAFT_LAN_BIND=127.0.0.1` (no firewall prompt per test program); a
+  wrapper that sets its own profile variables after it would build every variant in its profile.
+  It records the clean build time,
   the memory peak of the build processes (sampled twice a second: quiet machine only), the `.text`
   size, the file size and the sha256 in `<out>/matrix.json`, and copies the executable, its PDB and
   cargo's timing page (critical path) to `<out>/exes/`. `test` builds and runs the suite with the
-  same settings (it refuses to run without `RUSTCRAFT_SOLO_WORLD`). Variants:
+  same settings (it refuses to run without `RUSTCRAFT_SOLO_WORLD`, and refuses
+  `fat-lto-panic-abort`: cargo builds test targets and all their dependencies with unwinding
+  whatever the profile says, so its tests and its `bench_ticks` would be those of `fat-lto`;
+  `panic = "abort"` is measured on the executable only). Variants:
 
   | Variant | Setting on top of `dist` | Lead |
   |---|---|---|
@@ -5712,19 +5723,21 @@ proves them, measures what a loaded machine can show, and leaves every decision 
   Never rc-commands (command blocks and `/test` run every tick) nor wgpu / wgpu-core (they encode
   every frame) among the cold crates. Under LTO the cold opt-level only changes the optimisation
   before the LTO step: to be measured before it is adopted. Tests
-  (`tools/bench/test_build_matrix.py`, 11, CI tools job): every variant is the shipped build plus
+  (`tools/bench/test_build_matrix.py`, 14, CI tools job): every variant is the shipped build plus
   its own settings, every setting is valid cargo TOML, the named crates are in `Cargo.lock` (a
   misspelt package in a profile override is only a warning), the hot crates stay out, the trial
   environment never reaches cargo, `.text` comes from the PE section table (virtual size), memory
   figures are read in any locale. Sabotages, each failing: the `CARGO_PROFILE_` variables kept,
   rc-commands marked cold, a misspelt crate, the raw size read instead of the virtual size, tests
-  without `--workspace`, no timing page. The settings reach rustc (queue, `cargo build --profile
+  without `--workspace`, no timing page; after review (3 more tests, 14 in all):
+  the shell's `TMP` kept, no LAN bind, a `panic = "abort"` variant accepted by `test`, a target
+  folder per variant, no path-hiding config. The settings reach rustc (queue, `cargo build --profile
   dist -p rc-env -v` with three `--config`): 88 rustc runs, all with `-C metadata=layout-salt`
   and the committed `/Brepro` (cargo joins the two rustflags lists), `-C codegen-units=4` on
   rc-env only, `-C opt-level=s` on zip only.
 - Method (written into the protocol, B11): every build or micro-bench of a toolchain lead uses the
-  shipped settings (`--profile dist`, `RUSTCRAFT_FULL_RELEASE=1` in the queue), never the trial
-  profile. Two builds with the same settings are byte-identical since C7-M10, so the "two base
+  shipped settings (`--profile dist` with no profile variable in the environment), never the trial
+  profile; `panic = "abort"` on the executable only. Two builds with the same settings are byte-identical since C7-M10, so the "two base
   executables" of the plan would measure run noise only; the code-layout noise comes from
   `shipped-layout-salt` (an extra metadata salt changes every symbol hash, so the order of the
   generic instances inside each object and every address, the code staying the same). Checked
@@ -5750,8 +5763,8 @@ proves them, measures what a loaded machine can show, and leaves every decision 
   median and p99: `crowd-1000`, `tnt`, `redstone`, `cave`, `plains32` for the LTO, unit and linker
   variants, plus `title` (naga compiles the shaders at startup) for the cold crates, `generation`
   and `village`; the tick micro-bench per variant (`test target/matrix --variant V --package rc-sim
-  -- bench_ticks -- --ignored --nocapture`, 1 thread and all threads); then `test` of every variant
-  kept, twice (the second time with `RUSTCRAFT_OPT_NOISE_AVX2=0`): tests_opt fingerprints
+  -- bench_ticks -- --ignored --nocapture`, 1 thread and all threads; not for
+  `fat-lto-panic-abort`, see above); then `test` of every variant kept, twice (the second time with `RUSTCRAFT_OPT_NOISE_AVX2=0`): tests_opt fingerprints
   (`6a557b6a…`, `9abd8cbe…`), generation reference, mesh fingerprint, relight replay; 1600×900
   screenshots (two executables are two launches: compare within the launch-to-launch noise,
   about 76,000 pixels). A lead is adopted only beyond the `shipped-layout-salt` distance.
