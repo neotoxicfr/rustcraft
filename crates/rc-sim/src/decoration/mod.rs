@@ -12,6 +12,8 @@ mod mannequin;
 pub(crate) mod stand;
 mod summoned;
 #[cfg(test)]
+mod switch_equivalence_tests;
+#[cfg(test)]
 mod tests;
 
 pub(crate) use summoned::summoned;
@@ -107,6 +109,45 @@ fn deco_scan_indexed() -> bool {
     *ON.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_DECOSCAN") != Some("0"))
 }
 
+/// Optimisation switches of the decoration code (and of the blast pass over the still
+/// compounds), read once at startup; a test flips them on its own server to compare both paths.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DecoSwitches {
+    /// Callers that know a decoration's registry index use it (edit, push, survival) instead of
+    /// walking the registry for its identifier (`RUSTCRAFT_OPT_DECO_SINGLE_LOOKUP=0`).
+    pub by_index: bool,
+    /// The compound's remembered place in its chunk's entity list is tried before scanning the
+    /// list (`RUSTCRAFT_OPT_DECO_SLOT_HINT=0`).
+    pub slot_hint: bool,
+    /// An explosion reads each compound in place and copies only those it breaks
+    /// (`RUSTCRAFT_OPT_DECO_EXPLOSION_BORROW=0`: a deep copy of every decoration per blast).
+    pub explosion_borrow: bool,
+    /// The blast pass over the still compounds tests the distance before the entity type
+    /// (`RUSTCRAFT_OPT_STILL_PUSH_DISTANCE_FIRST=0`: the type first, the former order).
+    pub still_distance_first: bool,
+}
+
+impl Default for DecoSwitches {
+    fn default() -> DecoSwitches {
+        DecoSwitches {
+            by_index: rc_data::opt_switch!("RUSTCRAFT_OPT_DECO_SINGLE_LOOKUP"),
+            slot_hint: rc_data::opt_switch!("RUSTCRAFT_OPT_DECO_SLOT_HINT"),
+            explosion_borrow: rc_data::opt_switch!("RUSTCRAFT_OPT_DECO_EXPLOSION_BORROW"),
+            still_distance_first: rc_data::opt_switch!("RUSTCRAFT_OPT_STILL_PUSH_DISTANCE_FIRST"),
+        }
+    }
+}
+
+/// Index of entity `id` in a chunk's entity list, trying `slot` (where it was last found) first.
+fn index_in(list: &[(i32, Nbt)], id: i32, slot: Option<usize>) -> Option<usize> {
+    if let Some(k) = slot
+        && list.get(k).is_some_and(|(x, _)| *x == id)
+    {
+        return Some(k);
+    }
+    list.iter().position(|(x, _)| *x == id)
+}
+
 /// Result of an item use on a block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Use {
@@ -121,6 +162,9 @@ struct Live {
     kind: DKind,
     /// Chunk where the compound was last seen (fast lookup).
     chunk: (i32, i32),
+    /// Its index in that chunk's entity list when last seen: a hint only, checked before use (a
+    /// removal or a move out of the list shifts it). Saves scanning a crowded chunk's list.
+    slot: usize,
     /// Ticks since the last survival check (not saved, 0 at creation).
     check: i32,
     /// Armor stand: instant of the last hit that made it wobble.
@@ -138,11 +182,12 @@ struct Live {
 }
 
 impl Live {
-    fn new(id: i32, kind: DKind, chunk: (i32, i32)) -> Live {
+    fn new(id: i32, kind: DKind, chunk: (i32, i32), slot: usize) -> Live {
         Live {
             id,
             kind,
             chunk,
+            slot,
             check: 0,
             last_hit: 0,
             removed: false,
@@ -164,6 +209,31 @@ pub(crate) struct LivingDeco {
     pub marker: bool,
 }
 
+/// An explosion as the decoration pass sees it.
+struct DecoBlast {
+    center: [f64; 3],
+    /// Twice the radius: the reach, and the damage scale of a mannequin.
+    diameter: f64,
+    /// A mob is the author and the `mob_griefing` rule is off: nothing is broken.
+    refused_by_rule: bool,
+    /// The direct source is in water: nothing hung or laid is touched.
+    wet: bool,
+    /// The explosion touches block-like entities.
+    blocklike: bool,
+}
+
+/// What an explosion does to one decoration.
+enum DecoBlastEffect {
+    /// Mannequin hurt by `damage`, then pushed by `knockback`.
+    HurtMannequin { damage: f32, knockback: [f64; 3] },
+    /// Armor stand or mannequin left standing (refused, marker), pushed.
+    Push([f64; 3]),
+    /// Armor stand smashed, its equipment dropped (copy of its compound).
+    BreakStand(Nbt),
+    /// Something attached killed with its loot, attributed to the author when `credited`.
+    KillAttached { compound: Nbt, credited: bool },
+}
+
 /// Fields of an entry read by the tick (without copying the network tracking).
 struct Brief {
     id: i32,
@@ -183,6 +253,7 @@ pub(crate) struct Decos {
     /// Explosion about to go off: its non-mob direct source (TNT, projectile) is in
     /// water. Read and reset to false by the explosion.
     pub blast_wet: bool,
+    pub(crate) switches: DecoSwitches,
 }
 
 // ---------- Directions and boxes ----------
@@ -339,9 +410,9 @@ impl Server {
                 continue;
             }
             let Some(list) = self.entities.get(p) else { continue };
-            for (id, e) in list {
+            for (slot, (id, e)) in list.iter().enumerate() {
                 if let Some(kind) = kind_of(e) {
-                    self.deco.live.push(Live::new(*id, kind, *p));
+                    self.deco.live.push(Live::new(*id, kind, *p, slot));
                 }
             }
         }
@@ -351,27 +422,41 @@ impl Server {
     pub(crate) fn deco_register(&mut self, id: i32, e: &Nbt) {
         if let Some(kind) = kind_of(e) {
             let chunk = chunk_of(nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default());
-            self.deco.live.push(Live::new(id, kind, chunk));
+            // Its place in the chunk's list is not known yet: the first lookup records it.
+            self.deco.live.push(Live::new(id, kind, chunk, 0));
         }
     }
 
-    /// Position of a decoration of the registry (searched first in its chunk).
+    /// Position of a decoration of the registry (searched first in its chunk); the place where
+    /// its compound was found is remembered for the lookups that follow in the same tick.
     pub(crate) fn live_pos(&mut self, i: usize) -> Option<[f64; 3]> {
-        let (lid, lchunk) = (self.deco.live[i].id, self.deco.live[i].chunk);
-        let near = self.entities.get(&lchunk).and_then(|v| v.iter().find(|(x, _)| *x == lid));
-        let pos = match near {
-            Some((_, e)) => nbtio::f64s::<3>(e.get("Pos")),
-            None => {
-                let (c, e) = self
-                    .entities
-                    .iter()
-                    .find_map(|(c, v)| v.iter().find(|(x, _)| *x == lid).map(|(_, e)| (*c, e)))?;
-                let p = nbtio::f64s::<3>(e.get("Pos"));
-                self.deco.live[i].chunk = c;
-                p
-            }
-        };
+        let (chunk, slot, compound) = self.find_live(i)?;
+        let pos = nbtio::f64s::<3>(compound.get("Pos"));
+        let l = &mut self.deco.live[i];
+        (l.chunk, l.slot) = (chunk, slot);
         Some(pos.unwrap_or_default())
+    }
+
+    /// Chunk, list index and compound of registry entry `i`: its known chunk first (at its
+    /// remembered index when that switch is on), otherwise the whole world.
+    fn find_live(&self, i: usize) -> Option<((i32, i32), usize, &Nbt)> {
+        let l = &self.deco.live[i];
+        let slot = self.deco.switches.slot_hint.then_some(l.slot);
+        self.find_kept(l.id, Some(l.chunk), slot)
+    }
+
+    /// Chunk, list index and compound of kept entity `id`, searched first in chunk `hint`.
+    fn find_kept(&self, id: i32, hint: Option<(i32, i32)>, slot: Option<usize>) -> Option<((i32, i32), usize, &Nbt)> {
+        if let Some(c) = hint
+            && let Some(list) = self.entities.get(&c)
+            && let Some(k) = index_in(list, id, slot)
+        {
+            return Some((c, k, &list[k].1));
+        }
+        self.entities.iter().find_map(|(c, list)| {
+            let k = list.iter().position(|(x, _)| *x == id)?;
+            Some((*c, k, &list[k].1))
+        })
     }
 
     fn deco_live(&mut self, id: i32) -> Option<&mut Live> {
@@ -386,33 +471,40 @@ impl Server {
 
     /// Compound of decoration `i` of the registry (known chunk first: called every tick).
     fn live_nbt(&self, i: usize) -> Option<&Nbt> {
-        let l = &self.deco.live[i];
-        self.deco_nbt_near(l.id, Some(l.chunk))
+        self.find_live(i).map(|(_, _, compound)| compound)
     }
 
     /// Searches first in chunk `hint`, otherwise in the whole world.
     fn deco_nbt_near(&self, id: i32, hint: Option<(i32, i32)>) -> Option<&Nbt> {
-        let near = hint.and_then(|c| self.entities.get(&c)).and_then(|v| v.iter().find(|(i, _)| *i == id));
-        near.or_else(|| self.entities.values().flat_map(|l| l.iter()).find(|(i, _)| *i == id)).map(|(_, n)| n)
+        self.find_kept(id, hint, None).map(|(_, _, compound)| compound)
     }
 
     /// Modifies the compound of a decoration; its chunk will be rewritten, and a move into
     /// another chunk files it there (armor stand that falls or is pushed across a border).
     fn deco_edit(&mut self, id: i32, f: impl FnOnce(&mut Nbt)) {
         let hint = self.deco.live.iter().find(|l| l.id == id).map(|l| l.chunk);
-        let mut edited = None;
-        if let Some(c) = hint
-            && let Some((_, n)) = self.entities.get_mut(&c).and_then(|v| v.iter_mut().find(|(i, _)| *i == id))
-        {
-            f(n);
-            edited = Some((c, chunk_of(nbtio::f64s::<3>(n.get("Pos")).unwrap_or_default())));
-        } else if let Some((c, n)) =
-            self.entities.iter_mut().find_map(|(c, l)| l.iter_mut().find(|(i, _)| *i == id).map(|(_, n)| (*c, n)))
-        {
-            f(n);
-            edited = Some((c, chunk_of(nbtio::f64s::<3>(n.get("Pos")).unwrap_or_default())));
+        let Some((chunk, slot, _)) = self.find_kept(id, hint, None) else { return };
+        self.edit_kept_at(id, chunk, slot, f);
+    }
+
+    /// [`Server::deco_edit`] of registry entry `i`, found from the entry itself: no walk of the
+    /// registry for its identifier, which made every armor stand falling at once quadratic
+    /// (`RUSTCRAFT_OPT_DECO_SINGLE_LOOKUP=0`: that walk, the former path).
+    fn deco_edit_at(&mut self, i: usize, f: impl FnOnce(&mut Nbt)) {
+        let id = self.deco.live[i].id;
+        if !self.deco.switches.by_index {
+            return self.deco_edit(id, f);
         }
-        let Some((filed_under, now_in)) = edited else { return };
+        let Some((chunk, slot, _)) = self.find_live(i) else { return };
+        (self.deco.live[i].chunk, self.deco.live[i].slot) = (chunk, slot);
+        self.edit_kept_at(id, chunk, slot, f);
+    }
+
+    /// Edit of a decoration's compound, entry `slot` of chunk `chunk`'s list (just found).
+    fn edit_kept_at(&mut self, id: i32, chunk: (i32, i32), slot: usize, f: impl FnOnce(&mut Nbt)) {
+        let Some((_, n)) = self.entities.get_mut(&chunk).and_then(|list| list.get_mut(slot)) else { return };
+        f(n);
+        let (filed_under, now_in) = (chunk, chunk_of(nbtio::f64s::<3>(n.get("Pos")).unwrap_or_default()));
         self.life.drop_chunks.insert(filed_under);
         // Cheap check first: the refile searches the whole map, rare (a border crossed).
         if now_in != filed_under {
@@ -710,7 +802,7 @@ impl Server {
                 return;
             }
         }
-        if !self.deco_survives(l.id) {
+        if !self.deco_survives_at(i) {
             let e = self.live_nbt(i).cloned();
             self.deco_remove(l.id);
             if let Some(e) = e {
@@ -728,7 +820,19 @@ impl Server {
 
     /// `survives` of an attached entity.
     pub(crate) fn deco_survives(&self, id: i32) -> bool {
-        let Some(e) = self.deco_nbt(id) else { return false };
+        self.deco_nbt(id).is_some_and(|e| self.attached_survives(id, e))
+    }
+
+    /// [`Server::deco_survives`] of registry entry `i` (found from the entry, not by identifier).
+    fn deco_survives_at(&self, i: usize) -> bool {
+        let id = self.deco.live[i].id;
+        if !self.deco.switches.by_index {
+            return self.deco_survives(id);
+        }
+        self.live_nbt(i).is_some_and(|e| self.attached_survives(id, e))
+    }
+
+    fn attached_survives(&self, id: i32, e: &Nbt) -> bool {
         match kind_of(e) {
             Some(k) if k.hanging() => self.hang_survives(id, k, e),
             Some(DKind::Cushion) => self.cushion_survives(e),
@@ -781,6 +885,24 @@ impl Server {
         if radius < 1.0e-5 || self.deco.live.is_empty() {
             return;
         }
+        if self.deco.switches.explosion_borrow {
+            self.deco_explosion_borrowed(center, radius, ty, by, wet, blocklike);
+        } else {
+            self.deco_explosion_cloned(center, radius, ty, by, wet, blocklike);
+        }
+    }
+
+    /// [`Server::deco_explosion`], former path: a deep copy of every decoration's compound
+    /// (equipment, framed items) per blast, far ones included (`RUSTCRAFT_OPT_DECO_EXPLOSION_BORROW=0`).
+    fn deco_explosion_cloned(
+        &mut self,
+        center: [f64; 3],
+        radius: f32,
+        ty: &str,
+        by: Option<crate::mobs::mob::Ent>,
+        wet: bool,
+        blocklike: bool,
+    ) {
         let double = f64::from(radius * 2.0);
         let by_mob = matches!(by, Some(crate::mobs::mob::Ent::Mob(_)));
         let griefing = self.rule("minecraft:mob_griefing", true);
@@ -837,6 +959,110 @@ impl Server {
                 self.attached_kill_by(id, &e, None);
             }
         }
+    }
+
+    /// [`Server::deco_explosion`] reading each compound in place: a decoration out of reach
+    /// costs a few field reads, and only one the blast breaks has its compound copied (the
+    /// breaking calls change the server while they read it). Same decisions, same order.
+    fn deco_explosion_borrowed(
+        &mut self,
+        center: [f64; 3],
+        radius: f32,
+        ty: &str,
+        by: Option<crate::mobs::mob::Ent>,
+        wet: bool,
+        blocklike: bool,
+    ) {
+        let blast = DecoBlast {
+            center,
+            diameter: f64::from(radius * 2.0),
+            refused_by_rule: matches!(by, Some(crate::mobs::mob::Ent::Mob(_))) && !self.rule("minecraft:mob_griefing", true),
+            wet,
+            blocklike,
+        };
+        // Registry length fixed at the start, like the former snapshot of identifiers: nothing a
+        // blast adds is visited, and a removed entry keeps its index (`removed` set, not dropped).
+        for i in 0..self.deco.live.len() {
+            let Some(effect) = self.deco_blast_effect(i, &blast) else { continue };
+            let id = self.deco.live[i].id;
+            match effect {
+                DecoBlastEffect::HurtMannequin { damage, knockback } => {
+                    self.mannequin_hurt(id, ty, damage, by, Some(center));
+                    self.deco_push_at(i, knockback);
+                }
+                DecoBlastEffect::Push(knockback) => self.deco_push_at(i, knockback),
+                DecoBlastEffect::BreakStand(compound) => {
+                    let pos = nbtio::f64s::<3>(compound.get("Pos")).unwrap_or_default();
+                    self.stand_broken(&compound, pos.map(|v| v.floor() as i32));
+                    self.deco_remove(id);
+                    self.game_event_at("minecraft:entity_die", pos, None);
+                }
+                // Loot attributed to the author when the hit was allowed (creative: nothing).
+                DecoBlastEffect::KillAttached { compound, credited } => {
+                    self.attached_kill_by(id, &compound, if credited { by } else { None });
+                }
+            }
+        }
+    }
+
+    /// What blast `blast` does to registry entry `i`, decided from its compound read in place
+    /// (`None`: nothing, out of reach or ignored). Each mutating outcome carries what it needs.
+    fn deco_blast_effect(&self, i: usize, blast: &DecoBlast) -> Option<DecoBlastEffect> {
+        let entry = &self.deco.live[i];
+        if entry.removed {
+            return None;
+        }
+        let kind = entry.kind;
+        let compound = self.live_nbt(i)?;
+        let ignored = match kind {
+            DKind::Stand => !blast.blocklike || flag(compound, "Invisible"),
+            DKind::Mannequin => false,
+            _ => blast.wet || !blast.blocklike,
+        };
+        if ignored {
+            return None;
+        }
+        let center = blast.center;
+        let pos = nbtio::f64s::<3>(compound.get("Pos")).unwrap_or_default();
+        let offset = [pos[0] - center[0], pos[1] - center[1], pos[2] - center[2]];
+        let dist = (offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]).sqrt() / blast.diameter;
+        // Distance before the box: a painting's box reads its variant's size.
+        if dist > 1.0 {
+            return None;
+        }
+        let bbox = self.deco_box(compound)?;
+        let eye = self.deco_eye(kind, compound);
+        let to_eye = [offset[0], pos[1] + eye - center[1], offset[2]];
+        let exposure = f64::from(self.seen_percent(center, &bbox));
+        // The hit: refused for a mob without the `mob_griefing` rule, or invulnerable.
+        let refused = blast.refused_by_rule || flag(compound, "Invulnerable");
+        if matches!(kind, DKind::Stand | DKind::Mannequin) {
+            if kind == DKind::Stand && !refused && !flag(compound, "Marker") {
+                return Some(DecoBlastEffect::BreakStand(compound.clone()));
+            }
+            // Still there (refused, marker, mannequin): pushed like any living entity, reduced
+            // by the resistance read before any hurt (as the former copy did).
+            let resistance =
+                self.nbt_attribute(compound, kind.name(), "minecraft:explosion_knockback_resistance").unwrap_or(0.0);
+            let strength = (1.0 - dist) * exposure * (1.0 - resistance);
+            let knockback = crate::mobs::mth::normalize(to_eye).map(|v| v * strength);
+            if kind == DKind::Mannequin {
+                let power = (1.0 - dist) * exposure;
+                let damage = ((power * power + power) / 2.0 * 7.0 * blast.diameter + 1.0) as f32;
+                return Some(DecoBlastEffect::HurtMannequin { damage, knockback });
+            }
+            return Some(DecoBlastEffect::Push(knockback));
+        }
+        if !refused {
+            return Some(DecoBlastEffect::KillAttached { compound: compound.clone(), credited: true });
+        }
+        // Non-zero push: the hung item is knocked off (fixed frame excepted).
+        let to_eye_len = (to_eye[0] * to_eye[0] + to_eye[1] * to_eye[1] + to_eye[2] * to_eye[2]).sqrt();
+        let pushed = to_eye_len >= f64::from(1.0e-5f32) && (1.0 - dist) * exposure != 0.0;
+        if pushed && !(kind.frame() && flag(compound, "Fixed")) {
+            return Some(DecoBlastEffect::KillAttached { compound: compound.clone(), credited: false });
+        }
+        None
     }
 
     // ---------- Pushes (shulker, piston) ----------
@@ -932,7 +1158,7 @@ impl Server {
             let kp = (1.0 - dist) * f64::from(self.seen_percent(center, &b)) * mult * (1.0 - res);
             let kb = dir.map(|v| v * kp);
             if living {
-                self.deco_push(id, kb);
+                self.deco_push_at(i, kb);
             } else if kb.iter().any(|&v| v != 0.0) && !(k.frame() && flag(e, "Fixed")) {
                 let e = e.clone();
                 self.attached_kill_by(id, &e, None);
@@ -971,11 +1197,26 @@ impl Server {
         }
         // One registry search; the compound read and rewritten in place (its chunk known).
         let Some(i) = self.deco.live.iter().position(|l| l.id == id && !l.removed) else { return };
+        self.push_live_entry(i, v);
+    }
+
+    /// [`Server::deco_push`] of registry entry `i`, whose index the caller already holds (no walk
+    /// of the registry for its identifier: one per push made a blast over many stands quadratic).
+    fn deco_push_at(&mut self, i: usize, v: [f64; 3]) {
+        if !self.deco.switches.by_index {
+            return self.deco_push(self.deco.live[i].id, v);
+        }
+        if v.iter().all(|x| x.is_finite()) && !self.deco.live[i].removed {
+            self.push_live_entry(i, v);
+        }
+    }
+
+    fn push_live_entry(&mut self, i: usize, v: [f64; 3]) {
         let Some(e) = self.live_nbt(i) else { return };
         let m = nbtio::motion(e.get("Motion")).unwrap_or_default();
         let (pos, ground) = (nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default(), flag(e, "OnGround"));
         let nv = [m[0] + v[0], m[1] + v[1], m[2] + v[2]];
-        self.deco_edit(id, |n| nbtio::set(n, "Motion", dbl(nv)));
+        self.deco_edit_at(i, |n| nbtio::set(n, "Motion", dbl(nv)));
         // Not tracked yet (pushed before its first tick): the client knows the state before.
         let t = &mut self.deco.live[i].track;
         t.begin(pos, m, ground);

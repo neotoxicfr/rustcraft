@@ -233,7 +233,7 @@ impl Server {
             return false;
         }
         let death = if dying { death + 1 } else { death };
-        self.deco_edit(id, |n| {
+        self.deco_edit_at(i, |n| {
             if hurt > 0 {
                 nbtio::set(n, "HurtTime", Nbt::Short((hurt - 1) as i16));
             }
