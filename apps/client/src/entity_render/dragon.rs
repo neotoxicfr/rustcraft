@@ -56,7 +56,6 @@ pub(super) fn skin(_r: &EntityRenderer, e: &Entity) -> Option<u32> {
     (e.kind == KIND).then_some(0)
 }
 
-
 /// Dying: the history and the wing flap are frozen.
 fn dying(e: &Entity) -> bool {
     e.death_time > 0

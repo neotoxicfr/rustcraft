@@ -263,7 +263,8 @@ fn prep(k: &mut Kit, ents: &[Entity], opt: EntOpt) {
     let bright = |x: i32, y: i32, z: i32| (x * 3 + y + z * 5).rem_euclid(16);
     let tints = |_: i32, _: i32, _: i32| [0xff_ffff; 4];
     let world = ShadowWorld { state: &state, brightness: &bright, ambient: 0.1, biome_tints: &tints };
-    let light = |x: i32, y: i32, z: i32| ((x * 7 + y * 3 + z).rem_euclid(16) as u8, (x + y * 5 + z * 3).rem_euclid(16) as u8);
+    let light =
+        |x: i32, y: i32, z: i32| ((x * 7 + y * 3 + z).rem_euclid(16) as u8, (x + y * 5 + z * 3).rem_euclid(16) as u8);
     k.r.prepare(ents.iter(), 0.37, [0, 0], [0.5, 66.0, -2.5], &light, &|_, _| true, Some(&k.items), &world);
 }
 

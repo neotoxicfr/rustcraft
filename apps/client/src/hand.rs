@@ -824,7 +824,8 @@ mod tests {
     #[test]
     fn bow_like_hand_selection() {
         let h = state();
-        let (bow, xbow, xbow_loaded, torch) = (Some((-2, false)), Some((-1, false)), Some((-1, true)), Some((7, false)));
+        let (bow, xbow, xbow_loaded, torch) =
+            (Some((-2, false)), Some((-1, false)), Some((-1, true)), Some((7, false)));
         // Neither bow nor crossbow: both hands, even during a use.
         assert_eq!(h.hands_drawn([torch, torch], Some((7, 1))), [true, true]);
         // Bow held without use: both.

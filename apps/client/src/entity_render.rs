@@ -24,10 +24,10 @@ mod blocks;
 pub use blocks::BlockFrame;
 mod creatures;
 pub(crate) use creatures::{warden_beat, warden_dig_ticks};
-// Transient blocks (`docs/specs/miscellaneous.md` § 5.5).
-mod misc;
 mod dragon;
 mod keyframes;
+// Transient blocks (`docs/specs/miscellaneous.md` § 5.5).
+mod misc;
 mod wither;
 // Maps (`docs/specs/maps.md` § 6): pixels, decorations, background in hand.
 mod maps;
@@ -38,11 +38,11 @@ mod shulker;
 mod tests_g1f08;
 #[cfg(test)]
 mod tests_g2f03;
+#[cfg(test)]
+mod tests_c3m11;
 // Entity objects and maps (mission G2-F05).
 #[cfg(test)]
 mod tests_g2f05;
-#[cfg(test)]
-mod tests_c3m11;
 #[cfg(test)]
 mod tests_moving_block_tints;
 // Dragon effects, creaking tearing itself down (mission G4-F16a).
@@ -110,7 +110,8 @@ pub fn water_track(
         }
         if guardian {
             let below = [e.pos[0].floor() as i32, e.pos[1].floor() as i32 - 1, e.pos[2].floor() as i32];
-            let top = data.state(state(below[0], below[1], below[2])).is_some_and(|s| top_full(data.shape(s.collision)));
+            let top =
+                data.state(state(below[0], below[1], below[2])).is_some_and(|s| top_full(data.shape(s.collision)));
             e.extra[9] = f32::from(u8::from(top));
         }
     }
@@ -1348,8 +1349,12 @@ struct AnimationPaths {
 }
 
 impl AnimationPaths {
-    const NEW: AnimationPaths =
-        AnimationPaths { sine_table: true, widened_part_names: true, static_keyframe_names: true, poly_rotations: true };
+    const NEW: AnimationPaths = AnimationPaths {
+        sine_table: true,
+        widened_part_names: true,
+        static_keyframe_names: true,
+        poly_rotations: true,
+    };
 
     fn of(opt: &EntOpt) -> AnimationPaths {
         AnimationPaths {
@@ -5138,8 +5143,7 @@ impl EntityRenderer {
         }
         let Some(stack) = &e.equipment[5] else { return };
         let source = self.source.clone();
-        let Some(name) =
-            usize::try_from(stack.item).ok().and_then(|i| items_in(&source, self.item_idx())?.get(i))
+        let Some(name) = usize::try_from(stack.item).ok().and_then(|i| items_in(&source, self.item_idx())?.get(i))
         else {
             return;
         };
@@ -6291,11 +6295,8 @@ impl EntityRenderer {
         let view =
             crate::stack::StackRef { stack, info, ids: &self.ids, data: &self.source, hold: crate::stack::Hold::NONE };
         let Some(model) = view.model() else { return false };
-        let name = usize::try_from(stack.item)
-            .ok()
-            .and_then(|i| self.item_names()?.get(i))
-            .cloned()
-            .unwrap_or_default();
+        let name =
+            usize::try_from(stack.item).ok().and_then(|i| self.item_names()?.get(i)).cloned().unwrap_or_default();
         let env = crate::stack::OwnerEnv::new(&self.world, "ground", owner.0, owner.1, owner.2);
         let (mut layers, mut key) = (Vec::new(), Vec::new());
         models.layers(&name, &model, &view, &env, env.seed(), &mut layers, &mut key);
@@ -7176,7 +7177,10 @@ impl EntityRenderer {
     pub(super) fn eye_light(&self, e: &Entity, world: [f64; 3], light: &dyn Fn(i32, i32, i32) -> (u8, u8)) -> (u8, u8) {
         let keep = self.opt.light_once && self.is_current(e);
         let key = world.map(f64::to_bits);
-        if keep && let Some((k, v)) = self.cur_light.get() && k == key {
+        if keep
+            && let Some((k, v)) = self.cur_light.get()
+            && k == key
+        {
             return v;
         }
         let eye_y = world[1] + f64::from(self.dims_of(e)[1]);
@@ -8255,11 +8259,16 @@ mod tests {
         assert_eq!(rounding_mismatches(round_half_away_from_zero), 0);
         let to_even = |v: f32| (v + 12_582_912.0) - 12_582_912.0;
         assert!(rounding_mismatches(to_even) > 0, "sabotage not detected");
-        assert_eq!(PI / 2.0 * 0.5 * std::f32::consts::FRAC_2_PI, 0.5, "a halved right angle is a half quarter");
+        let halved_right_angle = std::hint::black_box(PI / 2.0) * 0.5;
+        assert_eq!(halved_right_angle * std::f32::consts::FRAC_2_PI, 0.5, "a halved right angle is a half quarter");
         let mut x = -20.0f32;
         while x < 20.0 {
             let (a, b) = (sin_cos_with(x, true), sin_cos_with(x, false));
-            assert_eq!(((a.0 + 0.0).to_bits(), (a.1 + 0.0).to_bits()), ((b.0 + 0.0).to_bits(), (b.1 + 0.0).to_bits()), "{x}");
+            assert_eq!(
+                ((a.0 + 0.0).to_bits(), (a.1 + 0.0).to_bits()),
+                ((b.0 + 0.0).to_bits(), (b.1 + 0.0).to_bits()),
+                "{x}"
+            );
             x += 0.000_37;
         }
     }
@@ -8273,9 +8282,24 @@ mod tests {
             let (s, c) = f64::from(degrees).to_radians().sin_cos();
             let (s, c) = (s as f32, c as f32);
             match axis {
-                0 => Mat4::from_cols(glam::Vec4::X, glam::Vec4::new(0.0, c, s, 0.0), glam::Vec4::new(0.0, -s, c, 0.0), glam::Vec4::W),
-                1 => Mat4::from_cols(glam::Vec4::new(c, 0.0, -s, 0.0), glam::Vec4::Y, glam::Vec4::new(s, 0.0, c, 0.0), glam::Vec4::W),
-                _ => Mat4::from_cols(glam::Vec4::new(c, s, 0.0, 0.0), glam::Vec4::new(-s, c, 0.0, 0.0), glam::Vec4::Z, glam::Vec4::W),
+                0 => Mat4::from_cols(
+                    glam::Vec4::X,
+                    glam::Vec4::new(0.0, c, s, 0.0),
+                    glam::Vec4::new(0.0, -s, c, 0.0),
+                    glam::Vec4::W,
+                ),
+                1 => Mat4::from_cols(
+                    glam::Vec4::new(c, 0.0, -s, 0.0),
+                    glam::Vec4::Y,
+                    glam::Vec4::new(s, 0.0, c, 0.0),
+                    glam::Vec4::W,
+                ),
+                _ => Mat4::from_cols(
+                    glam::Vec4::new(c, s, 0.0, 0.0),
+                    glam::Vec4::new(-s, c, 0.0, 0.0),
+                    glam::Vec4::Z,
+                    glam::Vec4::W,
+                ),
             }
         };
         let helpers: [fn(f32) -> Mat4; 3] = [rotation_x_degrees, rotation_y_degrees, rotation_z_degrees];
@@ -8299,7 +8323,7 @@ mod tests {
     /// would point an animation at another part.
     #[test]
     fn known_part_names_find_their_index() {
-        assert!(KNOWN >= 160, "{KNOWN}");
+        const { assert!(KNOWN >= 160) };
         for (i, name) in KNOWN_PART_NAMES.iter().enumerate() {
             assert_eq!(known_id(name), Some(i), "{name}");
         }

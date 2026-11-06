@@ -978,8 +978,7 @@ impl EntityRenderer {
         if let Some(&s) = self.swallowed.get(&key) {
             return s;
         }
-        let name =
-            usize::try_from(stack.item).ok().and_then(|i| self.item_names()?.get(i));
+        let name = usize::try_from(stack.item).ok().and_then(|i| self.item_names()?.get(i));
         let s = match name.and_then(|n| SKULLS.iter().position(|s| s.0 == n)) {
             Some(k) => Some(Swallowed::Skull(k)),
             None => item_block(&self.source, stack.item, comp).map(Swallowed::Block),

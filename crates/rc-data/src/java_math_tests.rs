@@ -398,7 +398,11 @@ fn turn_remainders_exhaustive_over_floats() {
         );
     }
     for path in TurnRemainder::ALL {
-        assert_eq!(first_remainder_mismatch(1.0, |x| remainder_by_one_with(x, path)), None, "remainder by one {path:?}");
+        assert_eq!(
+            first_remainder_mismatch(1.0, |x| remainder_by_one_with(x, path)),
+            None,
+            "remainder by one {path:?}"
+        );
     }
 }
 
@@ -421,10 +425,13 @@ fn turn_remainders_on_sampled_floats() {
 fn double_degrees_remainder_matches_library() {
     let mut r = Mix(11);
     let widened = (0..=u32::MAX).step_by(7).map(|b| f64::from(f32::from_bits(b)));
-    let draws: Vec<f64> = (0..2_000_000).map(|i| if i % 2 == 0 { r.range(-2000.0, 2000.0) } else { random_double(&mut r, i) }).collect();
-    let values: Vec<f64> = widened.chain(limits()).chain(draws).chain([360.0, -360.0, 720.0, -720.0, 719.999_999_999_999_9]).collect();
+    let draws: Vec<f64> =
+        (0..2_000_000).map(|i| if i % 2 == 0 { r.range(-2000.0, 2000.0) } else { random_double(&mut r, i) }).collect();
+    let values: Vec<f64> =
+        widened.chain(limits()).chain(draws).chain([360.0, -360.0, 720.0, -720.0, 719.999_999_999_999_9]).collect();
     for path in TurnRemainder::ALL {
-        let bad = values.par_iter().find_any(|&&v| degrees_remainder_f64_with(v, path).to_bits() != (v % 360.0).to_bits());
+        let bad =
+            values.par_iter().find_any(|&&v| degrees_remainder_f64_with(v, path).to_bits() != (v % 360.0).to_bits());
         assert_eq!(bad, None, "{path:?}");
     }
 }
@@ -622,8 +629,9 @@ fn rounding_micro_bench() {
 #[ignore = "benchmark"]
 fn angle_wrap_micro_bench() {
     let mut r = Mix(5);
-    let diffs: Vec<f32> =
-        (0..1_000_000).map(|i| (if i % 50 == 0 { r.range(-700.0, 700.0) } else { r.range(-90.0, 90.0) }) as f32).collect();
+    let diffs: Vec<f32> = (0..1_000_000)
+        .map(|i| (if i % 50 == 0 { r.range(-700.0, 700.0) } else { r.range(-90.0, 90.0) }) as f32)
+        .collect();
     let ages: Vec<f32> = (0..1_000_000).map(|_| r.range(0.0, 2e5) as f32).collect();
     let threads = rayon::current_num_threads();
     let both = |label: &str, f: &(dyn Fn() -> f32 + Sync)| {
@@ -632,23 +640,30 @@ fn angle_wrap_micro_bench() {
     };
     for path in TurnRemainder::ALL {
         both(&format!("wrap degrees 10^6, {path:?}"), &|| {
-            diffs.iter().map(|&d| {
-                let mut a = degrees_remainder_with(d, path);
-                if a >= 180.0 {
-                    a -= 360.0;
-                }
-                if a < -180.0 {
-                    a += 360.0;
-                }
-                a
-            }).sum::<f32>()
+            diffs
+                .iter()
+                .map(|&d| {
+                    let mut a = degrees_remainder_with(d, path);
+                    if a >= 180.0 {
+                        a -= 360.0;
+                    }
+                    if a < -180.0 {
+                        a += 360.0;
+                    }
+                    a
+                })
+                .sum::<f32>()
         });
     }
     let radians: Vec<f32> = diffs.iter().map(|d| d.to_radians() * 0.1).collect();
-    both("fold radians 10^6, old library remainder", &|| radians.iter().map(|&d| old_fold_radians_by_remainder(d)).sum());
+    both("fold radians 10^6, old library remainder", &|| {
+        radians.iter().map(|&d| old_fold_radians_by_remainder(d)).sum()
+    });
     both("fold radians 10^6, game loops", &|| radians.iter().map(|&d| fold_radians(d)).sum());
     let scrolls: Vec<f32> = ages.iter().map(|a| a * 0.01).collect();
-    both("scroll fraction 10^6, library % 1 then rem_euclid", &|| scrolls.iter().map(|&x| (x % 1.0).rem_euclid(1.0)).sum());
+    both("scroll fraction 10^6, library % 1 then rem_euclid", &|| {
+        scrolls.iter().map(|&x| (x % 1.0).rem_euclid(1.0)).sum()
+    });
     both("scroll fraction 10^6, shared", &|| {
         scrolls
             .iter()
