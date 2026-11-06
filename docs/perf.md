@@ -5706,16 +5706,22 @@ old path 36.2 + 35.4 + 34.7 ms; one private generator 35.1 + 0 + 0; the generati
 + 0 (the 0.4 ms: the generation data looked up once). Same with the shared setup: old 12.6 + 11.9 +
 12.4, one private 12.4 + 0 + 0, the thread's 0 + 0.8 + 0. A dimension trip no longer rebuilds them.
 
-World creation then opening (`bench_new_world_opening`, median of 3, two runs on a machine whose
-load moved between them; "ready" = the main world generator ready, from the start of the opening):
+World creation then opening (`bench_new_world_opening`, median of 3 per pass, four passes in one
+sitting alternating the shared setup on / off / on / off, loaded machine; "ready" = the main world
+generator ready, from the start of the opening; figures of pass 1 and 3 against 2 and 4). A first
+pair of runs taken hours apart (52.7 against 135.9 ms even in the case the sharing cannot touch)
+was not comparable and is replaced by this one:
 
-| Run | nothing kept, late start | nothing kept, early start | data kept | data and generator kept |
+| Generator ready / opening | nothing kept, late start | nothing kept, early start | data kept | data and generator kept |
 |---|---|---|---|---|
-| setup of before: ready / opening | 134.4 / 59.9 ms | 109.1 / 49.7 | 101.8 / 44.1 | 52.7 / 52.7 |
-| shared setup: ready / opening | 294.6 / 103.5 ms | 204.9 / 93.3 | 154.1 / 132.7 | 135.9 / 135.9 |
+| shared setup (passes 1, 3) | 113.5, 112.5 / 42.3, 40.4 ms | 89.4, 90.0 / 33.4, 35.5 | 55.0, 55.9 / 52.5, 48.9 | 31.7, 54.8 / same |
+| setup of before (passes 2, 4) | 115.4, 116.2 / 42.6, 44.4 ms | 88.9, 93.0 / 33.1, 36.1 | 81.5, 82.5 / 33.4, 33.1 | 55.1, 56.4 / same |
 
-The creation itself (192-237 ms, then 513-556 ms) is within the noise of the load between cases;
-with the generator kept, the generator is ready before the opening ends.
+Reading: with nothing kept the server's generator is the first one built from its generation data,
+so it parses the biome list either way (no gain, as expected); the early start wins 23-26 ms; with
+the data kept, the spawn search already parsed the list and the server's generator copies it (82 →
+55 ms); with the generator kept, it is ready when the opening ends (31.7-56.4 ms, within the noise
+of the load). The creation itself (148-205 ms) is within that noise across cases.
 
 - Fidelity (A3): one difference, towards the game. A scattered structure piece (desert or jungle
   temple, swamp hut) keeps the height it measured at its first placement. Shared, a search reads the
@@ -5727,6 +5733,19 @@ with the generator kept, the generator is ready before the opening ends.
   meal now use the decorator that has the templates and processor lists (the generation thread's),
   where the old `/place` generator had none (fossils and template features failed there; the game
   places them).
+- Fidelity (A3), second difference, towards the game: with `RUSTCRAFT_OPT_REUSE_SPAWN_GENERATOR`
+  the server keeps the spawn search's generator with the state its template pieces gained. A
+  shipwreck (beached or on the ocean floor) measures its height once, then keeps it (adjusted flag
+  and Y). Our piece NBT writes `TPY` but not `height_adjusted`, and nothing reads the flag back, so
+  a fresh generator (old path) facing a shipwreck that straddles a chunk decorated by the spawn
+  search and a neighbour decorated later by the server measures again on the neighbour's region:
+  the Y may change and the wreck is cut in two. Reused, the first Y stays, as in the game, which
+  writes and reads `height_adjusted` with the piece (checked in the 26.3 code). The same gap
+  already exists on the old code at every restart (an earlier fidelity gap, out of this mission):
+  writing `height_adjusted` with the piece and reading it back at load, as `restore_scattered` does
+  for `HPos`, makes the reuse identical to the old path and the restart faithful.
+- Identity (A1) limit: `fingerprint_new_world` proves the reuse on its one seed only; the
+  shipwreck case above is not covered by it.
 - Equivalence: `generator_sharing_tests` (programs of every noise setting of the jar for 3 seeds,
   shared definitions against parsed again, second user included; processor lists one by one; biome
   lists; main world, Nether, End and flat generators all sharing on against all off: program,
@@ -5752,5 +5771,8 @@ with the generator kept, the generator is ready before the opening ends.
 - To measure on the quiet machine: scenes "first use" (C1-M01: tick max at the first `/locate`,
   bone meal, sapling, eye of Ender, after a Nether trip), `world-create`, `world-list`, `generation`
   (world opening, generator ready, first batch), `crowd`, `plains12`, `fresh-village-rd16`; memstats
-  with 1 to 3 generators fewer.
+  with 1 to 3 generators fewer. Still open until then: no other scene has run (C5, partial) and no
+  memory figure is taken (C2, partial), while the generation data and generator of a new world are
+  kept until the server takes them and a private generator per visited dimension stays for the
+  session (one per dimension and structure setting).
 
