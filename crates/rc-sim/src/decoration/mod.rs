@@ -661,7 +661,7 @@ impl Server {
     }
 
     pub(crate) fn deco_resort(&mut self) {
-        self.deco.live.sort_by_key(|l| l.rank);
+        crate::walk::sort_by_rank(&mut self.deco.live, |l| l.rank);
     }
 
     /// A decoration at `pos` ticks: "entity ticking" chunk, simulated and its 8 neighbours

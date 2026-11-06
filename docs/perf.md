@@ -5660,3 +5660,90 @@ profile, machine loaded by other agents compiling, best of 5 or 7; three runs, t
   decorations, noise floors), `crowd-1000`, `tnt`, `dropped-items` (collision walks); memstats at
   world opening (−1 MB of heap expected).
 
+## C5-M23: ground items and orbs, merges without wasted work, recycled bodies, linear re-sort (06/11, loaded machine)
+
+Micro-bench `bench_ground_items` (`cargo test --release -p rc-sim --features memstats
+bench_ground_items -- --ignored --nocapture --test-threads=1`): "pile2000" = the `items-merge-1`
+scene (2,000 items, 4 kinds, 0.4 apart, dropped again every 100 ticks), "pile64" = 64 of them,
+"kept" = the 500 never-merging items of `dropped-items`, "farm" = 1,000 items born and removed
+per tick. Machine loaded by other agents compiling: two passes where the same case varies by up
+to ×2 (pile2000 off: 3,894 then 7,775 µs per tick); the timings below are hints only, the counts
+(items read by the merges, allocations) do not depend on the load. Switches, default on, `=0` the
+former way (read once; `drops::DropSwitches`, `walk.rs`):
+
+- Fidelity fix (both ways, no switch): the game merges a neighbour only if its box crosses the
+  item's box inflated by 0.5 horizontally (strict). Ours took every centre within 0.75 / 0.25:
+  items whose faces only touch (0.75 apart on the floor, or 0.25 in height, one on three snow
+  layers) merged, the game's do not (`items_merge_only_when_their_boxes_cross`). Same box test as
+  the orbs (`crosses`). The `tests_opt` fingerprints did not move. Still different from the game
+  (outside this mission): the game also needs the same owner (`Owner`, we keep none), and meets its
+  candidates by entity section, ours in list order.
+- `RUSTCRAFT_OPT_ITEM_MERGE_EARLY_EXIT`: the stack size is read once per merge (it was read for
+  every pair: patch scan plus registry lookup), an item that cannot merge (pickup 32767, age
+  −32768, too old, full) skips its merge before the loop (those flags never change during it), and
+  each pair tests removal and distance first. `dropped-items`: 500 items × 12.5 due merges per tick
+  scanned the list for nothing.
+- `RUSTCRAFT_OPT_ITEM_MERGE_LIVE_PREFILTER`: in a run, the distance is first tested on the compact
+  positions kept for the plates (`contact.live_items`, 32 bytes) before an item (368 bytes) is read.
+- `RUSTCRAFT_OPT_ITEM_MERGE_GRID`: in a run of at least 64 items, the candidates come from a grid
+  of the run's slots by 2 × 2 column (hash map, buffers kept from run to run), built at the run's
+  first due merge from the live positions and kept up to date by the ticked item (`item_seen`) and
+  the absorbed ones; the crossing ones are sorted back into list order. Only in a run: its list is
+  taken out, nothing but the ticked item can move one of its items (a command run during the walk
+  sees only `life.drops`). Shared grid with the mobs (C5-M18, not merged yet): not used.
+
+| Case, µs per tick (pass 1 / pass 2) | items read by merges per tick | former | early exit | early exit + prefilter | early exit + grid | all |
+|---|---|---|---|---|---|---|
+| pile2000 | 175,912 → 356 | 3,894 / 7,775 | 3,877 / 4,327 | 2,924 / 4,438 | 3,045 / 4,434 | 3,893 / 2,429 |
+| pile64 | 177 → 4.45 | 81 / 190 | 133 / 155 | 157 / 237 | 141 / 303 | 153 / 106 |
+| kept (median) | — | 455 / 800 | 595 / 785 | 594 / 850 | 592 / 965 | 581 / 585 |
+
+  The prefilter reads the same 356 items as the grid but still walks the 2,000 live positions per
+  due merge (O(n) compact); the grid walks about 100 (4 columns). The bench scene does not merge
+  at all (`items_left` 2,000): same-kind items are 0.8 apart (`i % 4` along rows of 50), beyond
+  the reach of 0.75; it measures the search (`tools/bench/perf_pack.py`, outside this mission).
+  `bench_l10order_walk` only-items (1,000 items, pickup blocked), every switch of this mission on
+  against off, two alternated passes: 1,897-2,293 / 1,471-1,642 µs (pass 1, on slower), then
+  1,158-1,248 / 1,783-1,887 (pass 2, on faster): within the machine's noise.
+- `RUSTCRAFT_OPT_BODY_POOL`: the boxed physics bodies (288 bytes) of the items and orbs removed
+  after a walk are kept (up to 1,024) and reset for the next ones born. Farm: 6,708 → 5,708
+  allocations per tick (one per birth); timing within noise (1,495 / 2,153 µs off, 1,779 / 2,021
+  on). Memory: at most 1,024 × 288 B ≈ 290 KB held after a wave of removals.
+- `RUSTCRAFT_OPT_ITEM_PICKUP_IN_PLACE`: a pickup no longer tries the stack on a clone of the 46
+  slots first (46 `String` clones per item in reach and per tick, e.g. a full inventory standing on
+  a pile): adding to the inventory touches no slot when nothing fits, so the real slots answer.
+- `RUSTCRAFT_OPT_ENTITY_KIND_INDEXED`: the entity type id of each spawned item and orb (and every
+  caller of `entity_kind_id` / `entity_kind_index`) comes from the registry's name index, not a
+  scan with string compares. About 40 other `entries.iter().position` scans of registries remain in
+  rc-sim (sounds, particles, effects, items), outside this mission's files.
+- `RUSTCRAFT_OPT_ENTITY_SAVE_LENT`: a saved entity chunk encodes the kept entities (decorations,
+  entities read as they are) lent from their list and put back, instead of cloning them (an
+  autosave spike: every kept compound of every rewritten chunk was cloned). Same bytes
+  (`entity_chunks_saved_from_lent_compounds`).
+- `RUSTCRAFT_OPT_WALK_RESORT_LINEAR`: a family list goes back in rank order in two passes plus the
+  sort of the entities that moved (`put_back_in_rank_order`: the ranks below the smallest one
+  followed by a smaller one are already in order; no allocation), instead of a stable sort of the
+  whole list (which allocates half of a long list: 2,000 items × 368 B ≈ 370 KB). Used for every
+  family, the mobs (`sort_by_rank`), decorations and ominous spawners.
+  `RUSTCRAFT_OPT_WALK_REJOIN_CHUNK_TABLE`: `walk_rejoin` looks each chunk's place up in a table
+  built once instead of searching the chunk list at each comparison (O(k log k) instead of
+  O(k log k × chunks)). `bench_l10order_rejoin` (1,000 pigs, 25 back every other tick), both on
+  against off, two passes: 11.8-20.4 ms / 12.2-23.0 ms then 14.3-21.0 / 12.0-16.3: noise (the
+  re-sort of 1,000 boxed mobs is not visible next to their AI).
+- Proofs: `item_merge_switches_give_the_same_items` (2,100 items, 200 never merging, dense 3 × 3
+  and wide 16 × 16 thrown hard, 400 ticks, identifier, count, age, pickup delay and position of
+  every item after every tick: former code against each lead alone, all as a run, all one by one;
+  fails with the grid's candidates unsorted, and with the grid not following moves: the dense
+  scene alone missed that one, hence the wide one), `recycled_bodies_move_like_new_ones` (fails
+  with a body not reset), `pickup_in_place_stores_like_the_trial_on_a_copy`,
+  `rank_resort_matches_a_stable_sort`, `walk_resort_switches_give_the_same_order`,
+  `ground_item_and_orb_sizes` (item 368, orb 288, tracker 184 bytes: may not grow unnoticed).
+- Not done: the hot/cold split of the item (the tracker is 184 of its 368 bytes): a parallel
+  array must follow every push, removal, retain, sort and insert of `life.drops` (97 sites in 35
+  files) and a layout cannot be switched at run time; bounded gain (the linear passes read one
+  cache line per item either way, the moves of a removal halve). Interned item id in `Stack`
+  (transversal). Rank arrays beside the mob and minecart lists (walk self time ≈ 0). Multi-core and
+  GPU: not applicable (merges and walk order are sequential and observable).
+- To measure on the quiet machine: `items-merge-1`, `dropped-items`, `forest`, `crowd-1000`
+  (control), two passes, old exe as reference; this bench for the counts.
+

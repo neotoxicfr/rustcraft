@@ -13,7 +13,14 @@ use crate::server::Server;
 impl Server {
     /// Rank of the entity type in the built-in registry (tag indices).
     pub(crate) fn entity_kind_index(&self, name: &str) -> Option<usize> {
-        self.data.registry("minecraft:entity_type")?.entries.iter().position(|n| n == name)
+        let types = self.data.registry("minecraft:entity_type")?;
+        // `RUSTCRAFT_OPT_ENTITY_KIND_INDEXED` (default on): the registry's name index, the same first
+        // occurrence as the scan of every name (`=0`), which each spawned item or orb paid.
+        if rc_data::opt_switch!("RUSTCRAFT_OPT_ENTITY_KIND_INDEXED") {
+            types.id(name).map(|i| i as usize)
+        } else {
+            types.entries.iter().position(|n| n == name)
+        }
     }
 
     /// Entity type tags that contain this species.
