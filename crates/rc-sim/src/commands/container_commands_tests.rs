@@ -73,8 +73,9 @@ fn pos(at: [i32; 3]) -> String {
     format!("{} {} {}", at[0], at[1], at[2])
 }
 
-/// Blast furnace cooking raw iron (100 ticks): reads, block data and writes of every slot work
-/// on the live furnace; only another ingredient (an emptied slot included) restarts cooking.
+/// Blast furnace cooking raw iron (100 ticks): reads, block data, block predicates, clone,
+/// setblock and writes of every slot work on the live furnace; only another ingredient (an
+/// emptied slot included) restarts cooking.
 #[test]
 fn furnace_commands_use_the_live_furnace() {
     let mut w = world("furnace");
@@ -84,16 +85,35 @@ fn furnace_commands_use_the_live_furnace() {
     w.cmd(&format!("item replace block {f} container.0 with minecraft:raw_iron 8"));
     w.cmd(&format!("item replace block {f} container.1 with minecraft:coal 4"));
     w.ticks(30);
-    let live = |w: &World| {
+    let live_at = |w: &World, at: [i32; 3]| {
         let f = &w.p.s.life.furnaces[&at];
         (f.timer, f.total, f.lit_remaining)
     };
+    let live = |w: &World| live_at(w, at);
     let (timer, total, lit) = live(&w);
     assert!(timer >= 20 && total == 100 && lit > 0, "the furnace cooks: timer {timer}, total {total}, lit {lit}");
     // Reads: the coal burning is in the live slot, not in the NBT written at the last save.
     assert_eq!(w.cmd(&format!("execute if items block {f} container.1 minecraft:coal")), 3, "live fuel read");
     assert_eq!(w.block_data_int(at, "cooking_time_spent"), Some(i64::from(timer)), "block data = live cooking");
     assert_eq!(w.block_data_int(at, "lit_time_remaining"), Some(i64::from(lit)), "block data = live burning");
+    // A block predicate with data compares the live furnace.
+    let cooking = |t: i32| format!("execute if block {f} minecraft:blast_furnace{{cooking_time_spent:{t}}}");
+    assert!(w.try_cmd(&cooking(timer)).0, "the predicate sees the live cooking time");
+    assert!(!w.try_cmd(&cooking(0)).0, "the predicate does not see the saved cooking time");
+    // A clone copies the live furnace: fuel burnt and cooking time carried over.
+    let copy = [2, Y, 5];
+    w.cmd(&format!("clone {f} {f} {}", pos(copy)));
+    assert_eq!(live_at(&w, copy), (timer, total, lit), "the copy cooks where the source was");
+    assert_eq!(w.cmd(&format!("execute if items block {} container.1 minecraft:coal", pos(copy))), 3, "the burnt coal is not copied");
+    assert_eq!(w.cmd(&format!("execute if blocks {f} {f} {} all", pos(copy))), 1, "source and copy have the same live data");
+    // A setblock giving the live data again changes nothing, so it fails.
+    let mut same = w.p.s.data_of_block(at).expect("furnace data");
+    for k in ["id", "x", "y", "z"] {
+        crate::nbtio::remove(&mut same, k);
+    }
+    let same = crate::commands::snbt::to_snbt(&same);
+    let (ok, _) = w.try_cmd(&format!("setblock {f} minecraft:blast_furnace[lit=true]{same}"));
+    assert!(!ok, "the same block with its live data is not a change");
     // Writes that keep cooking: result slot, block data merge, same ingredient.
     w.cmd(&format!("item replace block {f} container.2 with minecraft:iron_ingot"));
     assert_eq!(live(&w), (timer, total, lit), "a result write keeps cooking");
@@ -155,13 +175,13 @@ fn jukebox_and_pot_slot_is_their_own_key() {
     assert!(w.state(jukebox).contains("has_record=false"), "the disc is out: {}", w.state(jukebox));
 }
 
-/// A slot write marks a chest changed (its comparator lights) but not a hopper (the game's
-/// quirk: its comparator is not told).
+/// A slot write marks a chest changed (its comparator lights) but not a hopper nor a decorated
+/// pot (the game's quirk: their comparator is not told).
 #[test]
 fn slot_write_tells_comparators_except_for_the_hopper() {
     let mut w = world("comparator");
-    let (chest, hopper) = ([2, Y, 6], [6, Y, 6]);
-    for (at, block) in [(chest, "minecraft:chest"), (hopper, "minecraft:hopper")] {
+    let (chest, hopper, pot) = ([2, Y, 6], [6, Y, 6], [10, Y, 6]);
+    for (at, block) in [(chest, "minecraft:chest"), (hopper, "minecraft:hopper"), (pot, "minecraft:decorated_pot")] {
         w.cmd(&format!("setblock {} {block}", pos(at)));
         // The comparator reads the block north of it.
         w.cmd(&format!("setblock {} {} {} minecraft:comparator[facing=north]", at[0], at[1], at[2] + 1));
@@ -169,10 +189,12 @@ fn slot_write_tells_comparators_except_for_the_hopper() {
     w.ticks(4);
     w.cmd(&format!("item replace block {} container.0 with minecraft:stone 64", pos(chest)));
     w.cmd(&format!("item replace block {} container.0 with minecraft:stone 64", pos(hopper)));
+    w.cmd(&format!("item replace block {} container.0 with minecraft:stone 64", pos(pot)));
     w.ticks(4);
     let lit = |w: &World, at: [i32; 3]| w.state([at[0], at[1], at[2] + 1]).contains("powered=true");
     assert!(lit(&w, chest), "the chest's comparator lights");
     assert!(!lit(&w, hopper), "the hopper's comparator is not told");
+    assert!(!lit(&w, pot), "the decorated pot's comparator is not told");
     // `loot insert` marks every container it changes, the hopper included.
     w.cmd(&format!("loot insert {} loot minecraft:blocks/dirt", pos(hopper)));
     w.ticks(4);
@@ -236,7 +258,8 @@ fn storage_edits_happen_in_place() {
 }
 
 /// Chiseled bookshelf: a book written by a command shows in the block state, an empty write
-/// takes it out. Crafter: a disabled slot that receives an item is enabled again.
+/// takes it out. Crafter: any write to a disabled empty slot, an empty one included, enables it;
+/// a disabled slot that holds an item keeps its state.
 #[test]
 fn bookshelf_and_crafter_slot_writes_follow_their_block() {
     let mut w = world("bookshelf");
@@ -248,7 +271,15 @@ fn bookshelf_and_crafter_slot_writes_follow_their_block() {
     w.cmd(&format!("item replace block {s} container.0 with minecraft:air"));
     assert!(w.state(shelf).contains("slot_0_occupied=false"), "the book is out: {}", w.state(shelf));
     w.cmd(&format!("setblock {c} minecraft:crafter{{disabled_slots:[I;0,4]}}"));
+    let disabled = |w: &World| w.p.s.be_get(crafter).and_then(|b| b.get("disabled_slots").cloned());
     w.cmd(&format!("item replace block {c} container.0 with minecraft:stone"));
-    let disabled = w.p.s.be_get(crafter).and_then(|b| b.get("disabled_slots").cloned());
-    assert_eq!(disabled, Some(Nbt::IntArray(vec![4])), "slot 0 enabled, slot 4 still disabled");
+    assert_eq!(disabled(&w), Some(Nbt::IntArray(vec![4])), "slot 0 enabled, slot 4 still disabled");
+    // An empty write enables a disabled slot too.
+    w.cmd(&format!("item replace block {c} container.4 with minecraft:air"));
+    assert_eq!(disabled(&w), Some(Nbt::IntArray(vec![])), "an empty write enables slot 4");
+    // A disabled slot that already holds an item (data written by hand) stays disabled.
+    w.cmd(&format!("setblock {c} minecraft:air"));
+    w.cmd(&format!("setblock {c} minecraft:crafter{{disabled_slots:[I;2],Items:[{{Slot:2b,id:\"minecraft:dirt\",count:1}}]}}"));
+    w.cmd(&format!("item replace block {c} container.2 with minecraft:stone"));
+    assert_eq!(disabled(&w), Some(Nbt::IntArray(vec![2])), "a slot holding an item keeps its state");
 }

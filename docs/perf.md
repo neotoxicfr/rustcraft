@@ -5668,12 +5668,17 @@ profile, machine loaded by other agents compiling, best of 5 or 7; three runs, t
   block` now read the simulated state (their NBT is only rewritten before a save). Before, a
   command read the last saved contents, and any write reloaded the stand from that stale NBT:
   cooking, burning fuel and brewing went back to the last save (an `item replace` of the result
-  slot put out a lit furnace).
+  slot put out a lit furnace). The same live data is now what `clone` copies, what a block
+  predicate with data compares (`execute if block`, `fill … replace`, `clone … filtered`), what
+  `execute if blocks` compares, and what `setblock`/`fill` with data compare to decide whether the
+  block changed. Before, a clone of a cooking furnace copied the saved ingredient and fuel with
+  no cooking done (items duplicated, a `clone … move` lost the cooking).
 - A command's slot write is the container's own write, no longer a reload of the whole block
   data: furnace (only another ingredient, an emptied slot included, restarts cooking and tells
   the comparators), jukebox (`RecordItem`, `has_record`, song), decorated pot (`item`, no
-  comparator update), hopper (no comparator update, the game's quirk), crafter (a disabled slot
-  that receives an item is enabled), chiseled bookshelf (block state), shelf (its change mark),
+  comparator update), hopper (no comparator update, the game's quirk), crafter (any write to a
+  disabled slot, an empty one included, enables it when the slot is still empty; a disabled slot
+  holding an item stays disabled), chiseled bookshelf (block state), shelf (its change mark),
   other containers (comparators told). No block entity packet for a slot write (the game sends
   none). `loot insert` grows a stack in place and marks the container changed once per drop.
 - Sealed loot is drawn by a slot read or write (`execute if items`, `item`, `loot insert|replace`),
@@ -5682,7 +5687,8 @@ profile, machine loaded by other agents compiling, best of 5 or 7; three runs, t
   (the game edits the stored compound itself); an emptied identifier is removed; only the
   namespaces written are saved (one dirty mark per namespace, an emptied namespace written empty).
 - Proof: `commands::container_commands_tests` (7 tests); each fails when its former code path is
-  put back (see the commit). Cost: none measured (one command at a time; the slot read decodes
+  put back (see the commits). The game quirks kept here are listed in
+  `docs/quirks-to-reproduce.md` (Containers rows). Cost: none measured (one command at a time; the slot read decodes
   the same `Items` list as before, the live read skips it for furnaces and brewing stands).
 - Not done, noted: a menu write of an empty stack into a furnace's ingredient slot (number-key
   swap) also restarts cooking in the game, not in our menu path; `data merge block` sends a block

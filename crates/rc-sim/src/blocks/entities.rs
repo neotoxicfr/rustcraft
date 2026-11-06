@@ -1533,7 +1533,7 @@ impl Server {
             "minecraft:decorated_pot" => self.container_store_item(p, i, size, item),
             "minecraft:chiseled_bookshelf" => self.bookshelf_write(p, i, item),
             _ => {
-                if id == "minecraft:crafter" && item.is_some() {
+                if id == "minecraft:crafter" {
                     self.crafter_enable_slot(p, i);
                 }
                 self.container_store_item(p, i, size, item.map(|st| self.limited_to_container(st)));
@@ -1592,9 +1592,11 @@ impl Server {
         }
     }
 
-    /// A disabled crafter slot that receives an item is enabled first (with its change mark).
+    /// Any write to a disabled crafter slot, an empty one included, enables it first (with its
+    /// change mark), but only while the slot is still empty: a slot holding an item (data
+    /// written by hand) cannot change its state, so it stays disabled.
     fn crafter_enable_slot(&mut self, p: P, i: usize) {
-        if !self.crafter_slot_disabled(p, i) {
+        if !self.crafter_slot_disabled(p, i) || self.container_item(p, i, 9).is_some() {
             return;
         }
         if let Some(be) = self.be_get_mut(p) {
