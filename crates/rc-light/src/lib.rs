@@ -528,6 +528,28 @@ pub fn relight_sections_inc(
     touched
 }
 
+/// Benches: [`relight_sections`] with some switches set (`("LIGHTSKYFRONTIER", false)`: as with
+/// `RUSTCRAFT_OPT_LIGHTSKYFRONTIER=0`), the others being those of the process, to compare the
+/// paths in one executable. Not counted in the relights.
+#[doc(hidden)]
+pub fn relight_sections_with(
+    grid: &mut impl LightGrid,
+    height: i32,
+    t: &LightTables,
+    has_sky: bool,
+    changes: &[[i32; 3]],
+    switches: &[(&str, bool)],
+) -> Touched {
+    let o = switches.iter().fold(fast::Opts::current(), |o, &(name, on)| o.with(name, on));
+    if o == fast::Opts::OLD {
+        return relight_zones(grid, height, t, has_sky, changes, true);
+    }
+    let mut out = [Touched::new()];
+    fast::relight_zones(grid, height, t, has_sky, changes, None, o, &mut out);
+    let [touched] = out;
+    touched
+}
+
 /// Like [`relight_sections`], the sky being recomputed only around `sky_changes` (the
 /// changes that touch attenuation or shape, [`LightTables::matters_sky`]): a
 /// lamp that turns on only changes the block light. `RUSTCRAFT_OPT_SKYBIT=0`: sky

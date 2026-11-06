@@ -16,7 +16,10 @@ const LAMP_ON: u32 = 7;
 const TORCH: u32 = 3;
 const GLASS: u32 = 5;
 /// Bit of `LIGHTDEDUP` in [`Opts::from_bits`].
-const DEDUP: u16 = 512;
+const DEDUP: u32 = 512;
+/// Bits of the switches that act on the sequential path: C2-M03 (`SKYSKIP` to
+/// `RELIGHT_OCCTAB`) and C2-M02 (`LIGHTSKYFRONTIER` to `LIGHTLEVELFIRST`).
+const SEQUENTIAL_BITS: u32 = 0x7ff | 0xf << 14;
 
 /// Test states: air, stone, leaves, torch, low slab, glass, lamp off and on
 /// (differ only by emission), high slab, attenuations 2 to 14, half-faces in the six
@@ -232,7 +235,7 @@ fn random_opts(rng: &mut Rng) -> Opts {
     if rng.below(4) == 0 {
         Opts::from_bits(!DEDUP)
     } else {
-        Opts::from_bits(rng.below(1 << 11) as u16 & !DEDUP)
+        Opts::from_bits(rng.below(1 << 18) as u32 & SEQUENTIAL_BITS & !DEDUP)
     }
 }
 
@@ -268,14 +271,25 @@ fn shipped_defaults_match_old() {
     }
 }
 
-/// Buffers kept per thread: purged beyond `RETAIN_BYTES`, buckets included.
+/// Buffers kept per thread: purged beyond `RETAIN_BYTES`, buckets, parallel task queues and
+/// stack seeds included.
 #[test]
 fn retained_buffers_are_bounded() {
-    super::with_work(true, |w| w.lane.buckets[15].reserve(super::RETAIN_BYTES / 8 + 1));
-    super::WORK.with(|cell| {
-        let b = cell.borrow().bytes();
-        assert!(b <= super::RETAIN_BYTES, "{b} bytes kept");
-    });
+    let grow: [fn(&mut Work); 3] = [
+        |w| w.lane.buckets[15].reserve(super::RETAIN_BYTES / 8 + 1),
+        |w| {
+            w.lane.task_queues.resize_with(2, Default::default);
+            w.lane.task_queues[1][3].reserve(super::RETAIN_BYTES / 8 + 1);
+        },
+        |w| w.lane.stacks.reserve(super::RETAIN_BYTES / 8 + 1),
+    ];
+    for f in grow {
+        super::with_work(true, f);
+        super::WORK.with(|cell| {
+            let b = cell.borrow().bytes();
+            assert!(b <= super::RETAIN_BYTES, "{b} bytes kept");
+        });
+    }
 }
 
 /// Touched sections: all those where a cell changed, with the edges of those cells.
@@ -487,16 +501,18 @@ fn occlusion_table_matches_masks() {
 }
 
 /// Bits of the multi-core switches (`LIGHTJOIN`, `LIGHTPARSOLVE`, `LIGHTGROUPS`).
-const PAR_BITS: u16 = 2048 | 4096 | 8192;
+const PAR_BITS: u32 = 2048 | 4096 | 8192;
 
 /// Random switches (without `LIGHTDEDUP`), multi-core on one step in two, thresholds at 0
-/// so that the small zones of the tests go through `par.rs`.
+/// so that the small zones of the tests go through `par.rs`; sequential propagation after the
+/// seeding (`LIGHTSPREADAFTERSEED`) never, always or under 64 entries.
 fn par_opts(rng: &mut Rng) -> Opts {
-    let mut b = rng.below(1 << 14) as u16 & !DEDUP;
+    let mut b = rng.below(1 << NAMES.len()) as u32 & !DEDUP;
     if rng.below(2) == 0 {
         b |= PAR_BITS;
     }
-    Opts { join_min: 0, par_min: 0, chunk: 64, ..Opts::from_bits(b) }
+    let spread_min = [0, 64, usize::MAX][rng.below(3) as usize];
+    Opts { join_min: 0, par_min: 0, chunk: 64, spread_min, ..Opts::from_bits(b) }
 }
 
 pub(super) fn pool(threads: usize) -> rayon::ThreadPool {
@@ -661,9 +677,30 @@ fn parallel_sabotages_are_caught() {
 /// (the benches measure what runs in game), `LIGHTJOIN` off by default (no measured gain).
 #[test]
 fn shipped_chunk_and_join_default() {
-    assert_eq!(Opts::from_bits(u16::MAX).chunk, 2048);
+    let all = Opts::from_bits(u32::MAX);
+    assert_eq!((all.chunk, all.par_min, all.join_min, all.spread_min), (2048, 65_536, 16_384, 8192));
     let k = NAMES.iter().position(|n| *n == "LIGHTJOIN").expect("name");
     assert_ne!(super::DEFAULT_OFF & 1 << k, 0, "LIGHTJOIN off by default");
+    // Thresholds of the environment: shipped value when absent or unreadable.
+    assert_eq!(super::threshold(None, 7), 7);
+    assert_eq!(super::threshold(Some(" 4096 "), 7), 4096);
+    assert_eq!(super::threshold(Some("many"), 7), 7);
+}
+
+/// Bits and names agree: `bits` inverts `from_bits`, `with` sets one switch and keeps the
+/// thresholds.
+#[test]
+fn switch_bits_round_trip() {
+    let mut rng = Rng(3);
+    for _ in 0..200 {
+        let b = rng.below(1 << NAMES.len()) as u32;
+        assert_eq!(Opts::from_bits(b).bits(), b);
+    }
+    let o = Opts { chunk: 64, spread_min: 5, ..Opts::from_bits(0) };
+    let on = o.with("LIGHTSKYFRONTIER", true);
+    assert!(on.sky_frontier && !on.margin_frontier && on.chunk == 64 && on.spread_min == 5);
+    assert_eq!(on.with("LIGHTSKYFRONTIER", false), o);
+    assert!(Opts::from_bits(1 << 21).spread_after_seed && !Opts::from_bits(1 << 20).spread_after_seed);
 }
 
 /// `ZONEONCE=0` keeps two zone reads per group (block then sky) even with `LIGHTJOIN` or
@@ -673,11 +710,11 @@ fn zone_once_off_reads_twice_with_join_and_groups() {
     let t = tables();
     let mut rng = Rng(9);
     let base = world(64, true, &mut rng);
-    let zo = 1u16 << NAMES.iter().position(|n| *n == "ZONEONCE").expect("name");
+    let zo = 1u32 << NAMES.iter().position(|n| *n == "ZONEONCE").expect("name");
     let one = [[0, 30, 0]];
     let far = [[-12, 30, 0], [40, 30, 30]];
     pool(1).install(|| {
-        for extra in [2048u16, 8192, 2048 | 8192] {
+        for extra in [2048u32, 8192, 2048 | 8192] {
             for once in [false, true] {
                 let bits = (!DEDUP & !PAR_BITS & !zo & ((1 << NAMES.len()) - 1)) | extra | if once { zo } else { 0 };
                 let o = Opts { join_min: 0, par_min: usize::MAX, ..Opts::from_bits(bits) };
@@ -699,5 +736,6 @@ fn zone_once_off_reads_twice_with_join_and_groups() {
 }
 
 mod bench;
+mod frontier;
 mod inc;
 mod queue_counters;
