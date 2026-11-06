@@ -26,8 +26,12 @@ pub mod cmds_scores;
 pub mod cmds_world;
 pub mod ents;
 pub mod exec;
+pub mod functions;
 pub mod hash_order;
 pub mod itempred;
+pub mod parse_cache;
+pub mod paths;
+pub mod schedule;
 pub mod score_holders;
 pub mod scores;
 pub mod select;
@@ -55,6 +59,12 @@ mod scores_equivalence_tests;
 mod scores_world_equivalence_tests;
 #[cfg(test)]
 mod team_by_uuid_tests;
+#[cfg(test)]
+mod function_cache_tests;
+#[cfg(test)]
+mod command_block_equivalence_tests;
+#[cfg(test)]
+mod parser_equivalence_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -77,6 +87,16 @@ pub type R = Result<i32, Fail>;
 pub struct Level {
     pub packet: Commands,
     pub tree: Tree,
+    /// Name of each node, shared by the kept parses (their argument names).
+    node_names: Vec<std::sync::Arc<str>>,
+}
+
+impl Level {
+    fn new(packet: Commands) -> Level {
+        let tree = Tree::new(&packet);
+        let node_names = tree.nodes.iter().map(|n| std::sync::Arc::from(n.name.as_str())).collect();
+        Level { packet, tree, node_names }
+    }
 }
 
 /// State of the commands of the open world.
@@ -100,17 +120,22 @@ pub struct Cmds {
     pub forced_dirty: bool,
     /// Changed rules (rewrite `game_rules.dat`).
     pub rules_dirty: bool,
-    /// Functions of the data packs: identifier → lines; function tags.
-    pub functions: BTreeMap<String, Vec<String>>,
-    pub function_tags: BTreeMap<String, Vec<String>>,
+    /// Functions of the data packs: identifier → compiled function; function tags (member lists
+    /// shared with the calls that run them).
+    pub functions: BTreeMap<String, functions::Function>,
+    pub function_tags: BTreeMap<String, std::sync::Arc<[String]>>,
     /// Data (re)loaded: the `#minecraft:load` tag goes out at the next tick.
     pub post_reload: bool,
     /// Server-side registries not synchronized (structures, advancements, templates…).
     pub server_regs: BTreeMap<String, Vec<String>>,
     /// Most recent suggestions request (processed at the next tick).
     pub pending_suggest: Option<(i32, String)>,
-    /// Scheduled functions (`schedule`): game tick → (function, tag).
-    pub scheduled: Vec<(i64, String, bool)>,
+    /// Scheduled functions (`schedule`).
+    pub scheduled: schedule::ScheduledFunctions,
+    /// Optimised command paths, read from their switches when the world opens.
+    pub paths: paths::CommandPaths,
+    /// Parses of the texts run by command blocks, minecarts and the player (`PARSECACHE`).
+    pub parse_cache: parse_cache::ParseCache,
     /// Execution depth (nested functions, safeguard).
     pub depth: u32,
     /// Return in progress (`return`) in a function: (success, value).
@@ -244,7 +269,7 @@ fn load_markers(jar: &crate::registries::Jar) -> Vec<Marker> {
     out
 }
 
-fn load_levels(path: &std::path::Path) -> Vec<Level> {
+pub(crate) fn load_levels(path: &std::path::Path) -> Vec<Level> {
     let Ok(bytes) = std::fs::read(path) else {
         eprintln!("singleplayer: command tree missing ({}): redo the data preparation", path.display());
         return Vec::new();
@@ -257,10 +282,7 @@ fn load_levels(path: &std::path::Path) -> Vec<Level> {
         let Some(body) = bytes.get(i..i + n) else { break };
         i += n;
         match rc_proto_v777::commands::read_commands(&mut Reader::new(body)) {
-            Ok(c) => {
-                let tree = Tree::new(&c);
-                out.push(Level { packet: c, tree });
-            }
+            Ok(c) => out.push(Level::new(c)),
             Err(e) => {
                 eprintln!("singleplayer: command tree unreadable: {e}");
                 return Vec::new();
@@ -357,7 +379,8 @@ impl Cmds {
         d.op_level = i32::from(op);
         let levels = load_levels(&rc_data::commands_path(&data.version));
         exec::apply_pack_tags(jar, &mut d, &jar_tags);
-        let (functions, function_tags) = exec::load_functions(jar, &levels, &d);
+        let paths = paths::CommandPaths::from_switches();
+        let (functions, function_tags) = exec::load_functions(jar, &levels, &d, &paths);
         let mut c = Cmds {
             levels,
             data: d,
@@ -375,7 +398,9 @@ impl Cmds {
             post_reload: true,
             server_regs,
             pending_suggest: None,
-            scheduled: Vec::new(),
+            scheduled: schedule::ScheduledFunctions::new(paths.schedule_queue),
+            paths,
+            parse_cache: parse_cache::ParseCache::default(),
             depth: 0,
             returned: None,
             flow: exec::Flow::default(),
@@ -405,6 +430,18 @@ impl Cmds {
     pub fn level(&self, op: u8) -> Option<&Level> {
         self.levels.get(usize::from(op.min(4)))
     }
+
+    /// Data reloaded (`/reload`, `/datapack`): new functions and tags; the parses kept for the
+    /// former tags and registries are forgotten.
+    pub(crate) fn functions_reloaded(
+        &mut self,
+        functions: BTreeMap<String, functions::Function>,
+        tags: BTreeMap<String, std::sync::Arc<[String]>>,
+    ) {
+        self.functions = functions;
+        self.function_tags = tags;
+        self.parse_cache.clear();
+    }
 }
 
 /// Parse segment: nodes read up to a redirect, readable path.
@@ -413,31 +450,49 @@ pub struct Seg {
     /// Path: node names (arguments between `<>`), preceded by the name of the root node of the
     /// segment if it is not the root (`execute` subcommands, aliases).
     pub path: Vec<String>,
-    /// Arguments: name → range in the input.
-    pub args: Vec<(String, (usize, usize))>,
+    /// Arguments: name (shared with the tree's level) → byte range in the parsed text.
+    pub args: Vec<(std::sync::Arc<str>, (u32, u32))>,
     /// Last node read (possible redirect).
     pub last: NodeId,
+    /// `path` joined by spaces, built once (every run of the command matches on it).
+    path_text: String,
 }
 
 impl Seg {
-    pub fn path_str(&self) -> String {
-        self.path.join(" ")
+    pub fn path_str(&self) -> &str {
+        &self.path_text
     }
 }
 
-/// Parsed and split input.
+/// Parsed and split input. Kept by the functions and the parse cache: the text is stored once,
+/// as UTF-8 (a `Vec<char>` would take 4 bytes per character for every kept line).
+#[derive(Debug)]
 pub struct Parsed {
-    pub input: Vec<char>,
+    pub text: String,
     pub segs: Vec<Seg>,
 }
 
 impl Parsed {
-    pub fn arg(&self, seg: &Seg, name: &str) -> Option<String> {
-        seg.args.iter().find(|(n, _)| n == name).map(|(_, (a, b))| self.input[*a..*b].iter().collect())
+    /// Bytes held: the structure and everything it owns (memory of the kept parses, benches).
+    #[cfg(test)]
+    pub(crate) fn held_bytes(&self) -> usize {
+        let seg = |s: &Seg| {
+            size_of::<Seg>()
+                + s.path.capacity() * size_of::<String>()
+                + s.path.iter().map(String::capacity).sum::<usize>()
+                + s.args.capacity() * size_of::<(std::sync::Arc<str>, (u32, u32))>()
+                + s.path_text.capacity()
+        };
+        size_of::<Parsed>() + self.text.capacity() + self.segs.iter().map(seg).sum::<usize>()
     }
 
+    pub fn arg(&self, seg: &Seg, name: &str) -> Option<String> {
+        self.range(seg, name).map(|(a, b)| self.text[a..b].to_owned())
+    }
+
+    /// Byte range of an argument in `text`.
     pub fn range(&self, seg: &Seg, name: &str) -> Option<(usize, usize)> {
-        seg.args.iter().find(|(n, _)| n == name).map(|(_, r)| *r)
+        seg.args.iter().find(|(n, _)| **n == *name).map(|&(_, (a, b))| (a as usize, b as usize))
     }
 }
 
@@ -460,77 +515,120 @@ fn parse_error(p: &rc_commands::Parse, len: usize) -> Option<rc_commands::CmdErr
     }
 }
 
-/// Parse error text as the game writes it in its logs and macro messages
-/// (error message: message, then "at position N: …<--[HERE]"); `None` if the command is
-/// valid.
-pub fn syntax_message(lvl: &Level, data: &rc_commands::Data, text: &str, op: u8) -> Option<String> {
+/// Parse of `text` with the tree of a level (the walk chosen by `no_alloc`); the input as
+/// characters, for the error texts.
+fn parse_text(lvl: &Level, data: &rc_commands::Data, text: &str, op: u8, no_alloc: bool) -> (Vec<char>, rc_commands::Parse) {
     let input: Vec<char> = text.chars().collect();
     let src = rc_commands::parse::Source { restricted: true, selectors: op >= 2 };
-    let p = rc_commands::parse(&lvl.tree, &input, data, src);
-    let e = parse_error(&p, input.len())?;
+    let p = rc_commands::parse::parse_with(&lvl.tree, &input, data, src, no_alloc);
+    (input, p)
+}
+
+/// Parse error text as the game writes it in its logs and macro messages: message, then "at
+/// position N: …<--[HERE]".
+fn log_text(e: &rc_commands::CmdError, input: &[char]) -> String {
     let msg = cmds_ents::plain(&tr(e.key, e.args.iter().map(|a| text::A::S(a.clone())).collect()));
-    let Some(c) = e.cursor else { return Some(msg) };
+    let Some(c) = e.cursor else { return msg };
     let c = c.min(input.len());
     let dots = if c > 10 { "..." } else { "" };
     let before: String = input[c.saturating_sub(10)..c].iter().collect();
-    Some(format!("{msg} at position {c}: {dots}{before}<--[HERE]"))
+    format!("{msg} at position {c}: {dots}{before}<--[HERE]")
 }
 
-pub fn analyse(lvl: &Level, data: &rc_commands::Data, text: &str, op: u8) -> Result<Parsed, Vec<Component>> {
-    let input: Vec<char> = text.chars().collect();
-    let src = rc_commands::parse::Source { restricted: true, selectors: op >= 2 };
-    let p = rc_commands::parse(&lvl.tree, &input, data, src);
+/// Parse error lines shown to the source: the message, then the context (command offered on
+/// click, rest underlined in red, "<--[HERE]").
+fn chat_lines(e: &rc_commands::CmdError, input: &[char]) -> Vec<Component> {
     let start = usize::from(input.first() == Some(&'/'));
     let body: String = input[start..].iter().collect();
-    let shift = |c: usize| c.saturating_sub(start);
-    if let Some(e) = parse_error(&p, input.len()) {
-        let mut out = vec![tr(e.key, e.args.iter().map(|a| text::A::S(a.clone())).collect())];
-        if let Some(c) = e.cursor {
-            let c = shift(c).min(body.chars().count());
-            let chars: Vec<char> = body.chars().collect();
-            let mut ctx = colored(lit(""), GRAY);
-            suggest_cmd(&mut ctx, &body);
-            let mut extra = Vec::new();
-            if c > 10 {
-                extra.push(lit("..."));
-            }
-            extra.push(lit(chars[c.saturating_sub(10)..c].iter().collect::<String>()));
-            if c < chars.len() {
-                let mut rest = colored(lit(chars[c..].iter().collect::<String>()), RED);
-                rest.style.underlined = Some(true);
-                extra.push(rest);
-            }
-            let mut here = colored(tr("command.context.here", Vec::new()), RED);
-            here.style.italic = Some(true);
-            extra.push(here);
-            ctx.extra = extra;
-            out.push(ctx);
+    let mut out = vec![tr(e.key, e.args.iter().map(|a| text::A::S(a.clone())).collect())];
+    if let Some(c) = e.cursor {
+        let c = c.saturating_sub(start).min(body.chars().count());
+        let chars: Vec<char> = body.chars().collect();
+        let mut ctx = colored(lit(""), GRAY);
+        suggest_cmd(&mut ctx, &body);
+        let mut extra = Vec::new();
+        if c > 10 {
+            extra.push(lit("..."));
         }
-        return Err(out);
+        extra.push(lit(chars[c.saturating_sub(10)..c].iter().collect::<String>()));
+        if c < chars.len() {
+            let mut rest = colored(lit(chars[c..].iter().collect::<String>()), RED);
+            rest.style.underlined = Some(true);
+            extra.push(rest);
+        }
+        let mut here = colored(tr("command.context.here", Vec::new()), RED);
+        here.style.italic = Some(true);
+        extra.push(here);
+        ctx.extra = extra;
+        out.push(ctx);
     }
+    out
+}
+
+/// Segments of a parse that succeeded; argument ranges turned into byte ranges of `text`.
+fn parsed_from(lvl: &Level, p: &rc_commands::Parse, text: &str) -> Parsed {
+    // Byte offset of each character index (and of the end), for the ranges of the parser; a
+    // command fits in `u32` bytes (the protocol caps it at 32,767 characters).
+    let mut offsets: Vec<u32> = text.char_indices().map(|(b, _)| b as u32).collect();
+    offsets.push(text.len() as u32);
+    let bytes = |(a, b): (usize, usize)| (offsets[a.min(offsets.len() - 1)], offsets[b.min(offsets.len() - 1)]);
     let mut segs = Vec::new();
     let mut ctx = Some(&p.ctx);
     while let Some(c) = ctx {
-        let mut path = Vec::new();
+        // Exact capacities: a kept parse lives as long as its function.
+        let mut path = Vec::with_capacity(c.nodes.len() + 1);
         if c.root != lvl.tree.root {
             path.push(lvl.tree.node(c.root).name.clone());
         }
-        let mut args = Vec::new();
+        let arguments = c.nodes.iter().filter(|(id, _)| lvl.tree.node(*id).kind == Kind::Argument).count();
+        let mut args = Vec::with_capacity(arguments);
         let mut last = c.root;
         for &(id, r) in &c.nodes {
             let n = lvl.tree.node(id);
             if n.kind == Kind::Argument {
                 path.push(format!("<{}>", n.name));
-                args.push((n.name.clone(), r));
+                args.push((lvl.node_names[id as usize].clone(), bytes(r)));
             } else {
                 path.push(n.name.clone());
             }
             last = id;
         }
-        segs.push(Seg { path, args, last });
+        let path_text = path.join(" ");
+        segs.push(Seg { path, args, last, path_text });
         ctx = c.child.as_deref();
     }
-    Ok(Parsed { input, segs })
+    segs.shrink_to_fit();
+    Parsed { text: text.to_owned(), segs }
+}
+
+/// Parse error text as the game writes it in its logs and macro messages; `None` if the command
+/// is valid.
+pub fn syntax_message(lvl: &Level, data: &rc_commands::Data, text: &str, op: u8, no_alloc: bool) -> Option<String> {
+    let (input, p) = parse_text(lvl, data, text, op, no_alloc);
+    parse_error(&p, input.len()).map(|e| log_text(&e, &input))
+}
+
+/// A function line (level 2, the game's function permission level) parsed once: the parsed
+/// command, or its error in the log's words (one parse gives both).
+pub fn parse_function_line(lvl: &Level, data: &rc_commands::Data, text: &str, no_alloc: bool) -> Result<Parsed, String> {
+    let (input, p) = parse_text(lvl, data, text, 2, no_alloc);
+    match parse_error(&p, input.len()) {
+        Some(e) => Err(log_text(&e, &input)),
+        None => Ok(parsed_from(lvl, &p, text)),
+    }
+}
+
+pub fn analyse(lvl: &Level, data: &rc_commands::Data, text: &str, op: u8) -> Result<Parsed, Vec<Component>> {
+    analyse_with(lvl, data, text, op, rc_commands::parse::no_alloc_switch())
+}
+
+/// `analyse` with the parser walk chosen by the caller.
+pub fn analyse_with(lvl: &Level, data: &rc_commands::Data, text: &str, op: u8, no_alloc: bool) -> Result<Parsed, Vec<Component>> {
+    let (input, p) = parse_text(lvl, data, text, op, no_alloc);
+    match parse_error(&p, input.len()) {
+        Some(e) => Err(chat_lines(&e, &input)),
+        None => Ok(parsed_from(lvl, &p, text)),
+    }
 }
 
 fn tr(key: &str, args: Vec<text::A>) -> Component {
@@ -606,27 +704,54 @@ impl Server {
 
     /// Executes a complete command for a source; returns (success, result).
     pub fn perform(&mut self, src: Src, text: &str) -> (bool, i32) {
+        self.perform_as(&src, text)
+    }
+
+    /// `perform` with a borrowed source.
+    pub fn perform_as(&mut self, src: &Src, text: &str) -> (bool, i32) {
         // Texts rendered on the server side (conversion to a plain string): server language, en_us (S7).
         cmds_ents::SERVER_LANG.get_or_init(|| crate::stations::en_us(&self.life.items));
         if self.exhausted() {
             return (false, 0);
         }
-        let op = src.level;
-        let Some(lvl) = self.cmd.level(op) else {
-            self.fail(&src, tr("command.unknown.command", Vec::new()));
-            return (false, 0);
-        };
         let text = text.strip_prefix('/').unwrap_or(text);
-        let parsed = match analyse(lvl, &self.cmd.data, text, op) {
-            Ok(p) => p,
-            Err(msgs) => {
-                for m in msgs {
-                    self.fail(&src, m);
-                }
-                return (false, 0);
+        match self.parse_to_run(src.level, text) {
+            None => {
+                self.fail(src, tr("command.unknown.command", Vec::new()));
+                (false, 0)
             }
+            Some(Ok(parsed)) => self.in_context(|sv| sv.run_parsed(src, &parsed)),
+            Some(Err(msgs)) => {
+                // Moved out when not shared with the cache.
+                let msgs = std::sync::Arc::try_unwrap(msgs).unwrap_or_else(|shared| (*shared).clone());
+                for m in msgs {
+                    self.fail(src, m);
+                }
+                (false, 0)
+            }
+        }
+    }
+
+    /// Parse of a command about to run at level `op` (`None`: no tree for that level). With
+    /// `PARSECACHE`, a text already run comes back from the cache: the parse is a pure function
+    /// of the level, the text and the pack data (emptied at `/reload`).
+    pub(crate) fn parse_to_run(&mut self, op: u8, text: &str) -> Option<parse_cache::CachedParse> {
+        let cmd = &mut self.cmd;
+        let lvl = cmd.levels.get(usize::from(op.min(4)))?;
+        let (data, paths) = (&cmd.data, cmd.paths);
+        let parse = || match analyse_with(lvl, data, text, op, paths.parser_no_alloc) {
+            Ok(p) => Ok(std::sync::Arc::new(p)),
+            Err(msgs) => Err(std::sync::Arc::new(msgs)),
         };
-        self.in_context(|sv| sv.run_parsed(src, &parsed))
+        if !paths.parse_cache {
+            return Some(parse());
+        }
+        if let Some(hit) = cmd.parse_cache.get(op, text) {
+            return Some(hit);
+        }
+        let fresh = parse();
+        cmd.parse_cache.insert(op, text, fresh.clone());
+        Some(fresh)
     }
 
     /// Success message: to the player if the rule allows it, to the output of a command block
@@ -668,7 +793,7 @@ impl Server {
                     self.chat_out(Event::Chat { component: Box::new(msg), tag: ChatTag::System });
                 }
             }
-            Origin::Block(p) => self.cb_output(p, msg, true),
+            Origin::Block(p) => self.command_block_output(p, msg, true),
             Origin::Minecart(_) | Origin::Server => {}
         }
         if let Some(c) = admin {
@@ -689,7 +814,7 @@ impl Server {
         match src.origin {
             Origin::Player => !host_current,
             Origin::Server => true,
-            Origin::Block(p) => self.rule("minecraft:command_block_output", true) && self.cb_tracks_output(p),
+            Origin::Block(p) => self.rule("minecraft:command_block_output", true) && self.command_block_tracks_output(p),
             Origin::Minecart(id) => {
                 self.rule("minecraft:command_block_output", true)
                     && self.cart_ref(id).is_none_or(|c| crate::nbtio::int(&c.nbt, "TrackOutput").is_none_or(|v| v != 0))
@@ -724,7 +849,7 @@ impl Server {
         // which stays the player when they are the one who typed the command.
         match src.origin {
             Origin::Player => self.system(msg),
-            Origin::Block(p) => self.cb_output(p, msg, false),
+            Origin::Block(p) => self.command_block_output(p, msg, false),
             Origin::Minecart(_) | Origin::Server => {}
         }
     }
@@ -754,7 +879,7 @@ impl Server {
             Origin::Player => {
                 self.chat_out(Event::Chat { component: Box::new(c), tag: ChatTag::System });
             }
-            Origin::Block(p) => self.cb_output(p, c, false),
+            Origin::Block(p) => self.command_block_output(p, c, false),
             Origin::Minecart(_) | Origin::Server => {}
         }
     }
@@ -810,11 +935,15 @@ impl Server {
     }
 
     fn run_tag_functions(&mut self, tag: &str) {
-        if self.cmd.function_tags.get(tag).is_none_or(Vec::is_empty) {
-            return;
-        }
+        let Some(members) = self.cmd.function_tags.get(tag).filter(|m| !m.is_empty()) else { return };
         let src = self.server_source();
-        let _ = self.run_functions(&src, &format!("#{tag}"), false);
+        if self.cmd.paths.function_cache {
+            // The tag key is already complete: its members are shared, not looked up by name again.
+            let ids = exec::FunctionIds::Tag(members.clone());
+            self.run_function_ids(&src, &ids);
+        } else {
+            let _ = self.run_functions(&src, &format!("#{tag}"), false);
+        }
     }
 
     /// Speed of a clock sent to the client (0 when paused or with no time advance).
@@ -835,7 +964,11 @@ impl Server {
             if rate == 1.0 {
                 c.1 += 1;
             } else {
-                let acc = self.cmd.clock_acc.entry(c.0.clone()).or_insert(0.0);
+                // The clock name is copied only the first time (no allocation per tick).
+                if !self.cmd.clock_acc.contains_key(&c.0) {
+                    self.cmd.clock_acc.insert(c.0.clone(), 0.0);
+                }
+                let Some(acc) = self.cmd.clock_acc.get_mut(&c.0) else { continue };
                 *acc += rate;
                 let whole = acc.floor();
                 *acc -= whole;

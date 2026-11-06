@@ -263,6 +263,9 @@ pub(crate) struct Ids {
     pub sculk_shrieker: u16,
     pub dried_ghast: u16,
     pub command_block: u16,
+    /// The two other command blocks, told apart by identifier at each of their ticks.
+    pub chain_command_block: u16,
+    pub repeating_command_block: u16,
     pub lightning_rod: u16,
     pub carved_pumpkin: u16,
     /// G6-F09a: blocks under which speleothems grow.
@@ -673,6 +676,8 @@ impl Table {
             sculk_shrieker: f("sculk_shrieker"),
             dried_ghast: f("dried_ghast"),
             command_block: f("command_block"),
+            chain_command_block: f("chain_command_block"),
+            repeating_command_block: f("repeating_command_block"),
             lightning_rod: f("lightning_rod"),
             carved_pumpkin: f("carved_pumpkin"),
             dripstone_block: f("dripstone_block"),

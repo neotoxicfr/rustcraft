@@ -164,8 +164,8 @@ fn nested_function_tags_are_resolved() {
         write(&tags.join("req.json"), r#"{"values":["t:missing","t:a"]}"#);
     });
     let ft = &t.s.cmd.function_tags;
-    assert_eq!(ft.get("t:outer").map(Vec::as_slice), Some(&["t:a".to_owned(), "t:b".to_owned()][..]));
-    assert_eq!(ft.get("t:opt").map(Vec::as_slice), Some(&["t:b".to_owned()][..]));
+    assert_eq!(ft.get("t:outer").map(|m| &m[..]), Some(&["t:a".to_owned(), "t:b".to_owned()][..]));
+    assert_eq!(ft.get("t:opt").map(|m| &m[..]), Some(&["t:b".to_owned()][..]));
     for k in ["t:cyc1", "t:cyc2", "t:req"] {
         assert!(!ft.contains_key(k), "{k} should have been refused");
     }

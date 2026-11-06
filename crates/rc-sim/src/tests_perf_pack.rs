@@ -37,7 +37,7 @@ fn perf_pack_functions_compile() {
         refused.push(format!("{name}: {why}"));
     }
     assert!(p.s.cmd.levels.len() > 2, "command tree missing: nothing was checked");
-    assert_eq!(p.s.cmd.function_tags.get("minecraft:tick"), Some(&vec!["perf:tick".to_owned()]));
+    assert_eq!(p.s.cmd.function_tags.get("minecraft:tick").map(|m| &m[..]), Some(&["perf:tick".to_owned()][..]));
     crate::tests_g3f13::finish(p, dir);
     assert!(refused.is_empty(), "{} functions refused:\n{}", refused.len(), refused.join("\n"));
 }
