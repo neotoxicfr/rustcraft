@@ -328,15 +328,34 @@ fn trace_columns(changes: &[[i32; 3]]) -> Vec<(i32, i32)> {
 
 /// Missing sky layer: the one the game reads in its place (lowest plane of the first
 /// stored layer above, otherwise 15 everywhere).
-fn implied_sky(layers: &[LightLayer], i: usize) -> [u8; rc_world::LIGHT_BYTES] {
-    match layers[i + 1..].iter().flatten().next() {
-        None => [0xff; rc_world::LIGHT_BYTES],
+fn implied_sky(layers: &[LightLayer], i: usize) -> std::sync::Arc<[u8; rc_world::LIGHT_BYTES]> {
+    implied_sky_with(layers, i, rc_light::uniform_light_interned())
+}
+
+/// [`implied_sky`] with the switch given. Interned: a uniform plane (nothing stored above, or a
+/// plane all 0 or all 15) gives the shared layer, without allocating for the 9 columns around
+/// each change.
+fn implied_sky_with(
+    layers: &[LightLayer],
+    i: usize,
+    intern_uniform: bool,
+) -> std::sync::Arc<[u8; rc_world::LIGHT_BYTES]> {
+    let above = layers[i + 1..].iter().flatten().next();
+    if intern_uniform {
+        let plane = above.map_or(&[0xff; 128][..], |above| &above[..128]);
+        let (or, and) = plane.iter().fold((0u8, 0xffu8), |(or, and), &v| (or | v, and & v));
+        if let Some(shared) = rc_world::shared_layer_from_or_and(or, and) {
+            return shared;
+        }
+    }
+    match above {
+        None => std::sync::Arc::new([0xff; rc_world::LIGHT_BYTES]),
         Some(above) => {
             let mut out = [0u8; rc_world::LIGHT_BYTES];
             for y in 0..16 {
                 out[y * 128..y * 128 + 128].copy_from_slice(&above[..128]);
             }
-            out
+            std::sync::Arc::new(out)
         }
     }
 }
@@ -1099,7 +1118,7 @@ impl Server {
             let Some(Some(c)) = chunks.get_mut(&(x, z)) else { return };
             let Some(iu) = usize::try_from(i).ok().filter(|&i| i < c.sky.len()) else { return };
             if c.sky[iu].is_none() {
-                c.sky[iu] = Some(std::sync::Arc::new(implied_sky(&c.sky, iu)));
+                c.sky[iu] = Some(implied_sky(&c.sky, iu));
                 created.push((x, z, i, true));
             }
             if c.block[iu].is_none() {
@@ -1252,6 +1271,37 @@ impl Server {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use rc_world::LIGHT_BYTES;
+
+    /// The implied sky layer has the same bytes with and without interning, for each kind of
+    /// layer above (none, all 0, all 15, lit plane, uniform plane over a lit rest); the shared
+    /// layer is returned exactly when the plane read is uniform and interning is on.
+    #[test]
+    fn implied_sky_same_bytes_shared_when_uniform() {
+        let mut lit_plane = [0u8; LIGHT_BYTES];
+        lit_plane[127] = 0x0f;
+        let mut dark_plane_lit_rest = [0x77u8; LIGHT_BYTES];
+        dark_plane_lit_rest[..128].fill(0);
+        let above: [(rc_world::LightLayer, bool); 5] = [
+            (None, true),
+            (Some(rc_world::zero_layer()), true),
+            (Some(Arc::new([0xff; LIGHT_BYTES])), true),
+            (Some(Arc::new(lit_plane)), false),
+            (Some(Arc::new(dark_plane_lit_rest)), true),
+        ];
+        for (n, (layer, uniform_plane)) in above.into_iter().enumerate() {
+            let layers = vec![None, None, layer, None];
+            let old = super::implied_sky_with(&layers, 0, false);
+            let new = super::implied_sky_with(&layers, 0, true);
+            assert_eq!(old, new, "case {n}");
+            let shared = Arc::ptr_eq(&new, &rc_world::zero_layer()) || Arc::ptr_eq(&new, &rc_world::full_layer());
+            assert_eq!(shared, uniform_plane, "case {n}");
+            assert!(!Arc::ptr_eq(&old, &rc_world::zero_layer()) && !Arc::ptr_eq(&old, &rc_world::full_layer()));
+        }
+    }
+
     /// Diagonal flow of 126 cells (a single chained group) plus an isolated change
     /// far away: the trace writes the whole group's box at ±16 (corners included), and the
     /// isolated change's zone, nothing else.

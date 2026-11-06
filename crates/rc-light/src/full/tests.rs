@@ -139,18 +139,72 @@ fn cases(height: usize) -> Vec<Case> {
         }
     }
     out.push((cols, false));
+    // A whole section of sea lanterns over a stone floor in every column: block sheet all 15,
+    // sky sheet all 0 under the cover (both uniform kinds, with and without sky).
+    let mut cols: Vec<Option<Vec<u32>>> = (0..9).map(|_| Some(flat(16))).collect();
+    for c in cols.iter_mut().flatten() {
+        c[256 * 32..256 * 48].fill(6);
+    }
+    out.push((cols.clone(), true));
+    out.push((cols, false));
     out
 }
 
+/// The 8 resolution combinations; interning (only applied when the sheets are packed) on for
+/// half of them, the all-off one excluded and the all-on one included, so that each test run stays short.
 const COMBOS: [FullOpts; 8] = {
     let mut v = [FullOpts::OLD; 8];
     let mut i = 0;
     while i < 8 {
-        v[i] = FullOpts { skip: i & 1 != 0, noemit: i & 2 != 0, layout: i & 4 != 0 };
+        let intern_uniform = (i as u32).count_ones() % 2 == 1;
+        v[i] = FullOpts { skip: i & 1 != 0, noemit: i & 2 != 0, layout: i & 4 != 0, intern_uniform };
         i += 1;
     }
     v
 };
+
+/// The old resolution path, with and without interning, also gives the frozen copy.
+#[test]
+fn light_chunk_inner_matches_frozen_reference() {
+    let t = tables();
+    let height = 96;
+    for (n, (cols, has_sky)) in cases(height as usize).iter().enumerate() {
+        let refs: Columns = std::array::from_fn(|i| cols[i].as_deref());
+        let want = reference::light_chunk(&t, refs, height, *has_sky);
+        for intern in [false, true] {
+            assert_eq!(light_chunk_inner(&t, refs, height, *has_sky, intern), want, "case {n}, interned {intern}");
+        }
+    }
+}
+
+/// With interning, every all-0 or all-0xff sheet of both paths is a shared one and no other
+/// sheet is; without it, none is shared. The cases must hold both kinds (explicit failure).
+#[test]
+fn uniform_sheets_shared_only_when_interned() {
+    let t = tables();
+    let height = 96;
+    let (zero, full) = (rc_world::zero_layer(), rc_world::full_layer());
+    let (mut zeros, mut fulls) = (0usize, 0usize);
+    for (n, (cols, has_sky)) in cases(height as usize).iter().enumerate() {
+        let refs: Columns = std::array::from_fn(|i| cols[i].as_deref());
+        for intern in [false, true] {
+            let new_opts = FullOpts { skip: true, noemit: true, layout: true, intern_uniform: intern };
+            let new = light_chunk_opt(&t, refs, [None; 9], height, *has_sky, new_opts);
+            let old = light_chunk_inner(&t, refs, height, *has_sky, intern);
+            for (sky, block) in [new, old] {
+                for sheet in sky.iter().chain(&block).flatten() {
+                    let is_zero = Arc::ptr_eq(sheet, &zero);
+                    let is_full = Arc::ptr_eq(sheet, &full);
+                    let uniform = rc_world::shared_layer_equal_to(sheet).is_some();
+                    assert_eq!(is_zero || is_full, intern && uniform, "case {n}, interned {intern}");
+                    zeros += usize::from(is_zero);
+                    fulls += usize::from(is_full);
+                }
+            }
+        }
+    }
+    assert!(zeros > 0 && fulls > 0, "cases without both uniform kinds: {zeros} zero, {fulls} full");
+}
 
 #[test]
 fn light_chunk_opt_matches_frozen_reference() {

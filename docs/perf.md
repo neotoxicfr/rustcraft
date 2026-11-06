@@ -5660,3 +5660,51 @@ profile, machine loaded by other agents compiling, best of 5 or 7; three runs, t
   decorations, noise floors), `crowd-1000`, `tnt`, `dropped-items` (collision walks); memstats at
   world opening (−1 MB of heap expected).
 
+## C5-M06: uniform light sheets shared (all 0 under the terrain, all 15) (06/11, loaded machine)
+
+Switch `RUSTCRAFT_OPT_INTERN_UNIFORM_LIGHT` (default on; `0`: every sheet has its own 2 KB). A light
+sheet whose bytes are all 0 (sky under the terrain, the bulk of the sky sheets) or all 0xff (a
+section of sea lanterns, the full sky sheets an official server sends as data) is replaced by one
+process-wide shared sheet (`rc_world::zero_layer`, new `rc_world::full_layer`). Safe because every
+light writer goes through `Arc::make_mut`, which copies a shared sheet before writing; the first
+write into a shared sheet pays the allocation that its creation no longer pays (never more
+allocations than before). Applied where sheets are made: full light of a new chunk (both
+resolution paths; OR and AND of the bytes gathered while packing, which also replace the old
+"empty" scan), save loading (`chunk::light_layer`), packet decoding (`read_layers`, client), and
+the sky sheet implied around a change (`play::implied_sky`, 9 columns per change, plane checked:
+128 bytes). The send shortcut (`ptr_eq` against the zero sheet in `light_data_with`) now hits for
+those sheets instead of scanning them. `Column::heap_bytes` leaves out both shared sheets; the
+server memstats line already counts a sheet once per pointer. Names: `layers_upto` →
+`pack_sheets_below_top`, `layers` → `pack_sheets`, `trailing` → `drop_only_top_empty`, the
+"empty" closure → `empty_byte`.
+
+Proof: frozen reference of the full light (`full::tests`, all resolution combinations, interning
+on in half of them, plus the old path with and without; new case: a section of sea lanterns),
+pointer test (with interning every uniform sheet and only those is shared; without, none; both
+kinds required), rc-world tests (only uniform sheets shared, a write into a shared sheet splits it
+off without touching the other holders, `heap_bytes`), save reading and packet decoding (bytes kept,
+sharing only when on), implied sky (same bytes, shared exactly when the plane is uniform), and the
+official model world (`RUSTCRAFT_SOLO_WORLD`, 9,626 chunks): every layer read keeps its saved
+bytes, the light packets (with and without the empty mask) and the saved compound equal those of a
+copy whose layers are all separate. Sabotages caught: interning when the AND is 0 instead of the OR
+(frozen-reference tests), interning whatever the switch (pointer test), uniformity checked on the
+first 16 bytes only (save reading and model world tests).
+
+Memory (counted, not timed):
+
+| Where | Sheets | Own allocations, off | Own allocations, on |
+|---|---|---|---|
+| Model world loaded from its save (3 dimensions, 9,626 chunks) | 19,952 | 19,952 (39.0 MiB) | 10,351 (20.2 MiB, −48 %) |
+| Full light of the 1,248 reference capture columns (`light_chunk` bench) | 15,474 | 15,474 (30.2 MiB) | 6,342 (12.4 MiB, −59 %) |
+
+Time, loaded machine. `light_chunk` bench matrix (minimum of 7 alternated passes, all three
+resolution switches with scans): 64 columns, 1 thread 65.8 ms shared / 70.2 ms not; 256 columns,
+all threads 16.4 / 15.6 ms (first run 13.7 / 14.4): within the noise both ways. Micro-bench
+(`rc-world` `bench_shared_sheets`, ns per sheet, two runs): uniformity check of an all-0 sheet
+28.9 / 29.2, of a sheet lit in its middle 15.3 / 14.8, lit from its first byte 0.6 / 0.6; own
+allocation it replaces 52.5 / 51.0; first write into a shared sheet (copy) 43.3 / 42.7.
+Not applicable: multi-core (the light pool is unchanged, the shared sheets are read-only), GPU
+(the light upload reads the same bytes), disk and network bytes (identical). To settle on the
+quiet-machine scene bench: `plains12`, `plains32`, `cave`, `forest`, `redstone` (memstats line
+"server: … light X MB (N layers)", client `Column::heap_bytes`, light ms per chunk, tick p99).
+
