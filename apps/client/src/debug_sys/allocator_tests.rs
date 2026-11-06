@@ -69,29 +69,86 @@ fn direct_calls_honour_every_alignment_and_size() {
     }
 }
 
-/// Same check through the global allocator's own entry points under every switch combination
-/// (direct or aligned calls, single or separate checks), counting on. Flips the process-wide
-/// flags: every combination is a correct allocator, other tests running meanwhile are unharmed.
+unsafe fn global_alloc(layout: Layout, zeroed: bool) -> *mut u8 {
+    // SAFETY: same contract as the caller's.
+    unsafe { if zeroed { CountingAllocator.alloc_zeroed(layout) } else { CountingAllocator.alloc(layout) } }
+}
+
+unsafe fn global_realloc(p: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+    // SAFETY: same contract as the caller's.
+    unsafe { CountingAllocator.realloc(p, layout, new_size) }
+}
+
+/// Same check through the global allocator's own entry points under all 8 combinations of
+/// direct or aligned calls, single or separate checks, counting off or on (each arm of the
+/// dispatch: inline paths and the out-of-line one). Holds the flag lock, so that each combination
+/// is the one tested; with counting on, `ALLOCATED` must grow.
 #[test]
 fn every_switch_combination_honours_alignment() {
-    unsafe fn alloc(layout: Layout, zeroed: bool) -> *mut u8 {
-        // SAFETY: same contract as the caller's.
-        unsafe { if zeroed { CountingAllocator.alloc_zeroed(layout) } else { CountingAllocator.alloc(layout) } }
-    }
-    unsafe fn realloc(p: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // SAFETY: same contract as the caller's.
-        unsafe { CountingAllocator.realloc(p, layout, new_size) }
-    }
-    for flags in [ALIGNED_CALLS, SEPARATE_CHECKS, ALIGNED_CALLS | SEPARATE_CHECKS, COUNT_BYTES, 0] {
-        set_allocator_flag(ALIGNED_CALLS, flags & ALIGNED_CALLS != 0);
-        set_allocator_flag(SEPARATE_CHECKS, flags & SEPARATE_CHECKS != 0);
+    let _flags = lock_allocator_flags();
+    for combination in 0..8u8 {
+        let flags = [ALIGNED_CALLS, SEPARATE_CHECKS, COUNT_BYTES]
+            .into_iter()
+            .enumerate()
+            .filter(|(bit, _)| combination & (1 << bit) != 0)
+            .fold(0, |flags, (_, flag)| flags | flag);
+        ALLOCATOR_FLAGS.store(flags, Ordering::Relaxed);
+        let counted_before = ALLOCATED.load(Ordering::Relaxed);
         for align in ALIGNMENTS {
             for size in sizes().step_by(7) {
                 // SAFETY: the global allocator is valid (what this test checks).
-                unsafe { check_block(Layout::from_size_align(size, align).unwrap(), alloc, realloc) };
+                unsafe { check_block(Layout::from_size_align(size, align).unwrap(), global_alloc, global_realloc) };
             }
         }
+        let counted = ALLOCATED.load(Ordering::Relaxed) - counted_before;
+        ALLOCATOR_FLAGS.store(0, Ordering::Relaxed);
+        if flags & COUNT_BYTES != 0 {
+            assert!(counted > 0, "flags {flags:#06b}: counting on, nothing counted");
+        }
     }
+}
+
+/// Growths of 768 to 1,536 bytes (a `Vec` of 12-byte elements doubling from 64 to 128): the
+/// tracer files them by the block requested, 1,536 bytes "above otherwise" (the case the aligned
+/// calls padded), not by the 768 bytes of growth. Out-of-line path called directly with the
+/// global flags clear (flag lock held): no other allocation is traced, the count is exact.
+#[test]
+fn tracer_files_a_reallocation_by_its_new_block_size() {
+    const GROWTHS: u64 = 200;
+    let _flags = lock_allocator_flags();
+    let (small, grown) = (Layout::from_size_align(768, 4).unwrap(), 1536);
+    let above_otherwise_before = crate::alloc_trace::BY_SIZE[2].load(Ordering::Relaxed);
+    for _ in 0..GROWTHS {
+        // SAFETY: a block of `small` grown once, then freed.
+        unsafe {
+            let p = mimalloc_alloc(small, false);
+            mi::mi_free(realloc_with_flags(TRACE, p, small, grown).cast());
+        }
+    }
+    let above_otherwise = crate::alloc_trace::BY_SIZE[2].load(Ordering::Relaxed) - above_otherwise_before;
+    assert_eq!(above_otherwise, GROWTHS, "growths 768 -> 1,536 B not filed by their new block size");
+}
+
+/// Same filing on the inline path of the separate checks (`ALLOCATOR_SINGLE_FLAG=0`), which reads
+/// the tracer bit from the global flags: other tests' allocations are traced meanwhile, hence "at
+/// least".
+#[test]
+fn tracer_files_by_block_size_with_separate_checks() {
+    const GROWTHS: u64 = 200;
+    let _flags = lock_allocator_flags();
+    let small = Layout::from_size_align(768, 4).unwrap();
+    let above_otherwise_before = crate::alloc_trace::BY_SIZE[2].load(Ordering::Relaxed);
+    ALLOCATOR_FLAGS.store(SEPARATE_CHECKS | TRACE, Ordering::Relaxed);
+    for _ in 0..GROWTHS {
+        // SAFETY: a block of `small` grown once, then freed.
+        unsafe {
+            let p = mimalloc_alloc(small, false);
+            mi::mi_free(CountingAllocator.realloc(p, small, 1536).cast());
+        }
+    }
+    ALLOCATOR_FLAGS.store(0, Ordering::Relaxed);
+    let above_otherwise = crate::alloc_trace::BY_SIZE[2].load(Ordering::Relaxed) - above_otherwise_before;
+    assert!(above_otherwise >= GROWTHS, "separate checks: {above_otherwise} of {GROWTHS} growths filed above 1 KiB");
 }
 
 /// Why the plain call needs `align <= size`: 8-byte blocks of the plain call sit every 8 bytes,
@@ -204,14 +261,15 @@ fn fixed_allocation_script() {
 }
 
 /// With counting on, `ALLOCATED` grows by exactly what the script allocates (growth by
-/// reallocation included), with the single flag and with the separate checks. The counter is
-/// process-wide: tries again while other tests' allocations add to it or switch it off; a path
+/// reallocation included), with the single flag and with the separate checks (flag lock held).
+/// The counter is process-wide: tries again while other tests' allocations add to it; a path
 /// that miscounts never gives the exact total.
 #[test]
 fn allocated_bytes_counts_a_fixed_script() {
+    let _flags = lock_allocator_flags();
     for separate in [false, true] {
         set_allocator_flag(SEPARATE_CHECKS, separate);
-        let exact = (0..1000).any(|_| allocated_bytes(fixed_allocation_script) == SCRIPT_BYTES);
+        let exact = (0..1000).any(|_| allocated_bytes_unlocked(fixed_allocation_script) == SCRIPT_BYTES);
         set_allocator_flag(SEPARATE_CHECKS, false);
         assert!(exact, "separate checks {separate}: never counted exactly {SCRIPT_BYTES} B");
     }
@@ -231,6 +289,28 @@ fn mimalloc_option_indices_were_checked_for_this_version() {
     assert_eq!((o::PAGE_COMMIT_ON_DEMAND, o::PURGE_DELAY), expected);
 }
 
+/// The long purge delay is ten times the linked library's own (v3 1 s, v2 10 ms, read from its
+/// `options.c`), and nothing when the library never purges or purges at once.
+#[test]
+fn long_purge_delay_is_relative_to_the_library_delay() {
+    let index = mimalloc_options::PURGE_DELAY.unwrap();
+    assert_eq!(library_purge_delay(index), if MIMALLOC_V3 { 1000 } else { 10 }, "library purge delay");
+    assert_eq!(long_purge_delay_from(1000), Some(10_000));
+    assert_eq!(long_purge_delay_from(10), Some(100));
+    assert_eq!(long_purge_delay_from(0), None);
+    assert_eq!(long_purge_delay_from(-1), None);
+}
+
+/// A purge delay set by the user under its legacy name (`MIMALLOC_RESET_DELAY`, still read by
+/// mimalloc) wins over the switch, like the current name.
+#[test]
+fn user_purge_delay_counts_under_both_names() {
+    for name in ["MIMALLOC_PURGE_DELAY", "MIMALLOC_RESET_DELAY"] {
+        assert!(user_set_purge_delay(|read| read == name), "{name} set by the user is ignored");
+    }
+    assert!(!user_set_purge_delay(|_| false));
+}
+
 /// The old global allocator, as it was: two flags each loaded per allocation, then mimalloc's
 /// aligned entry points (reference of the micro-bench).
 struct TwoFlagAllocator;
@@ -246,7 +326,7 @@ unsafe impl GlobalAlloc for TwoFlagAllocator {
             ALLOCATED.fetch_add(layout.size() as u64, Ordering::Relaxed);
         }
         if OLD_TRACE.load(Ordering::Relaxed) {
-            crate::alloc_trace::sample(layout.size());
+            crate::alloc_trace::sample(layout.size(), layout.size());
         }
         // SAFETY: same contract as the caller's.
         unsafe { mimalloc::MiMalloc.alloc(layout) }

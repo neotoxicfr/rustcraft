@@ -62,10 +62,27 @@ pub fn read_allocator_switches() -> (bool, bool) {
     (direct, single_flag)
 }
 
+/// Tests that change `ALLOCATOR_FLAGS` hold this, so that no other one flips a bit under them.
+#[cfg(test)]
+static ALLOCATOR_FLAGS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn lock_allocator_flags() -> std::sync::MutexGuard<'static, ()> {
+    // A test that failed while holding it leaves nothing half-done: the flags are set again.
+    ALLOCATOR_FLAGS_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Benches: bytes allocated while `f` runs (counter of the whole process: run the bench alone,
 /// other threads would count too).
 #[cfg(test)]
 pub fn allocated_bytes(f: impl FnOnce()) -> u64 {
+    let _flags = lock_allocator_flags();
+    allocated_bytes_unlocked(f)
+}
+
+/// `allocated_bytes` for a caller that already holds the flag lock.
+#[cfg(test)]
+fn allocated_bytes_unlocked(f: impl FnOnce()) -> u64 {
     count_allocated_bytes(true);
     let before = ALLOCATED.load(Ordering::Relaxed);
     f();
@@ -80,22 +97,27 @@ pub struct CountingAllocator;
 
 // SAFETY: every call goes to mimalloc with the caller's layout (see `mimalloc_alloc`).
 unsafe impl GlobalAlloc for CountingAllocator {
+    // The old paths stay inline (no call out of line), so that a switch at 0 costs what the old
+    // code cost and its A/B is fair; counting or tracing alone goes out of line. One copy of each
+    // old path, flags read at run time: a copy per flag value made every path slower (bigger body
+    // inlined at each site, micro-bench of 06/11).
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY (the three arms): same contract as the caller's, passed on unchanged.
+        // SAFETY (every arm): same contract as the caller's, passed on unchanged.
         match ALLOCATOR_FLAGS.load(Ordering::Relaxed) {
             0 => unsafe { mimalloc_alloc(layout, false) },
-            // Old path kept inline, so that its A/B against the direct call is fair.
             ALIGNED_CALLS => unsafe { mimalloc::MiMalloc.alloc(layout) },
+            flags if flags & SEPARATE_CHECKS != 0 => unsafe { alloc_after_separate_checks(flags, layout, false) },
             flags => unsafe { alloc_with_flags(flags, layout, false) },
         }
     }
     #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        // SAFETY (the three arms): same contract as the caller's, passed on unchanged.
+        // SAFETY (every arm): same contract as the caller's, passed on unchanged.
         match ALLOCATOR_FLAGS.load(Ordering::Relaxed) {
             0 => unsafe { mimalloc_alloc(layout, true) },
             ALIGNED_CALLS => unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) },
+            flags if flags & SEPARATE_CHECKS != 0 => unsafe { alloc_after_separate_checks(flags, layout, true) },
             flags => unsafe { alloc_with_flags(flags, layout, true) },
         }
     }
@@ -106,21 +128,85 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
     #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // SAFETY (the three arms): same contract as the caller's, passed on unchanged.
+        // SAFETY (every arm): same contract as the caller's, passed on unchanged.
         match ALLOCATOR_FLAGS.load(Ordering::Relaxed) {
             0 => unsafe { mimalloc_realloc(ptr, layout, new_size) },
             ALIGNED_CALLS => unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) },
+            flags if flags & SEPARATE_CHECKS != 0 => unsafe { realloc_after_separate_checks(flags, ptr, layout, new_size) },
             flags => unsafe { realloc_with_flags(flags, ptr, layout, new_size) },
         }
     }
 }
 
-/// Allocation while counting, tracing or an old path is on: out of line, so that the usual path
-/// stays a load, a branch and a call.
+/// `RUSTCRAFT_OPT_ALLOCATOR_SINGLE_FLAG=0`: the old sequence, inline as it was (no call out of
+/// line): counting and tracing each loaded and tested on its own, then the call.
+#[inline(always)]
+unsafe fn alloc_after_separate_checks(flags: u8, layout: Layout, zeroed: bool) -> *mut u8 {
+    record_with_separate_checks(layout.size(), layout.size());
+    // SAFETY: same contract as the caller's, passed on unchanged.
+    unsafe { mimalloc_alloc_by_flags(flags, layout, zeroed) }
+}
+
+/// Reallocation counterpart of `alloc_after_separate_checks`.
+#[inline(always)]
+unsafe fn realloc_after_separate_checks(flags: u8, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+    if new_size > layout.size() {
+        record_with_separate_checks(new_size - layout.size(), new_size);
+    }
+    // SAFETY: same contract as the caller's, passed on unchanged.
+    unsafe { mimalloc_realloc_by_flags(flags, ptr, layout, new_size) }
+}
+
+/// Counts and traces `new_bytes` (the block now has `block_size` bytes), one flag load per check
+/// as when counting and tracing were two flags.
+#[inline(always)]
+fn record_with_separate_checks(new_bytes: usize, block_size: usize) {
+    if ALLOCATOR_FLAGS.load(Ordering::Relaxed) & COUNT_BYTES != 0 {
+        ALLOCATED.fetch_add(new_bytes as u64, Ordering::Relaxed);
+    }
+    if ALLOCATOR_FLAGS.load(Ordering::Relaxed) & TRACE != 0 {
+        crate::alloc_trace::sample(new_bytes, block_size);
+    }
+}
+
+/// Allocation while counting or tracing is on: out of line, so that the usual path stays a load,
+/// a branch and a call.
 #[cold]
 #[inline(never)]
 unsafe fn alloc_with_flags(flags: u8, layout: Layout, zeroed: bool) -> *mut u8 {
-    record_allocation(flags, layout.size());
+    record_allocation(flags, layout.size(), layout.size());
+    // SAFETY: same contract as the caller's, passed on unchanged.
+    unsafe { mimalloc_alloc_by_flags(flags, layout, zeroed) }
+}
+
+/// Reallocation while counting or tracing is on (see `alloc_with_flags`).
+#[cold]
+#[inline(never)]
+unsafe fn realloc_with_flags(flags: u8, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+    if new_size > layout.size() {
+        record_allocation(flags, new_size - layout.size(), new_size);
+    }
+    // SAFETY: same contract as the caller's, passed on unchanged.
+    unsafe { mimalloc_realloc_by_flags(flags, ptr, layout, new_size) }
+}
+
+/// Counts and traces `new_bytes` newly allocated, in a block now of `block_size` bytes (the
+/// tracer sorts requests by block size).
+fn record_allocation(flags: u8, new_bytes: usize, block_size: usize) {
+    if flags & COUNT_BYTES != 0 {
+        ALLOCATED.fetch_add(new_bytes as u64, Ordering::Relaxed);
+    }
+    if flags & TRACE != 0 {
+        crate::alloc_trace::sample(new_bytes, block_size);
+    }
+}
+
+/// Direct or aligned allocation, as `ALIGNED_CALLS` says.
+///
+/// # Safety
+/// Same contract as [`GlobalAlloc::alloc`].
+#[inline(always)]
+unsafe fn mimalloc_alloc_by_flags(flags: u8, layout: Layout, zeroed: bool) -> *mut u8 {
     // SAFETY: same contract as the caller's, passed on unchanged.
     unsafe {
         match (flags & ALIGNED_CALLS != 0, zeroed) {
@@ -131,13 +217,12 @@ unsafe fn alloc_with_flags(flags: u8, layout: Layout, zeroed: bool) -> *mut u8 {
     }
 }
 
-/// Reallocation while counting, tracing or an old path is on (see `alloc_with_flags`).
-#[cold]
-#[inline(never)]
-unsafe fn realloc_with_flags(flags: u8, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-    if new_size > layout.size() {
-        record_allocation(flags, new_size - layout.size());
-    }
+/// Direct or aligned reallocation, as `ALIGNED_CALLS` says.
+///
+/// # Safety
+/// Same contract as [`GlobalAlloc::realloc`].
+#[inline(always)]
+unsafe fn mimalloc_realloc_by_flags(flags: u8, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
     // SAFETY: same contract as the caller's, passed on unchanged.
     unsafe {
         if flags & ALIGNED_CALLS == 0 {
@@ -145,22 +230,6 @@ unsafe fn realloc_with_flags(flags: u8, ptr: *mut u8, layout: Layout, new_size: 
         } else {
             mimalloc::MiMalloc.realloc(ptr, layout, new_size)
         }
-    }
-}
-
-/// Counts and traces `bytes` newly allocated.
-fn record_allocation(flags: u8, bytes: usize) {
-    let (count, trace) = if flags & SEPARATE_CHECKS == 0 {
-        (flags & COUNT_BYTES != 0, flags & TRACE != 0)
-    } else {
-        // Old sequence: one load per check, as when counting and tracing were two flags.
-        (ALLOCATOR_FLAGS.load(Ordering::Relaxed) & COUNT_BYTES != 0, ALLOCATOR_FLAGS.load(Ordering::Relaxed) & TRACE != 0)
-    };
-    if count {
-        ALLOCATED.fetch_add(bytes as u64, Ordering::Relaxed);
-    }
-    if trace {
-        crate::alloc_trace::sample(bytes);
     }
 }
 
@@ -384,20 +453,50 @@ pub fn commit_on_demand() -> CommitOnDemand {
     CommitOnDemand::Applied(on)
 }
 
-/// Purge delay set by `RUSTCRAFT_OPT_MI_PURGE_LONG`: freed pages stay committed 10 s instead of
-/// the library's 1 s (v3), fewer decommit/recommit cycles while chunks come and go.
-const LONG_PURGE_DELAY_MS: i64 = 10_000;
+/// Variables under which mimalloc reads its purge delay: the current name, then the legacy one it
+/// still honours (v2 and v3).
+const PURGE_DELAY_VARIABLES: [&str; 2] = ["MIMALLOC_PURGE_DELAY", "MIMALLOC_RESET_DELAY"];
+
+/// The user set mimalloc's purge delay under one of its names (`is_set` reads one variable).
+fn user_set_purge_delay(is_set: impl Fn(&str) -> bool) -> bool {
+    PURGE_DELAY_VARIABLES.into_iter().any(is_set)
+}
+
+/// How much longer `RUSTCRAFT_OPT_MI_PURGE_LONG` keeps freed pages committed than the library
+/// does: relative, because the library's delay differs by version (v3 1 s, v2 10 ms).
+const PURGE_DELAY_FACTOR: i64 = 10;
+
+/// Long delay for a library delay of `library_ms`; none when the library never purges (negative)
+/// or purges at once (0): there is nothing to lengthen.
+fn long_purge_delay_from(library_ms: i64) -> Option<i64> {
+    (library_ms > 0).then(|| library_ms * PURGE_DELAY_FACTOR)
+}
+
+/// Purge delay of the linked library, milliseconds (its default unless set).
+fn library_purge_delay(index: i32) -> i64 {
+    unsafe extern "C" {
+        fn mi_option_get(option: i32) -> std::ffi::c_long;
+    }
+    // SAFETY: function of the linked mimalloc library; index read from its header (`build.rs`).
+    i64::from(unsafe { mi_option_get(index) })
+}
 
 /// Longer purge delay of mimalloc, OFF by default (`RUSTCRAFT_OPT_MI_PURGE_LONG=1` turns it on):
-/// it can only trade memory for processor time, to decide on the scene bench. A
-/// `MIMALLOC_PURGE_DELAY` set by the user wins. Returns the delay set, if any.
+/// freed pages stay committed ten times the library's delay (v3 1 s → 10 s, v2 10 ms → 100 ms),
+/// fewer decommit/recommit cycles while chunks come and go. It can only trade memory for
+/// processor time, to decide on the scene bench. A purge delay set by the user under either of
+/// its names wins. Returns the delay set, if any.
 pub fn long_purge_delay() -> Option<i64> {
     let index = mimalloc_options::PURGE_DELAY?;
-    if rc_data::env_os!("MIMALLOC_PURGE_DELAY").is_some() || !rc_data::opt_switch!("RUSTCRAFT_OPT_MI_PURGE_LONG", default_off) {
+    // Read once, at startup: names from a fixed list, hence the raw read.
+    if user_set_purge_delay(|name| rc_data::env_flags::read_os(name).is_some())
+        || !rc_data::opt_switch!("RUSTCRAFT_OPT_MI_PURGE_LONG", default_off)
+    {
         return None;
     }
-    set_mimalloc_option(index, LONG_PURGE_DELAY_MS);
-    Some(LONG_PURGE_DELAY_MS)
+    let delay = long_purge_delay_from(library_purge_delay(index))?;
+    set_mimalloc_option(index, delay);
+    Some(delay)
 }
 
 /// Build with `mimalloc-win-direct-tls`: mimalloc reads its thread heap from one of the 64 direct

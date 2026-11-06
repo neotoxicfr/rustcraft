@@ -5678,21 +5678,30 @@ loaded by other agents compiling.
   64 KiB +0.03 % (22 of 8,064 sizes one class up); doubling `Vec` capacities of 1- to 64-byte
   elements +5.15 % (84 of 383 one class up; 12-byte elements at 128: 1,536 → 1,792 bytes). The
   tracer (`RUSTCRAFT_ALLOCTRACE=1`) now prints per second the allocations up to 1 KiB, above as a
-  power of two and above otherwise, to size the real share on the scenes.
+  power of two and above otherwise, to size the real share on the scenes (a reallocation is filed
+  by its new block size, the one that decides the padding, not by its growth: 768 → 1,536 B is
+  "above otherwise").
 - One flag byte (`RUSTCRAFT_OPT_ALLOCATOR_SINGLE_FLAG`, default 1): counting (`memory` entry),
   tracing and the two old-path switches in one `AtomicU8`; all clear = one load, one branch, the
   direct call; anything set goes to a `#[cold]` out-of-line function. The old aligned path is kept
   inline (its A/B stays fair). The memstats build wraps this same allocator (switches and tracer
-  included). `=0` re-reads counting and tracing separately in the cold function:
-  it pays one call more than the true old code, so the micro-bench also runs the old allocator as it
-  was (`TwoFlagAllocator`).
+  included). `=0` re-reads counting and tracing separately, inline as the old code did (a first
+  version did it in the cold function and paid one call more than the old code: 8 B 5.02 against
+  3.80 ns on 1 thread); the micro-bench also runs the old allocator as it was (`TwoFlagAllocator`).
+  Rerun after that fix (another loaded-machine run, interleaved, best of 5), 8 B, 1 / 4 / 32 threads:
+  new 3.62 / 7.09 / 12.97, `SINGLE_FLAG=0` 3.81 / 7.51 / 14.35, both `=0` 4.27 / 7.57 / 15.58, old
+  allocator 3.63 / 6.52 / 13.79, bare direct 3.59 / 6.10 / 11.52; 1,536 B 1 / 32 threads: new 15.85 /
+  115.0, `SINGLE_FLAG=0` 15.89 / 113.0, old allocator 25.69 / 140.0. `=0` now costs its dispatch
+  only (one load and two or three branches more than the old code). A copy of each old path per
+  flag value (flags known at compile time) was tried: every path got 0.4-0.7 ns slower at 8 B,
+  new path included (bigger body inlined at each site): not kept.
 
 | ns per alloc + free, best of 5, 256 live | 8 B, 1 thread | 8 B, 4 threads | 8 B, 32 threads | 1,536 B, 1 thread | 1,536 B, 32 threads |
 |---|---|---|---|---|---|
 | new (direct, one flag) | 3.81 | 5.53 | 7.78 | 17.55 | 110.1 |
 | `ALLOC_DIRECT=0` | 4.01 | 6.61 | 8.80 | 21.17 | 134.6 |
-| `ALLOCATOR_SINGLE_FLAG=0` | 5.02 | 7.92 | 11.26 | 16.60 | 111.0 |
-| both `=0` | 5.15 | 8.57 | 11.85 | 21.78 | 135.3 |
+| `ALLOCATOR_SINGLE_FLAG=0` (first version, cold call; fixed, see below) | 5.02 | 7.92 | 11.26 | 16.60 | 111.0 |
+| both `=0` (first version) | 5.15 | 8.57 | 11.85 | 21.78 | 135.3 |
 | old allocator as it was | 3.80 | 6.61 | 8.35 | 21.47 | 132.6 |
 | bare `mimalloc::MiMalloc`, no wrapper | 3.76 | 6.37 | 8.45 | 20.76 | 132.3 |
 | bare direct calls, no wrapper | 3.77 | 5.98 | 7.91 | 15.60 | 112.1 |
@@ -5721,9 +5730,11 @@ loaded by other agents compiling.
   arena every round). Decision on the scene bench, private memory first (v2 loses the
   on-demand commit: −735 MB when paused was gained with v3).
 - Low settings, nothing thrown away: `RUSTCRAFT_OPT_MI_PURGE_LONG=1` (default OFF: it can only trade
-  memory for processor time) sets the purge delay to 10 s instead of v3's 1 s (`MIMALLOC_PURGE_DELAY`
-  set by the user wins); the arena multiplier (1 in v3, the header comment saying 10 is stale) is
-  left alone. Feature `mimalloc-win-direct-tls` (two executables): mimalloc's thread heap read from the
+  memory for processor time) sets the purge delay to ten times the library's own, read from it
+  (v3 1 s → 10 s; v2 10 ms → 100 ms), so that both arms of the v2/v3 A/B lengthen it alike; a delay
+  set by the user wins under either of the names mimalloc reads (`MIMALLOC_PURGE_DELAY` and the
+  legacy `MIMALLOC_RESET_DELAY`; the on-demand commit has no legacy name). The arena multiplier
+  (1 in v3, the header comment saying 10 is stale; 10 in v2) is left alone. Feature `mimalloc-win-direct-tls` (two executables): mimalloc's thread heap read from the
   64 direct TLS slots only (one predictable branch, ≈ 0.2 ns); the startup line logs the lowest free
   slot (mimalloc took its own before `main`, when fewer were in use). `allow_thp`: Linux only, for
   the port.

@@ -34,7 +34,7 @@ pub fn init() {
 /// Allocations by size: up to 1 KiB, above as a power of two, above otherwise. mimalloc's
 /// aligned calls padded the last kind (direct calls since, `debug_sys::plain_call_aligns`):
 /// the report says how frequent they are.
-static BY_SIZE: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+pub(crate) static BY_SIZE: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 fn size_kind(size: usize) -> usize {
     match size {
@@ -44,17 +44,19 @@ fn size_kind(size: usize) -> usize {
     }
 }
 
-/// Called by the global allocator for each allocation while the tracer is active.
+/// Called by the global allocator for each allocation while the tracer is active: `new_bytes`
+/// newly allocated (the growth, for a reallocation), in a block of `block_size` bytes (the size
+/// requested, which decides the padding).
 #[inline]
-pub fn sample(size: usize) {
+pub fn sample(new_bytes: usize, block_size: usize) {
     // Allocations made by the tracer itself: neither counted nor sampled.
     if BUSY.try_with(Cell::get).unwrap_or(true) {
         return;
     }
-    BY_SIZE[size_kind(size)].fetch_add(1, Ordering::Relaxed);
-    TOTAL.fetch_add(size as u64, Ordering::Relaxed);
+    BY_SIZE[size_kind(block_size)].fetch_add(1, Ordering::Relaxed);
+    TOTAL.fetch_add(new_bytes as u64, Ordering::Relaxed);
     let Ok(n) = ACC.try_with(|a| {
-        let v = a.get() + size as u64;
+        let v = a.get() + new_bytes as u64;
         a.set(v % STEP);
         v / STEP
     }) else {
