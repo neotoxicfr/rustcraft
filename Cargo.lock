@@ -2350,6 +2350,7 @@ dependencies = [
  "bytemuck",
  "criterion",
  "hashbrown 0.17.1",
+ "libdeflater",
  "mimalloc",
  "pollster",
  "rayon",
