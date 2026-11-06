@@ -1,10 +1,10 @@
-//! Equivalence proof of the smoothed light paths (C2-M07, `RUSTCRAFT_OPT_AO*`
-//! switches): each path alone, all except one and all together give the mesh
-//! of the old path bit for bit (fingerprint of all the fields), on the whole reference capture
-//! (occlusion on, off, dimension without sky) and on a built scene (grass, stairs,
-//! slabs, leaves, water, emissive and luminous blocks, in contact with each other). The cache
-//! kept by the thread is proven on two successive tasks of the same thread and at the wrap of the
-//! generation through its maximum (16 B and 6 B cells).
+//! Equivalence proof of the smoothed light paths (`RUSTCRAFT_OPT_AO*` switches): each path
+//! alone, all except one and all together give the mesh of the old path bit for bit
+//! (fingerprint of all the fields), on the whole reference capture (occlusion on, off, dimension
+//! without sky) and on a built scene (grass, stairs, slabs, leaves, glass, water, emissive and
+//! luminous blocks, in contact with each other), with the raw light grid's threshold at both ends.
+//! The cache kept by the thread is proven on two successive tasks of the same thread and at the
+//! wrap of the generation through its maximum (12 B and 6 B cells).
 //!
 //! Without data (capture, cache, installed game) the test is ignored; under `RUSTCRAFT_OPT_REQUIRE=1`
 //! it is a failure.
@@ -27,11 +27,12 @@ fn total<'a>(meshes: impl Iterator<Item = &'a BlockMesh>) -> u64 {
     })
 }
 
-/// Old path, each path alone, all except one, all, and the default.
+/// Old path, each path alone, all except one, all, the default, and the raw light grid filled
+/// from the first candidate or never (same mesh either way).
 fn variants() -> Vec<(String, LightPaths)> {
     let (old, all) = (LightPaths::OLD, LightPaths::ALL);
     type Field = fn(&mut LightPaths) -> &mut bool;
-    let fields: [(&str, Field); 7] = [
+    let fields: [(&str, Field); 11] = [
         ("cell", |p| &mut p.cell),
         ("corners", |p| &mut p.corners),
         ("facetab", |p| &mut p.facetab),
@@ -39,6 +40,10 @@ fn variants() -> Vec<(String, LightPaths)> {
         ("cell8", |p| &mut p.cell8),
         ("fluid", |p| &mut p.fluid),
         ("neigh", |p| &mut p.neigh),
+        ("fixed_offsets", |p| &mut p.fixed_offsets),
+        ("prop_bits", |p| &mut p.prop_bits),
+        ("raw_grid", |p| &mut p.raw_grid),
+        ("zero_layers", |p| &mut p.zero_layers),
     ];
     let mut v = vec![("old".to_string(), old)];
     for (name, f) in fields {
@@ -51,6 +56,13 @@ fn variants() -> Vec<(String, LightPaths)> {
     }
     v.push(("all".to_string(), all));
     v.push(("default".to_string(), LightPaths::DEFAULT));
+    for (name, min) in [("from 1 candidate", 1), ("never", u16::MAX)] {
+        v.push((format!("raw grid {name}"), LightPaths { raw_grid: true, raw_grid_min: min, ..old }));
+        v.push((format!("default, raw grid {name}"), LightPaths { raw_grid_min: min, ..LightPaths::DEFAULT }));
+    }
+    // The addressed reader with the old cell format and its memos.
+    v.push(("addressed, 6 B cells".to_string(), LightPaths { cell8: true, ..LightPaths::DEFAULT }));
+    v.push(("addressed, kept neighbourhood".to_string(), LightPaths { neigh: true, ..LightPaths::DEFAULT }));
     v
 }
 
@@ -150,6 +162,7 @@ fn scene(d: &rc_data::VersionData, cols: &Cols) -> Cols {
         state("minecraft:short_grass", 0),
         state("minecraft:stone", 0),
         state("minecraft:dirt_path", 0),
+        state("minecraft:glass", 0),
     ];
     let (cx, cz) = middle(cols);
     let mut c = (*cols[&(cx, cz)]).clone();
@@ -240,12 +253,20 @@ fn kept_cache_across_tasks_and_epoch_wrap() {
     }
 }
 
-/// Default = best proven combination (D + A + B); C, E, F, G are only turned on after a calm
-/// machine bench that gives them as winners (then update this test and `docs/perf.md`).
+/// Default = best proven combination (D + A + B, then the addressed reads and the zero sheets on
+/// top); C, E, F, G are only turned on after a calm machine bench that gives them as winners
+/// (then update this test and `docs/perf.md`). Without any `RUSTCRAFT_OPT_AO*` variable, the
+/// environment gives the default.
 #[test]
 fn default_is_best_proven_combination() {
     let dab = LightPaths { cell: true, corners: true, scratch: true, ..LightPaths::OLD };
-    assert_eq!(LightPaths::DEFAULT, dab);
+    let addressed = LightPaths { fixed_offsets: true, prop_bits: true, raw_grid: true, zero_layers: true, ..dab };
+    assert_eq!(LightPaths::DEFAULT, addressed);
+    assert_eq!(LightPaths::DEFAULT.raw_grid_min, 64);
+    let set = std::env::vars_os().any(|(k, _)| k.to_string_lossy().starts_with("RUSTCRAFT_OPT_AO"));
+    if !set {
+        assert_eq!(LightPaths::from_env(), LightPaths::DEFAULT, "switch defaults differ from DEFAULT");
+    }
 }
 
 /// Face geometry built only when its path is active (`RUSTCRAFT_OPT_AOFACETAB`):
