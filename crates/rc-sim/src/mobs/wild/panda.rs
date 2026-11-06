@@ -3,6 +3,7 @@
 //! to eat, unhappy without bamboo, fear of thunderstorms, bite.
 
 use super::super::goals::{Goal, TBase};
+use super::super::ground_items;
 use super::super::mob::{Ent, Mob};
 use super::super::mth::{DEG, cos, dist2, sin};
 use super::super::species::Kind;
@@ -373,50 +374,45 @@ pub fn pickup(s: &mut Server, m: &mut Mob) {
     if !m.can_pickup || !m.alive() || m.dead || !s.rule("minecraft:mob_griefing", true) || m.equipment[0].is_some() {
         return;
     }
-    let bb = m.bbox();
-    let hit = s
-        .life
-        .drops
-        .iter()
-        .find(|d| {
-            !d.is_removed()
-                && d.stack.count > 0
-                && d.pickup_delay <= 0
-                && s.item_tag(&d.stack.id, "minecraft:panda_eats_from_ground")
-                && d.pos[0] + 0.125 > bb.min[0] - 1.0
-                && d.pos[0] - 0.125 < bb.max[0] + 1.0
-                && d.pos[1] + 0.25 > bb.min[1]
-                && d.pos[1] < bb.max[1]
-                && d.pos[2] + 0.125 > bb.min[2] - 1.0
-                && d.pos[2] - 0.125 < bb.max[2] + 1.0
-        })
-        .map(|d| (d.id, d.stack.clone()));
-    let Some((id, st)) = hit else { return };
+    let Some((id, st)) = pickup_choice(s, m, ground_items::filter_first()) else { return };
     let n = st.count;
     m.equipment[0] = Some(st);
     m.drop_chance[0] = 2.0;
     s.mob_take(id, m.id, n);
 }
 
+/// Item the panda picks up now: the first edible dropped item in reach, in list order
+/// (identifier and copy of the stack).
+pub(crate) fn pickup_choice(s: &Server, m: &Mob, filter_first: bool) -> Option<(i32, Stack)> {
+    let bb = m.bbox();
+    let edible = |d: &crate::drops::ItemEnt| s.item_tag(&d.stack.id, "minecraft:panda_eats_from_ground");
+    let hit = if filter_first {
+        // The tag lookup costs more than the position test, which rejects nearly every item.
+        s.life.drops.iter().find(|d| ground_items::in_pickup_reach(d, &bb) && edible(d))
+    } else {
+        s.life.drops.iter().find(|d| {
+            !d.is_removed() && d.stack.count > 0 && d.pickup_delay <= 0 && edible(d) && ground_items::in_pickup_reach(d, &bb)
+        })
+    };
+    hit.map(|d| (d.id, d.stack.clone()))
+}
+
 /// Edible items on the ground within ±6 (or ±8), in list order.
-pub fn ground_food(s: &Server, m: &Mob, r: f64) -> Vec<[f64; 3]> {
+pub(crate) fn ground_food<'a>(s: &'a Server, m: &Mob, r: f64) -> impl Iterator<Item = [f64; 3]> + 'a {
     let b = m.bbox();
     let area = rc_physics::Aabb { min: b.min.map(|v| v - r), max: b.max.map(|v| v + r) };
     s.life
         .drops
         .iter()
-        .filter(|d| {
-            let ib = rc_physics::Aabb {
-                min: [d.pos[0] - 0.125, d.pos[1], d.pos[2] - 0.125],
-                max: [d.pos[0] + 0.125, d.pos[1] + 0.25, d.pos[2] + 0.125],
-            };
-            !d.is_removed()
-                && d.pickup_delay <= 0
-                && ib.intersects(&area)
-                && s.item_tag(&d.stack.id, "minecraft:panda_eats_from_ground")
+        .filter(move |d| {
+            ground_items::ready_item_touches(d, &area) && s.item_tag(&d.stack.id, "minecraft:panda_eats_from_ground")
         })
         .map(|d| d.pos)
-        .collect()
+}
+
+/// First edible item on the ground within ±`r`, in list order (the sit goal reads only that one).
+pub fn first_ground_food(s: &Server, m: &Mob, r: f64) -> Option<[f64; 3]> {
+    ground_items::first_of(ground_food(s, m, r), ground_items::filter_first())
 }
 
 /// Out of water, stops and sits.

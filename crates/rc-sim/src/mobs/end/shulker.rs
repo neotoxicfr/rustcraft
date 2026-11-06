@@ -347,12 +347,7 @@ impl Server {
             return;
         }
         let area = rc_physics::Aabb { min: old_box.min.map(|v| v - 8.0), max: old_box.max.map(|v| v + 8.0) };
-        let mut count = self
-            .mobs
-            .list
-            .iter()
-            .filter(|o| o.kind == Kind::Shulker && o.alive() && o.touches(&area))
-            .count();
+        let mut count = self.mobs.of_kind(Kind::Shulker).filter(|o| o.alive() && o.touches(&area)).count();
         if bbox(m).intersects(&area) {
             count += 1;
         }

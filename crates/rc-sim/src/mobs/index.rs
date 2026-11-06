@@ -32,6 +32,14 @@ pub(crate) fn kind_on() -> bool {
     *ON.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_KINDINDEX") != Some("0"))
 }
 
+/// Animal scans of the list in one pass (default): the fox's alert and the nautilus charge test
+/// each candidate as they meet it and stop at the first that passes, the pufferfish tests the
+/// mob it holds instead of looking it up again by identifier. `RUSTCRAFT_OPT_MOB_SCAN_ONE_PASS=0`:
+/// old path (candidates collected first, lookup by identifier).
+pub(crate) fn one_pass_scans() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_MOB_SCAN_ONE_PASS")
+}
+
 /// Re-index only the moved tail after a removal (default); `RUSTCRAFT_OPT_INDEXTAIL=0`: whole rebuild.
 pub(crate) fn tail_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

@@ -20,6 +20,7 @@ pub(crate) mod end;
 pub(crate) mod explode;
 pub(crate) mod goals;
 pub(crate) mod golems;
+pub(crate) mod ground_items; // dropped items seen by the fox, panda and dolphin pickups
 pub(crate) mod illagers;
 pub(crate) mod index;
 pub(crate) mod interact; // G5-F03: name tag, egg, dyeing, cat and wolf
@@ -55,6 +56,8 @@ pub(crate) mod villager;
 pub(crate) mod wild;
 pub(crate) mod wither; // F16
 
+#[cfg(test)]
+mod animal_scan_tests;
 #[cfg(test)]
 mod tag_tests;
 #[cfg(test)]
