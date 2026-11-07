@@ -511,14 +511,10 @@ fn bonus_chest_at(
                 None => w.chunk(q).map(|d| (q, &d.blocks[..])),
             })
             .collect();
-        relight
-            .par_iter()
-            .map(|&(x, z)| {
-                let refs: rc_light::Columns =
-                    std::array::from_fn(|i| cols.get(&(x + i as i32 % 3 - 1, z + i as i32 / 3 - 1)).copied());
-                ((x, z), rc_light::light_chunk(&lt, refs, h, true))
-            })
-            .collect()
+        // Neighbouring chunks lit together by tiles (`RUSTCRAFT_OPT_FULL_UNION_TILES`), no scans.
+        let column = |x: i32, z: i32| cols.get(&(x, z)).copied();
+        let no_scan = |_: i32, _: i32| None::<&rc_light::ColumnScan>;
+        relight.iter().copied().zip(rc_light::light_chunks(&lt, &relight, column, no_scan, h, true)).collect()
     } else {
         let blocks_of = |q: (i32, i32)| -> Option<Vec<u32>> {
             match fulls.iter().find(|c| (c.x, c.z) == q) {

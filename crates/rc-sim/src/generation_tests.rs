@@ -382,8 +382,8 @@ fn long_flight_memory() {
 /// Micro-bench (run by hand, `--ignored --nocapture`): where a batch's time goes at 1, 2, 4…
 /// threads up to the logical cores. Flight of 12 rows of 24 chunks (the server's batch size),
 /// default cap, fast writer, lazy protos. Per thread count: ms per chunk of each phase and the
-/// single-threaded share (Amdahl). The test build lights every chunk twice (scan check of
-/// `light_scanned`): "light and conversion" and "relight" read about double the release.
+/// single-threaded share (Amdahl). The test build lights every chunk twice (check of
+/// `light_batch`): "light and conversion" and "relight" read about double the release.
 #[test]
 #[ignore]
 fn bench_batch_phases_by_threads() {
