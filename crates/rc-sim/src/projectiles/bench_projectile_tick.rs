@@ -75,34 +75,62 @@ fn stuck_arrows(p: &mut Probe, extra: &str) {
     }
 }
 
-fn ticks_case(tag: &str, setup: fn(&mut Probe)) {
-    for (label, paths) in paths() {
-        FORCED_PROJECTILE_PATHS.set(Some(paths));
-        let (mut p, dir) = open(&format!("bench-proj-{tag}-{label}"));
-        setup(&mut p);
-        let t = time_ticks(&mut p, 60, 200, 5);
-        report_timing(BENCH, &format!("{tag}/{label}"), &t);
-        // Deterministic count behind the timing: allocations of the server thread per tick.
-        let a0 = crate::test_alloc::allocations();
-        crate::bench_kit::run_ticks(&mut p, 50);
-        report(
-            BENCH,
-            &format!("{tag}/{label}"),
-            "thread_allocs_per_tick",
-            (crate::test_alloc::allocations() - a0) as f64 / 50.0,
-        );
-        finish(p, dir);
-    }
+/// One world of `setup` on `paths`: median µs per tick, and allocations of the server thread per
+/// tick (the deterministic count behind the timing).
+fn time_one_world(name: &str, paths: ProjectilePaths, setup: fn(&mut Probe)) -> (crate::bench_kit::Timing, f64) {
+    FORCED_PROJECTILE_PATHS.set(Some(paths));
+    let (mut p, dir) = open(name);
+    setup(&mut p);
+    let t = time_ticks(&mut p, 60, 200, 5);
+    let a0 = crate::test_alloc::allocations();
+    crate::bench_kit::run_ticks(&mut p, 50);
+    let allocs = (crate::test_alloc::allocations() - a0) as f64 / 50.0;
+    finish(p, dir);
     FORCED_PROJECTILE_PATHS.set(None);
+    (t, allocs)
+}
+
+/// Every path once, in the order of `pass`: forward on even passes, backward on odd ones. A whole
+/// tick shifts by tens of percent with the allocator's state left by the worlds opened before, so
+/// that no path may always run first or last; each line names its pass and position. The two
+/// ends of the order are the old and the new paths, so each of them runs first and last in turn.
+fn ticks_case(tag: &str, setup: fn(&mut Probe), pass: usize, medians: &mut Vec<(&'static str, f64)>) {
+    let mut order = paths();
+    if pass % 2 == 1 {
+        order.reverse();
+    }
+    for (position, (label, paths)) in order.into_iter().enumerate() {
+        let (t, allocs) = time_one_world(&format!("bench-proj-{tag}-{label}"), paths, setup);
+        let case = format!("{tag}/{label}/pass-{pass}-position-{position}");
+        report_timing(BENCH, &case, &t);
+        report(BENCH, &case, "thread_allocs_per_tick", allocs);
+        medians.push((label, crate::bench_kit::median(&t.us_per_tick)));
+    }
+}
+
+/// Per path, the median over the passes of its median tick (old and new ran first and last as
+/// often).
+fn report_over_passes(tag: &str, medians: &[(&'static str, f64)]) {
+    for (label, _) in paths() {
+        let runs: Vec<f64> = medians.iter().filter(|m| m.0 == label).map(|m| m.1).collect();
+        report(BENCH, &format!("{tag}/{label}/over-passes"), "us_per_tick", crate::bench_kit::median(&runs));
+    }
 }
 
 #[test]
 #[ignore = "measurement bench"]
 fn bench_projectile_tick() {
     crate::mobs::index::set_verify(false);
-    for _ in 0..2 {
-        ticks_case("stuck-arrows", |p| stuck_arrows(p, ""));
-        ticks_case("stuck-effect-arrows", |p| stuck_arrows(p, TIPPED));
+    // A world opened and dropped first, so that the first measured one does not meet a fresh heap.
+    let _ = time_one_world("bench-proj-warmup", ProjectilePaths::NEW, |p| stuck_arrows(p, ""));
+    let plain: fn(&mut Probe) = |p| stuck_arrows(p, "");
+    let effect: fn(&mut Probe) = |p| stuck_arrows(p, TIPPED);
+    for (tag, setup) in [("stuck-arrows", plain), ("stuck-effect-arrows", effect)] {
+        let mut medians = Vec::new();
+        for pass in 0..4 {
+            ticks_case(tag, setup, pass, &mut medians);
+        }
+        report_over_passes(tag, &medians);
     }
 }
 
