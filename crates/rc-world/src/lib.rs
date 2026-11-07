@@ -207,6 +207,40 @@ pub fn zero_layer() -> std::sync::Arc<[u8; LIGHT_BYTES]> {
     ZERO.get_or_init(|| std::sync::Arc::new([0; LIGHT_BYTES])).clone()
 }
 
+/// Fully lit sheet (15 everywhere), shared like [`zero_layer`].
+pub fn full_layer() -> std::sync::Arc<[u8; LIGHT_BYTES]> {
+    static FULL: std::sync::OnceLock<std::sync::Arc<[u8; LIGHT_BYTES]>> = std::sync::OnceLock::new();
+    FULL.get_or_init(|| std::sync::Arc::new([0xff; LIGHT_BYTES])).clone()
+}
+
+/// Shared sheet for a sheet whose bytes have this OR and this AND: [`zero_layer`] when they are
+/// all 0, [`full_layer`] when they are all 0xff, otherwise `None`. Sharing is safe because
+/// the light writers go through `Arc::make_mut`, which copies a shared sheet before writing.
+pub fn shared_layer_from_or_and(or: u8, and: u8) -> Option<std::sync::Arc<[u8; LIGHT_BYTES]>> {
+    match (or, and) {
+        (0, _) => Some(zero_layer()),
+        (_, 0xff) => Some(full_layer()),
+        _ => None,
+    }
+}
+
+/// Shared sheet equal to `bytes` (see [`shared_layer_from_or_and`]), otherwise `None`.
+pub fn shared_layer_equal_to(bytes: &[u8; LIGHT_BYTES]) -> Option<std::sync::Arc<[u8; LIGHT_BYTES]>> {
+    let first = bytes[0];
+    if first != 0 && first != 0xff {
+        return None;
+    }
+    // 16-byte words, exit at the first one that differs: a lit sheet is rejected within a few words.
+    let word = u128::from_ne_bytes([first; 16]);
+    let uniform = bytes.as_chunks::<16>().0.iter().all(|w| u128::from_ne_bytes(*w) == word);
+    if uniform { shared_layer_from_or_and(first, first) } else { None }
+}
+
+/// Heap sheet holding `bytes`: the shared one when they are all 0 or all 0xff.
+pub fn intern_light_layer(bytes: [u8; LIGHT_BYTES]) -> std::sync::Arc<[u8; LIGHT_BYTES]> {
+    shared_layer_equal_to(&bytes).unwrap_or_else(|| std::sync::Arc::new(bytes))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Column {
     pub x: i32,
@@ -283,12 +317,106 @@ impl Column {
     }
 
     pub fn heap_bytes(&self) -> usize {
-        let zero = zero_layer();
-        let light =
-            |l: &[LightLayer]| l.iter().flatten().filter(|a| !std::sync::Arc::ptr_eq(a, &zero)).count() * LIGHT_BYTES;
+        let (zero, full) = (zero_layer(), full_layer());
+        let owned = |a: &&std::sync::Arc<[u8; LIGHT_BYTES]>| {
+            !std::sync::Arc::ptr_eq(a, &zero) && !std::sync::Arc::ptr_eq(a, &full)
+        };
+        let light = |l: &[LightLayer]| l.iter().flatten().filter(owned).count() * LIGHT_BYTES;
         self.sections.iter().map(|s| s.blocks.heap_bytes() + s.biomes.heap_bytes()).sum::<usize>()
             + light(&self.sky_light)
             + light(&self.block_light)
             + self.heightmaps.iter().map(|h| h.1.len() * 8).sum::<usize>()
+    }
+}
+
+#[cfg(test)]
+mod shared_layer_tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    /// Only all-0 and all-0xff sheets are shared, and each with its own shared sheet: a sheet
+    /// that differs in a single byte keeps its own allocation.
+    #[test]
+    fn only_uniform_sheets_are_shared() {
+        assert!(Arc::ptr_eq(&intern_light_layer([0; LIGHT_BYTES]), &zero_layer()));
+        assert!(Arc::ptr_eq(&intern_light_layer([0xff; LIGHT_BYTES]), &full_layer()));
+        for (fill, odd) in [(0u8, 0x10u8), (0xff, 0xef), (0, 1), (0xff, 0xfe)] {
+            for at in [0, 1, 15, 16, LIGHT_BYTES - 1] {
+                let mut a = [fill; LIGHT_BYTES];
+                a[at] = odd;
+                assert!(shared_layer_equal_to(&a).is_none(), "fill {fill:#x}, byte {at} = {odd:#x}");
+                assert_eq!(*intern_light_layer(a), a);
+            }
+        }
+        assert!(shared_layer_equal_to(&[0x77; LIGHT_BYTES]).is_none());
+        assert!(shared_layer_from_or_and(0x01, 0x00).is_none());
+        assert!(shared_layer_from_or_and(0xff, 0xfe).is_none());
+    }
+
+    /// A write into a shared sheet (the light writers use `Arc::make_mut`) splits it off: the
+    /// other holders and the shared sheet itself keep their bytes.
+    #[test]
+    fn writing_a_shared_sheet_copies_it() {
+        for (shared, fill) in [(zero_layer(), 0u8), (full_layer(), 0xff)] {
+            let mut written = shared.clone();
+            let other = shared.clone();
+            Arc::make_mut(&mut written)[100] = 0x5a;
+            assert_eq!(written[100], 0x5a);
+            assert!(!Arc::ptr_eq(&written, &shared));
+            assert!(other.iter().all(|&b| b == fill), "other holder changed by a write");
+            let again = if fill == 0 { zero_layer() } else { full_layer() };
+            assert!(again.iter().all(|&b| b == fill), "shared sheet changed by a write");
+        }
+    }
+
+    /// Micro-bench (`--ignored --nocapture`): uniformity check of a received or saved sheet (all
+    /// 0, lit in its middle, lit from its first byte), the allocation it replaces, and the copy
+    /// a first write into a shared sheet costs.
+    #[test]
+    #[ignore = "micro-bench"]
+    fn bench_shared_sheets() {
+        use std::hint::black_box;
+        let rounds = 200_000u32;
+        let time = |f: &mut dyn FnMut()| {
+            let t0 = std::time::Instant::now();
+            for _ in 0..rounds {
+                f();
+            }
+            t0.elapsed().as_nanos() as f64 / f64::from(rounds)
+        };
+        let zero = [0u8; LIGHT_BYTES];
+        let mut lit_middle = [0u8; LIGHT_BYTES];
+        lit_middle[LIGHT_BYTES / 2] = 1;
+        let lit_first = [0x5au8; LIGHT_BYTES];
+        let check_zero = time(&mut || drop(black_box(shared_layer_equal_to(black_box(&zero)))));
+        let check_middle = time(&mut || drop(black_box(shared_layer_equal_to(black_box(&lit_middle)))));
+        let check_first = time(&mut || drop(black_box(shared_layer_equal_to(black_box(&lit_first)))));
+        let allocate = time(&mut || drop(black_box(Arc::new(*black_box(&lit_middle)))));
+        let first_write = time(&mut || {
+            let mut sheet = black_box(zero_layer());
+            Arc::make_mut(&mut sheet)[7] = 1;
+            drop(black_box(sheet));
+        });
+        eprintln!(
+            "ns per sheet: check all-0 {check_zero:.1}, lit in the middle {check_middle:.1}, lit at once \
+             {check_first:.1}; own allocation {allocate:.1}; first write into a shared sheet {first_write:.1}"
+        );
+    }
+
+    /// The column's own light bytes leave out both shared sheets.
+    #[test]
+    fn heap_bytes_skip_shared_sheets() {
+        let col = |sky: Vec<LightLayer>| Column {
+            x: 0,
+            z: 0,
+            sections: Box::new([]),
+            sky_light: sky.into_boxed_slice(),
+            block_light: Box::new([]),
+            heightmaps: Vec::new(),
+        };
+        let own = Some(Arc::new([3u8; LIGHT_BYTES]));
+        assert_eq!(col(vec![Some(zero_layer()), Some(full_layer()), None]).heap_bytes(), 0);
+        assert_eq!(col(vec![Some(full_layer()), own]).heap_bytes(), LIGHT_BYTES);
     }
 }

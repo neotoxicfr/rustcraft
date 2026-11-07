@@ -139,7 +139,23 @@ fn bit(set: &[u64], i: usize) -> bool {
     set.get(i / 64).is_some_and(|w| w >> (i % 64) & 1 == 1)
 }
 
+/// `RUSTCRAFT_OPT_INTERN_UNIFORM_LIGHT` (default on; `0`: each received sheet has its own
+/// allocation): an all-0 or all-15 received sheet becomes the shared one (an official server
+/// sends the full sky sheets above the terrain as data).
+fn uniform_light_interned() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_INTERN_UNIFORM_LIGHT")
+}
+
 fn read_layers(r: &mut Reader<'_>, mask: &[u64], positions: usize) -> Result<Vec<LightLayer>> {
+    read_layers_with(r, mask, positions, uniform_light_interned())
+}
+
+fn read_layers_with(
+    r: &mut Reader<'_>,
+    mask: &[u64],
+    positions: usize,
+    intern_uniform: bool,
+) -> Result<Vec<LightLayer>> {
     let n = read_count(r, LIGHT_BYTES)?;
     let mut out: Vec<LightLayer> = vec![None; positions];
     let mut slots = (0..positions).filter(|&i| bit(mask, i));
@@ -151,7 +167,7 @@ fn read_layers(r: &mut Reader<'_>, mask: &[u64], positions: usize) -> Result<Vec
         let bytes: [u8; LIGHT_BYTES] = r.take_array()?;
         let slot =
             slots.next().ok_or(Error::InvalidValue { what: "light sheet without position", value: n as i64 })?;
-        out[slot] = Some(std::sync::Arc::new(bytes));
+        out[slot] = Some(if intern_uniform { rc_world::intern_light_layer(bytes) } else { std::sync::Arc::new(bytes) });
     }
     Ok(out)
 }
@@ -246,6 +262,33 @@ mod tests {
 
     fn ctx() -> ChunkContext {
         ChunkContext::new(1, 35723, 65)
+    }
+
+    /// Received sheets keep their bytes either way; only all-0 and all-15 ones are shared, and
+    /// only when interned.
+    #[test]
+    fn received_uniform_sheets_shared_only_when_interned() {
+        let mut lit = [0xffu8; LIGHT_BYTES];
+        lit[LIGHT_BYTES - 1] = 0xfe;
+        let sheets = [[0u8; LIGHT_BYTES], [0xff; LIGHT_BYTES], lit, [0x21; LIGHT_BYTES]];
+        let mut w = Vec::new();
+        write_varint(&mut w, sheets.len() as i32);
+        for s in &sheets {
+            write_varint(&mut w, LIGHT_BYTES as i32);
+            w.extend_from_slice(s);
+        }
+        let mask = [0b11110u64];
+        for intern in [false, true] {
+            let got = read_layers_with(&mut Reader::new(&w), &mask, 6, intern).unwrap();
+            assert!(got[0].is_none() && got[5].is_none());
+            for (i, want) in sheets.iter().enumerate() {
+                let sheet = got[i + 1].as_ref().unwrap();
+                assert_eq!(&**sheet, want);
+                let shared = std::sync::Arc::ptr_eq(sheet, &rc_world::zero_layer())
+                    || std::sync::Arc::ptr_eq(sheet, &rc_world::full_layer());
+                assert_eq!(shared, intern && i < 2, "sheet {i}, interned {intern}");
+            }
+        }
     }
 
     #[test]
