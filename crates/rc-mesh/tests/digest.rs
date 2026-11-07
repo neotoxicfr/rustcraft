@@ -103,6 +103,70 @@ fn compact_format_digests_match_stored() {
     assert_ne!(total(sab.iter()), d, "offset nibble not seen");
 }
 
+/// Faces pushed straight into their group (`RUSTCRAFT_OPT_MESH_FACES_BY_GROUP`) against the old sort
+/// at the end, both in one process: every column identical (faces, starts, fluids, visibility),
+/// whole and partial (sections 4 to 10, and the 9th alone, on the base of either path), and the
+/// stored fingerprint of the compact formats. Sabotage: one face moved to the same group of
+/// another section changes the fingerprint.
+#[test]
+fn faces_by_group_digests_match_stored() {
+    let Some((_d, cols, t, palette)) = common::load() else { return };
+    assert_eq!((common::capture_fingerprint(), _d.states.len(), _d.biomes.len()), INPUT, "capture or data differ");
+    let mut keys: Vec<(i32, i32)> = cols.keys().copied().collect();
+    keys.sort_unstable();
+    let with = |by_group: bool, reuse: Option<(Sections, &[Vec<u32>])>| -> Vec<BlockMesh> {
+        keys.par_iter()
+            .enumerate()
+            .map(|(i, &(x, z))| {
+                let mut j = job(&cols, x, z);
+                j.faces_by_group = by_group;
+                j.reuse = reuse.map(|(mask, bases)| (mask, Arc::new(bases[i].clone()) as Packed));
+                mesh(&j, &t, &palette, MIN_Y)
+            })
+            .collect()
+    };
+    let (new, old) = (with(true, None), with(false, None));
+    for (a, b) in new.iter().zip(&old) {
+        assert!(common::same(a, b), "({}, {}): faces by group differ from the sort at the end", a.x, a.z);
+    }
+    assert_eq!(total(new.iter()), EXPECTED_COMPACT, "faces by group: fingerprint changed");
+    let mut wide = Sections::default();
+    (4..=10).for_each(|s| wide.insert(s));
+    let mut one = Sections::default();
+    one.insert(8);
+    // Bases of either path, and bases carrying a GPU tag on their faces (`pack_tagged`).
+    let tagged = |m: &BlockMesh| rc_mesh::blocks::pack_exact_tagged(m, (((m.x & 15) | (m.z & 15) << 4) as u32) << 20);
+    let bases: [(Vec<Vec<u32>>, &str); 3] = [
+        (new.iter().map(pack).collect(), "by group"),
+        (old.iter().map(pack).collect(), "sorted"),
+        (new.iter().map(tagged).collect(), "tagged"),
+    ];
+    for (flat, name) in &bases {
+        for mask in [wide, one] {
+            let (a, b) = (with(true, Some((mask, &flat[..]))), with(false, Some((mask, &flat[..]))));
+            assert!(a.iter().zip(&new).all(|(p, f)| common::same(p, f)), "partial by group on the {name} base differs");
+            assert_eq!(total(a.iter()), EXPECTED_COMPACT, "partial by group on the {name} base");
+            assert_eq!(total(b.iter()), EXPECTED_COMPACT, "partial sorted on the {name} base");
+        }
+    }
+    // Sabotage: the first face of a group moved to the end of the same group in a later section.
+    let mut sab: Vec<BlockMesh> = new.iter().map(|m| rc_mesh::blocks::unpack(&pack(m), 0).expect("flat")).collect();
+    let moved = sab.iter_mut().any(|m| {
+        let n = m.vis.len() + 1;
+        let starts = &mut m.starts[0];
+        let Some(k) = (0..starts.len() - 1).find(|&k| k % n + 1 < n - 1 && starts[k + 1] > starts[k] && starts[k + 2] > starts[k + 1])
+        else {
+            return false;
+        };
+        let (a, e) = (starts[k] as usize, starts[k + 2] as usize);
+        m.layers[0][a..e].rotate_left(1);
+        starts[k + 1] -= 1;
+        true
+    });
+    assert!(moved, "no column to sabotage");
+    assert_ne!(total(sab.iter()), EXPECTED_COMPACT, "face moved to another section not seen");
+}
+
 fn mesh_all(keys: &[(i32, i32)], cols: &Cols, t: &Tables, p: &BiomePalette, set: impl Fn(&mut MeshJob) + Sync) -> Vec<BlockMesh> {
     keys.par_iter()
         .map(|&(x, z)| {

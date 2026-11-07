@@ -433,7 +433,11 @@ impl MeshTask {
         perf_log::mesh_work(t.elapsed(), sections, kind);
         let (reuse, kept_job) = take_base(job, release_job_early);
         let t = Instant::now();
-        let base = reuse.as_ref().zip(base_version).map(|((_, w), v)| (w, v));
+        let base = reuse.as_ref().zip(base_version).map(|((remeshed, packed), version)| remesh::PartialBase {
+            packed,
+            version,
+            remeshed: *remeshed,
+        });
         let done = remesh::finish(mesh, live, urgent, base);
         perf_log::prep_work(t.elapsed());
         (done, kept_job)

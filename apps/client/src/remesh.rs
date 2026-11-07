@@ -52,6 +52,29 @@ pub struct Opts {
     /// `RUSTCRAFT_OPT_UPLOADBUDGET`: bytes uploaded per frame for whole columns
     /// (`RUSTCRAFT_UPLOADBUDGET_MB`, 16 by default); `None`: everything on every frame.
     pub budget: Option<usize>,
+    /// `RUSTCRAFT_OPT_MESH_PREPARE_BY_MOVE`: the GPU bytes take the mesh's faces instead of a copy
+    /// (`render::prepare_moving_faces`), whenever the mesh no longer needs them.
+    pub prepare_by_move: bool,
+    /// `RUSTCRAFT_OPT_IN_PLACE_TOUCHED_ONLY`: the in-place write compares only the remeshed sections
+    /// (and the faces whose place moved), not the whole column.
+    pub in_place_touched_only: bool,
+    /// `RUSTCRAFT_OPT_IN_PLACE_RANGES`: the in-place write sends each run of changed bytes, two runs
+    /// separated by at most `RUSTCRAFT_IN_PLACE_GAP_KB` KiB (4 by default) of unchanged bytes merged;
+    /// `None`: one range from the first change to the last, per buffer.
+    pub in_place_gap_bytes: Option<u64>,
+    /// `RUSTCRAFT_OPT_MESH_BASE_IS_PREPARED`: the base of a partial remesh is flattened with the
+    /// column's GPU tag on its faces, which the upload then reads from it (`render::prepare_from_base`).
+    pub base_is_prepared: bool,
+}
+
+impl Opts {
+    /// How the pool finds the in-place writes, gaps converted to the GPU sizes of `formats`.
+    pub fn in_place_paths(&self, formats: crate::render::GpuFormats) -> rc_mesh::blocks::InPlacePaths {
+        rc_mesh::blocks::InPlacePaths {
+            touched_only: self.in_place_touched_only,
+            gaps: self.in_place_gap_bytes.map(|bytes| crate::render::in_place_gaps(bytes, formats)),
+        }
+    }
 }
 
 pub fn opts() -> &'static Opts {
@@ -65,12 +88,17 @@ pub fn opts() -> &'static Opts {
             _ => PackAt::Pool,
         };
         let mb = var("RUSTCRAFT_UPLOADBUDGET_MB").and_then(|v| v.parse::<usize>().ok()).unwrap_or(16);
+        let gap_kb = var("RUSTCRAFT_IN_PLACE_GAP_KB").and_then(|v| v.parse::<u64>().ok()).unwrap_or(4);
         let o = Opts {
             pack,
             prep: on("RUSTCRAFT_OPT_MESHPREP"),
             transfree: on("RUSTCRAFT_OPT_TRANSFREE"),
             inplace: on("RUSTCRAFT_OPT_PARTIALINPLACE"),
             budget: on("RUSTCRAFT_OPT_UPLOADBUDGET").then_some(mb << 20),
+            prepare_by_move: rc_data::opt_switch!("RUSTCRAFT_OPT_MESH_PREPARE_BY_MOVE"),
+            in_place_touched_only: rc_data::opt_switch!("RUSTCRAFT_OPT_IN_PLACE_TOUCHED_ONLY"),
+            in_place_gap_bytes: rc_data::opt_switch!("RUSTCRAFT_OPT_IN_PLACE_RANGES").then_some(gap_kb << 10),
+            base_is_prepared: rc_data::opt_switch!("RUSTCRAFT_OPT_MESH_BASE_IS_PREPARED"),
         };
         eprintln!("[opt] mesh upload: {o:?}");
         o
@@ -171,22 +199,57 @@ pub fn split_budget(batch: &mut Vec<Done>, eye: (i32, i32), budget: usize) -> Ve
     batch.split_off(cut)
 }
 
+/// Base of a partial remesh as the end of the task sees it.
+pub struct PartialBase<'a> {
+    pub packed: &'a rc_mesh::blocks::Packed,
+    pub version: u64,
+    /// Sections the mesher redid; it copied all the others from `packed`.
+    pub remeshed: Sections,
+}
+
 /// End of the pool task: flattening of the base, GPU bytes and in-place write prepared
-/// according to the switches. `base`: base of the partial remesh and its version.
-pub fn finish(mut mesh: BlockMesh, live: bool, urgent: bool, base: Option<(&rc_mesh::blocks::Packed, u64)>) -> Done {
+/// according to the switches. `base`: base of the partial remesh.
+pub fn finish(mut mesh: BlockMesh, live: bool, urgent: bool, base: Option<PartialBase<'_>>) -> Done {
     let o = opts();
+    let formats = crate::render::gpu_formats();
+    // Base flattened with the column's GPU tag: its faces are then the upload's too, no other copy.
+    let base_is_prepared = o.base_is_prepared && o.prep && live && o.pack == PackAt::Pool;
+    let tag = if base_is_prepared { crate::render::region_tag(mesh.x, mesh.z) } else { 0 };
     let packed = (live && o.pack == PackAt::Pool)
-        .then(|| Arc::new(rc_mesh::blocks::pack_exact(&mesh)) as rc_mesh::blocks::Packed);
-    let in_place =
-        base.filter(|_| o.inplace).and_then(|(w, v)| rc_mesh::blocks::in_place_diff(w, &mesh).map(|d| (v, d)));
-    let prep = o.prep.then(|| crate::render::prepare(&mesh, o.transfree, crate::render::gpu_formats()));
+        .then(|| Arc::new(rc_mesh::blocks::pack_exact_tagged(&mesh, tag)) as rc_mesh::blocks::Packed);
+    let in_place = base.filter(|_| o.inplace).and_then(|b| {
+        rc_mesh::blocks::in_place_diff_with(b.packed, &mesh, Some(b.remeshed), o.in_place_paths(formats))
+            .map(|d| (b.version, d))
+    });
+    // The main thread still reads the faces only to flatten the base itself (`PackAt::Pool` off).
+    let faces_read_later = live && packed.is_none();
+    let prep = o.prep.then(|| {
+        let shared = packed.as_ref().filter(|_| base_is_prepared);
+        let shared = shared.and_then(|b| crate::render::prepare_from_base(&mesh, b.clone(), o.transfree, formats));
+        shared.unwrap_or_else(|| prepare_on_pool(&mut mesh, o.prepare_by_move && !faces_read_later, formats))
+    });
     // Faces and fluids that became useless on the main thread: freed here (the check keeps everything
     // for its fingerprints).
-    if prep.is_some() && (!live || packed.is_some()) && !checking() {
+    if prep.is_some() && !faces_read_later && !checking() {
         mesh.layers = Default::default();
         mesh.fluids = Default::default();
     }
     Done { mesh, live, urgent, packed, prep, in_place }
+}
+
+/// GPU bytes of the mesh made on the pool; `moving`: its faces moved into them. The check keeps a
+/// copy of the faces in the mesh for its fingerprints (the moved path is the one checked).
+fn prepare_on_pool(mesh: &mut BlockMesh, moving: bool, formats: crate::render::GpuFormats) -> crate::render::Prepared {
+    let transfree = opts().transfree;
+    if !moving {
+        return crate::render::prepare(mesh, transfree, formats);
+    }
+    let kept = checking().then(|| mesh.layers.clone());
+    let prepared = crate::render::prepare_moving_faces(mesh, transfree, formats);
+    if let Some(layers) = kept {
+        mesh.layers = layers;
+    }
+    prepared
 }
 
 /// Meshes in progress and last meshes received.
@@ -427,9 +490,10 @@ impl World {
         if checking() {
             let mut w = Vec::new();
             rc_mesh::blocks::pack(m, &mut w);
-            // Base flattened by the pool: identical to the main thread's.
+            // Base flattened by the pool: identical to the main thread's (the GPU tag it may carry
+            // taken off by the reading).
             if let Some(p) = &packed
-                && ***p != *w
+                && rc_mesh::blocks::unpack(p, m.version).is_none_or(|b| digest(&b) != digest(m))
             {
                 eprintln!("[meshcheck] ({}, {}): base flattened by the pool differs", key.0, key.1);
             }

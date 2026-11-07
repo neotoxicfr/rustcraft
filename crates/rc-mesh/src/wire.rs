@@ -37,6 +37,10 @@ pub struct MeshJob {
     /// Paths of the per-block loop and face removal rule (switches
     /// `RUSTCRAFT_OPT_MESH*`, `RUSTCRAFT_OPT_SHAPECULL` read at startup).
     pub cull: crate::cull::CullPaths,
+    /// Faces pushed straight into the list of their group while meshing, each layer then copied
+    /// once (`RUSTCRAFT_OPT_MESH_FACES_BY_GROUP`, on by default; `false`: one list per layer, sorted
+    /// by group at the end). Same mesh either way.
+    pub faces_by_group: bool,
 }
 
 /// Meshes that read changed cells of section `sy` of a column (edges `edges`,
@@ -178,6 +182,7 @@ impl MeshJob {
             tint: crate::blocks::TintPaths::from_env(),
             light: crate::light::LightPaths::from_env(),
             cull: crate::cull::CullPaths::from_env(),
+            faces_by_group: rc_data::opt_switch!("RUSTCRAFT_OPT_MESH_FACES_BY_GROUP"),
         }
     }
 }

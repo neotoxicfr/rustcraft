@@ -257,7 +257,7 @@ fn render_timed(
     let col = storage(g, bytemuck::cast_slice(&[key.0 * REGION, key.1 * REGION, 0, 0]));
     let offsets = storage(g, bytemuck::cast_slice(d.offsets));
     let pad = |w: &[u32]| -> Vec<u32> { if w.is_empty() { vec![0; 64] } else { w.to_vec() } };
-    let faces = storage(g, bytemuck::cast_slice(&pad(bytemuck::cast_slice(&d.p.faces))));
+    let faces = storage(g, bytemuck::cast_slice(&pad(bytemuck::cast_slice(&d.p.faces.parts().concat()))));
     let fluids = storage(g, bytemuck::cast_slice(&pad(&d.p.fluids)));
     let trans = storage(g, bytemuck::cast_slice(&pad(&d.p.trans)));
     let order: Vec<u32> = (0..d.p.trans_len().max(1) as u32).collect();
@@ -275,7 +275,7 @@ fn render_timed(
     };
     let (vs_sorted, vs_fluid) = d.f.entries();
     let face_vs = v.opts.face_entry();
-    let ids: Vec<u32> = (0..d.p.faces.len().max(1) as u32).collect();
+    let ids: Vec<u32> = (0..d.p.face_len().max(1) as u32).collect();
     let ids = storage(g, bytemuck::cast_slice(&ids));
     let index_data = v.index.map_or_else(|| face_indices(INDEXED_FACES), <[u16]>::to_vec);
     let index = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -284,7 +284,7 @@ fn render_timed(
         usage: wgpu::BufferUsages::INDEX,
     });
     let draws: [(&str, &wgpu::Buffer, u32, &wgpu::Buffer); 3] = [
-        (face_vs, if face_vs == "vs_idx" { &ids } else { &faces }, d.p.faces.len() as u32, &faces),
+        (face_vs, if face_vs == "vs_idx" { &ids } else { &faces }, d.p.face_len() as u32, &faces),
         (vs_fluid, &fluids, d.p.fluid_len() as u32, &fluids),
         (vs_sorted, &order, d.p.trans_len() as u32, &trans),
     ];
@@ -521,7 +521,7 @@ fn atlas_frames(textures: u32) -> Vec<[u32; 2]> {
 /// then faces), which changes the order outside the water (known difference, `docs/perf.md`).
 fn only_water(m: &BlockMesh, f: GpuFormats) -> Prepared {
     let mut p = prepare(m, false, f);
-    p.faces.clear();
+    p.faces = column_upload::PreparedFaces::Owned(Default::default());
     p.fluids.clear();
     p.set_slot(SLOT);
     p
@@ -745,7 +745,7 @@ fn format_bench() {
             let (mut faces, mut fluids, mut trans) = (0usize, 0usize, 0usize);
             for m in &ms {
                 let p = prepare(m, true, f);
-                faces += p.faces.len() * 24;
+                faces += p.face_len() * 24;
                 fluids += p.fluids.len() * 4;
                 trans += p.trans.len() * 4;
             }
@@ -932,7 +932,7 @@ fn shader_variants_cost() {
         all.iter().map(|(_, o)| probe_module(&g.device, &crate::terrain_shader::terrain(*o))).collect();
     for (p, f) in &preps {
         let d = Draw { p, f: *f, offsets: &table };
-        eprintln!("{f:?}: {} faces, {} fluids, {} translucent", p.faces.len(), p.fluid_len(), p.trans_len());
+        eprintln!("{f:?}: {} faces, {} fluids, {} translucent", p.face_len(), p.fluid_len(), p.trans_len());
         for (name, cam) in views.iter().filter(|(n, _)| *n == "from above" || *n == "out of view") {
             let mut best = vec![f64::MAX; all.len()];
             for _ in 0..7 {
