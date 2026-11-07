@@ -114,6 +114,7 @@ pub mod randsrc;
 pub mod commands;
 // Advancements and statistics (S9).
 pub mod progress;
+mod resource_id; // identifiers compared and completed with their default namespace, without allocating
 pub mod stats;
 pub mod score_criteria;
 // Local network (S9).
@@ -255,6 +256,8 @@ mod bench_scores; // scoreboard switches: writes over every holder, save, entity
 mod bench_function_tick; // command switches: functions per tick, macros, command blocks, schedule, parse
 #[cfg(test)]
 mod bench_spawner_blocks; // trial spawners, vaults, monster spawners, natural spawn pass, structure lists
+#[cfg(test)]
+mod bench_advancement_triggers; // advancement switches: inventory and recipe indexes, location, file and tree loading
 #[cfg(test)]
 mod tests_perf_pack; // the scene bench's `perf` data pack compiles with our command parser
 #[cfg(test)]

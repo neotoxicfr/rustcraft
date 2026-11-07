@@ -7429,3 +7429,97 @@ loaded by other agents compiling.
   (`push_item_layer`, `prepare` sorts, NBT clones, rc-mesh `to_vec`) belong to their zones: a
   reused buffer beats any allocator setting.
 
+
+## C6-M14: advancements, criteria indexed by item and by recipe, identifiers compared without allocating (07/11, loaded machine)
+
+Before: every changed inventory slot tested the 1,914 `inventory_changed` criteria of 26.3 one by
+one (1,807 name one item, 104 one of 36 item tags), each building an air stack, a full identifier
+per comparison and a list of its items; a learned recipe tested the 1,739 `recipe_unlocked`
+criteria (`/recipe give @s *`: ≈ 1,400 × 1,739 tests); opening a world searched each key of the
+advancements file in the whole text (one search per started advancement); every `location`
+check (every 20 ticks) copied the biome name once per criterion. Switches, default = new, `=0` =
+old, read once (`ProgressPaths`, progress/paths.rs; `RUSTCRAFT_OPT_IDEQ` in resource_id.rs):
+- `RUSTCRAFT_OPT_IDEQ`: `resource_id::id_eq` / `full_id` (borrowed full identifier) replace
+  `commands::args::id(x) == y` in the predicates and triggers (sets, tags, dimension, damage
+  types, effects, components, entity sub-predicate keys, condition types, clocks, recipes and
+  advancements of the player predicate); `p_item` of an empty slot builds the air stack only when
+  the predicate asks for components; `inventory_changed` reads the inventory in place instead of
+  copying its 43 slots; a criterion with several items keeps the unmatched ones as bits (same
+  tests in the same order). The formula of the mission (`raw == full || …`) was wrong on two
+  forms: `stone` against `stone` and `:stone` (empty namespace) against `minecraft:stone`; the
+  written one follows `args::id` (no colon, empty namespace, other).
+- `RUSTCRAFT_OPT_ADVINDEX`: `CriteriaIndex` built with the tree (progress/criteria_index.rs):
+  full identifier → criteria, item tag → criteria (the tag asked at the event: a `/reload` of the
+  tags needs no rebuild), and the criteria tested for every change (no single item, a bad key, or
+  a `player` condition: it is evaluated before the criterion's test, possibly with a random
+  draw, so it keeps its place in the order of draws). An emptied slot tests only the latter.
+  Candidates merged back into list order: awards in the order of the full scan.
+- `RUSTCRAFT_OPT_RECIPEINDEX`: the same index on `recipes` (`recipe_unlocked`, `recipe_crafted`,
+  `crafter_recipe_crafted`) and `loot_tables` (`player_generates_container_loot`); a field that
+  is neither an identifier nor a list never matches (no list tested for every event).
+- `RUSTCRAFT_OPT_ADVLOADFAST`: the file read in one pass keeping its key order (a `serde` visitor,
+  `progress/ordered_json.rs`; not the order-keeping feature of `serde_json`, which would change
+  the maps of the whole repository); a key written twice keeps its first place with its last
+  value, like the former map and search; the visibility walk lends the children instead of
+  copying them at every node; a started advancement is found by a flag instead of a scan.
+- `RUSTCRAFT_OPT_ADVTREEPARALLEL`, OFF by default: the ~1,900 files of the tree parsed on every
+  core (rayon). Slower on all cores here (the opening parses it while the generator fills the same
+  pool); kept behind its switch for the quiet bench.
+- `RUSTCRAFT_OPT_LOCATIONFAST`: biome name lent (`biome_str`), mob and projectile types lent
+  (`w_type` gives a `Cow`), block tags answered by `tag_bits` (block index, one bit) instead of
+  three scans by name.
+
+Proof: `resource_id_tests` (every identifier of every 26.3 registry in three forms against the odd
+strings, every pair of the item registry: `id_eq_borrowed(a, b) == (args::id(a) == b)`, `full_id`
+equal, no allocation); `tests_indexes` (flat world, 26.3 tree plus 22 odd criteria: id list with a
+repeat and a short name, `#tag` inside a list, short and empty-namespace names, short tag, no key,
+count, components, `player` condition, two items, slot counts, inventory entirely empty, bad key,
+empty list, air, recipe forms, loot list): every indexed event checked against the full scan
+(same hits, same order) while every item of the registry goes through the hotbar, then the
+inventory is emptied, and while every recipe is learned (`/recipe give @s *`, `take`, batches of
+100), on a fresh and on a half-advanced player; then the same walks on the former paths: same
+criteria granted in the same order, same `update_advancements` packets, same file. Odd criteria
+reached (or never, for the forms the game never matches). `tests_fast_load`: none, medium,
+complete (shuffled), unknown advancement and criterion, a key written twice: same criteria,
+order, first packet and file on both readings, the same after more grants, files rewritten to the
+byte; parallel tree = sequential tree (links, positions, criteria, index). `tests_location_fast`:
+every block against every block tag (full, short and `#` forms, unknown tag and block), lent
+types, the `location` trigger over 770 points of the test world on both paths. Sabotages that
+fail them: see the commit.
+
+Difference faithful to the game (A3): a key written with a space before its colon (or any form the
+game does not write) was not found by the former search and placed by its earliest date; the one
+pass keeps the written order, as the game's ordered table does (`one_pass_reading_keeps_the_written_order`).
+Checked against the game (read outside the repository): a structure start without pieces is
+skipped by the structure lookup of the location predicate; ours finds no piece in an `INVALID`
+start: same answer, no difference.
+
+| Advancements, flat world, 26.3 tree, loaded machine, 2 passes | former | new | IDEQ off, index on |
+|---|---|---|---|
+| one changed slot, fresh player (µs, allocations) | 102-161 µs, 3,929 | 1.0-1.6 µs, 0 | 2.8 µs, 39 |
+| one changed slot, half-advanced | 86 µs, 1,971 | 1.7-1.8 µs, 0 | 2.7 µs, 38 |
+| 36 slots filled then 41 emptied (two scans) | 2,820-2,890 µs, 80,556 | 89-93 µs, 60 | 225 µs, 10,536 |
+| the same, half-advanced | 2,438-2,471 µs, 41,406 | 63-116 µs, 60 | 153 µs, 6,612 |
+| every recipe learned at once (1,739 criteria granted) | 148-201 ms | 11.3-12.7 ms | 9.5 ms |
+| `location` trigger, fresh (67 criteria) | 8.5-13.3 µs, 254 | 10.9-11.8 µs, 0 | 11.6 µs, 194 (location on) |
+| complete advancements file read and shown | 94.6-115.8 ms, 25,561 | 1.6-2.7 ms, 19,663 | |
+| tree parsed (1,900 files), in order / 1, 2, 4, 8, 16, 32 threads | 5.2, 17.1 ms | 6.1-16.0, 9.7-13.5, 4.7-14.1, 4.2-15.3, 6.0-17.6, 7.9-19.7 ms | |
+
+The "former" column runs with `RUSTCRAFT_OPT_IDEQ=0` for allocations (the first pass, IDEQ on,
+gives 0 for a changed slot and 102-161 µs: the identifiers alone save ≈ 15 % of the former
+scan). The 60 allocations left per pair of scans are the inventory snapshot of the slot scan
+(`inv_seen`, 46 stacks copied on each change) and the copy of each changed stack: not touched
+(see below). Placement: server thread, 1 core: the awards must follow the list order (multi-core
+discarded); the tree parse alone is parallel (above: loses on every core, wins slightly on 4-8
+threads in one pass of two). GPU: not applicable. Memory: the indexes hold ≈ 3,700 positions (4
+bytes) and 540 + 1,739 + 37 identifier keys, built once per tree. Not done: the `inv_seen`
+snapshot updated per changed slot (needs proof that `items::matches` plus the count sees every
+difference), `done(a)` cached per advancement and a context memo for `location` (the bench shows
+no time to win there: 1 µs once half-advanced), a (registry, tag) table for the other registries
+(event callers only), the layout walk's child copies (≈ 125 displayed nodes, once per tree),
+`p_structure_at` reading a starts cache (C6-M09 left none outside the spawn pass; the tag members
+lookup lives in cmds_locate.rs). Coordination noted for a fidelity lot: `trig_inventory_scan`
+updates its snapshot before the awards, so a loot reward adding items never fires
+`inventory_changed`; `parse_adv` keeps criteria of an unknown trigger. To settle on the
+quiet-machine scene bench: `survie-inventaire` (tick p99 on a pickup, a shift-click, a death),
+`plains12`, `village`; the opening step "commands and advancements" of the opening log.

@@ -4,10 +4,12 @@
 
 use serde_json::Value;
 
+use super::criteria_index::INVENTORY_CHANGED;
 use super::pred::{Ctx, Dmg, Who, doubles, ints, p_distance};
 use crate::commands::ents::E;
 use crate::mobs::mob::Ent;
 use crate::player::Stack;
+use crate::resource_id::{full_id, id_eq};
 use crate::server::Server;
 
 #[cfg(test)]
@@ -28,9 +30,39 @@ impl Server {
     pub(crate) fn trigger(&mut self, name: &str, test: &dyn Fn(&Server, &Value) -> bool) {
         let tree = self.prog.tree.clone();
         let Some(list) = tree.by_trigger.get(name) else { return };
+        let hits = self.passing_criteria(&tree, list.iter().copied(), test);
+        self.award_all(hits);
+    }
+
+    /// [`Self::trigger`] on the criteria the trigger's index keeps for an event about `id`
+    /// (`None`: an emptied slot), when `indexed`; the whole list otherwise. Same hits in the same
+    /// order: a criterion left out names another identifier, so its test could not pass.
+    fn trigger_for_id(&mut self, name: &str, id: Option<&str>, indexed: bool, test: &dyn Fn(&Server, &Value) -> bool) {
+        let tree = self.prog.tree.clone();
+        let (Some(list), Some(index), true) = (tree.by_trigger.get(name), tree.indexed.get(name), indexed) else {
+            return self.trigger(name, test);
+        };
+        let mut positions = std::mem::take(&mut self.prog.candidates);
+        index.candidates(id, |tag, item| self.p_tag("minecraft:item", tag, item), &mut positions);
+        let hits = self.passing_criteria(&tree, positions.iter().map(|&p| list[p as usize]), test);
+        if super::paths::check_against_full_scan() {
+            let full = self.passing_criteria(&tree, list.iter().copied(), test);
+            assert_eq!(hits, full, "index of {name} for {id:?}: hits differ from the full scan");
+        }
+        self.prog.candidates = positions;
+        self.award_all(hits);
+    }
+
+    /// Active criteria among `criteria` that pass their `player` condition then `test`, in order.
+    fn passing_criteria(
+        &self,
+        tree: &super::Tree,
+        criteria: impl Iterator<Item = (usize, usize)>,
+        test: &dyn Fn(&Server, &Value) -> bool,
+    ) -> Vec<(usize, usize)> {
         let me = Ctx { this: Some(Who::E(E::Player)), origin: Some(self.pos), ..Ctx::default() };
         let mut hits = Vec::new();
-        for &(a, c) in list {
+        for (a, c) in criteria {
             if self.prog.crit_done(a, c) || self.prog.done(a) {
                 continue;
             }
@@ -44,6 +76,10 @@ impl Server {
                 hits.push((a, c));
             }
         }
+        hits
+    }
+
+    fn award_all(&mut self, hits: Vec<(usize, usize)>) {
         for (a, c) in hits {
             self.adv_award(a, c);
         }
@@ -181,48 +217,35 @@ impl Server {
 
     /// `inventory_changed` (counts of full, empty, occupied slots; required items).
     pub(crate) fn trig_inventory_changed(&mut self, changed: Option<&Stack>) {
-        let (mut full, mut empty, mut occupied) = (0i64, 0i64, 0i64);
-        let inv: Vec<Option<Stack>> = (0..43)
-            .map(|i| {
-                let m = super::pred::inv_to_menu(i);
-                self.slots.get(m).cloned().flatten()
-            })
-            .collect();
-        for s in &inv {
+        // Former way: a copy of the 43 inventory slots for the criteria needing several items;
+        // they are now read in place (nothing moves the inventory before the hits are awarded).
+        let copied: Option<Vec<Option<Stack>>> =
+            (!crate::resource_id::borrowed()).then(|| inventory_slots(&self.slots).map(|s| s.cloned()).collect());
+        let counts = self.inventory_counts();
+        let test = |sv: &Server, c: &Value| match &copied {
+            Some(inv) => inventory_criterion_ok(sv, c, changed, counts, inv.iter().flatten()),
+            None => inventory_criterion_ok(sv, c, changed, counts, inventory_slots(&sv.slots).flatten()),
+        };
+        let indexed = self.prog.paths.item_index;
+        self.trigger_for_id(INVENTORY_CHANGED, changed.map(|s| s.id.as_str()), indexed, &test);
+    }
+
+    /// Full, empty and occupied slots of the inventory, counted again for each change (a reward
+    /// of the previous change may have filled slots).
+    fn inventory_counts(&self) -> SlotCounts {
+        let mut n = SlotCounts::default();
+        for s in inventory_slots(&self.slots) {
             match s {
-                None => empty += 1,
+                None => n.empty += 1,
                 Some(s) => {
-                    occupied += 1;
+                    n.occupied += 1;
                     if s.count >= self.life.items.max_stack(s) {
-                        full += 1;
+                        n.full += 1;
                     }
                 }
             }
         }
-        self.trigger("minecraft:inventory_changed", &|sv, c| {
-            let slots = c.get("slots");
-            if let Some(sl) = slots
-                && !(ints(sl.get("full"), full) && ints(sl.get("empty"), empty) && ints(sl.get("occupied"), occupied))
-            {
-                return false;
-            }
-            let items: Vec<&Value> =
-                c.get("items").and_then(Value::as_array).map(|a| a.iter().collect()).unwrap_or_default();
-            match items.len() {
-                0 => true,
-                1 => changed.is_some_and(|s| sv.p_item(items[0], Some(s))),
-                _ => {
-                    let mut left = items.clone();
-                    for s in inv.iter().flatten() {
-                        if left.is_empty() {
-                            break;
-                        }
-                        left.retain(|p| !sv.p_item(p, Some(s)));
-                    }
-                    left.is_empty()
-                }
-            }
-        });
+        n
     }
 
     /// `recipe_unlocked` for each learned recipe.
@@ -230,8 +253,9 @@ impl Server {
         if !self.trig_active("minecraft:recipe_unlocked") {
             return;
         }
+        let indexed = self.prog.paths.recipe_index;
         for id in ids {
-            self.trigger("minecraft:recipe_unlocked", &|_, c| id_in(c.get("recipes"), id));
+            self.trigger_for_id("minecraft:recipe_unlocked", Some(id), indexed, &|_, c| id_in(c.get("recipes"), id));
         }
     }
 
@@ -379,7 +403,8 @@ impl Server {
         if !self.trig_active(kind) {
             return;
         }
-        self.trigger(kind, &|sv, c| {
+        let indexed = self.prog.paths.recipe_index;
+        self.trigger_for_id(kind, Some(id), indexed, &|sv, c| {
             if !id_in(c.get("recipes"), id) {
                 return false;
             }
@@ -453,7 +478,10 @@ impl Server {
     /// `player_generates_container_loot`: loot table of an opened chest.
     pub(crate) fn trig_container_loot(&mut self, table: &str) {
         if self.trig_active("minecraft:player_generates_container_loot") {
-            self.trigger("minecraft:player_generates_container_loot", &|_, c| id_in(c.get("loot_tables"), table));
+            let indexed = self.prog.paths.recipe_index;
+            self.trigger_for_id("minecraft:player_generates_container_loot", Some(table), indexed, &|_, c| {
+                id_in(c.get("loot_tables"), table)
+            });
         }
     }
 
@@ -471,7 +499,7 @@ impl Server {
         if self.trig_active("minecraft:brewed_potion") {
             self.trigger("minecraft:brewed_potion", &|_, c| match c.get("potion") {
                 None | Some(Value::Null) => true,
-                Some(p) => potion.is_some_and(|x| p.as_str().is_some_and(|w| crate::commands::args::id(w) == x)),
+                Some(p) => potion.is_some_and(|x| p.as_str().is_some_and(|w| id_eq(w, x))),
             });
         }
     }
@@ -535,8 +563,8 @@ impl Server {
     pub(crate) fn trig_changed_dimension(&mut self, from: &str, to: &str) {
         if self.trig_active("minecraft:changed_dimension") {
             self.trigger("minecraft:changed_dimension", &|_, c| {
-                c.get("from").and_then(Value::as_str).is_none_or(|f| crate::commands::args::id(f) == from)
-                    && c.get("to").and_then(Value::as_str).is_none_or(|t| crate::commands::args::id(t) == to)
+                c.get("from").and_then(Value::as_str).is_none_or(|f| id_eq(f, from))
+                    && c.get("to").and_then(Value::as_str).is_none_or(|t| id_eq(t, to))
             });
         }
         if from == "minecraft:the_nether"
@@ -633,7 +661,7 @@ impl Server {
         if !self.trig_active("minecraft:killed_by_arrow") {
             return;
         }
-        let mut types: Vec<String> = victims.iter().map(|v| self.w_type(*v)).collect();
+        let mut types: Vec<std::borrow::Cow<'static, str>> = victims.iter().map(|v| self.w_type(*v)).collect();
         types.sort();
         types.dedup();
         let unique = types.len() as i64;
@@ -684,12 +712,85 @@ impl Server {
     }
 }
 
+/// Full, empty and occupied slots of the inventory (`inventory_changed`'s `slots`).
+#[derive(Clone, Copy, Default)]
+struct SlotCounts {
+    full: i64,
+    empty: i64,
+    occupied: i64,
+}
+
+/// The 43 slots `inventory_changed` counts, in inventory order (hotbar, main, armor feet to head,
+/// offhand, then two indices with no menu slot: always empty, like the old count).
+fn inventory_slots(slots: &[Option<Stack>]) -> impl Iterator<Item = Option<&Stack>> {
+    (0..43).map(|i| slots.get(super::pred::inv_to_menu(i)).and_then(Option::as_ref))
+}
+
+/// One `inventory_changed` criterion: slot counts, then its items: none (true), one (the changed
+/// stack must match it), several (each matched by some stack of `inventory`).
+fn inventory_criterion_ok<'a>(
+    sv: &Server,
+    c: &Value,
+    changed: Option<&Stack>,
+    n: SlotCounts,
+    inventory: impl Iterator<Item = &'a Stack>,
+) -> bool {
+    if let Some(sl) = c.get("slots")
+        && !(ints(sl.get("full"), n.full) && ints(sl.get("empty"), n.empty) && ints(sl.get("occupied"), n.occupied))
+    {
+        return false;
+    }
+    let items: &[Value] = c.get("items").and_then(Value::as_array).map_or(&[], Vec::as_slice);
+    match items {
+        [] => true,
+        [only] => changed.is_some_and(|s| sv.p_item(only, Some(s))),
+        _ => all_items_found(sv, items, inventory, crate::resource_id::borrowed()),
+    }
+}
+
+/// Each predicate of `items` matched by some stack of `inventory`, every stack testing the
+/// predicates still unmatched in their order. `as_bits` (`RUSTCRAFT_OPT_IDEQ`): the unmatched ones
+/// kept as bits instead of a list allocated at every change (these criteria are tested for every
+/// change); same tests in the same order.
+pub(super) fn all_items_found<'a>(
+    sv: &Server,
+    items: &[Value],
+    inventory: impl Iterator<Item = &'a Stack>,
+    as_bits: bool,
+) -> bool {
+    if as_bits && (1..=64).contains(&items.len()) {
+        let mut left = u64::MAX >> (64 - items.len());
+        for s in inventory {
+            if left == 0 {
+                break;
+            }
+            let mut untested = left;
+            while untested != 0 {
+                let i = untested.trailing_zeros() as usize;
+                untested &= untested - 1;
+                if sv.p_item(&items[i], Some(s)) {
+                    left &= !(1 << i);
+                }
+            }
+        }
+        return left == 0;
+    }
+    let mut left: Vec<&Value> = items.iter().collect();
+    for s in inventory {
+        if left.is_empty() {
+            break;
+        }
+        left.retain(|p| !sv.p_item(p, Some(s)));
+    }
+    left.is_empty()
+}
+
 /// Set of identifiers of a criterion (`recipes`, `loot_tables`): identifier or list
 /// (a tag of recipes or tables does not exist in the base game: never true).
 fn id_in(v: Option<&Value>, id: &str) -> bool {
     match v {
-        Some(Value::String(s)) => crate::commands::args::id(s) == id,
-        Some(Value::Array(a)) => a.iter().any(|x| x.as_str().is_some_and(|s| crate::commands::args::id(s) == id)),
+        Some(Value::String(s)) => id_eq(s, id),
+        Some(Value::Array(a)) => a.iter().any(|x| x.as_str().is_some_and(|s| id_eq(s, id))),
         _ => false,
     }
 }
@@ -781,9 +882,7 @@ impl Server {
             Value::Null => true,
             Value::Array(l) => l.iter().all(|c| self.bolt_cond(c, pos, fires, hit)),
             Value::Object(o) if o.contains_key("type") || o.contains_key("condition") => {
-                match crate::commands::args::id(v["type"].as_str().or_else(|| v["condition"].as_str()).unwrap_or(""))
-                    .as_str()
-                {
+                match full_id(v["type"].as_str().or_else(|| v["condition"].as_str()).unwrap_or("")).as_ref() {
                     "minecraft:entity_properties" => {
                         v.get("predicate").is_none_or(|p| self.bolt_pred(p, pos, fires, hit))
                     }
@@ -803,7 +902,7 @@ impl Server {
 
     fn bolt_pred(&self, p: &Value, pos: [f64; 3], fires: i32, hit: &[Ent]) -> bool {
         let Value::Object(parts) = p else { return true };
-        parts.iter().all(|(k, v)| match crate::commands::args::id(k).as_str() {
+        parts.iter().all(|(k, v)| match full_id(k).as_ref() {
             "minecraft:entity_type" | "minecraft:type" => self.p_set("minecraft:entity_type", v, "minecraft:lightning_bolt"),
             "minecraft:location" => self.p_location(v, pos[0], pos[1], pos[2]),
             "minecraft:distance" => p_distance(v, self.pos, pos),
