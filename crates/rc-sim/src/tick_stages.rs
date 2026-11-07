@@ -2,9 +2,11 @@
 //! diagnostic, never on in the reference bench (`docs/perf.md`). Each tick is cut into its stages
 //! by a lap clock (one clock read per stage boundary). Over every window of 100 ticks, the slowest
 //! tick is written with its OWN composition and the three ticks after it: never the sum of the
-//! per-stage maxima, which no real tick ever had. Its number modulo 400 and 20 shows the periodic
-//! work (flowing water every 5 ticks, time sent every 20...). The light time is the server
-//! thread's own relights and chunk lighting during the tick: it lies inside the stages (mostly the
+//! per-stage maxima, which no real tick ever had. Its game time, with that time modulo 400 and 20
+//! (the world's periodic work: spawn checks every 400, many checks every 20), is in the readable
+//! line only: a remainder means nothing as the mean the bench takes of a counter. Work due a delay
+//! after an event (flowing water every 5 ticks from its placement) shows as a spacing of the game
+//! times between reports, not as a fixed remainder. The light time is the server thread's own relights and chunk lighting during the tick: it lies inside the stages (mostly the
 //! block-change flush), so it is shown apart and never added to their sum.
 //!
 //! Lines dated like the client's (`[perf] [t s]`, origin of `generation_timing`): generic counters
@@ -98,6 +100,8 @@ fn enabled() -> bool {
 pub(crate) struct TickComposition {
     /// Server tick count at the start of the tick.
     pub tick: u64,
+    /// Game time at the end of the tick (what the world's periodic work is keyed on).
+    pub game_time: i64,
     pub total_ns: u64,
     pub stage_ns: [u64; STAGE_COUNT],
     /// Light computed on the server thread during the tick (inside the stages).
@@ -152,11 +156,13 @@ impl TickStageLog {
         }
     }
 
-    /// End of the tick numbered `tick`, which lasted `total` from its start: its composition.
-    fn finish(&mut self, tick: u64, total: Duration) -> Option<TickComposition> {
+    /// End of the tick numbered `tick`, which lasted `total` from its start and left the game
+    /// time at `game_time`: its composition.
+    fn finish(&mut self, tick: u64, game_time: i64, total: Duration) -> Option<TickComposition> {
         self.lap_at.take()?;
         Some(TickComposition {
             tick,
+            game_time,
             total_ns: total.as_nanos() as u64,
             stage_ns: self.stage_ns,
             light_ns: rc_light::stats::this_thread_light_ns() - self.light_ns_at_start,
@@ -164,8 +170,8 @@ impl TickStageLog {
     }
 
     /// End of a tick: kept in the window, and the window's report written once it is complete.
-    pub(crate) fn end_tick(&mut self, tick: u64, total: Duration) {
-        let Some(composition) = self.finish(tick, total) else { return };
+    pub(crate) fn end_tick(&mut self, tick: u64, game_time: i64, total: Duration) {
+        let Some(composition) = self.finish(tick, game_time, total) else { return };
         if let Some(report) = self.window.push(composition) {
             let t = crate::generation_timing::seconds_since_origin(Instant::now());
             for line in report.lines(t) {
@@ -220,16 +226,15 @@ impl SlowestTickReport {
         lines.extend(TickStage::ALL.iter().map(|&stage| counter(&format!("{}_ms", stage.name()), ms(s.stage(stage)))));
         lines.push(counter("rest_ms", ms(s.rest_ns())));
         lines.push(counter("light_ms", ms(s.light_ns)));
-        lines.push(counter("mod_400", (s.tick % 400) as f64));
-        lines.push(counter("mod_20", (s.tick % 20) as f64));
         let after = self.followers.iter().map(|f| f.total_ns).sum::<u64>() / self.followers.len().max(1) as u64;
         lines.push(counter("followers_ms", ms(after)));
         let next: Vec<String> = self.followers.iter().map(composition_text).collect();
         lines.push(format!(
-            "[perf] [{t:>6.1} s] server slowest tick {} (mod 400 = {}, mod 20 = {}): {}; next ticks: {}",
+            "[perf] [{t:>6.1} s] server slowest tick {} (game time {}, mod 400 = {}, mod 20 = {}): {}; next ticks: {}",
             s.tick,
-            s.tick % 400,
-            s.tick % 20,
+            s.game_time,
+            s.game_time.rem_euclid(400),
+            s.game_time.rem_euclid(20),
             composition_text(s),
             next.join("; ")
         ));
@@ -257,7 +262,7 @@ mod tests {
         for &(s, ns) in stages {
             stage_ns[s as usize] += ns;
         }
-        TickComposition { tick: n, total_ns: stage_ns.iter().sum::<u64>() + 10, stage_ns, light_ns: 0 }
+        TickComposition { tick: n, game_time: n as i64, total_ns: stage_ns.iter().sum::<u64>() + 10, stage_ns, light_ns: 0 }
     }
 
     /// The report is one real tick, the slowest, with the three after it; a tick whose single stage
@@ -309,10 +314,16 @@ mod tests {
         assert_ne!(next_window_spike.expect("report").slowest.tick, WINDOW_TICKS as u64 + 1);
     }
 
-    /// Counter names read by the bench, each stage's own, the tick's phase, the readable line.
+    /// Counter names read by the bench, each stage's own, and the readable line with the game
+    /// time's phase. The phase is never a counter: the bench averages counters over a scene, and
+    /// the mean of remainders 19 and 1 (10) is no phase at all.
     #[test]
     fn report_lines_carry_every_stage_and_the_tick_phase() {
-        let slowest = TickComposition { light_ns: 4_000_000, ..tick(1234, &[(TickStage::BlockChangeFlush, 6_000_000)]) };
+        let slowest = TickComposition {
+            light_ns: 4_000_000,
+            game_time: 24_047,
+            ..tick(1234, &[(TickStage::BlockChangeFlush, 6_000_000)])
+        };
         let report = SlowestTickReport { slowest, followers: vec![tick(1235, &[(TickStage::Blocks, 1_000_000)])] };
         let lines = report.lines(12.0);
         let has = |text: &str| lines.iter().any(|l| l == text);
@@ -320,12 +331,11 @@ mod tests {
         assert!(has("[perf] [  12.0 s] counter server_slowest_tick_block_change_flush_ms 6.000"));
         assert!(has("[perf] [  12.0 s] counter server_slowest_tick_entities_ms 0.000"));
         assert!(has("[perf] [  12.0 s] counter server_slowest_tick_light_ms 4.000"));
-        assert!(has("[perf] [  12.0 s] counter server_slowest_tick_mod_400 34.000"));
-        assert!(has("[perf] [  12.0 s] counter server_slowest_tick_mod_20 14.000"));
-        assert_eq!(lines.iter().filter(|l| l.contains("counter server_slowest_tick_")).count(), STAGE_COUNT + 6);
+        assert!(!lines.iter().any(|l| l.contains("counter server_slowest_tick_mod")), "{lines:#?}");
+        assert_eq!(lines.iter().filter(|l| l.contains("counter server_slowest_tick_")).count(), STAGE_COUNT + 4);
         assert_eq!(
             lines.last().unwrap(),
-            "[perf] [  12.0 s] server slowest tick 1234 (mod 400 = 34, mod 20 = 14): 6.000 ms = \
+            "[perf] [  12.0 s] server slowest tick 1234 (game time 24047, mod 400 = 47, mod 20 = 7): 6.000 ms = \
              block_change_flush 6.000 + rest 0.000, light 4.000; next ticks: 1.000 ms = blocks 1.000 + rest 0.000, light 0.000"
         );
     }
@@ -348,7 +358,7 @@ mod tests {
             let total = start.elapsed();
             p.s.tick += 1;
             let _ = p.take_events();
-            let c = p.s.stage_log.finish(p.s.tick - 1, total).expect("tick measured");
+            let c = p.s.stage_log.finish(p.s.tick - 1, p.s.time, total).expect("tick measured");
             let sum: u64 = c.stage_ns.iter().sum();
             assert!(sum <= c.total_ns, "stages {sum} ns over the tick {} ns", c.total_ns);
             assert!(sum as f64 >= 0.95 * c.total_ns as f64, "stages {sum} ns cover under 95 % of {} ns", c.total_ns);
@@ -384,7 +394,7 @@ mod tests {
                 for &stage in TickStage::ALL.iter().chain(&[TickStage::ChunkAdoption, TickStage::Save]) {
                     log.lap(std::hint::black_box(stage));
                 }
-                if let Some(c) = log.finish(u64::from(n), at.elapsed())
+                if let Some(c) = log.finish(u64::from(n), i64::from(n), at.elapsed())
                     && let Some(r) = log.window.push(c)
                 {
                     std::hint::black_box(r);

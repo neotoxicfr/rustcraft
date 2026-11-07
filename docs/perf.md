@@ -9230,20 +9230,29 @@ never in the reference runs). No gain of its own: it tells which spreading leads
   stages (chunk adoption, packets, save, world clock, blocks, entities, block entities, world after,
   block-change flush, LAN guests, paused, tracking, chunk send, loading screen) plus the rest. Over
   each window of 100 ticks the SLOWEST tick is written with its own composition and the 3 ticks after
-  it (never the sum of the per-stage maxima), with its number mod 400 and mod 20, and the light time
-  of the server thread inside it (`rc_light::stats::this_thread_light_ns`, new per-thread total:
-  the process totals mix the client's relights in). Dated lines `[perf] [t s] counter
-  server_slowest_tick_<stage>_ms`, `_rest_ms`, `_light_ms`, `_mod_400`, `_mod_20`, `_followers_ms`
-  (columns `c:` of scenes.py, unchanged) and one readable line `server slowest tick N (mod 400 = ..,
-  mod 20 = ..): total = stage + stage + rest, light; next ticks: ...`. While on, these dated server
-  lines also fill the client's silences: the bench's client-stall detection is blind then.
-- Client (`apps/client/src/frame_stages.rs`, third collection of `profiler.rs`): the zones right
-  under `root` by index (packets, light and meshing, mouse, tick, sound, frame, fps update, other),
-  the driver stages of `present_watch` (GPU wait = the device poll after the submission, now watched;
+  it (never the sum of the per-stage maxima), and the light time of the server thread inside it
+  (`rc_light::stats::this_thread_light_ns`, new per-thread total: the process totals mix the
+  client's relights in). Dated lines `[perf] [t s] counter server_slowest_tick_<stage>_ms`,
+  `_rest_ms`, `_light_ms`, `_followers_ms` (columns `c:` of scenes.py, unchanged) and one readable
+  line `server slowest tick N (game time G, mod 400 = .., mod 20 = ..): total = stage + stage +
+  rest, light; next ticks: ...`. The phase is in the readable line only: scenes.py averages every
+  counter over the scene window, and a mean of remainders (19 and 1 give 10) means nothing. It is
+  taken on the game time, which the world's periodic work is keyed on (spawn checks every 400,
+  many checks every 20), not on the server's tick count (offset by the saved game time). While on,
+  these dated server lines also fill the client's silences: the bench's client-stall detection is
+  blind then.
+- Client (`apps/client/src/frame_stages.rs`, a collection of `profiler.rs` apart from its three text
+  collections `PIE`, `RECORD`, `SINGLE`): the zones right under `root` by index (packets, light and
+  meshing, mouse, tick, sound, frame, other), the end of the frame (`fpsUpdate`, a child of `frame`
+  in the game's zone tree, which the F3 chart shows and so stays as it is: found at its own depth;
+  the perf log's own work after its reading lands in the next frame's `fps_update`), the driver
+  stages of `present_watch` (GPU wait = the device poll after the submission, now watched;
   configure, acquire, submit, present, readback) which take over from their zone, the gap between
   frames (`outside_frame`) and the time inside the frame outside any zone (`unzoned`). One clock
   always charged to the current stage, read at the perf log's own frame instant: the stages add up
-  to the frame interval exactly. Counters per second: `frame_us_<stage>` (mean over all frames),
+  to the frame interval exactly. Only the frames in a world are composed: out of a world (title
+  screen, menus, connection) the whole menu frame runs inside `scheduledExecutables` and would be
+  charged to light and meshing. Counters per second: `frame_us_<stage>` (mean over all frames),
   `slow_frames_per_s` and `slow_frame_us_<stage>` (frames over twice the median), the client relight
   time of each (`frame_us_client_relight`, `slow_frame_us_client_relight`), and a readable
   `slowest frame` line. `frame_p999_ms` (99.9th percentile of the frames) is printed whenever the
@@ -9262,9 +9271,13 @@ never in the reference runs). No gain of its own: it tells which spreading leads
   tick; fails on a lap that does not move its boundary: 32.3 ms counted for an 8.5 ms tick, and on a
   misplaced entity boundary), the window tests (the slowest tick whole, followers across the window
   end, no per-stage maxima), `profiler::tests::frame_stages_follow_the_zones_and_the_driver_calls`
-  (real zone calls and `present_watch::during`: stages within 5% of the interval, the driver call
-  out of the `frame` zone; fails when the driver stage is not switched), `frame_stages` unit tests
-  (exact cover to the nanosecond, zone switch during a driver call).
+  (the zone calls of `app_frame.rs` in their order and depth, `present_watch::during` inside
+  `render`: stages within 5% of the interval, the driver call and the end of the frame out of the
+  `frame` zone; lower bounds only tight, upper margin 20 ms for loaded runners; fails when the
+  driver stage is not switched and when `fpsUpdate` is only looked for right under `root`, as
+  first written), `frame_stages` unit tests (exact cover to the nanosecond, zone switch during a
+  driver call), `tick_stages::tests::report_lines_carry_every_stage_and_the_tick_phase` (no phase
+  counter, phase of the game time in the readable line).
 - Placement (B4): log only; main thread for the frames, server thread for the ticks; no GPU or
   multi-core lead applies. PresentMon (driver against OS) and the samply cross-check of the 2-70 ms
   spikes are outside the code: to do on the quiet machine.
@@ -9272,4 +9285,6 @@ never in the reference runs). No gain of its own: it tells which spreading leads
   (72.6 ms volley), crowd-1000, redstone, cave (table of the slowest tick's stages); plains32,
   forest, village, crowd-1000 (cost of the collector against the same scene without the switch,
   share of each stage in the frames over twice the median); a flowing-water scene to find the relight
-  spikes again (server every 5 ticks: `mod_20` in 0/5/10/15; client: `slow_frame_us_client_relight`).
+  spikes again (server: flowing water is due 5 ticks after each change, so look for a spacing of
+  5, or a multiple, between the game times of successive readable `server slowest tick` lines,
+  not for fixed remainders; client: `slow_frame_us_client_relight`).

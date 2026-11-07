@@ -1361,7 +1361,7 @@ impl Server {
             let tick_time = work.elapsed();
             self.cmd.ticking.record_tick_time(tick_time);
             perf_tick_report(&self.cmd.ticking);
-            self.stage_log.end_tick(tick_number, tick_time);
+            self.stage_log.end_tick(tick_number, self.time, tick_time);
             // Memory readout (`RUSTCRAFT_PERFLOG`, bounded batch) AFTER the tick measurement: counted
             // inside, it added ~0.3 ms to the bench's median tick (0.36 ms in pause) without costing
             // anything in normal play, where it does not run.
