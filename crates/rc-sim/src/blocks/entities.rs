@@ -1831,7 +1831,7 @@ impl Server {
         match self.bs.shulkers.get_mut(&p) {
             Some(e) => e.1 = status,
             None => {
-                let id = self.add_ticker(p);
+                let id = self.add_ticker(p, super::ticks::TickerFamily::ShulkerLid);
                 self.bs.shulkers.insert(p, (id, status, if status == 3 { 1.0 } else { 0.0 }));
             }
         }
@@ -1888,7 +1888,7 @@ impl Server {
     /// Block entity created: the hoppers tick.
     pub(crate) fn after_block_entity_created(&mut self, p: P, s: u32) {
         if matches!(self.view().kind(s), Kind::Hopper | Kind::DaylightDetector) {
-            let id = self.add_ticker(p);
+            let id = self.add_ticker(p, super::ticks::TickerFamily::Hopper);
             self.bs.hoppers.insert(p, (id, 0, i64::MIN));
         }
         // Furnaces and brewing stands tick as soon as they are created (and not on first opening): their
@@ -2066,7 +2066,7 @@ impl Server {
     fn register_loaded_ticker(&mut self, p: P, be: LoadedBe) {
         match be {
             LoadedBe::Hopper(cd) => {
-                let id = self.add_ticker(p);
+                let id = self.add_ticker(p, super::ticks::TickerFamily::Hopper);
                 self.bs.hoppers.insert(p, (id, cd, i64::MIN));
             }
             LoadedBe::Hive => self.hive_register(p),              // F11

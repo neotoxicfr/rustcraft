@@ -1332,6 +1332,25 @@ impl Server {
             || self.ticket_level(c) <= BLOCK_TICKING
     }
 
+    /// Squares (centre chunk, Chebyshev radius) whose union holds every chunk `chunk_simulated`
+    /// accepts, for listing candidates instead of testing every loaded chunk: the players'
+    /// squares, one chunk around each forced chunk and each applied pearl ticket, the dragon
+    /// fight's square around the origin. Keep it in step with `chunk_simulated`, which still
+    /// judges every candidate.
+    pub(crate) fn simulated_squares(&self, centers: &[(i32, i32)]) -> Vec<((i32, i32), i32)> {
+        let mut squares: Vec<((i32, i32), i32)> = centers.iter().map(|&c| (c, self.sim_dist + 1)).collect();
+        squares.extend(self.cmd.forced.iter().map(|&c| (c, 1)));
+        // A ticket of level L at its own chunk weakens by one per chunk: it keeps the "ticking
+        // blocks" level up to BLOCK_TICKING − L chunks away.
+        let pearl = BLOCK_TICKING - crate::projectiles::PEARL_TICKET_LEVEL;
+        squares.extend(self.proj.tickets.iter().filter(|t| t.live).map(|t| (t.chunk, pearl)));
+        let fight = self.fight_ticket_level((0, 0));
+        if fight <= BLOCK_TICKING {
+            squares.push(((0, 0), BLOCK_TICKING - fight));
+        }
+        squares
+    }
+
     /// "Ticking entities" chunk (level 31): random ticks, thunderstorm; simulation
     /// distance, or the force-loaded chunk itself.
     pub(crate) fn chunk_entity_ticking(&self, c: (i32, i32), centers: &[(i32, i32)]) -> bool {
@@ -1382,8 +1401,15 @@ impl Server {
         self.mob_chunk_ticking(c) || self.ticket_level(c) <= ENTITY_TICKING
     }
 
+    /// A forced chunk lies within `r` chunks (Chebyshev) of `c`.
     fn forced_near(&self, c: (i32, i32), r: i32) -> bool {
-        self.cmd.forced.iter().any(|f| (c.0 - f.0).abs() <= r && (c.1 - f.1).abs() <= r)
+        let forced = &self.cmd.forced;
+        // Up to a few forced chunks, comparing them all costs less than searching the set.
+        if forced.len() <= 8 || !crate::blocks::ticks::BlockTickPaths::current().simulated_candidates {
+            return forced.iter().any(|f| (c.0 - f.0).abs() <= r && (c.1 - f.1).abs() <= r);
+        }
+        // The set is sorted by (x, z): one range search per column of the square.
+        (c.0 - r..=c.0 + r).any(|x| forced.range((x, c.1 - r)..=(x, c.1 + r)).next().is_some())
     }
 
     /// Mob count for the caps: seven categories
@@ -1487,8 +1513,7 @@ impl Server {
     /// force-loaded chunk, propagated by two chunks up to the "full" status.
     pub(crate) fn entities_loaded_at(&self, c: (i32, i32), centers: &[(i32, i32)]) -> bool {
         let r = self.view.clamp(2, 32) + 2;
-        centers.iter().any(|p| (c.0 - p.0).abs() <= r && (c.1 - p.1).abs() <= r)
-            || self.cmd.forced.iter().any(|f| (c.0 - f.0).abs() <= 2 && (c.1 - f.1).abs() <= 2)
+        centers.iter().any(|p| (c.0 - p.0).abs() <= r && (c.1 - p.1).abs() <= r) || self.forced_near(c, 2)
     }
 
     /// `chunk_simulated` without a prepared list (hot paths: no allocation).

@@ -147,7 +147,7 @@ impl Server {
             Some(be) => flags(&read_items(be, SLOTS), &times(be, "CookingTimes")),
             None => BeTick::Campfire { food: false, warm: false },
         };
-        let id = self.add_ticker(p);
+        let id = self.add_ticker(p, crate::blocks::ticks::TickerFamily::Shared);
         self.bs.be_ticks.insert(p, (id, state));
     }
 

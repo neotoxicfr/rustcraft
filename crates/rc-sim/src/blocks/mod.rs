@@ -71,6 +71,10 @@ mod g6f07_tests;
 mod draw_order_tests;
 #[cfg(test)]
 mod g6f08_tests;
+#[cfg(test)]
+mod tick_engine_bench; // world tick engine: micro-benches, former against optimised paths
+#[cfg(test)]
+mod tick_engine_tests; // world tick engine: former and optimised paths compared
 
 pub(crate) use table::{Kind, Table};
 

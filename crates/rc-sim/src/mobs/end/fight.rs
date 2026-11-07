@@ -89,6 +89,14 @@ pub struct Fight {
 }
 
 impl Fight {
+    /// Tests outside this module: a default fight with players in its bar (its ticket counts).
+    #[cfg(test)]
+    pub(crate) fn with_players_in_bar() -> Fight {
+        let mut f = Fight::read(None);
+        f.bar_player = true;
+        f
+    }
+
     /// State read (game codec), otherwise default.
     pub(super) fn read(root: Option<&Nbt>) -> Fight {
         let d = root.and_then(|r| r.get("data"));
