@@ -40,6 +40,23 @@ pub mod stats {
         FULL_CELLS.load(Relaxed)
     }
 
+    std::thread_local! {
+        /// Light time (chunks lit in full and relights) spent on this thread since it started.
+        static THIS_THREAD_LIGHT_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Charges `ns` of light work to the calling thread (the process totals above mix the client's
+    /// relights with the integrated server's: this one tells a server tick its own share).
+    pub(crate) fn add_this_thread_light_ns(ns: u64) {
+        THIS_THREAD_LIGHT_NS.with(|t| t.set(t.get() + ns));
+    }
+
+    /// Light time spent on the calling thread since it started (ns): chunks lit in full and
+    /// relights after block changes.
+    pub fn this_thread_light_ns() -> u64 {
+        THIS_THREAD_LIGHT_NS.with(std::cell::Cell::get)
+    }
+
     /// Bytes of the property grid's zone buffers in use right now over every thread, and the most
     /// in use at once since [`reset_zone_buffer_peak`]: the memory a batch's tiles hold together.
     static ZONE_BUFFER_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -254,7 +271,9 @@ pub fn light_chunk_scanned(
     use std::sync::atomic::Ordering::Relaxed;
     let t0 = std::time::Instant::now();
     let out = light_chunk_dispatch(t, cols, scans, height, has_sky, full::FullOpts::current());
-    stats::CHUNK_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    let ns = t0.elapsed().as_nanos() as u64;
+    stats::CHUNK_NS.fetch_add(ns, Relaxed);
+    stats::add_this_thread_light_ns(ns);
     stats::CHUNKS.fetch_add(1, Relaxed);
     out
 }
@@ -742,7 +761,9 @@ fn timed<R>(changes: usize, f: impl FnOnce() -> R) -> R {
     use std::sync::atomic::Ordering::Relaxed;
     let t0 = std::time::Instant::now();
     let out = f();
-    stats::RELIGHT_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    let ns = t0.elapsed().as_nanos() as u64;
+    stats::RELIGHT_NS.fetch_add(ns, Relaxed);
+    stats::add_this_thread_light_ns(ns);
     stats::RELIGHTS.fetch_add(1, Relaxed);
     stats::CHANGES.fetch_add(changes as u64, Relaxed);
     out

@@ -13,6 +13,8 @@ pub struct ChunkGrid {
     /// Stamp per cell, changed at each write access (insertion, removal, `get_mut`):
     /// values unique in the process, never reused by another grid.
     stamps: Vec<u64>,
+    /// Stamp of the last write access to any cell, or of the last resize ([`ChunkGrid::epoch`]).
+    epoch: u64,
 }
 
 /// Unique stamp in the process (never 0).
@@ -72,7 +74,13 @@ impl ChunkGrid {
     pub fn new(radius: u32) -> Self {
         let size = Self::size_for(radius);
         let s = stamp();
-        ChunkGrid { size, slots: (0..size * size).map(|_| None).collect(), loaded: 0, stamps: vec![s; (size * size) as usize] }
+        ChunkGrid {
+            size,
+            slots: (0..size * size).map(|_| None).collect(),
+            loaded: 0,
+            stamps: vec![s; (size * size) as usize],
+            epoch: s,
+        }
     }
 
     /// Stamp of the cell of column (x, z): if it equals a previous read, nothing can
@@ -81,6 +89,21 @@ impl ChunkGrid {
     #[inline]
     pub fn stamp(&self, x: i32, z: i32) -> u64 {
         self.stamps[self.slot(x, z)]
+    }
+
+    /// Write epoch of the whole grid: if it equals a previous read, no cell can have changed
+    /// between the two (same rule as [`ChunkGrid::stamp`], for any column; never 0). One load for
+    /// the read caches whose entries may land in any column, such as the particles' light.
+    #[inline]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// New stamp for cell `i`, which is also the grid's epoch.
+    fn touch(&mut self, i: usize) {
+        let s = stamp();
+        self.stamps[i] = s;
+        self.epoch = s;
     }
 
     fn size_for(radius: u32) -> i32 {
@@ -103,7 +126,7 @@ impl ChunkGrid {
     /// Inserts a column; returns the one it replaces in the cell, if there was one.
     pub fn insert(&mut self, column: Column) -> Option<Arc<Column>> {
         let i = self.slot(column.x, column.z);
-        self.stamps[i] = stamp();
+        self.touch(i);
         let old = self.slots[i].replace(Arc::new(column));
         if old.is_none() {
             self.loaded += 1;
@@ -132,7 +155,7 @@ impl ChunkGrid {
     #[inline]
     pub fn get_mut_by(&mut self, x: i32, z: i32, writer: ColumnWriter) -> Option<&mut Column> {
         let i = self.slot(x, z);
-        self.stamps[i] = stamp();
+        self.touch(i);
         let column = self.slots[i].as_mut().filter(|c| c.x == x && c.z == z)?;
         // Same test as the copy inside `make_mut` (one load): only the copies are counted.
         if Arc::strong_count(column) > 1 {
@@ -143,7 +166,7 @@ impl ChunkGrid {
 
     pub fn remove(&mut self, x: i32, z: i32) -> Option<Arc<Column>> {
         let i = self.slot(x, z);
-        self.stamps[i] = stamp();
+        self.touch(i);
         if self.slots[i].as_ref().is_some_and(|c| c.x == x && c.z == z) {
             self.loaded -= 1;
             self.slots[i].take()
@@ -161,7 +184,8 @@ impl ChunkGrid {
         let old = std::mem::take(&mut self.slots);
         self.size = size;
         self.slots = (0..size * size).map(|_| None).collect();
-        self.stamps = vec![stamp(); (size * size) as usize];
+        self.epoch = stamp();
+        self.stamps = vec![self.epoch; (size * size) as usize];
         self.loaded = 0;
         for c in old.into_iter().flatten() {
             let i = self.slot(c.x, c.z);
@@ -224,6 +248,31 @@ mod tests {
         assert!(g.get_mut_by(9, 9, ColumnWriter::Biomes).is_none(), "absent column");
         let after = column_copies();
         assert_eq!((after[biomes] - before[biomes], after[relight] - before[relight]), (1, 0));
+    }
+
+    /// The epoch moves with every write access to any cell and with a resize, never with a read;
+    /// a new grid never starts on the epoch of another.
+    #[test]
+    fn epoch_moves_with_every_write_only() {
+        fn moved(g: &ChunkGrid, last: &mut u64, what: &str) {
+            assert_ne!(g.epoch(), *last, "{what} must move the epoch");
+            *last = g.epoch();
+        }
+        let mut g = ChunkGrid::new(4);
+        let mut last = g.epoch();
+        g.insert(col(1, 2));
+        moved(&g, &mut last, "insertion");
+        let _ = (g.get(1, 2), g.get_arc(1, 2), g.stamp(1, 2), g.iter().count(), g.len());
+        assert_eq!(g.epoch(), last, "reads leave the epoch");
+        g.get_mut_by(1, 2, ColumnWriter::LightUpdate).expect("column present").sky_light = Box::new([None]);
+        moved(&g, &mut last, "light write");
+        g.get_mut(7, 7);
+        moved(&g, &mut last, "write access to an empty cell");
+        g.remove(1, 2);
+        moved(&g, &mut last, "removal");
+        g.set_radius(9);
+        moved(&g, &mut last, "resize");
+        assert_ne!(ChunkGrid::new(4).epoch(), g.epoch(), "another grid");
     }
 
     #[test]

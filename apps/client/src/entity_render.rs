@@ -45,6 +45,9 @@ mod tests_c3m11;
 mod tests_g2f05;
 #[cfg(test)]
 mod tests_moving_block_tints;
+// Primed TNT and ground items in bulk: fast paths and their benches.
+#[cfg(test)]
+mod tests_mass_entities;
 // Dragon effects, creaking tearing itself down (mission G4-F16a).
 #[cfg(test)]
 mod tests_g4f16a;
@@ -52,6 +55,9 @@ mod tests_g4f16a;
 // animated-models path (`push_object`), block models inside an entity.
 mod objects;
 mod transparency;
+// Orders of the frame (entities far to near, instances by geometry) and stacks on the ground.
+mod draw_order;
+mod ground_items;
 pub(crate) use objects::{DisplayState, display_cull_box, display_data, display_tick};
 pub(crate) use objects::{DisplaySub, ObjectsFrame, TextDraw};
 use transparency::EntityOit;
@@ -2141,6 +2147,8 @@ struct GpuLayer {
 
 /// Sizes of an entity for the frame: base (`Entity::base_size`) and full (`Entity::size`).
 type Sizes = (Size, Size);
+/// Entity of the frame's list: squared distance to the camera, sizes (`SIZEONCE`), kind flags.
+type ListRow<'e> = (&'e Entity, f64, Option<Sizes>, KindInfo);
 /// Kept probe at the eyes' block: exact position (bits), (block, sky).
 type EyeProbe = ([u64; 3], (u8, u8));
 
@@ -2188,6 +2196,27 @@ pub(crate) struct EntOpt {
     /// `POLY_ROTATIONS`: root and family rotations through the rendering polynomials (within
     /// 1e-6 of the library sine, an approximation of the rendering like the part matrices).
     pub poly_rotations: bool,
+    /// `DISTANCE_SORT_KEYS`: the far-to-near order of the frame sorted on compact keys (distance
+    /// bits, then rank in the list) instead of moving the whole entity rows in a merge sort.
+    pub distance_sort_keys: bool,
+    /// `PRIMED_TNT_SHARED_POSE`: a primed TNT that is not swelling takes the block pose shared by
+    /// all of them, only its translation added (the same matrix up to the sign of zeros).
+    pub primed_tnt_shared_pose: bool,
+    /// `PRIMED_TNT_BY_KIND_FLAG`: a primed TNT drawn straight from its kind flag (needs
+    /// `KINDINFO`) instead of being found among the object kinds by name.
+    pub primed_tnt_by_kind_flag: bool,
+    /// `STILL_TNT_CACHE`: part matrix and instances of a primed TNT kept while its position,
+    /// swelling, blinking, state and light stay the same (default off, see `docs/perf.md`).
+    pub still_tnt_cache: bool,
+    /// `GROUND_ITEM_LAYOUT_CACHE`: layers, model box and copy offsets of a stack on the ground kept
+    /// per stack content, as long as its model reads nothing from its surroundings.
+    pub ground_item_layout_cache: bool,
+    /// `ITEM_GROUPS_IN_PLACE`: the tint groups of an item mesh read where they are kept instead
+    /// of copied for each layer drawn.
+    pub item_groups_in_place: bool,
+    /// `INSTANCE_BUCKETS`: instances grouped by geometry in one counting pass, into buffers kept
+    /// between frames, instead of a merge sort and fresh buffers every frame.
+    pub instance_buckets: bool,
 }
 
 impl EntOpt {
@@ -2209,6 +2238,13 @@ impl EntOpt {
         known_part_names: false,
         keyframe_static_names: false,
         poly_rotations: false,
+        distance_sort_keys: false,
+        primed_tnt_shared_pose: false,
+        primed_tnt_by_kind_flag: false,
+        still_tnt_cache: false,
+        ground_item_layout_cache: false,
+        item_groups_in_place: false,
+        instance_buckets: false,
     };
 
     /// New paths everywhere.
@@ -2229,6 +2265,13 @@ impl EntOpt {
         known_part_names: true,
         keyframe_static_names: true,
         poly_rotations: true,
+        distance_sort_keys: true,
+        primed_tnt_shared_pose: true,
+        primed_tnt_by_kind_flag: true,
+        still_tnt_cache: true,
+        ground_item_layout_cache: true,
+        item_groups_in_place: true,
+        instance_buckets: true,
     };
 
     pub(crate) fn from_env() -> EntOpt {
@@ -2248,6 +2291,13 @@ impl EntOpt {
             known_part_names: rc_data::opt_switch!("RUSTCRAFT_OPT_KNOWN_PART_NAMES"),
             keyframe_static_names: rc_data::opt_switch!("RUSTCRAFT_OPT_KEYFRAME_STATIC_NAMES"),
             poly_rotations: rc_data::opt_switch!("RUSTCRAFT_OPT_POLY_ROTATIONS"),
+            distance_sort_keys: rc_data::opt_switch!("RUSTCRAFT_OPT_DISTANCE_SORT_KEYS"),
+            primed_tnt_shared_pose: rc_data::opt_switch!("RUSTCRAFT_OPT_PRIMED_TNT_SHARED_POSE"),
+            primed_tnt_by_kind_flag: rc_data::opt_switch!("RUSTCRAFT_OPT_PRIMED_TNT_BY_KIND_FLAG"),
+            still_tnt_cache: rc_data::opt_switch!("RUSTCRAFT_OPT_STILL_TNT_CACHE", default_off),
+            ground_item_layout_cache: rc_data::opt_switch!("RUSTCRAFT_OPT_GROUND_ITEM_LAYOUT_CACHE"),
+            item_groups_in_place: rc_data::opt_switch!("RUSTCRAFT_OPT_ITEM_GROUPS_IN_PLACE"),
+            instance_buckets: rc_data::opt_switch!("RUSTCRAFT_OPT_INSTANCE_BUCKETS"),
         }
     }
 }
@@ -2381,6 +2431,14 @@ pub struct EntityRenderer {
     mats_buf: Option<(wgpu::Buffer, u64)>,
     inst_buf: Option<(wgpu::Buffer, u64)>,
     mats: Vec<PartMat>,
+    /// Buffers of the frame's orders kept between frames: far-to-near keys of the entities,
+    /// geometry buckets of the instances, instances and free geometry flattened for upload.
+    sort_keys: Vec<(u64, u32)>,
+    geometry_buckets: draw_order::GeometryBuckets,
+    flat_instances: Vec<Instance>,
+    flat_free_verts: Vec<FreeVertex>,
+    /// Layers, box and copies of the stacks drawn on the ground (`GROUND_ITEM_LAYOUT_CACHE`).
+    ground_layouts: ground_items::GroundLayouts,
     /// Instances per pass: (source, first row of vertices, count, instance); source 0 =
     /// entity models, 1 = object meshes. Pass 3: boats' water mask
     /// (depth only); pass 4: additive (lightning); pass 5: dissolve (drawn just
@@ -3162,6 +3220,11 @@ impl EntityRenderer {
             mats_buf: None,
             inst_buf: None,
             mats: Vec::new(),
+            sort_keys: Vec::new(),
+            geometry_buckets: Default::default(),
+            flat_instances: Vec::new(),
+            flat_free_verts: Vec::new(),
+            ground_layouts: Default::default(),
             instances: Default::default(),
             hand_from: [0; PASSES],
             glow_only: Vec::new(),
@@ -3869,7 +3932,7 @@ impl EntityRenderer {
     }
 
     /// Prepares the instances of all visible entities. `origin` = integer origin of the
-    /// camera (x, z); `light(x, y, z)` = (block, sky); `visible(min, max)` = box within the field of view.
+    /// camera (x, z); `light(x, y, z)` = (block, sky); `visible.aabb(min, max)` = box within the field of view.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare<'e>(
         &mut self,
@@ -3878,7 +3941,7 @@ impl EntityRenderer {
         origin: [i32; 2],
         cam: [f64; 3],
         light: &dyn Fn(i32, i32, i32) -> (u8, u8),
-        visible: &dyn Fn([f32; 3], [f32; 3]) -> bool,
+        visible: &crate::render::FrameVisibility,
         items: Option<&rc_assets::item::ItemModels>,
         world_q: &ShadowWorld<'_>,
     ) {
@@ -3896,24 +3959,9 @@ impl EntityRenderer {
         self.set_current(None, None);
         let opt = self.opt;
         ANIMATION_PATHS.with(|p| p.set(AnimationPaths::of(&opt)));
-        // From farthest to nearest (translucent order). Sizes (base, full)
-        // computed once per entity (`SIZEONCE`); kind flags (`KINDINFO`).
-        let mut list: Vec<(&Entity, f64, Option<Sizes>, KindInfo)> = entities
-            .map(|e| {
-                let p = e.render_pos(pt);
-                let sizes = opt.size_once.then(|| {
-                    let b = e.base_size(&self.dims);
-                    (b, e.size_from(b))
-                });
-                let info = if opt.kind_info { self.kind_of(e) } else { KindInfo::default() };
-                (e, (0..3).map(|i| (p[i] - cam[i]).powi(2)).sum::<f64>(), sizes, info)
-            })
-            .filter(|&(e, d, sizes, _)| match sizes {
-                Some((_, full)) => within_render_distance_of(e, d, self.view_scale, || full),
-                None => within_render_distance(e, d, self.view_scale, &self.dims),
-            })
-            .collect();
-        list.sort_by(|a, b| b.1.total_cmp(&a.1));
+        self.begin_primed_tnt_frame();
+        self.begin_ground_layouts_frame();
+        let list = self.frame_list(entities, pt, cam);
         for v in &mut self.free_verts {
             v.clear();
         }
@@ -3992,7 +4040,9 @@ impl EntityRenderer {
                 (cull, always)
             };
             let (hw, hh) = cull.map_or((hw, hh), |(w, h)| (w * 0.5 + 0.5, h + 0.5));
-            if !(always || visible([rel[0] - hw, rel[1] - 0.5, rel[2] - hw], [rel[0] + hw, rel[1] + hh, rel[2] + hw])) {
+            if !(always
+                || visible.aabb([rel[0] - hw, rel[1] - 0.5, rel[2] - hw], [rel[0] + hw, rel[1] + hh, rel[2] + hw]))
+            {
                 continue;
             }
             // Invisible: never a shadow; the body of a living entity is handled by `push_entity`
@@ -4005,6 +4055,13 @@ impl EntityRenderer {
             if let Some(&rgb) = self.glow.get(&e.uuid) {
                 glowing =
                     Some((rgb, std::array::from_fn(|i| self.instances[GLOW_PASSES[i]].len()), self.glow_only.len()));
+            }
+            // Primed TNT straight from its kind flag: the object path finds it only after a
+            // score of name comparisons, for every TNT of a heap that went off.
+            if new && opt.primed_tnt_by_kind_flag && ki.has(K_PRIMED_TNT) {
+                let (b, s) = self.object_light(e, p, light);
+                drawn += usize::from(self.push_primed_tnt(e, pt, rel, objects::pack(b, s)));
+                continue;
             }
             if let Some(d) = self.push_object(e, pt, rel, p, cam, light, items, world_q) {
                 drawn += usize::from(d);
@@ -4080,6 +4137,38 @@ impl EntityRenderer {
         self.hand_from = std::array::from_fn(|i| self.instances[i].len());
         self.gui_from = None;
         self.totem_from = None;
+    }
+
+    /// The frame's entities within their render distance, from farthest to nearest (the
+    /// translucent order), each with its squared distance to the camera, its sizes (base, full)
+    /// computed once (`SIZEONCE`) and its kind flags (`KINDINFO`).
+    fn frame_list<'e>(&mut self, entities: impl Iterator<Item = &'e Entity>, pt: f32, cam: [f64; 3]) -> Vec<ListRow<'e>> {
+        let opt = self.opt;
+        let (dims, kinds, view_scale) = (&self.dims, &self.kinds, self.view_scale);
+        let row = move |e: &'e Entity| -> Option<ListRow<'e>> {
+            let p = e.render_pos(pt);
+            let sizes = opt.size_once.then(|| {
+                let b = e.base_size(dims);
+                (b, e.size_from(b))
+            });
+            let info = if opt.kind_info { kind_info_in(kinds, e) } else { KindInfo::default() };
+            let d = (0..3).map(|i| (p[i] - cam[i]).powi(2)).sum::<f64>();
+            let within = match sizes {
+                Some((_, full)) => within_render_distance_of(e, d, view_scale, || full),
+                None => within_render_distance(e, d, view_scale, dims),
+            };
+            within.then_some((e, d, sizes, info))
+        };
+        // One thread: the entities hold the crosshair's kept boxes (`Entity::cached_box`, a `Cell`),
+        // so they cannot be shared between threads; spreading this list over the cores is left to
+        // the multi-core prepare (C3-M25, `docs/perf.md`).
+        let mut list: Vec<ListRow<'e>> = entities.filter_map(row).collect();
+        if opt.distance_sort_keys {
+            draw_order::sort_far_to_near(&mut list, |r| r.1, &mut self.sort_keys);
+        } else {
+            list.sort_by(|a, b| b.1.total_cmp(&a.1));
+        }
+        list
     }
 
     /// Key of the layers of a kind handled here: variant (low 8 bits, 255 unknown) for the
@@ -6088,26 +6177,12 @@ impl EntityRenderer {
                 }
             }
         }
-        let groups = self.item_mesh(models, l.model).to_vec();
-        for (t, first, count, translucent) in groups {
-            let tint = usize::try_from(t).ok().and_then(|t| l.tints.get(t)).copied().unwrap_or(0xffff_ffff);
-            let color = (tint >> 16 & 0xff) | (tint & 0xff00) | (tint & 0xff) << 16 | (tint & 0xff00_0000);
-            // The game's "cutout item" and "translucent item" types, back faces culled in
-            // both cases: faces without translucency cut out (with the solids in improved
-            // transparency), the others blended (in the improved-transparency stages).
-            let pass = if translucent { PASS_ITEM_TRANSLUCENT } else { PASS_CUTOUT_CULL };
-            self.instances[pass].push((
-                1,
-                first,
-                count,
-                Instance {
-                    base: base_index,
-                    rect: [0.0, 0.0, 1.0, 1.0],
-                    color,
-                    light: light | glint,
-                    overlay: 10 << 16,
-                },
-            ));
+        if self.opt.item_groups_in_place {
+            self.item_mesh(models, l.model);
+            push_item_groups(&mut self.instances, &self.item_meshes[&l.model], &l.tints, base_index, light | glint);
+        } else {
+            let groups = self.item_mesh(models, l.model).to_vec();
+            push_item_groups(&mut self.instances, &groups, &l.tints, base_index, light | glint);
         }
     }
 
@@ -6297,118 +6372,13 @@ impl EntityRenderer {
         let age = e.age as f32 + pt;
         let bob = table_sin(age / 10.0 + bob_offs) * 0.1 + 0.1;
         // Light at the eyes' block (the game's light probe), not at the feet.
-        let (b, s) = self.eye_light(e, world, light);
-        let block = if e.flags() & 1 != 0 { 15 } else { b };
-        let packed = (u32::from(block) * 16) | ((u32::from(s) * 16) << 8);
+        let (b, s) = self.object_light(e, world, light);
+        let packed = objects::pack(b, s);
         // The ground item carries its stack: its position and its own rotation orient the needle.
         let owner = (e.id, e.pos, ground_item_yaw(e.age, bob_offs));
         let pre = Mat4::from_translation(Vec3::from(rel));
         let post = Mat4::from_rotation_y(age / 20.0 + bob_offs);
         self.push_item_cluster(models, stack, owner, pre, Some(bob), post, packed)
-    }
-
-    /// Group of items of a stack in the `ground` context (ground item, ominous spawner):
-    /// matrix `pre`, rise `lift` (bobbing) plus lift of the bottom of the model's box (+1/16),
-    /// neither for `None`, then `post`; copies
-    /// depending on the quantity, offset by the game's 48-bit random (seed = item + damage). `owner`:
-    /// id, position and visual rotation of the carrier (needles).
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn push_item_cluster(
-        &mut self,
-        models: &rc_assets::item::ItemModels,
-        stack: &rc_proto_v777::item::ItemStack,
-        owner: (i32, [f64; 3], f32),
-        pre: Mat4,
-        lift: Option<f32>,
-        post: Mat4,
-        packed: u32,
-    ) -> bool {
-        let info = usize::try_from(stack.item).ok().and_then(|i| self.source.items.get(i));
-        let view =
-            crate::stack::StackRef { stack, info, ids: &self.ids, data: &self.source, hold: crate::stack::Hold::NONE };
-        let Some(model) = view.model() else { return false };
-        let name =
-            usize::try_from(stack.item).ok().and_then(|i| self.item_names()?.get(i)).cloned().unwrap_or_default();
-        let env = crate::stack::OwnerEnv::new(&self.world, "ground", owner.0, owner.1, owner.2);
-        let (mut layers, mut key) = (Vec::new(), Vec::new());
-        models.layers(&name, &model, &view, &env, env.seed(), &mut layers, &mut key);
-        if layers.is_empty() {
-            return false;
-        }
-        // Box of the model after `ground` display and local transformations.
-        let ground = |l: &rc_assets::item::Layer| {
-            let b = models.baked(l.model).unwrap_or(&models.missing);
-            Mat4::from_cols_array_2d(&b.displays[1]).transpose() * Mat4::from_cols_array_2d(&l.local).transpose()
-        };
-        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-        for l in &layers {
-            let m = ground(l);
-            for q in models.baked(l.model).unwrap_or(&models.missing).quads() {
-                for p in q.pos {
-                    let v = m.transform_point3(Vec3::from(p));
-                    lo = lo.min(v);
-                    hi = hi.max(v);
-                }
-            }
-            // Special model: its geometry (the base model is empty) gives the box.
-            if l.special != 0 {
-                let mut sq = Vec::new();
-                self.special.quads(l.special, &l.tints, &mut sq);
-                for q in &sq {
-                    for p in q.pos {
-                        let v = m.transform_point3(Vec3::from(p));
-                        lo = lo.min(v);
-                        hi = hi.max(v);
-                    }
-                }
-            }
-        }
-        if lo.x > hi.x {
-            return false;
-        }
-        let n = match stack.count {
-            ..=1 => 1,
-            2..=16 => 2,
-            17..=32 => 3,
-            33..=48 => 4,
-            _ => 5,
-        };
-        // 48-bit random of the game, seed = item + damage.
-        let damage = rc_assets::item::StackView::damage(&view);
-        let mut seed = (i64::from(stack.item) + i64::from(damage)) as u64 ^ 0x5_DEEC_E66D;
-        let mut rand = move || {
-            seed = seed.wrapping_mul(0x5_DEEC_E66D).wrapping_add(11) & ((1 << 48) - 1);
-            (seed >> 24) as f32 / (1u32 << 24) as f32
-        };
-        let depth = hi.z - lo.z;
-        let base = match lift {
-            Some(bob) => pre * Mat4::from_translation(Vec3::new(0.0, bob + (-lo.y + 0.0625), 0.0)) * post,
-            None => pre * post,
-        };
-        let mut copies = Vec::with_capacity(n);
-        if depth > 0.0625 {
-            copies.push(base);
-            for _ in 1..n {
-                let o =
-                    Vec3::new((rand() * 2.0 - 1.0) * 0.15, (rand() * 2.0 - 1.0) * 0.15, (rand() * 2.0 - 1.0) * 0.15);
-                copies.push(base * Mat4::from_translation(o));
-            }
-        } else {
-            let step = depth * 1.5;
-            let mut z = -step * (n as f32 - 1.0) / 2.0;
-            copies.push(base * Mat4::from_translation(Vec3::new(0.0, 0.0, z)));
-            for _ in 1..n {
-                z += step;
-                let o = Vec3::new((rand() * 2.0 - 1.0) * 0.075, (rand() * 2.0 - 1.0) * 0.075, z);
-                copies.push(base * Mat4::from_translation(o));
-            }
-        }
-        for c in copies {
-            for l in &layers {
-                self.push_item_layer(models, l, c * ground(l), packed);
-            }
-        }
-        true
     }
 
     pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, _up: &mut crate::render::upload::Uploader) {
@@ -6418,8 +6388,6 @@ impl EntityRenderer {
         queue.write_buffer(&self.lights, 64, bytemuck::cast_slice(&[o0, o1, strength, 0.0]));
         queue.write_buffer(&self.lights_totem, 64, bytemuck::cast_slice(&[o0, o1, strength, 0.0]));
         queue.write_buffer(&self.lights_ui, 64, bytemuck::cast_slice(&[o0, o1, strength, 0.0]));
-        self.batches.clear();
-        self.glow_batches.clear();
         self.shadow_count = self.shadow_verts.len() as u32;
         if !self.shadow_verts.is_empty() {
             let bytes: &[u8] = bytemuck::cast_slice(&self.shadow_verts);
@@ -6437,7 +6405,16 @@ impl EntityRenderer {
             }
             queue.write_buffer(&self.shadow_buf.as_ref().expect("created above").0, 0, bytes);
         }
-        let free: Vec<FreeVertex> = self.free_verts.concat();
+        let free = if self.opt.instance_buckets {
+            let mut free = std::mem::take(&mut self.flat_free_verts);
+            free.clear();
+            for v in &self.free_verts {
+                free.extend_from_slice(v);
+            }
+            free
+        } else {
+            self.free_verts.concat()
+        };
         if !free.is_empty() {
             let bytes: &[u8] = bytemuck::cast_slice(&free);
             if self.free_buf.as_ref().is_none_or(|(_, cap)| *cap < bytes.len() as u64) {
@@ -6454,23 +6431,81 @@ impl EntityRenderer {
             }
             queue.write_buffer(&self.free_buf.as_ref().expect("created above").0, 0, bytes);
         }
+        if self.opt.instance_buckets {
+            self.flat_free_verts = free;
+        }
         if self.mats.is_empty() {
+            // Nothing placed: `build_batches` (which rebuilds the batches) is skipped, so the
+            // last frame's batches must not be drawn again.
+            self.batches.clear();
+            self.glow_batches.clear();
             return;
         }
-        // Cutouts and eyes grouped by layer rank then by geometry (stable sort: at equal rank,
-        // the placement order is kept); translucents from farthest to nearest, batches of
-        // identical consecutive layers. Real source = low 4 bits.
-        // World first, then the hand (separate batches, drawn in its pass).
+        let flat = self.build_batches();
+        if self.item_dirty && !self.item_verts.is_empty() {
+            self.item_dirty = false;
+            use wgpu::util::DeviceExt;
+            self.item_buf = Some((
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("item meshes"),
+                    contents: bytemuck::cast_slice(&self.item_verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+                0,
+            ));
+        }
+        let grow = |buf: &mut Option<(wgpu::Buffer, u64)>, bytes: &[u8], usage: wgpu::BufferUsages, label| {
+            let fresh = buf.as_ref().is_none_or(|(_, cap)| *cap < bytes.len() as u64);
+            if fresh {
+                let cap = (bytes.len() as u64).next_power_of_two().max(256);
+                *buf = Some((
+                    device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some(label),
+                        size: cap,
+                        usage: usage | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }),
+                    cap,
+                ));
+            }
+            queue.write_buffer(&buf.as_ref().expect("created above").0, 0, bytes);
+            fresh
+        };
+        let new_mats =
+            grow(&mut self.mats_buf, bytemuck::cast_slice(&self.mats), wgpu::BufferUsages::STORAGE, "entity parts");
+        grow(&mut self.inst_buf, bytemuck::cast_slice(&flat), wgpu::BufferUsages::VERTEX, "entity instances");
+        if self.opt.instance_buckets {
+            self.flat_instances = flat;
+        }
+        self.bind_entity_resources(device, queue, new_mats);
+    }
+
+    /// Batches of the frame, returning the instances in drawing order. Cutouts and eyes grouped
+    /// by layer rank then by geometry (at equal rank, the placement order is kept); translucents
+    /// from farthest to nearest; batches of identical consecutive layers. Real source = low 4
+    /// bits. World first, then the hand (separate batches, drawn in its pass).
+    fn build_batches(&mut self) -> Vec<Instance> {
+        self.batches.clear();
+        self.glow_batches.clear();
         let from = self.hand_from;
         for p in [0, 2, PASS_CUTOUT_CULL, PASS_SOLID] {
             let f = from[p].min(self.instances[p].len());
-            self.instances[p][..f].sort_by_key(|i| (i.0 >> 4, i.0 & 15, i.1));
+            if self.opt.instance_buckets {
+                draw_order::group_by_geometry(&mut self.instances[p][..f], &mut self.geometry_buckets);
+            } else {
+                self.instances[p][..f].sort_by_key(|i| (i.0 >> 4, i.0 & 15, i.1));
+            }
         }
         // Translucent items and moving blocks of the world: from farthest to nearest according to their
         // pose (stable sort: at equal distance, placement order).
         let f = from[PASS_ITEM_TRANSLUCENT].min(self.instances[PASS_ITEM_TRANSLUCENT].len());
-        sort_far_to_near(&mut self.instances[PASS_ITEM_TRANSLUCENT][..f], &self.mats, self.eye);
-        let mut flat: Vec<Instance> = Vec::new();
+        if self.opt.distance_sort_keys {
+            draw_order::sort_translucent_far_to_near(&mut self.instances[PASS_ITEM_TRANSLUCENT][..f], &self.mats, self.eye);
+        } else {
+            sort_far_to_near(&mut self.instances[PASS_ITEM_TRANSLUCENT][..f], &self.mats, self.eye);
+        }
+        let mut flat = if self.opt.instance_buckets { std::mem::take(&mut self.flat_instances) } else { Vec::new() };
+        flat.clear();
         // World then hand; dissolve (opaque) just after the cutouts.
         // Segments: world, hand, totem animation, interface models.
         let gui = self.gui_from;
@@ -6516,38 +6551,11 @@ impl EntityRenderer {
             }
             flat.push(inst);
         }
-        if self.item_dirty && !self.item_verts.is_empty() {
-            self.item_dirty = false;
-            use wgpu::util::DeviceExt;
-            self.item_buf = Some((
-                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("item meshes"),
-                    contents: bytemuck::cast_slice(&self.item_verts),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
-                0,
-            ));
-        }
-        let grow = |buf: &mut Option<(wgpu::Buffer, u64)>, bytes: &[u8], usage: wgpu::BufferUsages, label| {
-            let fresh = buf.as_ref().is_none_or(|(_, cap)| *cap < bytes.len() as u64);
-            if fresh {
-                let cap = (bytes.len() as u64).next_power_of_two().max(256);
-                *buf = Some((
-                    device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some(label),
-                        size: cap,
-                        usage: usage | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    }),
-                    cap,
-                ));
-            }
-            queue.write_buffer(&buf.as_ref().expect("created above").0, 0, bytes);
-            fresh
-        };
-        let new_mats =
-            grow(&mut self.mats_buf, bytemuck::cast_slice(&self.mats), wgpu::BufferUsages::STORAGE, "entity parts");
-        grow(&mut self.inst_buf, bytemuck::cast_slice(&flat), wgpu::BufferUsages::VERTEX, "entity instances");
+        flat
+    }
+
+    /// Atlas written and bindings remade when the part buffer or the atlas changed.
+    fn bind_entity_resources(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, new_mats: bool) {
         let atlas_changed = self.atlas.flush(device, queue);
         if new_mats || atlas_changed || self.bind.is_none() {
             let make = |lights: &wgpu::Buffer| {
@@ -7040,6 +7048,7 @@ const K_DROWNED: u32 = 1 << 17;
 const K_PIGLIN: u32 = 1 << 18;
 const K_SELF_LIT: u32 = 1 << 19;
 const K_GLOW_SQUID: u32 = 1 << 20;
+const K_PRIMED_TNT: u32 = 1 << 21;
 
 /// What the render asks of an entity's kind every frame, resolved once per kind
 /// (table by type id): flags `K_*`, family whose skin function answers
@@ -7089,6 +7098,7 @@ impl KindInfo {
         set(matches!(k, "piglin" | "piglin_brute"), K_PIGLIN);
         set(matches!(k, "vex" | "magma_cube" | "wither" | "blaze" | "allay"), K_SELF_LIT);
         set(k == "glow_squid", K_GLOW_SQUID);
+        set(k == "tnt", K_PRIMED_TNT);
         KindInfo { flags, family: family_of(k), variant_ser: own_variant_ser(k) }
     }
 }
@@ -7162,10 +7172,7 @@ impl EntityRenderer {
     /// Flags of the kind of `e`: table by type id (name checked), otherwise computed
     /// from the name (kind changed by hand, unknown id).
     pub(super) fn kind_of(&self, e: &Entity) -> KindInfo {
-        match usize::try_from(e.kind_id).ok().and_then(|i| self.kinds.get(i)) {
-            Some((n, info)) if *n == e.kind => *info,
-            _ => KindInfo::of(&e.kind),
-        }
+        kind_info_in(&self.kinds, e)
     }
 
     /// The entity currently in `prepare` (its sizes and probe hold for it alone; the
@@ -7225,6 +7232,36 @@ impl EntityRenderer {
     /// Kept index of the item registry (`REGIDX`), `None`: search by name.
     pub(super) fn item_idx(&self) -> Option<usize> {
         self.item_reg.filter(|_| self.opt.reg_idx)
+    }
+}
+
+/// Instances of the tint groups (tint index, first vertex, count, translucent) of an item mesh
+/// whose part matrix is `base`.
+fn push_item_groups(
+    instances: &mut [Vec<draw_order::Placed>; PASSES],
+    groups: &[(i32, u32, u32, bool)],
+    tints: &rc_assets::item::Tints,
+    base: u32,
+    light: u32,
+) {
+    for &(t, first, count, translucent) in groups {
+        let tint = usize::try_from(t).ok().and_then(|t| tints.get(t)).copied().unwrap_or(0xffff_ffff);
+        let color = (tint >> 16 & 0xff) | (tint & 0xff00) | (tint & 0xff) << 16 | (tint & 0xff00_0000);
+        // The game's "cutout item" and "translucent item" types, back faces culled in
+        // both cases: faces without translucency cut out (with the solids in improved
+        // transparency), the others blended (in the improved-transparency stages).
+        let pass = if translucent { PASS_ITEM_TRANSLUCENT } else { PASS_CUTOUT_CULL };
+        let rect = [0.0, 0.0, 1.0, 1.0];
+        instances[pass].push((1, first, count, Instance { base, rect, color, light, overlay: 10 << 16 }));
+    }
+}
+
+/// Flags of the kind of `e` in `kinds` (by type id, name checked), otherwise computed from the
+/// name (kind changed by hand, unknown id).
+fn kind_info_in(kinds: &[(String, KindInfo)], e: &Entity) -> KindInfo {
+    match usize::try_from(e.kind_id).ok().and_then(|i| kinds.get(i)) {
+        Some((n, info)) if *n == e.kind => *info,
+        _ => KindInfo::of(&e.kind),
     }
 }
 

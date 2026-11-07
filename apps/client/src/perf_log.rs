@@ -11,7 +11,9 @@
 //! of the bases served, in-place uploads, column copies by writer, and the generic counters any
 //! module adds by name ([`counter`], [`counter_per_second`], [`stage_time`], [`StageTimer`]) without
 //! touching this file. Frames outside a world (title screen, menus, loading screen) are logged
-//! too, without the world landmarks. Without the variable: one boolean read per frame.
+//! too, without the world landmarks. The 99.9th percentile of the frames is a counter
+//! (`frame_p999_ms`); with `RUSTCRAFT_PERFLOG_STAGES=1`, the composition of the frames and of the
+//! slow ones (`frame_stages.rs`). Without the variable: one boolean read per frame.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -19,6 +21,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::app_meshing::ChangeOrigin;
+use crate::frame_stages::{self, FrameComposition, FrameStage, SecondComposition};
 
 /// Columns meshed received by the render thread (up to date or stale).
 static MESHED: AtomicU64 = AtomicU64::new(0);
@@ -268,11 +271,15 @@ pub fn on() -> bool {
 static CLIENT_RELIGHTS: AtomicU64 = AtomicU64::new(0);
 static CLIENT_RELIGHT_CHANGES: AtomicU64 = AtomicU64::new(0);
 static CLIENT_RELIGHT_NS: AtomicU64 = AtomicU64::new(0);
+/// Same time, read back every frame by the frame composition (`frame_stages.rs`).
+static FRAME_RELIGHT_NS: AtomicU64 = AtomicU64::new(0);
 
 pub fn client_relight(d: std::time::Duration, changes: usize) {
+    let ns = d.as_nanos() as u64;
     CLIENT_RELIGHTS.fetch_add(1, Relaxed);
     CLIENT_RELIGHT_CHANGES.fetch_add(changes as u64, Relaxed);
-    CLIENT_RELIGHT_NS.fetch_add(d.as_nanos() as u64, Relaxed);
+    CLIENT_RELIGHT_NS.fetch_add(ns, Relaxed);
+    FRAME_RELIGHT_NS.fetch_add(ns, Relaxed);
 }
 
 /// Block changes that touch the light, by origin (`ChangeOrigin`): queued for the local
@@ -415,6 +422,8 @@ struct State {
     last: Option<Instant>,
     /// Durations of the frames of the current second (ms).
     frames: Vec<f32>,
+    /// The same frames with their composition (`RUSTCRAFT_PERFLOG_STAGES` only).
+    compositions: Vec<FrameComposition>,
     since: Instant,
     meshed: u64,
     /// Sections, meshing ns, walks, walk ns, process CPU ns at the last reading.
@@ -438,6 +447,7 @@ impl State {
     fn restart_counters(&mut self, now: Instant) {
         self.last = None;
         self.frames.clear();
+        self.compositions.clear();
         self.since = now;
         self.work = work_now();
         self.light = rc_light::stats::totals();
@@ -456,6 +466,7 @@ fn state() -> Option<&'static Mutex<State>> {
             out: std::io::BufWriter::with_capacity(1 << 16, f),
             last: None,
             frames: Vec::with_capacity(8192),
+            compositions: Vec::new(),
             since: Instant::now(),
             meshed: 0,
             work: work_now(),
@@ -516,9 +527,17 @@ pub fn frame(started: Instant, world: Option<WorldFrame>) {
         s.restart_counters(now);
         eprintln!("[perf] world entered at {:.0} ms", t * 1e3);
     }
+    // Read at the same `now` as the interval: the stages of the frame add up to it exactly.
+    // Read on every frame (the clock restarts here) but kept for the frames in a world only: out
+    // of a world the menu frame runs inside `scheduledExecutables` and would accuse the light.
+    let stage_ns = crate::profiler::take_frame_stages(now).filter(|_| world.is_some());
+    let relight_ns = FRAME_RELIGHT_NS.swap(0, Relaxed);
     if let Some(last) = s.last.replace(now) {
         let ms = now.duration_since(last).as_secs_f64() * 1e3;
         s.frames.push(ms as f32);
+        if let Some(stage_ns) = stage_ns {
+            s.compositions.push(FrameComposition { ms: ms as f32, stage_ns, relight_ns });
+        }
         let _ = writeln!(s.out, "{:.3} {ms:.4}", t * 1e3);
     }
     let cols = world.as_ref().map_or(0, |w| w.columns);
@@ -533,6 +552,7 @@ pub fn frame(started: Instant, world: Option<WorldFrame>) {
     v.sort_unstable_by(f32::total_cmp);
     let pick = |q: f64| v.get(((v.len() as f64 * q) as usize).min(v.len().saturating_sub(1))).copied().unwrap_or(0.0);
     let (p50, p99, max) = (pick(0.5), pick(0.99), v.last().copied().unwrap_or(0.0));
+    let p999 = pick(0.999);
     let n = v.len();
     v.clear();
     s.frames = v;
@@ -600,6 +620,12 @@ pub fn frame(started: Instant, world: Option<WorldFrame>) {
     }
     for (name, value) in drain_generic(n, window) {
         print_counter(t, name, value);
+    }
+    // The 99.9th percentile next to the p99 and the max of the line above (a 1-in-1000 frame).
+    print_counter(t, "frame_p999_ms", f64::from(p999));
+    if !s.compositions.is_empty() {
+        stage_counters(t, window, &SecondComposition::of(&s.compositions, p50));
+        s.compositions.clear();
     }
     let queues = rc_light::stats::queues();
     light_counters(t, window, &l.since(&p), &queues.since(&s.queues));
@@ -792,6 +818,24 @@ impl SecondStats {
 /// `c:<name>`, mean over the measured window).
 fn print_counter(t: f64, name: &str, value: f64) {
     eprintln!("[perf] [{t:>6.1} s] counter {name} {value:.2}");
+}
+
+/// Frame composition of the window (`RUSTCRAFT_PERFLOG_STAGES`): mean µs of every stage per frame,
+/// then the same over the slow frames (interval over twice the median), and the slowest frame's
+/// own composition in a readable line.
+fn stage_counters(t: f64, window: f64, c: &SecondComposition) {
+    for (stage, us) in FrameStage::ALL.iter().zip(&c.frame_us) {
+        print_counter(t, &format!("frame_us_{}", stage.name()), *us);
+    }
+    print_counter(t, "frame_us_client_relight", c.relight_us);
+    print_counter(t, "slow_frames_per_s", c.slow_frames as f64 / window);
+    for (stage, us) in FrameStage::ALL.iter().zip(&c.slow_frame_us) {
+        print_counter(t, &format!("slow_frame_us_{}", stage.name()), *us);
+    }
+    print_counter(t, "slow_frame_us_client_relight", c.slow_relight_us);
+    if let Some(slowest) = &c.slowest {
+        eprintln!("[perf] [{t:>6.1} s] slowest frame {}", frame_stages::composition_text(slowest));
+    }
 }
 
 /// Light counters of the window: relights of the client and of the integrated server, light

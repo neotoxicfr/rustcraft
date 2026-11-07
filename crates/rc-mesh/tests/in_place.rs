@@ -1,12 +1,17 @@
 // Direct read allowed (tests and benches: settings read at launch, off the measured path); the game goes through rc_data::env_*!.
 #![allow(clippy::disallowed_methods)]
-//! In-place writing of the partial remeshes (`in_place_diff`) and exact-size flattening
-//! (`pack_exact`): a simulated buffer (GPU bytes, other columns around) that receives only the announced
-//! range must become identical to a full upload of the new mesh. Randomly drawn meshes
+//! In-place writing of the partial remeshes (`in_place_diff`, `in_place_diff_with`) and exact-size
+//! flattening (`pack_exact`): a simulated buffer (GPU bytes, other columns around) that receives only
+//! the announced ranges must become identical to a full upload of the new mesh, on every path (one
+//! range or several, whole column or remeshed sections only compared). Randomly drawn meshes
 //! (always), then real columns of the reference capture when it is there.
 
-use rc_mesh::blocks::{BlockMesh, InPlace, in_place_diff, pack, pack_exact, packed_len};
+mod common;
+
+use common::check_in_place;
+use rc_mesh::blocks::{BUCKETS, BlockMesh, Face, InPlace, InPlacePaths, in_place_diff, in_place_diff_with, pack, pack_exact, packed_len};
 use rc_mesh::fluid::FluidQuad;
+use rc_mesh::wire::Sections;
 
 struct Rng(u64);
 
@@ -85,51 +90,215 @@ fn mutate(r: &mut Rng, m: &BlockMesh) -> BlockMesh {
     n
 }
 
-/// Simulated buffer: other columns before and after (known pattern), then the announced range alone.
-fn apply<T: Copy + PartialEq + std::fmt::Debug>(old: &[T], new: &[T], span: &Option<std::ops::Range<u32>>, pad: T) {
-    let mut gpu: Vec<T> =
-        std::iter::repeat_n(pad, 7).chain(old.iter().copied()).chain(std::iter::repeat_n(pad, 5)).collect();
-    if let Some(s) = span {
-        let s = s.start as usize..s.end as usize;
-        gpu[7 + s.start..7 + s.end].copy_from_slice(&new[s]);
-    }
-    let full: Vec<T> =
-        std::iter::repeat_n(pad, 7).chain(new.iter().copied()).chain(std::iter::repeat_n(pad, 5)).collect();
-    assert_eq!(gpu, full, "range {span:?}: buffer differs from a full upload");
-}
-
-fn words(q: &FluidQuad) -> [u32; 27] {
-    let mut w = Vec::new();
-    w.extend(q.corners.iter().flatten().map(|c| c.to_bits()));
-    w.push(q.texture);
-    w.extend(q.colors);
-    w.push(u32::from(q.light[0]) | u32::from(q.light[1]) << 16);
-    w.push(u32::from(q.light[2]) | u32::from(q.light[3]) << 16);
-    w.try_into().expect("27 words")
-}
-
-/// Checks a base → new mesh transition; true if it passes in place.
+/// Checks a base → new mesh transition on every path (whole column compared: the random meshes
+/// do not come from the mesher); true if it passes in place.
 fn check(old: &BlockMesh, new: &BlockMesh) -> bool {
-    let base = pack_exact(old);
-    let Some(d) = in_place_diff(&base, new) else {
-        let n = |m: &BlockMesh| {
-            (m.layers.iter().map(Vec::len).sum::<usize>(), m.fluids[0].len() + m.fluids[1].len(), m.fluids[2].len())
-        };
-        assert_ne!(n(old), n(new), "numbers unchanged but in-place write refused");
-        return false;
+    let n = |m: &BlockMesh| {
+        (m.layers.iter().map(Vec::len).sum::<usize>(), m.fluids[0].len() + m.fluids[1].len(), m.fluids[2].len())
     };
-    let faces = |m: &BlockMesh| m.layers.iter().flatten().copied().collect::<Vec<_>>();
-    apply(&faces(old), &faces(new), &d.faces, [0xdead; 6]);
-    let fl =
-        |m: &BlockMesh, ls: std::ops::Range<usize>| ls.flat_map(|l| m.fluids[l].iter().map(words)).collect::<Vec<_>>();
-    apply(&fl(old, 0..2), &fl(new, 0..2), &d.fluids, [0xbeef; 27]);
-    apply(&fl(old, 2..3), &fl(new, 2..3), &d.trans, [0xcafe; 27]);
-    // Shortest range: its two ends really differ.
-    if let Some(s) = &d.faces {
-        let (a, b) = (faces(old), faces(new));
-        assert!(a[s.start as usize] != b[s.start as usize] && a[s.end as usize - 1] != b[s.end as usize - 1]);
+    let in_place = check_in_place(old, new, None).is_some();
+    assert!(in_place || n(old) != n(new), "numbers unchanged but in-place write refused");
+    in_place
+}
+
+/// A mesh made of cells: faces per layer and (group × (sections + 1) + section), the last cell of
+/// each group empty; fluid faces per layer and section.
+struct Cells {
+    sections: usize,
+    faces: [Vec<Vec<Face>>; 3],
+    fluids: [Vec<Vec<FluidQuad>>; 3],
+}
+
+impl Cells {
+    fn random(r: &mut Rng) -> Cells {
+        let sections = 1 + r.next(24) as usize;
+        let n = sections + 1;
+        let face = |r: &mut Rng| std::array::from_fn(|_| r.next(1 << 20) as u32);
+        let faces = std::array::from_fn(|l| {
+            (0..BUCKETS * n)
+                .map(|k| if k % n == sections { Vec::new() } else { (0..r.next([30, 8, 3][l])).map(|_| face(r)).collect() })
+                .collect()
+        });
+        let fluids = std::array::from_fn(|_| (0..sections).map(|_| (0..r.next(3)).map(|_| quad(r)).collect()).collect());
+        Cells { sections, faces, fluids }
     }
-    true
+
+    fn mesh(&self, version: u64) -> BlockMesh {
+        let flat = |cells: &[Vec<Face>]| -> (Vec<Face>, Vec<u32>) {
+            let mut starts = Vec::new();
+            let mut all = Vec::new();
+            for c in cells {
+                starts.push(all.len() as u32);
+                all.extend_from_slice(c);
+            }
+            (all, starts)
+        };
+        let (layers, starts): (Vec<_>, Vec<_>) = self.faces.iter().map(|l| flat(l)).unzip();
+        let mut fluid_starts: [Vec<u32>; 3] = Default::default();
+        let fluids = std::array::from_fn(|l| {
+            let mut all = Vec::new();
+            for c in &self.fluids[l] {
+                fluid_starts[l].push(all.len() as u32);
+                all.extend_from_slice(c);
+            }
+            fluid_starts[l].push(all.len() as u32);
+            all
+        });
+        BlockMesh {
+            x: 3,
+            z: -5,
+            version,
+            layers: layers.try_into().expect("3 layers"),
+            fluids,
+            starts: starts.try_into().expect("3 layers"),
+            fluid_starts,
+            vis: vec![0; self.sections],
+        }
+    }
+
+    /// Cells of `layer` in remeshed sections.
+    fn remeshed_cells(&self, layer: usize, mask: Sections) -> Vec<usize> {
+        let n = self.sections + 1;
+        (0..self.faces[layer].len()).filter(|&k| k % n != self.sections && mask.contains(k % n)).collect()
+    }
+
+    /// Remesh of the sections of `mask` only, like the mesher's: their faces and fluid faces change,
+    /// some move to another group or layer of a remeshed section (same totals: the cells between
+    /// them move in the flat sequence); the other sections stay as they are.
+    fn remesh(&mut self, r: &mut Rng, mask: Sections) {
+        for _ in 0..r.next(6) {
+            let l = r.next(3) as usize;
+            let cells = self.remeshed_cells(l, mask);
+            let Some(&k) = cells.get(r.next(cells.len() as u64) as usize) else { continue };
+            if let Some(f) = self.faces[l][k].first_mut() {
+                f[r.next(6) as usize] ^= 1 << r.next(32);
+            }
+        }
+        if r.next(3) == 0 {
+            let (from, to) = (r.next(3) as usize, r.next(3) as usize);
+            let (a, b) = (self.remeshed_cells(from, mask), self.remeshed_cells(to, mask));
+            if let (Some(&ka), Some(&kb)) = (a.get(r.next(a.len() as u64) as usize), b.get(r.next(b.len() as u64) as usize))
+                && let Some(f) = self.faces[from][ka].pop()
+            {
+                self.faces[to][kb].insert(0, f);
+            }
+        }
+        for s in (0..self.sections).filter(|&s| mask.contains(s)) {
+            for l in 0..3 {
+                if let Some(q) = self.fluids[l][s].first_mut().filter(|_| r.next(2) == 0) {
+                    q.colors[r.next(4) as usize] ^= 1 << r.next(32);
+                }
+            }
+            // Fluid face moved between the opaque and cutout layers (same flat sequence).
+            if r.next(4) == 0
+                && let Some(q) = self.fluids[0][s].pop()
+            {
+                self.fluids[1][s].push(q);
+            }
+        }
+    }
+}
+
+fn random_mask(r: &mut Rng, sections: usize) -> Sections {
+    let mut mask = Sections::default();
+    for _ in 0..1 + r.next(3) {
+        mask.insert(r.next(sections as u64) as i32);
+    }
+    mask
+}
+
+/// Partial remeshes of random columns whose other sections are copies: comparing only the remeshed
+/// sections (and the cells that moved) gives the whole comparison's ranges, for every gap, and the
+/// ranges give a full upload. Several ranges for a change spread over groups.
+#[test]
+fn touched_sections_only_match_the_whole_comparison() {
+    let mut r = Rng(0x9e37_79b9_7f4a_7c15);
+    let (mut in_place, mut several) = (0, 0);
+    for _ in 0..2000 {
+        let mut cells = Cells::random(&mut r);
+        let old = cells.mesh(1);
+        let mask = random_mask(&mut r, cells.sections);
+        cells.remesh(&mut r, mask);
+        let new = cells.mesh(2);
+        if let Some(writes) = check_in_place(&old, &new, Some(mask)) {
+            in_place += 1;
+            several += usize::from(writes > 3);
+        }
+    }
+    eprintln!("2000 partial remeshes: {in_place} in place, {several} with several ranges");
+    assert!(in_place > 1200 && several > 200, "draw too poor: {in_place} / {several}");
+}
+
+/// A base flattened with a GPU tag on its faces (`pack_tagged`) reads like the plain one: same mesh
+/// once unpacked, same in-place ranges on every path; its face words are the tagged faces, layer by
+/// layer (`packed_face_words`). Sabotage: its raw faces do differ from the plain ones (the equality
+/// comes from taking the tag off), and a tag left on is seen.
+#[test]
+fn tagged_base_reads_like_the_plain_one() {
+    use rc_mesh::blocks::{GPU_TAG_BITS, pack_exact_tagged, packed_face_words, unpack};
+    let mut r = Rng(0x0dd_ba11_cafe_f00d);
+    let mut tagged_faces = 0;
+    for round in 0..500u32 {
+        let mut cells = Cells::random(&mut r);
+        let old = cells.mesh(1);
+        let mask = random_mask(&mut r, cells.sections);
+        cells.remesh(&mut r, mask);
+        let new = cells.mesh(2);
+        let tag = (1 + round % 255) << 20;
+        let (plain, tagged) = (pack_exact(&old), pack_exact_tagged(&old, tag));
+        let back = unpack(&tagged, 1).expect("flat");
+        assert!(back.layers == old.layers && back.starts == old.starts && back.fluids == old.fluids, "tag not taken off");
+        let words = packed_face_words(&tagged).expect("flat");
+        for (l, w) in words.iter().enumerate() {
+            let faces = tagged[w.clone()].as_chunks::<6>().0;
+            assert_eq!(faces.len(), old.layers[l].len());
+            assert!(faces.iter().zip(&old.layers[l]).all(|(t, f)| t[0] == f[0] | tag && t[1..] == f[1..]));
+            assert!(faces.iter().all(|t| t[0] & GPU_TAG_BITS == tag));
+            tagged_faces += faces.len();
+        }
+        for gaps in common::IN_PLACE_GAPS {
+            for (remeshed, touched_only) in [(None, false), (Some(mask), true)] {
+                let paths = InPlacePaths { touched_only, gaps };
+                assert_eq!(in_place_diff_with(&tagged, &new, remeshed, paths), in_place_diff_with(&plain, &new, remeshed, paths));
+            }
+        }
+        assert_eq!(in_place_diff(&tagged, &new), in_place_diff(&plain, &new));
+    }
+    assert!(tagged_faces > 100_000, "draw too poor: {tagged_faces}");
+    // A face of the same mesh, read raw from the tagged base, is not the plain face.
+    let old = Cells::random(&mut r).mesh(1);
+    let tagged = pack_exact_tagged(&old, 7 << 20);
+    let w = packed_face_words(&tagged).expect("flat")[0].clone();
+    if let Some(f) = tagged[w].as_chunks::<6>().0.first() {
+        assert_ne!(*f, old.layers[0][0], "tag not written");
+    }
+}
+
+/// Sabotage: a face changed in a section outside the remesh (a mesher fault the full check would
+/// see) is missed by the touched-only comparison, seen by the whole one.
+#[test]
+fn face_outside_the_remeshed_sections_is_only_seen_by_the_whole_comparison() {
+    let mut r = Rng(0x2545_f491_4f6c_dd1d);
+    let mut seen = 0;
+    for _ in 0..500 {
+        let mut cells = Cells::random(&mut r);
+        let old = cells.mesh(1);
+        let mask = random_mask(&mut r, cells.sections);
+        let mut outside = Sections::ALL;
+        outside.subtract(mask);
+        let Some(&k) = cells.remeshed_cells(0, outside).first() else { continue };
+        let Some(f) = cells.faces[0][k].first_mut() else { continue };
+        f[2] ^= 1;
+        let new = cells.mesh(2);
+        let base = pack_exact(&old);
+        let gaps = Some([0; 3]);
+        let whole = in_place_diff_with(&base, &new, None, InPlacePaths { touched_only: false, gaps }).expect("same counts");
+        let touched =
+            in_place_diff_with(&base, &new, Some(mask), InPlacePaths { touched_only: true, gaps }).expect("same counts");
+        assert!(!whole.faces.is_empty() && touched.faces.is_empty(), "sabotage outside the mask not isolated");
+        seen += 1;
+    }
+    assert!(seen > 100, "draw too poor: {seen}");
 }
 
 #[test]

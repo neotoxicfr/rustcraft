@@ -3,8 +3,9 @@
 //! ([`Uploader::write_texture`]) and the frame's encoder with the writes at its head
 //! ([`Uploader::frame_encoder`]). Their switches are described in the header of the parent module.
 //!
-//! The layers move their writes here one by one (each with its own A/B), the frame encoder once
-//! every write of the frame precedes it: until then nothing outside the tests calls this module.
+//! The layers move their writes here one by one (each with its own A/B; the particles first,
+//! `RUSTCRAFT_OPT_PARTICLE_WRITE_WITH`), the frame encoder once every write of the frame precedes
+//! it: until then the texture writes and the frame encoder are called by the tests only.
 #![cfg_attr(not(test), expect(dead_code, reason = "first callers: the migrations of the per-frame layers"))]
 
 use super::{Uploader, new_encoder};

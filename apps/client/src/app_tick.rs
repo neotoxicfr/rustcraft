@@ -21,8 +21,10 @@ impl App {
                 .map_or(self.world.min_y, |y| y + 1)
         };
         // Both lists from one walk, in the same order.
+        let by_facts = crate::entities::kind_id_filters_on();
+        let is_player = |e: &&crate::entities::Entity| if by_facts { e.facts.player } else { e.kind == "player" };
         let (mut players, mut named): (Vec<_>, Vec<_>) =
-            self.entities.map.values().filter(|e| e.kind == "player").map(|e| (e.pos, (e.uuid, e.pos))).unzip();
+            self.entities.map.values().filter(is_player).map(|e| (e.pos, (e.uuid, e.pos))).unzip();
         if self.positioned && self.env.game_mode != 3 {
             players.push(self.player.pos);
             named.push((self.local_uuid, self.player.pos));
@@ -276,7 +278,7 @@ impl App {
         self.hud.more.tick(&hud_more::TickIn {
             air: self.entities.me.as_ref().and_then(|e| e.meta_int(1)),
             eyes_in_water: self.player.eyes_in_water,
-            vehicle: hud_more::vehicle_of(&self.entities),
+            vehicle: hud_more::vehicle_of(&self.entities, self.player_vehicle(), &self.attr_names),
             frozen: self.entities.me.as_ref().and_then(|e| e.meta_int(7)),
             in_portal: self.positioned
                 && self.env.game_mode != 3
@@ -286,7 +288,7 @@ impl App {
                 || rc_data::env_flag!("RUSTCRAFT_JUMPTEST")
                 || self.riding.script_jump(),
         });
-        self.hud.more.prune(&self.entities);
+        self.riding.prune(&self.entities);
         if let Some(power) = self.hud.more.take_jump() {
             let _ = self.session.link.send_player_command_data(rc_client::link::action::START_RIDING_JUMP, power);
             self.riding.jump = Some(power);

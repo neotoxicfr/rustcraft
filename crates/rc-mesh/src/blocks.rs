@@ -1660,7 +1660,6 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
     };
 
     let models = &t.models;
-    let mut layers: [Vec<Face>; 3] = Default::default();
     let light_view = crate::light::LightView::new(job, &t.light_info);
     let paths = job.light;
     let mut lcache = crate::light::AnyCache::new(paths, &mut scratch.light);
@@ -1693,25 +1692,25 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
         rule,
         with_props: use_props,
     };
-    let mut starts: [Vec<u32>; 3] = Default::default();
+    let mut faces = ColumnFaces::new(job.faces_by_group, unpacked.len(), std::mem::take(&mut scratch.face_groups));
     let mut fluid_starts: [Vec<u32>; 3] = Default::default();
     let mut vis = Vec::with_capacity(unpacked.len());
     // Partial remeshing: final size close to that of the base, reserved in one go.
     if let Some((_, base)) = &reuse {
-        for l in 0..3 {
-            layers[l].reserve_exact(base.faces[l].len() / 6 + 64);
-            fluids[l].reserve_exact(base.fluids[l].len() / FLUID_WORDS + 16);
+        for (l, layer) in fluids.iter_mut().enumerate() {
+            faces.reserve(l, base.faces[l].len() / 6 + 64);
+            layer.reserve_exact(base.fluids[l].len() / FLUID_WORDS + 16);
         }
     }
     for (si, section) in unpacked.iter().enumerate() {
-        for l in 0..3 {
-            starts[l].push(layers[l].len() as u32);
-            fluid_starts[l].push(fluids[l].len() as u32);
+        faces.begin_section(si);
+        for (starts, layer) in fluid_starts.iter_mut().zip(&fluids) {
+            starts.push(layer.len() as u32);
         }
         if let Some((mask, base)) = &reuse
             && !mask.contains(si)
         {
-            vis.push(copy_reused_section(base, si, &mut layers, &mut fluids));
+            vis.push(copy_reused_section(base, si, &mut faces, &mut fluids));
             continue;
         }
         let UnfoldedSection::Full(values) = section else {
@@ -1914,14 +1913,11 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
                     Some((w0, w1)) if layer != 2 => {
                         let l = verts.map(|(l, _)| u32::from(l));
                         let g = verts.map(|(_, g)| u32::from(g));
-                        layers[layer].push([
-                            w0,
-                            w1,
-                            tint,
-                            l[0] | l[1] << 16,
-                            l[2] | l[3] << 16,
-                            g[0] | g[1] << 8 | g[2] << 16 | g[3] << 24,
-                        ]);
+                        faces.push(
+                            layer,
+                            face_group(&t.bucket, q),
+                            [w0, w1, tint, l[0] | l[1] << 16, l[2] | l[3] << 16, g[0] | g[1] << 8 | g[2] << 16 | g[3] << 24],
+                        );
                     }
                     _ => {
                         // Translucent or offset model without a compact face: explicit geometry (the
@@ -1945,13 +1941,11 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
             }
         }
     }
-    for l in 0..3 {
-        starts[l].push(layers[l].len() as u32);
-        fluid_starts[l].push(fluids[l].len() as u32);
+    for (starts, layer) in fluid_starts.iter_mut().zip(&fluids) {
+        starts.push(layer.len() as u32);
     }
-    for l in 0..3 {
-        (layers[l], starts[l]) = group_faces_by_bucket(&layers[l], &starts[l], &t.bucket);
-    }
+    let (layers, starts, face_groups) = faces.finish(&t.bucket);
+    scratch.face_groups = face_groups;
     // Buffers handed back to the thread (at most one column of sections kept).
     for section in unpacked {
         match section {
@@ -1977,20 +1971,25 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
 fn copy_reused_section(
     base: &PackedView<'_>,
     si: usize,
-    layers: &mut [Vec<Face>; 3],
+    faces: &mut ColumnFaces,
     fluids: &mut [Vec<crate::fluid::FluidQuad>; 3],
 ) -> crate::visibility::Vis {
     let sections_plus_one = base.sections + 1;
-    for l in 0..3 {
+    for (l, layer_fluids) in fluids.iter_mut().enumerate() {
         let bs = base.starts[l];
         for g in 0..BUCKETS {
             let (a, e) = (bs[g * sections_plus_one + si] as usize, bs[g * sections_plus_one + si + 1] as usize);
-            let words = &base.faces[l][a * 6..e * 6];
-            layers[l].extend_from_slice(words.as_chunks::<6>().0);
+            let group = base.faces[l][a * 6..e * 6].as_chunks::<6>().0;
+            // A base that also serves as GPU bytes carries the column's tag on every face (`pack_tagged`).
+            if group.first().is_some_and(|f| f[0] & GPU_TAG_BITS != 0) {
+                faces.extend_group_untagged(l, g, group);
+            } else {
+                faces.extend_group(l, g, group);
+            }
         }
         let fs = base.fluid_starts[l];
         let words = &base.fluids[l][fs[si] as usize * FLUID_WORDS..fs[si + 1] as usize * FLUID_WORDS];
-        fluids[l].extend(words.as_chunks::<FLUID_WORDS>().0.iter().map(decode_fluid));
+        layer_fluids.extend(words.as_chunks::<FLUID_WORDS>().0.iter().map(decode_fluid));
     }
     u64::from(base.vis[si * 2]) | u64::from(base.vis[si * 2 + 1]) << 32
 }
@@ -2012,6 +2011,132 @@ struct Scratch {
     tint: TintBufs,
     /// Light cache cells (`LightPaths::scratch`).
     light: crate::light::LightStores,
+    /// Face lists per layer and group (`MeshJob::faces_by_group`), emptied after each mesh.
+    face_groups: FaceGroups,
+}
+
+/// One face list per layer and group.
+type FaceGroups = [[Vec<Face>; BUCKETS]; 3];
+
+/// Capacity a meshing thread keeps in each face list of `FaceGroups` between two meshes (B10):
+/// beyond it, the list is shrunk back after the mesh. 8,192 faces = 192 KiB; a column of the
+/// reference capture holds at most 3,025 faces in one layer and group (99th percentile 1,862), so
+/// the lists stop growing after the first meshes while a rare huge column does not stay held.
+const KEPT_FACES_PER_GROUP: usize = 8192;
+
+/// Group of a baked face (`Tables::bucket`), the last group if unknown.
+fn face_group(bucket: &[u8], quad: u32) -> usize {
+    bucket.get(quad as usize).map_or(BUCKETS - 1, |&b| usize::from(b))
+}
+
+/// Faces of the column being meshed, in the order of the final mesh: by layer, then group
+/// (`BUCKETS`), then section; within one layer, group and section, in meshing order.
+enum ColumnFaces {
+    /// One list per layer in section order, sorted by group at the end (`group_faces_by_bucket`):
+    /// the old path (`RUSTCRAFT_OPT_MESH_FACES_BY_GROUP=0`).
+    SortedAtEnd { layers: [Vec<Face>; 3], section_starts: [Vec<u32>; 3], kept: FaceGroups },
+    /// Each face pushed straight into the list of its layer and group (lists kept by the thread),
+    /// then each layer assembled once at its exact size: no counting pass, no zeroed buffer, no
+    /// scattering copy, no growth of a whole-layer list.
+    ByGroup { groups: FaceGroups, starts: [Vec<u32>; 3], sections_plus_one: usize },
+}
+
+impl ColumnFaces {
+    /// `kept`: the thread's face lists (empty, with their capacity).
+    fn new(by_group: bool, sections: usize, kept: FaceGroups) -> Self {
+        if by_group {
+            let starts = std::array::from_fn(|_| vec![0; BUCKETS * (sections + 1)]);
+            ColumnFaces::ByGroup { groups: kept, starts, sections_plus_one: sections + 1 }
+        } else {
+            ColumnFaces::SortedAtEnd { layers: Default::default(), section_starts: Default::default(), kept }
+        }
+    }
+
+    /// Room for `n` more faces in `layer` (old path; the kept lists already have room).
+    fn reserve(&mut self, layer: usize, n: usize) {
+        if let ColumnFaces::SortedAtEnd { layers, .. } = self {
+            layers[layer].reserve_exact(n);
+        }
+    }
+
+    /// Section `s` starts: the faces pushed from now on belong to it.
+    fn begin_section(&mut self, s: usize) {
+        match self {
+            ColumnFaces::SortedAtEnd { layers, section_starts, .. } => {
+                for (starts, faces) in section_starts.iter_mut().zip(layers.iter()) {
+                    starts.push(faces.len() as u32);
+                }
+            }
+            ColumnFaces::ByGroup { groups, starts, sections_plus_one } => {
+                for (starts, groups) in starts.iter_mut().zip(groups.iter()) {
+                    for (g, faces) in groups.iter().enumerate() {
+                        starts[g * *sections_plus_one + s] = faces.len() as u32;
+                    }
+                }
+            }
+        }
+    }
+
+    fn push(&mut self, layer: usize, group: usize, face: Face) {
+        match self {
+            ColumnFaces::SortedAtEnd { layers, .. } => layers[layer].push(face),
+            ColumnFaces::ByGroup { groups, .. } => groups[layer][group].push(face),
+        }
+    }
+
+    /// Faces of one group of a section taken from the previous mesh (all in group `group`).
+    fn extend_group(&mut self, layer: usize, group: usize, faces: &[Face]) {
+        match self {
+            ColumnFaces::SortedAtEnd { layers, .. } => layers[layer].extend_from_slice(faces),
+            ColumnFaces::ByGroup { groups, .. } => groups[layer][group].extend_from_slice(faces),
+        }
+    }
+
+    /// [`ColumnFaces::extend_group`] for faces of a base carrying a GPU tag, taken off.
+    fn extend_group_untagged(&mut self, layer: usize, group: usize, faces: &[Face]) {
+        let faces = faces.iter().map(untagged);
+        match self {
+            ColumnFaces::SortedAtEnd { layers, .. } => layers[layer].extend(faces),
+            ColumnFaces::ByGroup { groups, .. } => groups[layer][group].extend(faces),
+        }
+    }
+
+    /// Faces and starts of the mesh (`BlockMesh::layers`, `BlockMesh::starts`), and the thread's
+    /// face lists handed back empty.
+    fn finish(self, bucket: &[u8]) -> ([Vec<Face>; 3], [Vec<u32>; 3], FaceGroups) {
+        match self {
+            ColumnFaces::SortedAtEnd { layers, mut section_starts, kept } => {
+                let mut starts: [Vec<u32>; 3] = Default::default();
+                let mut grouped: [Vec<Face>; 3] = Default::default();
+                for l in 0..3 {
+                    section_starts[l].push(layers[l].len() as u32);
+                    (grouped[l], starts[l]) = group_faces_by_bucket(&layers[l], &section_starts[l], bucket);
+                }
+                (grouped, starts, kept)
+            }
+            ColumnFaces::ByGroup { mut groups, mut starts, sections_plus_one } => {
+                let layers = std::array::from_fn(|l| assemble_layer(&mut groups[l], &mut starts[l], sections_plus_one));
+                (layers, starts, groups)
+            }
+        }
+    }
+}
+
+/// One layer of the mesh from its group lists, copied once at its exact size; `starts` (group
+/// lengths at each section start) become absolute, with the closing entry of each group. The lists
+/// are emptied, and shrunk to `KEPT_FACES_PER_GROUP`.
+fn assemble_layer(groups: &mut [Vec<Face>; BUCKETS], starts: &mut [u32], sections_plus_one: usize) -> Vec<Face> {
+    let mut layer = Vec::with_capacity(groups.iter().map(Vec::len).sum());
+    for (g, faces) in groups.iter_mut().enumerate() {
+        let group_starts = &mut starts[g * sections_plus_one..(g + 1) * sections_plus_one];
+        group_starts[sections_plus_one - 1] = faces.len() as u32;
+        let offset = layer.len() as u32;
+        group_starts.iter_mut().for_each(|s| *s += offset);
+        layer.extend_from_slice(faces);
+        faces.clear();
+        faces.shrink_to(KEPT_FACES_PER_GROUP);
+    }
+    layer
 }
 
 thread_local! {
@@ -2054,14 +2179,36 @@ pub type Packed = Arc<dyn std::ops::Deref<Target = [u32]> + Send + Sync>;
 /// Words of a fluid face: corners (20 floats), texture, colours (4), lights (2 × 2).
 const FLUID_WORDS: usize = 27;
 
+/// Bits 20-27 of word 0 of a face: never set by the mesher (the position takes bits 0-19, the
+/// offset class 28-31). The client writes there the column's place in its GPU region; a flat mesh
+/// may carry them on every face ([`pack_tagged`]), so each reader of a flat mesh takes them off.
+pub const GPU_TAG_BITS: u32 = 0xff << 20;
+
+/// A face of a flat mesh without its GPU tag (`GPU_TAG_BITS`).
+fn untagged(f: &Face) -> Face {
+    [f[0] & !GPU_TAG_BITS, f[1], f[2], f[3], f[4], f[5]]
+}
+
 /// Makes a flat mesh: x, z, sections, then per layer faces, starts, fluids, fluid
 /// starts (each array preceded by its length in elements), then communications.
 pub fn pack(m: &BlockMesh, out: &mut Vec<u32>) {
+    pack_tagged(m, out, 0);
+}
+
+/// [`pack`] with the GPU tag `tag` (within `GPU_TAG_BITS`) set on every face: the faces of the flat
+/// mesh are then those the GPU reads, layer by layer ([`packed_face_words`]), and the base of the
+/// partial remeshes serves as GPU bytes too (`RUSTCRAFT_OPT_MESH_BASE_IS_PREPARED`).
+pub fn pack_tagged(m: &BlockMesh, out: &mut Vec<u32>, tag: u32) {
+    debug_assert_eq!(tag & !GPU_TAG_BITS, 0, "tag outside its bits");
     out.clear();
     out.extend([m.x as u32, m.z as u32, m.vis.len() as u32]);
     for l in 0..3 {
         out.push(m.layers[l].len() as u32);
-        out.extend(m.layers[l].iter().flatten());
+        if tag == 0 {
+            out.extend(m.layers[l].iter().flatten());
+        } else {
+            out.extend(m.layers[l].iter().flat_map(|f| [f[0] | tag, f[1], f[2], f[3], f[4], f[5]]));
+        }
         out.push(m.starts[l].len() as u32);
         out.extend(&m.starts[l]);
         out.push(m.fluids[l].len() as u32);
@@ -2088,7 +2235,9 @@ struct PackedView<'a> {
     x: i32,
     z: i32,
     sections: usize,
+    /// Faces of each layer (words), and where they start in the flat mesh.
     faces: [&'a [u32]; 3],
+    face_at: [usize; 3],
     starts: [&'a [u32]; 3],
     fluids: [&'a [u32]; 3],
     fluid_starts: [&'a [u32]; 3],
@@ -2098,45 +2247,54 @@ struct PackedView<'a> {
 impl<'a> PackedView<'a> {
     fn new(w: &'a [u32]) -> Option<Self> {
         let mut at = 0;
+        // Next `n` words, and where they start.
         let mut take = |n: usize| {
-            let s = w.get(at..at + n)?;
+            let start = at;
             at += n;
-            Some(s)
+            Some((w.get(start..at)?, start))
         };
-        let head = take(3)?;
+        let head = take(3)?.0;
         let mut v = PackedView {
             x: head[0] as i32,
             z: head[1] as i32,
             sections: head[2] as usize,
             faces: [&[]; 3],
+            face_at: [0; 3],
             starts: [&[]; 3],
             fluids: [&[]; 3],
             fluid_starts: [&[]; 3],
             vis: &[],
         };
         for l in 0..3 {
-            let n = take(1)?[0] as usize;
-            v.faces[l] = take(n * 6)?;
-            let n = take(1)?[0] as usize;
-            v.starts[l] = take(n)?;
-            let n = take(1)?[0] as usize;
-            v.fluids[l] = take(n * FLUID_WORDS)?;
-            let n = take(1)?[0] as usize;
-            v.fluid_starts[l] = take(n)?;
+            let n = take(1)?.0[0] as usize;
+            (v.faces[l], v.face_at[l]) = take(n * 6)?;
+            let n = take(1)?.0[0] as usize;
+            v.starts[l] = take(n)?.0;
+            let n = take(1)?.0[0] as usize;
+            v.fluids[l] = take(n * FLUID_WORDS)?.0;
+            let n = take(1)?.0[0] as usize;
+            v.fluid_starts[l] = take(n)?.0;
         }
-        v.vis = take(v.sections * 2)?;
+        v.vis = take(v.sections * 2)?.0;
         Some(v)
     }
 }
 
-/// Inverse of [`pack`] (checks).
+/// Word ranges of the faces of each layer in the flat mesh `w`: with [`pack_tagged`], the GPU bytes
+/// of the faces, layer by layer.
+pub fn packed_face_words(w: &[u32]) -> Option<[std::ops::Range<usize>; 3]> {
+    let v = PackedView::new(w)?;
+    Some(std::array::from_fn(|l| v.face_at[l]..v.face_at[l] + v.faces[l].len()))
+}
+
+/// Inverse of [`pack`] (checks); the faces without their GPU tag.
 pub fn unpack(w: &[u32], version: u64) -> Option<BlockMesh> {
     let v = PackedView::new(w)?;
     Some(BlockMesh {
         x: v.x,
         z: v.z,
         version,
-        layers: v.faces.map(|f| f.as_chunks::<6>().0.to_vec()),
+        layers: v.faces.map(|f| f.as_chunks::<6>().0.iter().map(untagged).collect()),
         fluids: v.fluids.map(|f| f.as_chunks::<FLUID_WORDS>().0.iter().map(decode_fluid).collect()),
         starts: v.starts.map(<[u32]>::to_vec),
         fluid_starts: v.fluid_starts.map(<[u32]>::to_vec),
@@ -2157,8 +2315,13 @@ pub fn packed_len(m: &BlockMesh) -> usize {
 
 /// [`pack`] into a new buffer of the exact size (base kept as is, no copy).
 pub fn pack_exact(m: &BlockMesh) -> Vec<u32> {
+    pack_exact_tagged(m, 0)
+}
+
+/// [`pack_tagged`] into a new buffer of the exact size.
+pub fn pack_exact_tagged(m: &BlockMesh, tag: u32) -> Vec<u32> {
     let mut w = Vec::with_capacity(packed_len(m));
-    pack(m, &mut w);
+    pack_tagged(m, &mut w, tag);
     w
 }
 
@@ -2175,56 +2338,8 @@ fn fluid_words(q: &crate::fluid::FluidQuad) -> [u32; FLUID_WORDS] {
     w
 }
 
-/// Elements that differ between two sequences of the same length `n`: from the first different to the
-/// last (end excluded), `None` if they are identical.
-fn diff_span<A, B>(n: usize, a: impl Fn() -> A, b: impl Fn() -> B) -> Option<std::ops::Range<u32>>
-where
-    A: DoubleEndedIterator,
-    B: DoubleEndedIterator,
-    A::Item: PartialEq<B::Item>,
-{
-    let first = a().zip(b()).position(|(x, y)| x != y)?;
-    let last = n - 1 - a().rev().zip(b().rev()).position(|(x, y)| x != y)?;
-    Some(first as u32..last as u32 + 1)
-}
-
-/// In-place write of a partial remesh: ranges (in elements, layers put end to end)
-/// that differ from the base, `None` for an identical part.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct InPlace {
-    /// Faces of the three layers.
-    pub faces: Option<std::ops::Range<u32>>,
-    /// Fluids of the opaque and cutout layers.
-    pub fluids: Option<std::ops::Range<u32>>,
-    /// Translucent fluids.
-    pub trans: Option<std::ops::Range<u32>>,
-}
-
-/// Ranges to rewrite to go from the base `base` (flat, [`pack`]) to the mesh `m`, if the
-/// numbers of faces, fluids and translucents are unchanged (otherwise `None`: new
-/// place). Read on the pool: word-by-word comparison, no copy.
-pub fn in_place_diff(base: &[u32], m: &BlockMesh) -> Option<InPlace> {
-    let v = PackedView::new(base)?;
-    let faces_n = m.layers.iter().map(Vec::len).sum::<usize>();
-    let fluids_n = m.fluids[0].len() + m.fluids[1].len();
-    let trans_n = m.fluids[2].len();
-    let base_fluids = |l: usize| v.fluids[l].len() / FLUID_WORDS;
-    if v.faces.iter().map(|f| f.len() / 6).sum::<usize>() != faces_n
-        || base_fluids(0) + base_fluids(1) != fluids_n
-        || base_fluids(2) != trans_n
-    {
-        return None;
-    }
-    let base_faces = || v.faces.iter().flat_map(|f| f.as_chunks::<6>().0.iter());
-    let new_faces = || m.layers.iter().flatten();
-    let words = |l: usize| v.fluids[l].as_chunks::<FLUID_WORDS>().0.iter().copied();
-    let quads = |l: usize| m.fluids[l].iter().map(fluid_words);
-    Some(InPlace {
-        faces: diff_span(faces_n, base_faces, new_faces),
-        fluids: diff_span(fluids_n, || words(0).chain(words(1)), || quads(0).chain(quads(1))),
-        trans: diff_span(trans_n, || words(2), || quads(2)),
-    })
-}
+mod in_place;
+pub use in_place::{InPlace, InPlacePaths, in_place_diff, in_place_diff_with};
 
 /// Sorts the faces by group then by section (stable sort: the order within a same section and a
 /// same group is kept, like that of a decal placed on its face). `starts` (S + 1 entries)
@@ -2254,6 +2369,99 @@ fn group_faces_by_bucket(faces: &[Face], starts: &[u32], bucket: &[u8]) -> (Vec<
         }
     }
     (out, out_starts)
+}
+
+#[cfg(test)]
+mod face_group_tests {
+    use super::*;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n.max(1)
+        }
+    }
+
+    /// Faces collected for a random column through `ColumnFaces`: fresh faces and whole groups
+    /// copied from a previous mesh, mixed in each section, unknown baked faces included.
+    fn collect(by_group: bool, seed: u64, bucket: &[u8], kept: FaceGroups) -> ([Vec<Face>; 3], [Vec<u32>; 3], FaceGroups) {
+        let mut r = Rng(seed);
+        let sections = r.next(25) as usize;
+        let mut faces = ColumnFaces::new(by_group, sections, kept);
+        for s in 0..sections {
+            faces.begin_section(s);
+            for _ in 0..r.next(300) {
+                let layer = r.next(3) as usize;
+                // A few baked faces beyond the table: last group, like `group_faces_by_bucket`.
+                let quad = r.next(bucket.len() as u64 + 3) as u32;
+                let face = [s as u32, quad, r.next(1 << 30) as u32, 7, 8, layer as u32];
+                if r.next(5) == 0 {
+                    let g = face_group(bucket, quad);
+                    let run: Vec<Face> = (0..r.next(4)).map(|k| [s as u32, quad, k as u32, 1, 2, 3]).collect();
+                    faces.extend_group(layer, g, &run);
+                } else {
+                    faces.push(layer, face_group(bucket, quad), face);
+                }
+            }
+        }
+        faces.finish(bucket)
+    }
+
+    /// Faces pushed straight into their group give the faces and starts of the old sort at the
+    /// end, on random columns, with the thread's lists reused from one column to the next; and the
+    /// kept lists come back empty, within the kept capacity.
+    #[test]
+    fn faces_by_group_match_the_sort_at_the_end() {
+        let mut r = Rng(0x2545_f491_4f6c_dd1d);
+        let bucket: Vec<u8> = (0..500).map(|_| r.next(BUCKETS as u64) as u8).collect();
+        let mut kept = FaceGroups::default();
+        let mut faces = 0;
+        for seed in 1..400u64 {
+            let (old_layers, old_starts, _) = collect(false, seed, &bucket, FaceGroups::default());
+            let (layers, starts, back) = collect(true, seed, &bucket, kept);
+            assert_eq!(layers, old_layers, "column {seed}: faces differ");
+            assert_eq!(starts, old_starts, "column {seed}: starts differ");
+            assert!(back.iter().flatten().all(Vec::is_empty), "column {seed}: lists not emptied");
+            kept = back;
+            faces += layers.iter().map(Vec::len).sum::<usize>();
+        }
+        assert!(faces > 500_000, "draw too poor: {faces}");
+        // A huge group is not kept whole by the thread.
+        let mut big = ColumnFaces::new(true, 1, FaceGroups::default());
+        big.begin_section(0);
+        (0..3 * KEPT_FACES_PER_GROUP).for_each(|_| big.push(1, 4, [0; 6]));
+        let (layers, _, back) = big.finish(&bucket);
+        assert_eq!(layers[1].len(), 3 * KEPT_FACES_PER_GROUP);
+        assert!(back[1][4].capacity() <= KEPT_FACES_PER_GROUP, "huge list kept: {}", back[1][4].capacity());
+    }
+
+    /// The comparison sees a face put in the wrong group (sabotage of the collection).
+    #[test]
+    fn face_in_the_wrong_group_is_seen() {
+        let bucket = vec![0u8, 1, 2];
+        let run = |wrong: bool| {
+            let mut faces = ColumnFaces::new(true, 2, FaceGroups::default());
+            let mut old = ColumnFaces::new(false, 2, FaceGroups::default());
+            for s in 0..2 {
+                faces.begin_section(s);
+                old.begin_section(s);
+                for q in 0..3u32 {
+                    let face = [s as u32, q, 0, 0, 0, 0];
+                    let g = face_group(&bucket, q);
+                    faces.push(0, if wrong && q == 1 { 2 } else { g }, face);
+                    old.push(0, g, face);
+                }
+            }
+            let (a, b) = (faces.finish(&bucket), old.finish(&bucket));
+            a.0 == b.0 && a.1 == b.1
+        };
+        assert!(run(false));
+        assert!(!run(true), "face in the wrong group not seen");
+    }
 }
 
 #[cfg(test)]

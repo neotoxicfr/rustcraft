@@ -70,6 +70,8 @@ fn check(
                     j.reuse = Some((*mask, Arc::new(words)));
                     let p = mesh(&j, t, palette, -64);
                     assert!(same(&p, &after), "{what}: partial mesh of ({x}, {z}) differs from the full one");
+                    // In-place write of the partial mesh over its base, on every path.
+                    common::check_in_place(&before, &p, Some(*mask));
                     partial += 1;
                 }
                 _ => assert!(same(&before, &after), "{what}: column ({x}, {z}) changed out of reach"),
@@ -170,6 +172,62 @@ fn partial_remesh_reads_the_border_rows_of_its_neighbours() {
     }
     eprintln!("{checked} partial meshes reading their neighbours' border rows identical to the full ones");
     assert!(checked >= 24 * 3, "{checked} checks");
+}
+
+/// A stair turned, a lever thrown, a redstone wire repowered or reshaped on the surface of real
+/// columns: same face counts, faces that change group within the section. The partial mesh equals
+/// the full one, and its in-place write (remeshed sections only compared, one range or several)
+/// gives a full upload (`common::check_in_place`).
+#[test]
+fn in_place_follows_state_changes_of_stairs_levers_and_wire() {
+    let Some((d, cols, t, palette)) = load() else { return };
+    let mut keys: Vec<(i32, i32)> = cols
+        .keys()
+        .copied()
+        .filter(|&(x, z)| rc_mesh::wire::NEIGHBORS.iter().all(|(dx, dz)| cols.contains_key(&(x + dx, z + dz))))
+        .collect();
+    keys.sort_unstable();
+    let find = |name: &str| d.blocks.iter().find(|b| b.name == name).expect(name);
+    let blocks = [find("minecraft:oak_stairs"), find("minecraft:lever"), find("minecraft:redstone_wire")];
+    let bits = d.state_bits() as u8;
+    let mut rng = Rng(0x51f1_5eed_c0ff_ee11);
+    let (mut in_place, mut several, mut trials) = (0, 0, 0);
+    for round in 0..120 {
+        let (cx, cz) = keys[rng.next(keys.len() as u64) as usize];
+        let mut col = (*cols[&(cx, cz)]).clone();
+        let sections = col.sections.len() as i32;
+        // First air cell above a non-air block, in the highest non-empty section.
+        let Some(sy) = (0..col.sections.len()).rev().find(|&s| !col.sections[s].is_empty()) else { continue };
+        let (x, z) = (rng.next(16) as usize, rng.next(16) as usize);
+        let air = |c: &rc_world::Column, y: usize| t.air[c.sections[sy].blocks.get(rc_world::block_index(x, y, z)) as usize];
+        let Some(y) = (1..16).find(|&y| air(&col, y) && !air(&col, y - 1)) else { continue };
+        let b = blocks[round % 3];
+        let pick = |r: &mut Rng| b.first_state + r.next(u64::from(b.state_count)) as u32;
+        let (first, second) = (pick(&mut rng), pick(&mut rng));
+        if first == second {
+            continue;
+        }
+        let i = rc_world::block_index(x, y, z);
+        col.sections[sy].set_blocks(&[(i as u16, first)], bits, |s| t.air[s as usize]);
+        let mut world = cols.clone();
+        world.insert((cx, cz), Arc::new(col.clone()));
+        let before = mesh(&job(&world, cx, cz), &t, &palette, -64);
+        col.sections[sy].set_blocks(&[(i as u16, second)], bits, |s| t.air[s as usize]);
+        world.insert((cx, cz), Arc::new(col));
+        let after = mesh(&job(&world, cx, cz), &t, &palette, -64);
+        let (mask, ..) = reach(edge::near_of_index(i), sy as i32, sections, false, |_| true).expect("reach");
+        let mut j = job(&world, cx, cz);
+        j.reuse = Some((mask, Arc::new(rc_mesh::blocks::pack_exact(&before)) as rc_mesh::blocks::Packed));
+        let p = mesh(&j, &t, &palette, -64);
+        assert!(same(&p, &after), "{} #{first} -> #{second} at ({cx}, {cz}): partial mesh differs", b.name);
+        if let Some(writes) = common::check_in_place(&before, &p, Some(mask)) {
+            in_place += 1;
+            several += usize::from(writes > 1);
+        }
+        trials += 1;
+    }
+    eprintln!("{trials} state changes, {in_place} written in place, {several} with several ranges");
+    assert!(trials >= 60 && in_place >= 20, "draw too poor: {trials} / {in_place}");
 }
 
 #[test]

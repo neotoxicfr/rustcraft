@@ -369,7 +369,7 @@ impl Kit {
             [0, 0],
             [0.5, 65.0, 5.5],
             &|_, _, _| (15, 15),
-            &|_, _| true,
+            &crate::render::FrameVisibility::everything(),
             Some(&self.items),
             &world,
         );

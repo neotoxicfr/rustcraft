@@ -1,7 +1,7 @@
 //! Camera placement and what the crosshair aims at: picking, reach, held item and block outline.
 
 use crate::grid_world::aim_shape;
-use crate::{App, camera, debug_render, entities, environ, hand, item_use, pick};
+use crate::{App, camera, environ, hand, item_use, pick, pick_targets};
 
 impl App {
     /// Camera and local player after the tick's physics (`hand-camera.md` § 3 to 5).
@@ -91,9 +91,18 @@ impl App {
         // attack reach: its aiming goes first, player movement included along the gaze.
         let attack = (self.env.game_mode != 3).then(|| self.attack_reach()).flatten();
         let along: f64 = (0..3).map(|i| self.player.vel[i] * dir[i]).sum();
-        let attack_max = attack.map_or(0.0, |a| a.max + along.max(0.0));
-        let reach = block_range.max(entity_range).max(attack_max) + 8.0;
-        let candidates = || self.pick_candidates(reach);
+        let camera_box = self.camera_box();
+        // Widest search box of the frame: normal targeting over its whole reach, attack-range
+        // targeting over its whole segment; each one keeps the entities of its own box, shortened
+        // to the block hit.
+        let mut widest = pick::gaze_search_box(&camera_box, dir, block_range.max(entity_range));
+        if let Some(a) = attack {
+            let at = |k: f64| -> [f64; 3] { std::array::from_fn(|i| self.eye[i] + dir[i] * k) };
+            let attack_box = pick::attack_search_box(at(a.min), at(a.max + along.max(0.0)), a.margin);
+            widest = pick::hull(&widest, &attack_box);
+        }
+        let area = pick_targets::TargetArea::of(&widest, self.camera_root());
+        let candidates = || self.pick_candidates(area);
         if let Some(a) = attack {
             let border = self.weather.border.bounds();
             let hit =
@@ -102,43 +111,33 @@ impl App {
                 return hit;
             }
         }
-        pick::pick(self.eye, dir, block_range, entity_range, &shape, &interaction, candidates())
+        pick::pick(self.eye, dir, &camera_box, block_range, entity_range, &shape, &interaction, candidates())
     }
 
-    /// Targetable entities within `reach` of the eyes on each axis: current box and
-    /// selection radius.
-    pub(crate) fn pick_candidates(&self, reach: f64) -> impl Iterator<Item = pick::Candidate> + '_ {
+    /// Current box of the camera entity (the local player): the game's entity searches start
+    /// from it.
+    pub(crate) fn camera_box(&self) -> rc_data::Aabb {
+        let b = self.player.bounding_box();
+        rc_data::Aabb { min: b.min, max: b.max }
+    }
+
+    /// Root vehicle of the camera entity: the local player's, or the player when riding nothing.
+    pub(crate) fn camera_root(&self) -> i32 {
+        self.player_vehicle().map_or(self.player_id, |v| self.root_vehicle(v))
+    }
+
+    /// Targetable entities of `area`: current box, selection radius, same root vehicle as the
+    /// camera.
+    pub(crate) fn pick_candidates(&self, area: pick_targets::TargetArea) -> impl Iterator<Item = pick::Candidate> + '_ {
         let ents = self.renderer.as_ref().and_then(|r| r.entities.as_ref());
-        let table = ents.map_or(&[][..], |e| e.dims.as_slice());
-        let painting = move |v: i32| ents.and_then(|e| e.painting_size(v));
-        self.entities.map.iter().filter_map(move |(&id, e)| {
-            // Out of reach: discarded before any kind test.
-            let p = e.pos;
-            if (0..3).any(|i| (p[i] - self.eye[i]).abs() > reach) {
-                return None;
-            }
-            let pickable = match e.kind.as_str() {
-                "player" => self.players.map.get(&e.uuid).is_none_or(|p| p.game_mode != 3),
-                "armor_stand" => e.meta_byte(15) & 0x10 == 0,
-                // Outside the `redirectable_projectile` tag: never aimed at, in flight or stuck.
-                "arrow" | "spectral_arrow" | "trident" => false,
-                // Entities hanging on a block: always targetable.
-                "painting" | "item_frame" | "glow_item_frame" | "leash_knot" => true,
-                "end_crystal" | "interaction" | "falling_block" | "tnt" | "shulker_bullet" | "fireball"
-                | "wind_charge" | "breeze_wind_charge" => true,
-                k if k.ends_with("boat") || k.ends_with("raft") || k.ends_with("minecart") => true,
-                _ => e.class != entities::Kind::Other,
-            };
-            if !pickable {
-                return None;
-            }
-            // Current box (type size, baby, cubes, scale, interaction, shulker…), inflated
-            // by the selection radius: 1 for redirectable projectiles.
-            let b = e.bounding_box(table, &painting, debug_render::framed_map(e, &self.component_ids)).1;
-            let r =
-                if matches!(e.kind.as_str(), "fireball" | "wind_charge" | "breeze_wind_charge") { 1.0 } else { 0.0 };
-            Some(pick::Candidate { id, bb: rc_data::Aabb { min: b.min, max: b.max }, radius: r, same_vehicle: false })
-        })
+        let source = pick_targets::TargetSource {
+            ents: &self.entities,
+            players: &self.players,
+            table: ents.map_or(&[][..], |e| e.dims.as_slice()),
+            painting: move |v: i32| ents.and_then(|e| e.painting_size(v)),
+            component_ids: &self.component_ids,
+        };
+        pick_targets::candidates(source, area, pick_targets::TargetPaths::current())
     }
 
     /// Attack reach of the active item (`attack_range`): the one in use, otherwise the main

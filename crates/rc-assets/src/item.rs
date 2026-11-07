@@ -1510,9 +1510,26 @@ impl ItemModels {
             self.layers_with(opt.eval, item, model_id, stack, env, seed, out, key);
             return true;
         }
+        self.layers_watched(item, model_id, stack, env, seed, out, key)
+    }
+
+    /// [`Self::layers`] that always watches what the evaluation reads, whatever
+    /// `RUSTCRAFT_OPT_ITEMENVFLAG`: false when it read neither the environment nor the holder's
+    /// state, so that a caller keeping the layers per stack content may reuse them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn layers_watched(
+        &self,
+        item: &str,
+        model_id: &str,
+        stack: &dyn StackView,
+        env: &dyn EvalEnv,
+        seed: i32,
+        out: &mut Vec<Layer>,
+        key: &mut Vec<u64>,
+    ) -> bool {
         let read = Cell::new(false);
         let (stack, env) = (WatchStack { s: stack, read: &read }, WatchEnv { e: env, read: &read });
-        self.layers_with(opt.eval, item, model_id, &stack, &env, seed, out, key);
+        self.layers_with(Opt::get().eval, item, model_id, &stack, &env, seed, out, key);
         read.get()
     }
 

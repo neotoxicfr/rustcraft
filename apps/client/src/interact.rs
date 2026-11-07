@@ -421,6 +421,17 @@ fn minecart_use(kind: &str, sneak: bool, occupied: bool) -> UseRes {
 
 /// Break with sound and pieces (event 2001): every block except fire and soul fire, which go
 /// out without a break effect (the server only sends the extinguish sound).
+/// Entity that keeps a block from being placed where it stands, by its type name (old path of
+/// `App::entity_blocks`, test reference of `KindFacts::blocks_building`).
+pub(crate) fn blocks_building_by_name(e: &crate::entities::Entity) -> bool {
+    let k = e.kind.as_str();
+    e.class != crate::entities::Kind::Other
+        || k.ends_with("boat")
+        || k.ends_with("raft")
+        || k.ends_with("minecart")
+        || matches!(k, "falling_block" | "tnt" | "end_crystal")
+}
+
 fn break_shows_effect(name: &str) -> bool {
     !matches!(name, "minecraft:fire" | "minecraft:soul_fire")
 }
@@ -1254,7 +1265,8 @@ impl crate::App {
 
     /// An entity that blocks construction (mobs, boats, minecarts, falling blocks,
     /// TNT, crystals) meets the collision shape of the state placed at `p`. The local player is
-    /// counted separately (`collides_with`).
+    /// counted separately (`collides_with`). The kind is read from the facts of its type
+    /// (`RUSTCRAFT_OPT_KIND_ID_FILTERS`), or from its name (old path).
     pub(crate) fn entity_blocks(&self, p: [i32; 3], state: u32) -> bool {
         let Some(info) = self.data.state(state) else { return false };
         let shape = self.data.shape(info.collision);
@@ -1264,13 +1276,9 @@ impl crate::App {
         let table = self.renderer.as_ref().and_then(|r| r.entities.as_ref()).map_or(&[][..], |e| e.dims.as_slice());
         let local = self.entities.local;
         let o = p.map(f64::from);
+        let by_facts = crate::entities::kind_id_filters_on();
         self.entities.map.iter().any(|(&id, e)| {
-            let k = e.kind.as_str();
-            let building = e.class != crate::entities::Kind::Other
-                || k.ends_with("boat")
-                || k.ends_with("raft")
-                || k.ends_with("minecart")
-                || matches!(k, "falling_block" | "tnt" | "end_crystal");
+            let building = if by_facts { e.facts.blocks_building } else { blocks_building_by_name(e) };
             if id == local || !building {
                 return false;
             }
@@ -1452,8 +1460,12 @@ impl crate::App {
         };
         let interaction = |x: i32, y: i32, z: i32| rc_physics::ray::interaction_shape(data, view.state(x, y, z));
         let local = self.entities.local;
-        let ents = self.pick_candidates(range + 8.0).filter(|c| c.id != local);
-        crate::pick::pick_along(self.eye, to, &shape, &interaction, self.weather.border.bounds(), ents)
+        let camera_box = self.camera_box();
+        let search = crate::pick::along_search_box(self.eye, to, &camera_box);
+        let area = crate::pick_targets::TargetArea::of(&search, self.camera_root());
+        let ents = self.pick_candidates(area).filter(|c| c.id != local);
+        let border = self.weather.border.bounds();
+        crate::pick::pick_along(self.eye, to, &camera_box, &shape, &interaction, border, ents)
     }
 
     /// Brushing tick (`remaining` before the countdown): aim lost → local stop without a packet;

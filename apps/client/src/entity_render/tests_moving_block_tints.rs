@@ -77,7 +77,16 @@ fn draw_falling(k: &mut Kit, state: u32) -> (Placed, u32) {
     let reads = Cell::new(0);
     let biome = counting(&reads);
     let world = ShadowWorld { state: &|_, _, _| 0, brightness: &|_, _, _| 15, ambient: 0.0, biome_tints: &biome };
-    k.r.prepare(std::iter::once(&e), 0.0, [0, 0], [0.5, 65.0, 5.5], &|_, _, _| (15, 15), &|_, _| true, None, &world);
+    k.r.prepare(
+        std::iter::once(&e),
+        0.0,
+        [0, 0],
+        [0.5, 65.0, 5.5],
+        &|_, _, _| (15, 15),
+        &crate::render::FrameVisibility::everything(),
+        None,
+        &world,
+    );
     (placed(&k.r), reads.get())
 }
 
@@ -97,7 +106,7 @@ fn draw_pushed(k: &mut Kit, moved: u32, extending: bool, source: bool) -> (Place
         game_time: 0,
         min_y: -64,
         light: &|_, _, _| (15, 15),
-        visible: &|_, _| true,
+        visible: &crate::render::FrameVisibility::everything(),
         items: None,
         render_distance: 12,
         top: 320,
