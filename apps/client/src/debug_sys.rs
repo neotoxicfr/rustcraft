@@ -97,10 +97,12 @@ pub struct CountingAllocator;
 
 // SAFETY: every call goes to mimalloc with the caller's layout (see `mimalloc_alloc`).
 unsafe impl GlobalAlloc for CountingAllocator {
-    // The old paths stay inline (no call out of line), so that a switch at 0 costs what the old
-    // code cost and its A/B is fair; counting or tracing alone goes out of line. One copy of each
-    // old path, flags read at run time: a copy per flag value made every path slower (bigger body
-    // inlined at each site, micro-bench of 06/11).
+    // The old paths stay inline (no call out of line), so that one switch at 0 costs about what the
+    // old code cost (+0.2 ns at 8 B); counting or tracing alone goes out of line. Both switches at 0
+    // still pay the dispatch (+0.5 to 1.8 ns at 8 B): the scene reference for the old code is an
+    // executable built from `main`, not this arm. One copy of each old path, flags read at run
+    // time: a copy per flag value, or one exact arm for both at 0, made every path slower, the new
+    // one included (bigger body inlined at each site, micro-benches of 06/11 and 07/11).
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY (every arm): same contract as the caller's, passed on unchanged.

@@ -5691,10 +5691,17 @@ loaded by other agents compiling.
   Rerun after that fix (another loaded-machine run, interleaved, best of 5), 8 B, 1 / 4 / 32 threads:
   new 3.62 / 7.09 / 12.97, `SINGLE_FLAG=0` 3.81 / 7.51 / 14.35, both `=0` 4.27 / 7.57 / 15.58, old
   allocator 3.63 / 6.52 / 13.79, bare direct 3.59 / 6.10 / 11.52; 1,536 B 1 / 32 threads: new 15.85 /
-  115.0, `SINGLE_FLAG=0` 15.89 / 113.0, old allocator 25.69 / 140.0. `=0` now costs its dispatch
-  only (one load and two or three branches more than the old code). A copy of each old path per
-  flag value (flags known at compile time) was tried: every path got 0.4-0.7 ns slower at 8 B,
-  new path included (bigger body inlined at each site): not kept.
+  115.0, `SINGLE_FLAG=0` 15.89 / 113.0, old allocator 25.69 / 140.0. Each switch at 0 alone costs
+  its dispatch (+0.2 ns at 8 B against the old code: 3.81 against 3.63). Both at 0 do NOT reproduce
+  the old allocator: +0.6 to 1.8 ns at 8 B (+12 to 18 %) on every thread count of that run (1 / 2 /
+  4 / 8 / 16 / 32 threads: 4.27 / 7.58 / 7.57 / 7.47 / 13.15 / 15.58 against 3.63 / 6.56 / 6.52 /
+  6.63 / 11.40 / 13.79; rerun 07/11 on 1 / 4 / 32 threads: 4.02 / 4.13 / 8.61 against 3.48 / 3.56 /
+  7.42), so the scene reference for the old code is an executable built from `main`, never the
+  both-at-0 arm. Two ways to close the gap were tried and dropped, each making every path slower,
+  the new one included (bigger body inlined at each site): a copy of each old path per flag value
+  (flags known at compile time, +0.4-0.7 ns at 8 B), and one exact arm for both at 0 replaying the
+  old sequence (07/11, 8 B 1 thread: new 4.00 against 3.49 without it, both at 0 4.56 against 4.02,
+  old code 3.44 / 3.48: the gap stays and the new path loses its tie with the old code).
 
 | ns per alloc + free, best of 5, 256 live | 8 B, 1 thread | 8 B, 4 threads | 8 B, 32 threads | 1,536 B, 1 thread | 1,536 B, 32 threads |
 |---|---|---|---|---|---|
@@ -5739,8 +5746,10 @@ loaded by other agents compiling.
   slot (mimalloc took its own before `main`, when fewer were in use). `allow_thp`: Linux only, for
   the port.
 - To measure on the quiet machine: `crowd-1000`, `tnt`, `dropped-items`, `generation`, `plains32`,
-  3 passes, p99, `committed` of the `[perf] ram` line and private memory, with `ALLOC_DIRECT` and
-  `ALLOCATOR_SINGLE_FLAG` at 0 and 1; `generation` and `flight` for pool ms/s and tick; v2 and v3
+  3 passes, p99, `committed` of the `[perf] ram` line and private memory: the branch with both
+  switches at 1 against an executable built from `main` (the old allocator; both switches at 0 cost
+  +0.6 to 1.8 ns per small allocation more than it, see above), then each switch at 0 alone to
+  split the gain; `generation` and `flight` for pool ms/s and tick; v2 and v3
   executables, private memory first (−735 MB when paused was gained with v3); then
   `MI_PURGE_LONG=1` and the direct-TLS executable. Repeated > 1 KiB allocations per frame
   (`push_item_layer`, `prepare` sorts, NBT clones, rc-mesh `to_vec`) belong to their zones: a
