@@ -254,6 +254,30 @@ switch!(
     carver_replay,
     "RUSTCRAFT_OPT_CARVER_REPLAY"
 );
+/// Filling: each block written without reading the old one back, and the two generation height
+/// maps of a column worked out while walking it down, written once at its end.
+#[inline]
+pub fn fill_column_tracking() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_FILL_COLUMN_TRACKING")
+}
+/// Terrain to decoration chunk: a section of plain air is not converted state by state, and the
+/// highest other section bounds the walk of the final height maps.
+#[inline]
+pub fn skip_air_sections() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_SKIP_AIR_SECTIONS")
+}
+/// Terrain to decoration chunk: converted layer by layer from the top, the four final height
+/// maps found on the way instead of a second walk.
+#[inline]
+pub fn convert_with_heightmaps() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_CONVERT_WITH_HEIGHTMAPS")
+}
+/// Terrain to decoration chunk: the block buffer of the converted proto-chunk is kept by its
+/// thread for the next proto-chunk instead of being freed.
+#[inline]
+pub fn reuse_proto_buffer() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_REUSE_PROTO_BUFFER")
+}
 switch!(
     /// Volume: index of a block by shift and mask when the steps are powers of 2.
     vol_pow2,

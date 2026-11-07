@@ -2,6 +2,8 @@
 //! whole world height, generation height maps (`WORLD_SURFACE_WG`,
 //! `OCEAN_FLOOR_WG`) kept at each placement, positions marked for fluid post-processing.
 
+use std::cell::RefCell;
+
 use crate::palette::{AIR, BlockId, BlockTable};
 
 /// Height map: "first free y" per column (index `x + 16·z`).
@@ -31,17 +33,7 @@ fn col(x: i32, z: i32) -> usize {
 
 impl ProtoTerrain {
     pub fn new(cx: i32, cz: i32, min_y: i32, height: i32) -> Self {
-        ProtoTerrain {
-            cx,
-            cz,
-            min_y,
-            height,
-            blocks: vec![AIR; (256 * height) as usize],
-            section_counts: vec![0; (height >> 4) as usize],
-            world_surface_wg: [min_y; 256],
-            ocean_floor_wg: [min_y; 256],
-            post_processing: Vec::new(),
-        }
+        ProtoTerrain { blocks: vec![AIR; (256 * height) as usize], ..Self::empty(cx, cz, min_y, height) }
     }
 
     #[inline]
@@ -173,37 +165,62 @@ impl ProtoTerrain {
         self.section_counts.iter().rposition(|c| *c != 0)
     }
 
-    /// Final maps (§ 6, priming at the end of `terrain`): `WORLD_SURFACE`, `OCEAN_FLOOR`,
-    /// `MOTION_BLOCKING`, `MOTION_BLOCKING_NO_LEAVES` (without leaves in terrain: equal to the previous one).
-    pub fn final_heightmaps(&self, t: &BlockTable) -> [Heightmap; 4] {
-        let mut out = [[self.min_y; 256]; 4];
-        let top = self.highest_filled_section().map_or(self.min_y, |s| self.min_y + (s as i32) * 16 + 16);
-        for x in 0..16 {
-            for z in 0..16 {
-                let mut open = [true; 4];
-                for y in (self.min_y..top).rev() {
-                    let b = self.blocks[self.index(x, y, z)];
-                    if b == AIR {
-                        continue;
-                    }
-                    let preds = [
-                        !t.is_air(b),
-                        t.blocks_motion(b),
-                        t.blocks_motion(b) || t.has_fluid(b),
-                        t.blocks_motion(b) || t.has_fluid(b),
-                    ];
-                    for k in 0..4 {
-                        if open[k] && preds[k] {
-                            out[k][col(x, z)] = y + 1;
-                            open[k] = false;
-                        }
-                    }
-                    if !open.iter().any(|o| *o) {
-                        break;
-                    }
-                }
-            }
-        }
-        out
+    /// Index in [`Self::section_counts`] of the section holding world y.
+    #[inline]
+    pub fn section_index(&self, y: i32) -> usize {
+        ((y - self.min_y) >> 4) as usize
     }
+
+    /// Writes `s` into a cell nothing has written yet (still plain air), without reading the old
+    /// block back nor touching the counts or the maps: the caller keeps them.
+    #[inline]
+    pub fn set_fresh(&mut self, x: i32, y: i32, z: i32, s: BlockId) {
+        let i = self.index(x, y, z);
+        debug_assert_eq!(self.blocks[i], AIR, "cell written twice");
+        self.blocks[i] = s;
+    }
+
+    /// Both generation maps of column (x, z) from the y of its highest block that blocks motion
+    /// and of its highest block that is not air (`None`: the world bottom).
+    pub fn set_generation_heights(&mut self, x: i32, z: i32, blocks_motion: Option<i32>, not_air: Option<i32>) {
+        self.ocean_floor_wg[col(x, z)] = blocks_motion.map_or(self.min_y, |y| y + 1);
+        self.world_surface_wg[col(x, z)] = not_air.map_or(self.min_y, |y| y + 1);
+    }
+
+    /// Like [`Self::new`], with the block buffer this thread handed back through
+    /// [`Self::recycle_blocks`] when it has one (cleared to air again) instead of a new one.
+    pub fn with_spare_blocks(cx: i32, cz: i32, min_y: i32, height: i32) -> Self {
+        let Some(mut blocks) = SPARE_BLOCKS.with(|slot| slot.borrow_mut().take()) else {
+            return Self::new(cx, cz, min_y, height);
+        };
+        blocks.clear();
+        blocks.resize((256 * height) as usize, AIR);
+        ProtoTerrain { blocks, ..Self::empty(cx, cz, min_y, height) }
+    }
+
+    /// Hands the block buffer to the calling thread, for its next [`Self::with_spare_blocks`].
+    pub fn recycle_blocks(self) {
+        SPARE_BLOCKS.with(|slot| *slot.borrow_mut() = Some(self.blocks));
+    }
+
+    /// Chunk without block buffer (filled in by the constructors).
+    fn empty(cx: i32, cz: i32, min_y: i32, height: i32) -> Self {
+        ProtoTerrain {
+            cx,
+            cz,
+            min_y,
+            height,
+            blocks: Vec::new(),
+            section_counts: vec![0; (height >> 4) as usize],
+            world_surface_wg: [min_y; 256],
+            ocean_floor_wg: [min_y; 256],
+            post_processing: Vec::new(),
+        }
+    }
+}
+
+thread_local! {
+    /// Block buffer of the last proto-chunk this thread converted (`RUSTCRAFT_OPT_REUSE_PROTO_BUFFER`):
+    /// 196 KB in the main world, taken back by the next chunk generated on the thread.
+    static SPARE_BLOCKS: RefCell<Option<Vec<BlockId>>> = const { RefCell::new(None) };
 }
