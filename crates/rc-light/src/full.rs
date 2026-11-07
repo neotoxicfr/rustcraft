@@ -227,6 +227,9 @@ pub struct FullOpts {
     /// Side of a union tile in chunks (`RUSTCRAFT_OPT_FULL_UNION_TILE_SIDE`, 2 to 8; 0: chosen per
     /// batch, see `batch`).
     pub union_tile_side: i32,
+    /// Bytes of buffers a thread keeps between two lightings at most
+    /// (`RUSTCRAFT_OPT_FULL_KEPT_BUFFER_MIB`, see [`with_bufs`]).
+    pub max_kept_buffer_bytes: usize,
 }
 
 impl FullOpts {
@@ -245,6 +248,7 @@ impl FullOpts {
         skip_depths: false,
         union_tiles: false,
         union_tile_side: 0,
+        max_kept_buffer_bytes: DEFAULT_KEPT_BUFFER_BYTES,
     };
 
     /// Every switch on.
@@ -262,6 +266,7 @@ impl FullOpts {
         skip_depths: true,
         union_tiles: true,
         union_tile_side: 0,
+        max_kept_buffer_bytes: DEFAULT_KEPT_BUFFER_BYTES,
     };
 
     /// The process's switches (`=0`: old path).
@@ -280,12 +285,18 @@ impl FullOpts {
             skip_depths: rc_data::opt_switch!("RUSTCRAFT_OPT_FULL_SKIP_DEPTHS"),
             union_tiles: rc_data::opt_switch!("RUSTCRAFT_OPT_FULL_UNION_TILES"),
             union_tile_side: union_tile_side(),
+            max_kept_buffer_bytes: max_kept_buffer_bytes(),
         }
     }
 
     /// None of the resolution switches: [`light_chunk_inner`] resolves.
     pub(crate) fn old_resolution(self) -> bool {
         !self.skip && !self.noemit && !self.layout && !self.property_grid
+    }
+
+    /// A batch is resolved by tiles (`batch`), which needs the property grid.
+    pub(crate) fn lights_by_tiles(self, t: &LightTables) -> bool {
+        self.union_tiles && self.property_grid && t.has_property_grid()
     }
 }
 
@@ -296,6 +307,21 @@ fn union_tile_side() -> i32 {
     *SIDE.get_or_init(|| {
         let side = rc_data::env_str!("RUSTCRAFT_OPT_FULL_UNION_TILE_SIDE").and_then(|v| v.parse().ok());
         side.filter(|s| (2..=8).contains(s)).unwrap_or(0)
+    })
+}
+
+/// Buffers a thread keeps by default: the 3 × 3 zone of a world 384 high with its ring fits
+/// (0.97 MB of levels and 1.93 MB of properties), a batch tile does not (5 to 11 MB at full height).
+const DEFAULT_KEPT_BUFFER_BYTES: usize = 4 << 20;
+
+/// `RUSTCRAFT_OPT_FULL_KEPT_BUFFER_MIB`: MiB of buffers a thread keeps at most, 1 to 256 (otherwise
+/// 4), read once. Above 11, the tiles of a batch of a world 384 high reuse their thread's buffers
+/// instead of allocating theirs.
+fn max_kept_buffer_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        let mib = rc_data::env_str!("RUSTCRAFT_OPT_FULL_KEPT_BUFFER_MIB").and_then(|v| v.parse::<usize>().ok());
+        mib.filter(|m| (1..=256).contains(m)).map_or(DEFAULT_KEPT_BUFFER_BYTES, |m| m << 20)
     })
 }
 
@@ -418,23 +444,29 @@ impl Bufs {
     }
 }
 
-/// Bytes kept at most per thread; beyond that, everything is returned after the call. A world
-/// 384 high: ≈ 0.9 MiB of levels and a few hundred KiB of buckets on the old layout, plus
-/// 1.9 MiB of properties on the property grid (3 × 3 columns and the ring at full height).
-const KEEP_BYTES: usize = 4 << 20;
-
 thread_local! {
     static BUFS: RefCell<Bufs> = RefCell::default();
 }
 
-/// `f` with this thread's kept buffers (`keep`, given back after if not too big) or new ones.
-fn with_bufs<R>(keep: bool, f: impl FnOnce(&mut Bufs) -> R) -> R {
+/// `f` with this thread's kept buffers (`FULLLAYOUT`, given back after unless they grew beyond
+/// [`FullOpts::max_kept_buffer_bytes`]) or new ones. A zone expected to need more than that
+/// maximum (`expected_bytes`, see [`grid::zone_buffer_bytes`]) gets new buffers and leaves the kept
+/// ones in place, so that a large batch tile does not throw away the buffers the next 3 × 3
+/// lighting on this thread reuses.
+fn with_bufs<R>(opts: FullOpts, expected_bytes: usize, f: impl FnOnce(&mut Bufs) -> R) -> R {
+    let keep = opts.layout && expected_bytes <= opts.max_kept_buffer_bytes;
     let mut b = if keep { BUFS.with(|c| std::mem::take(&mut *c.borrow_mut())) } else { Bufs::default() };
     let out = f(&mut b);
-    if keep && b.bytes() <= KEEP_BYTES {
+    if keep && b.bytes() <= opts.max_kept_buffer_bytes {
         BUFS.with(|c| *c.borrow_mut() = b);
     }
     out
+}
+
+/// Bytes of the buffers this thread keeps (tests).
+#[cfg(test)]
+fn kept_buffer_bytes() -> usize {
+    BUFS.with(|c| c.borrow().bytes())
 }
 
 /// New paths (see the header): the property grid when on and possible, otherwise
@@ -447,7 +479,7 @@ pub(crate) fn light_chunk_opt(
     has_sky: bool,
     opts: FullOpts,
 ) -> LightSheets {
-    with_bufs(opts.layout, |b| {
+    with_bufs(opts, grid::zone_buffer_bytes(3, 3, height), |b| {
         if opts.property_grid && t.has_property_grid() {
             let zc = grid::ZoneColumns { chunks_x: 3, chunks_z: 3, columns: &cols, scans: &scans };
             grid::light_zone(t, &zc, &[[1, 1]], height, has_sky, opts, b).pop().expect("one target")

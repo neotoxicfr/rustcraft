@@ -40,6 +40,41 @@ pub mod stats {
         FULL_CELLS.load(Relaxed)
     }
 
+    /// Bytes of the property grid's zone buffers in use right now over every thread, and the most
+    /// in use at once since [`reset_zone_buffer_peak`]: the memory a batch's tiles hold together.
+    static ZONE_BUFFER_BYTES: AtomicU64 = AtomicU64::new(0);
+    static ZONE_BUFFER_PEAK: AtomicU64 = AtomicU64::new(0);
+
+    /// Zone buffers of `bytes` counted in use until it is dropped.
+    pub(crate) struct ZoneBuffersInUse(u64);
+
+    impl ZoneBuffersInUse {
+        pub(crate) fn new(bytes: usize) -> ZoneBuffersInUse {
+            let bytes = bytes as u64;
+            let now = ZONE_BUFFER_BYTES.fetch_add(bytes, Relaxed) + bytes;
+            ZONE_BUFFER_PEAK.fetch_max(now, Relaxed);
+            ZoneBuffersInUse(bytes)
+        }
+    }
+
+    impl Drop for ZoneBuffersInUse {
+        fn drop(&mut self) {
+            ZONE_BUFFER_BYTES.fetch_sub(self.0, Relaxed);
+        }
+    }
+
+    /// Most bytes of zone buffers in use at once since the last reset (benches).
+    #[doc(hidden)]
+    pub fn zone_buffer_peak_bytes() -> u64 {
+        ZONE_BUFFER_PEAK.load(Relaxed)
+    }
+
+    /// Restarts [`zone_buffer_peak_bytes`] from the bytes in use now (benches).
+    #[doc(hidden)]
+    pub fn reset_zone_buffer_peak() {
+        ZONE_BUFFER_PEAK.store(ZONE_BUFFER_BYTES.load(Relaxed), Relaxed);
+    }
+
     /// Totals since startup.
     #[derive(Clone, Copy, Debug, Default)]
     pub struct Totals {
@@ -256,6 +291,12 @@ pub fn light_chunks<'a>(
     has_sky: bool,
 ) -> Vec<LightSheets> {
     full::light_chunks(t, chunks, column, scan, height, has_sky, FullOpts::current())
+}
+
+/// [`light_chunks`] resolves neighbouring chunks together by tiles; otherwise it lights them one by
+/// one, which a caller may as well do itself, chunk by chunk, inside its own parallel loop.
+pub fn batch_lit_by_tiles(t: &LightTables) -> bool {
+    FullOpts::current().lights_by_tiles(t)
 }
 
 /// Benches: [`light_chunks`] with given switches instead of the process's.

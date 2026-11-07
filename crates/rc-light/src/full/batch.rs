@@ -25,6 +25,8 @@ const TILE_SIDES: [i32; 3] = [4, 3, 2];
 
 /// Deliberate error of the tests: the tile's zone without its margin of one chunk.
 pub(crate) const SABOTAGE_TILE_WITHOUT_MARGIN: u8 = 20;
+/// Deliberate error of the tests: a tile above the kept maximum takes its thread's kept buffers.
+pub(crate) const SABOTAGE_TILE_TAKES_KEPT_BUFFERS: u8 = 21;
 
 /// Light sheets of each chunk of `chunks`, in that order; `column` and `scan` give the states and
 /// the scan (if done) of a column. Counted in `stats` like [`crate::light_chunk`].
@@ -46,7 +48,7 @@ where
         let scans: Scans = std::array::from_fn(|i| scan(x + i as i32 % 3 - 1, z + i as i32 / 3 - 1));
         counted(1, || crate::light_chunk_dispatch(t, cols, scans, height, has_sky, opts))
     };
-    if !(opts.union_tiles && opts.property_grid && t.has_property_grid()) {
+    if !opts.lights_by_tiles(t) {
         return chunks.par_iter().map(alone).collect();
     }
     let tiles = tiles_of(chunks, tile_side(chunks, opts.union_tile_side));
@@ -140,8 +142,9 @@ impl Tile<'_> {
         let scans: Vec<Option<&ColumnScan>> = positions.iter().map(|&(x, z)| scan(x, z)).collect();
         let zc = ZoneColumns { chunks_x: w, chunks_z: d, columns: &columns, scans: &scans };
         let (t, height, has_sky, opts) = (self.t, self.height, self.has_sky, self.opts);
+        let expected_bytes = if sabotaged(SABOTAGE_TILE_TAKES_KEPT_BUFFERS) { 0 } else { grid::zone_buffer_bytes(w, d, height) };
         let lit = counted(self.members.len() as u64, || {
-            with_bufs(opts.layout, |b| grid::light_zone(t, &zc, &targets, height, has_sky, opts, b))
+            with_bufs(opts, expected_bytes, |b| grid::light_zone(t, &zc, &targets, height, has_sky, opts, b))
         });
         Some(self.members.iter().copied().zip(lit).collect())
     }

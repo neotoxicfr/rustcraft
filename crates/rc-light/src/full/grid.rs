@@ -15,7 +15,7 @@
 //! - `RUSTCRAFT_OPT_FULL_NO_EMITTER_EXIT`: a zone without an emitter skips the block propagation,
 //!   its packing and the reset of the levels before the sky;
 //! - `RUSTCRAFT_OPT_FULL_SKY_SEED_FILTER`: a sky source is queued only if one of its neighbours
-//!   can still rise when it spreads (see [`sky_seed_useful`]);
+//!   can still rise when it spreads (see [`ZoneView::sky_seed_useful`]);
 //! - `RUSTCRAFT_OPT_FULL_EMITTERS_IN_FILL`: the emitters are seeded by the pass that fills the
 //!   properties (one read of the states instead of two);
 //! - `RUSTCRAFT_OPT_FULL_SKIP_DEPTHS`: the rows that no light reaches, deep under every source,
@@ -24,6 +24,7 @@
 use rc_world::LightLayer;
 
 use super::{Bufs, ColumnScan, FullOpts, LightSheets, pack_sheets_below_top, sabotaged, stack};
+use crate::stats::ZoneBuffersInUse;
 use crate::{LightTables, OPPOSITE};
 
 /// Property of a closed cell: opacity 15 and no face, so no light ever enters it (a level minus
@@ -40,6 +41,14 @@ const ALL_DIRECTIONS: u32 = 63 << DIRECTION_SHIFT;
 /// (3 × 3 columns always do, up to the highest world of 4,064 rows).
 pub(crate) fn zone_fits(chunks_x: i32, chunks_z: i32, height: i32) -> bool {
     Zone { chunks_x, chunks_z, bottom: 0, top: height }.cells() <= INDEX_MASK as usize + 1
+}
+
+/// Bytes of the level, property and source buffers of a zone of `chunks_x × chunks_z` columns
+/// `height` high at most (resolved at full height; the queues are left out): 3 bytes per cell.
+pub(crate) fn zone_buffer_bytes(chunks_x: i32, chunks_z: i32, height: i32) -> usize {
+    let cells = Zone { chunks_x, chunks_z, bottom: 0, top: height }.cells();
+    let stacks = (16 * chunks_x * 16 * chunks_z) as usize;
+    cells * (size_of::<u8>() + size_of::<u16>()) + stacks * size_of::<i32>()
 }
 
 /// Deliberate errors of the tests (each must break the equivalence proof).
@@ -151,12 +160,14 @@ pub(crate) fn light_zone(
         seed_block(t, zc, zone, opts.noemit, &mut seeds);
     }
     let emitters = seeds.found;
-    let props = &props[..zone.cells()];
+    let queues = buckets.iter().map(|q| q.capacity() * size_of::<u32>()).sum::<usize>();
+    let _in_use = ZoneBuffersInUse::new(level.capacity() + props.capacity() * 2 + src.capacity() * 4 + queues);
+    let view = ZoneView::new(t, &props[..zone.cells()], zone, opts);
     let skip_block = opts.no_emitter_exit && !emitters;
     let blocks: Vec<Vec<LightLayer>> = if skip_block {
         vec![vec![None; sections + 2]; targets.len()]
     } else {
-        propagate(t, props, level, buckets, zone, opts);
+        view.propagate(level, buckets, opts.queue_directions);
         targets.iter().map(|&c| pack_target(level, zone, c, sections, 0, false, opts.intern_uniform)).collect()
     };
     if !has_sky {
@@ -166,8 +177,8 @@ pub(crate) fn light_zone(
     if !skip_block {
         level.fill(0);
     }
-    seed_sky(t, zone, src, props, level, buckets, opts);
-    propagate(t, props, level, buckets, zone, opts);
+    view.seed_sky(src, level, buckets, opts.sky_seed_filter);
+    view.propagate(level, buckets, opts.queue_directions);
     targets
         .iter()
         .zip(blocks)
@@ -349,43 +360,137 @@ fn seed_block(t: &LightTables, zc: &ZoneColumns, zone: Zone, skip_quiet_sections
     }
 }
 
-/// Sky sources: every cell at or above its stack's source height at 15, then the queued ones,
-/// between the source height and the highest source height beside it (above, every neighbour is a
-/// source too); with the filter, only those [`sky_seed_useful`] keeps.
-fn seed_sky(
-    t: &LightTables,
+/// What the sky seeding and the propagation read and never write: the tables, the zone's cell
+/// properties and layout, the offsets of the six neighbours and the occlusion switch.
+#[derive(Clone, Copy)]
+struct ZoneView<'a> {
+    t: &'a LightTables,
+    props: &'a [u16],
     zone: Zone,
-    src: &[i32],
-    props: &[u16],
-    level: &mut [u8],
-    buckets: &mut [Vec<u32>; 16],
-    opts: FullOpts,
-) {
-    let (w, d) = (16 * zone.chunks_x, 16 * zone.chunks_z);
-    light_sky_sources(zone, src, level);
-    for z in 0..d {
-        for x in 0..w {
-            let from = src[(z * w + x) as usize];
-            if from == i32::MAX {
-                continue;
+    steps: [isize; 6],
+    occlusion_table: bool,
+}
+
+impl<'a> ZoneView<'a> {
+    fn new(t: &'a LightTables, props: &'a [u16], zone: Zone, opts: FullOpts) -> ZoneView<'a> {
+        ZoneView { t, props, zone, steps: zone.steps(), occlusion_table: opts.occlusion_table }
+    }
+
+    /// Face shape index of a cell property.
+    #[inline(always)]
+    fn face(property: u16) -> u32 {
+        u32::from(property >> 4)
+    }
+
+    /// Light leaving a cell of face `face_i` through its face `dir` enters a neighbour of property
+    /// `property_j`, when the faces do not close the passage between them.
+    #[inline(always)]
+    fn faces_open(&self, face_i: u32, property_j: u16, dir: usize) -> bool {
+        let face_j = Self::face(property_j);
+        (face_i | face_j) == 0 || !self.t.occluded_faces(face_i, face_j, dir, self.occlusion_table)
+    }
+
+    /// Sky sources: every cell at or above its stack's source height at 15, then the queued ones,
+    /// between the source height and the highest source height beside it (above, every neighbour
+    /// is a source too); with `filter`, only those [`Self::sky_seed_useful`] keeps.
+    fn seed_sky(&self, src: &[i32], level: &mut [u8], buckets: &mut [Vec<u32>; 16], filter: bool) {
+        let zone = self.zone;
+        let (w, d) = (16 * zone.chunks_x, 16 * zone.chunks_z);
+        light_sky_sources(zone, src, level);
+        for z in 0..d {
+            for x in 0..w {
+                let from = src[(z * w + x) as usize];
+                if from == i32::MAX {
+                    continue;
+                }
+                let mut highest = from;
+                for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+                    let (nx, nz) = (x + dx, z + dz);
+                    if (0..w).contains(&nx) && (0..d).contains(&nz) {
+                        let s = src[(nz * w + nx) as usize];
+                        if s != i32::MAX {
+                            highest = highest.max(s);
+                        }
+                    }
+                }
+                for y in from..=highest.min(zone.top - 1) {
+                    if filter && !self.sky_seed_useful(src, [x, y, z], from) {
+                        continue;
+                    }
+                    buckets[15].push(zone.index(x, y, z) as u32 | ALL_DIRECTIONS);
+                }
             }
-            let mut highest = from;
-            for (dx, dz) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
-                let (nx, nz) = (x + dx, z + dz);
-                if (0..w).contains(&nx) && (0..d).contains(&nz) {
-                    let s = src[(nz * w + nx) as usize];
-                    if s != i32::MAX {
-                        highest = highest.max(s);
+        }
+    }
+
+    /// Whether the sky source `[x, y, z]` of a stack whose source height is `from` can raise a
+    /// neighbour when it spreads. Every other source is already at 15 and every other cell at 0, so
+    /// only an open neighbour (opacity under 15, faces not closing the passage) that is not a source
+    /// can rise: the cell under the source height, or a side cell below its own stack's source
+    /// height. The cell above is always a source or the ring.
+    fn sky_seed_useful(&self, src: &[i32], [x, y, z]: [i32; 3], from: i32) -> bool {
+        let i = self.zone.index(x, y, z);
+        let face_i = Self::face(self.props[i]);
+        let enters = |dir: usize| {
+            let p = self.props[i.wrapping_add_signed(self.steps[dir])];
+            p & 15 < 15 && self.faces_open(face_i, p, dir)
+        };
+        if y == from && !sabotaged(SABOTAGE_SKY_SEED_FILTER_FORGETS_BELOW) && enters(0) {
+            return true;
+        }
+        let (w, d) = (16 * self.zone.chunks_x, 16 * self.zone.chunks_z);
+        [(2, 0, -1), (3, 0, 1), (4, -1, 0), (5, 1, 0)].into_iter().any(|(dir, dx, dz)| {
+            let (nx, nz) = (x + dx, z + dz);
+            (0..w).contains(&nx) && (0..d).contains(&nz) && src[(nz * w + nx) as usize] > y && enters(dir)
+        })
+    }
+
+    /// Spreads the queues by decreasing level over the grid: same fixed point as `super::propagate`
+    /// (relaxation by maximum, whatever the order). `queue_directions`: an entry only tries the
+    /// directions it carries.
+    fn propagate(&self, level: &mut [u8], buckets: &mut [Vec<u32>; 16], queue_directions: bool) {
+        for l in (2..16u8).rev() {
+            while let Some(entry) = buckets[usize::from(l)].pop() {
+                let i = (entry & INDEX_MASK) as usize;
+                if level[i] != l {
+                    continue;
+                }
+                let directions = if queue_directions { entry >> DIRECTION_SHIFT } else { 63 };
+                let face_i = Self::face(self.props[i]);
+                for (dir, &step) in self.steps.iter().enumerate() {
+                    if directions >> dir & 1 == 0 {
+                        continue;
+                    }
+                    // Never out of the arrays: queued cells are inside the ring.
+                    let j = i.wrapping_add_signed(step);
+                    let Some(new_level) = self.rise(l, face_i, dir, j, level[j]) else { continue };
+                    level[j] = new_level;
+                    if new_level > 1 {
+                        let back = if sabotaged(SABOTAGE_QUEUE_DIRECTIONS_DROP_FORWARD) { dir } else { OPPOSITE[dir] };
+                        let rest = 63 & !(1 << back);
+                        buckets[usize::from(new_level)].push(j as u32 | rest << DIRECTION_SHIFT);
                     }
                 }
             }
-            for y in from..=highest.min(zone.top - 1) {
-                if opts.sky_seed_filter && !sky_seed_useful(t, zone, src, props, [x, y, z], from, opts) {
-                    continue;
-                }
-                buckets[15].push(zone.index(x, y, z) as u32 | ALL_DIRECTIONS);
-            }
         }
+    }
+
+    /// New level of the neighbour `j` (level `level_j`) that light at level `from_level` leaving a
+    /// cell of face `face_i` through its face `dir` reaches, if it rises. The level goes first:
+    /// every opacity is at least 1, so a neighbour already at `from_level − 1` or more cannot rise,
+    /// which settles most neighbours of a dense front on one byte, without reading its property.
+    #[inline(always)]
+    fn rise(&self, from_level: u8, face_i: u32, dir: usize, j: usize, level_j: u8) -> Option<u8> {
+        let least_opacity = if sabotaged(SABOTAGE_LEVEL_TEST_ASSUMES_OPACITY_2) { 2 } else { 1 };
+        if level_j + least_opacity >= from_level {
+            return None;
+        }
+        let p = self.props[j];
+        let new_level = from_level.saturating_sub((p & 15) as u8);
+        if new_level <= level_j || !self.faces_open(face_i, p, dir) {
+            return None;
+        }
+        Some(new_level)
     }
 }
 
@@ -404,83 +509,6 @@ fn light_sky_sources(zone: Zone, src: &[i32], level: &mut [u8]) {
             }
         }
     }
-}
-
-/// Whether the sky source `[x, y, z]` of a stack whose source height is `from` can raise a
-/// neighbour when it spreads. Every other source is already at 15 and every other cell at 0, so
-/// only an open neighbour (opacity under 15, faces not closing the passage) that is not a source
-/// can rise: the cell under the source height, or a side cell below its own stack's source height.
-/// The cell above is always a source or the ring.
-fn sky_seed_useful(t: &LightTables, zone: Zone, src: &[i32], props: &[u16], [x, y, z]: [i32; 3], from: i32, opts: FullOpts) -> bool {
-    let i = zone.index(x, y, z);
-    let face_i = u32::from(props[i] >> 4);
-    let steps = zone.steps();
-    let enters = |dir: usize| {
-        let p = props[i.wrapping_add_signed(steps[dir])];
-        let face_j = u32::from(p >> 4);
-        p & 15 < 15 && ((face_i | face_j) == 0 || !t.occluded_faces(face_i, face_j, dir, opts.occlusion_table))
-    };
-    if y == from && !sabotaged(SABOTAGE_SKY_SEED_FILTER_FORGETS_BELOW) && enters(0) {
-        return true;
-    }
-    let (w, d) = (16 * zone.chunks_x, 16 * zone.chunks_z);
-    [(2, 0, -1), (3, 0, 1), (4, -1, 0), (5, 1, 0)].into_iter().any(|(dir, dx, dz)| {
-        let (nx, nz) = (x + dx, z + dz);
-        (0..w).contains(&nx) && (0..d).contains(&nz) && src[(nz * w + nx) as usize] > y && enters(dir)
-    })
-}
-
-/// Spreads the queues by decreasing level over the grid: same fixed point as `super::propagate`
-/// (relaxation by maximum, whatever the order).
-fn propagate(t: &LightTables, props: &[u16], level: &mut [u8], buckets: &mut [Vec<u32>; 16], zone: Zone, opts: FullOpts) {
-    let steps = zone.steps();
-    for l in (2..16usize).rev() {
-        while let Some(entry) = buckets[l].pop() {
-            let i = (entry & INDEX_MASK) as usize;
-            if usize::from(level[i]) != l {
-                continue;
-            }
-            let directions = if opts.queue_directions { entry >> DIRECTION_SHIFT } else { 63 };
-            let face_i = u32::from(props[i] >> 4);
-            for (dir, &step) in steps.iter().enumerate() {
-                if directions >> dir & 1 == 0 {
-                    continue;
-                }
-                // Never out of the arrays: queued cells are inside the ring.
-                let j = i.wrapping_add_signed(step);
-                let Some(new_level) = rise(t, props, j, level[j], face_i, dir, l, opts) else { continue };
-                level[j] = new_level;
-                if new_level > 1 {
-                    let back = if sabotaged(SABOTAGE_QUEUE_DIRECTIONS_DROP_FORWARD) { dir } else { OPPOSITE[dir] };
-                    let rest = 63 & !(1 << back);
-                    buckets[new_level as usize].push(j as u32 | rest << DIRECTION_SHIFT);
-                }
-            }
-        }
-    }
-}
-
-/// New level of the neighbour `j` (level `level_j`) reached from a cell of level `l` and face
-/// `face_i` through its face `dir`, if it rises. The level goes first: every opacity is at least 1,
-/// so a neighbour already at `l − 1` or more cannot rise, which settles most neighbours of a dense
-/// front on one byte, without reading its property.
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-fn rise(t: &LightTables, props: &[u16], j: usize, level_j: u8, face_i: u32, dir: usize, l: usize, opts: FullOpts) -> Option<u8> {
-    let least_opacity = if sabotaged(SABOTAGE_LEVEL_TEST_ASSUMES_OPACITY_2) { 2 } else { 1 };
-    if usize::from(level_j) + least_opacity >= l {
-        return None;
-    }
-    let p = props[j];
-    let new_level = l as i32 - i32::from(p & 15);
-    if new_level <= i32::from(level_j) {
-        return None;
-    }
-    let face_j = u32::from(p >> 4);
-    if (face_i | face_j) != 0 && t.occluded_faces(face_i, face_j, dir, opts.occlusion_table) {
-        return None;
-    }
-    Some(new_level as u8)
 }
 
 /// Sheets of the target chunk `[cx, cz]` of the zone (see [`pack_sheets_below_top`]).

@@ -4,7 +4,7 @@
 use hashbrown::HashMap;
 
 use super::*;
-use crate::full::batch::SABOTAGE_TILE_WITHOUT_MARGIN;
+use crate::full::batch::{SABOTAGE_TILE_TAKES_KEPT_BUFFERS, SABOTAGE_TILE_WITHOUT_MARGIN};
 use crate::full::grid::{
     SABOTAGE_ABSENT_COLUMN_OPEN, SABOTAGE_EMITTERS_IN_FILL_MISS_A_ROW, SABOTAGE_LEVEL_TEST_ASSUMES_OPACITY_2,
     SABOTAGE_NO_EMITTER_EXIT_MISSES_LEVEL_1, SABOTAGE_QUEUE_DIRECTIONS_DROP_FORWARD, SABOTAGE_SKIP_DEPTHS_WITHOUT_MARGIN,
@@ -237,4 +237,38 @@ fn sabotaged_tile_without_margin_breaks_the_union() {
     eprintln!("tile without margin: {} chunks of {} differ", broken.len(), all.len());
     assert!(!broken.is_empty(), "tile without margin not caught");
     assert!(pool.install(|| world.differing(&t, &all, (true, true, FullOpts::ALL), &want)).is_empty());
+}
+
+/// A tile whose zone exceeds the buffers a thread keeps gets buffers of its own: the 3 × 3 buffers
+/// its thread keeps stay in place for the next chunk lit alone (they were thrown away before).
+#[test]
+fn large_tile_leaves_the_kept_buffers_in_place() {
+    let t = tables();
+    // Above a 3 × 3 zone and its queues, under a tile of 4 with its margin (6 × 6 columns).
+    let cap = 2 << 20;
+    assert!(grid::zone_buffer_bytes(3, 3, HEIGHT) <= cap && grid::zone_buffer_bytes(6, 6, HEIGHT) > cap);
+    let opts = FullOpts { max_kept_buffer_bytes: cap, union_tile_side: 4, ..FullOpts::ALL };
+    let world = World::new(&t, 5);
+    // One aligned tile of 4 × 4 chunks.
+    let tile: Vec<(i32, i32)> = world.present().into_iter().filter(|&(x, z)| (-4..0).contains(&x) && z < 0).collect();
+    assert!(tile.len() >= 5, "the tile is lit as one zone");
+    let want = world.reference(&t, true);
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().expect("thread pool");
+    let kept_before_and_after = |sabotage: u8| {
+        pool.install(|| {
+            drop(world.light(&t, &tile[..1], true, true, opts));
+            let before = kept_buffer_bytes();
+            SABOTAGE.with(|s| s.set(sabotage));
+            let wrong = world.differing(&t, &tile, (true, true, opts), &want);
+            SABOTAGE.with(|s| s.set(0));
+            assert!(wrong.is_empty(), "sabotage {sabotage}: {wrong:?}");
+            (before, kept_buffer_bytes())
+        })
+    };
+    let (before, after) = kept_before_and_after(0);
+    assert!(before > 0, "a chunk lit alone keeps its buffers");
+    assert_eq!(after, before, "the tile left the kept buffers in place");
+    let (before, after) = kept_before_and_after(SABOTAGE_TILE_TAKES_KEPT_BUFFERS);
+    eprintln!("tile taking the kept buffers: {before} bytes kept before, {after} after");
+    assert_eq!(after, 0, "sabotage not seen: the tile took the kept buffers and threw them away");
 }
