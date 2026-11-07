@@ -2312,7 +2312,8 @@ Reached sections (same bench): construction set / grid 52 / 29 µs at 12, 405 / 
 at 32 instead of a set of 63,000 entries (≈ 1 MB). ARGSKIP: no isolated bench (memory copy
 against GPU write of a few KB), counter `ko_ecrits_gpu_image` on the scene bench.
 
-Not done (reason): `FRUSTSIMD`, `FRUSTRANGE`, `LISTPAR` (only the columns straddling an edge
+`FRUSTRANGE` and `LISTPAR` were done later (section search and parallel lists, see "C3-M06
+(series 4)" at the end of this log). Not done (reason): `FRUSTSIMD`, `FRUSTRANGE`, `LISTPAR` (only the columns straddling an edge
 do the per-section test; the per-plane predicate is monotonic in height, so a binary
 search would give the same decision, expected gain small); `REBIND` (≈ 30 bindings per frame,
 no full-render bench); `TRANSADAPT`, `SECTIONFREE`, `TRANSROLL` (the per-viewpoint re-sort
@@ -7428,4 +7429,95 @@ loaded by other agents compiling.
   `MI_PURGE_LONG=1` and the direct-TLS executable. Repeated > 1 KiB allocations per frame
   (`push_item_layer`, `prepare` sorts, NBT clones, rc-mesh `to_vec`) belong to their zones: a
   reused buffer beats any allocator setting.
+
+## C3-M06 (series 4): draw lists, column command cache, hierarchical frustum, section search, kept buffers, parallel builds (07/11, loaded machine)
+
+The terrain draw lists (`apps/client/src/render/lists.rs`) were rebuilt whole at every rotation,
+step and column upload: every candidate column tested against the frustum, every straddling
+column tested section by section, and every visible column's six lists (layer × fluid) emitted
+again run by run and face group by face group. Paths, all read once in `ListPaths::from_switches`
+(default on, `=0` = old path, except the two parallel ones, off by default, `=1` turns them on):
+
+- `RUSTCRAFT_OPT_COLUMN_COMMAND_CACHE`: each column keeps its commands for the six lists, already
+  merged among themselves; a build copies them and redoes only the merge at the seams between
+  columns (same batch, `first_instance + instance_count` of the last command = start of the next).
+  An entry is rebuilt when its mesh changes (version and starts of its four buffers: a remesh
+  written in place changes the version only, the same mesh uploaded elsewhere the places only),
+  its face groups seen from the front change, the eye height changes (bits, only for a column with
+  translucents, drawn far to near in height), or its runs change. The runs are compared without the
+  sections that draw nothing at their ends (air above the ground, swept by the top plane while the
+  camera turns): an empty section adds no instance, so every instance range starts and ends at the
+  same numbers; empty sections inside a run stay (joining runs would change the command order). The
+  sections that draw something are computed once per mesh. Unused entries leave after 64 builds;
+  a change of face vertices or split draws empties the cache.
+- `RUSTCRAFT_OPT_HIERARCHICAL_FRUSTUM` (one implementation of the C3-M06 and C2-M06 lead, the
+  two-level test read in Sodium 0.7; C2-M06's `DRAWLISTTREE`): box of the region of 16 × 16 columns
+  first (out: all its columns skipped; wholly inside: all their reached sections accepted), then the
+  box of the column's reached sections only (tighter than the whole column, which the old path
+  tested), then the sections.
+- `RUSTCRAFT_OPT_PLANE_COHERENCE` (C2-M06's `PLANECOHERENCE`): the plane that rejected a column at
+  the last build is tested first (kept per candidate of the cached order).
+- `RUSTCRAFT_OPT_SECTION_RANGE_SEARCH` (series 2's `FRUSTRANGE`, not done then): in a column across
+  some planes, the planes its box is wholly inside pass every section; for each crossed plane the
+  test is monotonic in height (the section box moves up along a fixed normal, rounding keeps the
+  order), so a binary search with the very same test finds the lower or upper bound. About 1 or 2
+  crossed planes × 5 tests instead of up to 6 tests per section.
+- `RUSTCRAFT_OPT_LIST_BUFFER_REUSE`: the working buffers (region ranks, near and far orders,
+  face groups, translucent pieces, cache slots) kept from one build to the next.
+- `RUSTCRAFT_OPT_PARALLEL_LISTS` (off by default): column selection and, without the cache, the six
+  lists cut into slices of 128 columns built as tasks on a dedicated pool (`RUSTCRAFT_LIST_THREADS`,
+  default half the logical cores), put end to end with the seam merge and each batch's first command
+  index shifted to its place in the list. `RUSTCRAFT_OPT_PARALLEL_LIST_KINDS` (off, C2-M06's
+  `DRAWLISTJOIN`): the six lists as six tasks.
+
+Proof (`render/lists_test.rs`): 44 paths (each alone on the old path and on the cached order, all
+together, the parallel ones in pools of 1, 2, 4 and 8 threads with slices of 1, 2, 3 and 7 columns)
+give the old construction's batches and commands byte for byte on 700 scripted frames (rotation,
+walk at a fixed height, flight, eye at a section's exact middle and on a boundary, look down from
+high above), in a world with air above the ground and caves, with columns sent again, the same mesh
+moved, a remesh written in place, a column removed and sent back. The old path's fingerprint on
+the series-2 trajectory is unchanged (the split of `build` is exact). Sabotages seen: stale face
+groups reused (123 frames wrong), mesh version ignored (101), batch offset forgotten at a seam (700),
+straddling column accepted whole (600), runs joined across empty sections (623), section search
+from below only (600). Nested boxes (region ⊇ column ⊇ reached sections ⊇ section): verdicts kept
+on 10^5 random boxes and frusta; the remembered plane gives the same answer on 10^5 boxes.
+
+Micro-bench `lists_bench` (400 / 120 / 30 frames at distance 12 / 32 / 64, second of two passes,
+µs per build, loaded machine: other agents compiling, swings of ±30 % and outliers of several
+times between runs). "previous" = the defaults before this mission (`VISORDER` on); "ground and
+air" = ground 7 to 11 sections high, air above, 7 sections out of 8 reached, closer to the game
+than the series-2 world (5 sections out of 8 reached at random):
+
+| world, distance, motion | old | previous | + cache | + hierarchy | + coherence | + search | + buffers | all but cache | all | all + slices, 4 threads |
+|---|---|---|---|---|---|---|---|---|---|---|
+| ground and air, 12, rotation | 148 | 125 | 111 | 156 | 153 | 119 | 151 | 121 | 77 | 81 |
+| ground and air, 32, rotation | 1,782 | 1,487 | 790 | 1,343 | 1,321 | 1,048 | 1,321 | 1,092 | 469 | 369 |
+| ground and air, 32, rotation, 1 ms between frames | 3,688 | 3,173 | 1,510 | 2,829 | 2,469 | 2,155 | 2,376 | 2,204 | 1,092 | 3,187 |
+| ground and air, 32, walk | 2,738 | 2,218 | 1,019 | 2,007 | 1,972 | 1,725 | 2,021 | 1,586 | 636 | 532 |
+| ground and air, 32, fast flight | 2,597 | 2,157 | 1,060 | 1,798 | 1,751 | 1,374 | 1,867 | 1,371 | 706 | 714 |
+| ground and air, 64, rotation | 9,456 | 6,743 | 3,310 | 7,018 | 7,625 | 7,111 | 7,081 | 7,330 | 2,424 | 1,745 |
+| random sections, 32, rotation | 2,352 | 1,654 | 1,000 | 1,963 | 1,861 | 1,590 | 1,719 | 1,461 | 685 | 749 |
+| random sections, 64, walk | 10,102 | 7,758 | 3,878 | 8,529 | 7,008 | 7,028 | 8,723 | 9,029 | 4,358 | 2,498 |
+
+The cache serves 79 to 91 % of the visible columns (89 to 91 % in the ground and air world;
+rotation, walk and flight alike: the order is rebuilt in flight, the commands mostly not). Split of a build (`lists_phase_bench`, ground and air,
+distance 32, rotation): all paths 352 µs of which column selection 147 µs; without the section
+search 627 µs of which selection 398 µs. Cache memory: 2,065 columns, 2.7 MB at distance 32
+(synthetic world, more commands per column than the game's). First run of the bench without the
+trimmed runs: 55 % of the columns from the cache on the scripted rotation (pitch swinging ±60°),
+70 % with them.
+
+Decisions: cache, hierarchy, coherence, search and kept buffers on (the cache and the search are
+the gains; hierarchy, coherence and buffers alone are within the noise, −10 to −20 % on some rows,
++5 to +25 % on others: decided on the scene bench). Parallel builds off: they win on an idle pool
+(−21 % at distance 32, −28 % at 64 on top of all the rest) but lose badly when the pool's threads
+sleep between frames (1 ms pauses: 1,092 → 2,800 to 3,200 µs, the wake-ups and the other agents'
+compilations taking the cores), and the game's pool sleeps between frames; the six lists as six
+tasks lose to the slices everywhere (the opaque list holds most of the work). To measure on the
+quiet machine: `plains32-rotation`, `flight-rotation-32`, `flight`, `ocean-walk`, `plains32`,
+`us_listes_image`, CPU ms and p99, defaults against every switch at 0 and against the reference
+exe, then `RUSTCRAFT_OPT_PARALLEL_LISTS=1` with `RUSTCRAFT_LIST_THREADS` 2 and 4, and each serial
+switch at 0 alone; counters `terrain_column_commands_reused_per_frame` and `_rebuilt_per_frame`
+give the cache's share in game. The background placement next to the entity preparation belongs
+to C3-M07.
 

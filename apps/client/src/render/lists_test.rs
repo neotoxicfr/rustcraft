@@ -23,10 +23,24 @@ const SEED: u64 = 0x5eed_c306;
 const SECTIONS: i32 = 24;
 const MIN_Y: i32 = -64;
 
+/// Mesh version of the next test column: each upload has its own, like the real meshes.
+fn next_version() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static VERSION: AtomicU64 = AtomicU64::new(1);
+    VERSION.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Test column: random faces, fluids and translucents per layer, group and section,
 /// absolute instances contiguous within their region (`cursor`), like the real upload.
-fn column(rng: &mut Lcg, k: (i32, i32), region_div: i32, cursor: &mut HashMap<(i32, i32), u32>, trans: &mut u32) -> ColumnGpu {
+fn column(
+    rng: &mut Lcg,
+    k: (i32, i32),
+    region_div: i32,
+    cursor: &mut HashMap<(i32, i32), u32>,
+    trans: &mut u32,
+) -> ColumnGpu {
     let region = (k.0.div_euclid(region_div), k.1.div_euclid(region_div));
+    let face_start = *cursor.get(&region).unwrap_or(&0);
     let s1 = SECTIONS as usize + 1;
     let cum = |rng: &mut Lcg, n: usize, at: &mut u32, empty: bool| {
         let mut v = Vec::with_capacity(n);
@@ -64,7 +78,7 @@ fn column(rng: &mut Lcg, k: (i32, i32), region_div: i32, cursor: &mut HashMap<(i
     ColumnGpu {
         digest: 0,
         region,
-        face_alloc: (0, 0),
+        face_alloc: (face_start, 0),
         fluid_alloc: (0, 0),
         trans_alloc: (0, 0),
         ranges,
@@ -78,7 +92,7 @@ fn column(rng: &mut Lcg, k: (i32, i32), region_div: i32, cursor: &mut HashMap<(i
         order_starts,
         sorted_at: None,
         povs: Vec::new(),
-        version: 0,
+        version: next_version(),
         trans_slot: None,
     }
 }
@@ -204,8 +218,8 @@ fn draw_lists_match_the_old_build_along_a_trajectory() {
             reached_gen: rgen,
             columns_rev: rev,
         };
-        let a = build(&inp, &mut old, false, || {});
-        let b = build(&inp, &mut new, true, || {});
+        let a = build(&inp, &mut old, ListPaths::OLD, || {});
+        let b = build(&inp, &mut new, ListPaths { cached_order: true, ..ListPaths::OLD }, || {});
         hits += usize::from(new.order_key == Some((rgen, origin, rev)));
         let (ia, ib) = (image_bytes(&old, a), image_bytes(&new, b));
         assert!(ia == ib, "frame {f}: lists differ (eye {eye:?}, yaw {yaw}, pitch {pitch})");
@@ -221,6 +235,399 @@ fn draw_lists_match_the_old_build_along_a_trajectory() {
 }
 
 const EXPECTED_DIGEST: u64 = 0x88c4_1e8e_1e14_3620;
+
+/// Frames of the scripted cameras.
+const SCRIPTED_FRAMES: u32 = 700;
+
+/// Scripted camera of the path tests: rotation in place, walk at a fixed height (steps across
+/// column edges), flight (every coordinate moving), rotation at a section's exact middle then on a
+/// section boundary, and a look straight down from high above (regions wholly in the field).
+/// Returns eye, yaw, pitch, far plane.
+fn scripted_camera(f: u32) -> ([f64; 3], f32, f32, f32) {
+    let t = f as f32;
+    let far = 12.0 * 16.0;
+    match f / 150 {
+        0 => ([3.5, 70.5, -2.5], t * 2.4 - 180.0, (t * 0.07).sin() * 60.0, far),
+        1 => {
+            let s = f64::from(f - 150) * 0.3;
+            ([-20.0 + s, 70.5, 4.0 + s * 0.2], 90.0 + (t * 0.05).sin() * 40.0, 10.0, far)
+        }
+        2 => {
+            let s = f64::from(f - 300);
+            ([20.0 - s * 0.8, 60.0 + s * 0.4, -10.0 + s * 0.5], t * 1.3, (t * 0.11).sin() * 70.0, far)
+        }
+        3 => {
+            // Middle of section 9, then the boundary between sections 9 and 10.
+            let y = if f < 525 { f64::from(MIN_Y + 16 * 9 + 8) } else { f64::from(MIN_Y + 16 * 10) };
+            ([0.5, y, 0.5], t * 3.1, (t * 0.13).sin() * 85.0, far)
+        }
+        _ => ([0.5, 900.0, 0.5], t, 89.0, 2000.0),
+    }
+}
+
+/// Test world changed along the scripted cameras like the game changes it: walk redone, a column
+/// sent again with a new mesh (often while the camera holds still), the same mesh moved to another
+/// place, a column removed then sent back.
+struct ScriptedWorld {
+    rng: Lcg,
+    columns: HashMap<(i32, i32), ColumnGpu>,
+    reached: Vec<(i32, i32, i32)>,
+    cursor: HashMap<(i32, i32), u32>,
+    trans: u32,
+    removed: Option<((i32, i32), ColumnGpu)>,
+    reached_gen: u64,
+    columns_rev: u64,
+}
+
+impl ScriptedWorld {
+    fn new(seed: u64) -> Self {
+        let mut rng = Lcg(seed);
+        let (mut columns, mut reached) = (HashMap::new(), Vec::new());
+        let (mut cursor, mut trans) = (HashMap::new(), 0);
+        for x in -12..=12 {
+            for z in -12..=12 {
+                if rng.below(16) != 0 {
+                    let c = Self::new_column(&mut rng, (x, z), &mut cursor, &mut trans);
+                    columns.insert((x, z), c);
+                }
+            }
+        }
+        reach(&mut rng, 12, 5, &mut reached);
+        ScriptedWorld { rng, columns, reached, cursor, trans, removed: None, reached_gen: 1, columns_rev: 1 }
+    }
+
+    /// Column with air above its ground (sections drawing nothing) and, one time in two, a cave
+    /// section drawing nothing below it.
+    fn new_column(rng: &mut Lcg, k: (i32, i32), cursor: &mut HashMap<(i32, i32), u32>, trans: &mut u32) -> ColumnGpu {
+        let mut c = column(rng, k, 4, cursor, trans);
+        let ground = 8 + rng.below(10) as usize;
+        let cave = (rng.below(2) == 0).then(|| 1 + rng.below(ground as u32 - 2) as usize);
+        with_air(&mut c, ground, cave);
+        c
+    }
+
+    /// Changes of frame `f`; `near`: column of the camera.
+    fn step(&mut self, f: u32, near: (i32, i32)) {
+        let rng = &mut self.rng;
+        let around = |rng: &mut Lcg| (near.0 + rng.below(9) as i32 - 4, near.1 + rng.below(9) as i32 - 4);
+        if f % 23 == 22 {
+            reach(rng, 12, 5, &mut self.reached);
+            self.reached_gen += 1;
+        }
+        if f % 7 == 3 {
+            let k = around(rng);
+            let fresh = Self::new_column(rng, k, &mut self.cursor, &mut self.trans);
+            self.columns.insert(k, fresh);
+            self.columns_rev += 1;
+        }
+        if f % 17 == 5 {
+            // Same mesh (same version) uploaded at another place of its buffers.
+            let k = around(rng);
+            if let Some(c) = self.columns.get_mut(&k) {
+                move_column(c, 7);
+                self.columns_rev += 1;
+            }
+        }
+        if f % 11 == 6 {
+            // Partial remesh written in place: same places, faces spread otherwise, new version.
+            let k = around(rng);
+            if let Some(c) = self.columns.get_mut(&k) {
+                remesh_in_place(c, rng);
+                self.columns_rev += 1;
+            }
+        }
+        if f % 31 == 10 {
+            let k = around(rng);
+            self.removed = self.columns.remove(&k).map(|c| (k, c));
+            self.columns_rev += 1;
+        }
+        if f % 31 == 20
+            && let Some((k, c)) = self.removed.take()
+        {
+            self.columns.insert(k, c);
+            self.columns_rev += 1;
+        }
+    }
+
+    fn input<'a>(&'a self, planes: &'a [Vec4; 6], origin: [i32; 2], eye: [f64; 3]) -> ListIn<'a> {
+        ListIn {
+            columns: &self.columns,
+            reached: &self.reached,
+            planes,
+            origin,
+            eye,
+            min_y: MIN_Y,
+            sections: SECTIONS,
+            face_vertices: 4,
+            split_draws: false,
+            reached_gen: self.reached_gen,
+            columns_rev: self.columns_rev,
+        }
+    }
+}
+
+/// Makes the sections from `ground` up (air) and the section `cave` draw nothing in every list.
+fn with_air(c: &mut ColumnGpu, ground: usize, cave: Option<usize>) {
+    let empty = |sy: usize| sy >= ground || Some(sy) == cave;
+    let lists = c.starts.iter_mut().chain(c.fluid_starts.iter_mut()).chain([&mut c.order_starts]);
+    for starts in lists {
+        for group in starts.as_chunks_mut::<{ SECTIONS as usize + 1 }>().0 {
+            let counts: Vec<u32> = group.windows(2).map(|w| w[1] - w[0]).collect();
+            for (sy, n) in counts.into_iter().enumerate() {
+                group[sy + 1] = group[sy] + if empty(sy) { 0 } else { n };
+            }
+        }
+    }
+}
+
+/// Places the column `by` instances further in each of its buffers.
+fn move_column(c: &mut ColumnGpu, by: u32) {
+    for r in c.ranges.iter_mut().chain(c.fluid_ranges.iter_mut()) {
+        *r = r.start + by..r.end + by;
+    }
+    for s in c.starts.iter_mut().chain(c.fluid_starts.iter_mut()).chain([&mut c.order_starts]) {
+        s.iter_mut().for_each(|v| *v += by);
+    }
+    for a in [&mut c.face_alloc, &mut c.fluid_alloc, &mut c.trans_alloc, &mut c.order_alloc] {
+        a.0 += by;
+    }
+}
+
+/// New mesh of the same size written over the old one (`in_place_writes`): the faces of the
+/// opaque layer move from one section to the next, the places stay, the version changes.
+fn remesh_in_place(c: &mut ColumnGpu, rng: &mut Lcg) {
+    let s1 = SECTIONS as usize + 1;
+    let starts = &mut c.starts[0];
+    for g in 0..BUCKETS {
+        let i = g * s1 + 1 + rng.below(SECTIONS as u32 - 1) as usize;
+        if starts[i] < starts[i + 1] {
+            starts[i] += 1;
+        }
+    }
+    c.version = next_version();
+}
+
+/// Every new path at once, on the calling thread.
+const ALL_SERIAL: ListPaths = ListPaths {
+    cached_order: true,
+    column_commands: true,
+    hierarchical_frustum: true,
+    plane_coherence: true,
+    section_search: true,
+    reuse_buffers: true,
+    ..ListPaths::OLD
+};
+
+/// A path compared with the old construction, and the threads of its pool (`None`: the calling
+/// thread).
+type Compared = (String, ListPaths, Option<usize>);
+
+/// Each path alone (on the old construction and on the cached order), all together, and the
+/// parallel ones in pools of 1 to 8 threads with slices of 1, 2, 3 and 7 columns.
+fn compared_paths() -> Vec<Compared> {
+    let old = ListPaths::OLD;
+    let cached = ListPaths { cached_order: true, ..old };
+    let mut v: Vec<Compared> = vec![("cached order".into(), cached, None), ("all".into(), ALL_SERIAL, None)];
+    for (base_name, base) in [("old", old), ("cached order", cached)] {
+        let alone = [
+            ("command cache", ListPaths { column_commands: true, ..base }),
+            ("hierarchical frustum", ListPaths { hierarchical_frustum: true, ..base }),
+            ("plane coherence", ListPaths { plane_coherence: true, ..base }),
+            ("section search", ListPaths { section_search: true, ..base }),
+            ("section search in the hierarchy", ListPaths { section_search: true, hierarchical_frustum: true, ..base }),
+            ("buffer reuse", ListPaths { reuse_buffers: true, ..base }),
+        ];
+        v.extend(alone.map(|(name, p)| (format!("{base_name} + {name}"), p, None)));
+        v.push((format!("{base_name} + list kinds"), ListPaths { parallel_kinds: true, ..base }, Some(4)));
+        for slice in [1, 2, 3, 7] {
+            v.push((
+                format!("{base_name} + slices of {slice}"),
+                ListPaths { column_slices: Some(slice), ..base },
+                Some(4),
+            ));
+        }
+    }
+    for threads in [1, 2, 4, 8] {
+        v.push(("all + list kinds".into(), ListPaths { parallel_kinds: true, ..ALL_SERIAL }, Some(threads)));
+        for slice in [1, 2, 3, 7] {
+            let p = ListPaths { column_slices: Some(slice), ..ALL_SERIAL };
+            v.push((format!("all + slices of {slice}"), p, Some(threads)));
+            let p =
+                ListPaths { column_slices: Some(slice), parallel_kinds: true, column_commands: false, ..ALL_SERIAL };
+            v.push((format!("all but the cache + slices of {slice} + kinds"), p, Some(threads)));
+        }
+    }
+    v
+}
+
+fn pools() -> HashMap<usize, rayon::ThreadPool> {
+    [1, 2, 4, 8]
+        .into_iter()
+        .map(|t| (t, rayon::ThreadPoolBuilder::new().num_threads(t).build().expect("pool")))
+        .collect()
+}
+
+fn build_on(
+    pools: &HashMap<usize, rayon::ThreadPool>,
+    threads: Option<usize>,
+    inp: &ListIn<'_>,
+    l: &mut Lists,
+    p: ListPaths,
+) -> (usize, u64) {
+    match threads {
+        Some(t) => pools[&t].install(|| build(inp, l, p, || {})),
+        None => build(inp, l, p, || {}),
+    }
+}
+
+/// Lists of each frame of the scripted cameras: `on_frame(frame, lists of the old construction)`.
+fn along_scripted_cameras(mut on_frame: impl FnMut(u32, &ListIn<'_>, &[u8])) {
+    let mut world = ScriptedWorld::new(SEED ^ 5);
+    let mut reference = Lists::default();
+    for f in 0..SCRIPTED_FRAMES {
+        let (eye, yaw, pitch, far) = scripted_camera(f);
+        world.step(f, (eye[0].floor() as i32 >> 4, eye[2].floor() as i32 >> 4));
+        let (origin, pl) = planes(eye, yaw, pitch, far);
+        let inp = world.input(&pl, origin, eye);
+        let drawn = build(&inp, &mut reference, ListPaths::OLD, || {});
+        on_frame(f, &inp, &image_bytes(&reference, drawn));
+    }
+}
+
+/// Every path gives the old construction's batches and commands (order included) on every frame
+/// of the scripted cameras, with columns sent, moved, removed and sent back on the way; the cache
+/// serves most columns while the camera turns in place.
+#[test]
+fn every_path_matches_the_old_build_along_scripted_cameras() {
+    let pools = pools();
+    let mut compared: Vec<(Compared, Lists)> = compared_paths().into_iter().map(|c| (c, Lists::default())).collect();
+    let (mut reused, mut rebuilt, mut drawn_frames) = (0, 0, 0);
+    along_scripted_cameras(|f, inp, want| {
+        drawn_frames += usize::from(want.len() > 64);
+        for ((name, paths, threads), lists) in &mut compared {
+            let drawn = build_on(&pools, *threads, inp, lists, *paths);
+            assert!(image_bytes(lists, drawn) == want, "frame {f}: path {name} ({threads:?} threads) differs");
+            if *paths == ALL_SERIAL && f < 150 {
+                let (r, b) = lists.column_command_reuse();
+                (reused, rebuilt) = (reused + r, rebuilt + b);
+            }
+        }
+    });
+    assert!(drawn_frames > 600, "frames drawing something: {drawn_frames}");
+    println!("rotation in place: {reused} columns reused, {rebuilt} rebuilt");
+    assert!(reused > rebuilt && rebuilt > 0, "rotation in place: {reused} columns reused, {rebuilt} rebuilt");
+}
+
+/// The sabotages the tests must see: stale face groups reused by the cache after a step, a slice's
+/// batches left at their place in the slice, a column across a plane accepted whole.
+#[test]
+fn sabotaged_paths_are_caught() {
+    let pools = pools();
+    let sabotaged = [
+        (Sabotage::StaleFacings, ALL_SERIAL, None),
+        (Sabotage::IgnoredMeshVersion, ALL_SERIAL, None),
+        // Without the cache: the slices then build the commands.
+        (
+            Sabotage::ForgottenBatchOffset,
+            ListPaths { column_slices: Some(3), column_commands: false, ..ALL_SERIAL },
+            Some(4),
+        ),
+        (Sabotage::StraddlingColumnAcceptedWhole, ALL_SERIAL, None),
+        (Sabotage::RunsJoinedAcrossEmptySections, ALL_SERIAL, None),
+        (Sabotage::SectionSearchFromBelowOnly, ALL_SERIAL, None),
+    ];
+    let mut runs: Vec<(Sabotage, ListPaths, Option<usize>, Lists, u32)> = sabotaged
+        .into_iter()
+        .map(|(s, p, t)| (s, ListPaths { sabotage: Some(s), ..p }, t, Lists::default(), 0))
+        .collect();
+    along_scripted_cameras(|_, inp, want| {
+        for (_, paths, threads, lists, differs) in &mut runs {
+            let drawn = build_on(&pools, *threads, inp, lists, *paths);
+            *differs += u32::from(image_bytes(lists, drawn) != want);
+        }
+    });
+    for (s, .., differs) in &runs {
+        println!("sabotage {s:?}: {differs} frames differ");
+        assert!(*differs > 0, "sabotage {s:?} not seen");
+    }
+}
+
+/// Region box ⊇ column box ⊇ box of a column's reached sections ⊇ section box, and an enclosing
+/// box out of the field (or wholly inside) makes every box it holds so: the shortcuts of the
+/// hierarchical frustum give the per-section answer. 10^5 random boxes and frusta.
+#[test]
+fn enclosing_boxes_answer_like_the_boxes_they_hold() {
+    let mut rng = Lcg(SEED ^ 11);
+    let mut outer = [0usize; 3];
+    for case in 0..100_000 {
+        let k = (rng.below(81) as i32 - 40, rng.below(81) as i32 - 40);
+        let ((eye, yaw, pitch), far) = if case % 4 == 0 {
+            // From high above the column's region, looking down: whole regions in the field.
+            let mut centre = |c: i32| f64::from((c >> REGION_SHIFT) * 256 + 128) + f64::from(rng.below(64)) - 32.0;
+            let (x, z) = (centre(k.0), centre(k.1));
+            (
+                ([x, 700.0 + f64::from(rng.below(800)), z], rng.below(360) as f32, 89.0 + rng.below(10) as f32 / 10.0),
+                3000.0,
+            )
+        } else {
+            let around = |c: i32, rng: &mut Lcg| f64::from(c * 16 + rng.below(600) as i32 - 300) + 0.25;
+            let eye = [around(k.0, &mut rng), f64::from(rng.below(400)) - 70.5, around(k.1, &mut rng)];
+            let view = (eye, rng.below(3600) as f32 / 10.0 - 180.0, rng.below(1800) as f32 / 10.0 - 90.0);
+            (view, 32.0 + rng.below(2000) as f32)
+        };
+        let (origin, pl) = planes(eye, yaw, pitch, far);
+        let culling = ColumnCulling { planes: &pl, origin, min_y: MIN_Y, sections: SECTIONS, paths: ListPaths::OLD };
+        let lo = rng.below(SECTIONS as u32) as i32;
+        let hi = lo + rng.below((SECTIONS - lo) as u32) as i32;
+        let sy = lo + rng.below((hi - lo + 1) as u32) as i32;
+        let reached = (section_box(origin, MIN_Y, k, lo).0, section_box(origin, MIN_Y, k, hi).1);
+        let boxes = [
+            culling.region_box((k.0 >> REGION_SHIFT, k.1 >> REGION_SHIFT)),
+            column_box(origin, MIN_Y, SECTIONS, k),
+            reached,
+            section_box(origin, MIN_Y, k, sy),
+        ];
+        let verdict = |(min, max): (Vec3, Vec3)| match (aabb_visible(&pl, min, max), aabb_inside(&pl, min, max)) {
+            (false, false) => BoxVerdict::Outside,
+            (true, true) => BoxVerdict::Inside,
+            (true, false) => BoxVerdict::Across,
+            (false, true) => panic!("box wholly inside but not visible: {min} {max}"),
+        };
+        for w in boxes.windows(2) {
+            let ((omin, omax), (imin, imax)) = (w[0], w[1]);
+            assert!(omin.cmple(imin).all() && omax.cmpge(imax).all(), "box {imin}..{imax} not inside {omin}..{omax}");
+            match verdict(w[0]) {
+                BoxVerdict::Outside => assert_eq!(verdict(w[1]), BoxVerdict::Outside),
+                BoxVerdict::Inside => assert_eq!(verdict(w[1]), BoxVerdict::Inside),
+                BoxVerdict::Across => {}
+            }
+        }
+        outer[verdict(boxes[0]) as usize] += 1;
+    }
+    assert!(outer.iter().all(|&n| n > 1000), "region verdicts outside / inside / across: {outer:?}");
+}
+
+/// The plane remembered by the coherence test changes nothing to the answer, and after a
+/// rejection it names a plane that rejects the box.
+#[test]
+fn remembered_plane_gives_the_same_answer() {
+    let mut rng = Lcg(SEED ^ 13);
+    let mut rejected = 0;
+    for _ in 0..100_000 {
+        let eye = [f64::from(rng.below(64)), 70.0, f64::from(rng.below(64))];
+        let (origin, pl) = planes(eye, rng.below(360) as f32, rng.below(180) as f32 - 90.0, 300.0);
+        let k = (rng.below(41) as i32 - 20, rng.below(41) as i32 - 20);
+        let (min, max) = section_box(origin, MIN_Y, k, rng.below(SECTIONS as u32) as i32);
+        let mut hint = rng.below(6) as u8;
+        let seen = visible_with_hint(&pl, min, max, &mut hint);
+        assert_eq!(seen, aabb_visible(&pl, min, max));
+        if !seen {
+            rejected += 1;
+            assert!(!box_reaches_plane(&pl[usize::from(hint)], min, max), "remembered plane {hint} does not reject");
+        }
+    }
+    assert!(rejected > 10_000, "boxes rejected: {rejected}");
+}
 
 /// Sections of a column from farthest to nearest: two-pointer merge = stable sort
 /// of the old path, eye at the exact middle of a section and on a boundary included.
@@ -247,7 +654,9 @@ fn far_to_near_matches_the_stable_sort() {
         far_to_near(&runs, ey, &mut src, &mut got);
         want.clear();
         want.extend(runs.iter().flat_map(|r| r.clone()).map(|sy| sy..sy + 1));
-        want.sort_by(|a: &Range<usize>, b: &Range<usize>| section_dist(b.start, ey).total_cmp(&section_dist(a.start, ey)));
+        want.sort_by(|a: &Range<usize>, b: &Range<usize>| {
+            section_dist(b.start, ey).total_cmp(&section_dist(a.start, ey))
+        });
         assert_eq!(got, want, "runs {runs:?}, eye {ey}");
         ties += usize::from(want.windows(2).any(|w| section_dist(w[0].start, ey) == section_dist(w[1].start, ey)));
     }
@@ -287,7 +696,10 @@ fn changed_range_rebuilds_the_new_commands() {
                 assert!(bytemuck::cast_slice::<_, u8>(&old[..new.len()]) == bytemuck::cast_slice::<_, u8>(&new[..]));
             }
             Some(r) => {
-                gpu.resize(gpu.len().max(r.end), DrawArgs { vertex_count: 0, instance_count: 0, first_vertex: 0, first_instance: 0 });
+                gpu.resize(
+                    gpu.len().max(r.end),
+                    DrawArgs { vertex_count: 0, instance_count: 0, first_vertex: 0, first_instance: 0 },
+                );
                 gpu[r.clone()].copy_from_slice(&new[r]);
             }
         }
@@ -457,52 +869,192 @@ fn reach_grid_matches_the_set() {
     }
 }
 
-/// Micro-bench (`cargo test --release -- --ignored lists_bench --nocapture`): construction only,
-/// rotation in place (fixed walk and origin) then walking (origin changing on every frame),
-/// old and new path, at distance 12, 32 and 64; one core.
+/// Paths of the micro-bench and the threads of their pool.
+fn bench_paths() -> Vec<Compared> {
+    let cached = ListPaths { cached_order: true, ..ListPaths::OLD };
+    let mut v: Vec<Compared> = vec![
+        ("old".into(), ListPaths::OLD, None),
+        ("cached order (previous default)".into(), cached, None),
+        ("+ command cache".into(), ListPaths { column_commands: true, ..cached }, None),
+        ("+ hierarchical frustum".into(), ListPaths { hierarchical_frustum: true, ..cached }, None),
+        ("+ plane coherence".into(), ListPaths { plane_coherence: true, ..cached }, None),
+        ("+ section search".into(), ListPaths { section_search: true, ..cached }, None),
+        ("+ buffer reuse".into(), ListPaths { reuse_buffers: true, ..cached }, None),
+        ("all but the cache".into(), ListPaths { column_commands: false, ..ALL_SERIAL }, None),
+        ("all".into(), ALL_SERIAL, None),
+    ];
+    let slices = Some(SLICE_COLUMNS);
+    v.push(("cached order + list kinds, 4 threads".into(), ListPaths { parallel_kinds: true, ..cached }, Some(4)));
+    for threads in [1, 2, 4, 8] {
+        v.push((
+            format!("cached order + slices, {threads} threads"),
+            ListPaths { column_slices: slices, ..cached },
+            Some(threads),
+        ));
+        v.push((
+            format!("all + slices, {threads} threads"),
+            ListPaths { column_slices: slices, ..ALL_SERIAL },
+            Some(threads),
+        ));
+    }
+    v
+}
+
+/// Bench world of radius `r` like the game's: ground 7 to 11 sections high, air above (drawing
+/// nothing), 7 sections out of 8 reached (the walk crosses the open air).
+fn world_with_air(rng: &mut Lcg, r: i32) -> World {
+    let (mut cols, reached) = world(rng, r, 7);
+    for (&(x, z), c) in cols.iter_mut() {
+        with_air(c, 7 + (x * 7 + z * 13).rem_euclid(5) as usize, None);
+    }
+    (cols, reached)
+}
+
+/// Camera motion of the micro-bench: blocks per frame, pause between two frames (the pool's
+/// threads fall asleep as between two frames of the game).
+struct Motion {
+    name: &'static str,
+    speed: f64,
+    pause: Option<std::time::Duration>,
+}
+
+const MOTIONS: [Motion; 4] = [
+    Motion { name: "rotation", speed: 0.0, pause: None },
+    Motion { name: "rotation, 1 ms between frames", speed: 0.0, pause: Some(std::time::Duration::from_millis(1)) },
+    Motion { name: "walk", speed: 0.07, pause: None },
+    Motion { name: "fast flight", speed: 1.1, pause: None },
+];
+
+/// Builds of `frames` frames of `motion` through `world` (radius `r`); returns µs per build and
+/// the columns reused and rebuilt by the cache.
+fn bench_motion(
+    world: &World,
+    r: i32,
+    frames: u32,
+    motion: &Motion,
+    path: &Compared,
+    pools: &HashMap<usize, rayon::ThreadPool>,
+) -> (f64, u64, u64) {
+    let (cols, reached) = world;
+    let (_, p, threads) = path;
+    let mut l = Lists::default();
+    let (mut reused, mut rebuilt, mut spent) = (0, 0, std::time::Duration::ZERO);
+    for f in 0..frames {
+        let s = f64::from(f) * motion.speed;
+        let eye = [0.5 + s, 70.0, 0.5 + s * 0.3];
+        let (origin, pl) = planes(eye, f as f32 * 0.9, 10.0, r as f32 * 16.0);
+        let inp = ListIn {
+            columns: cols,
+            reached,
+            planes: &pl,
+            origin,
+            eye,
+            min_y: MIN_Y,
+            sections: SECTIONS,
+            face_vertices: 4,
+            split_draws: false,
+            reached_gen: 1,
+            columns_rev: 1,
+        };
+        if let Some(pause) = motion.pause {
+            std::thread::sleep(pause);
+        }
+        let t = std::time::Instant::now();
+        std::hint::black_box(build_on(pools, *threads, &inp, &mut l, *p));
+        spent += t.elapsed();
+        let (a, b) = l.column_command_reuse();
+        (reused, rebuilt) = (reused + a, rebuilt + b);
+    }
+    (spent.as_secs_f64() * 1e6 / f64::from(frames), reused, rebuilt)
+}
+
+/// Share of the column selection in a build (`cargo test --release -p rc-app --bin rustcraft
+/// lists_phase_bench -- --ignored --nocapture`): world with ground and air, rotation in place,
+/// distance 32, every serial path on; one core.
+#[test]
+#[ignore]
+fn lists_phase_bench() {
+    let (cols, reached) = world_with_air(&mut Lcg(SEED), 32);
+    for paths in [ALL_SERIAL, ListPaths { section_search: false, ..ALL_SERIAL }] {
+        let (mut whole, mut selection) = (Lists::default(), Lists::default());
+        let (mut t_whole, mut t_selection) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        for f in 0..400u32 {
+            let eye = [0.5, 70.0, 0.5];
+            let (origin, pl) = planes(eye, f as f32 * 0.9, 10.0, 32.0 * 16.0);
+            let inp = ListIn {
+                columns: &cols,
+                reached: &reached,
+                planes: &pl,
+                origin,
+                eye,
+                min_y: MIN_Y,
+                sections: SECTIONS,
+                face_vertices: 4,
+                split_draws: false,
+                reached_gen: 1,
+                columns_rev: 1,
+            };
+            let t = std::time::Instant::now();
+            std::hint::black_box(build(&inp, &mut whole, paths, || {}));
+            t_whole += t.elapsed();
+            let t = std::time::Instant::now();
+            std::hint::black_box(select_visible(&inp, &mut selection, paths).len());
+            t_selection += t.elapsed();
+        }
+        let us = |d: std::time::Duration| d.as_secs_f64() * 1e6 / 400.0;
+        let (columns, bytes) = whole.command_cache_size();
+        println!(
+            "section search {}: build {:.1} µs/frame, of which column selection {:.1} µs; cache {columns} columns, {} KB",
+            paths.section_search,
+            us(t_whole),
+            us(t_selection),
+            bytes / 1024
+        );
+    }
+}
+
+/// Micro-bench (`cargo test --release -p rc-app --bin rustcraft lists_bench -- --ignored
+/// --nocapture`): construction only, in the world of the previous series (sections reached at
+/// random) and in a world with ground and air like the game's; rotation in place (fixed walk and
+/// origin), the same with a pause between frames, walking (origin moving now and then) and fast
+/// flight (origin changing on every frame); each path of [`bench_paths`], at distance 12, 32 and
+/// 64. Two alternating passes, the second counts.
 #[test]
 #[ignore]
 fn lists_bench() {
-    for r in [12, 32, 64] {
-        let mut rng = Lcg(SEED);
-        let (cols, reached) = world(&mut rng, r, 5);
-        for (walk, speed) in [("rotation", 0.0), ("walk", 0.07), ("fast flight", 1.1)] {
-            let mut res = [0.0f64; 2];
-            for (p, new) in [false, true, false, true].into_iter().enumerate() {
-                let mut l = Lists::default();
-                let frames = 400u32;
-                let t = std::time::Instant::now();
-                for f in 0..frames {
-                    let s = f64::from(f) * speed;
-                    let eye = [0.5 + s, 70.0, 0.5 + s * 0.3];
-                    let (origin, pl) = planes(eye, f as f32 * 0.9, 10.0, r as f32 * 16.0);
-                    let inp = ListIn {
-                        columns: &cols,
-                        reached: &reached,
-                        planes: &pl,
-                        origin,
-                        eye,
-                        min_y: MIN_Y,
-                        sections: SECTIONS,
-                        face_vertices: 4,
-                        split_draws: false,
-                        reached_gen: 1,
-                        columns_rev: 1,
-                    };
-                    std::hint::black_box(build(&inp, &mut l, new, || {}));
+    let pools = pools();
+    let paths = bench_paths();
+    for (r, frames) in [(12, 400u32), (32, 120), (64, 30)] {
+        let worlds =
+            [("random sections", world(&mut Lcg(SEED), r, 5)), ("ground and air", world_with_air(&mut Lcg(SEED), r))];
+        for (world_name, world) in &worlds {
+            for motion in &MOTIONS {
+                let mut res = vec![(0.0f64, 0u64, 0u64); paths.len()];
+                for pass in 0..2 {
+                    for (i, path) in paths.iter().enumerate() {
+                        let measured = bench_motion(world, r, frames, motion, path, &pools);
+                        if pass == 1 {
+                            res[i] = measured;
+                        }
+                    }
                 }
-                // Two alternating passes; the second counts.
-                if p >= 2 {
-                    res[usize::from(new)] = t.elapsed().as_secs_f64() * 1e6 / f64::from(frames);
+                let old = res[0].0;
+                for ((name, ..), (us, reused, rebuilt)) in paths.iter().zip(&res) {
+                    let cache = if reused + rebuilt > 0 {
+                        format!(
+                            ", {:.0}% of the columns from the cache",
+                            100.0 * *reused as f64 / (reused + rebuilt) as f64
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let against = (us / old - 1.0) * 100.0;
+                    println!(
+                        "lists {world_name} distance {r} {}: {name}: {us:.1} µs/frame ({against:+.0}% against old{cache})",
+                        motion.name
+                    );
                 }
             }
-            println!(
-                "lists distance {r} {}: old {:.1} µs/frame, new {:.1} µs/frame ({:+.0}%)",
-                walk,
-                res[0],
-                res[1],
-                (res[1] / res[0] - 1.0) * 100.0
-            );
         }
     }
     // Reached sections: set rebuilt on the main thread against grid.
@@ -523,8 +1075,11 @@ fn lists_bench() {
         let grid_us = t.elapsed().as_secs_f64() * 1e6 / f64::from(n);
         let set: hashbrown::HashSet<_> = reached.iter().copied().collect();
         let grid = ReachGrid::new(&reached);
-        let q: Vec<(i32, i32, i32)> =
-            (0..200_000).map(|_| (rng.below(2 * r as u32 + 1) as i32 - r, rng.below(24) as i32, rng.below(2 * r as u32 + 1) as i32 - r)).collect();
+        let q: Vec<(i32, i32, i32)> = (0..200_000)
+            .map(|_| {
+                (rng.below(2 * r as u32 + 1) as i32 - r, rng.below(24) as i32, rng.below(2 * r as u32 + 1) as i32 - r)
+            })
+            .collect();
         let t = std::time::Instant::now();
         let a = q.iter().filter(|p| set.contains(*p)).count();
         let set_q = t.elapsed().as_secs_f64() * 1e9 / q.len() as f64;
