@@ -147,14 +147,27 @@ pub fn normalize_patch(s: &mut Stack) {
     if defaults.is_null() {
         return;
     }
-    // Removal of a component without a default: nothing to remove; value equal to the default: useless.
-    f.retain(|(k, v)| match k.strip_prefix('!') {
-        Some(r) => !defaults[r].is_null(),
-        None => defaults[k.as_str()].is_null() || !crate::progress::pred::json_eq_nbt(&defaults[k.as_str()], v),
-    });
+    f.retain(|(k, v)| patch_entry_kept(&defaults, k, v));
     if f.is_empty() {
         s.components = None;
     }
+}
+
+/// An entry the reduced patch keeps: removal of a component without a default has nothing to
+/// remove, and a value equal to the default is useless.
+fn patch_entry_kept(defaults: &Value, key: &str, v: &Nbt) -> bool {
+    match key.strip_prefix('!') {
+        Some(r) => !defaults[r].is_null(),
+        None => defaults[key].is_null() || !crate::progress::pred::json_eq_nbt(&defaults[key], v),
+    }
+}
+
+/// `normalize_patch` would leave these components of item `id` exactly as they are (nothing
+/// dropped, not emptied into none), told without copying them.
+pub fn patch_already_reduced(id: &str, components: &Nbt) -> bool {
+    let Nbt::Compound(f) = components else { return true };
+    let defaults = defaults_of(id);
+    defaults.is_null() || (!f.is_empty() && f.iter().all(|(k, v)| patch_entry_kept(&defaults, k, v)))
 }
 
 /// Removal of a component through a patch (`!name`): recorded when the item carries it by

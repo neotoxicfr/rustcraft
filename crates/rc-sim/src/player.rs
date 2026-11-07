@@ -8,11 +8,26 @@ use rc_proto::nbt::Nbt;
 use crate::nbtio::{self, f32s, f64s, int, list};
 
 /// Stack from disk: identifier, quantity, components kept as is.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct Stack {
     pub id: String,
     pub count: i32,
     pub components: Option<Nbt>,
+}
+
+// Written by hand for `clone_from`: the derived one drops the target and copies anew, this one
+// keeps the target's identifier buffer (a menu's copy of what the client holds is overwritten
+// this way at each change).
+impl Clone for Stack {
+    fn clone(&self) -> Stack {
+        Stack { id: self.id.clone(), count: self.count, components: self.components.clone() }
+    }
+
+    fn clone_from(&mut self, source: &Stack) {
+        self.id.clone_from(&source.id);
+        self.count = source.count;
+        self.components.clone_from(&source.components);
+    }
 }
 
 impl Stack {
@@ -25,6 +40,23 @@ impl Stack {
             crate::items::normalize_patch(&mut s);
             s
         })
+    }
+
+    /// Whether `from_nbt(v)` would give exactly `held`, told without building the stack (an open
+    /// menu compares its copy with the saved contents every tick). `None`: the components are
+    /// not in reduced form, only the decoding can tell.
+    pub fn decodes_to(v: &Nbt, held: Option<&Stack>) -> Option<bool> {
+        let count = int(v, "count").unwrap_or(1) as i32;
+        let id = v.get("id").and_then(Nbt::as_str).filter(|&id| count > 0 && id != "minecraft:air");
+        let (Some(id), Some(held)) = (id, held) else { return Some(id.is_none() && held.is_none()) };
+        if held.id != id || held.count != count {
+            return Some(false);
+        }
+        let raw = v.get("components");
+        if raw.is_some_and(|c| !crate::items::patch_already_reduced(id, c)) {
+            return None;
+        }
+        Some(held.components.as_ref() == raw)
     }
 
     pub fn to_nbt(&self, slot: Option<i8>) -> Nbt {

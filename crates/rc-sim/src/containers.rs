@@ -38,6 +38,11 @@ pub(crate) fn furnace_kind(id: &str) -> Option<u8> {
     }
 }
 
+/// A source's slots replace an open menu's copy: same size and not equal (`pull_menu`'s rule).
+fn slots_differ(source: &[Option<Stack>], own: &[Option<Stack>]) -> bool {
+    source.len() == own.len() && source != own
+}
+
 fn cook_kind(k: u8) -> CookKind {
     match k {
         0 => CookKind::Smelting,
@@ -162,12 +167,7 @@ impl Server {
 
     /// Block entity at a position.
     pub(crate) fn block_entity(&self, p: [i32; 3]) -> Option<&Nbt> {
-        let c = self.chunks.get(&(p[0] >> 4, p[2] >> 4))?.as_ref()?;
-        c.block_entities.iter().find(|b| {
-            int(b, "x") == Some(i64::from(p[0]))
-                && int(b, "y") == Some(i64::from(p[1]))
-                && int(b, "z") == Some(i64::from(p[2]))
-        })
+        self.be_get(p)
     }
 
     /// Modifiable block entity (created if missing); the chunk becomes to-be-saved.
@@ -633,20 +633,29 @@ impl Server {
     /// dispenser, command) shows up on the client, and the next click starts from the real contents
     /// instead of overwriting the source with a stale copy.
     pub(crate) fn pull_menu(&mut self) {
+        // In place: the source is compared with the menu where it lies and decoded only when it
+        // differs (every tick otherwise decodes each stored stack of the open container).
+        let in_place = crate::menus::MenuSwitches::current().pull_without_decoding;
         // G5-F11: live data of the beacon (levels, effects) and of the crafter (disabled slots,
         // signal); crafter grid re-read (hoppers), shown result recomputed.
         if let Some((kind, Some(p))) = self.life.menu.as_ref().map(|m| (m.kind, m.block)) {
             match kind {
                 Kind::Beacon => {
-                    let d = self.beacon_data(p).to_vec();
+                    let d = self.beacon_data(p);
                     if let Some(m) = &mut self.life.menu {
-                        m.data = d;
+                        if in_place {
+                            m.data.clear();
+                            m.data.extend_from_slice(&d);
+                        } else {
+                            m.data = d.to_vec();
+                        }
                     }
                 }
                 Kind::Crafter => {
                     let d = self.crafter_data(p);
                     let dirty = self.life.menu.as_ref().is_some_and(|m| m.own_dirty);
-                    let grid = (!dirty).then(|| self.source_stacks(p)).filter(|g| g.len() == 9);
+                    let may_differ = !in_place || self.crafter_grid_may_differ(p);
+                    let grid = (!dirty && may_differ).then(|| self.source_stacks(p)).filter(|g| g.len() == 9);
                     let stale = grid.as_ref().zip(self.life.menu.as_ref()).is_some_and(|(g, m)| m.own[..9] != g[..]);
                     let result = grid.as_ref().filter(|_| stale).map(|g| self.crafter_result(g));
                     if let Some(m) = &mut self.life.menu {
@@ -664,8 +673,11 @@ impl Server {
         // Menu change not yet copied back to the source: the menu's copy is authoritative.
         let Some(m) = self.life.menu.as_ref().filter(|m| !m.own_dirty) else { return };
         let fresh: Option<Vec<Option<Stack>>> = match m.kind {
+            // An Ender chest equal to the menu (or of another size, never taken) is not copied.
+            Kind::Container { .. } if m.ender && in_place && !slots_differ(&self.life.vit.ender, &m.own) => None,
             Kind::Container { .. } if m.ender => Some(self.life.vit.ender.clone()),
             Kind::Container { .. } => match (m.block, m.block2) {
+                (Some(a), b) if in_place && self.container_source_changed(a, b, &m.own) == Some(false) => None,
                 (Some(a), Some(b)) => {
                     let mut v = self.source_stacks(a);
                     v.extend(self.source_stacks(b));
@@ -674,9 +686,11 @@ impl Server {
                 (Some(a), None) => Some(self.source_stacks(a)),
                 _ => None,
             },
-            Kind::Furnace(_) | Kind::Station(crate::stations::St::Brewing) => {
-                m.block.and_then(|p| self.live_items(p)).map(<[Option<Stack>]>::to_vec)
-            }
+            Kind::Furnace(_) | Kind::Station(crate::stations::St::Brewing) => m
+                .block
+                .and_then(|p| self.live_items(p))
+                .filter(|live| !in_place || slots_differ(live, &m.own))
+                .map(<[Option<Stack>]>::to_vec),
             _ => None,
         };
         if let Some(v) = fresh
@@ -686,6 +700,34 @@ impl Server {
         {
             m.own = v;
         }
+    }
+
+    /// Whether the stored contents of the open container (`a`, then the second half `b` of a
+    /// double chest) differ from the menu's copy `own`, told without decoding: `Some(false)` when
+    /// nothing is to be re-read (equal, or a size the menu cannot take, which `pull_menu` would
+    /// refuse as well), `None` when only the decoding can tell.
+    fn container_source_changed(&self, a: [i32; 3], b: Option<[i32; 3]>, own: &[Option<Stack>]) -> Option<bool> {
+        let (len_a, same_a) = self.stored_slots_match(a, own);
+        let (len_b, same_b) = match b {
+            Some(b) => self.stored_slots_match(b, own.get(len_a..).unwrap_or_default()),
+            None => (0, Some(true)),
+        };
+        if len_a + len_b != own.len() {
+            return Some(false);
+        }
+        match (same_a, same_b) {
+            (Some(true), Some(true)) => Some(false),
+            (Some(false), _) | (_, Some(false)) => Some(true),
+            _ => None,
+        }
+    }
+
+    /// The crafter's stored grid may differ from the open menu's (`false`: equal, or not a grid
+    /// of 9, which `pull_menu` would not take), told without decoding.
+    fn crafter_grid_may_differ(&self, p: [i32; 3]) -> bool {
+        let Some(own) = self.life.menu.as_ref().and_then(|m| m.own.get(..9)) else { return true };
+        let (len, same) = self.stored_slots_match(p, own);
+        len == 9 && same != Some(true)
     }
 
     /// Contents of a container with a block entity, as stacks (empty if the block entity has disappeared).

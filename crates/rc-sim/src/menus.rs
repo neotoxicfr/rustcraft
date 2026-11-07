@@ -107,6 +107,60 @@ pub enum Out {
     Data { prop: i16, value: i16 },
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: the menu switches used by this thread (every combination of the equivalence
+    /// proofs), without touching the environment.
+    pub(crate) static FORCED_SWITCHES: std::cell::Cell<Option<MenuSwitches>> = const { std::cell::Cell::new(None) };
+}
+
+/// Optimization switches of the menus (`docs/perf.md`, menus), each read once at the first use:
+/// on by default, `=0` takes the former way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MenuSwitches {
+    /// `RUSTCRAFT_OPT_MENU_BROADCAST_IN_PLACE`: the difference broadcast compares each slot and the
+    /// carried item with the client's copy where they lie, and copies a stack only when it sends it.
+    pub broadcast_in_place: bool,
+    /// `RUSTCRAFT_OPT_MENU_REMOTE_COPY_REUSE`: a client copy that changes is overwritten in place,
+    /// reusing its buffers, instead of being dropped and copied anew.
+    pub remote_copy_reuse: bool,
+    /// `RUSTCRAFT_OPT_MENU_PULL_WITHOUT_DECODING`: the open container's source is compared with the
+    /// menu straight from its saved form; it is decoded only when it differs.
+    pub pull_without_decoding: bool,
+    /// `RUSTCRAFT_OPT_MENU_FEWER_ALLOCATIONS`: clicks, bundles, trades and the packet flush read
+    /// the slots in place instead of copying them first.
+    pub fewer_allocations: bool,
+}
+
+impl MenuSwitches {
+    /// Every optimization on (the default).
+    #[cfg(test)]
+    pub(crate) const ALL_ON: MenuSwitches =
+        MenuSwitches { broadcast_in_place: true, remote_copy_reuse: true, pull_without_decoding: true, fewer_allocations: true };
+    /// Every optimization off (the former code).
+    #[cfg(test)]
+    pub(crate) const ALL_OFF: MenuSwitches = MenuSwitches {
+        broadcast_in_place: false,
+        remote_copy_reuse: false,
+        pull_without_decoding: false,
+        fewer_allocations: false,
+    };
+
+    pub(crate) fn current() -> MenuSwitches {
+        #[cfg(test)]
+        if let Some(forced) = FORCED_SWITCHES.with(std::cell::Cell::get) {
+            return forced;
+        }
+        static SWITCHES: std::sync::OnceLock<MenuSwitches> = std::sync::OnceLock::new();
+        *SWITCHES.get_or_init(|| MenuSwitches {
+            broadcast_in_place: rc_data::opt_switch!("RUSTCRAFT_OPT_MENU_BROADCAST_IN_PLACE"),
+            remote_copy_reuse: rc_data::opt_switch!("RUSTCRAFT_OPT_MENU_REMOTE_COPY_REUSE"),
+            pull_without_decoding: rc_data::opt_switch!("RUSTCRAFT_OPT_MENU_PULL_WITHOUT_DECODING"),
+            fewer_allocations: rc_data::opt_switch!("RUSTCRAFT_OPT_MENU_FEWER_ALLOCATIONS"),
+        })
+    }
+}
+
 /// What the menu asks of the server.
 pub trait Env {
     fn items(&self) -> &Items;
@@ -357,6 +411,9 @@ impl Menu {
         let Some(info) = &self.mount else { return false };
         if !info.active[usize::from(slot == 6)] || env.items().equip_slot(s) != Some(slot) {
             return false;
+        }
+        if MenuSwitches::current().fewer_allocations {
+            return mount_allows(env, s, info);
         }
         let allowed: Vec<String> = match crate::items::component(s, "minecraft:equippable") {
             Some(e) => match e.get("allowed_entities") {
@@ -721,9 +778,52 @@ impl Menu {
     }
 
     fn next_state(&mut self) -> i32 {
-        self.state = (self.state + 1) & 0x7FFF;
-        self.state
+        advance_state(&mut self.state)
     }
+}
+
+/// The next state number of a menu (15 bits, wrapping), stored and returned.
+fn advance_state(state: &mut i32) -> i32 {
+    *state = (*state + 1) & 0x7FFF;
+    *state
+}
+
+/// The client's copy of a slot becomes exactly `cur`. With `reuse`, a copy that already holds a
+/// stack is overwritten in place: its identifier and component buffers are kept.
+fn remember_exact(remote: &mut Remote, cur: Option<&Stack>, reuse: bool) {
+    match (remote, cur) {
+        (Remote::Exact(Some(old)), Some(new)) if reuse => old.clone_from(new),
+        (remote, cur) => *remote = Remote::Exact(cur.cloned()),
+    }
+}
+
+/// The equippable component's allowed entities (patch first, then the item's default) let the
+/// mount wear the stack; no list means every entity. Read in place, nothing copied.
+fn mount_allows(env: &dyn Env, s: &Stack, info: &MountInfo) -> bool {
+    let fits = |a: &str| match a.strip_prefix('#') {
+        Some(t) => info.tags.iter().any(|x| x == t),
+        None => a == info.name,
+    };
+    match crate::items::component(s, "minecraft:equippable") {
+        Some(e) => match e.get("allowed_entities") {
+            Some(rc_proto::nbt::Nbt::String(t)) => fits(t),
+            Some(rc_proto::nbt::Nbt::List(l)) => l.iter().filter_map(rc_proto::nbt::Nbt::as_str).any(fits),
+            _ => true,
+        },
+        None => {
+            let default = env.items().default_component(s, "minecraft:equippable");
+            match default.as_ref().map(|v| &v["allowed_entities"]) {
+                Some(serde_json::Value::String(t)) => fits(t),
+                Some(serde_json::Value::Array(a)) => a.iter().filter_map(serde_json::Value::as_str).any(fits),
+                _ => true,
+            }
+        }
+    }
+}
+
+/// Order in which a slot range is walked (`back`: from the last slot down), without a list.
+fn slot_order(start: usize, end: usize, back: bool) -> impl Iterator<Item = usize> {
+    (start..end).map(move |k| if back { end - 1 - (k - start) } else { k })
 }
 
 // --- Clicks ---
@@ -758,9 +858,15 @@ impl Menu {
     pub fn click(&mut self, env: &mut dyn Env, inv: &mut [Option<Stack>], slot: i16, button: i8, mode: i32) {
         let n = self.len();
         let idx = usize::try_from(slot).ok().filter(|&i| i < n);
+        let fewer_copies = MenuSwitches::current().fewer_allocations;
         let grid_before = self.grid_snapshot(inv);
         let own_before = matches!(self.kind, Kind::Station(_)).then(|| self.own.clone());
-        let pay_before = (self.own.first().cloned().flatten(), self.own.get(1).cloned().flatten());
+        // Only a trade reads the payments back; the former way copied them for every menu.
+        let pay_before = if fewer_copies && self.kind != Kind::Merchant {
+            (None, None)
+        } else {
+            (self.own.first().cloned().flatten(), self.own.get(1).cloned().flatten())
+        };
         let crafter_before = (self.kind == Kind::Crafter).then(|| self.own.clone());
         self.do_click(env, inv, slot, idx, i32::from(button), mode);
         // G5-F11: crafter grid changed → shown result recomputed.
@@ -770,7 +876,8 @@ impl Menu {
         if self.kind == Kind::Merchant && (self.own[0] != pay_before.0 || self.own[1] != pay_before.1) {
             self.update_sell_item(env);
         }
-        if self.grid.is_some() && self.grid_snapshot(inv) != grid_before {
+        let grid_changed = if fewer_copies { !self.grid_equals(inv, &grid_before) } else { self.grid_snapshot(inv) != grid_before };
+        if self.grid.is_some() && grid_changed {
             self.update_result(env, inv);
         }
         // S7: inputs of a station changed → result recomputed.
@@ -783,6 +890,16 @@ impl Menu {
         match self.grid {
             Some((first, w)) => (first..first + w * w).map(|j| self.get(inv, j).cloned()).collect(),
             None => Vec::new(),
+        }
+    }
+
+    /// The crafting grid still equals `before` (a `grid_snapshot`), read in place.
+    fn grid_equals(&self, inv: &[Option<Stack>], before: &[Option<Stack>]) -> bool {
+        match self.grid {
+            Some((first, w)) => {
+                before.len() == w * w && before.iter().enumerate().all(|(n, b)| self.get(inv, first + n) == b.as_ref())
+            }
+            None => before.is_empty(),
         }
     }
 
@@ -981,6 +1098,11 @@ impl Menu {
                 }
                 let n = self.len();
                 let max = env.items().max_stack(&carried);
+                if MenuSwitches::current().fewer_allocations {
+                    self.gather_in_place(env, inv, &mut carried, button != 0);
+                    self.carried = Some(carried);
+                    return;
+                }
                 for pass in 0..2 {
                     let order: Vec<usize> = if button == 0 { (0..n).collect() } else { (0..n).rev().collect() };
                     for t in order {
@@ -1005,6 +1127,33 @@ impl Menu {
                 self.carried = Some(carried);
             }
             _ => {}
+        }
+    }
+
+    /// Gathering onto the carried stack (double click), each slot read where it lies: two
+    /// passes, the full stacks only on the second.
+    fn gather_in_place(&mut self, env: &mut dyn Env, inv: &mut [Option<Stack>], carried: &mut Stack, back: bool) {
+        let max = env.items().max_stack(carried);
+        for pass in 0..2 {
+            for t in slot_order(0, self.len(), back) {
+                if carried.count >= max {
+                    break;
+                }
+                let Some(ts) = self.get(inv, t) else { continue };
+                let (count, full) = (ts.count, ts.count == env.items().max_stack(ts));
+                if !quick_replace(env.items(), Some(ts), carried, true)
+                    || !self.may_pickup(env, inv, t)
+                    || self.slots[t].role == Role::CraftResult
+                    || (self.slots[t].role == Role::StationResult && crate::stations::no_pick_all(self))
+                {
+                    continue;
+                }
+                if (pass != 0 || !full)
+                    && let Some(r) = self.safe_take(env, inv, t, count, max - carried.count)
+                {
+                    carried.count += r.count;
+                }
+            }
         }
     }
 
@@ -1067,6 +1216,9 @@ impl Menu {
         end: usize,
         back: bool,
     ) -> bool {
+        if MenuSwitches::current().fewer_allocations {
+            return self.move_to_in_place(env, inv, s, start, end, back);
+        }
         let mut changed = false;
         let items = env.items();
         let order: Vec<usize> = if back { (start..end).rev().collect() } else { (start..end).collect() };
@@ -1106,6 +1258,67 @@ impl Menu {
             }
         }
         changed
+    }
+
+    /// `move_to` without copies: the slots are walked in order without a list, and a stack that
+    /// receives items has its count raised where it lies instead of being copied and put back.
+    fn move_to_in_place(
+        &mut self,
+        env: &dyn Env,
+        inv: &mut [Option<Stack>],
+        s: &mut Stack,
+        start: usize,
+        end: usize,
+        back: bool,
+    ) -> bool {
+        let mut changed = false;
+        let items = env.items();
+        // Stackable: size > 1 and not damaged.
+        if items.max_stack(s) > 1 && items.damage(s) == 0 {
+            for d in slot_order(start, end, back) {
+                if s.count <= 0 {
+                    break;
+                }
+                let Some(t) = self.get(inv, d) else { continue };
+                if !same(t, s) {
+                    continue;
+                }
+                let (have, max) = (t.count, self.max_slot(items, d, t));
+                let total = have + s.count;
+                if total <= max {
+                    s.count = 0;
+                    self.set_count(inv, d, total);
+                    changed = true;
+                } else if have < max {
+                    s.count -= max - have;
+                    self.set_count(inv, d, max);
+                    changed = true;
+                }
+            }
+        }
+        if s.count > 0 {
+            for d in slot_order(start, end, back) {
+                if self.get(inv, d).is_none() && self.may_place(env, d, s) {
+                    let max = self.max_slot(items, d, s);
+                    let n = s.count.min(max);
+                    self.set(inv, d, Some(Stack { count: n, ..s.clone() }));
+                    s.count -= n;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        changed
+    }
+
+    /// The stack of slot `i` takes the count `n` where it lies (emptied at 0 or below, like `set`).
+    fn set_count(&mut self, inv: &mut [Option<Stack>], i: usize, n: i32) {
+        let slot = self.get_mut(inv, i);
+        if n <= 0 {
+            *slot = None;
+        } else if let Some(st) = slot.as_mut() {
+            st.count = n;
+        }
     }
 
     /// The quick move of a menu stack: returns the original stack (copy) if something moved.
@@ -1292,6 +1505,11 @@ impl Menu {
 
     /// Full contents.
     pub fn send_all(&mut self, inv: &[Option<Stack>]) {
+        let switches = MenuSwitches::current();
+        if switches.broadcast_in_place {
+            self.send_all_in_place(inv, switches.remote_copy_reuse);
+            return;
+        }
         let slots: Vec<Option<Stack>> = (0..self.len()).map(|i| self.get(inv, i).cloned()).collect();
         for (r, s) in self.remote.iter_mut().zip(&slots) {
             *r = Remote::Exact(s.clone());
@@ -1319,8 +1537,58 @@ impl Menu {
         }
     }
 
+    /// `send_all` without the second list of copies: each client copy is written from the packet's
+    /// list, and the properties are walked by index instead of from a copy.
+    fn send_all_in_place(&mut self, inv: &[Option<Stack>], reuse: bool) {
+        let slots: Vec<Option<Stack>> = (0..self.len()).map(|i| self.get(inv, i).cloned()).collect();
+        for (r, s) in self.remote.iter_mut().zip(&slots) {
+            remember_exact(r, s.as_ref(), reuse);
+        }
+        remember_exact(&mut self.remote_carried, self.carried.as_ref(), reuse);
+        self.remote_data.clone_from(&self.data);
+        let state = self.next_state();
+        self.out.push(Out::Content { state, slots, carried: self.carried.clone() });
+        for (i, &v) in self.data.iter().enumerate() {
+            self.out.push(Out::Data { prop: i as i16, value: v as i16 });
+        }
+    }
+
     /// Differences sent.
     pub fn broadcast(&mut self, env: &dyn Env, inv: &[Option<Stack>]) {
+        let switches = MenuSwitches::current();
+        if switches.broadcast_in_place {
+            self.broadcast_in_place(env, inv, switches.remote_copy_reuse);
+        } else {
+            self.broadcast_by_copies(env, inv);
+        }
+    }
+
+    /// The broadcast reading each slot where it lies: a slot equal to the client's copy costs no
+    /// copy at all; a changed one costs two (the client's new copy, the packet's stack).
+    fn broadcast_in_place(&mut self, env: &dyn Env, inv: &[Option<Stack>], reuse: bool) {
+        for i in 0..self.slots.len() {
+            // Fields borrowed one by one (`self.get` would hold the whole menu while the client's
+            // copy, the state and the packet list are written).
+            let cur = match self.slots[i].src {
+                Src::Inv(k) => inv[k].as_ref(),
+                Src::Own(k) => self.own[k].as_ref(),
+            };
+            if Self::remote_matches(&mut self.remote[i], cur, env) {
+                continue;
+            }
+            remember_exact(&mut self.remote[i], cur, reuse);
+            let state = advance_state(&mut self.state);
+            self.out.push(Out::Slot { state, slot: i as i16, stack: cur.cloned() });
+        }
+        if !Self::remote_matches(&mut self.remote_carried, self.carried.as_ref(), env) {
+            remember_exact(&mut self.remote_carried, self.carried.as_ref(), reuse);
+            self.out.push(Out::Cursor(self.carried.clone()));
+        }
+        self.broadcast_data();
+    }
+
+    /// The former broadcast: every slot copied before being compared.
+    fn broadcast_by_copies(&mut self, env: &dyn Env, inv: &[Option<Stack>]) {
         for i in 0..self.len() {
             let cur = self.get(inv, i).cloned();
             let mut r = std::mem::replace(&mut self.remote[i], Remote::Exact(None));
@@ -1339,6 +1607,11 @@ impl Menu {
             self.remote_carried = Remote::Exact(self.carried.clone());
             self.out.push(Out::Cursor(self.carried.clone()));
         }
+        self.broadcast_data();
+    }
+
+    /// Menu properties that changed since the last send.
+    fn broadcast_data(&mut self) {
         for i in 0..self.data.len() {
             if self.remote_data[i] != self.data[i] {
                 self.remote_data[i] = self.data[i];
