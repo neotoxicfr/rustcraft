@@ -566,6 +566,40 @@ fn check_mode_catches_a_wrong_reach() {
     }
 }
 
+/// A micro-bench skipping the walk check on its own thread leaves it on for a test running beside
+/// it: while a second thread holds the skip, a wrong reach still panics here, and not there.
+#[test]
+fn skipped_walk_check_stays_on_its_thread() {
+    let Some(d) = data() else { return };
+    let t = Tables::new(&d);
+    let low_top = Mix { reach: Aabb::UNIT, ..mix(&t, &d) };
+    let boxes = walk_boxes(&low_top);
+    let a_walk_panics = || {
+        boxes.iter().any(|b| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| collect(&low_top, b, &mut Vec::new()))).is_err()
+        })
+    };
+    let (skip_held, checked_here) = (std::sync::Barrier::new(2), std::sync::Barrier::new(2));
+    std::thread::scope(|sc| {
+        let bench = sc.spawn(|| {
+            let _check_skipped = crate::collide::skip_walk_check_on_this_thread();
+            skip_held.wait();
+            checked_here.wait();
+            a_walk_panics()
+        });
+        skip_held.wait();
+        // Asserted once both threads are past the barriers, so a failure never leaves one waiting.
+        let checked_beside = a_walk_panics();
+        checked_here.wait();
+        let bench_checked = bench.join().expect("bench thread");
+        assert!(checked_beside, "the check must stay on beside a bench");
+        // `RUSTCRAFT_COLLISION_WALK_CHECK=1` checks every walk, the bench's included.
+        if rc_data::env_str!("RUSTCRAFT_COLLISION_WALK_CHECK") != Some("1") {
+            assert!(!bench_checked, "the bench's own walks are not checked");
+        }
+    });
+}
+
 /// Both switches of `resolve` on (the default).
 const NEW_RESOLVE: ResolvePath = ResolvePath { walk: NEW_WALK, no_copy: true };
 
@@ -593,12 +627,17 @@ fn resolve_without_copies_identical() {
     assert!(stepped > 300 && by_entity > 50, "coverage: {stepped} step-ups, {by_entity} movements changed by an entity");
 }
 
-/// Time per call of `f` (ns), on `threads` threads that each make `n` calls.
+/// Time per call of `f` (ns), on `threads` threads that each make `n` calls, the walk check skipped
+/// on them (micro-benches only).
 fn per_call(threads: usize, n: usize, f: impl Fn(usize) -> u64 + Sync) -> f64 {
     let f = &f;
     let t0 = std::time::Instant::now();
     let sink: u64 = std::thread::scope(|sc| {
-        let hs: Vec<_> = (0..threads).map(|k| sc.spawn(move || (0..n).map(|i| f(i + k)).fold(0u64, u64::wrapping_add))).collect();
+        let measured = move |k: usize| {
+            let _check_skipped = crate::collide::skip_walk_check_on_this_thread();
+            (0..n).map(|i| f(i + k)).fold(0u64, u64::wrapping_add)
+        };
+        let hs: Vec<_> = (0..threads).map(|k| sc.spawn(move || measured(k))).collect();
         hs.into_iter().map(|h| h.join().expect("thread")).fold(0, u64::wrapping_add)
     });
     std::hint::black_box(sink);
@@ -637,7 +676,7 @@ fn bench_collision_top() {
 fn bench_is_free() {
     let Some(d) = data() else { return };
     let t = Tables::new(&d);
-    crate::collide::WALK_CHECK_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _check_skipped = crate::collide::skip_walk_check_on_this_thread();
     let w = mix(&t, &d);
     let bs = boxes(100_000, &w);
     let paths = [IsFreePath::CollectAll, IsFreePath::FirstOverlap, IsFreePath::FirstOverlapSharedBuffer];
@@ -765,7 +804,7 @@ const BENCH_PATHS: [(&str, ResolvePath); 6] = [
 #[ignore = "micro-bench"]
 fn bench_resolve_and_support() {
     let Some(d) = data() else { return };
-    crate::collide::WALK_CHECK_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _check_skipped = crate::collide::skip_walk_check_on_this_thread();
     let t = Tables::new(&d);
     let mixed = Mix { movers: Vec::new(), ..mix(&t, &d) };
     let plain = ground(&t, &d);

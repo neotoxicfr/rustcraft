@@ -570,7 +570,7 @@ mod tests {
     #[test]
     #[ignore]
     fn bench_collision_moving_check() {
-        crate::collide::WALK_CHECK_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _check_skipped = crate::collide::skip_walk_check_on_this_thread();
         let d = rc_testdata::version_data().expect("version data absent (extraction)");
         let t = Tables::new(&d);
         let stone = d.blocks.iter().find(|b| b.name == "minecraft:stone").expect("stone").default_state;

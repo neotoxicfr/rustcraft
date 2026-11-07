@@ -114,15 +114,36 @@ impl WalkPath {
     }
 }
 
-/// Micro-benches of this crate's tests: the check of every walk would be timed with them.
 #[cfg(test)]
-pub(crate) static WALK_CHECK_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+thread_local! {
+    /// Set by the micro-benches of this crate's tests on their own threads only: a flag shared by
+    /// the whole process would turn the check off for the tests running beside them.
+    static WALK_CHECK_SKIPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Skips the check of every walk on this thread until dropped (a micro-bench would time it).
+#[cfg(test)]
+pub(crate) struct WalkCheckSkipped {
+    before: bool,
+}
+
+#[cfg(test)]
+pub(crate) fn skip_walk_check_on_this_thread() -> WalkCheckSkipped {
+    WalkCheckSkipped { before: WALK_CHECK_SKIPPED.replace(true) }
+}
+
+#[cfg(test)]
+impl Drop for WalkCheckSkipped {
+    fn drop(&mut self) {
+        WALK_CHECK_SKIPPED.set(self.before);
+    }
+}
 
 /// `RUSTCRAFT_COLLISION_WALK_CHECK=1` (and always in this crate's tests, benches aside): every
 /// trimmed or batched walk is compared with the whole one and panics on the first difference.
 fn walk_check() -> bool {
     #[cfg(test)]
-    if !WALK_CHECK_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+    if !WALK_CHECK_SKIPPED.get() {
         return true;
     }
     rc_data::env_str!("RUSTCRAFT_COLLISION_WALK_CHECK") == Some("1")
