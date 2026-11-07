@@ -9220,3 +9220,64 @@ points, not the 49 and 121 the mission expected: the micro-bench covers all four
   reference exe), each switch at 0 alone (`NOISE_BATCH_POINTS`, `NOISE_BATCH_AVX2`,
   `NOISE_BATCH_SHARED_CELL`, `NOISE_XPRE`, `NOISE_XY_PERM_TABLE`), then all five at 0.
 
+## C3-M04 (series 3): frame visibility as a concrete test, particles culled like the game, lazy and cached particle light, particle writes through the ring (07/11, loaded machine)
+
+Hot spot (C3-M01 hot map, tnt): `render::visibility` 4.6 % self, 9.5 % with `aabb_visible` (3.5 %),
+84 % of it from the particles' per-frame test (one box test with occlusion per particle, behind a
+closure pointer, six C library floors per box); the particle light read the world at every frame,
+the full-bright kinds included. Everything behind switches read once (default 1, `=0` = path
+before). Micro-benches: `cargo test --release -p rc-app <name> -- --ignored --nocapture`
+(trial profile, one thread, machine loaded by other agents' builds: orders of magnitude only).
+
+| Lead (switch) | Micro-bench | Decision until the scenes |
+|---|---|---|
+| concrete `FrameVisibility` lent to entities, block entities, leashes, debug, particles (no switch: the type) + `FRAMEVISIBILITY` (floors without the C library, reached grid clamped once per axis) | boxes 24.82 → 22.63 ns (`frame_visibility_bench`, 10⁶ entity boxes) | on |
+| `REACHYMASK` (a column's heights as one bit run) | 22.63 → 22.71 ns (nothing: one to three sections per box) | on (no loss; tall boxes, debug) |
+| `PLANE_MASKS` (the corner each plane tests chosen once per frame) | 22.63 → 20.15 ns; all box paths 20.10 ns | on |
+| `POINTVISIBILITY` (points: six dot products, one bit on blocks 1 to 13 of a section) | points 24.55 → 18.25 ns (18.14 with all) | on (only with `PARTICLE_GAME_FRUSTUM=0`) |
+| `PARTICLE_GAME_FRUSTUM` (the game's point test, eye moved back three view vectors, no occlusion; A3) | 22.30 ns (entities' test) → 10.06 ns per particle (`particle_frustum_bench`) | on |
+| `PARTICLE_FRUSTUM_SIMD` (six planes in two SSE2 groups of four, same order, no FMA) | 10.06 → 4.09 ns | on |
+| `LAZY_PARTICLE_LIGHT` (world read only by the kinds that use it) | 16,000 particles in view, TNT-like mix (3 explosions : 1 smoke : 1 poof): 390 → 273 µs per frame; ordinary kinds: 391 → 412 (noise: nothing to skip) | on |
+| `PARTICLE_LIGHT_EPOCH_CACHE` (per particle: last read, block, grid write epoch) | TNT mix 390 → 227 (204 with lazy); ordinary 391 → 226 (237 with lazy); world written every frame: 276 and 414 (the check costs nothing visible) | on |
+| `PARTICLE_WRITE_WITH` (axes and instances through `FrameBuffer`, one write filled in the transit) | GPU, writes + submission, in a frame where another layer already uses the ring: 1,000 particles 15.2 → 12.9 µs, 4,000 21.9 → 19.8, 16,000 53.1 → 46.9; 3 staging buffers fewer per frame, 47 to 750 KB now in `gpu_kb_written_per_frame`. Alone (transit command buffer made for the particles only): 16,000 46.9 → 69.2, not the client's case | on |
+
+- Fidelity (A3, `docs/specs/visibility.md`, particles): the game tests a particle's tick position
+  as a point against its culling frustum with the eye moved back by three view vectors (the depth
+  row of its culling matrix, depth mapped to [0, 1]: the look direction × far / (far − near)), and
+  never against the occlusion walk. Before, a particle whose centre was just off screen vanished
+  at the edge, and one in an unreached section was hidden. Our near plane is not the game's (its
+  [−1, 1] rule puts it at half the distance, three blocks behind the camera: never on screen).
+- Fidelity fix (separate commit): a particle's light is full light inside a block drawn emissive,
+  and its block layer is at least the block's own emission; absent column: block 0, sky 15 (already
+  so). Costs one block-state read per particle that reads the light (amortised by the cache).
+- Grid write epoch (`rc-world` `ChunkGrid::epoch`): the stamp of the last write access to any cell
+  or of a resize, one load; the particle cache is keyed on it and on the block, not reset at each
+  tick (with ticks frozen the grid still changes). 24 bytes per particle.
+- Proofs: 16 path combinations × 10⁵ boxes and points (one float step either side of section
+  faces, out of the world in height, NaN, infinities, huge), grid and set, occlusion off, no walk:
+  same verdicts, class included; sabotages caught (edge block taken as inside, neighbours ignored,
+  and by hand: plane corner flipped, run mask one bit short). Particles against a rebuild of the
+  game's test (float matrix, normalised planes, eye moved in doubles), 10⁵ points: no difference
+  outside float rounding; sabotages (eye not moved back, occlusion kept) caught. Light: instances
+  byte for byte under the four combinations, after a light write and an unload with no tick;
+  sabotages (stale epoch, flames as full bright) caught. Writes: buffers read back from the GPU
+  byte for byte equal through queue, ring, uploader without ring; sabotage caught.
+- Placement: one caller per frame on the main thread, a few microseconds of work: several cores
+  would cost more in task hand-overs than they spread. GPU culling: left to C3-M19 (an atomic
+  compaction would change the order of the translucent instances).
+- Not done, by the mission's own conditions or measured reasons: per-section memo of the box
+  verdicts (`SECTIONVERDICT`, only if the `visibility_*_per_frame` shares on the quiet bench show
+  enough boxes inside fully visible sections; at 20 ns per box a crowd of 1,000 spends about 20 µs);
+  particle section cache (`PARTICLE_SECTION_CULL_CACHE`: the SIMD point test is already at 4 ns);
+  four points per SIMD lane group (`AABBSIMD`: the loop is bound by reading the ~400-byte particles);
+  the four side planes shared with the draw lists (planes computed once per frame: nothing to win).
+  Direct encoding of the instances into the transit at prepare time: the opaque/translucent split
+  is known only after the walk, and a second walk over the particles costs more than one copy.
+- The perf log's `visibility_*_per_frame` counters no longer include the particles (they no longer
+  take the entities' test); compare them across this change only with `PARTICLE_GAME_FRUSTUM=0`.
+- To measure on the quiet machine: tnt, fireworks, particles-1000/4000/16000, ocean, redstone, cave,
+  crowd-1000, dropped-items, nether, plains32, flight (2 alternating passes, reference exe), the
+  particles' `RUSTCRAFT_PARTICLES_STATS` (prepare ms per frame) and frame p99; each switch at 0 alone,
+  then all; 1600×900 captures in one launch with particles at the screen edge near the camera
+  (intended difference) and behind terrain (the depth must hide them).
+
