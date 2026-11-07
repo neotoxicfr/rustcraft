@@ -7,7 +7,8 @@ use super::super::jrand::JRand;
 use super::super::mob::{Ent, Mob};
 use super::super::nav::Path as NavPath;
 use super::super::species::Kind;
-use super::brain::{Act, Brain, GPos, M, Node, St, Track, Walk, b, dist2, gate, idle, o, run_one};
+use super::brain::{Act, Brain, GPos, M, Node, Sensed, St, Track, Walk, b, dist2, gate, idle, o, run_one};
+use super::switches;
 use super::{PROF_FARMER, PROF_NITWIT, PROF_NONE};
 use crate::player::Stack;
 use crate::poi::{Occupancy, PoiType};
@@ -49,7 +50,18 @@ pub enum Beh {
     Swim,
     LookAtTarget,
     PanicTrigger,
-    MoveToTarget { min: i32, max: i32, cooldown: i32, path: Option<Box<NavPath>>, last: Option<[i32; 3]>, speed: f32 },
+    /// Walk to the walk target. `path`: the path just computed; with
+    /// `RUSTCRAFT_OPT_VILLAGER_MOVE_PATHS` it is moved into the navigation when handed over and
+    /// `has_path` keeps whether the behaviour holds one (the old path keeps a copy and reads it).
+    MoveToTarget {
+        min: i32,
+        max: i32,
+        cooldown: i32,
+        path: Option<Box<NavPath>>,
+        has_path: bool,
+        last: Option<[i32; 3]>,
+        speed: f32,
+    },
     FollowTrader,
     GoToPotentialJobSite,
     WorkAtPoi { last_check: i64, composter: bool },
@@ -152,24 +164,30 @@ pub enum Trig {
 }
 
 impl Beh {
-    pub fn entry(&self) -> Vec<(M, St)> {
+    /// Memory conditions to start, as a table of the program (nothing built at each try).
+    pub fn entry_table(&self) -> &'static [(M, St)] {
         use M::*;
         use St::*;
         match self {
-            Beh::LookAtTarget => vec![(Look, Present)],
-            Beh::MoveToTarget { .. } => vec![(Path, Absent), (Walk, Present)],
-            Beh::GoToPotentialJobSite => vec![(PotentialJobSite, Present)],
-            Beh::WorkAtPoi { .. } => vec![(JobSite, Present)],
-            Beh::Harvest { .. } => vec![(Look, Absent), (Walk, Absent), (Secondary, Present)],
-            Beh::Bonemeal { .. } => vec![(Look, Absent), (Walk, Absent)],
-            Beh::ShowTrades { .. } => vec![(Interaction, Present)],
-            Beh::GiveGift { .. } => vec![(VisiblePlayer, Present)],
-            Beh::JumpOnBed { .. } => vec![(NearestBed, Present), (Walk, Absent)],
-            Beh::SleepInBed { .. } => vec![(Home, Present)],
-            Beh::TradeWithVillager { .. } => vec![(Interaction, Present), (Visible, Present)],
-            Beh::MakeLove { .. } => vec![(Breed, Present), (Visible, Present)],
-            _ => Vec::new(),
+            Beh::LookAtTarget => &[(Look, Present)],
+            Beh::MoveToTarget { .. } => &[(Path, Absent), (Walk, Present)],
+            Beh::GoToPotentialJobSite => &[(PotentialJobSite, Present)],
+            Beh::WorkAtPoi { .. } => &[(JobSite, Present)],
+            Beh::Harvest { .. } => &[(Look, Absent), (Walk, Absent), (Secondary, Present)],
+            Beh::Bonemeal { .. } => &[(Look, Absent), (Walk, Absent)],
+            Beh::ShowTrades { .. } => &[(Interaction, Present)],
+            Beh::GiveGift { .. } => &[(VisiblePlayer, Present)],
+            Beh::JumpOnBed { .. } => &[(NearestBed, Present), (Walk, Absent)],
+            Beh::SleepInBed { .. } => &[(Home, Present)],
+            Beh::TradeWithVillager { .. } => &[(Interaction, Present), (Visible, Present)],
+            Beh::MakeLove { .. } => &[(Breed, Present), (Visible, Present)],
+            _ => &[],
         }
+    }
+
+    /// The same conditions in a new vector (old path of `RUSTCRAFT_OPT_VILLAGER_NO_TICK_ALLOCATIONS`).
+    pub fn entry(&self) -> Vec<(M, St)> {
+        self.entry_table().to_vec()
     }
 
     pub fn duration(&self) -> (i32, i32) {
@@ -224,7 +242,8 @@ pub fn packages(baby: bool, prof: i32) -> Vec<(i32, Act, Node)> {
         kids.push((idle(30, 60), 2));
         (5, run_one(kids))
     };
-    let move_to = |min, max| b(Beh::MoveToTarget { min, max, cooldown: 0, path: None, last: None, speed: 0.0 });
+    let move_to =
+        |min, max| b(Beh::MoveToTarget { min, max, cooldown: 0, path: None, has_path: false, last: None, speed: 0.0 });
     // Work or play (added before the core).
     if baby {
         add(
@@ -505,6 +524,83 @@ pub fn walk_and_look(b: &mut Brain, t: Track, speed: f32, close: i32) {
     b.mem.walk = Some(Walk { target: t, speed, close });
 }
 
+/// The retry delay of `pos` lets it be tried now (never tried: yes; due: yes, delay drawn again).
+fn retry_allows(cache: &mut [([i32; 3], Retry)], rng: &mut JRand, pos: [i32; 3], t: i64) -> bool {
+    match cache.iter_mut().find(|c| c.0 == pos) {
+        None => true,
+        Some(c) if t >= c.1.next => {
+            c.1.mark(rng, t);
+            true
+        }
+        Some(_) => false,
+    }
+}
+
+/// The path computed by the walk, for the navigation: moved out of the behaviour
+/// (`RUSTCRAFT_OPT_VILLAGER_MOVE_PATHS`; the behaviour then keeps only `has_path`) or, on the old
+/// path, copied with every node.
+fn hand_over(path: &mut Option<Box<NavPath>>) -> Option<NavPath> {
+    if switches::move_paths() { path.take().map(|p| *p) } else { path.as_deref().cloned() }
+}
+
+/// The game's crop blocks and the age at which each is ripe, by block identifier.
+#[derive(Debug, Clone, Copy)]
+pub struct CropBlocks {
+    ripe_age: [(u16, i32); 5],
+}
+
+impl CropBlocks {
+    /// The crops' identifiers through `block_id` (block name without namespace).
+    fn resolve(block_id: impl Fn(&str) -> u16) -> CropBlocks {
+        // Age 2 of the torchflower crop is the flower itself: never "ripe" as a sprout.
+        let crops = [("wheat", 7), ("carrots", 7), ("potatoes", 7), ("beetroots", 3), ("torchflower_crop", 2)];
+        CropBlocks { ripe_age: crops.map(|(name, age)| (block_id(name), age)) }
+    }
+
+    /// Ripe age of `block` if it is a crop (an unknown identifier is never one).
+    fn ripe_age(&self, block: u16) -> Option<i32> {
+        if block == u16::MAX {
+            return None;
+        }
+        self.ripe_age.iter().find(|c| c.0 == block).map(|c| c.1)
+    }
+}
+
+/// The list of a memory lent (`RUSTCRAFT_OPT_VILLAGER_NO_TICK_ALLOCATIONS`) or, on the old path,
+/// first copied into `copy`. Lending is enough: the readers only change other memories meanwhile.
+fn lent_or_copied<'a, T: Clone>(list: &'a Option<Vec<T>>, copy: &'a mut Option<Vec<T>>) -> Option<&'a [T]> {
+    if switches::no_tick_allocations() {
+        return list.as_deref();
+    }
+    copy.clone_from(list);
+    copy.as_deref()
+}
+
+/// Species `kind` is of the gaze kind `k`.
+fn kind_is(kind: Kind, k: LookKind) -> bool {
+    match k {
+        LookKind::Cat => kind == Kind::Cat,
+        LookKind::Villager => kind == Kind::Villager,
+        LookKind::Player => false,
+        LookKind::Category(c) => {
+            // Full gaze order: creature, aquatic, axolotls, underground aquatic,
+            // aquatic ambient, monster.
+            use super::super::species::Category as C;
+            const ORDER: [C; 6] =
+                [C::Creature, C::WaterCreature, C::Axolotls, C::UndergroundWaterCreature, C::WaterAmbient, C::Monster];
+            ORDER.get(usize::from(c)).is_some_and(|&want| kind.info().category == want)
+        }
+    }
+}
+
+/// The species the sensor read for `x` is of the gaze kind `k` (the player has none).
+fn sensed_kind_is(x: Sensed, k: LookKind) -> bool {
+    match x.kind {
+        None => k == LookKind::Player,
+        Some(kind) => kind_is(kind, k),
+    }
+}
+
 /// Profession → held job-site POI.
 pub fn job_poi(prof: i32) -> Option<PoiType> {
     let name = super::super::variants::PROFESSIONS.get(prof as usize)?;
@@ -558,20 +654,27 @@ impl Server {
 
     pub(crate) fn ent_is(&self, e: Ent, k: LookKind) -> bool {
         let Ent::Mob(id) = e else { return k == LookKind::Player };
-        let Some(o) = self.mob_ref(id) else { return false };
-        match k {
-            LookKind::Cat => o.kind == Kind::Cat,
-            LookKind::Villager => o.kind == Kind::Villager,
-            LookKind::Player => false,
-            LookKind::Category(c) => {
-                // Full gaze order: creature, aquatic, axolotls, underground aquatic,
-                // aquatic ambient, monster.
-                use super::super::species::Category as C;
-                const ORDER: [C; 6] =
-                    [C::Creature, C::WaterCreature, C::Axolotls, C::UndergroundWaterCreature, C::WaterAmbient, C::Monster];
-                ORDER.get(usize::from(c)).is_some_and(|&want| o.kind.info().category == want)
-            }
+        self.mob_ref(id).is_some_and(|o| kind_is(o.kind, k))
+    }
+
+    /// Sensed entity `x` is of the gaze kind `k` and still in the world. With
+    /// `RUSTCRAFT_OPT_VILLAGER_SENSED_KIND`, by the species the sensor read: a mob of another
+    /// species is turned down without being looked up.
+    pub(crate) fn sensed_is(&self, x: Sensed, k: LookKind) -> bool {
+        if !switches::sensed_kind() {
+            return self.ent_is(x.ent, k);
         }
+        sensed_kind_is(x, k)
+            && match x.ent {
+                Ent::Player => true,
+                Ent::Mob(id) => self.mob_ref(id).is_some(),
+            }
+    }
+
+    /// `sensed_is`, and within `sqrt(d2)` of `me` (finding the position is the presence test).
+    pub(crate) fn sensed_near(&self, x: Sensed, k: LookKind, me: [f64; 3], d2: f64) -> bool {
+        let kind_ok = if switches::sensed_kind() { sensed_kind_is(x, k) } else { self.ent_is(x.ent, k) };
+        kind_ok && self.ent_pos(x.ent).is_some_and(|p| dist2(p, me) <= d2)
     }
 
     // ---------- Behaviors with a duration ----------
@@ -582,14 +685,14 @@ impl Server {
             Beh::Swim => self.swim_ok(m),
             Beh::LookAtTarget => true,
             Beh::PanicTrigger => true,
-            Beh::MoveToTarget { cooldown, path, last, speed, .. } => {
+            Beh::MoveToTarget { cooldown, path, has_path, last, speed, .. } => {
                 if *cooldown > 0 {
                     *cooldown -= 1;
                     return false;
                 }
                 let Some(w) = b.mem.walk else { return false };
                 let reached = self.walk_reached(m, w);
-                if !reached && self.compute_walk_path(m, b, w, t, path, speed) {
+                if !reached && self.compute_walk_path(m, b, w, t, (path, has_path), speed) {
                     *last = self.track_block(w.target);
                     return true;
                 }
@@ -695,9 +798,9 @@ impl Server {
                     b.set_active_if_possible(Act::Panic);
                 }
             }
-            Beh::MoveToTarget { speed, path, .. } => {
-                b.mem.path = path.is_some();
-                let p = path.as_deref().cloned();
+            Beh::MoveToTarget { speed, path, has_path, .. } => {
+                b.mem.path = *has_path;
+                let p = hand_over(path);
                 self.move_to_path(m, p, f64::from(*speed));
             }
             Beh::FollowTrader => self.follow_trader(b),
@@ -802,8 +905,8 @@ impl Server {
             Beh::Swim => self.swim_ok(m),
             Beh::LookAtTarget => b.mem.look.is_some_and(|l| self.track_visible(m, b, l)),
             Beh::PanicTrigger => b.mem.hurt_by || b.mem.hostile.is_some(),
-            Beh::MoveToTarget { path, last, .. } => {
-                if path.is_none() || last.is_none() {
+            Beh::MoveToTarget { has_path, last, .. } => {
+                if !*has_path || last.is_none() {
                     return false;
                 }
                 let Some(w) = b.mem.walk else { return false };
@@ -851,13 +954,14 @@ impl Server {
                     self.spawn_golem_if_needed(m, b, t, 3);
                 }
             }
-            Beh::MoveToTarget { path, last, speed, .. } => {
+            Beh::MoveToTarget { path, has_path, last, speed, .. } => {
                 // The followed path is the navigation's; only its presence matters here (the
                 // kept path is only read again after a new computation).
                 let has = m.nav.path.is_some();
                 b.mem.path = has;
                 if !has {
                     *path = None;
+                    *has_path = false;
                 }
                 if has
                     && let (Some(l), Some(w)) = (*last, b.mem.walk)
@@ -865,10 +969,10 @@ impl Server {
                 {
                     let d = [cur[0] - l[0], cur[1] - l[1], cur[2] - l[2]];
                     let d2 = i64::from(d[0]).pow(2) + i64::from(d[1]).pow(2) + i64::from(d[2]).pow(2);
-                    if d2 > 4 && self.compute_walk_path(m, b, w, t, path, speed) {
+                    if d2 > 4 && self.compute_walk_path(m, b, w, t, (path, has_path), speed) {
                         *last = Some(cur);
-                        b.mem.path = path.is_some();
-                        let p = path.as_deref().cloned();
+                        b.mem.path = *has_path;
+                        let p = hand_over(path);
                         self.move_to_path(m, p, f64::from(*speed));
                     }
                 }
@@ -899,16 +1003,29 @@ impl Server {
             Beh::ShowTrades { held, display, cycle, index, look } => {
                 let Some(target) = b.mem.interaction else { return };
                 b.mem.look = Some(Track::Ent(target, true));
-                let item = self.held_main_hand();
-                let changed = match held {
-                    None => true,
-                    Some(h) => h.as_ref().map(|s| s.id.as_str()) != item.as_ref().map(|s| s.id.as_str()),
+                // Old path: the held item copied at every tick to compare it.
+                let copied = (!switches::no_tick_allocations()).then(|| self.held_main_hand());
+                let changed = {
+                    // Otherwise read in place, and copied below only when it changed.
+                    let now = match &copied {
+                        Some(item) => item.as_ref(),
+                        None => self.slots.get(36 + self.held as usize).and_then(Option::as_ref),
+                    };
+                    held.as_ref().is_none_or(|h| h.as_ref().map(|s| s.id.as_str()) != now.map(|s| s.id.as_str()))
                 };
                 if changed {
+                    let item = copied.unwrap_or_else(|| self.held_main_hand());
                     *held = Some(item.clone());
                     display.clear();
                     if let Some(it) = &item {
-                        for off in self.npc_offers(m) {
+                        let copy;
+                        let offers: &[super::super::trades::Offer] = if switches::trade_borrow() {
+                            self.npc_offers_lent(m)
+                        } else {
+                            copy = self.npc_offers(m);
+                            &copy
+                        };
+                        for off in offers {
                             if !off.out_of_stock()
                                 && (off.cost_a.id == it.id || off.cost_b.as_ref().is_some_and(|c| c.id == it.id))
                             {
@@ -980,9 +1097,17 @@ impl Server {
                 if farmer && self.npc_count(m, "minecraft:wheat") > 32 {
                     self.throw_half_stack(m, tp, |_, st: &Stack| st.id == "minecraft:wheat");
                 }
-                let list = trades.clone();
-                if !list.is_empty() && list.iter().any(|i| self.npc_count(m, i) > 0) {
-                    self.throw_half_stack(m, tp, move |_, st: &Stack| list.contains(&st.id.as_str()));
+                if switches::no_tick_allocations() {
+                    // The list belongs to the behaviour, not to the server: lent to the throw.
+                    let goods: &[&str] = trades;
+                    if goods.iter().any(|i| self.npc_count(m, i) > 0) {
+                        self.throw_half_stack(m, tp, |_, st: &Stack| goods.contains(&st.id.as_str()));
+                    }
+                } else {
+                    let list = trades.clone();
+                    if !list.is_empty() && list.iter().any(|i| self.npc_count(m, i) > 0) {
+                        self.throw_half_stack(m, tp, move |_, st: &Stack| list.contains(&st.id.as_str()));
+                    }
                 }
             }
             Beh::MakeLove { birth } => {
@@ -1011,7 +1136,7 @@ impl Server {
     pub(crate) fn beh_stop(&mut self, m: &mut Mob, b: &mut Brain, beh: &mut Beh, t: i64) {
         match beh {
             Beh::LookAtTarget => b.mem.look = None,
-            Beh::MoveToTarget { cooldown, path, .. } => {
+            Beh::MoveToTarget { cooldown, path, has_path, .. } => {
                 if let Some(w) = b.mem.walk
                     && !self.walk_reached(m, w)
                     && m.nav.stuck
@@ -1022,6 +1147,7 @@ impl Server {
                 b.mem.walk = None;
                 b.mem.path = false;
                 *path = None;
+                *has_path = false;
             }
             Beh::FollowTrader => {
                 b.mem.walk = None;
@@ -1336,7 +1462,10 @@ impl Server {
                 true
             }
             Trig::StrollToSecondary { next } => {
-                let (Some(list), Some(job)) = (b.mem.secondary.clone(), b.mem.job_site) else { return false };
+                let mut copy = None;
+                let (Some(list), Some(job)) = (lent_or_copied(&b.mem.secondary, &mut copy), b.mem.job_site) else {
+                    return false;
+                };
                 if list.is_empty() {
                     return false;
                 }
@@ -1356,8 +1485,9 @@ impl Server {
                     return false;
                 }
                 let me = m.pos();
-                let found = self
-                    .find_closest(m, b, |s, e| e == Ent::Player && s.ent_pos(e).is_some_and(|p| dist2(p, me) <= 16.0));
+                let found = self.first_visible_matching(m, b, |s, x| {
+                    x.ent == Ent::Player && s.ent_pos(x.ent).is_some_and(|p| dist2(p, me) <= 16.0)
+                });
                 match found {
                     Some(e) => {
                         b.mem.interaction = Some(e);
@@ -1415,8 +1545,7 @@ impl Server {
                 }
                 let me = m.pos();
                 let k = *kind;
-                let found = self
-                    .find_closest(m, b, |s, e| s.ent_is(e, k) && s.ent_pos(e).is_some_and(|p| dist2(p, me) <= 64.0));
+                let found = self.first_visible_matching(m, b, |s, x| s.sensed_near(x, k, me, 64.0));
                 match found {
                     Some(e) => {
                         b.mem.look = Some(Track::Ent(e, true));
@@ -1434,13 +1563,12 @@ impl Server {
                 if breed && !self.can_breed(m) {
                     return false;
                 }
-                let valid = |s: &Server, e: Ent| s.ent_is(e, k) && (!breed || s.ent_can_breed(e));
-                if self.find_closest(m, b, valid).is_none() {
+                let breeds = |s: &Server, x: Sensed| !breed || s.ent_can_breed(x.ent);
+                if self.first_visible_matching(m, b, |s, x| s.sensed_is(x, k) && breeds(s, x)).is_none() {
                     return false;
                 }
                 let me = m.pos();
-                let found =
-                    self.find_closest(m, b, |s, e| s.ent_pos(e).is_some_and(|p| dist2(p, me) <= 64.0) && valid(s, e));
+                let found = self.first_visible_matching(m, b, |s, x| s.sensed_near(x, k, me, 64.0) && breeds(s, x));
                 if let Some(e) = found {
                     if breed {
                         b.mem.breed = Some(e);
@@ -1494,21 +1622,31 @@ impl Server {
                 if self.can_see_sky(here) {
                     return false;
                 }
-                let mut poses = Vec::new();
+                let mut cells = [[0i32; 3]; 27];
+                let mut k = 0;
                 for x in -1..=1 {
                     for y in -1..=1 {
                         for z in -1..=1 {
-                            poses.push([here[0] + x, here[1] + y, here[2] + z]);
+                            cells[k] = [here[0] + x, here[1] + y, here[2] + z];
+                            k += 1;
                         }
                     }
                 }
                 // List shuffle of the game: non-reproducible global random, clock random here.
                 let mut r = JRand::from_time(t ^ i64::from(m.id));
+                // The 27 cells fit on the stack; the old path shuffles a vector.
+                let mut copy = Vec::new();
+                let poses: &mut [[i32; 3]] = if switches::no_tick_allocations() {
+                    &mut cells
+                } else {
+                    copy.extend_from_slice(&cells);
+                    &mut copy
+                };
                 for i in (1..poses.len()).rev() {
                     let j = r.next_int_bound(i as i32 + 1) as usize;
                     poses.swap(i, j);
                 }
-                let found = poses.into_iter().find(|&p| !self.can_see_sky(p) && self.can_stand_on(m, p));
+                let found = poses.iter().copied().find(|&p| !self.can_see_sky(p) && self.can_stand_on(m, p));
                 if let Some(p) = found {
                     b.mem.walk = Some(Walk { target: Track::Block(p), speed: 0.5, close: 0 });
                 }
@@ -1553,13 +1691,11 @@ impl Server {
                 {
                     return false;
                 }
-                if self.find_closest(m, b, |s, e| s.ent_is(e, LookKind::Villager)).is_none() {
+                if self.first_visible_matching(m, b, |s, x| s.sensed_is(x, LookKind::Villager)).is_none() {
                     return false;
                 }
                 let me = m.pos();
-                let found = self.find_closest(m, b, |s, e| {
-                    s.ent_is(e, LookKind::Villager) && s.ent_pos(e).is_some_and(|p| dist2(p, me) <= 32.0)
-                });
+                let found = self.first_visible_matching(m, b, |s, x| s.sensed_near(x, LookKind::Villager, me, 32.0));
                 if let Some(e) = found {
                     b.mem.interaction = Some(e);
                     b.mem.look = Some(Track::Ent(e, true));
@@ -1626,8 +1762,25 @@ impl Server {
     }
 
     /// The path is kept by the behavior; the
-    /// navigation only receives one at start (or on recomputation while walking).
+    /// navigation only receives one at start (or on recomputation while walking). `kept`: the
+    /// behaviour's path and whether it holds one, both overwritten by this computation (a
+    /// failed one leaves none).
     fn compute_walk_path(
+        &mut self,
+        m: &mut Mob,
+        b: &mut Brain,
+        w: Walk,
+        t: i64,
+        kept: (&mut Option<Box<NavPath>>, &mut bool),
+        speed: &mut f32,
+    ) -> bool {
+        let (path, has_path) = kept;
+        let ok = self.compute_kept_path(m, b, w, t, path, speed);
+        *has_path = path.is_some();
+        ok
+    }
+
+    fn compute_kept_path(
         &mut self,
         m: &mut Mob,
         b: &mut Brain,
@@ -1674,19 +1827,34 @@ impl Server {
 
     fn harvest_valid(&self, p: [i32; 3]) -> bool {
         let s = self.st(p);
-        let below = self.bname([p[0], p[1] - 1, p[2]]);
-        self.crop_max_age(s).is_some_and(|(a, max)| a >= max) || (self.is_air(p) && below == "minecraft:farmland")
+        let farmland_below = self.is_farmland([p[0], p[1] - 1, p[2]], switches::block_ids());
+        self.crop_max_age(s).is_some_and(|(a, max)| a >= max) || (self.is_air(p) && farmland_below)
+    }
+
+    /// The block at `p` is farmland: compared by identifier (`by_id`, `RUSTCRAFT_OPT_BLOCKIDS`)
+    /// or by name.
+    pub(crate) fn is_farmland(&self, p: [i32; 3], by_id: bool) -> bool {
+        if by_id { self.view().block(self.st(p)) == self.bs.t.id.farmland } else { self.bname(p) == "minecraft:farmland" }
     }
 
     /// Crop (age, max age) for the game's crop blocks.
     pub(crate) fn crop_max_age(&self, s: u32) -> Option<(i32, i32)> {
-        let n = self.state_name(s);
-        let max = match n {
-            "minecraft:wheat" | "minecraft:carrots" | "minecraft:potatoes" => 7,
-            "minecraft:beetroots" => 3,
-            // Age 2 = the flower itself: never "ripe" as a sprout.
-            "minecraft:torchflower_crop" => 2,
-            _ => return None,
+        self.crop_max_age_with(s, switches::block_ids())
+    }
+
+    /// `crop_max_age`, the crop found by block identifier (`by_id`) or by name.
+    pub(crate) fn crop_max_age_with(&self, s: u32, by_id: bool) -> Option<(i32, i32)> {
+        let max = if by_id {
+            let crops = self.mobs.npc.crops.get_or_init(|| CropBlocks::resolve(|name| self.bs.t.block_id(name)));
+            crops.ripe_age(self.view().block(s))?
+        } else {
+            match self.state_name(s) {
+                "minecraft:wheat" | "minecraft:carrots" | "minecraft:potatoes" => 7,
+                "minecraft:beetroots" => 3,
+                // Age 2 = the flower itself: never "ripe" as a sprout.
+                "minecraft:torchflower_crop" => 2,
+                _ => return None,
+            }
         };
         Some((self.view().get_int(s, "age"), max))
     }
@@ -1710,7 +1878,7 @@ impl Server {
         {
             let s = self.st(p);
             let crop = self.crop_max_age(s);
-            let below = self.bname([p[0], p[1] - 1, p[2]]) == "minecraft:farmland";
+            let below = self.is_farmland([p[0], p[1] - 1, p[2]], switches::block_ids());
             if crop.is_some_and(|(a, max)| a >= max) {
                 self.villager_destroy_block(m, p);
             }
@@ -1777,9 +1945,9 @@ impl Server {
     }
 
     fn villager_sleeping_at(&self, p: [i32; 3]) -> bool {
-        self.mobs.list.iter().any(|o| {
-            o.kind == Kind::Villager
-                && o.npc.as_ref().is_some_and(|n| n.sleeping.is_some())
+        // The villagers alone, through the per-species index (`RUSTCRAFT_OPT_KINDINDEX`).
+        self.mobs.of_kind(Kind::Villager).any(|o| {
+            o.npc.as_ref().is_some_and(|n| n.sleeping.is_some())
                 && o.touches(&rc_physics::Aabb {
                     min: [f64::from(p[0]), f64::from(p[1]), f64::from(p[2])],
                     max: [f64::from(p[0]) + 1.0, f64::from(p[1]) + 1.0, f64::from(p[2]) + 1.0],
@@ -1875,36 +2043,43 @@ impl Server {
         let center = m.block_pos();
         // Retry filter evaluated on ALL POIs in the radius (the game's stream sort), then sort by
         // distance, first 5, then bed validity.
-        let all = self.poi_in_range(pred, center, 48, Occupancy::HasSpace);
-        let mut list = Vec::new();
-        for r in all {
-            let ok = match cache.iter_mut().find(|c| c.0 == r.pos) {
-                None => true,
-                Some(c) if t >= c.1.next => {
-                    c.1.mark(&mut self.mobs.rng, t);
-                    true
+        let mut all = self.poi_in_range(pred, center, 48, Occupancy::HasSpace);
+        let no_alloc = switches::no_tick_allocations();
+        let mut list = if no_alloc {
+            // Filtered in place: the same points in the same order, draws included.
+            all.retain(|r| retry_allows(cache, &mut self.mobs.rng, r.pos, t));
+            all
+        } else {
+            let mut kept = Vec::new();
+            for r in all {
+                if retry_allows(cache, &mut self.mobs.rng, r.pos, t) {
+                    kept.push(r);
                 }
-                Some(_) => false,
-            };
-            if ok {
-                list.push(r);
             }
-        }
+            kept
+        };
         list.sort_by_key(|r| crate::poi::dist2i(r.pos, center));
         list.truncate(5);
-        let mut pois = Vec::new();
-        for r in list {
-            if kind == Acq::Home {
-                let s = self.st(r.pos);
-                if !(self.btag_id(r.pos, crate::tag_bits::TagId::VillagersCanSleepOnBed)
-                    && !self.view().get_bool(s, "occupied"))
-                {
-                    continue;
-                }
+        let bed_free = |s: &Server, p: [i32; 3]| {
+            s.btag_id(p, crate::tag_bits::TagId::VillagersCanSleepOnBed) && !s.view().get_bool(s.st(p), "occupied")
+        };
+        // At most five points: on the stack (the old path builds a vector).
+        let mut on_stack = [(PoiType::Home, [0i32; 3]); 5];
+        let mut in_vec = Vec::new();
+        let mut n = 0;
+        for r in &list {
+            if kind == Acq::Home && !bed_free(self, r.pos) {
+                continue;
             }
-            pois.push((r.ty, r.pos));
+            if no_alloc {
+                on_stack[n] = (r.ty, r.pos);
+                n += 1;
+            } else {
+                in_vec.push((r.ty, r.pos));
+            }
         }
-        let path = self.path_to_pois(m, &pois);
+        let pois: &[(PoiType, [i32; 3])] = if no_alloc { &on_stack[..n] } else { &in_vec };
+        let path = self.path_to_pois(m, pois);
         if let Some(p) = path.filter(|p| p.reached) {
             let target = p.target;
             if self.poi_type(target).is_some() {
@@ -1921,7 +2096,7 @@ impl Server {
                 cache.clear();
             }
         } else {
-            for (_, p) in pois {
+            for &(_, p) in pois {
                 if !cache.iter().any(|c| c.0 == p) {
                     let r = Retry::new(&mut self.mobs.rng, t);
                     cache.push((p, r));
@@ -1937,18 +2112,29 @@ impl Server {
             return None;
         }
         let range = pois.iter().map(|p| p.0.valid_range()).max().unwrap_or(1).max(1);
+        // The callers ask for at most five points: their positions on the stack.
+        let mut on_stack = [[0i32; 3]; 8];
+        if switches::no_tick_allocations() && pois.len() <= on_stack.len() {
+            for (slot, p) in on_stack.iter_mut().zip(pois) {
+                *slot = p.1;
+            }
+            return self.create_path_multi(m, &on_stack[..pois.len()], range);
+        }
         let targets: Vec<[i32; 3]> = pois.iter().map(|p| p.1).collect();
         self.create_path_multi(m, &targets, range)
     }
 
     fn competitor_scan(&mut self, m: &mut Mob, b: &mut Brain) -> bool {
-        let (Some(job), Some(living)) = (b.mem.job_site, b.mem.living.clone()) else { return false };
+        let mut copy = None;
+        let (Some(job), Some(living)) = (b.mem.job_site, lent_or_copied(&b.mem.living, &mut copy)) else {
+            return false;
+        };
         // Type read at this level whatever the dimension of the location (like the game); the
         // comparison of job sites, though, takes the dimension into account.
         let Some(ty) = self.poi_type(job.pos) else { return true };
         // The game's reduction: the winner (more experience, otherwise the second) faces the next.
         let mut winner: (i32, i32) = (m.id, m.x.villager_xp);
-        for e in living {
+        for &e in living {
             let Ent::Mob(id) = e else { continue };
             let Some(o) = self.mob_ref(id) else { continue };
             if o.kind != Kind::Villager || !o.alive() {
@@ -1975,7 +2161,10 @@ impl Server {
     }
 
     fn yield_job_site(&mut self, m: &mut Mob, b: &mut Brain) -> bool {
-        let (Some(pot), None, Some(living)) = (b.mem.potential_job_site, b.mem.job_site, b.mem.living.clone()) else {
+        let mut copy = None;
+        let (Some(pot), None, Some(living)) =
+            (b.mem.potential_job_site, b.mem.job_site, lent_or_copied(&b.mem.living, &mut copy))
+        else {
             return false;
         };
         if m.is_baby() || m.villager[1] != PROF_NONE {
@@ -1983,7 +2172,7 @@ impl Server {
         }
         let pot = pot.pos;
         let Some(ty) = self.poi_type(pot) else { return true };
-        for e in living {
+        for &e in living {
             let Ent::Mob(id) = e else { continue };
             let Some(o) = self.mob_ref(id) else { continue };
             if o.kind != Kind::Villager || !o.alive() {
@@ -2062,7 +2251,8 @@ impl Server {
     }
 
     fn play_tag(&mut self, m: &mut Mob, b: &mut Brain) -> bool {
-        let Some(babies) = b.mem.babies.clone() else { return false };
+        let mut copy = None;
+        let Some(babies) = lent_or_copied(&b.mem.babies, &mut copy) else { return false };
         if b.mem.walk.is_some() {
             return false;
         }
@@ -2077,7 +2267,7 @@ impl Server {
         let chasing_me = babies.iter().any(|&f| chased_by(self, f) == Some(me));
         if !chasing_me {
             let mut counts: Vec<(Ent, i32)> = Vec::new();
-            for &f in &babies {
+            for &f in babies {
                 if let Some(t) = chased_by(self, f) {
                     match counts.iter_mut().find(|c| c.0 == t) {
                         Some(c) => c.1 += 1,
@@ -2248,33 +2438,53 @@ impl Server {
         to: Option<[i32; 3]>,
         near: Option<&[Ent]>,
     ) {
-        let Some(list) = doors.take() else { return };
+        let Some(mut list) = doors.take() else { return };
+        let on_path = |d: [i32; 3]| from == Some(d) || to == Some(d);
+        if switches::no_tick_allocations() {
+            // Only the doors of the two nodes stay: filtered in place, the others closed in the
+            // list's order on the way.
+            list.retain(|&d| {
+                if on_path(d) {
+                    return true;
+                }
+                self.close_door_unless_crossed(m, d, near);
+                false
+            });
+            *doors = (!list.is_empty()).then_some(list);
+            return;
+        }
         let mut keep = Vec::new();
         for d in list {
-            if from == Some(d) || to == Some(d) {
+            if on_path(d) {
                 keep.push(d);
                 continue;
             }
-            if !closer_center(d, m.pos(), 3.0) || !self.is_mob_door(d) || !self.view().get_bool(self.st(d), "open") {
-                continue;
-            }
-            let crossing = |o: &Mob| {
-                o.kind == m.kind
-                    && o.id != m.id
-                    && closer_center(d, o.pos(), 2.0)
-                    && o.nav.path.as_ref().is_some_and(|p| {
-                        !p.is_done() && p.next > 0 && (p.nodes[p.next - 1].0 == d || p.nodes[p.next].0 == d)
-                    })
-            };
-            let others = match near {
-                None => self.mobs.list.iter().any(crossing),
-                Some(n) => n.iter().any(|e| matches!(*e, Ent::Mob(id) if self.mob_ref(id).is_some_and(crossing))),
-            };
-            if !others {
-                self.set_door_open(d, false, m.id);
-            }
+            self.close_door_unless_crossed(m, d, near);
         }
         *doors = (!keep.is_empty()).then_some(keep);
+    }
+
+    /// A remembered door off the path: forgotten when far (3 blocks), gone or already closed;
+    /// closed unless a perceived fellow mob within 2 blocks is crossing it on its path.
+    fn close_door_unless_crossed(&mut self, m: &Mob, d: [i32; 3], near: Option<&[Ent]>) {
+        if !closer_center(d, m.pos(), 3.0) || !self.is_mob_door(d) || !self.view().get_bool(self.st(d), "open") {
+            return;
+        }
+        let crossing = |o: &Mob| {
+            o.kind == m.kind
+                && o.id != m.id
+                && closer_center(d, o.pos(), 2.0)
+                && o.nav.path.as_ref().is_some_and(|p| {
+                    !p.is_done() && p.next > 0 && (p.nodes[p.next - 1].0 == d || p.nodes[p.next].0 == d)
+                })
+        };
+        let others = match near {
+            None => self.mobs.list.iter().any(crossing),
+            Some(n) => n.iter().any(|e| matches!(*e, Ent::Mob(id) if self.mob_ref(id).is_some_and(crossing))),
+        };
+        if !others {
+            self.set_door_open(d, false, m.id);
+        }
     }
 }
 

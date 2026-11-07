@@ -7429,3 +7429,76 @@ loaded by other agents compiling.
   (`push_item_layer`, `prepare` sorts, NBT clones, rc-mesh `to_vec`) belong to their zones: a
   reused buffer beats any allocator setting.
 
+## C6-M11: villager brain without per-tick allocations, sensors without quadratic search, offers lent (07/11, loaded machine)
+
+Before: every search among a villager's visible entities (nine gaze kinds per gaze gate, the
+interaction, breeding, bell and hostile searches) copied the list, then looked each candidate up
+again by entity to read its visibility cache (quadratic in the list), and looked every candidate's
+mob up by identifier to test its species; each start try of a behaviour built its entry conditions
+in a vector; the sensors built three or four vectors per sensing; the walk cloned every computed
+path into the navigation; the villager food value took a process-wide lock and copied a JSON value
+per inventory stack (eight per breeding test, one test per candidate); the price of a payment built
+a stack to read its stack limit; the farmer's sensor compared 405 block names every 40 ticks.
+Switches, default = new, `=0` = old path (read once, `mobs/villager/switches.rs`, forced per thread
+by the proofs):
+- `RUSTCRAFT_OPT_VILLAGER_VISIBLE_BY_INDEX`: candidates tested at their index (`first_visible_matching`,
+  `visible_at`), babies and death witnesses too.
+- `RUSTCRAFT_OPT_VILLAGER_SENSED_KIND`: the sensor keeps each entity's species (`Sensed`); gaze,
+  interaction and bell searches reject other species without a lookup; hostiles and the iron golem
+  compared as species, not names.
+- `RUSTCRAFT_OPT_VILLAGER_NO_TICK_ALLOCATIONS`: entry conditions as static tables; sensing buffer,
+  living, visible, players, babies and secondary memories refilled in place; lists of the living,
+  babies and farmland lent instead of copied (competitor scan, job yield, tag game, stroll); doors
+  filtered in place; the 27 hiding cells and the five points of a POI acquisition on the stack; the
+  held item and the inventory stacks read in place.
+- `RUSTCRAFT_OPT_VILLAGER_MOVE_PATHS`: the computed path is moved into the navigation; the behaviour
+  keeps `has_path`, overwritten by every computation (a failed one leaves none, as the game's).
+- `RUSTCRAFT_OPT_VILLAGER_FOOD_CACHE`: default food value per item identifier, read on first need;
+  a patch that removes the component still wins.
+- `RUSTCRAFT_OPT_TRADE_BORROW`: offers lent (display, opening), only the traded offers copied by the
+  menu sync, stack limit of a cost read without a stack (`Items::max_stack_of`), trade set draws with
+  lent registries and the shared block tag bits.
+- `RUSTCRAFT_OPT_BLOCKIDS` (existing): farmland and crops compared by identifier (crop table resolved
+  once). `RUSTCRAFT_OPT_KINDINDEX` (existing): golem call and sleeping villager search by `of_kind`.
+- `RUSTCRAFT_OPT_VILLAGER_FARMLAND_BOX_SCAN`: the farmer's cube scanned section by section, sections
+  without farmland in their palette skipped, result sorted back to the sensor's order.
+
+Proof: `villager/brain_tests.rs`, on the village of the bench model world: twenty villagers
+(farmers with food, seeds and bone meal on two sown fields, jobless adults, a nitwit, babies, other
+professions), a cat, a zombie, the player holding wheat; three stretches of 200 ticks (work,
+meeting, rest). Each tick is one SHA-256 line over every mob (memories by content, behaviour nodes,
+navigation, inventory, offers), the items and, every 50 ticks, the village blocks. The old path gives
+the fingerprint recorded on the code before the work (`4720b587…`, Windows); the scenario is
+reproducible (second old run); each switch alone and all of them give the same 600 lines. Covered,
+in villager-ticks: path 7,426, look 5,503, babies 6,633, meet 3,160, rest 3,800, panic 1,136, work
+392, secondary 995, doors 488, sleeping 277, breed 112, player interaction 213, trades shown 32.
+Also: every block state for the crops, 200 cubes for the farmland (three ways), every item bare and
+patched for the food; every species for the alert distances; a trading session on the test world
+(open, choose, buy twice through a level up, choose, buy): the same events to the player with the
+offers lent; the payment price with stack limit patches; zero allocations for ten sensings and ten
+rounds of gaze searches (old path: at least 30 and 50). Seven sabotages fail them (visibility skipped
+for the first entry, food removal key misspelt, entry table inverted, farmland read as dirt, path
+flag never cleared after a failed computation, the player taken for every species, menu sync copying
+offer 0).
+
+| Micro-bench, loaded machine, 1 core | old path | new |
+|---|---|---|
+| nine gaze searches, 22 visible entities (index / species / both) | 1,714 ns, 9 allocations | 1,542 / 903 / 833 ns, 0 |
+| breeding test of 20 villagers | 2,772 ns, 94 allocations | 416 ns, 0 |
+| offer lookup among 100 offers | 2,435 ns, 100 allocations | 1,392 ns, 0 |
+| farmland of 10 farmers (by name / by id / box scan) | 12.0 µs | 10.7 / 4.8 µs |
+| scene: brain allocations per tick (20 villagers) | 180.2 | 17.1 (alone: visible 168.4, no-alloc 50.6, food 159.1) |
+| scene: brain time per tick, game tick | 360 µs, 955 µs | 374 µs, 1,006 µs (every case within ±10 %) |
+
+The scene times are inside the machine's noise (every case between 929 and 1,071 µs per tick): to
+settle on the quiet-machine scene bench (`village`, `crowd-villageois`, `village-nuit`). Axes: server
+CPU and allocations; memory: the sorting buffer kept between sensings (24 bytes per sensed entity,
+~0.5 KiB per villager), one food entry per item and five crop ids per server; no network, save or
+rendering change (the same events, proven). Multi-core and GPU not applicable: the brains run on the
+server thread in the list's order and change the world as they go. Not done: what still allocates in
+the brain lies in other zones (path search results for the walk, the job yield, POI acquisition and
+beds; the line of sight raycast; the wanted item search in `goals.rs`; the first POI indexing); the
+baby bed and closest home searches keep their small vectors (< 1 call per tick). `is_mob_door` keeps
+its name test: it only runs on blocks of the mob door tag. The same copy-then-search pattern exists in
+the `brainy`, piglin and creaking brains (C6-M18).
+

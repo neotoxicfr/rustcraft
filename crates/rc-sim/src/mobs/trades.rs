@@ -75,7 +75,13 @@ impl Offer {
     pub fn cost_a_count(&self, items: &Items) -> i32 {
         let base = self.cost_a.count;
         let demand = ((base * self.demand) as f32 * self.mult).floor() as i32;
-        let max = items.max_stack(&self.cost_a.stack(1));
+        // The stack limit read from the cost itself (`RUSTCRAFT_OPT_TRADE_BORROW`); the old path
+        // builds a stack (name and patch copied) to ask it.
+        let max = if super::villager::switches::trade_borrow() {
+            items.max_stack_of(&self.cost_a.id, self.cost_a.components.as_ref())
+        } else {
+            items.max_stack(&self.cost_a.stack(1))
+        };
         (base + demand.max(0) + self.special).clamp(1, max)
     }
 
@@ -564,7 +570,11 @@ impl TradeData<'_> {
         let cost = |v: &Value, extra: i32, rng: &mut Rng| -> Option<Cost> {
             let id = v["id"].as_str()?.to_owned();
             let n = if v["count"].is_null() { 1 } else { self.int(&v["count"], rng) };
-            let max = self.items.max_stack(&Stack { id: id.clone(), count: 1, components: None });
+            let max = if super::villager::switches::trade_borrow() {
+                self.items.max_stack_of(&id, None)
+            } else {
+                self.items.max_stack(&Stack { id: id.clone(), count: 1, components: None })
+            };
             Some(Cost {
                 id,
                 count: (n + extra).clamp(0, max),
@@ -669,19 +679,31 @@ impl Server {
     /// Adds the offers of a trade set (random: the game's named sequence if the set
     /// declares one, otherwise the world random).
     pub(crate) fn add_trade_set(&mut self, set: &str, villager_type: &str, offers: &mut Vec<Offer>) {
-        let data = self.data.clone();
+        let lend = super::villager::switches::trade_borrow();
+        let data = &self.data;
+        let (tag_bits, block_tags) = (&self.tag_bits, &self.block_tags);
         let tag_fn = |tag: &str, name: &str| {
-            let tags = &self.block_tags;
+            if lend {
+                // The block table's name index and tag bits (shared with the loot tables'
+                // conditions) instead of a walk over every block name.
+                return tag_bits.name_in_tag(tag, name);
+            }
             let id = data.blocks.iter().position(|b| b.name == name).map(|i| i as u32);
-            id.is_some_and(|id| tags.get(tag).is_some_and(|v| v.binary_search(&id).is_ok()))
+            id.is_some_and(|id| block_tags.get(tag).is_some_and(|v| v.binary_search(&id).is_ok()))
         };
         let seq = self.life.pack.get("trade_set", set).and_then(|t| t["random_sequence"].as_str().map(str::to_owned));
         let empty: Vec<(String, Vec<i32>)> = Vec::new();
         let ench_tags = self.regs.tags.iter().find(|t| t.0 == "minecraft:enchantment").map_or(&empty, |t| &t.1);
         let potion_tags = self.regs.tags.iter().find(|t| t.0 == "minecraft:potion").map_or(&empty, |t| &t.1);
-        let ench_names = self.regs.entries("minecraft:enchantment").to_vec();
-        let potion_names: Vec<String> =
-            data.registry("minecraft:potion").map(|r| r.entries.clone()).unwrap_or_default();
+        // The registries' name lists lent to the draw; the old path copies them.
+        let (ench_copy, potion_copy);
+        let (ench_names, potion_names): (&[String], &[String]) = if lend {
+            (self.regs.entries("minecraft:enchantment"), data.registry("minecraft:potion").map_or(&[], |r| &r.entries))
+        } else {
+            ench_copy = self.regs.entries("minecraft:enchantment").to_vec();
+            potion_copy = data.registry("minecraft:potion").map(|r| r.entries.clone()).unwrap_or_default();
+            (&ench_copy, &potion_copy)
+        };
         let instant =
             |e: &str| matches!(e, "minecraft:instant_health" | "minecraft:instant_damage" | "minecraft:saturation");
         let life = &mut *self.life;
@@ -691,9 +713,9 @@ impl Server {
             items: &life.items,
             loot: &loot,
             ench_tags,
-            ench_names: &ench_names,
+            ench_names,
             potion_tags,
-            potion_names: &potion_names,
+            potion_names,
             effect_instant: &instant,
         };
         let rng = match &seq {
