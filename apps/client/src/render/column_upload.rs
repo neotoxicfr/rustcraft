@@ -581,6 +581,8 @@ impl Renderer {
             RegionGpu::new(&self.device, &self.column_layout, (0, 0), self.formats.trans_bytes(), &self.trans_slots);
         self.free_slots.clear();
         self.next_slot = 0;
+        // The buffers restart from their first place: no cached command may outlive them.
+        self.lists.forget_columns();
         self.columns_rev += 1;
         self.vis_rev += 1;
     }

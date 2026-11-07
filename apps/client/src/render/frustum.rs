@@ -42,28 +42,36 @@ pub(super) fn frustum_planes(m: Mat4) -> [Vec4; 6] {
 }
 
 pub(super) fn aabb_visible(planes: &[Vec4; 6], min: Vec3, max: Vec3) -> bool {
-    planes.iter().all(|p| {
-        // Most advanced corner in the direction of the normal.
-        let v = Vec3::new(
-            if p.x >= 0.0 { max.x } else { min.x },
-            if p.y >= 0.0 { max.y } else { min.y },
-            if p.z >= 0.0 { max.z } else { min.z },
-        );
-        p.truncate().dot(v) + p.w >= 0.0
-    })
+    planes.iter().all(|p| box_reaches_plane(p, min, max))
+}
+
+/// Part of the box is on the inner side of plane `p`: its most advanced corner in the direction
+/// of the normal is.
+#[inline]
+pub(super) fn box_reaches_plane(p: &Vec4, min: Vec3, max: Vec3) -> bool {
+    let v = Vec3::new(
+        if p.x >= 0.0 { max.x } else { min.x },
+        if p.y >= 0.0 { max.y } else { min.y },
+        if p.z >= 0.0 { max.z } else { min.z },
+    );
+    p.truncate().dot(v) + p.w >= 0.0
 }
 
 /// Box entirely in the field (its least advanced corner is on the right side of each plane):
 /// any box it contains is too.
 pub(super) fn aabb_inside(planes: &[Vec4; 6], min: Vec3, max: Vec3) -> bool {
-    planes.iter().all(|p| {
-        let v = Vec3::new(
-            if p.x >= 0.0 { min.x } else { max.x },
-            if p.y >= 0.0 { min.y } else { max.y },
-            if p.z >= 0.0 { min.z } else { max.z },
-        );
-        p.truncate().dot(v) + p.w >= 0.0
-    })
+    planes.iter().all(|p| box_inside_plane(p, min, max))
+}
+
+/// The whole box is on the inner side of plane `p`: its least advanced corner is.
+#[inline]
+pub(super) fn box_inside_plane(p: &Vec4, min: Vec3, max: Vec3) -> bool {
+    let v = Vec3::new(
+        if p.x >= 0.0 { min.x } else { max.x },
+        if p.y >= 0.0 { min.y } else { max.y },
+        if p.z >= 0.0 { min.z } else { max.z },
+    );
+    p.truncate().dot(v) + p.w >= 0.0
 }
 
 /// Box of section `sy` of column `(x, z)` in the frame relative to the camera's integer `origin`,
@@ -136,22 +144,20 @@ impl MeshingView {
     }
 
     /// Sections among `reached` (the reached sections of column `key`) whose box lies in the
-    /// view: the box test of the draw lists (`lists::column_runs`), as a set, on the moved planes.
+    /// view: the column test of the draw lists, as a set, on the moved planes.
     pub fn sections_in_view(&self, key: (i32, i32), reached: &[(i32, i32, i32)]) -> Sections {
-        let mut seen = Sections::default();
-        let (min, max) = column_box(self.origin, self.min_y, self.sections, key);
-        if !aabb_visible(&self.planes, min, max) {
-            return seen;
-        }
-        // Column entirely in the field: every section is, without a per-section test.
-        let all = aabb_inside(&self.planes, min, max);
-        for &(_, sy, _) in reached {
-            let (min, max) = section_box(self.origin, self.min_y, key, sy);
-            if all || aabb_visible(&self.planes, min, max) {
-                seen.insert(sy);
-            }
-        }
-        seen
+        self.sections_in_view_with(key, reached, super::lists::ListPaths::from_switches())
+    }
+
+    /// [`Self::sections_in_view`] with the culling paths `paths` (the tests compare them).
+    pub(super) fn sections_in_view_with(
+        &self,
+        key: (i32, i32),
+        reached: &[(i32, i32, i32)],
+        paths: super::lists::ListPaths,
+    ) -> Sections {
+        let world = (self.min_y, self.sections);
+        super::lists::sections_in_field(&self.planes, self.origin, world, key, reached, paths)
     }
 }
 

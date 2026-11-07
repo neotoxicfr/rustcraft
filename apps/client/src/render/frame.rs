@@ -615,7 +615,7 @@ impl Renderer {
         t_vis: Instant,
     ) -> (usize, u64) {
         let t_lists = Instant::now();
-        let inp = lists::ListIn {
+        let input = lists::ListIn {
             columns: &self.columns,
             reached: &self.reached,
             planes,
@@ -629,9 +629,17 @@ impl Renderer {
             columns_rev: self.columns_rev,
         };
         let vis_ms = &mut self.vis_ms;
-        let drawn = lists::build(&inp, &mut self.lists, lists::vis_order(), || {
-            *vis_ms = t_vis.elapsed().as_secs_f64() * 1e3;
-        });
+        let ordered = || *vis_ms = t_vis.elapsed().as_secs_f64() * 1e3;
+        let paths = lists::ListPaths::from_switches();
+        let out = &mut self.lists;
+        let drawn = if paths.parallel() {
+            lists::list_pool().install(|| lists::build(&input, out, paths, ordered))
+        } else {
+            lists::build(&input, out, paths, ordered)
+        };
+        let (reused, rebuilt) = self.lists.column_command_reuse();
+        crate::perf_log::counter("terrain_column_commands_reused_per_frame", reused);
+        crate::perf_log::counter("terrain_column_commands_rebuilt_per_frame", rebuilt);
         let (batches, args) = (&self.lists.batches, &self.lists.args);
         crate::perf_log::list_stage(ListStage::Lists, t_lists.elapsed());
         let t_send = Instant::now();
