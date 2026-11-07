@@ -13,6 +13,7 @@ mod boot;
 mod block_entities;
 mod block_fx;
 mod block_text;
+mod cache_key;
 mod capseq;
 mod disconnect_report;
 mod entity_loops;

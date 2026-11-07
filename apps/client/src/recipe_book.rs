@@ -496,15 +496,11 @@ impl RecipeBook {
 
     /// Recompute of the "craftable" if the content changed (§ 10.2).
     pub fn refresh_craftable(&mut self, inv: &PlayerInventory, kind: Kind, ctx: &Ctx<'_>) {
-        use std::hash::{Hash, Hasher};
         let counts = Self::available(inv, kind, ctx);
-        let mut h = std::collections::hash_map::DefaultHasher::new();
         let mut v: Vec<_> = counts.iter().collect();
         v.sort();
-        v.hash(&mut h);
-        format!("{kind:?}").hash(&mut h);
-        self.generation.hash(&mut h);
-        let stamp = h.finish() | 1;
+        // `| 1`: never the "to recompute" stamp (0).
+        let stamp = crate::cache_key::cache_key(&(v, format!("{kind:?}"), self.generation)) | 1;
         if stamp == self.stamp {
             return;
         }

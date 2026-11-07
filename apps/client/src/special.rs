@@ -220,7 +220,6 @@ pub fn tr(gui: &Gui, key: &str) -> Vec<StyledChar> {
 
 /// Item of a stack at `(x, y)` (item atlas render).
 pub fn item(gui: &mut Gui, it: &HotbarItems<'_>, st: &ItemStack, x: f32, y: f32) {
-    use std::hash::{Hash, Hasher};
     let Some(models) = gui.items.as_ref().map(|a| &a.models) else { return };
     let info = usize::try_from(st.item).ok().and_then(|i| it.infos.get(i));
     let name = usize::try_from(st.item).ok().and_then(|i| it.names.get(i)).map_or("", String::as_str);
@@ -232,10 +231,8 @@ pub fn item(gui: &mut Gui, it: &HotbarItems<'_>, st: &ItemStack, x: f32, y: f32)
     if layers.is_empty() {
         return;
     }
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut h);
     gui.stratum(Blend::Premultiplied);
-    gui.item(h.finish(), &layers, x, y, 0.0);
+    gui.item(crate::cache_key::item_layers_key(&key), &layers, x, y, 0.0);
     gui.stratum(Blend::Normal);
 }
 

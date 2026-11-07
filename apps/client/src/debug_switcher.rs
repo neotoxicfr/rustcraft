@@ -125,7 +125,6 @@ pub struct Icons<'a> {
 
 impl Icons<'_> {
     fn layers(&self, item: &str) -> (u64, Vec<rc_assets::item::Layer>) {
-        use std::hash::{Hash, Hasher};
         let Some(models) = self.models else { return (0, Vec::new()) };
         let full = format!("minecraft:{item}");
         let Some(i) = self.names.iter().position(|n| n == &full || n == item) else { return (0, Vec::new()) };
@@ -142,9 +141,7 @@ impl Icons<'_> {
         if let Some(model) = view.model() {
             models.layers(&self.names[i], &model, &view, self.env, 0, &mut layers, &mut key);
         }
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut h);
-        (h.finish(), layers)
+        (crate::cache_key::item_layers_key(&key), layers)
     }
 }
 

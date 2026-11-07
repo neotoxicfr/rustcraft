@@ -25,6 +25,7 @@ mimalloc-win-direct-tls = ["mimalloc/win_direct_tls"]
 
 [dependencies]
 hashbrown = { workspace = true }
+foldhash.workspace = true
 rc-client.workspace = true
 rc-sim = { path = "../../crates/rc-sim" }
 rc-light = { path = "../../crates/rc-light" }

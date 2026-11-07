@@ -966,15 +966,8 @@ impl EntityRenderer {
     pub(super) fn swallowed(&mut self, e: &Entity) -> Option<Swallowed> {
         let stack = e.equipment[6].as_ref()?;
         let comp = self.ids.block_state.and_then(|id| stack.component(id));
-        let key = (
-            stack.item,
-            comp.map_or(0, |b| {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                b.hash(&mut h);
-                h.finish() | 1
-            }),
-        );
+        // `| 1`: a component present never shares the key of an absent one (0).
+        let key = (stack.item, comp.map_or(0, |b| crate::cache_key::cache_key(b) | 1));
         if let Some(&s) = self.swallowed.get(&key) {
             return s;
         }
