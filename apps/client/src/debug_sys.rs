@@ -475,6 +475,8 @@ fn long_purge_delay_from(library_ms: i64) -> Option<i64> {
 }
 
 /// Purge delay of the linked library, milliseconds (its default unless set).
+// `c_long` is 32 bits on Windows and 64 on Linux: the conversion to i64 is only useless on Linux.
+#[allow(clippy::useless_conversion)]
 fn library_purge_delay(index: i32) -> i64 {
     unsafe extern "C" {
         fn mi_option_get(option: i32) -> std::ffi::c_long;
