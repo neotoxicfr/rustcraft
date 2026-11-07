@@ -379,3 +379,7 @@ fn bundle_selected_item_is_removed() {
     m.select_bundle(&w.items, &inv, 9, 5);
     assert!(m.bundle_sel.is_none());
 }
+
+/// Equivalence of the menu switches (every combination, the same clicks).
+#[path = "menus_switch_tests.rs"]
+mod switch_equivalence;

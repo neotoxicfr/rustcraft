@@ -580,6 +580,10 @@ impl Server {
 
     /// Sends the packets accumulated by the menus.
     pub(crate) fn flush_menus(&mut self) {
+        if crate::menus::MenuSwitches::current().fewer_allocations {
+            self.flush_menus_in_place();
+            return;
+        }
         let mut outs = Vec::new();
         outs.push((0, std::mem::take(&mut self.life.inv_menu.out)));
         if let Some(m) = &mut self.life.menu {
@@ -608,6 +612,48 @@ impl Server {
                 };
                 let _ = self.send(Event::Inventory(ev));
             }
+        }
+    }
+
+    /// `flush_menus` without the list of lists: nothing to send (most ticks) costs nothing, and
+    /// each packet list goes back to its menu emptied, keeping its room for the next packets.
+    fn flush_menus_in_place(&mut self) {
+        let open_has_packets = self.life.menu.as_ref().is_some_and(|m| !m.out.is_empty());
+        if self.life.inv_menu.out.is_empty() && !open_has_packets {
+            return;
+        }
+        let mut inventory_packets = std::mem::take(&mut self.life.inv_menu.out);
+        self.send_menu_packets(0, &mut inventory_packets);
+        self.life.inv_menu.out = inventory_packets;
+        if let Some(m) = &mut self.life.menu {
+            let (window, mut packets) = (m.window, std::mem::take(&mut m.out));
+            self.send_menu_packets(window, &mut packets);
+            if let Some(m) = &mut self.life.menu {
+                m.out = packets;
+            }
+        }
+    }
+
+    /// The packets of one menu list sent in order; the list is left empty.
+    fn send_menu_packets(&self, window: i32, packets: &mut Vec<Out>) {
+        for o in packets.drain(..) {
+            let ev = match o {
+                Out::Slot { state, slot, stack } => {
+                    rc_proto_v777::item::Inventory::Slot { container: window, state, slot, stack: self.net(stack.as_ref()) }
+                }
+                Out::Content { state, slots, carried } => rc_proto_v777::item::Inventory::Content {
+                    container: window,
+                    state,
+                    slots: slots.iter().map(|s| self.net(s.as_ref())).collect(),
+                    carried: self.net(carried.as_ref()),
+                },
+                Out::Cursor(s) => rc_proto_v777::item::Inventory::Cursor(self.net(s.as_ref())),
+                Out::Data { prop, value } => {
+                    let _ = self.send(Event::ContainerData { window, prop, value });
+                    continue;
+                }
+            };
+            let _ = self.send(Event::Inventory(ev));
         }
     }
 
