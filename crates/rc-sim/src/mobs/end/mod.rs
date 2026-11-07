@@ -1,4 +1,4 @@
-//! Ender Dragon, the End fight and shulker (family F15, `server-mobs.md` § 4.F15).
+//! Ender Dragon, the End fight and shulker (`server-mobs.md` § 4.F15).
 //! Info sheets, own mob state (dragon, shulker), world state (crystals, breath clouds, dragon
 //! fireballs, shulker bullets, fight) and hooks called by the common engine (`mobs/`). The
 //! dragon has its own tick (`dragon.rs`, without common AI or movement), its phases
@@ -17,11 +17,14 @@ pub(crate) mod shulker;
 
 #[cfg(test)]
 mod tests;
-// Dragon gaze along its head (mission G4-F16a).
+// Dragon gaze along its head.
 #[cfg(test)]
 mod head_tests;
 #[cfg(test)]
 mod kb_world_tests;
+// Reused crystal compounds, arena ticket memo, shared dragon contact walk.
+#[cfg(test)]
+mod reuse_tests;
 #[cfg(test)]
 mod world_tests;
 
@@ -112,8 +115,14 @@ pub struct EndWorld {
     pub really: bool,
     /// Player hit on a dragon part (the weapon's knockback goes to the part).
     pub part_attack: bool,
-    /// Up-to-date compounds of the family's entities (selectors and commands), rebuilt every tick.
+    /// Up-to-date compounds of the family's entities (selectors and commands), refreshed every
+    /// tick.
     pub snapshots: Vec<(i32, Nbt)>,
+    /// Fields each entry of `snapshots` was built from, to rebuild only the changed ones.
+    pub(crate) snapshot_fields: Vec<crystal::SavedFields>,
+    /// Chunk map swap count (`Server::chunk_map_swaps`) at which every chunk of the arena
+    /// ticket was found present: the 19 × 19 lookups are skipped until the map is swapped.
+    pub(crate) arena_ticket_present_at: Option<u64>,
     /// Direct entity of the current damage (arrow, wind charge: nothing in the sitting phase;
     /// shulker bullet: teleportation and duplication).
     pub direct: Option<&'static str>,
@@ -284,10 +293,9 @@ pub fn hurt_sound(m: &Mob, death: bool) -> Option<&'static str> {
 /// Dragon in a sitting phase (arrows and tridents without effect, set on fire).
 pub fn sitting_dragon(s: &Server, t: super::mob::Ent) -> bool {
     match t {
-        super::mob::Ent::Mob(id) => s
-            .mob_ref(id)
-            .and_then(|m| m.end.dragon.as_ref())
-            .is_some_and(|d| d.phase.sitting_class()),
+        super::mob::Ent::Mob(id) => {
+            s.mob_ref(id).and_then(|m| m.end.dragon.as_ref()).is_some_and(|d| d.phase.sitting_class())
+        }
         super::mob::Ent::Player => false,
     }
 }
@@ -349,9 +357,21 @@ impl Server {
 
     /// Compounds of the family's entities (id, NBT up to date as of the last tick).
     pub(crate) fn end_snapshot(&mut self) {
-        let mut out: Vec<(i32, Nbt)> = Vec::new();
-        out.extend(self.mobs.end.crystals.iter().filter(|c| !c.removed).map(|c| (c.id, c.save())));
-        self.mobs.end.snapshots = out;
+        let end = &mut self.mobs.end;
+        if !crystal::snapshot_reuse_enabled() {
+            end.snapshots = crystal::rebuild_snapshots(&end.crystals);
+            end.snapshot_fields.clear();
+            return;
+        }
+        crystal::refresh_snapshots(&end.crystals, &mut end.snapshots, &mut end.snapshot_fields);
+        // Every test that reaches the End checks the reused compounds against a full rebuild
+        // (Debug text: a NaN double then compares equal to itself).
+        #[cfg(test)]
+        assert_eq!(
+            format!("{:?}", end.snapshots),
+            format!("{:?}", crystal::rebuild_snapshots(&end.crystals)),
+            "reused crystal compounds differ from a rebuild"
+        );
     }
 
     /// Compound of an entity of the family (commands).

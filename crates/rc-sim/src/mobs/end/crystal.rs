@@ -1,4 +1,4 @@
-//! End crystals (F15): fire maintained under the crystal during a fight, destruction at the
+//! End crystals: fire maintained under the crystal during a fight, destruction at the
 //! slightest hit (except from the dragon, or invulnerable ones outside a creative player) with a
 //! power-6 explosion (unless destroyed by an explosion), fight notified; synchronized beam and
 //! base; placing by the item (obsidian or bedrock, free space) which attempts the dragon
@@ -90,6 +90,22 @@ impl Crystal {
         e
     }
 
+    /// Everything `save` reads besides the compound kept from the load (which never changes
+    /// after it). Floats are kept by their bits so that -0.0 against 0.0 or a NaN payload count
+    /// as a change, exactly like the saved doubles.
+    pub(crate) fn saved_fields(&self) -> SavedFields {
+        SavedFields {
+            id: self.id,
+            uuid: self.uuid,
+            pos: self.pos.map(f64::to_bits),
+            vel: self.vel.map(f64::to_bits),
+            yaw: self.yaw.to_bits(),
+            invulnerable: self.invulnerable,
+            beam: self.beam,
+            show_bottom: self.show_bottom,
+        }
+    }
+
     /// 2 × 2 box.
     pub fn bbox(&self) -> rc_physics::Aabb {
         let p = self.pos;
@@ -108,12 +124,71 @@ impl Crystal {
     }
 }
 
+/// The fields a crystal's saved compound is built from (see `Crystal::saved_fields`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SavedFields {
+    id: i32,
+    uuid: u128,
+    pos: [u64; 3],
+    vel: [u64; 3],
+    yaw: u32,
+    invulnerable: bool,
+    beam: Option<[i32; 3]>,
+    show_bottom: bool,
+}
+
+/// Compounds of the living crystals, in list order, every one rebuilt.
+pub(crate) fn rebuild_snapshots(crystals: &[Crystal]) -> Vec<(i32, Nbt)> {
+    crystals.iter().filter(|c| !c.removed).map(|c| (c.id, c.save())).collect()
+}
+
+/// Same list as `rebuild_snapshots`, but an entry is rebuilt only when its crystal's saved
+/// fields differ from those it was built from (`fields`, kept side by side with `snapshots`).
+/// An unchanged End reuses every compound: no allocation, about ten comparisons per crystal.
+/// Returns how many entries were rebuilt.
+pub(crate) fn refresh_snapshots(
+    crystals: &[Crystal],
+    snapshots: &mut Vec<(i32, Nbt)>,
+    fields: &mut Vec<SavedFields>,
+) -> usize {
+    let (mut kept, mut rebuilt) = (0, 0);
+    for c in crystals.iter().filter(|c| !c.removed) {
+        let now = c.saved_fields();
+        if fields.get(kept) != Some(&now) {
+            rebuilt += 1;
+            let entry = (c.id, c.save());
+            if kept < snapshots.len() {
+                snapshots[kept] = entry;
+                fields[kept] = now;
+            } else {
+                snapshots.push(entry);
+                fields.push(now);
+            }
+        }
+        kept += 1;
+    }
+    snapshots.truncate(kept);
+    fields.truncate(kept);
+    rebuilt
+}
+
+/// `RUSTCRAFT_OPT_CRYSTAL_SNAPSHOT_REUSE=0`: the crystal compounds are rebuilt every tick.
+pub(crate) fn snapshot_reuse_enabled() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_CRYSTAL_SNAPSHOT_REUSE")
+}
+
+/// `RUSTCRAFT_OPT_CRYSTAL_TRACKING_SKIP_EMPTY=0`: the crystal tracking runs its whole pass
+/// even without any crystal.
+fn tracking_skip_empty_enabled() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_CRYSTAL_TRACKING_SKIP_EMPTY")
+}
+
 impl Server {
     /// Crystal of slot `i`, at its rank in the entity walk: fire under the crystal during a
     /// fight (air cell).
     pub(crate) fn crystal_visit(&mut self, i: usize) {
         let Some(c) = self.mobs.end.crystals.get(i).filter(|c| !c.removed) else { return };
-        // G3-F13: a crystal outside a "ticking entities" chunk waits (age included).
+        // A crystal outside a "ticking entities" chunk waits (age included).
         let (ticking, mut rank) = (self.entity_ticks_at(c.pos), c.rank);
         let meet = self.meet(&mut rank, ticking, crate::walk::Fam::Crystal);
         let c = &mut self.mobs.end.crystals[i];
@@ -189,8 +264,10 @@ impl Server {
         if !self.dmg_tag(ty, "minecraft:is_explosion") {
             let ety = if by.is_some() { "minecraft:player_explosion" } else { "minecraft:explosion" };
             self.game_event_src("minecraft:explode", pos, Some(crate::mobs::recent::vibration::Src::Other), None);
-            self.prog.expl_cause_next = Some("minecraft:end_crystal"); // W8c
-            self.blast_direct_next(by, id, |s| s.mobs.end.crystals[i].save()); // L10-COMBAT
+            // Exploding entity type for the explosion criteria (`fall_after_explosion`), and the
+            // crystal as the explosion's direct entity.
+            self.prog.expl_cause_next = Some("minecraft:end_crystal");
+            self.blast_direct_next(by, id, |s| s.mobs.end.crystals[i].save());
             self.explode_with(None, by, None, pos, 6.0, false, ety, super::super::explode::Blast::Block);
             self.prog.expl_cause_next = None;
         }
@@ -212,7 +289,7 @@ impl Server {
         }
         self.mobs.attack_ticker = 0;
         let creative = self.game_mode == 1;
-        // G5-F04: damage source of the weapon (its type, the mace's smash).
+        // Damage source of the weapon (its type, the mace's smash).
         let weapon = self.player_weapon();
         let smash = weapon.as_ref().is_some_and(|w| w.id == crate::mace::MACE)
             && crate::mace::can_smash(self.life.vit.fall, self.proj_player.fall_flying);
@@ -258,6 +335,10 @@ impl Server {
 
     /// Network tracking of a crystal (range 16 chunks, never a position update).
     pub(crate) fn track_crystals(&mut self) {
+        // Most worlds have no crystal: skip the registry lookup and the list shuffling.
+        if self.mobs.end.crystals.is_empty() && tracking_skip_empty_enabled() {
+            return;
+        }
         let range = (16.0f64 * 16.0).min(f64::from(self.view) * 16.0);
         let kind = self.entity_kind_id("minecraft:end_crystal");
         let mut list = std::mem::take(&mut self.mobs.end.crystals);
@@ -300,7 +381,10 @@ impl Server {
             }
             // A push: its velocity goes to the client (the spawn carries it otherwise).
             if std::mem::take(&mut c.vel_dirty) && c.seen && !c.removed {
-                let _ = self.send(Event::Entity(EntityEvent::Motion { id: c.id, velocity: crate::mobs::track::lp_quantize(c.vel) }));
+                let _ = self.send(Event::Entity(EntityEvent::Motion {
+                    id: c.id,
+                    velocity: crate::mobs::track::lp_quantize(c.vel),
+                }));
             }
         }
         list.retain(|c| !c.removed || c.seen);

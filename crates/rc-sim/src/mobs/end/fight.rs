@@ -1,4 +1,4 @@
-//! Dragon fight (F15, the dragon fight): saved dimension state
+//! Dragon fight: saved dimension state
 //! (`data/minecraft/ender_dragon_fight.dat`), boss bar of nearby players, arena kept
 //! loaded, first pass (inactive exit portal, dragon created), pillar crystals
 //! counted, victory (active portal, gateway, egg), respawn with the four crystals placed
@@ -19,6 +19,16 @@ use crate::server::Server;
 const FIGHT_TICKET_LEVEL: i32 = 24;
 /// Radius of the fight's ticket: the full chunks it keeps loaded around chunk (0, 0).
 const FIGHT_TICKET_RADIUS: i32 = 9;
+
+/// `RUSTCRAFT_OPT_ARENA_TICKET_MEMO=0`: the 19 × 19 arena ticket chunks are looked up every tick.
+fn arena_ticket_memo_enabled() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_ARENA_TICKET_MEMO")
+}
+
+/// `RUSTCRAFT_OPT_DRAGON_NAME_CLONE_ON_CHANGE=0`: a named dragon's name is cloned every tick.
+fn dragon_name_clone_on_change_enabled() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_DRAGON_NAME_CLONE_ON_CHANGE")
+}
 
 /// Respawn stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +90,7 @@ pub struct Fight {
 
 impl Fight {
     /// State read (game codec), otherwise default.
-    fn read(root: Option<&Nbt>) -> Fight {
+    pub(super) fn read(root: Option<&Nbt>) -> Fight {
         let d = root.and_then(|r| r.get("data"));
         let flag_or = |k: &str, def: bool| d.and_then(|d| int(d, k)).map_or(def, |v| v != 0);
         let ints = |n: Option<&Nbt>| -> Vec<i32> {
@@ -219,15 +229,7 @@ impl Server {
         if !f.bar_player {
             return;
         }
-        // Arena ticket (L9-TICK: centred on chunk (0, 0) like the game, full chunks within 9, so
-        // those within 8 have their neighbours and tick their blocks).
-        if (-FIGHT_TICKET_RADIUS..=FIGHT_TICKET_RADIUS)
-            .any(|x| (-FIGHT_TICKET_RADIUS..=FIGHT_TICKET_RADIUS).any(|z| !self.chunks.contains_key(&(x, z))))
-        {
-            let r = FIGHT_TICKET_RADIUS;
-            let arena: Vec<(i32, i32)> = (-r..=r).flat_map(|x| (-r..=r).map(move |z| (x, z))).collect();
-            self.ensure_loaded(&arena);
-        }
+        self.fight_hold_arena_ticket();
         if !self.arena_loaded() {
             return;
         }
@@ -283,6 +285,35 @@ impl Server {
                 self.fight_update_crystal_count();
             }
         }
+    }
+
+    /// Arena ticket: centred on chunk (0, 0) like the game, full chunks within 9, so those
+    /// within 8 have their neighbours and tick their blocks. Missing chunks are loaded.
+    fn fight_hold_arena_ticket(&mut self) {
+        let memo = arena_ticket_memo_enabled();
+        // Chunks are only dropped by a swap of the whole map and insertions only add keys: while no
+        // swap happened since every ticket chunk was seen, they are all still there.
+        let swaps = self.chunk_map_swaps;
+        if memo && self.mobs.end.arena_ticket_present_at == Some(swaps) {
+            #[cfg(test)]
+            assert!(self.arena_ticket_present(), "arena ticket memo kept after a chunk left the map");
+            return;
+        }
+        if self.arena_ticket_present() {
+            if memo {
+                self.mobs.end.arena_ticket_present_at = Some(swaps);
+            }
+            return;
+        }
+        let r = FIGHT_TICKET_RADIUS;
+        let arena: Vec<(i32, i32)> = (-r..=r).flat_map(|x| (-r..=r).map(move |z| (x, z))).collect();
+        self.ensure_loaded(&arena);
+    }
+
+    /// Every chunk of the arena ticket is in the map (loaded, or known as missing).
+    pub(super) fn arena_ticket_present(&self) -> bool {
+        let r = FIGHT_TICKET_RADIUS;
+        (-r..=r).all(|x| (-r..=r).all(|z| self.chunks.contains_key(&(x, z))))
     }
 
     /// The game loop tests only row z = 8 (from −8 to 8 in x), then
@@ -392,9 +423,14 @@ impl Server {
             return;
         }
         self.fbar_set_progress(m.health / m.max_health());
-        let name = m.custom_name.clone();
         let Some(f) = self.fight() else { return };
         f.ticks_since_dragon_seen = 0;
+        // The name is cloned only when the bar takes it, not on every tick of a named dragon.
+        let name = if dragon_name_clone_on_change_enabled() {
+            m.custom_name.as_ref().filter(|n| f.bar_name.as_ref() != Some(*n)).cloned()
+        } else {
+            m.custom_name.clone()
+        };
         if let Some(n) = name
             && f.bar_name.as_ref() != Some(&n)
         {
@@ -502,8 +538,7 @@ impl Server {
                 self.spawn_exit_portal(false);
             }
         }
-        let dragon =
-            self.mobs.of_kind(Kind::EnderDragon).find(|o| o.alive()).map(|o| (o.id, o.uuid));
+        let dragon = self.mobs.of_kind(Kind::EnderDragon).find(|o| o.alive()).map(|o| (o.id, o.uuid));
         match dragon {
             None => {
                 if let Some(f) = self.fight() {
@@ -941,7 +976,12 @@ impl Server {
                         let pos = self.mobs.end.crystals[i].pos;
                         // The crystal is the source: game event emitted by it, and its
                         // own breath does not hit it (the other crystals, yes).
-                        self.game_event_src("minecraft:explode", pos, Some(crate::mobs::recent::vibration::Src::Other), None);
+                        self.game_event_src(
+                            "minecraft:explode",
+                            pos,
+                            Some(crate::mobs::recent::vibration::Src::Other),
+                            None,
+                        );
                         self.explode_with(
                             None,
                             None,
@@ -1049,7 +1089,7 @@ impl Server {
 mod summon_tests {
     use super::{Fight, Stage};
 
-    /// G1-F02: dragon respawned, player in the fight bar: `summoned_entity`
+    /// Dragon respawned, player in the fight bar: `summoned_entity`
     /// ("The End... Again..."); test world absent: test skipped.
     #[test]
     fn respawned_dragon_summons() {
@@ -1070,7 +1110,7 @@ mod summon_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// L9-TICK: the fight's ticket also ticks the blocks of the arena (see the shared body).
+    /// The fight's ticket also ticks the blocks of the arena (see the shared body).
     #[test]
     fn fight_ticket_ticks_the_blocks_of_the_arena() {
         crate::tests_l9tick::fight_ticket_ticks_the_blocks_of_the_arena(|| {
@@ -1080,7 +1120,7 @@ mod summon_tests {
         });
     }
 
-    /// G3-F13: the fight's ticket (players in the fight) makes the arena "ticking entities" for
+    /// The fight's ticket (players in the fight) makes the arena "ticking entities" for
     /// every entity, not only the dragon: a mob 6 chunks from the origin, beyond the simulation
     /// distance, ticks (falls); 8 chunks away, or without players in the fight, it waits.
     #[test]

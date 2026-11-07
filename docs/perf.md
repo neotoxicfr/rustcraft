@@ -7161,4 +7161,61 @@ the main thread: no multi-core form), median of 1,000 frames:
   vertex overhead of the references against the halved back faces is decided there. Lead noted, not
   done: drawing exactly 6 × glyphs vertices by a search of the reference in a prefix sum of the
   counts (no wasted vertex, one draw per pass, a few storage reads per vertex).
+## C6-M31: End, crystal compounds reused, arena ticket memo, one dragon contact walk (06/11, loaded machine)
+
+Before: every tick in the End rebuilt the compound of every living crystal for commands and
+selectors (clone of its loaded compound + nine fields set, ≈ 15 allocations per crystal); the
+crystal tracking looked the crystal kind up in the registry and shuffled the list in every
+dimension, crystals or not; while players were in the fight, 361 chunk lookups checked the arena
+ticket every tick; each tick of the dragon walked the mob list four times (two wings, head, neck);
+a named dragon cloned its name every tick; every thorns or after-hit effect on a dragon target
+deep-copied the dragon's state. Switches, default = new, `=0` = old (read once):
+- `RUSTCRAFT_OPT_CRYSTAL_SNAPSHOT_REUSE`: an entry is rebuilt only when the fields its save reads
+  (id, UUID, position, velocity and yaw by their bits, invulnerable, beam, base) differ from those
+  it was built from. Chosen over the planned version counter: the list is changed at about twelve
+  places (beam, invulnerable, push, removals, three insertions, the tracking's sweep, the walk's
+  sort by rank, tests), a missed bump would show a stale compound, and comparing ten integers
+  per crystal costs the same as reading a counter. Reading lazily at the first command of the
+  tick: rejected (functions before the walk must see the previous tick).
+- `RUSTCRAFT_OPT_CRYSTAL_TRACKING_SKIP_EMPTY`: no crystal, no tracking pass.
+- `RUSTCRAFT_OPT_ARENA_TICKET_MEMO`: "every ticket chunk is present" remembered with a new chunk map
+  swap count (`chunk_map_swaps`, bumped only by the dimension swap, the only way a chunk leaves
+  the map; an insertion only adds keys, so chunks arriving while the player flies keep the memo).
+- `RUSTCRAFT_OPT_DRAGON_SHARED_CONTACT_SCAN`: one walk over the union of the four contact boxes,
+  each box filters it while no box has touched anyone; after the first contact (something may
+  have moved, died, teleported or appeared, a reinforcement in a reused slot included) every
+  remaining box walks the list again, as before.
+- `RUSTCRAFT_OPT_DRAGON_NAME_CLONE_ON_CHANGE`: the name is cloned only when the bar takes it.
+- `RUSTCRAFT_OPT_DRAGON_STATE_LEND_WITHOUT_CLONE`: the state is moved into the mob and back
+  instead of copied (one block allocated instead of four, the old lists no longer freed after
+  each hit). A first bench, which left out the move back in the copy case only, had it losing
+  (95 against 88 ns) and the switch off; measured on the real lend both ways (same box, same move
+  back, alternating passes), it wins.
+
+Proof (`mobs/end/reuse_tests.rs`, plus test-only checks inside the code that every End test
+runs): reused compounds against a full rebuild after 4,000 random changes (signed zero, NaN,
+reversed order, removals, a loaded compound with extra tags) and after every tick of a world where
+crystals are added, killed, beamed and pushed at random ticks (the compound a command reads equals
+the crystal's save); an unchanged End rebuilds nothing; each box's shared list against a walk of
+its own (zombie bitten by the head only, dying zombie killed by the head and no longer seen by the
+neck); the dragon state lent both ways (moved and copied, called directly, whatever the switch)
+reaches the mob whole and comes back whole; the arena memo kept by a chunk insertion and dropped
+by a map swap (missing chunk loaded again); a named dragon renames the bar once. Eight sabotages
+fail them (see the commits).
+
+| One core, loaded machine | former | new |
+|---|---|---|
+| crystal compounds, 10 crystals, per tick | 2,592 ns | 64 ns (no allocation) |
+| crystal tracking without crystals, per tick (all scenes) | ≈ 33 ns (kind lookup) | 0 |
+| arena ticket, per fight tick | 594 ns (361 lookups) | 1 comparison |
+| dragon contacts, 300 mobs in the world, no contact | 3,968 ns (4 walks) | 1,027 ns |
+| dragon state lent to the mob, per target hit (state 1,768 bytes) | 104 to 110 ns (copy) | 95 to 98 ns (move) |
+
+Multi-core and GPU: not applicable (server thread state, game order of the hits). Not done:
+`rule()` read once per dragon tick in the wall test (C6-M33); `arena_loaded` (17 + 9 lookups:
+slots can turn empty and the adopted set changes); the dragon state held by the mob for the whole
+contact phase (would remove the copy entirely, ≈ 90 ns per target hit, but splits the AI step in
+three). Known difference, not an optimisation: after `kill` of a crystal, a later command of the
+same tick still sees it until the snapshot runs (the game reads the live entity). To settle on the
+quiet-machine scene bench: `combat-end`, `plains12` (empty tracking).
 

@@ -1,4 +1,4 @@
-//! Ender Dragon (F15): own tick (the game calls neither the common AI nor movement), flight
+//! Ender Dragon: own tick (the game calls neither the common AI nor movement), flight
 //! history, eight parts (ids reserved right after the dragon), healing by the closest crystal,
 //! flight toward the phase target, contacts (wings: knockback and 5 damage, head and neck: 10),
 //! blocks crossed (removed if the rule allows, otherwise a "wall" that slows), damage by the part
@@ -122,6 +122,42 @@ fn inflate(b: rc_physics::Aabb, x: f64, y: f64, z: f64) -> rc_physics::Aabb {
         min: [b.min[0] - x, b.min[1] - y, b.min[2] - z],
         max: [b.max[0] + x, b.max[1] + y, b.max[2] + z],
     }
+}
+
+/// Wing contact box: the wing inflated by 4 × 2 × 4, lowered by 2.
+pub(super) fn wing_contact_box(d: &Dragon, wing: usize) -> rc_physics::Aabb {
+    let mut b = inflate(part_box(d, wing), 4.0, 2.0, 4.0);
+    b.min[1] -= 2.0;
+    b.max[1] -= 2.0;
+    b
+}
+
+/// Bite contact box: head or neck inflated by 1.
+pub(super) fn bite_contact_box(d: &Dragon, part: usize) -> rc_physics::Aabb {
+    inflate(part_box(d, part), 1.0, 1.0, 1.0)
+}
+
+/// Smallest box holding the four contact boxes of the current part positions.
+pub(super) fn contact_boxes_union(d: &Dragon) -> rc_physics::Aabb {
+    let boxes =
+        [wing_contact_box(d, WING1), wing_contact_box(d, WING2), bite_contact_box(d, HEAD), bite_contact_box(d, NECK)];
+    boxes[1..].iter().fold(boxes[0], |u, b| rc_physics::Aabb {
+        min: std::array::from_fn(|k| u.min[k].min(b.min[k])),
+        max: std::array::from_fn(|k| u.max[k].max(b.max[k])),
+    })
+}
+
+/// `RUSTCRAFT_OPT_DRAGON_STATE_LEND_WITHOUT_CLONE=0`: the dragon's state is deep-copied into the
+/// mob for every thorns or after-hit effect instead of moved (95 to 98 against 104 to 110 ns per
+/// lend of the 1,768-byte state, real lend both ways, loaded machine).
+fn lend_without_clone_enabled() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_DRAGON_STATE_LEND_WITHOUT_CLONE")
+}
+
+/// `RUSTCRAFT_OPT_DRAGON_SHARED_CONTACT_SCAN=0`: each of the four contact boxes walks the mob
+/// list.
+fn shared_contact_scan_enabled() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_DRAGON_SHARED_CONTACT_SCAN")
 }
 
 impl Server {
@@ -256,16 +292,7 @@ impl Server {
         set(d, WING2, f64::from(cc1 * -4.5), 2.0, f64::from(ss1 * -4.5));
         // Contacts (head and neck at their position of the previous tick), if it has not been hurt.
         if m.hurt_time <= 0 {
-            for w in [WING1, WING2] {
-                let mut b = inflate(part_box(d, w), 4.0, 2.0, 4.0);
-                b.min[1] -= 2.0;
-                b.max[1] -= 2.0;
-                self.dragon_knockback(m, d, b);
-            }
-            for part in [HEAD, NECK] {
-                let b = inflate(part_box(d, part), 1.0, 1.0, 1.0);
-                self.dragon_bite(m, d, b);
-            }
+            self.dragon_contacts(m, d);
         }
         let ss2 = sin(m.yaw * DEG - d.y_rot_a * 0.01);
         let cc2 = cos(m.yaw * DEG - d.y_rot_a * 0.01);
@@ -355,19 +382,66 @@ impl Server {
         }
     }
 
-    /// Wings: living entities in the box are pushed back, and hurt (5) outside the sitting
-    /// phase if their last injury by a mob is at least 3 ticks old.
-    fn dragon_knockback(&mut self, m: &mut Mob, d: &mut Dragon, area: rc_physics::Aabb) {
+    /// The four contact boxes of a tick, in the game's order: both wings push (and hurt), then
+    /// head and neck bite. Each box is computed when its turn comes, from the state left by the
+    /// previous ones.
+    pub(super) fn dragon_contacts(&mut self, m: &mut Mob, d: &mut Dragon) {
+        // One walk of the mob list for the four boxes, kept while no box has touched anything:
+        // until then nothing has moved, died or appeared, so filtering that walk by each box gives
+        // what a fresh walk would. After the first contact every box walks the list again.
+        let mut nearby =
+            shared_contact_scan_enabled().then(|| self.mobs_touching_dragon_box(m, &contact_boxes_union(d)));
+        for wing in [WING1, WING2] {
+            let area = wing_contact_box(d, wing);
+            let ids = self.dragon_box_targets(m, &area, nearby.as_deref());
+            if self.dragon_knockback_targets(m, d, area, ids) {
+                nearby = None;
+            }
+        }
+        for part in [HEAD, NECK] {
+            let area = bite_contact_box(d, part);
+            let ids = self.dragon_box_targets(m, &area, nearby.as_deref());
+            if self.dragon_bite_targets(m, d, area, ids) {
+                nearby = None;
+            }
+        }
+    }
+
+    /// Living mobs other than the dragon whose box touches `area`, with that box, in list order.
+    pub(super) fn mobs_touching_dragon_box(&self, m: &Mob, area: &rc_physics::Aabb) -> Vec<(i32, rc_physics::Aabb)> {
+        self.mobs
+            .list
+            .iter()
+            .filter(|o| o.id != m.id && o.alive() && o.touches(area))
+            .map(|o| (o.id, o.bbox()))
+            .collect()
+    }
+
+    /// Mobs hit by the contact box `area`: filtered from the shared walk when it is still valid,
+    /// otherwise found by a walk of their own.
+    fn dragon_box_targets(
+        &self,
+        m: &Mob,
+        area: &rc_physics::Aabb,
+        nearby: Option<&[(i32, rc_physics::Aabb)]>,
+    ) -> Vec<i32> {
+        let own_walk =
+            || -> Vec<i32> { self.mobs_touching_dragon_box(m, area).into_iter().map(|(id, _)| id).collect() };
+        let Some(list) = nearby else { return own_walk() };
+        let ids: Vec<i32> = list.iter().filter(|(_, b)| b.intersects(area)).map(|(id, _)| *id).collect();
+        #[cfg(test)]
+        assert_eq!(ids, own_walk(), "shared dragon contact walk differs from a walk of its own");
+        ids
+    }
+
+    /// Wings: living entities in the box (the mobs `ids`, then the player) are pushed back, and
+    /// hurt (5) outside the sitting phase if their last injury by a mob is at least 3 ticks old;
+    /// true if it touched anyone.
+    fn dragon_knockback_targets(&mut self, m: &mut Mob, d: &mut Dragon, area: rc_physics::Aabb, ids: Vec<i32>) -> bool {
         let body = part_box(d, BODY);
         let xm = (body.min[0] + body.max[0]) / 2.0;
         let zm = (body.min[2] + body.max[2]) / 2.0;
-        let ids: Vec<i32> = self
-            .mobs
-            .list
-            .iter()
-            .filter(|o| o.id != m.id && o.alive() && o.touches(&area))
-            .map(|o| o.id)
-            .collect();
+        let mut touched = !ids.is_empty();
         for id in ids {
             let Some(i) = self.mob_index(id) else { continue };
             let Some(mut o) = self.mobs.list.take(i) else { continue };
@@ -387,6 +461,7 @@ impl Server {
             && self.ent_alive(Ent::Player)
             && self.player_aabb().intersects(&area)
         {
+            touched = true;
             let (xd, zd) = (self.pos[0] - xm, self.pos[2] - zm);
             let dd = (xd * xd + zd * zd).max(0.1);
             self.player_push([xd / dd * 4.0, f64::from(0.2f32), zd / dd * 4.0]);
@@ -394,20 +469,22 @@ impl Server {
             if !d.phase.sitting() && stamp < self.mobs.player_ticks - 2 {
                 let kb = Some((m.pos()[0] - self.pos[0], m.pos()[2] - self.pos[2]));
                 self.player_hurt_by_mob(m, "minecraft:mob_attack", 5.0, kb);
-                self.dragon_thorns(m, d); // G5-F02d: even without a hit dealt, like the game
+                self.dragon_thorns(m, d); // even without a hit dealt, like the game
             }
         }
+        touched
     }
 
     /// Head and neck: 10 damage to every living entity in the box.
+    #[cfg(test)]
     pub(crate) fn dragon_bite(&mut self, m: &mut Mob, d: &mut Dragon, area: rc_physics::Aabb) {
-        let ids: Vec<i32> = self
-            .mobs
-            .list
-            .iter()
-            .filter(|o| o.id != m.id && o.alive() && o.touches(&area))
-            .map(|o| o.id)
-            .collect();
+        let ids = self.dragon_box_targets(m, &area, None);
+        self.dragon_bite_targets(m, d, area, ids);
+    }
+
+    /// Bite on the mobs `ids`, then on the player; true if it touched anyone.
+    fn dragon_bite_targets(&mut self, m: &mut Mob, d: &mut Dragon, area: rc_physics::Aabb, ids: Vec<i32>) -> bool {
+        let mut touched = !ids.is_empty();
         for id in ids {
             let Some(i) = self.mob_index(id) else { continue };
             let Some(mut o) = self.mobs.list.take(i) else { continue };
@@ -420,42 +497,64 @@ impl Server {
             && self.ent_alive(Ent::Player)
             && self.player_aabb().intersects(&area)
         {
+            touched = true;
             let kb = Some((m.pos()[0] - self.pos[0], m.pos()[2] - self.pos[2]));
             self.player_hurt_by_mob(m, "minecraft:mob_attack", 10.0, kb);
-            self.dragon_thorns(m, d); // G5-F02d: even without a hit dealt, like the game
+            self.dragon_thorns(m, d); // even without a hit dealt, like the game
         }
+        touched
     }
 
-    /// Player thorns against the dragon during its tick: its own state, taken out for the time
-    /// of the tick, is put back for the thorns (damage reception reads the phase and
-    /// accumulates the sitting-phase damage), then taken again with what changed.
-    fn dragon_thorns(&mut self, m: &mut Mob, d: &mut Dragon) {
-        m.end.dragon = Some(Box::new(d.clone()));
-        self.player_thorns(m, "minecraft:mob_attack");
+    /// Runs `f` with the dragon's own state, taken out for the time of the tick, put back in the
+    /// mob (damage reception reads the phase and accumulates the sitting-phase damage), then
+    /// takes it again with what changed.
+    fn with_dragon_state_lent(&mut self, m: &mut Mob, d: &mut Dragon, f: impl FnOnce(&mut Server, &mut Mob)) {
+        self.lend_dragon_state(m, d, lend_without_clone_enabled(), f);
+    }
+
+    /// [`Server::with_dragon_state_lent`] with the way of lending chosen by the caller, so tests
+    /// and the bench run both ways in one process: `move_out` moves the state into the mob,
+    /// otherwise the mob gets a deep copy.
+    pub(super) fn lend_dragon_state(
+        &mut self,
+        m: &mut Mob,
+        d: &mut Dragon,
+        move_out: bool,
+        f: impl FnOnce(&mut Server, &mut Mob),
+    ) {
+        // Moving the state out leaves an empty default behind (no list allocated) instead of a
+        // deep copy of its flight graph and paths. Nothing called here takes the state out of the
+        // mob for good, so it always comes back.
+        let lent = if move_out { std::mem::take(d) } else { d.clone() };
+        m.end.dragon = Some(Box::new(lent));
+        f(self, m);
         if let Some(back) = m.end.dragon.take() {
             *d = *back;
         }
+    }
+
+    /// Player thorns against the dragon during its tick.
+    fn dragon_thorns(&mut self, m: &mut Mob, d: &mut Dragon) {
+        self.with_dragon_state_lent(m, d, |s, m| s.player_thorns(m, "minecraft:mob_attack"));
     }
 
     /// After-hit effects of a wing or bite hit on the mob `o` (taken out of the list), with the
     /// dragon's state put back like for the player's thorns: its equipment (thorns), then the
     /// dragon's empty main hand.
     fn dragon_post_attack(&mut self, m: &mut Mob, d: &mut Dragon, o: &mut Mob) {
-        m.end.dragon = Some(Box::new(d.clone()));
-        let weapon = m.equipment[0].clone();
-        let mut hit = crate::ench_fx::Hit {
-            ty: "minecraft:mob_attack",
-            victim: crate::ench_fx::Side::Mob(o),
-            attacker: Some(crate::ench_fx::Side::Mob(m)),
-            direct: true,
-        };
-        self.post_attack(&mut hit, weapon.as_ref());
-        if let Some(back) = m.end.dragon.take() {
-            *d = *back;
-        }
+        self.with_dragon_state_lent(m, d, |s, m| {
+            let weapon = m.equipment[0].clone();
+            let mut hit = crate::ench_fx::Hit {
+                ty: "minecraft:mob_attack",
+                victim: crate::ench_fx::Side::Mob(o),
+                attacker: Some(crate::ench_fx::Side::Mob(m)),
+                direct: true,
+            };
+            s.post_attack(&mut hit, weapon.as_ref());
+        });
     }
 
-    // Player push (`push`): `player_push`, shared with F14 (`recent/mod.rs`).
+    // The wings push the player through `player_push`, shared with the other recent mobs (`recent/mod.rs`).
 
     /// Non-empty blocks outside `dragon_transparent` removed (without loot) if the
     /// rule allows and outside `dragon_immune`, otherwise "wall". A removed block: event 2008
