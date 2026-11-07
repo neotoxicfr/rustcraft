@@ -745,11 +745,6 @@ mod tests {
         drain_generic(1, 1.0);
         eprintln!("generic counter: {add_ns:.1} ns per add, {lap_ns:.1} ns per stage lap (40 counters, last one)");
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
 
     /// Ages of a base served sorted into their bucket, bounds excluded from the lower bucket.
     #[test]
