@@ -4,9 +4,16 @@
 
 use glam::{Mat4, Vec3, Vec4};
 
+use super::frame_visibility::{FrameVisibility, VisibilityPaths};
 use super::{Renderer, perspective};
 use rc_mesh::blocks::BUCKETS;
 use rc_mesh::wire::Sections;
+
+/// Near plane of the culling projection (the game's 0.05).
+const CULL_NEAR: f32 = 0.05;
+/// How far the game moves the eye back, in view vectors, to test the particles: a particle whose
+/// centre is just off screen still shows the part of its quad that is on it.
+const PARTICLE_EYE_BACK: f32 = 3.0;
 
 /// For each group of faces (order `Dir`, then unaligned), range of sections of the
 /// column where it can be seen from the front. A face oriented +x is only visible if the camera is
@@ -205,18 +212,19 @@ impl BoxVerdict {
 
 /// What the frame's visibility test reads: frustum planes, camera integer origin (x, z), world
 /// bottom and height in sections, sections reached by the walk.
-struct FrameView {
-    planes: [Vec4; 6],
-    origin: [i32; 2],
-    min_y: i32,
-    sections: i32,
-    reached: std::sync::Arc<super::lists::Reach>,
-    occlusion: bool,
+pub(super) struct FrameView {
+    pub planes: [Vec4; 6],
+    pub origin: [i32; 2],
+    pub min_y: i32,
+    pub sections: i32,
+    pub reached: std::sync::Arc<super::lists::Reach>,
+    pub occlusion: bool,
 }
 
 impl FrameView {
-    /// Verdict of the box `min..max` (frame relative to the camera's integer origin).
-    fn verdict(&self, min: [f32; 3], max: [f32; 3]) -> BoxVerdict {
+    /// Verdict of the box `min..max` (frame relative to the camera's integer origin): the test of
+    /// before the paths of [`FrameVisibility`], kept as their `=0` path and their reference.
+    pub fn verdict(&self, min: [f32; 3], max: [f32; 3]) -> BoxVerdict {
         if !aabb_visible(&self.planes, Vec3::from(min), Vec3::from(max)) {
             return BoxVerdict::Outside;
         }
@@ -245,10 +253,10 @@ impl FrameView {
 /// Calls of one frame's visibility test per verdict, handed to the perf log when the test is
 /// dropped (plain cells: the test runs on the main thread, thousands of times per frame).
 #[derive(Default)]
-struct VerdictTally([std::cell::Cell<u32>; BoxVerdict::ALL.len()]);
+pub(super) struct VerdictTally([std::cell::Cell<u32>; BoxVerdict::ALL.len()]);
 
 impl VerdictTally {
-    fn add(&self, v: BoxVerdict) {
+    pub fn add(&self, v: BoxVerdict) {
         let c = &self.0[v as usize];
         c.set(c.get() + 1);
     }
@@ -260,19 +268,78 @@ impl Drop for VerdictTally {
     }
 }
 
+/// The game's particle test (`visibility.md`, particles): a particle is drawn when its tick
+/// position lies in the culling frustum whose eye is moved back three blocks along the game's
+/// view vector; no occlusion. Frame relative to the camera's integer origin (x, z).
+pub struct ParticleFrustum {
+    planes: [Vec4; 6],
+    /// The same planes in columns, four then two (repeated to fill the lanes), for the SIMD
+    /// test (`RUSTCRAFT_OPT_PARTICLE_FRUSTUM_SIMD`): x, y, z and w of planes 0 to 3, then of
+    /// planes 4, 5, 4, 5.
+    columns: [[Vec4; 4]; 2],
+    simd: bool,
+}
+
+impl ParticleFrustum {
+    /// Frustum `planes` of the frame with the eye moved back by `back` (three game view vectors).
+    pub(super) fn new(planes: [Vec4; 6], back: Vec3, simd: bool) -> Self {
+        // Eye moved by −back: each plane tests p + back with the old planes.
+        let planes = planes.map(|p| p + Vec4::new(0.0, 0.0, 0.0, p.truncate().dot(back)));
+        let column =
+            |ids: [usize; 4]| [0, 1, 2, 3].map(|axis| Vec4::from_array(ids.map(|i| planes[i].to_array()[axis])));
+        ParticleFrustum { planes, columns: [column([0, 1, 2, 3]), column([4, 5, 4, 5])], simd }
+    }
+
+    /// The point `p` is on the inner side of the six planes.
+    #[inline]
+    pub fn contains_point(&self, p: [f32; 3]) -> bool {
+        if self.simd {
+            return self.contains_point_by_columns(p);
+        }
+        let at = Vec3::from(p);
+        self.planes.iter().all(|plane| plane.truncate().dot(at) + plane.w >= 0.0)
+    }
+
+    /// [`Self::contains_point`] with the planes four at a time in SIMD lanes (SSE2, part of every
+    /// x86-64): the same products and sums in the same order, so the same answer bit for bit.
+    #[inline]
+    fn contains_point_by_columns(&self, p: [f32; 3]) -> bool {
+        let (x, y, z) = (Vec4::splat(p[0]), Vec4::splat(p[1]), Vec4::splat(p[2]));
+        self.columns.iter().all(|[px, py, pz, pw]| (*px * x + *py * y + *pz * z + *pw).cmpge(Vec4::ZERO).all())
+    }
+}
+
+/// The game's view vector for its particle frustum: its culling matrix (projection × view)
+/// applied transposed to the depth axis. The game's culling projection maps depth to [0, 1]
+/// (OpenGL with clip control, Vulkan), whose depth row is far / (near − far) times the view's
+/// backward axis: the look direction, a little longer than one block. Our own projection is
+/// reversed, so the row is rebuilt rather than read from our matrix.
+pub(super) fn game_view_vector(yaw: f32, pitch: f32, near: f32, far: f32) -> Vec3 {
+    let backward = crate::camera::view_rotation(yaw, pitch).row(2).truncate();
+    backward * (far / (near - far))
+}
+
+/// [`ParticleFrustum`] of a camera at `eye` with the culling projection `(fov, aspect, far)`.
+pub(super) fn particle_frustum_of(
+    eye: [f64; 3],
+    yaw: f32,
+    pitch: f32,
+    (fov, aspect, far): (f32, f32, f32),
+    simd: bool,
+) -> ParticleFrustum {
+    let (_, _, view_m) = crate::camera::view_matrix(eye, yaw, pitch);
+    let planes = frustum_planes(perspective(fov, aspect, CULL_NEAR, far) * view_m);
+    let back = game_view_vector(yaw, pitch, CULL_NEAR, far) * PARTICLE_EYE_BACK;
+    ParticleFrustum::new(planes, back, simd)
+}
+
 impl Renderer {
     /// "Box in the field of view" test of the frame (frame relative to the camera's integer origin),
     /// same projection as the render.
-    pub fn visibility(
-        &self,
-        eye: [f64; 3],
-        yaw: f32,
-        pitch: f32,
-        far: f32,
-    ) -> impl Fn([f32; 3], [f32; 3]) -> bool + use<> {
+    pub fn visibility(&self, eye: [f64; 3], yaw: f32, pitch: f32, far: f32) -> FrameVisibility {
         let (origin, _, view_m) = crate::camera::view_matrix(eye, yaw, pitch);
         let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
-        let proj = perspective(self.view.cull_fov, aspect, 0.05, far);
+        let proj = perspective(self.view.cull_fov, aspect, CULL_NEAR, far);
         let (_, min_y, sections, reached) = self.reached_set.clone();
         let view = FrameView {
             planes: frustum_planes(proj * view_m),
@@ -282,14 +349,15 @@ impl Renderer {
             reached,
             occlusion: self.occlusion && !self.all_entities,
         };
-        let tally = crate::perf_log::on().then(VerdictTally::default);
-        move |min, max| {
-            let verdict = view.verdict(min, max);
-            if let Some(t) = &tally {
-                t.add(verdict);
-            }
-            verdict.visible()
-        }
+        FrameVisibility::new(view, VisibilityPaths::from_switches())
+    }
+
+    /// The game's particle test of the frame ([`ParticleFrustum`]): same culling frustum as
+    /// [`Self::visibility`], eye moved back three view vectors.
+    pub fn particle_frustum(&self, eye: [f64; 3], yaw: f32, pitch: f32, far: f32) -> ParticleFrustum {
+        let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
+        let simd = rc_data::opt_switch!("RUSTCRAFT_OPT_PARTICLE_FRUSTUM_SIMD");
+        particle_frustum_of(eye, yaw, pitch, (self.view.cull_fov, aspect, far), simd)
     }
 
     /// Perf log: the last visibility walk reached a section of column `(x, z)`; `None` before

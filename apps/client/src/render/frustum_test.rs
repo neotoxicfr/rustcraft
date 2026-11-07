@@ -131,3 +131,202 @@ fn verdict_classes_follow_the_sections() {
     assert_eq!(view.verdict([0.0, 0.0, behind], [0.2, 0.2, behind + 0.2]), BoxVerdict::Outside);
     assert_eq!(no_occlusion.verdict([2.0, 2.0, other], [2.2, 2.2, other + 0.2]), BoxVerdict::Unchecked);
 }
+
+/// The game's particle test rebuilt as the game computes it (reference): culling matrix in floats
+/// (projection with depth in [0, 1], times the camera rotation), six planes taken from its rows as
+/// the game's frustum library does (near = w + z, a rule written for depth in [−1, 1]), normalised;
+/// eye moved back by three view vectors (the depth row of that matrix) in doubles; point taken
+/// relative to it in doubles, then cast to a float.
+struct GameParticleTest {
+    planes: [Vec4; 6],
+    eye: [f64; 3],
+}
+
+impl GameParticleTest {
+    fn new(eye: [f64; 3], yaw: f32, pitch: f32, (fov, aspect, far): (f32, f32, f32)) -> Self {
+        let near = 0.05f32;
+        let h = (fov.to_radians() * 0.5).tan();
+        let projection = Mat4::from_cols(
+            Vec4::new(1.0 / (h * aspect), 0.0, 0.0, 0.0),
+            Vec4::new(0.0, 1.0 / h, 0.0, 0.0),
+            Vec4::new(0.0, 0.0, far / (near - far), -1.0),
+            Vec4::new(0.0, 0.0, far * near / (near - far), 0.0),
+        );
+        let m = projection * crate::camera::view_rotation(yaw, pitch);
+        let r = [m.row(0), m.row(1), m.row(2), m.row(3)];
+        let planes = [r[3] + r[0], r[3] - r[0], r[3] + r[1], r[3] - r[1], r[3] + r[2], r[3] - r[2]]
+            .map(|p| p / p.truncate().length());
+        let view_vector = m.row(2);
+        let eye = std::array::from_fn(|i| eye[i] + f64::from(view_vector[i] * -3.0));
+        GameParticleTest { planes, eye }
+    }
+
+    /// The game's answer at `p`, and whether `p` is too close to a plane for float rounding (or to
+    /// the game's near plane, which its [−1, 1] rule puts at half the distance of ours: three
+    /// blocks behind the camera, never on screen) to settle it the same way in both frames.
+    fn test(&self, p: [f64; 3]) -> (bool, bool) {
+        let q = Vec3::from(std::array::from_fn(|i| (p[i] - self.eye[i]) as f32));
+        let d = self.planes.map(|plane| plane.truncate().dot(q) + plane.w);
+        let close = d.iter().any(|v| v.abs() < 1e-3) || d[4].abs() < 0.06;
+        (d.iter().all(|&v| v >= 0.0), close)
+    }
+}
+
+/// Point relative to the integer origin of `eye`, as the particles hand it over.
+fn relative(eye: [f64; 3], p: [f64; 3]) -> [f32; 3] {
+    [(p[0] - eye[0].floor()) as f32, p[1] as f32, (p[2] - eye[2].floor()) as f32]
+}
+
+/// Particles drawn by `drawn` that the game does not draw or the reverse, over random cameras and
+/// points (around the camera, out of the world in height, behind it), the close calls left out.
+fn particle_differences(drawn: impl Fn([f64; 3], f32, f32, [f32; 3]) -> bool) -> u32 {
+    let projection = (70.0, 16.0 / 9.0, 512.0);
+    let mut rng = Rng(0x5851_f42d_4c95_7f2d);
+    let mut different = 0;
+    for _ in 0..400 {
+        let eye = [
+            f64::from(rng.below(2000)) - 1000.37,
+            f64::from(rng.below(400)) - 70.6,
+            f64::from(rng.below(2000)) - 999.81,
+        ];
+        let (yaw, pitch) = (rng.unit() * 360.0 - 180.0, rng.unit() * 180.0 - 90.0);
+        let game = GameParticleTest::new(eye, yaw, pitch, projection);
+        for _ in 0..250 {
+            let reach = [4.0, 20.0, 80.0][rng.below(3) as usize];
+            let p: [f64; 3] = std::array::from_fn(|i| eye[i] + f64::from(rng.unit() * 2.0 - 1.0) * reach);
+            let (want, close) = game.test(p);
+            if !close {
+                different += u32::from(drawn(eye, yaw, pitch, relative(eye, p)) != want);
+            }
+        }
+    }
+    different
+}
+
+#[test]
+fn particles_are_culled_like_the_game() {
+    let projection = (70.0, 16.0 / 9.0, 512.0);
+    for simd in [false, true] {
+        let ours = |eye, yaw, pitch, p| particle_frustum_of(eye, yaw, pitch, projection, simd).contains_point(p);
+        assert_eq!(particle_differences(ours), 0, "simd {simd}");
+    }
+    // Sabotages: the eye left in place; the entities' test (occlusion) kept for the particles.
+    let not_moved_back = |eye, yaw, pitch, p| {
+        let (_, _, view_m) = crate::camera::view_matrix(eye, yaw, pitch);
+        let planes = frustum_planes(perspective(projection.0, projection.1, 0.05, projection.2) * view_m);
+        ParticleFrustum::new(planes, Vec3::ZERO, false).contains_point(p)
+    };
+    assert!(particle_differences(not_moved_back) > 0, "eye not moved back: not caught");
+    let with_occlusion = |eye: [f64; 3], yaw, pitch, p| {
+        let (origin, _, view_m) = crate::camera::view_matrix(eye, yaw, pitch);
+        let planes = frustum_planes(perspective(projection.0, projection.1, 0.05, projection.2) * view_m);
+        let planes = ParticleFrustum::new(planes, game_view_vector(yaw, pitch, 0.05, projection.2) * 3.0, false).planes;
+        // Only the camera's own section reached.
+        let own = ((eye[0].floor() as i32) >> 4, (eye[1].floor() as i32 + 64) >> 4, (eye[2].floor() as i32) >> 4);
+        let reached = std::sync::Arc::new(Reach::Set([own].into_iter().collect()));
+        FrameView { planes, origin, min_y: -64, sections: 24, reached, occlusion: true }.verdict(p, p).visible()
+    };
+    assert!(particle_differences(with_occlusion) > 0, "occlusion kept: not caught");
+}
+
+/// The cases the game's particle test decides differently from the entities' test (A3): a centre
+/// just off screen, in a section the walk did not reach, out of the world in height; and those it
+/// decides like it: behind the camera, NaN and infinities.
+#[test]
+fn particle_test_edge_cases() {
+    let projection = (70.0, 16.0 / 9.0, 512.0);
+    let eye = [100.5, 70.2, -40.7];
+    let (yaw, pitch) = (30.0, 10.0);
+    let ours = particle_frustum_of(eye, yaw, pitch, projection, false);
+    let game = GameParticleTest::new(eye, yaw, pitch, projection);
+    let (right, up, forward) = crate::camera::axes(yaw, pitch);
+    let at = |d: Vec3| std::array::from_fn(|i| eye[i] + f64::from(d[i]));
+    // 20 blocks ahead, just beyond the right edge of the true field (half-angle along x).
+    let half_width = (projection.0.to_radians() * 0.5).tan() * projection.1 * 20.0;
+    let off_screen = at(forward * 20.0 + right * (half_width + 1.0));
+    let (shown, _) = game.test(off_screen);
+    assert!(shown, "the game draws a centre one block off screen at 20 blocks");
+    assert!(ours.contains_point(relative(eye, off_screen)));
+    let (origin, _, view_m) = crate::camera::view_matrix(eye, yaw, pitch);
+    let true_field = frustum_planes(perspective(projection.0, projection.1, 0.05, projection.2) * view_m);
+    let p = relative(eye, off_screen);
+    assert!(!aabb_visible(&true_field, Vec3::from(p), Vec3::from(p)), "the entities' test hides it");
+    // Behind the camera, farther than the three blocks: hidden by both.
+    let behind = at(forward * -6.0);
+    assert!(!game.test(behind).0 && !ours.contains_point(relative(eye, behind)));
+    // In view, in a section nobody reached, and far above the world: drawn (no occlusion).
+    let ahead = relative(eye, at(forward * 30.0 + up * 2.0));
+    assert!(ours.contains_point(ahead));
+    let empty_walk = std::sync::Arc::new(Reach::Set([(1000, 0, 1000)].into_iter().collect()));
+    let entities =
+        FrameView { planes: true_field, origin, min_y: -64, sections: 24, reached: empty_walk, occlusion: true };
+    assert!(!entities.verdict(ahead, ahead).visible(), "the entities' test hides an unreached section");
+    let sky = GameParticleTest::new([0.5, 400.0, 0.5], 0.0, -60.0, projection);
+    let ours_sky = particle_frustum_of([0.5, 400.0, 0.5], 0.0, -60.0, projection, false);
+    let high = [0.5, 420.0, 30.0];
+    assert_eq!(ours_sky.contains_point(relative([0.5, 400.0, 0.5], high)), sky.test(high).0);
+    for simd in [false, true] {
+        let f = particle_frustum_of(eye, yaw, pitch, projection, simd);
+        for p in [[f32::NAN, 0.0, 0.0], [0.0, f32::INFINITY, 0.0], [f32::NEG_INFINITY, 0.0, 5.0], [f32::NAN; 3]] {
+            assert!(!f.contains_point(p), "{p:?}, simd {simd}");
+        }
+    }
+}
+
+/// The SIMD planes answer like the scalar ones, bit for bit, on points of every kind.
+#[test]
+fn particle_simd_test_matches_the_scalar_one() {
+    let mut rng = Rng(0xd1b5_4a32_d192_ed03);
+    let special = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -0.0, 1.0e30, -1.0e30, f32::MIN_POSITIVE];
+    for _ in 0..400 {
+        let eye =
+            [f64::from(rng.below(200)) - 100.5, f64::from(rng.below(120)) - 30.25, f64::from(rng.below(200)) - 100.75];
+        let (yaw, pitch) = (rng.unit() * 360.0, rng.unit() * 180.0 - 90.0);
+        let projection = (30.0 + rng.unit() * 80.0, 0.5 + rng.unit() * 2.0, 64.0 + rng.unit() * 900.0);
+        let (scalar, simd) = (
+            particle_frustum_of(eye, yaw, pitch, projection, false),
+            particle_frustum_of(eye, yaw, pitch, projection, true),
+        );
+        for _ in 0..250 {
+            let p: [f32; 3] = std::array::from_fn(|_| match rng.below(20) {
+                0 => special[rng.below(special.len() as u64) as usize],
+                _ => rng.unit() * 160.0 - 80.0,
+            });
+            assert_eq!(simd.contains_point(p), scalar.contains_point(p), "{p:?}");
+        }
+    }
+}
+
+/// Micro-bench (machine loaded by other agents' builds: an order of magnitude only): one particle
+/// point per call, the game's test scalar and SIMD against the entities' test of before.
+#[test]
+#[ignore = "micro-bench: cargo test --release -p rc-app particle_frustum_bench -- --ignored --nocapture"]
+fn particle_frustum_bench() {
+    let mut rng = Rng(0x0123_4567_89ab_cdef);
+    let eye = [10.5, 70.25, -3.75];
+    let (yaw, pitch) = (20.0, 5.0);
+    let projection = (70.0, 16.0 / 9.0, 512.0);
+    let points: Vec<[f32; 3]> = (0..1_000_000)
+        .map(|_| [rng.unit() * 120.0 - 60.0, 40.0 + rng.unit() * 60.0, rng.unit() * 120.0 - 60.0])
+        .collect();
+    let time = |name: &str, test: &dyn Fn([f32; 3]) -> bool| {
+        let best = (0..5)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                std::hint::black_box(points.iter().filter(|p| test(**p)).count());
+                t.elapsed().as_secs_f64() * 1e9 / points.len() as f64
+            })
+            .fold(f64::MAX, f64::min);
+        eprintln!("particle points, {name}: {best:.2} ns per point");
+    };
+    let scalar = particle_frustum_of(eye, yaw, pitch, projection, false);
+    let simd = particle_frustum_of(eye, yaw, pitch, projection, true);
+    time("game frustum, scalar", &|p| scalar.contains_point(p));
+    time("game frustum, SIMD", &|p| simd.contains_point(p));
+    let (origin, _, view_m) = crate::camera::view_matrix(eye, yaw, pitch);
+    let planes = frustum_planes(perspective(projection.0, projection.1, 0.05, projection.2) * view_m);
+    let list: Vec<_> = (-4..=4).flat_map(|x| (0..24).flat_map(move |y| (-4..=4).map(move |z| (x, y, z)))).collect();
+    let reached = std::sync::Arc::new(Reach::Grid(ReachGrid::new(&list)));
+    let view = FrameView { planes, origin, min_y: -64, sections: 24, reached, occlusion: true };
+    time("entities' test of before", &|p| view.verdict(p, p).visible());
+}

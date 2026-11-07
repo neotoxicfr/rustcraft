@@ -46,6 +46,12 @@ impl EventFx {
     pub fn kinetic_since(&self, id: i32, now: i64, pt: f32) -> f32 {
         self.kinetic.get(&id).map_or(0.0, |&t| (now - t) as f32 + pt)
     }
+
+    /// New world (join, respawn): entity ids start again from 1 and the game time is another
+    /// one, so the kinetic hits of the old world must not mute or pose a new entity of the same id.
+    pub fn reset_world(&mut self) {
+        self.kinetic.clear();
+    }
 }
 
 /// Box and orientation of an entity at the time of the event.

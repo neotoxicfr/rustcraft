@@ -10,7 +10,7 @@ use std::f64::consts::PI;
 
 use rc_physics::body::{Bobber, BobberTick, Body, Follow, clip_blocks};
 
-use crate::entities::{Entities, Entity, rot_lerp};
+use crate::entities::{Entities, Entity, MotionFamily, kind_id_filters_on, rot_lerp};
 use crate::particles::{Kind as PKind, Options as POptions, Particles};
 
 /// Movement family of a type.
@@ -37,6 +37,31 @@ enum Family {
     Bobber,
 }
 
+/// Movement family of an entity: from the facts of its type (`RUSTCRAFT_OPT_KIND_ID_FILTERS`), or
+/// from its type name (old path).
+fn family_of(e: &Entity, by_facts: bool) -> Option<Family> {
+    if by_facts { family_of_motion(e.facts.motion) } else { family(&e.kind) }
+}
+
+fn family_of_motion(m: MotionFamily) -> Option<Family> {
+    Some(match m {
+        MotionFamily::None => return None,
+        MotionFamily::Arrow => Family::Arrow { water: 0.6 },
+        MotionFamily::Trident => Family::Arrow { water: 0.99 },
+        MotionFamily::ThrownLight => Family::Thrown { gravity: 0.03 },
+        MotionFamily::ThrownPotion => Family::Thrown { gravity: 0.05 },
+        MotionFamily::ExperienceBottle => Family::Thrown { gravity: 0.07 },
+        MotionFamily::Fireball => Family::Hurting { inertia: 0.95, liquid: 0.8, accel: 0.1 },
+        MotionFamily::WindCharge => Family::Hurting { inertia: 1.0, liquid: 1.0, accel: 0.0 },
+        MotionFamily::LlamaSpit => Family::Spit,
+        MotionFamily::ShulkerBullet => Family::Bullet,
+        MotionFamily::EyeOfEnder => Family::Eye,
+        MotionFamily::FireworkRocket => Family::Firework,
+        MotionFamily::FishingBobber => Family::Bobber,
+    })
+}
+
+/// Movement family by type name (old path, test reference).
 fn family(kind: &str) -> Option<Family> {
     Some(match kind {
         "arrow" | "spectral_arrow" => Family::Arrow { water: 0.6 },
@@ -179,6 +204,54 @@ impl Trail<'_> {
     }
 }
 
+/// Eyes of a Loyalty trident's thrower (id given at spawn): the local player while alive and not a
+/// spectator, otherwise a living entity of the table.
+fn thrower_eye(ents: &Entities, me: &Follow, id: i32) -> Option<[f64; 3]> {
+    if id == me.id {
+        return me.eligible().then(|| [me.pos[0], me.pos[1] + me.eye, me.pos[2]]);
+    }
+    let o = ents.map.get(&id)?;
+    (o.death_time == 0).then(|| [o.pos[0], o.pos[1] + f64::from(o.dims(&ents.dims)[1]), o.pos[2]])
+}
+
+/// Hooked entity of a bobber (id + 1 in data 8): its feet raised by 0.8 of its height.
+fn hook_point(ents: &Entities, me: &Follow, bobber: &Entity) -> Option<(i32, [f64; 3])> {
+    let id = bobber.meta_int(8).filter(|&v| v > 0)? - 1;
+    if id == me.id {
+        return Some((id, [me.pos[0], me.pos[1] + player_height(me.eye) * 0.8, me.pos[2]]));
+    }
+    let o = ents.map.get(&id)?;
+    let h = f64::from(o.dims(&ents.dims)[0]);
+    Some((id, [o.pos[0], o.pos[1] + h * 0.8, o.pos[2]]))
+}
+
+/// Points that pull projectiles, by entity id: thrower eyes of the Loyalty tridents, hooked
+/// entities of the bobbers.
+type PullPoints = Vec<(i32, [f64; 3])>;
+
+/// Thrower eyes of the Loyalty tridents and points of the bobber hooks, in table order. One walk
+/// that reads the facts of each type.
+fn throwers_and_hooks(ents: &Entities, me: &Follow) -> (PullPoints, PullPoints) {
+    let (mut owners, mut hooks) = (Vec::new(), Vec::new());
+    for e in ents.map.values() {
+        if e.facts.trident && e.meta_byte(11) > 0 {
+            owners.extend(thrower_eye(ents, me, e.data).map(|p| (e.data, p)));
+        } else if e.facts.fishing_bobber {
+            hooks.extend(hook_point(ents, me, e));
+        }
+    }
+    (owners, hooks)
+}
+
+/// `throwers_and_hooks` by two walks that compare type names (old path, test reference).
+fn throwers_and_hooks_by_name(ents: &Entities, me: &Follow) -> (PullPoints, PullPoints) {
+    let tridents = ents.map.values().filter(|e| e.kind == "trident" && e.meta_byte(11) > 0);
+    let owners = tridents.filter_map(|e| thrower_eye(ents, me, e.data).map(|p| (e.data, p))).collect();
+    let bobbers = ents.map.values().filter(|e| e.kind == "fishing_bobber");
+    let hooks = bobbers.filter_map(|e| hook_point(ents, me, e)).collect();
+    (owners, hooks)
+}
+
 /// One client tick of the known projectiles. `me`: local player (possible thrower of a trident,
 /// holder of a hooked bobber); `game_time`: game time (bobber seed);
 /// `fast_lava`: fast lava in this dimension (current push); `power`: acceleration power
@@ -194,47 +267,35 @@ pub(crate) fn tick(
     power: &hashbrown::HashMap<i32, f64>,
     ps: &mut Particles,
 ) {
-    let mut fx = Trail { ps };
     static SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0x2545_f491_4f6c_dd1d);
     let mut seed = SEED.load(std::sync::atomic::Ordering::Relaxed);
+    let by_facts = kind_id_filters_on();
+    tick_projectiles(ents, phys, w, me, game_time, fast_lava, power, ps, &mut seed, by_facts);
+    SEED.store(seed, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `tick` with the randomness of the entities `shared_seed` and the kind test chosen
+/// (`by_facts`: facts of the type, otherwise type names).
+#[allow(clippy::too_many_arguments)]
+fn tick_projectiles(
+    ents: &mut Entities,
+    phys: &rc_physics::Tables,
+    w: &dyn rc_physics::World,
+    me: Follow,
+    game_time: i64,
+    fast_lava: bool,
+    power: &hashbrown::HashMap<i32, f64>,
+    ps: &mut Particles,
+    shared_seed: &mut u64,
+    by_facts: bool,
+) {
+    let mut fx = Trail { ps };
+    let mut seed = *shared_seed;
     let mut boxes = Vec::new();
     let mut gone = Vec::new();
-    // Eyes of the Loyalty trident throwers (id given at spawn).
-    let owners: Vec<(i32, [f64; 3])> = ents
-        .map
-        .values()
-        .filter(|e| e.kind == "trident" && e.meta_byte(11) > 0)
-        .filter_map(|e| {
-            let id = e.data;
-            let eye = if id == me.id {
-                me.eligible().then(|| [me.pos[0], me.pos[1] + me.eye, me.pos[2]])
-            } else {
-                let o = ents.map.get(&id)?;
-                (o.death_time == 0).then(|| [o.pos[0], o.pos[1] + f64::from(o.dims(&ents.dims)[1]), o.pos[2]])
-            };
-            eye.map(|p| (id, p))
-        })
-        .collect();
-    // Bobber hooks (id + 1 in data 8): feet of the entity at 0.8 of
-    // its height.
-    let hooks: Vec<(i32, [f64; 3])> = ents
-        .map
-        .values()
-        .filter(|e| e.kind == "fishing_bobber")
-        .filter_map(|e| {
-            let id = e.meta_int(8).filter(|&v| v > 0)? - 1;
-            let p = if id == me.id {
-                [me.pos[0], me.pos[1] + player_height(me.eye) * 0.8, me.pos[2]]
-            } else {
-                let o = ents.map.get(&id)?;
-                let h = f64::from(o.dims(&ents.dims)[0]);
-                [o.pos[0], o.pos[1] + h * 0.8, o.pos[2]]
-            };
-            Some((id, p))
-        })
-        .collect();
+    let (owners, hooks) = if by_facts { throwers_and_hooks(ents, &me) } else { throwers_and_hooks_by_name(ents, &me) };
     for (&id, e) in ents.map.iter_mut() {
-        let Some(fam) = family(&e.kind) else { continue };
+        let Some(fam) = family_of(e, by_facts) else { continue };
         if e.vehicle.is_some() {
             continue;
         }
@@ -480,11 +541,14 @@ pub(crate) fn tick(
         }
         put_body(e, b);
     }
-    SEED.store(seed, std::sync::atomic::Ordering::Relaxed);
+    *shared_seed = seed;
     for id in gone {
         ents.map.remove(&id);
     }
 }
+
+#[cfg(test)]
+mod equivalence_tests;
 
 #[cfg(test)]
 mod tests {

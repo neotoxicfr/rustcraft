@@ -1417,6 +1417,43 @@ impl ReachGrid {
     pub fn is_empty(&self) -> bool {
         self.bits.is_empty()
     }
+
+    /// One of the sections with x in `xs`, height in `ys` and z in `zs` (inclusive ranges) is
+    /// reached: the answer of [`Self::contains`] over the whole range. Each range is clamped to
+    /// the grid once (outside it nothing is reached); with `y_runs`, the heights of a column,
+    /// side by side in the grid, are read as one run of bits.
+    pub fn any_in_box(&self, xs: [i32; 2], ys: [i32; 2], zs: [i32; 2], y_runs: bool) -> bool {
+        let clamp = |range: [i32; 2], axis: usize| {
+            let low = (i64::from(range[0]) - self.lo[axis]).max(0);
+            let high = (i64::from(range[1]) - self.lo[axis]).min(self.n[axis] - 1);
+            (low <= high).then_some((low as usize, high as usize))
+        };
+        let (Some(dx), Some(dy), Some(dz)) = (clamp(xs, 0), clamp(ys, 1), clamp(zs, 2)) else { return false };
+        let (ny, nz) = (self.n[1] as usize, self.n[2] as usize);
+        (dx.0..=dx.1).any(|x| {
+            (dz.0..=dz.1).any(|z| {
+                let column = (x * nz + z) * ny;
+                if y_runs {
+                    self.any_bit_in(column + dy.0, column + dy.1)
+                } else {
+                    (dy.0..=dy.1).any(|y| self.bits[(column + y) >> 6] >> ((column + y) & 63) & 1 != 0)
+                }
+            })
+        })
+    }
+
+    /// A bit is set among `first..=last`.
+    fn any_bit_in(&self, first: usize, last: usize) -> bool {
+        let (first_word, last_word) = (first >> 6, last >> 6);
+        let from_first = !0u64 << (first & 63);
+        let up_to_last = !0u64 >> (63 - (last & 63));
+        if first_word == last_word {
+            return self.bits[first_word] & from_first & up_to_last != 0;
+        }
+        self.bits[first_word] & from_first != 0
+            || self.bits[last_word] & up_to_last != 0
+            || self.bits[first_word + 1..last_word].iter().any(|&w| w != 0)
+    }
 }
 
 /// Reached sections for the visibility test of entities, particles, block entities, leashes.

@@ -596,7 +596,8 @@ impl Renderer {
         }
         // Read callbacks handled at the next submit (wgpu picks up finished work there).
         if !self.no_poll {
-            let _ = self.device.poll(wgpu::PollType::Poll);
+            // Watched as a GPU wait: the poll also frees the finished work's resources, a spike suspect.
+            let _ = crate::present_watch::during(Stage::GpuWait, || self.device.poll(wgpu::PollType::Poll));
         }
         if let Some(pending) = readback {
             self.capture_readback(pending);

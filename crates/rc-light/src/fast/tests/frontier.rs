@@ -39,8 +39,8 @@ fn seed_zone(world: &World, t: &LightTables, cs: &[[i32; 3]], sky: bool, opts: &
     let (sky_geo, _) = sky_zone(world, &first, &mut w.aux, cs, block_geo);
     let g = if sky { sky_geo } else { block_geo };
     read(world, &first, &mut w, g, sky, !sky);
-    let Work { face, prop, emit, sky: sky_sheet, blk, aux, .. } = &mut w;
-    let z = Cells { face, prop, emit };
+    let Work { face, prop, emit, emitters, sky: sky_sheet, blk, aux, .. } = &mut w;
+    let z = Cells { face, prop, emit, emitters };
     let read_sheet = if sky { sky_sheet.clone() } else { blk.clone() };
     opts.iter()
         .map(|&o| {

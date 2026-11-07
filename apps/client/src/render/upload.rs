@@ -144,7 +144,6 @@ pub struct Uploader {
     device: wgpu::Device,
     ring: bool,
     opts: Options,
-    #[cfg_attr(not(test), expect(dead_code, reason = "read by the per-frame uploads once the layers migrate"))]
     layer_opts: per_frame::LayerOptions,
     enc: Option<wgpu::CommandEncoder>,
     active: Option<Active>,

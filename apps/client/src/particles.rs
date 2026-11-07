@@ -17,6 +17,9 @@ use rc_physics::{Aabb, Fluid};
 use rc_world::ChunkGrid;
 use serde_json::Value;
 
+use crate::render::upload::Uploader;
+use crate::render::upload::per_frame::FrameBuffer;
+
 /// Capacity of a queue (§ 2.1) and threshold of the progressive admission.
 const CAPACITY: usize = 16_384;
 const CROWDED: usize = 12_288;
@@ -714,6 +717,18 @@ thread_local! {
     static SCRATCH: RefCell<(Vec<Aabb>, Vec<Aabb>)> = const { RefCell::new((Vec::new(), Vec::new())) };
 }
 
+/// Per block state, what it adds to the light of a particle in its cell: the light it emits
+/// (0 to 15), or `GLOWS` for a state drawn emissive (magma), whose particles take full light.
+const GLOWS: u8 = 0x80;
+
+/// Packed light of the kinds lit whatever the world (block 15 × 16, sky 15 × 16 << 8).
+const FULL_BRIGHT: u32 = 0xf0 | (0xf0 << 8);
+
+fn particle_glow_per_state(data: &rc_data::VersionData) -> Vec<u8> {
+    let emissive = |s: &rc_data::StateInfo| s.light & rc_data::light_bits::EMISSIVE != 0;
+    data.states.iter().map(|s| if emissive(s) { GLOWS } else { s.light_emission.min(15) }).collect()
+}
+
 fn light_nibble(layers: &[rc_world::LightLayer], min_y: i32, x: i32, y: i32, z: i32) -> u8 {
     let sy = ((y - min_y) >> 4) + 1;
     let Some(Some(layer)) = usize::try_from(sy).ok().and_then(|i| layers.get(i)) else { return 0 };
@@ -732,13 +747,23 @@ impl TickWorld<'_> {
         c.block((x & 15) as usize, ly as usize, (z & 15) as usize)
     }
 
-    /// Light (block, sky) of the block; chunk absent: sky 15, block 0.
-    fn light(&self, x: i32, y: i32, z: i32) -> (u8, u8) {
+    /// Light (block, sky) a particle in block (x, y, z) takes, as the game reads it: chunk absent
+    /// or above the world, block 0 and sky 15; in a block drawn emissive (`glow` holds [`GLOWS`]
+    /// for its state), full light; otherwise the block layer raised to the light the block itself
+    /// emits.
+    fn light(&self, x: i32, y: i32, z: i32, glow: &[u8]) -> (u8, u8) {
         let Some(c) = self.grid.get(x >> 4, z >> 4) else { return (0, 15) };
-        if y >= self.min_y + self.height {
+        let local_y = y - self.min_y;
+        if local_y >= self.height {
             return (0, 15);
         }
-        (light_nibble(&c.block_light, self.min_y, x, y, z), light_nibble(&c.sky_light, self.min_y, x, y, z))
+        let state = if local_y >= 0 { c.block((x & 15) as usize, local_y as usize, (z & 15) as usize) } else { None };
+        let own = state.and_then(|s| glow.get(s as usize)).copied().unwrap_or(0);
+        if own & GLOWS != 0 {
+            return (15, 15);
+        }
+        let block = light_nibble(&c.block_light, self.min_y, x, y, z).max(own);
+        (block, light_nibble(&c.sky_light, self.min_y, x, y, z))
     }
 
     /// Fluid of the block and its height.
@@ -938,6 +963,21 @@ struct P {
     biome: u32,
     /// Vibration signal that follows an entity: id and height above the feet.
     vib_target: Option<(i32, f32)>,
+    /// Last world light read ([`P::world_light`]).
+    light_cache: std::cell::Cell<LightCache>,
+}
+
+/// World light (block, sky) a particle read last (`RUSTCRAFT_OPT_PARTICLE_LIGHT_EPOCH_CACHE`), with
+/// the grid's write epoch and the block it was read at: while both are the same, so is the light.
+/// The position moves only at a tick, but the grid also changes when ticks are frozen, hence the
+/// epoch rather than a reset at each tick. (The world's height range changes only with a new grid,
+/// whose epochs are new.)
+#[derive(Clone, Copy, Debug, Default)]
+struct LightCache {
+    /// 0 (never a grid epoch): nothing read yet.
+    epoch: u64,
+    block: [i32; 3],
+    light: (u8, u8),
 }
 
 /// Tint extracted from a state: kind (`rc_data::tint::*`) and value (ARGB colour, or offset
@@ -1072,6 +1112,7 @@ impl P {
             spark_child: false,
             biome: 0,
             vib_target: None,
+            light_cache: std::cell::Cell::default(),
         }
     }
 
@@ -1769,21 +1810,69 @@ impl P {
         (size, self.rgba[3])
     }
 
-    /// Packed light (block × 16, sky × 16 << 8).
-    fn light(&self, w: &TickWorld<'_>, t: f32) -> u32 {
-        let full = 0xf0 | (0xf0 << 8);
-        let b = self.pos.map(|v| v.floor() as i32);
-        let (block, sky) = w.light(b[0], b[1], b[2]);
-        let (block, sky) = (u32::from(block) * 16, u32::from(sky) * 16);
+    /// Packed light (block × 16, sky × 16 << 8); `glow`: per state, what the block adds
+    /// ([`TickWorld::light`]).
+    fn light(&self, world: &TickWorld<'_>, glow: &[u8], paths: LightPaths, partial_tick: f32) -> u32 {
+        #[cfg(test)]
+        if paths.sabotage == Some(LightSabotage::EmissiveAsFullBright) && self.kind.flame() {
+            return FULL_BRIGHT;
+        }
+        if !paths.lazy {
+            // Path before: the world read first, whatever the kind does with it.
+            let read = self.world_light(world, glow, paths);
+            return self.light_of_kind(partial_tick, || read);
+        }
+        // The world is read only by the kinds whose light depends on it (not the full-bright
+        // explosions of a TNT salvo, nor the fireflies).
+        self.light_of_kind(partial_tick, || self.world_light(world, glow, paths))
+    }
+
+    /// World light (block, sky) at the particle's block ([`TickWorld::light`]); with the epoch
+    /// cache, the last read while the block and the grid's write epoch stay the same.
+    fn world_light(&self, world: &TickWorld<'_>, glow: &[u8], paths: LightPaths) -> (u8, u8) {
+        // Floor without the C library call (same result as `floor() as i32`, saturated).
+        let block_pos = self.pos.map(rc_data::java_math::floor_to_i32);
+        if !paths.epoch_cache {
+            return world.light(block_pos[0], block_pos[1], block_pos[2], glow);
+        }
+        let epoch = world.grid.epoch();
+        let cached = self.light_cache.get();
+        #[cfg(test)]
+        let epoch_matches = cached.epoch == epoch || paths.sabotage == Some(LightSabotage::EpochIgnored);
+        #[cfg(not(test))]
+        let epoch_matches = cached.epoch == epoch;
+        if epoch_matches && cached.block == block_pos {
+            return cached.light;
+        }
+        let light = world.light(block_pos[0], block_pos[1], block_pos[2], glow);
+        self.light_cache.set(LightCache { epoch, block: block_pos, light });
+        light
+    }
+
+    /// Light by the kind's rule; `world()` = (block, sky) at the particle's block, called only by
+    /// the kinds that use it.
+    fn light_of_kind(&self, partial_tick: f32, world: impl Fn() -> (u8, u8)) -> u32 {
+        let scaled = || {
+            let (block, sky) = world();
+            (u32::from(block) * 16, u32::from(sky) * 16)
+        };
         let life = self.life.max(1) as f32;
-        let emissive = |f: f32| (block + (f.clamp(0.0, 1.0) * 240.0) as u32).min(240) | (sky << 8);
+        let emissive = |f: f32| {
+            let (block, sky) = scaled();
+            (block + (f.clamp(0.0, 1.0) * 240.0) as u32).min(240) | (sky << 8)
+        };
+        let full_block_own_sky = || 240 | (scaled().1 << 8);
         match self.kind {
-            k if k.flame() => emissive((self.age as f32 + t) / life),
-            K::Glow | K::ElectricSpark | K::WaxOn | K::WaxOff | K::Scrape => emissive((self.age as f32 + t) / life),
+            k if k.flame() => emissive((self.age as f32 + partial_tick) / life),
+            K::Glow | K::ElectricSpark | K::WaxOn | K::WaxOff | K::Scrape => {
+                emissive((self.age as f32 + partial_tick) / life)
+            }
             K::Portal | K::ReversePortal | K::Enchant | K::Nautilus => emissive((self.age as f32 / life).powi(4)),
-            K::DrippingObsidianTear | K::FallingObsidianTear | K::LandingObsidianTear => 240 | (sky << 8),
+            K::DrippingObsidianTear | K::FallingObsidianTear | K::LandingObsidianTear => full_block_own_sky(),
             // Firefly: its own glow only, sky ignored.
-            K::Firefly => ((255.0 * fade(progress(self.age as f32 + t, self.life), 0.1, 0.3)) as u32).min(240),
+            K::Firefly => {
+                ((255.0 * fade(progress(self.age as f32 + partial_tick, self.life), 0.1, 0.3)) as u32).min(240)
+            }
             K::Lava
             | K::SculkCharge
             | K::SculkChargePop
@@ -1792,7 +1881,7 @@ impl P {
             | K::TrialDetection
             | K::TrialDetectionOminous
             | K::OminousSpawning
-            | K::VaultConnection => 240 | (sky << 8),
+            | K::VaultConnection => full_block_own_sky(),
             K::Explosion
             | K::SweepAttack
             | K::TotemOfUndying
@@ -1803,11 +1892,46 @@ impl P {
             | K::SmallGust
             | K::SquidInk
             | K::GlowSquidInk
-            | K::Trail => full,
-            K::SculkSoul => 240 | (sky << 8),
-            _ => block | (sky << 8),
+            | K::Trail => FULL_BRIGHT,
+            K::SculkSoul => full_block_own_sky(),
+            _ => {
+                let (block, sky) = scaled();
+                block | (sky << 8)
+            }
         }
     }
+}
+
+/// How a particle's light is computed, read once per frame from the switches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LightPaths {
+    /// `RUSTCRAFT_OPT_LAZY_PARTICLE_LIGHT`: the world read only by the kinds that use it.
+    lazy: bool,
+    /// `RUSTCRAFT_OPT_PARTICLE_LIGHT_EPOCH_CACHE`: each particle keeps its last read ([`LightCache`]).
+    epoch_cache: bool,
+    #[cfg(test)]
+    sabotage: Option<LightSabotage>,
+}
+
+impl LightPaths {
+    fn from_switches() -> Self {
+        LightPaths {
+            lazy: rc_data::opt_switch!("RUSTCRAFT_OPT_LAZY_PARTICLE_LIGHT"),
+            epoch_cache: rc_data::opt_switch!("RUSTCRAFT_OPT_PARTICLE_LIGHT_EPOCH_CACHE"),
+            #[cfg(test)]
+            sabotage: None,
+        }
+    }
+}
+
+/// Faults injected by the tests, each of which must make the equivalence proof fail.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LightSabotage {
+    /// The flames, whose light grows from the block light, taken as full bright.
+    EmissiveAsFullBright,
+    /// A cached light kept after the grid changed.
+    EpochIgnored,
 }
 
 /// Factory (§ 3): `p` = velocity-parameter passed.
@@ -2837,6 +2961,8 @@ pub struct Particles {
     /// Per state: tint of the block fragments, colour of the falling dust (client data).
     terrain: Vec<StateTint>,
     dust: Vec<StateTint>,
+    /// Per state, what the block adds to the light of a particle in its cell ([`TickWorld::light`]).
+    glow: Vec<u8>,
     /// Eyes of the player aiming with a spyglass, read at the last tick.
     scope: Option<[f64; 3]>,
     /// Biome colours (palette, blend radius, biome of absent columns) for the
@@ -2899,6 +3025,7 @@ impl Particles {
             started: Instant::now(),
             terrain: data.client_states.iter().map(|c| c.particle_tint).collect(),
             dust: data.client_states.iter().map(|c| c.dust).collect(),
+            glow: particle_glow_per_state(data),
             scope: None,
             biomes: (std::sync::Arc::new(Vec::new()), rc_mesh::blocks::BIOME_BLEND, 0),
             gas: GasTables::new(data),
@@ -3351,7 +3478,7 @@ impl Particles {
     }
 
     /// Instances of the frame: interpolation, size, sprite, colour and light; opaque then
-    /// translucent, in insertion order. `in_view`: box (relative to the origin) visible.
+    /// translucent, in insertion order. `cull`: which tick positions (relative to the origin) are drawn.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &mut self,
@@ -3361,26 +3488,43 @@ impl Particles {
         yaw: f32,
         pitch: f32,
         pt: f32,
-        in_view: &dyn Fn([f32; 3], [f32; 3]) -> bool,
+        cull: ParticleCull<'_>,
     ) {
         let t0 = Instant::now();
         if let Some(img) = self.assets.image.take() {
             out.pending_atlas = Some(img);
         }
-        let origin = [eye[0].floor(), eye[2].floor()];
         let (right, up, _) = crate::camera::axes(yaw, pitch);
         out.right_up = [right.extend(0.0).to_array(), up.extend(0.0).to_array()];
-        out.opaque.clear();
-        out.trans.clear();
+        let lists = InstanceLists { opaque: &mut out.opaque, trans: &mut out.trans, layers: &out.layers };
+        self.fill_instances(lists, w, eye, pt, cull, LightPaths::from_switches());
+        self.stats.prepare_s += t0.elapsed().as_secs_f64();
+        self.stats.frames += 1;
+    }
+
+    /// The instances of [`Self::prepare`], in `lists` (emptied first).
+    fn fill_instances(
+        &self,
+        lists: InstanceLists<'_>,
+        w: &TickWorld<'_>,
+        eye: [f64; 3],
+        pt: f32,
+        cull: ParticleCull<'_>,
+        light_paths: LightPaths,
+    ) {
+        let InstanceLists { opaque, trans, layers } = lists;
+        opaque.clear();
+        trans.clear();
+        let origin = [eye[0].floor(), eye[2].floor()];
         let a = &self.assets;
         let pt64 = f64::from(pt);
         for p in &self.quads {
-            let rel = |v: [f64; 3]| [(v[0] - origin[0]) as f32, v[1] as f32, (v[2] - origin[1]) as f32];
-            let now = rel(p.pos);
-            if !in_view(now, now) {
+            // The rejections that read no position first: the culling test is the dearer one.
+            if p.kind == K::Shriek && p.param[0] > 0.0 || p.hidden() {
                 continue;
             }
-            if p.kind == K::Shriek && p.param[0] > 0.0 || p.hidden() {
+            let rel = |v: [f64; 3]| [(v[0] - origin[0]) as f32, v[1] as f32, (v[2] - origin[1]) as f32];
+            if !cull.shows(rel(p.pos)) {
                 continue;
             }
             let (size, alpha) = p.render_size(pt);
@@ -3400,7 +3544,7 @@ impl Particles {
             // shriek, 3 camera-facing without tilting (fixed vertical axis), 4 and 5 planes of the
             // vibration signal (heading in the roll, pitch and sway on 14 bits each).
             let tex = if p.block_tex > 0 {
-                match out.layers.get((p.block_tex - 1) as usize) {
+                match layers.get((p.block_tex - 1) as usize) {
                     Some(&l) if l != u32::MAX => l + 1,
                     _ => continue,
                 }
@@ -3426,7 +3570,7 @@ impl Particles {
                 size,
                 uv,
                 color: c(rgb[0]) | c(rgb[1]) << 8 | c(rgb[2]) << 16 | c(alpha) << 24,
-                light: p.light(w, pt),
+                light: p.light(w, &self.glow, light_paths, pt),
                 roll: p.old_roll + (p.roll - p.old_roll) * pt,
                 tex,
             };
@@ -3436,15 +3580,41 @@ impl Particles {
                 _ => None,
             };
             if p.translucent || alpha < 1.0 {
-                out.trans.push(inst);
-                out.trans.extend(second);
+                trans.push(inst);
+                trans.extend(second);
             } else {
-                out.opaque.push(inst);
-                out.opaque.extend(second);
+                opaque.push(inst);
+                opaque.extend(second);
             }
         }
-        self.stats.prepare_s += t0.elapsed().as_secs_f64();
-        self.stats.frames += 1;
+    }
+}
+
+/// Where a frame's particle instances go: the opaque and translucent lists, and the layer of
+/// each block texture (`u32::MAX`: absent) for the block fragments.
+struct InstanceLists<'a> {
+    opaque: &'a mut Vec<Inst>,
+    trans: &'a mut Vec<Inst>,
+    layers: &'a [u32],
+}
+
+/// How the frame decides which particles are drawn.
+#[derive(Clone, Copy)]
+pub enum ParticleCull<'a> {
+    /// The game's test (`RUSTCRAFT_OPT_PARTICLE_GAME_FRUSTUM`, default): tick position in the
+    /// frustum whose eye is moved back three blocks, no occlusion (`visibility.md`, particles).
+    GameFrustum(&'a crate::render::ParticleFrustum),
+    /// The test before (`=0`): the entities' visibility test on the tick position, occlusion included.
+    LikeEntities(&'a crate::render::FrameVisibility),
+}
+
+impl ParticleCull<'_> {
+    #[inline]
+    fn shows(&self, p: [f32; 3]) -> bool {
+        match self {
+            ParticleCull::GameFrustum(frustum) => frustum.contains_point(p),
+            ParticleCull::LikeEntities(visibility) => visibility.point(p),
+        }
     }
 }
 
@@ -3552,20 +3722,31 @@ pub struct Inst {
     tex: u32,
 }
 
+/// Size of the screen axes uniform (right and up, four floats each).
+const AXES_BYTES: u64 = 32;
+
+/// The tests read the particle buffers back from the GPU, which takes a copy source.
+#[cfg(test)]
+const READ_BACK: wgpu::BufferUsages = wgpu::BufferUsages::COPY_SRC;
+#[cfg(not(test))]
+const READ_BACK: wgpu::BufferUsages = wgpu::BufferUsages::empty();
+
 /// GPU side: two pipelines (opaque with the entities, translucent after the translucent
 /// terrain), particle atlas, one reused instance buffer.
 pub struct ParticleRenderer {
     opaque_pl: wgpu::RenderPipeline,
     trans_pl: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
-    axes: wgpu::Buffer,
+    /// Screen axes (uniform, 32 bytes), made with the renderer: the atlas's binding points at it.
+    axes: FrameBuffer,
     bind: Option<wgpu::BindGroup>,
     pending_atlas: Option<Image>,
     /// Block texture → layer of the main array (`u32::MAX`: absent).
     layers: Vec<u32>,
     opaque: Vec<Inst>,
     trans: Vec<Inst>,
-    buf: Option<(wgpu::Buffer, u64)>,
+    /// Instances of the frame, opaque then translucent.
+    instances: FrameBuffer,
     counts: (u32, u32),
     right_up: [[f32; 4]; 2],
     /// Camera layout (group 0), for the pipelines made on demand.
@@ -3603,7 +3784,7 @@ impl ParticleRenderer {
 
     /// Translucents, stage `f` of the improved transparency; group 0 (camera) is already bound.
     pub fn draw_translucent_oit(&self, pass: &mut wgpu::RenderPass<'_>, f: crate::oit::Frame<'_>) {
-        let (Some(bind), Some((buf, _)), Some(set)) = (&self.bind, &self.buf, &self.oit) else { return };
+        let (Some(bind), Some(buf), Some(set)) = (&self.bind, self.instances.buffer(), &self.oit) else { return };
         if self.counts.1 == 0 {
             return;
         }
@@ -3691,12 +3872,8 @@ impl ParticleRenderer {
         };
         let opaque_pl = pipeline("opaque particles", None);
         let trans_pl = pipeline("translucent particles", Some(wgpu::BlendState::ALPHA_BLENDING));
-        let axes = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("particles (axes)"),
-            size: 32,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let mut axes = FrameBuffer::new("particles (axes)", wgpu::BufferUsages::UNIFORM | READ_BACK, AXES_BYTES);
+        axes.reserve(device, AXES_BYTES);
         ParticleRenderer {
             opaque_pl,
             trans_pl,
@@ -3707,7 +3884,7 @@ impl ParticleRenderer {
             layers,
             opaque: Vec::new(),
             trans: Vec::new(),
-            buf: None,
+            instances: FrameBuffer::new("particles", wgpu::BufferUsages::VERTEX | READ_BACK, 16 * 1024),
             counts: (0, 0),
             right_up: [[0.0; 4]; 2],
             camera_layout: camera_layout.clone(),
@@ -3715,7 +3892,13 @@ impl ParticleRenderer {
         }
     }
 
-    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, _up: &mut crate::render::upload::Uploader) {
+    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, up: &mut Uploader) {
+        self.upload_with(device, queue, up, rc_data::opt_switch!("RUSTCRAFT_OPT_PARTICLE_WRITE_WITH"));
+    }
+
+    /// [`Self::upload`], the frame's writes through the uploader or (`through_uploader` false, the
+    /// path before) through the queue.
+    fn upload_with(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, up: &mut Uploader, through_uploader: bool) {
         if let Some(img) = self.pending_atlas.take() {
             let tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("particle atlas"),
@@ -3743,7 +3926,7 @@ impl ParticleRenderer {
                 layout: &self.layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: self.axes.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: self.axes_buffer().as_entire_binding() },
                 ],
             }));
         }
@@ -3751,22 +3934,40 @@ impl ParticleRenderer {
         if self.counts == (0, 0) {
             return;
         }
-        queue.write_buffer(&self.axes, 0, bytemuck::cast_slice(&self.right_up));
-        let size = std::mem::size_of::<Inst>() as u64;
-        let need = (u64::from(self.counts.0) + u64::from(self.counts.1)) * size;
-        if self.buf.as_ref().is_none_or(|(_, cap)| *cap < need) {
-            let cap = need.next_power_of_two().max(16 * 1024);
-            self.buf = Some((
-                device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("particles"),
-                    size: cap,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }),
-                cap,
-            ));
+        if through_uploader {
+            self.write_through_uploader(queue, up);
+        } else {
+            self.write_through_queue(device, queue);
         }
-        let buf = &self.buf.as_ref().expect("created above").0;
+    }
+
+    fn axes_buffer(&self) -> &wgpu::Buffer {
+        self.axes.buffer().expect("axes buffer made with the renderer")
+    }
+
+    /// The frame's writes through the uploader (`RUSTCRAFT_OPT_PARTICLE_WRITE_WITH`): its transit
+    /// ring (`RUSTCRAFT_OPT_FRAME_WRITES_RING`) instead of a staging buffer made and dropped per
+    /// write, the opaque and translucent instances copied into one write, and the bytes counted
+    /// with the renderer's other writes.
+    fn write_through_uploader(&mut self, queue: &wgpu::Queue, up: &mut Uploader) {
+        self.axes.write(up, queue, bytemuck::cast_slice(&self.right_up));
+        let (opaque, trans): (&[u8], &[u8]) = (bytemuck::cast_slice(&self.opaque), bytemuck::cast_slice(&self.trans));
+        self.instances.write_with(up, queue, (opaque.len() + trans.len()) as u64, |mut view| {
+            if !opaque.is_empty() {
+                view.slice(..opaque.len()).copy_from_slice(opaque);
+            }
+            if !trans.is_empty() {
+                view.slice(opaque.len()..).copy_from_slice(trans);
+            }
+        });
+    }
+
+    /// The writes of before: three queue writes, each with its own staging buffer.
+    fn write_through_queue(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        queue.write_buffer(self.axes_buffer(), 0, bytemuck::cast_slice(&self.right_up));
+        let size = std::mem::size_of::<Inst>() as u64;
+        self.instances.reserve(device, (u64::from(self.counts.0) + u64::from(self.counts.1)) * size);
+        let buf = self.instances.buffer().expect("reserved above");
         if !self.opaque.is_empty() {
             queue.write_buffer(buf, 0, bytemuck::cast_slice(&self.opaque));
         }
@@ -3786,7 +3987,7 @@ impl ParticleRenderer {
     }
 
     fn draw(&self, pass: &mut wgpu::RenderPass<'_>, pipeline: &wgpu::RenderPipeline, range: std::ops::Range<u32>) {
-        let (Some(bind), Some((buf, _))) = (&self.bind, &self.buf) else { return };
+        let (Some(bind), Some(buf)) = (&self.bind, self.instances.buffer()) else { return };
         if range.is_empty() {
             return;
         }
@@ -3798,10 +3999,11 @@ impl ParticleRenderer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn assets() -> ParticleAssets {
+    /// One blank sprite for every particle: enough for code that only spawns particles.
+    pub(crate) fn assets() -> ParticleAssets {
         ParticleAssets {
             rects: vec![[0.0, 0.0, 16.0, 16.0]],
             translucent: vec![false],
@@ -3902,6 +4104,7 @@ mod tests {
             started: Instant::now(),
             terrain: Vec::new(),
             dust: Vec::new(),
+            glow: Vec::new(),
             scope: None,
             biomes: (std::sync::Arc::new(Vec::new()), 2, 0),
             gas: GasTables::new(&rc_data::VersionData::default()),
@@ -3986,6 +4189,281 @@ mod tests {
         let q = p.quads.iter().find(|q| q.kind == K::Block).expect("fragment admitted");
         assert_eq!(q.rgba[..3], rgb_of(0x30_60c0).map(|c| 0.6 * c));
         assert_eq!(q.biome, 0);
+    }
+
+    /// Light of a particle as the game reads it: in a block drawn emissive, full light (sky
+    /// included, so the kinds that keep only the sky get 15 too); in a block that emits light, at
+    /// least that light; column absent: block 0, sky 15. Before, the raw layers alone (0 in both
+    /// blocks here, whose light data say nothing).
+    #[test]
+    fn particle_light_inside_glowing_blocks() {
+        const MAGMA: u32 = 1;
+        const LANTERN: u32 = 2;
+        let data = rc_data::VersionData::default();
+        let glow = vec![0, GLOWS, 12];
+        let mut grid = ChunkGrid::new(2);
+        grid.insert(column(0, &[([1, 1, 1], MAGMA), ([2, 1, 1], LANTERN)], 15));
+        let phys = rc_physics::Tables::new(&data);
+        let w = TickWorld { grid: &grid, min_y: 0, height: 16, phys: &phys, player: None, scope: None };
+        for paths in all_light_paths() {
+            let light = |kind: Kind, at: [f64; 3]| P::base(kind, at, Rng(3)).light(&w, &glow, paths, 0.0);
+            assert_eq!(light(K::Smoke, [1.5, 1.5, 1.5]), FULL_BRIGHT, "emissive block, {paths:?}");
+            assert_eq!(light(K::Lava, [1.5, 1.5, 1.5]), FULL_BRIGHT, "sky kept by a block-15 kind: 15, {paths:?}");
+            assert_eq!(light(K::Smoke, [2.5, 1.5, 1.5]), 12 * 16, "emitting block, {paths:?}");
+            assert_eq!(light(K::Smoke, [3.5, 1.5, 1.5]), 0, "air, layers absent, {paths:?}");
+            assert_eq!(light(K::Smoke, [40.5, 1.5, 1.5]), 240 << 8, "column absent, {paths:?}");
+            assert_eq!(light(K::Smoke, [1.5, 30.0, 1.5]), 240 << 8, "above the world, {paths:?}");
+        }
+    }
+
+    /// Sizes of the per-particle and per-instance data the frame walks (rule B10): the light
+    /// cache adds 24 bytes to each particle, an instance stays 48 bytes.
+    #[test]
+    fn particle_frame_data_sizes() {
+        assert_eq!(std::mem::size_of::<LightCache>(), 24);
+        assert_eq!(std::mem::size_of::<Inst>(), 48);
+    }
+
+    /// The four combinations of the light paths, the path before first.
+    fn all_light_paths() -> [LightPaths; 4] {
+        [(false, false), (false, true), (true, false), (true, true)].map(|(lazy, epoch_cache)| LightPaths {
+            lazy,
+            epoch_cache,
+            sabotage: None,
+        })
+    }
+
+    /// A column (0, 0) of one section with every light value somewhere: block light and sky light
+    /// as two different patterns, a glowing and an emitting block.
+    fn lit_column() -> rc_world::Column {
+        let mut c = column(0, &[([1, 1, 1], 1), ([2, 1, 1], 2)], 15);
+        let pattern = |step: u8| std::sync::Arc::new(std::array::from_fn(|i| (i as u8).wrapping_mul(step)));
+        c.block_light[1] = Some(pattern(37));
+        c.sky_light[1] = Some(pattern(101));
+        c
+    }
+
+    /// Bytes of the frame's instances (opaque then translucent), every particle shown.
+    fn instance_bytes(p: &Particles, grid: &ChunkGrid, paths: LightPaths) -> Vec<u8> {
+        let data = rc_data::VersionData::default();
+        let phys = rc_physics::Tables::new(&data);
+        let w = TickWorld { grid, min_y: 0, height: 16, phys: &phys, player: None, scope: None };
+        let (mut opaque, mut trans) = (Vec::new(), Vec::new());
+        let lists = InstanceLists { opaque: &mut opaque, trans: &mut trans, layers: &[] };
+        let everything = crate::render::FrameVisibility::everything();
+        p.fill_instances(lists, &w, [8.0, 8.0, 8.0], 0.4, ParticleCull::LikeEntities(&everything), paths);
+        [bytemuck::cast_slice::<Inst, u8>(&opaque), bytemuck::cast_slice(&trans)].concat()
+    }
+
+    /// The light paths give the same instances byte for byte (light included) on a mix of
+    /// full-bright, emissive and ordinary kinds over varied light; again after the light changes and
+    /// after the column is unloaded with no tick in between (ticks frozen); each sabotage is caught.
+    #[test]
+    fn light_paths_give_the_same_instances() {
+        let data = rc_data::VersionData::default();
+        let mut p = engine(&data);
+        p.glow = vec![0, GLOWS, 12];
+        let kinds = [
+            K::Smoke,
+            K::Poof,
+            K::Flame,
+            K::SoulFireFlame,
+            K::Portal,
+            K::Enchant,
+            K::Firefly,
+            K::Lava,
+            K::Explosion,
+            K::EndRod,
+            K::Glow,
+            K::DrippingObsidianTear,
+            K::SculkSoul,
+            K::Heart,
+            K::Note,
+        ];
+        p.quads = (0..600)
+            .map(|i| {
+                let at = [(i % 16) as f64 + 0.5, ((i / 16) % 16) as f64 + 0.3, ((i * 7) % 16) as f64 + 0.5];
+                let mut q = P::base(kinds[i % kinds.len()], at, Rng(i as u64 + 1));
+                q.age = (i as i32) % q.life.max(1);
+                q
+            })
+            .collect();
+        let mut grid = ChunkGrid::new(2);
+        grid.insert(lit_column());
+        let check = |p: &Particles, grid: &ChunkGrid, what: &str| {
+            let [eager, rest @ ..] = all_light_paths();
+            let want = instance_bytes(p, grid, eager);
+            assert_eq!(want.len(), 600 * std::mem::size_of::<Inst>(), "{what}: every particle drawn");
+            for paths in rest {
+                assert!(instance_bytes(p, grid, paths) == want, "{what}: {paths:?}");
+            }
+        };
+        check(&p, &grid, "first frame");
+        check(&p, &grid, "same world, lights kept");
+        let cached = LightPaths { lazy: true, epoch_cache: true, sabotage: None };
+        let stale = LightPaths { sabotage: Some(LightSabotage::EpochIgnored), ..cached };
+        let sky = std::sync::Arc::new(std::array::from_fn(|i| (i as u8).wrapping_mul(53)));
+        grid.get_mut_by(0, 0, rc_world::ColumnWriter::LightUpdate).expect("column").sky_light[1] = Some(sky);
+        assert!(instance_bytes(&p, &grid, stale) != instance_bytes(&p, &grid, all_light_paths()[0]), "stale kept");
+        check(&p, &grid, "light changed, no tick");
+        instance_bytes(&p, &grid, cached);
+        grid.remove(0, 0);
+        assert!(instance_bytes(&p, &grid, stale) != instance_bytes(&p, &grid, all_light_paths()[0]), "unload");
+        check(&p, &grid, "column unloaded, no tick");
+        grid.insert(lit_column());
+        let flames_full = LightPaths { sabotage: Some(LightSabotage::EmissiveAsFullBright), ..cached };
+        assert!(instance_bytes(&p, &grid, flames_full) != instance_bytes(&p, &grid, cached), "flames full bright");
+    }
+
+    /// An instance whose every field tells frame `n`, index `i` and list `list` apart.
+    fn numbered_instance(n: usize, i: usize, list: u32) -> Inst {
+        let v = (n * 10_000 + i) as f32;
+        Inst {
+            pos: [v, -v, list as f32],
+            size: v * 0.5,
+            uv: [v, v + 1.0, v + 2.0, v + 3.0],
+            color: (n as u32) << 24 | i as u32,
+            light: i as u32 ^ 0xf0f0,
+            roll: -v * 0.25,
+            tex: list << 29 | n as u32,
+        }
+    }
+
+    /// The instances and the screen axes reach the GPU the same byte for byte through the uploader,
+    /// with and without its transit ring, as through the queue (the path before), over frames that
+    /// grow the buffer, hold only opaque or only translucent instances, and shrink.
+    #[test]
+    fn particle_writes_reach_the_gpu_unchanged() {
+        use crate::render::upload::tests::{gpu, read};
+        let Some((device, queue)) = gpu() else { return };
+        let camera = crate::render::camera_layout(&device, false);
+        let frames = [(3, 2), (500, 0), (0, 700), (2000, 1500), (40, 1)];
+        let read_frames = |through_uploader: bool, ring: bool| -> Vec<Vec<u8>> {
+            let mut r = ParticleRenderer::new(&device, &camera, wgpu::TextureFormat::Rgba8Unorm, Vec::new());
+            let mut up = Uploader::new(&device, ring);
+            let mut out = Vec::new();
+            for (n, &(opaque, trans)) in frames.iter().enumerate() {
+                r.opaque = (0..opaque).map(|i| numbered_instance(n, i, 0)).collect();
+                r.trans = (0..trans).map(|i| numbered_instance(n, i, 1)).collect();
+                r.right_up = [[n as f32; 4], [-(n as f32); 4]];
+                r.upload_with(&device, &queue, &mut up, through_uploader);
+                up.submit(&queue, device.create_command_encoder(&Default::default()).finish());
+                let len = (opaque + trans) * std::mem::size_of::<Inst>();
+                let mut bytes = read(&device, &queue, r.instances.buffer().expect("written"))[..len].to_vec();
+                bytes.extend(read(&device, &queue, r.axes_buffer()));
+                out.push(bytes);
+            }
+            out
+        };
+        let want = read_frames(false, true);
+        assert!(read_frames(true, true) == want, "through the ring");
+        assert!(read_frames(true, false) == want, "through the uploader without the ring");
+    }
+
+    /// Micro-bench on the GPU (machine loaded by other agents' builds: an order of magnitude only):
+    /// CPU time of a frame's particle writes plus its submission, through the queue (before) and
+    /// through the uploader with and without its ring; staging buffers and bytes per frame. Alone,
+    /// and in a frame where another layer already writes through the ring (its transit command
+    /// buffer then exists anyway, as in the client).
+    #[test]
+    #[ignore = "micro-bench: cargo test --release -p rc-app particle_writes_bench -- --ignored --nocapture"]
+    fn particle_writes_bench() {
+        let Some((device, queue)) = crate::render::upload::tests::gpu() else { return };
+        let camera = crate::render::camera_layout(&device, false);
+        let other_layer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let paths = [("queue", false, true), ("uploader, ring", true, true), ("uploader", true, false)];
+        for (count, in_frame) in [1000, 4000, 16_000].into_iter().flat_map(|n| [(n, false), (n, true)]) {
+            for (name, through_uploader, ring) in paths {
+                let mut r = ParticleRenderer::new(&device, &camera, wgpu::TextureFormat::Rgba8Unorm, Vec::new());
+                let mut up = Uploader::new(&device, ring);
+                r.opaque = (0..count / 2).map(|i| numbered_instance(0, i, 0)).collect();
+                r.trans = (0..count / 2).map(|i| numbered_instance(0, i, 1)).collect();
+                let mut best = f64::MAX;
+                for frame in 0..120 {
+                    if in_frame {
+                        up.write(&queue, &other_layer, 0, &[7; 256]);
+                    }
+                    let t = Instant::now();
+                    r.upload_with(&device, &queue, &mut up, through_uploader);
+                    up.submit(&queue, device.create_command_encoder(&Default::default()).finish());
+                    best = best.min(t.elapsed().as_secs_f64() * 1e6);
+                    if frame % 8 == 7 {
+                        device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).expect("GPU wait");
+                    }
+                }
+                let s = up.take_stats();
+                let (transits, kb) = (s.transits as f64 / 120.0, s.bytes as f64 / 120.0 / 1024.0);
+                let place = if in_frame { "in a frame" } else { "alone" };
+                eprintln!(
+                    "{count} particles {place}, {name}: {best:.1} µs per frame, {transits:.2} staging buffers counted, {kb:.1} KB counted"
+                );
+            }
+        }
+    }
+
+    /// Micro-bench (machine loaded by other agents' builds: an order of magnitude only): the
+    /// instances of one frame of 16,000 particles, every one in view, per light path, on a TNT-like
+    /// mix (three explosions, full bright, for one smoke and one poof) and on ordinary kinds; the
+    /// cache measured with the world unchanged (frames between two ticks) and written every frame.
+    #[test]
+    #[ignore = "micro-bench: cargo test --release -p rc-app particle_instances_bench -- --ignored --nocapture"]
+    fn particle_instances_bench() {
+        let data = rc_data::VersionData::default();
+        let phys = rc_physics::Tables::new(&data);
+        let mixes: [(&str, &[Kind]); 2] = [
+            ("tnt mix", &[K::Explosion, K::Explosion, K::Explosion, K::Smoke, K::Poof]),
+            ("ordinary", &[K::Smoke, K::Poof, K::Flame, K::Heart]),
+        ];
+        for (mix, kinds) in mixes {
+            let mut p = engine(&data);
+            p.glow = vec![0, GLOWS, 12];
+            p.quads = (0..16_000)
+                .map(|i| {
+                    let at = [(i % 16) as f64 + 0.5, ((i / 16) % 16) as f64 + 0.3, ((i / 256) % 16) as f64 + 0.5];
+                    P::base(kinds[i % kinds.len()], at, Rng(i as u64 + 1))
+                })
+                .collect();
+            let mut grid = ChunkGrid::new(2);
+            grid.insert(lit_column());
+            let everything = crate::render::FrameVisibility::everything();
+            let (mut opaque, mut trans) = (Vec::new(), Vec::new());
+            let cases: Vec<_> = all_light_paths()
+                .map(|paths| (paths, false))
+                .into_iter()
+                .chain([(all_light_paths()[3], true)])
+                .collect();
+            // Best of 41 each, the four paths interleaved (the load of the machine drifts during the
+            // run); the world written every frame last, as it would empty the others' caches.
+            let mut best = vec![f64::MAX; cases.len()];
+            for written in [false, true] {
+                for _ in 0..41 {
+                    for (n, &(paths, written_every_frame)) in cases.iter().enumerate() {
+                        if written_every_frame != written {
+                            continue;
+                        }
+                        if written_every_frame {
+                            grid.get_mut(0, 0);
+                        }
+                        let w = TickWorld { grid: &grid, min_y: 0, height: 16, phys: &phys, player: None, scope: None };
+                        let t = Instant::now();
+                        let lists = InstanceLists { opaque: &mut opaque, trans: &mut trans, layers: &[] };
+                        let cull = ParticleCull::LikeEntities(&everything);
+                        p.fill_instances(lists, &w, [8.0, 8.0, 8.0], 0.4, cull, paths);
+                        best[n] = best[n].min(t.elapsed().as_secs_f64() * 1e6);
+                    }
+                }
+            }
+            for (&(paths, written_every_frame), best) in cases.iter().zip(best) {
+                let (lazy, cache) = (paths.lazy, paths.epoch_cache);
+                let world = if written_every_frame { ", world written every frame" } else { "" };
+                eprintln!("{mix}, lazy {lazy}, epoch cache {cache}{world}: {best:.0} µs per frame of 16,000");
+            }
+        }
     }
 
     /// Bench (`cargo test --release -p rc-app -- --ignored bench_fragment_tint --nocapture`): cost of

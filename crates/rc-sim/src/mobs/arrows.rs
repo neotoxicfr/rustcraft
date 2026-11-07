@@ -81,42 +81,16 @@ impl Server {
         if from == to {
             return None;
         }
-        let lerp = |k: f64, a: f64, b: f64| a + k * (b - a);
-        let te: [f64; 3] = std::array::from_fn(|i| lerp(-1.0e-7, to[i], from[i]));
-        let fe: [f64; 3] = std::array::from_fn(|i| lerp(-1.0e-7, from[i], to[i]));
-        let mut cell = fe.map(|v| v.floor() as i32);
-        if let Some((t, n)) = self.clip_cell(cell, from, to) {
-            return Some((t, cell, n));
-        }
-        let d: [f64; 3] = std::array::from_fn(|i| te[i] - fe[i]);
-        let sign = d.map(|v| {
-            if v > 0.0 {
-                1
-            } else if v < 0.0 {
-                -1
-            } else {
-                0
+        let mut walk = CellWalk::new(from, to);
+        loop {
+            let cell = walk.cell();
+            if let Some((t, n)) = self.clip_cell(cell, from, to) {
+                return Some((t, cell, n));
             }
-        });
-        let delta: [f64; 3] = std::array::from_fn(|i| if sign[i] == 0 { f64::MAX } else { f64::from(sign[i]) / d[i] });
-        let frac = |v: f64| v - v.floor();
-        let mut t: [f64; 3] =
-            std::array::from_fn(|i| delta[i] * if sign[i] > 0 { 1.0 - frac(fe[i]) } else { frac(fe[i]) });
-        while t[0] <= 1.0 || t[1] <= 1.0 || t[2] <= 1.0 {
-            let a = if t[0] < t[1] {
-                if t[0] < t[2] { 0 } else { 2 }
-            } else if t[1] < t[2] {
-                1
-            } else {
-                2
-            };
-            cell[a] += sign[a];
-            t[a] += delta[a];
-            if let Some((s, n)) = self.clip_cell(cell, from, to) {
-                return Some((s, cell, n));
+            if !walk.advance() {
+                return None;
             }
         }
-        None
     }
 
     /// Test of a cell on the original segment (every sightline of `clip_blocks` goes through it).
@@ -132,9 +106,104 @@ impl Server {
     }
 }
 
+/// The cells a segment crosses, in the order of the game's block walk: the segment's ends pushed
+/// 1e-7 outwards, then one cell at a time through the face the segment crosses first.
+pub(crate) struct CellWalk {
+    cell: [i32; 3],
+    /// Direction of the walk on each axis (-1, 0 or 1).
+    sign: [i32; 3],
+    /// Fraction of the segment between two faces of the same axis (`f64::MAX` on an axis the
+    /// segment does not move along).
+    delta: [f64; 3],
+    /// Fraction of the segment at which the walk crosses the next face of each axis.
+    t: [f64; 3],
+}
+
+impl CellWalk {
+    /// The walk of the segment from `from` to `to` (two different points), on its first cell.
+    pub(crate) fn new(from: [f64; 3], to: [f64; 3]) -> CellWalk {
+        let lerp = |k: f64, a: f64, b: f64| a + k * (b - a);
+        let te: [f64; 3] = std::array::from_fn(|i| lerp(-1.0e-7, to[i], from[i]));
+        let fe: [f64; 3] = std::array::from_fn(|i| lerp(-1.0e-7, from[i], to[i]));
+        let d: [f64; 3] = std::array::from_fn(|i| te[i] - fe[i]);
+        let sign = d.map(|v| {
+            if v > 0.0 {
+                1
+            } else if v < 0.0 {
+                -1
+            } else {
+                0
+            }
+        });
+        let delta: [f64; 3] = std::array::from_fn(|i| if sign[i] == 0 { f64::MAX } else { f64::from(sign[i]) / d[i] });
+        let frac = |v: f64| v - v.floor();
+        let t: [f64; 3] = std::array::from_fn(|i| delta[i] * if sign[i] > 0 { 1.0 - frac(fe[i]) } else { frac(fe[i]) });
+        CellWalk { cell: fe.map(|v| v.floor() as i32), sign, delta, t }
+    }
+
+    pub(crate) fn cell(&self) -> [i32; 3] {
+        self.cell
+    }
+
+    /// Steps into the next cell; false once the segment's end is passed.
+    pub(crate) fn advance(&mut self) -> bool {
+        let t = self.t;
+        if !(t[0] <= 1.0 || t[1] <= 1.0 || t[2] <= 1.0) {
+            return false;
+        }
+        let a = if t[0] < t[1] {
+            if t[0] < t[2] { 0 } else { 2 }
+        } else if t[1] < t[2] {
+            1
+        } else {
+            2
+        };
+        self.cell[a] += self.sign[a];
+        self.t[a] += self.delta[a];
+        true
+    }
+
+    /// Lowest and highest cell, on each axis, of every cell the walk visits from here to the
+    /// segment's end; `None` when that cannot be counted (a crossing fraction not finite, or a
+    /// segment longer than `MAX_COUNTED_CELLS` on an axis). Along one axis the walk steps once
+    /// for each value its crossing fraction takes up to 1, whatever the order the axes are
+    /// stepped in, so the same additions count the last cell exactly.
+    pub(crate) fn cell_range(&self) -> Option<([i32; 3], [i32; 3])> {
+        /// Past this, the count would cost more than the walk it saves.
+        const MAX_COUNTED_CELLS: i32 = 1024;
+        // A NaN fraction breaks the walk's choice of axis: left to the walk itself.
+        if self.t.iter().any(|t| t.is_nan()) {
+            return None;
+        }
+        let (mut low, mut high) = (self.cell, self.cell);
+        for axis in 0..3 {
+            // An axis the segment does not move along keeps its cell (a step on it adds 0).
+            if self.sign[axis] == 0 {
+                continue;
+            }
+            let (mut t, delta) = (self.t[axis], self.delta[axis]);
+            if !(t.is_finite() && delta.is_finite() && delta > 0.0) {
+                return None;
+            }
+            let mut steps = 0;
+            while t <= 1.0 {
+                t += delta;
+                steps += 1;
+                if steps > MAX_COUNTED_CELLS {
+                    return None;
+                }
+            }
+            let last = self.cell[axis] + self.sign[axis] * steps;
+            low[axis] = low[axis].min(last);
+            high[axis] = high[axis].max(last);
+        }
+        Some((low, high))
+    }
+}
+
 /// Test of the collision boxes `boxes` of `cell` on the segment from `from` to `to`: fraction
 /// of the hit and normal of the face hit.
-fn clip_boxes(boxes: &[rc_physics::Aabb], cell: [i32; 3], from: [f64; 3], to: [f64; 3]) -> Option<(f64, [i32; 3])> {
+pub(crate) fn clip_boxes(boxes: &[rc_physics::Aabb], cell: [i32; 3], from: [f64; 3], to: [f64; 3]) -> Option<(f64, [i32; 3])> {
     if boxes.is_empty() {
         return None;
     }

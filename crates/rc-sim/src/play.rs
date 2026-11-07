@@ -123,7 +123,7 @@ pub(crate) fn block_at(chunks: &HashMap<(i32, i32), Option<Box<Chunk>>>, min_y: 
 }
 
 /// State at `p` in its column `c`; `None` outside the column's sections.
-fn block_in(c: &Chunk, min_y: i32, p: [i32; 3]) -> Option<u32> {
+pub(crate) fn block_in(c: &Chunk, min_y: i32, p: [i32; 3]) -> Option<u32> {
     let ly = p[1] - min_y;
     let s = c.sections.get(usize::try_from(ly >> 4).ok()?)?;
     Some(s.blocks.get(block_index((p[0] & 15) as usize, (ly & 15) as usize, (p[2] & 15) as usize)))

@@ -65,6 +65,7 @@ pub(crate) mod inside_blocks; // G5-F02a: shared crossed-block pass
 pub(crate) mod usercache; // L9-COMBAT: profile name cache (`usercache.json`)
 pub mod weather;
 pub mod tickrate;
+mod tick_stages; // composition of the slowest ticks (`RUSTCRAFT_PERFLOG_STAGES`)
 // Mobs (S4).
 pub mod mobs;
 mod walk; // L10-ORDER: one entity walk for every family, in list order
@@ -272,6 +273,10 @@ mod tests_menu_switches; // menu switches: open chest fed and drained by hoppers
 mod bench_menus; // menus: broadcast with a full inventory, open chest re-read, clicks
 #[cfg(test)]
 mod bench_advancement_triggers; // advancement switches: inventory and recipe indexes, location, file and tree loading
+#[cfg(test)]
+mod bench_tnt_heap; // mass explosion: 1,728 TNT blocks set off at once, visible parts and object pass
+#[cfg(test)]
+mod bench_visible_part; // visible part of 1 to 1,000 explosion targets, per call and together
 #[cfg(test)]
 mod tests_perf_pack; // the scene bench's `perf` data pack compiles with our command parser
 #[cfg(test)]

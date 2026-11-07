@@ -87,7 +87,7 @@ impl crate::App {
     /// Inventory key while riding a vehicle with an inventory (§ 2.1): "open the
     /// inventory" command to the server; true if it was sent.
     pub(crate) fn ride_inventory(&mut self) -> bool {
-        let Some(v) = self.vehicle() else { return false };
+        let Some(v) = self.player_vehicle() else { return false };
         let Some(e) = self.entities.map.get(&v) else { return false };
         let k = e.kind.strip_prefix("minecraft:").unwrap_or(&e.kind);
         let has = mount_of(e, 0).is_some()

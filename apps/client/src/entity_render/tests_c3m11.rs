@@ -28,7 +28,7 @@ fn mat_bits(m: &PartMat) -> Vec<u32> {
 
 /// Fingerprint of everything `prepare` placed: matrices, instances per pass, silhouettes,
 /// shadows, free geometry, crystals, number of entities drawn.
-fn digest(r: &EntityRenderer) -> u64 {
+pub(super) fn digest(r: &EntityRenderer) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for m in &r.mats {
         for b in mat_bits(m) {
@@ -39,7 +39,7 @@ fn digest(r: &EntityRenderer) -> u64 {
 }
 
 /// The rest of [`digest`]: everything `prepare` placed but the part matrices.
-fn digest_all_but_matrices(r: &EntityRenderer, mut h: u64) -> u64 {
+pub(super) fn digest_all_but_matrices(r: &EntityRenderer, mut h: u64) -> u64 {
     for (p, list) in r.instances.iter().enumerate() {
         fnv(&mut h, &(p as u32).to_le_bytes());
         for (src, first, count, inst) in list {
@@ -257,7 +257,7 @@ fn run(k: &mut Kit, ents: &[Entity], opt: EntOpt) -> u64 {
 }
 
 /// Prepares the scene (fixed world, light and camera).
-fn prep(k: &mut Kit, ents: &[Entity], opt: EntOpt) {
+pub(super) fn prep(k: &mut Kit, ents: &[Entity], opt: EntOpt) {
     k.r.opt = opt;
     let state = |x: i32, y: i32, z: i32| if y < 64 && (x + z) & 3 == 0 { 1u32 } else { 0 };
     let bright = |x: i32, y: i32, z: i32| (x * 3 + y + z * 5).rem_euclid(16);
@@ -265,7 +265,16 @@ fn prep(k: &mut Kit, ents: &[Entity], opt: EntOpt) {
     let world = ShadowWorld { state: &state, brightness: &bright, ambient: 0.1, biome_tints: &tints };
     let light =
         |x: i32, y: i32, z: i32| ((x * 7 + y * 3 + z).rem_euclid(16) as u8, (x + y * 5 + z * 3).rem_euclid(16) as u8);
-    k.r.prepare(ents.iter(), 0.37, [0, 0], [0.5, 66.0, -2.5], &light, &|_, _| true, Some(&k.items), &world);
+    k.r.prepare(
+        ents.iter(),
+        0.37,
+        [0, 0],
+        [0.5, 66.0, -2.5],
+        &light,
+        &crate::render::FrameVisibility::everything(),
+        Some(&k.items),
+        &world,
+    );
 }
 
 /// Expected fingerprint of the scene (26.3 data and game): any change to what `prepare`
@@ -289,7 +298,7 @@ const GOLDEN_POLY_ROTATIONS: u64 = 0x0ffc_de87_4213_3a49;
 
 /// Largest difference between two lists of part matrices, relative to each entry's size
 /// (at least 1: translations of a few blocks are compared absolutely).
-fn worst_matrix_difference(a: &[PartMat], b: &[PartMat]) -> f32 {
+pub(super) fn worst_matrix_difference(a: &[PartMat], b: &[PartMat]) -> f32 {
     assert_eq!(a.len(), b.len(), "matrix counts");
     let entries = |m: &PartMat| m.m.iter().flatten().chain(m.n.iter().flatten()).copied().collect::<Vec<f32>>();
     a.iter()
@@ -445,7 +454,8 @@ fn kind_table_matches_predicates() {
     for (i, full) in names.iter().enumerate() {
         let n = full.strip_prefix("minecraft:").unwrap_or(full);
         let info = KindInfo::of(n);
-        let old: [(u32, bool); 21] = [
+        let old: [(u32, bool); 22] = [
+            (K_PRIMED_TNT, n == "tnt"),
             (K_BIG_BOX, matches!(n, "ender_dragon" | "ghast" | "happy_ghast" | "giant" | "wither")),
             (K_ILLUSIONER, n == "illusioner"),
             (K_DISPLAY, matches!(n, "block_display" | "item_display" | "text_display")),

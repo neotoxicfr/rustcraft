@@ -223,11 +223,82 @@ struct Script {
     release: bool,
 }
 
+/// `RUSTCRAFT_OPT_PILOT_CHECK_ORDER=0`: a movement packet looks for the player's vehicle (a walk)
+/// before asking whether the client pilots the entity it moves (old path). Both tests are pure:
+/// asking the second one first, a check that the player is its first passenger, answers at once
+/// for every entity the player does not ride.
+fn pilot_check_order_on() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_PILOT_CHECK_ORDER")
+}
+
+/// `RUSTCRAFT_OPT_VEHICLES_FROM_RIDER_LIST=0`: the player's vehicle, the root vehicles and the
+/// seats of the tick are found by walking every entity (old path) instead of the vehicles of
+/// `Entities::riders`.
+pub(crate) fn vehicles_from_rider_list_on() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_VEHICLES_FROM_RIDER_LIST")
+}
+
+/// Which code answers the vehicle questions, from the switches (read once at startup).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RidePaths {
+    /// Vehicles looked for among `Entities::riders` only.
+    pub rider_list: bool,
+    /// Piloting asked before the vehicle walk.
+    pub authority_first: bool,
+}
+
+impl RidePaths {
+    #[cfg(test)]
+    pub const OLD: RidePaths = RidePaths { rider_list: false, authority_first: false };
+
+    pub fn current() -> RidePaths {
+        RidePaths { rider_list: vehicles_from_rider_list_on(), authority_first: pilot_check_order_on() }
+    }
+}
+
+/// Does the local player `player` pilot the root vehicle `id`? It rides it (even through other
+/// passengers) and `authority` grants the client its control (§ 2).
+fn piloted_by_player(
+    ents: &crate::entities::Entities,
+    id: i32,
+    player: i32,
+    authority: impl Fn(i32) -> bool,
+    paths: RidePaths,
+) -> bool {
+    let rides = || {
+        let vehicle = ents.vehicle_carrying(player, paths.rider_list);
+        vehicle.is_some_and(|v| ents.root_vehicle_of(v, paths.rider_list) == id)
+    };
+    #[cfg(test)]
+    if PILOT_CHECK_SABOTAGED.get() {
+        return authority(id) || rides();
+    }
+    // Both tests are pure: the order only decides which one runs when the first one fails.
+    if paths.authority_first {
+        if !authority(id) {
+            return false;
+        }
+        rides()
+    } else {
+        if !rides() {
+            return false;
+        }
+        authority(id)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Sabotage for the proof of the check order: piloted when either test passes.
+    static PILOT_CHECK_SABOTAGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+mod vehicle_tests;
+
 /// State of the mounts in `App`.
 #[derive(Default)]
 pub(crate) struct Riding {
-    /// Attributes received from the other entities (name → value).
-    attrs: HashMap<i32, HashMap<String, f64>>,
     /// Locally simulated vehicle (root) and its physics.
     sim: Option<(i32, Mount)>,
     /// Inputs set by the player at the previous tick.
@@ -238,8 +309,9 @@ pub(crate) struct Riding {
     pub jump: Option<i32>,
     /// Piloted boat and movement key held: attack and use without effect.
     pub hands_busy: bool,
-    /// Acceleration duration seen (pig, strider), to detect a new value.
-    boost_seen: HashMap<i32, i32>,
+    /// Acceleration duration seen per vehicle (pig, strider), to detect a new value; emptied with
+    /// the world (entity ids start again from 1) and pruned of the vehicles gone.
+    last_boost_duration: HashMap<i32, i32>,
     sounds: Vec<RideSound>,
     /// Sustained sounds of the other entities (minecarts, bees, bubble column).
     pub(crate) loops: crate::entity_loops::Loops,
@@ -260,18 +332,18 @@ impl Riding {
         Riding { script, ..Default::default() }
     }
 
-    /// Attributes of another entity (`update_attributes`).
-    pub fn attributes(&mut self, entity: i32, list: &[rc_proto_v777::play::Attribute], names: &[String]) {
-        let map = self.attrs.entry(entity).or_default();
-        for a in list {
-            if let Some(n) = names.get(a.id as usize) {
-                let v = crate::hud_more::attribute_value(n, a);
-                if rc_data::env_flag!("RUSTCRAFT_RIDELOG") {
-                    eprintln!("attribute {entity} {n} = {v}");
-                }
-                map.insert(n.clone(), v);
-            }
-        }
+    /// New world (join, respawn): the entity ids start again from 1, so nothing tied to an id of
+    /// the old world may carry over to the entity that reuses it (physics of the piloted vehicle,
+    /// boost seen, vehicle of the previous tick). Riding sounds are stopped by the caller.
+    pub fn reset_world(&mut self) {
+        self.sim = None;
+        self.vehicle = None;
+        self.last_boost_duration.clear();
+    }
+
+    /// Forgets the boosts seen of the vehicles gone.
+    pub fn prune(&mut self, entities: &crate::entities::Entities) {
+        self.last_boost_duration.retain(|id, _| entities.map.contains_key(id));
     }
 
     /// Piloting script active (clicks accepted without a captured mouse).
@@ -287,19 +359,19 @@ impl Riding {
 
 impl App {
     /// Vehicle of which the local player is a passenger.
-    pub(crate) fn vehicle(&self) -> Option<i32> {
-        self.entities.map.iter().find(|(_, e)| e.passengers.contains(&self.player_id)).map(|(id, _)| *id)
+    pub(crate) fn player_vehicle(&self) -> Option<i32> {
+        self.entities.vehicle_carrying(self.player_id, RidePaths::current().rider_list)
     }
 
     /// Root vehicle (the one that mounts nothing).
-    fn root_vehicle(&self, mut id: i32) -> i32 {
-        for _ in 0..8 {
-            match self.entities.map.iter().find(|(_, e)| e.passengers.contains(&id)) {
-                Some((v, _)) => id = *v,
-                None => break,
-            }
-        }
-        id
+    pub(crate) fn root_vehicle(&self, id: i32) -> i32 {
+        self.entities.root_vehicle_of(id, RidePaths::current().rider_list)
+    }
+
+    /// New world (join, respawn): riding state tied to the old world's entity ids dropped.
+    pub(crate) fn reset_riding_world(&mut self) {
+        self.stop_ride_sounds();
+        self.riding.reset_world();
     }
 
     fn stack_item_name(&self, stack: Option<&rc_proto_v777::item::ItemStack>) -> &str {
@@ -339,7 +411,7 @@ impl App {
     /// Do the normal physics and position sending apply this tick? No if the camera follows
     /// another entity or if the player is a passenger.
     pub(crate) fn moves_freely(&self) -> bool {
-        self.exact.camera.is_none() && self.vehicle().is_none()
+        self.exact.camera.is_none() && self.player_vehicle().is_none()
     }
 
     fn dims_table(&self) -> &[[f32; 4]] {
@@ -352,8 +424,10 @@ impl App {
         (f64::from(s.w), f64::from(s.h))
     }
 
-    fn entity_scale(&self, id: i32) -> f64 {
-        self.riding.attrs.get(&id).and_then(|m| m.get("minecraft:scale")).copied().unwrap_or(1.0)
+    /// Scale of another entity as the game reads it for seats: the synchronised attribute in
+    /// single precision, brought within its type's limits (1 without the entity).
+    fn entity_scale(&self, id: i32) -> f32 {
+        self.entities.map.get(&id).map_or(1.0, Entity::attribute_scale)
     }
 
     // ---------- Tick ----------
@@ -361,7 +435,7 @@ impl App {
     /// Tick of the passenger player and of the vehicles: physics of the piloted vehicle, seats, view.
     pub(crate) fn ride_tick(&mut self, input: &mut rc_physics::Input) {
         self.ride_script(input);
-        let vehicle = self.vehicle();
+        let vehicle = self.player_vehicle();
         if vehicle != self.riding.vehicle {
             self.vehicle_changed(self.riding.vehicle, vehicle);
             self.riding.vehicle = vehicle;
@@ -425,19 +499,18 @@ impl App {
     }
 
     /// Third-person camera setback due to the living mount (§ 5.2): scale ×
-    /// `camera_distance` (happy ghast 8, otherwise 4); 0 without a living mount.
+    /// `camera_distance` (happy ghast 8, otherwise 4), in single precision like the game, which
+    /// does not apply the age scale here; 0 without a living mount.
     pub(crate) fn vehicle_camera_distance(&self) -> f64 {
-        let Some((id, e)) = self.riding.vehicle.and_then(|v| self.entities.map.get(&v).map(|e| (v, e))) else {
+        let Some(e) = self.riding.vehicle.and_then(|v| self.entities.map.get(&v)) else {
             return 0.0;
         };
         if e.class == Kind::Other {
             return 0.0;
         }
-        let a = self.riding.attrs.get(&id);
-        let dist = a.and_then(|m| m.get("minecraft:camera_distance")).copied();
+        let dist = e.synced_attribute(&self.attr_names, "minecraft:camera_distance");
         let dist = dist.unwrap_or(if e.kind == "happy_ghast" { 8.0 } else { 4.0 }).clamp(0.0, 32.0);
-        let age = if e.baby() { 0.5 } else { 1.0 };
-        self.entity_scale(id) * age * dist
+        f64::from(e.attribute_scale() * dist as f32)
     }
 
     /// Clamping of the view of a boat passenger to ±105° of the boat (§ 1.4), also applied on
@@ -504,9 +577,9 @@ impl App {
         // Position and rotation of the entity (repositioning by `move_vehicle` included).
         (m.pos, m.yaw, m.pitch, m.width, m.height) = (e.pos, e.yaw, e.pitch, w, h);
         m.attrs = default_attrs(&e.kind);
-        if let Some(a) = self.riding.attrs.get(&root) {
-            for (n, v) in a {
-                m.attrs.set(n, *v);
+        for &(id, v) in &e.attributes {
+            if let Some(n) = self.attr_names.get(usize::from(id)) {
+                m.attrs.set(n, v);
             }
         }
         m.fast_lava = self.player.fast_lava;
@@ -521,7 +594,7 @@ impl App {
             }
             MountKind::Pig | MountKind::Strider => {
                 let total = e.meta_int(18).unwrap_or(0);
-                if self.riding.boost_seen.insert(root, total).is_some_and(|old| old != total) && total > 0 {
+                if self.riding.last_boost_duration.insert(root, total).is_some_and(|old| old != total) && total > 0 {
                     m.start_boost(total);
                 }
                 m.suffocating = kind == MountKind::Strider && e.meta_bool(19);
@@ -613,8 +686,9 @@ impl App {
             return [0.0, y, f64::from(z)];
         }
         let living = v.class != Kind::Other;
-        let age = if v.baby() { if k.starts_with("camel") { 0.6 } else { 0.5 } } else { 1.0 };
-        let s = if living { self.entity_scale(vid) * age } else { 1.0 };
+        let age: f32 = if v.baby() { if k.starts_with("camel") { 0.6 } else { 0.5 } } else { 1.0 };
+        // Scale times age scale in single precision, as the game multiplies them.
+        let s = if living { f64::from(self.entity_scale(vid) * age) } else { 1.0 };
         match k {
             "camel" | "camel_husk" => {
                 let game_time = self.env.env.clocks.game_time;
@@ -668,20 +742,16 @@ impl App {
         let attach = if pid == self.player_id {
             0.6 * self.player.attribute("minecraft:scale").unwrap_or(1.0)
         } else {
-            rider.map_or(0.0, |r| rider_attach(r, self.entity_scale(pid)))
+            rider.map_or(0.0, |r| rider_attach(r, f64::from(self.entity_scale(pid))))
         };
         Some([v.pos[0] + rot[0], v.pos[1] + rot[1] - attach, v.pos[2] + rot[2]])
     }
 
-    /// All the passengers on their seat, roots first (§ 1.2, 1.3).
+    /// All the passengers on their seat, roots first (§ 1.2, 1.3). The order of the roots does
+    /// not matter: a seat depends only on its own vehicle, placed before it, and a passenger rides
+    /// one vehicle at most.
     fn place_passengers(&mut self) {
-        let mut queue: Vec<i32> = self
-            .entities
-            .map
-            .iter()
-            .filter(|(_, e)| !e.passengers.is_empty() && e.vehicle.is_none_or(|v| !self.entities.map.contains_key(&v)))
-            .map(|(id, _)| *id)
-            .collect();
+        let mut queue = self.entities.seat_roots(RidePaths::current().rider_list);
         let mut done = 0;
         while done < queue.len() && done < 4096 {
             let vid = queue[done];
@@ -753,7 +823,7 @@ impl App {
         }
         // Vehicle vanished or became silent: sounds stopped for good, like the game.
         let gone = self.riding.sounds.iter().any(|s| self.entities.map.get(&s.vehicle).is_none_or(|e| e.meta_bool(4)));
-        if gone || self.vehicle() != self.riding.sounds.first().map(|s| s.vehicle) {
+        if gone || self.player_vehicle() != self.riding.sounds.first().map(|s| s.vehicle) {
             self.stop_ride_sounds();
             return;
         }
@@ -852,7 +922,7 @@ impl App {
 
     /// Inventory key on a vehicle with its own inventory: request to the server (§ 1.6).
     pub(crate) fn vehicle_inventory(&mut self) -> bool {
-        let Some(e) = self.vehicle().and_then(|v| self.entities.map.get(&v)) else { return false };
+        let Some(e) = self.player_vehicle().and_then(|v| self.entities.map.get(&v)) else { return false };
         let k = e.kind.as_str();
         let own = (is_boat(k) && k.contains("chest"))
             || is_equine(k)
@@ -869,7 +939,7 @@ impl App {
         if self.exact.camera.is_some() {
             return;
         }
-        let Some(v) = self.vehicle() else { return };
+        let Some(v) = self.player_vehicle() else { return };
         let root = self.root_vehicle(v);
         let link = self.session.link.clone();
         let p = &self.player;
@@ -891,18 +961,22 @@ impl App {
             E::Motion { id, .. } => *id,
             _ => return false,
         };
-        let piloted = self.vehicle().is_some_and(|v| self.root_vehicle(v) == id && self.local_authority(id));
+        let piloted = self.pilots(id);
         if piloted {
             self.entities.update_base(e);
         }
         piloted
     }
 
+    /// Does the client pilot the root vehicle `id` (the local player rides it and has its control)?
+    fn pilots(&self, id: i32) -> bool {
+        piloted_by_player(&self.entities, id, self.player_id, |r| self.local_authority(r), RidePaths::current())
+    }
+
     /// Speed of the root vehicle `id` if it is piloted locally (boat bubble column,
     /// events 71/72); false otherwise.
     pub(crate) fn piloted_velocity(&mut self, id: i32, f: impl FnOnce(&mut [f64; 3])) -> bool {
-        let piloted = self.vehicle().is_some_and(|v| self.root_vehicle(v) == id && self.local_authority(id));
-        if !piloted {
+        if !self.pilots(id) {
             return false;
         }
         match &mut self.riding.sim {
@@ -918,7 +992,7 @@ impl App {
     /// `move_vehicle` received: repositioning of the piloted vehicle, and reply in every case where it
     /// is piloted locally.
     pub(crate) fn on_move_vehicle(&mut self, pos: [f64; 3], yaw: f32, pitch: f32) {
-        let Some(v) = self.vehicle() else { return };
+        let Some(v) = self.player_vehicle() else { return };
         let root = self.root_vehicle(v);
         if !self.local_authority(root) {
             return;

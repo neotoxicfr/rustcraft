@@ -12,6 +12,31 @@ use crate::{
     widgets,
 };
 
+/// Attributes of another entity (`update_attributes`, `names`: the `minecraft:attribute`
+/// registry) kept by the entity: every value (mounts, mount hearts), and the render scale and
+/// name tag distances in their own fields.
+pub(crate) fn store_attributes(
+    e: &mut crate::entities::Entity,
+    attributes: &[rc_proto_v777::play::Attribute],
+    names: &[String],
+) {
+    for a in attributes {
+        let Some(name) = names.get(a.id as usize) else { continue };
+        let Ok(id) = u16::try_from(a.id) else { continue };
+        let value = hud_more::attribute_value(name, a);
+        if rc_data::env_flag!("RUSTCRAFT_RIDELOG") {
+            eprintln!("attribute {} {name} = {value}", e.id);
+        }
+        e.set_synced_attribute(id, value);
+        match name.as_str() {
+            "minecraft:scale" => e.scale = value as f32,
+            "minecraft:name_tag_distance" => e.tag_dist = value,
+            "minecraft:below_name_distance" => e.below_dist = value,
+            _ => {}
+        }
+    }
+}
+
 impl App {
     pub(crate) fn apply(&mut self, ev: Event) {
         let air = |s: u32, t: &Tables| t.air.get(s as usize).copied().unwrap_or(true);
@@ -23,6 +48,7 @@ impl App {
                 self.cmd.data.dimensions = login.dimensions.clone();
                 self.entities.local = login.player_id;
                 self.entities.clear();
+                self.reset_riding_world();
                 self.misc.reset_world();
                 self.progress.join();
                 // Local player, drawn in third person (`hand-camera.md` § 3.3).
@@ -31,6 +57,7 @@ impl App {
                 self.entities.spawn_me(self.local_uuid, kind, self.player.pos, self.yaw);
                 self.particles.clear();
                 self.ev.totem.reset();
+                self.ev.reset_world();
                 self.act.reset_world();
                 self.palette = Arc::new(blocks::biome_palette(&self.data, &self.colormaps, &biomes));
                 self.env.join(&self.data, &dimension, &biomes, flat);
@@ -93,10 +120,12 @@ impl App {
                     self.player.reset_entity_state();
                 }
                 self.entities.clear();
+                self.reset_riding_world();
                 self.entities.respawn_me(keep & 2 != 0, self.player.pos, self.yaw);
                 self.misc.reset_world();
                 self.particles.clear();
                 self.ev.totem.reset();
+                self.ev.reset_world();
                 self.act.reset_world();
                 if self.death.take().is_some() && !self.front.is_open() {
                     self.grab(true);
@@ -459,7 +488,7 @@ impl App {
             }
             Event::Teleport(p) => {
                 // Passenger: position ignored, acknowledged with the current position (like the game).
-                let passenger = self.vehicle().is_some();
+                let passenger = self.player_vehicle().is_some();
                 let current = (self.player.pos, self.player.vel, self.yaw, self.pitch);
                 let (pos, vel, yaw, pitch) = player_position_values(&p, passenger, current);
                 if let Some(t) = &mut self.trace {
@@ -498,19 +527,10 @@ impl App {
                 }
             }
             Event::Attributes { entity, attributes } => {
-                self.riding.attributes(entity, &attributes, &self.attr_names);
-                self.hud.more.attributes(entity, &attributes, &self.attr_names);
-                // Render scale of living entities, distances of the name tags.
+                // Kept by the entity (mounts, mount hearts), like the game: an unknown entity's
+                // attributes are dropped. Render scale of living entities, distances of the name tags.
                 if let Some(e) = self.entities.map.get_mut(&entity) {
-                    for a in &attributes {
-                        let Some(name) = self.attr_names.get(a.id as usize) else { continue };
-                        match name.as_str() {
-                            "minecraft:scale" => e.scale = hud_more::attribute_value(name, a) as f32,
-                            "minecraft:name_tag_distance" => e.tag_dist = hud_more::attribute_value(name, a),
-                            "minecraft:below_name_distance" => e.below_dist = hud_more::attribute_value(name, a),
-                            _ => {}
-                        }
-                    }
+                    store_attributes(e, &attributes, &self.attr_names);
                 }
             }
             Event::Waypoint(w) => self.hud.more.waypoint(*w),

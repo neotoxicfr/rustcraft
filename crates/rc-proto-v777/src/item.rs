@@ -6,8 +6,9 @@
 use rc_proto::varint::read_varint;
 use rc_proto::{Decode, Error, Reader, Result, read_str};
 
-/// Stack received (non-empty).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Stack received (non-empty). Hashable by content: the client keeps what it derives from a stack
+/// (ground item layouts) per stack.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ItemStack {
     pub item: i32,
     pub count: i32,

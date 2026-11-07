@@ -33,7 +33,7 @@ pub struct BlockFrame<'a> {
     /// Raw light (block, sky) of a position.
     pub light: &'a dyn Fn(i32, i32, i32) -> (u8, u8),
     /// Box within the field of view and in a reached section (frame relative to the origin).
-    pub visible: &'a dyn Fn([f32; 3], [f32; 3]) -> bool,
+    pub visible: &'a crate::render::FrameVisibility,
     pub items: Option<&'a rc_assets::item::ItemModels>,
     /// Effective render distance (chunks), range of the beams.
     pub render_distance: i32,
@@ -286,7 +286,7 @@ impl EntityRenderer {
                         let x0 = (key.0 * 16 - f.origin[0]) as f32;
                         let z0 = (key.2 * 16 - f.origin[1]) as f32;
                         let y0 = (f.min_y + key.1 * 16) as f32;
-                        (f.visible)([x0, y0, z0], [x0 + 16.0, y0 + 16.0, z0 + 16.0])
+                        f.visible.aabb([x0, y0, z0], [x0 + 16.0, y0 + 16.0, z0 + 16.0])
                     });
                     if !visible {
                         continue;

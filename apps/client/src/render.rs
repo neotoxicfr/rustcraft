@@ -26,6 +26,7 @@ use rc_assets::BlockModels;
 mod capture;
 mod column_upload;
 mod frame;
+mod frame_visibility;
 mod frustum;
 mod lists;
 mod oit_draw;
@@ -39,8 +40,9 @@ pub(crate) mod upload;
 #[cfg(test)]
 mod test_meshes;
 
-pub use column_upload::{Prepared, prepare};
-pub use frustum::BoxVerdict;
+pub use column_upload::{Prepared, in_place_gaps, prepare, prepare_from_base, prepare_moving_faces, region_tag};
+pub use frame_visibility::FrameVisibility;
+pub use frustum::{BoxVerdict, ParticleFrustum};
 pub(crate) use pipelines::camera_layout;
 
 use column_upload::ColumnGpu;

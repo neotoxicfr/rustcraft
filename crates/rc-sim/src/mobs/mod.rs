@@ -19,6 +19,7 @@ pub(crate) mod effects;
 pub(crate) mod env;
 pub(crate) mod end;
 pub(crate) mod explode;
+pub(crate) mod visible_part; // visible part of an explosion's targets: cell cube, air shortcut, objects together
 pub(crate) mod goals;
 pub(crate) mod golems;
 pub(crate) mod ground_items; // dropped items seen by the fox, panda and dolphin pickups
@@ -83,6 +84,8 @@ mod tests_patterns;
 mod tests_respawn_blast;
 #[cfg(test)]
 mod tests_explosion_rays;
+#[cfg(test)]
+mod tests_visible_part;
 #[cfg(test)]
 mod tests_w10;
 #[cfg(test)]

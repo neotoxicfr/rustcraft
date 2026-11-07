@@ -143,13 +143,109 @@ fn pool_prepared_bytes_match_legacy_upload() {
         assert_eq!(full.centers.len(), m.fluids[2].len());
         assert_eq!(short.centers.len(), if short.free { 0 } else { m.fluids[2].len() });
         free += usize::from(full.free && !m.fluids[2].is_empty());
-        faces += full.faces.len();
+        faces += full.face_len();
         // Column in the region placed on each face (the drawn faces fit in 20 bits).
         let local = local_of(m.x, m.z);
-        assert!(full.faces.iter().all(|f| f[0] >> 20 == local));
+        assert!(full.faces.parts().into_iter().flatten().all(|f| f[0] >> 20 == local));
     }
     eprintln!("500 meshes, {faces} faces, {free} free translucent columns");
     assert!(free > 50 && faces > 100_000, "draw too poor");
+}
+
+/// Copy of a mesh (the test meshes are not `Clone`).
+fn copy_of(m: &BlockMesh) -> BlockMesh {
+    BlockMesh {
+        x: m.x,
+        z: m.z,
+        version: m.version,
+        layers: m.layers.clone(),
+        fluids: m.fluids.clone(),
+        starts: m.starts.clone(),
+        fluid_starts: m.fluid_starts.clone(),
+        vis: m.vis.clone(),
+    }
+}
+
+/// Faces moved out of the mesh into the GPU bytes (`RUSTCRAFT_OPT_MESH_PREPARE_BY_MOVE`): the same
+/// bytes as the copy and as the old upload, one part per layer, the mesh left without faces.
+/// Sabotage: a face left untagged is seen.
+#[test]
+fn moved_faces_match_the_copy() {
+    let mut seed = 0x0bad_5eed_1234_5678u64;
+    let mut faces = 0;
+    for _ in 0..300 {
+        let m = random_mesh(&mut seed, 1);
+        for transfree in [false, true] {
+            for f in FORMATS {
+                let mut moved_from = copy_of(&m);
+                let moved = prepare_moving_faces(&mut moved_from, transfree, f);
+                assert!(moved.same(&prepare(&m, transfree, f)), "({}, {}) {f:?}: moved bytes differ", m.x, m.z);
+                assert!(moved.same(&prepare_legacy(&m, transfree, f)));
+                assert!(moved_from.layers.iter().all(Vec::is_empty), "faces left in the mesh");
+                assert_eq!(moved.faces.parts().map(<[_]>::len), m.layers.each_ref().map(Vec::len));
+                faces += moved.face_len();
+                // Faces read from the base flattened with the column's tag (`MESH_BASE_IS_PREPARED`).
+                let base: rc_mesh::blocks::Packed = Arc::new(rc_mesh::blocks::pack_exact_tagged(&m, region_tag(m.x, m.z)));
+                let shared = prepare_from_base(&m, base, transfree, f).expect("flat base of the mesh");
+                assert!(shared.same(&moved), "({}, {}) {f:?}: faces read from the base differ", m.x, m.z);
+                assert!(matches!(shared.faces, PreparedFaces::InBase(..)));
+                // Sabotage: a base flattened without the tag gives other bytes.
+                let plain: rc_mesh::blocks::Packed = Arc::new(rc_mesh::blocks::pack_exact(&m));
+                let untagged = prepare_from_base(&m, plain, transfree, f).expect("flat base of the mesh");
+                if local_of(m.x, m.z) != 0 && moved.face_len() > 0 {
+                    assert!(!untagged.same(&moved), "untagged base not seen");
+                }
+            }
+        }
+    }
+    assert!(faces > 100_000, "draw too poor: {faces}");
+    let m = random_mesh(&mut seed, 1);
+    // A base of other counts is refused.
+    let mut other = copy_of(&m);
+    other.layers[0].push([0; 6]);
+    assert!(prepare_from_base(&m, Arc::new(rc_mesh::blocks::pack_exact(&other)), false, OLD).is_none());
+    let mut moved = prepare_moving_faces(&mut copy_of(&m), false, OLD);
+    let PreparedFaces::Owned(parts) = &mut moved.faces else { panic!("faces not owned") };
+    let Some(f) = parts.iter_mut().flatten().next() else { panic!("no face drawn") };
+    f[0] &= !(0xff << 20);
+    if local_of(m.x, m.z) != 0 {
+        assert!(!moved.same(&prepare(&m, false, OLD)), "untagged face not seen");
+    }
+}
+
+/// Pieces of a byte range over faces in parts: end to end they are the bytes of the range, each at
+/// its offset, one per part touched.
+#[test]
+fn face_byte_pieces_cover_the_range() {
+    let mut rng = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move |n: u64| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng % n.max(1)
+    };
+    let mut k = 0u32;
+    for _ in 0..2000 {
+        let parts: [Vec<rc_mesh::blocks::Face>; 3] = std::array::from_fn(|_| {
+            (0..next(5)).map(|_| {
+                k += 1;
+                [k; 6]
+            })
+            .collect()
+        });
+        let all: Vec<u8> = parts.iter().flat_map(|p| bytemuck::cast_slice::<_, u8>(p).to_vec()).collect();
+        let (a, b) = (next(all.len() as u64 + 1) as usize, next(all.len() as u64 + 1) as usize);
+        let range = a.min(b)..a.max(b);
+        let pieces: Vec<_> = face_byte_pieces(parts.each_ref().map(Vec::as_slice), range.clone()).collect();
+        let mut at = 0;
+        for (offset, piece) in &pieces {
+            assert_eq!(*offset, at as u64, "pieces not contiguous");
+            at += piece.len();
+        }
+        let joined: Vec<u8> = pieces.iter().flat_map(|(_, p)| p.to_vec()).collect();
+        assert_eq!(joined, all[range], "pieces differ from the range");
+        assert!(pieces.len() <= 3 && pieces.iter().all(|(_, p)| !p.is_empty()));
+    }
 }
 
 /// In-place write as the upload applies it: base sent whole into simulated buffers (other
@@ -168,18 +264,9 @@ fn in_place_writes_match_full_upload() {
         rng % n.max(1)
     };
     let (mut written, mut shifted, mut kept_order) = (0, 0, 0);
-    for _ in 0..500 {
+    for round in 0..500 {
         let m = random_mesh(&mut seed, 1);
-        let mut n = BlockMesh {
-            x: m.x,
-            z: m.z,
-            version: 2,
-            layers: m.layers.clone(),
-            fluids: m.fluids.clone(),
-            starts: m.starts.clone(),
-            fluid_starts: m.fluid_starts.clone(),
-            vis: m.vis.clone(),
-        };
+        let mut n = BlockMesh { version: 2, ..copy_of(&m) };
         for _ in 0..next(4) {
             let l = next(3) as usize;
             if let Some(f) = n.layers[l].get_mut(next(400) as usize) {
@@ -190,12 +277,16 @@ fn in_place_writes_match_full_upload() {
             }
         }
         let f = FORMATS[next(4) as usize];
-        let (pb, pn) = (prepare(&m, true, f), prepare(&n, true, f));
+        // Faces copied or moved into the GPU bytes, one range per buffer or several (gaps of 0, 1 KiB, 64 KiB).
+        let pb = prepare(&m, true, f);
+        let pn = if round % 2 == 0 { prepare(&n, true, f) } else { prepare_moving_faces(&mut copy_of(&n), true, f) };
         let mut packed = Vec::new();
         rc_mesh::blocks::pack(&m, &mut packed);
-        let d = rc_mesh::blocks::in_place_diff(&packed, &n).expect("same counts");
+        let gaps = [None, Some(0), Some(1024), Some(65_536)][round % 4].map(|b| in_place_gaps(b, f));
+        let paths = rc_mesh::blocks::InPlacePaths { touched_only: false, gaps };
+        let d = rc_mesh::blocks::in_place_diff_with(&packed, &n, None, paths).expect("same counts");
         let at = [1 + next(50) as u32, 1 + next(50) as u32, 1 + next(50) as u32, 1 + next(50) as u32];
-        let len = [pb.faces.len() as u32, pb.fluid_len() as u32, pb.trans_len() as u32];
+        let len = [pb.face_len() as u32, pb.fluid_len() as u32, pb.trans_len() as u32];
         let slot = Slot {
             version: 1,
             faces: (at[0], len[0]),
@@ -207,7 +298,7 @@ fn in_place_writes_match_full_upload() {
         let stride = [FACE_BYTES, f.fluid_bytes(), f.trans_bytes()];
         let bytes = |p: &Prepared| -> [Vec<u8>; 3] {
             [
-                bytemuck::cast_slice(&p.faces).to_vec(),
+                p.faces.parts().iter().flat_map(|l| bytemuck::cast_slice::<_, u8>(l).to_vec()).collect(),
                 bytemuck::cast_slice(&p.fluids).to_vec(),
                 bytemuck::cast_slice(&p.trans).to_vec(),
             ]
@@ -231,7 +322,14 @@ fn in_place_writes_match_full_upload() {
             let off = off as usize;
             written += 1;
             shifted += usize::from(off > at[i] as usize * stride[i] as usize);
-            gpu[i][off..off + r.len()].copy_from_slice(&src[i][r]);
+            if t == Target::Faces {
+                // Through the pieces the upload writes, part by part.
+                for (o, piece) in face_byte_pieces(pn.faces.parts(), r) {
+                    gpu[i][off + o as usize..off + o as usize + piece.len()].copy_from_slice(piece);
+                }
+            } else {
+                gpu[i][off..off + r.len()].copy_from_slice(&src[i][r]);
+            }
         }
         assert!(gpu == full(&pn), "({}, {}): buffers different from a full upload", m.x, m.z);
         assert_eq!(k.order, !pn.trans.is_empty() && !(pn.free && slot.free));
@@ -280,6 +378,11 @@ fn prepare_cost() {
     time("old preparation + shortcut", &|m| prepare_legacy(m, true, gpu_formats()).bytes());
     time("pool preparation", &|m| prepare(m, false, gpu_formats()).bytes());
     time("pool preparation + shortcut", &|m| prepare(m, true, gpu_formats()).bytes());
+    // Faces copied against moved (`RUSTCRAFT_OPT_MESH_PREPARE_BY_MOVE`): both start from a copy of
+    // the mesh (the pool's own), whose cost is the line "mesh copy alone".
+    time("mesh copy alone", &|m| std::hint::black_box(copy_of(m)).len());
+    time("mesh copy + faces copied", &|m| prepare(&copy_of(m), true, gpu_formats()).bytes());
+    time("mesh copy + faces moved", &|m| prepare_moving_faces(&mut copy_of(m), true, gpu_formats()).bytes());
     thread_local!(static SCRATCH: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) });
     time("flattening + copy (reused buffer)", &|m| {
         SCRATCH.with_borrow_mut(|w| {
