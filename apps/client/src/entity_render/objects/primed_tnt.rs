@@ -9,7 +9,8 @@
 //!   its translation, the same floats up to the sign of zeros. A swelling TNT keeps the product,
 //!   its two quarter turns built once.
 //! - `STILL_TNT_CACHE`: what a TNT placed is replayed while its position, swelling, blinking,
-//!   state and light stay the same.
+//!   state and light stay the same (never for a state with a special model, which also draws
+//!   outside the part matrices and instances).
 
 use super::*;
 
@@ -77,7 +78,9 @@ impl EntityRenderer {
             None if shared => self.tnt_default_state(),
             None => self.default_state("minecraft:tnt"),
         };
-        if !self.opt.still_tnt_cache {
+        // A special model (End portal or gateway cube, chest…) also writes outside the part
+        // matrices and instances that a kept placement replays: always placed again.
+        if !self.opt.still_tnt_cache || self.special_of(state).is_some() {
             return self.place_primed_tnt(state, rel, g, light, overlay);
         }
         let key = (rel.map(f32::to_bits), g.to_bits(), overlay, state, light);

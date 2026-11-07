@@ -463,7 +463,8 @@ pub(super) fn display_context(context: i8) -> Option<usize> {
     }
 }
 
-fn pack(b: u8, s: u8) -> u32 {
+/// Block light `b` and sky light `s` (0 to 15) packed as the instances carry them.
+pub(super) fn pack(b: u8, s: u8) -> u32 {
     (u32::from(b) * 16) | ((u32::from(s) * 16) << 8)
 }
 
@@ -638,6 +639,14 @@ impl EntityRenderer {
         beam_quads(m, d, time, rect, light, &mut self.free_verts[FREE_BEAM]);
     }
 
+    /// (block, sky) light of a non-living entity: probed at the block of its eyes (interpolated
+    /// position + eye height of the type), block light 15 while it burns. Shared by every path
+    /// that draws such an entity, so that none of them drifts from the rule.
+    pub(super) fn object_light(&self, e: &Entity, p: [f64; 3], light: &dyn Fn(i32, i32, i32) -> (u8, u8)) -> (u8, u8) {
+        let (b, s) = self.eye_light(e, p, light);
+        (if e.flags() & 1 != 0 { 15 } else { b }, s)
+    }
+
     /// Draws a non-living entity of this family: `None` if the kind is not part of it,
     /// otherwise true if something was drawn.
     #[allow(clippy::too_many_arguments)]
@@ -659,9 +668,7 @@ impl EntityRenderer {
         {
             return None;
         }
-        // Light probe: block of the eyes (interpolated position + eye height of the type).
-        let (b, s) = self.eye_light(e, p, light);
-        let b = if e.flags() & 1 != 0 { 15 } else { b };
+        let (b, s) = self.object_light(e, p, light);
         let normal = pack(b, s);
         let bright = pack(15, s);
         let t = Mat4::from_translation(Vec3::from(rel));

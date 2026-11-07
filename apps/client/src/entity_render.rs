@@ -3972,6 +3972,7 @@ impl EntityRenderer {
         let opt = self.opt;
         ANIMATION_PATHS.with(|p| p.set(AnimationPaths::of(&opt)));
         self.begin_primed_tnt_frame();
+        self.begin_ground_layouts_frame();
         let list = self.frame_list(entities, pt, cam);
         for v in &mut self.free_verts {
             v.clear();
@@ -4068,10 +4069,8 @@ impl EntityRenderer {
             // Primed TNT straight from its kind flag: the object path finds it only after a
             // score of name comparisons, for every TNT of a heap that went off.
             if new && opt.primed_tnt_by_kind_flag && ki.has(K_PRIMED_TNT) {
-                let (b, s) = self.eye_light(e, p, light);
-                let b = if e.flags() & 1 != 0 { 15 } else { b };
-                let packed = (u32::from(b) * 16) | ((u32::from(s) * 16) << 8);
-                drawn += usize::from(self.push_primed_tnt(e, pt, rel, packed));
+                let (b, s) = self.object_light(e, p, light);
+                drawn += usize::from(self.push_primed_tnt(e, pt, rel, objects::pack(b, s)));
                 continue;
             }
             if let Some(d) = self.push_object(e, pt, rel, p, cam, light, items, world_q) {
@@ -6405,9 +6404,8 @@ impl EntityRenderer {
         let age = e.age as f32 + pt;
         let bob = table_sin(age / 10.0 + bob_offs) * 0.1 + 0.1;
         // Light at the eyes' block (the game's light probe), not at the feet.
-        let (b, s) = self.eye_light(e, world, light);
-        let block = if e.flags() & 1 != 0 { 15 } else { b };
-        let packed = (u32::from(block) * 16) | ((u32::from(s) * 16) << 8);
+        let (b, s) = self.object_light(e, world, light);
+        let packed = objects::pack(b, s);
         // The ground item carries its stack: its position and its own rotation orient the needle.
         let owner = (e.id, e.pos, ground_item_yaw(e.age, bob_offs));
         let pre = Mat4::from_translation(Vec3::from(rel));
@@ -6422,8 +6420,6 @@ impl EntityRenderer {
         queue.write_buffer(&self.lights, 64, bytemuck::cast_slice(&[o0, o1, strength, 0.0]));
         queue.write_buffer(&self.lights_totem, 64, bytemuck::cast_slice(&[o0, o1, strength, 0.0]));
         queue.write_buffer(&self.lights_ui, 64, bytemuck::cast_slice(&[o0, o1, strength, 0.0]));
-        self.batches.clear();
-        self.glow_batches.clear();
         self.shadow_count = self.shadow_verts.len() as u32;
         if !self.shadow_verts.is_empty() {
             let bytes: &[u8] = bytemuck::cast_slice(&self.shadow_verts);
@@ -6471,6 +6467,10 @@ impl EntityRenderer {
             self.flat_free_verts = free;
         }
         if self.mats.is_empty() {
+            // Nothing placed: `build_batches` (which rebuilds the batches) is skipped, so the
+            // last frame's batches must not be drawn again.
+            self.batches.clear();
+            self.glow_batches.clear();
             return;
         }
         let flat = self.build_batches();

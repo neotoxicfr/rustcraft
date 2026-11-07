@@ -1,6 +1,9 @@
-//! Orders of the frame without moving big rows around nor allocating per frame: the entities
-//! from farthest to nearest (`DISTANCE_SORT_KEYS`) and the instances grouped by geometry
+//! Orders of the frame without moving big rows around during the sort: the entities from
+//! farthest to nearest (`DISTANCE_SORT_KEYS`) and the instances grouped by geometry
 //! (`INSTANCE_BUCKETS`). Each gives exactly the order of the stable sort it replaces.
+//! Allocations per frame: the geometry buckets and the entity sort keys are kept between
+//! frames; the sorted entity list is a new vector (its rows borrow the frame's entities, so it
+//! cannot be kept), and the translucent sort allocates its table of keys at each call.
 
 use glam::{Mat4, Vec3};
 use hashbrown::HashMap;
@@ -28,7 +31,8 @@ fn far_to_near_key_f32(d: f32) -> u32 {
 
 /// Reorders `rows` from farthest to nearest like a stable sort on `distance`: compact
 /// (key, rank) pairs are sorted instead of the rows (the rank breaks ties, so an unstable sort
-/// gives the stable order), then the rows are moved once. `keys` is kept between frames.
+/// gives the stable order), then the rows are copied once into a new vector. `keys` is kept
+/// between frames.
 pub(super) fn sort_far_to_near<T: Copy>(rows: &mut Vec<T>, distance: impl Fn(&T) -> f64, keys: &mut Vec<(u64, u32)>) {
     keys.clear();
     keys.extend(rows.iter().enumerate().map(|(rank, r)| (far_to_near_key(distance(r)), rank as u32)));

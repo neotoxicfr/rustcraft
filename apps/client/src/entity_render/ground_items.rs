@@ -31,17 +31,47 @@ enum KeptLayout {
     ReadsSurroundings,
 }
 
-/// Layouts kept per stack content.
+/// Layouts kept per stack content, with the frame of their last use.
 #[derive(Default)]
 pub(super) struct GroundLayouts {
-    by_stack: HashMap<ItemStack, KeptLayout>,
+    by_stack: HashMap<ItemStack, (KeptLayout, u32)>,
     /// Generation of the item models the layouts come from (a resource reload drops them).
     generation: u64,
+    frame: u32,
 }
 
 /// Bound of the kept layouts: stacks that each carry their own components (named, enchanted)
-/// could otherwise pile up; the whole set is dropped and rebuilt as the frames need it.
-const MAX_KEPT_LAYOUTS: usize = 4096;
+/// could otherwise pile up. Once full, a new stack is drawn without keeping anything (the old
+/// path) rather than emptying the table: emptying it would rebuild it every frame while more
+/// distinct stacks than this are in view.
+pub(super) const MAX_KEPT_LAYOUTS: usize = 4096;
+
+/// Frames after which a layout no longer used (its items picked up or despawned) is dropped.
+pub(super) const LAYOUT_KEPT_FRAMES: u32 = 256;
+
+/// Largest component data (bytes) of a stack whose layout is kept: the key is a full copy of
+/// the stack, and a written book or a filled Shulker box carries tens of KiB. Such stacks are
+/// drawn without keeping anything; the table then stays within a few MiB.
+const MAX_KEPT_COMPONENT_BYTES: usize = 1024;
+
+/// Bytes of the components a stack carries (its key's heap share): each added component's entry
+/// and value, each removed type.
+fn component_bytes(stack: &ItemStack) -> usize {
+    let entry = std::mem::size_of::<(u16, Box<[u8]>)>();
+    stack.added.iter().map(|(_, value)| entry + value.len()).sum::<usize>() + stack.removed.len() * 2
+}
+
+impl EntityRenderer {
+    /// New frame for the kept ground layouts: those unused for a while are dropped.
+    pub(super) fn begin_ground_layouts_frame(&mut self) {
+        let kept = &mut self.ground_layouts;
+        kept.frame = kept.frame.wrapping_add(1);
+        if kept.frame.is_multiple_of(LAYOUT_KEPT_FRAMES) && !kept.by_stack.is_empty() {
+            let now = kept.frame;
+            kept.by_stack.retain(|_, (_, seen)| now.wrapping_sub(*seen) < LAYOUT_KEPT_FRAMES);
+        }
+    }
+}
 
 impl EntityRenderer {
     /// Group of items of a stack in the `ground` context (ground item, ominous spawner):
@@ -71,7 +101,8 @@ impl EntityRenderer {
     }
 
     /// [`Self::push_item_cluster`] from the kept layout of `stack` (made on first sight); `None`
-    /// when the stack's model reads its surroundings.
+    /// when the stack's model reads its surroundings, or when the stack is not kept (table full,
+    /// heavy components).
     #[allow(clippy::too_many_arguments)]
     fn push_kept_ground_layout(
         &mut self,
@@ -88,10 +119,17 @@ impl EntityRenderer {
             kept.by_stack.clear();
             kept.generation = models.generation();
         }
-        let layout = match kept.by_stack.get(stack) {
-            Some(KeptLayout::Draw(layout)) => layout.clone(),
-            Some(KeptLayout::Nothing) => return Some(false),
-            Some(KeptLayout::ReadsSurroundings) => return None,
+        let (frame, full) = (kept.frame, kept.by_stack.len() >= MAX_KEPT_LAYOUTS);
+        let layout = match kept.by_stack.get_mut(stack) {
+            Some((entry, seen)) => {
+                *seen = frame;
+                match entry {
+                    KeptLayout::Draw(layout) => layout.clone(),
+                    KeptLayout::Nothing => return Some(false),
+                    KeptLayout::ReadsSurroundings => return None,
+                }
+            }
+            None if full || component_bytes(stack) > MAX_KEPT_COMPONENT_BYTES => return None,
             None => {
                 let (layout, reads_surroundings) = self.ground_layout(models, stack, owner, true);
                 let layout = layout.map(Arc::new);
@@ -100,11 +138,7 @@ impl EntityRenderer {
                     (Some(l), false) => KeptLayout::Draw(l.clone()),
                     (None, false) => KeptLayout::Nothing,
                 };
-                let kept = &mut self.ground_layouts.by_stack;
-                if kept.len() >= MAX_KEPT_LAYOUTS {
-                    kept.clear();
-                }
-                kept.insert(stack.clone(), entry);
+                self.ground_layouts.by_stack.insert(stack.clone(), (entry, frame));
                 // Evaluated once this frame anyway: drawn from it.
                 let Some(layout) = layout else { return Some(false) };
                 layout
@@ -184,12 +218,24 @@ impl EntityRenderer {
         self.ground_layouts = GroundLayouts::default();
     }
 
+    /// Turns every kept layout into a wrong one ("draws nothing") from an older generation of
+    /// the item models, as after a resource reload: the next frame must drop them all
+    /// (proofs only).
+    #[cfg(test)]
+    pub(super) fn make_ground_layouts_stale(&mut self) {
+        let kept = &mut self.ground_layouts;
+        kept.generation = kept.generation.wrapping_add(1);
+        for (entry, _) in kept.by_stack.values_mut() {
+            *entry = KeptLayout::Nothing;
+        }
+    }
+
     /// Kept layouts drawn from, and stacks found to read their surroundings (proofs only).
     #[cfg(test)]
     pub(super) fn ground_layouts_counts(&self) -> (usize, usize) {
         let kept = self.ground_layouts.by_stack.values();
-        let drawn = kept.clone().filter(|k| matches!(k, KeptLayout::Draw(_))).count();
-        (drawn, kept.filter(|k| matches!(k, KeptLayout::ReadsSurroundings)).count())
+        let drawn = kept.clone().filter(|k| matches!(k.0, KeptLayout::Draw(_))).count();
+        (drawn, kept.filter(|k| matches!(k.0, KeptLayout::ReadsSurroundings)).count())
     }
 
     /// Instances of a ground layout: base matrix `pre`, bobbing `lift` plus the layout's rise,

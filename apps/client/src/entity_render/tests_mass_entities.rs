@@ -126,16 +126,77 @@ fn mass_scene(k: &Kit) -> Vec<Entity> {
     ents
 }
 
-/// Fingerprint of two consecutive frames of `ents` (the second one replays what is kept) and
-/// of the batches built from the last one.
-fn two_frames(k: &mut Kit, ents: &[Entity], opt: EntOpt) -> (u64, u64, u64) {
-    // Each setting builds what it keeps itself (the first frame), then reuses it (the second).
-    k.r.forget_primed_tnt();
-    k.r.forget_ground_layouts();
-    prep(k, ents, opt);
-    let first = digest(&k.r);
-    prep(k, ents, opt);
-    let second = digest(&k.r);
+/// Default state of block `name` (without namespace) in the 26.3 data.
+fn state_of(k: &Kit, name: &str) -> i32 {
+    let full = format!("minecraft:{name}");
+    let block = k.r.source.blocks.iter().find(|b| b.name == full).unwrap_or_else(|| panic!("block {name}"));
+    block.default_state as i32
+}
+
+/// [`prep`] under another light: the light of every block shifted by `shift` levels, so that
+/// every entity's probed light changes.
+fn prep_with_light(k: &mut Kit, ents: &[Entity], opt: EntOpt, shift: i32) {
+    if shift == 0 {
+        return prep(k, ents, opt);
+    }
+    k.r.opt = opt;
+    let state = |x: i32, y: i32, z: i32| if y < 64 && (x + z) & 3 == 0 { 1u32 } else { 0 };
+    let bright = |x: i32, y: i32, z: i32| (x * 3 + y + z * 5).rem_euclid(16);
+    let tints = |_: i32, _: i32, _: i32| [0xff_ffff; 4];
+    let world = ShadowWorld { state: &state, brightness: &bright, ambient: 0.1, biome_tints: &tints };
+    let light = |x: i32, y: i32, z: i32| {
+        ((x * 7 + y * 3 + z + shift).rem_euclid(16) as u8, (x + y * 5 + z * 3 + shift).rem_euclid(16) as u8)
+    };
+    k.r.prepare(ents.iter(), 0.37, [0, 0], [0.5, 66.0, -2.5], &light, &|_, _| true, Some(&k.items), &world);
+}
+
+/// The mass scene a few ticks later, what the kept placements and layouts must notice: still
+/// TNT that cross a blink (fuse + 5), start to swell (fuse 4) or take another block state
+/// (tinted leaves, End gateway and End portal with their portal cubes); piles whose count
+/// changes. Drawn under the same light, then under another one, by [`frames`].
+fn changed_scene(k: &Kit, ents: &[Entity]) -> Vec<Entity> {
+    let (leaves, gateway, portal) = (state_of(k, "oak_leaves"), state_of(k, "end_gateway"), state_of(k, "end_portal"));
+    let mut changed = ents.to_vec();
+    for e in &mut changed {
+        if e.kind == "tnt" {
+            let fuse = e.meta_int(8).unwrap_or(80);
+            match (e.id - 1) % 9 {
+                1 => e.meta.insert(8, Meta::Int(fuse + 5)),
+                2 => e.meta.insert(8, Meta::Int(4)),
+                4 => e.meta.insert(9, Meta::BlockState(Some(leaves))),
+                5 => e.meta.insert(9, Meta::BlockState(Some(gateway))),
+                7 => e.meta.insert(9, Meta::BlockState(Some(portal))),
+                _ => {}
+            }
+        } else if e.id % 11 == 2 {
+            let mut stack = ground_stack(e);
+            stack.count = if stack.count == 1 { 20 } else { 1 };
+            e.meta.insert(8, Meta::Item(Some(stack)));
+        }
+    }
+    changed
+}
+
+/// The stack of ground item `e`.
+fn ground_stack(e: &Entity) -> ItemStack {
+    match e.meta.get(&8) {
+        Some(Meta::Item(Some(stack))) => stack.clone(),
+        _ => panic!("ground item {} without a stack", e.id),
+    }
+}
+
+/// Fingerprint of a prepared frame: [`digest`] and the End portal cubes, which live apart.
+fn frame_digest(r: &EntityRenderer) -> u64 {
+    let mut h = digest(r);
+    for b in bytemuck::cast_slice::<_, u8>(&r.objects.portals) {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+/// Fingerprint of the batches built from the last frame.
+fn batches_digest(k: &mut Kit) -> u64 {
     let flat = k.r.build_batches();
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     let mut eat = |bytes: &[u8]| {
@@ -152,50 +213,132 @@ fn two_frames(k: &mut Kit, ents: &[Entity], opt: EntOpt) -> (u64, u64, u64) {
             eat(&v.to_le_bytes());
         }
     }
-    (first, second, h)
+    h
+}
+
+/// Fingerprints of five frames and of the batches of the last one: `ents` twice (the second
+/// replays what is kept), `changed` under the same light (each change alone makes a kept entry
+/// stale), `changed` under another light (the light alone does), then once more (replayed).
+fn frames(k: &mut Kit, ents: &[Entity], changed: &[Entity], opt: EntOpt) -> [u64; 6] {
+    // Each setting builds what it keeps itself, never from what another setting kept.
+    k.r.forget_primed_tnt();
+    k.r.forget_ground_layouts();
+    let mut out = [0; 6];
+    let scenes = [(ents, 0), (ents, 0), (changed, 0), (changed, 5), (changed, 5)];
+    for (i, (scene, shift)) in scenes.into_iter().enumerate() {
+        prep_with_light(k, scene, opt, shift);
+        out[i] = frame_digest(&k.r);
+    }
+    out[5] = batches_digest(k);
+    out
 }
 
 /// Expected fingerprints of the mass scene (26.3 data and game) with the switches of this file
 /// off and every other one on: any change to what `prepare` places or to the batch order makes
 /// the test fail.
-const GOLDEN_MASS: (u64, u64, u64) = (0xe34e_bcd5_a0c8_6b96, 0xe34e_bcd5_a0c8_6b96, 0x67a0_e1d3_d106_2756);
+const GOLDEN_MASS: [u64; 6] = [
+    0xe34e_bcd5_a0c8_6b96,
+    0xe34e_bcd5_a0c8_6b96,
+    0xf7de_264c_a157_8093,
+    0x4dd0_b150_3059_b293,
+    0x4dd0_b150_3059_b293,
+    0x7800_10c0_bb41_ba56,
+];
 
 /// Every switch of this file, alone on and alone off, places exactly what its old path places
-/// (matrices compared up to the sign of zeros, as everywhere in these proofs), over a first
-/// frame and a second one that reuses what was kept, and builds the same batches. The other
-/// switches stay on (the sine table changes the bobbing of the items: a fidelity switch with its
-/// own proof).
+/// (matrices compared up to the sign of zeros, as everywhere in these proofs), over the frames
+/// of [`frames`] (kept, replayed, changed, replayed again), and builds the same batches. The
+/// other switches stay on (the sine table changes the bobbing of the items: a fidelity switch
+/// with its own proof).
 #[test]
 fn bulk_entities_same_under_every_switch() {
     let Some(mut k) = kit() else { return };
     let ents = mass_scene(&k);
+    let changed = changed_scene(&k, &ents);
     // Caches (layers, meshes, atlas) filled, then the reference.
-    two_frames(&mut k, &ents, EntOpt::NEW);
-    let reference = two_frames(&mut k, &ents, bulk_off());
+    frames(&mut k, &ents, &changed, EntOpt::NEW);
+    let reference = frames(&mut k, &ents, &changed, bulk_off());
     // The far ground items are beyond their render distance (16 blocks at this view scale).
     assert!(k.r.drawn > 1800, "scene almost empty: {} entities drawn", k.r.drawn);
+    assert!(!k.r.objects.portals.is_empty(), "no End portal cube drawn");
     let mut differ = Vec::new();
-    if two_frames(&mut k, &ents, EntOpt::NEW) != reference {
+    if frames(&mut k, &ents, &changed, EntOpt::NEW) != reference {
         differ.push("every switch on".to_owned());
     }
     for (i, (name, _)) in bulk_switches().iter().enumerate() {
-        if two_frames(&mut k, &ents, with_switch(true, i)) != reference {
+        if frames(&mut k, &ents, &changed, with_switch(true, i)) != reference {
             differ.push(format!("{name}=0, the others on"));
         }
-        if two_frames(&mut k, &ents, with_switch(false, i)) != reference {
+        if frames(&mut k, &ents, &changed, with_switch(false, i)) != reference {
             differ.push(format!("{name} alone"));
         }
     }
     assert!(differ.is_empty(), "not the old placement: {differ:?}");
     // The fast paths were taken: shared pose built, TNT placements kept, layouts kept (the
     // compass reads its surroundings, the others are drawn from their layout).
-    two_frames(&mut k, &ents, EntOpt::NEW);
+    frames(&mut k, &ents, &changed, EntOpt::NEW);
     let (shared_pose, kept_tnt) = k.r.primed_tnt_counts();
     assert!(shared_pose, "no shared TNT pose");
     assert!(kept_tnt > 1000, "TNT placements kept: {kept_tnt}");
     let (drawn, surroundings) = k.r.ground_layouts_counts();
     assert!(drawn >= 7 && surroundings >= 1, "ground layouts: {drawn} kept, {surroundings} reading their surroundings");
     assert_eq!(reference, GOLDEN_MASS, "mass scene fingerprint changed: {reference:#x?}");
+}
+
+/// The kept ground layouts stay bounded and never outlive their use: a resource reload drops
+/// them, a stack with heavy components is never kept, a full table keeps what it has (no
+/// rebuild every frame), and layouts unused for a while are dropped. What is drawn stays the
+/// old path's in every case.
+#[test]
+fn ground_layouts_stay_bounded() {
+    let Some(mut k) = kit() else { return };
+    let off = EntOpt { ground_item_layout_cache: false, ..EntOpt::NEW };
+    let draw = |k: &mut Kit, ents: &[Entity], opt: EntOpt| {
+        prep(k, ents, opt);
+        frame_digest(&k.r)
+    };
+    // Reload: stale layouts of an older generation are dropped, not drawn.
+    let piles = ground_items(&k, 200, 1);
+    let old = draw(&mut k, &piles, off);
+    k.r.forget_ground_layouts();
+    draw(&mut k, &piles, EntOpt::NEW);
+    k.r.make_ground_layouts_stale();
+    assert_eq!(draw(&mut k, &piles, EntOpt::NEW), old, "stale layouts drawn after a reload");
+    // A name of 2,000 characters (a text tag of the custom name component): drawn, not kept.
+    let names = k.r.source.registry("minecraft:data_component_type").expect("component registry").entries.clone();
+    let custom_name = names.iter().position(|n| n == "minecraft:custom_name").expect("custom_name") as u16;
+    let mut tag = vec![8u8, 0x07, 0xd0];
+    tag.extend(std::iter::repeat_n(b'a', 2000));
+    let mut named = ground_items(&k, 1, 1);
+    let heavy = ItemStack { item: k.item("minecraft:diamond"), count: 1, added: vec![(custom_name, tag.into())], removed: vec![] };
+    named[0].meta.insert(8, Meta::Item(Some(heavy)));
+    named[0].pos = [0.5, 64.0, 4.0];
+    named[0].pos_o = named[0].pos;
+    let old = draw(&mut k, &named, off);
+    assert_eq!(k.r.drawn, 1, "heavy stack not drawn");
+    k.r.forget_ground_layouts();
+    assert_eq!(draw(&mut k, &named, EntOpt::NEW), old, "heavy stack");
+    assert_eq!(k.r.ground_layouts_counts(), (0, 0), "a stack with heavy components was kept");
+    // More distinct stacks in view than the table holds: it fills up once and stays full.
+    let mut crowd = ground_items(&k, ground_items::MAX_KEPT_LAYOUTS + 100, 1);
+    for (i, e) in crowd.iter_mut().enumerate() {
+        e.pos = [0.5, 64.0, 4.0];
+        e.pos_o = e.pos;
+        let item = ground_stack(e).item;
+        e.meta.insert(8, Meta::Item(Some(ItemStack { item, count: i as i32 + 1, added: vec![], removed: vec![] })));
+    }
+    let old = draw(&mut k, &crowd, off);
+    k.r.forget_ground_layouts();
+    for frame in 0..3 {
+        assert_eq!(draw(&mut k, &crowd, EntOpt::NEW), old, "crowd, frame {frame}");
+        let (drawn, surroundings) = k.r.ground_layouts_counts();
+        assert_eq!(drawn + surroundings, ground_items::MAX_KEPT_LAYOUTS, "crowd, frame {frame}: table not full");
+    }
+    // Unused for long enough (the items picked up): dropped.
+    for _ in 0..2 * ground_items::LAYOUT_KEPT_FRAMES {
+        prep(&mut k, &[], EntOpt::NEW);
+    }
+    assert_eq!(k.r.ground_layouts_counts(), (0, 0), "unused layouts kept");
 }
 
 /// `EntOpt::NEW` with every switch of this file off: the reference of the benches (the other
