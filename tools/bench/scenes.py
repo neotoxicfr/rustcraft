@@ -965,6 +965,12 @@ UPLOAD = re.compile(r"\[perf\] \[\s*([\d.]+) s\] work: .*mesh upload ([\d.]+) ms
 TICK = re.compile(r"\[perf\] server: tick median ([\d.]+) ms, p95 ([\d.]+) ms, p99 ([\d.]+) ms, mean ([\d.]+) ms")
 INGAME = re.compile(r"\[perf\] in game at (\d+) ms")
 LOADED = re.compile(r"\[perf\] initial load meshed at (\d+) ms")
+# Loading landmarks (client `perf_log.rs`, integrated server `server.rs`).
+WORLD_ENTERED = re.compile(r"\[perf\] world entered at (\d+) ms")
+FIRST_CHUNK = re.compile(r"\[perf\] first chunk received at (\d+) ms")
+CAUGHT_UP = re.compile(r"\[perf\] meshing caught up at (\d+) ms")
+SERVER_FIRST_CHUNK = re.compile(r"singleplayer: first chunk sent (\d+) ms after opening")
+SERVER_QUEUE_EMPTY = re.compile(r"singleplayer: chunk queue empty (\d+) ms after opening")
 FIRST = re.compile(r"first frame: (\d+) ms")
 GEN = re.compile(r"singleplayer: generated (\d+) chunks in ([\d.]+) ms")
 # Phases of a generation batch and steps of the generator setup (`rc-sim/src/generation_timing.rs`).
@@ -1092,6 +1098,28 @@ def generation_phase_metrics(lines):
     return m
 
 
+def lines_since_world_entry(lines):
+    """Lines after the first `[perf] world entered`, or all of them without a world (title
+    screen). The per-second blocks of the loading screen before it carry the world preparation
+    (spawn light, events); the whole-run sums leave them out, as when only worlds were logged."""
+    entry = next((i for i, l in enumerate(lines) if WORLD_ENTERED.search(l)), None)
+    return lines if entry is None else lines[entry + 1:]
+
+
+def loading_landmarks(lines):
+    """Loading landmarks in ms (NaN when absent). `meshing_after_last_column_ms`: meshing still
+    needed once the count of columns to mesh stopped changing (negative when it had already
+    caught up, e.g. a count that dropped)."""
+    def first(rx):
+        x = next((x for x in (rx.search(l) for l in lines) if x), None)
+        return float(x.group(1)) if x else float("nan")
+
+    m = {"first_chunk_ms": first(FIRST_CHUNK), "caught_up_ms": first(CAUGHT_UP), "stable_ms": first(STABLE),
+         "server_first_chunk_ms": first(SERVER_FIRST_CHUNK), "server_queue_empty_ms": first(SERVER_QUEUE_EMPTY)}
+    m["meshing_after_last_column_ms"] = m["caught_up_ms"] - m["stable_ms"]
+    return m
+
+
 def analyse(log_path, frames_path, frm, secs):
     with open(log_path, encoding="utf-8", errors="replace") as f:
         lines = f.read().splitlines()
@@ -1102,7 +1130,8 @@ def analyse(log_path, frames_path, frm, secs):
     m["cpu_ms"] = med([float(s.group(3)) for s in sw])
     m["gpu_ms"] = med([float(s.group(4)) for s in sw if s.group(4) != "?"])
     m["columns"] = med([int(s.group(5)) for s in sw])
-    pl = [p for p in (PERFL.search(l) for l in lines) if p]
+    world = lines_since_world_entry(lines)
+    pl = [p for p in (PERFL.search(l) for l in world) if p]
     pw = [p for p in pl if win(float(p.group(1)))]
     span = max(1e-9, len(pw))
     m["meshed_s"] = sum(float(p.group(6)) for p in pw) / span
@@ -1120,7 +1149,7 @@ def analyse(log_path, frames_path, frm, secs):
     for i, k in enumerate(("sections_s", "meshing_ms_s", "walks_s", "walks_ms_s", "process_cpu_ms_s"), 2):
         m[k] = sum(float(w.group(i)) for w in wk) / len(wk) if wk else float("nan")
     # Receiving events on the render thread during loading (first 5 seconds).
-    rv = [r for r in (RECV.search(l) for l in lines) if r and float(r.group(1)) <= 5.0]
+    rv = [r for r in (RECV.search(l) for l in world) if r and float(r.group(1)) <= 5.0]
     m["receive_load_ms"] = sum(float(r.group(2)) for r in rv) if rv else float("nan")
     mc = [c for c in (MCACHE.search(l) for l in lines) if c and win(float(c.group(1)))]
     m["cache_mb"] = med([float(c.group(2)) for c in mc])
@@ -1143,8 +1172,7 @@ def analyse(log_path, frames_path, frm, secs):
     m.update(memory_metrics(lines, win))
     c = [x for x in (LOADED.search(l) for l in lines) if x]
     m["load_ms"] = float(c[0].group(1)) if c else float("nan")
-    st = [x for x in (STABLE.search(l) for l in lines) if x]
-    m["stable_ms"] = float(st[0].group(1)) if st else float("nan")
+    m.update(loading_landmarks(lines))
     g = [x for x in (INGAME.search(l) for l in lines) if x]
     m["in_game_ms"] = float(g[0].group(1)) if g else float("nan")
     f = [x for x in (FIRST.search(l) for l in lines) if x]
@@ -1421,7 +1449,11 @@ KEYS = [
     ("tick_med_ms", "tick med. ms", ".3f"), ("tick_p99_ms", "tick p99 ms", ".3f"),
     ("private_mb", "private MB", ".0f"), ("ws_mb", "WS MB", ".0f"), ("vram_allocated_mb", "VRAM MB", ".1f"),
     ("first_frame_ms", "1st frame ms", ".0f"), ("in_game_ms", "in game ms", ".0f"),
-    ("load_ms", "meshed load ms", ".0f"), ("stable_ms", "last column ms", ".0f"),
+    ("first_chunk_ms", "first chunk received ms", ".0f"), ("caught_up_ms", "meshing caught up ms", ".0f"),
+    ("load_ms", "meshed load ms", ".0f"), ("stable_ms", "meshable columns stable since ms", ".0f"),
+    ("meshing_after_last_column_ms", "meshing after last column ms", ".0f"),
+    ("server_first_chunk_ms", "server first chunk sent ms", ".0f"),
+    ("server_queue_empty_ms", "server chunk queue empty ms", ".0f"),
     ("last_mesh_ms", "last mesh ms", ".0f"), ("receive_load_ms", "receive 0-5 s ms", ".0f"),
     ("audio_ready_ms", "audio ready ms", ".0f"), ("audio_joined_ms", "audio joined ms", ".0f"),
     ("audio_wait_ms", "audio wait ms", ".0f"), ("open_ms", "world opening ms", ".0f"),

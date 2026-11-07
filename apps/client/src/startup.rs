@@ -314,6 +314,7 @@ pub(crate) fn run() {
         last: Instant::now(),
         fps_frames: 0,
         fps_since: Instant::now(),
+        window_title: crate::window_title::WindowTitle::new(),
         started,
         status: String::new(),
         capture: rc_data::env_str!("RUSTCRAFT_CAPTURE").and_then(|v| {

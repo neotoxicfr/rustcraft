@@ -401,6 +401,7 @@ impl App {
                     s.chunk(x, z, &col.sky_light, &col.block_light);
                 }
                 self.world.grid.insert(col);
+                crate::perf_log::chunk_received(self.started);
                 let view =
                     environ::WorldView { grid: &self.world.grid, min_y: self.world.min_y, height: self.world.height };
                 self.block_entities.load_chunk(x, z, &c.block_entities, |x, y, z| view.state(x, y, z));

@@ -19,7 +19,6 @@ identical view from one launch to the next.
 """
 import argparse
 import os
-import re
 import statistics
 import subprocess
 import sys
@@ -28,7 +27,9 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import scenes  # noqa: E402
 
-LINE = re.compile(r"\[\s*([\d.]+) s\] (\d+) fps, CPU ([\d.]+) ms/frame, GPU ([\d.]+|\?) ms/frame")
+# Per-second statistics line, one format for the client and both benches (groups 1-4: date,
+# fps, CPU, GPU).
+LINE = scenes.STAT
 
 
 def run(exe, env_extra, a, tmp):
