@@ -259,7 +259,8 @@ fn storage_edits_happen_in_place() {
 
 /// Chiseled bookshelf: a book written by a command shows in the block state, an empty write
 /// takes it out. Crafter: any write to a disabled empty slot, an empty one included, enables it;
-/// a disabled slot that holds an item keeps its state.
+/// a load never disables an occupied slot (only sealed loot drawn by the slot read just before
+/// a write can leave a disabled slot occupied).
 #[test]
 fn bookshelf_and_crafter_slot_writes_follow_their_block() {
     let mut w = world("bookshelf");
@@ -277,9 +278,14 @@ fn bookshelf_and_crafter_slot_writes_follow_their_block() {
     // An empty write enables a disabled slot too.
     w.cmd(&format!("item replace block {c} container.4 with minecraft:air"));
     assert_eq!(disabled(&w), Some(Nbt::IntArray(vec![])), "an empty write enables slot 4");
-    // A disabled slot that already holds an item (data written by hand) stays disabled.
+    // Loading drops a disabled index whose slot holds an item: the slot is active from the start
+    // and stays so after a stone write, then an empty write.
     w.cmd(&format!("setblock {c} minecraft:air"));
     w.cmd(&format!("setblock {c} minecraft:crafter{{disabled_slots:[I;2],Items:[{{Slot:2b,id:\"minecraft:dirt\",count:1}}]}}"));
+    assert_eq!(disabled(&w), Some(Nbt::IntArray(vec![])), "an occupied slot is never disabled by a load");
     w.cmd(&format!("item replace block {c} container.2 with minecraft:stone"));
-    assert_eq!(disabled(&w), Some(Nbt::IntArray(vec![2])), "a slot holding an item keeps its state");
+    assert_eq!(disabled(&w), Some(Nbt::IntArray(vec![])), "still active after the stone write");
+    w.cmd(&format!("item replace block {c} container.2 with minecraft:air"));
+    assert_eq!(disabled(&w), Some(Nbt::IntArray(vec![])), "still active after the empty write");
+    assert_eq!(w.p.s.crafter_data(crafter)[2], 0, "the menu shows slot 2 active");
 }

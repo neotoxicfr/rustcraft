@@ -5677,8 +5677,9 @@ profile, machine loaded by other agents compiling, best of 5 or 7; three runs, t
   data: furnace (only another ingredient, an emptied slot included, restarts cooking and tells
   the comparators), jukebox (`RecordItem`, `has_record`, song), decorated pot (`item`, no
   comparator update), hopper (no comparator update, the game's quirk), crafter (any write to a
-  disabled slot, an empty one included, enables it when the slot is still empty; a disabled slot
-  holding an item stays disabled), chiseled bookshelf (block state), shelf (its change mark),
+  disabled slot, an empty one included, enables it when the slot is still empty; loading the
+  data drops a disabled index whose slot holds an item, as the game does, so only sealed loot
+  drawn by the read just before a write leaves a disabled slot occupied), chiseled bookshelf (block state), shelf (its change mark),
   other containers (comparators told). No block entity packet for a slot write (the game sends
   none). `loot insert` grows a stack in place and marks the container changed once per drop.
 - Sealed loot is drawn by a slot read or write (`execute if items`, `item`, `loot insert|replace`),
@@ -5688,7 +5689,8 @@ profile, machine loaded by other agents compiling, best of 5 or 7; three runs, t
   namespaces written are saved (one dirty mark per namespace, an emptied namespace written empty).
 - Proof: `commands::container_commands_tests` (7 tests); each fails when its former code path is
   put back (see the commits). The game quirks kept here are listed in
-  `docs/quirks-to-reproduce.md` (Containers rows). Cost: none measured (one command at a time; the slot read decodes
+  `docs/quirks-to-reproduce.md` (Containers rows, and the two Commands rows on command storage,
+  test `storage_edits_happen_in_place`). Cost: none measured (one command at a time; the slot read decodes
   the same `Items` list as before, the live read skips it for furnaces and brewing stands).
 - Not done, noted: a menu write of an empty stack into a furnace's ingredient slot (number-key
   swap) also restarts cooking in the game, not in our menu path; `data merge block` sends a block

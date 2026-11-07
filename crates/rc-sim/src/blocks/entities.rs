@@ -1593,8 +1593,9 @@ impl Server {
     }
 
     /// Any write to a disabled crafter slot, an empty one included, enables it first (with its
-    /// change mark), but only while the slot is still empty: a slot holding an item (data
-    /// written by hand) cannot change its state, so it stays disabled.
+    /// change mark), but only while the slot is still empty. Loading never leaves a disabled
+    /// slot occupied (`keep_loadable_disabled_slots`); the one case is sealed loot drawn by the
+    /// slot read just before the write, and then the slot stays disabled, as in the game.
     fn crafter_enable_slot(&mut self, p: P, i: usize) {
         if !self.crafter_slot_disabled(p, i) || self.container_item(p, i, 9).is_some() {
             return;
@@ -1933,6 +1934,11 @@ impl Server {
             Cont::Brewing => {
                 self.life.brewers.remove(&p);
                 self.ensure_brewer(p);
+            }
+            Cont::Crafter => {
+                if let Some(be) = self.be_get_mut(p) {
+                    crate::crafter::keep_loadable_disabled_slots(be);
+                }
             }
             _ => {}
         }
