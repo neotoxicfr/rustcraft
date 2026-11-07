@@ -99,6 +99,9 @@ pub struct MapData {
     pub decorations: Vec<MapDecoration>,
     /// Rectangle modified since the last upload to the GPU: x0, y0, x1, y1 (inclusive).
     dirty: Option<[u8; 4]>,
+    /// Bumped by every patch that writes at least one pixel: the inventory preview compares it
+    /// instead of hashing the 16 KiB of colors every frame (`dirty` belongs to `MapTextures`).
+    version: u32,
 }
 
 #[derive(Default)]
@@ -127,6 +130,7 @@ impl MapStore {
             colors: vec![0; SIZE * SIZE].into_boxed_slice(),
             decorations: Vec::new(),
             dirty: None,
+            version: 0,
         });
         if let Some(d) = p.decorations {
             m.decorations = d;
@@ -148,6 +152,7 @@ impl MapStore {
             });
         }
         if let Some(r) = rect {
+            m.version = m.version.wrapping_add(1);
             m.dirty = Some(match m.dirty {
                 None => r,
                 Some(d) => [d[0].min(r[0]), d[1].min(r[1]), d[2].max(r[2]), d[3].max(r[3])],
@@ -167,6 +172,12 @@ impl MapStore {
 }
 
 impl MapData {
+    /// Stamp of the color content, different after every change: its version, or (`by_version`
+    /// false, former way, `RUSTCRAFT_OPT_MAP_VERSION=0`) a hash of the 16 KiB of colors.
+    pub fn content_stamp(&self, by_version: bool) -> u64 {
+        if by_version { u64::from(self.version) } else { crate::cache_key::sip_cache_key(&self.colors) }
+    }
+
     /// RGBA pixels of the rectangle (x0, y0, x1, y1 inclusive).
     fn image(&self, r: [u8; 4]) -> Image {
         let pal = palette();
@@ -310,6 +321,72 @@ mod tests {
         assert_eq!((m.scale, m.locked), (2, false));
         assert_eq!(&m.colors[126 + 3 * SIZE..128 + 3 * SIZE], &[9, 10]);
         assert_eq!(m.dirty, Some([126, 3, 127, 3]));
+    }
+
+    /// The inventory preview slot over a run of packets, as `draw_map_preview` keeps it: the colors
+    /// are copied again only when (map, generation, stamp) changes. Returns the copy count.
+    fn preview_slot_run(by_version: bool) -> usize {
+        let mut s = MapStore::default();
+        let patch = |x0, colors: Vec<u8>| Some(MapPatch { x0, y0: 7, width: colors.len() as u8, height: 1, colors });
+        let packets = [
+            packet(1, 0, false, patch(0, vec![4, 5])),
+            packet(1, 0, false, None),
+            packet(1, 0, false, patch(10, vec![9])),
+            packet(1, 0, false, None),
+            packet(1, 0, false, patch(127, vec![6, 6])),
+            packet(1, 0, false, patch(200, vec![8])),
+        ];
+        let (mut slot, mut shown, mut copies) = (None, Vec::new(), 0);
+        for p in packets {
+            s.apply(p);
+            for _frame in 0..3 {
+                let d = s.get(1).unwrap();
+                let key = (1, s.generation, d.content_stamp(by_version));
+                if slot != Some(key) {
+                    slot = Some(key);
+                    shown = d.colors.to_vec();
+                    copies += 1;
+                }
+                assert_eq!(shown[..], d.colors[..], "the preview shows stale colors");
+            }
+        }
+        copies
+    }
+
+    #[test]
+    fn map_preview_follows_every_patch_and_nothing_else() {
+        // Three patches that write pixels (the last one lies outside the map): three copies,
+        // none for the frames in between, whichever stamp is compared.
+        assert_eq!(preview_slot_run(true), 3);
+        assert_eq!(preview_slot_run(false), 3);
+        let mut s = MapStore::default();
+        s.apply(packet(2, 0, false, None));
+        let before = s.get(2).unwrap().content_stamp(true);
+        s.apply(packet(2, 0, false, Some(MapPatch { x0: 3, y0: 3, width: 1, height: 1, colors: vec![0] })));
+        // Same color as before, yet a patch: the version moves (one needless copy, never a stale one).
+        assert_ne!(s.get(2).unwrap().content_stamp(true), before);
+    }
+
+    /// Micro-bench (ignored; `cargo test --release -p rc-app bench_map_preview_stamp -- --ignored
+    /// --nocapture`): the per-frame cost of the preview's stamp, 16 KiB hashed against the version.
+    #[test]
+    #[ignore]
+    fn bench_map_preview_stamp() {
+        let mut s = MapStore::default();
+        s.apply(packet(1, 0, false, Some(MapPatch { x0: 0, y0: 0, width: 128, height: 128, colors: vec![9; SIZE * SIZE] })));
+        let d = s.get(1).unwrap();
+        for (name, by_version) in [("16 KiB hashed (former)", false), ("version compared", true)] {
+            let best = (0..7)
+                .map(|_| {
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..2_000 {
+                        std::hint::black_box(std::hint::black_box(d).content_stamp(by_version));
+                    }
+                    t0.elapsed().as_secs_f64() * 1e9 / 2_000.0
+                })
+                .fold(f64::MAX, f64::min);
+            println!("{name:<24} {best:>10.1} ns per frame");
+        }
     }
 
     #[test]
