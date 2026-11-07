@@ -7489,7 +7489,7 @@ summon; UUID texts formatted once per entity. Sabotages (manual, reverted, `targ
 candidate order reversed, first match also with a random order, kept hint trusted unchecked, mob
 lookup one slot off, UUID lookup keeping the first family, terminal form without its count (first
 caught only once the count was stored: added), type first without kept compounds, two options
-sharing a bit: each fails its test.
+sharing a bit, UUID map hint trusted without checking the compound's UUID: each fails its test.
 
 `bench_selectors.rs` (memstats build, µs per command / allocations per command, median of 5
 runs, loaded machine: timings spread by ±30 %, allocations exact). "old" = former search;
