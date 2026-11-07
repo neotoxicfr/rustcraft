@@ -17,6 +17,9 @@ use rc_physics::{Aabb, Fluid};
 use rc_world::ChunkGrid;
 use serde_json::Value;
 
+use crate::render::upload::Uploader;
+use crate::render::upload::per_frame::FrameBuffer;
+
 /// Capacity of a queue (§ 2.1) and threshold of the progressive admission.
 const CAPACITY: usize = 16_384;
 const CROWDED: usize = 12_288;
@@ -3719,20 +3722,31 @@ pub struct Inst {
     tex: u32,
 }
 
+/// Size of the screen axes uniform (right and up, four floats each).
+const AXES_BYTES: u64 = 32;
+
+/// The tests read the particle buffers back from the GPU, which takes a copy source.
+#[cfg(test)]
+const READ_BACK: wgpu::BufferUsages = wgpu::BufferUsages::COPY_SRC;
+#[cfg(not(test))]
+const READ_BACK: wgpu::BufferUsages = wgpu::BufferUsages::empty();
+
 /// GPU side: two pipelines (opaque with the entities, translucent after the translucent
 /// terrain), particle atlas, one reused instance buffer.
 pub struct ParticleRenderer {
     opaque_pl: wgpu::RenderPipeline,
     trans_pl: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
-    axes: wgpu::Buffer,
+    /// Screen axes (uniform, 32 bytes), made with the renderer: the atlas's binding points at it.
+    axes: FrameBuffer,
     bind: Option<wgpu::BindGroup>,
     pending_atlas: Option<Image>,
     /// Block texture → layer of the main array (`u32::MAX`: absent).
     layers: Vec<u32>,
     opaque: Vec<Inst>,
     trans: Vec<Inst>,
-    buf: Option<(wgpu::Buffer, u64)>,
+    /// Instances of the frame, opaque then translucent.
+    instances: FrameBuffer,
     counts: (u32, u32),
     right_up: [[f32; 4]; 2],
     /// Camera layout (group 0), for the pipelines made on demand.
@@ -3770,7 +3784,7 @@ impl ParticleRenderer {
 
     /// Translucents, stage `f` of the improved transparency; group 0 (camera) is already bound.
     pub fn draw_translucent_oit(&self, pass: &mut wgpu::RenderPass<'_>, f: crate::oit::Frame<'_>) {
-        let (Some(bind), Some((buf, _)), Some(set)) = (&self.bind, &self.buf, &self.oit) else { return };
+        let (Some(bind), Some(buf), Some(set)) = (&self.bind, self.instances.buffer(), &self.oit) else { return };
         if self.counts.1 == 0 {
             return;
         }
@@ -3858,12 +3872,8 @@ impl ParticleRenderer {
         };
         let opaque_pl = pipeline("opaque particles", None);
         let trans_pl = pipeline("translucent particles", Some(wgpu::BlendState::ALPHA_BLENDING));
-        let axes = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("particles (axes)"),
-            size: 32,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let mut axes = FrameBuffer::new("particles (axes)", wgpu::BufferUsages::UNIFORM | READ_BACK, AXES_BYTES);
+        axes.reserve(device, AXES_BYTES);
         ParticleRenderer {
             opaque_pl,
             trans_pl,
@@ -3874,7 +3884,7 @@ impl ParticleRenderer {
             layers,
             opaque: Vec::new(),
             trans: Vec::new(),
-            buf: None,
+            instances: FrameBuffer::new("particles", wgpu::BufferUsages::VERTEX | READ_BACK, 16 * 1024),
             counts: (0, 0),
             right_up: [[0.0; 4]; 2],
             camera_layout: camera_layout.clone(),
@@ -3882,7 +3892,13 @@ impl ParticleRenderer {
         }
     }
 
-    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, _up: &mut crate::render::upload::Uploader) {
+    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, up: &mut Uploader) {
+        self.upload_with(device, queue, up, rc_data::opt_switch!("RUSTCRAFT_OPT_PARTICLE_WRITE_WITH"));
+    }
+
+    /// [`Self::upload`], the frame's writes through the uploader or (`through_uploader` false, the
+    /// path before) through the queue.
+    fn upload_with(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, up: &mut Uploader, through_uploader: bool) {
         if let Some(img) = self.pending_atlas.take() {
             let tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("particle atlas"),
@@ -3910,7 +3926,7 @@ impl ParticleRenderer {
                 layout: &self.layout,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: self.axes.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: self.axes_buffer().as_entire_binding() },
                 ],
             }));
         }
@@ -3918,22 +3934,40 @@ impl ParticleRenderer {
         if self.counts == (0, 0) {
             return;
         }
-        queue.write_buffer(&self.axes, 0, bytemuck::cast_slice(&self.right_up));
-        let size = std::mem::size_of::<Inst>() as u64;
-        let need = (u64::from(self.counts.0) + u64::from(self.counts.1)) * size;
-        if self.buf.as_ref().is_none_or(|(_, cap)| *cap < need) {
-            let cap = need.next_power_of_two().max(16 * 1024);
-            self.buf = Some((
-                device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("particles"),
-                    size: cap,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }),
-                cap,
-            ));
+        if through_uploader {
+            self.write_through_uploader(queue, up);
+        } else {
+            self.write_through_queue(device, queue);
         }
-        let buf = &self.buf.as_ref().expect("created above").0;
+    }
+
+    fn axes_buffer(&self) -> &wgpu::Buffer {
+        self.axes.buffer().expect("axes buffer made with the renderer")
+    }
+
+    /// The frame's writes through the uploader (`RUSTCRAFT_OPT_PARTICLE_WRITE_WITH`): its transit
+    /// ring (`RUSTCRAFT_OPT_FRAME_WRITES_RING`) instead of a staging buffer made and dropped per
+    /// write, the opaque and translucent instances copied into one write, and the bytes counted
+    /// with the renderer's other writes.
+    fn write_through_uploader(&mut self, queue: &wgpu::Queue, up: &mut Uploader) {
+        self.axes.write(up, queue, bytemuck::cast_slice(&self.right_up));
+        let (opaque, trans): (&[u8], &[u8]) = (bytemuck::cast_slice(&self.opaque), bytemuck::cast_slice(&self.trans));
+        self.instances.write_with(up, queue, (opaque.len() + trans.len()) as u64, |mut view| {
+            if !opaque.is_empty() {
+                view.slice(..opaque.len()).copy_from_slice(opaque);
+            }
+            if !trans.is_empty() {
+                view.slice(opaque.len()..).copy_from_slice(trans);
+            }
+        });
+    }
+
+    /// The writes of before: three queue writes, each with its own staging buffer.
+    fn write_through_queue(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        queue.write_buffer(self.axes_buffer(), 0, bytemuck::cast_slice(&self.right_up));
+        let size = std::mem::size_of::<Inst>() as u64;
+        self.instances.reserve(device, (u64::from(self.counts.0) + u64::from(self.counts.1)) * size);
+        let buf = self.instances.buffer().expect("reserved above");
         if !self.opaque.is_empty() {
             queue.write_buffer(buf, 0, bytemuck::cast_slice(&self.opaque));
         }
@@ -3953,7 +3987,7 @@ impl ParticleRenderer {
     }
 
     fn draw(&self, pass: &mut wgpu::RenderPass<'_>, pipeline: &wgpu::RenderPipeline, range: std::ops::Range<u32>) {
-        let (Some(bind), Some((buf, _))) = (&self.bind, &self.buf) else { return };
+        let (Some(bind), Some(buf)) = (&self.bind, self.instances.buffer()) else { return };
         if range.is_empty() {
             return;
         }
@@ -4270,6 +4304,97 @@ mod tests {
         grid.insert(lit_column());
         let flames_full = LightPaths { sabotage: Some(LightSabotage::EmissiveAsFullBright), ..cached };
         assert!(instance_bytes(&p, &grid, flames_full) != instance_bytes(&p, &grid, cached), "flames full bright");
+    }
+
+    /// An instance whose every field tells frame `n`, index `i` and list `list` apart.
+    fn numbered_instance(n: usize, i: usize, list: u32) -> Inst {
+        let v = (n * 10_000 + i) as f32;
+        Inst {
+            pos: [v, -v, list as f32],
+            size: v * 0.5,
+            uv: [v, v + 1.0, v + 2.0, v + 3.0],
+            color: (n as u32) << 24 | i as u32,
+            light: i as u32 ^ 0xf0f0,
+            roll: -v * 0.25,
+            tex: list << 29 | n as u32,
+        }
+    }
+
+    /// The instances and the screen axes reach the GPU the same byte for byte through the uploader,
+    /// with and without its transit ring, as through the queue (the path before), over frames that
+    /// grow the buffer, hold only opaque or only translucent instances, and shrink.
+    #[test]
+    fn particle_writes_reach_the_gpu_unchanged() {
+        use crate::render::upload::tests::{gpu, read};
+        let Some((device, queue)) = gpu() else { return };
+        let camera = crate::render::camera_layout(&device, false);
+        let frames = [(3, 2), (500, 0), (0, 700), (2000, 1500), (40, 1)];
+        let read_frames = |through_uploader: bool, ring: bool| -> Vec<Vec<u8>> {
+            let mut r = ParticleRenderer::new(&device, &camera, wgpu::TextureFormat::Rgba8Unorm, Vec::new());
+            let mut up = Uploader::new(&device, ring);
+            let mut out = Vec::new();
+            for (n, &(opaque, trans)) in frames.iter().enumerate() {
+                r.opaque = (0..opaque).map(|i| numbered_instance(n, i, 0)).collect();
+                r.trans = (0..trans).map(|i| numbered_instance(n, i, 1)).collect();
+                r.right_up = [[n as f32; 4], [-(n as f32); 4]];
+                r.upload_with(&device, &queue, &mut up, through_uploader);
+                up.submit(&queue, device.create_command_encoder(&Default::default()).finish());
+                let len = (opaque + trans) * std::mem::size_of::<Inst>();
+                let mut bytes = read(&device, &queue, r.instances.buffer().expect("written"))[..len].to_vec();
+                bytes.extend(read(&device, &queue, r.axes_buffer()));
+                out.push(bytes);
+            }
+            out
+        };
+        let want = read_frames(false, true);
+        assert!(read_frames(true, true) == want, "through the ring");
+        assert!(read_frames(true, false) == want, "through the uploader without the ring");
+    }
+
+    /// Micro-bench on the GPU (machine loaded by other agents' builds: an order of magnitude only):
+    /// CPU time of a frame's particle writes plus its submission, through the queue (before) and
+    /// through the uploader with and without its ring; staging buffers and bytes per frame. Alone,
+    /// and in a frame where another layer already writes through the ring (its transit command
+    /// buffer then exists anyway, as in the client).
+    #[test]
+    #[ignore = "micro-bench: cargo test --release -p rc-app particle_writes_bench -- --ignored --nocapture"]
+    fn particle_writes_bench() {
+        let Some((device, queue)) = crate::render::upload::tests::gpu() else { return };
+        let camera = crate::render::camera_layout(&device, false);
+        let other_layer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let paths = [("queue", false, true), ("uploader, ring", true, true), ("uploader", true, false)];
+        for (count, in_frame) in [1000, 4000, 16_000].into_iter().flat_map(|n| [(n, false), (n, true)]) {
+            for (name, through_uploader, ring) in paths {
+                let mut r = ParticleRenderer::new(&device, &camera, wgpu::TextureFormat::Rgba8Unorm, Vec::new());
+                let mut up = Uploader::new(&device, ring);
+                r.opaque = (0..count / 2).map(|i| numbered_instance(0, i, 0)).collect();
+                r.trans = (0..count / 2).map(|i| numbered_instance(0, i, 1)).collect();
+                let mut best = f64::MAX;
+                for frame in 0..120 {
+                    if in_frame {
+                        up.write(&queue, &other_layer, 0, &[7; 256]);
+                    }
+                    let t = Instant::now();
+                    r.upload_with(&device, &queue, &mut up, through_uploader);
+                    up.submit(&queue, device.create_command_encoder(&Default::default()).finish());
+                    best = best.min(t.elapsed().as_secs_f64() * 1e6);
+                    if frame % 8 == 7 {
+                        device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).expect("GPU wait");
+                    }
+                }
+                let s = up.take_stats();
+                let (transits, kb) = (s.transits as f64 / 120.0, s.bytes as f64 / 120.0 / 1024.0);
+                let place = if in_frame { "in a frame" } else { "alone" };
+                eprintln!(
+                    "{count} particles {place}, {name}: {best:.1} µs per frame, {transits:.2} staging buffers counted, {kb:.1} KB counted"
+                );
+            }
+        }
     }
 
     /// Micro-bench (machine loaded by other agents' builds: an order of magnitude only): the
