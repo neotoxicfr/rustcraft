@@ -99,7 +99,9 @@ fn tiles_of(chunks: &[(i32, i32)], side: i32) -> Vec<Vec<usize>> {
 fn counted<R>(n: u64, f: impl FnOnce() -> R) -> R {
     let t0 = std::time::Instant::now();
     let out = f();
-    stats::CHUNK_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    let ns = t0.elapsed().as_nanos() as u64;
+    stats::CHUNK_NS.fetch_add(ns, Relaxed);
+    stats::add_this_thread_light_ns(ns);
     stats::CHUNKS.fetch_add(n, Relaxed);
     out
 }

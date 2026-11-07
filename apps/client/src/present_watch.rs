@@ -86,11 +86,12 @@ pub fn leave() {
     enter(Stage::Idle);
 }
 
-/// Runs `f` in `stage`, then returns to the previous stage.
+/// Runs `f` in `stage`, then returns to the previous stage. The frame composition of the perf
+/// log charges the call to its own stage (`frame_stages.rs`).
 pub fn during<T>(stage: Stage, f: impl FnOnce() -> T) -> T {
     let prev = Stage::from_u8(STAGE.load(Ordering::Relaxed));
     enter(stage);
-    let r = f();
+    let r = crate::profiler::during_driver_stage(stage, f);
     enter(prev);
     r
 }

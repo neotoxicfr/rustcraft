@@ -9882,3 +9882,71 @@ items, a fifth of the stacks with copies, one in seven moving). Before (1 core, 
   0 alone, then `STILL_TNT_CACHE=1` and `PARALLEL_ENTITY_LIST=1`; samply over the explosion window;
   captures 1600×900 of `tnt-heap` and `dropped-items` in one run with every switch at 0 against the
   default.
+
+## C5-M03: attribution of the spikes, composition of the slowest server tick and of the slow frames (07/11, loaded machine)
+
+Diagnostic only: `RUSTCRAFT_PERFLOG_STAGES=1` (default off, never set by `tools/bench/scenes.py`,
+never in the reference runs). No gain of its own: it tells which spreading leads (B12) are worth it.
+
+- Server (`crates/rc-sim/src/tick_stages.rs`): a lap clock cuts each tick of `Server::run` into 14
+  stages (chunk adoption, packets, save, world clock, blocks, entities, block entities, world after,
+  block-change flush, LAN guests, paused, tracking, chunk send, loading screen) plus the rest. Over
+  each window of 100 ticks the SLOWEST tick is written with its own composition and the 3 ticks after
+  it (never the sum of the per-stage maxima), and the light time of the server thread inside it
+  (`rc_light::stats::this_thread_light_ns`, new per-thread total: the process totals mix the
+  client's relights in). Dated lines `[perf] [t s] counter server_slowest_tick_<stage>_ms`,
+  `_rest_ms`, `_light_ms`, `_followers_ms` (columns `c:` of scenes.py, unchanged) and one readable
+  line `server slowest tick N (game time G, mod 400 = .., mod 20 = ..): total = stage + stage +
+  rest, light; next ticks: ...`. The phase is in the readable line only: scenes.py averages every
+  counter over the scene window, and a mean of remainders (19 and 1 give 10) means nothing. It is
+  taken on the game time, which the world's periodic work is keyed on (spawn checks every 400,
+  many checks every 20), not on the server's tick count (offset by the saved game time). While on,
+  these dated server lines also fill the client's silences: the bench's client-stall detection is
+  blind then.
+- Client (`apps/client/src/frame_stages.rs`, a collection of `profiler.rs` apart from its three text
+  collections `PIE`, `RECORD`, `SINGLE`): the zones right under `root` by index (packets, light and
+  meshing, mouse, tick, sound, frame, other), the end of the frame (`fpsUpdate`, a child of `frame`
+  in the game's zone tree, which the F3 chart shows and so stays as it is: found at its own depth;
+  the perf log's own work after its reading lands in the next frame's `fps_update`), the driver
+  stages of `present_watch` (GPU wait = the device poll after the submission, now watched;
+  configure, acquire, submit, present, readback) which take over from their zone, the gap between
+  frames (`outside_frame`) and the time inside the frame outside any zone (`unzoned`). One clock
+  always charged to the current stage, read at the perf log's own frame instant: the stages add up
+  to the frame interval exactly. Only the frames in a world are composed: out of a world (title
+  screen, menus, connection) the whole menu frame runs inside `scheduledExecutables` and would be
+  charged to light and meshing. Counters per second: `frame_us_<stage>` (mean over all frames),
+  `slow_frames_per_s` and `slow_frame_us_<stage>` (frames over twice the median), the client relight
+  time of each (`frame_us_client_relight`, `slow_frame_us_client_relight`), and a readable
+  `slowest frame` line. `frame_p999_ms` (99.9th percentile of the frames) is printed whenever the
+  perf log is on.
+
+| Cost (micro-bench, loaded machine) | off | on |
+|---|---|---|
+| `tick_stage_log_cost`, ns per tick (start, 16 laps, end, window) | 50 | 447 |
+| `frame_stage_cost`, ns per frame (6 top zones, 30 nested, 2 driver calls, reading) | 30 | 778 |
+
+  On: 0.45 µs per server tick, 0.78 µs per frame (0.3% of a 240 µs frame, within the 1-2% asked).
+  Off: unchanged paths (a thread boolean in the profiler; one `Option` test per lap on the server;
+  one relaxed addition per client relight and one thread-local addition per light computation).
+- Proofs: `tick_stages::tests::stages_cover_real_ticks` (flat world, 40 zombies, flowing water,
+  40 real ticks: stages within 5% of the measured tick, entity time in its stage, light inside the
+  tick; fails on a lap that does not move its boundary: 32.3 ms counted for an 8.5 ms tick, and on a
+  misplaced entity boundary), the window tests (the slowest tick whole, followers across the window
+  end, no per-stage maxima), `profiler::tests::frame_stages_follow_the_zones_and_the_driver_calls`
+  (the zone calls of `app_frame.rs` in their order and depth, `present_watch::during` inside
+  `render`: stages within 5% of the interval, the driver call and the end of the frame out of the
+  `frame` zone; lower bounds only tight, upper margin 20 ms for loaded runners; fails when the
+  driver stage is not switched and when `fpsUpdate` is only looked for right under `root`, as
+  first written), `frame_stages` unit tests (exact cover to the nanosecond, zone switch during a
+  driver call), `tick_stages::tests::report_lines_carry_every_stage_and_the_tick_phase` (no phase
+  counter, phase of the game time in the readable line).
+- Placement (B4): log only; main thread for the frames, server thread for the ticks; no GPU or
+  multi-core lead applies. PresentMon (driver against OS) and the samply cross-check of the 2-70 ms
+  spikes are outside the code: to do on the quiet machine.
+- To measure on the quiet machine, with `RUSTCRAFT_PERFLOG_STAGES=1` (not a reference run): tnt
+  (72.6 ms volley), crowd-1000, redstone, cave (table of the slowest tick's stages); plains32,
+  forest, village, crowd-1000 (cost of the collector against the same scene without the switch,
+  share of each stage in the frames over twice the median); a flowing-water scene to find the relight
+  spikes again (server: flowing water is due 5 ticks after each change, so look for a spacing of
+  5, or a multiple, between the game times of successive readable `server slowest tick` lines,
+  not for fixed remainders; client: `slow_frame_us_client_relight`).

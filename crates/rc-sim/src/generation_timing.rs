@@ -22,7 +22,7 @@ pub fn set_log_origin(origin: Instant) {
     let _ = LOG_ORIGIN.set(origin);
 }
 
-fn seconds_since_origin(now: Instant) -> f64 {
+pub(crate) fn seconds_since_origin(now: Instant) -> f64 {
     now.duration_since(*LOG_ORIGIN.get_or_init(|| now)).as_secs_f64()
 }
 

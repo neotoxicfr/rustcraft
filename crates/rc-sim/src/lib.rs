@@ -65,6 +65,7 @@ pub(crate) mod inside_blocks; // G5-F02a: shared crossed-block pass
 pub(crate) mod usercache; // L9-COMBAT: profile name cache (`usercache.json`)
 pub mod weather;
 pub mod tickrate;
+mod tick_stages; // composition of the slowest ticks (`RUSTCRAFT_PERFLOG_STAGES`)
 // Mobs (S4).
 pub mod mobs;
 mod walk; // L10-ORDER: one entity walk for every family, in list order

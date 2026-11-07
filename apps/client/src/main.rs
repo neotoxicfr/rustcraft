@@ -51,6 +51,7 @@ mod events_before_renderer;
 mod exact;
 mod explode;
 mod flow;
+mod frame_stages;
 mod front;
 mod glyph_pool;
 mod gui;
