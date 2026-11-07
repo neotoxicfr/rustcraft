@@ -7,7 +7,7 @@ use super::super::goals::{LOOK, MOVE, TARGET, TBase};
 use super::super::mob::{Ent, Mob, MoveOp};
 use super::super::mth::{block_of, dist2, reduced};
 use super::super::species::Kind;
-use super::{Spell, is_raider};
+use super::Spell;
 use crate::server::Server;
 
 /// Crossbow goal state.
@@ -236,7 +236,7 @@ impl Server {
                 if !m.ill.johnny {
                     return false;
                 }
-                *target = self.nearest_living(m, base.must_see, |_, _| true);
+                *target = self.nearest_living(m, base.must_see, self.mobs.list.iter(), true, |_, _| true);
                 target.is_some()
             }
             IGoal::VexCharge => {
@@ -268,12 +268,8 @@ impl Server {
                     return false;
                 }
                 let see = base.must_see;
-                *target = self.nearest_living(m, see, |s, e| match e {
-                    Ent::Mob(id) => s
-                        .mob_ref(id)
-                        .is_some_and(|o| matches!(o.kind, Kind::Villager | Kind::WanderingTrader) && !o.is_baby()),
-                    Ent::Player => false,
-                });
+                let adults = self.mobs.of_kinds([Kind::Villager, Kind::WanderingTrader]);
+                *target = self.nearest_living(m, see, adults, false, |_, o| !o.is_baby());
                 target.is_some()
             }
             IGoal::Ranged { .. } => self.ent_valid(m.target),
@@ -285,12 +281,16 @@ impl Server {
                     return false;
                 }
                 let see = base.must_see;
-                *target = self.nearest_living(m, see, |s, e| match e {
-                    Ent::Mob(id) => s.mob_ref(id).is_some_and(|o| {
-                        is_raider(o.kind) && o.kind != Kind::Witch && o.ill.raid.is_some_and(|r| s.raid_is_active(r))
-                    }),
-                    Ent::Player => false,
-                });
+                // The raiders other than witches.
+                let allies = self.mobs.of_kinds([
+                    Kind::Pillager,
+                    Kind::Vindicator,
+                    Kind::Evoker,
+                    Kind::Illusioner,
+                    Kind::Ravager,
+                ]);
+                *target =
+                    self.nearest_living(m, see, allies, false, |s, o| o.ill.raid.is_some_and(|r| s.raid_is_active(r)));
                 target.is_some()
             }
             IGoal::WitchPlayers { base, target } => {
@@ -668,12 +668,7 @@ impl Server {
         }
         // Index of the points of interest around all the candidate points (±15 + 10 blocks;
         // distance to villages over ±7 sections), then read-only searches.
-        let (cx, cz) = (pos[0] >> 4, pos[2] >> 4);
-        for dz in -9..=9 {
-            for dx in -9..=9 {
-                self.poi_ensure(cx + dx, cz + dz);
-            }
-        }
+        self.poi_ensure_square(pos[0] >> 4, pos[2] >> 4, 9);
         let homes: Vec<[i32; 3]> =
             self.poi_in_range(|t| t.is_village(), pos, 64, Occupancy::IsOccupied).into_iter().map(|r| r.pos).collect();
         let find = |c: [i32; 3], seen: &[[i32; 3]]| {
@@ -684,13 +679,14 @@ impl Server {
                     && !seen.contains(h)
             })
         };
-        let seen = visited.clone();
+        // Borrowed for the draw: the visited list does not change until it ends.
+        let seen: &[[i32; 3]] = visited;
         let land = super::super::wild::rpos::land_pos(self, m, 15, 7, |s, _, p| {
             let sec = (p[0] >> 4, p[1] >> 4, p[2] >> 4);
-            if s.mobs.poi.sections_to_village(sec) > 1 {
+            if !s.mobs.poi.within_sections_of_village(sec, 1) {
                 return f64::NEG_INFINITY;
             }
-            find(p, &seen).map_or(f64::NEG_INFINITY, |h| -(crate::poi::dist2i(h, pos) as f64))
+            find(p, seen).map_or(f64::NEG_INFINITY, |h| -(crate::poi::dist2i(h, pos) as f64))
         });
         let Some(land) = land else { return false };
         let Some(target) = find(block_of(land), visited) else { return false };
@@ -725,65 +721,66 @@ impl Server {
         t.is_some_and(|t| self.ent_alive(t))
     }
 
-    /// Closest mob (`Mob`) in the box (radius, 3, radius), sight required
-    /// (non-combat targeting limited to range `d`), measured from the eyes.
-    fn nearest_mob_in(&self, m: &mut Mob, d: f32) -> Option<Ent> {
-        let d = f64::from(d);
-        let b = m.bbox();
+    /// Closest mob (`Mob`) in the box (range, 3, range), sight required
+    /// (non-combat targeting limited to range `range`), measured from the eyes. One pass: the
+    /// sight checks read the server without changing it.
+    fn nearest_mob_in(&self, m: &mut Mob, range: f32) -> Option<Ent> {
+        let range = f64::from(range);
+        let bbox = m.bbox();
         let area = rc_physics::Aabb {
-            min: [b.min[0] - d, b.min[1] - 3.0, b.min[2] - d],
-            max: [b.max[0] + d, b.max[1] + 3.0, b.max[2] + d],
+            min: [bbox.min[0] - range, bbox.min[1] - 3.0, bbox.min[2] - range],
+            max: [bbox.max[0] + range, bbox.max[1] + 3.0, bbox.max[2] + range],
         };
         let eye = [m.pos()[0], m.eye_y(), m.pos()[2]];
-        let cands: Vec<(i32, [f64; 3])> = self
-            .mobs
-            .list
-            .iter()
-            .filter(|o| o.alive() && o.id != m.id && o.touches(&area))
-            .map(|o| (o.id, o.pos()))
-            .collect();
         let mut best: Option<(f64, i32)> = None;
-        for (id, p) in cands {
-            if !self.targeting_ok(m, Ent::Mob(id), false, d, true, true) {
+        let own_id = m.id;
+        for o in self.mobs.list.iter().filter(|o| o.alive() && o.id != own_id && o.touches(&area)) {
+            if !self.targeting_ok(m, Ent::Mob(o.id), false, range, true, true) {
                 continue;
             }
-            let dd = dist2(eye, p);
+            let dd = dist2(eye, o.pos());
             if best.is_none_or(|b| dd < b.0) {
-                best = Some((dd, id));
+                best = Some((dd, o.id));
             }
         }
         best.map(|b| Ent::Mob(b.1))
     }
 
-    /// Closest living entity in the targeting zone (tracking, 4, tracking), combat conditions
-    /// (the player included).
-    fn nearest_living(&self, m: &mut Mob, see: bool, filter: impl Fn(&Server, Ent) -> bool) -> Option<Ent> {
-        let f = m.follow_range();
-        let b = m.bbox();
+    /// Closest living entity in the targeting zone (tracking, 4, tracking), combat conditions:
+    /// the `candidates` mobs that pass `filter` (in the list's order), then the player when
+    /// `player_too`. The first minimum wins, as before when all the candidates were collected.
+    fn nearest_living<'s>(
+        &'s self,
+        m: &mut Mob,
+        see: bool,
+        candidates: impl Iterator<Item = &'s Mob>,
+        player_too: bool,
+        filter: impl Fn(&Server, &Mob) -> bool,
+    ) -> Option<Ent> {
+        let follow_range = m.follow_range();
+        let bbox = m.bbox();
         let area = rc_physics::Aabb {
-            min: [b.min[0] - f, b.min[1] - 4.0, b.min[2] - f],
-            max: [b.max[0] + f, b.max[1] + 4.0, b.max[2] + f],
+            min: [bbox.min[0] - follow_range, bbox.min[1] - 4.0, bbox.min[2] - follow_range],
+            max: [bbox.max[0] + follow_range, bbox.max[1] + 4.0, bbox.max[2] + follow_range],
         };
         let eye = [m.pos()[0], m.eye_y(), m.pos()[2]];
-        let mut cands: Vec<(Ent, [f64; 3])> = self
-            .mobs
-            .list
-            .iter()
-            .filter(|o| o.alive() && o.id != m.id && o.touches(&area))
-            .map(|o| (Ent::Mob(o.id), o.pos()))
-            .collect();
-        if self.player_aabb().intersects(&area) {
-            cands.push((Ent::Player, self.pos));
-        }
         let mut best: Option<(f64, Ent)> = None;
-        for (e, p) in cands {
-            if !filter(self, e) || !self.targeting_ok(m, e, true, f, see, true) {
-                continue;
+        let mut consider = |m: &mut Mob, e: Ent, p: [f64; 3]| {
+            if self.targeting_ok(m, e, true, follow_range, see, true) {
+                let dd = dist2(eye, p);
+                if best.is_none_or(|b| dd < b.0) {
+                    best = Some((dd, e));
+                }
             }
-            let dd = dist2(eye, p);
-            if best.is_none_or(|b| dd < b.0) {
-                best = Some((dd, e));
+        };
+        let own_id = m.id;
+        for o in candidates.filter(|o| o.alive() && o.id != own_id && o.touches(&area)) {
+            if filter(self, o) {
+                consider(m, Ent::Mob(o.id), o.pos());
             }
+        }
+        if player_too && self.player_aabb().intersects(&area) {
+            consider(m, Ent::Player, self.pos);
         }
         best.map(|b| b.1)
     }
@@ -793,8 +790,8 @@ impl Server {
     fn shout_to_raiders(&mut self, m: &Mob, target: Option<Ent>, aggressive: bool) {
         let b = m.bbox();
         let area = rc_physics::Aabb { min: b.min.map(|v| v - 8.0), max: b.max.map(|v| v + 8.0) };
-        for o in self.mobs.list.iter_mut() {
-            if o.id != m.id && is_raider(o.kind) && o.alive() && o.touches(&area) && dist2(m.pos(), o.pos()) <= 64.0 {
+        for o in self.mobs.of_kinds_mut(super::RAIDER_KINDS) {
+            if o.id != m.id && o.alive() && o.touches(&area) && dist2(m.pos(), o.pos()) <= 64.0 {
                 o.target = target;
                 if aggressive {
                     o.aggressive = true;
@@ -809,10 +806,12 @@ impl Server {
         if !m.nav.is_done() {
             return;
         }
-        let companions = self.patrol_companions(m);
+        // Only the leader hands its companions a target; the others only ask whether one exists.
+        let companions = if leader { self.patrol_companions(m) } else { Vec::new() };
+        let alone = if leader { companions.is_empty() } else { !self.has_patrol_companion(m) };
         let Some(target) = m.ill.patrol_target else { return };
         let tc = [f64::from(target[0]) + 0.5, f64::from(target[1]), f64::from(target[2]) + 0.5];
-        if m.ill.patrolling && companions.is_empty() {
+        if m.ill.patrolling && alone {
             m.ill.patrolling = false;
         } else if leader && closer_to_center(target, m.pos(), 10.0) {
             self.find_patrol_target(m);
@@ -848,19 +847,20 @@ impl Server {
 
     /// Patrol companions: patrollers within 16 blocks (box), outside an active raid.
     fn patrol_companions(&self, m: &Mob) -> Vec<i32> {
+        self.patrol_companions_of(m).map(|o| o.id).collect()
+    }
+
+    fn has_patrol_companion(&self, m: &Mob) -> bool {
+        self.patrol_companions_of(m).next().is_some()
+    }
+
+    fn patrol_companions_of<'s>(&'s self, m: &Mob) -> impl Iterator<Item = &'s Mob> {
         let b = m.bbox();
         let area = rc_physics::Aabb { min: b.min.map(|v| v - 16.0), max: b.max.map(|v| v + 16.0) };
-        self.mobs
-            .list
-            .iter()
-            .filter(|o| {
-                o.id != m.id
-                    && is_raider(o.kind)
-                    && o.touches(&area)
-                    && !o.ill.raid.is_some_and(|r| self.raid_is_active(r))
-            })
-            .map(|o| o.id)
-            .collect()
+        let own_id = m.id;
+        self.mobs.of_kinds(super::RAIDER_KINDS).filter(move |o| {
+            o.id != own_id && o.touches(&area) && !o.ill.raid.is_some_and(|r| self.raid_is_active(r))
+        })
     }
 
     /// ±500 blocks around the mob (entity random).

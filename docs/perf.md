@@ -6524,3 +6524,89 @@ Not done: a persistent starts cache kept with the chunk (needs a single setter f
 quiet-machine scene bench: `chambre-epreuve` (Job::Chunk per autosave, bytes written), `plains12`,
 `plains32`, `village`, `redstone` (be_tick_run at the profile), `forteresse-nether` (tick median
 and p99, with placement first on and off).
+## C6-M10: village distance, POI searches, golems, raids and illagers (06/11, loaded machine)
+
+Before: every village test (`is_village`, `close_to_village`, the golem's and the zombie's
+village checks) checked the 225 chunks of its ±7 square one by one, then read the whole ±6 cube
+of sections (2,197 lookups away from a village) even to answer "within one section"; the golem
+moving back to its village did that 126 times in one tick (≈ 300,000 lookups), the raid centre
+move 125 times; every radius search (`poi_in_range`, ≈ 20 callers: villager brains, golems,
+cats, trader, raids, lightning rods r128) looked up every section of every column and sorted the
+types and records of each again. Switches, default = new, `=0` = old (read once, `PoiPaths` for
+the registry):
+- `RUSTCRAFT_OPT_VILLAGESHELLS`: distance by shells of growing Chebyshev distance (stops at the
+  first village), bounded predicates (`within_sections_of_village(s, d)`: the (2d + 1)³ cube only).
+- `RUSTCRAFT_OPT_POICOLUMNS`: per chunk column, the filled sections and the count of occupied
+  village records, kept by every change (addition, removal, ticket taken or given back, chunk
+  indexing); distance by rings of columns with early exit, predicates through the columns; empty
+  columns skipped. Takes precedence over the shells when both are on.
+- `RUSTCRAFT_OPT_VILLAGEBATCH`: the golem's closest section, the golem's village sections and the
+  raid centre move collect the village sections of their cube once; the squares of chunks are
+  indexed in the order the per-section calls asked for them (same insertion ranks, same chunks to
+  save); the raid tick reuses its first village test when the centre did not move.
+- `RUSTCRAFT_OPT_POISORTED`: each section keeps its records' search order (type, hash bucket,
+  insertion rank), rebuilt when a record comes or goes; the radius search reads only the filled
+  sections of each column. The save still writes the insertion order.
+- `RUSTCRAFT_OPT_POIINDEXEDAREAS`: a square of chunks found fully indexed is remembered (the
+  indexed set only grows): one lookup instead of (2r + 1)². A square touching an unloaded chunk is
+  never remembered (it is checked again until that chunk is loaded).
+- `RUSTCRAFT_OPT_OMINOUSFAST`: item and count first, then the components against a reference built
+  once (the old test built the banner, ≈ 35 allocations, at every comparison); the banner pickup
+  filter tests the box before the banner.
+- `RUSTCRAFT_OPT_FANGSLAZY`: the caster is copied (a whole mob) only when the fangs hit something.
+- `RUSTCRAFT_OPT_WITCHFIRECHECKLAZY`: the witch's fire damage check (a linear walk of the damage
+  types) runs only in the branch that uses it; the draws keep their order.
+- `RUSTCRAFT_OPT_SNOWSTATELAZY`: the snow golem's trail state comes from the block table, and only
+  for an air cell (it was a walk over every block by name at each tick of each snow golem).
+- `RUSTCRAFT_OPT_KINDINDEX` (existing) now also serves the vexes of the summoning spell, the blue
+  sheep, the golem's villagers (and copper golems), the patrol companions, the raiders shouted to
+  and recruited, the witch's allies and the ravager's adult villagers. Without a switch (the same
+  calls in the same order): the nearest-living search filters each candidate mob directly (no
+  identifier lookup per candidate, no list), the look-at search is one pass, a patroller that is
+  not the leader only asks whether a companion exists, the zombie's visited houses are borrowed,
+  the raid bar sums its health without a list.
+
+Proof: `poi_tests.rs` (10⁵ sections of 20 random registries built by additions, type changes,
+removals and tickets; every distance 0..7 covered): shells and columns = whole cube for the
+distance and for every bound −1..8; the batched collections = one search per section (closest
+section, "within one" of the raid centre, distance 0 of the golem); radius searches r8..r64, three
+occupancies, four type filters: the same sequence of records, insertion ranks included; column
+summaries and search orders equal a fresh computation. Sabotages caught in the tests themselves
+(a shell read one step out, a section read in reverse) and on the code (ring early exit off by
+one, batched distance capped at 6: two tests fail). `search_equivalence_tests.rs`: three scenarios
+on the test world (village with golems and a zombie at night, 2,000 ticks; raid with the village
+moved two sections at tick 1,100, 1,500 ticks; evoker, witch, ravager, patrol, snow golem, blue
+sheep, 800 ticks), old paths against new: every mob's position, yaw, health, target and random
+state, the world random, the player, the raids and the fangs identical tick by tick, the POI
+registry identical at the end (insertion ranks, indexed chunks, chunks to save), the walking
+layer identical (snow); each scenario must go through its new paths (counted in the tests).
+`search_scenarios.rs` freezes the traces of the code before the change (2e768c2f, the scenario
+file added alone): the current code replays them (Windows).
+
+| Micro-bench, ns per call, loaded machine (1 core) | old | new |
+|---|---|---|
+| radius search r48 / r64, homes, village of 60 POIs | 2,738 / 3,811 | 592 / 668 (kept order) |
+| village distance in / at the edge of / outside the village | 2,188 / 2,208 / 4,565 | shells 12 / 1,353 / 4,133; columns 13 / 201 / 306 |
+| "within one section", same sites | 2,191 / 2,204 / 4,533 | cube 41 / 240 / 227; columns 16 / 25 / 21 |
+| golem's closest section (radius 2), same sites | 519,914 / 600,579 / 1,010,718 | one collection 15,300 / 9,596 / 13,829; through the columns 5,234 / 3,021 / 1,890 |
+| ominous banner test on the banner / on another stack | 599 / 422 | 175 / 2.5 |
+
+The square check of a village test, measured apart (the registry's indexed set, 41 × 41 chunks):
+557 ns checked chunk by chunk against 3 ns remembered; with the old cube read (≈ 2.1-4.5 µs) it was
+a fifth of a village test, after the columns it is most of it. A second run gave the same ratios
+(radius search 2,657 → 597 ns, closest section outside 1.20 ms → 2.3 µs). Shells alone lose
+outside a village on the exact distance (same 2,197 reads, more loop work: closest section 1.31 ms
+against 1.01 ms in the first run, 1.18 against 1.20 in the second) and win everywhere a village is
+near; with the columns on (default) they are not used. `bench_ticks` village site (integrated server, 400 ticks, two alternated
+passes): median 0.956 / 0.738 ms new against 0.731 / 0.794 ms old, p99 10.1 / 5.8 against
+5.2 / 5.5 ms: within the noise of the loaded machine (the site's villagers rarely ask). Memory:
+per section a `u32` per record (search order); per chunk column holding records ≈ 40 bytes; per
+remembered square 12 bytes. Multi-core and GPU: not applicable (registry of the server thread,
+answers needed in the caller's order). Not done (other files): `tick.rs` (`<= 2`),
+`wild/goals.rs` (`> 6`), `behave.rs` (villager's closest section, `sections_to_village` read
+only) can move to the bounded predicate and the batched closest section; the snow golem's melt
+attribute per biome needs a server-level table (C6-M33); `golem_on_place` by identifier needs the
+jack o'lantern in the block identifiers table; the ravager's crop names are already behind a
+column pre-scan. To settle on the quiet-machine scene bench: `village`, `village-nuit`, `raid`,
+`crowd-villageois` (2 passes, old exe as reference).
+
