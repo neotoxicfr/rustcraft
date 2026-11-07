@@ -1181,10 +1181,15 @@ impl Entities {
         // Movement of the tick (elytra, gliding in third-person view).
         e.velocity = std::array::from_fn(|i| pos[i] - e.pos[i]);
         e.linear = Some((pos, yaw, pitch, 1));
+        // The game keeps last tick's head yaw as the previous one, then turns the head to the
+        // player's yaw: set it before the tick (which reads it), but restore the old value as
+        // the previous one afterwards, or the head would not interpolate between ticks.
+        let head_before = e.head;
         e.head = yaw;
         e.on_ground = on_ground;
         e.death_time = if !dead { 0 } else { e.death_time.max(1) };
         e.tick();
+        e.head_o = e.head - wrap_degrees(e.head - head_before);
     }
 
     /// Entity by id, local player included.

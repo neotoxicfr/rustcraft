@@ -8082,6 +8082,23 @@ mod tests {
         }
     }
 
+    /// The local player's head yaw interpolates between two ticks like a remote one: after
+    /// two local ticks with yaws 0 then 40, the glide angle at half a tick lies strictly
+    /// between those of both ticks (a head copied into its previous value froze it).
+    #[test]
+    fn local_glide_yaw_interpolates_between_ticks() {
+        let mut all = testkit::spawn("player");
+        all.local = 7;
+        all.me = all.map.remove(&7);
+        all.tick_me([1.0, 0.0, 0.0], 0.0, 0.0, false, false);
+        all.tick_me([2.0, 0.0, 0.0], 40.0, 0.0, false, false);
+        let me = all.me.as_mut().unwrap();
+        assert_eq!((me.head_o, me.head), (0.0, 40.0));
+        me.pose_anim.vel_o = me.velocity;
+        let [start, middle, end] = [0.0, 0.5, 1.0].map(|pt| flying_y_rot(me, pt).unwrap());
+        assert!(start != end && middle > start.min(end) && middle < start.max(end), "{start} {middle} {end}");
+    }
+
     /// The game compares both squared horizontal lengths with the float 1e-5 widened
     /// (9.99999974e-6), not the double 1e-5: a movement in between still turns the glide.
     #[test]
