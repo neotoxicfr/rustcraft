@@ -340,11 +340,11 @@ impl Server {
     /// Hive that became a block entity (placement, generation, reading): it ticks.
     pub(crate) fn hive_register(&mut self, p: [i32; 3]) {
         if let Some(&id) = self.mobs.wild.tickers.get(&p)
-            && self.bs.tickers.iter().chain(self.bs.pending_tickers.iter()).any(|t| *t == (id, p))
+            && self.ticker_registered(id, p)
         {
             return;
         }
-        let id = self.add_ticker(p);
+        let id = self.add_ticker(p, crate::blocks::ticks::TickerFamily::Hive);
         self.mobs.wild.tickers.insert(p, id);
     }
 

@@ -101,6 +101,8 @@ pub(crate) fn run() {
     rc_sim::generation_timing::set_log_origin(started);
     boot::start();
     boot::mark("entering main");
+    // Driver, adapter and device opened while the resources load (`gpu_backend/early_open.rs`).
+    let early_gpu = gpu_backend::EarlyGpuOpen::start();
     let data = Arc::new(rc_data::load_or_prepare("26.3", |s| eprintln!("data: {s}")).unwrap_or_else(|e| {
         eprintln!("version data: {e}");
         std::process::exit(1);
@@ -169,6 +171,8 @@ pub(crate) fn run() {
         weather_images,
         languages,
     } = loaded;
+    // GPU formats fixed from the mesh tables before any meshing task can read them.
+    crate::render::init_gpu_formats(&tables);
     let phys = rc_physics::Tables::new(&data);
     let light = light_engine::LightTables::new(&data);
     boot::mark("physics and light");
@@ -300,10 +304,13 @@ pub(crate) fn run() {
             hm_rules: Vec::new(),
         },
         renderer: None,
+        early_gpu,
+        held_event: None,
         meshes_tx,
         meshes_rx,
         mesh_pending: Vec::new(),
         in_flight: 0,
+        all_held: None,
         eye: [0.0, 100.0, 0.0],
         yaw: 0.0,
         pitch: 0.0,
@@ -314,6 +321,7 @@ pub(crate) fn run() {
         last: Instant::now(),
         fps_frames: 0,
         fps_since: Instant::now(),
+        window_title: crate::window_title::WindowTitle::new(),
         started,
         status: String::new(),
         capture: rc_data::env_str!("RUSTCRAFT_CAPTURE").and_then(|v| {

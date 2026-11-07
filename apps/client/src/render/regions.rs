@@ -52,11 +52,9 @@ pub(super) fn alloc_in(
         usage: REGION_USAGE,
         mapped_at_creation: false,
     });
-    // Copy submitted right away, preceded by the pending staging (writes into the old
-    // buffer): the following writes into the new buffer come after.
-    let mut enc = device.create_command_encoder(&Default::default());
-    enc.copy_buffer_to_buffer(buf, 0, &bigger, 0, u64::from(arena.capacity) * stride);
-    up.submit(queue, enc.finish());
+    // Copy in order with the writes: after the pending ones into the old buffer, before the
+    // following ones into the new buffer (the new range may start inside the old one).
+    up.copy_buffer(queue, buf, 0, &bigger, 0, u64::from(arena.capacity) * stride);
     *buf = bigger;
     arena.grow(cap);
     arena.alloc(n).expect("room after growth")

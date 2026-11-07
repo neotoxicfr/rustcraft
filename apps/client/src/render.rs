@@ -265,25 +265,77 @@ impl GpuFormats {
     }
 }
 
-static GPU_FORMATS: std::sync::OnceLock<GpuFormats> = std::sync::OnceLock::new();
-
-/// Formats in force (set by the first renderer; without it, from the environment).
-pub fn gpu_formats() -> GpuFormats {
-    *GPU_FORMATS.get_or_init(|| GpuFormats::decide(true, 0))
+/// Formats fixed once per launch. A read before they are set from the mesh tables fixes the
+/// environment's defaults for the whole session (a meshing task started too early would do it):
+/// the setting then reports it.
+struct FormatsOnce {
+    formats: std::sync::OnceLock<GpuFormats>,
+    read_before_set: std::sync::atomic::AtomicBool,
 }
 
-/// Sets the formats from the mesh tables (once per launch).
+impl FormatsOnce {
+    const fn new() -> Self {
+        FormatsOnce {
+            formats: std::sync::OnceLock::new(),
+            read_before_set: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    fn read(&self) -> GpuFormats {
+        *self.formats.get_or_init(|| {
+            self.read_before_set.store(true, std::sync::atomic::Ordering::Relaxed);
+            GpuFormats::decide(true, 0)
+        })
+    }
+
+    /// Formats in force; `Err` when a read already fixed the defaults before this setting.
+    fn set(&self, decide: impl FnOnce() -> GpuFormats) -> Result<GpuFormats, GpuFormats> {
+        let f = *self.formats.get_or_init(decide);
+        if self.read_before_set.load(std::sync::atomic::Ordering::Relaxed) { Err(f) } else { Ok(f) }
+    }
+}
+
+static GPU_FORMATS: FormatsOnce = FormatsOnce::new();
+
+/// Formats in force (set at startup from the mesh tables; without it, from the environment).
+pub fn gpu_formats() -> GpuFormats {
+    GPU_FORMATS.read()
+}
+
+/// Sets the formats from the mesh tables (once per launch, before the first meshing task).
 pub fn init_gpu_formats(t: &rc_mesh::blocks::Tables) -> GpuFormats {
-    *GPU_FORMATS.get_or_init(|| {
+    let set = GPU_FORMATS.set(|| {
         let f = GpuFormats::decide(t.offsets_all_compact(), t.models.texture_names.len());
         eprintln!("[opt] GPU formats: {f:?}");
         f
+    });
+    set.unwrap_or_else(|f| {
+        eprintln!("GPU formats read before the mesh tables were known: {f:?} kept for the session");
+        f
     })
+}
+
+/// Everything the renderer is built from besides the GPU context.
+pub struct RendererAssets<'a> {
+    pub models: &'a BlockModels,
+    pub textures: &'a [Vec<rc_assets::texture::Image>],
+    pub sky: &'a crate::sky::SkyAssets,
+    pub gui: crate::gui::GuiAssets,
+    pub entities: Option<(Arc<rc_data::VersionData>, crate::entity_render::EntityTextures)>,
+    pub tables: &'a rc_mesh::blocks::Tables,
+}
+
+/// Waits until the GPU memory of the resources just released is given back (resource reload on a
+/// kept device): the new renderer does not allocate on top of the old one.
+pub fn wait_for_released_gpu_memory(device: &wgpu::Device) {
+    let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
 }
 
 pub struct Renderer {
     pub window: Arc<Window>,
     surface: wgpu::Surface<'static>,
+    /// Adapter of the device, handed back with it on a resource reload.
+    adapter: wgpu::Adapter,
     device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -469,6 +521,8 @@ pub struct Renderer {
     reached: Vec<(i32, i32, i32)>,
     /// Meshing view of the last frame drawn (`frustum::Renderer::sections_in_view`).
     meshing_view: Option<frustum::MeshingView>,
+    /// Bumped each time a frame's meshing view differs from the previous one.
+    meshing_view_rev: u64,
     reached_key: Option<([i64; 3], u64, bool, i32, i32)>,
     columns_rev: u64,
     /// Version of the sections' connectivity (column appeared, disappeared, or one of whose sections
@@ -497,20 +551,26 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    /// Renderer on `window` with the device of `gpu`. `between_phases` runs after each long phase
+    /// (surface, block textures, each group of pipelines): the app applies there the session events
+    /// that need no renderer and starts their meshing (`events_before_renderer.rs`).
     pub fn new(
         window: Arc<Window>,
-        models: &BlockModels,
-        textures: &[Vec<rc_assets::texture::Image>],
-        sky_assets: &crate::sky::SkyAssets,
-        gui_assets: crate::gui::GuiAssets,
-        entity_assets: Option<(Arc<rc_data::VersionData>, crate::entity_render::EntityTextures)>,
-        tables: &rc_mesh::blocks::Tables,
+        gpu: crate::gpu_backend::GpuContext,
+        assets: RendererAssets<'_>,
+        between_phases: &mut dyn FnMut(),
     ) -> Self {
-        let formats = init_gpu_formats(tables);
-        // Order of the APIs according to the "graphics API" setting read at startup (Vulkan first by
-        // default, arch § 8); RUSTCRAFT_BACKEND=vulkan|dx12 to force.
-        let crate::gpu_backend::Picked { surface, adapter, device, queue, text: gpu_text } =
-            crate::gpu_backend::pick(&window);
+        let RendererAssets {
+            models,
+            textures,
+            sky: sky_assets,
+            gui: gui_assets,
+            entities: entity_assets,
+            tables,
+        } = assets;
+        // Set at startup from these tables, before any meshing task (`startup.rs`).
+        let formats = gpu_formats();
+        let crate::gpu_backend::GpuContext { surface, adapter, device, queue, text: gpu_text } = gpu;
         let info = adapter.get_info();
         // Features retained when the device was opened (`gpu_backend::open_device`).
         let features = device.features();
@@ -530,6 +590,7 @@ impl Renderer {
         let SurfaceSetup { config, can_capture, present_mode, present_modes_caps } =
             configure_surface(&surface, &adapter, &device, &window);
         crate::boot::mark("renderer: surface configured");
+        between_phases();
 
         let shader_opts = crate::terrain_shader::opts().within_limits(&device.limits());
         let cameras = upload::Slots::new(
@@ -579,6 +640,7 @@ impl Renderer {
             block_texture_array(&device, &queue, "large block textures", big_size.max(1), &big_layers);
         let atlas_texel = [texel_size(main_size), texel_size(big_size)];
         crate::boot::mark("block textures written (write_texture)");
+        between_phases();
         let atlas_bytes = main_bytes + big_bytes;
         let sampler = crate::video::atlas_sampler(&device, 4, 1);
         let camera_layout = camera_layout(&device, shader_opts.lightmap_buffer);
@@ -656,6 +718,7 @@ impl Renderer {
         let TerrainPipelines { blocks: pipelines, fluids: fluid_pipelines, sorted: sorted_pipeline, sky: sky_pipeline } =
             terrain_pipelines(&device, &camera_layout, &column_layout, config.format, wire_mode, shader_opts, formats);
         crate::boot::mark("renderer: terrain and sky pipelines");
+        between_phases();
         let timer = timestamps.then(|| {
             let mode = crate::gpu_time::GpuTimer::mode_for(features);
             crate::gpu_time::GpuTimer::new(&device, &queue, mode, crate::gpu_time::settings().passes)
@@ -666,6 +729,7 @@ impl Renderer {
         crate::boot::mark("renderer: sky");
         let gui = crate::gui::Gui::new(&device, &queue, config.format, gui_assets);
         crate::boot::mark("renderer: interface");
+        between_phases();
         let blur = crate::blur::Blur::new(&device, config.format);
         crate::boot::mark("renderer: blur");
         let leash = crate::leash::LeashRenderer::new(&device, &camera_layout, config.format);
@@ -680,6 +744,7 @@ impl Renderer {
         let cracks = crate::crack::Cracks::new(&device, &camera_layout, config.format);
         let debug_lines = crate::debug_render::DebugLines::new(&device, &camera_layout, config.format);
         crate::boot::mark("renderer: labels, texts, outlines, cracks and debug lines");
+        between_phases();
         // Block fragments: layers of the main array only.
         let particle_layers =
             remap.iter().map(|&l| if l == u32::MAX || l & BIG_LAYER != 0 { u32::MAX } else { l }).collect();
@@ -690,6 +755,7 @@ impl Renderer {
             crate::entity_render::EntityRenderer::new(&device, &camera_layout, config.format, data, tex)
         });
         crate::boot::mark("renderer: entities");
+        between_phases();
         let weather = crate::weather_render::WeatherRenderer::new(&device, &camera_layout, config.format);
         crate::boot::mark("renderer: weather");
         Renderer {
@@ -760,6 +826,7 @@ impl Renderer {
             graph_rx,
             reached: Vec::new(),
             meshing_view: None,
+            meshing_view_rev: 0,
             reached_key: None,
             columns_rev: 0,
             vis_rev: 0,
@@ -770,6 +837,7 @@ impl Renderer {
             depth: depth_view(&device, config.width, config.height),
             window,
             surface,
+            adapter,
             device,
             queue,
             config,
@@ -829,6 +897,14 @@ impl Renderer {
             oit: None,
             terrain_oit: None,
         }
+    }
+
+    /// Hands back surface, adapter, device and queue, and releases everything else this renderer
+    /// built (resource reload, `RUSTCRAFT_OPT_KEEP_GPU_ON_RELOAD`): the next renderer is built
+    /// whole on the same device and the same surface, without reopening the driver.
+    pub fn into_gpu_context(self) -> crate::gpu_backend::GpuContext {
+        let Renderer { surface, adapter, device, queue, gpu_text, .. } = self;
+        crate::gpu_backend::GpuContext { surface, adapter, device, queue, text: gpu_text }
     }
 
     /// Sampler of the block textures: mip levels (`mipmapLevels`) and anisotropy
@@ -893,7 +969,9 @@ impl Renderer {
     pub fn prepare_overlays(&mut self, f: &crate::overlays::Frame<'_>) {
         let (frames, size, scale) = (&self.frames, (self.config.width, self.config.height), self.gui.scale);
         if let Some(o) = &mut self.overlays {
-            o.prepare(&self.device, &self.queue, f, size, scale, |t| frames.get(t as usize).map(|v| v[0] & 0xffff));
+            o.prepare(&self.device, &self.queue, &mut self.up, f, size, scale, |t| {
+                frames.get(t as usize).map(|v| v[0] & 0xffff)
+            });
         }
     }
 
@@ -1067,9 +1145,27 @@ impl Renderer {
 mod gpu_test;
 
 #[cfg(test)]
+mod kept_device_test;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use glam::Vec4;
+
+    /// A read of the GPU formats before they are set from the mesh tables (a meshing task started
+    /// too early) is reported by the setting; set first, the formats read are those of the tables.
+    /// Sabotage checked: ignoring the early read in `set` fails the first assertion.
+    #[test]
+    fn formats_read_before_being_set_are_reported() {
+        let tables = GpuFormats { fluid96: false, trans_compact: false };
+        let early = FormatsOnce::new();
+        let defaults = early.read();
+        assert_eq!(early.set(|| tables), Err(defaults), "early read not reported");
+        let in_order = FormatsOnce::new();
+        assert_eq!(in_order.set(|| tables), Ok(tables));
+        assert_eq!(in_order.read(), tables);
+        assert_eq!(in_order.set(|| unreachable!("set twice")), Ok(tables), "second setting keeps the first");
+    }
 
     /// Totem and interface do not read the fade clock: their cameras do not change
     /// when only the world clock advances (unchanged upload skipped).

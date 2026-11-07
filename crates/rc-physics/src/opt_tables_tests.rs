@@ -1,10 +1,14 @@
-//! Proofs of mission C6-M02 on the game's real data: fence gate recognised by its kind
-//! (fidelity fix), borrowed shape and precomputed top (`RUSTCRAFT_OPT_SHAPEREF`),
-//! `is_free` without collection (`RUSTCRAFT_OPT_ISFREE`), collection through the common walk. Micro-benches
-//! ignored by default (`--ignored`, 1 thread then all threads).
+//! Proofs of the collision tables and walk on the game's real data: fence gate recognised by its
+//! kind (fidelity fix), borrowed shape and precomputed top (`RUSTCRAFT_OPT_SHAPEREF`), `is_free`
+//! without collection (`RUSTCRAFT_OPT_ISFREE`), collection through the common walk, walk trimmed
+//! to the reach of the shapes (`RUSTCRAFT_OPT_COLLISION_SCAN_TRIM`), `resolve` without copies
+//! (`RUSTCRAFT_OPT_RESOLVE_NO_COPY`). Micro-benches ignored by default (`--ignored`, 1 thread then
+//! all threads).
 
 use super::*;
-use crate::collide::{EPS, collect, collect_ordered, is_free_with};
+use crate::collide::{
+    EPS, IsFreePath, ResolvePath, WalkOrder, WalkPath, collect, collect_ordered, is_free_with, resolve_with, walk_cells,
+};
 
 fn data() -> Option<VersionData> {
     rc_testdata::need(rc_testdata::version_data(), "26.3 data cache")
@@ -110,6 +114,19 @@ struct Mix<'a> {
     n: u64,
     ents: Vec<Aabb>,
     border: Option<border::WorldBorder>,
+    /// Reach announced to the collision walk: the tables' one, a wrong one in the sabotages.
+    reach: Aabb,
+    /// Moving blocks: cell and offset of their full-cube shape, one per direction (like a block
+    /// pushed by a piston, the shape leaves its cell).
+    movers: Vec<([i32; 3], [f64; 3])>,
+}
+
+impl Mix<'_> {
+    fn mover_shape(&self, p: [i32; 3], out: &mut Vec<Aabb>) -> bool {
+        let Some((_, o)) = self.movers.iter().find(|(c, _)| *c == p) else { return false };
+        out.push(Aabb::UNIT.offset(o[0], o[1], o[2]));
+        true
+    }
 }
 
 impl World for Mix<'_> {
@@ -118,7 +135,7 @@ impl World for Mix<'_> {
         Some(if !h.is_multiple_of(5) { 0 } else { ((h >> 8) % self.n) as u32 })
     }
     fn collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
-        self.state(x, y, z).is_some_and(|s| self.t.collision(s, out))
+        self.mover_shape([x, y, z], out) || self.state(x, y, z).is_some_and(|s| self.t.collision(s, out))
     }
     fn border(&self) -> Option<&border::WorldBorder> {
         self.border.as_ref()
@@ -126,16 +143,57 @@ impl World for Mix<'_> {
     fn entity_colliders(&self, area: &Aabb, out: &mut Vec<Aabb>) {
         entity_boxes_in(&self.ents, area, out);
     }
+    fn moving_collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        self.mover_shape([x, y, z], out)
+    }
+    fn shape_reach(&self, lo: [i32; 3], hi: [i32; 3]) -> Aabb {
+        let walked = |p: &[i32; 3]| (0..3).all(|a| lo[a] <= p[a] && p[a] <= hi[a]);
+        if self.movers.iter().any(|(p, _)| walked(p)) { Aabb::EVERYWHERE } else { self.reach }
+    }
+    fn states_in(&self, first: [i32; 3], last: [i32; 3], out: &mut [u32]) -> bool {
+        let mut i = 0;
+        for y in first[1]..=last[1] {
+            for z in first[2]..=last[2] {
+                for x in first[0]..=last[0] {
+                    out[i] = self.state(x, y, z).unwrap_or(UNLOADED);
+                    i += 1;
+                }
+            }
+        }
+        true
+    }
+    fn collision_of_state(&self, state: Option<u32>, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        self.mover_shape([x, y, z], out) || state.is_some_and(|s| self.t.collision(s, out))
+    }
 }
+
+/// The six directions a piston pushes in, with the shape 0.6 of the way.
+const PUSHES: [[f64; 3]; 6] =
+    [[0.6, 0.0, 0.0], [-0.6, 0.0, 0.0], [0.0, 0.6, 0.0], [0.0, -0.6, 0.0], [0.0, 0.0, 0.6], [0.0, 0.0, -0.6]];
 
 fn mix<'a>(t: &'a Tables, d: &VersionData) -> Mix<'a> {
     // Boat (1.375 × 0.5625) and shulker box (cube) placed near the origin; border of
-    // 40 blocks centred at (0, 0).
+    // 40 blocks centred at (0, 0); one moving block per direction along x = 10.
     let boat = Aabb { min: [2.3125, 64.0, 2.3125], max: [3.6875, 64.5625, 3.6875] };
     let shulker = Aabb { min: [-4.0, 64.0, -4.0], max: [-3.0, 65.0, -3.0] };
     let mut b = border::WorldBorder::default();
     b.set_size(40.0);
-    Mix { t, n: d.states.len() as u64, ents: vec![boat, shulker], border: Some(b) }
+    let movers = PUSHES.iter().enumerate().map(|(i, &o)| ([10, 64, 4 * i as i32 - 10], o)).collect();
+    Mix { t, n: d.states.len() as u64, ents: vec![boat, shulker], border: Some(b), reach: t.shape_reach(), movers }
+}
+
+/// Test boxes around the moving blocks of `w` (`n` per block), touching the shifted shape.
+fn boxes_near_movers(n: usize, w: &Mix) -> Vec<Aabb> {
+    let mut r = Rng(0xC5_0013);
+    let mut out = Vec::new();
+    for &(p, o) in &w.movers {
+        for _ in 0..n {
+            let size = [0.1 + r.f() * 1.4, 0.1 + r.f() * 1.9, 0.1 + r.f() * 1.4];
+            let min: [f64; 3] = std::array::from_fn(|a| f64::from(p[a]) + o[a] + r.f() * 2.0 - 1.0 - size[a] * 0.5);
+            out.push(Aabb { min, max: std::array::from_fn(|a| min[a] + size[a]) });
+        }
+    }
+    out
 }
 
 /// Test boxes: drawn around the entities (often in exact contact with a face) and up to
@@ -170,16 +228,16 @@ fn is_free_identical_at_all_levels() {
     let w = mix(&t, &d);
     let (mut free, mut by_ent, mut by_border) = (0, 0, 0);
     for b in boxes(10_000, &w) {
-        let old = is_free_with(&w, &b, 0);
-        assert_eq!(is_free_with(&w, &b, 1), old, "level 1, box {b:?}");
-        assert_eq!(is_free_with(&w, &b, 2), old, "level 2, box {b:?}");
+        let old = is_free_with(&w, &b, IsFreePath::CollectAll);
+        assert_eq!(is_free_with(&w, &b, IsFreePath::FirstOverlap), old, "level 1, box {b:?}");
+        assert_eq!(is_free_with(&w, &b, IsFreePath::FirstOverlapSharedBuffer), old, "level 2, box {b:?}");
         free += usize::from(old);
         let no_ent = Mix { ents: Vec::new(), ..mix(&t, &d) };
-        if !old && is_free_with(&no_ent, &b, 0) {
+        if !old && is_free_with(&no_ent, &b, IsFreePath::CollectAll) {
             by_ent += 1;
         }
         let no_border = Mix { border: None, ..mix(&t, &d) };
-        if !old && is_free_with(&no_border, &b, 0) {
+        if !old && is_free_with(&no_border, &b, IsFreePath::CollectAll) {
             by_border += 1;
         }
     }
@@ -241,12 +299,345 @@ fn collection_identical_to_the_old_one() {
     assert!(total > 3_000, "coverage: {total} boxes collected");
 }
 
-/// Time per call of `f` (ns), on `threads` threads that each make `n` calls.
+/// Stored figures the trimmed walk relies on: in 26.3 only piston heads and pitcher crops leave
+/// their cell sideways or below (by 0.25), fences and walls rise to 1.5; every shape lies inside
+/// the reach of its kind.
+#[test]
+fn shape_reach_of_the_game() {
+    let Some(d) = data() else { return };
+    let t = Tables::new(&d);
+    let mut spilling: Vec<&str> = (0..d.states.len() as u32)
+        .filter(|&s| t.shape_extent(s) == ShapeExtent::Spills)
+        .filter_map(|s| d.block_of(s).map(|b| b.name.as_str()))
+        .collect();
+    spilling.dedup();
+    assert_eq!(spilling, ["minecraft:piston_head", "minecraft:pitcher_crop"]);
+    let (all, common) = (t.shape_reach(), t.common_shape_reach());
+    assert_eq!((all.min, all.max), ([-0.25; 3], [1.25, 1.5, 1.25]));
+    assert_eq!((common.min, common.max), ([0.0; 3], [1.0, 1.5, 1.0]));
+    let inside = |b: &Aabb, r: &Aabb| (0..3).all(|a| b.min[a] >= r.min[a] && b.max[a] <= r.max[a]);
+    let (mut taller, mut empty) = (0, 0);
+    for s in 0..d.states.len() as u32 {
+        let extent = t.shape_extent(s);
+        assert_eq!(extent == ShapeExtent::Empty, t.shape(s).is_empty(), "state {s}");
+        empty += usize::from(extent == ShapeExtent::Empty);
+        for b in t.shape(s) {
+            assert!(inside(b, &all), "state {s}: {b:?}");
+            assert!(extent == ShapeExtent::Spills || inside(b, &common), "state {s}: {b:?}");
+            taller += usize::from(b.max[1] > 1.0);
+        }
+    }
+    assert!(taller > 1000 && empty > 1000, "coverage: {taller} boxes above their cell, {empty} empty shapes");
+}
+
+/// `RUSTCRAFT_OPT_STAND_SHAPE_FLAGS`: the per-state flags of the mob envelopes say what the block
+/// names said, on every state (powder snow; lava source = the lava block at level 0).
+#[test]
+fn stand_flags_match_the_block_names() {
+    let Some(d) = data() else { return };
+    let t = Tables::new(&d);
+    let (mut snow, mut sources) = (0, 0);
+    for s in 0..d.states.len() as u32 + 2 {
+        let name = d.block_of(s).map_or("minecraft:air", |b| b.name.as_str());
+        let level_0 = d.state_properties(s).any(|(k, v)| k == "level" && v == "0");
+        assert_eq!(t.is_powder_snow(s), name == "minecraft:powder_snow", "state {s}");
+        assert_eq!(t.is_lava_source(s), name == "minecraft:lava" && level_0, "state {s}");
+        snow += usize::from(t.is_powder_snow(s));
+        sources += usize::from(t.is_lava_source(s));
+    }
+    assert_eq!((snow, sources), (1, 1));
+}
+
+/// The player's envelope announces the unit cube for its own shapes: scaffolding platforms
+/// (from the tables) never leave their cell.
+#[test]
+fn scaffolding_shapes_stay_in_their_cell() {
+    let Some(d) = data() else { return };
+    let t = Tables::new(&d);
+    let scaffolding: Vec<u32> = (0..d.states.len() as u32).filter(|&s| t.is_scaffolding(s)).collect();
+    assert!(!scaffolding.is_empty());
+    for s in scaffolding {
+        assert!(t.shape(s).iter().all(|b| (0..3).all(|a| b.min[a] >= 0.0 && b.max[a] <= 1.0)), "state {s}");
+    }
+}
+
+/// Palette summary: nothing to reach without a shape, the common reach without a spilling state,
+/// the whole reach otherwise.
+#[test]
+fn reach_from_palettes_by_kind() {
+    let Some(d) = data() else { return };
+    let t = Tables::new(&d);
+    let state = |name: &str| d.blocks.iter().find(|b| b.name == name).map(|b| b.default_state).expect(name);
+    let holding = |states: Vec<u32>| t.reach_from_palettes(|pred| states.iter().any(|&s| pred(s)));
+    assert_eq!(holding(vec![0, state("minecraft:short_grass")]), Aabb::NOTHING);
+    assert_eq!(holding(vec![0, state("minecraft:oak_fence")]), t.common_shape_reach());
+    assert_eq!(holding(vec![state("minecraft:stone"), state("minecraft:piston_head")]), t.shape_reach());
+}
+
+/// Trimmed and batched walk (the default path).
+const NEW_WALK: WalkPath = WalkPath { trim: true, batch: true };
+
+/// Cells and boxes of a walk, in order, without the check mode: on the new path (trimmed,
+/// batched) or the whole one.
+fn walked(w: &dyn World, b: &Aabb, order: WalkOrder, new_path: bool) -> Vec<([i32; 3], Aabb)> {
+    let mut found = Vec::new();
+    let path = if new_path { NEW_WALK } else { WalkPath::WHOLE };
+    walk_cells(w, b, order, path, &mut Vec::new(), |c, bx| {
+        found.push((c, bx));
+        false
+    });
+    found
+}
+
+/// Boxes of the Mix world, then around its six moving blocks.
+fn walk_boxes(w: &Mix) -> Vec<Aabb> {
+    boxes(3_000, w).into_iter().chain(boxes_near_movers(300, w)).collect()
+}
+
+/// `RUSTCRAFT_OPT_COLLISION_SCAN_TRIM`: the trimmed walk finds the same cells and boxes, in the
+/// same order, as the whole one, in both orders, moving blocks pushed in the six directions included.
+#[test]
+fn trimmed_walk_identical_to_the_whole_one() {
+    let Some(d) = data() else { return };
+    let t = Tables::new(&d);
+    let w = mix(&t, &d);
+    let (mut found, mut moving, mut above) = (0, 0, 0);
+    for b in walk_boxes(&w) {
+        for order in [WalkOrder::YOuter, WalkOrder::ZOuter] {
+            let whole = walked(&w, &b, order, false);
+            assert_eq!(walked(&w, &b, order, true), whole, "box {b:?}, {order:?}");
+            found += whole.len();
+            moving += whole.iter().filter(|(c, _)| w.movers.iter().any(|(p, _)| p == c)).count();
+            above += whole.iter().filter(|(c, bx)| bx.max[1] > f64::from(c[1]) + 1.0).count();
+        }
+    }
+    assert!(found > 10_000 && moving > 500 && above > 200, "coverage: {found} boxes, {moving} moving, {above} above their cell");
+}
+
+/// First test box whose trimmed walk differs from the whole one.
+fn first_difference(w: &Mix) -> Option<Aabb> {
+    walk_boxes(w).into_iter().find(|b| walked(w, b, WalkOrder::YOuter, true) != walked(w, b, WalkOrder::YOuter, false))
+}
+
+/// Sabotages of the reach, each caught by the proof above: a top at 1.0 loses the fences and walls
+/// of the bottom margin row, a bottom at 0.5 the bottom slabs, the common reach the piston heads
+/// and pitcher crops of the margins, and forgetting the moving blocks loses their shifted shapes.
+#[test]
+fn a_wrong_reach_changes_the_walk() {
+    let Some(d) = data() else { return };
+    let t = Tables::new(&d);
+    let all = t.shape_reach();
+    let low_top = Mix { reach: Aabb { max: [all.max[0], 1.0, all.max[2]], ..all }, ..mix(&t, &d) };
+    assert!(first_difference(&low_top).is_some(), "a reach topped at 1.0 must lose a box");
+    let high_bottom = Mix { reach: Aabb { min: [all.min[0], 0.5, all.min[2]], ..all }, ..mix(&t, &d) };
+    assert!(first_difference(&high_bottom).is_some(), "a reach starting at 0.5 must lose a box");
+    // The moving blocks need the unbounded reach: a world that forgets them loses their boxes.
+    let w = mix(&t, &d);
+    let forgets = ForgetsMovers(&w);
+    let lost = boxes_near_movers(300, &w)
+        .into_iter()
+        .any(|b| walked(&forgets, &b, WalkOrder::YOuter, true) != walked(&w, &b, WalkOrder::YOuter, false));
+    assert!(lost, "a moving block's shape leaves the tables' reach");
+}
+
+/// One block in the cell at the origin, air elsewhere, and the reach it announces.
+struct Lone<'a> {
+    t: &'a Tables,
+    state: u32,
+    reach: Aabb,
+}
+
+impl World for Lone<'_> {
+    fn state(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        Some(if [x, y, z] == [0, 0, 0] { self.state } else { 0 })
+    }
+    fn collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        self.state(x, y, z).is_some_and(|s| self.t.collision(s, out))
+    }
+    fn shape_reach(&self, _: [i32; 3], _: [i32; 3]) -> Aabb {
+        self.reach
+    }
+}
+
+/// Every state that spills out of its cell (piston heads, pitcher crops): the tables' reach keeps
+/// all its boxes around the cell, the common reach (the sabotage, as if the palette had been
+/// misread) loses some for each of these blocks.
+#[test]
+fn spilling_states_need_the_whole_reach() {
+    let Some(d) = data() else { return };
+    let t = Tables::new(&d);
+    let mut r = Rng(0x5_7111);
+    let around: Vec<Aabb> = (0..400)
+        .map(|_| {
+            let size = [0.05 + r.f() * 0.6, 0.05 + r.f() * 0.6, 0.05 + r.f() * 0.6];
+            let min: [f64; 3] = std::array::from_fn(|a| r.f() * 2.2 - 0.6 - size[a] * 0.5);
+            Aabb { min, max: std::array::from_fn(|a| min[a] + size[a]) }
+        })
+        .collect();
+    let mut lost_by_block: Vec<&str> = Vec::new();
+    for s in (0..d.states.len() as u32).filter(|&s| t.shape_extent(s) == ShapeExtent::Spills) {
+        let right = Lone { t: &t, state: s, reach: t.shape_reach() };
+        let wrong = Lone { reach: t.common_shape_reach(), ..right };
+        let mut lost = false;
+        for b in &around {
+            let whole = walked(&right, b, WalkOrder::YOuter, false);
+            assert_eq!(walked(&right, b, WalkOrder::YOuter, true), whole, "state {s}, box {b:?}");
+            lost |= walked(&wrong, b, WalkOrder::YOuter, true) != whole;
+        }
+        if lost {
+            lost_by_block.push(d.block_of(s).map_or("?", |b| b.name.as_str()));
+        }
+    }
+    lost_by_block.dedup();
+    assert_eq!(lost_by_block, ["minecraft:piston_head", "minecraft:pitcher_crop"]);
+}
+
+/// Sabotage of the batched read: the states written z fastest instead of x fastest.
+struct Transposed<'a>(&'a Mix<'a>);
+
+impl World for Transposed<'_> {
+    fn state(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        self.0.state(x, y, z)
+    }
+    fn collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        self.0.collision(x, y, z, out)
+    }
+    fn shape_reach(&self, lo: [i32; 3], hi: [i32; 3]) -> Aabb {
+        self.0.shape_reach(lo, hi)
+    }
+    fn states_in(&self, first: [i32; 3], last: [i32; 3], out: &mut [u32]) -> bool {
+        let mut i = 0;
+        for y in first[1]..=last[1] {
+            for x in first[0]..=last[0] {
+                for z in first[2]..=last[2] {
+                    out[i] = self.0.state(x, y, z).unwrap_or(UNLOADED);
+                    i += 1;
+                }
+            }
+        }
+        true
+    }
+    fn collision_of_state(&self, state: Option<u32>, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        self.0.collision_of_state(state, x, y, z, out)
+    }
+}
+
+/// `RUSTCRAFT_OPT_COLLISION_BATCH_READ`: the proof above sees a batched read in the wrong order.
+#[test]
+fn a_wrong_batch_order_changes_the_walk() {
+    let Some(d) = data() else { return };
+    let t = Tables::new(&d);
+    let w = mix(&t, &d);
+    let transposed = Transposed(&w);
+    let lost = boxes(3_000, &w)
+        .into_iter()
+        .any(|b| walked(&transposed, &b, WalkOrder::YOuter, true) != walked(&w, &b, WalkOrder::YOuter, false));
+    assert!(lost, "states read in the wrong order must change the walk");
+}
+
+/// Sabotage: the Mix world announcing the tables' reach even where a block moves.
+struct ForgetsMovers<'a>(&'a Mix<'a>);
+
+impl World for ForgetsMovers<'_> {
+    fn state(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        self.0.state(x, y, z)
+    }
+    fn collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        self.0.collision(x, y, z, out)
+    }
+    fn moving_collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        self.0.moving_collision(x, y, z, out)
+    }
+    fn shape_reach(&self, _: [i32; 3], _: [i32; 3]) -> Aabb {
+        self.0.reach
+    }
+}
+
+/// The check mode (always on in this crate's tests) catches a wrong reach.
+#[test]
+#[should_panic(expected = "trimmed collision walk differs")]
+fn check_mode_catches_a_wrong_reach() {
+    let Some(d) = data() else { panic!("trimmed collision walk differs (no data)") };
+    let t = Tables::new(&d);
+    let low_top = Mix { reach: Aabb::UNIT, ..mix(&t, &d) };
+    let mut out = Vec::new();
+    for b in walk_boxes(&low_top) {
+        collect(&low_top, &b, &mut out);
+    }
+}
+
+/// A micro-bench skipping the walk check on its own thread leaves it on for a test running beside
+/// it: while a second thread holds the skip, a wrong reach still panics here, and not there.
+#[test]
+fn skipped_walk_check_stays_on_its_thread() {
+    let Some(d) = data() else { return };
+    let t = Tables::new(&d);
+    let low_top = Mix { reach: Aabb::UNIT, ..mix(&t, &d) };
+    let boxes = walk_boxes(&low_top);
+    let a_walk_panics = || {
+        boxes.iter().any(|b| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| collect(&low_top, b, &mut Vec::new()))).is_err()
+        })
+    };
+    let (skip_held, checked_here) = (std::sync::Barrier::new(2), std::sync::Barrier::new(2));
+    std::thread::scope(|sc| {
+        let bench = sc.spawn(|| {
+            let _check_skipped = crate::collide::skip_walk_check_on_this_thread();
+            skip_held.wait();
+            checked_here.wait();
+            a_walk_panics()
+        });
+        skip_held.wait();
+        // Asserted once both threads are past the barriers, so a failure never leaves one waiting.
+        let checked_beside = a_walk_panics();
+        checked_here.wait();
+        let bench_checked = bench.join().expect("bench thread");
+        assert!(checked_beside, "the check must stay on beside a bench");
+        // `RUSTCRAFT_COLLISION_WALK_CHECK=1` checks every walk, the bench's included.
+        if rc_data::env_str!("RUSTCRAFT_COLLISION_WALK_CHECK") != Some("1") {
+            assert!(!bench_checked, "the bench's own walks are not checked");
+        }
+    });
+}
+
+/// Both switches of `resolve` on (the default).
+const NEW_RESOLVE: ResolvePath = ResolvePath { walk: NEW_WALK, no_copy: true };
+
+/// `RUSTCRAFT_OPT_RESOLVE_NO_COPY` with the trimmed walk: same movement, bit for bit, as the old
+/// path (whole walk, copies), with and without step-up, against blocks, border, entities and
+/// moving blocks.
+#[test]
+fn resolve_without_copies_identical() {
+    let Some(d) = data() else { return };
+    let t = Tables::new(&d);
+    let w = mix(&t, &d);
+    let mut r = Rng(0x05E5_017E);
+    let (mut stepped, mut by_entity) = (0, 0);
+    let no_ents = Mix { ents: Vec::new(), ..mix(&t, &d) };
+    for b in walk_boxes(&w) {
+        let delta = [r.f() * 1.2 - 0.6, r.f() * 1.2 - 0.8, r.f() * 1.2 - 0.6];
+        for (on_ground, step) in [(true, 0.6), (false, 0.6), (true, 0.0), (true, 1.0)] {
+            let old = resolve_with(&w, &b, delta, on_ground, step, ResolvePath::OLD);
+            let new = resolve_with(&w, &b, delta, on_ground, step, NEW_RESOLVE);
+            assert_eq!(new.map(f64::to_bits), old.map(f64::to_bits), "box {b:?}, delta {delta:?}, step {step}");
+            stepped += usize::from(step > 0.0 && old != resolve_with(&w, &b, delta, on_ground, 0.0, ResolvePath::OLD));
+            by_entity += usize::from(old != resolve_with(&no_ents, &b, delta, on_ground, step, ResolvePath::OLD));
+        }
+    }
+    assert!(stepped > 300 && by_entity > 50, "coverage: {stepped} step-ups, {by_entity} movements changed by an entity");
+}
+
+/// Time per call of `f` (ns), on `threads` threads that each make `n` calls, the walk check skipped
+/// on them (micro-benches only).
 fn per_call(threads: usize, n: usize, f: impl Fn(usize) -> u64 + Sync) -> f64 {
     let f = &f;
     let t0 = std::time::Instant::now();
     let sink: u64 = std::thread::scope(|sc| {
-        let hs: Vec<_> = (0..threads).map(|k| sc.spawn(move || (0..n).map(|i| f(i + k)).fold(0u64, u64::wrapping_add))).collect();
+        let measured = move |k: usize| {
+            let _check_skipped = crate::collide::skip_walk_check_on_this_thread();
+            (0..n).map(|i| f(i + k)).fold(0u64, u64::wrapping_add)
+        };
+        let hs: Vec<_> = (0..threads).map(|k| sc.spawn(move || measured(k))).collect();
         hs.into_iter().map(|h| h.join().expect("thread")).fold(0, u64::wrapping_add)
     });
     std::hint::black_box(sink);
@@ -285,11 +676,13 @@ fn bench_collision_top() {
 fn bench_is_free() {
     let Some(d) = data() else { return };
     let t = Tables::new(&d);
+    let _check_skipped = crate::collide::skip_walk_check_on_this_thread();
     let w = mix(&t, &d);
     let bs = boxes(100_000, &w);
+    let paths = [IsFreePath::CollectAll, IsFreePath::FirstOverlap, IsFreePath::FirstOverlapSharedBuffer];
     for threads in thread_counts() {
         let r: Vec<f64> =
-            (0..3u8).map(|m| per_call(threads, bs.len(), |i| u64::from(is_free_with(&w, &bs[i % bs.len()], m)))).collect();
+            paths.iter().map(|&p| per_call(threads, bs.len(), |i| u64::from(is_free_with(&w, &bs[i % bs.len()], p)))).collect();
         println!(
             "is_free, {threads} thread(s), ns per call and per thread: level 0 {:.1}, level 1 {:.1}, level 2 {:.1}",
             r[0], r[1], r[2]
@@ -308,4 +701,162 @@ fn bench_is_free() {
     }
     let old = t0.elapsed().as_nanos() as f64 / bs.len() as f64;
     println!("collection, 1 thread, ns per call: old {old:.1}, common walk {new:.1}");
+}
+
+/// A world that counts the cells the walk reads (`collision` and `moving_collision` calls).
+struct Counted<'a> {
+    w: &'a dyn World,
+    reads: std::cell::Cell<u64>,
+}
+
+impl World for Counted<'_> {
+    fn state(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        self.w.state(x, y, z)
+    }
+    fn collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        self.reads.set(self.reads.get() + 1);
+        self.w.collision(x, y, z, out)
+    }
+    fn moving_collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        self.reads.set(self.reads.get() + 1);
+        self.w.moving_collision(x, y, z, out)
+    }
+    fn border(&self) -> Option<&border::WorldBorder> {
+        self.w.border()
+    }
+    fn entity_colliders(&self, area: &Aabb, out: &mut Vec<Aabb>) {
+        self.w.entity_colliders(area, out);
+    }
+    fn shape_reach(&self, lo: [i32; 3], hi: [i32; 3]) -> Aabb {
+        self.w.shape_reach(lo, hi)
+    }
+}
+
+/// Plain ground: stone under y = 64, then one cell in ten a fence and one in ten a bottom slab on
+/// the surface row, air above.
+struct Ground<'a> {
+    t: &'a Tables,
+    stone: u32,
+    fence: u32,
+    slab: u32,
+}
+
+impl World for Ground<'_> {
+    fn state(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        let h = Rng((x as u64) ^ ((z as u64) << 32)).next() % 10;
+        Some(match y {
+            ..64 => self.stone,
+            64 if h == 0 => self.fence,
+            64 if h == 1 => self.slab,
+            _ => 0,
+        })
+    }
+    fn collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        self.state(x, y, z).is_some_and(|s| self.t.collision(s, out))
+    }
+    fn shape_reach(&self, _: [i32; 3], _: [i32; 3]) -> Aabb {
+        self.t.shape_reach()
+    }
+}
+
+fn ground<'a>(t: &'a Tables, d: &VersionData) -> Ground<'a> {
+    let state = |name: &str| d.blocks.iter().find(|b| b.name == name).map(|b| b.default_state).expect(name);
+    Ground { t, stone: state("minecraft:stone"), fence: state("minecraft:oak_fence"), slab: state("minecraft:oak_slab") }
+}
+
+/// Mob-sized boxes standing on the cell grid or a slab (bottom at .0 or .5) and in the air.
+fn mob_boxes(n: usize) -> Vec<Aabb> {
+    let mut r = Rng(0xB0D1E5);
+    (0..n)
+        .map(|i| {
+            let bottom = 64.0 + (r.next() % 2) as f64 + [0.0, 0.5, r.f()][i % 3];
+            let (x, z) = (r.f() * 50.0 - 25.0, r.f() * 50.0 - 25.0);
+            Aabb { min: [x - 0.3, bottom, z - 0.3], max: [x + 0.3, bottom + 1.8, z + 0.3] }
+        })
+        .collect()
+}
+
+
+/// Walking mob: 0.1 forward in a direction that changes with `i`, gravity.
+fn walk_delta(i: usize) -> [f64; 3] {
+    [0.1 * ((i % 7) as f64 - 3.0) / 3.0, -0.0784, 0.1 * ((i % 5) as f64 - 2.0) / 2.0]
+}
+
+/// Feet of a box.
+fn feet(b: &Aabb) -> [f64; 3] {
+    [(b.min[0] + b.max[0]) / 2.0, b.min[1], (b.min[2] + b.max[2]) / 2.0]
+}
+
+/// Paths of `resolve` timed: the old one, each lead alone, both.
+const BENCH_PATHS: [(&str, ResolvePath); 6] = [
+    ("old", ResolvePath::OLD),
+    ("trim", ResolvePath { walk: WalkPath { trim: true, batch: false }, no_copy: false }),
+    ("batch", ResolvePath { walk: WalkPath { trim: false, batch: true }, no_copy: false }),
+    ("no copy", ResolvePath { walk: WalkPath::WHOLE, no_copy: true }),
+    ("trim + no copy", ResolvePath { walk: WalkPath { trim: true, batch: false }, no_copy: true }),
+    ("all", NEW_RESOLVE),
+];
+
+/// `RUSTCRAFT_OPT_COLLISION_SCAN_TRIM` and `RUSTCRAFT_OPT_RESOLVE_NO_COPY`: cells read per call and
+/// time of `support_of` and `resolve` (walking mob, step 0.6) on the Mix world and on plain ground,
+/// old against each lead alone and combined; 1 thread then powers of 2, two alternating passes.
+#[test]
+#[ignore = "micro-bench"]
+fn bench_resolve_and_support() {
+    let Some(d) = data() else { return };
+    let _check_skipped = crate::collide::skip_walk_check_on_this_thread();
+    let t = Tables::new(&d);
+    let mixed = Mix { movers: Vec::new(), ..mix(&t, &d) };
+    let plain = ground(&t, &d);
+    let bs = mob_boxes(100_000);
+    print_cells_read("mixed", &mixed, &bs);
+    print_cells_read("ground", &plain, &bs);
+    for pass in 0..2 {
+        time_paths("mixed", pass, &mixed, &bs);
+        time_paths("ground", pass, &plain, &bs);
+    }
+}
+
+fn print_cells_read(world: &str, w: &dyn World, bs: &[Aabb]) {
+    for trim in [false, true] {
+        let counted = Counted { w, reads: std::cell::Cell::new(0) };
+        for b in bs {
+            support_of_with(&counted, b, feet(b), WalkPath { trim, batch: false });
+        }
+        let support = counted.reads.replace(0) as f64 / bs.len() as f64;
+        for (i, b) in bs.iter().enumerate() {
+            resolve_with(&counted, b, walk_delta(i), true, 0.6, ResolvePath { walk: WalkPath { trim, batch: false }, no_copy: true });
+        }
+        let resolve = counted.reads.get() as f64 / bs.len() as f64;
+        println!("{world}: cells read per call, trim {trim}: support_of {support:.1}, resolve {resolve:.1}");
+    }
+}
+
+fn time_paths<W: World + Sync>(world: &str, pass: usize, w: &W, bs: &[Aabb]) {
+    let at = |i: usize| &bs[i % bs.len()];
+    let cell_bits = |o: Option<[i32; 3]>| o.map_or(7, |p| (p[0] as u64) ^ ((p[1] as u64) << 21) ^ ((p[2] as u64) << 42));
+    for threads in thread_counts() {
+        let support: Vec<f64> = [false, true]
+            .iter()
+            .map(|&new_path| {
+                let path = if new_path { NEW_WALK } else { WalkPath::WHOLE };
+                per_call(threads, bs.len(), |i| cell_bits(support_of_with(w, at(i), feet(at(i)), path)))
+            })
+            .collect();
+        let resolve: Vec<String> = BENCH_PATHS
+            .iter()
+            .map(|&(name, p)| {
+                let ns = per_call(threads, bs.len(), |i| {
+                    resolve_with(w, at(i), walk_delta(i), true, 0.6, p).iter().fold(0, |a, v| a ^ v.to_bits())
+                });
+                format!("{name} {ns:.1}")
+            })
+            .collect();
+        println!(
+            "{world}, pass {pass}, {threads} thread(s), ns per call and per thread: support_of old {:.1} new {:.1}; resolve {}",
+            support[0],
+            support[1],
+            resolve.join(", ")
+        );
+    }
 }

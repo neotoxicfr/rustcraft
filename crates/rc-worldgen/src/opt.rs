@@ -1,10 +1,15 @@
 //! Optimisation switches of the generator, read once (first use) from
 //! the environment: absent or any value other than `0` = new path, `0` = old path.
 //! The equivalence tests call both paths explicitly, without going through here.
-//! Dependencies: `NOISE_COLCONST`, `NOISE_SIMD` and `NOISE_AVX2` only act in the
-//! precomputed path (`NOISE_YPRE`), and `NOISE_AVX2` only with `NOISE_SIMD`. To isolate a track
+//! Dependencies: `NOISE_COLCONST`, `NOISE_SIMD`, `NOISE_AVX2`, `NOISE_XPRE` and
+//! `NOISE_XY_PERM_TABLE` only act in the precomputed path (`NOISE_YPRE`), and `NOISE_AVX2` only
+//! with `NOISE_SIMD`; `NOISE_BATCH_AVX2` only acts on the batches of `NOISE_BATCH_POINTS` with
+//! `PERM512`, and `NOISE_BATCH_SHARED_CELL` only inside the AVX2 batch (`NOISE_BATCH_AVX2`, so
+//! not at all on a processor without AVX2). To isolate a track
 //! on the scene bench: ypre = YPRE=1 COLCONST=0 SIMD=0 against YPRE=0; colconst, simd = the single
-//! track at 0; avx2 = AVX2=0 against all.
+//! track at 0; avx2 = AVX2=0 against all. Batches: points = BATCH_POINTS=1 BATCH_AVX2=0 against
+//! BATCH_POINTS=0; batch avx2 = BATCH_SHARED_CELL=0 against BATCH_AVX2=0; shared cell = the single
+//! track at 0.
 
 use std::sync::LazyLock;
 
@@ -48,6 +53,30 @@ switch!(
     /// Noise volume: runs of the same cell in y through a branchless kernel (vectorised).
     noise_simd,
     "RUSTCRAFT_OPT_NOISE_SIMD"
+);
+switch!(
+    /// Noise volume: the work in x (cell, position in the cell, smoothing, first permutations)
+    /// computed once per octave for the columns of a row, not again for every row in z.
+    noise_x_precomputed,
+    "RUSTCRAFT_OPT_NOISE_XPRE"
+);
+switch!(
+    /// Noise volume: the 4 permutations that depend on x and y only, kept per x cell and run of
+    /// the same y cell, read again by every column in z of that x cell.
+    noise_xy_perm_table,
+    "RUSTCRAFT_OPT_NOISE_XY_PERM_TABLE"
+);
+switch!(
+    /// Shifted noise volumes: the points of the volume handed to the noise in batches (layers
+    /// outside, points inside) instead of the whole noise point by point.
+    noise_batch_points,
+    "RUSTCRAFT_OPT_NOISE_BATCH_POINTS"
+);
+switch!(
+    /// AVX2 batches of noise points: a group of 8 points in one cell (low octaves) reads its
+    /// permutations once instead of gathering them for each point.
+    noise_batch_shared_cell,
+    "RUSTCRAFT_OPT_NOISE_BATCH_SHARED_CELL"
 );
 switch!(
     /// `sincos`: a single argument reduction and a single pair of series.
@@ -254,6 +283,30 @@ switch!(
     carver_replay,
     "RUSTCRAFT_OPT_CARVER_REPLAY"
 );
+/// Filling: each block written without reading the old one back, and the two generation height
+/// maps of a column worked out while walking it down, written once at its end.
+#[inline]
+pub fn fill_column_tracking() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_FILL_COLUMN_TRACKING")
+}
+/// Terrain to decoration chunk: a section of plain air is not converted state by state, and the
+/// highest other section bounds the walk of the final height maps.
+#[inline]
+pub fn skip_air_sections() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_SKIP_AIR_SECTIONS")
+}
+/// Terrain to decoration chunk: converted layer by layer from the top, the four final height
+/// maps found on the way instead of a second walk.
+#[inline]
+pub fn convert_with_heightmaps() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_CONVERT_WITH_HEIGHTMAPS")
+}
+/// Terrain to decoration chunk: the block buffer of the converted proto-chunk is kept by its
+/// thread for the next proto-chunk instead of being freed.
+#[inline]
+pub fn reuse_proto_buffer() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_REUSE_PROTO_BUFFER")
+}
 switch!(
     /// Volume: index of a block by shift and mask when the steps are powers of 2.
     vol_pow2,
@@ -649,12 +702,45 @@ pub fn noise_avx2() -> bool {
     *S
 }
 
+/// Batches of noise points: 8 points at a time in AVX2 registers (permutations read by gathers),
+/// if the processor has it (detection done once).
+#[inline]
+pub fn noise_batch_avx2() -> bool {
+    static S: LazyLock<bool> = LazyLock::new(|| on(&["RUSTCRAFT_OPT_NOISE_BATCH_AVX2"]) && rc_data::cpu::has_avx2());
+    *S
+}
+
 switch_f!(
     /// Named density functions and noise parameters of a data pack parsed once and shared by every
     /// generator built from that pack, instead of once per generator (four or more per dimension).
     shared_generator_defs,
     "SHARED_GENERATOR_DEFS"
 );
+switch_f!(
+    /// JSON reader: numbers and object keys stored in place, an object as one shared block of members
+    /// sorted by key, instead of a string per number and per key and a tree map per object.
+    compact_json,
+    "COMPACT_JSON"
+);
+switch_f!(
+    /// A data pack file parsed once and its tree shared by every later reader, instead of parsed
+    /// again at every read (a biome file was parsed twice per generator).
+    json_parse_cache,
+    "JSON_PARSE_CACHE"
+);
+/// Named density functions and noises of a pack parsed on every core, only
+/// `RUSTCRAFT_OPT_PARALLEL_DEFS_LOAD=1` (off by default: about a millisecond of work, which waking
+/// the pool's threads costs more than it saves; see `docs/perf.md`).
+#[inline]
+pub fn parallel_defs_load() -> bool {
+    #[cfg(test)]
+    if let Some(v) = forced("PARALLEL_DEFS_LOAD") {
+        return v;
+    }
+    static S: LazyLock<bool> =
+        LazyLock::new(|| rc_data::env_str!("RUSTCRAFT_OPT_PARALLEL_DEFS_LOAD").is_some_and(|v| v.trim() == "1"));
+    *S
+}
 switch_f!(
     /// Biome parameter list of a preset parsed once per world data, then copied into each generator.
     shared_climate_lists,

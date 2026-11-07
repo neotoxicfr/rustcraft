@@ -831,6 +831,7 @@ impl ItemAtlas {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        _up: &mut crate::render::upload::Uploader,
         enc: &mut wgpu::CommandEncoder,
         timer: Option<&crate::gpu_time::GpuTimer>,
     ) {

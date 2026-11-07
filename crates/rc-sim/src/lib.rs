@@ -9,6 +9,7 @@
 mod blocks;
 mod fluid_use;
 pub mod chunk;
+mod chunk_disk;
 pub mod debug_report;
 pub mod demo;
 pub mod gen_debug;
@@ -71,6 +72,7 @@ pub(crate) mod decoration;
 // Dimensions and portals (S6).
 pub(crate) mod dims;
 mod portal;
+mod portal_site;
 pub(crate) mod portal_shape;
 mod respawn;
 // Effects, potions, enchanting, stations, loot chests (S7).
@@ -114,6 +116,7 @@ pub mod randsrc;
 pub mod commands;
 // Advancements and statistics (S9).
 pub mod progress;
+mod resource_id; // identifiers compared and completed with their default namespace, without allocating
 pub mod stats;
 pub mod score_criteria;
 // Local network (S9).
@@ -196,7 +199,11 @@ mod tests_s2;
 #[cfg(test)]
 mod newworld_tests;
 #[cfg(test)]
+mod chunk_disk_tests;
+#[cfg(test)]
 mod portal_tests;
+#[cfg(test)]
+mod portal_site_tests;
 #[cfg(test)]
 mod tests_s7;
 #[cfg(test)]
@@ -213,6 +220,8 @@ mod tests_air;
 mod tests_opt;
 #[cfg(test)]
 mod tests_c6m02;
+#[cfg(test)]
+mod collision_walk_tests;
 #[cfg(test)]
 mod tests_light_m04;
 #[cfg(test)]
@@ -254,7 +263,15 @@ mod bench_scores; // scoreboard switches: writes over every holder, save, entity
 #[cfg(test)]
 mod bench_function_tick; // command switches: functions per tick, macros, command blocks, schedule, parse
 #[cfg(test)]
+mod bench_selectors; // selector switches: one search, the quadratic `execute as … at @s`, families, `@s`
+#[cfg(test)]
 mod bench_spawner_blocks; // trial spawners, vaults, monster spawners, natural spawn pass, structure lists
+#[cfg(test)]
+mod tests_menu_switches; // menu switches: open chest fed and drained by hoppers, every combination
+#[cfg(test)]
+mod bench_menus; // menus: broadcast with a full inventory, open chest re-read, clicks
+#[cfg(test)]
+mod bench_advancement_triggers; // advancement switches: inventory and recipe indexes, location, file and tree loading
 #[cfg(test)]
 mod tests_perf_pack; // the scene bench's `perf` data pack compiles with our command parser
 #[cfg(test)]

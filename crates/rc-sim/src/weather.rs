@@ -195,9 +195,7 @@ impl Server {
             }
             on = foot;
         }
-        let mut boxes = Vec::new();
-        self.phys.collision(on, &mut boxes);
-        boxes.iter().map(|b| b.max[1]).reduce(f64::max)
+        self.phys.shape(on).iter().map(|b| b.max[1]).reduce(f64::max)
     }
 
     fn overlay(&self, c: rc_text::Component) {

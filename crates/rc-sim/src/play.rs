@@ -48,11 +48,13 @@ pub(crate) struct SimWorld<'a> {
     pub chunks: &'a HashMap<(i32, i32), Option<Box<Chunk>>>,
     pub min_y: i32,
     pub height: i32,
-    pub t: &'a rc_physics::Tables,
+    pub tables: &'a rc_physics::Tables,
+    /// `RUSTCRAFT_OPT_COLLISION_PALETTE_PREFILTER`, kept per world so the benches compare both paths.
+    pub palette_prefilter: bool,
     /// Moving piston blocks and direction of the push in progress (ignored by them).
     pub movers: &'a HashMap<[i32; 3], crate::blocks::level::Mover>,
     pub noclip: Option<u8>,
-    /// G6-F14: border of the dimension (collision of the server's entities), built at first need.
+    /// Border of the dimension (collision of the server's entities), built at first need.
     pub border_src: &'a crate::commands::Border,
     pub border: std::cell::OnceCell<rc_physics::WorldBorder>,
 }
@@ -60,18 +62,68 @@ pub(crate) struct SimWorld<'a> {
 impl SimWorld<'_> {
     /// Shape of a moving piston block at `p`; false if it is not one.
     fn piston_shape(&self, s: u32, p: [i32; 3], out: &mut Vec<Aabb>) -> bool {
-        if !self.t.is_moving_piston(s) {
+        if !self.tables.is_moving_piston(s) {
             return false;
         }
         if let Some(m) = self.movers.get(&p) {
-            self.t.moving_collision(&m.physics(), self.noclip, out);
+            self.tables.moving_collision(&m.physics(), self.noclip, out);
         }
         true
     }
+
+    /// `collision` of the cell `p` whose state (`state(p)`) the caller already read.
+    pub(crate) fn collision_of(&self, state: Option<u32>, p: [i32; 3], out: &mut Vec<Aabb>) -> bool {
+        match state {
+            Some(s) => (!self.movers.is_empty() && self.piston_shape(s, p, out)) || self.tables.collision(s, out),
+            None => false,
+        }
+    }
+
+    /// `state` of `p` in its column, already found (`None`: not loaded).
+    fn state_in(&self, column: Option<&Chunk>, p: [i32; 3]) -> Option<u32> {
+        if !(self.min_y..self.min_y + self.height).contains(&p[1]) {
+            return Some(0);
+        }
+        block_in(column?, self.min_y, p)
+    }
+
+    /// A moving piston block among the cells `lo..=hi`. Every walk of every entity asks, and a
+    /// piston door or a world eater leaves hundreds to thousands of moving blocks for a few
+    /// ticks: they are tested one by one while that is cheaper, otherwise each cell of the span
+    /// is looked up in their table, so a walk never costs more than its own cells.
+    fn mover_between(&self, lo: [i32; 3], hi: [i32; 3]) -> bool {
+        if self.movers.is_empty() {
+            return false;
+        }
+        let cells = (0..3).map(|a| (i64::from(hi[a]) - i64::from(lo[a]) + 1).max(0) as u64).fold(1u64, u64::saturating_mul);
+        if self.movers.len() as u64 <= MOVERS_TESTED_PER_CELL_LOOKUP.saturating_mul(cells) {
+            return self.movers.keys().any(|p| (0..3).all(|a| lo[a] <= p[a] && p[a] <= hi[a]));
+        }
+        (lo[1]..=hi[1]).any(|y| (lo[2]..=hi[2]).any(|z| (lo[0]..=hi[0]).any(|x| self.movers.contains_key(&[x, y, z]))))
+    }
+
+    /// The loaded column `(cx, cz)`.
+    fn loaded_column(&self, cx: i32, cz: i32) -> Option<&Chunk> {
+        self.chunks.get(&(cx, cz))?.as_deref()
+    }
+}
+
+/// Moving blocks compared for the cost of one cell looked up in their table (micro-bench
+/// `bench_palette_prefilter`: about 0.7 ns per comparison, 10.8 ns per lookup).
+const MOVERS_TESTED_PER_CELL_LOOKUP: u64 = 16;
+
+/// `RUSTCRAFT_OPT_COLLISION_PALETTE_PREFILTER` (default on): the collision walk asks the section
+/// palettes which shapes can be there before choosing the cells it reads.
+fn palette_prefilter() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_COLLISION_PALETTE_PREFILTER")
 }
 
 pub(crate) fn block_at(chunks: &HashMap<(i32, i32), Option<Box<Chunk>>>, min_y: i32, p: [i32; 3]) -> Option<u32> {
-    let c = chunks.get(&(p[0] >> 4, p[2] >> 4))?.as_ref()?;
+    block_in(chunks.get(&(p[0] >> 4, p[2] >> 4))?.as_ref()?, min_y, p)
+}
+
+/// State at `p` in its column `c`; `None` outside the column's sections.
+fn block_in(c: &Chunk, min_y: i32, p: [i32; 3]) -> Option<u32> {
     let ly = p[1] - min_y;
     let s = c.sections.get(usize::try_from(ly >> 4).ok()?)?;
     Some(s.blocks.get(block_index((p[0] & 15) as usize, (ly & 15) as usize, (p[2] & 15) as usize)))
@@ -86,10 +138,7 @@ impl rc_physics::World for SimWorld<'_> {
     }
 
     fn collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
-        match self.state(x, y, z) {
-            Some(s) => (!self.movers.is_empty() && self.piston_shape(s, [x, y, z], out)) || self.t.collision(s, out),
-            None => false,
-        }
+        self.collision_of(self.state(x, y, z), [x, y, z], out)
     }
 
     fn border(&self) -> Option<&rc_physics::WorldBorder> {
@@ -104,6 +153,29 @@ impl rc_physics::World for SimWorld<'_> {
             Some(s) => self.piston_shape(s, [x, y, z], out),
             None => false,
         }
+    }
+
+    fn shape_reach(&self, lo: [i32; 3], hi: [i32; 3]) -> Aabb {
+        // A moving block's shape follows its progress out of its cell.
+        if self.mover_between(lo, hi) {
+            return Aabb::EVERYWHERE;
+        }
+        if self.palette_prefilter {
+            let sections = |cx, cz| self.loaded_column(cx, cz).map(|c| c.sections.as_slice());
+            return self.tables.reach_from_palettes(|pred| rc_world::sections_may_hold(lo, hi, self.min_y, self.height, sections, pred));
+        }
+        self.tables.shape_reach()
+    }
+
+    /// One hash lookup per column instead of one per cell.
+    fn states_in(&self, first: [i32; 3], last: [i32; 3], out: &mut [u32]) -> bool {
+        let state_in = |column, p| self.state_in(column, p).unwrap_or(rc_physics::UNLOADED);
+        rc_world::states_by_column(first, last, out, |cx, cz| self.loaded_column(cx, cz), state_in);
+        true
+    }
+
+    fn collision_of_state(&self, state: Option<u32>, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        self.collision_of(state, [x, y, z], out)
     }
 }
 
@@ -409,7 +481,8 @@ impl Server {
             chunks: &self.chunks,
             min_y: self.dim.height.min_y,
             height: self.dim.height.sections as i32 * 16,
-            t: &self.phys,
+            tables: &self.phys,
+            palette_prefilter: palette_prefilter(),
             movers: &self.bs.movers,
             noclip: self.bs.noclip,
             border_src: &self.cmd.border,
@@ -488,8 +561,9 @@ impl Server {
                 (cx + 1, cz + 1),
             ]
         };
-        let mut need: Vec<(i32, i32)> = around(start).to_vec();
-        need.extend(around(target));
+        // On the stack: this runs for every movement packet.
+        let (from, to) = (around(start), around(target));
+        let need: [(i32, i32); 18] = std::array::from_fn(|i| if i < 9 { from[i] } else { to[i - 9] });
         self.ensure_loaded(&need);
         let d = [target[0] - start[0], target[1] - start[1], target[2] - start[2]];
         let old_box = player_box(start, self.sneaking);
@@ -1309,8 +1383,8 @@ mod tests {
     fn trace_columns_cover_each_group_box() {
         let mut changes: Vec<[i32; 3]> = (0..=21).map(|i| [i * 6, 64, i * 6]).collect();
         changes.push([1000, 64, -1000]);
-        let got: std::collections::HashSet<(i32, i32)> = super::trace_columns(&changes).into_iter().collect();
-        let mut want = std::collections::HashSet::new();
+        let got: hashbrown::HashSet<(i32, i32)> = super::trace_columns(&changes).into_iter().collect();
+        let mut want = hashbrown::HashSet::new();
         for cx in -1..=8 {
             for cz in -1..=8 {
                 want.insert((cx, cz));

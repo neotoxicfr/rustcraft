@@ -3715,7 +3715,7 @@ impl ParticleRenderer {
         }
     }
 
-    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, _up: &mut crate::render::upload::Uploader) {
         if let Some(img) = self.pending_atlas.take() {
             let tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("particle atlas"),

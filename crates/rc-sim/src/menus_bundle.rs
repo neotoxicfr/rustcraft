@@ -54,6 +54,14 @@ pub(crate) fn contents(items: &Items, s: &Stack) -> Option<Vec<Stack>> {
     }
 }
 
+/// The stack is a bundle (`contents` would give a list), told without decoding its contents:
+/// the component on the stack, or by default on the item when the stack does not remove it.
+fn is_bundle(items: &Items, s: &Stack) -> bool {
+    component(s, "minecraft:bundle_contents").is_some()
+        || (component(s, "!minecraft:bundle_contents").is_none()
+            && !items.defaults(&s.id)["minecraft:bundle_contents"].is_null())
+}
+
 /// Weight of a unit stack: nested bundle = its weight + 1/16; occupied hive =
 /// 1; otherwise 1 / maximum size. `None`: impossible weight (overflow).
 pub(crate) fn weight(items: &Items, s: &Stack) -> Option<Frac> {
@@ -173,6 +181,14 @@ impl Menu {
     /// onto a slot, then slot containing a bundle
     /// (the replacement of stacking onto itself). True if the click is consumed.
     pub(crate) fn bundle_click(&mut self, env: &mut dyn Env, inv: &mut [Option<Stack>], i: usize, button: i32) -> bool {
+        // Every simple click asks first; without a bundle on either side nothing is diverted,
+        // so the two stacks are not copied (nor a bundle's contents decoded) for nothing.
+        if super::MenuSwitches::current().fewer_allocations {
+            let is_bag = |s: &Stack| is_bundle(env.items(), s);
+            if !self.carried.as_ref().is_some_and(is_bag) && !self.get(inv, i).is_some_and(is_bag) {
+                return false;
+            }
+        }
         let primary = button == 0;
         let clicked = self.get(inv, i).cloned();
         if let Some(mut bag_stack) = self.carried.clone()

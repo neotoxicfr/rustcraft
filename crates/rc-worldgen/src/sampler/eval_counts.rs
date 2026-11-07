@@ -63,6 +63,12 @@ counters!(
     plain_branch_noise_values_whole_hull,
     /// Noise values a hull per column would compute instead.
     plain_branch_noise_values_column_hulls,
+    /// Volumes of a shifted noise (in x and z, or in x, y and z).
+    shifted_noise_volumes,
+    /// Values of those volumes (points handed to the noise).
+    shifted_noise_values,
+    /// Those of the volumes that hold more than one row in y.
+    shifted_noise_volumes_taller_than_one_row,
 );
 
 /// Callers that turned the counts on and have not turned them off yet (tests run in parallel).

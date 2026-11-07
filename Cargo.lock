@@ -2186,6 +2186,7 @@ dependencies = [
  "base64",
  "bytemuck",
  "crossbeam-channel",
+ "foldhash",
  "glam",
  "hashbrown 0.17.1",
  "libmimalloc-sys",
@@ -2438,6 +2439,7 @@ dependencies = [
  "rc-worldgen",
  "ring",
  "rsa",
+ "serde",
  "serde_json",
  "thiserror 2.0.21",
  "unicode_names2",
@@ -2484,6 +2486,7 @@ dependencies = [
  "rc-proto",
  "rc-testdata",
  "ring",
+ "smol_str",
  "thiserror 2.0.21",
  "zip",
 ]

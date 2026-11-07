@@ -9,6 +9,7 @@ use crate::commands::ents::E;
 use crate::mobs::mob::{Ent, Mob};
 use crate::player::Stack;
 use crate::projectiles::Proj;
+use crate::resource_id::{full_id, id_eq};
 use crate::server::Server;
 
 /// Entity targeted by a predicate: designated (commands) or held outside the list (mob
@@ -222,20 +223,17 @@ pub fn doubles_sqr(v: Option<&Value>, x2: f64) -> bool {
 pub fn in_set(v: &Value, id: &str, tag: &dyn Fn(&str, &str) -> bool) -> bool {
     match v {
         Value::String(s) => match s.strip_prefix('#') {
-            Some(t) => tag(&crate::commands::args::id(t), id),
-            None => crate::commands::args::id(s) == id,
+            Some(t) => tag(&full_id(t), id),
+            None => id_eq(s, id),
         },
-        Value::Array(a) => a.iter().any(|x| x.as_str().is_some_and(|s| crate::commands::args::id(s) == id)),
+        // A `#tag` inside a list is compared as an identifier (never true), like the game.
+        Value::Array(a) => a.iter().any(|x| x.as_str().is_some_and(|s| id_eq(s, id))),
         _ => false,
     }
 }
 
 fn opt_bool(v: &Value, k: &str) -> Option<bool> {
     v.get(k).and_then(Value::as_bool)
-}
-
-fn args_id(s: &str) -> String {
-    crate::commands::args::id(s)
 }
 
 /// Raw value of a filterable field (`{raw, filtered}` or the lone value).
@@ -247,7 +245,7 @@ fn filterable_raw(v: &Nbt) -> &Nbt {
 /// must appear in it and its bounds pass.
 fn effect_test(w: &Value, e: &crate::effects::Inst) -> bool {
     let Value::Object(map) = w else { return false };
-    map.iter().find(|(id, _)| args_id(id) == e.id).is_some_and(|(_, pr)| {
+    map.iter().find(|(id, _)| id_eq(id, &e.id)).is_some_and(|(_, pr)| {
         ints(pr.get("amplifier"), i64::from(e.amp))
             && ints(pr.get("duration"), i64::from(e.dur))
             && opt_bool(pr, "ambient").is_none_or(|b| b == e.ambient)
@@ -281,7 +279,7 @@ pub fn json_eq_nbt(j: &Value, n: &Nbt) -> bool {
             };
             a.as_f64().is_some_and(|y| (x - y).abs() <= 1e-6 * y.abs().max(1.0))
         }
-        (Value::String(s), Nbt::String(t)) => s == t || crate::commands::args::id(s) == *t,
+        (Value::String(s), Nbt::String(t)) => s == t || id_eq(s, t),
         (Value::Array(a), Nbt::List(l)) => a.len() == l.len() && a.iter().zip(l).all(|(x, y)| json_eq_nbt(x, y)),
         (Value::Array(a), Nbt::IntArray(l)) => {
             a.len() == l.len() && a.iter().zip(l).all(|(x, y)| x.as_i64() == Some(i64::from(*y)))
@@ -314,12 +312,18 @@ impl Server {
 
     /// Member of a tag of any registry (items: the item table).
     pub(crate) fn p_tag(&self, reg: &str, tag: &str, id: &str) -> bool {
-        let tag = crate::commands::args::id(tag.trim_start_matches('#'));
+        let tag_full = full_id(tag.trim_start_matches('#'));
+        let tag: &str = &tag_full;
         if reg == "minecraft:item" {
-            return self.life.items.has_tag(&tag, id);
+            return self.life.items.has_tag(tag, id);
+        }
+        // The block tag table answers by the block's index what the three scans below answer by
+        // name (registry, tag, then the block among ~1,100 entries).
+        if reg == "minecraft:block" && self.prog.paths.location_fast {
+            return self.tag_bits.block_of_name(id).is_some_and(|b| self.tag_bits.has(tag, u32::from(b)) == Some(true));
         }
         let Some((_, tags)) = self.regs.tags.iter().find(|(r, _)| r == reg) else { return false };
-        let Some((_, ids)) = tags.iter().find(|(n, _)| *n == tag) else { return false };
+        let Some((_, ids)) = tags.iter().find(|(n, _)| n == tag) else { return false };
         let entries: &[String] = match self.data.registry(reg) {
             Some(r) => &r.entries,
             None => self.regs.entries(reg),
@@ -349,8 +353,17 @@ impl Server {
 
     /// Item predicate (`items`, `count`, exact `components`, partial `predicates`).
     pub(crate) fn p_item(&self, p: &Value, s: Option<&Stack>) -> bool {
-        let air = Stack { id: "minecraft:air".into(), count: 0, components: None };
-        let s = s.unwrap_or(&air);
+        if !crate::resource_id::borrowed() {
+            let air = Stack { id: "minecraft:air".into(), count: 0, components: None };
+            return self.p_item_of(p, s.unwrap_or(&air));
+        }
+        match s {
+            Some(s) => self.p_item_of(p, s),
+            None => self.p_empty_item(p),
+        }
+    }
+
+    pub(super) fn p_item_of(&self, p: &Value, s: &Stack) -> bool {
         if let Some(items) = p.get("items")
             && !self.p_set("minecraft:item", items, &s.id)
         {
@@ -362,12 +375,28 @@ impl Server {
         self.p_components(p, s)
     }
 
+    /// [`Self::p_item`] of an empty slot, read as air of count 0; the air stack is only built
+    /// when the predicate asks for components (most predicates name an item and stop there).
+    pub(super) fn p_empty_item(&self, p: &Value) -> bool {
+        if let Some(items) = p.get("items")
+            && !self.p_set("minecraft:item", items, "minecraft:air")
+        {
+            return false;
+        }
+        if !ints(p.get("count"), 0) {
+            return false;
+        }
+        if p.get("components").is_none() && p.get("predicates").is_none() {
+            return true;
+        }
+        self.p_components(p, &Stack { id: "minecraft:air".into(), count: 0, components: None })
+    }
+
     /// `components` (exact equality) and `predicates` (partial predicates) of a stack.
     fn p_components(&self, p: &Value, s: &Stack) -> bool {
         if let Some(Value::Object(exact)) = p.get("components") {
             for (k, want) in exact {
-                let k = crate::commands::args::id(k.trim_start_matches('!'));
-                match self.p_component(s, &k) {
+                match self.p_component(s, &full_id(k.trim_start_matches('!'))) {
                     Some(have) if json_eq_nbt(want, &have) => {}
                     _ => return false,
                 }
@@ -375,7 +404,7 @@ impl Server {
         }
         if let Some(Value::Object(partial)) = p.get("predicates") {
             for (k, want) in partial {
-                if !self.p_partial(&crate::commands::args::id(k), want, s) {
+                if !self.p_partial(&full_id(k), want, s) {
                     return false;
                 }
             }
@@ -433,7 +462,7 @@ impl Server {
                     c => c.get("potion").and_then(Nbt::as_str).map(str::to_owned),
                 };
                 if let Some(set) = p.get("potions")
-                    && !potion.as_deref().is_some_and(|id| self.p_set("minecraft:potion", set, &args_id(id)))
+                    && !potion.as_deref().is_some_and(|id| self.p_set("minecraft:potion", set, &full_id(id)))
                 {
                     return false;
                 }
@@ -566,12 +595,12 @@ impl Server {
     fn modifier_test(&self, w: &Value, e: &Nbt) -> bool {
         let s = |k: &str| e.get(k).and_then(Nbt::as_str).map(str::to_owned);
         if let Some(set) = w.get("attribute")
-            && !s("type").is_some_and(|t| self.p_set("minecraft:attribute", set, &args_id(&t)))
+            && !s("type").is_some_and(|t| self.p_set("minecraft:attribute", set, &full_id(&t)))
         {
             return false;
         }
         if let Some(id) = w.get("id").and_then(Value::as_str)
-            && s("id").map(|x| args_id(&x)) != Some(args_id(id))
+            && s("id").as_deref().map(full_id) != Some(full_id(id))
         {
             return false;
         }
@@ -602,14 +631,14 @@ impl Server {
             return false;
         }
         if let Some(d) = p.get("dimension").and_then(Value::as_str)
-            && crate::commands::args::id(d) != self.dim.name
+            && !id_eq(d, &self.dim.name)
         {
             return false;
         }
         let bp = [x.floor() as i32, y.floor() as i32, z.floor() as i32];
         let loaded = self.is_loaded(bp);
         if let Some(b) = p.get("biomes")
-            && !(loaded && self.p_set("minecraft:worldgen/biome", b, &self.biome_name(bp)))
+            && !(loaded && self.p_biome_set(b, bp))
         {
             return false;
         }
@@ -644,6 +673,16 @@ impl Server {
             return false;
         }
         true
+    }
+
+    /// The biome at `bp` is in the set `b`; the name is lent instead of copied
+    /// (`RUSTCRAFT_OPT_LOCATIONFAST`: every 20 ticks, once per active `location` criterion).
+    fn p_biome_set(&self, b: &Value, bp: [i32; 3]) -> bool {
+        if self.prog.paths.location_fast {
+            self.p_set("minecraft:worldgen/biome", b, self.biome_str(bp))
+        } else {
+            self.p_set("minecraft:worldgen/biome", b, &self.biome_name(bp))
+        }
     }
 
     /// Raw local brightness: darkened sky, block.
@@ -681,9 +720,9 @@ impl Server {
 
     /// "State" part of a block predicate.
     pub(crate) fn p_block_state(&self, b: &Value, s: u32) -> bool {
-        let name = self.data.block_of(s).map_or("", |b| b.name.as_str()).to_owned();
+        let name = self.data.block_of(s).map_or("", |b| b.name.as_str());
         if let Some(set) = b.get("blocks")
-            && !self.p_set("minecraft:block", set, &name)
+            && !self.p_set("minecraft:block", set, name)
         {
             return false;
         }
@@ -772,11 +811,17 @@ impl Server {
 
     // ---- Entities ---------------------------------------------------------------------------
 
-    pub(crate) fn w_type(&self, w: Who<'_>) -> String {
+    /// Type identifier of an entity; a mob's or a projectile's is lent from its kind
+    /// (`RUSTCRAFT_OPT_LOCATIONFAST`), the others built as before.
+    pub(crate) fn w_type(&self, w: Who<'_>) -> std::borrow::Cow<'static, str> {
+        use std::borrow::Cow;
+        let lend = self.prog.paths.location_fast;
         match w {
-            Who::E(e) => self.ent_type(e),
-            Who::Mob(m) => m.kind.info().name.to_owned(),
-            Who::Proj(p) => p.kind.name().to_owned(),
+            Who::E(e) => Cow::Owned(self.ent_type(e)),
+            Who::Mob(m) if lend => Cow::Borrowed(m.kind.info().name),
+            Who::Proj(p) if lend => Cow::Borrowed(p.kind.name()),
+            Who::Mob(m) => Cow::Owned(m.kind.info().name.to_owned()),
+            Who::Proj(p) => Cow::Owned(p.kind.name().to_owned()),
         }
     }
 
@@ -943,8 +988,7 @@ impl Server {
         let Value::Object(parts) = p else { return true };
         // Game order: type first, NBT last; the result is the same (AND).
         for (k, v) in parts {
-            let k = crate::commands::args::id(k);
-            if !self.p_entity_part(&k, v, w, origin) {
+            if !self.p_entity_part(&full_id(k), v, w, origin) {
                 return false;
             }
         }
@@ -992,8 +1036,7 @@ impl Server {
                 }
                 let Value::Object(want) = v else { return true };
                 want.iter().all(|(id, pr)| {
-                    let id = crate::commands::args::id(id);
-                    have.iter().find(|e| e.0 == id).is_some_and(|e| {
+                    have.iter().find(|e| id_eq(id, &e.0)).is_some_and(|e| {
                         ints(pr.get("amplifier"), i64::from(e.1))
                             && ints(pr.get("duration"), i64::from(e.2))
                             && opt_bool(pr, "ambient").is_none_or(|b| b == e.3)
@@ -1072,11 +1115,8 @@ impl Server {
             "minecraft:components" => {
                 let Value::Object(want) = v else { return true };
                 want.iter().all(|(k, val)| {
-                    let k = crate::commands::args::id(k);
-                    self.w_component(w, &k).is_some_and(|have| match (&have, val) {
-                        (Value::String(a), Value::String(b)) => {
-                            crate::commands::args::id(a) == crate::commands::args::id(b)
-                        }
+                    self.w_component(w, &full_id(k)).is_some_and(|have| match (&have, val) {
+                        (Value::String(a), Value::String(b)) => full_id(a) == full_id(b),
                         (a, b) => a == b,
                     })
                 })
@@ -1086,9 +1126,9 @@ impl Server {
                 // villager variant carries one (the others: presence).
                 let Value::Object(want) = v else { return true };
                 want.iter().all(|(k, pv)| {
-                    let k = crate::commands::args::id(k);
+                    let k = full_id(k);
                     let Some(have) = self.w_component(w, &k) else { return false };
-                    match k.as_str() {
+                    match k.as_ref() {
                         "minecraft:villager/variant" => {
                             have.as_str().is_some_and(|t| self.p_set("minecraft:villager_type", pv, t))
                         }
@@ -1120,7 +1160,7 @@ impl Server {
             "minecraft:type_specific/player" => self.p_player(v, w),
             "minecraft:type_specific/cube_mob" => {
                 let size = self.w_nbt(w).get("Size").and_then(Nbt::as_i64);
-                let cube = matches!(self.w_type(w).as_str(), "minecraft:slime" | "minecraft:magma_cube");
+                let cube = matches!(self.w_type(w).as_ref(), "minecraft:slime" | "minecraft:magma_cube");
                 cube && ints(v.get("size"), size.unwrap_or(0) + 1)
             }
             "minecraft:type_specific/sheep" => match self.w_mob(w) {
@@ -1232,8 +1272,8 @@ impl Server {
         }
         if let Some(Value::Array(stats)) = v.get("stats") {
             for s in stats {
-                let ty = crate::commands::args::id(s["type"].as_str().unwrap_or(""));
-                let key = crate::commands::args::id(s["stat"].as_str().unwrap_or(""));
+                let ty = full_id(s["type"].as_str().unwrap_or(""));
+                let key = full_id(s["stat"].as_str().unwrap_or(""));
                 if !ints(s.get("value"), i64::from(self.stat_value(&ty, &key))) {
                     return false;
                 }
@@ -1241,14 +1281,14 @@ impl Server {
         }
         if let Some(Value::Object(recipes)) = v.get("recipes") {
             for (id, want) in recipes {
-                if self.life.known.contains(&crate::commands::args::id(id)) != want.as_bool().unwrap_or(true) {
+                if self.life.known.contains(full_id(id).as_ref()) != want.as_bool().unwrap_or(true) {
                     return false;
                 }
             }
         }
         if let Some(Value::Object(advs)) = v.get("advancements") {
             for (id, want) in advs {
-                if !self.adv_predicate(&crate::commands::args::id(id), want) {
+                if !self.adv_predicate(&full_id(id), want) {
                     return false;
                 }
             }
@@ -1326,7 +1366,7 @@ impl Server {
                 let expected = t["expected"].as_bool().unwrap_or(true);
                 let has = match id.strip_prefix('#') {
                     Some(tag) => self.p_tag("minecraft:damage_type", tag, &d.ty),
-                    None => crate::commands::args::id(id) == d.ty,
+                    None => id_eq(id, &d.ty),
                 };
                 if has != expected {
                     return false;
@@ -1386,7 +1426,7 @@ impl Server {
     /// Loot condition in a context.
     pub(crate) fn p_condition(&self, v: &Value, ctx: &Ctx<'_>) -> bool {
         if let Value::String(id) = v {
-            return match self.life.pack.get("predicate", &crate::commands::args::id(id)) {
+            return match self.life.pack.get("predicate", &full_id(id)) {
                 Some(p) => self.p_condition(&p, ctx),
                 None => false,
             };
@@ -1396,12 +1436,12 @@ impl Server {
         }
         let ty = v.get("type").or_else(|| v.get("condition")).and_then(Value::as_str).unwrap_or("");
         let target = |name: Option<&str>| ctx.target_of(name.unwrap_or("this"));
-        match crate::commands::args::id(ty).as_str() {
+        match full_id(ty).as_ref() {
             "minecraft:inverted" => !self.p_condition(&v["term"], ctx),
             "minecraft:any_of" => v["terms"].as_array().is_some_and(|t| t.iter().any(|c| self.p_condition(c, ctx))),
             "minecraft:all_of" => v["terms"].as_array().is_none_or(|t| t.iter().all(|c| self.p_condition(c, ctx))),
             "minecraft:reference" => {
-                let id = crate::commands::args::id(v["name"].as_str().unwrap_or(""));
+                let id = full_id(v["name"].as_str().unwrap_or(""));
                 self.life.pack.get("predicate", &id).is_some_and(|p| self.p_condition(&p, ctx))
             }
             "minecraft:entity_properties" => {
@@ -1461,8 +1501,8 @@ impl Server {
                     && opt_bool(v, "thundering").is_none_or(|b| b == w.thundering)
             }
             "minecraft:time_check" => {
-                let clock = crate::commands::args::id(v["clock"].as_str().unwrap_or("minecraft:overworld"));
-                let mut t = self.clocks.iter().find(|c| c.0 == clock).map_or(self.time, |c| c.1);
+                let clock = v["clock"].as_str().unwrap_or("minecraft:overworld");
+                let mut t = self.clocks.iter().find(|c| id_eq(clock, &c.0)).map_or(self.time, |c| c.1);
                 if let Some(p) = v["period"].as_i64()
                     && p != 0
                 {

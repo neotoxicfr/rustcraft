@@ -6,7 +6,9 @@ use rc_proto::nbt::Nbt;
 
 use super::super::jrand::JRand;
 use super::super::mob::{Ent, Mob};
+use super::super::species::Kind;
 use super::behave::{Beh, Trig};
+use super::switches;
 use crate::server::{DIMENSIONS, Server};
 
 /// Dimension of a remembered location: the game's three without lock, the others interned.
@@ -81,7 +83,7 @@ pub struct Walk {
 
 /// Memory keys (behavior entry conditions).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum M {
+pub enum MemKey {
     Walk,
     Look,
     Path,
@@ -102,9 +104,18 @@ pub enum M {
 
 /// Expected state of a memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum St {
+pub enum MemState {
     Present,
     Absent,
+}
+
+/// A living entity of the last sensing: the entity, its species then (`None`: the player) and
+/// whether the villager sees it, evaluated on the first request and kept until the next sensing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sensed {
+    pub ent: Ent,
+    pub kind: Option<Kind>,
+    pub seen: Option<bool>,
 }
 
 /// Villager memories.
@@ -122,7 +133,7 @@ pub struct Mem {
     pub secondary: Option<Vec<[i32; 3]>>,
     pub living: Option<Vec<Ent>>,
     /// Living entities visible: same list, visibility evaluated lazily (sensor cache).
-    pub visible: Option<Vec<(Ent, Option<bool>)>>,
+    pub visible: Option<Vec<Sensed>>,
     pub players: Option<Vec<Ent>>,
     pub visible_player: Option<Ent>,
     pub wanted_item: Option<i32>,
@@ -144,50 +155,50 @@ pub struct Mem {
 }
 
 impl Mem {
-    pub fn present(&self, k: M) -> bool {
+    pub fn present(&self, k: MemKey) -> bool {
         match k {
-            M::Walk => self.walk.is_some(),
-            M::Look => self.look.is_some(),
-            M::Path => self.path,
-            M::Home => self.home.is_some(),
-            M::JobSite => self.job_site.is_some(),
-            M::PotentialJobSite => self.potential_job_site.is_some(),
-            M::MeetingPoint => self.meeting_point.is_some(),
-            M::Secondary => self.secondary.is_some(),
-            M::Living => self.living.is_some(),
-            M::Visible => self.visible.is_some(),
-            M::Interaction => self.interaction.is_some(),
-            M::Breed => self.breed.is_some(),
-            M::Babies => self.babies.is_some(),
-            M::NearestBed => self.nearest_bed.is_some(),
-            M::WantedItem => self.wanted_item.is_some(),
-            M::VisiblePlayer => self.visible_player.is_some(),
+            MemKey::Walk => self.walk.is_some(),
+            MemKey::Look => self.look.is_some(),
+            MemKey::Path => self.path,
+            MemKey::Home => self.home.is_some(),
+            MemKey::JobSite => self.job_site.is_some(),
+            MemKey::PotentialJobSite => self.potential_job_site.is_some(),
+            MemKey::MeetingPoint => self.meeting_point.is_some(),
+            MemKey::Secondary => self.secondary.is_some(),
+            MemKey::Living => self.living.is_some(),
+            MemKey::Visible => self.visible.is_some(),
+            MemKey::Interaction => self.interaction.is_some(),
+            MemKey::Breed => self.breed.is_some(),
+            MemKey::Babies => self.babies.is_some(),
+            MemKey::NearestBed => self.nearest_bed.is_some(),
+            MemKey::WantedItem => self.wanted_item.is_some(),
+            MemKey::VisiblePlayer => self.visible_player.is_some(),
         }
     }
 
-    pub fn erase(&mut self, k: M) {
+    pub fn erase(&mut self, k: MemKey) {
         match k {
-            M::Walk => self.walk = None,
-            M::Look => self.look = None,
-            M::Path => self.path = false,
-            M::Home => self.home = None,
-            M::JobSite => self.job_site = None,
-            M::PotentialJobSite => self.potential_job_site = None,
-            M::MeetingPoint => self.meeting_point = None,
-            M::Secondary => self.secondary = None,
-            M::Living => self.living = None,
-            M::Visible => self.visible = None,
-            M::Interaction => self.interaction = None,
-            M::Breed => self.breed = None,
-            M::Babies => self.babies = None,
-            M::NearestBed => self.nearest_bed = None,
-            M::WantedItem => self.wanted_item = None,
-            M::VisiblePlayer => self.visible_player = None,
+            MemKey::Walk => self.walk = None,
+            MemKey::Look => self.look = None,
+            MemKey::Path => self.path = false,
+            MemKey::Home => self.home = None,
+            MemKey::JobSite => self.job_site = None,
+            MemKey::PotentialJobSite => self.potential_job_site = None,
+            MemKey::MeetingPoint => self.meeting_point = None,
+            MemKey::Secondary => self.secondary = None,
+            MemKey::Living => self.living = None,
+            MemKey::Visible => self.visible = None,
+            MemKey::Interaction => self.interaction = None,
+            MemKey::Breed => self.breed = None,
+            MemKey::Babies => self.babies = None,
+            MemKey::NearestBed => self.nearest_bed = None,
+            MemKey::WantedItem => self.wanted_item = None,
+            MemKey::VisiblePlayer => self.visible_player = None,
         }
     }
 
-    pub fn check(&self, e: &[(M, St)]) -> bool {
-        e.iter().all(|&(k, st)| self.present(k) == (st == St::Present))
+    pub fn check(&self, e: &[(MemKey, MemState)]) -> bool {
+        e.iter().all(|&(k, st)| self.present(k) == (st == MemState::Present))
     }
 
     /// Aging: only the "golem seen" memory expires (599 ticks).
@@ -209,33 +220,41 @@ impl Mem {
 pub enum Node {
     /// Behavior with a duration: state, planned end.
     B { b: Beh, run: bool, end: i64 },
-    /// Instant trigger (`OneShot`).
+    /// Instant trigger, run once then over.
     O { t: Trig, run: bool },
     /// Gate.
     G(Box<Gate>),
-    /// Nothing for a duration (`DoNothing`).
+    /// Nothing for a duration.
     Idle { min: i32, max: i32, run: bool, end: i64 },
 }
 
 #[derive(Debug, Clone)]
 pub struct Gate {
-    pub entry: Vec<(M, St)>,
-    pub erase: Vec<M>,
+    pub entry: Vec<(MemKey, MemState)>,
+    pub erase: Vec<MemKey>,
     pub shuffled: bool,
     pub run_one: bool,
-    pub kids: Vec<(Node, i32, f64)>,
+    pub kids: Vec<GateChild>,
     pub rng: JRand,
     pub run: bool,
+}
+
+/// A node of a gate, its draw weight and the key of the last weighted shuffle.
+#[derive(Debug, Clone)]
+pub struct GateChild {
+    pub node: Node,
+    pub weight: i32,
+    pub shuffle_key: f64,
 }
 
 impl Gate {
     fn shuffle(&mut self) {
         for k in &mut self.kids {
             let r = self.rng.next_float();
-            k.2 = -f64::from(r).powf(f64::from(1.0f32 / k.1 as f32));
+            k.shuffle_key = -f64::from(r).powf(f64::from(1.0f32 / k.weight as f32));
         }
         // Stable sort (the game's `List.sort`).
-        self.kids.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        self.kids.sort_by(|a, b| a.shuffle_key.partial_cmp(&b.shuffle_key).unwrap_or(std::cmp::Ordering::Equal));
     }
 }
 
@@ -243,27 +262,30 @@ pub fn run_one(kids: Vec<(Node, i32)>) -> Node {
     gate(Vec::new(), Vec::new(), true, kids)
 }
 
-pub fn gate(entry: Vec<(M, St)>, erase: Vec<M>, shuffled: bool, kids: Vec<(Node, i32)>) -> Node {
+pub fn gate(entry: Vec<(MemKey, MemState)>, erase: Vec<MemKey>, shuffled: bool, kids: Vec<(Node, i32)>) -> Node {
     Node::G(Box::new(Gate {
         entry,
         erase,
         shuffled,
         run_one: true,
-        kids: kids.into_iter().map(|(n, w)| (n, w, 0.0)).collect(),
+        kids: kids.into_iter().map(|(node, weight)| GateChild { node, weight, shuffle_key: 0.0 }).collect(),
         rng: JRand::from_time(0x5255_4E4F),
         run: false,
     }))
 }
 
-pub fn b(b: Beh) -> Node {
+/// Node of a behaviour with a duration.
+pub fn behavior_node(b: Beh) -> Node {
     Node::B { b, run: false, end: 0 }
 }
 
-pub fn o(t: Trig) -> Node {
+/// Node of an instant trigger.
+pub fn trigger_node(t: Trig) -> Node {
     Node::O { t, run: false }
 }
 
-pub fn idle(min: i32, max: i32) -> Node {
+/// Node that does nothing for `min..=max` ticks.
+pub fn idle_node(min: i32, max: i32) -> Node {
     Node::Idle { min, max, run: false, end: 0 }
 }
 
@@ -286,6 +308,9 @@ pub struct Brain {
     /// Rebuild requested (profession change) during the tick.
     pub refresh: bool,
     pub nodes: Vec<(i32, Act, Node)>,
+    /// Living entities being sorted by the sensor, kept between sensings so that its capacity
+    /// serves again (`RUSTCRAFT_OPT_VILLAGER_NO_TICK_ALLOCATIONS`); empty outside the sensor.
+    pub sensing_buffer: Vec<(f64, Sensed)>,
 }
 
 /// Sensor periods: living, players, items, bed, hurt, hostiles, babies, secondary POIs (40),
@@ -389,6 +414,7 @@ impl Server {
             bed_last: 0,
             refresh: false,
             nodes,
+            sensing_buffer: Vec::new(),
         };
         let t = self.time;
         let day = self.day_time();
@@ -415,7 +441,7 @@ impl Server {
     pub(crate) fn refresh_brain(&mut self, m: &mut Mob, mut b: Brain) -> Brain {
         let t = self.time;
         for i in 0..b.nodes.len() {
-            let mut n = std::mem::replace(&mut b.nodes[i].2, idle(0, 0));
+            let mut n = std::mem::replace(&mut b.nodes[i].2, idle_node(0, 0));
             self.node_stop_all(m, &mut b, &mut n, t);
             b.nodes[i].2 = n;
         }
@@ -434,7 +460,7 @@ impl Server {
             if !b.is_active(act) {
                 continue;
             }
-            let mut n = std::mem::replace(&mut b.nodes[i].2, idle(0, 0));
+            let mut n = std::mem::replace(&mut b.nodes[i].2, idle_node(0, 0));
             if !is_running(&n) {
                 self.node_try_start(m, b, &mut n, t);
             }
@@ -445,7 +471,7 @@ impl Server {
         }
         // Tick or stop of those running.
         for i in 0..b.nodes.len() {
-            let mut n = std::mem::replace(&mut b.nodes[i].2, idle(0, 0));
+            let mut n = std::mem::replace(&mut b.nodes[i].2, idle_node(0, 0));
             if is_running(&n) {
                 self.node_tick_or_stop(m, b, &mut n, t);
             }
@@ -459,7 +485,9 @@ impl Server {
     fn node_try_start(&mut self, m: &mut Mob, b: &mut Brain, n: &mut Node, t: i64) -> bool {
         match n {
             Node::B { b: beh, run, end } => {
-                if !b.mem.check(&beh.entry()) || !self.beh_check(m, b, beh) {
+                let entry_ok =
+                    if switches::no_tick_allocations() { b.mem.check(beh.entry_table()) } else { b.mem.check(&beh.entry()) };
+                if !entry_ok || !self.beh_check(m, b, beh) {
                     return false;
                 }
                 *run = true;
@@ -492,12 +520,12 @@ impl Server {
                     g.shuffle();
                 }
                 for k in 0..g.kids.len() {
-                    if is_running(&g.kids[k].0) {
+                    if is_running(&g.kids[k].node) {
                         continue;
                     }
-                    let mut kid = std::mem::replace(&mut g.kids[k].0, idle(0, 0));
+                    let mut kid = std::mem::replace(&mut g.kids[k].node, idle_node(0, 0));
                     let ok = self.node_try_start(m, b, &mut kid, t);
-                    g.kids[k].0 = kid;
+                    g.kids[k].node = kid;
                     if b.refresh || (ok && g.run_one) {
                         break;
                     }
@@ -525,17 +553,17 @@ impl Server {
             }
             Node::G(g) => {
                 for k in 0..g.kids.len() {
-                    if !is_running(&g.kids[k].0) {
+                    if !is_running(&g.kids[k].node) {
                         continue;
                     }
-                    let mut kid = std::mem::replace(&mut g.kids[k].0, idle(0, 0));
+                    let mut kid = std::mem::replace(&mut g.kids[k].node, idle_node(0, 0));
                     self.node_tick_or_stop(m, b, &mut kid, t);
-                    g.kids[k].0 = kid;
+                    g.kids[k].node = kid;
                     if b.refresh {
                         return;
                     }
                 }
-                if !g.kids.iter().any(|k| is_running(&k.0)) {
+                if !g.kids.iter().any(|k| is_running(&k.node)) {
                     self.gate_stop(m, b, g, t);
                 }
             }
@@ -545,10 +573,10 @@ impl Server {
     fn gate_stop(&mut self, m: &mut Mob, b: &mut Brain, g: &mut Gate, t: i64) {
         g.run = false;
         for k in 0..g.kids.len() {
-            if is_running(&g.kids[k].0) {
-                let mut kid = std::mem::replace(&mut g.kids[k].0, idle(0, 0));
+            if is_running(&g.kids[k].node) {
+                let mut kid = std::mem::replace(&mut g.kids[k].node, idle_node(0, 0));
                 self.node_stop_all(m, b, &mut kid, t);
-                g.kids[k].0 = kid;
+                g.kids[k].node = kid;
             }
         }
         for &e in &g.erase {
@@ -596,7 +624,36 @@ impl Server {
     }
 
     /// Living entities in the enlarged tracking box, sorted by distance².
-    fn sense_living(&mut self, m: &mut Mob, b: &mut Brain) {
+    pub(super) fn sense_living(&mut self, m: &mut Mob, b: &mut Brain) {
+        let reuse = switches::no_tick_allocations();
+        let mut sorted = if reuse { std::mem::take(&mut b.sensing_buffer) } else { Vec::new() };
+        self.living_in_range(m, &mut sorted);
+        // Stable sort: equal distances keep the list's order, the player last.
+        sorted.sort_by(|a, c| a.0.partial_cmp(&c.0).unwrap_or(std::cmp::Ordering::Equal));
+        if reuse {
+            // The vectors of the last sensing are emptied and filled again: no allocation once
+            // their capacity has grown to the size of the crowd.
+            let mut living = b.mem.living.take().unwrap_or_default();
+            living.clear();
+            living.extend(sorted.iter().map(|x| x.1.ent));
+            b.mem.living = (!living.is_empty()).then_some(living);
+            let mut visible = b.mem.visible.take().unwrap_or_default();
+            visible.clear();
+            visible.extend(sorted.iter().map(|x| x.1));
+            b.mem.visible = Some(visible);
+            sorted.clear();
+            b.sensing_buffer = sorted;
+            return;
+        }
+        let ents: Vec<Sensed> = sorted.into_iter().map(|x| x.1).collect();
+        b.mem.living = (!ents.is_empty()).then(|| ents.iter().map(|x| x.ent).collect());
+        // The empty list stays a present memory for the visible living entities (non-empty object).
+        b.mem.visible = Some(ents);
+    }
+
+    /// Living entities in the box of the follow range around `m`, with their distance², in the
+    /// list's order then the player.
+    fn living_in_range(&self, m: &Mob, out: &mut Vec<(f64, Sensed)>) {
         let r = m.follow_range();
         let bb = m.bbox();
         let inside = |p: [f64; 3], w: f64, h: f64| {
@@ -607,52 +664,75 @@ impl Server {
                 && p[2] + w / 2.0 > bb.min[2] - r
                 && p[2] - w / 2.0 < bb.max[2] + r
         };
-        let mut list: Vec<(f64, Ent)> = Vec::new();
         for o in self.mobs.list.iter() {
             if o.id != m.id && o.alive() && inside(o.pos(), f64::from(o.width()), f64::from(o.height())) {
-                list.push((dist2(m.pos(), o.pos()), Ent::Mob(o.id)));
+                let entry = Sensed { ent: Ent::Mob(o.id), kind: Some(o.kind), seen: None };
+                out.push((dist2(m.pos(), o.pos()), entry));
             }
         }
         if self.ent_alive(Ent::Player) && inside(self.pos, 0.6, 1.8) {
-            list.push((dist2(m.pos(), self.pos), Ent::Player));
+            out.push((dist2(m.pos(), self.pos), Sensed { ent: Ent::Player, kind: None, seen: None }));
         }
-        list.sort_by(|a, c| a.0.partial_cmp(&c.0).unwrap_or(std::cmp::Ordering::Equal));
-        let ents: Vec<Ent> = list.into_iter().map(|x| x.1).collect();
-        b.mem.living = (!ents.is_empty()).then(|| ents.clone());
-        // The empty list stays a present memory for the visible living entities (non-empty object).
-        b.mem.visible = Some(ents.into_iter().map(|e| (e, None)).collect());
     }
 
     /// Lazy visibility of a living entity of the list.
     pub(crate) fn visible(&self, m: &mut Mob, b: &mut Brain, e: Ent) -> bool {
-        let Some(v) = &mut b.mem.visible else { return false };
-        let Some(i) = v.iter().position(|x| x.0 == e) else { return false };
-        if let Some(r) = v[i].1 {
+        let Some(i) = b.mem.visible.as_ref().and_then(|v| v.iter().position(|x| x.ent == e)) else { return false };
+        self.visible_at(m, b, i)
+    }
+
+    /// Lazy visibility of entry `i` of the visible list: evaluated once per sensing.
+    pub(crate) fn visible_at(&self, m: &mut Mob, b: &mut Brain, i: usize) -> bool {
+        let Some(entry) = b.mem.visible.as_ref().and_then(|v| v.get(i).copied()) else { return false };
+        if let Some(r) = entry.seen {
             return r;
         }
         let range = self.mobs.pig.sensor_range;
-        let r = self.targeting_ok(m, e, false, range, true, true);
+        let r = self.targeting_ok(m, entry.ent, false, range, true, true);
         if let Some(v) = &mut b.mem.visible {
-            v[i].1 = Some(r);
+            v[i].seen = Some(r);
         }
         r
     }
 
-    /// First visible living entity satisfying the filter.
-    pub(crate) fn find_closest(&self, m: &mut Mob, b: &mut Brain, f: impl Fn(&Server, Ent) -> bool) -> Option<Ent> {
-        let list: Vec<Ent> = b.mem.visible.as_ref()?.iter().map(|x| x.0).collect();
-        list.into_iter().find(|&e| f(self, e) && self.visible(m, b, e))
+    /// First visible living entity of the list (nearest first) that passes `f`.
+    pub(crate) fn first_visible_matching(
+        &self,
+        m: &mut Mob,
+        b: &mut Brain,
+        f: impl Fn(&Server, Sensed) -> bool,
+    ) -> Option<Ent> {
+        if !switches::visible_by_index() {
+            // Old path: the list copied, each candidate that passes looked up again by entity.
+            let list: Vec<Sensed> = b.mem.visible.clone()?;
+            return list.into_iter().find(|&x| f(self, x) && self.visible(m, b, x.ent)).map(|x| x.ent);
+        }
+        // Each candidate tested at its index: an entity appears once in the list and the test only
+        // fills the visibility of that entry, so neither a copy nor a second search is needed.
+        let n = b.mem.visible.as_ref()?.len();
+        (0..n).find_map(|i| {
+            let x = b.mem.visible.as_ref()?[i];
+            (f(self, x) && self.visible_at(m, b, i)).then_some(x.ent)
+        })
     }
 
     fn sense_players(&mut self, m: &mut Mob, b: &mut Brain) {
         let r = m.follow_range();
-        let mut players = Vec::new();
-        if self.game_mode != 3 && self.ent_alive(Ent::Player) && dist2(m.pos(), self.pos) < r * r {
-            players.push(Ent::Player);
+        let near = self.game_mode != 3 && self.ent_alive(Ent::Player) && dist2(m.pos(), self.pos) < r * r;
+        if switches::no_tick_allocations() {
+            // At most the one player: the memory's vector is filled again in place.
+            let mut players = b.mem.players.take().unwrap_or_default();
+            players.clear();
+            if near {
+                players.push(Ent::Player);
+            }
+            b.mem.players = (!players.is_empty()).then_some(players);
+        } else {
+            let players = if near { vec![Ent::Player] } else { Vec::new() };
+            b.mem.players = (!players.is_empty()).then(|| players.clone());
         }
-        b.mem.players = (!players.is_empty()).then(|| players.clone());
         let sr = self.mobs.pig.sensor_range;
-        let vis = players.first().copied().filter(|&p| self.targeting_ok(m, p, false, sr, true, true));
+        let vis = Some(Ent::Player).filter(|&p| near && self.targeting_ok(m, p, false, sr, true, true));
         b.mem.visible_player = vis;
     }
 
@@ -711,8 +791,14 @@ impl Server {
 
     fn sense_hostiles(&mut self, m: &mut Mob, b: &mut Brain) {
         let me = m.pos();
-        let found = self.find_closest(m, b, |s, e| {
-            let Ent::Mob(id) = e else { return false };
+        let by_sensed_kind = switches::sensed_kind();
+        let found = self.first_visible_matching(m, b, |s, x| {
+            let Ent::Mob(id) = x.ent else { return false };
+            if by_sensed_kind {
+                // Species read by the sensor: only a hostile is looked up, for its position.
+                let Some(d) = x.kind.and_then(hostile_alert_distance) else { return false };
+                return s.ent_pos(x.ent).is_some_and(|p| dist2(p, me) <= d * d);
+            }
             let Some(o) = s.mob_ref(id) else { return false };
             let Some(d) = hostile_distance(o.kind.info().name) else { return false };
             dist2(o.pos(), me) <= d * d
@@ -721,14 +807,31 @@ impl Server {
     }
 
     fn sense_babies(&mut self, m: &mut Mob, b: &mut Brain) {
-        let list: Vec<Ent> = b.mem.visible.as_ref().map(|v| v.iter().map(|x| x.0).collect()).unwrap_or_default();
-        let mut out = Vec::new();
-        for e in list {
-            let Ent::Mob(id) = e else { continue };
-            let baby_villager =
-                self.mob_ref(id).is_some_and(|o| o.kind == super::super::species::Kind::Villager && o.is_baby());
-            if baby_villager && self.visible(m, b, e) {
-                out.push(e);
+        let by_sensed_kind = switches::sensed_kind();
+        let baby_villager = |s: &Server, x: Sensed| {
+            let Ent::Mob(id) = x.ent else { return false };
+            // The species read by the sensor spares the lookup of every other mob.
+            if by_sensed_kind && x.kind != Some(Kind::Villager) {
+                return false;
+            }
+            s.mob_ref(id).is_some_and(|o| o.kind == Kind::Villager && o.is_baby())
+        };
+        let mut out = reused(b.mem.babies.take());
+        if switches::visible_by_index() {
+            let n = b.mem.visible.as_ref().map_or(0, Vec::len);
+            for i in 0..n {
+                let Some(x) = b.mem.visible.as_ref().map(|v| v[i]) else { break };
+                if baby_villager(self, x) && self.visible_at(m, b, i) {
+                    out.push(x.ent);
+                }
+            }
+        } else {
+            // Old path: the list copied, each baby looked up again by entity.
+            let list: Vec<Sensed> = b.mem.visible.clone().unwrap_or_default();
+            for x in list {
+                if baby_villager(self, x) && self.visible(m, b, x.ent) {
+                    out.push(x.ent);
+                }
             }
         }
         b.mem.babies = (!out.is_empty()).then_some(out);
@@ -738,27 +841,75 @@ impl Server {
     fn sense_secondary(&mut self, m: &mut Mob, b: &mut Brain) {
         let c = m.block_pos();
         let farmer = m.villager[1] == super::PROF_FARMER;
-        let mut out = Vec::new();
+        let mut out = reused(b.mem.secondary.take());
         if farmer {
-            for x in -4..=4 {
-                for y in -2..=2 {
-                    for z in -4..=4 {
-                        let p = [c[0] + x, c[1] + y, c[2] + z];
-                        if self.bname(p) == "minecraft:farmland" {
-                            out.push(p);
-                        }
+            let how = if switches::farmland_box_scan() {
+                FarmlandSearch::BoxScan
+            } else if switches::block_ids() {
+                FarmlandSearch::ById
+            } else {
+                FarmlandSearch::ByName
+            };
+            self.farmland_around(c, how, &mut out);
+        }
+        b.mem.secondary = (!out.is_empty()).then_some(out);
+    }
+
+    /// Farmland of the cube ±4, ±2 around `c`, appended to `out` in the order x, then y, then z.
+    pub(crate) fn farmland_around(&self, c: [i32; 3], how: FarmlandSearch, out: &mut Vec<[i32; 3]>) {
+        let (min, max) = ([c[0] - 4, c[1] - 2, c[2] - 4], [c[0] + 4, c[1] + 2, c[2] + 4]);
+        if let FarmlandSearch::BoxScan = how {
+            let (farmland, view) = (self.bs.t.id.farmland, self.view());
+            let start = out.len();
+            self.scan_box(min, max, |s| view.block(s) == farmland, |p, _| {
+                out.push(p);
+                true
+            });
+            // The box scan walks section by section: sorted back to the sensor's order.
+            out[start..].sort_unstable();
+            return;
+        }
+        let by_id = matches!(how, FarmlandSearch::ById);
+        for x in min[0]..=max[0] {
+            for y in min[1]..=max[1] {
+                for z in min[2]..=max[2] {
+                    if self.is_farmland([x, y, z], by_id) {
+                        out.push([x, y, z]);
                     }
                 }
             }
         }
-        b.mem.secondary = (!out.is_empty()).then_some(out);
+    }
+}
+
+/// How the farmer's sensor finds farmland: each cell's block compared by name, or by identifier
+/// (`RUSTCRAFT_OPT_BLOCKIDS`), or a scan of the box that skips the sections whose palette holds no
+/// farmland (`RUSTCRAFT_OPT_VILLAGER_FARMLAND_BOX_SCAN`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FarmlandSearch {
+    ByName,
+    ById,
+    BoxScan,
+}
+
+/// The emptied vector of a memory, to fill again (`RUSTCRAFT_OPT_VILLAGER_NO_TICK_ALLOCATIONS`:
+/// its capacity serves again), otherwise a new one.
+fn reused<T>(old: Option<Vec<T>>) -> Vec<T> {
+    match old {
+        Some(mut v) if switches::no_tick_allocations() => {
+            v.clear();
+            v
+        }
+        _ => Vec::new(),
     }
 }
 
 fn sense_golem(s: &Server, b: &mut Brain) {
     let Some(l) = &b.mem.living else { return };
+    let by_kind = switches::sensed_kind();
+    let is_golem = |o: &Mob| if by_kind { o.kind == Kind::IronGolem } else { o.kind.info().name == "minecraft:iron_golem" };
     let golem = l.iter().any(|e| match e {
-        Ent::Mob(id) => s.mob_ref(*id).is_some_and(|o| o.kind.info().name == "minecraft:iron_golem"),
+        Ent::Mob(id) => s.mob_ref(*id).is_some_and(is_golem),
         Ent::Player => false,
     });
     if golem {
@@ -766,7 +917,18 @@ fn sense_golem(s: &Server, b: &mut Brain) {
     }
 }
 
-/// Alert distance of the villager's hostiles.
+/// Alert distance of the villager's hostiles, by species (same table as `hostile_distance`).
+pub fn hostile_alert_distance(k: Kind) -> Option<f64> {
+    Some(match k {
+        Kind::Drowned | Kind::Husk | Kind::Vex | Kind::Zombie | Kind::ZombieVillager => 8.0,
+        Kind::Evoker | Kind::Illusioner | Kind::Ravager => 12.0,
+        Kind::Pillager => 15.0,
+        Kind::Vindicator | Kind::Zoglin => 10.0,
+        _ => return None,
+    })
+}
+
+/// Alert distance of the villager's hostiles, by name (old path).
 pub fn hostile_distance(name: &str) -> Option<f64> {
     Some(match name.trim_start_matches("minecraft:") {
         "drowned" | "husk" | "vex" | "zombie" | "zombie_villager" => 8.0,

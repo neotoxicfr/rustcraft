@@ -353,6 +353,11 @@ impl Server {
         super::select::parse(text).map(|s| self.select(&s, src)).unwrap_or_default()
     }
 
+    /// Does an `entity` argument find at least one entity? (`arg_entities_opt` not empty.)
+    pub fn arg_entities_any(&mut self, src: &Src, text: &str) -> bool {
+        super::select::parse(text).is_some_and(|s| self.select_finds_any(&s, src))
+    }
+
     /// Player profiles (`game_profile`): selector or name (online player only).
     pub fn arg_profiles(&mut self, src: &Src, text: &str) -> Result<Vec<E>, Fail> {
         if text.starts_with('@') {

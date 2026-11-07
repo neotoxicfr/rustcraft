@@ -62,6 +62,19 @@ pub(crate) fn arrow_knockback_push(vel: [f64; 3], scale: f64) -> Option<[f64; 3]
 }
 
 impl Server {
+    /// Damage dealt to the player by the mob `id` (in the list or frozen copy) through a projectile
+    /// or a potion. The mob stays in its slot for the hit (the player's death walks the mobs: they
+    /// forgive it, the kill credit looks the shooter up); a copy of it is the damage source, made
+    /// once (old path: a first copy here, then the damage source copied from it).
+    fn player_hurt_by_mob_id(&mut self, id: i32, ty: &str, amount: f32, kb: Option<(f64, f64)>) -> bool {
+        if !super::ProjectilePaths::current().hit_without_mob_clone {
+            let m = self.mob_ref(id).map(|m| (*m).clone()).expect("mob");
+            return self.player_hurt_by_mob(&m, ty, amount, kb);
+        }
+        let m = self.mob_ref(id).map(|m| Box::new(m.clone())).expect("mob");
+        self.player_hurt_by_mob_copy(m, ty, amount, kb)
+    }
+
     /// Damage of a projectile on a living entity; `kb` = knockback direction (the game's `xd`, `zd`).
     pub(crate) fn proj_damage(&mut self, t: Ent, ty: &str, amount: f32, by: Option<Ent>, kb: (f64, f64)) -> bool {
         // W8c: direct entity = the projectile (shield: side it comes from, no retaliation).
@@ -72,8 +85,7 @@ impl Server {
         match t {
             Ent::Player => match by {
                 Some(Ent::Mob(id)) if self.mob_ref(id).is_some() => {
-                    let m = self.mob_ref(id).map(|m| (*m).clone()).expect("mob");
-                    self.player_hurt_by_mob(&m, ty, amount, Some(kb))
+                    self.player_hurt_by_mob_id(id, ty, amount, Some(kb))
                 }
                 _ => self.player_hurt_kb(ty, amount, Some(kb)),
             },
@@ -403,13 +415,11 @@ impl Server {
                     // Responsible mob (witch, dragon): difficulty, named author; knockback
                     // from the origin (potion, cloud), random without it.
                     let kb = origin.map(|o| (o[0] - self.pos[0], o[2] - self.pos[2]));
-                    let owner = match causing {
-                        Some(Ent::Mob(o)) => self.mob_ref(o).map(|m| (*m).clone()),
-                        _ => None,
-                    };
-                    match owner {
-                        Some(om) => self.player_hurt_by_mob(&om, ty, n as f32, kb),
-                        None => self.player_hurt_kb(ty, n as f32, kb),
+                    match causing {
+                        Some(Ent::Mob(o)) if self.mob_ref(o).is_some() => {
+                            self.player_hurt_by_mob_id(o, ty, n as f32, kb)
+                        }
+                        _ => self.player_hurt_kb(ty, n as f32, kb),
                     };
                 }
                 Ent::Mob(mid) => {

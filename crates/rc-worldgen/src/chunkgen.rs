@@ -14,8 +14,10 @@ use crate::data::{DataPack, full_id};
 use crate::decor::{DecorStats, Decorator};
 use crate::decor_blocks::{Blocks, State};
 use crate::decor_data::DecorData;
-use crate::decor_region::{DecoChunk, Hm, Region};
+use crate::decor_region::{DecoChunk, FINAL_HMS, Hm, Region};
 use crate::json::Json;
+use crate::palette::{AIR, BlockId};
+use crate::proto::ProtoTerrain;
 use crate::sampler::{Ctx, Sid};
 use crate::structure_place::ProcLists;
 use crate::terrain::StructureDensity;
@@ -219,6 +221,45 @@ pub fn debug_state_at(x: i32, z: i32, state_count: usize, air: State) -> State {
 /// Spawn target point: (function, quantised (min, max)) per parameter.
 type SpawnTarget = Vec<(Sid, (i64, i64))>;
 
+/// Optimised paths of the conversion of a terrain proto-chunk into a decoration chunk. Default:
+/// `RUSTCRAFT_OPT_*` switches read at startup; the equivalence tests set them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConversionOpts {
+    /// `SKIP_AIR_SECTIONS`: a section of plain air is not converted cell by cell, and the highest
+    /// other section bounds the walk of the final height maps.
+    pub skip_air_sections: bool,
+    /// `CONVERT_WITH_HEIGHTMAPS`: conversion layer by layer from the top, finding the four final
+    /// height maps on the way.
+    pub heightmaps_while_converting: bool,
+    /// `REUSE_PROTO_BUFFER`: the proto-chunk's block buffer goes back to its thread for the next one.
+    pub reuse_proto_buffer: bool,
+}
+
+impl ConversionOpts {
+    pub const OLD: ConversionOpts =
+        ConversionOpts { skip_air_sections: false, heightmaps_while_converting: false, reuse_proto_buffer: false };
+    pub const NEW: ConversionOpts =
+        ConversionOpts { skip_air_sections: true, heightmaps_while_converting: true, reuse_proto_buffer: true };
+
+    pub fn from_env() -> Self {
+        ConversionOpts {
+            skip_air_sections: crate::opt::skip_air_sections(),
+            heightmaps_while_converting: crate::opt::convert_with_heightmaps(),
+            reuse_proto_buffer: crate::opt::reuse_proto_buffer(),
+        }
+    }
+}
+
+/// What the conversion of the blocks leaves to do for the final height maps.
+enum FinalMapsToDo {
+    /// Found during the conversion.
+    Nothing,
+    /// Every cell from this y up is plain air.
+    WalkBelow(i32),
+    /// The whole chunk to walk.
+    WalkAll,
+}
+
 /// Ready generator of a dimension.
 pub struct DimGen {
     kind: Kind,
@@ -226,6 +267,10 @@ pub struct DimGen {
     pub blocks: Arc<Blocks>,
     /// Terrain block identifier → network state.
     to_state: Vec<State>,
+    /// Terrain block identifier → height map bits of its network state.
+    final_map_bits: Vec<u8>,
+    /// Optimised paths of the conversion into decoration chunks.
+    pub conversion: ConversionOpts,
     pub dimension: String,
     pub seed: i64,
     pub min_y: i32,
@@ -318,6 +363,7 @@ impl DimGen {
                         w.blocks.state_from_str(name).ok_or_else(|| Error::Missing(format!("state {name}")))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                let final_map_bits = to_state.iter().map(|&s| w.blocks.facts(s).hm).collect();
                 let spawn_targets = Self::spawn_targets(&w.pack, settings, &mut t)?;
                 let biome_names = t.biome_names.clone();
                 let mut deco = Decorator::new(&w.decor, &w.blocks, &biome_names, seed)?;
@@ -330,6 +376,8 @@ impl DimGen {
                     deco: Some(Arc::new(deco)),
                     blocks: w.blocks.clone(),
                     to_state,
+                    final_map_bits,
+                    conversion: ConversionOpts::from_env(),
                     dimension,
                     seed,
                     min_y,
@@ -379,6 +427,8 @@ impl DimGen {
                     deco,
                     blocks: w.blocks.clone(),
                     to_state: Vec::new(),
+                    final_map_bits: Vec::new(),
+                    conversion: ConversionOpts::from_env(),
                     dimension,
                     seed,
                     min_y,
@@ -398,6 +448,8 @@ impl DimGen {
                 deco: None,
                 blocks: w.blocks.clone(),
                 to_state: Vec::new(),
+                final_map_bits: Vec::new(),
+                conversion: ConversionOpts::from_env(),
                 dimension,
                 seed,
                 min_y,
@@ -579,49 +631,99 @@ impl DimGen {
         cache: &BiomeCache,
         structures: Option<&dyn StructureDensity>,
     ) -> DecoChunk {
+        let flat_layers = match &self.kind {
+            Kind::Noise(t) => return self.noise_terrain(t, cx, cz, cache, structures),
+            Kind::Flat { layers, .. } => Some(layers),
+            Kind::Debug => None,
+        };
         let mut c = DecoChunk::new(cx, cz, self.min_y, self.height);
-        let air = self.blocks.default_state(self.blocks.k.air);
-        match &self.kind {
-            Kind::Noise(t) => {
-                // Structures active: beard of the referenced starts (except forced density).
-                let own = match (&self.structures, structures) {
-                    (Some(sg), None) => {
-                        let refs = sg.referenced(cx, cz, t, &self.blocks);
-                        crate::structure_beard::Beard::new(cx, cz, &refs, &sg.defs)
-                    }
-                    _ => None,
-                };
-                let structures = structures.or_else(|| own.as_ref().map(|b| b as &dyn StructureDensity));
-                let p = t.generate(cx, cz, cache, structures);
-                for (dst, &b) in c.blocks.iter_mut().zip(&p.blocks) {
-                    *dst = self.to_state[b as usize];
-                }
-                for i in 0..256 {
-                    c.heights[Hm::WorldSurfaceWg as usize][i] = p.world_surface_wg[i] as i16;
-                    c.heights[Hm::OceanFloorWg as usize][i] = p.ocean_floor_wg[i] as i16;
-                }
-                match cache.chunks.get(&(cx, cz)) {
-                    Some(b) => c.biomes.copy_from_slice(&b.data),
-                    None => c.biomes.copy_from_slice(&t.chunk_biomes(cx, cz).data),
-                }
-                for &m in &p.post_processing {
-                    let sec = (m >> 16) as i32;
-                    let (x, y, z) = ((m & 15) as i32, ((m >> 4) & 15) as i32, ((m >> 8) & 15) as i32);
-                    c.post_process.push([cx * 16 + x, self.min_y + sec * 16 + y, cz * 16 + z]);
-                }
+        c.blocks.fill(self.blocks.default_state(self.blocks.k.air));
+        if let Some(layers) = flat_layers {
+            for (i, &s) in layers.iter().enumerate() {
+                let base = i * 256;
+                c.blocks[base..base + 256].fill(s);
             }
-            Kind::Flat { layers, .. } => {
-                c.blocks.fill(air);
-                for (i, &s) in layers.iter().enumerate() {
-                    let base = i * 256;
-                    c.blocks[base..base + 256].fill(s);
-                }
-                c.prime_maps(&self.blocks, &[Hm::WorldSurfaceWg, Hm::OceanFloorWg]);
-            }
-            Kind::Debug => c.blocks.fill(air),
+            c.prime_maps(&self.blocks, &[Hm::WorldSurfaceWg, Hm::OceanFloorWg]);
         }
         c.prime_final_heightmaps(&self.blocks);
         c
+    }
+
+    /// [`Self::terrain`] of the noise generator `t`.
+    fn noise_terrain(
+        &self,
+        t: &TerrainGenerator,
+        cx: i32,
+        cz: i32,
+        cache: &BiomeCache,
+        structures: Option<&dyn StructureDensity>,
+    ) -> DecoChunk {
+        // Structures active: beard of the referenced starts (except forced density).
+        let own = match (&self.structures, structures) {
+            (Some(sg), None) => {
+                let refs = sg.referenced(cx, cz, t, &self.blocks);
+                crate::structure_beard::Beard::new(cx, cz, &refs, &sg.defs)
+            }
+            _ => None,
+        };
+        let structures = structures.or_else(|| own.as_ref().map(|b| b as &dyn StructureDensity));
+        let p = t.generate(cx, cz, cache, structures);
+        let c = self.convert_noise_terrain(t, &p, cache);
+        if self.conversion.reuse_proto_buffer {
+            p.recycle_blocks();
+        }
+        c
+    }
+
+    /// Decoration chunk of the proto-chunk `p` of the noise generator `t`: network states,
+    /// generation maps, biomes, fluid marks and final maps (public for the conversion bench).
+    #[doc(hidden)]
+    pub fn convert_noise_terrain(&self, t: &TerrainGenerator, p: &ProtoTerrain, cache: &BiomeCache) -> DecoChunk {
+        let (cx, cz) = (p.cx, p.cz);
+        let mut c = DecoChunk::new(cx, cz, self.min_y, self.height);
+        let final_maps = self.convert_noise_blocks(&p.blocks, &mut c);
+        for i in 0..256 {
+            c.heights[Hm::WorldSurfaceWg as usize][i] = p.world_surface_wg[i] as i16;
+            c.heights[Hm::OceanFloorWg as usize][i] = p.ocean_floor_wg[i] as i16;
+        }
+        match cache.chunks.get(&(cx, cz)) {
+            Some(b) => c.biomes.copy_from_slice(&b.data),
+            None => c.biomes.copy_from_slice(&t.chunk_biomes(cx, cz).data),
+        }
+        for &m in &p.post_processing {
+            let sec = (m >> 16) as i32;
+            let (x, y, z) = ((m & 15) as i32, ((m >> 4) & 15) as i32, ((m >> 8) & 15) as i32);
+            c.post_process.push([cx * 16 + x, self.min_y + sec * 16 + y, cz * 16 + z]);
+        }
+        match final_maps {
+            FinalMapsToDo::Nothing => {}
+            FinalMapsToDo::WalkBelow(top) if crate::opt::prime_one_walk() => {
+                c.prime_many(&self.blocks, &FINAL_HMS, top);
+            }
+            FinalMapsToDo::WalkBelow(_) | FinalMapsToDo::WalkAll => c.prime_final_heightmaps(&self.blocks),
+        }
+        c
+    }
+
+    /// Network states of the terrain blocks `terrain` written into the new chunk `c`, on the
+    /// paths of [`Self::conversion`].
+    fn convert_noise_blocks(&self, terrain: &[BlockId], c: &mut DecoChunk) -> FinalMapsToDo {
+        let o = self.conversion;
+        let air = self.blocks.default_state(self.blocks.k.air);
+        // Skipping a section of plain air is exact while plain air counts in no height map (true
+        // with the game's tags, checked here once).
+        let skip_air = o.skip_air_sections && self.final_map_bits[AIR as usize] == 0;
+        if o.heightmaps_while_converting {
+            c.convert_terrain_finding_final_maps(terrain, &self.to_state, &self.final_map_bits, air, skip_air, true);
+            FinalMapsToDo::Nothing
+        } else if skip_air {
+            FinalMapsToDo::WalkBelow(c.convert_terrain_skipping_air(terrain, &self.to_state, air, true))
+        } else {
+            for (dst, &b) in c.blocks.iter_mut().zip(terrain) {
+                *dst = self.to_state[b as usize];
+            }
+            FinalMapsToDo::WalkAll
+        }
     }
 
     /// Regeneration generator below y = 0 (built at first need), and its state table.
@@ -675,11 +777,16 @@ impl DimGen {
         };
         let p = t.generate(cx, cz, &cache, None);
         let mut c = old.clone();
-        for (dst, &b) in c.blocks.iter_mut().zip(&p.blocks) {
-            *dst = to_state[b as usize];
+        let b = &self.blocks;
+        if self.conversion.skip_air_sections {
+            // The old blocks of the band are overwritten, plain air sections included.
+            c.convert_terrain_skipping_air(&p.blocks, to_state, b.default_state(b.k.air), false);
+        } else {
+            for (dst, &id) in c.blocks.iter_mut().zip(&p.blocks) {
+                *dst = to_state[id as usize];
+            }
         }
         c.biomes[..band_biomes.len()].copy_from_slice(&band_biomes);
-        let b = &self.blocks;
         let deepslate = b.default_state(b.block_id("deepslate")?);
         let bedrock = b.block_id("bedrock")?;
         for y in 0..=4 {
@@ -711,6 +818,9 @@ impl DimGen {
             let sec = (m >> 16) as i32;
             let (x, y, z) = ((m & 15) as i32, ((m >> 4) & 15) as i32, ((m >> 8) & 15) as i32);
             c.post_process.push([cx * 16 + x, lo + sec * 16 + y, cz * 16 + z]);
+        }
+        if self.conversion.reuse_proto_buffer {
+            p.recycle_blocks();
         }
         c.prime_final_heightmaps(b);
         Some(c)

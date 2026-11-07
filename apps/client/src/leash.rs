@@ -287,7 +287,7 @@ impl LeashRenderer {
         LeashRenderer { pipeline, buf: None, verts: Vec::new(), count: 0 }
     }
 
-    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, _up: &mut crate::render::upload::Uploader) {
         self.count = self.verts.len() as u32;
         if self.verts.is_empty() {
             return;

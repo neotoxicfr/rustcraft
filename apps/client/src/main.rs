@@ -13,6 +13,7 @@ mod boot;
 mod block_entities;
 mod block_fx;
 mod block_text;
+mod cache_key;
 mod capseq;
 mod disconnect_report;
 mod entity_loops;
@@ -46,6 +47,7 @@ mod entity_atlas;
 mod entity_outline;
 mod entity_render;
 mod environ;
+mod events_before_renderer;
 mod exact;
 mod explode;
 mod flow;
@@ -117,6 +119,7 @@ mod symlink_notice;
 mod tablist;
 mod tech_blocks;
 mod terrain_shader;
+mod window_title;
 mod text_display;
 mod syslocale;
 mod ticking;
@@ -407,11 +410,18 @@ struct App {
     biome_names: Vec<String>,
     world: World,
     renderer: Option<Renderer>,
+    /// GPU being opened in the background until the window exists (`gpu_backend::EarlyGpuOpen`).
+    early_gpu: Option<gpu_backend::EarlyGpuOpen>,
+    /// First session event that needed the renderer while it was being built: applied first at the
+    /// next frame (`events_before_renderer.rs`).
+    held_event: Option<rc_client::Event>,
     meshes_tx: Sender<remesh::Done>,
     meshes_rx: Receiver<remesh::Done>,
     /// Meshes received not yet uploaded (upload budget per frame, `RUSTCRAFT_OPT_UPLOADBUDGET`).
     mesh_pending: Vec<remesh::Done>,
     in_flight: usize,
+    /// What the last pick that held every dirty column saw (`app_meshing::HeldSignature`).
+    all_held: Option<app_meshing::HeldSignature>,
     eye: [f64; 3],
     yaw: f32,
     pitch: f32,
@@ -423,6 +433,8 @@ struct App {
     last: Instant,
     fps_frames: u32,
     fps_since: Instant,
+    /// Title refreshed every second, in a world and outside (`window_title.rs`).
+    window_title: window_title::WindowTitle,
     started: Instant,
     status: String,
     /// Fixed game tick at 20 per second: accumulated time not yet consumed.

@@ -53,6 +53,10 @@ impl App {
         // Only what arrived before the frame: a flood of chunks does not delay it.
         profiler::push("scheduledPacketProcessing");
         let (t_recv, n_recv) = (Instant::now(), self.session.events.len());
+        // Event held back while the renderer was being built: first, the order stays the same.
+        if let Some(ev) = self.held_event.take() {
+            self.deliver(ev);
+        }
         for _ in 0..n_recv {
             let Ok(ev) = self.session.events.try_recv() else { break };
             self.deliver(ev);
@@ -66,6 +70,16 @@ impl App {
         }
         // Slot left by the mouse in a container or creative screen (`bundle.rs`).
         self.bundle_hover();
+        self.relight_then_schedule_meshing();
+        profiler::pop_push("mouse");
+        self.mouse_frame();
+        profiler::pop();
+        self.frame_after_meshing();
+    }
+
+    /// Light recomputed after the packets received, then the meshing of what changed (each frame,
+    /// and between the phases of the first renderer's build).
+    pub(crate) fn relight_then_schedule_meshing(&mut self) {
         // Light recomputed after the frame's packets, before the meshing (like the game).
         if !self.relight.is_empty() {
             let changes = std::mem::take(&mut self.relight);
@@ -93,9 +107,10 @@ impl App {
             }
         }
         self.schedule_meshing();
-        profiler::pop_push("mouse");
-        self.mouse_frame();
-        profiler::pop();
+    }
+
+    /// The frame in a world after the packets, the light and the meshing.
+    fn frame_after_meshing(&mut self) {
         let now = Instant::now();
         self.debug.on_frame(now, &self.session.link.stats);
         let elapsed = now.duration_since(self.last).as_secs_f64();
@@ -912,71 +927,62 @@ impl App {
             let busy = self.in_flight > 0 || !self.world.dirty.is_empty();
             // Columns to mesh: the loaded ones, minus those waiting for a neighbour.
             let cols = self.world.grid.len().saturating_sub(self.world.meshes.waiting_len());
-            perf_log::frame(self.started, busy, self.positioned && !self.front.is_open(), cols);
+            let in_game = self.positioned && !self.front.is_open();
+            perf_log::frame(self.started, Some(perf_log::WorldFrame { busy, in_game, columns: cols }));
         }
+        self.report_each_second(true);
+    }
+
+    /// Once a second, in a world and outside (title screen, menus): statistics line read by the
+    /// bench, allocator totals, window title.
+    pub(crate) fn report_each_second(&mut self, in_world: bool) {
         let since = self.fps_since.elapsed().as_secs_f64();
-        if since >= 1.0 {
-            let (cols, quads) = r.stats();
-            let (va, vu, vt, vo) = r.vram();
-            let mo = |b: u64| b as f64 / 1_048_576.0;
-            let cpu = r.cpu_ms();
-            let gpu_ms = r.gpu_ms();
-            self.debug.set_gpu(gpu_ms);
-            let gpu = gpu_ms.map_or_else(|| "?".into(), |ms| format!("{ms:.3}"));
-            let line = format!(
-                "{:.0} fps, CPU {cpu:.3} ms/frame, GPU {gpu} ms/frame, {} columns loaded, {} on GPU ({:.2} M faces), {} drawn ({:.2} M faces), {} meshes in progress, sort {:.3} ms (walk {:.3} ms), VRAM {:.1} MB (regions {:.1} of which {:.1} used, textures {:.1}, other {:.1}), translucent {} columns of which {} unsorted, {} entities drawn, block entities {} of which {} drawn",
-                f64::from(self.fps_frames) / since,
-                self.world.grid.len(),
-                cols,
-                quads as f64 / 1e6,
-                r.drawn.0,
-                r.drawn.1 as f64 / 1e6,
-                self.in_flight,
-                r.vis_ms,
-                r.graph_ms,
-                mo(va + vt + vo),
-                mo(va),
-                mo(vu),
-                mo(vt),
-                mo(vo),
-                r.trans_stats().0,
-                r.trans_stats().1,
-                r.entities.as_ref().map_or(0, |e| e.drawn),
-                self.block_entities.len(),
-                r.entities.as_ref().map_or(0, |e| e.blocks.drawn)
+        if since < 1.0 {
+            return;
+        }
+        let Some(r) = &mut self.renderer else { return };
+        let fps = f64::from(self.fps_frames) / since;
+        let stats = perf_log::SecondStats::read(r, fps, self.world.grid.len(), self.in_flight, self.block_entities.len());
+        if in_world {
+            self.debug.set_gpu(stats.gpu_ms);
+        }
+        eprintln!("[{:>6.1} s] {}", self.started.elapsed().as_secs_f64(), stats.line());
+        alloc_trace::per_second(since, self.fps_frames);
+        let mo = |b: u64| b as f64 / 1_048_576.0;
+        // Total of the allocator (Vulkan): everything included (textures, buffers, targets).
+        if let Some(rep) = r.allocator_report() {
+            eprintln!(
+                "GPU allocator: {:.1} MB allocated, {:.1} MB reserved",
+                mo(rep.total_allocated_bytes),
+                mo(rep.total_reserved_bytes)
             );
-            eprintln!("[{:>6.1} s] {line}", self.started.elapsed().as_secs_f64());
-            alloc_trace::per_second(since, self.fps_frames);
-            // Total of the allocator (Vulkan): everything included (textures, buffers, targets).
-            if let Some(rep) = r.allocator_report() {
-                eprintln!(
-                    "GPU allocator: {:.1} MB allocated, {:.1} MB reserved",
-                    mo(rep.total_allocated_bytes),
-                    mo(rep.total_reserved_bytes)
-                );
-                if rc_data::env_flag!("RUSTCRAFT_VRAMDUMP") {
-                    let allocations: Vec<_> = rep.allocations.iter().map(|x| (x.size, x.name.as_str())).collect();
-                    let blocks: Vec<_> = rep.blocks.iter().map(|b| (b.size, b.allocations.clone())).collect();
-                    for line in vram_dump_lines(&allocations, &blocks) {
-                        eprintln!("{line}");
-                    }
+            if rc_data::env_flag!("RUSTCRAFT_VRAMDUMP") {
+                let allocations: Vec<_> = rep.allocations.iter().map(|x| (x.size, x.name.as_str())).collect();
+                let blocks: Vec<_> = rep.blocks.iter().map(|b| (b.size, b.allocations.clone())).collect();
+                for line in vram_dump_lines(&allocations, &blocks) {
+                    eprintln!("{line}");
                 }
             }
-            #[cfg(feature = "memstats")]
-            eprintln!(
-                "Rust heap: {:.1} MB (world {:.1} MB, render translucents {:.1} MB)",
-                memstats::LIVE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1_048_576.0,
-                self.world.grid.iter().map(rc_world::Column::heap_bytes).sum::<usize>() as f64 / 1_048_576.0,
-                r.trans_bytes() as f64 / 1_048_576.0
-            );
-            // Title like the official one ("<name> <version> - <mode>"), name Rustcraft (decided on
-            // 12/10/2026); the readings stay in the log above.
+        }
+        #[cfg(feature = "memstats")]
+        eprintln!(
+            "Rust heap: {:.1} MB (world {:.1} MB, render translucents {:.1} MB)",
+            memstats::LIVE.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1_048_576.0,
+            self.world.grid.iter().map(rc_world::Column::heap_bytes).sum::<usize>() as f64 / 1_048_576.0,
+            r.trans_bytes() as f64 / 1_048_576.0
+        );
+        // Title like the official one ("<name> <version>", plus " - <mode>" in a world), name
+        // Rustcraft (decided on 12/10/2026); the readings stay in the log above.
+        let title = if in_world {
             let mode = front::title_mode_key(self.solo.is_some(), self.menus.world.published.is_some());
             let mode = r.gui.lang.map.get(mode).map_or(mode, String::as_str);
-            r.window.set_title(&format!("Rustcraft {} - {mode}", front::VERSION_NAME));
-            self.fps_frames = 0;
-            self.fps_since = Instant::now();
-        }
+            format!("Rustcraft {} - {mode}", front::VERSION_NAME)
+        } else {
+            format!("Rustcraft {}", front::VERSION_NAME)
+        };
+        self.window_title.set(&r.window, &title);
+        self.fps_frames = 0;
+        self.fps_since = Instant::now();
     }
 
     /// Texture animation (blocks, item sprites, entity textures including the flames of

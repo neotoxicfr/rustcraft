@@ -62,6 +62,15 @@ fn before_propagation(g: &mut MapGrid, h: i32, t: &LightTables, sky: bool, c: &[
     rc_light::relight_sections_with(g, h, t, sky, c, &PROPAGATION_OFF)
 }
 
+/// The C2-M10 switches (zone read by rows, uniform rows filled, plane scan, column kept) set off.
+const ZONE_IO_OFF: [(&str, bool); 4] =
+    [("LIGHTREADROWS", false), ("LIGHTREADFILL", false), ("LIGHTSCANPLANES", false), ("LIGHTWRITECOLUMN", false)];
+
+/// Working path without the C2-M10 switches.
+fn before_zone_io(g: &mut MapGrid, h: i32, t: &LightTables, sky: bool, c: &[[i32; 3]]) -> Touched {
+    rc_light::relight_sections_with(g, h, t, sky, c, &ZONE_IO_OFF)
+}
+
 fn frozen(g: &mut MapGrid, h: i32, t: &LightTables, sky: bool, c: &[[i32; 3]]) -> Touched {
     rc_light::reference::relight_sections(g, h, t, sky, c)
 }
@@ -248,7 +257,8 @@ fn bench(c: &mut Criterion) {
         rc_light::stats::force_queue_counting(Some(false));
         let (allocs_c, bytes_c) = (IN_ALLOCS.load(Relaxed) - ia, IN_BYTES.load(Relaxed) - ib);
         print_queues(&format!("{} before C2-M02", tr.name), tr.events(), &rc_light::stats::queues().since(&queues_before));
-        for (g, touched, label) in [(&ga, &ta, "work"), (&gc, &tc, "before C2-M02")] {
+        let (gd, td, _) = replay(tr, &t, before_zone_io);
+        for (g, touched, label) in [(&ga, &ta, "work"), (&gc, &tc, "before C2-M02"), (&gd, &td, "before C2-M10")] {
             assert_eq!(touched.len(), tb.len());
             for (i, (a, b)) in touched.iter().zip(&tb).enumerate() {
                 assert_eq!(a, b, "{} ({label}): touched sections of relight {i}", tr.name);
@@ -259,7 +269,7 @@ fn bench(c: &mut Criterion) {
             }
         }
         check_known(&tr.name, tr.digest, digest(&ga, &ta), KNOWN);
-        drop((gc, tc));
+        drop((gc, tc, gd, td));
         let n = tr.events().max(1) as f64;
         eprintln!(
             "{}: {} relights, {} changes; work {:.3} ms/relight, reference {:.3} ms/relight",
@@ -299,9 +309,10 @@ fn bench(c: &mut Criterion) {
         // A gain is judged against the old working path (main), never against the frozen
         // copy: it has no counters nor `bounded` parameter and its machine code differs.
         // `inc` and `inc16`: incremental relight (C2-M14), `counted`: queue counters on (C2-M01),
-        // `before`: the C2-M02 switches off, same order mirrored.
+        // `before`: the C2-M02 switches off, `before_io`: the C2-M10 ones, same order mirrored.
         for (label, f) in [
             ("work_a", work as Relight),
+            ("before_io_a", before_zone_io),
             ("before_a", before_propagation),
             ("counted_a", counted),
             ("inc_a", inc),
@@ -312,6 +323,7 @@ fn bench(c: &mut Criterion) {
             ("inc_b", inc),
             ("counted_b", counted),
             ("before_b", before_propagation),
+            ("before_io_b", before_zone_io),
             ("work_b", work),
         ] {
             g.bench_function(format!("{}_{label}_1t", tr.name), |b| {

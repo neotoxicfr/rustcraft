@@ -82,7 +82,7 @@ impl Server {
         if matches!(self.bs.be_ticks.get(&p), Some((_, BeTick::Conduit(_)))) {
             return;
         }
-        let id = self.add_ticker(p);
+        let id = self.add_ticker(p, crate::blocks::ticks::TickerFamily::Shared);
         self.bs.be_ticks.insert(p, (id, BeTick::Conduit(ConduitTick::default())));
     }
 
@@ -238,7 +238,7 @@ mod tests {
     /// one of the three planes of the conduit and on the edge (radius 2) of its ring.
     #[test]
     fn frame_has_the_42_ring_places() {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = hashbrown::HashSet::new();
         for o in FRAME {
             assert!(seen.insert(o), "place {o:?} en double");
             assert!(o.iter().any(|v| v.abs() == 2), "{o:?} in the central cube");

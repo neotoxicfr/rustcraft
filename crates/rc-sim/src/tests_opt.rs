@@ -580,11 +580,14 @@ fn save_writes_protos(autosave: bool, no_wait: Option<bool>) {
             } else {
                 assert_eq!(after_save, seen, "default: the automatic save waited for the generator");
             }
-            let t = std::time::Instant::now();
-            while s.generator.as_ref().is_some_and(|g| g.seen == seen) && t.elapsed().as_secs() < 30 {
-                std::thread::sleep(std::time::Duration::from_millis(2));
-                s.poll_gen();
+            // The flush the save requested, not the first batch to come back: on a loaded machine
+            // (4-core CI runner) a batch of wanted chunks still in progress ends first.
+            if no_wait != Some(false) {
+                let done = crate::generation::TEST_ASYNC_FLUSH_DONE.with(|d| d.borrow_mut().take());
+                let done = done.expect("the automatic save requested a flush");
+                assert!(done.recv_timeout(std::time::Duration::from_secs(30)).is_ok(), "flush never ended");
             }
+            s.poll_gen();
             if let Some(w) = s.writer.take() {
                 w.finish();
             }

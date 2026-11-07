@@ -225,7 +225,14 @@ fn write_common(f: &mut Vec<(String, Nbt)>, p: Part) {
 /// UUID shown and saved for a ground item or an orb (not kept from the world: derived from its
 /// identifier).
 pub(crate) fn ground_uuid(id: i32) -> u128 {
-    0x5332_0000_0000_0000_0000_0000_0000_0000 | id as u32 as u128
+    GROUND_UUID_PREFIX | id as u32 as u128
+}
+
+const GROUND_UUID_PREFIX: u128 = 0x5332_0000_0000_0000_0000_0000_0000_0000;
+
+/// Identifier whose [`ground_uuid`] is `u`, if `u` has that form.
+pub(crate) fn ground_id_of_uuid(u: u128) -> Option<i32> {
+    (u & !u128::from(u32::MAX) == GROUND_UUID_PREFIX).then_some(u as u32 as i32)
 }
 
 impl ItemEnt {

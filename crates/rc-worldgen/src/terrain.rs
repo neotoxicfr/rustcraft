@@ -72,6 +72,8 @@ pub struct TerrainOpts {
     pub carver_replay: bool,
     /// Evaluation context kept by each thread from one chunk (or base column) to the next.
     pub keep_eval_context: bool,
+    /// Filling: blocks written without reading the old one, generation maps found per column.
+    pub fill_column_tracking: bool,
 }
 
 impl TerrainOpts {
@@ -86,6 +88,7 @@ impl TerrainOpts {
         carver_widths: false,
         carver_replay: false,
         keep_eval_context: false,
+        fill_column_tracking: false,
     };
     pub const NEW: TerrainOpts = TerrainOpts {
         ids: true,
@@ -98,6 +101,7 @@ impl TerrainOpts {
         carver_widths: true,
         carver_replay: true,
         keep_eval_context: true,
+        fill_column_tracking: true,
     };
 
     pub fn from_env() -> Self {
@@ -113,6 +117,7 @@ impl TerrainOpts {
             carver_widths: opt::carver_widths(),
             carver_replay: opt::carver_replay(),
             keep_eval_context: opt::keep_eval_context(),
+            fill_column_tracking: opt::fill_column_tracking(),
         }
     }
 }
@@ -177,6 +182,43 @@ impl TerrainIds {
             dirt: b.get("minecraft:dirt"),
             grass: b.get("minecraft:grass_block"),
             mycelium: b.get("minecraft:mycelium"),
+        }
+    }
+}
+
+/// What the filling needs to know of a placed block.
+#[derive(Debug, Clone, Copy)]
+struct FillFacts {
+    /// Counts in its section and in `WORLD_SURFACE_WG` (cave and void air do not).
+    not_air: bool,
+    /// Counts in `OCEAN_FLOOR_WG`.
+    blocks_motion: bool,
+    has_fluid: bool,
+}
+
+impl FillFacts {
+    #[inline]
+    fn of(b: &BlockTable, s: BlockId) -> Self {
+        FillFacts { not_air: !b.is_air(s), blocks_motion: b.blocks_motion(s), has_fluid: b.has_fluid(s) }
+    }
+}
+
+/// Highest block of a column that counts for each generation map, as the filling walks it down.
+#[derive(Debug, Default)]
+struct ColumnTops {
+    highest_not_air: Option<i32>,
+    highest_blocking_motion: Option<i32>,
+}
+
+impl ColumnTops {
+    /// Block at `y`, below every block recorded so far: only the first one that counts is kept.
+    #[inline]
+    fn record(&mut self, y: i32, facts: FillFacts) {
+        if facts.not_air {
+            self.highest_not_air.get_or_insert(y);
+        }
+        if facts.blocks_motion {
+            self.highest_blocking_motion.get_or_insert(y);
         }
     }
 }
@@ -505,7 +547,8 @@ impl TerrainGenerator {
         structures: Option<&dyn StructureDensity>,
         stop: Stage,
     ) -> ProtoTerrain {
-        let mut chunk = ProtoTerrain::new(cx, cz, self.world_min_y, self.world_height);
+        // A buffer is only handed back when the conversion reuses them (`DimGen::terrain`).
+        let mut chunk = ProtoTerrain::with_spare_blocks(cx, cz, self.world_min_y, self.world_height);
         let Some(vol) = self.fill_volume(cx, cz) else { return chunk };
         with_eval_context(self.opts.keep_eval_context, |ctx| {
             self.run_stages(&mut chunk, ctx, vol, cache, structures, stop);
@@ -801,9 +844,94 @@ impl TerrainGenerator {
         targets.par_iter().map(|&(cx, cz)| self.generate(cx, cz, &cache, None)).collect()
     }
 
+    /// `fill` sub-step: every cell of the fresh chunk `chunk` inside `vol` gets the block of its
+    /// density and of the aquifers, column by column, from the top down.
     fn fill(&self, chunk: &mut ProtoTerrain, aquifer: &mut Aquifer, ctx: &mut Ctx, density: &[f32], vol: &Volume) {
-        let b = &self.blocks;
+        if self.opts.fill_column_tracking {
+            self.fill_tracking_columns(chunk, aquifer, ctx, density, vol);
+        } else {
+            self.fill_block_by_block(chunk, aquifer, ctx, density, vol);
+        }
+    }
+
+    /// Block of the filling at (bx, by, bz) of density `d`, and whether its fluid is marked for
+    /// post-processing; `None` = the default block.
+    #[inline]
+    fn fill_block(
+        &self,
+        aquifer: &mut Aquifer,
+        ctx: &mut Ctx,
+        bx: i32,
+        by: i32,
+        bz: i32,
+        d: f32,
+    ) -> (Option<BlockId>, bool) {
         let o = self.opts;
+        if o.aq_pretest && d > 0.0 {
+            (None, false)
+        } else if o.aq_colwin {
+            aquifer.compute_column(&self.g, ctx, bx, by, bz, f64::from(d), o.aq_net)
+        } else {
+            aquifer.compute(&self.g, ctx, bx, by, bz, f64::from(d))
+        }
+    }
+
+    /// Filling that knows the chunk is fresh (`fill_column_tracking`): a cell is written once, so
+    /// the old block need not be read back nor its counts undone; and walking a column from the
+    /// top down, the first block that counts for a generation map is the map's height, so both
+    /// maps are written once at the end of the column instead of being updated per block.
+    fn fill_tracking_columns(
+        &self,
+        chunk: &mut ProtoTerrain,
+        aquifer: &mut Aquifer,
+        ctx: &mut Ctx,
+        density: &[f32],
+        vol: &Volume,
+    ) {
+        let b = &self.blocks;
+        // Most cells hold the default block: its facts are read once per chunk.
+        let default = (self.default_block, FillFacts::of(b, self.default_block));
+        // Counts kept apart from the chunk while its blocks are written (no aliasing to re-check).
+        let mut section_counts = std::mem::take(&mut chunk.section_counts);
+        for z in 0..vol.sz {
+            let bz = vol.bz(z);
+            for x in 0..vol.sx {
+                let bx = vol.bx(x);
+                let base = vol.index(x, 0, z);
+                let mut column = ColumnTops::default();
+                for y in (0..vol.sy).rev() {
+                    let by = vol.by(y);
+                    let (s, update) = self.fill_block(aquifer, ctx, bx, by, bz, density[base + y as usize]);
+                    let (s, facts) = s.map_or(default, |s| (s, FillFacts::of(b, s)));
+                    if s == AIR {
+                        continue;
+                    }
+                    chunk.set_fresh(x, by, z, s);
+                    if facts.not_air {
+                        section_counts[chunk.section_index(by)] += 1;
+                    }
+                    column.record(by, facts);
+                    if update && facts.has_fluid {
+                        chunk.mark_post_processing(x, by, z);
+                    }
+                }
+                chunk.set_generation_heights(x, z, column.highest_blocking_motion, column.highest_not_air);
+            }
+        }
+        chunk.section_counts = section_counts;
+    }
+
+    /// Filling through the general placement (old path): each block reads the old one back and
+    /// updates both generation maps.
+    fn fill_block_by_block(
+        &self,
+        chunk: &mut ProtoTerrain,
+        aquifer: &mut Aquifer,
+        ctx: &mut Ctx,
+        density: &[f32],
+        vol: &Volume,
+    ) {
+        let b = &self.blocks;
         for z in 0..vol.sz {
             let bz = vol.bz(z);
             for x in 0..vol.sx {
@@ -811,14 +939,7 @@ impl TerrainGenerator {
                 let base = vol.index(x, 0, z);
                 for y in (0..vol.sy).rev() {
                     let by = vol.by(y);
-                    let d = density[base + y as usize];
-                    let (s, update) = if o.aq_pretest && d > 0.0 {
-                        (None, false)
-                    } else if o.aq_colwin {
-                        aquifer.compute_column(&self.g, ctx, bx, by, bz, f64::from(d), o.aq_net)
-                    } else {
-                        aquifer.compute(&self.g, ctx, bx, by, bz, f64::from(d))
-                    };
+                    let (s, update) = self.fill_block(aquifer, ctx, bx, by, bz, density[base + y as usize]);
                     let s = s.unwrap_or(self.default_block);
                     if s != AIR {
                         chunk.set_raw(b, x, by, z, s);

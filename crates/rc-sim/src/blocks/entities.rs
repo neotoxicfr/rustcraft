@@ -361,6 +361,10 @@ fn face_slots(kind: Cont, size: usize, face: Option<Dir>) -> &'static [usize] {
 
 /// NBT key of single-slot containers (jukebox: disc, decorated pot: item); `Items`
 /// for the others.
+/// Most slots `stored_slots_match` reads in place (a double chest's two halves are read apart);
+/// a larger container is left to the decoding.
+const MOST_STORED_SLOTS: usize = 54;
+
 fn single_item_key(kind: Cont) -> Option<&'static str> {
     match kind {
         Cont::Jukebox => Some("RecordItem"),
@@ -1382,6 +1386,45 @@ impl Server {
         out
     }
 
+    /// For a container whose block entity exists, the number of slots `slots(p)` gives and whether
+    /// they decode to exactly the first ones of `menu`, read in place (nothing copied). The
+    /// answer is `None` when only the decoding can tell: live furnace or brewing stand,
+    /// single-item container, a patch the decoding would reduce, `menu` shorter than the container.
+    /// No block entity or no container: no slot, nothing to compare.
+    pub(crate) fn stored_slots_match(&self, p: P, menu: &[Option<crate::player::Stack>]) -> (usize, Option<bool>) {
+        let Some(be) = self.be_get(p) else { return (0, Some(true)) };
+        let s = self.get(p);
+        let Some(size) = self.container_size(s) else { return (0, Some(true)) };
+        if let Some(live) = self.live_items(p) {
+            return (live.len(), None);
+        }
+        if single_item_key(self.cont_kind(s)).is_some() || size > MOST_STORED_SLOTS {
+            return (size, None);
+        }
+        let Some(menu) = menu.get(..size) else { return (size, None) };
+        // The last entry of a slot wins, as in `slots`.
+        let mut by_slot: [Option<&Nbt>; MOST_STORED_SLOTS] = [None; MOST_STORED_SLOTS];
+        for it in crate::nbtio::list(be.get("Items")) {
+            let slot = crate::nbtio::int(it, "Slot").unwrap_or(-1);
+            if (0..size as i64).contains(&slot) {
+                by_slot[slot as usize] = Some(it);
+            }
+        }
+        let mut all_equal = Some(true);
+        for (raw, held) in by_slot.iter().zip(menu) {
+            let equal = match raw {
+                Some(it) => crate::player::Stack::decodes_to(it, held.as_ref()),
+                None => Some(held.is_none()),
+            };
+            match equal {
+                Some(false) => return (size, Some(false)),
+                None => all_equal = None,
+                Some(true) => {}
+            }
+        }
+        (size, all_equal)
+    }
+
     /// Contents written back to their source (placing an item then the "to save" mark): comparators notified.
     pub(crate) fn store_slots(&mut self, p: P, slots: &[Option<Nbt>]) {
         let s = self.get(p);
@@ -1831,7 +1874,7 @@ impl Server {
         match self.bs.shulkers.get_mut(&p) {
             Some(e) => e.1 = status,
             None => {
-                let id = self.add_ticker(p);
+                let id = self.add_ticker(p, super::ticks::TickerFamily::ShulkerLid);
                 self.bs.shulkers.insert(p, (id, status, if status == 3 { 1.0 } else { 0.0 }));
             }
         }
@@ -1888,7 +1931,7 @@ impl Server {
     /// Block entity created: the hoppers tick.
     pub(crate) fn after_block_entity_created(&mut self, p: P, s: u32) {
         if matches!(self.view().kind(s), Kind::Hopper | Kind::DaylightDetector) {
-            let id = self.add_ticker(p);
+            let id = self.add_ticker(p, super::ticks::TickerFamily::Hopper);
             self.bs.hoppers.insert(p, (id, 0, i64::MIN));
         }
         // Furnaces and brewing stands tick as soon as they are created (and not on first opening): their
@@ -2066,7 +2109,7 @@ impl Server {
     fn register_loaded_ticker(&mut self, p: P, be: LoadedBe) {
         match be {
             LoadedBe::Hopper(cd) => {
-                let id = self.add_ticker(p);
+                let id = self.add_ticker(p, super::ticks::TickerFamily::Hopper);
                 self.bs.hoppers.insert(p, (id, cd, i64::MIN));
             }
             LoadedBe::Hive => self.hive_register(p),              // F11

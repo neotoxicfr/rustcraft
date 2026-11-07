@@ -119,10 +119,8 @@ fn can_reach(s: &Server, m: &Mob, travel: [f64; 3]) -> bool {
         if s.is_air(p) {
             return true;
         }
-        let mut shapes = Vec::new();
-        s.phys.collision(s.st(p), &mut shapes);
         let shapes: Vec<rc_physics::Aabb> =
-            shapes.iter().map(|b| b.offset(f64::from(p[0]), f64::from(p[1]), f64::from(p[2]))).collect();
+            s.phys.shape(s.st(p)).iter().map(|b| b.offset(f64::from(p[0]), f64::from(p[1]), f64::from(p[2]))).collect();
         !collided_along(&bb, travel, &shapes)
     })
 }

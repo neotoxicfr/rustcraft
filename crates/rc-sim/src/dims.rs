@@ -36,6 +36,9 @@ pub(crate) struct World {
     pub dim: Dimension,
     pub chunks: HashMap<(i32, i32), Option<Box<Chunk>>>,
     pub entities: HashMap<(i32, i32), Vec<(i32, Nbt)>>,
+    /// Hints into `entities`, parked with them (one index for two dimensions' lists kept the
+    /// entries of both and rebuilt for each).
+    pub kept_index: crate::commands::kept_entity_index::KeptEntityIndex,
     pub bs: crate::blocks::level::Sim,
     pub generator: Option<crate::generation::Gen>,
     /// Mobs (only the list, the arrows, the chunks read and the world's random draw are used).
@@ -233,6 +236,7 @@ impl Server {
         swap(&mut self.chunks, &mut w.chunks);
         self.chunk_map_swaps += 1;
         swap(&mut self.entities, &mut w.entities);
+        swap(&mut self.kept_index, &mut w.kept_index);
         swap(&mut self.bs, &mut w.bs);
         swap(&mut self.generator, &mut w.generator);
         swap(&mut self.mobs.list, &mut w.mobs.list);
@@ -326,6 +330,7 @@ impl Server {
             generator: crate::generation::start_for(&self.data, &self.world, name, &self.regs),
             chunks: HashMap::new(),
             entities: HashMap::new(),
+            kept_index: Default::default(),
             bs: crate::blocks::level::Sim::new(&self.data),
             mobs: Box::default(),
             deco: Box::default(),

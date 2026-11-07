@@ -88,6 +88,7 @@ fn hash_bytes(h: &mut impl Hasher, layers: &[rc_world::LightLayer]) {
 /// Fingerprints (full chunks: NBT, final light and number of relights; proto-chunks never
 /// full: last version sent, final flush included, what remains on disk).
 /// `lazy`: lazy writing of proto-chunks (`RUSTCRAFT_OPT_PROTO_LAZY`).
+#[allow(clippy::disallowed_types, reason = "test fingerprint: the same fixed SipHash for every run it compares")]
 fn run(
     data: &Arc<VersionData>,
     template: &Path,
@@ -381,8 +382,8 @@ fn long_flight_memory() {
 /// Micro-bench (run by hand, `--ignored --nocapture`): where a batch's time goes at 1, 2, 4…
 /// threads up to the logical cores. Flight of 12 rows of 24 chunks (the server's batch size),
 /// default cap, fast writer, lazy protos. Per thread count: ms per chunk of each phase and the
-/// single-threaded share (Amdahl). The test build lights every chunk twice (scan check of
-/// `light_scanned`): "light and conversion" and "relight" read about double the release.
+/// single-threaded share (Amdahl). The test build lights every chunk twice (check of
+/// `light_batch`): "light and conversion" and "relight" read about double the release.
 #[test]
 #[ignore]
 fn bench_batch_phases_by_threads() {

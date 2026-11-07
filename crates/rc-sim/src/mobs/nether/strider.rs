@@ -138,19 +138,60 @@ impl rc_physics::World for LavaStand<'_> {
     }
 
     fn collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        // The state is read once and its lava source flag taken from the physics tables; the old
+        // path (`RUSTCRAFT_OPT_STAND_SHAPE_FLAGS=0`) read it three times and compared names.
+        if rc_data::opt_switch!("RUSTCRAFT_OPT_STAND_SHAPE_FLAGS") {
+            return self.collision_with_flags(self.w.state(x, y, z), [x, y, z], out);
+        }
         let over = self.w.collision(x, y, z, out);
-        if out.is_empty()
-            && self.bottom > f64::from(y) + 0.5 - f64::from(1.0e-5f32)
-            && lava_source(self.s, [x, y, z])
-            && self.s.mob_fluid([x, y + 1, z]) != Fluid::Lava
-        {
-            out.push(Aabb { min: [0.0; 3], max: [1.0, 0.5, 1.0] });
+        if out.is_empty() && self.feet_above_half(y) && lava_source(self.s, [x, y, z]) && self.no_lava_above([x, y, z]) {
+            out.push(HALF_SLAB);
         }
         over
     }
 
+    fn states_in(&self, first: [i32; 3], last: [i32; 3], out: &mut [u32]) -> bool {
+        self.w.states_in(first, last, out)
+    }
+
+    fn collision_of_state(&self, state: Option<u32>, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        if rc_data::opt_switch!("RUSTCRAFT_OPT_STAND_SHAPE_FLAGS") {
+            return self.collision_with_flags(state, [x, y, z], out);
+        }
+        self.collision(x, y, z, out)
+    }
+
     fn moving_collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
         self.w.moving_collision(x, y, z, out)
+    }
+
+    /// The half-slab over a lava source stays inside the cell.
+    fn shape_reach(&self, lo: [i32; 3], hi: [i32; 3]) -> Aabb {
+        self.w.shape_reach(lo, hi).union(&Aabb::UNIT)
+    }
+}
+
+/// The strider's own shape over a lava source.
+const HALF_SLAB: Aabb = Aabb { min: [0.0; 3], max: [1.0, 0.5, 1.0] };
+
+impl LavaStand<'_> {
+    /// Collision of `p` holding `state` (read once), lava source told by the physics tables.
+    fn collision_with_flags(&self, state: Option<u32>, p: [i32; 3], out: &mut Vec<Aabb>) -> bool {
+        let over = self.w.collision_of(state, p, out);
+        let source = state.is_some_and(|s| self.s.phys.is_lava_source(s));
+        if out.is_empty() && self.feet_above_half(p[1]) && source && self.no_lava_above(p) {
+            out.push(HALF_SLAB);
+        }
+        over
+    }
+
+    /// The strider's bottom is above the middle of row `y`.
+    fn feet_above_half(&self, y: i32) -> bool {
+        self.bottom > f64::from(y) + 0.5 - f64::from(1.0e-5f32)
+    }
+
+    fn no_lava_above(&self, p: [i32; 3]) -> bool {
+        self.s.mob_fluid([p[0], p[1] + 1, p[2]]) != Fluid::Lava
     }
 }
 

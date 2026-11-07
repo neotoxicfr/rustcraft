@@ -2068,11 +2068,12 @@ impl Gui {
     pub fn encode_items(
         &mut self,
         queue: &wgpu::Queue,
+        up: &mut crate::render::upload::Uploader,
         enc: &mut wgpu::CommandEncoder,
         timer: Option<&crate::gpu_time::GpuTimer>,
     ) {
         if let Some(a) = &mut self.items {
-            a.encode(&self.device, queue, enc, timer);
+            a.encode(&self.device, queue, up, enc, timer);
         }
     }
 

@@ -1,6 +1,6 @@
 //! Bit-for-bit equivalence of the optimised terrain paths (`TerrainOpts`, switches
 //! `RUSTCRAFT_OPT_TERRAIN_IDS`, `AQ_COLWIN`, `AQ_SIMD`, `AQ_PRETEST`, `BASEH_LAZY`, `BASEH_MEMO`,
-//! `CARVER_YD`, `CARVER_WIDTHS`, `CARVER_REPLAY`) against the old code: complete chunks
+//! `CARVER_YD`, `CARVER_WIDTHS`, `CARVER_REPLAY`, `FILL_COLUMN_TRACKING`) against the old code: complete chunks
 //! (blocks, height maps, fluid marks), aquifer block by block with drawn densities,
 //! base heights, cave masks. Missing game data makes the tests fail under
 //! `RUSTCRAFT_OPT_REQUIRE=1`.
@@ -50,6 +50,7 @@ fn variants() -> Vec<(&'static str, TerrainOpts)> {
         ("carver_yd", TerrainOpts { carver_yd: true, ..o }),
         ("carver_widths", TerrainOpts { carver_widths: true, ..o }),
         ("carver_replay", TerrainOpts { carver_replay: true, ..o }),
+        ("fill_column_tracking", TerrainOpts { fill_column_tracking: true, ..o }),
         ("all", TerrainOpts::NEW),
     ]
 }
@@ -254,7 +255,7 @@ fn base_height_paths_identical() {
         let differ = cols.chunks(2).zip(reference.chunks(2)).filter(|(_, h)| h[0] != h[1]).count();
         // Surface and floor differ only where there is water (main world).
         assert!(!dim.ends_with("overworld") || differ > 100, "{dim}: surface and floor too rarely distinct ({differ})");
-        let distinct: std::collections::HashSet<i32> = reference.iter().copied().collect();
+        let distinct: hashbrown::HashSet<i32> = reference.iter().copied().collect();
         // Nether: bedrock ceiling, always 128 (first block read); it only tests the stop.
         assert!(dim.ends_with("nether") || distinct.len() > 5, "{dim}: heights too uniform {distinct:?}");
     }

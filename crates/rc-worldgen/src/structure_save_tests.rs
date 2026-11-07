@@ -3,7 +3,7 @@
 //! Saving of the structure pieces and placed mobs (G6-F19). Game data required
 //! (jar 26.3 and rc-data cache); absent: tests skipped, except `RUSTCRAFT_OPT_REQUIRE=1`.
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 use rc_proto::nbt::Nbt;
 

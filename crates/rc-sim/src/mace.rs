@@ -156,9 +156,16 @@ impl Server {
         let mult = if fall > 5.0 { 2.0 } else { 1.0 };
         let power = |d: [f64; 3], res: f64| smash_power(d, res, mult);
         let near = |pos: [f64; 3]| crate::mobs::mth::dist2(t.pos, pos) <= 3.5 * 3.5;
-        let attacker_mob = match attacker {
-            Ent::Mob(id) => self.mob_ref(id).cloned(),
-            Ent::Player => None,
+        // The attacking mob is only read by the ally test below, before anything changes: borrowed
+        // (old path: copied first).
+        let borrow = crate::projectiles::paths::ProjectilePaths::current().hit_without_mob_clone;
+        let attacker_copy = match attacker {
+            Ent::Mob(id) if !borrow => self.mob_ref(id).cloned(),
+            _ => None,
+        };
+        let attacker_mob: Option<&Mob> = match attacker {
+            Ent::Mob(id) if borrow => self.mob_ref(id),
+            _ => attacker_copy.as_ref(),
         };
         // `same_team` with each entity, the attacker's team looked up once and the entities'
         // UUIDs never formatted (team found by UUID).
@@ -170,9 +177,7 @@ impl Server {
             .iter()
             .filter(|o| Ent::Mob(o.id) != attacker && Ent::Mob(o.id) != t.ent && o.touches(&area) && near(o.pos()))
             .filter(|o| !(o.tame && o.owner == Some(t.uuid) && crate::mobs::species::tamable(o.kind)))
-            .filter(|o| {
-                !ally(self, o.uuid) && !attacker_mob.as_ref().is_some_and(|a| crate::mobs::illagers::allied(self, a, o))
-            })
+            .filter(|o| !ally(self, o.uuid) && !attacker_mob.is_some_and(|a| crate::mobs::illagers::allied(self, a, o)))
             .map(|o| o.id)
             .collect();
         for id in ids {

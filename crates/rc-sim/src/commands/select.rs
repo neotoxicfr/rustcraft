@@ -362,7 +362,7 @@ fn wrap_degrees(v: f64) -> f64 {
     w
 }
 
-fn rot_test(r: &Range, v: f32) -> bool {
+pub(super) fn rot_test(r: &Range, v: f32) -> bool {
     let min = wrap_degrees(r.min.unwrap_or(0.0));
     let max = wrap_degrees(r.max.unwrap_or(359.0));
     let v = wrap_degrees(f64::from(v));
@@ -370,7 +370,7 @@ fn rot_test(r: &Range, v: f32) -> bool {
 }
 
 impl Server {
-    fn mode_name(&self) -> &'static str {
+    pub(super) fn mode_name(&self) -> &'static str {
         match self.game_mode {
             1 => "creative",
             2 => "adventure",
@@ -471,14 +471,37 @@ impl Server {
 
     /// `predicate=` option: the named predicate tested with the entity as `this` and its own
     /// position as origin. An unknown identifier fails even when inverted, like the game.
-    fn selector_predicate(&self, id: &str, inverted: bool, e: E) -> bool {
+    pub(super) fn selector_predicate(&self, id: &str, inverted: bool, e: E) -> bool {
         let Some(condition) = self.life.pack.get("predicate", id) else { return false };
         let ctx = Ctx { this: Some(Who::E(e)), origin: Some(self.e_pos(e)), ..Ctx::default() };
         self.p_condition(&condition, &ctx) != inverted
     }
 
-    /// Selected entities, in the game's order.
+    /// Selected entities, in the game's order (`RUSTCRAFT_OPT_SELECTOR_CANDIDATE_VIEW=0`: the
+    /// former search, [`Server::select_reference`]).
     pub fn select(&mut self, s: &Sel, src: &Src) -> Vec<E> {
+        if self.cmd.paths.selector_candidate_view {
+            self.select_resolved(s, src, false)
+        } else {
+            self.select_reference(s, src)
+        }
+    }
+
+    /// Does the selector find an entity? With the candidate view the search stops at the first
+    /// match (`RUSTCRAFT_OPT_EXECUTE_IF_ENTITY_FIRST_MATCH`), except for a random order whose
+    /// shuffle draws on the world's random once per match.
+    pub fn select_finds_any(&mut self, s: &Sel, src: &Src) -> bool {
+        let first_only = self.cmd.paths.execute_if_entity_first_match;
+        if self.cmd.paths.selector_candidate_view && first_only {
+            !self.select_resolved(s, src, true).is_empty()
+        } else {
+            !self.select(s, src).is_empty()
+        }
+    }
+
+    /// Old path (and test reference): every entity listed by identifier, each option looking it
+    /// up again.
+    pub(crate) fn select_reference(&mut self, s: &Sel, src: &Src) -> Vec<E> {
         if let Some(n) = &s.name {
             return if java_eq_ignore_case(n, &self.name) { vec![E::Player] } else { Vec::new() };
         }
@@ -492,17 +515,7 @@ impl Server {
                 _ => Vec::new(),
             };
         }
-        let candidates = if s.players_only {
-            if self.life.vit.dead && s.letter != Some('a') && s.letter != Some('p') && s.letter != Some('r') {
-                Vec::new()
-            } else {
-                vec![E::Player]
-            }
-        } else {
-            self.all_ents()
-        };
-        let mut found: Vec<E> =
-            candidates.into_iter().filter(|&e| self.sel_test(s, e, src) && self.sel_pos_ok(s, e, base)).collect();
+        let mut found = self.reference_matches(s, src, base);
         let dist = |me: &Server, e: E| {
             let p = me.e_pos(e);
             (p[0] - base[0]).powi(2) + (p[1] - base[1]).powi(2) + (p[2] - base[2]).powi(2)
@@ -521,6 +534,20 @@ impl Server {
         }
         found.truncate(s.limit);
         found
+    }
+
+    /// Old path: the entities that pass every option, before the sort.
+    pub(super) fn reference_matches(&self, s: &Sel, src: &Src, base: [f64; 3]) -> Vec<E> {
+        let candidates = if s.players_only {
+            if self.life.vit.dead && s.letter != Some('a') && s.letter != Some('p') && s.letter != Some('r') {
+                Vec::new()
+            } else {
+                vec![E::Player]
+            }
+        } else {
+            self.all_ents()
+        };
+        candidates.into_iter().filter(|&e| self.sel_test(s, e, src) && self.sel_pos_ok(s, e, base)).collect()
     }
 
     fn sel_pos_ok(&self, s: &Sel, e: E, base: [f64; 3]) -> bool {

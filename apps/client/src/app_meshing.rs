@@ -183,6 +183,18 @@ impl App {
         let (ex, ez) = ((self.eye[0] / 16.0).floor() as i32, (self.eye[2] / 16.0).floor() as i32);
         let (eye, sync_mode) = (self.eye, self.options.i("prioritizeChunkUpdates"));
         let visible_only = mesh_visible_only();
+        // Every dirty column was held last time and nothing they depend on changed since: they
+        // would all be held again, so the pick is skipped (it tests each one against the view).
+        let signature = self.renderer.as_ref().filter(|_| visible_only).map(|r| HeldSignature {
+            view: r.meshing_view_stamp(),
+            marks: self.world.counter,
+            dirty: self.world.dirty.len(),
+            in_flight: self.in_flight,
+            sync_mode,
+        });
+        if signature.is_some() && signature == self.all_held && skip_unchanged_held() {
+            return;
+        }
         let (meshes, renderer, video) = (&self.world.meshes, self.renderer.as_ref(), &self.video);
         // Like the game, a column already drawn is remeshed only for its dirty sections in view.
         let launchable = |(x, z): (i32, i32), marks: Sections| {
@@ -200,6 +212,7 @@ impl App {
             launchable,
             visible_only && mesh_hidden_in_spare_slots(),
         );
+        self.all_held = signature.filter(|_| picked.is_empty() && !self.world.dirty.is_empty());
         let release_early = release_job_early();
         for ((x, z), mask) in picked {
             let Some(center) = self.world.grid.get_arc(x, z) else { continue };
@@ -271,6 +284,27 @@ impl App {
 /// their mark until they come into view (`docs/specs/visibility.md` § 3).
 fn mesh_visible_only() -> bool {
     rc_data::opt_switch!("RUSTCRAFT_OPT_MESHVISIBLEONLY")
+}
+
+/// Inputs of the visibility filter's verdicts: the renderer's meshing view stamp, the marks (the
+/// world's touch counter and the dirty columns), the tasks in flight (a column in progress is not
+/// picked until its result arrives) and the priority option. Two equal signatures give the same
+/// held columns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeldSignature {
+    view: [u64; 4],
+    marks: u64,
+    dirty: usize,
+    in_flight: usize,
+    sync_mode: i32,
+}
+
+/// The pick is skipped while every dirty column stays held for the same reasons
+/// (`RUSTCRAFT_OPT_MESH_SKIP_UNCHANGED_HELD`, on by default; `=0`: every frame tests each held
+/// column against the view again). Bench of 07/11: on plains32 the columns held out of view took
+/// 0.11 ms per frame, 2,555 instead of 3,563 frames per second.
+fn skip_unchanged_held() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_MESH_SKIP_UNCHANGED_HELD")
 }
 
 /// Cautious variant of the filter (`RUSTCRAFT_OPT_MESH_HIDDEN_IN_SPARE_SLOTS=1`, off by default):

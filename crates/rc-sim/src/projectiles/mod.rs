@@ -13,17 +13,24 @@ pub(crate) mod dispense;
 pub(crate) mod ench;
 pub(crate) mod fishing;
 pub(crate) mod hits;
+pub(crate) mod paths;
 pub(crate) mod physics;
 mod progress;
 mod save;
 pub(crate) mod weapons;
 
 #[cfg(test)]
+mod bench_projectile_tick; // switches of `paths`: stuck arrows, target search, clips, hits, tick copy
+#[cfg(test)]
 mod impact_tests;
+#[cfg(test)]
+mod paths_equivalence_tests;
 #[cfg(test)]
 mod progress_tests;
 #[cfg(test)]
 mod tests;
+
+use paths::{ProjectilePaths, Sabotage};
 
 use rc_client::{EntityEvent, Event};
 use rc_proto_v777::entity::{AddEntity, Delta, Meta, Move, PositionPath, PositionSync};
@@ -664,6 +671,39 @@ impl Proj {
     pub fn sync_fire_flag(&mut self) {
         self.set_meta(0, Meta::Byte(i8::from(self.fire > 0)));
     }
+
+    /// Moves the fields that hold heap data out, leaving empty ones (no allocation either way).
+    fn take_heavy_fields(&mut self) -> HeavyFields {
+        let empty_stack = Stack { id: String::new(), count: 0, components: None };
+        HeavyFields {
+            item: std::mem::replace(&mut self.item, empty_stack),
+            weapon: self.weapon.take(),
+            meta: std::mem::take(&mut self.meta),
+            bullet: self.bullet.take(),
+            pierced: std::mem::take(&mut self.pierced),
+            pierce_killed: self.pierce_killed.take(),
+        }
+    }
+
+    fn put_heavy_fields(&mut self, h: HeavyFields) {
+        self.item = h.item;
+        self.weapon = h.weapon;
+        self.meta = h.meta;
+        self.bullet = h.bullet;
+        self.pierced = h.pierced;
+        self.pierce_killed = h.pierce_killed;
+    }
+}
+
+/// The fields of a projectile that hold heap data: stacks, entity data, pierced lists, bullet
+/// state. Without them, a copy of the projectile allocates nothing.
+struct HeavyFields {
+    item: Stack,
+    weapon: Option<Stack>,
+    meta: Vec<(u8, Meta, bool)>,
+    bullet: Option<Box<crate::mobs::end::bullet::BulletState>>,
+    pierced: Vec<i32>,
+    pierce_killed: Option<Vec<Ent>>,
 }
 
 impl Server {
@@ -679,10 +719,14 @@ impl Server {
         if u == self.uuid {
             return Some(Ent::Player);
         }
-        self.mobs
-            .list
-            .iter()
-            .find(|m| m.uuid == u && !m.removed)
+        let living = |m: &crate::mobs::mob::Mob| !m.removed;
+        let in_list = if ProjectilePaths::current().owner_index {
+            // Same first mob as the walk, found from the UUID index (a miss still walks the list).
+            self.mobs.find_uuid_where(u, living)
+        } else {
+            self.mobs.list.iter().find(|m| m.uuid == u && living(m))
+        };
+        in_list
             .map(|m| Ent::Mob(m.id))
             // Shooter taken out of the list during its own tick.
             .or_else(|| self.mobs.ticking.iter().rev().find(|t| t.0 == u).map(|t| Ent::Mob(t.1)))
@@ -992,15 +1036,22 @@ impl Server {
         if meet != crate::walk::Meet::Tick {
             return;
         }
-        let mut p = self.proj.list[i].clone();
+        let paths = ProjectilePaths::current();
+        let mut p = self.take_for_tick(i, paths);
         let id = p.id;
         p.tick_count += 1;
         p.old_pos = p.pos;
         let before = ((p.pos[0].floor() as i32) >> 4, (p.pos[2].floor() as i32) >> 4);
         self.proj_tick(&mut p);
         trace(&p);
-        // List replaced during the tick (dimension change): left as it is.
-        let Some(slot) = self.proj.list.get(i).filter(|s| s.id == id) else { return };
+        // List replaced during the tick (dimension change): the slot, parked with its world, still
+        // gets the result of the tick, as the game's projectile keeps it.
+        let Some(slot) = self.proj.list.get(i).filter(|s| s.id == id) else {
+            if paths.sabotage != Sabotage::SlotNotWrittenBackAfterListChange {
+                self.write_back_after_list_change(p);
+            }
+            return;
+        };
         // Destroyed by another during its own tick (explosion it caused).
         p.removed |= slot.removed;
         // L9-TICK: a pearl still alive after its tick renews its ticket.
@@ -1008,6 +1059,34 @@ impl Server {
             self.pearl_ticket_tick(&mut p, before);
         }
         self.proj.list[i] = p;
+    }
+
+    /// The projectile of slot `i`, out of its slot for its tick. With its heavy fields taken, the
+    /// slot keeps a light copy (no stack, no data) that the others read during the tick
+    /// (identifier, position, kind, removed flag), as they read the full copy before.
+    fn take_for_tick(&mut self, i: usize, paths: ProjectilePaths) -> Proj {
+        let slot = &mut self.proj.list[i];
+        if !paths.take_heavy_fields {
+            return slot.clone();
+        }
+        let heavy = slot.take_heavy_fields();
+        // The slot holds no heap data any more: this copy allocates nothing.
+        let mut p = slot.clone();
+        p.put_heavy_fields(heavy);
+        p
+    }
+
+    /// After a dimension change during its tick, the slot of `p` (parked with its world, or still
+    /// in the active list) gets the whole result of the tick, as on an ordinary tick. Two fields
+    /// stay the slot's: its tracking, which the dimension change cleared (otherwise the arrow
+    /// would never be paired again), and a removal made by another during the tick.
+    fn write_back_after_list_change(&mut self, mut p: Proj) {
+        let parked = self.dims.parked.iter_mut().flat_map(|w| w.proj.list.iter_mut());
+        if let Some(slot) = self.proj.list.iter_mut().chain(parked).find(|s| s.id == p.id) {
+            std::mem::swap(&mut p.track, &mut slot.track);
+            p.removed |= slot.removed;
+            *slot = p;
+        }
     }
 
     /// Removed projectiles: taken off the list, forgotten by the client that saw them.

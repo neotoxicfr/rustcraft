@@ -822,6 +822,7 @@ impl Server {
                 let Some(Some(c)) = self.chunks.get_mut(&(cx, cz)) else { continue };
                 let before = changed;
                 for (si, sec) in c.sections.iter_mut().enumerate() {
+                    let section_before = changed;
                     for i in 0..64 {
                         let (qx, qz, qy) = (i & 3, (i >> 2) & 3, i >> 4);
                         let bx = cx * 16 + (qx as i32) * 4;
@@ -840,12 +841,14 @@ impl Server {
                         sec.biomes.set(i, bid as u32, 1, 3, direct);
                         changed += 1;
                     }
+                    // Only the biomes of the sections they moved in are re-encoded at the save (the
+                    // blocks and height maps stay as read; before, every section was marked).
+                    if changed != section_before {
+                        c.biomes_changed[si] = true;
+                    }
                 }
                 if changed != before {
                     c.dirty = true;
-                    for x in c.changed.iter_mut() {
-                        *x = true;
-                    }
                     touched.push((cx, cz));
                 }
             }

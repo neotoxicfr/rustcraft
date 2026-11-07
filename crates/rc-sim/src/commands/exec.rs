@@ -252,8 +252,10 @@ impl Server {
                 self.cmd.flow.quota -= 1;
             }
             let mut next = Vec::new();
+            // Split once for every source (the former loop split the path again per source).
+            let words: Vec<&str> = path.strip_prefix("execute ").unwrap_or(path).split(' ').collect();
             for s in sources.iter() {
-                match self.modifier(s, p, seg, path) {
+                match self.modifier(s, p, seg, &words) {
                     Ok(v) => {
                         if self.cmd.flow.active && (next.len() + v.len()) as i64 >= self.cmd.flow.fork_limit {
                             let limit = self.cmd.flow.fork_limit;
@@ -396,17 +398,13 @@ impl Server {
         self.flush_scores();
     }
 
-    /// Subcommand (redirection): following sources.
-    fn modifier(&mut self, s: &Src, p: &Parsed, seg: &Seg, path: &str) -> Result<Vec<Src>, Fail> {
+    /// Subcommand (redirection): following sources. `words`: the segment's path without its
+    /// `execute` root, split on spaces (aliases and `execute run` never come here: `run_parsed`
+    /// skips them).
+    fn modifier(&mut self, s: &Src, p: &Parsed, seg: &Seg, words: &[&str]) -> Result<Vec<Src>, Fail> {
         let a = |n: &str| p.arg(seg, n).unwrap_or_default();
         let one = |x: Src| Ok(vec![x]);
-        // Alias (`tp`, `xp`, `tell`, `w`, `tm`) and `execute run`: source unchanged.
-        if matches!(path, "tp" | "xp" | "tell" | "w" | "tm" | "execute run") {
-            return one(s.clone());
-        }
-        let p_ = path.strip_prefix("execute ").unwrap_or(path);
-        let w: Vec<&str> = p_.split(' ').collect();
-        match w.as_slice() {
+        match words {
             ["as", _] => {
                 let ents = self.arg_entities_opt(s, &a("targets"));
                 Ok(ents.into_iter().map(|e| self.with_entity(s, e)).collect())
@@ -579,7 +577,7 @@ impl Server {
             }
             [cond @ ("if" | "unless"), rest @ ..] => {
                 let expected = *cond == "if";
-                let n = self.condition(s, p, seg, rest)?;
+                let n = self.condition(s, p, seg, rest, false)?;
                 Ok(if (n > 0) == expected { vec![s.clone()] } else { Vec::new() })
             }
             _ => Err(Fail(tr!("command.unknown.command"))),
@@ -671,10 +669,12 @@ impl Server {
         self.surface_y(x, z, kind)
     }
 
-    /// Condition of `execute if|unless`: number of matches (0 = false).
-    fn condition(&mut self, s: &Src, p: &Parsed, seg: &Seg, rest: &[&str]) -> Result<i32, Fail> {
+    /// Condition of `execute if|unless`: number of matches (0 = false). `counted`: the terminal
+    /// form, whose message gives the count; before another step only "none or some" matters.
+    fn condition(&mut self, s: &Src, p: &Parsed, seg: &Seg, rest: &[&str], counted: bool) -> Result<i32, Fail> {
         let a = |n: &str| p.arg(seg, n).unwrap_or_default();
         Ok(match rest {
+            ["entity", _] if !counted => i32::from(self.arg_entities_any(s, &a("entities"))),
             ["block", _, _] => {
                 let pos = self.loaded_pos(s, &a("pos"))?;
                 i32::from(self.block_matches(&a("block"), pos))
@@ -830,7 +830,7 @@ impl Server {
                 let w: Vec<&str> = path.split(' ').skip(1).collect();
                 let expected = w.first() == Some(&"if");
                 let numeric = matches!(w.get(1), Some(&"entity" | &"data" | &"items" | &"slots" | &"blocks"));
-                let n = self.condition(s, p, seg, &w[1..])?;
+                let n = self.condition(s, p, seg, &w[1..], true)?;
                 if numeric {
                     if expected {
                         if n > 0 {

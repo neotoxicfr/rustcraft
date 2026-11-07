@@ -411,7 +411,7 @@ impl Server {
         if self.lan.is_none() {
             return Err(Fail(tr!("commands.kick.singleplayer.failed")));
         }
-        let uuids: std::collections::HashMap<usize, u128> =
+        let uuids: hashbrown::HashMap<usize, u128> =
             self.lan.as_ref().map(|l| l.guests.iter().enumerate().map(|(k, g)| (k, g.uuid)).collect()).unwrap_or_default();
         let mut n = 0;
         for who in targets {

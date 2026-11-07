@@ -43,6 +43,10 @@ impl Menu {
 
     /// Active offer from the payments (A then B, otherwise B then A).
     pub fn update_sell_item(&mut self, env: &dyn Env) {
+        if super::MenuSwitches::current().fewer_allocations {
+            self.update_sell_item_in_place(env);
+            return;
+        }
         let Some(t) = self.merchant.as_mut() else { return };
         t.active = None;
         let (p0, p1) = (self.own[0].clone(), self.own[1].clone());
@@ -76,10 +80,57 @@ impl Menu {
         self.own_dirty = true;
     }
 
+    /// `update_sell_item` reading the payments where they lie: only the chosen result is copied.
+    fn update_sell_item_in_place(&mut self, env: &dyn Env) {
+        let Some(t) = self.merchant.as_mut() else { return };
+        t.active = None;
+        let (a, b) = match (self.own[0].as_ref(), self.own[1].as_ref()) {
+            (None, p1) => (p1, None),
+            (p0, p1) => (p0, p1),
+        };
+        if a.is_none() {
+            self.own[2] = None;
+            t.future_xp = 0;
+            self.own_dirty = true;
+            return;
+        }
+        let mut result = None;
+        if !t.offers.is_empty() {
+            let items = env.items();
+            let mut off = recipe_for(items, &t.offers, a, b, t.hint);
+            if off.is_none_or(|i| t.offers[i].out_of_stock()) {
+                t.active = off;
+                off = recipe_for(items, &t.offers, b, a, t.hint);
+            }
+            match off.filter(|&i| !t.offers[i].out_of_stock()) {
+                Some(i) => {
+                    t.active = Some(i);
+                    result = Some(Some(t.offers[i].result.clone()));
+                    t.future_xp = t.offers[i].xp;
+                }
+                None => {
+                    result = Some(None);
+                    t.future_xp = 0;
+                }
+            }
+        }
+        // Written once the payments are no longer read (`a` and `b` borrow the menu's slots).
+        if let Some(r) = result {
+            self.own[2] = r;
+        }
+        t.updated.push(self.own[2].is_some());
+        self.own_dirty = true;
+    }
+
     /// The removal condition of a trade result.
     pub(super) fn merchant_may_pickup(&self, env: &dyn Env) -> bool {
         let Some(t) = &self.merchant else { return false };
         let Some(i) = t.active else { return false };
+        if super::MenuSwitches::current().fewer_allocations {
+            let (a, b) = (self.own.first().and_then(Option::as_ref), self.own.get(1).and_then(Option::as_ref));
+            let o = &t.offers[i];
+            return o.satisfied_by(env.items(), a, b) || o.satisfied_by(env.items(), b, a);
+        }
         let (a, b) = self.payments();
         let o = &t.offers[i];
         o.satisfied_by(env.items(), a.as_ref(), b.as_ref()) || o.satisfied_by(env.items(), b.as_ref(), a.as_ref())
@@ -91,8 +142,14 @@ impl Menu {
         let Some(i) = t.active else { return };
         let (mut a, mut b) = (self.own[0].take(), self.own[1].take());
         let items = env.items();
-        let o = t.offers[i].clone();
-        if o.take(items, &mut a, &mut b) || o.take(items, &mut b, &mut a) {
+        let taken = if super::MenuSwitches::current().fewer_allocations {
+            let o = &t.offers[i];
+            o.take(items, &mut a, &mut b) || o.take(items, &mut b, &mut a)
+        } else {
+            let o = t.offers[i].clone();
+            o.take(items, &mut a, &mut b) || o.take(items, &mut b, &mut a)
+        };
+        if taken {
             t.offers[i].uses += 1;
             t.traded.push(i);
         }

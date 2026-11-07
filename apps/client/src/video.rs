@@ -457,10 +457,9 @@ impl crate::App {
         (limit > 0 && limit < UNLIMITED).then_some(limit as u32)
     }
 
-    /// Video and sound settings with immediate effect (called by `apply_options`).
-    pub(crate) fn apply_video_options(&mut self) {
+    /// Meshing settings from the options: a change remeshes all the columns, like the game.
+    pub(crate) fn refresh_mesh_options(&mut self) {
         let o = &self.options;
-        // Meshing: a change remeshes all the columns, like the game.
         let (offset_faces, water_double) = crate::remesh::formats();
         let mesh = rc_mesh::wire::MeshOptions {
             blend: o.i("biomeBlendRadius").clamp(0, 7),
@@ -476,6 +475,12 @@ impl crate::App {
                 self.world.touch(x, z);
             }
         }
+    }
+
+    /// Video and sound settings with immediate effect (called by `apply_options`).
+    pub(crate) fn apply_video_options(&mut self) {
+        self.refresh_mesh_options();
+        let o = &self.options;
         // Sound: music frequency, device (engine redone, like the game's reload).
         let first = !self.video.applied;
         self.video.applied = true;

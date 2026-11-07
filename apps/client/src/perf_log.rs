@@ -3,13 +3,15 @@
 //! and every second on the error output a `[perf]` line: frame distribution
 //! (median, 99th percentile, maximum), columns meshed, lighting (`rc_light::stats`, client and
 //! integrated server), process memory, last instant when meshing was working, and once
-//! the instant of entering the game; then generic `counter <name> <value>` lines (column
+//! the loading landmarks (world entered, first chunk received, in game, meshing caught up,
+//! initial load meshed); then generic `counter <name> <value>` lines (column
 //! `c:<name>` of `tools/bench/scenes.py`): GPU writes and draw-list stations per frame, visibility
 //! verdicts, relights of the client and of the integrated server, light changes by origin,
 //! propagation queues, mesh jobs by kind, base misses by cause, mesh cache shares and stages, ages
 //! of the bases served, in-place uploads, column copies by writer, and the generic counters any
 //! module adds by name ([`counter`], [`counter_per_second`], [`stage_time`], [`StageTimer`]) without
-//! touching this file. Without the variable: one boolean read per frame.
+//! touching this file. Frames outside a world (title screen, menus, loading screen) are logged
+//! too, without the world landmarks. Without the variable: one boolean read per frame.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -424,13 +426,25 @@ struct State {
     /// Last instant (s since startup) when a meshing was in progress or to do.
     busy_at: f64,
     in_game: bool,
-    /// Columns loaded and instant of their last change (s).
-    cols: (usize, f64),
-    settled: bool,
-    /// Columns meshed at least once (until the initial load).
-    seen: hashbrown::HashSet<(i32, i32)>,
+    /// The previous frame was drawn in a world (false on the title screen and the menus).
+    in_world: bool,
+    load: InitialLoad,
     /// Last `[perf] ram` line (every 5 s).
     ram_at: Instant,
+}
+
+impl State {
+    /// Counter baselines taken now: the per-second lines that follow count from here.
+    fn restart_counters(&mut self, now: Instant) {
+        self.last = None;
+        self.frames.clear();
+        self.since = now;
+        self.work = work_now();
+        self.light = rc_light::stats::totals();
+        self.queues = rc_light::stats::queues();
+        self.copies = rc_world::column_copies();
+        self.ram_at = now;
+    }
 }
 
 fn state() -> Option<&'static Mutex<State>> {
@@ -450,9 +464,8 @@ fn state() -> Option<&'static Mutex<State>> {
             copies: rc_world::column_copies(),
             busy_at: 0.0,
             in_game: false,
-            cols: (0, 0.0),
-            settled: false,
-            seen: hashbrown::HashSet::new(),
+            in_world: false,
+            load: InitialLoad::default(),
             ram_at: Instant::now(),
         }))
     })
@@ -464,45 +477,53 @@ pub fn meshed(x: i32, z: i32) {
     MESHED.fetch_add(1, Relaxed);
     if let Some(m) = state()
         && let Ok(mut s) = m.lock()
-        && !s.settled
     {
-        s.seen.insert((x, z));
+        s.load.column_meshed(x, z);
     }
 }
 
-/// End of a drawn frame. `busy`: meshes in progress or columns to mesh; `in_game`:
-/// player placed and no screen outside the world; `cols`: columns loaded.
-pub fn frame(started: Instant, busy: bool, in_game: bool, cols: usize) {
+/// A chunk received from the server: the first one of the process is a loading landmark.
+pub fn chunk_received(started: Instant) {
+    static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    // A plain load first: the swap (a write shared by every core) happens once.
+    if on() && !SEEN.load(Relaxed) && !SEEN.swap(true, Relaxed) {
+        eprintln!("[perf] first chunk received at {:.0} ms", started.elapsed().as_secs_f64() * 1e3);
+    }
+}
+
+/// What a frame drawn in a world tells the perf log.
+pub struct WorldFrame {
+    /// Meshes in progress or columns to mesh.
+    pub busy: bool,
+    /// Player placed and no screen outside the world.
+    pub in_game: bool,
+    /// Columns to mesh (loaded, minus those waiting for a neighbour).
+    pub columns: usize,
+}
+
+/// End of a drawn frame: `world` is `None` on the title screen and the menus (frame interval and
+/// per-second lines only).
+pub fn frame(started: Instant, world: Option<WorldFrame>) {
     let Some(m) = state() else { return };
     let Ok(mut s) = m.lock() else { return };
     let now = Instant::now();
     let t = now.duration_since(started).as_secs_f64();
+    let entering_world = world.is_some() && !s.in_world;
+    s.in_world = world.is_some();
+    if entering_world {
+        // Same baselines as when the log only started in a world: the work done while the
+        // loading screen was up (world preparation, spawn light) stays out of the world's lines.
+        s.restart_counters(now);
+        eprintln!("[perf] world entered at {:.0} ms", t * 1e3);
+    }
     if let Some(last) = s.last.replace(now) {
         let ms = now.duration_since(last).as_secs_f64() * 1e3;
         s.frames.push(ms as f32);
         let _ = writeln!(s.out, "{:.3} {ms:.4}", t * 1e3);
     }
-    if busy {
-        s.busy_at = t;
-    }
-    if cols != s.cols.0 {
-        s.cols = (cols, t);
-    }
-    if in_game && !s.in_game {
-        s.in_game = true;
-        eprintln!("[perf] in game at {:.0} ms ({cols} columns)", t * 1e3);
-    }
-    // Initial load: first frame where every loaded column has been meshed at least once
-    // and the number of columns has been stable for half a second (remeshes happen
-    // afterwards as blocks change: meshing is never at rest for long).
-    if s.in_game && !s.settled && cols > 0 && s.seen.len() >= cols && t - s.cols.1 >= 0.5 {
-        s.settled = true;
-        s.seen = hashbrown::HashSet::new();
-        eprintln!(
-            "[perf] initial load meshed at {:.0} ms ({cols} columns; column count stable since {:.0} ms)",
-            t * 1e3,
-            s.cols.1 * 1e3
-        );
+    let cols = world.as_ref().map_or(0, |w| w.columns);
+    if let Some(w) = &world {
+        world_landmarks(&mut s, t, w);
     }
     let window = now.duration_since(s.since).as_secs_f64();
     if window < 1.0 {
@@ -608,6 +629,163 @@ pub fn frame(started: Instant, busy: bool, in_game: bool, cols: usize) {
     s.meshed = meshed;
     s.light = l;
     s.since = now;
+}
+
+/// Once-per-process landmarks of a frame in a world: entry into the game, end of the initial load.
+fn world_landmarks(s: &mut State, t: f64, w: &WorldFrame) {
+    if w.busy {
+        s.busy_at = t;
+    }
+    if w.in_game && !s.in_game {
+        s.in_game = true;
+        eprintln!("[perf] in game at {:.0} ms ({} columns)", t * 1e3, w.columns);
+    }
+    if let Some(done) = s.load.frame(t, s.in_game, w.columns) {
+        eprintln!("[perf] meshing caught up at {:.0} ms", done.caught_up_at * 1e3);
+        eprintln!(
+            "[perf] initial load meshed at {:.0} ms ({} columns; column count stable since {:.0} ms)",
+            done.meshed_at * 1e3,
+            done.columns,
+            done.stable_since * 1e3
+        );
+    }
+}
+
+/// Initial load of a world, as the bench reads it: done at the first frame in the game where every
+/// column to mesh has been meshed at least once and their number has been stable for half a
+/// second (remeshes happen afterwards as blocks change: meshing is never at rest for long).
+#[derive(Default)]
+struct InitialLoad {
+    /// Columns to mesh and the instant (s) of their last change.
+    columns: (usize, f64),
+    /// Columns meshed at least once (until the load is done).
+    seen: hashbrown::HashSet<(i32, i32)>,
+    /// Instant (s) the meshing last caught up with the columns to mesh, while it still holds.
+    caught_up_since: Option<f64>,
+    done: bool,
+}
+
+/// Instants (s since startup) of a finished initial load.
+#[derive(Debug, PartialEq)]
+struct LoadLandmarks {
+    meshed_at: f64,
+    /// Last time every column to mesh became meshed at least once: the meshing's own end,
+    /// without the half second of stable column count the load waits for.
+    caught_up_at: f64,
+    stable_since: f64,
+    columns: usize,
+}
+
+impl InitialLoad {
+    fn column_meshed(&mut self, x: i32, z: i32) {
+        if !self.done {
+            self.seen.insert((x, z));
+        }
+    }
+
+    /// Frame at `t` (s); `Some` once, at the end of the load.
+    fn frame(&mut self, t: f64, in_game: bool, columns: usize) -> Option<LoadLandmarks> {
+        if columns != self.columns.0 {
+            self.columns = (columns, t);
+        }
+        if !in_game || self.done {
+            return None;
+        }
+        let caught_up = columns > 0 && self.seen.len() >= columns;
+        self.caught_up_since = if caught_up { self.caught_up_since.or(Some(t)) } else { None };
+        let caught_up_at = self.caught_up_since?;
+        if t - self.columns.1 < 0.5 {
+            return None;
+        }
+        self.done = true;
+        self.seen = hashbrown::HashSet::new();
+        Some(LoadLandmarks { meshed_at: t, caught_up_at, stable_since: self.columns.1, columns })
+    }
+}
+
+/// Readings of the per-second statistics line, written in a world and outside (title screen,
+/// menus). Its text is parsed by `tools/bench/scenes.py` (`STAT`) and `tools/bench/ab.py`.
+pub struct SecondStats {
+    pub fps: f64,
+    pub cpu_ms: f64,
+    pub gpu_ms: Option<f64>,
+    pub columns_loaded: usize,
+    pub columns_on_gpu: usize,
+    pub faces_on_gpu: u64,
+    pub columns_drawn: usize,
+    pub faces_drawn: u64,
+    pub meshes_in_progress: usize,
+    pub sort_ms: f64,
+    pub walk_ms: f64,
+    /// Terrain regions allocated and used, textures, other (bytes).
+    pub vram: (u64, u64, u64, u64),
+    pub translucent_columns: usize,
+    pub translucent_unsorted: usize,
+    pub entities_drawn: usize,
+    pub block_entities: usize,
+    pub block_entities_drawn: usize,
+}
+
+impl SecondStats {
+    /// Reads the renderer (its CPU time sum restarts at zero) and the counts of the world.
+    pub fn read(
+        r: &mut crate::render::Renderer,
+        fps: f64,
+        columns_loaded: usize,
+        meshes_in_progress: usize,
+        block_entities: usize,
+    ) -> SecondStats {
+        let (columns_on_gpu, faces_on_gpu) = r.stats();
+        let (translucent_columns, translucent_unsorted) = r.trans_stats();
+        SecondStats {
+            fps,
+            cpu_ms: r.cpu_ms(),
+            gpu_ms: r.gpu_ms(),
+            columns_loaded,
+            columns_on_gpu,
+            faces_on_gpu,
+            columns_drawn: r.drawn.0,
+            faces_drawn: r.drawn.1,
+            meshes_in_progress,
+            sort_ms: r.vis_ms,
+            walk_ms: r.graph_ms,
+            vram: r.vram(),
+            translucent_columns,
+            translucent_unsorted,
+            entities_drawn: r.entities.as_ref().map_or(0, |e| e.drawn),
+            block_entities,
+            block_entities_drawn: r.entities.as_ref().map_or(0, |e| e.blocks.drawn),
+        }
+    }
+
+    pub fn line(&self) -> String {
+        let mb = |b: u64| b as f64 / 1_048_576.0;
+        let (regions, used, textures, other) = self.vram;
+        let gpu = self.gpu_ms.map_or_else(|| "?".into(), |ms| format!("{ms:.3}"));
+        format!(
+            "{:.0} fps, CPU {:.3} ms/frame, GPU {gpu} ms/frame, {} columns loaded, {} on GPU ({:.2} M faces), {} drawn ({:.2} M faces), {} meshes in progress, sort {:.3} ms (walk {:.3} ms), VRAM {:.1} MB (regions {:.1} of which {:.1} used, textures {:.1}, other {:.1}), translucent {} columns of which {} unsorted, {} entities drawn, block entities {} of which {} drawn",
+            self.fps,
+            self.cpu_ms,
+            self.columns_loaded,
+            self.columns_on_gpu,
+            self.faces_on_gpu as f64 / 1e6,
+            self.columns_drawn,
+            self.faces_drawn as f64 / 1e6,
+            self.meshes_in_progress,
+            self.sort_ms,
+            self.walk_ms,
+            mb(regions + textures + other),
+            mb(regions),
+            mb(used),
+            mb(textures),
+            mb(other),
+            self.translucent_columns,
+            self.translucent_unsorted,
+            self.entities_drawn,
+            self.block_entities,
+            self.block_entities_drawn
+        )
+    }
 }
 
 /// Generic line `[perf] [t s] counter <name> <value>`, read by `tools/bench/scenes.py` (column
@@ -744,6 +922,101 @@ mod tests {
         let lap_ns = started.elapsed().as_nanos() as f64 / f64::from(CALLS);
         drain_generic(1, 1.0);
         eprintln!("generic counter: {add_ns:.1} ns per add, {lap_ns:.1} ns per stage lap (40 counters, last one)");
+    }
+
+    fn sample_stats(gpu_ms: Option<f64>) -> SecondStats {
+        const MB: u64 = 1_048_576;
+        SecondStats {
+            fps: 143.6,
+            cpu_ms: 0.41234,
+            gpu_ms,
+            columns_loaded: 625,
+            columns_on_gpu: 600,
+            faces_on_gpu: 1_234_567,
+            columns_drawn: 300,
+            faces_drawn: 456_789,
+            meshes_in_progress: 3,
+            sort_ms: 0.0123,
+            walk_ms: 0.5,
+            vram: (10 * MB, 5 * MB, 20 * MB, MB),
+            translucent_columns: 12,
+            translucent_unsorted: 4,
+            entities_drawn: 7,
+            block_entities: 9,
+            block_entities_drawn: 2,
+        }
+    }
+
+    /// The shared statistics line keeps, character for character, the text the in-world frame
+    /// wrote before it was shared with the menus (`tools/bench/scenes.py` parses it).
+    #[test]
+    fn statistics_line_keeps_its_text() {
+        assert_eq!(
+            sample_stats(Some(0.1)).line(),
+            "144 fps, CPU 0.412 ms/frame, GPU 0.100 ms/frame, 625 columns loaded, 600 on GPU (1.23 M faces), \
+             300 drawn (0.46 M faces), 3 meshes in progress, sort 0.012 ms (walk 0.500 ms), VRAM 31.0 MB \
+             (regions 10.0 of which 5.0 used, textures 20.0, other 1.0), translucent 12 columns of which 4 \
+             unsorted, 7 entities drawn, block entities 9 of which 2 drawn"
+        );
+        assert!(sample_stats(None).line().starts_with("144 fps, CPU 0.412 ms/frame, GPU ? ms/frame, 625 columns"));
+    }
+
+    /// A frame of a load: `(t, in_game, columns, columns meshed during the frame)`.
+    type LoadFrame<'a> = (f64, bool, usize, &'a [(i32, i32)]);
+
+    fn play(frames: &[LoadFrame<'_>]) -> Vec<(f64, LoadLandmarks)> {
+        let mut load = InitialLoad::default();
+        let mut done = Vec::new();
+        for &(t, in_game, columns, meshed) in frames {
+            for &(x, z) in meshed {
+                load.column_meshed(x, z);
+            }
+            done.extend(load.frame(t, in_game, columns).map(|l| (t, l)));
+        }
+        done
+    }
+
+    /// Done once, at the first frame that is caught up and half a second after the last change
+    /// of the column count; the caught-up instant lies between them.
+    #[test]
+    fn initial_load_waits_for_stable_columns_after_catching_up() {
+        let all: &[(i32, i32)] = &[(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (2, 1)];
+        let done = play(&[
+            (0.1, false, 4, &all[..4]), // meshed before the game: counts, but not caught up yet
+            (0.2, true, 4, &[]),        // caught up at the first frame in the game
+            (1.0, true, 6, &[]),        // two more columns: no longer caught up
+            (1.2, true, 6, &all[4..]),  // caught up again
+            (1.4, true, 6, &[]),        // stable for 0.4 s only
+            (1.5, true, 6, &[]),
+            (2.5, true, 6, &[]), // already done: nothing more
+        ]);
+        let expected = LoadLandmarks { meshed_at: 1.5, caught_up_at: 1.2, stable_since: 1.0, columns: 6 };
+        assert_eq!(done, vec![(1.5, expected)]);
+    }
+
+    /// The load ends at the later of the last catch-up and half a second of stable count
+    /// (within a frame); the caught-up instant is the last one, not the first.
+    #[test]
+    fn initial_load_ends_at_the_later_of_catch_up_and_stable_count() {
+        let done = play(&[
+            (0.0, true, 1, &[(0, 0)]),
+            (0.1, true, 2, &[]),
+            (0.2, true, 2, &[(0, 1)]), // first catch-up
+            (0.3, true, 3, &[]),
+            (0.4, true, 3, &[(0, 2)]), // last catch-up
+            (0.7, true, 3, &[]),
+            (0.8, true, 3, &[]),
+        ]);
+        assert_eq!(done, vec![(0.8, LoadLandmarks { meshed_at: 0.8, caught_up_at: 0.4, stable_since: 0.3, columns: 3 })]);
+        // Meshing slower than the half second: the load ends when it catches up.
+        let done = play(&[(0.0, true, 2, &[(0, 0)]), (0.6, true, 2, &[]), (1.0, true, 2, &[(0, 1)])]);
+        assert_eq!(done, vec![(1.0, LoadLandmarks { meshed_at: 1.0, caught_up_at: 1.0, stable_since: 0.0, columns: 2 })]);
+        // A column count that drops while caught up: the catch-up stays the earlier instant.
+        let done = play(&[(0.0, true, 2, &[(0, 0), (0, 1)]), (0.25, true, 1, &[]), (0.75, true, 1, &[])]);
+        assert_eq!(done, vec![(0.75, LoadLandmarks { meshed_at: 0.75, caught_up_at: 0.0, stable_since: 0.25, columns: 1 })]);
+        // Never done without a column, nor outside the game.
+        assert!(play(&[(0.0, true, 0, &[]), (5.0, true, 0, &[])]).is_empty());
+        assert!(play(&[(0.0, false, 1, &[(0, 0)]), (5.0, false, 1, &[])]).is_empty());
     }
 
     /// Ages of a base served sorted into their bucket, bounds excluded from the lower bucket.

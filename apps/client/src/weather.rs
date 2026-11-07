@@ -452,9 +452,7 @@ pub struct TickCtx<'a, 'w> {
 
 /// Top of the collision shape of state `s` under the local point `(fx, fz)`.
 fn shape_top(phys: &rc_physics::Tables, s: u32, fx: f64, fz: f64) -> f64 {
-    let mut boxes = Vec::new();
-    phys.collision(s, &mut boxes);
-    boxes
+    phys.shape(s)
         .iter()
         .filter(|b| b.min[0] <= fx && fx <= b.max[0] && b.min[2] <= fz && fz <= b.max[2])
         .map(|b| b.max[1])

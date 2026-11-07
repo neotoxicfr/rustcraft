@@ -1,7 +1,8 @@
 //! Lean zone resolution (mission C2-M03, `docs/perf.md`): same rule and same result,
 //! bit for bit, as `solve` in `lib.rs`, kept as is and taken when all the switches
 //! are at 0. Each slimming has its switch `RUSTCRAFT_OPT_<NAME>` (`0`: off, `1`:
-//! on, absent: on except `SKYMEMO`, `LIGHTDEDUP` and `LIGHTJOIN`, see `DEFAULT_OFF`), read once per
+//! on, absent: on except `SKYMEMO`, `LIGHTDEDUP`, `LIGHTJOIN` and `LIGHTZEROONLYRING`, see
+//! `DEFAULT_OFF`), read once per
 //! process:
 //! - `SKYSKIP`: above the sky zone and below the changes, a section whose states all
 //!   let the sky through (zero attenuation, no occluding face: flag drawn from
@@ -30,6 +31,12 @@
 //! - `LIGHTLEVELFIRST`: a neighbour's level is tested before its occlusion (see [`rise`]).
 //! - `LIGHTSPREADINLINE`, `LIGHTATOMICVIEW`, `LIGHTSPREADBUFS`, `LIGHTSPREADAFTERSEED`: cheaper
 //!   parallel propagation (mission C2-M02, `fast/par.rs`).
+//! - `LIGHTREADROWS`, `LIGHTREADFILL`: zone read by row segments, uniform rows filled (mission
+//!   C2-M10, `fast/zone_read.rs`; with `ZONEUNPACK`, whose per-section read they replace).
+//! - `LIGHTSCANPLANES`, `LIGHTWRITECOLUMN`: changed cells found plane by plane, sheets of a column
+//!   fetched once per run of its stacks (mission C2-M10, `fast/change_scan.rs`).
+//! - `LIGHTZEROONLYRING`: with `ZONEBUF`, a kept zone buffer gets only its sentinel ring zeroed
+//!   before a read (every read path writes all the other cells; mission C2-M10).
 //! - Thresholds `RUSTCRAFT_OPT_LIGHTPARMIN`, `LIGHTCHUNK`, `LIGHTJOINMIN`, `LIGHTSPREADMIN`
 //!   (shipped values: the constants of `par.rs`), read once like the switches.
 //!
@@ -40,7 +47,7 @@ use std::cell::RefCell;
 use std::sync::{Arc, OnceLock};
 
 use hashbrown::HashMap;
-use rc_world::{Container, Section};
+use rc_world::{Container, LightLayer, Section};
 
 use crate::stats::LevelCounts;
 use crate::{GROUP, LightGrid, LightTables, OPPOSITE, STEP, Touched, nibble, set_nibble};
@@ -95,10 +102,20 @@ pub(crate) struct Opts {
     /// queues hold fewer than `spread_min` entries.
     pub spread_after_seed: bool,
     pub spread_min: usize,
+    /// `LIGHTREADROWS`: zone read by row segments, the source of a section's cells chosen once.
+    pub read_by_rows: bool,
+    /// `LIGHTREADFILL`: with `LIGHTREADROWS`, uniform rows and shared uniform sheets filled.
+    pub fill_uniform_rows: bool,
+    /// `LIGHTSCANPLANES`: changed cells found plane by plane, then grouped by stack.
+    pub scan_by_planes: bool,
+    /// `LIGHTWRITECOLUMN`: the sheets of a column fetched once for its consecutive stacks.
+    pub keep_column_while_writing: bool,
+    /// `LIGHTZEROONLYRING`: kept zone buffers get only their sentinel ring zeroed before a read.
+    pub zero_only_ring: bool,
 }
 
 /// Names of the switches (`RUSTCRAFT_OPT_<name>`), in the bit order of [`Opts::from_bits`].
-pub(crate) const NAMES: [&str; 22] = [
+pub(crate) const NAMES: [&str; 27] = [
     "SKYSKIP",
     "SKYMEMO",
     "SKYBIT",
@@ -121,14 +138,20 @@ pub(crate) const NAMES: [&str; 22] = [
     "LIGHTATOMICVIEW",
     "LIGHTSPREADBUFS",
     "LIGHTSPREADAFTERSEED",
+    "LIGHTREADROWS",
+    "LIGHTREADFILL",
+    "LIGHTSCANPLANES",
+    "LIGHTWRITECOLUMN",
+    "LIGHTZEROONLYRING",
 ];
 
 /// Switches off by default (`=1` to turn them on): losers in the micro-bench, kept for
 /// the scene bench. `SKYMEMO`: +0.5 to +3.5 % against "all" (plains, cave, building).
 /// `LIGHTDEDUP`: changes the result (see the header) for ±5 % within the noise (rule C3).
 /// `LIGHTJOIN`: no measured gain (±2 % in the micro-bench, synthetic trace of a single group slower
-/// when on), set aside (rule C3) until the scene bench.
-pub(crate) const DEFAULT_OFF: u32 = 2 | 512 | 2048;
+/// when on), set aside (rule C3) until the scene bench. `LIGHTZEROONLYRING`: no measured gain
+/// (alone ±2 %, mixed −13 to +17 % against shipped on a loaded machine), likewise.
+pub(crate) const DEFAULT_OFF: u32 = 2 | 512 | 2048 | 1 << 26;
 
 impl Opts {
     pub(crate) const OLD: Opts = Opts::from_bits(0);
@@ -165,6 +188,11 @@ impl Opts {
             spread_bufs: b & 1 << 20 != 0,
             spread_after_seed: b & 1 << 21 != 0,
             spread_min: par::SPREAD_MIN,
+            read_by_rows: b & 1 << 22 != 0,
+            fill_uniform_rows: b & 1 << 23 != 0,
+            scan_by_planes: b & 1 << 24 != 0,
+            keep_column_while_writing: b & 1 << 25 != 0,
+            zero_only_ring: b & 1 << 26 != 0,
         }
     }
 
@@ -193,6 +221,11 @@ impl Opts {
             self.atomic_view,
             self.spread_bufs,
             self.spread_after_seed,
+            self.read_by_rows,
+            self.fill_uniform_rows,
+            self.scan_by_planes,
+            self.keep_column_while_writing,
+            self.zero_only_ring,
         ];
         on.iter().enumerate().fold(0, |b, (k, &v)| b | u32::from(v) << k)
     }
@@ -323,6 +356,10 @@ struct Lane {
     /// Queues filled by each task of a parallel level (`LIGHTSPREADBUFS`), emptied into
     /// `buckets` after the level, their capacity kept.
     task_queues: Vec<[Vec<u64>; 16]>,
+    /// Scratch of the plane-by-plane scan of the changed cells (`LIGHTSCANPLANES`).
+    plane_scan: change_scan::PlaneScan,
+    /// Changed cells of the resolution, stack by stack, before they are written.
+    changes: change_scan::Changes,
 }
 
 impl Lane {
@@ -335,6 +372,8 @@ impl Lane {
             + self.stacks.capacity() * size_of::<frontier::StackSeed>()
             + self.task_queues.capacity() * size_of::<[Vec<u64>; 16]>()
             + self.task_queues.iter().map(queues).sum::<usize>()
+            + self.plane_scan.bytes()
+            + self.changes.bytes()
     }
 }
 
@@ -771,15 +810,16 @@ fn read(grid: &impl LightGrid, c: &Ctx, w: &mut Work, g: Geo, want_sky: bool, wa
     #[cfg(test)]
     READS.with(|r| r.set(r.get() + 1));
     let keep = c.o.zone_buf;
+    let ring_only = keep && c.o.zero_only_ring;
     let n = g.cells();
-    reset(&mut w.face, n, keep);
-    reset(&mut w.prop, n, keep);
+    prepare_zone_array(&mut w.face, g, keep, ring_only);
+    prepare_zone_array(&mut w.prop, g, keep, ring_only);
     if want_blk {
-        reset(&mut w.emit, n, keep);
-        reset(&mut w.blk, n, keep);
+        prepare_zone_array(&mut w.emit, g, keep, ring_only);
+        prepare_zone_array(&mut w.blk, g, keep, ring_only);
     }
     if want_sky {
-        reset(&mut w.sky, n, keep);
+        prepare_zone_array(&mut w.sky, g, keep, ring_only);
     }
     if c.o.zone_unpack && c.o.par_solve && n >= c.o.par_min {
         par::read_par(grid, c, w, g, want_sky, want_blk);
@@ -790,17 +830,61 @@ fn read(grid: &impl LightGrid, c: &Ctx, w: &mut Work, g: Geo, want_sky: bool, wa
     }
 }
 
+/// A zone array sized for `g` before a read: all zeros (old way), or, with `ring_only`, stale
+/// values kept and only the sentinel ring zeroed. Every read path writes every other cell, so
+/// zeroing them first doubles the stores (5 arrays, about 8 bytes per cell); no gain measured yet
+/// on a loaded machine (`LIGHTZEROONLYRING` off by default, see `DEFAULT_OFF`).
+fn prepare_zone_array<T: Copy + Default>(v: &mut Vec<T>, g: Geo, keep: bool, ring_only: bool) {
+    let n = g.cells();
+    if !ring_only {
+        reset(v, n, keep);
+        return;
+    }
+    if v.len() < n {
+        v.resize(n, T::default());
+    } else {
+        v.truncate(n);
+    }
+    zero_ring(v, g);
+}
+
+/// Zeroes the sentinel ring of a zone array: the bottom and top planes, and the border of every
+/// plane between them (the cells no read writes).
+fn zero_ring<T: Copy + Default>(v: &mut [T], g: Geo) {
+    if g.ring == 0 {
+        return;
+    }
+    let (ax, plane) = (g.ax, g.plane);
+    let planes = v.len() / plane;
+    let zero = T::default();
+    for (y, p) in v.chunks_exact_mut(plane).enumerate() {
+        if y == 0 || (y + 1 == planes && !sabotage(SABOTAGE_RING_KEEPS_ITS_TOP_PLANE)) {
+            p.fill(zero);
+            continue;
+        }
+        p[..ax].fill(zero);
+        p[plane - ax..].fill(zero);
+        for row in p[ax..plane - ax].chunks_exact_mut(ax) {
+            row[0] = zero;
+            row[ax - 1] = zero;
+        }
+    }
+}
+
+/// Deliberate error of the tests: the ring zeroing leaves the inside of the top plane stale.
+const SABOTAGE_RING_KEEPS_ITS_TOP_PLANE: u8 = 42;
+
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn put(w: &mut Work, i: usize, p: (u32, u8, u8), vs: u8, vb: u8, want_sky: bool, want_blk: bool) {
+fn put(w: &mut Work, i: usize, p: (u32, u8, u8), sky_value: u8, block_value: u8, want_sky: bool, want_blk: bool) {
     w.face[i] = p.0;
     w.prop[i] = p.1;
     if want_blk {
         w.emit[i] = p.2;
-        w.blk[i] = vb;
+        w.blk[i] = block_value;
     }
     if want_sky {
-        w.sky[i] = vs;
+        w.sky[i] = sky_value;
     }
 }
 
@@ -815,24 +899,24 @@ fn read_cells(grid: &impl LightGrid, c: &Ctx, w: &mut Work, g: Geo, want_sky: bo
             for dy in 0..g.size[1] {
                 let y = g.lo[1] + dy;
                 let i = g.at(dx, dy, dz);
-                let (mut s, mut vs, mut vb) = (0u32, 0u8, 0u8);
+                let (mut s, mut sky_value, mut block_value) = (0u32, 0u8, 0u8);
                 if let Some((sections, sky_layers, block_layers)) = col {
                     if (0..h).contains(&y) {
                         s = state_in(Some(sections), lx, lz, y, h);
                         let li = ((y >> 4) + 1) as usize;
                         let ly = (y & 15) as usize;
                         if want_sky && let Some(Some(l)) = sky_layers.get(li) {
-                            vs = DATA | nibble(l, lx, ly, lz);
+                            sky_value = DATA | nibble(l, lx, ly, lz);
                         }
                         if want_blk && let Some(Some(l)) = block_layers.get(li) {
-                            vb = DATA | nibble(l, lx, ly, lz);
+                            block_value = DATA | nibble(l, lx, ly, lz);
                         }
                     } else if y >= h {
                         // Above the world: full sky (without a sheet).
-                        vs = 15;
+                        sky_value = 15;
                     }
                 }
-                put(w, i, props(t, s), vs, vb, want_sky, want_blk);
+                put(w, i, props(t, s), sky_value, block_value, want_sky, want_blk);
             }
         }
     }
@@ -852,9 +936,9 @@ fn unpack_raw(bits: u8, data: &[u64], out: &mut [u32]) {
     }
 }
 
-/// Output arrays of a zone read, from cell `base` (a slice of rows;
-/// unwanted sheets: empty arrays).
-struct Bufs<'a> {
+/// Output arrays of a zone read for the cells `base..base + len` (a band of planes; unwanted
+/// sheets: empty arrays).
+struct ZoneSlice<'a> {
     base: usize,
     face: &'a mut [u32],
     prop: &'a mut [u8],
@@ -865,18 +949,18 @@ struct Bufs<'a> {
     want_blk: bool,
 }
 
-impl Bufs<'_> {
+impl ZoneSlice<'_> {
     #[inline]
-    fn put(&mut self, i: usize, p: (u32, u8, u8), vs: u8, vb: u8) {
+    fn put(&mut self, i: usize, p: (u32, u8, u8), sky_value: u8, block_value: u8) {
         let i = i - self.base;
         self.face[i] = p.0;
         self.prop[i] = p.1;
         if self.want_blk {
             self.emit[i] = p.2;
-            self.blk[i] = vb;
+            self.blk[i] = block_value;
         }
         if self.want_sky {
-            self.sky[i] = vs;
+            self.sky[i] = sky_value;
         }
     }
 }
@@ -886,7 +970,7 @@ impl Bufs<'_> {
 fn read_sections(grid: &impl LightGrid, c: &Ctx, w: &mut Work, g: Geo, want_sky: bool, want_blk: bool) {
     let n = g.cells();
     let mut raw = std::mem::take(&mut w.raw);
-    let out = Bufs {
+    let out = ZoneSlice {
         base: 0,
         face: &mut w.face[..n],
         prop: &mut w.prop[..n],
@@ -900,8 +984,18 @@ fn read_sections(grid: &impl LightGrid, c: &Ctx, w: &mut Work, g: Geo, want_sky:
     w.raw = raw;
 }
 
-/// Rows `ya..yb` (world y, within the zone) of [`read_sections`], written into `out`.
-fn read_rows(grid: &impl LightGrid, c: &Ctx, g: Geo, ya: i32, yb: i32, mut out: Bufs, raw: &mut Vec<u32>) {
+/// Rows `ya..yb` (world y, within the zone) of [`read_sections`], written into `out`: by row
+/// segments (`LIGHTREADROWS`, `fast/zone_read.rs`) or cell by cell (old read).
+fn read_rows(grid: &impl LightGrid, c: &Ctx, g: Geo, ya: i32, yb: i32, out: ZoneSlice, raw: &mut Vec<u32>) {
+    if c.o.read_by_rows {
+        zone_read::read_section_rows(grid, c, g, ya, yb, out, raw);
+    } else {
+        read_rows_cell_by_cell(grid, c, g, ya, yb, out, raw);
+    }
+}
+
+/// Old read of [`read_rows`]: per cell, block index, source match and sheet lookups.
+fn read_rows_cell_by_cell(grid: &impl LightGrid, c: &Ctx, g: Geo, ya: i32, yb: i32, mut out: ZoneSlice, raw: &mut Vec<u32>) {
     let (t, h) = (c.t, c.height);
     let (x0, x1) = (g.lo[0], g.lo[0] + g.size[0]);
     let (y0, y1) = (g.lo[1], yb);
@@ -917,10 +1011,10 @@ fn read_rows(grid: &impl LightGrid, c: &Ctx, g: Geo, ya: i32, yb: i32, mut out: 
             while y < y1 {
                 let Some((sections, sky_layers, block_layers)) = col.filter(|_| (0..h).contains(&y)) else {
                     // Row outside the world, or column absent (neither light nor passage).
-                    let vs = if col.is_some() && y >= h { 15 } else { 0 };
+                    let sky_value = if col.is_some() && y >= h { 15 } else { 0 };
                     for z in za..zb {
                         for x in xa..xb {
-                            out.put(g.at(x - x0, y - y0, z - z0), air, vs, 0);
+                            out.put(g.at(x - x0, y - y0, z - z0), air, sky_value, 0);
                         }
                     }
                     y += 1;
@@ -929,32 +1023,26 @@ fn read_rows(grid: &impl LightGrid, c: &Ctx, g: Geo, ya: i32, yb: i32, mut out: 
                 let sec = y >> 4;
                 let yb = y1.min(sec * 16 + 16).min(h);
                 let li = (sec + 1) as usize;
-                let lsky = if out.want_sky { sky_layers.get(li).and_then(|l| l.as_deref()) } else { None };
-                let lblk = if out.want_blk { block_layers.get(li).and_then(|l| l.as_deref()) } else { None };
+                let sky_sheet = if out.want_sky { sky_layers.get(li).and_then(|l| l.as_deref()) } else { None };
+                let block_sheet = if out.want_blk { block_layers.get(li).and_then(|l| l.as_deref()) } else { None };
                 let cells = (xb - xa) * (zb - za) * (yb - y);
                 // Properties of a cell by index in the section, depending on the content.
-                let mut pal = [(0u32, 0u8, 0u8); 256];
+                let mut palette_props = [(0u32, 0u8, 0u8); 256];
                 let blocks = sections.get(sec as usize).map(|s| &s.blocks);
-                enum Src<'a> {
-                    Fixed((u32, u8, u8)),
-                    Palette,
-                    Values,
-                    Cells(&'a Container),
-                }
                 let src = match blocks {
-                    None => Src::Fixed(props(t, 0)),
-                    Some(Container::Single(v)) => Src::Fixed(props(t, *v)),
-                    Some(b) if cells < 512 => Src::Cells(b),
+                    None => CellSource::Fixed(props(t, 0)),
+                    Some(Container::Single(v)) => CellSource::Fixed(props(t, *v)),
+                    Some(b) if cells < 512 => CellSource::Cells(b),
                     Some(Container::Packed { bits, palette: Some(p), data }) if *bits <= 8 => {
-                        for (k, e) in pal.iter_mut().enumerate().take(1 << bits) {
+                        for (k, e) in palette_props.iter_mut().enumerate().take(1 << bits) {
                             *e = props(t, p.get(k).copied().unwrap_or(0));
                         }
                         unpack_raw(*bits, data, raw);
-                        Src::Palette
+                        CellSource::Palette
                     }
                     Some(b) => {
                         b.unpack_into(raw);
-                        Src::Values
+                        CellSource::Values
                     }
                 };
                 for yy in y..yb {
@@ -965,14 +1053,14 @@ fn read_rows(grid: &impl LightGrid, c: &Ctx, g: Geo, ya: i32, yb: i32, mut out: 
                             let lx = (x & 15) as usize;
                             let k = rc_world::block_index(lx, ly, lz);
                             let p = match &src {
-                                Src::Fixed(p) => *p,
-                                Src::Palette => pal[raw[k] as usize],
-                                Src::Values => props(t, raw[k]),
-                                Src::Cells(b) => props(t, b.get(k)),
+                                CellSource::Fixed(p) => *p,
+                                CellSource::Palette => palette_props[raw[k] as usize],
+                                CellSource::Values => props(t, raw[k]),
+                                CellSource::Cells(b) => props(t, b.get(k)),
                             };
-                            let vs = lsky.map_or(0, |l| DATA | nibble(l, lx, ly, lz));
-                            let vb = lblk.map_or(0, |l| DATA | nibble(l, lx, ly, lz));
-                            out.put(g.at(x - x0, yy - y0, z - z0), p, vs, vb);
+                            let sky_value = sky_sheet.map_or(0, |l| DATA | nibble(l, lx, ly, lz));
+                            let block_value = block_sheet.map_or(0, |l| DATA | nibble(l, lx, ly, lz));
+                            out.put(g.at(x - x0, yy - y0, z - z0), p, sky_value, block_value);
                         }
                     }
                 }
@@ -1057,7 +1145,7 @@ fn solve_body(grid: &mut impl LightGrid, c: &Ctx, w: &mut Work, g: Geo, r0: i32,
     let z = Cells { face, prop, emit };
     let lay = if sky { lsky } else { blk };
     if compute(&*grid, c, &z, lay, lane, sky.then_some(aux), g, r0, ny, sky) {
-        write(grid, lay, lane, g, r0, ny, sky, out);
+        write(grid, c, lay, lane, g, r0, ny, sky, out);
     }
 }
 
@@ -1298,8 +1386,14 @@ fn scan_column(lay: &[u8], level: &[u8], g: Geo, r0: i32, ny: i32, dx: i32, dz: 
 
 /// Writes the changed cells of a stack and marks its touched sections (like the old `solve`).
 fn apply_column(grid: &mut impl LightGrid, x: i32, wz: i32, changed: &[(i32, u8)], sky: bool, touched: &mut Touched) {
-    let (lx, lz) = ((x & 15) as usize, (wz & 15) as usize);
     let Some(layers) = grid.layers_mut(x >> 4, wz >> 4, sky) else { return };
+    write_stack(layers, x, wz, changed, touched);
+}
+
+/// Writes the changed cells of the stack `(x, wz)` into the sheets of its column and marks its
+/// touched sections, section by section from the bottom up.
+fn write_stack(layers: &mut [LightLayer], x: i32, wz: i32, changed: &[(i32, u8)], touched: &mut Touched) {
+    let (lx, lz) = ((x & 15) as usize, (wz & 15) as usize);
     let flat =
         rc_world::edge::ANY | rc_world::edge::bits(lx, rc_world::edge::X0) | rc_world::edge::bits(lz, rc_world::edge::Z0);
     let mut run: Option<(i32, u8)> = None;
@@ -1322,11 +1416,28 @@ fn apply_column(grid: &mut impl LightGrid, x: i32, wz: i32, changed: &[(i32, u8)
     }
 }
 
-/// Writing of the changed cells and touched sections (like the old `solve`).
+/// Writing of the changed cells and touched sections (like the old `solve`): found plane by plane
+/// or written column by column (`fast/change_scan.rs`), otherwise stack by stack (old write).
 #[allow(clippy::too_many_arguments)]
-fn write(grid: &mut impl LightGrid, lay: &[u8], lane: &mut Lane, g: Geo, r0: i32, ny: i32, sky: bool, out: &mut [Touched]) {
+fn write(
+    grid: &mut impl LightGrid,
+    c: &Ctx,
+    lay: &[u8],
+    lane: &mut Lane,
+    g: Geo,
+    r0: i32,
+    ny: i32,
+    sky: bool,
+    out: &mut [Touched],
+) {
     let k = if sky { out.len() - 1 } else { 0 };
     let touched = &mut out[k];
+    if c.o.scan_by_planes || c.o.keep_column_while_writing {
+        let Lane { level, plane_scan, changes, .. } = lane;
+        change_scan::find_changes(&c.o, lay, level, plane_scan, g, r0, ny, changes);
+        change_scan::apply_changes(grid, &c.o, changes, sky, touched);
+        return;
+    }
     let Lane { level, changed, .. } = lane;
     for dz in 1..g.size[2] - 1 {
         for dx in 1..g.size[0] - 1 {
@@ -1339,9 +1450,13 @@ fn write(grid: &mut impl LightGrid, lay: &[u8], lane: &mut Lane, g: Geo, r0: i32
     }
 }
 
+mod change_scan;
 mod frontier;
 mod inc;
 mod par;
+mod zone_read;
+
+use zone_read::CellSource;
 
 #[cfg(test)]
 mod tests;

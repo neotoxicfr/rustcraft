@@ -687,12 +687,7 @@ impl Screens {
         if crate::tooltips::log_enabled() {
             for st in slots.iter().flatten() {
                 let lines = tooltip_lines(st, it, &self.hasher.enchantments, gui, self.advanced_tooltips);
-                let h = {
-                    use std::hash::{Hash, Hasher};
-                    let mut h = std::collections::hash_map::DefaultHasher::new();
-                    format!("{:?}", (st.item, &st.added)).hash(&mut h);
-                    h.finish()
-                };
+                let h = crate::cache_key::cache_key(&(st.item, &st.added));
                 crate::tooltips::log_once(&format!("{}#{h:x}", st.item), &lines);
             }
         }
@@ -792,7 +787,6 @@ pub(crate) fn refresh_held(
     seed: i32,
     hold: crate::stack::Hold,
 ) {
-    use std::hash::{Hash, Hasher};
     let held = (hold, hold.menu_slot.map_or(-1, |s| crate::bundle::selected(usize::from(s))));
     if cache.as_ref().is_some_and(|c| c.tick == it.env.tick && c.hold == held && c.stack == *st) {
         return;
@@ -808,10 +802,8 @@ pub(crate) fn refresh_held(
     if let Some(model) = view.model() {
         models.layers(name, &model, &view, it.env, seed, &mut layers, &mut key);
     }
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut h);
-    *cache =
-        Some(Cached { stack: st.clone(), tick: it.env.tick, hold: held, layers, key: h.finish(), bar: view.durability_bar() });
+    let key = crate::cache_key::item_layers_key(&key);
+    *cache = Some(Cached { stack: st.clone(), tick: it.env.tick, hold: held, layers, key, bar: view.durability_bar() });
 }
 
 /// Durability bar and count (`hud.md` § 3.5); capped count written in yellow.

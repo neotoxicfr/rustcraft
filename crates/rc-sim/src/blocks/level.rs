@@ -83,16 +83,20 @@ pub(crate) struct Sim {
     /// Phase of the current world ticks (pistons, § 3.9).
     pub handling_tick: bool,
     pub movers: HashMap<P, Mover>,
-    /// Block entities that tick (identifier, position), in order of addition (§ 1.7).
-    pub tickers: Vec<(u64, P)>,
-    pub pending_tickers: Vec<(u64, P)>,
+    /// Block entities that tick, in order of addition (§ 1.7).
+    pub tickers: Vec<super::ticks::Ticker>,
+    pub pending_tickers: Vec<super::ticks::Ticker>,
+    /// (Identifier, position) of every ticker in `tickers` or `pending_tickers`, kept on the
+    /// compacting path (`RUSTCRAFT_OPT_TICKER_COMPACTION`): a registration asks it instead of
+    /// scanning both lists.
+    pub registered_tickers: HashSet<(u64, P)>,
     pub ticking_bes: bool,
     pub next_be: u64,
     /// Chunks whose saved ticks have been resumed.
     pub imported: HashSet<(i32, i32)>,
     pub entities: super::entities::Entities,
     /// Random-tick sections (chunk, section index): cache recomputed as needed.
-    pub rt: HashMap<(i32, i32, usize), bool>,
+    pub random_ticking_sections: HashMap<(i32, i32, usize), bool>,
     /// Hoppers: ticker identifier, transfer delay, last tick.
     pub hoppers: HashMap<P, (u64, i32, i64)>,
     /// Direction of the current piston push: moving blocks in that direction do not block
@@ -167,11 +171,12 @@ impl Sim {
             movers: HashMap::new(),
             tickers: Vec::new(),
             pending_tickers: Vec::new(),
+            registered_tickers: HashSet::new(),
             ticking_bes: false,
             next_be: 1,
             imported: HashSet::new(),
             entities: Default::default(),
-            rt: HashMap::new(),
+            random_ticking_sections: HashMap::new(),
             hoppers: HashMap::new(),
             noclip: None,
             shulkers: HashMap::new(),
@@ -416,9 +421,9 @@ impl Server {
         if self.data.states.get(state as usize).is_some_and(|i| i.has(flags::RANDOM_TICK))
             || self.fluid_of(state).kind == 2
         {
-            self.bs.rt.insert(key, true);
+            self.bs.random_ticking_sections.insert(key, true);
         } else if self.data.states.get(old as usize).is_some_and(|i| i.has(flags::RANDOM_TICK)) {
-            self.bs.rt.remove(&key);
+            self.bs.random_ticking_sections.remove(&key);
         }
     }
 

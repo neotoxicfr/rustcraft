@@ -29,12 +29,14 @@ pub mod exec;
 pub mod functions;
 pub mod hash_order;
 pub mod itempred;
+pub mod kept_entity_index;
 pub mod parse_cache;
 pub mod paths;
 pub mod schedule;
 pub mod score_holders;
 pub mod scores;
 pub mod select;
+pub mod select_candidates;
 pub mod team_members;
 pub mod snbt;
 pub mod src;
@@ -67,6 +69,8 @@ mod command_block_equivalence_tests;
 mod parser_equivalence_tests;
 #[cfg(test)]
 mod container_commands_tests;
+#[cfg(test)]
+mod selector_equivalence_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -1,10 +1,12 @@
 //! World storage on the client side. Independent of the protocol and rendering: reused by
 //! singleplayer (`rc-sim`). Section format: `docs/specs/chunks.md`.
 
+mod cell_span;
 mod container;
 mod grid;
 pub mod heightmap;
 
+pub use cell_span::{sections_may_hold, states_by_column};
 pub use container::{
     ColumnIter, Container, GetMode, is_canonical, longs_for, opt as container_opt, remap_first_seen, values_per_long,
 };

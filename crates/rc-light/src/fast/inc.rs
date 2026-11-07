@@ -61,7 +61,8 @@ pub(super) struct Buf {
     /// Height from which the sky descends unobstructed, per stack (states fixed during the call).
     floors: HashMap<(i32, i32), i32>,
     changed: Vec<(u32, i32, u8)>,
-    column: Vec<(i32, u8)>,
+    /// The changed cells grouped by stack, for `change_scan::apply_changes`.
+    changes: change_scan::Changes,
 }
 
 impl Buf {
@@ -77,7 +78,7 @@ impl Buf {
             + self.dirty.capacity() * 4
             + self.floors.capacity() * 16
             + self.changed.capacity() * 12
-            + self.column.capacity() * 8
+            + self.changes.bytes()
     }
 
     fn prepare(&mut self, n: usize) {
@@ -315,7 +316,7 @@ fn solve(grid: &mut impl LightGrid, c: &Ctx, w: &mut Work, zone: Geo, cs: &[[i32
         let win = Win::new(&*grid, g, c.height, sky);
         compute(&*grid, c, aux, b, &win, cs);
     }
-    write(grid, b, g, sky, out);
+    write(grid, c, b, g, sky, out);
     count_solve(sky, t0.elapsed());
     #[cfg(test)]
     SOLVES.with(|s| s.set(s.get() + 1));
@@ -475,8 +476,9 @@ fn compute(grid: &impl LightGrid, c: &Ctx, aux: &mut Aux, b: &mut Buf, win: &Win
     }
 }
 
-/// Writes only the changed cells, stack by stack from bottom to top, and marks their sections.
-fn write(grid: &mut impl LightGrid, b: &mut Buf, g: Geo, sky: bool, out: &mut [Touched]) {
+/// Writes only the changed cells, stack by stack from bottom to top, and marks their sections
+/// (`LIGHTWRITECOLUMN`: one sheet access per run of stacks of a column, see `change_scan.rs`).
+fn write(grid: &mut impl LightGrid, c: &Ctx, b: &mut Buf, g: Geo, sky: bool, out: &mut [Touched]) {
     let k = if sky { out.len() - 1 } else { 0 };
     let touched = &mut out[k];
     b.changed.clear();
@@ -491,18 +493,16 @@ fn write(grid: &mut impl LightGrid, b: &mut Buf, g: Geo, sky: bool, out: &mut [T
     if b.changed.is_empty() {
         return;
     }
+    // Index in the plane: z then x, the stack order of the zone writes.
     b.changed.sort_unstable_by_key(|&(col, y, _)| (col, y));
-    let mut s = 0;
-    while s < b.changed.len() {
-        let col = b.changed[s].0;
-        let mut e = s;
-        b.column.clear();
-        while e < b.changed.len() && b.changed[e].0 == col {
-            b.column.push((b.changed[e].1, b.changed[e].2));
-            e += 1;
-        }
-        let (dx, dz) = ((col as usize % g.ax) as i32 - g.ring, (col as usize / g.ax) as i32 - g.ring);
-        apply_column(grid, g.lo[0] + dx, g.lo[2] + dz, &b.column, sky, touched);
-        s = e;
+    let change_scan::Changes { stacks, cells } = &mut b.changes;
+    stacks.clear();
+    cells.clear();
+    for stack in b.changed.chunk_by(|p, q| p.0 == q.0) {
+        let col = stack[0].0 as usize;
+        let (dx, dz) = ((col % g.ax) as i32 - g.ring, (col / g.ax) as i32 - g.ring);
+        cells.extend(stack.iter().map(|&(_, y, v)| (y, v)));
+        stacks.push((g.lo[0] + dx, g.lo[2] + dz, cells.len()));
     }
+    change_scan::apply_changes(grid, &c.o, &b.changes, sky, touched);
 }

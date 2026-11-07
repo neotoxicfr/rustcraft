@@ -299,13 +299,11 @@ impl Server {
             self.export_chunk_ticks(p);
             let Some(Some(c)) = self.chunks.get_mut(&p) else { continue };
             c.dirty = false;
-            let Some(root) = c.encode(&self.data, &self.states, h, self.time) else {
+            let Some(nbt) = c.encode_for_save(&self.data, &self.states, h, self.time, |root| encoder.encode(root)) else {
                 eprintln!("singleplayer: chunk {p:?} not rewritten (unknown identifier)");
                 continue;
             };
-            c.changed.iter_mut().for_each(|x| *x = false);
-            let nbt = encoder.encode(&root);
-            c.root = root;
+            c.changed.iter_mut().chain(c.biomes_changed.iter_mut()).for_each(|x| *x = false);
             jobs.push(Job::Chunk { path: region_dir.join(region_name(p.0, p.1)), cx: p.0, cz: p.1, nbt });
             written += 1;
         }

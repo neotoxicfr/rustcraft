@@ -18,8 +18,12 @@ const GLASS: u32 = 5;
 /// Bit of `LIGHTDEDUP` in [`Opts::from_bits`].
 const DEDUP: u32 = 512;
 /// Bits of the switches that act on the sequential path: C2-M03 (`SKYSKIP` to
-/// `RELIGHT_OCCTAB`) and C2-M02 (`LIGHTSKYFRONTIER` to `LIGHTLEVELFIRST`).
-const SEQUENTIAL_BITS: u32 = 0x7ff | 0xf << 14;
+/// `RELIGHT_OCCTAB`), C2-M02 (`LIGHTSKYFRONTIER` to `LIGHTLEVELFIRST`) and C2-M10
+/// (`LIGHTREADROWS` to `LIGHTZEROONLYRING`).
+const SEQUENTIAL_BITS: u32 = 0x7ff | 0xf << 14 | ZONE_IO_BITS;
+/// Bits of the C2-M10 switches (zone read by rows, uniform rows filled, plane scan, column kept,
+/// only the ring zeroed).
+pub(super) const ZONE_IO_BITS: u32 = 0x1f << 22;
 
 /// Test states: air, stone, leaves, torch, low slab, glass, lamp off and on
 /// (differ only by emission), high slab, attenuations 2 to 14, half-faces in the six
@@ -96,11 +100,11 @@ pub(super) fn world(height: i32, garbage: bool, rng: &mut Rng) -> World {
             }
             let mut layer = |full: u8| -> LightLayer {
                 if !garbage {
-                    return Some(Arc::new([full; LIGHT_BYTES]));
+                    return Some(shared_uniform_sheet(full));
                 }
                 match rng.below(5) {
                     0 => None,
-                    1 => Some(Arc::new([full; LIGHT_BYTES])),
+                    1 => Some(shared_uniform_sheet(full)),
                     _ => Some(Arc::new(std::array::from_fn(|_| rng.below(256) as u8))),
                 }
             };
@@ -117,6 +121,12 @@ pub(super) fn world(height: i32, garbage: bool, rng: &mut Rng) -> World {
         }
     }
     World(m)
+}
+
+/// The process-wide sheet of `full` (0 or 0xff) bytes, as the game's light gives them since C5-M06
+/// (a write goes through `Arc::make_mut`, which copies it first).
+fn shared_uniform_sheet(full: u8) -> Arc<[u8; LIGHT_BYTES]> {
+    if full == 0 { rc_world::zero_layer() } else { rc_world::full_layer() }
 }
 
 pub(super) fn set(w: &mut World, p: [i32; 3], s: u32) -> Option<u32> {
@@ -235,7 +245,7 @@ fn random_opts(rng: &mut Rng) -> Opts {
     if rng.below(4) == 0 {
         Opts::from_bits(!DEDUP)
     } else {
-        Opts::from_bits(rng.below(1 << 18) as u32 & SEQUENTIAL_BITS & !DEDUP)
+        Opts::from_bits(rng.below(1 << NAMES.len()) as u32 & SEQUENTIAL_BITS & !DEDUP)
     }
 }
 
@@ -275,13 +285,14 @@ fn shipped_defaults_match_old() {
 /// stack seeds included.
 #[test]
 fn retained_buffers_are_bounded() {
-    let grow: [fn(&mut Work); 3] = [
+    let grow: [fn(&mut Work); 4] = [
         |w| w.lane.buckets[15].reserve(super::RETAIN_BYTES / 8 + 1),
         |w| {
             w.lane.task_queues.resize_with(2, Default::default);
             w.lane.task_queues[1][3].reserve(super::RETAIN_BYTES / 8 + 1);
         },
         |w| w.lane.stacks.reserve(super::RETAIN_BYTES / 8 + 1),
+        |w| w.lane.changes.cells.reserve(super::RETAIN_BYTES / 8 + 1),
     ];
     for f in grow {
         super::with_work(true, f);
@@ -432,18 +443,20 @@ fn split_union_matches_combined() {
 fn sabotages_are_caught() {
     let t = tables();
     let names = [
-        "",
-        "section skip of 17",
-        "shape above kept after the skip",
-        "no sentinel ring",
-        "block slice shifted by one row",
-        "queue: arrival direction removed instead of the return one",
-        "memo: first blocked edge shifted by one cell",
-        "section in direct identifiers taken for clear",
+        (1u8, "section skip of 17"),
+        (2, "shape above kept after the skip"),
+        (3, "no sentinel ring"),
+        (4, "block slice shifted by one row"),
+        (5, "queue: arrival direction removed instead of the return one"),
+        (6, "memo: first blocked edge shifted by one cell"),
+        (7, "section in direct identifiers taken for clear"),
+        (40, "row read from an odd cell: nibble shifted by one"),
+        (41, "plane scan: last stack lost"),
+        (42, "ring zeroing leaves the top plane stale"),
     ];
-    for (k, name) in names.iter().enumerate().skip(1) {
+    for (k, name) in names {
         let caught = (0..6u64).any(|seed| {
-            SABOTAGE.with(|s| s.set(k as u8));
+            SABOTAGE.with(|s| s.set(k));
             let garbage = seed % 2 == 1;
             let case = Case { t: &t, height: 64, has_sky: true, garbage, steps: 400, seed, state: &state };
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -739,3 +752,4 @@ mod bench;
 mod frontier;
 mod inc;
 mod queue_counters;
+mod zone_io;

@@ -591,7 +591,14 @@ impl DebugLines {
         self.front_texts.extend(text_glyphs(&mut self.cache, gui, queue, pos, s, rgba(color), scale));
     }
 
-    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, size: (u32, u32), gui: &crate::gui::Gui) {
+    pub fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        _up: &mut crate::render::upload::Uploader,
+        size: (u32, u32),
+        gui: &crate::gui::Gui,
+    ) {
         if self.is_empty() {
             self.ranges = Default::default();
             (self.face_count, self.text_count, self.front_text_count) = (0, 0, 0);
@@ -860,6 +867,7 @@ impl Scene<'_> {
             colliders,
             movers: None,
             noclip: None,
+            palette_prefilter: crate::grid_world::palette_prefilter(),
         }
     }
 }
@@ -1270,9 +1278,7 @@ fn supporting_blocks(
         let b = Aabb { min: from, max: from.map(|v| v + 1.0 + 4.0 * offset) };
         let (a, c) = rel.b(&b);
         lines.cuboid(Layer::Depth, a, c, (102 << 24) | (color & 0xff_ffff), 2.5);
-        let mut shape = Vec::new();
-        s.phys.collision(s.state(pos[0], pos[1], pos[2]), &mut shape);
-        for b in shape {
+        for b in s.phys.shape(s.state(pos[0], pos[1], pos[2])) {
             let (a, c) = rel.b(&b.offset(f64::from(pos[0]), f64::from(pos[1]), f64::from(pos[2])));
             lines.cuboid(Layer::Depth, a, c, color, 2.5);
         }

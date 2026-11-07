@@ -149,6 +149,12 @@ pub fn opts() -> ShaderOpts {
 
 /// `base` (terrain.wgsl) reduced to the blocks of variant `o`.
 pub fn source(base: &str, o: ShaderOpts) -> String {
+    select_blocks(base, |name| o.defined(name))
+}
+
+/// `base` reduced to its `//#if NAME` blocks whose name `defined` accepts (shared by the terrain
+/// and the sky shaders).
+pub fn select_blocks(base: &str, defined: impl Fn(&str) -> bool) -> String {
     let mut out = String::with_capacity(base.len());
     // Stack of open blocks: (block kept, parent kept).
     let mut stack: Vec<(bool, bool)> = Vec::new();
@@ -158,24 +164,24 @@ pub fn source(base: &str, o: ShaderOpts) -> String {
         if let Some(cond) = t.strip_prefix("//#if ") {
             let cond = cond.trim();
             let on = match cond.strip_prefix('!') {
-                Some(n) => !o.defined(n),
-                None => o.defined(cond),
+                Some(n) => !defined(n),
+                None => defined(cond),
             };
             stack.push((on, keep));
             keep = keep && on;
         } else if t.starts_with("//#else") {
-            let (on, parent) = stack.last_mut().expect("terrain.wgsl: //#else without //#if");
+            let (on, parent) = stack.last_mut().expect("shader: //#else without //#if");
             *on = !*on;
             keep = *parent && *on;
         } else if t.starts_with("//#endif") {
-            let (_, parent) = stack.pop().expect("terrain.wgsl: //#endif without //#if");
+            let (_, parent) = stack.pop().expect("shader: //#endif without //#if");
             keep = parent;
         } else if keep {
             out.push_str(line);
             out.push('\n');
         }
     }
-    assert!(stack.is_empty(), "terrain.wgsl: //#if not closed");
+    assert!(stack.is_empty(), "shader: //#if not closed");
     out
 }
 
@@ -336,7 +342,7 @@ impl FadeRing {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn variants() -> Vec<ShaderOpts> {
@@ -361,7 +367,7 @@ mod tests {
         v
     }
 
-    fn validate(src: &str) -> (naga::Module, naga::valid::ModuleInfo) {
+    pub(crate) fn validate(src: &str) -> (naga::Module, naga::valid::ModuleInfo) {
         let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{}", e.emit_to_string(src)));
         let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
             .validate(&module)
@@ -371,7 +377,11 @@ mod tests {
 
     /// Access by non-constant index to an array held by value (local copy or constant) in
     /// the function: the compiler must then store it in local memory.
-    fn value_array_indexing(module: &naga::Module, f: &naga::Function, info: &naga::valid::FunctionInfo) -> usize {
+    pub(crate) fn value_array_indexing(
+        module: &naga::Module,
+        f: &naga::Function,
+        info: &naga::valid::FunctionInfo,
+    ) -> usize {
         let locals =
             f.local_variables.iter().filter(|(_, l)| matches!(module.types[l.ty].inner, naga::TypeInner::Array { .. }));
         let dynamic = f.expressions.iter().filter(|(_, e)| match e {
@@ -408,8 +418,33 @@ mod tests {
         }
     }
 
+    /// [`value_array_indexing`] over the vertex entry points that `chosen` accepts and every
+    /// function they reach (each counted once; the fragments are off topic).
+    pub(crate) fn vertex_value_array_indexing(
+        m: &naga::Module,
+        info: &naga::valid::ModuleInfo,
+        chosen: impl Fn(&str) -> bool,
+    ) -> usize {
+        let mut n = 0;
+        let mut todo = Vec::new();
+        for (i, ep) in m.entry_points.iter().enumerate() {
+            if ep.stage == naga::ShaderStage::Vertex && chosen(&ep.name) {
+                n += value_array_indexing(m, &ep.function, info.get_entry_point(i));
+                calls(&ep.function.body, &mut todo);
+            }
+        }
+        let mut seen = hashbrown::HashSet::new();
+        while let Some(h) = todo.pop() {
+            if seen.insert(h) {
+                n += value_array_indexing(m, &m.functions[h], &info[h]);
+                calls(&m.functions[h].body, &mut todo);
+            }
+        }
+        n
+    }
+
     /// Functions called (recursively) from a block.
-    fn calls(block: &naga::Block, out: &mut Vec<naga::Handle<naga::Function>>) {
+    pub(crate) fn calls(block: &naga::Block, out: &mut Vec<naga::Handle<naga::Function>>) {
         for s in block.iter() {
             match s {
                 naga::Statement::Call { function, .. } => out.push(*function),
@@ -437,7 +472,7 @@ mod tests {
         let mut bodies = vec![&ep.function];
         let mut todo = Vec::new();
         calls(&ep.function.body, &mut todo);
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = hashbrown::HashSet::new();
         while let Some(h) = todo.pop() {
             if seen.insert(h) {
                 bodies.push(&m.functions[h]);
@@ -477,23 +512,7 @@ mod tests {
         let count = |o: ShaderOpts| -> usize {
             let src = terrain(o);
             let (m, info) = validate(&src);
-            let mut n = 0;
-            let mut todo = Vec::new();
-            for (i, ep) in m.entry_points.iter().enumerate() {
-                if ep.stage == naga::ShaderStage::Vertex && ep.name != "vs_sky" {
-                    n += value_array_indexing(&m, &ep.function, info.get_entry_point(i));
-                    calls(&ep.function.body, &mut todo);
-                }
-            }
-            // Functions reached from the terrain vertices (the fragments are off topic).
-            let mut seen = std::collections::HashSet::new();
-            while let Some(h) = todo.pop() {
-                if seen.insert(h) {
-                    n += value_array_indexing(&m, &m.functions[h], &info[h]);
-                    calls(&m.functions[h].body, &mut todo);
-                }
-            }
-            n
+            vertex_value_array_indexing(&m, &info, |name| name != "vs_sky")
         };
         assert_eq!(count(ShaderOpts::NEW), 0, "array indexed by value in the new path");
         assert!(count(ShaderOpts { quadbits: false, ..ShaderOpts::NEW }) > 0, "indexed QUAD not seen");

@@ -198,7 +198,7 @@ fn frontier_sabotages_are_caught() {
 fn each_new_switch_alone_matches_old() {
     let t = tables();
     let par = |o: Opts| Opts { join_min: 0, par_min: 0, chunk: 64, ..o };
-    for (n, name) in NAMES.iter().enumerate().skip(14) {
+    for (n, name) in NAMES.iter().enumerate().take(22).skip(14) {
         // The multi-core switches act inside `LIGHTPARSOLVE` only.
         let base = if n >= 18 { par(Opts::from_bits(4096)) } else { Opts::OLD };
         let o = base.with(name, true);

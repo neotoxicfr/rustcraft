@@ -78,18 +78,35 @@ struct Model {
     meshed: usize,
     late: usize,
     held_frames: usize,
+    /// Marks made so far (the world's touch counter of the client).
+    marks_rev: u64,
+    /// What the last pick that held every dirty column saw (`HeldSignature` of the client), and
+    /// the frames that skipped their pick for it.
+    all_held: Option<(u32, u64, usize)>,
+    skipped: usize,
+}
+
+/// Inputs of the held verdicts the model's skip compares: the view, the marks, the columns drawn.
+/// `Sabotage` forgets the marks.
+#[derive(Clone, Copy, PartialEq)]
+enum Skip {
+    Never,
+    Unchanged,
+    Sabotage,
 }
 
 impl Model {
     fn load(&mut self, key: (i32, i32)) {
         self.world.insert(key, [1; SECTIONS]);
         self.dirty.insert(key, Sections::ALL);
+        self.marks_rev += 1;
     }
 
     fn change(&mut self, key: (i32, i32), s: usize) {
         if let Some(c) = self.world.get_mut(&key) {
             c[s] += 1;
             self.dirty.entry(key).or_default().insert(s as i32);
+            self.marks_rev += 1;
         }
     }
 
@@ -98,24 +115,35 @@ impl Model {
         if let Some(c) = self.world.get_mut(&key) {
             c.iter_mut().for_each(|v| *v += 1);
             self.dirty.insert(key, Sections::ALL);
+            self.marks_rev += 1;
         }
     }
 
-    /// One frame: launches chosen by `policy` from the view `policy_view`, meshes made, then the
-    /// frame drawn checked against the view `must_be_fresh`.
+    /// One frame: launches chosen by `policy` from the view `policy_view` (number `view_id`: the
+    /// same number, the same view), meshes made, then the frame drawn checked against the view
+    /// `must_be_fresh`. With `skip`, the pick is skipped while nothing changed since a pick that
+    /// held every dirty column, as the client does.
     fn frame(
         &mut self,
         policy: Policy,
-        policy_view: impl Fn((i32, i32)) -> Sections,
+        (view_id, policy_view): (u32, impl Fn((i32, i32)) -> Sections),
         must_be_fresh: impl Fn((i32, i32)) -> Sections,
         spare: bool,
+        skip: Skip,
     ) -> Result<(), String> {
-        let Model { drawn, evicted, dirty, .. } = self;
-        let in_view = |k: (i32, i32)| drawn.contains_key(&k).then(|| policy_view(k));
-        let launchable = |k, marks| policy(marks, in_view(k), !evicted.contains(&k), urgent(k));
-        let launches = pick_columns(dirty, usize::MAX, (0, 0), |_, _| true, launchable, spare);
-        for (key, launch) in launches {
-            self.mesh(key, launch);
+        let marks = if skip == Skip::Sabotage { 0 } else { self.marks_rev };
+        let signature = (skip != Skip::Never).then_some((view_id, marks, self.drawn.len()));
+        if signature.is_some() && signature == self.all_held {
+            self.skipped += 1;
+        } else {
+            let Model { drawn, evicted, dirty, .. } = self;
+            let in_view = |k: (i32, i32)| drawn.contains_key(&k).then(|| policy_view(k));
+            let launchable = |k, marks| policy(marks, in_view(k), !evicted.contains(&k), urgent(k));
+            let launches = pick_columns(dirty, usize::MAX, (0, 0), |_, _| true, launchable, spare);
+            self.all_held = signature.filter(|_| launches.is_empty() && !self.dirty.is_empty());
+            for (key, launch) in launches {
+                self.mesh(key, launch);
+            }
         }
         self.check(must_be_fresh)?;
         self.held_frames += usize::from(!self.dirty.is_empty());
@@ -167,6 +195,20 @@ type Outcome = (usize, usize, usize, HashMap<(i32, i32), [u32; SECTIONS]>);
 /// one frame after it shows, as the game whose rebuilds run in the background). Then everything
 /// comes into view: the meshes must be the world's.
 fn trajectory(policy: Policy, lag: u32, spare: bool) -> Result<Outcome, String> {
+    trajectory_with(policy, lag, spare, Skip::Never, false).map(|(outcome, _)| outcome)
+}
+
+/// [`trajectory`] with the skip of unchanged held picks `skip`, and with `still` a still camera on
+/// a resting world before everything comes into view (the client's static scene: the columns held
+/// out of view stay held frame after frame), in which one section in view changes once. Also gives
+/// the frames skipped.
+fn trajectory_with(
+    policy: Policy,
+    lag: u32,
+    spare: bool,
+    skip: Skip,
+    still: bool,
+) -> Result<(Outcome, usize), String> {
     let mut m = Model::default();
     let mut rng = Rng(SEED);
     for x in 0..6 {
@@ -190,12 +232,44 @@ fn trajectory(policy: Policy, lag: u32, spare: bool) -> Result<Outcome, String> 
         if f % 7 == 3 {
             m.evicted.insert(key(&mut rng));
         }
-        let policy_view = |k| view_of_frame(f.saturating_sub(lag), k);
+        // The view of `view_of_frame` turns every 3 frames.
+        let seen = f.saturating_sub(lag);
+        let policy_view = (seen / 3, |k| view_of_frame(seen, k));
         let fresh = |k| view_of_frame(f, k).intersection(view_of_frame(f.saturating_sub(1), k));
-        m.frame(policy, policy_view, fresh, spare).map_err(|e| format!("frame {f}: {e}"))?;
+        m.frame(policy, policy_view, fresh, spare, skip).map_err(|e| format!("frame {f}: {e}"))?;
     }
-    m.frame(policy, |_| all_sections(), |_| all_sections(), spare).map_err(|e| format!("all in view: {e}"))?;
-    Ok((m.meshed, m.late, m.held_frames, m.drawn))
+    if still {
+        let view = |k| view_of_frame(399, k);
+        let mut drawn: Vec<_> = m.drawn.keys().copied().collect();
+        drawn.sort_unstable();
+        let shown = drawn.into_iter().find_map(|k| (0..SECTIONS).find(|&s| view(k).contains(s)).map(|s| (k, s)));
+        for q in 0..12 {
+            if q == 6
+                && let Some((k, s)) = shown
+            {
+                m.change(k, s);
+            }
+            m.frame(policy, (u32::MAX - 1, view), view, spare, skip).map_err(|e| format!("still frame {q}: {e}"))?;
+        }
+    }
+    m.frame(policy, (u32::MAX, |_| all_sections()), |_| all_sections(), spare, skip)
+        .map_err(|e| format!("all in view: {e}"))?;
+    Ok(((m.meshed, m.late, m.held_frames, m.drawn), m.skipped))
+}
+
+/// Skipping the pick while nothing changed since one that held every dirty column (the client's
+/// `RUSTCRAFT_OPT_MESH_SKIP_UNCHANGED_HELD`) gives the same meshes, work and late sections as
+/// picking every frame; a skip that forgets the new marks draws stale sections.
+#[test]
+fn unchanged_held_pick_is_skipped_without_changing_the_meshes() {
+    let (picked_each_frame, _) = trajectory_with(sections_to_launch, 1, false, Skip::Never, true).expect("filter");
+    let (skipping, skipped) = trajectory_with(sections_to_launch, 1, false, Skip::Unchanged, true)
+        .expect("filter skipping unchanged picks");
+    assert!(skipped > 0, "the trajectory never repeats an all-held pick: test without object");
+    assert_eq!(skipping, picked_each_frame, "skipping changed the outcome");
+    let stale =
+        trajectory_with(sections_to_launch, 1, false, Skip::Sabotage, true).expect_err("skip blind to new marks");
+    assert!(stale.contains("stale"), "{stale}");
 }
 
 /// The filter holds sections out of view and meshes them once they show; nothing drawn twice in a

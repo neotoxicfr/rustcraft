@@ -191,6 +191,13 @@ def tnt_once_function(x, y, z):
     return lines(*primed_tnt(x, y, z))
 
 
+def tnt_heap_function(x, y, z):
+    """A heap of 12 × 12 × 12 TNT blocks (1,728) set off from the top: the chain reaction throws
+    primed TNT and dropped blocks everywhere, the case that separates two clients."""
+    return lines(f"fill {x - 6} {y + 1} {z - 6} {x + 5} {y + 12} {z + 5} minecraft:tnt",
+                 f"setblock {x} {y + 13} {z} minecraft:redstone_block")
+
+
 def fireworks_function(x, y, z):
     """16 firework rockets (large ball, trail, twinkle) every second."""
     rocket = ('{LifeTime:20,FireworksItem:{id:"minecraft:firework_rocket",count:1,components:{"minecraft:fireworks":'
@@ -712,6 +719,7 @@ FUNCTIONS = {
     "keyframes": ("crowd", keyframes_function), "items": ("crowd", items_function),
     "glowing": ("crowd", glowing_function), "names": ("crowd", names_function), "signs": ("crowd", signs_function),
     "tnt": ("crowd", tnt_function), "tnt_once": ("crowd", tnt_once_function), "fireworks": ("crowd", fireworks_function),
+    "tnt_heap": ("crowd", tnt_heap_function),
     "block_entities": ("redstone", block_entities_function),
     "hoppers": ("crowd", hoppers_function), "hoppers_feed": ("crowd", hoppers_feed_function),
     "furnaces": ("crowd", furnaces_function), "sculk": ("crowd", sculk_function),

@@ -661,7 +661,7 @@ fn relative_keys_are_distinct_within_a_search_reach() {
         .map(|_| [r.next_int_bound(8193) - 4096, r.next_int_bound(8193) - 4096, r.next_int_bound(8193) - 4096])
         .collect();
     offsets.extend([[far, far, far], [-far, -far, -far], [far, -far, 0], [0, 0, 0], [-1, -1, -1]]);
-    let mut by_key = std::collections::HashMap::new();
+    let mut by_key = hashbrown::HashMap::new();
     for d in offsets {
         let key = super::relative_key(origin, origin[0] + d[0], origin[1] + d[1], origin[2] + d[2]);
         let prev = by_key.insert(key, d);

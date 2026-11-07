@@ -1196,7 +1196,7 @@ impl Blocks {
                 let p = self.prop(k).ok_or_else(|| Error::Format(format!("property {k} of {name}")))?;
                 let val = match v {
                     Json::Str(x) => x.clone(),
-                    Json::Num(x) => x.clone(),
+                    Json::Num(x) => x.to_string(),
                     Json::Bool(b) => b.to_string(),
                     _ => return Err(Error::Format(format!("value of {k}"))),
                 };

@@ -513,6 +513,7 @@ impl crate::App {
             colliders: &[],
             movers: None,
             noclip: None,
+            palette_prefilter: crate::grid_world::palette_prefilter(),
         };
         let bb = rc_physics::Aabb {
             min: [pos[0] - w / 2.0, pos[1], pos[2] - w / 2.0],

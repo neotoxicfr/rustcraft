@@ -81,7 +81,7 @@ impl Server {
         if matches!(self.bs.be_ticks.get(&p), Some((_, BeTick::Beacon(_)))) {
             return;
         }
-        let id = self.add_ticker(p);
+        let id = self.add_ticker(p, crate::blocks::ticks::TickerFamily::Shared);
         let b = BeaconTick { last_y: self.dim.height.min_y - 1, checking: false, beam: false, levels: 0 };
         self.bs.be_ticks.insert(p, (id, BeTick::Beacon(b)));
     }

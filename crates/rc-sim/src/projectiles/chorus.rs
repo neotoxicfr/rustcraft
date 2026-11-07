@@ -116,8 +116,21 @@ impl Server {
         false
     }
 
-    fn chorus_block_tag(&self, s: u32, tag: &str) -> bool {
+    /// The block of state `s` carries `tag`, under its full name or without its namespace.
+    pub(super) fn chorus_block_tag(&self, s: u32, tag: &str) -> bool {
         let short = tag.trim_start_matches("minecraft:");
+        if !super::ProjectilePaths::current().chorus_tag_bits {
+            return self.chorus_block_tag_by_name(s, tag, short);
+        }
+        // The state's block index, instead of the block's name searched in the whole block list
+        // (a thousand string compares per cell of the descent, 16 descents per fruit).
+        let block = self.data.state(s).map_or(u32::MAX, |i| u32::from(i.block));
+        let mode = crate::tag_bits::mode();
+        self.tag_u32(tag, block, mode) || self.tag_u32(short, block, mode)
+    }
+
+    /// Old path of `chorus_block_tag`: the block's index found from its name.
+    fn chorus_block_tag_by_name(&self, s: u32, tag: &str, short: &str) -> bool {
         let block = self.data.block_of(s).map(|b| b.name.as_str()).unwrap_or("");
         let Some(bid) = self.data.blocks.iter().position(|b| b.name == block) else { return false };
         [tag, short].iter().any(|t| self.block_tags.get(*t).is_some_and(|v| v.binary_search(&(bid as u32)).is_ok()))

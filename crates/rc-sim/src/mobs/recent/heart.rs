@@ -76,11 +76,11 @@ impl Server {
         }
         if let Some(h) = self.mobs.rec.hearts.map.get(&p)
             && h.ticker_id != 0
-            && self.bs.tickers.iter().chain(self.bs.pending_tickers.iter()).any(|t| *t == (h.ticker_id, p))
+            && self.ticker_registered(h.ticker_id, p)
         {
             return;
         }
-        let id = self.add_ticker(p);
+        let id = self.add_ticker(p, crate::blocks::ticks::TickerFamily::Heart);
         let link = self.block_entity(p).and_then(|be| match be.get("creaking") {
             Some(Nbt::IntArray(v)) if v.len() == 4 => Some(Link { uuid: ints_uuid(v), id: None }),
             _ => None,

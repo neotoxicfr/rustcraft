@@ -147,14 +147,27 @@ pub fn normalize_patch(s: &mut Stack) {
     if defaults.is_null() {
         return;
     }
-    // Removal of a component without a default: nothing to remove; value equal to the default: useless.
-    f.retain(|(k, v)| match k.strip_prefix('!') {
-        Some(r) => !defaults[r].is_null(),
-        None => defaults[k.as_str()].is_null() || !crate::progress::pred::json_eq_nbt(&defaults[k.as_str()], v),
-    });
+    f.retain(|(k, v)| patch_entry_kept(&defaults, k, v));
     if f.is_empty() {
         s.components = None;
     }
+}
+
+/// An entry the reduced patch keeps: removal of a component without a default has nothing to
+/// remove, and a value equal to the default is useless.
+fn patch_entry_kept(defaults: &Value, key: &str, v: &Nbt) -> bool {
+    match key.strip_prefix('!') {
+        Some(r) => !defaults[r].is_null(),
+        None => defaults[key].is_null() || !crate::progress::pred::json_eq_nbt(&defaults[key], v),
+    }
+}
+
+/// `normalize_patch` would leave these components of item `id` exactly as they are (nothing
+/// dropped, not emptied into none), told without copying them.
+pub fn patch_already_reduced(id: &str, components: &Nbt) -> bool {
+    let Nbt::Compound(f) = components else { return true };
+    let defaults = defaults_of(id);
+    defaults.is_null() || (!f.is_empty() && f.iter().all(|(k, v)| patch_entry_kept(&defaults, k, v)))
 }
 
 /// Removal of a component through a patch (`!name`): recorded when the item carries it by
@@ -269,8 +282,13 @@ impl Items {
     /// Maximum size of a stack (`max_stack_size` component); a patch that removes it leaves
     /// the game's fallback, 1.
     pub fn max_stack(&self, s: &Stack) -> i32 {
+        self.max_stack_of(&s.id, s.components.as_ref())
+    }
+
+    /// `max_stack` of item `id` with the patch `components`, without a stack to build.
+    pub fn max_stack_of(&self, id: &str, components: Option<&Nbt>) -> i32 {
         // One pass over the patch for the value and the removal (called for every stack moved).
-        if let Some(Nbt::Compound(f)) = &s.components {
+        if let Some(Nbt::Compound(f)) = components {
             for (k, v) in f {
                 match k.as_str() {
                     "minecraft:max_stack_size" => {
@@ -283,7 +301,7 @@ impl Items {
                 }
             }
         }
-        self.info(&s.id).map_or(64, |i| i32::from(i.max_stack_size.max(1)))
+        self.info(id).map_or(64, |i| i32::from(i.max_stack_size.max(1)))
     }
 
     pub fn max_damage(&self, s: &Stack) -> i32 {

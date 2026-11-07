@@ -81,7 +81,8 @@ fn generated_chunks_match_official_server() {
         );
         let mut ours: HashMap<(i32, i32), DecoChunk> = HashMap::new();
         for c in &full {
-            let (d, _, _) = conv.from_nbt(&c.root).expect("reread");
+            // The compound the save writes (the chunk keeps only what memory does not hold).
+            let (d, _, _) = conv.from_nbt(&c.encode(&data, &states, height, 0).expect("encoding")).expect("reread");
             ours.insert((c.x, c.z), d);
         }
         for (p, n) in &protos {
@@ -1031,7 +1032,7 @@ fn flat_world_layers_far_from_origin() {
     let height = rc_sim::dimension_height(&data, "minecraft:overworld");
     let conv = Conv::new(&data, &states, &blocks, height, &biomes);
     let c = full.iter().find(|c| (c.x, c.z) == (375, 375)).expect("chunk (375, 375)");
-    let (d, _, _) = conv.from_nbt(&c.root).expect("reread");
+    let (d, _, _) = conv.from_nbt(&c.encode(&data, &states, height, 0).expect("encoding")).expect("reread");
     let name = |y: i32| blocks.block_name(blocks.block(d.blocks[d.index(0, y, 0)])).to_owned();
     assert_eq!((name(-61), name(-60), name(-59)), ("stone".into(), "grass_block".into(), "air".into()));
     let _ = std::fs::remove_dir_all(&dir);

@@ -176,6 +176,8 @@ pub struct Server {
     pub(crate) chunk_map_swaps: u64,
     /// Frozen entities (raw NBT) per chunk, with their entity id.
     pub(crate) entities: HashMap<(i32, i32), Vec<(i32, Nbt)>>,
+    /// Where each compound of `entities` sits, checked at every read (`kept_entity_index`).
+    pub(crate) kept_index: crate::commands::kept_entity_index::KeptEntityIndex,
     pub(crate) next_entity: i32,
     pub(crate) paused: Arc<AtomicBool>,
     /// Save in progress (read by the client: indicator), reset to false by the write thread.
@@ -223,6 +225,8 @@ pub struct Server {
     pub(crate) center: Option<(i32, i32)>,
     pub(crate) sent: HashSet<(i32, i32)>,
     pub(crate) queue: Vec<(i32, i32)>,
+    /// Loading landmarks of the chunk sending (`RUSTCRAFT_PERFLOG` only).
+    send_landmarks: Option<ChunkSendLandmarks>,
     /// Read thread of the send queue (`RUSTCRAFT_OPT_ASYNC_LOAD`), created on first use.
     pub(crate) loader: Option<crate::loader::Loader>,
     // Time.
@@ -476,6 +480,7 @@ impl Server {
             chunks: HashMap::new(),
             chunk_map_swaps: 0,
             entities: HashMap::new(),
+            kept_index: Default::default(),
             next_entity: 2,
             paused,
             saving: Arc::new(AtomicBool::new(false)),
@@ -515,6 +520,7 @@ impl Server {
             center: None,
             sent: HashSet::new(),
             queue: Vec::new(),
+            send_landmarks: crate::mem_stats::enabled().then(|| ChunkSendLandmarks::new(opened)),
             loader: None,
             clocks: clocks.clone(),
             rules,
@@ -1314,6 +1320,11 @@ impl Server {
                 self.poll_loader();
             }
             self.send_chunks();
+            if let Some(marks) = &mut self.send_landmarks {
+                for line in marks.after_sending(self.sent.len(), self.queue.is_empty(), Instant::now()) {
+                    eprintln!("{line}");
+                }
+            }
             self.prep_tick(); // loading screen: progress and map
             // (4) automatic save (§ 8).
             if !paused {
@@ -1574,6 +1585,63 @@ fn perf_tick_report(t: &crate::tickrate::TickRate) {
         ms(p99),
         ms(t.average_tick_nanos())
     );
+}
+
+/// Loading landmarks of the chunk sending, once per world opening, in ms since the opening began
+/// (the origin of `singleplayer: opened in`): first chunk sent, then first tick that ends with an
+/// empty send queue. The generation itself has its own line (`singleplayer: generated`).
+struct ChunkSendLandmarks {
+    opened: Instant,
+    first_sent: bool,
+    queue_emptied: bool,
+}
+
+impl ChunkSendLandmarks {
+    fn new(opened: Instant) -> Self {
+        ChunkSendLandmarks { opened, first_sent: false, queue_emptied: false }
+    }
+
+    /// Lines to log after a tick's sending (`sent`: chunks sent so far); at most one of each per
+    /// opening. The queue only counts as emptied once something has been sent.
+    fn after_sending(&mut self, sent: usize, queue_empty: bool, now: Instant) -> Vec<String> {
+        let ms = now.duration_since(self.opened).as_secs_f64() * 1e3;
+        let mut lines = Vec::new();
+        if sent > 0 && !self.first_sent {
+            self.first_sent = true;
+            lines.push(format!("singleplayer: first chunk sent {ms:.0} ms after opening"));
+        }
+        if self.first_sent && queue_empty && !self.queue_emptied {
+            self.queue_emptied = true;
+            lines.push(format!("singleplayer: chunk queue empty {ms:.0} ms after opening ({sent} chunks sent)"));
+        }
+        lines
+    }
+}
+
+#[cfg(test)]
+mod send_landmark_tests {
+    use super::*;
+
+    /// One line of each, in order, at the tick they happen; nothing before the first chunk sent
+    /// (an empty queue at the very start is not a finished load) and nothing after.
+    #[test]
+    fn each_landmark_is_logged_once_per_opening() {
+        let opened = Instant::now();
+        let at = |ms: u64| opened + std::time::Duration::from_millis(ms);
+        let mut marks = ChunkSendLandmarks::new(opened);
+        assert!(marks.after_sending(0, true, at(50)).is_empty());
+        assert_eq!(marks.after_sending(9, false, at(120)), ["singleplayer: first chunk sent 120 ms after opening"]);
+        assert!(marks.after_sending(30, false, at(170)).is_empty());
+        assert_eq!(
+            marks.after_sending(49, true, at(220)),
+            ["singleplayer: chunk queue empty 220 ms after opening (49 chunks sent)"]
+        );
+        assert!(marks.after_sending(60, false, at(400)).is_empty());
+        assert!(marks.after_sending(60, true, at(450)).is_empty());
+        // Everything sent within one tick: both lines in that tick.
+        let mut marks = ChunkSendLandmarks::new(opened);
+        assert_eq!(marks.after_sending(4, true, at(80)).len(), 2);
+    }
 }
 
 #[cfg(test)]

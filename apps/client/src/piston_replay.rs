@@ -112,6 +112,7 @@ impl App {
             colliders: &colliders,
             movers: Some(&self.block_entities),
             noclip: Some(m.movement()),
+            palette_prefilter: crate::grid_world::palette_prefilter(),
         };
         for e in self.entities.map.values_mut().filter(|e| e.vehicle.is_none()) {
             let k = entity_motion::heft(&e.kind);
@@ -155,6 +156,7 @@ impl App {
                         colliders: &colliders,
                         movers: Some(&self.block_entities),
                         noclip: Some(m.movement()),
+                        palette_prefilter: crate::grid_world::palette_prefilter(),
                     };
                     self.player.piston_tick(pos, &m, next, time, &world, &self.phys);
                 }

@@ -13,6 +13,7 @@ use rc_proto::nbt::Nbt;
 use crate::blocks::{Dir, Kind, P, flag};
 use crate::dims::{END, EntPortal, NETHER, OVERWORLD, PortalKind, Proc, Transition, rel};
 use crate::portal_shape::{self as ps, Axis, Cell, Rect, Shape};
+use crate::portal_site::{SitePaths, dist_sqr};
 use crate::server::Server;
 
 /// Arrival point in the End.
@@ -25,11 +26,6 @@ const CART_COOLDOWN: i32 = 10;
 
 fn floor3(p: [f64; 3]) -> P {
     [p[0].floor() as i32, p[1].floor() as i32, p[2].floor() as i32]
-}
-
-fn dist_sqr(a: P, b: P) -> i64 {
-    let d = |i: usize| i64::from(a[i] - b[i]);
-    d(0) * d(0) + d(1) * d(1) + d(2) * d(2)
 }
 
 /// Box of an entity of width `w` and height `h` placed at `p`.
@@ -47,7 +43,93 @@ pub(crate) struct Touch {
     pub pos: P,
 }
 
+/// Ids of the three portal blocks.
+#[derive(Clone, Copy)]
+struct PortalBlocks {
+    nether: u16,
+    end: u16,
+    gateway: u16,
+}
+
+impl PortalBlocks {
+    fn kind_of(&self, block: u16) -> Option<PortalKind> {
+        if block == self.nether {
+            Some(PortalKind::Nether)
+        } else if block == self.end {
+            Some(PortalKind::End)
+        } else if block == self.gateway {
+            Some(PortalKind::Gateway)
+        } else {
+            None
+        }
+    }
+
+    fn all(&self) -> [u16; 3] {
+        [self.nether, self.end, self.gateway]
+    }
+}
+
+/// The slab of the End portal block at `p`, which a box must touch to enter it.
+fn end_portal_shape(p: P) -> Aabb {
+    Aabb {
+        min: [f64::from(p[0]), f64::from(p[1]) + 0.375, f64::from(p[2])],
+        max: [f64::from(p[0]) + 1.0, f64::from(p[1]) + 0.75, f64::from(p[2]) + 1.0],
+    }
+}
+
+/// `RUSTCRAFT_OPT_PORTAL_TOUCH_PREFILTER=0`: the portal check of every entity reads each cell of
+/// its box, even when the palettes of the sections under the box hold no portal block.
+fn touch_prefilter_enabled() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_PORTAL_TOUCH_PREFILTER")
+}
+
+/// `RUSTCRAFT_OPT_BLOCKIDS=0`: the portal blocks of the per-cell checks looked up by name on every
+/// call (hashed string lookups) instead of the ids kept by the block table.
+fn block_ids_enabled() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_BLOCKIDS")
+}
+
+/// `RUSTCRAFT_OPT_GATEWAY_LOOKUP_WITHOUT_COPY=0`: every cooldown lookup of an End gateway copies
+/// the dimension name into its key.
+fn gateway_lookup_without_copy_enabled() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_GATEWAY_LOOKUP_WITHOUT_COPY")
+}
+
+/// Borrowed form of a gateway cooldown key (dimension, position): hashes and compares like the
+/// owned `(String, P)`, so a lookup needs no copy of the name.
+#[derive(Hash)]
+pub(crate) struct GatewayKeyRef<'a>(pub(crate) &'a str, pub(crate) P);
+
+impl hashbrown::Equivalent<(String, P)> for GatewayKeyRef<'_> {
+    fn equivalent(&self, key: &(String, P)) -> bool {
+        self.0 == key.0 && self.1 == key.1
+    }
+}
+
 impl Server {
+    /// Id of the Nether portal block, from the block table (or by name, `RUSTCRAFT_OPT_BLOCKIDS=0`).
+    fn nether_portal_block(&self) -> u16 {
+        if block_ids_enabled() { self.bs.t.id.nether_portal } else { self.block_id_of("nether_portal") }
+    }
+
+    /// Ids of the three portal blocks, from the block table or looked up by name.
+    fn portal_blocks_by(&self, table_ids: bool) -> PortalBlocks {
+        if table_ids {
+            self.portal_blocks_from_table()
+        } else {
+            PortalBlocks {
+                nether: self.block_id_of("nether_portal"),
+                end: self.block_id_of("end_portal"),
+                gateway: self.block_id_of("end_gateway"),
+            }
+        }
+    }
+
+    fn portal_blocks_from_table(&self) -> PortalBlocks {
+        let id = &self.bs.t.id;
+        PortalBlocks { nether: id.nether_portal, end: id.end_portal, gateway: id.end_gateway }
+    }
+
     fn block_id_of(&self, name: &str) -> u16 {
         self.table().block_id(name)
     }
@@ -61,7 +143,7 @@ impl Server {
         let s = self.get(p);
         let v = self.view();
         let b = v.block(s);
-        if b == self.block_id_of("nether_portal") {
+        if b == self.nether_portal_block() {
             Cell::Portal
         } else if v.is_air(s) || self.tag_id(crate::tag_bits::TagId::Fire, b) {
             Cell::Empty
@@ -109,7 +191,7 @@ impl Server {
     /// Shape update of a Nether portal block: air if the frame is no longer complete.
     pub(crate) fn portal_update_shape(&self, state: u32, p: P, dir: Dir, ns: u32) -> Option<u32> {
         let v = self.view();
-        let pb = self.block_id_of("nether_portal");
+        let pb = self.nether_portal_block();
         if v.block(state) != pb {
             return None;
         }
@@ -278,7 +360,7 @@ impl Server {
 
     /// Nether portal blocks of a chunk (sections whose palette contains some).
     fn portal_blocks_in(&self, c: &crate::chunk::Chunk, out: &mut Vec<P>) {
-        let pb = self.block_id_of("nether_portal");
+        let pb = self.nether_portal_block();
         let v = self.view();
         let min_y = self.dim.height.min_y;
         for (si, sec) in c.sections.iter().enumerate() {
@@ -373,12 +455,77 @@ impl Server {
         let min_y = self.dim.height.min_y;
         let max_placeable = self.max_placeable_y();
         self.load_now(&Self::chunks_around(origin, 16 + 4));
+        let bounds = self.border_bounds();
+        let site = self.portal_site(origin, dir, SitePaths::from_switches());
+        let obsidian = self.view().default_state(self.block_id_of("obsidian"));
+        let air = self.air();
+        let base = match site {
+            Some(site) => site,
+            None => {
+                let min_start = (min_y + 1).max(70);
+                let max_start = max_placeable - 9;
+                if max_start < min_start {
+                    return None;
+                }
+                let b = [origin[0] - d[0], origin[1].clamp(min_start, max_start), origin[2] - d[2]];
+                let b = Self::clamp_to_border(bounds, f64::from(b[0]), f64::from(b[1]), f64::from(b[2]));
+                // Brought back inside the border, the fallback can land far from the loaded chunks.
+                self.load_now(&Self::chunks_around(b, 3));
+                let cw = dir.clockwise().step();
+                for bx in -1..2 {
+                    for w in 0..2 {
+                        for h in -1..3 {
+                            let p = [b[0] + w * d[0] + bx * cw[0], b[1] + h, b[2] + w * d[2] + bx * cw[2]];
+                            self.set_block(p, if h < 0 { obsidian } else { air }, flag::ALL);
+                        }
+                    }
+                }
+                b
+            }
+        };
+        for w in -1..3 {
+            for h in -1..4 {
+                if w == -1 || w == 2 || h == -1 || h == 3 {
+                    self.set_block([base[0] + w * d[0], base[1] + h, base[2] + w * d[2]], obsidian, flag::ALL);
+                }
+            }
+        }
+        let portal = self.nether_portal_state(axis);
+        for w in 0..2 {
+            for h in 0..3 {
+                self.set_block(
+                    [base[0] + w * d[0], base[1] + h, base[2] + w * d[2]],
+                    portal,
+                    flag::CLIENTS | flag::KNOWN_SHAPE,
+                );
+            }
+        }
+        Some(Rect { min: base, size1: 2, size2: 3 })
+    }
+
+    /// Site of the exit portal, the former walk kept as the reference (`SitePaths::REFERENCE`):
+    /// every cell read through the server's lookup, column height scanned with the former rule.
+    pub(crate) fn portal_site_cell_by_cell(&self, origin: P, dir: Dir) -> Option<P> {
+        self.portal_site_cell_by_cell_with_height(origin, dir, |x, z| self.portal_surface_height(x, z))
+    }
+
+    /// The reference walk with the column height given by `surface_height` (tests compare the
+    /// heightmap path with this walk fed by the game's height rule).
+    pub(crate) fn portal_site_cell_by_cell_with_height(
+        &self,
+        origin: P,
+        dir: Dir,
+        surface_height: impl Fn(i32, i32) -> i32,
+    ) -> Option<P> {
+        let d = dir.step();
+        let min_y = self.dim.height.min_y;
+        let max_placeable = self.max_placeable_y();
         let (mut full_d, mut full_p): (f64, Option<P>) = (-1.0, None);
         let (mut part_d, mut part_p): (f64, Option<P>) = (-1.0, None);
         let bounds = self.border_bounds();
         let in_border = |p: P| Self::block_in_border(bounds, p);
         for col in ps::spiral(origin, 16, Dir::East, Dir::South) {
-            let height = max_placeable.min(self.portal_surface_height(col[0], col[2]));
+            let height = max_placeable.min(surface_height(col[0], col[2]));
             if !(in_border(col) && in_border(ps::add(col, d, 1))) {
                 continue;
             }
@@ -420,51 +567,8 @@ impl Server {
         }
         if full_d == -1.0 && part_d != -1.0 {
             full_p = part_p;
-            full_d = part_d;
         }
-        let obsidian = self.view().default_state(self.block_id_of("obsidian"));
-        let air = self.air();
-        let base = if full_d == -1.0 {
-            let min_start = (min_y + 1).max(70);
-            let max_start = max_placeable - 9;
-            if max_start < min_start {
-                return None;
-            }
-            let b = [origin[0] - d[0], origin[1].clamp(min_start, max_start), origin[2] - d[2]];
-            let b = Self::clamp_to_border(bounds, f64::from(b[0]), f64::from(b[1]), f64::from(b[2]));
-            // Brought back inside the border, the fallback can land far from the loaded chunks.
-            self.load_now(&Self::chunks_around(b, 3));
-            let cw = dir.clockwise().step();
-            for bx in -1..2 {
-                for w in 0..2 {
-                    for h in -1..3 {
-                        let p = [b[0] + w * d[0] + bx * cw[0], b[1] + h, b[2] + w * d[2] + bx * cw[2]];
-                        self.set_block(p, if h < 0 { obsidian } else { air }, flag::ALL);
-                    }
-                }
-            }
-            b
-        } else {
-            full_p?
-        };
-        for w in -1..3 {
-            for h in -1..4 {
-                if w == -1 || w == 2 || h == -1 || h == 3 {
-                    self.set_block([base[0] + w * d[0], base[1] + h, base[2] + w * d[2]], obsidian, flag::ALL);
-                }
-            }
-        }
-        let portal = self.nether_portal_state(axis);
-        for w in 0..2 {
-            for h in 0..3 {
-                self.set_block(
-                    [base[0] + w * d[0], base[1] + h, base[2] + w * d[2]],
-                    portal,
-                    flag::CLIENTS | flag::KNOWN_SHAPE,
-                );
-            }
-        }
-        Some(Rect { min: base, size1: 2, size2: 3 })
+        full_p
     }
 
     /// Rectangle of blocks identical to that of `p` (portal), axis of the state.
@@ -702,35 +806,32 @@ impl Server {
 
     /// Portals touched by a box (box shrunk by 1e-5, like the check of blocks passed through).
     pub(crate) fn portals_touched(&self, b: &Aabb) -> Vec<Touch> {
+        self.portals_touched_with(b, touch_prefilter_enabled(), block_ids_enabled())
+    }
+
+    /// `portals_touched` with the palette prefilter on or off, portal ids from the block table or
+    /// looked up by name.
+    pub(crate) fn portals_touched_with(&self, b: &Aabb, prefilter: bool, table_ids: bool) -> Vec<Touch> {
         let e = 1.0e-5;
-        let d =
+        let shrunk =
             Aabb { min: [b.min[0] + e, b.min[1] + e, b.min[2] + e], max: [b.max[0] - e, b.max[1] - e, b.max[2] - e] };
-        let lo = floor3(d.min);
-        let hi = floor3(d.max);
-        let (np, ep, gw) =
-            (self.block_id_of("nether_portal"), self.block_id_of("end_portal"), self.block_id_of("end_gateway"));
+        let lo = floor3(shrunk.min);
+        let hi = floor3(shrunk.max);
+        let blocks = self.portal_blocks_by(table_ids);
+        // Called for every mob, item and entity at every tick, nearly always far from any portal:
+        // the palettes of the one to four sections under the box say so without reading a cell.
+        if prefilter && !self.portal_in_sections(lo, hi, blocks.all()) {
+            return Vec::new();
+        }
         let mut out = Vec::new();
         for x in lo[0]..=hi[0] {
             for y in lo[1]..=hi[1] {
                 for z in lo[2]..=hi[2] {
                     let p = [x, y, z];
-                    let b = self.view().block(self.get(p));
-                    let kind = if b == np {
-                        PortalKind::Nether
-                    } else if b == ep {
-                        let shape = Aabb {
-                            min: [f64::from(x), f64::from(y) + 0.375, f64::from(z)],
-                            max: [f64::from(x) + 1.0, f64::from(y) + 0.75, f64::from(z) + 1.0],
-                        };
-                        if !hits(&d, &shape) {
-                            continue;
-                        }
-                        PortalKind::End
-                    } else if b == gw {
-                        PortalKind::Gateway
-                    } else {
+                    let Some(kind) = blocks.kind_of(self.state_block(self.get(p))) else { continue };
+                    if kind == PortalKind::End && !hits(&shrunk, &end_portal_shape(p)) {
                         continue;
-                    };
+                    }
                     out.push(Touch { kind, pos: p });
                 }
             }
@@ -877,7 +978,17 @@ impl Server {
     }
 
     fn gateway_cooling(&self, p: P) -> bool {
-        self.dims.gateways.get(&self.gateway_key(p)).is_some_and(|&c| c > 0)
+        self.gateway_cooling_with(p, gateway_lookup_without_copy_enabled())
+    }
+
+    pub(crate) fn gateway_cooling_with(&self, p: P, without_copy: bool) -> bool {
+        // Looked up twice per gateway and per tick: the borrowed key spares a copy of the name.
+        let cooldown = if without_copy {
+            self.dims.gateways.get(&GatewayKeyRef(&self.dim.name, p))
+        } else {
+            self.dims.gateways.get(&self.gateway_key(p))
+        };
+        cooldown.is_some_and(|&c| c > 0)
     }
 
     /// 40 ticks, block event 1 (the client's beam).
@@ -893,7 +1004,7 @@ impl Server {
         if matches!(self.bs.be_ticks.get(&p), Some((_, crate::blocks::level::BeTick::Gateway))) {
             return;
         }
-        let id = self.add_ticker(p);
+        let id = self.add_ticker(p, crate::blocks::ticks::TickerFamily::Shared);
         self.bs.be_ticks.insert(p, (id, crate::blocks::level::BeTick::Gateway));
     }
 
@@ -1213,35 +1324,22 @@ impl Server {
         straight: bool,
     ) -> Vec<Touch> {
         // Ids kept by the table (no lookup by name on every call).
-        let (np, ep, gw) = (self.bs.t.id.nether_portal, self.bs.t.id.end_portal, self.bs.t.id.end_gateway);
+        let blocks = self.portal_blocks_from_table();
         let at = ent_box(to, w, h);
         let start = ent_box(from, w, h);
         let lo = floor3(std::array::from_fn(|i| at.min[i].min(start.min[i])));
         let hi = floor3(std::array::from_fn(|i| at.max[i].max(start.max[i])));
-        if !self.portal_in_sections(lo, hi, [np, ep, gw]) {
+        if !self.portal_in_sections(lo, hi, blocks.all()) {
             return Vec::new();
         }
         let mut cells = Vec::new();
         crate::contact::path_cells(from, to, w / 2.0, h, straight, &mut cells);
         let mut out: Vec<Touch> = Vec::new();
         for (p, a, b) in cells {
-            let block = self.state_block(self.get(p));
-            let kind = if block == np {
-                PortalKind::Nether
-            } else if block == gw {
-                PortalKind::Gateway
-            } else if block == ep {
-                let shape = Aabb {
-                    min: [f64::from(p[0]), f64::from(p[1]) + 0.375, f64::from(p[2])],
-                    max: [f64::from(p[0]) + 1.0, f64::from(p[1]) + 0.75, f64::from(p[2]) + 1.0],
-                };
-                if !crate::contact::touches(&shape, a, b, w / 2.0, h, straight) {
-                    continue;
-                }
-                PortalKind::End
-            } else {
+            let Some(kind) = blocks.kind_of(self.state_block(self.get(p))) else { continue };
+            if kind == PortalKind::End && !crate::contact::touches(&end_portal_shape(p), a, b, w / 2.0, h, straight) {
                 continue;
-            };
+            }
             if !out.iter().any(|t| t.pos == p) {
                 out.push(Touch { kind, pos: p });
             }
@@ -1261,12 +1359,7 @@ impl Server {
                 let Some(Some(c)) = self.chunks.get(&(cx, cz)) else { continue };
                 for sy in sy0..=sy1 {
                     let Some(sec) = usize::try_from(sy).ok().and_then(|i| c.sections.get(i)) else { continue };
-                    let maybe = match &sec.blocks {
-                        rc_world::Container::Single(v) => is_portal(*v),
-                        rc_world::Container::Packed { palette: Some(p), .. } => p.iter().any(|&v| is_portal(v)),
-                        rc_world::Container::Packed { palette: None, .. } => true,
-                    };
-                    if maybe {
+                    if sec.blocks.may_contain(is_portal) {
                         return true;
                     }
                 }
