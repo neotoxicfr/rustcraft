@@ -145,7 +145,11 @@ impl Renderer {
         // Kept for the meshing, which only remeshes the dirty sections in view (frustum moved back
         // as the game's: the sections right behind the camera are rebuilt too).
         let forward = crate::camera::axes(yaw, pitch).2;
-        self.meshing_view = Some(MeshingView::new(planes, origin, eye, forward, min_y, height / 16));
+        let meshing_view = MeshingView::new(planes, origin, eye, forward, min_y, height / 16);
+        if self.meshing_view != Some(meshing_view) {
+            self.meshing_view_rev += 1;
+        }
+        self.meshing_view = Some(meshing_view);
         // Improved transparency: targets and pipelines prepared as needed, targets freed otherwise.
         if oit_on {
             self.prepare_oit(proj);

@@ -420,6 +420,8 @@ struct App {
     /// Meshes received not yet uploaded (upload budget per frame, `RUSTCRAFT_OPT_UPLOADBUDGET`).
     mesh_pending: Vec<remesh::Done>,
     in_flight: usize,
+    /// What the last pick that held every dirty column saw (`app_meshing::HeldSignature`).
+    all_held: Option<app_meshing::HeldSignature>,
     eye: [f64; 3],
     yaw: f32,
     pitch: f32,

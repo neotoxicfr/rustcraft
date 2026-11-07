@@ -310,6 +310,7 @@ pub(crate) fn run() {
         meshes_rx,
         mesh_pending: Vec::new(),
         in_flight: 0,
+        all_held: None,
         eye: [0.0, 100.0, 0.0],
         yaw: 0.0,
         pitch: 0.0,

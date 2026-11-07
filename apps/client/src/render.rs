@@ -521,6 +521,8 @@ pub struct Renderer {
     reached: Vec<(i32, i32, i32)>,
     /// Meshing view of the last frame drawn (`frustum::Renderer::sections_in_view`).
     meshing_view: Option<frustum::MeshingView>,
+    /// Bumped each time a frame's meshing view differs from the previous one.
+    meshing_view_rev: u64,
     reached_key: Option<([i64; 3], u64, bool, i32, i32)>,
     columns_rev: u64,
     /// Version of the sections' connectivity (column appeared, disappeared, or one of whose sections
@@ -824,6 +826,7 @@ impl Renderer {
             graph_rx,
             reached: Vec::new(),
             meshing_view: None,
+            meshing_view_rev: 0,
             reached_key: None,
             columns_rev: 0,
             vis_rev: 0,

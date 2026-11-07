@@ -121,7 +121,7 @@ pub(super) fn planes_holding_camera_cell(
 /// What the meshing treats as in view, from the last frame drawn: the draw's frustum moved back
 /// to hold the camera's cell ([`planes_holding_camera_cell`]), camera integer origin (x, z), bottom
 /// of the world, number of sections.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct MeshingView {
     pub planes: [Vec4; 6],
     pub origin: [i32; 2],
@@ -317,6 +317,12 @@ impl Renderer {
         let lo = self.reached.partition_point(|&(rx, _, rz)| (rx, rz) < (x, z));
         let len = self.reached[lo..].partition_point(|&(rx, _, rz)| (rx, rz) == (x, z));
         Some(view.sections_in_view((x, z), &self.reached[lo..lo + len]))
+    }
+
+    /// Everything [`Self::sections_in_view`] reads, as revisions: the meshing view, the walk's
+    /// reached sections and the columns held. The same stamp gives the same verdicts.
+    pub fn meshing_view_stamp(&self) -> [u64; 4] {
+        [self.meshing_view_rev, self.reached_gen, self.vis_rev, self.columns_rev]
     }
 
     /// Appearance fade (0 to 1) of the already meshed column `(x, z)`, `None` before.
