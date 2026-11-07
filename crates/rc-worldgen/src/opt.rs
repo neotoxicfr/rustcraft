@@ -656,6 +656,31 @@ switch_f!(
     "SHARED_GENERATOR_DEFS"
 );
 switch_f!(
+    /// JSON reader: numbers and object keys stored in place, an object as one shared block of members
+    /// sorted by key, instead of a string per number and per key and a tree map per object.
+    compact_json,
+    "COMPACT_JSON"
+);
+switch_f!(
+    /// A data pack file parsed once and its tree shared by every later reader, instead of parsed
+    /// again at every read (a biome file was parsed twice per generator).
+    json_parse_cache,
+    "JSON_PARSE_CACHE"
+);
+/// Named density functions and noises of a pack parsed on every core, only
+/// `RUSTCRAFT_OPT_PARALLEL_DEFS_LOAD=1` (off by default: about a millisecond of work, which waking
+/// the pool's threads costs more than it saves; see `docs/perf.md`).
+#[inline]
+pub fn parallel_defs_load() -> bool {
+    #[cfg(test)]
+    if let Some(v) = forced("PARALLEL_DEFS_LOAD") {
+        return v;
+    }
+    static S: LazyLock<bool> =
+        LazyLock::new(|| rc_data::env_str!("RUSTCRAFT_OPT_PARALLEL_DEFS_LOAD").is_some_and(|v| v.trim() == "1"));
+    *S
+}
+switch_f!(
     /// Biome parameter list of a preset parsed once per world data, then copied into each generator.
     shared_climate_lists,
     "SHARED_CLIMATE_LISTS"

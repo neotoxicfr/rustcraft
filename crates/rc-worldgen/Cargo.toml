@@ -15,6 +15,7 @@ flate2.workspace = true
 md-5.workspace = true
 ring.workspace = true
 rayon.workspace = true
+smol_str.workspace = true
 zip.workspace = true
 thiserror.workspace = true
 

@@ -2484,6 +2484,7 @@ dependencies = [
  "rc-proto",
  "rc-testdata",
  "ring",
+ "smol_str",
  "thiserror 2.0.21",
  "zip",
 ]
