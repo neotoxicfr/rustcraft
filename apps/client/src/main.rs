@@ -46,6 +46,7 @@ mod entity_atlas;
 mod entity_outline;
 mod entity_render;
 mod environ;
+mod events_before_renderer;
 mod exact;
 mod explode;
 mod flow;
@@ -407,6 +408,11 @@ struct App {
     biome_names: Vec<String>,
     world: World,
     renderer: Option<Renderer>,
+    /// GPU being opened in the background until the window exists (`gpu_backend::EarlyGpuOpen`).
+    early_gpu: Option<gpu_backend::EarlyGpuOpen>,
+    /// First session event that needed the renderer while it was being built: applied first at the
+    /// next frame (`events_before_renderer.rs`).
+    held_event: Option<rc_client::Event>,
     meshes_tx: Sender<remesh::Done>,
     meshes_rx: Receiver<remesh::Done>,
     /// Meshes received not yet uploaded (upload budget per frame, `RUSTCRAFT_OPT_UPLOADBUDGET`).

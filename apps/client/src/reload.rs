@@ -1,15 +1,43 @@
 //! Resource reload in game (`docs/specs/resource-packs.md` § 6): new stack read
 //! on a background thread (cache of the baked resources per stack), loading screen, then everything is
 //! replaced and sent back to the GPU: renderer recreated on the same window, sections re-meshed.
+//! The GPU context (surface, adapter, device) is kept from one renderer to the next
+//! (`RUSTCRAFT_OPT_KEEP_GPU_ON_RELOAD`, on by default; `=0`: driver reopened as before).
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use winit::event::WindowEvent;
 
+use crate::gpu_backend::GpuContext;
 use crate::gui::Gui;
 use crate::resources::Loaded;
 use crate::{App, audio_slot, pack_stack, particles, resources, skins};
+
+/// Why a renderer is built, and the GPU context it starts from.
+pub(crate) enum RendererBuild {
+    /// First renderer: device opened early in the background or picked now; the session events
+    /// received meanwhile may be applied between its phases.
+    Startup,
+    /// Resource reload: the old renderer's context when it is kept, otherwise picked again.
+    Reload { kept_gpu: Option<GpuContext> },
+}
+
+/// The renderer reuses the old one's GPU context on a reload (`RUSTCRAFT_OPT_KEEP_GPU_ON_RELOAD`).
+fn keep_gpu_on_reload() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_KEEP_GPU_ON_RELOAD")
+}
+
+/// The exit fade starts once the new resources are applied, like the game, instead of when they
+/// arrive (`RUSTCRAFT_OPT_RELOAD_FADE_AFTER_APPLY`; `=0`: the application ate the start of the fade).
+fn fade_after_apply() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_RELOAD_FADE_AFTER_APPLY")
+}
+
+/// Instant the exit fade starts from: the end of the application, or the arrival of the resources.
+fn fade_start(received: Instant, applied: Instant, after_apply: bool) -> Instant {
+    if after_apply { applied } else { received }
+}
 
 /// Reload in progress or in exit fade.
 pub(crate) struct Reload {
@@ -83,14 +111,8 @@ impl Reload {
     pub fn draw(&mut self, gui: &mut Gui, dark: bool) {
         let (w, h) = (gui.width, gui.height);
         let ms = |t: Instant| t.elapsed().as_secs_f32() * 1000.0;
-        let fade_in = ms(self.start) / FADE_IN_MS;
         let fade_out = self.done.map_or(-1.0, |d| ms(d) / FADE_OUT_MS);
-        let (bg_alpha, logo_alpha) = if fade_out >= 0.0 {
-            let a = 1.0 - (fade_out - 1.0).clamp(0.0, 1.0);
-            (a, a)
-        } else {
-            (fade_in.clamp(0.15, 1.0), fade_in.clamp(0.0, 1.0))
-        };
+        let (bg_alpha, logo_alpha) = screen_alphas(ms(self.start), self.done.map(ms));
         let brand: u32 = if dark { 0x000000 } else { 0xEF323D };
         let alpha = |a: f32| ((a * 255.0).ceil() as u32).min(255) << 24;
         gui.next_layer();
@@ -136,6 +158,21 @@ impl Reload {
     /// Exit fade finished.
     fn finished(&self) -> bool {
         self.done.is_some_and(|d| d.elapsed().as_secs_f32() * 1000.0 >= 2.0 * FADE_OUT_MS)
+    }
+}
+
+/// Opacity of the background and of the logo, `since_start` ms after the reload began and
+/// `since_done` ms after the exit fade started (`None` while loading).
+fn screen_alphas(since_start: f32, since_done: Option<f32>) -> (f32, f32) {
+    match since_done {
+        Some(d) => {
+            let a = 1.0 - (d / FADE_OUT_MS - 1.0).clamp(0.0, 1.0);
+            (a, a)
+        }
+        None => {
+            let fade_in = since_start / FADE_IN_MS;
+            (fade_in.clamp(0.15, 1.0), fade_in.clamp(0.0, 1.0))
+        }
     }
 }
 
@@ -207,7 +244,8 @@ impl App {
                 return;
             }
             let Ok(((l, dropped), audio)) = r.rx.try_recv() else { return };
-            r.done = Some(Instant::now());
+            let received = Instant::now();
+            r.done = Some(received);
             if dropped != resources::Dropped::Nothing {
                 // Like the game: packs removed from the settings, notification after the reload.
                 let all = dropped == resources::Dropped::All;
@@ -221,6 +259,9 @@ impl App {
             let t = Instant::now();
             self.apply_loaded(l, audio);
             eprintln!("resource reload: applied in {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+            if let Some(r) = &mut self.packs.reload {
+                r.done = Some(fade_start(received, Instant::now(), fade_after_apply()));
+            }
             self.packs.generation += 1;
             if std::mem::take(&mut self.packs.again) {
                 self.packs.reload = None;
@@ -279,12 +320,15 @@ impl App {
         self.skins.update(&self.players, self.local_uuid);
         self.pending_registries = self.packs.registries.clone();
         if let Some(w) = window {
-            // The old engine (device, surface) is released before creating another.
-            self.renderer = None;
-            self.build_renderer(w);
-            if let Some(r) = &mut self.renderer {
-                r.shade = self.shade;
+            // The old renderer is released before the new one is built: one swap chain per window
+            // (DXGI, and Vulkan refuses a second surface in use on the same window), and its video
+            // memory given back first. A kept context reuses the same surface and device.
+            let old = self.renderer.take();
+            let kept_gpu = old.filter(|_| keep_gpu_on_reload()).map(crate::Renderer::into_gpu_context);
+            if let Some(gpu) = &kept_gpu {
+                crate::render::wait_for_released_gpu_memory(&gpu.device);
             }
+            self.build_renderer(w, RendererBuild::Reload { kept_gpu });
         }
         // All the columns re-meshed with the new faces (old meshes in flight ignored).
         let cols: Vec<(i32, i32)> = self.world.grid.iter().map(|c| (c.x, c.z)).collect();
@@ -294,23 +338,53 @@ impl App {
         self.apply_options();
     }
 
+    /// GPU context of the first renderer: the device opened early in the background when it is the
+    /// one the order of the APIs gives, otherwise the APIs tried now on the window.
+    fn startup_gpu(&mut self, window: &Arc<winit::window::Window>) -> GpuContext {
+        let early = self.early_gpu.take().and_then(|e| e.join(window));
+        early.unwrap_or_else(|| crate::gpu_backend::pick(window))
+    }
+
     /// Renderer on `window` with the pending resources (startup, reload).
-    pub(crate) fn build_renderer(&mut self, window: Arc<winit::window::Window>) {
+    pub(crate) fn build_renderer(&mut self, window: Arc<winit::window::Window>, how: RendererBuild) {
         let Some(gui_assets) = self.gui_assets.take() else { return };
+        // Before any meshing task: meshing may start while the renderer is being built.
+        crate::render::init_gpu_formats(&self.tables);
+        let (gpu, startup) = match how {
+            RendererBuild::Startup => (self.startup_gpu(&window), true),
+            RendererBuild::Reload { kept_gpu } => {
+                (kept_gpu.unwrap_or_else(|| crate::gpu_backend::pick(&window)), false)
+            }
+        };
         let entity_assets =
             self.entity_textures.take().filter(|_| !self.data.entity_models.is_empty()).map(|t| (self.data.clone(), t));
-        let mut r =
-            crate::Renderer::new(
-                window,
-                &self.models,
-                &self.textures,
-                &self.sky_assets,
-                gui_assets,
-                entity_assets,
-                &self.tables,
-            );
-        self.sky_assets = crate::sky::SkyAssets::default();
-        self.textures = Vec::new();
+        // Owned here so that the events applied between the build phases may borrow the app.
+        let (models, tables) = (self.models.clone(), self.tables.clone());
+        let textures = std::mem::take(&mut self.textures);
+        let sky = std::mem::take(&mut self.sky_assets);
+        let assets = crate::render::RendererAssets {
+            models: &models,
+            textures: &textures,
+            sky: &sky,
+            gui: gui_assets,
+            entities: entity_assets,
+            tables: &tables,
+        };
+        let events_meanwhile = startup && crate::events_before_renderer::enabled();
+        let mut r = crate::Renderer::new(window, gpu, assets, &mut || {
+            if events_meanwhile {
+                self.apply_events_before_renderer();
+            }
+        });
+        drop((textures, sky));
+        // State the events may have set before the renderer existed (always the case on a reload):
+        // shading of the dimension, entity lights of the Nether.
+        r.shade = self.shade;
+        if self.shade == rc_mesh::wire::SHADE_NETHER
+            && let Some(e) = &r.entities
+        {
+            e.set_dimension(&r.queue_handle(), true);
+        }
         if let Some(p) = self.panorama_assets.take() {
             r.enable_panorama(&p);
         }
@@ -334,5 +408,34 @@ impl App {
         let json = self.assets.read("assets/minecraft/regional_compliancies.json").unwrap_or_default();
         let now = self.started.elapsed().as_secs_f64() * 1000.0;
         self.toasts.periodic = crate::toasts::Periodic::new(&json, crate::debug_sys::country_iso3().as_deref(), now);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Opacity of the loading screen on the frames that follow the application of the resources
+    /// (60 Hz, 2.3 s): with the fade started after the application it does not depend on how long
+    /// the application lasted, like the game; started at their arrival, a 300 ms application ate
+    /// the start of the fade. Sabotage checked: `fade_start` returning the arrival fails the first
+    /// assertion.
+    #[test]
+    fn fade_curve_does_not_depend_on_the_apply_duration() {
+        let curve = |apply_ms: u64, after_apply: bool| {
+            let received = Instant::now();
+            let applied = received + Duration::from_millis(apply_ms);
+            let done = fade_start(received, applied, after_apply);
+            let since_done = |k: u64| (applied + Duration::from_millis(16 * k) - done).as_secs_f32() * 1000.0;
+            (0..140).map(|k| screen_alphas(10_000.0, Some(since_done(k)))).collect::<Vec<_>>()
+        };
+        assert_eq!(curve(300, true), curve(0, true), "fade after the application");
+        assert_eq!(curve(0, false), curve(0, true), "instant application: both starts agree");
+        assert_ne!(curve(300, false), curve(0, false), "the old start loses the application time");
+        // While loading: the background rises from 15 % and the logo from 0 over half a second.
+        assert_eq!(screen_alphas(0.0, None), (0.15, 0.0));
+        assert_eq!(screen_alphas(250.0, None), (0.5, 0.5));
+        assert_eq!(screen_alphas(900.0, None), (1.0, 1.0));
     }
 }

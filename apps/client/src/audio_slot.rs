@@ -210,6 +210,14 @@ impl Audio {
         matches!(self.0, State::Pending { .. })
     }
 
+    /// [`get`](Self::get) returns at once: no sound, engine ready, or its thread already done.
+    pub fn joins_without_waiting(&self) -> bool {
+        match &self.0 {
+            State::Pending { handle, .. } => handle.is_finished(),
+            State::Off | State::Ready(_) => true,
+        }
+    }
+
     /// With sound (engine ready or being built).
     pub fn is_on(&self) -> bool {
         !matches!(self.0, State::Off)
