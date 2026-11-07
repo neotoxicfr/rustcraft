@@ -344,12 +344,7 @@ impl Server {
             return false;
         };
         let Some(mut m) = self.mobs.list.take(i) else { return false };
-        if let Some(mut b) = m.npc.as_mut().and_then(|n| n.brain.take()) {
-            self.stop_sleeping(&mut m, &mut b);
-            if let Some(n) = m.npc.as_mut() {
-                n.brain = Some(b);
-            }
-        }
+        self.npc_wake(&mut m);
         self.mobs.list.put(i, m);
         true
     }

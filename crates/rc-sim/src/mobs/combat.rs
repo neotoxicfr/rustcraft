@@ -714,6 +714,9 @@ impl Server {
         {
             self.pet_death_message(m, owner);
         }
+        // Like the game, a sleeper is woken before the rest of the death, conversion by a zombie
+        // included: bed freed, stood up beside it.
+        self.npc_wake(m);
         m.dead = true;
         m.use_ticks = -1;
         // Wolf: no longer wet or shaking off.
