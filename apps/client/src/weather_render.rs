@@ -258,7 +258,7 @@ impl WeatherRenderer {
         self.pending = Some(images);
     }
 
-    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, _up: &mut crate::render::upload::Uploader) {
         if let Some(img) = self.pending.take() {
             // Nearest neighbor, repeat, no mipmap (§ 1.8).
             let sampler = device.create_sampler(&wgpu::SamplerDescriptor {

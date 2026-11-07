@@ -400,7 +400,7 @@ impl Cracks {
         self.verts.extend(late);
     }
 
-    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, _up: &mut crate::render::upload::Uploader) {
         self.total = self.verts.len() as u32;
         if self.verts.is_empty() {
             return;

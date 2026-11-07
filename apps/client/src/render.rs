@@ -893,7 +893,9 @@ impl Renderer {
     pub fn prepare_overlays(&mut self, f: &crate::overlays::Frame<'_>) {
         let (frames, size, scale) = (&self.frames, (self.config.width, self.config.height), self.gui.scale);
         if let Some(o) = &mut self.overlays {
-            o.prepare(&self.device, &self.queue, f, size, scale, |t| frames.get(t as usize).map(|v| v[0] & 0xffff));
+            o.prepare(&self.device, &self.queue, &mut self.up, f, size, scale, |t| {
+                frames.get(t as usize).map(|v| v[0] & 0xffff)
+            });
         }
     }
 

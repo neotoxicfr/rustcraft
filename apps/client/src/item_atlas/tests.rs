@@ -117,9 +117,10 @@ fn frame(e: &Env, a: &mut ItemAtlas, items: &[(u64, Vec<Layer>)], ms: u64) -> (u
         a.cell_for(&e.device, *k, l).expect("case");
     }
     let clears = a.clears.len();
+    let mut up = crate::render::upload::Uploader::new(&e.device, true);
     let mut enc = e.device.create_command_encoder(&Default::default());
-    a.encode(&e.device, &e.queue, &mut enc, None);
-    e.queue.submit([enc.finish()]);
+    a.encode(&e.device, &e.queue, &mut up, &mut enc, None);
+    up.submit(&e.queue, enc.finish());
     (clears, uvs)
 }
 
@@ -202,6 +203,7 @@ fn glint_clock_counts_passes() {
             items.retain(|(_, l)| l.iter().all(|l| l.glint == 0));
         }
         let mut shown: Vec<(u64, Vec<Layer>)> = Vec::new();
+        let mut up = crate::render::upload::Uploader::new(&e.device, true);
         let (mut passes, mut tick) = (0, 0);
         for f in 0..2400u64 {
             let us = f * 400 + 1;
@@ -219,8 +221,8 @@ fn glint_clock_counts_passes() {
             }
             passes += u32::from(!a.clears.is_empty());
             let mut enc = e.device.create_command_encoder(&Default::default());
-            a.encode(&e.device, &e.queue, &mut enc, None);
-            e.queue.submit([enc.finish()]);
+            a.encode(&e.device, &e.queue, &mut up, &mut enc, None);
+            up.submit(&e.queue, enc.finish());
             if f % 100 == 99 {
                 e.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).expect("GPU wait");
             }

@@ -258,7 +258,13 @@ impl Outline {
         self.segments.extend(edges.iter().map(|e| Segment { a: add(e[0]), b: add(e[1]) }));
     }
 
-    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, size: (u32, u32)) {
+    pub fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        _up: &mut crate::render::upload::Uploader,
+        size: (u32, u32),
+    ) {
         self.count = self.segments.len() as u32;
         if self.segments.is_empty() {
             return;

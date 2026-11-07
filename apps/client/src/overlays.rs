@@ -259,10 +259,12 @@ impl Overlays {
 
     /// Builds and sends the frame's vertices. `size` = window in pixels, `scale` = scale
     /// of the interface, `layer` = current layer of a block texture (animations included).
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        _up: &mut crate::render::upload::Uploader,
         f: &Frame<'_>,
         size: (u32, u32),
         scale: u32,

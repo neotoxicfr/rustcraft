@@ -165,6 +165,7 @@ impl Blur {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        _up: &mut crate::render::upload::Uploader,
         enc: &mut wgpu::CommandEncoder,
         frame: &wgpu::Texture,
         frame_view: &wgpu::TextureView,

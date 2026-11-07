@@ -283,7 +283,13 @@ impl BlockFx {
         }));
     }
 
-    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, f: &FxFrame) {
+    pub fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        _up: &mut crate::render::upload::Uploader,
+        f: &FxFrame,
+    ) {
         self.counts = (f.beams.len() as u32, f.halos.len() as u32, f.portals.len() as u32);
         if self.counts == (0, 0, 0) {
             return;

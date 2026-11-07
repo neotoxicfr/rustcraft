@@ -1,4 +1,4 @@
-//! Uploads to the GPU buffers, common to the whole renderer.
+//! Uploads to the GPU buffers and textures, common to the whole renderer.
 //!
 //! **Upload transit** (`RUSTCRAFT_OPT_UPLOADRING`, default 1). Old path (`=0`): each
 //! write goes through wgpu's queue write, which creates a transit buffer, fills it, then
@@ -12,11 +12,35 @@
 //!
 //! Rules of use:
 //! - every submission that follows writes goes through [`Uploader::submit`] (otherwise the writes
-//!   wait for the next submission); no copy is inserted in the caller's encoder;
-//! - a buffer written here is never also written by `queue.write_buffer` (within one submit, the
-//!   queue writes would go before the transit and the order of the calls would be lost);
+//!   wait for the next submission); a copy that must stay in order with the writes (a growing
+//!   buffer moving its contents) goes through [`Uploader::copy_buffer`], never through a
+//!   submission of its own;
+//! - a buffer or texture written here is never also written by the queue (`write_buffer`,
+//!   `write_texture`): within one submit, the queue writes would go before the transit and the
+//!   order of the calls would be lost. Debug builds and tests check it for the queue writes made
+//!   here (the `=0` paths of the switches below);
+//! - a texture written here that grows by a GPU copy has that copy recorded here too: a direct
+//!   submission would run before the pending writes and lose them (the glyph pages and the entity
+//!   textures grow that way, with their writes still on the queue);
 //! - a write larger than a chunk has its own disposable buffer (same cost as before);
 //!   beyond `MAX_FREE` free chunks, the chunks returned are destroyed (bounded memory).
+//!
+//! Switches, read once when the uploader is created (default 1, `=0` = the path before):
+//! - `RUSTCRAFT_OPT_FRAME_WRITES_RING`: the per-frame layers' buffers ([`per_frame::FrameBuffer`])
+//!   written through the ring; `=0`: through the queue, for the A/B of each migrated layer in one exe;
+//! - `RUSTCRAFT_OPT_RING_TEXTURE_WRITES`: [`Uploader::write_texture`] through the ring, rows
+//!   padded to 256 bytes in the chunk; `=0`: the queue's texture write;
+//! - `RUSTCRAFT_OPT_GROWTH_IN_TRANSIT`: [`Uploader::copy_buffer`] recorded in the transit in call
+//!   order; `=0`: submitted at once after the pending transit (one more command buffer);
+//! - `RUSTCRAFT_OPT_SINGLE_COMMAND_BUFFER`: [`Uploader::frame_encoder`] hands out the transit
+//!   encoder, the pending writes at its head (one command buffer per submission instead of two).
+//!   A write made after that call goes into a new transit submitted before the frame, so it must
+//!   not touch a resource written before the call (checked in debug builds and tests);
+//! - `RUSTCRAFT_OPT_ADAPTIVE_UPLOAD_CHUNK`: chunks of max(1 MiB, power of two above the largest
+//!   write of the last 60 submissions), 8 MiB at most: a large write made on every frame (the
+//!   matrices of a crowd) reuses its chunk instead of a disposable buffer per frame;
+//! - `RUSTCRAFT_OPT_MERGE_UPLOAD_COPIES`: a write that continues the previous one (same target, same
+//!   chunk, contiguous on both sides) extends its GPU copy instead of recording another.
 //!
 //! **Frame uniforms** ([`Slots`], `RUSTCRAFT_OPT_FRAMEUNIF`, `RUSTCRAFT_OPT_UNIFSKIP`):
 //! N values of 256 bytes (one camera per slot) in a single buffer with fixed offsets, one binding
@@ -25,10 +49,18 @@
 //! frame. The slot buffers are never recreated (a surface resume keeps them); a
 //! subsystem that recreated its own must forget the last values written (`sent`).
 
+pub(crate) mod per_frame;
+
 use crossbeam_channel::{Receiver, Sender};
 
-/// Size of a ring chunk; a larger write has its disposable buffer.
+/// Size of a ring chunk (the smallest one with adaptive chunks); a larger write has its
+/// disposable buffer.
 const CHUNK: u64 = 1 << 20;
+/// Largest adaptive chunk: a larger write keeps its disposable buffer, and the chunks kept stay
+/// under `MAX_FREE` × 8 MiB.
+const MAX_CHUNK: u64 = 8 << 20;
+/// Submissions whose largest write sets the size of the adaptive chunks.
+const CHUNK_WINDOW: usize = 60;
 /// Free chunks kept at most (beyond, given back to the driver).
 const MAX_FREE: usize = 8;
 /// Size of a uniform slot (maximum alignment of the uniform binding offsets).
@@ -49,12 +81,33 @@ pub fn skip_on() -> bool {
     rc_data::opt_switch!("RUSTCRAFT_OPT_UNIFSKIP")
 }
 
-/// Counters since the last sample: writes, transit buffers created, bytes written.
+/// Behaviour of the ring itself (module header), read once; the tests set it directly.
+#[derive(Debug, Clone, Copy)]
+struct Options {
+    growth_in_transit: bool,
+    adaptive_chunk: bool,
+    merge_copies: bool,
+}
+
+impl Options {
+    fn from_switches() -> Self {
+        Options {
+            growth_in_transit: rc_data::opt_switch!("RUSTCRAFT_OPT_GROWTH_IN_TRANSIT"),
+            adaptive_chunk: rc_data::opt_switch!("RUSTCRAFT_OPT_ADAPTIVE_UPLOAD_CHUNK"),
+            merge_copies: rc_data::opt_switch!("RUSTCRAFT_OPT_MERGE_UPLOAD_COPIES"),
+        }
+    }
+}
+
+/// Counters since the last sample: writes, transit buffers created, bytes written, GPU copies
+/// recorded (after merges) and command buffers submitted.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Stats {
     pub writes: u64,
     pub transits: u64,
     pub bytes: u64,
+    pub copies: u64,
+    pub command_buffers: u64,
 }
 
 /// Chunk being filled: its mapped view (kept while it is active) and the cursor.
@@ -64,89 +117,95 @@ struct Active {
     at: u64,
 }
 
+/// GPU copy of a write, from the transit into its target.
+struct BufferCopy {
+    src: wgpu::Buffer,
+    src_offset: u64,
+    dst: wgpu::Buffer,
+    dst_offset: u64,
+    len: u64,
+}
+
+impl BufferCopy {
+    /// True if `next` continues this copy on both sides (same chunk and same target, contiguous).
+    fn continued_by(&self, next: &BufferCopy) -> bool {
+        self.src == next.src
+            && self.dst == next.dst
+            && self.src_offset + self.len == next.src_offset
+            && self.dst_offset + self.len == next.dst_offset
+    }
+
+    fn record(&self, enc: &mut wgpu::CommandEncoder) {
+        enc.copy_buffer_to_buffer(&self.src, self.src_offset, &self.dst, self.dst_offset, self.len);
+    }
+}
+
 pub struct Uploader {
     device: wgpu::Device,
     ring: bool,
+    opts: Options,
+    #[cfg_attr(not(test), expect(dead_code, reason = "read by the per-frame uploads once the layers migrate"))]
+    layer_opts: per_frame::LayerOptions,
     enc: Option<wgpu::CommandEncoder>,
     active: Option<Active>,
+    /// Copy of the last write, not recorded yet (`merge_copies`): the next write may extend it.
+    pending: Option<BufferCopy>,
     /// Chunks written since the last submission (unmapped), returned after being read.
     used: Vec<wgpu::Buffer>,
     /// Chunks back from the GPU, mapped and empty.
     free: Vec<wgpu::Buffer>,
     back_tx: Sender<wgpu::Buffer>,
     back_rx: Receiver<wgpu::Buffer>,
+    chunk_size: ChunkSizer,
+    rules: rules::RuleCheck,
     stats: Stats,
-    /// Test sabotage: number of the omitted write.
     #[cfg(test)]
+    sabotage: Sabotage,
+}
+
+/// Faults injected by the tests, each of which must make an equivalence proof fail.
+#[cfg(test)]
+#[derive(Default)]
+struct Sabotage {
+    /// Number of the omitted write.
     omit: Option<u64>,
+    /// Texture rows staged without their padding (the declared stride stays padded).
+    unpadded_rows: bool,
+    /// Growth copies recorded after all the writes of the transit instead of in call order.
+    growth_copies_last: bool,
+    delayed_growth_copies: Vec<BufferCopy>,
 }
 
 impl Uploader {
     pub fn new(device: &wgpu::Device, ring: bool) -> Self {
+        Self::with_options(device, ring, Options::from_switches(), per_frame::LayerOptions::from_switches())
+    }
+
+    fn with_options(device: &wgpu::Device, ring: bool, opts: Options, layer_opts: per_frame::LayerOptions) -> Self {
         let (back_tx, back_rx) = crossbeam_channel::unbounded();
         Uploader {
             device: device.clone(),
             ring,
+            opts,
+            layer_opts,
             enc: None,
             active: None,
+            pending: None,
             used: Vec::new(),
             free: Vec::new(),
             back_tx,
             back_rx,
+            chunk_size: ChunkSizer::new(opts.adaptive_chunk),
+            rules: rules::RuleCheck::new(),
             stats: Stats::default(),
             #[cfg(test)]
-            omit: None,
+            sabotage: Sabotage::default(),
         }
     }
 
     /// Writes `data` into `target` at `offset` (multiples of 4), effective at the next submission.
     pub fn write(&mut self, queue: &wgpu::Queue, target: &wgpu::Buffer, offset: u64, data: &[u8]) {
-        if data.is_empty() {
-            return;
-        }
-        #[cfg(test)]
-        if self.omit == Some(self.stats.writes) {
-            self.stats.writes += 1;
-            return;
-        }
-        let len = data.len() as u64;
-        self.stats.writes += 1;
-        self.stats.bytes += len;
-        if !self.ring {
-            self.stats.transits += 1;
-            queue.write_buffer(target, offset, data);
-            return;
-        }
-        debug_assert!(
-            len.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT) && offset.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
-        );
-        if len > CHUNK {
-            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("transit (large upload)"),
-                size: len,
-                usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: true,
-            });
-            buf.slice(..).get_mapped_range_mut().expect("transit mapped at creation").copy_from_slice(data);
-            buf.unmap();
-            self.stats.transits += 1;
-            // The buffer stays alive as long as the recorded copy has not been executed.
-            self.encoder().copy_buffer_to_buffer(&buf, 0, target, offset, len);
-            return;
-        }
-        if self.active.as_ref().is_none_or(|a| a.at + len > CHUNK) {
-            self.close_active();
-            let buf = self.take_chunk();
-            let view = buf.slice(..).get_mapped_range_mut().expect("transit chunk mapped");
-            self.active = Some(Active { buf, view, at: 0 });
-        }
-        let device = &self.device;
-        let enc = self.enc.get_or_insert_with(|| new_encoder(device));
-        let a = self.active.as_mut().expect("active chunk");
-        let at = a.at;
-        a.view.slice(at as usize..(at + len) as usize).copy_from_slice(data);
-        a.at = at + len;
-        enc.copy_buffer_to_buffer(&a.buf, at, target, offset, len);
+        self.write_routed(queue, target, offset, data, self.ring);
     }
 
     /// Like [`Uploader::write`], the `len` bytes being filled by `fill` directly in the
@@ -160,52 +219,55 @@ impl Uploader {
         len: u64,
         fill: impl FnOnce(wgpu::WriteOnly<'_, [u8]>),
     ) {
-        let Some(size) = wgpu::BufferSize::new(len) else { return };
-        self.stats.writes += 1;
-        self.stats.bytes += len;
-        if !self.ring {
-            self.stats.transits += 1;
-            let mut view = queue.write_buffer_with(target, offset, size).expect("valid queue write");
-            fill(view.slice(..));
+        self.write_with_routed(queue, target, offset, len, fill, self.ring);
+    }
+
+    /// Copies `len` bytes of `src` into `dst` in order with the writes (a growing buffer moving its
+    /// contents into the larger one): recorded in the transit (`RUSTCRAFT_OPT_GROWTH_IN_TRANSIT`),
+    /// or submitted at once after the pending transit (`=0`, and always without the ring, where
+    /// the queue writes that follow must land after the copy).
+    pub fn copy_buffer(
+        &mut self,
+        queue: &wgpu::Queue,
+        src: &wgpu::Buffer,
+        src_offset: u64,
+        dst: &wgpu::Buffer,
+        dst_offset: u64,
+        len: u64,
+    ) {
+        if !(self.ring && self.opts.growth_in_transit) {
+            let mut enc = new_encoder(&self.device, "buffer growth");
+            enc.copy_buffer_to_buffer(src, src_offset, dst, dst_offset, len);
+            self.submit(queue, enc.finish());
             return;
         }
-        debug_assert!(
-            len.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT) && offset.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
-        );
-        if len > CHUNK {
-            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("transit (large upload)"),
-                size: len,
-                usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: true,
-            });
-            fill(buf.slice(..).get_mapped_range_mut().expect("transit mapped at creation").slice(..));
-            buf.unmap();
-            self.stats.transits += 1;
-            self.encoder().copy_buffer_to_buffer(&buf, 0, target, offset, len);
+        self.rules.ring_reads(src);
+        self.rules.ring_writes(dst);
+        let copy = BufferCopy { src: src.clone(), src_offset, dst: dst.clone(), dst_offset, len };
+        #[cfg(test)]
+        if self.sabotage.growth_copies_last {
+            self.sabotage.delayed_growth_copies.push(copy);
             return;
         }
-        if self.active.as_ref().is_none_or(|a| a.at + len > CHUNK) {
-            self.close_active();
-            let buf = self.take_chunk();
-            let view = buf.slice(..).get_mapped_range_mut().expect("transit chunk mapped");
-            self.active = Some(Active { buf, view, at: 0 });
-        }
-        let device = &self.device;
-        let enc = self.enc.get_or_insert_with(|| new_encoder(device));
-        let a = self.active.as_mut().expect("active chunk");
-        let at = a.at;
-        fill(a.view.slice(at as usize..(at + len) as usize));
-        a.at = at + len;
-        enc.copy_buffer_to_buffer(&a.buf, at, target, offset, len);
+        self.record_pending();
+        self.record(&copy);
     }
 
     /// Submits `cmd` preceded by the transit of the pending writes.
     pub fn submit(&mut self, queue: &wgpu::Queue, cmd: wgpu::CommandBuffer) -> wgpu::SubmissionIndex {
-        match self.finish() {
-            Some(transit) => queue.submit([transit, cmd]),
-            None => queue.submit([cmd]),
-        }
+        let index = match self.finish() {
+            Some(transit) => {
+                self.stats.command_buffers += 2;
+                queue.submit([transit, cmd])
+            }
+            None => {
+                self.stats.command_buffers += 1;
+                queue.submit([cmd])
+            }
+        };
+        self.chunk_size.end_submission();
+        self.rules.submitted();
+        index
     }
 
     /// Counters since the last call.
@@ -213,15 +275,157 @@ impl Uploader {
         std::mem::take(&mut self.stats)
     }
 
+    /// Counts a write of `len` bytes; false if a test sabotage omits it.
+    fn counted(&mut self, len: u64) -> bool {
+        self.stats.writes += 1;
+        #[cfg(test)]
+        if self.sabotage.omit == Some(self.stats.writes - 1) {
+            return false;
+        }
+        self.stats.bytes += len;
+        true
+    }
+
+    fn write_routed(&mut self, queue: &wgpu::Queue, target: &wgpu::Buffer, offset: u64, data: &[u8], ring: bool) {
+        if data.is_empty() || !self.counted(data.len() as u64) {
+            return;
+        }
+        if ring {
+            self.ring_write(target, offset, data.len() as u64, |mut view| view.copy_from_slice(data));
+        } else {
+            self.rules.queue_writes(target);
+            self.stats.transits += 1;
+            queue.write_buffer(target, offset, data);
+        }
+    }
+
+    fn write_with_routed(
+        &mut self,
+        queue: &wgpu::Queue,
+        target: &wgpu::Buffer,
+        offset: u64,
+        len: u64,
+        fill: impl FnOnce(wgpu::WriteOnly<'_, [u8]>),
+        ring: bool,
+    ) {
+        let Some(size) = wgpu::BufferSize::new(len) else { return };
+        if !self.counted(len) {
+            return;
+        }
+        if ring {
+            self.ring_write(target, offset, len, fill);
+        } else {
+            self.rules.queue_writes(target);
+            self.stats.transits += 1;
+            let mut view = queue.write_buffer_with(target, offset, size).expect("valid queue write");
+            fill(view.slice(..));
+        }
+    }
+
+    /// Write through the transit: staged in a chunk, then a GPU copy into `target`.
+    fn ring_write(
+        &mut self,
+        target: &wgpu::Buffer,
+        offset: u64,
+        len: u64,
+        fill: impl FnOnce(wgpu::WriteOnly<'_, [u8]>),
+    ) {
+        debug_assert!(
+            len.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT) && offset.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT)
+        );
+        self.rules.ring_writes(target);
+        let (src, src_offset) = self.stage(len, wgpu::COPY_BUFFER_ALIGNMENT, fill);
+        let copy = BufferCopy { src, src_offset, dst: target.clone(), dst_offset: offset, len };
+        if !self.opts.merge_copies {
+            self.record(&copy);
+            return;
+        }
+        // Kept unrecorded: a run of contiguous writes (fade slots, neighbouring columns) then costs
+        // one GPU copy instead of one per write.
+        match &mut self.pending {
+            Some(last) if last.continued_by(&copy) => last.len += copy.len,
+            _ => {
+                self.record_pending();
+                self.pending = Some(copy);
+            }
+        }
+    }
+
+    /// Room for `len` bytes in the transit at an offset aligned to `align`, filled by `fill`: the
+    /// source buffer and offset of its GPU copy. A write larger than a chunk gets a disposable buffer.
+    fn stage(&mut self, len: u64, align: u64, fill: impl FnOnce(wgpu::WriteOnly<'_, [u8]>)) -> (wgpu::Buffer, u64) {
+        self.chunk_size.note_write(len);
+        if len > self.chunk_size.current() {
+            return (self.disposable(len, fill), 0);
+        }
+        let at = self.room_in_active_chunk(len, align);
+        let active = self.active.as_mut().expect("active chunk");
+        fill(active.view.slice(at as usize..(at + len) as usize));
+        active.at = at + len;
+        (active.buf.clone(), at)
+    }
+
+    /// Offset of `len` bytes in the active chunk; a new chunk is taken when it has no room left.
+    fn room_in_active_chunk(&mut self, len: u64, align: u64) -> u64 {
+        if let Some(active) = &self.active {
+            let at = active.at.next_multiple_of(align);
+            if at + len <= active.buf.size() {
+                return at;
+            }
+        }
+        self.close_active();
+        let buf = self.take_chunk();
+        let view = buf.slice(..).get_mapped_range_mut().expect("transit chunk mapped");
+        self.active = Some(Active { buf, view, at: 0 });
+        0
+    }
+
+    /// Transit of its own for a write larger than a chunk, destroyed once its copy has run.
+    fn disposable(&mut self, len: u64, fill: impl FnOnce(wgpu::WriteOnly<'_, [u8]>)) -> wgpu::Buffer {
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("transit (large upload)"),
+            size: len,
+            usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        });
+        fill(buf.slice(..).get_mapped_range_mut().expect("transit mapped at creation").slice(..));
+        buf.unmap();
+        self.stats.transits += 1;
+        buf
+    }
+
+    /// Records the copy kept for a merge: every later command lands after it (call order).
+    fn record_pending(&mut self) {
+        if let Some(copy) = self.pending.take() {
+            self.record(&copy);
+        }
+    }
+
+    fn record(&mut self, copy: &BufferCopy) {
+        self.stats.copies += 1;
+        copy.record(self.encoder());
+    }
+
     fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
         let device = &self.device;
-        self.enc.get_or_insert_with(|| new_encoder(device))
+        self.enc.get_or_insert_with(|| new_encoder(device, "transit"))
     }
 
     /// Closes the transit: chunks unmapped, returned to the ring when the GPU has read them.
     fn finish(&mut self) -> Option<wgpu::CommandBuffer> {
+        self.record_pending();
+        #[cfg(test)]
+        for copy in std::mem::take(&mut self.sabotage.delayed_growth_copies) {
+            self.record(&copy);
+        }
         let enc = self.enc.take()?;
         self.close_active();
+        self.return_chunks_after(&enc);
+        Some(enc.finish())
+    }
+
+    /// The chunks written since the last submission go back to the ring once `enc` has run.
+    fn return_chunks_after(&mut self, enc: &wgpu::CommandEncoder) {
         for buf in self.used.drain(..) {
             let (tx, back) = (self.back_tx.clone(), buf.clone());
             enc.map_buffer_on_submit(&buf, wgpu::MapMode::Write, .., move |r| {
@@ -230,7 +434,6 @@ impl Uploader {
                 }
             });
         }
-        Some(enc.finish())
     }
 
     fn close_active(&mut self) {
@@ -241,18 +444,21 @@ impl Uploader {
         }
     }
 
-    /// Free chunk (back from the GPU) or new one, mapped.
+    /// Free chunk (back from the GPU) or new one, mapped, of the current chunk size.
     fn take_chunk(&mut self) -> wgpu::Buffer {
+        let size = self.chunk_size.current();
         while let Ok(b) = self.back_rx.try_recv() {
             if self.free.len() < MAX_FREE {
                 self.free.push(b);
             }
         }
+        // Chunks of an older size (adaptive chunks) are given back to the driver.
+        self.free.retain(|b| b.size() == size);
         self.free.pop().unwrap_or_else(|| {
             self.stats.transits += 1;
             self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("transit ring"),
-                size: CHUNK,
+                size,
                 usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: true,
             })
@@ -260,8 +466,143 @@ impl Uploader {
     }
 }
 
-fn new_encoder(device: &wgpu::Device) -> wgpu::CommandEncoder {
-    device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("transit") })
+fn new_encoder(device: &wgpu::Device, label: &str) -> wgpu::CommandEncoder {
+    device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) })
+}
+
+/// Size of the next ring chunks. Adaptive: max(1 MiB, power of two above the largest write of the
+/// last `CHUNK_WINDOW` submissions), `MAX_CHUNK` at most; otherwise always 1 MiB.
+struct ChunkSizer {
+    adaptive: bool,
+    current: u64,
+    /// Largest write (up to `MAX_CHUNK`) of each of the last submissions, in a circle.
+    largest: [u64; CHUNK_WINDOW],
+    slot: usize,
+}
+
+impl ChunkSizer {
+    fn new(adaptive: bool) -> Self {
+        ChunkSizer { adaptive, current: CHUNK, largest: [0; CHUNK_WINDOW], slot: 0 }
+    }
+
+    fn current(&self) -> u64 {
+        self.current
+    }
+
+    /// A write of `len` bytes: with adaptive chunks, one that stays under `MAX_CHUNK` raises the
+    /// size at once (its chunk is created now and recycled afterwards).
+    fn note_write(&mut self, len: u64) {
+        if !self.adaptive || len > MAX_CHUNK {
+            return;
+        }
+        self.largest[self.slot] = self.largest[self.slot].max(len);
+        self.current = self.current.max(len.next_power_of_two());
+    }
+
+    /// End of a submission: the window moves on and the size follows its largest write (back to
+    /// 1 MiB once the large writes have stopped for a whole window).
+    fn end_submission(&mut self) {
+        if !self.adaptive {
+            return;
+        }
+        self.slot = (self.slot + 1) % CHUNK_WINDOW;
+        self.largest[self.slot] = 0;
+        let largest = self.largest.iter().copied().max().unwrap_or(0);
+        self.current = largest.next_power_of_two().max(CHUNK);
+    }
+}
+
+/// Check of the rules of use (module header), in debug builds and tests only: a resource written
+/// by the ring is never written by the queue afterwards, and after [`Uploader::frame_encoder`] a
+/// late write or growth copy never touches a resource already written at the head of the frame
+/// encoder. Per resource, not per range: conservative.
+#[cfg(any(test, debug_assertions))]
+mod rules {
+    use std::any::TypeId;
+    use std::collections::HashSet;
+    use std::hash::{Hash, Hasher};
+
+    /// Identity of a buffer or texture that does not keep it alive (wgpu ids are never reused;
+    /// the type keeps a buffer and a texture with the same id apart).
+    fn key<T: Hash + 'static>(resource: &T) -> u64 {
+        let mut h = std::hash::DefaultHasher::new();
+        (TypeId::of::<T>(), resource).hash(&mut h);
+        h.finish()
+    }
+
+    #[derive(Default)]
+    pub(super) struct RuleCheck {
+        /// Every resource ever written by the ring.
+        ring_written: HashSet<u64>,
+        /// Resources written since the last submission.
+        this_submission: Vec<u64>,
+        /// Resources written at the head of the frame encoder handed out, until the submission.
+        at_head: Vec<u64>,
+    }
+
+    impl RuleCheck {
+        pub(super) fn new() -> Self {
+            Self::default()
+        }
+
+        pub(super) fn ring_writes<T: Hash + 'static>(&mut self, resource: &T) {
+            let k = key(resource);
+            assert!(
+                !self.at_head.contains(&k),
+                "late write to a resource already written at the head of the frame encoder: it would land first"
+            );
+            self.ring_written.insert(k);
+            self.this_submission.push(k);
+        }
+
+        pub(super) fn ring_reads<T: Hash + 'static>(&mut self, resource: &T) {
+            assert!(
+                !self.at_head.contains(&key(resource)),
+                "late copy from a resource written at the head of the frame encoder: it would read the old contents"
+            );
+        }
+
+        pub(super) fn queue_writes<T: Hash + 'static>(&self, resource: &T) {
+            assert!(
+                !self.ring_written.contains(&key(resource)),
+                "queue write to a resource written by the ring: it would land before the ring's pending writes"
+            );
+        }
+
+        #[cfg_attr(not(test), expect(dead_code, reason = "first caller: the frame encoder once wired"))]
+        pub(super) fn frame_encoder_taken(&mut self) {
+            self.at_head.append(&mut self.this_submission);
+        }
+
+        pub(super) fn submitted(&mut self) {
+            self.this_submission.clear();
+            self.at_head.clear();
+        }
+    }
+}
+
+/// Release builds: the rules are not checked (nothing computed).
+#[cfg(not(any(test, debug_assertions)))]
+mod rules {
+    pub(super) struct RuleCheck;
+
+    impl RuleCheck {
+        pub(super) fn new() -> Self {
+            RuleCheck
+        }
+
+        #[inline(always)]
+        pub(super) fn ring_writes<T>(&mut self, _: &T) {}
+        #[inline(always)]
+        pub(super) fn ring_reads<T>(&mut self, _: &T) {}
+        #[inline(always)]
+        pub(super) fn queue_writes<T>(&self, _: &T) {}
+        #[expect(dead_code, reason = "first caller: the frame encoder once wired")]
+        #[inline(always)]
+        pub(super) fn frame_encoder_taken(&mut self) {}
+        #[inline(always)]
+        pub(super) fn submitted(&mut self) {}
+    }
 }
 
 /// `N` uniforms of [`SLOT`] bytes of the frame (see the module header).
@@ -334,352 +675,5 @@ impl<const N: usize> Slots<N> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
-    //! Proof on a real GPU: a deterministic script of 300 frames of writes (small,
-    //! overlapping, larger than a chunk, buffers enlarged by a copy submitted in the middle
-    //! like `alloc_in`, and a check copy in each frame's encoder that reads a written
-    //! buffer) played by the old and the new path; final contents and log of the copies read back and
-    //! compared with the CPU model. An omitted write makes the comparison fail (verified right here).
-    //! Without a GPU the test skips itself; under `RUSTCRAFT_OPT_REQUIRE=1` it is a failure.
-    use super::*;
-
-    /// Tests on a real GPU: only one at a time in the binary. Each creates its instance and its
-    /// device; sixteen at once occasionally blocked all the GPU tests (about one
-    /// run in five, never on a single thread). Taken by each test device creation and
-    /// held by the test thread until its end (libtest: one thread per test; on a single thread, already
-    /// held, it is not taken again).
-    pub(crate) fn gpu_serial() {
-        use std::sync::{Mutex, MutexGuard, PoisonError};
-        static L: Mutex<()> = Mutex::new(());
-        thread_local! {
-            static HELD: std::cell::RefCell<Option<MutexGuard<'static, ()>>> = const { std::cell::RefCell::new(None) };
-        }
-        HELD.with(|h| {
-            let mut h = h.borrow_mut();
-            if h.is_none() {
-                *h = Some(L.lock().unwrap_or_else(PoisonError::into_inner));
-            }
-        });
-    }
-
-    pub(crate) fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
-        gpu_serial();
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            ..Default::default()
-        }))
-        .ok();
-        // A software adapter (WARP, llvmpipe) is not the real GPU these proofs are about.
-        let hardware = adapter.filter(|a| a.get_info().device_type != wgpu::DeviceType::Cpu);
-        let adapter = rc_testdata::need(hardware, "hardware GPU adapter")?;
-        // Blend of float targets requested if it exists, like the client (improved transparency).
-        let required_features = adapter.features() & wgpu::Features::FLOAT32_BLENDABLE;
-        let desc = wgpu::DeviceDescriptor { required_features, ..Default::default() };
-        Some(pollster::block_on(adapter.request_device(&desc)).expect("device"))
-    }
-
-    struct Rng(u64);
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
-        fn below(&mut self, n: u64) -> u64 {
-            self.next() % n.max(1)
-        }
-    }
-
-    const FRAMES: usize = 300;
-    const PROBE: u64 = 64;
-    const USAGE: wgpu::BufferUsages = wgpu::BufferUsages::COPY_DST.union(wgpu::BufferUsages::COPY_SRC);
-
-    pub(crate) fn read(device: &wgpu::Device, queue: &wgpu::Queue, src: &wgpu::Buffer) -> Vec<u8> {
-        let dst = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: src.size(),
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let mut enc = device.create_command_encoder(&Default::default());
-        enc.copy_buffer_to_buffer(src, 0, &dst, 0, src.size());
-        queue.submit([enc.finish()]);
-        dst.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).expect("GPU wait");
-        let v = dst.slice(..).get_mapped_range().expect("read").to_vec();
-        dst.unmap();
-        v
-    }
-
-    /// Plays the script on the GPU (`gpu` = Some) or on the CPU model; returns the final contents of the
-    /// buffers, the log of the check copies and the counters.
-    fn play(gpu: Option<(&wgpu::Device, &wgpu::Queue, bool, Option<u64>)>) -> (Vec<Vec<u8>>, Stats) {
-        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-        let mut model: Vec<Vec<u8>> = [4096usize, 300 << 10, 3 << 20].iter().map(|&n| vec![0; n]).collect();
-        let mut journal = vec![0u8; FRAMES * PROBE as usize];
-        let mut dev = gpu.map(|(device, queue, ring, omit)| {
-            let mut up = Uploader::new(device, ring);
-            up.omit = omit;
-            let bufs: Vec<wgpu::Buffer> = model
-                .iter()
-                .map(|m| {
-                    device.create_buffer(&wgpu::BufferDescriptor {
-                        label: None,
-                        size: m.len() as u64,
-                        usage: USAGE,
-                        mapped_at_creation: false,
-                    })
-                })
-                .collect();
-            let log = device.create_buffer(&wgpu::BufferDescriptor {
-                label: None,
-                size: journal.len() as u64,
-                usage: USAGE,
-                mapped_at_creation: false,
-            });
-            (device, queue, up, bufs, log)
-        });
-        for frame in 0..FRAMES {
-            let writes = 4 + rng.below(16);
-            for w in 0..writes {
-                let t = rng.below(3) as usize;
-                // Larger than a chunk from time to time, otherwise small (often overlapping).
-                let max = if t == 2 && rng.below(12) == 0 { 3 * CHUNK / 2 } else { 4096 };
-                let size = model[t].len() as u64;
-                let len = (4 + rng.below(max.min(size) - 4)) & !3;
-                let off = rng.below(size - len) & !3;
-                let data: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
-                model[t][off as usize..(off + len) as usize].copy_from_slice(&data);
-                if let Some((_, queue, up, bufs, _)) = dev.as_mut() {
-                    up.write(queue, &bufs[t], off, &data);
-                }
-                // Enlargement in the middle of the writes (copy submitted at once, like `alloc_in`).
-                if w == 1 && frame % 50 == 7 {
-                    let g = rng.below(2) as usize;
-                    let grown = (model[g].len() + model[g].len() / 4).next_multiple_of(4);
-                    if let Some((device, queue, up, bufs, _)) = dev.as_mut() {
-                        let bigger = device.create_buffer(&wgpu::BufferDescriptor {
-                            label: None,
-                            size: grown as u64,
-                            usage: USAGE,
-                            mapped_at_creation: false,
-                        });
-                        let mut enc = device.create_command_encoder(&Default::default());
-                        enc.copy_buffer_to_buffer(&bufs[g], 0, &bigger, 0, bufs[g].size());
-                        up.submit(queue, enc.finish());
-                        bufs[g] = bigger;
-                    }
-                    model[g].resize(grown, 0);
-                }
-            }
-            // Check copy in the frame's encoder: reads what the writes placed.
-            let at = rng.below(model[0].len() as u64 - PROBE) & !3;
-            journal[frame * PROBE as usize..][..PROBE as usize]
-                .copy_from_slice(&model[0][at as usize..(at + PROBE) as usize]);
-            if let Some((device, queue, up, bufs, log)) = dev.as_mut() {
-                let mut enc = device.create_command_encoder(&Default::default());
-                enc.copy_buffer_to_buffer(&bufs[0], at, log, frame as u64 * PROBE, PROBE);
-                up.submit(queue, enc.finish());
-                if frame % 3 == 2 {
-                    // Rhythm of a frame loop (a few frames in flight).
-                    let _ = device.poll(wgpu::PollType::Poll);
-                }
-            }
-        }
-        match dev {
-            Some((device, queue, mut up, bufs, log)) => {
-                let mut out: Vec<Vec<u8>> = bufs.iter().map(|b| read(device, queue, b)).collect();
-                out.push(read(device, queue, &log));
-                (out, up.take_stats())
-            }
-            None => {
-                model.push(journal);
-                (model, Stats::default())
-            }
-        }
-    }
-
-    fn digest(v: &[Vec<u8>]) -> u64 {
-        v.iter().flatten().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
-    }
-
-    #[test]
-    fn ring_writes_match_queue_writes() {
-        let Some((device, queue)) = gpu() else { return };
-        let (expected, _) = play(None);
-        let (old, old_stats) = play(Some((&device, &queue, false, None)));
-        let (new, new_stats) = play(Some((&device, &queue, true, None)));
-        eprintln!("old: {old_stats:?}; ring: {new_stats:?}; fingerprint {:016x}", digest(&expected));
-        assert!(old == expected, "old path differs from the model");
-        assert!(new == expected, "transit ring differs from the model");
-        assert_eq!(old_stats.writes, new_stats.writes);
-        assert_eq!(old_stats.transits, old_stats.writes, "old path: one transit per write");
-        assert!(new_stats.transits * 4 < new_stats.writes, "ring: chunks recycled ({new_stats:?})");
-        // Sabotage: an omitted write must show.
-        let (bad, _) = play(Some((&device, &queue, true, Some(new_stats.writes - 1))));
-        assert!(bad != expected, "omitted write not detected");
-    }
-
-    /// Without any `device.poll` (`RUSTCRAFT_OPT_NOPOLL`): chunks come back through submissions
-    /// alone (wgpu delivers the mapping callbacks on every submit). Imposed rhythm: each
-    /// frame waits, through empty submissions, for its chunk to come back; a callback delivered only by
-    /// a poll would make the wait fail (and create a new chunk per frame).
-    #[test]
-    fn chunks_come_back_without_poll() {
-        let Some((device, queue)) = gpu() else { return };
-        let target = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: 1 << 16,
-            usage: USAGE,
-            mapped_at_creation: false,
-        });
-        let mut up = Uploader::new(&device, true);
-        let data = vec![5u8; 4096];
-        for frame in 0..60 {
-            up.write(&queue, &target, 0, &data);
-            up.submit(&queue, device.create_command_encoder(&Default::default()).finish());
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while up.back_rx.is_empty() {
-                assert!(std::time::Instant::now() < deadline, "frame {frame}: chunk never returned without poll");
-                queue.submit([]);
-                std::thread::sleep(std::time::Duration::from_micros(200));
-            }
-        }
-        let s = up.take_stats();
-        assert_eq!((s.writes, s.transits), (60, 1), "a single chunk, recycled on every frame");
-    }
-
-    /// Plays 300 frames of slots (CPU model if `gpu` = None); returns the log (all the slots
-    /// read back by a copy in the encoder of EVERY frame, hence what its draws see) and the
-    /// number of writes.
-    fn play_slots(gpu: Option<(&wgpu::Device, &wgpu::Queue, bool, bool, Option<u64>)>) -> (Vec<u8>, u64) {
-        const N: usize = 4;
-        const ROW: u64 = (N * SLOT) as u64;
-        let mut rng = Rng(42);
-        let mut model = [[0u8; SLOT]; N];
-        let mut journal = Vec::with_capacity(FRAMES * N * SLOT);
-        let mut dev = gpu.map(|(device, queue, merged, skip, omit)| {
-            let mut up = Uploader::new(device, true);
-            up.omit = omit;
-            let slots = Slots::<N>::new(device, ["a", "b", "c", "d"], merged, skip);
-            let log = device.create_buffer(&wgpu::BufferDescriptor {
-                label: None,
-                size: FRAMES as u64 * ROW,
-                usage: USAGE,
-                mapped_at_creation: false,
-            });
-            (device, queue, up, slots, log)
-        });
-        // A few possible values per slot: the repetitions exercise the skipping.
-        let pool: Vec<[u8; SLOT]> = (0..3).map(|_| std::array::from_fn(|_| rng.next() as u8)).collect();
-        for frame in 0..FRAMES {
-            for (i, slot) in model.iter_mut().enumerate() {
-                if rng.below(3) != 0 {
-                    let v = pool[rng.below(pool.len() as u64) as usize];
-                    *slot = v;
-                    if let Some((_, _, _, s, _)) = dev.as_mut() {
-                        s.set(i, &v);
-                    }
-                }
-            }
-            journal.extend_from_slice(model.as_flattened());
-            if let Some((device, queue, up, s, log)) = dev.as_mut() {
-                s.flush(up, queue);
-                let mut enc = device.create_command_encoder(&Default::default());
-                let base = frame as u64 * ROW;
-                if s.merged {
-                    enc.copy_buffer_to_buffer(&s.bufs[0], 0, log, base, ROW);
-                } else {
-                    for (i, b) in s.bufs.iter().enumerate() {
-                        enc.copy_buffer_to_buffer(b, 0, log, base + (i * SLOT) as u64, SLOT as u64);
-                    }
-                }
-                up.submit(queue, enc.finish());
-            }
-        }
-        match dev {
-            Some((device, queue, mut up, _, log)) => (read(device, queue, &log), up.take_stats().writes),
-            None => (journal, 0),
-        }
-    }
-
-    #[test]
-    fn slots_match_separate_buffers() {
-        let Some((device, queue)) = gpu() else { return };
-        let (expected, _) = play_slots(None);
-        let mut writes = Vec::new();
-        for (merged, skip) in [(false, false), (false, true), (true, false), (true, true)] {
-            let (got, w) = play_slots(Some((&device, &queue, merged, skip, None)));
-            // Frame-by-frame comparison: the first wrong frame is named.
-            let row = 4 * SLOT;
-            let bad = got.chunks(row).zip(expected.chunks(row)).position(|(g, e)| g != e);
-            assert!(got.len() == expected.len() && bad.is_none(), "merged {merged}, skip {skip}: frame {bad:?} wrong");
-            writes.push(w);
-        }
-        eprintln!("writes (separate, separate+skip, merged, merged+skip): {writes:?}");
-        assert!(writes[3] < writes[1] && writes[1] < writes[0] && writes[2] < writes[0]);
-        // Transient sabotage: a write omitted in the middle (slot wrong for a few frames, then
-        // rewritten) must show in the log, even if the final state is right.
-        let (bad, _) = play_slots(Some((&device, &queue, true, true, Some(writes[3] / 2))));
-        let first = bad.chunks(4 * SLOT).zip(expected.chunks(4 * SLOT)).position(|(g, e)| g != e);
-        let last_ok = bad[bad.len() - 4 * SLOT..] == expected[expected.len() - 4 * SLOT..];
-        eprintln!("sabotage: first wrong frame {first:?}, last correct frame {last_ok}");
-        assert!(first.is_some(), "omitted write not detected");
-    }
-
-    /// Micro-bench (main thread, single GPU queue: no multi-core version): 15 small
-    /// writes per frame + submission, old path against ring.
-    /// `cargo test --release -p rc-app --bin rustcraft upload_bench -- --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn upload_bench() {
-        let Some((device, queue)) = gpu() else { return };
-        let target = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: 1 << 20,
-            usage: USAGE,
-            mapped_at_creation: false,
-        });
-        // Typical frame (cameras, 64 KiB fade, orders, indirect commands) and small writes alone.
-        let image: &[u64] = &[256, 256, 256, 256, 64 << 10, 4096, 2048, 512, 512, 512, 512, 512, 8192, 8, 1024];
-        let small: &[u64] = &[256; 15];
-        let data = vec![7u8; 64 << 10];
-        for pass in 0..3 {
-            for (set, sizes) in [("frame", image), ("small", small)] {
-                for ring in [false, true] {
-                    let mut up = Uploader::new(&device, ring);
-                    let frames = 3000;
-                    let t = std::time::Instant::now();
-                    let (mut write_ns, mut submit_ns) = (0u128, 0u128);
-                    for f in 0..frames {
-                        let tw = std::time::Instant::now();
-                        let mut at = 0;
-                        for &s in sizes {
-                            up.write(&queue, &target, at, &data[..s as usize]);
-                            at += s.next_multiple_of(256);
-                        }
-                        write_ns += tw.elapsed().as_nanos();
-                        let enc = device.create_command_encoder(&Default::default());
-                        let ts = std::time::Instant::now();
-                        let idx = up.submit(&queue, enc.finish());
-                        submit_ns += ts.elapsed().as_nanos();
-                        if f % 3 == 2 {
-                            let _ = device.poll(wgpu::PollType::Wait { submission_index: Some(idx), timeout: None });
-                        }
-                    }
-                    let us = |ns: u128| ns as f64 / 1e3 / f64::from(frames);
-                    eprintln!(
-                        "pass {pass} {set} {}: {:.1} µs/frame (writes {:.1} µs, submit {:.1} µs), {:?}",
-                        if ring { "ring" } else { "old" },
-                        t.elapsed().as_secs_f64() * 1e6 / f64::from(frames),
-                        us(write_ns),
-                        us(submit_ns),
-                        up.take_stats()
-                    );
-                }
-            }
-        }
-    }
-}
+#[path = "upload_test.rs"]
+pub(crate) mod tests;
