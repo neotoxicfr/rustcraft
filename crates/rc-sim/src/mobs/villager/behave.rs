@@ -2372,7 +2372,10 @@ impl Server {
         if !b.mem.path {
             return false;
         }
-        self.path_doors_step(m, &mut b.mem.doors, last, cooldown, None)
+        // Like the game, only the living entities the villager perceives can hold a door open
+        // (none when that memory is absent), not every loaded mob.
+        let near = b.mem.living.as_deref().unwrap_or(&[]);
+        self.path_doors_step(m, &mut b.mem.doors, last, cooldown, Some(near))
     }
 
     /// Shared door behaviour (villager, copper golem), without the path-memory test: every 20
@@ -2423,8 +2426,10 @@ impl Server {
     }
 
     /// Closing of the doors that were opened or passed through.
-    fn close_doors(&mut self, m: &Mob, b: &mut Brain, from: Option<[i32; 3]>, to: Option<[i32; 3]>) {
-        self.close_doors_in(m, &mut b.mem.doors, from, to, None);
+    pub(super) fn close_doors(&mut self, m: &Mob, b: &mut Brain, from: Option<[i32; 3]>, to: Option<[i32; 3]>) {
+        // The perceived living entities only, as for the door trigger.
+        let near = b.mem.living.as_deref().unwrap_or(&[]);
+        self.close_doors_in(m, &mut b.mem.doors, from, to, Some(near));
     }
 
     /// Closes the remembered doors other than the `from` / `to` nodes: forgotten when far (3

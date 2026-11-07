@@ -7502,3 +7502,12 @@ baby bed and closest home searches keep their small vectors (< 1 call per tick).
 its name test: it only runs on blocks of the mob door tag. The same copy-then-search pattern exists in
 the `brainy`, piglin and creaking brains (C6-M18).
 
+Fidelity fix, separate commit (read in the decompiled game): a villager closing the doors it passed
+spares one only for a fellow it perceives (its living entities memory; none when the memory is
+absent), at the door trigger and before sleeping; we scanned every loaded mob. Observable only when
+an unperceived villager (born less than 20 ticks ago, for instance) crosses the door: the scene's
+fingerprint does not move; `only_perceived_villagers_hold_a_door_open` fails on the old rule. It
+also replaces a walk over the whole mob list per remembered door by the ~20 perceived entities. The
+walk's retry delay (drawn on the world random at a stop while stuck, decreased at each start try)
+was checked and is faithful.
+

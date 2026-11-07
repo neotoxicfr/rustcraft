@@ -616,6 +616,58 @@ fn payment_price_reads_the_same_stack_limit() {
     });
 }
 
+/// Like the game, a villager closing the doors it passed only spares one that a fellow villager it
+/// perceives (its living entities memory) is crossing: an unperceived one crossing the door does not
+/// hold it open.
+#[test]
+fn only_perceived_villagers_hold_a_door_open() {
+    on_own_thread(|| {
+        let (Some(world), Some(data)) = (crate::tests::test_world(), rc_testdata::version_data()) else { return };
+        let dir = super::super::tests::prep(&world, "villager-door-hold", 0, "normal", &[]);
+        let mut p = crate::blocks::probe::Probe::open(&dir, std::sync::Arc::new(data));
+        p.run(
+            "fill 200 -60 200 231 -60 231 minecraft:stone\nfill 200 -59 200 231 -40 231 minecraft:air\n\
+             player 210.5 -59 202.5 0 0\n\
+             setblock 216 -59 206 minecraft:oak_door[half=lower,open=true]\n\
+             setblock 216 -58 206 minecraft:oak_door[half=upper,open=true]\n",
+        );
+        let door = [216, -59, 206];
+        let add = |p: &mut crate::blocks::probe::Probe, at: [f64; 3]| {
+            let mut m = p.s.new_mob(Kind::Villager, at, 0.0);
+            m.persistent = true;
+            let id = m.id;
+            p.s.add_mob(m);
+            id
+        };
+        let closer = add(&mut p, [216.5, -59.0, 204.5]);
+        let crosser = add(&mut p, [216.5, -59.0, 207.5]);
+        let i = p.s.mob_index(crosser).expect("crossing villager");
+        // Its path goes through the door: next node on it.
+        p.s.mobs.list.get_mut(i).expect("crossing villager").nav.path = Some(super::super::nav::Path {
+            nodes: [[216, -59, 208], door, [216, -59, 205]].map(|n| (n, super::super::nav::PathType::Walkable)).to_vec(),
+            next: 1,
+            target: [216, -59, 205],
+            dist_to_target: 0.0,
+            reached: true,
+        });
+        let open = |p: &crate::blocks::probe::Probe| p.s.view().get_bool(p.s.st(door), "open");
+        assert!(open(&p), "the door is not placed open");
+        for perceived in [true, false] {
+            let i = p.s.mob_index(closer).expect("villager");
+            let mut m = p.s.mobs.list.take(i).expect("villager");
+            let mut b = m.npc.as_mut().and_then(|n| n.brain.take()).expect("brain");
+            b.mem.doors = Some(vec![door]);
+            b.mem.living = perceived.then(|| vec![super::super::mob::Ent::Mob(crosser)]);
+            p.s.close_doors(&m, &mut b, None, None);
+            if let Some(n) = m.npc.as_mut() {
+                n.brain = Some(b);
+            }
+            p.s.mobs.list.put(i, m);
+            assert_eq!(open(&p), perceived, "perceived crossing villager: {perceived}");
+        }
+    });
+}
+
 /// The species tables give the name tables' answers for every species.
 #[test]
 fn species_tables_match_the_names() {
