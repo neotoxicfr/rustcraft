@@ -3,13 +3,46 @@
 //! progress (criteria obtained, visibility), full then incremental `update_advancements` packet,
 //! rewards, chat announcement, `advancements/<uuid>.json` save.
 
+pub mod criteria_index;
 pub mod hooks;
 pub mod layout;
+mod ordered_json;
+pub mod paths;
 pub mod pred;
 pub mod trig;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_fast_load;
+#[cfg(test)]
+mod tests_indexes;
+#[cfg(test)]
+mod tests_location_fast;
+
+pub use paths::ProgressPaths;
+
+/// Identifier of the advancement file `data/<ns>/advancement/<path>.json` (`<ns>:<path>`).
+fn advancement_file_id(name: &str) -> Option<String> {
+    let (ns, path) = name.strip_prefix("data/")?.split_once('/')?;
+    let p = path.strip_prefix("advancement/")?.strip_suffix(".json")?;
+    Some(format!("{ns}:{p}"))
+}
+
+/// The advancement files of `jar`, parsed; unreadable ones left out. `parallel`
+/// (`RUSTCRAFT_OPT_ADVTREEPARALLEL`): the ~1,900 files of the base game are parsed on every core, the
+/// result keyed by identifier as before (the order of the parsing does not show).
+fn read_advancement_files(jar: &crate::registries::Jar, parallel: bool) -> std::collections::BTreeMap<String, Value> {
+    use rayon::prelude::*;
+    let files: Vec<(String, &[u8])> =
+        jar.files.iter().filter_map(|(name, bytes)| Some((advancement_file_id(name)?, &bytes[..]))).collect();
+    let parse = |(id, bytes): (String, &[u8])| serde_json::from_slice::<Value>(bytes).ok().map(|v| (id, v));
+    if parallel {
+        files.into_par_iter().filter_map(parse).collect()
+    } else {
+        files.into_iter().filter_map(parse).collect()
+    }
+}
 
 use hashbrown::HashMap;
 use std::collections::BTreeSet;
@@ -22,6 +55,7 @@ use rc_proto_v777::advancements as adv;
 use serde_json::Value;
 
 use crate::player::Stack;
+use crate::resource_id::full_id;
 use crate::server::Server;
 
 /// Display of an advancement (`display`).
@@ -71,10 +105,9 @@ pub struct Tree {
     pub index: HashMap<String, usize>,
     /// Trigger → (advancement, criterion).
     pub by_trigger: HashMap<String, Vec<(usize, usize)>>,
-}
-
-fn id_of(s: &str) -> String {
-    crate::commands::args::id(s)
+    /// Indexed triggers → their criteria grouped by the identifier they name (positions in
+    /// `by_trigger`).
+    pub indexed: HashMap<String, criteria_index::CriteriaIndex>,
 }
 
 impl Tree {
@@ -91,16 +124,7 @@ impl Tree {
     /// Reads `data/<ns>/advancement/**.json` from the stack of chosen packs (`packs.rs`: the
     /// last pack wins), links parents and children, computes positions.
     pub(crate) fn load(jar: &crate::registries::Jar) -> Tree {
-        let mut raw: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
-        for (name, bytes) in &jar.files {
-            let Some(rest) = name.strip_prefix("data/") else { continue };
-            let Some((ns, path)) = rest.split_once('/') else { continue };
-            let Some(p) = path.strip_prefix("advancement/").and_then(|p| p.strip_suffix(".json")) else { continue };
-            if let Ok(v) = serde_json::from_slice::<Value>(bytes) {
-                raw.insert(format!("{ns}:{p}"), v);
-            }
-        }
-        Tree::build(raw)
+        Tree::build(read_advancement_files(jar, ProgressPaths::from_switches().parallel_tree))
     }
 
     pub fn build(raw: std::collections::BTreeMap<String, Value>) -> Tree {
@@ -111,7 +135,7 @@ impl Tree {
             let before = pending.len();
             let mut rest = Vec::new();
             for (id, v) in pending {
-                let parent = v.get("parent").and_then(Value::as_str).map(id_of);
+                let parent = v.get("parent").and_then(Value::as_str).map(crate::commands::args::id);
                 let pidx = match &parent {
                     Some(p) => match t.index.get(p) {
                         Some(&i) => Some(i),
@@ -152,6 +176,7 @@ impl Tree {
                 t.by_trigger.entry(crit.trigger.clone()).or_default().push((i, c));
             }
         }
+        t.indexed = criteria_index::build_all(&t.list, &t.by_trigger);
         layout::run(&mut t);
         t
     }
@@ -170,7 +195,9 @@ fn parse_adv(id: &str, v: &Value, parent: Option<usize>) -> Option<Adv> {
         .iter()
         .map(|(name, c)| Crit {
             name: name.clone(),
-            trigger: id_of(c.get("trigger").and_then(Value::as_str).unwrap_or("minecraft:impossible")),
+            trigger: crate::commands::args::id(
+                c.get("trigger").and_then(Value::as_str).unwrap_or("minecraft:impossible"),
+            ),
             cond: c.get("conditions").cloned().unwrap_or(Value::Null),
         })
         .collect();
@@ -216,7 +243,7 @@ fn parse_adv(id: &str, v: &Value, parent: Option<usize>) -> Option<Adv> {
             Some("goal") => 2,
             _ => 0,
         },
-        background: d.get("background").and_then(Value::as_str).map(id_of),
+        background: d.get("background").and_then(Value::as_str).map(crate::commands::args::id),
         toast: d.get("show_toast").and_then(Value::as_bool).unwrap_or(true),
         announce: d.get("announce_to_chat").and_then(Value::as_bool).unwrap_or(true),
         hidden: d.get("hidden").and_then(Value::as_bool).unwrap_or(false),
@@ -249,6 +276,15 @@ pub struct Progress {
     pub tab: Option<usize>,
     /// Write order of the file (started advancements).
     pub order: Vec<usize>,
+    /// Per advancement: already in `order` (kept with it on every path).
+    in_order: Vec<bool>,
+    /// Optimised paths taken (switches read once).
+    pub paths: ProgressPaths,
+    /// Reused buffer of the criteria an indexed event tests (positions in the trigger's list).
+    pub(crate) candidates: Vec<u32>,
+    /// Tests: every criterion granted, in order.
+    #[cfg(test)]
+    pub(crate) grant_log: Vec<(usize, usize)>,
     pub path: PathBuf,
     pub dirty: bool,
     /// Inventory snapshot (detection of changed slots).
@@ -306,6 +342,11 @@ impl Progress {
             first: true,
             tab: None,
             order: Vec::new(),
+            in_order: vec![false; n],
+            paths: ProgressPaths::from_switches(),
+            candidates: Vec::new(),
+            #[cfg(test)]
+            grant_log: Vec::new(),
             path,
             dirty: false,
             inv_seen: Vec::new(),
@@ -332,39 +373,72 @@ impl Progress {
 
     fn load(&mut self) {
         let Ok(text) = std::fs::read(&self.path) else { return };
-        let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(&text) else {
+        let read = if self.paths.fast_load { self.read_in_one_pass(&text) } else { self.read_searching_keys(&text) };
+        let Some(started) = read else {
             eprintln!("singleplayer: advancements unreadable: {}", self.path.display());
             return;
         };
-        let raw = String::from_utf8_lossy(&text);
+        for i in started {
+            self.order.push(i);
+            self.in_order[i] = true;
+            self.changed.insert(i);
+            self.roots.insert(self.tree.list[i].root);
+        }
+    }
+
+    /// Criteria of the file's advancement `id` taken into `got`; `None` for an unknown advancement.
+    /// Also gives the earliest date read (`i64::MAX` without any).
+    fn read_entry(&mut self, id: &str, v: &Value) -> Option<(usize, i64)> {
+        let Some(i) = self.tree.get(&full_id(id)) else {
+            eprintln!("singleplayer: unknown advancement ignored: {id}");
+            return None;
+        };
+        let mut first = i64::MAX;
+        if let Some(Value::Object(c)) = v.get("criteria") {
+            for (name, date) in c {
+                let Some(ci) = self.tree.list[i].criteria.iter().position(|x| &x.name == name) else { continue };
+                let ms = date.as_str().and_then(parse_date).unwrap_or(0);
+                first = first.min(ms);
+                self.got[i][ci] = Some(ms);
+            }
+        }
+        Some((i, first))
+    }
+
+    /// Former reading: the file parsed into a sorted map, then each key searched in the text for
+    /// its place (the game keeps the file's order); a key not found goes by its earliest date.
+    fn read_searching_keys(&mut self, text: &[u8]) -> Option<Vec<usize>> {
+        let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(text) else { return None };
+        let raw = String::from_utf8_lossy(text);
         let mut entries: Vec<(usize, i64)> = Vec::new();
         for (id, v) in &map {
             if id == "DataVersion" {
                 continue;
             }
-            let Some(i) = self.tree.get(&id_of(id)) else {
-                eprintln!("singleplayer: unknown advancement ignored: {id}");
-                continue;
-            };
-            let mut first = i64::MAX;
-            if let Some(Value::Object(c)) = v.get("criteria") {
-                for (name, date) in c {
-                    let Some(ci) = self.tree.list[i].criteria.iter().position(|x| &x.name == name) else { continue };
-                    let ms = date.as_str().and_then(parse_date).unwrap_or(0);
-                    first = first.min(ms);
-                    self.got[i][ci] = Some(ms);
-                }
-            }
+            let Some((i, first)) = self.read_entry(id, v) else { continue };
             // File order (the game's ordered table): position of the key in the text.
             let at = raw.find(&format!("{}:", json_str(id))).map_or(first, |p| p as i64);
             entries.push((i, at));
         }
         entries.sort_by_key(|e| e.1);
-        for (i, _) in entries {
-            self.order.push(i);
-            self.changed.insert(i);
-            self.roots.insert(self.tree.list[i].root);
+        Some(entries.into_iter().map(|e| e.0).collect())
+    }
+
+    /// One pass over the file that keeps its keys in their written order (the order the game
+    /// keeps), instead of a sorted map and one text search per key (about 1,900 searches over the
+    /// whole text for a complete file).
+    fn read_in_one_pass(&mut self, text: &[u8]) -> Option<Vec<usize>> {
+        let entries = serde_json::from_slice::<ordered_json::Entries>(text).ok()?.into_unique();
+        let mut started = Vec::with_capacity(entries.len());
+        for (id, v) in &entries {
+            if id == "DataVersion" {
+                continue;
+            }
+            if let Some((i, _)) = self.read_entry(id, v) {
+                started.push(i);
+            }
         }
+        Some(started)
     }
 
     /// Data reload (`reload`): progress written then re-read with the new tree.
@@ -377,6 +451,7 @@ impl Progress {
         self.changed.clear();
         self.roots.clear();
         self.order.clear();
+        self.in_order = vec![false; n];
         self.first = true;
         self.tab = None;
         self.tree = tree;
@@ -411,13 +486,14 @@ impl Progress {
         }
         fn walk(
             p: &mut Progress,
+            tree: &Tree,
             n: usize,
             stack: &mut Vec<Rule>,
             added: &mut Vec<usize>,
             removed: &mut Vec<usize>,
         ) -> bool {
             let done = p.done(n);
-            let rule = match &p.tree.list[n].display {
+            let rule = match &tree.list[n].display {
                 None => Rule::Hide,
                 Some(_) if done => Rule::Show,
                 Some(d) if d.hidden => Rule::Hide,
@@ -425,9 +501,17 @@ impl Progress {
             };
             let mut any = done;
             stack.push(rule);
-            let children = p.tree.list[n].children.clone();
-            for c in children {
-                any |= walk(p, c, stack, added, removed);
+            if p.paths.fast_load {
+                // The tree is held apart from `p` (one shared handle per walk): its children are
+                // lent instead of copied at every node.
+                for &c in &tree.list[n].children {
+                    any |= walk(p, tree, c, stack, added, removed);
+                }
+            } else {
+                let children = p.tree.list[n].children.clone();
+                for c in children {
+                    any |= walk(p, tree, c, stack, added, removed);
+                }
             }
             let visible = any || {
                 let mut v = false;
@@ -457,7 +541,8 @@ impl Progress {
             any
         }
         let mut stack = vec![Rule::Keep; 3];
-        walk(self, root, &mut stack, added, removed);
+        let tree = self.tree.clone();
+        walk(self, &tree, root, &mut stack, added, removed);
     }
 
     /// Pending packet; `None` if nothing to send.
@@ -487,8 +572,13 @@ impl Progress {
             return (false, false);
         }
         self.got[a][c] = Some(now_ms());
-        if !self.order.contains(&a) {
+        #[cfg(test)]
+        self.grant_log.push((a, c));
+        // The flag answers what a scan of the order (up to ~1,900 entries) answered.
+        let started = if self.paths.fast_load { self.in_order[a] } else { self.order.contains(&a) };
+        if !started {
             self.order.push(a);
+            self.in_order[a] = true;
         }
         self.changed.insert(a);
         self.dirty = true;
@@ -633,7 +723,7 @@ impl Server {
             if read_varint(&mut r).ok() == Some(0)
                 && let Ok(tab) = rc_proto::read_str(&mut r, 32767)
             {
-                let tab = id_of(tab);
+                let tab = full_id(tab);
                 if let Some(a) = self.prog.tree.get(&tab) {
                     self.adv_select_tab(Some(a));
                 }
@@ -694,7 +784,7 @@ impl Server {
 
     fn adv_display(&self, d: &Display) -> adv::Display {
         let icon_stack = Stack {
-            id: id_of(d.icon.get("id").and_then(Value::as_str).unwrap_or("minecraft:air")),
+            id: crate::commands::args::id(d.icon.get("id").and_then(Value::as_str).unwrap_or("minecraft:air")),
             count: d.icon.get("count").and_then(Value::as_i64).unwrap_or(1) as i32,
             components: d.icon.get("components").filter(|c| c.is_object()).map(crate::recipes::json_to_nbt),
         };
@@ -784,8 +874,8 @@ impl Server {
             self.give_experience_points(xp);
         }
         let tables: Vec<String> = match r.get("loot") {
-            Some(Value::String(s)) => vec![id_of(s)],
-            Some(Value::Array(a)) => a.iter().filter_map(|x| x.as_str().map(id_of)).collect(),
+            Some(Value::String(s)) => vec![crate::commands::args::id(s)],
+            Some(Value::Array(a)) => a.iter().filter_map(|x| x.as_str().map(crate::commands::args::id)).collect(),
             _ => Vec::new(),
         };
         let mut changes = false;
@@ -817,7 +907,7 @@ impl Server {
         let recipes: Vec<String> = r
             .get("recipes")
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(id_of)).collect())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(crate::commands::args::id)).collect())
             .unwrap_or_default();
         if !recipes.is_empty() {
             self.award_recipes(&recipes);
@@ -826,7 +916,7 @@ impl Server {
             let mut src = self.player_source();
             src.silent = true;
             src.level = 2;
-            let _ = self.run_functions(&src, &id_of(f), false);
+            let _ = self.run_functions(&src, &full_id(f), false);
         }
     }
 

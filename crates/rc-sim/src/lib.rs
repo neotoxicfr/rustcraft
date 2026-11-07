@@ -115,6 +115,7 @@ pub mod randsrc;
 pub mod commands;
 // Advancements and statistics (S9).
 pub mod progress;
+mod resource_id; // identifiers compared and completed with their default namespace, without allocating
 pub mod stats;
 pub mod score_criteria;
 // Local network (S9).
@@ -262,6 +263,8 @@ mod bench_spawner_blocks; // trial spawners, vaults, monster spawners, natural s
 mod tests_menu_switches; // menu switches: open chest fed and drained by hoppers, every combination
 #[cfg(test)]
 mod bench_menus; // menus: broadcast with a full inventory, open chest re-read, clicks
+#[cfg(test)]
+mod bench_advancement_triggers; // advancement switches: inventory and recipe indexes, location, file and tree loading
 #[cfg(test)]
 mod tests_perf_pack; // the scene bench's `perf` data pack compiles with our command parser
 #[cfg(test)]
