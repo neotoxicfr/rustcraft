@@ -566,7 +566,8 @@ impl Renderer {
             entities: entity_assets,
             tables,
         } = assets;
-        let formats = init_gpu_formats(tables);
+        // Set at startup from these tables, before any meshing task (`startup.rs`).
+        let formats = gpu_formats();
         let crate::gpu_backend::GpuContext { surface, adapter, device, queue, text: gpu_text } = gpu;
         let info = adapter.get_info();
         // Features retained when the device was opened (`gpu_backend::open_device`).

@@ -7169,7 +7169,7 @@ Vulkan instance 179 (98 ms after the window), adapter 186, device 229, block tex
 frame 335. Everything from the instance to the device needs no window, yet waited for it; on a
 reload (F3+T, server packs) the renderer reopened instance, adapter, device and surface again.
 Micro-figures, LOADED machine (other agents compiling), test
-`gpu_backend::early_open::tests::device_opened_in_the_background_matches_the_main_thread`:
+`gpu_backend::early_open::tests::early_opening_asks_for_the_old_path_adapter_and_device`:
 
 | Opening of instance + adapter + device (Vulkan) | time |
 |---|---|
@@ -7184,14 +7184,19 @@ Micro-figures, LOADED machine (other agents compiling), test
   unchanged (software fallback, "Tried" list, error box). Same adapter by construction: wgpu-core
   30 `request_adapter` drops the adapters that cannot present and then sorts by type with a stable
   sort, and the Vulkan and DX12 backends ignore the surface when listing; the first adapter without
-  surface is therefore the one chosen with it whenever it can present. The thread competes with
+  surface is therefore the one chosen with it whenever it can present. That equivalence is proven
+  by reading wgpu-core and wgpu-hal 30.0.1 only (no window in tests) and is to be read again at
+  every wgpu update; the test proves the rest: the early opening, on its thread, asks for the same
+  adapter, features and limits as the old path's request written out separately. The thread competes with
   the resource loading for the DLL loader and the CPU: "resources: end", "audio joined", the
   driver's ~700 MB commit moved earlier (memstats) are to be read on the bench. Milestones added:
   "before GPU instance" (separates show/icon/formats from the driver), "GPU joined" and the wait.
-- Window icon (same switch): only the retained image is decoded (names give the sides, candidates
-  narrowest first among those wide enough, then largest first; an image whose side differs from its
-  name falls back to decoding all five) and one icon object serves title bar and taskbar (one RGBA
-  copy instead of two). Expected gain ≈ 0 once the thread overlaps it; kept as a fix.
+- Window icon (`RUSTCRAFT_OPT_DECODE_ONLY_CHOSEN_ICON`, default 1, its own lead: measured alone
+  then combined with the others): only the retained image is decoded (names give the sides,
+  candidates narrowest first among those wide enough, then largest first; an image whose side
+  differs from its name falls back to decoding all five) and one icon object serves title bar and
+  taskbar (one RGBA copy instead of two). Expected gain small, on the main thread before the window
+  shows; to read on the "before GPU instance" milestone.
 - Kept context on reload (`RUSTCRAFT_OPT_KEEP_GPU_ON_RELOAD`, default 1): the old renderer hands
   back surface, adapter, device and queue (`Renderer::into_gpu_context`, everything else dropped),
   `render::wait_for_released_gpu_memory` waits for the release, and `Renderer::new` rebuilds
@@ -7209,7 +7214,9 @@ Micro-figures, LOADED machine (other agents compiling), test
   `events_before_renderer.rs`): `Renderer::new` calls back after the surface, the block textures,
   the terrain pipelines, the interface, the overlay pipelines and the entities; the app applies the
   events already received in their order while their kind is in the checked list (world data,
-  player state, registries, chat, inventory, teleport, local player entity data; entering the world
+  player state, registries, system chat messages, inventory, teleport, local player entity data;
+  never a player message, which reads the chat delay and "secure chat only" that only the first
+  application of the options sets, once the renderer is built; entering the world
   only in singleplayer without a quick play log and with the sound engine joinable without waiting)
   and holds the first other one, applied first at the next frame; then the meshing settings, the
   light and the meshing run as in a frame. Startup only (a reload keeps its frames' order). Before

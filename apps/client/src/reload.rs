@@ -348,8 +348,6 @@ impl App {
     /// Renderer on `window` with the pending resources (startup, reload).
     pub(crate) fn build_renderer(&mut self, window: Arc<winit::window::Window>, how: RendererBuild) {
         let Some(gui_assets) = self.gui_assets.take() else { return };
-        // Before any meshing task: meshing may start while the renderer is being built.
-        crate::render::init_gpu_formats(&self.tables);
         let (gpu, startup) = match how {
             RendererBuild::Startup => (self.startup_gpu(&window), true),
             RendererBuild::Reload { kept_gpu } => {

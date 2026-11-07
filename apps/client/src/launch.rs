@@ -365,10 +365,10 @@ const ICON_SIDES: [u32; 5] = [256, 128, 48, 32, 16];
 /// the system icon size, 32 px at 100%) serves for the title bar and the taskbar.
 pub fn set_icon(window: &winit::window::Window, assets: &rc_assets::Assets) {
     let want = icon_metric();
-    // Only the retained image is decoded (`RUSTCRAFT_OPT_EARLY_GPU_OPEN`, with the window work it
-    // trims); `=0`: the five are decoded as before.
+    // Only the retained image is decoded: the four others cost decoding time on the main thread
+    // before the window shows. `=0`: the five are decoded as before.
     let load = |p: &str| assets.image(p);
-    let chosen = if rc_data::opt_switch!("RUSTCRAFT_OPT_EARLY_GPU_OPEN") {
+    let chosen = if rc_data::opt_switch!("RUSTCRAFT_OPT_DECODE_ONLY_CHOSEN_ICON") {
         icon_decoding_one(want, load)
     } else {
         icon_decoding_all(want, load)

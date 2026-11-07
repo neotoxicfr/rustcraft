@@ -157,27 +157,47 @@ mod tests {
         assert_eq!(super::super::order(Some("dx12"), "opengl"), super::super::order(Some("dx12"), "default"));
     }
 
-    /// Adapter, device features and limits opened on the "gpu-init" thread without a window are
-    /// those of the same opening on the calling thread (what the old path does after the window):
-    /// same adapter text for F3, same features, same limits. Times printed (loaded machine).
+    /// The old path's request on the first API, written out here on purpose rather than through
+    /// the shared helper: high-performance adapter, no fallback, device opened as `pick` opens it.
+    /// The window's surface is left out: no window is created in tests.
+    fn old_path_request_without_surface(backends: wgpu::Backends) -> Option<(wgpu::AdapterInfo, wgpu::Device)> {
+        let inst = super::super::instance(backends);
+        let adapter = pollster::block_on(inst.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            ..Default::default()
+        }))
+        .ok()?;
+        let (device, _queue) = super::super::open_device(&adapter).ok()?;
+        Some((adapter.get_info(), device))
+    }
+
+    /// The early opening, run on a "gpu-init" thread, asks for what the old path asks for: same
+    /// adapter, same device features and limits. What this cannot prove without a window: that the
+    /// adapter chosen without a surface is the one chosen with it. That rests on reading wgpu-core
+    /// 30.0.1 (adapters filtered by surface, then a stable sort by type; the Vulkan and DX12
+    /// backends list adapters without the surface) and is to be read again at every wgpu update.
+    /// Times printed (loaded machine). Sabotage checked: the early opening asking for a low-power
+    /// adapter and a device without features fails on the features.
     #[test]
-    fn device_opened_in_the_background_matches_the_main_thread() {
+    fn early_opening_asks_for_the_old_path_adapter_and_device() {
         crate::render::upload::tests::gpu_serial();
         let backends = super::super::order(rc_data::env_str!("RUSTCRAFT_BACKEND"), "default")[0];
         let t = Instant::now();
-        let Some(main) = rc_testdata::need(open_without_window(backends), "GPU device on the first API") else {
+        let Some((info, device)) =
+            rc_testdata::need(old_path_request_without_surface(backends), "GPU device on the first API")
+        else {
             return;
         };
-        let main_ms = t.elapsed().as_secs_f64() * 1e3;
+        let old_ms = t.elapsed().as_secs_f64() * 1e3;
         let t = Instant::now();
         let thread = std::thread::Builder::new().name("gpu-init".into()).spawn(move || open_without_window(backends));
-        let background = thread.expect("thread").join().expect("join").expect("opened on the thread");
-        let background_ms = t.elapsed().as_secs_f64() * 1e3;
-        eprintln!("opening {backends:?}: calling thread {main_ms:.1} ms, background thread {background_ms:.1} ms");
-        let (a, b) = (&main.opened, &background.opened);
-        assert_eq!(a.text, b.text, "adapter text");
-        assert_eq!(a.adapter.get_info(), b.adapter.get_info(), "adapter");
-        assert_eq!(a.device.features(), b.device.features(), "device features");
-        assert_eq!(a.device.limits(), b.device.limits(), "device limits");
+        let early = thread.expect("thread").join().expect("join").expect("opened on the thread").opened;
+        let early_ms = t.elapsed().as_secs_f64() * 1e3;
+        eprintln!("opening {backends:?}: old path request {old_ms:.1} ms, early opening on its thread {early_ms:.1} ms");
+        assert_eq!(early.adapter.get_info(), info, "adapter");
+        assert_eq!(early.device.features(), device.features(), "device features");
+        assert_eq!(early.device.limits(), device.limits(), "device limits");
     }
 }
