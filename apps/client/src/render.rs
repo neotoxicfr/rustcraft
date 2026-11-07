@@ -39,7 +39,7 @@ pub(crate) mod upload;
 #[cfg(test)]
 mod test_meshes;
 
-pub use column_upload::{Prepared, prepare};
+pub use column_upload::{Prepared, in_place_gaps, prepare, prepare_from_base, prepare_moving_faces, region_tag};
 pub use frustum::BoxVerdict;
 pub(crate) use pipelines::camera_layout;
 

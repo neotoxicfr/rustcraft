@@ -108,3 +108,71 @@ pub fn same(a: &BlockMesh, b: &BlockMesh) -> bool {
         && a.fluid_starts == b.fluid_starts
         && a.vis == b.vis
 }
+
+/// Gaps (faces, fluids, translucents) tried by [`check_in_place`]: one range, runs touching, small
+/// and large gaps.
+pub const IN_PLACE_GAPS: [Option<[u32; 3]>; 4] = [None, Some([0; 3]), Some([4, 1, 1]), Some([170, 10, 10])];
+
+/// Words of a fluid face as the flat mesh stores them.
+pub fn fluid_words(q: &rc_mesh::fluid::FluidQuad) -> [u32; 27] {
+    let mut w = Vec::new();
+    w.extend(q.corners.iter().flatten().map(|c| c.to_bits()));
+    w.push(q.texture);
+    w.extend(q.colors);
+    w.push(u32::from(q.light[0]) | u32::from(q.light[1]) << 16);
+    w.push(u32::from(q.light[2]) | u32::from(q.light[3]) << 16);
+    w.try_into().expect("27 words")
+}
+
+/// Simulated GPU buffer: other columns before and after (known pattern) and the old elements,
+/// then the announced ranges alone written from the new ones; must equal a full upload.
+pub fn apply_ranges<T: Copy + PartialEq + std::fmt::Debug>(old: &[T], new: &[T], ranges: &[std::ops::Range<u32>], pad: T) {
+    let around = |v: &[T]| -> Vec<T> {
+        std::iter::repeat_n(pad, 7).chain(v.iter().copied()).chain(std::iter::repeat_n(pad, 5)).collect()
+    };
+    let mut gpu = around(old);
+    for s in ranges {
+        let s = s.start as usize..s.end as usize;
+        gpu[7 + s.start..7 + s.end].copy_from_slice(&new[s]);
+    }
+    assert_eq!(gpu, around(new), "ranges {ranges:?}: buffer differs from a full upload");
+    // Each range starts and ends on a changed element (nothing sent for nothing at the ends).
+    for s in ranges {
+        assert!(old[s.start as usize] != new[s.start as usize] && old[s.end as usize - 1] != new[s.end as usize - 1]);
+    }
+}
+
+/// In-place write from the base `old` to `new` checked on every path: for each gap of
+/// [`IN_PLACE_GAPS`], the whole comparison and the comparison of the `remeshed` sections only give
+/// the same ranges, which applied to a simulated buffer give a full upload; without gaps they are the
+/// old diff's. `None` if the counts changed (new place, checked as such by every path), otherwise
+/// the number of ranges of the smallest gap.
+pub fn check_in_place(old: &BlockMesh, new: &BlockMesh, remeshed: Option<rc_mesh::wire::Sections>) -> Option<usize> {
+    use rc_mesh::blocks::{InPlacePaths, in_place_diff, in_place_diff_with, pack_exact};
+    let base = pack_exact(old);
+    let faces = |m: &BlockMesh| m.layers.iter().flatten().copied().collect::<Vec<_>>();
+    let fluids = |m: &BlockMesh, ls: std::ops::Range<usize>| {
+        ls.flat_map(|l| m.fluids[l].iter().map(fluid_words)).collect::<Vec<_>>()
+    };
+    let old_diff = in_place_diff(&base, new);
+    let mut writes = None;
+    for gaps in IN_PLACE_GAPS {
+        let whole = in_place_diff_with(&base, new, None, InPlacePaths { touched_only: false, gaps });
+        let touched = in_place_diff_with(&base, new, remeshed, InPlacePaths { touched_only: true, gaps });
+        assert_eq!(touched, whole, "gaps {gaps:?}: touched-only comparison differs from the whole one");
+        let Some(d) = whole else {
+            assert!(old_diff.is_none(), "gaps {gaps:?}: in-place write refused, the old diff accepts it");
+            continue;
+        };
+        if gaps.is_none() {
+            assert_eq!(Some(&d), old_diff.as_ref(), "single range differs from the old diff");
+        }
+        apply_ranges(&faces(old), &faces(new), &d.faces, [0xdead; 6]);
+        apply_ranges(&fluids(old, 0..2), &fluids(new, 0..2), &d.fluids, [0xbeef; 27]);
+        apply_ranges(&fluids(old, 2..3), &fluids(new, 2..3), &d.trans, [0xcafe; 27]);
+        if gaps == Some([0; 3]) {
+            writes = Some(d.faces.len() + d.fluids.len() + d.trans.len());
+        }
+    }
+    writes
+}

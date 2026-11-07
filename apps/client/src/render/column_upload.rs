@@ -113,7 +113,7 @@ fn fluid96_mixed() {
 /// of the translucents and whether their order is free (`order_free`). Made on the pool
 /// (`RUSTCRAFT_OPT_MESHPREP`) or at upload.
 pub struct Prepared {
-    pub(super) faces: Vec<rc_mesh::blocks::Face>,
+    pub(super) faces: PreparedFaces,
     counts: [u32; 3],
     /// Words of the fluids (layers 0 and 1) and translucents, in format `formats`.
     pub(super) fluids: Vec<u32>,
@@ -125,9 +125,34 @@ pub struct Prepared {
     free: bool,
 }
 
+/// Faces of a column ready for the GPU (column in the region in bits 20-27), written one part after
+/// the other.
+pub(super) enum PreparedFaces {
+    /// Copied here (all in the first part), or the mesh's three layers moved here
+    /// (`prepare_moving_faces`).
+    Owned([Vec<rc_mesh::blocks::Face>; 3]),
+    /// The faces of the column's flat base, tagged there (`prepare_from_base`): word range of each
+    /// layer in it.
+    InBase(rc_mesh::blocks::Packed, [std::ops::Range<usize>; 3]),
+}
+
+impl PreparedFaces {
+    pub(super) fn parts(&self) -> [&[rc_mesh::blocks::Face]; 3] {
+        match self {
+            PreparedFaces::Owned(parts) => parts.each_ref().map(Vec::as_slice),
+            PreparedFaces::InBase(base, words) => words.clone().map(|r| base[r].as_chunks::<6>().0),
+        }
+    }
+}
+
 impl Prepared {
     pub fn bytes(&self) -> usize {
-        (self.faces.len() * FACE_BYTES as usize / 4 + self.fluids.len() + self.trans.len()) * 4
+        (self.face_len() * FACE_BYTES as usize / 4 + self.fluids.len() + self.trans.len()) * 4
+    }
+
+    /// Number of faces, all parts together.
+    pub(super) fn face_len(&self) -> usize {
+        self.faces.parts().iter().map(|p| p.len()).sum()
     }
 
     pub(super) fn fluid_len(&self) -> usize {
@@ -139,15 +164,16 @@ impl Prepared {
     }
 
     fn is_empty(&self) -> bool {
-        self.faces.is_empty() && self.fluids.is_empty() && self.trans.is_empty()
+        self.face_len() == 0 && self.fluids.is_empty() && self.trans.is_empty()
     }
 
-    /// Same bytes, same counts and same free order (centres compared bit by bit).
+    /// Same bytes, same counts and same free order (centres compared bit by bit); the faces
+    /// compared end to end, whatever their split into parts.
     fn same(&self, o: &Prepared) -> bool {
         fn b<T: bytemuck::NoUninit>(v: &[T]) -> &[u8] {
             bytemuck::cast_slice(v)
         }
-        b(&self.faces) == b(&o.faces)
+        self.faces.parts().into_iter().flatten().eq(o.faces.parts().into_iter().flatten())
             && self.fluids == o.fluids
             && self.trans == o.trans
             && b(&self.centers) == b(&o.centers)
@@ -225,7 +251,7 @@ fn in_place_writes(
 ) -> Option<Keep> {
     let (o, (base, d)) = (old?, in_place?);
     if o.version != base
-        || o.faces.1 as usize != p.faces.len()
+        || o.faces.1 as usize != p.face_len()
         || o.fluids.1 as usize != p.fluid_len()
         || o.trans.1 as usize != p.trans_len()
         || o.order.1 as usize != p.trans_len()
@@ -238,13 +264,20 @@ fn in_place_writes(
         (Target::Trans, o.trans.0, p.formats.trans_bytes(), d.trans),
     ]
     .into_iter()
-    .filter_map(|(t, at, stride, s)| {
-        let s = s?;
-        let bytes = s.start as usize * stride as usize..s.end as usize * stride as usize;
-        Some((t, (u64::from(at) + u64::from(s.start)) * stride, bytes))
+    .flat_map(|(t, at, stride, ranges)| {
+        ranges.into_iter().map(move |s| {
+            let bytes = s.start as usize * stride as usize..s.end as usize * stride as usize;
+            (t, (u64::from(at) + u64::from(s.start)) * stride, bytes)
+        })
     })
     .collect();
     Some(Keep { slot: o, writes, order: !(free && o.free) && p.trans_len() != 0 })
+}
+
+/// In-place gaps of `gap_bytes` bytes as numbers of elements (faces, fluid faces, translucent
+/// faces) in the GPU formats `formats`.
+pub fn in_place_gaps(gap_bytes: u64, formats: GpuFormats) -> [u32; 3] {
+    [FACE_BYTES, formats.fluid_bytes(), formats.trans_bytes()].map(|stride| (gap_bytes / stride) as u32)
 }
 
 /// Column in its region (4 bits per axis).
@@ -285,7 +318,8 @@ fn prepare_legacy(m: &BlockMesh, transfree: bool, formats: GpuFormats) -> Prepar
             })
             .collect()
     };
-    Prepared { faces: all, counts, fluids: fluid_all, fluid_counts, trans: trans_all, formats, centers, free }
+    let faces = PreparedFaces::Owned([all, Vec::new(), Vec::new()]);
+    Prepared { faces, counts, fluids: fluid_all, fluid_counts, trans: trans_all, formats, centers, free }
 }
 
 /// Preparation on the pool: buffers of the exact size, centres taken from the quads without going through
@@ -297,6 +331,45 @@ pub fn prepare(m: &BlockMesh, transfree: bool, formats: GpuFormats) -> Prepared 
     for l in &m.layers {
         faces.extend(l.iter().map(|f| [f[0] | local << 20, f[1], f[2], f[3], f[4], f[5]]));
     }
+    prepare_with_faces(m, PreparedFaces::Owned([faces, Vec::new(), Vec::new()]), counts, transfree, formats)
+}
+
+/// [`prepare`] with the faces MOVED out of the mesh (`RUSTCRAFT_OPT_MESH_PREPARE_BY_MOVE`): each layer
+/// becomes a part of the GPU bytes, tagged where it lies, without a copy of the faces; the mesh is
+/// left without them.
+pub fn prepare_moving_faces(m: &mut BlockMesh, transfree: bool, formats: GpuFormats) -> Prepared {
+    let local = local_of(m.x, m.z);
+    let mut faces = std::mem::take(&mut m.layers);
+    faces.iter_mut().flatten().for_each(|f| f[0] |= local << 20);
+    let counts = faces.each_ref().map(|l| l.len() as u32);
+    prepare_with_faces(m, PreparedFaces::Owned(faces), counts, transfree, formats)
+}
+
+/// GPU tag of the column (`x`, `z`): its place in the region, in `rc_mesh::blocks::GPU_TAG_BITS`.
+pub fn region_tag(x: i32, z: i32) -> u32 {
+    local_of(x, z) << 20
+}
+
+/// [`prepare`] whose faces are those of the column's flat base `base`, made by
+/// `rc_mesh::blocks::pack_tagged` with [`region_tag`] (`RUSTCRAFT_OPT_MESH_BASE_IS_PREPARED`): no
+/// copy nor pass over the faces, the base and the upload share them. `None` if `base` is not a
+/// flat mesh of `m`'s faces.
+pub fn prepare_from_base(
+    m: &BlockMesh,
+    base: rc_mesh::blocks::Packed,
+    transfree: bool,
+    formats: GpuFormats,
+) -> Option<Prepared> {
+    let words = rc_mesh::blocks::packed_face_words(&base)?;
+    let counts = words.clone().map(|r| (r.len() / 6) as u32);
+    (counts == m.layers.each_ref().map(|l| l.len() as u32))
+        .then(|| prepare_with_faces(m, PreparedFaces::InBase(base, words), counts, transfree, formats))
+}
+
+/// The rest of [`prepare`] around faces already prepared (`counts` per layer): fluids, translucents,
+/// centres and free order.
+fn prepare_with_faces(m: &BlockMesh, faces: PreparedFaces, counts: [u32; 3], transfree: bool, formats: GpuFormats) -> Prepared {
+    let local = local_of(m.x, m.z);
     let fluid_counts = [m.fluids[0].len() as u32, m.fluids[1].len() as u32, 0];
     let mut fluids = Vec::with_capacity((fluid_counts[0] + fluid_counts[1]) as usize * formats.fluid_words());
     for l in &m.fluids[..2] {
@@ -316,6 +389,37 @@ pub fn prepare(m: &BlockMesh, transfree: bool, formats: GpuFormats) -> Prepared 
         tq.iter().map(|q| std::array::from_fn(|a| (q.corners[0][a] + q.corners[2][a]) * 0.5)).collect()
     };
     Prepared { faces, counts, fluids, fluid_counts, trans, formats, centers, free }
+}
+
+/// The bytes `bytes` of faces stored in parts put end to end: each piece with its offset from the
+/// start of `bytes`, one per part it touches.
+fn face_byte_pieces(
+    parts: [&[rc_mesh::blocks::Face]; 3],
+    bytes: std::ops::Range<usize>,
+) -> impl Iterator<Item = (u64, &[u8])> {
+    let mut part_start = 0;
+    parts.into_iter().filter_map(move |part| {
+        let b: &[u8] = bytemuck::cast_slice(part);
+        let (start, end) = (bytes.start.max(part_start), bytes.end.min(part_start + b.len()));
+        let piece = (start < end).then(|| ((start - bytes.start) as u64, &b[start - part_start..end - part_start]));
+        part_start += b.len();
+        piece
+    })
+}
+
+/// Writes the bytes `bytes` of the faces at `at` in `target`. The pieces are contiguous in the
+/// target: the uploader records them as one GPU copy.
+fn write_faces(
+    up: &mut super::Uploader,
+    queue: &wgpu::Queue,
+    target: &wgpu::Buffer,
+    at: u64,
+    faces: &PreparedFaces,
+    bytes: std::ops::Range<usize>,
+) {
+    for (offset, piece) in face_byte_pieces(faces.parts(), bytes) {
+        up.write(queue, target, at + offset, piece);
+    }
 }
 
 impl Renderer {
@@ -383,7 +487,8 @@ impl Renderer {
         let sent =
             in_place_plan.as_ref().map_or_else(|| prepared.bytes(), |k| k.writes.iter().map(|(.., r)| r.len()).sum());
         crate::perf_log::upload_bytes(sent, prepared.bytes(), in_place_plan.is_some());
-        let (fluid_n, trans_n) = (prepared.fluid_len() as u32, prepared.trans_len() as u32);
+        let (face_n, fluid_n, trans_n) =
+            (prepared.face_len() as u32, prepared.fluid_len() as u32, prepared.trans_len() as u32);
         let Prepared { faces, counts, fluids: fluid_words, fluid_counts, trans: trans_words, centers, free, .. } =
             prepared;
         let (fluid_bytes, trans_bytes) = (formats.fluid_bytes(), formats.trans_bytes());
@@ -412,13 +517,22 @@ impl Renderer {
             // the exact eye of the last sort), except an unchanged identity order.
             let s = k.slot;
             (face_start, fluid_start, trans_start, order_start) = (s.faces.0, s.fluids.0, s.trans.0, s.order.0);
+            crate::perf_log::counter_per_second("upload_in_place_writes_per_s", k.writes.len() as u64);
             for (t, at, r) in k.writes {
-                let (buf, b, stage): (&wgpu::Buffer, &[u8], _) = match t {
-                    Target::Faces => (&region.faces, bytemuck::cast_slice(&faces), UPLOAD_WRITE_FACES),
-                    Target::Fluids => (&region.fluids, bytemuck::cast_slice(&fluid_words), UPLOAD_WRITE_FLUIDS),
-                    Target::Trans => (&trans.fluids, bytemuck::cast_slice(&trans_words), UPLOAD_WRITE_TRANSLUCENT),
+                let stage = match t {
+                    Target::Faces => {
+                        write_faces(up, queue, &region.faces, at, &faces, r);
+                        UPLOAD_WRITE_FACES
+                    }
+                    Target::Fluids => {
+                        up.write(queue, &region.fluids, at, &bytemuck::cast_slice(&fluid_words)[r]);
+                        UPLOAD_WRITE_FLUIDS
+                    }
+                    Target::Trans => {
+                        up.write(queue, &trans.fluids, at, &bytemuck::cast_slice(&trans_words)[r]);
+                        UPLOAD_WRITE_TRANSLUCENT
+                    }
                 };
-                up.write(queue, buf, at, &b[r]);
                 clock.lap(stage);
             }
             order_len = trans_n;
@@ -430,10 +544,10 @@ impl Renderer {
             }
         } else {
             let faces_size = region.faces.size();
-            face_start =
-                alloc_in(device, queue, up, &mut region.faces, &mut region.face_arena, faces.len() as u32, FACE_BYTES);
+            face_start = alloc_in(device, queue, up, &mut region.faces, &mut region.face_arena, face_n, FACE_BYTES);
             clock.lap(UPLOAD_ALLOC);
-            up.write(queue, &region.faces, u64::from(face_start) * FACE_BYTES, bytemuck::cast_slice(&faces));
+            let all_faces = 0..face_n as usize * FACE_BYTES as usize;
+            write_faces(up, queue, &region.faces, u64::from(face_start) * FACE_BYTES, &faces, all_faces);
             clock.lap(UPLOAD_WRITE_FACES);
             let fluids_size = region.fluids.size();
             fluid_start =
@@ -510,7 +624,7 @@ impl Renderer {
         let column = ColumnGpu {
             digest: if crate::remesh::checking() { crate::remesh::digest(m) } else { 0 },
             region: key,
-            face_alloc: (face_start, faces.len() as u32),
+            face_alloc: (face_start, face_n),
             fluid_alloc: (fluid_start, fluid_n),
             trans_alloc: (trans_start, trans_n),
             ranges,
