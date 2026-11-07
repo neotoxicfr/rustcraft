@@ -7429,3 +7429,87 @@ loaded by other agents compiling.
   (`push_item_layer`, `prepare` sorts, NBT clones, rc-mesh `to_vec`) belong to their zones: a
   reused buffer beats any allocator setting.
 
+## C6-M15: menus, broadcast compared in place, open container re-read without decoding, clicks without copies (07/11, loaded machine)
+
+Before, with a menu open, every tick (and again after each click): the difference broadcast copied
+every occupied slot and the cursor before comparing them with the client's copy (one copy per
+occupied slot, about 60 with a full inventory and a full chest); the open container's re-read
+looked its block entity up twice, copied every stored entry and decoded it into a stack (identifier
+and patch copied, patch reduced against the item's defaults) to compare the result with the menu,
+27 decodings per tick for a chest and 54 for a double chest; an open Ender chest was copied whole,
+a furnace or brewing stand's live slots too, the beacon's three properties went through a new
+list; the packet flush built a list of lists even with nothing to send. Each click copied the
+merchant payments whatever the menu, compared the crafting grid through a second copy, walked the
+slots of a shift-click or a gather through a list of indices and copied each candidate stack, and
+copied both stacks to ask whether a bundle was involved; the mount equipment test copied its
+allowed entities into strings; trading copied the payments and the offer. Switches, default = new,
+`=0` = old path (read once, `MenuSwitches` in `menus.rs`):
+- `RUSTCRAFT_OPT_MENU_BROADCAST_IN_PLACE` (C6-M15 lead 1 with C5-M44 merged in): the broadcast reads
+  each slot where it lies (fields borrowed one by one), a slot equal to the client's copy costs no
+  copy, a changed one two (the client's new copy, the packet); same for the cursor; `send_all`
+  writes the client copies from the packet's list and walks the properties by index.
+- `RUSTCRAFT_OPT_MENU_REMOTE_COPY_REUSE`: a changed client copy is overwritten by `clone_from`
+  (`Stack`'s `Clone` written by hand so that the identifier buffer is kept).
+- `RUSTCRAFT_OPT_MENU_PULL_WITHOUT_DECODING`: the stored entries are compared with the menu straight
+  from their saved form (`Stack::decodes_to`, `stored_slots_match`: one block entity lookup, the
+  last entry of a slot wins as in `slots`); an entry whose patch the decoding would reduce
+  (`patch_already_reduced`, the same rule as the reduction, shared through `patch_entry_kept`), a
+  live furnace or brewing stand, a single-item container or a larger one hand over to the full
+  decoding; a difference decodes as before. Ender chest, live slots and crafter grid compared
+  before any copy; the beacon's properties rewritten in place. `block_entity` now calls `be_get`
+  (the duplicated lookup is gone).
+- `RUSTCRAFT_OPT_MENU_FEWER_ALLOCATIONS`: flush returns at once when both packet lists are empty and
+  gives each list back emptied (its room kept); clicks copy the payments only for a merchant and
+  compare the grid in place after the click; shift-click and gather walk their range without a
+  list and raise counts where the stacks lie; the mount test reads the allowed entities in place;
+  a click without a bundle on either side leaves the bundle code without copying anything; trading
+  reads the payments and the offer by reference.
+
+Proof: `menus_switch_tests` (menu level: every click mode, drags, gathers, bundles in and out,
+2×2 and 3×3 crafting, three trades, mount equipment, client copies announced right and wrong) and
+`tests_menu_switches` (server: a chest open 1,200 ticks while a hopper fills it and another drains
+it, `/data` entries with a component equal to its default, a removal without a default, an empty
+patch, air and a zero count, `/item` and `/give` with the menu open, clicks of every mode with the
+client's copies right and stale, a stale state number, a creative clone; then a crafting table, the
+inventory grid, a burning furnace, an Ender chest changed by a command, a double chest fed on both
+halves, a crafter): the trace of each of the 16 switch combinations is identical (every packet, the
+stored contents, the chest's comparator signal, the advancement updates per tick, the ground
+items) and matches a stored fingerprint. `in_place_reading_matches_the_decoding` checks the in-place
+reading against the decoding on 17 tricky entries (counts of every width, one past 32 bits; missing
+id or count; patches kept, reduced, emptied, not a compound; unknown item) × 5 menu stacks, and on a
+chest holding them with a duplicate and an out-of-range slot. Five sabotages fail them (cursor
+never compared, reused copy without its patch, the reduced-patch guard always true, the second half
+of a double chest ignored, a carried bundle not seen).
+
+`bench_menus` (flat world, the player's 36 slots full, half of them damaged swords that carry a
+patch; `--features memstats`; two passes of the same binary, loaded machine: the timings move by up
+to 2× between passes and between leads that do not touch the measured path, the allocation counts
+do not move and are the figure that settles):
+
+| Micro-bench, loaded machine, 1 core | all off | broadcast in place | + copy reuse | pull without decoding | fewer allocations | all on |
+|---|---|---|---|---|---|---|
+| `broadcast_menus`, chest of 27 full stacks open, nothing changing: allocations per call | 264 | 165 | 165 | 100 | 263 | **0** |
+| same, ns per call (pass 1 / pass 2) | 4,202 / 4,470 | 3,123 / 3,161 | 3,163 / 4,148 | 4,046 / 3,405 | 4,528 / 9,017 | **2,109 / 1,850** |
+| `pull_menu`, double chest of 54 stacks open: allocations per call | 329 | 329 | 329 | **0** | 329 | **0** |
+| same, ns per call | 5,162 / 5,093 | 5,082 / 5,187 | 8,453 / 8,416 | 2,318 / 1,836 | 7,666 / 10,164 | **1,593 / 2,258** |
+| click through the packet handler (cycle of four: take, put back, shift-click there and back): allocations per click | 107.6 | 36.6 | 36.6 | 102.6 | 85.3 | **9.3** |
+| same, ns per click | 2,716 / 2,699 | 1,811 / 1,951 | 2,862 / 2,700 | 3,447 / 3,425 | 3,996 / 3,732 | **2,023 / 2,017** |
+
+Steady state with a menu open: 0 allocations per menu broadcast instead of 264 (chest) — the
+C5-M44 target "0 copies in steady state" reached — and the double chest is no longer decoded (329
+allocations, 54 decodings per call before). The copy reuse only acts when a slot changes (not in
+these cases): kept on, to settle on the scene bench like the others (rule C6). The 9.3 allocations
+left per click were not broken down (packets of the moved slots, post-action work).
+
+Axes: server CPU and allocations (no change of network, save, memory or rendering: the packets
+are the same, the reused buffers are those of copies the menu already held); multi-core and GPU not
+applicable (one menu per player on the server thread, the packet order is observable); invisible on
+the scenes until a menu is open (`survie-inventaire`). Not done: `with_menu` still looks the
+`limited_crafting` rule up by name each call (typed rules come with C6-M33); `select_trade` still
+copies the chosen offer (once per trade selection); `Nbt::clone_from` keeps the default (rc-proto,
+a patch is copied whole on a changed slot). Discarded by the mission: one pass shared with the
+inventory scan (a reward could reach the client a tick early), a revision counter per slot or per
+block entity (writes outside the menu, about 18 direct writes into the block entity lists: one
+forgotten and the next click overwrites the source). To settle on the quiet-machine scene bench:
+`survie-inventaire` (menu open).
+
