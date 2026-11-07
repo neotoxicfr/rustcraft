@@ -7161,6 +7161,73 @@ the main thread: no multi-core form), median of 1,000 frames:
   vertex overhead of the references against the halved back faces is decided there. Lead noted, not
   done: drawing exactly 6 × glyphs vertices by a search of the reference in a prefix sum of the
   counts (no wasted vertex, one draw per pass, a few storage reads per vertex).
+
+## C4-M05: GPU opened in the background at startup, GPU context kept on reload, meshing while the renderer builds (07/11, loaded machine)
+
+Startup milestones of the series-3 audit (plains12, ms since the process started): window 81,
+Vulkan instance 179 (98 ms after the window), adapter 186, device 229, block textures 264, first
+frame 335. Everything from the instance to the device needs no window, yet waited for it; on a
+reload (F3+T, server packs) the renderer reopened instance, adapter, device and surface again.
+Micro-figures, LOADED machine (other agents compiling), test
+`gpu_backend::early_open::tests::device_opened_in_the_background_matches_the_main_thread`:
+
+| Opening of instance + adapter + device (Vulkan) | time |
+|---|---|
+| first in the process (driver loaded: the startup case) | 213.3 ms |
+| again in the same process (the second creation of a reload, surface not counted) | 38.4 ms |
+
+- Early opening (`RUSTCRAFT_OPT_EARLY_GPU_OPEN`, default 1; "gpu-init" thread from the entry into
+  `main`, `gpu_backend/early_open.rs`): first API of the order known before the settings (forced
+  API, default preference). At the join, kept only when it is the device `pick` would choose:
+  same order once `options.txt` is read (preference "opengl" or a changed order: dropped, not
+  waited for), opened, surface creatable and supported, hardware adapter; otherwise `pick` runs
+  unchanged (software fallback, "Tried" list, error box). Same adapter by construction: wgpu-core
+  30 `request_adapter` drops the adapters that cannot present and then sorts by type with a stable
+  sort, and the Vulkan and DX12 backends ignore the surface when listing; the first adapter without
+  surface is therefore the one chosen with it whenever it can present. The thread competes with
+  the resource loading for the DLL loader and the CPU: "resources: end", "audio joined", the
+  driver's ~700 MB commit moved earlier (memstats) are to be read on the bench. Milestones added:
+  "before GPU instance" (separates show/icon/formats from the driver), "GPU joined" and the wait.
+- Window icon (same switch): only the retained image is decoded (names give the sides, candidates
+  narrowest first among those wide enough, then largest first; an image whose side differs from its
+  name falls back to decoding all five) and one icon object serves title bar and taskbar (one RGBA
+  copy instead of two). Expected gain ≈ 0 once the thread overlaps it; kept as a fix.
+- Kept context on reload (`RUSTCRAFT_OPT_KEEP_GPU_ON_RELOAD`, default 1): the old renderer hands
+  back surface, adapter, device and queue (`Renderer::into_gpu_context`, everything else dropped),
+  `render::wait_for_released_gpu_memory` waits for the release, and `Renderer::new` rebuilds
+  everything on that context. The old order (release, then create) is kept and explained: one swap
+  chain per window under DXGI, a second surface in use on the same window refused by Vulkan, and
+  the video memory given back first. Proof `render::kept_device_test`: the block arrays of 96
+  textures of 64 px (2,359,824 bytes) still used by the last submission are 0 bytes after the
+  release, and the rebuilt ones take the same size; sabotage seen (wait removed: arrays still
+  allocated). Not proven here and left to the bench: capture before / after F3+T in one launch
+  (the old path may flash the window while no surface exists; the game keeps its context).
+- Fidelity fix found (A3): after a reload in the Nether, the new entity renderer kept the
+  overworld entity lights until the next dimension change (only the shading was carried over).
+  Every new renderer now receives the dimension's shading and entity lights (no switch: a bug).
+- Meshing while the first renderer builds (`RUSTCRAFT_OPT_MESH_DURING_RENDERER_INIT`, default 1,
+  `events_before_renderer.rs`): `Renderer::new` calls back after the surface, the block textures,
+  the terrain pipelines, the interface, the overlay pipelines and the entities; the app applies the
+  events already received in their order while their kind is in the checked list (world data,
+  player state, registries, chat, inventory, teleport, local player entity data; entering the world
+  only in singleplayer without a quick play log and with the sound engine joinable without waiting)
+  and holds the first other one, applied first at the next frame; then the meshing settings, the
+  light and the meshing run as in a frame. Startup only (a reload keeps its frames' order). Before
+  any of it, the GPU formats are set from the mesh tables at startup; a read before that setting is
+  now reported (`FormatsOnce`). Approach "leave a core to the build": the pool already runs below
+  the main thread's priority (`RUSTCRAFT_POOLPRIO`), nothing added. To measure: "meshing caught up
+  at", first frame (must not move back), longest frame of the first two seconds (a backlog of
+  finished meshes waits for the first frame and its upload budget).
+- Reload fade (`RUSTCRAFT_OPT_RELOAD_FADE_AFTER_APPLY`, default 1): the exit fade started when the
+  resources arrived, so the application time (a few hundred ms) ate the start of its first second;
+  it now starts once they are applied, as the game does. Proof: alpha curve over 140 frames
+  identical for an application of 0 and 300 ms, different on the old start. The demo variable
+  `RUSTCRAFT_RELOADTEST` was already read once per site by `env_str!` (C4-M02) and not parsed when
+  unset: nothing left there.
+- To measure on the quiet machine: title, plains12, plains32, village (milestones of the 15 scenes,
+  3 alternating passes, each switch at 0 against the default) and reload-f3t ("resource reload:
+  applied in X ms", visible fade, GPU allocator line, `RUSTCRAFT_VRAMDUMP`).
+
 ## C6-M31: End, crystal compounds reused, arena ticket memo, one dragon contact walk (06/11, loaded machine)
 
 Before: every tick in the End rebuilt the compound of every living crystal for commands and
