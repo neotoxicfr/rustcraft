@@ -30,6 +30,18 @@ pub struct CommandPaths {
     /// `RUSTCRAFT_OPT_PARSERNOALLOC`: the command parser tries the tree's nodes without copying
     /// the parse context, the child lists or the words it compares.
     pub parser_no_alloc: bool,
+    /// `RUSTCRAFT_OPT_SELECTOR_CANDIDATE_VIEW`: a selector reads each candidate entity from the
+    /// list it is walked in (type, position, tags…) instead of looking it up again by identifier
+    /// for every option, nothing allocated per entity; the sort reads distances computed once and
+    /// an arbitrary order stops at the limit.
+    pub selector_candidate_view: bool,
+    /// `RUSTCRAFT_OPT_SELECTOR_TYPE_FIRST` (with the candidate view): `type=<id>` walks only the
+    /// entities of that type (the mobs of its species through the per-species index).
+    pub selector_type_first: bool,
+    /// `RUSTCRAFT_OPT_EXECUTE_IF_ENTITY_FIRST_MATCH`: `execute if|unless entity` followed by
+    /// another subcommand stops at the first match (except `sort=random`, whose shuffle draws on
+    /// the world's random); the terminal form still counts them all.
+    pub execute_if_entity_first_match: bool,
 }
 
 #[cfg(test)]
@@ -54,6 +66,9 @@ impl CommandPaths {
             local_time_cache: rc_data::opt_switch!("RUSTCRAFT_OPT_LOCALTIMECACHE"),
             schedule_queue: rc_data::opt_switch!("RUSTCRAFT_OPT_SCHEDULEQUEUE"),
             parser_no_alloc: rc_commands::parse::no_alloc_switch(),
+            selector_candidate_view: rc_data::opt_switch!("RUSTCRAFT_OPT_SELECTOR_CANDIDATE_VIEW"),
+            selector_type_first: rc_data::opt_switch!("RUSTCRAFT_OPT_SELECTOR_TYPE_FIRST"),
+            execute_if_entity_first_match: rc_data::opt_switch!("RUSTCRAFT_OPT_EXECUTE_IF_ENTITY_FIRST_MATCH"),
         }
     }
 
@@ -68,6 +83,9 @@ impl CommandPaths {
         local_time_cache: false,
         schedule_queue: false,
         parser_no_alloc: false,
+        selector_candidate_view: false,
+        selector_type_first: false,
+        execute_if_entity_first_match: false,
     };
 
     /// Every path on: the defaults.
@@ -81,6 +99,9 @@ impl CommandPaths {
         local_time_cache: true,
         schedule_queue: true,
         parser_no_alloc: true,
+        selector_candidate_view: true,
+        selector_type_first: true,
+        execute_if_entity_first_match: true,
     };
 
     /// Runs `f` with the worlds it opens on `paths`.
