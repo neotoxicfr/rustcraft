@@ -121,7 +121,8 @@ const SEED: i64 = 20_261_011;
 
 /// Each path alone, then the combinations with `range_yvol`, then all: a faulty track is
 /// named by its own failure.
-const VARIANTS: [(&str, Opts); 14] = [
+const VARIANTS: [(&str, Opts); 15] = [
+    ("shifted_noise_in_batches", Opts { shifted_noise_in_batches: true, ..Opts::OLD }),
     ("column_memo_y_independent", Opts { column_memo_y_independent: true, ..Opts::OLD }),
     ("memo+sublattice", Opts { column_memo_y_independent: true, sublattice_cache_read: true, ..Opts::OLD }),
     ("range_yvol", Opts { range_yvol: true, ..Opts::OLD }),
@@ -1130,6 +1131,36 @@ fn bench_kept_context_alternated() {
     }
     let (n, k) = (min_and_median(new), min_and_median(kept));
     eprintln!("terrain, ms/chunk min / median: new {:.3} / {:.3} | kept {:.3} / {:.3}", n.0, n.1, k.0, k.1);
+}
+
+/// Final density of 64 chunks on 1 thread (kept context), shifted noises in batches against point by
+/// point, alternated over 15 rounds: minimum and median per chunk. The noise kernel inside the
+/// batches (AVX2, shared cell) follows the environment: run it again with those switches at 0.
+#[test]
+#[ignore = "benchmark"]
+fn bench_shifted_noise_batches_alternated() {
+    let Some(pack) = common::data_pack() else { return };
+    counting::client_options();
+    let g = Generator::new(&pack, "overworld", 42).unwrap();
+    let chunks: Vec<(i32, i32)> = (0..8).flat_map(|x| (0..8).map(move |z| (x - 4, z - 4))).collect();
+    eprintln!("noise paths {:?}", rc_worldgen::noise::Paths::current());
+    let cases = [
+        ("default (batches)", Opts::current()),
+        ("default, point by point", Opts { shifted_noise_in_batches: false, ..Opts::current() }),
+    ];
+    let mut contexts: Vec<Ctx> = cases.iter().map(|(_, o)| Ctx::cached_with(*o)).collect();
+    let mut samples = vec![Vec::new(); cases.len()];
+    for _ in 0..15 {
+        for (i, ctx) in contexts.iter_mut().enumerate() {
+            samples[i].push(ms_per_chunk(&chunks, |x, z| {
+                std::hint::black_box(final_density_kept(&g, ctx, x, z));
+            }));
+        }
+    }
+    for ((label, _), s) in cases.iter().zip(samples) {
+        let (min, median) = min_and_median(s);
+        eprintln!("final density, {label:26} ms/chunk min {min:.3} median {median:.3}");
+    }
 }
 
 /// Terrain of 64 chunks (filling, surface, caves): a new context per chunk against the context
