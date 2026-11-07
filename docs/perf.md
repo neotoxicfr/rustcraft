@@ -6717,4 +6717,98 @@ proves them, measures what a loaded machine can show, and leaves every decision 
   (`6a557b6a…`, `9abd8cbe…`), generation reference, mesh fingerprint, relight replay; 1600×900
   screenshots (two executables are two launches: compare within the launch-to-launch noise,
   about 76,000 pixels). A lead is adopted only beyond the `shipped-layout-salt` distance.
+## C2-M09: smoothed light of the mesher, reads at fixed addresses, property bits, raw light grid, zero sheets (06/11, loaded machine)
+
+Hot spot (hot map v3, cave, pool, self / inclusive % of the process): `face_corners` 1.53 / 4.09,
+cell read 1.17 / 1.69, cell fill 1.00 / 1.05, properties read 0.34 / 0.86, about 41 % of
+`mesh_with`. Reading the code: every read of a face corner located its cache cell from its
+coordinates (three range tests and a product), tested the cell's generation and, at a miss, called
+the state closure (border grid or columns) then read the two half-bytes from the resolved layers.
+Geometry of the reads (block `p` inside the section, base `p` or `p + d` for a glued face): edges,
+diagonals, front and centre always fall inside the section's 18³ grid; only the four cells beyond
+the edges of a glued face of a block on the section boundary, looking out, reach the second ring
+(`p + 2d`), and those are property reads. Every LIGHT read of a face is inside the 18³ grid.
+Switches in `MeshJob::light` (`rc_mesh::light::LightPaths`, read once; the first three on by
+default, `=0` old path; the zero sheets off by default, `=1` on; the seven older ones now go
+through `opt_switch!` with the same defaults):
+- `RUSTCRAFT_OPT_AOOFFSETS` (`fixed_offsets`): the 14 reads of a face as a constant table per
+  (direction, glued), each with its vector, its step in the 20³ cache and its step in the 18³
+  grids: one addition per read, one test per face for the second ring.
+- `RUSTCRAFT_OPT_AOPROPBITS` (`prop_bits`): inside the 18³ grid, "lets the light through", solid
+  render and dark shade come from bits 29-31 of the property word (put there by C2-M08), and the
+  state of a light read from the state grid (`OUTSIDE` read as air, as the closure does) instead
+  of the closure and the border grid lookup. Second ring and path without the grids (reference,
+  cull paths without the property grid) unchanged.
+- `RUSTCRAFT_OPT_AORAWGRID` (`raw_grid`) with `RUSTCRAFT_OPT_AORAWGRIDMIN` (64 candidate blocks):
+  raw light of the section's 18³ grid (not 20³ as planned: no light read reaches the second ring),
+  u16 per cell, same index as the state and property grids, 11.4 KiB per thread, filled at the
+  section reset from the 27 resolved layers: per (y, z) row, the western and eastern cells read
+  one by one and the 16 middle cells unpacked from 8 bytes of each layer by a branch-free body that
+  the compiler vectorises, AVX2 version chosen at run time (`is_x86_feature_detected`, the release
+  stays portable). Emission and emissive forcing applied at the read. Fill: 2.1 µs per section
+  (2.8 for the baseline x86-64 body), 0.7 µs when the 27 layers are constants (`raw_grid_fill_cost`,
+  best of 9 × 2,000, loaded machine), about 400 lazy reads: hence the threshold on the candidate
+  blocks of the section (the reset moved after the candidate rows).
+- `RUSTCRAFT_OPT_AOZEROLAYER` (`zero_layers`): the shared all-zero sheet (`rc_world::zero_layer`)
+  recognised by its address at the reset: block "no data", sky level 0 (sky taken from the bottom
+  of a section above too): no memory read for the dark sections, and a constant row fill.
+- The 16-byte cell kept the state, written and never read: 12 bytes now (−32 KiB per pool thread,
+  raw grid +11.4 KiB: −20.6 KiB per thread); with `prop_bits` and `raw_grid`, the 20³ cells are only
+  touched by the second ring. `AOCELL` and `AONEIGH` only act on the coordinate reader (the three
+  addressed switches at 0).
+
+Interleaved micro-bench `tests/light_bench.rs` `addressed_reads_bench`, capture, 15 short passes
+(best / median; 1 thread on 156 columns, also counted in thread cycles; all threads on 1,248
+columns), against D + A + B (former default, 263.3 / 344.2 ms 1 thread, 110.5 ms all), loaded
+machine: old +9.5 % / +21.5 % all; offsets alone −12.4 / −15.7 %; property bits alone −6.2 / −16.0 %;
+raw grid alone −4.1 / −12.1 %; zero sheets alone +13.5 / −3.1 % (median −4.9 %); offsets + bits
+−24.1 / −18.4 %; offsets + raw −11.2 / −20.0 %; bits + raw −9.1 / −17.2 %; all four −14.1 /
+−22.3 % (median 1 thread 254 ms, −26 %); all four but offsets −21.5 / −16.7 %, but bits −22.7 /
+−21.3 %, but raw −15.4 / −18.6 %, but zero sheets −26.6 / −18.2 %; raw grid from 64 candidates
+−12.7 / −19.0 %, from 256 −34.9 / −22.8 %, from 1,024 −25.3 / −23.6 %; default (all four, 64)
+−14.6 / −23.0 %. A first pass of 7 long runs gave the same order for the paths alone and
+indistinct combinations (from −2 to −16 % all threads): the thread cycles follow the wall time
+exactly (4.49 GHz), the noise is contention, not preemption. On this bench the 1-thread best is
+the noisiest column: for the thresholds and the zero sheets in combination the medians are flat
+(254.0 all four, 251.8 without zero sheets, 254.9 / 258.5 / 257.3 from 64 / 256 / 1,024, 255.8
+default), the spread of the bests (171 to 230 ms) is noise.
+
+Second micro-bench `zero_sheets_and_raw_threshold_bench`, on top of the new default, the default
+repeated three times as noise reference, two runs of 15 passes (best / median, 1 thread; best all
+threads), loaded machine: the default repeated moves by up to −8.2 / −5.6 % and −3.3 % all;
+zero sheets +1.0 / −4.9 / +0.7 % then −5.0 / +1.7 / −4.4 %; raw grid from 0 +0.1 / +14.0 / +1.9 %
+then −4.3 / +3.1 / −6.3 %; from 256 +0.5 / +15.1 / +2.0 % then −5.1 / −0.7 / −2.9 %; from 1,024
++2.3 / +18.8 / +1.2 % then −5.8 / +1.4 / −4.6 % (the median step of the first run is gone in the
+second): all inside the noise.
+
+Decision: the addressed reader wins in every combination (1-thread medians −17 to −27 %): offsets,
+property bits and raw grid on by default. The zero sheets show no gain on the capture (a surface
+region) and no proven gain anywhere else: OFF by default (`RUSTCRAFT_OPT_AOZEROLAYER=1` turns them
+on), to measure on the cave scene where most layers are the shared zero sheet. Threshold kept at 64
+(the fill cost, 2 µs, against some 400 lazy reads): no threshold beats another beyond the noise,
+to measure again on the quiet machine. Multi-core: the pool already spreads the columns, a 2 µs
+fill is not worth splitting; GPU ruled out as for C2-M07 (reads made while building the faces).
+
+Proofs: `tests/light_paths.rs` — the 11 paths each alone and all but one, all, the default, the raw
+grid from 1 candidate and never (alone and in the default), the addressed reader with the 6-byte
+cells, with the memorised neighbourhood and with the zero sheets: 32 variants × default / without occlusion / without sky
+over the whole capture against the old path and the stored fingerprint, and on the built scene
+(glass added); unit tests in `light.rs` (no data needed): raw grid against the lazy read of every
+cell (baseline body and AVX2, with and without the zero sheet shortcut, own layers, bottom of a
+section above, levels, no data, zero sheet), zero sheet reads, emission on packed levels against
+the cell read, property word against the light table for the 32 combinations of the light bits,
+fixed offsets against the coordinate walk (6 directions × glued × every read × every 7th block),
+cell sizes 12 and 6 bytes. Sabotages, each alone (`target/notes/sabotage.ps1` of the mission):
+sky half-byte shifted in the raw grid, emissive forcing forgotten, zero sky sheet read as level
+15, a diagonal offset built from the same side twice, the closed bit of the property word
+inverted: the matching unit test and both capture tests fail; second ring taken as inside the
+grid: both capture tests fail. "Closed" bit computed without the dampening: the two unit tests
+fail, the meshes do not change — no state of 26.3 is solid render without dampening. Grid state
+`OUTSIDE` not mapped to air: nothing fails (only the dampening bit would differ, which no reader
+of that info looks at); the mapping stays so that the state is the closure's.
+
+To measure on the quiet machine: `scenes.py` cave, forest, plains32, flight, redstone (meshing
+ms/s in the pool, meshed sections/s), each of `AOOFFSETS`, `AOPROPBITS`, `AORAWGRID` at 0,
+`AOZEROLAYER` at 1 (cave first), `AORAWGRIDMIN` at 0, 256 and 1024; memstats per pool thread. Not done: the
+flat path (emissive blocks, occlusion off) and the fluids still read the layers, not the raw grid.
 
