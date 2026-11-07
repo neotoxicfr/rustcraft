@@ -150,6 +150,7 @@ fn schedule_applies_in_every_dimension() {
         bed_last: 0,
         refresh: false,
         nodes: Vec::new(),
+        sensing_buffer: Vec::new(),
     };
     b.mem.job_site = Some(GPos { dim: DimKey::of("minecraft:the_nether"), pos: [0, 0, 0] });
     b.update_schedule(100, 6000);

@@ -376,7 +376,7 @@ pub(crate) fn mob_states_on() -> bool {
 
 /// `RUSTCRAFT_OPT_BLOCKIDS`, read once: 1 (default) block name resolved by the block table;
 /// 0 walk over all blocks at each call.
-fn block_ids_on() -> bool {
+pub(crate) fn block_ids_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_BLOCKIDS").map(str::trim) != Some("0"))
 }

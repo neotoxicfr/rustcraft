@@ -282,8 +282,13 @@ impl Items {
     /// Maximum size of a stack (`max_stack_size` component); a patch that removes it leaves
     /// the game's fallback, 1.
     pub fn max_stack(&self, s: &Stack) -> i32 {
+        self.max_stack_of(&s.id, s.components.as_ref())
+    }
+
+    /// `max_stack` of item `id` with the patch `components`, without a stack to build.
+    pub fn max_stack_of(&self, id: &str, components: Option<&Nbt>) -> i32 {
         // One pass over the patch for the value and the removal (called for every stack moved).
-        if let Some(Nbt::Compound(f)) = &s.components {
+        if let Some(Nbt::Compound(f)) = components {
             for (k, v) in f {
                 match k.as_str() {
                     "minecraft:max_stack_size" => {
@@ -296,7 +301,7 @@ impl Items {
                 }
             }
         }
-        self.info(&s.id).map_or(64, |i| i32::from(i.max_stack_size.max(1)))
+        self.info(id).map_or(64, |i| i32::from(i.max_stack_size.max(1)))
     }
 
     pub fn max_damage(&self, s: &Stack) -> i32 {

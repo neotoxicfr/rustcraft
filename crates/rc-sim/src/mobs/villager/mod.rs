@@ -6,10 +6,36 @@
 pub mod behave;
 pub mod brain;
 mod rpos;
+pub(crate) mod switches;
 pub mod trader;
 
 #[cfg(test)]
+mod bench_villager_brain;
+#[cfg(test)]
+mod brain_tests;
+#[cfg(test)]
 mod tests;
+
+/// Tests: time (ns) and allocations spent in the villager brains by this thread so far (scene bench).
+#[cfg(test)]
+pub(crate) mod brain_cost {
+    use std::cell::Cell;
+
+    thread_local! {
+        static TOTAL: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    }
+
+    pub(crate) fn add(ns: u64, allocations: u64) {
+        TOTAL.with(|t| {
+            let (a, b) = t.get();
+            t.set((a + ns, b + allocations));
+        });
+    }
+
+    pub(crate) fn read() -> (u64, u64) {
+        TOTAL.with(Cell::get)
+    }
+}
 
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::Meta;
@@ -215,6 +241,11 @@ pub struct NpcWorld {
     pub spawn_chance: i32,
     pub loaded: bool,
     pub rng: JRand,
+    /// Food value of each item's default `villager_food` component, by item identifier, read on
+    /// first need (`RUSTCRAFT_OPT_VILLAGER_FOOD_CACHE`).
+    pub food_values: std::sync::OnceLock<Box<[std::sync::OnceLock<Option<i32>>]>>,
+    /// Crop blocks and their ripe age, resolved once (`RUSTCRAFT_OPT_BLOCKIDS`).
+    pub crops: std::sync::OnceLock<behave::CropBlocks>,
 }
 
 impl Default for NpcWorld {
@@ -225,8 +256,15 @@ impl Default for NpcWorld {
             spawn_chance: 25,
             loaded: false,
             rng: JRand::from_time(0x5452_4144),
+            food_values: std::sync::OnceLock::new(),
+            crops: std::sync::OnceLock::new(),
         }
     }
+}
+
+/// Food value of a `villager_food` component: its nutrition (object form) or the number itself.
+fn food_value(v: &serde_json::Value) -> i32 {
+    v["nutrition"].as_i64().or_else(|| v.as_i64()).unwrap_or(0) as i32
 }
 
 pub fn is_npc(k: Kind) -> bool {
@@ -336,10 +374,27 @@ impl Server {
         })
     }
 
-    /// Nutritional value for a villager (component `villager_food`).
+    /// Nutritional value for a villager (default component `villager_food`, unless the stack's
+    /// patch removes it).
     pub(crate) fn villager_food(&self, s: &Stack) -> Option<i32> {
-        let v = self.life.items.default_component(s, "minecraft:villager_food")?;
-        Some(v["nutrition"].as_i64().or_else(|| v.as_i64()).unwrap_or(0) as i32)
+        if !switches::food_cache() {
+            let v = self.life.items.default_component(s, "minecraft:villager_food")?;
+            return Some(food_value(&v));
+        }
+        // The patch wins over the item's default, as on the old path: only the default is kept.
+        if crate::items::component(s, "!minecraft:villager_food").is_some() {
+            return None;
+        }
+        let items = &self.life.items;
+        let id = usize::try_from(items.id(&s.id)?).ok()?;
+        // The default components are read under a process-wide lock: each item's value is read
+        // once, on its first need, then served from this table.
+        let table =
+            self.mobs.npc.food_values.get_or_init(|| (0..items.names.len()).map(|_| std::sync::OnceLock::new()).collect());
+        *table.get(id)?.get_or_init(|| {
+            let v = &items.defaults(&s.id)["minecraft:villager_food"];
+            (!v.is_null()).then(|| food_value(v))
+        })
     }
 
     pub(crate) fn npc_food_points(&self, m: &Mob) -> i32 {
@@ -420,8 +475,14 @@ impl Server {
         super::variants::VILLAGER_TYPES.get(m.villager[0] as usize).copied().unwrap_or("plains")
     }
 
-    /// Generated at the first consultation (current profession and level).
+    /// Generated at the first consultation (current profession and level), copied (old path of
+    /// `RUSTCRAFT_OPT_TRADE_BORROW`).
     pub(crate) fn npc_offers(&mut self, m: &mut Mob) -> Vec<Offer> {
+        self.npc_offers_lent(m).to_vec()
+    }
+
+    /// The trader's offers, generated at the first consultation (current profession and level).
+    pub(crate) fn npc_offers_lent<'a>(&mut self, m: &'a mut Mob) -> &'a [Offer] {
         if m.npc.as_ref().is_some_and(|n| n.offers.is_none()) {
             let mut offers = Vec::new();
             self.update_trades(m, &mut offers);
@@ -429,7 +490,7 @@ impl Server {
                 n.offers = Some(offers);
             }
         }
-        m.npc.as_ref().and_then(|n| n.offers.clone()).unwrap_or_default()
+        m.npc.as_ref().and_then(|n| n.offers.as_deref()).unwrap_or(&[])
     }
 
     /// Trade set of the profession at the current level (or the trader's three sets).
@@ -469,8 +530,8 @@ impl Server {
         }
         // Main-hand click on an adult: counted even without an offer.
         self.award_custom("talked_to_villager", 1);
-        let offers = self.npc_offers(m);
-        if offers.is_empty() {
+        let none = if switches::trade_borrow() { self.npc_offers_lent(m).is_empty() } else { self.npc_offers(m).is_empty() };
+        if none {
             // Villager: unhappy; wandering trader: nothing.
             if m.kind == Kind::Villager {
                 self.set_unhappy(m);
@@ -611,7 +672,14 @@ impl Server {
         let traded = std::mem::take(&mut t.traded);
         let updated = std::mem::take(&mut t.updated);
         let sound = std::mem::replace(&mut t.trade_sound, false);
-        let offers = t.offers.clone();
+        // The menu's offers as they are now (the rewards below may send new ones to the menu):
+        // only those of the trades made are copied, the old path copies them all.
+        let offers: Vec<(usize, Offer)> = if switches::trade_borrow() {
+            traded.iter().map(|&k| (k, t.offers[k].clone())).collect()
+        } else {
+            let all = t.offers.clone();
+            traded.iter().map(|&k| (k, all[k].clone())).collect()
+        };
         let Some(i) = self.mob_index(id) else { return };
         let Some(mut m) = self.mobs.list.take(i) else { return };
         for valid in updated {
@@ -631,16 +699,15 @@ impl Server {
         if sound {
             // Client-local sound: not sent by the server.
         }
-        for k in traded {
+        for (k, off) in offers {
             if let Some(n) = m.npc.as_mut()
-                && let Some(off) = n.offers.as_mut().and_then(|o| o.get_mut(k))
+                && let Some(mine) = n.offers.as_mut().and_then(|o| o.get_mut(k))
             {
                 // Use, ambient timer, reward.
-                *off = offers[k].clone();
+                mine.clone_from(&off);
             }
             let interval = m.kind.info().ambient_interval;
             m.ambient_time = -interval;
-            let off = offers[k].clone();
             self.reward_trade(&mut m, &off);
             self.s9_traded(&m, &off.result); // S9: statistic and trading trigger
         }
@@ -782,19 +849,19 @@ impl Server {
             return;
         }
         let bb = m.bbox();
-        let mut count = 0;
-        for o in self.mobs.list.iter() {
-            if o.kind != Kind::Villager {
-                continue;
-            }
+        let inside = |o: &Mob| {
             let ob = o.bbox();
-            let inside = ob.max[0] > bb.min[0] - 10.0
+            ob.max[0] > bb.min[0] - 10.0
                 && ob.min[0] < bb.max[0] + 10.0
                 && ob.max[1] > bb.min[1] - 10.0
                 && ob.min[1] < bb.max[1] + 10.0
                 && ob.max[2] > bb.min[2] - 10.0
-                && ob.min[2] < bb.max[2] + 10.0;
-            if inside && o.npc.as_ref().and_then(|n| n.brain.as_ref()).is_some_and(|ob| wants(&ob.mem)) && count < 5 {
+                && ob.min[2] < bb.max[2] + 10.0
+        };
+        // The villagers alone, through the per-species index (`RUSTCRAFT_OPT_KINDINDEX`).
+        let mut count = 0;
+        for o in self.mobs.of_kind(Kind::Villager) {
+            if inside(o) && o.npc.as_ref().and_then(|n| n.brain.as_ref()).is_some_and(|ob| wants(&ob.mem)) && count < 5 {
                 count += 1;
             }
         }
@@ -805,18 +872,10 @@ impl Server {
         if count >= needed && self.summon_golem_for_villager(m.block_pos()) {
             // Golem born (F06): all villagers in the enlarged box of 10 have "seen" it.
             b.mem.golem = Some(599);
-            for o in self.mobs.list.iter_mut() {
-                if o.kind != Kind::Villager {
-                    continue;
-                }
-                let ob = o.bbox();
-                let inside = ob.max[0] > bb.min[0] - 10.0
-                    && ob.min[0] < bb.max[0] + 10.0
-                    && ob.max[1] > bb.min[1] - 10.0
-                    && ob.min[1] < bb.max[1] + 10.0
-                    && ob.max[2] > bb.min[2] - 10.0
-                    && ob.min[2] < bb.max[2] + 10.0;
-                if inside && let Some(ob) = o.npc.as_mut().and_then(|n| n.brain.as_mut()) {
+            for o in self.mobs.of_kind_mut(Kind::Villager) {
+                if inside(o)
+                    && let Some(ob) = o.npc.as_mut().and_then(|n| n.brain.as_mut())
+                {
                     ob.mem.golem = Some(599);
                 }
             }
@@ -1188,13 +1247,22 @@ impl Server {
     /// Throws half a stack toward a target (an item throw toward a target).
     pub(crate) fn throw_half_stack(&mut self, m: &mut Mob, target: [f64; 3], pred: impl Fn(&Server, &Stack) -> bool) {
         let len = m.npc.as_ref().map_or(0, |n| n.inv.len());
+        let lend = switches::no_tick_allocations();
         let mut thrown = None;
         for i in 0..len {
-            let Some(s) = m.npc.as_ref().and_then(|n| n.inv[i].clone()) else { continue };
-            if !pred(self, &s) {
+            let Some(slot) = m.npc.as_ref().and_then(|n| n.inv[i].as_ref()) else { continue };
+            // Each stack lent to the test; the old path copies every one of them first.
+            let copy;
+            let s = if lend {
+                slot
+            } else {
+                copy = slot.clone();
+                &copy
+            };
+            if !pred(self, s) {
                 continue;
             }
-            let max = self.life.items.max_stack(&s);
+            let max = self.life.items.max_stack(s);
             let count = if s.count > max / 2 {
                 s.count / 2
             } else if s.count > 24 {
@@ -1202,6 +1270,7 @@ impl Server {
             } else {
                 continue;
             };
+            let out = Stack { count, ..s.clone() };
             if let Some(n) = m.npc.as_mut()
                 && let Some(st) = n.inv[i].as_mut()
             {
@@ -1210,7 +1279,7 @@ impl Server {
                     n.inv[i] = None;
                 }
             }
-            thrown = Some(Stack { count, ..s });
+            thrown = Some(out);
             break;
         }
         if let Some(s) = thrown {
@@ -1331,7 +1400,11 @@ impl Server {
             }
         }
         if let Some(mut b) = m.npc.as_mut().and_then(|n| n.brain.take()) {
+            #[cfg(test)]
+            let started = (std::time::Instant::now(), crate::test_alloc::allocations());
             self.brain_tick(m, &mut b);
+            #[cfg(test)]
+            brain_cost::add(started.0.elapsed().as_nanos() as u64, crate::test_alloc::allocations() - started.1);
             if b.refresh {
                 b.refresh = false;
                 b = Box::new(self.refresh_brain(m, *b));
@@ -1453,20 +1526,26 @@ impl Server {
                 // those already in cache).
                 let mut witnesses: Vec<i32> = Vec::new();
                 if let Some(mut b) = m.npc.as_mut().and_then(|n| n.brain.take()) {
-                    let list: Vec<i32> = b
-                        .mem
-                        .visible
-                        .as_ref()
-                        .map(|v| {
-                            v.iter()
-                                .filter_map(|x| if let Ent::Mob(id) = x.0 { Some(id) } else { None })
-                                .filter(|&id| self.mob_ref(id).is_some_and(|o| o.kind == Kind::Villager))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    for id in list {
-                        if self.visible(m, &mut b, Ent::Mob(id)) {
-                            witnesses.push(id);
+                    let villager_id = |x: brain::Sensed| match x.ent {
+                        Ent::Mob(id) if self.mob_ref(id).is_some_and(|o| o.kind == Kind::Villager) => Some(id),
+                        _ => None,
+                    };
+                    if switches::visible_by_index() {
+                        // Each villager tested at its index in the list (no copy, no second search).
+                        let n = b.mem.visible.as_ref().map_or(0, Vec::len);
+                        for i in 0..n {
+                            let Some(id) = b.mem.visible.as_ref().and_then(|v| villager_id(v[i])) else { continue };
+                            if self.visible_at(m, &mut b, i) {
+                                witnesses.push(id);
+                            }
+                        }
+                    } else {
+                        let list: Vec<i32> =
+                            b.mem.visible.as_ref().map(|v| v.iter().filter_map(|&x| villager_id(x)).collect()).unwrap_or_default();
+                        for id in list {
+                            if self.visible(m, &mut b, Ent::Mob(id)) {
+                                witnesses.push(id);
+                            }
                         }
                     }
                     if let Some(n) = m.npc.as_mut() {
@@ -1584,6 +1663,7 @@ pub fn load(m: &mut Mob, e: &Nbt) {
             bed_last: 0,
             refresh: false,
             nodes: Vec::new(),
+            sensing_buffer: Vec::new(),
         }));
         if let Some(Nbt::IntArray(p)) = e.get("sleeping_pos")
             && p.len() == 3
