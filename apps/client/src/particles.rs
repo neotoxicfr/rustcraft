@@ -4215,6 +4215,14 @@ mod tests {
         }
     }
 
+    /// Sizes of the per-particle and per-instance data the frame walks (rule B10): the light
+    /// cache adds 24 bytes to each particle, an instance stays 48 bytes.
+    #[test]
+    fn particle_frame_data_sizes() {
+        assert_eq!(std::mem::size_of::<LightCache>(), 24);
+        assert_eq!(std::mem::size_of::<Inst>(), 48);
+    }
+
     /// The four combinations of the light paths, the path before first.
     fn all_light_paths() -> [LightPaths; 4] {
         [(false, false), (false, true), (true, false), (true, true)].map(|(lazy, epoch_cache)| LightPaths {
