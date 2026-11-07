@@ -8,7 +8,7 @@
 //! at the next frame, so the sequence of applied events stays the same. The meshing of what they
 //! brought then starts on the pool, as a frame would start it.
 
-use rc_client::{EntityEvent, Event};
+use rc_client::{ChatTag, EntityEvent, Event};
 
 use crate::App;
 
@@ -29,9 +29,10 @@ struct EarlyContext {
 }
 
 /// The event has, applied before the renderer exists, the effect it would have at the first frame.
-/// Each kind listed here was checked: its handling reads neither the renderer nor its interface,
-/// and leaves nothing a renderer under construction would miss (the dimension's shading and entity
-/// lights are applied to it once built).
+/// Each kind listed here was checked on two criteria: its handling reads neither the renderer nor
+/// its interface, and leaves nothing a renderer under construction would miss (the dimension's
+/// shading and entity lights are applied to it once built); and it reads no state set by the first
+/// application of the options, which runs only once the renderer is built.
 fn applies_without_renderer(ev: &Event, cx: EarlyContext) -> bool {
     match ev {
         // World data: grid, light, biomes, block entities, weather. A forgotten column has nothing to
@@ -61,7 +62,9 @@ fn applies_without_renderer(ev: &Event, cx: EarlyContext) -> bool {
         | Event::TickingStep(_)
         | Event::PlayerInfo(_)
         | Event::Score(_)
-        | Event::Chat { .. }
+        // A system message is never delayed nor hidden by the chat settings; a player message reads
+        // the chat delay and "secure chat only", set by the first application of the options.
+        | Event::Chat { tag: ChatTag::System, .. }
         | Event::Inventory(_)
         | Event::Attributes { .. }
         | Event::Teleport(_)
@@ -192,7 +195,8 @@ mod tests {
     }
 
     /// Kinds that would act on the renderer or its interface wait for it; the local player's state
-    /// and world data do not. Sabotage checked: accepting every entity event fails the third line.
+    /// and world data do not. Sabotages checked: accepting every entity event fails the third line,
+    /// accepting every chat message fails the player message lines.
     #[test]
     fn kinds_that_need_the_renderer_wait_for_it() {
         let time = Event::Time { game_time: 1, clocks: Vec::new() };
@@ -208,6 +212,10 @@ mod tests {
         assert!(!applies_without_renderer(&Event::Disconnected("x".into()), cx()), "disconnect screen");
         assert!(!applies_without_renderer(&Event::GameEvent { kind: 5, param: 0.0 }, cx()), "demo message");
         assert!(applies_without_renderer(&Event::GameEvent { kind: 13, param: 0.0 }, cx()));
+        let chat = |tag| Event::Chat { component: Box::new(rc_text::Component::text("hi")), tag };
+        assert!(applies_without_renderer(&chat(ChatTag::System), cx()));
+        assert!(!applies_without_renderer(&chat(ChatTag::Disguised), cx()), "player message: chat delay not set yet");
+        assert!(!applies_without_renderer(&chat(ChatTag::NotSecure), cx()), "player message: secure chat only not set yet");
         let bundle = |last| Event::Bundle(vec![Event::HeldSlot(1), last]);
         assert!(applies_without_renderer(&bundle(Event::HeldSlot(2)), cx()));
         assert!(!applies_without_renderer(&bundle(Event::Disconnected("x".into())), cx()));
