@@ -419,6 +419,68 @@ fn point_after_volume_cache_under_choice() {
     assert!(failures.is_empty(), "{} differences:\n{}", failures.len(), failures.join("\n"));
 }
 
+/// Shifted noises a data pack can declare but the 26.3 data never does: a shift in y (compiled to
+/// `ShiftedXyz`), and no shift in y but a y scale over volumes of several rows. Volumes of several
+/// batches (1 024 points), ending on a partial batch, and stepped: the batches against the noise
+/// point by point, bit for bit.
+#[test]
+fn shifted_noise_batches_data_pack_cases() {
+    let Some(pack) = common::data_pack() else { return };
+    let mut g = Generator::new(&pack, "overworld", SEED).unwrap();
+    // Each shift reads its own noise, scaled so that neighbouring points fall in other cells.
+    let shift = |noise: &str| {
+        format!(
+            r#"{{"type":"minecraft:mul","left":200.0,
+                "right":{{"type":"minecraft:noise","noise":"{noise}","xz_scale":0.5,"y_scale":0.5}}}}"#
+        )
+    };
+    let shifted_xyz = format!(
+        r#"{{"type":"minecraft:noise","noise":"minecraft:temperature","xz_scale":0.25,"y_scale":0.75,
+            "shift_x":{},"shift_y":{},"shift_z":{}}}"#,
+        shift("minecraft:cave_cheese"),
+        shift("minecraft:cave_layer"),
+        shift("minecraft:vegetation")
+    );
+    let shifted_xz = format!(
+        r#"{{"type":"minecraft:noise","noise":"minecraft:continentalness","xz_scale":0.25,"y_scale":0.75,
+            "shift_x":{},"shift_z":{}}}"#,
+        shift("minecraft:cave_cheese"),
+        shift("minecraft:vegetation")
+    );
+    let xyz = compile_text(&mut g, &shifted_xyz);
+    let xz = compile_text(&mut g, &shifted_xz);
+    assert!(matches!(g.program.nodes[xyz as usize], S::ShiftedXyz { .. }), "shift in y compiled to ShiftedXyz");
+    assert!(matches!(g.program.nodes[xz as usize], S::ShiftedXz { y, .. } if y != 0.0), "ShiftedXz with a y scale");
+    let pairs = [
+        ("old", Opts { shifted_noise_in_batches: true, ..Opts::OLD }, Opts::OLD),
+        ("default", Opts::current(), Opts { shifted_noise_in_batches: false, ..Opts::current() }),
+    ];
+    let mut failures = Vec::new();
+    for (cx, cz) in chunks(4) {
+        let (x, z, y0) = (cx * 16, cz * 16, g.settings.min_y);
+        let volumes = [
+            Volume::new(16, 4, 16, x, y0 + 61, z),
+            Volume::new(7, 9, 11, x + 3, -5, z - 2),
+            Volume::stepped(5, 7, 5, x, y0, z, 4, 8, 4),
+        ];
+        for (root_name, root) in [("shifted xyz", xyz), ("shifted xz", xz)] {
+            for v in &volumes {
+                for (label, batches, point_by_point) in &pairs {
+                    let want = g.volume(root, &mut Ctx::cached_with(*point_by_point), v);
+                    let got = g.volume(root, &mut Ctx::cached_with(*batches), v);
+                    if let Some((bad, first)) = first_diff(&got, &want) {
+                        failures.push(format!(
+                            "{root_name} {label}, chunk {cx},{cz}, {}x{}x{}: {bad} differences, first at {first}",
+                            v.sx, v.sy, v.sz
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{} differences:\n{}", failures.len(), failures.join("\n"));
+}
+
 /// Pairs of volumes of a chunk evaluated one after the other in one context: a larger one, then
 /// one whose points it holds. The aquifer's quart grid then the corners of the final density (the
 /// order of the terrain); a block volume then a grid of step 4 inside it; a block volume then a

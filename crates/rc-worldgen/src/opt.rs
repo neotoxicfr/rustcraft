@@ -4,9 +4,12 @@
 //! Dependencies: `NOISE_COLCONST`, `NOISE_SIMD`, `NOISE_AVX2`, `NOISE_XPRE` and
 //! `NOISE_XY_PERM_TABLE` only act in the precomputed path (`NOISE_YPRE`), and `NOISE_AVX2` only
 //! with `NOISE_SIMD`; `NOISE_BATCH_AVX2` only acts on the batches of `NOISE_BATCH_POINTS` with
-//! `PERM512`. To isolate a track
+//! `PERM512`, and `NOISE_BATCH_SHARED_CELL` only inside the AVX2 batch (`NOISE_BATCH_AVX2`, so
+//! not at all on a processor without AVX2). To isolate a track
 //! on the scene bench: ypre = YPRE=1 COLCONST=0 SIMD=0 against YPRE=0; colconst, simd = the single
-//! track at 0; avx2 = AVX2=0 against all.
+//! track at 0; avx2 = AVX2=0 against all. Batches: points = BATCH_POINTS=1 BATCH_AVX2=0 against
+//! BATCH_POINTS=0; batch avx2 = BATCH_SHARED_CELL=0 against BATCH_AVX2=0; shared cell = the single
+//! track at 0.
 
 use std::sync::LazyLock;
 

@@ -687,40 +687,43 @@ impl S {
     }
 }
 
-/// Points of a shifted noise volume handed to the noise at once (on the stack: 6 KB). A 2D
-/// climate layer of a chunk (49 or 121 points) fits in one batch.
-const SHIFTED_NOISE_BATCH: usize = 256;
+/// Points of a shifted noise volume handed to the noise at once (on the stack: 3 × 512 bytes,
+/// zeroed on every call, hence small). The 26.3 volumes are one row of 16 to 25 points (4×4, 5×5
+/// climate grids) and fit in one batch; a larger one (data pack) empties its batch more often, each
+/// point keeping its layers in the same order, so the result does not depend on this size.
+const SHIFTED_NOISE_BATCH: usize = 64;
 
 /// Shifted noise over a volume, its points handed to the noise in batches: `out` holds the shift
 /// in x on entry and the noise on exit, `by` the shift in y (absent: none), `bz` the shift in z.
-/// Each point gets the coordinates of the point-by-point path, `(xz, ys)` being its scales.
+/// Each point gets the coordinates of the point-by-point path.
 fn shifted_noise_in_batches(
     noise: &NoiseStack,
     v: &Volume,
-    (xz, ys): (f64, f64),
+    (xz_scale, y_scale): (f64, f64),
     out: &mut [f32],
     by: Option<&[f32]>,
     bz: &[f32],
 ) {
-    let mut xs = [0.0f64; SHIFTED_NOISE_BATCH];
-    let mut yv = [0.0f64; SHIFTED_NOISE_BATCH];
-    let mut zs = [0.0f64; SHIFTED_NOISE_BATCH];
+    let mut x_coords = [0.0f64; SHIFTED_NOISE_BATCH];
+    let mut y_coords = [0.0f64; SHIFTED_NOISE_BATCH];
+    let mut z_coords = [0.0f64; SHIFTED_NOISE_BATCH];
     let (mut i, mut start, mut filled) = (0, 0, 0);
     for iz in 0..v.sz {
-        let base_z = f64::from(v.bz(iz)) * xz;
+        let base_z = f64::from(v.bz(iz)) * xz_scale;
         for ix in 0..v.sx {
-            let base_x = f64::from(v.bx(ix)) * xz;
+            let base_x = f64::from(v.bx(ix)) * xz_scale;
             for iy in 0..v.sy {
-                xs[filled] = base_x + f64::from(out[i]);
-                yv[filled] = match by {
-                    None => f64::from(v.by(iy)) * ys,
-                    Some(by) => f64::from(v.by(iy)) * ys + f64::from(by[i]),
+                x_coords[filled] = base_x + f64::from(out[i]);
+                y_coords[filled] = match by {
+                    None => f64::from(v.by(iy)) * y_scale,
+                    Some(by) => f64::from(v.by(iy)) * y_scale + f64::from(by[i]),
                 };
-                zs[filled] = base_z + f64::from(bz[i]);
+                z_coords[filled] = base_z + f64::from(bz[i]);
                 (i, filled) = (i + 1, filled + 1);
                 // The shifts of these points are read: their places in `out` take the noise.
                 if filled == SHIFTED_NOISE_BATCH || i == out.len() {
-                    noise.get_many(&xs[..filled], &yv[..filled], &zs[..filled], &mut out[start..i]);
+                    let batch = ..filled;
+                    noise.get_many(&x_coords[batch], &y_coords[batch], &z_coords[batch], &mut out[start..i]);
                     (start, filled) = (i, 0);
                 }
             }
