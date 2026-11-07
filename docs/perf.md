@@ -7429,3 +7429,79 @@ loaded by other agents compiling.
   (`push_item_layer`, `prepare` sorts, NBT clones, rc-mesh `to_vec`) belong to their zones: a
   reused buffer beats any allocator setting.
 
+
+## C1-M25: JSON reader without a string per number and per key, parse cache, definitions in parallel (07/11, loaded machine)
+
+- Compact tree (`RUSTCRAFT_OPT_COMPACT_JSON`, default on): numbers and object keys are stored in
+  place (`smol_str`, up to 23 bytes without a heap block; already in the tree through winit), an
+  object is one block of members sorted by key, shared through a counter and never modified (a key
+  written twice keeps its last value, as the old tree map; printed as a map, so every debug digest
+  of data holding JSON stays), arrays and objects are taken off a scratch stack in one exactly sized
+  block, a string without escapes is copied in one piece, whitespace and numbers are scanned on the
+  remaining slice. String values stay `String` (biome and terrain code clone them as such). The
+  literal approach of the audit (`Json<'a>` borrowing the text) was not taken: the noise settings
+  keep `Option<Json>` fields, feature and jigsaw configurations keep trees, and the world creation
+  returns a tree of a pack it drops; a lifetime changes all of them, and the four files that had to
+  compile unchanged (generator, density, biome, noise) did not. Outside the reader, one line
+  each in `decor_blocks.rs`, `structure_place.rs` and rc-sim's `newworld.rs` / `storage.rs` (a key
+  or a number text converted into a `String` explicitly). `=0` restores the old reading algorithm
+  (a string per number and per key, a tree map per object), its result converted into the compact
+  tree: about 20 % slower than the true old reader because of that conversion, so the scene-bench
+  reference of the old reader is the reference executable.
+- Micro-bench `examples/worlddata.rs` (client allocator mimalloc with allocations counted, min /
+  median of 9): every file of the pack (1,446 files, 5.6 MB) true old reader (original file built
+  once) 15.3 / 15.5 ms, 429,950 allocations, 29.3 MB held by the trees; compact 13.0 / 13.4 ms,
+  110,877 allocations, 10.8 MB held; `=0` path 18.6 / 20.3 ms, 495,850 allocations, 13.8 MB.
+  Overworld biome report (3.5 MB, 56 % of it indentation): 10.1 / 10.6 → 7.7 / 10.0 ms (8.6 / 8.9
+  with the byte-by-byte scanner). Placement: the whole pack one file per task 12.0 ms on 1 thread,
+  9.7-11.4 ms on 2 to 32: bounded by the report, one task; splitting the report itself needs a
+  structural pre-scan of the order of the parse, not done. GPU: not applicable (text, a few ms,
+  once per process).
+- Generator setup (`chunkgen::generator_sharing_tests::bench_generator_setup`, system allocator,
+  parallel definitions off, two alternated passes, min / median; none / compact alone / cache alone
+  / both): density functions and noises 2.6-2.7 / 1.3-1.5 / 2.6-2.7 / 0.8-1.5 ms; overworld biome
+  list from the report 67.1-75.2 / 52.1-57.6 / 51.0-72.5 / 41.9-49.5; decorator 15.0-24.2 /
+  6.8-10.5 / 14.1-17.5 / 6.3-7.5; second generator of the same world data ("sharing on") 24.9-25.4
+  / 9.7-15.9 / 15.4-22.3 / 9.3-13.1; with structures 26.9-28.0 / 14.9-15.5 / 15.5-21.8 / 11.2-14.1;
+  generator without any sharing 55.0-113.4 / 73.8-79.7 / 72.2-107.1 / 52.6-68.9. Both kept on.
+- Parse cache (`RUSTCRAFT_OPT_JSON_PARSE_CACHE`, default on): a pack file's tree is kept at its
+  first read and every later reader gets a copy (a counter per object), except the kinds a pack turns
+  once into shared structures (biome reports, density functions, noises: keeping their trees would
+  only hold memory). Counted before (temporary instrumentation): the world data then the three
+  dimension generators with structures parsed 2,563 times 1,258 texts, 1,305 repeats (8.4 of 33.7 ms
+  with the old reader and the system allocator): every biome file twice per generator (terrain and
+  surface rules), the block tags at every generator. 67 biome files read twice: 0.62 then 0.004 ms.
+  Held for the session: 0.7 MB (three generators built then dropped: 4.42-4.49 MB still held by the
+  world data against 3.76 with the cache off; build time 32.8-38.2 against 33.6-34.5 ms, the first
+  build of each dimension mostly missing). A shared `Arc<Json>` return was tried first and dropped:
+  `&pack.json(..)?` in the biome code takes the expected type into `?` (no deref coercion there), so
+  the API had to stay `Json`, hence the shared object blocks.
+- Definitions in parallel (`RUSTCRAFT_OPT_PARALLEL_DEFS_LOAD`, OFF by default, `=1` turns it on;
+  the first failing file in identifier order is reported on both paths): about a millisecond of work.
+  `worlddata`: series 0.68 / 0.70 ms, 1 thread 0.71, 2 0.72, 4 0.51, 8 0.52, 16 0.70, 32 0.65 (a
+  noisier run: series 1.42); setup bench, compact reader and cache on, three alternated passes: series
+  0.8-1.4 / 0.8-1.6 ms, parallel 1.9-5.0 / 2.2-5.6 (waking the pool costs more than the work).
+  Kept behind its switch for the quiet-machine bench.
+- Not done: the decoration data parse again too (template pools 735 times for three generators,
+  7.4 ms with the old reader): the decorator walks every template pool for the pool feature names at
+  each build (`decor.rs`); a list of those names kept per decoration data would remove it without
+  holding trees (lead for that file). The biome files read by the terrain setup in parallel
+  (`terrain.rs`, another mission's file in this wave): with the cache the second reader of each biome
+  is a hit.
+- Equivalence (A2): `json::tests` (crafted texts through both readers, errors and their byte
+  included; a duplicated key, member order and rendering frozen by hand, and so the four kinds of
+  whitespace and the number forms; `size_of::<Json>() == 32`;
+  every JSON file of the jar, 1,542 with the biome reports and the fluid and biome tags, through both
+  readers, plus the md5 of their rendering frozen with the old reader before the change,
+  `81dfa95c…`), `generator::defs_load_tests` (parallel = series definitions and compiled programs
+  for every noise setting of the jar; same error; cache shared, not kept for the excluded kinds,
+  forgotten on replacement, same errors), and the existing `generator_sharing_tests`. Seen failing
+  on sabotage: first of a duplicated key kept, members left unsorted, duplicates never detected,
+  `E` no longer read in numbers (shared by both readers: only the frozen digest sees it), last byte
+  of long strings lost, tab no longer whitespace (seen only by a scanner value frozen by hand, the jar holding no tab); cache never kept, excluded kinds kept; parallel
+  error taken from the end, last definition dropped in parallel.
+- To measure on the quiet machine: scenes `generation` and `plains12` ("world opening ms",
+  "generator ready ms"), 2 alternated passes, the branch against the reference executable and with
+  `RUSTCRAFT_OPT_COMPACT_JSON=0`, `RUSTCRAFT_OPT_JSON_PARSE_CACHE=0`, then
+  `RUSTCRAFT_OPT_PARALLEL_DEFS_LOAD=1`; private memory at the world opening (the trees held by the
+  game are a third of the old ones: noise settings, processor lists).
