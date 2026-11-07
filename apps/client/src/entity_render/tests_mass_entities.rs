@@ -94,10 +94,9 @@ fn median(v: &mut [f64]) -> f64 {
 type Switch = (&'static str, fn(&mut EntOpt) -> &mut bool);
 
 /// The switches of this file.
-fn bulk_switches() -> [Switch; 8] {
+fn bulk_switches() -> [Switch; 7] {
     [
         ("DISTANCE_SORT_KEYS", |o| &mut o.distance_sort_keys),
-        ("PARALLEL_ENTITY_LIST", |o| &mut o.parallel_entity_list),
         ("PRIMED_TNT_SHARED_POSE", |o| &mut o.primed_tnt_shared_pose),
         ("PRIMED_TNT_BY_KIND_FLAG", |o| &mut o.primed_tnt_by_kind_flag),
         ("STILL_TNT_CACHE", |o| &mut o.still_tnt_cache),
@@ -115,14 +114,12 @@ fn with_switch(base_on: bool, which: usize) -> EntOpt {
     o
 }
 
-/// The mass scene: a TNT heap (a third moving, some swelling), ground items of the eight kinds
-/// (copies, a compass that reads its surroundings) and, for the parallel list, enough of them
-/// to cross [`PARALLEL_LIST_MIN_ENTITIES`] (the rows beyond the first 500 lie past their render
-/// distance: listed, never drawn).
+/// The mass scene: a TNT heap (a third moving, some swelling) and ground items of the eight kinds
+/// (copies, a compass that reads its surroundings); the items beyond the first 500 lie past their
+/// render distance: listed, never drawn.
 fn mass_scene(k: &Kit) -> Vec<Entity> {
     let mut ents = tnt_heap(k, 1728, 1);
     ents.extend(ground_items(k, 2400, 10_000));
-    assert!(ents.len() >= PARALLEL_LIST_MIN_ENTITIES, "the scene does not reach the parallel list");
     ents
 }
 
@@ -147,7 +144,8 @@ fn prep_with_light(k: &mut Kit, ents: &[Entity], opt: EntOpt, shift: i32) {
     let light = |x: i32, y: i32, z: i32| {
         ((x * 7 + y * 3 + z + shift).rem_euclid(16) as u8, (x + y * 5 + z * 3 + shift).rem_euclid(16) as u8)
     };
-    k.r.prepare(ents.iter(), 0.37, [0, 0], [0.5, 66.0, -2.5], &light, &|_, _| true, Some(&k.items), &world);
+    let everything = crate::render::FrameVisibility::everything();
+    k.r.prepare(ents.iter(), 0.37, [0, 0], [0.5, 66.0, -2.5], &light, &everything, Some(&k.items), &world);
 }
 
 /// The mass scene a few ticks later, what the kept placements and layouts must notice: still
@@ -368,10 +366,9 @@ fn bench_mass_entities() {
         o
     };
     let mut configs: Vec<(String, EntOpt)> = vec![("old".into(), bulk_off())];
-    let serial_all = EntOpt { parallel_entity_list: false, ..EntOpt::NEW };
-    configs.push(("all (1 core)".into(), serial_all));
-    configs.push(("all but STILL_TNT_CACHE".into(), EntOpt { still_tnt_cache: false, ..serial_all }));
-    for (name, _) in bulk_switches().into_iter().filter(|(n, _)| *n != "PARALLEL_ENTITY_LIST") {
+    configs.push(("all".into(), EntOpt::NEW));
+    configs.push(("all but STILL_TNT_CACHE".into(), EntOpt { still_tnt_cache: false, ..EntOpt::NEW }));
+    for (name, _) in bulk_switches() {
         configs.push((format!("{name} alone"), only(&[name])));
     }
     configs.push(("SHARED_POSE + STILL_TNT_CACHE".into(), only(&["PRIMED_TNT_SHARED_POSE", "STILL_TNT_CACHE"])));
@@ -404,53 +401,6 @@ fn bench_mass_entities() {
     }
 }
 
-/// The frame list alone (positions, sizes, kinds, distances, sort) on 1 thread and on pools of
-/// 2 to all logical cores, by entity count: where spreading it starts to pay
-/// ([`PARALLEL_LIST_MIN_ENTITIES`]). Median µs.
-/// `cargo test --release -p rc-app -- --ignored bench_parallel_entity_list --nocapture`.
-#[test]
-#[ignore]
-fn bench_parallel_entity_list() {
-    let Some(mut k) = kit() else { return };
-    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    let mut threads = vec![1usize];
-    while threads.last().is_some_and(|&t| t * 2 <= cores) {
-        threads.push(threads.last().unwrap() * 2);
-    }
-    if threads.last() != Some(&cores) {
-        threads.push(cores);
-    }
-    for n in [500usize, 1000, 2000, 4000, 8000, 16000] {
-        let mut ents = tnt_heap(&k, n.min(1728), 1);
-        ents.extend(ground_items(&k, n.saturating_sub(1728), 100_000));
-        let serial = EntOpt { parallel_entity_list: false, ..EntOpt::NEW };
-        let parallel = EntOpt { parallel_entity_list: true, ..EntOpt::NEW };
-        let mut line = format!("{n:>6} entities: 1 thread (serial path)");
-        let mut time = |o: EntOpt, pool: Option<&rayon::ThreadPool>| {
-            k.r.opt = o;
-            let mut v = Vec::new();
-            for round in 0..83 {
-                let clock = std::time::Instant::now();
-                // The parallel path is taken from any count to find the threshold.
-                let mut run = || std::hint::black_box(k.r.frame_list_from(ents.iter(), 0.37, [0.5, 66.0, -2.5], 0).len());
-                match pool {
-                    Some(p) => p.install(run),
-                    None => run(),
-                };
-                if round >= 3 {
-                    v.push(clock.elapsed().as_secs_f64() * 1e6);
-                }
-            }
-            median(&mut v)
-        };
-        line += &format!(" {:.1}", time(serial, None));
-        for &t in &threads {
-            let pool = rayon::ThreadPoolBuilder::new().num_threads(t).build().expect("thread pool");
-            line += &format!(", {t} threads {:.1}", time(parallel, Some(&pool)));
-        }
-        println!("{line} µs");
-    }
-}
 
 /// Where `prepare` spends its time on the mass scenes: the list (positions, sizes, kinds,
 /// distances, sort), the shadows, the object path of TNT and the ground items, each timed alone

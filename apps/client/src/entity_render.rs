@@ -2199,9 +2199,6 @@ pub(crate) struct EntOpt {
     /// `DISTANCE_SORT_KEYS`: the far-to-near order of the frame sorted on compact keys (distance
     /// bits, then rank in the list) instead of moving the whole entity rows in a merge sort.
     pub distance_sort_keys: bool,
-    /// `PARALLEL_ENTITY_LIST`: positions, sizes, kinds and distances of the frame's entities
-    /// computed on every core from [`PARALLEL_LIST_MIN_ENTITIES`] entities.
-    pub parallel_entity_list: bool,
     /// `PRIMED_TNT_SHARED_POSE`: a primed TNT that is not swelling takes the block pose shared by
     /// all of them, only its translation added (the same matrix up to the sign of zeros).
     pub primed_tnt_shared_pose: bool,
@@ -2221,12 +2218,6 @@ pub(crate) struct EntOpt {
     /// between frames, instead of a merge sort and fresh buffers every frame.
     pub instance_buckets: bool,
 }
-
-/// Entities from which [`EntOpt::parallel_entity_list`] spreads the list over the cores (below,
-/// the threads cost more than the work they share; `bench_mass_entities` measures it).
-const PARALLEL_LIST_MIN_ENTITIES: usize = 4096;
-/// Fewest entities per slice of the parallel list.
-const PARALLEL_LIST_SLICE: usize = 1024;
 
 impl EntOpt {
     /// Old paths everywhere.
@@ -2248,7 +2239,6 @@ impl EntOpt {
         keyframe_static_names: false,
         poly_rotations: false,
         distance_sort_keys: false,
-        parallel_entity_list: false,
         primed_tnt_shared_pose: false,
         primed_tnt_by_kind_flag: false,
         still_tnt_cache: false,
@@ -2276,7 +2266,6 @@ impl EntOpt {
         keyframe_static_names: true,
         poly_rotations: true,
         distance_sort_keys: true,
-        parallel_entity_list: true,
         primed_tnt_shared_pose: true,
         primed_tnt_by_kind_flag: true,
         still_tnt_cache: true,
@@ -2303,7 +2292,6 @@ impl EntOpt {
             keyframe_static_names: rc_data::opt_switch!("RUSTCRAFT_OPT_KEYFRAME_STATIC_NAMES"),
             poly_rotations: rc_data::opt_switch!("RUSTCRAFT_OPT_POLY_ROTATIONS"),
             distance_sort_keys: rc_data::opt_switch!("RUSTCRAFT_OPT_DISTANCE_SORT_KEYS"),
-            parallel_entity_list: rc_data::opt_switch!("RUSTCRAFT_OPT_PARALLEL_ENTITY_LIST", default_off),
             primed_tnt_shared_pose: rc_data::opt_switch!("RUSTCRAFT_OPT_PRIMED_TNT_SHARED_POSE"),
             primed_tnt_by_kind_flag: rc_data::opt_switch!("RUSTCRAFT_OPT_PRIMED_TNT_BY_KIND_FLAG"),
             still_tnt_cache: rc_data::opt_switch!("RUSTCRAFT_OPT_STILL_TNT_CACHE", default_off),
@@ -4155,18 +4143,6 @@ impl EntityRenderer {
     /// translucent order), each with its squared distance to the camera, its sizes (base, full)
     /// computed once (`SIZEONCE`) and its kind flags (`KINDINFO`).
     fn frame_list<'e>(&mut self, entities: impl Iterator<Item = &'e Entity>, pt: f32, cam: [f64; 3]) -> Vec<ListRow<'e>> {
-        self.frame_list_from(entities, pt, cam, PARALLEL_LIST_MIN_ENTITIES)
-    }
-
-    /// [`Self::frame_list`] spread over the cores from `parallel_from` entities
-    /// (`PARALLEL_ENTITY_LIST`; the benches pick the count).
-    fn frame_list_from<'e>(
-        &mut self,
-        entities: impl Iterator<Item = &'e Entity>,
-        pt: f32,
-        cam: [f64; 3],
-        parallel_from: usize,
-    ) -> Vec<ListRow<'e>> {
         let opt = self.opt;
         let (dims, kinds, view_scale) = (&self.dims, &self.kinds, self.view_scale);
         let row = move |e: &'e Entity| -> Option<ListRow<'e>> {
@@ -4183,20 +4159,10 @@ impl EntityRenderer {
             };
             within.then_some((e, d, sizes, info))
         };
-        let mut list: Vec<ListRow<'e>> = if opt.parallel_entity_list {
-            let all: Vec<&'e Entity> = entities.collect();
-            if all.len() >= parallel_from {
-                use rayon::prelude::*;
-                // Rayon's collect keeps the order of the source: the same list as one thread.
-                // Slices of at least `PARALLEL_LIST_SLICE` entities: waking every core of the pool
-                // for a few microseconds of work each costs more than it shares.
-                all.par_iter().with_min_len(PARALLEL_LIST_SLICE).filter_map(|&e| row(e)).collect()
-            } else {
-                all.into_iter().filter_map(row).collect()
-            }
-        } else {
-            entities.filter_map(row).collect()
-        };
+        // One thread: the entities hold the crosshair's kept boxes (`Entity::cached_box`, a `Cell`),
+        // so they cannot be shared between threads; spreading this list over the cores is left to
+        // the multi-core prepare (C3-M25, `docs/perf.md`).
+        let mut list: Vec<ListRow<'e>> = entities.filter_map(row).collect();
         if opt.distance_sort_keys {
             draw_order::sort_far_to_near(&mut list, |r| r.1, &mut self.sort_keys);
         } else {

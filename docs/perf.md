@@ -9822,7 +9822,11 @@ items, a fifth of the stacks with copies, one in seven moving). Before (1 core, 
 - `RUSTCRAFT_OPT_INSTANCE_BUCKETS`: instances grouped by geometry in one counting pass (a list
   already in order is left alone: one kind of model), into buffers kept between frames, as the
   flat instance list and the free geometry (both were fresh vectors every frame).
-- `RUSTCRAFT_OPT_PARALLEL_ENTITY_LIST` (several cores, default OFF): positions, sizes, kinds
+- REMOVED at the integration of the TNT series (07/11): the kept crosshair boxes of C4-M27
+  (`Entity::cached_box`, a `Cell`, 10 to 25 % of the targeting) make `Entity` unshareable between
+  threads, and this list was off by default; spreading the list over the cores goes to the
+  multi-core prepare (C3-M25), which must keep or move those boxes. Figures kept below.
+  `RUSTCRAFT_OPT_PARALLEL_ENTITY_LIST` (several cores, default OFF): positions, sizes, kinds
   and distances of the list on the pool from 4,096 entities, slices of at least 1,024 (rayon
   keeps the order). Needed entities readable from several threads: the display's last rendered
   progress went from a `Cell` to an atomic read and written without ordering (a plain load and
