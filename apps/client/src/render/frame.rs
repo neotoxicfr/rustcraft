@@ -103,7 +103,7 @@ impl Renderer {
         let sky_vp = proj * sky_view;
         self.sky.prepare(&self.device, &self.queue, &mut self.up, sky_vp, &env.bodies, env.dome, eye);
         if let Some(p) = self.panorama.as_mut().filter(|_| self.show_panorama) {
-            p.prepare(&self.queue, (self.config.width, self.config.height));
+            p.prepare(&self.queue, &mut self.up, (self.config.width, self.config.height));
         }
         // Improved transparency: texts stored (solids or stages) as soon as the frame is uploaded.
         let oit_on = self.improved_transparency && self.oit_ok;
@@ -111,21 +111,22 @@ impl Renderer {
         self.text_displays.oit = oit_on;
         self.gui.upload(&self.device, &self.queue, &mut self.up);
         if let Some(e) = &mut self.entities {
-            e.upload(&self.device, &self.queue);
+            e.upload(&self.device, &self.queue, &mut self.up);
         }
         let gui = &self.gui;
         self.tags.upload(&self.device, &self.queue, &mut self.up, gui.glyph_gen, || gui.glyph_view());
         self.block_text.upload(&self.device, &self.queue, &mut self.up, gui.glyph_gen, || gui.glyph_view());
         self.text_displays.upload(&self.device, &self.queue, &mut self.up, gui.glyph_gen, || gui.glyph_view());
         if let Some(e) = &self.entities {
-            self.block_fx.upload(&self.device, &self.queue, &e.blocks.fx);
+            self.block_fx.upload(&self.device, &self.queue, &mut self.up, &e.blocks.fx);
         }
-        self.outline.upload(&self.device, &self.queue, (self.config.width, self.config.height));
-        self.cracks.upload(&self.device, &self.queue);
-        self.leash.upload(&self.device, &self.queue);
-        self.debug_lines.upload(&self.device, &self.queue, (self.config.width, self.config.height), &self.gui);
-        self.particles.upload(&self.device, &self.queue);
-        self.weather.upload(&self.device, &self.queue);
+        let size = (self.config.width, self.config.height);
+        self.outline.upload(&self.device, &self.queue, &mut self.up, size);
+        self.cracks.upload(&self.device, &self.queue, &mut self.up);
+        self.leash.upload(&self.device, &self.queue, &mut self.up);
+        self.debug_lines.upload(&self.device, &self.queue, &mut self.up, size, &self.gui);
+        self.particles.upload(&self.device, &self.queue, &mut self.up);
+        self.weather.upload(&self.device, &self.queue, &mut self.up);
         // Appearance fade: visibilities of the recent columns (0 → 1 over `fade_secs`), or
         // only births and ends of fade on the GPU (`RUSTCRAFT_OPT_FADEGPU`).
         match self.fade_ring.frame(frame_now, self.fade_secs) {
@@ -162,7 +163,7 @@ impl Renderer {
         }
         // Last pass of the frame: that of the interface after the blur if there is one.
         let blur_radius = self.gui.blur_radius();
-        self.gui.encode_items(&self.queue, &mut enc, self.timer.as_ref());
+        self.gui.encode_items(&self.queue, &mut self.up, &mut enc, self.timer.as_ref());
         let drawn: (usize, u64);
         {
             let timestamp_writes = self.stamp("world", Role::World);
@@ -466,6 +467,7 @@ impl Renderer {
             self.post_fx.run(
                 &self.device,
                 &self.queue,
+                &mut self.up,
                 &mut enc,
                 &frame.texture,
                 &view,
@@ -549,7 +551,7 @@ impl Renderer {
             // No image copy possible: interface without blur.
             if self.can_capture {
                 let timer = self.timer.as_ref();
-                self.blur.run(&self.device, &self.queue, &mut enc, &frame.texture, &view, radius, timer);
+                self.blur.run(&self.device, &self.queue, &mut self.up, &mut enc, &frame.texture, &view, radius, timer);
             }
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("interface after the blur"),
@@ -581,6 +583,8 @@ impl Renderer {
         crate::present_watch::during(Stage::Submit, || self.up.submit(&self.queue, enc.finish()));
         let s = self.up.take_stats();
         crate::perf_log::gpu_writes(s.writes, s.transits, s.bytes);
+        crate::perf_log::counter("gpu_copies_per_frame", s.copies);
+        crate::perf_log::counter("gpu_command_buffers_per_frame", s.command_buffers);
         self.cpu_ms_sum += t_cpu.elapsed().as_secs_f64() * 1e3;
         self.cpu_frames += 1;
         if let Some(t) = &mut self.timer {

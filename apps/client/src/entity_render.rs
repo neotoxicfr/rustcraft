@@ -6411,7 +6411,7 @@ impl EntityRenderer {
         true
     }
 
-    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, _up: &mut crate::render::upload::Uploader) {
         // Glint scroll (speed and strength settings).
         let (speed, strength) = self.glint;
         let (o0, o1) = glint_offsets(self.glint_started.elapsed().as_secs_f64() * 1000.0, speed);

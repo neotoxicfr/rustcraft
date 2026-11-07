@@ -240,7 +240,7 @@ impl Panorama {
     }
 
     /// Advances the rotation in real time and sends the matrix.
-    pub fn prepare(&mut self, queue: &wgpu::Queue, size: (u32, u32)) {
+    pub fn prepare(&mut self, queue: &wgpu::Queue, _up: &mut crate::render::upload::Uploader, size: (u32, u32)) {
         let now = Instant::now();
         if let Some(last) = self.last {
             self.spin = advance(self.spin, (now - last).as_secs_f32() * 1e3, self.speed);

@@ -591,7 +591,14 @@ impl DebugLines {
         self.front_texts.extend(text_glyphs(&mut self.cache, gui, queue, pos, s, rgba(color), scale));
     }
 
-    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, size: (u32, u32), gui: &crate::gui::Gui) {
+    pub fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        _up: &mut crate::render::upload::Uploader,
+        size: (u32, u32),
+        gui: &crate::gui::Gui,
+    ) {
         if self.is_empty() {
             self.ranges = Default::default();
             (self.face_count, self.text_count, self.front_text_count) = (0, 0, 0);

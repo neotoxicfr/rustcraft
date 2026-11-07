@@ -217,6 +217,7 @@ impl PostFx {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        up: &mut crate::render::upload::Uploader,
         enc: &mut wgpu::CommandEncoder,
         frame: &wgpu::Texture,
         frame_view: &wgpu::TextureView,
@@ -234,7 +235,7 @@ impl PostFx {
         let mut slot = 0u64;
         for &fx in effects {
             if fx == Effect::Blur {
-                blur.run(device, queue, enc, frame, frame_view, blur_radius, timer);
+                blur.run(device, queue, up, enc, frame, frame_view, blur_radius, timer);
                 continue;
             }
             let Some(t) = &self.targets else { return };
