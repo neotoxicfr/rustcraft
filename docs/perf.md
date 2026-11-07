@@ -7458,7 +7458,8 @@ pass under it (rc-sim 1,494 library tests).
   state on instead of reading it again.
 - `resolve` without copies (`RUSTCRAFT_OPT_RESOLVE_NO_COPY`, default 1): blocks, border and entities
   walked as three slices in that order (the order matters: early exit under `EPS`), boxes and step
-  heights in thread buffers: 0 allocation per movement once warm (was 4 to 7).
+  heights in thread buffers: 0 allocation per movement once warm (`tests/resolve_noalloc.rs`; under `=0` the same 900
+  movements allocate 2,100 times: the test fails there).
 - Mob envelopes (`RUSTCRAFT_OPT_STAND_SHAPE_FLAGS`, default 1): powder snow and lava sources told by
   per-state flags of the physics tables instead of block names and property strings (lava stand: state
   read once instead of three times); the strider's envelope built once per movement.
@@ -7487,13 +7488,14 @@ Same ratios on 2 to 32 threads (each thread its own buffers, no contention).
 | `support_of`, among fences, walls, piston heads… | 569 / 566 | 291 / 286 | 283 / 282 |
 | `resolve`, same | 1,156 / 1,206 | 601 / 604 | 603 / 598 |
 
-Batched reads alone (four alternating runs, prefilter on): grazing `support_of` 152-156 against
-150-153 ns, `resolve` 302-307 against 296-352; scattered 294-300 / 614-625 against 292-309 /
-614-651: within the noise of a loaded machine (after the trim a mob reads 1 to 12 cells, mostly in
-one column). Kept on, to settle on the scene bench (`=0` turns it off).
+Batched reads alone (two runs each, alternated, prefilter on, `support_of` / `resolve` ns): batch
+on, grazing 208-212 / 375-396 then 160-200 / 303-319, scattered 336-349 / 703-718 then 309-318 /
+618-777; batch off, grazing 179-209 / 375-383 then 156-170 / 339-344, scattered 350-385 / 689-1,165
+then 312-334 / 693-773: within the noise of a loaded machine (after the trim a mob reads 1 to 12
+cells, mostly in one column). Kept on, to settle on the scene bench (`=0` turns it off).
 
 Axes (B1): server CPU (every mob, item, projectile, minecart, stand) and client CPU (local player,
-entity prediction); allocations −4 to −7 per `resolve`; stack +256 bytes per walk (states); no
+entity prediction); allocations −2 to −4 per `resolve`; stack +256 bytes per walk (states); no
 GPU, disk, network or RAM change. Multi-core: the walks are per entity on the tick thread (4 to 30
 cells), nothing to split; GPU not applicable (branchy, a few hundred ns). Not done: one shape
 context replacing the four envelopes (after the batched read an envelope costs one indirect call
