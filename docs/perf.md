@@ -5909,3 +5909,98 @@ hit ones. The wind burst had its own copy of the walk (a tag test per step, a ha
   `RUSTCRAFT_OPT_SIGHTLINE_BORROWED_SHAPES` at 0 and 1), `tnt-cannon`, the radius-20 micro-bench
   on 1 to 32 threads (share boxes); expected: the salvo spike from about 66 ms towards
   10-20 ms (rays were about 2 ms of each explosion).
+## C2-M02: light, sky frontier seeding, cheaper propagation step, parallel step without copies (06/11, loaded machine)
+
+`crates/rc-light/src/fast.rs`, `fast/frontier.rs` (new), `fast/par.rs`. Eight switches read once
+with the other light switches (`RUSTCRAFT_OPT_<name>`, default on, `=0`: old path) and four
+thresholds read once (`RUSTCRAFT_OPT_LIGHTPARMIN` 65,536 cells, `LIGHTCHUNK` 2,048 entries,
+`LIGHTJOINMIN` 16,384, `LIGHTSPREADMIN` 8,192 entries; every switch at 0 = the old code, whatever
+thresholds remain). Bit for bit the old path, sheets and touched sections: the seeded levels and
+opened cells are unchanged, only the queue entries whose every relaxation would fail against the
+seeded levels are left out (levels only rise, so such an entry does nothing when spread).
+- `LIGHTSKYFRONTIER`: in a stack, the sky sources run from its source height up; a source only
+  needs queuing below the highest of its own source height + 1 and the source heights of its four
+  interior neighbours (margin stacks are never opened). The source heights of the zone are computed
+  first (sequential: per stack; parallel: `par::sources` as before).
+- `LIGHTMARGINFRONTIER`: margin cells seeded after the interior; a margin cell touches at most one
+  interior cell (none for the corner stacks) and is only queued if its value minus that cell's
+  opacity is above the cell's seeded level. Sky and block.
+- `LIGHTSEEDROWS`: interior walked by rows of consecutive cells instead of by stacks.
+- `LIGHTLEVELFIRST`: neighbour tests in the order closed cell, level prefilter (a neighbour at
+  `l - 1` or more cannot rise: every opacity is at least 1), exact new level, occlusion last (two
+  shapeless faces skip the lookup); one function shared by `propagate` and the parallel step.
+- `LIGHTSPREADINLINE`: parallel step generic over its push (no dynamic call), no coordinate
+  division with the sentinel ring, a level spread by a single task uses plain stores instead of
+  `fetch_max`.
+- `LIGHTATOMICVIEW`: the parallel propagation works on the levels viewed in place as atomics
+  (first `unsafe` of `rc-light`, size and alignment asserted at compile time): the two copies of the
+  zone per parallel resolution go (2 × 142,500 bytes on the slab) and `Lane.shared` stays empty.
+- `LIGHTSPREADBUFS`: queues of the parallel tasks kept in the lane from one level to the next
+  (counted in `RETAIN_BYTES`).
+- `LIGHTSPREADAFTERSEED`: in a zone of `LIGHTPARMIN` cells or more, the propagation stays on one
+  thread when the seeded queues hold fewer than `LIGHTSPREADMIN` entries (source heights and zone
+  read stay parallel). With the frontier, most large zones now fall under the threshold.
+
+Deterministic counts, relight bench (`benches/relight.rs -- --test`, `RUSTCRAFT_OPT_REQUIRE=1`, the
+old working path replayed with the C2-M02 switches off next to the working path), per relight:
+
+| trace | sky seeded (at 15), before → after | sky entries before → after | block seeded before → after |
+|---|---|---|---|
+| synthetic | 17,355 (16,291) → 2,230 (1,227) | 25,597 → 10,472 (−59 %) | 36 → 32 |
+| surface | 1,832 (1,515) → 403 (220) | 3,608 → 2,179 (−40 %) | 1,516 → 1,317 |
+| Nether | – | – | 20,368 (8,192 at 15) → 17,850 (6,637) |
+| redstone | 77,583 (74,636) → 6,966 (4,089) | 108,728 → 38,111 (−65 %) | 540 → 491 |
+
+Pushed entries are the same on every trace (same rises). The redstone trace was recorded again
+(the C2-M01 copy was lost with its worktree) with this branch's `rc-light`: its input fingerprint
+and replay output are C2-M01's (`KNOWN`), so the integrated server's light through the recording is
+main's. Micro-bench world (`bench_queue_entries`, sky entries per relight): plains 14,132 → 1,800,
+building 17,178 → 2,151, water 16,233 → 2,060, slab 27,946 → 5,501, spread 43,995 → 5,970 (that world
+has no block sheet outside lit sections: its block resolutions stop early, only the traces measure
+the block). Allocations (`--features memstats`), redstone: 516 allocations / 1,100 KiB per relight →
+63 / 238 KiB; synthetic 8.7 → 8.1 (10 KiB).
+
+Timings, LOADED machine (other agents compiling), to settle on the quiet machine:
+- Trace replay, calling thread + light pool, criterion median, order A B B A, whole replay (work
+  then old working path): redstone 777 / 1,043 ms against 1,575 / 2,760 ms (−51 % and −62 %,
+  intervals disjoint); surface 810 / 740 against 995 / 912 ms (−19 %, −19 %); Nether 264 / 390
+  against 319 / 415 ms (−17 %, −6 %, pass b of the work 285–534 ms); synthetic 418 / 351 against
+  489 / 742 ms. The working path wins every pass.
+- Phases of the sequential sky resolution (`bench_phases`, order A B C D E E D C B A): propagation
+  per group plains 146 / 265 → 25 / 30 µs, building 188 / 320 → 27 / 35, slab 320 / 562 → 62 / 91,
+  spread 176 / 221 → 18 / 26 (−83 to −88 %). Sources and seeds unchanged (seeding over zone read
+  1.32–1.38 before, 1.34–1.43 after): the seeding is now the largest phase (next lead: its walk of
+  the whole zone). Without `LIGHTMARGINFRONTIER` the propagation is 30 to 65 % longer, without
+  `LIGHTLEVELFIRST` 10 to 18 % (normalised by the read), without `LIGHTSEEDROWS` the seeding is
+  equal (±5 %).
+- Micro-bench of the switches (`bench_propagation_switches`, best of 7, two runs; noise ±10 to 30 %:
+  a switch that cannot act on a kind moves by that much): shipped against before, plains −28 / −29 %,
+  torches −29 %, building −41 / −41 %, water −27 %, slab −30 / −22 %, spread −25 %; cave and redstone
+  (no sky entries) within noise. `LIGHTSKYFRONTIER` alone −27 to −56 %. The parallel switches
+  (slab only: the other zones are below `LIGHTPARMIN`) alone −3 to −19 %, within the noise;
+  thresholds `LIGHTSPREADMIN` 2,048 / 32,768 / ∞, `LIGHTPARMIN` 131,072, `LIGHTCHUNK` 1,024 /
+  4,096 within the noise of the shipped values; `LIGHTPARMIN=∞` (all sequential) loses on the slab
+  (−6 to −11 % against before, −22 to −30 % shipped). Light pool of 1, 2, 4, 8 threads: shipped
+  wins in every pool on plains, building, water, slab and spread (−8 to −52 %); torches at 8 threads
+  +18 % and redstone +5 to +16 % on one run, where nothing of C2-M02 acts beyond the sky frontier
+  (noise, to check on the scene bench).
+
+Decisions (C4): all eight on (bit for bit; gains or within the noise, none loses consistently). `LIGHTSEEDROWS`, the parallel switches and the four thresholds are within the noise on this
+machine: kept at their values, to settle on the scene bench; no switch removed (C6). GPU: not
+applicable (C2-M11: zones of 40,000 to 150,000 cells, the round trip costs more than the
+resolution). Proofs: `new_path_matches_old_bit_for_bit` (random combinations of the sequential
+switches including the new ones), `parallel_paths_match_old_with_1_and_32_threads` (all 22 bits
+drawn, `LIGHTSPREADMIN` 0, 64 or ∞), `shipped_defaults_match_old`, `real_tables_match_old`,
+`each_new_switch_alone_matches_old`, `spread_after_seed_thresholds_give_the_same_light` (0 and ∞,
+1 and 8 threads), `frontier_seeding_keeps_the_levels_with_fewer_entries` (same opened cells, seeded
+levels and propagated levels with each seeding switch, ≥ 10× fewer sky entries), `retained_buffers_are_bounded`
+(task queues and stack seeds included), `switch_bits_round_trip`, `stack_seed_is_two_heights`; trace
+replays against the frozen copy for both paths. Sabotages caught: frontier without the lowest source
+(30), frontier that forgets its east neighbour (31), margins at 15 never queued (32), all three by
+the frontier scene (3 × 3 leaves, 5 × 5 roof, zone margin next to its shadow); level prefilter that
+assumes an opacity of 2 (34) by the random suite; truncated parallel queue (10) on the kept queues.
+To measure on the quiet machine (2 alternating passes, `main` and this branch): `scenes.py`
+redstone, cave, plains12, nether, generation, tnt (relight ms/s, tick p99, CPU of the light
+threads, wake-ups), then redstone and plains12 with each switch at 0, `LIGHTSPREADMIN` 2,048 and ∞,
+`LIGHTPARMIN` 131,072 and ∞, `LIGHTCHUNK` 1,024 and 4,096, `RUSTCRAFT_LIGHT_THREADS` 1, 2, 4, 8;
+the relight bench A B B A on the four traces.

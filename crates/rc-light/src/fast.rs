@@ -25,6 +25,13 @@
 //! - `LIGHTJOIN`, `LIGHTPARSOLVE`, `LIGHTGROUPS`: multi-core (mission C2-M11, `fast/par.rs`).
 //! - `LIGHTINC`, `LIGHTINCMAX`: isolated groups resolved by decrease then increase (mission C2-M14,
 //!   `fast/inc.rs`). Bit for bit on consistent sheets only: off by default.
+//! - `LIGHTSKYFRONTIER`, `LIGHTMARGINFRONTIER`, `LIGHTSEEDROWS`: seeds that cannot raise anything
+//!   are not queued, interior seeded by rows (mission C2-M02, `fast/frontier.rs`).
+//! - `LIGHTLEVELFIRST`: a neighbour's level is tested before its occlusion (see [`rise`]).
+//! - `LIGHTSPREADINLINE`, `LIGHTATOMICVIEW`, `LIGHTSPREADBUFS`, `LIGHTSPREADAFTERSEED`: cheaper
+//!   parallel propagation (mission C2-M02, `fast/par.rs`).
+//! - Thresholds `RUSTCRAFT_OPT_LIGHTPARMIN`, `LIGHTCHUNK`, `LIGHTJOINMIN`, `LIGHTSPREADMIN`
+//!   (shipped values: the constants of `par.rs`), read once like the switches.
 //!
 //! Properties read once per cell (shape, opacity, non-zero attenuation, emission) instead of
 //! three tables per neighbour.
@@ -69,10 +76,29 @@ pub(crate) struct Opts {
     pub inc: bool,
     /// `LIGHTINCMAX`: at most this many changes in a group resolved incrementally.
     pub inc_max: usize,
+    /// `LIGHTSKYFRONTIER`: a sky source with only sources or closed cells around is not queued.
+    pub sky_frontier: bool,
+    /// `LIGHTMARGINFRONTIER`: a margin seed that cannot raise its interior neighbour is not queued.
+    pub margin_frontier: bool,
+    /// `LIGHTSEEDROWS`: interior seeded row by row (consecutive cells), source heights first.
+    pub seed_rows: bool,
+    /// `LIGHTLEVELFIRST`: neighbour level tested before the occlusion of the shared faces.
+    pub level_first: bool,
+    /// `LIGHTSPREADINLINE`: parallel step inlined, coordinates only without the sentinel ring,
+    /// plain stores for a level spread by a single task.
+    pub spread_inline: bool,
+    /// `LIGHTATOMICVIEW`: parallel propagation on the levels viewed as atomics (no copy).
+    pub atomic_view: bool,
+    /// `LIGHTSPREADBUFS`: queues of the parallel tasks kept from one level to the next.
+    pub spread_bufs: bool,
+    /// `LIGHTSPREADAFTERSEED`: propagation of a large zone kept on one thread when its seeded
+    /// queues hold fewer than `spread_min` entries.
+    pub spread_after_seed: bool,
+    pub spread_min: usize,
 }
 
 /// Names of the switches (`RUSTCRAFT_OPT_<name>`), in the bit order of [`Opts::from_bits`].
-pub(crate) const NAMES: [&str; 14] = [
+pub(crate) const NAMES: [&str; 22] = [
     "SKYSKIP",
     "SKYMEMO",
     "SKYBIT",
@@ -87,6 +113,14 @@ pub(crate) const NAMES: [&str; 14] = [
     "LIGHTJOIN",
     "LIGHTPARSOLVE",
     "LIGHTGROUPS",
+    "LIGHTSKYFRONTIER",
+    "LIGHTMARGINFRONTIER",
+    "LIGHTSEEDROWS",
+    "LIGHTLEVELFIRST",
+    "LIGHTSPREADINLINE",
+    "LIGHTATOMICVIEW",
+    "LIGHTSPREADBUFS",
+    "LIGHTSPREADAFTERSEED",
 ];
 
 /// Switches off by default (`=1` to turn them on): losers in the micro-bench, kept for
@@ -94,14 +128,14 @@ pub(crate) const NAMES: [&str; 14] = [
 /// `LIGHTDEDUP`: changes the result (see the header) for ±5 % within the noise (rule C3).
 /// `LIGHTJOIN`: no measured gain (±2 % in the micro-bench, synthetic trace of a single group slower
 /// when on), set aside (rule C3) until the scene bench.
-pub(crate) const DEFAULT_OFF: u16 = 2 | 512 | 2048;
+pub(crate) const DEFAULT_OFF: u32 = 2 | 512 | 2048;
 
 impl Opts {
     pub(crate) const OLD: Opts = Opts::from_bits(0);
     #[cfg(test)]
-    pub(crate) const ALL: Opts = Opts::from_bits(u16::MAX);
+    pub(crate) const ALL: Opts = Opts::from_bits(u32::MAX);
 
-    pub(crate) const fn from_bits(b: u16) -> Opts {
+    pub(crate) const fn from_bits(b: u32) -> Opts {
         Opts {
             sky_skip: b & 1 != 0,
             sky_memo: b & 2 != 0,
@@ -122,11 +156,64 @@ impl Opts {
             chunk: par::CHUNK,
             inc: false,
             inc_max: usize::MAX,
+            sky_frontier: b & 1 << 14 != 0,
+            margin_frontier: b & 1 << 15 != 0,
+            seed_rows: b & 1 << 16 != 0,
+            level_first: b & 1 << 17 != 0,
+            spread_inline: b & 1 << 18 != 0,
+            atomic_view: b & 1 << 19 != 0,
+            spread_bufs: b & 1 << 20 != 0,
+            spread_after_seed: b & 1 << 21 != 0,
+            spread_min: par::SPREAD_MIN,
+        }
+    }
+
+    /// Bits of the switches, the inverse of [`Opts::from_bits`] (thresholds and `LIGHTINC` aside).
+    pub(crate) fn bits(&self) -> u32 {
+        let on = [
+            self.sky_skip,
+            self.sky_memo,
+            self.sky_bit,
+            self.block_early,
+            self.zone_once,
+            self.zone_buf,
+            self.zone_sent,
+            self.zone_unpack,
+            self.queue_dir,
+            self.dedup,
+            self.occ_tab,
+            self.join,
+            self.par_solve,
+            self.groups,
+            self.sky_frontier,
+            self.margin_frontier,
+            self.seed_rows,
+            self.level_first,
+            self.spread_inline,
+            self.atomic_view,
+            self.spread_bufs,
+            self.spread_after_seed,
+        ];
+        on.iter().enumerate().fold(0, |b, (k, &v)| b | u32::from(v) << k)
+    }
+
+    /// The switch `RUSTCRAFT_OPT_<name>` set to `on`, everything else kept (benches).
+    pub(crate) fn with(self, name: &str, on: bool) -> Opts {
+        let k = NAMES.iter().position(|n| *n == name).unwrap_or_else(|| panic!("unknown light switch {name}"));
+        let b = if on { self.bits() | 1 << k } else { self.bits() & !(1 << k) };
+        Opts {
+            join_min: self.join_min,
+            par_min: self.par_min,
+            chunk: self.chunk,
+            inc: self.inc,
+            inc_max: self.inc_max,
+            spread_min: self.spread_min,
+            ..Opts::from_bits(b)
         }
     }
 
     fn from_env() -> Opts {
-        let mut b = 0u16;
+        let mut b = 0u32;
         for (k, name) in NAMES.iter().enumerate() {
             let v = rc_data::env_flags::read_os(&format!("RUSTCRAFT_OPT_{name}")).and_then(|v| v.into_string().ok());
             let on = match v.as_deref().map(str::trim) {
@@ -142,7 +229,19 @@ impl Opts {
         // `fast/inc.rs`), like `LIGHTDEDUP`.
         let (inc, inc_max) =
             Self::inc_env(rc_data::env_str!("RUSTCRAFT_OPT_LIGHTINC"), rc_data::env_str!("RUSTCRAFT_OPT_LIGHTINCMAX"));
-        Opts { inc, inc_max, ..Opts::from_bits(b) }
+        // Every switch at 0: the old code, whatever thresholds remain in the environment.
+        if b == 0 && !inc {
+            return Opts::OLD;
+        }
+        Opts {
+            inc,
+            inc_max,
+            par_min: threshold(rc_data::env_str!("RUSTCRAFT_OPT_LIGHTPARMIN"), par::PAR_MIN),
+            chunk: threshold(rc_data::env_str!("RUSTCRAFT_OPT_LIGHTCHUNK"), par::CHUNK).max(1),
+            join_min: threshold(rc_data::env_str!("RUSTCRAFT_OPT_LIGHTJOINMIN"), par::JOIN_MIN),
+            spread_min: threshold(rc_data::env_str!("RUSTCRAFT_OPT_LIGHTSPREADMIN"), par::SPREAD_MIN),
+            ..Opts::from_bits(b)
+        }
     }
 
     /// `(LIGHTINC, LIGHTINCMAX)` read. Threshold ignored when the incremental is off: everything at 0 stays
@@ -158,6 +257,11 @@ impl Opts {
         static OPTS: OnceLock<Opts> = OnceLock::new();
         *OPTS.get_or_init(Opts::from_env)
     }
+}
+
+/// A threshold read from the environment (a cell or entry count), `shipped` when absent or unreadable.
+fn threshold(v: Option<&str>, shipped: usize) -> usize {
+    v.and_then(|v| v.trim().parse().ok()).unwrap_or(shipped)
 }
 
 /// Grouping of neighbouring changes, identical to that of `relight_zones` (old path):
@@ -212,16 +316,25 @@ struct Lane {
     /// Entry: cell index (low 32 bits), remaining directions (6 bits above).
     buckets: [Vec<u64>; 16],
     changed: Vec<(i32, u8)>,
-    /// Shared levels of the parallel propagation (`LIGHTPARSOLVE`).
+    /// Shared levels of the parallel propagation (`LIGHTPARSOLVE`, copy when `LIGHTATOMICVIEW=0`).
     shared: Vec<std::sync::atomic::AtomicU8>,
+    /// Sky seeding of each stack (`fast/frontier.rs`), index `dz · sx + dx`.
+    stacks: Vec<frontier::StackSeed>,
+    /// Queues filled by each task of a parallel level (`LIGHTSPREADBUFS`), emptied into
+    /// `buckets` after the level, their capacity kept.
+    task_queues: Vec<[Vec<u64>; 16]>,
 }
 
 impl Lane {
     fn bytes(&self) -> usize {
+        let queues = |q: &[Vec<u64>; 16]| q.iter().map(|b| b.capacity() * 8).sum::<usize>();
         self.level.capacity()
-            + self.buckets.iter().map(|b| b.capacity() * 8).sum::<usize>()
+            + queues(&self.buckets)
             + self.changed.capacity() * 8
             + self.shared.capacity()
+            + self.stacks.capacity() * size_of::<frontier::StackSeed>()
+            + self.task_queues.capacity() * size_of::<[Vec<u64>; 16]>()
+            + self.task_queues.iter().map(queues).sum::<usize>()
     }
 }
 
@@ -1009,20 +1122,12 @@ fn seed(
     sky: bool,
 ) -> bool {
     let o = c.o;
-    let (sx, sz) = (g.size[0], g.size[2]);
-    let n = g.cells();
-    if o.zone_buf {
-        if lane.level.len() < n {
-            lane.level.resize(n, 0);
-        }
-        for b in &mut lane.buckets {
-            b.clear();
-        }
-    } else {
-        lane.level = vec![0; n];
-        lane.buckets = Default::default();
+    if o.sky_frontier || o.margin_frontier || o.seed_rows {
+        return frontier::seed(grid, c, z, lay, lane, aux, pre, g, r0, ny, sky);
     }
-    let all = 63u64 << 32;
+    let (sx, sz) = (g.size[0], g.size[2]);
+    prepare_lane(lane, g.cells(), o.zone_buf);
+    let all = ALL_DIRS;
     let mut any = 0u8;
     for dz in 0..sz {
         for dx in 0..sx {
@@ -1072,12 +1177,31 @@ fn seed(
     sky || !o.block_early || any != 0
 }
 
+/// Queue entry bits: every direction still to try (a seed has no arrival direction).
+const ALL_DIRS: u64 = 63 << 32;
+
+/// Levels sized for `n` cells (stale values left: only the rows seeded are read) and empty
+/// queues; kept buffers (`keep`) or new ones.
+fn prepare_lane(lane: &mut Lane, n: usize, keep: bool) {
+    if keep {
+        if lane.level.len() < n {
+            lane.level.resize(n, 0);
+        }
+        for b in &mut lane.buckets {
+            b.clear();
+        }
+    } else {
+        lane.level = vec![0; n];
+        lane.buckets = Default::default();
+    }
+}
+
 /// Spreads the queues by decreasing level; returns the entries each level held when its turn
 /// came (an entry pushed always has a lower level: the opacity is at least 1), level 1 being
 /// what is left unspread.
 fn propagate(c: &Ctx, z: &Cells, lay: &[u8], lane: &mut Lane, g: Geo, r0: i32, ny: i32) -> LevelCounts {
-    let (t, o) = (c.t, c.o);
-    let (face, prop) = (z.face, z.prop);
+    let o = c.o;
+    let face = z.face;
     let Lane { level, buckets, .. } = lane;
     let (plane, ax) = (g.plane as isize, g.ax as isize);
     let offs: [isize; 6] = [-plane, plane, -ax, ax, -1, 1];
@@ -1113,21 +1237,51 @@ fn propagate(c: &Ctx, z: &Cells, lay: &[u8], lane: &mut Lane, g: Geo, r0: i32, n
                     }
                     qy as usize * g.plane + qz as usize * g.ax + qx as usize
                 };
-                if lay[j] & OPEN == 0 || t.occluded_faces(fi, face[j], dir, o.occ_tab) {
-                    continue;
-                }
-                let nv = l as i32 - i32::from(prop[j] & 15);
-                if nv > i32::from(level[j]) {
-                    level[j] = nv as u8;
-                    let back = if sabotage(5) { dir } else { OPPOSITE[dir] };
-                    let rest = if o.queue_dir { 63 & !(1u64 << back) } else { 63 };
-                    buckets[nv as usize].push(j as u64 | rest << 32);
-                }
+                let Some(nv) = rise(c, z, lay, level[j], fi, j, dir, l) else { continue };
+                level[j] = nv;
+                let back = if sabotage(5) { dir } else { OPPOSITE[dir] };
+                let rest = if o.queue_dir { 63 & !(1u64 << back) } else { 63 };
+                buckets[nv as usize].push(j as u64 | rest << 32);
             }
         }
     }
     queued[1] = buckets[1].len() as u32;
     queued
+}
+
+/// Deliberate error of the tests: the level prefilter assumes an opacity of at least 2.
+const SABOTAGE_PREFILTER_ASSUMES_OPACITY_2: u8 = 34;
+
+/// New level of the neighbour `j` (current level `level_j`), reached through the face `dir` of a
+/// cell of level `l` and shape `face_i`, if it rises. Old order: closed cell, occluded faces, then
+/// the level. `LIGHTLEVELFIRST`: the occlusion (two shape lookups, a table read) goes last, after
+/// two tests on bytes: a neighbour already at `l - 1` or more cannot rise (every opacity is at
+/// least 1), which settles most neighbours of a dense front without reading its opacity.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn rise(c: &Ctx, z: &Cells, lay: &[u8], level_j: u8, face_i: u32, j: usize, dir: usize, l: usize) -> Option<u8> {
+    let (t, tab) = (c.t, c.o.occ_tab);
+    if !c.o.level_first {
+        if lay[j] & OPEN == 0 || t.occluded_faces(face_i, z.face[j], dir, tab) {
+            return None;
+        }
+        let new_level = l as i32 - i32::from(z.prop[j] & 15);
+        return (new_level > i32::from(level_j)).then_some(new_level as u8);
+    }
+    let least_opacity = if sabotage(SABOTAGE_PREFILTER_ASSUMES_OPACITY_2) { 2 } else { 1 };
+    if lay[j] & OPEN == 0 || usize::from(level_j) + least_opacity >= l {
+        return None;
+    }
+    let new_level = l as i32 - i32::from(z.prop[j] & 15);
+    if new_level <= i32::from(level_j) {
+        return None;
+    }
+    // Shapeless on both sides (air, most blocks): nothing to look up.
+    let face_j = z.face[j];
+    if (face_i | face_j) != 0 && t.occluded_faces(face_i, face_j, dir, tab) {
+        return None;
+    }
+    Some(new_level as u8)
 }
 
 /// Changed cells of the interior stack `(dx, dz)`: (height, new value), bottom to top.
@@ -1185,6 +1339,7 @@ fn write(grid: &mut impl LightGrid, lay: &[u8], lane: &mut Lane, g: Geo, r0: i32
     }
 }
 
+mod frontier;
 mod inc;
 mod par;
 
