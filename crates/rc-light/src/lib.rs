@@ -50,11 +50,32 @@ pub mod stats {
 
     impl ZoneBuffersInUse {
         pub(crate) fn new(bytes: usize) -> ZoneBuffersInUse {
-            let bytes = bytes as u64;
-            let now = ZONE_BUFFER_BYTES.fetch_add(bytes, Relaxed) + bytes;
-            ZONE_BUFFER_PEAK.fetch_max(now, Relaxed);
-            ZoneBuffersInUse(bytes)
+            let mut in_use = ZoneBuffersInUse(0);
+            in_use.grow_to(bytes);
+            in_use
         }
+
+        /// The buffers grew to `bytes` (the queues grow during the propagation).
+        pub(crate) fn grow_to(&mut self, bytes: usize) {
+            let added = (bytes as u64).saturating_sub(self.0);
+            if added > 0 {
+                let now = ZONE_BUFFER_BYTES.fetch_add(added, Relaxed) + added;
+                ZONE_BUFFER_PEAK.fetch_max(now, Relaxed);
+                self.0 += added;
+            }
+        }
+    }
+
+    /// Kept zone buffers given back without their queues (too large with them), and thrown away
+    /// whole (too large even without): see `full::give_back`.
+    pub(crate) static KEPT_QUEUES_RELEASED: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static KEPT_BUFFERS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+    /// Times since startup a thread's kept buffers were given back without their queues, and
+    /// thrown away whole (benches).
+    #[doc(hidden)]
+    pub fn kept_buffer_releases() -> (u64, u64) {
+        (KEPT_QUEUES_RELEASED.load(Relaxed), KEPT_BUFFERS_DROPPED.load(Relaxed))
     }
 
     impl Drop for ZoneBuffersInUse {

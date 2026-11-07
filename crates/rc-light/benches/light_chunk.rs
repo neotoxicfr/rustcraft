@@ -195,11 +195,14 @@ fn bench_batches(
                 .iter()
                 .map(|&o| {
                     let before = rc_light::stats::full_light_cells();
+                    let (queues_before, drops_before) = rc_light::stats::kept_buffer_releases();
                     rc_light::stats::reset_zone_buffer_peak();
                     on(pool, &|| set.iter().for_each(|b| drop(light_batch(t, flats, scans, b, o, h))));
                     let cells = (rc_light::stats::full_light_cells() - before) as f64 / chunks as f64;
                     let peak = rc_light::stats::zone_buffer_peak_bytes() as f64 / 1e6;
-                    format!("{} {cells:.0} cells, {peak:.1} MB", o.0)
+                    let (queues, drops) = rc_light::stats::kept_buffer_releases();
+                    let (queues, drops) = (queues - queues_before, drops - drops_before);
+                    format!("{} {cells:.0} cells, {peak:.1} MB, kept queues released {queues}, kept buffers dropped {drops}", o.0)
                 })
                 .collect();
             eprintln!("batches {label} ({threads}): per chunk / peak zone buffers: {}", counts.join(", "));

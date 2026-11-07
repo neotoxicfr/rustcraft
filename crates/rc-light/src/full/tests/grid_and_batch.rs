@@ -5,6 +5,7 @@ use hashbrown::HashMap;
 
 use super::*;
 use crate::full::batch::{SABOTAGE_TILE_TAKES_KEPT_BUFFERS, SABOTAGE_TILE_WITHOUT_MARGIN};
+use crate::full::{SABOTAGE_BUFFERS_GROW_BY_DOUBLING, SABOTAGE_QUEUES_KEPT_OVER_THE_MAX};
 use crate::full::grid::{
     SABOTAGE_ABSENT_COLUMN_OPEN, SABOTAGE_EMITTERS_IN_FILL_MISS_A_ROW, SABOTAGE_LEVEL_TEST_ASSUMES_OPACITY_2,
     SABOTAGE_NO_EMITTER_EXIT_MISSES_LEVEL_1, SABOTAGE_QUEUE_DIRECTIONS_DROP_FORWARD, SABOTAGE_SKIP_DEPTHS_WITHOUT_MARGIN,
@@ -271,4 +272,78 @@ fn large_tile_leaves_the_kept_buffers_in_place() {
     let (before, after) = kept_before_and_after(SABOTAGE_TILE_TAKES_KEPT_BUFFERS);
     eprintln!("tile taking the kept buffers: {before} bytes kept before, {after} after");
     assert_eq!(after, 0, "sabotage not seen: the tile took the kept buffers and threw them away");
+}
+
+/// In a world 384 high, under the default maximum, the 3 × 3 buffers a thread keeps survive a zone
+/// higher than the one before: grown exactly, not doubled (doubled after a zone cut short by the
+/// void skip, they reached 5.6 MB, over the 4 MiB kept, and were thrown away).
+#[test]
+fn kept_buffers_survive_a_higher_zone() {
+    const TALL: i32 = 384;
+    let t = tables();
+    assert!(grid::zone_buffer_bytes(3, 3, TALL) <= DEFAULT_KEPT_BUFFER_BYTES);
+    let air = vec![AIR; 256 * TALL as usize];
+    // One stone in the centre column: the void skip cuts the zone 30 rows above it at most.
+    let centre_with_stone_at = |y: usize| {
+        let mut c = air.clone();
+        c[idx(8, y, 8)] = STONE;
+        c
+    };
+    let (low, high) = (centre_with_stone_at(339), centre_with_stone_at(383));
+    let light = |centre: &[u32]| {
+        let mut cols: Columns = [Some(&air[..]); 9];
+        cols[4] = Some(centre);
+        drop(light_chunk_opt(&t, cols, [None; 9], TALL, true, FullOpts::ALL));
+    };
+    // Each run on a thread of its own: its kept buffers start empty.
+    let kept_after_low_then_high = |sabotage: u8| {
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                SABOTAGE.with(|s| s.set(sabotage));
+                light(&low);
+                let after_low = kept_buffer_bytes();
+                light(&high);
+                (after_low, kept_buffer_bytes())
+            })
+            .join()
+            .expect("lighting thread")
+        })
+    };
+    let (low_kept, high_kept) = kept_after_low_then_high(0);
+    eprintln!("kept after the low zone: {low_kept} bytes, after the higher one: {high_kept}");
+    assert!(low_kept > 0 && high_kept >= grid::zone_buffer_bytes(3, 3, TALL), "the higher zone kept its buffers");
+    assert!(high_kept <= DEFAULT_KEPT_BUFFER_BYTES);
+    let (low_kept, high_kept) = kept_after_low_then_high(SABOTAGE_BUFFERS_GROW_BY_DOUBLING);
+    eprintln!("buffers grown by doubling: {low_kept} bytes kept after the low zone, {high_kept} after the higher one");
+    assert!(low_kept > 0);
+    assert_eq!(high_kept, 0, "sabotage not seen: the doubled buffers went over the maximum and were thrown away");
+}
+
+/// A tile that fits the kept maximum but whose queues take its buffers over it gives back its
+/// zone buffers without the queues, instead of throwing everything away.
+#[test]
+fn queues_over_the_kept_maximum_are_released_alone() {
+    let t = tables();
+    // The zone buffers of a tile of 4 (6 × 6 columns with its margin) fit exactly, its queues do not.
+    let cap = grid::zone_buffer_bytes(6, 6, HEIGHT);
+    let opts = FullOpts { max_kept_buffer_bytes: cap, union_tile_side: 4, ..FullOpts::ALL };
+    let world = World::new(&t, 5);
+    let tile: Vec<(i32, i32)> = world.present().into_iter().filter(|&(x, z)| (-4..0).contains(&x) && z < 0).collect();
+    let want = world.reference(&t, true);
+    // Each run on a pool of its own: its thread's kept buffers start empty.
+    let kept_after_the_tile = |sabotage: u8| {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().expect("thread pool");
+        pool.install(|| {
+            SABOTAGE.with(|s| s.set(sabotage));
+            let wrong = world.differing(&t, &tile, (true, true, opts), &want);
+            SABOTAGE.with(|s| s.set(0));
+            assert!(wrong.is_empty(), "sabotage {sabotage}: {wrong:?}");
+            kept_buffer_bytes()
+        })
+    };
+    let kept = kept_after_the_tile(0);
+    eprintln!("kept after the tile: {kept} bytes of at most {cap}");
+    assert!(kept > 0 && kept <= cap, "the zone buffers are kept without the queues");
+    let kept = kept_after_the_tile(SABOTAGE_QUEUES_KEPT_OVER_THE_MAX);
+    assert_eq!(kept, 0, "sabotage not seen: the queues kept took the buffers over the maximum");
 }

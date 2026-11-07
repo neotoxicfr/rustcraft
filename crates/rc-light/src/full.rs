@@ -311,7 +311,8 @@ fn union_tile_side() -> i32 {
 }
 
 /// Buffers a thread keeps by default: the 3 × 3 zone of a world 384 high with its ring fits
-/// (0.97 MB of levels and 1.93 MB of properties), a batch tile does not (5 to 11 MB at full height).
+/// (0.97 MB of levels and 1.93 MB of properties, plus the queues), a batch tile does not (5 to 11 MB
+/// at full height).
 const DEFAULT_KEPT_BUFFER_BYTES: usize = 4 << 20;
 
 /// `RUSTCRAFT_OPT_FULL_KEPT_BUFFER_MIB`: MiB of buffers a thread keeps at most, 1 to 256 (otherwise
@@ -326,7 +327,7 @@ fn max_kept_buffer_bytes() -> usize {
 }
 
 thread_local! {
-    /// Deliberate error of the tests (constants `SABOTAGE_*` of `grid` and `batch`).
+    /// Deliberate error of the tests (constants `SABOTAGE_*` of this module, `grid` and `batch`).
     pub(crate) static SABOTAGE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 
@@ -448,19 +449,56 @@ thread_local! {
     static BUFS: RefCell<Bufs> = RefCell::default();
 }
 
-/// `f` with this thread's kept buffers (`FULLLAYOUT`, given back after unless they grew beyond
-/// [`FullOpts::max_kept_buffer_bytes`]) or new ones. A zone expected to need more than that
-/// maximum (`expected_bytes`, see [`grid::zone_buffer_bytes`]) gets new buffers and leaves the kept
-/// ones in place, so that a large batch tile does not throw away the buffers the next 3 × 3
-/// lighting on this thread reuses.
+/// Deliberate errors of the tests: buffers grown by the default doubling, and queues kept even
+/// when they take the kept buffers over their maximum (both throw the kept buffers away).
+pub(crate) const SABOTAGE_BUFFERS_GROW_BY_DOUBLING: u8 = 22;
+pub(crate) const SABOTAGE_QUEUES_KEPT_OVER_THE_MAX: u8 = 23;
+
+/// `v` cleared and refilled with `len` copies of `value` (see [`reserve_exact_len`]).
+fn reset_exact<T: Clone>(v: &mut Vec<T>, len: usize, value: T) {
+    v.clear();
+    reserve_exact_len(v, len);
+    v.resize(len, value);
+}
+
+/// Capacity of `v` raised to exactly `len` when below. A kept buffer grown by the default doubling
+/// could reach twice the zone it serves: the 3 × 3 buffers of a world 384 high went from 2.9 MB to
+/// 5.6 MB after a zone cut short by the void skip, over the kept maximum, and were thrown away.
+fn reserve_exact_len<T>(v: &mut Vec<T>, len: usize) {
+    if !sabotaged(SABOTAGE_BUFFERS_GROW_BY_DOUBLING) {
+        v.reserve_exact(len.saturating_sub(v.len()));
+    }
+}
+
+/// `f` with this thread's kept buffers (`FULLLAYOUT`, given back after, see [`give_back`]) or new
+/// ones. A zone expected to need more than [`FullOpts::max_kept_buffer_bytes`] (`expected_bytes`,
+/// see [`grid::zone_buffer_bytes`]) gets new buffers and leaves the kept ones in place, so that a
+/// large batch tile does not throw away the buffers the next 3 × 3 lighting on this thread reuses.
 fn with_bufs<R>(opts: FullOpts, expected_bytes: usize, f: impl FnOnce(&mut Bufs) -> R) -> R {
     let keep = opts.layout && expected_bytes <= opts.max_kept_buffer_bytes;
     let mut b = if keep { BUFS.with(|c| std::mem::take(&mut *c.borrow_mut())) } else { Bufs::default() };
     let out = f(&mut b);
-    if keep && b.bytes() <= opts.max_kept_buffer_bytes {
-        BUFS.with(|c| *c.borrow_mut() = b);
+    if keep {
+        give_back(b, opts.max_kept_buffer_bytes);
     }
     out
+}
+
+/// Keeps `b` for this thread's next zone within `max` bytes. The zone-sized buffers fit, being
+/// grown exactly ([`reserve_exact_len`]) for zones expected under `max`; the queues, whose size
+/// follows the light rather than the zone, are released first when the whole goes over, so the
+/// rest is not thrown away with them.
+fn give_back(mut b: Bufs, max: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if b.bytes() > max && !sabotaged(SABOTAGE_QUEUES_KEPT_OVER_THE_MAX) {
+        b.buckets = Default::default();
+        crate::stats::KEPT_QUEUES_RELEASED.fetch_add(1, Relaxed);
+    }
+    if b.bytes() > max {
+        crate::stats::KEPT_BUFFERS_DROPPED.fetch_add(1, Relaxed);
+        return;
+    }
+    BUFS.with(|c| *c.borrow_mut() = b);
 }
 
 /// Bytes of the buffers this thread keeps (tests).
@@ -501,8 +539,7 @@ fn light_chunk_fast(
 ) -> LightSheets {
     let sections = (height / 16) as usize;
     // Stacks: non-neutral top (void skip) and source height (sky), one pass each.
-    b.src.clear();
-    b.src.resize((W * W) as usize, i32::MAX);
+    reset_exact(&mut b.src, (W * W) as usize, i32::MAX);
     let mut ymax = 0;
     if has_sky || opts.skip {
         for (ci, col) in cols.iter().enumerate() {
@@ -524,8 +561,7 @@ fn light_chunk_fast(
     let g = Grid { cols, height: top };
     let n = (W * W * top) as usize;
     crate::stats::FULL_CELLS.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
-    b.level.clear();
-    b.level.resize(n, 0);
+    reset_exact(&mut b.level, n, 0);
     for k in &mut b.buckets {
         k.clear();
     }

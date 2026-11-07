@@ -23,7 +23,9 @@
 
 use rc_world::LightLayer;
 
-use super::{Bufs, ColumnScan, FullOpts, LightSheets, pack_sheets_below_top, sabotaged, stack};
+use super::{
+    Bufs, ColumnScan, FullOpts, LightSheets, pack_sheets_below_top, reserve_exact_len, reset_exact, sabotaged, stack,
+};
 use crate::stats::ZoneBuffersInUse;
 use crate::{LightTables, OPPOSITE};
 
@@ -146,43 +148,44 @@ pub(crate) fn light_zone(
     let zone = Zone { chunks_x: zc.chunks_x, chunks_z: zc.chunks_z, bottom, top };
     debug_assert!(zone.cells() <= INDEX_MASK as usize + 1, "zone of {} cells", zone.cells());
     crate::stats::FULL_CELLS.fetch_add(zone.cells() as u64, std::sync::atomic::Ordering::Relaxed);
-    let Bufs { level, buckets, src, props } = b;
-    level.clear();
-    level.resize(zone.cells(), 0);
-    for k in buckets.iter_mut() {
+    reset_exact(&mut b.level, zone.cells(), 0);
+    for k in b.buckets.iter_mut() {
         k.clear();
     }
-    let mut seeds = BlockSeeds { level, buckets, found: false };
+    let mut seeds = BlockSeeds { level: &mut b.level, buckets: &mut b.buckets, found: false };
     if opts.emitters_in_fill {
-        fill_properties(t, zc, zone, props, Some((&mut seeds, opts.noemit)));
+        fill_properties(t, zc, zone, &mut b.props, Some((&mut seeds, opts.noemit)));
     } else {
-        fill_properties(t, zc, zone, props, None);
+        fill_properties(t, zc, zone, &mut b.props, None);
         seed_block(t, zc, zone, opts.noemit, &mut seeds);
     }
     let emitters = seeds.found;
-    let queues = buckets.iter().map(|q| q.capacity() * size_of::<u32>()).sum::<usize>();
-    let _in_use = ZoneBuffersInUse::new(level.capacity() + props.capacity() * 2 + src.capacity() * 4 + queues);
-    let view = ZoneView::new(t, &props[..zone.cells()], zone, opts);
+    // Memory counted once the zone's buffers are sized, then again after each propagation, as
+    // the queues grow.
+    let mut in_use = ZoneBuffersInUse::new(b.bytes());
+    let view = ZoneView::new(t, &b.props[..zone.cells()], zone, opts);
     let skip_block = opts.no_emitter_exit && !emitters;
     let blocks: Vec<Vec<LightLayer>> = if skip_block {
         vec![vec![None; sections + 2]; targets.len()]
     } else {
-        view.propagate(level, buckets, opts.queue_directions);
-        targets.iter().map(|&c| pack_target(level, zone, c, sections, 0, false, opts.intern_uniform)).collect()
+        view.propagate(&mut b.level, &mut b.buckets, opts.queue_directions);
+        in_use.grow_to(b.bytes());
+        targets.iter().map(|&c| pack_target(&b.level, zone, c, sections, 0, false, opts.intern_uniform)).collect()
     };
     if !has_sky {
         return blocks.into_iter().map(|block| (vec![None; sections + 2], block)).collect();
     }
     // Without an emitter the levels are still all zero.
     if !skip_block {
-        level.fill(0);
+        b.level.fill(0);
     }
-    view.seed_sky(src, level, buckets, opts.sky_seed_filter);
-    view.propagate(level, buckets, opts.queue_directions);
+    view.seed_sky(&b.src, &mut b.level, &mut b.buckets, opts.sky_seed_filter);
+    view.propagate(&mut b.level, &mut b.buckets, opts.queue_directions);
+    in_use.grow_to(b.bytes());
     targets
         .iter()
         .zip(blocks)
-        .map(|(&c, block)| (pack_target(level, zone, c, sections, 0xff, true, opts.intern_uniform), block))
+        .map(|(&c, block)| (pack_target(&b.level, zone, c, sections, 0xff, true, opts.intern_uniform), block))
         .collect()
 }
 
@@ -218,8 +221,7 @@ fn unlit_depth(zc: &ZoneColumns, src: &[i32], has_sky: bool) -> i32 {
 /// skip), source heights only if `want_src`.
 fn zone_stacks(t: &LightTables, zc: &ZoneColumns, height: i32, needed: bool, want_src: bool, src: &mut Vec<i32>) -> i32 {
     let w = 16 * zc.chunks_x;
-    src.clear();
-    src.resize((w * 16 * zc.chunks_z) as usize, i32::MAX);
+    reset_exact(src, (w * 16 * zc.chunks_z) as usize, i32::MAX);
     if !needed {
         return 0;
     }
@@ -281,6 +283,7 @@ fn fill_properties(
     let n = zone.cells();
     // Stale values are fine: every cell below is written.
     if props.len() < n {
+        reserve_exact_len(props, n);
         props.resize(n, CLOSED);
     }
     let (mut seeds, skip_quiet_sections) = match seeds {
