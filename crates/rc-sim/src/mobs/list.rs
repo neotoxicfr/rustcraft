@@ -125,7 +125,7 @@ impl Mobs {
         let list = &mut self.list.slots;
         let rank = |m: &Option<Box<Mob>>| m.as_ref().map_or(0, |m| m.rank);
         let first_moved = first_out_of_order(list, rank);
-        list.sort_by_key(rank);
+        crate::walk::sort_by_rank(list, rank);
         let len = list.len();
         self.index.refresh_from(list, first_moved.unwrap_or(len), len);
     }

@@ -139,6 +139,12 @@ pub(crate) struct Walk {
     pub(crate) spare_orb: Option<crate::drops::Orb>,
     /// Orb merge buckets built for this walk (`drops::orb_buckets`).
     pub(crate) buckets_built: bool,
+    /// Merge candidates of the item run in progress (`drops::ItemGrid`).
+    pub(crate) item_grid: crate::drops::ItemGrid,
+    /// Physics bodies of the items and orbs removed after a walk, given to the next ones born
+    /// (`RUSTCRAFT_OPT_BODY_POOL`). Their boxes are what is kept: an item holds its body boxed.
+    #[allow(clippy::vec_box)]
+    pub(crate) spare_bodies: Vec<Box<rc_physics::body::Body>>,
     /// Families of a parked world already swept out of the list (`walk_park_sweep`); kept with
     /// the world, cleared when the player leaves it.
     pub(crate) swept: u16,
@@ -238,13 +244,23 @@ impl Server {
             return;
         }
         back.sort_unstable_by_key(|b| b.2);
-        let mut chunks: Vec<(i32, i32)> = Vec::new();
-        for b in &back {
-            if !chunks.contains(&b.3) {
-                chunks.push(b.3);
+        if rejoin_chunk_table() {
+            // Each chunk's place in the order looked up once per entity, not at every comparison.
+            let mut place: hashbrown::HashMap<(i32, i32), usize> = hashbrown::HashMap::new();
+            for b in &back {
+                let next = place.len();
+                place.entry(b.3).or_insert(next);
             }
+            back.sort_by_cached_key(|b| (place[&b.3], b.4, b.2));
+        } else {
+            let mut chunks: Vec<(i32, i32)> = Vec::new();
+            for b in &back {
+                if !chunks.contains(&b.3) {
+                    chunks.push(b.3);
+                }
+            }
+            back.sort_by_key(|b| (chunks.iter().position(|&c| c == b.3), b.4, b.2));
         }
-        back.sort_by_key(|b| (chunks.iter().position(|&c| c == b.3), b.4, b.2));
         let mut mask = 0;
         for &(f, i, ..) in &back {
             if let Some(r) = self.fam_rank_mut(f, i) {
@@ -504,29 +520,29 @@ impl Server {
     fn fam_resort(&mut self, mask: u16) {
         let has = |f: Fam| mask & bit(f) != 0;
         if has(Fam::Sim) {
-            self.bs.entities.list.sort_by_key(|e| e.rank);
+            sort_by_rank(&mut self.bs.entities.list, |e| e.rank);
         }
         if has(Fam::Item) {
-            self.life.drops.sort_by_key(|d| d.rank);
+            sort_by_rank(&mut self.life.drops, |d| d.rank);
         }
         if has(Fam::Orb) {
-            self.life.orbs.sort_by_key(|o| o.rank);
+            sort_by_rank(&mut self.life.orbs, |o| o.rank);
         }
         if has(Fam::Mob) {
             // Index brought up to date now: the walk that follows a return looks mobs up by it.
             self.mobs.sort_by_rank();
         }
         if has(Fam::Fang) {
-            self.mobs.ill.fangs.sort_by_key(|f| f.rank);
+            sort_by_rank(&mut self.mobs.ill.fangs, |f| f.rank);
         }
         if has(Fam::Spit) {
-            self.mobs.mounts.spits.sort_by_key(|s| s.rank);
+            sort_by_rank(&mut self.mobs.mounts.spits, |s| s.rank);
         }
         if has(Fam::Bolt) {
-            self.mobs.mounts.bolts.sort_by_key(|b| b.rank);
+            sort_by_rank(&mut self.mobs.mounts.bolts, |b| b.rank);
         }
         if has(Fam::Crystal) {
-            self.mobs.end.crystals.sort_by_key(|c| c.rank);
+            sort_by_rank(&mut self.mobs.end.crystals, |c| c.rank);
         }
         if has(Fam::Ominous) {
             self.ominous_resort();
@@ -535,13 +551,13 @@ impl Server {
             self.deco_resort();
         }
         if has(Fam::Cart) {
-            self.carts.list.sort_by_key(|c| c.as_ref().map_or(0, |c| c.rank));
+            sort_by_rank(&mut self.carts.list, |c| c.as_ref().map_or(0, |c| c.rank));
         }
         if has(Fam::Proj) {
-            self.proj.list.sort_by_key(|p| p.rank);
+            sort_by_rank(&mut self.proj.list, |p| p.rank);
         }
         if has(Fam::Cloud) {
-            self.proj.clouds.sort_by_key(|c| c.rank);
+            sort_by_rank(&mut self.proj.clouds, |c| c.rank);
         }
     }
 
@@ -667,3 +683,69 @@ pub(crate) const fn parked_walk(portal: bool) -> u16 {
 /// Families a parked world sweeps out of the list (`walk_park_sweep`): all but the player and
 /// its bobber (neither is kept with a world).
 pub(crate) const SWEPT: u16 = ALL & !bit(Fam::Player) & !bit(Fam::Hook);
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: `RUSTCRAFT_OPT_WALK_RESORT_LINEAR` and `RUSTCRAFT_OPT_WALK_REJOIN_CHUNK_TABLE` for
+    /// this thread (both ways of the equivalence proofs), without touching the environment.
+    pub(crate) static FORCED_RESORT_LINEAR: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    pub(crate) static FORCED_REJOIN_CHUNK_TABLE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `RUSTCRAFT_OPT_WALK_RESORT_LINEAR` (default on): a family list goes back in rank order by
+/// `put_back_in_rank_order`; `0`: a stable sort of the whole list (which, for a long list,
+/// allocates a buffer of half of it). Read once.
+fn resort_linear() -> bool {
+    #[cfg(test)]
+    if let Some(on) = FORCED_RESORT_LINEAR.with(std::cell::Cell::get) {
+        return on;
+    }
+    rc_data::opt_switch!("RUSTCRAFT_OPT_WALK_RESORT_LINEAR")
+}
+
+/// `RUSTCRAFT_OPT_WALK_REJOIN_CHUNK_TABLE` (default on): `walk_rejoin` looks each chunk's place
+/// up in a table built once; `0`: searched in the list of chunks at every comparison. Read once.
+fn rejoin_chunk_table() -> bool {
+    #[cfg(test)]
+    if let Some(on) = FORCED_REJOIN_CHUNK_TABLE.with(std::cell::Cell::get) {
+        return on;
+    }
+    rc_data::opt_switch!("RUSTCRAFT_OPT_WALK_REJOIN_CHUNK_TABLE")
+}
+
+/// A family list put back in rank order after some of its entities got a new rank.
+pub(crate) fn sort_by_rank<T>(list: &mut [T], rank: impl Fn(&T) -> u64) {
+    if resort_linear() {
+        put_back_in_rank_order(list, rank);
+    } else {
+        list.sort_by_key(rank);
+    }
+}
+
+/// The order of a stable sort by rank, in two passes plus the sort of the entities that moved,
+/// without allocating. `first_moved` is the smallest rank followed somewhere by a smaller one:
+/// the ranks below it are already in order (of two out of order, the larger would be such a
+/// rank), so they only slide forward, keeping their order; the others (the entities given a new
+/// rank and those born after them) gather at the end and are sorted alone. Ranks are unique (one
+/// counter) except empty slots (0), which always stay in front: the end needs no stable sort.
+pub(crate) fn put_back_in_rank_order<T>(list: &mut [T], rank: impl Fn(&T) -> u64) {
+    let (mut smallest_after, mut first_moved) = (u64::MAX, u64::MAX);
+    for e in list.iter().rev() {
+        let r = rank(e);
+        if r > smallest_after {
+            first_moved = first_moved.min(r);
+        }
+        smallest_after = smallest_after.min(r);
+    }
+    if first_moved == u64::MAX {
+        return;
+    }
+    let mut kept = 0;
+    for k in 0..list.len() {
+        if rank(&list[k]) < first_moved {
+            list.swap(kept, k);
+            kept += 1;
+        }
+    }
+    list[kept..].sort_unstable_by_key(rank);
+}

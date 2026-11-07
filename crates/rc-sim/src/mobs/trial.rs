@@ -1165,7 +1165,7 @@ impl Server {
     }
 
     pub(crate) fn ominous_resort(&mut self) {
-        self.mobs.spawners.blocks.items.sort_by_key(|o| o.rank);
+        crate::walk::sort_by_rank(&mut self.mobs.spawners.blocks.items, |o| o.rank);
     }
 
     /// Ominous item spawner of slot `i`, at its rank in the entity walk. The list is taken out

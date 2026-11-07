@@ -240,6 +240,10 @@ mod tests_l10order; // L10-ORDER: one entity walk, every kind in the order of ar
 #[cfg(test)]
 mod bench_l10order; // L10-ORDER: server tick with 1,000 entities of five families
 #[cfg(test)]
+mod tests_ground_items; // ground items and orbs: pickup and recycled bodies, both ways of each switch
+#[cfg(test)]
+mod bench_ground_items; // ground items: merges of a dropped pile, births and removals per tick
+#[cfg(test)]
 mod bench_kit; // common kit of the micro-benches: flat world, perf pack, timed ticks, `[bench]` lines
 #[cfg(test)]
 mod bench_datapack_tick; // tick of the bench's `datapack` scene (crowd, #tick workload, command blocks)

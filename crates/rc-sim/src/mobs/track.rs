@@ -175,10 +175,7 @@ impl Server {
     }
 
     pub(crate) fn entity_kind_id(&self, name: &str) -> i32 {
-        self.data
-            .registry("minecraft:entity_type")
-            .and_then(|r| r.entries.iter().position(|e| e == name))
-            .map_or(0, |i| i as i32)
+        self.entity_kind_index(name).map_or(0, |i| i as i32)
     }
 
     /// End of tick (the chunk map tick → sending the changes).
