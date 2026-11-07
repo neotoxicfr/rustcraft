@@ -69,7 +69,7 @@ fn set_portals(s: &mut Server, spawn: P) -> Vec<[f64; 3]> {
 /// a section boundary and beside an absent chunk; ids from the table equal ids by name.
 #[test]
 fn portals_touched_prefilter_matches_cell_by_cell() {
-    let Some((mut s, dir)) = open_new_world("portal-touch-prefilter", 20_261_107) else { return };
+    let Some((mut s, _dir)) = open_new_world("portal-touch-prefilter", 20_261_107) else { return };
     ready(&mut s);
     let spawn = s.level.spawn_pos;
     let centers = set_portals(&mut s, spawn);
@@ -90,7 +90,6 @@ fn portals_touched_prefilter_matches_cell_by_cell() {
     }
     eprintln!("touches seen (nether, end, gateway): {seen:?}");
     assert!(seen.iter().all(|&n| n > 100), "too few touches to prove anything: {seen:?}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -170,10 +169,30 @@ fn load_area(s: &mut Server, center: P, radius: i32) {
     s.load_now(&list);
 }
 
-/// Checks of one dimension: every path against the reference on `origins` random arrival points
+/// Column heights by the game's rule over the columns the spirals of `radius` reach, scanned once.
+fn game_heights(s: &Server, center: P, radius: i32) -> HashMap<(i32, i32), i32> {
+    let r = radius + 16;
+    let mut out = HashMap::new();
+    for x in center[0] - r..=center[0] + r {
+        for z in center[2] - r..=center[2] + r {
+            out.insert((x, z), tag_scan_height(s, x, z));
+        }
+    }
+    out
+}
+
+/// The reference walk fed by the game's height rule: what the heightmap path must choose.
+fn site_by_game_rule(s: &Server, heights: &HashMap<(i32, i32), i32>, origin: P, dir: Dir) -> Option<P> {
+    s.portal_site_cell_by_cell_with_height(origin, dir, |x, z| {
+        heights.get(&(x, z)).copied().unwrap_or_else(|| tag_scan_height(s, x, z))
+    })
+}
+
+/// Checks of one dimension: every path against its reference on `origins` random arrival points
 /// within `radius` of `center`; returns the number of points where a spot was found.
 fn check_site_paths(s: &mut Server, center: P, radius: i32, origins: usize, seed: i64) -> usize {
     load_area(s, center, radius);
+    let heights = game_heights(s, center, radius);
     let mut r = JRand::new(seed);
     let (min_y, max_y) = (s.dim.height.min_y, s.max_placeable_y());
     let mut found = 0;
@@ -187,11 +206,13 @@ fn check_site_paths(s: &mut Server, center: P, radius: i32, origins: usize, seed
             center[2] + r.int_between(-radius, radius),
         ];
         let dir = if n % 2 == 0 { Dir::East } else { Dir::South };
-        // The area holds no column where the former height rule and the game's differ (checked by
-        // the caller): every path, heightmap included, must find the reference spot.
-        let want = s.portal_site_cell_by_cell(origin, dir);
-        found += usize::from(want.is_some());
+        // Two references: the former height rule for the local scan, the game's rule for the
+        // heightmap path (they differ only on a column topped by a sign).
+        let want_former = s.portal_site_cell_by_cell(origin, dir);
+        let want_game = site_by_game_rule(s, &heights, origin, dir);
+        found += usize::from(want_former.is_some());
         for paths in all_paths() {
+            let want = if paths.heightmap { want_game } else { want_former };
             let mut at = |what: &str, got: Option<P>| {
                 let failure = format!("{paths:?} {what}");
                 if got != want && !failures.contains(&failure) {
@@ -256,15 +277,22 @@ fn build_column_cases(s: &mut Server, center: P) {
 /// arrival points; the live heightmap equals a scan with the game's rule.
 #[test]
 fn portal_site_paths_choose_the_reference_spot() {
-    let Some((mut s, dir)) = open_new_world("portal-site-paths", 1_234_567_890_123_456_789) else { return };
+    let Some((mut s, _dir)) = open_new_world("portal-site-paths", 1_234_567_890_123_456_789) else { return };
     ready(&mut s);
     let spawn = s.level.spawn_pos;
     let center = [spawn[0], 0, spawn[2]];
     load_area(&mut s, center, 24);
     build_column_cases(&mut s, center);
     // Columns reached by the spirals of arrival points up to 24 blocks away.
-    assert_eq!(height_differences(&s, center, 24 + 16), (0, 0), "heights off the game's rule (live map, former rule)");
+    assert_eq!(height_differences(&s, center, 24 + 16).0, 0, "live heightmap off the game's rule");
     let found = check_site_paths(&mut s, center, 24, 60, 11);
+    // Signs on top of columns near the center: there the two height rules part.
+    let signs = [center[0] - 6, s.hm_motion_blocking(center[0] - 6, center[2] + 6) + 6, center[2] + 6];
+    build_sign_floor(&mut s, signs, Dir::East);
+    let (live, rule) = height_differences(&s, center, 24 + 16);
+    assert_eq!(live, 0, "live heightmap off the game's rule beside the signs");
+    assert!(rule > 0, "no column where the height rules differ");
+    check_site_paths(&mut s, signs, 4, 20, 14);
     let found_built = check_site_paths(&mut s, center, 4, 20, 12);
     eprintln!("overworld: {found}+{found_built} spots found");
     assert!(found > 30, "too few spots found to prove anything: {found}");
@@ -282,35 +310,83 @@ fn portal_site_paths_choose_the_reference_spot() {
     assert_eq!(s.dim.name, NETHER);
     let nether_center = [center[0] / 8, 0, center[2] / 8];
     load_area(&mut s, nether_center, 24);
-    assert_eq!(height_differences(&s, nether_center, 24 + 16), (0, 0), "Nether heights off the game's rule");
+    assert_eq!(height_differences(&s, nether_center, 24 + 16).0, 0, "Nether live heightmap off the game's rule");
     let found = check_site_paths(&mut s, nether_center, 24, 60, 13);
     eprintln!("nether: {found} spots found");
     assert!(found > 10, "too few spots found in the Nether: {found}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Same proof on 200 seeds, ten arrival points each (long: `--ignored`).
 #[test]
 #[ignore]
 fn portal_site_paths_choose_the_reference_spot_on_200_seeds() {
-    let mut skipped = 0;
+    let mut with_signs = 0;
     for seed in 1..=200i64 {
-        let Some((mut s, dir)) = open_new_world(&format!("portal-site-seed-{seed}"), seed * 7_919) else { return };
+        let Some((mut s, _dir)) = open_new_world(&format!("portal-site-seed-{seed}"), seed * 7_919) else { return };
         ready(&mut s);
         let spawn = s.level.spawn_pos;
         let center = [spawn[0], 0, spawn[2]];
         load_area(&mut s, center, 8);
         let (live, rule) = height_differences(&s, center, 8 + 16);
         assert_eq!(live, 0, "seed {seed}: live heightmap off the game's rule");
-        // A sign on top of a column: the heightmap path follows the game there, not the reference.
-        if rule == 0 {
-            check_site_paths(&mut s, center, 8, 10, seed);
-        } else {
-            skipped += 1;
-        }
-        let _ = std::fs::remove_dir_all(&dir);
+        with_signs += usize::from(rule > 0);
+        check_site_paths(&mut s, center, 8, 10, seed);
     }
-    eprintln!("{skipped} seeds skipped (sign on top of a column)");
+    eprintln!("{with_signs} seeds with a sign on top of a column");
+}
+
+/// Standing signs on a stone floor in open air, around `at`: the floor spans 9 x 9 columns, the
+/// signs 7 x 5 (long side along `dir`), so a full frame fits on the signs above `at`.
+fn build_sign_floor(s: &mut Server, at: P, dir: Dir) {
+    let (stone, sign) = (state(s, "stone"), state(s, "oak_sign"));
+    let along_x = dir == Dir::East;
+    for dx in -4..=4 {
+        for dz in -4..=4 {
+            s.set_block([at[0] + dx, at[1] - 2, at[2] + dz], stone, flag::CLIENTS | flag::KNOWN_SHAPE);
+            let (along, across) = if along_x { (dx, dz) } else { (dz, dx) };
+            if along.abs() <= 3 && across.abs() <= 2 {
+                s.set_block([at[0] + dx, at[1] - 1, at[2] + dz], sign, flag::CLIENTS | flag::KNOWN_SHAPE);
+            }
+        }
+    }
+}
+
+/// Fidelity fix of the heightmap path: the game's motion-blocking height ignores signs, so no
+/// exit portal stands on a floor of signs; the former local rule counted them as ground and put
+/// the portal right on them. Every heightmap combination must follow the game's rule.
+#[test]
+fn portal_site_heightmap_never_stands_on_signs() {
+    let Some((mut s, _dir)) = open_new_world("portal-site-signs", 99) else { return };
+    ready(&mut s);
+    let spawn = s.level.spawn_pos;
+    load_area(&mut s, spawn, 4);
+    let pools = test_pools();
+    for (n, dir) in [Dir::East, Dir::South].into_iter().enumerate() {
+        // Open air well above the ground, apart for each direction.
+        let col = [spawn[0] + 12 * n as i32, 0, spawn[2]];
+        let at = [col[0], s.hm_motion_blocking(col[0], col[2]) + 12, col[2]];
+        assert!(at[1] + 6 <= s.max_placeable_y(), "no room above the ground at {at:?}");
+        build_sign_floor(&mut s, at, dir);
+        let sign = s.table().block_id("oak_sign");
+        let on_sign = |s: &Server, p: Option<P>| p.is_some_and(|p| s.view().block(s.get([p[0], p[1] - 1, p[2]])) == sign);
+        let former = s.portal_site_cell_by_cell(at, dir);
+        assert_eq!(former, Some(at), "{dir:?}: the former rule puts the portal on the signs");
+        let heights = game_heights(&s, at, 0);
+        let game = site_by_game_rule(&s, &heights, at, dir);
+        assert!(game.is_some() && !on_sign(&s, game), "{dir:?}: game rule chose {game:?}");
+        for paths in all_paths().into_iter().filter(|p| p.heightmap) {
+            let got: Vec<Option<P>> = if paths.parallel {
+                let search = s.portal_site_search(at, dir, paths);
+                pools.iter().map(|pool| pool.install(|| search.run())).collect()
+            } else {
+                vec![s.portal_site(at, dir, paths)]
+            };
+            for g in got {
+                assert_eq!(g, game, "{dir:?} {paths:?}");
+                assert!(!on_sign(&s, g), "{dir:?} {paths:?}: portal on the signs at {g:?}");
+            }
+        }
+    }
 }
 
 /// Blocks whose states the former height rule (legacy solid, cobweb and bamboo sapling excepted)
@@ -319,7 +395,7 @@ fn portal_site_paths_choose_the_reference_spot_on_200_seeds() {
 /// height under the former rule; the heightmap path, like the game, ignores it.
 #[test]
 fn former_height_rule_against_the_game_tag() {
-    let Some((s, dir)) = open_new_world("portal-height-rule", 5) else { return };
+    let Some((s, _dir)) = open_new_world("portal-height-rule", 5) else { return };
     let cobweb = s.table().block_id("cobweb");
     let sapling = s.table().block_id("bamboo_sapling");
     let mut differ: Vec<String> = Vec::new();
@@ -338,7 +414,6 @@ fn former_height_rule_against_the_game_tag() {
     eprintln!("{} blocks differ: {differ:?}", differ.len());
     assert_eq!(differ.len(), 26, "{differ:?}");
     assert!(differ.iter().all(|n| n.ends_with("_sign")), "{differ:?}");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // --- Micro-benches (ignored): `cargo test --release -p rc-sim -- --ignored bench_portal`. ---
@@ -357,7 +432,7 @@ fn time_per_call(n: u32, mut f: impl FnMut() -> usize) -> (f64, usize) {
 #[test]
 #[ignore]
 fn bench_portals_touched() {
-    let Some((mut s, dir)) = open_new_world("portal-touch-bench", 81) else { return };
+    let Some((mut s, _dir)) = open_new_world("portal-touch-bench", 81) else { return };
     ready(&mut s);
     let spawn = s.level.spawn_pos;
     let centers = set_portals(&mut s, spawn);
@@ -375,7 +450,6 @@ fn bench_portals_touched() {
             eprintln!("{label:24} prefilter {prefilter:5} table ids {table_ids:5}: {ns:6.1} ns per call ({found})");
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Site search of the exit portal (ms per search), Overworld then Nether, each lead alone and
@@ -383,7 +457,7 @@ fn bench_portals_touched() {
 #[test]
 #[ignore]
 fn bench_portal_site() {
-    let Some((mut s, dir)) = open_new_world("portal-site-bench", 1_234_567_890_123_456_789) else { return };
+    let Some((mut s, _dir)) = open_new_world("portal-site-bench", 1_234_567_890_123_456_789) else { return };
     ready(&mut s);
     let spawn = s.level.spawn_pos;
     let center = [spawn[0], 0, spawn[2]];
@@ -400,7 +474,6 @@ fn bench_portal_site() {
     });
     ready(&mut s);
     bench_site_dimension(&mut s, [center[0] / 8, 0, center[2] / 8], "nether");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn bench_site_dimension(s: &mut Server, center: P, label: &str) {
@@ -450,7 +523,7 @@ fn bench_site_dimension(s: &mut Server, center: P, label: &str) {
 #[test]
 #[ignore]
 fn bench_gateway_lookup() {
-    let Some((mut s, dir)) = open_new_world("portal-gateway-bench", 82) else { return };
+    let Some((mut s, _dir)) = open_new_world("portal-gateway-bench", 82) else { return };
     let gateways: Vec<P> = (0..20).map(|i| [i * 3, 80, 0]).collect();
     for (i, p) in gateways.iter().enumerate() {
         if i % 2 == 0 {
@@ -465,5 +538,4 @@ fn bench_gateway_lookup() {
             ns * 2.0
         );
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -506,6 +506,17 @@ impl Server {
     /// Site of the exit portal, the former walk kept as the reference (`SitePaths::REFERENCE`):
     /// every cell read through the server's lookup, column height scanned with the former rule.
     pub(crate) fn portal_site_cell_by_cell(&self, origin: P, dir: Dir) -> Option<P> {
+        self.portal_site_cell_by_cell_with_height(origin, dir, |x, z| self.portal_surface_height(x, z))
+    }
+
+    /// The reference walk with the column height given by `surface_height` (tests compare the
+    /// heightmap path with this walk fed by the game's height rule).
+    pub(crate) fn portal_site_cell_by_cell_with_height(
+        &self,
+        origin: P,
+        dir: Dir,
+        surface_height: impl Fn(i32, i32) -> i32,
+    ) -> Option<P> {
         let d = dir.step();
         let min_y = self.dim.height.min_y;
         let max_placeable = self.max_placeable_y();
@@ -514,7 +525,7 @@ impl Server {
         let bounds = self.border_bounds();
         let in_border = |p: P| Self::block_in_border(bounds, p);
         for col in ps::spiral(origin, 16, Dir::East, Dir::South) {
-            let height = max_placeable.min(self.portal_surface_height(col[0], col[2]));
+            let height = max_placeable.min(surface_height(col[0], col[2]));
             if !(in_border(col) && in_border(ps::add(col, d, 1))) {
                 continue;
             }
