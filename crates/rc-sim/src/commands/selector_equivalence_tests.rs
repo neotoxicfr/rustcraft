@@ -276,7 +276,12 @@ fn entity_by_uuid_matches_the_former_lookup() {
     let Some(E::Other(marker_id)) = marker else { panic!("test setup: no marker") };
     assert!(marker_id < zombie_id, "test setup: marker after the zombie");
     let (c, k) = p.s.kept_entity_slot(marker_id).expect("marker slot");
+    let marker_uuid = p.s.ent_uuid(E::Other(marker_id));
+    assert_eq!(p.s.ent_by_uuid(marker_uuid), Some(E::Other(marker_id)), "test setup: UUID map made");
     crate::nbtio::set(&mut p.s.entities.get_mut(&c).expect("chunk")[k].1, "UUID", crate::nbtio::uuid_nbt(zombie_uuid));
+    // The map still names the marker for its former UUID: the check must refuse it.
+    check(&p, marker_uuid, "UUID no longer carried");
+    assert_eq!(p.s.ent_by_uuid(marker_uuid), None, "former UUID of the marker");
     check(&p, zombie_uuid, "mob and kept compound");
     assert_eq!(p.s.ent_by_uuid(zombie_uuid), Some(E::Other(marker_id)));
     // Two living mobs with one UUID: the smaller identifier.
