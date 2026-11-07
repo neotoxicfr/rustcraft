@@ -780,12 +780,14 @@ impl App {
             // 3D interface models requested when drawing the screens (`special.rs`).
             special::push_models(er, &mut self.entities, items, pt);
         }
-        // Text of the visible signs (faces collected by the block-entity render).
+        // Text of the visible signs (faces collected by the block-entity render) and displays;
+        // the camera lets them leave out the faces turned away.
         if let Some(er) = &r.entities {
             let q = r.queue_handle();
-            r.block_text.prepare(&mut r.gui, &q, &er.blocks.texts, &self.block_entities);
+            let camera = crate::glyph_pool::BackFaceTest::for_camera(shot.pos, r.view.fov, r.size().1);
+            r.block_text.prepare(&mut r.gui, &q, &er.blocks.texts, &self.block_entities, &camera);
             let bg = self.hud.text_background.unwrap_or(63 << 24);
-            r.text_displays.prepare(&mut r.gui, &q, er.text_draws(), er.text_labels(), &self.entities, bg);
+            r.text_displays.prepare(&mut r.gui, &q, er.text_draws(), er.text_labels(), &self.entities, bg, &camera);
         }
         // End screen: End portal background in front of the camera (`win_screen.rs`).
         if let Some(er) = r.entities.as_mut()

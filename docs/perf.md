@@ -7088,4 +7088,77 @@ already walks shulkers only. The same pickup box is written again in the allay, 
 cube, crystal and projectile code (other zones). To settle on the quiet-machine scene bench:
 `ocean`, `forest`, `crowd-1000`, `dropped-items` (gain of the contact scan below scene noise:
 not to be announced from a scene).
+## C4-M36: sign and display text in the shared glyph pool, back faces left out (06/11, loaded machine)
+
+Sign text and text displays copied every glyph of every visible face into a 52-byte instance
+on every frame (face, light, glyph; the display opacity applied glyph by glyph on the CPU) and
+sent all of it with `queue.write_buffer`, while the glyphs only change with the text. The name
+tag pool of C3-M23 is now a shared module (`glyph_pool.rs`: pool with compaction, solids-first
+copies, draw cutting, per-frame buffers) used by the three texts. Micro-benches (ignored tests
+`block_text::tests::bench`, `text_display::tests::bench`), LOADED machine, one core (a few µs on
+the main thread: no multi-core form), median of 1,000 frames:
+
+| Case (switches) | CPU per frame | bytes sent per frame | vertices per frame |
+|---|---|---|---|
+| 100 signs, both faces written, seen from the front, old path | 15.2 µs | 524,792 | 59,076 |
+| … glyph pool (`SIGN_TEXT_GLYPH_POOL`) | 4.4 µs | 16,800 | 88,800 |
+| … pool + unchanged writes skipped (`TEXT_SKIP_UNCHANGED_WRITES`) | 4.7 µs | 0 (still camera) | 88,800 |
+| … old path + back faces left out (`SIGN_BACKFACE_SKIP`) | 9.1 µs | 250,384 | 28,152 |
+| … pool + back faces left out | 4.8 µs | 8,400 | 39,900 |
+| … all three | 5.4 µs | 0 (still camera) | 39,900 |
+| 50 text displays (shadow, background, a third fading), old path | 2.6 µs | 79,524 | |
+| … glyph pool (`DISPLAY_TEXT_GLYPH_POOL`) | 1.2 µs | 10,032 | |
+| … pool + unchanged writes skipped | 1.3 µs | 0 (still camera) | |
+
+- Glyph pool (`RUSTCRAFT_OPT_SIGN_TEXT_GLYPH_POOL`, `RUSTCRAFT_OPT_DISPLAY_TEXT_GLYPH_POOL`,
+  default 1): glyphs of a layout (48 B each) sent once at the tail of the pool; per frame one
+  reference per face and pass for signs (matrix, light, first glyph, count: 16 B; outline then
+  text, faces in their far-to-near order) and per layer for displays (plus opacity and the
+  background colour of the frame: 24 B; the shader scales the alpha byte with the same integer
+  division). Improved transparency: opaque glyphs from the layer's solids-first copy when the
+  layer is fully opaque this frame. GPU: 6 × (longest reference of the draw) vertices per
+  instance, at most 2 × the useful ones by construction; +50 % vertices on the sign bench
+  (outline references 6 × longer than the text ones), not timed. All writes through the common
+  transit.
+- Unchanged writes (`RUSTCRAFT_OPT_TEXT_SKIP_UNCHANGED_WRITES`, default 1, new paths): the
+  matrices and references of the frame are compared with what the GPU buffer already holds
+  (+0.1 to 0.3 µs): a still camera sends 0 bytes. This is the "persistent instance buffer" lead of
+  C3-M03, applied to the references (rebuilding the old 52-byte instances only when the visible
+  set changes would still copy every glyph on each change).
+- Back faces (`RUSTCRAFT_OPT_SIGN_BACKFACE_SKIP`, `RUSTCRAFT_OPT_DISPLAY_BACKFACE_SKIP`, default 1;
+  idea of the Camera Culling mod, our own test): a face whose text plane surely turns its back to
+  the eye is not laid out again, referenced or drawn (its layout is kept). Exact because the GPU
+  culls back faces anyway; margin: 0.25 block for the view bobbing (the projection's eye moves
+  by less than 0.12 block) plus d² × (1/64 px) / (half a font pixel × pixels per radian of the
+  frame), so a grazing face stays for the GPU's rounding to decide. CPU +0.4 µs on the bench with
+  the pool (the test costs more than the few references it saves), vertices halved from behind.
+- Fidelity (A3): the game's polygon-offset text pipeline culls back faces; our sign text
+  pipelines did not, so the back of a face's text could show mirrored past the board's edge at
+  grazing angles or with the camera inside the sign block. Both sign text pipelines now cull back
+  faces (old and new paths), which is also what makes the back-face test exact.
+- Readability: the duplicated buffer-growth closures became `write_growing`, display layouts
+  updated in place (`get_mut`) instead of removed and inserted again, instance counts in a struct.
+  A revision key instead of comparing the display text was ruled out by the mission (no counter
+  in the metadata, ~100 ns per display).
+- Proofs: `block_text::tests` (240 frames, 120 signs: texts changed, outlines by distance, faces
+  appearing, light changing, camera circling and crossing block origins, still camera; glyphs
+  drawn per pass rebuilt from copies of the GPU buffers that receive only the uploads, identical
+  to the old path in order, back faces on and off; GPU captures from 7 eyes — front, behind,
+  angled, grazing from both sides, close behind, far — old against new, skip on and off,
+  identical to the bit, two frames each (the second sends nothing); from behind the GPU itself
+  draws nothing of front-only signs); `text_display::tests` (240 frames, 56 displays and map
+  names: shadow, see-through, default background, held map names, opacity and background
+  interpolated, obfuscated text, improved transparency toggled, a sixth turned away; same glyphs
+  per pass, in order, or as a set for the opaque and translucent parts of improved transparency;
+  GPU captures normal mode identical to the bit; improved transparency at most one level on fewer
+  than 0.1 % of the bytes: the translucent stages add fragments in drawing order and the old order
+  was the arbitrary output of an unstable sort, three fragments or more per pixel round
+  differently); `nametag::tests` unchanged on the shared pool. Sabotages seen: pool additions not
+  sent, "unchanged" judged on the length, reversed back-face test, opacity rounded up in the
+  shader, margin replaced by −0.5 block.
+- To measure on the quiet machine: `signs-1`, `displays-1`, `village` (non-regression): CPU ms of
+  prepare + upload, GPU ms, bytes written per frame, each switch at 0 against the default; the
+  vertex overhead of the references against the halved back faces is decided there. Lead noted, not
+  done: drawing exactly 6 × glyphs vertices by a search of the reference in a prefix sum of the
+  counts (no wasted vertex, one draw per pass, a few storage reads per vertex).
 

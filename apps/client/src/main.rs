@@ -50,6 +50,7 @@ mod exact;
 mod explode;
 mod flow;
 mod front;
+mod glyph_pool;
 mod gui;
 mod hand;
 mod hotbars;

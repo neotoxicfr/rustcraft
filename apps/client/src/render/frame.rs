@@ -115,8 +115,8 @@ impl Renderer {
         }
         let gui = &self.gui;
         self.tags.upload(&self.device, &self.queue, &mut self.up, gui.glyph_gen, || gui.glyph_view());
-        self.block_text.upload(&self.device, &self.queue, &self.gui);
-        self.text_displays.upload(&self.device, &self.queue, &self.gui);
+        self.block_text.upload(&self.device, &self.queue, &mut self.up, gui.glyph_gen, || gui.glyph_view());
+        self.text_displays.upload(&self.device, &self.queue, &mut self.up, gui.glyph_gen, || gui.glyph_view());
         if let Some(e) = &self.entities {
             self.block_fx.upload(&self.device, &self.queue, &e.blocks.fx);
         }
