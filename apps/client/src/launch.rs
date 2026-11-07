@@ -358,23 +358,63 @@ pub const ICONS: [&str; 5] = [
     "assets/icons/icon_16x16.png",
 ];
 
+/// Side in pixels each name of [`ICONS`] announces.
+const ICON_SIDES: [u32; 5] = [256, 128, 48, 32, 16];
+
 /// Sets the icon: like the game's window library on Windows, the same image (the one at
 /// the system icon size, 32 px at 100%) serves for the title bar and the taskbar.
 pub fn set_icon(window: &winit::window::Window, assets: &rc_assets::Assets) {
-    let images: Vec<rc_assets::texture::Image> = ICONS.iter().filter_map(|p| assets.image(p)).collect();
-    if images.is_empty() {
+    let want = icon_metric();
+    // Only the retained image is decoded: the four others cost decoding time on the main thread
+    // before the window shows. `=0`: the five are decoded as before.
+    let load = |p: &str| assets.image(p);
+    let chosen = if rc_data::opt_switch!("RUSTCRAFT_OPT_DECODE_ONLY_CHOSEN_ICON") {
+        icon_decoding_one(want, load)
+    } else {
+        icon_decoding_all(want, load)
+    };
+    let Some(image) = chosen else {
         eprintln!("window icon not found (asset index missing?)");
         return;
-    }
-    let want = icon_metric();
-    let pick = images.iter().filter(|i| i.width >= want).min_by_key(|i| i.width).unwrap_or(&images[0]);
-    let icon = |i: &rc_assets::texture::Image| winit::window::Icon::from_rgba(i.rgba.clone(), i.width, i.height).ok();
-    window.set_window_icon(icon(pick));
+    };
+    let icon = winit::window::Icon::from_rgba(image.rgba, image.width, image.height).ok();
     #[cfg(windows)]
     {
         use winit::platform::windows::WindowExtWindows;
-        window.set_taskbar_icon(icon(pick));
+        window.set_taskbar_icon(icon.clone());
     }
+    window.set_window_icon(icon);
+}
+
+/// Icon of the system size from every image present: the narrowest at least `want` pixels wide,
+/// otherwise the largest present (the first of [`ICONS`]).
+fn icon_decoding_all(
+    want: u32,
+    load: impl Fn(&str) -> Option<rc_assets::texture::Image>,
+) -> Option<rc_assets::texture::Image> {
+    let mut images: Vec<rc_assets::texture::Image> = ICONS.iter().filter_map(|p| load(p)).collect();
+    let narrowest = images.iter().enumerate().filter(|(_, i)| i.width >= want).min_by_key(|(_, i)| i.width);
+    let at = narrowest.map_or(0, |(at, _)| at);
+    (!images.is_empty()).then(|| images.swap_remove(at))
+}
+
+/// Same choice decoding only the image retained: the names announce the sides, so the candidates
+/// are tried narrowest first among those wide enough, then largest first. An image whose real side
+/// differs from its name makes the choice on every decoded image, as before.
+fn icon_decoding_one(
+    want: u32,
+    load: impl Fn(&str) -> Option<rc_assets::texture::Image>,
+) -> Option<rc_assets::texture::Image> {
+    let wide_enough = (0..ICONS.len()).rev().filter(|&i| ICON_SIDES[i] >= want);
+    let largest_first = (0..ICONS.len()).filter(|&i| ICON_SIDES[i] < want);
+    for i in wide_enough.chain(largest_first) {
+        let Some(image) = load(ICONS[i]) else { continue };
+        if image.width != ICON_SIDES[i] {
+            return icon_decoding_all(want, load);
+        }
+        return Some(image);
+    }
+    None
 }
 
 /// System icon size in pixels (SM_CXICON on Windows; 32 elsewhere).
@@ -407,6 +447,49 @@ pub fn profile(name: &str) -> (u128, Option<AccessToken>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decoding only the retained icon chooses the image the full decoding chooses, for every
+    /// system size and every set of icons present (the official index names each image by its
+    /// side), and when the retained image is not the side its name says; it decodes one image when
+    /// names and sides agree. Sabotage checked: trying the candidates widest first fails at 32 px.
+    #[test]
+    fn icon_decoding_one_chooses_like_decoding_all() {
+        use std::cell::Cell;
+        let image = |side: u32, tag: u8| rc_assets::texture::Image { width: side, height: side, rgba: vec![tag; 4] };
+        // Icons present (bit i: `ICONS[i]`) with the sides their images really have.
+        let loader = |present: u32, sides: [u32; 5]| {
+            move |p: &str| {
+                let i = ICONS.iter().position(|&n| n == p).expect("known icon");
+                (present & (1 << i) != 0).then(|| image(sides[i], i as u8))
+            }
+        };
+        let choice = |i: Option<rc_assets::texture::Image>| i.map(|i| (i.width, i.rgba));
+        for present in 0u32..32 {
+            for want in [1, 16, 20, 32, 33, 48, 64, 128, 200, 256, 300] {
+                let all = choice(icon_decoding_all(want, loader(present, ICON_SIDES)));
+                let one = choice(icon_decoding_one(want, loader(present, ICON_SIDES)));
+                assert_eq!(one, all, "present {present:05b}, system size {want}");
+                // The first candidate present is not the side its name announces.
+                let wide_enough = (0..5).rev().filter(|&i| ICON_SIDES[i] >= want);
+                let mut candidates = wide_enough.chain((0..5).filter(|&i| ICON_SIDES[i] < want));
+                if let Some(first) = candidates.find(|&i| present & (1 << i) != 0) {
+                    let mut odd = ICON_SIDES;
+                    odd[first] = 40;
+                    let all = choice(icon_decoding_all(want, loader(present, odd)));
+                    let one = choice(icon_decoding_one(want, loader(present, odd)));
+                    assert_eq!(one, all, "odd side, present {present:05b}, system size {want}");
+                }
+            }
+        }
+        // At 100 % with every icon: one image decoded, the 32 px one.
+        let decoded = Cell::new(0);
+        let one = icon_decoding_one(32, |p: &str| {
+            decoded.set(decoded.get() + 1);
+            let i = ICONS.iter().position(|&n| n == p)?;
+            Some(image(ICON_SIDES[i], 0))
+        });
+        assert_eq!((one.map(|i| i.width), decoded.get()), (Some(32), 1));
+    }
 
     #[test]
     fn default_window_is_centered_854_by_480() {

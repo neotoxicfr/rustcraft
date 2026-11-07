@@ -53,6 +53,10 @@ impl App {
         // Only what arrived before the frame: a flood of chunks does not delay it.
         profiler::push("scheduledPacketProcessing");
         let (t_recv, n_recv) = (Instant::now(), self.session.events.len());
+        // Event held back while the renderer was being built: first, the order stays the same.
+        if let Some(ev) = self.held_event.take() {
+            self.deliver(ev);
+        }
         for _ in 0..n_recv {
             let Ok(ev) = self.session.events.try_recv() else { break };
             self.deliver(ev);
@@ -66,6 +70,16 @@ impl App {
         }
         // Slot left by the mouse in a container or creative screen (`bundle.rs`).
         self.bundle_hover();
+        self.relight_then_schedule_meshing();
+        profiler::pop_push("mouse");
+        self.mouse_frame();
+        profiler::pop();
+        self.frame_after_meshing();
+    }
+
+    /// Light recomputed after the packets received, then the meshing of what changed (each frame,
+    /// and between the phases of the first renderer's build).
+    pub(crate) fn relight_then_schedule_meshing(&mut self) {
         // Light recomputed after the frame's packets, before the meshing (like the game).
         if !self.relight.is_empty() {
             let changes = std::mem::take(&mut self.relight);
@@ -93,9 +107,10 @@ impl App {
             }
         }
         self.schedule_meshing();
-        profiler::pop_push("mouse");
-        self.mouse_frame();
-        profiler::pop();
+    }
+
+    /// The frame in a world after the packets, the light and the meshing.
+    fn frame_after_meshing(&mut self) {
         let now = Instant::now();
         self.debug.on_frame(now, &self.session.link.stats);
         let elapsed = now.duration_since(self.last).as_secs_f64();

@@ -34,6 +34,11 @@ impl Log {
         Log { path: path.map(|p| game_dir.join(p)), world: None }
     }
 
+    /// A log was requested (`--quickPlayPath`).
+    pub fn enabled(&self) -> bool {
+        self.path.is_some()
+    }
+
     /// Game that opens (singleplayer world: folder and level name; server: address and name).
     pub fn set_world(&mut self, kind: Kind, id: &str, name: Option<&str>) {
         if self.path.is_some() {

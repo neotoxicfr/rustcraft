@@ -25,7 +25,7 @@ impl ApplicationHandler for App {
         launch::set_icon(&window, &self.assets);
         present_watch::set_window(&window);
         present_watch::enter(present_watch::Stage::Frame);
-        self.build_renderer(window);
+        self.build_renderer(window, crate::reload::RendererBuild::Startup);
         present_watch::leave();
     }
 

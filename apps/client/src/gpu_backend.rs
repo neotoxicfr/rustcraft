@@ -16,6 +16,13 @@
 //! announce that a restart is needed.
 //!
 //! `RUSTCRAFT_BACKEND=vulkan|dx12` forces a single API (comparisons, faulty drivers).
+//!
+//! The first API of the order is opened on a background thread while the resources load
+//! (`early_open.rs`, `RUSTCRAFT_OPT_EARLY_GPU_OPEN`); the window is attached when it exists.
+
+mod early_open;
+
+pub use early_open::EarlyGpuOpen;
 
 use std::sync::{Arc, OnceLock};
 use winit::window::Window;
@@ -34,13 +41,35 @@ pub fn startup_preference() -> &'static str {
     STARTUP_PREFERENCE.get().map_or("default", String::as_str)
 }
 
-/// Window surface and adapter retained (the surface keeps its instance alive).
-pub struct Picked {
+/// GPU context of the window: surface, adapter, device and queue (the surface keeps its instance
+/// alive). The renderer owns it and hands it back on a resource reload
+/// (`RUSTCRAFT_OPT_KEEP_GPU_ON_RELOAD`).
+pub struct GpuContext {
     pub surface: wgpu::Surface<'static>,
     pub adapter: wgpu::Adapter,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub text: GpuText,
+}
+
+/// Adapter retained on one API and its device, before any surface is attached.
+struct OpenedDevice {
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    text: GpuText,
+}
+
+impl OpenedDevice {
+    /// Software adapter (WARP, lavapipe): only a last resort.
+    fn is_software(&self) -> bool {
+        self.adapter.get_info().device_type == wgpu::DeviceType::Cpu
+    }
+
+    fn with_surface(self, surface: wgpu::Surface<'static>) -> GpuContext {
+        let OpenedDevice { adapter, device, queue, text } = self;
+        GpuContext { surface, adapter, device, queue, text }
+    }
 }
 
 /// Adapter described in the game's words, computed once at startup (F3 `system_specs`, system
@@ -214,16 +243,51 @@ fn open_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue), S
     .map_err(|e| e.to_string())
 }
 
+/// Name of an API in the "Tried" list of the error box.
+fn api_name(backends: wgpu::Backends) -> &'static str {
+    if backends == wgpu::Backends::DX12 { "DirectX 12" } else { "Vulkan" }
+}
+
+/// Instance of one API, with the startup milestones around the driver's loading.
+fn instance_with_marks(backends: wgpu::Backends) -> wgpu::Instance {
+    // Separates the window work before it (background, icon) from the loading of the driver.
+    crate::boot::mark("before GPU instance");
+    let inst = instance(backends);
+    crate::boot::mark(&format!("instance {}", api_name(backends)));
+    inst
+}
+
+/// Adapter of `inst` (compatible with `surface` when one is given) and its device. The error
+/// carries the stage that failed, as printed, and the reason for the "Tried" list.
+fn open_adapter_and_device(
+    inst: &wgpu::Instance,
+    surface: Option<&wgpu::Surface<'_>>,
+) -> Result<OpenedDevice, (&'static str, String)> {
+    let found = pollster::block_on(inst.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: surface,
+        force_fallback_adapter: false,
+        ..Default::default()
+    }));
+    let adapter = found.map_err(|e| ("no compatible adapter", e.to_string()))?;
+    crate::boot::mark("adapter");
+    // Like the game: the device is created in the same attempt; a failure notes the "Tried"
+    // line and moves on to the next API.
+    let (device, queue) = open_device(&adapter).map_err(|e| ("cannot create a device", e))?;
+    crate::boot::mark("GPU device");
+    let text = GpuText::new(&adapter.get_info(), vulkan_api_version(&adapter));
+    Ok(OpenedDevice { adapter, device, queue, text })
+}
+
 /// Hardware adapter (with its device) of the first API that offers one, otherwise the first software one found.
-pub fn pick(window: &Arc<Window>) -> Picked {
+pub fn pick(window: &Arc<Window>) -> GpuContext {
     install_log();
     let forced = rc_data::env_str!("RUSTCRAFT_BACKEND");
-    let mut software: Option<Picked> = None;
+    let mut software: Option<GpuContext> = None;
     let mut tried: Vec<(&str, String)> = Vec::new();
     for &backends in order(forced, startup_preference()) {
-        let inst = instance(backends);
-        let name = if backends == wgpu::Backends::DX12 { "DirectX 12" } else { "Vulkan" };
-        crate::boot::mark(&format!("instance {name}"));
+        let inst = instance_with_marks(backends);
+        let name = api_name(backends);
         let surface = match inst.create_surface(window.clone()) {
             Ok(s) => s,
             Err(e) => {
@@ -232,39 +296,19 @@ pub fn pick(window: &Arc<Window>) -> Picked {
                 continue;
             }
         };
-        let found = pollster::block_on(inst.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-            ..Default::default()
-        }));
-        let adapter = match found {
-            Ok(a) => a,
-            Err(e) => {
-                eprintln!("API {backends:?}: no compatible adapter");
-                tried.push((name, e.to_string()));
-                continue;
-            }
-        };
-        crate::boot::mark("adapter");
-        // Like the game: the device is created in the same attempt; a failure notes the "Tried"
-        // line and moves on to the next API.
-        let (device, queue) = match open_device(&adapter) {
-            Ok(dq) => dq,
-            Err(e) => {
-                eprintln!("API {backends:?}: cannot create a device");
+        let opened = match open_adapter_and_device(&inst, Some(&surface)) {
+            Ok(o) => o,
+            Err((stage, e)) => {
+                eprintln!("API {backends:?}: {stage}");
                 tried.push((name, e));
                 continue;
             }
         };
-        crate::boot::mark("GPU device");
-        let info = adapter.get_info();
-        let text = GpuText::new(&info, vulkan_api_version(&adapter));
-        if info.device_type != wgpu::DeviceType::Cpu {
-            return Picked { surface, adapter, device, queue, text };
+        if !opened.is_software() {
+            return opened.with_surface(surface);
         }
         if software.is_none() {
-            software = Some(Picked { surface, adapter, device, queue, text });
+            software = Some(opened.with_surface(surface));
         }
     }
     software.unwrap_or_else(|| {
