@@ -17,6 +17,7 @@ use crate::decor_data::DecorData;
 use crate::decor_region::{DecoChunk, Hm, Region};
 use crate::json::Json;
 use crate::sampler::{Ctx, Sid};
+use crate::structure_place::ProcLists;
 use crate::terrain::StructureDensity;
 use crate::terrain::{BiomeCache, TerrainGenerator, world_height};
 
@@ -27,6 +28,10 @@ pub struct WorldData {
     pub blocks: Arc<Blocks>,
     /// Structure templates (read on demand).
     pub templates: Arc<crate::template::Templates>,
+    /// Biome parameter lists already parsed, per preset (`RUSTCRAFT_OPT_SHARED_CLIMATE_LISTS`).
+    climate_lists: std::sync::Mutex<Vec<(String, ClimateList)>>,
+    /// Processor lists shared by every generator of these data (`RUSTCRAFT_OPT_SHARED_PROC_LISTS`).
+    proc_lists: std::sync::OnceLock<Arc<ProcLists>>,
 }
 
 impl std::fmt::Debug for WorldData {
@@ -47,7 +52,38 @@ impl WorldData {
         let blocks = Arc::new(Blocks::new(v, &decor)?);
         let templates =
             Arc::new(crate::template::Templates::for_world(decor.files_of("template"), &blocks, blocks_key(jar, v)));
-        Ok(WorldData { pack: Arc::new(pack), decor, blocks, templates })
+        Ok(WorldData {
+            pack: Arc::new(pack),
+            decor,
+            blocks,
+            templates,
+            climate_lists: Default::default(),
+            proc_lists: Default::default(),
+        })
+    }
+
+    /// Biome parameter list of a preset (report of the data generator): parsed once per world
+    /// data, then copied for each generator, which is far cheaper than parsing the report again.
+    fn climate_list(&self, preset: &str) -> Result<ClimateList, Error> {
+        if !crate::opt::shared_climate_lists() {
+            return ClimateList::from_report(&self.pack, preset);
+        }
+        let mut lists = self.climate_lists.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, list)) = lists.iter().find(|(p, _)| p == preset) {
+            return Ok(list.clone());
+        }
+        let list = ClimateList::from_report(&self.pack, preset)?;
+        lists.push((preset.to_owned(), list.clone()));
+        Ok(list)
+    }
+
+    /// Processor lists of the data, analysed on demand: one table shared by every decorator and
+    /// structure generator of these data (old path: a new table for each).
+    pub fn proc_lists(&self) -> Arc<ProcLists> {
+        if !crate::opt::shared_proc_lists() {
+            return Arc::new(ProcLists::new(&self.decor));
+        }
+        self.proc_lists.get_or_init(|| Arc::new(ProcLists::new(&self.decor))).clone()
     }
 
     /// Data shared by all the users of the same jar in the process (dimension generators,
@@ -227,6 +263,25 @@ fn param_distance((min, max): (i64, i64), v: i64) -> i64 {
     if above > 0 { above } else { (min - v).max(0) }
 }
 
+/// Points visited by one spiral of the spawn search around `origin`: rings of `step` blocks up
+/// to `max_r`, the angle advancing by `step / radius` (single precision, like the game).
+fn spawn_spiral(origin: (i32, i32), max_r: f32, step: f32) -> Vec<(i32, i32)> {
+    let mut points = Vec::new();
+    let mut angle = 0.0f32;
+    let mut radius = step;
+    while radius <= max_r {
+        let x = origin.0 + (crate::jmath::sin(f64::from(angle)) * f64::from(radius)) as i32;
+        let z = origin.1 + (crate::jmath::cos(f64::from(angle)) * f64::from(radius)) as i32;
+        points.push((x, z));
+        angle += step / radius;
+        if f64::from(angle) > std::f64::consts::PI * 2.0 {
+            angle = 0.0;
+            radius += step;
+        }
+    }
+    points
+}
+
 fn parse_param(j: &Json) -> Option<(i64, i64)> {
     match j {
         Json::Arr(a) if a.len() == 2 => Some((quantize(a[0].as_f32()?), quantize(a[1].as_f32()?))),
@@ -247,7 +302,7 @@ impl DimGen {
         match spec {
             GenSpec::Noise { settings, source } => {
                 let src = match source {
-                    SourceSpec::MultiNoise(p) => BiomeSource::MultiNoise(ClimateList::from_report(&w.pack, p)?),
+                    SourceSpec::MultiNoise(p) => BiomeSource::MultiNoise(w.climate_list(p)?),
                     SourceSpec::TheEnd => BiomeSource::TheEnd,
                     SourceSpec::Fixed(b) => BiomeSource::Fixed(full_id(b)),
                     SourceSpec::Checkerboard { biomes, scale } => {
@@ -267,7 +322,7 @@ impl DimGen {
                 let biome_names = t.biome_names.clone();
                 let mut deco = Decorator::new(&w.decor, &w.blocks, &biome_names, seed)?;
                 deco.templates = Some(w.templates.clone());
-                deco.procs = Some(Arc::new(crate::structure_place::ProcLists::new(&w.decor)));
+                deco.procs = Some(w.proc_lists());
                 let s = &t.g.settings;
                 let (sea_level, gen_min_y, gen_depth) = (s.sea_level, s.min_y, s.height);
                 Ok(DimGen {
@@ -360,9 +415,13 @@ impl DimGen {
     }
 
     fn spawn_targets(pack: &DataPack, settings: &str, t: &mut TerrainGenerator) -> Result<Vec<SpawnTarget>, Error> {
-        let j = pack.json("noise_settings", settings)?;
+        let targets = if crate::opt::noise_settings_read_once() {
+            t.g.settings.spawn_target.clone()
+        } else {
+            pack.json("noise_settings", settings)?.get("spawn_target").cloned()
+        };
         let mut out = Vec::new();
-        for point in j.get("spawn_target").and_then(Json::as_array).unwrap_or(&[]) {
+        for point in targets.as_ref().and_then(Json::as_array).unwrap_or(&[]) {
             let Json::Obj(m) = point else { continue };
             let mut v = Vec::new();
             for (id, p) in m {
@@ -403,7 +462,7 @@ impl DimGen {
                 )?));
                 if let Some(d) = self.deco.as_mut().and_then(Arc::get_mut) {
                     d.templates = Some(w.templates.clone());
-                    d.procs = Some(Arc::new(crate::structure_place::ProcLists::new(&w.decor)));
+                    d.procs = Some(w.proc_lists());
                 }
                 Some(spec.structure_overrides.clone())
             }
@@ -413,6 +472,7 @@ impl DimGen {
             &w.decor,
             &w.blocks,
             w.templates.clone(),
+            w.proc_lists(),
             &self.biome_names,
             self.seed,
             flat.is_some(),
@@ -731,22 +791,21 @@ impl DimGen {
             let bias = i64::from(x) * i64::from(x) + i64::from(z) * i64::from(z);
             best.wrapping_mul(2048 * 2048).wrapping_add(bias)
         };
+        let parallel = crate::opt::parallel_spawn_search();
         let mut best = ((0, 0), fitness(0, 0));
         for (max_r, step) in [(2048.0f32, 512.0f32), (512.0, 32.0)] {
-            let origin = best.0;
-            let mut angle = 0.0f32;
-            let mut radius = step;
-            while radius <= max_r {
-                let x = origin.0 + (crate::jmath::sin(f64::from(angle)) * f64::from(radius)) as i32;
-                let z = origin.1 + (crate::jmath::cos(f64::from(angle)) * f64::from(radius)) as i32;
-                let f = fitness(x, z);
+            let points = spawn_spiral(best.0, max_r, step);
+            // The points of a spiral do not depend on the scores: they can all be scored at once,
+            // the strict comparison in spiral order below keeps the first best one either way.
+            let scores: Vec<i64> = if parallel {
+                use rayon::prelude::*;
+                points.par_iter().map(|&(x, z)| fitness(x, z)).collect()
+            } else {
+                points.iter().map(|&(x, z)| fitness(x, z)).collect()
+            };
+            for (p, f) in points.into_iter().zip(scores) {
                 if f < best.1 {
-                    best = ((x, z), f);
-                }
-                angle += step / radius;
-                if f64::from(angle) > std::f64::consts::PI * 2.0 {
-                    angle = 0.0;
-                    radius += step;
+                    best = (p, f);
                 }
             }
         }
@@ -776,6 +835,10 @@ fn retro_reject_starts(refs: &mut [(usize, Vec<crate::structure::Start>)], cente
         });
     }
 }
+
+#[cfg(test)]
+#[path = "generator_sharing_tests.rs"]
+mod generator_sharing_tests;
 
 #[cfg(test)]
 mod tests {

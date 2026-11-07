@@ -6051,4 +6051,119 @@ Not applicable: multi-core (the light pool is unchanged, the shared sheets are r
 (the light upload reads the same bytes), disk and network bytes (identical). To settle on the
 quiet-machine scene bench: `plains12`, `plains32`, `cave`, `forest`, `redstone` (memstats line
 "server: … light X MB (N layers)", client `Column::heap_bytes`, light ms per chunk, tick p99).
+## C1-M03: one generator per dimension, shared setup, spawn search generator handed to the server (06/11, loaded machine)
+
+Before: up to four generators per dimension (generation thread, `/locate`, `/place`, `/place
+structure`), the last three rebuilt at every dimension trip, each one on the server thread (the
+tick it froze); the template and structure blocks built a whole generator to read the generation
+data; the world creation's spawn search built a generator, threw it away, and the server built it
+again (the generation data released in between). Every path behind its switch, default new, `=0`
+old:
+
+- rc-sim (`command_generators.rs`): `RUSTCRAFT_OPT_COMMAND_WORLD_DATA_ONLY` (template and structure
+  blocks take the generation data alone); `RUSTCRAFT_OPT_ONE_COMMAND_GENERATOR` (one generator per
+  dimension and structure setting for the session: one in a world with structures, two without, the
+  second for `/place structure` and the jigsaw block); `RUSTCRAFT_OPT_SHARE_WORKER_GENERATOR` (the
+  commands use the generation thread's generator, published once built, waited for while it is
+  being built, released whatever ends the thread); `RUSTCRAFT_OPT_KEEP_NEW_WORLD_DATA` (the creation
+  reads its preset from the shared generation data and keeps them until the server takes them);
+  `RUSTCRAFT_OPT_REUSE_SPAWN_GENERATOR` (the spawn search's generator becomes the server's main world
+  generator: "generator ready in 0 ms" on a world just created, rings already computed);
+  `RUSTCRAFT_OPT_EARLY_GENERATOR_START` (the generation thread starts right after the world's files
+  are read, the biome registry sent once the registries are loaded: it is only needed after "ready").
+- rc-worldgen (`opt.rs`): `RUSTCRAFT_OPT_SHARED_GENERATOR_DEFS` (density functions and noises parsed
+  once per data pack), `RUSTCRAFT_OPT_SHARED_CLIMATE_LISTS` (biome parameter list parsed once per
+  preset, copied for each generator), `RUSTCRAFT_OPT_SHARED_PROC_LISTS` (one processor list table per
+  world data for every decorator and structure generator), `RUSTCRAFT_OPT_NOISE_SETTINGS_READ_ONCE`
+  (spawn targets read from the parsed settings), `RUSTCRAFT_OPT_NOISE_LOOKUP_BEFORE_CLONE`,
+  `RUSTCRAFT_OPT_PARALLEL_SPAWN_SEARCH` (points of a spiral scored on every core, picked in spiral
+  order).
+
+Generator setup, step by step (`chunkgen::generator_sharing_tests::bench_generator_setup`, min /
+median of 5, main world, loaded machine): density functions and noises 1.3 ms (not the hot spot the
+audit expected); noise settings 0.0; biome parameter list from the report 48.4 / 51.6 ms (THE hot
+spot), its copy 0.8 / 1.6; processor lists 0.3; decorator 8.3 / 9.0. Whole generator, sharing off
+74.3 / 119.5 ms, on 12.2 / 12.7 ms (second generator of the same data and later); with structures
+103.7 / 113.2 → 12.7 / 12.9 ms. Spawn search 3.5 ms on one core either way, 0.8 ms on 32 threads.
+Stronghold rings (first computation) 575 ms on 1 thread, 34.7 ms on 32 threads: the
+`RUSTCRAFT_OPT_RINGS_BG` question (rings after the first batch rather than before "ready") stays for
+the quiet-machine scenes `generation` and `crowd`; with the spawn generator handed over, a new world
+no longer pays it at opening at all.
+
+Server thread time of the first `/locate`, `/place feature` and `/place structure` of a session
+(`command_generators::tests::bench_first_command_generators`, world with structures, median of 3,
+loaded machine), generator setup of before (`SHARED_*`, `NOISE_*`, `PARALLEL_SPAWN_SEARCH` at 0):
+old path 36.2 + 35.4 + 34.7 ms; one private generator 35.1 + 0 + 0; the generation thread's 0 + 0.4
++ 0 (the 0.4 ms: the generation data looked up once). Same with the shared setup: old 12.6 + 11.9 +
+12.4, one private 12.4 + 0 + 0, the thread's 0 + 0.8 + 0. A dimension trip no longer rebuilds them.
+
+World creation then opening (`bench_new_world_opening`, median of 3 per pass, four passes in one
+sitting alternating the shared setup on / off / on / off, loaded machine; "ready" = the main world
+generator ready, from the start of the opening; figures of pass 1 and 3 against 2 and 4). A first
+pair of runs taken hours apart (52.7 against 135.9 ms even in the case the sharing cannot touch)
+was not comparable and is replaced by this one:
+
+| Generator ready / opening | nothing kept, late start | nothing kept, early start | data kept | data and generator kept |
+|---|---|---|---|---|
+| shared setup (passes 1, 3) | 113.5, 112.5 / 42.3, 40.4 ms | 89.4, 90.0 / 33.4, 35.5 | 55.0, 55.9 / 52.5, 48.9 | 31.7, 54.8 / same |
+| setup of before (passes 2, 4) | 115.4, 116.2 / 42.6, 44.4 ms | 88.9, 93.0 / 33.1, 36.1 | 81.5, 82.5 / 33.4, 33.1 | 55.1, 56.4 / same |
+
+Reading: with nothing kept the server's generator is the first one built from its generation data,
+so it parses the biome list either way (no gain, as expected); the early start wins 23-26 ms; with
+the data kept, the spawn search already parsed the list and the server's generator copies it (82 →
+55 ms); with the generator kept, it is ready when the opening ends (31.7-56.4 ms, within the noise
+of the load). The creation itself (148-205 ms) is within that noise across cases.
+
+- Fidelity (A3): one difference, towards the game. A scattered structure piece (desert or jungle
+  temple, swamp hut) keeps the height it measured at its first placement. Shared, a search reads the
+  piece the generation thread placed: an exploration map that references such a start while its
+  chunk is still a proto-chunk in memory writes the measured height (`HPos` 68 in the test) where a
+  private generator wrote −1. The game holds one start object per chunk: its map search loads the
+  chunk up to the structure starts status and reads that object, the same one the placement
+  modified (checked in the 26.3 code). In a flat world with structures, `/place feature` and bone
+  meal now use the decorator that has the templates and processor lists (the generation thread's),
+  where the old `/place` generator had none (fossils and template features failed there; the game
+  places them).
+- Fidelity (A3), second difference, towards the game: with `RUSTCRAFT_OPT_REUSE_SPAWN_GENERATOR`
+  the server keeps the spawn search's generator with the state its template pieces gained. A
+  shipwreck (beached or on the ocean floor) measures its height once, then keeps it (adjusted flag
+  and Y). Our piece NBT writes `TPY` but not `height_adjusted`, and nothing reads the flag back, so
+  a fresh generator (old path) facing a shipwreck that straddles a chunk decorated by the spawn
+  search and a neighbour decorated later by the server measures again on the neighbour's region:
+  the Y may change and the wreck is cut in two. Reused, the first Y stays, as in the game, which
+  writes and reads `height_adjusted` with the piece (checked in the 26.3 code). The same gap
+  already exists on the old code at every restart (an earlier fidelity gap, out of this mission):
+  writing `height_adjusted` with the piece and reading it back at load, as `restore_scattered` does
+  for `HPos`, makes the reuse identical to the old path and the restart faithful.
+- Identity (A1) limit: `fingerprint_new_world` proves the reuse on its one seed only; the
+  shipwreck case above is not covered by it.
+- Equivalence: `generator_sharing_tests` (programs of every noise setting of the jar for 3 seeds,
+  shared definitions against parsed again, second user included; processor lists one by one; biome
+  lists; main world, Nether, End and flat generators all sharing on against all off: program,
+  biomes, spawn chunk, terrain, structure starts of 256 chunks; spawn search parallel = sequential =
+  the loop as written before = stored chunks); `command_generators_tests` (one generator per
+  dimension and setting, kept across a dimension trip; 20 structure searches identical shared,
+  private and with the thread busy with a batch; structure starts of 10 structures × 4 chunks
+  assembled identically; the measured height above; the spawn generator taken by the server);
+  `fingerprint_new_world`, `all_regions*`, `EXPECTED_STARTS`, `exploration_maps_reference_each_start_once`.
+  Sabotages, each detected: biome list of another preset, a score shifted by one point in the
+  parallel spawn search, a noise factor × 1.0001 in the shared definitions (one ulp in f64 is not:
+  the factor is used in f32), the commands never given the thread's generator (5 failures, the
+  measured height among them), the spawn search handing over a generator without structures
+  (`fingerprint_new_world` changes). Two live worlds cannot be compared block for block for `/place`
+  (a test's world randomness follows its thread: 214,438 against 214,439 solid blocks with the same
+  switches), hence the proof on the assembled starts.
+- Not done: the decorator split into seed and seed-free parts (8 ms per private generator, which are
+  now rare; its types are not cloneable), the terrain of the next 8 spiral chunks of the spawn search
+  in advance (it would write other chunks into the new world's regions), the preload of a world at
+  its selection in the list (client side), `level.dat` and the world settings read once (< 1 ms),
+  the region copy filled only past the live sections (a truncated packed section would map its
+  unwritten slots differently).
+- To measure on the quiet machine: scenes "first use" (C1-M01: tick max at the first `/locate`,
+  bone meal, sapling, eye of Ender, after a Nether trip), `world-create`, `world-list`, `generation`
+  (world opening, generator ready, first batch), `crowd`, `plains12`, `fresh-village-rd16`; memstats
+  with 1 to 3 generators fewer. Still open until then: no other scene has run (C5, partial) and no
+  memory figure is taken (C2, partial), while the generation data and generator of a new world are
+  kept until the server takes them and a private generator per visited dimension stays for the
+  session (one per dimension and structure setting).
 

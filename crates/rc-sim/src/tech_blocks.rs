@@ -719,7 +719,7 @@ impl Server {
         to_disk: bool,
         skip_air: bool,
     ) -> bool {
-        let Some((wd, _)) = self.place_data() else { return false };
+        let Some(wd) = self.template_data() else { return false };
         let mut entry = match self.template_get(id) {
             Some(e) => e,
             None => {
@@ -884,7 +884,7 @@ impl Server {
     /// chosen packs: the top pack holding the file (`data/<ns>/structure/<path>.nbt`), the game's
     /// base pack last.
     fn template_load(&mut self, id: &str) -> Option<Tpl> {
-        let (wd, _) = self.place_data()?;
+        let wd = self.template_data()?;
         let world = template_file(&self.world, id)
             .and_then(|f| crate::nbtio::read_dat(&f).ok())
             .and_then(|root| Template::parse(&root, &wd.blocks).ok())
@@ -1110,7 +1110,7 @@ impl Server {
     /// loaded (fresh loot seed for the containers), waterlogging and its filling, edge shape
     /// pass, shape and neighbour updates, entities. `false` if nothing can be placed.
     pub(crate) fn place_template_live(&mut self, t: &Template, pos: P, s: &LivePlace, flags: u32) -> bool {
-        let Some((wd, _)) = self.place_data() else { return false };
+        let Some(wd) = self.template_data() else { return false };
         place_live(self, t, &wd.templates.transforms, &wd.blocks, pos, s, flags)
     }
 }

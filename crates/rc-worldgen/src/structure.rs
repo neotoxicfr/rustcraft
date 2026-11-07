@@ -286,7 +286,7 @@ pub struct StructureGen {
     /// Structures per step (registry order).
     pub by_step: Vec<Vec<usize>>,
     pub flat: bool,
-    pub procs: crate::structure_place::ProcLists,
+    pub procs: Arc<crate::structure_place::ProcLists>,
     /// Biomes where mineshafts are not placed.
     pub mineshaft_blocking: Vec<bool>,
     /// Decorator (biome temperature: "cold" portals).
@@ -399,11 +399,12 @@ fn reducer(j: &Json) -> Reducer {
 }
 
 impl StructureGen {
-    /// `flat`: flat world (ring seed zero).
+    /// `flat`: flat world (ring seed zero); `procs`: processor lists of the data (shared table).
     pub fn new(
         d: &DecorData,
         b: &Blocks,
         templates: Arc<Templates>,
+        procs: Arc<crate::structure_place::ProcLists>,
         biome_names: &[String],
         seed: i64,
         flat: bool,
@@ -528,7 +529,7 @@ impl StructureGen {
             starts_clears: AtomicUsize::new(0),
             by_step,
             flat,
-            procs: crate::structure_place::ProcLists::new(d),
+            procs,
             mineshaft_blocking: biome_set(d, Some(&Json::Str("#minecraft:mineshaft_blocking".into())), biome_names),
             deco: None,
             villager_types: villager_types(biome_names),

@@ -134,8 +134,13 @@ pub fn create_world(dir: &Path, data: &Arc<VersionData>, w: &NewWorld) -> Result
         return Err(Error::Refused(format!("{}: a world already exists", dir.display())));
     }
     let jar = crate::registries::client_jar(data).ok_or_else(|| Error::Refused("game jar not found".into()))?;
-    let pack = rc_worldgen::data::DataPack::from_jar(&jar).map_err(|e| Error::Format(e.to_string()))?;
-    let preset = pack.json("world_preset", w.preset.id()).map_err(|e| Error::Format(e.to_string()))?;
+    // Held until the server of this world takes them: the spawn search and the server find them again.
+    let world_data = kept_world_data(&jar, data);
+    let preset = match &world_data {
+        Some(wd) => wd.pack.json("world_preset", w.preset.id()),
+        None => rc_worldgen::data::DataPack::from_jar(&jar).and_then(|pack| pack.json("world_preset", w.preset.id())),
+    }
+    .map_err(|e| Error::Format(e.to_string()))?;
     let mut dims = match preset.get("dimensions").map(json_to_nbt) {
         Some(d @ Nbt::Compound(_)) => d,
         _ => return Err(Error::Format("preset without dimensions".into())),
@@ -193,11 +198,39 @@ pub fn create_world(dir: &Path, data: &Arc<VersionData>, w: &NewWorld) -> Result
         write_dat(&data_dir.join("game_rules.dat"), &rules)?;
     }
     let spawn = match spec {
-        Some(GenSpec::Debug) | None => [0, 80, 0],
+        Some(GenSpec::Debug) => {
+            if let Some(wd) = world_data {
+                keep_new_world(dir, GenSpec::Debug, w.seed, wd, None);
+            }
+            [0, 80, 0]
+        }
+        None => [0, 80, 0],
         Some(spec) => find_spawn(dir, data, &jar, spec, w.seed, w.bonus_chest)?,
     };
     write_dat(&dir.join("level.dat"), &level_dat(w, spawn, debug))?;
     Ok(())
+}
+
+/// Generation data kept from the creation of a world to its opening
+/// (`RUSTCRAFT_OPT_KEEP_NEW_WORLD_DATA`); `None`: switch off or data unreadable (the old path then
+/// reports the error where it always did).
+fn kept_world_data(jar: &Path, data: &VersionData) -> Option<Arc<rc_worldgen::chunkgen::WorldData>> {
+    if !crate::generation::command_generators::keep_new_world_data() {
+        return None;
+    }
+    let reports = crate::generation::reports_dir(data);
+    rc_worldgen::chunkgen::WorldData::shared(jar, reports.is_dir().then_some(reports.as_path()), data).ok()
+}
+
+/// Leaves the main world's generation data (and generator) for the server that opens the world.
+fn keep_new_world(
+    dir: &Path,
+    spec: GenSpec,
+    seed: i64,
+    wd: Arc<rc_worldgen::chunkgen::WorldData>,
+    generator: Option<crate::generation::command_generators::BuiltGenerator>,
+) {
+    crate::generation::command_generators::keep_new_world(dir, "minecraft:overworld", spec, seed, wd, generator);
 }
 
 /// Instant when a new clock (at 0) reaches the marker `marker` of a jar timeline, as
@@ -311,6 +344,7 @@ fn find_spawn(
     let dimension = "minecraft:overworld";
     let height = crate::dimension_height(data, dimension);
     let (tx, rx) = crossbeam_channel::unbounded();
+    let kept_spec = spec.clone();
     let setup = Setup {
         data: data.clone(),
         world: dir.to_owned(),
@@ -381,6 +415,11 @@ fn find_spawn(
     }
     for (_, f) in files {
         f.close().map_err(|e| Error::io(&region_dir, e))?;
+    }
+    if crate::generation::command_generators::keep_new_world_data() {
+        let (wd, built) = w.into_generator();
+        let reuse = crate::generation::command_generators::reuse_spawn_generator();
+        keep_new_world(dir, kept_spec, seed, wd, reuse.then_some(built));
     }
     Ok(spawn)
 }
