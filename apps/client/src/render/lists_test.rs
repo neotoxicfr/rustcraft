@@ -205,7 +205,7 @@ fn draw_lists_match_the_old_build_along_a_trajectory() {
         }
         let (eye, yaw, pitch) = camera(f);
         let (origin, pl) = planes(eye, yaw, pitch, 12.0 * 16.0);
-        let inp = ListIn {
+        let input = ListIn {
             columns: &cols,
             reached: &reached,
             planes: &pl,
@@ -218,8 +218,8 @@ fn draw_lists_match_the_old_build_along_a_trajectory() {
             reached_gen: rgen,
             columns_rev: rev,
         };
-        let a = build(&inp, &mut old, ListPaths::OLD, || {});
-        let b = build(&inp, &mut new, ListPaths { cached_order: true, ..ListPaths::OLD }, || {});
+        let a = build(&input, &mut old, ListPaths::OLD, || {});
+        let b = build(&input, &mut new, ListPaths { cached_order: true, ..ListPaths::OLD }, || {});
         hits += usize::from(new.order_key == Some((rgen, origin, rev)));
         let (ia, ib) = (image_bytes(&old, a), image_bytes(&new, b));
         assert!(ia == ib, "frame {f}: lists differ (eye {eye:?}, yaw {yaw}, pitch {pitch})");
@@ -470,13 +470,13 @@ fn pools() -> HashMap<usize, rayon::ThreadPool> {
 fn build_on(
     pools: &HashMap<usize, rayon::ThreadPool>,
     threads: Option<usize>,
-    inp: &ListIn<'_>,
+    input: &ListIn<'_>,
     l: &mut Lists,
     p: ListPaths,
 ) -> (usize, u64) {
     match threads {
-        Some(t) => pools[&t].install(|| build(inp, l, p, || {})),
-        None => build(inp, l, p, || {}),
+        Some(t) => pools[&t].install(|| build(input, l, p, || {})),
+        None => build(input, l, p, || {}),
     }
 }
 
@@ -488,9 +488,9 @@ fn along_scripted_cameras(mut on_frame: impl FnMut(u32, &ListIn<'_>, &[u8])) {
         let (eye, yaw, pitch, far) = scripted_camera(f);
         world.step(f, (eye[0].floor() as i32 >> 4, eye[2].floor() as i32 >> 4));
         let (origin, pl) = planes(eye, yaw, pitch, far);
-        let inp = world.input(&pl, origin, eye);
-        let drawn = build(&inp, &mut reference, ListPaths::OLD, || {});
-        on_frame(f, &inp, &image_bytes(&reference, drawn));
+        let input = world.input(&pl, origin, eye);
+        let drawn = build(&input, &mut reference, ListPaths::OLD, || {});
+        on_frame(f, &input, &image_bytes(&reference, drawn));
     }
 }
 
@@ -502,10 +502,10 @@ fn every_path_matches_the_old_build_along_scripted_cameras() {
     let pools = pools();
     let mut compared: Vec<(Compared, Lists)> = compared_paths().into_iter().map(|c| (c, Lists::default())).collect();
     let (mut reused, mut rebuilt, mut drawn_frames) = (0, 0, 0);
-    along_scripted_cameras(|f, inp, want| {
+    along_scripted_cameras(|f, input, want| {
         drawn_frames += usize::from(want.len() > 64);
         for ((name, paths, threads), lists) in &mut compared {
-            let drawn = build_on(&pools, *threads, inp, lists, *paths);
+            let drawn = build_on(&pools, *threads, input, lists, *paths);
             assert!(image_bytes(lists, drawn) == want, "frame {f}: path {name} ({threads:?} threads) differs");
             if *paths == ALL_SERIAL && f < 150 {
                 let (r, b) = lists.column_command_reuse();
@@ -540,9 +540,9 @@ fn sabotaged_paths_are_caught() {
         .into_iter()
         .map(|(s, p, t)| (s, ListPaths { sabotage: Some(s), ..p }, t, Lists::default(), 0))
         .collect();
-    along_scripted_cameras(|_, inp, want| {
+    along_scripted_cameras(|_, input, want| {
         for (_, paths, threads, lists, differs) in &mut runs {
-            let drawn = build_on(&pools, *threads, inp, lists, *paths);
+            let drawn = build_on(&pools, *threads, input, lists, *paths);
             *differs += u32::from(image_bytes(lists, drawn) != want);
         }
     });
@@ -740,7 +740,7 @@ fn meshing_view_holds_the_drawn_runs() {
         let ((eye, yaw, pitch), far) =
             if f < 200 { (camera(f), 4.0 * 12.0 * 16.0) } else { (([0.5, 900.0, 0.5], f as f32, 89.0), 2000.0) };
         let (origin, pl) = planes(eye, yaw, pitch, far);
-        let inp = ListIn {
+        let input = ListIn {
             columns: &cols,
             reached: &reached,
             planes: &pl,
@@ -757,7 +757,7 @@ fn meshing_view_holds_the_drawn_runs() {
         for secs in reached.chunk_by(|a, b| (a.0, a.2) == (b.0, b.2)) {
             let k = (secs[0].0, secs[0].2);
             runs.clear();
-            column_runs(&inp, k, secs, &mut runs);
+            column_runs(&input, k, secs, &mut runs);
             let mut drawn = Sections::default();
             runs.iter().flat_map(Range::clone).for_each(|s| drawn.insert(s as i32));
             let seen = view.sections_in_view(k, secs);
@@ -943,7 +943,7 @@ fn bench_motion(
         let s = f64::from(f) * motion.speed;
         let eye = [0.5 + s, 70.0, 0.5 + s * 0.3];
         let (origin, pl) = planes(eye, f as f32 * 0.9, 10.0, r as f32 * 16.0);
-        let inp = ListIn {
+        let input = ListIn {
             columns: cols,
             reached,
             planes: &pl,
@@ -960,7 +960,7 @@ fn bench_motion(
             std::thread::sleep(pause);
         }
         let t = std::time::Instant::now();
-        std::hint::black_box(build_on(pools, *threads, &inp, &mut l, *p));
+        std::hint::black_box(build_on(pools, *threads, &input, &mut l, *p));
         spent += t.elapsed();
         let (a, b) = l.column_command_reuse();
         (reused, rebuilt) = (reused + a, rebuilt + b);
@@ -981,7 +981,7 @@ fn lists_phase_bench() {
         for f in 0..400u32 {
             let eye = [0.5, 70.0, 0.5];
             let (origin, pl) = planes(eye, f as f32 * 0.9, 10.0, 32.0 * 16.0);
-            let inp = ListIn {
+            let input = ListIn {
                 columns: &cols,
                 reached: &reached,
                 planes: &pl,
@@ -995,10 +995,10 @@ fn lists_phase_bench() {
                 columns_rev: 1,
             };
             let t = std::time::Instant::now();
-            std::hint::black_box(build(&inp, &mut whole, paths, || {}));
+            std::hint::black_box(build(&input, &mut whole, paths, || {}));
             t_whole += t.elapsed();
             let t = std::time::Instant::now();
-            std::hint::black_box(select_visible(&inp, &mut selection, paths).len());
+            std::hint::black_box(select_visible(&input, &mut selection, paths).len());
             t_selection += t.elapsed();
         }
         let us = |d: std::time::Duration| d.as_secs_f64() * 1e6 / 400.0;

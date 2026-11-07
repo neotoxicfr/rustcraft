@@ -278,9 +278,9 @@ struct PieceScratch {
 /// Builds the runs, batches and commands of the frame; returns (columns, faces) drawn. `ordered`:
 /// called once the column order is fixed (end of the "visibility" measurement). With a parallel
 /// path, the tasks run on the current rayon pool.
-pub(super) fn build(inp: &ListIn<'_>, out: &mut Lists, paths: ListPaths, ordered: impl FnOnce()) -> (usize, u64) {
+pub(super) fn build(input: &ListIn<'_>, out: &mut Lists, paths: ListPaths, ordered: impl FnOnce()) -> (usize, u64) {
     let mut scratch = if paths.reuse_buffers { std::mem::take(&mut out.scratch) } else { ListScratch::default() };
-    let visible = select_visible(inp, out, paths);
+    let visible = select_visible(input, out, paths);
     ordered();
     let ListScratch { ranks, rank_starts, near, far, facings, pieces, slots } = &mut scratch;
     if paths.cached_order {
@@ -291,7 +291,7 @@ pub(super) fn build(inp: &ListIn<'_>, out: &mut Lists, paths: ListPaths, ordered
     far.clear();
     far.extend(0..visible.len());
     facings.clear();
-    facings.extend(visible.iter().map(|v| facing(inp.eye, v.key, inp.min_y)));
+    facings.extend(visible.iter().map(|v| facing(input.eye, v.key, input.min_y)));
     out.batches.clear();
     out.args.clear();
     let em = Emission {
@@ -300,9 +300,9 @@ pub(super) fn build(inp: &ListIn<'_>, out: &mut Lists, paths: ListPaths, ordered
         facings,
         near,
         far,
-        eye_height: inp.eye[1] - f64::from(inp.min_y),
-        face_vertices: inp.face_vertices,
-        split_draws: inp.split_draws,
+        eye_height: input.eye[1] - f64::from(input.min_y),
+        face_vertices: input.face_vertices,
+        split_draws: input.split_draws,
         merged_translucent: paths.cached_order,
     };
     let faces = if paths.column_commands {
@@ -323,39 +323,39 @@ pub(super) fn build(inp: &ListIn<'_>, out: &mut Lists, paths: ListPaths, ordered
 }
 
 /// Visible columns from farthest to nearest, their runs written into `out.runs`.
-fn select_visible<'a>(inp: &ListIn<'a>, out: &mut Lists, paths: ListPaths) -> Vec<VisibleColumn<'a>> {
+fn select_visible<'a>(input: &ListIn<'a>, out: &mut Lists, paths: ListPaths) -> Vec<VisibleColumn<'a>> {
     out.runs.clear();
-    let culling = ColumnCulling::new(inp, paths);
-    let key = (inp.reached_gen, inp.origin, inp.columns_rev);
+    let culling = ColumnCulling::new(input, paths);
+    let key = (input.reached_gen, input.origin, input.columns_rev);
     // Order of all the candidates kept only when the key repeats (rotation in place,
     // slow walk): an origin that changes every frame (fast flight) would redo it for nothing.
     let cached = paths.cached_order && (out.order_key == Some(key) || out.seen_key.replace(key) == Some(key));
     if !cached {
-        return sorted_visible(inp, &culling, &mut out.runs);
+        return sorted_visible(input, &culling, &mut out.runs);
     }
-    refresh_order(inp, out, key);
+    refresh_order(input, out, key);
     match paths.column_slices {
-        Some(slice) => select_in_slices(inp, &culling, &out.order, &mut out.plane_hints, slice, &mut out.runs),
-        None => select_in_order(inp, &culling, &out.order, &mut out.plane_hints, &mut out.runs),
+        Some(slice) => select_in_slices(input, &culling, &out.order, &mut out.plane_hints, slice, &mut out.runs),
+        None => select_in_order(input, &culling, &out.order, &mut out.plane_hints, &mut out.runs),
     }
 }
 
 /// Candidates of `order` whose runs are not empty, in that order.
 fn select_in_order<'a>(
-    inp: &ListIn<'a>,
+    input: &ListIn<'a>,
     culling: &ColumnCulling<'_>,
     order: &[OrderedColumn],
     hints: &mut [u8],
     runs: &mut Vec<Range<usize>>,
 ) -> Vec<VisibleColumn<'a>> {
-    let mut regions = RegionVerdicts::new(inp.origin);
+    let mut regions = RegionVerdicts::new(input.origin);
     let mut visible = Vec::new();
     for (c, hint) in order.iter().zip(hints) {
         let first = runs.len();
-        culling.column_runs(&mut regions, c.key, &inp.reached[c.first as usize..c.end as usize], hint, runs);
+        culling.column_runs(&mut regions, c.key, &input.reached[c.first as usize..c.end as usize], hint, runs);
         if runs.len() > first {
             // Present: the order keeps only the loaded columns.
-            visible.push(VisibleColumn { column: &inp.columns[&c.key], key: c.key, runs: first..runs.len() });
+            visible.push(VisibleColumn { column: &input.columns[&c.key], key: c.key, runs: first..runs.len() });
         }
     }
     visible
@@ -364,7 +364,7 @@ fn select_in_order<'a>(
 /// [`select_in_order`] on slices of `slice` candidates as parallel tasks, then put end to end
 /// (the runs of each slice shifted to their place in `runs`).
 fn select_in_slices<'a>(
-    inp: &ListIn<'a>,
+    input: &ListIn<'a>,
     culling: &ColumnCulling<'_>,
     order: &[OrderedColumn],
     hints: &mut [u8],
@@ -377,7 +377,7 @@ fn select_in_slices<'a>(
         .zip(hints.par_chunks_mut(slice))
         .map(|(order, hints)| {
             let mut part_runs = Vec::new();
-            let visible = select_in_order(inp, culling, order, hints, &mut part_runs);
+            let visible = select_in_order(input, culling, order, hints, &mut part_runs);
             (part_runs, visible)
         })
         .collect();
@@ -404,20 +404,20 @@ fn section_dist(sy: usize, ey: f64) -> f64 {
 /// Visible columns (runs added to `runs`) from farthest to nearest; at equal distance,
 /// fixed order of the coordinates (stable image from one run to the next).
 fn sorted_visible<'a>(
-    inp: &ListIn<'a>,
+    input: &ListIn<'a>,
     culling: &ColumnCulling<'_>,
     runs: &mut Vec<Range<usize>>,
 ) -> Vec<VisibleColumn<'a>> {
-    let mut regions = RegionVerdicts::new(inp.origin);
+    let mut regions = RegionVerdicts::new(input.origin);
     let mut cand: Vec<Candidate<'_>> = Vec::new();
-    for secs in inp.reached.chunk_by(|a, b| (a.0, a.2) == (b.0, b.2)) {
+    for secs in input.reached.chunk_by(|a, b| (a.0, a.2) == (b.0, b.2)) {
         let key = (secs[0].0, secs[0].2);
         let first = runs.len();
         // No plane remembered on this path: every column starts with the first plane.
         culling.column_runs(&mut regions, key, secs, &mut 0, runs);
-        match inp.columns.get(&key) {
+        match input.columns.get(&key) {
             Some(column) if runs.len() > first => cand.push(Candidate {
-                dist2: dist2(inp.origin, key),
+                dist2: dist2(input.origin, key),
                 visible: VisibleColumn { column, key, runs: first..runs.len() },
             }),
             _ => runs.truncate(first),
@@ -428,17 +428,22 @@ fn sorted_visible<'a>(
 }
 
 /// Order of the candidate columns redone if the walk, the origin or the columns changed.
-fn refresh_order(inp: &ListIn<'_>, out: &mut Lists, key: OrderKey) {
+fn refresh_order(input: &ListIn<'_>, out: &mut Lists, key: OrderKey) {
     if out.order_key == Some(key) {
         return;
     }
     out.order.clear();
     let mut first = 0;
-    for secs in inp.reached.chunk_by(|a, b| (a.0, a.2) == (b.0, b.2)) {
+    for secs in input.reached.chunk_by(|a, b| (a.0, a.2) == (b.0, b.2)) {
         let k = (secs[0].0, secs[0].2);
         let end = first + secs.len();
-        if inp.columns.contains_key(&k) {
-            out.order.push(OrderedColumn { dist2: dist2(inp.origin, k), key: k, first: first as u32, end: end as u32 });
+        if input.columns.contains_key(&k) {
+            out.order.push(OrderedColumn {
+                dist2: dist2(input.origin, k),
+                key: k,
+                first: first as u32,
+                end: end as u32,
+            });
         }
         first = end;
     }
@@ -452,9 +457,9 @@ fn refresh_order(inp: &ListIn<'_>, out: &mut Lists, key: OrderKey) {
 /// box (one block of margin: a model can overflow) is in the field of view, added to `runs`
 /// (old path, the reference of the tests).
 #[cfg(test)]
-fn column_runs(inp: &ListIn<'_>, k: (i32, i32), secs: &[(i32, i32, i32)], runs: &mut Vec<Range<usize>>) {
-    let culling = ColumnCulling::new(inp, ListPaths::OLD);
-    culling.column_runs(&mut RegionVerdicts::new(inp.origin), k, secs, &mut 0, runs);
+fn column_runs(input: &ListIn<'_>, k: (i32, i32), secs: &[(i32, i32, i32)], runs: &mut Vec<Range<usize>>) {
+    let culling = ColumnCulling::new(input, ListPaths::OLD);
+    culling.column_runs(&mut RegionVerdicts::new(input.origin), k, secs, &mut 0, runs);
 }
 
 /// Verdict of a box against the frustum.
@@ -482,8 +487,14 @@ struct ColumnCulling<'a> {
 }
 
 impl<'a> ColumnCulling<'a> {
-    fn new(inp: &ListIn<'a>, paths: ListPaths) -> Self {
-        ColumnCulling { planes: inp.planes, origin: inp.origin, min_y: inp.min_y, sections: inp.sections, paths }
+    fn new(input: &ListIn<'a>, paths: ListPaths) -> Self {
+        ColumnCulling {
+            planes: input.planes,
+            origin: input.origin,
+            min_y: input.min_y,
+            sections: input.sections,
+            paths,
+        }
     }
 
     /// Runs of the reached sections `secs` of column `k` (increasing height) whose box is in the
