@@ -8958,3 +8958,97 @@ holds no replaceable state could be skipped whole by the site walk (underground 
 nearly all mixed: little to gain once the cutoff stops the walk early). To settle on the
 quiet-machine scene bench: `crowd-1000` (self time of the touched check), `village`, `nether`
 (portal creation, tick p99 on the passage), `combat-end` (gateways).
+## C1-M21: noise kernel, shifted noises in batches (AVX2 gathers, shared cell), work in x once per octave, xy permutation table (07/11, loaded machine)
+
+Reading (B5): a shifted noise volume (`ShiftedXz` / `ShiftedXyz` of the evaluator) computed the
+whole point path for each element (every layer, its kind and switches re-read per point); the
+precomputed volume path (`NOISE_YPRE`) redid the work in x (wrap, floor, two permutations,
+smoothing) for every row in z, and the 4 permutations that depend on x and y only for every
+column in z. Inventory (tests `flat_shifted_noises_are_reached_under_a_slice_in_y` and
+`shifted_noise_volumes_are_single_rows`, 26.3 data): 5 shifted noises per overworld program
+(normal, large biomes, amplified: temperature, vegetation, continents, erosion, ridges), all with
+a zero y scale and reached under a slice in y only; none in the Nether and the End; no
+`ShiftedXyz` and no shifted noise with y anywhere (cold path, it shares the body). Generating 16
+overworld chunks (biomes, then the terrain up to the caves): 768 shifted noise volumes, 22.6
+points each on average, none taller than one row (the batches are layers of 4 × 4 and 5 × 5
+points, not the 49 and 121 the mission expected: the micro-bench covers all four sizes).
+
+- `RUSTCRAFT_OPT_NOISE_BATCH_POINTS` (on, `sampler::Opts::shifted_noise_in_batches`): the points
+  of a shifted noise volume handed to `NoiseStack::get_many` in batches of up to 64 on the stack
+  (1.5 KB, zeroed on every call: 256 before review), layers outside and points inside, each point adding its layers in the same order.
+  Alone (scalar) it gains nothing: the point path was already well compiled.
+- `RUSTCRAFT_OPT_NOISE_BATCH_AVX2` (on, with `PERM512`, detection by `rc_data::cpu`): groups of 8
+  points in AVX2 registers (`noise/batch_avx2.rs`): the same additions, subtractions and
+  multiplications lane by lane, the floor by the 1.5·2^52 shift of the scalar path, gradients by
+  two in-register permutes and a blend, no FMA. Permutations read by 4-byte gathers whose low byte
+  is kept: the table gets 4 bytes of padding (512 → 516) instead of a second table of 512 i32
+  (2 KB more per Perlin). A group with a coordinate outside the range the wrap leaves as it is
+  (far coordinates, infinities, NaN) goes through the scalar path; Smeared layers (never shifted
+  in 26.3) too.
+- `RUSTCRAFT_OPT_NOISE_BATCH_SHARED_CELL` (on, with the AVX2 batch): a group whose 8 points lie in
+  one cell (the low octaves of a small batch: its points span less than a cell) reads its 14
+  permutations once instead of 14 gathers.
+- `RUSTCRAFT_OPT_NOISE_XPRE` (on, with `NOISE_YPRE`): the work in x of each column computed once
+  per octave (`XColumn`), not again for every row in z. `RUSTCRAFT_OPT_NOISE_XY_PERM_TABLE` (on,
+  with `NOISE_YPRE`): the 4 permutations in x and y kept per distinct x cell and run of the same y
+  cell (`[u8; 4]`), read again by every column in z.
+- Proofs (A2): `noise_opt` batches against the point path, 10⁶ points in batches of 900 to 1,099
+  (groups and tails), half of them clustered within a few blocks (whole groups in one cell), with
+  far, infinite and NaN coordinates, under 9 paths (old, current, each floor and table, AVX2 with
+  and without the shared cell): bit for bit against the point path of the same switches, NaN
+  included, and against the old point path where a NaN only has to stay a NaN (the 256 and 512
+  tables of the point path already give NaNs of different bits for an infinite or NaN
+  coordinate). Volumes: the 15 chosen variants on 1,000 cases and every combination of the 8
+  volume switches (2⁸) on 150 cases against the old path, bit for bit. `sampler_opt` (8 router
+  roots + veins, 200 chunks, and the other presets) with the batches alone and in `all`;
+  `density_ref`, `terrain_ref` on the default paths. Sabotages caught by the permanent tests:
+  layers added in reverse order, each layer through `mul_add`, each column computed at its
+  neighbour's x. Sabotages of the code, each caught then removed: AVX2 corner with `rx` for `rx - 1`,
+  shared-cell corners swapped, precomputed x read at the next column, xy row of the next column,
+  the batch's z shift read from the x buffer (98,304 differences per chunk volume in `sampler_opt`).
+- Micro-bench `noise_opt::shifted_noise_batch_bench` (continentalness stack, 9 octaves = 18 layers,
+  2,048 grids of quarter positions with shifts), ms, 1 thread (two runs) / 32 threads:
+
+| Points per batch | point by point | batch, scalar | batch, AVX2 | AVX2 + shared cell |
+|---|---|---|---|---|
+| 16 (4 × 4) | 9.36 / 10.77, 0.760 | 9.52 / 9.81, 0.882 | 4.32 / 4.37, 0.430 | 3.70, 0.355 |
+| 25 (5 × 5) | 14.62 / 15.03, 0.944 | 14.80 / 14.99, 0.947 | 6.88 / 7.13, 0.448 | 6.13, 0.387 |
+| 49 (7 × 7) | 28.91 / 29.38, 1.80 | 28.93 / 29.49, 1.75 | 13.11 / 12.66, 0.811 | 10.95, 0.699 |
+| 121 (11 × 11) | 78.5 / 72.4, 5.89 | 77.3 / 111.2 (noise), 5.54 | 30.4 / 44.7, 2.48 | 38.5, 1.88 |
+
+  At 16 points, 1 thread: 18 ns per layer and point → 6.3 ns (−66%); the shared cell alone takes
+  14-15% off the AVX2 batch. Scaling 1 → 16 threads ×10 to ×13 on every way.
+- Volumes, `noise_opt::noise_volume_x_work_bench` (8 octaves, y scale 1, 4 variants alternated over
+  5 passes, best per volume, three runs), ms per volume:
+
+| Volume, body | before | x work | xy table | both |
+|---|---|---|---|---|
+| 16 × 384 × 16, generic | 3.09 / 2.87 / 2.73 | 2.94 / 2.72 / 2.70 | 3.08 / 2.67 / 2.65 | 2.73 / 2.67 / 2.64 |
+| 16 × 384 × 16, AVX2 | 3.45 / 2.74 / 2.59 | 3.04 / 2.73 / 2.57 | 3.58 / 2.67 / 2.54 | 3.46 / 2.67 / 2.54 |
+| 5 × 49 × 5 cell corners, generic | 0.0820 / 0.0747 / 0.0738 | 0.0773 / 0.0733 / 0.0728 | 0.0787 / 0.0744 / 0.0730 | 0.0755 / 0.0730 / 0.0726 |
+| 5 × 49 × 5 cell corners, AVX2 | 0.0809 / 0.0773 / 0.0724 | 0.0832 / 0.0769 / 0.0712 | 0.0770 / 0.0759 / 0.0718 | 0.0754 / 0.0755 / 0.0715 |
+
+  Both together: −2 to −11% (16 × 384 × 16) and −1.2 to −8% (corners), the lowest in the calmest
+  run; small, but "both" is below "before" in 11 of its 12 measurements (the twelfth +0.3%), kept
+  on (C1). Each alone moves less than the noise of one run.
+- Final density, `sampler_opt::bench_shifted_noise_batches_alternated` (64 chunks, kept context,
+  1 thread, 15 alternated rounds), ms per chunk min / median: batches 0.931 / 0.934 against point
+  by point 0.935 / 0.939 (−0.4%; with `NOISE_BATCH_SHARED_CELL=0` 0.935 / 0.943 against 0.942 /
+  0.950; with `NOISE_BATCH_AVX2=0` 0.944 / 0.987 against 0.946 / 0.988). The final density reads
+  the shifted noises through flat caches only (a few dozen points per chunk): the mission's
+  0.5-1% estimate holds. Biomes, `biome_opt::bench_chunk_biomes` (1,024 chunks, 1 thread, best of
+  3, three alternated processes): batches 231 / 256 / 219 ms against point by point 251 / 256 /
+  322 (favourable but within the noise of the loaded machine). `final_density_threads` with each
+  switch at 0 in separate processes moved ±60% between passes: not used.
+- Memory: a Perlin 536 → 544 bytes (padding); per thread, the x columns (20 bytes × columns) and
+  the xy table (4 bytes × distinct x cells × y runs: 24 KB at most for a 16 × 384 × 16 volume at
+  one block per cell); 6 KB of stack per shifted volume. No allocation added.
+- Placement (B4): GPU ruled out (wrap and floor in f64, FMA contraction not forbidden in WGSL;
+  and batches of 16 to 25 points per call, far below a round trip); several cores: the chunks
+  already spread over the pool, the batch scales with them (above). Not done: an AVX2 batch for
+  the smeared layers (old blended noise, never shifted), groups of 8 that share a cell partly.
+  `get_many` also serves the climate searches in batches (C1-M22).
+- To measure on the quiet machine: `generation-1thread`, `fresh-mountain-rd16` (2 passes, the
+  reference exe), each switch at 0 alone (`NOISE_BATCH_POINTS`, `NOISE_BATCH_AVX2`,
+  `NOISE_BATCH_SHARED_CELL`, `NOISE_XPRE`, `NOISE_XY_PERM_TABLE`), then all five at 0.
+

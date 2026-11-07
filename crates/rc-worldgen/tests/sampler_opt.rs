@@ -121,7 +121,8 @@ const SEED: i64 = 20_261_011;
 
 /// Each path alone, then the combinations with `range_yvol`, then all: a faulty track is
 /// named by its own failure.
-const VARIANTS: [(&str, Opts); 14] = [
+const VARIANTS: [(&str, Opts); 15] = [
+    ("shifted_noise_in_batches", Opts { shifted_noise_in_batches: true, ..Opts::OLD }),
     ("column_memo_y_independent", Opts { column_memo_y_independent: true, ..Opts::OLD }),
     ("memo+sublattice", Opts { column_memo_y_independent: true, sublattice_cache_read: true, ..Opts::OLD }),
     ("range_yvol", Opts { range_yvol: true, ..Opts::OLD }),
@@ -411,6 +412,68 @@ fn point_after_volume_cache_under_choice() {
                 if want.to_bits() != got.to_bits() {
                     failures.push(format!("chunk {cx},{cz} ({x},{y},{z}): {got} ≠ {want}"));
                     break;
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{} differences:\n{}", failures.len(), failures.join("\n"));
+}
+
+/// Shifted noises a data pack can declare but the 26.3 data never does: a shift in y (compiled to
+/// `ShiftedXyz`), and no shift in y but a y scale over volumes of several rows. Volumes of several
+/// batches (1 024 points), ending on a partial batch, and stepped: the batches against the noise
+/// point by point, bit for bit.
+#[test]
+fn shifted_noise_batches_data_pack_cases() {
+    let Some(pack) = common::data_pack() else { return };
+    let mut g = Generator::new(&pack, "overworld", SEED).unwrap();
+    // Each shift reads its own noise, scaled so that neighbouring points fall in other cells.
+    let shift = |noise: &str| {
+        format!(
+            r#"{{"type":"minecraft:mul","left":200.0,
+                "right":{{"type":"minecraft:noise","noise":"{noise}","xz_scale":0.5,"y_scale":0.5}}}}"#
+        )
+    };
+    let shifted_xyz = format!(
+        r#"{{"type":"minecraft:noise","noise":"minecraft:temperature","xz_scale":0.25,"y_scale":0.75,
+            "shift_x":{},"shift_y":{},"shift_z":{}}}"#,
+        shift("minecraft:cave_cheese"),
+        shift("minecraft:cave_layer"),
+        shift("minecraft:vegetation")
+    );
+    let shifted_xz = format!(
+        r#"{{"type":"minecraft:noise","noise":"minecraft:continentalness","xz_scale":0.25,"y_scale":0.75,
+            "shift_x":{},"shift_z":{}}}"#,
+        shift("minecraft:cave_cheese"),
+        shift("minecraft:vegetation")
+    );
+    let xyz = compile_text(&mut g, &shifted_xyz);
+    let xz = compile_text(&mut g, &shifted_xz);
+    assert!(matches!(g.program.nodes[xyz as usize], S::ShiftedXyz { .. }), "shift in y compiled to ShiftedXyz");
+    assert!(matches!(g.program.nodes[xz as usize], S::ShiftedXz { y, .. } if y != 0.0), "ShiftedXz with a y scale");
+    let pairs = [
+        ("old", Opts { shifted_noise_in_batches: true, ..Opts::OLD }, Opts::OLD),
+        ("default", Opts::current(), Opts { shifted_noise_in_batches: false, ..Opts::current() }),
+    ];
+    let mut failures = Vec::new();
+    for (cx, cz) in chunks(4) {
+        let (x, z, y0) = (cx * 16, cz * 16, g.settings.min_y);
+        let volumes = [
+            Volume::new(16, 4, 16, x, y0 + 61, z),
+            Volume::new(7, 9, 11, x + 3, -5, z - 2),
+            Volume::stepped(5, 7, 5, x, y0, z, 4, 8, 4),
+        ];
+        for (root_name, root) in [("shifted xyz", xyz), ("shifted xz", xz)] {
+            for v in &volumes {
+                for (label, batches, point_by_point) in &pairs {
+                    let want = g.volume(root, &mut Ctx::cached_with(*point_by_point), v);
+                    let got = g.volume(root, &mut Ctx::cached_with(*batches), v);
+                    if let Some((bad, first)) = first_diff(&got, &want) {
+                        failures.push(format!(
+                            "{root_name} {label}, chunk {cx},{cz}, {}x{}x{}: {bad} differences, first at {first}",
+                            v.sx, v.sy, v.sz
+                        ));
+                    }
                 }
             }
         }
@@ -1130,6 +1193,36 @@ fn bench_kept_context_alternated() {
     }
     let (n, k) = (min_and_median(new), min_and_median(kept));
     eprintln!("terrain, ms/chunk min / median: new {:.3} / {:.3} | kept {:.3} / {:.3}", n.0, n.1, k.0, k.1);
+}
+
+/// Final density of 64 chunks on 1 thread (kept context), shifted noises in batches against point by
+/// point, alternated over 15 rounds: minimum and median per chunk. The noise kernel inside the
+/// batches (AVX2, shared cell) follows the environment: run it again with those switches at 0.
+#[test]
+#[ignore = "benchmark"]
+fn bench_shifted_noise_batches_alternated() {
+    let Some(pack) = common::data_pack() else { return };
+    counting::client_options();
+    let g = Generator::new(&pack, "overworld", 42).unwrap();
+    let chunks: Vec<(i32, i32)> = (0..8).flat_map(|x| (0..8).map(move |z| (x - 4, z - 4))).collect();
+    eprintln!("noise paths {:?}", rc_worldgen::noise::Paths::current());
+    let cases = [
+        ("default (batches)", Opts::current()),
+        ("default, point by point", Opts { shifted_noise_in_batches: false, ..Opts::current() }),
+    ];
+    let mut contexts: Vec<Ctx> = cases.iter().map(|(_, o)| Ctx::cached_with(*o)).collect();
+    let mut samples = vec![Vec::new(); cases.len()];
+    for _ in 0..15 {
+        for (i, ctx) in contexts.iter_mut().enumerate() {
+            samples[i].push(ms_per_chunk(&chunks, |x, z| {
+                std::hint::black_box(final_density_kept(&g, ctx, x, z));
+            }));
+        }
+    }
+    for ((label, _), s) in cases.iter().zip(samples) {
+        let (min, median) = min_and_median(s);
+        eprintln!("final density, {label:26} ms/chunk min {min:.3} median {median:.3}");
+    }
 }
 
 /// Terrain of 64 chunks (filling, surface, caves): a new context per chunk against the context

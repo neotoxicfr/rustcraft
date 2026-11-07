@@ -9,6 +9,24 @@ use crate::math::{Interval, lerp3, smoothstep};
 use crate::rng::Rng;
 use crate::volume::Volume;
 
+#[cfg(target_arch = "x86_64")]
+mod batch_avx2;
+
+#[cfg(not(target_arch = "x86_64"))]
+mod batch_avx2 {
+    /// No AVX2 outside x86-64: the caller computes every point.
+    pub(super) fn add_points(
+        _: &super::Perlin,
+        _: super::Points<'_>,
+        _: f64,
+        _: f32,
+        _: &mut [f32],
+        _: super::Paths,
+    ) -> usize {
+        0
+    }
+}
+
 /// Gradients (index `h & 15`).
 const GRAD: [[i8; 3]; 16] = [
     [1, 1, 0],
@@ -57,12 +75,31 @@ pub struct Paths {
     pub colconst: bool,
     pub simd: bool,
     pub avx2: bool,
+    /// Volume: work in x done once per octave (`RUSTCRAFT_OPT_NOISE_XPRE`, with `ypre`).
+    pub x_precomputed: bool,
+    /// Volume: permutations in x and y kept per x cell and y run (`RUSTCRAFT_OPT_NOISE_XY_PERM_TABLE`,
+    /// with `ypre`).
+    pub xy_perm_table: bool,
+    /// Batch of points: 8 at a time in AVX2 (`RUSTCRAFT_OPT_NOISE_BATCH_AVX2`, with `perm512`).
+    pub batch_avx2: bool,
+    /// AVX2 batch: 8 points in one cell read its permutations once (`RUSTCRAFT_OPT_NOISE_BATCH_SHARED_CELL`).
+    pub batch_shared_cell: bool,
 }
 
 impl Paths {
     /// Code from before the mission.
-    pub const OLD: Paths =
-        Paths { floor_java: false, perm512: false, ypre: false, colconst: false, simd: false, avx2: false };
+    pub const OLD: Paths = Paths {
+        floor_java: false,
+        perm512: false,
+        ypre: false,
+        colconst: false,
+        simd: false,
+        avx2: false,
+        x_precomputed: false,
+        xy_perm_table: false,
+        batch_avx2: false,
+        batch_shared_cell: false,
+    };
 
     pub fn current() -> Paths {
         static P: std::sync::LazyLock<Paths> = std::sync::LazyLock::new(|| Paths {
@@ -72,6 +109,10 @@ impl Paths {
             colconst: crate::opt::noise_colconst(),
             simd: crate::opt::noise_simd(),
             avx2: crate::opt::noise_avx2(),
+            x_precomputed: crate::opt::noise_x_precomputed(),
+            xy_perm_table: crate::opt::noise_xy_perm_table(),
+            batch_avx2: crate::opt::noise_batch_avx2(),
+            batch_shared_cell: crate::opt::noise_batch_shared_cell(),
         });
         *P
     }
@@ -142,15 +183,49 @@ struct YPre {
     runs: Vec<u32>,
 }
 
-thread_local! {
-    static YPRE: std::cell::RefCell<YPre> = std::cell::RefCell::default();
+/// Work in x of one column of a volume (one octave): cell, permutations of the cell and of the
+/// next one, position in the cell and its smoothed weight.
+#[derive(Clone, Copy)]
+struct XColumn {
+    fx: i32,
+    x0: i32,
+    x1: i32,
+    rx: f32,
+    ax: f32,
 }
+
+/// The 4 permutations of a cell that depend on x and y only (`xy00, xy01, xy10, xy11`), one row
+/// per distinct x cell of the volume and one entry per run of the same y cell: every column in z
+/// of that x cell reads them instead of looking them up again.
+#[derive(Default)]
+struct XyPermTable {
+    perms: Vec<[u8; 4]>,
+    /// Start in `perms` of the row of each column in x (neighbours in the same cell share it).
+    row_of_column: Vec<u32>,
+}
+
+/// Per-octave precomputations of a volume, kept per thread so that no octave allocates.
+#[derive(Default)]
+struct VolumeScratch {
+    y: YPre,
+    /// Work in x of each column in x (`Paths::x_precomputed`).
+    x: Vec<XColumn>,
+    xy: XyPermTable,
+}
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<VolumeScratch> = std::cell::RefCell::default();
+}
+
+/// Length of the permutation table: 256 entries, the same 256 again to read without mask, then
+/// 4 bytes of padding so that the AVX2 batch can read 4 bytes at the last index (it keeps the low one).
+const PERM_LEN: usize = 512 + 4;
 
 /// Improved Perlin (§ 2.1).
 #[derive(Clone)]
 pub struct Perlin {
     /// Permutation, copied a second time (indices 256..512 = 0..256) to read without mask.
-    perm: [u8; 512],
+    perm: [u8; PERM_LEN],
     pub ox: f64,
     pub oy: f64,
     pub oz: f64,
@@ -171,7 +246,7 @@ impl Perlin {
         let ox = r.next_double() * scale;
         let oy = r.next_double() * scale;
         let oz = r.next_double() * scale;
-        let mut perm = [0u8; 512];
+        let mut perm = [0u8; PERM_LEN];
         for (i, p) in perm[..256].iter_mut().enumerate() {
             *p = i as u8;
         }
@@ -207,6 +282,15 @@ impl Perlin {
         let ry = (y - ffy) as f32;
         let rz = (z - ffz) as f32;
         self.sample(fx, fy, fz, rx, ry, rz, ry, p.perm512)
+    }
+
+    /// Layer of a batch: `out[i] += amp × noise(point i × freq)`, the point path's operations;
+    /// whole groups of 8 points in AVX2 registers when allowed, the rest one point at a time.
+    fn add_points(&self, pts: Points<'_>, freq: f64, amp: f32, out: &mut [f32], p: Paths) {
+        let done = if p.batch_avx2 && p.perm512 { batch_avx2::add_points(self, pts, freq, amp, out, p) } else { 0 };
+        for (i, o) in out.iter_mut().enumerate().skip(done) {
+            *o += amp * self.get_with(pts.x[i] * freq, pts.y[i] * freq, pts.z[i] * freq, p);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -279,11 +363,17 @@ impl Perlin {
         fudge: Option<f64>,
         p: Paths,
     ) {
-        // `simd`, `avx2` and `colconst` live in the precomputed path: without `ypre`, old
-        // whole path, so that each switch at 0 isolates its track on the bench.
+        // `simd`, `avx2`, `colconst`, `x_precomputed` and `xy_perm_table` live in the precomputed
+        // path: without `ypre`, old whole path, so that each switch at 0 isolates its track on the bench.
         if p.ypre {
-            YPRE.with_borrow_mut(|pre| {
-                self.fill_ypre(pre, v, ys, fudge, p.floor_java);
+            SCRATCH.with_borrow_mut(|pre| {
+                self.fill_ypre(&mut pre.y, v, ys, fudge, p.floor_java);
+                if p.x_precomputed || p.xy_perm_table {
+                    self.fill_x_columns(&mut pre.x, v, xz, p);
+                }
+                if p.xy_perm_table {
+                    self.fill_xy_perm_table(&mut pre.xy, &pre.x, &pre.y, p.perm512);
+                }
                 if p.avx2 && p.simd {
                     self.add_ypre_avx2(buf, v, xz, amp, p, pre);
                 } else {
@@ -401,20 +491,75 @@ impl Perlin {
         pre.runs.push(n as u32);
     }
 
+    /// Work in x of the column at block `bx`, the operations of the old path.
+    #[inline(always)]
+    fn x_column(&self, bx: i32, xz: f64, java: bool, perm512: bool) -> XColumn {
+        let x = wrap(f64::from(bx) * xz, java) + self.ox;
+        let (fx, ffx) = fl2(x, java);
+        let rx = (x - ffx) as f32;
+        let (x0, x1) = if perm512 {
+            let i = (fx & 255) as usize;
+            (i32::from(self.perm[i]), i32::from(self.perm[i + 1]))
+        } else {
+            (self.p(fx), self.p(fx.wrapping_add(1)))
+        };
+        XColumn { fx, x0, x1, rx, ax: smoothstep(rx) }
+    }
+
+    /// Work in x of an octave, once for the `sx` columns of a row.
+    fn fill_x_columns(&self, columns: &mut Vec<XColumn>, v: &Volume, xz: f64, p: Paths) {
+        columns.clear();
+        columns.extend((0..v.sx).map(|ix| self.x_column(v.bx(ix), xz, p.floor_java, p.perm512)));
+    }
+
+    /// Permutations in x and y of each distinct x cell (neighbouring columns in the same cell share
+    /// a row) and each run in y.
+    fn fill_xy_perm_table(&self, table: &mut XyPermTable, columns: &[XColumn], y: &YPre, perm512: bool) {
+        table.perms.clear();
+        table.row_of_column.clear();
+        let run_starts = &y.runs[..y.runs.len() - 1];
+        let mut previous_cell = None;
+        for c in columns {
+            if previous_cell != Some(c.fx) {
+                previous_cell = Some(c.fx);
+                table.row_of_column.push(table.perms.len() as u32);
+                table.perms.extend(run_starts.iter().map(|&s| self.xy_perms(c.x0, c.x1, y.fy[s as usize], perm512)));
+            } else {
+                let shared = table.row_of_column.last().copied().unwrap_or(0);
+                table.row_of_column.push(shared);
+            }
+        }
+    }
+
+    /// The 4 permutations of a cell that depend on x and y only (`xy00, xy01, xy10, xy11`).
+    #[inline(always)]
+    fn xy_perms(&self, x0: i32, x1: i32, fy: i32, perm512: bool) -> [u8; 4] {
+        if perm512 {
+            let p = &self.perm;
+            let (x0, x1, y) = (x0 as usize, x1 as usize, (fy & 255) as usize);
+            [p[x0 + y], p[x0 + y + 1], p[x1 + y], p[x1 + y + 1]]
+        } else {
+            let p = |v: i32| self.perm[(v & 255) as usize];
+            [p(x0 + fy), p(x0 + fy.wrapping_add(1)), p(x1 + fy), p(x1 + fy.wrapping_add(1))]
+        }
+    }
+
     /// The 8 corners of a cell (x/z already taken, y component apart).
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     fn corners(&self, x0: i32, x1: i32, fy: i32, fz: i32, rx: f32, rz: f32, perm512: bool) -> ([f32; 8], [f32; 8]) {
+        self.corners_from_xy(self.xy_perms(x0, x1, fy, perm512), fz, rx, rz, perm512)
+    }
+
+    /// The 8 corners of a cell from its 4 permutations in x and y (see [`Perlin::xy_perms`]).
+    #[inline(always)]
+    fn corners_from_xy(&self, xy: [u8; 4], fz: i32, rx: f32, rz: f32, perm512: bool) -> ([f32; 8], [f32; 8]) {
         let mut d = [0.0f32; 8];
         let mut gy = [0.0f32; 8];
         if perm512 {
             let p = &self.perm;
-            let (x0, x1) = (x0 as usize, x1 as usize);
-            let (y, z) = ((fy & 255) as usize, (fz & 255) as usize);
-            let xy00 = usize::from(p[x0 + y]);
-            let xy01 = usize::from(p[x0 + y + 1]);
-            let xy10 = usize::from(p[x1 + y]);
-            let xy11 = usize::from(p[x1 + y + 1]);
+            let z = (fz & 255) as usize;
+            let [xy00, xy01, xy10, xy11] = xy.map(usize::from);
             (d[0], gy[0]) = gxz_f(p[xy00 + z], rx, rz);
             (d[1], gy[1]) = gxz_f(p[xy10 + z], rx - 1.0, rz);
             (d[2], gy[2]) = gxz_f(p[xy01 + z], rx, rz);
@@ -424,10 +569,7 @@ impl Perlin {
             (d[6], gy[6]) = gxz_f(p[xy01 + z + 1], rx, rz - 1.0);
             (d[7], gy[7]) = gxz_f(p[xy11 + z + 1], rx - 1.0, rz - 1.0);
         } else {
-            let xy00 = self.p(x0 + fy);
-            let xy01 = self.p(x0 + fy.wrapping_add(1));
-            let xy10 = self.p(x1 + fy);
-            let xy11 = self.p(x1 + fy.wrapping_add(1));
+            let [xy00, xy01, xy10, xy11] = xy.map(i32::from);
             let z1 = fz.wrapping_add(1);
             (d[0], gy[0]) = gxz(self.p(xy00 + fz), rx, rz);
             (d[1], gy[1]) = gxz(self.p(xy10 + fz), rx - 1.0, rz);
@@ -441,16 +583,24 @@ impl Perlin {
         (d, gy)
     }
 
-    fn add_ypre(&self, buf: &mut [f32], v: &Volume, xz: f64, amp: f32, p: Paths, pre: &YPre) {
+    fn add_ypre(&self, buf: &mut [f32], v: &Volume, xz: f64, amp: f32, p: Paths, pre: &VolumeScratch) {
         self.add_ypre_body(buf, v, xz, amp, p, pre);
     }
 
     /// Same body compiled for AVX2 (8 lanes); called only if the processor has it.
     #[cfg(target_arch = "x86_64")]
     #[allow(unsafe_code)]
-    fn add_ypre_avx2(&self, buf: &mut [f32], v: &Volume, xz: f64, amp: f32, p: Paths, pre: &YPre) {
+    fn add_ypre_avx2(&self, buf: &mut [f32], v: &Volume, xz: f64, amp: f32, p: Paths, pre: &VolumeScratch) {
         #[target_feature(enable = "avx2")]
-        fn add_ypre_body_avx2(n: &Perlin, buf: &mut [f32], v: &Volume, xz: f64, amp: f32, p: Paths, pre: &YPre) {
+        fn add_ypre_body_avx2(
+            n: &Perlin,
+            buf: &mut [f32],
+            v: &Volume,
+            xz: f64,
+            amp: f32,
+            p: Paths,
+            pre: &VolumeScratch,
+        ) {
             n.add_ypre_body(buf, v, xz, amp, p, pre);
         }
         // `Paths` is public: `p.avx2` proves nothing, the detection (done once, one atomic
@@ -463,18 +613,19 @@ impl Perlin {
     }
 
     #[cfg(not(target_arch = "x86_64"))]
-    fn add_ypre_avx2(&self, buf: &mut [f32], v: &Volume, xz: f64, amp: f32, p: Paths, pre: &YPre) {
+    fn add_ypre_avx2(&self, buf: &mut [f32], v: &Volume, xz: f64, amp: f32, p: Paths, pre: &VolumeScratch) {
         self.add_ypre_body(buf, v, xz, amp, p, pre);
     }
 
     /// Precomputed path: per column, only the corners at the cell change and `lerp3`.
     #[inline(always)]
-    fn add_ypre_body(&self, buf: &mut [f32], v: &Volume, xz: f64, amp: f32, p: Paths, pre: &YPre) {
+    fn add_ypre_body(&self, buf: &mut [f32], v: &Volume, xz: f64, amp: f32, p: Paths, pre: &VolumeScratch) {
         let java = p.floor_java;
         let sy = v.sy as usize;
-        let (fys, ays, tys, ty1s) = (&pre.fy[..sy], &pre.ay[..sy], &pre.ty[..sy], &pre.ty1[..sy]);
+        let y = &pre.y;
+        let (fys, ays, tys, ty1s) = (&y.fy[..sy], &y.ay[..sy], &y.ty[..sy], &y.ty1[..sy]);
         // All the y inputs equal (zero y scale, a single row…): one value per column.
-        let constant = p.colconst && pre.runs.len() == 2 && {
+        let constant = p.colconst && y.runs.len() == 2 && {
             let (a, t) = (ays[0].to_bits(), tys[0].to_bits());
             ays.iter().all(|v| v.to_bits() == a) && tys.iter().all(|v| v.to_bits() == t)
         };
@@ -485,37 +636,41 @@ impl Perlin {
             let rz = (z - ffz) as f32;
             let az = smoothstep(rz);
             for ix in 0..v.sx {
-                let x = wrap(f64::from(v.bx(ix)) * xz, java) + self.ox;
-                let (fx, ffx) = fl2(x, java);
-                let rx = (x - ffx) as f32;
-                let (x0, x1) = if p.perm512 {
-                    let i = (fx & 255) as usize;
-                    (i32::from(self.perm[i]), i32::from(self.perm[i + 1]))
-                } else {
-                    (self.p(fx), self.p(fx.wrapping_add(1)))
+                let XColumn { x0, x1, rx, ax, .. } =
+                    if p.x_precomputed { pre.x[ix as usize] } else { self.x_column(v.bx(ix), xz, java, p.perm512) };
+                // Corners of the run `run`, whose cell in y is `fy`.
+                let xy_row = p.xy_perm_table.then(|| &pre.xy.perms[pre.xy.row_of_column[ix as usize] as usize..]);
+                let corners = |run: usize, fy: i32| match xy_row {
+                    Some(row) => self.corners_from_xy(row[run], fz, rx, rz, p.perm512),
+                    None => self.corners(x0, x1, fy, fz, rx, rz, p.perm512),
                 };
-                let ax = smoothstep(rx);
                 let col = &mut buf[idx..idx + sy];
                 idx += sy;
                 if constant {
-                    let (d, g) = self.corners(x0, x1, fys[0], fz, rx, rz, p.perm512);
+                    let (d, g) = corners(0, fys[0]);
                     let n = cell_value(ax, ays[0], az, &d, &g, tys[0], ty1s[0]);
                     for o in col.iter_mut() {
                         *o += amp * n;
                     }
                 } else if p.simd {
-                    for r in pre.runs.windows(2) {
+                    for (run, r) in y.runs.windows(2).enumerate() {
                         let (s, e) = (r[0] as usize, r[1] as usize);
-                        let (d, g) = self.corners(x0, x1, fys[s], fz, rx, rz, p.perm512);
+                        let (d, g) = corners(run, fys[s]);
                         run_kernel(&mut col[s..e], &ays[s..e], &tys[s..e], &ty1s[s..e], ax, az, &d, &g, amp);
                     }
                 } else {
                     let mut last_fy = i32::MIN;
+                    let mut run = 0;
                     let (mut d, mut g) = ([0.0f32; 8], [0.0f32; 8]);
                     for (k, o) in col.iter_mut().enumerate() {
                         let fy = fys[k];
+                        // Counted like the runs of `fill_ypre` (the first row always starts one),
+                        // apart from the corner test, which keeps the old sentinel.
+                        if k > 0 && fy != fys[k - 1] {
+                            run += 1;
+                        }
                         if last_fy != fy {
-                            (d, g) = self.corners(x0, x1, fy, fz, rx, rz, p.perm512);
+                            (d, g) = corners(run, fy);
                             last_fy = fy;
                         }
                         *o += amp * cell_value(ax, ays[k], az, &d, &g, tys[k], ty1s[k]);
@@ -607,6 +762,21 @@ impl Smeared {
     pub fn range(fudge: f64) -> Interval {
         Interval::symmetric((fudge.abs() + 2.0) as f32)
     }
+
+    /// Layer of a batch: `out[i] += amp × noise(point i × freq)`, the point path's operations.
+    fn add_points(&self, pts: Points<'_>, freq: f64, amp: f32, out: &mut [f32], p: Paths) {
+        for (i, o) in out.iter_mut().enumerate() {
+            *o += amp * self.get_with(pts.x[i] * freq, pts.y[i] * freq, pts.z[i] * freq, p);
+        }
+    }
+}
+
+/// Coordinates of a batch of points, as many as values to compute.
+#[derive(Clone, Copy)]
+struct Points<'a> {
+    x: &'a [f64],
+    y: &'a [f64],
+    z: &'a [f64],
 }
 
 /// 2D simplex (§ 2.3), offsets drawn then cancelled.
@@ -721,6 +891,26 @@ impl NoiseStack {
             v += l.amp * l.noise.get(x * l.freq, y * l.freq, z * l.freq, p);
         }
         v
+    }
+
+    /// Batch of points: `out[i]` gets the point value at (`xs[i]`, `ys[i]`, `zs[i]`), bit for bit.
+    /// Layers outside, points inside: each point still adds its layers in the same order, while
+    /// what a layer does not take from the point (its kind, offsets, scales) is read once.
+    pub fn get_many(&self, xs: &[f64], ys: &[f64], zs: &[f64], out: &mut [f32]) {
+        self.get_many_with(xs, ys, zs, out, Paths::current());
+    }
+
+    #[doc(hidden)]
+    pub fn get_many_with(&self, xs: &[f64], ys: &[f64], zs: &[f64], out: &mut [f32], p: Paths) {
+        let n = out.len();
+        let points = Points { x: &xs[..n], y: &ys[..n], z: &zs[..n] };
+        out.fill(0.0);
+        for l in &self.layers {
+            match &l.noise {
+                Octave::Perlin(noise) => noise.add_points(points, l.freq, l.amp, out, p),
+                Octave::Smeared(noise) => noise.add_points(points, l.freq, l.amp, out, p),
+            }
+        }
     }
 
     /// Volume path: each layer adds `(amp × layer_amp) × noise(block × (scale × f))`.

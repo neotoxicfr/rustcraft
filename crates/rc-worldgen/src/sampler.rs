@@ -182,6 +182,9 @@ pub struct Opts {
     /// Scattered floors of the generator (surface levels, cell tops) through the shared floor,
     /// not the C library (`RUSTCRAFT_OPT_FLOOR_JAVA`).
     pub floor_java: bool,
+    /// Shifted noise volumes: the points handed to the noise in batches, layers outside and points
+    /// inside (`RUSTCRAFT_OPT_NOISE_BATCH_POINTS`).
+    pub shifted_noise_in_batches: bool,
 }
 
 impl Opts {
@@ -196,6 +199,7 @@ impl Opts {
         spline_inputs_on_stack: false,
         column_memo_y_independent: false,
         floor_java: false,
+        shifted_noise_in_batches: false,
     };
     /// All the tracks.
     pub const NEW: Opts = Opts {
@@ -208,6 +212,7 @@ impl Opts {
         spline_inputs_on_stack: true,
         column_memo_y_independent: true,
         floor_java: true,
+        shifted_noise_in_batches: true,
     };
 
     pub fn current() -> Opts {
@@ -221,6 +226,7 @@ impl Opts {
             spline_inputs_on_stack: crate::opt::spline_inputs_on_stack(),
             column_memo_y_independent: crate::opt::column_memo_y_independent(),
             floor_java: crate::opt::floor_java(),
+            shifted_noise_in_batches: crate::opt::noise_batch_points(),
         });
         *P
     }
@@ -679,6 +685,59 @@ impl S {
             }
         }
     }
+}
+
+/// Points of a shifted noise volume handed to the noise at once (on the stack: 3 × 512 bytes,
+/// zeroed on every call, hence small). The 26.3 volumes are one row of 16 to 25 points (4×4, 5×5
+/// climate grids) and fit in one batch; a larger one (data pack) empties its batch more often, each
+/// point keeping its layers in the same order, so the result does not depend on this size.
+const SHIFTED_NOISE_BATCH: usize = 64;
+
+/// Shifted noise over a volume, its points handed to the noise in batches: `out` holds the shift
+/// in x on entry and the noise on exit, `by` the shift in y (absent: none), `bz` the shift in z.
+/// Each point gets the coordinates of the point-by-point path.
+fn shifted_noise_in_batches(
+    noise: &NoiseStack,
+    v: &Volume,
+    (xz_scale, y_scale): (f64, f64),
+    out: &mut [f32],
+    by: Option<&[f32]>,
+    bz: &[f32],
+) {
+    let mut x_coords = [0.0f64; SHIFTED_NOISE_BATCH];
+    let mut y_coords = [0.0f64; SHIFTED_NOISE_BATCH];
+    let mut z_coords = [0.0f64; SHIFTED_NOISE_BATCH];
+    let (mut i, mut start, mut filled) = (0, 0, 0);
+    for iz in 0..v.sz {
+        let base_z = f64::from(v.bz(iz)) * xz_scale;
+        for ix in 0..v.sx {
+            let base_x = f64::from(v.bx(ix)) * xz_scale;
+            for iy in 0..v.sy {
+                x_coords[filled] = base_x + f64::from(out[i]);
+                y_coords[filled] = match by {
+                    None => f64::from(v.by(iy)) * y_scale,
+                    Some(by) => f64::from(v.by(iy)) * y_scale + f64::from(by[i]),
+                };
+                z_coords[filled] = base_z + f64::from(bz[i]);
+                (i, filled) = (i + 1, filled + 1);
+                // The shifts of these points are read: their places in `out` take the noise.
+                if filled == SHIFTED_NOISE_BATCH || i == out.len() {
+                    let batch = ..filled;
+                    noise.get_many(&x_coords[batch], &y_coords[batch], &z_coords[batch], &mut out[start..i]);
+                    (start, filled) = (i, 0);
+                }
+            }
+        }
+    }
+}
+
+/// Counts a volume of a shifted noise (inventory of the batch sizes, see `EvalCounts`).
+fn count_shifted_noise_volume(v: &Volume) {
+    count(|c| {
+        c.shifted_noise_volumes += 1;
+        c.shifted_noise_values += v.size() as u64;
+        c.shifted_noise_volumes_taller_than_one_row += u64::from(v.sy > 1);
+    });
 }
 
 fn island_height(n: &Simplex, sx: i32, sz: i32) -> f32 {
@@ -1312,7 +1371,27 @@ impl Program {
                 out.fill(0.0);
                 self.noises[*noise as usize].add_to_volume(out, v, *xz, *y, 1.0);
             }
+            S::ShiftedXz { sx, sz, noise, xz, y: ys } if ctx.opts.shifted_noise_in_batches => {
+                count_shifted_noise_volume(v);
+                self.volume(*sx, ctx, out, v);
+                let mut bz = ctx.take(v.size());
+                self.volume(*sz, ctx, &mut bz, v);
+                shifted_noise_in_batches(&self.noises[*noise as usize], v, (*xz, *ys), out, None, &bz);
+                ctx.give(bz);
+            }
+            S::ShiftedXyz { sx, sy, sz, noise, xz, y: ys } if ctx.opts.shifted_noise_in_batches => {
+                count_shifted_noise_volume(v);
+                self.volume(*sx, ctx, out, v);
+                let mut by = ctx.take(v.size());
+                self.volume(*sy, ctx, &mut by, v);
+                let mut bz = ctx.take(v.size());
+                self.volume(*sz, ctx, &mut bz, v);
+                shifted_noise_in_batches(&self.noises[*noise as usize], v, (*xz, *ys), out, Some(&by), &bz);
+                ctx.give(by);
+                ctx.give(bz);
+            }
             S::ShiftedXz { sx, sz, noise, xz, y: ys } => {
+                count_shifted_noise_volume(v);
                 self.volume(*sx, ctx, out, v);
                 let mut bz = ctx.take(v.size());
                 self.volume(*sz, ctx, &mut bz, v);
@@ -1334,6 +1413,7 @@ impl Program {
                 ctx.give(bz);
             }
             S::ShiftedXyz { sx, sy, sz, noise, xz, y: ys } => {
+                count_shifted_noise_volume(v);
                 self.volume(*sx, ctx, out, v);
                 let mut by = ctx.take(v.size());
                 self.volume(*sy, ctx, &mut by, v);
