@@ -219,7 +219,7 @@ impl Server {
                 if m.rng.next_int_bound(reduced(10)) != 0 {
                     return false;
                 }
-                !fox::items_near(self, m).is_empty() && m.equipment[0].is_none()
+                fox::first_item_near(self, m).is_some() && m.equipment[0].is_none()
             }
             WGoal::Perch { .. } => {
                 m.last_hurt_by_mob.is_none()
@@ -278,7 +278,7 @@ impl Server {
                 {
                     return false;
                 }
-                m.equipment[0].is_some() || !panda::ground_food(self, m, 6.0).is_empty()
+                m.equipment[0].is_some() || panda::first_ground_food(self, m, 6.0).is_some()
             }
             WGoal::LieOnBack { cd } => {
                 *cd < m.tick_count
@@ -495,7 +495,7 @@ impl Server {
                 *max_stay = m.rng.next_int_bound(inner) + 1200;
             }
             WGoal::SearchItems => {
-                if let Some(p) = fox::items_near(self, m).first().copied() {
+                if let Some(p) = fox::first_item_near(self, m) {
                     self.move_to_entity(m, p, f64::from(1.2f32));
                 }
             }
@@ -517,7 +517,7 @@ impl Server {
             WGoal::PandaBreed { inner, .. } => self.goal_start(inner, m),
             WGoal::PandaSit { cd } => {
                 if m.equipment[0].is_none() {
-                    if let Some(p) = panda::ground_food(self, m, 8.0).first().copied() {
+                    if let Some(p) = panda::first_ground_food(self, m, 8.0) {
                         self.move_to_entity(m, p, f64::from(1.2f32));
                     }
                 } else {
@@ -678,9 +678,8 @@ impl Server {
             }
             WGoal::EatBerries { .. } => self.eat_berries_tick(g, m),
             WGoal::SearchItems => {
-                let items = fox::items_near(self, m);
                 if m.equipment[0].is_none()
-                    && let Some(p) = items.first().copied()
+                    && let Some(p) = fox::first_item_near(self, m)
                 {
                     self.move_to_entity(m, p, f64::from(1.2f32));
                 }

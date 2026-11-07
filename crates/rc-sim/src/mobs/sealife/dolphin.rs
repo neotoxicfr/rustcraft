@@ -3,6 +3,7 @@
 //! grace), fish given → treasure (ruins and shipwrecks), playing with items, retaliation.
 
 use super::super::goals::{Melee, Who};
+use super::super::ground_items;
 use super::super::mob::{Ent, Mob, MoveOp};
 use super::super::mth::{DEG, cos, dist2, facing, pitch_to, rotate_towards, rotlerp_360, sin, wrap, yaw_to};
 use super::goals::AGoal;
@@ -154,26 +155,13 @@ pub fn pickup(s: &mut Server, m: &mut Mob) {
         return;
     }
     let bb = m.bbox();
-    let hit = s
-        .life
-        .drops
-        .iter()
-        .find(|d| {
-            !d.is_removed()
-                && d.stack.count > 0
-                && d.pickup_delay <= 0
-                && d.pos[0] + 0.125 > bb.min[0] - 1.0
-                && d.pos[0] - 0.125 < bb.max[0] + 1.0
-                && d.pos[1] + 0.25 > bb.min[1]
-                && d.pos[1] < bb.max[1]
-                && d.pos[2] + 0.125 > bb.min[2] - 1.0
-                && d.pos[2] - 0.125 < bb.max[2] + 1.0
-        })
-        .map(|d| (d.id, d.stack.clone()));
+    let hit = s.life.drops.iter().find(|d| ground_items::in_pickup_reach(d, &bb)).map(|d| (d.id, d.stack.clone()));
     let Some((id, st)) = hit else { return };
-    m.equipment[0] = Some(st.clone());
+    let count = st.count;
+    // The stack is moved into the hand; the old path copied it a second time.
+    m.equipment[0] = Some(if ground_items::filter_first() { st } else { st.clone() });
     m.drop_chance[0] = 2.0;
-    s.mob_take(id, m.id, st.count);
+    s.mob_take(id, m.id, count);
 }
 
 /// Fish given: the baby grows up, the adult looks for treasure.
@@ -196,24 +184,22 @@ pub fn interact(s: &mut Server, m: &mut Mob, slot: usize, item: &str) -> Option<
 // ---------- Goals ----------
 
 /// "Playable" items: without pickup delay, in the water, within 8 blocks of the box.
-fn items_near(s: &Server, m: &Mob) -> Vec<(i32, [f64; 3])> {
+pub(crate) fn items_near<'a>(s: &'a Server, m: &Mob) -> impl Iterator<Item = [f64; 3]> + 'a {
     let b = m.bbox();
     let area = rc_physics::Aabb { min: b.min.map(|v| v - 8.0), max: b.max.map(|v| v + 8.0) };
     s.life
         .drops
         .iter()
-        .filter(|d| {
-            let ib = rc_physics::Aabb {
-                min: [d.pos[0] - 0.125, d.pos[1], d.pos[2] - 0.125],
-                max: [d.pos[0] + 0.125, d.pos[1] + 0.25, d.pos[2] + 0.125],
-            };
-            !d.is_removed()
-                && d.pickup_delay <= 0
-                && ib.intersects(&area)
+        .filter(move |d| {
+            ground_items::ready_item_touches(d, &area)
                 && s.mob_fluid(super::super::mth::block_of(d.pos)) == super::super::env::Fluid::Water
         })
-        .map(|d| (d.id, d.pos))
-        .collect()
+        .map(|d| d.pos)
+}
+
+/// First playable item, in list order (the item goal reads only that one).
+fn first_item_near(s: &Server, m: &Mob) -> Option<[f64; 3]> {
+    ground_items::first_of(items_near(s, m), ground_items::filter_first())
 }
 
 impl Server {
@@ -278,7 +264,7 @@ impl Server {
                 }
                 true
             }
-            AGoal::MoveToItem { cooldown } => *cooldown <= m.tick_count && !items_near(self, m).is_empty(),
+            AGoal::MoveToItem { cooldown } => *cooldown <= m.tick_count && first_item_near(self, m).is_some(),
             AGoal::PlayWithItems => m.equipment[0].is_some(),
             AGoal::FollowRidden { following, .. } => {
                 (*following && self.player_moved()) || self.follow_ridden_can_use(m)
@@ -353,7 +339,7 @@ impl Server {
                 m.nav.stop();
             }
             AGoal::MoveToItem { cooldown } => {
-                if let Some(&(_, p)) = items_near(self, m).first() {
+                if let Some(p) = first_item_near(self, m) {
                     self.move_to_entity(m, p, f64::from(1.2f32));
                     self.mob_sound(m, "minecraft:entity.dolphin.play", 1.0, 1.0);
                 }
@@ -440,7 +426,7 @@ impl Server {
                 }
             }
             AGoal::MoveToItem { .. } => {
-                if let Some(&(_, p)) = items_near(self, m).first() {
+                if let Some(p) = first_item_near(self, m) {
                     self.move_to_entity(m, p, f64::from(1.2f32));
                 }
             }

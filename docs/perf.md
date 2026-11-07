@@ -7038,4 +7038,54 @@ former way (read once; `drops::DropSwitches`, `walk.rs`):
   (explosion).
 - To measure on the quiet machine: scenes `tnt` and `dropped-items` (2 alternating passes, main
   before the series and this branch with the four switches at 0).
+## C6-M30: animals, scans by species, pickups without lists or copies (07/11, loaded machine)
+
+Before: the player's pufferfish contact (every tick) and the shulker bullet count walked the whole
+mob list to keep one species; the pufferfish puffing test looked every neighbour up again by
+identifier; the fox alert and the nautilus charge collected every candidate before testing the
+first; the fox, panda and dolphin pickups and item searches built the list of every item in range to
+read its first entry, the fox copied every stack in reach before testing it, the panda looked the
+item tag up before the position test, the dolphin copied the chosen stack twice; a nautilus in love
+without a partner copied its whole mob every tick, copied its visible list for every search and its
+path for every restart, and called the breeding statistic a second time after both loves were reset
+(a call that recorded nothing). Switches, default = new, `=0` = old path (read once):
+- `RUSTCRAFT_OPT_KINDINDEX` (existing): pufferfish contact and shulker bullet count by `of_kind`.
+- `RUSTCRAFT_OPT_MOB_SCAN_ONE_PASS`: fox alert and nautilus charge test each candidate as met and stop
+  at the first; the pufferfish tests the mob it holds, species first (`index::one_pass_scans`).
+- `RUSTCRAFT_OPT_PICKUPFILTERFIRST`: one pickup reach and item box for the three species
+  (`mobs/ground_items.rs`); position before tag, only the chosen stack copied, searches stop at their
+  first item (`first_of`).
+- `RUSTCRAFT_OPT_NAUTILUSNOCLONE`: partner test on three copied fields (`Suitor`), visible list walked
+  by position with its verdicts filled in place, path moved into the restart (the restart keeps an
+  equal path), the dead second statistic call skipped.
+
+Proof: `animal_scan_tests` (fresh flat world, a pool, 104 mobs, 200 items, two thirds placed in a
+picker's reach) compares every new path with the old one in the same process: same item, mob or
+entity, and the same mob and nautilus brain afterwards (sight caches, kept verdicts compared in
+full): 28 pickups (7 where the first item in reach is refused), 38 searches, 21 puffing tests and
+stung lists, 48 fox alerts, 75 charges, 32 visible searches, 18 path restarts, before and after 45
+ticks; the partner test against the game's rule on 72 cases; one breeding counted per birth; the
+dolphin takes the first item in reach. Nine sabotages fail them (fox pickup without `can_hold`,
+`first_of` taking the last, pufferfish forgetting its tag, fox alert without the targeting test,
+charge taking the last mob, visible list walked backwards, partner test forgetting its own age, the
+birth statistic call removed, dolphin taking the last item).
+
+| Micro-bench, loaded machine, 1 core | old path | new |
+|---|---|---|
+| player's pufferfish contact scan, 1,000 mobs, no pufferfish (per tick) | 912 ns | 11 ns |
+| fox pickup choice + item search, 200 items (per fox) | 981 ns | 327 ns |
+| panda pickup choice + food search, 200 items (per panda) | 3,640 ns | 527 ns |
+| dolphin item search, 200 items (per dolphin) | 2,112 ns | 595 ns |
+| nautilus partner test set up (per tick in love without a partner) | 1,420 ns (whole mob copied) | 0.5 ns |
+
+Species queries over the 145 ticks of the proof: 145, all served by the index (0 sent to the scan):
+the contact runs after the mob walk with the index in service. Axes: server CPU and allocations
+only (no network, save, rendering or memory change: `ground_items` holds no state, `Suitor` lives on
+the stack); multi-core and GPU not applicable (state of the server thread, list order decides).
+Not done: the nautilus sensors (a scan of every species, sorted, once per 20 ticks) and the fish
+school leader search (two lists per try, ~1 per 100 ticks) stay as they are; `shulker_can_stay`
+already walks shulkers only. The same pickup box is written again in the allay, piglin, villager,
+cube, crystal and projectile code (other zones). To settle on the quiet-machine scene bench:
+`ocean`, `forest`, `crowd-1000`, `dropped-items` (gain of the contact scan below scene noise:
+not to be announced from a scene).
 
