@@ -1120,7 +1120,10 @@ New paths of `rc-light/src/full/grid.rs` and `full/batch.rs`, each behind its sw
   `FULL_EMITTERS_IN_FILL` (emitters seeded by the fill: one read of the states),
   `FULL_SKIP_DEPTHS` (rows more than 14 under the lowest source, sky or emitter section of the
   scans, neither filled nor resolved).
-- `FULL_UNION_TILES`: the chunks of a batch (`rc_light::light_chunks`: generation targets, relit
+- `FULL_UNION_TILES` (OFF by default since 07/11, `=1` turns it on): with it, a world generated
+  under load (the whole rc-sim suite on 4 cores, like the CI runners) was saved differently from
+  one run to the next (`tests_opt::all_regions`, 2 failures per run), and never without it; to be
+  understood before it comes back. The chunks of a batch (`rc_light::light_chunks`: generation targets, relit
   neighbours, bonus chest of a new world) resolved by aligned tiles, one zone per tile (bounding
   box + one chunk of margin) instead of one 3 × 3 zone per chunk; exact since a level drops by at
   least 1 per step (every path reaching a chunk stays in its 3 × 3). Side
