@@ -7334,4 +7334,98 @@ creation, copied per frame into the animation paths of the thread; the two globa
   equipped-humanoids, plains12, plains32 (2 passes, old exe as reference; the inlining A/B with
   a `--features part-lookup-not-inlined` exe); captures 1600×900 of crowd and crowd-1000 in one
   run (`RUSTCRAFT_OPT_ANIMATION_SINE_TABLE=0` against the default, `POLY_ROTATIONS=0` likewise).
+## C7-M07: global allocator, direct mimalloc calls, one flag byte, option indices from the header, v2 against v3 (06/11, loaded machine)
+
+Global allocator of the client (`debug_sys::CountingAllocator`, the integrated server shares it) and
+the memstats one. Tests `cargo test --release -p rc-app --bin rustcraft debug_sys`; micro-bench
+`allocator_micro_bench` (ignored, `--ignored --nocapture --test-threads=1`); trial profile, machine
+loaded by other agents compiling.
+
+- Direct calls (`RUSTCRAFT_OPT_ALLOC_DIRECT`, default 1, `=0`: old path). The `mimalloc` crate always
+  calls the aligned entry points. Above 1 KiB they leave the inlined fast path for an out-of-line one
+  that pads the request by `align - 1` bytes unless the size class is a power of two: a size that
+  sits exactly on a class bound (classes by quarters: 1,280, 1,536, 1,792, 2,048…) moves up one
+  class. The plain entry points give 16-byte alignment from 16 bytes up (8 for the 8-byte class), so
+  `align <= 16 && align <= size` now takes them (the rule of Rust's own unix allocator); larger
+  alignments and smaller sizes keep the aligned calls; reallocation likewise on the new size.
+  Block bytes (`direct_calls_take_no_bigger_blocks_above_one_kib`): every multiple of 8 from 1 KiB to
+  64 KiB +0.03 % (22 of 8,064 sizes one class up); doubling `Vec` capacities of 1- to 64-byte
+  elements +5.15 % (84 of 383 one class up; 12-byte elements at 128: 1,536 → 1,792 bytes). The
+  tracer (`RUSTCRAFT_ALLOCTRACE=1`) now prints per second the allocations up to 1 KiB, above as a
+  power of two and above otherwise, to size the real share on the scenes (a reallocation is filed
+  by its new block size, the one that decides the padding, not by its growth: 768 → 1,536 B is
+  "above otherwise").
+- One flag byte (`RUSTCRAFT_OPT_ALLOCATOR_SINGLE_FLAG`, default 1): counting (`memory` entry),
+  tracing and the two old-path switches in one `AtomicU8`; all clear = one load, one branch, the
+  direct call; anything set goes to a `#[cold]` out-of-line function. The old aligned path is kept
+  inline (its A/B stays fair). The memstats build wraps this same allocator (switches and tracer
+  included). `=0` re-reads counting and tracing separately, inline as the old code did (a first
+  version did it in the cold function and paid one call more than the old code: 8 B 5.02 against
+  3.80 ns on 1 thread); the micro-bench also runs the old allocator as it was (`TwoFlagAllocator`).
+  Rerun after that fix (another loaded-machine run, interleaved, best of 5), 8 B, 1 / 4 / 32 threads:
+  new 3.62 / 7.09 / 12.97, `SINGLE_FLAG=0` 3.81 / 7.51 / 14.35, both `=0` 4.27 / 7.57 / 15.58, old
+  allocator 3.63 / 6.52 / 13.79, bare direct 3.59 / 6.10 / 11.52; 1,536 B 1 / 32 threads: new 15.85 /
+  115.0, `SINGLE_FLAG=0` 15.89 / 113.0, old allocator 25.69 / 140.0. Each switch at 0 alone costs
+  its dispatch (+0.2 ns at 8 B against the old code: 3.81 against 3.63). Both at 0 do NOT reproduce
+  the old allocator: +0.6 to 1.8 ns at 8 B (+12 to 18 %) on every thread count of that run (1 / 2 /
+  4 / 8 / 16 / 32 threads: 4.27 / 7.58 / 7.57 / 7.47 / 13.15 / 15.58 against 3.63 / 6.56 / 6.52 /
+  6.63 / 11.40 / 13.79; rerun 07/11 on 1 / 4 / 32 threads: 4.02 / 4.13 / 8.61 against 3.48 / 3.56 /
+  7.42), so the scene reference for the old code is an executable built from `main`, never the
+  both-at-0 arm. Two ways to close the gap were tried and dropped, each making every path slower,
+  the new one included (bigger body inlined at each site): a copy of each old path per flag value
+  (flags known at compile time, +0.4-0.7 ns at 8 B), and one exact arm for both at 0 replaying the
+  old sequence (07/11, 8 B 1 thread: new 4.00 against 3.49 without it, both at 0 4.56 against 4.02,
+  old code 3.44 / 3.48: the gap stays and the new path loses its tie with the old code).
+
+| ns per alloc + free, best of 5, 256 live | 8 B, 1 thread | 8 B, 4 threads | 8 B, 32 threads | 1,536 B, 1 thread | 1,536 B, 32 threads |
+|---|---|---|---|---|---|
+| new (direct, one flag) | 3.81 | 5.53 | 7.78 | 17.55 | 110.1 |
+| `ALLOC_DIRECT=0` | 4.01 | 6.61 | 8.80 | 21.17 | 134.6 |
+| `ALLOCATOR_SINGLE_FLAG=0` (first version, cold call; fixed, see below) | 5.02 | 7.92 | 11.26 | 16.60 | 111.0 |
+| both `=0` (first version) | 5.15 | 8.57 | 11.85 | 21.78 | 135.3 |
+| old allocator as it was | 3.80 | 6.61 | 8.35 | 21.47 | 132.6 |
+| bare `mimalloc::MiMalloc`, no wrapper | 3.76 | 6.37 | 8.45 | 20.76 | 132.3 |
+| bare direct calls, no wrapper | 3.77 | 5.98 | 7.91 | 15.60 | 112.1 |
+
+  1,536 bytes: −18 % on 1 thread, −17 % on 32 against the old allocator; 8 bytes: equal on 1 thread
+  (the plain fast path and the aligned one are both inlined), −7 to −16 % on 4 to 32 threads (within
+  the noise of a loaded machine). The wrapper costs nothing measurable against the bare calls: kept.
+- Option indices (`build.rs`): `mi_option_set` takes the position of the option in the library's
+  enumeration; it was hard-coded (40), so a bump that inserts an option would have set another one
+  silently. The build script now reads the enumeration in the header of the linked library
+  (`DEP_MIMALLOC_INCLUDE_DIR`, `libmimalloc-sys` added as a direct dependency, same version) and
+  fails on an explicit value before the end marker; the generated indices are checked against those
+  read by hand per library version (`mimalloc_option_indices_were_checked_for_this_version`: an
+  unknown version fails until its header is read). Still hard-coded: the copy in
+  `crates/rc-worldgen/tests/sampler_opt.rs` (another crate's test; to point at the same guard).
+- mimalloc v2 against v3 (feature `mimalloc-v2`, two executables of the same commit): v2 has no
+  on-demand page commit (the startup line says so); `mi_stats_t` layout picked by the linked version
+  (v2: version 4, 4,168 bytes, confirmed by the committed-memory test). rc-app suite: v3 803
+  passed; v2 802 passed, the 803rd expected v3's padding and now expects per version (rerun
+  passes). v2's aligned calls do not pad
+  small alignments (block bytes equal in both sweeps): the padding is v3's alone. Micro-bench
+  (same table, v2 executable): 8 B 4.36 / 5.88 / 9.31 ns (1, 4, 32 threads), against v3's 3.81 /
+  5.53 / 7.78; 1,536 B 14.70 (1 thread) and 30.53 (32 threads), against v3's 17.55 and 110.1: v3
+  scales badly when many threads each empty and refill pages of mid-size blocks (each thread frees
+  only its own blocks here; cause not established, possibly emptied pages going back to the shared
+  arena every round). Decision on the scene bench, private memory first (v2 loses the
+  on-demand commit: −735 MB when paused was gained with v3).
+- Low settings, nothing thrown away: `RUSTCRAFT_OPT_MI_PURGE_LONG=1` (default OFF: it can only trade
+  memory for processor time) sets the purge delay to ten times the library's own, read from it
+  (v3 1 s → 10 s; v2 10 ms → 100 ms), so that both arms of the v2/v3 A/B lengthen it alike; a delay
+  set by the user wins under either of the names mimalloc reads (`MIMALLOC_PURGE_DELAY` and the
+  legacy `MIMALLOC_RESET_DELAY`; the on-demand commit has no legacy name). The arena multiplier
+  (1 in v3, the header comment saying 10 is stale; 10 in v2) is left alone. Feature `mimalloc-win-direct-tls` (two executables): mimalloc's thread heap read from the
+  64 direct TLS slots only (one predictable branch, ≈ 0.2 ns); the startup line logs the lowest free
+  slot (mimalloc took its own before `main`, when fewer were in use). `allow_thp`: Linux only, for
+  the port.
+- To measure on the quiet machine: `crowd-1000`, `tnt`, `dropped-items`, `generation`, `plains32`,
+  3 passes, p99, `committed` of the `[perf] ram` line and private memory: the branch with both
+  switches at 1 against an executable built from `main` (the old allocator; both switches at 0 cost
+  +0.6 to 1.8 ns per small allocation more than it, see above), then each switch at 0 alone to
+  split the gain; `generation` and `flight` for pool ms/s and tick; v2 and v3
+  executables, private memory first (−735 MB when paused was gained with v3); then
+  `MI_PURGE_LONG=1` and the direct-TLS executable. Repeated > 1 KiB allocations per frame
+  (`push_item_layer`, `prepare` sorts, NBT clones, rc-mesh `to_vec`) belong to their zones: a
+  reused buffer beats any allocator setting.
 

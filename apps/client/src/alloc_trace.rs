@@ -1,16 +1,15 @@
 //! Allocation tracer (`RUSTCRAFT_ALLOCTRACE=1`): one stack sample every
 //! `STEP` bytes allocated per thread, accumulated by (thread, callers) and flushed to the log
-//! every 10 s, sorted by bytes. Diagnostic tool: costly when active, a single
-//! atomic read per allocation otherwise.
+//! every 10 s, sorted by bytes. Diagnostic tool: costly when active, free otherwise (its flag
+//! shares the allocator's flag byte, `debug_sys.rs`).
 #![allow(unsafe_code)]
 
 use hashbrown::HashMap;
 use std::cell::Cell;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Tracer active.
-pub static TRACE: AtomicBool = AtomicBool::new(false);
+use crate::debug_sys;
 
 /// Bytes between two samples of the same thread.
 const STEP: u64 = 256 * 1024;
@@ -28,20 +27,36 @@ static TABLE: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 /// Enables the tracer if the environment variable is set.
 pub fn init() {
     if rc_data::env_flag!("RUSTCRAFT_ALLOCTRACE") {
-        TRACE.store(true, Ordering::Relaxed);
+        debug_sys::trace_allocations(true);
     }
 }
 
-/// Called by the global allocator for each allocation while the tracer is active.
+/// Allocations by size: up to 1 KiB, above as a power of two, above otherwise. mimalloc's
+/// aligned calls padded the last kind (direct calls since, `debug_sys::plain_call_aligns`):
+/// the report says how frequent they are.
+pub(crate) static BY_SIZE: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+fn size_kind(size: usize) -> usize {
+    match size {
+        0..=1024 => 0,
+        _ if size.is_power_of_two() => 1,
+        _ => 2,
+    }
+}
+
+/// Called by the global allocator for each allocation while the tracer is active: `new_bytes`
+/// newly allocated (the growth, for a reallocation), in a block of `block_size` bytes (the size
+/// requested, which decides the padding).
 #[inline]
-pub fn sample(size: usize) {
+pub fn sample(new_bytes: usize, block_size: usize) {
     // Allocations made by the tracer itself: neither counted nor sampled.
     if BUSY.try_with(Cell::get).unwrap_or(true) {
         return;
     }
-    TOTAL.fetch_add(size as u64, Ordering::Relaxed);
+    BY_SIZE[size_kind(block_size)].fetch_add(1, Ordering::Relaxed);
+    TOTAL.fetch_add(new_bytes as u64, Ordering::Relaxed);
     let Ok(n) = ACC.try_with(|a| {
-        let v = a.get() + size as u64;
+        let v = a.get() + new_bytes as u64;
         a.set(v % STEP);
         v / STEP
     }) else {
@@ -98,7 +113,7 @@ static WINDOW: Mutex<(u64, f64)> = Mutex::new((0, 0.0));
 
 /// One line per second (bytes per frame, all threads) and the detail every 10 s.
 pub fn per_second(since: f64, frames: u32) {
-    if !TRACE.load(Ordering::Relaxed) {
+    if !debug_sys::tracing_allocations() {
         return;
     }
     {
@@ -106,8 +121,10 @@ pub fn per_second(since: f64, frames: u32) {
         let Ok(mut w) = WINDOW.lock() else { return };
         let frames = frames.max(1);
         let per_s = total.saturating_sub(w.0) as f64 / since;
+        let [small, power_of_two, other] = BY_SIZE.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / since);
         eprintln!(
-            "allocations: {:.1} MB/s, {:.1} KB per frame",
+            "allocations: {:.1} MB/s, {:.1} KB per frame; per second: {small:.0} up to 1 KiB, \
+             {power_of_two:.0} above as a power of two, {other:.0} above otherwise",
             per_s / 1_048_576.0,
             total.saturating_sub(w.0) as f64 / f64::from(frames) / 1024.0
         );
