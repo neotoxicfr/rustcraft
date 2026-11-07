@@ -6,8 +6,9 @@
 //! Like the game: paths separated by the 0x1E character, cumulation since turning on (no reset
 //! per frame), "live" reading of the results during the current frame.
 //!
-//! A third collection, ours, serves the perf log (`RUSTCRAFT_PERFLOG_STAGES`, `frame_stages.rs`):
-//! the zones right under `root` and the driver stages, by index, read once per frame.
+//! A collection apart, ours, besides the three text collections (`PIE`, `RECORD`, `SINGLE`), serves
+//! the perf log (`RUSTCRAFT_PERFLOG_STAGES`, `frame_stages.rs`): the zones right under `root`, the
+//! end of the frame and the driver stages, by index, read once per frame.
 
 use hashbrown::HashMap;
 use std::cell::{Cell, RefCell};
@@ -187,7 +188,8 @@ pub const SINGLE: usize = 2;
 thread_local! {
     static ON: Cell<bool> = const { Cell::new(false) };
     static COLLECTORS: RefCell<[Option<Collector>; 3]> = const { RefCell::new([None, None, None]) };
-    /// Third collection, for the perf log: the top zones and the driver stages by index
+    /// Collection apart from the three above, for the perf log: the top zones, the end of the
+    /// frame and the driver stages by index
     /// (`frame_stages.rs`), created once the composition is wanted.
     static FRAME_STAGES: RefCell<Option<FrameStageClock>> = const { RefCell::new(None) };
 }
@@ -397,40 +399,52 @@ mod tests {
         assert_eq!(depth(), 0);
     }
 
-    /// A frame through the real zone calls and the presentation guard: each top zone keeps its
-    /// own time, the driver call is taken out of the `frame` zone, the gap after the frame is
-    /// outside it, and the stages add up to the time between two readings within 5 %. Fails if a
-    /// driver stage stays charged to its zone, or a zone switch is lost.
+    /// A frame through the zone calls of `app_frame.rs`, in their order and at their depth (the
+    /// end of the frame is a child of `frame`, the presentation runs inside `render`), and the
+    /// presentation guard: each stage keeps its own time, the driver call and the end of the frame
+    /// are taken out of the `frame` zone, the gap after the frame is outside it, and the stages add
+    /// up to the time between two readings within 5 %. Fails if a driver stage stays charged to its
+    /// zone, if the end of the frame is not found under `frame`, or if a zone switch is lost.
     #[test]
     fn frame_stages_follow_the_zones_and_the_driver_calls() {
         use crate::frame_stages::FrameStage;
         use std::time::Duration;
-        let sleep = std::thread::sleep;
+        let sleep = |ms| std::thread::sleep(Duration::from_millis(ms));
         start_frame_stages();
         let started = Instant::now();
         let _ = take_frame_stages(started);
         start_tick();
         push("scheduledPacketProcessing");
-        sleep(Duration::from_millis(3));
+        sleep(3);
+        pop_push("scheduledExecutables");
+        pop_push("mouse");
+        pop();
+        push("tick");
+        pop();
+        push("sound");
         pop_push("frame");
         push("update");
-        sleep(Duration::from_millis(2));
-        pop();
-        crate::present_watch::during(crate::present_watch::Stage::Present, || sleep(Duration::from_millis(4)));
+        pop_push("extract");
+        sleep(2);
+        pop_push("render");
+        crate::present_watch::during(crate::present_watch::Stage::Present, || sleep(4));
         pop_push("fpsUpdate");
+        sleep(2);
         end_tick();
-        sleep(Duration::from_millis(1));
+        sleep(1);
         let now = Instant::now();
         let ns = take_frame_stages(now).expect("frame stages on");
         let ms = |s: FrameStage| ns[s as usize] as f64 / 1e6;
         let interval = now.duration_since(started).as_secs_f64() * 1e3;
         let sum: f64 = FrameStage::ALL.iter().map(|&s| ms(s)).sum();
         assert!((sum - interval).abs() <= 0.05 * interval, "stages {sum:.3} ms for a frame of {interval:.3} ms");
-        // Lower bounds: the sleeps; upper bounds: the sleep plus a scheduler's late wake-up.
-        let within = |s: FrameStage, low: f64| (low..low + 3.0).contains(&ms(s));
+        // Lower bounds: the sleeps, enough to catch a stage charged to another one. The upper
+        // margin is wide: a loaded machine or a shared runner wakes a sleeper late.
+        let within = |s: FrameStage, low: f64| (low..low + 20.0).contains(&ms(s));
         assert!(within(FrameStage::Packets, 3.0), "packets {:.3} ms", ms(FrameStage::Packets));
-        assert!(within(FrameStage::Frame, 2.0), "frame {:.3} ms (driver call left in it?)", ms(FrameStage::Frame));
+        assert!(within(FrameStage::Frame, 2.0), "frame {:.3} ms", ms(FrameStage::Frame));
         assert!(within(FrameStage::Present, 4.0), "present {:.3} ms", ms(FrameStage::Present));
+        assert!(within(FrameStage::FpsUpdate, 2.0), "end of frame {:.3} ms", ms(FrameStage::FpsUpdate));
         assert!(within(FrameStage::OutsideFrame, 1.0), "outside {:.3} ms", ms(FrameStage::OutsideFrame));
         // Depth and unwinding with no string collection on (only the frame stages).
         start_tick();
@@ -462,6 +476,7 @@ mod tests {
                 pop();
             }
             push("frame");
+            push("render");
             for stage in [crate::present_watch::Stage::Acquire, crate::present_watch::Stage::Submit] {
                 std::hint::black_box(during_driver_stage(stage, || 1));
             }

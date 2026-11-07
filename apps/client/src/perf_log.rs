@@ -528,7 +528,9 @@ pub fn frame(started: Instant, world: Option<WorldFrame>) {
         eprintln!("[perf] world entered at {:.0} ms", t * 1e3);
     }
     // Read at the same `now` as the interval: the stages of the frame add up to it exactly.
-    let stage_ns = crate::profiler::take_frame_stages(now);
+    // Read on every frame (the clock restarts here) but kept for the frames in a world only: out
+    // of a world the menu frame runs inside `scheduledExecutables` and would accuse the light.
+    let stage_ns = crate::profiler::take_frame_stages(now).filter(|_| world.is_some());
     let relight_ns = FRAME_RELIGHT_NS.swap(0, Relaxed);
     if let Some(last) = s.last.replace(now) {
         let ms = now.duration_since(last).as_secs_f64() * 1e3;

@@ -1,11 +1,14 @@
 //! Composition of each frame for the perf log (`RUSTCRAFT_PERFLOG_STAGES=1` with
-//! `RUSTCRAFT_PERFLOG`): a diagnostic, never on in the reference bench. A third collection of
-//! the frame profiler (`profiler.rs`) that keeps only the zones right under `root`, by index (no
-//! path text), plus the driver stages of the presentation guard (`present_watch.rs`: GPU wait,
-//! acquisition, submission, presentation...) which take over from the zone while they last, and
-//! the time between two frames (event loop, outside any frame). One clock, always charged to the
-//! current stage: the stages of a frame add up exactly to its interval in the perf log, since both
-//! are read at the same instant. Off: the profiler's usual thread boolean, nothing else.
+//! `RUSTCRAFT_PERFLOG`): a diagnostic, never on in the reference bench. A collection of the frame
+//! profiler (`profiler.rs`) apart from its three text collections, that keeps only the zones right
+//! under `root`, by index (no path text), plus `fpsUpdate` (the end of the frame, a child of
+//! `frame` in the zone tree), plus the driver stages of the presentation guard (`present_watch.rs`:
+//! GPU wait, acquisition, submission, presentation...) which take over from the zone while they
+//! last, and the time between two frames (event loop, outside any frame). One clock, always charged
+//! to the current stage: the stages of a frame add up exactly to its interval in the perf log,
+//! since both are read at the same instant. Only frames in a world are composed: out of a world the
+//! whole menu frame runs inside `scheduledExecutables`. Off: the profiler's usual thread boolean,
+//! nothing else.
 
 use std::time::Instant;
 
@@ -20,15 +23,18 @@ pub enum FrameStage {
     Unzoned,
     /// Server packets received (zone `scheduledPacketProcessing`).
     Packets,
-    /// Light then meshing scheduled after the packets (zone `scheduledExecutables`).
+    /// Light then meshing scheduled after the packets (zone `scheduledExecutables`; out of a
+    /// world the whole menu frame runs in it, so those frames are not composed).
     LightAndMeshing,
     Mouse,
     /// Client ticks.
     Tick,
     Sound,
-    /// Frame preparation and drawing on the CPU, driver stages excluded (zone `frame`).
+    /// Frame preparation and drawing on the CPU, driver stages and `fpsUpdate` excluded (zone
+    /// `frame`).
     Frame,
-    /// End of the frame: perf log, statistics (zone `fpsUpdate`).
+    /// End of the frame (zone `fpsUpdate` under `frame`): frame counter, statistics of each
+    /// second, and the perf log's own work after its reading, so it shows in the NEXT frame.
     FpsUpdate,
     /// A top zone of another name.
     OtherZone,
@@ -96,9 +102,15 @@ impl FrameStage {
             "tick" => FrameStage::Tick,
             "sound" => FrameStage::Sound,
             "frame" => FrameStage::Frame,
-            "fpsUpdate" => FrameStage::FpsUpdate,
             _ => FrameStage::OtherZone,
         }
+    }
+
+    /// Stage of a zone opened right under the top zone `top`: only the end of the frame has one.
+    /// The zone tree stays the game's (the F3 chart shows it), so `fpsUpdate` is found at its
+    /// own depth rather than moved to the top.
+    fn of_child_zone(top: FrameStage, name: &str) -> Option<FrameStage> {
+        (top == FrameStage::Frame && name == "fpsUpdate").then_some(FrameStage::FpsUpdate)
     }
 
     /// Stage of a driver call watched by the presentation guard; `None` for its other states.
@@ -171,20 +183,28 @@ impl FrameStageClock {
         self.enter_zone(FrameStage::OutsideFrame, now);
     }
 
-    /// Zone `name` opened; `now` is only read when it is a top zone (the clock stays still for the
-    /// nested ones, which are most zone calls).
+    /// Zone `name` opened; `now` is only read when it changes the stage (a top zone, or the end
+    /// of the frame): the clock stays still for the other nested zones, which are most zone calls.
     pub fn push(&mut self, name: &str, now: impl FnOnce() -> Instant) {
         if self.depth == 0 {
             return; // outside a frame, like the profiler's collections
         }
         self.depth += 1;
-        if self.depth == 2 {
-            self.enter_zone(FrameStage::of_top_zone(name), now());
+        match self.depth {
+            2 => self.enter_zone(FrameStage::of_top_zone(name), now()),
+            3 => {
+                if let Some(stage) = FrameStage::of_child_zone(self.zone, name) {
+                    self.enter_zone(stage, now());
+                }
+            }
+            _ => {}
         }
     }
 
     pub fn pop(&mut self, now: impl FnOnce() -> Instant) {
         match self.depth {
+            // The end of the frame closed: back to its top zone.
+            3 if self.zone == FrameStage::FpsUpdate => self.enter_zone(FrameStage::Frame, now()),
             2 => self.enter_zone(FrameStage::Unzoned, now()),
             // `root` closed: the frame is over for the collections.
             1 => self.enter_zone(FrameStage::OutsideFrame, now()),
@@ -314,15 +334,37 @@ mod tests {
         c.push("frame", || t0);
         c.begin_driver(FrameStage::Acquire, at(t0, 10));
         c.pop(|| at(t0, 20));
-        c.push("fpsUpdate", || at(t0, 30));
+        c.push("sound", || at(t0, 30));
         assert_eq!(c.current, FrameStage::Acquire, "the driver stage keeps running");
         c.end_driver(at(t0, 50));
-        assert_eq!(c.current, FrameStage::FpsUpdate);
+        assert_eq!(c.current, FrameStage::Sound);
         let ns = c.take(at(t0, 60));
         assert_eq!(ns[FrameStage::Acquire as usize], 40_000);
         assert_eq!(ns[FrameStage::Frame as usize], 10_000);
-        assert_eq!(ns[FrameStage::FpsUpdate as usize], 10_000);
+        assert_eq!(ns[FrameStage::Sound as usize], 10_000);
         assert_eq!(ns.iter().sum::<u64>(), 60_000);
+    }
+
+    /// The end of the frame is a child of `frame` (the zone tree of `app_frame.rs`): it gets its own
+    /// stage there, and only there; closed, the clock goes back to `frame`.
+    #[test]
+    fn end_of_frame_is_found_under_the_frame_zone() {
+        let t0 = Instant::now();
+        let mut c = FrameStageClock::new(t0);
+        c.start_frame(t0);
+        c.push("frame", || t0);
+        c.push("render", || unreachable!("no clock read for a nested zone"));
+        c.pop(|| unreachable!("no clock read for a nested zone"));
+        c.push("fpsUpdate", || at(t0, 10)); // frame 10 µs
+        c.pop(|| at(t0, 30)); // end of the frame 20 µs
+        assert_eq!(c.current, FrameStage::Frame);
+        c.pop(|| at(t0, 35)); // frame 5 µs more
+        c.push("tick", || at(t0, 35));
+        c.push("fpsUpdate", || unreachable!("not the end of the frame under another zone"));
+        let ns = c.take(at(t0, 40));
+        assert_eq!(ns[FrameStage::Frame as usize], 15_000);
+        assert_eq!(ns[FrameStage::FpsUpdate as usize], 20_000);
+        assert_eq!(ns[FrameStage::Tick as usize], 5_000);
     }
 
     /// Slow frames are those over twice the median; the slowest frame is reported whole.
