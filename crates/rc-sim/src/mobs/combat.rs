@@ -1153,6 +1153,26 @@ impl Server {
 
     /// Damage of a mob to the player: difficulty scaling, knockback, memory of the attacker.
     pub(crate) fn player_hurt_by_mob(&mut self, m: &Mob, ty: &str, amount: f32, kb: Option<(f64, f64)>) -> bool {
+        let Some(d) = self.mob_damage_on_player(ty, amount) else { return false };
+        self.player_hurt_by_mob_scaled(Box::new(m.clone()), ty, d, kb)
+    }
+
+    /// `player_hurt_by_mob` for a caller that already made its own copy of the mob: that copy
+    /// becomes the damage source, instead of a second copy.
+    pub(crate) fn player_hurt_by_mob_copy(
+        &mut self,
+        m: Box<Mob>,
+        ty: &str,
+        amount: f32,
+        kb: Option<(f64, f64)>,
+    ) -> bool {
+        let Some(d) = self.mob_damage_on_player(ty, amount) else { return false };
+        self.player_hurt_by_mob_scaled(m, ty, d, kb)
+    }
+
+    /// Damage of a mob's hit on the player after the difficulty; `None` if the difficulty cancels
+    /// it (the shoulder parrots still get off).
+    fn mob_damage_on_player(&mut self, ty: &str, amount: f32) -> Option<f32> {
         self.prog.riposte = None;
         let scaling = self
             .life
@@ -1174,25 +1194,32 @@ impl Server {
                 if !self.hurt_refused(ty) {
                     super::surface::parrot::remove_from_shoulders(self);
                 }
-                return false;
+                return None;
             }
         }
+        Some(d)
+    }
+
+    /// The rest of `player_hurt_by_mob`, damage `d` already scaled; `m`: copy of the mob, kept as
+    /// the damage source for the time of the hit.
+    fn player_hurt_by_mob_scaled(&mut self, m: Box<Mob>, ty: &str, d: f32, kb: Option<(f64, f64)>) -> bool {
         let full = self.life.vit.cooldown <= 10;
         // W8c: without a source set by the caller (projectile, explosion), the mob hits
         // itself: position, weapon that disables the shield.
         if self.prog.dmg_src.pos.is_none() {
-            self.prog.dmg_src = self.melee_src(m, ty);
+            self.prog.dmg_src = self.melee_src(&m, ty);
         }
+        let id = m.id;
         // Direct attacker, named in the death message ("killed by a husk").
         self.mobs.hit_by = Some(m.kind);
-        self.prog.attacker = Some(Box::new(m.clone())); // S9: damage source
+        self.prog.attacker = Some(m); // S9: damage source
         let ok = self.hurt(ty, d);
         self.prog.attacker = None; // S9
         self.mobs.hit_by = None;
         if !ok {
             return false;
         }
-        self.mobs.player_hurt_by = Some((Ent::Mob(m.id), self.mobs.player_ticks));
+        self.mobs.player_hurt_by = Some((Ent::Mob(id), self.mobs.player_ticks));
         if full && !self.dmg_tag(ty, "minecraft:no_knockback") {
             // Without an origin, the game still pushes, in a randomly drawn direction.
             let (xd, zd) = kb.unwrap_or((0.0, 0.0));

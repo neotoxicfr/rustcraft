@@ -5,7 +5,7 @@
 
 use rc_physics::Aabb;
 
-use super::{DEG, PKind, Proj, lerp_rotation};
+use super::{DEG, PKind, Proj, ProjectilePaths, Sabotage, lerp_rotation};
 use crate::mobs::mob::Ent;
 use crate::mobs::mth::atan2;
 use crate::server::Server;
@@ -162,6 +162,37 @@ pub fn margin(tick_count: i32) -> f64 {
     f64::from(((tick_count - 2) as f32 / 20.0).clamp(0.0, 0.3))
 }
 
+/// `clip_cell_hit` on the local collision boxes of the cell.
+fn clip_cell_boxes(boxes: &[Aabb], cell: [i32; 3], from: [f64; 3], to: [f64; 3]) -> Option<BlockHit> {
+    if boxes.is_empty() {
+        return None;
+    }
+    let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+    if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < 1.0e-7 {
+        return None;
+    }
+    let test = [from[0] + d[0] * 0.001, from[1] + d[1] * 0.001, from[2] + d[2] * 0.001];
+    let c = cell.map(f64::from);
+    if boxes.iter().any(|b| contains(&b.offset(c[0], c[1], c[2]), test)) {
+        return Some(BlockHit { loc: test, pos: cell, face: opposite(nearest_face(d)), inside: true, border: false });
+    }
+    let mut best: Option<(f64, usize)> = None;
+    for b in boxes {
+        let bb = b.offset(c[0], c[1], c[2]);
+        // Same sweep as the intersection of a ray with a list of boxes: the scale shrinks from one box to the next.
+        let mut sub = aabb_clip(&bb, from, to);
+        if let (Some((s, _)), Some((bs, _))) = (sub, best)
+            && s >= bs
+        {
+            sub = None;
+        }
+        if sub.is_some() {
+            best = sub;
+        }
+    }
+    best.map(|(s, face)| BlockHit { loc: lerp3(s, from, to), pos: cell, face, inside: false, border: false })
+}
+
 impl Server {
     /// Trace of the segment against collision shapes (colliding blocks, without fluid).
     pub(crate) fn proj_clip(&self, from: [f64; 3], to: [f64; 3]) -> Option<BlockHit> {
@@ -224,45 +255,37 @@ impl Server {
 
     /// The intersection of a ray with a one-cell shape on the original segment.
     fn clip_cell_hit(&self, cell: [i32; 3], from: [f64; 3], to: [f64; 3]) -> Option<BlockHit> {
-        let boxes = self.phys.shape(self.st(cell));
-        if boxes.is_empty() {
-            return None;
+        self.with_collision_shape(self.st(cell), |boxes| clip_cell_boxes(boxes, cell, from, to))
+    }
+
+    /// Local collision boxes of `state` given to `f`: borrowed from the shape table, or (old path)
+    /// copied into a new list first.
+    pub(crate) fn with_collision_shape<R>(&self, state: u32, f: impl FnOnce(&[Aabb]) -> R) -> R {
+        if ProjectilePaths::current().borrowed_shapes {
+            return f(self.phys.shape(state));
         }
-        let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
-        if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < 1.0e-7 {
-            return None;
-        }
-        let test = [from[0] + d[0] * 0.001, from[1] + d[1] * 0.001, from[2] + d[2] * 0.001];
-        let c = cell.map(f64::from);
-        if boxes.iter().any(|b| contains(&b.offset(c[0], c[1], c[2]), test)) {
-            return Some(BlockHit {
-                loc: test,
-                pos: cell,
-                face: opposite(nearest_face(d)),
-                inside: true,
-                border: false,
-            });
-        }
-        let mut best: Option<(f64, usize)> = None;
-        for b in boxes {
-            let bb = b.offset(c[0], c[1], c[2]);
-            // Same sweep as the intersection of a ray with a list of boxes: the scale shrinks from one box to the next.
-            let mut sub = aabb_clip(&bb, from, to);
-            if let (Some((s, _)), Some((bs, _))) = (sub, best)
-                && s >= bs
-            {
-                sub = None;
-            }
-            if sub.is_some() {
-                best = sub;
-            }
-        }
-        best.map(|(s, face)| BlockHit { loc: lerp3(s, from, to), pos: cell, face, inside: false, border: false })
+        let mut boxes = Vec::new();
+        self.phys.collision(state, &mut boxes);
+        f(&boxes)
     }
 
     /// Possible targets of a projectile in `area`, with box and position.
     pub(crate) fn proj_targets(&self, p: &Proj, area: &Aabb, items: bool) -> Vec<(Target, Aabb, [f64; 3])> {
         let mut out = Vec::new();
+        self.for_each_target(p, area, items, |t, b, pos| out.push((t, b, pos)));
+        out
+    }
+
+    /// Possible targets of a projectile in `area`, each given to `visit` with its box and position,
+    /// in the order of `proj_targets`.
+    pub(crate) fn for_each_target(
+        &self,
+        p: &Proj,
+        area: &Aabb,
+        items: bool,
+        mut visit: impl FnMut(Target, Aabb, [f64; 3]),
+    ) {
+        let prefilter = ProjectilePaths::current().target_prefilter;
         let owner = self.proj_owner(p);
         let blocks_owner = |e: Ent| !p.left_owner && owner == Some(e);
         for o in self.mobs.list.iter() {
@@ -278,7 +301,7 @@ impl Server {
                 for i in 0..8 {
                     let b = crate::mobs::end::dragon::part_box(d, i);
                     if b.intersects(area) {
-                        out.push((Target::Part(o.id, i as u8), b, d.parts[i]));
+                        visit(Target::Part(o.id, i as u8), b, d.parts[i]);
                     }
                 }
                 continue;
@@ -287,15 +310,20 @@ impl Server {
             if (p.kind.hurting() || p.kind == PKind::ShulkerBullet) && crate::mobs::illagers::no_physics(o) {
                 continue;
             }
+            // The species bound says the box cannot reach the area: no box to work out (the
+            // dragon, whose parts reach further than its box, went through above).
+            if prefilter && !o.may_touch(area) {
+                continue;
+            }
             let b = o.bbox();
             if b.intersects(area) {
-                out.push((Target::Living(e), b, o.pos()));
+                visit(Target::Living(e), b, o.pos());
             }
         }
         if self.game_mode != 3 && self.ent_alive(Ent::Player) && !blocks_owner(Ent::Player) {
             let b = self.player_aabb();
             if b.intersects(area) && !p.pierced.contains(&self.player_id) {
-                out.push((Target::Living(Ent::Player), b, self.pos));
+                visit(Target::Living(Ent::Player), b, self.pos);
             }
         }
         // "Catchable" non-living entities (except fishing hook): End crystals, shulker bullets
@@ -307,14 +335,14 @@ impl Server {
             for c in self.mobs.end.crystals.iter().filter(|c| !c.removed && !wind) {
                 let b = c.bbox();
                 if b.intersects(area) && !p.pierced.contains(&c.id) {
-                    out.push((Target::Crystal(c.id), b, c.pos));
+                    visit(Target::Crystal(c.id), b, c.pos);
                 }
             }
             // G5-F06: minecarts (always touchable as long as they exist).
             for c in self.carts.list.iter().flatten().filter(|c| !c.removed) {
                 let b = c.bbox();
                 if b.intersects(area) && !p.pierced.contains(&c.id) {
-                    out.push((Target::Cart(c.id), b, c.pos));
+                    visit(Target::Cart(c.id), b, c.pos);
                 }
             }
             for q in self.proj.list.iter().filter(|q| !q.removed && q.id != p.id && !(wind && q.kind.wind())) {
@@ -324,7 +352,7 @@ impl Server {
                 };
                 let b = q.bbox();
                 if ok && b.intersects(area) && !p.pierced.contains(&q.id) {
-                    out.push((Target::Proj(q.id), b, q.pos));
+                    visit(Target::Proj(q.id), b, q.pos);
                 }
             }
         }
@@ -335,14 +363,13 @@ impl Server {
                     max: [d.pos[0] + 0.125, d.pos[1] + 0.25, d.pos[2] + 0.125],
                 };
                 if b.intersects(area) {
-                    out.push((Target::Item(d.id), b, d.pos));
+                    visit(Target::Item(d.id), b, d.pos);
                 }
             }
         }
-        out
     }
 
-    /// The nearest of the boxes inflated by the margin.
+    /// The nearest of the boxes inflated by the margin (the first met at equal distance).
     pub(crate) fn entity_hit_nearest(
         &self,
         p: &Proj,
@@ -352,14 +379,24 @@ impl Server {
         m: f64,
         items: bool,
     ) -> Option<EntityHit> {
+        let paths = ProjectilePaths::current();
+        let last_at_equal = paths.sabotage == Sabotage::LastTargetAtEqualDistance;
         let mut best: Option<(f64, EntityHit)> = None;
-        for (t, b, _) in self.proj_targets(p, area, items) {
+        let mut consider = |t: Target, b: Aabb| {
             if let Some((s, _)) = aabb_clip(&inflate(&b, m), from, to) {
                 let loc = lerp3(s, from, to);
                 let dd = dist2(from, loc);
-                if best.is_none_or(|x| dd < x.0) {
+                if best.is_none_or(|x| dd < x.0 || (last_at_equal && dd == x.0)) {
                     best = Some((dd, EntityHit { ent: t, loc }));
                 }
+            }
+        };
+        if paths.targets_in_place {
+            // Picked while walking: no list of targets built every tick of a flying projectile.
+            self.for_each_target(p, area, items, |t, b, _| consider(t, b));
+        } else {
+            for (t, b, _) in self.proj_targets(p, area, items) {
+                consider(t, b);
             }
         }
         best.map(|b| b.1)
@@ -593,7 +630,10 @@ impl Server {
         let state = self.st(bp);
         if physics {
             let c = bp.map(f64::from);
-            if self.phys.shape(state).iter().any(|b| contains(&b.offset(c[0], c[1], c[2]), p.pos)) {
+            let tip_inside = self.with_collision_shape(state, |boxes| {
+                boxes.iter().any(|b| contains(&b.offset(c[0], c[1], c[2]), p.pos))
+            });
+            if tip_inside {
                 p.vel = [0.0; 3];
                 p.in_ground = true;
             }

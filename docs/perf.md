@@ -8777,3 +8777,103 @@ CPU ms and p99, defaults against every switch at 0 and against the reference exe
 `terrain_column_commands_reused_per_frame` and `_rebuilt_per_frame` give the cache's share in game.
 The background placement next to the entity preparation belongs to C3-M07.
 
+## C6-M22: projectiles, no full copy per tick, borrowed shapes, shooter and targets without a full walk (07/11, loaded machine)
+
+Before: every tick of every projectile copied the whole projectile out of its slot (stacks, entity
+data, pierced lists, bullet state) and wrote it back; every cell of a projectile's block clip and
+the stuck test of every arrow copied the cell's collision shape into a new list; the shooter was
+found by walking the whole mob list (several times per tick of a flying projectile); the target
+search built a list of every candidate (each mob's box worked out) to keep the nearest; a mob's
+arrow or potion hurting the player copied the mob twice (once here, once as the damage source);
+the bobber's open-water test compared names and properties as text over 100 cells; the chorus
+fruit searched the block's name in the whole block list at every cell of its descents. Switches
+(`projectiles/paths.rs`, default = new, `=0` = old path, read once):
+- `RUSTCRAFT_OPT_PROJECTILE_TAKE_HEAVY_FIELDS`: the heap fields move out of the slot for the tick;
+  the slot keeps a light copy (no heap data) for the others to read, as they read the full copy
+  before. Guard: when a dimension change during the tick replaced the list (a function reward of an
+  advancement can `tp` the player away in the middle of an arrow's hit), the slot is found by
+  identifier in the active or parked lists and gets the whole result of the tick, its tracking
+  (cleared by the dimension change) and a removal by another kept. This is also a fidelity fix,
+  on both paths: the old path dropped the tick's result there (the arrow that hit the target
+  block flew on, pre-hit, in the parked world), and a first version of the guard gave back only
+  the heavy fields (entity data of after the tick, in-ground and critical flags of before: the
+  pairing on return sent "in ground" for an arrow the server simulated in flight).
+- `RUSTCRAFT_OPT_PROJECTILE_BORROWED_SHAPES`: block clip, stuck test and the bobber's collision test
+  borrow the cell's shape (`with_collision_shape`). Separate from C6-M04's
+  `RUSTCRAFT_OPT_SIGHTLINE_BORROWED_SHAPES` so that each is measured alone.
+- `RUSTCRAFT_OPT_PROJECTILE_OWNER_INDEX`: shooter through the mobs' UUID index
+  (`find_uuid_where`, same first mob; a miss still walks the list: the index is only a hint).
+- `RUSTCRAFT_OPT_PROJECTILE_TARGET_PREFILTER`: species bound (`may_touch`) before a mob's box,
+  after the dragon's parts.
+- `RUSTCRAFT_OPT_PROJECTILE_TARGETS_IN_PLACE`: the nearest target picked while walking
+  (`for_each_target`, same order); the piercing search keeps its list and stable sort.
+- `RUSTCRAFT_OPT_HIT_WITHOUT_MOB_CLONE`: one copy of the mob, moved into the damage source
+  (`player_hurt_by_mob_copy`); the mace smash of a mob borrows the attacker. Taking the mob out of
+  its slot for the hit (as the pufferfish and `/damage` do) was refused: when the hit kills the
+  player, the mobs forgive the dead player by walking the list and the kill credit looks the
+  shooter up; both would miss it.
+- `RUSTCRAFT_OPT_CHORUS_TAG_BITS`: tags through the state's block index and the tag bits, both
+  forms of the tag name kept (full, then without namespace).
+- `RUSTCRAFT_OPT_FISHING_STATE_BITS`: open-water class of a cell from the state's air flag, the lily
+  pad's block index, the fluid's source bit and the borrowed shape; water block by block index.
+
+Proof (`projectiles/paths_equivalence_tests.rs`, each run on a fresh flat world in its own thread,
+stored fingerprints, Windows): archers (20 skeletons shooting at a survival player every 40 ticks,
+a witch throwing potions, arrows stuck in wooden buttons, pressure plates, slabs and fences, effect
+and spectral arrows, a piercing arrow through pigs, a loyal trident, a large fireball sent back,
+rain, 3,000 ticks, 452,999 trace lines: every projectile each tick, every event, saved compounds)
+identical on the old path, each new path alone and all of them; a dimension change in the middle of
+an arrow's tick (target block → advancement → `tp` to the Nether, critical piercing arrow), then
+the player back: parked compounds and the pairing on return identical, and the parked slot holds
+the hit (stuck, no longer critical nor piercing, entity data agreeing; this check failed on both
+paths before the fix), sabotage "slot not written back" seen; 10,000 random boxes in a crowd of 1,000 mobs:
+targets (order included), nearest hit and owner (alive, removed, shared UUID, absent) identical,
+sabotage "last target at equal distance" seen 40 times; every block state: chorus tags (both forms),
+open-water class, water block, shape; 32 chorus fruits (open ground, closed room); 2,000 ticks of
+fishing (open pond, then roofed: 4 catches); a mob's mace smash among allies. The tick copy takes
+its heavy fields with 0 allocations (counted). Sabotages seen failing by hand: heavy fields not given
+back to the tick copy; owner scan resumed after the hinted slot; prefilter on an area shrunk by 0.3.
+
+| Micro-bench, loaded machine, 1 core, median of 7 | old path | new |
+|---|---|---|
+| server tick, 1,000 stuck arrows: allocations of the server thread | 2,077 per tick | 77 per tick |
+| tick copy of one effect arrow (pierced list) | 141-226 ns, 8 allocations | 55-91 ns, 0 |
+| block clip across 30 cells (slabs, fences, stone) | 1,093 ns, 1 allocation | 574 ns, 0 |
+| shooter lookup, alive among 1,000 mobs | 590-810 ns | 11.4 ns |
+| shooter lookup, absent | 1.53-1.77 µs | same (the miss walks the list) |
+| nearest target of a flying arrow, 1,000 mobs | 27-42 µs, 2 allocations | 12.7 µs, 0 |
+| same, prefilter alone / in place alone / owner index alone | | 15.5 / 30.8 (0 allocations) / 32.3 µs |
+| a skeleton's arrow hurting the player | 5.7-9.8 µs, 54 allocations | 4.1-7.4 µs, 34 |
+| bobber's open-water test (100 cells), open / roofed | 3.83 / 4.13 µs | 1.88 / 2.24 µs |
+| chorus tag test per cell, average over every state | 742 ns | 90 ns |
+| chorus fruit in a closed end stone room / stone room | 14.0 / 4.6 µs | 4.6 / 4.7 µs |
+
+Whole server ticks with 1,000 stuck arrows (`bench_projectile_tick`). A first run (2 passes,
+always the old path first and the new one last) gave old 537-611 µs against new 721-821 µs: the
+order, not the path (a world's tick shifts with the allocator's state left by the worlds opened
+before). The bench now opens a warm-up world, then runs 4 passes, forward and backward in turn
+(old and new each first twice and last twice), and prints every figure with its pass and
+position. Loaded machine, median tick per pass: plain arrows old 690-847 µs, new 719-807 µs
+(ranges overlap: no conclusion), take alone 589-758 µs; effect arrows old 886-1,142 µs, new
+717-755 µs (new ahead in every pass and position), take alone 586-788 µs. Allocations of the
+server thread 2,077 → 77 per tick on both. To be measured again on the quiet machine before any
+gain is announced. A
+full-height chorus descent (384 cells × 16 attempts) is ≈ 4.6 ms old against ≈ 0.55 ms new by the
+per-cell figure. Axes: server CPU, allocations, regularity (chorus spike); network, save, rendering,
+memory unchanged (packets and compounds compared; the slot's light copy is the same size);
+multi-core and GPU not applicable (fewer than a hundred projectiles in play, applied in list order).
+Not done, kept as leads: heavy fields shared behind an `Arc` (model of the copy 41-55 ns against
+55-91 ns moved; not built: a type cannot follow a switch, every write site would go through
+`make_mut`, and during the tick the slot holds the second count, so any write copies every heavy
+field again); the stuck arrow's block effects skipped when its cell's contact mask is empty (asked
+for after a measure only); the chorus's tag lookups resolved once per fruit (named tag bit, short
+form looked up once: ≈ 90 → 10 ns a cell, rare event); orphan projectiles still walk the mob list
+for their shooter (an authoritative index miss needs the index to follow UUID changes); a spatial
+index of the mobs (C6-M37). Found on the way, other zones: a mob hurt by the player's projectile is
+out of its list during the hurt, so an advancement reward that changes the dimension there puts it
+back into the other world's list (panic past the end in `MobList::put`, or the wrong world): every
+path, every take/put site around a hurt; in the flat test world, skeletons holding a bow and
+targeting the player never shot in 3,000 ticks (the server test `skeleton_shoots` passes): check that
+`crowd-1000-archers` really shoots before measuring there. To settle on the quiet-machine scene
+bench: `crowd-1000-archers`, `crowd-1000`.
+
