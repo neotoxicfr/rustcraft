@@ -303,7 +303,7 @@ impl Server {
                 eprintln!("singleplayer: chunk {p:?} not rewritten (unknown identifier)");
                 continue;
             };
-            c.changed.iter_mut().for_each(|x| *x = false);
+            c.changed.iter_mut().chain(c.biomes_changed.iter_mut()).for_each(|x| *x = false);
             let nbt = encoder.encode(&root);
             c.root = root;
             jobs.push(Job::Chunk { path: region_dir.join(region_name(p.0, p.1)), cx: p.0, cz: p.1, nbt });

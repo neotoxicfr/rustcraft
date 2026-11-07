@@ -107,6 +107,8 @@ pub struct Chunk {
     pub lossy: bool,
     /// Sections whose blocks changed since the read (re-encoded on write).
     pub changed: Vec<bool>,
+    /// Sections whose biomes changed since the read (`/fillbiome`; re-encoded on write).
+    pub biomes_changed: Vec<bool>,
     /// Modified since the last save.
     pub dirty: bool,
 }
@@ -617,16 +619,19 @@ impl Chunk {
             let i = y - min;
             if (0..h.sections as i32).contains(&i) {
                 let sec = &self.sections[i as usize];
-                if self.changed[i as usize] || (!existed && !sec.is_empty()) {
+                let blocks_reencoded = self.changed[i as usize] || (!existed && !sec.is_empty());
+                if blocks_reencoded {
                     let blocks = encode_container(&sec.blocks, SECTION_BLOCKS, true, |v| states.palette_entry(data, v));
                     crate::nbtio::set(&mut s, "block_states", blocks);
-                    if s.get("biomes").is_none() {
-                        let names = &states.biome_names;
-                        let biomes = encode_container(&sec.biomes, SECTION_BIOMES, false, |v| {
-                            Nbt::String(names.get(v as usize).cloned().unwrap_or_else(|| "minecraft:plains".into()))
-                        });
-                        crate::nbtio::set(&mut s, "biomes", biomes);
-                    }
+                }
+                // Biomes changed in memory (`/fillbiome`) are written like the blocks; before, the
+                // biomes read stayed on disk and the change was lost at the next opening.
+                if self.biomes_changed[i as usize] || (blocks_reencoded && s.get("biomes").is_none()) {
+                    let names = &states.biome_names;
+                    let biomes = encode_container(&sec.biomes, SECTION_BIOMES, false, |v| {
+                        Nbt::String(names.get(v as usize).cloned().unwrap_or_else(|| "minecraft:plains".into()))
+                    });
+                    crate::nbtio::set(&mut s, "biomes", biomes);
                 }
             }
             for (key, layer) in [("BlockLight", &self.block[li as usize]), ("SkyLight", &self.sky[li as usize])] {
@@ -754,6 +759,7 @@ pub(crate) fn parse_with(
         root,
         lossy,
         changed: vec![false; n],
+        biomes_changed: vec![false; n],
         dirty: false,
     };
     c.prime_heightmaps(&states.heightmap_rules, states.air_state, h);
@@ -842,6 +848,7 @@ mod heightmap_tests {
             root: Nbt::Compound(vec![("Status".into(), Nbt::String("minecraft:full".into()))]),
             lossy: false,
             changed: vec![false; H.sections],
+            biomes_changed: vec![false; H.sections],
             dirty: false,
         };
         let layers =

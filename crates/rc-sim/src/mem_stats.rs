@@ -565,6 +565,7 @@ mod tests {
                 root: chunk_root(sections + (i % 3) as i8, longs),
                 lossy: false,
                 changed: Vec::new(),
+                biomes_changed: Vec::new(),
                 dirty: false,
             };
             map.insert((i, -i), Some(Box::new(chunk)));

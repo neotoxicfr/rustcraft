@@ -325,6 +325,7 @@ impl<'a> Conv<'a> {
             root: Nbt::Compound(root),
             lossy: false,
             changed: vec![false; n],
+            biomes_changed: vec![false; n],
             dirty: true,
         }
     }

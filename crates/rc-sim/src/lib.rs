@@ -196,6 +196,8 @@ mod tests_s2;
 #[cfg(test)]
 mod newworld_tests;
 #[cfg(test)]
+mod chunk_disk_tests;
+#[cfg(test)]
 mod portal_tests;
 #[cfg(test)]
 mod tests_s7;
