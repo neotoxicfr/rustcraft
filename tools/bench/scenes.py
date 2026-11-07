@@ -536,6 +536,8 @@ SCENES.update({
     **{f"particles-{n}": {"at": "plains", **STANDARD, "env": {"RUSTCRAFT_PARTICLES_BENCH": str(n)}} for n in (1000, 4000, 16000)},
     # Priming around 27 s (entering the game ≈ 1 s + 520 ticks): 1st explosion around 31 s, then every 5 s.
     "tnt": {**CROWD, "cmd": FUNCTION("tnt", 520)},
+    # 1,728 TNT blocks set off at 27 s: the chain runs inside the measured window (30 to 50 s).
+    "tnt-heap": {**CROWD, "cmd": FUNCTION("tnt_heap", 520)},
     "fireworks": {**CROWD, "cmd": FUNCTION("fireworks")},
     # Mobs.
     "crowd-close-up": {"site": "crowd", "d": [0.5, 2.0, -6.5], "rot": [0.0, 10.0], "rd": 12, "secs": 50, "from": 30,
