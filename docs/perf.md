@@ -1840,7 +1840,7 @@ section too low; sections skipped by their count, which turns cave air into plai
 | Conversion alone, Mcycles / chunk (25 chunks, best of 20) | 0.262 | skip air 0.094; maps while converting 0.184; both 0.078 | −70 % (both) |
 | Conversion alone, µs / chunk (best) | 58.5 | skip air 20.6; maps 36.6; both 17.5 | ≈ −40 µs per chunk |
 | Allocations of `DimGen::terrain` / chunk (`REUSE_PROTO_BUFFER`) | 64.0, 3,316 KB | 63.0, 3,125 KB | −1 allocation, −191 KB asked |
-| `DimGen::terrain`, ms / chunk, 1 / 8 / 32 threads (median) | 4.38 / 0.62 / 0.230 | 4.55 / 0.62 / 0.228 | conversion gain (1 %) under the noise |
+| `DimGen::terrain`, ms / chunk, 1 / 8 / 32 threads (median) | 4.38 / 0.62 / 0.230 | 4.55 / 0.62 / 0.228 | expected gain ≈ 1 % (40 µs / 4.4 ms), not seen: 1 thread +3.9 % median, loaded machine, ±40 %; scene `generation-1thread` kept for the quiet bench |
 
 - Filling (`fill_tracking_columns`): the chunk is fresh and each cell is written once, so the
   block is written without reading the old one back (`ProtoTerrain::set_fresh`), the section counts

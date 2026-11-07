@@ -714,7 +714,7 @@ impl DimGen {
         // with the game's tags, checked here once).
         let skip_air = o.skip_air_sections && self.final_map_bits[AIR as usize] == 0;
         if o.heightmaps_while_converting {
-            c.convert_terrain_finding_final_maps(terrain, &self.to_state, &self.final_map_bits, air, skip_air);
+            c.convert_terrain_finding_final_maps(terrain, &self.to_state, &self.final_map_bits, air, skip_air, true);
             FinalMapsToDo::Nothing
         } else if skip_air {
             FinalMapsToDo::WalkBelow(c.convert_terrain_skipping_air(terrain, &self.to_state, air, true))

@@ -312,9 +312,10 @@ impl DecoChunk {
 
     /// Converts `terrain` like [`Self::convert_terrain_skipping_air`] (plain air sections skipped
     /// only with `skip_air`), but layer by layer from the top, and finds the four final height maps
-    /// on the way, which replaces the walk of [`Self::prime_final_heightmaps`]. `self` is a new
-    /// chunk (every state 0); `map_bits[id]`: the height map bits of `to_state[id]`. Exact as long
-    /// as the skipped air counts in no map.
+    /// on the way, which replaces the walk of [`Self::prime_final_heightmaps`]. A skipped section is
+    /// left as is only when the chunk is `fresh` (every state 0) and `air` is 0, filled with `air`
+    /// otherwise; `map_bits[id]`: the height map bits of `to_state[id]`. Exact as long as the
+    /// skipped air counts in no map.
     pub fn convert_terrain_finding_final_maps(
         &mut self,
         terrain: &[u16],
@@ -322,22 +323,25 @@ impl DecoChunk {
         map_bits: &[u8],
         air: State,
         skip_air: bool,
+        fresh: bool,
     ) {
+        let already_air = fresh && air == 0;
         let mut search = FinalMapSearch::new(self.min_y as i16);
-        for (k, (src, dst)) in sections(terrain, &mut self.blocks).enumerate().rev() {
-            if skip_air && is_terrain_air(src) {
-                if air != 0 {
-                    dst.fill(air);
+        for (k, (section_ids, section_states)) in sections(terrain, &mut self.blocks).enumerate().rev() {
+            if skip_air && is_terrain_air(section_ids) {
+                if !already_air {
+                    section_states.fill(air);
                 }
                 continue;
             }
-            let layers = src.as_chunks::<256>().0.iter().zip(dst.as_chunks_mut::<256>().0);
-            for (layer, (src, dst)) in layers.enumerate().rev() {
-                for (d, &id) in dst.iter_mut().zip(src) {
-                    *d = to_state[id as usize];
+            let layer_ids = section_ids.as_chunks::<256>().0.iter();
+            let layers = layer_ids.zip(section_states.as_chunks_mut::<256>().0);
+            for (layer, (layer_ids, layer_states)) in layers.enumerate().rev() {
+                for (state, &id) in layer_states.iter_mut().zip(layer_ids) {
+                    *state = to_state[id as usize];
                 }
                 let y = self.min_y + 16 * k as i32 + layer as i32;
-                search.visit_layer(y, src, map_bits);
+                search.visit_layer(y, layer_ids, map_bits);
             }
         }
         for (k, m) in FINAL_HMS.iter().enumerate() {
@@ -1066,7 +1070,7 @@ mod tests {
             let terrain = drawn_terrain(seed);
             for skip_air in [false, true] {
                 let mut c = DecoChunk::new(0, 0, -64, 384);
-                c.convert_terrain_finding_final_maps(&terrain, &STATES, &MAP_BITS, STATES[0], skip_air);
+                c.convert_terrain_finding_final_maps(&terrain, &STATES, &MAP_BITS, STATES[0], skip_air, true);
                 assert_eq!(c.blocks, converted(&terrain), "seed {seed}, skip {skip_air}: states");
                 for m in super::FINAL_HMS {
                     for col in 0..256 {
@@ -1077,6 +1081,21 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Converting into a chunk that already holds other states, with air at 0 and plain air
+    /// sections skipped, still writes air there: the old states never stay behind.
+    #[test]
+    fn final_maps_conversion_into_a_used_chunk_writes_the_skipped_air() {
+        let zero_air: Vec<u32> = std::iter::once(0).chain(STATES[1..].iter().copied()).collect();
+        for seed in 0..8 {
+            let terrain = drawn_terrain(seed);
+            let mut used = DecoChunk::new(0, 0, -64, 384);
+            used.blocks.fill(7);
+            used.convert_terrain_finding_final_maps(&terrain, &zero_air, &MAP_BITS, 0, true, false);
+            let want: Vec<u32> = terrain.iter().map(|&id| zero_air[id as usize]).collect();
+            assert_eq!(used.blocks, want, "seed {seed}, chunk holding other states");
         }
     }
 }
