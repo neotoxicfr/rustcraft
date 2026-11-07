@@ -3869,7 +3869,7 @@ impl EntityRenderer {
     }
 
     /// Prepares the instances of all visible entities. `origin` = integer origin of the
-    /// camera (x, z); `light(x, y, z)` = (block, sky); `visible(min, max)` = box within the field of view.
+    /// camera (x, z); `light(x, y, z)` = (block, sky); `visible.aabb(min, max)` = box within the field of view.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare<'e>(
         &mut self,
@@ -3878,7 +3878,7 @@ impl EntityRenderer {
         origin: [i32; 2],
         cam: [f64; 3],
         light: &dyn Fn(i32, i32, i32) -> (u8, u8),
-        visible: &dyn Fn([f32; 3], [f32; 3]) -> bool,
+        visible: &crate::render::FrameVisibility,
         items: Option<&rc_assets::item::ItemModels>,
         world_q: &ShadowWorld<'_>,
     ) {
@@ -3992,7 +3992,9 @@ impl EntityRenderer {
                 (cull, always)
             };
             let (hw, hh) = cull.map_or((hw, hh), |(w, h)| (w * 0.5 + 0.5, h + 0.5));
-            if !(always || visible([rel[0] - hw, rel[1] - 0.5, rel[2] - hw], [rel[0] + hw, rel[1] + hh, rel[2] + hw])) {
+            if !(always
+                || visible.aabb([rel[0] - hw, rel[1] - 0.5, rel[2] - hw], [rel[0] + hw, rel[1] + hh, rel[2] + hw]))
+            {
                 continue;
             }
             // Invisible: never a shadow; the body of a living entity is handled by `push_entity`

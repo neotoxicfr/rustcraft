@@ -15,6 +15,7 @@ use rc_physics::Aabb;
 
 use crate::entities::{Entity, Kind};
 use crate::nametag::Glyph;
+use crate::render::FrameVisibility;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -888,7 +889,7 @@ impl Rel {
 }
 
 /// Fills the frame's lists (§ 8); empty if no rendering entry is active.
-pub fn fill(r: &mut crate::render::Renderer, s: &Scene<'_>, in_view: &dyn Fn([f32; 3], [f32; 3]) -> bool) {
+pub fn fill(r: &mut crate::render::Renderer, s: &Scene<'_>, in_view: &FrameVisibility) {
     let queue = r.queue_handle();
     // Paths and visibility of the sections: nodes of the last occlusion walk.
     let (occ_paths, occ_vis) = (s.debug.is_on("chunk_section_paths"), s.debug.is_on("chunk_section_visibility"));
@@ -1029,13 +1030,13 @@ fn shown_by_renderer(
     er: Option<&crate::entity_render::EntityRenderer>,
     bb: &Aabb,
     rel: &Rel,
-    in_view: &dyn Fn([f32; 3], [f32; 3]) -> bool,
+    in_view: &FrameVisibility,
 ) -> bool {
     if er.is_some_and(|er| !er.within_view_distance(e, s.pt, s.eye)) {
         return false;
     }
     let (lo, hi) = rel.b(&Aabb { min: bb.min.map(|v| v - 0.5), max: bb.max.map(|v| v + 0.5) });
-    if !in_view(lo, hi) {
+    if !in_view.aabb(lo, hi) {
         return false;
     }
     let p = e.render_pos(s.pt);
@@ -1053,7 +1054,7 @@ fn hitbox(
     er: Option<&crate::entity_render::EntityRenderer>,
     painting: &dyn Fn(i32) -> Option<(u8, u8)>,
     rel: &Rel,
-    in_view: &dyn Fn([f32; 3], [f32; 3]) -> bool,
+    in_view: &FrameVisibility,
 ) {
     let (latest, bb) = e.bounding_box(table, painting, framed_map(e, s.ids));
     // Interpolation offset: rendered position minus tick position (zero for attached,
@@ -1380,7 +1381,7 @@ fn section_graph(
     lines: &mut DebugLines,
     s: &Scene<'_>,
     rel: &Rel,
-    in_view: &dyn Fn([f32; 3], [f32; 3]) -> bool,
+    in_view: &FrameVisibility,
     nodes: &[crate::render::OccNode],
     paths: bool,
     visibility: bool,
@@ -1390,7 +1391,7 @@ fn section_graph(
     for &(p, sources, step, vis, geometry) in nodes {
         let o = [f64::from(p.0 * 16), f64::from(s.min_y + p.1 * 16), f64::from(p.2 * 16)];
         let (lo, hi) = (rel.p(o), rel.p([o[0] + 16.0, o[1] + 16.0, o[2] + 16.0]));
-        if !in_view(lo, hi) {
+        if !in_view.aabb(lo, hi) {
             continue;
         }
         let at = |d: [f32; 3], k: f32| std::array::from_fn(|i| lo[i] + 8.0 + k * d[i]);

@@ -88,7 +88,7 @@ fn draw(k: &mut Kit, e: &Entity, biome: [u32; 4]) -> Frame {
         [0, 0],
         [0.5, 65.0, 5.5],
         &|_, _, _| (15, 15),
-        &|_, _| true,
+        &crate::render::FrameVisibility::everything(),
         Some(&k.items),
         &world,
     );

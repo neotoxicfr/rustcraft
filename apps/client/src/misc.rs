@@ -395,7 +395,7 @@ pub fn leash_vertices(
     origin: [i32; 2],
     cam: [f64; 3],
     light: &dyn Fn(i32, i32, i32) -> (u8, u8),
-    visible: &dyn Fn([f32; 3], [f32; 3]) -> bool,
+    visible: &crate::render::FrameVisibility,
 ) -> Vec<crate::leash::Vertex> {
     let mut out = Vec::new();
     for (&held, &holder) in &d.leashes {
@@ -419,7 +419,7 @@ pub fn leash_vertices(
             let (a, b) = if i == 1 { (p[1] + eh, q[1] + hh) } else { (p[i] + ew / 2.0, q[i] + hw / 2.0) };
             rel(a.max(b), i)
         });
-        if !visible(lo, hi) {
+        if !visible.aabb(lo, hi) {
             continue;
         }
         let lights = [eye_light(e, ctx.pt, ctx.table, light), eye_light(h, ctx.pt, ctx.table, light)];

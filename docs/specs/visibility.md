@@ -83,6 +83,29 @@ the order down, up, north, south, west, east.
 - Cautious variant (`RUSTCRAFT_OPT_MESH_HIDDEN_IN_SPARE_SLOTS=1`, off by default): the held
   columns take the task slots the visible ones leave free.
 
+## Particles (per frame)
+
+- A particle is drawn when its position of the last tick (not the interpolated one) lies in the
+  culling frustum whose eye has been moved back by three "view vectors". There is no occlusion
+  test: a particle in a section the walk did not reach, or above the world, is still drawn, and the
+  depth buffer hides it behind the terrain.
+- View vector: the culling matrix (projection × camera rotation) applied, transposed, to the depth
+  axis, that is its depth row. The game's culling projection maps depth to [0, 1] (OpenGL with
+  clip control, Vulkan), so the vector is the look direction scaled by far / (far − near), a little
+  more than one block: the eye moves back by just over three blocks.
+- The test is a point test: the point, relative to the moved eye (difference in doubles, then
+  floats), is on the inner side of the six planes (dot product plus constant ≥ 0, no corner choice).
+  The game takes its near plane from the rows with the rule written for a [−1, 1] depth, which puts it
+  at half the near distance; three blocks behind the camera, it never changes what is on screen.
+- Effect: a particle whose centre is just off screen (within about three blocks of the edge of the
+  view) is still drawn, so the part of its quad that is on screen does not vanish at the edge.
+- Our version (`RUSTCRAFT_OPT_PARTICLE_GAME_FRUSTUM`, default): the same test on our planes (frame
+  of the camera's integer origin, our own near plane, so the slab between the two near planes, behind
+  the camera, differs). `=0`: the test used before, the entities' box test on the point with the
+  occlusion of the walk; it hid particles whose centre was off screen and those of unreached
+  sections (an approximation of the walk, rule 4, could then hide a visible one).
+  `RUSTCRAFT_OPT_PARTICLE_FRUSTUM_SIMD`: the six planes four at a time in SIMD lanes, same answer.
+
 ## Sorting of translucent surfaces (translucent layer without improved transparency)
 
 - Within each section, the translucent quads are drawn from farthest to nearest
