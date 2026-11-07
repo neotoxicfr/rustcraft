@@ -23,9 +23,9 @@ use super::*;
 #[derive(Clone, Copy)]
 pub(super) struct StackSeed {
     /// Height from which the stack receives full sky (`i32::MAX`: never; margin stacks, block light).
-    source_from: i32,
+    pub(super) source_from: i32,
     /// Sources at this height or above only have sources or closed cells around: not queued.
-    queue_below: i32,
+    pub(super) queue_below: i32,
 }
 
 const NO_SKY: StackSeed = StackSeed { source_from: i32::MAX, queue_below: i32::MAX };
@@ -53,6 +53,10 @@ pub(super) fn seed(
     debug_assert!(ny >= 3, "a resolution has a margin row at each end");
     prepare_lane(lane, g.cells(), c.o.zone_buf);
     stack_seeds(grid, c, z, &mut lane.stacks, aux, pre, g, r0, ny, sky);
+    if c.o.seeds_at_read() {
+        // The read opened the cells and listed the emitters (`fast/seed_at_read.rs`).
+        return seed_at_read::seed(c, z, lay, lane, g, r0, ny, sky);
+    }
     let interior = if c.o.seed_rows {
         seed_interior_by_rows(z, lay, lane, g, r0, ny, sky)
     } else {
@@ -84,12 +88,19 @@ fn stack_seeds(
     if !sky {
         return;
     }
+    let columns = match aux.as_deref_mut() {
+        Some(aux) if pre.is_none() => SkyColumns::when_cached(grid, c, aux, g),
+        _ => None,
+    };
     for dz in 1..sz - 1 {
         for dx in 1..sx - 1 {
             let k = (dz * sx + dx) as usize;
             stacks[k].source_from = match pre {
                 Some(p) => p[k],
-                None => column_source(grid, c, aux.as_deref_mut().expect("sky caches"), z, g, r0, ny, dx, dz),
+                None => {
+                    let aux = aux.as_deref_mut().expect("sky caches");
+                    column_source(grid, c, aux, columns.as_ref(), z, g, r0, ny, dx, dz)
+                }
             };
         }
     }
@@ -232,6 +243,6 @@ fn seed_margin_cell(c: &Ctx, z: &Cells, lay: &[u8], lane: &mut Lane, i: usize, i
 
 /// A seed of value `v` raises the interior cell `j` above its seeded level (levels only rise
 /// afterwards: if it does not now, it never will).
-fn raises(z: &Cells, lay: &[u8], level: &[u8], v: u8, j: usize) -> bool {
+pub(super) fn raises(z: &Cells, lay: &[u8], level: &[u8], v: u8, j: usize) -> bool {
     lay[j] & OPEN != 0 && i32::from(v) - i32::from(z.prop[j] & 15) > i32::from(level[j])
 }

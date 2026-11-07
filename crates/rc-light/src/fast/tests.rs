@@ -18,12 +18,16 @@ const GLASS: u32 = 5;
 /// Bit of `LIGHTDEDUP` in [`Opts::from_bits`].
 const DEDUP: u32 = 512;
 /// Bits of the switches that act on the sequential path: C2-M03 (`SKYSKIP` to
-/// `RELIGHT_OCCTAB`), C2-M02 (`LIGHTSKYFRONTIER` to `LIGHTLEVELFIRST`) and C2-M10
-/// (`LIGHTREADROWS` to `LIGHTZEROONLYRING`).
-const SEQUENTIAL_BITS: u32 = 0x7ff | 0xf << 14 | ZONE_IO_BITS;
+/// `RELIGHT_OCCTAB`), C2-M02 (`LIGHTSKYFRONTIER` to `LIGHTLEVELFIRST`), C2-M10
+/// (`LIGHTREADROWS` to `LIGHTZEROONLYRING`) and C2-M11 of series 3 (`LIGHTSEEDATREAD`,
+/// `LIGHTSKYCOLUMNCACHE`, `LIGHTOPENAFTERREAD`).
+const SEQUENTIAL_BITS: u32 = 0x7ff | 0xf << 14 | ZONE_IO_BITS | SEED_AND_SKY_COLUMN_BITS;
 /// Bits of the C2-M10 switches (zone read by rows, uniform rows filled, plane scan, column kept,
 /// only the ring zeroed).
 pub(super) const ZONE_IO_BITS: u32 = 0x1f << 22;
+/// Bits of the switches of C2-M11, series 3 (seeding prepared by the read, sky columns fetched once,
+/// cells opened after the read).
+pub(super) const SEED_AND_SKY_COLUMN_BITS: u32 = 0x7 << 27;
 
 /// Test states: air, stone, leaves, torch, low slab, glass, lamp off and on
 /// (differ only by emission), high slab, attenuations 2 to 14, half-faces in the six
@@ -453,6 +457,10 @@ fn sabotages_are_caught() {
         (40, "row read from an odd cell: nibble shifted by one"),
         (41, "plane scan: last stack lost"),
         (42, "ring zeroing leaves the top plane stale"),
+        (super::seed_at_read::SABOTAGE_EMITTER_LOST_AT_SECTION_TOP, "read forgets the emitters of a section's top row"),
+        (super::seed_at_read::SABOTAGE_STORED_LIGHT_IGNORED, "old interior light ignored by the early stop"),
+        (super::seed_at_read::SABOTAGE_BLOCK_MARGIN_ROW_OPENED, "read opens the block's bottom margin row"),
+        (super::sky_columns::SABOTAGE_HIGHEST_SECTION_OVERLOOKED, "sky descent starts below a section that is not clear"),
     ];
     for (k, name) in names {
         let caught = (0..6u64).any(|seed| {
@@ -752,4 +760,5 @@ mod bench;
 mod frontier;
 mod inc;
 mod queue_counters;
+mod seed_at_read;
 mod zone_io;

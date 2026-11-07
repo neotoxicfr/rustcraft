@@ -215,10 +215,11 @@ fn bench_phases() {
     let base = bench_world(&t);
     // Sequential switches of C2-M03, then with those of C2-M02 (frontier seeding, step order),
     // then without one of the seeding switches; the list, then the list backwards.
-    let shipped = 0x7ff | 0xf << 14 | ZONE_IO_BITS;
+    let shipped = 0x7ff | 0xf << 14 | ZONE_IO_BITS | SEED_AND_SKY_COLUMN_BITS;
     let paths = [
         ("before C2-M02", 0x7ff),
         ("shipped without C2-M10", shipped & !ZONE_IO_BITS),
+        ("shipped without C2-M11 (series 3)", shipped & !SEED_AND_SKY_COLUMN_BITS),
         ("shipped", shipped),
         ("shipped without LIGHTSEEDROWS", shipped & !(1 << 16)),
         ("shipped without LIGHTMARGINFRONTIER", shipped & !(1 << 15)),
@@ -253,8 +254,8 @@ fn phases(t: &LightTables, base: &World, o: Opts) {
                         let t1 = std::time::Instant::now();
                         read(&world, &c, w, sg, true, true);
                         let t2 = std::time::Instant::now();
-                        let Work { face, prop, emit, sky, aux, lane, .. } = w;
-                        let z = Cells { face, prop, emit };
+                        let Work { face, prop, emit, emitters, sky, aux, lane, .. } = w;
+                        let z = Cells { face, prop, emit, emitters };
                         seed(&world, &c, &z, sky, lane, Some(aux), None, sg, 0, sg.size[1], true);
                         let t3 = std::time::Instant::now();
                         propagate(&c, &z, sky, lane, sg, 0, sg.size[1]);
@@ -491,8 +492,8 @@ fn read_and_write_us(t: &LightTables, base: &World, world: &World, kind: &str, o
                     let t0 = std::time::Instant::now();
                     read(&world, &c, w, sg, true, true);
                     read_ns += t0.elapsed().as_nanos();
-                    let Work { face, prop, emit, sky, aux, lane, .. } = w;
-                    let z = Cells { face, prop, emit };
+                    let Work { face, prop, emit, emitters, sky, aux, lane, .. } = w;
+                    let z = Cells { face, prop, emit, emitters };
                     seed(&world, &c, &z, sky, lane, Some(aux), None, sg, 0, sg.size[1], true);
                     propagate(&c, &z, sky, lane, sg, 0, sg.size[1]);
                     let t1 = std::time::Instant::now();
@@ -652,6 +653,145 @@ fn bench_relight() {
                 h.into_iter().map(|h| h.join().expect("thread")).fold(0.0, f64::max)
             });
             eprintln!("{kind:9} ZONEBUF={} 1 thread {one:9.1} µs, 2 threads {two:9.1} µs per relight", u8::from(o.zone_buf));
+        }
+    }
+}
+
+/// Source heights of the interior stacks of a sky zone, as the seeding computes them.
+fn source_heights(world: &World, c: &Ctx, aux: &mut Aux, z: &Cells, g: Geo) -> Vec<i32> {
+    let (sx, sz, ny) = (g.size[0], g.size[2], g.size[1]);
+    let columns = SkyColumns::when_cached(world, c, aux, g);
+    let mut heights = vec![i32::MAX; (sx * sz) as usize];
+    for dz in 1..sz - 1 {
+        for dx in 1..sx - 1 {
+            heights[(dz * sx + dx) as usize] = column_source(world, c, aux, columns.as_ref(), z, g, 0, ny, dx, dz);
+        }
+    }
+    heights
+}
+
+/// µs per group of the zone read, the block seeding, the sky sources and the sky seeding, replaying
+/// `kind` from `world` with the switches `o` and the order of a group with `ZONEONCE` (one read,
+/// block on its slice, then sky; each resolution propagated and written so the trace goes on).
+fn seed_phases_us(t: &LightTables, base: &World, world: &World, kind: &str, o: Opts) -> [f64; 4] {
+    let c = Ctx { height: H, t, o, count_queues: false };
+    let mut world = world.clone();
+    let (mut ns, mut count) = ([0u128; 4], 0usize);
+    for step in trace(base, kind) {
+        for undo in [false, true] {
+            let ps: Vec<[i32; 3]> = step.iter().map(|&(p, _)| p).collect();
+            for &(p, s) in &step {
+                set(&mut world, p, if undo { 0 } else { s });
+            }
+            for g in groups(&ps) {
+                let mut out = [Touched::new()];
+                with_work(true, |w| {
+                    w.aux.memo.clear();
+                    let bg = block_zone(&c, &g);
+                    let (sg, slo) = sky_zone(&world, &c, &mut w.aux, &g, bg);
+                    let block_rows = SolvedRows { first: bg.lo[1] + 1 - slo, count: bg.size[1] };
+                    let t0 = std::time::Instant::now();
+                    read_zone(&world, &c, w, sg, Some(SolvedRows::all(sg)), Some(block_rows));
+                    let t1 = std::time::Instant::now();
+                    let Work { face, prop, emit, emitters, sky, blk, aux, lane, lane2, .. } = w;
+                    let z = Cells { face, prop, emit, emitters };
+                    let (r0b, nyb) = (block_rows.first, block_rows.count);
+                    let block_lit = seed(&world, &c, &z, blk, lane2, None, None, sg, r0b, nyb, false);
+                    let t2 = std::time::Instant::now();
+                    let heights = source_heights(&world, &c, aux, &z, sg);
+                    let t3 = std::time::Instant::now();
+                    seed(&world, &c, &z, sky, lane, Some(aux), Some(&heights[..]), sg, 0, sg.size[1], true);
+                    let t4 = std::time::Instant::now();
+                    if block_lit {
+                        propagate(&c, &z, blk, lane2, sg, r0b, nyb);
+                        write(&mut world, &c, blk, lane2, sg, r0b, nyb, false, &mut out);
+                    }
+                    propagate(&c, &z, sky, lane, sg, 0, sg.size[1]);
+                    write(&mut world, &c, sky, lane, sg, 0, sg.size[1], true, &mut out);
+                    for (k, d) in [t1 - t0, t2 - t1, t3 - t2, t4 - t3].iter().enumerate() {
+                        ns[k] += d.as_nanos();
+                    }
+                });
+                count += 1;
+            }
+        }
+    }
+    ns.map(|v| v as f64 / 1000.0 / count as f64)
+}
+
+/// C2-M11 of series 3: zone read, block seeding, sky sources and sky seeding (µs per group, best of
+/// 7 A B B A) before the mission (its two switches off), shipped, each switch alone on before and
+/// shipped without each; then whole relights before / shipped (µs per relight, best of 7) outside a
+/// pool, then in pools of 1, 2, 4… threads up to every core (slab and redstone: zones read and
+/// sourced in parallel). `RUSTCRAFT_BENCH_KINDS=cave,plains` keeps some traces.
+#[test]
+#[ignore = "bench: cargo test --release -p rc-light bench_seed_at_read -- --ignored --nocapture"]
+fn bench_seed_at_read() {
+    let t = tables();
+    let base = bench_world(&t);
+    let shipped = Opts::from_bits(shipped_bits());
+    let before = Opts::from_bits(shipped_bits() & !SEED_AND_SKY_COLUMN_BITS);
+    let mut paths = vec![("before".to_string(), before), ("shipped".to_string(), shipped)];
+    for name in ["LIGHTSEEDATREAD", "LIGHTSKYCOLUMNCACHE"] {
+        paths.push((format!("{name} alone"), before.with(name, true)));
+        paths.push((format!("shipped without {name}"), shipped.with(name, false)));
+    }
+    // Opening after the read refines the prepared read: measured against shipped only.
+    paths.push(("shipped without LIGHTOPENAFTERREAD".to_string(), shipped.with("LIGHTOPENAFTERREAD", false)));
+    let only = rc_data::env_str!("RUSTCRAFT_BENCH_KINDS");
+    let wanted = |kind: &str| only.is_none_or(|k| k.split(',').any(|x| x == kind));
+    let kinds = ["plains", "torches", "cave", "redstone", "building", "water", "slab", "spread"];
+    for kind in kinds.into_iter().filter(|k| wanted(k)) {
+        let world = start_world(&t, &base, kind);
+        let mut best = vec![[f64::MAX; 4]; paths.len()];
+        for pass in 0..7 {
+            let order: Vec<usize> = if pass % 2 == 0 { (0..paths.len()).collect() } else { (0..paths.len()).rev().collect() };
+            for k in order {
+                let us = seed_phases_us(&t, &base, &world, kind, paths[k].1);
+                for (b, u) in best[k].iter_mut().zip(us) {
+                    *b = b.min(u);
+                }
+            }
+        }
+        let b0 = best[0];
+        for ((name, _), b) in paths.iter().zip(&best) {
+            let rel = |k: usize| (b[k] / b0[k] - 1.0) * 100.0;
+            eprintln!(
+                "{kind:9} {name:34} read {:6.1} ({:+.0} %), block seeds {:6.1} ({:+.0} %), sky sources {:6.1} ({:+.0} %), sky seeds {:6.1} ({:+.0} %) µs",
+                b[0], rel(0), b[1], rel(1), b[2], rel(2), b[3], rel(3)
+            );
+        }
+    }
+    for kind in kinds.into_iter().filter(|k| wanted(k)) {
+        let world = start_world(&t, &base, kind);
+        let tr = trace(&base, kind);
+        let masked = kind == "redstone";
+        let b = best_abba(&t, &world, &tr, &[before, shipped], masked, 7);
+        eprintln!("{kind:9} relight outside pool: before {:9.1} µs, shipped {:9.1} µs ({:+.1} %)", b[0], b[1], (b[1] / b[0] - 1.0) * 100.0);
+        for (name, o) in [("before", before), ("shipped", shipped)] {
+            let stats_before = crate::stats::totals();
+            let total = run(&t, &world, &tr, Path::New(o), masked, 1);
+            let st = crate::stats::totals().since(&stats_before);
+            let per = |ns: u64| ns as f64 / 1000.0 / (2 * tr.len()) as f64;
+            eprintln!(
+                "{kind:9}   {name:8} one more pass {total:7.1} µs per relight, of which sky solves {:6.1} µs ({} res.), block solves {:6.1} µs ({} res.)",
+                per(st.sky_ns),
+                st.sky_solves,
+                per(st.block_ns),
+                st.block_solves
+            );
+        }
+        if kind != "slab" && kind != "redstone" {
+            continue;
+        }
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let mut threads: Vec<usize> = std::iter::successors(Some(1), |n| Some(n * 2)).take_while(|&n| n <= cores).collect();
+        if threads.last() != Some(&cores) {
+            threads.push(cores);
+        }
+        for n in threads {
+            let b = super::pool(n).install(|| best_abba(&t, &world, &tr, &[before, shipped], masked, 5));
+            eprintln!("{kind:9} pool {n:2} threads: before {:9.1} µs, shipped {:9.1} µs ({:+.1} %)", b[0], b[1], (b[1] / b[0] - 1.0) * 100.0);
         }
     }
 }
