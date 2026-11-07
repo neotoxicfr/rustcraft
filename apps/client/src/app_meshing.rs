@@ -173,6 +173,7 @@ impl App {
         static DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let depth =
             *DEPTH.get_or_init(|| rc_data::env_str!("RUSTCRAFT_MESHQUEUE").and_then(|v| v.parse().ok()).unwrap_or(4));
+        self.world.meshes.tick(Instant::now());
         let limit = rayon::current_num_threads() * depth;
         let free = limit.saturating_sub(self.in_flight);
         if !pick_this_frame(free, self.world.dirty.len(), perf_log::on()) {

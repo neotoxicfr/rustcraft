@@ -6224,4 +6224,74 @@ Two leads, default = new, `=0` = old path:
   turning (held columns coming into view at once); redstone, plains12, tnt for
   `RUSTCRAFT_OPT_MESHDROPJOBEARLY` (`column_copies_*_per_s`). 1600 × 900 captures in one launch
   along a camera turn and after a change behind a wall.
+## C2-M03: base cache of the partial remeshes, adaptive budget, segmented eviction, cold compressed stage (06/11, loaded machine)
+
+The base cache leaves `remesh.rs` for `remesh/base_cache.rs` (the old least-recently-used cache is
+the path with every switch at 0, proven step by step against a copy of the old code). Five leads,
+each behind its switch, read once at startup (`[opt] mesh base cache` line), default = new:
+- `RUSTCRAFT_OPT_MESHCACHEADAPTIVE`: hot budget raised by 32 MB per 2 s window that sees at least
+  6 misses after an eviction (3/s; plains32 sees 0.6/s), up to 128 MB, up to 192 MB while they
+  are 12 or more; lowered by 32 MB after 30 s of rest (under 2 base requests per window), never
+  below 64 MB. `RUSTCRAFT_MESHCACHE_MB` still fixes the budget and wins.
+- `RUSTCRAFT_OPT_MESHCACHEEVICT`: segmented eviction: the base of a column remeshed twice in a
+  row with a base goes to a protected segment (at most three quarters of the budget), the others
+  are evicted first. Expected gain small (82 % hits before), to judge with the adaptive budget.
+- `RUSTCRAFT_OPT_MESHCACHECOLD`: an evicted base is compressed on the pool (deflate level 1,
+  libdeflate already in the tree, `rc_mesh::packed_codec`) into a cold stage of
+  `RUSTCRAFT_MESHCACHE_COLD_MB` (32) compressed MB; the meshing task that needs it decodes it on
+  the pool (the main thread only hands over a shared pointer). Same lead as
+  `RUSTCRAFT_OPT_MESH_BASE_COMPRESS` of C5-M36: one switch only.
+- `RUSTCRAFT_OPT_MESH_BASE_EXPIRY`: a base unused for `RUSTCRAFT_MESH_BASE_EXPIRY_S` (120 s)
+  leaves both stages (memory at rest).
+- `RUSTCRAFT_OPT_MESH_BASE_SECOND_ADMISSION`, OFF by default (`=1`): a column's first live mesh
+  is not kept, only the next ones. It costs one whole column per column changed once by design,
+  for memory only: kept off until the scene bench says the memory is worth it.
+
+Codec bench (`rc-mesh` `tests/packed_codec.rs`, `--ignored`, 1,248 columns of the capture, loaded
+machine): flat 180.5 MB (largest column 477 KB), fluid faces 25.4 % of the flat bytes. Ratio:
+deflate level 1 4.64, level 6 5.26, level 12 5.64; byte planes 4.96 (level 1), 5.56 (level 6);
+XOR with the previous face then level 1 4.51. Plain level 1 kept: the custom codec variant (XOR +
+varint) was conditioned on the codec not compressing enough, it does (ratio ≥ 2), and the XOR
+prefilter compresses worse. libdeflate's `CompressionLvl::fastest()` is level 0 (stored: ratio
+1.00, caught by the bench; level 1 named explicitly, unit test). µs per column, 1 / 2 / 4 / 8 / 16 /
+32 threads: flatten 60 / 15 / 14 / 16 / 13 / 14, compress 405 / 185 / 107 / 83 / 43 / 33, decode
+181 / 62 / 35 / 36 / 17 / 14, whole mesh 1,889 / 958 / 518 / 334 / 206 / 143. Decode = 3.0 times
+the flattening and 1/10 of a whole mesh; compress = 6.7 times the flattening at 1 thread (2.3 at 32),
+ABOVE the limit of 3 the plan set: a cold hit saves about 1.7 ms of pool, an eviction costs about
+0.4 ms, so the stage pays only if at least one evicted base in four is asked again. Kept on (C6,
+loaded machine); `mesh_cold_compress_ms_per_s` and `mesh_base_cold_hits_per_s` settle it at the
+scene bench. GPU: not applicable (deflate is serial per stream; the data is on the CPU).
+FLUID96 bases (fluid faces in 3 words instead of 27, −22 % of the hot bytes): not done here, the
+flat format belongs to `rc-mesh` `blocks.rs` (`pack`, `in_place_diff`, partial reader), a mission of
+its own if the scene bench shows the hot budget still matters with the cold stage.
+
+New counters (`tools/bench/scenes.py` columns): `mesh_cache_budget_mb`, `mesh_cache_cold_mb`,
+`mesh_base_cold_hits_per_s`, `mesh_cold_compress_ms_per_s`,
+`mesh_base_hits_age_{under_1s,1_to_10s,10_to_60s,60_to_300s,over_300s}_per_s` (age = time since the
+base's mesh was received). `base_miss_evicted` now counts a base dropped by the budget of either
+stage or by the expiry, and is tracked without the perf log too (the regulator reads it).
+
+Proofs: `remesh::base_cache::tests` — `switches_off_keep_the_old_cache` (3,000 random steps: same
+kept bases, bytes and fluid bytes as a copy of the cache of before; seen failing when the protection
+ignores its switch), `served_bases_are_the_last_mesh_received` (6,000 steps on 8 policies: no cache,
+fixed, adaptive, frequency, cold, expiry, second admission, all; every base served is the last mesh
+received for its column word for word with its version, worlds restart their versions; served
+273 / 702 / 271 / 736 (463 cold) / 273 / 241 / 636 (249 cold), none without a cache; seen failing
+with a decoded word flipped and with a stale compression accepted after a new world),
+`regulator_raises_caps_and_lowers` (seen failing with a cap of 4 floors),
+`frequency_eviction_protects_columns_remeshed_with_a_base` (seen failing when the protected
+segment is evicted first), `second_admission_keeps_from_the_second_live_mesh`,
+`expiry_drops_idle_bases`, `cold_stage_serves_evicted_bases`; `rc-mesh` `packed_codec` unit test
+(round trip, real compression, damaged bytes read as no base) and `tests/packed_codec.rs` (all
+1,248 columns round trip word for word; partial remesh of sections 4 to 10 on compressed bases =
+`EXPECTED_COMPACT`; a changed word of a kept face is seen). With a base always equal to the last
+mesh received, the final mesh is the whole one (`tests/partial.rs`, `tests/digest.rs`); in game:
+`RUSTCRAFT_MESHCHECK=1` on the scenes below.
+
+To measure on the quiet machine (2 alternating passes, `main` and this branch): `scenes.py` cave,
+redstone, forest, plains32, flight, nether: partials without base/s, meshing ms/s (pool), mesh cache
+MB (hot and cold), budget MB, private MB, cold compression ms/s; then cave and redstone with each
+switch at 0 alone (`--env=RUSTCRAFT_OPT_MESHCACHEADAPTIVE=0`, `…EVICT=0`, `…COLD=0`,
+`…MESH_BASE_EXPIRY=0`) and with `RUSTCRAFT_OPT_MESH_BASE_SECOND_ADMISSION=1`; `RUSTCRAFT_MESHCHECK=1`
+on cave and redstone.
 
