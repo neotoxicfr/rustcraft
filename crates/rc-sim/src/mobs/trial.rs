@@ -3,13 +3,15 @@
 //! cooldown, ominous version) and vault (key, rewarded players, ejection one by one);
 //! plus the ominous item spawner that the ominous trial spawner places above the fighters.
 
+use std::sync::Arc;
+
 use hashbrown::HashMap;
 
 use rc_proto::nbt::Nbt;
 use rc_proto_v777::entity::{AddEntity, Meta};
 
 use super::mob::{Ent, f64_of};
-use super::spawn::{Group, Reason};
+use super::spawn::{Group, Reason, SpawnPaths};
 use super::species::Kind;
 use crate::nbtio;
 use crate::player::Stack;
@@ -50,48 +52,109 @@ struct OminousItem {
     removed: bool,
 }
 
-/// Settings of a trial spawner (normal or ominous).
+/// Loot tables ejected by a configuration that names none (weight 1 each).
+const DEFAULT_LOOT_TABLES_TO_EJECT: [&str; 2] =
+    ["minecraft:spawners/trial_chamber/consumables", "minecraft:spawners/trial_chamber/key"];
+const DEFAULT_ITEMS_TO_DROP_WHEN_OMINOUS: &str = "minecraft:spawners/trial_chamber/items_to_drop_when_ominous";
+
+/// Settings of a trial spawner (normal or ominous): the numbers decoded, the lists read in place
+/// from the configuration compound.
 #[derive(Debug, Clone)]
-struct Cfg {
-    range: i32,
-    total: f32,
-    simul: f32,
-    total_add: f32,
-    simul_add: f32,
-    between: i32,
-    /// `[{data, weight}]`.
-    potentials: Vec<Nbt>,
-    eject: Vec<(String, i32)>,
-    ominous_items: String,
+struct TrialSpawnSettings {
+    /// Configuration compound: pack entry (shared with the pack's cache), inline compound, or
+    /// empty for the defaults.
+    source: Arc<Nbt>,
+    spawn_range: i32,
+    total_mobs: f32,
+    simultaneous_mobs: f32,
+    total_mobs_added_per_player: f32,
+    simultaneous_mobs_added_per_player: f32,
+    ticks_between_spawn: i32,
 }
 
-impl Default for Cfg {
-    fn default() -> Cfg {
-        Cfg {
-            range: 4,
-            total: 6.0,
-            simul: 2.0,
-            total_add: 2.0,
-            simul_add: 1.0,
-            between: 40,
-            potentials: Vec::new(),
-            eject: vec![
-                ("minecraft:spawners/trial_chamber/consumables".into(), 1),
-                ("minecraft:spawners/trial_chamber/key".into(), 1),
-            ],
-            ominous_items: "minecraft:spawners/trial_chamber/items_to_drop_when_ominous".into(),
+impl TrialSpawnSettings {
+    fn read(source: Arc<Nbt>) -> TrialSpawnSettings {
+        let float = |k: &str, default: f32| nbt_number(source.get(k)).map_or(default, |x| x as f32);
+        let int = |k: &str, default: i32| nbt_number(source.get(k)).map_or(default, |x| x as i32);
+        TrialSpawnSettings {
+            spawn_range: int("spawn_range", 4),
+            total_mobs: float("total_mobs", 6.0),
+            simultaneous_mobs: float("simultaneous_mobs", 2.0),
+            total_mobs_added_per_player: float("total_mobs_added_per_player", 2.0),
+            simultaneous_mobs_added_per_player: float("simultaneous_mobs_added_per_player", 1.0),
+            ticks_between_spawn: int("ticks_between_spawn", 40),
+            source,
         }
     }
+
+    /// `[{data, weight}]`.
+    fn spawn_potentials(&self) -> &[Nbt] {
+        nbtio::list(self.source.get("spawn_potentials"))
+    }
+
+    /// Loot tables to eject and their weights (only read when a reward is ejected).
+    fn loot_tables_to_eject(&self) -> Vec<(String, i32)> {
+        match self.source.get("loot_tables_to_eject") {
+            Some(Nbt::List(l)) => l
+                .iter()
+                .filter_map(|e| {
+                    let id = e.get("data").and_then(Nbt::as_str)?.to_owned();
+                    Some((id, nbt_number(e.get("weight")).map_or(1, |w| w as i32)))
+                })
+                .collect(),
+            _ => DEFAULT_LOOT_TABLES_TO_EJECT.iter().map(|t| ((*t).to_owned(), 1)).collect(),
+        }
+    }
+
+    fn items_to_drop_when_ominous(&self) -> &str {
+        self.source
+            .get("items_to_drop_when_ominous")
+            .and_then(Nbt::as_str)
+            .unwrap_or(DEFAULT_ITEMS_TO_DROP_WHEN_OMINOUS)
+    }
+
+    fn target_total(&self, extra: i32) -> i32 {
+        (self.total_mobs + self.total_mobs_added_per_player * extra as f32).floor() as i32
+    }
+
+    fn target_simultaneous(&self, extra: i32) -> i32 {
+        (self.simultaneous_mobs + self.simultaneous_mobs_added_per_player * extra as f32).floor() as i32
+    }
 }
 
-impl Cfg {
-    fn target_total(&self, extra: i32) -> i32 {
-        (self.total + self.total_add * extra as f32).floor() as i32
+/// Former path (`RUSTCRAFT_OPT_TRIAL_BORROW=0`): the copies the former decode made on every tick
+/// and then dropped, so that the switch off costs what the former code cost. It built the
+/// defaults first (eject list and ominous loot table) and, for a configuration found, copied its
+/// spawn potentials, eject list and ominous loot table; the configuration itself was borrowed.
+fn replay_former_config_copies(settings: &TrialSpawnSettings, found: bool) {
+    let defaults: (Vec<(String, i32)>, String) = (
+        DEFAULT_LOOT_TABLES_TO_EJECT.iter().map(|t| ((*t).to_owned(), 1)).collect(),
+        DEFAULT_ITEMS_TO_DROP_WHEN_OMINOUS.to_owned(),
+    );
+    std::hint::black_box(&defaults);
+    if found {
+        let copies = (
+            settings.spawn_potentials().to_vec(),
+            settings.loot_tables_to_eject(),
+            // A missing field took the default string over, without a copy.
+            settings.source.get("items_to_drop_when_ominous").and_then(Nbt::as_str).map(str::to_owned),
+        );
+        std::hint::black_box(&copies);
     }
+}
 
-    fn target_simul(&self, extra: i32) -> i32 {
-        (self.simul + self.simul_add * extra as f32).floor() as i32
-    }
+/// Configuration compound of the defaults (no allocation per tick).
+fn empty_config() -> Arc<Nbt> {
+    static EMPTY: std::sync::OnceLock<Arc<Nbt>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| Arc::new(Nbt::Compound(Vec::new()))).clone()
+}
+
+/// Empty compound, lent where a missing field reads as `{}`.
+static EMPTY_COMPOUND: Nbt = Nbt::Compound(Vec::new());
+
+/// Spawn data of a spawner with nothing to spawn: `{entity: {}}`.
+fn empty_spawn_data() -> Nbt {
+    Nbt::Compound(vec![("entity".into(), Nbt::Compound(Vec::new()))])
 }
 
 /// Saved state of a trial spawner.
@@ -106,9 +169,61 @@ struct TrialData {
     ejecting: Option<String>,
 }
 
+/// States of a trial spawner (block property `trial_spawner_state`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrialState {
+    Inactive,
+    WaitingForPlayers,
+    Active,
+    WaitingForRewardEjection,
+    EjectingReward,
+    Cooldown,
+}
+
+impl TrialState {
+    /// State of a property value (absent: inactive; the property only takes the six values).
+    fn of(value: Option<&str>) -> TrialState {
+        match value.unwrap_or("inactive") {
+            "inactive" => TrialState::Inactive,
+            "waiting_for_players" => TrialState::WaitingForPlayers,
+            "active" => TrialState::Active,
+            "waiting_for_reward_ejection" => TrialState::WaitingForRewardEjection,
+            "ejecting_reward" => TrialState::EjectingReward,
+            _ => TrialState::Cooldown,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            TrialState::Inactive => "inactive",
+            TrialState::WaitingForPlayers => "waiting_for_players",
+            TrialState::Active => "active",
+            TrialState::WaitingForRewardEjection => "waiting_for_reward_ejection",
+            TrialState::EjectingReward => "ejecting_reward",
+            TrialState::Cooldown => "cooldown",
+        }
+    }
+}
+
+/// What a trial spawner tick reads and changes: saved data, ominous flag, state at the start,
+/// whether the client must receive the block entity again.
+struct TrialTick {
+    data: TrialData,
+    ominous: bool,
+    state: TrialState,
+    updated: bool,
+}
+
+impl TrialTick {
+    /// Spawn data (after `trial_draw_next_data`).
+    fn next_data(&self) -> &Nbt {
+        self.data.spawn_data.as_ref().unwrap_or(&EMPTY_COMPOUND)
+    }
+}
+
 /// Player seen by a spawner (host or guest).
 #[derive(Debug, Clone, Copy)]
-struct Seen {
+struct DetectedPlayer {
     guest: Option<usize>,
     uuid: u128,
     pos: [f64; 3],
@@ -118,7 +233,7 @@ struct Seen {
     alive: bool,
 }
 
-fn num(v: Option<&Nbt>) -> Option<f64> {
+fn nbt_number(v: Option<&Nbt>) -> Option<f64> {
     v.and_then(f64_of)
 }
 
@@ -185,22 +300,53 @@ impl Server {
     /// Tick of a spawner block (block entity phase, after the entities: a mob born here ticks on
     /// the next tick, like in the game). `players`: living players, read once per walk.
     pub(crate) fn spawner_block_tick(&mut self, p: P, players: &[[f64; 3]]) {
-        match spawner_block_id(self.be_get(p)) {
+        // The block entity's rank in its chunk list, found once and handed to the tick.
+        let Some(rank) = self.be_index(p) else { return };
+        match spawner_block_id(self.chunk_be(p, rank)) {
             Some(CAGE) => {
                 if self.rule("minecraft:spawner_blocks_work", true) {
                     self.spawner_tick(p, players);
                 }
             }
-            Some(TRIAL) => self.trial_tick(p),
-            Some(_) => self.vault_tick(p),
+            Some(TRIAL) => self.trial_tick(p, rank),
+            Some(_) => self.vault_tick(p, rank),
             None => {}
         }
     }
 
+    /// Block tag test of the loot conditions: the block found by name through the data's index
+    /// (the former copies walked the whole block list for each test).
+    fn loot_block_in_tag(&self, tag: &str, name: &str) -> bool {
+        self.data
+            .block_id(name)
+            .is_some_and(|id| self.block_tags.get(tag).is_some_and(|v| v.binary_search(&id).is_ok()))
+    }
+
+    /// Block entity of rank `rank` in the list of the chunk of `p`.
+    fn chunk_be(&self, p: P, rank: usize) -> Option<&Nbt> {
+        self.chunks.get(&(p[0] >> 4, p[2] >> 4))?.as_ref()?.block_entities.get(rank)
+    }
+
+    /// Like `chunk_be`, to modify it (the chunk is then marked for saving, like `be_get_mut`).
+    fn chunk_be_mut(&mut self, p: P, rank: usize) -> Option<&mut Nbt> {
+        let c = self.chunks.get_mut(&(p[0] >> 4, p[2] >> 4))?.as_mut()?;
+        c.dirty = true;
+        c.block_entities.get_mut(rank)
+    }
+
+    /// Rank of the block entity at `p`: `hint` if it still holds it (a block update during the
+    /// tick may have shifted the chunk's list), otherwise looked up again.
+    fn be_rank(&self, p: P, hint: usize) -> Option<usize> {
+        let at_p = |be: &Nbt| {
+            [("x", p[0]), ("y", p[1]), ("z", p[2])].iter().all(|&(k, v)| nbtio::int(be, k) == Some(i64::from(v)))
+        };
+        if self.chunk_be(p, hint).is_some_and(at_p) { Some(hint) } else { self.be_index(p) }
+    }
+
     // ---------- Players ----------
 
-    fn seen_players(&self) -> Vec<Seen> {
-        let mut out = vec![Seen {
+    fn seen_players(&self) -> Vec<DetectedPlayer> {
+        let mut out = vec![DetectedPlayer {
             guest: None,
             uuid: self.uuid,
             pos: self.pos,
@@ -213,7 +359,7 @@ impl Server {
             for (i, g) in l.guests.iter().enumerate() {
                 if let Some(c) = g.ctx.as_ref().filter(|_| g.joined && !g.gone) {
                     let eye = c.pos[1] + if c.sneaking { 1.27 } else { 1.62 };
-                    out.push(Seen {
+                    out.push(DetectedPlayer {
                         guest: Some(i),
                         uuid: c.uuid,
                         pos: c.pos,
@@ -289,48 +435,23 @@ impl Server {
 
     // ---------- Trial spawner ----------
 
-    /// Setting: id of the `trial_spawner` registry or inline setting.
-    fn trial_cfg(&self, raw: Option<&Nbt>) -> Cfg {
-        let owned;
-        let v = match raw {
-            // Pack settings: converted to NBT once (reread on every spawner tick).
+    /// Configuration: id of the `trial_spawner` registry (the pack's NBT, shared) or inline
+    /// compound; anything else: the defaults. `shared` false: the former path, which made on
+    /// every tick the copies `replay_former_config_copies` repeats.
+    fn trial_config(&self, raw: Option<&Nbt>, shared: bool) -> TrialSpawnSettings {
+        let (source, found) = match raw {
             Some(Nbt::String(id)) => match self.life.pack.get_nbt("trial_spawner", id) {
-                Some(j) => {
-                    owned = j;
-                    &*owned
-                }
-                None => return Cfg::default(),
+                Some(entry) => (entry, true),
+                None => (empty_config(), false),
             },
-            Some(c @ Nbt::Compound(_)) => c,
-            _ => return Cfg::default(),
+            Some(c @ Nbt::Compound(_)) => (Arc::new(c.clone()), true),
+            _ => (empty_config(), false),
         };
-        let d = Cfg::default();
-        let f = |k: &str, def: f32| num(v.get(k)).map_or(def, |x| x as f32);
-        let i = |k: &str, def: i32| num(v.get(k)).map_or(def, |x| x as i32);
-        let eject = match v.get("loot_tables_to_eject") {
-            Some(Nbt::List(l)) => l
-                .iter()
-                .filter_map(|e| {
-                    let id = e.get("data").and_then(Nbt::as_str)?.to_owned();
-                    Some((id, num(e.get("weight")).map_or(1, |w| w as i32)))
-                })
-                .collect(),
-            _ => d.eject.clone(),
-        };
-        Cfg {
-            range: i("spawn_range", d.range),
-            total: f("total_mobs", d.total),
-            simul: f("simultaneous_mobs", d.simul),
-            total_add: f("total_mobs_added_per_player", d.total_add),
-            simul_add: f("simultaneous_mobs_added_per_player", d.simul_add),
-            between: i("ticks_between_spawn", d.between),
-            potentials: nbtio::list(v.get("spawn_potentials")).to_vec(),
-            eject,
-            ominous_items: v
-                .get("items_to_drop_when_ominous")
-                .and_then(Nbt::as_str)
-                .map_or(d.ominous_items, str::to_owned),
+        let settings = TrialSpawnSettings::read(source);
+        if !shared {
+            replay_former_config_copies(&settings, found);
         }
+        settings
     }
 
     fn trial_load(be: &Nbt) -> TrialData {
@@ -345,8 +466,20 @@ impl Server {
         }
     }
 
-    fn trial_store(&mut self, p: P, t: &TrialData) {
-        let Some(be) = self.be_get_mut(p) else { return };
+    /// Data written into the block entity (found by its rank when known).
+    fn trial_store(&mut self, p: P, rank: Option<usize>, t: &TrialData) {
+        let be = match rank {
+            Some(i) => self.chunk_be_mut(p, i),
+            None => self.be_get_mut(p),
+        };
+        if let Some(be) = be {
+            Self::trial_write(be, t);
+        }
+    }
+
+    /// Data written into a trial spawner's compound, default values removed (in place: the other
+    /// fields keep their order).
+    fn trial_write(be: &mut Nbt, t: &TrialData) {
         let put = |be: &mut Nbt, k: &str, v: Option<Nbt>| match v {
             Some(v) => nbtio::set(be, k, v),
             None => nbtio::remove(be, k),
@@ -358,6 +491,44 @@ impl Server {
         put(be, "total_mobs_spawned", (t.total != 0).then_some(Nbt::Int(t.total)));
         put(be, "spawn_data", t.spawn_data.clone());
         put(be, "ejecting_loot_table", t.ejecting.clone().map(Nbt::String));
+    }
+
+    /// Would `trial_write` leave `be` as it is? Compared field by field without building the
+    /// fields: most ticks change nothing, and a write marks the chunk for saving. A field kept in
+    /// another form (an `Int` time, a duplicated UUID, an empty list…) is not "as it is": the
+    /// write normalizes it, like before.
+    fn trial_stored_as(be: &Nbt, t: &TrialData) -> bool {
+        let uuids_as = |key: &str, list: &[u128]| match be.get(key) {
+            None => list.is_empty(),
+            Some(Nbt::List(stored)) => {
+                !list.is_empty()
+                    && stored.len() == list.len()
+                    && stored.iter().zip(list).all(|(n, &u)| nbtio::uuid(Some(n)) == Some(u))
+            }
+            Some(_) => false,
+        };
+        let long_as = |key: &str, v: i64| match be.get(key) {
+            None => v == 0,
+            Some(Nbt::Long(stored)) => v != 0 && *stored == v,
+            Some(_) => false,
+        };
+        let total_as = match be.get("total_mobs_spawned") {
+            None => t.total == 0,
+            Some(Nbt::Int(stored)) => t.total != 0 && *stored == t.total,
+            Some(_) => false,
+        };
+        let ejecting_as = match be.get("ejecting_loot_table") {
+            None => t.ejecting.is_none(),
+            Some(Nbt::String(stored)) => t.ejecting.as_deref() == Some(stored.as_str()),
+            Some(_) => false,
+        };
+        uuids_as("registered_players", &t.players)
+            && uuids_as("current_mobs", &t.mobs)
+            && long_as("cooldown_ends_at", t.cooldown_ends_at)
+            && long_as("next_mob_spawns_at", t.next_mob_spawns_at)
+            && total_as
+            && be.get("spawn_data") == t.spawn_data.as_ref()
+            && ejecting_as
     }
 
     /// Data sent to the client: next spawn (active state), spawn data.
@@ -381,161 +552,220 @@ impl Server {
         }
     }
 
-    fn trial_tick(&mut self, p: P) {
-        let Some(be) = self.be_get(p).cloned() else { return };
-        let mut t = Self::trial_load(&be);
-        let normal = self.trial_cfg(be.get("normal_config"));
-        let ominous_cfg = self.trial_cfg(be.get("ominous_config"));
-        let target_cd = nbtio::int(&be, "target_cooldown_length").map_or(36000, |v| v.max(0));
-        let range = nbtio::int(&be, "required_player_range").map_or(14, |v| v.clamp(1, 128) as i32);
+    /// Trial spawner tick: lost mobs forgotten, then the step of its state; the block entity is
+    /// rewritten and sent back to the client when needed.
+    fn trial_tick(&mut self, p: P, rank: usize) {
+        let paths = SpawnPaths::current();
+        let Some((mut tick, ctx)) = self.trial_tick_read(p, rank, paths.trial_borrow) else { return };
+        self.trial_forget_lost_mobs(&mut tick, &ctx);
+        let next = match tick.state {
+            TrialState::Inactive => self.trial_inactive_step(&mut tick, &ctx),
+            TrialState::WaitingForPlayers => self.trial_waiting_step(&mut tick, &ctx),
+            TrialState::Active => self.trial_active_step(&mut tick, &ctx),
+            TrialState::WaitingForRewardEjection => self.trial_reward_wait_step(&tick, &ctx),
+            TrialState::EjectingReward => self.trial_ejecting_step(&mut tick, &ctx),
+            TrialState::Cooldown => self.trial_cooldown_step(&mut tick, &ctx),
+        };
+        self.trial_tick_write(p, rank, &tick, next, paths);
+    }
+
+    /// The tick's inputs: saved data, configurations, block state. `in_place` false: the former
+    /// path, which first copied the whole block entity and read the state as a string.
+    fn trial_tick_read(&self, p: P, rank: usize, in_place: bool) -> Option<(TrialTick, TrialCtx)> {
+        let copy;
+        let be = if in_place {
+            self.chunk_be(p, rank)?
+        } else {
+            copy = self.be_get(p).cloned()?;
+            &copy
+        };
+        let ctx = TrialCtx {
+            normal_config: self.trial_config(be.get("normal_config"), in_place),
+            ominous_config: self.trial_config(be.get("ominous_config"), in_place),
+            target_cooldown: nbtio::int(be, "target_cooldown_length").map_or(36000, |v| v.max(0)),
+            range: nbtio::int(be, "required_player_range").map_or(14, |v| v.clamp(1, 128) as i32),
+            p,
+        };
+        let data = Self::trial_load(be);
         let s = self.get(p);
-        let mut ominous = self.view().get_bool(s, "ominous");
-        let state = self.prop(p, "trial_spawner_state").unwrap_or_else(|| "inactive".into());
-        let mut updated = false;
-        let now = self.time;
-        // Mobs lost (dead, removed, more than 47 blocks away): next spawn pushed back.
-        let before = t.mobs.len();
-        t.mobs.retain(|&u| {
+        let state = if in_place {
+            TrialState::of(self.view().get(s, "trial_spawner_state"))
+        } else {
+            TrialState::of(self.prop(p, "trial_spawner_state").as_deref())
+        };
+        let ominous = self.view().get_bool(s, "ominous");
+        Some((TrialTick { data, ominous, state, updated: false }, ctx))
+    }
+
+    /// Mobs lost (dead, removed, more than 47 blocks away): next spawn pushed back.
+    fn trial_forget_lost_mobs(&self, tick: &mut TrialTick, ctx: &TrialCtx) {
+        let p = ctx.p;
+        let before = tick.data.mobs.len();
+        tick.data.mobs.retain(|&u| {
             self.mobs.get_uuid(u).is_some_and(|m| {
                 let b = m.block_pos();
                 let d = [b[0] - p[0], b[1] - p[1], b[2] - p[2]].map(i64::from);
                 m.alive() && !m.removed && d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= 47 * 47
             })
         });
-        if t.mobs.len() != before {
-            let cfg = if ominous { &ominous_cfg } else { &normal };
-            t.next_mob_spawns_at = now + i64::from(cfg.between);
+        if tick.data.mobs.len() != before {
+            tick.data.next_mob_spawns_at = self.time + i64::from(ctx.config(tick.ominous).ticks_between_spawn);
         }
-        let ctx = TrialCtx { normal, ominous_cfg, target_cd, range, p };
-        let next = match state.as_str() {
-            "inactive" => {
-                let d = self.trial_next_data(&mut t, &ctx, ominous, &mut updated);
-                let id = d.get("entity").and_then(|e| e.get("id")).and_then(Nbt::as_str);
-                let known = id.is_some_and(|i| {
-                    self.data.registry("minecraft:entity_type").is_some_and(|r| r.entries.iter().any(|e| e == i))
-                });
-                if known { "waiting_for_players" } else { "inactive" }
+    }
+
+    /// Inactive: waits for spawn data naming a known entity type.
+    fn trial_inactive_step(&mut self, tick: &mut TrialTick, ctx: &TrialCtx) -> TrialState {
+        self.trial_draw_next_data(tick, ctx);
+        let id = tick.next_data().get("entity").and_then(|e| e.get("id")).and_then(Nbt::as_str);
+        // The registry, not `Kind`: a known type we do not spawn still wakes the spawner up.
+        let known = id.is_some_and(|i| {
+            self.data.registry("minecraft:entity_type").is_some_and(|r| r.entries.iter().any(|e| e == i))
+        });
+        if known { TrialState::WaitingForPlayers } else { TrialState::Inactive }
+    }
+
+    /// Waiting for players: detection (spawns allowed and a mob to spawn).
+    fn trial_waiting_step(&mut self, tick: &mut TrialTick, ctx: &TrialCtx) -> TrialState {
+        if !self.trial_can_spawn() {
+            Self::trial_reset_stats(&mut tick.data);
+            TrialState::WaitingForPlayers
+        } else if !self.trial_has_mob(tick, ctx) {
+            TrialState::Inactive
+        } else {
+            self.trial_detect(tick, ctx);
+            if tick.data.players.is_empty() { TrialState::WaitingForPlayers } else { TrialState::Active }
+        }
+    }
+
+    /// Active: detection, ominous items, then a mob when the delay and the cap allow; the fight
+    /// is over once the total is reached and every mob is gone.
+    fn trial_active_step(&mut self, tick: &mut TrialTick, ctx: &TrialCtx) -> TrialState {
+        if !self.trial_can_spawn() {
+            Self::trial_reset_stats(&mut tick.data);
+            return TrialState::WaitingForPlayers;
+        }
+        if !self.trial_has_mob(tick, ctx) {
+            return TrialState::Inactive;
+        }
+        // Configuration and player count of the start of the tick, like the game: a detection
+        // that turns the spawner ominous changes them from the next tick on.
+        let cfg = ctx.config(tick.ominous);
+        let extra = (tick.data.players.len() as i32 - 1).max(0);
+        self.trial_detect(tick, ctx);
+        if tick.ominous {
+            self.trial_item_spawner(&mut tick.data, ctx);
+        }
+        if tick.data.total >= cfg.target_total(extra) {
+            if !tick.data.mobs.is_empty() {
+                return TrialState::Active;
             }
-            "waiting_for_players" => {
-                if !self.trial_can_spawn() {
-                    Self::trial_reset_stats(&mut t);
-                    "waiting_for_players"
-                } else if !self.trial_has_mob(&mut t, &ctx, ominous, &mut updated) {
-                    "inactive"
-                } else {
-                    self.trial_detect(&mut t, &ctx, &state, &mut ominous, &mut updated);
-                    if t.players.is_empty() { "waiting_for_players" } else { "active" }
-                }
+            let t = &mut tick.data;
+            t.cooldown_ends_at = self.time + ctx.target_cooldown;
+            t.total = 0;
+            t.next_mob_spawns_at = 0;
+            return TrialState::WaitingForRewardEjection;
+        }
+        if self.time >= tick.data.next_mob_spawns_at
+            && (tick.data.mobs.len() as i32) < cfg.target_simultaneous(extra)
+            && let Some(u) = self.trial_spawn_mob(tick, ctx)
+        {
+            let t = &mut tick.data;
+            t.mobs.push(u);
+            t.total += 1;
+            t.next_mob_spawns_at = self.time + i64::from(cfg.ticks_between_spawn);
+            if let Some(d) = super::spawn::pick_weighted(cfg.spawn_potentials(), &mut self.mobs.rng) {
+                t.spawn_data = Some(d);
+                tick.updated = true;
             }
-            "active" => {
-                if !self.trial_can_spawn() {
-                    Self::trial_reset_stats(&mut t);
-                    "waiting_for_players"
-                } else if !self.trial_has_mob(&mut t, &ctx, ominous, &mut updated) {
-                    "inactive"
-                } else {
-                    let cfg = if ominous { ctx.ominous_cfg.clone() } else { ctx.normal.clone() };
-                    let extra = (t.players.len() as i32 - 1).max(0);
-                    self.trial_detect(&mut t, &ctx, &state, &mut ominous, &mut updated);
-                    if ominous {
-                        self.trial_item_spawner(&mut t, &ctx);
-                    }
-                    if t.total >= cfg.target_total(extra) {
-                        if t.mobs.is_empty() {
-                            t.cooldown_ends_at = self.time + ctx.target_cd;
-                            t.total = 0;
-                            t.next_mob_spawns_at = 0;
-                            "waiting_for_reward_ejection"
-                        } else {
-                            "active"
-                        }
-                    } else {
-                        if self.time >= t.next_mob_spawns_at
-                            && (t.mobs.len() as i32) < cfg.target_simul(extra)
-                            && let Some(u) = self.trial_spawn_mob(&mut t, &ctx, ominous, &mut updated)
-                        {
-                            t.mobs.push(u);
-                            t.total += 1;
-                            t.next_mob_spawns_at = self.time + i64::from(cfg.between);
-                            if let Some(d) = super::spawn::pick_weighted(&cfg.potentials, &mut self.mobs.rng) {
-                                t.spawn_data = Some(d);
-                                updated = true;
-                            }
-                        }
-                        "active"
-                    }
-                }
-            }
-            "waiting_for_reward_ejection" => {
-                let started = t.cooldown_ends_at - ctx.target_cd;
-                if self.time as f32 >= started as f32 + 40.0 {
-                    self.block_sound(p, "minecraft:block.trial_spawner.open_shutter", 1.0, 1.0);
-                    "ejecting_reward"
-                } else {
-                    "waiting_for_reward_ejection"
-                }
-            }
-            "ejecting_reward" => {
-                let started = t.cooldown_ends_at - ctx.target_cd;
-                if (self.time - started) as f32 % 30.0 != 0.0 {
-                    "ejecting_reward"
-                } else if t.players.is_empty() {
-                    self.block_sound(p, "minecraft:block.trial_spawner.close_shutter", 1.0, 1.0);
-                    t.ejecting = None;
-                    "cooldown"
-                } else {
-                    if t.ejecting.is_none() {
-                        let cfg = if ominous { &ctx.ominous_cfg } else { &ctx.normal };
-                        let list: Vec<Nbt> = cfg
-                            .eject
-                            .iter()
-                            .map(|(id, w)| {
-                                Nbt::Compound(vec![
-                                    ("data".into(), Nbt::String(id.clone())),
-                                    ("weight".into(), Nbt::Int(*w)),
-                                ])
-                            })
-                            .collect();
-                        t.ejecting = super::spawn::pick_weighted(&list, &mut self.mobs.rng)
-                            .and_then(|d| d.as_str().map(str::to_owned));
-                    }
-                    if let Some(table) = t.ejecting.clone() {
-                        self.trial_eject(p, &table);
-                    }
-                    t.players.remove(0);
-                    "ejecting_reward"
-                }
-            }
-            _ => {
-                // Recharge.
-                self.trial_detect(&mut t, &ctx, "cooldown", &mut ominous, &mut updated);
-                if !t.players.is_empty() {
-                    t.total = 0;
-                    t.next_mob_spawns_at = 0;
-                    "active"
-                } else if self.time >= t.cooldown_ends_at {
-                    let s = self.get(p);
-                    let ns = self.view().set(s, "ominous", "false");
-                    self.set_update(p, ns);
-                    ominous = false;
-                    t.mobs.clear();
-                    t.spawn_data = None;
-                    Self::trial_reset_stats(&mut t);
-                    "waiting_for_players"
-                } else {
-                    "cooldown"
-                }
-            }
-        };
-        let changed = next != state;
+        }
+        TrialState::Active
+    }
+
+    /// Reward wait: the shutter opens 40 ticks after the end of the fight.
+    fn trial_reward_wait_step(&mut self, tick: &TrialTick, ctx: &TrialCtx) -> TrialState {
+        let started = tick.data.cooldown_ends_at - ctx.target_cooldown;
+        if self.time as f32 >= started as f32 + 40.0 {
+            self.block_sound(ctx.p, "minecraft:block.trial_spawner.open_shutter", 1.0, 1.0);
+            TrialState::EjectingReward
+        } else {
+            TrialState::WaitingForRewardEjection
+        }
+    }
+
+    /// Ejection: every 30 ticks, one reward for one registered player; none left: cooldown.
+    fn trial_ejecting_step(&mut self, tick: &mut TrialTick, ctx: &TrialCtx) -> TrialState {
+        let t = &mut tick.data;
+        let started = t.cooldown_ends_at - ctx.target_cooldown;
+        if (self.time - started) as f32 % 30.0 != 0.0 {
+            return TrialState::EjectingReward;
+        }
+        if t.players.is_empty() {
+            self.block_sound(ctx.p, "minecraft:block.trial_spawner.close_shutter", 1.0, 1.0);
+            t.ejecting = None;
+            return TrialState::Cooldown;
+        }
+        if t.ejecting.is_none() {
+            let tables: Vec<Nbt> = ctx
+                .config(tick.ominous)
+                .loot_tables_to_eject()
+                .into_iter()
+                .map(|(id, w)| Nbt::Compound(vec![("data".into(), Nbt::String(id)), ("weight".into(), Nbt::Int(w))]))
+                .collect();
+            t.ejecting =
+                super::spawn::pick_weighted(&tables, &mut self.mobs.rng).and_then(|d| d.as_str().map(str::to_owned));
+        }
+        if let Some(table) = t.ejecting.clone() {
+            self.trial_eject(ctx.p, &table);
+        }
+        t.players.remove(0);
+        TrialState::EjectingReward
+    }
+
+    /// Cooldown: a player detected again restarts the fight; at its end, back to waiting (an
+    /// ominous spawner becomes normal again).
+    fn trial_cooldown_step(&mut self, tick: &mut TrialTick, ctx: &TrialCtx) -> TrialState {
+        self.trial_detect(tick, ctx);
+        let t = &mut tick.data;
+        if !t.players.is_empty() {
+            t.total = 0;
+            t.next_mob_spawns_at = 0;
+            return TrialState::Active;
+        }
+        if self.time < t.cooldown_ends_at {
+            return TrialState::Cooldown;
+        }
+        let s = self.get(ctx.p);
+        let ns = self.view().set(s, "ominous", "false");
+        self.set_update(ctx.p, ns);
+        tick.ominous = false;
+        let t = &mut tick.data;
+        t.mobs.clear();
+        t.spawn_data = None;
+        Self::trial_reset_stats(t);
+        TrialState::WaitingForPlayers
+    }
+
+    /// End of tick: new state set, data rewritten (with the switch, only when that changes the
+    /// block entity), block entity sent back when the state or the spawn data changed.
+    fn trial_tick_write(&mut self, p: P, rank: usize, tick: &TrialTick, next: TrialState, paths: SpawnPaths) {
+        let changed = next != tick.state;
         if changed {
             let s = self.get(p);
-            let ns = self.view().set(s, "trial_spawner_state", next);
+            let ns = self.view().set(s, "trial_spawner_state", next.name());
             self.set_update(p, ns);
         }
-        let _ = ominous;
-        self.trial_store(p, &t);
-        if changed || updated {
+        let rank = if paths.trial_borrow { self.be_rank(p, rank) } else { None };
+        let stored_as_is = paths.trial_write_on_change && {
+            let be = match rank {
+                Some(i) => self.chunk_be(p, i),
+                None => self.be_get(p),
+            };
+            be.is_some_and(|be| Self::trial_stored_as(be, &tick.data))
+        };
+        if !stored_as_is {
+            self.trial_store(p, rank, &tick.data);
+        }
+        if changed || tick.updated {
             self.trial_send(p);
         }
     }
@@ -553,32 +783,26 @@ impl Server {
         t.cooldown_ends_at = 0;
     }
 
-    /// The next spawn data.
-    fn trial_next_data(&mut self, t: &mut TrialData, ctx: &TrialCtx, ominous: bool, updated: &mut bool) -> Nbt {
-        if let Some(d) = &t.spawn_data {
-            return d.clone();
+    /// Spawn data drawn from the potentials when the spawner has none (`{entity: {}}` without
+    /// potentials); the client then receives the block entity again.
+    fn trial_draw_next_data(&mut self, tick: &mut TrialTick, ctx: &TrialCtx) {
+        if tick.data.spawn_data.is_some() {
+            return;
         }
-        let cfg = if ominous { &ctx.ominous_cfg } else { &ctx.normal };
-        let picked = if cfg.potentials.is_empty() {
-            None
-        } else {
-            super::spawn::pick_weighted(&cfg.potentials, &mut self.mobs.rng)
-        };
-        let d = picked.unwrap_or_else(|| Nbt::Compound(vec![("entity".into(), Nbt::Compound(Vec::new()))]));
-        t.spawn_data = Some(d.clone());
-        *updated = true;
-        d
+        // An empty list draws nothing (no random number either).
+        let picked = super::spawn::pick_weighted(ctx.config(tick.ominous).spawn_potentials(), &mut self.mobs.rng);
+        tick.data.spawn_data = Some(picked.unwrap_or_else(empty_spawn_data));
+        tick.updated = true;
     }
 
-    fn trial_has_mob(&mut self, t: &mut TrialData, ctx: &TrialCtx, ominous: bool, updated: &mut bool) -> bool {
-        let d = self.trial_next_data(t, ctx, ominous, updated);
-        let has_id = d.get("entity").and_then(|e| e.get("id")).and_then(Nbt::as_str).is_some();
-        let cfg = if ominous { &ctx.ominous_cfg } else { &ctx.normal };
-        has_id || !cfg.potentials.is_empty()
+    fn trial_has_mob(&mut self, tick: &mut TrialTick, ctx: &TrialCtx) -> bool {
+        self.trial_draw_next_data(tick, ctx);
+        let has_id = tick.next_data().get("entity").and_then(|e| e.get("id")).and_then(Nbt::as_str).is_some();
+        has_id || !ctx.config(tick.ominous).spawn_potentials().is_empty()
     }
 
     /// Players detected (not creative, not spectators, in range, clear sight when needed).
-    fn trial_find(&self, p: P, range: i32, sight: bool) -> Vec<Seen> {
+    fn trial_find(&self, p: P, range: i32, sight: bool) -> Vec<DetectedPlayer> {
         let c = center(p);
         self.seen_players()
             .into_iter()
@@ -589,18 +813,19 @@ impl Server {
 
     /// Player detection (every 20 ticks depending on the position): ominous omen converted,
     /// players added, next spawn at least 40 ticks later.
-    fn trial_detect(&mut self, t: &mut TrialData, ctx: &TrialCtx, state: &str, ominous: &mut bool, updated: &mut bool) {
+    fn trial_detect(&mut self, tick: &mut TrialTick, ctx: &TrialCtx) {
         let p = ctx.p;
         if pos_long(p).wrapping_add(self.time) % 20 != 0 {
             return;
         }
-        if state == "cooldown" && *ominous {
+        let cooldown = tick.state == TrialState::Cooldown;
+        if cooldown && tick.ominous {
             return;
         }
         let in_sight = self.trial_find(p, ctx.range, true);
         let mut became = false;
-        if !*ominous && !in_sight.is_empty() {
-            let mut omen: Option<(Seen, bool)> = None;
+        if !tick.ominous && !in_sight.is_empty() {
+            let mut omen: Option<(DetectedPlayer, bool)> = None;
             for s in &in_sight {
                 if self.seen_effect(s.guest, "minecraft:trial_omen").is_some() {
                     omen = Some((*s, false));
@@ -615,13 +840,14 @@ impl Server {
                     self.trial_omen_from_bad(s.guest);
                 }
                 self.level_event(3020, block_of(s.eye), 0);
-                self.trial_apply_ominous(t, ctx, updated);
-                *ominous = true;
+                self.trial_apply_ominous(tick, ctx);
+                tick.ominous = true;
                 became = true;
             }
         }
-        if state != "cooldown" || became {
-            let found = if t.players.is_empty() { in_sight } else { self.trial_find(p, ctx.range, false) };
+        if !cooldown || became {
+            let found = if tick.data.players.is_empty() { in_sight } else { self.trial_find(p, ctx.range, false) };
+            let t = &mut tick.data;
             let mut added = false;
             for s in found {
                 if !t.players.contains(&s.uuid) {
@@ -632,7 +858,7 @@ impl Server {
             if added {
                 t.next_mob_spawns_at = (self.time + 40).max(t.next_mob_spawns_at);
                 if !became {
-                    let ev = if *ominous { 3019 } else { 3013 };
+                    let ev = if tick.ominous { 3019 } else { 3013 };
                     self.level_event(ev, p, t.players.len() as i32);
                 }
             }
@@ -657,12 +883,13 @@ impl Server {
 
     /// Ominous block, event 3020, mobs in progress removed (with their
     /// guaranteed-drop items), counters reset, spawns and spawners pushed back.
-    fn trial_apply_ominous(&mut self, t: &mut TrialData, ctx: &TrialCtx, updated: &mut bool) {
+    fn trial_apply_ominous(&mut self, tick: &mut TrialTick, ctx: &TrialCtx) {
         let p = ctx.p;
         let s = self.get(p);
         let ns = self.view().set(s, "ominous", "true");
         self.set_update(p, ns);
         self.level_event(3020, p, 1);
+        let t = &mut tick.data;
         for u in std::mem::take(&mut t.mobs) {
             let Some(i) = self.mobs.index_of_uuid(u) else {
                 continue;
@@ -673,33 +900,30 @@ impl Server {
             m.removed = true;
             self.mobs.list.put(i, m);
         }
-        if !ctx.ominous_cfg.potentials.is_empty() {
+        if !ctx.ominous_config.spawn_potentials().is_empty() {
             t.spawn_data = None;
         }
         t.total = 0;
-        t.next_mob_spawns_at = self.time + i64::from(ctx.ominous_cfg.between);
-        *updated = true;
+        t.next_mob_spawns_at = self.time + i64::from(ctx.ominous_config.ticks_between_spawn);
         t.cooldown_ends_at = self.time + 160;
+        tick.updated = true;
     }
 
     /// Drawn position (or `Pos`), free spot, clear sight, spawn rules
     /// (light ignored), own rules, finalization if only the id is given, persistent
     /// and equipped mob; flames 3011/3012, `entity_place` event.
-    fn trial_spawn_mob(
-        &mut self,
-        t: &mut TrialData,
-        ctx: &TrialCtx,
-        ominous: bool,
-        updated: &mut bool,
-    ) -> Option<u128> {
+    fn trial_spawn_mob(&mut self, tick: &mut TrialTick, ctx: &TrialCtx) -> Option<u128> {
         let p = ctx.p;
-        let next = self.trial_next_data(t, ctx, ominous, updated);
-        let ent = next.get("entity").cloned().unwrap_or(Nbt::Compound(Vec::new()));
+        let ominous = tick.ominous;
+        self.trial_draw_next_data(tick, ctx);
+        // Read in place: the spawn data is only copied into the mob that loads it.
+        let next = tick.next_data();
+        let ent = next.get("entity").unwrap_or(&EMPTY_COMPOUND);
         let kind = ent.get("id").and_then(Nbt::as_str).and_then(Kind::from_name)?;
         let pos = match nbtio::list(ent.get("Pos")) {
             [Nbt::Double(x), Nbt::Double(y), Nbt::Double(z)] => [*x, *y, *z],
             _ => {
-                let range = f64::from(if ominous { ctx.ominous_cfg.range } else { ctx.normal.range });
+                let range = f64::from(ctx.config(ominous).spawn_range);
                 let r = &mut self.mobs.rng;
                 let x = f64::from(p[0]) + (r.next_double() - r.next_double()) * range + 0.5;
                 let y = f64::from(p[1] + r.next_int_bound(3) - 1);
@@ -723,7 +947,7 @@ impl Server {
         {
             return None;
         }
-        let only_id = matches!(&ent, Nbt::Compound(f) if f.len() == 1);
+        let only_id = matches!(ent, Nbt::Compound(f) if f.len() == 1);
         let yaw = self.mobs.rng.next_float() * 360.0;
         let mut m = self.new_mob(kind, pos, yaw);
         if !only_id {
@@ -833,15 +1057,10 @@ impl Server {
         ];
         let seed = self.seed().wrapping_add(pos_long(low));
         let drops = {
-            let tags = &self.block_tags;
-            let data = &self.data;
-            let tag_fn = |tag: &str, n: &str| {
-                let id = data.blocks.iter().position(|b| b.name == n).map(|i| i as u32);
-                id.is_some_and(|id| tags.get(tag).is_some_and(|v| v.binary_search(&id).is_ok()))
-            };
+            let tag_fn = |tag: &str, n: &str| self.loot_block_in_tag(tag, n);
             let l = crate::loot::Loot { pack: &self.life.pack, items: &self.life.items, block_tag: &tag_fn };
             let mut rng = super::jrand::JRand::new(seed);
-            l.drops(&ctx.ominous_cfg.ominous_items, &crate::loot::Ctx::default(), &mut rng)
+            l.drops(ctx.ominous_config.items_to_drop_when_ominous(), &crate::loot::Ctx::default(), &mut rng)
         };
         let total: i32 = drops.iter().map(|d| d.count).sum();
         if total <= 0 {
@@ -860,7 +1079,7 @@ impl Server {
         }
         let c = center(p);
         let r2 = f64::from(ctx.range) * f64::from(ctx.range);
-        let near: Vec<Seen> = self
+        let near: Vec<DetectedPlayer> = self
             .seen_players()
             .into_iter()
             .filter(|s| t.players.contains(&s.uuid) && !s.creative && !s.spectator && s.alive && dist2(s.pos, c) <= r2)
@@ -1055,9 +1274,12 @@ impl Server {
 
     // ---------- Vault ----------
 
-    fn vault_tick(&mut self, p: P) {
-        let Some(be) = self.be_get(p).cloned() else { return };
-        let mut v = VaultData::load(&be);
+    fn vault_tick(&mut self, p: P, rank: usize) {
+        let paths = SpawnPaths::current();
+        if paths.vault_early_exit && self.vault_waits(p, rank) {
+            return;
+        }
+        let Some(mut v) = self.vault_load(p, Some(rank), paths.vault_borrow) else { return };
         let state = self.prop(p, "vault_state").unwrap_or_else(|| "inactive".into());
         let s = self.get(p);
         let ominous = self.view().get_bool(s, "ominous");
@@ -1071,6 +1293,29 @@ impl Server {
             }
         }
         v.finish(self, p);
+    }
+
+    /// Paused vault (before `state_updating_resumes_at`) that does not cycle its displayed item
+    /// this tick (every 20 ticks when active): its tick would change nothing, so nothing is
+    /// decoded. Same readers as `VaultData::load` (any integer width, default 0 and inactive).
+    fn vault_waits(&self, p: P, rank: usize) -> bool {
+        let Some(be) = self.chunk_be(p, rank) else { return true };
+        let resumes_at = be.get("server_data").and_then(|s| nbtio::int(s, "state_updating_resumes_at")).unwrap_or(0);
+        let active = self.view().get(self.get(p), "vault_state") == Some("active");
+        self.time < resumes_at && !(self.time % 20 == 0 && active)
+    }
+
+    /// Vault data of the block entity at `p` (its rank when known). `in_place` false: the former
+    /// path, which decoded a copy of the whole block entity.
+    fn vault_load(&self, p: P, rank: Option<usize>, in_place: bool) -> Option<VaultData> {
+        if !in_place {
+            return self.be_get(p).cloned().map(|be| VaultData::load(&be));
+        }
+        let be = match rank {
+            Some(i) => self.chunk_be(p, i),
+            None => self.be_get(p),
+        };
+        be.map(VaultData::load)
     }
 
     fn vault_next(&mut self, v: &mut VaultData, state: &str, p: P) -> &'static str {
@@ -1164,12 +1409,7 @@ impl Server {
         let table = v.display_table.clone().unwrap_or_else(|| v.loot_table.clone());
         let ctx = crate::loot::Ctx::default();
         let items = {
-            let tags = &self.block_tags;
-            let data = &self.data;
-            let tag_fn = |tag: &str, n: &str| {
-                let id = data.blocks.iter().position(|b| b.name == n).map(|i| i as u32);
-                id.is_some_and(|id| tags.get(tag).is_some_and(|v| v.binary_search(&id).is_ok()))
-            };
+            let tag_fn = |tag: &str, n: &str| self.loot_block_in_tag(tag, n);
             let l = crate::loot::Loot { pack: &self.life.pack, items: &self.life.items, block_tag: &tag_fn };
             let mut rng = self.mobs.rng;
             let out = l.drops(&table, &ctx, &mut rng);
@@ -1198,8 +1438,7 @@ impl Server {
         if self.prop(p, "vault_state").as_deref() != Some("active") {
             return None;
         }
-        let be = self.be_get(p).cloned()?;
-        let mut v = VaultData::load(&be);
+        let mut v = self.vault_load(p, None, SpawnPaths::current().vault_borrow)?;
         let key = v.key.clone()?;
         let now = self.time;
         let fail = |s: &mut Server, sound: &str| {
@@ -1293,14 +1532,14 @@ impl Server {
             // Trial spawner: settings replaced by the single mob, state reset.
             let be = self.be_get(p).cloned()?;
             let put = |key: &str, raw: Option<&Nbt>, s: &mut Server| {
-                let base = s.trial_cfg(raw);
+                let base = s.trial_config(raw, true);
                 let mut c = vec![
-                    ("spawn_range".into(), Nbt::Int(base.range)),
-                    ("total_mobs".into(), Nbt::Float(base.total)),
-                    ("simultaneous_mobs".into(), Nbt::Float(base.simul)),
-                    ("total_mobs_added_per_player".into(), Nbt::Float(base.total_add)),
-                    ("simultaneous_mobs_added_per_player".into(), Nbt::Float(base.simul_add)),
-                    ("ticks_between_spawn".into(), Nbt::Int(base.between)),
+                    ("spawn_range".into(), Nbt::Int(base.spawn_range)),
+                    ("total_mobs".into(), Nbt::Float(base.total_mobs)),
+                    ("simultaneous_mobs".into(), Nbt::Float(base.simultaneous_mobs)),
+                    ("total_mobs_added_per_player".into(), Nbt::Float(base.total_mobs_added_per_player)),
+                    ("simultaneous_mobs_added_per_player".into(), Nbt::Float(base.simultaneous_mobs_added_per_player)),
+                    ("ticks_between_spawn".into(), Nbt::Int(base.ticks_between_spawn)),
                     (
                         "spawn_potentials".into(),
                         Nbt::List(vec![Nbt::Compound(vec![
@@ -1312,18 +1551,18 @@ impl Server {
                 c.push((
                     "loot_tables_to_eject".into(),
                     Nbt::List(
-                        base.eject
-                            .iter()
+                        base.loot_tables_to_eject()
+                            .into_iter()
                             .map(|(t, w)| {
-                                Nbt::Compound(vec![
-                                    ("data".into(), Nbt::String(t.clone())),
-                                    ("weight".into(), Nbt::Int(*w)),
-                                ])
+                                Nbt::Compound(vec![("data".into(), Nbt::String(t)), ("weight".into(), Nbt::Int(w))])
                             })
                             .collect(),
                     ),
                 ));
-                c.push(("items_to_drop_when_ominous".into(), Nbt::String(base.ominous_items)));
+                c.push((
+                    "items_to_drop_when_ominous".into(),
+                    Nbt::String(base.items_to_drop_when_ominous().to_owned()),
+                ));
                 if let Some(b) = s.be_get_mut(p) {
                     nbtio::set(b, key, Nbt::Compound(c));
                 }
@@ -1331,7 +1570,7 @@ impl Server {
             put("normal_config", be.get("normal_config"), self);
             put("ominous_config", be.get("ominous_config"), self);
             let t = TrialData::default();
-            self.trial_store(p, &t);
+            self.trial_store(p, None, &t);
             let s = self.get(p);
             let ns = self.view().set(s, "trial_spawner_state", "inactive");
             self.set_update(p, ns);
@@ -1350,13 +1589,19 @@ impl Server {
     }
 }
 
-/// Common settings of a trial spawner tick.
+/// Settings read once per trial spawner tick.
 struct TrialCtx {
-    normal: Cfg,
-    ominous_cfg: Cfg,
-    target_cd: i64,
+    normal_config: TrialSpawnSettings,
+    ominous_config: TrialSpawnSettings,
+    target_cooldown: i64,
     range: i32,
     p: P,
+}
+
+impl TrialCtx {
+    fn config(&self, ominous: bool) -> &TrialSpawnSettings {
+        if ominous { &self.ominous_config } else { &self.normal_config }
+    }
 }
 
 /// Vault: setting, server and shared data (read from the block entity, rewritten).
@@ -1394,8 +1639,8 @@ impl VaultData {
                 .and_then(Nbt::as_str)
                 .unwrap_or("minecraft:chests/trial_chambers/reward")
                 .to_owned(),
-            activation: num(g("activation_range")).unwrap_or(4.0),
-            deactivation: num(g("deactivation_range")).unwrap_or(4.5),
+            activation: nbt_number(g("activation_range")).unwrap_or(4.0),
+            deactivation: nbt_number(g("deactivation_range")).unwrap_or(4.5),
             key,
             display_table: g("override_loot_table_to_display").and_then(Nbt::as_str).map(str::to_owned),
             rewarded: uuids(sd.and_then(|s| s.get("rewarded_players"))),
@@ -1407,7 +1652,7 @@ impl VaultData {
             total_needed: sd.and_then(|s| nbtio::int(s, "total_ejections_needed")).unwrap_or(0) as i32,
             display: sh.and_then(|s| s.get("display_item")).and_then(Stack::from_nbt),
             connected: uuids(sh.and_then(|s| s.get("connected_players"))),
-            particles_range: num(sh.and_then(|s| s.get("connected_particles_range"))).unwrap_or(4.5),
+            particles_range: nbt_number(sh.and_then(|s| s.get("connected_particles_range"))).unwrap_or(4.5),
             server_dirty: false,
             shared_dirty: false,
             state_changed: false,
@@ -1724,6 +1969,48 @@ mod tests {
         p.s.sim_dist = 12;
         assert!(p.s.mob_chunk_ticking(at(8)) && !p.s.mob_chunk_ticking(at(9)));
         finish(p, dir);
+    }
+
+    /// The trial spawner's write is skipped only when it changes nothing: a field in another form
+    /// (an `Int` time, a duplicated player, an empty list, a `Long` total, a zero time, a
+    /// non-text table, spawn data without entity) is still normalized, like before; the
+    /// normalized form is then left alone.
+    #[test]
+    fn trial_write_skipped_only_when_unchanged() {
+        let u = nbtio::uuid_nbt(7);
+        let base = Nbt::Compound(vec![
+            ("id".into(), Nbt::String(TRIAL.into())),
+            ("registered_players".into(), Nbt::List(vec![nbtio::uuid_nbt(3)])),
+            ("next_mob_spawns_at".into(), Nbt::Long(40)),
+            ("spawn_data".into(), Nbt::Compound(vec![("entity".into(), Nbt::Compound(Vec::new()))])),
+        ]);
+        let data = Server::trial_load(&base);
+        assert!(Server::trial_stored_as(&base, &data), "canonical block entity: no write");
+        for (field, value) in [
+            ("next_mob_spawns_at", Nbt::Int(40)),
+            ("registered_players", Nbt::List(vec![u.clone(), u])),
+            ("current_mobs", Nbt::List(Vec::new())),
+            ("total_mobs_spawned", Nbt::Long(1)),
+            ("cooldown_ends_at", Nbt::Long(0)),
+            ("ejecting_loot_table", Nbt::Int(1)),
+            ("spawn_data", Nbt::Compound(Vec::new())),
+        ] {
+            let mut be = base.clone();
+            nbtio::set(&mut be, field, value);
+            let t = Server::trial_load(&be);
+            let mut written = be.clone();
+            Server::trial_write(&mut written, &t);
+            assert_ne!(written, be, "{field}: the write normalizes");
+            assert!(!Server::trial_stored_as(&be, &t), "{field}: not skipped");
+            assert!(Server::trial_stored_as(&written, &t), "{field}: normalized form left alone");
+        }
+        // Data changed by the tick: written.
+        let mut t = data.clone();
+        t.total = 2;
+        assert!(!Server::trial_stored_as(&base, &t));
+        t = data;
+        t.players.push(9);
+        assert!(!Server::trial_stored_as(&base, &t));
     }
 
     /// Egg on a monster spawner: the mob to spawn changes, no mob is born.
