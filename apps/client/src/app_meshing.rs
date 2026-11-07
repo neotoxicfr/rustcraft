@@ -1,7 +1,9 @@
 //! From a block change to a mesh job: light recompute of the touched sections, then scheduling of the meshing.
 
-use rc_mesh::blocks::{self, Tables};
-use rc_mesh::wire::MeshJob;
+use hashbrown::HashMap;
+use rc_mesh::blocks::{self, BiomePalette, Tables};
+use rc_mesh::wire::{MeshJob, Sections};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::{App, environ, light_engine, perf_log, remesh, weather};
@@ -165,31 +167,40 @@ impl App {
 
     /// Starts the meshing of the modified columns (at most four tasks per pool thread,
     /// `RUSTCRAFT_MESHQUEUE`: a deep queue keeps the pool busy during the long frames of
-    /// loading; bench of 19/10 in `docs/perf.md`).
+    /// loading; bench of 19/10 in `docs/perf.md`). Only their dirty sections in view, like the
+    /// game ([`sections_to_launch`]).
     pub(crate) fn schedule_meshing(&mut self) {
         static DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let depth =
             *DEPTH.get_or_init(|| rc_data::env_str!("RUSTCRAFT_MESHQUEUE").and_then(|v| v.parse().ok()).unwrap_or(4));
         let limit = rayon::current_num_threads() * depth;
         let free = limit.saturating_sub(self.in_flight);
-        if free == 0 || self.world.dirty.is_empty() {
+        if !pick_this_frame(free, self.world.dirty.len(), perf_log::on()) {
             return;
         }
         // The closest to the camera first: the world appears around the player.
         let (ex, ez) = ((self.eye[0] / 16.0).floor() as i32, (self.eye[2] / 16.0).floor() as i32);
+        let (eye, sync_mode) = (self.eye, self.options.i("prioritizeChunkUpdates"));
+        let visible_only = mesh_visible_only();
+        let (meshes, renderer, video) = (&self.world.meshes, self.renderer.as_ref(), &self.video);
+        // Like the game, a column already drawn is remeshed only for its dirty sections in view.
+        let launchable = |(x, z): (i32, i32), marks: Sections| {
+            let Some(r) = renderer.filter(|_| visible_only) else { return Some(marks) };
+            let urgent = video.wants_sync(x, z, eye, sync_mode);
+            sections_to_launch(marks, r.sections_in_view(x, z), meshes.has_base((x, z)), urgent)
+        };
         // A column already in progress waits for its result (base of the next remesh), unless it
         // must be redone whole.
-        let meshes = &self.world.meshes;
-        let mut ready: Vec<(i32, i32)> =
-            self.world.dirty.iter().filter(|&(&k, &m)| meshes.may_start(k, m)).map(|(&k, _)| k).collect();
-        let dist = |&k: &(i32, i32)| remesh::column_dist2(k, (ex, ez));
-        if ready.len() > free {
-            ready.select_nth_unstable_by_key(free - 1, dist);
-            ready.truncate(free);
-        }
-        ready.sort_unstable_by_key(dist);
-        for (x, z) in ready {
-            let Some(mask) = self.world.dirty.remove(&(x, z)) else { continue };
+        let picked = pick_columns(
+            &mut self.world.dirty,
+            free,
+            (ex, ez),
+            |k, m| meshes.may_start(k, m),
+            launchable,
+            visible_only && mesh_hidden_in_spare_slots(),
+        );
+        let release_early = release_job_early();
+        for ((x, z), mask) in picked {
             let Some(center) = self.world.grid.get_arc(x, z) else { continue };
             let version = self.world.versions.get(&(x, z)).copied().unwrap_or(0);
             let mut job = MeshJob::gather(center, version, |x, z| self.world.grid.get_arc(x, z));
@@ -213,23 +224,29 @@ impl App {
             job.opts = self.video.mesh;
             job.plains_biome = self.env.plains();
             (job.biome_zoom_seed, job.min_y) = (crate::environ::biome_zoom_seed(), self.world.min_y);
-            let (tables, tx, min_y, palette) =
-                (self.tables.clone(), self.meshes_tx.clone(), self.world.min_y, self.palette.clone());
+            let tx = self.meshes_tx.clone();
             self.in_flight += 1;
             let n = job.center.sections.len();
-            let secs = job.reuse.as_ref().map_or(n, |(m, _)| m.count(n));
+            let sections = job.reuse.as_ref().map_or(n, |(m, _)| m.count(n));
             // Priority updates (`prioritizeChunkUpdates`): in-place meshing, visible in
             // this frame (never delayed by the upload budget).
-            let urgent = self.video.mesh_sync(x, z, self.eye, self.options.i("prioritizeChunkUpdates"));
+            let urgent = self.video.mesh_sync(x, z, self.eye, sync_mode);
+            let task = MeshTask {
+                job,
+                tables: self.tables.clone(),
+                palette: self.palette.clone(),
+                min_y: self.world.min_y,
+                live,
+                urgent,
+                base_version,
+                kind,
+                sections,
+            };
             let run = move || {
-                let t = Instant::now();
-                let m = blocks::mesh(&job, &tables, &palette, min_y);
-                perf_log::mesh_work(t.elapsed(), secs, kind);
-                let t = Instant::now();
-                let base = job.reuse.as_ref().zip(base_version).map(|((_, w), v)| (w, v));
-                let done = remesh::finish(m, live, urgent, base);
-                perf_log::prep_work(t.elapsed());
+                let (done, kept_job) = task.run(release_early);
                 let _ = tx.send(done);
+                // Old path: the job's columns were held until the result was sent.
+                drop(kept_job);
             };
             if urgent {
                 run();
@@ -247,6 +264,160 @@ impl App {
         }
     }
 }
+
+/// Visibility filter of the meshing (`RUSTCRAFT_OPT_MESHVISIBLEONLY`, on by default; `=0`: every
+/// dirty column as before): the game rebuilds only the dirty sections in view, the others keep
+/// their mark until they come into view (`docs/specs/visibility.md` § 3).
+fn mesh_visible_only() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_MESHVISIBLEONLY")
+}
+
+/// Cautious variant of the filter (`RUSTCRAFT_OPT_MESH_HIDDEN_IN_SPARE_SLOTS=1`, off by default):
+/// the columns held out of view still take the task slots the visible ones leave free.
+fn mesh_hidden_in_spare_slots() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_MESH_HIDDEN_IN_SPARE_SLOTS", default_off)
+}
+
+/// The task lets go of its nine columns as soon as the mesh is made
+/// (`RUSTCRAFT_OPT_MESHDROPJOBEARLY`, on by default; `=0`: held until the result is sent).
+fn release_job_early() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_MESHDROPJOBEARLY")
+}
+
+/// Sections a dirty column launches under the visibility filter, `None` to hold it this frame.
+/// `in_view`: its sections reached by the walk and kept by the field of the last frame drawn;
+/// `None` when the walk cannot see the column (no mesh of it drawn yet): launched as before, or
+/// the walk would never reach it. A priority (synchronous) remesh is never held. Without a kept
+/// base, or redone whole, the task meshes the whole column anyway: every mark goes as soon as one
+/// dirty section is in view.
+pub(crate) fn sections_to_launch(
+    dirty: Sections,
+    in_view: Option<Sections>,
+    has_base: bool,
+    urgent: bool,
+) -> Option<Sections> {
+    let Some(in_view) = in_view.filter(|_| !urgent) else { return Some(dirty) };
+    let seen = dirty.intersection(in_view);
+    if seen.is_empty() {
+        None
+    } else if dirty.is_all() || !has_base {
+        Some(dirty)
+    } else {
+        Some(seen)
+    }
+}
+
+/// The frame runs [`pick_columns`]: something to launch (`free` task slots, `dirty` columns), or the
+/// perf log on (`counting_held`), whose held-columns gauge must stay current even with a full queue
+/// or nothing dirty (the pick then launches nothing and leaves the marks as they are).
+fn pick_this_frame(free: usize, dirty: usize, counting_held: bool) -> bool {
+    counting_held || (free > 0 && dirty > 0)
+}
+
+/// A dirty column and the sections it launches.
+type Launch = ((i32, i32), Sections);
+
+/// Columns to mesh this frame with the sections of each: at most `free`, the closest to the eye
+/// column first. `launchable` tells what a startable column launches (`None`: held); what is
+/// launched leaves `dirty`, the sections held stay marked. `hidden_in_spare_slots`: the held
+/// columns fill the slots left free, all their marks.
+pub(crate) fn pick_columns(
+    dirty: &mut HashMap<(i32, i32), Sections>,
+    free: usize,
+    eye: (i32, i32),
+    may_start: impl Fn((i32, i32), Sections) -> bool,
+    launchable: impl Fn((i32, i32), Sections) -> Option<Sections>,
+    hidden_in_spare_slots: bool,
+) -> Vec<Launch> {
+    let (mut ready, mut held) = (Vec::new(), Vec::new());
+    for (&key, &marks) in dirty.iter().filter(|&(&k, &m)| may_start(k, m)) {
+        match launchable(key, marks) {
+            Some(launch) => ready.push((key, launch)),
+            None => held.push((key, marks)),
+        }
+    }
+    let mut held_count = held.len();
+    keep_closest(&mut ready, free, eye);
+    if hidden_in_spare_slots && ready.len() < free {
+        keep_closest(&mut held, free - ready.len(), eye);
+        held_count -= held.len();
+        ready.append(&mut held);
+    }
+    let mut left_marked = 0;
+    for &(key, launch) in &ready {
+        let Some(marks) = dirty.get_mut(&key) else { continue };
+        marks.subtract(launch);
+        if marks.is_empty() {
+            dirty.remove(&key);
+        } else {
+            left_marked += 1;
+        }
+    }
+    if perf_log::on() {
+        perf_log::mesh_held(held_count, left_marked);
+    }
+    ready
+}
+
+/// Keeps the `n` launches closest to the eye column, sorted from the closest.
+fn keep_closest(launches: &mut Vec<Launch>, n: usize, eye: (i32, i32)) {
+    let dist = |&(k, _): &Launch| remesh::column_dist2(k, eye);
+    if launches.len() > n {
+        launches.select_nth_unstable_by_key(n.saturating_sub(1), dist);
+        launches.truncate(n);
+    }
+    launches.sort_unstable_by_key(dist);
+}
+
+/// One meshing task: run on the pool, or on the main thread for a priority remesh.
+struct MeshTask {
+    job: MeshJob,
+    tables: Arc<Tables>,
+    palette: Arc<BiomePalette>,
+    min_y: i32,
+    /// Redone for changed blocks or light (kept as a base), not the whole column.
+    live: bool,
+    urgent: bool,
+    /// Version of the base the partial remesh starts from.
+    base_version: Option<u64>,
+    kind: perf_log::MeshJobKind,
+    /// Sections meshed (perf log).
+    sections: usize,
+}
+
+impl MeshTask {
+    /// Meshes, then prepares the upload (`remesh::finish`). With `release_job_early`, the job's
+    /// nine columns are let go right after the meshing: they are shared with the client world,
+    /// whose next write to a column a task still holds copies it whole, and the end of the task
+    /// (flattening, GPU bytes) reads none of them. Otherwise the job is handed back, to be dropped
+    /// after the send as before.
+    fn run(self, release_job_early: bool) -> (remesh::Done, Option<MeshJob>) {
+        let MeshTask { job, tables, palette, min_y, live, urgent, base_version, kind, sections } = self;
+        let t = Instant::now();
+        let mesh = blocks::mesh(&job, &tables, &palette, min_y);
+        perf_log::mesh_work(t.elapsed(), sections, kind);
+        let (reuse, kept_job) = take_base(job, release_job_early);
+        let t = Instant::now();
+        let base = reuse.as_ref().zip(base_version).map(|((_, w), v)| (w, v));
+        let done = remesh::finish(mesh, live, urgent, base);
+        perf_log::prep_work(t.elapsed());
+        (done, kept_job)
+    }
+}
+
+/// The base of a meshed job, and the job itself unless `release` lets it (and its columns) go now.
+fn take_base(mut job: MeshJob, release: bool) -> (Option<(Sections, blocks::Packed)>, Option<MeshJob>) {
+    let reuse = job.reuse.take();
+    if release {
+        drop(job);
+        return (reuse, None);
+    }
+    (reuse, Some(job))
+}
+
+#[cfg(test)]
+#[path = "app_meshing_filter_test.rs"]
+mod filter_tests;
 
 #[cfg(test)]
 mod tests {

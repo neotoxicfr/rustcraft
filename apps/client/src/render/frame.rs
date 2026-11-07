@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::capture::surface_state;
-use super::frustum::frustum_planes;
+use super::frustum::{MeshingView, frustum_planes};
 use super::regions::identity_buffer;
 use super::terrain_draw::indexed_args;
 use super::{
@@ -141,6 +141,10 @@ impl Renderer {
             }
         }
         let planes = frustum_planes(cull_view_proj);
+        // Kept for the meshing, which only remeshes the dirty sections in view (frustum moved back
+        // as the game's: the sections right behind the camera are rebuilt too).
+        let forward = crate::camera::axes(yaw, pitch).2;
+        self.meshing_view = Some(MeshingView::new(planes, origin, eye, forward, min_y, height / 16));
         // Improved transparency: targets and pipelines prepared as needed, targets freed otherwise.
         if oit_on {
             self.prepare_oit(proj);
