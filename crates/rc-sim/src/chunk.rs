@@ -1,6 +1,6 @@
 //! Block chunk (`anvil-world.md` § 4): disk NBT → palettized sections with global
 //! identifiers, light, height maps, block entities. The compound read is kept for
-//! rewriting (unknown keys copied as they are, § 7).
+//! rewriting (unknown keys copied as they are, § 7), less what memory holds (`chunk_disk`).
 
 use std::sync::Arc;
 
@@ -8,6 +8,7 @@ use rc_data::VersionData;
 use rc_proto::nbt::Nbt;
 use rc_world::{Container, LIGHT_BYTES, LightLayer, SECTION_BIOMES, SECTION_BLOCKS, Section, longs_for};
 
+use crate::chunk_disk::{self, DiskKeeping, DiskSection, KeptLight, SectionForm, SectionWrite};
 use crate::nbtio::{int, list};
 use crate::states::States;
 
@@ -101,12 +102,18 @@ pub struct Chunk {
     /// Inhabited time (`InhabitedTime`): +1 per tick as long as the chunk is within a player's
     /// spawn range; feeds the local difficulty.
     pub inhabited_time: i64,
-    /// Compound read, kept for rewriting.
+    /// Compound read (then last written), kept for rewriting. With `disk_sections`, its
+    /// `sections`, `block_entities` and complete `Heightmaps` are left empty: memory holds them.
     pub root: Nbt,
+    /// Per light index (`sections + 2`), what the save rewrites of each section besides memory.
+    /// Empty: the sections stay in `root` (`RUSTCRAFT_OPT_SLIM_DISK_COMPOUND=0`).
+    pub disk_sections: Vec<DiskSection>,
     /// An unknown identifier was replaced: this chunk is never rewritten.
     pub lossy: bool,
     /// Sections whose blocks changed since the read (re-encoded on write).
     pub changed: Vec<bool>,
+    /// Sections whose biomes changed since the read (`/fillbiome`; re-encoded on write).
+    pub biomes_changed: Vec<bool>,
     /// Modified since the last save.
     pub dirty: bool,
 }
@@ -141,14 +148,32 @@ enum DiskContainer {
     Packed { ids: Box<[u32]>, bits: u8, data: Box<[u64]> },
 }
 
+/// Width of a disk container's packed indices for a palette of `entries` (§ 4.3): at least 4 bits
+/// for blocks.
+pub(crate) fn disk_bits(entries: usize, blocks: bool) -> u8 {
+    let k = bits_for(entries);
+    if blocks && k <= 4 { 4 } else { k }
+}
+
+/// How a container's packed words reach memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Words {
+    /// Copied: the compound keeps them.
+    Copied,
+    /// Moved out of the compound, [`chunk_disk::moved_words`] left in their place (the compound is
+    /// not kept whole).
+    Moved,
+}
+
 /// Palette resolved and `data` read and sized. `lossy`: an unknown entry was replaced by `fallback`.
 fn read_container(
-    c: Option<&Nbt>,
+    c: Option<&mut Nbt>,
     entries: usize,
     blocks: bool,
     fallback: u32,
     mut resolve: impl FnMut(&Nbt) -> Option<u32>,
     lossy: &mut bool,
+    words: Words,
 ) -> Result<DiskContainer, String> {
     let Some(c) = c else { return Ok(DiskContainer::Single(fallback)) };
     let palette = list(c.get("palette"));
@@ -167,10 +192,14 @@ fn read_container(
     if ids.len() == 1 {
         return Ok(DiskContainer::Single(ids[0]));
     }
-    let k = bits_for(ids.len());
-    let bits = if blocks && k <= 4 { 4 } else { k };
-    let data: Box<[u64]> = match c.get("data") {
-        Some(Nbt::LongArray(d)) => d.iter().map(|&v| v as u64).collect(),
+    let bits = disk_bits(ids.len(), blocks);
+    let data: Box<[u64]> = match (crate::nbtio::get_mut(c, "data"), words) {
+        (Some(slot @ Nbt::LongArray(_)), Words::Moved) => {
+            let Nbt::LongArray(d) = std::mem::replace(slot, chunk_disk::moved_words()) else { unreachable!() };
+            // Same size and alignment: the words are reinterpreted in their own allocation.
+            d.into_iter().map(|v| v as u64).collect()
+        }
+        (Some(Nbt::LongArray(d)), Words::Copied) => d.iter().map(|&v| v as u64).collect(),
         _ => return Err("data missing".into()),
     };
     if data.len() != longs_for(entries, bits) {
@@ -201,15 +230,16 @@ fn outside_palette() -> String {
 
 /// Disk container (§ 4.3) → memory container with global identifiers. `lossy`: an unknown
 /// entry was replaced by `fallback`.
-pub(crate) fn container(
-    c: Option<&Nbt>,
+pub(crate) fn read_disk_container(
+    c: Option<&mut Nbt>,
     entries: usize,
     blocks: bool,
     fallback: u32,
     resolve: impl FnMut(&Nbt) -> Option<u32>,
     lossy: &mut bool,
+    words: Words,
 ) -> Result<Container, String> {
-    match read_container(c, entries, blocks, fallback, resolve, lossy)? {
+    match read_container(c, entries, blocks, fallback, resolve, lossy, words)? {
         DiskContainer::Single(v) => Ok(Container::Single(v)),
         DiskContainer::Packed { ids, bits, data } => {
             // Indices outside the palette: corrupt.
@@ -224,13 +254,14 @@ pub(crate) fn container(
 /// counted in the same walk (`RUSTCRAFT_OPT_SECTION_ONE_PASS_COUNT`) instead of a check, then an
 /// unpacking of the 4,096 states and a lookup of each.
 pub(crate) fn block_container_counted(
-    c: Option<&Nbt>,
+    c: Option<&mut Nbt>,
     fallback: u32,
     resolve: impl FnMut(&Nbt) -> Option<u32>,
     lossy: &mut bool,
     states: &States,
+    words: Words,
 ) -> Result<(Container, i16), String> {
-    match read_container(c, SECTION_BLOCKS, true, fallback, resolve, lossy)? {
+    match read_container(c, SECTION_BLOCKS, true, fallback, resolve, lossy, words)? {
         DiskContainer::Single(v) => {
             let c = Container::Single(v);
             let n = count_non_empty(&c, states);
@@ -280,26 +311,49 @@ fn section_one_pass_count() -> bool {
     rc_data::opt_switch!("RUSTCRAFT_OPT_SECTION_ONE_PASS_COUNT")
 }
 
-fn light_layer(v: Option<&Nbt>) -> Result<LightLayer, String> {
-    light_layer_with(v, rc_light::uniform_light_interned())
+fn read_light_layer(v: Option<&Nbt>) -> Result<LightLayer, String> {
+    read_light_layer_with(v, rc_light::uniform_light_interned(), light_read_in_one_copy())
 }
 
-/// [`light_layer`] with the switch given: an all-0 or all-15 saved layer (sky under the
+/// `RUSTCRAFT_OPT_READ_WITHOUT_COPIES=0`: a saved light layer copied twice (into a stack array,
+/// then into its heap sheet) instead of once.
+fn light_read_in_one_copy() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_READ_WITHOUT_COPIES")
+}
+
+/// [`read_light_layer`] with the switches given: an all-0 or all-15 saved layer (sky under the
 /// terrain) becomes the shared one instead of its own 2 KB.
-fn light_layer_with(v: Option<&Nbt>, intern_uniform: bool) -> Result<LightLayer, String> {
-    match v {
-        None => Ok(None),
-        Some(Nbt::ByteArray(b)) if b.len() == LIGHT_BYTES => {
-            let mut a = [0u8; LIGHT_BYTES];
-            a.copy_from_slice(b);
-            Ok(Some(if intern_uniform { rc_world::intern_light_layer(a) } else { Arc::new(a) }))
-        }
-        Some(_) => Err("light layer of invalid size".into()),
-    }
+pub(crate) fn read_light_layer_with(v: Option<&Nbt>, intern_uniform: bool, one_copy: bool) -> Result<LightLayer, String> {
+    let bytes: &[u8; LIGHT_BYTES] = match v {
+        None => return Ok(None),
+        Some(Nbt::ByteArray(b)) => b.as_slice().try_into().map_err(|_| "light layer of invalid size")?,
+        Some(_) => return Err("light layer of invalid size".into()),
+    };
+    let shared = if intern_uniform { rc_world::shared_layer_equal_to(bytes) } else { None };
+    Ok(Some(match shared {
+        Some(s) => s,
+        // The sheet built straight from the saved bytes: no stack copy on the way.
+        None if one_copy => Arc::<[u8]>::from(&bytes[..]).try_into().expect("layer of LIGHT_BYTES"),
+        None => Arc::new(*bytes),
+    }))
+}
+
+/// `RUSTCRAFT_OPT_COUNT_BLOCKS_BY_HISTOGRAM=0`: non-empty blocks counted on the 4,096 unpacked
+/// states instead of a histogram of the packed indices (one test per palette entry).
+fn count_by_histogram() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_COUNT_BLOCKS_BY_HISTOGRAM")
 }
 
 /// Number of non-empty blocks of a section.
 pub fn count_non_empty(blocks: &Container, states: &States) -> i16 {
+    count_non_empty_with(blocks, states, count_by_histogram())
+}
+
+/// [`count_non_empty`] with the switch given.
+pub(crate) fn count_non_empty_with(blocks: &Container, states: &States, by_histogram: bool) -> i16 {
+    if by_histogram {
+        return blocks.count_where(SECTION_BLOCKS, |s| !states.is_air(s)) as i16;
+    }
     match blocks {
         Container::Single(v) => {
             if states.is_air(*v) {
@@ -396,6 +450,22 @@ fn encode_container_reference(c: &Container, entries: usize, blocks: bool, entry
 /// Block container in disk format.
 pub fn encode_blocks(c: &Container, data: &VersionData, states: &States) -> Nbt {
     encode_container(c, SECTION_BLOCKS, true, |v| states.palette_entry(data, v))
+}
+
+/// Biome container in disk format.
+pub fn encode_biomes(c: &Container, states: &States) -> Nbt {
+    encode_container(c, SECTION_BIOMES, false, |v| Nbt::String(chunk_disk::biome_name(states, v).to_owned()))
+}
+
+/// For a container freshly built by [`Container::pack`] (palette in order of first appearance,
+/// no unused entry): is its disk encoding exactly what memory holds? Only the width may differ,
+/// or the palette be missing (direct values beyond 8 bits).
+pub(crate) fn fresh_pack_is_disk_encoding(c: &Container, blocks: bool) -> bool {
+    match c {
+        Container::Single(_) => true,
+        Container::Packed { bits, palette: Some(p), .. } => *bits == disk_bits(p.len(), blocks),
+        Container::Packed { palette: None, .. } => false,
+    }
 }
 
 /// Placement without notification in a chunk of the list (flag 2 of the game): height maps
@@ -597,6 +667,13 @@ impl Chunk {
         }
     }
 
+    /// The live height maps are all there with the right length (the save then writes them all).
+    pub(crate) fn live_heightmaps(&self, h: Height) -> bool {
+        LIVE_HEIGHTMAPS
+            .iter()
+            .all(|(id, _)| self.heightmaps.iter().any(|(k, l)| k == id && l.len() == heightmap_longs(h)))
+    }
+
     /// Compound to write (§ 7): the compound read, with the changed sections re-encoded, the current light,
     /// the current block entities, `LastUpdate`, the current height maps (without up-to-date
     /// live maps, those of a modified chunk are removed to be recomputed).
@@ -605,47 +682,133 @@ impl Chunk {
         if self.lossy {
             return None;
         }
-        let mut root = self.root.clone();
+        let without_copies = chunk_disk::encode_without_copies();
+        let (root, _) = self.assemble(self.root.clone(), self.block_entities.clone(), without_copies, data, states, h, time);
+        Some(root)
+    }
+
+    /// The save's [`Chunk::encode`]: the compound is handed to `write`, then the chunk keeps what it
+    /// wrote, less what memory holds. `None`: never rewritten (unknown identifier replaced).
+    pub fn encode_for_save<R>(
+        &mut self,
+        data: &VersionData,
+        states: &States,
+        h: Height,
+        time: i64,
+        write: impl FnOnce(&Nbt) -> R,
+    ) -> Option<R> {
+        let without_copies = chunk_disk::encode_without_copies();
+        self.encode_for_save_with(without_copies, DiskKeeping::from_switches(), (data, states, h, time), write)
+    }
+
+    /// [`Chunk::encode_for_save`] with the switches given. `without_copies`: the kept parts are
+    /// moved into the written compound and back instead of copied.
+    pub(crate) fn encode_for_save_with<R>(
+        &mut self,
+        without_copies: bool,
+        keeping: DiskKeeping,
+        (data, states, h, time): (&VersionData, &States, Height, i64),
+        write: impl FnOnce(&Nbt) -> R,
+    ) -> Option<R> {
+        if self.lossy {
+            return None;
+        }
+        let (root, block_entities) = if without_copies {
+            (std::mem::replace(&mut self.root, Nbt::Compound(Vec::new())), std::mem::take(&mut self.block_entities))
+        } else {
+            (self.root.clone(), self.block_entities.clone())
+        };
+        let (mut written, writes) = self.assemble(root, block_entities, without_copies, data, states, h, time);
+        let out = write(&written);
+        self.keep_after_save(&mut written, &writes, without_copies, keeping, h);
+        self.root = written;
+        Some(out)
+    }
+
+    /// What the chunk keeps of the compound it just wrote: all of it with the sections in the root
+    /// compound, otherwise only what memory cannot give back (sections per height, see
+    /// [`DiskSection`]); the block entities in memory only with `no_duplicate_block_entities`.
+    fn keep_after_save(&mut self, written: &mut Nbt, writes: &[SectionWrite], without_copies: bool, keeping: DiskKeeping, h: Height) {
+        if without_copies {
+            // Moved into the written compound: back into memory.
+            self.block_entities = chunk_disk::take_list(written, "block_entities");
+            if !keeping.no_duplicate_block_entities {
+                crate::nbtio::set(written, "block_entities", Nbt::List(self.block_entities.clone()));
+            }
+        } else if keeping.no_duplicate_block_entities {
+            chunk_disk::take_list(written, "block_entities");
+        }
+        if self.disk_sections.is_empty() {
+            return;
+        }
+        chunk_disk::take_list(written, "sections");
+        if self.live_heightmaps(h) {
+            chunk_disk::empty_compound(written, "Heightmaps");
+        }
         let min = h.min_section();
-        let old: Vec<Nbt> = list(root.get("sections")).to_vec();
-        let mut sections = Vec::new();
-        for li in 0..self.sky.len() as i32 {
-            let y = min - 1 + li;
-            let found = old.iter().find(|s| int(s, "Y") == Some(i64::from(y))).cloned();
-            let existed = found.is_some();
-            let mut s = found.unwrap_or_else(|| Nbt::Compound(vec![("Y".into(), Nbt::Byte(y as i8))]));
-            let i = y - min;
-            if (0..h.sections as i32).contains(&i) {
-                let sec = &self.sections[i as usize];
-                if self.changed[i as usize] || (!existed && !sec.is_empty()) {
-                    let blocks = encode_container(&sec.blocks, SECTION_BLOCKS, true, |v| states.palette_entry(data, v));
-                    crate::nbtio::set(&mut s, "block_states", blocks);
-                    if s.get("biomes").is_none() {
-                        let names = &states.biome_names;
-                        let biomes = encode_container(&sec.biomes, SECTION_BIOMES, false, |v| {
-                            Nbt::String(names.get(v as usize).cloned().unwrap_or_else(|| "minecraft:plains".into()))
-                        });
-                        crate::nbtio::set(&mut s, "biomes", biomes);
-                    }
+        for (li, w) in writes.iter().enumerate() {
+            let d = &mut self.disk_sections[li];
+            d.form = chunk_disk::form_after_save(std::mem::take(&mut d.form), min - 1 + li as i32, *w, keeping.drop_rebuildable);
+            // Written: memory's layer when it has one, the kept one otherwise.
+            for (kept, layer) in [(&mut d.sky, &self.sky[li]), (&mut d.block, &self.block[li])] {
+                if layer.is_some() {
+                    *kept = KeptLight::of(layer);
                 }
-            }
-            for (key, layer) in [("BlockLight", &self.block[li as usize]), ("SkyLight", &self.sky[li as usize])] {
-                if let Some(l) = layer {
-                    crate::nbtio::set(&mut s, key, Nbt::ByteArray(l.to_vec()));
-                }
-            }
-            if matches!(&s, Nbt::Compound(f) if f.len() > 1) {
-                sections.push(s);
             }
         }
+    }
+
+    /// The compound to write: `root` (the kept one, moved or copied by the caller) completed from
+    /// memory; also what the save did to each section.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        &self,
+        mut root: Nbt,
+        block_entities: Vec<Nbt>,
+        without_copies: bool,
+        data: &VersionData,
+        states: &States,
+        h: Height,
+        time: i64,
+    ) -> (Nbt, Vec<SectionWrite>) {
+        let min = h.min_section();
+        let mut in_root = self.disk_sections.is_empty().then(|| SectionsInRoot::take(&mut root, without_copies, h));
+        let mut sections = Vec::new();
+        let mut writes = Vec::with_capacity(self.sky.len());
+        for li in 0..self.sky.len() {
+            let y = min - 1 + li as i32;
+            let i = usize::try_from(y - min).ok().filter(|&i| i < h.sections);
+            let as_read = match &mut in_root {
+                Some(kept) => kept.at(li, y),
+                None => {
+                    let reencoding = SectionWrite {
+                        blocks_reencoded: i.is_some_and(|i| self.changed[i]),
+                        biomes_reencoded: i.is_some_and(|i| self.biomes_changed[i]),
+                        ..SectionWrite::default()
+                    };
+                    let section = i.map(|i| &self.sections[i]);
+                    chunk_disk::section_as_read(&self.disk_sections[li].form, y, section, reencoding, data, states)
+                }
+            };
+            let (s, w) = self.section_to_write(as_read, li, y, i, data, states);
+            if w.written {
+                sections.push(s);
+            }
+            writes.push(w);
+        }
         crate::nbtio::set(&mut root, "sections", Nbt::List(sections));
-        crate::nbtio::set(&mut root, "block_entities", Nbt::List(self.block_entities.clone()));
+        crate::nbtio::set(&mut root, "block_entities", Nbt::List(block_entities));
         crate::nbtio::set(&mut root, "LastUpdate", Nbt::Long(time));
         crate::nbtio::set(&mut root, "DataVersion", Nbt::Int(DATA_VERSION));
-        let live = LIVE_HEIGHTMAPS
-            .iter()
-            .all(|(id, _)| self.heightmaps.iter().any(|(k, l)| k == id && l.len() == heightmap_longs(h)));
-        if live {
+        self.write_heightmaps(&mut root, h);
+        crate::nbtio::set(&mut root, "InhabitedTime", Nbt::Long(self.inhabited_time));
+        (root, writes)
+    }
+
+    /// Current height maps into `root` when the live ones are complete; without them, those of a
+    /// modified chunk are removed (to be recomputed), the others kept as read.
+    fn write_heightmaps(&self, root: &mut Nbt, h: Height) {
+        if self.live_heightmaps(h) {
             let maps = HEIGHTMAPS
                 .iter()
                 .filter_map(|(name, id)| {
@@ -653,27 +816,252 @@ impl Chunk {
                     Some(((*name).to_owned(), Nbt::LongArray(l.to_vec())))
                 })
                 .collect();
-            crate::nbtio::set(&mut root, "Heightmaps", Nbt::Compound(maps));
+            crate::nbtio::set(root, "Heightmaps", Nbt::Compound(maps));
         } else if self.changed.iter().any(|&c| c) {
-            crate::nbtio::remove(&mut root, "Heightmaps");
+            crate::nbtio::remove(root, "Heightmaps");
         }
-        crate::nbtio::set(&mut root, "InhabitedTime", Nbt::Long(self.inhabited_time));
-        Some(root)
+    }
+
+    /// One section compound to write, from the one read (`as_read`, `None`: none at this height):
+    /// its changed containers re-encoded, its light the current one (or the kept one when memory
+    /// has none).
+    fn section_to_write(
+        &self,
+        as_read: Option<Nbt>,
+        li: usize,
+        y: i32,
+        i: Option<usize>,
+        data: &VersionData,
+        states: &States,
+    ) -> (Nbt, SectionWrite) {
+        let existed = as_read.is_some();
+        let mut s = as_read.unwrap_or_else(|| Nbt::Compound(vec![("Y".into(), Nbt::Byte(y as i8))]));
+        let mut w = SectionWrite::default();
+        if let Some(i) = i {
+            let sec = &self.sections[i];
+            w.blocks_reencoded = self.changed[i] || (!existed && !sec.is_empty());
+            if w.blocks_reencoded {
+                crate::nbtio::set(&mut s, "block_states", encode_blocks(&sec.blocks, data, states));
+            }
+            // Biomes changed in memory (`/fillbiome`) are written like the blocks; before, the
+            // biomes read stayed on disk and the change was lost at the next opening.
+            w.biomes_reencoded = self.biomes_changed[i] || (w.blocks_reencoded && s.get("biomes").is_none());
+            if w.biomes_reencoded {
+                crate::nbtio::set(&mut s, "biomes", encode_biomes(&sec.biomes, states));
+            }
+        }
+        let kept = self.disk_sections.get(li);
+        let none = KeptLight::None;
+        let (kept_block, kept_sky) = (kept.map_or(&none, |d| &d.block), kept.map_or(&none, |d| &d.sky));
+        for (key, layer, kept, written) in [
+            ("BlockLight", &self.block[li], kept_block, &mut w.block_light),
+            ("SkyLight", &self.sky[li], kept_sky, &mut w.sky_light),
+        ] {
+            if let Some(bytes) = layer.as_ref().map(|l| l.to_vec()).or_else(|| kept.bytes()) {
+                crate::nbtio::set(&mut s, key, Nbt::ByteArray(bytes));
+                *written = true;
+            }
+        }
+        w.written = matches!(&s, Nbt::Compound(f) if f.len() > 1);
+        (s, w)
+    }
+}
+
+/// Exact height of a section compound (`Y` read as any integer, kept only when it fits).
+fn section_y(s: &Nbt) -> Option<i32> {
+    int(s, "Y").and_then(|y| i32::try_from(y).ok())
+}
+
+/// Light index of the height `y` (`None` outside the `sections + 2` of the chunk).
+fn light_index(y: i32, h: Height) -> Option<usize> {
+    usize::try_from(y - (h.min_section() - 1)).ok().filter(|&li| li < h.sections + 2)
+}
+
+/// Sections of the old representation, still in the root compound.
+enum SectionsInRoot {
+    /// The list copied, each section found by height and copied again (old save,
+    /// `RUSTCRAFT_OPT_ENCODE_WITHOUT_COPIES=0`).
+    Copied(Vec<Nbt>),
+    /// Taken out of the list, one per light index (the first at its height, like the search).
+    ByHeight(Vec<Option<Nbt>>),
+}
+
+impl SectionsInRoot {
+    fn take(root: &mut Nbt, without_copies: bool, h: Height) -> Self {
+        if !without_copies {
+            return Self::Copied(list(root.get("sections")).to_vec());
+        }
+        let mut by_height = vec![None; h.sections + 2];
+        for s in chunk_disk::take_list(root, "sections") {
+            if let Some(li) = section_y(&s).and_then(|y| light_index(y, h))
+                && by_height[li].is_none()
+            {
+                by_height[li] = Some(s);
+            }
+        }
+        Self::ByHeight(by_height)
+    }
+
+    /// The section read at light index `li` (height `y`).
+    fn at(&mut self, li: usize, y: i32) -> Option<Nbt> {
+        match self {
+            Self::Copied(old) => old.iter().find(|s| int(s, "Y") == Some(i64::from(y))).cloned(),
+            Self::ByHeight(by_height) => by_height[li].take(),
+        }
     }
 }
 
 /// Reads a chunk. Error: to be treated as absent (and never rewritten).
 pub fn parse(root: Nbt, data: &VersionData, states: &States, h: Height) -> Result<Chunk, Skip> {
-    parse_with(root, data, states, h, section_one_pass_count())
+    parse_with(root, data, states, h, section_one_pass_count(), DiskKeeping::from_switches())
 }
 
-/// [`parse`], the block count of the sections taken in the index check (`one_pass_count`) or apart.
+/// Memory of a chunk being read: sections and light layers.
+struct ReadChunk<'a> {
+    data: &'a VersionData,
+    states: &'a States,
+    h: Height,
+    one_pass_count: bool,
+    sections: Vec<Section>,
+    sky: Vec<LightLayer>,
+    block: Vec<LightLayer>,
+    lossy: bool,
+}
+
+impl<'a> ReadChunk<'a> {
+    fn new(data: &'a VersionData, states: &'a States, h: Height, one_pass_count: bool) -> Self {
+        let n = h.sections;
+        ReadChunk {
+            data,
+            states,
+            h,
+            one_pass_count,
+            sections: (0..n).map(|_| Section::empty(states.air_state, states.default_biome)).collect(),
+            sky: vec![None; n + 2],
+            block: vec![None; n + 2],
+            lossy: false,
+        }
+    }
+
+    /// Reads one section compound into memory (its light, and its containers within the world).
+    /// Returns its height.
+    fn read_section(&mut self, s: &mut Nbt, words: Words) -> Result<i32, Skip> {
+        let corrupt = Skip::Corrupt;
+        let (n, min) = (self.h.sections, self.h.min_section());
+        let y = int(s, "Y").ok_or_else(|| corrupt("section without Y".into()))? as i32;
+        let li = y - (min - 1);
+        if (0..n as i32 + 2).contains(&li) {
+            self.sky[li as usize] = read_light_layer(s.get("SkyLight")).map_err(corrupt)?;
+            self.block[li as usize] = read_light_layer(s.get("BlockLight")).map_err(corrupt)?;
+        }
+        let i = y - min;
+        if !(0..n as i32).contains(&i) {
+            return Ok(y);
+        }
+        let (data, states) = (self.data, self.states);
+        let resolve = |e: &Nbt| states.state_of(data, e);
+        let block_states = crate::nbtio::get_mut(s, "block_states");
+        let counted = if self.one_pass_count {
+            block_container_counted(block_states, states.air_state, resolve, &mut self.lossy, states, words)
+        } else {
+            read_disk_container(block_states, SECTION_BLOCKS, true, states.air_state, resolve, &mut self.lossy, words)
+                .map(|b| {
+                    let n = count_non_empty(&b, states);
+                    (b, n)
+                })
+        };
+        let (blocks, non_empty) = counted.map_err(|e| corrupt(format!("section {y}, blocks: {e}")))?;
+        let biomes = read_disk_container(
+            crate::nbtio::get_mut(s, "biomes"),
+            SECTION_BIOMES,
+            false,
+            states.default_biome,
+            |e| e.as_str().and_then(|n| states.biomes.get(n).copied()),
+            &mut self.lossy,
+            words,
+        )
+        .map_err(|e| corrupt(format!("section {y}, biomes: {e}")))?;
+        self.sections[i as usize] = Section { non_empty, blocks, biomes };
+        Ok(y)
+    }
+
+    /// Reads the section list kept in the root compound (old representation).
+    fn read_sections_in_root(&mut self, root: &mut Nbt) -> Result<(), Skip> {
+        if let Some(Nbt::List(sections)) = crate::nbtio::get_mut(root, "sections") {
+            for s in sections {
+                self.read_section(s, Words::Copied)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads the section list taken out of the root compound; each height keeps what the save
+    /// needs besides memory ([`DiskSection`]). A height read twice keeps its first compound for
+    /// the save (like the old save's search) while memory holds the last one: that first one
+    /// keeps its packed words.
+    fn read_sections_apart(&mut self, list: Vec<Nbt>, drop_rebuildable: bool) -> Result<Vec<DiskSection>, Skip> {
+        let h = self.h;
+        let ys: Vec<Option<i64>> = list.iter().map(|s| int(s, "Y")).collect();
+        // Heights as the reading takes them (`Y` cut to 32 bits): two sections may land on one.
+        let read_at = |y: Option<i64>| y.and_then(|y| light_index(y as i32, h));
+        let mut at_height = vec![0u8; h.sections + 2];
+        for li in ys.iter().filter_map(|&y| read_at(y)) {
+            at_height[li] = at_height[li].saturating_add(1);
+        }
+        let mut disk = vec![DiskSection::default(); h.sections + 2];
+        let mut kept = vec![false; h.sections + 2];
+        for (mut s, y) in list.into_iter().zip(ys) {
+            // The exact height, as the save looks a section up.
+            let li = y.and_then(|y| i32::try_from(y).ok()).and_then(|y| light_index(y, h));
+            let alone = li.is_some() && read_at(y).is_some_and(|li| at_height[li] == 1);
+            self.read_section(&mut s, if alone { Words::Moved } else { Words::Copied })?;
+            // Outside the chunk's heights the save drops the section, like the old one did.
+            let Some(li) = li.filter(|&li| !std::mem::replace(&mut kept[li], true)) else { continue };
+            let y = h.min_section() - 1 + li as i32;
+            let section = usize::try_from(y - h.min_section()).ok().and_then(|i| self.sections.get(i));
+            let form = if alone {
+                chunk_disk::read_section_form(s, y, section, drop_rebuildable, self.data, self.states)
+            } else {
+                SectionForm::Kept(Box::new(chunk_disk::without_light(s)))
+            };
+            disk[li] = DiskSection { form, sky: KeptLight::of(&self.sky[li]), block: KeptLight::of(&self.block[li]) };
+        }
+        Ok(disk)
+    }
+}
+
+/// Height maps read from the compound; moved out of it (an empty compound left in place) when
+/// `move_out`, copied otherwise.
+fn read_heightmaps(root: &mut Nbt, move_out: bool) -> Vec<(i32, Box<[i64]>)> {
+    let id_of = |k: &str| HEIGHTMAPS.iter().find(|(name, _)| *name == k).map(|&(_, id)| id);
+    match crate::nbtio::get_mut(root, "Heightmaps") {
+        Some(Nbt::Compound(f)) if move_out => std::mem::take(f)
+            .into_iter()
+            .filter_map(|(k, v)| match v {
+                Nbt::LongArray(a) => Some((id_of(&k)?, a.into_boxed_slice())),
+                _ => None,
+            })
+            .collect(),
+        Some(Nbt::Compound(f)) => f
+            .iter()
+            .filter_map(|(k, v)| match v {
+                Nbt::LongArray(a) => Some((id_of(k)?, a.clone().into_boxed_slice())),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// [`parse`] with the switches given: the block count of the sections taken in the index check
+/// (`one_pass_count`) or apart; what of the compound is left to memory (`keeping`).
 pub(crate) fn parse_with(
-    root: Nbt,
+    mut root: Nbt,
     data: &VersionData,
     states: &States,
     h: Height,
     one_pass_count: bool,
+    keeping: DiskKeeping,
 ) -> Result<Chunk, Skip> {
     let status = root.get("Status").and_then(Nbt::as_str).unwrap_or("");
     if status.strip_prefix("minecraft:").unwrap_or(status) != "full" {
@@ -687,76 +1075,47 @@ pub(crate) fn parse_with(
     let x = int(&root, "xPos").ok_or_else(|| corrupt("xPos".into()))? as i32;
     let z = int(&root, "zPos").ok_or_else(|| corrupt("zPos".into()))? as i32;
     let n = h.sections;
-    let min = h.min_section();
-    let mut lossy = false;
-    let mut sections: Vec<Section> = (0..n).map(|_| Section::empty(states.air_state, states.default_biome)).collect();
-    let mut sky: Vec<LightLayer> = vec![None; n + 2];
-    let mut block: Vec<LightLayer> = vec![None; n + 2];
-    for s in list(root.get("sections")) {
-        let y = int(s, "Y").ok_or_else(|| corrupt("section without Y".into()))? as i32;
-        let li = y - (min - 1);
-        if (0..n as i32 + 2).contains(&li) {
-            sky[li as usize] = light_layer(s.get("SkyLight")).map_err(corrupt)?;
-            block[li as usize] = light_layer(s.get("BlockLight")).map_err(corrupt)?;
-        }
-        let i = y - min;
-        if !(0..n as i32).contains(&i) {
-            continue;
-        }
-        let resolve = |e: &Nbt| states.state_of(data, e);
-        let block_states = s.get("block_states");
-        let counted = if one_pass_count {
-            block_container_counted(block_states, states.air_state, resolve, &mut lossy, states)
-        } else {
-            container(block_states, SECTION_BLOCKS, true, states.air_state, resolve, &mut lossy).map(|b| {
-                let n = count_non_empty(&b, states);
-                (b, n)
-            })
-        };
-        let (blocks, non_empty) = counted.map_err(|e| corrupt(format!("section {y}, blocks: {e}")))?;
-        let biomes = container(
-            s.get("biomes"),
-            SECTION_BIOMES,
-            false,
-            states.default_biome,
-            |e| e.as_str().and_then(|n| states.biomes.get(n).copied()),
-            &mut lossy,
-        )
-        .map_err(|e| corrupt(format!("section {y}, biomes: {e}")))?;
-        sections[i as usize] = Section { non_empty, blocks, biomes };
-    }
-    let heightmaps = match root.get("Heightmaps") {
-        Some(Nbt::Compound(f)) => f
-            .iter()
-            .filter_map(|(k, v)| {
-                let id = HEIGHTMAPS.iter().find(|(name, _)| name == k)?.1;
-                match v {
-                    Nbt::LongArray(a) => Some((id, a.clone().into_boxed_slice())),
-                    _ => None,
-                }
-            })
-            .collect(),
-        _ => Vec::new(),
+    let mut read = ReadChunk::new(data, states, h, one_pass_count);
+    let mut disk_sections = if keeping.slim {
+        read.read_sections_apart(chunk_disk::take_list(&mut root, "sections"), keeping.drop_rebuildable)?
+    } else {
+        read.read_sections_in_root(&mut root)?;
+        Vec::new()
     };
-    let block_entities = list(root.get("block_entities")).to_vec();
+    if read.lossy {
+        // Never rewritten: nothing to keep for the save.
+        disk_sections.iter_mut().for_each(|d| *d = DiskSection::default());
+    }
+    // With height rules, the live maps are completed below and the save writes them all.
+    let heightmaps = read_heightmaps(&mut root, keeping.slim && !states.heightmap_rules.is_empty());
+    let block_entities = if keeping.no_duplicate_block_entities {
+        chunk_disk::take_list(&mut root, "block_entities")
+    } else {
+        list(root.get("block_entities")).to_vec()
+    };
     let light_on = int(&root, "isLightOn") == Some(1);
     let inhabited_time = int(&root, "InhabitedTime").unwrap_or(0);
     let mut c = Chunk {
         x,
         z,
-        sections,
-        sky,
-        block,
+        sections: read.sections,
+        sky: read.sky,
+        block: read.block,
         light_on,
         heightmaps,
         block_entities,
         inhabited_time,
         root,
-        lossy,
+        disk_sections,
+        lossy: read.lossy,
         changed: vec![false; n],
+        biomes_changed: vec![false; n],
         dirty: false,
     };
     c.prime_heightmaps(&states.heightmap_rules, states.air_state, h);
+    if keeping.slim && c.live_heightmaps(h) {
+        chunk_disk::empty_compound(&mut c.root, "Heightmaps");
+    }
     Ok(c)
 }
 
@@ -773,15 +1132,17 @@ mod light_layer_tests {
         for bytes in [vec![0u8; LIGHT_BYTES], vec![0xff; LIGHT_BYTES], lit, vec![0x5a; LIGHT_BYTES]] {
             let uniform = bytes.iter().all(|&b| b == bytes[0]) && (bytes[0] == 0 || bytes[0] == 0xff);
             let nbt = Nbt::ByteArray(bytes.clone());
-            for intern in [false, true] {
-                let got = light_layer_with(Some(&nbt), intern).unwrap().unwrap();
+            for (intern, one_copy) in [(false, false), (true, false), (false, true), (true, true)] {
+                let got = read_light_layer_with(Some(&nbt), intern, one_copy).unwrap().unwrap();
                 assert!(got[..] == bytes[..], "first byte {:#x}, interned {intern}: bytes changed", bytes[0]);
                 let shared = Arc::ptr_eq(&got, &rc_world::zero_layer()) || Arc::ptr_eq(&got, &rc_world::full_layer());
                 assert_eq!(shared, intern && uniform, "first byte {:#x}, interned {intern}", bytes[0]);
             }
         }
-        assert_eq!(light_layer_with(None, true), Ok(None));
-        assert!(light_layer_with(Some(&Nbt::ByteArray(vec![0; 10])), true).is_err());
+        for one_copy in [false, true] {
+            assert_eq!(read_light_layer_with(None, true, one_copy), Ok(None));
+            assert!(read_light_layer_with(Some(&Nbt::ByteArray(vec![0; 10])), true, one_copy).is_err());
+        }
     }
 }
 
@@ -840,8 +1201,10 @@ mod heightmap_tests {
             block_entities: Vec::new(),
             inhabited_time: 0,
             root: Nbt::Compound(vec![("Status".into(), Nbt::String("minecraft:full".into()))]),
+            disk_sections: Vec::new(),
             lossy: false,
             changed: vec![false; H.sections],
+            biomes_changed: vec![false; H.sections],
             dirty: false,
         };
         let layers =
