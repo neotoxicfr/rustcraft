@@ -213,12 +213,12 @@ fn row_candidates_with_sure(cell_props: &[u32], candidates: &mut Vec<u16>, sure:
     #[cfg(target_arch = "x86_64")]
     {
         #[target_feature(enable = "avx2")]
-        fn avx2(cell_props: &[u32], candidates: &mut Vec<u16>, sure: &mut Vec<u8>) {
+        fn row_candidates_avx2(cell_props: &[u32], candidates: &mut Vec<u16>, sure: &mut Vec<u8>) {
             row_candidates_by_lanes(cell_props, candidates, sure);
         }
-        if std::arch::is_x86_feature_detected!("avx2") {
+        if rc_data::cpu::has_avx2() {
             // SAFETY: AVX2 has just been detected on this processor.
-            return unsafe { avx2(cell_props, candidates, sure) };
+            return unsafe { row_candidates_avx2(cell_props, candidates, sure) };
         }
     }
     row_candidates_by_lanes(cell_props, candidates, sure);

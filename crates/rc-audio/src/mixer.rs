@@ -983,9 +983,9 @@ fn render_buffer_avx2(v: &mut Voice, out: &mut [f32], frames: usize, tl: f32, tr
     fn groups_of_8(v: &mut Voice, out: &mut [f32], frames: usize, tl: f32, tr: f32, ways: GroupWays) {
         render_buffer_groups::<8>(v, out, frames, tl, tr, ways);
     }
-    // The switch says nothing about the processor: the detection (cached by the standard library,
-    // one atomic read) is the only guard of the call below.
-    if !std::arch::is_x86_feature_detected!("avx2") {
+    // The switch says nothing about the processor: the detection (done once, one atomic read) is
+    // the only guard of the call below.
+    if !rc_data::cpu::has_avx2() {
         return render_buffer_groups::<4>(v, out, frames, tl, tr, ways);
     }
     // SAFETY: AVX2 has just been detected on this processor.
@@ -1550,7 +1550,7 @@ mod tests {
     /// run the 4-lane path on a processor without AVX2).
     #[test]
     fn mix_digest() {
-        if !avx2_detected() {
+        if !rc_data::cpu::has_avx2() {
             eprintln!("no AVX2 on this processor: MIXER_AVX2 combinations run the 4-lane path");
         }
         let mut seen = Vec::new();
@@ -1575,17 +1575,6 @@ mod tests {
         let expected = if cfg!(windows) { MIX_DIGEST } else { seen[0].1 };
         for (opt, d) in &seen {
             assert_eq!(*d, expected, "{opt:?}: fingerprint {d:#018x}, expected {expected:#018x}; all: {seen:x?}");
-        }
-    }
-
-    fn avx2_detected() -> bool {
-        #[cfg(target_arch = "x86_64")]
-        {
-            std::arch::is_x86_feature_detected!("avx2")
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            false
         }
     }
 
@@ -1658,7 +1647,7 @@ mod tests {
         const BLOCK: usize = 480;
         const BLOCKS: usize = 2_000;
         const ROUNDS: usize = 31;
-        println!("AVX2 detected: {}", avx2_detected());
+        println!("AVX2 detected: {}", rc_data::cpu::has_avx2());
         let buffers: Vec<_> = (0..6u32).map(|k| noise(if k % 4 == 0 { 2 } else { 1 }, 44_100, k + 1, 44_100)).collect();
         let all = renderers();
         for voices in [64usize, 247] {

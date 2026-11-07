@@ -273,7 +273,7 @@ impl Flat {
 #[allow(unsafe_code)]
 fn simd_dists(f: &Flat, a: usize, k: usize, t: &[i32; 7], out: &mut [i64; 24]) {
     #[target_feature(enable = "avx2")]
-    fn body(f: &Flat, a: usize, k: usize, t: &[i32; 7], out: &mut [i64; 24]) {
+    fn child_distances_avx2(f: &Flat, a: usize, k: usize, t: &[i32; 7], out: &mut [i64; 24]) {
         use std::arch::x86_64::*;
         let zero = _mm256_setzero_si256();
         let mut j = 0;
@@ -302,7 +302,7 @@ fn simd_dists(f: &Flat, a: usize, k: usize, t: &[i32; 7], out: &mut [i64; 24]) {
             j += 8;
         }
     }
-    if !crate::opt::avx2_available() {
+    if !rc_data::cpu::has_avx2() {
         let t64 = t.map(i64::from);
         for (j, o) in out.iter_mut().enumerate().take(k) {
             *o = f.dist(a + j, &t64);
@@ -310,7 +310,7 @@ fn simd_dists(f: &Flat, a: usize, k: usize, t: &[i32; 7], out: &mut [i64; 24]) {
         return;
     }
     // SAFETY: AVX2 has just been detected on this processor.
-    unsafe { body(f, a, k, t, out) }
+    unsafe { child_distances_avx2(f, a, k, t, out) }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -549,7 +549,7 @@ impl ClimateList {
                 let cand = last.map(|l| f.of_old[l as usize]);
                 let cand_d = cand.map_or(i64::MAX, |c| f.dist(c as usize, t));
                 // Outside the no-overflow regime (extreme target), scalar i64 distances.
-                let batch = p.simd && small && f.simd && crate::opt::avx2_available();
+                let batch = p.simd && small && f.simd && rc_data::cpu::has_avx2();
                 let t32 = if batch { t.map(|v| v as i32) } else { [0; 7] };
                 let leaf = if p.early {
                     f.search::<true, SAB>(0, t, &t32, cand, cand_d, small, batch).0
@@ -603,7 +603,7 @@ impl ClimateList {
         };
         let (leaf, d) = match &self.flat {
             Some(f) if p.soa || SAB => {
-                let batch = p.simd && f.simd && crate::opt::avx2_available();
+                let batch = p.simd && f.simd && rc_data::cpu::has_avx2();
                 let t32 = if batch { t.map(|v| v as i32) } else { [0; 7] };
                 let fc = c.map(|h| f.of_old[h as usize]);
                 let (leaf, d) = f.search::<true, SAB>(0, &t, &t32, fc, bound, true, batch);
