@@ -7428,4 +7428,75 @@ loaded by other agents compiling.
   `MI_PURGE_LONG=1` and the direct-TLS executable. Repeated > 1 KiB allocations per frame
   (`push_item_layer`, `prepare` sorts, NBT clones, rc-mesh `to_vec`) belong to their zones: a
   reused buffer beats any allocator setting.
+## C3-M02: upload ring for the per-frame layers, texture writes, growth copies, one command buffer, adaptive chunks, merged copies (07/11, loaded machine)
+
+Root cause (C3-M01 hot map): about 25 per-frame `queue.write_buffer` sites in the layers
+(entities, particles, weather, outlines, cracks, leashes, debug lines, block effects, item atlas,
+screen effects, blur, panorama, overlays) bypass the ring; wgpu 30 creates and destroys a transit
+buffer for each, plus its own pending-writes command buffer. This mission builds what the layers'
+own missions need to move onto the ring without touching `frame.rs` again; it migrates no layer
+body (their owners do, each with its A/B). Everything in `render/upload.rs` and
+`render/upload/per_frame.rs`; switches read once, default 1, `=0` = path before.
+
+| Path (switch) | Used now by | Micro-bench, µs per frame, 3 passes (`upload_bench`) |
+|---|---|---|
+| `FrameBuffer` (`FRAME_WRITES_RING`) | nobody yet (layers' missions) | same as the ring (script: 300 queue transits → 0) |
+| `Uploader::write_texture` (`RING_TEXTURE_WRITES`) | nobody yet (light map, sprites, glyphs) | light map in a frame: queue 88.0 / 87.3 / 85.7 → ring 74.2 / 80.1 / 86.4; alone: 48.1 / 46.2 / 47.3 → 52.4 / 56.7 / 53.2 |
+| `Uploader::copy_buffer` (`GROWTH_IN_TRANSIT`) | region growth (`alloc_in`) | script: 12 command buffers fewer for 6 growths |
+| `Uploader::frame_encoder` (`SINGLE_COMMAND_BUFFER`) | nobody yet (frame, once its writes precede the encoder) | frame: ring 45.2 / 66.2 / 66.0 → 43.8 / 61.0 / 62.9; small: 46.1 / 72.5 / 74.9 → 41.9 / 66.0 / 68.3 |
+| adaptive chunks (`ADAPTIVE_UPLOAD_CHUNK`) | every ring write | 1.2 MB + 14 small writes: queue 107.4 / 134.7 / 132.7, ring 157.3 / 184.7 / 186.6 → 106.3 / 125.2 / 127.0; disposable transits 3,003 → 3 |
+| merged copies (`MERGE_UPLOAD_COPIES`) | every ring write | 15 contiguous writes: 43.9 / 74.4 / 72.5 → 32.1 / 54.6 / 53.6; GPU copies 15 → 1 per frame |
+| all together | | frame: 38.3 / 51.9 / 65.6 (queue 58.0 / 60.8 / 76.2); small: 30.8 / 50.5 / 50.4 (queue 47.7 / 72.5 / 70.4) |
+
+- `FrameBuffer`: the buffer a layer rewrites every frame, grown to a power of two above a minimum
+  (the growth closures each layer duplicated), `write` / `write_with` return true when the buffer
+  was recreated (bindings to redo). With `=0` its writes take the queue: the hybrid path of today,
+  so each migrated layer is A/B'd in one exe; `RUSTCRAFT_OPT_UPLOADRING=0` stays the full fallback.
+- Texture writes: rows staged at a 256-byte stride (the buffer-to-texture rule), source offset
+  aligned to 512 (Direct3D 12 placement), one copy into the transit. The queue's own texture write
+  costs about 8 µs of CPU per call on this machine (writes column: 9.3 against 1.6 µs); alone, the
+  ring adds the transit's command buffer (+9 to +23 %), inside a frame that buffer exists anyway
+  (−8 to −16 % on two passes out of three, +1 % on the third): kept at 1, to confirm with the
+  consumers. Until a layer moves its texture writes, the per-tick ones stay in wgpu's pending writes.
+- Growth copies: `alloc_in` used to submit its copy at once (transit + its own command buffer);
+  the copy is now recorded in the transit in call order, after the writes into the old buffer and
+  before those into the new one (whose range may start inside the old one: the arena merges a
+  released last range with the new room).
+- Frame encoder: hands out the transit encoder with the pending copies at its head. Not wired in
+  the frame yet: the translucent order buffer is written by the column upload (before the frame)
+  and by the re-sort (inside the world pass block, after the encoder exists); with the encoder taken
+  at its creation the re-sort's write would land first and the upload's order would win for one
+  frame. The frame mission moves the re-sort and the lists before the encoder first; a late write to
+  a resource written at the head is refused in debug builds and tests.
+- Adaptive chunks: max(1 MiB, power of two above the largest write of the last 60 submissions),
+  8 MiB at most, older-size chunks given back to the driver: at most 8 × 8 MiB kept, 8 × 2 MiB for a
+  crowd's matrices. The gain is the creation and destruction of the disposable buffer, not the copy.
+- Merged copies: a write that continues the previous one (same chunk and target, contiguous on both
+  sides) extends its GPU copy; the typical frame merges 15 copies into 2, the contiguous runs of the
+  column upload and the fade slots benefit at loading.
+- Rules of use checked in debug builds and tests (no cost in release): a queue write to a resource
+  the ring wrote (it would land before the pending ring writes), a late write or growth copy touching
+  a resource written at the head of the frame encoder. Direct submissions read in the code
+  (entity texture and glyph page growth, tests): none reads a buffer the ring writes; when the glyph
+  or entity texture writes move to the ring, their growth copies must move with them (header rule).
+- Counters: `gpu_copies_per_frame`, `gpu_command_buffers_per_frame` in the `[perf]` line.
+- Proofs (real GPU): `ring_writes_match_queue_writes` (300 frames: small, overlapping, contiguous
+  runs, larger than a chunk, growth copies with a write across the old end, a per-frame layer
+  buffer that grows, a direct submission in the middle, a late write after the frame encoder, check
+  copies of three buffers in every frame's encoder; queue, ring before, each path alone, all
+  together: contents and log equal to the CPU model; fingerprint 797b165e5b616210),
+  `region_growth_keeps_contents` (the real `alloc_in`, 400 allocations and releases),
+  `ring_texture_writes_match_queue_texture_writes` (light map, odd 3-layer array, two mips, offset
+  and wide source strides, 50 frames, per-frame log: equal to the queue's texture writes to the
+  byte), `slots_match_separate_buffers` (plus a per-frame uniform by queue and by ring),
+  `chunks_come_back_without_poll` (also with one command buffer), `rules_of_use_are_checked`.
+  Sabotages seen: omitted write, growth copy recorded after the writes (script and real `alloc_in`),
+  texture rows staged without padding, merge without the target contiguity (wgpu validation error),
+  late-write check removed.
+- To measure on the quiet machine (scenes plains12, crowd, crowd-1000, dropped-items,
+  equipped-humanoids, tnt, village, redstone, cave, title): no layer is migrated, so the expected
+  effect is small (growth copies and merged copies at loading, adaptive chunks only where a ring
+  write exceeds 1 MiB); `RUSTCRAFT_OPT_GROWTH_IN_TRANSIT=0`, `RUSTCRAFT_OPT_MERGE_UPLOAD_COPIES=0`
+  and `RUSTCRAFT_OPT_ADAPTIVE_UPLOAD_CHUNK=0` against the default, plus `generation` and `flight` for
+  the loading. The others are measured with their consumers.
 
