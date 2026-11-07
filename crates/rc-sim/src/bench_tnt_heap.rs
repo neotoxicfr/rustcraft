@@ -99,33 +99,41 @@ fn report_run(case: &str, p: &Probe, run: &HeapRun) {
 }
 
 /// The configurations the bench compares: every former path, the objects in one pass alone,
-/// then with each visible-part path, every default but the threads, the threads on 2 threads
-/// and powers of 2 up to `RUSTCRAFT_THREADS` or every logical core (from 32 distinct boxes), on
-/// every core from 8, 64 and 128, and the cube per call on top of the defaults.
+/// then with each visible-part path, every default but the threads, the cube per call on top of
+/// them, and the thread configurations up to `RUSTCRAFT_THREADS` or every logical core.
 fn bench_configurations() -> Vec<(String, VisiblePartPaths)> {
     let old = VisiblePartPaths::OLD;
     let one_pass = VisiblePartPaths { objects_one_pass: true, ..old };
-    let no_threads = VisiblePartPaths { parallel: false, ..VisiblePartPaths::NEW };
+    let defaults = VisiblePartPaths::NEW;
     let mut configs = vec![
         ("former".to_owned(), old),
         ("objects one pass".to_owned(), one_pass),
         ("one pass, cell cube".to_owned(), VisiblePartPaths { cell_cube: true, ..one_pass }),
         ("one pass, air shortcut".to_owned(), VisiblePartPaths { air_shortcut: true, ..one_pass }),
         ("one pass, same box once".to_owned(), VisiblePartPaths { same_box_once: true, ..one_pass }),
-        ("defaults but threads".to_owned(), no_threads),
-        ("defaults but threads, cube per call".to_owned(), VisiblePartPaths { cube_per_call: true, ..no_threads }),
+        ("defaults (no threads)".to_owned(), defaults),
+        ("defaults, cube per call".to_owned(), VisiblePartPaths { cube_per_call: true, ..defaults }),
     ];
     let cores = rc_data::env_str!("RUSTCRAFT_THREADS")
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get));
+    configs.extend(thread_configurations(cores));
+    configs
+}
+
+/// The threads on 2 threads and powers of 2 up to `cores` (a task per 4,096 walked cells, the
+/// default), then on `cores` threads with a task per 1,024 to 16,384 walked cells.
+fn thread_configurations(cores: usize) -> Vec<(String, VisiblePartPaths)> {
+    let with_threads = VisiblePartPaths { parallel: true, ..VisiblePartPaths::NEW };
+    let mut configs = Vec::new();
     let mut threads = 2;
     while threads <= cores {
-        configs.push((format!("threads {threads} from 32"), VisiblePartPaths { threads, ..VisiblePartPaths::NEW }));
+        configs.push((format!("threads {threads}"), VisiblePartPaths { threads, ..with_threads }));
         threads *= 2;
     }
-    for from in [8, 64, 128] {
-        let paths = VisiblePartPaths { threads: cores, parallel_min_targets: from, ..VisiblePartPaths::NEW };
-        configs.push((format!("threads {cores} from {from}"), paths));
+    for per_task in [1024, 2048, 8192, 16384] {
+        let paths = VisiblePartPaths { threads: cores, walked_cells_per_task: per_task, ..with_threads };
+        configs.push((format!("threads {cores}, a task per {per_task} walked cells"), paths));
     }
     configs
 }
@@ -156,13 +164,13 @@ fn bench_object_pass_among_items() {
         cmd(&mut p, &format!("summon minecraft:item {x:.2} -60 {z:.2} {{Item:{item},PickupDelay:32767s,NoGravity:1b}}"));
     }
     let old = VisiblePartPaths::OLD;
-    let configs = [
-        ("one by one", old),
-        ("one pass", VisiblePartPaths { objects_one_pass: true, ..old }),
-        ("defaults but threads", VisiblePartPaths { parallel: false, ..VisiblePartPaths::NEW }),
-        ("defaults", VisiblePartPaths::NEW),
+    let mut configs = vec![
+        ("one by one".to_owned(), old),
+        ("one pass".to_owned(), VisiblePartPaths { objects_one_pass: true, ..old }),
+        ("defaults (no threads)".to_owned(), VisiblePartPaths::NEW),
     ];
-    let mut best = [f64::INFINITY; 4];
+    configs.extend(thread_configurations(std::thread::available_parallelism().map_or(1, std::num::NonZero::get)));
+    let mut best = vec![f64::INFINITY; configs.len()];
     for _ in 0..7 {
         for ((_, paths), best) in configs.iter().zip(&mut best) {
             FORCED_VISIBLE_PART_PATHS.set(Some(*paths));

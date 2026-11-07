@@ -49,12 +49,19 @@ fn with_switch(mut paths: VisiblePartPaths, i: usize, on: bool) -> VisiblePartPa
 }
 
 /// Every former path, the defaults, each new path alone, every new path, each former path
-/// alone, and the threads from the first target on 2, 4 and 8 threads.
+/// alone, the threads from the first target on 2, 4 and 8 threads, and the cube filled always
+/// and never.
 fn every_path_mix() -> Vec<(String, VisiblePartPaths)> {
     let old = VisiblePartPaths::OLD;
-    let new = VisiblePartPaths { parallel_min_targets: 0, threads: 4, ..VisiblePartPaths::ALL_NEW };
-    let defaults = VisiblePartPaths { parallel_min_targets: 0, threads: 4, ..VisiblePartPaths::NEW };
-    let mut mixes = vec![("old".to_owned(), old), ("defaults".to_owned(), defaults), ("new".to_owned(), new)];
+    let new = VisiblePartPaths { walked_cells_per_task: 1, threads: 4, ..VisiblePartPaths::ALL_NEW };
+    let defaults = VisiblePartPaths { walked_cells_per_task: 1, threads: 4, ..VisiblePartPaths::NEW };
+    let mut mixes = vec![
+        ("old".to_owned(), old),
+        ("defaults".to_owned(), defaults),
+        ("new".to_owned(), new),
+        ("cube always".to_owned(), VisiblePartPaths { cube_cost_limit: usize::MAX, ..new }),
+        ("cube never".to_owned(), VisiblePartPaths { cube_cost_limit: 0, ..new }),
+    ];
     mixes.extend((0..SWITCHES).map(|i| (format!("only{i}"), with_switch(VisiblePartPaths { threads: 4, ..old }, i, true))));
     mixes.extend((0..SWITCHES).map(|i| (format!("but{i}"), with_switch(new, i, false))));
     mixes.extend([2, 8].map(|threads| (format!("threads{threads}"), VisiblePartPaths { threads, ..new })));
@@ -385,8 +392,9 @@ fn tnt_heap_leaves_the_world_of_the_former_paths() {
     if cfg!(windows) {
         assert_eq!(former, FROZEN_TNT_HEAP, "the former paths no longer give the frozen digest");
     }
-    let threads = VisiblePartPaths { parallel_min_targets: 0, threads: 8, ..VisiblePartPaths::ALL_NEW };
-    let runs = [("defaults", VisiblePartPaths::NEW), ("one thread", VisiblePartPaths::ALL_NEW), ("threads", threads)];
+    let threads = VisiblePartPaths { walked_cells_per_task: 1, threads: 8, ..VisiblePartPaths::ALL_NEW };
+    let one_thread = VisiblePartPaths { parallel: false, ..VisiblePartPaths::ALL_NEW };
+    let runs = [("defaults", VisiblePartPaths::NEW), ("all new paths on one thread", one_thread), ("threads", threads)];
     let differences: Vec<String> = runs
         .into_iter()
         .filter_map(|(tag, paths)| {

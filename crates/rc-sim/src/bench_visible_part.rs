@@ -33,9 +33,14 @@ pub(crate) fn scattered_boxes(n: usize) -> Vec<rc_physics::Aabb> {
             let (dx, dz) = (next() * 11.0 - 5.5, next() * 11.0 - 5.5);
             let y = if i % 3 == 0 { -60.0 } else { -60.0 + next() * 6.0 };
             let (px, pz) = (BENCH_CENTER[0] + dx, BENCH_CENTER[2] + dz);
-            rc_physics::Aabb { min: [px - 0.49, y, pz - 0.49], max: [px + 0.49, y + 0.98, pz + 0.49] }
+            tnt_box_at([px, y, pz])
         })
         .collect()
+}
+
+/// A primed TNT box standing on `at`.
+fn tnt_box_at(at: [f64; 3]) -> rc_physics::Aabb {
+    rc_physics::Aabb { min: [at[0] - 0.49, at[1], at[2] - 0.49], max: [at[0] + 0.49, at[1] + 0.98, at[2] + 0.49] }
 }
 
 /// One timing of `f`, in microseconds per box.
@@ -50,12 +55,14 @@ fn micros_per_box(boxes: usize, f: &mut dyn FnMut()) -> f64 {
 
 /// The paths the bench compares, and whether the boxes are weighed together: the former path,
 /// the cube per call with its cells, with its shape count, with both, then together with both,
-/// with equal boxes once, then on 1 thread and powers of 2 up to `RUSTCRAFT_THREADS` or every
+/// with equal boxes once, the defaults under several cube cost limits (0: no cube, 3: the
+/// default), then on 1 thread and powers of 2 up to `RUSTCRAFT_THREADS` or every
 /// logical core.
 fn bench_configurations() -> Vec<(String, VisiblePartPaths, bool)> {
     let old = VisiblePartPaths::OLD;
-    let per_call = VisiblePartPaths { cube_per_call: true, ..old };
-    let cube_and_count = VisiblePartPaths { cell_cube: true, air_shortcut: true, ..old };
+    let always_cube = VisiblePartPaths { cube_cost_limit: usize::MAX, ..old };
+    let per_call = VisiblePartPaths { cube_per_call: true, ..always_cube };
+    let cube_and_count = VisiblePartPaths { cell_cube: true, air_shortcut: true, ..always_cube };
     let mut configs = vec![
         ("former".to_owned(), old, false),
         ("cell cube per call".to_owned(), VisiblePartPaths { cell_cube: true, ..per_call }, false),
@@ -64,12 +71,17 @@ fn bench_configurations() -> Vec<(String, VisiblePartPaths, bool)> {
         ("cube and shortcut together".to_owned(), cube_and_count, true),
         ("same box once together".to_owned(), VisiblePartPaths { same_box_once: true, ..cube_and_count }, true),
     ];
+    for limit in [0, 2, 3, 4] {
+        let paths = VisiblePartPaths { cube_cost_limit: limit, ..VisiblePartPaths::NEW };
+        configs.push((format!("defaults, cube cost limit {limit}"), paths, true));
+    }
     let cores = rc_data::env_str!("RUSTCRAFT_THREADS")
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get));
     let mut threads = 1;
     while threads <= cores {
-        let paths = VisiblePartPaths { same_box_once: true, parallel: true, parallel_min_targets: 0, threads, ..cube_and_count };
+        let paths =
+            VisiblePartPaths { same_box_once: true, parallel: true, walked_cells_per_task: 1, threads, ..cube_and_count };
         configs.push((format!("together on {threads} threads"), paths, true));
         threads *= 2;
     }
@@ -82,8 +94,24 @@ fn bench_visible_part() {
     let (mut p, _dir) = crate::tests_g3f13::open("visible-part-bench");
     build_mixed_walls(&mut p);
     let configs = bench_configurations();
-    for n in [1, 10, 100, 1000] {
-        let boxes = scattered_boxes(n);
+    // A lone box 20 blocks away on x and z and 8 up: the reach of a strong `/summon` explosion,
+    // the largest cube for the fewest sightlines.
+    let far = [BENCH_CENTER[0] + 20.0, BENCH_CENTER[1] + 8.0, BENCH_CENTER[2] + 20.0];
+    let cases: Vec<(String, Vec<rc_physics::Aabb>)> = [1, 2, 4, 10, 100, 1000]
+        .into_iter()
+        .map(|n| (format!("{n}_boxes"), scattered_boxes(n)))
+        .chain([("1_far_box".to_owned(), vec![tnt_box_at(far)])])
+        // Two boxes on the ground on either side of the centre: the cube grows as the square of
+        // their distance, their sightlines only linearly.
+        .chain([6.0, 10.0, 14.0, 20.0].map(|d| {
+            let pair = [-d, d].map(|d| tnt_box_at([BENCH_CENTER[0] + d, -60.0, BENCH_CENTER[2] + d]));
+            (format!("2_boxes_{d}_blocks_away"), pair.to_vec())
+        }))
+        .collect();
+    for (case, boxes) in &cases {
+        let n = boxes.len();
+        let ratio = crate::mobs::visible_part::cube_cost_ratio(BENCH_CENTER, boxes).unwrap_or(f64::NAN);
+        report("visible_part", case, "cube cost over walked cells", ratio);
         // The configurations alternate over 7 rounds, the best of each kept: a load that comes
         // and goes on the machine then weighs on all of them alike.
         let mut best = vec![f64::INFINITY; configs.len()];
@@ -92,9 +120,9 @@ fn bench_visible_part() {
                 FORCED_VISIBLE_PART_PATHS.set(Some(*paths));
                 let us = micros_per_box(n, &mut || {
                     if *together {
-                        std::hint::black_box(p.s.seen_percents(BENCH_CENTER, &boxes));
+                        std::hint::black_box(p.s.seen_percents(BENCH_CENTER, boxes));
                     } else {
-                        for b in &boxes {
+                        for b in boxes {
                             std::hint::black_box(p.s.seen_percent(BENCH_CENTER, b));
                         }
                     }
@@ -103,7 +131,7 @@ fn bench_visible_part() {
             }
         }
         for ((label, _, _), us) in configs.iter().zip(best) {
-            report("visible_part", &format!("{n}_boxes"), &format!("us_per_box {label}"), us);
+            report("visible_part", case, &format!("us_per_box {label}"), us);
         }
     }
     FORCED_VISIBLE_PART_PATHS.set(None);
