@@ -78,7 +78,7 @@ pub struct SelParser<'a, 'r> {
     gamemode: Inv,
     team: Inv,
     ty: Inv,
-    once: HashSet<&'static str>,
+    once: GivenOptions,
 }
 
 const OPTIONS: [&str; 20] = [
@@ -120,7 +120,7 @@ impl<'a, 'r> SelParser<'a, 'r> {
             gamemode: Inv::default(),
             ty: Inv::default(),
             team: Inv::default(),
-            once: HashSet::new(),
+            once: GivenOptions::default(),
         }
     }
 
@@ -302,11 +302,11 @@ impl<'a, 'r> SelParser<'a, 'r> {
             }
             "x" | "y" | "z" | "dx" | "dy" | "dz" => {
                 self.r.read_double()?;
-                self.once.insert(static_key(key));
+                self.once.insert(key);
             }
             "x_rotation" | "y_rotation" => {
                 read_float_range(self.r)?;
-                self.once.insert(static_key(key));
+                self.once.insert(key);
             }
             "limit" => {
                 let n = self.r.read_int()?;
@@ -535,8 +535,24 @@ impl<'a, 'r> SelParser<'a, 'r> {
     }
 }
 
-fn static_key(k: &str) -> &'static str {
-    OPTIONS.iter().find(|o| **o == k).copied().unwrap_or("x")
+/// Options already given that may appear only once, one bit per place in `OPTIONS`: no set
+/// allocated per selector read (the parser reads one at every keystroke of a command).
+#[derive(Default, Clone, Copy)]
+struct GivenOptions(u32);
+
+impl GivenOptions {
+    /// Bit of `key` (none for a key outside `OPTIONS`, never inserted).
+    fn bit(key: &str) -> u32 {
+        OPTIONS.iter().position(|o| *o == key).map_or(0, |i| 1 << i)
+    }
+
+    fn contains(self, key: &str) -> bool {
+        self.0 & Self::bit(key) != 0
+    }
+
+    fn insert(&mut self, key: &str) {
+        self.0 |= Self::bit(key);
+    }
 }
 
 const GAMEMODES: [&str; 4] = ["survival", "creative", "adventure", "spectator"];
@@ -641,6 +657,23 @@ mod tests {
         let d = Data::default();
         let mut r = Reader::new(&c, 0);
         SelParser::new(&mut r, allow, &d).parse()
+    }
+
+    /// Every option has its own bit, and an option given once refuses only itself.
+    #[test]
+    fn given_options_one_bit_each() {
+        assert!(OPTIONS.len() <= 32);
+        for (i, key) in OPTIONS.iter().enumerate() {
+            let mut given = GivenOptions::default();
+            given.insert(key);
+            assert_eq!(given.0, 1 << i, "{key}");
+            assert!(OPTIONS.iter().all(|other| given.contains(other) == (other == key)), "{key}");
+        }
+        assert!(!GivenOptions(u32::MAX).contains(PREDICATE));
+        for key in ["x", "dz", "x_rotation", "distance", "level", "scores", "advancements"] {
+            let text = format!("@e[{key}=1,{key}=1]").replace("scores=1", "scores={}").replace("advancements=1", "advancements={}");
+            assert_eq!(sel(&text, true).unwrap_err().key, "argument.entity.options.inapplicable", "{text}");
+        }
     }
 
     #[test]

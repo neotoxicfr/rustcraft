@@ -176,6 +176,8 @@ pub struct Server {
     pub(crate) chunk_map_swaps: u64,
     /// Frozen entities (raw NBT) per chunk, with their entity id.
     pub(crate) entities: HashMap<(i32, i32), Vec<(i32, Nbt)>>,
+    /// Where each compound of `entities` sits, checked at every read (`kept_entity_index`).
+    pub(crate) kept_index: crate::commands::kept_entity_index::KeptEntityIndex,
     pub(crate) next_entity: i32,
     pub(crate) paused: Arc<AtomicBool>,
     /// Save in progress (read by the client: indicator), reset to false by the write thread.
@@ -476,6 +478,7 @@ impl Server {
             chunks: HashMap::new(),
             chunk_map_swaps: 0,
             entities: HashMap::new(),
+            kept_index: Default::default(),
             next_entity: 2,
             paused,
             saving: Arc::new(AtomicBool::new(false)),

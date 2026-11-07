@@ -84,12 +84,9 @@ impl Server {
         }
     }
 
-    fn other(&self, id: i32) -> Option<&Nbt> {
-        self.entities
-            .values()
-            .flat_map(|l| l.iter())
-            .find(|(i, _)| *i == id)
-            .map(|(_, n)| n)
+    pub(crate) fn other(&self, id: i32) -> Option<&Nbt> {
+        self.kept_entity_slot(id)
+            .map(|(c, k)| &self.entities[&c][k].1)
             .or_else(|| self.end_other(id)) // F15
             .or_else(|| self.cart_ref(id).map(|c| &c.nbt)) // G5-F06: fields kept (name, tags)
             // L10-COMBAT: the entity exploding right now, out of its list.
@@ -102,17 +99,14 @@ impl Server {
         if self.cart_ref(id).is_some() {
             return self.cart_mut(id).map(|c| &mut c.nbt); // G5-F06: saved with the live minecarts
         }
-        let (chunk, entry) = self
-            .entities
-            .iter_mut()
-            .find_map(|(c, l)| l.iter_mut().find(|(i, _)| *i == id).map(|entry| (*c, entry)))?;
+        let (chunk, k) = self.kept_entity_slot(id)?;
         self.life.drop_chunks.insert(chunk);
-        Some(&mut entry.1)
+        self.entities.get_mut(&chunk).map(|l| &mut l[k].1)
     }
 
     /// Chunk whose list holds the kept compound `id`, and its index there.
-    fn kept_entity_slot(&self, id: i32) -> Option<((i32, i32), usize)> {
-        self.entities.iter().find_map(|(c, l)| l.iter().position(|(i, _)| *i == id).map(|k| (*c, k)))
+    pub(crate) fn kept_entity_slot(&self, id: i32) -> Option<((i32, i32), usize)> {
+        self.kept_index.find(&self.entities, id)
     }
 
     /// After a kept compound's position changed: when it now lies in another chunk, its entry
@@ -766,18 +760,24 @@ impl Server {
                 self.entity_scores_removed(self.ent_uuid(e));
                 // A marker was never announced: no removal either (G5-F05).
                 let visible = self.other(i).is_none_or(crate::decoration::client_visible);
-                let held_by = self.kept_entity_slot(i).map(|(c, _)| c);
-                for l in self.entities.values_mut() {
-                    l.retain(|(x, _)| *x != i);
-                }
-                self.deco_forget(i);
-                // Only the chunk that held it changed: rewriting every entity chunk of the
-                // dimension at the next save wrote the same contents again.
+                let held_by = self.kept_entity_slot(i);
+                // Only the chunk that held it changes (one counter numbers every entity, so no
+                // other list holds the identifier): rewriting every entity chunk of the dimension
+                // at the next save wrote the same contents again.
                 if kill_rewrites_one_chunk() {
-                    self.life.drop_chunks.extend(held_by);
+                    if let Some((c, k)) = held_by {
+                        self.entities.get_mut(&c).expect("slot found above").remove(k);
+                        self.life.drop_chunks.insert(c);
+                    }
+                    #[cfg(test)]
+                    assert!(self.kept_entity_slot(i).is_none(), "kept compound {i} listed twice");
                 } else {
+                    for l in self.entities.values_mut() {
+                        l.retain(|(x, _)| *x != i);
+                    }
                     self.life.drop_chunks.extend(self.entities.keys().copied().collect::<Vec<_>>());
                 }
+                self.deco_forget(i);
                 if visible {
                     let _ = self.send(Event::Entity(EntityEvent::Remove(vec![i])));
                 }
@@ -807,9 +807,65 @@ impl Server {
         }
     }
 
-    /// Entity from its UUID.
+    /// Entity from its UUID: the first of [`Server::all_ents`] carrying it (the player, then the
+    /// smallest identifier). Looked up family by family through the indexes, without listing and
+    /// sorting every entity (`RUSTCRAFT_OPT_MOBINDEX=0`: [`Server::ent_by_uuid_reference`]).
     pub fn ent_by_uuid(&self, u: u128) -> Option<E> {
+        if !crate::mobs::index::on() {
+            return self.ent_by_uuid_reference(u);
+        }
+        let found = self.ent_by_uuid_direct(u);
+        #[cfg(test)]
+        if crate::mobs::index::verify() {
+            assert_eq!(found, self.ent_by_uuid_reference(u), "entity by UUID {u:x}");
+        }
+        found
+    }
+
+    /// Old path (and test reference): every living entity listed and sorted, then the first
+    /// carrying `u`.
+    pub(crate) fn ent_by_uuid_reference(&self, u: u128) -> Option<E> {
         self.all_ents().into_iter().find(|e| self.ent_uuid(*e) == u)
+    }
+
+    fn ent_by_uuid_direct(&self, u: u128) -> Option<E> {
+        // Many kept compounds have no UUID (read as 0) and the mob index never records 0.
+        if u == 0 {
+            return self.ent_by_uuid_reference(u);
+        }
+        if !self.life.vit.dead && self.uuid == u {
+            return Some(E::Player);
+        }
+        // Smallest identifier over the families; on a tie the earlier family, like the stable
+        // sort of `all_ents` (families pushed in this order).
+        let mut best: Option<(i32, E)> = None;
+        let mut offer = |id: i32, e: E| {
+            if best.is_none_or(|(b, _)| id < b) {
+                best = Some((id, e));
+            }
+        };
+        if let Some(m) = self.mobs.alive_with_uuid(u) {
+            offer(m.id, E::Mob(m.id));
+        }
+        // Ground items and orbs carry a UUID made from their identifier.
+        if let Some(id) = crate::drops::ground_id_of_uuid(u) {
+            if self.life.drops.iter().any(|d| d.id == id) {
+                offer(id, E::Item(id));
+            }
+            if self.life.orbs.iter().any(|o| o.id == id) {
+                offer(id, E::Orb(id));
+            }
+        }
+        let has_uuid = |n: &Nbt| nbtio::uuid(n.get("UUID")) == Some(u);
+        for (id, n) in self.entities.values().flatten().chain(&self.mobs.end.snapshots) {
+            if has_uuid(n) {
+                offer(*id, E::Other(*id));
+            }
+        }
+        for c in self.carts.list.iter().flatten().filter(|c| !c.removed && c.uuid == u) {
+            offer(c.id, E::Other(c.id));
+        }
+        best.map(|(_, e)| e)
     }
 
     /// Name of a stack (custom name or item name).
@@ -833,9 +889,20 @@ impl Server {
 }
 
 impl crate::mobs::Mobs {
-    /// Mob from its network identifier.
+    /// Mob from its network identifier: the first slot carrying it, dead mobs included, like the
+    /// former scan of the list, through the identifier index (`RUSTCRAFT_OPT_MOBINDEX=0`: the scan).
     pub fn mob_ref_any(&self, id: i32) -> Option<&crate::mobs::mob::Mob> {
-        self.list.iter().find(|m| m.id == id)
+        self.get(id)
+    }
+
+    /// Living mob carrying UUID `u` with the smallest identifier: the first one `all_ents` lists.
+    /// Through the UUID index while no UUID repeats in the list (at most one slot then carries
+    /// `u`); otherwise every mob is looked at.
+    fn alive_with_uuid(&self, u: u128) -> Option<&crate::mobs::mob::Mob> {
+        if self.index.unique_uuids() {
+            return self.find_uuid_where(u, crate::mobs::mob::Mob::alive);
+        }
+        self.list.iter().filter(|m| m.uuid == u && m.alive()).min_by_key(|m| m.id)
     }
 }
 

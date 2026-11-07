@@ -254,6 +254,8 @@ mod bench_scores; // scoreboard switches: writes over every holder, save, entity
 #[cfg(test)]
 mod bench_function_tick; // command switches: functions per tick, macros, command blocks, schedule, parse
 #[cfg(test)]
+mod bench_selectors; // selector switches: one search, the quadratic `execute as … at @s`, families, `@s`
+#[cfg(test)]
 mod bench_spawner_blocks; // trial spawners, vaults, monster spawners, natural spawn pass, structure lists
 #[cfg(test)]
 mod tests_perf_pack; // the scene bench's `perf` data pack compiles with our command parser

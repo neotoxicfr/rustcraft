@@ -154,6 +154,11 @@ impl MobIndex {
         on() && !self.dup_id
     }
 
+    /// No UUID seen twice (index in service): a slot that carries the UUID is then the only one.
+    pub(crate) fn unique_uuids(&self) -> bool {
+        on() && !self.dup_uuid
+    }
+
     /// Hint to redo (list shifted, mutation outside `Mobs::push`).
     pub(crate) fn mark_stale(&self) {
         self.stale.store(true, Ordering::Relaxed);
