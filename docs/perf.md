@@ -1132,6 +1132,13 @@ New paths of `rc-light/src/full/grid.rs` and `full/batch.rs`, each behind its sw
   leaves the kept 3 × 3 ones in place (before the fix it took them and threw them away, so the next
   chunk lit alone on that thread allocated everything again; test
   `large_tile_leaves_the_kept_buffers_in_place`, sabotage caught: 1.07 MB kept before, 0 after).
+  The level, property and source buffers grow to exactly the zone's size, never by the default
+  doubling: doubled after a zone cut short by the void skip, the 3 × 3 buffers of a world 384 high
+  reached 5.6 MB, over the 4 MiB, and were thrown away too (test
+  `kept_buffers_survive_a_higher_zone`: 2.91 MB kept, sabotage 0). The queues, sized by the light
+  and not by the zone, are released alone when they take the whole over the maximum (test
+  `queues_over_the_kept_maximum_are_released_alone`, sabotage caught); `stats::kept_buffer_releases`
+  counts both cases.
 
 Equivalence: `full/tests.rs` and `full/tests/grid_and_batch.rs` (all combinations against the
 frozen copy, absent neighbour and centre, no sky, level-1 emitters only, deep ground, irregular,
@@ -1208,26 +1215,56 @@ on the flight at all threads (+6 %, only reached with `RUSTCRAFT_OPT_FULLCACHE=0
 switch). Small batches on all threads are dominated by scheduling (49.6 ms chunk by chunk for 72
 chunks): their spread is wide, to confirm on the scene bench.
 
-Memory (C2), measured: `stats::zone_buffer_peak_bytes`, most bytes of zone buffers (levels,
-properties, sources, queues) in use at once over every thread, void skip included, run 5:
+Memory (C2), measured: `stats::zone_buffer_peak_bytes`, most bytes of zone buffers in use at once
+over every thread, void skip included. Counted with the buffers' own byte count (capacities of the
+level, property, source and queue buffers of each zone being lit), taken once the zone's buffers
+are sized and again after each propagation (the queues grow there). Run 5 took it before the
+propagation only, and with the buffers still grown by doubling; run 6 (after both fixes) also
+counts, per option, the kept buffers given back without their queues and thrown away whole
+(`stats::kept_buffer_releases`):
 
 | Batches | 1 thread: chunk by chunk / tiles auto / 4 / kept 16 MiB | all threads (32): chunk by chunk / tiles auto / 2 / 3 / 4 / kept 16 MiB |
 |---|---|---|
-| all columns | 4.9 / 9.8 / 9.8 / 11.4 MB | 89.4 / 131.8 / 64.2 / 96.9 / 126.7 / 189.1 MB |
-| flight | 3.1 / 5.0 / 5.0 / 7.3 | 60.4 / 38.1 / 43.2 / 22.8 / 22.1 / 43.5 |
-| squares 8 × 8 | 3.1 / 7.9 / 7.9 / 14.1 | 76.5 / 37.5 / 49.1 / 34.0 / 30.1 / 67.0 |
-| bonus chest 3 × 3 | 3.1 / 3.1 / 3.1 / 3.2 | 33.2 / 13.1 / 13.1 / 13.3 / 13.6 / 15.7 |
+| all columns, run 5 | 4.9 / 9.8 / 9.8 / 11.4 MB | 89.4 / 131.8 / 64.2 / 96.9 / 126.7 / 189.1 MB |
+| all columns, run 6 | 3.1 / 10.6 / 10.6 / 11.0 | 106.2 / 138.2 / 72.6 / 100.3 / 148.6 / 169.2 |
+| flight, run 5 / run 6 | 3.1 / 5.0 / 5.0 / 7.3 — 3.2 / 5.5 / 5.5 / 5.6 | 60.4 / 38.1 / 43.2 / 22.8 / 22.1 / 43.5 — 50.3 / 34.7 / 46.0 / 23.4 / 22.7 / 46.5 |
+| squares 8 × 8, run 5 / run 6 | 3.1 / 7.9 / 7.9 / 14.1 — 3.2 / 8.5 / 8.5 / 8.7 | 76.5 / 37.5 / 49.1 / 34.0 / 30.1 / 67.0 — 102.4 / 39.0 / 46.0 / 27.0 / 30.7 / 58.2 |
+| bonus chest 3 × 3, run 5 / run 6 | 3.1 / 3.1 / 3.1 / 3.2 — 2.9 / 2.9 / 2.9 / 2.9 | 33.2 / 13.1 / 13.1 / 13.3 / 13.6 / 15.7 — 35.6 / 14.4 / 14.4 / 14.0 / 14.5 / 15.9 |
 
-The tiles hold at most +42 MB more than chunk by chunk at once (dense batch of 1,248 chunks on 32
-threads) and less on the flight and the squares (fewer zones at a time); the estimate at full height
-without the void skip (≈ 11 MB per tile of 4, ≈ 355 MB on 32 threads) is never reached: the skip
-cuts the zones to the terrain and not every thread holds a tile at once. These tile buffers are
-transient (freed after each tile). Kept between lightings, per thread: the 3 × 3 buffers, ≈ 2.9 MB
-plus their queues at height 384 (≤ 4 MiB, ≤ 128 MiB on 32 threads, unchanged). With
-`FULL_KEPT_BUFFER_MIB=16` the tiles reuse their thread's buffers: −7 to −22 % on the dense batch
-and the squares, equal on the flight, worse on the small bonus chest batches, for up to 16 MiB kept
-per thread (≈ 6 to 11 MB in practice, up to ≈ 350 MB on 32 threads, never given back): default
-left at 4 MiB, the tile side and this maximum to decide on the scene bench. GPU ruled out for the
+The 4.9 MB of run 5 on one thread, chunk by chunk, was a single 3 × 3 zone whose buffers had
+doubled past the 4 MiB kept, so they were thrown away and regrown again and again; run 6: 3.1 MB,
+and on every property grid option of every set, 1 thread and 32, no kept buffers given back without
+their queues nor thrown away (0 and 0). The only drops left are one per pool thread on the
+series 2 option that follows the 16 MiB option in the bench (1 on one thread, 32 on all threads):
+buffers grown under 16 MiB then given back under 4 MiB, a switch of the maximum that a process
+never makes. The tiles hold at most +32 to +42 MB more than chunk by chunk at once (dense batch of
+1,248 chunks on 32 threads) and less on the flight and the squares (fewer zones at a time); the
+estimate at full height without the void skip (≈ 11 MB per tile of 4, ≈ 355 MB on 32 threads) is
+never reached: the skip cuts the zones to the terrain and not every thread holds a tile at once.
+These tile buffers are transient (freed after each tile). Kept between lightings, per thread: the
+3 × 3 buffers, ≈ 2.9 MB of levels, properties and sources at height 384 (exactly the zone, never
+doubled) plus their queues, all within 4 MiB (≤ 128 MiB on 32 threads). With
+`FULL_KEPT_BUFFER_MIB=16` the tiles reuse their thread's buffers: run 5, −7 to −22 % on the dense
+batch and the squares, equal on the flight, worse on the small bonus chest batches; run 6, −3 % /
+−7 % on the dense batch (1 thread / all threads: 185.2 → 179.4, 40.0 → 37.4 ms), −3 % / +3 % on the
+flight, +1 % / −4 % on the squares, −2 % / 0 on the bonus chest; for up to 16 MiB kept per thread
+(≈ 6 to 11 MB in practice, up to ≈ 350 MB on 32 threads, never given back): default left at 4 MiB,
+the tile side and this maximum to decide on the scene bench.
+
+Run 6 times (after the two buffer fixes, machine loaded, minimum of 5 passes, ms; same columns as
+the run 5 table): all columns 1 thread 588.8 / 185.2 / 290.3 / 215.0 / 184.3 / 179.4 | 1,503.9 /
+1,311.6 / 377.9 | 258.5, all threads 38.5 / 40.0 / 45.5 / 41.1 / 39.6 / 37.4 | 91.2 / 105.5 / 54.3 |
+48.5; flight 1 thread 308.5 / 178.6 / 213.2 / 188.9 / 178.3 / 173.5 | 663.2 / 638.4 / 357.5 | 279.2,
+all threads 51.2 / 48.8 / 49.6 / 56.8 / 60.6 / 50.1 | 74.8 / 71.6 / 79.9 | 65.7; squares 1 thread
+66.2 / 24.8 / 36.6 / 26.2 / 24.6 / 25.0 | 139.2 / 140.0 / 49.5 | 35.9, all threads 7.3 / 7.0 / 7.1 /
+7.6 / 9.9 / 6.7 | 10.6 / 11.6 / 10.1 | 8.9; bonus chest 1 thread 27.9 / 17.8 / 17.8 / 16.2 / 17.8 /
+17.5 | 78.0 / 71.8 / 44.8 | 29.5, all threads 6.3 / 8.1 / 8.0 / 8.6 / 7.5 / 8.1 | 15.3 / 14.2 / 19.1 |
+11.3. The machine was less loaded than in run 5 (series 2 without scans 1,980.5 → 1,503.9 ms): the
+ratios only compare within a run. In run 6 the tiles stay −69 % on one thread on the dense batch
+but are +4 % on all threads (38.5 → 40.0), and the bonus chest without scans on all threads is
++25 % against series 2 (15.3 → 19.1; run 5: −7 %) while −43 % on one thread: small batches on all
+threads remain dominated by scheduling, so this regression on a loaded machine stays to confirm on
+the scene bench before the tiles are kept on by default for the bonus chest. GPU ruled out for the
 same reasons as C2-M08 (no
 device in `rc-sim`). Not done (C3): per-batch cache of the property columns (each column is still
 converted by every zone that reads it), block and sky passes of a tile in parallel, dense sky sweep
