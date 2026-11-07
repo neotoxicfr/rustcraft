@@ -500,3 +500,210 @@ fn mob_index_rebuilt_when_a_mob_rejoins() {
     assert_eq!(in_use, crate::mobs::index::kind_on(), "per-species index in use");
     finish(p, dir);
 }
+
+/// State of every ground item after a tick: identifier, count, age, pickup delay, position bits.
+type ItemState = (i32, i32, i32, i32, [u64; 3]);
+
+/// 1,900 ground items of four kinds dropped in layers (they merge as they land, counts of 1 to
+/// 3) and 200 that never merge (pickup blocked, eternal), on 3 × 3 blocks thrown slightly
+/// sideways, or `wide` on 16 × 16 thrown hard (they cross the grid's columns while a run goes
+/// on); 400 ticks with the switches `switches`, ticked as a run or one by one: the items after
+/// every tick, and the merge queries the grid answered.
+fn merge_scene(switches: crate::drops::DropSwitches, one_by_one: bool, wide: bool) -> (Vec<Vec<ItemState>>, usize) {
+    crate::drops::FORCED_SWITCHES.with(|c| c.set(Some(switches)));
+    crate::drops::ONE_BY_ONE.with(|c| c.set(one_by_one));
+    crate::drops::GRID_QUERIES.with(|c| c.set(0));
+    let (mut p, dir) = open(&format!("merge-{one_by_one}-{}-{wide}", switches.merge_grid));
+    let kinds = ["cobblestone", "dirt", "oak_log", "wheat_seeds"];
+    let (width, throw) = if wide { (15.8, 0.2) } else { (2.74, 0.05) };
+    for k in 0..2100usize {
+        // A fixed scatter (no random source): 47 and 31 are prime to the 2,100 slots.
+        let (x, z) = (8.13 + ((k * 47) % 100) as f64 * width / 100.0, 8.13 + ((k * 31) % 97) as f64 * width / 97.0);
+        let y = -59.0 + (k % 9) as f64;
+        let never = match k % 21 {
+            0 => ",PickupDelay:32767s",
+            10 => ",Age:-32768s",
+            _ => "",
+        };
+        let item = format!("{{id:\"minecraft:{}\",count:{}}}", kinds[k % 4], 1 + k % 3);
+        let (mx, mz) = ((((k * 13) % 7) as f64 - 3.0) * throw, (((k * 17) % 5) as f64 - 2.0) * throw);
+        let motion = format!("Motion:[{mx:.2}d,0.0d,{mz:.2}d]");
+        cmd(&mut p, &format!("summon minecraft:item {x:.4} {y} {z:.4} {{Item:{item},{motion}{never}}}"));
+    }
+    let mut ticks = Vec::new();
+    for _ in 0..400 {
+        game_ticks(&mut p, 1);
+        let items = p.s.life.drops.iter().filter(|d| !d.is_removed());
+        ticks.push(items.map(|d| (d.id, d.stack.count, d.age, d.pickup_delay, d.pos.map(f64::to_bits))).collect());
+        let _ = p.take_events();
+    }
+    let queries = crate::drops::GRID_QUERIES.with(std::cell::Cell::get);
+    crate::drops::FORCED_SWITCHES.with(|c| c.set(None));
+    crate::drops::ONE_BY_ONE.with(|c| c.set(false));
+    finish(p, dir);
+    (ticks, queries)
+}
+
+/// The merge switches (early exit, live prefilter, grid of a run, each alone then together)
+/// give the same items every tick as the former code, ticked as a run or one by one. Sabotage
+/// checks: merges happened, the never-merging items stayed, the grid answered queries (a grid
+/// that met its candidates out of list order, or missed one, changes the items).
+#[test]
+fn item_merge_switches_give_the_same_items() {
+    use crate::drops::DropSwitches;
+    let early = DropSwitches { merge_early_exit: true, ..DropSwitches::ALL_OFF };
+    let ways = [
+        ("early exit alone", early, false),
+        ("live prefilter", DropSwitches { merge_live_prefilter: true, ..early }, false),
+        ("grid", DropSwitches { merge_grid: true, ..early }, false),
+        ("all, as a run", DropSwitches::ALL_ON, false),
+        ("all, one by one", DropSwitches::ALL_ON, true),
+    ];
+    for wide in [false, true] {
+        let fresh = |switches: DropSwitches, one: bool| {
+            std::thread::spawn(move || merge_scene(switches, one, wide)).join().expect("simulation")
+        };
+        let (former, _) = fresh(DropSwitches::ALL_OFF, false);
+        let first = former.first().map_or(0, Vec::len);
+        let last = former.last().map_or(0, Vec::len);
+        assert!(first == 2100 && last + 500 < first, "merges happened (wide: {wide}): {first} items, then {last}");
+        assert!(last >= 200, "the 200 items that never merge are still there (wide: {wide}): {last}");
+        for (name, switches, one) in ways {
+            let (items, queries) = fresh(switches, one);
+            assert_eq!(queries > 0, switches.merge_grid && !one, "grid queries ({name}, wide: {wide}): {queries}");
+            for (t, (a, b)) in former.iter().zip(&items).enumerate() {
+                let (ta, tb) = (a.len(), b.len());
+                assert!(a == b, "{name} (wide: {wide}): items differ after tick {} ({ta} against {tb})", t + 1);
+            }
+            assert_eq!(former.len(), items.len(), "{name}: ticks");
+        }
+    }
+}
+
+/// The game's merge reach: the neighbour's box must cross the item's box inflated by 0.5
+/// horizontally; boxes that only touch do not merge. Two items 0.75 apart on the floor (faces
+/// touching) and two 0.25 apart in height (one on a layer of snow 0.25 high) stay apart; 0.74
+/// apart they merge. Before, every distance up to 0.75 and 0.25 merged.
+#[test]
+fn items_merge_only_when_their_boxes_cross() {
+    let (mut p, dir) = open("merge-reach");
+    // Three layers of snow: a collision box 0.25 high.
+    cmd(&mut p, "setblock 9 -60 12 minecraft:snow[layers=3]");
+    let pair = |p: &mut Probe, a: [f64; 3], b: [f64; 3]| {
+        for at in [a, b] {
+            let item = "{Item:{id:\"minecraft:cobblestone\",count:1}}";
+            cmd(p, &format!("summon minecraft:item {} {} {} {item}", at[0], at[1], at[2]));
+        }
+    };
+    pair(&mut p, [4.5, -60.0, 4.5], [5.25, -60.0, 4.5]);
+    pair(&mut p, [4.5, -60.0, 8.5], [5.24, -60.0, 8.5]);
+    pair(&mut p, [8.8, -60.0, 12.5], [9.2, -59.75, 12.5]);
+    // At rest, an item merges every 40 ticks.
+    game_ticks(&mut p, 45);
+    let at = |p: &Probe, z: f64| -> Vec<(i32, f64)> {
+        let row = p.s.life.drops.iter().filter(|d| !d.is_removed() && (d.pos[2] - z).abs() < 0.01);
+        row.map(|d| (d.stack.count, d.pos[1])).collect()
+    };
+    assert_eq!(at(&p, 8.5), [(2, -60.0)], "0.74 apart: merged");
+    assert_eq!(at(&p, 4.5), [(1, -60.0), (1, -60.0)], "0.75 apart, faces touching: not merged");
+    assert_eq!(at(&p, 12.5), [(1, -60.0), (1, -59.75)], "0.25 apart in height: not merged");
+    finish(p, dir);
+}
+
+/// The two ways of putting a family list back in rank order give the same lists: renewed
+/// ranks at the start, the middle and the end, entities born after them, empty slots (rank 0).
+/// Sabotage check: appending the moved entities without sorting them would differ.
+#[test]
+fn rank_resort_matches_a_stable_sort() {
+    let mut next = 2u64;
+    let mut rank = || {
+        next += 2;
+        next
+    };
+    let mut cases: Vec<Vec<u64>> = Vec::new();
+    for (renewed, born, empty) in
+        [(vec![0], 0, 0), (vec![5, 2, 9], 3, 0), (vec![19], 4, 2), (vec![7, 3], 0, 3), (vec![], 2, 1)]
+    {
+        let mut list: Vec<u64> = (0..20).map(|_| rank()).collect();
+        for &k in &renewed {
+            list[k] = rank();
+        }
+        list.extend((0..born).map(|_| rank()));
+        // Two renewals after the births: they rank above them too.
+        if let Some(&k) = renewed.first() {
+            list[k + 1] = rank();
+        }
+        for e in 0..empty {
+            list[3 + 4 * e] = 0;
+        }
+        cases.push(list);
+    }
+    // The moved entities appended in list order, unsorted.
+    let unsorted_end = |list: &[u64]| -> Vec<u64> {
+        let moved = (0..list.len()).filter(|&k| list[k + 1..].iter().any(|&r| r < list[k])).map(|k| list[k]).min();
+        let Some(first_moved) = moved else { return list.to_vec() };
+        let mut out: Vec<u64> = list.iter().copied().filter(|&r| r < first_moved).collect();
+        out.extend(list.iter().copied().filter(|&r| r >= first_moved));
+        out
+    };
+    let mut sabotage_seen = false;
+    for list in cases {
+        let mut stable = list.clone();
+        stable.sort();
+        assert_ne!(list, stable, "a list with something to put back");
+        let mut linear = list.clone();
+        crate::walk::put_back_in_rank_order(&mut linear, |&r| r);
+        assert_eq!(linear, stable, "from {list:?}");
+        sabotage_seen |= unsorted_end(&list) != stable;
+    }
+    assert!(sabotage_seen, "an unsorted end must be caught");
+}
+
+/// Entities that leave the ticking chunks and come back every other tick (simulation distance
+/// 2, then 3) in three chunks, of several families: with the linear re-sort and the chunk table
+/// on or off, the lists hold the same entities in the same order after every tick and the walk
+/// visits the families in the same order.
+#[test]
+fn walk_resort_switches_give_the_same_order() {
+    let run = |on: bool| {
+        crate::walk::FORCED_RESORT_LINEAR.with(|c| c.set(Some(on)));
+        crate::walk::FORCED_REJOIN_CHUNK_TABLE.with(|c| c.set(Some(on)));
+        let (mut p, dir) = open(&format!("resort-{on}"));
+        for k in 0..36 {
+            // A third near the player (always ticking), the others in three chunks at x 48 to 63.
+            let (x, z) = if k % 3 == 0 {
+                (4.5 + f64::from(k % 6), 2.5 + f64::from(k / 6))
+            } else {
+                (50.5 + f64::from(k % 5) * 2.0, -12.5 + f64::from(k) * 1.1)
+            };
+            let (kind, nbt) = match k % 4 {
+                0 => ("pig", "{NoAI:1b}"),
+                1 => ("item", "{Item:{id:\"minecraft:stone\",count:1},PickupDelay:32767s}"),
+                2 => ("experience_orb", "{Value:1}"),
+                _ => ("minecart", "{}"),
+            };
+            cmd(&mut p, &format!("summon minecraft:{kind} {x} -60 {z} {nbt}"));
+        }
+        let mut seen = Vec::new();
+        for t in 0..40 {
+            p.s.sim_dist = if t % 2 == 0 { 2 } else { 3 };
+            crate::walk::TRACE.with_borrow_mut(|t| *t = Some(Vec::new()));
+            game_ticks(&mut p, 1);
+            let trace = crate::walk::TRACE.with_borrow_mut(Option::take).expect("trace");
+            let items: Vec<i32> = p.s.life.drops.iter().map(|d| d.id).collect();
+            let orbs: Vec<i32> = p.s.life.orbs.iter().map(|o| o.id).collect();
+            let mobs: Vec<i32> = p.s.mobs.list.iter().map(|m| m.id).collect();
+            let carts: Vec<i32> = p.s.carts.list.iter().flatten().map(|c| c.id).collect();
+            seen.push((format!("{trace:?}"), items, orbs, mobs, carts));
+            let _ = p.take_events();
+        }
+        crate::walk::FORCED_RESORT_LINEAR.with(|c| c.set(None));
+        crate::walk::FORCED_REJOIN_CHUNK_TABLE.with(|c| c.set(None));
+        finish(p, dir);
+        seen
+    };
+    let fresh = |on: bool| std::thread::spawn(move || run(on)).join().expect("simulation");
+    let (linear, sorted) = (fresh(true), fresh(false));
+    assert!(linear.iter().any(|s| s.1 != linear[0].1), "the item list changed order: entities came back");
+    assert_eq!(linear, sorted);
+}

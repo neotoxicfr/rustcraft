@@ -21,6 +21,20 @@ fn is_number(c: char) -> bool {
     c.is_ascii_digit() || c == '.' || c == '-'
 }
 
+/// Longest number text parsed without a heap copy.
+const NUMBER_ON_STACK: usize = 64;
+
+/// `run` (ASCII characters) as a `str` in `buf`, if it fits.
+fn ascii_on_stack<'b>(run: &[char], buf: &'b mut [u8; NUMBER_ON_STACK]) -> Option<&'b str> {
+    if run.len() > NUMBER_ON_STACK || !run.iter().all(char::is_ascii) {
+        return None;
+    }
+    for (b, &c) in buf.iter_mut().zip(run) {
+        *b = c as u8;
+    }
+    std::str::from_utf8(&buf[..run.len()]).ok()
+}
+
 impl<'a> Reader<'a> {
     pub fn new(s: &'a [char], cursor: usize) -> Self {
         Reader { s, cursor }
@@ -79,21 +93,24 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn number_run(&mut self) -> String {
+    fn number<T: std::str::FromStr>(&mut self, expected: &'static str, invalid: &'static str) -> Result<T, CmdError> {
         let start = self.cursor;
         while self.can_read() && is_number(self.peek()) {
             self.skip();
         }
-        self.slice(start, self.cursor)
-    }
-
-    fn number<T: std::str::FromStr>(&mut self, expected: &'static str, invalid: &'static str) -> Result<T, CmdError> {
-        let start = self.cursor;
-        let n = self.number_run();
-        if n.is_empty() {
+        let run = &self.s[start..self.cursor];
+        if run.is_empty() {
             return Err(self.err0(expected));
         }
-        n.parse::<T>().map_err(|_| {
+        // Digits, dots and minus signs are ASCII: a usual number parses from the stack, the text
+        // is only copied for the error message.
+        let mut buf = [0u8; NUMBER_ON_STACK];
+        let value = match ascii_on_stack(run, &mut buf) {
+            Some(text) => text.parse::<T>().ok(),
+            None => run.iter().collect::<String>().parse::<T>().ok(),
+        };
+        value.ok_or_else(|| {
+            let n = self.slice(start, self.cursor);
             self.cursor = start;
             self.err(invalid, vec![n])
         })
@@ -230,6 +247,10 @@ pub fn read_id(r: &mut Reader<'_>) -> Result<String, CmdError> {
         r.cursor = start;
         return Err(r.err0("argument.id.invalid"));
     }
+    // A text that names its namespace is already the full identifier: no second string.
+    if s.split_once(':').is_some_and(|(ns, _)| !ns.is_empty()) {
+        return Ok(s);
+    }
     Ok(format!("{ns}:{path}"))
 }
 
@@ -285,6 +306,39 @@ mod tests {
         assert_eq!(read_id(&mut rd).unwrap(), "minecraft:");
         let s = r("a:b:c");
         assert_eq!(read_id(&mut Reader::new(&s, 0)).unwrap_err().key, "argument.id.invalid");
+    }
+
+    /// The identifier returned without a second string is the one the former formula built.
+    #[test]
+    fn identifiers_match_the_formatted_form() {
+        for text in ["stone", "minecraft:stone", ":stone", "foo:bar/baz", "a.b-c_d:e/f.g", "", ":", "x:", "1:2"] {
+            let s = r(text);
+            let got = read_id(&mut Reader::new(&s, 0)).expect(text);
+            let (ns, path) = match text.split_once(':') {
+                Some((ns, p)) => (if ns.is_empty() { "minecraft" } else { ns }, p),
+                None => ("minecraft", text),
+            };
+            assert_eq!(got, format!("{ns}:{path}"), "{text}");
+        }
+    }
+
+    /// Numbers parsed from the stack, and the long ones through a string: same values, same
+    /// errors (text and position).
+    #[test]
+    fn numbers_on_the_stack_and_beyond() {
+        let long = "1".repeat(NUMBER_ON_STACK + 6);
+        let s = r(&long);
+        let e = Reader::new(&s, 0).read_int().unwrap_err();
+        assert_eq!((e.key, e.args.clone(), e.cursor), ("parsing.int.invalid", vec![long.clone()], Some(0)));
+        let s = r(&format!("0.{}5", "0".repeat(NUMBER_ON_STACK)));
+        assert!(Reader::new(&s, 0).read_double().unwrap() > 0.0);
+        let s = r("-12.5e");
+        let mut rd = Reader::new(&s, 0);
+        assert_eq!(rd.read_double(), Ok(-12.5));
+        assert_eq!(rd.cursor, 5);
+        let s = r("1-2 x");
+        let e = Reader::new(&s, 0).read_long().unwrap_err();
+        assert_eq!((e.key, e.args, e.cursor), ("parsing.long.invalid", vec!["1-2".to_owned()], Some(0)));
     }
 
     #[test]

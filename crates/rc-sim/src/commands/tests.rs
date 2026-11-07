@@ -62,6 +62,6 @@ fn parse_errors() {
     assert_eq!(p.segs[0].path_str(), "tp");
     assert_eq!(p.segs[1].path_str(), "teleport <targets> <location>");
     let p = analyse(l, &data, "execute as @a at @s run say hi", 4).ok().unwrap();
-    let paths: Vec<String> = p.segs.iter().map(Seg::path_str).collect();
+    let paths: Vec<String> = p.segs.iter().map(|s| s.path_str().to_owned()).collect();
     assert_eq!(paths, ["execute as <targets>", "execute at <targets>", "execute run", "say <message>"]);
 }

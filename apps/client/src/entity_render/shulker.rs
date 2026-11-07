@@ -155,11 +155,11 @@ pub(super) fn render_offset(e: &Entity, pt: f32) -> Option<[f64; 3]> {
 
 /// Body rotation offset by 180° by the game: `180 − (body + 180)` = −body. The body
 /// stays at 0° client-side (empty rotation control), unless set by a mount.
-pub(super) fn rotations(e: &Entity, pt: f32, m: &mut Mat4) -> bool {
+pub(super) fn rotations(e: &Entity, body: f32, m: &mut Mat4) -> bool {
     if e.kind != KIND {
         return false;
     }
-    *m *= Mat4::from_rotation_y(-rot_lerp(pt, e.body_o, e.body) * (PI / 180.0));
+    *m *= Mat4::from_rotation_y(-body * (PI / 180.0));
     true
 }
 
@@ -198,12 +198,12 @@ pub(super) fn animate(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) -> b
         return false;
     }
     let bs = (0.5 + peek(e, pt)) * PI;
-    let q = -1.0 + bs.sin();
-    let extra = if bs > PI { (s.age * 0.1).sin() * 0.7 } else { 0.0 };
+    let q = -1.0 + table_sin(bs);
+    let extra = if bs > PI { table_sin(s.age * 0.1) * 0.7 } else { 0.0 };
     let peek = peek(e, pt);
     p.set("lid", |l| {
         l[0] = 0.0;
-        l[1] = 16.0 + bs.sin() * 8.0 + extra;
+        l[1] = 16.0 + table_sin(bs) * 8.0 + extra;
         l[2] = 0.0;
         l[4] = if peek > 0.3 { q * q * q * q * PI * 0.125 } else { 0.0 };
     });

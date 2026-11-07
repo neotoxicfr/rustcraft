@@ -106,6 +106,18 @@ impl Sections {
         }
     }
 
+    /// Sections in both sets.
+    pub fn intersection(&self, o: Sections) -> Sections {
+        Sections(std::array::from_fn(|i| self.0[i] & o.0[i]))
+    }
+
+    /// Removes the sections of `o`.
+    pub fn subtract(&mut self, o: Sections) {
+        for (a, b) in self.0.iter_mut().zip(o.0) {
+            *a &= !b;
+        }
+    }
+
     pub fn is_all(&self) -> bool {
         *self == Self::ALL
     }

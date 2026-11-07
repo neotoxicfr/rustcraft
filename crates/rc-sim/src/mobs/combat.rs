@@ -22,16 +22,45 @@ pub(crate) fn hurt_knockback_dir(dir: Option<(f64, f64)>, src: Option<[f64; 3]>,
     }
 }
 
+/// Path of an identifier written without a namespace (`is_fire`) or with an empty one
+/// (`:is_fire`): the game reads both in `minecraft`. `None` for a complete identifier.
+fn default_namespace_path(written: &str) -> Option<&str> {
+    match written.split_once(':') {
+        None => Some(written),
+        Some(("", path)) => Some(path),
+        Some(_) => None,
+    }
+}
+
+/// Does the complete identifier `full` (`minecraft:is_fire`) name what `written` names, once
+/// `written` is read like the game reads an identifier (missing namespace = `minecraft`)?
+pub(crate) fn same_identifier(full: &str, written: &str) -> bool {
+    match default_namespace_path(written) {
+        Some(path) => full.strip_prefix("minecraft:") == Some(path),
+        None => full == written,
+    }
+}
+
 impl Server {
-    /// Damage type in a tag (`tags/damage_type`).
+    /// Damage type in a tag (`tags/damage_type`). The tag may be written short (`is_fire`, from
+    /// a `damage_resistant` or `blocks_attacks` component): it is then in `minecraft`, like the game.
     pub(crate) fn dmg_tag(&self, ty: &str, tag: &str) -> bool {
         let Some(idx) = self.regs.entries("minecraft:damage_type").iter().position(|e| e == ty) else { return false };
         self.regs
             .tags
             .iter()
             .find(|(r, _)| r == "minecraft:damage_type")
-            .and_then(|(_, t)| t.iter().find(|(n, _)| n == tag))
+            .and_then(|(_, t)| t.iter().find(|(n, _)| same_identifier(n, tag)))
             .is_some_and(|(_, ids)| ids.contains(&(idx as i32)))
+    }
+
+    /// Is damage type `ty` in one entry of a set of damage types: a tag (`#is_fire`) or a single
+    /// damage type (`in_fire`), each with an optional namespace like the game.
+    pub(crate) fn damage_set_entry_has(&self, entry: &str, ty: &str) -> bool {
+        match entry.strip_prefix('#') {
+            Some(tag) => self.dmg_tag(ty, tag),
+            None => same_identifier(ty, entry),
+        }
     }
 
     pub(crate) fn sound_id(&self, name: &str) -> Option<i32> {
@@ -685,6 +714,9 @@ impl Server {
         {
             self.pet_death_message(m, owner);
         }
+        // Like the game, a sleeper is woken before the rest of the death, conversion by a zombie
+        // included: bed freed, stood up beside it.
+        self.npc_wake(m);
         m.dead = true;
         m.use_ticks = -1;
         // Wolf: no longer wet or shaking off.

@@ -281,12 +281,18 @@ fn section_one_pass_count() -> bool {
 }
 
 fn light_layer(v: Option<&Nbt>) -> Result<LightLayer, String> {
+    light_layer_with(v, rc_light::uniform_light_interned())
+}
+
+/// [`light_layer`] with the switch given: an all-0 or all-15 saved layer (sky under the
+/// terrain) becomes the shared one instead of its own 2 KB.
+fn light_layer_with(v: Option<&Nbt>, intern_uniform: bool) -> Result<LightLayer, String> {
     match v {
         None => Ok(None),
         Some(Nbt::ByteArray(b)) if b.len() == LIGHT_BYTES => {
             let mut a = [0u8; LIGHT_BYTES];
             a.copy_from_slice(b);
-            Ok(Some(Arc::new(a)))
+            Ok(Some(if intern_uniform { rc_world::intern_light_layer(a) } else { Arc::new(a) }))
         }
         Some(_) => Err("light layer of invalid size".into()),
     }
@@ -755,6 +761,31 @@ pub(crate) fn parse_with(
 }
 
 #[cfg(test)]
+mod light_layer_tests {
+    use super::*;
+
+    /// A saved layer reads back with the same bytes either way; only all-0 and all-15 ones are
+    /// shared, and only when interned.
+    #[test]
+    fn saved_layers_read_back_and_uniform_ones_shared() {
+        let mut lit = vec![0u8; LIGHT_BYTES];
+        lit[2047] = 0x10;
+        for bytes in [vec![0u8; LIGHT_BYTES], vec![0xff; LIGHT_BYTES], lit, vec![0x5a; LIGHT_BYTES]] {
+            let uniform = bytes.iter().all(|&b| b == bytes[0]) && (bytes[0] == 0 || bytes[0] == 0xff);
+            let nbt = Nbt::ByteArray(bytes.clone());
+            for intern in [false, true] {
+                let got = light_layer_with(Some(&nbt), intern).unwrap().unwrap();
+                assert!(got[..] == bytes[..], "first byte {:#x}, interned {intern}: bytes changed", bytes[0]);
+                let shared = Arc::ptr_eq(&got, &rc_world::zero_layer()) || Arc::ptr_eq(&got, &rc_world::full_layer());
+                assert_eq!(shared, intern && uniform, "first byte {:#x}, interned {intern}", bytes[0]);
+            }
+        }
+        assert_eq!(light_layer_with(None, true), Ok(None));
+        assert!(light_layer_with(Some(&Nbt::ByteArray(vec![0; 10])), true).is_err());
+    }
+}
+
+#[cfg(test)]
 mod heightmap_tests {
     use super::*;
     use crate::states::States;
@@ -955,6 +986,63 @@ mod heightmap_tests {
         }
         eprintln!("{n} chunks: primed maps = maps of the game");
         assert!(n > 0);
+    }
+
+    /// Official world (`RUSTCRAFT_SOLO_WORLD`), read with the process's light switch: each
+    /// light layer read keeps the saved bytes, and the light packets (empty mask or not) and the
+    /// saved compound of each chunk are the same as those of a copy whose layers are all
+    /// separate allocations. With interning on (default), uniform layers must be found shared.
+    #[test]
+    fn model_world_light_unchanged_by_shared_layers() {
+        let Some(world) = crate::tests::test_world() else { return };
+        let Some((data, states)) = setup() else { return };
+        let (zero, full) = (rc_world::zero_layer(), rc_world::full_layer());
+        let (mut chunks, mut layers, mut shared) = (0usize, 0usize, 0usize);
+        for name in crate::tests::DIMENSIONS {
+            let h = crate::dimension_height(&data, name);
+            let dim = crate::world::Dimension::new(&world, name, h);
+            for (rx, rz) in dim.regions() {
+                let path = dim.region_dir().join(format!("r.{rx}.{rz}.mca"));
+                let mut region = crate::region::RegionFile::open(&path, false).expect("region");
+                let present: Vec<usize> = region.present().collect();
+                for i in present {
+                    let (x, z) = ((rx << 5) + (i & 31) as i32, (rz << 5) + (i >> 5) as i32);
+                    let Ok(Some(bytes)) = region.read(i, x, z) else { continue };
+                    let root = crate::nbtio::parse_root(&bytes).expect("chunk NBT");
+                    let Ok(c) = parse(root.clone(), &data, &states, h) else { continue };
+                    for s in list(root.get("sections")) {
+                        let li = (int(s, "Y").unwrap() as i32 - (h.min_section() - 1)) as usize;
+                        for (key, got) in [("SkyLight", &c.sky), ("BlockLight", &c.block)] {
+                            let saved = match s.get(key) {
+                                Some(Nbt::ByteArray(b)) => Some(&b[..]),
+                                _ => None,
+                            };
+                            let read = got.get(li).and_then(|l| l.as_deref()).map(|l| &l[..]);
+                            assert!(saved == read, "{name} ({x}, {z}) {key}: bytes changed");
+                        }
+                    }
+                    let mut separate = c.clone();
+                    for l in separate.sky.iter_mut().chain(separate.block.iter_mut()).flatten() {
+                        layers += 1;
+                        shared += usize::from(Arc::ptr_eq(l, &zero) || Arc::ptr_eq(l, &full));
+                        *l = Arc::new(**l);
+                    }
+                    for empty_mask in [false, true] {
+                        let sent = crate::server::light_data(&c.sky, &c.block, empty_mask);
+                        let sent_separate = crate::server::light_data(&separate.sky, &separate.block, empty_mask);
+                        assert!(sent == sent_separate, "{name} ({x}, {z}) light packet, empty mask {empty_mask}");
+                    }
+                    let saved = c.encode(&data, &states, h, 0);
+                    assert!(saved == separate.encode(&data, &states, h, 0), "{name} ({x}, {z}) save");
+                    chunks += 1;
+                }
+            }
+        }
+        eprintln!("{chunks} chunks, {layers} light layers, {shared} shared");
+        assert!(chunks > 100, "{chunks} chunks read");
+        if rc_light::uniform_light_interned() {
+            assert!(shared > 0, "no uniform layer shared in {layers}");
+        }
     }
 }
 

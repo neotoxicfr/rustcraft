@@ -107,6 +107,8 @@ mod ench_fx; // G5-F04: enchantment effects (protection, armor effectiveness, af
 mod mace; // G5-F04: smash attack
 #[cfg(test)]
 mod tests_g5f04;
+#[cfg(test)]
+mod tests_damage_tag_names; // short damage tag and damage type names, read in `minecraft`
 pub mod randsrc;
 // Commands (S5).
 pub mod commands;
@@ -238,6 +240,10 @@ mod tests_l10order; // L10-ORDER: one entity walk, every kind in the order of ar
 #[cfg(test)]
 mod bench_l10order; // L10-ORDER: server tick with 1,000 entities of five families
 #[cfg(test)]
+mod tests_ground_items; // ground items and orbs: pickup and recycled bodies, both ways of each switch
+#[cfg(test)]
+mod bench_ground_items; // ground items: merges of a dropped pile, births and removals per tick
+#[cfg(test)]
 mod bench_kit; // common kit of the micro-benches: flat world, perf pack, timed ticks, `[bench]` lines
 #[cfg(test)]
 mod bench_datapack_tick; // tick of the bench's `datapack` scene (crowd, #tick workload, command blocks)
@@ -245,6 +251,10 @@ mod bench_datapack_tick; // tick of the bench's `datapack` scene (crowd, #tick w
 mod bench_path_search; // mob path search on the village of the bench model world, each lead alone
 #[cfg(test)]
 mod bench_scores; // scoreboard switches: writes over every holder, save, entity removals, team lookups
+#[cfg(test)]
+mod bench_function_tick; // command switches: functions per tick, macros, command blocks, schedule, parse
+#[cfg(test)]
+mod bench_spawner_blocks; // trial spawners, vaults, monster spawners, natural spawn pass, structure lists
 #[cfg(test)]
 mod tests_perf_pack; // the scene bench's `perf` data pack compiles with our command parser
 #[cfg(test)]

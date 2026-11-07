@@ -280,12 +280,27 @@ pub fn scary(s: &Server, e: Ent) -> bool {
     }
 }
 
+/// A living mob outside the tag `not_scary_for_pufferfish` whose box touches `area`. The species
+/// test comes first: around a pufferfish most mobs are fish, rejected before any box is built.
+fn scary_mob_in(o: &Mob, area: &rc_physics::Aabb) -> bool {
+    !not_scary(o.kind) && o.alive() && o.touches(area)
+}
+
 /// The puffing goal: a scary entity within 2 blocks.
 pub fn puff_can_use(s: &Server, m: &Mob) -> bool {
     let b = m.bbox();
     let area = rc_physics::Aabb { min: b.min.map(|v| v - 2.0), max: b.max.map(|v| v + 2.0) };
     let player = s.player_aabb().intersects(&area) && scary(s, Ent::Player) && s.ent_alive(Ent::Player);
-    player || s.mobs.list.iter().any(|o| o.touches(&area) && scary(s, Ent::Mob(o.id)))
+    player || scary_mob_near(s, &area, super::super::index::one_pass_scans())
+}
+
+/// A scary mob in `area`; `one_pass`: tested as held, otherwise looked up again by identifier.
+pub(crate) fn scary_mob_near(s: &Server, area: &rc_physics::Aabb, one_pass: bool) -> bool {
+    if one_pass {
+        s.mobs.list.iter().any(|o| scary_mob_in(o, area))
+    } else {
+        s.mobs.list.iter().any(|o| o.touches(area) && scary(s, Ent::Mob(o.id)))
+    }
 }
 
 /// Stings of the mobs touched (after the common one), puffed only.
@@ -295,13 +310,7 @@ pub fn puff_touch(s: &mut Server, m: &mut Mob) {
     }
     let b = m.bbox();
     let area = rc_physics::Aabb { min: b.min.map(|v| v - 0.3), max: b.max.map(|v| v + 0.3) };
-    let ids: Vec<i32> = s
-        .mobs
-        .list
-        .iter()
-        .filter(|o| o.touches(&area) && o.alive() && !not_scary(o.kind))
-        .map(|o| o.id)
-        .collect();
+    let ids = stung_mobs(s, &area, super::super::index::one_pass_scans());
     let dmg = (1 + m.sea.puff) as f32;
     for id in ids {
         let Some(i) = s.mob_index(id) else { continue };
@@ -311,6 +320,16 @@ pub fn puff_touch(s: &mut Server, m: &mut Mob) {
             s.mob_sound(m, "minecraft:entity.puffer_fish.sting", 1.0, 1.0);
         }
         s.mobs.list.put(i, o);
+    }
+}
+
+/// Identifiers of the mobs a puffed pufferfish stings in `area`, in list order.
+pub(crate) fn stung_mobs(s: &Server, area: &rc_physics::Aabb, one_pass: bool) -> Vec<i32> {
+    let list = s.mobs.list.iter();
+    if one_pass {
+        list.filter(|o| scary_mob_in(o, area)).map(|o| o.id).collect()
+    } else {
+        list.filter(|o| o.touches(area) && o.alive() && !not_scary(o.kind)).map(|o| o.id).collect()
     }
 }
 
@@ -325,13 +344,9 @@ impl Server {
             min: [pb.min[0] - 1.0, pb.min[1] - 0.5, pb.min[2] - 1.0],
             max: [pb.max[0] + 1.0, pb.max[1] + 0.5, pb.max[2] + 1.0],
         };
-        let ids: Vec<i32> = self
-            .mobs
-            .list
-            .iter()
-            .filter(|o| o.kind == Kind::Pufferfish && !o.removed && o.touches(&area))
-            .map(|o| o.id)
-            .collect();
+        // Called every tick: the species index walks only the pufferfish (none: nothing walked).
+        let ids: Vec<i32> =
+            self.mobs.of_kind(Kind::Pufferfish).filter(|o| !o.removed && o.touches(&area)).map(|o| o.id).collect();
         for id in ids {
             let Some(i) = self.mob_index(id) else { continue };
             let Some(m) = self.mobs.list.take(i) else { continue };

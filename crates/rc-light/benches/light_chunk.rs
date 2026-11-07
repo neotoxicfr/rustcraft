@@ -128,23 +128,49 @@ fn bench(c: &mut Criterion) {
             rb as f64 / n / 1024.0
         );
     }
+    // Light sheets the chunks keep in their own allocation, with and without the shared uniform
+    // sheets (all the columns, new path with scans).
+    for intern in [false, true] {
+        let (mut sheets, mut owned) = (0usize, 0usize);
+        let (zero, full) = (rc_world::zero_layer(), rc_world::full_layer());
+        for &k in &keys {
+            let (sky, block) =
+                rc_light::light_chunk_with(&t, cols(k), scans_of(k), h, true, [true, true, true, intern]);
+            for l in sky.iter().chain(&block).flatten() {
+                sheets += 1;
+                owned += usize::from(!std::sync::Arc::ptr_eq(l, &zero) && !std::sync::Arc::ptr_eq(l, &full));
+            }
+        }
+        eprintln!(
+            "sheets, uniform ones shared {intern}: {sheets} sheets, {owned} own allocations ({:.1} MiB)",
+            (owned * rc_world::LIGHT_BYTES) as f64 / (1 << 20) as f64
+        );
+    }
     // Matrix of the switches in this process (loaded bench: from one process to the next the own
     // noise exceeds the gain): 7 passes, variants in an order rotated at each pass, minimal
-    // time per variant, 64 columns on 1 thread then 256 columns on all threads.
-    let combos: Vec<([bool; 3], bool)> = (0..8usize)
-        .flat_map(|b| [([b & 1 != 0, b & 2 != 0, b & 4 != 0], false), ([b & 1 != 0, b & 2 != 0, b & 4 != 0], true)])
+    // time per variant, 64 columns on 1 thread then 256 columns on all threads. Uniform
+    // sheets shared in every variant but the two "-INTERN" ones (all on, without sharing).
+    let interned = |[skip, noemit, layout]: [bool; 3]| [skip, noemit, layout, true];
+    let mut combos: Vec<([bool; 4], bool)> = (0..8usize)
+        .flat_map(|b| {
+            let o = interned([b & 1 != 0, b & 2 != 0, b & 4 != 0]);
+            [(o, false), (o, true)]
+        })
         .filter(|(o, sc)| !(o[1] && !sc))
         .collect();
-    let name = |(o, sc): &([bool; 3], bool)| {
+    combos.extend([([true, true, true, false], false), ([true, true, true, false], true)]);
+    let name = |(o, sc): &([bool; 4], bool)| {
         let mut v: Vec<&str> = Vec::new();
-        for (on, n) in o.iter().zip(["SKIP", "NOEMIT", "LAYOUT"]) {
+        for (on, n) in o[..3].iter().zip(["SKIP", "NOEMIT", "LAYOUT"]) {
             if *on {
                 v.push(n);
             }
         }
-        format!("{}{}", if v.is_empty() { "old".into() } else { v.join("+") }, if *sc { " +scans" } else { "" })
+        let sharing = if o[3] { "" } else { " -INTERN" };
+        let base = if v.is_empty() { "old".into() } else { v.join("+") };
+        format!("{base}{sharing}{}", if *sc { " +scans" } else { "" })
     };
-    let run = |list: &[(i32, i32)], (o, sc): &([bool; 3], bool), par: bool| {
+    let run = |list: &[(i32, i32)], (o, sc): &([bool; 4], bool), par: bool| {
         let f = |&k: &(i32, i32)| {
             let s = if *sc { scans_of(k) } else { [None; 9] };
             black_box(rc_light::light_chunk_with(&t, cols(k), s, h, true, *o)).0.len()

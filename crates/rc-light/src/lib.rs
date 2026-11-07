@@ -186,22 +186,40 @@ pub fn light_chunk_scanned(
 ) -> (Vec<LightLayer>, Vec<LightLayer>) {
     use std::sync::atomic::Ordering::Relaxed;
     let t0 = std::time::Instant::now();
-    let o = full::FullOpts::current();
-    let out = if o == full::FullOpts::OLD {
-        full::light_chunk_inner(t, cols, height, has_sky)
-    } else {
-        full::light_chunk_opt(t, cols, scans, height, has_sky, o)
-    };
+    let out = light_chunk_dispatch(t, cols, scans, height, has_sky, full::FullOpts::current());
     stats::CHUNK_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
     stats::CHUNKS.fetch_add(1, Relaxed);
     out
 }
 
+fn light_chunk_dispatch(
+    t: &LightTables,
+    cols: Columns,
+    scans: Scans,
+    height: i32,
+    has_sky: bool,
+    o: full::FullOpts,
+) -> (Vec<LightLayer>, Vec<LightLayer>) {
+    if o.old_resolution() {
+        full::light_chunk_inner(t, cols, height, has_sky, o.intern_uniform)
+    } else {
+        full::light_chunk_opt(t, cols, scans, height, has_sky, o)
+    }
+}
+
 pub use full::{ColumnScan, Scans, scan_column};
 
-/// Benches: [`light_chunk_scanned`] with given switches (`skip`, `noemit`, `layout`)
-/// instead of the process's, to compare the variants in one executable (alternating
-/// passes). All false: old path. Not counted in `stats`.
+/// `RUSTCRAFT_OPT_INTERN_UNIFORM_LIGHT` (default on; `0`: every sheet has its own allocation):
+/// all-0 and all-15 light sheets made by the full light, read from a save, received or
+/// implied around a change are the shared ones ([`rc_world::zero_layer`],
+/// [`rc_world::full_layer`]). Most sky sheets under the terrain are all 0.
+pub fn uniform_light_interned() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_INTERN_UNIFORM_LIGHT")
+}
+
+/// Benches: [`light_chunk_scanned`] with given switches (`skip`, `noemit`, `layout`,
+/// `intern_uniform`) instead of the process's, to compare the variants in one executable
+/// (alternating passes). All false: old path. Not counted in `stats`.
 #[doc(hidden)]
 pub fn light_chunk_with(
     t: &LightTables,
@@ -209,14 +227,9 @@ pub fn light_chunk_with(
     scans: Scans,
     height: i32,
     has_sky: bool,
-    [skip, noemit, layout]: [bool; 3],
+    [skip, noemit, layout, intern_uniform]: [bool; 4],
 ) -> (Vec<LightLayer>, Vec<LightLayer>) {
-    let o = full::FullOpts { skip, noemit, layout };
-    if o == full::FullOpts::OLD {
-        full::light_chunk_inner(t, cols, height, has_sky)
-    } else {
-        full::light_chunk_opt(t, cols, scans, height, has_sky, o)
-    }
+    light_chunk_dispatch(t, cols, scans, height, has_sky, full::FullOpts { skip, noemit, layout, intern_uniform })
 }
 
 use hashbrown::HashSet;
@@ -519,6 +532,28 @@ pub fn relight_sections_inc(
     inc: Option<usize>,
 ) -> Touched {
     let o = fast::Opts { inc: inc.is_some(), inc_max: inc.unwrap_or(usize::MAX), ..fast::Opts::current() };
+    if o == fast::Opts::OLD {
+        return relight_zones(grid, height, t, has_sky, changes, true);
+    }
+    let mut out = [Touched::new()];
+    fast::relight_zones(grid, height, t, has_sky, changes, None, o, &mut out);
+    let [touched] = out;
+    touched
+}
+
+/// Benches: [`relight_sections`] with some switches set (`("LIGHTSKYFRONTIER", false)`: as with
+/// `RUSTCRAFT_OPT_LIGHTSKYFRONTIER=0`), the others being those of the process, to compare the
+/// paths in one executable. Not counted in the relights.
+#[doc(hidden)]
+pub fn relight_sections_with(
+    grid: &mut impl LightGrid,
+    height: i32,
+    t: &LightTables,
+    has_sky: bool,
+    changes: &[[i32; 3]],
+    switches: &[(&str, bool)],
+) -> Touched {
+    let o = switches.iter().fold(fast::Opts::current(), |o, &(name, on)| o.with(name, on));
     if o == fast::Opts::OLD {
         return relight_zones(grid, height, t, has_sky, changes, true);
     }

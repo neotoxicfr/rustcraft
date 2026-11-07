@@ -349,6 +349,8 @@ fn tearing_creaking_blinks_without_flip_or_red() {
         swim: 0.0,
         env: PoseEnv::default(),
         height: 2.7,
+        shared_body_angle: true,
+        skip_identity_factors: true,
     };
     let mut m = Mat4::IDENTITY;
     pose_rotations(e, 0.0, 0.0, &mut m, &ctx);

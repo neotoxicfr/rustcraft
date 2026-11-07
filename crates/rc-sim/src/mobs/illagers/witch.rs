@@ -50,10 +50,21 @@ impl Server {
         } else {
             let eye_water = m.eyes_in_water;
             let has = |m: &Mob, id: &str| m.x.effects.iter().any(|e| e.id == id);
-            let fire_hit = m.last_hit.as_ref().is_some_and(|h| self.dmg_tag(&h.ty, "minecraft:is_fire"));
+            // The damage tag lookup only reads: `RUSTCRAFT_OPT_WITCHFIRECHECKLAZY` makes it where
+            // its answer is used (second branch, not on fire), the draws stay in the same order.
+            let lazy = crate::poi::new_search_path(rc_data::opt_switch!("RUSTCRAFT_OPT_WITCHFIRECHECKLAZY"));
+            let fire_hit = |s: &Server, m: &Mob| m.last_hit.as_ref().is_some_and(|h| s.dmg_tag(&h.ty, "minecraft:is_fire"));
+            let early_fire_hit = !lazy && fire_hit(self, m);
+            let lazy_fire_hit = |s: &Server, m: &Mob| {
+                crate::poi::note_search_path("witch fire check where used");
+                fire_hit(s, m)
+            };
             let potion = if m.rng.next_float() < 0.15 && eye_water && !has(m, "minecraft:water_breathing") {
                 Some("minecraft:water_breathing")
-            } else if m.rng.next_float() < 0.15 && (m.on_fire() || fire_hit) && !has(m, "minecraft:fire_resistance") {
+            } else if m.rng.next_float() < 0.15
+                && (m.on_fire() || if lazy { lazy_fire_hit(self, m) } else { early_fire_hit })
+                && !has(m, "minecraft:fire_resistance")
+            {
                 Some("minecraft:fire_resistance")
             } else if m.rng.next_float() < 0.05 && m.health < m.max_health() {
                 Some("minecraft:healing")

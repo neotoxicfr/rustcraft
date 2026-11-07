@@ -1115,45 +1115,66 @@ impl Mob {
         self.data.iter_mut().for_each(|s| s.dirty = false);
     }
 
-    /// Copies the current state into the synced values (marked if changed).
-    pub fn sync_data(&mut self) {
+    /// Shared entity flags (index 0), every bit decided here. A family that patched a bit
+    /// after this byte was written would flip the value twice per tick: it would stay
+    /// marked changed and be resent every tick, forcing a position sync with it.
+    fn synced_shared_flags(&self) -> i8 {
         let mut flags = 0i8;
         if self.on_fire() {
             flags |= 1;
         }
-        // Effects (S7): invisibility (bit 5) and glowing (bit 6, `Glowing` flag or effect).
         // Cat, ocelot: sprint (bit 3) set by their own AI step.
         if self.surf.sprinting {
             flags |= 8;
         }
+        // Drowned: swimming (bit 4), under water while it wants to swim.
+        if self.kind == Kind::Drowned && self.aqua.swimming {
+            flags |= 0x10;
+        }
+        // Effects (S7): invisibility (bit 5) and glowing (bit 6, `Glowing` flag or effect).
         if self.invisible() {
             flags |= 0x20;
         }
         if self.x.glowing || self.x.effects.iter().any(|e| e.id == "minecraft:glowing") {
             flags |= 0x40;
         }
-        self.set(0, Meta::Byte(flags));
+        flags
+    }
+
+    /// Pose (index 6), decided once for every family (same reason as the shared flags).
+    fn synced_pose(&self) -> i32 {
+        if self.dead {
+            return 7; // dying wins over sleeping: death wakes the sleeper first
+        }
+        if let Some(p) = super::end::pose(self) {
+            return p; // F15: dragon struck dead (still flying)
+        }
+        // F10: own pose (jump, croak, tongue).
+        if super::brainy::handles(self.kind) || super::recent::handles(self.kind) {
+            return self.bm.pose;
+        }
+        if self.npc.as_ref().is_some_and(|n| n.sleeping.is_some()) {
+            return 2;
+        }
+        if super::mounts::is_camel(self.kind) {
+            return if self.mount.camel_sitting_pose { 10 } else { 0 };
+        }
+        let crouches = self.kind == Kind::Cat || super::surface::handles(self.kind);
+        if crouches && self.surf.crouching { 5 } else { 0 }
+    }
+
+    /// Copies the current state into the synced values (marked if changed).
+    pub fn sync_data(&mut self) {
+        self.set(0, Meta::Byte(self.synced_shared_flags()));
         // Name always shown, silent, no gravity.
         self.set(3, Meta::Bool(self.x.name_visible));
         self.set(4, Meta::Bool(self.x.silent));
+        // No gravity; the vex turns it on at the end of each of its ticks (`vex_post_tick`).
         self.set(5, Meta::Bool(self.surf.no_gravity));
         self.set(1, Meta::Int(self.air));
         self.set(7, Meta::Int(self.ticks_frozen));
         self.set(2, Meta::Text(self.custom_name.clone()));
-        // F10: own pose (jump, croak, tongue) set directly, without going back through 0
-        // (otherwise the value would be resent every tick).
-        let pose = if self.dead {
-            7
-        } else if let Some(p) = super::end::pose(self) {
-            p // F15: dragon struck dead (still flying)
-        } else if super::brainy::handles(self.kind) || super::recent::handles(self.kind) {
-            self.bm.pose
-        } else if self.kind == Kind::Cat && self.surf.crouching {
-            5
-        } else {
-            0
-        };
-        self.set(6, Meta::Pose(pose));
+        self.set(6, Meta::Pose(self.synced_pose()));
         self.set(9, Meta::Float(self.health));
         let mut mf = 0i8;
         if self.no_ai {

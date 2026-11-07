@@ -184,7 +184,8 @@ Angle `a` = `seg × 22.5` (on the ground / on the ceiling) or `rot_y(facing)` (o
   offset (1 px for bitmap fonts), colour `d`, without effects (underline…), drawn in "normal" mode,
   then the text on top.
 - Text drawing mode (and the text above the outline): "polygon offset" (world text pipeline,
-  translucent blending, depth test with write, slope bias 1, constant 10) — `text.md` § 6.
+  translucent blending, depth test with write, slope bias 1, constant 10) — `text.md` § 6. Both
+  modes keep the pipeline default of back faces culled: a face's text is never seen from behind.
 - **Range**: the common range of 64 blocks (§ 5); beyond it the text disappears, the plank stays
   (chunk mesh). No other threshold.
 

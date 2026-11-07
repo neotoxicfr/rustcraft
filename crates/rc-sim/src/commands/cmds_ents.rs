@@ -940,7 +940,7 @@ impl Server {
         let ids: Vec<String> = if let Some(t) = name.strip_prefix('#') {
             let t = args::id(t);
             match self.cmd.function_tags.get(&t) {
-                Some(v) => v.clone(),
+                Some(v) => v.to_vec(),
                 None => return Err(Fail(tr!("arguments.function.tag.unknown", t))),
             }
         } else {
@@ -957,8 +957,8 @@ impl Server {
         let mut functions = 0usize;
         let mut single = String::new();
         for id in &ids {
-            let Some(lines) = self.cmd.functions.get(id) else { continue };
-            total += lines.iter().filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#')).count();
+            let Some(f) = self.cmd.functions.get(id) else { continue };
+            total += f.line_texts().filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#')).count();
             functions += 1;
             single.clone_from(id);
             with_trace(|t| {

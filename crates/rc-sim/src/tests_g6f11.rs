@@ -196,6 +196,33 @@ fn bed_stand_up_beside_and_look() {
     finish(p, dir);
 }
 
+/// A villager killed in its sleep is woken first, like the game: no longer sleeping, bed
+/// freed, stood up beside it with zero pitch, wake-up time noted.
+#[test]
+fn villager_dying_in_bed_frees_it() {
+    let (mut p, dir) = open("vdie");
+    p.run("setblock 2 -60 0 minecraft:red_bed[facing=east,part=foot]\nsetblock 3 -60 0 minecraft:red_bed[facing=east,part=head]\n");
+    cmd(&mut p, "summon minecraft:villager 1.5 -60 1.5");
+    let head = [3, -60, 0];
+    let i = p.s.mobs.list.slots().iter().position(|m| m.as_ref().is_some_and(|m| m.kind == Kind::Villager));
+    let i = i.expect("villager");
+    let mut m = p.s.mobs.list.take(i).expect("villager");
+    assert!(p.s.start_sleeping(&mut m, head));
+    m.pitch = 20.0;
+    let occupied = |p: &Probe| p.s.view().get_bool(p.s.get(head), "occupied");
+    assert!(occupied(&p), "occupied while it sleeps");
+    p.s.mob_die(&mut m, "minecraft:generic", None);
+    assert!(m.dead);
+    assert_eq!(p.s.npc_sleeping(&m), None, "no longer sleeping");
+    assert!(!occupied(&p), "bed freed");
+    assert!(m.pos()[1] < -60.0 + 0.5625, "stood up, not lying on the bed");
+    assert_eq!(m.pitch, 0.0);
+    let woken = m.npc.as_ref().and_then(|n| n.brain.as_ref()).and_then(|b| b.mem.last_woken);
+    assert_eq!(woken, Some(p.s.time), "wake-up time noted");
+    p.s.mobs.list.put(i, m);
+    finish(p, dir);
+}
+
 /// Nether: the straw bed breaks without explosion ("on leave" sound), the ordinary bed explodes.
 #[test]
 fn nether_straw_bed_breaks_without_explosion() {

@@ -18,6 +18,9 @@ use crate::json::{self, Json};
 pub struct DataPack {
     /// Texts borrowed from the process's jar index (`rc_data::jar`), without copy.
     files: HashMap<String, Arc<str>>,
+    /// Density functions and noises of the pack, parsed at first need and shared by every
+    /// generator built from it (`RUSTCRAFT_OPT_SHARED_GENERATOR_DEFS`); forgotten when a file is added.
+    generator_defs: std::sync::OnceLock<Arc<crate::generator::Defs>>,
 }
 
 /// Index of the process's jar, errors converted (old form of the messages).
@@ -66,7 +69,7 @@ impl DataPack {
         if files.is_empty() {
             return Err(Error::Missing(format!("no generation data in {}", jar.display())));
         }
-        Ok(DataPack { files })
+        Ok(DataPack { files, generator_defs: Default::default() })
     }
 
     /// Old path: the jar re-read, each entry opened.
@@ -85,7 +88,7 @@ impl DataPack {
         if files.is_empty() {
             return Err(Error::Missing(format!("no generation data in {}", jar.display())));
         }
-        Ok(DataPack { files })
+        Ok(DataPack { files, generator_defs: Default::default() })
     }
 
     /// Reads the JSON of a root folder containing `data/` (extracted jar).
@@ -111,7 +114,7 @@ impl DataPack {
         if files.is_empty() {
             return Err(Error::Missing(format!("no generation data under {}", root.display())));
         }
-        Ok(DataPack { files })
+        Ok(DataPack { files, generator_defs: Default::default() })
     }
 
     /// Adds the reports `biome_parameters/<ns>/<name>.json` of a `reports/` folder.
@@ -130,12 +133,25 @@ impl DataPack {
                 self.files.insert(format!("biome_parameters/{nsn}:{stem}"), Arc::from(text));
             }
         }
+        self.generator_defs = Default::default();
         Ok(())
     }
 
     /// Adds or replaces a file (tests, data packs).
     pub fn insert(&mut self, key: &str, text: String) {
         self.files.insert(key.to_owned(), Arc::from(text));
+        self.generator_defs = Default::default();
+    }
+
+    /// Named density functions and noise parameters of the pack, parsed once and then shared by
+    /// every generator built from this pack (they do not depend on the seed).
+    pub fn generator_defs(&self) -> Result<Arc<crate::generator::Defs>, Error> {
+        if let Some(defs) = self.generator_defs.get() {
+            return Ok(defs.clone());
+        }
+        let defs = Arc::new(crate::generator::Defs::load(self)?);
+        // Two first callers at once both parse; the first stored copy is the one everybody keeps.
+        Ok(self.generator_defs.get_or_init(|| defs).clone())
     }
 
     pub fn raw(&self, kind: &str, id: &str) -> Option<&str> {

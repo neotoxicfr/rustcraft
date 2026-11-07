@@ -16,10 +16,33 @@ use crate::{
     tech_blocks, video, weather, world_sounds,
 };
 
+/// `[opt]` lines of the allocator settings applied at the start of `run`.
+fn log_allocator_settings(
+    commit: debug_sys::CommitOnDemand,
+    purge_delay: Option<i64>,
+    direct_calls: bool,
+    single_flag: bool,
+) {
+    use debug_sys::CommitOnDemand as C;
+    match commit {
+        C::Applied(on) => eprintln!("[opt] allocator pages committed on demand: {on}"),
+        C::UserVariable => eprintln!("[opt] allocator pages: user's MIMALLOC_PAGE_COMMIT_ON_DEMAND"),
+        C::NotInLibrary => eprintln!("[opt] allocator pages: no on-demand commit in this mimalloc (v2)"),
+    }
+    eprintln!("[opt] allocator: direct calls {direct_calls}, single flag {single_flag}, long purge delay {purge_delay:?}");
+    #[cfg(all(windows, feature = "mimalloc-win-direct-tls"))]
+    match debug_sys::free_tls_slot_probe() {
+        Some(slot) if slot < 64 => eprintln!("[opt] mimalloc direct TLS: lowest free slot {slot} (< 64)"),
+        slot => eprintln!("[opt] mimalloc direct TLS: lowest free slot {slot:?}, NOT below 64: build without the feature"),
+    }
+}
+
 /// Runs the game: arguments, startup steps, the event loop, then the shutdown.
 pub(crate) fn run() {
     // Before any large allocation: allocator pages committed on demand.
     let commit = debug_sys::commit_on_demand();
+    let purge_delay = debug_sys::long_purge_delay();
+    let (direct_calls, single_flag) = debug_sys::read_allocator_switches();
     alloc_trace::init();
     // Panic of any thread (integrated server included): crash report in the game's format.
     crash_report::install_hook();
@@ -42,10 +65,7 @@ pub(crate) fn run() {
     if let Some(s) = args.launch.summary() {
         eprintln!("{s}");
     }
-    match commit {
-        Some(on) => eprintln!("[opt] allocator pages committed on demand: {on}"),
-        None => eprintln!("[opt] allocator pages: user's MIMALLOC_PAGE_COMMIT_ON_DEMAND"),
-    }
+    log_allocator_settings(commit, purge_delay, direct_calls, single_flag);
     if let Some(a) = args.launch.account() {
         rc_client::auth::set_account(a);
     }

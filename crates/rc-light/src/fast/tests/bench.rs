@@ -206,20 +206,38 @@ fn start_world(t: &LightTables, base: &World, kind: &str) -> World {
 }
 
 /// Share of each phase of a sky resolution (zone read, sources + seeds,
-/// propagation, write), shipped sequential path, µs per group: where multi-core can win.
+/// propagation, write), sequential path without then with the C2-M02 switches (twice, A B A B),
+/// µs per group: where multi-core can win.
 #[test]
 #[ignore = "bench: cargo test --release -p rc-light bench_phases -- --ignored --nocapture"]
 fn bench_phases() {
     let t = tables();
     let base = bench_world(&t);
-    let o = Opts::from_bits(!super::DEFAULT_OFF & 0x7ff);
-    let c = Ctx { height: H, t: &t, o, count_queues: false };
+    // Sequential switches of C2-M03, then with those of C2-M02 (frontier seeding, step order),
+    // then without one of the seeding switches; the list, then the list backwards.
+    let shipped = 0x7ff | 0xf << 14;
+    let paths = [
+        ("before C2-M02", 0x7ff),
+        ("shipped", shipped),
+        ("shipped without LIGHTSEEDROWS", shipped & !(1 << 16)),
+        ("shipped without LIGHTMARGINFRONTIER", shipped & !(1 << 15)),
+        ("shipped without LIGHTLEVELFIRST", shipped & !(1 << 17)),
+    ];
+    for (label, bits) in paths.iter().chain(paths.iter().rev()) {
+        eprintln!("{label}:");
+        phases(&t, &base, Opts::from_bits(!super::DEFAULT_OFF & bits));
+    }
+}
+
+/// Phases of the sky resolutions of each trace with the switches `o`.
+fn phases(t: &LightTables, base: &World, o: Opts) {
+    let c = Ctx { height: H, t, o, count_queues: false };
     for kind in ["plains", "torches", "building", "slab", "spread"] {
-        let mut world = start_world(&t, &base, kind);
+        let mut world = start_world(t, base, kind);
         let mut ns = [0u128; 5];
         let mut cells = 0usize;
         let mut count = 0usize;
-        for step in trace(&base, kind) {
+        for step in trace(base, kind) {
             for undo in [false, true] {
                 let ps: Vec<[i32; 3]> = step.iter().map(|&(p, _)| p).collect();
                 for &(p, s) in &step {
@@ -273,7 +291,7 @@ fn bench_par() {
     let t = tables();
     let base = bench_world(&t);
     let seq = !super::DEFAULT_OFF & 0x7ff;
-    let o = |bits: u16, zero: bool| {
+    let o = |bits: u32, zero: bool| {
         let o = Opts::from_bits(seq | bits);
         if zero { Opts { join_min: 0, par_min: 0, ..o } } else { o }
     };
@@ -336,6 +354,138 @@ fn bench_par() {
                 paths.iter().zip(&bp).skip(1).map(|((name, _), b)| format!("{name} {:+.0} %", (b / bp[0] - 1.0) * 100.0)).collect();
             eprintln!("{kind:9} pool {n:2} threads: sequential {:9.1} µs; {}", bp[0], line.join(", "));
             n *= 2;
+        }
+    }
+}
+
+/// Switches of C2-M02 (frontier seeding, step order, parallel step): bits 14 to 21.
+const PROPAGATION_SWITCHES: u32 = 0xff << 14;
+
+/// Shipped switches, `LIGHTDEDUP` aside.
+fn shipped_bits() -> u32 {
+    !super::DEFAULT_OFF & ((1u32 << NAMES.len()) - 1) & !DEDUP
+}
+
+/// µs per relight of each path, best of `passes`, paths run forward then backward on
+/// alternate passes (A B B A: a slow phase of the machine weighs on every path alike).
+fn best_abba(t: &LightTables, world: &World, tr: &[Vec<([i32; 3], u32)>], paths: &[Opts], masked: bool, passes: usize) -> Vec<f64> {
+    let mut best = vec![f64::MAX; paths.len()];
+    for pass in 0..passes {
+        let order: Vec<usize> = if pass % 2 == 0 { (0..paths.len()).collect() } else { (0..paths.len()).rev().collect() };
+        for k in order {
+            best[k] = best[k].min(run(t, world, tr, Path::New(paths[k]), masked, 1));
+        }
+    }
+    best
+}
+
+/// C2-M02: shipped configuration with every C2-M02 switch off ("before"), shipped, each switch
+/// alone on "before" and all but it, then the thresholds (`LIGHTSPREADMIN`, `LIGHTPARMIN`,
+/// `LIGHTCHUNK`); outside a pool (calling thread and light pool: the game's case), then the
+/// light pool's size (pools of 1, 2, 4, 8 threads) for before and shipped. µs per relight, best of 7.
+/// `RUSTCRAFT_BENCH_KINDS=slab,redstone` keeps some traces.
+#[test]
+#[ignore = "bench: cargo test --release -p rc-light bench_propagation_switches -- --ignored --nocapture"]
+fn bench_propagation_switches() {
+    let t = tables();
+    let base = bench_world(&t);
+    let shipped = shipped_bits();
+    let before = shipped & !PROPAGATION_SWITCHES;
+    let on = Opts::from_bits(shipped);
+    let mut paths = vec![("before (C2-M02 off)".to_string(), Opts::from_bits(before)), ("shipped".to_string(), on)];
+    for (k, name) in NAMES.iter().enumerate().skip(14) {
+        paths.push((format!("{name} alone"), Opts::from_bits(before | 1 << k)));
+        paths.push((format!("all except {name}"), Opts::from_bits(shipped & !(1 << k))));
+    }
+    // The parallel step alone (inline, atomic view, kept queues): long fronts without the frontier.
+    paths.push(("parallel step (3 switches) alone".into(), Opts::from_bits(before | 0x7 << 18)));
+    for spread_min in [2048, 32_768, usize::MAX] {
+        paths.push((format!("LIGHTSPREADMIN={spread_min}"), Opts { spread_min, ..on }));
+    }
+    for par_min in [131_072, usize::MAX] {
+        paths.push((format!("LIGHTPARMIN={par_min}"), Opts { par_min, ..on }));
+    }
+    for chunk in [1024, 4096] {
+        paths.push((format!("LIGHTCHUNK={chunk}"), Opts { chunk, ..on }));
+    }
+    let opts: Vec<Opts> = paths.iter().map(|(_, o)| *o).collect();
+    let only = rc_data::env_str!("RUSTCRAFT_BENCH_KINDS");
+    for kind in ["plains", "torches", "cave", "redstone", "building", "water", "slab", "spread"] {
+        if only.is_some_and(|k| !k.split(',').any(|x| x == kind)) {
+            continue;
+        }
+        let world = start_world(&t, &base, kind);
+        let tr = trace(&base, kind);
+        let masked = kind == "redstone";
+        let best = best_abba(&t, &world, &tr, &opts, masked, 7);
+        for ((name, _), b) in paths.iter().zip(&best) {
+            eprintln!("{kind:9} outside pool {name:34} {b:9.1} µs ({:+.1} % against before)", (b / best[0] - 1.0) * 100.0);
+        }
+        for n in [1, 2, 4, 8] {
+            let pool = super::pool(n);
+            let b = pool.install(|| best_abba(&t, &world, &tr, &opts[..2], masked, 5));
+            eprintln!("{kind:9} pool {n} threads: before {:9.1} µs, shipped {:9.1} µs ({:+.1} %)", b[0], b[1], (b[1] / b[0] - 1.0) * 100.0);
+        }
+    }
+}
+
+/// Queue entries per relight with the C2-M02 seeding off and on (deterministic: any machine),
+/// sky and block, on the micro-bench traces; same sheets checked at every relight.
+#[test]
+#[ignore = "bench: cargo test --release -p rc-light bench_queue_entries -- --ignored --nocapture"]
+fn bench_queue_entries() {
+    let t = tables();
+    let base = bench_world(&t);
+    let shipped = shipped_bits();
+    let before = Opts::from_bits(shipped & !PROPAGATION_SWITCHES);
+    let paths = [("before", before), ("shipped", Opts::from_bits(shipped))];
+    for kind in ["plains", "torches", "cave", "redstone", "building", "water", "slab", "spread"] {
+        let world = start_world(&t, &base, kind);
+        let tr = trace(&base, kind);
+        let masked = kind == "redstone";
+        let mut sheets = Vec::new();
+        for (name, o) in paths {
+            // Decided by the calling thread for the whole relight, pool threads included.
+            crate::stats::force_queue_counting(Some(true));
+            let q0 = crate::stats::queues();
+            let mut w = world.clone();
+            replay_micro(&t, &mut w, &tr, o, masked);
+            let q = crate::stats::queues().since(&q0);
+            crate::stats::force_queue_counting(None);
+            sheets.push(w);
+            let n = (2 * tr.len()) as f64;
+            for (label, k) in [("sky", crate::stats::SKY), ("block", crate::stats::BLOCK)] {
+                let seeded: u64 = q.seeded[k].iter().sum();
+                let queued: u64 = q.queued[k].iter().sum();
+                eprintln!(
+                    "{kind:9} {name:8} {label:5} per relight: seeded {:9.0} (at 15: {:9.0}), entries {:9.0}, cells {:9.0}",
+                    seeded as f64 / n,
+                    q.seeded[k][15] as f64 / n,
+                    queued as f64 / n,
+                    q.cells[k] as f64 / n
+                );
+            }
+        }
+        assert!(sheets[0] == sheets[1], "{kind}: sheets differ");
+    }
+}
+
+/// Replays a micro-bench trace (each step then its inverse) with the switches `o`.
+fn replay_micro(t: &LightTables, w: &mut World, tr: &[Vec<([i32; 3], u32)>], o: Opts, masked: bool) {
+    for step in tr {
+        for undo in [false, true] {
+            let mut ps = Vec::new();
+            let mut sky = Vec::new();
+            for &(p, s) in step {
+                let s = if undo { if s == LAMP_ON { LAMP_OFF } else { 0 } } else { s };
+                let old = set(w, p, s).unwrap_or(0);
+                ps.push(p);
+                if t.matters_sky(old, s) {
+                    sky.push(p);
+                }
+            }
+            let mut out = [Touched::new()];
+            relight_zones(w, H, t, true, &ps, masked.then_some(&sky[..]), o, &mut out);
         }
     }
 }

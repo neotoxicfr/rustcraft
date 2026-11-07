@@ -83,10 +83,10 @@ impl Server {
         let flags = flag::CLIENTS | if strict { 816 } else { flag::SKIP_BE_SIDE_EFFECTS };
         let mut affected = self.set_block(p, st, flags);
         if let Some(n) = &b.nbt
-            && let Some(before) = self.be_get(p).cloned()
+            && let Some(before) = self.live_block_data(p)
         {
             self.load_block_data(p, n.clone());
-            if !self.be_get(p).is_some_and(|after| crate::items::nbt_eq(after, &before)) {
+            if !self.live_block_data(p).is_some_and(|after| crate::items::nbt_eq(&after, &before)) {
                 affected = true;
                 self.send_block_entity(p);
             }
@@ -267,7 +267,8 @@ impl Server {
                             continue;
                         }
                         let info = me.view().info(st);
-                        if let Some(be) = me.be_get(sp).cloned() {
+                        // The live data: a furnace's NBT lags until the save.
+                        if let Some(be) = me.live_block_data(sp) {
                             l.1.push((dp, st, Some(be), 0));
                             l.3.push_back(sp);
                         } else if !info.has(rc_data::flags::SOLID_RENDER) && !info.has(rc_data::flags::FULL_COLLISION) {

@@ -606,8 +606,7 @@ impl DebugScreen {
         }
         self.any_active = self.active.iter().any(|&a| a);
         self.version += 1;
-        crate::debug_sys::COUNT_ALLOCS
-            .store(self.is_on("memory") || self.is_on("detailed_memory"), std::sync::atomic::Ordering::Relaxed);
+        crate::debug_sys::count_allocated_bytes(self.is_on("memory") || self.is_on("detailed_memory"));
     }
 
     /// Active entry (status, overlay, reduced info).

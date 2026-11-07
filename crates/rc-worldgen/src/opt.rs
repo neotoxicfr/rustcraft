@@ -202,7 +202,7 @@ switch!(
 /// Flattened biome tree: distances of the children in AVX2, if the processor has it.
 #[inline]
 pub fn btree_simd() -> bool {
-    static S: LazyLock<bool> = LazyLock::new(|| on(&["RUSTCRAFT_OPT_BTREE_SIMD"]) && avx2_available());
+    static S: LazyLock<bool> = LazyLock::new(|| on(&["RUSTCRAFT_OPT_BTREE_SIMD"]) && rc_data::cpu::has_avx2());
     *S
 }
 
@@ -645,18 +645,41 @@ switch_f!(
 /// Vectorised kernel compiled for AVX2, if the processor has it (detection done once).
 #[inline]
 pub fn noise_avx2() -> bool {
-    static S: LazyLock<bool> = LazyLock::new(|| on(&["RUSTCRAFT_OPT_NOISE_AVX2"]) && avx2_available());
+    static S: LazyLock<bool> = LazyLock::new(|| on(&["RUSTCRAFT_OPT_NOISE_AVX2"]) && rc_data::cpu::has_avx2());
     *S
 }
 
-/// AVX2 present on this processor.
-pub fn avx2_available() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        std::arch::is_x86_feature_detected!("avx2")
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        false
-    }
-}
+switch_f!(
+    /// Named density functions and noise parameters of a data pack parsed once and shared by every
+    /// generator built from that pack, instead of once per generator (four or more per dimension).
+    shared_generator_defs,
+    "SHARED_GENERATOR_DEFS"
+);
+switch_f!(
+    /// Biome parameter list of a preset parsed once per world data, then copied into each generator.
+    shared_climate_lists,
+    "SHARED_CLIMATE_LISTS"
+);
+switch_f!(
+    /// Processor lists built once per world data and shared by every decorator and structure
+    /// generator, instead of twice per generator with structures.
+    shared_proc_lists,
+    "SHARED_PROC_LISTS"
+);
+switch_f!(
+    /// Noise settings file parsed once per generator: the spawn targets are read from the copy kept
+    /// by the settings instead of parsing the file a second time.
+    noise_settings_read_once,
+    "NOISE_SETTINGS_READ_ONCE"
+);
+switch_f!(
+    /// Noise instance already created: found before its parameters are copied.
+    noise_lookup_before_clone,
+    "NOISE_LOOKUP_BEFORE_CLONE"
+);
+switch_f!(
+    /// Spawn search on the climate noise: the points of a spiral evaluated on every core, the best
+    /// one then picked in spiral order (same point as one at a time).
+    parallel_spawn_search,
+    "PARALLEL_SPAWN_SEARCH"
+);

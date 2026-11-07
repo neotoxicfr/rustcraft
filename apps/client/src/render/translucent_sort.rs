@@ -231,6 +231,10 @@ pub(super) fn eye_in_column(eye: [f64; 3], column: (i32, i32), min_y: i32) -> [f
     ]
 }
 
+/// Perf log: translucent columns examined by the re-sort per frame (by viewpoint: the nearby ones and
+/// the rotation; old rule: every column of the list while one is unsorted).
+const EXAMINED_COUNTER: &str = "translucent_columns_examined_per_frame";
+
 /// `RUSTCRAFT_SORTALL=1`: all the translucent columns re-sorted (comparison).
 pub(super) fn sort_all() -> bool {
     rc_data::env_flag!("RUSTCRAFT_SORTALL")
@@ -267,11 +271,13 @@ impl Renderer {
                 let (sy0, how) = (min_y.div_euclid(16), trans_key());
                 let scratch = &mut self.sort_scratch;
                 let mut secs = Vec::new();
+                let mut examined = 0;
                 for k in picks {
                     let Some(c) = self.columns.get_mut(&k) else { continue };
                     if c.trans_centers.is_empty() {
                         continue;
                     }
+                    examined += 1;
                     pov_resorts(&mut c.povs, &c.trans_starts, eye, k, sy0, moved, &mut secs);
                     let (e, st, base) = (eye_in_column(eye, k, min_y), &c.trans_starts, c.fluid_ranges[2].start);
                     let mut i = 0;
@@ -301,6 +307,7 @@ impl Renderer {
                     }
                 }
                 self.sort_cursor = next;
+                crate::perf_log::counter(EXAMINED_COUNTER, examined);
             }
         } else {
             if moved {
@@ -309,6 +316,7 @@ impl Renderer {
             let keys = if self.unsorted > 0 { std::mem::take(&mut self.trans_keys) } else { Vec::new() };
             let mut budget = (keys.len() / 8).max(15);
             let n = keys.len();
+            crate::perf_log::counter(EXAMINED_COUNTER, n as u64);
             for step in 0..n {
                 let k = keys[(self.sort_cursor + step) % n];
                 let near = (k.0 - cam_col.0).abs() <= 1 && (k.1 - cam_col.1).abs() <= 1;

@@ -10,13 +10,13 @@
 use std::ops::Range;
 use std::sync::OnceLock;
 
-use glam::{Vec3, Vec4};
+use glam::Vec4;
 use hashbrown::HashMap;
 
 use rc_mesh::blocks::BUCKETS;
 
 use super::column_upload::ColumnGpu;
-use super::frustum::{aabb_inside, aabb_visible, facing};
+use super::frustum::{aabb_inside, aabb_visible, column_box, facing, section_box};
 use super::{Batch, DrawArgs, TRANS_KEY};
 
 fn switch(cell: &'static OnceLock<bool>, name: &str) -> bool {
@@ -280,23 +280,17 @@ fn refresh_order(inp: &ListIn<'_>, out: &mut Lists, key: OrderKey) {
 /// Runs of sections of column `k` (reached sections `secs`, increasing height) whose
 /// box (one block of margin: a model can overflow) is in the field of view, added to `runs`.
 fn column_runs(inp: &ListIn<'_>, k: (i32, i32), secs: &[(i32, i32, i32)], runs: &mut Vec<Range<usize>>) {
-    let (x, z) = k;
     let planes = inp.planes;
     // Box of the whole column: out of the field, all its sections are; entirely inside the
     // field, all are in it, without a per-section test.
-    let col_min = Vec3::new((x * 16 - inp.origin[0]) as f32, inp.min_y as f32, (z * 16 - inp.origin[1]) as f32) - 1.0;
-    let col_max = col_min + Vec3::new(18.0, (inp.sections * 16) as f32 + 2.0, 18.0);
+    let (col_min, col_max) = column_box(inp.origin, inp.min_y, inp.sections, k);
     let column_in = if aabb_visible(planes, col_min, col_max) { Some(aabb_inside(planes, col_min, col_max)) } else { None };
     let Some(all) = column_in else { return };
     let mut open: Option<(usize, usize)> = None;
     for &(_, sy, _) in secs {
         if !all {
-            let min = Vec3::new(
-                (x * 16 - inp.origin[0]) as f32,
-                (inp.min_y + sy * 16) as f32,
-                (z * 16 - inp.origin[1]) as f32,
-            ) - 1.0;
-            if !aabb_visible(planes, min, min + Vec3::splat(18.0)) {
+            let (min, max) = section_box(inp.origin, inp.min_y, k, sy);
+            if !aabb_visible(planes, min, max) {
                 continue;
             }
         }

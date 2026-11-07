@@ -1275,6 +1275,16 @@ impl Server {
         b.mem.last_woken = Some(self.time);
     }
 
+    /// `stop_sleeping` for a villager whose brain is still in place (bed kicked, death).
+    pub(crate) fn npc_wake(&mut self, m: &mut Mob) {
+        if let Some(mut b) = m.npc.as_mut().and_then(|n| n.brain.take()) {
+            self.stop_sleeping(m, &mut b);
+            if let Some(n) = m.npc.as_mut() {
+                n.brain = Some(b);
+            }
+        }
+    }
+
     // ---------- Life cycle ----------
 
     /// Trader state of a new or read-back mob, villager brain.
@@ -1529,29 +1539,17 @@ pub fn copy_trade(from: &Mob, to: &mut Mob) {
     }
 }
 
-/// Trader metadata: unhappiness (18), data (19, 20), sleep (pose, bed).
+/// Trader metadata: unhappiness (18), drinking (8), bed (14); the villager data (19, 20) and
+/// the sleeping pose are common values.
 pub fn sync_data(m: &mut Mob) {
     let Some(n) = &m.npc else { return };
     let (unhappy, sleeping) = (n.unhappy, n.sleeping);
     m.set(18, Meta::Int(unhappy));
-    if m.kind == Kind::Villager {
-        m.set(20, Meta::Bool(m.x.vdata_final));
-    }
     if m.kind == Kind::WanderingTrader {
         let drinking = m.npc.as_ref().is_some_and(|n| n.drinking > 0);
         m.set(8, Meta::Byte(i8::from(drinking)));
     }
-    if m.x.effects.iter().any(|e| e.id == "minecraft:invisibility")
-        && let Some(Meta::Byte(f)) = m.data.iter().find(|s| s.index == 0).map(|s| s.value.clone())
-    {
-        m.set(0, Meta::Byte(f | 0x20));
-    }
-    if let Some(bed) = sleeping {
-        m.set(6, Meta::Pose(2));
-        m.set(14, Meta::BlockPos(Some(bed)));
-    } else {
-        m.set(14, Meta::BlockPos(None));
-    }
+    m.set(14, Meta::BlockPos(sleeping));
 }
 
 /// Reading the trader fields.

@@ -11,6 +11,7 @@ use rc_proto_v777::entity::{AddEntity, Meta};
 
 use crate::items::same;
 use crate::menus::inventory_add;
+use crate::mobs::combat::same_identifier;
 use crate::mobs::recent::vibration::Src;
 use crate::nbtio::int;
 use crate::player::Stack;
@@ -25,6 +26,85 @@ thread_local! {
     /// Tests: forces `RUSTCRAFT_OPT_ITEM_RUNS=0` in this thread (equivalence of the two ways,
     /// `tests_l10order`), without touching the environment.
     pub(crate) static ONE_BY_ONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests: the switches of the ground items used by this thread (every combination of the
+    /// equivalence proofs), without touching the environment.
+    pub(crate) static FORCED_SWITCHES: std::cell::Cell<Option<DropSwitches>> = const { std::cell::Cell::new(None) };
+    /// Tests: merge queries answered by the grid in this thread (proof that a test went that way).
+    pub(crate) static GRID_QUERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Tests: items read by the merges of this thread (the pairs tested, whatever the way): a
+    /// count of the work that does not depend on the machine's load.
+    pub(crate) static MERGE_PAIRS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// One more pair read by a merge (tests only, `MERGE_PAIRS`).
+#[inline]
+fn count_merge_pair() {
+    #[cfg(test)]
+    MERGE_PAIRS.with(|n| n.set(n.get() + 1));
+}
+
+/// Optimization switches of the ground items and orbs (`docs/perf.md`, ground items), each read
+/// once at the first use: on by default, `=0` takes the former way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DropSwitches {
+    /// `RUSTCRAFT_OPT_ITEM_MERGE_EARLY_EXIT`: an item that can never merge (pickup blocked,
+    /// eternal, too old, full) skips its merge; otherwise its stack size is read once per merge
+    /// and the distance is tested before the rest of each pair.
+    pub merge_early_exit: bool,
+    /// `RUSTCRAFT_OPT_ITEM_MERGE_LIVE_PREFILTER`: in a run, the distance is tested on the compact
+    /// positions kept for the plates (`contact.live_items`) before an item is touched.
+    pub merge_live_prefilter: bool,
+    /// `RUSTCRAFT_OPT_ITEM_MERGE_GRID`: in a long run, the merge candidates come from a grid of
+    /// the items by column (`ItemGrid`) instead of the whole list.
+    pub merge_grid: bool,
+    /// `RUSTCRAFT_OPT_ITEM_PICKUP_IN_PLACE`: a pickup stores the stack straight into the
+    /// inventory instead of trying it first on a copy of the 46 slots.
+    pub pickup_in_place: bool,
+    /// `RUSTCRAFT_OPT_BODY_POOL`: the physics bodies of removed items and orbs are kept for the
+    /// next ones instead of being freed and allocated again.
+    pub body_pool: bool,
+    /// `RUSTCRAFT_OPT_ENTITY_SAVE_LENT`: a saved entity chunk encodes the entities kept as read
+    /// from their own list instead of from clones.
+    pub save_lent: bool,
+}
+
+impl DropSwitches {
+    /// Every optimization on (the default).
+    #[cfg(test)]
+    pub(crate) const ALL_ON: DropSwitches = DropSwitches {
+        merge_early_exit: true,
+        merge_live_prefilter: true,
+        merge_grid: true,
+        pickup_in_place: true,
+        body_pool: true,
+        save_lent: true,
+    };
+    /// Every optimization off (the former code).
+    #[cfg(test)]
+    pub(crate) const ALL_OFF: DropSwitches = DropSwitches {
+        merge_early_exit: false,
+        merge_live_prefilter: false,
+        merge_grid: false,
+        pickup_in_place: false,
+        body_pool: false,
+        save_lent: false,
+    };
+
+    pub(crate) fn current() -> DropSwitches {
+        #[cfg(test)]
+        if let Some(forced) = FORCED_SWITCHES.with(std::cell::Cell::get) {
+            return forced;
+        }
+        static SWITCHES: std::sync::OnceLock<DropSwitches> = std::sync::OnceLock::new();
+        *SWITCHES.get_or_init(|| DropSwitches {
+            merge_early_exit: rc_data::opt_switch!("RUSTCRAFT_OPT_ITEM_MERGE_EARLY_EXIT"),
+            merge_live_prefilter: rc_data::opt_switch!("RUSTCRAFT_OPT_ITEM_MERGE_LIVE_PREFILTER"),
+            merge_grid: rc_data::opt_switch!("RUSTCRAFT_OPT_ITEM_MERGE_GRID"),
+            pickup_in_place: rc_data::opt_switch!("RUSTCRAFT_OPT_ITEM_PICKUP_IN_PLACE"),
+            body_pool: rc_data::opt_switch!("RUSTCRAFT_OPT_BODY_POOL"),
+            save_lent: rc_data::opt_switch!("RUSTCRAFT_OPT_ENTITY_SAVE_LENT"),
+        })
+    }
 }
 
 /// `RUSTCRAFT_OPT_ITEM_RUNS=N` (default 8): in the entity walk, a run of items or orbs of at least
@@ -44,6 +124,10 @@ fn one_by_one(start: usize, stop: usize, len: usize) -> bool {
     let n = item_run_divisor();
     n == 0 || (stop - start) * n < len
 }
+
+/// Bodies of removed items and orbs kept for the next ones (about 300 bytes each): enough for a
+/// farm's births of a tick, bounded after a big wave of removals.
+const SPARE_BODIES: usize = 1024;
 
 /// Physics of a server item or orb (authoritative instance).
 fn server_body(pos: [f64; 3], vel: [f64; 3], size: f64, eye: f64) -> Box<Body> {
@@ -271,6 +355,121 @@ fn crosses(a: &Aabb, b: &Aabb) -> bool {
     (0..3).all(|i| a.min[i] < b.max[i] && a.max[i] > b.min[i])
 }
 
+/// The game's merge reach of a ground item at `pos`: its box inflated by 0.5 horizontally. A
+/// neighbour merges only if its own box crosses it (`crosses`: boxes that only touch do not).
+fn merge_reach(pos: [f64; 3]) -> Aabb {
+    let b = bbox(pos, ITEM_SIZE);
+    Aabb { min: [b.min[0] - 0.5, b.min[1], b.min[2] - 0.5], max: [b.max[0] + 0.5, b.max[1], b.max[2] + 0.5] }
+}
+
+/// A ground item that may merge, for a stack size of `max`: neither pickup blocked (32767)
+/// nor eternal (age −32768), not too old, not full.
+fn may_merge(e: &ItemEnt, max: i32) -> bool {
+    !e.removed && e.pickup_delay != 32767 && e.age != -32768 && e.age < LIFETIME && e.stack.count < max
+}
+
+/// Slot `j` of a run's list whose slot `i` is taken out (`left`: the slots before it, `right`:
+/// those after).
+fn run_slot<'a>(left: &'a mut [ItemEnt], right: &'a mut [ItemEnt], i: usize, j: usize) -> &'a mut ItemEnt {
+    if j < i { &mut left[j] } else { &mut right[j - i - 1] }
+}
+
+/// Length of a run's list from which the merge candidates come from the grid: below, testing
+/// the compact positions of every slot costs about as much as building the grid.
+const ITEM_GRID_FROM: usize = 64;
+
+/// Merge candidates of a long run of items (`RUSTCRAFT_OPT_ITEM_MERGE_GRID`): the slots of the
+/// run's list by column of 2 × 2 blocks, read from the live positions of the plates
+/// (`contact.live_items`). Built at the run's first due merge, then it follows the ticked item
+/// when it changes column (`item_seen`) or goes: nothing else moves an item of a run, its list
+/// is taken out. A column holds its slots in any order; the candidates are sorted back into list
+/// order, the order the merges of a stack depend on.
+#[derive(Debug, Default)]
+pub(crate) struct ItemGrid {
+    /// Built for the run in progress.
+    built: bool,
+    columns: hashbrown::HashMap<(i32, i32), Vec<u32>>,
+    /// Column of each slot of the run's list, `None` once the item is gone.
+    column_of: Vec<Option<(i32, i32)>>,
+    /// Slots found by the last `near` (buffer kept from one query to the next).
+    candidates: Vec<u32>,
+}
+
+impl ItemGrid {
+    /// Column of an x or z coordinate: 2 blocks wide, so the candidates of a merge (within 0.75,
+    /// plus a margin for rounding) span at most two columns on each axis.
+    fn column(c: f64) -> i32 {
+        (c * 0.5).floor() as i32
+    }
+
+    /// For a new run: built again at its first due merge.
+    pub(crate) fn reset(&mut self) {
+        self.built = false;
+    }
+
+    fn build(&mut self, live: &[([f64; 3], bool)]) {
+        // Columns kept with their buffers from one run to the next; a map grown far beyond the
+        // run's items (a scattered list before) is dropped.
+        if self.columns.len() > 2 * live.len() + 64 {
+            self.columns.clear();
+        }
+        for slots in self.columns.values_mut() {
+            slots.clear();
+        }
+        self.column_of.clear();
+        for (j, &(pos, gone)) in live.iter().enumerate() {
+            let column = (!gone).then(|| (Self::column(pos[0]), Self::column(pos[2])));
+            if let Some(c) = column {
+                self.columns.entry(c).or_default().push(j as u32);
+            }
+            self.column_of.push(column);
+        }
+        self.built = true;
+    }
+
+    /// The item of slot `j` is now at `pos`, or gone.
+    fn moved(&mut self, j: usize, pos: [f64; 3], gone: bool) {
+        if !self.built {
+            return;
+        }
+        let new = (!gone).then(|| (Self::column(pos[0]), Self::column(pos[2])));
+        let Some(old) = self.column_of.get_mut(j).map(|c| std::mem::replace(c, new)) else { return };
+        if old == new {
+            return;
+        }
+        if let Some(slots) = old.and_then(|c| self.columns.get_mut(&c))
+            && let Some(k) = slots.iter().position(|&s| s as usize == j)
+        {
+            slots.swap_remove(k);
+        }
+        if let Some(c) = new {
+            self.columns.entry(c).or_default().push(j as u32);
+        }
+    }
+
+    /// Slots whose live position puts their box across `reach`, in list order, into
+    /// `candidates`; returns their number.
+    fn near(&mut self, reach: &Aabb, live: &[([f64; 3], bool)]) -> usize {
+        #[cfg(test)]
+        GRID_QUERIES.with(|n| n.set(n.get() + 1));
+        self.candidates.clear();
+        // A crossing box has its center within half its width (0.125) of the reach: a whole item
+        // size leaves room for rounding.
+        let margin = ITEM_SIZE;
+        let (x0, x1) = (Self::column(reach.min[0] - margin), Self::column(reach.max[0] + margin));
+        let (z0, z1) = (Self::column(reach.min[2] - margin), Self::column(reach.max[2] + margin));
+        for cx in x0..=x1 {
+            for cz in z0..=z1 {
+                let Some(slots) = self.columns.get(&(cx, cz)) else { continue };
+                let crossing = |&&j: &&u32| live.get(j as usize).is_some_and(|l| crosses(&bbox(l.0, ITEM_SIZE), reach));
+                self.candidates.extend(slots.iter().filter(crossing));
+            }
+        }
+        self.candidates.sort_unstable();
+        self.candidates.len()
+    }
+}
+
 /// G5-F05: orb `i` absorbs the orbs whose box crosses its own inflated by 0.5, of the same value
 /// and with an identifier congruent modulo 40: counts added, youngest age kept, the others removed.
 /// `candidates`: indices to test (all, or those of its residue modulo 40).
@@ -336,10 +535,7 @@ fn burn_step(fire: &mut i32, immune: bool, in_lava: bool) -> bool {
 
 impl Server {
     fn entity_kind(&self, name: &str) -> i32 {
-        self.data
-            .registry("minecraft:entity_type")
-            .and_then(|r| r.entries.iter().position(|e| e == name))
-            .map_or(0, |i| i as i32)
+        self.entity_kind_id(name)
     }
 
     fn new_entity_id(&mut self) -> i32 {
@@ -371,6 +567,7 @@ impl Server {
         let _ = self.send(Event::Entity(EntityEvent::Add(Box::new(add))));
         let net = self.net(Some(&stack));
         let _ = self.send(Event::Entity(EntityEvent::Data { id, values: vec![(8, Meta::Item(net))] }));
+        let body = self.new_body(pos, vel, ITEM_SIZE, 0.2125);
         self.life.drops.push(ItemEnt {
             id,
             stack,
@@ -384,7 +581,7 @@ impl Server {
             track: Default::default(),
             removed: false,
             health: 5,
-            body: server_body(pos, vel, ITEM_SIZE, 0.2125),
+            body,
             thrower: None,
             yaw,
             fire: 0,
@@ -540,6 +737,7 @@ impl Server {
         };
         let _ = self.send(Event::Entity(EntityEvent::Add(Box::new(add))));
         let _ = self.send(Event::Entity(EntityEvent::Data { id, values: vec![(8, Meta::Int(v))] }));
+        let body = self.new_body(pos, vel, ORB_SIZE, 0.425);
         self.life.orbs.push(Orb {
             id,
             value: v,
@@ -552,7 +750,7 @@ impl Server {
             track: Default::default(),
             removed: false,
             health: 5,
-            body: server_body(pos, vel, ORB_SIZE, 0.425),
+            body,
             fire: 0,
             fire_flag: false,
             rank: crate::walk::next_rank(),
@@ -601,7 +799,7 @@ impl Server {
         let _ = self.send(Event::Entity(EntityEvent::Add(Box::new(add))));
         let _ = self.send(Event::Entity(EntityEvent::Data { id, values: vec![(8, Meta::Int(value))] }));
         let (fire, on_ground, fall, common) = nbt.map(read_common).unwrap_or_default();
-        let mut body = server_body(pos, vel, ORB_SIZE, 0.425);
+        let mut body = self.new_body(pos, vel, ORB_SIZE, 0.425);
         body.fall = fall;
         self.life.orbs.push(Orb {
             id,
@@ -807,6 +1005,7 @@ impl Server {
         live.extend(drops.iter().map(|d| (d.pos, d.removed)));
         self.contact.live_items = live;
         self.contact.items_taken = true;
+        self.walk.item_grid.reset();
         for i in start..stop.min(drops.len()) {
             let (left, rest) = drops.split_at_mut(i);
             let (d, right) = rest.split_first_mut().expect("slot of the run");
@@ -814,6 +1013,7 @@ impl Server {
                 self.item_tick(d, i, Some([left, right]));
             }
         }
+        self.walk.item_grid.reset();
         self.contact.items_taken = false;
         self.contact.live_items.clear();
         drops.append(&mut self.life.drops);
@@ -861,6 +1061,7 @@ impl Server {
             if let Some(l) = self.contact.live_items.get_mut(i) {
                 *l = (pos, gone);
             }
+            self.walk.item_grid.moved(i, pos, gone);
         } else {
             self.contact.ticking_item = Some((pos, gone));
         }
@@ -950,15 +1151,109 @@ impl Server {
     /// equal counts), stops once `d` is gone. `taken`: see `item_tick`; the items it removes are
     /// marked in `contact.live_items` for the plates.
     fn item_merge(&mut self, d: &mut ItemEnt, i: usize, taken: Option<[&mut [ItemEnt]; 2]>) {
+        let switches = DropSwitches::current();
+        if !switches.merge_early_exit {
+            return self.item_merge_every_pair(d, i, taken);
+        }
+        // These never change while `d` merges: an item that cannot merge now never will this tick.
+        let max = self.life.items.max_stack(&d.stack);
+        if !may_merge(d, max) {
+            return;
+        }
+        let reach = merge_reach(d.pos);
         // In place: the whole list (placeholder in slot `i`); run: the items born since it began.
+        let mut rest = std::mem::take(&mut self.life.drops);
+        if let Some(run) = taken {
+            self.item_merge_in_run(d, i, run, &reach, max, switches);
+        }
+        if !d.removed {
+            for o in &mut rest {
+                self.item_merge_with(d, o, &reach, max);
+                if d.removed {
+                    break;
+                }
+            }
+        }
+        rest.append(&mut self.life.drops);
+        self.life.drops = rest;
+    }
+
+    /// The part of `item_merge` over the list of a run (`d` taken from slot `i`, the other
+    /// slots in `run`): candidates from the grid of a long run, otherwise every slot, the
+    /// distance tested on the compact live positions first.
+    fn item_merge_in_run(
+        &mut self,
+        d: &mut ItemEnt,
+        i: usize,
+        [left, right]: [&mut [ItemEnt]; 2],
+        reach: &Aabb,
+        max: i32,
+        switches: DropSwitches,
+    ) {
+        let len = left.len() + 1 + right.len();
+        if switches.merge_grid && len >= ITEM_GRID_FROM {
+            let mut grid = std::mem::take(&mut self.walk.item_grid);
+            if !grid.built {
+                grid.build(&self.contact.live_items);
+            }
+            let found = grid.near(reach, &self.contact.live_items);
+            for k in 0..found {
+                let j = grid.candidates[k] as usize;
+                if j != i && self.item_merge_with(d, run_slot(left, right, i, j), reach, max) {
+                    self.item_gone_in_run(j);
+                    grid.moved(j, [0.0; 3], true);
+                }
+                if d.removed {
+                    break;
+                }
+            }
+            self.walk.item_grid = grid;
+            return;
+        }
+        for j in (0..len).filter(|&j| j != i) {
+            // The live position of a slot is that of its item (only the ticked one moves in a run).
+            let far = switches.merge_live_prefilter
+                && self.contact.live_items.get(j).is_some_and(|l| !crosses(&bbox(l.0, ITEM_SIZE), reach));
+            if !far && self.item_merge_with(d, run_slot(left, right, i, j), reach, max) {
+                self.item_gone_in_run(j);
+            }
+            if d.removed {
+                break;
+            }
+        }
+    }
+
+    /// The item of slot `j` of the run in progress was absorbed whole: the plates no longer see it.
+    fn item_gone_in_run(&mut self, j: usize) {
+        if let Some(l) = self.contact.live_items.get_mut(j) {
+            l.1 = true;
+        }
+    }
+
+    /// One merge between the ticking item `d` (mergeable, stack size `max`, merge reach `reach`)
+    /// and `o`; true when `o` was absorbed whole. Cheapest tests first: removal, then distance.
+    fn item_merge_with(&mut self, d: &mut ItemEnt, o: &mut ItemEnt, reach: &Aabb, max: i32) -> bool {
+        count_merge_pair();
+        if o.removed
+            || !crosses(&bbox(o.pos, ITEM_SIZE), reach)
+            || !may_merge(o, max)
+            || d.stack.count >= max
+            || d.stack.count + o.stack.count > max
+            || !same(&d.stack, &o.stack)
+        {
+            return false;
+        }
+        self.merge_stacks(d, o, max)
+    }
+
+    /// `item_merge` before `RUSTCRAFT_OPT_ITEM_MERGE_EARLY_EXIT`: every pair tested in full.
+    fn item_merge_every_pair(&mut self, d: &mut ItemEnt, i: usize, taken: Option<[&mut [ItemEnt]; 2]>) {
         let mut rest = std::mem::take(&mut self.life.drops);
         if let Some([left, right]) = taken {
             let slots = left.iter_mut().enumerate().chain(right.iter_mut().enumerate().map(|(k, o)| (i + 1 + k, o)));
             for (j, o) in slots {
-                if self.item_merge_pair(d, o)
-                    && let Some(l) = self.contact.live_items.get_mut(j)
-                {
-                    l.1 = true;
+                if self.item_merge_pair(d, o) {
+                    self.item_gone_in_run(j);
                 }
                 if d.removed {
                     break;
@@ -977,26 +1272,28 @@ impl Server {
         self.life.drops = rest;
     }
 
-    /// One merge between the ticking item `d` and `o`; true when `o` was absorbed whole.
+    /// One merge between the ticking item `d` and `o`, every test redone; true when `o` was
+    /// absorbed whole.
     fn item_merge_pair(&mut self, d: &mut ItemEnt, o: &mut ItemEnt) -> bool {
+        count_merge_pair();
         if o.removed || d.removed {
             return false;
         }
         let max = self.life.items.max_stack(&d.stack);
-        // Neither pickup blocked (32767) nor eternal item (age −32768): never merged.
-        let mergeable = |e: &ItemEnt| e.pickup_delay != 32767 && e.age != -32768 && e.age < LIFETIME && e.stack.count < max;
-        let near = (d.pos[0] - o.pos[0]).abs() <= ITEM_SIZE + 0.5
-            && (d.pos[2] - o.pos[2]).abs() <= ITEM_SIZE + 0.5
-            && (d.pos[1] - o.pos[1]).abs() <= ITEM_SIZE;
-        if !near
-            || !mergeable(d)
-            || !mergeable(o)
+        if !crosses(&bbox(o.pos, ITEM_SIZE), &merge_reach(d.pos))
+            || !may_merge(d, max)
+            || !may_merge(o, max)
             || !same(&d.stack, &o.stack)
             || d.stack.count + o.stack.count > max
         {
             return false;
         }
-        // The biggest stack absorbs the smallest.
+        self.merge_stacks(d, o, max)
+    }
+
+    /// The biggest stack absorbs the smallest (`d` absorbed at equal counts), up to `max` and
+    /// 64; true when `o` was absorbed whole.
+    fn merge_stacks(&self, d: &mut ItemEnt, o: &mut ItemEnt, max: i32) -> bool {
         let (to, from) = if o.stack.count < d.stack.count { (&mut *d, &mut *o) } else { (&mut *o, &mut *d) };
         let moved = from.stack.count.min(max.min(64) - to.stack.count);
         to.stack.count += moved;
@@ -1083,14 +1380,27 @@ impl Server {
             }
         }
         let gone: Vec<i32> = drops.iter().filter(|d| d.removed).map(|d| d.id).collect();
-        drops.retain(|d| !d.removed);
+        let pool = DropSwitches::current().body_pool;
+        if pool {
+            for d in drops.extract_if(.., |d| d.removed) {
+                self.keep_body(d.body);
+            }
+        } else {
+            drops.retain(|d| !d.removed);
+        }
         // Items appeared during the pickup (contents of a bag…): after the others.
         drops.append(&mut self.life.drops);
         self.life.drops = drops;
         let mut orbs = std::mem::take(&mut self.life.orbs);
         self.orbs_pickup(&mut orbs);
         let gone_orbs: Vec<i32> = orbs.iter().filter(|o| o.removed).map(|o| o.id).collect();
-        orbs.retain(|o| !o.removed);
+        if pool {
+            for o in orbs.extract_if(.., |o| o.removed) {
+                self.keep_body(o.body);
+            }
+        } else {
+            orbs.retain(|o| !o.removed);
+        }
         orbs.append(&mut self.life.orbs);
         self.life.orbs = orbs;
         let all: Vec<i32> = gone.into_iter().chain(gone_orbs).collect();
@@ -1107,6 +1417,9 @@ impl Server {
 
     /// Storing a picked-up item: returns what did not fit.
     pub(crate) fn pickup_into_inventory(&mut self, s: Stack, creative: bool, selected: usize) -> Option<Stack> {
+        if DropSwitches::current().pickup_in_place {
+            return self.pickup_in_place(s, creative, selected);
+        }
         let items = &self.life.items;
         let count = s.count;
         // Adding an item to the inventory completes as best it can; the rest stays on the ground.
@@ -1121,6 +1434,39 @@ impl Server {
                 let placed = if creative { count } else { after - before };
                 (placed < count).then(|| Stack { count: count - placed, ..s })
             }
+        }
+    }
+
+    /// [`Server::pickup_into_inventory`] without the trial on a copy of the slots: adding to the
+    /// inventory touches no slot when nothing fits (its first step always stores at least one
+    /// item when it finds a slot), so the real slots answer the same question.
+    fn pickup_in_place(&mut self, s: Stack, creative: bool, selected: usize) -> Option<Stack> {
+        let count = s.count;
+        let held =
+            |slots: &[Option<Stack>]| -> i32 { slots.iter().flatten().filter(|t| same(t, &s)).map(|t| t.count).sum() };
+        let before = held(&self.slots);
+        match inventory_add(&mut self.slots, &self.life.items, selected, s.clone(), creative) {
+            Some(rest) if rest.count == count => Some(rest),
+            _ => {
+                let placed = if creative { count } else { held(&self.slots) - before };
+                (placed < count).then(|| Stack { count: count - placed, ..s })
+            }
+        }
+    }
+
+    /// Physics of a new server item or orb: a body kept from a removed one when there is one
+    /// (`RUSTCRAFT_OPT_BODY_POOL`), reset to the state of a new one.
+    fn new_body(&mut self, pos: [f64; 3], vel: [f64; 3], size: f64, eye: f64) -> Box<Body> {
+        let Some(mut b) = self.walk.spare_bodies.pop() else { return server_body(pos, vel, size, eye) };
+        *b = Body::new(pos, vel, size, size, eye);
+        b.server = true;
+        b
+    }
+
+    /// The body of a removed item or orb, kept for the next one born (up to `SPARE_BODIES`).
+    fn keep_body(&mut self, b: Box<Body>) {
+        if self.walk.spare_bodies.len() < SPARE_BODIES {
+            self.walk.spare_bodies.push(b);
         }
     }
 
@@ -1416,27 +1762,48 @@ impl Server {
         let mut all = now.clone();
         all.extend(self.life.drop_chunks.iter().copied());
         for c in all {
-            // Lead knot: never saved (the held mob recreates it on reload).
-            let mut ents: Vec<Nbt> = self
-                .entities
-                .get(&c)
-                .map(|l| {
-                    l.iter()
-                        .filter(|e| e.1.get("id").and_then(Nbt::as_str) != Some("minecraft:leash_knot"))
-                        .map(|e| e.1.clone())
-                        .collect()
-                })
-                .unwrap_or_default();
-            ents.extend(by_chunk.remove(&c).unwrap_or_default());
-            let root = Nbt::Compound(vec![
+            let fresh = by_chunk.remove(&c).unwrap_or_default();
+            let nbt = self.entity_chunk_bytes(c, fresh);
+            let path = self.dim.dir.join("entities").join(crate::region::region_name(c.0, c.1));
+            jobs.push(crate::save::Job::Chunk { path, cx: c.0, cz: c.1, nbt });
+        }
+        self.life.drop_chunks = now;
+    }
+
+    /// The entity chunk `c` as saved: the entities kept as they were read (lead knots left out:
+    /// the held mob recreates its knot on reload), then `fresh`.
+    /// `RUSTCRAFT_OPT_ENTITY_SAVE_LENT`: the kept compounds are lent to the encoding (moved out
+    /// of their list, then back) instead of cloned.
+    fn entity_chunk_bytes(&mut self, c: (i32, i32), fresh: Vec<Nbt>) -> Vec<u8> {
+        let saved = |e: &(i32, Nbt)| e.1.get("id").and_then(Nbt::as_str) != Some("minecraft:leash_knot");
+        let root = |ents: Vec<Nbt>| {
+            Nbt::Compound(vec![
                 ("DataVersion".into(), Nbt::Int(crate::chunk::DATA_VERSION)),
                 ("Position".into(), Nbt::IntArray(vec![c.0, c.1])),
                 ("Entities".into(), Nbt::List(ents)),
-            ]);
-            let path = self.dim.dir.join("entities").join(crate::region::region_name(c.0, c.1));
-            jobs.push(crate::save::Job::Chunk { path, cx: c.0, cz: c.1, nbt: crate::nbtio::encode_root(&root) });
+            ])
+        };
+        let lend = DropSwitches::current().save_lent;
+        let Some(list) = self.entities.get_mut(&c).filter(|_| lend) else {
+            let kept = self.entities.get(&c).map(|l| l.iter().filter(|e| saved(e)).map(|e| e.1.clone()));
+            let ents: Vec<Nbt> = kept.into_iter().flatten().chain(fresh).collect();
+            return crate::nbtio::encode_root(&root(ents));
+        };
+        let lent: Vec<bool> = list.iter().map(saved).collect();
+        let taken = list.iter_mut().zip(&lent).filter(|(_, lent)| **lent);
+        let ents: Vec<Nbt> = taken.map(|(e, _)| std::mem::replace(&mut e.1, Nbt::Byte(0))).chain(fresh).collect();
+        let root = root(ents);
+        let bytes = crate::nbtio::encode_root(&root);
+        // The lent compounds back in their slots, in the same order.
+        if let Nbt::Compound(mut fields) = root
+            && let Some((_, Nbt::List(ents))) = fields.pop()
+        {
+            let slots = list.iter_mut().zip(&lent).filter(|(_, lent)| **lent);
+            for ((e, _), back) in slots.zip(ents) {
+                e.1 = back;
+            }
         }
-        self.life.drop_chunks = now;
+        bytes
     }
 
     /// Metadata and equipment of an entity read from the world (`entities.md` § 3): common
@@ -1823,13 +2190,27 @@ impl Server {
 // ---------- Damage taken by ground items and orbs (`/damage`) ----------
 
 impl Server {
-    /// `damage_resistant` component of the stack (patch, otherwise prototype): tag of damage types.
-    pub(crate) fn resistant_tag(&self, s: &Stack) -> Option<String> {
+    /// True if the stack resists damage type `ty`: the `types` of its `damage_resistant`
+    /// component (patch, otherwise prototype) hold it. Like the game, `types` is a tag
+    /// (`#is_fire`), one damage type or a list of damage types.
+    pub(crate) fn item_resists(&self, s: &Stack, ty: &str) -> bool {
         if let Some(c) = crate::items::component(s, "minecraft:damage_resistant") {
-            return c.get("types").and_then(rc_proto::nbt::Nbt::as_str).map(str::to_owned);
+            return c.get("types").is_some_and(|t| self.nbt_damage_set_has(t, ty));
         }
-        let v = self.life.items.default_component(s, "minecraft:damage_resistant")?;
-        v["types"].as_str().map(str::to_owned)
+        self.life
+            .items
+            .default_component(s, "minecraft:damage_resistant")
+            .is_some_and(|v| crate::item_use::damage_set_has(self, &v["types"], ty))
+    }
+
+    /// [`crate::item_use::damage_set_has`] for a set written in NBT (component patch).
+    fn nbt_damage_set_has(&self, set: &Nbt, ty: &str) -> bool {
+        match set {
+            Nbt::String(entry) => self.damage_set_entry_has(entry, ty),
+            // A list holds damage types only, never tags.
+            Nbt::List(entries) => entries.iter().any(|e| e.as_str().is_some_and(|id| same_identifier(ty, id))),
+            _ => false,
+        }
     }
 
     /// Damage to a ground item: refused if a mob causes it without `mob_griefing` or if the
@@ -1862,11 +2243,6 @@ impl Server {
     /// Damage refused: caused by a mob without `mob_griefing`, or resisted by the stack.
     fn item_may_hurt(&self, s: &Stack, ty: &str, by_mob: bool) -> bool {
         !(by_mob && !self.rule("minecraft:mob_griefing", true)) && !self.item_resists(s, ty)
-    }
-
-    /// True if the stack resists damage type `ty` (`damage_resistant` component).
-    pub(crate) fn item_resists(&self, s: &Stack, ty: &str) -> bool {
-        self.resistant_tag(s).is_some_and(|tag| self.dmg_tag(ty, tag.trim_start_matches('#')))
     }
 
     /// Damage to an experience orb: health points removed, orb removed at 0.

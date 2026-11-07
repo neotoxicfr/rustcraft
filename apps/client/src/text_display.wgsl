@@ -35,8 +35,8 @@ struct Out {
 
 const SEE_THROUGH: u32 = 0x80000000u;
 
-// One instance per glyph: corners (top-left, bottom-left, bottom-right, top-right) in font pixels
-// in the frame of the layer (y downwards, scale included in the matrix).
+// One instance per glyph (old path): corners (top-left, bottom-left, bottom-right, top-right) in
+// font pixels in the frame of the layer (y downwards, scale included in the matrix).
 @vertex
 fn vs(
     @builtin(vertex_index) vi: u32,
@@ -47,6 +47,57 @@ fn vs(
     @location(4) uvr: vec4<f32>,
     @location(5) color: vec4<f32>,
     @location(6) mode: u32,
+) -> Out {
+    return place(vi, face, light, rect, skew, uvr, color, mode);
+}
+
+// Glyph of the shared pool (`RUSTCRAFT_OPT_DISPLAY_TEXT_GLYPH_POOL`): same fields, aligned to 16 bytes.
+struct PooledGlyph {
+    rect: vec4<f32>,
+    uv: vec4<f32>,
+    skew: f32,
+    color: u32,
+    mode: u32,
+    pad: u32,
+};
+@group(1) @binding(3) var<storage, read> pool: array<PooledGlyph>;
+
+// One instance per layer and pass: `count` glyphs of the pool from `first`; the glyph of a
+// vertex is vi / 6, those past the count are degenerate. `fill` (if not 0) replaces the
+// colour (background of the frame); the alpha byte is scaled by `opacity` with the integer
+// rounding of the old path.
+@vertex
+fn vs_ref(
+    @builtin(vertex_index) vi: u32,
+    @location(0) layer: u32,
+    @location(1) light: u32,
+    @location(2) first: u32,
+    @location(3) count: u32,
+    @location(4) opacity: u32,
+    @location(5) fill: u32,
+) -> Out {
+    let g = vi / 6u;
+    if g >= count {
+        var o: Out;
+        o.pos = vec4<f32>(2.0, 2.0, 0.5, 1.0);
+        return o;
+    }
+    let s = pool[first + g];
+    let c = select(s.color, fill, fill != 0u);
+    let alpha = ((c >> 24u) * opacity) / 255u;
+    let color = unpack4x8unorm((c & 0xffffffu) | (alpha << 24u));
+    return place(vi % 6u, layer, light, s.rect, s.skew, s.uv, color, s.mode);
+}
+
+fn place(
+    vi: u32,
+    face: u32,
+    light: u32,
+    rect: vec4<f32>,
+    skew: f32,
+    uvr: vec4<f32>,
+    color: vec4<f32>,
+    mode: u32,
 ) -> Out {
     let k = array<u32, 6>(0u, 1u, 2u, 0u, 2u, 3u)[vi];
     let bottom = k == 1u || k == 2u;

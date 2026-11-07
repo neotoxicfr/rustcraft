@@ -213,12 +213,12 @@ fn row_candidates_with_sure(cell_props: &[u32], candidates: &mut Vec<u16>, sure:
     #[cfg(target_arch = "x86_64")]
     {
         #[target_feature(enable = "avx2")]
-        fn avx2(cell_props: &[u32], candidates: &mut Vec<u16>, sure: &mut Vec<u8>) {
+        fn row_candidates_avx2(cell_props: &[u32], candidates: &mut Vec<u16>, sure: &mut Vec<u8>) {
             row_candidates_by_lanes(cell_props, candidates, sure);
         }
-        if std::arch::is_x86_feature_detected!("avx2") {
+        if rc_data::cpu::has_avx2() {
             // SAFETY: AVX2 has just been detected on this processor.
-            return unsafe { avx2(cell_props, candidates, sure) };
+            return unsafe { row_candidates_avx2(cell_props, candidates, sure) };
         }
     }
     row_candidates_by_lanes(cell_props, candidates, sure);
@@ -1569,7 +1569,7 @@ pub fn offset_face_quad(t: &Tables, table: &[f32], f: &Face, shade: &[f32; 6]) -
 }
 
 /// Value of the border grid outside the available columns.
-const OUTSIDE: u32 = u32::MAX;
+pub(crate) const OUTSIDE: u32 = u32::MAX;
 
 /// States read in the border grid of the current section when the position falls there,
 /// in the columns otherwise.
@@ -1731,8 +1731,6 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
             if fast { near.state(x, y, z) } else { around.state(x, y, z) }.unwrap_or(0)
         };
         let lum = |x: i32, y: i32, z: i32| light_view.lum(x, y, z, st(x, y, z));
-        // Cells served by the smoothing, and by the fluids if they read the cache.
-        lcache.reset(&light_view, si as i32 * 16, job.opts.ao || paths.fluid);
         tint.section(si as i32 * 16);
         // Rows: only the blocks that can produce something, in order.
         let rows = use_props && cull_paths.rows;
@@ -1743,6 +1741,11 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
             row_candidates(&cell_props, &mut candidates);
         }
         let count = if rows { candidates.len() } else { SECTION_BLOCKS };
+        // Cells served by the smoothing, and by the fluids if they read the cache.
+        lcache.reset(&light_view, si as i32 * 16, job.opts.ao || paths.fluid, count);
+        // The light reads the properties and states of the section's grids when they are filled.
+        let grids = use_props.then_some(crate::light::SectionGrids { states: &state_grid, props: &cell_props });
+        let light_sources = crate::light::Sources { view: &light_view, state_at: &st, grids };
         for k in 0..count {
             let i = if rows { usize::from(candidates[k]) } else { k };
             let state = values[i];
@@ -1896,7 +1899,7 @@ fn mesh_with(job: &MeshJob, t: &Tables, palette: &BiomePalette, min_y: i32, fast
                         .then(|| t.light_faces.faces.get(q as usize).map(|f| (f, &t.light_faces)))
                         .flatten(),
                 };
-                let verts = lcache.quad_light(&light_view, &st, [x, y, z], state, &geom, smooth);
+                let verts = lcache.quad_light(&light_sources, [x, y, z], state, &geom, smooth);
                 let layer = if opaque_leaves { 0 } else { quad.layer as usize };
                 let pos = (x as u32) | ((z as u32) << 4) | ((y as u32) << 8);
                 // Offset model outside translucents: compact face (offset re-read by the shader).

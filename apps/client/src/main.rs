@@ -50,6 +50,7 @@ mod exact;
 mod explode;
 mod flow;
 mod front;
+mod glyph_pool;
 mod gui;
 mod hand;
 mod hotbars;
@@ -196,7 +197,7 @@ use render::Renderer;
 
 #[cfg(not(feature = "memstats"))]
 #[global_allocator]
-static ALLOC: debug_sys::Gated = debug_sys::Gated;
+static ALLOC: debug_sys::CountingAllocator = debug_sys::CountingAllocator;
 
 /// Logs once the delay until the first frame drawn (startup measurement).
 fn first_frame(started: Instant) {

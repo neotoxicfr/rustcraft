@@ -430,7 +430,7 @@ impl Server {
         super::surface::post_tick(self, m);
         super::mounts::post_tick(self, m);
         self.golem_post_tick(m);
-        self.illager_post_tick(m); // F07: limited life of the vex
+        self.illager_post_tick(m); // F07: vex without gravity, limited life
         super::sealife::post_tick(self, m); // F09
         super::brainy::post_tick(self, m); // F10: armadillo, allay
         self.wild_post_tick(m); // F11

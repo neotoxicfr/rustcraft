@@ -13,6 +13,9 @@ rc-data.workspace = true
 rc-physics.workspace = true
 rc-world.workspace = true
 rc-assets.workspace = true
+# Cold stage of the client's base cache (`packed_codec.rs`), both already in the tree.
+libdeflater.workspace = true
+bytemuck.workspace = true
 
 [dev-dependencies]
 rc-testdata.workspace = true
@@ -23,7 +26,6 @@ mimalloc.workspace = true
 rayon.workspace = true
 wgpu.workspace = true
 pollster.workspace = true
-bytemuck.workspace = true
 rc-data.workspace = true
 
 [[bench]]

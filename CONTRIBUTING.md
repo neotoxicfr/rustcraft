@@ -73,7 +73,7 @@ publishes the release with an empty body. The notes are written by hand, by them
 the player), then added with `gh release edit vX.Y.Z --notes-file <file>`.
 
 Release builds are reproducible ([docs/reproducible-builds.md](docs/reproducible-builds.md)). Before a
-tag, start the manual **Reproducibility** workflow on the commit: it compiles the full release profile
-twice per system and fails if the executables or the archives differ.
+tag, start the manual **Reproducibility** workflow on the commit: it compiles the shipped profile
+(`dist`, the full release settings) twice per system and fails if the executables or the archives differ.
 
 By taking part, you accept the [code of conduct](CODE_OF_CONDUCT.md).

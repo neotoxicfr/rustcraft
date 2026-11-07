@@ -5,6 +5,7 @@
 pub(crate) mod aquatic;
 pub(crate) mod arrows;
 mod bell;
+pub(crate) mod blast_rays;
 mod body;
 mod resize; // refit after the box grows
 pub(crate) mod fireballs;
@@ -20,6 +21,7 @@ pub(crate) mod end;
 pub(crate) mod explode;
 pub(crate) mod goals;
 pub(crate) mod golems;
+pub(crate) mod ground_items; // dropped items seen by the fox, panda and dolphin pickups
 pub(crate) mod illagers;
 pub(crate) mod index;
 pub(crate) mod interact; // G5-F03: name tag, egg, dyeing, cat and wolf
@@ -41,7 +43,7 @@ pub(crate) mod sealife;
 pub(crate) mod recent; // F14: warden, breeze, creaking, happy ghast
 pub(crate) mod spawn;
 pub(crate) mod species;
-mod structure_spawn; // F07: spawn lists of structures
+pub(crate) mod structure_spawn; // F07: spawn lists of structures
 pub(crate) mod surface;
 mod tick;
 
@@ -56,11 +58,15 @@ pub(crate) mod wild;
 pub(crate) mod wither; // F16
 
 #[cfg(test)]
+mod animal_scan_tests;
+#[cfg(test)]
 mod tag_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_f01;
+#[cfg(test)]
+mod tests_steady_synced_data;
 #[cfg(test)]
 mod tests_index;
 #[cfg(test)]
@@ -76,6 +82,8 @@ mod tests_patterns;
 #[cfg(test)]
 mod tests_respawn_blast;
 #[cfg(test)]
+mod tests_explosion_rays;
+#[cfg(test)]
 mod tests_w10;
 #[cfg(test)]
 mod tests_g4f03;
@@ -87,6 +95,8 @@ mod tests_g5f03b;
 mod tests_g4f07b;
 #[cfg(test)]
 mod tests_g5f02b;
+#[cfg(test)]
+pub(crate) mod tests_spawn_paths; // spawner blocks and natural spawns: former and optimised paths compared
 
 use rc_proto::Reader;
 use rc_proto::nbt::Nbt;

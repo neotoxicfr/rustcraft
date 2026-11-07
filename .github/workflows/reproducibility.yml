@@ -1,6 +1,6 @@
 name: Reproducibility
 
-# Dress rehearsal of a release, started by hand: builds the commit twice with the FULL release profile
+# Dress rehearsal of a release, started by hand: builds the commit twice with the shipped profile `dist`
 # (the one a tag builds and ci.yml never compiles), on two separate runners per system, packages
 # both builds like release.yml does, then compares the executables and the archives byte for byte.
 # A build that no longer links, or two builds that differ, show up here before the tag does.
@@ -60,19 +60,19 @@ jobs:
         run: |
           echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
           python -I tools/release/hide_paths.py config "$RUNNER_TEMP/hide-paths.toml"
-      - name: Build (full release profile)
+      - name: Build (shipped profile, dist)
         shell: bash
-        run: cargo build --locked --release -p rc-app --config "$RUNNER_TEMP/hide-paths.toml"
+        run: cargo build --locked --profile dist -p rc-app --config "$RUNNER_TEMP/hide-paths.toml"
       # The executables compared are the shipped ones (Linux: after `strip`, as in the archive).
       - name: Package
         shell: bash
         run: |
           mkdir -p pkg out
           if [ "$RUNNER_OS" = Windows ]; then
-            cp target/release/rustcraft.exe out/
-            python -I tools/release/pack.py windows rehearsal target/release/rustcraft.exe pkg
+            cp target/dist/rustcraft.exe out/
+            python -I tools/release/pack.py windows rehearsal target/dist/rustcraft.exe pkg
           else
-            cp target/release/rustcraft pkg/rustcraft
+            cp target/dist/rustcraft pkg/rustcraft
             strip pkg/rustcraft
             cp pkg/rustcraft out/
             python -I tools/release/pack.py linux rehearsal pkg/rustcraft pkg
@@ -83,7 +83,7 @@ jobs:
         shell: bash
         run: |
           exe=pkg/rustcraft
-          if [ "$RUNNER_OS" = Windows ]; then exe=target/release/rustcraft.exe; fi
+          if [ "$RUNNER_OS" = Windows ]; then exe=target/dist/rustcraft.exe; fi
           python -I tools/release/hide_paths.py check "$exe"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

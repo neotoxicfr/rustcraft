@@ -108,8 +108,10 @@ impl Server {
         }
     }
 
-    /// End of the tick: limited life.
+    /// End of the tick: no gravity, limited life.
     pub(crate) fn vex_post_tick(&mut self, m: &mut Mob) {
+        // Like the game, gravity is turned off after every tick (synced, then saved).
+        m.surf.no_gravity = true;
         if let Some(l) = m.ill.life.as_mut() {
             *l -= 1;
             if *l <= 0 {

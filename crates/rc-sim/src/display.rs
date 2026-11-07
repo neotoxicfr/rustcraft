@@ -395,6 +395,21 @@ fn text_flags(e: &Nbt) -> i8 {
     }
 }
 
+/// Width, height and eye height of a compound the blast pushes although it never moves by
+/// itself: displays and markers have no size and their eyes at their feet, an interaction its
+/// own size; `None` for any other entity.
+fn still_size(e: &Nbt) -> Option<(f64, f64, f64)> {
+    match kind_of(e) {
+        Some(Kind::Interaction) => {
+            let h = get_float(e, "height", 1.0);
+            Some((f64::from(get_float(e, "width", 1.0)), f64::from(h), f64::from(h * 0.85)))
+        }
+        Some(_) => Some((0.0, 0.0, 0.0)),
+        None if e.get("id").and_then(Nbt::as_str) == Some("minecraft:marker") => Some((0.0, 0.0, 0.0)),
+        None => None,
+    }
+}
+
 /// Same value for the game's change test: decimals compared bit for bit, a non-empty stack
 /// never equal (each load builds a new one).
 fn same(a: &Meta, b: &Meta) -> bool {
@@ -518,32 +533,30 @@ impl Server {
         if radius < 1.0e-5 {
             return;
         }
-        let double = f64::from(radius * 2.0);
+        let diameter = f64::from(radius * 2.0);
         let push = |s: &Server, pos: [f64; 3], eye: f64, b: &rc_physics::Aabb| -> Option<[f64; 3]> {
-            let dist = crate::mobs::mth::dist2(pos, center).sqrt() / double;
+            let dist = crate::mobs::mth::dist2(pos, center).sqrt() / diameter;
             if dist > 1.0 {
                 return None;
             }
             let dir = crate::mobs::mth::normalize([pos[0] - center[0], pos[1] + eye - center[1], pos[2] - center[2]]);
             let exposure = if mult == 0.0 { 0.0 } else { f64::from(s.seen_percent(center, b)) };
-            let kp = (1.0 - dist) * exposure * mult;
-            Some(dir.map(|v| v * kp))
+            let strength = (1.0 - dist) * exposure * mult;
+            Some(dir.map(|v| v * strength))
         };
+        let distance_first = self.deco.switches.still_distance_first;
+        let out_of_reach = |p: [f64; 3]| crate::mobs::mth::dist2(p, center).sqrt() / diameter > 1.0;
+        let pos_of = |e: &Nbt| crate::nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
         let mut hits: Vec<((i32, i32), usize, [f64; 3])> = Vec::new();
         // Every kept compound: one teleported keeps the list of the chunk it was read in.
         for (&c, list) in &self.entities {
             for (k, (_, e)) in list.iter().enumerate() {
-                // Displays and markers: no size, eyes at their feet; an interaction its own size.
-                let (w, h, eye) = match kind_of(e) {
-                    Some(Kind::Interaction) => {
-                        let h = get_float(e, "height", 1.0);
-                        (f64::from(get_float(e, "width", 1.0)), f64::from(h), f64::from(h * 0.85))
-                    }
-                    Some(_) => (0.0, 0.0, 0.0),
-                    None if e.get("id").and_then(Nbt::as_str) == Some("minecraft:marker") => (0.0, 0.0, 0.0),
-                    None => continue,
-                };
-                let p = crate::nbtio::f64s::<3>(e.get("Pos")).unwrap_or_default();
+                // Distance first (switch): a far compound is dropped without its type compared.
+                if distance_first && out_of_reach(pos_of(e)) {
+                    continue;
+                }
+                let Some((w, h, eye)) = still_size(e) else { continue };
+                let p = pos_of(e);
                 let b = rc_physics::Aabb { min: [p[0] - w / 2.0, p[1], p[2] - w / 2.0], max: [p[0] + w / 2.0, p[1] + h, p[2] + w / 2.0] };
                 if let Some(kb) = push(self, p, eye, &b) {
                     hits.push((c, k, kb));

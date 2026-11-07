@@ -3,6 +3,7 @@
 
 mod bin;
 mod compile;
+pub mod cpu;
 pub mod env_flags;
 pub mod ids;
 pub mod jar;

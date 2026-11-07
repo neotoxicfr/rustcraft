@@ -45,6 +45,23 @@ fn counted(g: &mut MapGrid, h: i32, t: &LightTables, sky: bool, c: &[[i32; 3]]) 
     out
 }
 
+/// The C2-M02 switches (frontier seeding, step order, parallel step) set off.
+const PROPAGATION_OFF: [(&str, bool); 8] = [
+    ("LIGHTSKYFRONTIER", false),
+    ("LIGHTMARGINFRONTIER", false),
+    ("LIGHTSEEDROWS", false),
+    ("LIGHTLEVELFIRST", false),
+    ("LIGHTSPREADINLINE", false),
+    ("LIGHTATOMICVIEW", false),
+    ("LIGHTSPREADBUFS", false),
+    ("LIGHTSPREADAFTERSEED", false),
+];
+
+/// Working path without the C2-M02 switches (the working path of before).
+fn before_propagation(g: &mut MapGrid, h: i32, t: &LightTables, sky: bool, c: &[[i32; 3]]) -> Touched {
+    rc_light::relight_sections_with(g, h, t, sky, c, &PROPAGATION_OFF)
+}
+
 fn frozen(g: &mut MapGrid, h: i32, t: &LightTables, sky: bool, c: &[[i32; 3]]) -> Touched {
     rc_light::reference::relight_sections(g, h, t, sky, c)
 }
@@ -223,15 +240,26 @@ fn bench(c: &mut Criterion) {
         let (ia, ib) = (IN_ALLOCS.load(Relaxed), IN_BYTES.load(Relaxed));
         let (gb, tb, db) = replay(tr, &t, frozen);
         let (allocs_b, bytes_b) = (IN_ALLOCS.load(Relaxed) - ia, IN_BYTES.load(Relaxed) - ib);
-        assert_eq!(ta.len(), tb.len());
-        for (i, (a, b)) in ta.iter().zip(&tb).enumerate() {
-            assert_eq!(a, b, "{}: touched sections of relight {i}", tr.name);
-        }
-        for (k, (_, sa, ba)) in &ga.0 {
-            let (_, sb, bb) = &gb.0[k];
-            assert!(sa == sb && ba == bb, "{}: sheets of column {k:?} differ from the reference", tr.name);
+        // The working path of before (C2-M02 off): its queues, and the same output.
+        let queues_before = rc_light::stats::queues();
+        let (ia, ib) = (IN_ALLOCS.load(Relaxed), IN_BYTES.load(Relaxed));
+        rc_light::stats::force_queue_counting(Some(true));
+        let (gc, tc, _) = replay(tr, &t, before_propagation);
+        rc_light::stats::force_queue_counting(Some(false));
+        let (allocs_c, bytes_c) = (IN_ALLOCS.load(Relaxed) - ia, IN_BYTES.load(Relaxed) - ib);
+        print_queues(&format!("{} before C2-M02", tr.name), tr.events(), &rc_light::stats::queues().since(&queues_before));
+        for (g, touched, label) in [(&ga, &ta, "work"), (&gc, &tc, "before C2-M02")] {
+            assert_eq!(touched.len(), tb.len());
+            for (i, (a, b)) in touched.iter().zip(&tb).enumerate() {
+                assert_eq!(a, b, "{} ({label}): touched sections of relight {i}", tr.name);
+            }
+            for (k, (_, sa, ba)) in &g.0 {
+                let (_, sb, bb) = &gb.0[k];
+                assert!(sa == sb && ba == bb, "{} ({label}): sheets of column {k:?} differ from the reference", tr.name);
+            }
         }
         check_known(&tr.name, tr.digest, digest(&ga, &ta), KNOWN);
+        drop((gc, tc));
         let n = tr.events().max(1) as f64;
         eprintln!(
             "{}: {} relights, {} changes; work {:.3} ms/relight, reference {:.3} ms/relight",
@@ -251,10 +279,12 @@ fn bench(c: &mut Criterion) {
         );
         if cfg!(feature = "memstats") {
             eprintln!(
-                "{}: allocations per relight work {:.1} / {:.0} KiB, reference {:.1} / {:.0} KiB",
+                "{}: allocations per relight work {:.1} / {:.0} KiB, before C2-M02 {:.1} / {:.0} KiB, reference {:.1} / {:.0} KiB",
                 tr.name,
                 allocs_a as f64 / n,
                 bytes_a as f64 / n / 1024.0,
+                allocs_c as f64 / n,
+                bytes_c as f64 / n / 1024.0,
                 allocs_b as f64 / n,
                 bytes_b as f64 / n / 1024.0
             );
@@ -269,9 +299,10 @@ fn bench(c: &mut Criterion) {
         // A gain is judged against the old working path (main), never against the frozen
         // copy: it has no counters nor `bounded` parameter and its machine code differs.
         // `inc` and `inc16`: incremental relight (C2-M14), `counted`: queue counters on (C2-M01),
-        // same order mirrored.
+        // `before`: the C2-M02 switches off, same order mirrored.
         for (label, f) in [
             ("work_a", work as Relight),
+            ("before_a", before_propagation),
             ("counted_a", counted),
             ("inc_a", inc),
             ("inc16_a", inc16),
@@ -280,6 +311,7 @@ fn bench(c: &mut Criterion) {
             ("inc16_b", inc16),
             ("inc_b", inc),
             ("counted_b", counted),
+            ("before_b", before_propagation),
             ("work_b", work),
         ] {
             g.bench_function(format!("{}_{label}_1t", tr.name), |b| {

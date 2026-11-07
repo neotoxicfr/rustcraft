@@ -60,7 +60,7 @@ const VARIANTS: [Paths; 9] = {
 };
 
 fn variants() -> Vec<Paths> {
-    let avx2 = rc_worldgen::opt::avx2_available();
+    let avx2 = rc_data::cpu::has_avx2();
     VARIANTS.iter().copied().filter(|p| avx2 || !p.avx2).collect()
 }
 
@@ -250,7 +250,7 @@ fn sincos_matches_sin_cos_exhaustive() {
 #[test]
 fn sincos_paths_match_exhaustive() {
     use jmath::{ProductPath, SinCosPaths};
-    eprintln!("selected: {:?}, FMA on this processor: {}", SinCosPaths::selected(), jmath::fma_available());
+    eprintln!("selected: {:?}, FMA on this processor: {}", SinCosPaths::selected(), rc_data::cpu::has_fma());
     for product in [ProductPath::LibraryFma, ProductPath::Split, ProductPath::HardwareFma] {
         // Each series switch alone is checked by the unit tests of `jmath` (10⁷ angles).
         for (only_needed_series, interleaved_series) in [(false, false), (true, true)] {
@@ -322,7 +322,7 @@ fn named() -> Vec<(&'static str, Paths)> {
         ("ypre+simd", Paths { ypre: true, simd: true, ..o }),
         ("all but avx2", NEW),
     ];
-    if rc_worldgen::opt::avx2_available() {
+    if rc_data::cpu::has_avx2() {
         v.push(("ypre+simd+avx2", Paths { ypre: true, simd: true, avx2: true, ..o }));
         v.push(("all + avx2", Paths { avx2: true, ..NEW }));
     }
@@ -418,7 +418,7 @@ fn sincos_paths_bench() {
     };
     let mut r = Mix(11);
     let xs: Vec<f64> = (0..1_000_000).map(|_| r.range(-10.0, 10.0)).collect();
-    eprintln!("FMA on this processor: {}, selected: {:?}", jmath::fma_available(), SinCosPaths::selected());
+    eprintln!("FMA on this processor: {}, selected: {:?}", rc_data::cpu::has_fma(), SinCosPaths::selected());
     for (name, paths) in named {
         time(&format!("sin+cos 10^6, {name}"), 5, || {
             xs.iter().map(|&x| jmath::sin_with(x, paths) + jmath::cos_with(x, paths)).sum::<f64>()

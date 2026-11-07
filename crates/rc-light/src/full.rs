@@ -5,7 +5,8 @@
 //! light coming from beyond the zone cannot reach it (16 cells or more).
 //!
 //! New path (mission C2-M08, `docs/perf.md`), same result byte for byte as
-//! [`light_chunk_inner`] (kept as is, taken when the three switches are at 0):
+//! [`light_chunk_inner`] (kept as is, taken when the three switches are at 0; the fourth,
+//! `RUSTCRAFT_OPT_INTERN_UNIFORM_LIGHT`, only shares the uniform sheets of either path):
 //! - `RUSTCRAFT_OPT_FULLSKIP`: void skipped. A "neutral" cell (zero emission and attenuation,
 //!   no face) neither creates nor stops light. Above the highest non-neutral cell of the
 //!   9 columns (`ymax`, excluded), the sky is 15 everywhere and the block light dies out 14 cells
@@ -57,12 +58,14 @@ impl Grid<'_> {
 
 /// Light sheets (sky, block) of the central chunk, `height / 16 + 2` positions (one below the
 /// world, one above): zero block sheets absent; full sky sheets (15) at the
-/// top absent (the game reads them full). `has_sky` false: no sky sheet.
+/// top absent (the game reads them full). `has_sky` false: no sky sheet. `intern_uniform`: see
+/// [`FullOpts::intern_uniform`].
 pub(crate) fn light_chunk_inner(
     t: &LightTables,
     cols: Columns,
     height: i32,
     has_sky: bool,
+    intern_uniform: bool,
 ) -> (Vec<LightLayer>, Vec<LightLayer>) {
     let g = Grid { cols, height };
     let n = (W * W * height) as usize;
@@ -87,7 +90,7 @@ pub(crate) fn light_chunk_inner(
         }
     }
     propagate(&g, t, &mut level, &mut buckets);
-    let block = layers(&level, sections, |v| v.iter().all(|&b| b == 0), false);
+    let block = pack_sheets(&level, sections, 0, false, intern_uniform);
     if !has_sky {
         return (vec![None; sections + 2], block);
     }
@@ -127,7 +130,7 @@ pub(crate) fn light_chunk_inner(
         }
     }
     propagate(&g, t, &mut level, &mut buckets);
-    let sky = layers(&level, sections, |v| v.iter().all(|&b| b == 0xff), true);
+    let sky = pack_sheets(&level, sections, 0xff, true, intern_uniform);
     (sky, block)
 }
 
@@ -182,10 +185,14 @@ pub(crate) struct FullOpts {
     pub skip: bool,
     pub noemit: bool,
     pub layout: bool,
+    /// All-0 and all-15 sheets replaced by the shared ones ([`crate::uniform_light_interned`]).
+    pub intern_uniform: bool,
 }
 
 impl FullOpts {
-    pub(crate) const OLD: FullOpts = FullOpts { skip: false, noemit: false, layout: false };
+    /// Every switch off (tests: the old path).
+    #[cfg(test)]
+    pub(crate) const OLD: FullOpts = FullOpts { skip: false, noemit: false, layout: false, intern_uniform: false };
 
     pub(crate) fn current() -> FullOpts {
         static O: OnceLock<FullOpts> = OnceLock::new();
@@ -194,7 +201,13 @@ impl FullOpts {
             skip: on(rc_data::env_str!("RUSTCRAFT_OPT_FULLSKIP")),
             noemit: on(rc_data::env_str!("RUSTCRAFT_OPT_FULLNOEMIT")),
             layout: on(rc_data::env_str!("RUSTCRAFT_OPT_FULLLAYOUT")),
+            intern_uniform: crate::uniform_light_interned(),
         })
+    }
+
+    /// None of the three resolution switches: [`light_chunk_inner`] resolves.
+    pub(crate) fn old_resolution(self) -> bool {
+        !self.skip && !self.noemit && !self.layout
     }
 }
 
@@ -384,7 +397,7 @@ fn run(
         }
     }
     propagate(&g, t, level, buckets);
-    let block = layers_upto(level, sections, top, |v| v.iter().all(|&b| b == 0), false);
+    let block = pack_sheets_below_top(level, sections, top, 0, false, o.intern_uniform);
     if !has_sky {
         return (vec![None; sections + 2], block);
     }
@@ -415,51 +428,58 @@ fn run(
         }
     }
     propagate(&g, t, level, buckets);
-    let sky = layers_upto(level, sections, top, |v| v.iter().all(|&b| b == 0xff), true);
+    let sky = pack_sheets_below_top(level, sections, top, 0xff, true, o.intern_uniform);
     (sky, block)
 }
 
-/// Like [`layers`] on only the sections under `top` (the others are omitted: full sky or
+/// Like [`pack_sheets`] on only the sections under `top` (the others are omitted: full sky or
 /// zero block, see the header), two cells per byte.
-fn layers_upto(
+fn pack_sheets_below_top(
     level: &[u8],
     sections: usize,
     top: i32,
-    empty: impl Fn(&[u8]) -> bool,
-    trailing: bool,
+    empty_byte: u8,
+    drop_only_top_empty: bool,
+    intern_uniform: bool,
 ) -> Vec<LightLayer> {
     let mut out: Vec<LightLayer> = vec![None; sections + 2];
-    let mut keep = !trailing;
+    let mut keep = !drop_only_top_empty;
     for s in (0..(top / 16) as usize).rev() {
         let mut a = [0u8; LIGHT_BYTES];
+        // OR and AND of the packed bytes, gathered while packing: they tell an empty sheet and
+        // a uniform one without a second walk over its 2 KB.
+        let (mut or, mut and) = (0u8, 0xffu8);
         for ly in 0..16usize {
             let y = (s * 16 + ly) as i32;
             for z in 0..16usize {
                 let base = ((y * W + z as i32 + 16) * W + 16) as usize;
                 let row = &level[base..base + 16];
                 for xx in 0..8 {
-                    a[(ly << 7) | (z << 3) | xx] = row[2 * xx] | row[2 * xx + 1] << 4;
+                    let v = row[2 * xx] | row[2 * xx + 1] << 4;
+                    a[(ly << 7) | (z << 3) | xx] = v;
+                    or |= v;
+                    and &= v;
                 }
             }
         }
-        let is_empty = empty(&a);
-        if trailing {
-            keep |= !is_empty;
-            if keep {
-                out[s + 1] = Some(Arc::new(a));
-            }
-        } else if !is_empty {
-            out[s + 1] = Some(Arc::new(a));
+        if sheet_kept(or, and, empty_byte, drop_only_top_empty, &mut keep) {
+            out[s + 1] = Some(stored_sheet(a, or, and, intern_uniform));
         }
     }
     out
 }
 
-/// Sheets of the central chunk. `trailing`: "empty" sheets removed only at the top (sky);
-/// otherwise removed everywhere (block).
-fn layers(level: &[u8], sections: usize, empty: impl Fn(&[u8]) -> bool, trailing: bool) -> Vec<LightLayer> {
+/// Sheets of the central chunk. `drop_only_top_empty`: "empty" sheets (all `empty_byte`)
+/// removed only at the top (sky); otherwise removed everywhere (block).
+fn pack_sheets(
+    level: &[u8],
+    sections: usize,
+    empty_byte: u8,
+    drop_only_top_empty: bool,
+    intern_uniform: bool,
+) -> Vec<LightLayer> {
     let mut out: Vec<LightLayer> = vec![None; sections + 2];
-    let mut keep = !trailing;
+    let mut keep = !drop_only_top_empty;
     for s in (0..sections).rev() {
         let mut a = [0u8; LIGHT_BYTES];
         for ly in 0..16usize {
@@ -472,19 +492,33 @@ fn layers(level: &[u8], sections: usize, empty: impl Fn(&[u8]) -> bool, trailing
                 }
             }
         }
-        let is_empty = empty(&a);
-        if trailing {
-            if !is_empty {
-                keep = true;
-            }
-            if keep {
-                out[s + 1] = Some(Arc::new(a));
-            }
-        } else if !is_empty {
-            out[s + 1] = Some(Arc::new(a));
+        let (or, and) = a.iter().fold((0u8, 0xffu8), |(or, and), &v| (or | v, and & v));
+        if sheet_kept(or, and, empty_byte, drop_only_top_empty, &mut keep) {
+            out[s + 1] = Some(stored_sheet(a, or, and, intern_uniform));
         }
     }
     out
+}
+
+/// Whether a sheet (OR and AND of its bytes), visited from the top down, is kept: an empty one
+/// (all `empty_byte`) is dropped everywhere, or only above the highest non-empty one
+/// (`drop_only_top_empty`, which `keep` tracks).
+fn sheet_kept(or: u8, and: u8, empty_byte: u8, drop_only_top_empty: bool, keep: &mut bool) -> bool {
+    let is_empty = or == empty_byte && and == empty_byte;
+    if drop_only_top_empty {
+        *keep |= !is_empty;
+        *keep
+    } else {
+        !is_empty
+    }
+}
+
+/// Heap sheet for the packed bytes `a` (OR and AND of them given). A uniform sheet (zero sky
+/// under the terrain, full sky under an overhang) becomes the shared one: thousands of chunks
+/// then hold one copy, and a writer copies it first (`Arc::make_mut`).
+fn stored_sheet(a: [u8; LIGHT_BYTES], or: u8, and: u8, intern_uniform: bool) -> Arc<[u8; LIGHT_BYTES]> {
+    let shared = if intern_uniform { rc_world::shared_layer_from_or_and(or, and) } else { None };
+    shared.unwrap_or_else(|| Arc::new(a))
 }
 
 #[cfg(test)]

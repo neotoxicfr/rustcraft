@@ -108,8 +108,7 @@ impl Server {
             && self.bname([p[0], p[1] - 1, p[2]]) == "minecraft:nether_bricks"
             && self.in_structure(p, "minecraft:fortress")
         {
-            static FORTRESS: std::sync::OnceLock<Arc<[Value]>> = std::sync::OnceLock::new();
-            return FORTRESS.get_or_init(|| fortress_enemies().into()).clone();
+            return fortress_list();
         }
         // Structure without replacement for this category: its pieces are not read.
         let found = self.structure_starts_find(p, |name, ch| {
@@ -118,6 +117,180 @@ impl Server {
             hit.then(|| ov.spawns.clone())
         });
         found.unwrap_or_else(|| self.life.pack.biome_spawns(self.biome_str(p), key))
+    }
+
+    /// `spawn_list_at` on the starts decoded for a natural spawn pass: each start's pieces are
+    /// read from its NBT once per pass instead of on every attempt (a fortress has hundreds).
+    pub(crate) fn spawn_list_decoded(
+        &self,
+        starts: &mut DecodedStarts,
+        cat: Category,
+        key: &str,
+        p: [i32; 3],
+    ) -> Arc<[Value]> {
+        if cat == Category::Monster
+            && self.bname([p[0], p[1] - 1, p[2]]) == "minecraft:nether_bricks"
+            && self.in_structure_decoded(starts, p, "minecraft:fortress")
+        {
+            return fortress_list();
+        }
+        let found = self.decoded_starts_find(starts, p, |name, start| {
+            let ov = self.life.pack.structure_spawns(name, key)?;
+            let hit = if ov.piece { start.has_piece_at(p) } else { inside(&start.full_box(ov.grow), p) };
+            hit.then(|| ov.spawns.clone())
+        });
+        found.unwrap_or_else(|| self.life.pack.biome_spawns(self.biome_str(p), key))
+    }
+
+    /// `in_structure` on the decoded starts.
+    fn in_structure_decoded(&self, starts: &mut DecodedStarts, p: [i32; 3], id: &str) -> bool {
+        self.decoded_starts_find(starts, p, |n, start| {
+            (n == id && inside(&start.full_box(start.adapts_terrain), p)).then_some(())
+        })
+        .is_some()
+    }
+
+    /// `structure_starts_find` on the decoded starts: the references of the chunk of `p` are
+    /// read as before, each start they name decoded on its first use in the pass.
+    fn decoded_starts_find<R>(
+        &self,
+        starts: &mut DecodedStarts,
+        p: [i32; 3],
+        mut f: impl FnMut(&str, &StartBoxes) -> Option<R>,
+    ) -> Option<R> {
+        let Some(Some(c)) = self.chunks.get(&(p[0] >> 4, p[2] >> 4)) else { return None };
+        let Some(Nbt::Compound(refs)) = c.root.get("structures").and_then(|s| s.get("References")) else {
+            return None;
+        };
+        for (name, keys) in refs {
+            let Nbt::LongArray(keys) = keys else { continue };
+            for &k in keys {
+                if let Some(start) = starts.get_or_decode(self, unpack_chunk(k), name)
+                    && let Some(r) = f(name, start)
+                {
+                    return Some(r);
+                }
+            }
+        }
+        None
+    }
+
+    /// Boxes of the start `name` kept by chunk `chunk`; `None` when the start is not usable
+    /// (chunk not loaded, start missing or `INVALID`, no readable piece box), like the checks
+    /// of `structure_starts_find`.
+    fn decode_start(&self, chunk: (i32, i32), name: &str) -> Option<StartBoxes> {
+        let Some(Some(sc)) = self.chunks.get(&chunk) else { return None };
+        let start = sc.root.get("structures")?.get("starts")?.get(name)?;
+        if start.get("id").and_then(Nbt::as_str) == Some("INVALID") {
+            return None;
+        }
+        let Some(Nbt::List(children)) = start.get("Children") else { return None };
+        let pieces: Vec<Bb> = children.iter().filter_map(bb_of).collect();
+        let full = full_box_of(children, false)?;
+        let def = self.life.pack.get("worldgen/structure", name.strip_prefix("minecraft:").unwrap_or(name));
+        let adapts_terrain =
+            def.as_ref().is_some_and(|d| d["terrain_adaptation"].as_str().is_some_and(|t| t != "none"));
+        Some(StartBoxes { pieces, full, adapts_terrain, by_column: std::cell::OnceCell::new() })
+    }
+}
+
+/// The fixed fortress list, built once.
+fn fortress_list() -> Arc<[Value]> {
+    static FORTRESS: std::sync::OnceLock<Arc<[Value]>> = std::sync::OnceLock::new();
+    FORTRESS.get_or_init(|| fortress_enemies().into()).clone()
+}
+
+/// Structure starts decoded during one natural spawn pass. Nothing a pass does changes the
+/// structures of the chunks or loads one, so the boxes stay exact until the pass ends (then
+/// dropped: no invalidation to keep up with `/place`, loads or unloads).
+#[derive(Default)]
+pub(crate) struct DecodedStarts {
+    /// A pass meets a few starts: a list beats a map.
+    known: Vec<KnownStart>,
+}
+
+/// A start met during the pass, by its chunk and structure name; `boxes` is `None` for an
+/// unusable start.
+struct KnownStart {
+    chunk: (i32, i32),
+    name: Box<str>,
+    boxes: Option<StartBoxes>,
+}
+
+impl DecodedStarts {
+    fn get_or_decode(&mut self, s: &Server, chunk: (i32, i32), name: &str) -> Option<&StartBoxes> {
+        let i = match self.known.iter().position(|k| k.chunk == chunk && &*k.name == name) {
+            Some(i) => i,
+            None => {
+                self.known.push(KnownStart { chunk, name: name.into(), boxes: s.decode_start(chunk, name) });
+                self.known.len() - 1
+            }
+        };
+        self.known[i].boxes.as_ref()
+    }
+}
+
+/// Widest piece (in chunks per axis) listed under each column it covers; a wider (broken or
+/// edited) piece is tested for every position instead, so a huge box costs no huge table.
+const MAX_PIECE_COLUMNS: i32 = 32;
+
+/// Boxes of a usable structure start.
+pub(crate) struct StartBoxes {
+    /// Readable piece boxes, in the start's order.
+    pieces: Vec<Bb>,
+    /// Box enclosing every piece (not grown).
+    full: Bb,
+    /// The structure adapts the terrain (its box grown by 12 for `in_structure`).
+    adapts_terrain: bool,
+    /// Pieces by chunk column, built on the first piece query of the pass.
+    by_column: std::cell::OnceCell<PiecesByColumn>,
+}
+
+/// Indices of the pieces overlapping each chunk column, plus the too wide ones.
+struct PiecesByColumn {
+    columns: hashbrown::HashMap<(i32, i32), Vec<u32>>,
+    wide: Vec<u32>,
+}
+
+impl StartBoxes {
+    /// The enclosing box, grown by 12 when `grow`.
+    fn full_box(&self, grow: bool) -> Bb {
+        let mut b = self.full;
+        if grow {
+            for i in 0..3 {
+                b[i] -= 12;
+                b[i + 3] += 12;
+            }
+        }
+        b
+    }
+
+    /// A piece contains `p` (`in_piece`): outside the enclosing box no piece can; inside, only
+    /// the pieces overlapping the column of `p` are tested (5 to 20 instead of hundreds).
+    fn has_piece_at(&self, p: [i32; 3]) -> bool {
+        if !inside(&self.full, p) {
+            return false;
+        }
+        let index = self.by_column.get_or_init(|| self.group_by_column());
+        let hit = |i: &u32| inside(&self.pieces[*i as usize], p);
+        index.columns.get(&(p[0] >> 4, p[2] >> 4)).is_some_and(|l| l.iter().any(hit)) || index.wide.iter().any(hit)
+    }
+
+    fn group_by_column(&self) -> PiecesByColumn {
+        let mut index = PiecesByColumn { columns: hashbrown::HashMap::new(), wide: Vec::new() };
+        for (i, b) in self.pieces.iter().enumerate() {
+            let (x0, x1, z0, z1) = (b[0] >> 4, b[3] >> 4, b[2] >> 4, b[5] >> 4);
+            if x1 - x0 >= MAX_PIECE_COLUMNS || z1 - z0 >= MAX_PIECE_COLUMNS {
+                index.wide.push(i as u32);
+                continue;
+            }
+            for cx in x0..=x1 {
+                for cz in z0..=z1 {
+                    index.columns.entry((cx, cz)).or_default().push(i as u32);
+                }
+            }
+        }
+        index
     }
 }
 

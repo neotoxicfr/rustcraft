@@ -87,7 +87,7 @@ impl Furnace {
         }
     }
 
-    fn write(&self, be: &mut Nbt) {
+    pub(crate) fn write(&self, be: &mut Nbt) {
         set(be, "cooking_time_spent", Nbt::Int(self.timer));
         set(be, "cooking_total_time", Nbt::Int(self.total));
         set(be, "lit_time_remaining", Nbt::Int(self.lit_remaining));
@@ -112,13 +112,40 @@ impl Furnace {
             (None, Some(_)) => true,
         };
         if changed {
-            self.total = new
-                .as_ref()
-                .and_then(|s| recipes.cooking(items, cook_kind(self.kind), s))
-                .map_or(200, |(_, c)| total_time(c.time, self.speed));
+            self.total = self.total_time_for(new.as_ref(), recipes, items);
             self.timer = 0;
         }
         self.items[0] = new;
+    }
+
+    /// Cooking time of an ingredient: its recipe's time at this furnace's speed, 200 without a
+    /// recipe (an empty slot included).
+    fn total_time_for(&self, input: Option<&Stack>, recipes: &crate::recipes::Recipes, items: &crate::items::Items) -> i32 {
+        input
+            .and_then(|s| recipes.cooking(items, cook_kind(self.kind), s))
+            .map_or(200, |(_, c)| total_time(c.time, self.speed))
+    }
+
+    /// The game's container write of slot `i` (commands): unlike a stack that grows or is
+    /// taken, a write of anything but the same item into the ingredient slot (an empty write
+    /// included) restarts cooking. Returns whether the furnace marked itself changed, which
+    /// only that restart does (comparators are not told about the fuel or result slots).
+    pub(crate) fn set_slot(
+        &mut self,
+        i: usize,
+        new: Option<Stack>,
+        recipes: &crate::recipes::Recipes,
+        items: &crate::items::Items,
+    ) -> bool {
+        let same_item = matches!((&self.items[i], &new), (Some(a), Some(b)) if same(a, b));
+        let restart = i == 0 && !same_item;
+        self.items[i] = new;
+        if restart {
+            self.total = self.total_time_for(self.items[0].as_ref(), recipes, items);
+            self.timer = 0;
+        }
+        self.dirty = true;
+        restart
     }
 }
 

@@ -50,7 +50,13 @@ impl std::fmt::Debug for PlaceData {
 }
 
 impl Server {
+    /// Generation data and generator of the open dimension for `/place` and the live features
+    /// (with the structures of the world).
     pub(crate) fn place_data(&mut self) -> Option<(Arc<WorldData>, Arc<DimGen>)> {
+        if crate::generation::command_generators::one_command_generator() {
+            let dg = self.command_generator(self.world_has_structures())?;
+            return Some((self.world_data()?, dg));
+        }
         if let Some(p) = &self.prog.place
             && p.dim == self.dim.name
         {
@@ -67,7 +73,11 @@ impl Server {
     }
 
     /// Generator of the open dimension with its structures (kept with the `place` data).
-    fn structured_gen(&mut self) -> Option<(Arc<WorldData>, Arc<DimGen>)> {
+    pub(crate) fn structured_gen(&mut self) -> Option<(Arc<WorldData>, Arc<DimGen>)> {
+        if crate::generation::command_generators::one_command_generator() {
+            let dg = self.command_generator(true)?;
+            return Some((self.world_data()?, dg));
+        }
         let (wd, _) = self.place_data()?;
         if let Some(g) = self.prog.place.as_ref().and_then(|p| p.structured.clone()) {
             return Some((wd, g));

@@ -15,6 +15,10 @@ pub(crate) mod vex;
 pub(crate) mod witch;
 
 #[cfg(test)]
+mod search_equivalence_tests;
+#[cfg(test)]
+mod search_scenarios;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod world_tests;
@@ -176,6 +180,10 @@ pub fn is_raider(k: Kind) -> bool {
     is_illager(k) || k == Kind::Ravager || k == Kind::Witch
 }
 
+/// The species of `is_raider`, for the per-species index (`Mobs::of_kinds`).
+pub const RAIDER_KINDS: [Kind; 6] =
+    [Kind::Pillager, Kind::Vindicator, Kind::Evoker, Kind::Illusioner, Kind::Ravager, Kind::Witch];
+
 /// Spell caster.
 pub fn is_spellcaster(k: Kind) -> bool {
     matches!(k, Kind::Evoker | Kind::Illusioner)
@@ -282,11 +290,8 @@ pub fn sync_data(m: &mut Mob) {
     // The witch never "uses" an item on the living side: her drink goes through index 17.
     let using = m.kind != Kind::Witch && m.use_ticks >= 0;
     m.set(8, Meta::Byte(i8::from(using)));
-    // Vex: no gravity from its first tick.
+    // Vex: its no gravity from the first tick is a common value.
     if m.kind == Kind::Vex {
-        if m.tick_count > 0 {
-            m.set(5, Meta::Bool(true));
-        }
         m.set(16, Meta::Byte(i8::from(m.ill.vex_charging)));
         return;
     }
@@ -437,12 +442,31 @@ pub fn ominous_banner() -> Stack {
 
 /// The comparison of two item stacks with the ominous banner (same item, same components, same count).
 pub fn is_ominous_banner(s: &Stack) -> bool {
-    let b = ominous_banner();
-    s.id == b.id && s.count == b.count && components_eq(s.components.as_ref(), b.components.as_ref())
+    if crate::poi::new_search_path(rc_data::opt_switch!("RUSTCRAFT_OPT_OMINOUSFAST")) {
+        is_ominous_banner_against_kept_reference(s)
+    } else {
+        is_ominous_banner_building_reference(s)
+    }
 }
 
-/// Components equal up to key order.
-fn components_eq(a: Option<&Nbt>, b: Option<&Nbt>) -> bool {
+/// Old path: the reference banner (about 35 allocations) built again at each comparison.
+fn is_ominous_banner_building_reference(s: &Stack) -> bool {
+    let b = ominous_banner();
+    s.id == b.id && s.count == b.count && top_level_components_eq(s.components.as_ref(), b.components.as_ref())
+}
+
+/// Item and count first (no other stack goes further), then the components against a
+/// reference built once (`RUSTCRAFT_OPT_OMINOUSFAST`).
+fn is_ominous_banner_against_kept_reference(s: &Stack) -> bool {
+    static REFERENCE: std::sync::LazyLock<Stack> = std::sync::LazyLock::new(ominous_banner);
+    crate::poi::note_search_path("ominous banner kept reference");
+    s.id == REFERENCE.id
+        && s.count == REFERENCE.count
+        && top_level_components_eq(s.components.as_ref(), REFERENCE.components.as_ref())
+}
+
+/// Components equal up to the order of the top-level keys (nested values compared as they are).
+fn top_level_components_eq(a: Option<&Nbt>, b: Option<&Nbt>) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some(Nbt::Compound(x)), Some(Nbt::Compound(y))) => {
@@ -742,7 +766,7 @@ impl Server {
         }
     }
 
-    /// End of the tick (vex: limited life).
+    /// End of the tick (vex: no gravity, limited life).
     pub(crate) fn illager_post_tick(&mut self, m: &mut Mob) {
         if m.kind == Kind::Vex {
             self.vex_post_tick(m);

@@ -7,6 +7,7 @@ use rc_proto::nbt::Nbt;
 
 use super::super::mob::{Ent, Mob};
 use super::super::mth::{DEG, block_of, cos, dist2, sin};
+use super::super::nav::Path;
 use super::super::species::Kind;
 use crate::nbtio;
 use crate::player::Stack;
@@ -378,23 +379,47 @@ impl Server {
     }
 
     fn naut_visible_contains(&self, m: &mut Mob, b: &mut Brain, e: Ent) -> bool {
-        let Some(v) = b.visible.as_mut() else { return false };
-        let Some(slot) = v.iter_mut().find(|(x, _)| *x == e) else { return false };
-        if let Some(r) = slot.1 {
+        let Some(i) = b.visible.as_ref().and_then(|v| v.iter().position(|(x, _)| *x == e)) else { return false };
+        self.naut_visible_at(m, b, i)
+    }
+
+    /// Verdict on the `i`-th visible entity: the targeting test, computed once then kept.
+    fn naut_visible_at(&self, m: &mut Mob, b: &mut Brain, i: usize) -> bool {
+        let Some((e, kept)) = b.visible.as_ref().map(|v| v[i]) else { return false };
+        if let Some(r) = kept {
             return r;
         }
         let r = self.targeting_ok(m, e, false, self.mobs.pig.sensor_range, true, true);
-        if let Some(v) = b.visible.as_mut()
-            && let Some(slot) = v.iter_mut().find(|(x, _)| *x == e)
-        {
-            slot.1 = Some(r);
+        if let Some(v) = b.visible.as_mut() {
+            v[i].1 = Some(r);
         }
         r
     }
 
+    /// Closest visible entity accepted by `f` and seen (the list is sorted by distance).
     fn naut_visible_closest(&self, m: &mut Mob, b: &mut Brain, f: &dyn Fn(&Server, Ent) -> bool) -> Option<Ent> {
-        let list: Vec<Ent> = b.visible.as_ref()?.iter().map(|x| x.0).collect();
-        list.into_iter().find(|&e| f(self, e) && self.naut_visible_contains(m, b, e))
+        self.nautilus_visible_closest(m, b, f, skips_copies_and_dead_work())
+    }
+
+    /// `naut_visible_closest`; `in_place`: the list walked by position, otherwise copied first.
+    pub(crate) fn nautilus_visible_closest(
+        &self,
+        m: &mut Mob,
+        b: &mut Brain,
+        f: &dyn Fn(&Server, Ent) -> bool,
+        in_place: bool,
+    ) -> Option<Ent> {
+        if !in_place {
+            let list: Vec<Ent> = b.visible.as_ref()?.iter().map(|x| x.0).collect();
+            return list.into_iter().find(|&e| f(self, e) && self.naut_visible_contains(m, b, e));
+        }
+        // Each entry is unique and only its kept verdict changes: walk the list by position
+        // instead of copying it, and fill the verdict in place.
+        let len = b.visible.as_ref()?.len();
+        (0..len).find_map(|i| {
+            let e = b.visible.as_ref()?[i].0;
+            (f(self, e) && self.naut_visible_at(m, b, i)).then_some(e)
+        })
     }
 
     /// Brain, activity, return area.
@@ -506,10 +531,11 @@ impl Server {
             b.look_sink.end = t + self.naut_duration(45, 90);
         }
         if !b.fight && !zombie && !b.love.running && b.visible.is_some() && b.breed.is_none() && !b.panicking && m.in_love > 0 {
-            let me = m.clone();
+            // The partner test reads three fields of the nautilus: copy those, not the whole mob.
+            let me = if skips_copies_and_dead_work() { Suitor::of(m) } else { Suitor::of(&std::hint::black_box(m.clone())) };
             let f = move |s: &Server, e: Ent| match e {
                 Ent::Mob(id) => s.mob_ref(id).is_some_and(|o| {
-                    o.kind == Kind::Nautilus && can_mate(&me, o) && !o.sea.brain.as_ref().is_some_and(|x| x.panicking)
+                    o.kind == Kind::Nautilus && me.can_mate(o) && !o.sea.brain.as_ref().is_some_and(|x| x.panicking)
                 }),
                 Ent::Player => false,
             };
@@ -527,7 +553,7 @@ impl Server {
             b.move_sink.end = t + self.naut_duration(150, 250);
             b.path = true;
             let sp = f64::from(b.move_speed);
-            let p = m.nav.path.clone();
+            let p = current_path(m);
             self.move_to_path(m, p, sp);
         }
         // Fixed-duration behaviors (60) still draw their duration at start.
@@ -749,7 +775,7 @@ impl Server {
                 if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 4 && self.naut_compute_path(m, b, w) {
                     b.move_last = Some(tb);
                     let sp = f64::from(b.move_speed);
-                    let p = m.nav.path.clone();
+                    let p = current_path(m);
                     self.move_to_path(m, p, sp);
                 }
             }
@@ -788,15 +814,7 @@ impl Server {
     /// Charge: the first attackable living entity in the box takes the hit and knockback.
     pub(crate) fn charge_hit(&mut self, m: &mut Mob, b: &mut Brain) {
         let bb = m.bbox();
-        let mut hit: Option<Ent> = None;
-        let ids: Vec<i32> =
-            self.mobs.list.iter().filter(|o| o.touches(&bb) && o.alive()).map(|o| o.id).collect();
-        for id in ids {
-            if self.targeting_ok(m, Ent::Mob(id), true, 0.0, false, false) {
-                hit = Some(Ent::Mob(id));
-                break;
-            }
-        }
+        let mut hit = self.charged_mob(m, &bb, super::super::index::one_pass_scans()).map(Ent::Mob);
         if hit.is_none() && self.player_aabb().intersects(&bb) && self.targeting_ok(m, Ent::Player, true, 0.0, false, false) {
             hit = Some(Ent::Player);
         }
@@ -863,6 +881,17 @@ impl Server {
         m.vel[0] *= 0.6;
         m.vel[2] *= 0.6;
         self.charge_stop(b);
+    }
+
+    /// First living mob of the list in the box `bb` that the charging nautilus may attack.
+    pub(crate) fn charged_mob(&self, m: &mut Mob, bb: &rc_physics::Aabb, one_pass: bool) -> Option<i32> {
+        let attackable = |m: &mut Mob, id| self.targeting_ok(m, Ent::Mob(id), true, 0.0, false, false);
+        if one_pass {
+            // The targeting test does not change the list: test each mob as it comes.
+            return self.mobs.list.iter().find(|o| o.touches(bb) && o.alive() && attackable(m, o.id)).map(|o| o.id);
+        }
+        let ids: Vec<i32> = self.mobs.list.iter().filter(|o| o.touches(bb) && o.alive()).map(|o| o.id).collect();
+        ids.into_iter().find(|&id| attackable(m, id))
     }
 
     fn naut_lock_gaze(&mut self, m: &mut Mob, b: &mut Brain, pid: i32) {
@@ -932,7 +961,10 @@ impl Server {
             p.reset_love();
         }
         self.mob_event(m, 18);
-        self.s9_bred(m, partner, Some(&baby)); // S9: statistic and trigger, like the common routine
+        if !skips_copies_and_dead_work() {
+            // Old path: a second statistic call, which records nothing since both loves were reset.
+            self.s9_bred(m, partner, Some(&baby));
+        }
         if self.rule("minecraft:mob_drops", true) {
             let xp = m.rng.next_int_bound(7) + 1;
             self.spawn_orbs(m.pos(), xp);
@@ -1115,9 +1147,42 @@ impl Server {
     }
 }
 
+/// The nautilus skips its copies and dead work (default): the partner search copies three fields
+/// instead of the whole mob, the visible list is walked in place, a path restarted is moved
+/// instead of copied, and the second statistic call of a birth (which records nothing) is gone.
+/// `RUSTCRAFT_OPT_NAUTILUSNOCLONE=0`: old path.
+fn skips_copies_and_dead_work() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_NAUTILUSNOCLONE")
+}
+
+/// The current path handed to a path restart. The restart keeps its path when given an equal one,
+/// so moving the path out leaves the same navigation as copying it, without copying its nodes.
+fn current_path(m: &mut Mob) -> Option<Path> {
+    if skips_copies_and_dead_work() { m.nav.path.take() } else { m.nav.path.clone() }
+}
+
+/// What the partner test reads of a nautilus looking for a mate.
+#[derive(Clone, Copy)]
+pub(crate) struct Suitor {
+    id: i32,
+    in_love: i32,
+    age: i32,
+}
+
+impl Suitor {
+    pub(crate) fn of(m: &Mob) -> Suitor {
+        Suitor { id: m.id, in_love: m.in_love, age: m.age }
+    }
+
+    /// Two adult nautiluses in love, distinct.
+    pub(crate) fn can_mate(self, o: &Mob) -> bool {
+        o.id != self.id && o.kind == Kind::Nautilus && self.in_love > 0 && o.in_love > 0 && o.age == 0 && self.age == 0
+    }
+}
+
 /// Two adult nautiluses in love, distinct.
 fn can_mate(m: &Mob, o: &Mob) -> bool {
-    o.id != m.id && o.kind == Kind::Nautilus && m.in_love > 0 && o.in_love > 0 && o.age == 0 && m.age == 0
+    Suitor::of(m).can_mate(o)
 }
 
 /// Anger set by a hit received from a living entity.

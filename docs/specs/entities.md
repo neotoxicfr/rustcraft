@@ -1310,6 +1310,22 @@ Model conventions (reminder, valid everywhere):
   below therefore write either an absolute value (=), or an increment (+=) on the base pose.
 - Model frame: Y down (the definitions are "upside down"), model origin 24 px above
   the feet; the engine corrects it with the scale (-1, -1, 1) and the translation of -1.501 block (§1.2).
+- Every `sin` / `cos` of the formulas below, of the model animations as of the entity renders
+  (orbs, creeper swell, arrow shake, item bob, armor stand wiggle, fish wobble, boats, minecarts,
+  end crystal, shulker bullet, guardian beam, block entities), is the game's tabulated sine: 65,536
+  steps per turn, the float angle widened to a double, multiplied by 65,536 / 2π, truncated to a
+  long, low 16 bits (cosine: a quarter turn further). A few sites take the library sine in double
+  precision instead, the float argument widened, the result rounded back to a float after the
+  addition that follows: the living-entity shaking (§1.2, `cos(⌊age⌋ × 3.25) × π × 0.4`, the
+  last factor 0.4 as a float), the panda's shaking, the piglin and dragon heads (worn or placed),
+  the stunned ravager's neck (`sin(stun / 40 × 10)` with the stun ticks widened before the
+  division), the warden's tendrils, the allay's bob of its root, the boat in a bubble column
+  (`10 × sin(0.5 × ticks) × multiplier`, the product in double).
+- Angle folds: `wrap(a)` = `a % 360` (remainder with the sign of `a`) then one turn off if
+  ≥ 180, one turn on if < −180; the radian interpolation of the models brings the difference
+  into [−π, π[ by whole float turns, one at a time. The armor stand poses received keep the
+  truncated remainder (`v % 360`, negative stays negative); the swimming legs take a third of the
+  walk position as `walk × 0.33333334`.
 
 ---
 
@@ -2049,7 +2065,7 @@ pitch and relative head inverted). Squids, armor stand and dragon have none.
 Shaking: full freeze (data 7 ≥ 140); zombie/drowned/husk (18), zombie villager (19),
 skeleton alone (16, without the freeze), piglins outside the Nether (immunity 16, AI), hoglin (18), strider (19).
 Avatars then: gliding → X o × (−90 − pitch) (not during the spin attack), then Y
-of the signed angle between horizontal movement and gaze (if both > 1e-5); otherwise swimming → X
+of the signed angle between horizontal movement and gaze (head yaw; if both squared lengths > the float 1e-5); otherwise swimming → X
 w × (−90 − pitch in water, −90 out of water), then (0; −1; 0.3) in visible swimming. Drowned: X
 w × (−10 − pitch) around the middle of its box. Crouching avatar: render lowered by 2/16 × scale
 (not the shadow). Upside down: name "Dinnerbone"/"Grumm" (avatar: only if cape displayed).

@@ -14,6 +14,11 @@
 //!   same level thus do not touch each other and are computed at the same time, then written in order.
 //!   Sky zone taken down to the bottom of the world (cautious: its exact height is only known after
 //!   reading the columns).
+//! - Cheaper parallel propagation (mission C2-M02): `LIGHTATOMICVIEW` (levels viewed in place as
+//!   atomics instead of two copies of the zone), `LIGHTSPREADBUFS` (task queues kept),
+//!   `LIGHTSPREADINLINE` (step inlined, no division with the sentinel ring, plain stores for a
+//!   level spread by one task), `LIGHTSPREADAFTERSEED` (sequential propagation when the seeded
+//!   queues are short).
 //!
 //! Thread pool: called from a rayon pool thread (tests, client task), the work
 //! stays in that pool; otherwise (integrated server thread, main thread) a pool of its own for
@@ -38,6 +43,9 @@ pub(crate) const JOIN_MIN: usize = 16_384;
 pub(crate) const PAR_MIN: usize = 65_536;
 /// Entries of a level handed to a task of the parallel propagation.
 pub(crate) const CHUNK: usize = 2048;
+/// Seeded queue entries below which a large zone is still propagated on one thread
+/// (`LIGHTSPREADAFTERSEED`): under [`CHUNK`] no level could be shared anyway.
+pub(crate) const SPREAD_MIN: usize = 4 * CHUNK;
 
 /// Threads of the light pool: `RUSTCRAFT_LIGHT_THREADS`, otherwise an eighth of the logical
 /// cores, at least 2 (micro-bench: beyond 8 threads, a resolution of a few hundred
@@ -155,12 +163,18 @@ fn sky_part(gr: &impl LightGrid, c: &Ctx, z: &Cells, lsky: &mut [u8], lane: &mut
 /// Block propagation of [`pair`], timed, with the entries each level held.
 fn block_part(c: &Ctx, z: &Cells, blk: &[u8], lane2: &mut Lane, g: Geo, r0b: i32, nyb: i32) -> (Duration, LevelCounts) {
     let t = Instant::now();
-    let queued = if c.o.par_solve && g.cells() >= c.o.par_min {
+    let queued = if c.o.par_solve && g.cells() >= c.o.par_min && !short_queues(c, lane2) {
         install(|| spread(c, z, blk, lane2, g, r0b, nyb))
     } else {
         propagate(c, z, blk, lane2, g, r0b, nyb)
     };
     (t.elapsed(), queued)
+}
+
+/// `LIGHTSPREADAFTERSEED`: the seeded queues are too short to share; the sequential propagation
+/// then saves the atomics, the level copies and the wake-ups of the parallel one.
+fn short_queues(c: &Ctx, lane: &Lane) -> bool {
+    c.o.spread_after_seed && lane.buckets.iter().map(Vec::len).sum::<usize>() < c.o.spread_min
 }
 
 /// `LIGHTPARSOLVE`: [`compute`] spread over the thread pool.
@@ -186,7 +200,11 @@ pub(super) fn par_compute(
             return false;
         }
         let seeded = queue_lengths(&lane.buckets);
-        let queued = spread(c, z, lay, lane, g, r0, ny);
+        let queued = if short_queues(c, lane) {
+            propagate(c, z, lay, lane, g, r0, ny)
+        } else {
+            spread(c, z, lay, lane, g, r0, ny)
+        };
         count_queues(c, sky, &seeded, &queued, g, ny);
         true
     })
@@ -273,101 +291,181 @@ fn sources(grid: &impl LightGrid, c: &Ctx, z: &Cells, sg: SecGeo, g: Geo, r0: i3
 /// held when its turn came, like `propagate`.
 fn spread(c: &Ctx, z: &Cells, lay: &[u8], lane: &mut Lane, g: Geo, r0: i32, ny: i32) -> LevelCounts {
     let n = g.cells();
-    let Lane { level, buckets, shared, .. } = lane;
-    shared.clear();
-    shared.extend(level[..n].iter().map(|&v| AtomicU8::new(v)));
-    let lv: &[AtomicU8] = shared;
-    let step = |e: u64, l: usize, push: &mut dyn FnMut(usize, u64)| spread_one(c, z, lay, lv, g, r0, ny, e, l, push);
+    let Lane { level, buckets, shared, task_queues, .. } = lane;
+    let levels: &[AtomicU8] = if c.o.atomic_view {
+        as_atomic(&mut level[..n])
+    } else {
+        shared.clear();
+        shared.extend(level[..n].iter().map(|&v| AtomicU8::new(v)));
+        shared
+    };
     let mut queued = [0u32; 16];
     for l in (2..16usize).rev() {
         let mut front = std::mem::take(&mut buckets[l]);
         queued[l] = front.len() as u32;
         let chunk = c.o.chunk.max(1);
+        let step = Step { c, z, lay, levels, g, r0, ny, l };
         if front.len() <= chunk {
-            for &e in &front {
-                step(e, l, &mut |nv, en| buckets[nv].push(en));
-            }
+            step.alone(&front, buckets);
+        } else if c.o.spread_bufs {
+            step.shared_kept_queues(&front, chunk, task_queues, buckets);
         } else {
-            let parts: Vec<[Vec<u64>; 16]> = front
-                .par_chunks(chunk)
-                .map(|ch| {
-                    let mut loc: [Vec<u64>; 16] = Default::default();
-                    for &e in ch {
-                        step(e, l, &mut |nv, en| loc[nv].push(en));
-                    }
-                    loc
-                })
-                .collect();
-            let last = parts.len() - 1;
-            for (k, mut p) in parts.into_iter().enumerate() {
-                if sabotage(10) && k == last {
-                    continue;
-                }
-                for (m, b) in p.iter_mut().enumerate().take(l) {
-                    buckets[m].append(b);
-                }
-            }
+            step.shared_new_queues(&front, chunk, buckets);
         }
         front.clear();
         buckets[l] = front;
     }
     queued[1] = buckets[1].len() as u32;
-    for (d, a) in level[..n].iter_mut().zip(lv) {
-        *d = a.load(Relaxed);
+    if !c.o.atomic_view {
+        for (d, a) in level[..n].iter_mut().zip(shared.iter()) {
+            *d = a.load(Relaxed);
+        }
     }
     queued
 }
 
-/// An entry of the queue of level `l` (same neighbours and same rules as `propagate`).
-#[allow(clippy::too_many_arguments)]
-fn spread_one(
-    c: &Ctx,
-    z: &Cells,
-    lay: &[u8],
-    level: &[AtomicU8],
+/// The levels viewed as atomics for the parallel propagation, without a copy (`LIGHTATOMICVIEW`).
+#[allow(unsafe_code)]
+fn as_atomic(levels: &mut [u8]) -> &mut [AtomicU8] {
+    const { assert!(size_of::<AtomicU8>() == 1 && align_of::<AtomicU8>() == 1) };
+    // SAFETY: `AtomicU8` has the size, alignment and bit validity of `u8` (documented guarantee,
+    // checked above), and the view keeps `levels` borrowed exclusively for its whole life: no
+    // plain access to these bytes can happen while the atomics are in use.
+    unsafe { std::slice::from_raw_parts_mut(levels.as_mut_ptr().cast::<AtomicU8>(), levels.len()) }
+}
+
+/// One level of [`spread`]: the entries of level `l` and what they read.
+#[derive(Clone, Copy)]
+struct Step<'a> {
+    c: &'a Ctx<'a>,
+    z: &'a Cells<'a>,
+    lay: &'a [u8],
+    levels: &'a [AtomicU8],
     g: Geo,
     r0: i32,
     ny: i32,
-    e: u64,
     l: usize,
-    push: &mut dyn FnMut(usize, u64),
-) {
-    let (t, o) = (c.t, c.o);
-    let i = (e as u32) as usize;
-    if level[i].load(Relaxed) as usize != l {
-        return;
-    }
-    let (plane, ax) = (g.plane as isize, g.ax as isize);
-    let offs: [isize; 6] = [-plane, plane, -ax, ax, -1, 1];
-    let r = g.ring;
-    let (xr, zr, yr) = (r..g.size[0] + r, r..g.size[2] + r, r0 + r..r0 + ny + r);
-    let dirs = if o.queue_dir { (e >> 32) as u8 } else { 63 };
-    let fi = z.face[i];
-    let ii = i as i32;
-    let (px, pz, py) = (ii % g.ax as i32, (ii / g.ax as i32) % g.az as i32, ii / g.plane as i32);
-    for (dir, s) in STEP.iter().enumerate() {
-        if dirs >> dir & 1 == 0 {
-            continue;
-        }
-        let j = if o.zone_sent {
-            i.wrapping_add_signed(offs[dir])
+}
+
+impl Step<'_> {
+    /// A front of one task, on the calling thread.
+    fn alone(&self, front: &[u64], buckets: &mut [Vec<u64>; 16]) {
+        let mut push = |nv: usize, en: u64| buckets[nv].push(en);
+        if self.c.o.spread_inline {
+            // A single task: no other thread writes the levels, a plain store suffices.
+            front.iter().for_each(|&e| self.relax_entry::<true, _>(e, &mut push));
         } else {
-            let (qx, qy, qz) = (px + s[0], py + s[1], pz + s[2]);
-            if !xr.contains(&qx) || !zr.contains(&qz) || !yr.contains(&qy) {
+            let push: &mut dyn FnMut(usize, u64) = &mut push;
+            front.iter().for_each(|&e| self.relax_entry::<false, _>(e, push));
+        }
+    }
+
+    /// A front shared over tasks of `chunk` entries, each with new queues (old path).
+    fn shared_new_queues(&self, front: &[u64], chunk: usize, buckets: &mut [Vec<u64>; 16]) {
+        let parts: Vec<[Vec<u64>; 16]> = front
+            .par_chunks(chunk)
+            .map(|entries| {
+                let mut queues: [Vec<u64>; 16] = Default::default();
+                self.relax_task(entries, &mut queues);
+                queues
+            })
+            .collect();
+        let last = parts.len() - 1;
+        for (k, mut p) in parts.into_iter().enumerate() {
+            if sabotage(10) && k == last {
                 continue;
             }
-            qy as usize * g.plane + qz as usize * g.ax + qx as usize
+            for (m, b) in p.iter_mut().enumerate().take(self.l) {
+                buckets[m].append(b);
+            }
+        }
+    }
+
+    /// Like [`Step::shared_new_queues`], each task filling queues kept in the lane from one
+    /// level and one resolution to the next (`LIGHTSPREADBUFS`): no allocation once warm.
+    fn shared_kept_queues(
+        &self,
+        front: &[u64],
+        chunk: usize,
+        kept: &mut Vec<[Vec<u64>; 16]>,
+        buckets: &mut [Vec<u64>; 16],
+    ) {
+        let tasks = front.len().div_ceil(chunk);
+        if kept.len() < tasks {
+            kept.resize_with(tasks, Default::default);
+        }
+        let kept = &mut kept[..tasks];
+        front.par_chunks(chunk).zip(kept.par_iter_mut()).for_each(|(entries, queues)| self.relax_task(entries, queues));
+        for (k, p) in kept.iter_mut().enumerate() {
+            if sabotage(10) && k == tasks - 1 {
+                p.iter_mut().for_each(Vec::clear);
+                continue;
+            }
+            // `append` leaves each task queue empty with its capacity.
+            for (m, b) in p.iter_mut().enumerate().take(self.l) {
+                buckets[m].append(b);
+            }
+        }
+    }
+
+    /// The entries of one task, other tasks running at the same time.
+    fn relax_task(&self, entries: &[u64], queues: &mut [Vec<u64>; 16]) {
+        let mut push = |nv: usize, en: u64| queues[nv].push(en);
+        if self.c.o.spread_inline {
+            entries.iter().for_each(|&e| self.relax_entry::<false, _>(e, &mut push));
+        } else {
+            // Old path: the push behind a dynamic call.
+            let push: &mut dyn FnMut(usize, u64) = &mut push;
+            entries.iter().for_each(|&e| self.relax_entry::<false, _>(e, push));
+        }
+    }
+
+    /// Relaxes the neighbours of an entry of level `l` (same neighbours and rules as `propagate`).
+    /// `ALONE`: no other task runs, so a rise is a plain store instead of an atomic maximum.
+    fn relax_entry<const ALONE: bool, P: FnMut(usize, u64) + ?Sized>(&self, entry: u64, push: &mut P) {
+        let Step { c, z, lay, levels, g, r0, ny, l } = *self;
+        let o = c.o;
+        let i = (entry as u32) as usize;
+        if levels[i].load(Relaxed) as usize != l {
+            return;
+        }
+        let (plane, ax) = (g.plane as isize, g.ax as isize);
+        let offs: [isize; 6] = [-plane, plane, -ax, ax, -1, 1];
+        let r = g.ring;
+        let (xr, zr, yr) = (r..g.size[0] + r, r..g.size[2] + r, r0 + r..r0 + ny + r);
+        let dirs = if o.queue_dir { (entry >> 32) as u8 } else { 63 };
+        let face_i = z.face[i];
+        // The coordinates only bound a zone without its sentinel ring: three divisions saved.
+        let (px, pz, py) = if o.spread_inline && o.zone_sent {
+            (0, 0, 0)
+        } else {
+            let index = i as i32;
+            (index % g.ax as i32, (index / g.ax as i32) % g.az as i32, index / g.plane as i32)
         };
-        if lay[j] & OPEN == 0 || t.occluded_faces(fi, z.face[j], dir, o.occ_tab) {
-            continue;
-        }
-        let nv = l as i32 - i32::from(z.prop[j] & 15);
-        if nv <= i32::from(level[j].load(Relaxed)) {
-            continue;
-        }
-        if level[j].fetch_max(nv as u8, Relaxed) < nv as u8 {
-            let rest = if o.queue_dir { 63 & !(1u64 << OPPOSITE[dir]) } else { 63 };
-            push(nv as usize, j as u64 | rest << 32);
+        for (dir, s) in STEP.iter().enumerate() {
+            if dirs >> dir & 1 == 0 {
+                continue;
+            }
+            let j = if o.zone_sent {
+                i.wrapping_add_signed(offs[dir])
+            } else {
+                let (qx, qy, qz) = (px + s[0], py + s[1], pz + s[2]);
+                if !xr.contains(&qx) || !zr.contains(&qz) || !yr.contains(&qy) {
+                    continue;
+                }
+                qy as usize * g.plane + qz as usize * g.ax + qx as usize
+            };
+            let Some(new_level) = rise(c, z, lay, levels[j].load(Relaxed), face_i, j, dir, l) else { continue };
+            let risen = if ALONE {
+                levels[j].store(new_level, Relaxed);
+                true
+            } else {
+                levels[j].fetch_max(new_level, Relaxed) < new_level
+            };
+            if risen {
+                let rest = if o.queue_dir { 63 & !(1u64 << OPPOSITE[dir]) } else { 63 };
+                push(new_level as usize, j as u64 | rest << 32);
+            }
         }
     }
 }

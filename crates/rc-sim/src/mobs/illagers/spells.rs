@@ -43,9 +43,8 @@ impl Server {
                 let area = rc_physics::Aabb { min: b.min.map(|v| v - 16.0), max: b.max.map(|v| v + 16.0) };
                 let vexes = self
                     .mobs
-                    .list
-                    .iter()
-                    .filter(|o| o.kind == Kind::Vex && o.alive() && o.touches(&area) && dist2(m.pos(), o.pos()) <= 256.0)
+                    .of_kind(Kind::Vex)
+                    .filter(|o| o.alive() && o.touches(&area) && dist2(m.pos(), o.pos()) <= 256.0)
                     .count() as i32;
                 m.rng.next_int_bound(8) + 1 > vexes
             }
@@ -80,15 +79,14 @@ impl Server {
             min: [b.min[0] - 16.0, b.min[1] - 4.0, b.min[2] - 16.0],
             max: [b.max[0] + 16.0, b.max[1] + 4.0, b.max[2] + 16.0],
         };
-        let cands: Vec<i32> = self
+        // Blue sheep through the per-species index; the sight checks only read the server.
+        let sheep: Vec<i32> = self
             .mobs
-            .list
-            .iter()
-            .filter(|o| o.kind == Kind::Sheep && o.alive() && (o.wool & 15) == 11 && o.touches(&area))
+            .of_kind(Kind::Sheep)
+            .filter(|o| o.alive() && (o.wool & 15) == 11 && o.touches(&area))
             .map(|o| o.id)
+            .filter(|&id| self.targeting_ok(m, Ent::Mob(id), false, 16.0, true, true))
             .collect();
-        let sheep: Vec<i32> =
-            cands.into_iter().filter(|&id| self.targeting_ok(m, Ent::Mob(id), false, 16.0, true, true)).collect();
         if sheep.is_empty() {
             return false;
         }
@@ -303,13 +301,23 @@ impl Server {
 
     /// 6 magic (indirect if the caster lives), allies spared.
     fn fangs_damage(&mut self, f: &Fangs, bb: &rc_physics::Aabb) {
+        let ids: Vec<i32> = self
+            .mobs
+            .list
+            .iter()
+            .filter(|o| o.alive() && o.touches(bb) && Some(o.id) != f.owner)
+            .map(|o| o.id)
+            .collect();
+        // The caster is copied as it is before any hit (it stays in the list: thorns and anger
+        // reach it there). `RUSTCRAFT_OPT_FANGSLAZY`: the copy is made only when something is hit,
+        // which most fangs never do.
+        let lazy = crate::poi::new_search_path(rc_data::opt_switch!("RUSTCRAFT_OPT_FANGSLAZY"));
+        if lazy && ids.is_empty() && !self.fangs_reach_player(bb) {
+            crate::poi::note_search_path("fangs without caster copy");
+            return;
+        }
         let owner = f.owner.and_then(|id| self.mob_ref(id)).filter(|o| o.alive()).cloned();
-        let ids: Vec<i32> =
-            self.mobs.list.iter().filter(|o| o.alive() && o.touches(bb)).map(|o| o.id).collect();
         for id in ids {
-            if Some(id) == f.owner {
-                continue;
-            }
             let Some(i) = self.mob_index(id) else { continue };
             let mut o = self.mobs.list.take(i).expect("mob");
             match &owner {
@@ -329,7 +337,7 @@ impl Server {
             }
             self.mobs.list.put(i, o);
         }
-        if self.game_mode != 3 && self.ent_alive(Ent::Player) && self.player_aabb().intersects(bb) {
+        if self.fangs_reach_player(bb) {
             match &owner {
                 None => {
                     self.hurt("minecraft:magic", 6.0);
@@ -343,6 +351,10 @@ impl Server {
                 }
             }
         }
+    }
+
+    fn fangs_reach_player(&self, bb: &rc_physics::Aabb) -> bool {
+        self.game_mode != 3 && self.ent_alive(Ent::Player) && self.player_aabb().intersects(bb)
     }
 
     /// Launch of the evoker's summoning spell: 3 vexes at ±2 blocks, one block higher, life of

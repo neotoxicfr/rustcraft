@@ -11,9 +11,10 @@ description = "Protocol 777 packets (Java Edition 26.3): structures and codecs"
 rc-proto.workspace = true
 rc-world.workspace = true
 thiserror.workspace = true
+# Switch `RUSTCRAFT_OPT_INTERN_UNIFORM_LIGHT` read when light sheets are decoded.
+rc-data.workspace = true
 
 [dev-dependencies]
-rc-data.workspace = true
 rc-testdata.workspace = true
 criterion.workspace = true
 mimalloc.workspace = true

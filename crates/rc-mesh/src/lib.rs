@@ -4,5 +4,6 @@ pub mod blocks;
 pub mod cull;
 pub mod fluid;
 pub mod light;
+pub mod packed_codec;
 pub mod visibility;
 pub mod wire;

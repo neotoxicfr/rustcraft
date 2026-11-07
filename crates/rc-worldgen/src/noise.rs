@@ -450,16 +450,16 @@ impl Perlin {
     #[allow(unsafe_code)]
     fn add_ypre_avx2(&self, buf: &mut [f32], v: &Volume, xz: f64, amp: f32, p: Paths, pre: &YPre) {
         #[target_feature(enable = "avx2")]
-        fn body(n: &Perlin, buf: &mut [f32], v: &Volume, xz: f64, amp: f32, p: Paths, pre: &YPre) {
+        fn add_ypre_body_avx2(n: &Perlin, buf: &mut [f32], v: &Volume, xz: f64, amp: f32, p: Paths, pre: &YPre) {
             n.add_ypre_body(buf, v, xz, amp, p, pre);
         }
-        // `Paths` is public: `p.avx2` proves nothing, the detection (cached by the
-        // standard library, one atomic read) is the only guard.
-        if !crate::opt::avx2_available() {
+        // `Paths` is public: `p.avx2` proves nothing, the detection (done once, one atomic
+        // read) is the only guard.
+        if !rc_data::cpu::has_avx2() {
             return self.add_ypre_body(buf, v, xz, amp, p, pre);
         }
         // SAFETY: AVX2 has just been detected on this processor.
-        unsafe { body(self, buf, v, xz, amp, p, pre) }
+        unsafe { add_ypre_body_avx2(self, buf, v, xz, amp, p, pre) }
     }
 
     #[cfg(not(target_arch = "x86_64"))]

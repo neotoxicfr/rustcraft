@@ -3,6 +3,7 @@
 //! the snow), defense of trusted beings, picked berries, nocturnal cry.
 
 use super::super::goals::{Goal, TBase, Who};
+use super::super::ground_items;
 use super::super::mob::{Ent, Mob};
 use super::super::mth::reduced;
 use super::super::species::Kind;
@@ -360,25 +361,7 @@ pub fn pickup(s: &mut Server, m: &mut Mob) {
     if !m.can_pickup || !m.alive() || m.dead || !s.rule("minecraft:mob_griefing", true) {
         return;
     }
-    let bb = m.bbox();
-    let hit = s
-        .life
-        .drops
-        .iter()
-        .filter(|d| {
-            !d.is_removed()
-                && d.stack.count > 0
-                && d.pickup_delay <= 0
-                && d.pos[0] + 0.125 > bb.min[0] - 1.0
-                && d.pos[0] - 0.125 < bb.max[0] + 1.0
-                && d.pos[1] + 0.25 > bb.min[1]
-                && d.pos[1] < bb.max[1]
-                && d.pos[2] + 0.125 > bb.min[2] - 1.0
-                && d.pos[2] - 0.125 < bb.max[2] + 1.0
-        })
-        .map(|d| (d.id, d.stack.clone()))
-        .find(|(_, st)| can_hold(s, m, st));
-    let Some((id, st)) = hit else { return };
+    let Some((id, st)) = pickup_choice(s, m, ground_items::filter_first()) else { return };
     if st.count > 1 {
         let rest = Stack { count: st.count - 1, ..st.clone() };
         s.spawn_item(m.pos(), [0.0; 3], rest, 0);
@@ -390,6 +373,19 @@ pub fn pickup(s: &mut Server, m: &mut Mob) {
     m.drop_chance[0] = 2.0;
     s.mob_take(id, m.id, 1);
     m.wild.since_eaten = 0;
+}
+
+/// Item the fox picks up now: the first dropped item in reach that it can hold, in list order
+/// (identifier and copy of the stack).
+pub(crate) fn pickup_choice(s: &Server, m: &Mob, filter_first: bool) -> Option<(i32, Stack)> {
+    let bb = m.bbox();
+    let mut in_reach = s.life.drops.iter().filter(|d| ground_items::in_pickup_reach(d, &bb));
+    if filter_first {
+        // Copying a stack allocates its identifier: test it in place, copy only the chosen one.
+        in_reach.find(|d| can_hold(s, m, &d.stack)).map(|d| (d.id, d.stack.clone()))
+    } else {
+        in_reach.map(|d| (d.id, d.stack.clone())).find(|(_, st)| can_hold(s, m, st))
+    }
 }
 
 /// In front of the fox, one cell above, pickup delay 40, sound.
@@ -460,14 +456,17 @@ pub fn alertable(s: &Server, m: &mut Mob) -> bool {
     {
         return true;
     }
-    let cands: Vec<i32> = s
-        .mobs
-        .list
-        .iter()
-        .filter(|o| o.id != m.id && o.alive() && o.touches(&area) && alertable_mob(o))
-        .filter(|o| !trusts(m, o.uuid))
-        .map(|o| o.id)
-        .collect();
+    alertable_mob_near(s, m, &area, super::super::index::one_pass_scans())
+}
+
+/// A worrying mob in `area` that the fox may target (list order, first one seen wins).
+pub(crate) fn alertable_mob_near(s: &Server, m: &mut Mob, area: &rc_physics::Aabb, one_pass: bool) -> bool {
+    let worrying = |o: &Mob, m: &Mob| o.id != m.id && o.alive() && o.touches(area) && alertable_mob(o) && !trusts(m, o.uuid);
+    if one_pass {
+        // The filter reads nothing the targeting test changes: test each candidate as it comes.
+        return s.mobs.list.iter().any(|o| worrying(o, m) && s.targeting_ok(m, Ent::Mob(o.id), true, 12.0, false, true));
+    }
+    let cands: Vec<i32> = s.mobs.list.iter().filter(|o| worrying(o, m)).map(|o| o.id).collect();
     cands.into_iter().any(|id| s.targeting_ok(m, Ent::Mob(id), true, 12.0, false, true))
 }
 
@@ -545,21 +544,15 @@ pub fn pick_berries(s: &mut Server, m: &mut Mob, p: [i32; 3]) {
 }
 
 /// Pickable items within ±8 (no delay, alive), in list order.
-pub fn items_near(s: &Server, m: &Mob) -> Vec<[f64; 3]> {
+pub(crate) fn items_near<'a>(s: &'a Server, m: &Mob) -> impl Iterator<Item = [f64; 3]> + 'a {
     let b = m.bbox();
     let area = rc_physics::Aabb { min: b.min.map(|v| v - 8.0), max: b.max.map(|v| v + 8.0) };
-    s.life
-        .drops
-        .iter()
-        .filter(|d| {
-            let ib = rc_physics::Aabb {
-                min: [d.pos[0] - 0.125, d.pos[1], d.pos[2] - 0.125],
-                max: [d.pos[0] + 0.125, d.pos[1] + 0.25, d.pos[2] + 0.125],
-            };
-            !d.is_removed() && d.pickup_delay <= 0 && ib.intersects(&area)
-        })
-        .map(|d| d.pos)
-        .collect()
+    s.life.drops.iter().filter(move |d| ground_items::ready_item_touches(d, &area)).map(|d| d.pos)
+}
+
+/// First pickable item within ±8, in list order (the item search goal reads only that one).
+pub fn first_item_near(s: &Server, m: &Mob) -> Option<[f64; 3]> {
+    ground_items::first_of(items_near(s, m), ground_items::filter_first())
 }
 
 /// First trusted being present: its last attacker and the timestamp of the hit

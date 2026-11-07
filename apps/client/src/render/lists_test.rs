@@ -302,6 +302,130 @@ fn changed_range_rebuilds_the_new_commands() {
     assert!(skipped > 1000, "no-change cases too rare ({skipped})");
 }
 
+/// Meshing view of a frame drawn from `eye` (`MeshingView`, `RUSTCRAFT_OPT_MESHVISIBLEONLY`).
+fn meshing_view(eye: [f64; 3], yaw: f32, pitch: f32, far: f32) -> super::super::frustum::MeshingView {
+    let (origin, pl) = planes(eye, yaw, pitch, far);
+    super::super::frustum::MeshingView::new(pl, origin, eye, crate::camera::axes(yaw, pitch).2, MIN_Y, SECTIONS)
+}
+
+/// The meshing's view of a column holds every section the draw lists draw for it, along the
+/// trajectory of the draw test, and more (the game's frustum moved back also holds sections behind
+/// the camera); columns out of the field, wholly in it and across its edge all met.
+#[test]
+fn meshing_view_holds_the_drawn_runs() {
+    use rc_mesh::wire::Sections;
+    let mut rng = Lcg(SEED ^ 7);
+    let (cols, mut reached) = world(&mut rng, 12, 5);
+    let (mut outside, mut across, mut inside, mut wider) = (0, 0, 0, 0);
+    let mut runs = Vec::new();
+    for f in 0..240u32 {
+        if f % 7 == 6 {
+            reach(&mut rng, 12, 5, &mut reached);
+        }
+        // Far plane at 4 × the render distance, as the game's and ours (`environ`): moving the
+        // frustum back never brings it inside the loaded area. The last frames from high above,
+        // looking down: whole columns in the field.
+        let ((eye, yaw, pitch), far) =
+            if f < 200 { (camera(f), 4.0 * 12.0 * 16.0) } else { (([0.5, 900.0, 0.5], f as f32, 89.0), 2000.0) };
+        let (origin, pl) = planes(eye, yaw, pitch, far);
+        let inp = ListIn {
+            columns: &cols,
+            reached: &reached,
+            planes: &pl,
+            origin,
+            eye,
+            min_y: MIN_Y,
+            sections: SECTIONS,
+            face_vertices: 4,
+            split_draws: false,
+            reached_gen: 0,
+            columns_rev: 0,
+        };
+        let view = meshing_view(eye, yaw, pitch, far);
+        for secs in reached.chunk_by(|a, b| (a.0, a.2) == (b.0, b.2)) {
+            let k = (secs[0].0, secs[0].2);
+            runs.clear();
+            column_runs(&inp, k, secs, &mut runs);
+            let mut drawn = Sections::default();
+            runs.iter().flat_map(Range::clone).for_each(|s| drawn.insert(s as i32));
+            let seen = view.sections_in_view(k, secs);
+            assert_eq!(seen.intersection(drawn), drawn, "frame {f}, column {k:?}: a drawn section left out");
+            wider += usize::from(seen != drawn);
+            match drawn.count(SECTIONS as usize) {
+                0 => outside += 1,
+                n if n == secs.len() => inside += 1,
+                _ => across += 1,
+            }
+        }
+    }
+    assert!(outside > 1000 && across > 100 && inside > 1000, "cases {outside} / {across} / {inside}");
+    assert!(wider > 100, "columns with sections in view behind the camera too rare ({wider})");
+}
+
+/// Game rule of the sections to rebuild: a dirty section just behind the camera (a lamp or a door
+/// changing 4 to 6 blocks behind the player) is in the meshing view, so a quick half-turn shows it
+/// rebuilt; the draw's frustum leaves it out. Two sections behind, it is out of both.
+#[test]
+fn section_just_behind_the_camera_is_in_the_meshing_view() {
+    // Eye at z 4.5 looking south (+z), at height 70.5: its section is 8 (MIN_Y −64).
+    let (eye, yaw, pitch, far) = ([4.5, 70.5, 4.5], 0.0, 0.0, 12.0 * 16.0);
+    assert!(crate::camera::axes(yaw, pitch).2.z > 0.99, "yaw 0 looks south");
+    let (origin, drawn_planes) = planes(eye, yaw, pitch, far);
+    let drawn = super::super::frustum::MeshingView { planes: drawn_planes, origin, min_y: MIN_Y, sections: SECTIONS };
+    let view = meshing_view(eye, yaw, pitch, far);
+    let behind = [(0, 8, -1)];
+    assert!(drawn.sections_in_view((0, -1), &behind).is_empty(), "the draw's frustum keeps it");
+    assert!(view.sections_in_view((0, -1), &behind).contains(8), "the section just behind is not rebuilt");
+    let far_behind = [(0, 8, -2)];
+    assert!(view.sections_in_view((0, -2), &far_behind).is_empty(), "two sections behind is rebuilt");
+}
+
+/// The moved-back frustum holds the camera's 8-block cell along the whole trajectory of the draw
+/// test (zoomed views and looks straight up and down included), as the game requires.
+#[test]
+fn meshing_view_holds_the_camera_cell() {
+    use glam::Vec3;
+    for f in 0..400u32 {
+        let (eye, yaw, pitch) = camera(f);
+        // Looks straight down and straight up now and then.
+        let pitch = match f % 50 {
+            0 => 90.0,
+            1 => -90.0,
+            _ => pitch,
+        };
+        let (origin, _) = planes(eye, yaw, pitch, 12.0 * 16.0);
+        let view = meshing_view(eye, yaw, pitch, 12.0 * 16.0);
+        let local = |v: f64, i: usize| (v - [f64::from(origin[0]), 0.0, f64::from(origin[1])][i]) as f32;
+        let corner = |round: fn(f64) -> f64| Vec3::from(std::array::from_fn(|i| local(round(eye[i] / 8.0) * 8.0, i)));
+        assert!(aabb_inside(&view.planes, corner(f64::floor), corner(f64::ceil)), "frame {f}: cell not held");
+    }
+}
+
+/// Micro-bench of the meshing's view (`cargo test --release -- --ignored meshing_view_bench
+/// --nocapture`): sections in view of every reached column, distance 12 and 32, one core.
+#[test]
+#[ignore]
+fn meshing_view_bench() {
+    for r in [12, 32] {
+        let mut rng = Lcg(SEED);
+        let (_, reached) = world(&mut rng, r, 5);
+        let columns: Vec<&[(i32, i32, i32)]> = reached.chunk_by(|a, b| (a.0, a.2) == (b.0, b.2)).collect();
+        let frames = 200u32;
+        let mut seen = 0usize;
+        let t = std::time::Instant::now();
+        for f in 0..frames {
+            let eye = [0.5, 70.0, 0.5];
+            let view = meshing_view(eye, f as f32 * 0.9, 10.0, r as f32 * 16.0);
+            for secs in &columns {
+                let s = view.sections_in_view((secs[0].0, secs[0].2), secs);
+                seen += s.count(SECTIONS as usize);
+            }
+        }
+        let ns = t.elapsed().as_secs_f64() * 1e9 / f64::from(frames) / columns.len() as f64;
+        println!("meshing view distance {r}: {ns:.1} ns per column ({} columns, {seen} sections seen)", columns.len());
+    }
+}
+
 /// Grid of reached sections = set of the same sections, over the whole box and beyond.
 #[test]
 fn reach_grid_matches_the_set() {

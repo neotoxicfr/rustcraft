@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use glam::{Mat4, Vec3};
 use rc_assets::texture::Image;
+use rc_data::java_math::{euclid_remainder_by_one, remainder_by_one};
 use rc_data::{EntityLayer, VersionData};
 
 use crate::entities::{Entity, Kind, Size, rot_lerp};
@@ -23,10 +24,10 @@ mod blocks;
 pub use blocks::BlockFrame;
 mod creatures;
 pub(crate) use creatures::{warden_beat, warden_dig_ticks};
-// Transient blocks (`docs/specs/miscellaneous.md` § 5.5).
-mod misc;
 mod dragon;
 mod keyframes;
+// Transient blocks (`docs/specs/miscellaneous.md` § 5.5).
+mod misc;
 mod wither;
 // Maps (`docs/specs/maps.md` § 6): pixels, decorations, background in hand.
 mod maps;
@@ -37,11 +38,11 @@ mod shulker;
 mod tests_g1f08;
 #[cfg(test)]
 mod tests_g2f03;
+#[cfg(test)]
+mod tests_c3m11;
 // Entity objects and maps (mission G2-F05).
 #[cfg(test)]
 mod tests_g2f05;
-#[cfg(test)]
-mod tests_c3m11;
 #[cfg(test)]
 mod tests_moving_block_tints;
 // Dragon effects, creaking tearing itself down (mission G4-F16a).
@@ -109,7 +110,8 @@ pub fn water_track(
         }
         if guardian {
             let below = [e.pos[0].floor() as i32, e.pos[1].floor() as i32 - 1, e.pos[2].floor() as i32];
-            let top = data.state(state(below[0], below[1], below[2])).is_some_and(|s| top_full(data.shape(s.collision)));
+            let top =
+                data.state(state(below[0], below[1], below[2])).is_some_and(|s| top_full(data.shape(s.collision)));
             e.extra[9] = f32::from(u8::from(top));
         }
     }
@@ -260,6 +262,62 @@ struct PoseEnv {
     in_water: bool,
 }
 
+/// Dragon jaw and piglin ears of a skull (`kind` 4 and 5), worn or placed, at the rhythm
+/// `anim`; the other skulls do not move.
+pub(super) fn animate_head(p: &mut Pose<'_>, kind: usize, anim: f32) {
+    match kind {
+        4 => p.set("jaw", |q| q[3] = dragon_head_jaw_angle(anim)),
+        5 => {
+            let [left, right] = piglin_head_ear_angles(anim);
+            p.set("left_ear", |q| q[5] = left);
+            p.set("right_ear", |q| q[5] = right);
+        }
+        _ => {}
+    }
+}
+
+/// The game takes this sine in double precision (the library, not its table): the float angle
+/// widened first, rounded back to a float after adding the offset.
+fn dragon_head_jaw_angle(anim: f32) -> f32 {
+    (f64::from(anim * PI * 0.2).sin() + 1.0) as f32 * 0.2
+}
+
+/// Roll of the left and right ears, the cosines in double precision like the dragon jaw.
+fn piglin_head_ear_angles(anim: f32) -> [f32; 2] {
+    let left = -((f64::from(anim * PI * 0.2 * 1.2).cos() + 2.5) as f32) * 0.2;
+    let right = (f64::from(anim * PI * 0.2).cos() + 2.5) as f32 * 0.2;
+    [left, right]
+}
+
+/// Yaw offset (degrees) of a shaking body at `age` ticks: the game takes this cosine in double
+/// precision (the library, not its table), the phase being a float product.
+fn shaking_yaw_offset(age: f32) -> f32 {
+    let phase = age.floor() * 3.25;
+    (f64::from(phase).cos() * std::f64::consts::PI * f64::from(0.4f32)) as f32
+}
+
+/// Sideways shift of a stunned ravager's neck: the library sine in double precision, the stun
+/// ticks widened before the division.
+fn ravager_stunned_neck_shift(stun_ticks: f32) -> f32 {
+    (f64::from(stun_ticks) / 40.0 * 10.0).sin() as f32 * 3.0
+}
+
+/// Horizontal components (x, z) of the game's view vector of the living entity `e` at `pt`:
+/// the HEAD yaw (a living entity looks where its head turns) interpolated the shorter way
+/// (both angles exact at `pt` = 1), degrees to radians in floats, the sine table, products in
+/// single precision.
+fn flat_view_vector(e: &Entity, pt: f32) -> [f64; 2] {
+    const RADIANS_PER_DEGREE: f32 = 0.017_453_292;
+    let (pitch, yaw) = if pt == 1.0 {
+        (e.pitch, e.head)
+    } else {
+        (e.pitch_o + pt * (e.pitch - e.pitch_o), rot_lerp(pt, e.head_o, e.head))
+    };
+    let pitch_cos = table_cos(pitch * RADIANS_PER_DEGREE);
+    let yaw_radians = -yaw * RADIANS_PER_DEGREE;
+    [f64::from(table_sin(yaw_radians) * pitch_cos), f64::from(table_cos(yaw_radians) * pitch_cos)]
+}
+
 /// Glide yaw (radians) towards the movement direction: signed angle between the
 /// horizontal movement (interpolated from the previous tick) and the horizontal gaze; none
 /// if either is almost zero.
@@ -267,15 +325,16 @@ fn flying_y_rot(e: &Entity, pt: f32) -> Option<f32> {
     let pt64 = f64::from(pt);
     let a = &e.pose_anim;
     let mv: [f64; 3] = std::array::from_fn(|i| a.vel_o[i] + pt64 * (e.velocity[i] - a.vel_o[i]));
-    let yaw = f64::from(e.yaw_o + pt * (e.yaw - e.yaw_o)).to_radians();
-    let pitch = f64::from(e.pitch_o + pt * (e.pitch - e.pitch_o)).to_radians();
-    let look = [-yaw.sin() * pitch.cos(), yaw.cos() * pitch.cos()];
+    let look = flat_view_vector(e, pt);
     let m2 = mv[0] * mv[0] + mv[2] * mv[2];
     let l2 = look[0] * look[0] + look[1] * look[1];
-    if m2 <= 1.0e-5 || l2 <= 1.0e-5 {
+    let threshold = f64::from(1.0e-5f32);
+    if !(m2 > threshold && l2 > threshold) {
         return None;
     }
-    let dot = (mv[0] * look[0] + mv[2] * look[1]) / (m2.sqrt() * l2.sqrt());
+    // Both horizontal vectors normalised first, then their dot product, as the game rounds it.
+    let (m_len, l_len) = (m2.sqrt(), l2.sqrt());
+    let dot = (mv[0] / m_len) * (look[0] / l_len) + (mv[2] / m_len) * (look[1] / l_len);
     let sign = mv[0] * look[1] - mv[2] * look[0];
     let s = if sign > 0.0 {
         1.0
@@ -872,51 +931,68 @@ struct BakedPart {
     quads: Vec<Quad>,
 }
 
-/// Known animated parts: their index in each layer is computed at baking time (the
-/// animations designate them without hashing a string at every frame).
-const KNOWN: usize = 36;
+/// Declares the known part names with their index, once: the table of names and the lookup,
+/// a `match` that the compiler folds to a constant when the name is a literal and the call is
+/// inlined (nearly every animation site), so a part is found by one load.
+macro_rules! known_part_names {
+    ($($name:literal => $id:literal),* $(,)?) => {
+        const KNOWN_PART_NAMES: &[&str] = &[$($name),*];
 
-fn known_id(name: &str) -> Option<usize> {
-    Some(match name {
-        "head" => 0,
-        "body" => 1,
-        "right_arm" => 2,
-        "left_arm" => 3,
-        "right_leg" => 4,
-        "left_leg" => 5,
-        "right_hind_leg" => 6,
-        "left_hind_leg" => 7,
-        "right_front_leg" => 8,
-        "left_front_leg" => 9,
-        "right_wing" => 10,
-        "left_wing" => 11,
-        "right_middle_hind_leg" => 12,
-        "left_middle_hind_leg" => 13,
-        "right_middle_front_leg" => 14,
-        "left_middle_front_leg" => 15,
-        "jacket" => 16,
-        "left_sleeve" => 17,
-        "right_sleeve" => 18,
-        "left_pants" => 19,
-        "right_pants" => 20,
-        "hat" => 21,
-        "left_ear" => 22,
-        "right_ear" => 23,
-        "arms" => 24,
-        "mushrooms" => 25,
-        "neck" => 26,
-        "mouth" => 27,
-        "base_plate" => 28,
-        "right_body_stick" => 29,
-        "left_body_stick" => 30,
-        "shoulder_stick" => 31,
-        "upper_jaw" => 32,
-        "lower_jaw" => 33,
-        "base" => 34,
-        "root" => 35,
-        _ => return None,
-    })
+        #[cfg_attr(not(feature = "part-lookup-not-inlined"), inline(always))]
+        fn known_id(name: &str) -> Option<usize> {
+            Some(match name {
+                $($name => $id,)*
+                _ => return None,
+            })
+        }
+    };
 }
+
+// Known animated parts: their index in each layer is computed at baking time (the animations
+// designate them without comparing strings at every frame). The first 36 were the whole table
+// before `KNOWN_PART_NAMES`; the others are every name the animations use.
+known_part_names! {
+    "head" => 0, "body" => 1, "right_arm" => 2, "left_arm" => 3, "right_leg" => 4, "left_leg" => 5,
+    "right_hind_leg" => 6, "left_hind_leg" => 7, "right_front_leg" => 8, "left_front_leg" => 9,
+    "right_wing" => 10, "left_wing" => 11, "right_middle_hind_leg" => 12, "left_middle_hind_leg" => 13,
+    "right_middle_front_leg" => 14, "left_middle_front_leg" => 15, "jacket" => 16, "left_sleeve" => 17,
+    "right_sleeve" => 18, "left_pants" => 19, "right_pants" => 20, "hat" => 21, "left_ear" => 22,
+    "right_ear" => 23, "arms" => 24, "mushrooms" => 25, "neck" => 26, "mouth" => 27, "base_plate" => 28,
+    "right_body_stick" => 29, "left_body_stick" => 30, "shoulder_stick" => 31, "upper_jaw" => 32,
+    "lower_jaw" => 33, "base" => 34, "root" => 35,
+    "tail" => 36, "tail0" => 37, "tail1" => 38, "tail2" => 39, "tail3" => 40, "tail4" => 41, "tail5" => 42,
+    "tail6" => 43, "tail7" => 44, "tail8" => 45, "tail9" => 46, "tail10" => 47, "tail11" => 48,
+    "tail_base" => 49, "tail_fin" => 50, "tail_tip" => 51, "real_tail" => 52, "jaw" => 53, "nose" => 54,
+    "eye" => 55, "lid" => 56, "left_lid" => 57, "right_lid" => 58, "left_horn" => 59, "right_horn" => 60,
+    "left_antenna" => 61, "right_antenna" => 62, "left_chest" => 63, "right_chest" => 64,
+    "left_gills" => 65, "right_gills" => 66, "top_gills" => 67, "left_tendril" => 68,
+    "right_tendril" => 69, "left_wing_base" => 70, "right_wing_base" => 71, "left_wing_tip" => 72,
+    "right_wing_tip" => 73, "left_pages" => 74, "right_pages" => 75, "flip_page1" => 76,
+    "flip_page2" => 77, "left_saddle_line" => 78, "right_saddle_line" => 79, "reins" => 80,
+    "right_fin" => 81, "upper_body" => 82, "body_back" => 83, "bell_body" => 84, "croaking_body" => 85,
+    "egg_belly" => 86, "head_parts" => 87, "real_head" => 88, "center_head" => 89, "left_head" => 90,
+    "right_head" => 91, "neck0" => 92, "neck1" => 93, "neck2" => 94, "neck3" => 95, "neck4" => 96,
+    "ribcage" => 97, "bone" => 98, "stinger" => 99, "corals" => 100, "goggles" => 101,
+    "front_legs" => 102, "middle_legs" => 103, "back_legs" => 104, "cube" => 105, "cube0" => 106,
+    "cube1" => 107, "cube2" => 108, "cube3" => 109, "cube4" => 110, "cube5" => 111, "cube6" => 112,
+    "cube7" => 113, "inner_glass" => 114, "outer_glass" => 115, "lock" => 116, "flag" => 117,
+    "main" => 118, "layer0" => 119, "layer1" => 120, "layer2" => 121, "wind" => 122,
+    "wind_charge" => 123, "box0" => 124, "box1" => 125, "left_paddle" => 126, "right_paddle" => 127,
+    "tentacle0" => 128, "tentacle1" => 129, "tentacle2" => 130, "tentacle3" => 131, "tentacle4" => 132,
+    "tentacle5" => 133, "tentacle6" => 134, "tentacle7" => 135, "tentacle8" => 136, "spike0" => 137,
+    "spike1" => 138, "spike2" => 139, "spike3" => 140, "spike4" => 141, "spike5" => 142,
+    "spike6" => 143, "spike7" => 144, "spike8" => 145, "spike9" => 146, "spike10" => 147,
+    "spike11" => 148, "part0" => 149, "part1" => 150, "part2" => 151, "part3" => 152, "part4" => 153,
+    "part5" => 154, "part6" => 155, "part7" => 156, "part8" => 157, "part9" => 158, "part10" => 159,
+    "part11" => 160, "segment0" => 161, "segment1" => 162, "segment2" => 163, "segment3" => 164,
+    "segment4" => 165, "segment5" => 166, "segment6" => 167,
+}
+
+const KNOWN: usize = KNOWN_PART_NAMES.len();
+
+/// Size of the table before every animated name was added: under
+/// `RUSTCRAFT_OPT_KNOWN_PART_NAMES=0` the later ones are searched among the layer's names.
+const FIRST_KNOWN_PARTS: usize = 36;
 
 /// Baked layer: parts in drawing order, index of the known parts.
 pub struct BakedLayer {
@@ -1007,8 +1083,12 @@ pub struct Pose<'a> {
     layer: &'a BakedLayer,
     pub parts: Vec<[f32; 9]>,
     pub visible: Vec<bool>,
+    /// `KNOWN_PART_NAMES` of the frame, read once per layer.
+    widened_part_names: bool,
 }
 
+// The lookups are inlined everywhere (feature `part-lookup-not-inlined` builds the other
+// executable for the A/B): with a literal name the whole search folds to one table load.
 impl<'a> Pose<'a> {
     /// Definition pose of the layer, in reused buffers.
     fn reset(layer: &'a BakedLayer, mut parts: Vec<[f32; 9]>, mut visible: Vec<bool>) -> Self {
@@ -1016,35 +1096,41 @@ impl<'a> Pose<'a> {
         parts.extend(layer.parts.iter().map(|p| p.pose));
         visible.clear();
         visible.resize(layer.parts.len(), true);
-        Pose { layer, parts, visible }
+        Pose { layer, parts, visible, widened_part_names: animation_paths().widened_part_names }
     }
 
-    /// Part by name: table of known parts, otherwise search in the layer's names.
+    /// Part by name: table of known parts (the first of that name, like the search), otherwise
+    /// search in the layer's names.
+    #[cfg_attr(not(feature = "part-lookup-not-inlined"), inline(always))]
     fn index(&self, name: &str) -> Option<usize> {
         match known_id(name) {
-            Some(k) => {
+            Some(k) if k < FIRST_KNOWN_PARTS || self.widened_part_names => {
                 let i = self.layer.known[k];
                 (i != u16::MAX).then_some(usize::from(i))
             }
-            None => self.layer.names.iter().position(|n| n == name),
+            _ => self.layer.names.iter().position(|n| n == name),
         }
     }
 
+    #[cfg_attr(not(feature = "part-lookup-not-inlined"), inline(always))]
     fn get(&mut self, name: &str) -> Option<&mut [f32; 9]> {
         let i = self.index(name)?;
         Some(&mut self.parts[i])
     }
 
+    #[cfg_attr(not(feature = "part-lookup-not-inlined"), inline(always))]
     fn set(&mut self, name: &str, f: impl FnOnce(&mut [f32; 9])) {
         if let Some(p) = self.get(name) {
             f(p);
         }
     }
 
+    #[cfg_attr(not(feature = "part-lookup-not-inlined"), inline(always))]
     fn has(&self, name: &str) -> bool {
         self.index(name).is_some()
     }
 
+    #[cfg_attr(not(feature = "part-lookup-not-inlined"), inline(always))]
     fn hide(&mut self, name: &str) {
         if let Some(i) = self.index(name) {
             self.visible[i] = false;
@@ -1078,7 +1164,34 @@ fn part_matrix(p: &[f32; 9]) -> Mat4 {
 /// Sine and cosine (rendering only): reduction to a quarter turn, minimax polynomials on
 /// [−π/4, π/4]; error < 1e-6 on [−20, 20] (a few ulp of f32), invisible when rendered.
 fn sin_cos(x: f32) -> (f32, f32) {
-    let q = (x * std::f32::consts::FRAC_2_PI).round();
+    sin_cos_with(x, rc_data::opt_switch!("RUSTCRAFT_OPT_ROUND_BY_TRUNCATION"))
+}
+
+/// The library's rounding of `v` (halves away from zero) for `|v| < 2^22`, without its call:
+/// the truncation to an integer is one instruction and leaves an exact fraction. Exact halves
+/// are frequent here (a right angle halved for the quaternion is a half quarter), so a
+/// rounding to even would move bits.
+fn round_half_away_from_zero(v: f32) -> f32 {
+    let whole = (v as i32) as f32;
+    let fraction = v - whole;
+    if fraction >= 0.5 {
+        whole + 1.0
+    } else if fraction <= -0.5 {
+        whole - 1.0
+    } else {
+        whole
+    }
+}
+
+/// [`sin_cos`], the quarter turn rounded by [`round_half_away_from_zero`] (`by_truncation`)
+/// or by the library (the old path): the same quotient, so the same bits.
+fn sin_cos_with(x: f32, by_truncation: bool) -> (f32, f32) {
+    let quotient = x * std::f32::consts::FRAC_2_PI;
+    let q = if by_truncation && quotient.abs() < 4_194_304.0 {
+        round_half_away_from_zero(quotient)
+    } else {
+        quotient.round()
+    };
     // Two-step reduction (π/2 = high + low) to keep the precision.
     let r = (x - q * 1.570_796_4) + q * 4.371_139e-8;
     let r2 = r * r;
@@ -1261,6 +1374,97 @@ const fn deg(d: f32) -> f32 {
     d * PI / 180.0
 }
 
+/// Switches of the frame read by animation helpers that have no access to the renderer (about
+/// 250 trigonometric sites in the family modules): set by `prepare` from `EntOpt` for the
+/// thread that animates. A thread that never prepared keeps the new paths.
+#[derive(Clone, Copy, Debug)]
+struct AnimationPaths {
+    /// `ANIMATION_SINE_TABLE`: the game's tabulated sine.
+    sine_table: bool,
+    /// `KNOWN_PART_NAMES`: every part name of the animations has its index baked.
+    widened_part_names: bool,
+    /// `KEYFRAME_STATIC_NAMES`: keyframe animations named by literals, not formatted.
+    static_keyframe_names: bool,
+    /// `POLY_ROTATIONS`: root and family rotations through the rendering polynomials.
+    poly_rotations: bool,
+}
+
+impl AnimationPaths {
+    const NEW: AnimationPaths = AnimationPaths {
+        sine_table: true,
+        widened_part_names: true,
+        static_keyframe_names: true,
+        poly_rotations: true,
+    };
+
+    fn of(opt: &EntOpt) -> AnimationPaths {
+        AnimationPaths {
+            sine_table: opt.animation_sine_table,
+            widened_part_names: opt.known_part_names,
+            static_keyframe_names: opt.keyframe_static_names,
+            poly_rotations: opt.poly_rotations,
+        }
+    }
+}
+
+thread_local! {
+    static ANIMATION_PATHS: std::cell::Cell<AnimationPaths> = const { std::cell::Cell::new(AnimationPaths::NEW) };
+}
+
+fn animation_paths() -> AnimationPaths {
+    ANIMATION_PATHS.with(std::cell::Cell::get)
+}
+
+/// The game's tabulated sine, the one its models and entity renders animate with (65,536
+/// steps per turn, the angle widened to a double; a few in ten thousand of a radian from the
+/// exact sine). `RUSTCRAFT_OPT_ANIMATION_SINE_TABLE=0`: the C library's sine, the old path.
+#[inline]
+fn table_sin(x: f32) -> f32 {
+    if animation_paths().sine_table { rc_physics::sin_t(x) } else { x.sin() }
+}
+
+/// The game's tabulated cosine (see [`table_sin`]).
+#[inline]
+fn table_cos(x: f32) -> f32 {
+    if animation_paths().sine_table { rc_physics::cos_t(x) } else { x.cos() }
+}
+
+/// Sine and cosine of an angle in degrees for a rendering matrix: folded exactly into
+/// [−180, 180[ first (a yaw grows without bound and the polynomials are only precise under
+/// 20 rad; in degrees the turn is exact), then the rendering polynomials of [`sin_cos`].
+fn rendering_sin_cos_degrees(degrees: f32) -> (f32, f32) {
+    sin_cos(deg(rc_data::java_math::wrap_degrees(degrees)))
+}
+
+/// Rotation about Y by `degrees`, for the entity roots and the family rotation stacks: the
+/// rendering sine (within 1e-6, invisible) where the library sine is a call per axis
+/// (`RUSTCRAFT_OPT_POLY_ROTATIONS=0`: the library's, the old path).
+fn rotation_y_degrees(degrees: f32) -> Mat4 {
+    if !animation_paths().poly_rotations {
+        return Mat4::from_rotation_y(deg(degrees));
+    }
+    let (s, c) = rendering_sin_cos_degrees(degrees);
+    Mat4::from_cols(glam::Vec4::new(c, 0.0, -s, 0.0), glam::Vec4::Y, glam::Vec4::new(s, 0.0, c, 0.0), glam::Vec4::W)
+}
+
+/// Rotation about X by `degrees` (see [`rotation_y_degrees`]).
+fn rotation_x_degrees(degrees: f32) -> Mat4 {
+    if !animation_paths().poly_rotations {
+        return Mat4::from_rotation_x(deg(degrees));
+    }
+    let (s, c) = rendering_sin_cos_degrees(degrees);
+    Mat4::from_cols(glam::Vec4::X, glam::Vec4::new(0.0, c, s, 0.0), glam::Vec4::new(0.0, -s, c, 0.0), glam::Vec4::W)
+}
+
+/// Rotation about Z by `degrees` (see [`rotation_y_degrees`]).
+fn rotation_z_degrees(degrees: f32) -> Mat4 {
+    if !animation_paths().poly_rotations {
+        return Mat4::from_rotation_z(deg(degrees));
+    }
+    let (s, c) = rendering_sin_cos_degrees(degrees);
+    Mat4::from_cols(glam::Vec4::new(c, s, 0.0, 0.0), glam::Vec4::new(-s, c, 0.0, 0.0), glam::Vec4::Z, glam::Vec4::W)
+}
+
 /// Pitch of the humanoid head: raised by 45° forwards while gliding.
 fn head_pitch(s: &AnimState) -> f32 {
     if s.fall_flying { -PI / 4.0 } else { s.pitch }
@@ -1274,15 +1478,15 @@ fn humanoid(p: &mut Pose<'_>, s: &AnimState) {
     });
     let q = pp * 0.6662;
     let sp = s.speed;
-    p.set("right_arm", |a| a[3] = (q + PI).cos() * 2.0 * v * 0.5 / sp);
-    p.set("left_arm", |a| a[3] = q.cos() * 2.0 * v * 0.5 / sp);
+    p.set("right_arm", |a| a[3] = table_cos(q + PI) * 2.0 * v * 0.5 / sp);
+    p.set("left_arm", |a| a[3] = table_cos(q) * 2.0 * v * 0.5 / sp);
     p.set("right_leg", |l| {
-        l[3] = q.cos() * 1.4 * v / sp;
+        l[3] = table_cos(q) * 1.4 * v / sp;
         l[4] = 0.005;
         l[5] = 0.005;
     });
     p.set("left_leg", |l| {
-        l[3] = (q + PI).cos() * 1.4 * v / sp;
+        l[3] = table_cos(q + PI) * 1.4 * v / sp;
         l[4] = -0.005;
         l[5] = -0.005;
     });
@@ -1306,32 +1510,32 @@ fn humanoid(p: &mut Pose<'_>, s: &AnimState) {
     }
     // `whack` attack (§ 2.1.2).
     if s.swing > 0.0 && s.swing_on {
-        let mut body = (s.swing.sqrt() * 2.0 * PI).sin() * 0.2;
+        let mut body = table_sin(s.swing.sqrt() * 2.0 * PI) * 0.2;
         if !s.swing_right {
             body = -body;
         }
         let age_scale = if s.baby { 0.5 } else { 1.0 };
         p.set("body", |b| b[4] = body);
         p.set("right_arm", |a| {
-            a[2] = body.sin() * 5.0 * age_scale;
-            a[0] = -body.cos() * 5.0 * age_scale;
+            a[2] = table_sin(body) * 5.0 * age_scale;
+            a[0] = -table_cos(body) * 5.0 * age_scale;
             a[4] += body;
         });
         p.set("left_arm", |a| {
-            a[2] = -body.sin() * 5.0 * age_scale;
-            a[0] = body.cos() * 5.0 * age_scale;
+            a[2] = -table_sin(body) * 5.0 * age_scale;
+            a[0] = table_cos(body) * 5.0 * age_scale;
             a[4] += body;
             a[3] += body;
         });
         if s.swing_kind == 1 {
             let out = 1.0 - (1.0 - s.swing).powi(4);
-            let a = (out * PI).sin();
+            let a = table_sin(out * PI);
             let head_x = p.get("head").map_or(0.0, |h| h[3]);
-            let b = (s.swing * PI).sin() * -(head_x - 0.7) * 0.75;
+            let b = table_sin(s.swing * PI) * -(head_x - 0.7) * 0.75;
             p.set(if s.swing_right { "right_arm" } else { "left_arm" }, |arm| {
                 arm[3] -= a * 1.2 + b;
                 arm[4] += body * 2.0;
-                arm[5] += (s.swing * PI).sin() * -0.4;
+                arm[5] += table_sin(s.swing * PI) * -0.4;
             });
         } else if s.swing_kind == 2 {
             // Lunge: body rotation removed from the arms, then thrust of the striking arm.
@@ -1350,9 +1554,16 @@ fn humanoid(p: &mut Pose<'_>, s: &AnimState) {
     }
 }
 
-/// Angular interpolation along the shortest path (radians).
-fn rot_lerp_rad(t: f32, a: f32, b: f32) -> f32 {
-    let mut d = (b - a) % (2.0 * PI);
+/// Angular interpolation along the shortest path (radians), the game's folding loops, shared by
+/// every model. `RUSTCRAFT_OPT_ANGLE_WRAP_FAST_PATH=0`: the old library remainder first, which
+/// gives the same bits for the differences under one turn that animations hand over
+/// (`radian_fold_is_the_game_loops`).
+fn lerp_angle_radians(t: f32, a: f32, b: f32) -> f32 {
+    use rc_data::java_math::{TurnRemainder, radians_remainder_with};
+    if TurnRemainder::selected() != TurnRemainder::Library {
+        return rc_data::java_math::lerp_angle_radians(t, a, b);
+    }
+    let mut d = radians_remainder_with(b - a, TurnRemainder::Library);
     if d >= PI {
         d -= 2.0 * PI;
     }
@@ -1368,7 +1579,7 @@ fn rot_lerp_rad(t: f32, a: f32, b: f32) -> f32 {
 fn swim_arms(p: &mut Pose<'_>, s: &AnimState) {
     let w = s.swim;
     if !s.fall_flying {
-        p.set("head", |h| h[3] = rot_lerp_rad(w, h[3], -PI / 4.0));
+        p.set("head", |h| h[3] = lerp_angle_radians(w, h[3], -PI / 4.0));
     }
     let pos = s.walk_pos % 26.0;
     let swinging = s.swing_on;
@@ -1389,9 +1600,9 @@ fn swim_arms(p: &mut Pose<'_>, s: &AnimState) {
             ([PI / 2.0 - PI / 2.0 * t, PI, PI], [PI / 2.0 - PI / 2.0 * t, PI, PI])
         };
         p.set("left_arm", |a| {
-            a[3] = rot_lerp_rad(lw, a[3], lt[0]);
-            a[4] = rot_lerp_rad(lw, a[4], lt[1]);
-            a[5] = rot_lerp_rad(lw, a[5], lt[2]);
+            a[3] = lerp_angle_radians(lw, a[3], lt[0]);
+            a[4] = lerp_angle_radians(lw, a[4], lt[1]);
+            a[5] = lerp_angle_radians(lw, a[5], lt[2]);
         });
         p.set("right_arm", |a| {
             a[3] += rw * (rt[0] - a[3]);
@@ -1399,21 +1610,22 @@ fn swim_arms(p: &mut Pose<'_>, s: &AnimState) {
             a[5] += rw * (rt[2] - a[5]);
         });
     }
-    p.set("left_leg", |l| l[3] += w * (0.3 * (s.walk_pos / 3.0 + PI).cos() - l[3]));
-    p.set("right_leg", |l| l[3] += w * (0.3 * (s.walk_pos / 3.0).cos() - l[3]));
+    // A third of the walk position as the game rounds it: times the float nearest 1/3.
+    p.set("left_leg", |l| l[3] += w * (0.3 * table_cos(s.walk_pos * 0.333_333_34 + PI) - l[3]));
+    p.set("right_leg", |l| l[3] += w * (0.3 * table_cos(s.walk_pos * 0.333_333_34) - l[3]));
 }
 
 /// Drowned swim: arms stretched forward that wave, alternating legs, head straight.
 fn drowned_swim(p: &mut Pose<'_>, s: &AnimState) {
     let w = s.swim;
-    let o = (0.1 * s.age).sin();
+    let o = table_sin(0.1 * s.age);
     p.set("right_arm", |a| {
-        a[3] = rot_lerp_rad(w, a[3], -PI * 4.0 / 5.0) + w * 0.35 * o;
-        a[5] = rot_lerp_rad(w, a[5], -0.15);
+        a[3] = lerp_angle_radians(w, a[3], -PI * 4.0 / 5.0) + w * 0.35 * o;
+        a[5] = lerp_angle_radians(w, a[5], -0.15);
     });
     p.set("left_arm", |a| {
-        a[3] = rot_lerp_rad(w, a[3], -PI * 4.0 / 5.0) - w * 0.35 * o;
-        a[5] = rot_lerp_rad(w, a[5], 0.15);
+        a[3] = lerp_angle_radians(w, a[3], -PI * 4.0 / 5.0) - w * 0.35 * o;
+        a[5] = lerp_angle_radians(w, a[5], 0.15);
     });
     p.set("left_leg", |l| l[3] -= w * 0.55 * o);
     p.set("right_leg", |l| l[3] += w * 0.55 * o);
@@ -1442,8 +1654,8 @@ fn idle_and_crouch(p: &mut Pose<'_>, s: &AnimState) {
             continue;
         }
         p.set(arm, |a| {
-            a[5] += f * ((s.age * 0.09).cos() * 0.05 + 0.05);
-            a[3] += f * (s.age * 0.067).sin() * 0.05;
+            a[5] += f * (table_cos(s.age * 0.09) * 0.05 + 0.05);
+            a[3] += f * table_sin(s.age * 0.067) * 0.05;
         });
     }
 }
@@ -1535,8 +1747,8 @@ fn skeleton_arms(p: &mut Pose<'_>, s: &AnimState, aggressive: bool) {
     if !aggressive || s.arm_pose.contains(&arm::BOW) {
         return;
     }
-    let swing2 = (s.swing * PI).sin();
-    let swing = ((1.0 - (1.0 - s.swing) * (1.0 - s.swing)) * PI).sin();
+    let swing2 = table_sin(s.swing * PI);
+    let swing = table_sin((1.0 - (1.0 - s.swing) * (1.0 - s.swing)) * PI);
     let x = -PI / 2.0 - (swing2 * 1.2 - swing * 0.4);
     let y = 0.1 - swing2 * 0.6;
     for (arm, f) in [("right_arm", -1.0f32), ("left_arm", 1.0)] {
@@ -1548,8 +1760,8 @@ fn skeleton_arms(p: &mut Pose<'_>, s: &AnimState, aggressive: bool) {
     }
     for (arm, f) in [("right_arm", 1.0f32), ("left_arm", -1.0)] {
         p.set(arm, |a| {
-            a[5] += f * ((s.age * 0.09).cos() * 0.05 + 0.05);
-            a[3] += f * (s.age * 0.067).sin() * 0.05;
+            a[5] += f * (table_cos(s.age * 0.09) * 0.05 + 0.05);
+            a[3] += f * table_sin(s.age * 0.067) * 0.05;
         });
     }
 }
@@ -1557,8 +1769,8 @@ fn skeleton_arms(p: &mut Pose<'_>, s: &AnimState, aggressive: bool) {
 /// Zombie arms (§ 2.2), after the humanoid animation.
 fn zombie_arms(p: &mut Pose<'_>, s: &AnimState, aggressive: bool, raise: bool) {
     let fall = if raise { -PI / if aggressive { 1.5 } else { 2.25 } } else { 0.0 };
-    let ay = (if raise { 1.0 } else { -1.0 }) * (s.swing * PI).sin();
-    let ax = ((1.0 - (1.0 - s.swing).powi(2)) * PI).sin();
+    let ay = (if raise { 1.0 } else { -1.0 }) * table_sin(s.swing * PI);
+    let ax = table_sin((1.0 - (1.0 - s.swing).powi(2)) * PI);
     let x = fall + ay * 1.2 - ax * 0.4;
     let y = 0.1 - ay * 0.6;
     // A held spear or a lunge leaves both arms in their walking pose.
@@ -1596,7 +1808,7 @@ fn quadruped_legs(p: &mut Pose<'_>, s: &AnimState, crossed: bool) {
         h[4] = s.yaw;
     });
     let q = s.walk_pos * 0.6662;
-    let (a, b) = (q.cos() * 1.4 * s.walk_speed, (q + PI).cos() * 1.4 * s.walk_speed);
+    let (a, b) = (table_cos(q) * 1.4 * s.walk_speed, table_cos(q + PI) * 1.4 * s.walk_speed);
     let (a, b) = if crossed { (b, a) } else { (a, b) };
     p.set("right_hind_leg", |l| l[3] = a);
     p.set("left_front_leg", |l| l[3] = a);
@@ -1612,16 +1824,16 @@ fn spider(p: &mut Pose<'_>, s: &AnimState) {
     let q = s.walk_pos * 0.6662;
     let v = s.walk_speed;
     let g = [
-        -(2.0 * q).cos() * 0.4 * v,
-        -(2.0 * q + PI).cos() * 0.4 * v,
-        -(2.0 * q + PI / 2.0).cos() * 0.4 * v,
-        -(2.0 * q + 3.0 * PI / 2.0).cos() * 0.4 * v,
+        -table_cos(2.0 * q) * 0.4 * v,
+        -table_cos(2.0 * q + PI) * 0.4 * v,
+        -table_cos(2.0 * q + PI / 2.0) * 0.4 * v,
+        -table_cos(2.0 * q + 3.0 * PI / 2.0) * 0.4 * v,
     ];
     let l = [
-        (q.sin() * 0.4).abs() * v,
-        ((q + PI).sin() * 0.4).abs() * v,
-        ((q + PI / 2.0).sin() * 0.4).abs() * v,
-        ((q + 3.0 * PI / 2.0).sin() * 0.4).abs() * v,
+        (table_sin(q) * 0.4).abs() * v,
+        (table_sin(q + PI) * 0.4).abs() * v,
+        (table_sin(q + PI / 2.0) * 0.4).abs() * v,
+        (table_sin(q + 3.0 * PI / 2.0) * 0.4).abs() * v,
     ];
     let pairs = [
         ("right_hind_leg", "left_hind_leg"),
@@ -1955,6 +2167,27 @@ pub(crate) struct EntOpt {
     /// `BLOCKTINTLAZY`: biome colours of a moving block (pushed, falling, transient) read only
     /// when one of its drawn states has a biome-tinted layer.
     pub block_tint_lazy: bool,
+    /// `DRAGON_EFFECTS_GATE`: the dragon's rays and crystal beam looked for only when the kind
+    /// table says the entity is the dragon (needs `KINDINFO`).
+    pub dragon_effects_gate: bool,
+    /// `SHARED_BODY_ANGLE`: the interpolated body yaw computed once per entity and handed to
+    /// the family rotations, which recomputed it.
+    pub shared_body_angle: bool,
+    /// `SKIP_IDENTITY_ROOT_FACTORS`: root factors that are the identity (no shaking, scales of
+    /// 1) not multiplied in.
+    pub skip_identity_root_factors: bool,
+    /// `ANIMATION_SINE_TABLE`: animations through the game's sine table (fidelity: the C
+    /// library's sine is a few ten-thousandths of a radian away from it).
+    pub animation_sine_table: bool,
+    /// `KNOWN_PART_NAMES`: every part name the animations use has its index baked; otherwise
+    /// only the first 36 and a search through the layer's names for the others.
+    pub known_part_names: bool,
+    /// `KEYFRAME_STATIC_NAMES`: keyframe animations named by literals instead of names
+    /// formatted at every frame (camel, rabbit, armadillo, breeze, warden).
+    pub keyframe_static_names: bool,
+    /// `POLY_ROTATIONS`: root and family rotations through the rendering polynomials (within
+    /// 1e-6 of the library sine, an approximation of the rendering like the part matrices).
+    pub poly_rotations: bool,
 }
 
 impl EntOpt {
@@ -1969,6 +2202,13 @@ impl EntOpt {
         reg_idx: false,
         item_flags: false,
         block_tint_lazy: false,
+        dragon_effects_gate: false,
+        shared_body_angle: false,
+        skip_identity_root_factors: false,
+        animation_sine_table: false,
+        known_part_names: false,
+        keyframe_static_names: false,
+        poly_rotations: false,
     };
 
     /// New paths everywhere.
@@ -1982,6 +2222,13 @@ impl EntOpt {
         reg_idx: true,
         item_flags: true,
         block_tint_lazy: true,
+        dragon_effects_gate: true,
+        shared_body_angle: true,
+        skip_identity_root_factors: true,
+        animation_sine_table: true,
+        known_part_names: true,
+        keyframe_static_names: true,
+        poly_rotations: true,
     };
 
     pub(crate) fn from_env() -> EntOpt {
@@ -1994,6 +2241,13 @@ impl EntOpt {
             reg_idx: rc_data::opt_switch!("RUSTCRAFT_OPT_REGIDX"),
             item_flags: rc_data::opt_switch!("RUSTCRAFT_OPT_ITEMFLAGS"),
             block_tint_lazy: rc_data::opt_switch!("RUSTCRAFT_OPT_BLOCKTINTLAZY"),
+            dragon_effects_gate: rc_data::opt_switch!("RUSTCRAFT_OPT_DRAGON_EFFECTS_GATE"),
+            shared_body_angle: rc_data::opt_switch!("RUSTCRAFT_OPT_SHARED_BODY_ANGLE"),
+            skip_identity_root_factors: rc_data::opt_switch!("RUSTCRAFT_OPT_SKIP_IDENTITY_ROOT_FACTORS"),
+            animation_sine_table: rc_data::opt_switch!("RUSTCRAFT_OPT_ANIMATION_SINE_TABLE"),
+            known_part_names: rc_data::opt_switch!("RUSTCRAFT_OPT_KNOWN_PART_NAMES"),
+            keyframe_static_names: rc_data::opt_switch!("RUSTCRAFT_OPT_KEYFRAME_STATIC_NAMES"),
+            poly_rotations: rc_data::opt_switch!("RUSTCRAFT_OPT_POLY_ROTATIONS"),
         }
     }
 }
@@ -3152,8 +3406,8 @@ impl EntityRenderer {
             rect[3] / 4.0,
         ];
         let a = e.age as f32 + pt;
-        let r = (((a / 2.0).sin() + 1.0) * 0.5 * 255.0).floor() as u32;
-        let b = (((a / 2.0 + std::f32::consts::PI * 4.0 / 3.0).sin() + 1.0) * 0.1 * 255.0).floor() as u32;
+        let r = ((table_sin(a / 2.0) + 1.0) * 0.5 * 255.0).floor() as u32;
+        let b = ((table_sin(a / 2.0 + std::f32::consts::PI * 4.0 / 3.0) + 1.0) * 0.1 * 255.0).floor() as u32;
         let color = r | 255 << 8 | b << 16 | 128 << 24;
         // Light at the eyes' block (the game's light probe), not at the feet.
         let (bl, sl) = self.eye_light(e, p, light);
@@ -3641,6 +3895,7 @@ impl EntityRenderer {
         }
         self.set_current(None, None);
         let opt = self.opt;
+        ANIMATION_PATHS.with(|p| p.set(AnimationPaths::of(&opt)));
         // From farthest to nearest (translucent order). Sizes (base, full)
         // computed once per entity (`SIZEONCE`); kind flags (`KINDINFO`).
         let mut list: Vec<(&Entity, f64, Option<Sizes>, KindInfo)> = entities
@@ -4264,8 +4519,13 @@ impl EntityRenderer {
             }
             // Scale of the living entity before the rotations (shulker attach pivot included);
             // brought back to 1 in the interface, like the game.
+            let skip_identity = self.opt.skip_identity_root_factors;
             if self.gui_root.is_none() {
-                m *= Mat4::from_scale(Vec3::splat(living_scale(e)));
+                let s = living_scale(e);
+                // A scale of 1 returns the matrix up to the sign of zeros (see the shaking).
+                if !(skip_identity && s == 1.0) {
+                    m *= Mat4::from_scale(Vec3::splat(s));
+                }
             }
             let ctx = RotCtx {
                 shaking: self.shaking(e),
@@ -4274,6 +4534,8 @@ impl EntityRenderer {
                 swim: state.swim,
                 env,
                 height: self.size_of(e).h,
+                shared_body_angle: self.opt.shared_body_angle,
+                skip_identity_factors: skip_identity,
             };
             pose_rotations(e, pt, body, &mut m, &ctx);
             shulker::attach(e, &mut m);
@@ -4284,7 +4546,7 @@ impl EntityRenderer {
             }
             if e.kind == "creeper" {
                 let g = (e.swell.0 as f32 + pt * (e.swell.1 - e.swell.0) as f32) / 28.0;
-                let w = 1.0 + (g * 100.0).sin() * g * 0.01;
+                let w = 1.0 + table_sin(g * 100.0) * g * 0.01;
                 let h = g.clamp(0.0, 1.0).powi(4);
                 let sxz = (1.0 + h * 0.4) * w;
                 scale = Vec3::new(sxz, (1.0 + h * 0.1) / w, sxz);
@@ -4299,23 +4561,25 @@ impl EntityRenderer {
             creatures::scale(e, pt, matches!(swallowed, Some(creatures::Swallowed::Block(_))), &mut scale);
             dragon::scale(e, pt, &mut scale);
             wither::scale(e, pt, &mut scale);
-            m *= Mat4::from_scale(scale);
+            if !(skip_identity && scale == Vec3::ONE) {
+                m *= Mat4::from_scale(scale);
+            }
             m *= Mat4::from_translation(creatures::model_offset(e) + Vec3::new(0.0, -1.501, 0.0));
         } else if e.kind == "evoker_fangs" {
-            m *= Mat4::from_rotation_y(deg(90.0 - e.yaw));
+            m *= rotation_y_degrees(90.0 - e.yaw);
             m *= Mat4::from_scale(Vec3::new(-1.0, -1.0, 1.0));
             m *= Mat4::from_translation(Vec3::new(0.0, -1.501, 0.0));
         } else if matches!(e.kind.as_str(), "arrow" | "spectral_arrow") {
             // Yaw − 90° then pitch; shaking after the impact.
             let yaw = e.yaw_o + (e.yaw - e.yaw_o) * pt;
             let pitch = e.pitch_o + (e.pitch - e.pitch_o) * pt;
-            m *= Mat4::from_rotation_y(deg(yaw - 90.0)) * Mat4::from_rotation_z(deg(pitch));
+            m *= rotation_y_degrees(yaw - 90.0) * rotation_z_degrees(pitch);
             let s = e.shake as f32 - pt;
             if s > 0.0 {
-                m *= Mat4::from_rotation_z(deg(-(3.0 * s).sin() * s));
+                m *= rotation_z_degrees(-table_sin(3.0 * s) * s);
             }
         } else {
-            m *= Mat4::from_rotation_y(deg(-e.yaw));
+            m *= rotation_y_degrees(-e.yaw);
         }
         let overlay = (white * 15.0) as u32 | (if red { 3 } else { 10 }) << 16;
         let wool = e.meta_byte(18) as u8;
@@ -4421,18 +4685,20 @@ impl EntityRenderer {
                 Pass::Swirl => {
                     // Charged creeper: linear scroll; wither armor: oscillating u.
                     let (u, v) = if e.kind == "creeper" {
-                        (state.age * 0.01 % 1.0, state.age * 0.01 % 1.0)
+                        let scroll = remainder_by_one(state.age * 0.01);
+                        (scroll, scroll)
                     } else {
                         wither::swirl_offset(state.age)
                     };
-                    let q = |f: f32| (f.rem_euclid(1.0) * 65535.0) as u32;
+                    let q = |f: f32| (euclid_remainder_by_one(f) * 65535.0) as u32;
                     (7, 0xf0f0, q(u) | q(v) << 16)
                 }
                 // Damage overlay without white; no lightmap.
                 Pass::Emissive => (1, packed | LIGHT_EMISSIVE, overlay & 0xffff_0000),
-                // Breeze wind: scroll in u of 0.02 per tick.
+                // Breeze wind: scroll in u of 0.02 per tick (the Euclidean fraction of the
+                // fraction is that of the value itself, bit for bit).
                 Pass::Wind => {
-                    let u = (state.age * 0.02 % 1.0).rem_euclid(1.0);
+                    let u = euclid_remainder_by_one(state.age * 0.02);
                     (1, packed | LIGHT_FLAT | LIGHT_SCROLL, (u * 65535.0) as u32)
                 }
                 // Interior of the sulfur cube (layer 0 without content): fuse blinking.
@@ -4530,7 +4796,10 @@ impl EntityRenderer {
                 self.push_mob_item(e, base, m, models, &state, pt, packed);
             }
         }
-        self.dragon_effects(e, m, rel, pt, packed);
+        // The kind flag spares the call and its name comparison for every other entity.
+        if !(new && self.opt.dragon_effects_gate) || ki.has(K_ENDER_DRAGON) {
+            self.dragon_effects(e, m, rel, pt, packed);
+        }
         if living && let Some(base) = base_model {
             // Spectator avatar: no layers (cape, armor, held items).
             let spectator = self.spectators.contains(&e.uuid);
@@ -4915,8 +5184,7 @@ impl EntityRenderer {
         }
         let Some(stack) = &e.equipment[5] else { return };
         let source = self.source.clone();
-        let Some(name) =
-            usize::try_from(stack.item).ok().and_then(|i| items_in(&source, self.item_idx())?.get(i))
+        let Some(name) = usize::try_from(stack.item).ok().and_then(|i| items_in(&source, self.item_idx())?.get(i))
         else {
             return;
         };
@@ -4980,7 +5248,7 @@ impl EntityRenderer {
                 0.0,
             ));
             let (pitch, yaw) = (s.pitch, s.yaw);
-            let tail = (s.walk_pos * 0.6662).cos() * 0.3 * s.walk_speed;
+            let tail = table_cos(s.walk_pos * 0.6662) * 0.3 * s.walk_speed;
             self.push_posed(layer, rect, at, 0, light, |p| {
                 p.set("head", |h| {
                     h[3] = pitch;
@@ -5016,8 +5284,9 @@ impl EntityRenderer {
             self.push_posed(layer, rect, m, 0, light, |p| {
                 for (i, name) in ["box0", "box1"].into_iter().enumerate() {
                     let a = age * -(45.0 + (i as f32 + 1.0) * 5.0);
-                    let wrapped = (a + 180.0).rem_euclid(360.0) - 180.0;
-                    p.set(name, |b| b[4] = deg(wrapped));
+                    // The game's fold; the old shift by 180 around a Euclidean remainder
+                    // could round the last bit differently.
+                    p.set(name, |b| b[4] = deg(rc_data::java_math::wrap_degrees(a)));
                 }
             });
         }
@@ -5160,7 +5429,7 @@ impl EntityRenderer {
                 }
                 let (mut y, mut z) = (1.4f32, -0.6f32);
                 if e.meta_int(20).unwrap_or(0) > 0 {
-                    let w = (s.age * 0.6).sin();
+                    let w = table_sin(s.age * 0.6);
                     z -= 0.2 * w + 0.2;
                     y -= 0.09 * w;
                 }
@@ -5257,14 +5526,7 @@ impl EntityRenderer {
         };
         let Some(rect) = rect else { return };
         let lay = if !offset || self.gui_root.is_some() { Mat4::IDENTITY } else { self.layering };
-        self.push_posed(layer, rect, lay * mtx, pass, light, |p| match kind {
-            4 => p.set("jaw", |q| q[3] = ((walk * PI * 0.2).sin() + 1.0) * 0.2),
-            5 => {
-                p.set("left_ear", |q| q[5] = -((walk * PI * 0.2 * 1.2).cos() + 2.5) * 0.2);
-                p.set("right_ear", |q| q[5] = ((walk * PI * 0.2).cos() + 2.5) * 0.2);
-            }
-            _ => {}
-        });
+        self.push_posed(layer, rect, lay * mtx, pass, light, |p| animate_head(p, kind, walk));
     }
 
     /// Instance of a baked layer (white, no overlay) placed by `anim` under matrix `m`.
@@ -6033,7 +6295,7 @@ impl EntityRenderer {
         let Some(rc_proto_v777::entity::Meta::Item(Some(stack))) = e.meta.get(&8) else { return false };
         let bob_offs = (e.uuid as u32 >> 8) as f32 / (1u32 << 24) as f32 * 2.0 * PI;
         let age = e.age as f32 + pt;
-        let bob = (age / 10.0 + bob_offs).sin() * 0.1 + 0.1;
+        let bob = table_sin(age / 10.0 + bob_offs) * 0.1 + 0.1;
         // Light at the eyes' block (the game's light probe), not at the feet.
         let (b, s) = self.eye_light(e, world, light);
         let block = if e.flags() & 1 != 0 { 15 } else { b };
@@ -6065,11 +6327,8 @@ impl EntityRenderer {
         let view =
             crate::stack::StackRef { stack, info, ids: &self.ids, data: &self.source, hold: crate::stack::Hold::NONE };
         let Some(model) = view.model() else { return false };
-        let name = usize::try_from(stack.item)
-            .ok()
-            .and_then(|i| self.item_names()?.get(i))
-            .cloned()
-            .unwrap_or_default();
+        let name =
+            usize::try_from(stack.item).ok().and_then(|i| self.item_names()?.get(i)).cloned().unwrap_or_default();
         let env = crate::stack::OwnerEnv::new(&self.world, "ground", owner.0, owner.1, owner.2);
         let (mut layers, mut key) = (Vec::new(), Vec::new());
         models.layers(&name, &model, &view, &env, env.seed(), &mut layers, &mut key);
@@ -6506,8 +6765,8 @@ fn pulse_alpha(e: &Entity, id: u8, pt: f32) -> f32 {
     let age = e.age as f32 + pt;
     match id {
         0 => 1.0,
-        1 => ((age * 0.045).cos() * 0.25).max(0.0),
-        2 => ((age * 0.045 + PI).cos() * 0.25).max(0.0),
+        1 => (table_cos(age * 0.045) * 0.25).max(0.0),
+        2 => (table_cos(age * 0.045 + PI) * 0.25).max(0.0),
         3 => (e.extra[2] + pt * (e.extra[1] - e.extra[2])) / 10.0,
         // Heart counter held by the tick (`creatures::tick`, extra 9 current, 10 old): a change
         // of anger does not interrupt a beat in progress.
@@ -6534,6 +6793,9 @@ struct RotCtx {
     env: PoseEnv,
     /// Current height of the box (scale attribute included).
     height: f32,
+    /// Switches `SHARED_BODY_ANGLE` and `SKIP_IDENTITY_ROOT_FACTORS` of the frame.
+    shared_body_angle: bool,
+    skip_identity_factors: bool,
 }
 
 /// Rotations of a living entity after its scaling: shaking, body yaw (or those
@@ -6545,23 +6807,27 @@ fn pose_rotations(e: &Entity, pt: f32, body: f32, m: &mut Mat4, c: &RotCtx) {
     let base_rot = !matches!(e.kind.as_str(), "squid" | "glow_squid" | "ender_dragon" | "armor_stand");
     // Shaking: body yaw offset; Y rotation applied before that of the body
     // (coincident axes, the families' translations are vertical).
-    let shake = if base_rot && c.shaking { ((e.age as f32 + pt).floor() * 3.25).cos() * PI * 0.4 } else { 0.0 };
+    let shake = if base_rot && c.shaking { shaking_yaw_offset(e.age as f32 + pt) } else { 0.0 };
     let sleeping = base_rot && e.pose() == 2;
-    if !sleeping {
-        *m *= Mat4::from_rotation_y(deg(-shake));
+    // A zero shake is the identity rotation (sine +0, cosine 1): the product would return the
+    // matrix up to the sign of zeros, which no pixel shows (`identity_product_keeps_matrix`).
+    if !sleeping && !(c.skip_identity_factors && shake == 0.0) {
+        *m *= rotation_y_degrees(-shake);
     }
+    // `body` is the same interpolation the families used to redo, bit for bit.
+    let family_body = if c.shared_body_angle { body } else { rot_lerp(pt, e.body_o, e.body) };
     let family = !sleeping
-        && (animals::rotations(e, pt, m)
-            || creatures::rotations(e, pt, m)
+        && (animals::rotations(e, pt, family_body, m, c.shared_body_angle)
+            || creatures::rotations(e, pt, family_body, m)
             || dragon::rotations(e, pt, m)
-            || shulker::rotations(e, pt, m));
+            || shulker::rotations(e, family_body, m));
     if !family && !sleeping {
-        *m *= Mat4::from_rotation_y(deg(180.0 - body));
+        *m *= rotation_y_degrees(180.0 - body);
     }
     // Armor stand hit (event 32): 5-tick oscillation around Y.
     if e.kind == "armor_stand" && e.timers[0] > 0 {
         let w = (5 - e.timers[0]) as f32 + pt;
-        *m *= Mat4::from_rotation_y(deg((w / 1.5 * std::f32::consts::PI).sin() * 3.0));
+        *m *= rotation_y_degrees(table_sin(w / 1.5 * std::f32::consts::PI) * 3.0);
     }
     // Pitch of the entity in degrees (inverted upside down).
     let x_rot = (e.pitch_o + pt * (e.pitch - e.pitch_o)) * if c.upside_down { -1.0 } else { 1.0 };
@@ -6573,14 +6839,14 @@ fn pose_rotations(e: &Entity, pt: f32, body: f32, m: &mut Mat4, c: &RotCtx) {
         // Death tilt (not for a creaking tearing itself down: counter rendered as zero).
         let t = e.death_time as f32 - 1.0 + pt;
         let f = (t / 20.0 * 1.6).sqrt().min(1.0);
-        *m *= Mat4::from_rotation_z(deg(f * flip));
+        *m *= rotation_z_degrees(f * flip);
     } else if spin {
         // Spin attack (Riptide): lying along the gaze axis, spinning top.
-        *m *= Mat4::from_rotation_x(deg(-90.0 - x_rot)) * Mat4::from_rotation_y(deg((e.age as f32 + pt) * -75.0));
+        *m *= rotation_x_degrees(-90.0 - x_rot) * rotation_y_degrees((e.age as f32 + pt) * -75.0);
     } else if sleeping {
         // Lying: head towards the head of the bed (bed direction), otherwise body yaw.
         let angle = c.env.bed.map_or(body + shake, |b| b.2);
-        *m *= Mat4::from_rotation_y(deg(angle)) * Mat4::from_rotation_z(deg(flip)) * Mat4::from_rotation_y(deg(270.0));
+        *m *= rotation_y_degrees(angle) * rotation_z_degrees(flip) * rotation_y_degrees(270.0);
     } else if c.upside_down {
         let h = c.height;
         let s = living_scale(e);
@@ -6592,14 +6858,14 @@ fn pose_rotations(e: &Entity, pt: f32, body: f32, m: &mut Mat4, c: &RotCtx) {
             // Glide: lying forward as the flight sets in, then
             // turned towards the movement direction.
             if !spin {
-                *m *= Mat4::from_rotation_x(deg(pa.fly_scale(pt) * (-90.0 - x_rot)));
+                *m *= rotation_x_degrees(pa.fly_scale(pt) * (-90.0 - x_rot));
             }
             if let Some(a) = flying_y_rot(e, pt) {
                 *m *= Mat4::from_rotation_y(a);
             }
         } else if c.swim > 0.0 {
             let target = if c.env.in_water { -90.0 - x_rot } else { -90.0 };
-            *m *= Mat4::from_rotation_x(deg(c.swim * target));
+            *m *= rotation_x_degrees(c.swim * target);
             if visually_swimming(e) {
                 *m *= Mat4::from_translation(Vec3::new(0.0, -1.0, 0.3));
             }
@@ -6609,7 +6875,7 @@ fn pose_rotations(e: &Entity, pt: f32, body: f32, m: &mut Mat4, c: &RotCtx) {
     if e.kind == "drowned" && c.swim > 0.0 {
         let pivot = Vec3::new(0.0, c.height / 2.0 / living_scale(e), 0.0);
         *m *= Mat4::from_translation(pivot)
-            * Mat4::from_rotation_x(deg(c.swim * (-10.0 - x_rot)))
+            * rotation_x_degrees(c.swim * (-10.0 - x_rot))
             * Mat4::from_translation(-pivot);
     }
 }
@@ -6659,7 +6925,7 @@ fn animate(pose: &mut Pose<'_>, e: &Entity, state: &AnimState, pt: f32, living: 
                     -(c - 40.0 - pt) / 4.0
                 };
                 let ah = if c > 4.0 && c <= 36.0 {
-                    PI / 5.0 + 0.219_911_49 * ((c - 4.0 - pt) / 32.0 * 28.7).sin()
+                    PI / 5.0 + 0.219_911_49 * table_sin((c - 4.0 - pt) / 32.0 * 28.7)
                 } else {
                     PI / 5.0
                 };
@@ -6708,8 +6974,8 @@ fn animate(pose: &mut Pose<'_>, e: &Entity, state: &AnimState, pt: f32, living: 
         "evoker_fangs" => fangs(pose, e, pt),
         "chicken" => {
             let q = state.walk_pos * 0.6662;
-            pose.set("right_leg", |l| l[3] = q.cos() * 1.4 * state.walk_speed);
-            pose.set("left_leg", |l| l[3] = (q + PI).cos() * 1.4 * state.walk_speed);
+            pose.set("right_leg", |l| l[3] = table_cos(q) * 1.4 * state.walk_speed);
+            pose.set("left_leg", |l| l[3] = table_cos(q + PI) * 1.4 * state.walk_speed);
             if !state.baby {
                 pose.set("head", |h| {
                     h[3] = state.pitch;
@@ -6718,7 +6984,7 @@ fn animate(pose: &mut Pose<'_>, e: &Entity, state: &AnimState, pt: f32, living: 
             }
             let f = e.flap[0] + pt * (e.flap[1] - e.flap[0]);
             let fs = e.flap[2] + pt * (e.flap[3] - e.flap[2]);
-            let angle = (f.sin() + 1.0) * fs;
+            let angle = (table_sin(f) + 1.0) * fs;
             pose.set("right_wing", |w| w[5] = angle);
             pose.set("left_wing", |w| w[5] = -angle);
         }
@@ -6937,7 +7203,10 @@ impl EntityRenderer {
     pub(super) fn eye_light(&self, e: &Entity, world: [f64; 3], light: &dyn Fn(i32, i32, i32) -> (u8, u8)) -> (u8, u8) {
         let keep = self.opt.light_once && self.is_current(e);
         let key = world.map(f64::to_bits);
-        if keep && let Some((k, v)) = self.cur_light.get() && k == key {
+        if keep
+            && let Some((k, v)) = self.cur_light.get()
+            && k == key
+        {
             return v;
         }
         let eye_y = world[1] + f64::from(self.dims_of(e)[1]);
@@ -7017,9 +7286,9 @@ fn illusion_offsets(e: &Entity, pt: f32) -> [[f64; 3]; 4] {
 fn illusion_wobble(i: usize, age: f32) -> [f64; 3] {
     let i = i as f32;
     [
-        f64::from((i + age * 0.5).cos()) * 0.025,
-        f64::from((i + age * 0.75).cos()) * 0.0125,
-        f64::from((i + age * 0.7).cos()) * 0.025,
+        f64::from(table_cos(i + age * 0.5)) * 0.025,
+        f64::from(table_cos(i + age * 0.75)) * 0.0125,
+        f64::from(table_cos(i + age * 0.7)) * 0.025,
     ]
 }
 
@@ -7077,14 +7346,14 @@ fn piglin_ears(p: &mut Pose<'_>, s: &AnimState) {
     let d = deg(if s.baby { 5.0 } else { 30.0 });
     let f = s.age * 0.1 + s.walk_pos * 0.5;
     let a = 0.08 + s.walk_speed * 0.4;
-    p.set("left_ear", |e| e[5] = -d - (1.2 * f).cos() * a);
-    p.set("right_ear", |e| e[5] = d + f.cos() * a);
+    p.set("left_ear", |e| e[5] = -d - table_cos(1.2 * f) * a);
+    p.set("right_ear", |e| e[5] = d + table_cos(f) * a);
 }
 
 /// Downward weapon strike (armed piglin, illagers): main arm M, other arm O.
 fn strike_down(p: &mut Pose<'_>, s: &AnimState, right: bool) {
-    let a2 = (s.swing * PI).sin();
-    let a1 = ((1.0 - (1.0 - s.swing).powi(2)) * PI).sin();
+    let a2 = table_sin(s.swing * PI);
+    let a1 = table_sin((1.0 - (1.0 - s.swing).powi(2)) * PI);
     let (m, o) = if right { ("right_arm", "left_arm") } else { ("left_arm", "right_arm") };
     p.set("right_arm", |a| {
         a[5] = 0.0;
@@ -7094,8 +7363,8 @@ fn strike_down(p: &mut Pose<'_>, s: &AnimState, right: bool) {
         a[5] = 0.0;
         a[4] = -PI / 20.0;
     });
-    p.set(m, |a| a[3] = -1.884_955_8 + (s.age * 0.09).cos() * 0.15 + a2 * 2.2 - a1 * 0.4);
-    p.set(o, |a| a[3] = (s.age * 0.19).cos() * 0.5 + a2 * 1.2 - a1 * 0.4);
+    p.set(m, |a| a[3] = -1.884_955_8 + table_cos(s.age * 0.09) * 0.15 + a2 * 2.2 - a1 * 0.4);
+    p.set(o, |a| a[3] = table_cos(s.age * 0.19) * 0.5 + a2 * 1.2 - a1 * 0.4);
     idle_and_crouch(p, &AnimState { crouching: false, ..*s });
 }
 
@@ -7130,22 +7399,22 @@ fn piglin(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
     piglin_ears(p, s);
     if dancing {
         let t = s.age / 60.0;
-        p.set("right_ear", |x| x[5] = PI / 6.0 + deg((30.0 * t).sin() * 10.0));
-        p.set("left_ear", |x| x[5] = -PI / 6.0 - deg((30.0 * t).cos() * 10.0));
+        p.set("right_ear", |x| x[5] = PI / 6.0 + deg(table_sin(30.0 * t) * 10.0));
+        p.set("left_ear", |x| x[5] = -PI / 6.0 - deg(table_cos(30.0 * t) * 10.0));
         p.set("head", |h| {
-            h[0] += (10.0 * t).sin();
-            h[1] += (40.0 * t).sin() + 0.4;
+            h[0] += table_sin(10.0 * t);
+            h[1] += table_sin(40.0 * t) + 0.4;
         });
-        let rz = deg(70.0 + (40.0 * t).cos() * 10.0);
+        let rz = deg(70.0 + table_cos(40.0 * t) * 10.0);
         p.set("right_arm", |a| {
             a[5] = rz;
-            a[1] += (40.0 * t).sin() * 0.5 - 0.5;
+            a[1] += table_sin(40.0 * t) * 0.5 - 0.5;
         });
         p.set("left_arm", |a| {
             a[5] = -rz;
-            a[1] += (40.0 * t).sin() * 0.5 + 0.5;
+            a[1] += table_sin(40.0 * t) * 0.5 + 0.5;
         });
-        p.set("body", |b| b[1] += (40.0 * t).sin() * 0.35);
+        p.set("body", |b| b[1] += table_sin(40.0 * t) * 0.35);
     } else if melee {
         if s.swing == 0.0 {
             p.set(if right { "right_arm" } else { "left_arm" }, |a| a[3] = -1.8);
@@ -7206,22 +7475,22 @@ fn illager(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
         h[4] = s.yaw;
     });
     p.set("right_arm", |a| {
-        a[3] = (pp + PI).cos() * v;
+        a[3] = table_cos(pp + PI) * v;
         a[4] = 0.0;
         a[5] = 0.0;
     });
     p.set("left_arm", |a| {
-        a[3] = pp.cos() * v;
+        a[3] = table_cos(pp) * v;
         a[4] = 0.0;
         a[5] = 0.0;
     });
     p.set("right_leg", |l| {
-        l[3] = pp.cos() * 0.7 * v;
+        l[3] = table_cos(pp) * 0.7 * v;
         l[4] = 0.0;
         l[5] = 0.0;
     });
     p.set("left_leg", |l| {
-        l[3] = (pp + PI).cos() * 0.7 * v;
+        l[3] = table_cos(pp + PI) * 0.7 * v;
         l[4] = 0.0;
         l[5] = 0.0;
     });
@@ -7276,7 +7545,7 @@ fn illager(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
         Arm::CrossbowHold => crossbow_hold(p, s, true),
         Arm::CrossbowCharge => crossbow_charge(p, s, true),
         Arm::Spell => {
-            let x = (s.age * 0.6662).cos() * 0.25;
+            let x = table_cos(s.age * 0.6662) * 0.25;
             p.set("right_arm", |a| {
                 a[0] = -5.0;
                 a[2] = 0.0;
@@ -7304,7 +7573,7 @@ fn illager(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
             });
         }
         Arm::Celebrate => {
-            let x = (s.age * 0.6662).cos() * 0.05;
+            let x = table_cos(s.age * 0.6662) * 0.05;
             p.set("right_arm", |a| {
                 a[0] = -5.0;
                 a[2] = 0.0;
@@ -7330,7 +7599,7 @@ fn vex(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
         h[3] = s.pitch;
         h[4] = s.yaw;
     });
-    let b = deg(s.age * 5.5).cos() * 0.1;
+    let b = table_cos(deg(s.age * 5.5)) * 0.1;
     p.set("right_arm", |a| a[5] = PI / 5.0 + b);
     p.set("left_arm", |a| a[5] = -(PI / 5.0 + b));
     if e.meta_byte(16) & 1 != 0 {
@@ -7358,7 +7627,7 @@ fn vex(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
     } else {
         p.set("body", |x| x[3] = PI / 20.0);
     }
-    let w = 1.099_557_4 + deg(s.age * 45.836_624).cos() * deg(16.2);
+    let w = 1.099_557_4 + table_cos(deg(s.age * 45.836_624)) * deg(16.2);
     p.set("left_wing", |x| {
         x[4] = w;
         x[3] = 0.471_238_88;
@@ -7383,7 +7652,7 @@ fn ravager(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
             n[2] = -6.5 + h;
             n[1] = -7.0;
         });
-        let m = if a > 5.0 { ((a - 4.0) / 4.0).sin() * 0.4 * PI } else { PI / 20.0 * (PI * a / 10.0).sin() };
+        let m = if a > 5.0 { table_sin((a - 4.0) / 4.0) * 0.4 * PI } else { PI / 20.0 * table_sin(PI * a / 10.0) };
         p.set("mouth", |x| x[3] = m);
     } else {
         p.set("neck", |n| {
@@ -7394,11 +7663,11 @@ fn ravager(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
         if st > 0.0 {
             p.set("neck", |n| {
                 n[3] = 0.219_911_49;
-                n[0] = (st / 40.0 * 10.0).sin() * 3.0;
+                n[0] = ravager_stunned_neck_shift(st);
             });
             p.set("mouth", |x| x[3] = 0.05 * PI);
         } else {
-            let m = if g > 0.0 { PI / 2.0 * (g * PI * 0.25).sin() } else { 0.01 * PI };
+            let m = if g > 0.0 { PI / 2.0 * table_sin(g * PI * 0.25) } else { 0.01 * PI };
             p.set("mouth", |x| x[3] = m);
         }
     }
@@ -7409,18 +7678,18 @@ fn ravager(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     let q = s.walk_pos * 0.6662;
     let l = 0.4 * s.walk_speed;
     for leg in ["right_hind_leg", "left_front_leg"] {
-        p.set(leg, |x| x[3] = q.cos() * l);
+        p.set(leg, |x| x[3] = table_cos(q) * l);
     }
     for leg in ["left_hind_leg", "right_front_leg"] {
-        p.set(leg, |x| x[3] = (q + PI).cos() * l);
+        p.set(leg, |x| x[3] = table_cos(q + PI) * l);
     }
 }
 
 /// Hoglin and zoglin (§ 5): ears, head butt, legs.
 fn hoglin(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
     let (pp, v) = (s.walk_pos, s.walk_speed);
-    p.set("right_ear", |x| x[5] = -2.0 * PI / 9.0 - v * pp.sin());
-    p.set("left_ear", |x| x[5] = 2.0 * PI / 9.0 + v * pp.sin());
+    p.set("right_ear", |x| x[5] = -2.0 * PI / 9.0 - v * table_sin(pp));
+    p.set("left_ear", |x| x[5] = 2.0 * PI / 9.0 + v * table_sin(pp));
     p.set("head", |h| h[4] = s.yaw);
     let r = e.timers[0] as f32;
     let f = 1.0 - (10.0 - 2.0 * r).abs() / 10.0;
@@ -7430,7 +7699,7 @@ fn hoglin(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
             h[1] += f * 2.5;
         }
     });
-    let (a, b) = (pp.cos() * 1.2 * v, (pp + PI).cos() * 1.2 * v);
+    let (a, b) = (table_cos(pp) * 1.2 * v, table_cos(pp + PI) * 1.2 * v);
     p.set("right_front_leg", |x| x[3] = a);
     p.set("left_front_leg", |x| x[3] = b);
     p.set("right_hind_leg", |x| x[3] = b);
@@ -7441,7 +7710,8 @@ fn hoglin(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
 fn armor_stand(p: &mut Pose<'_>, e: &Entity) {
     let rot = |i: u8, d: [f32; 3]| match e.meta.get(&i) {
         Some(rc_proto_v777::entity::Meta::Rotations(r)) => {
-            r.map(|v| if v.is_finite() { deg(v.rem_euclid(360.0)) } else { 0.0 })
+            // The game keeps the truncated remainder (a negative angle stays negative).
+            r.map(|v| if v.is_finite() { deg(rc_data::java_math::degrees_remainder(v)) } else { 0.0 })
         }
         _ => d.map(deg),
     };
@@ -7491,7 +7761,7 @@ fn fangs(p: &mut Pose<'_>, e: &Entity, pt: f32) {
     let m = 1.0 - (2.0 * b).min(1.0).powi(3);
     p.set("upper_jaw", |x| x[5] = PI - 0.35 * PI * m);
     p.set("lower_jaw", |x| x[5] = PI + 0.35 * PI * m);
-    p.set("base", |x| x[1] -= (b + (2.7 * b).sin()) * 7.2);
+    p.set("base", |x| x[1] -= (b + table_sin(2.7 * b)) * 7.2);
     let k = if b > 0.9 { (1.0 - b) / 0.1 } else { 1.0 };
     p.set("root", |x| {
         x[1] = 24.0 - 20.0 * k;
@@ -7722,6 +7992,8 @@ mod tests {
             swim: 0.0,
             env: PoseEnv::default(),
             height: 1.8,
+            shared_body_angle: true,
+            skip_identity_factors: true,
         }
     }
 
@@ -7795,6 +8067,183 @@ mod tests {
         assert!(flying_y_rot(e, 0.0).is_none());
     }
 
+    /// The gaze of a gliding avatar is its HEAD yaw: body turned towards −x, head towards +z,
+    /// movement towards +x → +π/2 (the body yaw would give 0).
+    #[test]
+    fn flying_yaw_looks_where_the_head_turns() {
+        let mut all = testkit::spawn("player");
+        let e = all.map.get_mut(&7).unwrap();
+        e.velocity = [1.0, 0.0, 0.0];
+        e.pose_anim.vel_o = [1.0, 0.0, 0.0];
+        (e.yaw, e.yaw_o, e.head, e.head_o) = (90.0, 90.0, 0.0, 0.0);
+        for pt in [0.0, 0.5, 1.0] {
+            let a = flying_y_rot(e, pt).unwrap();
+            assert!((a - PI / 2.0).abs() < 1e-5, "pt {pt}: {a}");
+        }
+    }
+
+    /// The local player's head yaw interpolates between two ticks like a remote one: after
+    /// two local ticks with yaws 0 then 40, the glide angle at half a tick lies strictly
+    /// between those of both ticks (a head copied into its previous value froze it).
+    #[test]
+    fn local_glide_yaw_interpolates_between_ticks() {
+        let mut all = testkit::spawn("player");
+        all.local = 7;
+        all.me = all.map.remove(&7);
+        all.tick_me([1.0, 0.0, 0.0], 0.0, 0.0, false, false);
+        all.tick_me([2.0, 0.0, 0.0], 40.0, 0.0, false, false);
+        let me = all.me.as_mut().unwrap();
+        assert_eq!((me.head_o, me.head), (0.0, 40.0));
+        me.pose_anim.vel_o = me.velocity;
+        let [start, middle, end] = [0.0, 0.5, 1.0].map(|pt| flying_y_rot(me, pt).unwrap());
+        assert!(start != end && middle > start.min(end) && middle < start.max(end), "{start} {middle} {end}");
+    }
+
+    /// The game compares both squared horizontal lengths with the float 1e-5 widened
+    /// (9.99999974e-6), not the double 1e-5: a movement in between still turns the glide.
+    #[test]
+    fn flying_yaw_threshold_is_the_float_one() {
+        let mut all = testkit::spawn("player");
+        let e = all.map.get_mut(&7).unwrap();
+        let x = 9.999_999_9e-6f64.sqrt();
+        assert!(x * x > f64::from(1.0e-5f32) && x * x <= 1.0e-5, "{}", x * x);
+        e.velocity = [x, 0.0, 0.0];
+        e.pose_anim.vel_o = e.velocity;
+        assert!(flying_y_rot(e, 1.0).is_some());
+    }
+
+    /// Glide yaw, bit for bit, against the game's steps written out: view vector from the
+    /// float angles and the sine table, both horizontal vectors normalised, then their dot
+    /// product. The body yaw (the old path) moves the angle.
+    #[test]
+    fn flying_yaw_matches_the_game_bit_for_bit() {
+        fn game(pitch: f32, head: f32, mv: [f64; 2]) -> f32 {
+            let (x_rot, y_rot) = (pitch * 0.017_453_292f32, -head * 0.017_453_292f32);
+            let x_cos = rc_physics::cos_t(x_rot);
+            let look = [f64::from(rc_physics::sin_t(y_rot) * x_cos), f64::from(rc_physics::cos_t(y_rot) * x_cos)];
+            let normalized = |v: [f64; 2]| {
+                let length = (v[0] * v[0] + v[1] * v[1]).sqrt();
+                [v[0] / length, v[1] / length]
+            };
+            let (m, l) = (normalized(mv), normalized(look));
+            let dot = m[0] * l[0] + m[1] * l[1];
+            let sign = mv[0] * look[1] - mv[1] * look[0];
+            let signum = if sign > 0.0 {
+                1.0
+            } else if sign < 0.0 {
+                -1.0
+            } else {
+                0.0
+            };
+            (signum * dot.abs().min(1.0).acos()) as f32
+        }
+        let mut all = testkit::spawn("player");
+        let e = all.map.get_mut(&7).unwrap();
+        let mut seed = 0x9e37_79b9u32;
+        let mut random = |lo: f32, hi: f32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            lo + (hi - lo) * (seed as f32 / u32::MAX as f32)
+        };
+        let (mut body_yaw_differs, mut division_differs) = (0, 0);
+        for _ in 0..2000 {
+            (e.pitch, e.head) = (random(-89.0, 89.0), random(-720.0, 720.0));
+            e.yaw = random(-180.0, 180.0);
+            e.velocity = [f64::from(random(-2.0, 2.0)), 0.0, f64::from(random(-2.0, 2.0))];
+            e.pose_anim.vel_o = e.velocity;
+            let mv = [e.velocity[0], e.velocity[2]];
+            let want = game(e.pitch, e.head, mv);
+            let got = flying_y_rot(e, 1.0).unwrap();
+            assert_eq!(got.to_bits(), want.to_bits(), "pitch {} head {} movement {mv:?}", e.pitch, e.head);
+            body_yaw_differs += usize::from(game(e.pitch, e.yaw, mv) != want);
+            let look = flat_view_vector(e, 1.0);
+            let (m2, l2) = (mv[0] * mv[0] + mv[1] * mv[1], look[0] * look[0] + look[1] * look[1]);
+            let old_dot = (mv[0] * look[0] + mv[1] * look[1]) / (m2.sqrt() * l2.sqrt());
+            division_differs += usize::from(got.abs() != old_dot.abs().min(1.0).acos() as f32);
+        }
+        assert!(body_yaw_differs > 0, "the body yaw gives the head's angles: the test sees nothing");
+        // The dot product's last bits are lost in the float angle: noted, not required.
+        eprintln!("glide angles where dividing the dot product by both lengths differs: {division_differs} of 2000");
+    }
+
+    /// Shaking, stunned ravager, dragon jaw and piglin ears: each takes the library sine in
+    /// double precision like the game, bit for bit; the old single-precision formulas differ.
+    #[test]
+    fn double_precision_angles_match_the_game() {
+        let pi64 = std::f64::consts::PI;
+        let mut single_differs = [0usize; 4];
+        for step in 0..4000 {
+            let t = step as f32 * 0.37 + 0.013;
+            let shake = (f64::from(t.floor() * 3.25f32).cos() * pi64 * f64::from(0.4f32)) as f32;
+            assert_eq!(shaking_yaw_offset(t).to_bits(), shake.to_bits(), "shake at {t}");
+            let neck = (f64::from(t) / 40.0 * 10.0).sin() as f32 * 3.0;
+            assert_eq!(ravager_stunned_neck_shift(t).to_bits(), neck.to_bits(), "ravager at {t}");
+            let jaw = (f64::from(t * PI * 0.2).sin() + 1.0) as f32 * 0.2;
+            assert_eq!(dragon_head_jaw_angle(t).to_bits(), jaw.to_bits(), "dragon jaw at {t}");
+            let ears = [
+                -((f64::from(t * PI * 0.2 * 1.2).cos() + 2.5) as f32) * 0.2,
+                (f64::from(t * PI * 0.2).cos() + 2.5) as f32 * 0.2,
+            ];
+            assert_eq!(piglin_head_ear_angles(t).map(f32::to_bits), ears.map(f32::to_bits), "piglin ears at {t}");
+            let single = [
+                ((t.floor() * 3.25).cos() * PI * 0.4) != shake,
+                ((t / 40.0 * 10.0).sin() * 3.0) != neck,
+                (((t * PI * 0.2).sin() + 1.0) * 0.2) != jaw,
+                (-((t * PI * 0.2 * 1.2).cos() + 2.5) * 0.2) != ears[0],
+            ];
+            for (count, differs) in single_differs.iter_mut().zip(single) {
+                *count += usize::from(differs);
+            }
+        }
+        assert!(
+            single_differs.iter().all(|&n| n > 0),
+            "a single-precision formula equals the game's: {single_differs:?}"
+        );
+    }
+
+    /// Boat in a bubble column: the tilt is the library sine of half the tick count in double
+    /// precision, like the game, bit for bit; the old single-precision product differs.
+    #[test]
+    fn boat_bubble_tilt_matches_the_game() {
+        let mut all = testkit::spawn("oak_boat");
+        let e = all.map.get_mut(&7).unwrap();
+        e.meta.insert(13, Meta::Int(60));
+        let mut single_differs = 0;
+        for age in 0..4000u32 {
+            e.age = age;
+            objects::tick(e);
+            let multiplier = e.extra[4];
+            let want = 10.0 * (0.5 * f64::from(age)).sin() as f32 * multiplier;
+            assert_eq!(e.extra[5].to_bits(), want.to_bits(), "tick {age}");
+            single_differs += usize::from(10.0 * (0.5 * age as f32).sin() * multiplier != want);
+        }
+        assert_eq!(e.extra[4], 1.0, "the bubble multiplier never filled up");
+        assert!(single_differs > 0, "the single-precision sine gives the same tilt: the test sees nothing");
+    }
+
+    /// Swimming legs: a third of the walk position as the game takes it, times the float
+    /// nearest 1/3, through its sine table, bit for bit; dividing by 3 moves table indexes.
+    #[test]
+    fn swimming_legs_take_a_third_like_the_game() {
+        let parts = [("head", None), ("right_arm", None), ("left_arm", None), ("right_leg", None), ("left_leg", None)];
+        let l = testkit::test_layer(&parts);
+        let all = testkit::spawn("player");
+        let mut divided_differs = 0;
+        for step in 0..2000 {
+            let mut s = testkit::state(&all.map[&7], 0.0);
+            s.walk_pos = step as f32 * 0.37 + 0.11;
+            s.walk_speed = 0.0;
+            s.swim = 1.0;
+            let mut p = Pose::reset(&l, Vec::new(), Vec::new());
+            humanoid(&mut p, &s);
+            let want = 0.3 * rc_physics::cos_t(s.walk_pos * 0.333_333_34);
+            assert_eq!(p.parts[3][3].to_bits(), want.to_bits(), "walk position {}", s.walk_pos);
+            divided_differs += usize::from(0.3 * rc_physics::cos_t(s.walk_pos / 3.0) != want);
+        }
+        assert!(divided_differs > 0, "dividing by 3 gives the same angles: the test sees nothing");
+    }
+
     /// Breaststroke at time 7 of the cycle: right arm (x, y, z) = (0, π, π − 1.8708 × q(7)/q(14)),
     /// legs 0.3 cos(7/3); head at −π/4.
     #[test]
@@ -7811,7 +8260,7 @@ mod tests {
         let ra = p.parts[1];
         assert!(ra[3].abs() < 1e-5 && (ra[4] - PI).abs() < 1e-5, "{ra:?}");
         assert!((ra[5] - (PI - 1.870_796_4 * q(7.0) / q(14.0))).abs() < 1e-5, "{ra:?}");
-        assert!((p.parts[3][3] - 0.3 * (7.0f32 / 3.0).cos()).abs() < 1e-5);
+        assert!((p.parts[3][3] - 0.3 * table_cos(7.0f32 * 0.333_333_34)).abs() < 1e-5);
         assert!((p.parts[0][3] + PI / 4.0).abs() < 1e-5);
     }
 
@@ -7860,7 +8309,7 @@ mod tests {
         c.shaking = true;
         let mut m = Mat4::IDENTITY;
         pose_rotations(e, 0.0, 30.0, &mut m, &c);
-        let shake = (2.0f32 * 3.25).cos() * PI * 0.4;
+        let shake = (f64::from(2.0f32 * 3.25).cos() * std::f64::consts::PI * f64::from(0.4f32)) as f32;
         close(m, Mat4::from_rotation_y(deg(180.0 - 30.0 - shake)));
     }
 
@@ -7991,6 +8440,147 @@ mod tests {
             x += 0.000_37;
         }
         assert!(worst < 1e-6, "{worst}");
+    }
+
+    /// Floats of magnitude under 2^22 that `round` rounds to another integer than the library.
+    fn rounding_mismatches(round: impl Fn(f32) -> f32 + Sync) -> usize {
+        use rayon::prelude::*;
+        (0..4_194_304.0f32.to_bits())
+            .into_par_iter()
+            .flat_map_iter(|b| [f32::from_bits(b), -f32::from_bits(b)])
+            .filter(|&v| round(v) != v.round())
+            .count()
+    }
+
+    /// Every float quotient under 2^22: the truncation rounds it to the library's integer (a
+    /// zero may lose its sign, which no product or sum of `sin_cos` keeps), so `sin_cos` picks
+    /// the same quadrant and gives the same bits. Sabotage: rounding halves to even (the
+    /// 1.5·2^23 shift) is caught, on the halves `sin_cos` really meets.
+    #[test]
+    fn truncated_quadrant_matches_library_rounding() {
+        assert_eq!(rounding_mismatches(round_half_away_from_zero), 0);
+        let to_even = |v: f32| (v + 12_582_912.0) - 12_582_912.0;
+        assert!(rounding_mismatches(to_even) > 0, "sabotage not detected");
+        let halved_right_angle = std::hint::black_box(PI / 2.0) * 0.5;
+        assert_eq!(halved_right_angle * std::f32::consts::FRAC_2_PI, 0.5, "a halved right angle is a half quarter");
+        let mut x = -20.0f32;
+        while x < 20.0 {
+            let (a, b) = (sin_cos_with(x, true), sin_cos_with(x, false));
+            assert_eq!(
+                ((a.0 + 0.0).to_bits(), (a.1 + 0.0).to_bits()),
+                ((b.0 + 0.0).to_bits(), (b.1 + 0.0).to_bits()),
+                "{x}"
+            );
+            x += 0.000_37;
+        }
+    }
+
+    /// The polynomial rotations about each axis stay within 2e-6 of the double-precision
+    /// rotation for angles up to ±10^5 degrees (the library path of the unfolded angle drifts
+    /// there), and sit where glam puts each entry (a transposed or mis-signed entry is caught).
+    #[test]
+    fn polynomial_rotations_match_double_reference() {
+        let reference = |axis: usize, degrees: f32| {
+            let (s, c) = f64::from(degrees).to_radians().sin_cos();
+            let (s, c) = (s as f32, c as f32);
+            match axis {
+                0 => Mat4::from_cols(
+                    glam::Vec4::X,
+                    glam::Vec4::new(0.0, c, s, 0.0),
+                    glam::Vec4::new(0.0, -s, c, 0.0),
+                    glam::Vec4::W,
+                ),
+                1 => Mat4::from_cols(
+                    glam::Vec4::new(c, 0.0, -s, 0.0),
+                    glam::Vec4::Y,
+                    glam::Vec4::new(s, 0.0, c, 0.0),
+                    glam::Vec4::W,
+                ),
+                _ => Mat4::from_cols(
+                    glam::Vec4::new(c, s, 0.0, 0.0),
+                    glam::Vec4::new(-s, c, 0.0, 0.0),
+                    glam::Vec4::Z,
+                    glam::Vec4::W,
+                ),
+            }
+        };
+        let helpers: [fn(f32) -> Mat4; 3] = [rotation_x_degrees, rotation_y_degrees, rotation_z_degrees];
+        let glam_helpers: [fn(f32) -> Mat4; 3] = [Mat4::from_rotation_x, Mat4::from_rotation_y, Mat4::from_rotation_z];
+        let mut worst = 0.0f32;
+        let mut d = -100_000.0f32;
+        while d < 100_000.0 {
+            for axis in 0..3 {
+                let got = helpers[axis](d);
+                worst = worst.max((got - reference(axis, d)).abs().to_cols_array().into_iter().fold(0.0, f32::max));
+                if d.abs() < 360.0 {
+                    assert!(got.abs_diff_eq(glam_helpers[axis](deg(d)), 2e-6), "axis {axis} at {d}");
+                }
+            }
+            d += 0.731;
+        }
+        assert!(worst < 2e-6, "{worst}");
+    }
+
+    /// Each declared part name finds its own index (dense, unique): a shifted or repeated id
+    /// would point an animation at another part.
+    #[test]
+    fn known_part_names_find_their_index() {
+        const { assert!(KNOWN >= 160) };
+        for (i, name) in KNOWN_PART_NAMES.iter().enumerate() {
+            assert_eq!(known_id(name), Some(i), "{name}");
+        }
+        assert_eq!(known_id("not_a_part"), None);
+        // A late name found by the table and by the search alike, the first of two equal names.
+        let l = testkit::test_layer(&[("tail", None), ("head", None), ("tail", None), ("segment6", None)]);
+        let widened = Pose::reset(&l, Vec::new(), Vec::new());
+        let searched = Pose { widened_part_names: false, ..Pose::reset(&l, Vec::new(), Vec::new()) };
+        for name in ["tail", "head", "segment6", "jaw"] {
+            assert_eq!(widened.index(name), searched.index(name), "{name}");
+        }
+    }
+
+    /// Walk angles of a cow's legs and a zombie's legs at 20 instants are the game's formulas
+    /// through its sine table, bit for bit; through the C library (the old path) they differ.
+    #[test]
+    fn walk_angles_follow_the_game_sine_table() {
+        let legs4 = testkit::test_layer(&[
+            ("right_hind_leg", None),
+            ("left_hind_leg", None),
+            ("right_front_leg", None),
+            ("left_front_leg", None),
+        ]);
+        let biped = testkit::test_layer(&[("right_leg", None), ("left_leg", None)]);
+        let all = testkit::spawn("zombie");
+        let cos = |x: f32| rc_data::java_math::cos(f64::from(x));
+        let mut library_matches = true;
+        for library in [false, true] {
+            ANIMATION_PATHS.with(|p| p.set(AnimationPaths { sine_table: !library, ..AnimationPaths::NEW }));
+            for step in 0..20 {
+                let mut s = testkit::state(&all.map[&7], 0.0);
+                s.walk_pos = step as f32 * 1.37 + 0.11;
+                s.walk_speed = 0.8;
+                let q = s.walk_pos * 0.6662;
+                let mut cow = Pose::reset(&legs4, Vec::new(), Vec::new());
+                quadruped_legs(&mut cow, &s, false);
+                let (a, b) = (cos(q) * 1.4 * s.walk_speed, cos(q + PI) * 1.4 * s.walk_speed);
+                let mut zombie = Pose::reset(&biped, Vec::new(), Vec::new());
+                humanoid(&mut zombie, &s);
+                let leg = |c: f32| c * 1.4 * s.walk_speed / s.speed;
+                let got = [cow.parts[0][3], cow.parts[1][3], cow.parts[2][3], cow.parts[3][3]]
+                    .into_iter()
+                    .chain([zombie.parts[0][3], zombie.parts[1][3]])
+                    .map(f32::to_bits);
+                let want = [a, b, b, a, leg(cos(q)), leg(cos(q + PI))].map(f32::to_bits);
+                let same = got.eq(want);
+                if library {
+                    library_matches &= same;
+                } else {
+                    assert!(same, "step {step}");
+                }
+            }
+        }
+        ANIMATION_PATHS.with(|p| p.set(AnimationPaths::NEW));
+        assert!(!library_matches, "the library sine gives the table's angles: the test sees nothing");
     }
 
     #[test]

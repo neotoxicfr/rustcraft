@@ -279,38 +279,37 @@ pub(super) fn animate(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) -> b
                 h[4] = y;
             });
             // Walk, sit, stand up, rest, dash through keyframes, in the model's order.
-            let pre = if s.baby { "camel_baby" } else { "camel" };
-            let anim =
-                |n: &str| keyframes::get(&format!("{pre}.{n}")).or_else(|| keyframes::get(&format!("camel.{n}")));
+            let anim = |names| camel_animation(s.baby, names);
             let sitting = matches!(e.meta.get(&20), Some(rc_proto_v777::entity::Meta::Long(t)) if *t < 0);
             let since = s.age - e.extra[7];
             // Walk always applied, including sitting or dashing (its speed drops by itself).
-            if let Some(a) = anim("walk") {
+            if let Some(a) = anim(CAMEL_WALK) {
                 keyframes::apply_walk(p, a, s, 2.0, 2.5);
             }
             if e.extra[5] != 0.0 {
                 if sitting && since < 40.0 {
-                    if let Some(a) = anim("sit") {
+                    if let Some(a) = anim(CAMEL_SIT) {
                         keyframes::apply_since(p, a, e.extra[7], s.age, 1.0);
                     }
                 } else if sitting {
-                    if let Some(a) = anim("sit_pose") {
+                    if let Some(a) = anim(CAMEL_SIT_POSE) {
                         keyframes::apply_since(p, a, e.extra[7] + 40.0, s.age, 1.0);
                     }
                 } else if since < 52.0
-                    && let Some(a) = anim("standup")
+                    && let Some(a) = anim(CAMEL_STANDUP)
                 {
                     keyframes::apply_since(p, a, e.extra[7], s.age, 1.0);
                 }
             }
-            if let Some(a) = anim("idle")
-                && e.extra[2] != 0.0
+            // The idle state tested before the lookup (same result, no search when idle is off).
+            if e.extra[2] != 0.0
+                && let Some(a) = anim(CAMEL_IDLE)
             {
                 keyframes::apply_since(p, a, e.extra[4], s.age, 1.0);
             }
             if !sitting
                 && e.extra[8] >= 0.0
-                && let Some(a) = anim("dash")
+                && let Some(a) = anim(CAMEL_DASH)
             {
                 keyframes::apply_since(p, a, e.extra[8], s.age, 1.0);
             }
@@ -400,13 +399,18 @@ pub(super) fn animate(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) -> b
                 });
             }
             let b = if s.baby { "baby_rabbit" } else { "rabbit" };
+            let (hop_name, tilt_name) = if s.baby {
+                ("baby_rabbit.hop", "baby_rabbit.idle_head_tilt")
+            } else {
+                ("rabbit.hop", "rabbit.idle_head_tilt")
+            };
             if hop >= 0.0
-                && let Some(a) = keyframes::get(&format!("{b}.hop"))
+                && let Some(a) = keyframes::get_named(hop_name, || format!("{b}.hop"))
             {
                 keyframes::apply_since(p, a, hop, s.age, 1.0);
             }
             if tilt >= 0.0
-                && let Some(a) = keyframes::get(&format!("{b}.idle_head_tilt"))
+                && let Some(a) = keyframes::get_named(tilt_name, || format!("{b}.idle_head_tilt"))
             {
                 keyframes::apply_since(p, a, tilt, s.age, 1.0);
             }
@@ -437,10 +441,10 @@ fn horse(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     let yr = s.yaw.clamp(deg(-20.0), deg(20.0));
     let mut xr = s.pitch;
     if v > 0.2 {
-        xr += (pp * 0.8).cos() * 0.15 * v;
+        xr += table_cos(pp * 0.8) * 0.15 * v;
     }
     let m = 1.0 - stand.max(eat);
-    let sa = age.sin();
+    let sa = table_sin(age);
     p.set("head_parts", |h| {
         h[3] = stand * (PI / 12.0 + xr) + eat * (2.181_661_6 + sa * 0.05) + m * (PI / 6.0 + xr + mouth * sa * 0.05);
         h[4] = (stand + m) * yr;
@@ -472,9 +476,9 @@ fn horse(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     });
     // Stride shortened in water (× 0.2).
     let w = if s.in_water { 0.2 } else { 1.0 };
-    let l = (w * pp * 0.6662 + PI).cos();
+    let l = table_cos(w * pp * 0.6662 + PI);
     let a = l * 0.8 * v;
-    let o = (age * 0.6 + PI).cos();
+    let o = table_cos(age * 0.6 + PI);
     let walk = 1.0 - stand;
     p.set("left_front_leg", |x| x[3] = (xo + o) * stand + a * walk);
     p.set("right_front_leg", |x| x[3] = (xo - o) * stand - a * walk);
@@ -493,7 +497,7 @@ fn horse(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
         t[3] = qo + PI / 6.0 + v * 0.75;
         t[1] += v * age_scale;
         t[2] += 2.0 * v * age_scale;
-        t[4] = if tail_moving { (age * 0.7).cos() } else { 0.0 };
+        t[4] = if tail_moving { table_cos(age * 0.7) } else { 0.0 };
     });
     if class == 2 {
         // Pitch forced to −30°: only the head rotation depends on it.
@@ -561,11 +565,11 @@ fn feline(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
         } else {
             (q, q + PI, q + PI, q, if crouch { 0.471_238_94 } else { PI / 4.0 })
         };
-        p.set("left_hind_leg", |l| l[3] = lh.cos() * v);
-        p.set("right_hind_leg", |l| l[3] = rh.cos() * v);
-        p.set("left_front_leg", |l| l[3] = lf.cos() * v);
-        p.set("right_front_leg", |l| l[3] = rf.cos() * v);
-        p.set("tail2", |t| t[3] = 1.727_876_1 + swing * pp.cos() * v);
+        p.set("left_hind_leg", |l| l[3] = table_cos(lh) * v);
+        p.set("right_hind_leg", |l| l[3] = table_cos(rh) * v);
+        p.set("left_front_leg", |l| l[3] = table_cos(lf) * v);
+        p.set("right_front_leg", |l| l[3] = table_cos(rf) * v);
+        p.set("tail2", |t| t[3] = 1.727_876_1 + swing * table_cos(pp) * v);
     } else if !s.baby {
         p.set("body", |b| {
             b[3] = PI / 4.0;
@@ -684,26 +688,31 @@ fn feline(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
 /// Angle interpolation whose difference is brought into [−180, 180[ ("degrees" version of the game, applied
 /// as is to radians by the felines: no wrap-around effect for these differences).
 fn rot_lerp_deg(t: f32, a: f32, b: f32) -> f32 {
-    let mut d = (b - a) % 360.0;
-    if d >= 180.0 {
-        d -= 360.0;
-    }
-    if d < -180.0 {
-        d += 360.0;
-    }
-    a + t * d
+    rc_data::java_math::lerp_angle_degrees(t, a, b)
 }
 
-/// Angle interpolation in radians along the shortest path (of the game).
-fn rot_lerp_rad(t: f32, a: f32, b: f32) -> f32 {
-    let mut d = b - a;
-    while d < -PI {
-        d += 2.0 * PI;
+/// A camel animation: short name, then the baby's and the adult's full names.
+type CamelAnimation = [&'static str; 3];
+const CAMEL_WALK: CamelAnimation = ["walk", "camel_baby.walk", "camel.walk"];
+const CAMEL_SIT: CamelAnimation = ["sit", "camel_baby.sit", "camel.sit"];
+const CAMEL_SIT_POSE: CamelAnimation = ["sit_pose", "camel_baby.sit_pose", "camel.sit_pose"];
+const CAMEL_STANDUP: CamelAnimation = ["standup", "camel_baby.standup", "camel.standup"];
+const CAMEL_IDLE: CamelAnimation = ["idle", "camel_baby.idle", "camel.idle"];
+const CAMEL_DASH: CamelAnimation = ["dash", "camel_baby.dash", "camel.dash"];
+
+/// The baby's animation when it has its own, otherwise the adult's. `KEYFRAME_STATIC_NAMES`:
+/// the literal names (up to six lookups per camel and per frame used to format their names);
+/// otherwise formatted, the old path.
+fn camel_animation(
+    baby: bool,
+    [short, baby_name, adult_name]: CamelAnimation,
+) -> Option<&'static rc_data::KeyframeAnimation> {
+    if animation_paths().static_keyframe_names {
+        keyframes::get(if baby { baby_name } else { adult_name }).or_else(|| keyframes::get(adult_name))
+    } else {
+        let pre = if baby { "camel_baby" } else { "camel" };
+        keyframes::get(&format!("{pre}.{short}")).or_else(|| keyframes::get(&format!("camel.{short}")))
     }
-    while d >= PI {
-        d -= 2.0 * PI;
-    }
-    a + t * d
 }
 
 /// Walk: target min(d × 4, 1) smoothed at 0.4; camel standing, not dashing
@@ -836,7 +845,7 @@ fn wolf(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     let is_angry = angry(e, 22);
     let flags = e.meta_byte(18);
     let (pp, v) = (s.walk_pos, s.walk_speed);
-    p.set("tail", |t| t[4] = if is_angry { 0.0 } else { (pp * 0.6662).cos() * 1.4 * v });
+    p.set("tail", |t| t[4] = if is_angry { 0.0 } else { table_cos(pp * 0.6662) * 1.4 * v });
     if flags & 1 != 0 {
         p.set("body", |b| {
             b[1] += 4.0 * a;
@@ -872,15 +881,15 @@ fn wolf(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
         }
     } else {
         let q = pp * 0.6662;
-        p.set("right_hind_leg", |l| l[3] = q.cos() * 1.4 * v);
-        p.set("left_hind_leg", |l| l[3] = (q + PI).cos() * 1.4 * v);
-        p.set("right_front_leg", |l| l[3] = (q + PI).cos() * 1.4 * v);
-        p.set("left_front_leg", |l| l[3] = q.cos() * 1.4 * v);
+        p.set("right_hind_leg", |l| l[3] = table_cos(q) * 1.4 * v);
+        p.set("left_hind_leg", |l| l[3] = table_cos(q + PI) * 1.4 * v);
+        p.set("right_front_leg", |l| l[3] = table_cos(q + PI) * 1.4 * v);
+        p.set("left_front_leg", |l| l[3] = table_cos(q) * 1.4 * v);
     }
     let shake = lerp(pt, x[3], x[2]);
     let roll = |off: f32| {
         let t = ((shake + off) / 1.8).clamp(0.0, 1.0);
-        (t * PI).sin() * (t * PI * 11.0).sin() * 0.15 * PI
+        table_sin(t * PI) * table_sin(t * PI * 11.0) * 0.15 * PI
     };
     let head_roll = lerp(pt, x[1], x[0]) * 0.15 * PI;
     p.set("body", |b| b[5] = roll(-0.16));
@@ -934,16 +943,16 @@ fn fox(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
         }
     } else {
         let q = pp * 0.6662;
-        p.set("right_hind_leg", |l| l[3] = q.cos() * 1.4 * v);
-        p.set("left_hind_leg", |l| l[3] = (q + PI).cos() * 1.4 * v);
-        p.set("right_front_leg", |l| l[3] = (q + PI).cos() * 1.4 * v);
-        p.set("left_front_leg", |l| l[3] = q.cos() * 1.4 * v);
+        p.set("right_hind_leg", |l| l[3] = table_cos(q) * 1.4 * v);
+        p.set("left_hind_leg", |l| l[3] = table_cos(q + PI) * 1.4 * v);
+        p.set("right_front_leg", |l| l[3] = table_cos(q + PI) * 1.4 * v);
+        p.set("left_front_leg", |l| l[3] = table_cos(q) * 1.4 * v);
     }
     const LEGS: [&str; 4] = ["right_hind_leg", "left_hind_leg", "right_front_leg", "left_front_leg"];
     if crouching {
         p.set("body", |b| b[3] += 0.104_719_76);
         p.set("head", |h| h[1] += crouch * a);
-        let w = s.age.cos() * 0.05;
+        let w = table_cos(s.age) * 0.05;
         p.set("body", |b| b[4] = w);
         p.set("right_hind_leg", |l| l[5] = w);
         p.set("left_hind_leg", |l| l[5] = w);
@@ -1058,7 +1067,7 @@ fn fox(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
         p.set("head", |h| {
             h[3] = 0.0;
             h[4] = -PI * 2.0 / 3.0;
-            h[5] = (s.age * 0.027).cos() / 22.0;
+            h[5] = table_cos(s.age * 0.027) / 22.0;
         });
     }
     if faceplanted {
@@ -1066,10 +1075,10 @@ fn fox(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
         let m = f32::from_bits(cell.load(Ordering::Relaxed)) + 0.67;
         cell.store(m.to_bits(), Ordering::Relaxed);
         let q = m * 0.4662;
-        p.set("right_hind_leg", |l| l[3] = q.cos() * 0.1);
-        p.set("left_hind_leg", |l| l[3] = (q + PI).cos() * 0.1);
-        p.set("right_front_leg", |l| l[3] = (q + PI).cos() * 0.1);
-        p.set("left_front_leg", |l| l[3] = q.cos() * 0.1);
+        p.set("right_hind_leg", |l| l[3] = table_cos(q) * 0.1);
+        p.set("left_hind_leg", |l| l[3] = table_cos(q + PI) * 0.1);
+        p.set("right_front_leg", |l| l[3] = table_cos(q + PI) * 0.1);
+        p.set("left_front_leg", |l| l[3] = table_cos(q) * 0.1);
     }
 }
 
@@ -1086,11 +1095,11 @@ fn panda(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     let roll = if s.baby { 0.0 } else { lerp(pt, x[5], x[4]) };
     if e.meta_int(18).unwrap_or(0) > 0 {
         p.set("head", |h| {
-            h[4] = 0.35 * (0.6 * age).sin();
-            h[5] = 0.35 * (0.6 * age).sin();
+            h[4] = 0.35 * table_sin(0.6 * age);
+            h[5] = 0.35 * table_sin(0.6 * age);
         });
-        p.set("right_front_leg", |l| l[3] = -0.75 * (0.3 * age).sin());
-        p.set("left_front_leg", |l| l[3] = 0.75 * (0.3 * age).sin());
+        p.set("right_front_leg", |l| l[3] = -0.75 * table_sin(0.3 * age));
+        p.set("left_front_leg", |l| l[3] = 0.75 * table_sin(0.3 * age));
     } else {
         p.set("head", |h| h[5] = 0.0);
     }
@@ -1108,7 +1117,7 @@ fn panda(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     if sit > 0.0 {
         if s.baby {
             p.set("body", |b| {
-                b[3] = rot_lerp_rad(sit, b[3], PI / 18.0);
+                b[3] = lerp_angle_radians(sit, b[3], PI / 18.0);
                 b[2] = lerp(sit, b[2], -1.5);
             });
             p.set("head", |h| {
@@ -1121,17 +1130,17 @@ fn panda(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
                 p.set(leg, |l| l[2] = lerp(sit, l[2], z));
             }
         } else {
-            p.set("body", |b| b[3] = rot_lerp_rad(sit, b[3], 1.740_796_3));
-            p.set("head", |h| h[3] = rot_lerp_rad(sit, h[3], PI / 2.0));
+            p.set("body", |b| b[3] = lerp_angle_radians(sit, b[3], 1.740_796_3));
+            p.set("head", |h| h[3] = lerp_angle_radians(sit, h[3], PI / 2.0));
         }
         p.set("right_front_leg", |l| l[5] = -0.270_796_42);
         p.set("left_front_leg", |l| l[5] = 0.270_796_42);
         p.set("right_hind_leg", |l| l[5] = 0.570_796_4);
         p.set("left_hind_leg", |l| l[5] = -0.570_796_4);
         if e.meta_int(20).unwrap_or(0) > 0 {
-            p.set("head", |h| h[3] = PI / 2.0 + 0.2 * (age * 0.6).sin());
-            p.set("right_front_leg", |l| l[3] = -0.4 - 0.2 * (age * 0.6).sin());
-            p.set("left_front_leg", |l| l[3] = -0.4 - 0.2 * (age * 0.6).sin());
+            p.set("head", |h| h[3] = PI / 2.0 + 0.2 * table_sin(age * 0.6));
+            p.set("right_front_leg", |l| l[3] = -0.4 - 0.2 * table_sin(age * 0.6));
+            p.set("left_front_leg", |l| l[3] = -0.4 - 0.2 * table_sin(age * 0.6));
         }
         // Scared by the thunderstorm: head tucked in, front legs over the eyes.
         if panda_scared(e) {
@@ -1145,18 +1154,18 @@ fn panda(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
         }
     }
     if back > 0.0 {
-        p.set("right_hind_leg", |l| l[3] = -0.6 * (age * 0.15).sin());
-        p.set("left_hind_leg", |l| l[3] = 0.6 * (age * 0.15).sin());
-        p.set("right_front_leg", |l| l[3] = 0.3 * (age * 0.25).sin());
-        p.set("left_front_leg", |l| l[3] = -0.3 * (age * 0.25).sin());
-        p.set("head", |h| h[3] = rot_lerp_rad(back, h[3], PI / 2.0));
+        p.set("right_hind_leg", |l| l[3] = -0.6 * table_sin(age * 0.15));
+        p.set("left_hind_leg", |l| l[3] = 0.6 * table_sin(age * 0.15));
+        p.set("right_front_leg", |l| l[3] = 0.3 * table_sin(age * 0.25));
+        p.set("left_front_leg", |l| l[3] = -0.3 * table_sin(age * 0.25));
+        p.set("head", |h| h[3] = lerp_angle_radians(back, h[3], PI / 2.0));
     }
     if roll > 0.0 {
-        p.set("head", |h| h[3] = rot_lerp_rad(roll, h[3], 2.056_194_5));
-        p.set("right_hind_leg", |l| l[3] = -0.5 * (age * 0.5).sin());
-        p.set("left_hind_leg", |l| l[3] = 0.5 * (age * 0.5).sin());
-        p.set("right_front_leg", |l| l[3] = 0.5 * (age * 0.5).sin());
-        p.set("left_front_leg", |l| l[3] = -0.5 * (age * 0.5).sin());
+        p.set("head", |h| h[3] = lerp_angle_radians(roll, h[3], 2.056_194_5));
+        p.set("right_hind_leg", |l| l[3] = -0.5 * table_sin(age * 0.5));
+        p.set("left_hind_leg", |l| l[3] = 0.5 * table_sin(age * 0.5));
+        p.set("right_front_leg", |l| l[3] = 0.5 * table_sin(age * 0.5));
+        p.set("left_front_leg", |l| l[3] = -0.5 * table_sin(age * 0.5));
     }
 }
 
@@ -1178,14 +1187,14 @@ fn turtle(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
         let laying = e.meta_bool(19);
         let (f, amp) = if laying { (4.0, 2.0) } else { (1.0, 1.0) };
         let sw = pp * 5.0;
-        let front = (f * sw).cos();
-        let hind = sw.cos();
+        let front = table_cos(f * sw);
+        let hind = table_cos(sw);
         p.set("right_front_leg", |l| l[4] = -front * 8.0 * v * amp);
         p.set("left_front_leg", |l| l[4] = front * 8.0 * v * amp);
         p.set("right_hind_leg", |l| l[4] = -hind * 3.0 * v);
         p.set("left_hind_leg", |l| l[4] = hind * 3.0 * v);
     } else {
-        let sw = (pp * 0.6662 * 0.6).cos() * 0.5 * v;
+        let sw = table_cos(pp * 0.6662 * 0.6) * 0.5 * v;
         p.set("right_hind_leg", |l| l[3] = sw);
         p.set("left_hind_leg", |l| l[3] = -sw);
         p.set("right_front_leg", |l| l[5] = -sw);
@@ -1223,13 +1232,23 @@ fn armadillo(p: &mut Pose<'_>, e: &Entity, s: &AnimState) {
             h[3] = s.pitch.clamp(deg(-22.5), deg(25.0));
             h[4] = s.yaw.clamp(deg(-32.5), deg(32.5));
         });
-        if let Some(a) = keyframes::get(&format!("{pre}walk")) {
+        let walk = if s.baby { "baby_armadillo.armadillo_baby_walk" } else { "armadillo.walk" };
+        if let Some(a) = keyframes::get_named(walk, || format!("{pre}walk")) {
             keyframes::apply_walk(p, a, s, 16.5, 2.5);
         }
     }
-    keyframes::play(p, &format!("{pre}roll_out"), x[2], s.age);
-    keyframes::play(p, &format!("{pre}roll_up"), x[3], s.age);
-    keyframes::play(p, &format!("{pre}peek"), x[4], s.age);
+    let [roll_out, roll_up, peek] = if s.baby {
+        [
+            "baby_armadillo.armadillo_baby_roll_out",
+            "baby_armadillo.armadillo_baby_roll_up",
+            "baby_armadillo.armadillo_baby_peek",
+        ]
+    } else {
+        ["armadillo.roll_out", "armadillo.roll_up", "armadillo.peek"]
+    };
+    keyframes::play_named(p, roll_out, || format!("{pre}roll_out"), x[2], s.age);
+    keyframes::play_named(p, roll_up, || format!("{pre}roll_up"), x[3], s.age);
+    keyframes::play_named(p, peek, || format!("{pre}peek"), x[4], s.age);
     if hiding {
         skip_draw(p, "body");
     }
@@ -1307,7 +1326,7 @@ fn bee(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     let age = s.age;
     if !grounded {
         let sp = age * 120.321_13 * PI / 180.0;
-        let rz = sp.cos() * PI * 0.15;
+        let rz = table_cos(sp) * PI * 0.15;
         let rx = p.get("right_wing").map_or(0.0, |w| w[3]);
         p.set("right_wing", |w| {
             w[4] = 0.0;
@@ -1323,10 +1342,10 @@ fn bee(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
         }
     }
     if !angry(e, 19) && !grounded {
-        let sp = (age * 0.18).cos();
+        let sp = table_cos(age * 0.18);
         p.set("bone", |b| {
             b[3] = 0.1 + sp * PI * 0.025;
-            b[1] -= (age * 0.18).cos() * 0.9;
+            b[1] -= table_cos(age * 0.18) * 0.9;
         });
         p.set("front_legs", |l| l[3] = -sp * PI * 0.1 + PI / 8.0);
         p.set("back_legs", |l| l[3] = -sp * PI * 0.05 + PI / 4.0);
@@ -1337,7 +1356,7 @@ fn bee(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     }
     let roll = lerp(pt, e.extra[1], e.extra[0]);
     if roll > 0.0 {
-        p.set("bone", |b| b[3] = rot_lerp_rad(roll, b[3], 3.091_592_8));
+        p.set("bone", |b| b[3] = lerp_angle_radians(roll, b[3], 3.091_592_8));
     }
 }
 
@@ -1347,14 +1366,14 @@ fn allay(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     let x = &e.extra;
     let (v, pos, age) = (s.walk_speed, s.walk_pos, s.age);
     let flap_speed = age * 20.0 * PI / 180.0 + pos;
-    let flap = flap_speed.cos() * PI * 0.15 + v;
+    let flap = table_cos(flap_speed) * PI * 0.15 + v;
     let bob_speed = age * 9.0 * PI / 180.0;
     let flying = (v / 0.3).min(1.0);
     let idle = 1.0 - flying;
     let hold = lerp(pt, x[1], x[0]) / 5.0;
     if e.meta_bool(16) {
         let ds = age * 8.0 * PI / 180.0 + v;
-        let freq = ds.cos() * 16.0 * PI / 180.0;
+        let freq = table_cos(ds) * 16.0 * PI / 180.0;
         let spin = lerp(pt, x[4], x[3]) / 15.0;
         let spinning = x[2] % 55.0 < 15.0;
         p.set("root", |r| {
@@ -1364,8 +1383,8 @@ fn allay(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
             r[5] = freq * (1.0 - spin);
         });
         p.set("head", |h| {
-            h[4] = ds.cos() * 30.0 * PI / 180.0 * (1.0 - spin);
-            h[5] = ds.cos() * 14.0 * PI / 180.0 * (1.0 - spin);
+            h[4] = table_cos(ds) * 30.0 * PI / 180.0 * (1.0 - spin);
+            h[5] = table_cos(ds) * 14.0 * PI / 180.0 * (1.0 - spin);
         });
     } else {
         p.set("head", |h| {
@@ -1385,7 +1404,7 @@ fn allay(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     let arm_x = hold * lerp(flying, -PI / 3.0, -1.134_464);
     p.set("root", |r| r[1] += (bob_speed as f64).cos() as f32 * 0.25 * idle);
     let bob_f = idle * (1.0 - hold);
-    let bob = 0.436_332_32 - (bob_speed + PI * 3.0 / 2.0).cos() * PI * 0.075 * bob_f;
+    let bob = 0.436_332_32 - table_cos(bob_speed + PI * 3.0 / 2.0) * PI * 0.075 * bob_f;
     p.set("right_arm", |a| {
         a[3] = arm_x;
         a[5] = bob;
@@ -1401,14 +1420,14 @@ fn allay(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
 /// Parrot (§ 7): poses party (jukebox nearby, priority), sitting, flying, standing.
 fn parrot(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     let x = &e.extra;
-    let f = (lerp(pt, x[1], x[0]).sin() + 1.0) * lerp(pt, x[3], x[2]);
+    let f = (table_sin(lerp(pt, x[1], x[0])) + 1.0) * lerp(pt, x[3], x[2]);
     if matches!(e.jukebox, Some((_, true))) {
         // Party: legs spread, the rest describes a circle (cos, sin of the age), head straight
         // that rolls; no walk or swaying.
         let leg = (std::f64::consts::PI / 9.0) as f32;
         p.set("left_leg", |l| l[5] = -leg);
         p.set("right_leg", |l| l[5] = leg);
-        let (dx, dy) = (s.age.cos(), s.age.sin());
+        let (dx, dy) = (table_cos(s.age), table_sin(s.age));
         for n in ["head", "body", "left_wing", "right_wing", "tail"] {
             p.set(n, |q| {
                 q[0] += dx;
@@ -1418,7 +1437,7 @@ fn parrot(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
         p.set("head", |h| {
             h[3] = 0.0;
             h[4] = 0.0;
-            h[5] = s.age.sin() * 0.4;
+            h[5] = table_sin(s.age) * 0.4;
         });
         p.set("left_wing", |w| w[5] = -0.0873 - f);
         p.set("right_wing", |w| w[5] = 0.0873 + f);
@@ -1449,31 +1468,37 @@ fn parrot(p: &mut Pose<'_>, e: &Entity, s: &AnimState, pt: f32) {
     }
     let (pp, v) = (s.walk_pos, s.walk_speed);
     if !flying {
-        p.set("left_leg", |l| l[3] += (pp * 0.6662).cos() * 1.4 * v);
-        p.set("right_leg", |l| l[3] += (pp * 0.6662 + PI).cos() * 1.4 * v);
+        p.set("left_leg", |l| l[3] += table_cos(pp * 0.6662) * 1.4 * v);
+        p.set("right_leg", |l| l[3] += table_cos(pp * 0.6662 + PI) * 1.4 * v);
     }
     let b = f * 0.3;
     for n in ALL {
         p.set(n, |q| q[1] += b);
     }
-    p.set("tail", |t| t[3] += (pp * 0.6662).cos() * 0.3 * v);
+    p.set("tail", |t| t[3] += table_cos(pp * 0.6662) * 0.3 * v);
     p.set("left_wing", |w| w[5] = -0.0873 - f);
     p.set("right_wing", |w| w[5] = 0.0873 + f);
 }
 
 /// Own render rotations, after "Y(180 − body)" (the death tilt, placed afterwards by the
 /// engine, precedes these additions in the game: difference limited to dying mobs in these poses).
-pub(super) fn rotations(e: &Entity, pt: f32, m: &mut Mat4) -> bool {
-    let body = rot_lerp(pt, e.body_o, e.body);
+/// Body rotations of the felines and the panda; `body`: interpolated body yaw (degrees).
+/// `lazy_base`: the base rotation is built only for these three kinds (it cost a sine and a
+/// cosine for every living entity); otherwise built first, the old path.
+pub(super) fn rotations(e: &Entity, pt: f32, body: f32, m: &mut Mat4, lazy_base: bool) -> bool {
+    let has_family_rotation = matches!(e.kind.as_str(), "cat" | "fox" | "panda");
+    if lazy_base && !has_family_rotation {
+        return false;
+    }
     let x_rot = e.pitch_o + pt * (e.pitch - e.pitch_o);
-    let base = Mat4::from_rotation_y(deg(180.0 - body));
+    let base = rotation_y_degrees(180.0 - body);
     match e.kind.as_str() {
         "cat" => {
             let lie = lerp(pt, e.extra[1], e.extra[0]);
             *m *= base;
             if lie > 0.0 {
                 *m *= Mat4::from_translation(Vec3::new(0.4 * lie, 0.15 * lie, 0.1 * lie))
-                    * Mat4::from_rotation_z(deg(rot_lerp_deg(lie, 0.0, 90.0)));
+                    * rotation_z_degrees(rot_lerp_deg(lie, 0.0, 90.0));
                 // Lying on a sleeping player (`cat_track`, extra 6): offset by 0.15.
                 if e.extra[6] != 0.0 {
                     *m *= Mat4::from_translation(Vec3::new(0.15 * lie, 0.0, 0.0));
@@ -1484,7 +1509,7 @@ pub(super) fn rotations(e: &Entity, pt: f32, m: &mut Mat4) -> bool {
         "fox" => {
             *m *= base;
             if e.meta_byte(19) & (16 | 64) != 0 {
-                *m *= Mat4::from_rotation_x(deg(-x_rot));
+                *m *= rotation_x_degrees(-x_rot);
             }
             true
         }
@@ -1525,19 +1550,19 @@ fn panda_rotations(e: &Entity, pt: f32, x_rot: f32, m: &mut Mat4) {
             (0.0, 0.0)
         };
         if pos < 32 {
-            *m *= Mat4::from_translation(Vec3::new(0.0, dy, 0.0)) * Mat4::from_rotation_x(deg(-a));
+            *m *= Mat4::from_translation(Vec3::new(0.0, dy, 0.0)) * rotation_x_degrees(-a);
         }
     }
     let sit = lerp(pt, x[1], x[0]);
     if sit > 0.0 {
         *m *= Mat4::from_translation(Vec3::new(0.0, 0.8 * sit, 0.0))
-            * Mat4::from_rotation_x(deg(lerp(sit, x_rot, x_rot + 90.0)))
+            * rotation_x_degrees(lerp(sit, x_rot, x_rot + 90.0))
             * Mat4::from_translation(Vec3::new(0.0, -sit, 0.0));
         // Scared (worried gene, thunderstorm): yaw shaking; the baby is realigned.
         if panda_scared(e) {
             let age = e.age as f32 + pt;
             let shake = (f64::from(age * 1.25).cos() * std::f64::consts::PI * 0.05) as f32;
-            *m *= Mat4::from_rotation_y(deg(shake));
+            *m *= rotation_y_degrees(shake);
             if baby {
                 *m *= Mat4::from_translation(Vec3::new(0.0, 0.8, 0.55));
             }
@@ -1547,7 +1572,7 @@ fn panda_rotations(e: &Entity, pt: f32, x_rot: f32, m: &mut Mat4) {
     if back > 0.0 {
         let y = if baby { 0.5 } else { 1.3 };
         *m *= Mat4::from_translation(Vec3::new(0.0, y * back, 0.0))
-            * Mat4::from_rotation_x(deg(lerp(back, x_rot, x_rot + 180.0)));
+            * rotation_x_degrees(lerp(back, x_rot, x_rot + 180.0));
     }
 }
 
@@ -2208,10 +2233,10 @@ mod tests {
         e.walk_speed = 0.5;
         e.walk_speed_o = 0.5;
         let dry = part(&posed(&l, e, 1.0), "left_hind_leg")[3];
-        assert!((dry + (3.0f32 * 0.6662 + PI).cos() * 0.5 * 0.5).abs() < 1e-6);
+        assert!((dry + table_cos(3.0f32 * 0.6662 + PI) * 0.5 * 0.5).abs() < 1e-6);
         e.in_water = true;
         let wet = part(&posed(&l, e, 1.0), "left_hind_leg")[3];
-        assert!((wet + (0.2 * 3.0f32 * 0.6662 + PI).cos() * 0.5 * 0.5).abs() < 1e-6, "{wet}");
+        assert!((wet + table_cos(0.2 * 3.0f32 * 0.6662 + PI) * 0.5 * 0.5).abs() < 1e-6, "{wet}");
     }
 
     /// Turtle placed on the bottom of the water: swims (front legs in z), not the land walk (y).
@@ -2226,7 +2251,7 @@ mod tests {
         e.walk_speed = 0.5;
         e.walk_speed_o = 0.5;
         let p = posed(&l, e, 1.0);
-        let sw = (2.0f32 * 0.6662 * 0.6).cos() * 0.5 * 0.5;
+        let sw = table_cos(2.0f32 * 0.6662 * 0.6) * 0.5 * 0.5;
         assert_eq!(part(&p, "right_front_leg")[4], 0.0);
         assert!((part(&p, "right_front_leg")[5] + sw).abs() < 1e-6);
         e.in_water = false;
@@ -2264,7 +2289,7 @@ mod tests {
         e.age = 10;
         let calm = part(&posed(&l, e, 0.0), "head")[3];
         let mut calm_m = Mat4::IDENTITY;
-        rotations(e, 0.0, &mut calm_m);
+        rotations(e, 0.0, rot_lerp(0.0, e.body_o, e.body), &mut calm_m, true);
         e.meta.insert(21, Meta::Byte(2));
         assert!(panda_scared(e));
         let p = posed(&l, e, 0.0);
@@ -2273,7 +2298,7 @@ mod tests {
         assert_eq!(part(&p, "right_front_leg")[3], -0.9);
         assert_eq!(part(&p, "left_front_leg")[3], -0.9);
         let mut m = Mat4::IDENTITY;
-        rotations(e, 0.0, &mut m);
+        rotations(e, 0.0, rot_lerp(0.0, e.body_o, e.body), &mut m, true);
         let shake = (f64::from(10.0f32 * 1.25).cos() * std::f64::consts::PI * 0.05) as f32;
         let want = calm_m * Mat4::from_rotation_y(deg(shake));
         assert!(m.abs_diff_eq(want, 1e-6), "{m:?}");
@@ -2295,11 +2320,13 @@ mod tests {
         player.pos = [2.5, 64.2, 0.5];
         all.map.insert(8, player);
         let mut alone = Mat4::IDENTITY;
-        rotations(&all.map[&7], 0.0, &mut alone);
+        let cat = &all.map[&7];
+        rotations(cat, 0.0, rot_lerp(0.0, cat.body_o, cat.body), &mut alone, true);
         cat_track(&mut all);
         assert_eq!(all.map[&7].extra[6], 1.0);
         let mut m = Mat4::IDENTITY;
-        rotations(&all.map[&7], 0.0, &mut m);
+        let cat = &all.map[&7];
+        rotations(cat, 0.0, rot_lerp(0.0, cat.body_o, cat.body), &mut m, true);
         assert!(m.abs_diff_eq(alone * Mat4::from_translation(Vec3::new(0.15, 0.0, 0.0)), 1e-6));
         // Outside the block widened by 2 (x ≥ 3 + 0.1): nothing.
         all.map.get_mut(&8).unwrap().pos[0] = 3.11;
@@ -2410,9 +2437,9 @@ mod tests {
         assert_eq!(part(&p, "left_leg")[5], -leg);
         assert_eq!(part(&p, "right_leg")[5], leg);
         let head = part(&p, "head");
-        assert_eq!((head[0], head[1], head[3], head[4]), (10f32.cos(), 10f32.sin(), 0.0, 0.0));
-        assert_eq!(head[5], 10f32.sin() * 0.4);
-        assert_eq!(part(&p, "tail")[0], 10f32.cos());
+        assert_eq!((head[0], head[1], head[3], head[4]), (table_cos(10.0), table_sin(10.0), 0.0, 0.0));
+        assert_eq!(head[5], table_sin(10.0) * 0.4);
+        assert_eq!(part(&p, "tail")[0], table_cos(10.0));
         assert_eq!(part(&p, "left_leg")[1], 0.0, "legs outside the circle");
         // End: party over, jukebox remembered.
         super::super::jukebox_notify(&mut all, &dims, [3, 64, 0], false);

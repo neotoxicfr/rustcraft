@@ -307,22 +307,12 @@ impl Server {
     /// Block in tag `tag`, at level `mode` of `RUSTCRAFT_OPT_TAG_BITS`; a block outside
     /// the table goes through the sorted list (the only one that can hold an unknown identifier).
     pub(crate) fn tag_u32(&self, tag: &str, block: u32, mode: u8) -> bool {
-        if mode >= 1
-            && let Some(v) = self.tag_bits.has(tag, block)
-        {
-            return v;
-        }
-        self.block_tags.get(tag).is_some_and(|v| v.binary_search(&block).is_ok())
+        block_tag_named(&self.tag_bits, &self.block_tags, tag, block, mode)
     }
 
     /// Block in the tag named `t`, at level `mode` of `RUSTCRAFT_OPT_TAG_BITS`.
     pub(crate) fn tag_id_u32(&self, t: crate::tag_bits::TagId, block: u32, mode: u8) -> bool {
-        if mode >= 2
-            && let Some(v) = self.tag_bits.has_id(t, block)
-        {
-            return v;
-        }
-        self.tag_u32(t.name(), block, mode)
+        block_tag_member(&self.tag_bits, &self.block_tags, t, block, mode)
     }
 
     /// Block tag `tag` of the block named `name` (full name, `minecraft:` included), for
@@ -422,6 +412,40 @@ impl MobStates {
 
 fn state_name(d: &rc_data::VersionData, s: u32) -> &str {
     d.block_of(s).map_or("minecraft:air", |b| b.name.as_str())
+}
+
+/// Block (index) in tag `tag`, at level `mode` of `RUSTCRAFT_OPT_TAG_BITS`, from the tag tables
+/// alone (the server and the views shared with other threads read the same way); a block outside
+/// the bit table goes through the sorted list (the only one that can hold an unknown identifier).
+pub(crate) fn block_tag_named(
+    bits: &crate::tag_bits::TagBits,
+    lists: &hashbrown::HashMap<String, Vec<u32>>,
+    tag: &str,
+    block: u32,
+    mode: u8,
+) -> bool {
+    if mode >= 1
+        && let Some(v) = bits.has(tag, block)
+    {
+        return v;
+    }
+    lists.get(tag).is_some_and(|v| v.binary_search(&block).is_ok())
+}
+
+/// Block (index) in the tag named in the code `t`, like [`block_tag_named`].
+pub(crate) fn block_tag_member(
+    bits: &crate::tag_bits::TagBits,
+    lists: &hashbrown::HashMap<String, Vec<u32>>,
+    t: crate::tag_bits::TagId,
+    block: u32,
+    mode: u8,
+) -> bool {
+    if mode >= 2
+        && let Some(v) = bits.has_id(t, block)
+    {
+        return v;
+    }
+    block_tag_named(bits, lists, t.name(), block, mode)
 }
 
 /// On-foot rule by name (old path, and table construction).
