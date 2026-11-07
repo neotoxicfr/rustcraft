@@ -714,6 +714,15 @@ thread_local! {
     static SCRATCH: RefCell<(Vec<Aabb>, Vec<Aabb>)> = const { RefCell::new((Vec::new(), Vec::new())) };
 }
 
+/// Per block state, what it adds to the light of a particle in its cell: the light it emits
+/// (0 to 15), or `GLOWS` for a state drawn emissive (magma), whose particles take full light.
+const GLOWS: u8 = 0x80;
+
+fn particle_glow_per_state(data: &rc_data::VersionData) -> Vec<u8> {
+    let emissive = |s: &rc_data::StateInfo| s.light & rc_data::light_bits::EMISSIVE != 0;
+    data.states.iter().map(|s| if emissive(s) { GLOWS } else { s.light_emission.min(15) }).collect()
+}
+
 fn light_nibble(layers: &[rc_world::LightLayer], min_y: i32, x: i32, y: i32, z: i32) -> u8 {
     let sy = ((y - min_y) >> 4) + 1;
     let Some(Some(layer)) = usize::try_from(sy).ok().and_then(|i| layers.get(i)) else { return 0 };
@@ -732,13 +741,23 @@ impl TickWorld<'_> {
         c.block((x & 15) as usize, ly as usize, (z & 15) as usize)
     }
 
-    /// Light (block, sky) of the block; chunk absent: sky 15, block 0.
-    fn light(&self, x: i32, y: i32, z: i32) -> (u8, u8) {
+    /// Light (block, sky) a particle in block (x, y, z) takes, as the game reads it: chunk absent
+    /// or above the world, block 0 and sky 15; in a block drawn emissive (`glow` holds [`GLOWS`]
+    /// for its state), full light; otherwise the block layer raised to the light the block itself
+    /// emits.
+    fn light(&self, x: i32, y: i32, z: i32, glow: &[u8]) -> (u8, u8) {
         let Some(c) = self.grid.get(x >> 4, z >> 4) else { return (0, 15) };
-        if y >= self.min_y + self.height {
+        let local_y = y - self.min_y;
+        if local_y >= self.height {
             return (0, 15);
         }
-        (light_nibble(&c.block_light, self.min_y, x, y, z), light_nibble(&c.sky_light, self.min_y, x, y, z))
+        let state = if local_y >= 0 { c.block((x & 15) as usize, local_y as usize, (z & 15) as usize) } else { None };
+        let own = state.and_then(|s| glow.get(s as usize)).copied().unwrap_or(0);
+        if own & GLOWS != 0 {
+            return (15, 15);
+        }
+        let block = light_nibble(&c.block_light, self.min_y, x, y, z).max(own);
+        (block, light_nibble(&c.sky_light, self.min_y, x, y, z))
     }
 
     /// Fluid of the block and its height.
@@ -1769,11 +1788,12 @@ impl P {
         (size, self.rgba[3])
     }
 
-    /// Packed light (block × 16, sky × 16 << 8).
-    fn light(&self, w: &TickWorld<'_>, t: f32) -> u32 {
+    /// Packed light (block × 16, sky × 16 << 8); `glow`: per state, what the block adds
+    /// ([`TickWorld::light`]).
+    fn light(&self, w: &TickWorld<'_>, glow: &[u8], t: f32) -> u32 {
         let full = 0xf0 | (0xf0 << 8);
         let b = self.pos.map(|v| v.floor() as i32);
-        let (block, sky) = w.light(b[0], b[1], b[2]);
+        let (block, sky) = w.light(b[0], b[1], b[2], glow);
         let (block, sky) = (u32::from(block) * 16, u32::from(sky) * 16);
         let life = self.life.max(1) as f32;
         let emissive = |f: f32| (block + (f.clamp(0.0, 1.0) * 240.0) as u32).min(240) | (sky << 8);
@@ -2837,6 +2857,8 @@ pub struct Particles {
     /// Per state: tint of the block fragments, colour of the falling dust (client data).
     terrain: Vec<StateTint>,
     dust: Vec<StateTint>,
+    /// Per state, what the block adds to the light of a particle in its cell ([`TickWorld::light`]).
+    glow: Vec<u8>,
     /// Eyes of the player aiming with a spyglass, read at the last tick.
     scope: Option<[f64; 3]>,
     /// Biome colours (palette, blend radius, biome of absent columns) for the
@@ -2899,6 +2921,7 @@ impl Particles {
             started: Instant::now(),
             terrain: data.client_states.iter().map(|c| c.particle_tint).collect(),
             dust: data.client_states.iter().map(|c| c.dust).collect(),
+            glow: particle_glow_per_state(data),
             scope: None,
             biomes: (std::sync::Arc::new(Vec::new()), rc_mesh::blocks::BIOME_BLEND, 0),
             gas: GasTables::new(data),
@@ -3426,7 +3449,7 @@ impl Particles {
                 size,
                 uv,
                 color: c(rgb[0]) | c(rgb[1]) << 8 | c(rgb[2]) << 16 | c(alpha) << 24,
-                light: p.light(w, pt),
+                light: p.light(w, &self.glow, pt),
                 roll: p.old_roll + (p.roll - p.old_roll) * pt,
                 tex,
             };
@@ -3922,6 +3945,7 @@ mod tests {
             started: Instant::now(),
             terrain: Vec::new(),
             dust: Vec::new(),
+            glow: Vec::new(),
             scope: None,
             biomes: (std::sync::Arc::new(Vec::new()), 2, 0),
             gas: GasTables::new(&rc_data::VersionData::default()),
@@ -4006,6 +4030,30 @@ mod tests {
         let q = p.quads.iter().find(|q| q.kind == K::Block).expect("fragment admitted");
         assert_eq!(q.rgba[..3], rgb_of(0x30_60c0).map(|c| 0.6 * c));
         assert_eq!(q.biome, 0);
+    }
+
+    /// Light of a particle as the game reads it: in a block drawn emissive, full light (sky
+    /// included, so the kinds that keep only the sky get 15 too); in a block that emits light, at
+    /// least that light; column absent: block 0, sky 15. Before, the raw layers alone (0 in both
+    /// blocks here, whose light data say nothing).
+    #[test]
+    fn particle_light_inside_glowing_blocks() {
+        const MAGMA: u32 = 1;
+        const LANTERN: u32 = 2;
+        let data = rc_data::VersionData::default();
+        let glow = vec![0, GLOWS, 12];
+        let mut grid = ChunkGrid::new(2);
+        grid.insert(column(0, &[([1, 1, 1], MAGMA), ([2, 1, 1], LANTERN)], 15));
+        let phys = rc_physics::Tables::new(&data);
+        let w = TickWorld { grid: &grid, min_y: 0, height: 16, phys: &phys, player: None, scope: None };
+        let light = |kind: Kind, at: [f64; 3]| P::base(kind, at, Rng(3)).light(&w, &glow, 0.0);
+        let full = 240 | 240 << 8;
+        assert_eq!(light(K::Smoke, [1.5, 1.5, 1.5]), full, "emissive block");
+        assert_eq!(light(K::Lava, [1.5, 1.5, 1.5]), full, "sky kept by a block-15 kind: 15");
+        assert_eq!(light(K::Smoke, [2.5, 1.5, 1.5]), 12 * 16, "emitting block");
+        assert_eq!(light(K::Smoke, [3.5, 1.5, 1.5]), 0, "air, layers absent");
+        assert_eq!(light(K::Smoke, [40.5, 1.5, 1.5]), 240 << 8, "column absent");
+        assert_eq!(light(K::Smoke, [1.5, 30.0, 1.5]), 240 << 8, "above the world");
     }
 
     /// Bench (`cargo test --release -p rc-app -- --ignored bench_fragment_tint --nocapture`): cost of
