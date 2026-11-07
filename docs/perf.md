@@ -9254,10 +9254,25 @@ default = new, `=0` = former path, read once):
   boxes on the ground never passed (814 k sightlines still set up against 447 k by layer).
 - `RUSTCRAFT_OPT_VISIBLE_PART_SAME_BOX_ONCE`: among the gathered targets, a box equal to the bit
   to an earlier one takes its part (stacked TNT of a cannon: `/summon` gives them one spot).
-- `RUSTCRAFT_OPT_VISIBLE_PART_THREADS`: from 32 distinct boxes, the parts on a pool of its own
-  (`RUSTCRAFT_THREADS` or every logical core, at least 8 boxes a task), kept apart from the pool of
-  chunk generation (an explosion would wait behind a generation task); the cube is shared, read
-  only. Built on first use: the first such explosion pays for starting the threads.
+- `RUSTCRAFT_OPT_VISIBLE_PART_THREADS` (default OFF since the review, `=1` turns it on): the
+  parts on a pool of its own (`RUSTCRAFT_THREADS` or every logical core), kept apart from the
+  pool of chunk generation (an explosion would wait behind a generation task); the cube is
+  shared, read only. One task per 4,096 cells the distinct boxes' walks would cross (the
+  estimate of the cube's choice below), at most one per thread (rayon wakes a thread per task
+  split off, not the whole pool), none below two tasks. Built on first use. First version,
+  reviewed: on by default from 32 distinct boxes, at least 8 boxes a task, so every core woken
+  for 300 items of 8 short sightlines (224-249 µs against 212-217 on one thread), and the core
+  count asked of the system at every call (0.6 µs, now asked once). Why off: on the loaded
+  machine no setting gains on both scenes (table below).
+- The cube is filled only when it is worth it (review): its cost, its cells plus 8 cells' worth a
+  column (a chunk lookup and the section reads' setup), at most 3 times the cells the sightlines
+  would cross walked through the world (sightlines times the distance from the box's middle to
+  the centre along the three axes); otherwise the sightlines read the world, the other paths
+  unchanged. A lone box (one object in reach, or all on one spot) takes the per-call path, the
+  former one by default, byte for byte the same work as before. Measured (loaded machine): the
+  cube gains up to a ratio of 2.2 (2 scattered boxes) and loses from 3.5 (two boxes on the ground
+  6 blocks away on either side: a flat cube of 225 columns for 54 short walks, 5.7 µs a box
+  against 2.2).
 - `RUSTCRAFT_OPT_VISIBLE_PART_CUBE_PER_CALL` (default off): a box weighed alone (mobs, players,
   decorations, minecarts, crystals, projectiles, displays: their passes can change the world
   between two targets, a hurt mob can drop, die, dismount its rider) gets a cube of its own, with
@@ -9270,7 +9285,7 @@ cells walked 21.6 M → 3.23 M (÷ 6.7), 1.97 M sample points settled by their l
 cells in all (2,100 per explosion), 24 ms to fill and count before the count kept the answer of
 the state before along a column (10 ms of reads, 14 of count).
 
-| Bench, loaded machine (very noisy: one configuration moved up to 2× between passes), best of 2 to 3 passes | former | one pass, cube, shortcut, same box (1 thread) | + threads (2 to 16) |
+| First version, bench, loaded machine (very noisy: one configuration moved up to 2× between passes), best of 2 to 3 passes | former | one pass, cube, shortcut, same box (1 thread) | + threads (2 to 16) |
 |---|---|---|---|
 | `bench_tnt_heap`: object pass of the whole chain | 402-592 ms | 109-172 ms | 67-138 ms |
 | `bench_tnt_heap`: worst tick of the chain | 95-159 ms | 50-96 ms | 40-63 ms |
@@ -9278,14 +9293,52 @@ the state before along a column (10 ms of reads, 14 of count).
 | `bench_visible_part`, 1,000 boxes together, µs per box | 3.9-5.3 | 2.2-2.8 | 0.32-0.49 (16 threads) |
 | `bench_visible_part`, 100 boxes together, µs per box | 3.7-6.1 | 2.0-2.4 | 0.84-1.6 |
 | `bench_visible_part`, one box per call, cube per call | 2.8-3.6 | 3.3-5.2 (loses) | - |
-| `bench_object_pass_among_items`: one push among 2,000 items on the ground (about 300 in reach), 3 runs | 541-545 µs | 215-217 µs | 224-238 µs (loses) |
+| `bench_object_pass_among_items`: one push among 2,000 items on the ground (about 300 in reach), first version, 3 runs | 541-545 µs | 215-217 µs | 224-238 µs (loses) |
+
+After the review (cube only when worth it, lone box per call, threads off), loaded machine,
+`bench_visible_part` µs per box, best of 7 alternating rounds, three runs (the cost ratio, cube
+cost over walked cells, in brackets):
+
+| Boxes | former | cube always | defaults | together, a task per box on 16 threads |
+|---|---|---|---|---|
+| 1 (on the ground, behind the walls) | 2.76-3.01 | 3.30-3.34 (loses 19%) | 2.75-3.05 (former path) | - |
+| 2 scattered (2.2) | 3.07-3.15 | 2.33-2.40 | 2.38-2.42 | 8.5-9.1 |
+| 4 scattered (2.1) | 2.73-2.80 | 1.74-1.79 | 1.77-1.79 | 9.4 |
+| 10 scattered (1.3) | 2.67-2.76 | 1.74-1.80 | 1.76 | 7.3-7.6 |
+| 100 scattered (0.17) | 3.66-3.70 | 1.55-1.60 | 1.56-1.57 | 1.13-1.14 |
+| 1,000 scattered (0.017) | 3.82-3.88 | 1.78-1.85 | 1.79-1.81 | 0.39-0.41 |
+| 1 far away (20, 8, 20 blocks) | 17.3-17.7 | 42.2 (loses 2.4×) | 17.3-17.6 (former path) | - |
+| 2 on the ground 6 blocks away on either side (3.5) | 2.30-2.42 | 5.4-5.7 (loses) | 2.22 (no cube) | 14.2-14.7 |
+| 2 at 10 blocks (5.1) | 5.22-5.31 | 11.0-11.6 (loses) | 4.82-4.87 (no cube) | 25 |
+| 2 at 14 blocks (6.8) | 8.40-8.51 | 18.1-19.2 (loses) | 7.57-7.66 (no cube) | 31 |
+| 2 at 20 blocks (9.2) | 13.2-13.4 | 31.9-33.9 (loses) | 11.85-11.95 (no cube) | 45-47 |
+
+Without a cube the sightlines of boxes weighed together still read the world a little faster
+than the former path (2.22 against 2.30-2.42, 11.9 against 13.3; same walk, the cause not looked
+for).
+
+The threads, after the review (a task per 4,096 walked cells, at most one per thread), two
+benches, three runs each:
+
+| Configuration | object pass among 2,000 items, µs per push | `bench_tnt_heap` chain, ms (passes) | worst tick, ms |
+|---|---|---|---|
+| no threads (default) | 210-215 | 667-673, 703, 722 | 34.1-34.8, 36.6, 37.6 |
+| pool of 2 threads | 220-226 | 686-699, 715, 708 | 36.0-36.6, 36.2, 35.9 |
+| pool of 4 | 140-144 | 682-687, 725, 698 | 34.0-34.6, 35.6, 34.2 |
+| pool of 8 | 138-141 | 677-685, 733, 695 | 32.8-33.2, 34.5, 32.8 |
+| pool of 32 (every logical core) | 140-154 | 700-720, 737, 716 | 37.1-39.0, 37.6, 37.3 |
+| 32 threads, a task per 2,048 cells | 118-135 | 723, 771, 725 | 39.5, 43.3, 39.5 |
+| 32 threads, a task per 8,192 cells | 225-231 | 675, 708, 705 | 34.8, 35.2, 35.4 |
+
+Among the items the threads gain 27 to 44%; on the heap (many explosions a tick, each with short
+walks mostly settled by their layer) they lengthen the chain by about 1.5% (pool of 8) to 5%
+(every core) and the pool of 8 shortens the worst tick by 4 to 13%. No setting gains on both, so
+the default stays off (C5), the switch kept (C6): to settle on the quiet machine, pool of 8
+against every core and against none (the estimate counts walks the layer shortcut later
+settles, which is why the heap's work looks bigger than it is).
 
 Among the 2,000 items the object pass alone (no cube) gives 541-545 → 398-404 µs: the search by
-identifier of every item in reach was a quarter of the pass. There the threads lose 4 to 11%:
-an item has 8 sightlines, half of them settled by their layer, so the weighing (about 180 µs on
-one thread) does not pay for waking the pool; they gain on the heap (TNT boxes, 27 sightlines).
-The threshold counts distinct boxes, not their work: to settle on the quiet machine (a threshold on
-sightlines, or fewer threads), with `RUSTCRAFT_OPT_VISIBLE_PART_THREADS=0` against 1.
+identifier of every item in reach was a quarter of the pass.
 
 Each lead alone on the heap (object pass): one pass without cube 405-823 ms (no gain: the items
 and orbs are few in the heap, the quadratic search only shows with many items on the ground);
@@ -9308,7 +9361,14 @@ quiet bench (`crowd-1000` with a TNT, `tnt-first-volley`).
   the C library's sin/cos); the whole heap with two zombies, then every block of the area and every
   object (what the save holds), Windows. Every switch combination run against them: the former
   paths, the defaults, each new path alone, every new path, each former path alone, threads from
-  the first target on 2, 4 and 8 threads; one call per box and together. The half-hidden boxes of
+  the first target on 2, 4 and 8 threads, the cube filled always and never; one call per box and
+  together; the heap also with every new path on one thread. Units added by the review: the
+  sightline count equals the sample points placed (2,000 boxes, flat, slightly negative, not
+  finite); the cube is filled for ten close boxes, not for two far ones nor two on either side
+  of the centre; a lone box, three on one spot and two far boxes fill no cube, ten close ones
+  one (counted fills); the task count follows the walks (none for a heap explosion's 63
+  packed primed TNT, a few for 300 items in reach, every thread for 1,000
+  scattered TNT). The half-hidden boxes of
   `tests_explosion_rays` keep their frozen parts on every path. Units: the cell range a walk
   announces is exactly its lowest and highest cell (4,000 segments: along one axis, two, whole and
   half coordinates, 1e-6 long), NaN and too long refused; the cells announced for a layer hold every
@@ -9351,5 +9411,11 @@ quiet bench (`crowd-1000` with a TNT, `tnt-first-volley`).
 - To measure on the quiet machine: `tnt-heap` (worst tick, ticks of the chain, worst second of
   frames), `tnt`, `tnt-first-volley`, `tnt-cannon`, 2 passes, the reference exe; each switch at 0
   alone, then `RUSTCRAFT_OPT_VISIBLE_PART_CUBE_PER_CALL=1` (and `crowd-1000` with it); the pool
-  from 2 to every core (`RUSTCRAFT_THREADS`).
+  from 2 to every core (`RUSTCRAFT_THREADS`) with `RUSTCRAFT_OPT_VISIBLE_PART_THREADS=1` against
+  the default (off);
+  `dropped-items` with a wind charge or a TNT among the items (the object pass among many items);
+  the micro-benches `bench_visible_part` (cube cost limit 2, 3, 4) and
+  `bench_object_pass_among_items` (pool size against tasks). No scene for an explosion with one
+  object in reach: it now takes the former path call for call (2.80 against 2.79 µs at the
+  micro-bench), a difference no scene could resolve.
 
