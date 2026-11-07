@@ -33,13 +33,14 @@ a PDB (and so loses the file that names its functions), or keep `link.exe`.
 
 ## Build the executable the way a release does
 
-In a POSIX shell (Git Bash on Windows, as the workflows):
+In a POSIX shell (Git Bash on Windows, as the workflows). The shipped profile is `dist` (`Cargo.toml`):
+`release` plus the settings that only the published file gets; the executable lands in `target/dist/`.
 
 ```
 export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
 python -I tools/release/hide_paths.py config target/hide-paths.toml
-cargo build --locked --release -p rc-app --config target/hide-paths.toml
-python -I tools/release/hide_paths.py check target/release/rustcraft.exe
+cargo build --locked --profile dist -p rc-app --config target/hide-paths.toml
+python -I tools/release/hide_paths.py check target/dist/rustcraft.exe
 ```
 
 On Linux, `strip` the executable first and `check` the stripped file, the one the archive holds: before
@@ -62,7 +63,7 @@ differ with another zlib, the files inside never do.
 ## Rehearsal
 
 The workflow `Reproducibility` (manual start, Actions tab) builds the selected commit twice per system
-with the full release profile, the second time at another checkout folder and with another cargo home,
+with the shipped profile `dist`, the second time at another checkout folder and with another cargo home,
 packages both like `release.yml`, and fails if a shipped executable or an archive differs. Run it before
 merging a change of the build into the branch that is tagged. It is also the only place besides a tag where the full profile (LTO, one code generation unit, and later the
 profile-guided step) is compiled in CI, so a break of that profile is seen before the tag. It is not run on

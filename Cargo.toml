@@ -71,3 +71,11 @@ opt-level = 2
 lto = "thin"
 codegen-units = 1
 debug = "line-tables-only"
+
+# The shipped executable (release.yml, reproducibility.yml, docs/reproducible-builds.md). A setting
+# meant for the shipped file only (fat LTO, `panic = "abort"`: docs/perf.md, C7-M04) goes here, so
+# that tests, clippy and the `prepare` example keep building with `release` and nothing is compiled
+# twice. Same settings as `release` until those leads are measured on a quiet machine
+# (`tools/bench/build_matrix.py`).
+[profile.dist]
+inherits = "release"
