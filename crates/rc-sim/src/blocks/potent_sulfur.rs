@@ -99,7 +99,7 @@ impl Server {
         if dry && have {
             self.bs.be_ticks.remove(&p);
         } else if !dry && !have {
-            let id = self.add_ticker(p);
+            let id = self.add_ticker(p, crate::blocks::ticks::TickerFamily::Shared);
             self.bs.be_ticks.insert(p, (id, BeTick::PotentSulfur));
         }
     }

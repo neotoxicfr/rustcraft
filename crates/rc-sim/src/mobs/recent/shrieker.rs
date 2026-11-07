@@ -97,16 +97,10 @@ pub fn receive(s: &mut Server, p: [i32; 3], info: &VibInfo, owner: Option<Ent>) 
 impl Server {
     /// Ticker of a vibration block (shrieker, sculk sensor) and registered listener.
     pub(crate) fn vib_block_register(&mut self, p: [i32; 3]) {
-        if self
-            .mobs
-            .rec
-            .vib_blocks
-            .get(&p)
-            .is_some_and(|&id| self.bs.tickers.iter().chain(self.bs.pending_tickers.iter()).any(|t| *t == (id, p)))
-        {
+        if self.mobs.rec.vib_blocks.get(&p).is_some_and(|&id| self.ticker_registered(id, p)) {
             return;
         }
-        let id = self.add_ticker(p);
+        let id = self.add_ticker(p, crate::blocks::ticks::TickerFamily::Vibration);
         self.mobs.rec.vib_blocks.insert(p, id);
         // Sensor: retained frequency always written (0 by default), before the listener.
         if !is_shrieker(self.bname(p))

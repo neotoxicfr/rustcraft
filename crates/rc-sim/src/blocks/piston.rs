@@ -359,7 +359,7 @@ impl Server {
 
     fn add_mover(&mut self, p: P, moved: u32, dir: Dir, extending: bool, source: bool) {
         self.remove_block_entity(p);
-        let id = self.add_ticker(p);
+        let id = self.add_ticker(p, crate::blocks::ticks::TickerFamily::Mover);
         self.bs.movers.insert(
             p,
             Mover { id, moved, dir, extending, source, progress: 0.0, progress_o: 0.0, last_ticked: i64::MIN },

@@ -893,7 +893,7 @@ impl Server {
         if matches!(self.bs.be_ticks.get(&p), Some((_, crate::blocks::level::BeTick::Gateway))) {
             return;
         }
-        let id = self.add_ticker(p);
+        let id = self.add_ticker(p, crate::blocks::ticks::TickerFamily::Shared);
         self.bs.be_ticks.insert(p, (id, crate::blocks::level::BeTick::Gateway));
     }
 

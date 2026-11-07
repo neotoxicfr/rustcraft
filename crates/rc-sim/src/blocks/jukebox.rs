@@ -181,7 +181,7 @@ impl Server {
         if want && !have {
             // Playback in progress (counter present): the disc's track, kept by the ticker.
             let song = self.jukebox_playing_song(p);
-            let id = self.add_ticker(p);
+            let id = self.add_ticker(p, crate::blocks::ticks::TickerFamily::Shared);
             self.bs.be_ticks.insert(p, (id, BeTick::Jukebox(song)));
         } else if !want && have {
             self.bs.be_ticks.remove(&p);

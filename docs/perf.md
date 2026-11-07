@@ -7664,3 +7664,84 @@ thread count above), the save on the server thread (1 thread is the figure that 
 on the quiet-machine scene bench: `plains12`, `plains32`, `cave`, `forest`, `village`, `nether`
 (memstats line "kept compound X MB", private MB, chunk loading), `generation` (ms per chunk, first
 batch), `autosave-1` and `save` (snapshot ms at the autosave, closing save ms, tick p99).
+## C5-M11: block ticks in O(simulated chunks), scheduled ticks without a sweep, compacted tickers (07/11, loaded machine)
+
+The server never unloads a chunk: `chunks` only grows while exploring, and every world tick used
+to walk all of it twice (a set of the loaded chunks, then the simulated ones among them, then the
+random-tick list), every chunk with a pending tick once more (a copy of all the queue keys), and
+removed each dead ticker by shifting the whole tail of the list. Figures of the micro-benches
+`blocks::tick_engine_bench` (one core, server thread, alternated sample by sample, machine loaded
+by other compilations).
+
+- Ticking chunks listed from what simulates them (`RUSTCRAFT_OPT_SIMULATED_CANDIDATES`): the
+  squares of `simulated_squares` (players at simulation + 1, forced chunks and applied pearl
+  tickets at 1, the dragon fight at 8 around the origin, radii derived from the ticket levels),
+  sorted and deduplicated, each candidate still judged by `chunk_simulated`; the loaded chunks are
+  walked instead when the squares cover more cells than the table holds (hundreds of forced
+  chunks, far-apart guests). Fixed at the same moment as before (before the pearl purge), the
+  "ticking entities" test of the random ticks still read after it. `bench_ticking_chunks` (ticking
+  set + random-tick list of one tick, µs, scan → listed with the grid):
+
+  | loaded | simulation 6 | simulation 12 | simulation 32 |
+  |---|---|---|---|
+  | 961 | 53.9 → 12.7 | 85.5 → 38.6 | 96.6 → 63.3 |
+  | 4,900 | 179.5 → 13.2 | 237.2 → 40.7 | 510.0 → 238.0 |
+  | 19,881 | 645.8 → 13.8 | 720.5 → 39.8 | 1,095.1 → 246.3 |
+
+  The scene bench runs simulation 12 with 4,900-odd loaded chunks at `plains32`: −0.2 ms per
+  tick expected there, and the cost no longer grows with the session.
+- Loaded grid (`RUSTCRAFT_OPT_TICKING_LOADED_GRID`): the loaded flags of the candidates' box read
+  once each, when the box stays within twice the candidates (else 9 table lookups per candidate,
+  as without it): listed 56.8 → 40.7 µs (4,900 loaded, simulation 12), 333.8 → 238.0 µs at 32.
+- Forced chunks near a chunk: the sorted set answers with one range search per column of the
+  square beyond 8 forced chunks (`chunk_simulated`, `chunk_simulated_now` and the entity
+  loading test `entities_loaded_at`, the same pattern), instead of comparing every forced chunk
+  for every chunk tested.
+- Scheduled-tick collection (`RUSTCRAFT_OPT_TICK_QUEUE_CANDIDATES`): the due chunks are looked up
+  from the ticking chunks when they are fewer than the chunks with pending ticks, otherwise found
+  by one `retain` over the due times (no copy of the keys); the heap of chunk heads is kept between
+  ticks. A due chunk that does not tick is left untouched, as before. `bench_tick_queue_collect`
+  (49 ticking chunks, nothing due in them): chunks left behind with due ticks 100 / 1,000 / 3,000:
+  1.08 / 10.95 / 33.58 µs → 0.07 µs. Not done: the "sleeping" set of the mission (the lookup
+  already makes those chunks free), compact keys (to measure first: the per-chunk maps stay small).
+  Discarded by the plan: a min-heap by due time (the due heads outside the range would be popped
+  and pushed back every tick).
+- Random-tick sections (`RUSTCRAFT_OPT_RANDOM_TICK_PALETTE`): the palette answers first (no entry
+  that random-ticks: no; a single-state section: its state); the cells are read only on a "maybe".
+  `bench_section_random_ticks`: stone 6.5 µs → 3 ns, stone with ores 12.2 µs → 7 ns, surface and
+  Nether unchanged (11.4-11.8 µs, the scan is needed). The 2-3 ms spike when a row of chunks enters
+  the simulation came from the deep stone sections: about 25 chunks × 18 such sections × 6-12 µs.
+  The lava clause of the test only restates the block's own random-tick flag. Not done: purging
+  the section cache with its chunk (no chunk is ever unloaded: it is bounded by the loaded chunks,
+  24 entries each).
+- Ticker walk (`RUSTCRAFT_OPT_TICKER_COMPACTION`, `RUSTCRAFT_OPT_TICKER_FAMILY`): the living
+  tickers slide down as the walk goes and the list is cut once (a dead one leaves a hole no lookup
+  matches; the list stays in place because a tick may look for another ticker in it); the
+  registrations of hives, hearts and sculk blocks ask a set of the registered tickers instead of
+  scanning both lists; the family recorded at registration (in the padding: 24 bytes, asserted)
+  spares the lookups of the other families' maps, a moving block at the ticker's place still
+  deciding first. `bench_ticker_walk` (1,000 daylight detectors, 100 removed and 100 placed before
+  each walk, hives, shulker lids and furnaces present, 60 walks per variant alternated): former
+  261.2 µs, compaction 245.4, family 245.7, both 230.5 (−12 %).
+- Export of the pending ticks of a saved chunk: the block names are borrowed (the 1,286 of them
+  were copied for every chunk saved) and one sorting buffer serves both queues.
+  `bench_export_chunk_ticks` (100 chunks, 50 + 50 ticks): 722 µs for the export, while the former
+  name copies alone cost 1,365 µs (≈ −65 % of the export).
+- Readability: `rt` renamed `random_ticking_sections`; `tick_level_blocks` cut into its phases
+  (`ticking_chunks`, `run_scheduled_ticks`, `run_random_ticks`), its test-only time accounting in
+  `BlockPhaseTime`.
+- Placement: everything here runs on the server thread and decides the order of the world LCG
+  draws; the work left is a few tens of µs: no thread nor GPU lead.
+- Equivalence (A2), `blocks::tick_engine_tests`: 10⁵ random queue operations on three paths
+  (same pops, same pending ticks), chunks left behind then ticking again, listed against scanned
+  ticking chunks for every source (host moved, spectator, 5 / 40 / 300 forced, applied and fresh
+  pearl tickets, dragon fight, LAN guest; with and without the grid), the whole world tick for
+  400 ticks on every former path, every new path and each lead alone (stored fingerprint,
+  Windows), every section of the test world and hand-made ones (stale palette, no palette),
+  tickers dying and coming back among every family. Seen failing on sabotage: squares without
+  the pearl or without the fight, due test `<` instead of `<=` in the listed collection, dead
+  ticker kept in the registration set.
+- To measure on the quiet machine: `plains32`, `plains12`, `forest`, `cave`, `nether`, `ocean`,
+  `redstone`, `village`, `flight`, `generation` (median and p99, 2 alternating passes), main before
+  the series against this branch, then the branch with the six switches at 0.
+
