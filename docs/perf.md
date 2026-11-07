@@ -1097,13 +1097,94 @@ with the one without a scan (cache staleness = failure). New world (`NEWWORLDLIG
 the full chunks unfolded once per position, the generator's ones borrowed (no more 9 clones of
 393 KiB per chunk), lightings in parallel; gain to measure on the scene bench.
 
-Ruled out or not done here (C3: to take up again): union of the batch in a single propagation (`FULLUNION`) and
+Ruled out or not done here (C3: to take up again): union of the batch in a single propagation (`FULLUNION`,
+done by tiles in C2-M15 below) and
 per-row bit masks (`FULLBITS`) not implemented; W = 46 not studied; post-processing as a
 graph, reuse of the mushrooms' light, speculation and generation pipeline (leads
 merged from C5-M08) not done. GPU ruled out on paper: `rc-sim` stays without a device
 (dedicated server), sending the 9 columns (≈ 3.5 MiB per chunk) would dominate a 0.77 ms computation,
 same reason as the section communication (6.2 ms GPU against 1.9 ms CPU). Final decision:
 flight, crowd, redstone (startup), plains32, cave scene bench, quiet machine.
+
+### Light of new chunks: property grid, batch tiles (C2-M15, 07/11/2026, loaded machine)
+
+New paths of `rc-light/src/full/grid.rs` and `full/batch.rs`, each behind its switch
+(`RUSTCRAFT_OPT_<NAME>=0`: path before it), all on by default:
+- `FULL_PROPERTY_GRID`: the zone copied once into 16 bits per cell (face shape index, opacity)
+  inside a ring of closed cells, shared by the block and sky passes; absent columns closed;
+  a neighbour's level tested before its property is read; level 1 never queued; sky sources
+  written plane by plane. Tables of more than 4,095 shapes: old layout. Sub-switches:
+  `FULL_OCCLUSION_TABLE` (pair table, masks beyond 512 shapes), `FULL_QUEUE_DIRECTIONS` (no step
+  back), `FULL_NO_EMITTER_EXIT` (zone without emitter: no block pass, packing nor reset),
+  `FULL_SKY_SEED_FILTER` (a sky source queued only if a neighbour can rise),
+  `FULL_EMITTERS_IN_FILL` (emitters seeded by the fill: one read of the states),
+  `FULL_SKIP_DEPTHS` (rows more than 14 under the lowest source, sky or emitter section of the
+  scans, neither filled nor resolved).
+- `FULL_UNION_TILES`: the chunks of a batch (`rc_light::light_chunks`: generation targets, relit
+  neighbours, bonus chest of a new world) resolved by aligned tiles, one zone per tile (bounding
+  box + one chunk of margin) instead of one 3 × 3 zone per chunk; exact since a level drops by at
+  least 1 per step (every path reaching a chunk stays in its 3 × 3). Side
+  `FULL_UNION_TILE_SIDE` (2 to 8), by default per batch: the largest of 4, 3, 2 that still gives
+  every pool thread a tile.
+
+Equivalence: `full/tests.rs` and `full/tests/grid_and_batch.rs` (all combinations against the
+frozen copy, absent neighbour and centre, no sky, level-1 emitters only, deep ground, irregular,
+sparse and absent-chunk batches, tile sides 2 to 8), 8 deliberate errors all caught (level test
+assuming an opacity of 2: 210 cases, absent column open: 23, seed filter forgetting the cell
+below: 117, queue directions dropping the forward step: 214, no-emitter exit missing level 1: 2,
+emitters in the fill missing a row: 202, depths skipped without margin: 2, tile without margin:
+27 chunks of 42); bench checked first against the frozen copy on the 1,248 capture columns (17
+variants, every batch option); generation compares every batch lighting with the chunk lit alone
+without scans in tests; rc-sim fingerprints unchanged.
+
+Bench `cargo bench -p rc-light --bench light_chunk`, matrix in one process (7 alternated passes,
+minimum), four runs; the machine was loaded by other compilations (the reference moved from 147 to
+195 ms between runs: compare within a run only). Work counted without the clock
+(`stats::full_light_cells`, cells of the resolved zones per chunk, margins and ring included): old
+884,736; series 2 default 380,898; property grid 418,301 (+10 %: the ring); with `SKIP_DEPTHS`
+410,064 (−2 %: on the capture an emitter or an open stack is almost always within reach of the
+bottom).
+
+| Variant (scans cached) | 64 columns, 1 thread | 256 columns, all threads |
+|---|---|---|
+| series 2 default (`SKIP` + `NOEMIT` + `LAYOUT`) | 61.3 / 46.8 / 63.1 / 55.9 ms | 13.7 / 13.7 / 13.9 / 13.7 ms |
+| `FULL_PROPERTY_GRID` alone on top | 30.4 / 29.9 / 31.9 / 40.7 (−27 to −50 %) | 13.5 / 13.8 / 14.1 / 13.2 |
+| + `OCCLUSION_TABLE` / `QUEUE_DIRECTIONS` / both | 30.1, 30.6, 30.8 (run 1) | 13.4, 12.7, 12.3 (run 1) |
+| + `NO_EMITTER_EXIT` / `SKY_SEED_FILTER` / both | 30.1, 30.0, 29.9 (run 1) | 12.5, 12.8, 13.4 (run 1) |
+| + `EMITTERS_IN_FILL` | 32.5 (run 2, per-row test, hoisted since) / 32.2 / 45.8 | 12.4 / 12.3 / 12.5 |
+| + `SKIP_DEPTHS` | 36.5 / 36.4 (runs 3, 4) | 13.1 / 12.9 |
+| everything | 30.7 / 33.2 / 39.4 / 44.5 | 12.9 / 12.1 / 12.6 / 11.9 (−13 %) |
+| without scans: `SKIP` + `LAYOUT` → grid, all on | 96.8 → 71.7, 105.1 → 82.8, 92.3 → 75.2 | 23.5 → 31.1, 23.7 → 29.0, 24.6 → 27.8 |
+
+The grid cuts the time by 27 to 50 % on one thread; on all threads it stays within noise alone
+(the loaded machine and the memory traffic of 2 bytes of properties per cell bound it), −13 % with
+everything on. Its sub-switches are within the noise of the run (± 5 to 15 % on one thread here):
+kept on until the scene bench. Without scans
+(mushroom chunks, lit one at a time: the one-thread figure applies; new world) the grid wins on one
+thread but loses on all threads (+19 % after `EMITTERS_IN_FILL`): no scene lights scanless chunks
+in parallel except the bonus chest of a new world.
+
+Batch level (sets of batches from the capture, scans cached, tiles chosen for the pool; runs 3
+and 4; cells per chunk lit chunk by chunk → tiles chosen for 32 threads, → tiles of 4):
+
+| Batches | cells per chunk | 1 thread: chunk by chunk → tiles | all threads: chunk by chunk → tiles |
+|---|---|---|---|
+| all 1,248 columns in one batch | 410,064 → 113,559 (−72 %) | 636.6 → 198.2 / 900.8 → 329.6 ms (−63 to −69 %) | 49.6 → 45.8 / 67.8 → 53.5 ms (−8 to −21 %) |
+| flight: 12 rows of 24 chunks + the relit row before (550 chunks) | 499,836 → 343,737 (−31 %), 273,653 (−45 %) | 377.6 → 215.7 / 464.1 → 269.2 (−42 %) | 59.8 → 59.6 / 60.1 → 58.9 (side 4 alone: 72.2 / 74.0, +21 %) |
+| two squares of 8 × 8 (127 chunks) | 489,409 → 252,420 (−48 %), 163,525 (−67 %) | 84.2 → 39.3 / 85.7 → 35.7 (−55 %) | 8.7 → 8.5 / 9.5 → 8.7 (side 4 alone: 11.7 / 11.6) |
+
+Tiles cut the work by 2 to 3 (fewer columns per chunk), but give fewer, longer tasks: with tiles
+of 4 a row of 24 chunks makes 6 tasks for 32 threads and its wall time grows; the side chosen per
+batch keeps the wall time of chunk by chunk on all threads and the full gain on one thread (all the
+CPU saved goes to the other work of the shared pool: client meshing, terrain).
+
+Memory (C2): property grid buffers kept per thread under `KEEP_BYTES` (unchanged, 4 MiB):
+3 × 3 zone with its ring at full height 384, 0.97 MB of levels + 1.93 MB of properties (≈ +1.9 MB
+per thread at most, +62 MB on 32 threads at most, less with the void skip); tile zones beyond
+4 MiB are not kept (one allocation per tile). GPU ruled out for the same reasons as C2-M08 (no
+device in `rc-sim`). Not done (C3): per-batch cache of the property columns (each column is still
+converted by every zone that reads it), block and sky passes of a tile in parallel, dense sky sweep
+(`FULLBITS`, exploratory). Final decision: flight, generation, new world startup, quiet machine.
 
 ### Visual environment: allocation-free evaluation, fog and world reads (C5-M27, 22/10/2026)
 
