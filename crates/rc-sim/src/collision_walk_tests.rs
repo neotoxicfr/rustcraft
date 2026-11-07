@@ -55,8 +55,15 @@ fn state_named(p: &Probe, name: &str) -> u32 {
     p.s.data.blocks.iter().find(|b| b.name == name).map(|b| b.default_state).expect(name)
 }
 
-/// Flat world with the scattered blocks, a stale palette entry and six moving blocks.
-fn prepared(tag: &str) -> (Probe, std::path::PathBuf) {
+/// Cells of `n` moving blocks high in the sky (y = 0, x 100..150), away from every test box: a
+/// piston door or a flying machine leaves that many for a few ticks.
+fn far_mover_cells(n: usize) -> impl Iterator<Item = [i32; 3]> {
+    (0..n as i32).map(|i| [100 + i % 50, 0, i / 50])
+}
+
+/// Flat world with the scattered blocks, a stale palette entry, six moving blocks and
+/// `far_movers` more far away.
+fn prepared(tag: &str, far_movers: usize) -> (Probe, std::path::PathBuf) {
     let (mut p, dir) = crate::tests_g3f13::open(tag);
     let mut states: Vec<u32> = Vec::new();
     for name in SCATTERED {
@@ -80,7 +87,10 @@ fn prepared(tag: &str) -> (Probe, std::path::PathBuf) {
     p.s.set_block([20, -30, 20], 0, flag::KNOWN_SHAPE);
     let (stone, moving) = (state_named(&p, "minecraft:stone"), state_named(&p, "minecraft:moving_piston"));
     use crate::blocks::Dir::*;
-    for (i, (cell, dir)) in mover_cells().into_iter().zip([Down, Up, North, South, West, East]).enumerate() {
+    let directions = [Down, Up, North, South, West, East];
+    let near = mover_cells().into_iter().zip(directions);
+    let far = far_mover_cells(far_movers).zip(directions.into_iter().cycle());
+    for (i, (cell, dir)) in near.chain(far).enumerate() {
         p.s.set_block(cell, moving, flag::KNOWN_SHAPE);
         let mover = Mover {
             id: i as u64,
@@ -137,7 +147,18 @@ fn walked_cells(b: &Aabb) -> ([i32; 3], [i32; 3]) {
 
 #[test]
 fn sim_world_walk_keeps_every_box() {
-    let (p, dir) = prepared("walk-keeps");
+    assert_walk_keeps_every_box("walk-keeps", 0);
+}
+
+/// With 3,000 more moving blocks far away, more than 16 per walked cell: the world looks each
+/// cell up in their table instead of testing them one by one, and must still find the six near ones.
+#[test]
+fn sim_world_walk_keeps_every_box_among_many_movers() {
+    assert_walk_keeps_every_box("walk-keeps-many", 3000);
+}
+
+fn assert_walk_keeps_every_box(tag: &str, far_movers: usize) {
+    let (p, dir) = prepared(tag, far_movers);
     let stale = p.s.chunks[&(1, 1)].as_ref().expect("column").sections[2].blocks.may_contain(|s| s != 0);
     assert!(stale, "the removed piston head stays in its section's palette");
     let (mut found, mut moving, mut nothing, mut common) = (0, 0, 0, 0);
@@ -179,27 +200,37 @@ fn grazing_mobs(n: usize) -> Vec<(Aabb, [f64; 3])> {
 
 /// `RUSTCRAFT_OPT_COLLISION_PALETTE_PREFILTER`: time of `support_of` and `resolve` on the server
 /// world, prefilter off then on, for mobs grazing on flat ground and for boxes among the
-/// scattered blocks (piston heads there: whole reach); 1 thread, two alternating passes.
+/// scattered blocks (piston heads there: whole reach); 1 thread, two alternating passes. Run with
+/// the six near moving blocks alone, then with 200 and 2,000 more far away (the cost of finding
+/// the moving blocks of a walk among many).
 #[test]
 #[ignore = "micro-bench"]
 fn bench_palette_prefilter() {
-    let (p, dir) = prepared("walk-bench");
+    for far_movers in [0, 200, 2000] {
+        println!("[bench] palette_prefilter, {} moving blocks", 6 + far_movers);
+        time_walks_with_prefilter(far_movers);
+    }
+}
+
+fn time_walks_with_prefilter(far_movers: usize) {
+    let (p, dir) = prepared("walk-bench", far_movers);
     let grazing = grazing_mobs(50_000);
     let scattered: Vec<(Aabb, [f64; 3])> = test_boxes().into_iter().map(|b| (b, [0.1, -0.0784, 0.05])).collect();
     let feet = |b: &Aabb| [(b.min[0] + b.max[0]) / 2.0, b.min[1], (b.min[2] + b.max[2]) / 2.0];
     for pass in 0..2 {
         for (name, cases) in [("grazing", &grazing), ("scattered", &scattered)] {
             for on in [false, true] {
-                let w = world_with_prefilter(&p, on);
+                // One world per call, like one per mob move: the bounds of the moving blocks are
+                // found again every time.
                 let t0 = std::time::Instant::now();
                 let mut sink = 0usize;
                 for (b, _) in cases.iter() {
-                    sink += usize::from(rc_physics::support_of(&w, b, feet(b)).is_some());
+                    sink += usize::from(rc_physics::support_of(&world_with_prefilter(&p, on), b, feet(b)).is_some());
                 }
                 let support = t0.elapsed().as_nanos() as f64 / cases.len() as f64;
                 let t0 = std::time::Instant::now();
                 for (b, d) in cases.iter() {
-                    sink += collide::resolve(&w, b, *d, true, 0.6)[1].to_bits() as usize & 1;
+                    sink += collide::resolve(&world_with_prefilter(&p, on), b, *d, true, 0.6)[1].to_bits() as usize & 1;
                 }
                 let resolve = t0.elapsed().as_nanos() as f64 / cases.len() as f64;
                 std::hint::black_box(sink);
@@ -214,7 +245,7 @@ fn bench_palette_prefilter() {
 /// `state` gives cell by cell, across columns, unloaded ones (x ≥ 160) and the world's height.
 #[test]
 fn sim_world_states_in_matches_state() {
-    let (p, dir) = prepared("walk-states");
+    let (p, dir) = prepared("walk-states", 0);
     let w = p.s.world();
     let spans = [
         ([-3, -61, -3], [18, -55, 2]),
@@ -268,7 +299,7 @@ impl World for Narrowed<'_> {
 /// would miss the piston heads and pitcher crops), the tables' reach where a block moves.
 #[test]
 fn a_narrowed_reach_loses_boxes() {
-    let (p, dir) = prepared("walk-narrowed");
+    let (p, dir) = prepared("walk-narrowed", 0);
     // Under `RUSTCRAFT_COLLISION_WALK_CHECK=1` the walk itself panics on the first difference.
     let differs = |reach: Aabb| {
         let narrowed = Narrowed { w: p.s.world(), reach };

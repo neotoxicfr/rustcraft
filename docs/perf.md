@@ -7507,4 +7507,34 @@ entity colliders (mobs do not bump into boats or shulkers), `LavaFloor` forwards
 colliders, moving blocks nor `min_y`, a mob's support search has no second offset search and does
 not see the powder snow envelope its movement used. Scenes to measure (quiet machine, 2 passes,
 against `main` and each switch at 0): `crowd-1000`, `crowd`, `village`, `forest`, `tnt`, `nether`,
-`plains12`.
+`plains12`, `redstone` (pistons: moving blocks during the walks).
+
+Review follow-up (07/11, loaded machine):
+
+- Moving blocks among many (no switch, same answer): the server walk asks whether a moving piston
+  block lies in its cells, and used to test every moving block of the dimension. A piston door or
+  a world eater leaves hundreds to thousands of them for 2 to 3 ticks, paid by every walk of every
+  entity. The moving blocks are now tested one by one only while there are at most 16 per walked
+  cell, otherwise each cell is looked up in their table (bench: 0.7 ns per comparison, 10.8 ns per
+  lookup). `support_of` of a grazing mob, prefilter on, world rebuilt per call (ns, two passes):
+  6 moving blocks 155-175; 206: 289 before, 310-315 after (same path, noise); 2,006: 2,222-2,229
+  before, 311 after; `resolve` 2,326-2,331 → 495-497. Discarded: per-cell lookup at any count
+  (206 blocks: 669 ns, a lookup costs 16 comparisons) and the bounds of all moving blocks computed
+  once per world (206: 390 ns, the bounds scan costs more than the test it saves when the mob is
+  inside them). Proof: `sim_world_walk_keeps_every_box_among_many_movers` (3,006 moving blocks:
+  lookup path), which fails when the lookup finds nothing.
+- One implementation of the column walks: the section palette question and the batched state read
+  of the server and client worlds are `rc_world::sections_may_hold` / `states_by_column`, each
+  world only giving its column lookup. The client world now carries its prefilter choice like the
+  server one, and `grid_world_walk_keeps_every_box` proves its trimmed walk (fences, piston heads,
+  pitcher crops, single-state and air sections, a stale palette entry, an unloaded column; prefilter
+  off then on, every reach kind reached); it fails when the section lookup answers nothing or
+  forgets `min_y`, and `states_in_matches_state` fails on transposed rows in the shared read.
+- Borrowed shapes everywhere a fresh list was only read (B6): arrows and tridents stuck in a block
+  (every tick), the ray hit of every projectile cell, respawn and dismount, frog, copper golem,
+  evoker fangs, ghast and happy ghast, fishing bobber, bed sleep height, client rain, debug outline. Left:
+  the creaking's shape (returned and clipped: it needs its own copy), and the old paths behind
+  `RUSTCRAFT_OPT_*` switches.
+- The rc-physics benches skip the walk check on their own threads only (thread-local, restored at
+  the end): with `--include-ignored` they used to turn it off for the tests running beside them
+  (`skipped_walk_check_stays_on_its_thread`, fails with a process-wide flag).

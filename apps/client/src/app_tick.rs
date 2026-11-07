@@ -126,6 +126,7 @@ impl App {
                 colliders: &colliders,
                 movers: Some(&self.block_entities),
                 noclip: None,
+                palette_prefilter: crate::grid_world::palette_prefilter(),
             };
             if !zones.is_empty() {
                 // Opening shulkers push the local player (their own collision world, as for
@@ -361,6 +362,7 @@ impl App {
             colliders: &colliders,
             movers: Some(&self.block_entities),
             noclip: None,
+            palette_prefilter: crate::grid_world::palette_prefilter(),
         };
         self.player.spectator = self.env.game_mode == 3;
         let sig = if free { self.player.tick(input, &world, &self.phys) } else { Default::default() };

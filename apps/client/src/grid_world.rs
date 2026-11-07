@@ -53,6 +53,15 @@ pub(crate) struct GridWorld<'a> {
     /// progress in which they do not block.
     pub(crate) movers: Option<&'a block_entities::BlockEntities>,
     pub(crate) noclip: Option<u8>,
+    /// `RUSTCRAFT_OPT_COLLISION_PALETTE_PREFILTER` ([`palette_prefilter`]), kept per world so the
+    /// tests compare both paths.
+    pub(crate) palette_prefilter: bool,
+}
+
+/// `RUSTCRAFT_OPT_COLLISION_PALETTE_PREFILTER` (default on): the collision walk asks the section
+/// palettes which shapes can be there before choosing the cells it reads.
+pub(crate) fn palette_prefilter() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_COLLISION_PALETTE_PREFILTER")
 }
 
 impl GridWorld<'_> {
@@ -76,24 +85,6 @@ impl GridWorld<'_> {
             return Some(0);
         }
         c.block((x & 15) as usize, ly as usize, (z & 15) as usize)
-    }
-
-    /// Could one of the loaded sections holding cells of `lo..=hi` hold a state satisfying `pred`?
-    /// Answered by the section palettes, without reading a block; unloaded columns hold nothing
-    /// (their cells have no collision).
-    fn sections_may_hold(&self, lo: [i32; 3], hi: [i32; 3], pred: &dyn Fn(u32) -> bool) -> bool {
-        let bottom = (lo[1] - self.min_y).max(0);
-        let top = (hi[1] - self.min_y).min(self.height - 1);
-        if bottom > top {
-            return false;
-        }
-        let sections = (bottom >> 4) as usize..=(top >> 4) as usize;
-        (lo[0] >> 4..=hi[0] >> 4).any(|cx| {
-            (lo[2] >> 4..=hi[2] >> 4).any(|cz| {
-                let Some(c) = self.grid.get(cx, cz) else { return false };
-                sections.clone().any(|i| c.sections.get(i).is_some_and(|s| s.blocks.may_contain(pred)))
-            })
-        })
     }
 }
 
@@ -119,28 +110,17 @@ impl rc_physics::World for GridWorld<'_> {
 
     /// One grid lookup per column instead of one per cell.
     fn states_in(&self, first: [i32; 3], last: [i32; 3], out: &mut [u32]) -> bool {
-        let (nx, nz) = ((last[0] - first[0] + 1) as usize, (last[2] - first[2] + 1) as usize);
-        for cx in first[0] >> 4..=last[0] >> 4 {
-            for cz in first[2] >> 4..=last[2] >> 4 {
-                let column = self.grid.get(cx, cz);
-                let xs = first[0].max(cx << 4)..=last[0].min((cx << 4) + 15);
-                let zs = first[2].max(cz << 4)..=last[2].min((cz << 4) + 15);
-                for y in first[1]..=last[1] {
-                    for z in zs.clone() {
-                        let row = ((y - first[1]) as usize * nz + (z - first[2]) as usize) * nx;
-                        for x in xs.clone() {
-                            out[row + (x - first[0]) as usize] = self.state_in(column, x, y, z).unwrap_or(rc_physics::UNLOADED);
-                        }
-                    }
-                }
-            }
-        }
+        let state_in = |column, [x, y, z]: [i32; 3]| self.state_in(column, x, y, z).unwrap_or(rc_physics::UNLOADED);
+        rc_world::states_by_column(first, last, out, |cx, cz| self.grid.get(cx, cz), state_in);
         true
     }
 
     fn collision_of_state(&self, state: Option<u32>, x: i32, y: i32, z: i32, out: &mut Vec<rc_physics::Aabb>) -> bool {
         match state {
-            Some(s) => (self.movers.is_some_and(|b| b.moving > 0) && self.piston_shape(s, x, y, z, out)) || self.t.collision(s, out),
+            Some(s) => {
+                (self.movers.is_some_and(|b| b.moving > 0) && self.piston_shape(s, x, y, z, out))
+                    || self.t.collision(s, out)
+            }
             None => false,
         }
     }
@@ -158,8 +138,11 @@ impl rc_physics::World for GridWorld<'_> {
         if self.movers.is_some_and(|b| b.moving > 0) {
             return rc_physics::Aabb::EVERYWHERE;
         }
-        if rc_data::opt_switch!("RUSTCRAFT_OPT_COLLISION_PALETTE_PREFILTER") {
-            return self.t.reach_from_palettes(|pred| self.sections_may_hold(lo, hi, pred));
+        if self.palette_prefilter {
+            let sections = |cx, cz| self.grid.get(cx, cz).map(|c| &*c.sections);
+            return self.t.reach_from_palettes(|pred| {
+                rc_world::sections_may_hold(lo, hi, self.min_y, self.height, sections, pred)
+            });
         }
         self.t.shape_reach()
     }
@@ -206,10 +189,25 @@ mod tests {
             grid.insert(filled(x, z));
         }
         let border = rc_physics::WorldBorder::default();
-        let w = GridWorld { grid: &grid, min_y: -64, height: 64, t: &t, border: &border, colliders: &[], movers: None, noclip: None };
+        let w = GridWorld {
+            grid: &grid,
+            min_y: -64,
+            height: 64,
+            t: &t,
+            border: &border,
+            colliders: &[],
+            movers: None,
+            noclip: None,
+            palette_prefilter: true,
+        };
         use rc_physics::World;
         let mut cells = 0;
-        for (first, last) in [([10, -70, 10], [20, -60, 20]), ([-3, -2, 14], [17, 3, 17]), ([14, -20, -2], [33, -15, 2]), ([5, -40, 5], [5, -40, 5])] {
+        for (first, last) in [
+            ([10, -70, 10], [20, -60, 20]),
+            ([-3, -2, 14], [17, 3, 17]),
+            ([14, -20, -2], [33, -15, 2]),
+            ([5, -40, 5], [5, -40, 5]),
+        ] {
             let n = (0..3).map(|a| (last[a] - first[a] + 1) as usize).product();
             let mut out = vec![0; n];
             assert!(w.states_in(first, last, &mut out));
@@ -225,6 +223,128 @@ mod tests {
             cells += n;
         }
         assert!(cells > 2000);
+    }
+
+    /// Every state of the named blocks.
+    fn states_of(d: &rc_data::VersionData, names: &[&str]) -> Vec<u32> {
+        names
+            .iter()
+            .flat_map(|name| {
+                let b = d.blocks.iter().find(|b| b.name == *name).expect(name);
+                b.first_state..b.first_state + b.state_count
+            })
+            .collect()
+    }
+
+    /// A section whose cells are drawn among `states` (packed with a palette), fixed randomness.
+    fn scattered(states: &[u32], seed: u64) -> rc_world::Container {
+        let mut r = seed;
+        let values: Vec<u32> = (0..4096)
+            .map(|_| {
+                r = r.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                states[(r >> 33) as usize % states.len()]
+            })
+            .collect();
+        rc_world::Container::pack(&values, 4, 8, 15)
+    }
+
+    fn column_of(x: i32, z: i32, blocks: [rc_world::Container; 4]) -> Column {
+        let section = |blocks| rc_world::Section { non_empty: 0, blocks, biomes: rc_world::Container::Single(0) };
+        Column { sections: blocks.map(section).into(), ..col(x, z) }
+    }
+
+    /// Boxes of every size around and between the test columns, in the sky and below the world.
+    fn test_boxes() -> Vec<rc_physics::Aabb> {
+        let mut r = 0x0061_21D5u64;
+        let mut f = || {
+            r = r.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (r >> 11) as f64 / (1u64 << 53) as f64
+        };
+        (0..8_000)
+            .map(|_| {
+                let min = [-8.0 + f() * 48.0, -72.0 + f() * 80.0, -8.0 + f() * 48.0];
+                let size = [0.1 + f() * 1.4, 0.1 + f() * 1.9, 0.1 + f() * 1.4];
+                rc_physics::Aabb { min, max: std::array::from_fn(|a| min[a] + size[a]) }
+            })
+            .collect()
+    }
+
+    /// `RUSTCRAFT_OPT_COLLISION_SCAN_TRIM` and `RUSTCRAFT_OPT_COLLISION_PALETTE_PREFILTER` on the
+    /// client's world: the trimmed walk keeps every box of the whole one, prefilter off then on.
+    /// Columns: (0, 0) mixes fences, piston heads and pitcher crops (shapes spilling out of their
+    /// cell) and keeps a piston head in the palette of an empty section; (1, 0) holds only shapes
+    /// that stay in their cell sideways; (0, 1) is air over stone; (1, 1) is not loaded.
+    #[test]
+    fn grid_world_walk_keeps_every_box() {
+        use rc_physics::{Aabb, World, collide};
+        use rc_world::Container;
+        let Some(d) = rc_testdata::version_data() else { return };
+        let t = rc_physics::Tables::new(&d);
+        let [stone] = states_of(&d, &["minecraft:stone"])[..] else { panic!("one stone state") };
+        let air_and_stone = [0, stone];
+        let spilling = [
+            &air_and_stone[..],
+            &states_of(
+                &d,
+                &["minecraft:oak_fence", "minecraft:piston_head", "minecraft:pitcher_crop", "minecraft:oak_slab"],
+            ),
+        ]
+        .concat();
+        let in_cell = [
+            &air_and_stone[..],
+            &states_of(&d, &["minecraft:oak_fence", "minecraft:oak_slab", "minecraft:short_grass"]),
+        ]
+        .concat();
+        // A piston head placed then removed: the section stays empty, its palette keeps it.
+        let head = states_of(&d, &["minecraft:piston_head"])[0];
+        let mut stale = Container::Single(0);
+        stale.set(rc_world::block_index(3, 3, 3), head, 4, 8, 15);
+        stale.set(rc_world::block_index(3, 3, 3), 0, 4, 8, 15);
+        assert!(stale.may_contain(|s| s == head) && (0..4096).all(|i| stale.get(i) == 0), "stale palette entry");
+        let mut grid = ChunkGrid::new(4);
+        grid.insert(column_of(0, 0, [Container::Single(stone), scattered(&spilling, 1), Container::Single(0), stale]));
+        grid.insert(column_of(
+            1,
+            0,
+            [Container::Single(stone), scattered(&in_cell, 2), Container::Single(0), Container::Single(stone)],
+        ));
+        grid.insert(column_of(
+            0,
+            1,
+            [Container::Single(stone), Container::Single(0), Container::Single(0), Container::Single(0)],
+        ));
+        let border = rc_physics::WorldBorder::default();
+        let (mut found, mut nothing, mut common, mut whole_reach) = (0, 0, 0, 0);
+        let (mut trimmed, mut whole) = (Vec::new(), Vec::new());
+        for palette_prefilter in [false, true] {
+            let w = GridWorld {
+                grid: &grid,
+                min_y: -64,
+                height: 64,
+                t: &t,
+                border: &border,
+                colliders: &[],
+                movers: None,
+                noclip: None,
+                palette_prefilter,
+            };
+            for b in test_boxes() {
+                collide::collect(&w, &b, &mut trimmed);
+                collide::collect_untrimmed(&w, &b, &mut whole);
+                assert_eq!(trimmed, whole, "box {b:?}, prefilter {palette_prefilter}");
+                found += whole.len();
+                let lo = b.min.map(|v| (v - collide::EPS).floor() as i32 - 1);
+                let hi = b.max.map(|v| (v + collide::EPS).floor() as i32 + 1);
+                let reach = w.shape_reach(lo, hi);
+                nothing += usize::from(palette_prefilter && reach == Aabb::NOTHING);
+                common += usize::from(palette_prefilter && reach == t.common_shape_reach());
+                whole_reach += usize::from(palette_prefilter && reach == t.shape_reach());
+            }
+        }
+        assert!(
+            found > 10_000 && nothing > 300 && common > 100 && whole_reach > 200,
+            "coverage: {found} boxes, reach: {nothing} nothing, {common} common, {whole_reach} whole"
+        );
     }
 
     /// Respawn with a server view of 32: the grid keeps columns 0 and 35 side by side

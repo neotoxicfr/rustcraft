@@ -87,29 +87,30 @@ impl SimWorld<'_> {
         block_in(column?, self.min_y, p)
     }
 
-    /// A moving piston block among the cells `lo..=hi`.
+    /// A moving piston block among the cells `lo..=hi`. Every walk of every entity asks, and a
+    /// piston door or a world eater leaves hundreds to thousands of moving blocks for a few
+    /// ticks: they are tested one by one while that is cheaper, otherwise each cell of the span
+    /// is looked up in their table, so a walk never costs more than its own cells.
     fn mover_between(&self, lo: [i32; 3], hi: [i32; 3]) -> bool {
-        !self.movers.is_empty() && self.movers.keys().any(|p| (0..3).all(|a| lo[a] <= p[a] && p[a] <= hi[a]))
-    }
-
-    /// Could one of the loaded sections holding cells of `lo..=hi` hold a state satisfying `pred`?
-    /// Answered by the section palettes, without reading a block; unloaded columns hold nothing
-    /// (their cells have no collision).
-    fn sections_may_hold(&self, lo: [i32; 3], hi: [i32; 3], pred: &dyn Fn(u32) -> bool) -> bool {
-        let bottom = (lo[1] - self.min_y).max(0);
-        let top = (hi[1] - self.min_y).min(self.height - 1);
-        if bottom > top {
+        if self.movers.is_empty() {
             return false;
         }
-        let sections = (bottom >> 4) as usize..=(top >> 4) as usize;
-        (lo[0] >> 4..=hi[0] >> 4).any(|cx| {
-            (lo[2] >> 4..=hi[2] >> 4).any(|cz| {
-                let Some(Some(c)) = self.chunks.get(&(cx, cz)) else { return false };
-                sections.clone().any(|i| c.sections.get(i).is_some_and(|s| s.blocks.may_contain(pred)))
-            })
-        })
+        let cells = (0..3).map(|a| (i64::from(hi[a]) - i64::from(lo[a]) + 1).max(0) as u64).fold(1u64, u64::saturating_mul);
+        if self.movers.len() as u64 <= MOVERS_TESTED_PER_CELL_LOOKUP.saturating_mul(cells) {
+            return self.movers.keys().any(|p| (0..3).all(|a| lo[a] <= p[a] && p[a] <= hi[a]));
+        }
+        (lo[1]..=hi[1]).any(|y| (lo[2]..=hi[2]).any(|z| (lo[0]..=hi[0]).any(|x| self.movers.contains_key(&[x, y, z]))))
+    }
+
+    /// The loaded column `(cx, cz)`.
+    fn loaded_column(&self, cx: i32, cz: i32) -> Option<&Chunk> {
+        self.chunks.get(&(cx, cz))?.as_deref()
     }
 }
+
+/// Moving blocks compared for the cost of one cell looked up in their table (micro-bench
+/// `bench_palette_prefilter`: about 0.7 ns per comparison, 10.8 ns per lookup).
+const MOVERS_TESTED_PER_CELL_LOOKUP: u64 = 16;
 
 /// `RUSTCRAFT_OPT_COLLISION_PALETTE_PREFILTER` (default on): the collision walk asks the section
 /// palettes which shapes can be there before choosing the cells it reads.
@@ -160,32 +161,16 @@ impl rc_physics::World for SimWorld<'_> {
             return Aabb::EVERYWHERE;
         }
         if self.palette_prefilter {
-            return self.tables.reach_from_palettes(|pred| self.sections_may_hold(lo, hi, pred));
+            let sections = |cx, cz| self.loaded_column(cx, cz).map(|c| c.sections.as_slice());
+            return self.tables.reach_from_palettes(|pred| rc_world::sections_may_hold(lo, hi, self.min_y, self.height, sections, pred));
         }
         self.tables.shape_reach()
     }
 
     /// One hash lookup per column instead of one per cell.
     fn states_in(&self, first: [i32; 3], last: [i32; 3], out: &mut [u32]) -> bool {
-        let (nx, nz) = ((last[0] - first[0] + 1) as usize, (last[2] - first[2] + 1) as usize);
-        for cx in first[0] >> 4..=last[0] >> 4 {
-            for cz in first[2] >> 4..=last[2] >> 4 {
-                let column = match self.chunks.get(&(cx, cz)) {
-                    Some(Some(c)) => Some(&**c),
-                    _ => None,
-                };
-                let xs = first[0].max(cx << 4)..=last[0].min((cx << 4) + 15);
-                let zs = first[2].max(cz << 4)..=last[2].min((cz << 4) + 15);
-                for y in first[1]..=last[1] {
-                    for z in zs.clone() {
-                        let row = ((y - first[1]) as usize * nz + (z - first[2]) as usize) * nx;
-                        for x in xs.clone() {
-                            out[row + (x - first[0]) as usize] = self.state_in(column, [x, y, z]).unwrap_or(rc_physics::UNLOADED);
-                        }
-                    }
-                }
-            }
-        }
+        let state_in = |column, p| self.state_in(column, p).unwrap_or(rc_physics::UNLOADED);
+        rc_world::states_by_column(first, last, out, |cx, cz| self.loaded_column(cx, cz), state_in);
         true
     }
 
