@@ -46,7 +46,8 @@ fn steady_cases() -> Vec<SteadyCase> {
         case("crouching rabbit", Kind::Rabbit, |m| m.surf.crouching = true, 6, Meta::Pose(5)),
         case("crouching ocelot", Kind::Ocelot, |m| m.surf.crouching = true, 6, Meta::Pose(5)),
         case("crouching cat", Kind::Cat, |m| m.surf.crouching = true, 6, Meta::Pose(5)),
-        case("vex after its first tick", Kind::Vex, |m| m.tick_count = 1, 5, Meta::Bool(true)),
+        // State left by `vex_post_tick` at the end of its first tick.
+        case("vex after its first tick", Kind::Vex, |m| m.surf.no_gravity = true, 5, Meta::Bool(true)),
     ]
 }
 

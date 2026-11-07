@@ -1141,11 +1141,6 @@ impl Mob {
         flags
     }
 
-    /// No gravity (index 5): the vex turns it on at the end of each of its ticks.
-    fn synced_no_gravity(&self) -> bool {
-        self.surf.no_gravity || (self.kind == Kind::Vex && self.tick_count > 0)
-    }
-
     /// Pose (index 6), decided once for every family (same reason as the shared flags).
     fn synced_pose(&self) -> i32 {
         if self.dead {
@@ -1174,7 +1169,8 @@ impl Mob {
         // Name always shown, silent, no gravity.
         self.set(3, Meta::Bool(self.x.name_visible));
         self.set(4, Meta::Bool(self.x.silent));
-        self.set(5, Meta::Bool(self.synced_no_gravity()));
+        // No gravity; the vex turns it on at the end of each of its ticks (`vex_post_tick`).
+        self.set(5, Meta::Bool(self.surf.no_gravity));
         self.set(1, Meta::Int(self.air));
         self.set(7, Meta::Int(self.ticks_frozen));
         self.set(2, Meta::Text(self.custom_name.clone()));
