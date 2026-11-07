@@ -88,6 +88,7 @@ mod particles;
 mod pause;
 mod perf_log;
 mod pick;
+mod pick_targets;
 mod piston_replay;
 mod profiler;
 mod profiling_zip;

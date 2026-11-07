@@ -752,7 +752,7 @@ impl crate::App {
             "f3i" => self.debug_copy_recreate(arg == "shift"),
             "invkey" => {
                 if !self.ride_inventory() {
-                    let v = self.vehicle().and_then(|v| self.entities.map.get(&v)).map(|e| e.kind.clone());
+                    let v = self.player_vehicle().and_then(|v| self.entities.map.get(&v)).map(|e| e.kind.clone());
                     eprintln!("demo: no mount with an inventory ({v:?})");
                 }
             }

@@ -13,8 +13,16 @@ Ranges: player attributes `block_interaction_range` (4.5 by default) and
 2. **Blocks**: walk (§ 2) from the origin to the end with the **outline** shape
    of each state, fluids ignored. If a block is hit, `max` becomes the distance to the
    point hit.
-3. **Entities**: candidates = selectable entities (§ 3) other than the camera. For each one, its
-   box inflated by the selection radius (0, or 1 for selectable projectiles):
+3. **Entities**: candidates = selectable entities (§ 3) other than the camera, found by the
+   world's entity search over a search box: the camera entity's current box stretched along the
+   direction by `max` (the shortened one), inflated by 1 on every side. The search only looks in
+   the sections (16³, by the block of the entity's position) that meet that box widened by 2 on x
+   and z, by 4 below and by 0 above; there it keeps the entities whose own box (not inflated)
+   overlaps the search box (touching faces do not count). An entity stored in another section is
+   never found, even when its box reaches the search box (huge or tall entities). Attack-range
+   targeting searches a cube of side "margin" around its start stretched to its (shortened) end,
+   inflated by 1; the brush searches the camera's box stretched by its whole segment, inflated by 1.
+   For each candidate, its box inflated by the selection radius (0, or 1 for selectable projectiles):
    - if the box contains the origin (min ≤ v < max on all three axes): kept at distance 0,
      point = entry of the box if there is one, otherwise the origin;
    - otherwise, if the segment crosses it at point *p* with d² = |p − origin|² < best (or if

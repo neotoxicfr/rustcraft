@@ -9479,4 +9479,95 @@ against main and the reference exe — meshing ms/s (pool), pool preparation ms/
 private MB, upload MB/s, in place MB/s, upload ms/s, in place/s, `upload_in_place_writes_per_s`;
 each switch at 0 alone (`MESH_FACES_BY_GROUP`, `MESH_PREPARE_BY_MOVE`, `MESH_BASE_IS_PREPARED`,
 `IN_PLACE_TOUCHED_ONLY`, `IN_PLACE_RANGES`), then all at 0; `RUSTCRAFT_IN_PLACE_GAP_KB` 1, 4, 16, 64.
+## C4-M27: crosshair targeting through the game's entity search, type facts at spawn, kept boxes, vehicle questions without walks (07/11, loaded machine)
+
+Before: every frame, the crosshair walked every entity, kept those within 12.5 blocks of the eyes
+on each axis, compared each one's type name against twenty names, computed its box (more name
+comparisons, data read from the heap) and clipped the gaze against every box kept (1,000 clips in
+a dense crowd). Every tick, the simulated projectiles walked every entity three times comparing type
+names, the pushing neighbours and the players near block entities compared names too. Every
+movement packet of any entity looked for the player's vehicle by walking every entity (and up to 8
+more walks for its root): O(N²) per tick with N mobs moving. Attributes of the other entities lived
+in a table by id never emptied: after a world change, a new entity reusing an id inherited the old
+one's scale, camera distance, maximum health and boost.
+
+Switches (default = new, `=0` = old path, read once):
+- `RUSTCRAFT_OPT_KIND_FLAGS`: pick rule and pick radius from the facts of the type, worked out once
+  at spawn (`entities/kind_facts.rs`), instead of the name comparisons.
+- `RUSTCRAFT_OPT_CACHED_ENTITY_BOXES`: the box is kept in the entity with what it was computed from
+  (position bits, write stamp of the entity data, scale bits, dimension table); every frame after
+  the first of a tick reads it back. Not kept for paintings (size from the variant registry),
+  shulkers (opening) and polar bears (standing animation).
+- `RUSTCRAFT_OPT_KIND_ID_FILTERS`: the per-tick walks (projectile families, Loyalty throwers and
+  bobber hooks now found in one walk, pushing neighbours, players near block entities) and the
+  building checks (blocks in the way of a placement, of a boat) read the facts.
+- `RUSTCRAFT_OPT_PILOT_CHECK_ORDER`: "does the client pilot this entity" asks first the pure, O(1)
+  test (the player is its first passenger) before the vehicle walk.
+- `RUSTCRAFT_OPT_VEHICLES_FROM_RIDER_LIST`: the player's vehicle, the root vehicles and the seat
+  roots of the tick looked for among `Entities::riders` (vehicles that got passengers) instead of
+  every entity. The HUD's mount line reads the same answer instead of its own walk.
+
+Fidelity fixes (no switch; checked in the 26.3 jar, reported here as differences found):
+- Targeting finds entities like the game: the search box (camera entity's box stretched along the
+  gaze to the reach shortened at the block, inflated by 1; for the spear, a cube of the margin
+  around the start stretched to the shortened end; for the brush, the whole segment) and the
+  sections around it (2 blocks across, 4 below, 0 above); an entity whose section is outside is
+  not found even if its box overlaps. The old 12.5-block cube missed huge scaled entities (a ghast
+  scaled 16 times beside the eyes) and found tall ones the game does not (feet in a section more
+  than 4 blocks under the search).
+- Normal targeting skips the camera's own root vehicle from outside its box (riding a boat, the
+  gaze crossing it): `same_vehicle` was never set, the client aimed at its own boat or horse.
+- Attributes go with the entity (`Entity::attributes`), dropped for an unknown entity like the
+  game; the boost seen, the piloted vehicle's physics and the vehicle of the previous tick are
+  emptied with the world, and so is the spear hit feedback table (`EventFx::reset_world`).
+- Seats read the scale in single precision with the type's bounds (`attribute_scale`), times the
+  age scale in single precision (camel 0.6F): at most 2e-6 block on a 2-block seat (measured). The
+  mount's camera distance is scale × attribute in single precision, without the age scale.
+- Passengers: an unknown passenger is skipped, one moved to another vehicle leaves the first one,
+  an `add_entity` on an id in use removes the old entity first (passengers off, vehicle forgets
+  it). Before, a passenger could stay listed by two vehicles until the old one's update.
+
+Proofs: `pick_targets/tests.rs` (10,000 frames of a scene changing between frames: 120 entities of
+39 kinds, data, scale, opening, painting variants, framed maps, removals, camera, blocks; same
+candidates and same normal and spear hits, bit for bit, for each switch and both; pick rule of every
+registry type in each deciding state; sabotage "box key forgets the scale" caught; huge scaled ghast
+found by its section; own boat skipped), `pick.rs` (tall entity found by the section of its feet,
+radius inside the search box), `projectile_sim/equivalence_tests.rs` (1,000 mixed entities, 200
+ticks, by facts and by names: positions, velocities, rotations, stuck flags, bodies and randomness
+equal; more than 300 projectiles alive at the end; sabotage "light throws given the potions'
+gravity" caught; family of every registry type), `player_env.rs` (push rule of every type; 200
+ticks of 1,000 neighbours with teams, sabotage caught), `entities/kind_facts_tests.rs` (building,
+vehicle, frame, cacheable facts of every type, sabotage caught), `riding/vehicle_tests.rs` (20,000
+random spawn, removal, passenger and tick events: vehicle, root vehicle, seat roots and piloting
+equal for each switch, sabotage `&&` → `||` caught; unknown passengers, moved passenger, attributes
+after a world change: scale 1 instead of 3).
+
+| Micro-bench `bench_pick_targets`, loaded machine, 1 core, best of 9 alternating rounds | before the mission | old paths, game search | kind facts | kept boxes | both |
+|---|---|---|---|---|---|
+| 200 cows around the camera | 6.16 µs | 3.89 µs | 3.83 µs | 2.98 µs | 2.90 µs |
+| 1,000 cows around the camera | 33.23 µs | 22.15 µs | 21.74 µs | 19.94 µs | 19.04 µs |
+| 1,000 cows 22 blocks away (crowd scenes) | 5.97 µs | 9.58 µs | 9.49 µs | 8.08 µs | 8.06 µs |
+
+- The game's search removes most of the clipping in a dense crowd (−43 to −53 %). In the far crowd
+  of the bench it costs 2 µs per frame more than the old cube: the sections around the camera hold
+  224 cows against about 96 in the cube. That is the game's rule (it tests those entities too,
+  against a stored box); to settle on `crowd-1000`.
+- Kind facts alone: within the noise on this bench (2 %); kept boxes: 10 to 25 %; both: best
+  everywhere. `Entity` is 1,504 bytes.
+- The walk of 1,000 entities (about 5 µs per frame) remains: only a spatial index removes it.
+  Evaluated, not built: positions are written directly from about twelve places (entity tick,
+  projectiles, seats, pistons, entity motion, shulker snapping, item pickup…), several between
+  ticks; an exact index needs a position setter everywhere (a refactor of its own).
+- Not done: block part of the hit kept between frames (no section revision exposed to the
+  targeting); attached rockets counted in the projectile loop (`rockets()` already reads the rare
+  list); type interned instead of `String` (cross-cutting lead, mostly rendering).
+- Found, not fixed: a sulfur cube holding a block is not pickable from inside in the game; the
+  dragon is aimed at through its parts; a mob riding the local player shares its root vehicle; the
+  camera on another entity (`set_camera`) still aims from the player; `EventFx::follows` keyed by
+  id across a world change.
+- To measure on the quiet machine: `crowd-1000`, `crowd`, `village`, `plains32`, `plains12`,
+  `forest`, `equipped-humanoids` (2 passes, the reference exe), each switch at 0 alone
+  (`KIND_FLAGS`, `CACHED_ENTITY_BOXES`, `KIND_ID_FILTERS`, `PILOT_CHECK_ORDER`,
+  `VEHICLES_FROM_RIDER_LIST`), then all five at 0; samply share of `App::pick` and of `App::apply`
+  (`piloted_move`).
 
