@@ -5,10 +5,15 @@
 //!
 //! Like the game: paths separated by the 0x1E character, cumulation since turning on (no reset
 //! per frame), "live" reading of the results during the current frame.
+//!
+//! A third collection, ours, serves the perf log (`RUSTCRAFT_PERFLOG_STAGES`, `frame_stages.rs`):
+//! the zones right under `root` and the driver stages, by index, read once per frame.
 
 use hashbrown::HashMap;
 use std::cell::{Cell, RefCell};
 use std::time::Instant;
+
+use crate::frame_stages::{FrameStage, FrameStageClock, StageTimes};
 
 /// Separator of the zone paths.
 pub const SEP: char = '\u{1e}';
@@ -182,6 +187,9 @@ pub const SINGLE: usize = 2;
 thread_local! {
     static ON: Cell<bool> = const { Cell::new(false) };
     static COLLECTORS: RefCell<[Option<Collector>; 3]> = const { RefCell::new([None, None, None]) };
+    /// Third collection, for the perf log: the top zones and the driver stages by index
+    /// (`frame_stages.rs`), created once the composition is wanted.
+    static FRAME_STAGES: RefCell<Option<FrameStageClock>> = const { RefCell::new(None) };
 }
 
 fn each(f: impl Fn(&mut Collector)) {
@@ -192,8 +200,22 @@ fn each(f: impl Fn(&mut Collector)) {
     });
 }
 
-/// Turns a collection on or off (a collection turned back on restarts from zero).
+/// Runs `f` on the frame composition clock of this thread, if it exists.
+fn with_frame_stages<T>(f: impl FnOnce(&mut FrameStageClock) -> T) -> Option<T> {
+    FRAME_STAGES.with(|s| s.borrow_mut().as_mut().map(f))
+}
+
+/// Any collection on: the string ones, or the frame composition.
+fn any_on(c: &[Option<Collector>; 3]) -> bool {
+    c.iter().any(Option::is_some) || FRAME_STAGES.with(|s| s.borrow().is_some())
+}
+
+/// Turns a collection on or off (a collection turned back on restarts from zero). Also starts the
+/// frame composition the first time it is wanted (`frame_stages::enabled`, read once).
 pub fn set(which: usize, on: bool) {
+    if crate::frame_stages::enabled() {
+        start_frame_stages();
+    }
     COLLECTORS.with(|c| {
         let mut c = c.borrow_mut();
         match (on, c[which].is_some()) {
@@ -201,8 +223,16 @@ pub fn set(which: usize, on: bool) {
             (false, true) => c[which] = None,
             _ => {}
         }
-        ON.set(c.iter().any(Option::is_some));
+        ON.set(any_on(&c));
     });
+}
+
+/// Frame composition clock started on this thread (kept for good).
+fn start_frame_stages() {
+    FRAME_STAGES.with(|s| {
+        s.borrow_mut().get_or_insert_with(|| FrameStageClock::new(Instant::now()));
+    });
+    ON.set(true);
 }
 
 /// Removes a collection (end of a recording) and returns it.
@@ -210,9 +240,28 @@ pub fn take(which: usize) -> Option<Collector> {
     COLLECTORS.with(|c| {
         let mut c = c.borrow_mut();
         let out = c[which].take();
-        ON.set(c.iter().any(Option::is_some));
+        ON.set(any_on(&c));
         out
     })
+}
+
+/// Stage times of the frame composition since the last call, up to `now` (`None` when it is off).
+pub fn take_frame_stages(now: Instant) -> Option<StageTimes> {
+    if !ON.get() {
+        return None;
+    }
+    with_frame_stages(|c| c.take(now))
+}
+
+/// Runs a driver call (`present_watch.rs`) in its own stage of the frame composition.
+pub fn during_driver_stage<T>(stage: crate::present_watch::Stage, f: impl FnOnce() -> T) -> T {
+    let Some(stage) = ON.get().then(|| FrameStage::of_driver(stage)).flatten() else { return f() };
+    let started = with_frame_stages(|c| c.begin_driver(stage, Instant::now())).is_some();
+    let out = f();
+    if started {
+        with_frame_stages(|c| c.end_driver(Instant::now()));
+    }
+    out
 }
 
 /// Reading of a collection that is on.
@@ -224,6 +273,7 @@ pub fn with<T>(which: usize, f: impl FnOnce(&Collector) -> T) -> Option<T> {
 pub fn start_tick() {
     if ON.get() {
         each(Collector::start_tick);
+        with_frame_stages(|c| c.start_frame(Instant::now()));
     }
 }
 
@@ -231,18 +281,21 @@ pub fn start_tick() {
 pub fn end_tick() {
     if ON.get() {
         each(Collector::end_tick);
+        with_frame_stages(|c| c.end_frame(Instant::now()));
     }
 }
 
 pub fn push(name: &str) {
     if ON.get() {
         each(|c| c.push(name));
+        with_frame_stages(|c| c.push(name, Instant::now));
     }
 }
 
 pub fn pop() {
     if ON.get() {
         each(Collector::pop);
+        with_frame_stages(|c| c.pop(Instant::now));
     }
 }
 
@@ -259,6 +312,10 @@ pub fn pop_push(name: &str) {
             c.pop();
             c.push(name);
         });
+        with_frame_stages(|c| {
+            c.pop(Instant::now);
+            c.push(name, Instant::now);
+        });
     }
 }
 
@@ -267,7 +324,8 @@ pub fn depth() -> usize {
     if !ON.get() {
         return 0;
     }
-    COLLECTORS.with(|c| c.borrow().iter().flatten().map(|c| c.stack.len()).max().unwrap_or(0))
+    let collected = COLLECTORS.with(|c| c.borrow().iter().flatten().map(|c| c.stack.len()).max().unwrap_or(0));
+    collected.max(with_frame_stages(|c| c.depth).unwrap_or(0))
 }
 
 /// Closes the open zones beyond `d`.
@@ -276,6 +334,11 @@ pub fn unwind(d: usize) {
         each(|c| {
             while c.stack.len() > d {
                 c.pop();
+            }
+        });
+        with_frame_stages(|c| {
+            while c.depth > d {
+                c.pop(Instant::now);
             }
         });
     }
@@ -332,5 +395,91 @@ mod tests {
         assert_eq!(names, ["root", "root.frame", "root.tick", "root.tick.a", "root.tick.a.b"]);
         set(PIE, false);
         assert_eq!(depth(), 0);
+    }
+
+    /// A frame through the real zone calls and the presentation guard: each top zone keeps its
+    /// own time, the driver call is taken out of the `frame` zone, the gap after the frame is
+    /// outside it, and the stages add up to the time between two readings within 5 %. Fails if a
+    /// driver stage stays charged to its zone, or a zone switch is lost.
+    #[test]
+    fn frame_stages_follow_the_zones_and_the_driver_calls() {
+        use crate::frame_stages::FrameStage;
+        use std::time::Duration;
+        let sleep = std::thread::sleep;
+        start_frame_stages();
+        let started = Instant::now();
+        let _ = take_frame_stages(started);
+        start_tick();
+        push("scheduledPacketProcessing");
+        sleep(Duration::from_millis(3));
+        pop_push("frame");
+        push("update");
+        sleep(Duration::from_millis(2));
+        pop();
+        crate::present_watch::during(crate::present_watch::Stage::Present, || sleep(Duration::from_millis(4)));
+        pop_push("fpsUpdate");
+        end_tick();
+        sleep(Duration::from_millis(1));
+        let now = Instant::now();
+        let ns = take_frame_stages(now).expect("frame stages on");
+        let ms = |s: FrameStage| ns[s as usize] as f64 / 1e6;
+        let interval = now.duration_since(started).as_secs_f64() * 1e3;
+        let sum: f64 = FrameStage::ALL.iter().map(|&s| ms(s)).sum();
+        assert!((sum - interval).abs() <= 0.05 * interval, "stages {sum:.3} ms for a frame of {interval:.3} ms");
+        // Lower bounds: the sleeps; upper bounds: the sleep plus a scheduler's late wake-up.
+        let within = |s: FrameStage, low: f64| (low..low + 3.0).contains(&ms(s));
+        assert!(within(FrameStage::Packets, 3.0), "packets {:.3} ms", ms(FrameStage::Packets));
+        assert!(within(FrameStage::Frame, 2.0), "frame {:.3} ms (driver call left in it?)", ms(FrameStage::Frame));
+        assert!(within(FrameStage::Present, 4.0), "present {:.3} ms", ms(FrameStage::Present));
+        assert!(within(FrameStage::OutsideFrame, 1.0), "outside {:.3} ms", ms(FrameStage::OutsideFrame));
+        // Depth and unwinding with no string collection on (only the frame stages).
+        start_tick();
+        push("tick");
+        let d = depth();
+        assert_eq!(d, 2);
+        push("a");
+        push("b");
+        unwind(d);
+        assert_eq!(depth(), 2);
+        end_tick();
+    }
+
+    /// Cost of the frame composition for a frame of 8 top zones, 30 nested zones and 4 driver
+    /// calls, on and off: `cargo test --release -p rc-app --bin rustcraft -- --ignored
+    /// frame_stage_cost --nocapture`.
+    #[test]
+    #[ignore]
+    fn frame_stage_cost() {
+        const FRAMES: u32 = 100_000;
+        let frame = || {
+            start_tick();
+            for top in ["scheduledPacketProcessing", "scheduledExecutables", "mouse", "tick", "sound", "frame"] {
+                push(top);
+                for _ in 0..5 {
+                    push("nested");
+                    pop();
+                }
+                pop();
+            }
+            push("frame");
+            for stage in [crate::present_watch::Stage::Acquire, crate::present_watch::Stage::Submit] {
+                std::hint::black_box(during_driver_stage(stage, || 1));
+            }
+            pop_push("fpsUpdate");
+            std::hint::black_box(take_frame_stages(Instant::now()));
+            end_tick();
+        };
+        let time = || {
+            let started = Instant::now();
+            for _ in 0..FRAMES {
+                frame();
+            }
+            started.elapsed().as_nanos() as f64 / f64::from(FRAMES)
+        };
+        let off = time();
+        start_frame_stages();
+        let on = time();
+        eprintln!("[bench] frame_stages per_frame_ns off {off:.1}");
+        eprintln!("[bench] frame_stages per_frame_ns on {on:.1}");
     }
 }

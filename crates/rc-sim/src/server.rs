@@ -30,6 +30,7 @@ use crate::nbtio::{self, int, list};
 use crate::player::{MENU_SLOTS, PlayerData, Stack};
 use crate::registries::Registries;
 use crate::states::States;
+use crate::tick_stages::TickStage;
 use crate::world::{Dimension, Load};
 
 pub const TICK: Duration = Duration::from_millis(50);
@@ -227,6 +228,8 @@ pub struct Server {
     pub(crate) queue: Vec<(i32, i32)>,
     /// Loading landmarks of the chunk sending (`RUSTCRAFT_PERFLOG` only).
     send_landmarks: Option<ChunkSendLandmarks>,
+    /// Stages of each tick and the slowest tick of every window (`RUSTCRAFT_PERFLOG_STAGES` only).
+    pub(crate) stage_log: crate::tick_stages::TickStageLog,
     /// Read thread of the send queue (`RUSTCRAFT_OPT_ASYNC_LOAD`), created on first use.
     pub(crate) loader: Option<crate::loader::Loader>,
     // Time.
@@ -521,6 +524,7 @@ impl Server {
             sent: HashSet::new(),
             queue: Vec::new(),
             send_landmarks: crate::mem_stats::enabled().then(|| ChunkSendLandmarks::new(opened)),
+            stage_log: crate::tick_stages::TickStageLog::default(),
             loader: None,
             clocks: clocks.clone(),
             rules,
@@ -1205,10 +1209,14 @@ impl Server {
         self.sleep_world_tick(); // S2: night skip (all players), even frozen like the game
         if runs {
             self.run_scheduled(); // S5: scheduled functions, before blocks and entities
+        }
+        self.stage_log.lap(TickStage::WorldClock);
+        if runs {
             // Scheduled ticks, raids, spawns and random ticks, block events.
             self.tick_level_blocks(true);
             self.end_fight_tick(); // F15: dragon fight, before the entities
         }
+        self.stage_log.lap(TickStage::Blocks);
         self.bs.handling_tick = false;
         if let Some((_, _, at)) = self.teleport
             && self.tick > at + 20
@@ -1220,12 +1228,14 @@ impl Server {
         // world's list, every kind together, the player's world part at its rank (mining, demo,
         // menu broadcast, advancements sent); then the player's health, pushes and pickups.
         self.tick_entities();
+        self.stage_log.lap(TickStage::Entities);
         // Block entities after all the entities, like the game: a piston pushes an entity
         // after its own movement of the tick (slime momentum consumed on the next tick); one
         // list for every family (furnaces, brewing stands, bells and spawner blocks included).
         if runs {
             self.tick_block_entities();
         }
+        self.stage_log.lap(TickStage::BlockEntities);
         self.maps_tick(); // S8: held maps
         self.lodestone_compass_tick(); // G5-F10: lodestone compasses
         self.dims_tick(); // S6: portals, parked dimensions
@@ -1234,10 +1244,12 @@ impl Server {
         if runs {
             self.gametest_tick(); // G3-F06: in-game tests, after the world and the players
         }
+        self.stage_log.lap(TickStage::WorldAfter);
         self.flush_block_changes();
         if let Some(a) = self.ack.take() {
             let _ = self.send(Event::BlockChangedAck(a));
         }
+        self.stage_log.lap(TickStage::BlockChangeFlush);
     }
 
     fn run(&mut self) {
@@ -1267,9 +1279,12 @@ impl Server {
                 }
             }
             let work = Instant::now();
+            let tick_number = self.tick;
+            self.stage_log.start(work);
             crate::commands::cmds_ents::debug_profiler_tick_start(self.tick); // `/debug start`
             // (0 bis) chunks read on the separate thread, adopted before everything else in the tick.
             self.poll_loader();
+            self.stage_log.lap(TickStage::ChunkAdoption);
             // (1) client messages.
             loop {
                 match self.peer.packets.try_recv() {
@@ -1291,6 +1306,7 @@ impl Server {
             }
             self.gen_debug_tick();
             self.debug_report_tick();
+            self.stage_log.lap(TickStage::Packets);
             let method_start = Instant::now();
             // (2) tick, outside pause (§ 9); an open world does not pause.
             let paused = self.paused.load(Ordering::Acquire) && self.lan.is_none();
@@ -1302,30 +1318,37 @@ impl Server {
                     self.send_time(false);
                 }
             }
+            self.stage_log.lap(TickStage::Save);
             if paused {
                 self.paused_tick();
+                self.stage_log.lap(TickStage::Paused);
             } else {
                 self.game_tick();
                 if self.lan.is_some() {
                     self.lan_tick(); // S9: guests
                 }
+                self.stage_log.lap(TickStage::LanGuests);
                 self.tick += 1;
             }
             // (3) chunks.
             self.update_tracking();
             self.poll_gen();
+            self.stage_log.lap(TickStage::Tracking);
             // Batches finished during the tick: adopted right away, sent in this tick rather
             // than the next (`RUSTCRAFT_OPT_ASYNC_LATE`).
             if crate::loader::late_poll() {
                 self.poll_loader();
             }
+            self.stage_log.lap(TickStage::ChunkAdoption);
             self.send_chunks();
             if let Some(marks) = &mut self.send_landmarks {
                 for line in marks.after_sending(self.sent.len(), self.queue.is_empty(), Instant::now()) {
                     eprintln!("{line}");
                 }
             }
+            self.stage_log.lap(TickStage::ChunkSend);
             self.prep_tick(); // loading screen: progress and map
+            self.stage_log.lap(TickStage::LoadingScreen);
             // (4) automatic save (§ 8).
             if !paused {
                 self.autosave = self.autosave.saturating_sub(1);
@@ -1334,8 +1357,11 @@ impl Server {
                     self.save(false);
                 }
             }
-            self.cmd.ticking.record_tick_time(work.elapsed());
+            self.stage_log.lap(TickStage::Save);
+            let tick_time = work.elapsed();
+            self.cmd.ticking.record_tick_time(tick_time);
             perf_tick_report(&self.cmd.ticking);
+            self.stage_log.end_tick(tick_number, tick_time);
             // Memory readout (`RUSTCRAFT_PERFLOG`, bounded batch) AFTER the tick measurement: counted
             // inside, it added ~0.3 ms to the bench's median tick (0.36 ms in pause) without costing
             // anything in normal play, where it does not run.
