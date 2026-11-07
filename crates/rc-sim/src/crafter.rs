@@ -25,6 +25,15 @@ fn disabled(be: &Nbt) -> [bool; 9] {
     d
 }
 
+/// Crafter data as the game keeps it after a load: it reads the items first, then disables
+/// only the listed slots 0-8 that are empty, so an occupied or out-of-range index is dropped
+/// (and the next save writes the cleaned, sorted list).
+pub(crate) fn keep_loadable_disabled_slots(be: &mut Nbt) {
+    let d = disabled(be);
+    let kept = (0..9).filter(|&i| d[i]).map(|i| i as i32).collect();
+    crate::nbtio::set(be, "disabled_slots", Nbt::IntArray(kept));
+}
+
 impl Server {
     /// The 10 menu data: disabled slots (1), then the received signal.
     pub(crate) fn crafter_data(&self, p: P) -> Vec<i32> {

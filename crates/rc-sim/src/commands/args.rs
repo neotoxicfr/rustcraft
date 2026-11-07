@@ -267,8 +267,9 @@ impl Server {
             }
         }
         if let Some(n) = nbt {
-            let Some(be) = self.be_get(p) else { return false };
-            return super::select::nbt_matches(&n, be);
+            // The live data: a furnace's NBT lags until the save.
+            let Some(be) = self.live_block_data(p) else { return false };
+            return super::select::nbt_matches(&n, &be);
         }
         true
     }

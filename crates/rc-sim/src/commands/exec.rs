@@ -384,8 +384,11 @@ impl Server {
                     let mut n = self.cmd.storage.get(id).cloned().unwrap_or(Nbt::Compound(Vec::new()));
                     let tag = super::cmds_data::numeric(kind, f64::from(value) * scale);
                     if super::cmds_data::path_set(&mut n, path, tag).is_ok() {
-                        self.cmd.storage.insert(id.clone(), n);
-                        self.cmd.storage_dirty = true;
+                        self.storage_put(id, n);
+                    } else if let Some(stored) = self.cmd.storage.get_mut(id) {
+                        // The game sets into the stored compound itself: a failed store keeps
+                        // what it created (unsaved until the namespace is written again).
+                        *stored = n;
                     }
                 }
             }
@@ -785,16 +788,16 @@ impl Server {
                     if st != self.get(dp) {
                         return Ok(None);
                     }
-                    let strip = |n: Option<&Nbt>| {
-                        n.map(|n| {
-                            let mut n = n.clone();
+                    let strip = |n: Option<Nbt>| {
+                        n.map(|mut n| {
                             for k in ["x", "y", "z", "id"] {
                                 crate::nbtio::remove(&mut n, k);
                             }
                             n
                         })
                     };
-                    let (sb, db) = (strip(self.be_get(sp)), strip(self.be_get(dp)));
+                    // The live data: a furnace's NBT lags until the save.
+                    let (sb, db) = (strip(self.live_block_data(sp)), strip(self.live_block_data(dp)));
                     if let Some(sb) = sb {
                         match db {
                             Some(db) if crate::items::nbt_eq(&sb, &db) => {}

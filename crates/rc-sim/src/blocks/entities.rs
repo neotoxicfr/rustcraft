@@ -1450,6 +1450,167 @@ impl Server {
         }
     }
 
+    /// Stack in slot `i` of the container at `p` (`size`: its slot count) as the game's
+    /// container reads it: the live furnace or brewing stand, the single slot of the jukebox
+    /// and of the decorated pot, otherwise the `Items` list.
+    pub(crate) fn container_item(&self, p: P, i: usize, size: usize) -> Option<crate::player::Stack> {
+        if let Some(live) = self.live_items(p) {
+            return live.get(i).cloned().flatten();
+        }
+        let be = self.be_get(p)?;
+        match single_item_key(self.cont_kind(self.get(p))) {
+            Some(key) => be.get(key).filter(|_| i == 0).and_then(crate::player::Stack::from_nbt),
+            None => crate::containers::read_items(be, size).into_iter().nth(i).flatten(),
+        }
+    }
+
+    /// Sealed loot drawn the way the game's container read or write draws it (no player).
+    /// The drawn stacks are slot writes, so the container is marked changed, except the
+    /// decorated pot and the hopper, whose slot writes never mark it.
+    pub(crate) fn unseal_for_access(&mut self, p: P) {
+        let (randomizable, quiet) = match self.be_get(p) {
+            Some(be) if be.get("LootTable").is_some() => {
+                let id = be.get("id").and_then(Nbt::as_str).unwrap_or("");
+                (crate::loot::be::randomizable(id), matches!(id, "minecraft:decorated_pot" | "minecraft:hopper"))
+            }
+            _ => return,
+        };
+        if randomizable && self.unpack_loot(p, false) && !quiet {
+            self.container_changed(p);
+        }
+    }
+
+    /// Slot `i` of the container at `p` overwritten and nothing else (the game's stack grown
+    /// in place): live furnace or brewing stand, single-slot key, or the `Items` list.
+    pub(crate) fn container_store_item(&mut self, p: P, i: usize, size: usize, item: Option<crate::player::Stack>) {
+        let kind = self.cont_kind(self.get(p));
+        let live = match kind {
+            Cont::Furnace => self.life.furnaces.get_mut(&p).map(|f| (&mut f.items[..], &mut f.dirty)),
+            Cont::Brewing => self.life.brewers.get_mut(&p).map(|b| (&mut b.items[..], &mut b.dirty)),
+            _ => None,
+        };
+        if let Some((items, dirty)) = live {
+            if let Some(slot) = items.get_mut(i) {
+                *slot = item;
+                *dirty = true;
+            }
+            return;
+        }
+        let Some(be) = self.be_get_mut(p) else { return };
+        match single_item_key(kind) {
+            Some(key) => match &item {
+                Some(st) if i == 0 => crate::nbtio::set(be, key, st.to_nbt(None)),
+                None if i == 0 => crate::nbtio::remove(be, key),
+                _ => {}
+            },
+            None => {
+                let mut items = crate::containers::read_items(be, size);
+                if let Some(slot) = items.get_mut(i) {
+                    *slot = item;
+                    crate::containers::write_items(be, &items);
+                }
+            }
+        }
+    }
+
+    /// The game's write of one container slot (commands `item` and `loot`), each family with
+    /// its own rule. Sealed loot is drawn first. No block entity packet goes out: the game
+    /// sends none for a slot write, except the shelf through its own change mark.
+    pub(crate) fn container_set_item(&mut self, p: P, i: usize, size: usize, item: Option<crate::player::Stack>) {
+        self.unseal_for_access(p);
+        let id = self.be_get(p).and_then(|b| b.get("id")).and_then(Nbt::as_str).unwrap_or("").to_owned();
+        match id.as_str() {
+            "minecraft:furnace" | "minecraft:blast_furnace" | "minecraft:smoker" => {
+                self.furnace_set_slot(p, i, size, item.map(|st| self.limited_to_container(st)));
+            }
+            // The disc goes in or out with its song and the `has_record` state.
+            "minecraft:jukebox" => {
+                if i == 0 {
+                    self.jukebox_set_item(p, item, self.get(p));
+                }
+            }
+            // No limit to the stack size and no change mark.
+            "minecraft:decorated_pot" => self.container_store_item(p, i, size, item),
+            "minecraft:chiseled_bookshelf" => self.bookshelf_write(p, i, item),
+            _ => {
+                if id == "minecraft:crafter" {
+                    self.crafter_enable_slot(p, i);
+                }
+                self.container_store_item(p, i, size, item.map(|st| self.limited_to_container(st)));
+                // The hopper's slot write marks nothing (comparators are not told).
+                if id != "minecraft:hopper" {
+                    self.container_mark_changed(p);
+                }
+            }
+        }
+    }
+
+    /// The block entity's own "changed" mark: comparators reread it; the shelf also sends its
+    /// block event and its data to the clients.
+    pub(crate) fn container_mark_changed(&mut self, p: P) {
+        if self.be_get(p).and_then(|b| b.get("id")).and_then(Nbt::as_str) == Some("minecraft:shelf") {
+            self.shelf_changed(p, Some("minecraft:block_activate"));
+        } else {
+            self.container_changed(p);
+        }
+    }
+
+    /// A stack cut to what a container slot holds: the item's own size, 99 at most.
+    fn limited_to_container(&self, mut st: crate::player::Stack) -> crate::player::Stack {
+        st.count = st.count.min(self.life.items.max_stack(&st).min(99));
+        st
+    }
+
+    /// Furnace slot write: only a restarted cooking (another ingredient) marks it changed.
+    fn furnace_set_slot(&mut self, p: P, i: usize, size: usize, item: Option<crate::player::Stack>) {
+        let (recipes, items) = (&self.life.recipes, &self.life.items);
+        match self.life.furnaces.get_mut(&p) {
+            Some(f) if i < f.items.len() => {
+                if f.set_slot(i, item, recipes, items) {
+                    self.container_changed(p);
+                }
+            }
+            Some(_) => {}
+            None => self.container_store_item(p, i, size, item),
+        }
+    }
+
+    /// Chiseled bookshelf slot write: a book goes in with the state update, an empty write
+    /// removes (state updated only if a book was there), anything else is ignored.
+    fn bookshelf_write(&mut self, p: P, i: usize, item: Option<crate::player::Stack>) {
+        if i >= 6 {
+            return;
+        }
+        match item {
+            Some(st) if self.life.items.has_tag("minecraft:bookshelf_books", &st.id) => self.bookshelf_set(p, i, Some(st)),
+            Some(_) => {}
+            None => {
+                if self.container_item(p, i, 6).is_some() {
+                    self.bookshelf_set(p, i, None);
+                }
+            }
+        }
+    }
+
+    /// Any write to a disabled crafter slot, an empty one included, enables it first (with its
+    /// change mark), but only while the slot is still empty. Loading never leaves a disabled
+    /// slot occupied (`keep_loadable_disabled_slots`); the one case is sealed loot drawn by the
+    /// slot read just before the write, and then the slot stays disabled, as in the game.
+    fn crafter_enable_slot(&mut self, p: P, i: usize) {
+        if !self.crafter_slot_disabled(p, i) || self.container_item(p, i, 9).is_some() {
+            return;
+        }
+        if let Some(be) = self.be_get_mut(p) {
+            let kept: Vec<i32> = match be.get("disabled_slots") {
+                Some(Nbt::IntArray(a)) => a.iter().copied().filter(|&k| k != i as i32).collect(),
+                Some(Nbt::List(l)) => l.iter().filter_map(Nbt::as_i64).filter(|&k| k != i as i64).map(|k| k as i32).collect(),
+                _ => Vec::new(),
+            };
+            crate::nbtio::set(be, "disabled_slots", Nbt::IntArray(kept));
+        }
+        self.container_changed(p);
+    }
+
     pub(super) fn item_count(it: &Nbt) -> i32 {
         crate::nbtio::int(it, "count").unwrap_or(1) as i32
     }
@@ -1759,19 +1920,49 @@ impl Server {
 
     /// Block-entity data replaced after its creation (command, components of the placed
     /// item): the simulated state of the furnace or brewing stand is reread from it, otherwise the empty state
-    /// created with the block would mask then overwrite the given contents.
+    /// created with the block would mask then overwrite the given contents. The commands hand
+    /// over the live state merged into the data (`live_block_data`), so cooking is not sent
+    /// back to the last save.
     pub(crate) fn reload_live_be(&mut self, p: P) {
         match self.cont_kind(self.get(p)) {
             Cont::Furnace => {
                 self.life.furnaces.remove(&p);
                 self.ensure_furnace_at(p);
             }
+            // The fields the save leaves out (reagent at the start, last bottle bits) only
+            // matter while brewing, and then the loaded data sets them again.
             Cont::Brewing => {
                 self.life.brewers.remove(&p);
                 self.ensure_brewer(p);
             }
+            Cont::Crafter => {
+                if let Some(be) = self.be_get_mut(p) {
+                    crate::crafter::keep_loadable_disabled_slots(be);
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Block entity data as the game saves it now: the stored NBT with the live state of a
+    /// simulated furnace or brewing stand written over it (their NBT is only rewritten before
+    /// a save, so it is stale in between).
+    pub(crate) fn live_block_data(&self, p: P) -> Option<Nbt> {
+        let mut n = self.be_get(p)?.clone();
+        match self.cont_kind(self.get(p)) {
+            Cont::Furnace => {
+                if let Some(f) = self.life.furnaces.get(&p) {
+                    f.write(&mut n);
+                }
+            }
+            Cont::Brewing => {
+                if let Some(b) = self.life.brewers.get(&p) {
+                    b.write(&mut n);
+                }
+            }
+            _ => {}
+        }
+        Some(n)
     }
 
     /// Tickers of a chunk just read or generated, every family together, in the order the game

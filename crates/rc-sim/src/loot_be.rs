@@ -45,7 +45,7 @@ fn is_sign(id: &str) -> bool {
 }
 
 /// Containers that also carry sealed loot (`LootTable`, `LootTableSeed`).
-fn randomizable(id: &str) -> bool {
+pub(crate) fn randomizable(id: &str) -> bool {
     is_container(id)
         && !matches!(id, "minecraft:furnace" | "minecraft:blast_furnace" | "minecraft:smoker" | "minecraft:brewing_stand")
 }

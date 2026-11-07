@@ -2,7 +2,7 @@
 //! NBT paths (`a.b[0]{x:1}`); `item` (replace); `loot` (the pack's loot tables).
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use rc_client::Event;
@@ -714,11 +714,20 @@ pub fn read_storage(world: &Path) -> BTreeMap<String, Nbt> {
     out
 }
 
-pub(crate) fn storage_jobs(world: &Path, st: &BTreeMap<String, Nbt>) -> Vec<crate::save::Job> {
-    let mut by_ns: BTreeMap<&str, Vec<(String, Nbt)>> = BTreeMap::new();
+/// Namespace of a storage identifier (`minecraft` when it has none).
+pub(crate) fn storage_namespace(id: &str) -> &str {
+    id.split_once(':').map_or("minecraft", |(ns, _)| ns)
+}
+
+/// Save jobs of the namespaces marked dirty, like the game's one file per namespace: an
+/// untouched namespace is not rewritten, an emptied one is written empty.
+pub(crate) fn storage_jobs(world: &Path, st: &BTreeMap<String, Nbt>, dirty: &BTreeSet<String>) -> Vec<crate::save::Job> {
+    let mut by_ns: BTreeMap<&str, Vec<(String, Nbt)>> = dirty.iter().map(|ns| (ns.as_str(), Vec::new())).collect();
     for (id, v) in st {
         let (ns, path) = id.split_once(':').unwrap_or(("minecraft", id));
-        by_ns.entry(ns).or_default().push((path.to_owned(), v.clone()));
+        if let Some(contents) = by_ns.get_mut(ns) {
+            contents.push((path.to_owned(), v.clone()));
+        }
     }
     by_ns
         .into_iter()
@@ -745,9 +754,10 @@ pub enum Acc {
 }
 
 impl Server {
-    /// NBT of a block entity, `None` without a block entity.
+    /// NBT of a block entity as the game saves it now (a furnace's or brewing stand's live
+    /// state included), `None` without a block entity.
     pub fn data_of_block(&self, p: [i32; 3]) -> Option<Nbt> {
-        let mut n = self.be_get(p)?.clone();
+        let mut n = self.live_block_data(p)?;
         crate::nbtio::remove(&mut n, "keepPacked");
         Some(n)
     }
@@ -839,12 +849,32 @@ impl Server {
                 }
                 self.ent_set_nbt(*e, &n);
             }
-            Acc::Storage(id) => {
-                self.cmd.storage.insert(id.clone(), n);
-                self.cmd.storage_dirty = true;
-            }
+            Acc::Storage(id) => self.storage_put(id, n),
         }
         Ok(())
+    }
+
+    /// Storage written like the game: an empty compound removes the identifier; only the
+    /// identifier's namespace is marked to save.
+    pub(crate) fn storage_put(&mut self, id: &str, n: Nbt) {
+        if matches!(&n, Nbt::Compound(f) if f.is_empty()) {
+            self.cmd.storage.remove(id);
+        } else {
+            self.cmd.storage.insert(id.to_owned(), n);
+        }
+        self.cmd.storage_dirty.insert(storage_namespace(id).to_owned());
+    }
+
+    /// A storage edit that failed after changing its copy: the game edits the stored compound
+    /// itself, so what the edit created stays (in memory, unsaved until the namespace is
+    /// written for another reason). An identifier that did not exist was a fresh compound,
+    /// thrown away.
+    fn keep_failed_storage_edit(&mut self, acc: &Acc, data: Nbt) {
+        if let Acc::Storage(id) = acc
+            && let Some(stored) = self.cmd.storage.get_mut(id)
+        {
+            *stored = data;
+        }
     }
 
     fn acc_modified(&self, a: &Acc) -> Component {
@@ -884,14 +914,14 @@ impl Server {
         // (cmds_s9b, mob equipment included).
         let kind = item_source_kind(seg);
         let h = self.item_target(s, p, seg, kind, "source")?;
-        Ok(self
-            .holder_slots(&h, &range)
-            .into_iter()
-            .flat_map(|(_, v)| v)
-            .filter_map(|c| self.slot_get(c))
-            .filter(|st| self.item_pred_test(&pred, st))
-            .map(|st| st.count)
-            .sum())
+        let mut total = 0;
+        for slot in self.holder_slots(&h, &range).into_iter().flat_map(|(_, v)| v) {
+            // A read of the slot: a sealed loot container draws its loot (`if slots` does not).
+            if let Some(st) = self.command_slot_get(slot).filter(|st| self.item_pred_test(&pred, st)) {
+                total += st.count;
+            }
+        }
+        Ok(total)
     }
 
     /// `execute if|unless slots`: number of slots of the range that the source owns (empty ones
@@ -960,7 +990,7 @@ impl Server {
         let state = match ctx_kind {
             "block" => {
                 let pos = self.loaded_pos(s, &p.arg(seg, "computePos").unwrap_or_default())?;
-                Some((self.get(pos), self.be_get(pos).cloned()))
+                Some((self.get(pos), self.live_block_data(pos)))
             }
             _ => None,
         };
@@ -1142,31 +1172,33 @@ impl Server {
             }
             _ => return Err(Fail(tr!("command.failed"))),
         };
+        if op == "merge"
+            && let Some(v) = values.iter().find(|v| !matches!(v, Nbt::Compound(_)))
+        {
+            return Err(Fail(tr!("commands.data.modify.expected_object", snbt::to_snbt(v))));
+        }
         let mut data = self.acc_get(acc);
         let path = p.arg(seg, "targetPath").unwrap_or_default();
-        let n = match op {
-            "set" => {
-                let Some(last) = values.last().cloned() else { return Err(Fail(tr!("commands.data.merge.failed"))) };
-                path_set(&mut data, &path, last)?
-            }
-            "merge" => {
-                for v in &values {
-                    if !matches!(v, Nbt::Compound(_)) {
-                        return Err(Fail(tr!("commands.data.modify.expected_object", snbt::to_snbt(v))));
-                    }
-                }
-                path_merge(&mut data, &path, &values)?
-            }
-            "append" => path_insert(&mut data, &path, -1, &values)?,
-            "prepend" => path_insert(&mut data, &path, 0, &values)?,
+        let edited = match op {
+            "set" => match values.last().cloned() {
+                Some(last) => path_set(&mut data, &path, last),
+                None => Ok(0),
+            },
+            "merge" => path_merge(&mut data, &path, &values),
+            "append" => path_insert(&mut data, &path, -1, &values),
+            "prepend" => path_insert(&mut data, &path, 0, &values),
             _ => {
                 let idx: i32 = p.arg(seg, "index").and_then(|v| v.parse().ok()).unwrap_or(0);
-                path_insert(&mut data, &path, idx, &values)?
+                path_insert(&mut data, &path, idx, &values)
             }
         };
-        if n == 0 {
-            return Err(Fail(tr!("commands.data.merge.failed")));
-        }
+        let n = match edited {
+            Ok(n) if n > 0 => n,
+            failed => {
+                self.keep_failed_storage_edit(acc, data);
+                return Err(failed.err().unwrap_or_else(|| Fail(tr!("commands.data.merge.failed"))));
+            }
+        };
         self.acc_set(acc, data)?;
         let msg = self.acc_modified(acc);
         self.ok(s, msg);

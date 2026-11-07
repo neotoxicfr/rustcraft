@@ -65,6 +65,8 @@ mod function_cache_tests;
 mod command_block_equivalence_tests;
 #[cfg(test)]
 mod parser_equivalence_tests;
+#[cfg(test)]
+mod container_commands_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -114,7 +116,8 @@ pub struct Cmds {
     pub scores: scores::Board,
     /// Command storage (`command_storage_*.dat`): identifier → compound.
     pub storage: BTreeMap<String, Nbt>,
-    pub storage_dirty: bool,
+    /// Namespaces of the storage to save (the game keeps one file and one dirty mark per namespace).
+    pub storage_dirty: BTreeSet<String>,
     /// Force-loaded chunks (`chunk_tickets.dat`, `forceload`).
     pub forced: BTreeSet<(i32, i32)>,
     pub forced_dirty: bool,
@@ -389,7 +392,7 @@ impl Cmds {
             op,
             scores: scores::Board::read(world),
             storage: cmds_data::read_storage(world),
-            storage_dirty: false,
+            storage_dirty: BTreeSet::new(),
             forced: cmds_world::read_forced(dim_dir),
             forced_dirty: false,
             rules_dirty: false,
@@ -995,9 +998,9 @@ impl Server {
             self.cmd.scores.dirty = false;
             jobs.push(dat("scoreboard.dat", self.cmd.scores.to_nbt()));
         }
-        if self.cmd.storage_dirty {
-            self.cmd.storage_dirty = false;
-            jobs.extend(cmds_data::storage_jobs(&self.world, &self.cmd.storage));
+        if !self.cmd.storage_dirty.is_empty() {
+            let dirty = std::mem::take(&mut self.cmd.storage_dirty);
+            jobs.extend(cmds_data::storage_jobs(&self.world, &self.cmd.storage, &dirty));
         }
         if self.cmd.forced_dirty {
             self.cmd.forced_dirty = false;
