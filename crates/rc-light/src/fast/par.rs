@@ -101,9 +101,9 @@ pub(super) fn join_group(
     nyb: i32,
     out: &mut [Touched],
 ) {
-    read(&*grid, c, w, geo, true, true);
-    let Work { face, prop, emit, sky, blk, aux, lane, lane2, .. } = w;
-    let z = Cells { face, prop, emit };
+    read_zone(&*grid, c, w, geo, Some(SolvedRows::all(geo)), Some(SolvedRows { first: r0b, count: nyb }));
+    let Work { face, prop, emit, emitters, sky, blk, aux, lane, lane2, .. } = w;
+    let z = Cells { face, prop, emit, emitters };
     let ny = geo.size[1];
     let (go_b, db, ds) = pair(&*grid, c, &z, sky, lane, aux, blk, lane2, geo, r0b, nyb);
     let t0 = Instant::now();
@@ -193,8 +193,12 @@ pub(super) fn par_compute(
     sky: bool,
 ) -> bool {
     install(|| {
-        let pre = match (&aux, sky) {
-            (Some(a), true) => Some(sources(grid, c, z, a.sec_geo, g, r0, ny)),
+        let mut aux = aux;
+        let pre = match aux.as_deref_mut() {
+            Some(a) if sky => {
+                let columns = SkyColumns::when_cached(grid, c, a, g);
+                Some(sources(grid, c, z, a.sec_geo, columns.as_ref(), g, r0, ny))
+            }
             _ => None,
         };
         if !seed(grid, c, z, lay, lane, aux, pre.as_deref(), g, r0, ny, sky) {
@@ -222,8 +226,18 @@ fn cut<'a, T>(v: &mut &'a mut [T], k: usize) -> &'a mut [T] {
 }
 
 /// `LIGHTPARSOLVE`: zone read ([`read_sections`]) in slices of 16 rows in parallel,
-/// each slice writing its contiguous share of the arrays.
-pub(super) fn read_par(grid: &impl LightGrid, c: &Ctx, w: &mut Work, g: Geo, want_sky: bool, want_blk: bool) {
+/// each slice writing its contiguous share of the arrays (and listing its emitters, the lists
+/// then put end to end in slice order).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn read_par(
+    grid: &impl LightGrid,
+    c: &Ctx,
+    w: &mut Work,
+    g: Geo,
+    want_sky: bool,
+    want_blk: bool,
+    plan: Option<&seed_at_read::OpenPlan>,
+) {
     let n = g.cells();
     let band = g.plane * 16;
     let mut face = &mut w.face[..n];
@@ -231,6 +245,8 @@ pub(super) fn read_par(grid: &impl LightGrid, c: &Ctx, w: &mut Work, g: Geo, wan
     let mut emit: &mut [u8] = if want_blk { &mut w.emit[..n] } else { &mut [] };
     let mut sky: &mut [u8] = if want_sky { &mut w.sky[..n] } else { &mut [] };
     let mut blk: &mut [u8] = if want_blk { &mut w.blk[..n] } else { &mut [] };
+    let mut emitter_lists: Vec<Vec<u32>> = (0..n.div_ceil(band)).map(|_| Vec::new()).collect();
+    let mut lists = emitter_lists.iter_mut();
     let mut parts = Vec::new();
     let mut base = 0;
     while base < n {
@@ -244,6 +260,8 @@ pub(super) fn read_par(grid: &impl LightGrid, c: &Ctx, w: &mut Work, g: Geo, wan
             blk: cut(&mut blk, k),
             want_sky,
             want_blk,
+            plan,
+            emitters: lists.next().expect("one emitter list per slice"),
         };
         parts.push((base, k, b));
         base += k;
@@ -263,11 +281,25 @@ pub(super) fn read_par(grid: &impl LightGrid, c: &Ctx, w: &mut Work, g: Geo, wan
             }
         })
     });
+    for list in &emitter_lists {
+        w.emitters.extend_from_slice(list);
+    }
 }
 
 /// Source heights of the interior stacks (`column_source`), row by row in parallel;
-/// each task has its own caches (they only depend on the states).
-fn sources(grid: &impl LightGrid, c: &Ctx, z: &Cells, sg: SecGeo, g: Geo, r0: i32, ny: i32) -> Vec<i32> {
+/// each task has its own caches (they only depend on the states). `columns`: the zone's columns
+/// fetched once for every task (`LIGHTSKYCOLUMNCACHE`).
+#[allow(clippy::too_many_arguments)]
+fn sources(
+    grid: &impl LightGrid,
+    c: &Ctx,
+    z: &Cells,
+    sg: SecGeo,
+    columns: Option<&SkyColumns>,
+    g: Geo,
+    r0: i32,
+    ny: i32,
+) -> Vec<i32> {
     let (sx, sz) = (g.size[0], g.size[2]);
     let mut v = vec![i32::MAX; (sx * sz) as usize];
     let nsec = (sg.ncx * sg.ncz * sg.nsec) as usize;
@@ -279,7 +311,7 @@ fn sources(grid: &impl LightGrid, c: &Ctx, z: &Cells, sg: SecGeo, g: Geo, r0: i3
                 return;
             }
             for dx in 1..sx - 1 {
-                row[dx as usize] = column_source(grid, c, aux, z, g, r0, ny, dx, dz);
+                row[dx as usize] = column_source(grid, c, aux, columns, z, g, r0, ny, dx, dz);
             }
         },
     );
@@ -500,8 +532,8 @@ fn record(grid: &impl LightGrid, c: &Ctx, w: &mut Work, cs: &[[i32; 3]], block: 
         if block {
             read(grid, c, w, bg, false, true);
             let t0 = Instant::now();
-            let Work { face, prop, emit, blk, lane2, .. } = w;
-            let z = Cells { face, prop, emit };
+            let Work { face, prop, emit, emitters, blk, lane2, .. } = w;
+            let z = Cells { face, prop, emit, emitters };
             if compute(grid, c, &z, blk, lane2, None, bg, 0, bg.size[1], false) {
                 rec.block = Some(scan_all(c, blk, lane2, bg, 0, bg.size[1]));
             }
@@ -517,9 +549,9 @@ fn record(grid: &impl LightGrid, c: &Ctx, w: &mut Work, cs: &[[i32; 3]], block: 
     }
     let (sg, slo) = sky_zone(grid, c, &mut w.aux, cs, bg);
     let (r0b, nyb, ny) = (bg.lo[1] + 1 - slo, bg.size[1], sg.size[1]);
-    read(grid, c, w, sg, true, block);
-    let Work { face, prop, emit, sky: lsky, blk, aux, lane, lane2, .. } = w;
-    let z = Cells { face, prop, emit };
+    read_zone(grid, c, w, sg, Some(SolvedRows::all(sg)), block.then_some(SolvedRows { first: r0b, count: nyb }));
+    let Work { face, prop, emit, emitters, sky: lsky, blk, aux, lane, lane2, .. } = w;
+    let z = Cells { face, prop, emit, emitters };
     if block && c.o.join && sg.cells() >= c.o.join_min {
         let (go_b, db, ds) = pair(grid, c, &z, lsky, lane, aux, blk, lane2, sg, r0b, nyb);
         let t0 = Instant::now();

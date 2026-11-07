@@ -8440,6 +8440,83 @@ threads), 2 alternating passes against `main`; then `LIGHTREADROWS=0`, `LIGHTSCA
 `LIGHTWRITECOLUMN=0` and `LIGHTZEROONLYRING=1` one at a time; the relight trace bench A B B A
 (`work` against `before_io`).
 
+## C2-M11 (series 3): light seeds drawn from the zone read, sky descent started below the clear sections (07/11, loaded machine)
+
+`crates/rc-light/src/fast.rs`, `fast/seed_at_read.rs` (new), `fast/sky_columns.rs` (new),
+`fast/frontier.rs`, `fast/zone_read.rs`, `fast/par.rs`. Three switches read once with the other
+light switches (`RUSTCRAFT_OPT_<name>`, `=0`: old path), all on by default. Bit for bit the old path,
+sheets and touched sections; the seeded levels, opened cells and queue entries are those of the
+C2-M02 seeding (only the work moves).
+- `LIGHTSEEDATREAD` (on, needs `ZONEUNPACK`; the cell-by-cell read of before it is unchanged): the
+  zone read now gets, per sheet, the rows its resolution solves (the block's slice of the sky zone
+  under `ZONEONCE` and `LIGHTJOIN`, the whole zone otherwise). It opens their interior cells that have a
+  sheet (`OPEN` set from `DATA` by one shift) and lists the block's emitting interior cells, only in
+  the sections whose source can emit (a single state that emits, a palette with an emitting entry,
+  direct values, cells looked up); the parallel bands of `LIGHTPARSOLVE` list theirs, put end to end
+  in band order. The seeding no longer walks the interior: the levels of its rows are zeroed plane by
+  plane, then the listed emitters (block) or each stack's cells from its source height up (sky: a
+  branch-free row loop, then the queue walked stack by stack over its band of low sources only) get
+  their value; the margins are copied run by run (vectorised copy), only the lit ones going through
+  the queue test. The block's early stop (`BLOCKEARLY`) still sees the old light stored inside (light
+  to put out): an OR over the rows' bytes, only when nothing else is lit.
+- `LIGHTOPENAFTERREAD` (on, refines `LIGHTSEEDATREAD`): the cells are opened once the zone is read,
+  one loop per plane over its interior stretch (the two side margins of its rows closed again),
+  instead of segment by segment (16 cells at most) as each section is read. Opening while reading
+  costs the read +18 to +42 %, opening after it +1 to +6 %. A pass per zone row (33 cells) was in
+  between (−3 to −5 µs against while reading); the plane loop replaced it.
+- `LIGHTSKYCOLUMNCACHE` (on): the zone's chunk columns are fetched once per resolution (a window like
+  the incremental path's), and each one's highest section that is not clear is found once (through
+  the per-section cache); every stack starts its descent from the top of the world at the top cell of
+  that section, instead of a grid lookup per stack (a hash map on the server, ≈ 1,000 to 5,000 per
+  resolution) and a section-by-section walk from the top of the world. Exact: skipping a clear section
+  only tests the edge between the shape above and a shapeless cell; past the first one the shape above
+  is none and two shapeless cells never close an edge; the first one tests the air above the world,
+  checked once per window. The memo (`SKYMEMO`, off) may now record a deeper verified height: still
+  true, same answers. With `LIGHTPARSOLVE` the window is built once and read by every task.
+
+Micro-bench `bench_seed_at_read` (micro-bench world, µs per group, best of 7 A B B A, LOADED machine,
+final run), before (the three switches off) → shipped:
+
+| trace | read | block seeds | sky sources | sky seeds | whole relight |
+|---|---|---|---|---|---|
+| plains | 48.3 → 51.0 | 35.5 → 2.4 (−93 %) | 74.6 → 30.0 (−60 %) | 48.0 → 20.4 (−58 %) | −17 to −40 % (3 runs) |
+| torches | 50.5 → 57.1 | 35.6 → 2.4 (−93 %) | 74.6 → 30.0 (−60 %) | 48.3 → 20.4 (−58 %) | −43 % |
+| cave | 57.9 → 60.4 | 35.4 → 2.4 (−93 %) | 120.9 → 75.2 (−38 %) | 51.9 → 9.1 (−82 %) | −42 to −50 % (4 runs) |
+| redstone (block only) | 66.9 → 68.4 | 50.6 → 3.3 (−94 %) | 109.3 → 36.8 (−66 %) | 73.6 → 29.7 (−60 %) | −39 to −44 % (4 runs) |
+| building | 79.7 → 81.0 | 62.8 → 4.0 (−94 %) | 131.9 → 47.9 (−64 %) | 88.5 → 36.9 (−58 %) | −43 to −46 % |
+| water | 76.4 → 81.3 | 58.1 → 4.0 (−93 %) | 124.6 → 44.2 (−65 %) | 84.8 → 37.5 (−56 %) | −43 to −45 % |
+| slab (142,500 cells) | 122.6 → 128.8 | 75.0 → 5.0 (−93 %) | 219.7 → 117.9 (−46 %) | 142.7 → 67.4 (−53 %) | −23 to −34 % |
+| spread | 60.3 → 72.8 | 45.3 → 3.6 (−92 %) | 89.2 → 39.3 (−56 %) | 61.2 → 35.7 (−42 %) | −40 to −44 % |
+
+Each alone on "before": `LIGHTSKYCOLUMNCACHE` the sky sources −37 % (cave, the descent stops in the
+first stone section) to −66 %, nothing else moved; `LIGHTSEEDATREAD` (opening while reading) the
+block seeds −92 to −94 %, the sky seeds −49 to −82 %, the read +15 to +41 %. In pools (redstone, slab:
+zones read and sourced in parallel), shipped against before: redstone −36 to −58 % at 1 to 32 threads,
+slab −22 to −44 %. Integrated server traces (`benches/relight.rs`, criterion median, A B B A, `work`
+against `before_seed` = the two main switches off, same machine load): surface 364 / 350 ms against
+569 / 536 ms (−36 %, intervals disjoint); Nether (block only, many lava emitters listed) 177 / 154
+against 191 / 178 ms (−7 / −14 %); synthetic suite 171 / 174 against 250 / 248 ms (−31 %). Every
+trace still gives its known output fingerprint (frozen reference). GPU: not applicable (a resolution
+is tens of µs of work, under one upload of its zone). Allocations: one small window (≈ 9 to 30
+column entries of 24 bytes, asserted) per sky resolution, one emitter list per parallel band; the
+emitter list of the read is kept with the zone buffers (counted in their retained bytes).
+Same per-stack descent left in `inc.rs` (`floor_of`, `LIGHTINC` off by default, a few stacks per
+incremental resolution); `lib.rs` and `reference.rs` keep theirs (old path and frozen reference).
+
+Proofs: `prepared_read_opens_the_solved_interior_and_lists_its_emitters` (500 random zones and block
+slices, seven read variants, sequential and in parallel bands: the plain read's arrays with exactly
+the solved interior cells that have a sheet opened and exactly the emitting ones listed),
+`sky_columns_give_every_stack_its_source_height` (300 random sky zones, more than 100,000 stacks,
+source height compared stack by stack), `removed_torch_light_is_put_out` (old light, no emitter, dark
+margins: only the stored light keeps the block going), `each_seed_switch_alone_matches_old`
+(sequential and multi-core), the random suites now drawing the three bits. Sabotages caught: an emitter
+forgotten on a section's top row (50), the stored light ignored by the early stop (51), the block's
+bottom margin row opened by the read (52), the descent started below a section that is not clear (53).
+To measure on the quiet machine: `scenes.py` redstone, nether, tnt, then cave, plains12, generation,
+forest (relight ms/s, tick p99), 2 alternating passes against `main`; then `LIGHTSEEDATREAD=0`,
+`LIGHTSKYCOLUMNCACHE=0`, `LIGHTOPENAFTERREAD=0` one at a time; the trace bench A B B A (`work` against
+`before_seed`).
+
 
 ## C7-M08: the last SipHash of the client, one item atlas key, map preview version, clippy guard (07/11, loaded machine)
 

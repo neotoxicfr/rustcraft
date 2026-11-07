@@ -122,18 +122,22 @@ struct PaletteProps {
     /// from a zeroed table, so the entries past the current palette size are put back to zero (an
     /// index can only pass the palette size on malformed data, shorter than its section).
     written: usize,
+    /// One of the current palette's entries emits light.
+    emits: bool,
 }
 
 impl PaletteProps {
     fn new() -> Self {
-        PaletteProps { props: [(0, 0, 0); 256], written: 0 }
+        PaletteProps { props: [(0, 0, 0); 256], written: 0, emits: false }
     }
 
     /// Resolves the `1 << bits` entries of a palette (an entry past its end reads as state 0).
     fn resolve(&mut self, t: &LightTables, palette: &[u32], bits: u8) {
         let n = 1usize << bits;
+        self.emits = false;
         for (k, e) in self.props.iter_mut().enumerate().take(n) {
             *e = props(t, palette.get(k).copied().unwrap_or(0));
+            self.emits |= e.2 > 0;
         }
         if self.written > n {
             self.props[n..self.written].fill((0, 0, 0));
@@ -203,6 +207,8 @@ impl ColumnRead<'_, '_> {
             if self.out.want_blk {
                 copy_sheet(self.out.blk, &rows, sheet_of(block_sheets, sec), fill);
             }
+            let may_emit = seed_at_read::may_emit(&source, self.palette.emits);
+            seed_at_read::prepare_section(self.out, self.g, self.span.x.clone(), y..end, self.span.z.clone(), may_emit);
             y = end;
         }
     }

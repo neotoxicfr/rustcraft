@@ -37,6 +37,13 @@
 //!   fetched once per run of its stacks (mission C2-M10, `fast/change_scan.rs`).
 //! - `LIGHTZEROONLYRING`: with `ZONEBUF`, a kept zone buffer gets only its sentinel ring zeroed
 //!   before a read (every read path writes all the other cells; mission C2-M10).
+//! - `LIGHTSEEDATREAD`: with `ZONEUNPACK`, the read opens the solved interior cells and lists the
+//!   block emitters, the seeding only touches the lit cells (mission C2-M11 of series 3,
+//!   `fast/seed_at_read.rs`).
+//! - `LIGHTSKYCOLUMNCACHE`: the sky descent of each stack starts at its column's highest section
+//!   that is not clear, columns fetched once per resolution (same mission, `fast/sky_columns.rs`).
+//! - `LIGHTOPENAFTERREAD`: with `LIGHTSEEDATREAD`, the solved cells are opened plane by plane once
+//!   the zone is read, instead of segment by segment in each section.
 //! - Thresholds `RUSTCRAFT_OPT_LIGHTPARMIN`, `LIGHTCHUNK`, `LIGHTJOINMIN`, `LIGHTSPREADMIN`
 //!   (shipped values: the constants of `par.rs`), read once like the switches.
 //!
@@ -112,10 +119,19 @@ pub(crate) struct Opts {
     pub keep_column_while_writing: bool,
     /// `LIGHTZEROONLYRING`: kept zone buffers get only their sentinel ring zeroed before a read.
     pub zero_only_ring: bool,
+    /// `LIGHTSEEDATREAD`: the zone read opens the solved interior cells and lists the block
+    /// emitters; the seeding then only touches the lit cells (`fast/seed_at_read.rs`).
+    pub seed_at_read: bool,
+    /// `LIGHTSKYCOLUMNCACHE`: the zone's chunk columns fetched once per resolution, each stack's sky
+    /// descent started at its column's highest section that is not clear (`fast/sky_columns.rs`).
+    pub sky_column_cache: bool,
+    /// `LIGHTOPENAFTERREAD`: with `LIGHTSEEDATREAD`, the solved cells opened plane by plane after the
+    /// read, instead of segment by segment while each section is read.
+    pub open_after_read: bool,
 }
 
 /// Names of the switches (`RUSTCRAFT_OPT_<name>`), in the bit order of [`Opts::from_bits`].
-pub(crate) const NAMES: [&str; 27] = [
+pub(crate) const NAMES: [&str; 30] = [
     "SKYSKIP",
     "SKYMEMO",
     "SKYBIT",
@@ -143,6 +159,9 @@ pub(crate) const NAMES: [&str; 27] = [
     "LIGHTSCANPLANES",
     "LIGHTWRITECOLUMN",
     "LIGHTZEROONLYRING",
+    "LIGHTSEEDATREAD",
+    "LIGHTSKYCOLUMNCACHE",
+    "LIGHTOPENAFTERREAD",
 ];
 
 /// Switches off by default (`=1` to turn them on): losers in the micro-bench, kept for
@@ -193,7 +212,16 @@ impl Opts {
             scan_by_planes: b & 1 << 24 != 0,
             keep_column_while_writing: b & 1 << 25 != 0,
             zero_only_ring: b & 1 << 26 != 0,
+            seed_at_read: b & 1 << 27 != 0,
+            sky_column_cache: b & 1 << 28 != 0,
+            open_after_read: b & 1 << 29 != 0,
         }
+    }
+
+    /// The read prepares the seeding (`LIGHTSEEDATREAD`): only on the per-section reads
+    /// (`ZONEUNPACK`), the cell-by-cell read of before them staying as it was.
+    pub(crate) fn seeds_at_read(&self) -> bool {
+        self.seed_at_read && self.zone_unpack
     }
 
     /// Bits of the switches, the inverse of [`Opts::from_bits`] (thresholds and `LIGHTINC` aside).
@@ -226,6 +254,9 @@ impl Opts {
             self.scan_by_planes,
             self.keep_column_while_writing,
             self.zero_only_ring,
+            self.seed_at_read,
+            self.sky_column_cache,
+            self.open_after_read,
         ];
         on.iter().enumerate().fold(0, |b, (k, &v)| b | u32::from(v) << k)
     }
@@ -394,6 +425,8 @@ struct Work {
     sky: Vec<u8>,
     blk: Vec<u8>,
     raw: Vec<u32>,
+    /// Emitting interior cells of the block's solved rows, listed by the read (`LIGHTSEEDATREAD`).
+    emitters: Vec<u32>,
     aux: Aux,
     /// Resolution in progress (sky under `LIGHTJOIN`).
     lane: Lane,
@@ -412,6 +445,7 @@ impl Work {
             + self.sky.capacity()
             + self.blk.capacity()
             + self.raw.capacity() * 4
+            + self.emitters.capacity() * 4
             + self.aux.secs.capacity()
             + self.aux.memo.capacity() * 24
             + self.lane.bytes()
@@ -616,8 +650,9 @@ fn solve_group(
         return;
     }
     if block && c.o.zone_once {
-        read(&*grid, c, w, sky_geo, true, true);
         let r0 = blo - slo + i32::from(sabotage(4));
+        let block_rows = SolvedRows { first: r0, count: block_geo.size[1] };
+        read_zone(&*grid, c, w, sky_geo, Some(SolvedRows::all(sky_geo)), Some(block_rows));
         solve(grid, c, w, sky_geo, r0, block_geo.size[1], false, out);
     } else {
         if block {
@@ -747,11 +782,14 @@ fn sky_bottom(grid: &impl LightGrid, c: &Ctx, w: &mut Aux, cs: &[[i32; 3]], bmin
 }
 
 /// The sky descends without an occluded edge from the top of the world to `from` included (same rule as
-/// the old `clear_above`).
-fn clear_above(grid: &impl LightGrid, c: &Ctx, w: &mut Aux, x: i32, z: i32, from: i32) -> bool {
+/// the old `clear_above`). `columns`: the zone's columns fetched once, each with the start of its
+/// descent past the clear sections at the top (`LIGHTSKYCOLUMNCACHE`).
+#[allow(clippy::too_many_arguments)]
+fn clear_above(grid: &impl LightGrid, c: &Ctx, w: &mut Aux, columns: Option<&SkyColumns>, x: i32, z: i32, from: i32) -> bool {
     let (t, h, tab) = (c.t, c.height, c.o.occ_tab);
     let stop = from.max(-1);
     let (mut y, mut hf) = (h - 1, t.face(0));
+    let mut resumed = false;
     if c.o.sky_memo {
         match w.memo.get(&(x, z)) {
             Some(Memo::Blocked(yf)) => return stop > *yf - i32::from(sabotage(6)),
@@ -761,12 +799,27 @@ fn clear_above(grid: &impl LightGrid, c: &Ctx, w: &mut Aux, x: i32, z: i32, from
                 }
                 y = down - 1;
                 hf = face;
+                resumed = true;
             }
             None => {}
         }
     }
     let (cx, cz) = (x >> 4, z >> 4);
-    let Some((sections, _, _)) = grid.column(cx, cz) else { return true };
+    let sections = match columns {
+        Some(columns) => {
+            let Some(column) = columns.get(cx, cz) else { return true };
+            if !resumed && let Some(start) = column.descent_start {
+                // The clear sections above were skipped without meeting an edge (see
+                // `fast/sky_columns.rs`): below them, the shape above is none.
+                (y, hf) = (start, 0);
+            }
+            column.sections
+        }
+        None => {
+            let Some((sections, _, _)) = grid.column(cx, cz) else { return true };
+            sections
+        }
+    };
     let (lx, lz) = ((x & 15) as usize, (z & 15) as usize);
     let blocked = loop {
         if y < stop {
@@ -805,10 +858,35 @@ fn props(t: &LightTables, s: u32) -> (u32, u8, u8) {
     (t.face(s), t.opacity(s) | if t.damps(s) { DAMP } else { 0 }, t.emission.get(s as usize).copied().unwrap_or(0))
 }
 
-/// Reads the zone: properties of the states, and values of the wanted sheets (sky, block).
+/// Rows `first..first + count` of a zone read that one resolution solves, its two margin rows
+/// included (the `r0` and `ny` of [`solve`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SolvedRows {
+    first: i32,
+    count: i32,
+}
+
+impl SolvedRows {
+    /// Every row of the zone `g`.
+    fn all(g: Geo) -> Self {
+        SolvedRows { first: 0, count: g.size[1] }
+    }
+}
+
+/// [`read_zone`] for resolutions that solve every row of the zone.
 fn read(grid: &impl LightGrid, c: &Ctx, w: &mut Work, g: Geo, want_sky: bool, want_blk: bool) {
+    let all = SolvedRows::all(g);
+    read_zone(grid, c, w, g, want_sky.then_some(all), want_blk.then_some(all));
+}
+
+/// Reads the zone: properties of the states, and values of the wanted sheets (sky, block), each
+/// one for the rows its resolution will solve (`LIGHTSEEDATREAD` prepares their seeding).
+fn read_zone(grid: &impl LightGrid, c: &Ctx, w: &mut Work, g: Geo, sky: Option<SolvedRows>, block: Option<SolvedRows>) {
     #[cfg(test)]
     READS.with(|r| r.set(r.get() + 1));
+    let (want_sky, want_blk) = (sky.is_some(), block.is_some());
+    let plan = c.o.seeds_at_read().then(|| seed_at_read::OpenPlan::new(&c.o, g, sky, block));
+    w.emitters.clear();
     let keep = c.o.zone_buf;
     let ring_only = keep && c.o.zero_only_ring;
     let n = g.cells();
@@ -821,12 +899,16 @@ fn read(grid: &impl LightGrid, c: &Ctx, w: &mut Work, g: Geo, want_sky: bool, wa
     if want_sky {
         prepare_zone_array(&mut w.sky, g, keep, ring_only);
     }
+    let plan = plan.as_ref();
     if c.o.zone_unpack && c.o.par_solve && n >= c.o.par_min {
-        par::read_par(grid, c, w, g, want_sky, want_blk);
+        par::read_par(grid, c, w, g, want_sky, want_blk, plan);
     } else if c.o.zone_unpack {
-        read_sections(grid, c, w, g, want_sky, want_blk);
+        read_sections(grid, c, w, g, want_sky, want_blk, plan);
     } else {
         read_cells(grid, c, w, g, want_sky, want_blk);
+    }
+    if let Some(plan) = plan {
+        seed_at_read::open_after_read(plan, g, &mut w.sky[..], &mut w.blk[..]);
     }
 }
 
@@ -947,6 +1029,9 @@ struct ZoneSlice<'a> {
     blk: &'a mut [u8],
     want_sky: bool,
     want_blk: bool,
+    /// Cells to open and emitters to list while reading (`LIGHTSEEDATREAD`), into `emitters`.
+    plan: Option<&'a seed_at_read::OpenPlan>,
+    emitters: &'a mut Vec<u32>,
 }
 
 impl ZoneSlice<'_> {
@@ -967,7 +1052,16 @@ impl ZoneSlice<'_> {
 
 /// Read per chunk and section: single value set at once, palette resolved once per
 /// entry, sheets looked up once per section.
-fn read_sections(grid: &impl LightGrid, c: &Ctx, w: &mut Work, g: Geo, want_sky: bool, want_blk: bool) {
+#[allow(clippy::too_many_arguments)]
+fn read_sections(
+    grid: &impl LightGrid,
+    c: &Ctx,
+    w: &mut Work,
+    g: Geo,
+    want_sky: bool,
+    want_blk: bool,
+    plan: Option<&seed_at_read::OpenPlan>,
+) {
     let n = g.cells();
     let mut raw = std::mem::take(&mut w.raw);
     let out = ZoneSlice {
@@ -979,6 +1073,8 @@ fn read_sections(grid: &impl LightGrid, c: &Ctx, w: &mut Work, g: Geo, want_sky:
         blk: if want_blk { &mut w.blk[..n] } else { &mut [] },
         want_sky,
         want_blk,
+        plan,
+        emitters: &mut w.emitters,
     };
     read_rows(grid, c, g, g.lo[1], g.lo[1] + g.size[1], out, &mut raw);
     w.raw = raw;
@@ -1028,6 +1124,7 @@ fn read_rows_cell_by_cell(grid: &impl LightGrid, c: &Ctx, g: Geo, ya: i32, yb: i
                 let cells = (xb - xa) * (zb - za) * (yb - y);
                 // Properties of a cell by index in the section, depending on the content.
                 let mut palette_props = [(0u32, 0u8, 0u8); 256];
+                let mut palette_emits = false;
                 let blocks = sections.get(sec as usize).map(|s| &s.blocks);
                 let src = match blocks {
                     None => CellSource::Fixed(props(t, 0)),
@@ -1036,6 +1133,7 @@ fn read_rows_cell_by_cell(grid: &impl LightGrid, c: &Ctx, g: Geo, ya: i32, yb: i
                     Some(Container::Packed { bits, palette: Some(p), data }) if *bits <= 8 => {
                         for (k, e) in palette_props.iter_mut().enumerate().take(1 << bits) {
                             *e = props(t, p.get(k).copied().unwrap_or(0));
+                            palette_emits |= e.2 > 0;
                         }
                         unpack_raw(*bits, data, raw);
                         CellSource::Palette
@@ -1064,6 +1162,8 @@ fn read_rows_cell_by_cell(grid: &impl LightGrid, c: &Ctx, g: Geo, ya: i32, yb: i
                         }
                     }
                 }
+                let may_emit = seed_at_read::may_emit(&src, palette_emits);
+                seed_at_read::prepare_section(&mut out, g, xa..xb, y..yb, za..zb, may_emit);
                 y = yb;
             }
         }
@@ -1076,6 +1176,8 @@ struct Cells<'a> {
     face: &'a [u32],
     prop: &'a [u8],
     emit: &'a [u8],
+    /// Emitting interior cells of the block's solved rows (`LIGHTSEEDATREAD`; empty otherwise).
+    emitters: &'a [u32],
 }
 
 /// Source height of the sky of a stack (§ 1.4), over the rows `r0..r0 + ny` of the zone read.
@@ -1096,11 +1198,13 @@ fn source_height(c: &Ctx, z: &Cells, g: Geo, r0: i32, ny: i32, dx: i32, dz: i32)
 }
 
 /// Height from which the interior stack `(dx, dz)` receives full sky (`i32::MAX`: never).
+/// `columns`: the zone's columns fetched once (`LIGHTSKYCOLUMNCACHE`), otherwise looked up here.
 #[allow(clippy::too_many_arguments)]
 fn column_source(
     grid: &impl LightGrid,
     c: &Ctx,
     aux: &mut Aux,
+    columns: Option<&SkyColumns>,
     z: &Cells,
     g: Geo,
     r0: i32,
@@ -1109,7 +1213,7 @@ fn column_source(
     dz: i32,
 ) -> i32 {
     let top_margin = g.lo[1] + r0 + ny - 1;
-    if clear_above(grid, c, aux, g.lo[0] + dx, g.lo[2] + dz, top_margin) {
+    if clear_above(grid, c, aux, columns, g.lo[0] + dx, g.lo[2] + dz, top_margin) {
         source_height(c, z, g, r0, ny, dx, dz)
     } else {
         i32::MAX
@@ -1141,8 +1245,8 @@ fn count_solve(sky: bool, d: std::time::Duration) {
 
 #[allow(clippy::too_many_arguments)]
 fn solve_body(grid: &mut impl LightGrid, c: &Ctx, w: &mut Work, g: Geo, r0: i32, ny: i32, sky: bool, out: &mut [Touched]) {
-    let Work { face, prop, emit, sky: lsky, blk, aux, lane, .. } = w;
-    let z = Cells { face, prop, emit };
+    let Work { face, prop, emit, emitters, sky: lsky, blk, aux, lane, .. } = w;
+    let z = Cells { face, prop, emit, emitters };
     let lay = if sky { lsky } else { blk };
     if compute(&*grid, c, &z, lay, lane, sky.then_some(aux), g, r0, ny, sky) {
         write(grid, c, lay, lane, g, r0, ny, sky, out);
@@ -1210,11 +1314,15 @@ fn seed(
     sky: bool,
 ) -> bool {
     let o = c.o;
-    if o.sky_frontier || o.margin_frontier || o.seed_rows {
+    if o.sky_frontier || o.margin_frontier || o.seed_rows || o.seeds_at_read() {
         return frontier::seed(grid, c, z, lay, lane, aux, pre, g, r0, ny, sky);
     }
     let (sx, sz) = (g.size[0], g.size[2]);
     prepare_lane(lane, g.cells(), o.zone_buf);
+    let columns = match aux.as_deref_mut() {
+        Some(aux) if sky && pre.is_none() => SkyColumns::when_cached(grid, c, aux, g),
+        _ => None,
+    };
     let all = ALL_DIRS;
     let mut any = 0u8;
     for dz in 0..sz {
@@ -1226,7 +1334,7 @@ fn seed(
                 p[(dz * sx + dx) as usize]
             } else {
                 let aux = aux.as_deref_mut().expect("sky caches");
-                column_source(grid, c, aux, z, g, r0, ny, dx, dz)
+                column_source(grid, c, aux, columns.as_ref(), z, g, r0, ny, dx, dz)
             };
             for r in r0..r0 + ny {
                 let i = g.at(dx, r, dz);
@@ -1454,8 +1562,11 @@ mod change_scan;
 mod frontier;
 mod inc;
 mod par;
+mod seed_at_read;
+mod sky_columns;
 mod zone_read;
 
+use sky_columns::SkyColumns;
 use zone_read::CellSource;
 
 #[cfg(test)]
