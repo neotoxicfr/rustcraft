@@ -728,12 +728,12 @@ mod tests {
     #[test]
     fn family_shaders_are_valid_and_complete() {
         for (name, family, entries, prefixes) in FAMILIES {
-            // Terrain: source reduced to the default variant (`terrain_shader`, all the
-            // variants validated there).
-            let family = if *name == "terrain" {
-                crate::terrain_shader::terrain(crate::terrain_shader::ShaderOpts::NEW)
-            } else {
-                family.to_string()
+            // Terrain and clouds: source reduced to the default variant (`terrain_shader` and
+            // `sky`, all the variants validated there).
+            let family = match *name {
+                "terrain" => crate::terrain_shader::terrain(crate::terrain_shader::ShaderOpts::NEW),
+                "clouds" => crate::sky::SkyOpts::from_env().shader_source(),
+                _ => family.to_string(),
             };
             let module = validate(name, &format!("{family}\n{}\n{entries}", super::WGSL));
             for p in *prefixes {

@@ -1663,6 +1663,41 @@ Radius of the compact formats: bounded to 511 cells (10 signed bits); `cloudRang
 (test `cloud_range_fits_the_packed_radius`, which fails if the option's bound exceeds 383).
 Note: the End's box is not constant (its matrix follows the camera's rotation); skipping
 unchanged values writes it once as long as the view does not rotate.
+### Clouds: crossing off the main thread, indexed faces, packed constants (C3-M15, 07/11/2026, loaded-machine micro-benches)
+
+Crossing a 12-block cloud cell rebuilds the faces of the whole disk on the main thread (0.56 ms at
+range 128 on a quiet machine, 0.64 to 0.93 ms here). Benches: `cloud_bench` (CPU, 256 × 256 patchy
+map, range 128 below, 32 logical cores; "busy pool" = 8 tasks of 1 ms queued per thread of a
+32-thread pool when the faces are needed, 20 ms of rest between the 10 crossings so that sleeping
+threads go back to sleep) and `cloud_gpu_bench` (RTX 5080, 1600 × 900, range 128, GPU time of the
+clouds pass by timestamps, 800 frames per variant over 4 alternated rounds). Other agents were
+compiling: every figure is "loaded machine", to confirm on the scene bench.
+
+| Building block | Variant | Result (min / median / max over 10 crossings, or GPU median) | Decision |
+|---|---|---|---|
+| Speculation (`RUSTCRAFT_OPT_CLOUD_SPECULATIVE_BUILD`) | after each build, a background thread builds the cell the camera will enter (edge reached first along its motion in the cloud plane, +x neighbour when standing still: the drift); the crossing swaps two buffers, a miss builds in place | main thread at the crossing: 0.005 / 0.006 / 0.008 ms against 0.81 / 0.93 / 1.14 ms built in place (busy pool below normal) | **default**; RAM +1 to 2 face buffers (237 KB below, 404 KB inside at range 128), one more build per wrong guess (background) |
+| Own pool (`RUSTCRAFT_OPT_CLOUD_POOL`) | slices of the disk on a pool of its own, cores / 2 capped at 4 threads | busy pool below normal (as in the game): 2 threads 0.45 / 0.61 / 7.95 ms, 4 threads 0.41 / 1.39 / 8.27 ms; busy pool at normal priority: 2 threads 0.55 / 7.25 / 9.43, 4 threads 5.43 / 9.05 / 9.31; slices on the busy common pool 8.98 / 9.32 / 11.02 | **off by default** (`=1`): its sleeping threads wake up late under load (peaks of 8 ms against 1.1 ms on the main thread); only reached on a speculation miss; to re-measure on "flight" and "flight-clouds128" |
+| Indexed faces (`RUSTCRAFT_OPT_CLOUD_INDEXED_FACES`) | 4 vertices per face, shared 16-bit index list (16,384 faces per draw, base vertex = 4 × first face), face words read from storage by vertex number / 4; triangles 0-1-2 and 2-3-0 as before (own list: the terrain's list orders the second triangle 0-2-3) | below toward the sky: 0.0312 → 0.0088 ms (−72%; the old mesh 0.0101); above toward the ground: 0.0313 → 0.0091 ms. The instanced `face` format (6 vertices per 1-word instance) was 3× slower than the old mesh on the GPU | **default**; VRAM +192 KiB (index list, made at the first build) |
+| Packed constants (`RUSTCRAFT_OPT_PACKED_SHADER_CONSTANTS`) | cube corners as 3 bit masks (one per axis, bit direction × 4 + corner), shades by comparisons, quad corners 2 bits each, instead of 3 constant arrays copied and indexed per vertex (24 corners × 3 bits do not fit the 2 words the plan named) | instanced 0.0312 → 0.0310 ms, indexed 0.0088 → 0.0088 ms: noise on the RTX 5080; no array held by value and indexed in the cloud vertices any more (naga check) | **default** (local memory avoided, like `QUADBITS`); to re-measure on another GPU |
+| GPU construction | — | not done: ruled out by the plan (generalisation of the losing `cell` format, ×2.8 vertices) | — |
+
+Prediction: `next_cell` (cloud_builder.rs) picks the neighbour across the edge the camera reaches
+first; a change of side, radius or "fast" mode, a jump or another neighbour is a miss (built in
+place, then a new guess). Counters of the perf log: `c:cloud_builds_per_second`,
+`c:cloud_speculative_hits_per_second`, `c:us_cloud_build_per_frame` (time on the main thread).
+
+Proofs: `speculative_build_matches_a_direct_build` (1,000 crossings, 10 to 50% of misses asserted,
+through side, radius, mode, neighbour and jump changes; the buffer of each crossing equals the direct build word
+for word, with the own pool and by disk order, on the calling thread and by sweep; fails at crossing
+10 when a stale build of the same radius is accepted); `packed_clouds_render_like_the_mesh` (seven
+views, the seventh at range 128 needs at least 3 indexed draws; classic and improved transparency; six
+variants byte-identical to the old mesh; triangles wound the other way: 20,822 / 19,773 bytes
+differ; base vertex 0: 5,070 bytes differ on the seventh view); `cloud_shader_decodes_like_the_emulator`
+(both constant variants and the indexed corners, bit for bit; the inner-face reversal removed: vertex
+48 differs; one wrong mask bit: vertex 65 differs); `packed_shader_constants_match_the_cube_table`
+(CPU, without a GPU); `sky_buffers_match_the_old_path` (48-frame script, 9 switch combinations × 3
+formats). Scenes to measure: flight, flight-clouds128 (max and p99.9 frame, `c:us_cloud_build_per_frame`),
+plains12, plains32 (view toward the sky, GPU ms).
 ### UI upload, pre-resolved sprites, repeated background in the shader (C4-M14 + C3-M24, 24/10/2026, loaded-machine micro-bench)
 
 Bench `gui::tests_opt::gui_bench` (trial scene: pause background, list, 32 repeated strips, buttons,

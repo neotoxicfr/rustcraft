@@ -3,6 +3,8 @@
 
 use glam::{Mat3, Vec3};
 
+pub mod cloud_builder;
+
 /// The game's 48-bit linear congruential generator (identical to Java's linear congruential generator).
 pub struct JavaRandom(u64);
 
@@ -134,6 +136,17 @@ pub enum CloudSide {
     Above,
     Below,
     Inside,
+}
+
+/// Everything a cloud build depends on besides the map: center cell, side of the layer,
+/// radius of the disk, "fast" mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloudKey {
+    pub cx: i32,
+    pub cz: i32,
+    pub side: CloudSide,
+    pub radius: i32,
+    pub flat: bool,
 }
 
 /// Faces of the unit cube (§ 5.7), order down, up, north, south, west, east.
@@ -411,15 +424,32 @@ pub fn cloud_par<T: Copy + Send>(
     }
 }
 
+/// Corners of a face's two triangles, 0-1-2 then 2-3-0 (the order of [`cloud_mesh`]).
+pub const QUAD_TRIANGLES: [u16; 6] = [0, 1, 2, 2, 3, 0];
+
+/// Faces per indexed draw (`RUSTCRAFT_OPT_CLOUD_INDEXED_FACES`): their 4 corners each stay
+/// addressable by 16-bit indices.
+pub const FACES_PER_INDEXED_DRAW: u32 = 16_384;
+
+/// Index list shared by every indexed cloud draw: `triangles` repeated for each face, shifted by
+/// its 4 corners (192 KiB of 16-bit indices).
+pub fn indexed_face_list(triangles: [u16; 6]) -> Vec<u16> {
+    (0..FACES_PER_INDEXED_DRAW as u16).flat_map(|face| triangles.map(|corner| 4 * face + corner)).collect()
+}
+
 /// Vertex `v` (0 to 5, two triangles 0-1-2 and 2-3-0) of face `code` of cell (i, k):
 /// same computation as the shader (`cloud_corner` of sky.wgsl) and as [`cloud_mesh`].
 #[cfg(test)]
 pub fn face_vertex(i: i32, k: i32, code: u32, v: usize) -> [f32; 4] {
+    face_corner(i, k, code, usize::from(QUAD_TRIANGLES[v]))
+}
+
+/// Corner `corner` (0 to 3) of face `code` of cell (i, k), reversed for an inner face: what the
+/// indexed shader (`cloud_word_corner` of sky.wgsl) computes for vertex `4 × face + corner`.
+#[cfg(test)]
+pub fn face_corner(i: i32, k: i32, code: u32, corner: usize) -> [f32; 4] {
     let dir = (code & 7) as usize;
-    let mut q = [0, 1, 2, 2, 3, 0][v];
-    if code & FACE_INSIDE != 0 {
-        q = 3 - q;
-    }
+    let q = if code & FACE_INSIDE != 0 { 3 - corner } else { corner };
     let p = CLOUD_FACES[dir][q];
     let shade = if code & FACE_TOP != 0 { CLOUD_SHADE[1] } else { CLOUD_SHADE[dir] };
     [p[0] * 12.0 + 12.0 * i as f32, p[1] * 4.0, p[2] * 12.0 + 12.0 * k as f32, shade]
@@ -449,7 +479,9 @@ pub fn expand_cells(cells: &[[u32; 2]]) -> Vec<[f32; 4]> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[test]
@@ -488,7 +520,7 @@ mod tests {
     }
 
     /// Test map 64 × 64 (fixed seed), about half full, varied neighbors.
-    fn test_map() -> CloudMap {
+    pub(crate) fn test_map() -> CloudMap {
         let mut s = 0x2545_f491_4f6c_dd1du64;
         let mut rgba = vec![0u8; 64 * 64 * 4];
         for px in rgba.chunks_mut(4) {
@@ -554,10 +586,7 @@ mod tests {
                         assert!(expand_faces(&faces) == mesh, "parallel faces r{radius} ({cx},{cz}) {side:?} {flat}");
                         let cell_out = (&mut cells, &mut cell_parts);
                         cloud_par(cloud_cell_instances, &map, (cx, cz), &spiral, side, flat, cell_out);
-                        assert!(
-                            expand_cells(&cells) == mesh,
-                            "parallel cells r{radius} ({cx},{cz}) {side:?} {flat}"
-                        );
+                        assert!(expand_cells(&cells) == mesh, "parallel cells r{radius} ({cx},{cz}) {side:?} {flat}");
                     }
                 }
             }
@@ -570,14 +599,8 @@ mod tests {
         assert!(expand_faces(&faces) != mesh);
     }
 
-    /// Micro-bench (loaded machine possible):
-    /// `cargo test --release -p rc-app cloud_bench -- --ignored --nocapture`.
-    /// 256 × 256 map in 8 × 8 patches (≈ 45% full, irregular edges), range 128 and
-    /// 64 chunks, detailed (below, inside) and fast; build only (the buffer to send).
-    #[test]
-    #[ignore]
-    fn cloud_bench() {
-        use std::time::Instant;
+    /// Bench cloud image: 256 × 256 in 8 × 8 patches (≈ 45% full, irregular edges), RGBA.
+    pub(crate) fn patchy_map_rgba() -> Vec<u8> {
         let mut s = 0x1234_5678_9abc_def1u64;
         let mut rnd = || {
             s ^= s << 13;
@@ -593,7 +616,18 @@ mod tests {
                 rgba[(z * 256 + x) * 4 + 3] = if on { 255 } else { 0 };
             }
         }
-        let map = CloudMap::from_rgba(256, 256, &rgba);
+        rgba
+    }
+
+    /// Micro-bench (loaded machine possible):
+    /// `cargo test --release -p rc-app cloud_bench -- --ignored --nocapture`.
+    /// 256 × 256 map in 8 × 8 patches (≈ 45% full, irregular edges), range 128 and
+    /// 64 chunks, detailed (below, inside) and fast; build only (the buffer to send).
+    #[test]
+    #[ignore]
+    fn cloud_bench() {
+        use std::time::Instant;
+        let map = Arc::new(CloudMap::from_rgba(256, 256, &patchy_map_rgba()));
         let time = |f: &mut dyn FnMut()| {
             f();
             let mut best = f64::MAX;
@@ -656,40 +690,91 @@ mod tests {
                     t *= 2;
                 }
                 println!("{line}");
-                // Busy pool as in flight: 8 tasks of 1 ms per thread already queued (chunk meshes)
-                // when the main thread, outside the pool, starts the parallel build.
                 if range == 128 && side == CloudSide::Below && !flat {
-                    let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().expect("pool");
-                    let (mut par, mut parts) = (Vec::new(), Vec::new());
-                    let mut waits = Vec::new();
-                    for _ in 0..10 {
-                        for _ in 0..threads * 8 {
-                            pool.spawn(|| {
-                                let t = Instant::now();
-                                while t.elapsed().as_micros() < 1000 {
-                                    std::hint::spin_loop();
-                                }
-                            });
-                        }
-                        let t = Instant::now();
-                        pool.install(|| {
-                            cloud_par(cloud_faces, &map, (cx, cz), &spiral, side, flat, (&mut par, &mut parts))
-                        });
-                        waits.push(t.elapsed().as_secs_f64() * 1e3);
-                        // Drain before the next pass.
-                        std::thread::sleep(std::time::Duration::from_millis(20));
-                    }
-                    waits.sort_by(f64::total_cmp);
-                    println!(
-                        "    faces in parallel, busy pool ({threads} threads, {} tasks of 1 ms queued): min {:.3} / median {:.3} / max {:.3} ms",
-                        threads * 8,
-                        waits[0],
-                        waits[5],
-                        waits[9]
-                    );
+                    busy_pool_bench(&map, (cx, cz), radius, threads);
                 }
             }
         }
+    }
+
+    /// Busy pool as in flight: 8 tasks of 1 ms per thread already queued (chunk meshes) when the
+    /// main thread, outside the pool, needs the faces: built in slices on the busy common pool,
+    /// on the clouds' own pool (2 and 4 threads), on the main thread alone, or taken from the
+    /// speculation (min / median / max over 10 crossings). The busy pool runs at normal priority,
+    /// then below normal as the game's common pool does (`RUSTCRAFT_POOLPRIO`).
+    fn busy_pool_bench(map: &Arc<CloudMap>, center: (i32, i32), radius: i32, threads: usize) {
+        for lowered in [false, true] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .start_handler(move |_| {
+                    if lowered {
+                        crate::debug_sys::lower_thread_priority();
+                    }
+                })
+                .build()
+                .expect("pool");
+            println!("    busy pool at {} priority:", if lowered { "below normal (as in the game)" } else { "normal" });
+            busy_pool_placements(map, center, radius, &pool);
+        }
+    }
+
+    fn busy_pool_placements(map: &Arc<CloudMap>, (cx, cz): (i32, i32), radius: i32, pool: &rayon::ThreadPool) {
+        use std::time::{Duration, Instant};
+        let (side, flat) = (CloudSide::Below, false);
+        let spiral = &cloud_spiral(radius);
+        let threads = pool.current_num_threads();
+        let under_load = |label: &str, build: &mut dyn FnMut(usize)| {
+            let mut waits = Vec::new();
+            for pass in 0..10 {
+                for _ in 0..threads * 8 {
+                    pool.spawn(|| {
+                        let t = Instant::now();
+                        while t.elapsed().as_micros() < 1000 {
+                            std::hint::spin_loop();
+                        }
+                    });
+                }
+                let t = Instant::now();
+                build(pass);
+                waits.push(t.elapsed().as_secs_f64() * 1e3);
+                // Drain before the next pass.
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            waits.sort_by(f64::total_cmp);
+            println!(
+                "      {label} ({threads} threads, {} tasks of 1 ms queued): min {:.3} / median {:.3} / max {:.3} ms",
+                threads * 8,
+                waits[0],
+                waits[5],
+                waits[9]
+            );
+        };
+        let (mut out, mut parts) = (Vec::new(), Vec::new());
+        under_load("faces in slices on the busy pool", &mut |_| {
+            pool.install(|| cloud_par(cloud_faces, map, (cx, cz), spiral, side, flat, (&mut out, &mut parts)))
+        });
+        for own in [2, 4] {
+            let own_pool = rayon::ThreadPoolBuilder::new().num_threads(own).build().expect("pool");
+            under_load(&format!("faces on an own pool of {own} threads"), &mut |_| {
+                own_pool.install(|| cloud_par(cloud_faces, map, (cx, cz), spiral, side, flat, (&mut out, &mut parts)))
+            });
+        }
+        under_load("faces on the main thread alone", &mut |_| {
+            cloud_faces(map, cx, cz, CloudCells::Spiral(spiral), side, flat, &mut out)
+        });
+        // Speculation: each crossing finds the faces built ahead (the background thread had 20 ms).
+        let spiral = cloud_builder::Spiral::from(spiral.as_slice());
+        let mut builder = cloud_builder::FaceBuilder::new(cloud_builder::Speculation::start(Arc::clone(map)));
+        let main_thread = cloud_builder::ParallelBuild::CallingThread;
+        let key = |pass: usize| CloudKey { cx: cx + pass as i32, cz, side, radius, flat };
+        builder.build(map, key(0), Some(&spiral), key(1), &main_thread);
+        std::thread::sleep(Duration::from_millis(20));
+        under_load("faces taken from the speculation", &mut |pass| {
+            assert!(
+                builder.build(map, key(pass + 1), Some(&spiral), key(pass + 2), &main_thread),
+                "speculation missed"
+            );
+        });
     }
 
     /// Parallel build: the second pass at the same radius reuses the slice buffers
@@ -720,6 +805,30 @@ mod tests {
         let mut v = Vec::new();
         cloud_faces(map, cx, cz, CloudCells::Spiral(spiral), side, flat, &mut v);
         v
+    }
+
+    /// The packed constants of sky.wgsl are the cube table of this file: one bit per axis at
+    /// `direction * 4 + corner`, and the quad corners of the two triangles 2 bits each (checked
+    /// without a GPU; the GPU decoding itself: `cloud_shader_decodes_like_the_emulator`).
+    #[test]
+    fn packed_shader_constants_match_the_cube_table() {
+        let src = include_str!("sky.wgsl");
+        let constant = |name: &str| {
+            let line = src.lines().find(|l| l.starts_with(&format!("const {name}: u32 = "))).expect(name);
+            let hex = line.rsplit("0x").next().expect("hex").trim_end_matches(';').trim_end_matches('u');
+            u32::from_str_radix(hex, 16).expect("hex value")
+        };
+        for (axis, name) in ["CLOUD_CORNER_X", "CLOUD_CORNER_Y", "CLOUD_CORNER_Z"].into_iter().enumerate() {
+            let mut want = 0;
+            for (dir, corners) in CLOUD_FACES.iter().enumerate() {
+                for (corner, p) in corners.iter().enumerate() {
+                    want |= u32::from(p[axis] == 1.0) << (dir * 4 + corner);
+                }
+            }
+            assert_eq!(constant(name), want, "{name}: {want:#x}");
+        }
+        let quad = QUAD_TRIANGLES.iter().enumerate().fold(0, |acc, (v, &c)| acc | u32::from(c) << (2 * v));
+        assert_eq!(constant("CLOUD_QUAD_CORNERS"), quad, "CLOUD_QUAD_CORNERS: {quad:#x}");
     }
 
     #[test]
