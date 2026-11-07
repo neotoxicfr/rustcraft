@@ -502,7 +502,7 @@ impl Server {
             let v = saved.map(|c| if c.abs() < 0.003 { 0.0 } else { c });
             // Compared bit for bit: a saved -0.0 becomes 0.0 like the game's.
             if v.map(f64::to_bits) != saved.map(f64::to_bits) {
-                s.deco_edit(id, |n| nbtio::set(n, "Motion", super::dbl(v)));
+                s.deco_edit_at(i, |n| nbtio::set(n, "Motion", super::dbl(v)));
             }
             let mut t = std::mem::take(&mut s.deco.live[i].track);
             s.track_turned(&mut t, id, pos, v, on_ground, interval, rot);
@@ -588,7 +588,7 @@ impl Server {
         let changed = np != pos || landed != on_ground || motion != Some(vel);
         if changed {
             let fd = fall;
-            self.deco_edit(id, |n| {
+            self.deco_edit_at(i, |n| {
                 nbtio::set(n, "Pos", super::dbl(np));
                 nbtio::set(n, "Motion", super::dbl(vel));
                 nbtio::set(n, "OnGround", Nbt::Byte(i8::from(landed)));

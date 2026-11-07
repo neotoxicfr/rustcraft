@@ -6983,3 +6983,59 @@ former way (read once; `drops::DropSwitches`, `walk.rs`):
   SSE4.2). Gain: the 4 109 rounding calls and the 143 emulated bit counts above; cost: processors
   without SSE4.2 (before about 2008 for Intel, 2011 for AMD) could no longer start the game. Linux
   stays at plain x86-64 (its C library already picks an SSE4.1 `floor` at run time).
+## C5-M29: decorations, explosion without copying every compound, one lookup per tick (07/11, loaded machine)
+
+- Explosion pass over the decorations (`deco_explosion`): the former path copied every
+  decoration's compound (equipment, framed items) before any reach test, far ones included. Now
+  each compound is read in place (`deco_blast_effect`) and only one the blast breaks is copied
+  (armor stand smashed, something attached killed); `RUSTCRAFT_OPT_DECO_EXPLOSION_BORROW=0`
+  restores the copy. Micro-bench `decoration::switch_equivalence_tests::bench_explosion_among_decorations`
+  (64 blasts, 500 fixed frames holding items + 200 equipped armor stands, 2 runs of 2 passes): blast
+  out of reach of everything 323-394 us → 17-23 us; blast by a mob with `mob_griefing` off among
+  the frames (in reach, nothing broken) 436-452 us → 137-144 us. The distance is now tested before
+  the box (a painting's box reads its variant's size). Multi-core and GPU: not applicable (the hits
+  mutate the server in registry order).
+- Exposure only when the outcome reads it: an armor stand smashed and something attached killed
+  by an allowed hit are decided before the eye height and the rays cast towards the box (pure
+  reads, so the same events); only a decoration left standing or a refused hit casts them. Bench
+  `bench_explosion_breaking_everything` (ordinary blast, no author, breaking 40 frames holding
+  items + 20 equipped armor stands, rebuilt before each of 32 blasts, 3 passes): copy of every
+  compound 270-283 us per blast; read in place with the exposure first (former order) 272-274 us
+  (the rays dominate, the copies did not); exposure last 103-109 us. No switch of its own: the
+  order only skips work, and `RUSTCRAFT_OPT_DECO_EXPLOSION_BORROW=0` restores the former path.
+- One reach reckoning (`deco_blast_reach`, `deco_blast_exposure`, `deco_knockback_resistance`)
+  shared by the explosion and the wind burst (`deco_blast_push`), which had their own copy of
+  the distance, box, eye, direction and resistance. The explosion scene now ends with wind
+  bursts, so its stored fingerprint covers both (taken before the change, unchanged after).
+- Lookups by registry index (`RUSTCRAFT_OPT_DECO_SINGLE_LOOKUP`): the edit of a falling or pushed
+  armor stand, a mannequin's countdowns, a push from a blast and the survival check reach the
+  compound from the registry entry instead of walking the registry for the identifier (a walk per
+  edit: quadratic when many stands fall or are pushed at once). Remembered slot
+  (`RUSTCRAFT_OPT_DECO_SLOT_HINT`): each entry keeps the index of its compound in its chunk's
+  entity list, checked by identifier before use (a removal or a move shifts it: the list is then
+  scanned as before, no purge needed). Micro-bench `bench_decoration_ticks_with_falling_stands`
+  (500 frames + 100 armor stands falling, decoration walk alone, 40 ticks, 6 passes, very noisy):
+  old 150-215 us per tick, index alone 112-177, slot alone 132-217, both 110-152 (never above
+  old in a pass). Both kept on. Not taken: a cached position per entry (the lookups no longer
+  dominate once both leads are on, and it would need a refresh on every `Pos` write).
+- Wind burst bench `tests_l9combat::bench_wind_burst_decorations` (400 stands, 68 in reach), new
+  / old switches, 2 alternating passes: deco pass 585 / 455 then 447 / 533 us: within noise, the
+  visible part of the 68 boxes (403-533 us) dominates; the scan stays 16-18 us.
+- Blast pass over the still compounds (`blast_push_still`): the distance tested before the type
+  (`RUSTCRAFT_OPT_STILL_PUSH_DISTANCE_FIRST=0` restores the type first). Bench
+  `bench_still_push_distance_first` (2,000 markers + 500 frames, 200 calls, 2 runs of 2 passes):
+  nothing in reach 45-89 → 23-36 us; near a corner of the markers 50-81 → 26-41 us; among the
+  frames only (the case where the distance first does more work) 43-58 → 24-29 us. Kept on.
+- Minecart explosion pass: readability only (a minecart is taken out of the list only once in
+  reach), same order of calls.
+- Equivalence (A2): `explosion_paths_agree`, `tick_lookup_paths_agree`, `still_push_paths_agree`
+  run each scene in its own thread on every path (all old, all new, each lead alone) and compare
+  every event, the ground items and each chunk's encoded entity list, plus a stored fingerprint
+  (Windows). Seen failing on sabotage: reach taken as the radius (explosion), remembered slot used
+  without its identifier check (explosion and ticks), still reach halved (still pass), an
+  attached kill decided before the reach test (explosion), and for the lookups by index: survival
+  check always true, edit applied to the next entry (ticks), blast push given to the next entry
+  (explosion).
+- To measure on the quiet machine: scenes `tnt` and `dropped-items` (2 alternating passes, main
+  before the series and this branch with the four switches at 0).
+

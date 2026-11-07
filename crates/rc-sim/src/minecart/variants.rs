@@ -459,27 +459,27 @@ impl Server {
         if matches!(by, Some(Ent::Mob(_))) && !self.rule("minecraft:mob_griefing", true) {
             return;
         }
-        let double = f64::from(radius * 2.0);
+        let diameter = f64::from(radius * 2.0);
         for i in 0..self.carts.list.len() {
-            let Some(mut c) = self.carts.list[i].take() else { continue };
+            let Some(c) = &self.carts.list[i] else { continue };
             if c.removed || Some(c.id) == exclude {
-                self.carts.list[i] = Some(c);
                 continue;
             }
-            let d = [c.pos[0] - center[0], c.pos[1] - center[1], c.pos[2] - center[2]];
-            let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() / double;
+            let offset = [c.pos[0] - center[0], c.pos[1] - center[1], c.pos[2] - center[2]];
+            let dist = (offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]).sqrt() / diameter;
             if dist > 1.0 {
-                self.carts.list[i] = Some(c);
                 continue;
             }
+            // Taken out of the list while it is hurt (the hurt reads the server).
+            let Some(mut c) = self.carts.list[i].take() else { continue };
             let eye = c.pos[1] + f64::from(0.595f32);
             // A minecart at the centre is still hurt (zero push), like the game.
             let dir = crate::mobs::mth::normalize([c.pos[0] - center[0], eye - center[1], c.pos[2] - center[2]]);
             let exposure = f64::from(self.seen_percent(center, &c.bbox()));
-            let pow = (1.0 - dist) * exposure;
-            let dmg = ((pow * pow + pow) / 2.0 * 7.0 * double + 1.0) as f32;
-            self.cart_hurt(&mut c, ty, dmg, by);
-            c.vel = [c.vel[0] + dir[0] * pow, c.vel[1] + dir[1] * pow, c.vel[2] + dir[2] * pow];
+            let power = (1.0 - dist) * exposure;
+            let damage = ((power * power + power) / 2.0 * 7.0 * diameter + 1.0) as f32;
+            self.cart_hurt(&mut c, ty, damage, by);
+            c.vel = [c.vel[0] + dir[0] * power, c.vel[1] + dir[1] * power, c.vel[2] + dir[2] * power];
             c.needs_sync = true;
             self.carts.list[i] = Some(c);
         }
