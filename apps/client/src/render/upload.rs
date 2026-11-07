@@ -519,15 +519,14 @@ impl ChunkSizer {
 #[cfg(any(test, debug_assertions))]
 mod rules {
     use std::any::TypeId;
-    use std::collections::HashSet;
-    use std::hash::{Hash, Hasher};
+    use std::hash::Hash;
+
+    use hashbrown::HashSet;
 
     /// Identity of a buffer or texture that does not keep it alive (wgpu ids are never reused;
     /// the type keeps a buffer and a texture with the same id apart).
     fn key<T: Hash + 'static>(resource: &T) -> u64 {
-        let mut h = std::hash::DefaultHasher::new();
-        (TypeId::of::<T>(), resource).hash(&mut h);
-        h.finish()
+        crate::cache_key::fast_cache_key(&(TypeId::of::<T>(), resource))
     }
 
     #[derive(Default)]
