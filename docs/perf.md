@@ -7429,3 +7429,85 @@ loaded by other agents compiling.
   (`push_item_layer`, `prepare` sorts, NBT clones, rc-mesh `to_vec`) belong to their zones: a
   reused buffer beats any allocator setting.
 
+## C2-M10 (series 3): light zone read by row segments, changed cells found plane by plane (07/11, loaded machine)
+
+`crates/rc-light/src/fast.rs`, `fast/zone_read.rs` (new), `fast/change_scan.rs` (new),
+`fast/par.rs`, `fast/inc.rs`. Five switches read once with the other light switches
+(`RUSTCRAFT_OPT_<name>`, `=0`: old path). Bit for bit the old path, sheets and touched sections.
+- `LIGHTREADROWS` (on): the per-section zone read (`ZONEUNPACK`) copies row segments of consecutive
+  x instead of single cells. The source of a section's cell properties (single state, palette,
+  direct values, a few cells looked up) is chosen once and each copy loop is compiled for its source;
+  one start index per row instead of a zone index, a block index and five bounds checks per cell;
+  light nibbles unpacked two per byte; the palette properties live for the whole read (the old read
+  zeroed a 2 KB table per section; entries past the palette size are put back to zero, so even
+  malformed data reads alike). Same choice of source, same unpack calls in the same order.
+- `LIGHTREADFILL` (on, refines `LIGHTREADROWS`): uniform rows are filled: a single-state section,
+  rows outside the world or of an absent column, and the light sheets shared as uniform since C5-M06
+  (`rc_world::zero_layer` / `full_layer`: sky under the terrain, every unlit block sheet, open sky),
+  recognised by their address (two clones kept in a `OnceLock`: no reference count moves per read).
+- `LIGHTSCANPLANES` (on): the changed cells of a resolution are found plane by plane, row by row of
+  consecutive cells (the stack-by-stack scan jumped a whole plane between two cells); a row without a
+  change is settled by a branch-free test the compiler vectorises; the cells are then grouped by
+  stack with a counting sort over the stacks met (bitmap), in stack order and bottom to top: the same
+  lists, written in the same order, as before. Shared by the sequential write and `LIGHTGROUPS`.
+- `LIGHTWRITECOLUMN` (on): one sheet access (`layers_mut`: client stamp and copy check, server hash
+  lookup) per run of stacks of a column instead of one per stack; the incremental path (`inc.rs`,
+  off by default) now writes through the same function.
+- `LIGHTZEROONLYRING` (OFF): with `ZONEBUF`, kept zone buffers get only their sentinel ring zeroed
+  before a read (every read path writes all the other cells).
+
+The old `solve` of `lib.rs` keeps its per-stack sheet access: it only runs with every switch at 0
+(the old code by contract, and the reference of the equivalence tests); `reference.rs` is frozen.
+
+Micro-bench `bench_zone_io` (sky resolutions of the micro-bench world, µs per group, best of 7
+A B B A; LOADED machine), before C2-M10 → shipped:
+
+| trace | zone cells | read | write |
+|---|---|---|---|
+| plains | 42,875 | 89.4 → 47.6 (−47 %) | 18.0 → 6.4 (−64 %) |
+| torches | 42,875 | 99.3 → 49.5 (−50 %) | 18.0 → 6.4 (−64 %) |
+| cave | | 114.3 → 57.0 (−50 %) | 20.4 → 7.4 (−64 %) |
+| building | 53,280 | 119.8 → 57.9 (−52 %) | 23.1 → 5.5 (−76 %) |
+| slab | 142,500 | 247.5 → 160.5 (−35 %) | 71.0 → 41.8 (−41 %) |
+| spread | 43,476 | 128.7 → 72.4 (−44 %) | 23.3 → 10.6 (−55 %) |
+
+Each alone on "before": `LIGHTREADROWS` −35 to −46 % of the read, `LIGHTREADFILL` alone nothing (it
+needs the rows: −5 to −10 % more on top of them), `LIGHTSCANPLANES` −39 to −76 % of the write,
+`LIGHTWRITECOLUMN` within the noise (±1 %; the test world's hash map is cheap, the gain is the
+client's stamps and the server's lookups, to see on the scene bench). Whole relights, best of 7
+A B B A, before → shipped: plains −19 / −15 %, torches −21 / −22 %, cave −21 / −23 %, redstone
+(block resolutions of lamps) −35 / −34 %, building −22 / −28 %, water −23 / −22 %, slab −15 / −13 %,
+spread −24 / −20 % (two runs). Slab in pools (read in bands of 16 planes): 1 thread read 460 → 224 µs
+(−51 %), write 100 → 62 (−38 %); 32 threads read 273 → 231 (−15 %), write 105 → 69 (−34 %): the
+parallel read gains less, its bands are short of work once each row costs little.
+Trace replay (`benches/relight.rs`, integrated server traces, calling thread + light pool, criterion
+median, order A B B A, whole replay, work against `before_io` = the four on-switches off): surface
+559 / 506 ms against 681 / 699 ms (−18 %, −28 %, intervals disjoint); Nether (block only)
+292 / 241 against 492 / 313 ms (−41 %, −23 %; pass a of `before_io` 382–616 ms); synthetic
+230 / 332 against 265 / 316 ms (−13 %, +5 %: the machine slowed between the passes). The redstone
+trace is not on this machine.
+`LIGHTZEROONLYRING` (second run, machine twice as loaded): alone −2 to +15 %, against shipped −13 to
++17 % depending on the trace: nothing measurable, off by default until the quiet-machine bench (C6).
+Explicit SSE2 for the nibble unpack: not done, the scalar pair loop is what is left after the
+uniform sheets are filled (`LIGHTREADFILL` −5 to −10 % of the read bounds what any unpack could
+still gain). Multi-core plane scan: not done, the slab's whole write is 42 µs, under the cost of
+waking a pool. GPU: not applicable (C2-M11).
+
+Proofs: `zone_read_by_rows_matches_cell_by_cell` (600 random zones: odd origins, below and above the
+world, absent columns, partial rows; arrays compared cell for cell ring included, the new path on
+buffers kept from one zone to the next; the seven kinds of rows asserted met; parallel bands in a
+pool of 4), `plane_scan_finds_the_cells_of_the_stack_scan` (400 zones, 0 to 100 % changed, more
+than 100,000 cells), `column_kept_write_gives_the_same_sheets_and_sections_in_order` (sheet accesses
+counted), `each_zone_io_switch_alone_matches_old`, the random suites (`new_path_matches_old_bit_for_bit`,
+`real_tables_match_old`, `parallel_paths_match_old_with_1_and_32_threads`, `shipped_defaults_match_old`)
+now drawing the five bits; the test world now holds the shared uniform sheets, as the game does.
+Sabotages caught: a row starting on an odd cell reading the wrong nibble (40), the grouping losing
+its last stack (41), the ring left stale (42). Real traces (surface 409 relights, Nether 100) replayed
+with and without the switches = frozen reference, fingerprints known. The touched-section map draws
+its own hash seed per map, so its iteration order was never observable; the insertion order is kept
+anyway.
+To measure on the quiet machine: `scenes.py` cave, redstone, plains12 (relight ms/s, tick p99, light
+threads), 2 alternating passes against `main`; then `LIGHTREADROWS=0`, `LIGHTSCANPLANES=0`,
+`LIGHTWRITECOLUMN=0` and `LIGHTZEROONLYRING=1` one at a time; the relight trace bench A B B A
+(`work` against `before_io`).
+

@@ -215,9 +215,10 @@ fn bench_phases() {
     let base = bench_world(&t);
     // Sequential switches of C2-M03, then with those of C2-M02 (frontier seeding, step order),
     // then without one of the seeding switches; the list, then the list backwards.
-    let shipped = 0x7ff | 0xf << 14;
+    let shipped = 0x7ff | 0xf << 14 | ZONE_IO_BITS;
     let paths = [
         ("before C2-M02", 0x7ff),
+        ("shipped without C2-M10", shipped & !ZONE_IO_BITS),
         ("shipped", shipped),
         ("shipped without LIGHTSEEDROWS", shipped & !(1 << 16)),
         ("shipped without LIGHTMARGINFRONTIER", shipped & !(1 << 15)),
@@ -258,7 +259,7 @@ fn phases(t: &LightTables, base: &World, o: Opts) {
                         let t3 = std::time::Instant::now();
                         propagate(&c, &z, sky, lane, sg, 0, sg.size[1]);
                         let t4 = std::time::Instant::now();
-                        write(&mut world, sky, lane, sg, 0, sg.size[1], true, &mut out);
+                        write(&mut world, &c, sky, lane, sg, 0, sg.size[1], true, &mut out);
                         let t5 = std::time::Instant::now();
                         for (k, d) in [t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4].iter().enumerate() {
                             ns[k] += d.as_nanos();
@@ -467,6 +468,118 @@ fn bench_queue_entries() {
             }
         }
         assert!(sheets[0] == sheets[1], "{kind}: sheets differ");
+    }
+}
+
+/// µs per sky group of the zone read and of the write (changed cells found, then written),
+/// replaying `kind` from `world` with the switches `o` (the trace of [`phases`]).
+fn read_and_write_us(t: &LightTables, base: &World, world: &World, kind: &str, o: Opts) -> [f64; 2] {
+    let c = Ctx { height: H, t, o, count_queues: false };
+    let mut world = world.clone();
+    let (mut read_ns, mut write_ns, mut count) = (0u128, 0u128, 0usize);
+    for step in trace(base, kind) {
+        for undo in [false, true] {
+            let ps: Vec<[i32; 3]> = step.iter().map(|&(p, _)| p).collect();
+            for &(p, s) in &step {
+                set(&mut world, p, if undo { 0 } else { s });
+            }
+            for g in groups(&ps) {
+                let mut out = [Touched::new()];
+                with_work(true, |w| {
+                    let bg = block_zone(&c, &g);
+                    let (sg, _) = sky_zone(&world, &c, &mut w.aux, &g, bg);
+                    let t0 = std::time::Instant::now();
+                    read(&world, &c, w, sg, true, true);
+                    read_ns += t0.elapsed().as_nanos();
+                    let Work { face, prop, emit, sky, aux, lane, .. } = w;
+                    let z = Cells { face, prop, emit };
+                    seed(&world, &c, &z, sky, lane, Some(aux), None, sg, 0, sg.size[1], true);
+                    propagate(&c, &z, sky, lane, sg, 0, sg.size[1]);
+                    let t1 = std::time::Instant::now();
+                    write(&mut world, &c, sky, lane, sg, 0, sg.size[1], true, &mut out);
+                    write_ns += t1.elapsed().as_nanos();
+                });
+                count += 1;
+            }
+        }
+    }
+    [read_ns, write_ns].map(|ns| ns as f64 / 1000.0 / count as f64)
+}
+
+/// [`read_and_write_us`] of each path, best of `passes`, paths forward then backward on alternate
+/// passes (A B B A).
+fn best_read_write_abba(t: &LightTables, base: &World, world: &World, kind: &str, paths: &[Opts], passes: usize) -> Vec<[f64; 2]> {
+    let mut best = vec![[f64::MAX; 2]; paths.len()];
+    for pass in 0..passes {
+        let order: Vec<usize> = if pass % 2 == 0 { (0..paths.len()).collect() } else { (0..paths.len()).rev().collect() };
+        for k in order {
+            let [read_us, write_us] = read_and_write_us(t, base, world, kind, paths[k]);
+            best[k] = [best[k][0].min(read_us), best[k][1].min(write_us)];
+        }
+    }
+    best
+}
+
+/// C2-M10: zone read and write of the sky resolutions (µs per group) before C2-M10 (its four
+/// switches off), shipped, each switch alone on before and shipped without each, best of 7 A B B A;
+/// then whole relights before / shipped (µs per relight, best of 7) on every trace; then the slab
+/// (zones of 142,500 cells, read in parallel bands) in pools of 1, 2, 4… threads up to every core.
+/// `RUSTCRAFT_BENCH_KINDS=slab,cave` keeps some traces.
+#[test]
+#[ignore = "bench: cargo test --release -p rc-light bench_zone_io -- --ignored --nocapture"]
+fn bench_zone_io() {
+    let t = tables();
+    let base = bench_world(&t);
+    let shipped = Opts::from_bits(shipped_bits());
+    let before = Opts::from_bits(shipped_bits() & !ZONE_IO_BITS);
+    let mut paths = vec![("before C2-M10".to_string(), before), ("shipped".to_string(), shipped)];
+    for name in ["LIGHTREADROWS", "LIGHTREADFILL", "LIGHTSCANPLANES", "LIGHTWRITECOLUMN", "LIGHTZEROONLYRING"] {
+        paths.push((format!("{name} alone"), before.with(name, true)));
+        // A switch off by default is measured added to the shipped set, the others taken out of it.
+        let shipped_on = shipped.with(name, true) == shipped;
+        let label = if shipped_on { "shipped without" } else { "shipped with" };
+        paths.push((format!("{label} {name}"), shipped.with(name, !shipped_on)));
+    }
+    let opts: Vec<Opts> = paths.iter().map(|(_, o)| *o).collect();
+    let only = rc_data::env_str!("RUSTCRAFT_BENCH_KINDS");
+    let wanted = |kind: &str| only.is_none_or(|k| k.split(',').any(|x| x == kind));
+    for kind in ["plains", "torches", "cave", "building", "slab", "spread"].into_iter().filter(|k| wanted(k)) {
+        let world = start_world(&t, &base, kind);
+        let best = best_read_write_abba(&t, &base, &world, kind, &opts, 7);
+        let [read0, write0] = best[0];
+        for ((name, _), [read_us, write_us]) in paths.iter().zip(&best) {
+            eprintln!(
+                "{kind:9} {name:34} read {read_us:7.1} µs ({:+.1} %), write {write_us:6.1} µs ({:+.1} %)",
+                (read_us / read0 - 1.0) * 100.0,
+                (write_us / write0 - 1.0) * 100.0
+            );
+        }
+    }
+    for kind in ["plains", "torches", "cave", "redstone", "building", "water", "slab", "spread"].into_iter().filter(|k| wanted(k)) {
+        let world = start_world(&t, &base, kind);
+        let tr = trace(&base, kind);
+        let b = best_abba(&t, &world, &tr, &[before, shipped], kind == "redstone", 7);
+        eprintln!("{kind:9} relight: before {:9.1} µs, shipped {:9.1} µs ({:+.1} %)", b[0], b[1], (b[1] / b[0] - 1.0) * 100.0);
+    }
+    if wanted("slab") {
+        let world = start_world(&t, &base, "slab");
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let mut threads: Vec<usize> = std::iter::successors(Some(1), |n| Some(n * 2)).take_while(|&n| n <= cores).collect();
+        if threads.last() != Some(&cores) {
+            threads.push(cores);
+        }
+        for n in threads {
+            let b = super::pool(n).install(|| best_read_write_abba(&t, &base, &world, "slab", &opts[..2], 5));
+            eprintln!(
+                "slab      pool {n:2} threads: read before {:7.1} shipped {:7.1} µs ({:+.1} %), write before {:6.1} shipped {:6.1} µs ({:+.1} %)",
+                b[0][0],
+                b[1][0],
+                (b[1][0] / b[0][0] - 1.0) * 100.0,
+                b[0][1],
+                b[1][1],
+                (b[1][1] / b[0][1] - 1.0) * 100.0
+            );
+        }
     }
 }
 

@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
+use super::change_scan::Changes;
 use super::*;
 
 /// Zone cells (sky) below which sky and block stay one after the other; also the estimated
@@ -107,10 +108,10 @@ pub(super) fn join_group(
     let (go_b, db, ds) = pair(&*grid, c, &z, sky, lane, aux, blk, lane2, geo, r0b, nyb);
     let t0 = Instant::now();
     if go_b {
-        write(grid, blk, lane2, geo, r0b, nyb, sabotage(9), out);
+        write(grid, c, blk, lane2, geo, r0b, nyb, sabotage(9), out);
     }
     let t1 = Instant::now();
-    write(grid, sky, lane, geo, 0, ny, true, out);
+    write(grid, c, sky, lane, geo, 0, ny, true, out);
     count_solve(false, db + (t1 - t0));
     count_solve(true, ds + t1.elapsed());
 }
@@ -234,7 +235,7 @@ pub(super) fn read_par(grid: &impl LightGrid, c: &Ctx, w: &mut Work, g: Geo, wan
     let mut base = 0;
     while base < n {
         let k = band.min(n - base);
-        let b = Bufs {
+        let b = ZoneSlice {
             base,
             face: cut(&mut face, k),
             prop: cut(&mut prop, k),
@@ -470,34 +471,16 @@ impl Step<'_> {
     }
 }
 
-/// Changed cells of a resolution, stack by stack: (x, z, end in `cells`).
-#[derive(Default)]
-struct Changes {
-    cols: Vec<(i32, i32, usize)>,
-    cells: Vec<(i32, u8)>,
-}
-
-fn scan_all(lay: &[u8], level: &[u8], g: Geo, r0: i32, ny: i32) -> Changes {
+/// Changed cells of a resolution computed on `lane` (its levels), kept for a later write.
+fn scan_all(c: &Ctx, lay: &[u8], lane: &mut Lane, g: Geo, r0: i32, ny: i32) -> Changes {
     let mut ch = Changes::default();
-    for dz in 1..g.size[2] - 1 {
-        for dx in 1..g.size[0] - 1 {
-            let s = ch.cells.len();
-            scan_column(lay, level, g, r0, ny, dx, dz, &mut ch.cells);
-            if ch.cells.len() > s {
-                ch.cols.push((g.lo[0] + dx, g.lo[2] + dz, ch.cells.len()));
-            }
-        }
-    }
+    change_scan::find_changes(&c.o, lay, &lane.level, &mut lane.plane_scan, g, r0, ny, &mut ch);
     ch
 }
 
-fn apply(grid: &mut impl LightGrid, ch: &Changes, sky: bool, out: &mut [Touched]) {
+fn apply(grid: &mut impl LightGrid, c: &Ctx, ch: &Changes, sky: bool, out: &mut [Touched]) {
     let k = if sky { out.len() - 1 } else { 0 };
-    let mut s = 0;
-    for &(x, z, e) in &ch.cols {
-        apply_column(grid, x, z, &ch.cells[s..e], sky, &mut out[k]);
-        s = e;
-    }
+    change_scan::apply_changes(grid, &c.o, ch, sky, &mut out[k]);
 }
 
 /// Result of a group computed outside the grid: cells to write for the block and the sky.
@@ -520,7 +503,7 @@ fn record(grid: &impl LightGrid, c: &Ctx, w: &mut Work, cs: &[[i32; 3]], block: 
             let Work { face, prop, emit, blk, lane2, .. } = w;
             let z = Cells { face, prop, emit };
             if compute(grid, c, &z, blk, lane2, None, bg, 0, bg.size[1], false) {
-                rec.block = Some(scan_all(blk, &lane2.level, bg, 0, bg.size[1]));
+                rec.block = Some(scan_all(c, blk, lane2, bg, 0, bg.size[1]));
             }
             count_solve(false, t0.elapsed());
         }
@@ -540,9 +523,9 @@ fn record(grid: &impl LightGrid, c: &Ctx, w: &mut Work, cs: &[[i32; 3]], block: 
     if block && c.o.join && sg.cells() >= c.o.join_min {
         let (go_b, db, ds) = pair(grid, c, &z, lsky, lane, aux, blk, lane2, sg, r0b, nyb);
         let t0 = Instant::now();
-        rec.block = go_b.then(|| scan_all(blk, &lane2.level, sg, r0b, nyb));
+        rec.block = go_b.then(|| scan_all(c, blk, lane2, sg, r0b, nyb));
         let t1 = Instant::now();
-        rec.sky = Some(scan_all(lsky, &lane.level, sg, 0, ny));
+        rec.sky = Some(scan_all(c, lsky, lane, sg, 0, ny));
         count_solve(false, db + (t1 - t0));
         count_solve(true, ds + t1.elapsed());
         return rec;
@@ -550,13 +533,13 @@ fn record(grid: &impl LightGrid, c: &Ctx, w: &mut Work, cs: &[[i32; 3]], block: 
     if block {
         let t0 = Instant::now();
         if compute(grid, c, &z, blk, lane2, None, sg, r0b, nyb, false) {
-            rec.block = Some(scan_all(blk, &lane2.level, sg, r0b, nyb));
+            rec.block = Some(scan_all(c, blk, lane2, sg, r0b, nyb));
         }
         count_solve(false, t0.elapsed());
     }
     let t0 = Instant::now();
     compute(grid, c, &z, lsky, lane, Some(aux), sg, 0, ny, true);
-    rec.sky = Some(scan_all(lsky, &lane.level, sg, 0, ny));
+    rec.sky = Some(scan_all(c, lsky, lane, sg, 0, ny));
     count_solve(true, t0.elapsed());
     rec
 }
@@ -642,10 +625,10 @@ pub(super) fn run_groups(grid: &mut impl LightGrid, c: &Ctx, units: &[(Vec<[i32;
         });
         for r in &recs {
             if let Some(b) = &r.block {
-                apply(grid, b, false, out);
+                apply(grid, c, b, false, out);
             }
             if let Some(s) = &r.sky {
-                apply(grid, s, true, out);
+                apply(grid, c, s, true, out);
             }
         }
     }
