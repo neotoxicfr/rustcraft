@@ -71,7 +71,8 @@ struct Prepared<'a> {
 
 impl Server {
     /// Selected entities in the game's order, each candidate read from its record. `first_only`:
-    /// the caller only asks whether one matches (`execute if entity`).
+    /// the caller only asks whether one matches (`execute if entity`), and the list may then hold
+    /// the first match alone.
     pub(crate) fn select_resolved(&mut self, s: &Sel, src: &Src, first_only: bool) -> Vec<E> {
         if let Some(n) = &s.name {
             return if java_eq_ignore_case(n, &self.name) { vec![E::Player] } else { Vec::new() };

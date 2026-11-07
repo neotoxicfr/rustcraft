@@ -270,7 +270,7 @@ fn entity_by_uuid_matches_the_former_lookup() {
     check(&p, dead_uuid, "dead mob");
     assert_eq!(p.s.ent_by_uuid(dead_uuid), None, "a dead mob is not listed");
     // A marker given the UUID of a later zombie: the marker (smaller identifier) comes first.
-    let zombie = p.s.mobs.list.iter().filter(|m| m.alive()).last().expect("mob");
+    let zombie = p.s.mobs.list.iter().rfind(|m| m.alive()).expect("mob");
     let (zombie_id, zombie_uuid) = (zombie.id, zombie.uuid);
     let marker = p.s.all_ents().into_iter().find(|e| matches!(e, E::Other(_)) && p.s.ent_type(*e) == "minecraft:marker");
     let Some(E::Other(marker_id)) = marker else { panic!("test setup: no marker") };
@@ -334,6 +334,12 @@ fn kept_entity_index_follows_the_lists() {
     assert!(now.len() == all.len(), "{} markers, {} before", now.len(), all.len());
     assert_eq!(slots(&p, &now), scanned(&p, &now));
     assert_eq!(slots(&p, &all), scanned(&p, &all));
+    // Found by UUID after the kill, the moves and the summon (the UUID hint made before them).
+    for &id in &now {
+        let u = p.s.ent_uuid(E::Other(id));
+        assert_eq!(p.s.kept_index.find_uuid(&p.s.entities, u), super::kept_entity_index::scan_uuid(&p.s.entities, u));
+        assert_eq!(p.s.ent_by_uuid(u), Some(E::Other(id)), "marker {id} by UUID");
+    }
     // Every marker is still selected with its tags after the moves.
     let src = p.s.server_source();
     let tagged = p.s.select(&parse("@e[type=marker,tag=b]").expect("selector"), &src);

@@ -856,9 +856,11 @@ impl Server {
                 offer(id, E::Orb(id));
             }
         }
-        let has_uuid = |n: &Nbt| nbtio::uuid(n.get("UUID")) == Some(u);
-        for (id, n) in self.entities.values().flatten().chain(&self.mobs.end.snapshots) {
-            if has_uuid(n) {
+        if let Some(id) = self.kept_index.find_uuid(&self.entities, u) {
+            offer(id, E::Other(id));
+        }
+        for (id, n) in &self.mobs.end.snapshots {
+            if nbtio::uuid(n.get("UUID")) == Some(u) {
                 offer(*id, E::Other(*id));
             }
         }

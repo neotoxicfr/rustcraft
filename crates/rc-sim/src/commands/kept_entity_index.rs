@@ -34,9 +34,40 @@ pub(crate) struct KeptEntityIndex {
     slots: RefCell<hashbrown::HashMap<i32, (Chunk, u32)>>,
     /// Built from the lists and not caught out since (false: rebuild at the next read).
     fresh: Cell<bool>,
+    /// UUID → smallest identifier carrying it, made at the first lookup by UUID (most worlds
+    /// never ask, and reading every compound's UUID costs more than its slot); `None`: to make.
+    by_uuid: RefCell<Option<hashbrown::HashMap<u128, i32>>>,
 }
 
 impl KeptEntityIndex {
+    /// Smallest identifier of the kept compounds carrying UUID `u` (never 0): the score holder
+    /// named in every `scoreboard players … @s` message of a marker read every compound's UUID.
+    pub(crate) fn find_uuid(&self, lists: &Lists, u: u128) -> Option<i32> {
+        let found = if on() { self.find_uuid_hinted(lists, u) } else { scan_uuid(lists, u) };
+        #[cfg(test)]
+        if crate::mobs::index::verify() {
+            assert_eq!(found, scan_uuid(lists, u), "kept entity index: UUID {u:x} wrong");
+        }
+        found
+    }
+
+    fn find_uuid_hinted(&self, lists: &Lists, u: u128) -> Option<i32> {
+        let hint = self.by_uuid.borrow_mut().get_or_insert_with(|| uuid_map(lists)).get(&u).copied();
+        // Checked: the hinted compound is still there and still carries `u`. Compounds added
+        // since the map was made have larger identifiers (one counter), so it stays the smallest.
+        if let Some(id) = hint
+            && self.find(lists, id).is_some_and(|(c, k)| compound_uuid(&lists[&c][k].1) == Some(u))
+        {
+            return Some(id);
+        }
+        let found = scan_uuid(lists, u);
+        if found.is_some() {
+            // Added or changed behind the map's back: made again at the next lookup by UUID.
+            *self.by_uuid.borrow_mut() = None;
+        }
+        found
+    }
+
     /// Chunk and list index of kept compound `id`: the first one the scan of `lists` finds.
     pub(crate) fn find(&self, lists: &Lists, id: i32) -> Option<(Chunk, usize)> {
         let found = if on() { self.find_hinted(lists, id) } else { scan(lists, id) };
@@ -96,4 +127,23 @@ impl KeptEntityIndex {
 /// Old path (and test reference): the lists walked in the map's order.
 pub(crate) fn scan(lists: &Lists, id: i32) -> Option<(Chunk, usize)> {
     lists.iter().find_map(|(c, l)| l.iter().position(|(i, _)| *i == id).map(|k| (*c, k)))
+}
+
+/// Old path (and test reference): smallest identifier of the compounds carrying `u`.
+pub(crate) fn scan_uuid(lists: &Lists, u: u128) -> Option<i32> {
+    lists.values().flatten().filter(|(_, n)| compound_uuid(n) == Some(u)).map(|(id, _)| *id).min()
+}
+
+fn uuid_map(lists: &Lists) -> hashbrown::HashMap<u128, i32> {
+    let mut map = hashbrown::HashMap::new();
+    for (id, n) in lists.values().flatten() {
+        if let Some(u) = compound_uuid(n) {
+            map.entry(u).and_modify(|best: &mut i32| *best = (*best).min(*id)).or_insert(*id);
+        }
+    }
+    map
+}
+
+fn compound_uuid(n: &Nbt) -> Option<u128> {
+    crate::nbtio::uuid(n.get("UUID"))
 }

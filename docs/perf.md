@@ -7429,3 +7429,115 @@ loaded by other agents compiling.
   (`push_item_layer`, `prepare` sorts, NBT clones, rc-mesh `to_vec`) belong to their zones: a
   reused buffer beats any allocator setting.
 
+## C6-M13: selectors read candidates in place, entities found by index (07/11, loaded machine)
+
+Before: a selector listed every living entity by identifier (a `Vec`, then a sort), then each
+option looked the entity up again by that identifier: mobs by a walk of their list
+(`mob_ref_any`), kept compounds (markers, armor stands…) by a walk of every chunk list, ground
+items and orbs by a walk of theirs; the type test built a `String`, the tag test a `Vec` of every
+tag, the score test formatted the UUID once per objective; a nearest sort computed both distances
+at every comparison; `limit` with an arbitrary order still tested every entity; `execute if
+entity` before another step counted every match. A search was quadratic in the entities, and
+`execute as @e[type=zombie] at @s run … @e[distance=..2]` cubic. The lookup by UUID listed and
+sorted every entity again (`execute on origin`, a holder named by its UUID, and the holder named
+in every `scoreboard players … @s` message). Switches, default = new, `=0` = old:
+- `RUSTCRAFT_OPT_MOBINDEX` (existing): `mob_ref_any` (35 callers) is the indexed `Mobs::get`
+  (first slot carrying the identifier, dead mobs included, as the walk); `ent_by_uuid` looks
+  family by family (living mob by the UUID index, the smallest identifier when a UUID repeats;
+  ground items and orbs from the UUID's own form; kept compounds by the index below; End family
+  and minecarts by their short lists), the first of the former list (player, then the smallest
+  identifier, the earlier family on a tie); UUID 0 keeps the former lookup.
+- `RUSTCRAFT_OPT_KEPT_ENTITY_INDEX` (`commands/kept_entity_index.rs`): identifier → (chunk, slot)
+  hint of the kept compounds, checked at every read (slot holds the identifier), repaired from
+  the walk when it misses (missing entry inserted; shifted entry: one rebuild at the next read);
+  UUID → smallest identifier map made at the first lookup by UUID, checked the same way. Used by
+  `other`, `other_mut`, `kept_entity_slot` (refile, kill) and `ent_by_uuid`. With
+  `RUSTCRAFT_OPT_KILL_REWRITES_ONE_CHUNK` (C6-F03), a kill also removes the compound from its own
+  list only, instead of a `retain` over every list.
+- `RUSTCRAFT_OPT_SELECTOR_CANDIDATE_VIEW` (`commands/select_candidates.rs`): the walk of the lists
+  hands each candidate with its record (mob, item, orb, compound, minecart) and every option reads
+  it in place; per search, the type tag members and the translated default names are prepared
+  once; the distance is computed once and the stable sorts read it (same order as the former
+  stable sorts, and as the game's list sort); an arbitrary order stops at the limit (the game
+  collects until it); the holder name is formatted once per entity. The former search stays as
+  `select_reference`.
+- `RUSTCRAFT_OPT_SELECTOR_TYPE_FIRST` (with the view): `type=<id>` walks only that type's family
+  (the mobs of its species through the per-species index, the compounds and minecarts of that
+  identifier), then the same stable sort by identifier.
+- `RUSTCRAFT_OPT_EXECUTE_IF_ENTITY_FIRST_MATCH` (with the view): `execute if|unless entity`
+  before another step stops at the first match, except with `sort=random` (its shuffle draws on
+  the world's random once per match); the terminal form still counts every match. The game builds
+  the whole list in both forms; only the count is observable.
+Without switch (same result, unit-tested): the `execute` path of a step is split once for all its
+sources (was once per source); the command parser keeps a selector's once-only options in a
+32-bit set instead of a hash set (`GivenOptions`, client typing and server parse).
+
+Proof: in tests every search is compared with `select_reference` (random order: the matches
+before the shuffle), every UUID lookup with `ent_by_uuid_reference`, every kept compound and
+UUID lookup with the walk (the mob index already checks each read): the whole rc-sim suite runs
+both. `selector_equivalence_tests`: 1,500 selectors drawn from a fixed seed (types, tags with and
+without namespace, distances, boxes, sorts, limits, tags, teams, scores, names, rotations, NBT,
+game mode, level, inversions; `@e @a @p @r @n @s`) from drawn sources on a flat world of 1,000
+mixed entities (mobs of six species, one dead, markers, armor stands, ground items, orbs,
+minecarts, an End crystal, teams, two objectives): four path sets give the former list and leave
+the world's random where it left it (837 empty, 432 with several entities, 37 shuffled); whole
+`execute as … at @s if|unless entity … run …` chains, terminal forms (count stored, not compared)
+and random orders: same results, scores and random; UUID lookup: every entity, UUID 0, unknown,
+a dead mob, a UUID shared by a mob and a marker (smaller identifier) and by two mobs, the dead
+player; kept index after a kill (the stale hint seen and refused), moves to another chunk and a
+summon; UUID texts formatted once per entity. Sabotages (manual, reverted, `target/notes`):
+candidate order reversed, first match also with a random order, kept hint trusted unchecked, mob
+lookup one slot off, UUID lookup keeping the first family, terminal form without its count (first
+caught only once the count was stored: added), type first without kept compounds, two options
+sharing a bit: each fails its test.
+
+`bench_selectors.rs` (memstats build, µs per command / allocations per command, median of 5
+runs, loaded machine: timings spread by ±30 %, allocations exact). "old" = former search;
+indexes off = second process with `RUSTCRAFT_OPT_MOBINDEX=0 RUSTCRAFT_OPT_KEPT_ENTITY_INDEX=0`:
+
+| case | old, indexes off | old | candidate view | view + type first | all |
+|---|---|---|---|---|---|
+| `@e[type=zombie]`, 1,000 zombies | 846 / 1,027 | 77 / 1,027 | 26 / 35 | 31 / 35 | 30 / 35 |
+| `@e[type=zombie,tag=t1]`, 5,000 | 67,050 / 25,033 | 907 / 25,033 | 272 / 42 | 276 / 42 | 288 / 42 |
+| `@e[type=zombie,sort=nearest,limit=1]`, 5,000 | 580,283 / 5,043 | 3,032 / 5,043 | 224 / 54 | 224 / 54 | 230 / 54 |
+| `@e[type=zombie,limit=5]`, 5,000 | 53,551 / 5,032 | 252 / 5,032 | 23 / 33 | 30 / 33 | 29 / 33 |
+| `execute if entity …tag=t3] run …`, 5,000 | 60,852 / 25,062 | 827 / 25,062 | 190 / 71 | 200 / 71 | 30 / 62 |
+| `execute as @e[type=zombie] at @s run … @e[type=zombie,distance=..2]`, 1,000 | 1,299,708 / 1,321,186 | 67,572 / 1,321,186 | 25,203 / 324,126 | 26,342 / 324,126 | 26,446 / 324,126 |
+| same with `if entity @e[…,tag=t2] run …`, 1,000 | 1,399,624 / 5,118,250 | 119,247 / 5,106,250 | 18,424 / 106,974 | 20,798 / 106,974 | 9,922 / 105,258 |
+| mixed world (1,000 zombies, cows, markers): `@e[type=zombie]` | 3,990 / 3,029 | 217 / 3,029 | 93 / 37 | 44 / 35 | 42 / 35 |
+| mixed: `@e[type=cow,sort=nearest,limit=1]` | 30,429 / 3,042 | 505 / 3,042 | 103 / 50 | 59 / 48 | 59 / 48 |
+| mixed: `execute as @e[type=zombie,tag=t0] at @s if entity @e[type=cow,distance=..1] run …` | 1,634,418 / 786,607 | 64,460 / 783,107 | 28,644 / 26,357 | 16,799 / 25,855 | 11,833 / 25,611 |
+| 1,000 markers, `@e[tag=t1]` | 712 / 4,020 | 99 / 4,020 | 24 / 32 | 24 / 32 | 24 / 32 |
+| 1,000 ground items, `@e[distance=..2]` | 284 / 27 | 196 / 27 | 7 / 26 | 7 / 26 | 7 / 26 |
+| `execute as @e[type=marker] run scoreboard players add @s b 1`, 1,000 markers | 175,368 / 76,320 | 2,560 / 70,320 | 2,774 / 69,334 | 2,972 / 69,334 | 2,775 / 69,334 |
+
+The last row was 12,500 µs with the kept index before its UUID map (the holder named in the
+success message walked every compound's UUID: 10 µs per marker); `tag @s add q` on the same
+markers: 8,925 → 2,050 µs; with 100 markers each row is linear again (2.2 µs per marker).
+Type first costs 3 to 14 µs per search in a world of a single species (1,000 to 5,000 zombies:
+the per-species walk and the species lookup by name, 90 names) and halves the search in the
+mixed world: kept on, to settle on the scene. Datapack tick (`bench_datapack_tick`, perf pack, 2 alternated passes per
+side, this mission's four switches off against on; allocations per tick exact, µs within the
+noise of the loaded machine: the crowd alone, which runs no command, moved by 30 % between
+processes): `#tick` workload 38,377 → 33,355 allocations per tick (−13 %), with the 256 repeating
+command blocks 179,267 → 45,925 (−74 %).
+
+Leads noted, not taken: arguments pre-read with the kept parse of a line (a `OnceLock` per
+argument of the `Parsed` kept by C6-M12): `select::parse` costs 28 ns / 1 allocation for `@s`,
+164 ns / 9 for `@e[type=minecraft:marker,tag=src]`, 266 ns / 12 for a 59-character selector, 1 to
+8 % of a line run per source; +16 bytes per kept argument, and every caller of `p.arg` to move:
+for a later mission. A spatial index for `distance`/`dx` (the game asks its entity sections for
+the box): the view makes the walk cheap (7 to 25 µs for 1,000 entities), the quadratic case stays
+quadratic in the walk. Ground items and orbs by identifier (`@s` on an item walks the items:
+items merge, few). The UUID lookup of a mob still walks the kept compounds once when no compound
+carries it. Multi-core: not applicable (a search reads the server's state in order, `nbt=` and
+predicates are rare); GPU: not applicable. Memory: kept index ≈ 20 bytes per kept compound, UUID
+map ≈ 37 bytes per kept compound once a UUID is looked up (10,000 markers: ≈ 0.6 MB).
+
+Difference with the game, kept (reported, A3): `sort=random` shuffles with the world's random,
+drawing once per match from the level's sequence; the game shuffles with the JDK's own unseeded
+random and never touches the level's. The new paths keep exactly the former draws.
+
+To measure on the quiet machine: `datapack` scene, 2 alternated passes, every switch on against
+each at 0 (`RUSTCRAFT_OPT_SELECTOR_TYPE_FIRST=0` first), against the reference executable.
+

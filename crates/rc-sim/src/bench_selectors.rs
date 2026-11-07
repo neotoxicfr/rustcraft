@@ -140,6 +140,29 @@ fn bench_selectors_other_families() {
     }
 }
 
+/// A mixed world (1,000 zombies, 1,000 cows, 1,000 markers): where walking one type alone counts.
+#[test]
+#[ignore = "measurement bench"]
+fn bench_selectors_mixed_world() {
+    crate::mobs::index::set_verify(false);
+    let (mut p, dir) = world("bench-select-mixed", 1_000, "minecraft:zombie", "");
+    for (what, dz) in [("minecraft:cow", 0.25), ("minecraft:marker", 0.5)] {
+        for i in 0..1_000 {
+            let (x, z) = ((i % 128) as f64 / 2.0, (i / 128) as f64 / 2.0 - 16.0 + dz);
+            cmd(&mut p, &format!("summon {what} {x} -60 {z} {{NoAI:1b,Silent:1b,PersistenceRequired:1b,Tags:[\"t{}\"]}}", i % 4));
+        }
+    }
+    let cases = [
+        ("zombies", "execute if entity @e[type=minecraft:zombie]", 100),
+        ("markers_tag", "execute if entity @e[type=minecraft:marker,tag=t1]", 100),
+        ("cows_nearest", "execute positioned 16 -60 0 if entity @e[type=minecraft:cow,sort=nearest,limit=1]", 100),
+        ("not_cows_distance", "execute positioned 16 -60 0 if entity @e[type=!minecraft:cow,distance=..3]", 100),
+        ("zombies_quadratic", "execute as @e[type=minecraft:zombie,tag=t0] at @s if entity @e[type=minecraft:cow,distance=..1] run scoreboard players add @s b 1", 2),
+    ];
+    run_cases("select_mixed", &mut p, 3_000, &cases);
+    crate::tests_g3f13::finish(p, dir);
+}
+
 /// What re-reading a selector's text at every run costs (`select::parse` × 100,000): the figure
 /// behind pre-reading arguments with the kept parse of a line.
 #[test]
@@ -171,6 +194,8 @@ fn bench_selectors_markers_self() {
         let (mut p, dir) = world(&format!("bench-select-self-{n}"), n, "minecraft:marker", "");
         let cases = [
             ("as_score_self", "execute as @e[type=minecraft:marker] run scoreboard players add @s b 1", 10),
+            ("as_score_fixed", "execute as @e[type=minecraft:marker] run scoreboard players add #n b 1", 10),
+            ("as_tag_self", "execute as @e[type=minecraft:marker] run tag @s add q", 10),
             ("as_if_self", "execute as @e[type=minecraft:marker] if entity @s[tag=t1] run scoreboard players add #n b 1", 10),
         ];
         run_cases("select_markers_self", &mut p, n, &cases);
