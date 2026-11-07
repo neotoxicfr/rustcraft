@@ -7254,4 +7254,84 @@ quiet-machine scene bench: `combat-end`, `plains12` (empty tracking).
   swap) also restarts cooking in the game, not in our menu path; `data merge block` sends a block
   entity packet for every type (the game only for types with an update packet); the loot of a
   furnace broken by a player reads its stale NBT (only a datapack slot range would see it).
+## C3-M21: entity angles and animations without the C library (06/11, loaded machine)
+
+Profiles of crowd-1000 (series 3 hot map): `push_entity` 22.7% self of the process, calling
+`fmodf` 7%, `sinf` 7%, `part_matrix` 9%; `alloc::fmt::format` 12% of the animal animations;
+`known_id` 0.57%; `dragon_effects` 0.87%; `roundf` 2% of `part_matrix`, 46% of the animated
+texture blend; `powf` 11% of the first-person hand. Every switch is read once (`EntOpt` at engine
+creation, copied per frame into the animation paths of the thread; the two global ones by
+`opt_switch!`).
+
+- Angle folds (`rc_data::java_math`, shared): `RUSTCRAFT_OPT_ANGLE_WRAP_FAST_PATH` (on): below
+  one turn the remainder is the operand, no call; `RUSTCRAFT_OPT_ANGLE_WRAP_STERBENZ` (off): one
+  exact subtraction from one to two turns, kept off (no measured need: per-tick yaw differences
+  and head minus body stay under a turn). Proof: every float (2^32) through each path equals the
+  library remainder by 360, 2π and 1 (ignored test, 40 s on 32 threads; one float in 61 each run).
+  10^6 values, 1 thread / 32 threads, ms:
+
+| Fold | Library | Fast path | Fast path + Sterbenz |
+|---|---|---|---|
+| wrap degrees (2% beyond a turn) | 6.56 / 18.3 | 1.03 / 3.76 | 0.90 / 3.36 |
+| radian fold | 6.54 / 18.5 (remainder) | 0.79 / 3.48 (game loops) | — |
+| texture scroll fraction | 9.78 / 29.8 | 1.30 / 5.02 | — |
+
+  Fidelity: the old radian fold of the humanoid swim and drowned arms (remainder, then one turn)
+  differs from the game's loops on 103,478,446 floats of [2π, 1024[ (identical below one turn,
+  the only range animations hand over); one function kept, the game's. Riptide boxes: the game's
+  fold (the old shift by 180 around a Euclidean remainder could round differently); armor stand
+  poses: the game's truncated remainder (negative angles were turned positive).
+- `RUSTCRAFT_OPT_SHARED_BODY_ANGLE`: body yaw handed to the family rotations (they redid it)
+  and the cat/fox/panda base rotation built only for them (it cost a sine and a cosine per living
+  entity). `RUSTCRAFT_OPT_SKIP_IDENTITY_ROOT_FACTORS`: Ry(−0) and scales of 1 not multiplied
+  (exact up to the sign of zeros). `RUSTCRAFT_OPT_DRAGON_EFFECTS_GATE`: dragon effects called
+  for the dragon only. All three bit-identical (golden snapshot under each alone and off).
+- `RUSTCRAFT_OPT_ANIMATION_SINE_TABLE` (fidelity, A3): about 250 sites of the model animations
+  and entity renders used the C library's sine where the game reads its table (up to ≈ 10^-4 rad
+  apart). Each site checked in the game's code; the handful that take the library sine in double
+  precision do so here too (shaking, piglin and dragon heads, ravager stun, boat bubbles,
+  warden tendrils, allay root, panda shaking), and the gliding avatar's view vector follows the
+  game (head yaw, the sine table, the float 1e-5 threshold). Golden fingerprints: library sine
+  0x7f87d9a97d93dba3 (unchanged: every other path moves no bit), table 0xe50f7c48fa189cc8; cow
+  and zombie walk angles equal the game's formulas. The golden scene does not reach the
+  double-precision sites, the glide nor the axolotl's swim and rest: each has its own
+  bit-for-bit test against the game's expression, which fails when the site is put back
+  (shaking, ravager, dragon jaw, piglin ears, boat tilt, swimming legs' third, glide head yaw and
+  threshold, axolotl table sine; all seven failed on a combined sabotage). Dividing the glide's
+  dot product by both lengths instead of normalising first changed no float angle in 2,000
+  random cases (kept the game's order anyway).
+- `RUSTCRAFT_OPT_KNOWN_PART_NAMES`: 168 part names indexed at baking (36 before), lookups
+  inlined so a literal folds to one load (`part-lookup-not-inlined` feature: the other exe for the
+  A/B of the inlining, not measured yet). `RUSTCRAFT_OPT_KEYFRAME_STATIC_NAMES`: literal names
+  instead of `format!` (camel up to 6 per frame, rabbit, armadillo, breeze, warden); identical
+  poses over 300 frames.
+- `RUSTCRAFT_OPT_ROUND_BY_TRUNCATION`: quarter turn of the rendering sine and animated texture
+  channels rounded by truncation (exact: halves away from zero; a rounding to even through the
+  1.5·2^23 shift moved bits, halved right angles being exact half quarters).
+  `RUSTCRAFT_OPT_EAT_POWER_BY_MULTIPLICATION`: the first-person eating jiggle's power 27 by
+  multiplications instead of the library power (equal on every float of [0, 2[). The power
+  itself is now taken in double precision like the game (fidelity fix, A3, not behind the
+  switch: `=0` keeps the double, the old single-precision power is gone).
+- `RUSTCRAFT_OPT_POLY_ROTATIONS` (rendering tolerance): root and family rotations through the
+  rendering polynomials after an exact fold in degrees; within 2e-6 of the double rotation up to
+  ±10^5°, every matrix of the golden scene within 4.7e-6, fingerprint 0x0ffcde8742133a49.
+- `bench_entity_prepare` (median, loaded machine, 2 passes), µs:
+
+| Entities | everything | the 7 animation switches off (`POLY_ROTATIONS` included) | known part names off |
+|---|---|---|---|
+| 100 | 135.8 / 144.8 | 151.9 / 158.3 | 142.3 / 142.1 |
+| 1,000 | 1,493 / 1,447 | 1,666 / 1,598 | 1,563 / 1,524 |
+
+  The gain of `KNOWN_PART_NAMES` alone is not established: about 4-5% at 1,000 entities, but the
+  second pass at 100 entities is slower with every switch on (144.8 µs) than with this one off
+  (142.1 µs); to confirm on the quiet machine.
+  The 5,000-entity runs varied by ±40% between passes (other agents compiling): not used. The
+  other switches alone and the two global ones stay within the noise (±3%). Not done: the angle
+  differences per tick (the fast path leaves three comparisons), keyframe channel indexes resolved
+  at install, the per-family kind flag, the first-person hand's sine table (22 sites), the
+  guardian eye's view vector, the 4-leg SIMD (dropped by the mission).
+- To measure on the quiet machine: crowd-1000, crowd, village, mobs-keyframes,
+  equipped-humanoids, plains12, plains32 (2 passes, old exe as reference; the inlining A/B with
+  a `--features part-lookup-not-inlined` exe); captures 1600×900 of crowd and crowd-1000 in one
+  run (`RUSTCRAFT_OPT_ANIMATION_SINE_TABLE=0` against the default, `POLY_ROTATIONS=0` likewise).
 

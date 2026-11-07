@@ -66,19 +66,45 @@ impl SpriteAnim {
         let next = pick(self.steps[(self.step + 1) % self.steps.len()].0).filter(|n| n.rgba.len() == cur.rgba.len())?;
         // Share of the next one truncated to the thousandth, like the game.
         let p = ((self.sub as f32 / time as f32) * 1000.0) as u32 as f32 / 1000.0;
+        let by_truncation = rc_data::opt_switch!("RUSTCRAFT_OPT_ROUND_BY_TRUNCATION");
         let rgba = cur
             .rgba
             .iter()
             .zip(&next.rgba)
-            .map(|(&a, &b)| (f32::from(a) + (f32::from(b) - f32::from(a)) * p).round() as u8)
+            .map(|(&a, &b)| round_channel(f32::from(a) + (f32::from(b) - f32::from(a)) * p, by_truncation))
             .collect();
         Some(Image { width: cur.width, height: cur.height, rgba })
+    }
+}
+
+/// `v.round() as u8` of a blended channel. `by_truncation`: for a value of [0, 255.5[ the
+/// truncation is one instruction and the fraction it leaves is exact, where the library
+/// rounding is a call per channel (`RUSTCRAFT_OPT_ROUND_BY_TRUNCATION=0`: the library, the old path).
+fn round_channel(v: f32, by_truncation: bool) -> u8 {
+    if by_truncation && (0.0..255.5).contains(&v) {
+        let whole = v as u32;
+        (whole + u32::from(v - whole as f32 >= 0.5)) as u8
+    } else {
+        v.round() as u8
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every float (2^32): the channel rounded through the truncation is the library's.
+    /// Sabotage: a sum with one half then a truncation (wrong at 0.49999997) is caught.
+    #[test]
+    fn channel_rounding_matches_library_on_every_float() {
+        use rayon::prelude::*;
+        let first_mismatch = |f: &(dyn Fn(f32) -> u8 + Sync)| {
+            (0..=u32::MAX).into_par_iter().map(f32::from_bits).find_any(|&v| f(v) != v.round() as u8)
+        };
+        assert_eq!(first_mismatch(&|v| round_channel(v, true)), None);
+        let half_sum = |v: f32| if (0.0..255.5).contains(&v) { (v + 0.5) as u8 } else { v.round() as u8 };
+        assert!(first_mismatch(&half_sum).is_some(), "sabotage not detected");
+    }
 
     fn px(v: u8) -> Vec<Image> {
         vec![Image { width: 1, height: 1, rgba: vec![v, v, v, 255] }]

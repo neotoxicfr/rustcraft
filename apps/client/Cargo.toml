@@ -14,6 +14,9 @@ path = "src/main.rs"
 [features]
 # Counter of live bytes on the heap (memory measurements only).
 memstats = []
+# Part lookups of the entity animations left to the compiler's inlining choice: the reference
+# executable of the A/B of the forced inlining (benches only).
+part-lookup-not-inlined = []
 
 [dependencies]
 hashbrown = { workspace = true }

@@ -436,7 +436,8 @@ pub(super) fn tick(e: &mut Entity) {
     let mult = (e.extra[4] + if bubbles { 0.05 } else { -0.1 }).clamp(0.0, 1.0);
     e.extra[4] = mult;
     e.extra[6] = e.extra[5];
-    e.extra[5] = 10.0 * (0.5 * e.age as f32).sin() * mult;
+    // Library sine of the tick count times one half, in double precision, like the game.
+    e.extra[5] = 10.0 * (0.5 * f64::from(e.age)).sin() as f32 * mult;
 }
 
 /// Packed light (block × 16 | sky × 16 << 8).
@@ -525,7 +526,7 @@ pub(super) fn ominous_spawner_pose(age: f32) -> Mat4 {
 /// Light and overlay words of the wind charge: flags "no cardinal lighting" and
 /// "scrolling", offset u = age × 0.03 (fraction, in 1/65535) in the overlay word.
 fn wind_charge_scroll(light: u32, age: f32) -> (u32, u32) {
-    let u = (age * 0.03 % 1.0).rem_euclid(1.0);
+    let u = rc_data::java_math::euclid_remainder_by_one(age * 0.03);
     (light | super::LIGHT_FLAT | super::LIGHT_SCROLL, (u * 65535.0) as u32)
 }
 
@@ -552,7 +553,7 @@ fn hurt_shake(e: &Entity, pt: f32) -> Mat4 {
     }
     let d = (meta_float(e, 10).unwrap_or(0.0) - pt).max(0.0);
     let dir = e.meta_int(9).unwrap_or(1) as f32;
-    Mat4::from_rotation_x(deg(h.sin() * h * d / 10.0 * dir))
+    Mat4::from_rotation_x(deg(table_sin(h) * h * d / 10.0 * dir))
 }
 
 /// Swelling and blinking of TNT (§ 4.1) for f = fuse − pt + 1.
@@ -569,7 +570,7 @@ pub(super) fn crystal_time(e: &Entity, pt: f32) -> f32 {
 
 /// Height of the floating crystal (§ 7.2), in blocks.
 pub(super) fn crystal_height(a: f32) -> f32 {
-    let h = (0.2 * a).sin() / 2.0 + 0.5;
+    let h = table_sin(0.2 * a) / 2.0 + 0.5;
     (h * h + h) * 0.4 - 1.4
 }
 
@@ -813,9 +814,9 @@ impl EntityRenderer {
             "shulker_bullet" => {
                 let m = t
                     * Mat4::from_translation(Vec3::new(0.0, 0.15, 0.0))
-                    * Mat4::from_rotation_y(deg((0.1 * age).sin() * 180.0))
-                    * Mat4::from_rotation_x(deg((0.1 * age).cos() * 180.0))
-                    * Mat4::from_rotation_z(deg((0.15 * age).sin() * 360.0))
+                    * Mat4::from_rotation_y(deg(table_sin(0.1 * age) * 180.0))
+                    * Mat4::from_rotation_x(deg(table_cos(0.1 * age) * 180.0))
+                    * Mat4::from_rotation_z(deg(table_sin(0.15 * age) * 360.0))
                     * Mat4::from_scale(Vec3::new(-0.5, -0.5, 0.5));
                 // Single part oriented by the entity's interpolated yaw and pitch.
                 let (yaw, pitch) = shulker_bullet_angles(e, pt);
@@ -1632,8 +1633,8 @@ impl EntityRenderer {
             for (side, name) in ["left_paddle", "right_paddle"].into_iter().enumerate() {
                 let t = if active[side] { paddles[side] - PI / 8.0 + pt * PI / 8.0 } else { 0.0 };
                 let lerp = |f: f32, a: f32, b: f32| a + f.clamp(0.0, 1.0) * (b - a);
-                let xr = lerp(((-t).sin() + 1.0) / 2.0, -PI / 3.0, -PI / 12.0);
-                let mut yr = lerp(((-t + 1.0).sin() + 1.0) / 2.0, -PI / 4.0, PI / 4.0);
+                let xr = lerp((table_sin(-t) + 1.0) / 2.0, -PI / 3.0, -PI / 12.0);
+                let mut yr = lerp((table_sin(-t + 1.0) + 1.0) / 2.0, -PI / 4.0, PI / 4.0);
                 if side == 1 {
                     yr = PI - yr;
                 }
@@ -2227,7 +2228,7 @@ fn guardian_beam_quads(m: Mat4, d: Vec3, time: f32, scale: f32, rect: [f32; 4], 
     let (ex, ez) = at(0.0, 0.2);
     let (nx, nz) = at(PI / 2.0, 0.2);
     let (sx, sz) = at(PI * 3.0 / 2.0, 0.2);
-    let tex_v_off = time * 0.5 % 1.0;
+    let tex_v_off = rc_data::java_math::remainder_by_one(time * 0.5);
     let min_v = -1.0 + tex_v_off;
     let max_v = min_v + len * 2.5;
     let vert = |x: f32, y: f32, z: f32, u: f32, v: f32| FreeVertex {

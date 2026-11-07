@@ -18,6 +18,8 @@
 
 use std::f32::consts::TAU;
 
+// Angles in degrees brought into [−180, 180) (float and double: the game folds both).
+use rc_data::java_math::{wrap_degrees as wrap, wrap_degrees_f64 as wrap64};
 use rc_physics::{cos_t, sin_t};
 
 use super::*;
@@ -52,29 +54,6 @@ pub(super) fn layers(
 
 pub(super) fn skin(_r: &EntityRenderer, e: &Entity) -> Option<u32> {
     (e.kind == KIND).then_some(0)
-}
-
-/// Angle in degrees brought into [−180, 180).
-fn wrap(a: f32) -> f32 {
-    let a = a % 360.0;
-    if a >= 180.0 {
-        a - 360.0
-    } else if a < -180.0 {
-        a + 360.0
-    } else {
-        a
-    }
-}
-
-fn wrap64(a: f64) -> f64 {
-    let a = a % 360.0;
-    if a >= 180.0 {
-        a - 360.0
-    } else if a < -180.0 {
-        a + 360.0
-    } else {
-        a
-    }
 }
 
 /// Dying: the history and the wing flap are frozen.
@@ -158,8 +137,8 @@ pub(super) fn animate(p: &mut Pose<'_>, e: &Entity, _s: &AnimState, pt: f32) -> 
     }
     let flap = e.extra[2] + pt * (e.extra[1] - e.extra[2]);
     let phi = flap * 2.0 * PI;
-    p.set("jaw", |x| x[3] = (phi.sin() + 1.0) * 0.2);
-    let b = (phi - 1.0).sin() + 1.0;
+    p.set("jaw", |x| x[3] = (table_sin(phi) + 1.0) * 0.2);
+    let b = table_sin(phi - 1.0) + 1.0;
     let b = (b * b + 2.0 * b) * 0.05;
     let root = |x: &mut [f32; 9]| {
         x[1] = (b - 2.0) * 16.0;
@@ -182,12 +161,12 @@ pub(super) fn animate(p: &mut Pose<'_>, e: &Entity, _s: &AnimState, pt: f32) -> 
     for (i, name) in NECK.iter().enumerate() {
         let q = sample(e, 5 - i, pt);
         let yr = wrap(q.1 - s.1) * DEG * 1.5;
-        let xr = (0.45 * i as f32 + phi).cos() * 0.15 + head_offset(e, i, s, q) as f32 * DEG * 7.5;
+        let xr = table_cos(0.45 * i as f32 + phi) * 0.15 + head_offset(e, i, s, q) as f32 * DEG * 7.5;
         let zr = -wrap(q.1 - r) * DEG * 1.5;
         p.set(name, |n| *n = [x, y, z, xr, yr, zr, n[6], n[7], n[8]]);
-        x -= yr.sin() * xr.cos() * 10.0;
-        y += xr.sin() * 10.0;
-        z -= yr.cos() * xr.cos() * 10.0;
+        x -= table_sin(yr) * table_cos(xr) * 10.0;
+        y += table_sin(xr) * 10.0;
+        z -= table_cos(yr) * table_cos(xr) * 10.0;
     }
 
     // Head.
@@ -200,9 +179,9 @@ pub(super) fn animate(p: &mut Pose<'_>, e: &Entity, _s: &AnimState, pt: f32) -> 
     p.set("body", |x| x[5] = -r2 * 1.5 * DEG);
 
     // Wings.
-    let wx = 0.125 - phi.cos() * 0.2;
-    let wz = -(phi.sin() + 0.125) * 0.8;
-    let tip = ((phi + 2.0).sin() + 0.5) * 0.75;
+    let wx = 0.125 - table_cos(phi) * 0.2;
+    let wz = -(table_sin(phi) + 0.125) * 0.8;
+    let tip = (table_sin(phi + 2.0) + 0.5) * 0.75;
     p.set("left_wing", |w| {
         w[3] = wx;
         w[4] = -0.25;
@@ -243,14 +222,14 @@ pub(super) fn animate(p: &mut Pose<'_>, e: &Entity, _s: &AnimState, pt: f32) -> 
     let mut t = 0.0f32;
     for (i, name) in TAIL.iter().enumerate() {
         let q = sample(e, 12 + i, pt);
-        t += (0.45 * i as f32 + phi).sin() * 0.05;
+        t += table_sin(0.45 * i as f32 + phi) * 0.05;
         let yr = (wrap(q.1 - s.1) * 1.5 + 180.0) * DEG;
         let xr = t + (q.0 - s.0) as f32 * DEG * 7.5;
         let zr = wrap(q.1 - r) * DEG * 1.5;
         p.set(name, |n| *n = [x, y, z, xr, yr, zr, n[6], n[7], n[8]]);
-        y += xr.sin() * 10.0;
-        z -= yr.cos() * xr.cos() * 10.0;
-        x -= yr.sin() * xr.cos() * 10.0;
+        y += table_sin(xr) * 10.0;
+        z -= table_cos(yr) * table_cos(xr) * 10.0;
+        x -= table_sin(yr) * table_cos(xr) * 10.0;
     }
     true
 }
