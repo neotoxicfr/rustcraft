@@ -41,8 +41,9 @@ pub(crate) struct ProjectilePaths {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum Sabotage {
     None,
-    /// After a dimension change during its tick, the projectile's slot keeps no stack nor data.
-    ShellLeftInParkedList,
+    /// After a dimension change during its tick, the projectile's slot does not get the result of
+    /// the tick (on the new path it also keeps no stack nor data).
+    SlotNotWrittenBackAfterListChange,
     /// The nearest target is the last one met at equal distance instead of the first.
     LastTargetAtEqualDistance,
 }

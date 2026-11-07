@@ -7444,8 +7444,12 @@ fruit searched the block's name in the whole block list at every cell of its des
   the slot keeps a light copy (no heap data) for the others to read, as they read the full copy
   before. Guard: when a dimension change during the tick replaced the list (a function reward of an
   advancement can `tp` the player away in the middle of an arrow's hit), the slot is found by
-  identifier in the active or parked lists and gets its heavy fields back (its save and pairing
-  need them); the rest of the slot stays as before the tick, as on the old path.
+  identifier in the active or parked lists and gets the whole result of the tick, its tracking
+  (cleared by the dimension change) and a removal by another kept. This is also a fidelity fix,
+  on both paths: the old path dropped the tick's result there (the arrow that hit the target
+  block flew on, pre-hit, in the parked world), and a first version of the guard gave back only
+  the heavy fields (entity data of after the tick, in-ground and critical flags of before: the
+  pairing on return sent "in ground" for an arrow the server simulated in flight).
 - `RUSTCRAFT_OPT_PROJECTILE_BORROWED_SHAPES`: block clip, stuck test and the bobber's collision test
   borrow the cell's shape (`with_collision_shape`). Separate from C6-M04's
   `RUSTCRAFT_OPT_SIGHTLINE_BORROWED_SHAPES` so that each is measured alone.
@@ -7471,8 +7475,10 @@ a witch throwing potions, arrows stuck in wooden buttons, pressure plates, slabs
 and spectral arrows, a piercing arrow through pigs, a loyal trident, a large fireball sent back,
 rain, 3,000 ticks, 452,999 trace lines: every projectile each tick, every event, saved compounds)
 identical on the old path, each new path alone and all of them; a dimension change in the middle of
-an arrow's tick (target block → advancement → `tp` to the Nether): parked compounds identical,
-sabotage "light copy left in the parked list" seen; 10,000 random boxes in a crowd of 1,000 mobs:
+an arrow's tick (target block → advancement → `tp` to the Nether, critical piercing arrow), then
+the player back: parked compounds and the pairing on return identical, and the parked slot holds
+the hit (stuck, no longer critical nor piercing, entity data agreeing; this check failed on both
+paths before the fix), sabotage "slot not written back" seen; 10,000 random boxes in a crowd of 1,000 mobs:
 targets (order included), nearest hit and owner (alive, removed, shared UUID, absent) identical,
 sabotage "last target at equal distance" seen 40 times; every block state: chorus tags (both forms),
 open-water class, water block, shape; 32 chorus fruits (open ground, closed room); 2,000 ticks of
@@ -7494,9 +7500,16 @@ back to the tick copy; owner scan resumed after the hinted slot; prefilter on an
 | chorus tag test per cell, average over every state | 742 ns | 90 ns |
 | chorus fruit in a closed end stone room / stone room | 14.0 / 4.6 µs | 4.6 / 4.7 µs |
 
-Whole server ticks with 1,000 stuck arrows (`bench_projectile_tick`, 2 passes) swing by ±40 %
-between runs of the same path on the loaded machine (old 537-611 µs, new 721-821 µs, take alone
-440-760 µs): no conclusion from them; the allocation count above is the deterministic backing. A
+Whole server ticks with 1,000 stuck arrows (`bench_projectile_tick`). A first run (2 passes,
+always the old path first and the new one last) gave old 537-611 µs against new 721-821 µs: the
+order, not the path (a world's tick shifts with the allocator's state left by the worlds opened
+before). The bench now opens a warm-up world, then runs 4 passes, forward and backward in turn
+(old and new each first twice and last twice), and prints every figure with its pass and
+position. Loaded machine, median tick per pass: plain arrows old 690-847 µs, new 719-807 µs
+(ranges overlap: no conclusion), take alone 589-758 µs; effect arrows old 886-1,142 µs, new
+717-755 µs (new ahead in every pass and position), take alone 586-788 µs. Allocations of the
+server thread 2,077 → 77 per tick on both. To be measured again on the quiet machine before any
+gain is announced. A
 full-height chorus descent (384 cells × 16 attempts) is ≈ 4.6 ms old against ≈ 0.55 ms new by the
 per-cell figure. Axes: server CPU, allocations, regularity (chorus spike); network, save, rendering,
 memory unchanged (packets and compounds compared; the slot's light copy is the same size);

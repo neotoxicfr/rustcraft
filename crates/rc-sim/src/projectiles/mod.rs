@@ -1044,11 +1044,11 @@ impl Server {
         let before = ((p.pos[0].floor() as i32) >> 4, (p.pos[2].floor() as i32) >> 4);
         self.proj_tick(&mut p);
         trace(&p);
-        // List replaced during the tick (dimension change): the slot is left as it was before
-        // the tick, with its heavy fields back if they were taken.
+        // List replaced during the tick (dimension change): the slot, parked with its world, still
+        // gets the result of the tick, as the game's projectile keeps it.
         let Some(slot) = self.proj.list.get(i).filter(|s| s.id == id) else {
-            if paths.take_heavy_fields && paths.sabotage != Sabotage::ShellLeftInParkedList {
-                self.heavy_fields_back_after_list_change(p);
+            if paths.sabotage != Sabotage::SlotNotWrittenBackAfterListChange {
+                self.write_back_after_list_change(p);
             }
             return;
         };
@@ -1077,13 +1077,15 @@ impl Server {
     }
 
     /// After a dimension change during its tick, the slot of `p` (parked with its world, or still
-    /// in the active list) gets back the heavy fields the tick took, so that its save and its
-    /// pairing find its stacks and data; the rest of the slot stays as before the tick, as on the
-    /// old path.
-    fn heavy_fields_back_after_list_change(&mut self, mut p: Proj) {
+    /// in the active list) gets the whole result of the tick, as on an ordinary tick. Two fields
+    /// stay the slot's: its tracking, which the dimension change cleared (otherwise the arrow
+    /// would never be paired again), and a removal made by another during the tick.
+    fn write_back_after_list_change(&mut self, mut p: Proj) {
         let parked = self.dims.parked.iter_mut().flat_map(|w| w.proj.list.iter_mut());
         if let Some(slot) = self.proj.list.iter_mut().chain(parked).find(|s| s.id == p.id) {
-            slot.put_heavy_fields(p.take_heavy_fields());
+            std::mem::swap(&mut p.track, &mut slot.track);
+            p.removed |= slot.removed;
+            *slot = p;
         }
     }
 

@@ -395,8 +395,9 @@ impl Server {
         true
     }
 
-    /// Class of the cell `q` of state `s` for the open-water test, from the state's flags, block
-    /// index and fluid: the same answer as `open_water_cell_by_name`, without comparing text.
+    /// Class of a cell of state `s` for the open-water test (`lily_pad`: the lily pad's block
+    /// index), from the state's flags, block index and fluid: the same answer as
+    /// `open_water_cell_by_name`, without comparing text.
     pub(super) fn open_water_cell(&self, s: u32, lily_pad: Option<u16>) -> OpenWaterCell {
         let info = self.data.state(s);
         if info.is_some_and(|i| i.has(rc_data::flags::AIR) || Some(i.block) == lily_pad) {

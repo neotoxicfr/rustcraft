@@ -321,9 +321,10 @@ const AWAY_PACK: Pack = &[
     ),
 ];
 
-/// The player's effect arrow hits a target block: the reward takes the player to the Nether in the
-/// middle of the arrow's tick, which parks the overworld with the arrow's slot in it. Arrows stuck
-/// around stay there too.
+/// The player's critical, piercing effect arrow hits a target block: the reward takes the player to
+/// the Nether in the middle of the arrow's tick, which parks the overworld with the arrow's slot in
+/// it. Arrows stuck around stay there too. The player then comes back, and the arrows are paired
+/// again with the client.
 fn away_mid_tick(p: &mut Probe, trace: &mut Vec<String>) {
     p.s.view = 2;
     let me = uuid_ints(p.s.uuid);
@@ -333,7 +334,8 @@ fn away_mid_tick(p: &mut Probe, trace: &mut Vec<String>) {
         cmd(p, &format!("summon minecraft:arrow 1.5 -58.5 {z}.5 {{Motion:[1.0d,0.0d,0.0d]}}"));
     }
     let tipped = "item:{id:\"minecraft:tipped_arrow\",count:1,components:{\"minecraft:potion_contents\":{potion:\"minecraft:healing\"}}}";
-    cmd(p, &format!("summon minecraft:arrow 3.5 -58.5 0.5 {{Motion:[2.0d,0.1d,0.0d],Owner:{me},{tipped}}}"));
+    let shot = format!("Motion:[2.0d,0.1d,0.0d],crit:1b,PierceLevel:2b,Owner:{me},{tipped}");
+    cmd(p, &format!("summon minecraft:arrow 3.5 -58.5 0.5 {{{shot}}}"));
     assert!(p.s.trig_active("minecraft:target_hit"), "advancement of the pack not loaded");
     assert!(p.s.cmd.functions.contains_key("t:away"), "function of the pack not loaded");
     for _ in 0..60 {
@@ -342,13 +344,49 @@ fn away_mid_tick(p: &mut Probe, trace: &mut Vec<String>) {
         record_events(p, trace);
     }
     assert_eq!(p.s.dim.name, "minecraft:the_nether", "the reward did not take the player away during the hit");
+    let parked = p.s.dims.parked.iter().flat_map(|w| w.proj.list.iter());
+    check_hit_kept(parked.clone().find(|q| q.item.id == "minecraft:tipped_arrow"), "parked", trace);
+    cmd(p, "execute in minecraft:overworld run tp @a 0.5 -60 0.5");
+    // The probe streams no chunk: the arrows' chunk counts as sent, so that they are paired again.
+    p.s.sent.insert((0, 0));
+    for _ in 0..40 {
+        tick(p);
+        record_projectiles(p, trace);
+        record_events(p, trace);
+    }
+    assert_eq!(p.s.dim.name, "minecraft:overworld", "the player did not come back");
+    check_hit_kept(p.s.proj.list.iter().find(|q| q.item.id == "minecraft:tipped_arrow"), "back", trace);
 }
 
+/// The game keeps the result of the tick that hit the target: the arrow is stuck there, no longer
+/// critical nor piercing, and its entity data says the same as its fields. Checked on the parked
+/// slot (on return the arrow would hit the target again at its first tick, hiding a lost result).
+/// The sabotage leaves the slot as before the tick: for it only the trace must differ.
+fn check_hit_kept(arrow: Option<&Proj>, place: &str, trace: &mut Vec<String>) {
+    use rc_proto_v777::entity::Meta;
+    let Some(arrow) = arrow else {
+        trace.push(format!("{place}: the arrow that hit the target is gone"));
+        return;
+    };
+    let state = (arrow.in_ground, arrow.crit, arrow.pierce, arrow.pos);
+    trace.push(format!("{place}: arrow {state:?} data {:?}", arrow.meta));
+    if ProjectilePaths::current().sabotage != Sabotage::None {
+        return;
+    }
+    assert!(state.0 && !state.1 && state.2 == 0, "{place}: the arrow's slot lost the result of its tick: {state:?}");
+    let data = |i: u8| arrow.meta.iter().find(|m| m.0 == i).map(|m| m.1.clone());
+    assert_eq!(data(10), Some(Meta::Bool(true)), "{place}: in-ground data out of step with the slot");
+    assert_eq!(data(8), Some(Meta::Byte(0)), "{place}: critical data out of step with the slot");
+}
+
+/// Sabotage seen at every run: the slot not written back after the dimension change. Seen failing
+/// by hand before the fix: the new path gave the slot the heavy fields only (in-ground data sent at
+/// the pairing while the slot flew), the old path dropped the result of the tick (arrow in flight).
 #[test]
 fn dimension_change_during_a_tick_keeps_the_parked_slot_whole() {
     let paths = [("old", ProjectilePaths::OLD), ("new", ProjectilePaths::NEW)];
-    let faults = [("shell-left-in-parked-list", sabotaged(Sabotage::ShellLeftInParkedList))];
-    assert_paths_agree("proj-away", AWAY_PACK, away_mid_tick, &paths, &faults, 0xdc49_8b39_b05e_514e);
+    let faults = [("slot-not-written-back", sabotaged(Sabotage::SlotNotWrittenBackAfterListChange))];
+    assert_paths_agree("proj-away", AWAY_PACK, away_mid_tick, &paths, &faults, 0xca2b_01cf_6b4a_7917);
 }
 
 // ---------- Targets and owner in a crowd ----------
