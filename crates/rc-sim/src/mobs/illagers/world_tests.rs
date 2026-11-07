@@ -334,6 +334,7 @@ fn illagers_saved_and_reloaded() {
     let vx = list.iter().find(|e| e.get("id").and_then(Nbt::as_str) == Some("minecraft:vex")).expect("vex");
     assert_eq!(crate::nbtio::int(vx, "life_ticks"), Some(1233));
     assert_eq!(vx.get("bound_pos"), Some(&Nbt::IntArray(vec![212, -57, 210])));
+    assert_eq!(crate::nbtio::int(vx, "NoGravity"), Some(1), "the vex turns its gravity off every tick");
     let mut m = super::super::mob::Mob::new(Kind::Pillager, 1, 1, [0.0; 3], 0.0, super::super::jrand::JRand::new(1));
     m.define_data();
     m.load(pl);
