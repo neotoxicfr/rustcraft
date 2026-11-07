@@ -5533,7 +5533,7 @@ The new readings are generic `[perf] counter <name> <value>` lines (column `c:<n
   `mesh_partials_{reached,unreached}_per_s` (column reached or not by the last visibility walk).
 - Uploads: `upload_in_place_{sent,whole}_mb_per_s` (bytes written in place against a whole upload of
   the same columns), `upload_in_place_refused_{version,other}_per_s` (the GPU no longer holds the
-  base version, or another reason).
+  base version, or another reason), `upload_in_place_writes_per_s` (ranges written in place, C2-M13).
 - Visibility test of the frame (entities, particles, block entities): calls per frame by verdict
   `visibility_{outside,unchecked,one_section_reached,one_section_hidden,straddling_reached,
   straddling_hidden}_per_frame` (plain cells flushed when the frame's test is dropped).
@@ -9219,4 +9219,127 @@ points, not the 49 and 121 the mission expected: the micro-bench covers all four
 - To measure on the quiet machine: `generation-1thread`, `fresh-mountain-rd16` (2 passes, the
   reference exe), each switch at 0 alone (`NOISE_BATCH_POINTS`, `NOISE_BATCH_AVX2`,
   `NOISE_BATCH_SHARED_CELL`, `NOISE_XPRE`, `NOISE_XY_PERM_TABLE`), then all five at 0.
+
+## C2-M13: each face copied once at the end of the meshing, in-place writes restricted to the remeshed sections (07/11, loaded machine)
+
+Before: the faces of a live mesh were copied four times on the pool (pushed into one list per
+layer grown by doubling, sorted by group into a zeroed buffer after a counting pass, flattened into
+the base, copied again with the column's place in its region into the GPU bytes), and the in-place
+write of a partial remesh compared the whole column from each end and sent one range from the
+first change to the last; the layout by group then section (`g × (S + 1) + s`) spreads one
+changed section over every group, so that range covered most of the column. Switches, default =
+new, `=0` = old (read once):
+- `RUSTCRAFT_OPT_MESH_FACES_BY_GROUP` (`MeshJob::faces_by_group`, `blocks.rs` `ColumnFaces`): each
+  face pushed straight into the list of its layer and group (kept by the meshing thread, shrunk
+  back above 8,192 faces), each layer assembled once at its exact size; the faces of a reused
+  section go group by group into the same lists. No counting pass, zeroed buffer nor scatter.
+- `RUSTCRAFT_OPT_MESH_PREPARE_BY_MOVE` (`render::prepare_moving_faces`): the GPU bytes take the
+  mesh's three layers and tag them where they lie, written as three contiguous pieces (one GPU copy
+  for the uploader); used whenever the mesh no longer needs its faces (not when the main thread
+  flattens the base itself, `RUSTCRAFT_OPT_MESHPACK=0` or `main`); under `RUSTCRAFT_MESHCHECK` a
+  copy of the faces is put back in the mesh for the fingerprints.
+- `RUSTCRAFT_OPT_MESH_BASE_IS_PREPARED` (`pack_tagged`, `render::prepare_from_base`): the base of
+  a live mesh is flattened with the column's GPU tag in bits 20-27 of each face (never set by the
+  mesher: position in bits 0-19, offset class 28-31), and the upload reads its faces from it: no
+  other copy nor pass, the base and the upload share them. Every reader of a base takes the tag off
+  (copy of the reused sections, unpacking, in-place comparison); a base without a tag reads as
+  before (plain copy when the first face of a group carries none).
+- `RUSTCRAFT_OPT_IN_PLACE_TOUCHED_ONLY` (`blocks/in_place.rs` `in_place_diff_with`, mask of the job
+  passed to `remesh::finish`): only the (layer, group, section) of the remeshed sections are
+  compared, and those whose place moved in the flat sequence; the others were copied from this
+  very base to the same place. Exact: the shifted cells are compared, not counted as changed, so
+  the ranges are those of the whole comparison (proven), only the work differs. Used only when the
+  base has the mesh's column and height (the mesher reused it).
+- `RUSTCRAFT_OPT_IN_PLACE_RANGES` (+ `RUSTCRAFT_IN_PLACE_GAP_KB`, 4 by default): each run of changed
+  faces, fluid faces or translucents is a range of its own, two runs closer than the gap (in bytes
+  of the GPU format) merged; off: one range per buffer, as before.
+
+Proofs: `blocks.rs` `face_group_tests` (400 random columns, both paths and the lists reused from
+one column to the next, a huge group shrunk back; sabotage: a face pushed into another group);
+`tests/digest.rs` `faces_by_group_digests_match_stored` (1,248 columns of the capture, both paths
+in one process, whole and partial on sections 4-10 and the 9th alone, on bases of either path and
+on tagged bases: every column identical and the stored `EXPECTED_COMPACT`; sabotage: a face moved
+to the same group of the next section); `tests/common` `check_in_place`, run by `tests/in_place.rs`
+(2,000 partial remeshes of random columns whose other sections are copies, faces moved between
+groups and layers: touched-only = whole comparison for gaps none / 0 / 4 / 170, the ranges applied
+to a simulated buffer = a full upload, no gap = the old diff; a tagged base reads like the plain
+one; sabotage: a face changed outside the remeshed sections is seen by the whole comparison only)
+and by `tests/partial.rs` on every real partial remesh and on 84 state changes of stairs, levers and
+redstone wires (38 written in place, 37 of them with several ranges); `column_upload_test.rs`
+(moved faces and faces read from the base = the copy and the old upload; pieces of a byte range
+over the parts; in-place writes through the pieces = a full upload, one range and several). Code
+sabotages, each seen then removed: offset of a group forgotten in the assembly (unit tests,
+`digest.rs`, `partial.rs`), shifted cells left out of the touched comparison (`in_place.rs`,
+`partial.rs`), tag left on when copying a reused section (`digest.rs`), one face left untagged by
+the move (`column_upload_test.rs`).
+
+Micro-bench, loaded machine (`tests/mesh_output_bench.rs`, interleaved, best of 7, seven runs),
+meshing in ms, 1 thread on 312 columns / all threads on 1,248; sorted at the end → by group:
+
+| run | whole, 1 thread | whole, all threads | 9th section, 1 thread | 9th section, all threads |
+|---|---|---|---|---|
+| 1 | 309.6 → 304.6 | 104.4 → 105.9 | 47.8 → 43.6 | 33.4 → 22.8 |
+| 2 | 314.9 → 310.6 | 102.9 → 102.0 | 47.5 → 43.3 | 33.4 → 21.0 |
+| 3 (heaviest load) | 378.9 → 436.8 | 119.9 → 126.9 | 55.5 → 50.7 | 37.5 → 24.2 |
+| 4 | 314.6 → 309.8 | 85.4 → 78.3 | 48.4 → 44.2 | 29.7 → 20.6 |
+| 5 | 306.2 → 297.2 | 81.7 → 77.3 | 46.9 → 42.1 | 33.2 → 22.5 |
+| 6 | 320.0 → 315.5 | 106.6 → 102.4 | 48.1 → 44.6 | 37.7 → 24.9 |
+| 7 | 311.7 → 311.1 | 90.1 → 85.1 | 48.1 → 43.8 | 35.2 → 24.1 |
+
+The seven times of each variant fall in two modes of the load (1 thread: ≈ 310-330 and
+≈ 470-500 ms for the whole columns), the median between them: only the best is read. Whole
+columns: −0.2 to −2.9% in six runs on 1 thread, +15% in the heaviest one; −0.9 to −8.3% in five
+runs on all threads, +1.4 and +5.8% in two. One section remeshed (the partial remeshes of play):
+−7 to −10% on 1 thread and −31 to −37% on all threads in every run (no whole-layer list grown by
+doubling, no zeroed buffer, fewer allocations per task under contention). The 9th section remeshed
+on a base carrying the GPU tag (`MESH_BASE_IS_PREPARED`: reused sections copied with the tag taken
+off instead of a plain copy), two runs: 42.5 against 42.4 and 41.9 against 41.7 ms on 1 thread
+(noise), 28.5 against 26.0 and 33.2 against 32.1 ms on all threads (+3 to +10%, medians 33.7 / 32.9
+and 36.3 / 36.5): to settle on the scene bench against the pass over the faces it saves (below).
+Lists kept: faces per
+(layer, group) of a column on the capture, median 37, 99th percentile 1,862, maximum 3,025, so the
+8,192 cap is never reached there.
+
+In-place write of a light change in the 9th section of the 1,248 columns (138 MB of faces), ms
+(best of 7) and MB of faces sent:
+
+| | every face of the section | one face per group (local change) |
+|---|---|---|
+| old: whole column, one range | 37.4 ms, 58.1 MB | 38.3 ms, 57.0 MB |
+| touched only, one range | 3.5 ms, 58.1 MB | 3.9 ms, 57.0 MB |
+| whole column, gaps 4 KiB | 37.6 ms, 30.6 MB | 37.5 ms, 2.09 MB |
+| touched only, gaps 1 KiB | 10.5 ms, 28.5 MB, ≈ 10 ranges per touched column | 9.5 ms, 0.23 MB, ≈ 11 |
+| touched only, gaps 4 KiB | 10.4 ms, 30.6 MB, ≈ 7 | 9.7 ms, 2.09 MB, ≈ 9 |
+| touched only, gaps 16 KiB | 10.7 ms, 47.2 MB, ≈ 2 | 9.8 ms, 19.9 MB, ≈ 4 |
+| touched only, gaps 64 KiB | 10.4 ms, 57.9 MB, ≈ 1.3 | 9.3 ms, 56.6 MB, ≈ 1.3 |
+
+Comparison: 30 µs → 3 µs per column with one range (−90%), 8 µs with ranges (each candidate
+element is read to find the runs, still −72%). Bytes: a local change sends 27 times less at 4 KiB,
+250 times less at 1 KiB, for about nine writes instead of one; the gap trades bytes for GPU copies
+(`copy_buffer_to_buffer` = 29% of `Uploader::write`): 4 KiB kept by default, to settle on the scene
+bench. Preparation of the GPU bytes (`column_upload_test.rs` `prepare_cost`, 2,000 random meshes,
+µs per column, 1 / 4 / 32 threads, each from a copy of the mesh costing 9.2 / 6.7 / 7.2): faces
+copied 14.1–15.4 / 5.1 / 10.2, moved 9.9–10.8 / 4.5 / 6.3, so the faces' part goes from ≈ 5–6 µs to
+≈ 1 µs on 1 thread; read from the base: no work on the faces at all.
+
+Placement (B4): all on the pool, one core per task (1 thread and all threads measured above); the
+main thread only writes the pieces (three contiguous writes merged into one GPU copy). GPU not
+applicable: the faces come out of the CPU mesher, and the comparison reads a few kilobytes per
+column, far below a round trip. Memory (B10): the kept face lists hold at most 21 × 192 KiB per
+meshing thread, in practice the largest (layer, group) met (3,025 faces at most on the capture:
+≈ 0.5 MB per thread for the opaque groups, capacity doubling included), in place of the lists grown
+by doubling and the zeroed buffer of every task; with the base read by the upload, a live mesh's faces are held once instead of base
++ GPU bytes until the upload. Not done: the sparse preparation (`MESHPREPSPARSE` of the plan: only
+the bytes of the in-place ranges prepared) — its condition is the M01 counter showing that the
+preparation of in-place columns weighs, which only the scene bench gives, and the moved or shared
+faces already leave only the fluids and translucents to prepare; the comparison done by the mesher
+while it writes a remeshed section (the touched-only comparison is already 3 µs per column); a
+direct fill of the transit with the tag ORed during the copy (`Uploader::write_with`), which would
+make the faces' preparation vanish but moves work back to the main thread.
+
+To measure on the quiet machine (D1): `scenes.py` cave, redstone, forest, two alternated passes
+against main and the reference exe — meshing ms/s (pool), pool preparation ms/s, allocations,
+private MB, upload MB/s, in place MB/s, upload ms/s, in place/s, `upload_in_place_writes_per_s`;
+each switch at 0 alone (`MESH_FACES_BY_GROUP`, `MESH_PREPARE_BY_MOVE`, `MESH_BASE_IS_PREPARED`,
+`IN_PLACE_TOUCHED_ONLY`, `IN_PLACE_RANGES`), then all at 0; `RUSTCRAFT_IN_PLACE_GAP_KB` 1, 4, 16, 64.
 
