@@ -274,6 +274,36 @@ impl FaceBuilder {
 }
 
 #[cfg(test)]
+impl Speculation {
+    /// Tests: waits until the background thread has built what it was last asked for, so that the
+    /// hits no longer depend on the speed of the machine.
+    fn settle(&mut self) {
+        loop {
+            if self.building.is_some() {
+                match self.finished.recv() {
+                    Ok(job) => self.store(job),
+                    Err(_) => self.building = None,
+                }
+            }
+            self.poll();
+            if self.building.is_none() {
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl FaceBuilder {
+    /// Tests: [`Speculation::settle`].
+    fn settle(&mut self) {
+        if let Some(s) = &mut self.speculation {
+            s.settle();
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::super::tests::test_map;
     use super::super::{CloudSide, cloud_spiral};
@@ -320,6 +350,9 @@ mod tests {
                     stale_changes += 1;
                 }
                 let spiral = use_spiral.then(|| &spirals[radii.iter().position(|&r| r == new_key.radius).unwrap()]);
+                // The prediction made at the previous crossing is ready, whatever the machine's speed
+                // (a slow CI runner otherwise misses most of them).
+                builder.settle();
                 hits += usize::from(builder.build(&map, new_key, spiral, predict(new_key), &placement));
                 let cells = cells_of(new_key, spiral);
                 cloud_faces(&map, new_key.cx, new_key.cz, cells, new_key.side, new_key.flat, &mut want);

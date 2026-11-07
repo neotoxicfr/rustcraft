@@ -54,6 +54,9 @@ thread_local! {
     pub(crate) static TEST_PROTO_LAZY: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     /// Tests: flush without waiting imposed on the saves made from this thread.
     pub(crate) static TEST_PROTO_FLUSH_ASYNC: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// Tests: end of the last flush a save requested without waiting for it (`flush_gen(false)`).
+    pub(crate) static TEST_ASYNC_FLUSH_DONE: std::cell::RefCell<Option<Receiver<()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// `RUSTCRAFT_OPT_PROTO_LAZY` (default 1; `0`: all modified proto-chunks written at every
@@ -1438,6 +1441,8 @@ impl crate::server::Server {
     pub(crate) fn flush_gen(&mut self, wait: bool) {
         let Some(done) = self.generator.as_ref().and_then(Gen::flush) else { return };
         if !wait && proto_flush_async() {
+            #[cfg(test)]
+            TEST_ASYNC_FLUSH_DONE.with(|d| *d.borrow_mut() = Some(done));
             return;
         }
         let t = std::time::Instant::now();
