@@ -240,6 +240,10 @@ fn execute_if_entity_matches_the_former_runs() {
     };
     let reference = trace(&mut p, CommandPaths::OLD);
     assert!(reference.1.iter().filter(|(_, v)| v.is_some()).count() > 50, "test setup: few hits");
+    // The terminal form gives the count, whatever the paths (stored value, not a comparison).
+    let zombies_b = p.s.select(&parse("@e[type=zombie,tag=b]").expect("selector"), &src).len() as i32;
+    assert!(zombies_b > 1, "test setup: {zombies_b} zombies tagged b");
+    assert_eq!(reference.0[3], (true, zombies_b), "terminal `execute if entity` count");
     for (name, paths) in variants() {
         assert!(trace(&mut p, paths) == reference, "{name}: execute runs differ");
     }
