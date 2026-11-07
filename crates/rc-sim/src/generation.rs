@@ -791,8 +791,9 @@ impl Worker {
         let fulls: Vec<(Chunk, Vec<Nbt>)> = targets
             .par_iter()
             .zip(lights)
-            .filter_map(|(p, (sky, block))| {
-                let s = map.get(p)?;
+            .filter_map(|(&p, lit)| {
+                let s = map.get(&p)?;
+                let (sky, block) = lit.unwrap_or_else(|| light_alone(light, map, &scans, p, height, has_sky));
                 Some((conv.full_chunk(&s.c, sky, block, 0, &s.bes), s.c.entities.clone()))
             })
             .collect();
@@ -818,7 +819,14 @@ impl Worker {
             scan_missing(&mut scans, map, light, height, &around(&relit));
         }
         let lights = light_batch(light, map, &scans, &relit, height, has_sky);
-        let relights: Vec<Relit> = relit.iter().zip(lights).map(|(&p, (sky, block))| (p, sky, block)).collect();
+        let relights: Vec<Relit> = relit
+            .par_iter()
+            .zip(lights)
+            .map(|(&p, lit)| {
+                let (sky, block) = lit.unwrap_or_else(|| light_alone(light, map, &scans, p, height, has_sky));
+                (p, sky, block)
+            })
+            .collect();
         clock.lap(Phase::Relight);
         if rc_data::env_flag!("RUSTCRAFT_GENLOG") {
             eprintln!(
@@ -988,10 +996,10 @@ fn scan_missing(
     scans.extend(made);
 }
 
-/// Lighting of the chunks `list` with the batch's scans (missing ones: redone by the lighting), by
-/// tiles with `RUSTCRAFT_OPT_FULL_UNION_TILES` (`rc_light::light_chunks`). In tests, each one is
-/// compared to the chunk lit alone without scans: a stale scan (blocks changed since), a misplaced
-/// one or a tile that differs fails any test that generates.
+/// Lighting of the chunks `list` with the batch's scans (missing ones: redone by the lighting),
+/// resolved together by tiles (`RUSTCRAFT_OPT_FULL_UNION_TILES`, `rc_light::light_chunks`); without
+/// tiles, all `None`: the caller lights each chunk alone ([`light_alone`]) inside its own parallel
+/// loop, as before the tiles, with no wait for the whole batch.
 fn light_batch(
     light: &rc_light::LightTables,
     map: &HashMap<(i32, i32), Slot>,
@@ -999,19 +1007,58 @@ fn light_batch(
     list: &[(i32, i32)],
     height: i32,
     has_sky: bool,
-) -> Vec<rc_light::LightSheets> {
+) -> Vec<Option<rc_light::LightSheets>> {
+    if !rc_light::batch_lit_by_tiles(light) {
+        return list.iter().map(|_| None).collect();
+    }
     let column = |x: i32, z: i32| map.get(&(x, z)).map(|s| &s.c.blocks[..]);
     let scan = |x: i32, z: i32| scans.get(&(x, z));
     let out = rc_light::light_chunks(light, list, column, scan, height, has_sky);
     #[cfg(test)]
-    for (&(x, z), sheets) in list.iter().zip(&out) {
-        let cols: rc_light::Columns = std::array::from_fn(|i| column(x + i as i32 % 3 - 1, z + i as i32 / 3 - 1));
-        assert!(
-            *sheets == rc_light::light_chunk(light, cols, height, has_sky),
-            "light of chunk {x} {z}: batch lighting differs from the chunk lit alone without scans"
-        );
+    for (&p, sheets) in list.iter().zip(&out) {
+        check_against_lit_alone(light, map, p, sheets, height, has_sky);
+    }
+    out.into_iter().map(Some).collect()
+}
+
+/// Lighting of the chunk `(x, z)` alone with the batch's scans.
+fn light_alone(
+    light: &rc_light::LightTables,
+    map: &HashMap<(i32, i32), Slot>,
+    scans: &HashMap<(i32, i32), rc_light::ColumnScan>,
+    (x, z): (i32, i32),
+    height: i32,
+    has_sky: bool,
+) -> rc_light::LightSheets {
+    let around = |i: usize| (x + i as i32 % 3 - 1, z + i as i32 / 3 - 1);
+    let cols: rc_light::Columns = std::array::from_fn(|i| map.get(&around(i)).map(|s| &s.c.blocks[..]));
+    let scans_around: rc_light::Scans = std::array::from_fn(|i| scans.get(&around(i)));
+    let out = rc_light::light_chunk_scanned(light, cols, scans_around, height, has_sky);
+    #[cfg(test)]
+    if !scans.is_empty() {
+        check_against_lit_alone(light, map, (x, z), &out, height, has_sky);
     }
     out
+}
+
+/// Tests: the batch's lighting of chunk `(x, z)` equals the chunk lit alone without scans, so a
+/// stale scan (blocks changed since), a misplaced one or a tile that differs fails any test that
+/// generates.
+#[cfg(test)]
+fn check_against_lit_alone(
+    light: &rc_light::LightTables,
+    map: &HashMap<(i32, i32), Slot>,
+    (x, z): (i32, i32),
+    sheets: &rc_light::LightSheets,
+    height: i32,
+    has_sky: bool,
+) {
+    let cols: rc_light::Columns =
+        std::array::from_fn(|i| map.get(&(x + i as i32 % 3 - 1, z + i as i32 / 3 - 1)).map(|s| &s.c.blocks[..]));
+    assert!(
+        *sheets == rc_light::light_chunk(light, cols, height, has_sky),
+        "light of chunk {x} {z}: batch lighting differs from the chunk lit alone without scans"
+    );
 }
 
 impl Worker {
