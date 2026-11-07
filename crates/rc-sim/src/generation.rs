@@ -787,14 +787,12 @@ impl Worker {
         if cache {
             scan_missing(&mut scans, map, light, height, &around(&targets));
         }
+        let lights = light_batch(light, map, &scans, &targets, height, has_sky);
         let fulls: Vec<(Chunk, Vec<Nbt>)> = targets
             .par_iter()
-            .filter_map(|&(x, z)| {
-                let cols: rc_light::Columns = std::array::from_fn(|i| {
-                    map.get(&(x + i as i32 % 3 - 1, z + i as i32 / 3 - 1)).map(|s| &s.c.blocks[..])
-                });
-                let (sky, block) = light_scanned(light, cols, &scans, (x, z), height, has_sky);
-                let s = map.get(&(x, z))?;
+            .zip(lights)
+            .filter_map(|(p, (sky, block))| {
+                let s = map.get(p)?;
                 Some((conv.full_chunk(&s.c, sky, block, 0, &s.bes), s.c.entities.clone()))
             })
             .collect();
@@ -819,16 +817,8 @@ impl Worker {
         if cache {
             scan_missing(&mut scans, map, light, height, &around(&relit));
         }
-        let relights: Vec<Relit> = relit
-            .par_iter()
-            .map(|&(x, z)| {
-                let cols: rc_light::Columns = std::array::from_fn(|i| {
-                    map.get(&(x + i as i32 % 3 - 1, z + i as i32 / 3 - 1)).map(|s| &s.c.blocks[..])
-                });
-                let (sky, block) = light_scanned(light, cols, &scans, (x, z), height, has_sky);
-                ((x, z), sky, block)
-            })
-            .collect();
+        let lights = light_batch(light, map, &scans, &relit, height, has_sky);
+        let relights: Vec<Relit> = relit.iter().zip(lights).map(|(&p, (sky, block))| (p, sky, block)).collect();
         clock.lap(Phase::Relight);
         if rc_data::env_flag!("RUSTCRAFT_GENLOG") {
             eprintln!(
@@ -998,27 +988,27 @@ fn scan_missing(
     scans.extend(made);
 }
 
-/// Scans of the 9 columns around `(x, z)` (missing ones: redone by the lighting).
-fn scans_of(scans: &HashMap<(i32, i32), rc_light::ColumnScan>, x: i32, z: i32) -> rc_light::Scans<'_> {
-    std::array::from_fn(|i| scans.get(&(x + i as i32 % 3 - 1, z + i as i32 / 3 - 1)))
-}
-
-/// Lighting of a chunk with the batch's scans. In tests, compared to the lighting redone without
-/// scans: a stale scan (blocks changed since) or a misplaced one fails any test that generates.
-fn light_scanned(
+/// Lighting of the chunks `list` with the batch's scans (missing ones: redone by the lighting), by
+/// tiles with `RUSTCRAFT_OPT_FULL_UNION_TILES` (`rc_light::light_chunks`). In tests, each one is
+/// compared to the chunk lit alone without scans: a stale scan (blocks changed since), a misplaced
+/// one or a tile that differs fails any test that generates.
+fn light_batch(
     light: &rc_light::LightTables,
-    cols: rc_light::Columns,
+    map: &HashMap<(i32, i32), Slot>,
     scans: &HashMap<(i32, i32), rc_light::ColumnScan>,
-    (x, z): (i32, i32),
+    list: &[(i32, i32)],
     height: i32,
     has_sky: bool,
-) -> (Vec<LightLayer>, Vec<LightLayer>) {
-    let out = rc_light::light_chunk_scanned(light, cols, scans_of(scans, x, z), height, has_sky);
+) -> Vec<rc_light::LightSheets> {
+    let column = |x: i32, z: i32| map.get(&(x, z)).map(|s| &s.c.blocks[..]);
+    let scan = |x: i32, z: i32| scans.get(&(x, z));
+    let out = rc_light::light_chunks(light, list, column, scan, height, has_sky);
     #[cfg(test)]
-    if !scans.is_empty() {
+    for (&(x, z), sheets) in list.iter().zip(&out) {
+        let cols: rc_light::Columns = std::array::from_fn(|i| column(x + i as i32 % 3 - 1, z + i as i32 / 3 - 1));
         assert!(
-            out == rc_light::light_chunk(light, cols, height, has_sky),
-            "light of chunk {x} {z}: batch scans differ from the columns"
+            *sheets == rc_light::light_chunk(light, cols, height, has_sky),
+            "light of chunk {x} {z}: batch lighting differs from the chunk lit alone without scans"
         );
     }
     out
