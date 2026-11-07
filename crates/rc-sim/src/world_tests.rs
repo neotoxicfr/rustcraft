@@ -3,6 +3,8 @@
 //! and on damaged region files; the deliberate faults are seen.
 
 use super::*;
+use crate::chunk::Words;
+use crate::chunk_disk::DiskKeeping;
 use crate::region::ReadSabotage;
 use rc_proto::nbt::Nbt;
 use rc_world::SECTION_BLOCKS;
@@ -239,8 +241,9 @@ fn section_cases(data: &VersionData, states: &States) -> Vec<(&'static str, Opti
 type Counted = Result<(rc_world::Container, i16), String>;
 
 /// Old block read: index check, then a separate count.
-fn counted_old(c: Option<&Nbt>, data: &VersionData, states: &States, lossy: &mut bool) -> Counted {
-    let b = chunk::container(c, SECTION_BLOCKS, true, states.air_state, |e| states.state_of(data, e), lossy)?;
+fn counted_old(c: Option<&mut Nbt>, data: &VersionData, states: &States, lossy: &mut bool) -> Counted {
+    let resolve = |e: &Nbt| states.state_of(data, e);
+    let b = chunk::read_disk_container(c, SECTION_BLOCKS, true, states.air_state, resolve, lossy, Words::Copied)?;
     let n = chunk::count_non_empty(&b, states);
     Ok((b, n))
 }
@@ -255,7 +258,7 @@ fn count_differences(
         .into_iter()
         .filter(|(_, c)| {
             let (mut a, mut b) = (false, false);
-            (counted_old(c.as_ref(), data, states, &mut a), a) != (counted(c.as_ref(), &mut b), b)
+            (counted_old(c.clone().as_mut(), data, states, &mut a), a) != (counted(c.as_ref(), &mut b), b)
         })
         .map(|(name, _)| name)
         .collect()
@@ -269,7 +272,8 @@ fn section_count_same_both_ways() {
     let Some(data) = rc_testdata::version_data() else { return };
     let states = States::new(&data, Vec::new());
     let new = |c: Option<&Nbt>, lossy: &mut bool| {
-        chunk::block_container_counted(c, states.air_state, |e| states.state_of(&data, e), lossy, &states)
+        let mut c = c.cloned();
+        chunk::block_container_counted(c.as_mut(), states.air_state, |e| states.state_of(&data, e), lossy, &states, Words::Copied)
     };
     assert_eq!(count_differences(&data, &states, &new), Vec::<&str>::new());
     let damage_read_as_air = |c: Option<&Nbt>, lossy: &mut bool| -> Counted {
@@ -295,8 +299,8 @@ fn section_count_same_both_ways() {
                 let (x, z) = ((rx << 5) + (i & 31) as i32, (rz << 5) + (i >> 5) as i32);
                 let Ok(Some(bytes)) = f.read(i, x, z) else { continue };
                 let Ok(root) = crate::nbtio::parse_root(&bytes) else { continue };
-                let one = chunk::parse_with(root.clone(), &data, &states, dim.height, true);
-                let two = chunk::parse_with(root, &data, &states, dim.height, false);
+                let one = chunk::parse_with(root.clone(), &data, &states, dim.height, true, DiskKeeping::from_switches());
+                let two = chunk::parse_with(root, &data, &states, dim.height, false, DiskKeeping::from_switches());
                 assert!(digest(&one) == digest(&two), "{name} ({x}, {z})");
                 n += 1;
             }
@@ -406,7 +410,7 @@ fn bench_section_count() {
         for one_pass in [false, true] {
             let t = Instant::now();
             let mut total = 0i64;
-            for s in &sections {
+            for s in &mut sections {
                 let mut lossy = false;
                 let r = if one_pass {
                     chunk::block_container_counted(
@@ -415,6 +419,7 @@ fn bench_section_count() {
                         |e| states.state_of(&data, e),
                         &mut lossy,
                         &states,
+                        Words::Copied,
                     )
                 } else {
                     counted_old(Some(s), &data, &states, &mut lossy)
@@ -497,7 +502,7 @@ fn bench_load_stages() {
             let t = Instant::now();
             let ok = roots
                 .iter()
-                .filter(|r| chunk::parse_with((*r).clone(), &data, &states, dim.height, one_pass).is_ok())
+                .filter(|r| chunk::parse_with((*r).clone(), &data, &states, dim.height, one_pass, DiskKeeping::OLD).is_ok())
                 .count();
             eprintln!(
                 "bench_stages pass {pass}: chunk parse (count {}): {ok} chunks, {:.1} ms (root clone included)",

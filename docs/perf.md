@@ -7429,3 +7429,121 @@ loaded by other agents compiling.
   (`push_item_layer`, `prepare` sorts, NBT clones, rc-mesh `to_vec`) belong to their zones: a
   reused buffer beats any allocator setting.
 
+
+## C5-M07: disk compound kept per chunk without duplicate, /fillbiome saved (07/11, loaded machine)
+
+Fidelity first (own commit, no switch): `/fillbiome` changed the biomes in memory only. The save
+re-encoded the blocks of the sections it marked but kept the biomes read, so the change was lost
+at the next opening (official chunk and freshly generated chunk alike). Sections now carry a
+`biomes_changed` flag set by `/fillbiome` on the sections it touched; the save re-encodes their
+biomes. `/fillbiome` no longer marks every section as changed (blocks re-encoded and, with
+incomplete live maps, height maps dropped for nothing). Re-encoding the biomes at every block edit
+instead was rejected: the game writes `data` before `palette`, our encoder the other way, so every
+edited game section with several biomes would have changed bytes without reason. Test
+`chunk_disk_tests::fillbiome_survives_the_save` fails on the old code (S2 world, chunk (0, −1):
+biome 41 read back instead of 15).
+
+What a chunk kept for its next save (`Chunk::root`) was the whole compound read, then the whole
+compound written: block words, palettes, biomes and light a second time next to memory.
+New module `chunk_disk`; every lead behind its switch (default on, `=0` old path):
+
+- `RUSTCRAFT_OPT_SLIM_DISK_COMPOUND`: sections taken out of the root compound and kept per light
+  index (`Chunk::disk_sections`); their light arrays emptied (the layers read stay shared with
+  memory as `Arc`, free while memory keeps them, written when memory has none: the old semantics
+  when a relight leaves a layer empty); packed words moved into memory (`mem::take`, reinterpreted
+  in place) and given back at the save; complete `Heightmaps` moved into memory (the save writes
+  them all from memory anyway); `sections` and `Heightmaps` left in the root as empty values (same
+  key order). Applied at the three entries: reading, the generator's full chunk, after each save.
+- `RUSTCRAFT_OPT_DROP_REBUILDABLE_SECTIONS` (the mission's canonical sections and C1-M02's dropped
+  section NBT, one lead): a section memory gives back byte for byte keeps nothing but its key
+  order. "Gives back" is checked at reading without allocation: usual keys only, `Y` a byte, each
+  palette entry equal to the one our encoder writes, keys in our order or in the game's. The game
+  keeps a compound in a hash table and writes it in table order: Java string hash, spread, 16
+  slots doubled past three quarters, ties in insertion order (section inserted `block_states`,
+  `biomes`, `BlockLight`, `SkyLight`, `Y`; block properties inserted by name from the last, a
+  consequence of how its paired codecs encode). Emulated, it rebuilds 100 % of the sections of the
+  bench model world (220,656 overworld + 15,376 Nether), 1,632 + 226,247 of the 227,880 of the S2
+  world (the last one mixes both orders: kept as read). The palette is written as memory holds it
+  (unused entries and order kept), so a non canonical palette is rebuilt too; after a change the
+  section is written by our encoder like before. After a save the kept forms follow what the save
+  did (keys replaced in place or added at the end), no check paid at the snapshot.
+- `RUSTCRAFT_OPT_NO_DUPLICATE_BLOCK_ENTITIES` (C1-M02): the block entity list lives in memory only,
+  an empty list left in the root (the save always wrote memory's). At the save it is moved into the
+  written compound and back.
+- `RUSTCRAFT_OPT_LAZY_GENERATED_SECTION_NBT` (C1-M02): the generator's full chunk no longer encodes
+  its 24 sections; the save writes them from memory, as memory holds them when the fresh pack is
+  its disk encoding (palette, disk width), re-encoded otherwise (direct values). The warned risk,
+  encoding moved onto the snapshot of the server thread, does not come with it: writing a section
+  as memory holds it is a palette walk and a word copy, cheaper than the three deep copies the old
+  save made of the kept section (figures below).
+- `RUSTCRAFT_OPT_ENCODE_WITHOUT_COPIES` (+ C1-M02 section copy): the save moves the kept root, the
+  section list (indexed by height instead of a linear search per height) and the block entities
+  into the written compound and back, instead of `root.clone()`, `to_vec()` and `cloned()` per
+  section. `Chunk::encode_for_save` replaces `encode` + `c.root = root` in the save.
+- `RUSTCRAFT_OPT_READ_WITHOUT_COPIES`: a saved light layer built straight into its heap sheet (one
+  copy instead of two).
+- `RUSTCRAFT_OPT_COUNT_BLOCKS_BY_HISTOGRAM`: `count_non_empty` (generator's full chunk, old read
+  path) by `Container::count_where` instead of 4,096 unpacked states.
+- `RUSTCRAFT_OPT_SKIP_SECTIONS_WITHOUT_BLOCK_ENTITIES` (C1-M02): the generator's block entity list
+  skips a section whose palette holds no block entity state; `Conv::be_types` borrowed instead of
+  cloned per conversion; proto-chunk containers built once for the sections and the list.
+- `RUSTCRAFT_OPT_FILL_ONLY_ABSENT_SECTIONS` (C1-M02): a chunk read back by the generator fills only
+  its sections absent from the compound (the chunk starts zeroed; air and plains are written only
+  where needed) instead of filling all of it before overwriting.
+- Names: `container` → `read_disk_container`, `light_layer` → `read_light_layer`, the magic indices
+  of `mem_stats::root_parts` → `RootPart`. `Chunk::root` keeps its name (read in ten files outside
+  the mission): left to the end-of-wave renaming (`disk_extras`).
+
+Proof (`chunk_disk_tests`): every chunk of the bench model world and of the S2 world (19,781),
+read all-switches-0 and with four switch combinations, gives the same saved bytes at once, after
+177,422 random edits (blocks with and without properties and block entities, biome cells, light
+layers replaced, emptied or shared, block entities added), after a second save following a relight
+that leaves layers empty, after an unchanged save, by copies and by moves; 600 generator full
+chunks rebuilt from the model world (46 with block entities), three combinations, same bytes before
+and after edits; 12 crafted sections (unused entry, palette out of order, third property order,
+`Name`/`Properties` entries, unknown key, `Y` as int, height twice (once with the first one's words empty), single entry with words, blocks
+without biomes, light only) rebuilt or kept as expected and saved identically; block entity lists
+identical with and without skipping, and a lone chest in an empty section is listed; read-back
+decoration chunks identical with both fills. Existing proofs kept: `tests_opt` fingerprints (new
+world, model world), `world_tests::section_count_same_both_ways`, `model_world_light_unchanged_by_shared_layers`,
+`save_round_trip_modified`, `container_encoding_matches_game` (now reading the stored compound).
+Sabotages caught: moved words not given back, kept light dropped once memory has none, rebuilt
+section re-encoded instead of written as held, palette properties not compared, sections with
+block entities skipped.
+
+Memory (counted, not timed): kept compound of the whole model world loaded at once (10,155
+chunks): 608.4 MB → 81.7 MB (block words 180.4 → 0, palettes 106.1 → 0, biomes 33.2 → 0, light
+129.8 → 0, height maps 14.4 → 0.1, block entities 2.2 → 0.1, other 77.7 → 16.8; ticks 55.4 and
+structures 9.2 unchanged). What is left is mostly `block_ticks`/`fluid_ticks`/`PostProcessing`, read
+in play from the root (`blocks/ticks.rs`): next lead, outside this mission's files.
+
+Time, loaded machine (`chunk_disk_tests::bench_kept_compound`, 3,000 overworld chunks of the model
+world, 1,000 for the generator cases; best of 15 runs alternated old/new, µs per chunk):
+
+| Case | 1 thread, old → new | 32 threads, old → new |
+|---|---|---|
+| Read a stored chunk, all leads | 99.7 → 113.0 (other runs 49.8 → 57.3, 43.7 → 49.7) | 4.0 → 4.1 |
+| Read, slim compound only | 58.4 → 62.3 | 4.4 → 4.4 |
+| Save, sections unchanged (autosave of a chunk an entity dirtied) | 65.1 → 28.7 (−56 %) | 9.7 → 2.9 |
+| Save, every section changed | 135.0 → 91.7 (−32 %) | 22.4 → 8.6 |
+| Generator full chunk | 248.1 → 156.7 (−37 %) | 15.8 → 11.3 |
+| Chunk read back by the generator | 200.1 → 185.7 (−7 %) | 12.4 → 12.4 |
+| Generator block entity list | 164.2 → 1.2 (−99 %) | 11.8 → 1.5 |
+| Non-empty count, 24 sections | 28.6 → 14.7 (−49 %) | 2.2 → 1.3 |
+| Light layers read | 0.8 → 0.6 (within the noise) | 0.4 → 0.5 |
+
+Read: the rebuild check costs 5 to 13 % on one thread (palette entries compared, game property
+order cached per block and thread: hashing and sorting the names for every entry cost 5 µs more),
+nothing on the loader pool's 32 threads. A first version kept the light read as `Arc` clones: the
+interned uniform sheets are one process-wide `Arc` each, and every loader thread counting
+references on them made reading 6.1 → 11.4 µs per chunk on 32 threads; uniform layers are now
+kept by their byte (`KeptLight::Uniform`), back to 4.1. The light read in one copy gains nothing
+measurable: kept behind `RUSTCRAFT_OPT_READ_WITHOUT_COPIES` (C3) for the quiet-machine bench.
+The save gain is the snapshot of the server thread at every autosave and at closing.
+
+Not applicable: GPU (no rendering), network (packets built from memory, unchanged), disk bytes
+(identical by construction and test). Multi-core: reading runs on the loader pool (figures per
+thread count above), the save on the server thread (1 thread is the figure that matters). To settle
+on the quiet-machine scene bench: `plains12`, `plains32`, `cave`, `forest`, `village`, `nether`
+(memstats line "kept compound X MB", private MB, chunk loading), `generation` (ms per chunk, first
+batch), `autosave-1` and `save` (snapshot ms at the autosave, closing save ms, tick p99).

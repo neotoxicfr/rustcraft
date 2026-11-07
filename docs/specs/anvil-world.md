@@ -362,6 +362,12 @@ handles; any unknown key (including from a future version or a mod) is copied as
 - Modified chunk: replace `sections` (blocks, unchanged biomes copied, light), `Heightmaps`,
   `block_entities`, `block_ticks`/`fluid_ticks` if handled, `LastUpdate`, `InhabitedTime`; keep
   `structures`, `PostProcessing`, a chunk's upgrade data, `blending_data`, etc.
+- What the chunk keeps of the compound between saves need not hold what memory holds: a section
+  memory gives back byte for byte (palette as held, keys in our order or in the game's) keeps only
+  its key order. The game writes a compound in the order of its hash table (Java string hash,
+  spread, 16 slots doubled past three quarters, ties in insertion order); it inserts a section's
+  keys as `block_states`, `biomes`, `BlockLight`, `SkyLight`, `Y`, and a block state's properties
+  by name from the last.
 - Unmodified chunk: **do not rewrite it** (not even for `LastUpdate`).
 - Unhandled entities and block entities: original raw NBT.
 - Write `DataVersion = 5023` wherever we write.

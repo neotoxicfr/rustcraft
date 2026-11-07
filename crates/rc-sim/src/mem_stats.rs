@@ -22,7 +22,22 @@ pub fn enabled() -> bool {
     *E.get_or_init(|| rc_data::env_flag!("RUSTCRAFT_PERFLOG"))
 }
 
-/// Items of the compound kept per chunk (`Chunk::root`, rewritten at each save).
+/// Items of the compound kept per chunk for its next save (`Chunk::root` and
+/// `Chunk::disk_sections`), in the order of [`ROOT_PARTS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootPart {
+    BlockData,
+    BlockPalette,
+    Biomes,
+    Light,
+    Heightmaps,
+    BlockEntities,
+    Ticks,
+    Structures,
+    Other,
+}
+
+/// Labels of the items of the kept compound (`[perf] ram`), indexed by [`RootPart`].
 pub const ROOT_PARTS: [&str; 9] = [
     "sections.block_states.data",
     "sections.block_states.palette",
@@ -34,6 +49,44 @@ pub const ROOT_PARTS: [&str; 9] = [
     "structures",
     "other",
 ];
+
+/// Bytes per item of the kept compound, indexed by [`RootPart`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RootBytes(pub [u64; 9]);
+
+impl std::ops::IndexMut<RootPart> for RootBytes {
+    fn index_mut(&mut self, part: RootPart) -> &mut u64 {
+        &mut self.0[part as usize]
+    }
+}
+
+impl std::ops::Index<RootPart> for RootBytes {
+    type Output = u64;
+    fn index(&self, part: RootPart) -> &u64 {
+        &self.0[part as usize]
+    }
+}
+
+impl std::ops::AddAssign for RootBytes {
+    fn add_assign(&mut self, other: RootBytes) {
+        for (a, b) in self.0.iter_mut().zip(other.0) {
+            *a += b;
+        }
+    }
+}
+
+/// Kept compound of one chunk by item, its light layers shared with memory not counted.
+#[cfg(test)]
+pub(crate) fn kept_compound(c: &crate::chunk::Chunk) -> RootBytes {
+    let mut arcs = HashMap::new();
+    for l in c.sky.iter().chain(&c.block).flatten() {
+        first_sight(&mut arcs, l);
+    }
+    let mut out = RootBytes::default();
+    root_parts(&c.root, &mut out);
+    disk_section_parts(c, &mut arcs, &mut out);
+    out
+}
 
 /// Totals of a pass over the server's chunks (bytes unless noted).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -48,7 +101,7 @@ pub struct Server {
     pub heightmaps: u64,
     pub block_entities: u64,
     /// Kept compound, per item of `ROOT_PARTS`.
-    pub root: [u64; 9],
+    pub root: RootBytes,
     /// Frozen entities (NBT): count and bytes.
     pub entities: u64,
     pub entity_bytes: u64,
@@ -95,51 +148,71 @@ pub fn nbt_heap(n: &Nbt) -> usize {
 }
 
 /// Splits the compound of a chunk by item of `ROOT_PARTS`.
-pub fn root_parts(root: &Nbt, out: &mut [u64; 9]) {
+pub fn root_parts(root: &Nbt, out: &mut RootBytes) {
     let Nbt::Compound(top) = root else { return };
-    let entry = size_of::<(String, Nbt)>();
-    out[8] += (top.capacity() * size_of::<(String, Nbt)>()) as u64;
+    out[RootPart::Other] += (top.capacity() * size_of::<(String, Nbt)>()) as u64;
     for (k, v) in top {
-        let i = match k.as_str() {
+        let part = match k.as_str() {
             "sections" => {
                 let Nbt::List(secs) = v else {
-                    out[8] += (k.capacity() + nbt_heap(v)) as u64;
+                    out[RootPart::Other] += (k.capacity() + nbt_heap(v)) as u64;
                     continue;
                 };
-                out[8] += (k.capacity() + secs.capacity() * size_of::<Nbt>()) as u64;
-                for s in secs {
-                    let Nbt::Compound(f) = s else { continue };
-                    out[8] += (f.capacity() * entry) as u64;
-                    for (sk, sv) in f {
-                        let part = match sk.as_str() {
-                            "block_states" => {
-                                if let Nbt::Compound(b) = sv {
-                                    out[8] += (b.capacity() * entry) as u64;
-                                    for (bk, bv) in b {
-                                        let j = if bk == "data" { 0 } else { 1 };
-                                        out[j] += (bk.capacity() + nbt_heap(bv)) as u64;
-                                    }
-                                    out[8] += sk.capacity() as u64;
-                                    continue;
-                                }
-                                1
-                            }
-                            "biomes" => 2,
-                            "SkyLight" | "BlockLight" => 3,
-                            _ => 8,
-                        };
-                        out[part] += (sk.capacity() + nbt_heap(sv)) as u64;
-                    }
+                out[RootPart::Other] += (k.capacity() + secs.capacity() * size_of::<Nbt>()) as u64;
+                secs.iter().for_each(|s| section_parts(s, out));
+                continue;
+            }
+            "Heightmaps" => RootPart::Heightmaps,
+            "block_entities" => RootPart::BlockEntities,
+            "block_ticks" | "fluid_ticks" | "PostProcessing" => RootPart::Ticks,
+            "structures" => RootPart::Structures,
+            _ => RootPart::Other,
+        };
+        out[part] += (k.capacity() + nbt_heap(v)) as u64;
+    }
+}
+
+/// Splits a section compound by item of `ROOT_PARTS` (its own vector counted as `other`).
+fn section_parts(s: &Nbt, out: &mut RootBytes) {
+    let entry = size_of::<(String, Nbt)>();
+    let Nbt::Compound(f) = s else { return };
+    out[RootPart::Other] += (f.capacity() * entry) as u64;
+    for (sk, sv) in f {
+        let part = match (sk.as_str(), sv) {
+            ("block_states", Nbt::Compound(b)) => {
+                out[RootPart::Other] += (b.capacity() * entry + sk.capacity()) as u64;
+                for (bk, bv) in b {
+                    let part = if bk == "data" { RootPart::BlockData } else { RootPart::BlockPalette };
+                    out[part] += (bk.capacity() + nbt_heap(bv)) as u64;
                 }
                 continue;
             }
-            "Heightmaps" => 4,
-            "block_entities" => 5,
-            "block_ticks" | "fluid_ticks" | "PostProcessing" => 6,
-            "structures" => 7,
-            _ => 8,
+            ("block_states", _) => RootPart::BlockPalette,
+            ("biomes", _) => RootPart::Biomes,
+            ("SkyLight" | "BlockLight", _) => RootPart::Light,
+            _ => RootPart::Other,
         };
-        out[i] += (k.capacity() + nbt_heap(v)) as u64;
+        out[part] += (sk.capacity() + nbt_heap(sv)) as u64;
+    }
+}
+
+/// What a chunk keeps per height for its save (`Chunk::disk_sections`): the vector and boxes as
+/// `other`, kept compounds by item, kept light sheets memory no longer holds (first sight in the
+/// pass) as light.
+fn disk_section_parts(c: &crate::chunk::Chunk, arcs: &mut HashMap<usize, Layer>, out: &mut RootBytes) {
+    out[RootPart::Other] += (c.disk_sections.capacity() * size_of::<crate::chunk_disk::DiskSection>()) as u64;
+    for d in &c.disk_sections {
+        if let crate::chunk_disk::SectionForm::Kept(s) = &d.form {
+            out[RootPart::Other] += size_of::<Nbt>() as u64;
+            section_parts(s, out);
+        }
+        for kept in [&d.sky, &d.block] {
+            if let crate::chunk_disk::KeptLight::Own(l) = kept
+                && first_sight(arcs, l)
+            {
+                out[RootPart::Light] += rc_world::LIGHT_BYTES as u64;
+            }
+        }
     }
 }
 
@@ -285,6 +358,7 @@ fn add_chunk(a: &mut Server, arcs: &mut HashMap<usize, Layer>, c: &crate::chunk:
     a.heightmaps += c.heightmaps.iter().map(|h| h.1.len() * 8).sum::<usize>() as u64;
     a.block_entities += c.block_entities.iter().map(nbt_heap).sum::<usize>() as u64;
     root_parts(&c.root, &mut a.root);
+    disk_section_parts(c, arcs, &mut a.root);
 }
 
 type Layer = std::sync::Arc<[u8; rc_world::LIGHT_BYTES]>;
@@ -400,7 +474,7 @@ pub fn report() -> String {
     let mut out = String::new();
     use std::fmt::Write;
     if let Some(s) = s {
-        let root: u64 = s.root.iter().sum();
+        let root: u64 = s.root.0.iter().sum();
         let _ = write!(
             out,
             "server: {} chunks, sections {:.1} MB, light {:.1} MB ({} layers), heightmaps {:.1} MB, block entities {:.1} MB, kept compound {:.1} MB (",
@@ -413,7 +487,7 @@ pub fn report() -> String {
             mo(root)
         );
         for (i, k) in ROOT_PARTS.iter().enumerate() {
-            let _ = write!(out, "{}{k} {:.1}", if i > 0 { ", " } else { "" }, mo(s.root[i]));
+            let _ = write!(out, "{}{k} {:.1}", if i > 0 { ", " } else { "" }, mo(s.root.0[i]));
         }
         let _ = write!(
             out,
@@ -470,10 +544,10 @@ mod tests {
             ("block_entities".into(), Nbt::List(vec![])),
             ("Status".into(), Nbt::String("minecraft:full".into())),
         ]);
-        let mut parts = [0u64; 9];
+        let mut parts = RootBytes::default();
         root_parts(&root, &mut parts);
-        assert_eq!(parts.iter().sum::<u64>(), nbt_heap(&root) as u64, "{parts:?}");
-        assert!(parts[0] >= 2 * 256 * 8 && parts[3] >= 2 * 2048);
+        assert_eq!(parts.0.iter().sum::<u64>(), nbt_heap(&root) as u64, "{parts:?}");
+        assert!(parts[RootPart::BlockData] >= 2 * 256 * 8 && parts[RootPart::Light] >= 2 * 2048);
     }
 
     /// A seen layer stays alive during the pass: a layer freed then replaced during
@@ -563,6 +637,7 @@ mod tests {
                 block_entities: (0..i % 4).map(|_| Nbt::Compound(vec![("id".into(), Nbt::String("minecraft:chest".into()))])).collect(),
                 inhabited_time: 0,
                 root: chunk_root(sections + (i % 3) as i8, longs),
+                disk_sections: Vec::new(),
                 lossy: false,
                 changed: Vec::new(),
                 biomes_changed: Vec::new(),
@@ -597,7 +672,7 @@ mod tests {
             light_layers: 502,
             heightmaps: 300 * 37 * 8,
             block_entities: EXPECTED_BLOCK_ENTITY_BYTES,
-            root: EXPECTED_ROOT_PARTS,
+            root: RootBytes(EXPECTED_ROOT_PARTS),
             ..Default::default()
         }
     }

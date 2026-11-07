@@ -11,6 +11,7 @@ use rc_worldgen::decor_blocks::Blocks;
 use rc_worldgen::decor_region::{BeData, DecoChunk, FLUID_TICK_NAMES, Hm};
 
 use crate::chunk::{self, Chunk, DATA_VERSION, HEIGHTMAPS, Height};
+use crate::chunk_disk::{self, ContainerWriting, DiskKeeping, DiskSection, KeyOrder, RebuiltSection, SectionForm};
 use crate::nbtio::{int, list};
 use crate::states::States;
 
@@ -49,6 +50,15 @@ fn bits_for(n: usize) -> u8 {
     (usize::BITS - (n.max(1) - 1).leading_zeros()) as u8
 }
 
+/// Values by block position.
+type ByPosition<T> = HashMap<[i32; 3], T>;
+
+/// `RUSTCRAFT_OPT_SKIP_SECTIONS_WITHOUT_BLOCK_ENTITIES=0`: the block entity list looks up every
+/// block of the chunk, even in sections whose palette holds no block entity state.
+fn skip_sections_without_block_entities() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_SKIP_SECTIONS_WITHOUT_BLOCK_ENTITIES")
+}
+
 /// Conversions of a dimension.
 pub struct Conv<'a> {
     pub data: &'a VersionData,
@@ -59,8 +69,8 @@ pub struct Conv<'a> {
     pub biome_to_reg: Vec<u32>,
     /// Inverse (reading of proto-chunks).
     pub reg_to_biome: HashMap<u32, u16>,
-    /// Block entity identifiers of the registry (name validation).
-    pub be_types: Vec<String>,
+    /// Block entity identifiers of the registry (name validation), borrowed from the data.
+    pub be_types: &'a [String],
 }
 
 impl<'a> Conv<'a> {
@@ -74,7 +84,7 @@ impl<'a> Conv<'a> {
         let biome_to_reg: Vec<u32> =
             biome_names.iter().map(|n| states.biomes.get(n).copied().unwrap_or(states.default_biome)).collect();
         let reg_to_biome = biome_to_reg.iter().enumerate().map(|(i, &r)| (r, i as u16)).collect();
-        let be_types = data.registry("minecraft:block_entity_type").map(|r| r.entries.clone()).unwrap_or_default();
+        let be_types = data.registry("minecraft:block_entity_type").map_or(&[][..], |r| &r.entries[..]);
         Conv { data, states, blocks, height, biome_to_reg, reg_to_biome, be_types }
     }
 
@@ -150,8 +160,22 @@ impl<'a> Conv<'a> {
     }
 
     /// Block entities of the states that carry one, with the contents fixed by the decoration.
-    /// `disk`: entities read with the chunk (kept as is where the state carries one).
-    fn block_entities(&self, dc: &DecoChunk, packed: bool, disk: &[Nbt]) -> Vec<Nbt> {
+    /// `disk`: entities read with the chunk (kept as is where the state carries one). `blocks`:
+    /// the section containers, to skip the sections whose palette holds no such state.
+    fn block_entities(&self, dc: &DecoChunk, packed: bool, disk: &[Nbt], blocks: &[&Container]) -> Vec<Nbt> {
+        self.block_entities_with(dc, packed, disk, blocks, skip_sections_without_block_entities())
+    }
+
+    /// [`Conv::block_entities`] with the switch given (`skip`: sections without block entity state
+    /// passed over).
+    pub(crate) fn block_entities_with(
+        &self,
+        dc: &DecoChunk,
+        packed: bool,
+        disk: &[Nbt],
+        blocks: &[&Container],
+        skip: bool,
+    ) -> Vec<Nbt> {
         let mut extra: HashMap<[i32; 3], &BeData> = HashMap::new();
         for (p, d) in &dc.be_data {
             extra.insert(*p, d);
@@ -163,36 +187,56 @@ impl<'a> Conv<'a> {
             }
         }
         let mut out = Vec::new();
-        for (i, &s) in dc.blocks.iter().enumerate() {
-            if !self.blocks.facts(s).block_entity {
+        for (si, section) in dc.blocks.chunks(SECTION_BLOCKS).enumerate() {
+            // A section whose palette holds no block entity state is passed over whole (most of
+            // them: stone, air, water) instead of a lookup per block.
+            if skip && blocks.get(si).is_some_and(|c| !c.may_contain(|v| self.blocks.facts(v).block_entity)) {
                 continue;
             }
-            let name = self.blocks.block_name(self.blocks.block(s));
-            let Some(id) = be_type(name) else { continue };
-            if !self.be_types.contains(&id) {
-                continue;
+            for (j, &s) in section.iter().enumerate() {
+                out.extend(self.block_entity_at(dc, si * SECTION_BLOCKS + j, s, packed, (&kept, &extra)));
             }
-            let (x, z, y) = ((i & 15) as i32, ((i >> 4) & 15) as i32, (i >> 8) as i32 + dc.min_y);
-            let p = [dc.cx * 16 + x, y, dc.cz * 16 + z];
-            if let Some(b) = kept.get(&p) {
-                let mut b = (*b).clone();
-                crate::nbtio::set(&mut b, "keepPacked", Nbt::Byte(i8::from(packed)));
-                out.push(b);
-                continue;
-            }
-            let mut f = vec![
-                ("id".to_owned(), Nbt::String(id)),
-                ("x".to_owned(), Nbt::Int(p[0])),
-                ("y".to_owned(), Nbt::Int(p[1])),
-                ("z".to_owned(), Nbt::Int(p[2])),
-                ("keepPacked".to_owned(), Nbt::Byte(i8::from(packed))),
-            ];
-            if let Some(d) = extra.get(&p) {
-                be_extra_fields(d, &mut f);
-            }
-            out.push(Nbt::Compound(f));
         }
         out
+    }
+
+    /// Block entity of the block at index `i` of the chunk (state `s`), when its state carries one:
+    /// the one read with the chunk at that place (`kept`), or a new one with what the decoration
+    /// fixed (`extra`).
+    fn block_entity_at(
+        &self,
+        dc: &DecoChunk,
+        i: usize,
+        s: u32,
+        packed: bool,
+        (kept, extra): (&ByPosition<&Nbt>, &ByPosition<&BeData>),
+    ) -> Option<Nbt> {
+        if !self.blocks.facts(s).block_entity {
+            return None;
+        }
+        let name = self.blocks.block_name(self.blocks.block(s));
+        let id = be_type(name)?;
+        if !self.be_types.contains(&id) {
+            return None;
+        }
+        let (x, z, y) = ((i & 15) as i32, ((i >> 4) & 15) as i32, (i >> 8) as i32 + dc.min_y);
+        let p = [dc.cx * 16 + x, y, dc.cz * 16 + z];
+        if let Some(b) = kept.get(&p) {
+            let mut b = (*b).clone();
+            crate::nbtio::set(&mut b, "keepPacked", Nbt::Byte(i8::from(packed)));
+            return Some(b);
+        }
+        let mut f = vec![
+            ("id".to_owned(), Nbt::String(id)),
+            ("x".to_owned(), Nbt::Int(p[0])),
+            ("y".to_owned(), Nbt::Int(p[1])),
+            ("z".to_owned(), Nbt::Int(p[2])),
+            ("keepPacked".to_owned(), Nbt::Byte(i8::from(packed))),
+        ];
+        if let Some(d) = extra.get(&p) {
+            be_extra_fields(d, &mut f);
+        }
+        Some(Nbt::Compound(f))
     }
 
     fn post_processing(&self, dc: &DecoChunk) -> Nbt {
@@ -247,18 +291,21 @@ impl<'a> Conv<'a> {
     /// Disk compound of a proto-chunk (status `terrain` or decorated).
     pub fn proto_nbt(&self, dc: &DecoChunk, status: &str, time: i64, disk: &[Nbt]) -> Nbt {
         let mut root = self.base_root(dc, status, time);
-        let sections = (0..self.height.sections)
-            .map(|s| {
-                let blocks = chunk::encode_blocks(&self.section_blocks(dc, s), self.data, self.states);
+        let blocks: Vec<Container> = (0..self.height.sections).map(|s| self.section_blocks(dc, s)).collect();
+        let sections = blocks
+            .iter()
+            .enumerate()
+            .map(|(s, c)| {
                 Nbt::Compound(vec![
                     ("Y".into(), Nbt::Byte((self.height.min_section() + s as i32) as i8)),
-                    ("block_states".into(), blocks),
+                    ("block_states".into(), chunk::encode_blocks(c, self.data, self.states)),
                     ("biomes".into(), self.biomes_nbt(&self.section_biomes(dc, s))),
                 ])
             })
             .collect();
         root.push(("sections".into(), Nbt::List(sections)));
-        root.push(("block_entities".into(), Nbt::List(self.block_entities(dc, true, disk))));
+        let block_containers: Vec<&Container> = blocks.iter().collect();
+        root.push(("block_entities".into(), Nbt::List(self.block_entities(dc, true, disk, &block_containers))));
         let all = [
             Hm::OceanFloor,
             Hm::MotionBlockingNoLeaves,
@@ -283,27 +330,50 @@ impl<'a> Conv<'a> {
         time: i64,
         disk: &[Nbt],
     ) -> Chunk {
+        self.full_chunk_with(dc, (sky, block), time, disk, DiskKeeping::from_switches())
+    }
+
+    /// [`Conv::full_chunk`] with what the chunk leaves to memory given (`keeping`).
+    pub(crate) fn full_chunk_with(
+        &self,
+        dc: &DecoChunk,
+        (sky, block): (Vec<LightLayer>, Vec<LightLayer>),
+        time: i64,
+        disk: &[Nbt],
+        keeping: DiskKeeping,
+    ) -> Chunk {
         let n = self.height.sections;
         let biome_direct = bits_for(self.states.biome_names.len());
+        // Lazy: the save writes the sections from memory, nothing encoded here.
+        let lazy = keeping.slim && keeping.lazy_generated_sections;
         let mut sections = Vec::with_capacity(n);
-        let mut nbt_sections = Vec::with_capacity(n);
+        let mut nbt_sections = Vec::with_capacity(if lazy { 0 } else { n });
         for s in 0..n {
             let blocks = self.section_blocks(dc, s);
             let biome_vals = self.section_biomes(dc, s);
             let non_empty = chunk::count_non_empty(&blocks, self.states);
-            nbt_sections.push(Nbt::Compound(vec![
-                ("Y".into(), Nbt::Byte((self.height.min_section() + s as i32) as i8)),
-                ("block_states".into(), chunk::encode_blocks(&blocks, self.data, self.states)),
-                ("biomes".into(), self.biomes_nbt(&biome_vals)),
-            ]));
+            if !lazy {
+                nbt_sections.push(Nbt::Compound(vec![
+                    ("Y".into(), Nbt::Byte((self.height.min_section() + s as i32) as i8)),
+                    ("block_states".into(), chunk::encode_blocks(&blocks, self.data, self.states)),
+                    ("biomes".into(), self.biomes_nbt(&biome_vals)),
+                ]));
+            }
             let biomes = Container::pack(&biome_vals, 1, 3, biome_direct);
             sections.push(Section { non_empty, blocks, biomes });
         }
         let finals = [Hm::OceanFloor, Hm::MotionBlockingNoLeaves, Hm::MotionBlocking, Hm::WorldSurface];
-        let block_entities = self.block_entities(dc, false, disk);
+        let block_containers: Vec<&Container> = sections.iter().map(|s| &s.blocks).collect();
+        let block_entities = self.block_entities(dc, false, disk, &block_containers);
+        let (root_sections, disk_sections) = if keeping.slim {
+            (Vec::new(), self.generated_disk_sections(nbt_sections, &sections, lazy, keeping))
+        } else {
+            (nbt_sections, Vec::new())
+        };
         let mut root = self.base_root(dc, "minecraft:full", time);
-        root.push(("sections".into(), Nbt::List(nbt_sections)));
-        root.push(("block_entities".into(), Nbt::List(block_entities.clone())));
+        // Left empty when the sections or the block entities are kept apart: same key order.
+        root.push(("sections".into(), Nbt::List(root_sections)));
+        root.push(("block_entities".into(), Nbt::List(if keeping.no_duplicate_block_entities { Vec::new() } else { block_entities.clone() })));
         root.push(("Heightmaps".into(), self.heightmaps_nbt(dc, &finals)));
         root.push(("isLightOn".into(), Nbt::Byte(1)));
         // The full chunk keeps its old-terrain blending, plus the regeneration (finished).
@@ -312,7 +382,7 @@ impl<'a> Conv<'a> {
             .iter()
             .map(|&h| (HEIGHTMAPS[h as usize].1, self.pack_heightmap(&dc.heights[h as usize]).into_boxed_slice()))
             .collect();
-        Chunk {
+        let mut c = Chunk {
             x: dc.cx,
             z: dc.cz,
             sections,
@@ -323,16 +393,55 @@ impl<'a> Conv<'a> {
             block_entities,
             inhabited_time: 0,
             root: Nbt::Compound(root),
+            disk_sections,
             lossy: false,
             changed: vec![false; n],
             biomes_changed: vec![false; n],
             dirty: true,
+        };
+        if keeping.slim && c.live_heightmaps(self.height) {
+            chunk_disk::empty_compound(&mut c.root, "Heightmaps");
         }
+        c
+    }
+
+    /// What a generated chunk keeps per height for its save: nothing below and above the world;
+    /// each section rebuilt from memory (`lazy`), or its encoded compound when memory does not
+    /// give it back exactly.
+    fn generated_disk_sections(&self, nbt_sections: Vec<Nbt>, sections: &[Section], lazy: bool, keeping: DiskKeeping) -> Vec<DiskSection> {
+        let min = self.height.min_section();
+        let mut disk = vec![DiskSection::default(); sections.len() + 2];
+        if lazy {
+            for (d, s) in disk[1..].iter_mut().zip(sections) {
+                // A fresh pack is its disk encoding unless it went direct (then re-encoded like the
+                // encoded compound was).
+                let writing = |c: &Container, blocks: bool| {
+                    if chunk::fresh_pack_is_disk_encoding(c, blocks) {
+                        ContainerWriting::AsInMemory(KeyOrder::Ours)
+                    } else {
+                        ContainerWriting::Reencoded
+                    }
+                };
+                d.form = SectionForm::Rebuilt(RebuiltSection::ours(writing(&s.blocks, true), writing(&s.biomes, false)));
+            }
+        } else {
+            for (i, (nbt, s)) in nbt_sections.into_iter().zip(sections).enumerate() {
+                let y = min + i as i32;
+                disk[i + 1].form = chunk_disk::read_section_form(nbt, y, Some(s), keeping.drop_rebuildable, self.data, self.states);
+            }
+        }
+        disk
     }
 
     /// Reads a disk chunk at status `terrain` or higher (full ones included): decoration
     /// chunk and status rank. `None`: lower status, unreadable, or unknown identifier.
     pub fn from_nbt(&self, root: &Nbt) -> Option<(DecoChunk, u8, Vec<Nbt>)> {
+        self.decoration_chunk_with(root, fill_only_absent_sections())
+    }
+
+    /// [`Conv::from_nbt`] with the switch given (`fill_absent_only`: only the sections the compound
+    /// lacks are filled with air and plains).
+    pub(crate) fn decoration_chunk_with(&self, root: &Nbt, fill_absent_only: bool) -> Option<(DecoChunk, u8, Vec<Nbt>)> {
         let rank = status_rank(root.get("Status")?.as_str()?)?;
         // Old chunk converted by the game (`below_zero_retrogen`): read at any status, its blocks
         // are kept and the band under y = 0 regenerated (never regenerated entirely over it).
@@ -351,11 +460,15 @@ impl<'a> Conv<'a> {
         let mut dc = DecoChunk::new(cx, cz, h.min_y, h.sections as i32 * 16);
         let min = h.min_section();
         let air = self.states.air_state;
-        dc.blocks.fill(air);
         // Section absent: game default biome (plains), like a new section.
-        if let Some(&p) = self.states.biomes.get("minecraft:plains").and_then(|r| self.reg_to_biome.get(r)) {
-            dc.biomes.fill(p);
+        let plains = self.states.biomes.get("minecraft:plains").and_then(|r| self.reg_to_biome.get(r)).copied();
+        if !fill_absent_only {
+            dc.blocks.fill(air);
+            if let Some(p) = plains {
+                dc.biomes.fill(p);
+            }
         }
+        let mut read = vec![(false, false); h.sections];
         for s in list(root.get("sections")) {
             let i = int(s, "Y")? as i32 - min;
             if !(0..h.sections as i32).contains(&i) {
@@ -369,6 +482,7 @@ impl<'a> Conv<'a> {
                     .collect::<Option<Vec<_>>>()?;
                 let dst = &mut dc.blocks[i * SECTION_BLOCKS..(i + 1) * SECTION_BLOCKS];
                 unpack(bs.get("data"), &pal, bits_for(pal.len()).max(4), dst)?;
+                read[i].0 = true;
             }
             if let Some(bi) = s.get("biomes") {
                 let pal: Vec<u32> = list(bi.get("palette"))
@@ -383,7 +497,11 @@ impl<'a> Conv<'a> {
                 for (d, s) in dc.biomes[i * SECTION_BIOMES..(i + 1) * SECTION_BIOMES].iter_mut().zip(v) {
                     *d = s as u16;
                 }
+                read[i].1 = true;
             }
+        }
+        if fill_absent_only {
+            fill_absent_sections(&mut dc, &read, air, plains);
         }
         let maps = root.get("Heightmaps");
         for (k, (name, _)) in HEIGHTMAPS.iter().enumerate() {
@@ -438,6 +556,25 @@ impl<'a> Conv<'a> {
             }
         }
         Some((dc, rank, list(root.get("block_entities")).to_vec()))
+    }
+}
+
+/// `RUSTCRAFT_OPT_FILL_ONLY_ABSENT_SECTIONS=0`: a chunk read back fills all its blocks with air and
+/// its biomes with plains before writing the sections read over them.
+fn fill_only_absent_sections() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_FILL_ONLY_ABSENT_SECTIONS")
+}
+
+/// Sections a chunk read back has no blocks (`read[i].0`) or biomes (`read[i].1`) for: air and
+/// plains, like a new section. The chunk starts zeroed: a zero value needs no writing.
+fn fill_absent_sections(dc: &mut DecoChunk, read: &[(bool, bool)], air: u32, plains: Option<u16>) {
+    for (i, &(blocks, biomes)) in read.iter().enumerate() {
+        if !blocks && air != 0 {
+            dc.blocks[i * SECTION_BLOCKS..(i + 1) * SECTION_BLOCKS].fill(air);
+        }
+        if let Some(p) = plains.filter(|&p| !biomes && p != 0) {
+            dc.biomes[i * SECTION_BIOMES..(i + 1) * SECTION_BIOMES].fill(p);
+        }
     }
 }
 

@@ -473,6 +473,29 @@ fn save_round_trip_modified() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Every full chunk of `dim`: its compound as stored, and the chunk read from it.
+pub(crate) fn raw_and_parsed_chunks(
+    dim: &Dimension,
+    data: &rc_data::VersionData,
+    states: &States,
+) -> Vec<(rc_proto::nbt::Nbt, crate::chunk::Chunk)> {
+    let mut out = Vec::new();
+    for (rx, rz) in dim.regions() {
+        let path = dim.region_dir().join(format!("r.{rx}.{rz}.mca"));
+        let mut region = crate::region::RegionFile::open(&path, false).expect("region");
+        let present: Vec<usize> = region.present().collect();
+        for i in present {
+            let (x, z) = ((rx << 5) + (i & 31) as i32, (rz << 5) + (i >> 5) as i32);
+            let Ok(Some(bytes)) = region.read(i, x, z) else { continue };
+            let root = crate::nbtio::parse_root(&bytes).expect("chunk NBT");
+            if let Ok(c) = crate::chunk::parse(root.clone(), data, states, dim.height) {
+                out.push((root, c));
+            }
+        }
+    }
+    out
+}
+
 /// The container encoder gives back the game's data: same palette (up to the order of
 /// properties) and same `data` array, on all the sections of the world.
 #[test]
@@ -489,11 +512,10 @@ fn container_encoding_matches_game() {
         v
     };
     let mut n = 0;
-    for (_, l) in dim.load_everything(&data, &states) {
-        let Load::Loaded(c) = l else { continue };
+    for (root, c) in raw_and_parsed_chunks(&dim, &data, &states) {
         for (i, s) in c.sections.iter().enumerate() {
             let y = i as i64 - 4;
-            let Some(orig) = crate::nbtio::list(c.root.get("sections"))
+            let Some(orig) = crate::nbtio::list(root.get("sections"))
                 .iter()
                 .find(|x| x.get("Y").and_then(|v| v.as_i64()) == Some(y))
                 .cloned()

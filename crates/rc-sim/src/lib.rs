@@ -9,6 +9,7 @@
 mod blocks;
 mod fluid_use;
 pub mod chunk;
+mod chunk_disk;
 pub mod debug_report;
 pub mod demo;
 pub mod gen_debug;

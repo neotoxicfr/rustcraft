@@ -73,7 +73,7 @@ fn converted_chunks_match_official_retrogen() {
     let mut pairs: HashMap<(bool, String, String), usize> = HashMap::new();
     for p in &converted {
         let c = full.iter().find(|c| (c.x, c.z) == *p).expect("converted chunk returned full");
-        let (mine, _, _) = conv.from_nbt(&c.root).expect("reread");
+        let (mine, _, _) = conv.from_nbt(&c.encode(&data, &states, height, 0).expect("encoding")).expect("reread");
         let raw = refdim.load_raw("region", &[*p]).pop().and_then(|(_, n)| n).expect("reference");
         assert_eq!(raw.get("Status").and_then(rc_proto::nbt::Nbt::as_str), Some("minecraft:full"), "{p:?}");
         let (theirs, _, _) = conv.from_nbt(&raw).expect("readable reference");
