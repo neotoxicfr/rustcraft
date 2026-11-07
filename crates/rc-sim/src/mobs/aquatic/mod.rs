@@ -149,12 +149,7 @@ pub fn define_data(m: &mut Mob) {
 pub fn sync_data(m: &mut Mob) {
     match m.kind {
         Kind::Drowned => {
-            // Swimming (shared flag 0x10) and raised trident (item in hand in use).
-            if m.aqua.swimming
-                && let Some(Meta::Byte(f)) = m.get(0).cloned()
-            {
-                m.set(0, Meta::Byte(f | 0x10));
-            }
+            // Raised trident (item in hand in use); swimming is a shared flag set with the others.
             m.set(8, Meta::Byte(i8::from(m.use_ticks >= 0)));
         }
         Kind::Guardian | Kind::ElderGuardian => {

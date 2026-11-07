@@ -282,11 +282,8 @@ pub fn sync_data(m: &mut Mob) {
     // The witch never "uses" an item on the living side: her drink goes through index 17.
     let using = m.kind != Kind::Witch && m.use_ticks >= 0;
     m.set(8, Meta::Byte(i8::from(using)));
-    // Vex: no gravity from its first tick.
+    // Vex: its no gravity from the first tick is a common value.
     if m.kind == Kind::Vex {
-        if m.tick_count > 0 {
-            m.set(5, Meta::Bool(true));
-        }
         m.set(16, Meta::Byte(i8::from(m.ill.vex_charging)));
         return;
     }

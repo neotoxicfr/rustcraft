@@ -170,7 +170,6 @@ pub fn define_data(m: &mut Mob) {
 }
 
 pub fn sync_data(m: &mut Mob) {
-    m.set(5, Meta::Bool(m.surf.no_gravity));
     for i in 0..3 {
         m.set(16 + i as u8, Meta::Int(m.wither.targets[i]));
     }

@@ -288,7 +288,6 @@ pub fn define_data(m: &mut Mob) {
 }
 
 pub fn sync_data(m: &mut Mob) {
-    m.set(5, Meta::Bool(m.surf.no_gravity));
     m.set(16, Meta::Bool(m.age < 0));
     m.set(17, Meta::Bool(m.mount.age_locked));
     let flags = m.wild.flags as i8;

@@ -439,10 +439,8 @@ pub fn define_data(m: &mut Mob) {
     }
 }
 
+/// Own values, called after the common ones (the camel's sitting pose is common).
 pub fn sync_data(m: &mut Mob) {
-    if !m.dead && is_camel(m.kind) {
-        m.set(6, Meta::Pose(if m.mount.camel_sitting_pose { 10 } else { 0 }));
-    }
     m.set(16, Meta::Bool(m.age < 0));
     m.set(17, Meta::Bool(m.mount.age_locked));
     m.set(18, Meta::Byte(m.mount.flags));
