@@ -67,11 +67,13 @@ pub(super) struct ListPaths {
     pub section_search: bool,
     /// `RUSTCRAFT_OPT_LIST_BUFFER_REUSE`: working buffers kept from one build to the next.
     pub reuse_buffers: bool,
-    /// `RUSTCRAFT_OPT_PARALLEL_LISTS`: column selection and lists cut into slices of this many
-    /// columns, built as tasks on the current rayon pool; `None`: on the calling thread.
+    /// `RUSTCRAFT_OPT_PARALLEL_LISTS`: slices of this many columns as tasks on the current rayon
+    /// pool, for the column selection and then, without the cache, the building of the lists, with
+    /// it, the rebuilding of the columns whose commands changed; `None`: on the calling thread.
     pub column_slices: Option<usize>,
-    /// `RUSTCRAFT_OPT_PARALLEL_LIST_KINDS`: the six lists built as tasks on the current rayon
-    /// pool (each one whole, unless `column_slices` cuts it).
+    /// `RUSTCRAFT_OPT_PARALLEL_LIST_KINDS`: the six lists as six tasks on the current rayon pool,
+    /// built (without the cache, each one whole unless `column_slices` cuts it) or copied from the
+    /// cache.
     pub parallel_kinds: bool,
     #[cfg(test)]
     pub sabotage: Option<Sabotage>,
@@ -136,6 +138,10 @@ pub(super) enum Sabotage {
     StaleFacings,
     /// The column command cache ignores the mesh version: a remesh written in place goes unseen.
     IgnoredMeshVersion,
+    /// The column command cache ignores the eye height: translucent sections keep a stale order.
+    IgnoredEyeHeight,
+    /// The column command cache is kept when the face vertices or the split draws change.
+    CacheKeptAcrossSettings,
     /// The cache's runs are joined across sections that draw nothing (the command order changes).
     RunsJoinedAcrossEmptySections,
     /// A slice's batches keep their place in the slice instead of their place in the list.
@@ -208,6 +214,13 @@ impl Lists {
         (self.commands.hits, self.commands.misses)
     }
 
+    /// Forgets the cached commands of every column. Called when the terrain is cleared: its buffers
+    /// restart from their first place, so a column of the next world could meet the key of an entry
+    /// left from this one.
+    pub fn forget_columns(&mut self) {
+        self.commands = ColumnCommandCache::default();
+    }
+
     /// Columns held by the command cache and the bytes they take (micro-bench).
     #[cfg(test)]
     fn command_cache_size(&self) -> (usize, usize) {
@@ -264,8 +277,9 @@ struct ListScratch {
     /// Groups of faces seen from the front, per visible column.
     facings: Vec<[(usize, usize); BUCKETS]>,
     pieces: PieceScratch,
-    /// Cache slot of each visible column.
+    /// Cache slot of each visible column, and the visible columns whose commands are rebuilt.
     slots: Vec<u32>,
+    missed: Vec<usize>,
 }
 
 /// Sections of a column in draw order, and the sections of its runs one by one.
@@ -282,7 +296,7 @@ pub(super) fn build(input: &ListIn<'_>, out: &mut Lists, paths: ListPaths, order
     let mut scratch = if paths.reuse_buffers { std::mem::take(&mut out.scratch) } else { ListScratch::default() };
     let visible = select_visible(input, out, paths);
     ordered();
-    let ListScratch { ranks, rank_starts, near, far, facings, pieces, slots } = &mut scratch;
+    let ListScratch { ranks, rank_starts, near, far, facings, pieces, slots, missed } = &mut scratch;
     if paths.cached_order {
         group_by_region(&visible, &mut out.rank, ranks, rank_starts, near);
     } else {
@@ -294,7 +308,7 @@ pub(super) fn build(input: &ListIn<'_>, out: &mut Lists, paths: ListPaths, order
     facings.extend(visible.iter().map(|v| facing(input.eye, v.key, input.min_y)));
     out.batches.clear();
     out.args.clear();
-    let em = Emission {
+    let emission = Emission {
         visible: &visible,
         runs: &out.runs,
         facings,
@@ -306,13 +320,14 @@ pub(super) fn build(input: &ListIn<'_>, out: &mut Lists, paths: ListPaths, order
         merged_translucent: paths.cached_order,
     };
     let faces = if paths.column_commands {
-        emit_from_cache(&em, &mut out.commands, slots, pieces, &mut out.batches, &mut out.args, paths)
+        let cache_scratch = CacheScratch { slots, missed, pieces };
+        emit_from_cache(&emission, &mut out.commands, cache_scratch, &mut out.batches, &mut out.args, paths)
     } else if paths.parallel() {
-        emit_in_tasks(&em, paths.column_slices, &mut out.batches, &mut out.args, paths)
+        emit_in_tasks(&emission, paths.column_slices, &mut out.batches, &mut out.args, paths)
     } else {
         let mut faces = 0;
         for kind in LIST_KINDS {
-            faces += em.emit_span(kind, 0..visible.len(), pieces, &mut out.batches, &mut out.args);
+            faces += emission.emit_span(kind, 0..visible.len(), pieces, &mut out.batches, &mut out.args);
         }
         faces
     };
@@ -464,7 +479,7 @@ fn column_runs(input: &ListIn<'_>, k: (i32, i32), secs: &[(i32, i32, i32)], runs
 
 /// Verdict of a box against the frustum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BoxVerdict {
+enum FrustumSide {
     Outside,
     Inside,
     Across,
@@ -514,9 +529,9 @@ impl<'a> ColumnCulling<'a> {
             return self.runs_in_box(min, max, k, secs, hint, runs);
         }
         match regions.verdict(self, k) {
-            BoxVerdict::Outside => {}
-            BoxVerdict::Inside => push_section_runs(secs, |_| true, runs),
-            BoxVerdict::Across => {
+            FrustumSide::Outside => {}
+            FrustumSide::Inside => push_section_runs(secs, |_| true, runs),
+            FrustumSide::Across => {
                 // Box of the reached sections only: tighter than the whole column, so more often
                 // wholly in or out of the field.
                 let (min, _) = section_box(self.origin, self.min_y, k, secs[0].1);
@@ -535,7 +550,7 @@ impl<'a> ColumnCulling<'a> {
         k: (i32, i32),
         secs: &[(i32, i32, i32)],
         hint: &mut u8,
-        runs: &mut Vec<Range<usize>>,
+        runs: &mut impl Extend<Range<usize>>,
     ) {
         let visible = if self.paths.plane_coherence {
             visible_with_hint(self.planes, min, max, hint)
@@ -597,14 +612,14 @@ impl<'a> ColumnCulling<'a> {
         (min, min + Vec3::new(span as f32 + 2.0, (self.sections * 16) as f32 + 2.0, span as f32 + 2.0))
     }
 
-    fn region_verdict(&self, region: (i32, i32)) -> BoxVerdict {
+    fn region_verdict(&self, region: (i32, i32)) -> FrustumSide {
         let (min, max) = self.region_box(region);
         if !aabb_visible(self.planes, min, max) {
-            BoxVerdict::Outside
+            FrustumSide::Outside
         } else if aabb_inside(self.planes, min, max) {
-            BoxVerdict::Inside
+            FrustumSide::Inside
         } else {
-            BoxVerdict::Across
+            FrustumSide::Across
         }
     }
 }
@@ -630,7 +645,7 @@ fn visible_with_hint(planes: &[Vec4; 6], min: Vec3, max: Vec3, hint: &mut u8) ->
 struct RegionVerdicts {
     /// Region at index 0 of the grid: the camera's region minus `REGION_REACH` on each axis.
     corner: (i32, i32),
-    cells: [Option<BoxVerdict>; REGION_GRID * REGION_GRID],
+    cells: [Option<FrustumSide>; REGION_GRID * REGION_GRID],
 }
 
 impl RegionVerdicts {
@@ -640,7 +655,7 @@ impl RegionVerdicts {
     }
 
     /// Verdict of the region holding column `k`.
-    fn verdict(&mut self, culling: &ColumnCulling<'_>, k: (i32, i32)) -> BoxVerdict {
+    fn verdict(&mut self, culling: &ColumnCulling<'_>, k: (i32, i32)) -> FrustumSide {
         let region = (k.0 >> REGION_SHIFT, k.1 >> REGION_SHIFT);
         let (dx, dz) = (region.0 - self.corner.0, region.1 - self.corner.1);
         let grid = 0..REGION_GRID as i32;
@@ -653,7 +668,11 @@ impl RegionVerdicts {
 
 /// Adds to `runs` the runs of consecutive sections among `secs` (increasing height) that `keep`
 /// accepts.
-fn push_section_runs(secs: &[(i32, i32, i32)], mut keep: impl FnMut(i32) -> bool, runs: &mut Vec<Range<usize>>) {
+fn push_section_runs(
+    secs: &[(i32, i32, i32)],
+    mut keep: impl FnMut(i32) -> bool,
+    runs: &mut impl Extend<Range<usize>>,
+) {
     let mut open: Option<Range<usize>> = None;
     for &(_, sy, _) in secs {
         if !keep(sy) {
@@ -663,13 +682,41 @@ fn push_section_runs(secs: &[(i32, i32, i32)], mut keep: impl FnMut(i32) -> bool
         open = match open {
             Some(r) if r.end >= sy => Some(r.start..r.end.max(sy + 1)),
             Some(r) => {
-                runs.push(r);
+                runs.extend([r]);
                 Some(sy..sy + 1)
             }
             None => Some(sy..sy + 1),
         };
     }
     runs.extend(open);
+}
+
+/// Sections among `reached` (the reached sections of column `key`, increasing height) whose box is
+/// in the field of `planes`: the column test of the draw lists, for the meshing view. The region
+/// hierarchy and the remembered plane pay off only over a whole build: left out here.
+pub(super) fn sections_in_field(
+    planes: &[Vec4; 6],
+    origin: [i32; 2],
+    (min_y, sections): (i32, i32),
+    key: (i32, i32),
+    reached: &[(i32, i32, i32)],
+    paths: ListPaths,
+) -> Sections {
+    let paths = ListPaths { hierarchical_frustum: false, plane_coherence: false, ..paths };
+    let culling = ColumnCulling { planes, origin, min_y, sections, paths };
+    let (min, max) = column_box(origin, min_y, sections, key);
+    let mut seen = SectionSet(Sections::default());
+    culling.runs_in_box(min, max, key, reached, &mut 0, &mut seen);
+    seen.0
+}
+
+/// Runs of sections written as a set (no allocation for a single column).
+struct SectionSet(Sections);
+
+impl Extend<Range<usize>> for SectionSet {
+    fn extend<I: IntoIterator<Item = Range<usize>>>(&mut self, runs: I) {
+        runs.into_iter().flatten().for_each(|sy| self.0.insert(sy as i32));
+    }
 }
 
 /// Opaque and cutout order: rank of each region = order of first appearance starting from the
@@ -907,13 +954,13 @@ struct Segment {
 /// columns of each list), then put end to end: a task's first batch continues the previous task's
 /// last one when they share a key, and its first command merges at the seam.
 fn emit_in_tasks(
-    em: &Emission<'_, '_>,
+    emission: &Emission<'_, '_>,
     slice: Option<usize>,
     batches: &mut Vec<Batch>,
     args: &mut Vec<DrawArgs>,
     paths: ListPaths,
 ) -> u64 {
-    let n = em.visible.len();
+    let n = emission.visible.len();
     let step = slice.unwrap_or(n).max(1);
     let tasks: Vec<(ListKind, Range<usize>)> =
         LIST_KINDS.iter().flat_map(|&kind| (0..n).step_by(step).map(move |s| (kind, s..(s + step).min(n)))).collect();
@@ -921,11 +968,24 @@ fn emit_in_tasks(
         .par_iter()
         .map_init(PieceScratch::default, |scratch, (kind, span)| {
             let mut s = Segment::default();
-            s.faces = em.emit_span(*kind, span.clone(), scratch, &mut s.batches, &mut s.args);
+            s.faces = emission.emit_span(*kind, span.clone(), scratch, &mut s.batches, &mut s.args);
             s
         })
         .collect();
-    for s in &segments {
+    join_segments(&segments, batches, args, emission.split_draws, paths);
+    segments.iter().map(|s| s.faces).sum()
+}
+
+/// Puts the tasks' segments end to end in `batches` and `args`: a segment's first batch continues
+/// the previous one when they share a key, and its first command merges at the seam.
+fn join_segments(
+    segments: &[Segment],
+    batches: &mut Vec<Batch>,
+    args: &mut Vec<DrawArgs>,
+    split_draws: bool,
+    paths: ListPaths,
+) {
+    for s in segments {
         for &(layer, fluid, home, first, count) in &s.batches {
             let pushed = batches.len();
             append_commands(
@@ -933,19 +993,20 @@ fn emit_in_tasks(
                 args,
                 (layer, fluid, home),
                 &s.args[first as usize..(first + count) as usize],
-                em.split_draws,
+                split_draws,
             );
             if paths.sabotaged(Sabotage::ForgottenBatchOffset) && batches.len() > pushed {
                 batches.last_mut().expect("just pushed").3 = first;
             }
         }
     }
-    segments.iter().map(|s| s.faces).sum()
 }
 
 /// Mesh a column's commands are made from: its version and the starts of its faces, fluids,
 /// translucents and translucent order in their buffers. A new upload changes one of them, and with
-/// them every instance range.
+/// them every instance range. The key holds only because a version is never given twice in the
+/// process (the meshing's counter never restarts, not even for a new world) and because
+/// [`Lists::forget_columns`] empties the cache when the buffers restart from their first place.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MeshKey {
     version: u64,
@@ -1079,8 +1140,9 @@ struct ColumnCommandCache {
 impl ColumnCommandCache {
     /// Start of a build: empties the cache if the command settings changed, and now and then drops
     /// the columns unused for `STALE_BUILDS` builds.
-    fn begin(&mut self, face_vertices: u32, split_draws: bool) {
-        if self.settings != Some((face_vertices, split_draws)) {
+    fn begin(&mut self, face_vertices: u32, split_draws: bool, paths: ListPaths) {
+        let changed = self.settings != Some((face_vertices, split_draws));
+        if changed && !(self.settings.is_some() && paths.sabotaged(Sabotage::CacheKeptAcrossSettings)) {
             *self = ColumnCommandCache { settings: Some((face_vertices, split_draws)), ..Default::default() };
         }
         self.builds = self.builds.wrapping_add(1);
@@ -1121,62 +1183,148 @@ impl ColumnCommandCache {
     }
 }
 
+/// Working buffers of [`emit_from_cache`].
+struct CacheScratch<'s> {
+    /// Cache slot of each visible column.
+    slots: &'s mut Vec<u32>,
+    /// Visible columns whose commands are rebuilt.
+    missed: &'s mut Vec<usize>,
+    pieces: &'s mut PieceScratch,
+}
+
 /// The six lists as copies of each column's cached commands (rebuilt only for the columns whose
-/// sources changed), merged at the seams between columns as the old path merges them.
+/// sources changed), merged at the seams between columns as the old path merges them. With
+/// `column_slices`, the changed columns are rebuilt as tasks of that many columns; with
+/// `parallel_kinds`, the six lists are copied as six tasks, then put end to end.
 fn emit_from_cache(
-    em: &Emission<'_, '_>,
+    emission: &Emission<'_, '_>,
     cache: &mut ColumnCommandCache,
-    slots: &mut Vec<u32>,
-    scratch: &mut PieceScratch,
+    scratch: CacheScratch<'_>,
     batches: &mut Vec<Batch>,
     args: &mut Vec<DrawArgs>,
     paths: ListPaths,
 ) -> u64 {
-    cache.begin(em.face_vertices, em.split_draws);
+    let CacheScratch { slots, missed, pieces } = scratch;
+    cache.begin(emission.face_vertices, emission.split_draws, paths);
+    find_changed_columns(emission, cache, slots, missed, paths);
+    match paths.column_slices {
+        Some(slice) => rebuild_in_tasks(emission, &mut cache.entries, slots, missed, slice),
+        None => {
+            for &i in missed.iter() {
+                rebuild_column_commands(emission, i, pieces, &mut cache.entries[slots[i] as usize]);
+            }
+        }
+    }
+    let entries = &cache.entries;
+    if paths.parallel_kinds {
+        let segments: Vec<Segment> = (0..LIST_KINDS.len())
+            .into_par_iter()
+            .map(|l| {
+                let mut s = Segment::default();
+                copy_cached_list(emission, entries, slots, l, &mut s.batches, &mut s.args);
+                s
+            })
+            .collect();
+        join_segments(&segments, batches, args, emission.split_draws, paths);
+    } else {
+        for l in 0..LIST_KINDS.len() {
+            copy_cached_list(emission, entries, slots, l, batches, args);
+        }
+    }
+    slots.iter().map(|&slot| entries[slot as usize].faces).sum()
+}
+
+/// Cache slot of each visible column into `slots`, and into `missed` the visible columns whose
+/// entry no longer holds (its runs then set to the new ones).
+fn find_changed_columns(
+    emission: &Emission<'_, '_>,
+    cache: &mut ColumnCommandCache,
+    slots: &mut Vec<u32>,
+    missed: &mut Vec<usize>,
+    paths: ListPaths,
+) {
     slots.clear();
-    let mut faces = 0;
-    for (i, v) in em.visible.iter().enumerate() {
+    missed.clear();
+    for (i, v) in emission.visible.iter().enumerate() {
         let mut mesh = MeshKey::of(v.column);
-        let mut view = ViewKey::of(v.column, em.facings[i], em.eye_height);
+        let mut view = ViewKey::of(v.column, emission.facings[i], emission.eye_height);
         if paths.sabotaged(Sabotage::StaleFacings) {
             view.facing = [(0, 0); BUCKETS];
         }
         if paths.sabotaged(Sabotage::IgnoredMeshVersion) {
             mesh.version = 0;
         }
+        if paths.sabotaged(Sabotage::IgnoredEyeHeight) {
+            view.eye_height = 0;
+        }
         let slot = cache.slot_of(v.key);
-        let e = &mut cache.entries[slot as usize];
-        if e.holds(v.column, mesh, view, &em.runs[v.runs.clone()], paths) {
+        let entry = &mut cache.entries[slot as usize];
+        if entry.holds(v.column, mesh, view, &emission.runs[v.runs.clone()], paths) {
             cache.hits += 1;
         } else {
             cache.misses += 1;
-            rebuild_column_commands(em, i, scratch, e);
+            missed.push(i);
         }
-        faces += e.faces;
         slots.push(slot);
     }
-    for (l, &kind) in LIST_KINDS.iter().enumerate() {
-        for &i in em.order(kind) {
-            let commands = cache.entries[slots[i] as usize].list(l);
-            append_commands(batches, args, kind.batch_key(em.visible[i].column), commands, em.split_draws);
+}
+
+/// Rebuilds the commands of the visible columns `missed` as tasks of `slice` columns: each entry
+/// is taken out of the cache for its task, then put back in its slot.
+fn rebuild_in_tasks(
+    emission: &Emission<'_, '_>,
+    entries: &mut [ColumnCommands],
+    slots: &[u32],
+    missed: &[usize],
+    slice: usize,
+) {
+    let mut taken: Vec<(usize, ColumnCommands)> =
+        missed.iter().map(|&i| (i, std::mem::take(&mut entries[slots[i] as usize]))).collect();
+    taken.par_chunks_mut(slice.max(1)).for_each_init(PieceScratch::default, |pieces, chunk| {
+        for (i, entry) in chunk {
+            rebuild_column_commands(emission, *i, pieces, entry);
         }
+    });
+    for (i, entry) in taken {
+        entries[slots[i] as usize] = entry;
     }
-    faces
+}
+
+/// Copies list `LIST_KINDS[l]` of the cached commands of every visible column, in that list's
+/// order, into `batches` and `args`.
+fn copy_cached_list(
+    emission: &Emission<'_, '_>,
+    entries: &[ColumnCommands],
+    slots: &[u32],
+    l: usize,
+    batches: &mut Vec<Batch>,
+    args: &mut Vec<DrawArgs>,
+) {
+    let kind = LIST_KINDS[l];
+    for &i in emission.order(kind) {
+        let commands = entries[slots[i] as usize].list(l);
+        append_commands(batches, args, kind.batch_key(emission.visible[i].column), commands, emission.split_draws);
+    }
 }
 
 /// Commands of visible column `i` for the six lists, from the entry's runs, merged as within one
 /// batch.
-fn rebuild_column_commands(em: &Emission<'_, '_>, i: usize, scratch: &mut PieceScratch, e: &mut ColumnCommands) {
-    let ColumnCommands { runs, commands, ends, faces, .. } = e;
+fn rebuild_column_commands(
+    emission: &Emission<'_, '_>,
+    i: usize,
+    pieces: &mut PieceScratch,
+    entry: &mut ColumnCommands,
+) {
+    let ColumnCommands { runs, commands, ends, faces, .. } = entry;
     commands.clear();
     *faces = 0;
     for (l, &kind) in LIST_KINDS.iter().enumerate() {
         let start = commands.len();
-        em.column_ranges(i, runs, kind, scratch, |r| {
+        emission.column_ranges(i, runs, kind, pieces, |r| {
             *faces += u64::from(r.end - r.start);
-            let cmd = kind.command(r, em.face_vertices);
+            let cmd = kind.command(r, emission.face_vertices);
             match commands[start..].last_mut() {
-                Some(last) if continues(last, &cmd, em.split_draws) => last.instance_count += cmd.instance_count,
+                Some(last) if continues(last, &cmd, emission.split_draws) => last.instance_count += cmd.instance_count,
                 _ => commands.push(cmd),
             }
         });

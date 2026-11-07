@@ -480,29 +480,44 @@ fn build_on(
     }
 }
 
-/// Lists of each frame of the scripted cameras: `on_frame(frame, lists of the old construction)`.
-fn along_scripted_cameras(mut on_frame: impl FnMut(u32, &ListIn<'_>, &[u8])) {
+/// Draw settings of each frame: face vertices and split draws.
+type DrawSettings = fn(u32) -> (u32, bool);
+
+/// The game's usual settings: faces as 4-vertex strips, consecutive draws merged.
+fn usual_settings(_: u32) -> (u32, bool) {
+    (4, false)
+}
+
+/// Settings changed every 40 frames on the same lists: 6-vertex faces (shader without the strip),
+/// split draws (`RUSTCRAFT_SPLITDRAWS`), both, then back to the usual ones.
+fn changing_settings(f: u32) -> (u32, bool) {
+    [(4, false), (6, false), (6, true), (4, true)][(f / 40 % 4) as usize]
+}
+
+/// Lists of each frame of the scripted cameras drawn with `settings`: `on_frame(frame, lists of
+/// the old construction)`.
+fn along_scripted_cameras(settings: DrawSettings, mut on_frame: impl FnMut(u32, &ListIn<'_>, &[u8])) {
     let mut world = ScriptedWorld::new(SEED ^ 5);
     let mut reference = Lists::default();
     for f in 0..SCRIPTED_FRAMES {
         let (eye, yaw, pitch, far) = scripted_camera(f);
         world.step(f, (eye[0].floor() as i32 >> 4, eye[2].floor() as i32 >> 4));
         let (origin, pl) = planes(eye, yaw, pitch, far);
-        let input = world.input(&pl, origin, eye);
+        let (face_vertices, split_draws) = settings(f);
+        let input = ListIn { face_vertices, split_draws, ..world.input(&pl, origin, eye) };
         let drawn = build(&input, &mut reference, ListPaths::OLD, || {});
         on_frame(f, &input, &image_bytes(&reference, drawn));
     }
 }
 
-/// Every path gives the old construction's batches and commands (order included) on every frame
-/// of the scripted cameras, with columns sent, moved, removed and sent back on the way; the cache
-/// serves most columns while the camera turns in place.
-#[test]
-fn every_path_matches_the_old_build_along_scripted_cameras() {
+/// Every path of [`compared_paths`] built on its own lists along the scripted cameras with
+/// `settings`, compared with the old construction on every frame; returns the columns reused and
+/// rebuilt by every serial path during the rotation in place.
+fn compare_every_path(settings: DrawSettings) -> (u64, u64) {
     let pools = pools();
     let mut compared: Vec<(Compared, Lists)> = compared_paths().into_iter().map(|c| (c, Lists::default())).collect();
     let (mut reused, mut rebuilt, mut drawn_frames) = (0, 0, 0);
-    along_scripted_cameras(|f, input, want| {
+    along_scripted_cameras(settings, |f, input, want| {
         drawn_frames += usize::from(want.len() > 64);
         for ((name, paths, threads), lists) in &mut compared {
             let drawn = build_on(&pools, *threads, input, lists, *paths);
@@ -514,42 +529,99 @@ fn every_path_matches_the_old_build_along_scripted_cameras() {
         }
     });
     assert!(drawn_frames > 600, "frames drawing something: {drawn_frames}");
+    (reused, rebuilt)
+}
+
+/// Every path gives the old construction's batches and commands (order included) on every frame
+/// of the scripted cameras, with columns sent, moved, removed and sent back on the way; the cache
+/// serves most columns while the camera turns in place.
+#[test]
+fn every_path_matches_the_old_build_along_scripted_cameras() {
+    let (reused, rebuilt) = compare_every_path(usual_settings);
     println!("rotation in place: {reused} columns reused, {rebuilt} rebuilt");
     assert!(reused > rebuilt && rebuilt > 0, "rotation in place: {reused} columns reused, {rebuilt} rebuilt");
 }
 
-/// The sabotages the tests must see: stale face groups reused by the cache after a step, a slice's
-/// batches left at their place in the slice, a column across a plane accepted whole.
+/// The same with 6-vertex faces and split draws, changed on the way on the same lists: the merges
+/// they turn off and the cache emptied at each change.
+#[test]
+fn every_path_matches_the_old_build_while_the_draw_settings_change() {
+    let (reused, rebuilt) = compare_every_path(changing_settings);
+    println!("rotation in place, settings changing: {reused} columns reused, {rebuilt} rebuilt");
+    assert!(reused > 0 && rebuilt > 0, "rotation in place: {reused} columns reused, {rebuilt} rebuilt");
+}
+
+/// The sabotages the tests must see: stale face groups or eye height reused by the cache, a
+/// slice's or a list's batches left at their place in their task, a column across a plane accepted
+/// whole, runs joined over empty sections, a one-sided section search, the cache kept across a
+/// change of the draw settings.
 #[test]
 fn sabotaged_paths_are_caught() {
     let pools = pools();
-    let sabotaged = [
+    let kinds_from_the_cache = ListPaths { parallel_kinds: true, ..ALL_SERIAL };
+    let usual = [
         (Sabotage::StaleFacings, ALL_SERIAL, None),
         (Sabotage::IgnoredMeshVersion, ALL_SERIAL, None),
+        (Sabotage::IgnoredEyeHeight, ALL_SERIAL, None),
         // Without the cache: the slices then build the commands.
         (
             Sabotage::ForgottenBatchOffset,
             ListPaths { column_slices: Some(3), column_commands: false, ..ALL_SERIAL },
             Some(4),
         ),
+        // With the cache: the six lists copied as six tasks.
+        (Sabotage::ForgottenBatchOffset, kinds_from_the_cache, Some(4)),
         (Sabotage::StraddlingColumnAcceptedWhole, ALL_SERIAL, None),
         (Sabotage::RunsJoinedAcrossEmptySections, ALL_SERIAL, None),
         (Sabotage::SectionSearchFromBelowOnly, ALL_SERIAL, None),
     ];
-    let mut runs: Vec<(Sabotage, ListPaths, Option<usize>, Lists, u32)> = sabotaged
-        .into_iter()
-        .map(|(s, p, t)| (s, ListPaths { sabotage: Some(s), ..p }, t, Lists::default(), 0))
-        .collect();
-    along_scripted_cameras(|_, input, want| {
-        for (_, paths, threads, lists, differs) in &mut runs {
-            let drawn = build_on(&pools, *threads, input, lists, *paths);
-            *differs += u32::from(image_bytes(lists, drawn) != want);
+    let changing = [(Sabotage::CacheKeptAcrossSettings, ALL_SERIAL, None)];
+    for (settings, sabotaged) in [(usual_settings as DrawSettings, &usual[..]), (changing_settings, &changing[..])] {
+        let mut runs: Vec<(Sabotage, ListPaths, Option<usize>, Lists, u32)> = sabotaged
+            .iter()
+            .map(|&(s, p, t)| (s, ListPaths { sabotage: Some(s), ..p }, t, Lists::default(), 0))
+            .collect();
+        along_scripted_cameras(settings, |_, input, want| {
+            for (_, paths, threads, lists, differs) in &mut runs {
+                let drawn = build_on(&pools, *threads, input, lists, *paths);
+                *differs += u32::from(image_bytes(lists, drawn) != want);
+            }
+        });
+        for (s, paths, .., differs) in &runs {
+            println!("sabotage {s:?} (list kinds {}): {differs} frames differ", paths.parallel_kinds);
+            assert!(*differs > 0, "sabotage {s:?} not seen");
         }
-    });
-    for (s, .., differs) in &runs {
-        println!("sabotage {s:?}: {differs} frames differ");
-        assert!(*differs > 0, "sabotage {s:?} not seen");
     }
+}
+
+/// A cleared terrain restarts its buffers from the first place, and a column of the next world can
+/// meet an old entry's key (same coordinates, version and places, other faces): with the cache
+/// forgotten, it is drawn from its own mesh; without, stale commands would be drawn.
+#[test]
+fn forgotten_columns_are_rebuilt_after_the_terrain_is_cleared() {
+    let mut world = ScriptedWorld::new(SEED ^ 13);
+    let (eye, yaw, pitch, far) = scripted_camera(0);
+    let (origin, pl) = planes(eye, yaw, pitch, far);
+    let (mut kept, mut forgotten) = (Lists::default(), Lists::default());
+    build(&world.input(&pl, origin, eye), &mut kept, ALL_SERIAL, || {});
+    build(&world.input(&pl, origin, eye), &mut forgotten, ALL_SERIAL, || {});
+    // Next world: other faces at the same places, under the same versions.
+    for c in world.columns.values_mut() {
+        let version = c.version;
+        remesh_in_place(c, &mut world.rng);
+        c.version = version;
+    }
+    forgotten.forget_columns();
+    let input = world.input(&pl, origin, eye);
+    let want = {
+        let mut reference = Lists::default();
+        let drawn = build(&input, &mut reference, ListPaths::OLD, || {});
+        image_bytes(&reference, drawn)
+    };
+    let drawn = build(&input, &mut forgotten, ALL_SERIAL, || {});
+    assert!(image_bytes(&forgotten, drawn) == want, "forgotten cache: stale commands drawn");
+    let drawn = build(&input, &mut kept, ALL_SERIAL, || {});
+    assert!(image_bytes(&kept, drawn) != want, "kept cache: the scene does not tell stale commands apart");
 }
 
 /// Region box ⊇ column box ⊇ box of a column's reached sections ⊇ section box, and an enclosing
@@ -588,18 +660,18 @@ fn enclosing_boxes_answer_like_the_boxes_they_hold() {
             section_box(origin, MIN_Y, k, sy),
         ];
         let verdict = |(min, max): (Vec3, Vec3)| match (aabb_visible(&pl, min, max), aabb_inside(&pl, min, max)) {
-            (false, false) => BoxVerdict::Outside,
-            (true, true) => BoxVerdict::Inside,
-            (true, false) => BoxVerdict::Across,
+            (false, false) => FrustumSide::Outside,
+            (true, true) => FrustumSide::Inside,
+            (true, false) => FrustumSide::Across,
             (false, true) => panic!("box wholly inside but not visible: {min} {max}"),
         };
         for w in boxes.windows(2) {
             let ((omin, omax), (imin, imax)) = (w[0], w[1]);
             assert!(omin.cmple(imin).all() && omax.cmpge(imax).all(), "box {imin}..{imax} not inside {omin}..{omax}");
             match verdict(w[0]) {
-                BoxVerdict::Outside => assert_eq!(verdict(w[1]), BoxVerdict::Outside),
-                BoxVerdict::Inside => assert_eq!(verdict(w[1]), BoxVerdict::Inside),
-                BoxVerdict::Across => {}
+                FrustumSide::Outside => assert_eq!(verdict(w[1]), FrustumSide::Outside),
+                FrustumSide::Inside => assert_eq!(verdict(w[1]), FrustumSide::Inside),
+                FrustumSide::Across => {}
             }
         }
         outer[verdict(boxes[0]) as usize] += 1;
@@ -774,6 +846,36 @@ fn meshing_view_holds_the_drawn_runs() {
     assert!(wider > 100, "columns with sections in view behind the camera too rare ({wider})");
 }
 
+/// The meshing view's sections found by the section search (`RUSTCRAFT_OPT_SECTION_RANGE_SEARCH`)
+/// are those of the per-section test, on every column of the draw test's trajectory; a one-sided
+/// search is seen.
+#[test]
+fn meshing_view_section_search_matches_the_per_section_test() {
+    let mut rng = Lcg(SEED ^ 7);
+    let (_, mut reached) = world(&mut rng, 12, 5);
+    let search = ListPaths { section_search: true, ..ListPaths::OLD };
+    let sabotaged = ListPaths { sabotage: Some(Sabotage::SectionSearchFromBelowOnly), ..search };
+    let (mut across, mut sabotage_seen) = (0, 0);
+    for f in 0..240u32 {
+        if f % 7 == 6 {
+            reach(&mut rng, 12, 5, &mut reached);
+        }
+        let ((eye, yaw, pitch), far) =
+            if f < 200 { (camera(f), 4.0 * 12.0 * 16.0) } else { (([0.5, 900.0, 0.5], f as f32, 89.0), 2000.0) };
+        let view = meshing_view(eye, yaw, pitch, far);
+        for secs in reached.chunk_by(|a, b| (a.0, a.2) == (b.0, b.2)) {
+            let k = (secs[0].0, secs[0].2);
+            let want = view.sections_in_view_with(k, secs, ListPaths::OLD);
+            assert_eq!(view.sections_in_view_with(k, secs, search), want, "frame {f}, column {k:?}");
+            let n = want.count(SECTIONS as usize);
+            across += usize::from(n > 0 && n < secs.len());
+            sabotage_seen += usize::from(view.sections_in_view_with(k, secs, sabotaged) != want);
+        }
+    }
+    assert!(across > 100, "columns across an edge of the view too rare ({across})");
+    assert!(sabotage_seen > 0, "one-sided section search not seen");
+}
+
 /// Game rule of the sections to rebuild: a dirty section just behind the camera (a lamp or a door
 /// changing 4 to 6 blocks behind the player) is in the meshing view, so a quick half-turn shows it
 /// rebuilt; the draw's frustum leaves it out. Two sections behind, it is out of both.
@@ -814,7 +916,8 @@ fn meshing_view_holds_the_camera_cell() {
 }
 
 /// Micro-bench of the meshing's view (`cargo test --release -- --ignored meshing_view_bench
-/// --nocapture`): sections in view of every reached column, distance 12 and 32, one core.
+/// --nocapture`): sections in view of every reached column, distance 12 and 32, one core, with the
+/// per-section test and with the section search; two alternating passes, the second counts.
 #[test]
 #[ignore]
 fn meshing_view_bench() {
@@ -823,18 +926,29 @@ fn meshing_view_bench() {
         let (_, reached) = world(&mut rng, r, 5);
         let columns: Vec<&[(i32, i32, i32)]> = reached.chunk_by(|a, b| (a.0, a.2) == (b.0, b.2)).collect();
         let frames = 200u32;
-        let mut seen = 0usize;
-        let t = std::time::Instant::now();
-        for f in 0..frames {
-            let eye = [0.5, 70.0, 0.5];
-            let view = meshing_view(eye, f as f32 * 0.9, 10.0, r as f32 * 16.0);
-            for secs in &columns {
-                let s = view.sections_in_view((secs[0].0, secs[0].2), secs);
-                seen += s.count(SECTIONS as usize);
+        let paths =
+            [("per section", ListPaths::OLD), ("section search", ListPaths { section_search: true, ..ListPaths::OLD })];
+        for pass in 0..2 {
+            for (name, paths) in paths {
+                let mut seen = 0usize;
+                let t = std::time::Instant::now();
+                for f in 0..frames {
+                    let eye = [0.5, 70.0, 0.5];
+                    let view = meshing_view(eye, f as f32 * 0.9, 10.0, r as f32 * 16.0);
+                    for secs in &columns {
+                        let s = view.sections_in_view_with((secs[0].0, secs[0].2), secs, paths);
+                        seen += s.count(SECTIONS as usize);
+                    }
+                }
+                let ns = t.elapsed().as_secs_f64() * 1e9 / f64::from(frames) / columns.len() as f64;
+                if pass == 1 {
+                    println!(
+                        "meshing view distance {r}, {name}: {ns:.1} ns per column ({} columns, {seen} sections seen)",
+                        columns.len()
+                    );
+                }
             }
         }
-        let ns = t.elapsed().as_secs_f64() * 1e9 / f64::from(frames) / columns.len() as f64;
-        println!("meshing view distance {r}: {ns:.1} ns per column ({} columns, {seen} sections seen)", columns.len());
     }
 }
 
@@ -881,10 +995,15 @@ fn bench_paths() -> Vec<Compared> {
         ("+ section search".into(), ListPaths { section_search: true, ..cached }, None),
         ("+ buffer reuse".into(), ListPaths { reuse_buffers: true, ..cached }, None),
         ("all but the cache".into(), ListPaths { column_commands: false, ..ALL_SERIAL }, None),
+        ("all but the hierarchy".into(), ListPaths { hierarchical_frustum: false, ..ALL_SERIAL }, None),
+        ("all but the coherence".into(), ListPaths { plane_coherence: false, ..ALL_SERIAL }, None),
+        ("all but the search".into(), ListPaths { section_search: false, ..ALL_SERIAL }, None),
+        ("all but the buffers".into(), ListPaths { reuse_buffers: false, ..ALL_SERIAL }, None),
         ("all".into(), ALL_SERIAL, None),
     ];
     let slices = Some(SLICE_COLUMNS);
     v.push(("cached order + list kinds, 4 threads".into(), ListPaths { parallel_kinds: true, ..cached }, Some(4)));
+    v.push(("all + list kinds, 4 threads".into(), ListPaths { parallel_kinds: true, ..ALL_SERIAL }, Some(4)));
     for threads in [1, 2, 4, 8] {
         v.push((
             format!("cached order + slices, {threads} threads"),
