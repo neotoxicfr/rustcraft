@@ -701,21 +701,30 @@ fn prime_many_matches_prime_per_map() {
 }
 
 /// L9-STRUCT: height maps of generated chunks (noise terrain with structures, flat) from one walk
-/// per column (`PRIME_ONE_WALK`) equal to one walk per map.
+/// per column (`PRIME_ONE_WALK`) equal to one walk per map; for the noise terrain, also the maps
+/// found while converting (C1-M15, `CONVERT_WITH_HEIGHTMAPS`, `SKIP_AIR_SECTIONS`).
 #[test]
 fn generated_heightmaps_one_walk_match() {
+    use crate::chunkgen::ConversionOpts;
     let Some(w) = world_data() else { return };
     let all: Vec<(i32, i32)> = (-2..=2).flat_map(|x| (-2..=2).map(move |z| (x, z))).collect();
     for seed in [Some(1), Some(20261011), None] {
-        let dg = dim(w, seed);
+        let mut dg = dim(w, seed);
         let mut cache = crate::terrain::BiomeCache::default();
         dg.prepare_biomes(&mut cache, &all);
         for &(x, z) in &all {
-            opt::force(&["PRIME_ONE_WALK"], Some(true));
-            let a = dg.terrain(x, z, &cache, None);
-            opt::force(&["PRIME_ONE_WALK"], Some(false));
-            let b = dg.terrain(x, z, &cache, None);
-            assert_eq!(a.heights, b.heights, "seed {seed:?}, chunk {x} {z}");
+            let mut terrain = |conversion: ConversionOpts, one_walk: bool| {
+                dg.conversion = conversion;
+                opt::force(&["PRIME_ONE_WALK"], Some(one_walk));
+                dg.terrain(x, z, &cache, None)
+            };
+            let per_map = terrain(ConversionOpts::OLD, false);
+            let one_walk = terrain(ConversionOpts::OLD, true);
+            let skip_air = terrain(ConversionOpts { skip_air_sections: true, ..ConversionOpts::OLD }, true);
+            let while_converting = terrain(ConversionOpts::NEW, false);
+            for (name, c) in [("one walk", one_walk), ("air skipped", skip_air), ("while converting", while_converting)] {
+                assert_eq!(c.heights, per_map.heights, "seed {seed:?}, chunk {x} {z}, {name}");
+            }
         }
     }
     opt::force(&["PRIME_ONE_WALK"], None);

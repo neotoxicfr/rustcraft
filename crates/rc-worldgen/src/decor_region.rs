@@ -61,6 +61,77 @@ impl Hm {
 /// Maps kept up to date at each placement during decoration.
 pub const FINAL_HMS: [Hm; 4] = [Hm::WorldSurface, Hm::OceanFloor, Hm::MotionBlocking, Hm::MotionBlockingNoLeaves];
 
+/// Cells of a section of 16 layers.
+const SECTION_CELLS: usize = 4096;
+
+/// Sections of terrain identifiers paired with the sections of states they convert into, from the
+/// bottom (as many as `terrain` holds).
+fn sections<'a>(
+    terrain: &'a [u16],
+    states: &'a mut [State],
+) -> impl DoubleEndedIterator<Item = (&'a [u16; SECTION_CELLS], &'a mut [State; SECTION_CELLS])> + ExactSizeIterator {
+    terrain.as_chunks::<SECTION_CELLS>().0.iter().zip(states.as_chunks_mut::<SECTION_CELLS>().0)
+}
+
+/// The cells (a section or a layer of terrain identifiers) hold plain air only (identifier 0). No
+/// early exit: the OR over every identifier vectorises and costs less than a branch per cell.
+#[inline]
+fn is_terrain_air(cells: &[u16]) -> bool {
+    cells.iter().fold(0, |any, &id| any | id) == 0
+}
+
+/// Search of the four final height maps layer by layer from the top: per column, the map bits not
+/// found yet; the columns still searching are listed so that a layer visits only them.
+struct FinalMapSearch {
+    /// Heights of [`FINAL_HMS`], in its order.
+    heights: [[i16; 256]; 4],
+    missing: [u8; 256],
+    open: [u8; 256],
+    open_len: usize,
+}
+
+impl FinalMapSearch {
+    fn new(bottom: i16) -> Self {
+        let every_map = FINAL_HMS.iter().fold(0, |bits, m| bits | m.bit());
+        FinalMapSearch {
+            heights: [[bottom; 256]; 4],
+            missing: [every_map; 256],
+            open: std::array::from_fn(|col| col as u8),
+            open_len: 256,
+        }
+    }
+
+    /// Layer at world y (terrain identifiers, index `x + 16·z`), below every layer visited so far;
+    /// `map_bits[id]` = height map bits of the identifier's state.
+    fn visit_layer(&mut self, y: i32, layer: &[u16], map_bits: &[u8]) {
+        // A layer of plain air has nothing to find: one vectorised test instead of a lookup per
+        // open column (the layers above the ground of the highest sections).
+        if map_bits[0] == 0 && is_terrain_air(layer) {
+            return;
+        }
+        let mut k = 0;
+        while k < self.open_len {
+            let col = self.open[k] as usize;
+            let hit = map_bits[layer[col] as usize] & self.missing[col];
+            if hit != 0 {
+                for (m, heights) in FINAL_HMS.iter().zip(&mut self.heights) {
+                    if hit & m.bit() != 0 {
+                        heights[col] = (y + 1) as i16;
+                    }
+                }
+                self.missing[col] &= !hit;
+                if self.missing[col] == 0 {
+                    // Column done: the last open one takes its place in the list.
+                    self.open_len -= 1;
+                    self.open[k] = self.open[self.open_len];
+                    continue;
+                }
+            }
+            k += 1;
+        }
+    }
+}
+
 /// Chunk at status "terrain" (decoration input) then decorated.
 #[derive(Debug, Clone)]
 pub struct DecoChunk {
@@ -206,6 +277,71 @@ impl DecoChunk {
                     left &= !hit;
                 }
             }
+        }
+    }
+
+    /// Writes into the blocks, from the chunk bottom, the network state `to_state[id]` of each
+    /// terrain block identifier of `terrain` (same layout), one section of 16 layers at a time. A
+    /// section of plain terrain air only (identifier 0; cave air is converted like any block)
+    /// becomes `air` without a lookup per cell: nothing is written when the chunk is `fresh` (all
+    /// zero) and `air` is 0, the section is filled otherwise. Returns the top y of the highest
+    /// section that holds anything else (the chunk bottom if none).
+    pub fn convert_terrain_skipping_air(
+        &mut self,
+        terrain: &[u16],
+        to_state: &[State],
+        air: State,
+        fresh: bool,
+    ) -> i32 {
+        let already_air = fresh && air == 0;
+        let mut filled_sections = 0;
+        for (k, (src, dst)) in sections(terrain, &mut self.blocks).enumerate() {
+            if is_terrain_air(src) {
+                if !already_air {
+                    dst.fill(air);
+                }
+                continue;
+            }
+            for (d, &id) in dst.iter_mut().zip(src) {
+                *d = to_state[id as usize];
+            }
+            filled_sections = k + 1;
+        }
+        self.min_y + 16 * filled_sections as i32
+    }
+
+    /// Converts `terrain` like [`Self::convert_terrain_skipping_air`] (plain air sections skipped
+    /// only with `skip_air`), but layer by layer from the top, and finds the four final height maps
+    /// on the way, which replaces the walk of [`Self::prime_final_heightmaps`]. `self` is a new
+    /// chunk (every state 0); `map_bits[id]`: the height map bits of `to_state[id]`. Exact as long
+    /// as the skipped air counts in no map.
+    pub fn convert_terrain_finding_final_maps(
+        &mut self,
+        terrain: &[u16],
+        to_state: &[State],
+        map_bits: &[u8],
+        air: State,
+        skip_air: bool,
+    ) {
+        let mut search = FinalMapSearch::new(self.min_y as i16);
+        for (k, (src, dst)) in sections(terrain, &mut self.blocks).enumerate().rev() {
+            if skip_air && is_terrain_air(src) {
+                if air != 0 {
+                    dst.fill(air);
+                }
+                continue;
+            }
+            let layers = src.as_chunks::<256>().0.iter().zip(dst.as_chunks_mut::<256>().0);
+            for (layer, (src, dst)) in layers.enumerate().rev() {
+                for (d, &id) in dst.iter_mut().zip(src) {
+                    *d = to_state[id as usize];
+                }
+                let y = self.min_y + 16 * k as i32 + layer as i32;
+                search.visit_layer(y, src, map_bits);
+            }
+        }
+        for (k, m) in FINAL_HMS.iter().enumerate() {
+            self.heights[*m as usize] = search.heights[k];
         }
     }
 
@@ -862,6 +998,85 @@ mod tests {
             let i = c.index(5, y, 9);
             c.blocks[i] = block;
             assert_eq!(c.top_non_air(b), want, "single state {block} at y = {y}");
+        }
+    }
+
+    /// Terrain identifiers for the conversion tests: 0 plain air, 1 cave air, 2 stone, 3 water,
+    /// 4 leaves, 5 grass; their states are 100 + identifier, and their height map bits below.
+    const STATES: [u32; 6] = [100, 101, 102, 103, 104, 105];
+    const MAP_BITS: [u8; 6] = [0, 0, 1 | 2 | 4 | 8, 1 | 4 | 8, 1 | 4, 1];
+
+    /// 24 sections drawn: every section kind (plain air, cave air only, sparse, dense) in turn,
+    /// sparse cells so that columns stay open deep down.
+    fn drawn_terrain(seed: i64) -> Vec<u16> {
+        let mut rng = crate::decor_rng::DecoRng::legacy(seed);
+        let mut terrain = vec![0u16; 24 * 4096];
+        for (k, section) in terrain.as_chunks_mut::<4096>().0.iter_mut().enumerate() {
+            match (k + seed as usize) % 4 {
+                0 => {}
+                1 => section.fill(1),
+                kind => {
+                    let one_in = if kind == 2 { 200 } else { 3 };
+                    for id in section.iter_mut() {
+                        if rng.next_int_bounded(one_in) == 0 {
+                            *id = rng.next_int_bounded(STATES.len() as i32) as u16;
+                        }
+                    }
+                }
+            }
+        }
+        terrain
+    }
+
+    /// Converted states cell by cell (the old path).
+    fn converted(terrain: &[u16]) -> Vec<u32> {
+        terrain.iter().map(|&id| STATES[id as usize]).collect()
+    }
+
+    /// Skipping sections of plain terrain air gives the states of the cell by cell conversion, into
+    /// a chunk holding other states (filled) as into a new one with air at 0 (left as is), and
+    /// returns the top of the highest section that is not plain air: a section of cave air only is
+    /// converted and counts.
+    #[test]
+    fn skipping_air_sections_converts_like_cell_by_cell() {
+        for seed in 0..8 {
+            let terrain = drawn_terrain(seed);
+            let want = converted(&terrain);
+            let sections = terrain.as_chunks::<4096>().0;
+            let highest = sections.iter().rposition(|s| s.iter().any(|&id| id != 0)).map_or(0, |k| k + 1);
+            let mut old = DecoChunk::new(0, 0, -64, 384);
+            old.blocks.fill(7);
+            let top = old.convert_terrain_skipping_air(&terrain, &STATES, STATES[0], false);
+            assert_eq!(old.blocks, want, "seed {seed}, chunk holding other states");
+            assert_eq!(top, -64 + 16 * highest as i32, "seed {seed}, ceiling");
+            let zero_air: Vec<u32> = std::iter::once(0).chain(STATES[1..].iter().copied()).collect();
+            let mut new = DecoChunk::new(0, 0, -64, 384);
+            new.convert_terrain_skipping_air(&terrain, &zero_air, 0, true);
+            let want_zero: Vec<u32> = terrain.iter().map(|&id| zero_air[id as usize]).collect();
+            assert_eq!(new.blocks, want_zero, "seed {seed}, new chunk with air at 0");
+        }
+    }
+
+    /// The four final maps found while converting layer by layer equal a walk down each column per
+    /// map, with and without the plain air sections skipped, and the states equal the cell by cell
+    /// conversion.
+    #[test]
+    fn final_maps_found_while_converting_match_a_walk_per_column() {
+        for seed in 0..8 {
+            let terrain = drawn_terrain(seed);
+            for skip_air in [false, true] {
+                let mut c = DecoChunk::new(0, 0, -64, 384);
+                c.convert_terrain_finding_final_maps(&terrain, &STATES, &MAP_BITS, STATES[0], skip_air);
+                assert_eq!(c.blocks, converted(&terrain), "seed {seed}, skip {skip_air}: states");
+                for m in super::FINAL_HMS {
+                    for col in 0..256 {
+                        let first = (0..384).rev().find(|&y| MAP_BITS[terrain[y * 256 + col] as usize] & m.bit() != 0);
+                        let want = first.map_or(-64, |y| y as i16 - 64 + 1);
+                        let got = c.heights[m as usize][col];
+                        assert_eq!(got, want, "seed {seed}, skip {skip_air}, {m:?}, column {col}");
+                    }
+                }
+            }
         }
     }
 }
