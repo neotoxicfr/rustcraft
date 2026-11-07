@@ -224,8 +224,7 @@ impl Server {
 
     /// The intersection of a ray with a one-cell shape on the original segment.
     fn clip_cell_hit(&self, cell: [i32; 3], from: [f64; 3], to: [f64; 3]) -> Option<BlockHit> {
-        let mut boxes = Vec::new();
-        self.phys.collision(self.st(cell), &mut boxes);
+        let boxes = self.phys.shape(self.st(cell));
         if boxes.is_empty() {
             return None;
         }
@@ -245,7 +244,7 @@ impl Server {
             });
         }
         let mut best: Option<(f64, usize)> = None;
-        for b in &boxes {
+        for b in boxes {
             let bb = b.offset(c[0], c[1], c[2]);
             // Same sweep as the intersection of a ray with a list of boxes: the scale shrinks from one box to the next.
             let mut sub = aabb_clip(&bb, from, to);
@@ -593,10 +592,8 @@ impl Server {
         let bp = p.block_pos();
         let state = self.st(bp);
         if physics {
-            let mut boxes = Vec::new();
-            self.phys.collision(state, &mut boxes);
             let c = bp.map(f64::from);
-            if boxes.iter().any(|b| contains(&b.offset(c[0], c[1], c[2]), p.pos)) {
+            if self.phys.shape(state).iter().any(|b| contains(&b.offset(c[0], c[1], c[2]), p.pos)) {
                 p.vel = [0.0; 3];
                 p.in_ground = true;
             }

@@ -362,10 +362,8 @@ fn traversal_possible(s: &Server, m: &Mob, travel: Option<[f64; 3]>, p: [i32; 3]
     if s.is_air(p) {
         return true;
     }
-    let mut shapes = Vec::new();
-    s.phys.collision(s.st(p), &mut shapes);
     let shapes: Vec<rc_physics::Aabb> =
-        shapes.iter().map(|b| b.offset(f64::from(p[0]), f64::from(p[1]), f64::from(p[2]))).collect();
+        s.phys.shape(s.st(p)).iter().map(|b| b.offset(f64::from(p[0]), f64::from(p[1]), f64::from(p[2]))).collect();
     let no_collision = match travel {
         Some(t) => !super::super::nether::ghast::collided_along(&m.bbox(), t, &shapes),
         None => shapes.is_empty(),

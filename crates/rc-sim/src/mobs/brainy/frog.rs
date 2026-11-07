@@ -348,9 +348,7 @@ pub fn lay_spawn(s: &mut Server, m: &mut Mob, b: &mut Brain) -> bool {
 
 /// Does the collision shape touch the top of the block (non-empty top face)?
 fn top_face(s: &Server, p: [i32; 3]) -> bool {
-    let mut boxes = Vec::new();
-    s.phys.collision(s.st(p), &mut boxes);
-    boxes.iter().any(|b| b.max[1] >= 1.0 - 1.0e-7)
+    s.phys.shape(s.st(p)).iter().any(|b| b.max[1] >= 1.0 - 1.0e-7)
 }
 
 // ---------- Long jump ----------

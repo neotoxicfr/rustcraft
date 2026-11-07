@@ -139,8 +139,7 @@ impl Server {
         if climb || open_trap {
             return None;
         }
-        let mut boxes = Vec::new();
-        self.phys.collision(s, &mut boxes);
+        let boxes = self.phys.shape(s);
         if boxes.is_empty() {
             return None;
         }

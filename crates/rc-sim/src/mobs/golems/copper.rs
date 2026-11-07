@@ -830,14 +830,13 @@ impl Server {
     /// Bounds of the target's collision shape, inflated, against the mob's box
     /// centered at `from`.
     fn within_target(&self, m: &Mob, p: [i32; 3], dist: f64, from: [f64; 3]) -> bool {
-        let mut boxes = Vec::new();
-        self.phys.collision(self.st(p), &mut boxes);
+        let boxes = self.phys.shape(self.st(p));
         if boxes.is_empty() {
             return false;
         }
         let mut lo = [f64::MAX; 3];
         let mut hi = [f64::MIN; 3];
-        for b in &boxes {
+        for b in boxes {
             for k in 0..3 {
                 lo[k] = lo[k].min(b.min[k]);
                 hi[k] = hi[k].max(b.max[k]);
