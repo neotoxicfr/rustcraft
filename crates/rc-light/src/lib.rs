@@ -1037,7 +1037,7 @@ mod tests {
                 set(&mut b, p, s);
                 ps.push(p);
             }
-            let before: std::collections::HashMap<_, _> =
+            let before: hashbrown::HashMap<_, _> =
                 a.0.iter().map(|(&k, (_, s, bl))| (k, (s.clone(), bl.clone()))).collect();
             let touched = relight_zones(&mut a, 48, &t, true, &ps, true);
             relight_zones(&mut b, 48, &t, true, &ps, false);

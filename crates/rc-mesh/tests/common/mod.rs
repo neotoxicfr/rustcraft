@@ -6,7 +6,7 @@
 //! `RUSTCRAFT_OPT_REQUIRE=1`.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use rc_mesh::blocks::{BiomePalette, BlockMesh, Tables};

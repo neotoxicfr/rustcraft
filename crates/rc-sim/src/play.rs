@@ -1309,8 +1309,8 @@ mod tests {
     fn trace_columns_cover_each_group_box() {
         let mut changes: Vec<[i32; 3]> = (0..=21).map(|i| [i * 6, 64, i * 6]).collect();
         changes.push([1000, 64, -1000]);
-        let got: std::collections::HashSet<(i32, i32)> = super::trace_columns(&changes).into_iter().collect();
-        let mut want = std::collections::HashSet::new();
+        let got: hashbrown::HashSet<(i32, i32)> = super::trace_columns(&changes).into_iter().collect();
+        let mut want = hashbrown::HashSet::new();
         for cx in -1..=8 {
             for cz in -1..=8 {
                 want.insert((cx, cz));

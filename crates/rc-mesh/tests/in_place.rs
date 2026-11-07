@@ -179,7 +179,7 @@ fn in_place_on_reference_columns() {
 }
 
 fn reference_meshes() -> Option<Vec<BlockMesh>> {
-    use std::collections::HashMap;
+    use hashbrown::HashMap;
     use std::sync::Arc;
     let (cap, d) = (rc_testdata::reference_capture()?, rc_testdata::version_data()?);
     let ctx = rc_proto_v777::chunk::ChunkContext::new(24, d.states.len() as u32, 67);

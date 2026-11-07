@@ -88,6 +88,7 @@ fn hash_bytes(h: &mut impl Hasher, layers: &[rc_world::LightLayer]) {
 /// Fingerprints (full chunks: NBT, final light and number of relights; proto-chunks never
 /// full: last version sent, final flush included, what remains on disk).
 /// `lazy`: lazy writing of proto-chunks (`RUSTCRAFT_OPT_PROTO_LAZY`).
+#[allow(clippy::disallowed_types, reason = "test fingerprint: the same fixed SipHash for every run it compares")]
 fn run(
     data: &Arc<VersionData>,
     template: &Path,

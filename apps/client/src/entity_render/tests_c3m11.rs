@@ -422,7 +422,7 @@ fn keyframe_static_names_pose_like_formatted_names() {
     let formatted = EntOpt { keyframe_static_names: false, ..EntOpt::NEW };
     let first = keyframe_scene(&k, 20);
     run(&mut k, &first, EntOpt::NEW);
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = hashbrown::HashSet::new();
     for age in 20..320 {
         let ents = keyframe_scene(&k, age);
         let literal = run(&mut k, &ents, EntOpt::NEW);

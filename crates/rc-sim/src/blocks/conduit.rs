@@ -238,7 +238,7 @@ mod tests {
     /// one of the three planes of the conduit and on the edge (radius 2) of its ring.
     #[test]
     fn frame_has_the_42_ring_places() {
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = hashbrown::HashSet::new();
         for o in FRAME {
             assert!(seen.insert(o), "place {o:?} en double");
             assert!(o.iter().any(|v| v.abs() == 2), "{o:?} in the central cube");

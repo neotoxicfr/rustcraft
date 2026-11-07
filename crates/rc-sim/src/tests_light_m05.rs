@@ -186,6 +186,7 @@ impl Mirror {
     }
 
     /// Layers of each received column compared with those of the server.
+    #[allow(clippy::disallowed_types, reason = "test fingerprint: the same fixed SipHash for every run it compares")]
     fn compare(&mut self, s: &Server, tick: u64) {
         use std::hash::{Hash, Hasher};
         let mut keys: Vec<(i32, i32)> = s.sent.iter().copied().collect();

@@ -1125,7 +1125,7 @@ mod tests {
     fn character_names_full_table() {
         let p = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/g3f10/java-names.txt");
         let text = std::fs::read_to_string(p).expect("Java table missing");
-        let mut java = std::collections::HashMap::new();
+        let mut java = hashbrown::HashMap::new();
         for l in text.lines() {
             let (h, n) = l.split_once(' ').unwrap();
             java.insert(u32::from_str_radix(h, 16).unwrap(), n.to_owned());

@@ -437,7 +437,7 @@ mod tests {
         let mut bodies = vec![&ep.function];
         let mut todo = Vec::new();
         calls(&ep.function.body, &mut todo);
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = hashbrown::HashSet::new();
         while let Some(h) = todo.pop() {
             if seen.insert(h) {
                 bodies.push(&m.functions[h]);
@@ -486,7 +486,7 @@ mod tests {
                 }
             }
             // Functions reached from the terrain vertices (the fragments are off topic).
-            let mut seen = std::collections::HashSet::new();
+            let mut seen = hashbrown::HashSet::new();
             while let Some(h) = todo.pop() {
                 if seen.insert(h) {
                     n += value_array_indexing(&m, &m.functions[h], &info[h]);

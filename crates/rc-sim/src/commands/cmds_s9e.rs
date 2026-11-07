@@ -2,7 +2,7 @@
 //! effects imposed on a player), `fetchprofile` (player profile resolved by the session
 //! services, or carried by a player or a mannequin).
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
