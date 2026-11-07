@@ -992,8 +992,8 @@ fn fill_raw_grid(slots: &[Slot<'_>; 27], out: &mut Vec<u16>) {
         fn avx2(slots: &[Slot<'_>; 27], out: &mut [u16]) {
             fill_raw_rows(slots, out);
         }
-        if std::arch::is_x86_feature_detected!("avx2") {
-            // SAFETY: AVX2 has just been detected on this processor.
+        if rc_data::cpu::has_avx2() {
+            // SAFETY: the shared detection found AVX2 on this processor.
             return unsafe { avx2(slots, out) };
         }
     }
