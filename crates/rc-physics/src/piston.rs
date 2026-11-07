@@ -295,8 +295,7 @@ impl Tables {
 
     /// Area swept by the moving block at `pos` going to `new_progress`.
     pub fn piston_sweep(&self, pos: [i32; 3], m: &Moving, new_progress: f32) -> Option<Sweep> {
-        let mut shape = Vec::new();
-        self.collision(self.pushing_state(m), &mut shape);
+        let shape = self.shape(self.pushing_state(m));
         let first = shape.first()?;
         let movement = m.movement();
         let delta = f64::from(new_progress - m.progress);
@@ -327,9 +326,7 @@ impl Tables {
         if axis(movement) == 1 {
             return None;
         }
-        let mut shape = Vec::new();
-        self.collision(m.moved, &mut shape);
-        let top = shape.iter().map(|b| b.max[1]).fold(f64::NEG_INFINITY, f64::max);
+        let top = self.shape(m.moved).iter().map(|b| b.max[1]).fold(f64::NEG_INFINITY, f64::max);
         let o = m.offset();
         let o = [f64::from(pos[0]) + o[0], f64::from(pos[1]) + o[1], f64::from(pos[2]) + o[2]];
         let b = shift(&Aabb { min: [0.0, top, 0.0], max: [1.0, 1.500_001_000_000_000_1, 1.0] }, o);
@@ -573,6 +570,7 @@ mod tests {
     #[test]
     #[ignore]
     fn bench_collision_moving_check() {
+        crate::collide::WALK_CHECK_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
         let d = rc_testdata::version_data().expect("version data absent (extraction)");
         let t = Tables::new(&d);
         let stone = d.blocks.iter().find(|b| b.name == "minecraft:stone").expect("stone").default_state;

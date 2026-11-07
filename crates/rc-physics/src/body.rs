@@ -427,9 +427,7 @@ impl Body {
             inside::BUBBLE_COLUMN | BUBBLES_DOWN if precise => {
                 let down = k == BUBBLES_DOWN;
                 let up = Self::state(w, [c[0], c[1] + 1, c[2]]);
-                let mut shape = Vec::new();
-                t.collision(up, &mut shape);
-                let open = shape.is_empty() && t.fluids.fluid(up) == Fluid::None;
+                let open = t.shape(up).is_empty() && t.fluids.fluid(up) == Fluid::None;
                 let vy = self.vel[1];
                 self.vel[1] = match (open, down) {
                     (true, true) => (vy - 0.03).max(-0.9),

@@ -6,37 +6,64 @@ pub const EPS: f64 = 1.0e-7;
 
 /// Collision boxes of the blocks that count in zone `b` (edge cell rules).
 pub fn collect(w: &dyn World, b: &Aabb, out: &mut Vec<Aabb>) {
-    collect_in(w, b, out, false);
+    collect_in(w, b, out, WalkOrder::YOuter, WalkPath::current());
 }
 
 /// Like `collect`, in the game's walk order (x then y then z): useful when the
 /// first box found matters (auto-jump).
 pub fn collect_ordered(w: &dyn World, b: &Aabb, out: &mut Vec<Aabb>) {
-    collect_in(w, b, out, true);
+    collect_in(w, b, out, WalkOrder::ZOuter, WalkPath::current());
 }
 
-/// Level of `RUSTCRAFT_OPT_ISFREE`, read once: 0 old path (`is_free` collects all the
-/// boxes then queries the entities, new cell buffer on every collection); 1 `is_free` exits
-/// at the first overlap and only queries the entities if blocks and border let through;
-/// 2 (default): 1, plus the thread's cell buffer reused (collection and `is_free`).
-pub fn is_free_mode() -> u8 {
-    static M: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *M.get_or_init(|| match rc_data::env_str!("RUSTCRAFT_OPT_ISFREE").map(str::trim) {
-        Some("0") => 0,
-        Some("1") => 1,
-        _ => 2,
-    })
+/// `collect` walking every cell of the margin one by one, the path before
+/// `RUSTCRAFT_OPT_COLLISION_SCAN_TRIM` and `RUSTCRAFT_OPT_COLLISION_BATCH_READ`: the reference of
+/// the equivalence proofs, here and in the crates that wrap a world.
+pub fn collect_untrimmed(w: &dyn World, b: &Aabb, out: &mut Vec<Aabb>) {
+    collect_in(w, b, out, WalkOrder::YOuter, WalkPath::WHOLE);
+}
+
+/// Order of the collision walk; x always varies fastest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WalkOrder {
+    /// y outermost, then z.
+    YOuter,
+    /// The game's order (x, then y, then z): z outermost, then y.
+    ZOuter,
+}
+
+/// Path of `is_free` and of the cell buffer, `RUSTCRAFT_OPT_ISFREE` (read once): `0`
+/// [`IsFreePath::CollectAll`], `1` [`IsFreePath::FirstOverlap`], anything else the default
+/// [`IsFreePath::FirstOverlapSharedBuffer`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IsFreePath {
+    /// Old path: every box collected, then the entities always queried; a new cell buffer per walk.
+    CollectAll,
+    /// Exits at the first overlap; the entities are only queried if blocks and border let through.
+    FirstOverlap,
+    /// `FirstOverlap`, plus the thread's cell buffer reused by every walk (collections too).
+    FirstOverlapSharedBuffer,
+}
+
+impl IsFreePath {
+    pub fn current() -> IsFreePath {
+        static PATH: std::sync::OnceLock<IsFreePath> = std::sync::OnceLock::new();
+        *PATH.get_or_init(|| match rc_data::env_str!("RUSTCRAFT_OPT_ISFREE").map(str::trim) {
+            Some("0") => IsFreePath::CollectAll,
+            Some("1") => IsFreePath::FirstOverlap,
+            _ => IsFreePath::FirstOverlapSharedBuffer,
+        })
+    }
 }
 
 thread_local! {
-    /// Buffer of the boxes of a cell, reused from one call to the next (level 2).
+    /// Buffer of the boxes of a cell, reused from one call to the next (`FirstOverlapSharedBuffer`).
     static CELL: std::cell::RefCell<Vec<Aabb>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// `f` with a cell buffer: the thread's at level 2 (a new one if it is already borrowed by
-/// a nested call), otherwise a new one.
-pub(crate) fn with_cell<R>(mode: u8, f: impl FnOnce(&mut Vec<Aabb>) -> R) -> R {
-    if mode >= 2 {
+/// `f` with a cell buffer: the thread's on the shared-buffer path (a new one if it is already
+/// borrowed by a nested call), otherwise a new one.
+pub(crate) fn with_cell<R>(path: IsFreePath, f: impl FnOnce(&mut Vec<Aabb>) -> R) -> R {
+    if path == IsFreePath::FirstOverlapSharedBuffer {
         CELL.with(|c| match c.try_borrow_mut() {
             Ok(mut v) => f(&mut v),
             Err(_) => f(&mut Vec::new()),
@@ -46,10 +73,10 @@ pub(crate) fn with_cell<R>(mode: u8, f: impl FnOnce(&mut Vec<Aabb>) -> R) -> R {
     }
 }
 
-fn collect_in(w: &dyn World, b: &Aabb, out: &mut Vec<Aabb>, zyx: bool) {
+pub(crate) fn collect_in(w: &dyn World, b: &Aabb, out: &mut Vec<Aabb>, order: WalkOrder, path: WalkPath) {
     out.clear();
-    with_cell(is_free_mode(), |cell| {
-        scan(w, b, zyx, cell, |_, bx| {
+    with_cell(IsFreePath::current(), |cell| {
+        walk_checked(w, b, order, path, cell, |_, bx| {
             out.push(bx);
             false
         })
@@ -66,23 +93,142 @@ fn scan_bounds(b: &Aabb) -> ([i32; 3], [i32; 3]) {
     (b.min.map(|v| floor(v - EPS) - 1), b.max.map(|v| floor(v + EPS) + 1))
 }
 
+/// Paths of the collision walk: `trim` skips the cells out of reach of the shapes
+/// (`RUSTCRAFT_OPT_COLLISION_SCAN_TRIM`), `batch` reads the states of the walked cells in one
+/// call to the world (`RUSTCRAFT_OPT_COLLISION_BATCH_READ`). Both on by default, `=0` turns one off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WalkPath {
+    pub(crate) trim: bool,
+    pub(crate) batch: bool,
+}
+
+impl WalkPath {
+    /// The path before both: every cell of the margin, read one by one.
+    pub(crate) const WHOLE: WalkPath = WalkPath { trim: false, batch: false };
+
+    pub(crate) fn current() -> WalkPath {
+        WalkPath {
+            trim: rc_data::opt_switch!("RUSTCRAFT_OPT_COLLISION_SCAN_TRIM"),
+            batch: rc_data::opt_switch!("RUSTCRAFT_OPT_COLLISION_BATCH_READ"),
+        }
+    }
+}
+
+/// Micro-benches of this crate's tests: the check of every walk would be timed with them.
+#[cfg(test)]
+pub(crate) static WALK_CHECK_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `RUSTCRAFT_COLLISION_WALK_CHECK=1` (and always in this crate's tests, benches aside): every
+/// trimmed or batched walk is compared with the whole one and panics on the first difference.
+fn walk_check() -> bool {
+    #[cfg(test)]
+    if !WALK_CHECK_OFF.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    rc_data::env_str!("RUSTCRAFT_COLLISION_WALK_CHECK") == Some("1")
+}
+
+/// Narrows the cells `lo..=hi` to those whose boxes can reach `b`: on an axis, a box of cell `c`
+/// spans at most `c + reach.min .. c + reach.max`, and only overlaps `b` if that span does.
+/// The test makes the same addition as placing a box in its cell, and the rounding is monotonic,
+/// so a skipped cell could never have produced a box (NaN and infinities included). `None`:
+/// no cell can reach `b`.
+fn reachable_span(reach: &Aabb, b: &Aabb, lo: [i32; 3], hi: [i32; 3]) -> Option<([i32; 3], [i32; 3])> {
+    let (mut first, mut last) = (lo, hi);
+    for a in 0..3 {
+        first[a] = (lo[a]..=hi[a]).find(|&c| f64::from(c) + reach.max[a] > b.min[a])?;
+        last[a] = (first[a]..=hi[a]).rev().find(|&c| f64::from(c) + reach.min[a] < b.max[a])?;
+    }
+    Some((first, last))
+}
+
 /// Walks the collision boxes (placed in the world) that touch `b`, according to the edge
 /// cell rules; `f` receives the cell and the box, and returns true to stop (the walk
 /// then returns true).
-pub(crate) fn scan(
+pub(crate) fn walk_collision_cells(
     w: &dyn World,
     b: &Aabb,
-    zyx: bool,
+    order: WalkOrder,
+    cell: &mut Vec<Aabb>,
+    f: impl FnMut([i32; 3], Aabb) -> bool,
+) -> bool {
+    walk_checked(w, b, order, WalkPath::current(), cell, f)
+}
+
+/// `walk_cells`, compared with the whole walk first in check mode.
+pub(crate) fn walk_checked(
+    w: &dyn World,
+    b: &Aabb,
+    order: WalkOrder,
+    path: WalkPath,
+    cell: &mut Vec<Aabb>,
+    f: impl FnMut([i32; 3], Aabb) -> bool,
+) -> bool {
+    if path != WalkPath::WHOLE && walk_check() {
+        assert_same_as_whole_walk(w, b, order, path);
+    }
+    walk_cells(w, b, order, path, cell, f)
+}
+
+/// Check mode: the walk on `path` gives the same cells and boxes, in the same order, as the whole one.
+fn assert_same_as_whole_walk(w: &dyn World, b: &Aabb, order: WalkOrder, path: WalkPath) {
+    let walk = |path: WalkPath| {
+        let mut found = Vec::new();
+        walk_cells(w, b, order, path, &mut Vec::new(), |c, bx| {
+            found.push((c, bx));
+            false
+        });
+        found
+    };
+    assert_eq!(walk(path), walk(WalkPath::WHOLE), "trimmed collision walk differs for {b:?} ({path:?})");
+}
+
+/// Cells whose states a batched walk reads at once (a mob's movement needs 4 to 30); a larger
+/// span is read cell by cell.
+const BATCH_CELLS: usize = 64;
+
+/// Number of cells of `first..=last`, `None` past `usize` (or an empty span).
+fn span_cells(first: [i32; 3], last: [i32; 3]) -> Option<usize> {
+    (0..3).try_fold(1usize, |n, a| {
+        let len = usize::try_from(i64::from(last[a]) - i64::from(first[a]) + 1).ok()?;
+        n.checked_mul(len)
+    })
+}
+
+/// The walk on `path`: `trim` skips the cells that cannot reach `b` (`World::shape_reach`),
+/// `batch` reads the states of the remaining cells in one `World::states_in` call. The edge
+/// rules still count from the whole margin `lo..=hi`.
+pub(crate) fn walk_cells(
+    w: &dyn World,
+    b: &Aabb,
+    order: WalkOrder,
+    path: WalkPath,
     cell: &mut Vec<Aabb>,
     mut f: impl FnMut([i32; 3], Aabb) -> bool,
 ) -> bool {
     let (lo, hi) = scan_bounds(b);
-    // Outer loops: (y, z) or (z, y); x always the fastest.
-    let (o, m) = if zyx { (2, 1) } else { (1, 2) };
-    for a in lo[o]..=hi[o] {
-        for c in lo[m]..=hi[m] {
-            let (y, z) = if zyx { (c, a) } else { (a, c) };
-            for x in lo[0]..=hi[0] {
+    let walked = if path.trim { reachable_span(&w.shape_reach(lo, hi), b, lo, hi) } else { Some((lo, hi)) };
+    let Some((first, last)) = walked else { return false };
+    // One column lookup for all the cells instead of one per cell (a hash lookup on the server).
+    let mut states = [crate::UNLOADED; BATCH_CELLS];
+    let batched = path.batch
+        && span_cells(first, last).is_some_and(|n| n <= BATCH_CELLS && w.states_in(first, last, &mut states[..n]));
+    let (nx, nz) = if batched { ((last[0] - first[0] + 1) as usize, (last[2] - first[2] + 1) as usize) } else { (0, 0) };
+    let read_state = |x: i32, y: i32, z: i32| {
+        let s = states[((y - first[1]) as usize * nz + (z - first[2]) as usize) * nx + (x - first[0]) as usize];
+        (s != crate::UNLOADED).then_some(s)
+    };
+    let (outer, middle) = match order {
+        WalkOrder::YOuter => (1, 2),
+        WalkOrder::ZOuter => (2, 1),
+    };
+    for a in first[outer]..=last[outer] {
+        for c in first[middle]..=last[middle] {
+            let (y, z) = match order {
+                WalkOrder::YOuter => (a, c),
+                WalkOrder::ZOuter => (c, a),
+            };
+            for x in first[0]..=last[0] {
                 let edges = u8::from(x == lo[0] || x == hi[0])
                     + u8::from(y == lo[1] || y == hi[1])
                     + u8::from(z == lo[2] || z == hi[2]);
@@ -92,7 +238,8 @@ pub(crate) fn scan(
                     continue;
                 }
                 if edges < 2 {
-                    let oversized = w.collision(x, y, z, cell);
+                    let oversized =
+                        if batched { w.collision_of_state(read_state(x, y, z), x, y, z, cell) } else { w.collision(x, y, z, cell) };
                     if edges == 1 && !oversized {
                         continue;
                     }
@@ -110,24 +257,32 @@ pub(crate) fn scan(
 }
 
 /// Distance allowed on axis `axis` for box `b` that wants to move by `d`.
-pub fn clip_axis(boxes: &[Aabb], b: &Aabb, axis: usize, mut d: f64) -> f64 {
+pub fn clip_axis(boxes: &[Aabb], b: &Aabb, axis: usize, d: f64) -> f64 {
+    clip_axis_parts(&[boxes], b, axis, d)
+}
+
+/// `clip_axis` over boxes given in several slices, walked in order as if they were one: the
+/// order matters (the walk stops as soon as the distance falls under `EPS`).
+fn clip_axis_parts(parts: &[&[Aabb]], b: &Aabb, axis: usize, mut d: f64) -> f64 {
     let (o1, o2) = match axis {
         0 => (1, 2),
         1 => (0, 2),
         _ => (0, 1),
     };
-    for s in boxes {
-        if d.abs() < EPS {
-            return 0.0;
-        }
-        let overlap = |a: usize| s.max[a] - EPS > b.min[a] && s.min[a] + EPS < b.max[a];
-        if !overlap(o1) || !overlap(o2) {
-            continue;
-        }
-        if d > 0.0 && s.min[axis] >= b.max[axis] - EPS {
-            d = d.min(s.min[axis] - b.max[axis]);
-        } else if d < 0.0 && s.max[axis] <= b.min[axis] + EPS {
-            d = d.max(s.max[axis] - b.min[axis]);
+    for part in parts {
+        for s in *part {
+            if d.abs() < EPS {
+                return 0.0;
+            }
+            let overlap = |a: usize| s.max[a] - EPS > b.min[a] && s.min[a] + EPS < b.max[a];
+            if !overlap(o1) || !overlap(o2) {
+                continue;
+            }
+            if d > 0.0 && s.min[axis] >= b.max[axis] - EPS {
+                d = d.min(s.min[axis] - b.max[axis]);
+            } else if d < 0.0 && s.max[axis] <= b.min[axis] + EPS {
+                d = d.max(s.max[axis] - b.min[axis]);
+            }
         }
     }
     if d.abs() < EPS { 0.0 } else { d }
@@ -135,12 +290,17 @@ pub fn clip_axis(boxes: &[Aabb], b: &Aabb, axis: usize, mut d: f64) -> f64 {
 
 /// Sweep Y, then X and Z (the larger first); returns the allowed movement.
 pub fn sweep(boxes: &[Aabb], start: &Aabb, d: [f64; 3]) -> [f64; 3] {
+    sweep_parts(&[boxes], start, d)
+}
+
+/// `sweep` over boxes given in several slices, in order (see `clip_axis_parts`).
+fn sweep_parts(parts: &[&[Aabb]], start: &Aabb, d: [f64; 3]) -> [f64; 3] {
     let mut m = [0.0f64; 3];
     let mut b = *start;
     let order = if d[0].abs() >= d[2].abs() { [1, 0, 2] } else { [1, 2, 0] };
     for axis in order {
         if d[axis] != 0.0 {
-            let v = clip_axis(boxes, &b, axis, d[axis]);
+            let v = clip_axis_parts(parts, &b, axis, d[axis]);
             m[axis] = v;
             let mut o = [0.0; 3];
             o[axis] = v;
@@ -150,71 +310,174 @@ pub fn sweep(boxes: &[Aabb], start: &Aabb, d: [f64; 3]) -> [f64; 3] {
     m
 }
 
+/// Boxes and heights of a `resolve`, kept per thread so that a movement allocates nothing once
+/// the buffers have grown.
+#[derive(Default)]
+struct ResolveBuffers {
+    blocks: Vec<Aabb>,
+    border: Vec<Aabb>,
+    entities: Vec<Aabb>,
+    heights: Vec<f32>,
+}
+
+thread_local! {
+    static RESOLVE: std::cell::RefCell<ResolveBuffers> = std::cell::RefCell::new(ResolveBuffers::default());
+}
+
+/// Paths of `resolve`, compared by the proofs and the benches: `trim` for
+/// `RUSTCRAFT_OPT_COLLISION_SCAN_TRIM`, `no_copy` for `RUSTCRAFT_OPT_RESOLVE_NO_COPY`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvePath {
+    pub(crate) walk: WalkPath,
+    pub(crate) no_copy: bool,
+}
+
+impl ResolvePath {
+    #[cfg(test)]
+    pub(crate) const OLD: ResolvePath = ResolvePath { walk: WalkPath::WHOLE, no_copy: false };
+
+    fn current() -> ResolvePath {
+        ResolvePath { walk: WalkPath::current(), no_copy: rc_data::opt_switch!("RUSTCRAFT_OPT_RESOLVE_NO_COPY") }
+    }
+}
+
 /// Full movement with step-up (§ 6.3). `on_ground`: state before the movement.
 pub fn resolve(w: &dyn World, start: &Aabb, d: [f64; 3], on_ground: bool, step: f64) -> [f64; 3] {
+    resolve_with(w, start, d, on_ground, step, ResolvePath::current())
+}
+
+/// `resolve` on a given path.
+pub(crate) fn resolve_with(w: &dyn World, start: &Aabb, d: [f64; 3], on_ground: bool, step: f64, path: ResolvePath) -> [f64; 3] {
+    if !path.no_copy {
+        return resolve_copying(w, start, d, on_ground, step, path.walk);
+    }
+    RESOLVE.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut buffers) => resolve_in(w, start, d, on_ground, step, path.walk, &mut buffers),
+        // A world that resolves a movement from inside a collision search: own buffers.
+        Err(_) => resolve_in(w, start, d, on_ground, step, path.walk, &mut ResolveBuffers::default()),
+    })
+}
+
+/// `resolve` with the boxes left in their own buffers: blocks, border and entities are walked
+/// as three slices in that order instead of being copied one after the other.
+#[allow(clippy::too_many_arguments)]
+fn resolve_in(
+    w: &dyn World,
+    start: &Aabb,
+    d: [f64; 3],
+    on_ground: bool,
+    step: f64,
+    walk: WalkPath,
+    buffers: &mut ResolveBuffers,
+) -> [f64; 3] {
+    let ResolveBuffers { blocks, border, entities, heights } = buffers;
     // Shape of the world border, if the entity is close to it (`weather-border.md` § 4.5).
-    let mut border = Vec::new();
+    border.clear();
     if let Some(b) = w.border() {
-        b.collision(start, &mut border);
+        b.collision(start, border);
     }
     // Solid entities: searched once in the zone of the movement and the step.
-    let mut ents = Vec::new();
-    w.entity_colliders(&start.expand_towards(d).expand_towards([0.0, step.max(0.0), 0.0]), &mut ents);
-    let mut boxes = Vec::new();
-    collect(w, &start.expand_towards(d), &mut boxes);
-    boxes.extend_from_slice(&border);
-    boxes.extend_from_slice(&ents);
-    let m = sweep(&boxes, start, d);
-    let blocked_down = d[1] != m[1] && d[1] < 0.0;
-    let horizontal = d[0] != m[0] || d[2] != m[2];
-    if step <= 0.0 || !(blocked_down || on_ground) || !horizontal {
-        return m;
+    entities.clear();
+    w.entity_colliders(&start.expand_towards(d).expand_towards([0.0, step.max(0.0), 0.0]), entities);
+    collect_in(w, &start.expand_towards(d), blocks, WalkOrder::YOuter, walk);
+    let allowed = sweep_parts(&[blocks, border, entities], start, d);
+    let Some((step_base, zone)) = step_up_zone(start, d, allowed, on_ground, step) else { return allowed };
+    collect_in(w, &zone, blocks, WalkOrder::YOuter, walk);
+    heights.clear();
+    push_step_heights(blocks.iter().chain(border.iter()).chain(entities.iter()), &step_base, allowed, step, heights);
+    let horizontal_len_sq = |v: [f64; 3]| v[0] * v[0] + v[2] * v[2];
+    for &c in heights.iter() {
+        let stepped = sweep_parts(&[blocks, border, entities], &step_base, [d[0], f64::from(c), d[2]]);
+        if horizontal_len_sq(stepped) > horizontal_len_sq(allowed) {
+            let dy = start.min[1] - step_base.min[1];
+            return [stepped[0], stepped[1] - dy, stepped[2]];
+        }
     }
-    let bs = if blocked_down { start.offset(0.0, m[1], 0.0) } else { *start };
-    let mut zone = bs.expand_towards([d[0], step, d[2]]);
+    allowed
+}
+
+/// Box the step-up starts from and zone it searches, or `None` when no step-up is tried: no step
+/// height, neither blocked downwards nor on the ground, or nothing blocked horizontally.
+fn step_up_zone(start: &Aabb, d: [f64; 3], allowed: [f64; 3], on_ground: bool, step: f64) -> Option<(Aabb, Aabb)> {
+    let blocked_down = d[1] != allowed[1] && d[1] < 0.0;
+    let horizontal = d[0] != allowed[0] || d[2] != allowed[2];
+    if step <= 0.0 || !(blocked_down || on_ground) || !horizontal {
+        return None;
+    }
+    let step_base = if blocked_down { start.offset(0.0, allowed[1], 0.0) } else { *start };
+    let mut zone = step_base.expand_towards([d[0], step, d[2]]);
     if !blocked_down {
         zone = zone.expand_towards([0.0, f64::from(-1.0e-5f32), 0.0]);
     }
-    collect(w, &zone, &mut boxes);
-    boxes.extend_from_slice(&border);
-    boxes.extend_from_slice(&ents);
-    // Candidate heights: Y edges of the boxes relative to the bottom of Bs, in f32, increasing.
-    let my = m[1] as f32;
-    let mut heights: Vec<f32> = Vec::new();
-    for s in &boxes {
+    Some((step_base, zone))
+}
+
+/// Candidate step heights: Y edges of the boxes relative to the bottom of `step_base`, in f32,
+/// sorted increasing without duplicates.
+fn push_step_heights<'a>(
+    boxes: impl Iterator<Item = &'a Aabb>,
+    step_base: &Aabb,
+    allowed: [f64; 3],
+    step: f64,
+    heights: &mut Vec<f32>,
+) {
+    let allowed_y = allowed[1] as f32;
+    for s in boxes {
         for y in [s.min[1], s.max[1]] {
-            let c = (y - bs.min[1]) as f32;
-            if c >= 0.0 && c != my && f64::from(c) <= step {
+            let c = (y - step_base.min[1]) as f32;
+            if c >= 0.0 && c != allowed_y && f64::from(c) <= step {
                 heights.push(c);
             }
         }
     }
     heights.sort_by(f32::total_cmp);
     heights.dedup();
-    let horiz = |v: [f64; 3]| v[0] * v[0] + v[2] * v[2];
+}
+
+/// Old `resolve` (`RUSTCRAFT_OPT_RESOLVE_NO_COPY=0`): new buffers on every call, border and
+/// entities copied after the blocks.
+fn resolve_copying(w: &dyn World, start: &Aabb, d: [f64; 3], on_ground: bool, step: f64, walk: WalkPath) -> [f64; 3] {
+    let mut border = Vec::new();
+    if let Some(b) = w.border() {
+        b.collision(start, &mut border);
+    }
+    let mut ents = Vec::new();
+    w.entity_colliders(&start.expand_towards(d).expand_towards([0.0, step.max(0.0), 0.0]), &mut ents);
+    let mut boxes = Vec::new();
+    collect_in(w, &start.expand_towards(d), &mut boxes, WalkOrder::YOuter, walk);
+    boxes.extend_from_slice(&border);
+    boxes.extend_from_slice(&ents);
+    let allowed = sweep(&boxes, start, d);
+    let Some((step_base, zone)) = step_up_zone(start, d, allowed, on_ground, step) else { return allowed };
+    collect_in(w, &zone, &mut boxes, WalkOrder::YOuter, walk);
+    boxes.extend_from_slice(&border);
+    boxes.extend_from_slice(&ents);
+    let mut heights: Vec<f32> = Vec::new();
+    push_step_heights(boxes.iter(), &step_base, allowed, step, &mut heights);
+    let horizontal_len_sq = |v: [f64; 3]| v[0] * v[0] + v[2] * v[2];
     for c in heights {
-        let t = sweep(&boxes, &bs, [d[0], f64::from(c), d[2]]);
-        if horiz(t) > horiz(m) {
-            let dy = start.min[1] - bs.min[1];
-            return [t[0], t[1] - dy, t[2]];
+        let stepped = sweep(&boxes, &step_base, [d[0], f64::from(c), d[2]]);
+        if horizontal_len_sq(stepped) > horizontal_len_sq(allowed) {
+            let dy = start.min[1] - step_base.min[1];
+            return [stepped[0], stepped[1] - dy, stepped[2]];
         }
     }
-    m
+    allowed
 }
 
 /// True if no collision box overlaps `b`.
 pub fn is_free(w: &dyn World, b: &Aabb) -> bool {
-    is_free_with(w, b, is_free_mode())
+    is_free_with(w, b, IsFreePath::current())
 }
 
-/// `is_free` at level `mode` of `RUSTCRAFT_OPT_ISFREE` (the proofs compare the levels).
-pub fn is_free_with(w: &dyn World, b: &Aabb, mode: u8) -> bool {
-    if mode == 0 {
+/// `is_free` on a given path of `RUSTCRAFT_OPT_ISFREE` (the proofs compare the paths).
+pub fn is_free_with(w: &dyn World, b: &Aabb, path: IsFreePath) -> bool {
+    if path == IsFreePath::CollectAll {
         return is_free_old(w, b);
     }
-    with_cell(mode, |cell| {
+    with_cell(path, |cell| {
         // A box retained by the walk already overlaps `b` (same test as the old filter).
-        if scan(w, b, false, cell, |_, _| true) {
+        if walk_collision_cells(w, b, WalkOrder::YOuter, cell, |_, _| true) {
             return false;
         }
         cell.clear();

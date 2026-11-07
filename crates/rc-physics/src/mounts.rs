@@ -1049,6 +1049,21 @@ struct LavaFloor<'a> {
     feet: f64,
 }
 
+impl LavaFloor<'_> {
+    /// The half-slab over the lava source `state` at `p` with no lava above, feet above it.
+    fn push_lava_floor(&self, state: Option<u32>, p: [i32; 3], out: &mut Vec<Aabb>) {
+        let s = state.unwrap_or(0);
+        let f = &self.t.fluids;
+        if f.fluid(s) == Fluid::Lava
+            && f.source.get(s as usize).copied().unwrap_or(false)
+            && self.feet > f64::from(p[1]) + 0.5 - 1.0e-5
+            && f.fluid(self.w.state(p[0], p[1] + 1, p[2]).unwrap_or(0)) != Fluid::Lava
+        {
+            out.push(Aabb { min: [0.0; 3], max: [1.0, 0.5, 1.0] });
+        }
+    }
+}
+
 impl World for LavaFloor<'_> {
     fn state(&self, x: i32, y: i32, z: i32) -> Option<u32> {
         self.w.state(x, y, z)
@@ -1056,20 +1071,27 @@ impl World for LavaFloor<'_> {
 
     fn collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
         let big = self.w.collision(x, y, z, out);
-        let s = self.w.state(x, y, z).unwrap_or(0);
-        let f = &self.t.fluids;
-        if f.fluid(s) == Fluid::Lava
-            && f.source.get(s as usize).copied().unwrap_or(false)
-            && self.feet > f64::from(y) + 0.5 - 1.0e-5
-            && f.fluid(self.w.state(x, y + 1, z).unwrap_or(0)) != Fluid::Lava
-        {
-            out.push(Aabb { min: [0.0; 3], max: [1.0, 0.5, 1.0] });
-        }
+        self.push_lava_floor(self.w.state(x, y, z), [x, y, z], out);
+        big
+    }
+
+    fn states_in(&self, first: [i32; 3], last: [i32; 3], out: &mut [u32]) -> bool {
+        self.w.states_in(first, last, out)
+    }
+
+    fn collision_of_state(&self, state: Option<u32>, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        let big = self.w.collision_of_state(state, x, y, z, out);
+        self.push_lava_floor(state, [x, y, z], out);
         big
     }
 
     fn border(&self) -> Option<&crate::WorldBorder> {
         self.w.border()
+    }
+
+    /// The half-slab over a lava source stays inside the cell.
+    fn shape_reach(&self, lo: [i32; 3], hi: [i32; 3]) -> Aabb {
+        self.w.shape_reach(lo, hi).union(&Aabb::UNIT)
     }
 }
 

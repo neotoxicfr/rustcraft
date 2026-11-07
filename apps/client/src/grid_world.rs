@@ -66,6 +66,35 @@ impl GridWorld<'_> {
         }
         true
     }
+
+    /// State at (x, y, z) in its column, already found (`None`: not loaded). Unlike the server,
+    /// an unloaded column stays `None` even outside the world's height.
+    fn state_in(&self, column: Option<&rc_world::Column>, x: i32, y: i32, z: i32) -> Option<u32> {
+        let c = column?;
+        let ly = y - self.min_y;
+        if !(0..self.height).contains(&ly) {
+            return Some(0);
+        }
+        c.block((x & 15) as usize, ly as usize, (z & 15) as usize)
+    }
+
+    /// Could one of the loaded sections holding cells of `lo..=hi` hold a state satisfying `pred`?
+    /// Answered by the section palettes, without reading a block; unloaded columns hold nothing
+    /// (their cells have no collision).
+    fn sections_may_hold(&self, lo: [i32; 3], hi: [i32; 3], pred: &dyn Fn(u32) -> bool) -> bool {
+        let bottom = (lo[1] - self.min_y).max(0);
+        let top = (hi[1] - self.min_y).min(self.height - 1);
+        if bottom > top {
+            return false;
+        }
+        let sections = (bottom >> 4) as usize..=(top >> 4) as usize;
+        (lo[0] >> 4..=hi[0] >> 4).any(|cx| {
+            (lo[2] >> 4..=hi[2] >> 4).any(|cz| {
+                let Some(c) = self.grid.get(cx, cz) else { return false };
+                sections.clone().any(|i| c.sections.get(i).is_some_and(|s| s.blocks.may_contain(pred)))
+            })
+        })
+    }
 }
 
 impl rc_physics::World for GridWorld<'_> {
@@ -81,16 +110,36 @@ impl rc_physics::World for GridWorld<'_> {
     }
 
     fn state(&self, x: i32, y: i32, z: i32) -> Option<u32> {
-        let c = self.grid.get(x >> 4, z >> 4)?;
-        let ly = y - self.min_y;
-        if !(0..self.height).contains(&ly) {
-            return Some(0);
-        }
-        c.block((x & 15) as usize, ly as usize, (z & 15) as usize)
+        self.state_in(self.grid.get(x >> 4, z >> 4), x, y, z)
     }
 
     fn collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<rc_physics::Aabb>) -> bool {
-        match self.state(x, y, z) {
+        self.collision_of_state(self.state(x, y, z), x, y, z, out)
+    }
+
+    /// One grid lookup per column instead of one per cell.
+    fn states_in(&self, first: [i32; 3], last: [i32; 3], out: &mut [u32]) -> bool {
+        let (nx, nz) = ((last[0] - first[0] + 1) as usize, (last[2] - first[2] + 1) as usize);
+        for cx in first[0] >> 4..=last[0] >> 4 {
+            for cz in first[2] >> 4..=last[2] >> 4 {
+                let column = self.grid.get(cx, cz);
+                let xs = first[0].max(cx << 4)..=last[0].min((cx << 4) + 15);
+                let zs = first[2].max(cz << 4)..=last[2].min((cz << 4) + 15);
+                for y in first[1]..=last[1] {
+                    for z in zs.clone() {
+                        let row = ((y - first[1]) as usize * nz + (z - first[2]) as usize) * nx;
+                        for x in xs.clone() {
+                            out[row + (x - first[0]) as usize] = self.state_in(column, x, y, z).unwrap_or(rc_physics::UNLOADED);
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn collision_of_state(&self, state: Option<u32>, x: i32, y: i32, z: i32, out: &mut Vec<rc_physics::Aabb>) -> bool {
+        match state {
             Some(s) => (self.movers.is_some_and(|b| b.moving > 0) && self.piston_shape(s, x, y, z, out)) || self.t.collision(s, out),
             None => false,
         }
@@ -102,6 +151,17 @@ impl rc_physics::World for GridWorld<'_> {
 
     fn min_y(&self) -> i32 {
         self.min_y
+    }
+
+    fn shape_reach(&self, lo: [i32; 3], hi: [i32; 3]) -> rc_physics::Aabb {
+        // A moving block's shape follows its progress out of its cell.
+        if self.movers.is_some_and(|b| b.moving > 0) {
+            return rc_physics::Aabb::EVERYWHERE;
+        }
+        if rc_data::opt_switch!("RUSTCRAFT_OPT_COLLISION_PALETTE_PREFILTER") {
+            return self.t.reach_from_palettes(|pred| self.sections_may_hold(lo, hi, pred));
+        }
+        self.t.shape_reach()
     }
 }
 
@@ -119,6 +179,52 @@ mod tests {
             block_light: Box::new([]),
             heightmaps: Vec::new(),
         }
+    }
+
+    /// Column of 4 sections: a single state, a packed mix, air, a single state again.
+    fn filled(x: i32, z: i32) -> Column {
+        use rc_world::{Container, Section};
+        let mixed: Vec<u32> = (0..4096u32).map(|i| (i * 7 + x as u32 * 3 + z as u32) % 11).collect();
+        let section = |blocks| Section { non_empty: 0, blocks, biomes: Container::Single(0) };
+        let sections = vec![
+            section(Container::Single(1)),
+            section(Container::pack(&mixed, 4, 8, 15)),
+            section(Container::Single(0)),
+            section(Container::Single(5)),
+        ];
+        Column { sections: sections.into_boxed_slice(), ..col(x, z) }
+    }
+
+    /// `RUSTCRAFT_OPT_COLLISION_BATCH_READ`: the states of a span, read once per column, are the
+    /// ones `state` gives cell by cell, across columns, unloaded ones and the world's height.
+    #[test]
+    fn states_in_matches_state() {
+        let Some(d) = rc_testdata::version_data() else { return };
+        let t = rc_physics::Tables::new(&d);
+        let mut grid = ChunkGrid::new(4);
+        for (x, z) in [(0, 0), (1, 0), (0, 1)] {
+            grid.insert(filled(x, z));
+        }
+        let border = rc_physics::WorldBorder::default();
+        let w = GridWorld { grid: &grid, min_y: -64, height: 64, t: &t, border: &border, colliders: &[], movers: None, noclip: None };
+        use rc_physics::World;
+        let mut cells = 0;
+        for (first, last) in [([10, -70, 10], [20, -60, 20]), ([-3, -2, 14], [17, 3, 17]), ([14, -20, -2], [33, -15, 2]), ([5, -40, 5], [5, -40, 5])] {
+            let n = (0..3).map(|a| (last[a] - first[a] + 1) as usize).product();
+            let mut out = vec![0; n];
+            assert!(w.states_in(first, last, &mut out));
+            let mut i = 0;
+            for y in first[1]..=last[1] {
+                for z in first[2]..=last[2] {
+                    for x in first[0]..=last[0] {
+                        assert_eq!(out[i], w.state(x, y, z).unwrap_or(rc_physics::UNLOADED), "({x}, {y}, {z})");
+                        i += 1;
+                    }
+                }
+            }
+            cells += n;
+        }
+        assert!(cells > 2000);
     }
 
     /// Respawn with a server view of 32: the grid keeps columns 0 and 35 side by side

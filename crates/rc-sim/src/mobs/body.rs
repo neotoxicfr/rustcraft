@@ -76,12 +76,21 @@ impl rc_physics::World for SnowStand<'_> {
 
     fn collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<rc_physics::Aabb>) -> bool {
         let over = self.inner.collision(x, y, z, out);
-        if out.is_empty() && self.s.bname([x, y, z]) == "minecraft:powder_snow" {
-            if self.falling {
-                out.push(rc_physics::Aabb { min: [0.0; 3], max: [1.0, f64::from(0.9f32), 1.0] });
-            } else if self.walker && self.bottom > f64::from(y) + 1.0 - f64::from(1.0e-5f32) {
-                out.push(rc_physics::Aabb { min: [0.0; 3], max: [1.0; 3] });
-            }
+        if out.is_empty() && self.is_powder_snow([x, y, z], || self.inner.state(x, y, z)) {
+            self.push_snow_shape(y, out);
+        }
+        over
+    }
+
+    fn states_in(&self, first: [i32; 3], last: [i32; 3], out: &mut [u32]) -> bool {
+        self.inner.states_in(first, last, out)
+    }
+
+    /// The state the walk read serves the wrapped world and the snow test (no second read).
+    fn collision_of_state(&self, state: Option<u32>, x: i32, y: i32, z: i32, out: &mut Vec<rc_physics::Aabb>) -> bool {
+        let over = self.inner.collision_of_state(state, x, y, z, out);
+        if out.is_empty() && self.is_powder_snow([x, y, z], || state) {
+            self.push_snow_shape(y, out);
         }
         over
     }
@@ -92,6 +101,33 @@ impl rc_physics::World for SnowStand<'_> {
 
     fn moving_collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<rc_physics::Aabb>) -> bool {
         self.inner.moving_collision(x, y, z, out)
+    }
+
+    /// The snow shapes stay inside the cell.
+    fn shape_reach(&self, lo: [i32; 3], hi: [i32; 3]) -> rc_physics::Aabb {
+        self.inner.shape_reach(lo, hi).union(&rc_physics::Aabb::UNIT)
+    }
+}
+
+impl SnowStand<'_> {
+    /// Powder snow at `p` (state given by `state`): by the per-state flag of the physics tables,
+    /// or by the block name (`RUSTCRAFT_OPT_STAND_SHAPE_FLAGS=0`, the old path, which compared it
+    /// for every empty cell).
+    fn is_powder_snow(&self, p: [i32; 3], state: impl FnOnce() -> Option<u32>) -> bool {
+        if rc_data::opt_switch!("RUSTCRAFT_OPT_STAND_SHAPE_FLAGS") {
+            state().is_some_and(|s| self.s.phys.is_powder_snow(s))
+        } else {
+            self.s.bname(p) == "minecraft:powder_snow"
+        }
+    }
+
+    /// Shape of a powder snow cell of row `y` for this mob.
+    fn push_snow_shape(&self, y: i32, out: &mut Vec<rc_physics::Aabb>) {
+        if self.falling {
+            out.push(rc_physics::Aabb { min: [0.0; 3], max: [1.0, f64::from(0.9f32), 1.0] });
+        } else if self.walker && self.bottom > f64::from(y) + 1.0 - f64::from(1.0e-5f32) {
+            out.push(rc_physics::Aabb { min: [0.0; 3], max: [1.0; 3] });
+        }
     }
 }
 
@@ -113,6 +149,26 @@ fn team_allows(own: u8, own_team: Option<u32>, their: u8, their_team: Option<u32
 
 fn corrected(x: f32, m: f32) -> f32 {
     (1.0 - (1.0 - x) * m).clamp(0.0, 1.0)
+}
+
+/// Slowdown of the previous tick (cobweb, berries): the movement is multiplied and the velocity
+/// reset to zero (piston pushes clear it without multiplying it, `piston.rs`).
+fn slowed_by_last_tick(m: &mut Mob, delta: [f64; 3]) -> [f64; 3] {
+    if l2(m.stuck) > 1.0e-7 {
+        let slowed = std::array::from_fn(|i| delta[i] * m.stuck[i]);
+        m.stuck = [0.0; 3];
+        m.vel = [0.0; 3];
+        return slowed;
+    }
+    delta
+}
+
+/// Result of a mob's movement against the collisions: the movement allowed and the horizontal
+/// axes it blocked.
+struct Moved {
+    allowed: [f64; 3],
+    blocked_x: bool,
+    blocked_z: bool,
 }
 
 impl Server {
@@ -235,72 +291,72 @@ impl Server {
 
     /// Collisions, flags, fall, step, speed factor.
     pub(crate) fn mob_move(&mut self, m: &mut Mob, delta: [f64; 3]) {
-        // G5-F02e: slowdown of the previous tick (cobweb, berries): movement multiplied, velocity
-        // reset to zero (piston pushes clear it without multiplying it, `piston.rs`).
-        let mut delta = delta;
-        if l2(m.stuck) > 1.0e-7 {
-            delta = std::array::from_fn(|i| delta[i] * m.stuck[i]);
-            m.stuck = [0.0; 3];
-            m.vel = [0.0; 3];
-        }
+        let delta = slowed_by_last_tick(m, delta);
+        let moved = self.move_and_collide(m, delta);
+        let effect_pos = self.mob_below(m, 0.2);
+        m.body_fx.effect = Some((m.tick_count, m.pos(), m.support, effect_pos));
+        self.land_and_fall(m, moved.allowed, effect_pos);
+        self.bounce(m, delta, &moved, effect_pos);
+        self.accumulate_steps(m, moved.allowed, effect_pos);
+        let f = self.speed_factor(m);
+        m.vel[0] *= f64::from(f);
+        m.vel[2] *= f64::from(f);
+    }
+
+    /// Movement against the collisions, then position, collision flags and supporting block.
+    fn move_and_collide(&self, m: &mut Mob, delta: [f64; 3]) -> Moved {
         let start = m.bbox();
-        // F12: the strider settles on lava sources (own shape above them).
-        let mv = {
-            let w = self.world();
-            let lava = super::nether::strider::lava_stand(self, m, start.min[1]);
-            let wd: &dyn rc_physics::World = match &lava {
-                Some(l) => l,
-                None => &w,
-            };
-            // Powder snow: shape specific to the entity (fall, species that walk on it).
-            let falling = m.fall_distance > 2.5;
-            let walker = m.kind.powder_snow_walkable()
-                || m.equipment[2].as_ref().is_some_and(|s| s.id == "minecraft:leather_boots");
-            if falling || walker {
-                let snow = SnowStand { inner: wd, s: self, bottom: start.min[1], falling, walker };
-                collide::resolve(&snow, &start, delta, m.on_ground, m.step_height())
-            } else {
-                collide::resolve(wd, &start, delta, m.on_ground, m.step_height())
-            }
+        let world = self.world();
+        // The strider settles on lava sources (own shape above them): one envelope for the
+        // movement and the support search.
+        let lava = super::nether::strider::lava_stand(self, m, start.min[1]);
+        let collision_world: &dyn rc_physics::World = match &lava {
+            Some(l) => l,
+            None => &world,
         };
-        let ml = l2(mv);
-        if ml > 1.0e-7 || l2(delta) - ml < 1.0e-7 {
+        let allowed = self.resolve_through_snow(m, collision_world, &start, delta);
+        let allowed_len_sq = l2(allowed);
+        if allowed_len_sq > 1.0e-7 || l2(delta) - allowed_len_sq < 1.0e-7 {
             let from = m.pos();
-            m.add_pos(mv);
+            m.add_pos(allowed);
             m.inside.record(from, m.pos(), delta); // read back by the crossed-block pass
         }
-        let xc = (delta[0] - mv[0]).abs() >= 1.0e-5;
-        let zc = (delta[2] - mv[2]).abs() >= 1.0e-5;
-        m.horizontal_collision = xc || zc;
+        let blocked_x = (delta[0] - allowed[0]).abs() >= 1.0e-5;
+        let blocked_z = (delta[2] - allowed[2]).abs() >= 1.0e-5;
+        m.horizontal_collision = blocked_x || blocked_z;
         // The server is authoritative except for a mount the player pilots: ground and vertical
         // impact recomputed even without a vertical component (horizontal piston push).
         if delta[1].abs() > 0.0 || !Self::player_controls(m) {
-            m.vertical_collision = delta[1] != mv[1];
+            m.vertical_collision = delta[1] != allowed[1];
             let below = m.vertical_collision && delta[1] < 0.0;
             m.on_ground = below;
-            m.support = if below {
-                let w = self.world();
-                let lava = super::nether::strider::lava_stand(self, m, start.min[1]);
-                let wd: &dyn rc_physics::World = match &lava {
-                    Some(l) => l,
-                    None => &w,
-                };
-                rc_physics::support_of(wd, &m.bbox(), m.pos())
-            } else {
-                None
-            };
+            m.support = if below { rc_physics::support_of(collision_world, &m.bbox(), m.pos()) } else { None };
         }
-        // Fall; F12: strider in lava, fall reset to zero; nothing for the flyers.
-        let effect_pos = self.mob_below(m, 0.2);
-        m.body_fx.effect = Some((m.tick_count, m.pos(), m.support, effect_pos));
+        Moved { allowed, blocked_x, blocked_z }
+    }
+
+    /// `resolve` through the mob's own powder snow shape when it falls onto snow or walks on it.
+    fn resolve_through_snow(&self, m: &Mob, collision_world: &dyn rc_physics::World, start: &rc_physics::Aabb, delta: [f64; 3]) -> [f64; 3] {
+        let falling = m.fall_distance > 2.5;
+        let walker = m.kind.powder_snow_walkable() || m.equipment[2].as_ref().is_some_and(|s| s.id == "minecraft:leather_boots");
+        if falling || walker {
+            let snow = SnowStand { inner: collision_world, s: self, bottom: start.min[1], falling, walker };
+            collide::resolve(&snow, start, delta, m.on_ground, m.step_height())
+        } else {
+            collide::resolve(collision_world, start, delta, m.on_ground, m.step_height())
+        }
+    }
+
+    /// Fall distance and landing: the strider in lava resets it, the flyers skip it all.
+    fn land_and_fall(&mut self, m: &mut Mob, allowed: [f64; 3], effect_pos: [i32; 3]) {
         let lava_reset = super::nether::strider::fall_reset(m);
         if lava_reset {
             m.fall_distance = 0.0;
         }
         let falls = !ignores_falls(m.kind);
         let before = m.fall_distance;
-        if falls && !m.in_water && mv[1] < 0.0 && !lava_reset {
-            m.fall_distance -= f64::from(mv[1] as f32);
+        if falls && !m.in_water && allowed[1] < 0.0 && !lava_reset {
+            m.fall_distance -= f64::from(allowed[1] as f32);
         }
         // Landing dust: before the block's rule, on the fall from before this movement (none for
         // the flyers, which skip the whole fall check).
@@ -314,7 +370,7 @@ impl Server {
                 // Once trampled, the mob is raised onto the dirt before its damage (fall sound
                 // and landing at the new height).
                 self.trample_farmland(effect_pos, on, m.fall_distance, Some(&mut *m), w, h);
-                self.turtle_egg_fall_on(effect_pos, Some(m.kind)); // G6-F08: before the damage
+                self.turtle_egg_fall_on(effect_pos, Some(m.kind)); // turtle eggs crack before the damage
                 self.fall_on(m, on, m.fall_distance);
                 // Landing: state of the main supporting block, otherwise of the block at 0.2.
                 let st = self.st(m.support.unwrap_or(effect_pos));
@@ -327,62 +383,65 @@ impl Server {
             }
             m.fall_distance = 0.0;
         }
-        // Vertical collision: vertical velocity falls to 0 (no bounce for mobs
-        // outside bouncing blocks).
-        // Restitution: entity's own bounce (F03:
-        // full sulfur cube) off walls, maximum with that of the block on the ground.
-        if (delta[1].abs() > 0.0 && m.vertical_collision) || m.horizontal_collision {
-            let es = self.st(effect_pos);
-            let block_bounce = f64::from(self.phys.bounce.get(es as usize).copied().unwrap_or(0.0));
-            let own = m.bounciness();
-            let cur = m.vel;
-            let mut v = cur;
-            if xc {
-                v[0] = -cur[0] * own;
-            }
-            if zc {
-                v[2] = -cur[2] * own;
-            }
-            if m.vertical_collision {
-                let mut r = own;
-                if delta[1] < 0.0 {
-                    r = if -cur[1] > m.gravity() && !self.btag_id(effect_pos, crate::tag_bits::TagId::SuppressesBounce) {
-                        r.max(block_bounce)
-                    } else {
-                        0.0
-                    };
-                }
-                v[1] = if r > 0.0 {
-                    let portion = mv[1] / cur[1];
-                    let comp = portion * m.gravity();
-                    let air = if m.omnidirectional_air() { 0.91f32 } else { 0.98f32 };
-                    let air = f64::from(corrected(air, m.air_drag_modifier()));
-                    let drag = 1.0 + (air - 1.0) * portion;
-                    (comp - cur[1]) * drag * r
+    }
+
+    /// Velocity after a collision: the entity's own bounce (full sulfur cube) off walls, on the
+    /// ground the maximum with that of the block; otherwise the blocked axis stops (no bounce for
+    /// mobs outside bouncing blocks).
+    fn bounce(&mut self, m: &mut Mob, delta: [f64; 3], moved: &Moved, effect_pos: [i32; 3]) {
+        if !((delta[1].abs() > 0.0 && m.vertical_collision) || m.horizontal_collision) {
+            return;
+        }
+        let es = self.st(effect_pos);
+        let block_bounce = f64::from(self.phys.bounce.get(es as usize).copied().unwrap_or(0.0));
+        let own = m.bounciness();
+        let cur = m.vel;
+        let mut v = cur;
+        if moved.blocked_x {
+            v[0] = -cur[0] * own;
+        }
+        if moved.blocked_z {
+            v[2] = -cur[2] * own;
+        }
+        if m.vertical_collision {
+            let mut r = own;
+            if delta[1] < 0.0 {
+                r = if -cur[1] > m.gravity() && !self.btag_id(effect_pos, crate::tag_bits::TagId::SuppressesBounce) {
+                    r.max(block_bounce)
                 } else {
                     0.0
                 };
             }
-            m.vel = v;
-            // Vertical bounce: `bounce` event.
-            if m.vertical_collision && v[1] != 0.0 {
-                self.mob_game_event(m, "minecraft:bounce");
-            }
+            v[1] = if r > 0.0 {
+                let portion = moved.allowed[1] / cur[1];
+                let comp = portion * m.gravity();
+                let air = if m.omnidirectional_air() { 0.91f32 } else { 0.98f32 };
+                let air = f64::from(corrected(air, m.air_drag_modifier()));
+                let drag = 1.0 + (air - 1.0) * portion;
+                (comp - cur[1]) * drag * r
+            } else {
+                0.0
+            };
         }
-        // Step.
-        let h = (mv[0] * mv[0] + mv[2] * mv[2]).sqrt();
-        let full = l2(mv).sqrt();
+        m.vel = v;
+        // Vertical bounce: `bounce` event.
+        if m.vertical_collision && v[1] != 0.0 {
+            self.mob_game_event(m, "minecraft:bounce");
+        }
+    }
+
+    /// Walked distance, and the step (sound, vibration) or swim it makes when one is due.
+    fn accumulate_steps(&mut self, m: &mut Mob, allowed: [f64; 3], effect_pos: [i32; 3]) {
+        let h = (allowed[0] * allowed[0] + allowed[2] * allowed[2]).sqrt();
+        let full = l2(allowed).sqrt();
         let on = self.mob_below(m, 1.0e-5);
         let on_st = self.st(on);
         let climbing = self.climbable_state(on_st);
         m.move_dist += if climbing { (full * f64::from(0.6f32)) as f32 } else { (h * f64::from(0.6f32)) as f32 };
         m.surf.fly_dist += (full * f64::from(0.6f32)) as f32;
         if m.move_dist > m.next_step && !self.is_air(on) {
-            // F09: swimming (swim sound) when the aquatic mob is not on the ground.
+            // Swimming (swim sound) when the aquatic mob is not on the ground.
             if super::sealife::swim_step(self, m) {
-                let f = self.speed_factor(m);
-                m.vel[0] *= f64::from(f);
-                m.vel[2] *= f64::from(f);
                 return;
             }
             // Step on the ground: sound of the block at 0.2 under the feet, vibration of the supporting block (the game
@@ -410,9 +469,6 @@ impl Server {
         } else if self.is_air(on) {
             self.mob_flap(m);
         }
-        let f = self.speed_factor(m);
-        m.vel[0] *= f64::from(f);
-        m.vel[2] *= f64::from(f);
     }
 
     /// Climbable block for step accumulation: `climbable` tag or powder snow.

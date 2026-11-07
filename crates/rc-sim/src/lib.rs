@@ -214,6 +214,8 @@ mod tests_opt;
 #[cfg(test)]
 mod tests_c6m02;
 #[cfg(test)]
+mod collision_walk_tests;
+#[cfg(test)]
 mod tests_light_m04;
 #[cfg(test)]
 mod tests_light_m05;
