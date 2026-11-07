@@ -139,36 +139,6 @@ impl Server {
         Some(block.max(fluid))
     }
 
-    /// Visible part of a box from the centre.
-    pub(crate) fn seen_percent(&self, center: [f64; 3], b: &rc_physics::Aabb) -> f32 {
-        let step_x = 1.0 / ((b.max[0] - b.min[0]) * 2.0 + 1.0);
-        let step_y = 1.0 / ((b.max[1] - b.min[1]) * 2.0 + 1.0);
-        let step_z = 1.0 / ((b.max[2] - b.min[2]) * 2.0 + 1.0);
-        let offset_x = (1.0 - (1.0 / step_x).floor() * step_x) / 2.0;
-        let offset_z = (1.0 - (1.0 / step_z).floor() * step_z) / 2.0;
-        let (mut hits, mut count) = (0, 0);
-        let mut xx = 0.0;
-        while xx <= 1.0 {
-            let mut yy = 0.0;
-            while yy <= 1.0 {
-                let mut zz = 0.0;
-                while zz <= 1.0 {
-                    let x = b.min[0] + xx * (b.max[0] - b.min[0]);
-                    let y = b.min[1] + yy * (b.max[1] - b.min[1]);
-                    let z = b.min[2] + zz * (b.max[2] - b.min[2]);
-                    if !self.clip_blocks([x + offset_x, y, z + offset_z], center) {
-                        hits += 1;
-                    }
-                    count += 1;
-                    zz += step_z;
-                }
-                yy += step_y;
-            }
-            xx += step_x;
-        }
-        if count == 0 { 0.0 } else { hits as f32 / count as f32 }
-    }
-
     /// Explosion of a mob ("mob" interaction); `source` is excluded from the damage.
     pub(crate) fn mob_explode(&mut self, source: &Mob, center: [f64; 3], radius: f32) {
         // Direct source = cause = the creeper: player_explosion (message "blown up by").

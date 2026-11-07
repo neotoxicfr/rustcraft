@@ -2225,6 +2225,14 @@ impl Server {
     /// with its contents (box, bag) spilled in its place. True if they landed.
     pub(crate) fn item_hurt(&mut self, id: i32, ty: &str, amount: f32, by_mob: bool) -> bool {
         let Some(k) = self.life.drops.iter().position(|d| d.id == id && !d.removed) else { return false };
+        self.item_hurt_at(k, ty, amount, by_mob)
+    }
+
+    /// [`Server::item_hurt`] on the item of slot `k` of the list (nothing if it is removed).
+    pub(crate) fn item_hurt_at(&mut self, k: usize, ty: &str, amount: f32, by_mob: bool) -> bool {
+        if self.life.drops.get(k).is_none_or(|d| d.removed) {
+            return false;
+        }
         if self.invulnerable_to(self.life.drops[k].common, ty) || !self.item_may_hurt(&self.life.drops[k].stack, ty, by_mob) {
             return false;
         }
@@ -2255,6 +2263,14 @@ impl Server {
     /// Damage to an experience orb: health points removed, orb removed at 0.
     pub(crate) fn orb_hurt(&mut self, id: i32, ty: &str, amount: f32) -> bool {
         let Some(k) = self.life.orbs.iter().position(|o| o.id == id && !o.removed) else { return false };
+        self.orb_hurt_at(k, ty, amount)
+    }
+
+    /// [`Server::orb_hurt`] on the orb of slot `k` of the list (nothing if it is removed).
+    pub(crate) fn orb_hurt_at(&mut self, k: usize, ty: &str, amount: f32) -> bool {
+        if self.life.orbs.get(k).is_none_or(|o| o.removed) {
+            return false;
+        }
         if self.invulnerable_to(self.life.orbs[k].common, ty) {
             return false;
         }

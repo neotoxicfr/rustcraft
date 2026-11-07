@@ -1103,8 +1103,93 @@ impl Server {
     }
 
     /// Blast on primed TNT, falling blocks, items on the ground (`blocklike`) and orbs: damage
-    /// of `hurt` (type, author is a mob) if any, knockback × `mult`.
+    /// of `hurt` (type, author is a mob) if any, knockback × `mult`. The objects in reach are
+    /// gathered once with their slot and weighed together (`RUSTCRAFT_OPT_BLAST_OBJECTS_ONE_PASS`):
+    /// only velocities and the items' and orbs' health change on the way, never a block nor a
+    /// position, so every part can be worked out before the first push.
     fn objects_blast(
+        &mut self,
+        center: [f64; 3],
+        radius: f32,
+        exclude: Option<i32>,
+        blocklike: bool,
+        hurt: Option<(&str, bool)>,
+        mult: f64,
+    ) {
+        if !crate::mobs::visible_part::VisiblePartPaths::current().objects_one_pass {
+            return self.objects_blast_one_by_one(center, radius, exclude, blocklike, hurt, mult);
+        }
+        let double = f64::from(radius * 2.0);
+        let objects = self.objects_in_blast_reach(center, double, exclude, blocklike);
+        let boxes: Vec<Aabb> = objects.iter().map(|o| o.bbox).collect();
+        let parts = self.seen_percents(center, &boxes);
+        for (o, part) in objects.iter().zip(parts) {
+            let exposure = f64::from(part);
+            let kp = (1.0 - o.dist) * exposure * mult;
+            let kb = o.dir.map(|v| v * kp);
+            match o.slot {
+                BlastObjectSlot::Sim(i) => {
+                    let e = &mut self.bs.entities.list[i];
+                    e.vel = [e.vel[0] + kb[0], e.vel[1] + kb[1], e.vel[2] + kb[2]];
+                    e.track.needs_sync = true;
+                    // The falling block registers a hit (velocity returned right away); the TNT does not.
+                    e.track.sync_velocity |= !matches!(e.kind, EntKind::Tnt(_)) && hurt.is_some();
+                }
+                BlastObjectSlot::Item(k) => {
+                    let damage = blast_damage(o.dist, exposure, double);
+                    let hit = hurt.is_some_and(|(ty, by_mob)| self.item_hurt_at(k, ty, damage, by_mob));
+                    if let Some(d) = self.life.drops.get_mut(k).filter(|d| !d.is_removed()) {
+                        d.push_sync(kb, hit);
+                    }
+                }
+                BlastObjectSlot::Orb(k) => {
+                    let damage = blast_damage(o.dist, exposure, double);
+                    let hit = hurt.is_some_and(|(ty, _)| self.orb_hurt_at(k, ty, damage));
+                    if let Some(orb) = self.life.orbs.get_mut(k).filter(|orb| !orb.is_removed()) {
+                        orb.push_sync(kb, hit);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The objects within reach of an explosion (relative distance at most 1, `double`: twice
+    /// its radius), in the order the blast takes them: primed TNT and falling blocks, then items
+    /// on the ground (`blocklike`), then orbs, each in list order.
+    fn objects_in_blast_reach(&self, center: [f64; 3], double: f64, exclude: Option<i32>, blocklike: bool) -> Vec<BlastObject> {
+        let mut objects = Vec::new();
+        let mut take = |slot, pos: [f64; 3], eye: f64, bbox| {
+            let d = [pos[0] - center[0], pos[1] - center[1], pos[2] - center[2]];
+            let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() / double;
+            if dist > 1.0 {
+                return;
+            }
+            let dir = crate::mobs::mth::normalize([pos[0] - center[0], pos[1] + eye - center[1], pos[2] - center[2]]);
+            objects.push(BlastObject { slot, dist, dir, bbox });
+        };
+        for (i, e) in self.bs.entities.list.iter().enumerate() {
+            if e.removed || Some(e.id) == exclude {
+                continue;
+            }
+            let eye = if matches!(e.kind, EntKind::Tnt(_)) { 0.0 } else { f64::from(0.833f32) };
+            take(BlastObjectSlot::Sim(i), e.pos, eye, Self::entity_box(e));
+        }
+        // Only the item on the ground escapes the blast when neither the rule nor the explosion
+        // touch the blocks; the falling block and the orb always take it.
+        if blocklike {
+            for (k, d) in self.life.drops.iter().enumerate().filter(|(_, d)| !d.is_removed()) {
+                take(BlastObjectSlot::Item(k), d.pos, f64::from(0.2125f32), ground_object_box(d.pos, 0.125, 0.25));
+            }
+        }
+        for (k, o) in self.life.orbs.iter().enumerate().filter(|(_, o)| !o.is_removed()) {
+            take(BlastObjectSlot::Orb(k), o.pos, f64::from(0.425f32), ground_object_box(o.pos, 0.25, 0.5));
+        }
+        objects
+    }
+
+    /// The former object pass (`RUSTCRAFT_OPT_BLAST_OBJECTS_ONE_PASS=0`): every item and orb
+    /// gathered, each object weighed alone, items and orbs searched for by identifier.
+    fn objects_blast_one_by_one(
         &mut self,
         center: [f64; 3],
         radius: f32,
@@ -1187,6 +1272,42 @@ impl Server {
         }
     }
 
+}
+
+/// Where an object an explosion reaches sits in its list.
+#[derive(Clone, Copy)]
+enum BlastObjectSlot {
+    /// Primed TNT or falling block of `bs.entities.list`.
+    Sim(usize),
+    Item(usize),
+    Orb(usize),
+}
+
+/// An object within reach of an explosion: its slot, relative distance, push direction (from the
+/// centre to its eyes) and box.
+struct BlastObject {
+    slot: BlastObjectSlot,
+    dist: f64,
+    dir: [f64; 3],
+    bbox: Aabb,
+}
+
+/// Box of an item (half width 0.125, height 0.25) or an orb (0.25, 0.5) at `pos`.
+fn ground_object_box(pos: [f64; 3], half_width: f64, height: f64) -> Aabb {
+    Aabb {
+        min: [pos[0] - half_width, pos[1], pos[2] - half_width],
+        max: [pos[0] + half_width, pos[1] + height, pos[2] + half_width],
+    }
+}
+
+/// Damage of an explosion at relative distance `dist` with visible part `exposure`, `double`
+/// twice its radius.
+fn blast_damage(dist: f64, exposure: f64, double: f64) -> f32 {
+    let pow = (1.0 - dist) * exposure;
+    ((pow * pow + pow) / 2.0 * 7.0 * double + 1.0) as f32
+}
+
+impl Server {
     /// Entities that trigger blocks (plates, tripwire) whose box touches `b`; `living`:
     /// living entities only (stone plates).
     pub(crate) fn count_entities_in(&self, b: &Aabb, living: bool) -> usize {
