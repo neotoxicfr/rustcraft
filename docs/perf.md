@@ -5660,3 +5660,91 @@ profile, machine loaded by other agents compiling, best of 5 or 7; three runs, t
   decorations, noise floors), `crowd-1000`, `tnt`, `dropped-items` (collision walks); memstats at
   world opening (−1 MB of heap expected).
 
+## C3-M01: render counters, hot map down to the driver, upload ring A/B prepared (06/11, loaded machine)
+
+Measurement mission: no gain claimed, no `RUSTCRAFT_OPT_*` switch, no image change (counters only).
+
+**Hot map of the GPU stack.** `tools/hot_map.py` now gives wgpu, wgpu-core, wgpu-hal and the GPU
+driver modules (NVIDIA user and kernel side, Windows graphics kernel; their functions keep samply's
+`fun_…` names, grouped under their module) a sheet like our crates, and `--breakdown <function>`
+writes `BREAKDOWN.md` (call paths three levels under a function, % of the process per scene).
+Side fix: the `rustcraft` sheet looked for its definitions under `crates/rc-app` (moved to
+`apps/client`): 128 functions without definition in the previous map. Check: rerun on the 15
+profiles of `target/perf/avant-optim-main-profils` (names from `target/perf/ref-main/rustcraft.pdb`):
+the 16 crate rows and the 263 function lines of `carte-chaude-v3` are found unchanged, plus 7 new
+rows. GPU stack, self time in % of the process (plains12 / plains32 / crowd-1000 / title):
+`nvoglv64` 22.4 / 20.2 / 4.9 / 23.0, `wgpu_core` 8.6 / 8.9 / 1.9 / 6.8, `nvlddmkm` 5.8 / 5.0 / 1.8 / 8.0,
+`dxgkrnl` + `dxgmms2` 5.4 / 4.7 / 1.1 / 6.5, `wgpu_hal` 2.1 / 1.7 / 0.5 / 2.0.
+
+Where the frame submission and the encoder finish go, % of the whole process (plains12 / plains32 /
+village / crowd-1000 / title):
+
+| part | plains12 | plains32 | village | crowd-1000 | title | mission |
+|---|---|---|---|---|---|---|
+| `Uploader::submit` inclusive | 15.67 | 14.09 | 14.94 | 3.04 | 18.60 | |
+| driver queue submission (under the hal submit) | 10.37 | 9.88 | 10.17 | 1.99 | 12.79 | C3-M07 |
+| `maintain`: command buffers dropped | 1.46 | 1.41 | 1.26 | 0.25 | 1.70 | C3-M07 |
+| `maintain`: buffers destroyed (likely the queue-write transits) | 0.46 | 0.36 | 0.45 | 0.08 | 0.53 | C3-M02 |
+| barriers recorded at submission (buffers + textures) | 0.71 | 0.58 | 0.74 | 0.16 | 0.81 | C3-M02 / M07 |
+| encoder finish inclusive | 13.42 | 13.73 | 16.90 | 2.91 | 11.80 | |
+| render pass encoding | 10.87 | 11.49 | 14.12 | 2.36 | 9.10 | |
+| pass begins (hal and below) | 1.48 | 1.59 | 2.02 | 0.31 | 1.84 | C3-M07 (passes) |
+| pipeline changes (driver, two heaviest paths) | 1.21 | 1.14 | 1.83 | 0.34 | 0.70 | C3-M05 |
+| bindings (flush, assign, layout change, bind group merge) | 1.07 | 1.31 | 1.49 | 0.25 | 0.44 | C3-M05 |
+| hal command buffer begins (finish + passes) | 1.20 | 0.93 | 1.15 | 0.32 | 1.06 | C3-M07 |
+| GPU timer (timestamps, query copies and tracking) | 0.64 | 0.56 | 0.75 | 0.07 | 0.77 | C3-M07 |
+| present inclusive | 32.72 | 27.50 | 23.94 | 6.24 | 39.13 | |
+| of which wgpu-core's own submission at present | 3.85 | 3.85 | 3.26 | 0.69 | 4.68 | (inside wgpu) |
+
+Decision for the missions that wait on it: C3-M07 (one command buffer, timer on demand) holds the
+largest share in reach, about 3 % of the process outside the driver's submission (2.9 to 3.5:
+command buffer begins and drops, timer), plus a part of the 10 % of the driver's submission that
+depends on how its cost grows with the command buffers of a submission (its first measurement:
+command buffers per submission, then the same breakdown after). C3-M05 (batch state) can reach
+1 to 3 % (pipeline and binding changes, terrain, entities and interface together). C3-M02 (ring)
+has under 1.5 % in direct view (transit buffers destroyed, barriers); its sense waits for the A/B
+below, since the ring's transit encoder is itself one more command buffer per submission.
+
+**Render counters** (generic `[perf] counter` lines, column `c:<name>` of `scenes.py`):
+- Generic API in `perf_log`: `counter(name, value)` (mean per frame), `counter_per_second`,
+  `stage_time(name, duration)` and `StageTimer::lap(name)` (µs per frame); a counter is created at its
+  first use, printed every second, then reset to 0 (a quiet counter prints 0). Micro-bench
+  `generic_counter_cost` (perf log on, 40 counters, the last one looked for, LOADED machine):
+  11.7 ns per add, 35.8 ns per stage lap; a first version that compared the text before the
+  address took 82 ns. Without `RUSTCRAFT_PERFLOG`: one cached boolean per call, no clock read.
+- Draw-list stations: the translucent re-sort `us_resort_per_frame` is now recorded on every frame
+  (it was only recorded on the frames that rebuilt the lists, though it runs on every frame: its
+  mean was too low by the share of frames without a rebuild); new `us_walk_launch_per_frame`
+  (finished walks received, visibility snapshot, next walk launched: the stretch between the radius
+  and the reached set that no counter covered) and `us_visibility_snapshot_per_frame` (snapshot
+  rebuilt only). The printed name `us_ray_per_frame` (radius of the walk) is kept so that logs stay
+  comparable with the reference exe.
+- `translucent_columns_examined_per_frame`, `terrain_batches_per_frame`,
+  `terrain_commands_per_frame` (indirect commands; replaces the estimate of 150 batches).
+- Column upload by stage, µs per frame: `us_upload_{prepare,release,alloc,write_faces,write_fluids,
+  write_translucent,write_order,sort,bookkeeping}_per_frame`, and buffer growths
+  `upload_growths_{faces,fluids,translucent,order}_per_s`.
+- Startup marks (`[startup] renderer: …`, columns `startup:` of `scenes.py`): surface configured,
+  block texture arrays started, terrain shader module, terrain and sky pipelines, sky, interface,
+  blur, leashes and screen effects, labels/texts/outlines/cracks/debug lines, particles, entities,
+  weather.
+- `RUSTCRAFT_VRAMDUMP` also prints the allocator's memory blocks: reserved, used, unused in empty
+  blocks and free in the others, then the 15 blocks with the most unused room with their largest
+  allocation. wgpu's report does not say whether a block is local to the GPU or visible to the
+  host: the largest allocation's name tells a staging block from a resource block.
+
+Proofs: `translucent_resort_is_timed_on_frames_that_keep_their_lists` (fails when the record goes
+back into the rebuild branch: 0 ns recorded), `generic_counters_print_their_rate_then_restart_at_zero`
+(fails when the per-second rate is divided by the frames), `generic_counters_are_found_by_name`,
+`allocator_blocks_split_the_unused_room` (fails when the free room is also summed over the empty
+blocks); the existing `translucent_sort` and `column_upload` tests are unchanged.
+
+To measure on the quiet machine:
+- Cost of the counters, before / after with the perf log on: plains12, plains32, cave, crowd-1000,
+  generation (expected in the noise: about 3 counters per frame, 35 ns).
+- Upload ring A/B, 3 alternating passes: `python tools/bench/scenes.py run --exe <exe> --exe
+  "<exe>|RUSTCRAFT_OPT_UPLOADRING=0" --scenes plains12,crowd,crowd-1000,village,cave,title --passes 3
+  --label ring-ab`, then the same with `--samply` for `Uploader::submit` and the queue write inclusive
+  (`hot_map.py … --breakdown "rustcraft::render::upload::Uploader::submit"`). If the ring loses,
+  C3-M02 groups the writes through the queue instead.
+

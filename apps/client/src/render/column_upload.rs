@@ -12,6 +12,28 @@ use super::translucent_sort::{column_povs, eye_in_column, order_free, quad_cente
 use super::{
     FACE_BYTES, FACE_IDS_START, FLUID96_WORDS, GpuFormats, ORDER_BYTES, REGION, Renderer, TRANS_SLOTS, TRANS_WORDS,
 };
+use crate::perf_log::StageTimer;
+
+/// Stages of a column upload in the perf log (µs per frame): lookup of the old version and
+/// preparation of the bytes, release of the old place, places taken in the buffers (growths and
+/// new regions included), GPU writes per target, translucent order, bookkeeping (places, viewpoints,
+/// maps, slot table).
+const UPLOAD_PREPARE: &str = "us_upload_prepare_per_frame";
+const UPLOAD_RELEASE: &str = "us_upload_release_per_frame";
+const UPLOAD_ALLOC: &str = "us_upload_alloc_per_frame";
+const UPLOAD_WRITE_FACES: &str = "us_upload_write_faces_per_frame";
+const UPLOAD_WRITE_FLUIDS: &str = "us_upload_write_fluids_per_frame";
+const UPLOAD_WRITE_TRANSLUCENT: &str = "us_upload_write_translucent_per_frame";
+const UPLOAD_WRITE_ORDER: &str = "us_upload_write_order_per_frame";
+const UPLOAD_SORT: &str = "us_upload_sort_per_frame";
+const UPLOAD_BOOKKEEPING: &str = "us_upload_bookkeeping_per_frame";
+
+/// Perf log: one growth of a terrain buffer (copied into a bigger one), per buffer kind.
+fn count_growth(name: &'static str, grew: bool) {
+    if grew {
+        crate::perf_log::counter_per_second(name, 1);
+    }
+}
 
 pub(super) struct ColumnGpu {
     /// Fingerprint of the uploaded mesh (`RUSTCRAFT_MESHCHECK` only, otherwise 0).
@@ -304,6 +326,7 @@ impl Renderer {
         if self.columns.get(&(m.x, m.z)).is_some_and(|c| c.version > m.version) {
             return;
         }
+        let mut clock = StageTimer::start();
         let empty = prep.as_ref().map_or_else(|| m.is_empty(), Prepared::is_empty);
         let old = self.columns.remove(&(m.x, m.z));
         let old_empty = self.empty_vis.remove(&(m.x, m.z));
@@ -330,15 +353,18 @@ impl Renderer {
             crate::perf_log::in_place_refused(old.as_ref().is_some_and(|o| o.version != base));
         }
         let old_slot = old.as_ref().and_then(|o| o.trans_slot);
+        clock.lap(UPLOAD_PREPARE);
         if let Some(old) = old
             && in_place_plan.is_none()
         {
             self.release(&old);
         }
+        clock.lap(UPLOAD_RELEASE);
         self.fade_ring.birth((m.x, m.z), Instant::now());
         self.columns_rev += 1;
         let Some(mut prepared) = prepared else {
             self.empty_vis.insert((m.x, m.z), m.vis.as_slice().into());
+            clock.lap(UPLOAD_BOOKKEEPING);
             return;
         };
         // Compact translucents: the column's slot (kept in place, otherwise taken), its
@@ -365,7 +391,9 @@ impl Renderer {
         let key = (m.x.div_euclid(REGION), m.z.div_euclid(REGION));
         let (device, queue, layout, slots) = (&self.device, &self.queue, &self.column_layout, &self.trans_slots);
         let up = &mut self.up;
+        clock.lap(UPLOAD_BOOKKEEPING);
         let region = self.regions.entry(key).or_insert_with(|| RegionGpu::new(device, layout, key, fluid_bytes, slots));
+        clock.lap(UPLOAD_ALLOC);
         let trans = &mut self.trans;
         // Column whose order does not change the image: mesh order, never re-sorted, no centre
         // kept (`RUSTCRAFT_SORTALL=1` re-sorts everything, for comparison).
@@ -385,29 +413,37 @@ impl Renderer {
             let s = k.slot;
             (face_start, fluid_start, trans_start, order_start) = (s.faces.0, s.fluids.0, s.trans.0, s.order.0);
             for (t, at, r) in k.writes {
-                let (buf, b): (&wgpu::Buffer, &[u8]) = match t {
-                    Target::Faces => (&region.faces, bytemuck::cast_slice(&faces)),
-                    Target::Fluids => (&region.fluids, bytemuck::cast_slice(&fluid_words)),
-                    Target::Trans => (&trans.fluids, bytemuck::cast_slice(&trans_words)),
+                let (buf, b, stage): (&wgpu::Buffer, &[u8], _) = match t {
+                    Target::Faces => (&region.faces, bytemuck::cast_slice(&faces), UPLOAD_WRITE_FACES),
+                    Target::Fluids => (&region.fluids, bytemuck::cast_slice(&fluid_words), UPLOAD_WRITE_FLUIDS),
+                    Target::Trans => (&trans.fluids, bytemuck::cast_slice(&trans_words), UPLOAD_WRITE_TRANSLUCENT),
                 };
                 up.write(queue, buf, at, &b[r]);
+                clock.lap(stage);
             }
             order_len = trans_n;
             if k.order {
                 let order = order_of(trans_start);
+                clock.lap(UPLOAD_SORT);
                 up.write(queue, &trans.order, u64::from(order_start) * ORDER_BYTES, bytemuck::cast_slice(&order));
+                clock.lap(UPLOAD_WRITE_ORDER);
             }
         } else {
             let faces_size = region.faces.size();
             face_start =
                 alloc_in(device, queue, up, &mut region.faces, &mut region.face_arena, faces.len() as u32, FACE_BYTES);
+            clock.lap(UPLOAD_ALLOC);
             up.write(queue, &region.faces, u64::from(face_start) * FACE_BYTES, bytemuck::cast_slice(&faces));
+            clock.lap(UPLOAD_WRITE_FACES);
             let fluids_size = region.fluids.size();
             fluid_start =
                 alloc_in(device, queue, up, &mut region.fluids, &mut region.fluid_arena, fluid_n, fluid_bytes);
+            count_growth("upload_growths_faces_per_s", region.faces.size() != faces_size);
+            count_growth("upload_growths_fluids_per_s", region.fluids.size() != fluids_size);
             if region.fluids.size() != fluids_size || region.faces.size() != faces_size {
                 region.bind = region_bind(device, layout, &region.pos, &region.fluids, slots, &region.faces);
             }
+            clock.lap(UPLOAD_ALLOC);
             if !fluid_words.is_empty() {
                 up.write(
                     queue,
@@ -416,11 +452,14 @@ impl Renderer {
                     bytemuck::cast_slice(&fluid_words),
                 );
             }
+            clock.lap(UPLOAD_WRITE_FLUIDS);
             let trans_size = trans.fluids.size();
             trans_start = alloc_in(device, queue, up, &mut trans.fluids, &mut trans.fluid_arena, trans_n, trans_bytes);
+            count_growth("upload_growths_translucent_per_s", trans.fluids.size() != trans_size);
             if trans.fluids.size() != trans_size {
                 trans.bind = region_bind(device, layout, &trans.pos, &trans.fluids, slots, &trans.faces);
             }
+            clock.lap(UPLOAD_ALLOC);
             if !trans_words.is_empty() {
                 up.write(
                     queue,
@@ -429,12 +468,18 @@ impl Renderer {
                     bytemuck::cast_slice(&trans_words),
                 );
             }
+            clock.lap(UPLOAD_WRITE_TRANSLUCENT);
             let order = order_of(trans_start);
+            clock.lap(UPLOAD_SORT);
             order_len = order.len() as u32;
+            let order_size = trans.order.size();
             order_start = alloc_in(device, queue, up, &mut trans.order, &mut trans.order_arena, order_len, ORDER_BYTES);
+            count_growth("upload_growths_order_per_s", trans.order.size() != order_size);
+            clock.lap(UPLOAD_ALLOC);
             if !order.is_empty() {
                 up.write(queue, &trans.order, u64::from(order_start) * ORDER_BYTES, bytemuck::cast_slice(&order));
             }
+            clock.lap(UPLOAD_WRITE_ORDER);
             region.columns += 1;
         }
         let trans_centers = if free { Vec::new() } else { centers };
@@ -483,6 +528,7 @@ impl Renderer {
             trans_slot,
         };
         self.columns.insert((m.x, m.z), column);
+        clock.lap(UPLOAD_BOOKKEEPING);
     }
 
     /// Free slot of the table of the compact translucents' columns.

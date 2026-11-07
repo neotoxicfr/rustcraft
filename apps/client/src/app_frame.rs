@@ -953,10 +953,10 @@ impl App {
                     mo(rep.total_reserved_bytes)
                 );
                 if rc_data::env_flag!("RUSTCRAFT_VRAMDUMP") {
-                    let mut a: Vec<_> = rep.allocations.iter().map(|x| (x.size, x.name.as_str())).collect();
-                    a.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
-                    for (size, name) in a.iter().take(15) {
-                        eprintln!("  {:>8.2} MB  {name}", mo(*size));
+                    let allocations: Vec<_> = rep.allocations.iter().map(|x| (x.size, x.name.as_str())).collect();
+                    let blocks: Vec<_> = rep.blocks.iter().map(|b| (b.size, b.allocations.clone())).collect();
+                    for line in vram_dump_lines(&allocations, &blocks) {
+                        eprintln!("{line}");
                     }
                 }
             }
@@ -1003,5 +1003,78 @@ impl App {
                 (a.texture, cur, next, milli)
             }));
         }
+    }
+}
+
+/// `RUSTCRAFT_VRAMDUMP` lines from the GPU allocator's report: the 15 largest allocations (size,
+/// name), then the memory blocks (size, allocation ranges) summed (reserved, used, unused in empty
+/// blocks and free in the others) and the 15 with the most unused room, each with its largest
+/// allocation. The report does not say whether a block is local to the GPU or visible to the host:
+/// the name of its largest allocation tells a staging block from a resource block.
+fn vram_dump_lines(allocations: &[(u64, &str)], blocks: &[(u64, std::ops::Range<usize>)]) -> Vec<String> {
+    let mo = |b: u64| b as f64 / 1_048_576.0;
+    let mut lines = Vec::new();
+    let mut largest: Vec<_> = allocations.to_vec();
+    largest.sort_unstable_by_key(|x| std::cmp::Reverse(x.0));
+    for (size, name) in largest.iter().take(15) {
+        lines.push(format!("  {:>8.2} MB  {name}", mo(*size)));
+    }
+    // Per block: size, bytes used, allocations, name of the largest one.
+    let mut uses: Vec<(u64, u64, usize, &str)> = blocks
+        .iter()
+        .map(|(size, range)| {
+            let inside = allocations.get(range.clone()).unwrap_or(&[]);
+            let used = inside.iter().map(|a| a.0).sum();
+            let name = inside.iter().max_by_key(|a| a.0).map_or("(empty)", |a| a.1);
+            (*size, used, inside.len(), name)
+        })
+        .collect();
+    let reserved: u64 = uses.iter().map(|u| u.0).sum();
+    let used: u64 = uses.iter().map(|u| u.1).sum();
+    let empty: Vec<_> = uses.iter().filter(|u| u.2 == 0).collect();
+    let empty_bytes: u64 = empty.iter().map(|u| u.0).sum();
+    let free_in_used: u64 = uses.iter().filter(|u| u.2 > 0).map(|u| u.0.saturating_sub(u.1)).sum();
+    lines.push(format!(
+        "  {} memory blocks: {:.1} MB reserved, {:.1} MB used; unused: {:.1} MB in {} empty blocks, {:.1} MB free in the others",
+        uses.len(),
+        mo(reserved),
+        mo(used),
+        mo(empty_bytes),
+        empty.len(),
+        mo(free_in_used)
+    ));
+    uses.sort_unstable_by_key(|u| std::cmp::Reverse(u.0.saturating_sub(u.1)));
+    for (size, used, count, name) in uses.iter().take(15) {
+        lines.push(format!(
+            "  block {:>8.2} MB, used {:>8.2} MB by {count} allocations, largest: {name}",
+            mo(*size),
+            mo(*used)
+        ));
+    }
+    lines
+}
+
+#[cfg(test)]
+mod vram_dump_tests {
+    use super::vram_dump_lines;
+
+    const MB: u64 = 1 << 20;
+
+    /// Totals and block lines: an empty block counts in the unused room of the empty blocks, the free
+    /// room of a used block in the other total; blocks come out by decreasing unused room.
+    #[test]
+    fn allocator_blocks_split_the_unused_room() {
+        let allocations = [(3 * MB, "region faces"), (MB, "camera"), (8 * MB, "block textures")];
+        let blocks = [(8 * MB, 0..2), (16 * MB, 2..2), (8 * MB, 2..3)];
+        let lines = vram_dump_lines(&allocations, &blocks);
+        assert_eq!(lines[0], "      8.00 MB  block textures");
+        assert_eq!(
+            lines[3],
+            "  3 memory blocks: 32.0 MB reserved, 12.0 MB used; unused: 16.0 MB in 1 empty blocks, 4.0 MB free in the others"
+        );
+        assert_eq!(lines[4], "  block    16.00 MB, used     0.00 MB by 0 allocations, largest: (empty)");
+        assert_eq!(lines[5], "  block     8.00 MB, used     4.00 MB by 2 allocations, largest: region faces");
+        assert_eq!(lines[6], "  block     8.00 MB, used     8.00 MB by 1 allocations, largest: block textures");
+        assert_eq!(lines.len(), 7);
     }
 }

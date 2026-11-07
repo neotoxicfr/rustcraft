@@ -14,6 +14,7 @@ use super::{
     Renderer, VIEW_LIMIT, VisSnapshot, lists, perspective,
 };
 use crate::gpu_time::Role;
+use crate::perf_log::ListStage;
 use crate::present_watch::Stage;
 
 impl Renderer {
@@ -231,7 +232,8 @@ impl Renderer {
                     r
                 }
             };
-            crate::perf_log::list_stage(0, t_vis.elapsed());
+            crate::perf_log::list_stage(ListStage::Radius, t_vis.elapsed());
+            let t_walk = Instant::now();
             // Walk redone only if the camera or the columns changed, in a background task
             // like the game: we draw with the last result to arrive (one frame of lag at
             // most); the very first is computed in place. Camera counted in cells of 8 blocks
@@ -253,10 +255,12 @@ impl Renderer {
                 let snapshot = match &self.vis_snapshot {
                     Some((rev, s)) if *rev == self.vis_rev => s.clone(),
                     _ => {
+                        let t_snapshot = Instant::now();
                         let cols = self.columns.iter().map(|(&k, c)| (k, c.vis.clone()));
                         let s: VisSnapshot =
                             Arc::new(cols.chain(self.empty_vis.iter().map(|(&k, v)| (k, v.clone()))).collect());
                         self.vis_snapshot = Some((self.vis_rev, s.clone()));
+                        crate::perf_log::stage_time("us_visibility_snapshot_per_frame", t_snapshot.elapsed());
                         s
                     }
                 };
@@ -287,6 +291,7 @@ impl Renderer {
                     });
                 }
             }
+            crate::perf_log::list_stage(ListStage::WalkLaunch, t_walk.elapsed());
             // Sections reached as a set, for the entity visibility test.
             let t_set = Instant::now();
             if self.reached_set.0 != self.reached_gen {
@@ -296,9 +301,7 @@ impl Renderer {
                 };
                 self.reached_set = (self.reached_gen, min_y, sections, Arc::new(reach));
             }
-            crate::perf_log::list_stage(1, t_set.elapsed());
-            let t_sort = Instant::now();
-            self.resort_translucent_columns(eye, min_y, cam_col, oit_on);
+            crate::perf_log::list_stage(ListStage::ReachedSet, t_set.elapsed());
             // Runs of consecutive visible sections per column (`reached` is sorted by column
             // then height), in a reused buffer; each column points a range into it.
             let size = (self.config.width, self.config.height);
@@ -312,122 +315,18 @@ impl Renderer {
                 min_y,
                 sections,
             );
-            if self.draw_key != Some(draw_key) {
-                crate::perf_log::list_stage(2, t_sort.elapsed());
-                let t_lists = Instant::now();
-                // Visible columns from the farthest to the nearest, runs of sections in the
-                // field, batches and commands (`lists`).
-                let inp = lists::ListIn {
-                    columns: &self.columns,
-                    reached: &self.reached,
-                    planes: &planes,
-                    origin,
-                    eye,
-                    min_y,
-                    sections,
-                    face_vertices: self.shader_opts.face_vertices(),
-                    split_draws: self.split_draws,
-                    reached_gen: self.reached_gen,
-                    columns_rev: self.columns_rev,
-                };
-                let vis_ms = &mut self.vis_ms;
-                drawn = lists::build(&inp, &mut self.lists, lists::vis_order(), || {
-                    *vis_ms = t_vis.elapsed().as_secs_f64() * 1e3;
-                });
-                let (batches, args) = (&self.lists.batches, &self.lists.args);
-                crate::perf_log::list_stage(3, t_lists.elapsed());
-                let t_send = Instant::now();
-                // Indexed faces: indexed commands of each batch of block faces, split;
-                // only the instanced commands of the fluids remain, grouped.
-                let (mut indexed_draw_args, mut fluid_draw_args) =
-                    (std::mem::take(&mut self.indexed_draw_args), std::mem::take(&mut self.fluid_draw_args));
-                indexed_draw_args.clear();
-                fluid_draw_args.clear();
-                self.indexed_batch_ranges.clear();
-                if self.shader_opts.faceidx {
-                    for &(_, fluid, _, first, count) in batches {
-                        let cmds = &args[first as usize..(first + count) as usize];
-                        if fluid {
-                            self.indexed_batch_ranges.push((fluid_draw_args.len() as u32, count));
-                            fluid_draw_args.extend_from_slice(cmds);
-                        } else {
-                            let at = indexed_draw_args.len() as u32;
-                            indexed_args(cmds, &mut indexed_draw_args);
-                            self.indexed_batch_ranges.push((at, indexed_draw_args.len() as u32 - at));
-                        }
-                    }
-                }
-                // Commands sent: with `RUSTCRAFT_OPT_ARGSKIP`, only the range that differs from what the
-                // buffer already holds (unless a new buffer).
-                let skip = lists::args_skip();
-                let instanced: &[DrawArgs] = if self.shader_opts.faceidx { &fluid_draw_args } else { args };
-                if self.indirect_ok && !instanced.is_empty() {
-                    let bytes = std::mem::size_of_val(instanced) as u64;
-                    let mut fresh = !skip;
-                    if self.indirect.size() < bytes {
-                        self.indirect = self.device.create_buffer(&wgpu::BufferDescriptor {
-                            label: Some("indirect commands"),
-                            size: bytes.next_power_of_two(),
-                            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
-                            mapped_at_creation: false,
-                        });
-                        fresh = true;
-                    }
-                    let range =
-                        if fresh { Some(0..instanced.len()) } else { lists::changed_range(&self.sent_args, instanced) };
-                    if let Some(r) = range {
-                        let at = (r.start * std::mem::size_of::<DrawArgs>()) as u64;
-                        self.up.write(&self.queue, &self.indirect, at, bytemuck::cast_slice(&instanced[r]));
-                    }
-                    if skip {
-                        self.sent_args.clear();
-                        self.sent_args.extend_from_slice(instanced);
-                    }
-                }
-                if self.shader_opts.faceidx {
-                    let need = indexed_draw_args.iter().map(|a| a.first_instance + 1).max().unwrap_or(0);
-                    if need > self.face_ids.1 {
-                        let n = need.next_power_of_two();
-                        self.face_ids = (identity_buffer(&self.device, n), n);
-                    }
-                    if self.indirect_ok && !indexed_draw_args.is_empty() {
-                        let bytes = (indexed_draw_args.len() * std::mem::size_of::<DrawIndexedArgs>()) as u64;
-                        let mut fresh = !skip;
-                        if self.indirect_idx.size() < bytes {
-                            self.indirect_idx = self.device.create_buffer(&wgpu::BufferDescriptor {
-                                label: Some("indirect indexed commands"),
-                                size: bytes.next_power_of_two(),
-                                usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
-                                mapped_at_creation: false,
-                            });
-                            fresh = true;
-                        }
-                        let range = if fresh {
-                            Some(0..indexed_draw_args.len())
-                        } else {
-                            lists::changed_range(&self.sent_indexed_draw_args, &indexed_draw_args)
-                        };
-                        if let Some(r) = range {
-                            let at = (r.start * std::mem::size_of::<DrawIndexedArgs>()) as u64;
-                            self.up.write(
-                                &self.queue,
-                                &self.indirect_idx,
-                                at,
-                                bytemuck::cast_slice(&indexed_draw_args[r]),
-                            );
-                        }
-                        if skip {
-                            self.sent_indexed_draw_args.clear();
-                            self.sent_indexed_draw_args.extend_from_slice(&indexed_draw_args);
-                        }
-                    }
-                }
-                (self.indexed_draw_args, self.fluid_draw_args) = (indexed_draw_args, fluid_draw_args);
-                crate::perf_log::list_stage(4, t_send.elapsed());
-                (self.drawn_cache, self.draw_key) = (drawn, Some(draw_key));
-            } else {
-                drawn = self.drawn_cache;
+            let lists_changed = self.draw_key != Some(draw_key);
+            let rebuilt = draw_list_stages(
+                self,
+                lists_changed,
+                |r| r.resort_translucent_columns(eye, min_y, cam_col, oit_on),
+                |r| r.rebuild_draw_lists(&planes, origin, eye, min_y, sections, t_vis),
+            );
+            if let Some(d) = rebuilt {
+                (self.drawn_cache, self.draw_key) = (d, Some(draw_key));
             }
+            drawn = self.drawn_cache;
+            self.count_terrain_draws();
             let entities_done = self.encode_terrain_batches(&mut pass, oit_on);
             if oit_on {
                 self.draw_solid_features(&mut pass);
@@ -693,5 +592,187 @@ impl Renderer {
         self.window.pre_present_notify();
         crate::present_watch::during(Stage::Present, || self.queue.present(frame));
         true
+    }
+
+    /// Rebuilds the draw lists of the frame (visible columns from the farthest to the nearest, runs
+    /// of sections in the field, batches and commands, `lists`) and sends the indirect commands;
+    /// returns the columns and faces drawn. `t_vis`: start of the frame's visibility work.
+    fn rebuild_draw_lists(
+        &mut self,
+        planes: &[glam::Vec4; 6],
+        origin: [i32; 2],
+        eye: [f64; 3],
+        min_y: i32,
+        sections: i32,
+        t_vis: Instant,
+    ) -> (usize, u64) {
+        let t_lists = Instant::now();
+        let inp = lists::ListIn {
+            columns: &self.columns,
+            reached: &self.reached,
+            planes,
+            origin,
+            eye,
+            min_y,
+            sections,
+            face_vertices: self.shader_opts.face_vertices(),
+            split_draws: self.split_draws,
+            reached_gen: self.reached_gen,
+            columns_rev: self.columns_rev,
+        };
+        let vis_ms = &mut self.vis_ms;
+        let drawn = lists::build(&inp, &mut self.lists, lists::vis_order(), || {
+            *vis_ms = t_vis.elapsed().as_secs_f64() * 1e3;
+        });
+        let (batches, args) = (&self.lists.batches, &self.lists.args);
+        crate::perf_log::list_stage(ListStage::Lists, t_lists.elapsed());
+        let t_send = Instant::now();
+        // Indexed faces: indexed commands of each batch of block faces, split;
+        // only the instanced commands of the fluids remain, grouped.
+        let (mut indexed_draw_args, mut fluid_draw_args) =
+            (std::mem::take(&mut self.indexed_draw_args), std::mem::take(&mut self.fluid_draw_args));
+        indexed_draw_args.clear();
+        fluid_draw_args.clear();
+        self.indexed_batch_ranges.clear();
+        if self.shader_opts.faceidx {
+            for &(_, fluid, _, first, count) in batches {
+                let cmds = &args[first as usize..(first + count) as usize];
+                if fluid {
+                    self.indexed_batch_ranges.push((fluid_draw_args.len() as u32, count));
+                    fluid_draw_args.extend_from_slice(cmds);
+                } else {
+                    let at = indexed_draw_args.len() as u32;
+                    indexed_args(cmds, &mut indexed_draw_args);
+                    self.indexed_batch_ranges.push((at, indexed_draw_args.len() as u32 - at));
+                }
+            }
+        }
+        // Commands sent: with `RUSTCRAFT_OPT_ARGSKIP`, only the range that differs from what the
+        // buffer already holds (unless a new buffer).
+        let skip = lists::args_skip();
+        let instanced: &[DrawArgs] = if self.shader_opts.faceidx { &fluid_draw_args } else { args };
+        if self.indirect_ok && !instanced.is_empty() {
+            let bytes = std::mem::size_of_val(instanced) as u64;
+            let mut fresh = !skip;
+            if self.indirect.size() < bytes {
+                self.indirect = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("indirect commands"),
+                    size: bytes.next_power_of_two(),
+                    usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                fresh = true;
+            }
+            let range =
+                if fresh { Some(0..instanced.len()) } else { lists::changed_range(&self.sent_args, instanced) };
+            if let Some(r) = range {
+                let at = (r.start * std::mem::size_of::<DrawArgs>()) as u64;
+                self.up.write(&self.queue, &self.indirect, at, bytemuck::cast_slice(&instanced[r]));
+            }
+            if skip {
+                self.sent_args.clear();
+                self.sent_args.extend_from_slice(instanced);
+            }
+        }
+        if self.shader_opts.faceidx {
+            let need = indexed_draw_args.iter().map(|a| a.first_instance + 1).max().unwrap_or(0);
+            if need > self.face_ids.1 {
+                let n = need.next_power_of_two();
+                self.face_ids = (identity_buffer(&self.device, n), n);
+            }
+            if self.indirect_ok && !indexed_draw_args.is_empty() {
+                let bytes = (indexed_draw_args.len() * std::mem::size_of::<DrawIndexedArgs>()) as u64;
+                let mut fresh = !skip;
+                if self.indirect_idx.size() < bytes {
+                    self.indirect_idx = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("indirect indexed commands"),
+                        size: bytes.next_power_of_two(),
+                        usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    fresh = true;
+                }
+                let range = if fresh {
+                    Some(0..indexed_draw_args.len())
+                } else {
+                    lists::changed_range(&self.sent_indexed_draw_args, &indexed_draw_args)
+                };
+                if let Some(r) = range {
+                    let at = (r.start * std::mem::size_of::<DrawIndexedArgs>()) as u64;
+                    self.up.write(
+                        &self.queue,
+                        &self.indirect_idx,
+                        at,
+                        bytemuck::cast_slice(&indexed_draw_args[r]),
+                    );
+                }
+                if skip {
+                    self.sent_indexed_draw_args.clear();
+                    self.sent_indexed_draw_args.extend_from_slice(&indexed_draw_args);
+                }
+            }
+        }
+        (self.indexed_draw_args, self.fluid_draw_args) = (indexed_draw_args, fluid_draw_args);
+        crate::perf_log::list_stage(ListStage::CommandSubmit, t_send.elapsed());
+        drawn
+    }
+
+    /// Terrain batches and indirect commands drawn by this frame (perf log).
+    fn count_terrain_draws(&self) {
+        let commands = if self.shader_opts.faceidx {
+            self.indexed_draw_args.len() + self.fluid_draw_args.len()
+        } else {
+            self.lists.args.len()
+        };
+        crate::perf_log::counter("terrain_batches_per_frame", self.lists.batches.len() as u64);
+        crate::perf_log::counter("terrain_commands_per_frame", commands as u64);
+    }
+}
+
+/// Draw-list work of a frame: the translucent re-sort has its own rotation and runs every frame,
+/// so its time is recorded on every frame; the lists are only rebuilt (`rebuild`) when they
+/// changed. Returns what `rebuild` gave, if it ran. Generic over the renderer for the test.
+fn draw_list_stages<R, T>(
+    renderer: &mut R,
+    lists_changed: bool,
+    resort: impl FnOnce(&mut R),
+    rebuild: impl FnOnce(&mut R) -> T,
+) -> Option<T> {
+    let started = Instant::now();
+    resort(renderer);
+    crate::perf_log::list_stage(ListStage::Resort, started.elapsed());
+    lists_changed.then(|| rebuild(renderer))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The re-sort is timed on a frame that keeps its lists (it used to be recorded only on the
+    /// frames that rebuilt them); the rebuild does not run then.
+    #[test]
+    fn translucent_resort_is_timed_on_frames_that_keep_their_lists() {
+        let before = crate::perf_log::list_stage_ns(ListStage::Resort);
+        let mut rebuilt = false;
+        let resort_time = Duration::from_millis(3);
+        let out = draw_list_stages(&mut rebuilt, false, |_| std::thread::sleep(resort_time), |r| *r = true);
+        assert!(out.is_none() && !rebuilt, "the lists must not be rebuilt when they did not change");
+        let recorded = crate::perf_log::list_stage_ns(ListStage::Resort) - before;
+        assert!(
+            recorded >= resort_time.as_nanos() as u64,
+            "re-sort of a frame without rebuild not recorded: {recorded} ns"
+        );
+    }
+
+    /// A frame whose lists changed rebuilds them and returns what the rebuild gave.
+    #[test]
+    fn changed_lists_are_rebuilt() {
+        let mut rebuilt = 0;
+        let out = draw_list_stages(&mut rebuilt, true, |_| {}, |r| {
+            *r += 1;
+            7
+        });
+        assert_eq!((out, rebuilt), (Some(7), 1));
     }
 }
