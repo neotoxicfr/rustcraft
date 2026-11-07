@@ -107,6 +107,8 @@ mod ench_fx; // G5-F04: enchantment effects (protection, armor effectiveness, af
 mod mace; // G5-F04: smash attack
 #[cfg(test)]
 mod tests_g5f04;
+#[cfg(test)]
+mod tests_damage_tag_names; // short damage tag and damage type names, read in `minecraft`
 pub mod randsrc;
 // Commands (S5).
 pub mod commands;

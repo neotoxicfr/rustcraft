@@ -11,6 +11,7 @@ use rc_proto_v777::entity::{AddEntity, Meta};
 
 use crate::items::same;
 use crate::menus::inventory_add;
+use crate::mobs::combat::same_identifier;
 use crate::mobs::recent::vibration::Src;
 use crate::nbtio::int;
 use crate::player::Stack;
@@ -1823,13 +1824,27 @@ impl Server {
 // ---------- Damage taken by ground items and orbs (`/damage`) ----------
 
 impl Server {
-    /// `damage_resistant` component of the stack (patch, otherwise prototype): tag of damage types.
-    pub(crate) fn resistant_tag(&self, s: &Stack) -> Option<String> {
+    /// True if the stack resists damage type `ty`: the `types` of its `damage_resistant`
+    /// component (patch, otherwise prototype) hold it. Like the game, `types` is a tag
+    /// (`#is_fire`), one damage type or a list of damage types.
+    pub(crate) fn item_resists(&self, s: &Stack, ty: &str) -> bool {
         if let Some(c) = crate::items::component(s, "minecraft:damage_resistant") {
-            return c.get("types").and_then(rc_proto::nbt::Nbt::as_str).map(str::to_owned);
+            return c.get("types").is_some_and(|t| self.nbt_damage_set_has(t, ty));
         }
-        let v = self.life.items.default_component(s, "minecraft:damage_resistant")?;
-        v["types"].as_str().map(str::to_owned)
+        self.life
+            .items
+            .default_component(s, "minecraft:damage_resistant")
+            .is_some_and(|v| crate::item_use::damage_set_has(self, &v["types"], ty))
+    }
+
+    /// [`crate::item_use::damage_set_has`] for a set written in NBT (component patch).
+    fn nbt_damage_set_has(&self, set: &Nbt, ty: &str) -> bool {
+        match set {
+            Nbt::String(entry) => self.damage_set_entry_has(entry, ty),
+            // A list holds damage types only, never tags.
+            Nbt::List(entries) => entries.iter().any(|e| e.as_str().is_some_and(|id| same_identifier(ty, id))),
+            _ => false,
+        }
     }
 
     /// Damage to a ground item: refused if a mob causes it without `mob_griefing` or if the
@@ -1862,11 +1877,6 @@ impl Server {
     /// Damage refused: caused by a mob without `mob_griefing`, or resisted by the stack.
     fn item_may_hurt(&self, s: &Stack, ty: &str, by_mob: bool) -> bool {
         !(by_mob && !self.rule("minecraft:mob_griefing", true)) && !self.item_resists(s, ty)
-    }
-
-    /// True if the stack resists damage type `ty` (`damage_resistant` component).
-    pub(crate) fn item_resists(&self, s: &Stack, ty: &str) -> bool {
-        self.resistant_tag(s).is_some_and(|tag| self.dmg_tag(ty, tag.trim_start_matches('#')))
     }
 
     /// Damage to an experience orb: health points removed, orb removed at 0.
