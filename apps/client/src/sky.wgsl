@@ -100,6 +100,42 @@ fn vs_cloud(@location(0) p: vec4<f32>) -> V {
     return cloud_vertex(p);
 }
 
+// Faces of the clouds read by vertex number (`RUSTCRAFT_OPT_CLOUD_INDEXED_FACES`), one word per face.
+@group(1) @binding(0) var<storage, read> cloud_face_words: array<u32>;
+
+//#if PACKED_SHADER_CONSTANTS
+// Corners of the unit cube per face (down, up, north, south, west, east, like sky_mesh.rs) as one
+// bit per axis, bit `direction * 4 + corner`: a constant array indexed by a per-vertex value is
+// copied into local memory for every vertex, a shift of a constant is not.
+const CLOUD_CORNER_X: u32 = 0xf03cc3u;
+const CLOUD_CORNER_Y: u32 = 0x6666f0u;
+const CLOUD_CORNER_Z: u32 = 0xc3f066u;
+// Quad corner (2 bits each) of the 6 vertices of the two triangles 0-1-2 and 2-3-0.
+const CLOUD_QUAD_CORNERS: u32 = 0x3a4u;
+
+fn cloud_quad_corner(v: u32) -> u32 {
+    return (CLOUD_QUAD_CORNERS >> (2u * v)) & 3u;
+}
+
+fn cloud_cube_corner(dir: u32, corner: u32) -> vec3<f32> {
+    let bit = dir * 4u + corner;
+    return vec3<f32>((vec3<u32>(CLOUD_CORNER_X, CLOUD_CORNER_Y, CLOUD_CORNER_Z) >> vec3<u32>(bit)) & vec3<u32>(1u));
+}
+
+// Shading factor of a direction (the same literals as the table of the other branch).
+fn cloud_shade(dir: u32) -> f32 {
+    if dir == 0u {
+        return 0.7;
+    }
+    if dir == 1u {
+        return 1.0;
+    }
+    if dir < 4u {
+        return 0.8;
+    }
+    return 0.9;
+}
+//#else
 // Corners of the unit cube per face (down, up, north, south, west, east), like sky_mesh.rs.
 const CLOUD_CORNERS = array<vec3<f32>, 24>(
     vec3(1.0, 0.0, 0.0), vec3(1.0, 0.0, 1.0), vec3(0.0, 0.0, 1.0), vec3(0.0, 0.0, 0.0),
@@ -112,28 +148,52 @@ const CLOUD_CORNERS = array<vec3<f32>, 24>(
 const CLOUD_SHADE = array<f32, 6>(0.7, 1.0, 0.8, 0.8, 0.9, 0.9);
 const CLOUD_QUAD = array<u32, 6>(0u, 1u, 2u, 2u, 3u, 0u);
 
-// Vertex `v` (0 to 5) of face `code` (direction | inner << 3 | top shade << 4) of
-// cell (i, k): position relative to the mesh origin, shading factor in w.
-fn cloud_corner(i: i32, k: i32, code: u32, v: u32) -> vec4<f32> {
-    var corners = CLOUD_CORNERS;
-    var shades = CLOUD_SHADE;
+fn cloud_quad_corner(v: u32) -> u32 {
     var quad = CLOUD_QUAD;
+    return quad[v];
+}
+
+fn cloud_cube_corner(dir: u32, corner: u32) -> vec3<f32> {
+    var corners = CLOUD_CORNERS;
+    return corners[dir * 4u + corner];
+}
+
+fn cloud_shade(dir: u32) -> f32 {
+    var shades = CLOUD_SHADE;
+    return shades[dir];
+}
+//#endif
+
+// Corner `corner` (0 to 3) of face `code` (direction | inner << 3 | top shade << 4) of cell
+// (i, k): position relative to the mesh origin, shading factor in w. An inner face takes its
+// corners in reverse order (seen from inside the cell).
+fn cloud_face_corner(i: i32, k: i32, code: u32, corner: u32) -> vec4<f32> {
     let dir = code & 7u;
-    var q = quad[v];
+    var q = corner;
     if (code & 8u) != 0u {
         q = 3u - q;
     }
-    let c = corners[dir * 4u + q];
-    var shade = shades[dir];
+    let c = cloud_cube_corner(dir, q);
+    var shade = cloud_shade(dir);
     if (code & 16u) != 0u {
-        shade = shades[1];
+        shade = cloud_shade(1u);
     }
     return vec4<f32>(c.x * 12.0 + 12.0 * f32(i), c.y * 4.0, c.z * 12.0 + 12.0 * f32(k), shade);
 }
 
-// One face per instance: i (bits 0-9, signed), k (10-19), code (20-24).
+// Vertex `v` (0 to 5, two triangles 0-1-2 and 2-3-0) of face `code` of cell (i, k).
+fn cloud_corner(i: i32, k: i32, code: u32, v: u32) -> vec4<f32> {
+    return cloud_face_corner(i, k, code, cloud_quad_corner(v));
+}
+
+// Corner `corner` of the face of word `w`: i (bits 0-9, signed), k (10-19), code (20-24).
+fn cloud_word_corner(w: u32, corner: u32) -> vec4<f32> {
+    return cloud_face_corner(bitcast<i32>(w << 22u) >> 22u, bitcast<i32>(w << 12u) >> 22u, (w >> 20u) & 31u, corner);
+}
+
+// One face per instance, 6 vertices.
 fn cloud_face(w: u32, v: u32) -> vec4<f32> {
-    return cloud_corner(bitcast<i32>(w << 22u) >> 22u, bitcast<i32>(w << 12u) >> 22u, (w >> 20u) & 31u, v);
+    return cloud_word_corner(w, cloud_quad_corner(v));
 }
 
 // One cell per instance: up to 4 one-byte codes (255 = empty slot, w = -1).
@@ -148,6 +208,13 @@ fn cloud_cell(i: i32, k: i32, codes: u32, v: u32) -> vec4<f32> {
 @vertex
 fn vs_cloud_face(@builtin(vertex_index) v: u32, @location(0) w: u32) -> V {
     return cloud_vertex(cloud_face(w, v));
+}
+
+// Indexed faces: 4 vertices per face (the shared index list gives triangles 0-1-2 and 2-3-0),
+// so the vertex cache shades each corner once instead of six vertices per face.
+@vertex
+fn vs_cloud_indexed(@builtin(vertex_index) v: u32) -> V {
+    return cloud_vertex(cloud_word_corner(cloud_face_words[v / 4u], v & 3u));
 }
 
 @vertex

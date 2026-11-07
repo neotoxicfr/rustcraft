@@ -11,14 +11,27 @@
 //! - `RUSTCRAFT_OPT_CLOUDPAR`: `1` faces or instances built in slices of the spiral on
 //!   the common pool (with the spiral only); off by default (main thread alone) until the
 //!   "flight" scene bench has measured the wait behind the queued meshes.
+//! - `RUSTCRAFT_OPT_CLOUD_POOL`: `1` the slices built on the clouds' own pool of 2 to 4 threads
+//!   (with the spiral only; wins over `CLOUDPAR`); off by default: its sleeping threads woke up
+//!   late on the loaded-machine bench (median 0.6 to 1.4 ms, peaks of 8 ms, against 0.9 ms on the
+//!   main thread alone), to re-measure on the "flight" scenes.
+//! - `RUSTCRAFT_OPT_CLOUD_SPECULATIVE_BUILD`: (`face` format) a background thread builds the
+//!   cell the camera will enter next; the crossing swaps buffers; `0` built at the crossing.
+//! - `RUSTCRAFT_OPT_CLOUD_INDEXED_FACES`: (`face` format) 4 vertices per face drawn by a shared
+//!   16-bit index list, faces read from storage by vertex number; `0` 6 vertices per instance.
+//! - `RUSTCRAFT_OPT_PACKED_SHADER_CONSTANTS`: cube corners, shades and quad corners of the
+//!   cloud shader as bit constants; `0` constant arrays copied and indexed per vertex.
 //! - `RUSTCRAFT_OPT_SKYUNIF`: 7 uniforms in a buffer with 256-byte slots, one write of the
 //!   range changed per frame, unchanged values skipped; `0` one buffer and one write each.
+
+use std::sync::Arc;
 
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
 use crate::render::upload::{self, Uploader};
-use crate::sky_mesh::{self, CloudCells, CloudMap, CloudSide};
+use crate::sky_mesh::cloud_builder::{FaceBuilder, ParallelBuild, Speculation, Spiral, next_cell};
+use crate::sky_mesh::{self, CloudCells, CloudKey, CloudMap, CloudSide};
 
 /// Shape of the clouds buffer (`RUSTCRAFT_OPT_CLOUDINST`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +49,10 @@ pub struct SkyOpts {
     spiral: bool,
     par: bool,
     unif: bool,
+    own_pool: bool,
+    speculative: bool,
+    indexed: bool,
+    packed_constants: bool,
 }
 
 impl SkyOpts {
@@ -50,7 +67,57 @@ impl SkyOpts {
             spiral: rc_data::env_str!("RUSTCRAFT_OPT_CLOUDSPIRAL") != Some("0"),
             par: rc_data::env_str!("RUSTCRAFT_OPT_CLOUDPAR") == Some("1"),
             unif: rc_data::env_str!("RUSTCRAFT_OPT_SKYUNIF") != Some("0"),
+            own_pool: rc_data::opt_switch!("RUSTCRAFT_OPT_CLOUD_POOL", default_off),
+            speculative: rc_data::opt_switch!("RUSTCRAFT_OPT_CLOUD_SPECULATIVE_BUILD"),
+            indexed: rc_data::opt_switch!("RUSTCRAFT_OPT_CLOUD_INDEXED_FACES"),
+            packed_constants: rc_data::opt_switch!("RUSTCRAFT_OPT_PACKED_SHADER_CONSTANTS"),
         }
+    }
+
+    /// Complete old path (each switch at its old value).
+    #[cfg(test)]
+    const OLD: SkyOpts = SkyOpts {
+        inst: CloudInst::Mesh,
+        persist: false,
+        spiral: false,
+        par: false,
+        unif: false,
+        own_pool: false,
+        speculative: false,
+        indexed: false,
+        packed_constants: false,
+    };
+
+    /// Faces drawn indexed from storage (only the `face` format has one word per face).
+    fn indexed_faces(self) -> bool {
+        self.indexed && self.inst == CloudInst::Face
+    }
+
+    /// Faces built ahead on a background thread (`face` format).
+    fn speculative_faces(self) -> bool {
+        self.speculative && self.inst == CloudInst::Face
+    }
+
+    /// Cloud shader entry point and its vertex or instance buffer (none for indexed faces).
+    fn cloud_input(self) -> (&'static str, Option<wgpu::VertexBufferLayout<'static>>) {
+        if self.indexed_faces() {
+            return ("vs_cloud_indexed", None);
+        }
+        let (vs, buffer) = self.inst.vertex();
+        (vs, Some(buffer))
+    }
+
+    /// Usage of the clouds buffer: also read from storage by the indexed faces.
+    fn cloud_buffer_usage(self) -> wgpu::BufferUsages {
+        if self.indexed_faces() { BUF_USAGE | wgpu::BufferUsages::STORAGE } else { BUF_USAGE }
+    }
+
+    /// sky.wgsl reduced to the blocks of these switches.
+    pub(crate) fn shader_source(self) -> String {
+        crate::terrain_shader::select_blocks(include_str!("sky.wgsl"), |name| match name {
+            "PACKED_SHADER_CONSTANTS" => self.packed_constants,
+            _ => panic!("sky.wgsl: unknown variant '{name}'"),
+        })
     }
 }
 
@@ -80,6 +147,23 @@ impl CloudInst {
 const BUF_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::VERTEX
     .union(wgpu::BufferUsages::COPY_DST)
     .union(if cfg!(test) { wgpu::BufferUsages::COPY_SRC } else { wgpu::BufferUsages::empty() });
+
+/// Group 1 of the indexed faces: the clouds buffer read as storage by the vertices.
+fn cloud_faces_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("cloud faces"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    })
+}
 
 /// Sky images read from the resources: sun then 8 moon phases (32 × 32), clouds.
 #[derive(Default)]
@@ -159,18 +243,25 @@ pub struct Sky {
     cloud_cap: u64,
     cloud_verts: u32,
     cloud_n: u32,
+    /// Indexed faces: shared index list, layout of group 1 and its binding of the clouds buffer.
+    cloud_indices: Option<wgpu::Buffer>,
+    cloud_faces_layout: wgpu::BindGroupLayout,
+    cloud_faces_bind: Option<wgpu::BindGroup>,
     /// Precomputed disk order and its radius.
-    spiral: (i32, Vec<[i16; 2]>),
-    /// Faces or instances of the last build (reserve kept).
-    faces: Vec<u32>,
+    spiral: (i32, Spiral),
+    /// Faces of the last build and their builders (in place or ahead of time).
+    face_builder: FaceBuilder,
+    /// Where the in-place builds run.
+    placement: ParallelBuild,
+    /// Instances of the last build (reserve kept) and the slices of their parallel build.
     cells: Vec<[u32; 2]>,
-    /// Slices of the parallel build (reserves kept from one pass to the next).
-    face_parts: Vec<Vec<u32>>,
     cell_parts: Vec<Vec<[u32; 2]>>,
     unif: Unif,
     binds: Vec<wgpu::BindGroup>,
-    cloud_map: Option<CloudMap>,
-    cloud_key: Option<(i32, i32, CloudSide, i32, bool)>,
+    cloud_map: Option<Arc<CloudMap>>,
+    cloud_key: Option<CloudKey>,
+    /// Camera position in the cloud plane at the last frame (before the wrap), for its motion.
+    cloud_eye: Option<(f64, f64)>,
     has_bodies: bool,
     /// What is to be drawn in the current frame (set by `prepare`).
     draw: [bool; 7],
@@ -195,7 +286,7 @@ impl Sky {
     ) -> Sky {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sky"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("sky.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(opts.shader_source().into()),
         });
         // Celestial bodies: one layer per sprite (sun, moons, End flash) at the largest size,
         // enlarged with nearest neighbor (identical to the sampling of the original sprite).
@@ -229,7 +320,8 @@ impl Sky {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("celestial bodies"), ..Default::default() });
+        let sampler =
+            device.create_sampler(&wgpu::SamplerDescriptor { label: Some("celestial bodies"), ..Default::default() });
         // End box: repeated texture, nearest neighbor.
         let end_img = assets.end_sky.clone().unwrap_or_else(|| rc_assets::texture::Image::missing(16));
         let end_tex = device.create_texture_with_data(
@@ -345,6 +437,16 @@ impl Sky {
             bind_group_layouts: &[Some(&layout)],
             ..Default::default()
         });
+        let cloud_faces_layout = cloud_faces_layout(device);
+        let cloud_pl = if opts.indexed_faces() {
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("indexed clouds"),
+                bind_group_layouts: &[Some(&layout), Some(&cloud_faces_layout)],
+                ..Default::default()
+            })
+        } else {
+            pl.clone()
+        };
         let translucent = wgpu::BlendState::ALPHA_BLENDING;
         // Additive-α: source color × alpha added, source alpha kept.
         let additive = wgpu::BlendState {
@@ -360,20 +462,20 @@ impl Sky {
             },
         };
         let make_cull = |label: &str,
-                         vs: &str,
+                         (vs, buffer): (&str, Option<wgpu::VertexBufferLayout<'_>>),
                          fs: &str,
-                         buffer: wgpu::VertexBufferLayout<'_>,
+                         layout: &wgpu::PipelineLayout,
                          blend: wgpu::BlendState,
                          depth: bool,
                          cull: Option<wgpu::Face>| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
-                layout: Some(&pl),
+                layout: Some(layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some(vs),
                     compilation_options: Default::default(),
-                    buffers: &[Some(buffer)],
+                    buffers: if buffer.is_some() { std::slice::from_ref(&buffer) } else { &[] },
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
@@ -411,7 +513,7 @@ impl Sky {
                     depth: bool| {
             let buffer =
                 wgpu::VertexBufferLayout { array_stride: stride, step_mode: wgpu::VertexStepMode::Vertex, attributes };
-            make_cull(label, vs, fs, buffer, blend, depth, Some(wgpu::Face::Back))
+            make_cull(label, (vs, Some(buffer)), fs, &pl, blend, depth, Some(wgpu::Face::Back))
         };
         let fan_pipe =
             make("glow", "vs_fan", "fs_fan", &wgpu::vertex_attr_array![0 => Float32x4], 16, translucent, false);
@@ -426,10 +528,10 @@ impl Sky {
         );
         let star_pipe =
             make("stars", "vs_star", "fs_star", &wgpu::vertex_attr_array![0 => Float32x3], 12, additive, false);
-        let (cloud_vs, cloud_buffer) = opts.inst.vertex();
-        let cloud_pipe =
-            make_cull("clouds", cloud_vs, "fs_cloud", cloud_buffer.clone(), translucent, true, Some(wgpu::Face::Back));
-        let flat_cloud_pipe = make_cull("flat clouds", cloud_vs, "fs_cloud", cloud_buffer, translucent, true, None);
+        let back = Some(wgpu::Face::Back);
+        let cloud_pipe = make_cull("clouds", opts.cloud_input(), "fs_cloud", &cloud_pl, translucent, true, back);
+        let flat_cloud_pipe =
+            make_cull("flat clouds", opts.cloud_input(), "fs_cloud", &cloud_pl, translucent, true, None);
         let end_pipe = make(
             "End sky",
             "vs_body",
@@ -493,7 +595,9 @@ impl Sky {
             usage: wgpu::BufferUsages::VERTEX,
         });
         let cloud_map =
-            assets.clouds.as_ref().map(|i| CloudMap::from_rgba(i.width as usize, i.height as usize, &i.rgba));
+            assets.clouds.as_ref().map(|i| Arc::new(CloudMap::from_rgba(i.width as usize, i.height as usize, &i.rgba)));
+        let speculation =
+            cloud_map.as_ref().filter(|_| opts.speculative_faces()).and_then(|m| Speculation::start(Arc::clone(m)));
         Sky {
             fan_pipe,
             body_pipe,
@@ -515,15 +619,23 @@ impl Sky {
             cloud_cap: 0,
             cloud_verts: 0,
             cloud_n: 0,
-            spiral: (-1, Vec::new()),
-            faces: Vec::new(),
+            cloud_indices: None,
+            cloud_faces_layout,
+            cloud_faces_bind: None,
+            spiral: (-1, Spiral::from([])),
+            face_builder: FaceBuilder::new(speculation),
+            // The slices exist only for the packed formats in disk order: no idle threads otherwise.
+            placement: ParallelBuild::new(
+                opts.own_pool && opts.spiral && opts.inst != CloudInst::Mesh && assets.clouds.is_some(),
+                opts.par,
+            ),
             cells: Vec::new(),
-            face_parts: Vec::new(),
             cell_parts: Vec::new(),
             unif,
             binds,
             cloud_map,
             cloud_key: None,
+            cloud_eye: None,
             has_bodies: assets.celestial.len() >= 9,
             draw: [false; 7],
             star_vb_len: stars.len() as u32,
@@ -537,12 +649,14 @@ impl Sky {
         if self.oit.is_some() {
             return;
         }
-        let module =
-            crate::oit::module(device, "clouds (transparency)", include_str!("sky.wgsl"), include_str!("sky_oit.wgsl"));
-        let groups = [Some(&self.layout)];
-        let (vs, buffer) = self.opts.inst.vertex();
-        let buffers = [Some(buffer)];
-        let spec = |label| crate::oit::Spec::new(label, &groups, &module, vs, &buffers, "fs_cloud");
+        let source = self.opts.shader_source();
+        let module = crate::oit::module(device, "clouds (transparency)", &source, include_str!("sky_oit.wgsl"));
+        let groups = [Some(&self.layout), Some(&self.cloud_faces_layout)];
+        let groups = if self.opts.indexed_faces() { &groups[..] } else { &groups[..1] };
+        let (vs, buffer) = self.opts.cloud_input();
+        let buffers = [buffer];
+        let buffers = if buffers[0].is_some() { &buffers[..] } else { &[] };
+        let spec = |label| crate::oit::Spec::new(label, groups, &module, vs, buffers, "fs_cloud");
         // Detailed clouds: back faces culled, bounds written into their own depth
         // (only the closest face counts afterwards); flat: two faces, no write.
         self.oit = Some([
@@ -567,12 +681,32 @@ impl Sky {
 
     /// Clouds, stage `f` of improved transparency.
     pub fn draw_clouds_oit(&self, pass: &mut wgpu::RenderPass<'_>, f: crate::oit::Frame<'_>) {
-        if let (Some((vb, verts, n)), Some(sets)) = (self.cloud_draw(), &self.oit) {
+        if let (Some(_), Some(sets)) = (self.cloud_draw(), &self.oit) {
             f.set(pass, &sets[usize::from(self.cloud_flat)]);
-            pass.set_bind_group(0, &self.binds[CLOUDS], &[]);
-            pass.set_vertex_buffer(0, vb.slice(..));
-            pass.draw(0..verts, 0..n);
+            self.record_cloud_draw(pass);
         }
+    }
+
+    /// Draw of the frame's clouds with the pipeline already set: indexed faces read from storage
+    /// in draws of [`sky_mesh::FACES_PER_INDEXED_DRAW`] faces, or vertices and instances.
+    fn record_cloud_draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+        let Some((vb, verts, n)) = self.cloud_draw() else { return };
+        pass.set_bind_group(0, &self.binds[CLOUDS], &[]);
+        if let (true, Some(indices), Some(faces)) =
+            (self.opts.indexed_faces(), &self.cloud_indices, &self.cloud_faces_bind)
+        {
+            pass.set_bind_group(1, faces, &[]);
+            pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint16);
+            let per_draw = sky_mesh::FACES_PER_INDEXED_DRAW;
+            for first in (0..n).step_by(per_draw as usize) {
+                let count = (n - first).min(per_draw);
+                // The base vertex carries the draw's first face: the shader reads face vertex / 4.
+                pass.draw_indexed(0..6 * count, (4 * first) as i32, 0..1);
+            }
+            return;
+        }
+        pass.set_vertex_buffer(0, vb.slice(..));
+        pass.draw(0..verts, 0..n);
     }
 
     fn write(&mut self, queue: &wgpu::Queue, slot: usize, mvp: Mat4, color: [f32; 4], extra: [f32; 4]) {
@@ -587,79 +721,71 @@ impl Sky {
         }
     }
 
-    /// Rebuilds the clouds buffer around cell (cx, cz).
+    /// Rebuilds the clouds buffer for `key`, then asks for `next` (the cell the camera will most
+    /// likely enter) to be built ahead.
     fn build_clouds(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         up: &mut Uploader,
-        (cx, cz, side, radius, flat): (i32, i32, CloudSide, i32, bool),
+        key: CloudKey,
+        next: CloudKey,
     ) {
         let Some(map) = &self.cloud_map else { return };
+        let mut timer = crate::perf_log::StageTimer::start();
         let inst = self.opts.inst;
-        let radius = if inst == CloudInst::Mesh { radius } else { radius.min(sky_mesh::FACE_LIMIT) };
+        let radius = if inst == CloudInst::Mesh { key.radius } else { key.radius.min(sky_mesh::FACE_LIMIT) };
+        let (key, next) = (CloudKey { radius, ..key }, CloudKey { radius, ..next });
         if self.opts.spiral && self.spiral.0 != radius {
-            self.spiral = (radius, sky_mesh::cloud_spiral(radius));
+            self.spiral = (radius, Spiral::from(sky_mesh::cloud_spiral(radius)));
         }
-        let cells = if self.opts.spiral { CloudCells::Spiral(&self.spiral.1) } else { CloudCells::Scan(radius) };
+        let spiral = self.opts.spiral.then_some(&self.spiral.1);
+        let cells = spiral.map_or(CloudCells::Scan(radius), |s| CloudCells::Spiral(s));
         let mesh;
         let (bytes, n): (&[u8], u32) = match inst {
             CloudInst::Mesh => {
-                mesh = sky_mesh::cloud_mesh(map, cx, cz, radius, side, flat);
+                mesh = sky_mesh::cloud_mesh(map, key.cx, key.cz, radius, key.side, key.flat);
                 (bytemuck::cast_slice(&mesh), mesh.len() as u32)
             }
             CloudInst::Face => {
-                match cells {
-                    CloudCells::Spiral(s) if self.opts.par => sky_mesh::cloud_par(
-                        sky_mesh::cloud_faces,
-                        map,
-                        (cx, cz),
-                        s,
-                        side,
-                        flat,
-                        (&mut self.faces, &mut self.face_parts),
-                    ),
-                    _ => sky_mesh::cloud_faces(map, cx, cz, cells, side, flat, &mut self.faces),
+                if self.face_builder.build(map, key, spiral, next, &self.placement) {
+                    crate::perf_log::counter_per_second("cloud_speculative_hits_per_second", 1);
                 }
-                (bytemuck::cast_slice(&self.faces), self.faces.len() as u32)
+                let faces = &self.face_builder.faces;
+                (bytemuck::cast_slice(faces), faces.len() as u32)
             }
             CloudInst::Cell => {
-                match cells {
-                    CloudCells::Spiral(s) if self.opts.par => sky_mesh::cloud_par(
-                        sky_mesh::cloud_cell_instances,
-                        map,
-                        (cx, cz),
-                        s,
-                        side,
-                        flat,
-                        (&mut self.cells, &mut self.cell_parts),
-                    ),
-                    _ => sky_mesh::cloud_cell_instances(map, cx, cz, cells, side, flat, &mut self.cells),
-                }
+                let out = (&mut self.cells, &mut self.cell_parts);
+                self.placement.run(sky_mesh::cloud_cell_instances, map, key, cells, out);
                 (bytemuck::cast_slice(&self.cells), self.cells.len() as u32)
             }
         };
+        crate::perf_log::counter_per_second("cloud_builds_per_second", 1);
+        timer.lap("us_cloud_build_per_frame");
         self.cloud_verts = match inst {
             CloudInst::Mesh | CloudInst::Face => 6,
-            CloudInst::Cell if flat => 6,
+            CloudInst::Cell if key.flat => 6,
             CloudInst::Cell => (6 * sky_mesh::CELL_FACES) as u32,
         };
         self.cloud_n = n;
+        let usage = self.opts.cloud_buffer_usage();
         if !self.opts.persist {
             self.cloud_vb = (n > 0).then(|| {
                 device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("clouds"),
                     contents: bytes,
-                    usage: BUF_USAGE.difference(wgpu::BufferUsages::COPY_DST),
+                    usage: usage.difference(wgpu::BufferUsages::COPY_DST),
                 })
             });
+            self.bind_cloud_faces(device);
             return;
         }
         if n == 0 {
             return;
         }
         let len = bytes.len() as u64;
-        if len > self.cloud_cap {
+        let grows = len > self.cloud_cap;
+        if grows {
             // Instances: worst case of the radius (4 faces per disk cell + inner faces),
             // reserved once; old mesh: power of 2 above.
             let cells = sky_mesh::disc_len(radius) as u64;
@@ -672,11 +798,36 @@ impl Sky {
             self.cloud_vb = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("clouds"),
                 size: self.cloud_cap,
-                usage: BUF_USAGE,
+                usage,
                 mapped_at_creation: false,
             }));
         }
         up.write(queue, self.cloud_vb.as_ref().expect("clouds buffer"), 0, bytes);
+        if grows {
+            self.bind_cloud_faces(device);
+        }
+    }
+
+    /// Indexed faces: the shared index list (made once) and the binding of the clouds buffer as
+    /// storage (made again with each new buffer).
+    fn bind_cloud_faces(&mut self, device: &wgpu::Device) {
+        if !self.opts.indexed_faces() {
+            return;
+        }
+        if self.cloud_indices.is_none() {
+            self.cloud_indices = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("cloud face indices"),
+                contents: bytemuck::cast_slice(&sky_mesh::indexed_face_list(sky_mesh::QUAD_TRIANGLES)),
+                usage: wgpu::BufferUsages::INDEX,
+            }));
+        }
+        self.cloud_faces_bind = self.cloud_vb.as_ref().map(|vb| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("cloud faces"),
+                layout: &self.cloud_faces_layout,
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: vb.as_entire_binding() }],
+            })
+        });
     }
 
     /// Uniforms and mesh of the frame's clouds. `sky_vp`: projection × view without translation;
@@ -762,17 +913,23 @@ impl Sky {
             };
             let offset = (c.game_time.rem_euclid(102_400)) as f32 + c.pt;
             let size = (map_size * 12) as f64;
-            let mut nx = eye[0] + f64::from(offset * 0.030_000_001);
-            let mut nz = eye[2] + 3.96;
+            let unwrapped = (eye[0] + f64::from(offset * 0.030_000_001), eye[2] + 3.96);
+            let motion = self.cloud_eye.map_or((0.0, 0.0), |(x, z)| (unwrapped.0 - x, unwrapped.1 - z));
+            self.cloud_eye = Some(unwrapped);
+            let (mut nx, mut nz) = unwrapped;
             nx -= (nx / size).floor() * size;
             nz -= (nz / size).floor() * size;
             let (cx, cz) = ((nx / 12.0).floor() as i32, (nz / 12.0).floor() as i32);
-            let (fx, fz) = ((nx - 12.0 * f64::from(cx)) as f32, (nz - 12.0 * f64::from(cz)) as f32);
-            let key = (cx, cz, side, radius, c.flat);
+            let inside = (nx - 12.0 * f64::from(cx), nz - 12.0 * f64::from(cz));
+            let (fx, fz) = (inside.0 as f32, inside.1 as f32);
+            let key = CloudKey { cx, cz, side, radius, flat: c.flat };
             if self.cloud_key != Some(key) {
-                self.build_clouds(device, queue, up, key);
+                let (next_x, next_z) = next_cell((cx, cz), inside, motion, map_size as i32);
+                self.build_clouds(device, queue, up, key, CloudKey { cx: next_x, cz: next_z, ..key });
                 self.cloud_key = Some(key);
                 self.cloud_flat = c.flat;
+            } else {
+                self.face_builder.poll();
             }
             self.write(queue, CLOUDS, sky_vp, c.color, [-fx, low, -fz, c.cloud_end]);
             self.draw[CLOUDS] = self.cloud_n > 0;
@@ -824,11 +981,9 @@ impl Sky {
 
     /// Clouds (after the translucent terrain), from the closest to the farthest.
     pub fn draw_clouds(&self, pass: &mut wgpu::RenderPass<'_>) {
-        if let Some((vb, verts, n)) = self.cloud_draw() {
+        if self.cloud_draw().is_some() {
             pass.set_pipeline(if self.cloud_flat { &self.flat_cloud_pipe } else { &self.cloud_pipe });
-            pass.set_bind_group(0, &self.binds[CLOUDS], &[]);
-            pass.set_vertex_buffer(0, vb.slice(..));
-            pass.draw(0..verts, 0..n);
+            self.record_cloud_draw(pass);
         }
     }
 }
@@ -844,7 +999,23 @@ mod tests {
     //!   combination: drawn uniforms and clouds buffer read back and compared.
     use super::*;
     use crate::render::upload::tests::{gpu, read};
-    use crate::sky_mesh::{CloudCells, cloud_cell_instances, cloud_faces, cloud_mesh, expand_cells, face_vertex};
+    use crate::sky_mesh::{
+        CloudCells, cloud_cell_instances, cloud_faces, cloud_mesh, expand_cells, face_corner, face_vertex,
+    };
+
+    /// Every new path on, the clouds' own pool included (off by default in the client); format
+    /// `face`, parallel build on the common pool off.
+    const NEW: SkyOpts = SkyOpts {
+        inst: CloudInst::Face,
+        persist: true,
+        spiral: true,
+        par: false,
+        unif: true,
+        own_pool: true,
+        speculative: true,
+        indexed: true,
+        packed_constants: true,
+    };
 
     fn test_cloud_image() -> rc_assets::texture::Image {
         let mut s = 0x9e37_79b9_7f4a_7c15u64;
@@ -866,15 +1037,22 @@ mod tests {
 @compute @workgroup_size(64)
 fn t_main(@builtin(global_invocation_id) id: vec3<u32>) {
     let nf = arrayLength(&t_faces) * 6u;
+    let nc = arrayLength(&t_cells) * 24u;
     let v = id.x;
     if v < nf {
         t_out[v] = cloud_face(t_faces[v / 6u], v % 6u);
         return;
     }
     let c = v - nf;
-    if c < arrayLength(&t_cells) * 24u {
+    if c < nc {
         let ik = t_cells[c / 24u].x;
         t_out[v] = cloud_cell(bitcast<i32>(ik << 16u) >> 16u, bitcast<i32>(ik) >> 16u, t_cells[c / 24u].y, c % 24u);
+        return;
+    }
+    // Indexed faces: vertex 4 × face + corner, as vs_cloud_indexed reads it.
+    let q = c - nc;
+    if q < arrayLength(&t_faces) * 4u {
+        t_out[v] = cloud_word_corner(t_faces[q / 4u], q & 3u);
     }
 }
 ";
@@ -888,9 +1066,17 @@ fn t_main(@builtin(global_invocation_id) id: vec3<u32>) {
         })
     }
 
+    /// Instanced faces, cells and indexed faces decoded by the shader (constant arrays and packed
+    /// constants alike) return bit for bit the vertices of the CPU emulator.
     #[test]
     fn cloud_shader_decodes_like_the_emulator() {
         let Some((device, queue)) = gpu() else { return };
+        for packed_constants in [false, true] {
+            decode_on_the_gpu(&device, &queue, SkyOpts { packed_constants, ..NEW });
+        }
+    }
+
+    fn decode_on_the_gpu(device: &wgpu::Device, queue: &wgpu::Queue, opts: SkyOpts) {
         let img = test_cloud_image();
         let map = CloudMap::from_rgba(64, 64, &img.rgba);
         let (mut faces, mut cells) = (Vec::new(), Vec::new());
@@ -918,9 +1104,21 @@ fn t_main(@builtin(global_invocation_id) id: vec3<u32>) {
                 want.push(if code == 0xff { [0.0, 0.0, 0.0, -1.0] } else { face_vertex(i, k, code, v % 6) });
             }
         }
+        let sext = |x: u32| ((x << 22) as i32) >> 22;
+        for &w in &faces {
+            want.extend((0..4).map(|corner| face_corner(sext(w), sext(w >> 10), (w >> 20) & 31, corner)));
+        }
+        // Inner faces are among them, and reversing their corners moves every corner: a shader
+        // that forgot the reversal would differ here.
+        let inner = faces.iter().filter(|&&w| (w >> 20) & sky_mesh::FACE_INSIDE != 0).count();
+        assert!(inner > 50, "{inner} inner faces decoded");
+        for dir in 0..6 {
+            let inside = dir | sky_mesh::FACE_INSIDE;
+            assert!((0..4).all(|c| face_corner(3, -2, inside, c) != face_corner(3, -2, dir, c)), "direction {dir}");
+        }
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: None,
-            source: wgpu::ShaderSource::Wgsl(format!("{}\n{PROBE}", include_str!("sky.wgsl")).into()),
+            source: wgpu::ShaderSource::Wgsl(format!("{}\n{PROBE}", opts.shader_source()).into()),
         });
         let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: None,
@@ -930,9 +1128,9 @@ fn t_main(@builtin(global_invocation_id) id: vec3<u32>) {
             compilation_options: Default::default(),
             cache: None,
         });
-        let fb = storage(&device, bytemuck::cast_slice(&faces), false);
-        let cb = storage(&device, bytemuck::cast_slice(&cells), false);
-        let ob = storage(&device, &vec![0u8; want.len() * 16], true);
+        let fb = storage(device, bytemuck::cast_slice(&faces), false);
+        let cb = storage(device, bytemuck::cast_slice(&cells), false);
+        let ob = storage(device, &vec![0u8; want.len() * 16], true);
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &pipe.get_bind_group_layout(0),
@@ -950,16 +1148,48 @@ fn t_main(@builtin(global_invocation_id) id: vec3<u32>) {
             pass.dispatch_workgroups((want.len() as u32).div_ceil(64), 1, 1);
         }
         queue.submit([enc.finish()]);
-        let got: Vec<[f32; 4]> = bytemuck::cast_slice(&read(&device, &queue, &ob)).to_vec();
+        let got: Vec<[f32; 4]> = bytemuck::cast_slice(&read(device, queue, &ob)).to_vec();
         let bits = |v: &[[f32; 4]]| v.iter().flatten().map(|x| x.to_bits()).collect::<Vec<_>>();
         let first = bits(&got).iter().zip(bits(&want)).position(|(a, b)| *a != b);
         assert!(
             first.is_none(),
-            "vertex {:?}: {:?} instead of {:?}",
+            "packed constants {}: vertex {:?}: {:?} instead of {:?}",
+            opts.packed_constants,
             first,
             got[first.unwrap_or(0) / 4],
             want[first.unwrap_or(0) / 4]
         );
+    }
+
+    /// Both constant variants (alone and with the improved-transparency entries) are valid WGSL.
+    #[test]
+    fn sky_shader_variants_are_valid() {
+        for packed_constants in [false, true] {
+            let src = SkyOpts { packed_constants, ..NEW }.shader_source();
+            let (m, _) = crate::terrain_shader::tests::validate(&src);
+            for e in ["vs_cloud", "vs_cloud_face", "vs_cloud_cell", "vs_cloud_indexed", "fs_cloud"] {
+                assert!(m.entry_points.iter().any(|p| p.name == e), "{e} absent");
+            }
+            crate::terrain_shader::tests::validate(&format!(
+                "{src}\n{}\n{}",
+                crate::oit::WGSL,
+                include_str!("sky_oit.wgsl")
+            ));
+        }
+    }
+
+    /// Packed constants: no array held by value and indexed in the cloud vertices; the constant
+    /// arrays have some (the check sees what it looks for).
+    #[test]
+    fn packed_cloud_vertices_index_no_value_array() {
+        let count = |packed_constants: bool| {
+            let src = SkyOpts { packed_constants, ..NEW }.shader_source();
+            let (m, info) = crate::terrain_shader::tests::validate(&src);
+            let cloud_vertex = |name: &str| ["vs_cloud_face", "vs_cloud_cell", "vs_cloud_indexed"].contains(&name);
+            crate::terrain_shader::tests::vertex_value_array_indexing(&m, &info, cloud_vertex)
+        };
+        assert_eq!(count(true), 0, "array indexed by value with the packed constants");
+        assert!(count(false) >= 3, "indexed constant arrays not seen: {}", count(false));
     }
 
     fn assets() -> SkyAssets {
@@ -982,7 +1212,7 @@ fn t_main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     const UNIF_PROBE: &str = r"
-@group(1) @binding(0) var<storage, read_write> t_u: array<vec4<f32>, 6>;
+@group(1) @binding(1) var<storage, read_write> t_u: array<vec4<f32>, 6>;
 
 @compute @workgroup_size(1)
 fn t_unif() {
@@ -1006,12 +1236,13 @@ fn t_unif() {
         fn new(device: &wgpu::Device, sky: &Sky) -> Self {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: None,
-                source: wgpu::ShaderSource::Wgsl(format!("{}\n{UNIF_PROBE}", include_str!("sky.wgsl")).into()),
+                source: wgpu::ShaderSource::Wgsl(format!("{}\n{UNIF_PROBE}", sky.opts.shader_source()).into()),
             });
+            // Binding 1: group 1 binding 0 is the storage of the indexed cloud faces.
             let out_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: None,
                 entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
+                    binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: false },
@@ -1038,7 +1269,7 @@ fn t_unif() {
             let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &out_layout,
-                entries: &[wgpu::BindGroupEntry { binding: 0, resource: out.as_entire_binding() }],
+                entries: &[wgpu::BindGroupEntry { binding: 1, resource: out.as_entire_binding() }],
             });
             UnifProbe { pipe, out, bind }
         }
@@ -1109,24 +1340,29 @@ fn t_unif() {
     #[test]
     fn sky_buffers_match_the_old_path() {
         let Some((device, queue)) = gpu() else { return };
-        let old = SkyOpts { inst: CloudInst::Mesh, persist: false, spiral: false, par: false, unif: false };
-        let reference = play(&device, &queue, old);
+        let reference = play(&device, &queue, SkyOpts::OLD);
         assert!(reference.iter().all(|(_, w)| *w == 0), "the old path writes through the queue");
         assert!(reference.iter().filter(|((_, v), _)| !v.is_empty()).count() > 30, "clouds drawn");
         for inst in [CloudInst::Mesh, CloudInst::Face, CloudInst::Cell] {
-            for (persist, spiral, par, unif) in [
-                (true, true, true, true),
-                (true, true, false, true),
-                (false, false, false, true),
-                (true, false, false, false),
+            let old = SkyOpts { inst, ..SkyOpts::OLD };
+            let new = SkyOpts { inst, ..NEW };
+            for opts in [
+                SkyOpts { persist: true, spiral: true, par: true, unif: true, ..old },
+                SkyOpts { persist: true, spiral: true, unif: true, ..old },
+                SkyOpts { unif: true, ..old },
+                SkyOpts { persist: true, ..old },
+                new,
+                SkyOpts { own_pool: false, par: true, ..new },
+                SkyOpts { speculative: false, ..new },
+                SkyOpts { spiral: false, ..new },
+                SkyOpts { persist: false, ..new },
             ] {
-                let opts = SkyOpts { inst, persist, spiral, par, unif };
                 let got = play(&device, &queue, opts);
                 for (n, (((u, v), w), ((ru, rv), _))) in got.iter().zip(&reference).enumerate() {
                     assert!(u == ru, "uniforms frame {n} {opts:?}");
                     assert!(v == rv, "clouds frame {n} {opts:?}");
                     // At most one uniform write, plus the clouds buffer if it is redone.
-                    let max = u64::from(unif) + u64::from(persist);
+                    let max = u64::from(opts.unif) + u64::from(opts.persist);
                     assert!(*w <= max, "writes frame {n} {opts:?}: {w}");
                 }
             }
@@ -1148,23 +1384,56 @@ fn t_unif() {
         }
     }
 
+    /// Speculation, indexed faces and packed constants are on unless set to 0; the clouds' own
+    /// pool (lost on the micro-bench) only with `RUSTCRAFT_OPT_CLOUD_POOL=1`.
+    #[test]
+    fn cloud_switches_have_their_measured_defaults() {
+        let o = SkyOpts::from_env();
+        assert!(!o.own_pool || rc_data::env_flag!("RUSTCRAFT_OPT_CLOUD_POOL"));
+        assert!(o.speculative || rc_data::env_flag!("RUSTCRAFT_OPT_CLOUD_SPECULATIVE_BUILD"));
+        assert!(o.indexed || rc_data::env_flag!("RUSTCRAFT_OPT_CLOUD_INDEXED_FACES"));
+        assert!(o.packed_constants || rc_data::env_flag!("RUSTCRAFT_OPT_PACKED_SHADER_CONSTANTS"));
+    }
+
+    mod cloud_gpu_bench;
+
     const SIZE: u32 = 64;
 
-    /// Views of the render test: eye (height), direction, "fast" mode.
-    const VIEWS: [(f64, [f32; 3], bool); 6] = [
-        (150.0, [0.3, 0.6, 1.0], false),
-        (190.0, [1.0, 0.1, 0.4], false),
-        (194.0, [-0.2, 0.05, 1.0], false),
-        (250.0, [0.4, -0.7, 0.8], false),
-        (150.0, [-0.5, 0.5, 0.6], true),
-        (250.0, [0.1, -0.8, -0.5], true),
+    /// Views of the render test: eye (height), direction, "fast" mode, range in chunks. The last
+    /// one, toward the horizon at range 128 with the fade pushed back, needs several indexed draws.
+    const VIEWS: [(f64, [f32; 3], bool, i32); 7] = [
+        (150.0, [0.3, 0.6, 1.0], false, 6),
+        (190.0, [1.0, 0.1, 0.4], false, 6),
+        (194.0, [-0.2, 0.05, 1.0], false, 6),
+        (250.0, [0.4, -0.7, 0.8], false, 6),
+        (150.0, [-0.5, 0.5, 0.6], true, 6),
+        (250.0, [0.1, -0.8, -0.5], true, 6),
+        (150.0, [0.2, 0.12, 1.0], false, 128),
     ];
 
     /// Cloud images (64 × 64 RGBA) of each view, drawn as in the client: classic pass,
     /// or improved-transparency stages then composition (`oit`).
     fn render_clouds(device: &wgpu::Device, queue: &wgpu::Queue, opts: SkyOpts, oit: bool) -> Vec<Vec<u8>> {
+        render_clouds_with(device, queue, opts, oit, sky_mesh::QUAD_TRIANGLES)
+    }
+
+    /// [`render_clouds`] with the indexed faces drawn by the corner order `triangles` (sabotage).
+    fn render_clouds_with(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        opts: SkyOpts,
+        oit: bool,
+        triangles: [u16; 6],
+    ) -> Vec<Vec<u8>> {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let mut sky = Sky::with_opts(device, queue, format, &assets(), opts);
+        if triangles != sky_mesh::QUAD_TRIANGLES {
+            sky.cloud_indices = Some(device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&sky_mesh::indexed_face_list(triangles)),
+                usage: wgpu::BufferUsages::INDEX,
+            }));
+        }
         let mut up = Uploader::new(device, true);
         let target = |format, usage| {
             device.create_texture(&wgpu::TextureDescriptor {
@@ -1196,21 +1465,25 @@ fn t_unif() {
             mapped_at_creation: false,
         });
         let mut images = Vec::new();
-        for (n, (y, dir, flat)) in VIEWS.into_iter().enumerate() {
+        for (n, (y, dir, flat, range_chunks)) in VIEWS.into_iter().enumerate() {
             let vp = proj * glam::camera::rh::view::look_to_mat4(Vec3::ZERO, Vec3::from(dir).normalize(), Vec3::Y);
             let clouds = CloudFrame {
                 color: [1.0, 0.9, 0.8, 0.8],
                 height: 192.33,
                 game_time: 1000 + 997 * n as i64,
                 pt: 0.25,
-                range_chunks: 6,
-                cloud_end: 110.0,
+                range_chunks,
+                cloud_end: if range_chunks > 6 { 2048.0 } else { 110.0 },
                 flat,
             };
             let eye = [13.0 * n as f64 - 20.0, y, 5.5 - 9.0 * n as f64];
             sky.prepare(device, queue, &mut up, vp, &frame(0.3, Some(clouds), false), false, eye);
             up.submit(queue, device.create_command_encoder(&Default::default()).finish());
             assert!(sky.has_clouds(), "clouds in view {n}");
+            if opts.inst == CloudInst::Face && range_chunks > 6 {
+                let faces = sky.cloud_n;
+                assert!(faces > 2 * sky_mesh::FACES_PER_INDEXED_DRAW, "view {n}: {faces} faces, a single indexed draw");
+            }
             let mut enc = device.create_command_encoder(&Default::default());
             {
                 let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1269,32 +1542,47 @@ fn t_unif() {
         images
     }
 
-    /// Real draw (instanced draw, `Uint32` and `Sint16x2` attributes, classic and
-    /// improved-transparency pipelines): the `face` and `cell` formats return the old mesh's image
-    /// pixel for pixel, below, inside, above and in "fast" mode.
+    /// Real draw (instanced draw, `Uint32` and `Sint16x2` attributes, indexed faces read from
+    /// storage, constant arrays or packed constants, classic and improved-transparency pipelines):
+    /// every variant of the `face` and `cell` formats returns the old mesh's image pixel for
+    /// pixel, below, inside, above and in "fast" mode. Sabotage: the indexed triangles wound the
+    /// other way change the image.
     #[test]
     fn packed_clouds_render_like_the_mesh() {
         let Some((device, queue)) = gpu() else { return };
-        let opts = |inst| SkyOpts { inst, persist: true, spiral: true, par: false, unif: true };
+        let old = SkyOpts { persist: true, spiral: true, unif: true, ..SkyOpts::OLD };
+        let variants = [
+            SkyOpts { inst: CloudInst::Face, ..old },
+            SkyOpts { inst: CloudInst::Cell, ..old },
+            SkyOpts { inst: CloudInst::Cell, packed_constants: true, ..old },
+            SkyOpts { indexed: false, ..NEW },
+            SkyOpts { packed_constants: false, ..NEW },
+            NEW,
+        ];
         let blend = device.features().contains(wgpu::Features::FLOAT32_BLENDABLE);
         for oit in [false, true] {
             if oit && rc_testdata::need(blend.then_some(()), "float target blending (FLOAT32_BLENDABLE)").is_none() {
                 return;
             }
-            let want = render_clouds(&device, &queue, opts(CloudInst::Mesh), oit);
+            let want = render_clouds(&device, &queue, old, oit);
             for (n, img) in want.iter().enumerate() {
                 // Background cleared to (51, 102, 230): a cloud clearly raises the red.
                 let covered = img.chunks(4).filter(|p| p[0] > 60).count();
                 assert!(covered > 200, "view {n} (transparency {oit}): {covered} cloud pixels");
             }
             assert!(want[0] != want[1], "different views, different images");
-            for inst in [CloudInst::Face, CloudInst::Cell] {
-                let got = render_clouds(&device, &queue, opts(inst), oit);
+            for opts in variants {
+                let got = render_clouds(&device, &queue, opts, oit);
                 for (n, (g, w)) in got.iter().zip(&want).enumerate() {
                     let diff = g.iter().zip(w).filter(|(a, b)| a != b).count();
-                    assert!(diff == 0, "{inst:?} view {n} (transparency {oit}): {diff} bytes differ");
+                    assert!(diff == 0, "{opts:?} view {n} (transparency {oit}): {diff} bytes differ");
                 }
             }
+            let reversed = render_clouds_with(&device, &queue, NEW, oit, [2, 1, 0, 0, 3, 2]);
+            let diff: usize =
+                reversed.iter().zip(&want).map(|(g, w)| g.iter().zip(w).filter(|(a, b)| a != b).count()).sum();
+            eprintln!("triangles wound the other way (transparency {oit}): {diff} bytes differ");
+            assert!(diff > 0, "reversed triangles not seen (transparency {oit})");
         }
     }
 }
