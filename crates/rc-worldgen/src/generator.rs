@@ -28,17 +28,38 @@ pub struct Defs {
 }
 
 impl Defs {
+    /// Named density functions and noises of the pack, parsed one file after the other, or on every
+    /// core with `RUSTCRAFT_OPT_PARALLEL_DEFS_LOAD=1` (off by default: it loses, see `docs/perf.md`).
     pub fn load(pack: &DataPack) -> Result<Self, Error> {
-        let mut d = Defs::default();
-        for id in pack.ids("density_function") {
-            let j = pack.json("density_function", &id)?;
-            d.functions.insert(id.clone(), density::parse(&j).map_err(|e| Error::Format(format!("{id} : {e}")))?);
-        }
-        for id in pack.ids("noise") {
-            let j = pack.json("noise", &id)?;
-            d.noises.insert(id.clone(), NormalNoise::from_json(&j).map_err(|e| Error::Format(format!("{id} : {e}")))?);
-        }
-        Ok(d)
+        Self::load_mode(pack, crate::opt::parallel_defs_load())
+    }
+
+    /// [`Self::load`] on the chosen path (equivalence tests and benches).
+    pub fn load_mode(pack: &DataPack, parallel: bool) -> Result<Self, Error> {
+        let functions = parse_each(pack, "density_function", parallel, density::parse)?;
+        let noises = parse_each(pack, "noise", parallel, NormalNoise::from_json)?;
+        Ok(Defs { functions: functions.into_iter().collect(), noises: noises.into_iter().collect() })
+    }
+}
+
+/// Every file of a kind read by `read`, with its identifier. On both paths the error reported is
+/// the one of the first failing identifier in sorted order (in parallel, every file is read first).
+fn parse_each<T: Send>(
+    pack: &DataPack,
+    kind: &str,
+    parallel: bool,
+    read: impl Fn(&Json) -> Result<T, Error> + Sync,
+) -> Result<Vec<(String, T)>, Error> {
+    let one = |id: String| -> Result<(String, T), Error> {
+        let value = read(&pack.json(kind, &id)?).map_err(|e| Error::Format(format!("{id} : {e}")))?;
+        Ok((id, value))
+    };
+    let ids = pack.ids(kind);
+    if parallel {
+        let results: Vec<Result<(String, T), Error>> = ids.into_par_iter().map(one).collect();
+        results.into_iter().collect()
+    } else {
+        ids.into_iter().map(one).collect()
     }
 }
 
@@ -654,3 +675,7 @@ impl Rewriter for Inline<'_> {
         rewrite_children(&f, self, &*defs)
     }
 }
+
+#[cfg(test)]
+#[path = "defs_load_tests.rs"]
+mod defs_load_tests;

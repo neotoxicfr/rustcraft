@@ -5,7 +5,7 @@
 use hashbrown::HashMap;
 use std::io::Read;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::Error;
 use crate::json::{self, Json};
@@ -17,11 +17,30 @@ use crate::json::{self, Json};
 #[derive(Debug, Default, Clone)]
 pub struct DataPack {
     /// Texts borrowed from the process's jar index (`rc_data::jar`), without copy.
-    files: HashMap<String, Arc<str>>,
+    files: HashMap<String, PackFile>,
     /// Density functions and noises of the pack, parsed at first need and shared by every
     /// generator built from it (`RUSTCRAFT_OPT_SHARED_GENERATOR_DEFS`); forgotten when a file is added.
-    generator_defs: std::sync::OnceLock<Arc<crate::generator::Defs>>,
+    generator_defs: OnceLock<Arc<crate::generator::Defs>>,
 }
+
+/// A file of the pack: its text, and its tree once parsed (`RUSTCRAFT_OPT_JSON_PARSE_CACHE`).
+#[derive(Debug, Clone)]
+struct PackFile {
+    text: Arc<str>,
+    /// Handed out as copies: a copy shares the blocks of the objects (a counter per object).
+    tree: OnceLock<Json>,
+}
+
+impl PackFile {
+    fn new(text: Arc<str>) -> Self {
+        PackFile { text, tree: OnceLock::new() }
+    }
+}
+
+/// Kinds read once per pack into a structure every generator shares (generator definitions,
+/// climate lists): keeping their trees too would only hold memory (the overworld biome report's
+/// tree alone is several MB).
+const KINDS_PARSED_ONCE_PER_PACK: [&str; 3] = ["biome_parameters", "density_function", "noise"];
 
 /// Index of the process's jar, errors converted (old form of the messages).
 pub(crate) fn jar_index(jar: &Path) -> Result<Arc<rc_data::jar::JarIndex>, Error> {
@@ -64,7 +83,7 @@ impl DataPack {
             let text = blob.text().ok_or_else(|| {
                 Error::Io(name.clone(), std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid UTF-8"))
             })?;
-            files.insert(key, text);
+            files.insert(key, PackFile::new(text));
         }
         if files.is_empty() {
             return Err(Error::Missing(format!("no generation data in {}", jar.display())));
@@ -83,7 +102,7 @@ impl DataPack {
             let Some(key) = classify(&name) else { continue };
             let mut text = String::new();
             e.read_to_string(&mut text).map_err(|e| Error::Io(name.clone(), e))?;
-            files.insert(key, Arc::from(text));
+            files.insert(key, PackFile::new(Arc::from(text)));
         }
         if files.is_empty() {
             return Err(Error::Missing(format!("no generation data in {}", jar.display())));
@@ -107,7 +126,7 @@ impl DataPack {
                 let rel = rel.to_string_lossy().replace('\\', "/");
                 if let Some(key) = classify(&rel) {
                     let text = std::fs::read_to_string(&p).map_err(|e| Error::Io(p.display().to_string(), e))?;
-                    files.insert(key, Arc::from(text));
+                    files.insert(key, PackFile::new(Arc::from(text)));
                 }
             }
         }
@@ -130,7 +149,7 @@ impl DataPack {
                     continue;
                 };
                 let text = std::fs::read_to_string(&p).map_err(|e| Error::Io(p.display().to_string(), e))?;
-                self.files.insert(format!("biome_parameters/{nsn}:{stem}"), Arc::from(text));
+                self.files.insert(format!("biome_parameters/{nsn}:{stem}"), PackFile::new(Arc::from(text)));
             }
         }
         self.generator_defs = Default::default();
@@ -139,7 +158,7 @@ impl DataPack {
 
     /// Adds or replaces a file (tests, data packs).
     pub fn insert(&mut self, key: &str, text: String) {
-        self.files.insert(key.to_owned(), Arc::from(text));
+        self.files.insert(key.to_owned(), PackFile::new(Arc::from(text)));
         self.generator_defs = Default::default();
     }
 
@@ -155,12 +174,29 @@ impl DataPack {
     }
 
     pub fn raw(&self, kind: &str, id: &str) -> Option<&str> {
-        with_file_key(kind, id, |k| self.files.get(k)).map(|t| &**t)
+        self.file(kind, id).map(|f| &*f.text)
     }
 
+    fn file(&self, kind: &str, id: &str) -> Option<&PackFile> {
+        with_file_key(kind, id, |k| self.files.get(k))
+    }
+
+    /// Tree of a file: parsed at its first read, then copied for every later reader
+    /// (`RUSTCRAFT_OPT_JSON_PARSE_CACHE`), except the kinds of [`KINDS_PARSED_ONCE_PER_PACK`].
     pub fn json(&self, kind: &str, id: &str) -> Result<Json, Error> {
-        let text = self.raw(kind, id).ok_or_else(|| Error::Missing(format!("{kind}/{id}")))?;
-        json::parse(text).map_err(|e| Error::Format(format!("{kind}/{id} : {e}")))
+        self.json_mode(kind, id, crate::opt::json_parse_cache())
+    }
+
+    /// [`Self::json`] with the cache on or off (equivalence tests and benches).
+    pub fn json_mode(&self, kind: &str, id: &str, cache: bool) -> Result<Json, Error> {
+        let file = self.file(kind, id).ok_or_else(|| Error::Missing(format!("{kind}/{id}")))?;
+        let keep = cache && !KINDS_PARSED_ONCE_PER_PACK.contains(&kind);
+        if keep && let Some(tree) = file.tree.get() {
+            return Ok(tree.clone());
+        }
+        let tree = json::parse(&file.text).map_err(|e| Error::Format(format!("{kind}/{id} : {e}")))?;
+        // Two first readers at once both parse; the first stored tree is the one everybody keeps.
+        Ok(if keep { file.tree.get_or_init(|| tree).clone() } else { tree })
     }
 
     /// Identifiers (`ns:path`) of a type, sorted.
@@ -171,10 +207,15 @@ impl DataPack {
         v
     }
 
+    /// Every file as (key, text), in no particular order (benches, whole-pack proofs).
+    pub fn texts(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.files.iter().map(|(k, v)| (k.as_str(), &*v.text))
+    }
+
     /// All the files, sorted (equivalence proofs).
     #[cfg(test)]
     pub(crate) fn entries(&self) -> std::collections::BTreeMap<&str, &[u8]> {
-        self.files.iter().map(|(k, v)| (k.as_str(), v.as_bytes())).collect()
+        self.files.iter().map(|(k, v)| (k.as_str(), v.text.as_bytes())).collect()
     }
 
     pub fn len(&self) -> usize {

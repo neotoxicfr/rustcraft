@@ -864,7 +864,7 @@ fn json_nbt(j: &rc_worldgen::json::Json) -> Nbt {
         Json::Num(s) => s.parse::<i32>().map(Nbt::Int).unwrap_or_else(|_| Nbt::Double(s.parse().unwrap_or(0.0))),
         Json::Str(s) => Nbt::String(s.clone()),
         Json::Arr(a) => Nbt::List(a.iter().map(json_nbt).collect()),
-        Json::Obj(m) => Nbt::Compound(m.iter().map(|(k, v)| (k.clone(), json_nbt(v))).collect()),
+        Json::Obj(m) => Nbt::Compound(m.iter().map(|(k, v)| (k.to_owned(), json_nbt(v))).collect()),
     }
 }
 

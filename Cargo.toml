@@ -34,6 +34,8 @@ sha1 = "0.11.0"
 md-5 = "0.11.0"
 crossbeam-channel = "0.5.17"
 rayon = "1.12.0"
+# Short strings stored in place (numbers and keys of the generation JSON); already in the tree through winit.
+smol_str = "0.2.2"
 mimalloc = { version = "0.1.52", default-features = false }
 # Only the backends the client can pick (`gpu_backend.rs`: Vulkan, DX12; Metal kept for macOS):
 # the default OpenGL (gles: glow, EGL, GLSL output) and WebGPU backends are dead code here.
