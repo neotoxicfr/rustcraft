@@ -1813,6 +1813,78 @@ both, badlands 8 and 0.21 MB both, caves 70 → 69 (the column levels are a 2 KB
 stack, one boxed memo per thread); same bench, surface ms/chunk: grid 1.50-1.63 → 0.93-1.12,
 badlands 1.51-1.52 → 0.89-1.00.
 
+### Terrain filling by column, conversion into decoration chunks (C1-M15, 07/11/2026, loaded-machine micro-bench)
+
+Bench `rc-worldgen --test fill_convert_opt -- --ignored` (client allocator mimalloc with its client
+setting, allocation counter; alternated rounds, best and median; "Mcycles" = processor cycles of the
+measuring thread, `QueryThreadCycleTime`, which a thread put aside by the system does not count).
+LOADED machine (other agents compiling): 1-thread wall medians vary by up to ±40 % between rounds.
+Equivalence: `fill_convert_opt` (filling against block by block after the filling and after the
+caves, 3 seeds × main world, amplified, Nether, End and a main world whose filling block is cave air,
+8 chunks each, on the old and the default aquifer paths: blocks, section counts, both generation
+maps, fluid marks in order; conversion, every switch alone, the pairs and all, twice in a row, on
+3 main-world seeds with structures, Nether, End and the cave air world: states, six maps, biomes,
+marks; regeneration below y = 0 on every path), `terrain_opt` (new variant), the unit tests
+`decor_region::tests::skipping_air_sections_converts_like_cell_by_cell` and
+`final_maps_found_while_converting_match_a_walk_per_column` (drawn sections: plain air, cave air
+only, sparse, dense) and `templ_tests::generated_heightmaps_one_walk_match` (now also the maps
+of the skipping and of the finding conversions against one walk per map). Sabotage tests:
+`filling_comparison_catches_sabotage` (maps at the lowest counted block; cave air counted, seen
+only on the cave air world), `conversion_comparison_catches_sabotage` (final maps walked from one
+section too low; sections skipped by their count, which turns cave air into plain air).
+
+| Lead (switch, default 1) | old | new | Note |
+|---|---|---|---|
+| Filling by column (`FILL_COLUMN_TRACKING`), Mcycles / chunk | best 12.59, median 13.71 | best 12.63, median 13.32 | under the noise |
+| same, ms / chunk, 1 / 4 / 8 / 32 threads (median) | 3.33 / 0.79 / 0.40 / 0.170 | 3.29 / 0.76 / 0.39 / 0.168 | ≤ 4 %, under the noise |
+| Conversion alone, Mcycles / chunk (25 chunks, best of 20) | 0.262 | skip air 0.094; maps while converting 0.184; both 0.078 | −70 % (both) |
+| Conversion alone, µs / chunk (best) | 58.5 | skip air 20.6; maps 36.6; both 17.5 | ≈ −40 µs per chunk |
+| Allocations of `DimGen::terrain` / chunk (`REUSE_PROTO_BUFFER`) | 64.0, 3,316 KB | 63.0, 3,125 KB | −1 allocation, −191 KB asked |
+| `DimGen::terrain`, ms / chunk, 1 / 8 / 32 threads (median) | 4.38 / 0.62 / 0.230 | 4.55 / 0.62 / 0.228 | conversion gain (1 %) under the noise |
+
+- Filling (`fill_tracking_columns`): the chunk is fresh and each cell is written once, so the
+  block is written without reading the old one back (`ProtoTerrain::set_fresh`), the section counts
+  are kept apart from the chunk, the default block's facts are read once per chunk, and the two
+  generation maps of a column are the first block met from the top that counts for them, written
+  once at the end of the column (the old per-block update only ever did that during the filling).
+  Cave and void air still count as air (only a data pack's filling block can be one). No
+  measurable gain on this machine: the per-block bookkeeping is small next to the density and the
+  aquifer of the same cells. Kept on (never slower in any measurement, simpler maps), to re-measure
+  on a quiet machine. SIMD on the run boundaries: not done (well predicted branch, no gain to have).
+- Conversion, plain air sections (`SKIP_AIR_SECTIONS`): a section whose terrain identifiers are all
+  0 (one OR over the 4,096 identifiers, vectorised, no early exit) is not looked up cell by cell:
+  the new chunk already holds air (air's state is 0; filled otherwise), the regeneration below y = 0
+  fills it (old blocks underneath). The section counts are NOT used for this: they count cave air as
+  empty. The highest other section bounds the walk of the final maps (the scan of the converted
+  states by `top_non_air` disappears). Exact while plain air counts in no map, checked once per
+  generator.
+- Conversion with the final maps (`CONVERT_WITH_HEIGHTMAPS`): layer by layer from the top, the
+  four final maps found on the way from a table of map bits per terrain identifier (a few hundred
+  bytes instead of the 30,000-state facts table), the columns still searching listed (a done column
+  leaves the list), a layer of plain air passed with one vectorised test. Alone it beats the old
+  path (0.184 against 0.262 Mcycles; before the layer test it lost, 0.328), with the air skip it is
+  the best combination (0.078 against 0.094 for the skip alone).
+- Proto-chunk buffer reused (`REUSE_PROTO_BUFFER`): the 196 KB block buffer of a converted
+  proto-chunk goes back to its thread and the next proto-chunk of the thread takes it (cleared to
+  air), instead of a new zeroed allocation: one allocation and 191 KB fewer per chunk; time under
+  the noise (mimalloc hands the same freed block back anyway, and both paths zero 196 KB). Memory:
+  one 196 KB buffer held per generating thread (≈ 6 MB on 32 threads) after generation stops: to
+  check on the scene bench's private memory.
+- `ProtoTerrain::final_heightmaps`: no caller, duplicate of the priming: removed.
+- Placement (B4): conversion and filling stay inside the chunk's task (one chunk per rayon task, 1
+  to 32 threads measured); GPU not applicable (a gather of 98,304 two-byte identifiers per chunk
+  costs less than the transfer).
+- Fidelity check (A3, outside the leads): the fluid marks keep the game's order inside a section
+  (placement order, same lists on disk). At the pass to `full` the game walks them section by
+  section from the bottom, ours walks the single list in placement order (filling, caves, then
+  decoration, sections mixed). Our pass does no fluid tick (not reproduced); reading its bubble
+  columns and shape updates, no case was found where the order changes the result (not tested);
+  to align if fluid ticks of the post-processing are added.
+- Not done: the network states written by the filling itself (the surface and the caves read
+  terrain identifiers after it); writing plain air during the filling so that the reused buffer need
+  not be cleared (a few µs per chunk, couples the filling to the buffer).
+- Scenes to measure on a quiet machine: `generation`, `generation-1thread`, `crowd`.
+
 ### Effects and player (fidelity G4-F09, 24/10/2026, loaded-machine micro-bench)
 
 New code on the integrated server thread, off the hot path. Turtle helmet: bench
