@@ -434,6 +434,74 @@ class TimedAnalysis(unittest.TestCase):
         self.assertIn("| b | 12–15 (differs) |", rep)
 
 
+class LoadingLandmarks(unittest.TestCase):
+    """Frozen log of a world scene: loading screen, world entry, load landmarks of client and server."""
+    # Text pinned by the Rust test `statistics_line_keeps_its_text` (`apps/client/src/perf_log.rs`).
+    STAT_LINE = ("[  13.0 s] 144 fps, CPU 0.412 ms/frame, GPU 0.100 ms/frame, 625 columns loaded, 600 on GPU (1.23 M faces), "
+                 "300 drawn (0.46 M faces), 3 meshes in progress, sort 0.012 ms (walk 0.500 ms), VRAM 31.0 MB "
+                 "(regions 10.0 of which 5.0 used, textures 20.0, other 1.0), translucent 12 columns of which 4 "
+                 "unsorted, 7 entities drawn, block entities 9 of which 2 drawn")
+    PERF = ("[perf] [{t:6.1f} s] frames 60, median 4.000 ms, p99 6.000 ms, max 7.000 ms; columns meshed {m}/s; "
+            "light: {c} chunks in {ms} ms, 0 relights (0 changes) in 0.0 ms; private memory 900 MB, "
+            "working set 800 MB; last mesh at 0.0 s; 0 columns")
+    RECV = "[perf] [{t:6.1f} s] work: receive {r} ms/s, 10 events/s"
+
+    def journal(self, world=True):
+        p, r = self.PERF.format, self.RECV.format
+        loading = [p(t=1.0, m=0, c=200, ms=400.0), r(t=1.0, r=50.0),
+                   "singleplayer: first chunk sent 610 ms after opening"]
+        entered = ["[perf] world entered at 1500 ms"] if world else []
+        rest = ["[perf] first chunk received at 1520 ms", "[perf] in game at 1700 ms (100 columns)",
+                p(t=2.5, m=300, c=10, ms=10.0), r(t=2.5, r=5.0),
+                "singleplayer: chunk queue empty 900 ms after opening (625 chunks sent)",
+                "[perf] meshing caught up at 2300 ms",
+                "[perf] initial load meshed at 2600 ms (625 columns; column count stable since 2100 ms)",
+                self.STAT_LINE]
+        return loading + entered + rest
+
+    def analysed(self, lines):
+        base = os.path.join(scenes.ROOT, "target", "bench-tests")
+        os.makedirs(base, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=base) as t:
+            log = os.path.join(t, "game.log")
+            with open(log, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            return scenes.analyse(log, os.path.join(t, "absent.txt"), 10, 45)
+
+    def test_statistics_line_of_the_client_is_read(self):
+        m = self.analysed(self.journal())
+        self.assertEqual((m["cpu_ms"], m["gpu_ms"], m["columns"]), (0.412, 0.1, 625))
+        s = scenes.STAT.search(self.STAT_LINE)
+        self.assertEqual(s.group(6), "3")  # meshes in progress
+        import ab  # noqa: PLC0415 (only this test needs it)
+        self.assertIs(ab.LINE, scenes.STAT, "ab.py reads the same line format as scenes.py")
+
+    def test_landmarks(self):
+        m = self.analysed(self.journal())
+        self.assertEqual((m["first_chunk_ms"], m["in_game_ms"], m["caught_up_ms"], m["load_ms"], m["stable_ms"]),
+                         (1520.0, 1700.0, 2300.0, 2600.0, 2100.0))
+        self.assertEqual(m["meshing_after_last_column_ms"], 200.0)
+        self.assertEqual((m["server_first_chunk_ms"], m["server_queue_empty_ms"]), (610.0, 900.0))
+        # The load ends at the later of the catch-up and half a second of stable count.
+        self.assertEqual(m["load_ms"], max(m["caught_up_ms"], m["stable_ms"] + 500))
+        for k in ("first_chunk_ms", "caught_up_ms", "meshing_after_last_column_ms", "server_queue_empty_ms"):
+            self.assertIn(k, {k for k, _, _ in scenes.KEYS})
+
+    def test_loading_screen_stays_out_of_the_whole_run_sums(self):
+        m = self.analysed(self.journal())
+        # Only the line after the world entry: 10 chunks in 10 ms, receive 5 ms (not 210 chunks, 55 ms).
+        self.assertEqual((m["light_chunks_total"], m["light_ms_per_chunk"], m["receive_load_ms"]), (10, 1.0, 5.0))
+        self.assertEqual(m["meshed_s_max"], 300.0)
+        # Without a world (title screen), every line counts.
+        title = self.analysed(self.journal(world=False))
+        self.assertEqual((title["light_chunks_total"], title["receive_load_ms"]), (210, 55.0))
+
+    def test_absent_landmarks_stay_empty(self):
+        m = analyse("plains12-warm.log")
+        for k in ("first_chunk_ms", "caught_up_ms", "meshing_after_last_column_ms", "server_first_chunk_ms"):
+            self.assertTrue(math.isnan(m[k]), k)
+
+
 class Launch(unittest.TestCase):
     def test_remove_and_fixed_variables(self):
         a = argparse.Namespace(env=["-RUSTCRAFT_GENLOG", "X_PERF_TEST=1"])

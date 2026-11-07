@@ -7429,3 +7429,49 @@ loaded by other agents compiling.
   (`push_item_layer`, `prepare` sorts, NBT clones, rc-mesh `to_vec`) belong to their zones: a
   reused buffer beats any allocator setting.
 
+
+## C4-M01 (series 4): measurement outside a world, loading landmarks, window title kept (07/11, loaded machine)
+
+Measurement mission (prerequisite of the menu, startup and loading missions): no gain claimed for
+frames, one `RUSTCRAFT_OPT_*` switch (energy only). Nothing measured on scenes yet (no client
+launched during the series).
+
+**Title screen and menus measured.** The per-second statistics line (`N fps, CPU x ms/frame, GPU
+y ms/frame, …`) is built by one function (`perf_log::SecondStats::line`, its text pinned by a test)
+called by the in-world frame and by the frame outside a world; `tools/bench/ab.py` reads it with
+`scenes.STAT` instead of its own copy of the format. Outside a world the frame now counts its
+frames, calls `perf_log::frame` (frame intervals, `[perf]` lines), sleeps 4 ms when the surface
+gives no frame (same rule as in a world) and reads the renderer's CPU and GPU times every second:
+before, the CPU time summed over the whole stay in the menus landed in the first line in a world,
+and `title` read 0 fps / CPU NaN. Kept identical for world scenes: the perf log's counters restart
+at the first frame in a world (marker `[perf] world entered at X ms`), as when the log only
+started there, and `scenes.py` takes its whole-run sums (`light ms/chunk`, light chunks, `receive
+0-5 s`, `meshed/s max`) from the lines after that marker; windowed columns are unaffected (the
+window starts after the loading screen).
+
+**Loading landmarks without the fixed half second.** `meshed load` is the first frame in the game
+where every column to mesh was meshed once AND their count had been stable for 0.5 s, so it read
+`stable + 500 ms` on most scenes. New client lines: `[perf] first chunk received at X ms`,
+`[perf] meshing caught up at X ms` (last time, before the load is done, the meshing caught up with
+the columns to mesh; tracked in the game only, so `meshed load = max(caught up, stable + 500)`
+within a frame, test `initial_load_ends_at_the_later_of_catch_up_and_stable_count`). The meshing
+can catch up before the last count change (a count that drops while caught up): `meshing after last
+column` (= caught up − stable) is then negative. Integrated server, once per world opening, in ms
+since the opening began (origin of `singleplayer: opened in`): `singleplayer: first chunk sent X ms
+after opening` and `singleplayer: chunk queue empty X ms after opening (N chunks sent)`, under
+`RUSTCRAFT_PERFLOG` (one branch per tick otherwise). New columns: `first chunk received ms`,
+`meshing caught up ms`, `meshing after last column ms`, `server first chunk sent ms`, `server chunk
+queue empty ms`; `last column ms` renamed `meshable columns stable since ms`.
+
+**Window title kept** (`RUSTCRAFT_OPT_WINDOW_TITLE_CACHE`, on by default, `=0` = set every second
+as before). Root cause: the in-world frame and the frame outside a world each set the title every
+second, identical 59 times out of 60. One `WindowTitle` shared by both paths sets it only when the
+text changes (the title outside a world still replaces the game's on return, test
+`only_repeated_titles_are_skipped`). Count by reading the code, 60 s of a scene: about 60 calls
+before; after, 1 on `title` and 2 on `plains12` (loading screen, then the game). Gain: energy only
+(one message to the window thread and a caption redraw per second), not measurable in frames.
+
+To measure on the quiet machine: `title` 3 passes (fps, CPU and GPU finite), then the 15 scenes one
+pass against the reference exe (no column moves beyond the noise, except the new ones and `title`),
+then 2 passes to check the new landmarks within 5 ms between passes and the invariant above on
+every scene.

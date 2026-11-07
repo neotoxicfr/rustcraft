@@ -138,14 +138,16 @@ impl App {
             p.speed = self.options.f("panoramaScrollSpeed") as f32;
         }
         r.view.hand = false;
-        let _ = r.render(self.eye, 0.0, 0.0, self.world.min_y, self.world.height, &frame_env);
+        let drawn = r.render(self.eye, 0.0, 0.0, self.world.min_y, self.world.height, &frame_env);
         crate::first_frame(self.started);
-        if let Some(r) = &self.renderer
-            && self.fps_since.elapsed().as_secs_f64() >= 1.0
-        {
-            r.window.set_title(&format!("Rustcraft {}", crate::front::VERSION_NAME));
-            self.fps_since = Instant::now();
+        if drawn {
+            self.fps_frames += 1;
+            crate::perf_log::frame(self.started, None);
+        } else {
+            // Surface without a frame (hidden window, uncapped bench launch): no tight loop.
+            std::thread::sleep(std::time::Duration::from_millis(4));
         }
+        self.report_each_second(false);
     }
 
     /// Tick outside a world: menu music, sounds, menus and demo.

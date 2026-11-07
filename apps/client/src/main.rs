@@ -117,6 +117,7 @@ mod symlink_notice;
 mod tablist;
 mod tech_blocks;
 mod terrain_shader;
+mod window_title;
 mod text_display;
 mod syslocale;
 mod ticking;
@@ -423,6 +424,8 @@ struct App {
     last: Instant,
     fps_frames: u32,
     fps_since: Instant,
+    /// Title refreshed every second, in a world and outside (`window_title.rs`).
+    window_title: window_title::WindowTitle,
     started: Instant,
     status: String,
     /// Fixed game tick at 20 per second: accumulated time not yet consumed.
