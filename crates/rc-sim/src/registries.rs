@@ -330,7 +330,8 @@ mod tag_bench {
         });
         let e = median(&mut || {
             let d = rc_commands::Data::default();
-            std::hint::black_box(crate::commands::exec::load_functions(&jar, &[], &d));
+            let paths = crate::commands::paths::CommandPaths::from_switches();
+            std::hint::black_box(crate::commands::exec::load_functions(&jar, &[], &d, &paths));
         });
         eprintln!(
             "[bench] opening: registry tags before {a:.2} ms, after {b:.2} ms; tags for the parser {:.2} ms; jar functions {e:.2} ms (medians of 9)",

@@ -172,7 +172,7 @@ impl Server {
                 }
             }
             ("schedule", "function") if path.iter().any(|p| p == "clear") => {
-                let v: Vec<String> = self.cmd.scheduled.iter().map(|s| s.1.clone()).collect();
+                let v = self.cmd.scheduled.names();
                 b.suggest_matching(v);
             }
             // G3-F06: test instances, the game's own ones shown without their namespace.

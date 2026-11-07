@@ -2,15 +2,25 @@
 //! sources (`as`, `at`…), conditions, result storage (`store`), data-pack
 //! functions (`function`, `schedule`, `return`), dispatch to the commands.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use rc_proto::nbt::Nbt;
 
 use super::ents::E;
+use super::functions::{Function, ReadyLine};
+use super::paths::CommandPaths;
 use super::src::{Fail, Src, Store};
 use super::{Parsed, R, Seg, args, text};
 use crate::registries::Jar;
 use crate::server::Server;
 use crate::tr;
+
+pub use super::functions::compile_function;
+
+/// Function tags: name → members.
+pub type FunctionTags = BTreeMap<String, Arc<[String]>>;
 
 /// Functions and function tags of the stack of chosen packs
 /// (`data/<namespace>/function/**.mcfunction`, `data/<namespace>/tags/function`, `packs.rs`). Each
@@ -22,8 +32,10 @@ pub(crate) fn load_functions(
     jar: &Jar,
     levels: &[super::Level],
     cmd_data: &rc_commands::Data,
-) -> (BTreeMap<String, Vec<String>>, BTreeMap<String, Vec<String>>) {
+    paths: &CommandPaths,
+) -> (BTreeMap<String, Function>, FunctionTags) {
     let mut f = BTreeMap::new();
+    let mut shared = super::functions::SharedLines::default();
     for (name, bytes) in &jar.files {
         let Some(rest) = name.strip_prefix("data/") else { continue };
         let Some((ns, path)) = rest.split_once('/') else { continue };
@@ -34,9 +46,9 @@ pub(crate) fn load_functions(
             continue;
         };
         let raw: Vec<&str> = text.lines().collect();
-        match compile_function(&raw, levels.get(2), cmd_data) {
-            Ok(lines) => {
-                f.insert(id, lines);
+        match super::functions::compile_with(&raw, levels.get(2), cmd_data, paths, &mut shared) {
+            Ok(function) => {
+                f.insert(id, function);
             }
             Err(e) => eprintln!("Failed to load function {id}: {e}"),
         }
@@ -45,7 +57,23 @@ pub(crate) fn load_functions(
     let map: BTreeMap<String, &[serde_json::Value]> =
         raw.iter().map(|(n, v)| (n.clone(), v.as_array().map_or(&[][..], Vec::as_slice))).collect();
     let tags = crate::packs::resolve_tags(&map, &|id| f.contains_key(id).then(|| id.to_owned()));
-    (f, tags)
+    (f, tags.into_iter().map(|(name, members)| (name, Arc::from(members))).collect())
+}
+
+/// Functions designated by a `function` argument: one function, or the members of a tag
+/// (shared with the tag table, not copied at each call).
+pub(crate) enum FunctionIds {
+    One(String),
+    Tag(Arc<[String]>),
+}
+
+impl FunctionIds {
+    fn as_slice(&self) -> &[String] {
+        match self {
+            FunctionIds::One(id) => std::slice::from_ref(id),
+            FunctionIds::Tag(ids) => ids,
+        }
+    }
 }
 
 /// Tags per registry (`minecraft:block` → name without `#` → members), like `Data::tags`.
@@ -192,10 +220,19 @@ impl Server {
     }
 
     /// Runs a parsed input: subcommands then the final command for each source.
-    pub fn run_parsed(&mut self, src: Src, p: &Parsed) -> (bool, i32) {
+    pub fn run_parsed(&mut self, src: &Src, p: &Parsed) -> (bool, i32) {
         let n = p.segs.len();
-        let origin = src.clone();
-        let mut sources = vec![src];
+        // `SHAREDSOURCE`: the caller's source is borrowed until a subcommand makes new ones; the
+        // former path copied it twice (the source list, the fork-limit message).
+        let copied_origin;
+        let origin = if self.cmd.paths.shared_source {
+            src
+        } else {
+            copied_origin = src.clone();
+            &copied_origin
+        };
+        let mut sources: Cow<'_, [Src]> =
+            if self.cmd.paths.shared_source { Cow::Borrowed(std::slice::from_ref(src)) } else { Cow::Owned(vec![src.clone()]) };
         let mut forked = false;
         // `return run`: the running function stops from this step, the rest returns its
         // result (failure if no source remains).
@@ -207,20 +244,20 @@ impl Server {
                 continue;
             }
             // Pure redirections (alias, `execute run`): no step, no cost.
-            if matches!(path.as_str(), "tp" | "xp" | "tell" | "w" | "tm" | "execute run") {
+            if matches!(path, "tp" | "xp" | "tell" | "w" | "tm" | "execute run") {
                 continue;
             }
-            forked |= is_fork(&path);
+            forked |= is_fork(path);
             if !path.ends_with(" function <name>") {
                 self.cmd.flow.quota -= 1;
             }
             let mut next = Vec::new();
-            for s in sources {
-                match self.modifier(&s, p, seg, &path) {
+            for s in sources.iter() {
+                match self.modifier(s, p, seg, path) {
                     Ok(v) => {
                         if self.cmd.flow.active && (next.len() + v.len()) as i64 >= self.cmd.flow.fork_limit {
                             let limit = self.cmd.flow.fork_limit;
-                            self.fail_error(&origin, tr!("command.forkLimit", limit), forked);
+                            self.fail_error(origin, tr!("command.forkLimit", limit), forked);
                             if ret {
                                 self.cmd.returned = Some((false, 0));
                             }
@@ -229,7 +266,7 @@ impl Server {
                         next.extend(v);
                     }
                     Err(f) => {
-                        self.fail_error(&s, f.0, forked);
+                        self.fail_error(s, f.0, forked);
                         if !forked {
                             // `return run` has already abandoned the function's frame: it
                             // stops here, without running its following lines.
@@ -241,7 +278,7 @@ impl Server {
                     }
                 }
             }
-            sources = next;
+            sources = Cow::Owned(next);
             if sources.is_empty() {
                 if ret {
                     self.cmd.returned = Some((false, 0));
@@ -253,13 +290,11 @@ impl Server {
         let path = last.path_str();
         // `function` and `return` run directly (no queue entry, no cost).
         let custom = matches!(last.path.first().map(String::as_str), Some("function" | "return"));
-        if ret && !custom {
-            // Return mode: only the first source runs the command.
-            sources.truncate(1);
-        }
+        // Return mode: only the first source runs the command.
+        let running = if ret && !custom { &sources[..sources.len().min(1)] } else { &sources[..] };
         let mut any = false;
         let mut total = 0i32;
-        for s in sources {
+        for s in running {
             if !custom {
                 if self.exhausted() {
                     break;
@@ -268,14 +303,14 @@ impl Server {
             }
             self.cmd.flow.ret_mode = ret;
             self.cmd.flow.no_callback = false;
-            let r = self.command(&s, p, last, &path);
+            let r = self.command(s, p, last, path);
             self.cmd.flow.ret_mode = false;
             let no_callback = std::mem::take(&mut self.cmd.flow.no_callback);
             let (ok, v) = match r {
                 Ok(v) => (true, v),
                 Err(f) => {
                     if !is_silent(&f.0) {
-                        self.fail_error(&s, f.0, forked);
+                        self.fail_error(s, f.0, forked);
                     }
                     (false, 0)
                 }
@@ -292,7 +327,7 @@ impl Server {
             any |= ok;
             self.cmd.successes += i32::from(ok);
             total = total.wrapping_add(v);
-            self.apply_stores(&s, ok, v);
+            self.apply_stores(s, ok, v);
             if stop {
                 break;
             }
@@ -836,7 +871,7 @@ impl Server {
         let ids = self.function_ids(name)?;
         let mut fs = s.clone();
         fs.stores.clear();
-        for id in &ids {
+        for id in ids.as_slice() {
             let lines = match self.instantiate_function(id, None) {
                 Ok(l) => l,
                 Err(f) => return Err(Fail(tr!("commands.execute.function.instantiationFailure", id.clone(), f.0))),
@@ -848,7 +883,7 @@ impl Server {
                 break;
             }
         }
-        Ok((!ids.is_empty(), 0))
+        Ok((!ids.as_slice().is_empty(), 0))
     }
 
     /// Functions launched by the server (`tick`/`load` tags, `schedule`, advancement
@@ -856,22 +891,30 @@ impl Server {
     /// (found, last value returned).
     pub fn run_functions(&mut self, s: &Src, name: &str, _announce: bool) -> Result<(bool, i32), Fail> {
         let ids = self.function_ids(name)?;
+        let last = self.run_function_ids(s, &ids);
+        Ok((!ids.as_slice().is_empty(), last))
+    }
+
+    /// `run_functions` of functions already designated; last value returned.
+    pub(crate) fn run_function_ids(&mut self, s: &Src, ids: &FunctionIds) -> i32 {
         let mut last = 0;
-        for id in &ids {
+        for id in ids.as_slice() {
             let Ok(lines) = self.instantiate_function(id, None) else { continue };
             if let Some((_, v)) = self.in_context(|sv| sv.call_function(s, id, &lines)) {
                 last = v;
             }
         }
-        Ok((!ids.is_empty(), last))
+        last
     }
 
     /// Ids designated by `name` (`#tag` or function).
-    fn function_ids(&self, name: &str) -> Result<Vec<String>, Fail> {
+    fn function_ids(&self, name: &str) -> Result<FunctionIds, Fail> {
         if let Some(t) = name.strip_prefix('#') {
             let t = args::id(t);
             return match self.cmd.function_tags.get(&t) {
-                Some(v) => Ok(v.clone()),
+                Some(v) if self.cmd.paths.function_cache => Ok(FunctionIds::Tag(v.clone())),
+                // Former path: the member list copied at each call.
+                Some(v) => Ok(FunctionIds::Tag(Arc::from(v.to_vec()))),
                 None => Err(Fail(tr!("arguments.function.tag.unknown", t))),
             };
         }
@@ -879,58 +922,51 @@ impl Server {
         if !self.cmd.functions.contains_key(&id) {
             return Err(Fail(tr!("arguments.function.unknown", id)));
         }
-        Ok(vec![id])
+        Ok(FunctionIds::One(id))
     }
 
-    /// Lines to run of a function: macros substituted (`$…$(key)…`) then parsed,
-    /// like the game's instantiation; error = reason (`commands.function.error.*`).
-    fn instantiate_function(&self, id: &str, args_nbt: Option<&Nbt>) -> Result<Vec<String>, Fail> {
-        let Some(lines) = self.cmd.functions.get(id) else { return Ok(Vec::new()) };
-        if !lines.iter().any(|l| l.starts_with('$')) {
-            return Ok(lines.clone());
+    /// Lines to run of a function: its own lines (plain function), or macros substituted
+    /// (`$…$(key)…`) then parsed, like the game's instantiation; error = reason
+    /// (`commands.function.error.*`).
+    fn instantiate_function(&mut self, id: &str, args_nbt: Option<&Nbt>) -> Result<Arc<[ReadyLine]>, Fail> {
+        let paths = self.cmd.paths;
+        let cmd = &mut self.cmd;
+        let Some(f) = cmd.functions.get_mut(id) else { return Ok(Arc::from(Vec::new())) };
+        if !f.is_macro() {
+            return Ok(f.plain_lines(&paths));
         }
         let Some(args_nbt) = args_nbt else {
             return Err(Fail(tr!("commands.function.error.missing_arguments", id.to_owned())));
         };
-        // Parameters in order of first appearance (the game reports the first one missing).
-        let mut params: Vec<String> = Vec::new();
-        let templates: Vec<Option<Template>> =
-            lines.iter().map(|l| l.strip_prefix('$').and_then(|m| Template::parse(m).ok())).collect();
-        for t in templates.iter().flatten() {
-            for v in &t.vars {
-                if !params.contains(v) {
-                    params.push(v.clone());
-                }
-            }
-        }
-        let mut values = BTreeMap::new();
-        for k in &params {
+        // Values in parameter order (the game reports the first parameter missing).
+        let mut values = Vec::with_capacity(f.params.len());
+        for k in &f.params {
             let Some(v) = args_nbt.get(k) else {
                 return Err(Fail(tr!("commands.function.error.missing_argument", id.to_owned(), k.clone())));
             };
-            values.insert(k.clone(), macro_string(v));
+            values.push(macro_string(v));
         }
-        let lvl = self.cmd.level(2);
-        let mut out = Vec::with_capacity(lines.len());
-        for (line, t) in lines.iter().zip(&templates) {
-            let Some(t) = t else {
-                out.push(line.clone());
-                continue;
-            };
-            let cmd = t.substitute(&values);
-            if let Some(lvl) = lvl
-                && let Some(msg) = super::syntax_message(lvl, &self.cmd.data, &cmd, 2)
-            {
-                return Err(Fail(tr!("commands.function.error.parse", id.to_owned(), cmd, msg)));
+        // `MACROCACHE`: the same values give the same lines (a parse depends on the text and the
+        // pack data only, and a reload builds new functions).
+        if paths.macro_cache
+            && let Some(kept) = f.kept_instance(&values)
+        {
+            return Ok(kept);
+        }
+        match f.instantiate(&values, cmd.levels.get(2), &cmd.data, &paths) {
+            Ok(lines) => {
+                if paths.macro_cache {
+                    f.keep_instance(values, lines.clone());
+                }
+                Ok(lines)
             }
-            out.push(cmd);
+            Err((command, msg)) => Err(Fail(tr!("commands.function.error.parse", id.to_owned(), command, msg))),
         }
-        Ok(out)
     }
 
     /// Call of an instantiated function (queue entry of the game: one cost); `Some((success,
     /// value))` if it returned a result (`return`).
-    fn call_function(&mut self, s: &Src, id: &str, lines: &[String]) -> Option<(bool, i32)> {
+    fn call_function(&mut self, s: &Src, id: &str, lines: &[ReadyLine]) -> Option<(bool, i32)> {
         if !self.cmd.flow.active {
             // Top-level call: its own context (the lines must not each
             // open one, which would reset the call state to zero).
@@ -966,10 +1002,10 @@ impl Server {
             if self.exhausted() {
                 break;
             }
-            super::cmds_ents::trace_command(self.cmd.depth as usize, l);
-            let (ok, v) = self.perform(fs.clone(), l);
+            super::cmds_ents::trace_command(self.cmd.depth as usize, &l.text);
+            let (ok, v) = self.run_function_line(&fs, l);
             if ok {
-                super::cmds_ents::trace_return(self.cmd.depth as usize, l, v);
+                super::cmds_ents::trace_return(self.cmd.depth as usize, &l.text, v);
             }
             if self.cmd.returned.is_some() {
                 break;
@@ -981,11 +1017,51 @@ impl Server {
         result
     }
 
+    /// One line of a function: its kept parse runs as is (level 2, like the game's compiled
+    /// functions; made at the line's first run), otherwise its text is parsed now at the
+    /// source's level.
+    fn run_function_line(&mut self, fs: &Src, line: &ReadyLine) -> (bool, i32) {
+        // Former path: each line got its own copy of the source.
+        let copied;
+        let src = if self.cmd.paths.shared_source {
+            fs
+        } else {
+            copied = fs.clone();
+            &copied
+        };
+        let kept = line.parsed.as_ref().and_then(|cell| match cell.get() {
+            Some(p) => Some(p),
+            None => self.first_parse(&line.text).map(|p| cell.get_or_init(|| p)),
+        });
+        match kept {
+            Some(parsed) => self.run_kept_parse(src, parsed),
+            None => self.perform_as(src, &line.text),
+        }
+    }
+
+    /// Level-2 parse of a function line checked at load, made at its first run. `None` (the
+    /// line then runs by text) only if the packs changed without reloading the functions, which
+    /// never happens: both reload together.
+    fn first_parse(&self, text: &str) -> Option<Arc<Parsed>> {
+        let lvl = self.cmd.levels.get(2)?;
+        super::parse_function_line(lvl, &self.cmd.data, text, self.cmd.paths.parser_no_alloc).ok().map(Arc::new)
+    }
+
+    /// `perform` of a command parsed beforehand.
+    fn run_kept_parse(&mut self, src: &Src, parsed: &Parsed) -> (bool, i32) {
+        super::cmds_ents::SERVER_LANG.get_or_init(|| crate::stations::en_us(&self.life.items));
+        if self.exhausted() {
+            return (false, 0);
+        }
+        self.in_context(|sv| sv.run_parsed(src, parsed))
+    }
+
     /// Command `function <name> [arguments | with …]`.
     fn cmd_function(&mut self, s: &Src, p: &Parsed, seg: &Seg) -> R {
         let ret = std::mem::take(&mut self.cmd.flow.ret_mode);
         let name = p.arg(seg, "name").unwrap_or_default();
-        let ids = self.function_ids(&name)?;
+        let designated = self.function_ids(&name)?;
+        let ids = designated.as_slice();
         if ids.is_empty() {
             return Err(Fail(tr!("commands.function.scheduled.no_functions", args::id(name.trim_start_matches('#')))));
         }
@@ -999,7 +1075,7 @@ impl Server {
         let single = ids.len() == 1;
         let mut got: Option<(bool, i32)> = None;
         let mut sum = 0i32;
-        for id in &ids {
+        for id in ids {
             let lines = match self.instantiate_function(id, fargs.as_ref()) {
                 Ok(l) => l,
                 Err(f) => {
@@ -1071,9 +1147,7 @@ impl Server {
         match seg.path.get(1).map(String::as_str) {
             Some("clear") => {
                 let f = a("function");
-                let before = self.cmd.scheduled.len();
-                self.cmd.scheduled.retain(|(_, n, _)| *n != f);
-                let n = before - self.cmd.scheduled.len();
+                let n = self.cmd.scheduled.remove_named(&f);
                 if n == 0 {
                     return Err(Fail(tr!("commands.schedule.cleared.failure", f)));
                 }
@@ -1089,9 +1163,9 @@ impl Server {
                 let replace = seg.path.get(4).is_none_or(|m| m == "replace");
                 let at = self.time + i64::from(t);
                 if replace {
-                    self.cmd.scheduled.retain(|(_, n, _)| *n != f);
+                    self.cmd.scheduled.remove_named(&f);
                 }
-                self.cmd.scheduled.push((at, f.clone(), f.starts_with('#')));
+                self.cmd.scheduled.push(at, f.clone());
                 let key = if f.starts_with('#') {
                     "commands.schedule.created.tag"
                 } else {
@@ -1109,123 +1183,12 @@ impl Server {
         if self.cmd.scheduled.is_empty() {
             return;
         }
-        let now = self.time;
-        let (due, rest): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut self.cmd.scheduled).into_iter().partition(|(t, _, _)| *t <= now);
-        self.cmd.scheduled = rest;
-        for (_, f, _) in due {
+        // Every due entry is taken before any runs: what they schedule or clear waits for later.
+        let due = self.cmd.scheduled.take_due(self.time);
+        for f in due {
             let src = self.server_source();
             let _ = self.run_functions(&src, &f, false);
         }
-    }
-}
-
-/// Spaces removed like Java's `String.trim` (characters ≤ U+0020).
-fn jtrim(s: &str) -> &str {
-    s.trim_matches(|c: char| c <= ' ')
-}
-
-/// Compilation of a function at load time, like the game: `\` continuations joined,
-/// comments and empty lines removed, macro lines (`$`) kept with their `$`; any
-/// invalid line (command that does not parse at level 2, leading `/`, macro without a
-/// variable…) makes the whole function refused (the game's log text).
-pub fn compile_function(
-    raw: &[&str],
-    lvl: Option<&super::Level>,
-    data: &rc_commands::Data,
-) -> Result<Vec<String>, String> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < raw.len() {
-        let number = i + 1;
-        let mut line = jtrim(raw[i]).to_owned();
-        while line.ends_with('\\') {
-            i += 1;
-            if i == raw.len() {
-                return Err("Line continuation at end of file".into());
-            }
-            line.pop();
-            line.push_str(jtrim(raw[i]));
-        }
-        i += 1;
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix('/') {
-            if rest.starts_with('/') {
-                return Err(format!(
-                    "Unknown or invalid command '{line}' on line {number} (if you intended to make a comment, use '#' not '//')"
-                ));
-            }
-            let name: String = rest.chars().take_while(|&c| rc_commands::reader::is_unquoted(c)).collect();
-            return Err(format!(
-                "Unknown or invalid command '{line}' on line {number} (did you mean '{name}'? Do not use a preceding forwards slash.)"
-            ));
-        }
-        if let Some(m) = line.strip_prefix('$') {
-            if Template::parse(m).is_err() {
-                return Err(format!("Can't parse function line {number}: '{m}'"));
-            }
-        } else if let Some(lvl) = lvl
-            && let Some(msg) = super::syntax_message(lvl, data, &line, 2)
-        {
-            return Err(format!("Whilst parsing command on line {number}: {msg}"));
-        }
-        out.push(line);
-    }
-    Ok(out)
-}
-
-/// Template of a macro line: pieces of text and interspersed `$(name)` variables.
-struct Template {
-    segments: Vec<String>,
-    vars: Vec<String>,
-}
-
-impl Template {
-    fn parse(input: &str) -> Result<Template, &'static str> {
-        let b = input.as_bytes();
-        let (mut segments, mut vars) = (Vec::new(), Vec::new());
-        let mut start = 0;
-        let mut index = input.find('$');
-        while let Some(at) = index {
-            if at != b.len() - 1 && b[at + 1] == b'(' {
-                segments.push(input[start..at].to_owned());
-                let Some(end) = input[at + 1..].find(')').map(|e| e + at + 1) else {
-                    return Err("Unterminated macro variable");
-                };
-                let var = &input[at + 2..end];
-                if !var.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                    return Err("Invalid macro variable name");
-                }
-                vars.push(var.to_owned());
-                start = end + 1;
-                index = input[start..].find('$').map(|e| e + start);
-            } else {
-                index = input[at + 1..].find('$').map(|e| e + at + 1);
-            }
-        }
-        if start == 0 {
-            return Err("No variables in macro");
-        }
-        if start != input.len() {
-            segments.push(input[start..].to_owned());
-        }
-        Ok(Template { segments, vars })
-    }
-
-    fn substitute(&self, values: &BTreeMap<String, String>) -> String {
-        let mut s = String::new();
-        for (i, v) in self.vars.iter().enumerate() {
-            s.push_str(&self.segments[i]);
-            s.push_str(values.get(v).map_or("", String::as_str));
-        }
-        if self.segments.len() > self.vars.len()
-            && let Some(last) = self.segments.last()
-        {
-            s.push_str(last);
-        }
-        s
     }
 }
 
@@ -1347,22 +1310,18 @@ mod macro_tests {
 
     #[test]
     fn template_parse_and_substitute() {
+        use super::super::functions::Template;
         let t = Template::parse("say $(a) and $(b_2)!").unwrap();
         assert_eq!(t.vars, ["a", "b_2"]);
-        let v: BTreeMap<String, String> = [("a".into(), "1".into()), ("b_2".into(), "x".into())].into_iter().collect();
-        assert_eq!(t.substitute(&v), "say 1 and x!");
+        assert_eq!(t.substitute(["1", "x"]), "say 1 and x!");
         assert!(Template::parse("say nothing").is_err());
         assert!(Template::parse("say $(a").is_err());
         assert!(Template::parse("say $(a-b)").is_err());
-        assert_eq!(
-            Template::parse("$(x)").unwrap().substitute(&[("x".into(), "kill".into())].into_iter().collect()),
-            "kill"
-        );
+        assert_eq!(Template::parse("$(x)").unwrap().substitute(["kill"]), "kill");
         // `$` alone: text kept.
-        assert_eq!(
-            Template::parse("say 5$ $(x)").unwrap().substitute(&[("x".into(), "y".into())].into_iter().collect()),
-            "say 5$ y"
-        );
+        assert_eq!(Template::parse("say 5$ $(x)").unwrap().substitute(["y"]), "say 5$ y");
+        // A variable used twice takes the same value at both places.
+        assert_eq!(Template::parse("$(v) $(v)").unwrap().substitute(["a", "a"]), "a a");
     }
 
     #[test]

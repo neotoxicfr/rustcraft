@@ -6295,3 +6295,130 @@ switch at 0 alone (`--env=RUSTCRAFT_OPT_MESHCACHEADAPTIVE=0`, `…EVICT=0`, `…
 `…MESH_BASE_EXPIRY=0`) and with `RUSTCRAFT_OPT_MESH_BASE_SECOND_ADMISSION=1`; `RUSTCRAFT_MESHCHECK=1`
 on cave and redstone.
 
+## C6-M12: commands, functions compiled once, macros parsed once, command blocks and `/schedule` without repeated work (06/11, loaded machine)
+
+Before: every call of a function copied its lines (`Vec<String>`) and parsed each of them again
+at the caller's level; a macro line was parsed twice per call (the check at level 2, thrown away,
+then the run); every function line copied its source twice (one per line, one kept for the
+fork-limit message); a repeating command block parsed its text again at every tick, looked its
+block entity up about twelve times (each lookup scans the chunk's block entities and compares
+x, y, z by key), copied the whole block entity and told its kind by comparing block names; a
+failing block read the system time zone for every output stamp; `/schedule` split its whole
+list at every tick; the parser copied the parse context for every child it tried, the child
+lists and the word it looked up, and built a `Vec<char>` per literal tried. Switches, default =
+new, `=0` = old (read once when the world opens, `commands/paths.rs`, `CommandPaths`):
+- `RUSTCRAFT_OPT_FUNCTIONCACHE`: a plain line keeps its level-2 parse (the game's function
+  permission level: the form that runs whatever the caller's level, like the game), made at its
+  first run (the load only checks the line, as before: no load time or memory for lines that
+  never run); a plain function's lines are shared by every call (`Arc<[ReadyLine]>`), identical
+  lines of one load share one text and one kept parse (`SharedLines`), a tag's member list is shared
+  (`Arc<[String]>`) and `#minecraft:tick` / `#minecraft:load` run their members without
+  formatting `#tag` and looking it up again.
+- `RUSTCRAFT_OPT_MACROCACHE`: one parse per substituted macro line gives the error text and the
+  command run; the last 8 successful instantiations of a function are kept by argument values
+  (most recent last), like the game.
+- `RUSTCRAFT_OPT_SHAREDSOURCE`: `run_parsed` takes `&Src` (the source list starts borrowed, `Cow`);
+  a function line runs with the function's source by reference.
+- `RUSTCRAFT_OPT_PARSECACHE`: texts run by command blocks, minecarts and the player come back from
+  a two-generation cache (2 × 2,048 texts per level), errors included; emptied at `/reload`
+  (`Cmds::functions_reloaded`). A parse never reads teams or players (proved by a test).
+- `RUSTCRAFT_OPT_COMMANDBLOCKBORROW`: kind by block identifier (`Ids::chain_command_block`,
+  `repeating_command_block`); the block entity found once per step and read by reference
+  (`BlockEntityAt::Slot`), found again after the command ran (a command can add or remove block
+  entities); no copy of the block entity.
+- `RUSTCRAFT_OPT_LOCALTIMECACHE`: `[HH:mm:ss] ` formatted once per second, the system time zone
+  read once per minute (offsets only change on whole minutes; Java keeps the zone read at
+  startup).
+- `RUSTCRAFT_OPT_SCHEDULEQUEUE`: entries in a `BTreeMap` by (due tick, scheduling order) with a name
+  index; a tick with nothing due reads one key.
+- `RUSTCRAFT_OPT_PARSERNOALLOC` (rc-commands, client and server): the last usable child gets the
+  context itself (put back with `rewind` when it fails), the child list is borrowed from the
+  tree, the word is looked up from a stack buffer, a literal is compared in place.
+Without switch (identical text, unit-tested): `read_id` returns the text read when it names its
+namespace (one string instead of two), numbers are parsed from a stack buffer, `advance_clocks`
+copies a clock name only the first time.
+
+Kept parse layout: `Parsed` holds the UTF-8 text and byte ranges (`u32`), the argument names
+shared with the level (`Arc<str>`), the path text built once (`path_str() -> &str`), exact
+capacities.
+
+Proof: `function_cache_tests` runs a corpus (macros with the same, other, invalid and missing
+arguments, cache overflow, `return run`, quota, forks, `execute store`, tags, schedule append /
+replace / clear, a name merged between `execute as` and `say`, typed commands valid and invalid)
+by the server and by an operator on fresh flat worlds (one thread each: same test seeds), every
+switch off, each alone, all on: results, client events (advancement updates left out: they carry
+the wall clock), scores, storage, pending schedules and the stands' data identical.
+`command_block_equivalence_tests`: impulse, repeating, chain (conditional, failing, `Searge`,
+`UpdateLastExecution:0b`, custom name, self-stopping, replaced behind) for 200 ticks with a
+frozen clock moving one second per tick: events and every block's data after every tick
+identical. `parser_equivalence_tests`: 42 commands × every truncation × 5 levels, parse
+identical (Debug); kept arguments equal to the character ranges; teams and players ignored.
+`schedule::tests`: 10,000 schedules and 2,000 ticks, launches identical. Sabotages (manual,
+reverted; see `target/notes`): previous line's parse, chain/repeating confused, literal matched
+by prefix, macro instance returned whatever the values, parse cache miss returning another text:
+each fails its test.
+
+`bench_function_tick.rs` (one test per part; loaded machine; allocations per tick are
+deterministic: pass 2, after the kept-parse layout below; µs: median of 2 passes, timings
+spread by ±30 % on this machine, the allocations settle the order):
+
+| 20-line function per tick, µs / allocations | former | function cache | macro cache | shared source | parser without copies | function + macro | all |
+|---|---|---|---|---|---|---|---|
+| plain, 1 source | 161 / 3,739 | 81 / 1,164 | 160 / 3,739 | 164 / 3,468 | 156 / 2,598 | 84 / 1,164 | 91 / 904 |
+| plain, 100 sources | 12,636 / 265,578 | 5,655 / 93,372 | 11,156 / 265,578 | 8,609 / 245,518 | 10,470 / 189,967 | 4,596 / 93,405 | 4,889 / 73,312 |
+| plain, 1,000 sources | 451,263 / 2,651,709 | 316,488 / 935,912 | 331,139 | 393,872 | 367,171 | 314,367 / 935,989 | 380,744 / 735,819 |
+| macro, same arguments, 1 source | 214 / 4,083 | 199 / 3,232 | 140 / 3,148 | 192 / 3,823 | 159 / 2,710 | 103 / 1,142 | 94 / 882 |
+| macro, same arguments, 100 sources | 10,999 / 301,056 | 12,905 / 300,194 | 12,032 / 206,412 | 15,833 / 280,952 | 11,677 / 201,211 | 5,986 / 91,216 | 4,448 / 71,123 |
+| macro, 16 values in turn, 100 sources | 11,567 / 301,338 | 9,415 / 300,498 | 8,385 / 207,353 | 10,333 / 281,289 | 11,291 / 201,460 | 5,596 / 92,036 | 5,283 / 71,744 |
+| macro, 16 values, 1,000 sources | 386,539 / 3,009,926 | 371,181 | 371,785 / 2,062,628 | 401,559 | 398,809 | 278,304 / 917,531 | 324,139 / 717,408 |
+
+Per line and per source: 133 allocations before, 37 with every switch (−72 %); the 100-source
+tick goes from 12.6 to 4.9 ms (×2.6, not the ×5 hoped: the remaining cost is the commands
+themselves, argument strings read from the parse at every run, selectors parsed from their
+text, scoreboard writes). Macros with 16 values in turn never hit the 8 kept instantiations
+(like the game): the gain there is the single parse per macro line.
+
+| 256 repeating command blocks, µs / allocations per tick | former | parse cache | block borrow | local time cache | parser without copies | all |
+|---|---|---|---|---|---|---|
+| one chunk (3 passes) | 8,216 / 30,253 | 7,333 / 14,569 | 2,803 / 26,413 | 7,167 / 30,253 | 7,664 / 23,731 | 2,595 / 8,862 |
+| sixteen chunks (2 passes) | 3,771 / 30,255 | 3,562 / 14,571 | 2,980 / 26,415 | 3,975 / 30,255 | 4,630 / 23,733 | 1,581 / 8,864 |
+| failing, tracked output, one chunk (2 passes) | 18,481 / 36,909 | 17,589 / 32,489 | 7,735 / 23,341 | 10,481 / 36,397 | 8,271 / 36,275 | 2,361 / 18,334 |
+
+The block borrow is the big one in one chunk (the chunk's block entity list was scanned a
+dozen times per block); spread over 16 chunks the lists are short and the parse cache and the
+parser count more. Parse of 1,000 typical commands (server): 79.4 → 45.2 allocations per
+command, 2.53 → 1.79 ms (pass 3; pass 1: 84.0 → 49.9, 2.65 → 2.12). `/schedule` with 10,000
+entries waiting, none due: 133 → 58 µs per tick (the tick of the flat world alone ≈ 45 µs), 1,000
+entries: 79 → 66 µs.
+
+Memory and load of a 100,000-line function (`bench_function_memory`, 2 passes): former 96 bytes
+per line, load 182-188 ms; cache: load 91-104 ms (the parser without copies; the load only
+checks the lines, as before), +≈ 40 bytes per line that never runs (its empty parse slot),
+805 bytes per line that ran (first runs of all 100,000 lines: 164-186 ms, once). The same 20
+lines repeated 5,000 times (generated pack): 24 bytes per line, load 3.6-5.5 ms (each distinct
+line checked once) against 130-145 ms. Investigated: the first layout kept 997 bytes per line
+(`Vec<char>` input, owned argument names, growth slack, every parse made at load: load 243 ms);
+UTF-8 text with `u32` byte ranges, argument names shared with the level (`Arc<str>`), exact
+capacities, boxed macro lines and plain functions holding only their shared line list brought
+it to 779, the parse made at first run removed the load cost. What remains is `Seg.path`
+(`Vec<String>`, read by 64 call sites in the command files).
+
+Difference with the former path, toward the game: an operator at level 4 calling a function ran
+its lines parsed again at level 4; they now run their level-2 parse, like the game (the same
+result for every line a function can hold, since a line that does not parse at level 2 refuses
+the whole function at load). The schedule queue runs overdue entries by due tick then
+scheduling order (the game's order); the former list ran them in scheduling order only, which
+differs only if several ticks are overdue at once (never: every entry is due one tick or more
+later and ticks are not skipped).
+
+Findings left to other missions: with 1,000 markers the cost per call is 5× the cost with 100
+(same allocations): `Server::other` scans every non-mob entity (`execute as`, `@s`, names), and
+a selector argument is parsed from its text at every run (`select::parse`); be_index is a linear
+scan of the chunk's block entities (C5-M17). Not done: `Src.display` and `name` as shared
+pointers (one deep copy per `execute as` source and per function call remains); `Seg.path` as
+shared names (`Vec<String>`, 64 call sites in the command files: renaming mission); the
+fidelity points of the coordination note (UpdateLastExecution read before the run, results
+written to the entity at `p` after a replacement, schedules not saved, identical `append`
+kept twice) are unchanged. Multi-core and GPU: not applicable (commands read and write the world
+in order on the server thread). To settle on the quiet-machine scene bench: `datapack` and
+`plains12` (2 passes, old exe as reference).
