@@ -6,11 +6,20 @@ use rc_client::{EntityEvent, Event};
 use rc_proto_v777::entity::{AddEntity, Meta};
 
 use super::physics::{BlockHit, Hit, Target};
-use super::{DEG, PKind, Proj, lerp_rotation};
+use super::{DEG, PKind, Proj, ProjectilePaths, lerp_rotation};
 use crate::mobs::jrand::JRand;
 use crate::mobs::mob::Ent;
 use crate::mobs::mth::atan2;
 use crate::server::Server;
+
+/// A cell of the bobber's open-water test: air or lily pad above the water, water source without
+/// collision, or anything else.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum OpenWaterCell {
+    Above,
+    Inside,
+    Invalid,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookState {
@@ -355,13 +364,11 @@ impl Server {
     }
 
     /// 5 × 5 on four layers, water then air with no mixing.
-    fn open_water_at(&self, p: [i32; 3]) -> bool {
-        #[derive(PartialEq, Clone, Copy)]
-        enum T {
-            Above,
-            Inside,
-            Invalid,
-        }
+    pub(super) fn open_water_at(&self, p: [i32; 3]) -> bool {
+        use OpenWaterCell as T;
+        let by_state_bits = ProjectilePaths::current().fishing_state_bits;
+        // Looked up once per test of the 100 cells, not per cell.
+        let lily_pad = if by_state_bits { self.tag_bits.block_of_name("minecraft:lily_pad") } else { None };
         let mut prev = T::Invalid;
         for y in -1..=2 {
             let mut layer: Option<T> = None;
@@ -369,17 +376,8 @@ impl Server {
                 for z in -2..=2 {
                     let q = [p[0] + x, p[1] + y, p[2] + z];
                     let s = self.st(q);
-                    let name = self.state_name(s);
-                    let t = if self.is_air(q) || name == "minecraft:lily_pad" {
-                        T::Above
-                    } else {
-                        let src = self.phys.fluids.fluid(s) == rc_physics::Fluid::Water && self.water_source(s) && {
-                            let mut bx = Vec::new();
-                            self.phys.collision(s, &mut bx);
-                            bx.is_empty()
-                        };
-                        if src { T::Inside } else { T::Invalid }
-                    };
+                    let t =
+                        if by_state_bits { self.open_water_cell(s, lily_pad) } else { self.open_water_cell_by_name(s) };
                     layer = Some(match layer {
                         None => t,
                         Some(l) if l == t => l,
@@ -395,6 +393,48 @@ impl Server {
             }
         }
         true
+    }
+
+    /// Class of the cell `q` of state `s` for the open-water test, from the state's flags, block
+    /// index and fluid: the same answer as `open_water_cell_by_name`, without comparing text.
+    pub(super) fn open_water_cell(&self, s: u32, lily_pad: Option<u16>) -> OpenWaterCell {
+        let info = self.data.state(s);
+        if info.is_some_and(|i| i.has(rc_data::flags::AIR) || Some(i.block) == lily_pad) {
+            return OpenWaterCell::Above;
+        }
+        let source_water = info.is_some_and(|i| {
+            i.fluid != 0 && self.bs.t.fluid_water_source.get(usize::from(i.fluid)).copied().unwrap_or(false)
+        });
+        let inside =
+            self.phys.fluids.fluid(s) == rc_physics::Fluid::Water && source_water && self.phys.shape(s).is_empty();
+        if inside { OpenWaterCell::Inside } else { OpenWaterCell::Invalid }
+    }
+
+    /// Old path of `open_water_cell`: the block's name and properties compared as text (the air
+    /// test, formerly read again at the cell's position, is that of its state `s`).
+    pub(super) fn open_water_cell_by_name(&self, s: u32) -> OpenWaterCell {
+        let name = self.state_name(s);
+        let air = self.data.state(s).is_some_and(|i| i.has(rc_data::flags::AIR));
+        if air || name == "minecraft:lily_pad" {
+            return OpenWaterCell::Above;
+        }
+        let inside = self.phys.fluids.fluid(s) == rc_physics::Fluid::Water
+            && self.water_source(s)
+            && self.with_collision_shape(s, <[rc_physics::Aabb]>::is_empty);
+        if inside { OpenWaterCell::Inside } else { OpenWaterCell::Invalid }
+    }
+
+    /// The block at `q` is `minecraft:water`.
+    fn water_block_at(&self, q: [i32; 3]) -> bool {
+        self.water_block_state(self.st(q))
+    }
+
+    /// The block of state `s` is `minecraft:water`: by its block index, or (old path) by its name.
+    pub(super) fn water_block_state(&self, s: u32) -> bool {
+        if ProjectilePaths::current().fishing_state_bits {
+            return self.data.state(s).is_some_and(|i| i.block == self.bs.t.id.water);
+        }
+        self.state_name(s) == "minecraft:water"
     }
 
     /// Water source (full water, level-0 water block or waterlogged block).
@@ -441,7 +481,7 @@ impl Server {
                 let fy = h.p.pos[1].floor() + 1.0;
                 let fz = h.p.pos[2] + f64::from(c * h.until_hooked as f32 * 0.1);
                 let q = [fx.floor() as i32, (fy - 1.0).floor() as i32, fz.floor() as i32];
-                if self.state_name(self.st(q)) == "minecraft:water" {
+                if self.water_block_at(q) {
                     if h.p.rng.next_float() < 0.15 {
                         self.particles_full(
                             "minecraft:bubble",
@@ -484,7 +524,7 @@ impl Server {
                 let fy = h.p.pos[1].floor() + 1.0;
                 let fz = h.p.pos[2] + f64::from(rc_physics::cos_t(a) * d) * 0.1;
                 let q = [fx.floor() as i32, (fy - 1.0).floor() as i32, fz.floor() as i32];
-                if self.state_name(self.st(q)) == "minecraft:water" {
+                if self.water_block_at(q) {
                     let n = 2 + h.p.rng.next_int_bound(2);
                     self.particles("minecraft:splash", [fx, fy, fz], [0.1, 0.0, 0.1], 0.0, n);
                 }
