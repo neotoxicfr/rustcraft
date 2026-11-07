@@ -7484,8 +7484,12 @@ complete (shuffled), unknown advancement and criterion, a key written twice: sam
 order, first packet and file on both readings, the same after more grants, files rewritten to the
 byte; parallel tree = sequential tree (links, positions, criteria, index). `tests_location_fast`:
 every block against every block tag (full, short and `#` forms, unknown tag and block), lent
-types, the `location` trigger over 770 points of the test world on both paths. Sabotages that
-fail them: see the commit.
+types, the `location` trigger over 770 points of the test world on both paths. Twelve sabotages
+fail them, one at a time: item tags never asked, item lists ignored, item key not completed with
+its namespace, `player` criterion indexed, emptied slot skipping the criteria tested for every
+change, `id_eq` written with the mission's formula, recipe key not completed, repeated file key
+keeping its first value, started flag not set at load, block tag read for the next block, the
+several-item bits testing the first item only, biome read 64 blocks away.
 
 Difference faithful to the game (A3): a key written with a space before its colon (or any form the
 game does not write) was not found by the former search and placed by its earliest date; the one
