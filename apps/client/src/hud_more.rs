@@ -249,11 +249,12 @@ pub struct Sound {
 
 /// Mount as seen from the HUD.
 pub struct VehicleIn {
-    pub id: i32,
     /// Living entity (shows its health).
     pub living: bool,
     /// Health (entity data 9).
     pub health: f32,
+    /// Maximum health (synchronised attribute, 20 by default).
+    pub max_health: f64,
     /// Jumping mount steered by the player: cooldown set on each jump (0 for horses).
     pub jump_cooldown: Option<i32>,
 }
@@ -282,8 +283,6 @@ pub struct HudMore {
     last_bubble: i32,
     sounds: Vec<Sound>,
     vehicle: Option<Vehicle>,
-    /// Maximum health of the other entities (synchronised attribute), by id.
-    max_health: hashbrown::HashMap<i32, f64>,
     /// Mount jump: key at the previous tick, charge ticks, strength (0..1), cooldown.
     jump_was: bool,
     jump_ticks: i32,
@@ -322,20 +321,13 @@ impl HudMore {
         HudMore { air: MAX_AIR, ..Default::default() }
     }
 
-    /// Periodic forgetting of the max healths of vanished entities.
-    pub fn prune(&mut self, entities: &crate::entities::Entities) {
-        if self.ticks % 256 == 0 {
-            self.max_health.retain(|id, _| entities.map.contains_key(id));
-        }
-    }
-
     pub fn tick(&mut self, t: &TickIn) {
         self.ticks = self.ticks.wrapping_add(1);
         self.air = t.air.unwrap_or(MAX_AIR);
         self.eyes_in_water = t.eyes_in_water;
         self.vehicle = t.vehicle.as_ref().map(|v| {
             // Max health rounded, two points per heart, 30 hearts at most.
-            let max = self.max_health.get(&v.id).copied().unwrap_or(20.0) as f32;
+            let max = v.max_health as f32;
             Vehicle {
                 hearts: if v.living { (((max + 0.5) as i32) / 2).min(30) } else { 0 },
                 health: v.health.ceil() as i32,
@@ -627,15 +619,6 @@ impl HudMore {
         self.jump_send.take()
     }
 
-    /// Attributes of another entity: only the maximum health is used (mount health).
-    pub fn attributes(&mut self, entity: i32, list: &[rc_proto_v777::play::Attribute], names: &[String]) {
-        for a in list {
-            if names.get(a.id as usize).is_some_and(|n| n == "minecraft:max_health") {
-                self.max_health.insert(entity, attribute_value("minecraft:max_health", a));
-            }
-        }
-    }
-
     /// Experience progress changed: the XP bar takes precedence over the locator for 100 ticks,
     /// except for the very first change of a player (values received on arrival), which only
     /// marks the start as set without showing anything.
@@ -897,11 +880,17 @@ impl HudMore {
     }
 }
 
-/// Mount of the local player: the tracked entity that counts them among its passengers. It is steered
-/// (jump) if it is saddled and the player is its first passenger.
-pub fn vehicle_of(entities: &crate::entities::Entities) -> Option<VehicleIn> {
+/// Mount `vehicle` of the local player (`App::player_vehicle`): the tracked entity that counts them
+/// among its passengers. It is steered (jump) if it is saddled and the player is its first
+/// passenger. `attribute_names`: the `minecraft:attribute` registry.
+pub fn vehicle_of(
+    entities: &crate::entities::Entities,
+    vehicle: Option<i32>,
+    attribute_names: &[String],
+) -> Option<VehicleIn> {
     let local = entities.local;
-    let (&id, e) = entities.map.iter().find(|(_, e)| e.passengers.contains(&local))?;
+    let id = vehicle?;
+    let e = entities.map.get(&id)?;
     let health = match e.meta.get(&9) {
         Some(rc_proto_v777::entity::Meta::Float(h)) => *h,
         _ => 0.0,
@@ -914,7 +903,8 @@ pub fn vehicle_of(entities: &crate::entities::Entities) -> Option<VehicleIn> {
         "nautilus" | "zombie_nautilus" => Some(40),
         _ => None,
     };
-    Some(VehicleIn { id, living: e.class != crate::entities::Kind::Other, health, jump_cooldown })
+    let max_health = e.synced_attribute(attribute_names, "minecraft:max_health").unwrap_or(20.0);
+    Some(VehicleIn { living: e.class != crate::entities::Kind::Other, health, max_health, jump_cooldown })
 }
 
 /// Overlays of equipped items: `equippable.camera_overlay` texture of an item worn in
@@ -1055,7 +1045,11 @@ mod tests {
     }
 
     fn tick(h: &mut HudMore, jump: bool) {
-        let v = VehicleIn { id: 1, living: true, health: 10.0, jump_cooldown: Some(0) };
+        tick_with_max_health(h, jump, 20.0);
+    }
+
+    fn tick_with_max_health(h: &mut HudMore, jump: bool, max_health: f64) {
+        let v = VehicleIn { living: true, health: 10.0, max_health, jump_cooldown: Some(0) };
         h.tick(&TickIn { air: None, eyes_in_water: false, vehicle: Some(v), jump, frozen: None, in_portal: false });
     }
 
@@ -1141,9 +1135,7 @@ mod tests {
     #[test]
     fn mount_hearts_from_max_health() {
         let mut h = HudMore::new();
-        let a = rc_proto_v777::play::Attribute { id: 0, base: 53.0, modifiers: Vec::new() };
-        h.attributes(1, &[a], &["minecraft:max_health".to_owned()]);
-        tick(&mut h, false);
+        tick_with_max_health(&mut h, false, 53.0);
         assert_eq!(h.vehicle_hearts(), 26);
     }
 

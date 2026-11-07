@@ -7,7 +7,7 @@ use rc_physics::{Aabb, Nearby, Pusher};
 use rc_proto_v777::entity::Meta;
 use rc_proto_v777::item::ItemStack;
 
-use crate::entities::{Entities, Kind};
+use crate::entities::{Entities, Kind, kind_id_filters_on};
 use crate::scoreboard::Scoreboard;
 
 /// Ids of the components read here (`minecraft:data_component_type` registry).
@@ -92,6 +92,35 @@ fn team_allows(own: i32, own_team: Option<&str>, their: i32, their_team: Option<
     (own != 2 && their != 2) || same
 }
 
+/// What decides how a neighbour pushes the local player, by type.
+struct PushKind {
+    /// Remote player (skipped in spectator mode).
+    player: bool,
+    /// Player or mannequin: standing width 0.6 whatever the table says.
+    avatar: bool,
+    /// Pushes as a boat.
+    boat: bool,
+    /// Never pushes: bat, armor stand, parrot, vex (passes through).
+    quiet: bool,
+}
+
+impl PushKind {
+    fn from_facts(e: &crate::entities::Entity) -> PushKind {
+        let f = &e.facts;
+        PushKind { player: f.player, avatar: f.avatar, boat: f.boat_or_raft, quiet: f.never_pushes }
+    }
+
+    /// By the type name (old path, test reference).
+    fn by_name(k: &str) -> PushKind {
+        PushKind {
+            player: k == "player",
+            avatar: k == "player" || k == "mannequin",
+            boat: k.ends_with("boat") || k.ends_with("raft"),
+            quiet: matches!(k, "bat" | "armor_stand" | "parrot" | "vex"),
+        }
+    }
+}
+
 /// Entities within 4 blocks of the local player at `me` (boxes, alive, way of pushing).
 /// `spectator`: remote player in spectator (it does not push).
 pub(crate) fn nearby(
@@ -103,6 +132,18 @@ pub(crate) fn nearby(
     spectator: &dyn Fn(u128) -> bool,
     out: &mut Vec<Nearby>,
 ) {
+    nearby_with(ents, me, (scores, players, local_name), spectator, out, kind_id_filters_on());
+}
+
+/// `nearby` with the kind test chosen (`by_facts`: facts of the type, otherwise type names).
+fn nearby_with(
+    ents: &Entities,
+    me: [f64; 3],
+    (scores, players, local_name): (&Scoreboard, &crate::players::PlayerList, &str),
+    spectator: &dyn Fn(u128) -> bool,
+    out: &mut Vec<Nearby>,
+    by_facts: bool,
+) {
     out.clear();
     let teams = !scores.members.is_empty();
     let mine = teams.then(|| scores.team_named(local_name)).flatten();
@@ -111,17 +152,16 @@ pub(crate) fn nearby(
         if (0..3).any(|a| (e.pos[a] - me[a]).abs() > 4.0) {
             continue;
         }
-        let k = e.kind.as_str();
-        let player = k == "player";
+        let PushKind { player, avatar, boat, quiet } =
+            if by_facts { PushKind::from_facts(e) } else { PushKind::by_name(&e.kind) };
         if player && spectator(e.uuid) {
             continue;
         }
         let living = e.class != Kind::Other;
-        let boat = k.ends_with("boat") || k.ends_with("raft");
         let d =
             usize::try_from(e.kind_id).ok().and_then(|i| ents.dims.get(i)).copied().unwrap_or([0.6, 1.8, 1.62, 1.8]);
         let h = f64::from(e.dims(&ents.dims)[0]);
-        let width = if player || k == "mannequin" {
+        let width = if avatar {
             if e.pose() == 2 { 0.2 } else { 0.6 }
         } else if living && e.pose() == 2 {
             0.2
@@ -130,8 +170,6 @@ pub(crate) fn nearby(
         };
         let r = width / 2.0;
         let bb = Aabb { min: [e.pos[0] - r, e.pos[1], e.pos[2] - r], max: [e.pos[0] + r, e.pos[1] + h, e.pos[2] + r] };
-        // Do not push the player: bat, armor stand, parrot, vex (passes through).
-        let quiet = matches!(k, "bat" | "armor_stand" | "parrot" | "vex");
         let mut pusher = if boat {
             Pusher::Boat
         } else if living && !quiet {
@@ -175,6 +213,91 @@ pub(crate) fn local_flags(values: &[(u8, Meta)], player: &mut rc_physics::Player
             (8, Meta::Byte(b)) => player.spin_attack = *b & 4 != 0,
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+    use rc_client::EntityEvent;
+    use rc_proto_v777::entity::{AddEntity, Meta};
+
+    fn data() -> rc_data::VersionData {
+        rc_testdata::version_data().expect("version data missing (extraction)")
+    }
+
+    /// Push rule of every type of the 26.3 registry: facts and names agree.
+    #[test]
+    fn push_kind_of_every_registry_type_matches_the_names() {
+        let data = data();
+        let names = data.registry("minecraft:entity_type").expect("type registry").entries.clone();
+        assert!(names.len() > 100, "type registry too short: {}", names.len());
+        let mut ents = Entities { type_names: names.clone(), ..Default::default() };
+        for i in 0..names.len() {
+            let add =
+                AddEntity { id: i as i32, uuid: 0, kind: i as i32, pos: [0.0; 3], velocity: [0.0; 3], pitch: 0.0, yaw: 0.0, head_yaw: 0.0, data: 0 };
+            ents.apply(EntityEvent::Add(Box::new(add)));
+        }
+        let key = |p: PushKind| (p.player, p.avatar, p.boat, p.quiet);
+        let differ: Vec<&str> = ents
+            .map
+            .values()
+            .filter(|e| key(PushKind::from_facts(e)) != key(PushKind::by_name(&e.kind)))
+            .map(|e| e.kind.as_str())
+            .collect();
+        assert!(differ.is_empty(), "{differ:?}");
+    }
+
+    /// 200 ticks of a crowd of 1,000 mixed entities moving around the player (teams on): the
+    /// neighbours found by facts equal those found by names, bit for bit; a sabotaged fact (cows
+    /// that never push) is caught.
+    #[test]
+    fn neighbours_by_facts_equal_neighbours_by_names() {
+        let data = data();
+        let names = data.registry("minecraft:entity_type").expect("type registry").entries.clone();
+        let kinds = ["cow", "player", "mannequin", "bat", "armor_stand", "parrot", "vex", "oak_boat", "bamboo_raft", "minecart", "item", "zombie", "slime", "shulker"];
+        let id_of = |k: &str| names.iter().position(|n| n.strip_prefix("minecraft:") == Some(k)).expect(k) as i32;
+        let mut ents = Entities { type_names: names.clone(), dims: data.entity_dims.clone(), ..Default::default() };
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for id in 0..1_000 {
+            let kind = kinds[(next() % kinds.len() as u64) as usize];
+            let pos = [(next() % 900) as f64 / 100.0 - 4.5, 64.0, (next() % 900) as f64 / 100.0 - 4.5];
+            let add = AddEntity { id, uuid: id as u128, kind: id_of(kind), pos, velocity: [0.0; 3], pitch: 0.0, yaw: 0.0, head_yaw: 0.0, data: 0 };
+            ents.apply(EntityEvent::Add(Box::new(add)));
+            let pose = Meta::Pose([0, 0, 2][(next() % 3) as usize]);
+            ents.apply(EntityEvent::Data { id, values: vec![(6, pose), (16, Meta::Bool(next().is_multiple_of(4)))] });
+        }
+        let mut scores = Scoreboard::default();
+        let params = rc_proto_v777::scores::TeamParams { display: None, prefix: None, suffix: None, nametag: 0, collision: 2, color: None, options: 0 };
+        let members = (0..500).map(|i: u128| crate::app_entity_sets::UuidText::new(i).as_str().to_owned()).chain(["Me".to_owned()]).collect();
+        scores.apply(rc_proto_v777::scores::ScoreEvent::Team { name: "half".into(), mode: 0, params: Some(params), members });
+        let players = crate::players::PlayerList::default();
+        let spectator = |u: u128| u.is_multiple_of(7);
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        let mut run = |ents: &Entities| {
+            let mut differ = 0;
+            for t in 0..200 {
+                let me = [f64::from(t % 20) * 0.1 - 1.0, 64.0, 0.3];
+                nearby_with(ents, me, (&scores, &players, "Me"), &spectator, &mut a, false);
+                nearby_with(ents, me, (&scores, &players, "Me"), &spectator, &mut b, true);
+                differ += usize::from(a != b);
+            }
+            (differ, a.len())
+        };
+        let (differ, found) = run(&ents);
+        assert_eq!(differ, 0);
+        assert!(found > 50, "too few neighbours: {found}");
+        // Sabotage: cows that never push.
+        for e in ents.map.values_mut().filter(|e| e.kind == "cow") {
+            e.facts.never_pushes = true;
+        }
+        assert!(run(&ents).0 > 0, "sabotage not caught");
     }
 }
 

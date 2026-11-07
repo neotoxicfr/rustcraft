@@ -8,7 +8,9 @@ use rc_data::java_math::wrap_degrees;
 use rc_proto_v777::entity::{Meta, PositionPath};
 use rc_proto_v777::item::ItemStack;
 
+mod kind_facts;
 mod subsets;
+pub(crate) use kind_facts::{KindFacts, MotionFamily, PickRule, kind_flags_on, kind_id_filters_on};
 pub use subsets::EntitySubsets;
 pub(crate) use subsets::{entity_subsets_on, rare_kind_lists_on};
 
@@ -235,10 +237,17 @@ struct Stepper {
 /// hashing (read for each entity on every frame).
 ///
 /// Maintained on every `insert` (the only write point): for each variant serializer present,
-/// the smallest index that carries it (`RUSTCRAFT_OPT_VARIANTIDX`), and the custom name
-/// (data 2) as plain text (`RUSTCRAFT_OPT_NAMECACHE`).
+/// the smallest index that carries it (`RUSTCRAFT_OPT_VARIANTIDX`), the custom name
+/// (data 2) as plain text (`RUSTCRAFT_OPT_NAMECACHE`), and a stamp that changes on every write.
 #[derive(Debug, Clone, Default)]
-pub struct MetaMap(Vec<Option<Meta>>, Vec<(u8, u8)>, Option<Box<str>>);
+pub struct MetaMap(Vec<Option<Meta>>, Vec<(u8, u8)>, Option<Box<str>>, u64);
+
+/// Next write stamp of a `MetaMap`. Shared by every map so that a map replaced as a whole never
+/// shows the stamp of the one it replaces (0 only for a map never written).
+fn next_meta_stamp() -> u64 {
+    static STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    STAMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Variant read from the index held by `MetaMap` (otherwise search among all the data).
 #[inline]
@@ -287,6 +296,13 @@ impl MetaMap {
         if i == 2 {
             self.2 = parse_custom_name(self.0[idx].as_ref()).map(String::into_boxed_str);
         }
+        self.3 = next_meta_stamp();
+    }
+
+    /// Changes on every `insert`: what was computed from the data at one stamp still holds while
+    /// the stamp stays the same.
+    pub fn stamp(&self) -> u64 {
+        self.3
     }
 
     pub fn values(&self) -> impl Iterator<Item = &Meta> {
@@ -308,6 +324,38 @@ impl MetaMap {
     }
 }
 
+/// What an entity's box is computed from, apart from its type (fixed at spawn): position, data
+/// write stamp, scale attribute, dimension table (address and length).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct BoxKey {
+    pos: [u64; 3],
+    meta: u64,
+    scale: u32,
+    table: (usize, usize),
+}
+
+#[derive(Clone, Copy)]
+struct CachedBox {
+    key: BoxKey,
+    bb: rc_physics::Aabb,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Sabotage for the proof of the box cache: the key forgets the scale attribute, so a box
+    /// computed before a scale change is read back after it. The proof must catch it.
+    pub(crate) static BOX_KEY_FORGETS_SCALE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Scale attribute as written in a box key.
+fn box_key_scale(scale: f32) -> u32 {
+    #[cfg(test)]
+    if BOX_KEY_FORGETS_SCALE.get() {
+        return 0;
+    }
+    scale.to_bits()
+}
+
 /// Cloneable: frozen copy of the appearance (item picked up in flight, `misc.rs`).
 #[derive(Clone)]
 pub struct Entity {
@@ -321,6 +369,14 @@ pub struct Entity {
     pub uuid: u128,
     pub interp: Interp,
     pub class: Kind,
+    /// Facts of the type, worked out from `kind` at spawn (`kind_facts.rs`).
+    pub facts: KindFacts,
+    /// Box of the last `cached_box` call and what it was computed from.
+    box_cache: std::cell::Cell<Option<CachedBox>>,
+    /// Attributes synchronised by the server (`update_attributes`): id in the
+    /// `minecraft:attribute` registry and current value. They go with the entity: a new entity
+    /// that reuses the id after a world change starts from its type's defaults, like the game.
+    pub attributes: Vec<(u16, f64)>,
     /// Base of the position codec (last server position).
     pub base: [f64; 3],
     pub pos: [f64; 3],
@@ -416,6 +472,21 @@ pub struct Entity {
 }
 
 impl Entity {
+    /// Value of the synchronised attribute named `name` (`names`: the `minecraft:attribute`
+    /// registry), `None` if the server never sent it.
+    pub fn synced_attribute(&self, names: &[String], name: &str) -> Option<f64> {
+        let named = |id: u16| names.get(usize::from(id)).is_some_and(|n| n == name);
+        self.attributes.iter().find(|(id, _)| named(*id)).map(|(_, v)| *v)
+    }
+
+    /// Stores the synchronised attribute `id` (replacing its previous value).
+    pub fn set_synced_attribute(&mut self, id: u16, value: f64) {
+        match self.attributes.iter_mut().find(|(a, _)| *a == id) {
+            Some(slot) => slot.1 = value,
+            None => self.attributes.push((id, value)),
+        }
+    }
+
     pub fn flags(&self) -> i8 {
         match self.meta.get(&0) {
             Some(Meta::Byte(b)) => *b,
@@ -667,6 +738,36 @@ impl Entity {
         let s = self.size(table);
         let r = f64::from(s.w) / 2.0;
         (p, rc_physics::Aabb { min: [p[0] - r, p[1], p[2] - r], max: [p[0] + r, p[1] + f64::from(s.h), p[2] + r] })
+    }
+
+    /// `bounding_box(..).1`, kept from the previous call while its position, data, scale and
+    /// dimension table stay the same (`RUSTCRAFT_OPT_CACHED_ENTITY_BOXES`): between two ticks
+    /// nothing moves, so every frame after the first one of a tick reads the box back.
+    /// `framed_map` is only asked for item frames, and only when the box is computed.
+    pub fn cached_box(
+        &self,
+        table: &[[f32; 4]],
+        painting: &dyn Fn(i32) -> Option<(u8, u8)>,
+        framed_map: &dyn Fn(&Entity) -> bool,
+    ) -> rc_physics::Aabb {
+        let compute = || self.bounding_box(table, painting, self.facts.item_frame && framed_map(self)).1;
+        if !self.facts.box_cacheable {
+            return compute();
+        }
+        let key = BoxKey {
+            pos: self.pos.map(f64::to_bits),
+            meta: self.meta.stamp(),
+            scale: box_key_scale(self.scale),
+            table: (table.as_ptr() as usize, table.len()),
+        };
+        if let Some(c) = self.box_cache.get()
+            && c.key == key
+        {
+            return c.bb;
+        }
+        let bb = compute();
+        self.box_cache.set(Some(CachedBox { key, bb }));
+        bb
     }
 
     /// Shulker box: scaled cube pushed towards the face opposite the attachment, of the
@@ -1260,6 +1361,62 @@ impl Entities {
         }
     }
 
+    /// Vehicle that counts `rider` among its passengers: looked for among the vehicles of
+    /// `riders` (`from_list`), or among every entity (old path). A rider is listed by one
+    /// vehicle at most (`leave_previous_vehicles`), so both find the same one.
+    pub fn vehicle_carrying(&self, rider: i32, from_list: bool) -> Option<i32> {
+        if from_list {
+            let carries = |v: &i32| self.map.get(v).is_some_and(|e| e.passengers.contains(&rider));
+            self.riders.iter().copied().find(carries)
+        } else {
+            self.map.iter().find(|(_, e)| e.passengers.contains(&rider)).map(|(id, _)| *id)
+        }
+    }
+
+    /// Root vehicle of `id`: the one up its chain of vehicles that rides nothing (8 levels at most).
+    pub fn root_vehicle_of(&self, mut id: i32, from_list: bool) -> i32 {
+        for _ in 0..8 {
+            match self.vehicle_carrying(id, from_list) {
+                Some(v) => id = v,
+                None => break,
+            }
+        }
+        id
+    }
+
+    /// Vehicles whose passengers are seated first: those with passengers that ride no known
+    /// entity. From the vehicles of `riders` (`from_list`), or from every entity (old path).
+    pub fn seat_roots(&self, from_list: bool) -> Vec<i32> {
+        let root = |e: &Entity| !e.passengers.is_empty() && e.vehicle.is_none_or(|v| !self.map.contains_key(&v));
+        if from_list {
+            self.riders.iter().copied().filter(|id| self.map.get(id).is_some_and(root)).collect()
+        } else {
+            self.map.iter().filter(|(_, e)| root(e)).map(|(id, _)| *id).collect()
+        }
+    }
+
+    /// Passengers announced on `vehicle` leave the vehicle that listed them before, like the game,
+    /// which dismounts an entity before mounting it elsewhere. Otherwise, until the old vehicle's
+    /// own update, a passenger moved from one vehicle to another stays listed by both. Nothing
+    /// moves for an unknown vehicle (the game ignores the packet).
+    fn leave_previous_vehicles(&mut self, vehicle: i32, passengers: &[i32]) {
+        if !self.map.contains_key(&vehicle) {
+            return;
+        }
+        for &p in passengers {
+            let previous = if p == self.local {
+                self.vehicle_carrying(p, rider_list_on())
+            } else {
+                self.map.get(&p).and_then(|e| e.vehicle)
+            };
+            if let Some(old) = previous.filter(|&old| old != vehicle)
+                && let Some(v) = self.map.get_mut(&old)
+            {
+                v.passengers.retain(|&x| x != p);
+            }
+        }
+    }
+
     /// `rider` rides `vehicle`, directly or through other passengers (excluding `gone` entities).
     fn carries(&self, vehicle: i32, rider: i32, gone: &[i32]) -> bool {
         let mut todo = vec![vehicle];
@@ -1308,6 +1465,11 @@ impl Entities {
     pub fn apply(&mut self, ev: EntityEvent) {
         match ev {
             EntityEvent::Add(a) => {
+                // An id already in use: the old entity is removed first, like the game (its
+                // passengers get off, its vehicle forgets it).
+                if self.map.contains_key(&a.id) {
+                    self.apply(EntityEvent::Remove(vec![a.id]));
+                }
                 let kind = usize::try_from(a.kind)
                     .ok()
                     .and_then(|k| self.type_names.get(k))
@@ -1321,6 +1483,7 @@ impl Entities {
                     body = 0.0;
                 }
                 let pitch = if living { a.pitch.clamp(-90.0, 90.0) } else { a.pitch };
+                let facts = KindFacts::of(&kind);
                 self.map.insert(
                     a.id,
                     Entity {
@@ -1331,6 +1494,9 @@ impl Entities {
                         uuid: a.uuid,
                         interp,
                         class,
+                        facts,
+                        box_cache: std::cell::Cell::new(None),
+                        attributes: Vec::new(),
                         base: a.pos,
                         pos: a.pos,
                         pos_o: a.pos,
@@ -1601,6 +1767,11 @@ impl Entities {
                 }
             }
             EntityEvent::Passengers { vehicle, passengers } => {
+                // Unknown passengers are skipped, like the game (the server sends the packet again
+                // when it pairs them): a passenger is then always known while listed.
+                let known = |p: &i32| *p == self.local || self.map.contains_key(p);
+                let passengers: Vec<i32> = passengers.into_iter().filter(known).collect();
+                self.leave_previous_vehicles(vehicle, &passengers);
                 // Former passengers detached, new ones attached to the mount.
                 if !passengers.is_empty() && !self.riders.contains(&vehicle) {
                     self.riders.push(vehicle);
@@ -1742,7 +1913,8 @@ mod size_tests {
     /// boat goes back to the player; forgotten as soon as the player remounts or the id returns.
     #[test]
     fn teleport_of_removed_vehicle_goes_to_player() {
-        let mut all = Entities { type_names: vec!["minecraft:oak_boat".into()], ..Default::default() };
+        // The player (9) is the local one: a passenger the client knows.
+        let mut all = Entities { type_names: vec!["minecraft:oak_boat".into()], local: 9, ..Default::default() };
         for id in [1, 2] {
             let add = rc_proto_v777::entity::AddEntity {
                 id,

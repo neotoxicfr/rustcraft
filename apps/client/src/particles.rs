@@ -3798,10 +3798,11 @@ impl ParticleRenderer {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn assets() -> ParticleAssets {
+    /// One blank sprite for every particle: enough for code that only spawns particles.
+    pub(crate) fn assets() -> ParticleAssets {
         ParticleAssets {
             rects: vec![[0.0, 0.0, 16.0, 16.0]],
             translucent: vec![false],

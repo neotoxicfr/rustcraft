@@ -310,19 +310,114 @@ fn walk(from: [f64; 3], to: [f64; 3], test: impl Fn([i32; 3]) -> Option<Hit>) ->
 }
 
 /// Candidate entity: id, box, pick radius (box inflation for normal
-/// targeting), same root mount as the camera.
+/// targeting), same root mount as the camera, section of its block.
 pub struct Candidate {
     pub id: i32,
     pub bb: Aabb,
     pub radius: f64,
     pub same_vehicle: bool,
+    /// Section of the block the entity stands in: the game finds entities through the sections
+    /// they are stored in (`SectionRange`).
+    pub section: [i32; 3],
 }
 
 impl Candidate {
     fn picked_box(&self) -> Aabb {
-        let r = self.radius;
-        Aabb { min: self.bb.min.map(|v| v - r), max: self.bb.max.map(|v| v + r) }
+        inflate(&self.bb, self.radius)
     }
+}
+
+/// Section of the block holding `pos` (each coordinate floored, then divided by 16).
+pub fn section_of(pos: [f64; 3]) -> [i32; 3] {
+    pos.map(|v| (v.floor() as i32) >> 4)
+}
+
+/// Sections whose entities the game tests against a search box (`targeting.md` § 2): the box
+/// widened by 2 blocks across and by 4 blocks below, in section coordinates. An entity stored in
+/// a section outside is never found, even when its box overlaps the search box (very large or
+/// very tall entities).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SectionRange {
+    pub min: [i32; 3],
+    pub max: [i32; 3],
+}
+
+impl SectionRange {
+    pub fn of(search: &Aabb) -> SectionRange {
+        let s = |v: f64| (v.floor() as i32) >> 4;
+        SectionRange {
+            min: [s(search.min[0] - 2.0), s(search.min[1] - 4.0), s(search.min[2] - 2.0)],
+            max: [s(search.max[0] + 2.0), s(search.max[1]), s(search.max[2] + 2.0)],
+        }
+    }
+
+    pub fn holds(&self, section: [i32; 3]) -> bool {
+        (0..3).all(|i| self.min[i] <= section[i] && section[i] <= self.max[i])
+    }
+}
+
+fn inflate(b: &Aabb, r: f64) -> Aabb {
+    Aabb { min: b.min.map(|v| v - r), max: b.max.map(|v| v + r) }
+}
+
+/// The box extended toward a movement (the side matching the sign of each component).
+fn expand_towards(b: &Aabb, d: [f64; 3]) -> Aabb {
+    let mut out = *b;
+    for ((lo, hi), v) in out.min.iter_mut().zip(out.max.iter_mut()).zip(d) {
+        if v < 0.0 {
+            *lo += v;
+        } else {
+            *hi += v;
+        }
+    }
+    out
+}
+
+/// Boxes that overlap with some volume (touching faces do not count).
+fn overlaps(a: &Aabb, b: &Aabb) -> bool {
+    (0..3).all(|i| a.min[i] < b.max[i] && a.max[i] > b.min[i])
+}
+
+/// Entity search of the game over a search box: section in range and box overlapping. Every
+/// targeting filters its candidates with it before any ray test.
+struct Search {
+    area: Aabb,
+    sections: SectionRange,
+}
+
+impl Search {
+    fn new(area: Aabb) -> Search {
+        Search { sections: SectionRange::of(&area), area }
+    }
+
+    fn finds(&self, c: &Candidate) -> bool {
+        self.sections.holds(c.section) && overlaps(&self.area, &c.bb)
+    }
+}
+
+/// Search box of normal targeting: the camera entity's box stretched along the gaze to the
+/// reach (shortened to the block hit), inflated by 1.
+pub fn gaze_search_box(camera_box: &Aabb, dir: [f64; 3], reach: f64) -> Aabb {
+    inflate(&expand_towards(camera_box, dir.map(|v| v * reach)), 1.0)
+}
+
+/// Search box of attack-range targeting: a cube of side `margin` around `from`, stretched to `to`,
+/// inflated by 1.
+pub fn attack_search_box(from: [f64; 3], to: [f64; 3], margin: f64) -> Aabb {
+    let h = margin / 2.0;
+    let cube = Aabb { min: from.map(|v| v - h), max: from.map(|v| v + h) };
+    inflate(&expand_towards(&cube, sub(to, from)), 1.0)
+}
+
+/// Search box of the targeting along the gaze (brush): the camera entity's box stretched by the
+/// whole segment `eye` → `to`, inflated by 1.
+pub fn along_search_box(eye: [f64; 3], to: [f64; 3], camera_box: &Aabb) -> Aabb {
+    inflate(&expand_towards(camera_box, sub(to, eye)), 1.0)
+}
+
+/// Smallest box holding both.
+pub fn hull(a: &Aabb, b: &Aabb) -> Aabb {
+    Aabb { min: std::array::from_fn(|i| a.min[i].min(b.min[i])), max: std::array::from_fn(|i| a.max[i].max(b.max[i])) }
 }
 
 /// Entry point of the segment into a box.
@@ -332,10 +427,13 @@ fn clip_box(b: &Aabb, from: [f64; 3], to: [f64; 3]) -> Option<[f64; 3]> {
     box_face(b, from, &mut s, None, d).map(|_| [from[0] + s * d[0], from[1] + s * d[1], from[2] + s * d[2]])
 }
 
-/// Full targeting: eyes `eye`, unit view vector `dir`, block and entity ranges.
+/// Full targeting: eyes `eye`, unit view vector `dir`, current box of the camera entity
+/// `camera_box`, block and entity ranges.
+#[allow(clippy::too_many_arguments)]
 pub fn pick<'a>(
     eye: [f64; 3],
     dir: [f64; 3],
+    camera_box: &Aabb,
     block_range: f64,
     entity_range: f64,
     shape: &dyn Fn(i32, i32, i32) -> Shape<'a>,
@@ -356,9 +454,10 @@ pub fn pick<'a>(
         max = max2.sqrt();
     }
     let to = [eye[0] + dir[0] * max, eye[1] + dir[1] * max, eye[2] + dir[2] * max];
+    let search = Search::new(gaze_search_box(camera_box, dir, max));
     let mut nearest = max2;
     let mut hovered: Option<(i32, [f64; 3])> = None;
-    for c in entities {
+    for c in entities.filter(|c| search.finds(c)) {
         let bb = c.picked_box();
         let clip = clip_box(&bb, eye, to);
         if contains(&bb, eye) {
@@ -429,8 +528,9 @@ pub fn pick_attack<'a>(
         }
     }
     let m = reach.margin;
+    let search = Search::new(attack_search_box(from, to, m));
     let mut best: Option<(f64, i32, [f64; 3])> = None;
-    for c in entities {
+    for c in entities.filter(|c| search.finds(c)) {
         let bb = c.bb;
         let p = if contains(&bb, from) {
             Some(from)
@@ -488,10 +588,13 @@ fn clip_with_border<'a>(
 
 /// Targeting of an item along the gaze (brush): blocks from `eye` to `to` (shapes given, border
 /// `border` included), then the entity whose exact box cuts the segment shortened to the block, the
-/// closest one (start inside a box: ignored). Otherwise the block, or `Miss`.
+/// closest one (start inside a box: ignored). Otherwise the block, or `Miss`. The entities searched
+/// are those of the camera entity's box `camera_box` stretched to `to` (not shortened), inflated by 1.
+#[allow(clippy::too_many_arguments)]
 pub fn pick_along<'a>(
     eye: [f64; 3],
     to: [f64; 3],
+    camera_box: &Aabb,
     shape: &dyn Fn(i32, i32, i32) -> Shape<'a>,
     interaction: Interaction<'a, '_>,
     border: [f64; 4],
@@ -502,8 +605,9 @@ pub fn pick_along<'a>(
         Some(Hit::Block { at, .. }) => at,
         _ => to,
     };
+    let search = Search::new(along_search_box(eye, to, camera_box));
     let mut best: Option<(f64, i32, [f64; 3])> = None;
-    for c in entities {
+    for c in entities.filter(|c| search.finds(c)) {
         if contains(&c.bb, eye) {
             continue;
         }
@@ -533,6 +637,11 @@ fn filter_block(block: Option<Hit>, eye: [f64; 3], range: f64) -> Hit {
 mod tests {
     use super::*;
 
+    /// Camera entity of the tests: a standing player whose eyes are at `eye`.
+    fn camera(eye: [f64; 3]) -> Aabb {
+        Aabb { min: [eye[0] - 0.3, eye[1] - 1.62, eye[2] - 0.3], max: [eye[0] + 0.3, eye[1] + 0.18, eye[2] + 0.3] }
+    }
+
     const FULL: [Aabb; 1] = [Aabb { min: [0.0; 3], max: [1.0; 3] }];
     /// Distant border (no effect).
     const OPEN: [f64; 4] = [-3.0e7, 3.0e7, -3.0e7, 3.0e7];
@@ -547,6 +656,7 @@ mod tests {
             bb: Aabb { min: [-0.45, 64.0, 3.8], max: [0.45, 65.4, 4.7] },
             radius: 0.0,
             same_vehicle: false,
+            section: [0, 4, 0],
         };
         let empty = |_: i32, _: i32, _: i32| plain(&[]);
         let eye = [0.0, 64.62, 0.0];
@@ -591,7 +701,7 @@ mod tests {
 
     #[test]
     fn looks_down_at_floor() {
-        let h = pick([0.5, 65.62, 0.5], [0.0, -1.0, 0.0], 4.5, 3.0, &floor_at(63), &no_interaction, std::iter::empty());
+        let h = pick([0.5, 65.62, 0.5], [0.0, -1.0, 0.0], &camera([0.5, 65.62, 0.5]), 4.5, 3.0, &floor_at(63), &no_interaction, std::iter::empty());
         match h {
             Hit::Block { pos, face, at, inside } => {
                 assert_eq!((pos, face, inside), ([0, 63, 0], UP, false));
@@ -603,7 +713,7 @@ mod tests {
 
     #[test]
     fn out_of_reach_is_miss() {
-        let h = pick([0.5, 70.0, 0.5], [0.0, -1.0, 0.0], 4.5, 3.0, &floor_at(63), &no_interaction, std::iter::empty());
+        let h = pick([0.5, 70.0, 0.5], [0.0, -1.0, 0.0], &camera([0.5, 70.0, 0.5]), 4.5, 3.0, &floor_at(63), &no_interaction, std::iter::empty());
         assert_eq!(h, Hit::Miss);
     }
 
@@ -612,16 +722,55 @@ mod tests {
         let shape = |x: i32, y: i32, z: i32| plain(if (x, y, z) == (2, 64, 0) { &SLAB[..] } else { &[][..] });
         let d = [2.0f64, -1.0, 0.0];
         let n = (d[0] * d[0] + d[1] * d[1]).sqrt();
-        let h = pick([0.5, 65.62, 0.5], [d[0] / n, d[1] / n, 0.0], 4.5, 3.0, &shape, &no_interaction, std::iter::empty());
+        let h = pick([0.5, 65.62, 0.5], [d[0] / n, d[1] / n, 0.0], &camera([0.5, 65.62, 0.5]), 4.5, 3.0, &shape, &no_interaction, std::iter::empty());
         assert!(matches!(h, Hit::Block { pos: [2, 64, 0], face: UP, .. }), "{h:?}");
+    }
+
+    /// The game finds entities through their section: a box 15 blocks tall whose top the gaze
+    /// crosses is found only while its feet stand in a section reaching 4 blocks under the search
+    /// box (camera box from y = 76, inflated by 1: sections from (75 − 4) / 16 = 4).
+    #[test]
+    fn tall_entity_found_by_the_section_of_its_feet() {
+        let eye = [0.5, 77.62, 0.5];
+        let tall = |section_y: i32| Candidate {
+            id: 3,
+            bb: Aabb { min: [-1.0, 63.5, 2.0], max: [2.0, 78.5, 3.0] },
+            radius: 0.0,
+            same_vehicle: false,
+            section: [0, section_y, 0],
+        };
+        let empty = |_: i32, _: i32, _: i32| plain(&[]);
+        let aim = |c: Candidate| pick(eye, [0.0, 0.0, 1.0], &camera(eye), 4.5, 3.0, &empty, &no_interaction, std::iter::once(c));
+        assert_eq!(aim(tall(3)), Hit::Miss, "feet in the section below the search");
+        assert!(matches!(aim(tall(4)), Hit::Entity { id: 3, .. }));
+    }
+
+    /// Search along the gaze: a box beside the gaze is not even tested once out of the search box
+    /// (inflated by 1), while a pick radius of 1 inside it still reaches the gaze.
+    #[test]
+    fn search_box_keeps_what_the_radius_reaches() {
+        let eye = [0.5, 65.62, 0.5];
+        let fireball = |x: f64| Candidate {
+            id: 4,
+            bb: Aabb { min: [x, 65.0, 2.0], max: [x + 1.0, 66.0, 3.0] },
+            radius: 1.0,
+            same_vehicle: false,
+            section: [0, 4, 0],
+        };
+        let empty = |_: i32, _: i32, _: i32| plain(&[]);
+        let aim = |c: Candidate| pick(eye, [0.0, 0.0, 1.0], &camera(eye), 4.5, 3.0, &empty, &no_interaction, std::iter::once(c));
+        // 0.9 beside the gaze: the radius brings it on the gaze.
+        assert!(matches!(aim(fireball(1.4)), Hit::Entity { id: 4, .. }));
+        // 1.4 beside: outside the radius anyway.
+        assert_eq!(aim(fireball(1.9)), Hit::Miss);
     }
 
     #[test]
     fn entity_in_front_of_block() {
         let cow =
-            Candidate { id: 7, bb: Aabb { min: [-0.45, 64.0, 1.5], max: [0.45, 65.4, 2.4] }, radius: 0.0, same_vehicle: false };
+            Candidate { id: 7, bb: Aabb { min: [-0.45, 64.0, 1.5], max: [0.45, 65.4, 2.4] }, radius: 0.0, same_vehicle: false, section: [0, 4, 0] };
         let shape = |_: i32, _: i32, z: i32| plain(if z == 3 { &FULL[..] } else { &[][..] });
-        let h = pick([0.0, 64.62, 0.0], [0.0, 0.0, 1.0], 4.5, 3.0, &shape, &no_interaction, std::iter::once(cow));
+        let h = pick([0.0, 64.62, 0.0], [0.0, 0.0, 1.0], &camera([0.0, 64.62, 0.0]), 4.5, 3.0, &shape, &no_interaction, std::iter::once(cow));
         assert!(matches!(h, Hit::Entity { id: 7, .. }), "{h:?}");
     }
 
@@ -629,9 +778,9 @@ mod tests {
     fn entity_beyond_entity_range_is_miss_not_block() {
         // Entity at 3.5 (beyond 3) in front of a block at 4: the block is behind, nothing is targeted.
         let cow =
-            Candidate { id: 7, bb: Aabb { min: [-0.45, 64.0, 3.5], max: [0.45, 65.4, 3.9] }, radius: 0.0, same_vehicle: false };
+            Candidate { id: 7, bb: Aabb { min: [-0.45, 64.0, 3.5], max: [0.45, 65.4, 3.9] }, radius: 0.0, same_vehicle: false, section: [0, 4, 0] };
         let shape = |_: i32, _: i32, z: i32| plain(if z == 4 { &FULL[..] } else { &[][..] });
-        let h = pick([0.0, 64.62, 0.0], [0.0, 0.0, 1.0], 4.5, 3.0, &shape, &no_interaction, std::iter::once(cow));
+        let h = pick([0.0, 64.62, 0.0], [0.0, 0.0, 1.0], &camera([0.0, 64.62, 0.0]), 4.5, 3.0, &shape, &no_interaction, std::iter::once(cow));
         assert_eq!(h, Hit::Miss);
     }
 
@@ -645,10 +794,11 @@ mod tests {
             bb: Aabb { min: [-0.45, 64.0, 3.8], max: [0.45, 65.4, 4.7] },
             radius: 0.0,
             same_vehicle: false,
+            section: [0, 4, 0],
         };
         let eye = [0.0, 64.62, 0.0];
         let empty = |_: i32, _: i32, _: i32| plain(&[]);
-        assert_eq!(pick(eye, [0.0, 0.0, 1.0], 4.5, 3.0, &empty, &no_interaction, std::iter::once(far())), Hit::Miss);
+        assert_eq!(pick(eye, [0.0, 0.0, 1.0], &camera(eye), 4.5, 3.0, &empty, &no_interaction, std::iter::once(far())), Hit::Miss);
         let h = pick_attack(eye, [0.0, 0.0, 1.0], reach, 0.0, 4.5, OPEN, &empty, &no_interaction, std::iter::once(far()));
         match h {
             Hit::Entity { id: 7, at } => assert!((at[2] - 3.8).abs() < 1e-9, "{at:?}"),
@@ -659,6 +809,7 @@ mod tests {
             bb: Aabb { min: [-0.45, 64.0, 0.5], max: [0.45, 65.4, 1.4] },
             radius: 0.0,
             same_vehicle: false,
+            section: [0, 4, 0],
         };
         let h = pick_attack(eye, [0.0, 0.0, 1.0], reach, 0.0, 4.5, OPEN, &empty, &no_interaction, std::iter::once(near));
         assert_eq!(h, Hit::Miss);
@@ -674,6 +825,7 @@ mod tests {
             bb: Aabb { min: [0.1, 64.0, 2.0], max: [1.0, 65.0, 3.0] },
             radius: 0.0,
             same_vehicle: false,
+            section: [0, 4, 0],
         };
         let empty = |_: i32, _: i32, _: i32| plain(&[]);
         let h = pick_attack([0.0, 64.5, 0.0], [0.0, 0.0, 1.0], reach, 0.0, 4.5, OPEN, &empty, &no_interaction, std::iter::once(c));
@@ -701,12 +853,12 @@ mod tests {
         let (dx, dy) = (0.65f64, -1.0f64);
         let n = (dx * dx + dy * dy).sqrt();
         let dir = [dx / n, dy / n, 0.0];
-        let h = pick([0.3, 65.5, 0.5], dir, 4.5, 3.0, &shape, &inside, std::iter::empty());
+        let h = pick([0.3, 65.5, 0.5], dir, &camera([0.3, 65.5, 0.5]), 4.5, 3.0, &shape, &inside, std::iter::empty());
         match h {
             Hit::Block { pos: [0, 64, 0], face: UP, at, inside: false } => assert!((at[0] - 0.875).abs() < 1e-9, "{at:?}"),
             _ => panic!("{h:?}"),
         }
-        let h = pick([0.3, 65.5, 0.5], dir, 4.5, 3.0, &shape, &no_interaction, std::iter::empty());
+        let h = pick([0.3, 65.5, 0.5], dir, &camera([0.3, 65.5, 0.5]), 4.5, 3.0, &shape, &no_interaction, std::iter::empty());
         assert!(matches!(h, Hit::Block { face: WEST, .. }), "{h:?}");
     }
 
@@ -720,16 +872,17 @@ mod tests {
             bb: Aabb { min: [-0.45, 64.0, z0], max: [0.45, 65.4, z1] },
             radius: 0.0,
             same_vehicle: false,
+            section: [0, 4, 0],
         };
         let (eye, to) = ([0.0, 64.62, 0.0], [0.0, 64.62, 4.5]);
-        let h = pick_along(eye, to, &shape, &no_interaction, OPEN, std::iter::once(cow(7, 1.5, 2.4)));
+        let h = pick_along(eye, to, &camera(eye), &shape, &no_interaction, OPEN, std::iter::once(cow(7, 1.5, 2.4)));
         assert!(matches!(h, Hit::Entity { id: 7, at } if (at[2] - 1.5).abs() < 1e-9), "{h:?}");
-        let h = pick_along(eye, to, &shape, &no_interaction, OPEN, std::iter::once(cow(8, -0.5, 0.5)));
+        let h = pick_along(eye, to, &camera(eye), &shape, &no_interaction, OPEN, std::iter::once(cow(8, -0.5, 0.5)));
         assert!(matches!(h, Hit::Block { pos: [0, 64, 3], face: NORTH, .. }), "{h:?}");
-        let h = pick_along(eye, to, &shape, &no_interaction, OPEN, std::iter::once(cow(9, 3.2, 4.0)));
+        let h = pick_along(eye, to, &camera(eye), &shape, &no_interaction, OPEN, std::iter::once(cow(9, 3.2, 4.0)));
         assert!(matches!(h, Hit::Block { .. }), "entity behind the block: {h:?}");
         let empty = |_: i32, _: i32, _: i32| plain(&[]);
-        assert_eq!(pick_along(eye, to, &empty, &no_interaction, OPEN, std::iter::empty()), Hit::Miss);
+        assert_eq!(pick_along(eye, to, &camera(eye), &empty, &no_interaction, OPEN, std::iter::empty()), Hit::Miss);
     }
 
     /// Flower offset toward +x: a ray passing to the left of the model (at the center of the unshifted block)
@@ -741,9 +894,9 @@ mod tests {
         let shift = [0.25, 0.0, 0.0];
         let shape = |x: i32, y: i32, z: i32| if (x, y, z) == (0, 64, 2) { (&FLOWER[..], shift) } else { plain(&[]) };
         // Horizontal ray at x = 0.4: inside the centered shape, outside the shifted shape (0.5625..0.9375).
-        let miss = pick([0.4, 64.3, 0.5], [0.0, 0.0, 1.0], 4.5, 3.0, &shape, &no_interaction, std::iter::empty());
+        let miss = pick([0.4, 64.3, 0.5], [0.0, 0.0, 1.0], &camera([0.4, 64.3, 0.5]), 4.5, 3.0, &shape, &no_interaction, std::iter::empty());
         assert_eq!(miss, Hit::Miss);
-        let hit = pick([0.8, 64.3, 0.5], [0.0, 0.0, 1.0], 4.5, 3.0, &shape, &no_interaction, std::iter::empty());
+        let hit = pick([0.8, 64.3, 0.5], [0.0, 0.0, 1.0], &camera([0.8, 64.3, 0.5]), 4.5, 3.0, &shape, &no_interaction, std::iter::empty());
         match hit {
             Hit::Block { pos, face, at, .. } => {
                 assert_eq!((pos, face), ([0, 64, 2], NORTH));

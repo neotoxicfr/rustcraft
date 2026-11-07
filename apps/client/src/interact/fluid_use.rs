@@ -54,12 +54,22 @@ fn fluid_kind(data: &rc_data::VersionData, s: u32) -> u8 {
     }
 }
 
+/// Boat, raft or minecart: from the facts of its type (`RUSTCRAFT_OPT_KIND_ID_FILTERS`), or from
+/// its name (old path).
+fn vehicle_like(e: &crate::entities::Entity) -> bool {
+    if crate::entities::kind_id_filters_on() {
+        return e.facts.vehicle_like;
+    }
+    let k = e.kind.as_str();
+    k.ends_with("boat") || k.ends_with("raft") || k.ends_with("minecart")
+}
+
 /// Entity that blocks the placement of a boat: vehicles (boats, rafts, minecarts) and every
 /// living pushable creature (hence happy ghast, shulker, remote players), except bats,
 /// armor stands and mounts already ridden.
 fn blocks_boat(e: &crate::entities::Entity) -> bool {
     let k = e.kind.as_str();
-    if k.ends_with("boat") || k.ends_with("raft") || k.ends_with("minecart") {
+    if vehicle_like(e) {
         return true;
     }
     if e.class == crate::entities::Kind::Other || matches!(k, "bat" | "armor_stand") {
@@ -148,10 +158,9 @@ impl crate::App {
             let hw = f64::from(s.w) / 2.0;
             ([e.pos[0] - hw, e.pos[1], e.pos[2] - hw], [e.pos[0] + hw, e.pos[1] + f64::from(s.h), e.pos[2] + hw])
         };
-        let vehicle = |k: &str| k.ends_with("boat") || k.ends_with("raft") || k.ends_with("minecart");
         // A targetable entity enclosing the eyes: nothing.
         let wrapped = self.entities.map.iter().any(|(&id, e)| {
-            if id == local || !(e.class != crate::entities::Kind::Other || vehicle(&e.kind)) {
+            if id == local || !(e.class != crate::entities::Kind::Other || vehicle_like(e)) {
                 return false;
             }
             let (lo, hi) = boxed(e);
