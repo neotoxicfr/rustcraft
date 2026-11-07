@@ -3351,7 +3351,7 @@ impl Particles {
     }
 
     /// Instances of the frame: interpolation, size, sprite, colour and light; opaque then
-    /// translucent, in insertion order. `in_view`: box (relative to the origin) visible.
+    /// translucent, in insertion order. `cull`: which tick positions (relative to the origin) are drawn.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &mut self,
@@ -3361,7 +3361,7 @@ impl Particles {
         yaw: f32,
         pitch: f32,
         pt: f32,
-        in_view: &dyn Fn([f32; 3], [f32; 3]) -> bool,
+        cull: ParticleCull<'_>,
     ) {
         let t0 = Instant::now();
         if let Some(img) = self.assets.image.take() {
@@ -3375,12 +3375,12 @@ impl Particles {
         let a = &self.assets;
         let pt64 = f64::from(pt);
         for p in &self.quads {
-            let rel = |v: [f64; 3]| [(v[0] - origin[0]) as f32, v[1] as f32, (v[2] - origin[1]) as f32];
-            let now = rel(p.pos);
-            if !in_view(now, now) {
+            // The rejections that read no position first: the culling test is the dearer one.
+            if p.kind == K::Shriek && p.param[0] > 0.0 || p.hidden() {
                 continue;
             }
-            if p.kind == K::Shriek && p.param[0] > 0.0 || p.hidden() {
+            let rel = |v: [f64; 3]| [(v[0] - origin[0]) as f32, v[1] as f32, (v[2] - origin[1]) as f32];
+            if !cull.shows(rel(p.pos)) {
                 continue;
             }
             let (size, alpha) = p.render_size(pt);
@@ -3445,6 +3445,26 @@ impl Particles {
         }
         self.stats.prepare_s += t0.elapsed().as_secs_f64();
         self.stats.frames += 1;
+    }
+}
+
+/// How the frame decides which particles are drawn.
+#[derive(Clone, Copy)]
+pub enum ParticleCull<'a> {
+    /// The game's test (`RUSTCRAFT_OPT_PARTICLE_GAME_FRUSTUM`, default): tick position in the
+    /// frustum whose eye is moved back three blocks, no occlusion (`visibility.md`, particles).
+    GameFrustum(&'a crate::render::ParticleFrustum),
+    /// The test before (`=0`): the entities' visibility test on the tick position, occlusion included.
+    LikeEntities(&'a crate::render::FrameVisibility),
+}
+
+impl ParticleCull<'_> {
+    #[inline]
+    fn shows(&self, p: [f32; 3]) -> bool {
+        match self {
+            ParticleCull::GameFrustum(frustum) => frustum.contains_point(p),
+            ParticleCull::LikeEntities(visibility) => visibility.point(p),
+        }
     }
 }
 

@@ -1408,7 +1408,7 @@ impl EntityRenderer {
             // camera around the eye of the frame.
             Kind::Banner | Kind::Skull | Kind::DecoratedPot => {
                 let none = |_: i32, _: i32, _: i32| (0u8, 0u8);
-                let all = |_: [f32; 3], _: [f32; 3]| true;
+                let all = crate::render::FrameVisibility::everything();
                 let air = |_: i32, _: i32, _: i32| 0u32;
                 let plain = |_: i32, _: i32, _: i32| [0xff_ffff; 4];
                 let f = super::BlockFrame {

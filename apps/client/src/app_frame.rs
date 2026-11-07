@@ -819,7 +819,15 @@ impl App {
             player: None,
             scope: None,
         };
-        self.particles.prepare(&mut r.particles, &pw, shot.pos, shot.yaw, shot.pitch, pt, &in_view);
+        // The game tests a particle against the frustum moved back three blocks, without the
+        // occlusion of the entities (`RUSTCRAFT_OPT_PARTICLE_GAME_FRUSTUM=0`: the entities' test).
+        let particle_frustum = rc_data::opt_switch!("RUSTCRAFT_OPT_PARTICLE_GAME_FRUSTUM")
+            .then(|| r.particle_frustum(shot.pos, shot.yaw, shot.pitch, frame_env.far));
+        let cull = match &particle_frustum {
+            Some(frustum) => particles::ParticleCull::GameFrustum(frustum),
+            None => particles::ParticleCull::LikeEntities(&in_view),
+        };
+        self.particles.prepare(&mut r.particles, &pw, shot.pos, shot.yaw, shot.pitch, pt, cull);
         {
             let view =
                 environ::WorldView { grid: &self.world.grid, min_y: self.world.min_y, height: self.world.height };
