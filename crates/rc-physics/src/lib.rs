@@ -35,6 +35,21 @@ pub struct Aabb {
 }
 
 impl Aabb {
+    /// Unbounded box: holds every box.
+    pub const EVERYWHERE: Aabb = Aabb { min: [f64::NEG_INFINITY; 3], max: [f64::INFINITY; 3] };
+    /// The unit cube of a cell.
+    pub const UNIT: Aabb = Aabb { min: [0.0; 3], max: [1.0; 3] };
+    /// Empty reach: inverted box that overlaps nothing.
+    pub const NOTHING: Aabb = Aabb { min: [f64::INFINITY; 3], max: [f64::NEG_INFINITY; 3] };
+
+    /// Smallest box holding both.
+    pub fn union(&self, o: &Aabb) -> Aabb {
+        Aabb {
+            min: std::array::from_fn(|a| self.min[a].min(o.min[a])),
+            max: std::array::from_fn(|a| self.max[a].max(o.max[a])),
+        }
+    }
+
     pub fn offset(&self, x: f64, y: f64, z: f64) -> Aabb {
         Aabb {
             min: [self.min[0] + x, self.min[1] + y, self.min[2] + z],
@@ -87,7 +102,29 @@ pub trait World {
     fn min_y(&self) -> i32 {
         -64
     }
+    /// Local box (relative to a cell) holding every box that `collision` and `moving_collision`
+    /// can give for the cells `lo..=hi`: the collision walk skips the cells whose boxes cannot
+    /// reach the searched zone. Unbounded by default (every cell is read); an envelope that
+    /// adds shapes returns the union of its own and those of the world it wraps.
+    fn shape_reach(&self, _lo: [i32; 3], _hi: [i32; 3]) -> Aabb {
+        Aabb::EVERYWHERE
+    }
+    /// States of the cells `first..=last` into `out` (x fastest, then z, then y; [`UNLOADED`]
+    /// where `state` gives `None`), exactly as `state` gives them one by one, for a world that
+    /// finds a column once for all its cells; false (the default) for a world read cell by cell,
+    /// `out` then untouched. `out` holds exactly the cells of the span.
+    fn states_in(&self, _first: [i32; 3], _last: [i32; 3], _out: &mut [u32]) -> bool {
+        false
+    }
+    /// `collision` of the cell (x, y, z) whose state the walk already read through `states_in`
+    /// (`None`: unloaded). The default reads it again.
+    fn collision_of_state(&self, _state: Option<u32>, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        self.collision(x, y, z, out)
+    }
 }
+
+/// State written by `World::states_in` for an unloaded cell (no state is that high).
+pub const UNLOADED: u32 = u32::MAX;
 
 /// The world as seen by the local player's collision searches: scaffolding and powder
 /// snow have a shape that depends on it (feet height, Shift, fall, boots); the rest
@@ -113,15 +150,11 @@ impl CtxWorld<'_> {
     fn above(&self, top: f64) -> bool {
         self.bottom > top - f64::from(1.0e-5f32)
     }
-}
 
-impl World for CtxWorld<'_> {
-    fn state(&self, x: i32, y: i32, z: i32) -> Option<u32> {
-        self.w.state(x, y, z)
-    }
-
-    fn collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
-        let Some(s) = self.w.state(x, y, z) else { return false };
+    /// Collision of a cell of row `y` holding `state`, as the player sees it; `world` gives the
+    /// wrapped world's own collision for the other states.
+    fn player_collision(&self, state: Option<u32>, y: i32, out: &mut Vec<Aabb>, world: impl FnOnce(&mut Vec<Aabb>) -> bool) -> bool {
+        let Some(s) = state else { return false };
         let k = self.t.special.of(s);
         let fy = f64::from(y);
         match k & 0x0F {
@@ -145,8 +178,28 @@ impl World for CtxWorld<'_> {
                 }
                 false
             }
-            _ => self.w.collision(x, y, z, out),
+            _ => world(out),
         }
+    }
+}
+
+impl World for CtxWorld<'_> {
+    fn state(&self, x: i32, y: i32, z: i32) -> Option<u32> {
+        self.w.state(x, y, z)
+    }
+
+    fn collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        self.player_collision(self.w.state(x, y, z), y, out, |out| self.w.collision(x, y, z, out))
+    }
+
+    fn states_in(&self, first: [i32; 3], last: [i32; 3], out: &mut [u32]) -> bool {
+        self.w.states_in(first, last, out)
+    }
+
+    /// The state the walk read serves both the player's rules and the wrapped world (one read
+    /// per cell instead of two).
+    fn collision_of_state(&self, state: Option<u32>, x: i32, y: i32, z: i32, out: &mut Vec<Aabb>) -> bool {
+        self.player_collision(state, y, out, |out| self.w.collision_of_state(state, x, y, z, out))
     }
 
     fn border(&self) -> Option<&WorldBorder> {
@@ -163,6 +216,12 @@ impl World for CtxWorld<'_> {
 
     fn min_y(&self) -> i32 {
         self.w.min_y()
+    }
+
+    /// The scaffolding shapes (platform from the tables, bottom slab) and the powder snow ones all
+    /// stay inside the unit cube (`scaffolding_shapes_stay_in_their_cell`).
+    fn shape_reach(&self, lo: [i32; 3], hi: [i32; 3]) -> Aabb {
+        self.w.shape_reach(lo, hi).union(&Aabb::UNIT)
     }
 }
 
@@ -245,6 +304,14 @@ pub struct Tables {
     /// synthetic test tables (falls back to the shape).
     top: Vec<f64>,
     oversized: Vec<bool>,
+    /// Smallest local box holding the unit cube and every collision box of the states
+    /// ([`Tables::shape_reach`]); unbounded in the synthetic test tables.
+    shape_reach: Aabb,
+    /// Same for the states whose shape stays in its cell sideways and below
+    /// ([`Tables::common_shape_reach`]).
+    common_shape_reach: Aabb,
+    /// Extent of the collision shape per state; empty in the synthetic test tables.
+    shape_extent: Vec<ShapeExtent>,
     pub friction: Vec<f32>,
     pub speed_factor: Vec<f32>,
     pub jump_factor: Vec<f32>,
@@ -272,6 +339,28 @@ pub struct Tables {
     special: Special,
     /// Pistons: bases, heads, moving blocks, slime and honey.
     piston: piston::PistonStates,
+}
+
+/// Where the collision shape of a state lies, for the collision walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShapeExtent {
+    /// No collision box.
+    Empty,
+    /// Boxes within their cell sideways and below (they may rise above it, like fences).
+    InCell,
+    /// A box leaves the cell sideways or below (piston heads, pitcher crops in 26.3).
+    Spills,
+}
+
+impl ShapeExtent {
+    fn of(shape: &[Aabb]) -> ShapeExtent {
+        let spills = |b: &Aabb| b.min.iter().any(|&v| v < 0.0) || b.max[0] > 1.0 || b.max[2] > 1.0;
+        match shape {
+            [] => ShapeExtent::Empty,
+            _ if shape.iter().any(spills) => ShapeExtent::Spills,
+            _ => ShapeExtent::InCell,
+        }
+    }
 }
 
 /// Per-state data of the blocks with player-specific rules; empty by default (no case).
@@ -393,10 +482,19 @@ impl Tables {
             d.states.iter().map(|s| f(&d.blocks[s.block as usize])).collect()
         };
         let top = shapes.iter().map(|v| top_of(v).unwrap_or(f64::NEG_INFINITY)).collect();
+        let shape_extent: Vec<ShapeExtent> = shapes.iter().map(|v| ShapeExtent::of(v)).collect();
+        let reach_of = |keep: &dyn Fn(ShapeExtent) -> bool| {
+            shapes.iter().zip(&shape_extent).filter(|(_, e)| keep(**e)).flat_map(|(v, _)| v).fold(Aabb::UNIT, |r, b| r.union(b))
+        };
+        let shape_reach = reach_of(&|_| true);
+        let common_shape_reach = reach_of(&|e| e != ShapeExtent::Spills);
         Tables {
             shapes,
             top,
             oversized,
+            shape_reach,
+            common_shape_reach,
+            shape_extent,
             friction: per_block(&|b| b.friction),
             speed_factor: per_block(&|b| b.speed_factor),
             jump_factor: per_block(&|b| b.jump_factor),
@@ -513,6 +611,37 @@ impl Tables {
         self.oversized.get(i).copied().unwrap_or(false)
     }
 
+    /// Local box holding every collision box of every state (and the unit cube): −0.25 to 1.25
+    /// sideways and 1.5 high in 26.3. The collision walk skips the cells out of its reach.
+    pub fn shape_reach(&self) -> Aabb {
+        self.shape_reach
+    }
+
+    /// The same for the states that stay in their cell sideways and below (all but piston heads
+    /// and pitcher crops): the unit cube up to 1.5 high (fences, walls). Without such a state
+    /// around, the walk needs neither the side margins nor the top one.
+    pub fn common_shape_reach(&self) -> Aabb {
+        self.common_shape_reach
+    }
+
+    /// Extent of the collision shape of the state (`Spills` when unknown: never too narrow).
+    pub fn shape_extent(&self, state: u32) -> ShapeExtent {
+        self.shape_extent.get(state as usize).copied().unwrap_or(ShapeExtent::Spills)
+    }
+
+    /// Reach of the shapes held by some sections, from what their palettes answer: `may_hold(pred)`
+    /// tells whether one of the sections may hold a state satisfying `pred` (`Container::may_contain`).
+    /// No block is read; nothing at all ([`Aabb::NOTHING`]) when no state there has a shape.
+    pub fn reach_from_palettes(&self, may_hold: impl Fn(&dyn Fn(u32) -> bool) -> bool) -> Aabb {
+        if may_hold(&|s| self.shape_extent(s) == ShapeExtent::Spills) {
+            self.shape_reach
+        } else if may_hold(&|s| self.shape_extent(s) != ShapeExtent::Empty) {
+            self.common_shape_reach
+        } else {
+            Aabb::NOTHING
+        }
+    }
+
     /// Local collision boxes of the state, borrowed (empty for an unknown state).
     pub fn shape(&self, state: u32) -> &[Aabb] {
         self.shapes.get(state as usize).map_or(&[], Vec::as_slice)
@@ -544,6 +673,16 @@ impl Tables {
     /// The occupied block is a scaffolding.
     pub fn is_scaffolding(&self, s: u32) -> bool {
         self.special.of(s) & 0x0F == SP_SCAFFOLDING
+    }
+
+    /// The state is powder snow (a flag per state: no block name compared).
+    pub fn is_powder_snow(&self, s: u32) -> bool {
+        self.special.of(s) & 0x0F == SP_POWDER_SNOW
+    }
+
+    /// The state is a lava source (the lava block at level 0).
+    pub fn is_lava_source(&self, s: u32) -> bool {
+        self.fluids.fluid(s) == Fluid::Lava && self.fluids.source.get(s as usize).copied().unwrap_or(false)
     }
 
     /// Open trapdoor placed on a ladder of the same orientation (`below`): climbable.
@@ -789,13 +928,18 @@ fn scan_fluids_rule(
 /// Main supporting block of an entity on the ground with box `b` and feet `pos` (§ 6.5, without the
 /// second offset search).
 pub fn support_of(w: &dyn World, b: &Aabb, pos: [f64; 3]) -> Option<[i32; 3]> {
+    support_of_with(w, b, pos, collide::WalkPath::current())
+}
+
+/// `support_of` on a given path of the collision walk.
+pub(crate) fn support_of_with(w: &dyn World, b: &Aabb, pos: [f64; 3], path: collide::WalkPath) -> Option<[i32; 3]> {
     let zone = Aabb { min: [b.min[0], b.min[1] - 1.0e-6, b.min[2]], max: [b.max[0], b.min[1], b.max[2]] };
     let mut best: Option<([i32; 3], f64)> = None;
     // Same cells as the collisions (one-block margin, corners ignored, edges reserved for shapes
     // that overflow): standing on a fence or a wall (1.5 blocks), the support is under the
     // row of the feet.
-    collide::with_cell(collide::is_free_mode(), |cell| {
-        collide::scan(w, &zone, false, cell, |[x, y, z], _| {
+    collide::with_cell(collide::IsFreePath::current(), |cell| {
+        collide::walk_checked(w, &zone, collide::WalkOrder::YOuter, path, cell, |[x, y, z], _| {
             let c = [f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5];
             let d2 = (0..3).map(|a| (c[a] - pos[a]).powi(2)).sum::<f64>();
             let better = match best {
@@ -2349,9 +2493,7 @@ impl Player {
             inside::BUBBLE_COLUMN | BUBBLES_DOWN if precise && !self.flying => {
                 let down = k == BUBBLES_DOWN;
                 let up = Self::state_at(w, [c[0], c[1] + 1, c[2]]);
-                let mut shape = Vec::new();
-                t.collision(up, &mut shape);
-                let open = shape.is_empty() && t.fluids.fluid(up) == Fluid::None;
+                let open = t.shape(up).is_empty() && t.fluids.fluid(up) == Fluid::None;
                 let vy = self.vel[1];
                 self.vel[1] = match (open, down) {
                     (true, true) => (vy - 0.03).max(-0.9),

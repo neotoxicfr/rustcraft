@@ -173,12 +173,10 @@ impl Server {
         loop {
             let below = [p[0], p[1] - 1, p[2]];
             if self.face_sturdy_up(below) {
-                if !self.is_air(p) {
-                    let mut boxes = Vec::new();
-                    self.phys.collision(self.st(p), &mut boxes);
-                    if let Some(mx) = boxes.iter().map(|b| b.max[1]).reduce(f64::max) {
-                        top = mx;
-                    }
+                if !self.is_air(p)
+                    && let Some(mx) = self.phys.shape(self.st(p)).iter().map(|b| b.max[1]).reduce(f64::max)
+                {
+                    top = mx;
                 }
                 found = true;
                 break;
@@ -235,9 +233,7 @@ impl Server {
     /// Full top face: approximated by a collision box
     /// covering the whole top.
     fn face_sturdy_up(&self, p: [i32; 3]) -> bool {
-        let mut boxes = Vec::new();
-        self.phys.collision(self.st(p), &mut boxes);
-        boxes.iter().any(|b| {
+        self.phys.shape(self.st(p)).iter().any(|b| {
             b.max[1] >= 1.0 - 1.0e-7
                 && b.min[0] <= 1.0e-7
                 && b.min[2] <= 1.0e-7

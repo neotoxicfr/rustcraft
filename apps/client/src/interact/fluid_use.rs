@@ -186,6 +186,7 @@ impl crate::App {
                 colliders: &colliders,
                 movers: None,
                 noclip: None,
+                palette_prefilter: crate::grid_world::palette_prefilter(),
             };
             !self.player.on_climbable(&world, &self.phys)
         };

@@ -545,6 +545,7 @@ impl App {
             colliders: &colliders,
             movers: Some(&self.block_entities),
             noclip: None,
+            palette_prefilter: crate::grid_world::palette_prefilter(),
         };
         let out = m.tick(&pilot, &world, &self.phys);
         if let Some((l, r)) = out.paddles {

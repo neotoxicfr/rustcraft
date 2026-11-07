@@ -373,11 +373,9 @@ impl Server {
                     let t = if self.is_air(q) || name == "minecraft:lily_pad" {
                         T::Above
                     } else {
-                        let src = self.phys.fluids.fluid(s) == rc_physics::Fluid::Water && self.water_source(s) && {
-                            let mut bx = Vec::new();
-                            self.phys.collision(s, &mut bx);
-                            bx.is_empty()
-                        };
+                        let src = self.phys.fluids.fluid(s) == rc_physics::Fluid::Water
+                            && self.water_source(s)
+                            && self.phys.shape(s).is_empty();
                         if src { T::Inside } else { T::Invalid }
                     };
                     layer = Some(match layer {

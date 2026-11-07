@@ -8330,3 +8330,112 @@ to spread over threads or the GPU.
   `RUSTCRAFT_OPT_COMPACT_JSON=0`, `RUSTCRAFT_OPT_JSON_PARSE_CACHE=0`, then
   `RUSTCRAFT_OPT_PARALLEL_DEFS_LOAD=1`; private memory at the world opening (the trees held by the
   game are a third of the old ones: noise settings, processor lists).
+## C5-M13: collision walk trimmed to the reach of the shapes, palette prefilter, batched reads, `resolve` without copies (07/11, loaded machine)
+
+Every collision search (`collide::resolve`, `support_of`, `is_free`, `collect`) walks the cells the
+zone touches plus a one-cell margin (a mob standing still: 64 cells for `support_of`, ~35 of them
+read). Proofs: `cargo test --release -p rc-physics` (`opt_tables_tests`, `tests/resolve_noalloc.rs`),
+`-p rc-sim collision_walk`, `-p rc-app --bin rustcraft grid_world`; micro-benches (ignored)
+`rc-physics bench_resolve_and_support`, `rc-sim bench_palette_prefilter`; trial profile, machine
+loaded by other agents compiling. Every walk can check itself against the whole walk:
+`RUSTCRAFT_COLLISION_WALK_CHECK=1` (always on in the rc-physics tests); the rc-sim and rc-app suites
+pass under it (rc-sim 1,494 library tests).
+
+- Reach of the shapes (`RUSTCRAFT_OPT_COLLISION_SCAN_TRIM`, default 1): `Tables` keeps the box that
+  holds every collision box (26.3: −0.25..1.25 sideways and below, 1.5 high) and the one of the
+  states that stay in their cell sideways and below (all but piston heads and pitcher crops: the unit
+  cube up to 1.5, fences and walls); `World::shape_reach(lo, hi)` gives it to the walk (unbounded by
+  default, envelopes take the union with the unit cube, a moving piston block in the walked cells
+  makes it unbounded), which skips the cells whose boxes cannot reach the zone, edge rules unchanged.
+  Exact: the skip test makes the same addition as placing a box (monotonic rounding).
+- Palette prefilter (`RUSTCRAFT_OPT_COLLISION_PALETTE_PREFILTER`, default 1, server and client
+  worlds): the reach is chosen from the palettes of the sections of the walked cells
+  (`Container::may_contain`, no block read, no stored flag): a spilling state possible → whole reach;
+  shapes but no spill → common reach; no shape at all (sky, air sections) → nothing to walk. A palette
+  entry no block uses any more only makes it wider.
+- Batched reads (`RUSTCRAFT_OPT_COLLISION_BATCH_READ`, default 1): `World::states_in` fills the states
+  of the remaining cells (≤ 64) with one column lookup per column (server hash, client grid), then
+  `collision_of_state` uses them; the player's, the strider's and the snow envelopes pass the read
+  state on instead of reading it again.
+- `resolve` without copies (`RUSTCRAFT_OPT_RESOLVE_NO_COPY`, default 1): blocks, border and entities
+  walked as three slices in that order (the order matters: early exit under `EPS`), boxes and step
+  heights in thread buffers: 0 allocation per movement once warm (`tests/resolve_noalloc.rs`; under `=0` the same 900
+  movements allocate 2,100 times: the test fails there).
+- Mob envelopes (`RUSTCRAFT_OPT_STAND_SHAPE_FLAGS`, default 1): powder snow and lava sources told by
+  per-state flags of the physics tables instead of block names and property strings (lava stand: state
+  read once instead of three times); the strider's envelope built once per movement.
+- No switch (identical by construction): `bubble column`, `piston_sweep`, `honey_carry` borrow the
+  shape (`Tables::shape`, equal to the copy for every state: `borrowed_shape_and_top_per_state_identical`);
+  the movement packet's chunk list on the stack.
+
+| cells read per call (rc-physics, whole reach, no palette) | old | trimmed |
+|---|---|---|
+| `support_of`, mixed world / plain ground | 35.2 / 35.2 | 8.3 / 8.3 |
+| `resolve` (walking mob, step 0.6), mixed / ground | 66.1 / 59.7 | 19.9 / 18.1 |
+
+| ns per call, 1 thread, two passes (rc-physics) | old | trim | no copy | trim + no copy |
+|---|---|---|---|---|
+| `support_of`, mixed | 248 / 380 | 123 / 187 | — | — |
+| `resolve`, mixed | 633 / 993 | 406 / 617 | 598 / 904 | 361 / 514 |
+| `support_of`, ground | 191 / 243 | 88 / 142 | — | — |
+| `resolve`, ground | 296 / 508 | 183 / 304 | 297 / 413 | 173 / 228 |
+
+Same ratios on 2 to 32 threads (each thread its own buffers, no contention).
+
+| ns per call on the server world (rc-sim, flat world), two passes | old paths (all `=0`) | new, prefilter off | new, prefilter on |
+|---|---|---|---|
+| `support_of`, mobs grazing on flat ground | 760 / 725 | 231 / 227 | 147 / 148 |
+| `resolve`, grazing | 1,050 / 973 | 362 / 359 | 294 / 295 |
+| `support_of`, among fences, walls, piston heads… | 569 / 566 | 291 / 286 | 283 / 282 |
+| `resolve`, same | 1,156 / 1,206 | 601 / 604 | 603 / 598 |
+
+Batched reads alone (two runs each, alternated, prefilter on, `support_of` / `resolve` ns): batch
+on, grazing 208-212 / 375-396 then 160-200 / 303-319, scattered 336-349 / 703-718 then 309-318 /
+618-777; batch off, grazing 179-209 / 375-383 then 156-170 / 339-344, scattered 350-385 / 689-1,165
+then 312-334 / 693-773: within the noise of a loaded machine (after the trim a mob reads 1 to 12
+cells, mostly in one column). Kept on, to settle on the scene bench (`=0` turns it off).
+
+Axes (B1): server CPU (every mob, item, projectile, minecart, stand) and client CPU (local player,
+entity prediction); allocations −2 to −4 per `resolve`; stack +256 bytes per walk (states); no
+GPU, disk, network or RAM change. Multi-core: the walks are per entity on the tick thread (4 to 30
+cells), nothing to split; GPU not applicable (branchy, a few hundred ns). Not done: one shape
+context replacing the four envelopes (after the batched read an envelope costs one indirect call
+per read cell, 1 to 12 per walk), the oversized test before copying an edge cell's shape (edge cells
+left after trim and prefilter: the row under a bottom fraction < 0.5 only), the leather boots kept
+as a flag (equipment written in many places), `GridWorld` palette summary cached per section (no
+stored flag by design). Fidelity gaps seen, left to the fidelity missions: the server world has no
+entity colliders (mobs do not bump into boats or shulkers), `LavaFloor` forwards neither entity
+colliders, moving blocks nor `min_y`, a mob's support search has no second offset search and does
+not see the powder snow envelope its movement used. Scenes to measure (quiet machine, 2 passes,
+against `main` and each switch at 0): `crowd-1000`, `crowd`, `village`, `forest`, `tnt`, `nether`,
+`plains12`, `redstone` (pistons: moving blocks during the walks).
+
+Review follow-up (07/11, loaded machine):
+
+- Moving blocks among many (no switch, same answer): the server walk asks whether a moving piston
+  block lies in its cells, and used to test every moving block of the dimension. A piston door or
+  a world eater leaves hundreds to thousands of them for 2 to 3 ticks, paid by every walk of every
+  entity. The moving blocks are now tested one by one only while there are at most 16 per walked
+  cell, otherwise each cell is looked up in their table (bench: 0.7 ns per comparison, 10.8 ns per
+  lookup). `support_of` of a grazing mob, prefilter on, world rebuilt per call (ns, two passes):
+  6 moving blocks 155-175; 206: 289 before, 310-315 after (same path, noise); 2,006: 2,222-2,229
+  before, 311 after; `resolve` 2,326-2,331 → 495-497. Discarded: per-cell lookup at any count
+  (206 blocks: 669 ns, a lookup costs 16 comparisons) and the bounds of all moving blocks computed
+  once per world (206: 390 ns, the bounds scan costs more than the test it saves when the mob is
+  inside them). Proof: `sim_world_walk_keeps_every_box_among_many_movers` (3,006 moving blocks:
+  lookup path), which fails when the lookup finds nothing.
+- One implementation of the column walks: the section palette question and the batched state read
+  of the server and client worlds are `rc_world::sections_may_hold` / `states_by_column`, each
+  world only giving its column lookup. The client world now carries its prefilter choice like the
+  server one, and `grid_world_walk_keeps_every_box` proves its trimmed walk (fences, piston heads,
+  pitcher crops, single-state and air sections, a stale palette entry, an unloaded column; prefilter
+  off then on, every reach kind reached); it fails when the section lookup answers nothing or
+  forgets `min_y`, and `states_in_matches_state` fails on transposed rows in the shared read.
+- Borrowed shapes everywhere a fresh list was only read (B6): arrows and tridents stuck in a block
+  (every tick), the ray hit of every projectile cell, respawn and dismount, frog, copper golem,
+  evoker fangs, ghast and happy ghast, fishing bobber, bed sleep height, client rain, debug outline. Left:
+  the creaking's shape (returned and clipped: it needs its own copy), and the old paths behind
+  `RUSTCRAFT_OPT_*` switches.
+- The rc-physics benches skip the walk check on their own threads only (thread-local, restored at
+  the end): with `--include-ignored` they used to turn it off for the tests running beside them
+  (`skipped_walk_check_stays_on_its_thread`, fails with a process-wide flag).
