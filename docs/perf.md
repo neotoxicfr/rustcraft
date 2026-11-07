@@ -7445,8 +7445,8 @@ points each on average, none taller than one row (the batches are layers of 4 ×
 points, not the 49 and 121 the mission expected: the micro-bench covers all four sizes).
 
 - `RUSTCRAFT_OPT_NOISE_BATCH_POINTS` (on, `sampler::Opts::shifted_noise_in_batches`): the points
-  of a shifted noise volume handed to `NoiseStack::get_many` in batches of up to 256 on the stack
-  (6 KB), layers outside and points inside, each point adding its layers in the same order.
+  of a shifted noise volume handed to `NoiseStack::get_many` in batches of up to 64 on the stack
+  (1.5 KB, zeroed on every call: 256 before review), layers outside and points inside, each point adding its layers in the same order.
   Alone (scalar) it gains nothing: the point path was already well compiled.
 - `RUSTCRAFT_OPT_NOISE_BATCH_AVX2` (on, with `PERM512`, detection by `rc_data::cpu`): groups of 8
   points in AVX2 registers (`noise/batch_avx2.rs`): the same additions, subtractions and
