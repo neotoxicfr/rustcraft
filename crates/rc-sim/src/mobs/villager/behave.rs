@@ -7,7 +7,7 @@ use super::super::jrand::JRand;
 use super::super::mob::{Ent, Mob};
 use super::super::nav::Path as NavPath;
 use super::super::species::Kind;
-use super::brain::{Act, Brain, GPos, M, Node, Sensed, St, Track, Walk, b, dist2, gate, idle, o, run_one};
+use super::brain::{Act, Brain, GPos, MemKey, MemState, Node, Sensed, Track, Walk, behavior_node, dist2, gate, idle_node, run_one, trigger_node};
 use super::switches;
 use super::{PROF_FARMER, PROF_NITWIT, PROF_NONE};
 use crate::player::Stack;
@@ -165,9 +165,9 @@ pub enum Trig {
 
 impl Beh {
     /// Memory conditions to start, as a table of the program (nothing built at each try).
-    pub fn entry_table(&self) -> &'static [(M, St)] {
-        use M::*;
-        use St::*;
+    pub fn entry_table(&self) -> &'static [(MemKey, MemState)] {
+        use MemKey::*;
+        use MemState::*;
         match self {
             Beh::LookAtTarget => &[(Look, Present)],
             Beh::MoveToTarget { .. } => &[(Path, Absent), (Walk, Present)],
@@ -186,7 +186,7 @@ impl Beh {
     }
 
     /// The same conditions in a new vector (old path of `RUSTCRAFT_OPT_VILLAGER_NO_TICK_ALLOCATIONS`).
-    pub fn entry(&self) -> Vec<(M, St)> {
+    pub fn entry(&self) -> Vec<(MemKey, MemState)> {
         self.entry_table().to_vec()
     }
 
@@ -219,31 +219,31 @@ pub fn packages(baby: bool, prof: i32) -> Vec<(i32, Act, Node)> {
             v.push((p, a, n));
         }
     };
-    let acquire = |k: Acq| o(Trig::Acquire { kind: k, next: 0, cache: Vec::new() });
+    let acquire = |k: Acq| trigger_node(Trig::Acquire { kind: k, next: 0, cache: Vec::new() });
     let minimal_look = || {
         (
             5,
             run_one(vec![
-                (o(Trig::Look(LookKind::Villager)), 2),
-                (o(Trig::Look(LookKind::Player)), 2),
-                (idle(30, 60), 8),
+                (trigger_node(Trig::Look(LookKind::Villager)), 2),
+                (trigger_node(Trig::Look(LookKind::Player)), 2),
+                (idle_node(30, 60), 8),
             ]),
         )
     };
     let full_look = || {
         let mut kids = vec![
-            (o(Trig::Look(LookKind::Cat)), 8),
-            (o(Trig::Look(LookKind::Villager)), 2),
-            (o(Trig::Look(LookKind::Player)), 2),
+            (trigger_node(Trig::Look(LookKind::Cat)), 8),
+            (trigger_node(Trig::Look(LookKind::Villager)), 2),
+            (trigger_node(Trig::Look(LookKind::Player)), 2),
         ];
         for c in 0..6 {
-            kids.push((o(Trig::Look(LookKind::Category(c))), 1));
+            kids.push((trigger_node(Trig::Look(LookKind::Category(c))), 1));
         }
-        kids.push((idle(30, 60), 2));
+        kids.push((idle_node(30, 60), 2));
         (5, run_one(kids))
     };
     let move_to =
-        |min, max| b(Beh::MoveToTarget { min, max, cooldown: 0, path: None, has_path: false, last: None, speed: 0.0 });
+        |min, max| behavior_node(Beh::MoveToTarget { min, max, cooldown: 0, path: None, has_path: false, last: None, speed: 0.0 });
     // Work or play (added before the core).
     if baby {
         add(
@@ -251,24 +251,24 @@ pub fn packages(baby: bool, prof: i32) -> Vec<(i32, Act, Node)> {
             vec![
                 (0, move_to(80, 120)),
                 full_look(),
-                (5, o(Trig::PlayTag)),
+                (5, trigger_node(Trig::PlayTag)),
                 (
                     5,
                     gate(
-                        vec![(M::Babies, St::Absent)],
+                        vec![(MemKey::Babies, MemState::Absent)],
                         Vec::new(),
                         true,
                         vec![
-                            (o(Trig::InteractWith { kind: LookKind::Villager, breed: false }), 2),
-                            (o(Trig::InteractWith { kind: LookKind::Cat, breed: false }), 1),
-                            (o(Trig::VillageStroll { speed: sp, h: 10, v: 7 }), 1),
-                            (o(Trig::WalkFromLook { speed: sp, close: 2 }), 1),
-                            (b(Beh::JumpOnBed { speed: sp, bed: None, reach: 0, jumps: 0, cooldown: 0 }), 2),
-                            (idle(20, 40), 2),
+                            (trigger_node(Trig::InteractWith { kind: LookKind::Villager, breed: false }), 2),
+                            (trigger_node(Trig::InteractWith { kind: LookKind::Cat, breed: false }), 1),
+                            (trigger_node(Trig::VillageStroll { speed: sp, h: 10, v: 7 }), 1),
+                            (trigger_node(Trig::WalkFromLook { speed: sp, close: 2 }), 1),
+                            (behavior_node(Beh::JumpOnBed { speed: sp, bed: None, reach: 0, jumps: 0, cooldown: 0 }), 2),
+                            (idle_node(20, 40), 2),
                         ],
                     ),
                 ),
-                (99, o(Trig::UpdateSchedule)),
+                (99, trigger_node(Trig::UpdateSchedule)),
             ],
         );
     } else {
@@ -280,25 +280,25 @@ pub fn packages(baby: bool, prof: i32) -> Vec<(i32, Act, Node)> {
                 (
                     5,
                     run_one(vec![
-                        (b(Beh::WorkAtPoi { last_check: 0, composter: farmer }), 7),
-                        (o(Trig::StrollAroundPoi { mem: PoiMem::JobSite, speed: 0.4, max: 4, next: 0 }), 2),
-                        (o(Trig::StrollToPoi { mem: PoiMem::JobSite, speed: 0.4, close: 1, max: 10, next: 0 }), 5),
-                        (o(Trig::StrollToSecondary { next: 0 }), 5),
+                        (behavior_node(Beh::WorkAtPoi { last_check: 0, composter: farmer }), 7),
+                        (trigger_node(Trig::StrollAroundPoi { mem: PoiMem::JobSite, speed: 0.4, max: 4, next: 0 }), 2),
+                        (trigger_node(Trig::StrollToPoi { mem: PoiMem::JobSite, speed: 0.4, close: 1, max: 10, next: 0 }), 5),
+                        (trigger_node(Trig::StrollToSecondary { next: 0 }), 5),
                         (
-                            b(Beh::Harvest { pos: None, next_ok: 0, worked: 0, valid: Vec::new() }),
+                            behavior_node(Beh::Harvest { pos: None, next_ok: 0, worked: 0, valid: Vec::new() }),
                             if farmer { 2 } else { 5 },
                         ),
                         (
-                            b(Beh::Bonemeal { next_cycle: 0, last_session: 0, worked: 0, crop: None }),
+                            behavior_node(Beh::Bonemeal { next_cycle: 0, last_session: 0, worked: 0, crop: None }),
                             if farmer { 4 } else { 7 },
                         ),
                     ]),
                 ),
-                (10, b(Beh::ShowTrades { held: None, display: Vec::new(), cycle: 0, index: 0, look: 0 })),
-                (10, o(Trig::SetLookAndInteract)),
-                (2, o(Trig::WalkFromBlock { mem: PoiMem::JobSite, speed: sp, close: 9, far: 100, too_long: 1200 })),
-                (3, b(Beh::GiveGift { until: 600, given: false, since: 0 })),
-                (99, o(Trig::UpdateSchedule)),
+                (10, behavior_node(Beh::ShowTrades { held: None, display: Vec::new(), cycle: 0, index: 0, look: 0 })),
+                (10, trigger_node(Trig::SetLookAndInteract)),
+                (2, trigger_node(Trig::WalkFromBlock { mem: PoiMem::JobSite, speed: sp, close: 9, far: 100, too_long: 1200 })),
+                (3, behavior_node(Beh::GiveGift { until: 600, given: false, since: 0 })),
+                (99, trigger_node(Trig::UpdateSchedule)),
             ],
         );
     }
@@ -306,26 +306,26 @@ pub fn packages(baby: bool, prof: i32) -> Vec<(i32, Act, Node)> {
     add(
         Act::Core,
         vec![
-            (0, b(Beh::Swim)),
-            (0, o(Trig::Door { last: None, cooldown: 0 })),
-            (0, b(Beh::LookAtTarget)),
-            (0, b(Beh::PanicTrigger)),
-            (0, o(Trig::WakeUp)),
-            (0, o(Trig::ReactToBell)),
-            (0, o(Trig::SetRaidStatus)),
-            (0, o(Trig::Validate { mem: PoiMem::JobSite, job: true })),
-            (0, o(Trig::Validate { mem: PoiMem::Potential, job: true })),
+            (0, behavior_node(Beh::Swim)),
+            (0, trigger_node(Trig::Door { last: None, cooldown: 0 })),
+            (0, behavior_node(Beh::LookAtTarget)),
+            (0, behavior_node(Beh::PanicTrigger)),
+            (0, trigger_node(Trig::WakeUp)),
+            (0, trigger_node(Trig::ReactToBell)),
+            (0, trigger_node(Trig::SetRaidStatus)),
+            (0, trigger_node(Trig::Validate { mem: PoiMem::JobSite, job: true })),
+            (0, trigger_node(Trig::Validate { mem: PoiMem::Potential, job: true })),
             (1, move_to(150, 250)),
-            (2, o(Trig::CompetitorScan)),
-            (3, b(Beh::FollowTrader)),
-            (5, o(Trig::GoToWantedItem)),
+            (2, trigger_node(Trig::CompetitorScan)),
+            (3, behavior_node(Beh::FollowTrader)),
+            (5, trigger_node(Trig::GoToWantedItem)),
             (6, acquire(Acq::Job)),
-            (7, b(Beh::GoToPotentialJobSite)),
-            (8, o(Trig::YieldJobSite)),
+            (7, behavior_node(Beh::GoToPotentialJobSite)),
+            (8, trigger_node(Trig::YieldJobSite)),
             (10, acquire(Acq::Home)),
             (10, acquire(Acq::Meeting)),
-            (10, o(Trig::AssignProfession)),
-            (10, o(Trig::ResetProfession)),
+            (10, trigger_node(Trig::AssignProfession)),
+            (10, trigger_node(Trig::ResetProfession)),
         ],
     );
     // Meeting.
@@ -334,7 +334,7 @@ pub fn packages(baby: bool, prof: i32) -> Vec<(i32, Act, Node)> {
         vec![
             (
                 2,
-                o(Trig::Shuffled {
+                trigger_node(Trig::Shuffled {
                     kids: vec![
                         (Trig::StrollAroundPoi { mem: PoiMem::Meeting, speed: 0.4, max: 40, next: 0 }, 2, 0.0),
                         (Trig::SocializeAtBell, 2, 0.0),
@@ -342,47 +342,47 @@ pub fn packages(baby: bool, prof: i32) -> Vec<(i32, Act, Node)> {
                     rng: JRand::from_time(0x4D45_4554),
                 }),
             ),
-            (10, b(Beh::ShowTrades { held: None, display: Vec::new(), cycle: 0, index: 0, look: 0 })),
-            (10, o(Trig::SetLookAndInteract)),
-            (2, o(Trig::WalkFromBlock { mem: PoiMem::Meeting, speed: sp, close: 6, far: 100, too_long: 200 })),
-            (3, b(Beh::GiveGift { until: 600, given: false, since: 0 })),
-            (3, o(Trig::Validate { mem: PoiMem::Meeting, job: false })),
+            (10, behavior_node(Beh::ShowTrades { held: None, display: Vec::new(), cycle: 0, index: 0, look: 0 })),
+            (10, trigger_node(Trig::SetLookAndInteract)),
+            (2, trigger_node(Trig::WalkFromBlock { mem: PoiMem::Meeting, speed: sp, close: 6, far: 100, too_long: 200 })),
+            (3, behavior_node(Beh::GiveGift { until: 600, given: false, since: 0 })),
+            (3, trigger_node(Trig::Validate { mem: PoiMem::Meeting, job: false })),
             (
                 3,
                 gate(
                     Vec::new(),
-                    vec![M::Interaction],
+                    vec![MemKey::Interaction],
                     false,
-                    vec![(b(Beh::TradeWithVillager { trades: Vec::new() }), 1)],
+                    vec![(behavior_node(Beh::TradeWithVillager { trades: Vec::new() }), 1)],
                 ),
             ),
             full_look(),
-            (99, o(Trig::UpdateSchedule)),
+            (99, trigger_node(Trig::UpdateSchedule)),
         ],
     );
     // Rest.
     add(
         Act::Rest,
         vec![
-            (2, o(Trig::WalkFromBlock { mem: PoiMem::Home, speed: sp, close: 1, far: 150, too_long: 1200 })),
-            (3, o(Trig::Validate { mem: PoiMem::Home, job: false })),
-            (3, b(Beh::SleepInBed { next_ok: 0 })),
+            (2, trigger_node(Trig::WalkFromBlock { mem: PoiMem::Home, speed: sp, close: 1, far: 150, too_long: 1200 })),
+            (3, trigger_node(Trig::Validate { mem: PoiMem::Home, job: false })),
+            (3, behavior_node(Beh::SleepInBed { next_ok: 0 })),
             (
                 5,
                 gate(
-                    vec![(M::Home, St::Absent)],
+                    vec![(MemKey::Home, MemState::Absent)],
                     Vec::new(),
                     true,
                     vec![
-                        (o(Trig::ClosestHome { cache: Vec::new(), last: 0 }), 1),
-                        (o(Trig::InsideBrownian), 4),
-                        (o(Trig::ClosestVillage), 2),
-                        (idle(20, 40), 2),
+                        (trigger_node(Trig::ClosestHome { cache: Vec::new(), last: 0 }), 1),
+                        (trigger_node(Trig::InsideBrownian), 4),
+                        (trigger_node(Trig::ClosestVillage), 2),
+                        (idle_node(20, 40), 2),
                     ],
                 ),
             ),
             minimal_look(),
-            (99, o(Trig::UpdateSchedule)),
+            (99, trigger_node(Trig::UpdateSchedule)),
         ],
     );
     // Idle.
@@ -392,40 +392,40 @@ pub fn packages(baby: bool, prof: i32) -> Vec<(i32, Act, Node)> {
             (
                 2,
                 run_one(vec![
-                    (o(Trig::InteractWith { kind: LookKind::Villager, breed: false }), 2),
-                    (o(Trig::InteractWith { kind: LookKind::Villager, breed: true }), 1),
-                    (o(Trig::InteractWith { kind: LookKind::Cat, breed: false }), 1),
-                    (o(Trig::VillageStroll { speed: sp, h: 10, v: 7 }), 1),
-                    (o(Trig::WalkFromLook { speed: sp, close: 2 }), 1),
-                    (b(Beh::JumpOnBed { speed: sp, bed: None, reach: 0, jumps: 0, cooldown: 0 }), 1),
-                    (idle(30, 60), 1),
+                    (trigger_node(Trig::InteractWith { kind: LookKind::Villager, breed: false }), 2),
+                    (trigger_node(Trig::InteractWith { kind: LookKind::Villager, breed: true }), 1),
+                    (trigger_node(Trig::InteractWith { kind: LookKind::Cat, breed: false }), 1),
+                    (trigger_node(Trig::VillageStroll { speed: sp, h: 10, v: 7 }), 1),
+                    (trigger_node(Trig::WalkFromLook { speed: sp, close: 2 }), 1),
+                    (behavior_node(Beh::JumpOnBed { speed: sp, bed: None, reach: 0, jumps: 0, cooldown: 0 }), 1),
+                    (idle_node(30, 60), 1),
                 ]),
             ),
-            (3, b(Beh::GiveGift { until: 600, given: false, since: 0 })),
-            (3, o(Trig::SetLookAndInteract)),
-            (3, b(Beh::ShowTrades { held: None, display: Vec::new(), cycle: 0, index: 0, look: 0 })),
+            (3, behavior_node(Beh::GiveGift { until: 600, given: false, since: 0 })),
+            (3, trigger_node(Trig::SetLookAndInteract)),
+            (3, behavior_node(Beh::ShowTrades { held: None, display: Vec::new(), cycle: 0, index: 0, look: 0 })),
             (
                 3,
                 gate(
                     Vec::new(),
-                    vec![M::Interaction],
+                    vec![MemKey::Interaction],
                     false,
-                    vec![(b(Beh::TradeWithVillager { trades: Vec::new() }), 1)],
+                    vec![(behavior_node(Beh::TradeWithVillager { trades: Vec::new() }), 1)],
                 ),
             ),
-            (3, gate(Vec::new(), vec![M::Breed], false, vec![(b(Beh::MakeLove { birth: 0 }), 1)])),
+            (3, gate(Vec::new(), vec![MemKey::Breed], false, vec![(behavior_node(Beh::MakeLove { birth: 0 }), 1)])),
             full_look(),
-            (99, o(Trig::UpdateSchedule)),
+            (99, trigger_node(Trig::UpdateSchedule)),
         ],
     );
     // Panic.
     add(
         Act::Panic,
         vec![
-            (0, o(Trig::CalmDown)),
-            (1, o(Trig::AwayFrom { hostile: true })),
-            (1, o(Trig::AwayFrom { hostile: false })),
-            (3, o(Trig::VillageStroll { speed: sp * 1.5, h: 2, v: 2 })),
+            (0, trigger_node(Trig::CalmDown)),
+            (1, trigger_node(Trig::AwayFrom { hostile: true })),
+            (1, trigger_node(Trig::AwayFrom { hostile: false })),
+            (3, trigger_node(Trig::VillageStroll { speed: sp * 1.5, h: 2, v: 2 })),
             minimal_look(),
         ],
     );
@@ -433,10 +433,10 @@ pub fn packages(baby: bool, prof: i32) -> Vec<(i32, Act, Node)> {
     add(
         Act::PreRaid,
         vec![
-            (0, o(Trig::RingBell)),
+            (0, trigger_node(Trig::RingBell)),
             (
                 0,
-                o(Trig::Shuffled {
+                trigger_node(Trig::Shuffled {
                     kids: vec![
                         (
                             Trig::WalkFromBlock {
@@ -455,7 +455,7 @@ pub fn packages(baby: bool, prof: i32) -> Vec<(i32, Act, Node)> {
                 }),
             ),
             minimal_look(),
-            (99, o(Trig::ResetRaid)),
+            (99, trigger_node(Trig::ResetRaid)),
         ],
     );
     // Raid: after the victory, under the sky or wandering; celebration; during the raid, hiding.
@@ -464,7 +464,7 @@ pub fn packages(baby: bool, prof: i32) -> Vec<(i32, Act, Node)> {
         vec![
             (
                 0,
-                o(Trig::IfRaid {
+                trigger_node(Trig::IfRaid {
                     victory: true,
                     then: Box::new(Trig::Shuffled {
                         kids: vec![
@@ -475,24 +475,24 @@ pub fn packages(baby: bool, prof: i32) -> Vec<(i32, Act, Node)> {
                     }),
                 }),
             ),
-            (0, b(Beh::Celebrate { raid: None })),
+            (0, behavior_node(Beh::Celebrate { raid: None })),
             (
                 2,
-                o(Trig::IfRaid {
+                trigger_node(Trig::IfRaid {
                     victory: false,
                     then: Box::new(Trig::LocateHiding { radius: 24, speed: sp * 1.4, close: 1 }),
                 }),
             ),
             minimal_look(),
-            (99, o(Trig::ResetRaid)),
+            (99, trigger_node(Trig::ResetRaid)),
         ],
     );
     // Hiding: hiding counter, search for a house.
     add(
         Act::Hide,
         vec![
-            (0, o(Trig::SetHidden { stay: 15 * 20, close: 3, hidden: 0 })),
-            (1, o(Trig::LocateHiding { radius: 32, speed: sp * 1.25, close: 2 })),
+            (0, trigger_node(Trig::SetHidden { stay: 15 * 20, close: 3, hidden: 0 })),
+            (1, trigger_node(Trig::LocateHiding { radius: 32, speed: sp * 1.25, close: 2 })),
             minimal_look(),
         ],
     );

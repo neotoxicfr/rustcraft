@@ -19,7 +19,7 @@ use super::super::mob::Mob;
 use super::super::nav::search_tests::village_server;
 use super::super::species::Kind;
 use super::behave::Beh;
-use super::brain::{Brain, FarmlandSearch, Mem, Node};
+use super::brain::{Brain, FarmlandSearch, GateChild, Mem, Node};
 use super::switches::{FORCED, VillagerSwitches};
 use crate::player::Stack;
 use crate::server::Server;
@@ -409,7 +409,7 @@ fn node_state(out: &mut String, n: &Node) {
         }
         Node::G(g) => {
             let _ = write!(out, "G {:?} {:?} {} {} {:?} {} [", g.entry, g.erase, g.shuffled, g.run_one, g.rng, g.run);
-            for (kid, weight, key) in &g.kids {
+            for GateChild { node: kid, weight, shuffle_key: key } in &g.kids {
                 node_state(out, kid);
                 let _ = write!(out, " {weight} {key:?}; ");
             }

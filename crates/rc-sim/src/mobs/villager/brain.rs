@@ -83,7 +83,7 @@ pub struct Walk {
 
 /// Memory keys (behavior entry conditions).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum M {
+pub enum MemKey {
     Walk,
     Look,
     Path,
@@ -104,7 +104,7 @@ pub enum M {
 
 /// Expected state of a memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum St {
+pub enum MemState {
     Present,
     Absent,
 }
@@ -155,50 +155,50 @@ pub struct Mem {
 }
 
 impl Mem {
-    pub fn present(&self, k: M) -> bool {
+    pub fn present(&self, k: MemKey) -> bool {
         match k {
-            M::Walk => self.walk.is_some(),
-            M::Look => self.look.is_some(),
-            M::Path => self.path,
-            M::Home => self.home.is_some(),
-            M::JobSite => self.job_site.is_some(),
-            M::PotentialJobSite => self.potential_job_site.is_some(),
-            M::MeetingPoint => self.meeting_point.is_some(),
-            M::Secondary => self.secondary.is_some(),
-            M::Living => self.living.is_some(),
-            M::Visible => self.visible.is_some(),
-            M::Interaction => self.interaction.is_some(),
-            M::Breed => self.breed.is_some(),
-            M::Babies => self.babies.is_some(),
-            M::NearestBed => self.nearest_bed.is_some(),
-            M::WantedItem => self.wanted_item.is_some(),
-            M::VisiblePlayer => self.visible_player.is_some(),
+            MemKey::Walk => self.walk.is_some(),
+            MemKey::Look => self.look.is_some(),
+            MemKey::Path => self.path,
+            MemKey::Home => self.home.is_some(),
+            MemKey::JobSite => self.job_site.is_some(),
+            MemKey::PotentialJobSite => self.potential_job_site.is_some(),
+            MemKey::MeetingPoint => self.meeting_point.is_some(),
+            MemKey::Secondary => self.secondary.is_some(),
+            MemKey::Living => self.living.is_some(),
+            MemKey::Visible => self.visible.is_some(),
+            MemKey::Interaction => self.interaction.is_some(),
+            MemKey::Breed => self.breed.is_some(),
+            MemKey::Babies => self.babies.is_some(),
+            MemKey::NearestBed => self.nearest_bed.is_some(),
+            MemKey::WantedItem => self.wanted_item.is_some(),
+            MemKey::VisiblePlayer => self.visible_player.is_some(),
         }
     }
 
-    pub fn erase(&mut self, k: M) {
+    pub fn erase(&mut self, k: MemKey) {
         match k {
-            M::Walk => self.walk = None,
-            M::Look => self.look = None,
-            M::Path => self.path = false,
-            M::Home => self.home = None,
-            M::JobSite => self.job_site = None,
-            M::PotentialJobSite => self.potential_job_site = None,
-            M::MeetingPoint => self.meeting_point = None,
-            M::Secondary => self.secondary = None,
-            M::Living => self.living = None,
-            M::Visible => self.visible = None,
-            M::Interaction => self.interaction = None,
-            M::Breed => self.breed = None,
-            M::Babies => self.babies = None,
-            M::NearestBed => self.nearest_bed = None,
-            M::WantedItem => self.wanted_item = None,
-            M::VisiblePlayer => self.visible_player = None,
+            MemKey::Walk => self.walk = None,
+            MemKey::Look => self.look = None,
+            MemKey::Path => self.path = false,
+            MemKey::Home => self.home = None,
+            MemKey::JobSite => self.job_site = None,
+            MemKey::PotentialJobSite => self.potential_job_site = None,
+            MemKey::MeetingPoint => self.meeting_point = None,
+            MemKey::Secondary => self.secondary = None,
+            MemKey::Living => self.living = None,
+            MemKey::Visible => self.visible = None,
+            MemKey::Interaction => self.interaction = None,
+            MemKey::Breed => self.breed = None,
+            MemKey::Babies => self.babies = None,
+            MemKey::NearestBed => self.nearest_bed = None,
+            MemKey::WantedItem => self.wanted_item = None,
+            MemKey::VisiblePlayer => self.visible_player = None,
         }
     }
 
-    pub fn check(&self, e: &[(M, St)]) -> bool {
-        e.iter().all(|&(k, st)| self.present(k) == (st == St::Present))
+    pub fn check(&self, e: &[(MemKey, MemState)]) -> bool {
+        e.iter().all(|&(k, st)| self.present(k) == (st == MemState::Present))
     }
 
     /// Aging: only the "golem seen" memory expires (599 ticks).
@@ -220,33 +220,41 @@ impl Mem {
 pub enum Node {
     /// Behavior with a duration: state, planned end.
     B { b: Beh, run: bool, end: i64 },
-    /// Instant trigger (`OneShot`).
+    /// Instant trigger, run once then over.
     O { t: Trig, run: bool },
     /// Gate.
     G(Box<Gate>),
-    /// Nothing for a duration (`DoNothing`).
+    /// Nothing for a duration.
     Idle { min: i32, max: i32, run: bool, end: i64 },
 }
 
 #[derive(Debug, Clone)]
 pub struct Gate {
-    pub entry: Vec<(M, St)>,
-    pub erase: Vec<M>,
+    pub entry: Vec<(MemKey, MemState)>,
+    pub erase: Vec<MemKey>,
     pub shuffled: bool,
     pub run_one: bool,
-    pub kids: Vec<(Node, i32, f64)>,
+    pub kids: Vec<GateChild>,
     pub rng: JRand,
     pub run: bool,
+}
+
+/// A node of a gate, its draw weight and the key of the last weighted shuffle.
+#[derive(Debug, Clone)]
+pub struct GateChild {
+    pub node: Node,
+    pub weight: i32,
+    pub shuffle_key: f64,
 }
 
 impl Gate {
     fn shuffle(&mut self) {
         for k in &mut self.kids {
             let r = self.rng.next_float();
-            k.2 = -f64::from(r).powf(f64::from(1.0f32 / k.1 as f32));
+            k.shuffle_key = -f64::from(r).powf(f64::from(1.0f32 / k.weight as f32));
         }
         // Stable sort (the game's `List.sort`).
-        self.kids.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+        self.kids.sort_by(|a, b| a.shuffle_key.partial_cmp(&b.shuffle_key).unwrap_or(std::cmp::Ordering::Equal));
     }
 }
 
@@ -254,27 +262,30 @@ pub fn run_one(kids: Vec<(Node, i32)>) -> Node {
     gate(Vec::new(), Vec::new(), true, kids)
 }
 
-pub fn gate(entry: Vec<(M, St)>, erase: Vec<M>, shuffled: bool, kids: Vec<(Node, i32)>) -> Node {
+pub fn gate(entry: Vec<(MemKey, MemState)>, erase: Vec<MemKey>, shuffled: bool, kids: Vec<(Node, i32)>) -> Node {
     Node::G(Box::new(Gate {
         entry,
         erase,
         shuffled,
         run_one: true,
-        kids: kids.into_iter().map(|(n, w)| (n, w, 0.0)).collect(),
+        kids: kids.into_iter().map(|(node, weight)| GateChild { node, weight, shuffle_key: 0.0 }).collect(),
         rng: JRand::from_time(0x5255_4E4F),
         run: false,
     }))
 }
 
-pub fn b(b: Beh) -> Node {
+/// Node of a behaviour with a duration.
+pub fn behavior_node(b: Beh) -> Node {
     Node::B { b, run: false, end: 0 }
 }
 
-pub fn o(t: Trig) -> Node {
+/// Node of an instant trigger.
+pub fn trigger_node(t: Trig) -> Node {
     Node::O { t, run: false }
 }
 
-pub fn idle(min: i32, max: i32) -> Node {
+/// Node that does nothing for `min..=max` ticks.
+pub fn idle_node(min: i32, max: i32) -> Node {
     Node::Idle { min, max, run: false, end: 0 }
 }
 
@@ -430,7 +441,7 @@ impl Server {
     pub(crate) fn refresh_brain(&mut self, m: &mut Mob, mut b: Brain) -> Brain {
         let t = self.time;
         for i in 0..b.nodes.len() {
-            let mut n = std::mem::replace(&mut b.nodes[i].2, idle(0, 0));
+            let mut n = std::mem::replace(&mut b.nodes[i].2, idle_node(0, 0));
             self.node_stop_all(m, &mut b, &mut n, t);
             b.nodes[i].2 = n;
         }
@@ -449,7 +460,7 @@ impl Server {
             if !b.is_active(act) {
                 continue;
             }
-            let mut n = std::mem::replace(&mut b.nodes[i].2, idle(0, 0));
+            let mut n = std::mem::replace(&mut b.nodes[i].2, idle_node(0, 0));
             if !is_running(&n) {
                 self.node_try_start(m, b, &mut n, t);
             }
@@ -460,7 +471,7 @@ impl Server {
         }
         // Tick or stop of those running.
         for i in 0..b.nodes.len() {
-            let mut n = std::mem::replace(&mut b.nodes[i].2, idle(0, 0));
+            let mut n = std::mem::replace(&mut b.nodes[i].2, idle_node(0, 0));
             if is_running(&n) {
                 self.node_tick_or_stop(m, b, &mut n, t);
             }
@@ -509,12 +520,12 @@ impl Server {
                     g.shuffle();
                 }
                 for k in 0..g.kids.len() {
-                    if is_running(&g.kids[k].0) {
+                    if is_running(&g.kids[k].node) {
                         continue;
                     }
-                    let mut kid = std::mem::replace(&mut g.kids[k].0, idle(0, 0));
+                    let mut kid = std::mem::replace(&mut g.kids[k].node, idle_node(0, 0));
                     let ok = self.node_try_start(m, b, &mut kid, t);
-                    g.kids[k].0 = kid;
+                    g.kids[k].node = kid;
                     if b.refresh || (ok && g.run_one) {
                         break;
                     }
@@ -542,17 +553,17 @@ impl Server {
             }
             Node::G(g) => {
                 for k in 0..g.kids.len() {
-                    if !is_running(&g.kids[k].0) {
+                    if !is_running(&g.kids[k].node) {
                         continue;
                     }
-                    let mut kid = std::mem::replace(&mut g.kids[k].0, idle(0, 0));
+                    let mut kid = std::mem::replace(&mut g.kids[k].node, idle_node(0, 0));
                     self.node_tick_or_stop(m, b, &mut kid, t);
-                    g.kids[k].0 = kid;
+                    g.kids[k].node = kid;
                     if b.refresh {
                         return;
                     }
                 }
-                if !g.kids.iter().any(|k| is_running(&k.0)) {
+                if !g.kids.iter().any(|k| is_running(&k.node)) {
                     self.gate_stop(m, b, g, t);
                 }
             }
@@ -562,10 +573,10 @@ impl Server {
     fn gate_stop(&mut self, m: &mut Mob, b: &mut Brain, g: &mut Gate, t: i64) {
         g.run = false;
         for k in 0..g.kids.len() {
-            if is_running(&g.kids[k].0) {
-                let mut kid = std::mem::replace(&mut g.kids[k].0, idle(0, 0));
+            if is_running(&g.kids[k].node) {
+                let mut kid = std::mem::replace(&mut g.kids[k].node, idle_node(0, 0));
                 self.node_stop_all(m, b, &mut kid, t);
-                g.kids[k].0 = kid;
+                g.kids[k].node = kid;
             }
         }
         for &e in &g.erase {
