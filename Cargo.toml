@@ -19,6 +19,8 @@ serde_json = "1"
 # Visitor traits (advancements file read with its key order, `rc-sim` progress).
 serde = "1.0.229"
 hashbrown = { version = "0.17.1", features = ["rayon"] }
+# Fixed-seed hashing of the client's cache keys (the hasher hashbrown already uses).
+foldhash = { version = "0.2.0", default-features = false }
 ureq = "3.4.2"
 ring = "0.17.14"
 getrandom = { version = "0.4.3", features = ["sys_rng"] }

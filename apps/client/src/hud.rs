@@ -686,7 +686,6 @@ impl Hud {
 
     /// Off hand slot, slot items (seeds 1..9, then 10) and their decorations.
     fn draw_items(&mut self, gui: &mut Gui, queue: &wgpu::Queue, it: &HotbarItems<'_>, cx: i32, h: i32) {
-        use std::hash::{Hash, Hasher};
         let f = |v: i32| v as f32;
         let mut plan = Vec::new();
         // Off hand on the side opposite the main hand.
@@ -719,14 +718,12 @@ impl Hud {
                 if let Some(model) = view.model() {
                     models.layers(name, &model, &view, it.env, i as i32 + 1, &mut layers, &mut key);
                 }
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                key.hash(&mut hasher);
                 self.slot_cache[i] = Some(SlotCache {
                     stack: stack.clone(),
                     hold,
                     tick: it.env.tick,
                     layers,
-                    key: hasher.finish(),
+                    key: crate::cache_key::item_layers_key(&key),
                     bar: view.durability_bar(),
                 });
             }

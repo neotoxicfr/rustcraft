@@ -4,7 +4,8 @@
 //! the cache keeps every sound played until the resources reload, like the game.
 //! `cargo-file.ps1 run --release -p rc-audio --example pcm_census`
 
-use std::collections::{BTreeMap, HashSet};
+use hashbrown::HashSet;
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use rc_audio::SoundTable;

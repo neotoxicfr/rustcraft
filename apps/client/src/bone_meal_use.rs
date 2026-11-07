@@ -213,7 +213,7 @@ fn lichen(w: &impl World, p: P) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use hashbrown::HashMap;
 
     /// Fake world: named blocks with properties, air elsewhere; full cubes listed.
     #[derive(Default)]

@@ -18,7 +18,7 @@ mod tests;
 
 pub(crate) use summoned::summoned;
 
-use std::collections::HashSet;
+use hashbrown::HashSet;
 
 use rc_client::{EntityEvent, Event};
 use rc_physics::Aabb;

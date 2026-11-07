@@ -4,3 +4,12 @@ disallowed-methods = [
     { path = "std::env::set_var", reason = "the environment never changes after startup: the caches of rc_data::env_flags depend on it" },
     { path = "std::env::remove_var", reason = "the environment never changes after startup: the caches of rc_data::env_flags depend on it" },
 ]
+
+# SipHash costs several times foldhash on the short keys of our tables, and no outsider picks those
+# keys (docs/perf.md, "Hash tables of all the crates").
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "SipHash: use hashbrown::HashMap (foldhash)" },
+    { path = "std::collections::HashSet", reason = "SipHash: use hashbrown::HashSet (foldhash)" },
+    { path = "std::hash::RandomState", reason = "SipHash with a random seed: use hashbrown::DefaultHashBuilder for a table, a fixed foldhash seed for a cache key (the client's cache_key)" },
+    { path = "std::hash::DefaultHasher", reason = "SipHash: for a cache key use a fixed-seed foldhash (the client's cache_key); a test fingerprint pinned on SipHash says so in an allow" },
+]

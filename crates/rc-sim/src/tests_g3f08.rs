@@ -377,7 +377,7 @@ fn fetchprofile_and_join_use_the_name_cache() {
 /// held during the network access).
 #[test]
 fn fetchprofile_pool_reuses_threads_and_overlaps_loads() {
-    use std::collections::HashSet;
+    use hashbrown::HashSet;
     use std::sync::Mutex;
     use std::sync::atomic::Ordering::SeqCst;
     use std::time::{Duration, Instant};

@@ -119,7 +119,7 @@ fn assert_equivalent(sb: &mut Scoreboard, step: usize) {
     let (name, o) = sb.sidebar_objective(LOCAL).expect("displayed objective");
     assert_eq!(cached.title, full.title, "step {step}: title");
     assert_eq!(cached.holders.len(), full.holders.len(), "step {step}: number of lines");
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = hashbrown::HashSet::new();
     for (i, (hc, hf)) in cached.holders.iter().zip(&full.holders).enumerate() {
         assert!(seen.insert(hc), "step {step}: holder {hc} duplicated");
         let kc = key(sb, name, hc);

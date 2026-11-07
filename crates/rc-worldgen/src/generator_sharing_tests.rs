@@ -27,6 +27,7 @@ const SHARING: [&str; 6] = [
 const SEEDS: [i64; 3] = [0, 20_261_011, -4_172_144_997_902_289_642];
 
 /// Digest of a debug rendering, without building the (large) text.
+#[allow(clippy::disallowed_types, reason = "test fingerprint: the same fixed SipHash for every run it compares")]
 struct DigestWriter(std::collections::hash_map::DefaultHasher);
 
 impl std::fmt::Write for DigestWriter {
@@ -36,6 +37,7 @@ impl std::fmt::Write for DigestWriter {
     }
 }
 
+#[allow(clippy::disallowed_types, reason = "test fingerprint: the same fixed SipHash for every run it compares")]
 fn digest(v: &impl std::fmt::Debug) -> u64 {
     let mut w = DigestWriter(std::collections::hash_map::DefaultHasher::new());
     write!(w, "{v:?}").expect("debug rendering");

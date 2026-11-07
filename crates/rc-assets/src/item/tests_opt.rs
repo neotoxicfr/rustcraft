@@ -296,7 +296,7 @@ impl std::fmt::Write for Fp {
 fn compare_eval(m: &ItemModels, ids: &[String]) -> (usize, usize, u64) {
     let (mut evals, mut layers) = (0, 0);
     let mut fp = Fp::new();
-    let mut seen = std::collections::HashMap::new();
+    let mut seen = hashbrown::HashMap::new();
     let (stacks, envs) = (stacks(), envs());
     for id in ids {
         let short = id.strip_prefix("minecraft:").unwrap_or(id);

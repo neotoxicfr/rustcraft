@@ -8198,3 +8198,59 @@ threads), 2 alternating passes against `main`; then `LIGHTREADROWS=0`, `LIGHTSCA
 `LIGHTWRITECOLUMN=0` and `LIGHTZEROONLYRING=1` one at a time; the relight trace bench A B B A
 (`work` against `before_io`).
 
+
+## C7-M08: the last SipHash of the client, one item atlas key, map preview version, clippy guard (07/11, loaded machine)
+
+Micro-benches `cargo test --release -p rc-app bench_cache_key bench_map_preview_stamp -- --ignored
+--nocapture --test-threads 1`, trial profile, machine loaded by other agents compiling, 3 runs
+(figures below: range of the 3). Main thread work of a few keys per frame: one core only, nothing
+to spread over threads or the GPU.
+
+- Client cache keys (`RUSTCRAFT_OPT_FAST_CACHE_KEY`, default 1, `=0`: SipHash as before). Nine
+  sites hashed with the standard library's SipHash-1-3 (zero key, deterministic): four copies of
+  the same code fed the item atlas key (hotbar, menu slots, free item drawing, debug switcher),
+  plus the swallowed content of a sulfur cube (per entity, per frame), the worn trim texture, the
+  recipe book's craftable stamp, the tooltip log and the map preview. All go through
+  `cache_key::cache_key` now (`item_layers_key` for the four item sites): foldhash quality variant
+  with a fixed seed (never a seed per call or per builder, which would allocate a new atlas cell
+  each frame). foldhash 0.2.0 was already in the lock file (under hashbrown); declared as a
+  workspace dependency, nothing new compiled.
+
+| ns per key, 3 to 8 words, best of 7 | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| SipHash-1-3 (former) | 12.20 | 12.09 | 12.42 |
+| foldhash quality, fixed seed (kept) | 2.41 | 2.41 | 2.48 |
+| foldhash fast, fixed seed | 2.17 | 2.20 | 2.23 |
+| hashbrown default builder, one per process (approach B, no new dependency) | 2.16 | 2.18 | 2.21 |
+
+  −80 % per key. The fast variant and the per-process builder gain another 0.2 ns per key (≈ 10 ns
+  per frame for a full inventory, and the menu and hotbar keys are kept per slot until the tick
+  changes): not measurable on a frame, and the quality variant spreads the 64 bits better (two
+  renders that collide share a cell). Measured, not wired; re-measure if the key count grows.
+  Proof: `cache_key::tests` (same key on every call and for a list rebuilt anew, pinned value of
+  the fixed seed, SipHash path equal to the former code, 30 atlas cells for 600 frames of a
+  46-slot inventory, no collision over 20,000 lists); sabotage (seed changed per call): 3 of these
+  fail. Not done: the GPU atlas cell count over 600 real inventory frames and the 1600×900
+  captures (scenes, quiet machine).
+- Map preview (`RUSTCRAFT_OPT_MAP_VERSION`, default 1, `=0`: hash of the colors). The preview slot
+  of a map in a menu hashed the 16 KiB of colors every frame to know whether to re-upload; the map
+  now carries a version bumped by every patch that writes a pixel (`dirty` stays for the world
+  textures, the table generation moves only on reset). 1,921 / 1,967 / 1,946 ns → 0.3 / 0.4 /
+  0.4 ns per frame. A patch writing the colors already there now re-uploads once (the hash saw no
+  change): never a stale texture, one extra 64 KiB upload at most per such patch. Proof:
+  `map_preview_follows_every_patch_and_nothing_else` (3 copies for 3 pixel-writing patches, none
+  between, stale preview checked every frame, both stamps); sabotage (version not bumped): fails.
+- Server tables and the guard. The last standard `HashMap` / `HashSet` outside the tests (team
+  collision index, `/fetchprofile` cache, decoration adoption set, the LAN guest table of a basic
+  command) moved to hashbrown: read by key only, or iterated where the standard table's order was
+  already random per process (the profile cache's oldest-entry eviction, ties included), so no
+  order becomes observable. No bench gain expected (the collision index is read only with team
+  rules). `clippy.toml` now rejects `std::collections::HashMap`, `HashSet`, `std::hash::RandomState`
+  and `DefaultHasher` (the type, so `::new()` too), each with its replacement in the reason. Test
+  sites were moved to hashbrown (or a `BTreeSet` in rc-proto-v777, which has no hashbrown);
+  explicit allows remain for the three test fingerprints that compare runs with one fixed SipHash
+  (`generation_tests`, `tests_light_m05`, `generator_sharing_tests`), the old-path SipHash of
+  `cache_key`, and the capture tool (`tools/rc-capture`). Sabotage: a standard `HashMap` put back
+  in the team index fails `clippy -D warnings`.
+- Scenes to measure (quiet machine): equipped-humanoids, dropped-items, crowd-1000, redstone, and a
+  map held in a menu if the scene group adds one (maps-1).

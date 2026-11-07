@@ -272,7 +272,7 @@ fn memory_case(variant: &str, paths: CommandPaths, distinct: bool) {
     let start = std::time::Instant::now();
     f.parse_every_line(&levels[2], &d);
     let first_run_ms = start.elapsed().as_secs_f64() * 1e3;
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = hashbrown::HashSet::new();
     let mut bytes = 0usize;
     for line in f.ready_lines() {
         bytes += size_of::<ReadyLine>();

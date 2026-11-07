@@ -8,7 +8,6 @@
 //! - Enchantments: `crossbow_charge_time` effect (crossbow charge duration).
 
 use hashbrown::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::{Arc, LazyLock, RwLock};
 
 use rc_assets::palette::{self, Palette};
@@ -271,9 +270,7 @@ pub fn worn_texture(
     layer_type: &str,
     known: impl Fn(&str) -> bool,
 ) -> Option<(String, Option<Image>)> {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    (trim_bytes, equip_asset, layer_type).hash(&mut h);
-    let key = h.finish();
+    let key = crate::cache_key::cache_key(&(trim_bytes, equip_asset, layer_type));
     if let Some(found) = REGS.read().unwrap_or_else(|p| p.into_inner()).worn.get(&key) {
         let name = found.clone()?;
         if known(&name) {

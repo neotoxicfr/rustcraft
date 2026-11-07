@@ -255,7 +255,7 @@ fn base_height_paths_identical() {
         let differ = cols.chunks(2).zip(reference.chunks(2)).filter(|(_, h)| h[0] != h[1]).count();
         // Surface and floor differ only where there is water (main world).
         assert!(!dim.ends_with("overworld") || differ > 100, "{dim}: surface and floor too rarely distinct ({differ})");
-        let distinct: std::collections::HashSet<i32> = reference.iter().copied().collect();
+        let distinct: hashbrown::HashSet<i32> = reference.iter().copied().collect();
         // Nether: bedrock ceiling, always 128 (first block read); it only tests the stop.
         assert!(dim.ends_with("nether") || distinct.len() > 5, "{dim}: heights too uniform {distinct:?}");
     }

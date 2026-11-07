@@ -1,5 +1,6 @@
 // Direct read allowed (tool outside the game, single read at startup); the game goes through rc_data::env_*!.
 #![allow(clippy::disallowed_methods)]
+#![allow(clippy::disallowed_types, reason = "tool outside the game: a few small tables built once, SipHash is fine")]
 //! Capture proxy: the client connects to `--listen`, the proxy relays byte for byte to
 //! `--target` and, on the side, decodes the frames to log and record each packet. Only works
 //! in offline mode (no encryption to intercept).

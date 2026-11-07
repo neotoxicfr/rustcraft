@@ -566,18 +566,15 @@ fn affine_scale(s: f32) -> [f32; 6] {
     [s, 0.0, 0.0, s, 0.0, 0.0]
 }
 
-/// Last content sent in the slot `dyn/map/0`: map, generation, fingerprint.
+/// Last content sent in the slot `dyn/map/0`: map, generation, content stamp.
 static MAP_SLOT: std::sync::Mutex<Option<(i32, u32, u64)>> = std::sync::Mutex::new(None);
 
 /// Map `id` drawn at `(x, y)` at scale `s`: 128 × 128 pixels then the decorations
 /// visible in a frame (8 × 8 icon rotated in sixteenths of a turn, name reduced on a dark background).
 fn draw_map_preview(cx: &mut Ctx<'_, '_>, id: i32, x: i32, y: i32, s: f32) {
-    use std::hash::{Hash, Hasher};
     let store = crate::maps::store();
     let Some(d) = store.get(id) else { return };
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    d.colors.hash(&mut h);
-    let key = (id, store.generation, h.finish());
+    let key = (id, store.generation, d.content_stamp(rc_data::opt_switch!("RUSTCRAFT_OPT_MAP_VERSION")));
     let mut last = MAP_SLOT.lock().unwrap_or_else(|p| p.into_inner());
     if *last != Some(key) {
         let pal = crate::maps::palette();

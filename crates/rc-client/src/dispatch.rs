@@ -556,7 +556,7 @@ mod tests {
         let Some(data) = rc_testdata::version_data() else { return };
         let ids = Ids::resolve(&data).expect("packet identifiers");
         fn check<K: std::fmt::Debug>(name: &str, order: &[(i32, K)]) {
-            let mut seen = std::collections::HashMap::new();
+            let mut seen = hashbrown::HashMap::new();
             for (id, k) in order.iter().filter(|e| e.0 >= 0) {
                 if let Some(first) = seen.insert(*id, k) {
                     panic!("{name}: identifier {id} claimed by {first:?} then {k:?}");

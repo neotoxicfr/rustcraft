@@ -113,9 +113,9 @@ struct CollisionIndex {
     /// At least one team has a rule other than "always" (otherwise the push filters nothing).
     active: bool,
     /// Members whose name is a UUID in canonical text (entities).
-    by_uuid: std::collections::HashMap<u128, (u32, u8)>,
+    by_uuid: hashbrown::HashMap<u128, (u32, u8)>,
     /// Other members (players, free names).
-    by_name: std::collections::HashMap<String, (u32, u8)>,
+    by_name: hashbrown::HashMap<String, (u32, u8)>,
 }
 
 /// Which optimised paths a board takes, each behind its switch (`0` restores the former way),

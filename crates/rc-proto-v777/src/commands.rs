@@ -529,7 +529,7 @@ mod tests {
         // `message` arguments (say) and various types present.
         let say = child(&t, t.root, "say");
         assert_eq!(t.nodes[say.children[0] as usize].arg, Some(ArgType::Message));
-        let used: std::collections::HashSet<usize> =
+        let used: std::collections::BTreeSet<usize> =
             t.nodes.iter().filter_map(|n| n.arg.as_ref()).map(ArgType::id).collect();
         assert!(used.len() > 40, "{} types used", used.len());
     }
