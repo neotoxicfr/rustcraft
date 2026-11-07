@@ -13,6 +13,9 @@ use rc_proto_v777::item::ItemStack;
 
 use super::*;
 
+// Primed TNT (§ 4.1), drawn by the hundred when a heap goes off.
+mod primed_tnt;
+
 /// Quad of a named block model: positions as a fraction of a block, UV as a fraction of the texture
 /// `tex` (atlas name), normal, tint index.
 pub(crate) struct ModelQuad {
@@ -149,6 +152,8 @@ pub(super) struct Objects {
     /// Guardians' eye of the frame (entity → x, y offset of the "eye" part), turned towards
     /// the attack target, otherwise towards the camera entity.
     pub(super) guardian_eyes: hashbrown::HashMap<i32, [f32; 2]>,
+    /// Shared pose and kept placements of the primed TNT.
+    primed_tnt: primed_tnt::TntDrawState,
 }
 
 /// Colours of a block drawn as an entity: position-less colours of its tint sources
@@ -273,6 +278,7 @@ impl Objects {
             local: -1,
             guardian_eyes: Default::default(),
             lines: Vec::new(),
+            primed_tnt: Default::default(),
         }
     }
 }
@@ -556,6 +562,11 @@ fn hurt_shake(e: &Entity, pt: f32) -> Mat4 {
     Mat4::from_rotation_x(deg(table_sin(h) * h * d / 10.0 * dir))
 }
 
+/// ARGB colour as the RGBA bytes of an instance.
+fn argb_to_instance_rgba(c: u32) -> u32 {
+    (c >> 16 & 0xff) | (c & 0xff00) | (c & 0xff) << 16 | (c & 0xff00_0000)
+}
+
 /// Swelling and blinking of TNT (§ 4.1) for f = fuse − pt + 1.
 fn tnt_swell(f: f32) -> (f32, bool) {
     let g = if f < 10.0 { (1.0 - f / 10.0).clamp(0.0, 1.0).powi(4) * 0.3 } else { 0.0 };
@@ -737,18 +748,7 @@ impl EntityRenderer {
             }
             _ if is_boat(k) => self.push_boat(e, pt, t, normal),
             _ if is_minecart(k) => self.push_minecart(e, pt, t, p, normal, world.state),
-            "tnt" => {
-                let f = e.meta_int(8).unwrap_or(80) as f32 - pt + 1.0;
-                let (g, on) = tnt_swell(f);
-                let state = meta_state(e, 9).unwrap_or_else(|| self.default_state("minecraft:tnt"));
-                let m = t
-                    * Mat4::from_translation(Vec3::new(0.0, 0.5, 0.0))
-                    * Mat4::from_scale(Vec3::splat(1.0 + g))
-                    * Mat4::from_rotation_y(deg(-90.0))
-                    * Mat4::from_translation(Vec3::new(-0.5, -0.5, 0.5))
-                    * Mat4::from_rotation_y(deg(90.0));
-                self.push_block(state, m, normal, if on { WHITE } else { NEUTRAL })
-            }
+            "tnt" => self.push_primed_tnt(e, pt, rel, normal),
             "falling_block" => {
                 let state = u32::try_from(e.data).unwrap_or(0);
                 // Same state already placed in the world (landing): no duplicate.
@@ -1281,25 +1281,42 @@ impl EntityRenderer {
     fn push_mesh(&mut self, mesh: usize, m: Mat4, light: u32, overlay: u32, tint: Option<(u32, BlockTint)>) {
         let base = self.mats.len() as u32;
         self.mats.push(PartMat::new(&m));
-        // Carried blocks, falls and frames: block types of the game, back faces culled. A block
-        // with a translucent quad is blended whole in the translucent phase (with the
-        // items, sorted by the cube's centre); otherwise cut out with the solids.
-        let (pass, src) = if self.objects.mesh_translucent.get(mesh).copied().unwrap_or(false) {
-            (super::PASS_ITEM_TRANSLUCENT, 1 | super::SRC_BLOCK_CENTER)
-        } else {
-            (super::PASS_CUTOUT_CULL, 1)
-        };
+        let (pass, src) = self.mesh_pass(mesh);
         for g in 0..self.objects.meshes[mesh].len() {
             let (t, first, count) = self.objects.meshes[mesh][g];
             let c = tint.map_or(0xffff_ffff, |(state, b)| self.block_tint(state, t, b));
-            // ARGB → RGBA bytes of the instance.
-            let color = (c >> 16 & 0xff) | (c & 0xff00) | (c & 0xff) << 16 | (c & 0xff00_0000);
+            let color = argb_to_instance_rgba(c);
             self.instances[pass].push((
                 src,
                 first,
                 count,
                 Instance { base, rect: [0.0, 0.0, 1.0, 1.0], color, light, overlay },
             ));
+        }
+    }
+
+    /// Pass and source of a baked block mesh. Carried blocks, falls and frames: block types of
+    /// the game, back faces culled. A block with a translucent quad is blended whole in the
+    /// translucent phase (with the items, sorted by the cube's centre); otherwise cut out with
+    /// the solids.
+    fn mesh_pass(&self, mesh: usize) -> (usize, u8) {
+        if self.objects.mesh_translucent.get(mesh).copied().unwrap_or(false) {
+            (super::PASS_ITEM_TRANSLUCENT, 1 | super::SRC_BLOCK_CENTER)
+        } else {
+            (super::PASS_CUTOUT_CULL, 1)
+        }
+    }
+
+    /// Light of a block drawn as an entity: full light for an emissive block, otherwise the
+    /// entity's light with its block level raised to the block's own emission.
+    fn block_as_entity_light(&self, state: u32, light: u32) -> u32 {
+        match self.source.state(state).map(|i| (i.light, i.light_emission)) {
+            Some((bits, _)) if bits & rc_data::light_bits::EMISSIVE != 0 => 0xf0f0,
+            Some((_, emission)) => {
+                let b = (light & 0xff).max(u32::from(emission) * 16);
+                (light & 0xff00) | b
+            }
+            None => light,
         }
     }
 
@@ -1314,15 +1331,7 @@ impl EntityRenderer {
     /// (`BlockTint::Entity`), special model of the block if it has one (chests, heads, banners,
     /// Shulker boxes…), drawn without block-entity data.
     pub(super) fn push_block_tinted(&mut self, state: u32, m: Mat4, light: u32, overlay: u32, tint: BlockTint) -> bool {
-        let info = self.source.state(state).map(|i| (i.light, i.light_emission));
-        let light = match info {
-            Some((bits, _)) if bits & rc_data::light_bits::EMISSIVE != 0 => 0xf0f0,
-            Some((_, emission)) => {
-                let b = (light & 0xff).max(u32::from(emission) * 16);
-                (light & 0xff00) | b
-            }
-            None => light,
-        };
+        let light = self.block_as_entity_light(state, light);
         let mesh = self.block_mesh(state);
         if let Some(mesh) = mesh {
             self.push_mesh(mesh, m, light, overlay, Some((state, tint)));
@@ -1968,8 +1977,30 @@ pub struct DisplayState {
     new_render: bool,
     start: i64,
     duration: i32,
-    pub(crate) last: std::cell::Cell<f32>,
+    pub(crate) last: RenderedProgress,
     pub(crate) render: Option<DisplayRender>,
+}
+
+/// Last progress of a display written by the render through a shared reference. An atomic read
+/// and written without ordering (a plain load and store) rather than a `Cell`, so that entities
+/// can be read from several threads (the frame's entity list).
+#[derive(Debug, Default)]
+pub(crate) struct RenderedProgress(std::sync::atomic::AtomicU32);
+
+impl RenderedProgress {
+    pub(crate) fn get(&self) -> f32 {
+        f32::from_bits(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    pub(crate) fn set(&self, v: f32) {
+        self.0.store(v.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Clone for RenderedProgress {
+    fn clone(&self) -> Self {
+        RenderedProgress(self.get().to_bits().into())
+    }
 }
 
 impl Default for DisplayState {
@@ -1980,7 +2011,7 @@ impl Default for DisplayState {
             new_render: false,
             start: i64::from(i32::MIN),
             duration: 0,
-            last: std::cell::Cell::new(0.0),
+            last: RenderedProgress::default(),
             render: None,
         }
     }

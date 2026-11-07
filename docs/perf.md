@@ -9220,3 +9220,88 @@ points, not the 49 and 121 the mission expected: the micro-bench covers all four
   reference exe), each switch at 0 alone (`NOISE_BATCH_POINTS`, `NOISE_BATCH_AVX2`,
   `NOISE_BATCH_SHARED_CELL`, `NOISE_XPRE`, `NOISE_XY_PERM_TABLE`), then all five at 0.
 
+## T-M02: primed TNT and ground items in bulk, per-entity work cut down (07/11, loaded machine)
+
+Hot map of `tnt-heap` (1,728 TNT set off, exe of waves 3+4): `EntityRenderer::prepare` 9% of the
+frame during the explosion. The vertices were already shared (block mesh and item meshes baked
+once, one instance per entity and group): the per-entity cost was elsewhere. Benches
+`tests_mass_entities` (26.3 data and game, windowless GPU): scenes shaped like `tnt-heap` (1,728
+TNT in a 12 × 12 × 12 heap, fuses 0 to 79 ticks, a third moving) and `dropped-items` (its eight
+items, a fifth of the stacks with copies, one in seven moving). Before (1 core, median):
+1,728 TNT 280 µs per `prepare` (list and sort 89, shadows 38, object path 133 of which light probes
+18); 500 ground items 74 µs (list 12, item path 56). Every switch is read once (`EntOpt`).
+
+- `RUSTCRAFT_OPT_PRIMED_TNT_SHARED_POSE`: a TNT that is not swelling has every other one's block
+  pose up to its translation. The product `T(rel) · T(0, ½, 0) · S(1) · Ry(−90°) · T(−½, −½, ½) ·
+  Ry(90°)` taken left to right leaves the rotation columns of the constant tail as they are and
+  makes the translation column the tail's own plus `(rel.x, rel.y + ½, rel.z)`, added last: the
+  pose (normal matrix included), its mesh groups and colours are built once per state, each TNT
+  adds its translation (the same floats up to the sign of zeros; 2 sine/cosine pairs and 5 matrix
+  products gone). A swelling TNT keeps the product, its two quarter turns built once; the TNT's
+  default state kept instead of a lookup by name; a state with a special model (chest as the
+  TNT's block) keeps the full path.
+- `RUSTCRAFT_OPT_PRIMED_TNT_BY_KIND_FLAG`: a primed TNT drawn from its kind flag (`KINDINFO`)
+  instead of being found by about twenty name comparisons among the object kinds.
+- `RUSTCRAFT_OPT_STILL_TNT_CACHE` (second lead, default OFF): matrix and instances of a TNT replayed
+  while its position, swelling, blinking, state and light stay the same (entry and list reused
+  for a moving TNT). Alone −6.7%, but with the shared pose it costs more than it saves (the pose
+  is three additions): kept off, to settle on the quiet machine.
+- `RUSTCRAFT_OPT_GROUND_ITEM_LAYOUT_CACHE`: model layers, model box (it was recomputed over every
+  quad of the model, every frame) and copy offsets of a stack on the ground kept per stack
+  content (`ItemStack` now hashable), as long as the evaluation reads nothing from the
+  surroundings (new `ItemModels::layers_watched`, whatever `ITEMENVFLAG`): compass, clock, a use
+  in progress are evaluated every frame as before. Shared with the ominous item spawner; dropped
+  on an item-model reload (generation) and beyond 4,096 stacks.
+- `RUSTCRAFT_OPT_ITEM_GROUPS_IN_PLACE`: the tint groups of an item mesh read in place (they were
+  copied into a new vector for every layer drawn).
+- `RUSTCRAFT_OPT_DISTANCE_SORT_KEYS`: the frame's far-to-near order sorted on (distance key,
+  rank) pairs, then the 72-byte rows moved once (the merge sort moved them at every step and
+  allocated a buffer); the translucent items sorted on a distance computed once per instance (the
+  comparator rebuilt two matrices at every comparison). Same order as the stable sort (IEEE
+  total order as an integer, NaN and ±0 tested).
+- `RUSTCRAFT_OPT_INSTANCE_BUCKETS`: instances grouped by geometry in one counting pass (a list
+  already in order is left alone: one kind of model), into buffers kept between frames, as the
+  flat instance list and the free geometry (both were fresh vectors every frame).
+- `RUSTCRAFT_OPT_PARALLEL_ENTITY_LIST` (several cores, default OFF): positions, sizes, kinds
+  and distances of the list on the pool from 4,096 entities, slices of at least 1,024 (rayon
+  keeps the order). Needed entities readable from several threads: the display's last rendered
+  progress went from a `Cell` to an atomic read and written without ordering (a plain load and
+  store). List alone, µs, 1 thread then pools of 2 / 4 / 8 / 16 / 32 (slices of 512, loaded
+  machine, noisy): 2,000 entities 54 → 51 / 47 / 79 / 222 / 374; 4,000: 81 → 67 / 54 / 86 / 219 /
+  368; 8,000: 134 → 98 / 73 / 85 / 202 / 379; 16,000: 243 → 161 / 107 / 111 / 208 / 408. Waking
+  the whole pool costs more than the work shared; above 4,000 entities 2 to 4 threads win
+  20 to 55%. Off until the quiet-machine bench (the `tnt-heap` scene stays under 2,500 entities).
+- GPU (B4): not applicable as such: after the shared pose a still TNT costs three additions; the
+  transfer is the 112-byte part matrix per TNT (194 KB per frame at 1,728), whose rotation and
+  normal part is the same for every TNT: a translation-only instance format would cut it by 4,
+  but needs the entity shader to read it (not done, noted).
+- `bench_mass_entities` (prepare + batches, median of 61 alternated rounds, 1 core), µs:
+
+| Scene | old | all (default) | shared pose alone | by kind flag alone | still cache alone | layout cache alone | sort keys alone | buckets alone |
+|---|---|---|---|---|---|---|---|---|
+| 1,728 TNT | 235.7 | 172.6 (−26.8%) | 197.4 (−16.2%) | 224.2 (−4.9%) | 219.9 (−6.7%) | 237.6 | 225.0 (−4.5%) | 236.7 |
+| 500 ground items | 73.4 | 33.6 (−54.2%) | 73.4 | 73.7 | 73.4 | 37.0 (−49.6%) | 73.0 | 72.1 (−1.8%) |
+| both | 337.2 | 227.2 (−32.6%) | 300.0 (−11.0%) | 326.4 (−3.2%) | 326.3 (−3.2%) | 300.5 (−10.9%) | 323.6 (−4.0%) | 334.2 (−0.9%) |
+
+  Shared pose + still cache 207.5 (TNT) against 197.4 for the pose alone; shared pose + kind flag
+  184.3; layout cache + groups in place 35.7 (items). Groups in place alone −0.8% (items). An
+  earlier run on a less loaded machine gave the same ratios (TNT 243 → 189, items 76 → 35).
+- Proof: `bulk_entities_same_under_every_switch` (1,728 TNT + 2,400 ground items, two frames, the
+  second one replaying what is kept, then the batches): every switch alone on and alone off
+  equals its old path, matrices up to the sign of zeros; frozen fingerprint; the fast paths are
+  checked to have been taken (shared pose, kept placements, kept layouts, the compass reading its
+  surroundings). Sabotages seen failing: the TNT lift ½ → ¼ (exactly the configurations with the
+  shared pose on), the compass kept like the others (exactly those with the layout cache on), a
+  copy offset 0.075 → 0.076 (both paths: the frozen fingerprint). `draw_order` tests: the key
+  orders like `total_cmp` reversed, the keyed sort and the buckets give the stable order, the
+  translucent order equals the comparator's. The golden scene of `prepare` (TNT and item
+  included) is unchanged under every switch.
+- Not done, noted: the shadows (37 µs for 1,728 TNT: block and light reads under each one, not
+  keepable without a world revision), `special_mesh` still allocates its key and clones its
+  groups (special models on the ground are rare), the other object kinds still found by name
+  (the kind dispatch for every object belongs to the entity chains C3-M22 to M25).
+- To measure on the quiet machine: `tnt-heap` (worst second of frames, p99), `tnt`,
+  `dropped-items`, `crowd-1000` (2 alternated passes, `main` and the reference exe), each switch at
+  0 alone, then `STILL_TNT_CACHE=1` and `PARALLEL_ENTITY_LIST=1`; samply over the explosion window;
+  captures 1600×900 of `tnt-heap` and `dropped-items` in one run with every switch at 0 against the
+  default.
