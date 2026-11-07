@@ -123,7 +123,9 @@ impl Server {
         }
         let (_, n) = self.entities.get_mut(&from).expect("entry found above").remove(k);
         let visible = crate::decoration::client_visible(&n);
-        self.entities.entry(to).or_default().push((id, n));
+        let list = self.entities.entry(to).or_default();
+        list.push((id, n));
+        self.kept_index.placed(id, to, list.len() - 1);
         self.life.drop_chunks.extend([from, to]);
         self.deco_moved_to_chunk(id, to);
         let (seen_before, seen_now) = (self.sent.contains(&from), self.sent.contains(&to));
@@ -342,6 +344,12 @@ impl Server {
                         }
                     }
                     old = Some(std::mem::replace(o, new.clone()));
+                }
+                // A compound without a UUID takes the one provided.
+                if let Some(o) = &old
+                    && nbtio::uuid(o.get("UUID")) != nbtio::uuid(new.get("UUID"))
+                {
+                    self.kept_index.uuid_changed();
                 }
                 // G5-F05: the reloaded text display resolves its text again (previous one kept
                 // on failure); own data of displays and interactions sent when changed.
@@ -757,7 +765,8 @@ impl Server {
                 }
             }
             E::Other(i) => {
-                self.entity_scores_removed(self.ent_uuid(e));
+                let uuid = self.ent_uuid(e);
+                self.entity_scores_removed(uuid);
                 // A marker was never announced: no removal either (G5-F05).
                 let visible = self.other(i).is_none_or(crate::decoration::client_visible);
                 let held_by = self.kept_entity_slot(i);
@@ -770,13 +779,17 @@ impl Server {
                         self.life.drop_chunks.insert(c);
                     }
                     #[cfg(test)]
-                    assert!(self.kept_entity_slot(i).is_none(), "kept compound {i} listed twice");
+                    assert!(
+                        super::kept_entity_index::scan(&self.entities, i).is_none(),
+                        "kept compound {i} listed twice"
+                    );
                 } else {
                     for l in self.entities.values_mut() {
                         l.retain(|(x, _)| *x != i);
                     }
                     self.life.drop_chunks.extend(self.entities.keys().copied().collect::<Vec<_>>());
                 }
+                self.kept_index.forget(i, uuid);
                 self.deco_forget(i);
                 if visible {
                     let _ = self.send(Event::Entity(EntityEvent::Remove(vec![i])));

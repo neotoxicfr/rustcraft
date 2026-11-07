@@ -6,7 +6,8 @@
 //! - the quadratic case: every zombie searching the zombies around it (`execute as … at @s run …`
 //!   and `execute as … at @s if entity … run …`), 100 and 1,000 zombies;
 //! - searches over 1,000 markers, ground items and orbs (the families read as records);
-//! - 1,000 markers each adding to its own score (`@s`: the kept entity lookup).
+//! - 1,000 markers each adding to its own score (`@s`: the kept entity lookup);
+//! - `kill` and `tp` to another chunk of 1,000 markers sharing one chunk (lists shifted under it).
 //!
 //! One thread: commands run on the server thread (a search reads the world in order; no
 //! multi-core or GPU variant). Run alone:
@@ -183,6 +184,37 @@ fn bench_selectors_parse() {
         if cfg!(feature = "memstats") {
             bench_kit::report("select_parse", &case, "allocs", bench_kit::median(&allocs));
         }
+    }
+}
+
+/// `kill` and a move to another chunk of 1,000 markers sharing one chunk: every removal shifts the
+/// rest of the list under the kept entity index. Both commands empty the chunk, so each run gets
+/// a fresh world and the command is timed once.
+#[test]
+#[ignore = "measurement bench"]
+fn bench_selectors_markers_kill_and_move() {
+    crate::mobs::index::set_verify(false);
+    for (name, command) in [
+        ("kill", "kill @e[type=minecraft:marker]"),
+        ("move", "execute as @e[type=minecraft:marker] run tp @s ~40 ~ ~"),
+    ] {
+        let mut us = Vec::new();
+        for run in 0..RUNS {
+            let (mut p, dir) = crate::tests_g3f13::open(&format!("bench-select-{name}-{run}"));
+            for i in 0..1_000 {
+                let (x, z) = ((i % 32) as f64 / 2.0, (i / 32) as f64 / 2.0);
+                cmd(&mut p, &format!("summon minecraft:marker {x} -60 {z}"));
+            }
+            let _ = p.take_events();
+            let src = p.s.server_source();
+            let start = std::time::Instant::now();
+            std::hint::black_box(p.s.perform(src, command));
+            us.push(start.elapsed().as_secs_f64() * 1e6);
+            crate::tests_g3f13::finish(p, dir);
+        }
+        let best = us.iter().copied().fold(f64::INFINITY, f64::min);
+        bench_kit::report("select_markers_one_chunk", &format!("{name}_1000"), "us", bench_kit::median(&us));
+        bench_kit::report("select_markers_one_chunk", &format!("{name}_1000"), "us_best", best);
     }
 }
 

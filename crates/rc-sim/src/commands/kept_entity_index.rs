@@ -1,11 +1,12 @@
 //! Hint identifier → (chunk, list index) for the kept entity compounds (`Server::entities`:
 //! markers, armor stands, frames, every entity the simulation keeps as NBT).
 //!
-//! The lists stay the only truth and change in many places (chunk loads and unloads, summons,
-//! kills, refiles, dimension swaps), so the index is only a hint: a read checks that the hinted
-//! slot still holds the identifier, otherwise it scans the lists as before and repairs the hint
-//! (the one entry when it was missing, a whole rebuild at the next read when a list shifted under
-//! it). A change the index never heard of costs time, never a wrong answer:
+//! The lists stay the only truth and change in many places (chunk loads, adoptions, summons,
+//! kills, refiles), so the index is only a hint: a read checks that the hinted slot still holds
+//! the identifier, otherwise it searches the hinted chunk's list (a removal earlier in it only
+//! shifts the entry towards the front), then every list as before, and repairs that one entry.
+//! Kills and moves to another chunk tell the index directly; each dimension keeps its own index
+//! (swapped with its lists). A change the index never heard of costs time, never a wrong answer:
 //! one counter numbers every entity (`Server::next_entity`), so a slot holding the identifier is
 //! the one the scan finds (checked against the scan at every read during tests).
 //!
@@ -28,15 +29,18 @@ fn on() -> bool {
     rc_data::opt_switch!("RUSTCRAFT_OPT_KEPT_ENTITY_INDEX")
 }
 
-/// Hint of where each kept compound sits, rebuilt from the lists when it served a wrong slot.
+/// Hint of where each kept compound sits, each wrong entry repaired by the read that meets it.
 #[derive(Default)]
 pub(crate) struct KeptEntityIndex {
     slots: RefCell<hashbrown::HashMap<i32, (Chunk, u32)>>,
-    /// Built from the lists and not caught out since (false: rebuild at the next read).
-    fresh: Cell<bool>,
+    /// Made from every list once, at the first read; afterwards only single entries change.
+    built: Cell<bool>,
     /// UUID → smallest identifier carrying it, made at the first lookup by UUID (most worlds
     /// never ask, and reading every compound's UUID costs more than its slot); `None`: to make.
     by_uuid: RefCell<Option<hashbrown::HashMap<u128, i32>>>,
+    /// Tests: walks over every list (the first build and the scans), what a hint should save.
+    #[cfg(test)]
+    full_walks: Cell<u32>,
 }
 
 impl KeptEntityIndex {
@@ -79,33 +83,36 @@ impl KeptEntityIndex {
     }
 
     fn find_hinted(&self, lists: &Lists, id: i32) -> Option<(Chunk, usize)> {
-        if !self.fresh.get() {
-            self.rebuild(lists);
+        if !self.built.get() {
+            self.build(lists);
         }
         let hint = self.slots.borrow().get(&id).copied();
-        if let Some((chunk, k)) = hint
-            && lists.get(&chunk).and_then(|l| l.get(k as usize)).is_some_and(|(x, _)| *x == id)
-        {
-            return Some((chunk, k as usize));
-        }
-        let found = scan(lists, id);
-        match (hint, found) {
-            // Shifted by a removal or moved: the entries after it in its list are likely wrong
-            // too, one rebuild at the next read fixes them all.
-            (Some(_), Some(_)) => self.fresh.set(false),
-            // Added behind the index's back: only this entry is missing.
-            (None, Some((chunk, k))) => {
+        if let Some((chunk, k)) = hint {
+            let list = lists.get(&chunk).map_or(&[][..], Vec::as_slice);
+            if list.get(k as usize).is_some_and(|(x, _)| *x == id) {
+                return Some((chunk, k as usize));
+            }
+            // Shifted towards the front by a removal earlier in its own list: that list alone
+            // is searched (never more than the old scan) and only this entry is repaired. A
+            // rebuild here cost one per marker of `kill @e[type=marker]` on a shared chunk.
+            if let Some(k) = list.iter().position(|(x, _)| *x == id) {
                 self.slots.borrow_mut().insert(id, (chunk, k as u32));
+                return Some((chunk, k));
             }
-            (Some(_), None) => {
-                self.slots.borrow_mut().remove(&id);
-            }
-            (None, None) => {}
         }
+        let found = self.scan_counted(lists, id);
+        let mut slots = self.slots.borrow_mut();
+        match found {
+            // Added or moved behind the index's back: only this entry was missing or wrong.
+            Some((chunk, k)) => slots.insert(id, (chunk, k as u32)),
+            None => slots.remove(&id),
+        };
         found
     }
 
-    fn rebuild(&self, lists: &Lists) {
+    fn build(&self, lists: &Lists) {
+        #[cfg(test)]
+        self.full_walks.set(self.full_walks.get() + 1);
         let mut slots = self.slots.borrow_mut();
         slots.clear();
         for (chunk, list) in lists {
@@ -114,10 +121,44 @@ impl KeptEntityIndex {
                 slots.entry(*id).or_insert((*chunk, k as u32));
             }
         }
-        self.fresh.set(true);
+        self.built.set(true);
     }
 
-    /// Tests: the rebuilt hint of `id`, unchecked (what a read must never trust blindly).
+    fn scan_counted(&self, lists: &Lists, id: i32) -> Option<(Chunk, usize)> {
+        #[cfg(test)]
+        self.full_walks.set(self.full_walks.get() + 1);
+        scan(lists, id)
+    }
+
+    /// Kept compound `id` now sits at slot `k` of `chunk` (pushed there by a move).
+    pub(crate) fn placed(&self, id: i32, chunk: Chunk, k: usize) {
+        self.slots.borrow_mut().insert(id, (chunk, k as u32));
+    }
+
+    /// Kept compound `id`, carrying `uuid`, left the lists (killed): its entries go too, so the
+    /// index holds only live compounds.
+    pub(crate) fn forget(&self, id: i32, uuid: u128) {
+        self.slots.borrow_mut().remove(&id);
+        if let Some(map) = self.by_uuid.borrow_mut().as_mut()
+            && map.get(&uuid) == Some(&id)
+        {
+            map.remove(&uuid);
+        }
+    }
+
+    /// A kept compound's UUID changed (one without any was given one): the UUID map is made
+    /// again, since a smaller identifier may now carry a UUID the map gives to a larger one.
+    pub(crate) fn uuid_changed(&self) {
+        *self.by_uuid.borrow_mut() = None;
+    }
+
+    /// Tests: how many times every list was walked so far.
+    #[cfg(test)]
+    pub(crate) fn full_walks(&self) -> u32 {
+        self.full_walks.get()
+    }
+
+    /// Tests: the stored hint of `id`, unchecked (what a read must never trust blindly).
     #[cfg(test)]
     pub(crate) fn raw_hint(&self, id: i32) -> Option<(Chunk, usize)> {
         self.slots.borrow().get(&id).map(|&(c, k)| (c, k as usize))

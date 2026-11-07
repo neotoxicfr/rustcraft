@@ -352,6 +352,82 @@ fn kept_entity_index_follows_the_lists() {
     crate::tests_g3f13::finish(p, dir);
 }
 
+/// Markers sharing one chunk, all looked up in list order.
+fn markers_in_one_chunk(tag: &str, count: usize) -> (Probe, std::path::PathBuf, Vec<i32>) {
+    let (mut p, dir) = crate::tests_g3f13::open(tag);
+    for i in 0..count {
+        let (x, z) = (1.0 + (i % 14) as f64, 1.0 + (i / 14 % 14) as f64);
+        cmd(&mut p, &format!("summon minecraft:marker {x} -60 {z} {{Tags:[\"m\"]}}"));
+    }
+    let ids: Vec<i32> = p.s.entities.get(&(0, 0)).expect("markers' chunk").iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids.len(), count, "test setup: markers outside chunk (0, 0)");
+    for &id in &ids {
+        assert!(p.s.kept_entity_slot(id).is_some(), "test setup: marker {id}");
+    }
+    let _ = p.take_events();
+    (p, dir, ids)
+}
+
+/// `kill` and `tp` of markers sharing a chunk: each removal shifts the rest of the list, and the
+/// next lookups must repair their own entry from that list, not walk every list again (a
+/// rebuild per marker made the kill several times slower than the former scan).
+#[test]
+fn kept_entity_index_survives_mass_kill_and_move_without_full_walks() {
+    const COUNT: usize = 150;
+    for (command, tag) in [
+        ("kill @e[type=marker]", "kept-index-mass-kill"),
+        ("execute as @e[type=marker] run tp @s ~40 ~ ~", "kept-index-mass-move"),
+    ] {
+        let (mut p, dir, ids) = markers_in_one_chunk(tag, COUNT);
+        let before = p.s.kept_index.full_walks();
+        cmd(&mut p, command);
+        let walks = p.s.kept_index.full_walks() - before;
+        assert!(walks <= 2, "{command}: {walks} walks of every list for {COUNT} markers");
+        let left = p.s.entities.get(&(0, 0)).map_or(0, Vec::len);
+        assert_eq!(left, 0, "{command}: markers still in their chunk");
+        // Every marker is where the scan finds it (or gone), each read checked against the scan.
+        for &id in &ids {
+            assert_eq!(p.s.kept_entity_slot(id), super::kept_entity_index::scan(&p.s.entities, id));
+        }
+        crate::tests_g3f13::finish(p, dir);
+    }
+}
+
+/// A compound without a UUID given one (`data merge`): it is now the smallest identifier
+/// carrying that UUID, although the UUID map made before named a later marker.
+#[test]
+fn compound_given_a_uuid_is_found_by_it() {
+    let (mut p, dir, ids) = markers_in_one_chunk("kept-index-given-uuid", 2);
+    let (first, second) = (ids[0], ids[1]);
+    let (c, k) = p.s.kept_entity_slot(first).expect("slot");
+    crate::nbtio::remove(&mut p.s.entities.get_mut(&c).expect("chunk")[k].1, "UUID");
+    let u = p.s.ent_uuid(E::Other(second));
+    assert_eq!(p.s.ent_by_uuid(u), Some(E::Other(second)), "test setup: UUID map made");
+    let mut given = p.s.entities[&c][k].1.clone();
+    crate::nbtio::set(&mut given, "UUID", crate::nbtio::uuid_nbt(u));
+    p.s.ent_set_nbt(E::Other(first), &given);
+    assert_eq!(p.s.ent_by_uuid(u), p.s.ent_by_uuid_reference(u));
+    assert_eq!(p.s.ent_by_uuid(u), Some(E::Other(first)));
+    crate::tests_g3f13::finish(p, dir);
+}
+
+/// Each dimension keeps the hints of its own lists: the Nether starts without the Overworld's,
+/// and coming back finds them again without walking every list.
+#[test]
+fn kept_entity_index_is_parked_with_its_dimension() {
+    let (mut p, dir, ids) = markers_in_one_chunk("kept-index-dimension", 3);
+    assert!(p.s.kept_index.raw_hint(ids[0]).is_some(), "test setup: index built");
+    p.s.enter_world(crate::dims::NETHER);
+    assert_eq!(p.s.kept_index.raw_hint(ids[0]), None, "Overworld hint in the Nether's index");
+    p.s.enter_world(crate::dims::OVERWORLD);
+    let before = p.s.kept_index.full_walks();
+    for &id in &ids {
+        assert!(p.s.kept_entity_slot(id).is_some(), "marker {id} after the round trip");
+    }
+    assert_eq!(p.s.kept_index.full_walks(), before, "hints lost by the round trip");
+    crate::tests_g3f13::finish(p, dir);
+}
+
 /// The candidate view formats a UUID once per entity for its scores, the former search once per
 /// objective and entity.
 #[test]

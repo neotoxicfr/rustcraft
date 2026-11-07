@@ -7448,9 +7448,12 @@ in every `scoreboard players … @s` message). Switches, default = new, `=0` = o
   and minecarts by their short lists), the first of the former list (player, then the smallest
   identifier, the earlier family on a tie); UUID 0 keeps the former lookup.
 - `RUSTCRAFT_OPT_KEPT_ENTITY_INDEX` (`commands/kept_entity_index.rs`): identifier → (chunk, slot)
-  hint of the kept compounds, checked at every read (slot holds the identifier), repaired from
-  the walk when it misses (missing entry inserted; shifted entry: one rebuild at the next read);
-  UUID → smallest identifier map made at the first lookup by UUID, checked the same way. Used by
+  hint of the kept compounds, built from every list at the first read, then checked at every
+  read (slot holds the identifier); a wrong hint searches its own chunk's list first (a removal
+  earlier in it only shifts entries towards the front), then every list, and only that entry is
+  repaired; kills drop their entry, moves to another chunk set theirs; one index per dimension,
+  parked with its lists. UUID → smallest identifier map made at the first lookup by UUID, checked
+  the same way, made again when a compound without a UUID is given one (`data merge`). Used by
   `other`, `other_mut`, `kept_entity_slot` (refile, kill) and `ent_by_uuid`. With
   `RUSTCRAFT_OPT_KILL_REWRITES_ONE_CHUNK` (C6-F03), a kill also removes the compound from its own
   list only, instead of a `retain` over every list.
@@ -7516,7 +7519,14 @@ success message walked every compound's UUID: 10 µs per marker); `tag @s add q`
 markers: 8,925 → 2,050 µs; with 100 markers each row is linear again (2.2 µs per marker).
 Type first costs 3 to 14 µs per search in a world of a single species (1,000 to 5,000 zombies:
 the per-species walk and the species lookup by name, 90 names) and halves the search in the
-mixed world: kept on, to settle on the scene. Datapack tick (`bench_datapack_tick`, perf pack, 2 alternated passes per
+mixed world: kept on, to settle on the scene. Kill and move of 1,000 markers sharing one chunk
+(`bench_selectors_markers_kill_and_move`, one command per fresh world, median of 5, 2 alternated
+passes per side, loaded machine): `kill @e[type=marker]` 1,060 / 1,190 µs with the index against
+990 / 1,190 µs without it (the same); `execute as @e[type=marker] run tp @s ~40 ~ ~` 2,800 / 5,150
+against 5,610 / 6,560 µs. The first version, which rebuilt the whole index at the read after a
+shifted hint, did the kill in 3,060 / 3,790 µs (about 3 times the scan: one rebuild per marker,
+298 walks of every list for 150 markers in the test, at most 2 now) and the move in 6,710 / 7,040.
+Datapack tick (`bench_datapack_tick`, perf pack, 2 alternated passes per
 side, this mission's four switches off against on; allocations per tick exact, µs within the
 noise of the loaded machine: the crowd alone, which runs no command, moved by 30 % between
 processes): `#tick` workload 38,377 → 33,355 allocations per tick (−13 %), with the 256 repeating
@@ -7531,8 +7541,10 @@ the box): the view makes the walk cheap (7 to 25 µs for 1,000 entities), the qu
 quadratic in the walk. Ground items and orbs by identifier (`@s` on an item walks the items:
 items merge, few). The UUID lookup of a mob still walks the kept compounds once when no compound
 carries it. Multi-core: not applicable (a search reads the server's state in order, `nbt=` and
-predicates are rare); GPU: not applicable. Memory: kept index ≈ 20 bytes per kept compound, UUID
-map ≈ 37 bytes per kept compound once a UUID is looked up (10,000 markers: ≈ 0.6 MB).
+predicates are rare); GPU: not applicable. Memory: kept index ≈ 20 bytes per kept compound of
+each dimension visited, UUID map ≈ 37 bytes per kept compound once a UUID is looked up (10,000
+markers: ≈ 0.6 MB); the entity lists of a dimension are never dropped while the server runs, and
+killed compounds leave both maps, so both stay about the size of the lists they point into.
 
 Difference with the game, kept (reported, A3): `sort=random` shuffles with the world's random,
 drawing once per match from the level's sequence; the game shuffles with the JDK's own unseeded
