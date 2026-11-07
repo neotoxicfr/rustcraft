@@ -71,6 +71,7 @@ pub(crate) mod decoration;
 // Dimensions and portals (S6).
 pub(crate) mod dims;
 mod portal;
+mod portal_site;
 pub(crate) mod portal_shape;
 mod respawn;
 // Effects, potions, enchanting, stations, loot chests (S7).
@@ -197,6 +198,8 @@ mod tests_s2;
 mod newworld_tests;
 #[cfg(test)]
 mod portal_tests;
+#[cfg(test)]
+mod portal_site_tests;
 #[cfg(test)]
 mod tests_s7;
 #[cfg(test)]

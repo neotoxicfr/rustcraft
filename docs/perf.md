@@ -7429,3 +7429,84 @@ loaded by other agents compiling.
   (`push_item_layer`, `prepare` sorts, NBT clones, rc-mesh `to_vec`) belong to their zones: a
   reused buffer beats any allocator setting.
 
+
+## C6-M23: portals, palette prefilter of the touched portals, exit portal site without a column scan (07/11, loaded machine)
+
+Before: every mob, item and entity checked, at every tick, the portals in its box by reading each
+cell of the box (three block lookups by name per call); the creation of an exit portal (one per
+first passage, on the server thread) scanned each of the 1,089 columns of its spiral down from
+the top of the world for its height, then read every cell through the server's lookup (one chunk
+map lookup per cell); each End gateway copied the dimension name twice per tick to look its
+cooldown up. Switches, default = new, `=0` = old (read once):
+- `RUSTCRAFT_OPT_PORTAL_TOUCH_PREFILTER`: the palettes of the one to four sections under the box
+  (single value or state list) say whether a portal block can be there, before any cell is read;
+  the same prefilter as the swept check of projectiles (G4-F05), now shared with it.
+- `RUSTCRAFT_OPT_BLOCKIDS` (existing switch, extended): the portal ids of the per-cell checks
+  (touched portals, frame cells, shape updates, portal search in a chunk) come from the block
+  table. Cold paths that run once per event (gateway exit, End frame, platform) keep their lookup
+  by name.
+- `RUSTCRAFT_OPT_GATEWAY_LOOKUP_WITHOUT_COPY`: a borrowed key that hashes and compares like the
+  owned `(String, P)` key (hashbrown `Equivalent`); the map keeps its key type, the name is copied
+  only when a cooldown starts. Chosen over a dimension number: dimensions are named, a number
+  table would have to follow datapack dimensions.
+- Exit portal site, `rc_sim::portal_site` (the former walk is kept as the reference,
+  `portal_site_cell_by_cell`):
+  - `RUSTCRAFT_OPT_PORTAL_SITE_HEIGHTMAP`: the column height is read from the chunk's
+    motion-blocking heightmap, which is what the game reads. Fidelity fix as well: the former
+    scan used the legacy solid flag minus cobweb and bamboo sapling, which differs from the
+    game's `blocks_motion_in_heightmap` tag on the 26 standing and wall signs (solid for the old
+    rule, outside the tag): a sign on top of a column raised its height, so a portal could be
+    placed standing on it where the game would not. Proof that both rules agree everywhere
+    else, and that the live map equals a scan with the game's rule, in the tests below.
+  - `RUSTCRAFT_OPT_PORTAL_SITE_COLUMN_READS`: a column's cells are read from its chunk fetched
+    once (section, then container), instead of a chunk map lookup per cell.
+  - `RUSTCRAFT_OPT_PORTAL_SITE_DISTANCE_CUTOFF`: once a full spot is held at squared distance D, a
+    column whose horizontal distance alone reaches D is skipped, and a column's walk stops below
+    the arrival point once the cell reaches D (lower cells are farther still); spots that cannot
+    be strictly nearer are not tested. Equal distance keeps the first spot, as in the game, so
+    nothing skipped could have won.
+  - `RUSTCRAFT_OPT_PORTAL_SITE_PARALLEL` (off by default): the spiral cut into one contiguous
+    share per thread of the current pool, each share chosen alone, the shares chained in spiral
+    order. Only the nearest full spot and the nearest spot of any kind are kept per share; that
+    pair chains exactly like one walk (a full spot beats any other, equal distance keeps the
+    first). Heights are read by the server thread first (the heightmap belongs to the server).
+
+Proof (`portal_site_tests.rs`): the touched portals with and without the prefilter, and with ids
+by name and from the table, give the same portals in the same order on 10,000 random boxes (item
+to ghast sizes) around Nether portals, End portals and gateways set across a section boundary and
+beside a chunk removed from the map (1,046 / 1,044 / 867 touches seen); the 16 combinations of the
+four site leads, the shared one on 1, 2, 3 and 8 threads, choose the reference spot on 60 random
+arrival points in the Overworld, 20 more around a pool of water, cobwebs and bamboo saplings, and
+60 in the Nether (both frame directions); the area has no column where the live map, a scan with
+the game's tag and the former rule disagree; the spot choice keeps the first of equal spots and
+chains across every cut of a list; the borrowed gateway key finds the owned one. An ignored
+version runs 200 seeds × 10 arrival points. Sabotages that fail them: prefilter forced to "no
+portal", column read one cell off, gateway key ignoring the position, heightmap one block low,
+walk cutoff on the wrong side of the arrival point, equal distance won by the later spot.
+
+| Loaded machine | former | new |
+|---|---|---|
+| touched portals, mob box, far from any portal (all mobs, items, entities, every tick) | 53 ns | 14 ns |
+| same, in a section holding a portal / in the portal | 74 / 54 ns | 75 / 54 ns |
+| exit portal site, Overworld, 1 core (16 arrival points) | 3.08 ms | 0.155 ms |
+| exit portal site, Nether, 1 core | 2.27 ms | 0.282 ms |
+| gateway cooldown lookups, 20 gateways, per tick | 690 ns | 507 ns |
+
+Each lead alone on the site search (Overworld / Nether, ms): heightmap 1.49 / 1.30, column reads
+1.41 / 0.99, cutoff 1.28 / 1.14, heightmap + column reads 0.78 / 0.69, the three 0.155 / 0.282.
+Touched portals: ids from the table alone 34 ns far / 55 ns near, prefilter alone 35 ns far; the
+prefilter costs ≈ 20 ns when a section under the box holds a portal (rare), kept for the common case.
+Shared search with the three leads (ms, 1 / 2 / 4 / 8 / 16 / 32 threads): Overworld 0.168 / 0.152 /
+0.145 / 0.147 / 0.197 / 0.230, Nether 0.304 / 0.221 / 0.160 / 0.148 / 0.178 / 0.218; without the
+cutoff it scales better (Overworld 0.80 → 0.18 ms at 8 threads) but the cutoff alone does more. With
+the whole pool (32 threads here) it loses in the Overworld and gains ≈ 0.07 ms in the Nether, once
+per created portal, on a pool that chunk generation keeps busy: off by default, to settle on the
+quiet-machine bench. GPU: not applicable (a few hundred microseconds once per portal, an ordered
+choice, data on the server thread). Leads ruled out without measurement (mission notes): an
+incremental count of portal blocks per section (every write path would have to follow it, a miss
+is a silent wrong answer; the G4-F05 section above ruled out a cache of portal-free sections for projectiles); merging the
+touched check into the crossed-block walk (order of the marks). Not done: a section whose palette
+holds no replaceable state could be skipped whole by the site walk (underground sections are
+nearly all mixed: little to gain once the cutoff stops the walk early). To settle on the
+quiet-machine scene bench: `crowd-1000` (self time of the touched check), `village`, `nether`
+(portal creation, tick p99 on the passage), `combat-end` (gateways).
