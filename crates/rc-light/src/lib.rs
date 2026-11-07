@@ -8,7 +8,9 @@
 mod fast;
 mod full;
 mod received;
-pub use full::Columns;
+#[doc(hidden)]
+pub use full::FullOpts;
+pub use full::{Columns, LightSheets};
 pub use received::Received;
 
 /// Throughput counters (measurements, `docs/perf.md`): chunks lit in full and
@@ -28,6 +30,15 @@ pub mod stats {
     pub(crate) static SKY_NS: AtomicU64 = AtomicU64::new(0);
     pub(crate) static BLOCK_SOLVES: AtomicU64 = AtomicU64::new(0);
     pub(crate) static BLOCK_NS: AtomicU64 = AtomicU64::new(0);
+    /// Cells of the zones the full light resolved (margins and ring included): the work of the
+    /// full light counted independently of the clock.
+    pub(crate) static FULL_CELLS: AtomicU64 = AtomicU64::new(0);
+
+    /// Cells resolved by the full light since startup (see `FULL_CELLS`; benches).
+    #[doc(hidden)]
+    pub fn full_light_cells() -> u64 {
+        FULL_CELLS.load(Relaxed)
+    }
 
     /// Totals since startup.
     #[derive(Clone, Copy, Debug, Default)]
@@ -217,9 +228,9 @@ pub fn uniform_light_interned() -> bool {
     rc_data::opt_switch!("RUSTCRAFT_OPT_INTERN_UNIFORM_LIGHT")
 }
 
-/// Benches: [`light_chunk_scanned`] with given switches (`skip`, `noemit`, `layout`,
-/// `intern_uniform`) instead of the process's, to compare the variants in one executable
-/// (alternating passes). All false: old path. Not counted in `stats`.
+/// Benches: [`light_chunk_scanned`] with given switches instead of the process's, to compare the
+/// variants in one executable (alternating passes). [`FullOpts::OLD`]: old path. Not counted in
+/// `stats`.
 #[doc(hidden)]
 pub fn light_chunk_with(
     t: &LightTables,
@@ -227,9 +238,38 @@ pub fn light_chunk_with(
     scans: Scans,
     height: i32,
     has_sky: bool,
-    [skip, noemit, layout, intern_uniform]: [bool; 4],
+    opts: FullOpts,
 ) -> (Vec<LightLayer>, Vec<LightLayer>) {
-    light_chunk_dispatch(t, cols, scans, height, has_sky, full::FullOpts { skip, noemit, layout, intern_uniform })
+    light_chunk_dispatch(t, cols, scans, height, has_sky, opts)
+}
+
+/// Full light of the chunks `chunks` of a batch, in that order (same sheets as [`light_chunk_scanned`]
+/// on each), in parallel; `column(x, z)` gives the states of a column (`None`: absent), `scan(x, z)`
+/// its scan if done. With `RUSTCRAFT_OPT_FULL_UNION_TILES`, neighbouring chunks are resolved
+/// together (see `full/batch.rs`). Counted in `stats`.
+pub fn light_chunks<'a>(
+    t: &LightTables,
+    chunks: &[(i32, i32)],
+    column: impl Fn(i32, i32) -> Option<&'a [u32]> + Sync,
+    scan: impl Fn(i32, i32) -> Option<&'a ColumnScan> + Sync,
+    height: i32,
+    has_sky: bool,
+) -> Vec<LightSheets> {
+    full::light_chunks(t, chunks, column, scan, height, has_sky, FullOpts::current())
+}
+
+/// Benches: [`light_chunks`] with given switches instead of the process's.
+#[doc(hidden)]
+pub fn light_chunks_with<'a>(
+    t: &LightTables,
+    chunks: &[(i32, i32)],
+    column: impl Fn(i32, i32) -> Option<&'a [u32]> + Sync,
+    scan: impl Fn(i32, i32) -> Option<&'a ColumnScan> + Sync,
+    height: i32,
+    has_sky: bool,
+    opts: FullOpts,
+) -> Vec<LightSheets> {
+    full::light_chunks(t, chunks, column, scan, height, has_sky, opts)
 }
 
 use hashbrown::HashSet;
@@ -274,7 +314,13 @@ pub struct LightTables {
     /// "Neutral" state for the full light: zero emission and attenuation (known state),
     /// no occluding face (air, cave air, void air…).
     neutral: Vec<bool>,
+    /// Per state, what the full light's property grid reads (`full/grid.rs`): face shape index
+    /// `<< 4 | opacity`. Empty when the shapes do not fit in 12 bits.
+    cell_props: Vec<u16>,
 }
+
+/// Shapes at most for the property grid of the full light (12 bits of shape index).
+const PROPERTY_GRID_SHAPES: usize = 1 << 12;
 
 /// Shapes at most for the table of occluded edges (n² bytes: 256 KiB at 512).
 const OCC_MAX: usize = 512;
@@ -334,13 +380,36 @@ impl LightTables {
         let neutral = (0..emission.len().min(dampening.len()).min(face.len()))
             .map(|s| emission[s] == 0 && dampening[s] == 0 && face[s] == 0)
             .collect();
-        LightTables { emission, dampening, face, masks, occ, neutral }
+        let mut t = LightTables { emission, dampening, face, masks, occ, neutral, cell_props: Vec::new() };
+        if t.masks.len() <= PROPERTY_GRID_SHAPES {
+            let states = t.dampening.len().max(t.face.len()) as u32;
+            t.cell_props = (0..states).map(|s| (t.face(s) << 4) as u16 | u16::from(t.opacity(s))).collect();
+        }
+        t
     }
 
     /// See the `neutral` field (unknown state: not neutral).
     #[inline]
     fn neutral(&self, s: u32) -> bool {
         self.neutral.get(s as usize).copied().unwrap_or(false)
+    }
+
+    /// The full light can resolve on its property grid (see `cell_props`).
+    fn has_property_grid(&self) -> bool {
+        !self.cell_props.is_empty()
+    }
+
+    /// Property of state `s` on the full light's grid: same face and opacity as [`Self::face`] and
+    /// [`Self::opacity`] (unknown state: closed, opacity 15 and no face).
+    #[inline]
+    fn cell_property(&self, s: u32) -> u16 {
+        self.cell_props.get(s as usize).copied().unwrap_or(full::CLOSED)
+    }
+
+    /// Light emitted by state `s` (unknown state: none).
+    #[inline]
+    fn emission_of(&self, s: u32) -> u8 {
+        self.emission.get(s as usize).copied().unwrap_or(0)
     }
 
     /// The state change touches the sky light (different attenuation or shape): the

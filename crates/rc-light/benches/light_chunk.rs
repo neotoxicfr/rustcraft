@@ -13,7 +13,7 @@ use common::*;
 use criterion::{Criterion, criterion_group, criterion_main};
 use hashbrown::HashMap;
 use rayon::prelude::*;
-use rc_light::{Columns, LightTables};
+use rc_light::{ColumnScan, Columns, FullOpts, LightTables};
 use rc_world::LightLayer;
 use std::hint::black_box;
 
@@ -24,6 +24,145 @@ const KNOWN: &[(u64, u64)] = &[
 ];
 
 type Out = (Vec<LightLayer>, Vec<LightLayer>);
+
+/// Switches of the old layout (series 2, the default before the property grid).
+const FAST: FullOpts = FullOpts { skip: true, noemit: true, layout: true, intern_uniform: true, ..FullOpts::OLD };
+
+/// The property grid with the old layout's switches, none of its own.
+const GRID: FullOpts = FullOpts { property_grid: true, ..FAST };
+
+/// Variants of the matrix (switches, with the cached scans): the old layout's (series 2), then the
+/// property grid alone, with each of its own switches alone, and all of them; the variants without
+/// scans are those of the lightings that have none (mushroom generation, new world).
+fn variants() -> Vec<(FullOpts, bool)> {
+    let all_grid = FullOpts { union_tiles: false, ..FullOpts::ALL };
+    vec![
+        (FullOpts { intern_uniform: true, ..FullOpts::OLD }, false),
+        (FAST, true),
+        (FullOpts { noemit: false, ..FAST }, false),
+        (GRID, true),
+        (FullOpts { occlusion_table: true, ..GRID }, true),
+        (FullOpts { queue_directions: true, ..GRID }, true),
+        (FullOpts { occlusion_table: true, queue_directions: true, ..GRID }, true),
+        (FullOpts { no_emitter_exit: true, ..GRID }, true),
+        (FullOpts { sky_seed_filter: true, ..GRID }, true),
+        (FullOpts { no_emitter_exit: true, sky_seed_filter: true, ..GRID }, true),
+        (FullOpts { emitters_in_fill: true, ..GRID }, true),
+        (FullOpts { skip_depths: true, ..GRID }, true),
+        (FullOpts { skip_depths: false, ..all_grid }, true),
+        (all_grid, true),
+        (FullOpts { intern_uniform: false, ..all_grid }, true),
+        (FullOpts { noemit: false, emitters_in_fill: false, ..all_grid }, false),
+        (FullOpts { noemit: false, ..all_grid }, false),
+    ]
+}
+
+/// Short name of a variant: the switches on.
+fn name((o, sc): &(FullOpts, bool)) -> String {
+    let on = [
+        (o.skip, "SKIP"),
+        (o.noemit, "NOEMIT"),
+        (o.layout, "LAYOUT"),
+        (o.property_grid, "GRID"),
+        (o.occlusion_table, "OCCTABLE"),
+        (o.queue_directions, "QUEUEDIRS"),
+        (o.no_emitter_exit, "NOEMITEXIT"),
+        (o.sky_seed_filter, "SEEDFILTER"),
+        (o.emitters_in_fill, "EMITINFILL"),
+        (o.skip_depths, "SKIPDEPTHS"),
+        (o.union_tiles, "UNION"),
+    ];
+    let v: Vec<&str> = on.iter().filter(|(b, _)| *b).map(|(_, n)| *n).collect();
+    let base = if v.is_empty() { "old".to_string() } else { v.join("+") };
+    let sharing = if o.intern_uniform { "" } else { " -INTERN" };
+    format!("{base}{sharing}{}", if *sc { " +scans" } else { "" })
+}
+
+/// Batch level: the chunks of a generation batch lit one by one or by tiles
+/// (`FULL_UNION_TILES`, tiles of side chosen per batch, then 2, 3 and 4), checked first against the
+/// frozen copy. Sets of
+/// batches made of the capture's columns: every one in one batch (a dense area); a flight, 12
+/// batches of one row of 24 chunks (the server's batch), each followed by the relight of the row
+/// before; two squares of 8 × 8. Scans cached like the generation's. 1 thread then all threads,
+/// minimum of 5 alternated passes, time of the whole set.
+fn bench_batches(
+    t: &LightTables,
+    flats: &HashMap<(i32, i32), Vec<u32>>,
+    scans: &HashMap<(i32, i32), ColumnScan>,
+    keys: &[(i32, i32)],
+    want: &HashMap<(i32, i32), &Out>,
+    h: i32,
+) {
+    let column = |x: i32, z: i32| flats.get(&(x, z)).map(Vec::as_slice);
+    let scan = |x: i32, z: i32| scans.get(&(x, z));
+    let (x0, z0) = (keys.iter().map(|k| k.0).min().unwrap_or(0), keys.iter().map(|k| k.1).min().unwrap_or(0));
+    let present = |v: Vec<(i32, i32)>| -> Vec<(i32, i32)> { v.into_iter().filter(|k| want.contains_key(k)).collect() };
+    let rows: Vec<Vec<(i32, i32)>> = (0..12).map(|r| present((0..24).map(|x| (x0 + 4 + x, z0 + 4 + r)).collect())).collect();
+    let flight: Vec<Vec<(i32, i32)>> = (0..rows.len())
+        .flat_map(|r| std::iter::once(rows[r].clone()).chain(r.checked_sub(1).map(|p| rows[p].clone())))
+        .collect();
+    let squares: Vec<Vec<(i32, i32)>> =
+        (0..2).map(|s| present((0..64).map(|i| (x0 + 4 + 10 * s + i % 8, z0 + 4 + i / 8)).collect())).collect();
+    type Batches = Vec<Vec<(i32, i32)>>;
+    let sets: [(&str, Batches); 3] =
+        [("all columns", vec![keys.to_vec()]), ("flight rows 24 x 1", flight), ("squares 8 x 8", squares)];
+    let per_chunk = FullOpts { union_tiles: false, ..FullOpts::ALL };
+    let tiles = |side: i32| FullOpts { union_tile_side: side, ..FullOpts::ALL };
+    let opts =
+        [("chunk by chunk", per_chunk), ("tiles auto", tiles(0)), ("tiles 2", tiles(2)), ("tiles 3", tiles(3)), ("tiles 4", tiles(4))];
+    for (label, set) in &sets {
+        for (option, o) in opts {
+            for batch in set {
+                let got = rc_light::light_chunks_with(t, batch, column, scan, h, true, o);
+                for (k, sheets) in batch.iter().zip(&got) {
+                    assert_eq!(sheets, want[k], "batches {label}, chunk {k:?}, {option}");
+                }
+            }
+        }
+    }
+    eprintln!("batches identical to the frozen reference chunk by chunk and by tiles");
+    let one = rayon::ThreadPoolBuilder::new().num_threads(1).build().expect("thread pool");
+    // Cells resolved per chunk lit, independent of the clock (tiles chosen for the full pool).
+    for (label, set) in &sets {
+        let chunks: usize = set.iter().map(Vec::len).sum();
+        let counts: Vec<String> = opts
+            .iter()
+            .map(|(option, o)| {
+                let before = rc_light::stats::full_light_cells();
+                for batch in set {
+                    drop(rc_light::light_chunks_with(t, batch, column, scan, h, true, *o));
+                }
+                let cells = (rc_light::stats::full_light_cells() - before) as f64 / chunks as f64;
+                format!("{option} {cells:.0}")
+            })
+            .collect();
+        eprintln!("batches {label}: cells resolved per chunk: {}", counts.join(", "));
+    }
+    for (label, set) in &sets {
+        let chunks: usize = set.iter().map(Vec::len).sum();
+        for (threads, pool) in [("1 thread", Some(&one)), ("all threads", None)] {
+            let mut best = [f64::MAX; 5];
+            for pass in 0..5 {
+                for j in 0..opts.len() {
+                    let i = (j + pass) % opts.len();
+                    let lit = || {
+                        set.iter()
+                            .map(|b| black_box(rc_light::light_chunks_with(t, b, column, scan, h, true, opts[i].1)).len())
+                            .sum::<usize>()
+                    };
+                    let t0 = std::time::Instant::now();
+                    match pool {
+                        Some(p) => p.install(lit),
+                        None => lit(),
+                    };
+                    best[i] = best[i].min(t0.elapsed().as_secs_f64() * 1e3);
+                }
+            }
+            let times: Vec<String> = opts.iter().zip(best).map(|((n, _), b)| format!("{n} {b:.1} ms")).collect();
+            eprintln!("batches {label} ({} batches, {chunks} chunks, {threads}): {}", set.len(), times.join(", "));
+        }
+    }
+}
 
 fn bench(c: &mut Criterion) {
     let Some(d) = need(rc_testdata::version_data(), "26.3 data cache") else { return };
@@ -111,7 +250,6 @@ fn bench(c: &mut Criterion) {
         count("minecraft:block_update"),
         count("minecraft:section_blocks_update")
     );
-    drop(outs);
     // Measured subset (the whole takes several seconds per pass).
     let one: Vec<(i32, i32)> = keys.iter().copied().step_by((keys.len() / 64).max(1)).take(64).collect();
     let many: Vec<(i32, i32)> = keys.iter().copied().step_by((keys.len() / 256).max(1)).take(256).collect();
@@ -134,8 +272,8 @@ fn bench(c: &mut Criterion) {
         let (mut sheets, mut owned) = (0usize, 0usize);
         let (zero, full) = (rc_world::zero_layer(), rc_world::full_layer());
         for &k in &keys {
-            let (sky, block) =
-                rc_light::light_chunk_with(&t, cols(k), scans_of(k), h, true, [true, true, true, intern]);
+            let opts = FullOpts { intern_uniform: intern, ..FullOpts::ALL };
+            let (sky, block) = rc_light::light_chunk_with(&t, cols(k), scans_of(k), h, true, opts);
             for l in sky.iter().chain(&block).flatten() {
                 sheets += 1;
                 owned += usize::from(!std::sync::Arc::ptr_eq(l, &zero) && !std::sync::Arc::ptr_eq(l, &full));
@@ -148,29 +286,31 @@ fn bench(c: &mut Criterion) {
     }
     // Matrix of the switches in this process (loaded bench: from one process to the next the own
     // noise exceeds the gain): 7 passes, variants in an order rotated at each pass, minimal
-    // time per variant, 64 columns on 1 thread then 256 columns on all threads. Uniform
-    // sheets shared in every variant but the two "-INTERN" ones (all on, without sharing).
-    let interned = |[skip, noemit, layout]: [bool; 3]| [skip, noemit, layout, true];
-    let mut combos: Vec<([bool; 4], bool)> = (0..8usize)
-        .flat_map(|b| {
-            let o = interned([b & 1 != 0, b & 2 != 0, b & 4 != 0]);
-            [(o, false), (o, true)]
-        })
-        .filter(|(o, sc)| !(o[1] && !sc))
-        .collect();
-    combos.extend([([true, true, true, false], false), ([true, true, true, false], true)]);
-    let name = |(o, sc): &([bool; 4], bool)| {
-        let mut v: Vec<&str> = Vec::new();
-        for (on, n) in o[..3].iter().zip(["SKIP", "NOEMIT", "LAYOUT"]) {
-            if *on {
-                v.push(n);
-            }
+    // time per variant, 64 columns on 1 thread then 256 columns on all threads. Every variant is
+    // first checked against the frozen copy on all the columns.
+    let combos = variants();
+    keys.par_iter().zip(&outs).for_each(|(&k, want)| {
+        for (o, sc) in &combos {
+            let s = if *sc { scans_of(k) } else { [None; 9] };
+            assert_eq!(&rc_light::light_chunk_with(&t, cols(k), s, h, true, *o), want, "column {k:?}, {}", name(&(*o, *sc)));
         }
-        let sharing = if o[3] { "" } else { " -INTERN" };
-        let base = if v.is_empty() { "old".into() } else { v.join("+") };
-        format!("{base}{sharing}{}", if *sc { " +scans" } else { "" })
-    };
-    let run = |list: &[(i32, i32)], (o, sc): &([bool; 4], bool), par: bool| {
+    });
+    eprintln!("{} variants identical to the frozen reference on the {} columns", combos.len(), keys.len());
+    // Work counted independently of the clock: cells resolved per chunk (margins and ring included).
+    for (o, sc) in &combos {
+        let before = rc_light::stats::full_light_cells();
+        keys.par_iter().for_each(|&k| {
+            let s = if *sc { scans_of(k) } else { [None; 9] };
+            drop(rc_light::light_chunk_with(&t, cols(k), s, h, true, *o));
+        });
+        let cells = (rc_light::stats::full_light_cells() - before) as f64 / keys.len() as f64;
+        eprintln!("  cells resolved per chunk, {:<56} {:9.0}", name(&(*o, *sc)), cells);
+    }
+    let by_key: HashMap<(i32, i32), &Out> = keys.iter().copied().zip(&outs).collect();
+    bench_batches(&t, &flats, &scans, &keys, &by_key, h);
+    drop(by_key);
+    drop(outs);
+    let run = |list: &[(i32, i32)], (o, sc): &(FullOpts, bool), par: bool| {
         let f = |&k: &(i32, i32)| {
             let s = if *sc { scans_of(k) } else { [None; 9] };
             black_box(rc_light::light_chunk_with(&t, cols(k), s, h, true, *o)).0.len()
@@ -193,7 +333,7 @@ fn bench(c: &mut Criterion) {
         }
         eprintln!("matrix ({label}, minimum of 7 alternated passes):");
         for (cmb, b) in combos.iter().zip(&best) {
-            eprintln!("  {:<28} {b:8.1} ms", name(cmb));
+            eprintln!("  {:<56} {b:8.1} ms", name(cmb));
         }
     }
     let mut g = c.benchmark_group("light_chunk");
