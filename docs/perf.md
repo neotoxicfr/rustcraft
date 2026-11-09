@@ -10017,7 +10017,7 @@ starting right above the last section), a speckled job gives cells that differ b
 included), `row_corners_match_single_zoom` (every fraction, 16 offset draws),
 `corner_memo_entry_is_16_bytes`. Sabotages, each caught then removed: cell checked on 7 corners,
 memo kept across seeds, shared grid layers taken one layer low, every row lane given the first
-block's fraction.
+block's fraction, a mesh taking over the shared layers of the previous mesh's last section.
 
 Memory (B10): +2.8 KiB per meshing thread (cell verdicts); persistent memo 512 KiB per thread only
 under `=1`. Other axes: same mesh bytes (GPU, VRAM, upload unchanged); no allocation per mesh.
