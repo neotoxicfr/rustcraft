@@ -639,13 +639,9 @@ impl Renderer {
         };
         let vis_ms = &mut self.vis_ms;
         let ordered = || *vis_ms = t_vis.elapsed().as_secs_f64() * 1e3;
-        let paths = lists::ListPaths::from_switches();
-        let out = &mut self.lists;
-        let drawn = if paths.parallel() {
-            lists::list_pool().install(|| lists::build(&input, out, paths, ordered))
-        } else {
-            lists::build(&input, out, paths, ordered)
-        };
+        // On this thread: only the slices of the parallel path go to the list pool, this thread
+        // taking slices too.
+        let drawn = lists::build(&input, &mut self.lists, lists::ListPaths::from_switches(), ordered);
         let (reused, rebuilt) = self.lists.column_command_reuse();
         crate::perf_log::counter("terrain_column_commands_reused_per_frame", reused);
         crate::perf_log::counter("terrain_column_commands_rebuilt_per_frame", rebuilt);

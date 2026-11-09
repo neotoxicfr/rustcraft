@@ -452,8 +452,9 @@ fn compared_paths() -> Vec<Compared> {
         for slice in [1, 2, 3, 7] {
             let p = ListPaths { column_slices: Some(slice), ..ALL_SERIAL };
             v.push((format!("all + slices of {slice}"), p, Some(threads)));
-            let p =
-                ListPaths { column_slices: Some(slice), parallel_kinds: true, column_commands: false, ..ALL_SERIAL };
+            let p = ListPaths { column_slices: Some(slice), column_commands: false, ..ALL_SERIAL };
+            v.push((format!("all but the cache + slices of {slice}"), p, Some(threads)));
+            let p = ListPaths { parallel_kinds: true, ..p };
             v.push((format!("all but the cache + slices of {slice} + kinds"), p, Some(threads)));
         }
     }
@@ -474,10 +475,8 @@ fn build_on(
     l: &mut Lists,
     p: ListPaths,
 ) -> (usize, u64) {
-    match threads {
-        Some(t) => pools[&t].install(|| build(input, l, p, || {})),
-        None => build(input, l, p, || {}),
-    }
+    // From the test's own thread, as the frame thread: it takes slices next to the pool's threads.
+    build_with_pool(input, l, p, threads.map(|t| &pools[&t]), || {})
 }
 
 /// Draw settings of each frame: face vertices and split draws.
@@ -558,7 +557,6 @@ fn every_path_matches_the_old_build_while_the_draw_settings_change() {
 #[test]
 fn sabotaged_paths_are_caught() {
     let pools = pools();
-    let kinds_from_the_cache = ListPaths { parallel_kinds: true, ..ALL_SERIAL };
     let usual = [
         (Sabotage::StaleFacings, ALL_SERIAL, None),
         (Sabotage::IgnoredMeshVersion, ALL_SERIAL, None),
@@ -569,8 +567,9 @@ fn sabotaged_paths_are_caught() {
             ListPaths { column_slices: Some(3), column_commands: false, ..ALL_SERIAL },
             Some(4),
         ),
-        // With the cache: the six lists copied as six tasks.
-        (Sabotage::ForgottenBatchOffset, kinds_from_the_cache, Some(4)),
+        // The six lists as six tasks, copied from the cache, then built whole without it.
+        (Sabotage::ForgottenBatchOffset, ListPaths { parallel_kinds: true, ..ALL_SERIAL }, Some(4)),
+        (Sabotage::ForgottenBatchOffset, ListPaths { parallel_kinds: true, column_commands: false, ..ALL_SERIAL }, Some(4)),
         (Sabotage::StraddlingColumnAcceptedWhole, ALL_SERIAL, None),
         (Sabotage::RunsJoinedAcrossEmptySections, ALL_SERIAL, None),
         (Sabotage::SectionSearchFromBelowOnly, ALL_SERIAL, None),
@@ -588,10 +587,23 @@ fn sabotaged_paths_are_caught() {
             }
         });
         for (s, paths, .., differs) in &runs {
-            println!("sabotage {s:?} (list kinds {}): {differs} frames differ", paths.parallel_kinds);
+            let (slices, kinds) = (paths.column_slices, paths.parallel_kinds);
+            println!("sabotage {s:?} (slices {slices:?}, list kinds {kinds}): {differs} frames differ");
             assert!(*differs > 0, "sabotage {s:?} not seen");
         }
     }
+}
+
+/// The parallel builds stay off by default until the quiet-machine scene bench: the loaded
+/// micro-bench loses at four threads and the pool's default size was never measured.
+#[test]
+fn parallel_builds_are_off_by_default() {
+    let set = |name| rc_data::env_flags::read_os(name).is_some();
+    if set("RUSTCRAFT_OPT_PARALLEL_LISTS") || set("RUSTCRAFT_OPT_PARALLEL_LIST_KINDS") {
+        return;
+    }
+    let paths = ListPaths::from_switches();
+    assert_eq!((paths.column_slices, paths.parallel_kinds), (None, false));
 }
 
 /// A cleared terrain restarts its buffers from the first place, and a column of the next world can
@@ -1117,7 +1129,7 @@ fn lists_phase_bench() {
             std::hint::black_box(build(&input, &mut whole, paths, || {}));
             t_whole += t.elapsed();
             let t = std::time::Instant::now();
-            std::hint::black_box(select_visible(&input, &mut selection, paths).len());
+            std::hint::black_box(select_visible(&input, &mut selection, paths, None).len());
             t_selection += t.elapsed();
         }
         let us = |d: std::time::Duration| d.as_secs_f64() * 1e6 / 400.0;

@@ -11,10 +11,11 @@
 //! - `RUSTCRAFT_OPT_CLOUDPAR`: `1` faces or instances built in slices of the spiral on
 //!   the common pool (with the spiral only); off by default (main thread alone) until the
 //!   "flight" scene bench has measured the wait behind the queued meshes.
-//! - `RUSTCRAFT_OPT_CLOUD_POOL`: `1` the slices built on the clouds' own pool of 2 to 4 threads
-//!   (with the spiral only; wins over `CLOUDPAR`); off by default: its sleeping threads woke up
-//!   late on the loaded-machine bench (median 0.6 to 1.4 ms, peaks of 8 ms, against 0.9 ms on the
-//!   main thread alone), to re-measure on the "flight" scenes.
+//! - `RUSTCRAFT_OPT_CLOUD_POOL`: the slices taken by the calling thread and the clouds' own pool
+//!   of 2 to 4 threads (with the spiral only; wins over `CLOUDPAR`); `0` the calling thread alone.
+//!   A pool thread that wakes up late finds the slices taken: the first version, where the whole
+//!   build waited for the pool, lost to late wake-ups under load (peaks of 8 ms against 0.9 ms
+//!   on the main thread alone).
 //! - `RUSTCRAFT_OPT_CLOUD_SPECULATIVE_BUILD`: (`face` format) a background thread builds the
 //!   cell the camera will enter next; the crossing swaps buffers; `0` built at the crossing.
 //! - `RUSTCRAFT_OPT_CLOUD_INDEXED_FACES`: (`face` format) 4 vertices per face drawn by a shared
@@ -31,7 +32,7 @@ use wgpu::util::DeviceExt;
 
 use crate::render::upload::{self, Uploader};
 use crate::sky_mesh::cloud_builder::{FaceBuilder, ParallelBuild, Speculation, Spiral, next_cell};
-use crate::sky_mesh::{self, CloudCells, CloudKey, CloudMap, CloudSide};
+use crate::sky_mesh::{self, CloudKey, CloudMap, CloudSide};
 
 /// Shape of the clouds buffer (`RUSTCRAFT_OPT_CLOUDINST`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +68,7 @@ impl SkyOpts {
             spiral: rc_data::env_str!("RUSTCRAFT_OPT_CLOUDSPIRAL") != Some("0"),
             par: rc_data::env_str!("RUSTCRAFT_OPT_CLOUDPAR") == Some("1"),
             unif: rc_data::env_str!("RUSTCRAFT_OPT_SKYUNIF") != Some("0"),
-            own_pool: rc_data::opt_switch!("RUSTCRAFT_OPT_CLOUD_POOL", default_off),
+            own_pool: rc_data::opt_switch!("RUSTCRAFT_OPT_CLOUD_POOL"),
             speculative: rc_data::opt_switch!("RUSTCRAFT_OPT_CLOUD_SPECULATIVE_BUILD"),
             indexed: rc_data::opt_switch!("RUSTCRAFT_OPT_CLOUD_INDEXED_FACES"),
             packed_constants: rc_data::opt_switch!("RUSTCRAFT_OPT_PACKED_SHADER_CONSTANTS"),
@@ -740,7 +741,6 @@ impl Sky {
             self.spiral = (radius, Spiral::from(sky_mesh::cloud_spiral(radius)));
         }
         let spiral = self.opts.spiral.then_some(&self.spiral.1);
-        let cells = spiral.map_or(CloudCells::Scan(radius), |s| CloudCells::Spiral(s));
         let mesh;
         let (bytes, n): (&[u8], u32) = match inst {
             CloudInst::Mesh => {
@@ -756,7 +756,7 @@ impl Sky {
             }
             CloudInst::Cell => {
                 let out = (&mut self.cells, &mut self.cell_parts);
-                self.placement.run(sky_mesh::cloud_cell_instances, map, key, cells, out);
+                self.placement.run(sky_mesh::cloud_cell_instances, map, key, spiral, out);
                 (bytemuck::cast_slice(&self.cells), self.cells.len() as u32)
             }
         };
@@ -1003,8 +1003,8 @@ mod tests {
         CloudCells, cloud_cell_instances, cloud_faces, cloud_mesh, expand_cells, face_corner, face_vertex,
     };
 
-    /// Every new path on, the clouds' own pool included (off by default in the client); format
-    /// `face`, parallel build on the common pool off.
+    /// Every new path on, the clouds' own pool included; format `face`, parallel build on the
+    /// common pool off.
     const NEW: SkyOpts = SkyOpts {
         inst: CloudInst::Face,
         persist: true,
@@ -1384,12 +1384,11 @@ fn t_unif() {
         }
     }
 
-    /// Speculation, indexed faces and packed constants are on unless set to 0; the clouds' own
-    /// pool (lost on the micro-bench) only with `RUSTCRAFT_OPT_CLOUD_POOL=1`.
+    /// Speculation, indexed faces, packed constants and the clouds' own pool are on unless set to 0.
     #[test]
     fn cloud_switches_have_their_measured_defaults() {
         let o = SkyOpts::from_env();
-        assert!(!o.own_pool || rc_data::env_flag!("RUSTCRAFT_OPT_CLOUD_POOL"));
+        assert!(o.own_pool || rc_data::env_flag!("RUSTCRAFT_OPT_CLOUD_POOL"));
         assert!(o.speculative || rc_data::env_flag!("RUSTCRAFT_OPT_CLOUD_SPECULATIVE_BUILD"));
         assert!(o.indexed || rc_data::env_flag!("RUSTCRAFT_OPT_CLOUD_INDEXED_FACES"));
         assert!(o.packed_constants || rc_data::env_flag!("RUSTCRAFT_OPT_PACKED_SHADER_CONSTANTS"));
