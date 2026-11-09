@@ -33,7 +33,7 @@ fn translucent_color(i: Out, front: bool) -> vec4<f32> {
 }
 
 @fragment
-fn fs_translucent_bounds(i: Out, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
+fn fs_translucent_bounds(i: Out, @builtin(front_facing) front: bool) -> OitBounds {
     return oit_depth_bounds(i.pos, translucent_color(i, front).a);
 }
 
@@ -57,7 +57,7 @@ fn eyes_color(i: Out) -> vec4<f32> {
 }
 
 @fragment
-fn fs_eyes_bounds(i: Out) -> @location(0) vec4<f32> {
+fn fs_eyes_bounds(i: Out) -> OitBounds {
     return oit_depth_bounds(i.pos, eyes_color(i).a);
 }
 
@@ -77,7 +77,7 @@ fn bolt_color(i: Out) -> vec4<f32> {
 }
 
 @fragment
-fn fs_bolt_bounds(i: Out) -> @location(0) vec4<f32> {
+fn fs_bolt_bounds(i: Out) -> OitBounds {
     return oit_depth_bounds(i.pos, bolt_color(i).a);
 }
 
@@ -107,7 +107,7 @@ fn swirl_color(i: Out) -> vec4<f32> {
 }
 
 @fragment
-fn fs_swirl_bounds(i: Out) -> @location(0) vec4<f32> {
+fn fs_swirl_bounds(i: Out) -> OitBounds {
     return oit_depth_bounds(i.pos, swirl_color(i).a);
 }
 
@@ -128,7 +128,7 @@ fn rays_color(i: FreeOut) -> vec4<f32> {
 }
 
 @fragment
-fn fs_rays_bounds(i: FreeOut) -> @location(0) vec4<f32> {
+fn fs_rays_bounds(i: FreeOut) -> OitBounds {
     return oit_depth_bounds(i.pos, rays_color(i).a);
 }
 
@@ -152,7 +152,7 @@ fn shadow_color(i: ShadowOut) -> vec4<f32> {
 }
 
 @fragment
-fn fs_shadow_bounds(i: ShadowOut) -> @location(0) vec4<f32> {
+fn fs_shadow_bounds(i: ShadowOut) -> OitBounds {
     return oit_depth_bounds(i.pos, shadow_color(i).a);
 }
 

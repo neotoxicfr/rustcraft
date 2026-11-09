@@ -373,13 +373,13 @@ impl DebugLines {
         if self.oit.is_some() {
             return;
         }
-        let lines = crate::oit::module(
+        let lines = layouts.module(
             device,
             "debug (transparency)",
             include_str!("debug_lines.wgsl"),
             include_str!("debug_lines_oit.wgsl"),
         );
-        let text = crate::oit::module(
+        let text = layouts.module(
             device,
             "debug text (transparency)",
             include_str!("debug_text.wgsl"),

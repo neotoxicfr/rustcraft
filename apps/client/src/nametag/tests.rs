@@ -286,13 +286,13 @@ fn capture(device: &wgpu::Device, queue: &wgpu::Queue, persist: bool, sabotage: 
     let mut tags = NameTags::with_mode(device, &target.cam_layout, wgpu::TextureFormat::Rgba8Unorm, persist);
     tags.lists.store.sabotage = sabotage;
     tags.oit = oit;
+    let mut up = Uploader::new(device, true);
     let mut chain = oit.then(|| crate::oit::Oit::new(device, wgpu::TextureFormat::Rgba8Unorm));
     if let Some(chain) = &mut chain {
         tags.ensure_oit(device, &chain.layouts);
         chain.ensure(device, (SIZE, SIZE), &target.depth_view);
-        chain.set_projection(queue, test_projection());
+        chain.set_projection(&mut up, queue, test_projection());
     }
-    let mut up = Uploader::new(device, true);
     let mut images = Vec::new();
     for frame in 0..4u32 {
         tags.begin(Vec3::X, Vec3::Y);

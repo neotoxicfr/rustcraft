@@ -697,7 +697,7 @@ impl TextDisplays {
         if self.oit_set.is_some() {
             return;
         }
-        let module = crate::oit::module(
+        let module = layouts.module(
             device,
             "text displays (transparency)",
             include_str!("text_display.wgsl"),

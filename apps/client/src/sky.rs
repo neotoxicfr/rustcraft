@@ -650,7 +650,7 @@ impl Sky {
             return;
         }
         let source = self.opts.shader_source();
-        let module = crate::oit::module(device, "clouds (transparency)", &source, include_str!("sky_oit.wgsl"));
+        let module = layouts.module(device, "clouds (transparency)", &source, include_str!("sky_oit.wgsl"));
         let groups = [Some(&self.layout), Some(&self.cloud_faces_layout)];
         let groups = if self.opts.indexed_faces() { &groups[..] } else { &groups[..1] };
         let (vs, buffer) = self.opts.cloud_input();
@@ -1172,7 +1172,7 @@ fn t_main(@builtin(global_invocation_id) id: vec3<u32>) {
             }
             crate::terrain_shader::tests::validate(&format!(
                 "{src}\n{}\n{}",
-                crate::oit::WGSL,
+                crate::oit::Options::NEW.common_source(),
                 include_str!("sky_oit.wgsl")
             ));
         }
@@ -1414,15 +1414,16 @@ fn t_unif() {
     /// Cloud images (64 × 64 RGBA) of each view, drawn as in the client: classic pass,
     /// or improved-transparency stages then composition (`oit`).
     fn render_clouds(device: &wgpu::Device, queue: &wgpu::Queue, opts: SkyOpts, oit: bool) -> Vec<Vec<u8>> {
-        render_clouds_with(device, queue, opts, oit, sky_mesh::QUAD_TRIANGLES)
+        render_clouds_with(device, queue, opts, oit.then(crate::oit::Options::from_switches), sky_mesh::QUAD_TRIANGLES)
     }
 
-    /// [`render_clouds`] with the indexed faces drawn by the corner order `triangles` (sabotage).
+    /// [`render_clouds`] with the indexed faces drawn by the corner order `triangles` (sabotage),
+    /// improved transparency in the form `oit`.
     fn render_clouds_with(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         opts: SkyOpts,
-        oit: bool,
+        oit: Option<crate::oit::Options>,
         triangles: [u16; 6],
     ) -> Vec<Vec<u8>> {
         let format = wgpu::TextureFormat::Rgba8Unorm;
@@ -1451,8 +1452,8 @@ fn t_unif() {
         let color_view = color.create_view(&Default::default());
         let depth = target(wgpu::TextureFormat::Depth32Float, wgpu::TextureUsages::TEXTURE_BINDING)
             .create_view(&Default::default());
-        let oit = oit.then(|| {
-            let mut o = crate::oit::Oit::new(device, format);
+        let mut oit = oit.map(|options| {
+            let mut o = crate::oit::Oit::with_options(device, format, options);
             o.ensure(device, (SIZE, SIZE), &depth);
             sky.ensure_oit(device, &o.layouts);
             o
@@ -1478,6 +1479,9 @@ fn t_unif() {
             };
             let eye = [13.0 * n as f64 - 20.0, y, 5.5 - 9.0 * n as f64];
             sky.prepare(device, queue, &mut up, vp, &frame(0.3, Some(clouds), false), false, eye);
+            if let Some(o) = &mut oit {
+                o.set_projection(&mut up, queue, proj);
+            }
             up.submit(queue, device.create_command_encoder(&Default::default()).finish());
             assert!(sky.has_clouds(), "clouds in view {n}");
             if opts.inst == CloudInst::Face && range_chunks > 6 {
@@ -1513,7 +1517,6 @@ fn t_unif() {
             }
             if let Some(o) = &oit {
                 use crate::oit::Stage;
-                o.set_projection(queue, proj);
                 for stage in Stage::ALL {
                     drop(o.begin(&mut enc, stage, &depth, true, "clear", None));
                     if stage == Stage::Bounds {
@@ -1578,11 +1581,44 @@ fn t_unif() {
                     assert!(diff == 0, "{opts:?} view {n} (transparency {oit}): {diff} bytes differ");
                 }
             }
-            let reversed = render_clouds_with(&device, &queue, NEW, oit, [2, 1, 0, 0, 3, 2]);
+            let reversed = render_clouds_with(
+                &device,
+                &queue,
+                NEW,
+                oit.then(crate::oit::Options::from_switches),
+                [2, 1, 0, 0, 3, 2],
+            );
             let diff: usize =
                 reversed.iter().zip(&want).map(|(g, w)| g.iter().zip(w).filter(|(a, b)| a != b).count()).sum();
             eprintln!("triangles wound the other way (transparency {oit}): {diff} bytes differ");
             assert!(diff > 0, "reversed triangles not seen (transparency {oit})");
+        }
+    }
+
+    /// Real clouds through improved transparency in each form of its shaders (compact bounds,
+    /// unrolled wavelet, projection written once): the images of the form before (RGBA32F bounds,
+    /// wavelet loops, projection written on every frame) to the byte.
+    #[test]
+    fn cloud_transparency_forms_render_identically() {
+        use crate::oit::Options;
+        let Some((device, queue)) = gpu() else { return };
+        let blend = device.features().contains(wgpu::Features::FLOAT32_BLENDABLE);
+        if rc_testdata::need(blend.then_some(()), "float target blending (FLOAT32_BLENDABLE)").is_none() {
+            return;
+        }
+        let render = |options| render_clouds_with(&device, &queue, NEW, Some(options), sky_mesh::QUAD_TRIANGLES);
+        let want = render(Options::OLD);
+        let forms = [
+            Options { compact_bounds: true, ..Options::OLD },
+            Options { unrolled_wavelet: true, ..Options::OLD },
+            Options { projection_on_change: true, ..Options::OLD },
+            Options::NEW,
+        ];
+        for options in forms {
+            for (n, (got, want)) in render(options).iter().zip(&want).enumerate() {
+                let diff = got.iter().zip(want).filter(|(a, b)| a != b).count();
+                assert!(diff == 0, "{options:?} view {n}: {diff} bytes differ");
+            }
         }
     }
 }

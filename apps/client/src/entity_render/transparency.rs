@@ -28,7 +28,7 @@ impl EntityRenderer {
         if self.oit_sets.is_some() {
             return;
         }
-        let module = crate::oit::module(
+        let module = layouts.module(
             device,
             "entities (transparency)",
             include_str!("../entity.wgsl"),

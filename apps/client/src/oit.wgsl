@@ -1,9 +1,11 @@
 // Improved transparency (option "improvedTransparency"): common functions, appended to the
-// shader of a translucent family for its three stages (docs/specs/oit.md).
-// Group 3: 0 = projection coefficients, 1 = depth bounds (RGBA32F),
-// 2 and 3 = transmittance coefficients (RGBA16F).
+// shader of a translucent family for its three stages (docs/specs/oit.md). `oit.rs` follows them
+// with one layout of the depth bounds (`oit_bounds_compact.wgsl` or `oit_bounds_rgba.wgsl`) and one
+// form of the wavelet (`oit_wavelet_unrolled.wgsl` or `oit_wavelet_loops.wgsl`), chosen by switches.
+// Group 3: 0 = projection coefficients, 1 = depth bounds, 2 and 3 = transmittance
+// coefficients (RGBA16F).
 //
-// "Bounds" stage: (−lin, lin, depth, depth if opaque) blended with MAX.
+// "Bounds" stage: nearest and farthest depth, nearest opaque depth, blended with MAX.
 // "Transmittance" stage: Haar wavelet absorbance (rank 2, 8 coefficients) over the
 // depth normalised between the bounds, added into two targets.
 // "Accumulation" stage: premultiplied colour × transmittance in front of the fragment.
@@ -44,22 +46,12 @@ fn oit_transmittance_of(a: f32) -> f32 {
     return clamp(exp(-a), 0.0001, 1.0);
 }
 
-// "Bounds" stage: almost transparent fragments are rejected.
-fn oit_depth_bounds(frag: vec4<f32>, alpha: f32) -> vec4<f32> {
-    if alpha < 0.01 {
-        discard;
-    }
-    let lin = oit_linear(frag.z);
-    let opaque = select(0.0, frag.z, alpha > OIT_OPAQUE_ALPHA);
-    return vec4<f32>(-lin, lin, frag.z, opaque);
-}
-
 // Fragment depth brought into [0, 1] between the pixel's bounds; beyond a 13.3-block
 // range, the first 6 bins cover the first 10 blocks.
 fn oit_normalize(frag: vec4<f32>) -> f32 {
-    let b = textureLoad(oit_bounds, vec2<i32>(frag.xy), 0);
-    let near = -b.r;
-    let far = b.g;
+    let near_far = oit_near_far(vec2<i32>(frag.xy));
+    let near = near_far.x;
+    let far = near_far.y;
     let lin = oit_linear(frag.z);
     let range = max(far - near, 0.0001);
     let within = clamp(lin - near, 0.0, range);
@@ -73,81 +65,10 @@ fn oit_normalize(frag: vec4<f32>) -> f32 {
     return fine + ((within - OIT_PRECISE_DEPTH) / (range - OIT_PRECISE_DEPTH)) * (1.0 - fine);
 }
 
-// "Transmittance" stage: coefficients of the fragment's transmittance `t`.
-fn oit_add_transmittance(frag: vec4<f32>, t: f32) -> OitCoeffs {
-    var c: array<f32, 8>;
-    let absorbance = oit_absorbance(t);
-    let original = oit_normalize(frag);
-    let depth = original * f32(OIT_BINS - 1) / f32(OIT_BINS);
-    c[0] = absorbance * (1.0 - depth);
-    // The tree starts at coefficient 1.
-    var tree = i32(floor(original * f32(OIT_BINS - 1))) + OIT_COEFFS;
-    for (var level = 0; level <= OIT_RANK; level++) {
-        let power = OIT_RANK - level;
-        let parent = tree >> 1u;
-        let index = f32(parent & ((1 << u32(power)) - 1));
-        let right = tree & 1;
-        let sgn = 1 - (right << 1u);
-        let width = exp2(-f32(power));
-        let height = exp2(f32(power) * 0.5);
-        let offset = depth - width * index;
-        let edge = f32(right) * width + f32(sgn) * offset;
-        c[parent] = edge * height * absorbance;
-        tree = parent;
-    }
-    return OitCoeffs(vec4<f32>(c[0], c[1], c[2], c[3]), vec4<f32>(c[4], c[5], c[6], c[7]));
-}
-
-// Absorbance accumulated in front of the normalised depth `original`, the fragment's own
-// contribution (`current`) removed; interpolated between the fragment's bin and the previous one.
-fn oit_sample_absorbance(coefficients: array<f32, 8>, original: f32, current: f32) -> f32 {
-    var c = coefficients;
-    var average = c[0];
-    if average == 0.0 {
-        return 0.0;
-    }
-    let bins = original * f32(OIT_BINS - 1);
-    let depth = bins / f32(OIT_BINS);
-    average -= current * (1.0 - depth);
-    var tb = clamp(i32(floor(bins)), 0, OIT_BINS - 1);
-    let sample_a = tb >= 1;
-    var ta = select(tb, tb - 1, sample_a);
-    tb += OIT_COEFFS;
-    ta += OIT_COEFFS;
-    var sb = average;
-    var sa = select(0.0, average, sample_a);
-    for (var level = 0; level <= OIT_RANK; level++) {
-        let power = OIT_RANK - level;
-        let width = exp2(-f32(power));
-        let height = exp2(f32(power) * 0.5);
-        let pb = tb >> 1u;
-        let rb = tb & 1;
-        let sgn_b = 1 - (rb << 1u);
-        let index = f32(pb & ((1 << u32(power)) - 1));
-        let offset = depth - width * index;
-        let own = (f32(rb) * width + f32(sgn_b) * offset) * height * current;
-        var db = c[pb];
-        db -= own;
-        sb -= height * db * f32(sgn_b);
-        tb = pb;
-        if sample_a {
-            let pa = ta >> 1u;
-            let da = select(c[pa], db, pa == pb);
-            let ra = ta & 1;
-            let sgn_a = 1 - (ra << 1u);
-            sa -= height * da * f32(sgn_a);
-            ta = pa;
-        }
-    }
-    let lerp = select(fract(bins), 1.0, bins >= f32(OIT_BINS));
-    return mix(sa, sb, lerp);
-}
-
 fn oit_sample_transmittance(pos: vec2<i32>, depth: f32, current: f32) -> f32 {
-    let a = textureLoad(oit_coeff0, pos, 0);
-    let b = textureLoad(oit_coeff1, pos, 0);
-    let c = array<f32, 8>(a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w);
-    return oit_transmittance_of(oit_sample_absorbance(c, depth, oit_absorbance(current)));
+    let low = textureLoad(oit_coeff0, pos, 0);
+    let high = textureLoad(oit_coeff1, pos, 0);
+    return oit_transmittance_of(oit_sample_absorbance(low, high, depth, oit_absorbance(current)));
 }
 
 // "Accumulation" stage: premultiplied colour attenuated by what is in front; additive
