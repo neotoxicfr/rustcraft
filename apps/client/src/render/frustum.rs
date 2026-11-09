@@ -168,6 +168,54 @@ impl MeshingView {
     }
 }
 
+/// A section reached by the walk: column x, height in sections from the bottom of the world, column z.
+pub(super) type ReachedSection = (i32, i32, i32);
+
+/// Reached sections of column `key` within `reached` (the walk's sections sorted by column then
+/// height, `frame.rs`): one run, found by two binary searches.
+pub(super) fn column_run(reached: &[ReachedSection], key: (i32, i32)) -> &[ReachedSection] {
+    let lo = reached.partition_point(|&(rx, _, rz)| (rx, rz) < key);
+    let len = reached[lo..].partition_point(|&(rx, _, rz)| (rx, rz) == key);
+    &reached[lo..lo + len]
+}
+
+/// Where each column's run lies in the walk's sorted list of reached sections, made by the walk
+/// task (`RUSTCRAFT_OPT_MESH_REACHED_COLUMN_INDEX`, on by default; `=0`: [`column_run`]). The
+/// meshing asks about hundreds of columns per frame: two binary searches over the whole list (25,000
+/// sections at distance 32, cache misses) cost about 100 ns per column, a hash lookup a tenth.
+#[derive(Debug, Default)]
+pub(super) struct ReachedColumns(hashbrown::HashMap<(i32, i32), (u32, u32)>);
+
+impl ReachedColumns {
+    pub fn new(reached: &[ReachedSection]) -> Self {
+        let mut index = hashbrown::HashMap::new();
+        let mut first = 0;
+        for run in reached.chunk_by(|a, b| (a.0, a.2) == (b.0, b.2)) {
+            let end = first + run.len();
+            index.insert((run[0].0, run[0].2), (first as u32, end as u32));
+            first = end;
+        }
+        ReachedColumns(index)
+    }
+
+    /// [`column_run`] of `key` in `reached`, the list this index was made from.
+    pub fn run<'a>(&self, reached: &'a [ReachedSection], key: (i32, i32)) -> &'a [ReachedSection] {
+        self.0.get(&key).map_or(&[], |&(first, end)| &reached[first as usize..end as usize])
+    }
+}
+
+/// The walk task also makes the [`ReachedColumns`] of its result.
+pub(super) fn reached_column_index() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_MESH_REACHED_COLUMN_INDEX")
+}
+
+/// The heights of a run of reached sections, as a set.
+pub(super) fn sections_of_run(run: &[ReachedSection]) -> Sections {
+    let mut set = Sections::default();
+    run.iter().for_each(|&(_, sy, _)| set.insert(sy));
+    set
+}
+
 /// Verdict of the frame's visibility test for one box; the perf log counts the calls per verdict
 /// (share a per-section verdict cache could answer: boxes within one section).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -366,9 +414,15 @@ impl Renderer {
         if self.reached.is_empty() {
             return None;
         }
-        // Sorted by column then height (`frame.rs`).
-        let i = self.reached.partition_point(|&(rx, _, rz)| (rx, rz) < (x, z));
-        Some(self.reached.get(i).is_some_and(|&(rx, _, rz)| (rx, rz) == (x, z)))
+        Some(!self.reached_run(x, z).is_empty())
+    }
+
+    /// The last walk's reached sections of column `(x, z)`, by the index when the walk made one.
+    fn reached_run(&self, x: i32, z: i32) -> &[ReachedSection] {
+        match &self.reached_columns {
+            Some(index) => index.run(&self.reached, (x, z)),
+            None => column_run(&self.reached, (x, z)),
+        }
     }
 
     /// Sections of column `(x, z)` the meshing treats as seen: reached by the last walk and in the
@@ -376,21 +430,40 @@ impl Renderer {
     /// frame or no walk yet, or no mesh of the column held here (the walk only enters the columns
     /// it holds, so it would never reach a column left unmeshed).
     pub fn sections_in_view(&self, x: i32, z: i32) -> Option<Sections> {
+        let (view, reached) = self.meshing_column(x, z)?;
+        Some(view.sections_in_view((x, z), reached))
+    }
+
+    /// Sections of column `(x, z)` the last walk reached, whatever the view: those
+    /// [`Self::sections_in_view`] keeps when the column is wholly in the field, so a mark outside
+    /// them is held under every view. `None` exactly when [`Self::sections_in_view`] is `None`.
+    pub fn reached_sections(&self, x: i32, z: i32) -> Option<Sections> {
+        let (_, reached) = self.meshing_column(x, z)?;
+        Some(sections_of_run(reached))
+    }
+
+    /// Meshing view and reached sections of column `(x, z)`, `None` when the meshing cannot tell
+    /// what is in view (see [`Self::sections_in_view`]).
+    fn meshing_column(&self, x: i32, z: i32) -> Option<(&MeshingView, &[ReachedSection])> {
         let view = self.meshing_view.as_ref()?;
         let held = self.columns.contains_key(&(x, z)) || self.empty_vis.contains_key(&(x, z));
         if !held || self.reached.is_empty() {
             return None;
         }
-        // Sorted by column then height (`frame.rs`): the column's sections are one run.
-        let lo = self.reached.partition_point(|&(rx, _, rz)| (rx, rz) < (x, z));
-        let len = self.reached[lo..].partition_point(|&(rx, _, rz)| (rx, rz) == (x, z));
-        Some(view.sections_in_view((x, z), &self.reached[lo..lo + len]))
+        Some((view, self.reached_run(x, z)))
     }
 
     /// Everything [`Self::sections_in_view`] reads, as revisions: the meshing view, the walk's
     /// reached sections and the columns held. The same stamp gives the same verdicts.
     pub fn meshing_view_stamp(&self) -> [u64; 4] {
         [self.meshing_view_rev, self.reached_gen, self.vis_rev, self.columns_rev]
+    }
+
+    /// Everything [`Self::reached_sections`] reads, as revisions: whether a frame was drawn, the
+    /// walk's reached sections and the columns held (a column that appears or leaves bumps the
+    /// connectivity revision). It leaves out the view, which changes every frame while turning.
+    pub fn meshing_reach_stamp(&self) -> [u64; 3] {
+        [u64::from(self.meshing_view.is_some()), self.reached_gen, self.vis_rev]
     }
 
     /// Appearance fade (0 to 1) of the already meshed column `(x, z)`, `None` before.

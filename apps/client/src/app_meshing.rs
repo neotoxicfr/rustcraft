@@ -168,7 +168,8 @@ impl App {
     /// Starts the meshing of the modified columns (at most four tasks per pool thread,
     /// `RUSTCRAFT_MESHQUEUE`: a deep queue keeps the pool busy during the long frames of
     /// loading; bench of 19/10 in `docs/perf.md`). Only their dirty sections in view, like the
-    /// game ([`sections_to_launch`]).
+    /// game ([`sections_to_launch`]), and only the columns some view can launch are tested against
+    /// the view ([`MeshCandidates`]).
     pub(crate) fn schedule_meshing(&mut self) {
         static DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let depth =
@@ -195,7 +196,15 @@ impl App {
         if signature.is_some() && signature == self.all_held && skip_unchanged_held() {
             return;
         }
-        let (meshes, renderer, video) = (&self.world.meshes, self.renderer.as_ref(), &self.video);
+        let (renderer, video) = (self.renderer.as_ref(), &self.video);
+        let hidden_in_spare_slots = visible_only && mesh_hidden_in_spare_slots();
+        // Only the columns the view can launch are tested against it; the cautious variant needs
+        // every held column for its spare slots.
+        let among =
+            renderer.filter(|_| visible_only && !hidden_in_spare_slots && pick_reached_marks_only()).and_then(|r| {
+                candidates_of_frame(&mut self.mesh_candidates, &self.world, r, video, (eye, (ex, ez), sync_mode))
+            });
+        let meshes = &self.world.meshes;
         // Like the game, a column already drawn is remeshed only for its dirty sections in view.
         let launchable = |(x, z): (i32, i32), marks: Sections| {
             let Some(r) = renderer.filter(|_| visible_only) else { return Some(marks) };
@@ -206,11 +215,12 @@ impl App {
         // must be redone whole.
         let picked = pick_columns(
             &mut self.world.dirty,
+            among,
             free,
             (ex, ez),
             |k, m| meshes.may_start(k, m),
             launchable,
-            visible_only && mesh_hidden_in_spare_slots(),
+            hidden_in_spare_slots,
         );
         self.all_held = signature.filter(|_| picked.is_empty() && !self.world.dirty.is_empty());
         let release_early = release_job_early();
@@ -279,6 +289,31 @@ impl App {
     }
 }
 
+/// The candidates of this frame's pick ([`MeshCandidates::list`]), `None` when the pick tests every
+/// dirty column. `camera`: eye, eye column and priority option (`prioritizeChunkUpdates`).
+fn candidates_of_frame<'a>(
+    candidates: &'a mut MeshCandidates,
+    world: &crate::World,
+    renderer: &crate::Renderer,
+    video: &crate::video::VideoState,
+    (eye, eye_column, sync_mode): ([f64; 3], (i32, i32), i32),
+) -> Option<&'a [(i32, i32)]> {
+    let key = CandidateKey {
+        marks: world.counter,
+        reach: renderer.meshing_reach_stamp(),
+        sync_mode,
+        player_marks: video.player_change_marks(),
+        eye_column: (sync_mode == 2).then_some(eye_column),
+    };
+    candidates.list(key, &world.dirty, |(x, z), marks| {
+        // The player's columns as the priority test reads them; for the nearby priority, every
+        // column it may reach while the eye stays in its column.
+        let urgent =
+            video.wants_sync(x, z, eye, sync_mode.min(1)) || (sync_mode == 2 && near_eye_column((x, z), eye_column));
+        view_may_launch(marks, renderer.reached_sections(x, z), urgent)
+    })
+}
+
 /// Visibility filter of the meshing (`RUSTCRAFT_OPT_MESHVISIBLEONLY`, on by default; `=0`: every
 /// dirty column as before): the game rebuilds only the dirty sections in view, the others keep
 /// their mark until they come into view (`docs/specs/visibility.md` § 3).
@@ -311,6 +346,85 @@ fn skip_unchanged_held() -> bool {
 /// the columns held out of view still take the task slots the visible ones leave free.
 fn mesh_hidden_in_spare_slots() -> bool {
     rc_data::opt_switch!("RUSTCRAFT_OPT_MESH_HIDDEN_IN_SPARE_SLOTS", default_off)
+}
+
+/// The pick tests against the view only the dirty columns it can launch ([`MeshCandidates`],
+/// `RUSTCRAFT_OPT_MESH_PICK_REACHED_MARKS`, on by default; `=0`: every dirty column each pick).
+fn pick_reached_marks_only() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_MESH_PICK_REACHED_MARKS")
+}
+
+/// A dirty column some view can launch: never drawn (`reached` is `None`), a priority remesh, or
+/// marks on a section the walk reached. The game rebuilds only the dirty sections of its list of
+/// sections in view, which the walk fills: a mark outside the reached sections is held under
+/// every view until the walk changes.
+pub(crate) fn view_may_launch(marks: Sections, reached: Option<Sections>, urgent: bool) -> bool {
+    urgent || reached.is_none_or(|reached| !marks.intersection(reached).is_empty())
+}
+
+/// Column `key` lies within two columns of the eye's: every column whose centre is within √768
+/// blocks of the eye does (the nearby priority remesh, `prioritizeChunkUpdates` 2), wherever the
+/// eye stands in its column.
+fn near_eye_column(key: (i32, i32), eye_column: (i32, i32)) -> bool {
+    (key.0 - eye_column.0).abs() <= 2 && (key.1 - eye_column.1).abs() <= 2
+}
+
+/// Everything the candidate list depends on: the world's touch counter (every new mark bumps it),
+/// the renderer's reach stamp (walk, columns drawn), the priority option, the columns the player
+/// changed (priority remesh) and, for the nearby priority remesh, the eye's column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CandidateKey {
+    pub marks: u64,
+    pub reach: [u64; 3],
+    pub sync_mode: i32,
+    pub player_marks: usize,
+    pub eye_column: Option<(i32, i32)>,
+}
+
+/// Dirty columns the pick tests against the view ([`view_may_launch`]); every other dirty column is
+/// held whatever the view, so a turning camera costs the columns that can show, not every column
+/// waiting with marks the walk does not reach. The list is made again when its key changes; a
+/// column launched meanwhile stays listed (the pick skips it once it leaves the dirty columns).
+#[derive(Default)]
+pub(crate) struct MeshCandidates {
+    key: Option<CandidateKey>,
+    /// Key of the previous pick (the list is made on the second pick in a row with one key).
+    seen: Option<CandidateKey>,
+    pub columns: Vec<(i32, i32)>,
+}
+
+impl MeshCandidates {
+    /// The list for `key`, made from `dirty` on the second pick in a row with this key; `None`
+    /// before (the pick tests every dirty column). Making the list costs about what testing every
+    /// column does, so while the key changes every frame (new marks every frame when flying) a list
+    /// that would serve once is not made; while it repeats (turning in place) it serves every frame.
+    pub(crate) fn list(
+        &mut self,
+        key: CandidateKey,
+        dirty: &HashMap<(i32, i32), Sections>,
+        may_launch: impl Fn((i32, i32), Sections) -> bool,
+    ) -> Option<&[(i32, i32)]> {
+        if self.key != Some(key) && self.seen.replace(key) != Some(key) {
+            return None;
+        }
+        self.refresh(key, dirty, may_launch);
+        Some(&self.columns)
+    }
+
+    /// Makes the list again from `dirty` when `key` differs from the one it was made for.
+    pub(crate) fn refresh(
+        &mut self,
+        key: CandidateKey,
+        dirty: &HashMap<(i32, i32), Sections>,
+        may_launch: impl Fn((i32, i32), Sections) -> bool,
+    ) {
+        if self.key == Some(key) {
+            return;
+        }
+        self.columns.clear();
+        self.columns.extend(dirty.iter().filter(|&(&k, &m)| may_launch(k, m)).map(|(&k, _)| k));
+        self.key = Some(key);
+    }
 }
 
 /// The task lets go of its nine columns as soon as the mesh is made
@@ -354,10 +468,12 @@ type Launch = ((i32, i32), Sections);
 
 /// Columns to mesh this frame with the sections of each: at most `free`, the closest to the eye
 /// column first. `launchable` tells what a startable column launches (`None`: held); what is
-/// launched leaves `dirty`, the sections held stay marked. `hidden_in_spare_slots`: the held
-/// columns fill the slots left free, all their marks.
+/// launched leaves `dirty`, the sections held stay marked. `among`: the only dirty columns that
+/// can launch ([`MeshCandidates`], each listed once), the others held without a test; `None`: every
+/// dirty column. `hidden_in_spare_slots`: the held columns fill the slots left free, all their marks.
 pub(crate) fn pick_columns(
     dirty: &mut HashMap<(i32, i32), Sections>,
+    among: Option<&[(i32, i32)]>,
     free: usize,
     eye: (i32, i32),
     may_start: impl Fn((i32, i32), Sections) -> bool,
@@ -365,13 +481,29 @@ pub(crate) fn pick_columns(
     hidden_in_spare_slots: bool,
 ) -> Vec<Launch> {
     let (mut ready, mut held) = (Vec::new(), Vec::new());
-    for (&key, &marks) in dirty.iter().filter(|&(&k, &m)| may_start(k, m)) {
-        match launchable(key, marks) {
-            Some(launch) => ready.push((key, launch)),
-            None => held.push((key, marks)),
+    let mut classify = |key: (i32, i32), marks: Sections| {
+        if may_start(key, marks) {
+            match launchable(key, marks) {
+                Some(launch) => ready.push((key, launch)),
+                None => held.push((key, marks)),
+            }
         }
+    };
+    // Columns left out of `among`: held without a test (counted held for the perf log, also
+    // those still in progress).
+    let mut untested = 0;
+    match among {
+        Some(keys) => {
+            let mut tested = 0;
+            for (&key, &marks) in keys.iter().filter_map(|k| dirty.get(k).map(|m| (k, m))) {
+                tested += 1;
+                classify(key, marks);
+            }
+            untested = dirty.len() - tested;
+        }
+        None => dirty.iter().for_each(|(&key, &marks)| classify(key, marks)),
     }
-    let mut held_count = held.len();
+    let mut held_count = held.len() + untested;
     keep_closest(&mut ready, free, eye);
     if hidden_in_spare_slots && ready.len() < free {
         keep_closest(&mut held, free - ready.len(), eye);

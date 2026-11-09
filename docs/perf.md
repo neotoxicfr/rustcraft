@@ -9954,3 +9954,86 @@ never in the reference runs). No gain of its own: it tells which spreading leads
   spikes again (server: flowing water is due 5 ticks after each change, so look for a spacing of
   5, or a multiple, between the game times of successive readable `server slowest tick` lines,
   not for fixed remainders; client: `slow_frame_us_client_relight`).
+## V-M01: the meshing pick tests only the dirty columns some view can launch; reached sections found by column (09/11, loaded machine)
+
+The visibility filter of the meshing (C2-M04) holds the dirty sections out of view. Each frame whose
+view stamp changed, the pick tested every dirty column against the view: two binary searches over
+the walk's whole sorted list (25,000 sections at distance 32), two held-column lookups, the frustum
+test. About 850 columns stay held on plains32, almost all with marks the walk does not reach
+(underground, occluded): held under every view, so a turning camera paid for them every frame
+(2,412 against 2,766 frames per second on plains32 when the pick runs every frame). The game walks
+its list of sections in view (the walk's sections crossed with the frustum) and crosses it with the
+marks; the walk does not move while only the view turns, so we cross the marks with the walk's part
+once and the frustum part per frame. Two leads, default = new, `=0` = old path:
+- `RUSTCRAFT_OPT_MESH_PICK_REACHED_MARKS`: `app_meshing::MeshCandidates`, the dirty columns some view
+  can launch: never drawn by the renderer, a priority remesh (the player's columns; for the nearby
+  priority every column within two of the eye's, proved to hold the √768 rule wherever the eye
+  stands), or marks on a section the walk reached (`Renderer::reached_sections`). Only those are
+  tested against the view; the others keep their marks untouched. Key: the world's touch counter,
+  the renderer's reach stamp (frame drawn, walk generation, connectivity revision: a column that
+  appears or leaves bumps it), the priority option, the player-change count, the eye column for the
+  nearby priority. The list is made on the second pick in a row with one key, as the draw lists'
+  cached order: making it costs about what testing every column does, so a list serving one frame
+  (new marks every frame) would cost twice. Off with the cautious variant (it needs every held
+  column).
+- `RUSTCRAFT_OPT_MESH_REACHED_COLUMN_INDEX`: the walk task (background) also makes the run of each
+  column in its sorted list (`frustum::ReachedColumns`), read by `sections_in_view`,
+  `reached_sections` and the perf log's `column_reached` instead of two binary searches.
+- Kept as is: `RUSTCRAFT_OPT_MESH_SKIP_UNCHANGED_HELD` (a still view still saves the tests of the
+  listed columns held out of the field); `RUSTCRAFT_OPT_MESH_HIDDEN_IN_SPARE_SLOTS` stays off: by
+  construction it does at least the filter's meshing work (model: spare work ≥ filter work) and,
+  on, it brings back the test of every held column each frame; its only possible gain is a smoother
+  first turn (sections already meshed when they show), which the scene bench below settles: on if
+  `plains32-mouse-turn` frame p99 drops beyond the noise with no fps loss, otherwise removed with
+  the filter without spare slots as the only path.
+- Fidelity: same launches, same sections, same order rule (A1): nothing perceptible changes; the
+  perf log's `mesh_columns_held_out_of_view` counts the columns left out of the list as held (a
+  column in progress among them too, at most the tasks in flight).
+- Proofs: `app_meshing::filter_tests::candidate_list_launches_what_testing_every_column_launches`:
+  the client model now sees the walk's sections crossed with the frustum; on a walk reaching half
+  the sections (changing every 20 frames, blocks changing one frame in four) and on one reaching
+  them all, with and without the skip, the client's list and a list made at every new key give the
+  same meshes, work, late sections, held frames and skipped picks as testing every column; stored
+  outcome (1,119 sections meshed, 386 late, 408 frames held) and columns tested (every column / list
+  / list at every key: 8,148 / 4,874 / 3,150 without the skip, 6,552 / 4,356 / 2,607 with it, no
+  difference when the walk reaches everything). Automatic sabotages caught (list at every key): a
+  key blind to the walk or to the marks (stale sections), a list without the columns never drawn
+  (hole) or without the priority column (stale). `candidate_test_and_nearby_priority_bound`,
+  `candidate_list_is_kept_while_its_key_repeats`, the `among` case of
+  `pick_columns_serves_what_is_in_view_first`; `render::frustum::tests::
+  reached_column_index_finds_the_runs_of_the_binary_searches`, `sections_in_view_are_among_the_
+  reached_ones` (what makes the list safe). Manual sabotages seen failing: an undrawn column not
+  listed (2 tests), an index run one short (index test), the reached set missing a section (subset
+  test), a list never made again (2 tests). Old constants of the filter model unchanged (2,667 /
+  2,339 / 1,228).
+- Micro-bench `render::frustum::tests::meshing_pick_bench` (one core, LOADED machine, plains32-like:
+  3,209 columns drawn, the walk reaching sections 5 to 12, 850 dirty, camera turning 0.9° per
+  frame, µs per frame), binary searches / column index:
+  marks under the surface (steady state): every dirty column 115-128 / 41-52; list, no new mark
+  0.07-0.12 / 0.05-0.07; list, new marks every 4 frames 50 / 19; list, new marks every frame 115 /
+  41 (the list is not made: old path); list made at every new key (rejected) 82-96 / 30.
+  Marks on the surface (as during loading, all listed): every dirty column 116-131 / 43-48; list
+  115-120 / 45-51; list at every new key 204-223 / 77-83, the reason for the second-pick rule.
+- Axes (B1): main-thread CPU only (the pick runs there, it owns the marks); the index adds one map
+  per walk in the walk task (about 3,200 entries, 60 KB, made in the background); no GPU, network,
+  disk or server change; regularity: the per-frame cost of a turning view falls to the listed
+  columns. Multi-core and GPU: without object (tens of µs on the thread that owns the marks; the
+  common pool is busy with meshing, 8 to 9 ms of wait measured for the draw lists).
+- Not done: the literal walk of the list in view each frame (cost per frame of the culling of every
+  reached column, 3,209 at distance 32, about the old pick's); the list made in the same pass as a
+  full pick (it would need every dirty column, startable or not, in that pass).
+- New bench scene `plains32-mouse-turn` (group `reference-extended`): `RUSTCRAFT_BENCH_TURN=90`
+  turns the camera 90° per second every frame in the client (`keys.rs`), as a steady mouse; the
+  server teleports of `plains32-rotation` turn it 20 times a second only. An exe without the
+  variable skips the scene (compare through the switches).
+- To measure on the quiet machine (2 alternating passes at least), new exe against `main` before the
+  series, then each switch at 0 and both:
+  `python tools/bench/scenes.py run --exe <main>/rustcraft.exe --exe <v-m01>/rustcraft.exe --scenes
+  plains32-mouse-turn,plains32-rotation,flight,ocean-walk,plains32,flight-rotation-32 --passes 3
+  --label v-m01`, then `python tools/bench/scenes.py run --exe <v-m01>/rustcraft.exe --scenes
+  plains32-mouse-turn,plains32-rotation,flight,ocean-walk,plains32,flight-rotation-32 --passes 3
+  --label v-m01-switches --matrix RUSTCRAFT_OPT_MESH_PICK_REACHED_MARKS=0 --matrix
+  RUSTCRAFT_OPT_MESH_REACHED_COLUMN_INDEX=0 --matrix RUSTCRAFT_OPT_MESH_SKIP_UNCHANGED_HELD=0`, and
+  for the cautious variant `--label v-m01-spare --env RUSTCRAFT_OPT_MESH_HIDDEN_IN_SPARE_SLOTS=1`
+  against the same exe without it (fps, frame p99, `mesh_columns_held_out_of_view`, pool meshing
+  ms/s, sections/s).
