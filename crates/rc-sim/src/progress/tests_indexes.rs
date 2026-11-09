@@ -66,7 +66,7 @@ fn odd_pack() -> Vec<(&'static str, Value)> {
 fn tree_with_pack(p: &Probe) -> std::sync::Arc<super::Tree> {
     let jar = crate::registries::client_jar(&p.s.data).expect("26.3 client jar");
     let jar = crate::registries::Jar::read(&jar).expect("jar");
-    let mut raw: BTreeMap<String, Value> = super::read_advancement_files(&jar, false);
+    let mut raw: BTreeMap<String, Value> = super::read_advancement_files(&jar, None);
     raw.extend(odd_pack().into_iter().map(|(k, v)| (k.to_owned(), v)));
     std::sync::Arc::new(super::Tree::build(raw))
 }
