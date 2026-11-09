@@ -9,6 +9,8 @@
 //! The faces are the same words in the same order whatever the placement (proof:
 //! `speculative_build_matches_a_direct_build`).
 
+use std::any::Any;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 
@@ -91,6 +93,8 @@ struct SharedBuild<T> {
     slices: Vec<Mutex<Vec<T>>>,
     finished: Mutex<usize>,
     slice_finished: Condvar,
+    /// First panic of a slice, raised again on the calling thread once every slice is done.
+    panic: Mutex<Option<Box<dyn Any + Send>>>,
 }
 
 impl<T> SharedBuild<T> {
@@ -100,19 +104,34 @@ impl<T> SharedBuild<T> {
             // The counter only hands out each slice once; the slice's own lock carries its faces.
             let i = self.next_slice.fetch_add(1, Ordering::Relaxed);
             let Some(slice) = self.slices.get(i) else { return };
-            let start = i * self.cells_per_slice;
-            let cells = &self.spiral[start..(start + self.cells_per_slice).min(self.spiral.len())];
-            let k = self.key;
-            (self.build)(&self.map, k.cx, k.cz, CloudCells::Spiral(cells), k.side, k.flat, &mut lock(slice));
+            // Caught so that a pool thread's panic reaches the caller (a pool without a panic
+            // handler aborts the process) and the slice still counts as finished (the caller
+            // would wait for it forever). The faces of a slice that panicked are never used.
+            let built = panic::catch_unwind(AssertUnwindSafe(|| self.build_slice(i, &mut lock(slice))));
+            if let Err(payload) = built {
+                lock(&self.panic).get_or_insert(payload);
+            }
             *lock(&self.finished) += 1;
             self.slice_finished.notify_one();
         }
     }
 
+    fn build_slice(&self, i: usize, faces: &mut Vec<T>) {
+        let start = i * self.cells_per_slice;
+        let cells = &self.spiral[start..(start + self.cells_per_slice).min(self.spiral.len())];
+        let k = self.key;
+        (self.build)(&self.map, k.cx, k.cz, CloudCells::Spiral(cells), k.side, k.flat, faces);
+    }
+
+    /// Waits for every slice, then raises the first slice panic, if any, on the calling thread.
     fn wait_for_every_slice(&self) {
         let mut finished = lock(&self.finished);
         while *finished < self.slices.len() {
             finished = self.slice_finished.wait(finished).unwrap_or_else(PoisonError::into_inner);
+        }
+        drop(finished);
+        if let Some(payload) = lock(&self.panic).take() {
+            panic::resume_unwind(payload);
         }
     }
 }
@@ -148,6 +167,7 @@ pub fn build_with_helpers<T: Copy + Send + 'static>(
         slices: parts[..count].iter_mut().map(|p| Mutex::new(std::mem::take(p))).collect(),
         finished: Mutex::new(0),
         slice_finished: Condvar::new(),
+        panic: Mutex::new(None),
     });
     for _ in 0..helpers.min(count - 1) {
         let shared = Arc::clone(&shared);
@@ -564,6 +584,49 @@ mod tests {
         let mut want = Vec::new();
         cloud_faces(&map, 5, 9, CloudCells::Spiral(&spiral), CloudSide::Inside, false, &mut want);
         assert!(faces == want, "faces built without the pool");
+    }
+
+    /// Name of the pool threads of [`a_slice_panic_on_the_pool_reaches_the_caller`].
+    const PANICKING_HELPER: &str = "clouds test helper";
+
+    /// [`cloud_faces`] that panics on the pool's threads; the calling thread lingers on each of
+    /// its slices so that the pool's threads surely take some.
+    fn panics_on_a_pool_thread(
+        map: &CloudMap,
+        cx: i32,
+        cz: i32,
+        cells: CloudCells<'_>,
+        side: CloudSide,
+        flat: bool,
+        out: &mut Vec<u32>,
+    ) {
+        assert!(std::thread::current().name() != Some(PANICKING_HELPER), "slice failed on a pool thread");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        cloud_faces(map, cx, cz, cells, side, flat, out);
+    }
+
+    /// A slice that panics on a pool thread reaches the calling thread once every slice is done.
+    /// Without the catch, the failed slice never counts as finished and the caller waits forever
+    /// (and a pool without a panic handler, as in the game, aborts the process).
+    #[test]
+    fn a_slice_panic_on_the_pool_reaches_the_caller() {
+        let (map, spiral) = (Arc::new(test_map()), Spiral::from(cloud_spiral(60)));
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .thread_name(|_| PANICKING_HELPER.into())
+            // Lets the test see the lost slice as a wait rather than an abort.
+            .panic_handler(|_| {})
+            .build()
+            .expect("pool");
+        let (done, finished) = mpsc::channel();
+        std::thread::spawn(move || {
+            let key = CloudKey { cx: 5, cz: 9, side: CloudSide::Inside, radius: 60, flat: false };
+            let mut out = (Vec::new(), Vec::new());
+            let build = || build_with_helpers(&pool, panics_on_a_pool_thread, &map, key, &spiral, (&mut out.0, &mut out.1));
+            let _ = done.send(panic::catch_unwind(AssertUnwindSafe(build)).is_err());
+        });
+        let panicked = finished.recv_timeout(std::time::Duration::from_secs(20));
+        assert_eq!(panicked, Ok(true), "the slice panic did not reach the caller");
     }
 
     /// Own pool: half the cores, at most 4, none below 2 threads.
