@@ -664,6 +664,13 @@ impl Tables {
         self.block.get(s as usize).is_some_and(|&b| self.climbable[b as usize])
     }
 
+    /// The supporting block of state `s` stays the block under the feet at offset `h` (§ 4.2):
+    /// a wall or a fence gate always, a fence up to half a block.
+    pub fn keeps_support(&self, s: u32, h: f32) -> bool {
+        let keep = self.block.get(s as usize).map_or(0, |&b| self.support_keep[b as usize]);
+        keep & (KEEP_WALL | KEEP_GATE) != 0 || (keep & KEEP_FENCE != 0 && h <= 0.5)
+    }
+
     /// Speed factor read only on the occupied block (water block or bubble column,
     /// not a merely flooded block): never on the block below.
     pub fn speed_factor_here_only(&self, s: u32) -> bool {
@@ -933,26 +940,58 @@ pub fn support_of(w: &dyn World, b: &Aabb, pos: [f64; 3]) -> Option<[i32; 3]> {
 
 /// `support_of` on a given path of the collision walk.
 pub(crate) fn support_of_with(w: &dyn World, b: &Aabb, pos: [f64; 3], path: collide::WalkPath) -> Option<[i32; 3]> {
-    let zone = Aabb { min: [b.min[0], b.min[1] - 1.0e-6, b.min[2]], max: [b.max[0], b.min[1], b.max[2]] };
+    let zone = support_zone(b);
     let mut best: Option<([i32; 3], f64)> = None;
     // Same cells as the collisions (one-block margin, corners ignored, edges reserved for shapes
     // that overflow): standing on a fence or a wall (1.5 blocks), the support is under the
     // row of the feet.
     collide::with_cell(collide::IsFreePath::current(), |cell| {
-        collide::walk_checked(w, &zone, collide::WalkOrder::YOuter, path, cell, |[x, y, z], _| {
-            let c = [f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5];
-            let d2 = (0..3).map(|a| (c[a] - pos[a]).powi(2)).sum::<f64>();
-            let better = match best {
-                None => true,
-                Some((p, bd)) => d2 < bd || (d2 == bd && (y, z, x) > (p[1], p[2], p[0])),
-            };
-            if better {
-                best = Some(([x, y, z], d2));
-            }
+        collide::walk_checked(w, &zone, collide::WalkOrder::YOuter, path, cell, |at, _| {
+            keep_closer_support(&mut best, at, pos);
             false
         })
     });
     best.map(|b| b.0)
+}
+
+/// `support_of` for the box `b` a movement made by [`collide::resolve_keeping`] just reached
+/// (`kept`: what it kept): the same answer, taken from the kept boxes without walking the cells
+/// again when they can tell it (`CollectedBlocks::support_cells`), otherwise by the walk.
+pub fn support_of_kept(w: &dyn World, kept: &collide::CollectedBlocks, b: &Aabb, pos: [f64; 3]) -> Option<[i32; 3]> {
+    let Some(cells) = kept.support_cells(support_zone(b)) else { return support_of(w, b, pos) };
+    let mut best: Option<([i32; 3], f64)> = None;
+    for at in cells {
+        keep_closer_support(&mut best, at, pos);
+    }
+    best.map(|b| b.0)
+}
+
+impl collide::CollectedBlocks {
+    /// The kept boxes can answer the support search of box `b` without a walk (measurement).
+    pub fn answers_support_of(&self, b: &Aabb) -> bool {
+        self.support_cells(support_zone(b)).is_some()
+    }
+}
+
+/// Thin slab under the feet of box `b` where the supporting block is searched.
+fn support_zone(b: &Aabb) -> Aabb {
+    Aabb { min: [b.min[0], b.min[1] - 1.0e-6, b.min[2]], max: [b.max[0], b.min[1], b.max[2]] }
+}
+
+/// Keeps in `best` the cell `at` if its centre is closer to the feet `pos` than the best so far;
+/// at equal distance the greatest (y, z, x) wins, so the result does not depend on the order the
+/// cells come in.
+fn keep_closer_support(best: &mut Option<([i32; 3], f64)>, at: [i32; 3], pos: [f64; 3]) {
+    let [x, y, z] = at;
+    let c = [f64::from(x) + 0.5, f64::from(y) + 0.5, f64::from(z) + 0.5];
+    let d2 = (0..3).map(|a| (c[a] - pos[a]).powi(2)).sum::<f64>();
+    let better = match *best {
+        None => true,
+        Some((p, bd)) => d2 < bd || (d2 == bd && (y, z, x) > (p[1], p[2], p[0])),
+    };
+    if better {
+        *best = Some((at, d2));
+    }
 }
 
 /// Position under the feet `pos` with an offset `h`, according to the supporting block (§ 4.2).
@@ -962,11 +1001,7 @@ pub fn below_of(support: Option<[i32; 3]>, pos: [f64; 3], t: &Tables, w: &dyn Wo
         if h <= 1.0e-5 {
             return s;
         }
-        let keep = w
-            .state(s[0], s[1], s[2])
-            .and_then(|st| t.block.get(st as usize))
-            .map_or(0, |&b| t.support_keep[b as usize]);
-        if keep & (KEEP_WALL | KEEP_GATE) != 0 || (keep & KEEP_FENCE != 0 && h <= 0.5) {
+        if w.state(s[0], s[1], s[2]).is_some_and(|st| t.keeps_support(st, h)) {
             return s;
         }
         return [s[0], y, s[2]];

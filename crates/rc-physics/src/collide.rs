@@ -185,10 +185,25 @@ pub(crate) fn walk_checked(
     cell: &mut Vec<Aabb>,
     f: impl FnMut([i32; 3], Aabb) -> bool,
 ) -> bool {
+    let mut reach = Aabb::EVERYWHERE;
+    walk_checked_noting_reach(w, b, order, path, cell, &mut reach, f)
+}
+
+/// `walk_checked`, writing into `reach` the shape reach the walk trimmed with (unbounded when it
+/// did not trim).
+fn walk_checked_noting_reach(
+    w: &dyn World,
+    b: &Aabb,
+    order: WalkOrder,
+    path: WalkPath,
+    cell: &mut Vec<Aabb>,
+    reach: &mut Aabb,
+    f: impl FnMut([i32; 3], Aabb) -> bool,
+) -> bool {
     if path != WalkPath::WHOLE && walk_check() {
         assert_same_as_whole_walk(w, b, order, path);
     }
-    walk_cells(w, b, order, path, cell, f)
+    walk_cells_noting_reach(w, b, order, path, cell, reach, f)
 }
 
 /// Check mode: the walk on `path` gives the same cells and boxes, in the same order, as the whole one.
@@ -225,10 +240,26 @@ pub(crate) fn walk_cells(
     order: WalkOrder,
     path: WalkPath,
     cell: &mut Vec<Aabb>,
+    f: impl FnMut([i32; 3], Aabb) -> bool,
+) -> bool {
+    let mut reach = Aabb::EVERYWHERE;
+    walk_cells_noting_reach(w, b, order, path, cell, &mut reach, f)
+}
+
+/// `walk_cells`, writing into `reach` the shape reach it trimmed with (unbounded when it did not
+/// trim).
+fn walk_cells_noting_reach(
+    w: &dyn World,
+    b: &Aabb,
+    order: WalkOrder,
+    path: WalkPath,
+    cell: &mut Vec<Aabb>,
+    reach: &mut Aabb,
     mut f: impl FnMut([i32; 3], Aabb) -> bool,
 ) -> bool {
     let (lo, hi) = scan_bounds(b);
-    let walked = if path.trim { reachable_span(&w.shape_reach(lo, hi), b, lo, hi) } else { Some((lo, hi)) };
+    *reach = if path.trim { w.shape_reach(lo, hi) } else { Aabb::EVERYWHERE };
+    let walked = if path.trim { reachable_span(reach, b, lo, hi) } else { Some((lo, hi)) };
     let Some((first, last)) = walked else { return false };
     // One column lookup for all the cells instead of one per cell (a hash lookup on the server).
     let mut states = [crate::UNLOADED; BATCH_CELLS];
@@ -335,10 +366,77 @@ fn sweep_parts(parts: &[&[Aabb]], start: &Aabb, d: [f64; 3]) -> [f64; 3] {
 /// the buffers have grown.
 #[derive(Default)]
 struct ResolveBuffers {
-    blocks: Vec<Aabb>,
+    blocks: CollectedBlocks,
     border: Vec<Aabb>,
     entities: Vec<Aabb>,
     heights: Vec<f32>,
+}
+
+/// Block boxes of one collision collection. A movement made by [`resolve_keeping`] also keeps the
+/// cell of each box, the zone and the shape reach of its last collection: the support search
+/// that follows it ([`crate::support_of_kept`]) filters them instead of walking the same cells
+/// again (`RUSTCRAFT_OPT_SUPPORTSHARE`).
+#[derive(Debug)]
+pub struct CollectedBlocks {
+    boxes: Vec<Aabb>,
+    /// Cell of each box (filled only when kept).
+    cells: Vec<[i32; 3]>,
+    /// Zone of the kept collection; `None` when nothing is kept.
+    zone: Option<Aabb>,
+    /// Shape reach the kept collection walked with (unbounded when it did not trim).
+    reach: Aabb,
+}
+
+impl Default for CollectedBlocks {
+    fn default() -> Self {
+        CollectedBlocks { boxes: Vec::new(), cells: Vec::new(), zone: None, reach: Aabb::EVERYWHERE }
+    }
+}
+
+impl CollectedBlocks {
+    /// Collects the block boxes of `zone`; with `keep`, also their cells, the zone and the reach.
+    fn collect(&mut self, w: &dyn World, zone: &Aabb, walk: WalkPath, keep: bool) {
+        let CollectedBlocks { boxes, cells, zone: kept_zone, reach } = self;
+        boxes.clear();
+        cells.clear();
+        *kept_zone = keep.then_some(*zone);
+        with_cell(IsFreePath::current(), |cell| {
+            walk_checked_noting_reach(w, zone, WalkOrder::YOuter, walk, cell, reach, |at, bx| {
+                boxes.push(bx);
+                if keep {
+                    cells.push(at);
+                }
+                false
+            })
+        });
+    }
+
+    /// Nothing kept any more: the next support search walks.
+    pub fn forget(&mut self) {
+        self.zone = None;
+    }
+
+    /// The cells of the boxes the support walk of `zone` would find (one per box, in the walk's
+    /// order), taken from the kept collection, or `None` when it cannot tell them all.
+    ///
+    /// Exact when `zone` lies inside the kept zone and the kept reach spills out of no cell
+    /// sideways. The cells the support walk reads are then all read by the kept walk, with no more
+    /// edge restrictions (an edge of the kept walk is an edge of the support walk). The support
+    /// walk only skips or restricts its own edge cells: a box of an edge cell that does not leave
+    /// its cell never reaches `zone`; on two or three edges one of them is sideways, which no box
+    /// crosses without a sideways spill. Kept boxes are taken from the support walk's cells only.
+    pub(crate) fn support_cells(&self, zone: Aabb) -> Option<impl Iterator<Item = [i32; 3]> + use<'_>> {
+        let kept = self.zone?;
+        let inside = (0..3).all(|a| kept.min[a] <= zone.min[a] && zone.max[a] <= kept.max[a]);
+        let r = &self.reach;
+        let spills_sideways = !(r.min[0] >= 0.0 && r.min[2] >= 0.0 && r.max[0] <= 1.0 && r.max[2] <= 1.0);
+        if !inside || spills_sideways {
+            return None;
+        }
+        let (lo, hi) = scan_bounds(&zone);
+        let walked = move |c: &[i32; 3]| (0..3).all(|a| lo[a] <= c[a] && c[a] <= hi[a]);
+        Some(self.cells.iter().zip(&self.boxes).filter(move |(c, bx)| walked(c) && bx.intersects(&zone)).map(|(c, _)| *c))
+    }
 }
 
 thread_local! {
@@ -372,15 +470,41 @@ pub(crate) fn resolve_with(w: &dyn World, start: &Aabb, d: [f64; 3], on_ground: 
     if !path.no_copy {
         return resolve_copying(w, start, d, on_ground, step, path.walk);
     }
+    resolve_in_thread_buffers(w, start, d, on_ground, step, path.walk, None)
+}
+
+/// `resolve`, keeping in `kept` the block boxes of its last collection with their cells, for the
+/// support search that follows the movement ([`crate::support_of_kept`]). Nothing is kept on the
+/// old copying path (`RUSTCRAFT_OPT_RESOLVE_NO_COPY=0`).
+pub fn resolve_keeping(w: &dyn World, start: &Aabb, d: [f64; 3], on_ground: bool, step: f64, kept: &mut CollectedBlocks) -> [f64; 3] {
+    let path = ResolvePath::current();
+    kept.forget();
+    if !path.no_copy {
+        return resolve_copying(w, start, d, on_ground, step, path.walk);
+    }
+    resolve_in_thread_buffers(w, start, d, on_ground, step, path.walk, Some(kept))
+}
+
+/// `resolve_in` with the thread's buffers (own ones when a collision search resolves a movement
+/// from inside another); block boxes collected into `kept` when given.
+fn resolve_in_thread_buffers(
+    w: &dyn World,
+    start: &Aabb,
+    d: [f64; 3],
+    on_ground: bool,
+    step: f64,
+    walk: WalkPath,
+    kept: Option<&mut CollectedBlocks>,
+) -> [f64; 3] {
     RESOLVE.with(|cell| match cell.try_borrow_mut() {
-        Ok(mut buffers) => resolve_in(w, start, d, on_ground, step, path.walk, &mut buffers),
-        // A world that resolves a movement from inside a collision search: own buffers.
-        Err(_) => resolve_in(w, start, d, on_ground, step, path.walk, &mut ResolveBuffers::default()),
+        Ok(mut buffers) => resolve_in(w, start, d, on_ground, step, walk, &mut buffers, kept),
+        Err(_) => resolve_in(w, start, d, on_ground, step, walk, &mut ResolveBuffers::default(), kept),
     })
 }
 
 /// `resolve` with the boxes left in their own buffers: blocks, border and entities are walked
-/// as three slices in that order instead of being copied one after the other.
+/// as three slices in that order instead of being copied one after the other. The block boxes go
+/// into `kept` (with their cells) when given, otherwise into the buffers.
 #[allow(clippy::too_many_arguments)]
 fn resolve_in(
     w: &dyn World,
@@ -390,8 +514,11 @@ fn resolve_in(
     step: f64,
     walk: WalkPath,
     buffers: &mut ResolveBuffers,
+    kept: Option<&mut CollectedBlocks>,
 ) -> [f64; 3] {
-    let ResolveBuffers { blocks, border, entities, heights } = buffers;
+    let ResolveBuffers { blocks: own_blocks, border, entities, heights } = buffers;
+    let keep = kept.is_some();
+    let collected = kept.unwrap_or(own_blocks);
     // Shape of the world border, if the entity is close to it (`weather-border.md` § 4.5).
     border.clear();
     if let Some(b) = w.border() {
@@ -400,10 +527,11 @@ fn resolve_in(
     // Solid entities: searched once in the zone of the movement and the step.
     entities.clear();
     w.entity_colliders(&start.expand_towards(d).expand_towards([0.0, step.max(0.0), 0.0]), entities);
-    collect_in(w, &start.expand_towards(d), blocks, WalkOrder::YOuter, walk);
-    let allowed = sweep_parts(&[blocks, border, entities], start, d);
+    collected.collect(w, &start.expand_towards(d), walk, keep);
+    let allowed = sweep_parts(&[&collected.boxes, border, entities], start, d);
     let Some((step_base, zone)) = step_up_zone(start, d, allowed, on_ground, step) else { return allowed };
-    collect_in(w, &zone, blocks, WalkOrder::YOuter, walk);
+    collected.collect(w, &zone, walk, keep);
+    let blocks = &collected.boxes;
     heights.clear();
     push_step_heights(blocks.iter().chain(border.iter()).chain(entities.iter()), &step_base, allowed, step, heights);
     let horizontal_len_sq = |v: [f64; 3]| v[0] * v[0] + v[2] * v[2];
