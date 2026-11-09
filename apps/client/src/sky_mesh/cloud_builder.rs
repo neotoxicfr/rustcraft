@@ -1,16 +1,18 @@
 //! Where the cloud faces are built, so that crossing a 12-block cell does not stall the frame:
-//! - [`ParallelBuild`]: the disk order cut into slices on the clouds' own small pool
-//!   (`RUSTCRAFT_OPT_CLOUD_POOL=1`), on the common pool (`RUSTCRAFT_OPT_CLOUDPAR=1`, where the build
-//!   waits behind the queued chunk meshes) or on the calling thread alone (default);
+//! - [`ParallelBuild`]: the disk order cut into slices taken by the calling thread and the clouds'
+//!   own small pool (`RUSTCRAFT_OPT_CLOUD_POOL`, default), on the common pool
+//!   (`RUSTCRAFT_OPT_CLOUDPAR=1`, where the build waits behind the queued chunk meshes) or on the
+//!   calling thread alone (`RUSTCRAFT_OPT_CLOUD_POOL=0`);
 //! - [`Speculation`]: a background thread builds the cell the camera will most likely enter next
 //!   (`RUSTCRAFT_OPT_CLOUD_SPECULATIVE_BUILD`); the crossing then only swaps two buffers.
 //!
 //! The faces are the same words in the same order whatever the placement (proof:
 //! `speculative_build_matches_a_direct_build`).
 
-use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 
-use super::{CloudBuild, CloudCells, CloudKey, CloudMap, cloud_faces, cloud_par};
+use super::{CloudBuild, CloudCells, CloudKey, CloudMap, PAR_MIN, cloud_faces, cloud_par};
 
 /// Precomputed disk order of a radius, shared with the background thread.
 pub type Spiral = Arc<[[i16; 2]]>;
@@ -27,7 +29,7 @@ pub enum ParallelBuild {
     CallingThread,
     /// Slices on the common pool (`RUSTCRAFT_OPT_CLOUDPAR=1`).
     CommonPool,
-    /// Slices on the clouds' own pool (`RUSTCRAFT_OPT_CLOUD_POOL`).
+    /// Slices taken by the calling thread and the clouds' own pool (`RUSTCRAFT_OPT_CLOUD_POOL`).
     OwnPool(rayon::ThreadPool),
 }
 
@@ -47,26 +49,119 @@ impl ParallelBuild {
         if common_pool { ParallelBuild::CommonPool } else { ParallelBuild::CallingThread }
     }
 
-    /// `build` of `key` over `cells` into `out`; in slices of the disk order (`parts` keeps their
-    /// reserves) when the placement is parallel. Same words, same order everywhere.
-    pub fn run<T: Copy + Send>(
+    /// `build` of `key` into `out`, cells in the order of `spiral` (the disk order of its radius)
+    /// or of the square sweep; in slices of the disk order (`parts` keeps their reserves) when the
+    /// placement is parallel. Same words, same order everywhere.
+    pub fn run<T: Copy + Send + 'static>(
         &self,
         build: CloudBuild<T>,
-        map: &CloudMap,
+        map: &Arc<CloudMap>,
         key: CloudKey,
-        cells: CloudCells<'_>,
+        spiral: Option<&Spiral>,
         (out, parts): (&mut Vec<T>, &mut Vec<Vec<T>>),
     ) {
-        let center = (key.cx, key.cz);
-        match (self, cells) {
-            (ParallelBuild::CommonPool, CloudCells::Spiral(s)) => {
-                cloud_par(build, map, center, s, key.side, key.flat, (out, parts));
+        match (self, spiral) {
+            (ParallelBuild::CommonPool, Some(s)) => {
+                cloud_par(build, map, (key.cx, key.cz), s, key.side, key.flat, (out, parts));
             }
-            (ParallelBuild::OwnPool(pool), CloudCells::Spiral(s)) => {
-                pool.install(|| cloud_par(build, map, center, s, key.side, key.flat, (out, parts)));
-            }
-            _ => build(map, key.cx, key.cz, cells, key.side, key.flat, out),
+            (ParallelBuild::OwnPool(pool), Some(s)) => build_with_helpers(pool, build, map, key, s, (out, parts)),
+            _ => build(map, key.cx, key.cz, cells_of(key, spiral), key.side, key.flat, out),
         }
+    }
+}
+
+/// `lock` that ignores a poisoning: a slice is plain data, valid whatever happened to its writer.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// One build shared between the calling thread and the clouds' own pool. Everything it reads is
+/// owned (shared pointers), so a pool thread that wakes up late can still look at it safely: it
+/// then finds every slice taken and leaves. The calling thread therefore waits only for slices a
+/// pool thread already started, never for a thread still asleep (late wake-ups under load cost
+/// up to 8 ms when the whole build waited for the pool, `docs/perf.md`).
+struct SharedBuild<T> {
+    build: CloudBuild<T>,
+    map: Arc<CloudMap>,
+    spiral: Spiral,
+    key: CloudKey,
+    cells_per_slice: usize,
+    next_slice: AtomicUsize,
+    /// Faces of each slice, laid end to end in slice order afterwards.
+    slices: Vec<Mutex<Vec<T>>>,
+    finished: Mutex<usize>,
+    slice_finished: Condvar,
+}
+
+impl<T> SharedBuild<T> {
+    /// Builds slices until none is left.
+    fn take_slices(&self) {
+        loop {
+            // The counter only hands out each slice once; the slice's own lock carries its faces.
+            let i = self.next_slice.fetch_add(1, Ordering::Relaxed);
+            let Some(slice) = self.slices.get(i) else { return };
+            let start = i * self.cells_per_slice;
+            let cells = &self.spiral[start..(start + self.cells_per_slice).min(self.spiral.len())];
+            let k = self.key;
+            (self.build)(&self.map, k.cx, k.cz, CloudCells::Spiral(cells), k.side, k.flat, &mut lock(slice));
+            *lock(&self.finished) += 1;
+            self.slice_finished.notify_one();
+        }
+    }
+
+    fn wait_for_every_slice(&self) {
+        let mut finished = lock(&self.finished);
+        while *finished < self.slices.len() {
+            finished = self.slice_finished.wait(finished).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+}
+
+/// [`cloud_par`] with the calling thread taking slices next to the threads of `pool`
+/// ([`SharedBuild`]): the same slices, laid end to end in the same order.
+pub fn build_with_helpers<T: Copy + Send + 'static>(
+    pool: &rayon::ThreadPool,
+    build: CloudBuild<T>,
+    map: &Arc<CloudMap>,
+    key: CloudKey,
+    spiral: &Spiral,
+    (out, parts): (&mut Vec<T>, &mut Vec<Vec<T>>),
+) {
+    let helpers = pool.current_num_threads();
+    let cells_per_slice = spiral.len().div_ceil((helpers + 1) * 4).max(PAR_MIN);
+    let count = spiral.len().div_ceil(cells_per_slice);
+    if count <= 1 {
+        build(map, key.cx, key.cz, CloudCells::Spiral(spiral), key.side, key.flat, out);
+        return;
+    }
+    if parts.len() < count {
+        parts.resize_with(count, Vec::new);
+    }
+    let shared = Arc::new(SharedBuild {
+        build,
+        map: Arc::clone(map),
+        spiral: Arc::clone(spiral),
+        key,
+        cells_per_slice,
+        next_slice: AtomicUsize::new(0),
+        // The slice buffers travel with the build and come back: their reserves are kept.
+        slices: parts[..count].iter_mut().map(|p| Mutex::new(std::mem::take(p))).collect(),
+        finished: Mutex::new(0),
+        slice_finished: Condvar::new(),
+    });
+    for _ in 0..helpers.min(count - 1) {
+        let shared = Arc::clone(&shared);
+        pool.spawn(move || shared.take_slices());
+    }
+    shared.take_slices();
+    shared.wait_for_every_slice();
+    for (part, slice) in parts.iter_mut().zip(&shared.slices) {
+        *part = std::mem::take(&mut *lock(slice));
+    }
+    out.clear();
+    out.reserve(parts[..count].iter().map(Vec::len).sum());
+    for part in &parts[..count] {
+        out.extend_from_slice(part);
     }
 }
 
@@ -242,7 +337,7 @@ impl FaceBuilder {
     /// radius, or of the square sweep), then `next` asked ahead. True if the speculation had them.
     pub fn build(
         &mut self,
-        map: &CloudMap,
+        map: &Arc<CloudMap>,
         key: CloudKey,
         spiral: Option<&Spiral>,
         next: CloudKey,
@@ -257,7 +352,7 @@ impl FaceBuilder {
                     s.recycle(old);
                 }
             }
-            None => placement.run(cloud_faces, map, key, cells_of(key, spiral), (&mut self.faces, &mut self.parts)),
+            None => placement.run(cloud_faces, map, key, spiral, (&mut self.faces, &mut self.parts)),
         }
         if let Some(s) = &mut self.speculation {
             s.prepare(next, spiral.cloned());
@@ -306,7 +401,7 @@ impl FaceBuilder {
 #[cfg(test)]
 mod tests {
     use super::super::tests::test_map;
-    use super::super::{CloudSide, cloud_spiral};
+    use super::super::{CloudSide, cloud_cell_instances, cloud_spiral};
     use super::*;
 
     const SIDES: [CloudSide; 3] = [CloudSide::Above, CloudSide::Inside, CloudSide::Below];
@@ -399,6 +494,76 @@ mod tests {
         // Wrapped at the edges of the map.
         assert_eq!(next_cell((63, 0), (11.0, 1.0), (1.0, -0.01), 64), (0, 0));
         assert_eq!(next_cell((63, 0), (11.0, 0.5), (0.1, -1.0), 64), (63, 63));
+    }
+
+    /// The slices taken by the calling thread and the pool are laid end to end into the direct
+    /// build, word for word, faces and cell instances, for every side, radius and mode, with pools
+    /// of 1 to 4 threads; the slice buffers are kept from one build to the next.
+    #[test]
+    fn shared_build_matches_a_direct_build() {
+        let map = Arc::new(test_map());
+        for threads in [1, 2, 4] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().expect("pool");
+            let (mut faces, mut face_parts) = (Vec::new(), Vec::new());
+            let (mut cells, mut cell_parts) = (Vec::new(), Vec::new());
+            for radius in [3, 20, 60] {
+                let spiral = Spiral::from(cloud_spiral(radius));
+                for (side, flat) in SIDES.map(|s| (s, false)).into_iter().chain([(CloudSide::Below, true)]) {
+                    let key = CloudKey { cx: 17, cz: 41, side, radius, flat };
+                    let whole = CloudCells::Spiral(&spiral);
+                    build_with_helpers(&pool, cloud_faces, &map, key, &spiral, (&mut faces, &mut face_parts));
+                    let mut want = Vec::new();
+                    cloud_faces(&map, key.cx, key.cz, whole, side, flat, &mut want);
+                    assert!(faces == want, "faces, {threads} threads, {key:?}");
+                    build_with_helpers(&pool, cloud_cell_instances, &map, key, &spiral, (&mut cells, &mut cell_parts));
+                    let mut want = Vec::new();
+                    cloud_cell_instances(&map, key.cx, key.cz, whole, side, flat, &mut want);
+                    assert!(cells == want, "cell instances, {threads} threads, {key:?}");
+                }
+            }
+            assert!(face_parts.len() > 1, "radius 60 not cut into slices");
+            let addresses = face_parts.iter().map(|p| p.as_ptr()).collect::<Vec<_>>();
+            let spiral = Spiral::from(cloud_spiral(60));
+            let key = CloudKey { cx: 17, cz: 41, side: CloudSide::Below, radius: 60, flat: false };
+            build_with_helpers(&pool, cloud_faces, &map, key, &spiral, (&mut faces, &mut face_parts));
+            assert!(face_parts.iter().map(|p| p.as_ptr()).collect::<Vec<_>>() == addresses, "slice buffers redone");
+        }
+    }
+
+    /// Every thread of the pool asleep or busy: the calling thread builds every slice itself and
+    /// returns without waiting for them (the old placement, the whole build installed on the pool,
+    /// waits here until they are released, and fails).
+    #[test]
+    fn shared_build_never_waits_for_a_busy_pool() {
+        let map = Arc::new(test_map());
+        let spiral = Spiral::from(cloud_spiral(60));
+        let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(2).build().expect("pool"));
+        let (release, released) = mpsc::channel::<()>();
+        let released = Arc::new(Mutex::new(released));
+        let (started, wait_started) = mpsc::channel();
+        for _ in 0..2 {
+            let (released, started) = (Arc::clone(&released), started.clone());
+            pool.spawn(move || {
+                started.send(()).expect("test alive");
+                // Held until the test ends: this pool thread takes nothing else meanwhile.
+                let _ = lock(&released).recv();
+            });
+            wait_started.recv().expect("pool thread started");
+        }
+        let (done, finished) = mpsc::channel();
+        let (built_map, built_spiral, built_pool) = (Arc::clone(&map), Arc::clone(&spiral), Arc::clone(&pool));
+        std::thread::spawn(move || {
+            let key = CloudKey { cx: 5, cz: 9, side: CloudSide::Inside, radius: 60, flat: false };
+            let mut out = (Vec::new(), Vec::new());
+            build_with_helpers(&built_pool, cloud_faces, &built_map, key, &built_spiral, (&mut out.0, &mut out.1));
+            let _ = done.send(out.0);
+        });
+        let result = finished.recv_timeout(std::time::Duration::from_secs(20));
+        drop(release);
+        let faces = result.expect("the build waited for the busy pool");
+        let mut want = Vec::new();
+        cloud_faces(&map, 5, 9, CloudCells::Spiral(&spiral), CloudSide::Inside, false, &mut want);
+        assert!(faces == want, "faces built without the pool");
     }
 
     /// Own pool: half the cores, at most 4, none below 2 threads.
