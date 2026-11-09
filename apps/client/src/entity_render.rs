@@ -2205,9 +2205,6 @@ pub(crate) struct EntOpt {
     /// `PRIMED_TNT_BY_KIND_FLAG`: a primed TNT drawn straight from its kind flag (needs
     /// `KINDINFO`) instead of being found among the object kinds by name.
     pub primed_tnt_by_kind_flag: bool,
-    /// `STILL_TNT_CACHE`: part matrix and instances of a primed TNT kept while its position,
-    /// swelling, blinking, state and light stay the same (default off, see `docs/perf.md`).
-    pub still_tnt_cache: bool,
     /// `GROUND_ITEM_LAYOUT_CACHE`: layers, model box and copy offsets of a stack on the ground kept
     /// per stack content, as long as its model reads nothing from its surroundings.
     pub ground_item_layout_cache: bool,
@@ -2241,7 +2238,6 @@ impl EntOpt {
         distance_sort_keys: false,
         primed_tnt_shared_pose: false,
         primed_tnt_by_kind_flag: false,
-        still_tnt_cache: false,
         ground_item_layout_cache: false,
         item_groups_in_place: false,
         instance_buckets: false,
@@ -2268,7 +2264,6 @@ impl EntOpt {
         distance_sort_keys: true,
         primed_tnt_shared_pose: true,
         primed_tnt_by_kind_flag: true,
-        still_tnt_cache: true,
         ground_item_layout_cache: true,
         item_groups_in_place: true,
         instance_buckets: true,
@@ -2294,7 +2289,6 @@ impl EntOpt {
             distance_sort_keys: rc_data::opt_switch!("RUSTCRAFT_OPT_DISTANCE_SORT_KEYS"),
             primed_tnt_shared_pose: rc_data::opt_switch!("RUSTCRAFT_OPT_PRIMED_TNT_SHARED_POSE"),
             primed_tnt_by_kind_flag: rc_data::opt_switch!("RUSTCRAFT_OPT_PRIMED_TNT_BY_KIND_FLAG"),
-            still_tnt_cache: rc_data::opt_switch!("RUSTCRAFT_OPT_STILL_TNT_CACHE", default_off),
             ground_item_layout_cache: rc_data::opt_switch!("RUSTCRAFT_OPT_GROUND_ITEM_LAYOUT_CACHE"),
             item_groups_in_place: rc_data::opt_switch!("RUSTCRAFT_OPT_ITEM_GROUPS_IN_PLACE"),
             instance_buckets: rc_data::opt_switch!("RUSTCRAFT_OPT_INSTANCE_BUCKETS"),
@@ -3959,7 +3953,6 @@ impl EntityRenderer {
         self.set_current(None, None);
         let opt = self.opt;
         ANIMATION_PATHS.with(|p| p.set(AnimationPaths::of(&opt)));
-        self.begin_primed_tnt_frame();
         self.begin_ground_layouts_frame();
         let list = self.frame_list(entities, pt, cam);
         for v in &mut self.free_verts {

@@ -298,13 +298,7 @@ fn tint_paths_digests_match_stored() {
     keys.sort_unstable();
     let desert = d.biomes.iter().position(|b| b.name == "minecraft:desert").expect("desert") as u32;
     let (all, old) = (TintPaths::ALL, TintPaths::OLD);
-    let before_cells = TintPaths {
-        uniform_cells: false,
-        four_block_rows: false,
-        persistent_corner_memo: false,
-        shared_column_layers: false,
-        ..all
-    };
+    let before_cells = TintPaths { uniform_cells: false, four_block_rows: false, ..all };
     let combos = [
         all,
         old,
@@ -317,8 +311,6 @@ fn tint_paths_digests_match_stored() {
         TintPaths { sliding_sums: 1, ..all },
         TintPaths { uniform_cells: false, ..all },
         TintPaths { four_block_rows: false, ..all },
-        TintPaths { persistent_corner_memo: false, ..all },
-        TintPaths { shared_column_layers: false, ..all },
         TintPaths { single_biome_zone: true, ..old },
         TintPaths { lattice: true, ..old },
         TintPaths { grid: true, ..old },
@@ -326,8 +318,6 @@ fn tint_paths_digests_match_stored() {
         TintPaths { sliding_sums: 1, ..old },
         TintPaths { uniform_cells: true, ..old },
         TintPaths { grid: true, four_block_rows: true, ..old },
-        TintPaths { persistent_corner_memo: true, ..old },
-        TintPaths { grid: true, shared_column_layers: true, ..old },
     ];
     let expected = |n: &str| EXPECTED.iter().find(|e| e.0 == n).expect("variant").1;
     for p in combos {

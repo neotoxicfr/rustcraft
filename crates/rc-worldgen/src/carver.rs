@@ -241,27 +241,6 @@ impl CarvingMask {
         !self.any
     }
 
-    /// Carves the blocks `bottom..=top` (world y, inside the mask) of the column (x, z) at once.
-    pub fn carve_run(&mut self, x: i32, z: i32, bottom: i32, top: i32) {
-        if bottom > top {
-            return;
-        }
-        let column = ((z + (x << 4)) * self.height) as usize;
-        let first = column + (bottom - self.min_y) as usize;
-        let last = column + (top - self.min_y) as usize;
-        let (first_word, last_word) = (first >> 6, last >> 6);
-        let from_first = !0u64 << (first & 63);
-        let up_to_last = !0u64 >> (63 - (last & 63));
-        if first_word == last_word {
-            self.bits[first_word] |= from_first & up_to_last;
-        } else {
-            self.bits[first_word] |= from_first;
-            self.bits[first_word + 1..last_word].fill(!0);
-            self.bits[last_word] |= up_to_last;
-        }
-        self.any = true;
-    }
-
     #[inline]
     fn get(&self, i: usize) -> bool {
         self.bits[i >> 6] >> (i & 63) & 1 != 0
@@ -389,8 +368,6 @@ pub struct Target<'a> {
     pub yd_once: bool,
     /// `RUSTCRAFT_OPT_CARVER_WIDTHS`: canyon width buffer reused.
     pub reuse_widths: bool,
-    /// `RUSTCRAFT_OPT_CARVER_SPAN_FILL`: each column of a cave ellipsoid written as one run.
-    pub span_fill: bool,
     /// `RUSTCRAFT_OPT_CARVER_REACH_BOX`: a replay whose ellipsoids all miss the chunk is skipped.
     pub reach_box: bool,
     #[doc(hidden)]
@@ -411,8 +388,6 @@ pub enum CarvingSabotage {
     PretestNextRank,
     /// Reach box one block smaller on every side.
     ReachBoxOneBlockSmaller,
-    /// Top of each carved run left out.
-    RunTopExclusive,
 }
 
 impl<'a> Target<'a> {
@@ -423,7 +398,6 @@ impl<'a> Target<'a> {
             mask,
             yd_once,
             reuse_widths,
-            span_fill: false,
             reach_box: false,
             sabotage: CarvingSabotage::None,
             yd: Vec::new(),
@@ -500,59 +474,6 @@ impl<'a> Target<'a> {
             }
         }
     }
-
-    /// Cave ellipsoid written one column at a time, as a single run. In a column the carved rows
-    /// form one interval: the normalised height `yd` never decreases going up, so the sum of
-    /// squares only falls then rises, and the floor test only cuts rows off the bottom. The run
-    /// holds the row just below or just above the centre if it is not empty; it is grown from
-    /// there with the very expressions of the block-by-block test (same rounding, no square
-    /// root), then written with word masks.
-    #[allow(clippy::too_many_arguments)]
-    fn cave_ellipsoid_by_runs(&mut self, x: f64, y: f64, z: f64, hr: f64, vr: f64, floor: f64) {
-        let Some(reach) = self.reach_of(x, y, z, hr, vr) else { return };
-        let (cx0, cz0) = (self.min_x, self.min_z);
-        let rows = reach.y_below + 1..reach.y_top + 1;
-        if rows.is_empty() {
-            return;
-        }
-        // Same expression as the block-by-block walk, once per row.
-        let mut yd_rows = std::mem::take(&mut self.yd);
-        yd_rows.clear();
-        yd_rows.extend(rows.clone().map(|wy| (f64::from(wy) - 0.5 - y) / vr));
-        let yd = |wy: i32| yd_rows[(wy - rows.start) as usize];
-        // Rows below `centre` have yd < 0 (squares falling), rows from it yd ≥ 0 (squares rising).
-        let centre = first_row_where(rows.clone(), |wy| yd(wy) >= 0.0);
-        // The two halves of the block-by-block skip test, written the same way (NaN included).
-        let under_floor = |wy: i32| yd(wy) <= floor;
-        // Rows below `lowest` are cut by the floor.
-        let lowest = first_row_where(rows.clone(), |wy| !under_floor(wy));
-        for xi in reach.min_xi..=reach.max_xi {
-            let xd = (f64::from(cx0 + xi) + 0.5 - x) / hr;
-            for zi in reach.min_zi..=reach.max_zi {
-                let zd = (f64::from(cz0 + zi) + 0.5 - z) / hr;
-                if xd * xd + zd * zd >= 1.0 {
-                    continue;
-                }
-                let outside = |wy: i32| {
-                    let d = yd(wy);
-                    xd * xd + d * d + zd * zd >= 1.0
-                };
-                let mut high = centre - 1;
-                while high + 1 < rows.end && !outside(high + 1) {
-                    high += 1;
-                }
-                let mut low = centre;
-                while low > rows.start.max(lowest) && !outside(low - 1) {
-                    low -= 1;
-                }
-                if self.sabotage == CarvingSabotage::RunTopExclusive {
-                    high -= 1;
-                }
-                self.mask.carve_run(xi, zi, low.max(lowest), high);
-            }
-        }
-        self.yd = yd_rows;
-    }
 }
 
 /// Blocks of the target chunk an ellipsoid may touch: local columns `min_xi..=max_xi` ×
@@ -567,21 +488,6 @@ struct EllipsoidReach {
     max_zi: i32,
 }
 
-/// First row of `rows` where `pred` holds, for a `pred` false then true along the rows;
-/// `rows.end` if it never holds.
-fn first_row_where(rows: std::ops::Range<i32>, pred: impl Fn(i32) -> bool) -> i32 {
-    let (mut lo, mut hi) = (rows.start, rows.end);
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if pred(mid) {
-            hi = mid;
-        } else {
-            lo = mid + 1;
-        }
-    }
-    lo
-}
-
 impl Sink for Target<'_> {
     fn can_reach(&mut self, x: f64, z: f64, step: i32, total: i32, thickness: f32) -> bool {
         let (dx, dz) = (x - self.mid_x(), z - self.mid_z());
@@ -593,10 +499,6 @@ impl Sink for Target<'_> {
     #[inline]
     fn ellipsoid(&mut self, x: f64, y: f64, z: f64, hr: f64, vr: f64, skip: Skip<'_>) {
         match skip {
-            // The runs need a height that never decreases going up: a positive radius, a real centre.
-            Skip::Cave { floor } if self.span_fill && vr > 0.0 && y.is_finite() => {
-                self.cave_ellipsoid_by_runs(x, y, z, hr, vr, floor)
-            }
             Skip::Cave { floor } => self.ellipsoid_with(x, y, z, hr, vr, move |xd: f64, yd: f64, zd: f64, _y: i32| {
                 yd <= floor || xd * xd + yd * yd + zd * zd >= 1.0
             }),
@@ -1072,36 +974,11 @@ type ReplayShard = (hashbrown::HashMap<ReplayKey, std::sync::Arc<Record>>, usize
 /// Key of a recorded carving: (cave, rank, source x, source z).
 type ReplayKey = (u16, u16, i32, i32);
 
-/// How the tables of the replay cache are locked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReplayCacheLocks {
-    /// 16 tables under plain locks (old path).
-    Plain,
-    /// 16 tables under read-write locks (`RUSTCRAFT_OPT_REPLAY_CACHE_RWLOCK`): the threads that
-    /// find their carving do not wait for one another.
-    ReadWrite,
-    /// 64 tables under plain locks, each on its own cache lines (`RUSTCRAFT_OPT_REPLAY_CACHE_SPREAD`):
-    /// with many threads fewer of them want the same lock at once, and a lock taken does not
-    /// slow down the neighbouring tables, whose lock words shared a cache line before.
-    Spread,
-}
-
-/// Tables of the spread cache.
-const SPREAD_SHARDS: usize = 64;
-
-/// A table of the spread cache, alone on its cache lines.
-#[repr(align(128))]
-#[derive(Debug, Default)]
-struct PaddedShard(std::sync::Mutex<ReplayShard>);
-
 /// Shared cache of the recorded carvings of a generator, key (cave, rank, source x, source z).
-/// A table that would exceed its share of `cap` bytes is emptied. The tables exist once per way
-/// of locking them ([`ReplayCacheLocks`]); a cache is only ever used one way.
+/// A table that would exceed its share of `cap` bytes is emptied.
 #[derive(Debug)]
 pub struct ReplayCache {
     shards: [std::sync::Mutex<ReplayShard>; 16],
-    shared_read_shards: [std::sync::RwLock<ReplayShard>; 16],
-    spread_shards: Box<[PaddedShard]>,
     cap: usize,
 }
 
@@ -1109,8 +986,6 @@ impl Default for ReplayCache {
     fn default() -> Self {
         ReplayCache {
             shards: Default::default(),
-            shared_read_shards: Default::default(),
-            spread_shards: (0..SPREAD_SHARDS).map(|_| PaddedShard::default()).collect(),
             cap: 16 << 20,
         }
     }
@@ -1148,27 +1023,6 @@ impl ReplayCache {
         key.2.wrapping_mul(31).wrapping_add(key.3) as usize & (count - 1)
     }
 
-    /// Recorded carving of the source (computed as needed), through the tables locked `locks`.
-    pub fn get_with(&self, key: ReplayKey, locks: ReplayCacheLocks, make: impl FnOnce() -> Record) -> std::sync::Arc<Record> {
-        match locks {
-            ReplayCacheLocks::Plain => self.get(key, make),
-            ReplayCacheLocks::Spread => {
-                let shard = &self.spread_shards[Self::shard_of(key, SPREAD_SHARDS)].0;
-                get_in_table(shard, key, self.cap / SPREAD_SHARDS, make)
-            }
-            ReplayCacheLocks::ReadWrite => {
-                let shard = &self.shared_read_shards[Self::shard_of(key, 16)];
-                if let Some(r) = shard.read().unwrap_or_else(std::sync::PoisonError::into_inner).0.get(&key) {
-                    return r.clone();
-                }
-                let rec = std::sync::Arc::new(make());
-                let mut table = shard.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-                insert_record(&mut table, key, &rec, self.cap / 16);
-                rec
-            }
-        }
-    }
-
     /// Recorded carving of the source (computed as needed).
     pub fn get(&self, key: ReplayKey, make: impl FnOnce() -> Record) -> std::sync::Arc<Record> {
         get_in_table(&self.shards[Self::shard_of(key, 16)], key, self.cap / 16, make)
@@ -1180,15 +1034,9 @@ impl ReplayCache {
             let g = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             (g.1, g.0.len())
         };
-        let shared = self.shared_read_shards.iter().map(|s| {
-            let g = s.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-            (g.1, g.0.len())
-        });
         self.shards
             .iter()
             .map(locked)
-            .chain(shared)
-            .chain(self.spread_shards.iter().map(|s| locked(&s.0)))
             .fold((0, 0), |(b, n), (sb, sn)| (b + sb, n + sn))
     }
 }

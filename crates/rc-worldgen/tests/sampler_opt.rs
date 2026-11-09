@@ -1,6 +1,5 @@
 //! Density evaluator (C1-M05, C1-M06, C1-M13): new paths (`sampler::Opts::NEW`) against the old
-//! code (`Opts::OLD`) bit for bit, on the router roots and the vein functions; a context kept from
-//! one chunk to the next against a fresh one; cache reads of a sub-lattice; evaluation counts;
+//! code (`Opts::OLD`) bit for bit, on the router roots and the vein functions; cache reads of a sub-lattice; evaluation counts;
 //! micro-benches.
 //! Without game data, the tests are skipped (explicit failure under `RUSTCRAFT_OPT_REQUIRE=1`).
 //!
@@ -13,7 +12,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use rayon::prelude::*;
-use rc_worldgen::proto::ProtoTerrain;
 use rc_worldgen::sampler::{EvalCounts, Opts, S, Sid};
 use rc_worldgen::terrain::{BiomeCache, Stage, TerrainGenerator};
 use rc_worldgen::{Ctx, Generator, Volume};
@@ -121,19 +119,17 @@ const SEED: i64 = 20_261_011;
 
 /// Each path alone, then the combinations with `range_yvol`, then all: a faulty track is
 /// named by its own failure.
-const VARIANTS: [(&str, Opts); 15] = [
+const VARIANTS: [(&str, Opts); 13] = [
     ("shifted_noise_in_batches", Opts { shifted_noise_in_batches: true, ..Opts::OLD }),
     ("column_memo_y_independent", Opts { column_memo_y_independent: true, ..Opts::OLD }),
     ("memo+sublattice", Opts { column_memo_y_independent: true, sublattice_cache_read: true, ..Opts::OLD }),
     ("range_yvol", Opts { range_yvol: true, ..Opts::OLD }),
-    ("vol_pool", Opts { vol_pool: true, ..Opts::OLD }),
     ("spline_stack", Opts { spline_stack: true, ..Opts::OLD }),
     ("take_without_zeroing", Opts { take_without_zeroing: true, ..Opts::OLD }),
     ("best_fit_buffers", Opts { best_fit_buffers: true, ..Opts::OLD }),
     ("sublattice_cache_read", Opts { sublattice_cache_read: true, ..Opts::OLD }),
     ("spline_inputs_on_stack", Opts { spline_inputs_on_stack: true, ..Opts::OLD }),
     ("floor_java", Opts { floor_java: true, ..Opts::OLD }),
-    ("yvol+pool", Opts { range_yvol: true, vol_pool: true, ..Opts::OLD }),
     ("yvol+spline", Opts { range_yvol: true, spline_stack: true, ..Opts::OLD }),
     ("yvol+sublattice", Opts { range_yvol: true, sublattice_cache_read: true, ..Opts::OLD }),
     ("all", Opts::NEW),
@@ -241,7 +237,7 @@ fn check_volumes(preset: &str, n: usize, veins: bool) {
                             ));
                         }
                         compared += got.len();
-                        // Buffer returned: the next volume takes it back (`vol_pool`), dirty.
+                        // Buffer returned: the next volume takes it back dirty.
                         ctx.recycle(got);
                     }
                 }
@@ -765,17 +761,12 @@ fn point_evaluation_census() {
     rc_worldgen::sampler::count_evaluations(false);
 }
 
-const KEEP_SEEDS: [i64; 3] = [0, -6_214_586_474_519_478_921, 1_234_567_890_123_456_789];
-
 /// Function built so that a stale cache cell shows (no 26.3 cache is read this way): a cache over
 /// an interpolated noise whose y scale is not a power of 2, so that its point value differs
 /// from its volume value away from the cell corners.
 const CACHE_OVER_INTERPOLATION: &str = r#"{"type":"minecraft:cache","input":{"type":"minecraft:interpolated",
     "cell_size_xz":4,"cell_size_y":8,"input":{"type":"minecraft:noise","noise":"minecraft:cave_cheese",
     "xz_scale":1.0,"y_scale":0.6666666666666666}}}"#;
-
-/// Positions read in a chunk (offsets x, z; world y): away from the interpolation corners.
-const SPOTS: [(i32, i32, i32); 3] = [(5, 37, 7), (13, 101, 2), (2, 66, 11)];
 
 fn compile_text(g: &mut Generator, text: &str) -> Sid {
     let f = rc_worldgen::density::parse(&rc_worldgen::json::parse(text).unwrap()).unwrap();
@@ -784,192 +775,6 @@ fn compile_text(g: &mut Generator, text: &str) -> Sid {
 
 fn cache_nodes(g: &Generator) -> Vec<Sid> {
     (0..g.program.nodes.len() as Sid).filter(|&s| matches!(g.program.nodes[s as usize], S::Cache { .. })).collect()
-}
-
-/// 200 chunks: 8 runs of 25 neighbours along x, from the test chunks.
-fn chunk_walk() -> Vec<(i32, i32)> {
-    chunks(8).into_iter().flat_map(|(cx, cz)| (0..25).map(move |k| (cx + k, cz))).collect()
-}
-
-fn read_spots<'a>(
-    g: &Generator,
-    ctx: &mut Ctx,
-    caches: &[Sid],
-    (cx, cz): (i32, i32),
-    spots: impl Iterator<Item = &'a (i32, i32, i32)>,
-    out: &mut Vec<f32>,
-) {
-    for &(ox, y, oz) in spots {
-        for &c in caches {
-            out.push(g.value(c, ctx, cx * 16 + ox, y, cz * 16 + oz));
-        }
-    }
-}
-
-/// Values seen by one chunk in `ctx`, in the order of the terrain: point reads on every cache in
-/// the previous chunk (whose volumes a kept context could still hold), the volumes of the chunk
-/// (buffers handed back), then point reads in the chunk (in reverse order: the first one is
-/// the last point the previous chunk read) and in the next chunk.
-fn chunk_reads(g: &Generator, ctx: &mut Ctx, roots: &[Sid], caches: &[Sid], (cx, cz): (i32, i32)) -> Vec<f32> {
-    let mut out = Vec::new();
-    read_spots(g, ctx, caches, (cx - 1, cz), SPOTS.iter(), &mut out);
-    let v = g.chunk_volume(cx, cz);
-    for &root in roots {
-        let b = g.volume(root, ctx, &v);
-        out.extend_from_slice(&b);
-        ctx.recycle(b);
-    }
-    read_spots(g, ctx, caches, (cx, cz), SPOTS.iter().rev(), &mut out);
-    read_spots(g, ctx, caches, (cx + 1, cz), SPOTS.iter(), &mut out);
-    out
-}
-
-/// Chunks of the walk in a context kept and reset at each chunk, against a fresh context.
-fn kept_context_failures(pack: &rc_worldgen::data::DataPack, preset: &str, seed: i64) -> Vec<String> {
-    let mut g = Generator::new(pack, preset, seed).unwrap();
-    let built = compile_text(&mut g, CACHE_OVER_INTERPOLATION);
-    let roots = [g.router.final_density, built];
-    let caches = cache_nodes(&g);
-    let mut kept = Ctx::cached_with(Opts::NEW);
-    let mut failures = Vec::new();
-    for pos in chunk_walk() {
-        kept.reset_for_reuse();
-        let got = chunk_reads(&g, &mut kept, &roots, &caches, pos);
-        let want = chunk_reads(&g, &mut Ctx::cached_with(Opts::NEW), &roots, &caches, pos);
-        if let Some((bad, i)) = first_diff(&got, &want) {
-            failures.push(format!("{preset} seed {seed} chunk {pos:?}: {bad} differences, first {i}: {} ≠ {}", got[i], want[i]));
-            if failures.len() >= 5 {
-                break;
-            }
-        }
-    }
-    failures
-}
-
-/// A context kept from one chunk to the next and reset at each one (like the terrain) gives
-/// what a fresh context gives, bit for bit: 200 chunks × 3 seeds × 3 dimensions, final density
-/// and the built cache over an interpolation, point reads on every cache around the chunk.
-#[test]
-fn kept_context_matches_fresh_context() {
-    let Some(pack) = common::data_pack() else { return };
-    let jobs: Vec<(&str, i64)> =
-        ["overworld", "nether", "end"].into_iter().flat_map(|p| KEEP_SEEDS.map(|s| (p, s))).collect();
-    let failures: Vec<String> =
-        jobs.par_iter().flat_map_iter(|&(preset, seed)| kept_context_failures(&pack, preset, seed)).collect();
-    assert!(failures.is_empty(), "{} chunks differ:\n{}", failures.len(), failures.join("\n"));
-}
-
-/// One terrain chunk, then the base heights of two columns inside it (a kept context still holds
-/// its volumes) and of two columns of the next chunk (base columns go through the same kept
-/// context).
-fn terrain_step(t: &TerrainGenerator, cache: &BiomeCache, (cx, cz): (i32, i32)) -> (ProtoTerrain, Vec<i32>) {
-    let chunk = t.generate(cx, cz, cache, None);
-    let columns = [cx, cx + 1].into_iter().flat_map(|x0| SPOTS[..2].iter().map(move |&(ox, _, oz)| (x0 * 16 + ox, cz * 16 + oz)));
-    let heights = columns.flat_map(|(x, z)| [t.base_height(x, z, false), t.base_height(x, z, true)]);
-    (chunk, heights.collect())
-}
-
-/// Chunks of `walk` in order on this thread (see [`terrain_step`]).
-fn terrain_walk(t: &TerrainGenerator, cache: &BiomeCache, walk: &[(i32, i32)]) -> Vec<(ProtoTerrain, Vec<i32>)> {
-    walk.iter().map(|&pos| terrain_step(t, cache, pos)).collect()
-}
-
-/// Each chunk of `walk` generated by every generator in turn on this thread, with or without the
-/// kept context.
-fn interleaved_walk(
-    gens: &mut [(TerrainGenerator, BiomeCache)],
-    walk: &[(i32, i32)],
-    keep: bool,
-) -> Vec<(ProtoTerrain, Vec<i32>)> {
-    let mut out = Vec::new();
-    for &pos in walk {
-        for (t, cache) in gens.iter_mut() {
-            t.opts.keep_eval_context = keep;
-            out.push(terrain_step(t, cache, pos));
-        }
-    }
-    out
-}
-
-fn terrain_diff((a, ha): &(ProtoTerrain, Vec<i32>), (b, hb): &(ProtoTerrain, Vec<i32>)) -> Option<String> {
-    if let Some(i) = a.blocks.iter().zip(&b.blocks).position(|(x, y)| x != y) {
-        return Some(format!("block {i}: {} ≠ {}", a.blocks[i], b.blocks[i]));
-    }
-    if !a.world_surface_wg.iter().eq(b.world_surface_wg.iter()) || !a.ocean_floor_wg.iter().eq(b.ocean_floor_wg.iter()) {
-        return Some("height maps".into());
-    }
-    if a.post_processing != b.post_processing {
-        return Some("fluid marks".into());
-    }
-    (ha != hb).then(|| format!("base heights {ha:?} ≠ {hb:?}"))
-}
-
-/// Terrain chunks generated one after another on this thread with the kept context against a
-/// fresh context per chunk: same blocks, height maps, fluid marks and base heights. The kept
-/// context also passes from one generator (dimension, seed) to the next, as on a server thread.
-#[test]
-fn kept_context_terrain_matches_fresh() {
-    let Some(pack) = common::data_pack() else { return };
-    let dims = ["minecraft:overworld", "minecraft:the_nether", "minecraft:the_end"];
-    let mut failures = Vec::new();
-    let mut solid = 0usize;
-    for dim in dims {
-        for seed in KEEP_SEEDS {
-            let mut t = TerrainGenerator::from_preset(&pack, "minecraft:normal", dim, seed).expect("generator");
-            // Every base height computes its column.
-            t.opts.baseh_memo = false;
-            let walk: Vec<(i32, i32)> = chunks(2).into_iter().flat_map(|(cx, cz)| (0..4).map(move |k| (cx + k, cz))).collect();
-            let mut cache = BiomeCache::default();
-            t.prepare_biomes(&mut cache, &walk);
-            t.opts.keep_eval_context = false;
-            let fresh = terrain_walk(&t, &cache, &walk);
-            t.opts.keep_eval_context = true;
-            let kept = terrain_walk(&t, &cache, &walk);
-            solid += kept.iter().map(|(c, _)| c.blocks.iter().filter(|&&b| b != rc_worldgen::palette::AIR).count()).sum::<usize>();
-            for ((pos, a), b) in walk.iter().zip(&kept).zip(&fresh) {
-                if let Some(d) = terrain_diff(a, b) {
-                    failures.push(format!("{dim} seed {seed} chunk {pos:?}: {d}"));
-                }
-            }
-        }
-    }
-    eprintln!("{} chunks compared, {solid} solid blocks", dims.len() * KEEP_SEEDS.len() * 8);
-    assert!(solid > 0, "empty chunks: nothing compared");
-    assert!(failures.is_empty(), "{} chunks differ:\n{}", failures.len(), failures.join("\n"));
-}
-
-/// The same chunk generated by several generators one after another on this thread (a server
-/// thread serves every dimension, and after leaving a world it serves the next world's seed):
-/// the kept context then holds the volumes and last point of another program under the same cache
-/// numbers, which only the reset at the start of each chunk forgets.
-#[test]
-fn kept_context_survives_generator_switch() {
-    let Some(pack) = common::data_pack() else { return };
-    let sources = [
-        ("minecraft:overworld", KEEP_SEEDS[0]),
-        ("minecraft:overworld", KEEP_SEEDS[1]),
-        ("minecraft:the_nether", KEEP_SEEDS[0]),
-        ("minecraft:overworld", KEEP_SEEDS[2]),
-    ];
-    let walk: Vec<(i32, i32)> = chunks(2).into_iter().flat_map(|(cx, cz)| (0..2).map(move |k| (cx + k, cz))).collect();
-    let mut gens: Vec<(TerrainGenerator, BiomeCache)> = sources
-        .iter()
-        .map(|&(dim, seed)| {
-            let mut t = TerrainGenerator::from_preset(&pack, "minecraft:normal", dim, seed).expect("generator");
-            t.opts.baseh_memo = false;
-            let mut cache = BiomeCache::default();
-            t.prepare_biomes(&mut cache, &walk);
-            (t, cache)
-        })
-        .collect();
-    let fresh = interleaved_walk(&mut gens, &walk, false);
-    let kept = interleaved_walk(&mut gens, &walk, true);
-    let labels = walk.iter().flat_map(|pos| sources.iter().map(move |src| (pos, src)));
-    let failures: Vec<String> = labels
-        .zip(kept.iter().zip(&fresh))
-        .filter_map(|((pos, (dim, seed)), (a, b))| terrain_diff(a, b).map(|d| format!("{dim} seed {seed} chunk {pos:?}: {d}")))
-        .collect();
-    assert!(failures.is_empty(), "{} chunks differ:\n{}", failures.len(), failures.join("\n"));
 }
 
 /// Survey of the common subexpressions (SAMPLER_CSE track): uncached nodes that
@@ -1070,8 +875,8 @@ fn costs_now() -> (u64, u64, Option<(u64, u64)>) {
 /// Final density of 256 chunks: each path alone, then all; 1 thread then powers of 2
 /// up to the number of cores; allocations, page faults and private memory per chunk (1 thread).
 /// `kept`: one context per rayon job kept from one chunk to the next and reset at each one, output
-/// taken from its spare buffers and handed back (the terrain with `KEEP_EVAL_CONTEXT`);
-/// `new`: a new context per chunk (the terrain without it).
+/// taken from its spare buffers and handed back;
+/// `new`: a new context per chunk (what the terrain does).
 #[test]
 #[ignore = "benchmark"]
 fn bench_final_density() {
@@ -1085,7 +890,6 @@ fn bench_final_density() {
     cases.extend([
         ("all but best_fit", Opts { best_fit_buffers: false, ..Opts::NEW }),
         ("all but no_zeroing", Opts { take_without_zeroing: false, ..Opts::NEW }),
-        ("all but vol_pool", Opts { vol_pool: false, ..Opts::NEW }),
     ]);
     let max = std::thread::available_parallelism().map_or(1, |n| n.get());
     for pass in 0..2 {
@@ -1144,57 +948,6 @@ fn ms_per_chunk(chunks: &[(i32, i32)], mut run: impl FnMut(i32, i32)) -> f64 {
     s.elapsed().as_secs_f64() * 1e3 / chunks.len() as f64
 }
 
-/// New context per chunk against the kept one, on 1 thread, alternated over 15 rounds (final
-/// density, switches of the environment) then 8 rounds (whole terrain): minimum and median per
-/// chunk. Alternating and keeping the minimum resists a loaded machine better than two blocks.
-#[test]
-#[ignore = "benchmark"]
-fn bench_kept_context_alternated() {
-    let Some(pack) = common::data_pack() else { return };
-    counting::client_options();
-    let g = Generator::new(&pack, "overworld", 42).unwrap();
-    let chunks: Vec<(i32, i32)> = (0..8).flat_map(|x| (0..8).map(move |z| (x - 4, z - 4))).collect();
-    // (label, paths, kept context): the default paths, then each track of C1-M06 taken out.
-    let cases = [
-        ("default, new context", Opts::current(), false),
-        ("default, kept", Opts::current(), true),
-        ("default but no_zeroing, kept", Opts { take_without_zeroing: false, ..Opts::current() }, true),
-        ("default but best_fit, kept", Opts { best_fit_buffers: false, ..Opts::current() }, true),
-        ("default + vol_pool, kept", Opts { vol_pool: true, ..Opts::current() }, true),
-        ("default but both, new context", Opts { take_without_zeroing: false, best_fit_buffers: false, ..Opts::current() }, false),
-    ];
-    let mut kept_contexts: Vec<Ctx> = cases.iter().map(|(_, o, _)| Ctx::cached_with(*o)).collect();
-    let mut samples = vec![Vec::new(); cases.len()];
-    for _ in 0..12 {
-        for (i, (_, o, keep)) in cases.iter().enumerate() {
-            let ctx = &mut kept_contexts[i];
-            samples[i].push(ms_per_chunk(&chunks, |x, z| {
-                let n = if *keep { final_density_kept(&g, ctx, x, z) } else { final_density_with(&g, *o, x, z).len() };
-                std::hint::black_box(n);
-            }));
-        }
-    }
-    for ((label, ..), s) in cases.iter().zip(samples) {
-        let (min, median) = min_and_median(s);
-        eprintln!("final density, {label:32} ms/chunk min {min:.3} median {median:.3}");
-    }
-    let mut t = TerrainGenerator::from_preset(&pack, "minecraft:normal", "minecraft:overworld", 42).unwrap();
-    let mut cache = BiomeCache::default();
-    t.prepare_biomes(&mut cache, &chunks);
-    let (mut new, mut kept) = (Vec::new(), Vec::new());
-    for _ in 0..8 {
-        for keep in [false, true] {
-            t.opts.keep_eval_context = keep;
-            let ms = ms_per_chunk(&chunks, |x, z| {
-                std::hint::black_box(t.generate(x, z, &cache, None));
-            });
-            if keep { kept.push(ms) } else { new.push(ms) }
-        }
-    }
-    let (n, k) = (min_and_median(new), min_and_median(kept));
-    eprintln!("terrain, ms/chunk min / median: new {:.3} / {:.3} | kept {:.3} / {:.3}", n.0, n.1, k.0, k.1);
-}
-
 /// Final density of 64 chunks on 1 thread (kept context), shifted noises in batches against point by
 /// point, alternated over 15 rounds: minimum and median per chunk. The noise kernel inside the
 /// batches (AVX2, shared cell) follows the environment: run it again with those switches at 0.
@@ -1222,51 +975,6 @@ fn bench_shifted_noise_batches_alternated() {
     for ((label, _), s) in cases.iter().zip(samples) {
         let (min, median) = min_and_median(s);
         eprintln!("final density, {label:26} ms/chunk min {min:.3} median {median:.3}");
-    }
-}
-
-/// Terrain of 64 chunks (filling, surface, caves): a new context per chunk against the context
-/// kept by each thread; 1 thread then powers of 2; allocations, page faults and private memory
-/// per chunk at 1 thread. Other switches: those of the environment.
-#[test]
-#[ignore = "benchmark"]
-fn bench_terrain_kept_context() {
-    let Some(pack) = common::data_pack() else { return };
-    counting::client_options();
-    let mut t = TerrainGenerator::from_preset(&pack, "minecraft:normal", "minecraft:overworld", 42).unwrap();
-    let targets: Vec<(i32, i32)> = (0..8).flat_map(|x| (0..8).map(move |z| (x - 4, z - 4))).collect();
-    let mut cache = BiomeCache::default();
-    t.prepare_biomes(&mut cache, &targets);
-    let max = std::thread::available_parallelism().map_or(1, |n| n.get());
-    for pass in 0..2 {
-        for keep in [false, true] {
-            t.opts.keep_eval_context = keep;
-            let t = &t;
-            let mut line = format!("pass {pass} terrain {}", if keep { "kept" } else { "new " });
-            let mut threads = 1;
-            while threads <= max {
-                let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
-                let run = |cs: &[(i32, i32)]| {
-                    pool.install(|| cs.par_iter().map(|&(x, z)| t.generate(x, z, &cache, None).blocks.len()).sum::<usize>())
-                };
-                run(&targets[..8]);
-                let before = costs_now();
-                let s = Instant::now();
-                std::hint::black_box(run(&targets));
-                let dt = s.elapsed().as_secs_f64() * 1e3 / targets.len() as f64;
-                if threads == 1 {
-                    line += &format!(" | {}", per_chunk_costs(before, targets.len()));
-                    // The single thread saw every chunk: the largest context a thread keeps.
-                    if let Some(m) = pool.install(rc_worldgen::terrain::kept_context_memory) {
-                        let (held, after) = (m.held_bytes / 1024, m.spare_bytes_after_reset / 1024);
-                        line += &format!(" | kept context {held} KB held, {after} KB after reset");
-                    }
-                }
-                line += &format!(" | {threads} threads {dt:.2} ms");
-                threads *= 2;
-            }
-            eprintln!("{line}");
-        }
     }
 }
 

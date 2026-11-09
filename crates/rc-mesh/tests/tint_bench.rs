@@ -33,27 +33,15 @@ fn tint_paths_bench() {
     keys.sort_unstable();
     let (all, old) = (TintPaths::ALL, TintPaths::OLD);
     // The paths before C2-M14: the reference of the new ones.
-    let before = TintPaths {
-        uniform_cells: false,
-        four_block_rows: false,
-        persistent_corner_memo: false,
-        shared_column_layers: false,
-        ..all
-    };
+    let before = TintPaths { uniform_cells: false, four_block_rows: false, ..all };
     let variants = [
         ("old", old),
         ("before C2-M14", before),
         ("+ uniform cells", TintPaths { uniform_cells: true, ..before }),
         ("+ rows of four", TintPaths { four_block_rows: true, ..before }),
-        ("+ persistent memo", TintPaths { persistent_corner_memo: true, ..before }),
-        ("+ shared layers", TintPaths { shared_column_layers: true, ..before }),
         ("+ cells + rows", TintPaths { uniform_cells: true, four_block_rows: true, ..before }),
-        ("+ cells + memo", TintPaths { uniform_cells: true, persistent_corner_memo: true, ..before }),
-        ("+ cells + shared", TintPaths { uniform_cells: true, shared_column_layers: true, ..before }),
         ("all except cells", TintPaths { uniform_cells: false, ..all }),
         ("all except rows", TintPaths { four_block_rows: false, ..all }),
-        ("all except memo", TintPaths { persistent_corner_memo: false, ..all }),
-        ("all except shared", TintPaths { shared_column_layers: false, ..all }),
         ("all", all),
     ];
     let rad: i32 = rc_data::env_str!("RC_TINT_BLEND").and_then(|v| v.parse().ok()).unwrap_or(2);
@@ -135,10 +123,9 @@ fn tint_paths_bench() {
             line += &format!("  {name} {b:7.1} / {m:7.1} ({:+5.1} %)", (b / b0 - 1.0) * 100.0);
         }
         eprintln!(
-            "{line}  zooms {:>9}, uniform cells {:5.1} %, memo {:5.1} %",
+            "{line}  zooms {:>9}, uniform cells {:5.1} %",
             c.zoomed_blocks,
-            share(c.uniform_cell_hits),
-            share(c.corner_memo_hits)
+            share(c.uniform_cell_hits)
         );
     }
     assert!(sums.iter().all(|&s| s == sums[0]), "replayed colours differ between the paths: {sums:x?}");

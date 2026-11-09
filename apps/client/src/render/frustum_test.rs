@@ -467,7 +467,7 @@ fn meshing_pick_bench() {
                         }
                     };
                     let among = among.map(|columns| Among { columns, dirty_in_progress: 0 });
-                    std::hint::black_box(pick_columns(&mut dirty, among, 0, (0, 0), |_, _| true, launchable, false));
+                    std::hint::black_box(pick_columns(&mut dirty, among, 0, (0, 0), |_, _| true, launchable));
                 }
                 let us = t.elapsed().as_secs_f64() * 1e6 / f64::from(FRAMES);
                 if pass == 1 {

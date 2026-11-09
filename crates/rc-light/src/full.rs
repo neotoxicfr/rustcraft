@@ -27,8 +27,6 @@
 //! Mission C2-M15 (`docs/perf.md`), on top of the switches above:
 //! - `RUSTCRAFT_OPT_FULL_PROPERTY_GRID` and its sub-switches: resolution on a grid of cell
 //!   properties with a ring of closed cells (`grid`);
-//! - `RUSTCRAFT_OPT_FULL_UNION_TILES`: the chunks of a batch resolved by tiles, one zone per tile
-//!   instead of one per chunk ([`light_chunks`], `batch`).
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -222,11 +220,6 @@ pub struct FullOpts {
     pub emitters_in_fill: bool,
     /// `RUSTCRAFT_OPT_FULL_SKIP_DEPTHS` (property grid only, with the scans).
     pub skip_depths: bool,
-    /// `RUSTCRAFT_OPT_FULL_UNION_TILES` (`batch`, with the property grid only).
-    pub union_tiles: bool,
-    /// Side of a union tile in chunks (`RUSTCRAFT_OPT_FULL_UNION_TILE_SIDE`, 2 to 8; 0: chosen per
-    /// batch, see `batch`).
-    pub union_tile_side: i32,
     /// Bytes of buffers a thread keeps between two lightings at most
     /// (`RUSTCRAFT_OPT_FULL_KEPT_BUFFER_MIB`, see [`with_bufs`]).
     pub max_kept_buffer_bytes: usize,
@@ -246,8 +239,6 @@ impl FullOpts {
         sky_seed_filter: false,
         emitters_in_fill: false,
         skip_depths: false,
-        union_tiles: false,
-        union_tile_side: 0,
         max_kept_buffer_bytes: DEFAULT_KEPT_BUFFER_BYTES,
     };
 
@@ -264,8 +255,6 @@ impl FullOpts {
         sky_seed_filter: true,
         emitters_in_fill: true,
         skip_depths: true,
-        union_tiles: true,
-        union_tile_side: 0,
         max_kept_buffer_bytes: DEFAULT_KEPT_BUFFER_BYTES,
     };
 
@@ -283,8 +272,6 @@ impl FullOpts {
             sky_seed_filter: rc_data::opt_switch!("RUSTCRAFT_OPT_FULL_SKY_SEED_FILTER"),
             emitters_in_fill: rc_data::opt_switch!("RUSTCRAFT_OPT_FULL_EMITTERS_IN_FILL"),
             skip_depths: rc_data::opt_switch!("RUSTCRAFT_OPT_FULL_SKIP_DEPTHS"),
-            union_tiles: rc_data::opt_switch!("RUSTCRAFT_OPT_FULL_UNION_TILES"),
-            union_tile_side: union_tile_side(),
             max_kept_buffer_bytes: max_kept_buffer_bytes(),
         }
     }
@@ -293,31 +280,14 @@ impl FullOpts {
     pub(crate) fn old_resolution(self) -> bool {
         !self.skip && !self.noemit && !self.layout && !self.property_grid
     }
-
-    /// A batch is resolved by tiles (`batch`), which needs the property grid.
-    pub(crate) fn lights_by_tiles(self, t: &LightTables) -> bool {
-        self.union_tiles && self.property_grid && t.has_property_grid()
-    }
-}
-
-/// `RUSTCRAFT_OPT_FULL_UNION_TILE_SIDE`: side of a union tile in chunks, 2 to 8 (otherwise 0:
-/// chosen per batch), read once.
-fn union_tile_side() -> i32 {
-    static SIDE: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
-    *SIDE.get_or_init(|| {
-        let side = rc_data::env_str!("RUSTCRAFT_OPT_FULL_UNION_TILE_SIDE").and_then(|v| v.parse().ok());
-        side.filter(|s| (2..=8).contains(s)).unwrap_or(0)
-    })
 }
 
 /// Buffers a thread keeps by default: the 3 × 3 zone of a world 384 high with its ring fits
-/// (0.97 MB of levels and 1.93 MB of properties, plus the queues), a batch tile does not (5 to 11 MB
-/// at full height).
+/// (0.97 MB of levels and 1.93 MB of properties, plus the queues).
 const DEFAULT_KEPT_BUFFER_BYTES: usize = 4 << 20;
 
 /// `RUSTCRAFT_OPT_FULL_KEPT_BUFFER_MIB`: MiB of buffers a thread keeps at most, 1 to 256 (otherwise
-/// 4), read once. Above 11, the tiles of a batch of a world 384 high reuse their thread's buffers
-/// instead of allocating theirs.
+/// 4), read once.
 fn max_kept_buffer_bytes() -> usize {
     static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *BYTES.get_or_init(|| {
@@ -473,7 +443,7 @@ fn reserve_exact_len<T>(v: &mut Vec<T>, len: usize) {
 /// `f` with this thread's kept buffers (`FULLLAYOUT`, given back after, see [`give_back`]) or new
 /// ones. A zone expected to need more than [`FullOpts::max_kept_buffer_bytes`] (`expected_bytes`,
 /// see [`grid::zone_buffer_bytes`]) gets new buffers and leaves the kept ones in place, so that a
-/// large batch tile does not throw away the buffers the next 3 × 3 lighting on this thread reuses.
+/// large zone does not throw away the buffers the next 3 × 3 lighting on this thread reuses.
 fn with_bufs<R>(opts: FullOpts, expected_bytes: usize, f: impl FnOnce(&mut Bufs) -> R) -> R {
     let keep = opts.layout && expected_bytes <= opts.max_kept_buffer_bytes;
     let mut b = if keep { BUFS.with(|c| std::mem::take(&mut *c.borrow_mut())) } else { Bufs::default() };

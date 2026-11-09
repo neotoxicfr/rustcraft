@@ -753,20 +753,6 @@ pub(crate) mod tests {
         under_load("faces in slices on the busy pool", &mut |_| {
             pool.install(|| cloud_par(cloud_faces, map, (cx, cz), spiral, side, flat, (&mut out, &mut parts)))
         });
-        let shared_spiral = cloud_builder::Spiral::from(spiral.as_slice());
-        let key = CloudKey { cx, cz, side, radius, flat };
-        for own in [2, 4] {
-            let own_pool = rayon::ThreadPoolBuilder::new().num_threads(own).build().expect("pool");
-            // Each pass starts with the pool's threads asleep (20 ms between passes), as between two
-            // crossings of the game.
-            under_load(&format!("faces on an own pool of {own} threads, the whole build waiting for it"), &mut |_| {
-                own_pool.install(|| cloud_par(cloud_faces, map, (cx, cz), spiral, side, flat, (&mut out, &mut parts)))
-            });
-            under_load(&format!("faces on an own pool of {own} threads, the caller taking slices too"), &mut |_| {
-                let pair = (&mut out, &mut parts);
-                cloud_builder::build_with_helpers(&own_pool, cloud_faces, map, key, &shared_spiral, pair)
-            });
-        }
         under_load("faces on the main thread alone", &mut |_| {
             cloud_faces(map, cx, cz, CloudCells::Spiral(spiral), side, flat, &mut out)
         });

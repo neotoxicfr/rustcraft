@@ -1,7 +1,7 @@
 //! Bit-for-bit equivalence of the optimised terrain paths (`TerrainOpts`, switches
 //! `RUSTCRAFT_OPT_TERRAIN_IDS`, `AQ_COLWIN`, `AQ_SIMD`, `AQ_PRETEST`, `BASEH_LAZY`, `BASEH_MEMO`,
 //! `CARVER_YD`, `CARVER_WIDTHS`, `CARVER_REPLAY`, `CARVER_START_PRETEST`, `CARVER_REACH_BOX`,
-//! `REPLAY_CACHE_RWLOCK`, `REPLAY_CACHE_SPREAD`, `CARVER_SPAN_FILL`, `CARVING_MASK_READ_BY_RUNS`, `BATCH_BIOME_TILE`,
+//! `CARVING_MASK_READ_BY_RUNS`, `BATCH_BIOME_TILE`,
 //! `MERGED_BIOME_PHASE`, `CAVE_TOP_FROM_CHUNK_BIOMES`, `FILL_COLUMN_TRACKING`) against the old
 //! code: complete chunks (blocks, height maps, fluid marks), aquifer block by block with drawn
 //! densities, base heights, cave masks, batch biomes. Missing game data makes the tests fail under
@@ -11,7 +11,7 @@ mod common;
 
 use rayon::prelude::*;
 use rc_worldgen::Ctx;
-use rc_worldgen::carver::{CarvingMask, CarvingSabotage, ReplayCacheLocks};
+use rc_worldgen::carver::{CarvingMask, CarvingSabotage};
 use rc_worldgen::proto::ProtoTerrain;
 use rc_worldgen::terrain::{BiomeCache, TerrainGenerator, TerrainOpts};
 
@@ -55,9 +55,6 @@ fn variants() -> Vec<(&'static str, TerrainOpts)> {
         ("carver_replay", TerrainOpts { carver_replay: true, ..o }),
         ("carver_start_pretest", TerrainOpts { carver_replay: true, carver_start_pretest: true, ..o }),
         ("carver_reach_box", TerrainOpts { carver_replay: true, carver_reach_box: true, ..o }),
-        ("replay_cache_rwlock", TerrainOpts { carver_replay: true, replay_cache_locks: ReplayCacheLocks::ReadWrite, ..o }),
-        ("replay_cache_spread", TerrainOpts { carver_replay: true, replay_cache_locks: ReplayCacheLocks::Spread, ..o }),
-        ("carver_span_fill", TerrainOpts { carver_span_fill: true, ..o }),
         ("carving_mask_read_by_runs", TerrainOpts { carving_mask_read_by_runs: true, ..o }),
         ("merged_biome_phase", TerrainOpts { merged_biome_phase: true, ..o }),
         ("fill_column_tracking", TerrainOpts { fill_column_tracking: true, ..o }),
@@ -72,10 +69,6 @@ fn carving_variants() -> Vec<(&'static str, TerrainOpts)> {
         ("replay", replay),
         ("start pretest", TerrainOpts { carver_start_pretest: true, ..replay }),
         ("reach box", TerrainOpts { carver_reach_box: true, ..replay }),
-        ("read-write locks", TerrainOpts { replay_cache_locks: ReplayCacheLocks::ReadWrite, ..replay }),
-        ("spread tables", TerrainOpts { replay_cache_locks: ReplayCacheLocks::Spread, ..replay }),
-        ("span fill", TerrainOpts { carver_span_fill: true, ..TerrainOpts::OLD }),
-        ("span fill + yd", TerrainOpts { carver_span_fill: true, carver_yd: true, ..TerrainOpts::OLD }),
         ("all", TerrainOpts::NEW),
     ]
 }
@@ -349,7 +342,7 @@ fn carving_masks_identical() {
 }
 
 /// The mask comparison sees each optimised cave path go wrong: start pre-test drawn for the next
-/// cave of the list, reach box one block smaller, top of each run left out.
+/// cave of the list, reach box one block smaller.
 #[test]
 fn carving_masks_check_catches_sabotage() {
     let Some(pack) = common::data_pack() else { return };
@@ -361,9 +354,7 @@ fn carving_masks_check_catches_sabotage() {
     let mut cache = BiomeCache::default();
     old.prepare_biomes(&mut cache, &targets);
     let a: Vec<_> = targets.par_iter().map(|&(x, z)| old.carving_mask(x, z, &cache)).collect();
-    for sabotage in
-        [CarvingSabotage::PretestNextRank, CarvingSabotage::ReachBoxOneBlockSmaller, CarvingSabotage::RunTopExclusive]
-    {
+    for sabotage in [CarvingSabotage::PretestNextRank, CarvingSabotage::ReachBoxOneBlockSmaller] {
         let wrong = mask_differences(&new, &cache, &targets, &a, sabotage);
         eprintln!("{sabotage:?}: {} masks differ", wrong.len());
         assert!(!wrong.is_empty(), "{sabotage:?} not seen");

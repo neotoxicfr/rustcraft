@@ -6,16 +6,14 @@
 //! merged translucent sections, cached radius), `RUSTCRAFT_OPT_REACHGRID` (reached
 //! sections as a bit grid built by the walk task), `RUSTCRAFT_OPT_ARGSKIP`
 //! (indirect commands uploaded only over the changed range), and the paths of [`ListPaths`]
-//! (column command cache, hierarchical frustum, plane coherence, kept buffers, parallel builds).
+//! (column command cache, hierarchical frustum, plane coherence, kept buffers).
 //! `=0`: old path.
 
 use std::ops::Range;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::OnceLock;
 
 use glam::{Vec3, Vec4};
 use hashbrown::HashMap;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 use rc_mesh::blocks::BUCKETS;
 use rc_mesh::wire::Sections;
@@ -68,20 +66,9 @@ pub(super) struct ListPaths {
     pub section_search: bool,
     /// `RUSTCRAFT_OPT_LIST_BUFFER_REUSE`: working buffers kept from one build to the next.
     pub reuse_buffers: bool,
-    /// `RUSTCRAFT_OPT_PARALLEL_LISTS`: slices of this many columns, taken by the calling thread and
-    /// the list pool ([`Slicing`]), for the column selection and then, without the cache, the
-    /// building of the lists, with it, the rebuilding of the columns whose commands changed;
-    /// `None`: on the calling thread.
-    pub column_slices: Option<usize>,
-    /// `RUSTCRAFT_OPT_PARALLEL_LIST_KINDS`: the six lists as six tasks on the list pool, built
-    /// whole (without the cache and without `column_slices`) or copied from the cache.
-    pub parallel_kinds: bool,
     #[cfg(test)]
     pub sabotage: Option<Sabotage>,
 }
-
-/// Columns per task of `RUSTCRAFT_OPT_PARALLEL_LISTS`.
-const SLICE_COLUMNS: usize = 128;
 
 impl ListPaths {
     /// Old construction: every path off (the reference of the tests).
@@ -93,8 +80,6 @@ impl ListPaths {
         plane_coherence: false,
         section_search: false,
         reuse_buffers: false,
-        column_slices: None,
-        parallel_kinds: false,
         #[cfg(test)]
         sabotage: None,
     };
@@ -109,18 +94,9 @@ impl ListPaths {
             plane_coherence: rc_data::opt_switch!("RUSTCRAFT_OPT_PLANE_COHERENCE"),
             section_search: rc_data::opt_switch!("RUSTCRAFT_OPT_SECTION_RANGE_SEARCH"),
             reuse_buffers: rc_data::opt_switch!("RUSTCRAFT_OPT_LIST_BUFFER_REUSE"),
-            // Both off until the quiet-machine scene bench: the loaded micro-bench loses at four
-            // threads, and the pool is half the logical cores (never measured above eight).
-            column_slices: rc_data::opt_switch!("RUSTCRAFT_OPT_PARALLEL_LISTS", default_off).then_some(SLICE_COLUMNS),
-            parallel_kinds: rc_data::opt_switch!("RUSTCRAFT_OPT_PARALLEL_LIST_KINDS", default_off),
             #[cfg(test)]
             sabotage: None,
         })
-    }
-
-    /// Some part of the build runs on the list pool.
-    fn uses_the_pool(&self) -> bool {
-        self.column_slices.is_some() || self.parallel_kinds
     }
 
     #[cfg(test)]
@@ -147,81 +123,10 @@ pub(super) enum Sabotage {
     CacheKeptAcrossSettings,
     /// The cache's runs are joined across sections that draw nothing (the command order changes).
     RunsJoinedAcrossEmptySections,
-    /// A slice's batches keep their place in the slice instead of their place in the list.
-    ForgottenBatchOffset,
     /// A column across a plane is accepted whole instead of section by section.
     StraddlingColumnAcceptedWhole,
     /// The section search keeps the lower bound of the planes facing up and forgets the others.
     SectionSearchFromBelowOnly,
-}
-
-/// Pool of the parallel builds: its own threads, because the common pool is busy with meshing
-/// (8 to 9 ms of wait measured). `RUSTCRAFT_LIST_THREADS` sets its size, otherwise half the
-/// logical cores (at least one).
-fn list_pool() -> &'static rayon::ThreadPool {
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    POOL.get_or_init(|| {
-        let threads = rc_data::env_str!("RUSTCRAFT_LIST_THREADS")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| (std::thread::available_parallelism().map_or(1, std::num::NonZero::get) / 2).max(1));
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .thread_name(|i| format!("draw lists {i}"))
-            .build()
-            .expect("draw list pool")
-    })
-}
-
-/// Slices under which a build stays on the calling thread: a slice of the column selection is a
-/// few microseconds, and below eight of them a pool thread's wake-up costs more than it saves
-/// (distance 12, four slices, was slower in slices on the micro-bench, D-M05).
-const MIN_SLICES_FOR_THREADS: usize = 8;
-
-/// Slices of a parallel build: columns per slice and the pool whose threads take slices next to
-/// the calling thread.
-#[derive(Clone, Copy)]
-struct Slicing<'p> {
-    columns: usize,
-    pool: &'p rayon::ThreadPool,
-}
-
-/// `lock` that ignores a poisoning: a slice's data stays valid whatever happened to its writer.
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-impl Slicing<'_> {
-    /// `task(i)` for every slice `i` of `0..count`, results in slice order. The calling thread
-    /// takes slices next to the pool's threads, which join as they wake up; at the end it only
-    /// waits for the threads it called to pass by. The first version ran the whole build on the
-    /// pool, so even its serial parts waited for a sleeping thread to wake up, then for the frame
-    /// thread to be woken back (lost with 1 ms between frames, `docs/perf.md`).
-    fn run<R: Send>(self, count: usize, task: impl Fn(usize) -> R + Sync) -> Vec<R> {
-        if count < MIN_SLICES_FOR_THREADS {
-            return (0..count).map(task).collect();
-        }
-        let next = AtomicUsize::new(0);
-        let results: Vec<Mutex<Option<R>>> = (0..count).map(|_| Mutex::new(None)).collect();
-        let take_slices = || {
-            loop {
-                // The counter hands out each slice once; its own lock carries the result.
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some(result) = results.get(i) else { return };
-                let built = task(i);
-                *lock(result) = Some(built);
-            }
-        };
-        self.pool.in_place_scope(|s| {
-            for _ in 0..self.pool.current_num_threads().min(count - 1) {
-                s.spawn(|_| take_slices());
-            }
-            take_slices();
-        });
-        results
-            .into_iter()
-            .map(|r| r.into_inner().unwrap_or_else(PoisonError::into_inner).expect("slice built"))
-            .collect()
-    }
 }
 
 /// Inputs of the construction of a frame.
@@ -345,25 +250,10 @@ struct PieceScratch {
 }
 
 /// Builds the runs, batches and commands of the frame; returns (columns, faces) drawn. `ordered`:
-/// called once the column order is fixed (end of the "visibility" measurement). The slices of the
-/// parallel path are taken by the calling thread and the list pool.
+/// called once the column order is fixed (end of the "visibility" measurement).
 pub(super) fn build(input: &ListIn<'_>, out: &mut Lists, paths: ListPaths, ordered: impl FnOnce()) -> (usize, u64) {
-    build_with_pool(input, out, paths, paths.uses_the_pool().then(list_pool), ordered)
-}
-
-/// [`build`] with the slices of the parallel path taken by `pool` next to the calling thread
-/// (on the calling thread alone without a pool).
-pub(super) fn build_with_pool(
-    input: &ListIn<'_>,
-    out: &mut Lists,
-    paths: ListPaths,
-    pool: Option<&rayon::ThreadPool>,
-    ordered: impl FnOnce(),
-) -> (usize, u64) {
-    let slicing = paths.column_slices.zip(pool).map(|(columns, pool)| Slicing { columns: columns.max(1), pool });
-    let kinds_pool = pool.filter(|_| paths.parallel_kinds);
     let mut scratch = if paths.reuse_buffers { std::mem::take(&mut out.scratch) } else { ListScratch::default() };
-    let visible = select_visible(input, out, paths, slicing);
+    let visible = select_visible(input, out, paths);
     ordered();
     let ListScratch { ranks, rank_starts, near, far, facings, pieces, slots, missed } = &mut scratch;
     if paths.cached_order {
@@ -390,12 +280,7 @@ pub(super) fn build_with_pool(
     };
     let faces = if paths.column_commands {
         let cache_scratch = CacheScratch { slots, missed, pieces };
-        let pools = (slicing, kinds_pool);
-        emit_from_cache(&emission, &mut out.commands, cache_scratch, (&mut out.batches, &mut out.args), paths, pools)
-    } else if let Some(slicing) = slicing {
-        emit_in_slices(&emission, slicing, &mut out.batches, &mut out.args, paths)
-    } else if let Some(pool) = kinds_pool {
-        emit_whole_lists_in_parallel(&emission, pool, &mut out.batches, &mut out.args, paths)
+        emit_from_cache(&emission, &mut out.commands, cache_scratch, (&mut out.batches, &mut out.args), paths)
     } else {
         let mut faces = 0;
         for kind in LIST_KINDS {
@@ -410,12 +295,7 @@ pub(super) fn build_with_pool(
 }
 
 /// Visible columns from farthest to nearest, their runs written into `out.runs`.
-fn select_visible<'a>(
-    input: &ListIn<'a>,
-    out: &mut Lists,
-    paths: ListPaths,
-    slicing: Option<Slicing<'_>>,
-) -> Vec<VisibleColumn<'a>> {
+fn select_visible<'a>(input: &ListIn<'a>, out: &mut Lists, paths: ListPaths) -> Vec<VisibleColumn<'a>> {
     out.runs.clear();
     let culling = ColumnCulling::new(input, paths);
     let key = (input.reached_gen, input.origin, input.columns_rev);
@@ -426,10 +306,7 @@ fn select_visible<'a>(
         return sorted_visible(input, &culling, &mut out.runs);
     }
     refresh_order(input, out, key);
-    match slicing {
-        Some(slicing) => select_in_slices(input, &culling, &out.order, &mut out.plane_hints, slicing, &mut out.runs),
-        None => select_in_order(input, &culling, &out.order, &mut out.plane_hints, &mut out.runs),
-    }
+    select_in_order(input, &culling, &out.order, &mut out.plane_hints, &mut out.runs)
 }
 
 /// Candidates of `order` whose runs are not empty, in that order.
@@ -449,33 +326,6 @@ fn select_in_order<'a>(
             // Present: the order keeps only the loaded columns.
             visible.push(VisibleColumn { column: &input.columns[&c.key], key: c.key, runs: first..runs.len() });
         }
-    }
-    visible
-}
-
-/// [`select_in_order`] on slices of candidates built in parallel, then put end to end (the runs
-/// of each slice shifted to their place in `runs`).
-fn select_in_slices<'a>(
-    input: &ListIn<'a>,
-    culling: &ColumnCulling<'_>,
-    order: &[OrderedColumn],
-    hints: &mut [u8],
-    slicing: Slicing<'_>,
-    runs: &mut Vec<Range<usize>>,
-) -> Vec<VisibleColumn<'a>> {
-    let orders: Vec<&[OrderedColumn]> = order.chunks(slicing.columns).collect();
-    // Each slice writes the plane hints of its own candidates.
-    let hints: Vec<Mutex<&mut [u8]>> = hints.chunks_mut(slicing.columns).map(Mutex::new).collect();
-    let parts = slicing.run(orders.len().min(hints.len()), |i| {
-        let mut part_runs = Vec::new();
-        let visible = select_in_order(input, culling, orders[i], &mut lock(&hints[i]), &mut part_runs);
-        (part_runs, visible)
-    });
-    let mut visible = Vec::with_capacity(parts.iter().map(|p| p.1.len()).sum());
-    for (part_runs, part) in parts {
-        let shift = runs.len();
-        runs.extend(part_runs);
-        visible.extend(part.into_iter().map(|v| VisibleColumn { runs: v.runs.start + shift..v.runs.end + shift, ..v }));
     }
     visible
 }
@@ -1017,89 +867,6 @@ impl Emission<'_, '_> {
     }
 }
 
-/// Batches and commands made by one task, to put end to end with the other tasks' ones.
-#[derive(Default)]
-struct Segment {
-    batches: Vec<Batch>,
-    args: Vec<DrawArgs>,
-    faces: u64,
-}
-
-/// The six lists cut into slices of columns built in parallel ([`Slicing`]), then put end to end:
-/// a slice's first batch continues the previous slice's last one when they share a key, and its
-/// first command merges at the seam.
-fn emit_in_slices(
-    emission: &Emission<'_, '_>,
-    slicing: Slicing<'_>,
-    batches: &mut Vec<Batch>,
-    args: &mut Vec<DrawArgs>,
-    paths: ListPaths,
-) -> u64 {
-    let n = emission.visible.len();
-    let step = slicing.columns;
-    let tasks: Vec<(ListKind, Range<usize>)> =
-        LIST_KINDS.iter().flat_map(|&kind| (0..n).step_by(step).map(move |s| (kind, s..(s + step).min(n)))).collect();
-    let segments = slicing.run(tasks.len(), |t| {
-        let (kind, span) = &tasks[t];
-        let mut s = Segment::default();
-        s.faces = emission.emit_span(*kind, span.clone(), &mut PieceScratch::default(), &mut s.batches, &mut s.args);
-        s
-    });
-    join_segments(&segments, batches, args, emission.split_draws, paths);
-    segments.iter().map(|s| s.faces).sum()
-}
-
-/// `RUSTCRAFT_OPT_PARALLEL_LIST_KINDS` (off): `list(l)` for each of the six lists as a task on
-/// `pool`, results in list order. Kept for the quiet-machine bench (x1.36 slower when loaded).
-fn six_lists_in_parallel<R: Send>(pool: &rayon::ThreadPool, list: impl Fn(usize) -> R + Sync) -> Vec<R> {
-    pool.install(|| (0..LIST_KINDS.len()).into_par_iter().map(&list).collect())
-}
-
-/// The six lists built whole as six tasks ([`six_lists_in_parallel`]), then put end to end.
-fn emit_whole_lists_in_parallel(
-    emission: &Emission<'_, '_>,
-    pool: &rayon::ThreadPool,
-    batches: &mut Vec<Batch>,
-    args: &mut Vec<DrawArgs>,
-    paths: ListPaths,
-) -> u64 {
-    let columns = 0..emission.visible.len();
-    let segments = six_lists_in_parallel(pool, |l| {
-        let mut s = Segment::default();
-        let scratch = &mut PieceScratch::default();
-        s.faces = emission.emit_span(LIST_KINDS[l], columns.clone(), scratch, &mut s.batches, &mut s.args);
-        s
-    });
-    join_segments(&segments, batches, args, emission.split_draws, paths);
-    segments.iter().map(|s| s.faces).sum()
-}
-
-/// Puts the slices' segments end to end in `batches` and `args`: a segment's first batch continues
-/// the previous one when they share a key, and its first command merges at the seam.
-fn join_segments(
-    segments: &[Segment],
-    batches: &mut Vec<Batch>,
-    args: &mut Vec<DrawArgs>,
-    split_draws: bool,
-    paths: ListPaths,
-) {
-    for s in segments {
-        for &(layer, fluid, home, first, count) in &s.batches {
-            let pushed = batches.len();
-            append_commands(
-                batches,
-                args,
-                (layer, fluid, home),
-                &s.args[first as usize..(first + count) as usize],
-                split_draws,
-            );
-            if paths.sabotaged(Sabotage::ForgottenBatchOffset) && batches.len() > pushed {
-                batches.last_mut().expect("just pushed").3 = first;
-            }
-        }
-    }
-}
-
 /// Mesh a column's commands are made from: its version and the starts of its faces, fluids,
 /// translucents and translucent order in their buffers. A new upload changes one of them, and with
 /// them every instance range. The key holds only because a version is never given twice in the
@@ -1291,40 +1058,23 @@ struct CacheScratch<'s> {
 }
 
 /// The six lists as copies of each column's cached commands (rebuilt only for the columns whose
-/// sources changed), merged at the seams between columns as the old path merges them. With
-/// `slicing`, the changed columns are rebuilt in parallel slices; with `kinds_pool`, the six lists
-/// are copied as six tasks, then put end to end.
+/// sources changed), merged at the seams between columns as the old path merges them.
 fn emit_from_cache(
     emission: &Emission<'_, '_>,
     cache: &mut ColumnCommandCache,
     scratch: CacheScratch<'_>,
     (batches, args): (&mut Vec<Batch>, &mut Vec<DrawArgs>),
     paths: ListPaths,
-    (slicing, kinds_pool): (Option<Slicing<'_>>, Option<&rayon::ThreadPool>),
 ) -> u64 {
     let CacheScratch { slots, missed, pieces } = scratch;
     cache.begin(emission.face_vertices, emission.split_draws, paths);
     find_changed_columns(emission, cache, slots, missed, paths);
-    match slicing {
-        Some(slicing) => rebuild_in_slices(emission, &mut cache.entries, slots, missed, slicing),
-        None => {
-            for &i in missed.iter() {
-                rebuild_column_commands(emission, i, pieces, &mut cache.entries[slots[i] as usize]);
-            }
-        }
+    for &i in missed.iter() {
+        rebuild_column_commands(emission, i, pieces, &mut cache.entries[slots[i] as usize]);
     }
     let entries = &cache.entries;
-    if let Some(pool) = kinds_pool {
-        let segments = six_lists_in_parallel(pool, |l| {
-            let mut s = Segment::default();
-            copy_cached_list(emission, entries, slots, l, &mut s.batches, &mut s.args);
-            s
-        });
-        join_segments(&segments, batches, args, emission.split_draws, paths);
-    } else {
-        for l in 0..LIST_KINDS.len() {
-            copy_cached_list(emission, entries, slots, l, batches, args);
-        }
+    for l in 0..LIST_KINDS.len() {
+        copy_cached_list(emission, entries, slots, l, batches, args);
     }
     slots.iter().map(|&slot| entries[slot as usize].faces).sum()
 }
@@ -1361,31 +1111,6 @@ fn find_changed_columns(
             missed.push(i);
         }
         slots.push(slot);
-    }
-}
-
-/// Rebuilds the commands of the visible columns `missed` in parallel slices: each entry is taken
-/// out of the cache for its slice, then put back in its slot.
-fn rebuild_in_slices(
-    emission: &Emission<'_, '_>,
-    entries: &mut [ColumnCommands],
-    slots: &[u32],
-    missed: &[usize],
-    slicing: Slicing<'_>,
-) {
-    let mut taken: Vec<(usize, ColumnCommands)> =
-        missed.iter().map(|&i| (i, std::mem::take(&mut entries[slots[i] as usize]))).collect();
-    let slices: Vec<Mutex<&mut [(usize, ColumnCommands)]>> =
-        taken.chunks_mut(slicing.columns).map(Mutex::new).collect();
-    slicing.run(slices.len(), |s| {
-        let mut pieces = PieceScratch::default();
-        for (i, entry) in lock(&slices[s]).iter_mut() {
-            rebuild_column_commands(emission, *i, &mut pieces, entry);
-        }
-    });
-    drop(slices);
-    for (i, entry) in taken {
-        entries[slots[i] as usize] = entry;
     }
 }
 

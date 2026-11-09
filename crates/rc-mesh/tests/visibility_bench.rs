@@ -46,7 +46,7 @@ fn section_vis_paths_bench() {
     let variants: Vec<(String, DilationPaths)> = DilationPaths::every_combination()
         .into_iter()
         .map(|p| {
-            let names = [(p.row_carry, "carry"), (p.word_queue, "queue"), (p.stop_at_six_faces, "stop")];
+            let names = [(p.word_queue, "queue"), (p.stop_at_six_faces, "stop")];
             let name: Vec<&str> = names.iter().filter(|(on, _)| *on).map(|(_, n)| *n).collect();
             (if name.is_empty() { "old".to_string() } else { name.join("+") }, p)
         })
