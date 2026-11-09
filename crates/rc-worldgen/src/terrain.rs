@@ -14,7 +14,9 @@ use rayon::prelude::*;
 
 use crate::aquifer::{Aquifer, AquiferConfig, FluidPicker};
 use crate::biome::{BiomeSource, ChunkBiomes, Searcher};
-use crate::carver::{Carver, CarvingMask, Target, large_feature_random};
+use crate::carver::{
+    Carver, CarvingMask, CarvingSabotage, LargeFeatureSeed, ReplayCacheLocks, Target, large_feature_random,
+};
 use crate::data::{DataPack, full_id};
 use crate::density::{Binary, Df, Resolver, Simple};
 use crate::json::Json;
@@ -70,6 +72,23 @@ pub struct TerrainOpts {
     pub carver_widths: bool,
     /// Caves: carvings recorded per source and replayed.
     pub carver_replay: bool,
+    /// Caves (with `carver_replay`): sources whose starting draw fails skipped before the cache.
+    pub carver_start_pretest: bool,
+    /// Caves (with `carver_replay`): records whose ellipsoids all miss the chunk not replayed.
+    pub carver_reach_box: bool,
+    /// Caves (with `carver_replay`): how the replay cache's tables are locked.
+    pub replay_cache_locks: ReplayCacheLocks,
+    /// Caves: ellipsoid columns written as runs.
+    pub carver_span_fill: bool,
+    /// Caves: mask read back by runs, a word at a time.
+    pub carving_mask_read_by_runs: bool,
+    /// Caves: top material under the grass read from the chunk biomes around (the source outside
+    /// them) instead of the source alone.
+    pub cave_top_from_chunk_biomes: bool,
+    /// Biomes of a batch: cave biomes in a dense tile over the batch's rectangle.
+    pub batch_biome_tile: bool,
+    /// Biomes of a batch: one parallel pass for both kinds.
+    pub merged_biome_phase: bool,
     /// Evaluation context kept by each thread from one chunk (or base column) to the next.
     pub keep_eval_context: bool,
     /// Filling: blocks written without reading the old one, generation maps found per column.
@@ -87,6 +106,14 @@ impl TerrainOpts {
         carver_yd: false,
         carver_widths: false,
         carver_replay: false,
+        carver_start_pretest: false,
+        carver_reach_box: false,
+        replay_cache_locks: ReplayCacheLocks::Plain,
+        carver_span_fill: false,
+        carving_mask_read_by_runs: false,
+        cave_top_from_chunk_biomes: false,
+        batch_biome_tile: false,
+        merged_biome_phase: false,
         keep_eval_context: false,
         fill_column_tracking: false,
     };
@@ -100,6 +127,14 @@ impl TerrainOpts {
         carver_yd: true,
         carver_widths: true,
         carver_replay: true,
+        carver_start_pretest: true,
+        carver_reach_box: true,
+        replay_cache_locks: ReplayCacheLocks::Spread,
+        carver_span_fill: true,
+        carving_mask_read_by_runs: true,
+        cave_top_from_chunk_biomes: true,
+        batch_biome_tile: true,
+        merged_biome_phase: true,
         keep_eval_context: true,
         fill_column_tracking: true,
     };
@@ -116,6 +151,20 @@ impl TerrainOpts {
             carver_yd: opt::carver_yd(),
             carver_widths: opt::carver_widths(),
             carver_replay: opt::carver_replay(),
+            carver_start_pretest: opt::carver_start_pretest(),
+            carver_reach_box: opt::carver_reach_box(),
+            replay_cache_locks: if opt::replay_cache_spread() {
+                ReplayCacheLocks::Spread
+            } else if opt::replay_cache_rwlock() {
+                ReplayCacheLocks::ReadWrite
+            } else {
+                ReplayCacheLocks::Plain
+            },
+            carver_span_fill: opt::carver_span_fill(),
+            carving_mask_read_by_runs: opt::carving_mask_read_by_runs(),
+            cave_top_from_chunk_biomes: opt::cave_top_from_chunk_biomes(),
+            batch_biome_tile: opt::batch_biome_tile(),
+            merged_biome_phase: opt::merged_biome_phase(),
             keep_eval_context: opt::keep_eval_context(),
             fill_column_tracking: opt::fill_column_tracking(),
         }
@@ -294,6 +343,9 @@ pub struct TerrainGenerator {
     pub lazy_mode: u8,
     baseh: BaseHeightMemo,
     replay: crate::carver::ReplayCache,
+    /// Randomness of each cave rank before the source is mixed in (start pre-test), one more
+    /// than the longest cave list (the test sabotage draws the next rank).
+    cave_rank_seeds: Vec<LargeFeatureSeed>,
 }
 
 /// Biomes needed by the terrain of a set of chunks: biomes of the chunks (and neighbours) and
@@ -302,7 +354,84 @@ pub struct TerrainGenerator {
 pub struct BiomeCache {
     pub chunks: HashMap<(i32, i32), ChunkBiomes>,
     pub carver: HashMap<(i32, i32), u16>,
+    /// Cave biomes of the sources of the last batch prepared, dense over the batch's rectangle
+    /// (`batch_biome_tile`); `carver` keeps them from one batch to the next.
+    pub carver_tile: SourceBiomeTile,
 }
+
+/// Sources a target chunk reads the caves of: up to 8 chunks away in x and z.
+const CAVE_SOURCE_REACH: i32 = 8;
+
+/// A batch tile is used while its rectangle holds at most 4 times the sources its targets read
+/// (`(2 · 8 + 1)²` each); a batch spread wider goes through the hash maps.
+const TILE_AREA_PER_TARGET: usize = 4 * 17 * 17;
+
+/// Rectangle of chunk positions, walked row by row (z major, x minor).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChunkRect {
+    pub min_x: i32,
+    pub min_z: i32,
+    /// Extent in x and in z (0 = empty).
+    pub width: i32,
+    pub depth: i32,
+}
+
+impl ChunkRect {
+    /// Smallest rectangle holding every position of `list` grown by `margin` on each side,
+    /// `None` for an empty list.
+    pub fn around(list: &[(i32, i32)], margin: i32) -> Option<ChunkRect> {
+        let &(x0, z0) = list.first()?;
+        let (mut min_x, mut max_x, mut min_z, mut max_z) = (x0, x0, z0, z0);
+        for &(x, z) in list {
+            (min_x, max_x, min_z, max_z) = (min_x.min(x), max_x.max(x), min_z.min(z), max_z.max(z));
+        }
+        Some(ChunkRect {
+            min_x: min_x - margin,
+            min_z: min_z - margin,
+            width: max_x - min_x + 1 + 2 * margin,
+            depth: max_z - min_z + 1 + 2 * margin,
+        })
+    }
+
+    pub fn area(&self) -> usize {
+        self.width as usize * self.depth as usize
+    }
+
+    /// Index of (x, z), `None` outside.
+    #[inline]
+    pub fn index(&self, x: i32, z: i32) -> Option<usize> {
+        let (dx, dz) = (x - self.min_x, z - self.min_z);
+        ((0..self.width).contains(&dx) && (0..self.depth).contains(&dz)).then(|| (dz * self.width + dx) as usize)
+    }
+
+    /// Position of the index `i`.
+    #[inline]
+    pub fn position(&self, i: usize) -> (i32, i32) {
+        (self.min_x + i as i32 % self.width, self.min_z + i as i32 / self.width)
+    }
+}
+
+/// Cave biomes of source chunks over a rectangle, [`SourceBiomeTile::UNKNOWN`] where no target
+/// of the batch needed the source.
+#[derive(Debug, Default)]
+pub struct SourceBiomeTile {
+    rect: ChunkRect,
+    biomes: Vec<u16>,
+}
+
+impl SourceBiomeTile {
+    const UNKNOWN: u16 = u16::MAX;
+
+    /// Cave biome of the source (x, z) if the tile holds it.
+    #[inline]
+    pub fn get(&self, x: i32, z: i32) -> Option<u16> {
+        let b = self.biomes[self.rect.index(x, z)?];
+        (b != Self::UNKNOWN).then_some(b)
+    }
+}
+
+/// Biomes computed for a batch: of chunks, and cave biomes of sources.
+type ComputedBiomes = (Vec<((i32, i32), ChunkBiomes)>, Vec<((i32, i32), u16)>);
 
 impl TerrainGenerator {
     /// From a world preset (`minecraft:normal`, `large_biomes`, `amplified`…) and a
@@ -402,7 +531,10 @@ impl TerrainGenerator {
         });
         let lazy_step = i32::try_from(lazy_step).unwrap_or(i32::MAX);
         let ids = TerrainIds::resolve(&blocks);
+        let ranks = biome_carvers.iter().map(Vec::len).max().unwrap_or(0) + 1;
+        let cave_rank_seeds = (0..ranks as i64).map(|k| LargeFeatureSeed::new(seed, k)).collect();
         Ok(TerrainGenerator {
+            cave_rank_seeds,
             opts: TerrainOpts::from_env(),
             ids,
             lazy_step,
@@ -490,6 +622,97 @@ impl TerrainGenerator {
 
     /// Fills the biome cache to generate `targets` (in parallel, without recomputation).
     pub fn prepare_biomes(&self, cache: &mut BiomeCache, targets: &[(i32, i32)]) {
+        if self.opts.batch_biome_tile {
+            if self.prepare_biomes_on_tile(cache, targets) {
+                return;
+            }
+            // A batch too spread out: the tile of an earlier batch is let go.
+            cache.carver_tile = SourceBiomeTile::default();
+        }
+        self.prepare_biomes_by_hashing(cache, targets);
+    }
+
+    /// [`Self::prepare_biomes`] with the sources and chunks the targets need marked on the
+    /// batch's rectangle: the cache maps are read once per position, not once per target and
+    /// position (17 × 17 + 3 × 3 each), and the cave biomes stay in a dense tile that the cave
+    /// masks read by index. `false` (nothing done) when the batch is too spread out.
+    fn prepare_biomes_on_tile(&self, cache: &mut BiomeCache, targets: &[(i32, i32)]) -> bool {
+        let Some(rect) = ChunkRect::around(targets, CAVE_SOURCE_REACH) else { return false };
+        if rect.area() > TILE_AREA_PER_TARGET * targets.len() {
+            return false;
+        }
+        let side = 2 * CAVE_SOURCE_REACH as usize + 1;
+        let (mut wants_source, mut wants_chunk) = (vec![false; rect.area()], vec![false; rect.area()]);
+        let row_start = |x: i32, z: i32| rect.index(x, z).expect("inside the batch rectangle");
+        for &(cx, cz) in targets {
+            for dz in -CAVE_SOURCE_REACH..=CAVE_SOURCE_REACH {
+                let i = row_start(cx - CAVE_SOURCE_REACH, cz + dz);
+                wants_source[i..i + side].fill(true);
+            }
+            for dz in -1..=1 {
+                let i = row_start(cx - 1, cz + dz);
+                wants_chunk[i..i + 3].fill(true);
+            }
+        }
+        let mut tile = SourceBiomeTile { rect, biomes: vec![SourceBiomeTile::UNKNOWN; rect.area()] };
+        let (mut need_c, mut need_k) = (Vec::new(), Vec::new());
+        for i in 0..rect.area() {
+            let p = rect.position(i);
+            if wants_chunk[i] && !cache.chunks.contains_key(&p) {
+                need_c.push(p);
+            }
+            if wants_source[i] {
+                match cache.carver.get(&p) {
+                    Some(&b) => tile.biomes[i] = b,
+                    None => need_k.push(p),
+                }
+            }
+        }
+        let (c, k) = self.compute_biomes(&need_c, &need_k);
+        for &((x, z), b) in &k {
+            tile.biomes[row_start(x, z)] = b;
+        }
+        cache.chunks.extend(c);
+        cache.carver.extend(k);
+        cache.carver_tile = tile;
+        true
+    }
+
+    /// Biomes of the chunks `need_c` and cave biomes of the sources `need_k`, in parallel. With
+    /// `merged_biome_phase` both kinds go through one parallel pass (one wait for all the threads
+    /// instead of two), the chunk biomes first since they are the long jobs.
+    fn compute_biomes(&self, need_c: &[(i32, i32)], need_k: &[(i32, i32)]) -> ComputedBiomes {
+        if !self.opts.merged_biome_phase {
+            let c = need_c.par_iter().map(|&(x, z)| ((x, z), self.chunk_biomes(x, z))).collect();
+            let k = need_k.par_iter().map(|&(x, z)| ((x, z), self.carver_biome(x, z))).collect();
+            return (c, k);
+        }
+        enum Computed {
+            Chunk((i32, i32), ChunkBiomes),
+            Source((i32, i32), u16),
+        }
+        let all: Vec<Computed> = (0..need_c.len() + need_k.len())
+            .into_par_iter()
+            .map(|i| match need_c.get(i) {
+                Some(&(x, z)) => Computed::Chunk((x, z), self.chunk_biomes(x, z)),
+                None => {
+                    let (x, z) = need_k[i - need_c.len()];
+                    Computed::Source((x, z), self.carver_biome(x, z))
+                }
+            })
+            .collect();
+        let (mut c, mut k) = (Vec::with_capacity(need_c.len()), Vec::with_capacity(need_k.len()));
+        for done in all {
+            match done {
+                Computed::Chunk(p, b) => c.push((p, b)),
+                Computed::Source(p, b) => k.push((p, b)),
+            }
+        }
+        (c, k)
+    }
+
+    /// [`Self::prepare_biomes`] through hash sets (old path, and batches too spread out).
+    fn prepare_biomes_by_hashing(&self, cache: &mut BiomeCache, targets: &[(i32, i32)]) {
         let mut need_c: Vec<(i32, i32)> = Vec::new();
         let mut need_k: Vec<(i32, i32)> = Vec::new();
         let mut seen_c = hashbrown::HashSet::new();
@@ -512,9 +735,8 @@ impl TerrainGenerator {
                 }
             }
         }
-        let c: Vec<_> = need_c.par_iter().map(|&(x, z)| ((x, z), self.chunk_biomes(x, z))).collect();
+        let (c, k) = self.compute_biomes(&need_c, &need_k);
         cache.chunks.extend(c);
-        let k: Vec<_> = need_k.par_iter().map(|&(x, z)| ((x, z), self.carver_biome(x, z))).collect();
         cache.carver.extend(k);
     }
 
@@ -955,33 +1177,87 @@ impl TerrainGenerator {
 
     /// Carved-cave mask of the chunk (cx, cz): carvings of the 17 × 17 neighbouring sources.
     pub fn carving_mask(&self, cx: i32, cz: i32, cache: &BiomeCache) -> CarvingMask {
+        self.carving_mask_sabotaged(cx, cz, cache, CarvingSabotage::None)
+    }
+
+    /// [`Self::carving_mask`] with a deliberate error of an optimised path (tests that must see it).
+    #[doc(hidden)]
+    pub fn carving_mask_sabotaged(&self, cx: i32, cz: i32, cache: &BiomeCache, sabotage: CarvingSabotage) -> CarvingMask {
         let gc = self.gc;
         let max_y = gc.min_y + gc.depth - 1 - self.protect_top;
         let mut mask = CarvingMask::new(gc.min_y + 1, max_y);
         {
             let o = self.opts;
             let mut t = Target::new(cx * 16, cz * 16, &mut mask, o.carver_yd, o.carver_widths);
+            t.span_fill = o.carver_span_fill;
+            t.reach_box = o.carver_reach_box;
+            t.sabotage = sabotage;
+            let pretest_rank_shift = usize::from(sabotage == CarvingSabotage::PretestNextRank);
             for dx in -8..=8 {
                 for dz in -8..=8 {
                     let (sx, sz) = (cx + dx, cz + dz);
-                    let biome = cache.carver.get(&(sx, sz)).copied().unwrap_or_else(|| self.carver_biome(sx, sz));
+                    let biome = self.source_cave_biome(cache, sx, sz);
                     let Some(list) = self.biome_carvers.get(biome as usize) else { continue };
                     for (k, &ci) in list.iter().enumerate() {
                         let carver = &self.carvers[ci as usize];
-                        if o.carver_replay {
-                            let rec = self.replay.get((ci, k as u16, sx, sz), || {
-                                carver.record(&gc, &mut large_feature_random(self.g.seed, k as i64, sx, sz), sx, sz)
-                            });
-                            rec.replay(&mut t);
-                        } else {
+                        if !o.carver_replay {
                             let mut r = large_feature_random(self.g.seed, k as i64, sx, sz);
                             carver.run(&gc, &mut r, sx, sz, &mut t);
+                            continue;
+                        }
+                        // About 9 sources in 10 fail their starting draw and carve nothing: redoing
+                        // that draw costs far less than the cache's lock, hashing and shared pointer.
+                        let rank = &self.cave_rank_seeds[k + pretest_rank_shift];
+                        if o.carver_start_pretest && !carver.starts(rank, sx, sz) {
+                            continue;
+                        }
+                        let rec = self.replay.get_with((ci, k as u16, sx, sz), o.replay_cache_locks, || {
+                            carver.record(&gc, &mut large_feature_random(self.g.seed, k as i64, sx, sz), sx, sz)
+                        });
+                        if rec.may_reach(&t) {
+                            rec.replay(&mut t);
                         }
                     }
                 }
             }
         }
         mask
+    }
+
+    /// Cave biome of the source chunk (sx, sz): from the batch tile, else the cache, else computed.
+    fn source_cave_biome(&self, cache: &BiomeCache, sx: i32, sz: i32) -> u16 {
+        if self.opts.batch_biome_tile
+            && let Some(b) = cache.carver_tile.get(sx, sz)
+        {
+            return b;
+        }
+        cache.carver.get(&(sx, sz)).copied().unwrap_or_else(|| self.carver_biome(sx, sz))
+    }
+
+    /// Biomes seen by the top material of the caves: the source itself, or with
+    /// `cave_top_from_chunk_biomes` the biomes of the 3 × 3 chunks around when the cache holds
+    /// them all (the source answers outside them).
+    fn cave_top_view<'a>(&'a self, cache: &'a BiomeCache, cx: i32, cz: i32) -> BiomeView<'a> {
+        let source = BiomeView::Source { src: &self.source, zoom_seed: self.zoom_seed, searcher: Searcher::default() };
+        if !self.opts.cave_top_from_chunk_biomes {
+            return source;
+        }
+        // Same order as the surface step: x major, z minor.
+        let around: [Option<&ChunkBiomes>; 9] =
+            std::array::from_fn(|i| cache.chunks.get(&(cx + i as i32 / 3 - 1, cz + i as i32 % 3 - 1)));
+        if around.iter().any(Option::is_none) {
+            return source;
+        }
+        BiomeView::ChunkThenSource {
+            chunks: around.map(|c| c.expect("all nine checked above")),
+            cx,
+            cz,
+            zoom_seed: self.zoom_seed,
+            min_qy: self.world_min_y >> 2,
+            max_qy: (self.world_min_y >> 2) + (self.world_height >> 2) - 1,
+            src: &self.source,
+            searcher: Searcher::default(),
+        }
     }
 
     fn carve(&self, chunk: &mut ProtoTerrain, aquifer: &mut Aquifer, ctx: &mut Ctx, cache: &BiomeCache) {
@@ -995,10 +1271,9 @@ impl TerrainGenerator {
         } else {
             (b.get("minecraft:dirt"), b.get("minecraft:grass_block"), b.get("minecraft:mycelium"))
         };
-        let mut view =
-            BiomeView::Source { src: &self.source, zoom_seed: self.zoom_seed, searcher: Searcher::default() };
+        let mut view = self.cave_top_view(cache, chunk.cx, chunk.cz);
         let (bx0, bz0) = (chunk.min_x(), chunk.min_z());
-        mask.visit(|x, z, bottom, top| {
+        mask.visit_with(self.opts.carving_mask_read_by_runs, |x, z, bottom, top| {
             let mut has_grass = false;
             let (wx, wz) = (bx0 + x, bz0 + z);
             let mut y = top;

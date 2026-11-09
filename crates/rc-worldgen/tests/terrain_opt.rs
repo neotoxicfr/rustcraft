@@ -1,14 +1,17 @@
 //! Bit-for-bit equivalence of the optimised terrain paths (`TerrainOpts`, switches
 //! `RUSTCRAFT_OPT_TERRAIN_IDS`, `AQ_COLWIN`, `AQ_SIMD`, `AQ_PRETEST`, `BASEH_LAZY`, `BASEH_MEMO`,
-//! `CARVER_YD`, `CARVER_WIDTHS`, `CARVER_REPLAY`, `FILL_COLUMN_TRACKING`) against the old code: complete chunks
-//! (blocks, height maps, fluid marks), aquifer block by block with drawn densities,
-//! base heights, cave masks. Missing game data makes the tests fail under
+//! `CARVER_YD`, `CARVER_WIDTHS`, `CARVER_REPLAY`, `CARVER_START_PRETEST`, `CARVER_REACH_BOX`,
+//! `REPLAY_CACHE_RWLOCK`, `REPLAY_CACHE_SPREAD`, `CARVER_SPAN_FILL`, `CARVING_MASK_READ_BY_RUNS`, `BATCH_BIOME_TILE`,
+//! `MERGED_BIOME_PHASE`, `CAVE_TOP_FROM_CHUNK_BIOMES`, `FILL_COLUMN_TRACKING`) against the old
+//! code: complete chunks (blocks, height maps, fluid marks), aquifer block by block with drawn
+//! densities, base heights, cave masks, batch biomes. Missing game data makes the tests fail under
 //! `RUSTCRAFT_OPT_REQUIRE=1`.
 
 mod common;
 
 use rayon::prelude::*;
 use rc_worldgen::Ctx;
+use rc_worldgen::carver::{CarvingMask, CarvingSabotage, ReplayCacheLocks};
 use rc_worldgen::proto::ProtoTerrain;
 use rc_worldgen::terrain::{BiomeCache, TerrainGenerator, TerrainOpts};
 
@@ -50,7 +53,29 @@ fn variants() -> Vec<(&'static str, TerrainOpts)> {
         ("carver_yd", TerrainOpts { carver_yd: true, ..o }),
         ("carver_widths", TerrainOpts { carver_widths: true, ..o }),
         ("carver_replay", TerrainOpts { carver_replay: true, ..o }),
+        ("carver_start_pretest", TerrainOpts { carver_replay: true, carver_start_pretest: true, ..o }),
+        ("carver_reach_box", TerrainOpts { carver_replay: true, carver_reach_box: true, ..o }),
+        ("replay_cache_rwlock", TerrainOpts { carver_replay: true, replay_cache_locks: ReplayCacheLocks::ReadWrite, ..o }),
+        ("replay_cache_spread", TerrainOpts { carver_replay: true, replay_cache_locks: ReplayCacheLocks::Spread, ..o }),
+        ("carver_span_fill", TerrainOpts { carver_span_fill: true, ..o }),
+        ("carving_mask_read_by_runs", TerrainOpts { carving_mask_read_by_runs: true, ..o }),
+        ("merged_biome_phase", TerrainOpts { merged_biome_phase: true, ..o }),
         ("fill_column_tracking", TerrainOpts { fill_column_tracking: true, ..o }),
+        ("all", TerrainOpts::NEW),
+    ]
+}
+
+/// Cave paths of the C1-M12 mission alone and together, over the replay.
+fn carving_variants() -> Vec<(&'static str, TerrainOpts)> {
+    let replay = TerrainOpts { carver_replay: true, ..TerrainOpts::OLD };
+    vec![
+        ("replay", replay),
+        ("start pretest", TerrainOpts { carver_start_pretest: true, ..replay }),
+        ("reach box", TerrainOpts { carver_reach_box: true, ..replay }),
+        ("read-write locks", TerrainOpts { replay_cache_locks: ReplayCacheLocks::ReadWrite, ..replay }),
+        ("spread tables", TerrainOpts { replay_cache_locks: ReplayCacheLocks::Spread, ..replay }),
+        ("span fill", TerrainOpts { carver_span_fill: true, ..TerrainOpts::OLD }),
+        ("span fill + yd", TerrainOpts { carver_span_fill: true, carver_yd: true, ..TerrainOpts::OLD }),
         ("all", TerrainOpts::NEW),
     ]
 }
@@ -266,8 +291,29 @@ fn base_height_paths_identical() {
     assert!(failures.is_empty(), "{} differences:\n{}", failures.len(), failures[..failures.len().min(20)].join("\n"));
 }
 
-/// Cave masks: 500 targets, direct carving against replay (and precomputed vertical difference,
-/// width buffer); the replay then serves from the cache, second pass included.
+/// Masks of `t` with `sabotage`, against `expected`: the targets that differ.
+fn mask_differences(
+    t: &TerrainGenerator,
+    cache: &BiomeCache,
+    targets: &[(i32, i32)],
+    expected: &[CarvingMask],
+    sabotage: CarvingSabotage,
+) -> Vec<(i32, i32)> {
+    let got: Vec<_> = targets.par_iter().map(|&(x, z)| t.carving_mask_sabotaged(x, z, cache, sabotage)).collect();
+    targets.iter().zip(expected.iter().zip(&got)).filter(|(_, (a, b))| a != b).map(|(p, _)| *p).collect()
+}
+
+/// Grouped targets (shared sources) and sparse ones.
+fn carving_targets(seed: i64) -> Vec<(i32, i32)> {
+    let mut rng = Mix(seed as u64 ^ 0xCA7E);
+    let mut targets: Vec<(i32, i32)> = (0..12).flat_map(|x| (0..12).map(move |z| (x, z))).collect();
+    targets.extend((0..356).map(|_| (rng.range(-5000, 5000), rng.range(-5000, 5000))));
+    targets
+}
+
+/// Cave masks: 500 targets, direct carving against each optimised path (replay, start pre-test,
+/// reach box, runs, all); the replay then serves from the cache, second pass included. Every
+/// mask is also read back by runs and block by block: same ranges.
 #[test]
 fn carving_masks_identical() {
     let Some(pack) = common::data_pack() else { return };
@@ -275,26 +321,157 @@ fn carving_masks_identical() {
     for (preset, dim) in [DIMS[0], DIMS[2]] {
         for seed in SEEDS {
             let old = generator(&pack, preset, dim, seed, TerrainOpts::OLD);
-            let new = generator(&pack, preset, dim, seed, TerrainOpts::NEW);
-            let mut rng = Mix(seed as u64 ^ 0xCA7E);
-            // Grouped targets (shared sources) and sparse ones.
-            let mut targets: Vec<(i32, i32)> = (0..12).flat_map(|x| (0..12).map(move |z| (x, z))).collect();
-            targets.extend((0..356).map(|_| (rng.range(-5000, 5000), rng.range(-5000, 5000))));
+            let targets = carving_targets(seed);
             let mut cache = BiomeCache::default();
             old.prepare_biomes(&mut cache, &targets);
             let a: Vec<_> = targets.par_iter().map(|&(x, z)| old.carving_mask(x, z, &cache)).collect();
-            let mut carved = 0;
-            for pass in 0..2 {
-                let b: Vec<_> = targets.par_iter().map(|&(x, z)| new.carving_mask(x, z, &cache)).collect();
-                for (i, (ma, mb)) in a.iter().zip(&b).enumerate() {
-                    carved += usize::from(!ma.is_empty());
-                    if ma != mb {
-                        failures.push(format!("{dim} seed {seed} pass {pass} {:?}", targets[i]));
+            let carved = a.iter().filter(|m| !m.is_empty()).count();
+            assert!(carved > 100, "{dim}: too few carved chunks ({carved})");
+            for (name, o) in carving_variants() {
+                let t = generator(&pack, preset, dim, seed, o);
+                for pass in 0..2 {
+                    for p in mask_differences(&t, &cache, &targets, &a, CarvingSabotage::None) {
+                        failures.push(format!("{dim} seed {seed} [{name}] pass {pass} {p:?}"));
                     }
                 }
             }
-            assert!(carved > 100, "{dim}: too few carved chunks ({carved})");
+            for (m, p) in a.iter().zip(&targets) {
+                let (mut by_bits, mut by_runs) = (Vec::new(), Vec::new());
+                m.visit(|x, z, lo, hi| by_bits.push((x, z, lo, hi)));
+                m.visit_by_runs(|x, z, lo, hi| by_runs.push((x, z, lo, hi)));
+                if by_bits != by_runs {
+                    failures.push(format!("{dim} seed {seed} {p:?}: ranges read by runs differ"));
+                }
+            }
         }
+    }
+    assert!(failures.is_empty(), "{} differences:\n{}", failures.len(), failures[..failures.len().min(20)].join("\n"));
+}
+
+/// The mask comparison sees each optimised cave path go wrong: start pre-test drawn for the next
+/// cave of the list, reach box one block smaller, top of each run left out.
+#[test]
+fn carving_masks_check_catches_sabotage() {
+    let Some(pack) = common::data_pack() else { return };
+    let (preset, dim) = DIMS[0];
+    let seed = SEEDS[1];
+    let old = generator(&pack, preset, dim, seed, TerrainOpts::OLD);
+    let new = generator(&pack, preset, dim, seed, TerrainOpts::NEW);
+    let targets = carving_targets(seed);
+    let mut cache = BiomeCache::default();
+    old.prepare_biomes(&mut cache, &targets);
+    let a: Vec<_> = targets.par_iter().map(|&(x, z)| old.carving_mask(x, z, &cache)).collect();
+    for sabotage in
+        [CarvingSabotage::PretestNextRank, CarvingSabotage::ReachBoxOneBlockSmaller, CarvingSabotage::RunTopExclusive]
+    {
+        let wrong = mask_differences(&new, &cache, &targets, &a, sabotage);
+        eprintln!("{sabotage:?}: {} masks differ", wrong.len());
+        assert!(!wrong.is_empty(), "{sabotage:?} not seen");
+    }
+    // A wrong range read back by runs is seen too.
+    let m = a.iter().find(|m| !m.is_empty()).expect("a carved mask");
+    let (mut by_bits, mut by_runs) = (Vec::new(), Vec::new());
+    m.visit(|x, z, lo, hi| by_bits.push((x, z, lo, hi)));
+    m.visit_by_runs(|x, z, lo, hi| by_runs.push((x, z, lo, hi - 1)));
+    assert_ne!(by_bits, by_runs, "run end one block short not seen");
+}
+
+/// "Large structure" randomness drawn per rank then mixed with the source (start pre-test): same
+/// generator state as drawing everything for each source, on 20,000 draws of seeds, ranks and
+/// sources (extreme ones included); a wrong rank is seen.
+#[test]
+fn large_feature_seed_matches_direct_draw() {
+    use rc_worldgen::carver::LargeFeatureSeed;
+    use rc_worldgen::rng::LegacyRandom;
+    // The draw as written for a single source: rank salt, two longs, then reseeding.
+    let direct = |seed: i64, k: i64, sx: i32, sz: i32| {
+        let s = seed.wrapping_add(k);
+        let mut r = LegacyRandom::new(s);
+        let a = r.next_long();
+        let b = r.next_long();
+        r.set_seed(i64::from(sx).wrapping_mul(a) ^ i64::from(sz).wrapping_mul(b) ^ s);
+        (r.next_long(), r.next_float())
+    };
+    let mut rng = Mix(0x1A26E);
+    let (mut same, mut wrong_rank_seen) = (0usize, 0usize);
+    for n in 0..20_000 {
+        let seed = if n % 50 == 0 { [i64::MIN, i64::MAX, 0, -1][n / 50 % 4] } else { rng.next() as i64 };
+        let k = i64::from(rng.range(0, 4));
+        let (sx, sz) = if n % 7 == 0 { (i32::MIN + 5, i32::MAX - 3) } else { (rng.range(-1_900_000, 1_900_000), rng.range(-1_900_000, 1_900_000)) };
+        let mut r = LargeFeatureSeed::new(seed, k).at(sx, sz);
+        same += usize::from((r.next_long(), r.next_float()) == direct(seed, k, sx, sz));
+        let mut wrong = LargeFeatureSeed::new(seed, k + 1).at(sx, sz);
+        wrong_rank_seen += usize::from((wrong.next_long(), wrong.next_float()) != direct(seed, k, sx, sz));
+    }
+    assert_eq!(same, 20_000, "draws differ");
+    assert!(wrong_rank_seen > 19_000, "a wrong rank is not seen ({wrong_rank_seen})");
+}
+
+/// Batches like the generator's: compact squares, a strip, a ring, a scattered batch (hash maps),
+/// then a batch overlapping the previous one in the same cache.
+fn biome_batches() -> Vec<Vec<(i32, i32)>> {
+    let square = |x0: i32, z0: i32, n: i32| -> Vec<(i32, i32)> {
+        (0..n).flat_map(|x| (0..n).map(move |z| (x0 + x, z0 + z))).collect()
+    };
+    let ring: Vec<(i32, i32)> = (-6..=6)
+        .flat_map(|x: i32| (-6..=6).map(move |z: i32| (x + 300, z - 40)))
+        .filter(|&(x, z)| (x - 300).abs() == 6 || (z + 40).abs() == 6)
+        .collect();
+    vec![
+        square(0, 0, 9),
+        (0..30).map(|x| (x - 500, 77)).collect(),
+        ring,
+        vec![(10, 10), (4000, -4000), (-2500, 900)],
+        square(5, 3, 9),
+        vec![(1, 1)],
+    ]
+}
+
+/// Batch biome tile and merged biome phase: same chunk and cave biomes in the cache as the hash
+/// maps, the tile right on every source a target reads, and the same cave masks.
+#[test]
+fn batch_biome_tile_matches_hash_maps() {
+    let Some(pack) = common::data_pack() else { return };
+    let mut failures = Vec::new();
+    for seed in [SEEDS[0], SEEDS[2]] {
+        let (preset, dim) = DIMS[0];
+        let old = generator(&pack, preset, dim, seed, TerrainOpts::OLD);
+        let new = generator(&pack, preset, dim, seed, TerrainOpts::NEW);
+        let (mut cache_old, mut cache_new) = (BiomeCache::default(), BiomeCache::default());
+        let (mut tile_reads, mut shifted_wrong) = (0usize, 0usize);
+        for batch in biome_batches() {
+            old.prepare_biomes(&mut cache_old, &batch);
+            new.prepare_biomes(&mut cache_new, &batch);
+            if cache_old.carver != cache_new.carver {
+                failures.push(format!("seed {seed} batch {:?}…: cave biomes differ", batch[0]));
+            }
+            if cache_old.chunks != cache_new.chunks {
+                failures.push(format!("seed {seed} batch {:?}…: chunk biomes differ", batch[0]));
+            }
+            for &(cx, cz) in &batch {
+                for sx in cx - 8..=cx + 8 {
+                    for sz in cz - 8..=cz + 8 {
+                        let Some(b) = cache_new.carver_tile.get(sx, sz) else { continue };
+                        tile_reads += 1;
+                        if Some(&b) != cache_old.carver.get(&(sx, sz)) {
+                            failures.push(format!("seed {seed} tile ({sx}, {sz}): {b}"));
+                        }
+                        // Sabotage: the neighbour in x read instead must be seen somewhere.
+                        let next = cache_new
+                            .carver_tile
+                            .get(sx + 1, sz)
+                            .or_else(|| cache_old.carver.get(&(sx + 1, sz)).copied());
+                        shifted_wrong += usize::from(next != Some(b));
+                    }
+                }
+            }
+            let expected: Vec<_> = batch.par_iter().map(|&(x, z)| old.carving_mask(x, z, &cache_old)).collect();
+            for p in mask_differences(&new, &cache_new, &batch, &expected, CarvingSabotage::None) {
+                failures.push(format!("seed {seed} mask {p:?}"));
+            }
+        }
+        assert!(tile_reads > 20_000, "tile read {tile_reads} times only");
+        assert!(shifted_wrong > 100, "a tile read one source off would not be seen ({shifted_wrong})");
     }
     assert!(failures.is_empty(), "{} differences:\n{}", failures.len(), failures[..failures.len().min(20)].join("\n"));
 }

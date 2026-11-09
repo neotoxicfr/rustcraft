@@ -9954,3 +9954,62 @@ never in the reference runs). No gain of its own: it tells which spreading leads
   spikes again (server: flowing water is due 5 ticks after each change, so look for a spacing of
   5, or a multiple, between the game times of successive readable `server slowest tick` lines,
   not for fixed remainders; client: `slow_frame_us_client_relight`).
+
+## C1-M12 (series 3): batch biomes and cave masks (09/11, loaded machine)
+
+Micro-bench `rc-worldgen --test terrain_opt_bench -- --ignored cave_and_batch_biome_bench` (24 × 24
+grid from (0, 0), seed 0, main world; 2 to 3 alternating passes). LOADED machine (other agents
+compiling): ±30 % between passes on one thread, far more on many threads. Each lead alone, then
+together; ranges are the passes.
+
+| Lead (switch, default) | old | new | Note |
+|---|---|---|---|
+| Start pre-test (`CARVER_START_PRETEST`, 1) | replay 0.061-0.083 ms/mask | 0.049-0.065 | replay cache lookups 867 → 67.5 per chunk (÷ 12.8); records kept 4,800 → 368 (8.30 → 7.81 MB) |
+| + reach box (`CARVER_REACH_BOX`, 1) | 0.049-0.065 | 0.044-0.058 | exact box: the same floors as the ellipsoid bounds, no margin |
+| + read-write locks (`REPLAY_CACHE_RWLOCK`, 0) | 0.044-0.058 | 0.044-0.076 | never better, threads noisy: off |
+| + 64 spread tables (`REPLAY_CACHE_SPREAD`, 0) | 0.044-0.058 | 0.050-0.059 | per-table cap 256 KB empties tables (4,611 records, 8.8 allocations per mask against 4.1): off |
+| + ellipsoid runs (`CARVER_SPAN_FILL`, 0) | 0.044-0.048 | 0.047-0.062 | bisection +10 %, grown from the centre +6 to +12 %: off |
+| Mask read back by runs (`CARVING_MASK_READ_BY_RUNS`, 1) | 18-35 µs/chunk | 3.0-3.9 | −83 to −89 % |
+| Batch biome tile (`BATCH_BIOME_TILE`, 1) | 0.039-0.067 ms/batch | 0.003-0.005 | 9 × 9 batch whose biomes are all cached (sliding batches); masks reading it within noise |
+| Merged biome phase (`MERGED_BIOME_PHASE`, 1) | cold 9 × 9 batch 2.23-2.88 ms | 2.24-3.01 | within noise; one barrier fewer, kept until the scene bench |
+| Around on a bitmap (`BATCH_AROUND_BITMAP`, 1, rc-sim) | — | — | same order as the hash set; 9 insertions × 4 lists per position avoided, below the batch clocks' resolution |
+| Cave top from the chunk biomes (`CAVE_TOP_FROM_CHUNK_BIOMES`, 1, declared by C1-M04, wired here) | carve step 0.16-0.49 ms/chunk | 0.09-0.33 | mean −26 %; 0 chunks of 3,000 with a different block |
+
+- Start pre-test: about 9 sources in 10 fail their starting draw and carve nothing; the draw is
+  redone before the cache, and the part that depends only on the seed and the cave rank (two longs)
+  is drawn once per generator (`LargeFeatureSeed`), leaving one reseed and one step per source.
+- Ellipsoid runs: in a column the carved rows form one interval (the normalised height never
+  decreases going up), so a run per column is exact; it loses because the columns are short (a
+  few rows) and the per-bit loop was already cheap. Kept behind its switch (C6).
+- Threads (masks, hot cache, best of 3, µs per chunk, 1 / 8 / 16 / 32 threads): old 90-135 /
+  12-24 / 7-18 / 5.6-14; replay 61-92 / 23-28 / 21-22 / 23-26; pre-test + box 44-61 / 7-10 /
+  5-10 / 3.8-37. With 32 threads the cached paths stay behind the direct path in most runs (shared
+  locks and pointer counts, oversubscribed machine); the pre-test divides the shared accesses by
+  12.8, read-write locks and spread tables did not help here. To settle on the quiet machine.
+- Batch phases (rc-sim `bench_batch_phases_by_threads`, flight of 12 rows of 24 chunks, ms/chunk,
+  new defaults against these switches at 0, 2 passes): 1 thread 14.2-16.1 against 14.4-14.7
+  (noise); 32 threads total 1.73 against 1.98-2.00, terrain 0.66 against 0.79-0.81, biomes 0.086
+  against 0.099-0.105. The first pass with the new defaults stopped after one thread: the bench
+  reuses one scratch folder per thread count, deleted by the previous pool's thread on exit (bench
+  bug, not the generator).
+- Cave top material from the chunk biomes (A3, as C1-M04 describes it): the game reads the source
+  without cache there, whose answer on a climate tied between biomes depends on the thread's
+  history; the chunk biomes differ from our source only on such ties. No block differs on 3,000
+  scattered chunks, and the new-world and bench-world fingerprints are unchanged.
+- Proofs: `terrain_opt` `carving_masks_identical` (each lead alone and together, 2 passes, masks
+  read back both ways), `carving_masks_check_catches_sabotage` (pre-test drawn for the next rank:
+  481 masks differ; box one block smaller: 2; run top left out: 487; read-back run one short),
+  `batch_biome_tile_matches_hash_maps` (both maps, the tile on every source a target reads, masks;
+  hand sabotage of a tile value: 44,612 differences, merged results shifted: 12),
+  `large_feature_seed_matches_direct_draw` (20,000 draws, a wrong rank seen),
+  `terrain_paths_identical` (the new switches added), rc-sim `around_tests` (hand sabotage of the
+  bitmap seen), `terrain_ref` (51 chunks, 0 difference), `material_opt`, `generation_ref` (probes
+  49 + 64 chunks, 0 difference), `fingerprint_new_world` and `fingerprint_bench_world` identical with
+  the switches at their defaults, all at 0 and all at 1 (the bench model on disk has other input
+  files than the recorded one; its simulation fingerprint is still the recorded `2a5918d4…`).
+- Placement (B4): masks and biomes stay on the generation pool; no GPU lead (branchy integer work,
+  a few hundred µs per batch). Memory: replay cache 8.30 → 7.81 MB, tile ≈ 2 bytes per source of
+  the batch rectangle.
+- To measure on the quiet machine: scenes `generation`, `generation-1thread`, `fresh-mountain-rd16`,
+  `crowd` (first batch ms, in game ms, meshed load ms, `biomes` and `terrain` batch phases), with
+  `REPLAY_CACHE_RWLOCK=1`, `REPLAY_CACHE_SPREAD=1`, `CARVER_SPAN_FILL=1` each tried once.
