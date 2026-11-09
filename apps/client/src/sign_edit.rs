@@ -301,7 +301,7 @@ impl crate::App {
         let crate::block_entities::Data::Sign(faces) = &e.data else { return };
         let hanging = e.kind == crate::block_entities::Kind::HangingSign;
         let face = &faces[usize::from(!front)];
-        let lang = self.renderer.as_ref().map(|r| r.gui.lang.clone()).unwrap_or_default();
+        let lang = self.renderer.as_ref().map(|r| std::sync::Arc::clone(&r.gui.lang)).unwrap_or_default();
         let lines: [Vec<char>; 4] = std::array::from_fn(|i| {
             face.messages[i]
                 .as_ref()

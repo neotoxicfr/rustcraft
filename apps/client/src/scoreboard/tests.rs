@@ -427,7 +427,7 @@ fn sidebar_styled_cache_draws_identical_layers() {
         }
         for g in [&mut reference, &mut old, &mut new] {
             match frame {
-                50 => g.lang = rc_text::Lang::load(&base, Some(r#"{"gui.done": "Terminé"}"#.as_bytes()), None),
+                50 => g.lang = std::sync::Arc::new(rc_text::Lang::load(&base, Some(r#"{"gui.done": "Terminé"}"#.as_bytes()), None)),
                 70 => {
                     let opts = rc_assets::font::FontOptions { uniform: true, jp: false };
                     let load = |id: &&str| ((*id).to_owned(), rc_assets::font::Font::load(&e.assets, id, opts));

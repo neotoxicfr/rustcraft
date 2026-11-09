@@ -10257,3 +10257,36 @@ TNT among the items); the micro-benches `bench_helper_jobs_with_busy_cores`, `be
 `bench_object_pass_among_items`, `bench_portal_site`, `bench_advancement_triggers`,
 `bench_natural_spawn_pass --features memstats` (`cargo test --release -p rc-sim --lib <name> --
 --ignored --nocapture --test-threads=1`).
+## C4-M03: language identity, one shared translation table, search indexes rebuilt on a language change (09/11, loaded machine)
+
+No switch: one fidelity fix and the removal of useless copies (same values). Main thread work only,
+nothing to spread over threads or the GPU.
+
+- Search indexes (fidelity). The creative inventory and the recipe book keyed their search index on
+  the number of translations; the table merges `en_us` with the chosen language, so most languages
+  have the same count and the index stayed in the old language after a change (searching "épée"
+  in French found nothing until the lists were rebuilt). Both now compare a `SearchIndexKey`
+  (identity of the table, list rebuilds, server data generation) as a whole, in place of the XORed
+  integers. The game builds its search trees with the normal tooltip flag, never the advanced one
+  (F3+H, checked in the decompiled client): the index lines now use the normal tooltip too, so the
+  advanced setting no longer changes what a search finds, and is not part of the key. Proof:
+  `search_index_follows_a_language_change` (creative and recipe book, same key count in English and
+  French); sabotage (key back to the number of translations): both fail.
+- Shared table. `Gui::lang` is an `Arc<Lang>`: the Multiplayer and Statistics screens (every frame),
+  the tutorial (every tick of the movement step), the operator screens and the sign editor took a
+  full copy of the table to use it past a borrow of the interface; they take a handle now. `Lang`
+  is no longer `Clone`, so a new copy cannot come back. Micro-bench `bench_lang_clone` (rc-text,
+  table shaped like `en_us`: 8,559 entries, 476 KB of text), 3 passes: full copy and drop 894 /
+  857 / 796 µs, shared handle 0.003 / 0.004 / 0.003 µs. About −0.8 ms per frame on the
+  Multiplayer and Statistics screens, and about 17,000 allocations per frame fewer (2 per entry).
+- Generations. The language identity (`Lang::generation`, one per load), the bound keys generation
+  (moves only on a real change) and the process-wide font identity were already in place (text
+  cache work of the Tab list and the sidebar);
+  `font_identities_are_never_reused` now guards the last one (sabotage: counter not advanced,
+  fails). The experience level text of the HUD was kept per level only: it now keys on the
+  language too (it stayed in the former language after a change).
+- Noted, not done: the integrated server keeps its own `en_us` table (`stations.rs`), below 1 MB,
+  shareable with the client's in singleplayer.
+- To measure (quiet machine): title, plains12; the Multiplayer and Statistics screens with the
+  out-of-world performance line (scene of C4-M07); in game: close the creative inventory, change
+  the language, reopen it and search.

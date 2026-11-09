@@ -436,6 +436,16 @@ fn object_rect(x: f32, y: f32) -> [f32; 4] {
     [x, top, x + 8.0, top + 8.0]
 }
 
+/// A rebuilt interface (resource reload) or a font replacement never gets an identity already
+/// handed out: text caches outside the interface would otherwise keep widths of the old fonts.
+#[cfg(test)]
+#[test]
+fn font_identities_are_never_reused() {
+    let first = next_font_generation();
+    let second = next_font_generation();
+    assert!(second > first);
+}
+
 #[cfg(test)]
 #[test]
 fn object_sprite_sits_one_pixel_above_the_glyph_box() {
@@ -588,7 +598,9 @@ pub struct Gui {
     default_font: Option<usize>,
     /// Font set in place (changes with `set_fonts`: distinct glyph keys), unique in the process.
     font_gen: usize,
-    pub lang: rc_text::Lang,
+    /// Shared, never copied: screens that need the table past a borrow of the interface take a
+    /// cheap handle (`Arc::clone`); a language change replaces the whole table.
+    pub lang: std::sync::Arc<rc_text::Lang>,
     white: Glyph,
     missing: Glyph,
     slots: HashMap<(usize, u32), Slot>,
@@ -861,7 +873,7 @@ impl Gui {
             default_font: default_font(&assets.fonts),
             fonts: assets.fonts,
             font_gen: next_font_generation(),
-            lang: assets.lang,
+            lang: std::sync::Arc::new(assets.lang),
             white: Glyph::white(),
             missing: Glyph::missing(),
             slots: HashMap::new(),

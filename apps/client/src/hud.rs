@@ -54,8 +54,8 @@ pub struct Hud {
     pub no_vignette: bool,
     /// Weight of the world border warning (red tint of the vignette, § 5.3).
     pub border_warn: f32,
-    /// Experience level text, redone when the level changes.
-    level_text: Option<(i32, Vec<rc_text::StyledChar>)>,
+    /// Experience level text, redone when the level or the language (`Lang::generation`) changes.
+    level_text: Option<((i32, u64), Vec<rc_text::StyledChar>)>,
     /// Name of the held item (§ 5.1): item, name, timer.
     held: Option<(i32, rc_text::Component)>,
     held_timer: i32,
@@ -650,10 +650,11 @@ impl Hud {
         }
         if survival(game_mode) && self.xp_level > 0 {
             let level = self.xp_level;
-            if self.level_text.as_ref().is_none_or(|t| t.0 != level) {
+            let key = (level, gui.lang.generation);
+            if self.level_text.as_ref().is_none_or(|t| t.0 != key) {
                 let c =
                     rc_text::Component::translate("gui.experience.level", vec![rc_text::Arg::Text(level.to_string())]);
-                self.level_text = Some((level, rc_text::styled_chars(&rc_text::flatten(&c, &gui.lang))));
+                self.level_text = Some((key, rc_text::styled_chars(&rc_text::flatten(&c, &gui.lang))));
             }
             let chars = &self.level_text.as_ref().expect("set above").1;
             let x = (w - rc_text::width(gui, chars)) / 2;

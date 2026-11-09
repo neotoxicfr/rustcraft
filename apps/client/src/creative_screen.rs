@@ -10,7 +10,7 @@ use crate::gui::{Blend, Gui, Pre};
 use crate::hud::HotbarItems;
 use crate::inventory::PlayerInventory;
 use crate::menu::{self, Kind};
-use crate::screens::{Cached, decorate, draw_tooltip, refresh, tooltip_lines};
+use crate::screens::{Cached, SearchIndexKey, decorate, draw_tooltip, refresh, tooltip_lines};
 use crate::widgets::TextField;
 
 /// Tab `container/creative_inventory/tab_<top|bottom>_<unselected|selected>_<column + 1>`
@@ -49,7 +49,7 @@ pub struct CreativeScreen {
     /// Stacks of the current tab's grid (empty: empty slot).
     pub shown: Vec<Option<ItemStack>>,
     pub search: TextField,
-    index: Option<((usize, u64), SearchIndex)>,
+    index: Option<(SearchIndexKey, SearchIndex)>,
     /// Visible tags of the last `#` query (§ 4.2).
     pub visible_tags: Vec<String>,
     /// Item tags received (name, items), copied with the index.
@@ -357,8 +357,14 @@ impl CreativeScreen {
     }
 
     /// Search index (§ 4.1), redone after a rebuild or a language change.
-    pub fn ensure_index(&mut self, gui: &Gui, it: &HotbarItems<'_>, enchantments: &[String], rec: &Received) {
-        let key = (gui.lang.map.len(), self.rebuilt ^ rec.generation.rotate_left(32));
+    pub fn ensure_index(
+        &mut self,
+        lang: &rc_text::Lang,
+        it: &HotbarItems<'_>,
+        enchantments: &[String],
+        rec: &Received,
+    ) {
+        let key = SearchIndexKey { language: lang.generation, listed_content: self.rebuilt, server_data: rec.generation };
         if self.index.as_ref().is_some_and(|(k, _)| *k == key) {
             return;
         }
@@ -367,7 +373,7 @@ impl CreativeScreen {
         let mut idx = SearchIndex::default();
         crate::tooltips_more::set_creative(true);
         for s in &self.lists.search {
-            let lines = crate::screens::tooltip_search_lines(s, it, enchantments, gui, crate::screens::advanced());
+            let lines = crate::screens::tooltip_search_lines(s, it, enchantments, lang);
             idx.lines.push(lines);
             idx.ids.push(usize::try_from(s.item).ok().and_then(|i| names.get(i)).cloned().unwrap_or_default());
             idx.tags.push(by_item.get(&s.item).cloned().unwrap_or_default());
@@ -717,6 +723,27 @@ mod tests {
             assert!(found > 0, "{kind:?}: no slot found");
             assert_eq!(c.hits(&d).len(), if kind == CreativeKind::Inventory { 42 } else { 54 });
         }
+    }
+
+    /// Index built in English, language switched to French (same number of keys), search tab
+    /// reopened: "épée" finds the sword, like the game that rebuilds its search trees.
+    #[test]
+    fn search_index_follows_a_language_change() {
+        use crate::screens::SwordInTwoLanguages;
+        let f = SwordInTwoLanguages::new(data(CreativeKind::Search));
+        let (it, rec) = (f.items(), Received::default());
+        let mut c = CreativeScreen::default();
+        c.lists.search = vec![SwordInTwoLanguages::sword()];
+        let mut found = |query: &str, lang: &rc_text::Lang| {
+            c.search.text = query.chars().collect();
+            c.ensure_index(lang, &it, &[], &rec);
+            c.search_changed(&f.data);
+            c.shown.len()
+        };
+        assert_eq!(found("diamond", &f.english), 1);
+        assert_eq!(found("épée", &f.english), 0);
+        assert_eq!(found("épée", &f.french), 1, "index still in English after the language change");
+        assert_eq!(found("diamond", &f.french), 0);
     }
 
     /// Micro-bench of the hit test (former list against no list), alternated passes.

@@ -213,7 +213,7 @@ impl crate::App {
         if waiting < 100 {
             return;
         }
-        let lang = self.renderer.as_ref().map(|r| r.gui.lang.clone());
+        let lang = self.renderer.as_ref().map(|r| std::sync::Arc::clone(&r.gui.lang));
         let Some(lang) = lang else { return };
         if move_done == -1 && toast.is_none() {
             let k = |n| key(&self.options, &lang, n);
@@ -298,7 +298,7 @@ impl crate::App {
         }
         let resets = self.fx.tutorial.inst.as_ref().map_or(0, |i| i.resets);
         if (waiting >= 600 || resets > 3) && toast.is_none() {
-            let lang = self.renderer.as_ref().map(|r| r.gui.lang.clone());
+            let lang = self.renderer.as_ref().map(|r| std::sync::Arc::clone(&r.gui.lang));
             let Some(lang) = lang else { return };
             let title = Component::translate("tutorial.punch_tree.title", vec![]);
             let desc =
@@ -317,7 +317,7 @@ impl crate::App {
         }
         let i = self.fx.tutorial.inst.as_ref();
         if i.is_some_and(|i| i.waiting >= 600 && i.toast.is_none()) {
-            let lang = self.renderer.as_ref().map(|r| r.gui.lang.clone());
+            let lang = self.renderer.as_ref().map(|r| std::sync::Arc::clone(&r.gui.lang));
             let Some(lang) = lang else { return };
             let title = Component::translate("tutorial.open_inventory.title", vec![]);
             let desc = Component::translate(

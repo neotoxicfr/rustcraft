@@ -756,8 +756,9 @@ pub fn strip_codes(s: &str) -> String {
     out
 }
 
-/// Translation table (§ 3.5).
-#[derive(Debug, Default, Clone)]
+/// Translation table (§ 3.5). Deliberately not `Clone`: the table holds thousands of strings, so it
+/// is shared (`Arc`) or borrowed, never copied.
+#[derive(Debug, Default)]
 pub struct Lang {
     pub map: HashMap<String, String>,
     /// Right-to-left language (the `bidirectional` flag of its declaration): default direction of
@@ -1431,7 +1432,6 @@ mod tests {
         let _serial = KEYBINDS_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (a, b) = (Lang::load(b"{}", None, None), Lang::load(b"{}", None, None));
         assert!(a.generation != 0 && a.generation != b.generation);
-        assert_eq!(a.clone().generation, a.generation, "a copy is the same table");
         let keys = || [("key.jump".to_owned(), "key.keyboard.space".to_owned())];
         set_keybinds(keys());
         let g = keybinds_generation();
@@ -1439,6 +1439,34 @@ mod tests {
         assert_eq!(keybinds_generation(), g, "same keys");
         set_keybinds([("key.jump".to_owned(), "key.keyboard.j".to_owned())]);
         assert_ne!(keybinds_generation(), g, "changed keys");
+    }
+
+    /// Micro-bench: what the screens paid per frame before the table was shared (a full copy and
+    /// its drop) against a shared handle. Table shaped like `en_us` 26.3: 8 559 entries, about
+    /// 460 KB of text.
+    /// `cargo test --release -p rc-text bench_lang_clone -- --ignored --nocapture`
+    #[test]
+    #[ignore = "micro-bench"]
+    fn bench_lang_clone() {
+        let map = (0..8_559).map(|i| (format!("block.minecraft.some_long_key_{i:05}"), format!("Translated value {i:05}"))).collect();
+        let table = std::sync::Arc::new(Lang { map, bidirectional: false, generation: 1 });
+        let text: usize = table.map.iter().map(|(k, v)| k.len() + v.len()).sum();
+        let n = 200;
+        for pass in 0..3 {
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                let copy = Lang { map: table.map.clone(), ..Lang::default() };
+                std::hint::black_box(&copy);
+            }
+            let copied = t.elapsed().as_secs_f64() * 1e6 / f64::from(n);
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                let shared = std::sync::Arc::clone(&table);
+                std::hint::black_box(&shared);
+            }
+            let shared = t.elapsed().as_secs_f64() * 1e6 / f64::from(n);
+            eprintln!("pass {pass}: {} KB of text, full copy {copied:.1} µs, shared handle {shared:.3} µs", text / 1024);
+        }
     }
 
     #[test]
