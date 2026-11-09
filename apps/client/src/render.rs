@@ -90,8 +90,10 @@ pub fn view_layering(eye: Vec3, bias: f32) -> Mat4 {
 type GraphNode = ((i32, i32, i32), u8, u16);
 /// Node for F3: walk node, face connectivity, geometry present.
 pub type OccNode = ((i32, i32, i32), u8, u16, rc_mesh::visibility::Vis, bool);
-/// With `RUSTCRAFT_OPT_REACHGRID`, the reached sections as a bit grid, made by the task.
-type GraphResult = (rc_mesh::visibility::Graph, Vec<(i32, i32, i32)>, f64, Option<lists::ReachGrid>);
+/// With `RUSTCRAFT_OPT_REACHGRID`, the reached sections as a bit grid, made by the task; with
+/// `RUSTCRAFT_OPT_MESH_REACHED_COLUMN_INDEX`, the run of each column, made by the task too.
+type GraphResult =
+    (rc_mesh::visibility::Graph, Vec<(i32, i32, i32)>, f64, Option<lists::ReachGrid>, Option<frustum::ReachedColumns>);
 
 /// Maximum radius (in columns) of the visibility walk; the columns present are already
 /// limited by the server's view distance.
@@ -521,6 +523,8 @@ pub struct Renderer {
     graph_rx: crossbeam_channel::Receiver<GraphResult>,
     /// Last walk result and its key (exact position, version of the columns, settings).
     reached: Vec<(i32, i32, i32)>,
+    /// Run of each column in `reached`, made with it (`frustum::ReachedColumns`).
+    reached_columns: Option<frustum::ReachedColumns>,
     /// Meshing view of the last frame drawn (`frustum::Renderer::sections_in_view`).
     meshing_view: Option<frustum::MeshingView>,
     /// Bumped each time a frame's meshing view differs from the previous one.
@@ -827,6 +831,7 @@ impl Renderer {
             graph_tx,
             graph_rx,
             reached: Vec::new(),
+            reached_columns: None,
             meshing_view: None,
             meshing_view_rev: 0,
             reached_key: None,

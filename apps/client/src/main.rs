@@ -424,6 +424,8 @@ struct App {
     in_flight: usize,
     /// What the last pick that held every dirty column saw (`app_meshing::HeldSignature`).
     all_held: Option<app_meshing::HeldSignature>,
+    /// Dirty columns the view can launch, the only ones the pick tests (`app_meshing::MeshCandidates`).
+    mesh_candidates: app_meshing::MeshCandidates,
     eye: [f64; 3],
     yaw: f32,
     pitch: f32,

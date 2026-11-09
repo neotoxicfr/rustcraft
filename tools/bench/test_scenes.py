@@ -276,6 +276,12 @@ class Drivers(unittest.TestCase):
         self.assertEqual(unread, [])
         self.assertEqual(set(scenes.SCENE_VARS) - set(self.reads), set())
 
+    def test_scene_variables_never_leak_into_other_scenes(self):
+        # A variable left exported after a manual run of one scene (the camera turned every frame by
+        # RUSTCRAFT_BENCH_TURN) would drive every other scene: each one is cleared or fixed at launch.
+        driven = {v for sc in scenes.SCENES.values() for v in sc.get("env", {})}
+        self.assertEqual(driven - set(scenes.SCENE_VARS) - set(scenes.FIXED_ENV), set())
+
     def test_menu_names_exist(self):
         with open(os.path.join(scenes.ROOT, "apps", "client", "src", "menus.rs"), encoding="utf-8") as f:
             text = f.read()

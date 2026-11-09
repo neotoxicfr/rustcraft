@@ -526,6 +526,9 @@ SCENES.update({
     # Movement and weather.
     # Rotation alone over the whole scene: a single regime in the window (walking is ocean-walk).
     "plains32-rotation": {"at": "plains", "rd": 32, "secs": 80, "from": 45, "cmd": cmd_of((100, "tag @s add perf_turn"))},
+    # The camera turned every frame by the client itself, as a steady mouse (90 degrees per second):
+    # the server's teleports above turn it 20 times a second, so per-frame view costs hide between.
+    "plains32-mouse-turn": {"at": "plains", "rd": 32, "secs": 80, "from": 45, "env": {"RUSTCRAFT_BENCH_TURN": "90"}},
     "ocean-walk": {"at": "ocean", **STANDARD, "cmd": cmd_of((100, "tag @s add perf_walk"))},
     "rain": {"at": "plains", **STANDARD, "cmd": cmd_of(RAIN)},
     "rain-forest": {"at": "forest", **STANDARD, "cmd": cmd_of(RAIN)},
@@ -741,7 +744,7 @@ SCENES.update({
 SCENE_GROUPS = {
     "reference": ["plains12", "plains32", "forest", "village", "nether", "ocean", "cave", "crowd", "redstone",
                   "crowd-1000", "dropped-items", "equipped-humanoids", "generation", "title", "tnt"],
-    "reference-extended": ["plains32-rotation", "flight", "flight-clouds128", "rain", "rain-forest", "rain-redstone",
+    "reference-extended": ["plains32-rotation", "plains32-mouse-turn", "flight", "flight-clouds128", "rain", "rain-forest", "rain-redstone",
                            "rain-flight", "fireworks", "particles-1000", "particles-4000", "particles-16000",
                            "mobs-keyframes", "name-tags", "glowing", "signs", "block-entities", "crowd-close-up", "pause",
                            "inventory", "pause-enchanted", "building", "vsync"],
@@ -1281,7 +1284,7 @@ SCENE_VARS = ("RUSTCRAFT_CMDTEST", "RUSTCRAFT_KEYTEST", "RUSTCRAFT_MENUTEST", "R
               "RUSTCRAFT_CREATIVETEST", "RUSTCRAFT_PARTICLES_BENCH", "RUSTCRAFT_THREADS",
               "RUSTCRAFT_AUTOSAVE_TICKS", "RUSTCRAFT_LAN_AUTH", "RUSTCRAFT_INVTEST", "RUSTCRAFT_INVCLICKS",
               "RUSTCRAFT_INVMOUSE", "RUSTCRAFT_BOOKTEST", "RUSTCRAFT_TABTEST", "RUSTCRAFT_DEBUGTEST",
-              "RUSTCRAFT_PACKSCREEN", "RUSTCRAFT_RELOADTEST")
+              "RUSTCRAFT_PACKSCREEN", "RUSTCRAFT_RELOADTEST", "RUSTCRAFT_BENCH_TURN")
 # Variables of every launch (with the folders of the launch, set in `launch_env`).
 FIXED_ENV = {
     "RUSTCRAFT_BACKGROUND": "1", "RUSTCRAFT_LAN_BIND": "127.0.0.1", "RUSTCRAFT_SOLO": "perf",
