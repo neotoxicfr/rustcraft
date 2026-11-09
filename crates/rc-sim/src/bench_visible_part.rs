@@ -43,6 +43,12 @@ fn tnt_box_at(at: [f64; 3]) -> rc_physics::Aabb {
     rc_physics::Aabb { min: [at[0] - 0.49, at[1], at[2] - 0.49], max: [at[0] + 0.49, at[1] + 0.98, at[2] + 0.49] }
 }
 
+/// A mob box `width` wide and `height` tall standing on `at`.
+fn mob_box_at(at: [f64; 3], width: f64, height: f64) -> rc_physics::Aabb {
+    let half = width / 2.0;
+    rc_physics::Aabb { min: [at[0] - half, at[1], at[2] - half], max: [at[0] + half, at[1] + height, at[2] + half] }
+}
+
 /// One timing of `f`, in microseconds per box.
 fn micros_per_box(boxes: usize, f: &mut dyn FnMut()) -> f64 {
     let rounds = (2000 / boxes).max(1);
@@ -54,30 +60,39 @@ fn micros_per_box(boxes: usize, f: &mut dyn FnMut()) -> f64 {
 }
 
 /// The paths the bench compares, and whether the boxes are weighed together: the former path,
-/// the cube per call with its cells, with its shape count, with both, then together with both,
-/// with equal boxes once, the defaults under several cube cost limits (0: no cube, 3: the
-/// default), then on 1 thread and powers of 2 up to `RUSTCRAFT_THREADS` or every
-/// logical core.
+/// the cube per call (always filled) with its cells, with its shape count, with both, the
+/// defaults per call without the cube per call and under several lone-box cost limits (2: the
+/// default), then together with both, with equal boxes once, the defaults on one thread under
+/// several cube cost limits (0: no cube, 3: the default), then on 1 thread and powers of 2 up
+/// to `RUSTCRAFT_THREADS` or every logical core.
 fn bench_configurations() -> Vec<(String, VisiblePartPaths, bool)> {
     let old = VisiblePartPaths::OLD;
-    let always_cube = VisiblePartPaths { cube_cost_limit: usize::MAX, ..old };
+    let always_cube = VisiblePartPaths { cube_cost_limit: usize::MAX, lone_box_cube_cost_limit: usize::MAX, ..old };
     let per_call = VisiblePartPaths { cube_per_call: true, ..always_cube };
     let cube_and_count = VisiblePartPaths { cell_cube: true, air_shortcut: true, ..always_cube };
+    let defaults = VisiblePartPaths::NEW;
+    let no_cube_per_call = VisiblePartPaths { cube_per_call: false, ..defaults };
     let mut configs = vec![
         ("former".to_owned(), old, false),
         ("cell cube per call".to_owned(), VisiblePartPaths { cell_cube: true, ..per_call }, false),
         ("air shortcut per call".to_owned(), VisiblePartPaths { air_shortcut: true, ..per_call }, false),
         ("cube and shortcut per call".to_owned(), VisiblePartPaths { cube_per_call: true, ..cube_and_count }, false),
+        ("defaults per call, no cube per call".to_owned(), no_cube_per_call, false),
+    ];
+    for limit in [1, 2, 3] {
+        let paths = VisiblePartPaths { lone_box_cube_cost_limit: limit, ..defaults };
+        configs.push((format!("defaults per call, lone-box cost limit {limit}"), paths, false));
+    }
+    configs.extend([
         ("cube and shortcut together".to_owned(), cube_and_count, true),
         ("same box once together".to_owned(), VisiblePartPaths { same_box_once: true, ..cube_and_count }, true),
-    ];
+    ]);
     for limit in [0, 2, 3, 4] {
-        let paths = VisiblePartPaths { cube_cost_limit: limit, ..VisiblePartPaths::NEW };
-        configs.push((format!("defaults, cube cost limit {limit}"), paths, true));
+        let paths = VisiblePartPaths { cube_cost_limit: limit, parallel: false, ..defaults };
+        configs.push((format!("defaults on one thread, cube cost limit {limit}"), paths, true));
     }
-    let cores = rc_data::env_str!("RUSTCRAFT_THREADS")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get));
+    configs.push(("defaults together".to_owned(), defaults, true));
+    let cores = crate::helper_pool::logical_cores();
     let mut threads = 1;
     while threads <= cores {
         let paths =
@@ -101,6 +116,9 @@ fn bench_visible_part() {
         .into_iter()
         .map(|n| (format!("{n}_boxes"), scattered_boxes(n)))
         .chain([("1_far_box".to_owned(), vec![tnt_box_at(far)])])
+        // Mobs weighed one by one: a zombie and a ghast 3 blocks from the centre, behind the walls.
+        .chain([("1_zombie_box".to_owned(), vec![mob_box_at([57.5, -60.0, 17.5], 0.6, 1.95)])])
+        .chain([("1_ghast_box".to_owned(), vec![mob_box_at([57.5, -60.0, 17.5], 4.0, 4.0)])])
         // Two boxes on the ground on either side of the centre: the cube grows as the square of
         // their distance, their sightlines only linearly.
         .chain([6.0, 10.0, 14.0, 20.0].map(|d| {
