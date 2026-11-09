@@ -1289,7 +1289,14 @@ was not measured.
 Found by a forced order (test-only pause between the two groups of sends, tiles off): the five
 region tests all fail with fingerprint 7b2ead28… (1,249 chunks); other pauses (batch start, before
 the batch marker, after the batch) change nothing. With every batch split the fingerprint is always
-7b2ead28…; the CI ones would be some batches split only (not reproduced one by one). World diff:
+7b2ead28…. The two CI fingerprints were then reproduced exactly (all 64 hex digits, 1,249 chunks,
+twice each) by splitting a single batch in the old order (new chunks sent, 50 ms pause, then the
+relights): the last overworld batch of the first site, paused before its first relight, gives
+fc9dbab0…; the last Nether batch, paused before its first relight, gives a786905b…. That ties the CI
+failures to this race; it does not rule out another one elsewhere (for example the proto-chunks
+sent at eviction), but no observed fingerprint is left unexplained. Over 18 combinations of split points in the last
+batches (first and third overworld sites, Nether), each gave its own fingerprint: no split gives
+a055ca74…, all three gives 7b2ead28…, 14 others were never seen in CI. World diff:
 only `BlockLight` /
 `SkyLight` of the relit neighbours of the last batch of each site (overworld (5, 5), (5, 6),
 (−7, 21); Nether (5, 5), (6, 5)). Not reproduced passively on today's main (two whole suites on 4

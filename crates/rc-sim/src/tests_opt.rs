@@ -539,8 +539,8 @@ fn all_regions_protos_per_batch_and_lazy() {
 /// Each batch reaches the server in two polls (the generation thread pauses 30 ms between the
 /// neighbours' new light and the new chunks): the regions are those of a batch taken in one poll.
 /// With the new chunks sent first, their neighbours' light came ticks later and overwrote what the
-/// server had changed there (fingerprint 7b2ead28…; the 4-core CI runners of PR #24 got fc9dbab0…
-/// and a786905b…).
+/// server had changed there (fingerprint 7b2ead28…; splitting only the first site's last batch, or
+/// only the Nether's, gives fc9dbab0… or a786905b…, what the 4-core CI runners of PR #24 got).
 #[test]
 fn all_regions_with_each_batch_taken_in_two_polls() {
     check_regions_with(900, 0, None, 30);

@@ -864,8 +864,12 @@ impl Worker {
         // the light the server had set there, so the saved world depended on thread timing (4-core
         // runners, loaded machines). Sent first, it is taken no later than the chunk that caused it.
         self.send_relights(relights);
+        // No sleep at all when the pause is zero: on Windows a zero sleep still yields the thread,
+        // which would make every test batch time differently from the game right at this point.
         #[cfg(test)]
-        std::thread::sleep(self.pause_between_light_and_chunks);
+        if !self.pause_between_light_and_chunks.is_zero() {
+            std::thread::sleep(self.pause_between_light_and_chunks);
+        }
         self.send_new_chunks(fulls);
         clock.lap(Phase::Sending);
         // (5) Modified proto-chunks to disk: at every batch (old path); otherwise on
