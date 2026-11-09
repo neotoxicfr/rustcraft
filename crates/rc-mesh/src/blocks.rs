@@ -855,6 +855,68 @@ fn zoom_corner_with(ax: i32, ay: i32, az: i32, mut offsets: impl FnMut(i32, i32,
     best.0
 }
 
+/// Lowest corner (quart) of the lattice cell whose 8 corners the zoom of the absolute block `w`
+/// chooses from.
+#[inline]
+fn zoom_cell((x, y, z): (i32, i32, i32)) -> [i32; 3] {
+    [x.wrapping_sub(2) >> 2, y.wrapping_sub(2) >> 2, z.wrapping_sub(2) >> 2]
+}
+
+/// Corner `corner` (bits x = 4, y = 2, z = 1) of the lattice cell whose lowest corner is `lowest`.
+#[inline]
+fn cell_corner(lowest: [i32; 3], corner: u8) -> [i32; 3] {
+    let bit = |mask: u8| i32::from(corner & mask != 0);
+    [lowest[0] + bit(4), lowest[1] + bit(2), lowest[2] + bit(1)]
+}
+
+/// Zoom corners of the four blocks of a lattice cell row (x fractions 0, 1/4, 1/2 and 3/4) whose
+/// y and z fractions are `fy` and `fz`, from the offsets of the cell's 8 corners. Lane by lane
+/// these are the operations of [`zoom_corner_with`] in the same order (its sum adds the z and y
+/// terms first too) with the same strict comparison in corner order, hence the same corners.
+/// The AVX2 body (four lanes in one register) only runs with `RUSTCRAFT_OPT_TINTSIMD4AVX2=1`: it
+/// cannot be inlined into its caller, and that call per row cost more than the wider lanes saved
+/// (`row_corners_bench`, docs/perf.md C2-M14).
+#[inline]
+#[allow(unsafe_code)]
+fn zoom_corners_of_row(fy: f64, fz: f64, offsets: &[[f64; 3]; 8]) -> [u8; 4] {
+    #[cfg(target_arch = "x86_64")]
+    if rc_data::opt_switch!("RUSTCRAFT_OPT_TINTSIMD4AVX2", default_off) && rc_data::cpu::has_avx2() {
+        // SAFETY: AVX2 has just been detected on this processor.
+        return unsafe { zoom_corners_avx2(fy, fz, offsets) };
+    }
+    zoom_corners_by_lanes(fy, fz, offsets)
+}
+
+/// [`zoom_corners_by_lanes`] compiled for AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+fn zoom_corners_avx2(fy: f64, fz: f64, offsets: &[[f64; 3]; 8]) -> [u8; 4] {
+    zoom_corners_by_lanes(fy, fz, offsets)
+}
+
+/// Body of [`zoom_corners_of_row`], compiled once per instruction set. The winning corner is kept
+/// in 64-bit lanes, the width of the distance comparison, so that both updates are plain selects.
+#[inline(always)]
+fn zoom_corners_by_lanes(fy: f64, fz: f64, offsets: &[[f64; 3]; 8]) -> [u8; 4] {
+    let fractions = if sabotage() == 9 { [0.0; 4] } else { [0.0, 0.25, 0.5, 0.75] };
+    let mut best = [f64::INFINITY; 4];
+    let mut corner = [0u64; 4];
+    for (k, &[ox, oy, oz]) in offsets.iter().enumerate() {
+        let dy = if k & 2 == 0 { fy } else { fy - 1.0 };
+        let dz = if k & 1 == 0 { fz } else { fz - 1.0 };
+        let yz = (dz + oz) * (dz + oz) + (dy + oy) * (dy + oy);
+        for lane in 0..4 {
+            let fx = fractions[lane];
+            let dx = if k & 4 == 0 { fx } else { fx - 1.0 };
+            let d = yz + (dx + ox) * (dx + ox);
+            let closer = best[lane] > d;
+            best[lane] = if closer { d } else { best[lane] };
+            corner[lane] = if closer { k as u64 } else { corner[lane] };
+        }
+    }
+    corner.map(|k| k as u8)
+}
+
 /// Pseudo-random offset (x, y, z) of the lattice point (cx, cy, cz): six LCG steps on the
 /// coordinates, then one step per axis; depends only on the seed and the point.
 #[inline]
@@ -880,16 +942,21 @@ fn corner_offsets(seed: i64, cx: i32, cy: i32, cz: i32) -> [f64; 3] {
 /// up to (2r + 1)² times, and the client's main thread re-reads the same blocks every frame
 /// (moving blocks, rain columns, biome probe). 8 192 entries of 24 bytes (≈ 196 KB) per thread.
 pub fn biome_zoom_cached(seed: i64, x: i32, y: i32, z: i32) -> (i32, i32, i32) {
+    let [qx, qy, qz] = cell_corner(zoom_cell((x, y, z)), cached_zoom_corner(seed, x, y, z));
+    (qx, qy, qz)
+}
+
+/// Corner of [`biome_zoom_cached`], through the same per-thread table.
+fn cached_zoom_corner(seed: i64, x: i32, y: i32, z: i32) -> u8 {
     const N: usize = 1 << 13;
     thread_local! {
         static CACHE: std::cell::RefCell<Vec<(i64, [i32; 3], u8)>> = const { std::cell::RefCell::new(Vec::new()) };
     }
-    let (ax, ay, az) = (x.wrapping_sub(2), y.wrapping_sub(2), z.wrapping_sub(2));
     let h = (x as u32).wrapping_mul(0x9e37_79b1)
         ^ (z as u32).wrapping_mul(0x85eb_ca77)
         ^ (y as u32).wrapping_mul(0xc2b2_ae3d);
     let slot = (h >> 19) as usize & (N - 1);
-    let corner = CACHE.with_borrow_mut(|c| {
+    CACHE.with_borrow_mut(|c| {
         if c.is_empty() {
             c.resize(N, (0, [i32::MIN; 3], 0));
         }
@@ -897,15 +964,10 @@ pub fn biome_zoom_cached(seed: i64, x: i32, y: i32, z: i32) -> (i32, i32, i32) {
         if e.0 == seed && e.1 == [x, y, z] {
             return e.2;
         }
-        let k = zoom_corner(seed, ax, ay, az);
+        let k = zoom_corner(seed, x.wrapping_sub(2), y.wrapping_sub(2), z.wrapping_sub(2));
         *e = (seed, [x, y, z], k);
         k
-    });
-    (
-        (ax >> 2) + i32::from(corner & 4 != 0),
-        (ay >> 2) + i32::from(corner & 2 != 0),
-        (az >> 2) + i32::from(corner & 1 != 0),
-    )
+    })
 }
 
 /// Biome (network identifier) of an absolute quart; ordinate bounded to the world height like
@@ -1046,6 +1108,19 @@ pub struct TintPaths {
     /// Sliding sums of a whole layer from its `sliding_sums`-th request; 0 = off
     /// (`RUSTCRAFT_OPT_TINTBOX`, a numeric value fixes the threshold).
     pub sliding_sums: u16,
+    /// A lattice cell whose 8 corner quarts share one biome gives that biome to its 64 blocks
+    /// without computing their zoom (`RUSTCRAFT_OPT_TINTCELLUNIFORM`).
+    pub uniform_cells: bool,
+    /// A grid miss fills the four blocks of its lattice cell row at once: same 8 corner offsets,
+    /// zoom corners compared side by side (`RUSTCRAFT_OPT_TINTSIMD4`).
+    pub four_block_rows: bool,
+    /// Zoom corners of single blocks outside uniform cells kept by the thread from one mesh to the
+    /// next (`RUSTCRAFT_OPT_TINTMEMOPERSIST=1`, off by default, 512 KiB per meshing thread). The
+    /// rows of four do not read it.
+    pub persistent_corner_memo: bool,
+    /// A section takes over the lattice and grid layers it shares with the section just below it
+    /// (`RUSTCRAFT_OPT_TINTSHAREDCOLUMN=1`, off by default).
+    pub shared_column_layers: bool,
 }
 
 impl TintPaths {
@@ -1055,11 +1130,25 @@ impl TintPaths {
         grid: true,
         column_index: true,
         sliding_sums: SLIDING_SUMS_FROM,
+        uniform_cells: true,
+        four_block_rows: true,
+        persistent_corner_memo: true,
+        shared_column_layers: true,
     };
-    pub const OLD: TintPaths =
-        TintPaths { single_biome_zone: false, lattice: false, grid: false, column_index: false, sliding_sums: 0 };
+    pub const OLD: TintPaths = TintPaths {
+        single_biome_zone: false,
+        lattice: false,
+        grid: false,
+        column_index: false,
+        sliding_sums: 0,
+        uniform_cells: false,
+        four_block_rows: false,
+        persistent_corner_memo: false,
+        shared_column_layers: false,
+    };
 
-    /// Paths chosen by the environment (all active by default).
+    /// Paths chosen by the environment: all active by default except the persistent memo (it lost
+    /// at the micro-bench) and the shared layers (neutral there), both kept for the scene bench.
     pub fn from_env() -> Self {
         static P: std::sync::OnceLock<TintPaths> = std::sync::OnceLock::new();
         *P.get_or_init(|| {
@@ -1071,6 +1160,10 @@ impl TintPaths {
                 column_index: on(rc_data::env_os!("RUSTCRAFT_OPT_TINTIDX")),
                 sliding_sums: rc_data::env_str!("RUSTCRAFT_OPT_TINTBOX")
                     .map_or(SLIDING_SUMS_FROM, |v| v.parse().unwrap_or(SLIDING_SUMS_FROM)),
+                uniform_cells: rc_data::opt_switch!("RUSTCRAFT_OPT_TINTCELLUNIFORM"),
+                four_block_rows: rc_data::opt_switch!("RUSTCRAFT_OPT_TINTSIMD4"),
+                persistent_corner_memo: rc_data::opt_switch!("RUSTCRAFT_OPT_TINTMEMOPERSIST", default_off),
+                shared_column_layers: rc_data::opt_switch!("RUSTCRAFT_OPT_TINTSHAREDCOLUMN", default_off),
             }
         })
     }
@@ -1085,6 +1178,62 @@ const LATTICE_POINTS: usize = (LATTICE_SIDE * LATTICE_LAYERS * LATTICE_SIDE) as 
 const WINDOW_SIDE: usize = 32;
 const SECTION_LAYERS: usize = 18;
 const UNSET: u32 = u32::MAX;
+/// Lattice cell whose corners hold more than one biome (its blocks need the zoom). A biome that
+/// happened to have this number would only lose the shortcut, never get a wrong colour.
+const MIXED_CELL: u32 = u32::MAX - 1;
+
+/// Zoom requests of the mesh tints on one thread, by outcome (micro-bench hit rates).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TintCounters {
+    /// Blocks whose zoomed biome was asked for (grid misses, and blocks outside the grid).
+    pub zoomed_blocks: u64,
+    /// Of those, the blocks answered by a single-biome lattice cell.
+    pub uniform_cell_hits: u64,
+    /// Of those, the blocks whose zoom corner came from the persistent memo.
+    pub corner_memo_hits: u64,
+}
+
+/// Slots of the persistent corner memo (16 bytes each: 512 KiB per meshing thread).
+const CORNER_MEMO_SLOTS: usize = 1 << 15;
+/// Corner of an empty slot (real corners are 0 to 7).
+const NO_CORNER: u8 = u8::MAX;
+
+/// One block's zoom corner in the persistent memo.
+#[derive(Clone, Copy)]
+struct CornerEntry {
+    block: [i32; 3],
+    corner: u8,
+}
+
+/// Zoom corners of blocks kept by a meshing thread from one mesh to the next: a corner only
+/// depends on the seed and the block, so the table stays right as long as the seed does and is
+/// emptied when it changes (another world or dimension). Direct-mapped, an entry overwritten on a
+/// collision.
+#[derive(Default)]
+struct CornerMemo {
+    seed: i64,
+    entries: Vec<CornerEntry>,
+}
+
+impl CornerMemo {
+    /// Ready for a mesh with the zoom seed `seed`.
+    fn prepare(&mut self, seed: i64) {
+        let empty = CornerEntry { block: [0; 3], corner: NO_CORNER };
+        if self.entries.is_empty() {
+            self.entries = vec![empty; CORNER_MEMO_SLOTS];
+        } else if self.seed != seed && sabotage() != 7 {
+            self.entries.fill(empty);
+        }
+        self.seed = seed;
+    }
+
+    #[inline]
+    fn slot(block: [i32; 3]) -> usize {
+        let [x, y, z] = block.map(|v| v as u32);
+        let h = x.wrapping_mul(0x9e37_79b1) ^ z.wrapping_mul(0x85eb_ca77) ^ y.wrapping_mul(0xc2b2_ae3d);
+        (h >> (32 - CORNER_MEMO_SLOTS.trailing_zeros())) as usize
+    }
+}
 
 /// Tint buffers, kept by the thread (`Scratch`), reset per section.
 #[derive(Default)]
@@ -1110,11 +1259,27 @@ struct TintBufs {
     sliding_colors: Vec<u32>,
     sliding_layers_done: u128,
     sliding_requests: Vec<u16>,
+    /// Per lattice cell, indexed by its lowest corner like the lattice memos: the biome its 8
+    /// corners share, `MIXED_CELL`, or `UNSET` if not looked at yet.
+    cell_biomes: Vec<u32>,
+    cell_biomes_used: bool,
+    /// Bottom of the section prepared just before by the same mesh (`None` at the start of a mesh).
+    previous_base: Option<i32>,
+    corner_memo: CornerMemo,
+    counters: TintCounters,
+    /// Requests of the meshes made inside [`record_tint_requests`] (micro-bench replay).
+    recorded_requests: Option<Vec<[i32; 4]>>,
 }
+
+/// Kind of a recorded request that starts a section (`[SECTION_REQUEST, base, 0, 0]`); the
+/// colour requests are `[kind, x, y, z]`.
+const SECTION_REQUEST: i32 = -1;
 
 // Test sabotages: 1 grid window shifted by one block, 2 y outside the section not folded,
 // 3 sliding-sum window shifted by one block, 4 single-biome zone without excluding the
-// swamp, 5 lattice offset memo not reset between sections.
+// swamp, 5 lattice offset memo not reset between sections, 6 uniform cell checked on 7 corners,
+// 7 persistent corner memo kept across seeds, 8 shared grid layers taken one layer too low,
+// 9 every lane of a four-block row given the x fraction of the first block.
 #[cfg(test)]
 thread_local! {
     static SABOTAGE: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
@@ -1148,11 +1313,59 @@ fn lanes(c: u32) -> u64 {
     u64::from((c >> 16) & 0xff) << 42 | u64::from((c >> 8) & 0xff) << 21 | u64::from(c & 0xff)
 }
 
+/// Empties a memo per lattice point for a new section. Its `kept` lowest layers come from the
+/// layers `shift..` of the section below (same quarts, so the same values); `used` tells whether
+/// the memo holds anything.
+fn renew_lattice_memo<T: Copy>(memo: &mut [T], used: &mut bool, empty: T, shift: i32, kept: i32) {
+    const LAYER: usize = (LATTICE_SIDE * LATTICE_SIDE) as usize;
+    if !*used {
+        return;
+    }
+    if kept > 0 {
+        let (from, kept) = (shift as usize * LAYER, kept as usize * LAYER);
+        memo.copy_within(from..from + kept, 0);
+        memo[kept..].fill(empty);
+    } else {
+        memo.fill(empty);
+        *used = false;
+    }
+}
+
+/// Empties the grid of zoomed biomes for a new section. When the section below was the last one
+/// prepared, its two top layers (blocks 15 and 16 above its bottom) are this section's layers 0
+/// and 1: they are moved down instead of being zoomed again.
+fn renew_grid(s: &mut TintBufs, below: bool) {
+    const LAYER: usize = WINDOW_SIDE * WINDOW_SIDE;
+    let mut stale = s.grid_layers_used;
+    let mut kept = 0;
+    if below {
+        let from = if sabotage() == 8 { 15 } else { SECTION_LAYERS - 2 };
+        kept = (stale >> from) & 0b11;
+        // The mesher rarely asks for the border layers: most of the time there is nothing to move.
+        if kept != 0 {
+            s.grid.copy_within(from * LAYER..(from + 2) * LAYER, 0);
+            // Layers 0 and 1 have just been overwritten.
+            stale &= !0b11;
+        }
+    }
+    while stale != 0 {
+        let l = stale.trailing_zeros() as usize;
+        s.grid[l * LAYER..(l + 1) * LAYER].fill(UNSET);
+        stale &= stale - 1;
+    }
+    s.grid_layers_used = kept;
+}
+
 impl<'a> Tint<'a> {
     fn new(job: &'a MeshJob, palette: &'a BiomePalette, paths: TintPaths, on: bool, mut bufs: TintBufs) -> Self {
         if bufs.swamp_used {
             bufs.swamp.fill(UNSET);
             bufs.swamp_used = false;
+        }
+        // The memos of the last section of the previous mesh belong to another column.
+        bufs.previous_base = None;
+        if paths.persistent_corner_memo {
+            bufs.corner_memo.prepare(job.biome_zoom_seed);
         }
         Tint { job, palette, paths, rad: job.opts.blend.clamp(0, 7), on, bufs: bufs.into() }
     }
@@ -1161,15 +1374,64 @@ impl<'a> Tint<'a> {
         self.bufs.into_inner()
     }
 
-    /// Start of the section whose bottom is at `base` (relative y): memos reset.
+    /// Start of the section whose bottom is at `base` (relative y): memos reset, except the layers
+    /// shared with the section just below when this mesh prepared it last.
     fn section(&self, base: i32) {
         if !self.on {
             return;
         }
         let s = &mut *self.bufs.borrow_mut();
-        let (p, j, r) = (self.paths, self.job, self.rad);
+        if let Some(log) = &mut s.recorded_requests {
+            log.push([SECTION_REQUEST, base, 0, 0]);
+        }
+        let p = self.paths;
+        let below = p.shared_column_layers && s.previous_base == Some(base - 16);
+        let (old_origin_y, old_size) = (s.lattice_origin[1], s.lattice_size);
+        s.previous_base = Some(base);
         s.base = base;
         s.single_biome = None;
+        self.place_lattice(s, base);
+        // Lattice layers (quarts) of the new zone already filled for the section below.
+        let shift = s.lattice_origin[1] - old_origin_y;
+        let shared = below && old_size == s.lattice_size && s.lattice_size[0] != 0;
+        let kept = if shared { (s.lattice_size[1] - shift).max(0) } else { 0 };
+        if p.lattice && s.lattice_offsets.len() != LATTICE_POINTS {
+            s.lattice_offsets = vec![[f64::NAN; 3]; LATTICE_POINTS];
+        } else if sabotage() != 5 {
+            let used = &mut s.lattice_offsets_used;
+            renew_lattice_memo(&mut s.lattice_offsets, used, [f64::NAN; 3], shift, kept);
+        }
+        if p.column_index && s.quart_biomes.len() != LATTICE_POINTS {
+            s.quart_biomes = vec![UNSET; LATTICE_POINTS];
+        } else {
+            renew_lattice_memo(&mut s.quart_biomes, &mut s.quart_biomes_used, UNSET, shift, kept);
+        }
+        if p.uniform_cells && s.cell_biomes.len() != LATTICE_POINTS {
+            s.cell_biomes = vec![UNSET; LATTICE_POINTS];
+        } else {
+            renew_lattice_memo(&mut s.cell_biomes, &mut s.cell_biomes_used, UNSET, shift, kept);
+        }
+        if p.grid {
+            if s.grid.len() != SECTION_LAYERS * WINDOW_SIDE * WINDOW_SIDE {
+                s.grid = vec![UNSET; SECTION_LAYERS * WINDOW_SIDE * WINDOW_SIDE];
+                s.swamp = vec![UNSET; WINDOW_SIDE * WINDOW_SIDE];
+            }
+            renew_grid(s, below);
+        }
+        if p.sliding_sums > 0 {
+            if s.sliding_colors.len() != 4 * SECTION_LAYERS * 324 {
+                s.sliding_colors = vec![0; 4 * SECTION_LAYERS * 324];
+                s.sliding_requests = vec![0; 4 * SECTION_LAYERS];
+            }
+            s.sliding_layers_done = 0;
+            s.sliding_requests.fill(0);
+        }
+    }
+
+    /// Origin and size (quarts) of the lattice zone that the zooms of the section's window can
+    /// reach; size 0 when it exceeds the memo bounds.
+    fn place_lattice(&self, s: &mut TintBufs, base: i32) {
+        let (j, r) = (self.job, self.rad);
         let lo = |a: i32| a.wrapping_sub(2) >> 2;
         let (wx, wz, wy) = (j.center.x * 16, j.center.z * 16, j.min_y + base);
         let origin = [lo(wx - 1 - r), lo(wy - 1), lo(wz - 1 - r)];
@@ -1179,37 +1441,6 @@ impl<'a> Tint<'a> {
         let [size_x, size_y, size_z] = s.lattice_size;
         if size_x > LATTICE_SIDE || size_y > LATTICE_LAYERS || size_z > LATTICE_SIDE {
             s.lattice_size = [0; 3];
-        }
-        if p.lattice && s.lattice_offsets.len() != LATTICE_POINTS {
-            s.lattice_offsets = vec![[f64::NAN; 3]; LATTICE_POINTS];
-        } else if s.lattice_offsets_used && sabotage() != 5 {
-            s.lattice_offsets.fill([f64::NAN; 3]);
-        }
-        s.lattice_offsets_used = false;
-        if p.column_index && s.quart_biomes.len() != LATTICE_POINTS {
-            s.quart_biomes = vec![UNSET; LATTICE_POINTS];
-        } else if s.quart_biomes_used {
-            s.quart_biomes.fill(UNSET);
-        }
-        s.quart_biomes_used = false;
-        if p.grid {
-            if s.grid.len() != SECTION_LAYERS * WINDOW_SIDE * WINDOW_SIDE {
-                s.grid = vec![UNSET; SECTION_LAYERS * WINDOW_SIDE * WINDOW_SIDE];
-                s.swamp = vec![UNSET; WINDOW_SIDE * WINDOW_SIDE];
-            }
-            while s.grid_layers_used != 0 {
-                let l = s.grid_layers_used.trailing_zeros() as usize;
-                s.grid[l * WINDOW_SIDE * WINDOW_SIDE..(l + 1) * WINDOW_SIDE * WINDOW_SIDE].fill(UNSET);
-                s.grid_layers_used &= s.grid_layers_used - 1;
-            }
-        }
-        if p.sliding_sums > 0 {
-            if s.sliding_colors.len() != 4 * SECTION_LAYERS * 324 {
-                s.sliding_colors = vec![0; 4 * SECTION_LAYERS * 324];
-                s.sliding_requests = vec![0; 4 * SECTION_LAYERS];
-            }
-            s.sliding_layers_done = 0;
-            s.sliding_requests.fill(0);
         }
     }
 
@@ -1237,27 +1468,86 @@ impl<'a> Tint<'a> {
         s.quart_biomes[i]
     }
 
-    /// Zoomed biome of the absolute block (wx, wy, wz).
-    fn zoomed(&self, s: &mut TintBufs, (wx, wy, wz): (i32, i32, i32)) -> u32 {
+    /// Offsets of lattice point `p`: memorised for the section (lattice path) or computed.
+    #[inline]
+    fn corner_offset(&self, s: &mut TintBufs, p: [i32; 3]) -> [f64; 3] {
         let seed = self.job.biome_zoom_seed;
-        let q = if self.paths.lattice {
-            let (ax, ay, az) = (wx.wrapping_sub(2), wy.wrapping_sub(2), wz.wrapping_sub(2));
-            let k = zoom_corner_with(ax, ay, az, |cx, cy, cz| match Self::lattice_index(s, [cx, cy, cz]) {
-                Some(i) => {
-                    if s.lattice_offsets[i][0].is_nan() {
-                        s.lattice_offsets[i] = corner_offsets(seed, cx, cy, cz);
-                        s.lattice_offsets_used = true;
-                    }
-                    s.lattice_offsets[i]
-                }
-                None => corner_offsets(seed, cx, cy, cz),
-            });
-            [(ax >> 2) + i32::from(k & 4 != 0), (ay >> 2) + i32::from(k & 2 != 0), (az >> 2) + i32::from(k & 1 != 0)]
+        if !self.paths.lattice {
+            return corner_offsets(seed, p[0], p[1], p[2]);
+        }
+        let Some(i) = Self::lattice_index(s, p) else { return corner_offsets(seed, p[0], p[1], p[2]) };
+        if s.lattice_offsets[i][0].is_nan() {
+            s.lattice_offsets[i] = corner_offsets(seed, p[0], p[1], p[2]);
+            s.lattice_offsets_used = true;
+        }
+        s.lattice_offsets[i]
+    }
+
+    /// Zoom corner of the absolute block `w`.
+    fn zoom_corner_of(&self, s: &mut TintBufs, (wx, wy, wz): (i32, i32, i32)) -> u8 {
+        if !self.paths.lattice {
+            return cached_zoom_corner(self.job.biome_zoom_seed, wx, wy, wz);
+        }
+        let (ax, ay, az) = (wx.wrapping_sub(2), wy.wrapping_sub(2), wz.wrapping_sub(2));
+        zoom_corner_with(ax, ay, az, |cx, cy, cz| self.corner_offset(s, [cx, cy, cz]))
+    }
+
+    /// Zoom corner of the absolute block `w`, read from the thread's persistent memo when a
+    /// previous mesh already computed it.
+    fn remembered_zoom_corner(&self, s: &mut TintBufs, w: (i32, i32, i32)) -> u8 {
+        let block = [w.0, w.1, w.2];
+        let slot = CornerMemo::slot(block);
+        let entry = s.corner_memo.entries[slot];
+        if entry.corner != NO_CORNER && entry.block == block {
+            s.counters.corner_memo_hits += 1;
+            return entry.corner;
+        }
+        let corner = self.zoom_corner_of(s, w);
+        s.corner_memo.entries[slot] = CornerEntry { block, corner };
+        corner
+    }
+
+    /// Zoomed biome of the absolute block `w`.
+    fn zoomed(&self, s: &mut TintBufs, w: (i32, i32, i32)) -> u32 {
+        s.counters.zoomed_blocks += 1;
+        if self.paths.uniform_cells
+            && let Some(b) = self.uniform_cell_biome(s, w)
+        {
+            s.counters.uniform_cell_hits += 1;
+            return b;
+        }
+        let corner = if self.paths.persistent_corner_memo {
+            self.remembered_zoom_corner(s, w)
         } else {
-            let (x, y, z) = biome_zoom_cached(seed, wx, wy, wz);
-            [x, y, z]
+            self.zoom_corner_of(s, w)
         };
-        self.quart_biome(s, q)
+        self.quart_biome(s, cell_corner(zoom_cell(w), corner))
+    }
+
+    /// Biome shared by the 8 corners of the lattice cell serving the absolute block `w`: the zoom
+    /// always picks one of those corners, so when they agree no zoom is needed for any of the
+    /// cell's 64 blocks. `None` for a mixed cell or a cell outside the section's zone.
+    fn uniform_cell_biome(&self, s: &mut TintBufs, w: (i32, i32, i32)) -> Option<u32> {
+        let lowest = zoom_cell(w);
+        let i = Self::lattice_index(s, lowest)?;
+        if s.cell_biomes[i] == UNSET {
+            s.cell_biomes[i] = self.cell_corners_biome(s, lowest);
+            s.cell_biomes_used = true;
+        }
+        Some(s.cell_biomes[i]).filter(|&b| b != MIXED_CELL)
+    }
+
+    /// Biome of the 8 corners of the lattice cell whose lowest corner is `lowest` when they all
+    /// agree, `MIXED_CELL` otherwise.
+    fn cell_corners_biome(&self, s: &mut TintBufs, lowest: [i32; 3]) -> u32 {
+        let first = self.quart_biome(s, lowest);
+        let corners = if sabotage() == 6 { 1..7 } else { 1..8 };
+        for corner in corners {
+            if self.quart_biome(s, cell_corner(lowest, corner)) != first {
+                return MIXED_CELL;
+            }
+        }
+        first
     }
 
     /// Zoomed biome of the block (relative x, layer `ly` of the section, relative z).
@@ -1271,8 +1561,12 @@ impl<'a> Tint<'a> {
             if (0..gw).contains(&gx) && (0..gw).contains(&gz) {
                 let i = (ly as usize * WINDOW_SIDE + gz as usize) * WINDOW_SIDE + gx as usize;
                 if s.grid[i] == UNSET {
-                    let w = at(s, if sabotage() == 1 { x + 1 } else { x });
-                    s.grid[i] = self.zoomed(s, w);
+                    if self.paths.four_block_rows {
+                        self.fill_grid_row(s, x, ly, z);
+                    } else {
+                        let w = at(s, if sabotage() == 1 { x + 1 } else { x });
+                        s.grid[i] = self.zoomed(s, w);
+                    }
                     s.grid_layers_used |= 1 << ly;
                 }
                 return s.grid[i];
@@ -1280,6 +1574,43 @@ impl<'a> Tint<'a> {
         }
         let w = at(s, x);
         self.zoomed(s, w)
+    }
+
+    /// Fills the grid entries of the four blocks sharing the lattice cell row of the relative
+    /// block (x, ly, z): same y, same z and same lattice x, so their zooms read the same 8 corner
+    /// offsets and only the x fraction differs. Blocks of the row outside the window are left out.
+    fn fill_grid_row(&self, s: &mut TintBufs, x: i32, ly: i32, z: i32) {
+        let (j, r) = (self.job, self.rad);
+        let (wx, wy, wz) = (j.center.x * 16 + x, j.min_y + s.base - 1 + ly, j.center.z * 16 + z);
+        // Relative x of the row's first block (x fraction 0).
+        let first = x - (wx.wrapping_sub(2) & 3);
+        let row = (wx - (x - first), wy, wz);
+        s.counters.zoomed_blocks += 4;
+        let uniform = if self.paths.uniform_cells { self.uniform_cell_biome(s, row) } else { None };
+        let biomes = match uniform {
+            Some(b) => {
+                s.counters.uniform_cell_hits += 4;
+                [b; 4]
+            }
+            None => self.zoomed_row(s, row),
+        };
+        let gz = (z + 1 + r) as usize;
+        for (lane, b) in biomes.into_iter().enumerate() {
+            let gx = first + lane as i32 + 1 + r;
+            if (0..18 + 2 * r).contains(&gx) {
+                s.grid[(ly as usize * WINDOW_SIDE + gz) * WINDOW_SIDE + gx as usize] = b;
+            }
+        }
+    }
+
+    /// Zoomed biomes of the four blocks of the lattice cell row that starts at the absolute block
+    /// `first` (x fraction 0).
+    fn zoomed_row(&self, s: &mut TintBufs, first: (i32, i32, i32)) -> [u32; 4] {
+        let lowest = zoom_cell(first);
+        let offsets: [[f64; 3]; 8] = std::array::from_fn(|k| self.corner_offset(s, cell_corner(lowest, k as u8)));
+        let fraction = |a: i32| f64::from(a.wrapping_sub(2) & 3) / 4.0;
+        let corners = zoom_corners_of_row(fraction(first.1), fraction(first.2), &offsets);
+        corners.map(|k| self.quart_biome(s, cell_corner(lowest, k)))
     }
 
     /// Palette colour of biome `b` for kind `kind` at relative block (x, z).
@@ -1364,6 +1695,9 @@ impl<'a> Tint<'a> {
             return blended(self.job, self.palette, kind, x, y, z);
         }
         let s = &mut *self.bufs.borrow_mut();
+        if let Some(log) = &mut s.recorded_requests {
+            log.push([kind as i32, x, y, z]);
+        }
         let mut ly = y - s.base + 1;
         if sabotage() == 2 {
             ly = ly.clamp(0, SECTION_LAYERS as i32 - 1);
@@ -1424,8 +1758,9 @@ impl<'a> Tint<'a> {
 
 /// Check: [`Tint`] with each of the `paths` equals the direct computation without cache for each
 /// section, all kinds, layers `ystep` by `ystep` of the section and its border starting
-/// one block beyond (fallback), x and z from −2 to 17, requests in a shuffled order. The buffers of the
-/// first path are taken back from the thread (reset from one call to the next proven). Returns the
+/// one block beyond (fallback) plus its two bottom and two top layers, x and z from −2 to 17,
+/// requests in a shuffled order. The buffers of the first path, its persistent corner memo
+/// included, are taken back from the thread (reset from one call to the next proven). Returns the
 /// first difference found.
 #[doc(hidden)]
 pub fn tint_matches_reference(job: &MeshJob, palette: &BiomePalette, paths: &[TintPaths], ystep: usize) -> Option<String> {
@@ -1433,10 +1768,18 @@ pub fn tint_matches_reference(job: &MeshJob, palette: &BiomePalette, paths: &[Ti
     let tints: Vec<Tint> =
         paths.iter().map(|&p| Tint::new(job, palette, p, true, first.take().unwrap_or_default())).collect();
     let mut bad = None;
-    'all: for si in 0..job.center.sections.len() as i32 {
+    // Upper half of the sections first, then the lower half: sections in a row (shared layers
+    // taken over), a jump down (nothing taken over), and a next call that starts right above the
+    // last section of this one (nothing taken over from another mesh).
+    let n = job.center.sections.len() as i32;
+    'all: for si in (n / 2..n).chain(0..n / 2) {
         let base = si * 16;
         tints.iter().for_each(|t| t.section(base));
-        let ys: Vec<i32> = (base - 2..=base + 17).step_by(ystep.max(1)).collect();
+        // Layers every `ystep`, plus the two bottom and two top layers (shared with the neighbours).
+        let mut ys: Vec<i32> = (base - 2..=base + 17).step_by(ystep.max(1)).collect();
+        ys.extend([base - 1, base, base + 15, base + 16]);
+        ys.sort_unstable();
+        ys.dedup();
         let total = 4 * ys.len() * 20 * 20;
         let stride = [7919usize, 7907, 7901].into_iter().find(|&p| !total.is_multiple_of(p)).unwrap_or(1);
         for i in 0..total {
@@ -1460,6 +1803,40 @@ pub fn tint_matches_reference(job: &MeshJob, palette: &BiomePalette, paths: &[Ti
         SCRATCH.with_borrow_mut(|s| s.tint = bufs);
     }
     bad
+}
+
+/// Zoom counters of the meshes made by this thread since the previous call (micro-bench).
+#[doc(hidden)]
+pub fn take_tint_counters() -> TintCounters {
+    SCRATCH.with_borrow_mut(|s| std::mem::take(&mut s.tint.counters))
+}
+
+/// Runs `f` (meshes on this thread) and returns the tint requests those meshes made, in order:
+/// the micro-bench replays them to time the tint paths without the rest of the meshing.
+#[doc(hidden)]
+pub fn record_tint_requests<R>(f: impl FnOnce() -> R) -> (R, Vec<[i32; 4]>) {
+    SCRATCH.with_borrow_mut(|s| s.tint.recorded_requests = Some(Vec::new()));
+    let r = f();
+    (r, SCRATCH.with_borrow_mut(|s| s.tint.recorded_requests.take()).unwrap_or_default())
+}
+
+/// Replays requests recorded by [`record_tint_requests`] for `job` with the tint paths `paths`,
+/// on this thread's buffers like a mesh; returns a checksum of the colours.
+#[doc(hidden)]
+pub fn replay_tint_requests(job: &MeshJob, palette: &BiomePalette, paths: TintPaths, requests: &[[i32; 4]]) -> u64 {
+    let bufs = SCRATCH.with_borrow_mut(|s| std::mem::take(&mut s.tint));
+    let tint = Tint::new(job, palette, paths, true, bufs);
+    let mut sum = 0u64;
+    for &[kind, x, y, z] in requests {
+        if kind == SECTION_REQUEST {
+            tint.section(x);
+        } else {
+            sum = sum.wrapping_mul(0x100_0000_01b3) ^ u64::from(tint.get(kind as usize, x, y, z));
+        }
+    }
+    let bufs = tint.into_bufs();
+    SCRATCH.with_borrow_mut(|s| s.tint = bufs);
+    sum
 }
 
 /// Random offset of a block's model (plants, bamboo…), like the game: seed of the
@@ -2593,7 +2970,8 @@ mod biome_tests {
     }
 
     /// Test tasks: mixed biomes (north column absent, west column swamp), a single
-    /// biome everywhere, swamp everywhere; centre at (2, −1) for negative coordinates.
+    /// biome everywhere, swamp everywhere, isolated quarts of another biome (so that some lattice
+    /// cells differ by one corner only); centre at (2, −1) for negative coordinates.
     fn tint_jobs() -> Vec<(&'static str, MeshJob)> {
         let pick = |qx: i32, qy: i32, qz: i32| match (qx.div_euclid(3) + qz.div_euclid(2) + qy.div_euclid(5)).rem_euclid(5) {
             4 => 9,
@@ -2614,10 +2992,13 @@ mod biome_tests {
         });
         let uniform = make(&|x, z| Some(mixed(x, z, &|_, _, _| 1)));
         let swamp = make(&|x, z| Some(mixed(x, z, &|_, _, _| 2)));
-        vec![("mixed", mixed_job), ("one biome", uniform), ("swamp", swamp)]
+        let speckle = |qx: i32, qy: i32, qz: i32| u32::from((qx * 7 + qy * 13 + qz * 5) % 17 == 0) * 3;
+        let speckled = make(&|x, z| Some(mixed(x, z, &speckle)));
+        vec![("mixed", mixed_job), ("one biome", uniform), ("swamp", swamp), ("speckled", speckled)]
     }
 
-    /// Paths proven: all, none, each alone, all except one, sliding sums from the 1st request.
+    /// Paths proven: all, none, each alone, all except one, sliding sums from the 1st request,
+    /// the paths before the uniform cells, rows, persistent memo and shared layers.
     fn tint_variants() -> Vec<TintPaths> {
         let (all, old) = (TintPaths::ALL, TintPaths::OLD);
         let mut v = vec![all, old, TintPaths { sliding_sums: 1, ..all }, TintPaths { sliding_sums: 1, ..old }];
@@ -2626,11 +3007,26 @@ mod biome_tests {
             TintPaths { lattice: true, ..old },
             TintPaths { grid: true, ..old },
             TintPaths { column_index: true, ..old },
+            TintPaths { uniform_cells: true, ..old },
+            TintPaths { grid: true, four_block_rows: true, ..old },
+            TintPaths { persistent_corner_memo: true, ..old },
+            TintPaths { grid: true, shared_column_layers: true, ..old },
             TintPaths { single_biome_zone: false, ..all },
             TintPaths { lattice: false, ..all },
             TintPaths { grid: false, ..all },
             TintPaths { column_index: false, ..all },
             TintPaths { sliding_sums: 0, ..all },
+            TintPaths { uniform_cells: false, ..all },
+            TintPaths { four_block_rows: false, ..all },
+            TintPaths { persistent_corner_memo: false, ..all },
+            TintPaths { shared_column_layers: false, ..all },
+            TintPaths {
+                uniform_cells: false,
+                four_block_rows: false,
+                persistent_corner_memo: false,
+                shared_column_layers: false,
+                ..all
+            },
         ]);
         v
     }
@@ -2661,14 +3057,143 @@ mod biome_tests {
         let lattice = TintPaths { lattice: true, ..TintPaths::OLD };
         let (_, mut swamp) = tint_jobs().swap_remove(2);
         swamp.opts.blend = 2;
-        for (mode, paths, j) in
-            [(1, grid, &job), (2, TintPaths::ALL, &job), (3, boxes, &job), (4, TintPaths::ALL, &swamp), (5, lattice, &job)]
-        {
+        let (_, mut speckled) = tint_jobs().swap_remove(3);
+        speckled.opts.blend = 2;
+        let cells = TintPaths { uniform_cells: true, ..TintPaths::OLD };
+        let shared = TintPaths { grid: true, shared_column_layers: true, ..TintPaths::OLD };
+        let rows = TintPaths { grid: true, four_block_rows: true, ..TintPaths::OLD };
+        for (mode, paths, j) in [
+            (1, grid, &job),
+            (2, TintPaths::ALL, &job),
+            (3, boxes, &job),
+            (4, TintPaths::ALL, &swamp),
+            (5, lattice, &job),
+            (6, cells, &speckled),
+            (8, shared, &speckled),
+            (9, rows, &job),
+        ] {
             assert_eq!(tint_matches_reference(j, &palette, &[paths], 5), None, "without sabotage {mode}");
             SABOTAGE.set(mode);
             let r = tint_matches_reference(j, &palette, &[paths], 5);
             SABOTAGE.set(0);
             assert!(r.is_some(), "sabotage {mode} not seen");
+        }
+        // 7: the persistent memo of a previous mesh with another seed.
+        let memo = TintPaths { persistent_corner_memo: true, ..TintPaths::OLD };
+        let mut other_seed = tint_jobs().swap_remove(0).1;
+        other_seed.opts.blend = 2;
+        other_seed.biome_zoom_seed = SEED ^ 0x5_deec_e66d;
+        for sabotaged in [false, true] {
+            assert_eq!(tint_matches_reference(&job, &palette, &[memo], 5), None, "first mesh");
+            SABOTAGE.set(if sabotaged { 7 } else { 0 });
+            let second = tint_matches_reference(&other_seed, &palette, &[memo], 5);
+            SABOTAGE.set(0);
+            assert_eq!(second.is_some(), sabotaged, "second mesh, sabotage 7: {sabotaged}");
+        }
+    }
+
+    /// Meshes in a row on one thread keep their buffers (persistent corner memo, previous
+    /// section): each mesh, with the same seed or another one, still gets the direct colours.
+    #[test]
+    fn tint_successive_meshes_match_reference() {
+        let palette = test_palette();
+        for (name, mut job) in tint_jobs() {
+            job.opts.blend = 2;
+            let mut other_seed = tint_jobs().into_iter().find(|j| j.0 == name).expect("same job").1;
+            other_seed.opts.blend = 2;
+            other_seed.biome_zoom_seed = SEED ^ 0x5_deec_e66d;
+            for (k, j) in [&job, &job, &other_seed, &job].into_iter().enumerate() {
+                if let Some(e) = tint_matches_reference(j, &palette, &[TintPaths::ALL], 5) {
+                    panic!("{name}, mesh {k}: {e}");
+                }
+            }
+        }
+    }
+
+    /// Interleaved timing of the row corners, same process and inputs: generic body inlined
+    /// (SSE2), AVX2 body called once per row, single-block zoom ×4 (the work a row replaces).
+    /// `cargo test --release -p rc-mesh --lib row_corners_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    #[allow(unsafe_code)]
+    fn row_corners_bench() {
+        type Row = (f64, f64, [[f64; 3]; 8]);
+        let rows: Vec<Row> = (0..4096)
+            .map(|i: i32| {
+                let point = |k: i32| (i + (k >> 2), i / 7 + (k >> 1 & 1), k & 1);
+                let offsets = std::array::from_fn(|k| {
+                    let (x, y, z) = point(k as i32);
+                    corner_offsets(SEED, x, y, z)
+                });
+                (f64::from(i & 3) / 4.0, f64::from(i >> 2 & 3) / 4.0, offsets)
+            })
+            .collect();
+        let generic = |r: &[Row]| r.iter().map(|(fy, fz, o)| u64::from(zoom_corners_by_lanes(*fy, *fz, o)[3])).sum();
+        let avx2 = |r: &[Row]| {
+            r.iter()
+                .map(|(fy, fz, o)| {
+                    // SAFETY: only timed when AVX2 is there (checked below).
+                    u64::from(unsafe { zoom_corners_avx2(*fy, *fz, o) }[3])
+                })
+                .sum()
+        };
+        let single = |r: &[Row]| {
+            r.iter()
+                .map(|(fy, fz, o)| {
+                    let (ay, az) = ((*fy * 4.0) as i32, (*fz * 4.0) as i32);
+                    let offset = |cx: i32, cy: i32, cz: i32| o[(cx * 4 + cy * 2 + cz) as usize];
+                    (0..4).map(|ax| u64::from(zoom_corner_with(ax, ay, az, offset))).sum::<u64>()
+                })
+                .sum()
+        };
+        type Timed<'a> = &'a dyn Fn(&[Row]) -> u64;
+        let variants: [(&str, Timed); 3] = [("generic", &generic), ("avx2", &avx2), ("4 single zooms", &single)];
+        let mut times = vec![Vec::new(); 3];
+        for _ in 0..21 {
+            for (i, (_, f)) in variants.iter().enumerate() {
+                if i == 1 && !rc_data::cpu::has_avx2() {
+                    continue;
+                }
+                let s = std::time::Instant::now();
+                for _ in 0..100 {
+                    std::hint::black_box(f(std::hint::black_box(&rows)));
+                }
+                times[i].push(s.elapsed().as_secs_f64() * 1e9 / (100.0 * rows.len() as f64));
+            }
+        }
+        for ((name, _), t) in variants.iter().zip(&mut times) {
+            t.sort_by(f64::total_cmp);
+            if !t.is_empty() {
+                eprintln!("{name}: {:.2} / {:.2} ns per row (best / median)", t[0], t[t.len() / 2]);
+            }
+        }
+    }
+
+    /// Persistent corner memo entry: 16 bytes, the size its 512 KiB per thread is counted with.
+    #[test]
+    fn corner_memo_entry_is_16_bytes() {
+        assert_eq!(std::mem::size_of::<CornerEntry>(), 16);
+        assert_eq!(CORNER_MEMO_SLOTS * std::mem::size_of::<CornerEntry>(), 512 * 1024);
+    }
+
+    /// The four lanes of a row give the corners of the single-block zoom, for every fraction and
+    /// many offset draws (seeds and lattice points).
+    #[test]
+    fn row_corners_match_single_zoom() {
+        for seed in [SEED, -1, 0, 0x5_deec_e66d] {
+            for (cx, cy, cz) in [(0, 0, 0), (-3, 17, 5), (1000, -16, -2000), (7, 3, -9)] {
+                let offsets: [[f64; 3]; 8] = std::array::from_fn(|k| {
+                    let [x, y, z] = cell_corner([cx, cy, cz], k as u8);
+                    corner_offsets(seed, x, y, z)
+                });
+                for (fy, fz) in (0..16).map(|i| (i >> 2, i & 3)) {
+                    let row = zoom_corners_of_row(f64::from(fy) / 4.0, f64::from(fz) / 4.0, &offsets);
+                    for (fx, &corner) in row.iter().enumerate() {
+                        let (ax, ay, az) = (cx * 4 + fx as i32, cy * 4 + fy, cz * 4 + fz);
+                        assert_eq!(corner, zoom_corner(seed, ax, ay, az), "seed {seed} block ({ax}, {ay}, {az})");
+                    }
+                }
+            }
         }
     }
 

@@ -284,9 +284,11 @@ fn mesh_digests_match_stored() {
     assert_ne!(corner, reference, "fluid corner not seen");
 }
 
-/// Biome tint paths (C2-M06): each combination gives the stored fingerprints
-/// "default", "blend 0/1/7" and "absent columns as desert" on all the columns;
-/// then `Tint` equals the direct computation without cache on a sample of columns, radii 0 to 7.
+/// Biome tint paths (C2-M06, C2-M14): each combination gives the stored fingerprints
+/// "default", "blend 0/1/7" and "absent columns as desert" on all the columns (the meshes of a
+/// pool thread follow one another: persistent memo and section buffers carried from one mesh to
+/// the next); then `Tint` equals the direct computation without cache on a sample of columns,
+/// radii 0 to 7.
 #[test]
 fn tint_paths_digests_match_stored() {
     use rc_mesh::blocks::TintPaths;
@@ -296,20 +298,36 @@ fn tint_paths_digests_match_stored() {
     keys.sort_unstable();
     let desert = d.biomes.iter().position(|b| b.name == "minecraft:desert").expect("desert") as u32;
     let (all, old) = (TintPaths::ALL, TintPaths::OLD);
+    let before_cells = TintPaths {
+        uniform_cells: false,
+        four_block_rows: false,
+        persistent_corner_memo: false,
+        shared_column_layers: false,
+        ..all
+    };
     let combos = [
         all,
         old,
+        before_cells,
         TintPaths { single_biome_zone: false, ..all },
         TintPaths { lattice: false, ..all },
         TintPaths { grid: false, ..all },
         TintPaths { column_index: false, ..all },
         TintPaths { sliding_sums: 0, ..all },
         TintPaths { sliding_sums: 1, ..all },
+        TintPaths { uniform_cells: false, ..all },
+        TintPaths { four_block_rows: false, ..all },
+        TintPaths { persistent_corner_memo: false, ..all },
+        TintPaths { shared_column_layers: false, ..all },
         TintPaths { single_biome_zone: true, ..old },
         TintPaths { lattice: true, ..old },
         TintPaths { grid: true, ..old },
         TintPaths { column_index: true, ..old },
         TintPaths { sliding_sums: 1, ..old },
+        TintPaths { uniform_cells: true, ..old },
+        TintPaths { grid: true, four_block_rows: true, ..old },
+        TintPaths { persistent_corner_memo: true, ..old },
+        TintPaths { grid: true, shared_column_layers: true, ..old },
     ];
     let expected = |n: &str| EXPECTED.iter().find(|e| e.0 == n).expect("variant").1;
     for p in combos {
