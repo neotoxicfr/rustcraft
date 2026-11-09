@@ -238,7 +238,7 @@ fn drive(p: &mut Probe) -> Vec<String> {
     log
 }
 
-fn assert_same(reference: &[String], got: &[String], what: &str) {
+pub(super) fn assert_same(reference: &[String], got: &[String], what: &str) {
     if let Some(i) = (0..reference.len().max(got.len())).find(|&i| reference.get(i) != got.get(i)) {
         panic!(
             "{what}: first difference at line {i} of {}:\n  before: {:?}\n  now:    {:?}",

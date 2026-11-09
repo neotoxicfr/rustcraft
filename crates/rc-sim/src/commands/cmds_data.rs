@@ -16,6 +16,23 @@ use super::{Parsed, R, Seg, args, snbt};
 use crate::server::Server;
 use crate::tr;
 
+/// What a storage identifier or a block without data reads as.
+static EMPTY_COMPOUND: Nbt = Nbt::Compound(Vec::new());
+
+/// Result of `data get <path>`: the size of a collection or a string (UTF-16 units, like
+/// Java), otherwise the number rounded down.
+fn data_get_result(v: &Nbt) -> i32 {
+    match v {
+        Nbt::List(l) => l.len() as i32,
+        Nbt::Compound(f) => f.len() as i32,
+        Nbt::String(t) => t.encode_utf16().count() as i32,
+        Nbt::ByteArray(a) => a.len() as i32,
+        Nbt::IntArray(a) => a.len() as i32,
+        Nbt::LongArray(a) => a.len() as i32,
+        n => floor_to_i32(as_f64(n).unwrap_or(0.0)),
+    }
+}
+
 // ---------- NBT paths ----------
 
 #[derive(Debug, Clone)]
@@ -351,8 +368,19 @@ pub fn path_get(root: &Nbt, path: &str) -> Vec<Nbt> {
 /// Values designated by a path; otherwise `arguments.nbtpath.nothing_found` with the start of the
 /// path up to the node that found nothing.
 pub fn path_find(root: &Nbt, path: &str) -> Result<Vec<Nbt>, Fail> {
+    path_find_ref(root, path).map(|v| v.into_iter().map(Cow::into_owned).collect())
+}
+
+/// `path_find` without copies: the values are read in place (an element of a typed array is
+/// still a copy, it holds no tag of its own).
+pub fn path_find_ref<'a>(root: &'a Nbt, path: &str) -> Result<Vec<Cow<'a, Nbt>>, Fail> {
     let p = parse_path(path);
-    get_all(root, &p).map(|v| v.into_iter().map(Cow::into_owned).collect()).map_err(|d| p.not_found(d))
+    get_all(root, &p).map_err(|d| p.not_found(d))
+}
+
+/// Number of values a path designates (0 if a node finds nothing), nothing copied.
+pub fn path_count(root: &Nbt, path: &str) -> usize {
+    get_all(root, &parse_path(path)).map_or(0, |v| v.len())
 }
 
 // --- Write traversal ("get or create") ---
@@ -658,18 +686,31 @@ pub(crate) fn path_each_created(root: &mut Nbt, path: &str, default: &Nbt, f: &m
 }
 
 /// `merge` of the sub-path: each target (obtained or created as a compound) receives the sources.
-fn path_merge(root: &mut Nbt, path: &str, values: &[Nbt]) -> Result<usize, Fail> {
+/// `merge_changed`: a single source tells its change from the merged leaves (`merge_all`).
+fn path_merge(root: &mut Nbt, path: &str, values: &[Nbt], merge_changed: bool) -> Result<usize, Fail> {
     let p = parse_path(path);
     walk_created(root, &p, Some(&Nbt::Compound(Vec::new())), &mut |t| {
         if !matches!(t, Nbt::Compound(_)) {
             return Err(Fail(tr!("commands.data.modify.expected_object", snbt::to_snbt(t))));
         }
-        let before = t.clone();
-        for v in values {
-            merge(t, v);
-        }
-        Ok(usize::from(!eq(&before, t)))
+        Ok(usize::from(merge_all(t, values, merge_changed)))
     })
+}
+
+/// Merges `values` into `t` in turn; true if `t` changed. One value (the usual case) is tested
+/// leaf by leaf before the merge when `leafwise`, which spares the copy of `t` and the whole
+/// comparison; several values may undo each other, so they keep the copy.
+fn merge_all(t: &mut Nbt, values: &[Nbt], leafwise: bool) -> bool {
+    if let [one] = values
+        && leafwise
+    {
+        return merge_if_changes(t, one);
+    }
+    let before = t.clone();
+    for v in values {
+        merge(t, v);
+    }
+    !eq(&before, t)
 }
 
 /// Recursive merge of compounds.
@@ -682,6 +723,29 @@ pub fn merge(base: &mut Nbt, add: &Nbt) {
             None => b.push((k.clone(), v.clone())),
         }
     }
+}
+
+/// Would `merge(base, add)` change `base`? The same answer as comparing `base` before and after
+/// with `items::nbt_eq` (reals by bits, NaNs equal, 0.0 ≠ -0.0), read from the merged leaves
+/// only: a new key, or a replaced value that differs. `add` has one entry per key (an SNBT or a
+/// stored compound), so its entries never undo each other.
+pub fn merge_would_change(base: &Nbt, add: &Nbt) -> bool {
+    let (Nbt::Compound(b), Nbt::Compound(a)) = (base, add) else { return false };
+    a.iter().any(|(k, v)| match b.iter().find(|(x, _)| x == k) {
+        Some((_, old @ Nbt::Compound(_))) if matches!(v, Nbt::Compound(_)) => merge_would_change(old, v),
+        Some((_, old)) => !eq(old, v),
+        None => true,
+    })
+}
+
+/// `merge` done only if it changes something; true if it did. The test reads the leaves, so
+/// the merge itself writes exactly what `merge` writes.
+pub fn merge_if_changes(base: &mut Nbt, add: &Nbt) -> bool {
+    let changes = merge_would_change(base, add);
+    if changes {
+        merge(base, add);
+    }
+    changes
 }
 
 /// Typed numeric value (`execute store … byte|short|int|long|float|double`).
@@ -791,11 +855,8 @@ impl Server {
     /// `block_entity_data` to the client (network form: without id or position).
     pub fn send_block_entity(&self, p: [i32; 3]) {
         let Some(be) = self.be_get(p) else { return };
-        let Some(kind) = self
-            .data
-            .registry("minecraft:block_entity_type")
-            .and_then(|r| r.entries.iter().position(|e| Some(e.as_str()) == be.get("id").and_then(Nbt::as_str)))
-        else {
+        let id = be.get("id").and_then(Nbt::as_str);
+        let Some(kind) = self.data.block_entity_types().and_then(|r| id.and_then(|id| r.id(id))) else {
             return;
         };
         let mut nbt = be.clone();
@@ -826,6 +887,103 @@ impl Server {
             Acc::Entity(e) => self.entity_data(*e),
             Acc::Storage(id) => self.cmd.storage.get(id).cloned().unwrap_or(Nbt::Compound(Vec::new())),
         }
+    }
+
+    /// The target's data read in place when it can be: a storage, or a block entity with no
+    /// live state to write in; an entity's data is built for the read. The former path
+    /// (`RUSTCRAFT_OPT_DATABORROW=0`) copies it for every read.
+    fn acc_view(&self, a: &Acc) -> Cow<'_, Nbt> {
+        if !self.cmd.paths.data_borrow {
+            return Cow::Owned(self.acc_get(a));
+        }
+        match a {
+            Acc::Block(p) => self.block_data_view(*p).unwrap_or(Cow::Borrowed(&EMPTY_COMPOUND)),
+            Acc::Entity(e) => Cow::Owned(self.entity_data(*e)),
+            Acc::Storage(id) => Cow::Borrowed(self.cmd.storage.get(id).unwrap_or(&EMPTY_COMPOUND)),
+        }
+    }
+
+    /// `data_of_block` read in place when it is the stored block entity itself: no live furnace
+    /// or brewing stand to write in, no `keepPacked` to drop.
+    pub(crate) fn block_data_view(&self, p: [i32; 3]) -> Option<Cow<'_, Nbt>> {
+        let be = self.be_get(p)?;
+        let rewritten =
+            be.get("keepPacked").is_some() || self.life.furnaces.contains_key(&p) || self.life.brewers.contains_key(&p);
+        if rewritten { self.data_of_block(p).map(Cow::Owned) } else { Some(Cow::Borrowed(be)) }
+    }
+
+    /// Edits the target's data with `edit` (number of values changed): a storage in place
+    /// (`storage_edit_in_place`), otherwise a copy written back. Nothing changed is
+    /// `commands.data.merge.failed` unless the edit gave its own error; a failed edit of a
+    /// storage keeps what it created, like the game's.
+    fn data_edit(&mut self, acc: &Acc, edit: impl FnOnce(&mut Nbt) -> Result<usize, Fail>) -> Result<usize, Fail> {
+        if let Acc::Storage(id) = acc
+            && self.cmd.paths.data_borrow
+        {
+            return self.storage_edit_in_place(id, edit);
+        }
+        let mut data = self.acc_get(acc);
+        match edit(&mut data) {
+            Ok(n) if n > 0 => {
+                self.acc_set(acc, data)?;
+                Ok(n)
+            }
+            failed => {
+                self.keep_failed_storage_edit(acc, data);
+                Err(failed.err().unwrap_or_else(|| Fail(tr!("commands.data.merge.failed"))))
+            }
+        }
+    }
+
+    /// `data_edit` of a storage on the stored compound itself (a fresh empty one for a missing
+    /// identifier): no copy of it, so an edit costs its path, not the storage's size. A success
+    /// is written like `storage_put` (an emptied identifier removed, its namespace to save); a
+    /// failure keeps what it created, except a fresh compound, thrown away.
+    pub(crate) fn storage_edit_in_place(
+        &mut self,
+        id: &str,
+        edit: impl FnOnce(&mut Nbt) -> Result<usize, Fail>,
+    ) -> Result<usize, Fail> {
+        let existed = self.cmd.storage.contains_key(id);
+        if !existed {
+            self.cmd.storage.insert(id.to_owned(), Nbt::Compound(Vec::new()));
+        }
+        let Some(data) = self.cmd.storage.get_mut(id) else { return Err(Fail(tr!("commands.data.merge.failed"))) };
+        let edited = edit(data);
+        let emptied = matches!(data, Nbt::Compound(f) if f.is_empty());
+        match edited {
+            Ok(n) if n > 0 => {
+                if emptied {
+                    self.cmd.storage.remove(id);
+                }
+                let ns = storage_namespace(id);
+                if !self.cmd.storage_dirty.contains(ns) {
+                    self.cmd.storage_dirty.insert(ns.to_owned());
+                }
+                Ok(n)
+            }
+            failed => {
+                if !existed {
+                    self.cmd.storage.remove(id);
+                }
+                Err(failed.err().unwrap_or_else(|| Fail(tr!("commands.data.merge.failed"))))
+            }
+        }
+    }
+
+    /// `data merge`: a merge that changes nothing fails.
+    fn data_merge(&mut self, acc: &Acc, add: &Nbt) -> Result<(), Fail> {
+        if !self.cmd.paths.merge_changed {
+            // Former path: a merged copy compared whole with the data.
+            let old = self.acc_get(acc);
+            let mut new = old.clone();
+            merge(&mut new, add);
+            if crate::items::nbt_eq(&old, &new) {
+                return Err(Fail(tr!("commands.data.merge.failed")));
+            }
+            return self.acc_set(acc, new);
+        }
+        self.data_edit(acc, |data| Ok(usize::from(merge_if_changes(data, add)))).map(|_| ())
     }
 
     /// Comparable entity data (the write without id; player: held item `SelectedItem`).
@@ -894,15 +1052,11 @@ impl Server {
         }
     }
 
-    /// Data source of `execute if data` (block, entity, storage).
-    pub fn data_source(&mut self, s: &Src, p: &Parsed, seg: &Seg, kind: &str) -> Result<Nbt, Fail> {
-        let arg = match kind {
-            "block" => "source",
-            "entity" => "source",
-            _ => "source",
-        };
-        let acc = self.acc_of(s, p, seg, kind, arg)?;
-        Ok(self.acc_get(&acc))
+    /// Data source of `execute if data` and `function … with` (block, entity, storage), read in
+    /// place when it can be (`acc_view`).
+    pub fn data_source(&mut self, s: &Src, p: &Parsed, seg: &Seg, kind: &str) -> Result<Cow<'_, Nbt>, Fail> {
+        let acc = self.acc_of(s, p, seg, kind, "source")?;
+        Ok(self.acc_view(&acc))
     }
 
     /// `execute if items`: number of matching items.
@@ -915,9 +1069,10 @@ impl Server {
         let kind = item_source_kind(seg);
         let h = self.item_target(s, p, seg, kind, "source")?;
         let mut total = 0;
+        let mut view = super::cmds_s9b::SlotView::default();
         for slot in self.holder_slots(&h, &range).into_iter().flat_map(|(_, v)| v) {
             // A read of the slot: a sealed loot container draws its loot (`if slots` does not).
-            if let Some(st) = self.command_slot_get(slot).filter(|st| self.item_pred_test(&pred, st)) {
+            if let Some(st) = self.command_slot_read(slot, &mut view).filter(|st| self.item_pred_test(&pred, st)) {
                 total += st.count;
             }
         }
@@ -1001,7 +1156,7 @@ impl Server {
         let this_type = s.entity.map(|e| self.ent_type(e));
         let (tags, data) = (&self.block_tags, &self.data);
         let tag_fn = |tag: &str, name: &str| {
-            let b = data.blocks.iter().position(|x| x.name == name).map_or(u32::MAX, |i| i as u32);
+            let b = data.block_id(name).unwrap_or(u32::MAX);
             tags.get(tag.trim_start_matches('#')).is_some_and(|v| v.binary_search(&b).is_ok())
         };
         let mut rng = self.life.rng;
@@ -1043,72 +1198,61 @@ impl Server {
         };
         let acc = self.acc_of(s, p, seg, kind, target_arg)?;
         match op {
-            "get" => {
-                let data = self.acc_get(&acc);
-                let Some(path) = p.arg(seg, "path") else {
-                    let msg = self.acc_print(&acc, &data);
-                    self.ok(s, msg);
-                    return Ok(1);
-                };
-                let found = path_find(&data, &path)?;
-                if found.len() > 1 {
-                    return Err(Fail(tr!("commands.data.get.multiple")));
-                }
-                let v = &found[0];
-                if let Some(sc) = p.arg(seg, "scale") {
-                    let scale: f64 = sc.parse().unwrap_or(1.0);
-                    let Some(x) = as_f64(v) else { return Err(Fail(tr!("commands.data.get.invalid", path))) };
-                    let r = floor_to_i32(x * scale);
-                    let sc2 = format!("{scale:.2}");
-                    let msg = match &acc {
-                        Acc::Block(b) => tr!("commands.data.block.get", path.clone(), b[0], b[1], b[2], sc2, r),
-                        Acc::Entity(e) => tr!("commands.data.entity.get", path.clone(), self.ent_display(*e), sc2, r),
-                        Acc::Storage(id) => tr!("commands.data.storage.get", path.clone(), id.clone(), sc2, r),
-                    };
-                    self.ok(s, msg);
-                    return Ok(r);
-                }
-                let r = match v {
-                    Nbt::List(l) => l.len() as i32,
-                    Nbt::Compound(f) => f.len() as i32,
-                    Nbt::String(t) => t.encode_utf16().count() as i32,
-                    Nbt::ByteArray(a) => a.len() as i32,
-                    Nbt::IntArray(a) => a.len() as i32,
-                    Nbt::LongArray(a) => a.len() as i32,
-                    n => floor_to_i32(as_f64(n).unwrap_or(0.0)),
-                };
-                let msg = self.acc_print(&acc, v);
-                self.ok(s, msg);
-                Ok(r)
-            }
+            "get" => self.data_get(s, p, seg, &acc),
             "merge" => {
                 let add = snbt::parse(&p.arg(seg, "nbt").unwrap_or_default())
                     .map_err(|_| Fail(tr!("argument.nbt.expected.compound")))?;
-                let old = self.acc_get(&acc);
-                let mut new = old.clone();
-                merge(&mut new, &add);
-                if crate::items::nbt_eq(&old, &new) {
-                    return Err(Fail(tr!("commands.data.merge.failed")));
-                }
-                self.acc_set(&acc, new)?;
-                let msg = self.acc_modified(&acc);
-                self.ok(s, msg);
+                self.data_merge(&acc, &add)?;
+                self.ok_with(s, |sv| sv.acc_modified(&acc));
                 Ok(1)
             }
             "remove" => {
-                let mut data = self.acc_get(&acc);
                 let path = p.arg(seg, "path").unwrap_or_default();
-                let n = path_remove(&mut data, &path);
-                if n == 0 {
-                    return Err(Fail(tr!("commands.data.merge.failed")));
-                }
-                self.acc_set(&acc, data)?;
-                let msg = self.acc_modified(&acc);
-                self.ok(s, msg);
+                let n = self.data_edit(&acc, |data| Ok(path_remove(data, &path)))?;
+                self.ok_with(s, |sv| sv.acc_modified(&acc));
                 Ok(n as i32)
             }
             "modify" => self.data_modify(s, p, seg, &acc, &w),
             _ => Err(Fail(tr!("command.unknown.command"))),
+        }
+    }
+
+    /// `data get`: the whole data, or the value at a path (its size, or its number scaled). The
+    /// data is read in place and its text is written only when someone receives it.
+    fn data_get(&mut self, s: &Src, p: &Parsed, seg: &Seg, acc: &Acc) -> R {
+        let wanted = self.feedback_wanted(s);
+        let (result, msg) = {
+            let data = self.acc_view(acc);
+            match p.arg(seg, "path") {
+                None => (1, wanted.then(|| self.acc_print(acc, &data))),
+                Some(path) => {
+                    let found = path_find_ref(&data, &path)?;
+                    if found.len() > 1 {
+                        return Err(Fail(tr!("commands.data.get.multiple")));
+                    }
+                    let v = &found[0];
+                    match p.arg(seg, "scale") {
+                        Some(sc) => {
+                            let scale: f64 = sc.parse().unwrap_or(1.0);
+                            let Some(x) = as_f64(v) else { return Err(Fail(tr!("commands.data.get.invalid", path))) };
+                            let r = floor_to_i32(x * scale);
+                            (r, wanted.then(|| self.acc_scaled_get(acc, path, scale, r)))
+                        }
+                        None => (data_get_result(v), wanted.then(|| self.acc_print(acc, v))),
+                    }
+                }
+            }
+        };
+        self.ok_built(s, msg);
+        Ok(result)
+    }
+
+    fn acc_scaled_get(&self, a: &Acc, path: String, scale: f64, r: i32) -> Component {
+        let sc = format!("{scale:.2}");
+        match a {
+            Acc::Block(b) => tr!("commands.data.block.get", path, b[0], b[1], b[2], sc, r),
+            Acc::Entity(e) => tr!("commands.data.entity.get", path, self.ent_display(*e), sc, r),
+            Acc::Storage(id) => tr!("commands.data.storage.get", path, id.clone(), sc, r),
         }
     }
 
@@ -1125,15 +1269,12 @@ impl Server {
             ],
             "from" | "string" => {
                 let kind = w.get(src_i + 1).copied().unwrap_or("storage");
-                let arg = match kind {
-                    "block" => "source",
-                    _ => "source",
-                };
-                let sacc = self.acc_of(s, p, seg, kind, arg)?;
-                let data = self.acc_get(&sacc);
+                let sacc = self.acc_of(s, p, seg, kind, "source")?;
+                let data = self.acc_view(&sacc);
+                // Only the values the path reaches are copied.
                 let mut vals = match p.arg(seg, "sourcePath") {
                     Some(sp) => path_find(&data, &sp)?,
-                    None => vec![data],
+                    None => vec![data.into_owned()],
                 };
                 if how == "string" {
                     let start: Option<i32> = p.arg(seg, "start").and_then(|v| v.parse().ok());
@@ -1177,31 +1318,20 @@ impl Server {
         {
             return Err(Fail(tr!("commands.data.modify.expected_object", snbt::to_snbt(v))));
         }
-        let mut data = self.acc_get(acc);
         let path = p.arg(seg, "targetPath").unwrap_or_default();
-        let edited = match op {
+        let index: i32 = p.arg(seg, "index").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let merge_changed = self.cmd.paths.merge_changed;
+        let n = self.data_edit(acc, |data| match op {
             "set" => match values.last().cloned() {
-                Some(last) => path_set(&mut data, &path, last),
+                Some(last) => path_set(data, &path, last),
                 None => Ok(0),
             },
-            "merge" => path_merge(&mut data, &path, &values),
-            "append" => path_insert(&mut data, &path, -1, &values),
-            "prepend" => path_insert(&mut data, &path, 0, &values),
-            _ => {
-                let idx: i32 = p.arg(seg, "index").and_then(|v| v.parse().ok()).unwrap_or(0);
-                path_insert(&mut data, &path, idx, &values)
-            }
-        };
-        let n = match edited {
-            Ok(n) if n > 0 => n,
-            failed => {
-                self.keep_failed_storage_edit(acc, data);
-                return Err(failed.err().unwrap_or_else(|| Fail(tr!("commands.data.merge.failed"))));
-            }
-        };
-        self.acc_set(acc, data)?;
-        let msg = self.acc_modified(acc);
-        self.ok(s, msg);
+            "merge" => path_merge(data, &path, &values, merge_changed),
+            "append" => path_insert(data, &path, -1, &values),
+            "prepend" => path_insert(data, &path, 0, &values),
+            _ => path_insert(data, &path, index, &values),
+        })?;
+        self.ok_with(s, |sv| sv.acc_modified(acc));
         Ok(n as i32)
     }
 }
@@ -1438,9 +1568,11 @@ mod tests {
         let e = msg(path_insert(&mut v, "l", 5, &[Nbt::Int(2)]).unwrap_err());
         assert!(e.contains("invalid_index") && (e.contains("Int(5)") || e.contains("\"5\"")), "{e}");
         // `merge`: the missing target is created.
-        let mut v = snbt::parse("{}").unwrap();
-        assert_eq!(path_merge(&mut v, "a", &[snbt::parse("{x:1}").unwrap()]).unwrap(), 1);
-        assert_eq!(path_get(&v, "a.x"), vec![Nbt::Int(1)]);
+        for leafwise in [false, true] {
+            let mut v = snbt::parse("{}").unwrap();
+            assert_eq!(path_merge(&mut v, "a", &[snbt::parse("{x:1}").unwrap()], leafwise).unwrap(), 1);
+            assert_eq!(path_get(&v, "a.x"), vec![Nbt::Int(1)]);
+        }
     }
 
     /// Quirk of the game: all the `[]` of a path share the position of the last one.

@@ -64,6 +64,15 @@ pub fn read_items(be: &Nbt, size: usize) -> Vec<Option<Stack>> {
     out
 }
 
+/// Slot `i` of `Items` as `read_items` gives it, decoding only that slot's entries: the last
+/// valid entry wins, as in the full read (a later entry for the same slot overwrites it).
+pub fn read_item_at(be: &Nbt, i: usize, size: usize) -> Option<Stack> {
+    if i >= size {
+        return None;
+    }
+    list(be.get("Items")).iter().rev().filter(|it| int(it, "Slot") == Some(i as i64)).find_map(Stack::from_nbt)
+}
+
 pub fn write_items(be: &mut Nbt, items: &[Option<Stack>]) {
     let l: Vec<Nbt> =
         items.iter().enumerate().filter_map(|(i, s)| s.as_ref().map(|s| s.to_nbt(Some(i as i8)))).collect();
