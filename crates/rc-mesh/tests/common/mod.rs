@@ -83,6 +83,34 @@ pub fn load() -> Option<(rc_data::VersionData, Cols, Tables, BiomePalette)> {
     Some((d, cols, t, palette))
 }
 
+/// Solid-cell masks of the sections of one column of the capture (`None`: empty section).
+pub type ColumnMasks = ((i32, i32), Vec<Option<[u64; 64]>>);
+
+/// Solid-cell masks of the capture's sections, column by column in packet order, from the capture
+/// and the data cache only (no installed game needed).
+pub fn capture_solid_masks() -> Option<Vec<ColumnMasks>> {
+    let (cap, d) = (rc_testdata::reference_capture()?, rc_testdata::version_data()?);
+    let solid: Vec<bool> = d.states.iter().map(|s| s.has(rc_data::flags::SOLID_RENDER)).collect();
+    let ctx = ChunkContext::new(24, d.states.len() as u32, 67);
+    let mut values = vec![0u32; 4096];
+    let mut out = Vec::new();
+    for p in rc_testdata::play_packets(&cap, &d, "minecraft:level_chunk_with_light") {
+        let c = read_chunk(&mut Reader::new(&p), &ctx).expect("chunk of the capture");
+        let masks = c
+            .sections
+            .iter()
+            .map(|s| {
+                (!s.is_empty()).then(|| {
+                    s.blocks.unpack_into(&mut values);
+                    rc_mesh::visibility::solid_bits(&values, &solid)
+                })
+            })
+            .collect();
+        out.push(((c.x, c.z), masks));
+    }
+    Some(out)
+}
+
 /// Task for column (`x`, `z`) with the game's settings.
 pub fn job(cols: &Cols, x: i32, z: i32) -> MeshJob {
     let mut j = MeshJob::gather(cols[&(x, z)].clone(), 0, |x, z| cols.get(&(x, z)).cloned());

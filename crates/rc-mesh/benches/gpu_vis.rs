@@ -5,7 +5,7 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use rayon::prelude::*;
-use rc_mesh::visibility::{Vis, section_vis_bits, section_vis_fill, solid_bits};
+use rc_mesh::visibility::{DilationPaths, Vis, section_vis_bits, section_vis_fill, section_vis_with, solid_bits};
 use rc_proto::Reader;
 use rc_proto_v777::chunk::{ChunkContext, read_chunk};
 use wgpu::util::DeviceExt;
@@ -138,13 +138,35 @@ fn bench(c: &mut Criterion) {
     });
     let dil: Vec<Vis> = bits.iter().map(section_vis_bits).collect();
     assert_eq!(dil, cpu, "dilation by masks identical to the fill");
-    eprintln!("dilation identical to the fill on all the sections");
+    for p in DilationPaths::every_combination() {
+        assert!(bits.iter().zip(&cpu).all(|(s, v)| section_vis_with(s, p) == *v), "{p:?} differs from the fill");
+    }
+    eprintln!("dilation identical to the fill on all the sections, every path");
+    // Default paths (switches), then the paths one by one (`tests/visibility_bench.rs` alternates
+    // them under the same load and adds 2, 4… threads).
     g.bench_function("cpu_dilate_1t", |b| {
         b.iter(|| bits.iter().map(|s| black_box(section_vis_bits(s))).fold(0, |a, v| a ^ v))
     });
     g.bench_function("cpu_parallel", |b| {
         b.iter(|| bits.par_iter().map(|s| black_box(section_vis_bits(s))).reduce(|| 0, |a, v| a ^ v))
     });
+    let old = DilationPaths::OLD;
+    let paths = [
+        ("old", old),
+        ("row_carry", DilationPaths { row_carry: true, ..old }),
+        ("word_queue", DilationPaths { word_queue: true, ..old }),
+        ("stop_at_six_faces", DilationPaths { stop_at_six_faces: true, ..old }),
+        ("word_queue_stop", DilationPaths { word_queue: true, stop_at_six_faces: true, ..old }),
+        ("all", DilationPaths::ALL),
+    ];
+    for (name, p) in paths {
+        g.bench_function(format!("cpu_dilate_{name}_1t"), |b| {
+            b.iter(|| bits.iter().map(|s| black_box(section_vis_with(s, p))).fold(0, |a, v| a ^ v))
+        });
+        g.bench_function(format!("cpu_dilate_{name}_parallel"), |b| {
+            b.iter(|| bits.par_iter().map(|s| black_box(section_vis_with(s, p))).reduce(|| 0, |a, v| a ^ v))
+        });
+    }
     if let Some(gpu) = Gpu::new(&bits) {
         assert_eq!(gpu.run(None), cpu, "the GPU must return the same communications");
         eprintln!("GPU identical to the CPU on all the sections");
