@@ -401,6 +401,9 @@ impl Server {
         c.changed[si] = true;
         c.dirty = true;
         self.random_tick_changed((p[0] >> 4, p[2] >> 4, si), old, state);
+        if crate::mobs::move_stats::enabled() {
+            crate::mobs::move_stats::column_written(p, self.tick);
+        }
         if self.light.matters(old, state) {
             let o = self.light_opts;
             // Consecutive duplicate dropped (`misc`): exact, nothing moved between the two, it

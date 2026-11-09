@@ -4,7 +4,7 @@
 
 use super::goals::max_head_y;
 use super::mob::{Ent, Mob, MoveOp};
-use super::mth::{DEG, degrees_difference, pitch_to, rotate_if_necessary, rotate_towards, rotlerp_360, yaw_to};
+use super::mth::{DEG, pitch_to, rotate_if_necessary, rotate_towards, rotlerp_360, yaw_to};
 use super::species::Kind;
 use crate::server::Server;
 
@@ -15,18 +15,18 @@ impl Server {
         self.watch_main_hand();
         self.player_memory_tick();
         super::surface::parrot::player_tick(self);
-        self.sealife_player_tick(); // F09: player swimming
-        self.player_stingers_tick(); // F11: embedded stingers
+        self.sealife_player_tick(); // Player swimming
+        self.player_stingers_tick(); // Embedded stingers
     }
 
     /// Contacts of the current player after the mob tick: mount, push, cubes,
     /// pufferfish.
     pub(crate) fn mobs_player_touch(&mut self) {
-        self.riding_player_tick(); // F04
-        self.mount_menu_tick(); // F04
+        self.riding_player_tick();
+        self.mount_menu_tick();
         self.player_pushes_mobs();
         self.cubes_player_touch();
-        self.pufferfish_player_touch(); // F09
+        self.pufferfish_player_touch();
     }
 
     /// Special spawners of the chunk source (§ 1.2 step 9, after the random ticks): only if mobs
@@ -36,10 +36,10 @@ impl Server {
         crate::server::phase("spawners");
         if self.rule("minecraft:spawn_mobs", true) {
             self.phantom_spawner_tick();
-            self.patrol_spawner_tick(); // F07
+            self.patrol_spawner_tick();
             self.cat_spawner_tick();
             self.village_siege_tick();
-            self.trader_spawner_tick(); // F05
+            self.trader_spawner_tick();
         }
     }
 
@@ -78,7 +78,7 @@ impl Server {
     /// Before the entity walk: the player's parts the mobs read, its steps on sculk.
     pub(crate) fn mobs_pre(&mut self) {
         self.mobs_player_tick();
-        self.rec_world_tick(); // G6-F10: sensors and shriekers stepped on
+        self.rec_world_tick(); // Sensors and shriekers stepped on
     }
 
     /// Mob of slot `i`, at its rank in the entity walk. Frozen (`tick freeze`), only a mob
@@ -92,7 +92,7 @@ impl Server {
             self.mobs.list.put(i, m);
             return;
         }
-        let ticking = self.entity_ticks_at(m.pos()); // F15: arena ticket included
+        let ticking = self.entity_ticks_at(m.pos()); // Arena ticket included
         // Back in a ticking chunk during the walk: in the list from the next walk (despawn
         // check included).
         if self.meet(&mut m.rank, ticking, crate::walk::Fam::Mob) == crate::walk::Meet::Joined {
@@ -104,7 +104,7 @@ impl Server {
             self.mobs.list.put(i, m);
             return;
         }
-        // F04: a passenger is ticked by its vehicle.
+        // A passenger is ticked by its vehicle.
         if self.ticked_by_vehicle(&mut m) {
             self.mobs.list.put(i, m);
             return;
@@ -113,7 +113,7 @@ impl Server {
             self.tick_mob(&mut m);
         }
         let (id, carries) = (m.id, !m.mount.passengers.is_empty());
-        // G6-F10: on the ground on a sculk sensor or a shrieker (effect block 0.2 under the feet).
+        // On the ground on a sculk sensor or a shrieker (effect block 0.2 under the feet).
         let step = (ticking && m.on_ground && !m.removed && !self.mobs.rec.vib_blocks.is_empty())
             .then(|| (m.support, m.pos(), m.kind == Kind::Warden));
         // Put back only if the slot still exists (otherwise the mob is dropped).
@@ -130,23 +130,23 @@ impl Server {
     /// After the entity walk: the player's mount and push, the mob families' removals, contacts
     /// of the player, removed mobs, then network tracking.
     pub(crate) fn mobs_post(&mut self, runs: bool) {
-        self.riding_player_tick(); // F04
-        self.mount_menu_tick(); // F04
+        self.riding_player_tick();
+        self.mount_menu_tick();
         if runs {
             // Arrows and bolts of mobs, witch potions, golem snowballs, drowned tridents,
-            // fireballs, wind charges: common projectile engine (S8).
-            self.fangs_post(); // F07
-            self.spits_post(); // F04
-            self.bolts_post(); // F04
-            self.end_world_post(); // F15: crystals
-            self.ominous_items_post(); // W9: ominous item spawners
+            // fireballs, wind charges: common projectile engine.
+            self.fangs_post();
+            self.spits_post();
+            self.bolts_post();
+            self.end_world_post(); // Crystals
+            self.ominous_items_post(); // Ominous item spawners
             self.player_pushes_mobs(); // player push: also stopped when frozen
         }
         self.cubes_player_touch();
-        self.pufferfish_player_touch(); // F09
+        self.pufferfish_player_touch();
         // Removals, then network tracking.
         let mut gone = Vec::new();
-        let mut bars = Vec::new(); // F16: bars of removed withers
+        let mut bars = Vec::new(); // Bars of removed withers
         let mut uuids = Vec::new(); // scoreboard: permanently removed entities
         let mut ears = Vec::new(); // vibration listeners (warden, allay) to forget
         let scored = self.cmd.scores.has_entries();
@@ -195,7 +195,7 @@ impl Server {
     }
 
     fn tick_mob_body(&mut self, m: &mut Mob) {
-        // F15: the dragon has its own tick (no common AI or movement).
+        // The dragon has its own tick (no common AI or movement).
         if self.end_tick_mob(m) {
             return;
         }
@@ -203,18 +203,18 @@ impl Server {
         if m.kind == Kind::Creeper && self.creeper_tick(m) {
             return;
         }
-        // F01: skeleton freezing, zombie villager cure, pests' body.
+        // Skeleton freezing, zombie villager cure, pests' body.
         if self.variant_pre_tick(m) {
             return;
         }
         super::surface::pre_tick(m);
-        super::sealife::pre_tick(self, m); // F09: pufferfish inflation
-        super::brainy::pre_tick(self, m); // F10: sniffer seed
-        super::nether::pre_tick(self, m); // F12: strider sounds and cold
+        super::sealife::pre_tick(self, m); // Pufferfish inflation
+        super::brainy::pre_tick(self, m); // Sniffer seed
+        super::nether::pre_tick(self, m); // Strider sounds and cold
         if m.kind == Kind::Pig {
             super::nether::strider::steer_tick(self, m); // carrot on a stick in hand?
         }
-        super::recent::pre_tick(self, m); // F14: creaking heart, warden vibrations, breeze random draw
+        super::recent::pre_tick(self, m); // Creaking heart, warden vibrations, breeze random draw
         // Cubes: sulfur cube fuse, crushing; then common tick and landing.
         if m.kind.is_cube() {
             if self.cube_pre_tick(m) {
@@ -237,18 +237,18 @@ impl Server {
         m.pitch_o = m.pitch;
         m.head_yaw_o = m.head_yaw;
         m.tick_count += 1;
-        self.mob_boots_tick_effects(m); // G5-F02e: Soul Speed particles and sound
-        // Base tick of the entity (F06: iron golem run particles first).
+        self.mob_boots_tick_effects(m); // Soul Speed particles and sound
+        // Base tick of the entity (iron golem run particles first).
         self.golem_base_tick(m);
         m.was_eyes_in_water = m.eyes_in_water;
         let (was_in_water, vel) = (m.in_water, m.vel);
-        let air_before = m.air; // F09: air before the base tick
+        let air_before = m.air; // Air before the base tick
         self.mob_fluids(m);
-        // Splash on entering water, except on the first tick (F08).
+        // Splash on entering water, except on the first tick.
         if m.in_water && !was_in_water && m.tick_count > 1 {
             self.mob_splash(m, vel);
         }
-        super::aquatic::update_swimming(self, m); // F08: drowned swimming
+        super::aquatic::update_swimming(self, m); // Drowned swimming
         if m.fire > 0 && crate::inside_blocks::mob_fire_immune(m) {
             m.fire = 0;
         } else if m.fire > 0 {
@@ -266,21 +266,21 @@ impl Server {
             m.removed = true;
             return;
         }
-        // G4-F07a: lead (end of the entity's base tick).
+        // Lead (end of the entity's base tick).
         if m.leash.is_some() {
             self.leash_tick(m);
         }
         // Base tick of the living entity.
         if m.alive() {
             let eye = super::mth::block_of([m.pos()[0], m.eye_y(), m.pos()[2]]);
-            // F07: the vex passes through blocks (no physics: never "in a wall"). Only
+            // The vex passes through blocks (no physics: never "in a wall"). Only
             // suffocating blocks count: a parrot against a pane does not suffocate.
             if !super::illagers::no_physics(m) && self.in_wall([m.pos()[0], m.eye_y(), m.pos()[2]], m.width()) {
                 self.mob_hurt(m, "minecraft:in_wall", 1.0, None, None);
             }
-            if m.eyes_in_water && self.bname(eye) != "minecraft:bubble_column" {
-                // F06: the iron golem never loses air (neutral).
-                // S7: water breathing, conduit, nautilus shell breath.
+            if m.eyes_in_water && !self.is_bubble_column(eye) {
+                // The iron golem never loses air (neutral).
+                // Water breathing, conduit, nautilus shell breath.
                 let fx = |id: &str| m.x.effects.iter().any(|e| e.id == id);
                 let (wb, cp, bn) = (
                     fx("minecraft:water_breathing"),
@@ -299,17 +299,17 @@ impl Server {
                     && (!bn || wb || cp)
                 {
                     // Breathes underwater: air rises, except with the nautilus shell breath alone
-                    // (F09: own maximum air, dolphin filled at once).
+                    // (own maximum air, dolphin filled at once).
                     m.air = super::brainy::max_air(m)
                         .map_or_else(|| super::sealife::increase_air(m), |x| (m.air + 4).min(x));
                 }
-                self.mob_underwater_dismount(m); // F04
+                self.mob_underwater_dismount(m);
             } else if m.air < super::brainy::max_air(m).unwrap_or_else(|| super::sealife::max_air(m)) {
-                // F09: own maximum air and regain (dolphin: 4800 at once).
+                // Own maximum air and regain (dolphin: 4800 at once).
                 m.air =
                     super::brainy::max_air(m).map_or_else(|| super::sealife::increase_air(m), |x| (m.air + 4).min(x));
             }
-            self.mob_boots_location(m); // G5-F02e: Frost Walker, Soul Speed
+            self.mob_boots_location(m); // Frost Walker, Soul Speed
         }
         if m.hurt_time > 0 {
             m.hurt_time -= 1;
@@ -317,7 +317,7 @@ impl Server {
         if m.damage_cooldown > 0 {
             m.damage_cooldown -= 1;
         }
-        // F14: creaking being undone (45 ticks, dislocation).
+        // Creaking being undone (45 ticks, dislocation).
         if (m.dead || m.health <= 0.0) && super::recent::tick_death(self, m) {
             if m.removed {
                 return;
@@ -351,7 +351,7 @@ impl Server {
             if r < t {
                 m.ambient_time = -self.ambient_interval(m);
                 if let Some(s) = self.ambient_sound(m) {
-                    // F11: fox cry at volume 2.
+                    // Fox cry at volume 2.
                     if let Some(v) = super::wild::ambient_volume(m, &s) {
                         let p = Self::voice_pitch(m);
                         self.mob_sound(m, &s, v, p);
@@ -365,25 +365,25 @@ impl Server {
                 }
             }
         }
-        // F09: air of aquatic mobs out of water (after the base tick).
+        // Air of aquatic mobs out of water (after the base tick).
         super::sealife::handle_air(self, m, air_before);
-        super::brainy::handle_air(self, m, air_before); // F10: axolotl, tadpole
+        super::brainy::handle_air(self, m, air_before); // Axolotl, tadpole
         if m.swing_time > 0 {
             m.swing_time -= 1;
         }
         // Tick of the living entity: item in use, then the AI step.
         if m.use_ticks >= 0 {
-            // F07: crossbow sounds and loading.
+            // Crossbow sounds and loading.
             if m.kind == Kind::Pillager || m.kind == Kind::Piglin {
                 self.crossbow_use_tick(m);
             }
-            // F13: spear.
+            // Spear.
             if matches!(m.kind, Kind::Piglin | Kind::ZombifiedPiglin) {
                 self.spear_use_tick(m);
             }
             m.use_ticks += 1;
         }
-        // G5-F04: equipment modifiers, then the hit list of a tamed animal (every 20 ticks).
+        // Equipment modifiers, then the hit list of a tamed animal (every 20 ticks).
         self.mob_gear_tick(m);
         if m.tick_count % 20 == 0
             && let Some(c) = m.combat.as_mut()
@@ -413,8 +413,8 @@ impl Server {
         }
         // Control flags every 5 ticks (no passenger here: everything allowed).
         if m.tick_count % 5 == 0 {
-            m.goals.disabled = Self::control_flags(m); // F04: steering rider
-            // F07: a pillager who steers a ravager leaves it its goals.
+            m.goals.disabled = Self::control_flags(m); // Steering rider
+            // A pillager who steers a ravager leaves it its goals.
             if m.kind == Kind::Ravager
                 && Self::mob_controller(m)
                     .and_then(|id| self.mob_ref(id))
@@ -424,20 +424,20 @@ impl Server {
             }
             m.targets.disabled = 0;
         }
-        // F01: drowning of zombies, lifetime of the endermite.
+        // Drowning of zombies, lifetime of the endermite.
         self.variant_post_tick(m);
-        self.npc_post_tick(m); // F05
+        self.npc_post_tick(m);
         super::surface::post_tick(self, m);
         super::mounts::post_tick(self, m);
         self.golem_post_tick(m);
-        self.illager_post_tick(m); // F07: vex without gravity, limited life
-        super::sealife::post_tick(self, m); // F09
-        super::brainy::post_tick(self, m); // F10: armadillo, allay
-        self.wild_post_tick(m); // F11
-        super::nether::post_tick(self, m); // F12: strider standing on lava
-        super::piglins::post_tick(self, m); // F13
-        super::recent::post_tick(self, m); // F14: happy ghast
-        self.end_post_tick(m); // F15: shulker attachment and opening
+        self.illager_post_tick(m); // Vex without gravity, limited life
+        super::sealife::post_tick(self, m);
+        super::brainy::post_tick(self, m); // Armadillo, allay
+        self.wild_post_tick(m);
+        super::nether::post_tick(self, m); // Strider standing on lava
+        super::piglins::post_tick(self, m);
+        super::recent::post_tick(self, m); // Happy ghast
+        self.end_post_tick(m); // Shulker attachment and opening
         self.cat_post_tick(m); // cat: beg, purr
         if m.kind == Kind::Wolf {
             self.wolf_shake_tick(m);
@@ -483,7 +483,7 @@ impl Server {
             }
             k if super::surface::handles(k) => return super::surface::ambient_sound(self, m),
             k if super::mounts::handles(k) => return super::mounts::ambient_sound(m),
-            // F05: sleeping trader silent, in a trade: trade sound.
+            // Sleeping trader silent, in a trade: trade sound.
             k if super::villager::is_npc(k) => return super::villager::ambient_sound(m),
             k if super::golems::handles(k) => return super::golems::ambient_sound(m),
             k if super::aquatic::handles(k) => return super::aquatic::ambient_sound(m),
@@ -500,17 +500,17 @@ impl Server {
 
     /// The AI step of a mob.
     fn ai_step(&mut self, m: &mut Mob) {
-        self.illager_pre_ai_step(m); // F07: witch, raid pillager
-        super::aquatic::pre_ai_step(m); // F08: guardians
+        self.illager_pre_ai_step(m); // Witch, raid pillager
+        super::aquatic::pre_ai_step(m); // Guardians
         super::surface::pre_ai_step(self, m);
         super::mounts::pre_ai_step(m);
-        super::sealife::pre_ai_step(self, m); // F09: fish jump out of water
-        super::brainy::pre_ai_step(self, m); // F10: tadpole wriggling
-        self.wild_pre_ai_step(m); // F11: fox
-        super::nether::pre_ai_step(m); // F12: blaze slow fall
-        super::piglins::pre_ai_step(m); // F13: hoglin attack animation
-        super::recent::pre_ai_step(self, m); // F14: frozen creaking, happy ghast
-        super::wither::boss::pre_ai_step(self, m); // F16: push towards the target
+        super::sealife::pre_ai_step(self, m); // Fish jump out of water
+        super::brainy::pre_ai_step(self, m); // Tadpole wriggling
+        self.wild_pre_ai_step(m); // Fox
+        super::nether::pre_ai_step(m); // Blaze slow fall
+        super::piglins::pre_ai_step(m); // Hoglin attack animation
+        super::recent::pre_ai_step(self, m); // Frozen creaking, happy ghast
+        super::wither::boss::pre_ai_step(self, m); // Push towards the target
         // Cubes: the game's "age" class, not "monster" (no wear from light).
         if m.kind.is_monster()
             && m.kind != Kind::Phantom
@@ -542,7 +542,7 @@ impl Server {
         m.xxa *= 0.98;
         m.zza *= 0.98;
         let immobile = m.dead || m.health <= 0.0 || super::mounts::immobile(m) || super::illagers::immobile(m);
-        // F04: mount piloted by the player: neither AI nor server movement (client is master).
+        // Mount piloted by the player: neither AI nor server movement (client is master).
         let ridden = Self::player_controls(m) && m.alive();
         if immobile {
             m.jumping = false;
@@ -557,9 +557,9 @@ impl Server {
             if m.kind == Kind::Phantom {
                 self.phantom_travel(m);
             } else if m.kind == Kind::Vex {
-                self.vex_travel(m); // F07
+                self.vex_travel(m);
             } else if super::end::immobile(m) {
-                // F15: the shulker never moves (speed always zero).
+                // The shulker never moves (speed always zero).
             } else {
                 self.mob_jump(m);
                 self.mob_travel(m);
@@ -582,19 +582,19 @@ impl Server {
         // Sun, pickup.
         self.sun_burn(m);
         super::surface::post_ai_step(self, m);
-        super::sealife::post_ai_step(self, m); // F09
-        super::brainy::post_ai_step(self, m); // F10: tadpole, allay
+        super::sealife::post_ai_step(self, m);
+        super::brainy::post_ai_step(self, m); // Tadpole, allay
         super::mounts::post_ai_step(self, m);
-        self.npc_pickup(m); // F05
+        self.npc_pickup(m);
         if m.kind == Kind::SulfurCube {
             self.sulfur_pickup(m);
         }
         self.golem_post_ai_step(m);
-        self.illager_post_ai_step(m); // F07: ravager
-        self.wild_post_ai_step(m); // F11
-        self.piglin_pickup(m); // F13: piglin pickup
-        super::recent::post_ai_step(self, m); // F14: happy ghast healing
-        super::wither::boss::post_ai_step(self, m); // F16: heads, particle draws
+        self.illager_post_ai_step(m); // Ravager
+        self.wild_post_ai_step(m);
+        self.piglin_pickup(m); // Piglin pickup
+        super::recent::post_ai_step(self, m); // Happy ghast healing
+        super::wither::boss::post_ai_step(self, m); // Heads, particle draws
     }
 
     /// The server AI step (§ 3.1).
@@ -603,7 +603,7 @@ impl Server {
         m.sight.clear();
         let had = m.target;
         let odd = (m.tick_count + m.id) % 2 != 0 && m.tick_count > 1;
-        // F04: the steering rider acts on the navigation of their mount.
+        // The steering rider acts on the navigation of their mount.
         let lent = self.borrow_vehicle_nav(m);
         if odd {
             self.selector_tick_running(m, true);
@@ -614,26 +614,26 @@ impl Server {
         }
         self.return_vehicle_nav(m, lent);
         Self::enderman_target_changed(m, had);
-        // F14: the frozen creaking does not follow its navigation.
+        // The frozen creaking does not follow its navigation.
         if !super::recent::frozen(m) {
             self.nav_tick(m);
         }
         super::surface::custom_ai_step(self, m);
         if super::mounts::is_camel(m.kind) {
-            self.camel_brain_tick(m); // F04: camel brain
+            self.camel_brain_tick(m); // Camel brain
             super::mounts::camel::move_control_pre(self, m);
         }
-        self.npc_custom_ai(m); // F05: villager brain
+        self.npc_custom_ai(m); // Villager brain
         self.golem_custom_ai_step(m);
-        self.illager_custom_ai(m); // F07: spells, vindicator doors
-        super::aquatic::custom_ai_step(self, m); // F08: elder guardian
-        super::sealife::custom_ai_step(self, m); // F09: nautilus brain
-        super::brainy::custom_ai_step(self, m); // F10: animals with a brain
-        self.wild_custom_ai_step(m); // F11: bee
-        super::nether::custom_ai_step(self, m); // F12: blaze height
-        super::piglins::custom_ai_step(self, m); // F13: brains, zombification, anger
-        super::recent::custom_ai_step(self, m); // F14: brains
-        super::wither::boss::custom_ai_step(self, m); // F16: summoning, heads, blocks
+        self.illager_custom_ai(m); // Spells, vindicator doors
+        super::aquatic::custom_ai_step(self, m); // Elder guardian
+        super::sealife::custom_ai_step(self, m); // Nautilus brain
+        super::brainy::custom_ai_step(self, m); // Animals with a brain
+        self.wild_custom_ai_step(m); // Bee
+        super::nether::custom_ai_step(self, m); // Blaze height
+        super::piglins::custom_ai_step(self, m); // Brains, zombification, anger
+        super::recent::custom_ai_step(self, m); // Brains
+        super::wither::boss::custom_ai_step(self, m); // Summoning, heads, blocks
         // Own mechanics.
         if m.kind == Kind::Enderman && self.bright_outside() && m.tick_count >= m.target_change_time + 600 {
             let br = self.magic_light(m.block_pos());
@@ -654,10 +654,10 @@ impl Server {
             if m.kind.is_cube() {
                 self.cube_move_control(m);
             } else if m.kind == Kind::Vex {
-                self.vex_move_control(m); // F07
+                self.vex_move_control(m);
             } else if super::wild::handles(m.kind) {
                 if !self.wild_move_control(m) {
-                    self.move_control(m); // F11
+                    self.move_control(m);
                 }
             } else if !super::surface::move_control(self, m)
                 && !super::aquatic::move_control(self, m)
@@ -669,7 +669,7 @@ impl Server {
             {
                 self.move_control(m);
             }
-            // F04: the steered camel does not turn its head alone; head bounded to 30°.
+            // The steered camel does not turn its head alone; head bounded to 30°.
             let camel = super::mounts::is_camel(m.kind);
             if (camel && Self::mob_controller(m).is_some())
                 || super::sealife::look_control(m)
@@ -689,7 +689,7 @@ impl Server {
             m.jumping = m.jump_ctl;
             m.jump_ctl = false;
         }
-        // F14: jump cut for the frozen creaking.
+        // Jump cut for the frozen creaking.
         if super::recent::frozen(m) {
             m.jumping = false;
         }
@@ -742,14 +742,7 @@ impl Server {
                 let sp = (m.move_ctl.speed_mod * m.movement_speed()) as f32;
                 m.speed = sp;
                 m.zza = sp;
-                let bp = m.block_pos();
-                let top = self.collision_top(bp);
-                let n = self.bname(bp);
-                let door_or_fence = self.btag_id(bp, crate::tag_bits::TagId::Doors) || self.btag_id(bp, crate::tag_bits::TagId::Fences);
-                let _ = n;
-                if (yd > m.step_height() && xd * xd + zd * zd < f64::from(m.width().max(1.0)))
-                    || (top.is_some_and(|t| m.pos()[1] < t + f64::from(bp[1])) && !door_or_fence)
-                {
+                if (yd > m.step_height() && xd * xd + zd * zd < f64::from(m.width().max(1.0))) || self.jumps_onto_feet_block(m) {
                     m.jump_ctl = true;
                     m.move_ctl.op = MoveOp::Jumping;
                 }
@@ -763,6 +756,33 @@ impl Server {
             }
             MoveOp::Wait => m.zza = 0.0,
         }
+    }
+
+    /// The mob walking to a point jumps onto the block of its feet: the top of that block's shape is
+    /// above its feet and the block is neither a door nor a fence. One state read for the shape
+    /// and the two tags (`RUSTCRAFT_OPT_MOBSTATES`; old path: four reads, a block name read and
+    /// thrown away among them).
+    fn jumps_onto_feet_block(&self, m: &Mob) -> bool {
+        use crate::tag_bits::TagId;
+        let bp = m.block_pos();
+        if !super::env::mob_states_on() {
+            let top = self.collision_top(bp);
+            let _ = self.bname(bp);
+            let door_or_fence = self.btag_id(bp, TagId::Doors) || self.btag_id(bp, TagId::Fences);
+            return top.is_some_and(|t| m.pos()[1] < t + f64::from(bp[1])) && !door_or_fence;
+        }
+        let s = self.st(bp);
+        self.collision_top_of_state(s).is_some_and(|t| m.pos()[1] < t + f64::from(bp[1]))
+            && !(self.block_has_tag(s, TagId::Doors) || self.block_has_tag(s, TagId::Fences))
+    }
+
+    /// The block at `p` is a bubble column (block index compared, `RUSTCRAFT_OPT_MOBSTATES`; old
+    /// path: block name).
+    fn is_bubble_column(&self, p: [i32; 3]) -> bool {
+        if super::env::mob_states_on() {
+            return self.view().block(self.st(p)) == self.bs.t.id.bubble_column;
+        }
+        self.bname(p) == "minecraft:bubble_column"
     }
 
     /// The look control.
@@ -790,11 +810,11 @@ impl Server {
 
     /// Client-side body rotation (called by the end-of-tick rotation).
     fn body_rotation(&self, m: &mut Mob) {
-        // F10: the curled-up armadillo does not turn its body.
+        // The curled-up armadillo does not turn its body.
         if super::brainy::freezes_body(m) || super::end::immobile(m) {
             return;
         }
-        // F14: frozen creaking; mounted happy ghast (head and body on the yaw).
+        // Frozen creaking; mounted happy ghast (head and body on the yaw).
         if super::recent::body_rotation_pre(m) {
             return;
         }
@@ -824,7 +844,6 @@ impl Server {
                 m.body_yaw = rotate_if_necessary(m.body_yaw, m.head_yaw, max_head_y(m.kind) * (1.0 - f));
             }
         }
-        let _ = degrees_difference(0.0, 0.0);
     }
 }
 

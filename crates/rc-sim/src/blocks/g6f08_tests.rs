@@ -47,7 +47,7 @@ fn turtle_egg_hatch_chance_follows_the_day() {
         assert_eq!(w.p.s.turtle_egg_hatch_chance(), want, "time {t}");
     }
     set_day(&mut w, 21_500);
-    w.p.s.dim.name = "minecraft:the_nether".into();
+    w.p.s.dim.rename("minecraft:the_nether");
     assert_eq!(w.p.s.turtle_egg_hatch_chance(), 0.002, "no day timeline in the Nether");
 }
 
@@ -286,7 +286,7 @@ fn eyeblossoms_follow_the_night() {
     rtick(&mut w, pot);
     assert_eq!(w.p.s.state_name(w.p.s.get(c)), "minecraft:closed_eyeblossom", "closes at dawn");
     assert_eq!(w.p.s.state_name(w.p.s.get(pot)), "minecraft:potted_closed_eyeblossom");
-    w.p.s.dim.name = "minecraft:the_nether".into();
+    w.p.s.dim.rename("minecraft:the_nether");
     set_day(&mut w, 13_000);
     rtick(&mut w, c);
     assert_eq!(w.p.s.state_name(w.p.s.get(c)), "minecraft:closed_eyeblossom", "no timeline in the Nether");

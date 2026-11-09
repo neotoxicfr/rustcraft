@@ -63,6 +63,16 @@ pub struct Dimension {
     /// Region files kept open for reading between loads (`RUSTCRAFT_OPT_REGION_HANDLE_CACHE`),
     /// shared by the clones; closed with the last clone or by [`Dimension::close_region_files`].
     pub(crate) region_files: std::sync::Arc<SharedRegions>,
+    /// The overworld, by its name, decided once at the creation (`RUSTCRAFT_OPT_DIMFLAGS`).
+    overworld: bool,
+    /// The Nether, by its name, decided once at the creation (`RUSTCRAFT_OPT_DIMFLAGS`).
+    nether: bool,
+}
+
+/// `RUSTCRAFT_OPT_DIMFLAGS` (default on): the overworld and Nether tests of the hot mob paths read
+/// flags decided when the dimension is created instead of comparing its name at every call.
+fn dimension_flags() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_DIMFLAGS")
 }
 
 /// Flags of a dimension type, same rules as the lookups they replace: unknown type
@@ -102,7 +112,37 @@ impl Dimension {
             height,
             kind: std::sync::OnceLock::new(),
             region_files: Default::default(),
+            overworld: name == crate::dims::OVERWORLD,
+            nether: name == crate::dims::NETHER,
         }
+    }
+
+    /// The overworld (flag kept since the creation; old path: name compared).
+    pub(crate) fn is_overworld(&self) -> bool {
+        if !dimension_flags() {
+            return self.name == crate::dims::OVERWORLD;
+        }
+        #[cfg(test)]
+        assert_eq!(self.overworld, self.name == crate::dims::OVERWORLD, "dimension renamed without `rename`");
+        self.overworld
+    }
+
+    /// The Nether (flag kept since the creation; old path: name compared).
+    pub(crate) fn is_nether(&self) -> bool {
+        if !dimension_flags() {
+            return self.name == crate::dims::NETHER;
+        }
+        #[cfg(test)]
+        assert_eq!(self.nether, self.name == crate::dims::NETHER, "dimension renamed without `rename`");
+        self.nether
+    }
+
+    /// Renames the dimension in a test (its flags follow).
+    #[cfg(test)]
+    pub(crate) fn rename(&mut self, name: &str) {
+        self.name = name.to_owned();
+        self.overworld = name == crate::dims::OVERWORLD;
+        self.nether = name == crate::dims::NETHER;
     }
 
     /// Closes the region files kept for reading (world closed: its folder may be deleted, renamed

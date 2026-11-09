@@ -57,9 +57,18 @@ pub(crate) struct SimWorld<'a> {
     /// Border of the dimension (collision of the server's entities), built at first need.
     pub border_src: &'a crate::commands::Border,
     pub border: std::cell::OnceCell<rc_physics::WorldBorder>,
+    /// `RUSTCRAFT_OPT_SIMWORLDCURSOR`, kept per world so the tests compare both paths.
+    pub column_cursor_on: bool,
+    /// Last column looked up and what the lookup gave (`None`: not loaded). A movement reads the
+    /// same column dozens of times; the world borrows the chunks for its whole life, which is
+    /// at most one movement, so the column cannot change under the cursor.
+    pub column_cursor: std::cell::Cell<Option<ColumnLookup<'a>>>,
 }
 
-impl SimWorld<'_> {
+/// A column position and the loaded column found there (`None`: not loaded).
+pub(crate) type ColumnLookup<'a> = ((i32, i32), Option<&'a Chunk>);
+
+impl<'a> SimWorld<'a> {
     /// Shape of a moving piston block at `p`; false if it is not one.
     fn piston_shape(&self, s: u32, p: [i32; 3], out: &mut Vec<Aabb>) -> bool {
         if !self.tables.is_moving_piston(s) {
@@ -102,9 +111,23 @@ impl SimWorld<'_> {
         (lo[1]..=hi[1]).any(|y| (lo[2]..=hi[2]).any(|z| (lo[0]..=hi[0]).any(|x| self.movers.contains_key(&[x, y, z]))))
     }
 
-    /// The loaded column `(cx, cz)`.
-    fn loaded_column(&self, cx: i32, cz: i32) -> Option<&Chunk> {
-        self.chunks.get(&(cx, cz))?.as_deref()
+    /// The loaded column `(cx, cz)`: the last one looked up is kept (`column_cursor_on`).
+    fn loaded_column(&self, cx: i32, cz: i32) -> Option<&'a Chunk> {
+        if !self.column_cursor_on {
+            #[cfg(test)]
+            count_column_lookup();
+            return self.chunks.get(&(cx, cz))?.as_deref();
+        }
+        if let Some((key, column)) = self.column_cursor.get()
+            && key == (cx, cz)
+        {
+            return column;
+        }
+        #[cfg(test)]
+        count_column_lookup();
+        let column = self.chunks.get(&(cx, cz)).and_then(|c| c.as_deref());
+        self.column_cursor.set(Some(((cx, cz), column)));
+        column
     }
 }
 
@@ -118,8 +141,28 @@ fn palette_prefilter() -> bool {
     rc_data::opt_switch!("RUSTCRAFT_OPT_COLLISION_PALETTE_PREFILTER")
 }
 
+/// `RUSTCRAFT_OPT_SIMWORLDCURSOR` (default on): the server world seen by the physics keeps the last
+/// column it looked up instead of hashing the column position at every cell read.
+fn column_cursor() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_SIMWORLDCURSOR")
+}
+
 pub(crate) fn block_at(chunks: &HashMap<(i32, i32), Option<Box<Chunk>>>, min_y: i32, p: [i32; 3]) -> Option<u32> {
+    #[cfg(test)]
+    count_column_lookup();
     block_in(chunks.get(&(p[0] >> 4, p[2] >> 4))?.as_ref()?, min_y, p)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Column lookups in the chunk table made on this thread through `block_at` and the server
+    /// world (tests: the benches print them per tick, a count the machine's load does not move).
+    pub(crate) static COLUMN_LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_column_lookup() {
+    COLUMN_LOOKUPS.with(|n| n.set(n.get() + 1));
 }
 
 /// State at `p` in its column `c`; `None` outside the column's sections.
@@ -133,6 +176,9 @@ impl rc_physics::World for SimWorld<'_> {
     fn state(&self, x: i32, y: i32, z: i32) -> Option<u32> {
         if !(self.min_y..self.min_y + self.height).contains(&y) {
             return Some(0);
+        }
+        if self.column_cursor_on {
+            return block_in(self.loaded_column(x >> 4, z >> 4)?, self.min_y, [x, y, z]);
         }
         block_at(self.chunks, self.min_y, [x, y, z])
     }
@@ -487,6 +533,8 @@ impl Server {
             noclip: self.bs.noclip,
             border_src: &self.cmd.border,
             border: std::cell::OnceCell::new(),
+            column_cursor_on: column_cursor(),
+            column_cursor: std::cell::Cell::new(None),
         }
     }
 
@@ -679,7 +727,7 @@ impl Server {
                     .unwrap_or(false),
             ),
         };
-        v = self.dig_speed(v, self.eye_in_water()); // S7: efficiency, haste, fatigue, water
+        v = self.dig_speed(v, self.eye_in_water()); // Efficiency, haste, fatigue, water
         if !self.on_ground {
             v /= 5.0;
         }
@@ -856,7 +904,7 @@ impl Server {
     /// Break by the player: capable item, operator blocks, loot, removal.
     pub(crate) fn player_destroy_block(&mut self, pos: [i32; 3]) -> bool {
         let Some(state) = self.state_at(pos) else { return false };
-        // G5-F10: the debug stick never breaks; it picks the next property.
+        // The debug stick never breaks; it picks the next property.
         if self.held_stack().is_some_and(|s| s.id == "minecraft:debug_stick") {
             self.debug_stick_use(36 + self.held as usize, pos, false);
             return false;
@@ -889,7 +937,7 @@ impl Server {
         // Tool as before the wear.
         let tool = self.held_stack().cloned();
         let state = self.player_will_destroy(pos, state, tool.as_ref());
-        // S2: loot, wear, experience and container contents (block entity still there), then
+        // Loot, wear, experience and container contents (block entity still there), then
         // removal: linked halves, remaining fluid and notifications (`blocks::placement`).
         self.on_block_broken(pos, state);
         self.player_destroy(pos);
@@ -941,19 +989,19 @@ impl Server {
             self.send_block(neighbor);
             return;
         }
-        // S2: menu block or bed first (except when sneaking with an item in hand).
+        // Menu block or bed first (except when sneaking with an item in hand).
         let busy_hands = self.slots[36 + self.held as usize].is_some() || self.slots[45].is_some();
-        let s9_before = (self.data.block_of(self.get(pos)).map(|b| b.name.clone()).unwrap_or_default(), self.life.menu.is_some()); // S9
+        let s9_before = (self.data.block_of(self.get(pos)).map(|b| b.name.clone()).unwrap_or_default(), self.life.menu.is_some());
         let used = hand == 0
             && !(self.sneaking && busy_hands)
-            && (self.cmdblock_use(pos) || self.tech_block_use(pos) || self.use_block_or_bed(pos)); // S5, G6-F14
+            && (self.cmdblock_use(pos) || self.tech_block_use(pos) || self.use_block_or_bed(pos)); // command and technical blocks first
         if used {
-            self.s9_block_used(pos, &s9_before.0, !s9_before.1 && self.life.menu.is_some()); // S9
-            self.piglin_container_opened(&s9_before.0, !s9_before.1 && self.life.menu.is_some()); // F13
+            self.s9_block_used(pos, &s9_before.0, !s9_before.1 && self.life.menu.is_some());
+            self.piglin_container_opened(&s9_before.0, !s9_before.1 && self.life.menu.is_some());
         }
         // Spectator: a clicked portal makes them pass through (without a menu to open).
         let used = used || (self.game_mode == 3 && self.spectator_portal(pos));
-        let used = used || (self.game_mode != 3 && self.proj_use_on(hand, pos, face, at)); // S8: rocket placed
+        let used = used || (self.game_mode != 3 && self.proj_use_on(hand, pos, face, at)); // Rocket placed
         if !used && self.teleport.is_none() && self.game_mode != 3 && hand == 0 {
             // W8c: buckets (including mob ones) act on use (`use_item`, server aim),
             // like the game: their use on a block goes through.
@@ -1166,7 +1214,7 @@ impl Server {
     }
 
     pub(crate) fn send_slot(&mut self, _slot: usize) {
-        self.broadcast_menus(); // S2: differences sent with the tracked state number
+        self.broadcast_menus(); // Differences sent with the tracked state number
     }
 
     /// Flags of the active dimension's type (read once, see [`LightOpts::misc`]).
@@ -1329,7 +1377,7 @@ impl Server {
                     .collect();
                 let _ = self.send(Event::SectionUpdate { section: [sx, sy, sz], changes });
             }
-            // G6-F01: block entities with displayed contents (campfire, shelf, pot): their
+            // Block entities with displayed contents (campfire, shelf, pot): their
             // update follows the state, like the possible block-entity broadcast.
             for &p in &list {
                 let Some(s) = self.state_at(p) else { continue };

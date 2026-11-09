@@ -30,6 +30,44 @@ fn team_idx() -> bool {
     *ON.get_or_init(|| rc_data::env_str!("RUSTCRAFT_OPT_TEAMIDX") != Some("0"))
 }
 
+/// `RUSTCRAFT_OPT_SUPPORTSHARE` (default on): the support search after a mob's movement filters the
+/// block boxes the movement collected instead of walking the same cells again.
+fn support_share() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_SUPPORTSHARE")
+}
+
+/// `RUSTCRAFT_OPT_FREEZE_SKIP_UNFROZEN` (default on): the freezing step reads the block under the
+/// feet and the freeze-immune armour only when a frozen mob needs them.
+fn freeze_skip_unfrozen() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_FREEZE_SKIP_UNFROZEN")
+}
+
+/// `RUSTCRAFT_OPT_FREEZESHARE` (default on): the freezing step reuses the cell 0.2 under the feet
+/// that the movement of the same tick computed for the same position and support.
+fn freeze_share() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_FREEZESHARE")
+}
+
+/// `RUSTCRAFT_OPT_STEPSOUNDREF` (default on): a mob's own step sound is borrowed when it is a
+/// fixed name instead of being copied into a new string at every step.
+fn step_sound_ref() -> bool {
+    rc_data::opt_switch!("RUSTCRAFT_OPT_STEPSOUNDREF")
+}
+
+thread_local! {
+    /// Block boxes of this thread's last mob movement, read by its support search
+    /// (`RUSTCRAFT_OPT_SUPPORTSHARE`).
+    static MOVE_BOXES: std::cell::RefCell<collide::CollectedBlocks> = std::cell::RefCell::new(collide::CollectedBlocks::default());
+}
+
+/// `f` with the thread's kept movement boxes (fresh ones if a movement is already using them).
+fn with_move_boxes<R>(f: impl FnOnce(&mut collide::CollectedBlocks) -> R) -> R {
+    MOVE_BOXES.with(|kept| match kept.try_borrow_mut() {
+        Ok(mut kept) => f(&mut kept),
+        Err(_) => f(&mut collide::CollectedBlocks::default()),
+    })
+}
+
 /// Per-mob body state, outside physics: amethyst chime of the steps (intensity, tick of the
 /// last chime), last seen size (width, height) for the refit after growth (`None` before the
 /// first tick), effect cell of the last movement with the tick, position and support that
@@ -54,7 +92,7 @@ fn ignores_falls(k: Kind) -> bool {
     matches!(k, Kind::Bat | Kind::Allay | Kind::Bee | Kind::HappyGhast | Kind::Parrot | Kind::Ghast | Kind::Phantom)
 }
 
-fn l2(v: [f64; 3]) -> f64 {
+fn length_sq(v: [f64; 3]) -> f64 {
     v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
 }
 
@@ -62,8 +100,9 @@ fn l2(v: [f64; 3]) -> f64 {
 /// otherwise full block for a species in `#powder_snow_walkable_mobs` (or wearing leather
 /// boots) whose bottom is above the block; empty for the others.
 struct SnowStand<'a> {
-    inner: &'a dyn rc_physics::World,
-    s: &'a Server,
+    /// The world the snow shapes are added to.
+    base: &'a dyn rc_physics::World,
+    server: &'a Server,
     bottom: f64,
     falling: bool,
     walker: bool,
@@ -71,24 +110,24 @@ struct SnowStand<'a> {
 
 impl rc_physics::World for SnowStand<'_> {
     fn state(&self, x: i32, y: i32, z: i32) -> Option<u32> {
-        self.inner.state(x, y, z)
+        self.base.state(x, y, z)
     }
 
     fn collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<rc_physics::Aabb>) -> bool {
-        let over = self.inner.collision(x, y, z, out);
-        if out.is_empty() && self.is_powder_snow([x, y, z], || self.inner.state(x, y, z)) {
+        let over = self.base.collision(x, y, z, out);
+        if out.is_empty() && self.is_powder_snow([x, y, z], || self.base.state(x, y, z)) {
             self.push_snow_shape(y, out);
         }
         over
     }
 
     fn states_in(&self, first: [i32; 3], last: [i32; 3], out: &mut [u32]) -> bool {
-        self.inner.states_in(first, last, out)
+        self.base.states_in(first, last, out)
     }
 
     /// The state the walk read serves the wrapped world and the snow test (no second read).
     fn collision_of_state(&self, state: Option<u32>, x: i32, y: i32, z: i32, out: &mut Vec<rc_physics::Aabb>) -> bool {
-        let over = self.inner.collision_of_state(state, x, y, z, out);
+        let over = self.base.collision_of_state(state, x, y, z, out);
         if out.is_empty() && self.is_powder_snow([x, y, z], || state) {
             self.push_snow_shape(y, out);
         }
@@ -96,16 +135,16 @@ impl rc_physics::World for SnowStand<'_> {
     }
 
     fn border(&self) -> Option<&rc_physics::WorldBorder> {
-        self.inner.border()
+        self.base.border()
     }
 
     fn moving_collision(&self, x: i32, y: i32, z: i32, out: &mut Vec<rc_physics::Aabb>) -> bool {
-        self.inner.moving_collision(x, y, z, out)
+        self.base.moving_collision(x, y, z, out)
     }
 
     /// The snow shapes stay inside the cell.
     fn shape_reach(&self, lo: [i32; 3], hi: [i32; 3]) -> rc_physics::Aabb {
-        self.inner.shape_reach(lo, hi).union(&rc_physics::Aabb::UNIT)
+        self.base.shape_reach(lo, hi).union(&rc_physics::Aabb::UNIT)
     }
 }
 
@@ -115,9 +154,9 @@ impl SnowStand<'_> {
     /// for every empty cell).
     fn is_powder_snow(&self, p: [i32; 3], state: impl FnOnce() -> Option<u32>) -> bool {
         if rc_data::opt_switch!("RUSTCRAFT_OPT_STAND_SHAPE_FLAGS") {
-            state().is_some_and(|s| self.s.phys.is_powder_snow(s))
+            state().is_some_and(|s| self.server.phys.is_powder_snow(s))
         } else {
-            self.s.bname(p) == "minecraft:powder_snow"
+            self.server.bname(p) == "minecraft:powder_snow"
         }
     }
 
@@ -154,7 +193,7 @@ fn corrected(x: f32, m: f32) -> f32 {
 /// Slowdown of the previous tick (cobweb, berries): the movement is multiplied and the velocity
 /// reset to zero (piston pushes clear it without multiplying it, `piston.rs`).
 fn slowed_by_last_tick(m: &mut Mob, delta: [f64; 3]) -> [f64; 3] {
-    if l2(m.stuck) > 1.0e-7 {
+    if length_sq(m.stuck) > 1.0e-7 {
         let slowed = std::array::from_fn(|i| delta[i] * m.stuck[i]);
         m.stuck = [0.0; 3];
         m.vel = [0.0; 3];
@@ -179,7 +218,7 @@ impl Server {
         let mut flow = m.vel;
         let (water, lava, eyes) =
             rc_physics::scan_fluids_entity(&w, &self.phys, &m.bbox(), m.pos(), eye, true, self.fast_lava(), &mut flow);
-        // F09: aquatic fauna and nautiluses are not pushed by currents.
+        // Aquatic fauna and nautiluses are not pushed by currents.
         if super::surface::pushed_by_fluid(m.kind)
             && super::aquatic::pushed_by_fluid(m)
             && !super::sealife::handles(m.kind)
@@ -211,33 +250,56 @@ impl Server {
             if off <= 1.0e-5 {
                 return s;
             }
-            let fence = self.btag_id(s, crate::tag_bits::TagId::Fences);
-            let keep = (f64::from(off) <= 0.5 && fence)
-                || self.btag_id(s, crate::tag_bits::TagId::Walls)
-                || self.bname(s).ends_with("_fence_gate");
-            return if keep { s } else { [s[0], y, s[2]] };
+            return if self.keeps_support(s, off) { s } else { [s[0], y, s[2]] };
         }
         [pos[0].floor() as i32, y, pos[2].floor() as i32]
     }
 
+    /// The supporting block `s` stays the block under the feet at offset `off`: a wall or a fence
+    /// gate always, a fence up to half a block. One state read and the physics table
+    /// (`RUSTCRAFT_OPT_MOBSTATES`), or three reads by tag and name (old path).
+    fn keeps_support(&self, s: [i32; 3], off: f32) -> bool {
+        if super::env::mob_states_on() {
+            return self.phys.keeps_support(self.st(s), off);
+        }
+        let fence = self.btag_id(s, crate::tag_bits::TagId::Fences);
+        (f64::from(off) <= 0.5 && fence)
+            || self.btag_id(s, crate::tag_bits::TagId::Walls)
+            || self.bname(s).ends_with("_fence_gate")
+    }
+
     pub(crate) fn friction_at(&self, p: [i32; 3]) -> f32 {
-        self.phys.friction.get(self.st(p) as usize).copied().unwrap_or(0.6)
+        self.friction_of_state(self.st(p))
+    }
+
+    fn friction_of_state(&self, s: u32) -> f32 {
+        self.phys.friction.get(s as usize).copied().unwrap_or(0.6)
     }
 
     fn speed_factor(&self, m: &Mob) -> f32 {
-        // G5-F02e: Soul Speed active, movement efficiency 1: no slowdown.
+        // Soul Speed active, movement efficiency 1: no slowdown.
         if m.boots.soul_active {
             return 1.0;
         }
         let here = m.block_pos();
         let s = self.st(here);
         let f = self.phys.speed_factor.get(s as usize).copied().unwrap_or(1.0);
-        let name = self.state_name(s);
-        if name == "minecraft:water" || name == "minecraft:bubble_column" || f != 1.0 {
+        if self.speed_factor_here_only(s) || f != 1.0 {
             return f;
         }
         let b = self.st(self.mob_below(m, 0.500_001));
         self.phys.speed_factor.get(b as usize).copied().unwrap_or(1.0)
+    }
+
+    /// Water or bubble column: the speed factor of the occupied block is final, the block below
+    /// is not read. By a per-state flag of the physics tables (`RUSTCRAFT_OPT_MOBSTATES`) or by
+    /// the block name (old path).
+    fn speed_factor_here_only(&self, s: u32) -> bool {
+        if super::env::mob_states_on() {
+            return self.phys.speed_factor_here_only(s);
+        }
+        let name = self.state_name(s);
+        name == "minecraft:water" || name == "minecraft:bubble_column"
     }
 
     fn jump_factor(&self, m: &Mob) -> f32 {
@@ -270,14 +332,14 @@ impl Server {
         }
         m.vel[1] = f64::from(p).max(m.vel[1]);
         super::surface::after_jump(self, m);
-        super::brainy::after_jump(m); // F10: sniffer
+        super::brainy::after_jump(m); // Sniffer
         m.needs_sync = true;
     }
 
     /// Acceleration relative to the yaw.
     fn move_relative(m: &mut Mob, speed: f32) {
         let input = [f64::from(m.xxa), f64::from(m.yya), f64::from(m.zza)];
-        let len = l2(input);
+        let len = length_sq(input);
         if len < 1.0e-7 {
             return;
         }
@@ -314,34 +376,89 @@ impl Server {
             Some(l) => l,
             None => &world,
         };
-        let allowed = self.resolve_through_snow(m, collision_world, &start, delta);
-        let allowed_len_sq = l2(allowed);
-        if allowed_len_sq > 1.0e-7 || l2(delta) - allowed_len_sq < 1.0e-7 {
-            let from = m.pos();
-            m.add_pos(allowed);
-            m.inside.record(from, m.pos(), delta); // read back by the crossed-block pass
+        let snow = Self::powder_snow_rule(m);
+        if super::move_stats::enabled() {
+            self.count_movement(m, &start, delta, snow.0 || snow.1, lava.is_some());
         }
-        let blocked_x = (delta[0] - allowed[0]).abs() >= 1.0e-5;
-        let blocked_z = (delta[2] - allowed[2]).abs() >= 1.0e-5;
-        m.horizontal_collision = blocked_x || blocked_z;
-        // The server is authoritative except for a mount the player pilots: ground and vertical
-        // impact recomputed even without a vertical component (horizontal piston push).
-        if delta[1].abs() > 0.0 || !Self::player_controls(m) {
-            m.vertical_collision = delta[1] != allowed[1];
-            let below = m.vertical_collision && delta[1] < 0.0;
-            m.on_ground = below;
-            m.support = if below { rc_physics::support_of(collision_world, &m.bbox(), m.pos()) } else { None };
-        }
-        Moved { allowed, blocked_x, blocked_z }
+        with_move_boxes(|kept| {
+            let allowed = self.resolve_through_snow(m, collision_world, &start, delta, snow, kept);
+            let allowed_len_sq = length_sq(allowed);
+            if allowed_len_sq > 1.0e-7 || length_sq(delta) - allowed_len_sq < 1.0e-7 {
+                let from = m.pos();
+                m.add_pos(allowed);
+                m.inside.record(from, m.pos(), delta); // read back by the crossed-block pass
+            }
+            let blocked_x = (delta[0] - allowed[0]).abs() >= 1.0e-5;
+            let blocked_z = (delta[2] - allowed[2]).abs() >= 1.0e-5;
+            m.horizontal_collision = blocked_x || blocked_z;
+            // The server is authoritative except for a mount the player pilots: ground and vertical
+            // impact recomputed even without a vertical component (horizontal piston push).
+            if delta[1].abs() > 0.0 || !Self::player_controls(m) {
+                m.vertical_collision = delta[1] != allowed[1];
+                let below = m.vertical_collision && delta[1] < 0.0;
+                m.on_ground = below;
+                m.support = if below { Self::support_after_move(collision_world, kept, m) } else { None };
+            }
+            Moved { allowed, blocked_x, blocked_z }
+        })
     }
 
-    /// `resolve` through the mob's own powder snow shape when it falls onto snow or walks on it.
-    fn resolve_through_snow(&self, m: &Mob, collision_world: &dyn rc_physics::World, start: &rc_physics::Aabb, delta: [f64; 3]) -> [f64; 3] {
+    /// Counts the movement for the rest rate (`RUSTCRAFT_PERFLOG`): its inputs and the zone its
+    /// collision search may read.
+    fn count_movement(&self, m: &Mob, start: &rc_physics::Aabb, delta: [f64; 3], snow_envelope: bool, lava_envelope: bool) {
+        let step = m.step_height();
+        let inputs = super::move_stats::MoveInputs::new(start, delta, m.on_ground, step, snow_envelope, lava_envelope);
+        let zone = start.expand_towards(delta).expand_towards([0.0, step.max(0.0), 0.0]);
+        super::move_stats::movement(m.id, self.tick, inputs, &zone);
+    }
+
+    /// Main supporting block of a mob that just landed: taken from the block boxes its movement
+    /// kept when they can tell it (`RUSTCRAFT_OPT_SUPPORTSHARE`), otherwise by a new walk.
+    fn support_after_move(collision_world: &dyn rc_physics::World, kept: &collide::CollectedBlocks, m: &Mob) -> Option<[i32; 3]> {
+        let (b, pos) = (m.bbox(), m.pos());
+        let support = if support_share() {
+            rc_physics::support_of_kept(collision_world, kept, &b, pos)
+        } else {
+            rc_physics::support_of(collision_world, &b, pos)
+        };
+        if super::move_stats::enabled() {
+            super::move_stats::support_search(support_share() && kept.answers_support_of(&b));
+        }
+        // Every movement of the test suite proves the shared answer against the walk (the
+        // measurement benches turn the check off).
+        #[cfg(test)]
+        if super::index::verify() {
+            assert_eq!(support, rc_physics::support_of(collision_world, &b, pos), "support from the kept boxes, box {b:?}");
+        }
+        support
+    }
+
+    /// How powder snow carries the mob: (falling onto it from more than 2.5 blocks, walks on it:
+    /// species of `#powder_snow_walkable_mobs` or leather boots worn).
+    fn powder_snow_rule(m: &Mob) -> (bool, bool) {
         let falling = m.fall_distance > 2.5;
         let walker = m.kind.powder_snow_walkable() || m.equipment[2].as_ref().is_some_and(|s| s.id == "minecraft:leather_boots");
+        (falling, walker)
+    }
+
+    /// `resolve` through the mob's own powder snow shape when it falls onto snow or walks on it
+    /// (`snow`, from `powder_snow_rule`; the support search does not see that shape: nothing
+    /// kept); otherwise on `collision_world`, its block boxes kept in `kept` for the support search.
+    fn resolve_through_snow(
+        &self,
+        m: &Mob,
+        collision_world: &dyn rc_physics::World,
+        start: &rc_physics::Aabb,
+        delta: [f64; 3],
+        (falling, walker): (bool, bool),
+        kept: &mut collide::CollectedBlocks,
+    ) -> [f64; 3] {
         if falling || walker {
-            let snow = SnowStand { inner: collision_world, s: self, bottom: start.min[1], falling, walker };
+            kept.forget();
+            let snow = SnowStand { base: collision_world, server: self, bottom: start.min[1], falling, walker };
             collide::resolve(&snow, start, delta, m.on_ground, m.step_height())
+        } else if support_share() {
+            collide::resolve_keeping(collision_world, start, delta, m.on_ground, m.step_height(), kept)
         } else {
             collide::resolve(collision_world, start, delta, m.on_ground, m.step_height())
         }
@@ -392,8 +509,8 @@ impl Server {
         if !((delta[1].abs() > 0.0 && m.vertical_collision) || m.horizontal_collision) {
             return;
         }
-        let es = self.st(effect_pos);
-        let block_bounce = f64::from(self.phys.bounce.get(es as usize).copied().unwrap_or(0.0));
+        let effect_state = self.st(effect_pos);
+        let block_bounce = f64::from(self.phys.bounce.get(effect_state as usize).copied().unwrap_or(0.0));
         let own = m.bounciness();
         let cur = m.vel;
         let mut v = cur;
@@ -406,7 +523,14 @@ impl Server {
         if m.vertical_collision {
             let mut r = own;
             if delta[1] < 0.0 {
-                r = if -cur[1] > m.gravity() && !self.btag_id(effect_pos, crate::tag_bits::TagId::SuppressesBounce) {
+                let suppressed = || {
+                    if super::env::mob_states_on() {
+                        self.block_has_tag(effect_state, crate::tag_bits::TagId::SuppressesBounce)
+                    } else {
+                        self.btag_id(effect_pos, crate::tag_bits::TagId::SuppressesBounce)
+                    }
+                };
+                r = if -cur[1] > m.gravity() && !suppressed() {
                     r.max(block_bounce)
                 } else {
                     0.0
@@ -433,13 +557,15 @@ impl Server {
     /// Walked distance, and the step (sound, vibration) or swim it makes when one is due.
     fn accumulate_steps(&mut self, m: &mut Mob, allowed: [f64; 3], effect_pos: [i32; 3]) {
         let h = (allowed[0] * allowed[0] + allowed[2] * allowed[2]).sqrt();
-        let full = l2(allowed).sqrt();
+        let full = length_sq(allowed).sqrt();
         let on = self.mob_below(m, 1.0e-5);
         let on_st = self.st(on);
         let climbing = self.climbable_state(on_st);
         m.move_dist += if climbing { (full * f64::from(0.6f32)) as f32 } else { (h * f64::from(0.6f32)) as f32 };
         m.surf.fly_dist += (full * f64::from(0.6f32)) as f32;
-        if m.move_dist > m.next_step && !self.is_air(on) {
+        // The state of `on` is already read (old path: read again for each air test).
+        let on_air = if super::env::mob_states_on() { self.state_is_air(on_st) } else { self.is_air(on) };
+        if m.move_dist > m.next_step && !on_air {
             // Swimming (swim sound) when the aquatic mob is not on the ground.
             if super::sealife::swim_step(self, m) {
                 return;
@@ -449,8 +575,8 @@ impl Server {
             // in water; otherwise the step remains due.
             let sounds = super::aquatic::splash::emits_sounds(m.kind);
             let same = on == effect_pos;
-            let es = self.st(effect_pos);
-            let mut produced = self.mob_step_effects(m, effect_pos, es, sounds, same);
+            let effect_state = self.st(effect_pos);
+            let mut produced = self.mob_step_effects(m, effect_pos, effect_state, sounds, same);
             if !same {
                 produced |= self.mob_step_effects(m, on, on_st, false, true);
             }
@@ -466,14 +592,20 @@ impl Server {
                 }
                 self.mob_game_event(m, "minecraft:swim");
             }
-        } else if self.is_air(on) {
+        } else if on_air {
             self.mob_flap(m);
         }
     }
 
-    /// Climbable block for step accumulation: `climbable` tag or powder snow.
+    /// Climbable block for step accumulation: `climbable` tag or powder snow (per-state flag of
+    /// the physics tables, `RUSTCRAFT_OPT_MOBSTATES`; old path: block name).
     pub(crate) fn climbable_state(&self, st: u32) -> bool {
-        self.phys.climbable(st) || self.data.block_of(st).is_some_and(|b| b.name == "minecraft:powder_snow")
+        self.phys.climbable(st)
+            || if super::env::mob_states_on() {
+                self.phys.is_powder_snow(st)
+            } else {
+                self.data.block_of(st).is_some_and(|b| b.name == "minecraft:powder_snow")
+            }
     }
 
     /// Effects of a step on a block: nothing on air; on the
@@ -487,7 +619,7 @@ impl Server {
             return false;
         }
         if sound {
-            self.step_sound(m, p);
+            self.step_sound(m, p, st);
         }
         if vibrate {
             self.game_event_src(
@@ -524,7 +656,7 @@ impl Server {
 
     /// "Fall on" block: rule of the touched block `on` (`fall_rule`), then damage.
     pub(crate) fn fall_on(&mut self, m: &mut Mob, on: u32, dist: f64) {
-        // F14: breeze landing (sound beyond 3 blocks).
+        // Breeze landing (sound beyond 3 blocks).
         if m.kind == Kind::Breeze {
             super::recent::breeze::on_fall(self, m, dist);
         }
@@ -542,7 +674,7 @@ impl Server {
             }
             return;
         };
-        // F04: fall of equids (landing sound, riders hit too).
+        // Fall of equids (landing sound, riders hit too).
         if self.mount_fall(m, dist, mult) {
             return;
         }
@@ -550,7 +682,7 @@ impl Server {
             return;
         }
         let safe = m.attrs.safe_fall.value();
-        // F10: goat −10, frog −5.
+        // Goat −10, frog −5.
         let dmg = ((dist + 1.0e-6 - safe) * mult * m.attrs.fall_mult.value()).floor() as i32
             - super::brainy::fall_reduction(m.kind);
         if dmg > 0 {
@@ -588,11 +720,18 @@ impl Server {
         }
     }
 
-    /// Step sound on the effect block `on`: the species' own sound (or the block's), then the
-    /// amethyst chime, played whatever the step sound (even a silent one).
-    fn step_sound(&mut self, m: &mut Mob, on: [i32; 3]) {
-        self.step_sound_own(m, on);
-        if self.btag_id(on, crate::tag_bits::TagId::CrystalSoundBlocks) && m.tick_count >= m.body_fx.crystal_tick + 20 {
+    /// Step sound on the effect block `on` of state `on_state`: the species' own sound (or the
+    /// block's), then the amethyst chime, played whatever the step sound (even a silent one).
+    fn step_sound(&mut self, m: &mut Mob, on: [i32; 3], on_state: u32) {
+        // The caller already read the state (old path: read again for each use).
+        let on_state = if super::env::mob_states_on() { on_state } else { self.st(on) };
+        self.step_sound_own(m, on, on_state);
+        let crystal = if super::env::mob_states_on() {
+            self.block_has_tag(on_state, crate::tag_bits::TagId::CrystalSoundBlocks)
+        } else {
+            self.btag_id(on, crate::tag_bits::TagId::CrystalSoundBlocks)
+        };
+        if crystal && m.tick_count >= m.body_fx.crystal_tick + 20 {
             let fx = &mut m.body_fx;
             let decay = 0.997f64.powf(f64::from(m.tick_count - fx.crystal_tick)) as f32;
             fx.crystal = (fx.crystal * decay + 0.07).min(1.0);
@@ -603,11 +742,11 @@ impl Server {
         }
     }
 
-    fn step_sound_own(&mut self, m: &mut Mob, on: [i32; 3]) {
+    fn step_sound_own(&mut self, m: &mut Mob, on: [i32; 3], on_state: u32) {
         if self.mount_step_sound(m, on) {
             return;
         }
-        // Silent steps: happy ghast (F14), allay, bee, fish and tadpole, nautiluses; sulfur
+        // Silent steps: happy ghast, allay, bee, fish and tadpole, nautiluses; sulfur
         // cube carrying an item. (The breeze only emits events: never called.)
         let silent = match m.kind {
             Kind::SulfurCube => m.has_body_item(),
@@ -630,7 +769,7 @@ impl Server {
         if silent {
             return;
         }
-        // F06: iron and copper golems (volume 1).
+        // Iron and copper golems (volume 1).
         if let Some((s, v)) = super::golems::step_sound(m)
             .or_else(|| super::nether::step_sound(m))
             .or_else(|| super::recent::step_sound(m))
@@ -638,21 +777,12 @@ impl Server {
             self.mob_sound(m, s, v, 1.0);
             return;
         }
-        // Sound variant set (pig, cow, chicken, wolf; babies included).
-        let own = if m.kind == Kind::SulfurCube {
-            None
-        } else {
-            super::surface::step_sound(m)
-                .map(str::to_owned)
-                .or_else(|| self.variant_sound(m, "step_sound"))
-                .or_else(|| m.kind.info().step_sound.map(str::to_owned))
-        };
-        if let Some(s) = own {
+        if let Some(s) = self.own_step_sound(m) {
             self.mob_sound(m, &s, 0.15, 1.0);
             return;
         }
         // No sound of its own: step sound of the block's sound group, volume × 0.15.
-        let st = self.st(on);
+        let st = on_state;
         let Some(t) = self.data.states.get(st as usize).and_then(|i| self.data.sound_types.get(usize::from(i.sound)))
         else {
             return;
@@ -661,6 +791,27 @@ impl Server {
             let (s, v, p) = (t.step.clone(), t.volume * 0.15, t.pitch);
             self.mob_sound(m, &s, v, p);
         }
+    }
+
+    /// The species' own step sound (sound variant set of the pig, cow, chicken, wolf, babies
+    /// included), `None` for the sulfur cube and the species that use the block's sound. A fixed
+    /// name is borrowed (`RUSTCRAFT_OPT_STEPSOUNDREF`; old path: copied at every step).
+    fn own_step_sound(&self, m: &Mob) -> Option<std::borrow::Cow<'static, str>> {
+        use std::borrow::Cow;
+        if m.kind == Kind::SulfurCube {
+            return None;
+        }
+        if !step_sound_ref() {
+            let copied = super::surface::step_sound(m)
+                .map(str::to_owned)
+                .or_else(|| self.variant_sound(m, "step_sound"))
+                .or_else(|| m.kind.info().step_sound.map(str::to_owned));
+            return copied.map(Cow::Owned);
+        }
+        super::surface::step_sound(m)
+            .map(Cow::Borrowed)
+            .or_else(|| self.variant_sound(m, "step_sound").map(Cow::Owned))
+            .or_else(|| m.kind.info().step_sound.map(Cow::Borrowed))
     }
 
     /// Can freeze: not in `#freeze_immune_entity_types`, no `#freeze_immune_wearables` piece worn.
@@ -675,13 +826,33 @@ impl Server {
     /// 40 ticks once frozen.
     pub(crate) fn mob_freezing(&mut self, m: &mut Mob, in_snow: bool) {
         const REQUIRED: i32 = crate::inside_blocks::FREEZE_REQUIRED;
+        if !freeze_skip_unfrozen() {
+            return self.mob_freezing_reading_all(m, in_snow);
+        }
+        // Almost every mob is out of snow and not frozen: the armour, the block under the feet and
+        // the damage tick are only looked at when they can change something.
+        if !in_snow || !self.mob_can_freeze(m) {
+            m.ticks_frozen = (m.ticks_frozen - 2).max(0);
+        }
+        m.attrs.speed.remove_mod("minecraft:powder_snow");
+        if m.ticks_frozen > 0 && self.on_block_for_freezing(m) {
+            let pct = m.ticks_frozen.min(REQUIRED) as f32 / REQUIRED as f32;
+            m.attrs.speed.set_mod("minecraft:powder_snow", f64::from(-0.05 * pct), 0);
+        }
+        if m.tick_count % 40 == 0 && m.ticks_frozen >= REQUIRED && self.mob_can_freeze(m) {
+            self.mob_hurt(m, "minecraft:freeze", 1.0, None, None);
+        }
+    }
+
+    /// `mob_freezing` reading the armour and the block under the feet at every call (old path).
+    fn mob_freezing_reading_all(&mut self, m: &mut Mob, in_snow: bool) {
+        const REQUIRED: i32 = crate::inside_blocks::FREEZE_REQUIRED;
         let can_freeze = self.mob_can_freeze(m);
         if !in_snow || !can_freeze {
             m.ticks_frozen = (m.ticks_frozen - 2).max(0);
         }
         m.attrs.speed.remove_mod("minecraft:powder_snow");
-        let below = self.bname(self.mob_below(m, 0.2));
-        let on_block = !matches!(below, "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air");
+        let on_block = self.on_block_for_freezing(m);
         if m.ticks_frozen > 0 && on_block {
             let pct = m.ticks_frozen.min(REQUIRED) as f32 / REQUIRED as f32;
             m.attrs.speed.set_mod("minecraft:powder_snow", f64::from(-0.05 * pct), 0);
@@ -689,6 +860,22 @@ impl Server {
         if m.tick_count % 40 == 0 && m.ticks_frozen >= REQUIRED && can_freeze {
             self.mob_hurt(m, "minecraft:freeze", 1.0, None, None);
         }
+    }
+
+    /// The block 0.2 under the feet is not air (air, cave air, void air): the freezing slowdown
+    /// applies. The cell is the one this tick's movement computed when the position and the
+    /// support have not changed since (`RUSTCRAFT_OPT_FREEZESHARE`).
+    fn on_block_for_freezing(&self, m: &Mob) -> bool {
+        let cell = match m.body_fx.effect {
+            Some((tick, pos, support, cell)) if freeze_share() && tick == m.tick_count && pos == m.pos() && support == m.support => {
+                cell
+            }
+            _ => self.mob_below(m, 0.2),
+        };
+        if super::env::mob_states_on() {
+            return !self.phys.is_air(self.st(cell));
+        }
+        !matches!(self.bname(cell), "minecraft:air" | "minecraft:cave_air" | "minecraft:void_air")
     }
 
     /// Fall of a living entity (the mob `mob` being ticked, otherwise the player; box `w` × `h`)
@@ -719,7 +906,7 @@ impl Server {
     /// Entity on the ground on the effect block `p` (0.2 below the feet), every tick after the
     /// movement; `careful`: careful step (sneaking); `by`: the mob's species (`None`: the
     /// player). True if the block burns the feet (magma); a redstone ore lights up; turtle eggs
-    /// may lose one (G6-F08).
+    /// may lose one.
     pub(crate) fn step_on_block(&mut self, p: [i32; 3], careful: bool, by: Option<Kind>) -> bool {
         if careful {
             return false;
@@ -772,20 +959,20 @@ impl Server {
 
     /// `travel(input)` for a mob with effective AI.
     pub(crate) fn mob_travel(&mut self, m: &mut Mob) {
-        super::mounts::camel::freeze_travel(self, m); // F04
-        // F12: ghast flight.
+        super::mounts::camel::freeze_travel(self, m);
+        // Ghast flight.
         if super::nether::travel(self, m) {
             return;
         }
-        // F14: happy ghast flight (ridden or not).
+        // Happy ghast flight (ridden or not).
         if super::recent::travel(self, m) {
             return;
         }
         if super::surface::travel_in_water(self, m) || super::aquatic::travel_in_water(self, m) {
             return;
         }
-        // F09: squids (raw movement), swimmers in water.
-        // F10: allay flight, swimming of the frog, axolotl and tadpole.
+        // Squids (raw movement), swimmers in water.
+        // Allay flight, swimming of the frog, axolotl and tadpole.
         if super::brainy::travel(self, m) {
             return;
         }
@@ -794,7 +981,7 @@ impl Server {
         }
         let gravity = m.gravity();
         let falling = m.vel[1] <= 0.0;
-        // F12: the strider whose cell holds lava walks on it like on the ground.
+        // The strider whose cell holds lava walks on it like on the ground.
         if (m.in_water || m.lava_height > 0.0) && !super::nether::strider::stands_on_fluid(self, m) {
             let y0 = m.pos()[1];
             if m.in_water {
@@ -843,9 +1030,20 @@ impl Server {
             return;
         }
         let below = self.mob_below(m, 0.500_001);
-        let fb = if m.on_ground { corrected(self.friction_at(below), m.friction_modifier()) } else { 1.0 };
+        // One read of the cell under the feet serves the friction and, after the movement, the
+        // loaded test of the gravity (`RUSTCRAFT_OPT_MOBSTATES`; old path: read twice).
+        let below_state = super::env::mob_states_on().then(|| self.state_at(below));
+        let block_friction = if m.on_ground {
+            let st = match below_state {
+                Some(read) => read.unwrap_or(0),
+                None => self.st(below),
+            };
+            corrected(self.friction_of_state(st), m.friction_modifier())
+        } else {
+            1.0
+        };
         let speed = if m.on_ground {
-            if f64::from(fb) > 0.6 { m.speed * (0.216_000_02 / (fb * fb * fb)) } else { m.speed }
+            if f64::from(block_friction) > 0.6 { m.speed * (0.216_000_02 / (block_friction * block_friction * block_friction)) } else { m.speed }
         } else {
             0.02
         };
@@ -860,25 +1058,29 @@ impl Server {
         }
         let v = m.vel;
         self.mob_move(m, v);
-        let mut mv = m.vel;
+        let mut vel_after_move = m.vel;
         if (m.horizontal_collision || m.jumping) && self.on_climbable(m) {
-            mv[1] = 0.2;
+            vel_after_move[1] = 0.2;
         }
-        let mut my = mv[1];
-        if self.state_at(below).is_some() {
+        let mut my = vel_after_move[1];
+        let below_loaded = match below_state {
+            Some(read) => read.is_some(),
+            None => self.state_at(below).is_some(),
+        };
+        if below_loaded {
             my -= gravity;
         } else {
             my = if m.pos()[1] > f64::from(self.dim.height.min_y) { -0.1 } else { 0.0 };
         }
         let drag = m.air_drag_modifier();
         let air = corrected(0.91, drag);
-        let fr = f64::from(fb * air);
+        let horizontal_drag = f64::from(block_friction * air);
         let vertical = super::surface::air_vertical_friction(m)
             .unwrap_or_else(|| if m.omnidirectional_air() { air } else { corrected(0.98, drag) });
-        m.vel = [mv[0] * fr, my * f64::from(vertical), mv[2] * fr];
-        // F10: long jump (friction ignored).
+        m.vel = [vel_after_move[0] * horizontal_drag, my * f64::from(vertical), vel_after_move[2] * horizontal_drag];
+        // Long jump (friction ignored).
         if super::brainy::discard_friction(m) {
-            m.vel = [mv[0], my, mv[2]];
+            m.vel = [vel_after_move[0], my, vel_after_move[2]];
         }
         // Chicken: slowed fall.
         if m.kind == Kind::Chicken && !m.on_ground && m.vel[1] < 0.0 {
@@ -946,7 +1148,7 @@ impl Server {
     }
 
     fn jump_in_liquid(&self, m: &mut Mob) {
-        // F11: the bee only rises by 0.01.
+        // The bee only rises by 0.01.
         if super::wild::jump_in_liquid(m) {
             return;
         }
@@ -1066,7 +1268,7 @@ impl Server {
             self.mob_hurt(m, "minecraft:cramming", 6.0, None, None);
         }
         for (e, at) in list {
-            // F14: the warden pushed against an entity gets irritated by it.
+            // The warden pushed against an entity gets irritated by it.
             if m.kind == Kind::Warden {
                 super::recent::warden::on_push(self, m, e);
             }
@@ -1084,11 +1286,11 @@ impl Server {
                     }
                     let Some(i) = i else { continue };
                     let mut o = self.mobs.list.take(i).expect("mob");
-                    // F06: the iron golem's push (sometimes targets the pushed enemy).
+                    // The iron golem's push (sometimes targets the pushed enemy).
                     self.golem_pushed(m, &o);
                     let (po, pm) = (self.mob_pushable(&o), self.mob_pushable(m));
                     Self::push_pair(&mut o, m, po, pm);
-                    // F06: a cube pushed by an iron golem is hurt by it (`push` of the cube).
+                    // A cube pushed by an iron golem is hurt by it (`push` of the cube).
                     self.cube_pushed_by_golem(&mut o, m);
                     // A sulfur cube with a burning archetype hurts every entity it pushes.
                     if m.kind == Kind::SulfurCube && !m.cube.contacts.is_empty() {

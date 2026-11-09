@@ -10290,3 +10290,91 @@ nothing to spread over threads or the GPU.
 - To measure (quiet machine): title, plains12; the Multiplayer and Statistics screens with the
   out-of-world performance line (scene of C4-M07); in game: close the creative inventory, change
   the language, reopen it and search.
+## C6-M05: mob body without repeated work: support from the movement's boxes, one column lookup, one state read (09/11, loaded machine)
+
+Before: after every movement that lands, `support_of` walked again the cells `resolve` had just
+walked; every cell read of the server world hashed its column (a mob's fluid scan reads 2 to 8
+cells of one column); the block under the feet (`on_pos`, 3 to 4 times per tick) read its state
+three times (fence tag, wall tag, block name); speed factor, climbing, freezing and the bubble
+column compared block names; the freezing step read the armour and the block under the feet of
+every mob every tick, frozen or not; the walking control read and dropped a block name; the
+overworld and Nether tests compared the dimension's name. Proofs:
+`cargo test --release -p rc-physics` (`support_from_kept_boxes_identical_to_the_walk`,
+`kept_support_search_skips_what_the_walk_skips`), `-p rc-sim body_movement_tests` (every state's
+table rules against the name rules before and after a tag reload; the column cursor across four
+chunks, one missing; a crowd of 1,000 mobs of 12 species on a course of fences, walls, gates,
+slabs, stairs, water, powder snow, magma under carpets, soul sand, honey, slime, blue ice,
+amethyst, farmland and pitcher crops, 400 ticks, bodies and 22,846 sounds against a stored
+fingerprint; a cow freezing then thawing). Both fingerprints are the same with the seven switches
+at 0 and with the source files of `main` (checked by a temporary checkout). In the rc-sim tests
+every landing also compares the shared support with the walk (`body.rs`, off in the benches).
+
+- Support from the movement's boxes (`RUSTCRAFT_OPT_SUPPORTSHARE`): `collide::resolve_keeping`
+  keeps the block boxes of its last collection with their cells, the zone and the shape reach;
+  `support_of_kept` filters them (cell inside the support walk's cells, box touching the slab under
+  the feet) when the slab lies inside the kept zone and the reach spills out of no cell sideways,
+  otherwise it walks. Exact (proof in `CollectedBlocks::support_cells`): the support walk only
+  restricts its own edge cells, and their boxes never reach the slab without a sideways spill.
+  The mob's box is rebuilt from its position: on an axis it moved along, it can pass the kept zone
+  by one rounding step, and the search walks (an idle mob always shares). Not shared: the powder
+  snow envelope (the support search does not see it, a fidelity gap noted by C5-M13), the copying
+  path of `resolve`. The rule of the support kept under the feet is now one table method
+  (`Tables::keeps_support`) shared by mobs, player and minecarts.
+- Column cursor (`RUSTCRAFT_OPT_SIMWORLDCURSOR`): the server world keeps the last column looked up
+  (the world borrows the chunks for its whole life, at most one movement).
+- One state read and table flags (`RUSTCRAFT_OPT_MOBSTATES`, extended): support kept under the feet
+  from `Tables::keeps_support`; water or bubble column, powder snow and air from the physics
+  tables' existing per-state flags (no new table: the flags were already there for the player);
+  bubble column by block index; the state already read reused by the step sound, the amethyst
+  chime, the bounce, the air test of the steps, the friction and the loaded test of the travel, the
+  jump test of the walking control (whose dropped name read is gone).
+- Freezing (`RUSTCRAFT_OPT_FREEZE_SKIP_UNFROZEN`, new): armour and block under the feet read only
+  when the mob is in snow or frozen; `RUSTCRAFT_OPT_FREEZESHARE`: the cell 0.2 under the feet of
+  this tick's movement reused for the same position and support. The removal of the modifier
+  stays (it has to run before the new one).
+- Dimension flags (`RUSTCRAFT_OPT_DIMFLAGS`): overworld and Nether decided when the dimension is
+  created (sky darkening, magic light; for C6-M08: goals and brains). Tests rename a dimension
+  through `Dimension::rename` (a direct name write panics in the tests).
+- Step sound (`RUSTCRAFT_OPT_STEPSOUNDREF`): a fixed own step sound borrowed instead of copied;
+  the sound variants (pig, cow, chicken, wolf) still build their name.
+- Dead work removed: a yaw difference of 0 and 0 computed and dropped at every body rotation.
+- Rest rate (`RUSTCRAFT_PERFLOG`, line `[perf] mob movements`): movements whose inputs (box,
+  movement, ground, step height, envelopes) equal the previous tick's with no block written in the
+  columns they read since. Crowd of 1,000 on the model world, 200 ticks: 49.0 % at rest; 97.2 % of
+  the support searches answered from the kept boxes. A memo of the movement (C6-M39) is worth
+  launching.
+
+| Micro-bench, rc-sim course world, 1 thread, ns per call (two passes) | old | new |
+|---|---|---|
+| support kept under the feet (three reads by tags and name / one read and the table) | 25.7 / 25.7 | 8.6 / 8.6 |
+| `resolve` + support after landing, walk / kept boxes (cursor off) | 601 / 529 | 536 / 509 |
+| same, cursor on | 516 / 572 | 458 / 516 |
+| fluid scan, cursor off / on | 84 / 98 | 68 / 94 |
+
+| Crowd of 1,000 (model world, 980 mobs), column lookups per tick (deterministic) | lookups |
+|---|---|
+| default (all on) | 22,562 |
+| `SUPPORTSHARE=0` | 23,325 |
+| `SIMWORLDCURSOR=0` | 26,763 |
+| `MOBSTATES=0` | 29,144 |
+| `FREEZE_SKIP_UNFROZEN=0` | 23,383 |
+| `FREEZESHARE=0`, `DIMFLAGS=0`, `STEPSOUNDREF=0` (no lookup on their path in this crowd) | 22,562 |
+| all seven at 0 | 38,690 |
+
+Tick of that crowd (median, ms, loaded machine, three passes): default 8.70 / 8.69 / 8.08, all at
+0 9.03 / 8.79 / 10.89; each switch alone at 0 between 7.8 and 13.7 ms in the same passes: the
+machine's noise is larger than the expected gain (0.2 to 0.5 ms), decision on the quiet machine.
+
+Axes (B1): server CPU (every mob's movement, freezing, steps; the player and minecarts share the
+support rule); allocations: none added (the kept boxes live in a thread buffer), one string copy
+less per step of a mob with a fixed step sound; memory: the boxes of one movement per thread; no
+client, GPU, disk or network change. Multi-core: the movement is per mob on the tick thread, no
+work to split (speculative multi-core already discarded by the plan, redundant with the memo); GPU
+not applicable. Not done: leather boots as a flag (a string comparison only when something is worn
+on the feet; equipment written in many places), the block's own step sound copied per step (needs
+the sound resolved before the seed draw, `combat.rs`), crate-wide renames of `st`, `bname`,
+`btag_id`, `sflag`, `on_pos`, `mob_below` (hundreds of callers: renaming mission). Fidelity gaps
+seen, left to the fidelity missions: no entity colliders in the server world, no second offset
+search for the mob support, the powder snow envelope unseen by the support search. Scenes to
+measure (quiet machine, 2 passes, against `main` and each switch at 0): `crowd-1000`, `crowd`,
+`village`, `enclos-bebes`.

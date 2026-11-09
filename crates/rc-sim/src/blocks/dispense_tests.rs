@@ -296,10 +296,10 @@ fn placement_side_effects() {
         p.s.be_get([110, -59, 104]).and_then(|b| b.get("id")).and_then(Nbt::as_str),
         Some("minecraft:shelf")
     );
-    p.s.dim.name = "minecraft:the_nether".into();
+    p.s.dim.rename("minecraft:the_nether");
     p.run("setblock 112 -59 104 minecraft:wet_sponge\n");
     assert_eq!(name_at(&p, [112, -59, 104]), "minecraft:sponge");
-    p.s.dim.name = "minecraft:overworld".into();
+    p.s.dim.rename("minecraft:overworld");
     done(p, dir);
 }
 
