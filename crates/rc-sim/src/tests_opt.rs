@@ -425,18 +425,22 @@ fn regions_digest(root: &Path) -> Vec<(String, String)> {
 /// ticks left pending, `/locate` (references placed on in-memory protos), then
 /// closing like the game (generation stopped, save awaited) and rereading of ALL the
 /// regions. `keep`: cap of the generator map (evictions and rereads); `delay_ms`:
-/// latency of the writer. The result must depend on neither.
-fn run_regions(keep: usize, delay_ms: u64, lazy: Option<bool>) -> Option<Vec<(String, String)>> {
+/// latency of the writer; `pause_ms`: pause of the generation thread between the new light of a
+/// batch's neighbours and its new chunks (the server takes them in two polls). The result must
+/// depend on none of them.
+fn run_regions(keep: usize, delay_ms: u64, lazy: Option<bool>, pause_ms: u64) -> Option<Vec<(String, String)>> {
     let data = Arc::new(need(rc_testdata::version_data(), "26.3 data cache")?);
     need(crate::registries::client_jar(&data), "jar client 26.3")?;
     crate::generation::TEST_KEEP.with(|k| k.set(keep));
     crate::generation::TEST_PROTO_LAZY.with(|k| k.set(lazy));
+    crate::generation::TEST_PAUSE_BETWEEN_LIGHT_AND_CHUNKS.with(|p| p.set(std::time::Duration::from_millis(pause_ms)));
     crate::save::TEST_WRITER_DELAY_MS.with(|d| d.set(delay_ms));
     let tag = match lazy {
         None => String::new(),
         Some(l) => format!("-{}", u8::from(l)),
     };
-    let dir = std::env::temp_dir().join(format!("rc-sim-optreg-{}-{keep}-{delay_ms}{tag}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("rc-sim-optreg-{}-{keep}-{delay_ms}{tag}-{pause_ms}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let _guard = Scratch(dir.clone());
     let mut w = crate::newworld::NewWorld::new("opt");
@@ -472,14 +476,18 @@ fn run_regions(keep: usize, delay_ms: u64, lazy: Option<bool>) -> Option<Vec<(St
 }
 
 fn check_regions(keep: usize, delay_ms: u64) {
-    check_regions_with(keep, delay_ms, None);
+    check_regions_with(keep, delay_ms, None, 0);
 }
 
-/// `lazy`: lazy write of proto-chunks imposed (otherwise `RUSTCRAFT_OPT_PROTO_LAZY`).
-fn check_regions_with(keep: usize, delay_ms: u64, lazy: Option<bool>) {
-    let what = format!("all regions (map {keep}, writer +{delay_ms} ms, lazy protos {lazy:?})");
+/// `lazy`: lazy write of proto-chunks imposed (otherwise `RUSTCRAFT_OPT_PROTO_LAZY`); `pause_ms`:
+/// see [`run_regions`].
+fn check_regions_with(keep: usize, delay_ms: u64, lazy: Option<bool>, pause_ms: u64) {
+    let what = format!(
+        "all regions (map {keep}, writer +{delay_ms} ms, lazy protos {lazy:?}, light-to-chunks pause {pause_ms} ms)"
+    );
     let t = std::time::Instant::now();
-    let Some(got) = std::thread::spawn(move || run_regions(keep, delay_ms, lazy)).join().expect("simulation") else {
+    let Some(got) = std::thread::spawn(move || run_regions(keep, delay_ms, lazy, pause_ms)).join().expect("simulation")
+    else {
         return;
     };
     let sum = total(&got);
@@ -489,7 +497,7 @@ fn check_regions_with(keep: usize, delay_ms: u64, lazy: Option<bool>) {
     assert!(
         (sum.as_str(), got.len()) == (want, n),
         "{what}: regions {sum} ({} chunks) instead of {want} ({n}): closing did not write everything, \
-         or the result depends on evictions or on write latency",
+         or the result depends on evictions, on write latency or on when a batch reaches the server",
         got.len()
     );
 }
@@ -523,9 +531,19 @@ fn all_regions_reduced_map_slow_writer() {
 #[test]
 fn all_regions_protos_per_batch_and_lazy() {
     for lazy in [false, true] {
-        check_regions_with(900, 0, Some(lazy));
-        check_regions_with(16, 20, Some(lazy));
+        check_regions_with(900, 0, Some(lazy), 0);
+        check_regions_with(16, 20, Some(lazy), 0);
     }
+}
+
+/// Each batch reaches the server in two polls (the generation thread pauses 30 ms between the
+/// neighbours' new light and the new chunks): the regions are those of a batch taken in one poll.
+/// With the new chunks sent first, their neighbours' light came ticks later and overwrote what the
+/// server had changed there (fingerprint 7b2ead28…; the 4-core CI runners of PR #24 got fc9dbab0…
+/// and a786905b…).
+#[test]
+fn all_regions_with_each_batch_taken_in_two_polls() {
+    check_regions_with(900, 0, None, 30);
 }
 
 /// Save with the generator running: the proto-chunks it keeps in memory are on
