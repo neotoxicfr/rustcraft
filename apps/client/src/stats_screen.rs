@@ -450,7 +450,7 @@ impl StatsScreen {
         let sort = self.sort;
         let mut header_tip: Option<(usize, (i32, i32))> = None;
         let mut item_tip: Option<(usize, (i32, i32))> = None;
-        let lang = gui.lang.clone();
+        let lang = std::sync::Arc::clone(&gui.lang);
         self.panel.draw_with(gui, q, mouse, time, &mut |gui, q, l| {
             for i in 0..l.entries.len() {
                 let Some((x, y, _, eh)) = l.entry_rect(i) else { continue };

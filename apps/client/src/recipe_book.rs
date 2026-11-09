@@ -14,7 +14,7 @@ use crate::gui::{Blend, Gui};
 use crate::hud::HotbarItems;
 use crate::inventory::PlayerInventory;
 use crate::menu::{self, Kind};
-use crate::screens::{Cached, decorate, refresh, tooltip_lines};
+use crate::screens::{Cached, SearchIndexKey, decorate, refresh, tooltip_lines};
 use crate::widgets::TextField;
 
 /// Book types: 0 crafting table (and inventory), 1 furnace, 2 blast furnace, 3 smoker.
@@ -338,7 +338,7 @@ pub struct RecipeBook {
     pub time: u64,
     cache: Vec<Option<Cached>>,
     cursor: usize,
-    index: Option<(u64, HashMap<i32, Vec<String>>)>,
+    index: Option<(SearchIndexKey, HashMap<i32, Vec<String>>)>,
     generation: u64,
     tooltip: Option<(ItemStack, Vec<Vec<StyledChar>>, i32)>,
     /// Notifications of unlocked recipes to create: (station stack, result stack).
@@ -553,7 +553,7 @@ impl RecipeBook {
     fn listed(&mut self, kind: Kind, ctx: &Ctx<'_>, gui: &Gui, it: &HotbarItems<'_>, ench: &[String]) -> Vec<usize> {
         let q = self.search.value().to_lowercase();
         if !q.is_empty() {
-            self.ensure_index(ctx, gui, it, ench);
+            self.ensure_index(ctx, &gui.lang, it, ench);
         }
         let filter = self.settings[self.book].1;
         let idx = self.index.as_ref().map(|x| &x.1);
@@ -576,8 +576,8 @@ impl RecipeBook {
     }
 
     /// Search index (§ 10.3): tooltip lines of the results and ids.
-    fn ensure_index(&mut self, ctx: &Ctx<'_>, gui: &Gui, it: &HotbarItems<'_>, ench: &[String]) {
-        let key = self.generation ^ (gui.lang.map.len() as u64).rotate_left(40);
+    fn ensure_index(&mut self, ctx: &Ctx<'_>, lang: &rc_text::Lang, it: &HotbarItems<'_>, ench: &[String]) {
+        let key = SearchIndexKey { language: lang.generation, listed_content: self.generation, server_data: 0 };
         if self.index.as_ref().is_some_and(|x| x.0 == key) {
             return;
         }
@@ -585,7 +585,7 @@ impl RecipeBook {
         for (&id, (e, _)) in &self.known {
             let mut lines = Vec::new();
             for s in ctx.resolve(e.display.result()) {
-                lines.extend(crate::screens::tooltip_search_lines(&s, it, ench, gui, crate::screens::advanced()));
+                lines.extend(crate::screens::tooltip_search_lines(&s, it, ench, lang));
                 if let Some(n) = ctx.item_names.get(s.item as usize) {
                     lines.push(n.clone());
                 }
@@ -1553,6 +1553,31 @@ mod tests {
         assert_eq!(cells(&d(1, 2)), vec![(1, 0), (1, 1)]);
         assert_eq!(cells(&d(3, 1)), vec![(0, 1), (1, 1), (2, 1)]);
         assert_eq!(cells(&d(2, 2)), vec![(0, 0), (1, 0), (0, 1), (1, 1)]);
+    }
+
+    /// Index built in English, language switched to French (same number of keys): the next search
+    /// indexes the French name, like the game that rebuilds its search trees.
+    #[test]
+    fn search_index_follows_a_language_change() {
+        use crate::screens::SwordInTwoLanguages;
+        let f = SwordInTwoLanguages::new(rc_data::VersionData::default());
+        let rec = Received::default();
+        let ctx = Ctx { data: &f.data, rec: &rec, item_names: &f.names };
+        let display = RecipeDisplay::Shapeless {
+            ingredients: vec![SlotDisplay::Item(0)],
+            result: SlotDisplay::Item(0),
+            station: SlotDisplay::Empty,
+        };
+        let entry = RecipeEntry { id: 1, display, group: None, category: 0, requirements: None };
+        let mut b = RecipeBook::new();
+        b.known.insert(1, (entry, 0));
+        let mut indexed = |lang: &rc_text::Lang| {
+            b.ensure_index(&ctx, lang, &f.items(), &[]);
+            b.index.as_ref().expect("index built").1[&1].clone()
+        };
+        assert!(indexed(&f.english).contains(&"diamond sword".to_owned()));
+        let french = indexed(&f.french);
+        assert!(french.contains(&"épée en diamant".to_owned()), "index still in English: {french:?}");
     }
 
     /// A tab whose category holds a newly unlocked recipe bounces (search tab never); filtered

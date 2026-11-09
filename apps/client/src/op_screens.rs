@@ -1260,7 +1260,7 @@ impl crate::App {
             Some(Meta::String(s)) => s.clone(),
             _ => String::new(),
         };
-        let lang = self.renderer.as_ref().map(|r| r.gui.lang.clone()).unwrap_or_default();
+        let lang = self.renderer.as_ref().map(|r| std::sync::Arc::clone(&r.gui.lang)).unwrap_or_default();
         let output = match e.meta.get(&14) {
             Some(Meta::Component(n)) => plain(Some(n), &lang),
             Some(Meta::Text(n)) => plain(n.as_ref(), &lang),
@@ -1286,7 +1286,7 @@ impl crate::App {
             eprintln!("block entity {pos:?}: {n:?}");
         }
         let Some(cmd) = n.get("Command").and_then(Nbt::as_str) else { return };
-        let lang = self.renderer.as_ref().map(|r| r.gui.lang.clone()).unwrap_or_default();
+        let lang = self.renderer.as_ref().map(|r| std::sync::Arc::clone(&r.gui.lang)).unwrap_or_default();
         let output = plain(n.get("LastOutput"), &lang);
         let flag = |k: &str| n.get(k).and_then(Nbt::as_i64).is_some_and(|v| v != 0);
         let entry = (cmd.to_owned(), output.clone(), flag("auto"), flag("TrackOutput"));
@@ -1500,7 +1500,7 @@ impl crate::App {
         if !op.is_test_instance() {
             return;
         }
-        let lang = self.renderer.as_ref().map(|r| r.gui.lang.clone()).unwrap_or_default();
+        let lang = self.renderer.as_ref().map(|r| std::sync::Arc::clone(&r.gui.lang)).unwrap_or_default();
         // Error of the block at the time of the status (not at opening), then the status.
         let error = self.tech.map.get(&op.pos).and_then(|t| match t {
             Tech::TestInstance(i) => i.error.clone(),
