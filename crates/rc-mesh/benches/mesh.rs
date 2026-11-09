@@ -108,7 +108,7 @@ fn bench(c: &mut Criterion) {
             }
         }
         // Smoothed light paths (C2-M07, same output: `tests/light_paths.rs`): old,
-        // cumulative in the order D, A, B, C, then E, F, G alone and added, all, default; 1 thread and
+        // cumulative in the order D, A, B, C, then E, F alone and added, all, default; 1 thread and
         // all threads (`RC_BENCH_LIGHT_AO=0`: occlusion off).
         {
             use rc_mesh::light::LightPaths;
@@ -129,10 +129,8 @@ fn bench(c: &mut Criterion) {
                 ("c", LightPaths { facetab: true, ..old }),
                 ("e", LightPaths { cell8: true, ..old }),
                 ("f", LightPaths { fluid: true, ..old }),
-                ("g", LightPaths { neigh: true, ..old }),
                 ("dabce", LightPaths { cell8: true, ..dabc }),
                 ("dabcf", LightPaths { fluid: true, ..dabc }),
-                ("dabcg", LightPaths { neigh: true, ..dabc }),
                 ("dabcef", LightPaths { cell8: true, fluid: true, ..dabc }),
                 ("all", LightPaths::ALL),
                 ("default", LightPaths::DEFAULT),
@@ -155,7 +153,7 @@ fn bench(c: &mut Criterion) {
                     b.iter(|| js.par_iter().map(|j| black_box(m(j)).fluids.len()).sum::<usize>())
                 });
             }
-            eprintln!("face geometry for lighting: {} B", t.light_faces.heap_bytes());
+            eprintln!("face geometry for lighting: {} B", t.build_light_faces().heap_bytes());
         }
         // Without the shortcut for sealed sections (same output, cost comparison).
         let mut t0 = rc_mesh::blocks::Tables::new(&d, t.models.clone());
