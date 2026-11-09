@@ -625,6 +625,7 @@ fn rounding_micro_bench() {
 /// Angle folds of the entity render: per-tick yaw differences (a few degrees), head minus body
 /// (tens of degrees, one in 50 beyond a turn), texture scroll ages; one thread, then every
 /// thread (each its own copy of the work).
+/// `cargo test --release -p rc-data angle_wrap_micro_bench -- --ignored --nocapture`.
 #[test]
 #[ignore = "benchmark"]
 fn angle_wrap_micro_bench() {
@@ -638,22 +639,26 @@ fn angle_wrap_micro_bench() {
         time(&format!("{label}, 1 thread"), 7, f);
         time(&format!("{label}, {threads} threads"), 5, || (0..threads).into_par_iter().map(|_| f()).sum::<f32>());
     };
-    for path in TurnRemainder::ALL {
-        both(&format!("wrap degrees 10^6, {path:?}"), &|| {
-            diffs
-                .iter()
-                .map(|&d| {
-                    let mut a = degrees_remainder_with(d, path);
-                    if a >= 180.0 {
-                        a -= 360.0;
-                    }
-                    if a < -180.0 {
-                        a += 360.0;
-                    }
-                    a
-                })
-                .sum::<f32>()
-        });
+    // The same angles, then none beyond a turn: the subtraction must cost nothing there.
+    let within_a_turn: Vec<f32> = diffs.iter().map(|d| d % 360.0).collect();
+    for (set, angles) in [("2% beyond a turn", &diffs), ("all within a turn", &within_a_turn)] {
+        for path in TurnRemainder::ALL {
+            both(&format!("wrap degrees 10^6 ({set}), {path:?}"), &|| {
+                angles
+                    .iter()
+                    .map(|&d| {
+                        let mut a = degrees_remainder_with(d, path);
+                        if a >= 180.0 {
+                            a -= 360.0;
+                        }
+                        if a < -180.0 {
+                            a += 360.0;
+                        }
+                        a
+                    })
+                    .sum::<f32>()
+            });
+        }
     }
     let radians: Vec<f32> = diffs.iter().map(|d| d.to_radians() * 0.1).collect();
     both("fold radians 10^6, old library remainder", &|| {
