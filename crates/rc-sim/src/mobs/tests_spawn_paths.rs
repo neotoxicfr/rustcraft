@@ -411,7 +411,7 @@ fn natural_spawn_paths_match() {
     for (label, paths) in [
         ("census only", SpawnPaths { structure_starts: false, ..SpawnPaths::NEW }),
         ("structure starts only", SpawnPaths { spawn_census: false, ..SpawnPaths::NEW }),
-        ("placement first", SpawnPaths { placement_first: true, ..SpawnPaths::NEW }),
+        ("list first", SpawnPaths { placement_first: false, ..SpawnPaths::NEW }),
         ("placement first, former lists", SpawnPaths { placement_first: true, ..SpawnPaths::OLD }),
     ] {
         let alone = play(paths, natural_scenario).expect("same data");

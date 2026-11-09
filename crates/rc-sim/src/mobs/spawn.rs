@@ -119,9 +119,9 @@ pub(crate) struct SpawnPaths {
     /// Natural spawns: structure starts decoded once per pass, pieces grouped by chunk column,
     /// spawn list not read twice at the drawing position.
     pub structure_starts: bool,
-    /// Natural spawns: a position's placement tested before its spawn list (off by default: with
-    /// the decoded lists, the list is the cheaper test away from structures, where the placement
-    /// test allocates a block name; to settle on the fortress scene).
+    /// Natural spawns: a position's placement tested before its spawn list (the cheaper test
+    /// first once the placement test no longer copies the block name: most positions fail it,
+    /// and the list is then never read).
     pub placement_first: bool,
 }
 
@@ -146,11 +146,11 @@ impl SpawnPaths {
             spawner_borrow: rc_data::opt_switch!("RUSTCRAFT_OPT_SPAWNER_BORROW"),
             spawn_census: rc_data::opt_switch!("RUSTCRAFT_OPT_SPAWN_CENSUS"),
             structure_starts: rc_data::opt_switch!("RUSTCRAFT_OPT_STRUCTURE_STARTS"),
-            placement_first: rc_data::opt_switch!("RUSTCRAFT_OPT_SPAWN_PLACEMENT_FIRST", default_off),
+            placement_first: rc_data::opt_switch!("RUSTCRAFT_OPT_SPAWN_PLACEMENT_FIRST"),
         }
     }
 
-    /// The default paths (every new one, the placement-first order excepted).
+    /// The default paths: every new one.
     #[cfg(test)]
     pub(crate) const NEW: SpawnPaths = SpawnPaths {
         trial_write_on_change: true,
@@ -161,7 +161,7 @@ impl SpawnPaths {
         spawner_borrow: true,
         spawn_census: true,
         structure_starts: true,
-        placement_first: false,
+        placement_first: true,
     };
 
     /// Every former path.
@@ -1874,7 +1874,8 @@ impl Server {
 
     /// Block below that allows spawning.
     pub(crate) fn valid_spawn_on(&self, p: [i32; 3], kind: Kind) -> bool {
-        let n = self.bname(p).trim_start_matches("minecraft:").to_owned();
+        // The name is lent by the block table: no copy (this test runs for every spawn attempt).
+        let n = self.bname(p).trim_start_matches("minecraft:");
         // Species-specific predicates (F13: portal zombified piglin on magma).
         if n == "magma_block" {
             return kind.info().fire_immune;
@@ -1895,11 +1896,11 @@ impl Server {
             "chorus_flower",
             "scaffolding",
         ];
-        if NEVER.contains(&n.as_str()) || n.ends_with("_stained_glass") || n.ends_with("_trapdoor") {
+        if NEVER.contains(&n) || n.ends_with("_stained_glass") || n.ends_with("_trapdoor") {
             return false;
         }
         const ALWAYS: [&str; 5] = ["soul_sand", "carved_pumpkin", "jack_o_lantern", "redstone_lamp", "mud"];
-        if ALWAYS.contains(&n.as_str()) {
+        if ALWAYS.contains(&n) {
             return true;
         }
         let s = self.st(p);
